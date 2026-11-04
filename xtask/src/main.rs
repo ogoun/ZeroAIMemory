@@ -29,6 +29,9 @@ struct Cli {
     cmd: Cmd,
 }
 
+// аргументы разбираются один раз на запуск: размер вариантов значения не имеет (боксинг
+// `EvalArgs` лишь сдвинул бы предупреждение на `Package`)
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Скачать зависимости поставки (Qdrant, ONNX Runtime CPU и GPU, pdfium) в target/deps/<платформа>/;

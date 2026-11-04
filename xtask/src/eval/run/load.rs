@@ -88,12 +88,18 @@ impl Session {
                 }
             }
         }
-        // связи `contradicts` (M4.5) — после всех созданий: цель может стоять ниже по файлу
+        // связи `contradicts` (M4.5) — после всех созданий: цель может стоять ниже по файлу; сервер
+        // без них (B4, `ServerCaps::contradicts`) пары не получает — они запоминаются
+        // ([`Session::skipped_edges`]), сценарии с ними исключаются из сравнения плеч
         for i in insights {
             for t in &i.contradicts {
                 let dst = ids
                     .get(t.as_str())
                     .with_context(|| format!("insight {}: contradicts {t} не создан", i.key))?;
+                if !self.contradicts {
+                    self.skipped_edges.push((i.key.clone(), t.clone()));
+                    continue;
+                }
                 let body = json!({
                     "src": format!("entry:{}", ids[i.key.as_str()]),
                     "type": "contradicts",

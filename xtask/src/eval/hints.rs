@@ -52,6 +52,8 @@ use super::run::{self, RunSpec, Session};
 use super::{Device, EvalArgs, Mode, Paths};
 use crate::smoke::{admin_login, agent_with, api_timeout, scrub_zam_env};
 
+pub mod ideas;
+
 /// Ссылка на заметку Rules набора: `rule:<key>`.
 pub const RULE_REF: &str = "rule:";
 /// Не меньше стольких случаев в наборе.

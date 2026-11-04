@@ -12,6 +12,7 @@
 | `corpus/areas.toml` | M6: области заметок (`backend`, `frontend`, `infra`) — заголовок `X-Zam-Area` при загрузке |
 | `insights.toml` | 137 insight: 71 набора M3 (цепочки замещения, отзывы, пары противоречий `certainty`) и 66 M6 (группы буста вида `k01`–`k24`, пары `p15`–`p23`) |
 | `sessions-corpus/` | M6: корпус ТС-2 и 50 идей эталона подсказок-идей (задача 1c); ТС-1 и основной набор его не грузят — см. «Корпус ТС-2» |
+| `idea-hints.toml` | M6: 62 запроса `prompt` к 50 идеям `sessions-corpus/ideas/` — набор эталона подсказок-идей M5.7 (задача 1a2), см. «Эталон подсказок-идей M5.7» |
 | `queries.toml` | 326 запросов: 209 видов M2 (197 M2 и 12 `exact` к заметкам с `index: false`) и 117 M3 (`superseded` 33, `certainty` 14, `chunk` 70); у 13 запросов M2 — `also` |
 | `grid.toml`, `grid-confirm.toml`, `grid-relaxed.toml` | сетка подбора весов `[search]` и порогов чанкинга `[index]` (≤ 12 конфигураций) и две проверки выбора: чанки и `w_fts` 0,1 поверх выбранного веса; отдельный вес ослабленного bm25 против глобального |
 | `grid-overlap.toml` | чувствительность набора к нарезке: перекрытие листов 0/1/2 предложения (M3) |
@@ -594,6 +595,40 @@ Markdown. JSON отчёта хранит ответы целиком.
 (с `--compare`, точек сетки с первой, `--arm`) — рядом с плечом:
 `<префикс плеча>-vs-<база>.{json,md}`; в JSON — `only_base`/`only_arm` и параметры бутстрепа.
 Без нагетов Δ микро-полноты нет (`d_micro: null`), неинфериорность не утверждается.
+
+**Старые базы и связь `contradicts`.** У B4 (`v0.0.5-m4`) типа связи `contradicts` нет (`POST
+/edges` его отвергает; связь — с M4.5): по возможностям сервера (`caps::ServerCaps::contradicts`)
+загрузчик пары не связывает, а пишет в `info.excluded` каждую пару (`contradicts <a>→<b>: …`) и
+каждый сценарий, у которого ожидаемый источник — insight пары (`<id>: …`). Исключённый в любом
+плече сценарий в сравнение не входит ни в одном плече (спецификация M6 §3.3). Прочие различия
+тегов v0.0.5-m4 … v0.0.10-m5.7 для ТС-1 (области `X-Zam-Area`, insight с `area`/`certainty`/
+`force`, `supersede`/`retract`, инструменты MCP `memory_search|read|cache_put`, `DELETE
+/cache/{id}`) — общие, исключений не требуют (пилот задачи 1a2). Точка сетки с отброшенным ключом
+(у неё или у базы) при сравнении пропускается с сообщением, остальные сравнения идут.
+
+## Эталон подсказок-идей M5.7 (M6)
+
+Эквивалентность лёгкого поиска идей (спецификация M6 §16 «Долги M5.7», задачи плана 9 и 16): топ-5
+подсказок-идей к `prompt` у M6 должны совпасть с v0.0.10-m5.7. Набор — `idea-hints.toml`
+(`[[query]] {id, prompt, class = positive|negative, expect, about?, note}`: ≥ 40 запросов, по ≥ 15
+положительных и отрицательных, ≥ 4 длинных (> 30 слов), идеи всех семи состояний корпуса в
+`expect`/`about`; проверяет `--check`), идеи — `sessions-corpus/ideas/ideas.toml`.
+
+```powershell
+cargo xtask eval --idea-hints eval/idea-hints.toml --server-bin target/tags/v0.0.10-m5.7/release/zam-server.exe --out crates/zam-server/tests/fixtures/idea_hints_m57.json
+```
+
+Протокол (записан в эталоне, поле `protocol`): сервер без моделей (FTS — как тест
+`ideas_recall`), `recall.timeout_ms = 60000` (просрочка дала бы «тишину по идеям»); идеи — через
+API в решение набора: `propose`, `decide accept|decline|defer` с `by: human`, задача принятой —
+`PATCH` `dropped` (released) или `done`; `horizon_days = 0` API не принимает (горизонт — не раньше
+завтра), поэтому ставится завтрашний, а после остановки сервера `data.horizon` = сегодня (UTC)
+прямым SQL. На запрос — своя сессия `idea-hints-<id>`: `POST /recall {event: prompt}` повторяется,
+пока приходят новые подсказки-идеи, не больше 5 (при `ideas.prompt_max = 1` это порядок обоих
+проходов). Ссылки `w:<id>` записываются ключами `idea:<key>`. В эталоне — blake3 файлов идей и
+набора (`\r\n` → `\n`): тест `idea_hints_fixture_is_wellformed` (`cargo test -p zam-server --test
+ideas_recall idea_hints_fixture`) падает при правке любого из них — тогда эталон переснимается
+бинарником тега.
 
 ## Результаты
 

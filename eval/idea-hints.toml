@@ -1,0 +1,482 @@
+# Набор эталона подсказок-идей M5.7 (спецификация M6 §16 «Долги M5.7», задача плана 1a2):
+# запросы `prompt` к 50 идеям `eval/sessions-corpus/ideas/ideas.toml`. Эталон
+# `crates/zam-server/tests/fixtures/idea_hints_m57.json` снимается бинарником тега v0.0.10-m5.7
+# (`cargo xtask eval --idea-hints eval/idea-hints.toml --server-bin <…> --out <…>`) и фиксирует
+# поведение лексического правила M5.7 (`IdeaQuery::matches`, `api/recall.rs`): задачи 9 и 16
+# сравнивают с ним топ-5 подсказок-идей после переноса кода и дешёвого поиска. После снятия
+# эталона файл не правится — иначе эталон переснимается (тест сверяет blake3 файла).
+#
+# [[query]]: id (уникальный, `ih-NN`), prompt (текст запроса агента), class:
+#   positive — автор ждёт подсказку (expect — идеи `idea:<key>`, любая из них; не пусто);
+#   negative — автор ждёт тишину (expect = []); about — идеи, на которые запрос похож лексически,
+#     но которые подсказываться не должны (не кандидаты: агент, proposed, declined, accepted с
+#     живой задачей, done, deferred до горизонта) или совпадают только телом / служебным словом.
+# note — зачем запрос в наборе. Ожидания автора справочные: эталон — фактический ответ M5.7.
+#
+# Состав (проверяет `cargo xtask eval --check`): положительные и отрицательные — по ≥ 15; длинные
+# запросы (> 30 слов) ≥ 4; идеи всех семи состояний корпуса — в expect или about.
+
+# ---- положительные: совпадение по основам ----
+
+[[query]]
+id = "ih-01"
+prompt = "нужен экспорт отчёта в PDF"
+class = "positive"
+expect = ["idea:i01"]
+note = "основы «экспорт», «отчет» и короткое слово PDF целиком"
+
+[[query]]
+id = "ih-02"
+prompt = "экспортировать отчеты продавцов"
+class = "positive"
+expect = ["idea:i01"]
+note = "форма «экспортировать» к «экспорт», «отчеты» без «ё»"
+
+[[query]]
+id = "ih-03"
+prompt = "ЭКСПОРТ ОТЧЁТОВ"
+class = "positive"
+expect = ["idea:i01"]
+note = "верхний регистр и «ё»; рядом i03 (отчёт) и i37 (отчётов, снятая задача)"
+
+[[query]]
+id = "ih-04"
+prompt = "сводка возвратов товаров за неделю"
+class = "positive"
+expect = ["idea:i03"]
+note = "заголовок и тело i03"
+
+[[query]]
+id = "ih-05"
+prompt = "send scheduled report emails to sellers"
+class = "positive"
+expect = ["idea:i04"]
+note = "deferred с наступившим горизонтом — кандидат"
+
+[[query]]
+id = "ih-06"
+prompt = "график выручки по дням"
+class = "positive"
+expect = ["idea:i05"]
+note = "в заголовке i05 общий глагол «Добавить», совпадают значимые слова"
+
+[[query]]
+id = "ih-07"
+prompt = "уведомления покупателю о статусе заказа"
+class = "positive"
+expect = ["idea:i06"]
+note = "рядом i08 (центр уведомлений) — порядок двух идей с общей основой"
+
+[[query]]
+id = "ih-08"
+prompt = "единая лента уведомлений продавца"
+class = "positive"
+expect = ["idea:i08"]
+note = "«Сделать» в заголовке i08; «уведомлений» общее с i06"
+
+[[query]]
+id = "ih-09"
+prompt = "поиск по каталогу находит товары с опечатками"
+class = "positive"
+expect = ["idea:i10"]
+note = "основы «поиск», «каталог», «опечат»; рядом i12, i13 (каталог)"
+
+[[query]]
+id = "ih-10"
+prompt = "фильтры по наличию товара на складе"
+class = "positive"
+expect = ["idea:i12"]
+note = "«фильтры», «наличию», «складе»"
+
+[[query]]
+id = "ih-11"
+prompt = "сортировка по цене со скидкой работает неправильно"
+class = "positive"
+expect = ["idea:i13"]
+note = "принятая идея со снятой задачей — второй проход подсказки"
+
+[[query]]
+id = "ih-12"
+prompt = "корзина покупателя на разных устройствах"
+class = "positive"
+expect = ["idea:i15"]
+note = "«корзина», «устройствах»; i33 (корзины) — снятая задача"
+
+[[query]]
+id = "ih-13"
+prompt = "address autocomplete in the checkout form"
+class = "positive"
+expect = ["idea:i16", "idea:i18"]
+note = "«address» — ложный друг стоп-основы add; рядом i18 (addresses)"
+
+[[query]]
+id = "ih-14"
+prompt = "customers want several delivery addresses"
+class = "positive"
+expect = ["idea:i18"]
+note = "множественное число к «addresses»"
+
+[[query]]
+id = "ih-15"
+prompt = "импорт прайс-листов из Excel и XLSX"
+class = "positive"
+expect = ["idea:i20", "idea:i21"]
+note = "дефисное слово «прайс-листов», короткое XLSX; рядом i21 (прайс-листа)"
+
+[[query]]
+id = "ih-16"
+prompt = "шаблон прайс-листа без колонки штрихкода"
+class = "positive"
+expect = ["idea:i21"]
+note = "«Обновить» в заголовке i21; совпадение с телом «штрихкода»"
+
+[[query]]
+id = "ih-17"
+prompt = "bulk price editing for sellers"
+class = "positive"
+expect = ["idea:i22"]
+note = "«bulk», «price» к «prices»"
+
+[[query]]
+id = "ih-18"
+prompt = "менеджер фотографий товаров продавца"
+class = "positive"
+expect = ["idea:i23"]
+note = "«Файловый» — ложный друг стоп-основы файл; «фото» и «фотографий»"
+
+[[query]]
+id = "ih-19"
+prompt = "seller onboarding checklist is outdated"
+class = "positive"
+expect = ["idea:i25"]
+note = "«Update» в заголовке; рядом i50 (checklist)"
+
+[[query]]
+id = "ih-20"
+prompt = "generate changelog for the storefront release"
+class = "positive"
+expect = ["idea:i26"]
+note = "«changelog» — ложный друг стоп-основы chang"
+
+[[query]]
+id = "ih-21"
+prompt = "makefile for the local stand"
+class = "positive"
+expect = ["idea:i27"]
+note = "«makefile» — ложный друг стоп-основы make"
+
+[[query]]
+id = "ih-22"
+prompt = "функциональный стенд для ручного тестирования"
+class = "positive"
+expect = ["idea:i31"]
+note = "«Функциональный», «тестировщиков» — ложные друзья функци/тест"
+
+[[query]]
+id = "ih-23"
+prompt = "нестабильные e2e тесты корзины падают в CI"
+class = "positive"
+expect = ["idea:i33"]
+note = "снятая задача (второй проход); «тесты» ~ «тест»; рядом i15 (корзину)"
+
+[[query]]
+id = "ih-24"
+prompt = "canary releases for the orders service"
+class = "positive"
+expect = ["idea:i34"]
+note = "рядом i32 (release window, declined)"
+
+[[query]]
+id = "ih-25"
+prompt = "кэширование карточек товаров на CDN"
+class = "positive"
+expect = ["idea:i35"]
+note = "рядом i36 (product cache, принята, задача жива — не кандидат)"
+
+[[query]]
+id = "ih-26"
+prompt = "тайм-ауты при выгрузке больших отчётов"
+class = "positive"
+expect = ["idea:i37"]
+note = "снятая задача; рядом i01, i03 (отчёт) — первый проход"
+
+[[query]]
+id = "ih-27"
+prompt = "rate limits for partners by API key"
+class = "positive"
+expect = ["idea:i38"]
+note = "короткое слово API целиком"
+
+[[query]]
+id = "ih-28"
+prompt = "резервные копии фото в другом регионе"
+class = "positive"
+expect = ["idea:i39"]
+note = "«копии», «регионе»"
+
+[[query]]
+id = "ih-29"
+prompt = "баллы лояльности за отзывы покупателей"
+class = "positive"
+expect = ["idea:i41", "idea:i42"]
+note = "две идеи с общей основой «отзыв» — порядок"
+
+[[query]]
+id = "ih-30"
+prompt = "share a wishlist by link"
+class = "positive"
+expect = ["idea:i43"]
+note = "deferred с наступившим горизонтом"
+
+[[query]]
+id = "ih-31"
+prompt = "подписка на снижение цены товара"
+class = "positive"
+expect = ["idea:i46"]
+note = "«Сделать» в заголовке i46"
+
+[[query]]
+id = "ih-32"
+prompt = "keyboard accessibility of the size picker"
+class = "positive"
+expect = ["idea:i48"]
+note = "«Fix» в заголовке i48"
+
+[[query]]
+id = "ih-33"
+prompt = "чат покупателя с продавцом"
+class = "positive"
+expect = ["idea:i47"]
+note = "короткий запрос из трёх значимых слов"
+
+[[query]]
+id = "ih-34"
+prompt = "pdf"
+class = "positive"
+expect = ["idea:i01"]
+note = "одно короткое слово (< 4 символов) — только точное совпадение"
+
+# ---- положительные: длинные запросы ----
+
+[[query]]
+id = "ih-35"
+prompt = "Посмотри, пожалуйста, модуль бухгалтерской выгрузки: продавцы жалуются, что раз в месяц им приходится вручную собирать данные о продажах, а хотелось бы, чтобы кабинет сам делал экспорт отчётов в PDF, который можно сразу отправить в бухгалтерию без правок; заодно проверь, что даты в отчёте идут по часовому поясу продавца."
+class = "positive"
+expect = ["idea:i01"]
+note = "длинный запрос в стиле Claude Code: порог ограничен словами идеи"
+
+[[query]]
+id = "ih-36"
+prompt = "We keep losing customers at the last step: the checkout form asks for the full delivery address every time, there is no address autocomplete for street and house, and returning customers cannot pick one of their saved addresses, so please look at how the checkout page collects the address and what it would take to improve it."
+class = "positive"
+expect = ["idea:i16", "idea:i18"]
+note = "длинный английский запрос, две близкие идеи"
+
+[[query]]
+id = "ih-37"
+prompt = "Разберись с уведомлениями: покупатели пишут в поддержку, что не понимают, на каком этапе их заказ, письма о смене статуса заказа приходят не всегда, а пуши иногда дублируются; нужно понять, что из этого уже есть в коде, и предложить, как сделать уведомления о статусе заказа надёжными."
+class = "positive"
+expect = ["idea:i06", "idea:i08"]
+note = "длинный запрос; рядом i09 (агент, не кандидат)"
+
+[[query]]
+id = "ih-38"
+prompt = "Before the next sale we need the storefront to survive the traffic peak: check the CDN configuration for product cards, see whether anonymous visitors still hit the application servers for every product page, and estimate how much load caching product cards on the CDN would remove from the database during the first hour of the sale."
+class = "positive"
+expect = ["idea:i35"]
+note = "длинный английский запрос к русской идее: лексически почти без общих слов"
+
+# ---- отрицательные: посторонние темы ----
+
+[[query]]
+id = "ih-39"
+prompt = "почему cargo build падает на windows с ошибкой линковки"
+class = "negative"
+expect = []
+note = "посторонняя тема"
+
+[[query]]
+id = "ih-40"
+prompt = "how to configure nginx as a reverse proxy with tls"
+class = "negative"
+expect = []
+note = "посторонняя тема"
+
+[[query]]
+id = "ih-41"
+prompt = "Разбери, почему миграция базы на новой версии Postgres идёт так долго: мы переносим таблицу заказов на секционирование по месяцам, индексы пересоздаются заново, а репликация отстаёт на десятки минут; нужен план, как сократить окно простоя и проверить целостность данных после переноса."
+class = "negative"
+expect = []
+note = "длинный посторонний запрос с общими словами корпуса («заказов»)"
+
+# ---- отрицательные: служебные слова и общие глаголы ----
+
+[[query]]
+id = "ih-42"
+prompt = "и в на с по для от до"
+class = "negative"
+expect = []
+note = "только служебные слова ru"
+
+[[query]]
+id = "ih-43"
+prompt = "the and of to for with by"
+class = "negative"
+expect = []
+note = "только служебные слова en"
+
+[[query]]
+id = "ih-44"
+prompt = "сделай побыстрее"
+class = "negative"
+expect = []
+about = ["idea:i08", "idea:i46"]
+note = "общий глагол «сделать» из заголовков i08, i46"
+
+[[query]]
+id = "ih-45"
+prompt = "добавь тест на модуль авторизации"
+class = "negative"
+expect = []
+about = ["idea:i01", "idea:i29", "idea:i05"]
+note = "пример спецификации (задача 16): к i01 без подсказки; i29 — идея агента"
+
+[[query]]
+id = "ih-46"
+prompt = "fix it and update the docs"
+class = "negative"
+expect = []
+about = ["idea:i48", "idea:i25"]
+note = "общие глаголы «fix», «update» из заголовков i48, i25"
+
+[[query]]
+id = "ih-47"
+prompt = "make the change and add a test"
+class = "negative"
+expect = []
+about = ["idea:i30", "idea:i16", "idea:i32"]
+note = "общие глаголы make, change, add, test"
+
+[[query]]
+id = "ih-48"
+prompt = "исправь файл и обнови функцию"
+class = "negative"
+expect = []
+about = ["idea:i13", "idea:i21", "idea:i23", "idea:i31"]
+note = "«исправь», «обнови», «файл», «функцию» — стоп-основы рядом с ложными друзьями"
+
+[[query]]
+id = "ih-49"
+prompt = "поправь тест модуля"
+class = "negative"
+expect = []
+about = ["idea:i37", "idea:i28", "idea:i31"]
+note = "«поправь» ~ «Поправить» (i37), «модуля» ~ «Модульный» (i28)"
+
+# ---- отрицательные: совпадение только с телом идеи ----
+
+[[query]]
+id = "ih-50"
+prompt = "бухгалтерия просит данные за месяц"
+class = "negative"
+expect = []
+about = ["idea:i01"]
+note = "слова только из тела i01: нужно совпадение с заголовком"
+
+[[query]]
+id = "ih-51"
+prompt = "every Monday morning"
+class = "negative"
+expect = []
+about = ["idea:i04"]
+note = "слова только из тела i04"
+
+# ---- отрицательные: идеи, которые не предлагаются ----
+
+[[query]]
+id = "ih-52"
+prompt = "SMS notifications for delivery slots"
+class = "negative"
+expect = []
+about = ["idea:i07"]
+note = "declined; рядом i09 (агент, notifications)"
+
+[[query]]
+id = "ih-53"
+prompt = "search suggestions while typing"
+class = "negative"
+expect = []
+about = ["idea:i11"]
+note = "done"
+
+[[query]]
+id = "ih-54"
+prompt = "compare products side by side"
+class = "negative"
+expect = []
+about = ["idea:i14"]
+note = "deferred, горизонт через 30 дней"
+
+[[query]]
+id = "ih-55"
+prompt = "оплата заказа частями"
+class = "negative"
+expect = []
+about = ["idea:i17"]
+note = "proposed (вопрос-предложение открыт)"
+
+[[query]]
+id = "ih-56"
+prompt = "промокоды на первый заказ"
+class = "negative"
+expect = []
+about = ["idea:i19"]
+note = "accepted, задача жива"
+
+[[query]]
+id = "ih-57"
+prompt = "тёмная тема кабинета"
+class = "negative"
+expect = []
+about = ["idea:i24"]
+note = "deferred, горизонт через 90 дней"
+
+[[query]]
+id = "ih-58"
+prompt = "fix duplicate push notifications"
+class = "negative"
+expect = []
+about = ["idea:i09"]
+note = "идея агента"
+
+[[query]]
+id = "ih-59"
+prompt = "модульный монолит доставки"
+class = "negative"
+expect = []
+about = ["idea:i28"]
+note = "declined"
+
+[[query]]
+id = "ih-60"
+prompt = "cache docker layers in CI registry"
+class = "negative"
+expect = []
+about = ["idea:i30", "idea:i36"]
+note = "done; рядом i36 (cache, принята, задача жива)"
+
+[[query]]
+id = "ih-61"
+prompt = "экспорт заказов в CSV для партнёров"
+class = "negative"
+expect = []
+about = ["idea:i02", "idea:i01"]
+note = "accepted с живой задачей; «экспорт» совпадает и с заголовком i01 — граница порога"
+
+[[query]]
+id = "ih-62"
+prompt = "status page for customers"
+class = "negative"
+expect = []
+about = ["idea:i40"]
+note = "proposed"

@@ -26,6 +26,9 @@
 //! ([`split`]), статистика §3.5 ([`metrics`]); `--grid` — точки `[[point]]` (только dev), `--arm`
 //! с `--compare` — сравнение сохранённых плеч.
 //!
+//! Эталон подсказок-идей M5.7 (M6, задача 1a2): `--idea-hints eval/idea-hints.toml --out <json>`
+//! — топ-5 подсказок-идей к `prompt` на идеях корпуса ТС-2 ([`hints::ideas`]).
+//!
 //! Eval M4.5 (задача 15): `--glossary` — словарь RU↔EN `eval/glossary.toml`, канал `alias` и
 //! его вес, основной набор со словарём и связями `contradicts` ([`glossary`]).
 
@@ -138,6 +141,14 @@ pub struct EvalArgs {
     /// с --via mcp — замер M6 через MCP (спецификация M6 §3)
     #[arg(long, conflicts_with = "check")]
     pub tokens: bool,
+    /// Эталон подсказок-идей M5.7 (M6, задача 1a2): набор запросов `prompt` (eval/idea-hints.toml)
+    /// к идеям eval/sessions-corpus/ideas; `--out` — файл JSON эталона; поиск — FTS
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["hints", "tokens", "check", "grid", "glossary", "docs", "quality_gate"]
+    )]
+    pub idea_hints: Option<PathBuf>,
     /// Транспорт агента --tokens: mcp — ТС-1 M6 через POST /mcp (без флага — REST M4)
     #[arg(long, value_enum, requires = "tokens")]
     pub via: Option<Via>,
@@ -354,6 +365,9 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     if a.docs {
         return docs::run(&a, &p);
     }
+    if let Some(f) = &a.idea_hints {
+        return hints::ideas::run(&a, &p, f);
+    }
     if a.tokens && a.via == Some(Via::Mcp) {
         return tokens::mcp::main(&a, &p);
     }
@@ -414,6 +428,17 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
                 states.join(", "),
                 ss.stop_verb_ideas,
                 ss.false_friend_ideas
+            );
+            let iq = hints::ideas::load_queries(&p.repo.join("eval").join("idea-hints.toml"))?;
+            let is = hints::ideas::validate_queries(&iq, &sc)?;
+            println!(
+                "набор подсказок-идей M6 (эталон M5.7): запросов {} (положительных {}, \
+                 отрицательных {}, длинных {}), состояний идей {}",
+                is.queries,
+                is.positive,
+                is.negative,
+                is.long,
+                is.states.len()
             );
         }
         println!("EVAL-CHECK OK");

@@ -239,6 +239,10 @@ pub struct Session {
     /// Заметки с областью (M6 §11), которые [`Session::wait_indexed`] проверяет поиском с
     /// `scope.area`: сервер не отдаёт область узла в ответах узлов.
     area_probes: Vec<(Note, String)>,
+    /// Сервер умеет связь `contradicts` (M4.5; у B4 — нет, [`Session::without_contradicts`]).
+    contradicts: bool,
+    /// Пары `contradicts` (ключ insight → ключ цели), не созданные загрузчиком.
+    skipped_edges: Vec<(String, String)>,
 }
 
 /// Сообщение журнала сервера с действующими `[search]` и `[index]`.
@@ -407,7 +411,20 @@ impl Session {
             entry_keys,
             node_paths,
             area_probes: Vec::new(),
+            contradicts: true,
+            skipped_edges: Vec::new(),
         })
+    }
+
+    /// Загрузчик не создаёт связи `contradicts`: у сервера их нет (B4, `v0.0.5-m4`; спецификация
+    /// M6 §3.3 — цель, которую старый сервер не умеет, исключается из всех плеч).
+    pub fn without_contradicts(&mut self) {
+        self.contradicts = false;
+    }
+
+    /// Пары `contradicts` (ключ insight → ключ цели), которые загрузчик не создал.
+    pub fn skipped_edges(&self) -> &[(String, String)] {
+        &self.skipped_edges
     }
 
     pub(super) fn api(&self, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {

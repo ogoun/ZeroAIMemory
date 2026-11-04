@@ -39,7 +39,7 @@ use super::{
     read_elements, reread_items, reread_need, summary_of, validate_scenarios_with,
 };
 use crate::eval::caps;
-use crate::eval::corpus::{Corpus, EVAL_SOLUTION, load_insights};
+use crate::eval::corpus::{Corpus, EVAL_SOLUTION, INSIGHT_REF, load_insights};
 use crate::eval::hints::refs_in_text;
 use crate::eval::mcp_client::McpClient;
 use crate::eval::metrics::{
@@ -332,12 +332,19 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
             errs.join("; ")
         );
     }
+    // исключённые в любом плече (старый сервер не умеет цель) — вне сравнения обоих плеч
+    let excluded: BTreeSet<&str> = base
+        .excluded_ids()
+        .into_iter()
+        .chain(arm.excluded_ids())
+        .collect();
     let by_id: BTreeMap<&str, &McpScenario> =
         base.scenarios.iter().map(|s| (s.id.as_str(), s)).collect();
     let arm_ids: BTreeSet<&str> = arm.scenarios.iter().map(|s| s.id.as_str()).collect();
     let pairs: Vec<(&McpScenario, &McpScenario)> = arm
         .scenarios
         .iter()
+        .filter(|a| !excluded.contains(a.id.as_str()))
         .filter_map(|a| by_id.get(a.id.as_str()).map(|b| (*b, a)))
         .collect();
     let only_base: Vec<String> = by_id
@@ -351,11 +358,6 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
         .map(|s| s.to_string())
         .collect();
     if ai.split == Part::Holdout.as_str() {
-        let excluded: BTreeSet<&str> = base
-            .excluded_ids()
-            .into_iter()
-            .chain(arm.excluded_ids())
-            .collect();
         let stray: Vec<&String> = only_base
             .iter()
             .chain(&only_arm)
@@ -738,6 +740,44 @@ fn run_scenario(
     })
 }
 
+/// Перечень `info.excluded` по парам `contradicts`, которых нет у сервера `server` (B4): каждая
+/// пара (`contradicts <a>→<b>: …`) и сценарий, у которого ожидаемый источник — insight пары
+/// (`<id>: …`): его выдача у старого сервера без связи иная, и в сравнении плеч его нет.
+pub fn excluded_by_edges(
+    scenarios: &[&Scenario],
+    skipped: &[(String, String)],
+    server: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = skipped
+        .iter()
+        .map(|(a, b)| {
+            format!(
+                "contradicts {a}→{b}: связь не создана — у сервера {server} нет contradicts (с \
+                 0.0.6-m4.5)"
+            )
+        })
+        .collect();
+    for sc in scenarios {
+        let pairs: Vec<String> = skipped
+            .iter()
+            .filter(|(a, b)| {
+                [a, b]
+                    .iter()
+                    .any(|k| sc.expect.contains(&format!("{INSIGHT_REF}{k}")))
+            })
+            .map(|(a, b)| format!("{a}→{b}"))
+            .collect();
+        if !pairs.is_empty() {
+            out.push(format!(
+                "{}: ожидаемый источник в паре contradicts {} — у сервера {server} связи нет",
+                sc.id,
+                pairs.join(", ")
+            ));
+        }
+    }
+    out
+}
+
 /// Набор ТС-1: корпус, сценарии, отпечатки (сверенные с замком).
 pub struct Set {
     pub corpus: Corpus,
@@ -1004,7 +1044,14 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             true,
         )?;
         s.check_model()?;
+        if !caps.contradicts {
+            s.without_contradicts();
+        }
         s.load_corpus(&set.corpus)?;
+        let excluded = excluded_by_edges(&chosen, s.skipped_edges(), &caps.tag());
+        if !excluded.is_empty() {
+            println!("исключено (сервер {}): {}", caps.tag(), excluded.join("; "));
+        }
         if model.is_some() {
             s.wait_indexed()?;
         }
@@ -1049,7 +1096,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 corpus_fingerprint: set.corpus_fingerprint.clone(),
                 nuggets_fingerprint: set.nuggets_fingerprint.clone(),
                 frozen: set.frozen,
-                excluded: Vec::new(),
+                excluded,
                 counter: "bge-m3 tokenizer.json".into(),
                 read_budget: READ_BUDGET,
             },
@@ -1072,24 +1119,62 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         println!("  {}\n  {}", j.display(), m.display());
         results.push((point.unwrap_or_else(|| "default".into()), prefix, r));
     }
-    // сетка: каждая точка против первой (точки с отброшенными ключами не сравниваются)
-    if results.len() > 1 {
-        let (base_name, _, base) = &results[0];
-        for (name, prefix, r) in &results[1..] {
-            if !r.info.overrides_dropped.is_empty() || !base.info.overrides_dropped.is_empty() {
-                println!("точка {name}: не сравнивается — сервер не знает части ключей");
-                continue;
-            }
-            compare_and_write(base, r, (base_name, name), prefix)?;
-        }
-    }
-    for b in &a.compare {
-        let base = read_result(b)?;
-        for (name, prefix, r) in &results {
-            compare_and_write(&base, r, (&file_name(b), name), prefix)?;
-        }
+    let bases = a
+        .compare
+        .iter()
+        .map(|b| Ok((file_name(b), read_result(b)?)))
+        .collect::<Result<Vec<_>>>()?;
+    for m in compare_all(&results, &bases)? {
+        println!("{m}");
     }
     Ok(())
+}
+
+/// Плечо с отброшенными ключами у себя или у базы к сравнению не допускается: причина пропуска.
+fn skip_reason(base: &McpResult, arm: &McpResult) -> Option<String> {
+    let dropped: Vec<&str> = arm
+        .info
+        .overrides_dropped
+        .iter()
+        .chain(&base.info.overrides_dropped)
+        .map(String::as_str)
+        .collect();
+    (!dropped.is_empty()).then(|| {
+        format!(
+            "не сравнивается — сервер не знает части ключей ({})",
+            dropped.join(", ")
+        )
+    })
+}
+
+/// Сравнения прогона: точки сетки против первой и каждая точка против баз `--compare`. Точка с
+/// отброшенным ключом (у неё или у базы) пропускается с сообщением, цикл не обрывается;
+/// сообщения о пропусках — в ответе.
+fn compare_all(
+    results: &[(String, PathBuf, McpResult)],
+    bases: &[(String, McpResult)],
+) -> Result<Vec<String>> {
+    let mut skipped = Vec::new();
+    let mut one = |base: &McpResult, bname: &str, name: &str, prefix: &Path, r: &McpResult| {
+        match skip_reason(base, r) {
+            Some(why) => {
+                skipped.push(format!("точка {name} против {bname}: {why}"));
+                Ok(())
+            }
+            None => compare_and_write(base, r, (bname, name), prefix),
+        }
+    };
+    if let Some((base_name, _, base)) = results.first() {
+        for (name, prefix, r) in &results[1..] {
+            one(base, base_name, name, prefix, r)?;
+        }
+    }
+    for (bname, base) in bases {
+        for (name, prefix, r) in results {
+            one(base, bname, name, prefix, r)?;
+        }
+    }
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -1225,6 +1310,90 @@ mod tests {
         m6.info.excluded = vec!["x: вид idea не создаётся в B4".into()];
         let c = compare(&base, &m6, ("b", "m")).unwrap();
         assert_eq!(c.only_base, ["x"]);
+    }
+
+    /// Сценарий, исключённый в одном плече (B4 без `contradicts`), не входит в пары обоих.
+    #[test]
+    fn excluded_scenarios_leave_both_arms() {
+        let mut b4 = arm(
+            "c",
+            vec![
+                scen("a", 1, path(10, 1, true)),
+                scen("s-19", 1, path(100, 0, false)),
+            ],
+        );
+        b4.info.excluded = vec![
+            "contradicts p09-h→p09-t: связь не создана".into(),
+            "s-19: ожидаемый источник в паре contradicts".into(),
+        ];
+        let m6 = arm(
+            "c",
+            vec![
+                scen("a", 1, path(8, 1, true)),
+                scen("s-19", 1, path(5, 1, true)),
+            ],
+        );
+        let c = compare(&b4, &m6, ("b4", "m6")).unwrap();
+        assert_eq!((c.scenarios, c.base_tokens, c.arm_tokens), (1, 10, 8));
+        assert_eq!(c.net_losses, 0);
+    }
+
+    /// Пары `contradicts`, которых нет у сервера, и сценарии с insight пары — в `info.excluded`.
+    #[test]
+    fn excluded_by_missing_contradicts_edges() {
+        let sc = |id: &str, expect: &[&str]| Scenario {
+            id: id.into(),
+            kind: None,
+            question: "?".into(),
+            expect: expect.iter().map(|s| s.to_string()).collect(),
+            nuggets: Vec::new(),
+        };
+        let (s19, s20, s1) = (
+            sc("s-19", &["insight:p09-t"]),
+            sc("s-20", &["insight:p12-a", "insight:p02-t"]),
+            sc("s-01", &["ru/windows/crlf-bash-scripts"]),
+        );
+        let skipped = vec![
+            ("p09-h".to_string(), "p09-t".to_string()),
+            ("p02-h".to_string(), "p02-t".to_string()),
+        ];
+        let ex = excluded_by_edges(&[&s19, &s20, &s1], &skipped, "0.0.5-m4");
+        assert_eq!(ex.len(), 4, "{ex:?}");
+        assert!(ex[0].starts_with("contradicts p09-h→p09-t:"), "{ex:?}");
+        assert!(ex[2].starts_with("s-19: ") && ex[2].contains("p09-h→p09-t"));
+        assert!(ex[3].starts_with("s-20: ") && ex[3].contains("p02-h→p02-t"));
+        assert!(excluded_by_edges(&[&s19], &[], "0.0.10-m5.7").is_empty());
+    }
+
+    /// Точка сетки с отброшенным ключом пропускается с сообщением, остальные сравниваются, в том
+    /// числе с базами `--compare` после неё (цикл не обрывается).
+    #[test]
+    fn compare_all_skips_points_with_dropped_keys() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("target")
+            .join("unit-tmp")
+            .join("compare-all");
+        let _ = fs::remove_dir_all(&dir);
+        let sc = || vec![scen("a", 1, path(10, 1, true))];
+        let mut bad = arm("c", sc());
+        bad.info.overrides_dropped = vec!["ZAM_SEARCH__BUDGET_TOKENS".into()];
+        let results = vec![
+            ("p0".to_string(), dir.join("p0"), arm("c", sc())),
+            ("p1".to_string(), dir.join("p1"), bad),
+            ("p2".to_string(), dir.join("p2"), arm("c", sc())),
+        ];
+        let bases = vec![("b4".to_string(), arm("c", sc()))];
+        let skipped = compare_all(&results, &bases).unwrap();
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(
+            skipped.iter().all(|m| m.starts_with("точка p1 против")),
+            "{skipped:?}"
+        );
+        for f in ["p2-vs-p0.json", "p0-vs-b4.json", "p2-vs-b4.json"] {
+            assert!(dir.join(f).is_file(), "{f}");
+        }
+        assert!(!dir.join("p1-vs-p0.json").exists() && !dir.join("p1-vs-b4.json").exists());
     }
 
     /// Дочитывание нужно только ожидаемому источнику с невыданным нагетом.

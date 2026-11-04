@@ -1,0 +1,406 @@
+{
+  "server_version": "0.0.10-m5.7",
+  "server_git": "91363056d3ba",
+  "date": "2026-11-05",
+  "ideas_blake3": "196ba783b6c8f633eb1601e4beb419c9b2b50cd0441bd7e92633f2b5f7b19477",
+  "queries_blake3": "31f0cf5f39e0a4bcc2237de57fe62310a6bde5805170ef059d974f297a8879ff",
+  "protocol": "FTS без моделей; решение 5e7a1e00-2026-4e3a-9a11-000000000e01; идеи — через API (by: human), horizon_days = 0 — SQL data.horizon = сегодня UTC; на запрос — своя сессия X-Zam-Session idea-hints-<id>, POST /recall {event: prompt} повторяется, пока приходят новые подсказки-идеи (items[].reason = idea), не больше 5; w:<id> → idea:<key>",
+  "config": {
+    "recall.timeout_ms": "60000"
+  },
+  "rows": [
+    {
+      "id": "ih-01",
+      "query": "нужен экспорт отчёта в PDF",
+      "ideas": [
+        "idea:i01"
+      ]
+    },
+    {
+      "id": "ih-02",
+      "query": "экспортировать отчеты продавцов",
+      "ideas": []
+    },
+    {
+      "id": "ih-03",
+      "query": "ЭКСПОРТ ОТЧЁТОВ",
+      "ideas": [
+        "idea:i01"
+      ]
+    },
+    {
+      "id": "ih-04",
+      "query": "сводка возвратов товаров за неделю",
+      "ideas": [
+        "idea:i03"
+      ]
+    },
+    {
+      "id": "ih-05",
+      "query": "send scheduled report emails to sellers",
+      "ideas": [
+        "idea:i04"
+      ]
+    },
+    {
+      "id": "ih-06",
+      "query": "график выручки по дням",
+      "ideas": [
+        "idea:i05"
+      ]
+    },
+    {
+      "id": "ih-07",
+      "query": "уведомления покупателю о статусе заказа",
+      "ideas": [
+        "idea:i06",
+        "idea:i08"
+      ]
+    },
+    {
+      "id": "ih-08",
+      "query": "единая лента уведомлений продавца",
+      "ideas": [
+        "idea:i08"
+      ]
+    },
+    {
+      "id": "ih-09",
+      "query": "поиск по каталогу находит товары с опечатками",
+      "ideas": [
+        "idea:i10",
+        "idea:i12",
+        "idea:i23"
+      ]
+    },
+    {
+      "id": "ih-10",
+      "query": "фильтры по наличию товара на складе",
+      "ideas": [
+        "idea:i12"
+      ]
+    },
+    {
+      "id": "ih-11",
+      "query": "сортировка по цене со скидкой работает неправильно",
+      "ideas": [
+        "idea:i13"
+      ]
+    },
+    {
+      "id": "ih-12",
+      "query": "корзина покупателя на разных устройствах",
+      "ideas": [
+        "idea:i15"
+      ]
+    },
+    {
+      "id": "ih-13",
+      "query": "address autocomplete in the checkout form",
+      "ideas": [
+        "idea:i16",
+        "idea:i18",
+        "idea:i25"
+      ]
+    },
+    {
+      "id": "ih-14",
+      "query": "customers want several delivery addresses",
+      "ideas": [
+        "idea:i18",
+        "idea:i16"
+      ]
+    },
+    {
+      "id": "ih-15",
+      "query": "импорт прайс-листов из Excel и XLSX",
+      "ideas": [
+        "idea:i20"
+      ]
+    },
+    {
+      "id": "ih-16",
+      "query": "шаблон прайс-листа без колонки штрихкода",
+      "ideas": [
+        "idea:i21"
+      ]
+    },
+    {
+      "id": "ih-17",
+      "query": "bulk price editing for sellers",
+      "ideas": [
+        "idea:i22"
+      ]
+    },
+    {
+      "id": "ih-18",
+      "query": "менеджер фотографий товаров продавца",
+      "ideas": [
+        "idea:i23",
+        "idea:i03"
+      ]
+    },
+    {
+      "id": "ih-19",
+      "query": "seller onboarding checklist is outdated",
+      "ideas": [
+        "idea:i25"
+      ]
+    },
+    {
+      "id": "ih-20",
+      "query": "generate changelog for the storefront release",
+      "ideas": [
+        "idea:i26"
+      ]
+    },
+    {
+      "id": "ih-21",
+      "query": "makefile for the local stand",
+      "ideas": [
+        "idea:i27"
+      ]
+    },
+    {
+      "id": "ih-22",
+      "query": "функциональный стенд для ручного тестирования",
+      "ideas": [
+        "idea:i31"
+      ]
+    },
+    {
+      "id": "ih-23",
+      "query": "нестабильные e2e тесты корзины падают в CI",
+      "ideas": [
+        "idea:i33"
+      ]
+    },
+    {
+      "id": "ih-24",
+      "query": "canary releases for the orders service",
+      "ideas": [
+        "idea:i34"
+      ]
+    },
+    {
+      "id": "ih-25",
+      "query": "кэширование карточек товаров на CDN",
+      "ideas": [
+        "idea:i35"
+      ]
+    },
+    {
+      "id": "ih-26",
+      "query": "тайм-ауты при выгрузке больших отчётов",
+      "ideas": [
+        "idea:i01",
+        "idea:i37"
+      ]
+    },
+    {
+      "id": "ih-27",
+      "query": "rate limits for partners by API key",
+      "ideas": [
+        "idea:i38"
+      ]
+    },
+    {
+      "id": "ih-28",
+      "query": "резервные копии фото в другом регионе",
+      "ideas": [
+        "idea:i39"
+      ]
+    },
+    {
+      "id": "ih-29",
+      "query": "баллы лояльности за отзывы покупателей",
+      "ideas": [
+        "idea:i41",
+        "idea:i42"
+      ]
+    },
+    {
+      "id": "ih-30",
+      "query": "share a wishlist by link",
+      "ideas": [
+        "idea:i43"
+      ]
+    },
+    {
+      "id": "ih-31",
+      "query": "подписка на снижение цены товара",
+      "ideas": [
+        "idea:i46"
+      ]
+    },
+    {
+      "id": "ih-32",
+      "query": "keyboard accessibility of the size picker",
+      "ideas": [
+        "idea:i48"
+      ]
+    },
+    {
+      "id": "ih-33",
+      "query": "чат покупателя с продавцом",
+      "ideas": [
+        "idea:i47"
+      ]
+    },
+    {
+      "id": "ih-34",
+      "query": "pdf",
+      "ideas": [
+        "idea:i01"
+      ]
+    },
+    {
+      "id": "ih-35",
+      "query": "Посмотри, пожалуйста, модуль бухгалтерской выгрузки: продавцы жалуются, что раз в месяц им приходится вручную собирать данные о продажах, а хотелось бы, чтобы кабинет сам делал экспорт отчётов в PDF, который можно сразу отправить в бухгалтерию без правок; заодно проверь, что даты в отчёте идут по часовому поясу продавца.",
+      "ideas": [
+        "idea:i01",
+        "idea:i08"
+      ]
+    },
+    {
+      "id": "ih-36",
+      "query": "We keep losing customers at the last step: the checkout form asks for the full delivery address every time, there is no address autocomplete for street and house, and returning customers cannot pick one of their saved addresses, so please look at how the checkout page collects the address and what it would take to improve it.",
+      "ideas": [
+        "idea:i16",
+        "idea:i18"
+      ]
+    },
+    {
+      "id": "ih-37",
+      "query": "Разберись с уведомлениями: покупатели пишут в поддержку, что не понимают, на каком этапе их заказ, письма о смене статуса заказа приходят не всегда, а пуши иногда дублируются; нужно понять, что из этого уже есть в коде, и предложить, как сделать уведомления о статусе заказа надёжными.",
+      "ideas": [
+        "idea:i06"
+      ]
+    },
+    {
+      "id": "ih-38",
+      "query": "Before the next sale we need the storefront to survive the traffic peak: check the CDN configuration for product cards, see whether anonymous visitors still hit the application servers for every product page, and estimate how much load caching product cards on the CDN would remove from the database during the first hour of the sale.",
+      "ideas": []
+    },
+    {
+      "id": "ih-39",
+      "query": "почему cargo build падает на windows с ошибкой линковки",
+      "ideas": []
+    },
+    {
+      "id": "ih-40",
+      "query": "how to configure nginx as a reverse proxy with tls",
+      "ideas": []
+    },
+    {
+      "id": "ih-41",
+      "query": "Разбери, почему миграция базы на новой версии Postgres идёт так долго: мы переносим таблицу заказов на секционирование по месяцам, индексы пересоздаются заново, а репликация отстаёт на десятки минут; нужен план, как сократить окно простоя и проверить целостность данных после переноса.",
+      "ideas": []
+    },
+    {
+      "id": "ih-42",
+      "query": "и в на с по для от до",
+      "ideas": []
+    },
+    {
+      "id": "ih-43",
+      "query": "the and of to for with by",
+      "ideas": []
+    },
+    {
+      "id": "ih-44",
+      "query": "сделай побыстрее",
+      "ideas": []
+    },
+    {
+      "id": "ih-45",
+      "query": "добавь тест на модуль авторизации",
+      "ideas": []
+    },
+    {
+      "id": "ih-46",
+      "query": "fix it and update the docs",
+      "ideas": []
+    },
+    {
+      "id": "ih-47",
+      "query": "make the change and add a test",
+      "ideas": []
+    },
+    {
+      "id": "ih-48",
+      "query": "исправь файл и обнови функцию",
+      "ideas": []
+    },
+    {
+      "id": "ih-49",
+      "query": "поправь тест модуля",
+      "ideas": []
+    },
+    {
+      "id": "ih-50",
+      "query": "бухгалтерия просит данные за месяц",
+      "ideas": []
+    },
+    {
+      "id": "ih-51",
+      "query": "every Monday morning",
+      "ideas": []
+    },
+    {
+      "id": "ih-52",
+      "query": "SMS notifications for delivery slots",
+      "ideas": []
+    },
+    {
+      "id": "ih-53",
+      "query": "search suggestions while typing",
+      "ideas": []
+    },
+    {
+      "id": "ih-54",
+      "query": "compare products side by side",
+      "ideas": []
+    },
+    {
+      "id": "ih-55",
+      "query": "оплата заказа частями",
+      "ideas": []
+    },
+    {
+      "id": "ih-56",
+      "query": "промокоды на первый заказ",
+      "ideas": []
+    },
+    {
+      "id": "ih-57",
+      "query": "тёмная тема кабинета",
+      "ideas": []
+    },
+    {
+      "id": "ih-58",
+      "query": "fix duplicate push notifications",
+      "ideas": []
+    },
+    {
+      "id": "ih-59",
+      "query": "модульный монолит доставки",
+      "ideas": []
+    },
+    {
+      "id": "ih-60",
+      "query": "cache docker layers in CI registry",
+      "ideas": []
+    },
+    {
+      "id": "ih-61",
+      "query": "экспорт заказов в CSV для партнёров",
+      "ideas": []
+    },
+    {
+      "id": "ih-62",
+      "query": "status page for customers",
+      "ideas": []
+    }
+  ]
+}

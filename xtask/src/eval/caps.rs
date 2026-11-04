@@ -100,6 +100,9 @@ pub struct ServerCaps {
     pub focus: bool,
     /// Вид `idea` и подсказки идей (M5.7).
     pub ideas: bool,
+    /// Связь `contradicts` (`POST /edges`, M4.5): у B4 её нет — пары корпуса не связываются,
+    /// затронутые сценарии исключаются (`info.excluded`).
+    pub contradicts: bool,
     /// Снимок сессии (M6 §8а, `features`: `snapshot`).
     pub snapshot: bool,
     pub keys: BTreeSet<&'static str>,
@@ -263,6 +266,7 @@ pub fn caps_from(health: &Value) -> Result<ServerCaps> {
         .collect();
     Ok(ServerCaps {
         ideas: m6 || ver.triple() >= (0, 0, 10),
+        contradicts: m6 || ver.triple() >= (0, 0, 6),
         focus: has("focus"),
         snapshot: has("snapshot"),
         version: ver,
@@ -392,6 +396,10 @@ mod tests {
         assert!(m57.ideas && !m57.m6 && !m57.focus && !m57.snapshot);
         let m4 = caps_from(&health("0.0.5-m4", "56f1873c18b9", None)).unwrap();
         assert!(!m4.ideas && m4.keys.contains("search.w_fts"));
+        // связь `contradicts` — с M4.5 (у B4 её нет: POST /edges отвергает тип)
+        assert!(!m4.contradicts && m57.contradicts);
+        let m45 = caps_from(&health("0.0.6-m4.5", "6dee9f90ad8a", None)).unwrap();
+        assert!(m45.contradicts && !m45.ideas);
         for git in ["unknown", "535910eba54f", ""] {
             let e = caps_from(&health("0.0.10-m5.7", git, None))
                 .unwrap_err()
@@ -406,7 +414,7 @@ mod tests {
         assert!(caps_from(&health("0.0.11-m6", "x", None)).is_err());
         // сборка M6: git любой, ключи M6 — по возможностям сборки
         let m6 = caps_from(&health("0.0.10-m5.7", "unknown", Some(&["m6"]))).unwrap();
-        assert!(m6.m6 && m6.ideas && !m6.focus && !m6.snapshot);
+        assert!(m6.m6 && m6.ideas && m6.contradicts && !m6.focus && !m6.snapshot);
         assert!(m6.keys.contains("ideas.proactive") && !m6.keys.contains("search.budget_tokens"));
         let full = caps_from(&health(
             "0.0.10-m5.7",

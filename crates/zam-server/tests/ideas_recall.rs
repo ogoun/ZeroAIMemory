@@ -1214,3 +1214,93 @@ async fn ro_token_gets_no_ideas() {
     let j = prompt(&a, "rw-1", "экспорт отчётов в PDF").await;
     assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
 }
+
+// ---- эталон подсказок-идей M5.7 (M6, задача 1a2) ----
+
+/// Корень репозитория (набор `eval/` и фикстуры эталона).
+fn repo() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// blake3 файла по правилу отпечатков M6 (xtask `hints::ideas::file_blake3`): `\r\n` → `\n`.
+fn file_blake3(p: &std::path::Path) -> String {
+    let b = std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let mut out = Vec::with_capacity(b.len());
+    for (i, c) in b.iter().enumerate() {
+        if *c == b'\r' && b.get(i + 1) == Some(&b'\n') {
+            continue;
+        }
+        out.push(*c);
+    }
+    blake3::hash(&out).to_hex().to_string()
+}
+
+/// Эталон `tests/fixtures/idea_hints_m57.json` снят бинарником тега v0.0.10-m5.7 (`cargo xtask
+/// eval --idea-hints eval/idea-hints.toml`) на текущих наборе и идеях: blake3 обоих файлов
+/// совпадают (правка после снятия — переснять эталон), строки — запросы набора по порядку,
+/// подсказки — до 5 разных идей корпуса. Сравнение ответа M6 с эталоном — задачи 9 и 16.
+#[test]
+fn idea_hints_fixture_is_wellformed() {
+    let root = repo();
+    let ideas_path = root.join("eval/sessions-corpus/ideas/ideas.toml");
+    let queries_path = root.join("eval/idea-hints.toml");
+    let fx: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/idea_hints_m57.json"),
+        )
+        .expect("эталон tests/fixtures/idea_hints_m57.json"),
+    )
+    .expect("эталон — JSON");
+    assert_eq!(fx["server_version"], "0.0.10-m5.7", "эталон — с тега M5.7");
+    assert_eq!(fx["server_git"], "91363056d3ba");
+    assert_eq!(
+        fx["ideas_blake3"].as_str().unwrap(),
+        file_blake3(&ideas_path),
+        "ideas.toml изменён после снятия эталона"
+    );
+    assert_eq!(
+        fx["queries_blake3"].as_str().unwrap(),
+        file_blake3(&queries_path),
+        "idea-hints.toml изменён после снятия эталона"
+    );
+    let ideas: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&ideas_path).unwrap()).unwrap();
+    let keys: std::collections::BTreeSet<String> = ideas["idea"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| format!("idea:{}", i["key"].as_str().unwrap()))
+        .collect();
+    assert_eq!(keys.len(), 50);
+    let set: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&queries_path).unwrap()).unwrap();
+    let queries = set["query"].as_array().unwrap();
+    let rows = fx["rows"].as_array().unwrap();
+    assert!(queries.len() >= 40, "запросов {}", queries.len());
+    assert_eq!(rows.len(), queries.len(), "строк эталона ≠ запросов набора");
+    let mut with_hints = 0;
+    for (q, r) in queries.iter().zip(rows) {
+        assert_eq!(r["id"].as_str(), q["id"].as_str(), "{r}");
+        assert_eq!(r["query"].as_str(), q["prompt"].as_str(), "{r}");
+        let got: Vec<&str> = r["ideas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(got.len() <= 5, "{r}");
+        let uniq: std::collections::BTreeSet<&&str> = got.iter().collect();
+        assert_eq!(uniq.len(), got.len(), "повтор в строке: {r}");
+        assert!(
+            got.iter().all(|k| keys.contains(*k)),
+            "не идея корпуса: {r}"
+        );
+        with_hints += usize::from(!got.is_empty());
+    }
+    // эталон содержателен: есть и подсказки, и тишина
+    assert!(
+        with_hints > 0 && with_hints < rows.len(),
+        "с подсказками {with_hints}"
+    );
+}
