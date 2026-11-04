@@ -1025,7 +1025,7 @@ fn idea_lexically_matched(item: &Value, e: &Entry, terms: &[String]) -> bool {
         .into_iter()
         .flatten()
         .any(|s| matches!(s.as_str(), Some("fts" | "alias" | "trigram")));
-    lexical && idea_words_match(terms, &format!("{}\n{}", e.title, e.body))
+    lexical && idea_words_match(terms, &e.title, &e.body)
 }
 
 /// Значимых слов идеи в пороге [`idea_words_match`], не больше: длинное тело не делает порог
@@ -1038,6 +1038,21 @@ const STEM_MIN_CHARS: usize = 4;
 /// Слово для сравнения основ: нижний регистр, `ё` → `е`.
 fn idea_norm_word(w: &str) -> String {
     w.to_lowercase().replace('ё', "е")
+}
+
+/// Значимые слова текста для подтверждения идей: [`error_terms`] без служебных слов ru/en
+/// (общий стоп-список [`zam_markdown::is_stop_word`]), нормализованные [`idea_norm_word`], без
+/// повторов (после `ё` → `е` повторы могут быть не соседними).
+fn idea_terms(terms: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = terms
+        .iter()
+        .filter(|t| !zam_markdown::is_stop_word(&t.to_lowercase()))
+        .map(|t| idea_norm_word(t))
+        .filter(|t| !zam_markdown::is_stop_word(t))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Основа слова: первые `max(4, длина − 3)` символов — срез типичных русских и английских
@@ -1064,22 +1079,28 @@ fn idea_stem_match(a: &str, b: &str) -> bool {
     b.starts_with(&idea_stem(a)) || a.starts_with(&idea_stem(b))
 }
 
-/// Слова запроса `terms` ([`error_terms`]) подтверждаются словами идеи `text` (финальное
-/// ревью M5.7, I-1′): покрыты все слова запроса — да; иначе нужно не меньше
-/// `min(порог покрытия запроса, max(1, ⌈k / 2⌉))` совпавших по основе, где `k` — значимые слова
-/// идеи (до [`IDEA_WORDS_CAP`]). Порог ограничен словами самой идеи: к длинному запросу Claude
-/// Code короткая идея иначе не подходила бы никогда. Только для подсказок-идей; общий
+/// Слова запроса `terms` ([`error_terms`]) подтверждаются заголовком `title` и телом `body`
+/// идеи (финальное ревью M5.7, I-1′ и I-1″). Служебные слова не считаются ни в запросе, ни в
+/// идее ([`idea_terms`]). Нужно хотя бы одно совпадение по основе со словом **заголовка**:
+/// совпадения только с телом («пользователь», «server») связи с замыслом не доказывают. Далее:
+/// покрыты все слова запроса — да; иначе нужно не меньше
+/// `min(порог покрытия запроса, max(1, ⌈k / 2⌉))` совпавших, где `k` — значимые слова идеи (до
+/// [`IDEA_WORDS_CAP`]). Порог ограничен словами самой идеи: к длинному запросу Claude Code
+/// короткая идея иначе не подходила бы никогда. Только для подсказок-идей; общий
 /// [`term_coverage`] у `post_tool` прежний.
-fn idea_words_match(terms: &[String], text: &str) -> bool {
-    let mut q: Vec<String> = terms.iter().map(|t| idea_norm_word(t)).collect();
-    q.dedup();
+fn idea_words_match(terms: &[String], title: &str, body: &str) -> bool {
+    let q = idea_terms(terms);
     if q.is_empty() {
         return false;
     }
-    let words: Vec<String> = error_terms(text)
+    let title_words = idea_terms(&error_terms(title));
+    if !q
         .iter()
-        .map(|w| idea_norm_word(w))
-        .collect();
+        .any(|t| title_words.iter().any(|w| idea_stem_match(t, w)))
+    {
+        return false;
+    }
+    let words = idea_terms(&error_terms(&format!("{title}\n{body}")));
     let covered = q
         .iter()
         .filter(|t| words.iter().any(|w| idea_stem_match(t, w)))
@@ -1271,7 +1292,7 @@ async fn released_prompt_ideas(
                 }
             };
             // строгий FTS (все слова запроса) проходит сразу; ослабленный — по основам слов
-            if ch.relaxed && !idea_words_match(&terms, &format!("{}\n{}", e.title, e.body)) {
+            if ch.relaxed && !idea_words_match(&terms, &e.title, &e.body) {
                 continue;
             }
             let shared = t
@@ -3375,19 +3396,46 @@ mod tests {
     /// Порог подтверждения ограничен словами идеи: длинный запрос к короткой идее подходит.
     #[test]
     fn idea_words_match_long_queries() {
-        let idea = "Экспорт отчётов в PDF
-Замысел.";
-        let ok = |q: &str| idea_words_match(&error_terms(q), idea);
+        let ok = |q: &str| idea_words_match(&error_terms(q), "Экспорт отчётов в PDF", "Замысел.");
         assert!(ok("экспортировать отчёты в pdf"));
         assert!(ok(
-            "Пользователи просят, чтобы отчёты можно было скачать в PDF; посмотри модуль reports              и предложи план, с чего начать"
+            "Пользователи просят, чтобы отчёты можно было скачать в PDF; посмотри модуль reports и предложи план, с чего начать"
         ));
         assert!(ok("как сделать экспорт отчётов в PDF"));
         assert!(!ok("настрой логирование сервера"));
         assert!(!ok(
-            "Почини падающий тест миграции базы данных и обнови документацию по развёртыванию              на стенде"
+            "Почини падающий тест миграции базы данных и обнови документацию по развёртыванию на стенде"
         ));
-        assert!(!idea_words_match(&[], idea));
+        assert!(!ok(""));
+        // ложные срабатывания по служебным словам и словам тела (I-1″)
+        let body = "Нужно, чтобы пользователь мог скачать отчёт. Это удобно для клиентов.";
+        assert!(!idea_words_match(
+            &error_terms("Нужно поправить авторизацию, чтобы пользователь не вылетал при входе"),
+            "Экспорт отчётов в PDF",
+            body
+        ));
+        // с тем же телом связанные запросы проходят (совпадение с заголовком)
+        assert!(idea_words_match(
+            &error_terms("экспортировать отчёты в pdf"),
+            "Экспорт отчётов в PDF",
+            body
+        ));
+        assert!(!idea_words_match(
+            &error_terms("fix the server crash when this config is missing from the web request"),
+            "Dark theme for the web interface",
+            "This would make the server UI nicer."
+        ));
+        assert!(idea_words_match(
+            &error_terms("add a dark theme to the web interface"),
+            "Dark theme for the web interface",
+            "This would make the server UI nicer."
+        ));
+        // служебные слова не считаются
+        assert!(zam_markdown::is_stop_word("чтобы") && zam_markdown::is_stop_word("the"));
+        assert_eq!(
+            idea_terms(&error_terms("Ещё еще отчёты отчеты для")),
+            ["отчеты"]
+        );
     }
 
     fn cand(title: &str) -> Cand {

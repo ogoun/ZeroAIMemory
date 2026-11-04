@@ -618,10 +618,12 @@ async fn prompt_insight_hints_unchanged_with_ideas() {
 }
 
 /// Отдельный поиск идей не уложился в срок — идей нет, основные подсказки есть, без
-/// предупреждения о тайм-ауте (тестовая метка в заголовке идеи, фича `test-hooks`).
+/// предупреждения о тайм-ауте (тестовая метка в заголовке идеи, фича `test-hooks`). Срок 8 с:
+/// под параллельной нагрузкой набора (модели ML соседних тестов) основной поиск отладочной
+/// сборки на HDD сам доходил до 3–4 с — `recall timeout` ставил он, а не идеи.
 #[tokio::test]
 async fn prompt_ideas_timeout_silent() {
-    let a = api("ideas-recall-timeout", |c| c.recall.timeout_ms = 3000).await;
+    let a = api("ideas-recall-timeout", |c| c.recall.timeout_ms = 8000).await;
     register(&a, &a.token).await;
     let r = a
         .t(
