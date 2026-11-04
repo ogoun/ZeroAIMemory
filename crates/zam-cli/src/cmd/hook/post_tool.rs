@@ -14,17 +14,24 @@
 //! **Успех** (M4.5 §6.3, §9.1; `PostToolUse` без ошибки; без сети, бюджет 50 мс):
 //! - `Read` — `Ev::Read` и знание о файле по `file-refs.json` ([`file_context_lines`], ключ
 //!   `file_context`): до 3 записей, раз за сессию на файл (`shown-<сессия>.json`, ключ
-//!   `file:<путь>`), ссылка `stale` — «возможно устарело»;
+//!   `file:<путь>`), ссылка `stale` — «возможно устарело», ссылка на символ называет его
+//!   ([`file_hint`], M5.6 §8);
 //! - `Write|Edit|MultiEdit|NotebookEdit|apply_patch` — `Ev::Edit` по каждому пути и строка
 //!   `{path, hash}` в очередь `changed-<сессия>.jsonl` (при решении; файл больше
 //!   [`HASH_MAX`] не хэшируется — его поймает `zam refs check`, удалённый — хэш
-//!   [`MISSING_HASH`]);
+//!   [`MISSING_HASH`]). M5.6 §8: у пути в `file-refs.json` есть ссылка на символ, файл кода не
+//!   больше [`SYMBOLS_MAX_BYTES`] — он разбирается (`zam_code::symbol_hashes`, без запроса
+//!   ссылок) и в строку идут хэши тел **всех** его символов (решение составителя плана 5: кэш
+//!   ссылок может отставать); отсечка — [`SYMBOLS_PARSE_MS`] на все файлы хука; не успел,
+//!   разбор неполный или файл больше — строка без `symbols` (сервер судит по хэшу файла);
 //! - `Bash` — `Ev::Cmd {exe, ok: true}` (первое слово команды);
 //! - MCP [`MCP_MEMORY_LOG`] — `Ev::MemoryWrite {kind}` из `tool_input.kind` (§9.3: запись
 //!   insight через MCP гасит напоминание о паре «ошибка → исправление»).
 //!
 //! Путь — относительно корня проекта по правилам ссылок ([`crate::cmd::refs::ref_path`]);
 //! файл вне корня в журнал и очередь не попадает.
+use std::time::{Duration, Instant};
+
 use regex::RegexBuilder;
 use serde_json::{Value, json};
 
@@ -39,6 +46,10 @@ use crate::cmd::refs::{self, MISSING_HASH};
 
 /// Предел файла, который `post-tool` хэширует в бюджете 50 мс, байт.
 pub const HASH_MAX: u64 = 8 * 1024 * 1024;
+/// Предел файла, который `post-tool` разбирает на символы (M5.6 §10), байт.
+pub const SYMBOLS_MAX_BYTES: u64 = 512 * 1024;
+/// Отсечка разбора символов правленых файлов — на все файлы одного хука, мс (M5.6 §10).
+pub const SYMBOLS_PARSE_MS: u64 = 20;
 /// Записей в строке знания о файле.
 const FILE_ITEMS_MAX: usize = 3;
 /// Предел заголовка записи в строке знания о файле, символов.
@@ -338,8 +349,8 @@ fn success(env: &Env, inp: &Input, s: &Settings) -> Output {
 }
 
 /// Правка файлов инструментом `tool`: маркер правок, `Ev::Edit` по каждому пути (`journal_on`)
-/// и очередь `{path, hash}` (при решении). Вызывается и на отказ правки (fix round 1, M-8):
-/// патч мог примениться частично.
+/// и очередь `{path, hash, symbols?}` (при решении). Вызывается и на отказ правки (fix round 1,
+/// M-8): патч мог примениться частично.
 fn record_edits(env: &Env, s: &Settings, inp: &Input, tool: &str, id: &str, journal_on: bool) {
     if s.on(Kind::Checkpoint) {
         cache::mark_edits(env, id);
@@ -348,41 +359,79 @@ fn record_edits(env: &Env, s: &Settings, inp: &Input, tool: &str, id: &str, jour
         .iter()
         .filter_map(|f| refs::ref_path(f, &env.cwd, &env.root).ok())
         .collect();
+    // кэш ссылок читается, только если есть что ставить в очередь
+    let refs_cache = if env.solution.is_some() && !rels.is_empty() {
+        cache::usable_file_refs(env, env.server_url().as_deref())
+    } else {
+        None
+    };
+    let parse_until = Instant::now() + Duration::from_millis(SYMBOLS_PARSE_MS);
     let mut queue = Vec::new();
     for p in &rels {
         if journal_on {
             journal::note(env, id, &Ev::Edit { path: p.clone() });
         }
-        if env.solution.is_some()
-            && let Some(hash) = edited_hash(env, p)
-        {
-            queue.push(cache::Changed {
-                path: p.clone(),
-                hash,
-            });
+        if env.solution.is_none() {
+            continue;
         }
+        let symbolic = refs_cache.as_ref().is_some_and(|c| c.has_symbol_refs(p));
+        queue.extend(edited(env, p, symbolic.then_some(parse_until)));
     }
     cache::queue_changed(env, id, &queue);
 }
 
-/// Хэш правленого файла для очереди: нет файла — [`MISSING_HASH`], больше [`HASH_MAX`] или
-/// не читается — `None` (строка в журнал хуков).
-fn edited_hash(env: &Env, rel: &str) -> Option<String> {
+/// Строка очереди правленого файла: нет файла — [`MISSING_HASH`] без символов, больше
+/// [`HASH_MAX`] или не читается — `None` (строка в журнал хуков). `parse_until` задан (у пути
+/// ссылки на символы), файл кода не больше [`SYMBOLS_MAX_BYTES`] — читается один раз: хэш и
+/// хэши тел символов, если полный разбор успел до срока.
+fn edited(env: &Env, rel: &str, parse_until: Option<Instant>) -> Option<cache::Changed> {
     let abs = env.root.join(rel);
-    match std::fs::metadata(&abs) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(MISSING_HASH.to_string()),
+    let line = |hash: String, symbols| cache::Changed {
+        path: rel.to_string(),
+        hash,
+        symbols,
+    };
+    let meta = match std::fs::metadata(&abs) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some(line(MISSING_HASH.to_string(), None));
+        }
         Err(e) => {
             env.log(&format!("хэш правленого файла: {e}"));
-            None
+            return None;
         }
-        Ok(m) if m.len() > HASH_MAX => {
-            env.log("правленый файл больше 8 МБ — не хэшируется (zam refs check)");
-            None
-        }
-        Ok(_) => refs::hash_file(&abs)
-            .inspect_err(|e| env.log(&format!("хэш правленого файла: {e}")))
-            .ok(),
+        Ok(m) => m,
+    };
+    if meta.len() > HASH_MAX {
+        env.log("правленый файл больше 8 МБ — не хэшируется (zam refs check)");
+        return None;
     }
+    let lang = parse_until.and_then(|_| zam_code::lang_of(rel));
+    if let (Some(until), Some(lang), true) = (
+        parse_until,
+        lang,
+        meta.is_file() && meta.len() <= SYMBOLS_MAX_BYTES,
+    ) {
+        let bytes = std::fs::read(&abs)
+            .inspect_err(|e| env.log(&format!("хэш правленого файла: {e}")))
+            .ok()?;
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let left = until.saturating_duration_since(Instant::now());
+        let symbols = (!left.is_zero())
+            .then(|| {
+                let lim = zam_code::Limits {
+                    max_file_bytes: SYMBOLS_MAX_BYTES,
+                    parse_timeout: left,
+                    ..zam_code::Limits::default()
+                };
+                zam_code::symbol_hashes(lang, &bytes, &lim)
+            })
+            .flatten();
+        return Some(line(hash, symbols));
+    }
+    refs::hash_file(&abs)
+        .inspect_err(|e| env.log(&format!("хэш правленого файла: {e}")))
+        .ok()
+        .map(|h| line(h, None))
 }
 
 /// Строки знания о файле (§6.3) по `file-refs.json` для путей `rels` (относительно корня):
@@ -418,11 +467,21 @@ pub fn file_context_lines(
 }
 
 /// Строка знания о файле: до [`FILE_ITEMS_MAX`] записей, `stale` — «возможно устарело».
+/// Ссылки на символ (M5.6 §8; решение составителя плана 13) — первыми; все записи о одном
+/// символе — «ZeroAIMemory: о `Sym` в <путь> в памяти: <title> [<kind>] — <ref>; …»; смесь
+/// символьных и файловых (или разных символов) — «ZeroAIMemory: о файле <путь> в памяти:
+/// `Sym`: <title> [<kind>] — <ref>; <title> [<kind>] — <ref>».
 pub fn file_hint(pr: &PathRefs) -> String {
-    let parts: Vec<String> = pr
-        .items
+    let mut items: Vec<&cache::RefItem> = pr.items.iter().collect();
+    // устойчиво: символьные первыми, порядок сервера внутри групп
+    items.sort_by_key(|i| i.symbol.is_none());
+    items.truncate(FILE_ITEMS_MAX);
+    let one = items
+        .first()
+        .and_then(|i| i.symbol.as_deref())
+        .filter(|s| items.iter().all(|i| i.symbol.as_deref() == Some(*s)));
+    let parts: Vec<String> = items
         .iter()
-        .take(FILE_ITEMS_MAX)
         .map(|i| {
             let title: String = i
                 .title
@@ -436,14 +495,24 @@ pub fn file_hint(pr: &PathRefs) -> String {
             if i.state == "stale" {
                 tag.push_str(", возможно устарело");
             }
-            format!("{title} [{tag}] — {}", i.id)
+            match (&i.symbol, one) {
+                (Some(sym), None) => format!("`{sym}`: {title} [{tag}] — {}", i.id),
+                _ => format!("{title} [{tag}] — {}", i.id),
+            }
         })
         .collect();
-    format!(
-        "ZeroAIMemory: о файле {} в памяти: {}",
-        pr.path,
-        parts.join("; ")
-    )
+    match one {
+        Some(sym) => format!(
+            "ZeroAIMemory: о `{sym}` в {} в памяти: {}",
+            pr.path,
+            parts.join("; ")
+        ),
+        None => format!(
+            "ZeroAIMemory: о файле {} в памяти: {}",
+            pr.path,
+            parts.join("; ")
+        ),
+    }
 }
 
 /// Совпадения `error_regex` кэша (триггер с `tools` — только для них).
@@ -490,6 +559,7 @@ mod tests {
             kind: kind.into(),
             title: title.into(),
             state: state.into(),
+            symbol: None,
         };
         let pr = PathRefs {
             path: "src/pool.rs".into(),

@@ -379,10 +379,13 @@ fn cli_report_rejects_dotdot_absolute_backslash_symlink_outside() {
     {
         put(&root, "outdir/x.png", &png(3, 32));
         let j = d.join("figs").join("jdir");
+        // `mklink` принимает `/r1` из `target/r1` за ключ: пути — с `\`, в кавычках
+        use std::os::windows::process::CommandExt;
+        let q = |p: &std::path::Path| format!("\"{}\"", p.to_string_lossy().replace('/', "\\"));
         let st = std::process::Command::new("cmd")
             .args(["/c", "mklink", "/J"])
-            .arg(&j)
-            .arg(root.join("outdir"))
+            .raw_arg(q(&j))
+            .raw_arg(q(&root.join("outdir")))
             .output()
             .unwrap();
         assert!(

@@ -98,7 +98,9 @@ async function request(method: string, path: string, r: Req = {}): Promise<Respo
   return resp;
 }
 
-async function call<T>(method: string, path: string, body?: unknown, user?: string): Promise<T> {
+/** JSON-запрос к API (`request` + разбор тела; 204 — `undefined`). Экспорт — для модулей
+ * разделов в своих файлах (`code.ts`, M5.6): один источник CSRF и разбора problem+json. */
+export async function call<T>(method: string, path: string, body?: unknown, user?: string): Promise<T> {
   const resp = await request(method, path, { body, user });
   if (resp.status === 204) return undefined as T;
   return (await resp.json()) as T;
@@ -1206,7 +1208,8 @@ export type HookKind =
   | 'subagent_start'
   | 'file_context'
   | 'session_journal'
-  | 'recovery';
+  | 'recovery'
+  | 'code_map';
 export const HOOK_KINDS: HookKind[] = [
   'session_start',
   'prompt',
@@ -1217,6 +1220,7 @@ export const HOOK_KINDS: HookKind[] = [
   'file_context',
   'session_journal',
   'recovery',
+  'code_map',
 ];
 export type HookFlags = Record<HookKind, boolean>;
 

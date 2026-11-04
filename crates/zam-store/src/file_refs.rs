@@ -15,6 +15,11 @@
 //!   (`stale_reason = source_changed`), совпал → `ok`; у ссылки без хэша первый присланный
 //!   хэш становится ориентиром, она остаётся `ok`. [`files_verified`] возвращает ссылки
 //!   пути в `ok`. Обе операции касаются только владельцев из переданных пространств.
+//! - **Ссылка на символ** (M5.6 §8): `symbol` — квалифицированное имя (`Store::open`, `foo#2`),
+//!   `symbol_hash` — `body_hash` тела при записи. Ключ ссылки владельца — `(путь, символ)`: файл
+//!   целиком и его символы — разные ссылки. Строка `путь#qual` (frontmatter `refs:`,
+//!   `data.refs.files` changelog) разбирается [`zam_code::split_ref`]. Устарелость символьной
+//!   ссылки — по телу символа, если в сообщении есть символы файла ([`files_changed`]).
 //! - Ссылки удалённых владельцев остаются (восстановление их возвращает), но в индекс,
 //!   фильтр поиска и граф не попадают; в индекс не попадают и замещённые/отозванные записи.
 use std::collections::{HashMap, HashSet};
@@ -23,6 +28,7 @@ use jiff::Timestamp;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use zam_code::{MISSING_HASH, SymbolHash};
 use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::entries::EntryKind;
@@ -33,8 +39,10 @@ use crate::{Db, StoreError};
 
 /// Предел ссылок одного владельца.
 pub const REFS_MAX: usize = 64;
-/// Предел длины пути ссылки, символов.
-pub const PATH_MAX_CHARS: usize = 1000;
+/// Предел длины пути ссылки, символов (общий с разбором `путь#qual`, [`zam_code::REF_MAX_BYTES`]).
+pub use zam_code::PATH_MAX_CHARS;
+/// Символов пути или ссылки в тексте ошибки и предупреждения не больше ([`shown_ref`]).
+pub const SHOWN_REF_CHARS: usize = 200;
 /// Предел файлов в одном сообщении `POST /files/changed` и `/files/verified`.
 pub const FILES_MAX: usize = 500;
 /// Записей на путь в индексе [`refs_index`].
@@ -43,30 +51,74 @@ pub const INDEX_ITEMS_MAX: usize = 5;
 pub const COMMIT_MAX_CHARS: usize = 64;
 /// Причина устарелости: файл изменился.
 pub const SOURCE_CHANGED: &str = "source_changed";
+/// Причина устарелости символьной ссылки: тело символа изменилось (M5.6 §8).
+pub const SYMBOL_CHANGED: &str = "symbol_changed";
+/// Причина устарелости символьной ссылки: символа (или файла) больше нет (M5.6 §8).
+pub const SYMBOL_REMOVED: &str = "symbol_removed";
 /// Ключ `meta`: ссылки и `verified_at` ещё не дозаполнены (миграция 0016).
 pub(crate) const REFS_BACKFILL: &str = "refs_backfill";
 /// Заметок или записей в одном пакете дозаполнения.
 const BACKFILL_BATCH: i64 = 200;
 
-/// Ссылка на файл: нормализованный путь, blake3 содержимого (64 hex) и коммит, если известны.
+/// Ссылка на файл или его символ: нормализованный путь, квалифицированное имя символа,
+/// blake3 содержимого (64 hex), `body_hash` символа (16 hex) и коммит, если известны.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileRef {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
 }
 
 impl FileRef {
-    /// Ссылка без хэша и коммита.
+    /// Ссылка на файл без хэша и коммита.
     pub fn path_only(path: String) -> FileRef {
         FileRef {
             path,
+            symbol: None,
             hash: None,
+            symbol_hash: None,
             commit: None,
         }
     }
+
+    /// Ссылка из строки `путь` или `путь#qual` ([`zam_code::split_ref`]) без хэшей; путь не
+    /// нормализуется.
+    pub fn parse(raw: &str) -> FileRef {
+        let (path, symbol) = zam_code::split_ref(raw.trim());
+        FileRef {
+            symbol: symbol.map(str::to_string),
+            ..FileRef::path_only(path.to_string())
+        }
+    }
+
+    /// Ключ ссылки владельца: `(путь, символ или "")`.
+    fn key(&self) -> (&str, &str) {
+        (&self.path, self.symbol.as_deref().unwrap_or(""))
+    }
+
+    /// Строка `путь` или `путь#qual`.
+    pub fn display(&self) -> String {
+        match &self.symbol {
+            Some(s) => format!("{}#{s}", self.path),
+            None => self.path.clone(),
+        }
+    }
+}
+
+/// Файл сообщения об изменении (`POST /files/changed`, `PUT /code/files`): путь (нормализован
+/// вызывающим), blake3 содержимого (или [`MISSING_HASH`] — файл удалён) и, если клиент
+/// разобрал файл, хэши тел его символов.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub hash: String,
+    pub symbols: Option<Vec<SymbolHash>>,
 }
 
 /// Состояние ссылки.
@@ -117,6 +169,17 @@ pub enum PathError {
     Absolute,
     #[error("путь выходит выше корня решения")]
     AboveRoot,
+}
+
+/// Путь или ссылка (`путь#qual`) в тексте ошибки или предупреждения: недоверенная строка — не
+/// длиннее [`SHOWN_REF_CHARS`] символов, сверх — многоточие и общая длина
+/// (`<начало>… (N символов)`), чтобы ответ не повторял присланный мегабайт (финальное ревью
+/// ветки M5.6).
+pub fn shown_ref(s: &str) -> String {
+    match s.char_indices().nth(SHOWN_REF_CHARS) {
+        Some((i, _)) => format!("{}… ({} символов)", &s[..i], s.chars().count()),
+        None => s.to_string(),
+    }
 }
 
 /// Лексическая нормализация пути относительно корня решения: края без пробелов, `\` → `/`,
@@ -245,10 +308,16 @@ pub fn set_refs(
         return Err(bad(format!("refs: не больше {REFS_MAX} ссылок")));
     }
     let kind = owner_kind(owner.kind)?;
-    let keep: Vec<&str> = refs.iter().map(|r| r.path.as_str()).collect();
+    let keep: Vec<serde_json::Value> = refs
+        .iter()
+        .map(|r| {
+            let (p, s) = r.key();
+            serde_json::json!([p, s])
+        })
+        .collect();
     tx.prepare_cached(
         "DELETE FROM file_refs WHERE owner_kind = ?1 AND owner_id = ?2
-           AND path NOT IN (SELECT value FROM json_each(?3))",
+           AND json_array(path, coalesce(symbol, '')) NOT IN (SELECT value FROM json_each(?3))",
     )?
     .execute(params![
         kind,
@@ -256,39 +325,51 @@ pub fn set_refs(
         serde_json::Value::from(keep).to_string()
     ])?;
     let mut st = tx.prepare_cached(
-        "INSERT INTO file_refs (owner_kind, owner_id, solution_guid, path, content_hash,
-                                git_commit, recorded_at, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok')
-         ON CONFLICT (owner_kind, owner_id, path) DO UPDATE SET
+        "INSERT INTO file_refs (owner_kind, owner_id, solution_guid, path, symbol, content_hash,
+                                symbol_hash, git_commit, recorded_at, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ok')
+         ON CONFLICT (owner_kind, owner_id, path, COALESCE(symbol, '')) DO UPDATE SET
            solution_guid = excluded.solution_guid, content_hash = excluded.content_hash,
-           git_commit = excluded.git_commit, recorded_at = excluded.recorded_at,
-           state = 'ok', stale_at = NULL, stale_reason = NULL",
+           symbol_hash = excluded.symbol_hash, git_commit = excluded.git_commit,
+           recorded_at = excluded.recorded_at, state = 'ok', stale_at = NULL,
+           stale_reason = NULL",
     )?;
     for r in &refs {
         st.execute(params![
-            kind, owner.id, solution, r.path, r.hash, r.commit, now
+            kind,
+            owner.id,
+            solution,
+            r.path,
+            r.symbol,
+            r.hash,
+            r.symbol_hash,
+            r.commit,
+            now
         ])?;
     }
     Ok(())
 }
 
-/// Ссылки владельца (путь, хэш, коммит) по алфавиту пути.
+/// Ссылки владельца (путь, символ, хэши, коммит) по алфавиту пути, файловая — перед символьными.
 pub(crate) fn owner_refs(tx: &Connection, owner: TargetRef) -> Result<Vec<FileRef>, StoreError> {
     let mut st = tx.prepare_cached(
-        "SELECT path, content_hash, git_commit FROM file_refs
-         WHERE owner_kind = ?1 AND owner_id = ?2 ORDER BY path",
+        "SELECT path, symbol, content_hash, symbol_hash, git_commit FROM file_refs
+         WHERE owner_kind = ?1 AND owner_id = ?2 ORDER BY path, coalesce(symbol, '')",
     )?;
     let rows = st.query_map(params![owner_kind(owner.kind)?, owner.id], |r| {
         Ok(FileRef {
             path: r.get(0)?,
-            hash: r.get(1)?,
-            commit: r.get(2)?,
+            symbol: r.get(1)?,
+            hash: r.get(2)?,
+            symbol_hash: r.get(3)?,
+            commit: r.get(4)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Замещение без `refs` (раунд 2 задачи 7, ревью): ссылки новой записи `new` на те же пути
+/// Замещение без `refs` (раунд 2 задачи 7, ревью): ссылки новой записи `new` на те же пути (и
+/// символы)
 /// получают от замещаемой `old` решение, `recorded_at` и состояние (`state`, `stale_at`,
 /// `stale_reason`) — иначе ссылка Knowledge теряла бы `X-Zam-Solution` исходного запроса, а
 /// `stale` молча становилась бы `ok`.
@@ -298,89 +379,99 @@ pub(crate) fn inherit_ref_state(tx: &Connection, old: Id, new: Id) -> Result<(),
                 state = o.state, stale_at = o.stale_at, stale_reason = o.stale_reason
          FROM file_refs AS o
          WHERE n.owner_kind = 'entry' AND n.owner_id = ?2
-           AND o.owner_kind = 'entry' AND o.owner_id = ?1 AND o.path = n.path",
+           AND o.owner_kind = 'entry' AND o.owner_id = ?1 AND o.path = n.path
+           AND coalesce(o.symbol, '') = coalesce(n.symbol, '')",
     )?
     .execute(params![old, new])?;
     Ok(())
 }
 
-/// Дописывает ссылки без хэша на пути, которых у владельца ещё нет (до [`REFS_MAX`] всего).
-fn add_paths(
+/// Дописывает ссылки без хэша на `(путь, символ)`, которых у владельца ещё нет (до
+/// [`REFS_MAX`] всего).
+fn add_refs(
     tx: &Connection,
     owner: TargetRef,
     solution: Option<&str>,
-    paths: &[String],
+    refs: &[FileRef],
     now: &str,
 ) -> Result<(), StoreError> {
     let kind = owner_kind(owner.kind)?;
-    let have: HashSet<String> = tx
-        .prepare_cached("SELECT path FROM file_refs WHERE owner_kind = ?1 AND owner_id = ?2")?
-        .query_map(params![kind, owner.id], |r| r.get(0))?
+    let mut have: HashSet<(String, String)> = tx
+        .prepare_cached(
+            "SELECT path, coalesce(symbol, '') FROM file_refs
+             WHERE owner_kind = ?1 AND owner_id = ?2",
+        )?
+        .query_map(params![kind, owner.id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    let mut n = have.len();
     let mut st = tx.prepare_cached(
-        "INSERT OR IGNORE INTO file_refs (owner_kind, owner_id, solution_guid, path,
+        "INSERT OR IGNORE INTO file_refs (owner_kind, owner_id, solution_guid, path, symbol,
                                           recorded_at, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'ok')",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ok')",
     )?;
-    for p in paths {
-        if n >= REFS_MAX {
+    for r in refs {
+        if have.len() >= REFS_MAX {
             break;
         }
-        if !have.contains(p) {
-            st.execute(params![kind, owner.id, solution, p, now])?;
-            n += 1;
+        let (p, s) = r.key();
+        if have.insert((p.to_string(), s.to_string())) {
+            st.execute(params![kind, owner.id, solution, r.path, r.symbol, now])?;
         }
     }
     Ok(())
 }
 
-/// Нормализованные ссылки без повторов пути (первая побеждает); путь не принят — `BadInput`.
+/// Нормализованные ссылки без повторов `(путь, символ)` (первая побеждает); путь не принят
+/// — `BadInput`.
 fn dedup(refs: &[FileRef]) -> Result<Vec<FileRef>, StoreError> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(refs.len());
     for r in refs {
         let path = normalize_ref_path(&r.path).map_err(|e| bad(format!("refs: {e}")))?;
-        if seen.insert(path.clone()) {
-            out.push(FileRef {
-                path,
-                hash: r.hash.clone(),
-                commit: r.commit.clone(),
-            });
+        let r = FileRef { path, ..r.clone() };
+        if seen.insert((r.path.clone(), r.symbol.clone())) {
+            out.push(r);
         }
     }
     Ok(out)
 }
 
-/// Пути строк `data.refs.files` changelog, которые нормализуются (прочие пропускаются: это
-/// свободные строки с M3).
-pub fn changelog_paths(data: &serde_json::Value) -> Vec<String> {
+/// Строка `путь` или `путь#qual` → ссылка с нормализованным путём; путь не нормализуется —
+/// `None`.
+fn ref_of_str(raw: &str) -> Option<FileRef> {
+    let r = FileRef::parse(raw);
+    let path = normalize_ref_path(&r.path).ok()?;
+    Some(FileRef { path, ..r })
+}
+
+/// Ссылки строк `data.refs.files` changelog (`путь` или `путь#qual`), которые нормализуются
+/// (прочие пропускаются: это свободные строки с M3).
+pub fn changelog_refs(data: &serde_json::Value) -> Vec<FileRef> {
     data.pointer("/refs/files")
         .and_then(serde_json::Value::as_array)
         .map(|a| {
             a.iter()
                 .filter_map(serde_json::Value::as_str)
-                .filter_map(|s| normalize_ref_path(s).ok())
+                .filter_map(ref_of_str)
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// Набор ссылок записи: ссылки запроса, затем пути `data.refs.files` changelog без хэша —
+/// Набор ссылок записи: ссылки запроса, затем ссылки `data.refs.files` changelog без хэша —
 /// до [`REFS_MAX`] всего (строки сверх предела пропускаются).
 fn entry_set(kind: EntryKind, refs: &[FileRef], data: &serde_json::Value) -> Vec<FileRef> {
     let mut out = refs.to_vec();
     if kind == EntryKind::Changelog {
-        let have: HashSet<String> = refs
+        let mut have: HashSet<(String, Option<String>)> = refs
             .iter()
-            .filter_map(|r| normalize_ref_path(&r.path).ok())
+            .filter_map(|r| Some((normalize_ref_path(&r.path).ok()?, r.symbol.clone())))
             .collect();
-        for p in changelog_paths(data) {
+        for r in changelog_refs(data) {
             if out.len() >= REFS_MAX.max(refs.len()) {
                 break;
             }
-            if !have.contains(&p) && !out.iter().any(|r| r.path == p) {
-                out.push(FileRef::path_only(p));
+            if have.insert((r.path.clone(), r.symbol.clone())) {
+                out.push(r);
             }
         }
     }
@@ -444,28 +535,29 @@ pub(crate) fn sync_patched_entry(
             set_refs(tx, owner, solution.as_deref(), &set, now)
         }
         None if kind == EntryKind::Changelog && data_changed => {
-            let paths = changelog_paths(data);
-            if paths.is_empty() {
+            let refs = changelog_refs(data);
+            if refs.is_empty() {
                 return Ok(());
             }
             let solution = owner_solution(tx, space, a)?;
-            add_paths(tx, owner, solution.as_deref(), &paths, now)
+            add_refs(tx, owner, solution.as_deref(), &refs, now)
         }
         None => Ok(()),
     }
 }
 
-/// Пути `refs:` из frontmatter заметки: нормализуемые, без повторов, до [`REFS_MAX`].
-pub fn note_ref_paths(fm: Option<&zam_markdown::Frontmatter>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for p in fm.map(|f| f.refs.as_slice()).unwrap_or_default() {
+/// Ссылки `refs:` из frontmatter заметки (`путь` или `путь#qual`, без хэшей): нормализуемые,
+/// без повторов `(путь, символ)`, до [`REFS_MAX`].
+pub fn note_refs(fm: Option<&zam_markdown::Frontmatter>) -> Vec<FileRef> {
+    let mut out: Vec<FileRef> = Vec::new();
+    for raw in fm.map(|f| f.refs.as_slice()).unwrap_or_default() {
         if out.len() >= REFS_MAX {
             break;
         }
-        if let Ok(p) = normalize_ref_path(p)
-            && !out.contains(&p)
+        if let Some(r) = ref_of_str(raw)
+            && !out.iter().any(|o| o.key() == r.key())
         {
-            out.push(p);
+            out.push(r);
         }
     }
     out
@@ -487,19 +579,18 @@ pub(crate) fn sync_note(
     let (verified, commit) = verified_of(fm);
     tx.prepare_cached("UPDATE nodes SET verified_at = ?2, verified_at_commit = ?3 WHERE id = ?1")?
         .execute(params![node, verified, commit])?;
-    let paths = note_ref_paths(fm);
+    let set = note_refs(fm);
     let owner = TargetRef {
         kind: TargetKind::Node,
         id: node,
     };
-    if paths.is_empty() {
+    if set.is_empty() {
         // прежние ссылки снимаются (поле `refs:` убрали)
         tx.prepare_cached("DELETE FROM file_refs WHERE owner_kind = 'node' AND owner_id = ?1")?
             .execute([node])?;
         return Ok(());
     }
     let solution = owner_solution(tx, space, a)?;
-    let set: Vec<FileRef> = paths.into_iter().map(FileRef::path_only).collect();
     set_refs(tx, owner, solution.as_deref(), &set, now)
 }
 
@@ -514,81 +605,276 @@ fn verified_of(fm: Option<&zam_markdown::Frontmatter>) -> (Option<String>, Optio
 
 /// Ссылки решения `?1` на путь `?2` у владельцев из пространств `?3` (JSON-массив), в том
 /// числе удалённых: участнику не видны ссылки базы владельца вне пространства решения.
-const REFS_IN_SPACES: &str = "SELECT f.id, f.content_hash, f.state FROM file_refs f
+const REFS_IN_SPACES: &str = "SELECT f.id, f.content_hash, f.state, f.symbol, f.symbol_hash,
+            f.stale_reason
+     FROM file_refs f
      LEFT JOIN nodes n ON f.owner_kind = 'node' AND n.id = f.owner_id
      LEFT JOIN entries e ON f.owner_kind = 'entry' AND e.id = f.owner_id
      WHERE f.solution_guid = ?1 AND f.path = ?2
        AND coalesce(n.space_id, e.space_id) IN (SELECT value FROM json_each(?3))";
 
-/// Сообщение об изменении файлов решения `solution` (`(путь, хэш)`, пути нормализованы
-/// вызывающим) для ссылок владельцев из `spaces`: хэш другой — `stale`, совпал — `ok`;
-/// у ссылки без хэша присланный хэш становится ориентиром, ссылка остаётся `ok` (решение
-/// контроллера, раунд 1 задачи 7). Возвращает, сколько ссылок этих путей после этого `stale`.
+/// Ссылка, которую судит правило устарелости.
+struct RefRow {
+    id: i64,
+    hash: Option<String>,
+    state: RefState,
+    symbol: Option<String>,
+    symbol_hash: Option<String>,
+    stale_reason: Option<String>,
+}
+
+/// Ссылки решения на путь у владельцев из пространств (`spaces` — JSON-массив id).
+fn refs_in_spaces(
+    tx: &Connection,
+    solution: &str,
+    path: &str,
+    spaces: &str,
+) -> Result<Vec<RefRow>, StoreError> {
+    let mut sel = tx.prepare_cached(REFS_IN_SPACES)?;
+    let rows = sel.query_map(params![solution, path, spaces], |r| {
+        Ok(RefRow {
+            id: r.get(0)?,
+            hash: r.get(1)?,
+            state: r.get(2)?,
+            symbol: r.get(3)?,
+            symbol_hash: r.get(4)?,
+            stale_reason: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Откуда сведения об изменении файла.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeSource {
+    /// Хуки рабочей копии (`POST /files/changed`): файловые и символьные ссылки.
+    WorkingCopy,
+    /// Карта кода (`PUT /code/files`, удаление синхронизацией): только символьные ссылки и только
+    /// по символам — хэш файла другой машины (CRLF/LF, BOM) ни файловых ссылок, ни хэша файла
+    /// у символьных не трогает (решение контроллера по ревью задачи 3, I2).
+    Map,
+}
+
+/// Файл для правила устарелости: [`ChangedFile`], полнота присланных символов и источник.
+/// Неполный разбор (`partial`, предел символов): найденный символ судится по телу, не
+/// найденный — по хэшу файла у [`ChangeSource::WorkingCopy`] и не судится у
+/// [`ChangeSource::Map`] (он мог быть обрезан пределом, а не удалён).
+pub(crate) struct Change<'a> {
+    pub path: &'a str,
+    pub hash: &'a str,
+    pub symbols: Option<&'a [SymbolHash]>,
+    pub complete: bool,
+    pub source: ChangeSource,
+}
+
+/// Вердикт правила для одной ссылки.
+enum Verdict<'a> {
+    /// `ok`; ссылка принимает хэш файла и (если не было) хэш символа.
+    Ok {
+        hash: &'a str,
+        symbol_hash: Option<&'a str>,
+    },
+    /// `ok` без изменения хэшей (хэш совпал).
+    Same,
+    /// Карта подтвердила тело символа: хэш тела — если не было; `stale` по символу снимается,
+    /// `stale` по хэшу файла (его судят хуки рабочей копии) — остаётся.
+    SymbolOk {
+        symbol_hash: &'a str,
+    },
+    Stale(&'static str),
+    /// Ссылку этот источник не судит.
+    Skip,
+}
+
+/// Правило устарелости (спецификация M4.5 §6.2, M5.6 §8) для ссылки `r` и файла `c`.
+fn verdict<'a>(r: &RefRow, c: &Change<'a>) -> Verdict<'a> {
+    let map = c.source == ChangeSource::Map;
+    let by_file = || {
+        if map {
+            return Verdict::Skip;
+        }
+        match r.hash.as_deref() {
+            Some(h) if h == c.hash => Verdict::Same,
+            Some(_) => Verdict::Stale(SOURCE_CHANGED),
+            // без хэша: первый присланный хэш — ориентир
+            None => Verdict::Ok {
+                hash: c.hash,
+                symbol_hash: None,
+            },
+        }
+    };
+    let Some(qual) = r.symbol.as_deref() else {
+        return by_file();
+    };
+    if c.hash == MISSING_HASH {
+        return Verdict::Stale(SYMBOL_REMOVED);
+    }
+    let Some(symbols) = c.symbols else {
+        return by_file();
+    };
+    match symbols.iter().find(|s| s.qual == qual) {
+        Some(s) => match r.symbol_hash.as_deref() {
+            Some(h) if h != s.body_hash => Verdict::Stale(SYMBOL_CHANGED),
+            _ if map => Verdict::SymbolOk {
+                symbol_hash: &s.body_hash,
+            },
+            // тело то же (или ориентира не было): ссылка принимает и новый хэш файла, иначе
+            // следующее сообщение без символов сочло бы её устаревшей по старому хэшу файла
+            _ => Verdict::Ok {
+                hash: c.hash,
+                symbol_hash: Some(&s.body_hash),
+            },
+        },
+        None if c.complete => Verdict::Stale(SYMBOL_REMOVED),
+        None => by_file(),
+    }
+}
+
+/// Применяет правило устарелости к ссылкам решения `solution` на файлы `changes` у владельцев
+/// из `spaces` (JSON-массив id) — общая часть [`files_changed`], `code_put_files` и
+/// `code_sync_manifest`. Возвращает, сколько ссылок этот вызов признал устаревшими (в том
+/// числе уже бывших `stale`).
+pub(crate) fn apply_changes(
+    tx: &Connection,
+    solution: &str,
+    spaces: &str,
+    changes: &[Change<'_>],
+    now: &str,
+) -> Result<u32, StoreError> {
+    let mut stale = 0u32;
+    let mut to_stale = tx.prepare_cached(
+        "UPDATE file_refs SET state = 'stale', stale_reason = ?2,
+                stale_at = CASE WHEN state = 'stale' THEN stale_at ELSE ?3 END
+         WHERE id = ?1",
+    )?;
+    let mut to_ok = tx.prepare_cached(
+        "UPDATE file_refs SET state = 'ok', stale_at = NULL, stale_reason = NULL
+         WHERE id = ?1",
+    )?;
+    let mut adopt = tx.prepare_cached(
+        "UPDATE file_refs SET content_hash = ?2,
+                symbol_hash = coalesce(?3, symbol_hash), state = 'ok', stale_at = NULL,
+                stale_reason = NULL
+         WHERE id = ?1",
+    )?;
+    let mut symbol_ok = tx.prepare_cached(
+        "UPDATE file_refs SET symbol_hash = coalesce(symbol_hash, ?2), state = 'ok',
+                stale_at = NULL, stale_reason = NULL
+         WHERE id = ?1",
+    )?;
+    for c in changes {
+        for r in refs_in_spaces(tx, solution, c.path, spaces)? {
+            match verdict(&r, c) {
+                Verdict::Same => {
+                    if r.state == RefState::Stale {
+                        to_ok.execute([r.id])?;
+                    }
+                }
+                Verdict::Ok { hash, symbol_hash } => {
+                    adopt.execute(params![r.id, hash, symbol_hash])?;
+                }
+                Verdict::SymbolOk { symbol_hash } => {
+                    // `stale` по хэшу файла снимают только хуки рабочей копии
+                    let by_file = r.state == RefState::Stale
+                        && r.stale_reason.as_deref() == Some(SOURCE_CHANGED);
+                    if !by_file && (r.state == RefState::Stale || r.symbol_hash.is_none()) {
+                        symbol_ok.execute(params![r.id, symbol_hash])?;
+                    }
+                }
+                Verdict::Stale(reason) => {
+                    to_stale.execute(params![r.id, reason, now])?;
+                    stale += 1;
+                }
+                Verdict::Skip => {}
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// Сообщение об изменении файлов решения `solution` (пути нормализованы вызывающим) для
+/// ссылок владельцев из `spaces`. Ссылка на файл: хэш другой — `stale`/`source_changed`,
+/// совпал — `ok`; у ссылки без хэша присланный хэш становится ориентиром, ссылка остаётся
+/// `ok` (решение контроллера, раунд 1 задачи 7 M4.5). Ссылка на символ (M5.6 §8): файл удалён
+/// ([`MISSING_HASH`]) — `symbol_removed`; символы присланы — символ найден с тем же телом (или
+/// без записанного хэша тела) — `ok` с новыми хэшами, с другим — `symbol_changed`, не найден —
+/// `symbol_removed`; символов нет — по хэшу файла. Возвращает, сколько ссылок этих путей
+/// после этого `stale`.
 pub async fn files_changed(
     db: &Db,
     solution: &str,
     spaces: &[Id],
-    files: &[(String, String)],
+    files: &[ChangedFile],
     now: Timestamp,
 ) -> Result<u32, StoreError> {
     let solution = solution.to_string();
     let spaces = ids_json(spaces);
     let files = files.to_vec();
     db.write(move |tx| {
-        let now = fmt_ts(now);
-        let mut stale = 0u32;
-        let mut sel = tx.prepare_cached(REFS_IN_SPACES)?;
-        let mut to_stale = tx.prepare_cached(
-            "UPDATE file_refs SET state = 'stale', stale_reason = ?2,
-                    stale_at = CASE WHEN state = 'stale' THEN stale_at ELSE ?3 END
-             WHERE id = ?1",
-        )?;
-        let mut to_ok = tx.prepare_cached(
-            "UPDATE file_refs SET state = 'ok', stale_at = NULL, stale_reason = NULL
-             WHERE id = ?1",
-        )?;
-        let mut adopt = tx.prepare_cached(
-            "UPDATE file_refs SET content_hash = ?2, state = 'ok', stale_at = NULL,
-                    stale_reason = NULL
-             WHERE id = ?1",
-        )?;
-        for (path, hash) in &files {
-            let rows: Vec<(i64, Option<String>, RefState)> = sel
-                .query_map(params![solution, path, spaces], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?
-                .collect::<Result<_, _>>()?;
-            for (id, recorded, state) in rows {
-                match recorded.as_deref() {
-                    Some(h) if h == hash => {
-                        if state == RefState::Stale {
-                            to_ok.execute([id])?;
-                        }
-                    }
-                    Some(_) => {
-                        to_stale.execute(params![id, SOURCE_CHANGED, now])?;
-                        stale += 1;
-                    }
-                    // без хэша: первый присланный хэш — ориентир
-                    None => {
-                        adopt.execute(params![id, hash])?;
-                    }
-                }
-            }
-        }
-        Ok(stale)
+        let changes: Vec<Change<'_>> = files
+            .iter()
+            .map(|f| Change {
+                path: &f.path,
+                hash: &f.hash,
+                symbols: f.symbols.as_deref(),
+                complete: true,
+                source: ChangeSource::WorkingCopy,
+            })
+            .collect();
+        apply_changes(tx, &solution, &spaces, &changes, &fmt_ts(now))
     })
     .await
 }
 
+/// Правило загрузки карты кода (`PUT /code/files`) для ссылок владельцев из `spaces` другой
+/// базы (Knowledge участника): судятся только ссылки на символы и только по присланным
+/// символам (`symbols: None` — файл пропущен или разобран не полностью — ссылки не судятся;
+/// **при `partial` передавайте `None`**: присланный список считается полным, и не найденный в
+/// нём символ стал бы `symbol_removed`, хотя его мог обрезать предел),
+/// файловые ссылки и хэш файла не меняются — как у `code_put_files` в базе владельца
+/// (решение контроллера по ревью задачи 3, I2). Возвращает, сколько ссылок признано
+/// устаревшими.
+pub async fn symbols_uploaded(
+    db: &Db,
+    solution: &str,
+    spaces: &[Id],
+    files: &[ChangedFile],
+    now: Timestamp,
+) -> Result<u32, StoreError> {
+    let solution = solution.to_string();
+    let spaces = ids_json(spaces);
+    let files = files.to_vec();
+    db.write(move |tx| {
+        let changes: Vec<Change<'_>> = files
+            .iter()
+            .map(|f| Change {
+                path: &f.path,
+                hash: &f.hash,
+                symbols: f.symbols.as_deref(),
+                complete: true,
+                source: ChangeSource::Map,
+            })
+            .collect();
+        apply_changes(tx, &solution, &spaces, &changes, &fmt_ts(now))
+    })
+    .await
+}
+
+/// Файл `POST /files/verified`: путь (нормализован вызывающим), хэш содержимого и хэши тел
+/// символов, если известны.
+pub type VerifiedFile = (String, Option<String>, Option<Vec<SymbolHash>>);
+
 /// «Проверено, знание актуально»: ссылки решения на эти пути у владельцев из `spaces` —
 /// `ok`, `recorded_at` — сейчас, хэш — присланный (без него — NULL: ориентиром станет хэш
-/// следующего сообщения). Возвращает число обновлённых ссылок.
+/// следующего сообщения). У символьной ссылки хэш тела — из присланных символов (символа среди
+/// них нет — NULL); символов не прислали (файл не разобран, клиент без карты) — хэш тела
+/// прежний: иначе подтверждение файла стёрло бы ориентир чужих ссылок на его символы, и правка
+/// символа больше не давала бы `symbol_changed` (ревью задачи 6 M5.6, I3).
 pub async fn files_verified(
     db: &Db,
     solution: &str,
     spaces: &[Id],
-    files: &[(String, Option<String>)],
+    files: &[VerifiedFile],
     now: Timestamp,
 ) -> Result<u32, StoreError> {
     let solution = solution.to_string();
@@ -596,19 +882,24 @@ pub async fn files_verified(
     let files = files.to_vec();
     db.write(move |tx| {
         let now = fmt_ts(now);
-        let mut sel = tx.prepare_cached(REFS_IN_SPACES)?;
         let mut st = tx.prepare_cached(
             "UPDATE file_refs SET state = 'ok', stale_at = NULL, stale_reason = NULL,
-                    recorded_at = ?2, content_hash = ?3
+                    recorded_at = ?2, content_hash = ?3,
+                    symbol_hash = CASE WHEN ?5 THEN ?4 ELSE symbol_hash END
              WHERE id = ?1",
         )?;
         let mut n = 0u32;
-        for (path, hash) in &files {
-            let ids: Vec<i64> = sel
-                .query_map(params![solution, path, spaces], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
-            for id in ids {
-                n += st.execute(params![id, now, hash])? as u32;
+        for (path, hash, symbols) in &files {
+            for r in refs_in_spaces(tx, &solution, path, &spaces)? {
+                let body = r.symbol.as_deref().and_then(|q| {
+                    symbols
+                        .as_deref()?
+                        .iter()
+                        .find(|s| s.qual == q)
+                        .map(|s| s.body_hash.as_str())
+                });
+                let judged = symbols.is_some();
+                n += st.execute(params![r.id, now, hash, body, judged])? as u32;
             }
         }
         Ok(n)
@@ -616,16 +907,24 @@ pub async fn files_verified(
     .await
 }
 
-/// Запись индекса для хуков: ссылка `n:`/`i:`/`c:`/… , вид, заголовок и состояние ссылки.
+/// Запись индекса для хуков: ссылка `n:`/`i:`/`c:`/… , вид, заголовок, состояние ссылки и
+/// символ, если ссылка на символ (M5.6 §8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefItem {
     pub id: String,
     pub kind: String,
     pub title: String,
     pub state: RefState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Пространство записи-владельца — у [`path_owners`] (карточка символа и влияние, ссылка
+    /// WebUI на знание из Knowledge участника); в индексе хуков не отдаётся.
+    #[serde(skip)]
+    pub space: Option<zam_core::Id>,
 }
 
-/// Путь индекса: последний записанный хэш и до [`INDEX_ITEMS_MAX`] записей (новые первыми).
+/// Путь индекса: последний записанный хэш и до [`INDEX_ITEMS_MAX`] записей (ссылки на символы
+/// первыми, затем новые первыми).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PathRefs {
     pub path: String,
@@ -645,7 +944,7 @@ const LIVE_OWNER: &str = "((f.owner_kind = 'node' AND n.deleted_at IS NULL
 const OWNER_JOIN: &str = "LEFT JOIN nodes n ON f.owner_kind = 'node' AND n.id = f.owner_id
      LEFT JOIN entries e ON f.owner_kind = 'entry' AND e.id = f.owner_id";
 
-fn ids_json(ids: &[Id]) -> String {
+pub(crate) fn ids_json(ids: &[Id]) -> String {
     serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string()
 }
 
@@ -659,7 +958,8 @@ fn owner_ref(kind: &str, id: &str, entry_kind: Option<&str>) -> (String, String)
 }
 
 /// Индекс ссылок решения `solution` из пространств `spaces`: пути по алфавиту, у каждого —
-/// последний записанный хэш и до [`INDEX_ITEMS_MAX`] живых владельцев.
+/// последний записанный хэш и до [`INDEX_ITEMS_MAX`] живых владельцев (ссылки на символы
+/// первыми).
 pub async fn refs_index(
     db: &Db,
     solution: &str,
@@ -670,10 +970,10 @@ pub async fn refs_index(
     db.read(move |c| {
         let mut st = c.prepare_cached(&format!(
             "SELECT f.path, f.content_hash, f.state, f.owner_kind, f.owner_id,
-                    coalesce(n.name, e.title, ''), e.kind
+                    coalesce(n.name, e.title, ''), e.kind, f.symbol, f.recorded_at
              FROM file_refs f {OWNER_JOIN}
              WHERE f.solution_guid = ?1 AND {LIVE_OWNER}
-             ORDER BY f.path, f.recorded_at DESC, f.id DESC"
+             ORDER BY f.path, f.symbol IS NULL, f.recorded_at DESC, f.id DESC"
         ))?;
         let rows = st.query_map(params![solution, spaces], |r| {
             Ok((
@@ -684,21 +984,28 @@ pub async fn refs_index(
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })?;
         let mut out: Vec<PathRefs> = Vec::new();
+        // время записи хэша пути: «последний записанный» — по `recorded_at`, а не по порядку
+        // выдачи (символьные ссылки идут первыми)
+        let mut hash_at = String::new();
         for row in rows {
-            let (path, hash, state, kind, id, title, ekind) = row?;
+            let (path, hash, state, kind, id, title, ekind, symbol, at) = row?;
             if out.last().is_none_or(|p| p.path != path) {
                 out.push(PathRefs {
                     path,
                     hash: None,
                     items: Vec::new(),
                 });
+                hash_at.clear();
             }
             let cur = out.last_mut().expect("путь только что добавлен");
-            if cur.hash.is_none() {
+            if hash.is_some() && (cur.hash.is_none() || at > hash_at) {
                 cur.hash = hash;
+                hash_at = at;
             }
             if cur.items.len() < INDEX_ITEMS_MAX {
                 let (id, kind) = owner_ref(&kind, &id, ekind.as_deref());
@@ -707,6 +1014,8 @@ pub async fn refs_index(
                     kind,
                     title,
                     state,
+                    symbol,
+                    space: None,
                 });
             }
         }
@@ -715,22 +1024,79 @@ pub async fn refs_index(
     .await
 }
 
+/// Живые владельцы ссылок решения `solution` на путь `path` (нормализован вызывающим) в
+/// пространствах `spaces` — без предела [`INDEX_ITEMS_MAX`] (карточка символа и влияние правки,
+/// M5.6 §8–§9): ссылки на символы первыми, затем новые первыми; владелец с несколькими
+/// ссылками пути (файловой и символьными) — по строке на ссылку.
+pub async fn path_owners(
+    db: &Db,
+    solution: &str,
+    path: &str,
+    spaces: &[Id],
+) -> Result<Vec<RefItem>, StoreError> {
+    if spaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (solution, path) = (solution.to_string(), path.to_string());
+    let spaces = ids_json(spaces);
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT f.state, f.owner_kind, f.owner_id, coalesce(n.name, e.title, ''), e.kind,
+                    f.symbol, coalesce(n.space_id, e.space_id)
+             FROM file_refs f {OWNER_JOIN}
+             WHERE f.solution_guid = ?1 AND f.path = ?3 AND {LIVE_OWNER}
+             ORDER BY f.symbol IS NULL, f.recorded_at DESC, f.id DESC"
+        ))?;
+        let rows = st.query_map(params![solution, spaces, path], |r| {
+            Ok((
+                r.get::<_, RefState>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<zam_core::Id>>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (state, kind, id, title, ekind, symbol, space) = row?;
+            let (id, kind) = owner_ref(&kind, &id, ekind.as_deref());
+            out.push(RefItem {
+                id,
+                kind,
+                title,
+                state,
+                symbol,
+                space,
+            });
+        }
+        Ok(out)
+    })
+    .await
+}
+
 /// Живые владельцы ссылок на путь `path` (нормализован вызывающим) в пространствах `spaces`
-/// — в любом решении: «что память знает об этом файле». Новые первыми.
+/// — в любом решении: «что память знает об этом файле». Владельцы ссылок на символы первыми,
+/// затем новые первыми. `symbol` задан (`путь#qual`) — только ссылки на этот символ (первыми)
+/// и файловые; ссылки на другие символы файла — нет (ревью задачи 6 M5.6, M3).
 pub async fn refs_to_path(
     db: &Db,
     path: &str,
+    symbol: Option<&str>,
     spaces: &[Id],
 ) -> Result<Vec<TargetRef>, StoreError> {
     let path = path.to_string();
+    let symbol = symbol.map(str::to_string);
     let spaces = ids_json(spaces);
     db.read(move |c| {
         let mut st = c.prepare_cached(&format!(
             "SELECT f.owner_kind, f.owner_id FROM file_refs f {OWNER_JOIN}
              WHERE f.path = ?1 AND {LIVE_OWNER}
-             ORDER BY f.recorded_at DESC, f.id DESC"
+               AND (?3 IS NULL OR f.symbol IS NULL OR f.symbol = ?3)
+             ORDER BY f.symbol IS NULL, f.recorded_at DESC, f.id DESC"
         ))?;
-        let rows = st.query_map(params![path, spaces], |r| {
+        let rows = st.query_map(params![path, spaces, symbol], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Id>(1)?))
         })?;
         let mut out = Vec::new();
@@ -786,7 +1152,8 @@ pub async fn verified_notes(
     .await
 }
 
-/// Пути ссылок `stale` у владельцев `owners` (по алфавиту); владельцы без них в ответ не входят.
+/// Ссылки `stale` у владельцев `owners` строками `путь` или `путь#qual` (по алфавиту);
+/// владельцы без них в ответ не входят.
 pub async fn stale_refs_of(
     db: &Db,
     owners: &[TargetRef],
@@ -806,11 +1173,13 @@ pub async fn stale_refs_of(
     let (nodes, entries) = (of(TargetKind::Node), of(TargetKind::Entry));
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT owner_kind, owner_id, path FROM file_refs
+            "SELECT owner_kind, owner_id,
+                    CASE WHEN symbol IS NULL THEN path ELSE path || '#' || symbol END
+             FROM file_refs
              WHERE state = 'stale'
                AND ((owner_kind = 'node' AND owner_id IN (SELECT value FROM json_each(?1)))
                  OR (owner_kind = 'entry' AND owner_id IN (SELECT value FROM json_each(?2))))
-             ORDER BY owner_kind, owner_id, path",
+             ORDER BY owner_kind, owner_id, path, coalesce(symbol, '')",
         )?;
         let rows = st.query_map(params![nodes, entries], |r| {
             Ok((
@@ -917,8 +1286,8 @@ pub(crate) async fn backfill_refs(db: &Db) -> Result<u64, StoreError> {
                 for (id, space, data) in &batch {
                     let data: serde_json::Value =
                         serde_json::from_str(data).unwrap_or(serde_json::Value::Null);
-                    let paths = changelog_paths(&data);
-                    if paths.is_empty() {
+                    let refs = changelog_refs(&data);
+                    if refs.is_empty() {
                         continue;
                     }
                     let owner = TargetRef {
@@ -926,7 +1295,7 @@ pub(crate) async fn backfill_refs(db: &Db) -> Result<u64, StoreError> {
                         id: *id,
                     };
                     let solution = owner_solution(tx, *space, &a)?;
-                    add_paths(tx, owner, solution.as_deref(), &paths, &now)?;
+                    add_refs(tx, owner, solution.as_deref(), &refs, &now)?;
                     found += 1;
                 }
                 let last = batch.last().map(|b| b.0);
@@ -1000,6 +1369,18 @@ mod tests {
         );
     }
 
+    /// Путь в тексте ошибки: до 200 символов как есть, длиннее — начало, многоточие и длина.
+    #[test]
+    fn shown_ref_clips_long_paths() {
+        assert_eq!(shown_ref("src/a.rs"), "src/a.rs");
+        let max = "я".repeat(SHOWN_REF_CHARS);
+        assert_eq!(shown_ref(&max), max);
+        let long = "я".repeat(1_000_000);
+        let s = shown_ref(&long);
+        assert_eq!(s, format!("{max}… (1000000 символов)"));
+        assert!(s.len() < 1024);
+    }
+
     #[test]
     fn hash_and_commit_checked() {
         let h = "A".repeat(64);
@@ -1015,9 +1396,8 @@ mod tests {
     fn changelog_set_merges_strings_without_hash() {
         let data = serde_json::json!({"refs": {"files": ["a.rs", "../bad", "./b.rs", "a.rs"]}});
         let req = vec![FileRef {
-            path: "b.rs".into(),
             hash: Some("0".repeat(64)),
-            commit: None,
+            ..FileRef::path_only("b.rs".into())
         }];
         let set = entry_set(EntryKind::Changelog, &req, &data);
         assert_eq!(set.len(), 2);

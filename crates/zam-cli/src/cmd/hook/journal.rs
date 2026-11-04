@@ -610,7 +610,7 @@ fn secret_key(k: &str) -> bool {
 
 /// Длинный (≥ 32) высокоэнтропийный токен: символы base64/hex/`-_.`, буквы и цифры вперемешку,
 /// энтропия Шеннона ≥ 3,5 бита на символ.
-fn high_entropy(t: &str) -> bool {
+pub(crate) fn high_entropy(t: &str) -> bool {
     let t = t.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | '(' | '[' | ']'));
     if t.chars().count() < 32
         || !t

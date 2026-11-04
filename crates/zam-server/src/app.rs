@@ -56,6 +56,9 @@ pub struct AppState {
     pub glossary: Arc<crate::glossary::GlossaryCache>,
     /// Разрешения на большие тела запросов (`POST /entries` с отчётом MCP, `/mcp`; M5.5).
     pub big_bodies: api::big_body::BigBodies,
+    /// Карта кода (M5.6 §7): пересчёты рангов (single-flight на решение), слоты и кэш входов
+    /// ранжирования с фокусом.
+    pub code: Arc<api::code::CodeRuntime>,
     /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
     /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
     #[cfg(feature = "test-hooks")]
@@ -299,6 +302,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     let state = AppState {
         maintenance,
         glossary: Arc::default(),
+        code: Arc::default(),
         big_bodies: api::big_body::BigBodies::new(
             api::big_body::BIG_BODY_PERMITS,
             api::note_body_max(&cfg.limits),

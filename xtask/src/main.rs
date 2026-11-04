@@ -3,6 +3,7 @@
 mod bench;
 mod bundles;
 mod changelog;
+mod code_bench;
 mod docs_corpus;
 mod eval;
 mod fetch;
@@ -117,6 +118,10 @@ enum Cmd {
     /// Замеры нефункциональных целей §17 ТЗ (поиск, индексация, запись, reindex, RSS, старт,
     /// падение Qdrant) на корпусе eval/ с размножением до --notes заметок
     Bench(bench::BenchArgs),
+    /// Замеры карты кода M5.6 (спецификация §17 п. 2, 3, 8): копия HEAD через git archive в
+    /// .tmp/m56/bench/repo, синхронизации, карта 200/500/1000/2000, ключевые типы в центральных,
+    /// `zam --version` и запуск фоновой синхронизации (p95); отчёт .tmp/m56/bench/report.json
+    CodeBench(code_bench::CodeBenchArgs),
     /// Набор документов eval/docs/ (спецификация M5 §6): DOCX, XLSX, PPTX, PDF и враждебные
     /// файлы детерминированно из сида; бинарники не в git
     DocsCorpus(docs_corpus::DocsCorpusArgs),
@@ -480,6 +485,7 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::DocsCorpus(a) => docs_corpus::main(a, &repo_root()),
         Cmd::DocsExtract(a) => eval::docs::extract::child_main(a, &repo_root()),
         Cmd::Bench(a) => bench::main(a, &repo_root()),
+        Cmd::CodeBench(a) => code_bench::main(a, &repo_root()),
     }
 }
 

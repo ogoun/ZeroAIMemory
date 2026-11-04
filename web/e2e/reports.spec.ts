@@ -84,7 +84,7 @@ test('reports_journal_pinned_in_solution_tree', async ({ page }) => {
   await t.getByRole('button', { name: new RegExp(`^${SOLUTION_NAME}`) }).first().click();
   const journals = t.getByRole('list', { name: `Журналы: ${SOLUTION_NAME}` });
   await expect(journals.getByRole('link')).toHaveText([
-    'Changelog', 'Releases', 'Отчёты', 'Insights', 'Словарь', 'Задачи', 'Вопросы', 'Vault',
+    'Changelog', 'Releases', 'Отчёты', 'Код', 'Insights', 'Словарь', 'Задачи', 'Вопросы', 'Vault',
   ]);
   await journals.getByRole('link', { name: 'Отчёты', exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/s/${SOLUTION_GUID}/j/reports$`));

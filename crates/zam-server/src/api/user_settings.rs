@@ -6,8 +6,8 @@
 //!   **[решение исполнителя, задача 13 M4]**.
 //! - Ключи — `hooks.session_start | hooks.prompt | hooks.pre_tool | hooks.post_tool |
 //!   hooks.checkpoint` и с M4.5 (§9.6) `hooks.subagent_start | hooks.file_context |
-//!   hooks.session_journal | hooks.recovery`, значение — `bool`; нет строки — `true` (новые
-//!   ключи у старых пользователей включены).
+//!   hooks.session_journal | hooks.recovery`, с M5.6 (§10) `hooks.code_map`, значение — `bool`;
+//!   нет строки — `true` (новые ключи у старых пользователей включены).
 //! - `GET/PATCH /auth/settings` — свои (сессия пользователя; администратор — своего
 //!   пользователя); по токену — 403: агент свои подсказки не выключает.
 //!   `GET/PATCH /admin/users/{id}/settings` — администратор, любой пользователь.
@@ -31,8 +31,10 @@ use crate::error::ApiError;
 
 use super::{parse_body, parse_id};
 
-/// Типы подсказок хуков (порядок — порядок в ответе; M4.5 §9.6 добавил последние четыре).
-pub const HOOK_KINDS: [&str; 9] = [
+/// Типы подсказок хуков (порядок — порядок в ответе; M4.5 §9.6 добавил четыре после
+/// `checkpoint`, M5.6 §10 — `code_map`: строка карты в дайджесте, раздел `### Код` пакета под
+/// задачу и автосинхронизация карты из хуков).
+pub const HOOK_KINDS: [&str; 10] = [
     "session_start",
     "prompt",
     "pre_tool",
@@ -42,6 +44,7 @@ pub const HOOK_KINDS: [&str; 9] = [
     "file_context",
     "session_journal",
     "recovery",
+    "code_map",
 ];
 
 /// Префикс ключей переключателей в `user_settings`.
@@ -238,7 +241,8 @@ mod tests {
             f.to_json(),
             json!({"session_start": true, "prompt": true, "pre_tool": true,
                    "post_tool": true, "checkpoint": true, "subagent_start": true,
-                   "file_context": true, "session_journal": true, "recovery": true})
+                   "file_context": true, "session_journal": true, "recovery": true,
+                   "code_map": true})
         );
     }
 

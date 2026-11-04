@@ -198,9 +198,9 @@ fn init_creates_solution_block_hooks_mcp() {
     let (code, body) = api_get(&p, &format!("/solutions/{guid}"));
     assert_eq!(code, 200, "{body}");
     assert!(body.contains("\"role\":\"owner\""), "{body}");
-    // блок v4 с адресом и решением, без токена
+    // блок v5 с адресом и решением, без токена
     let md = p.read("CLAUDE.md");
-    assert!(md.starts_with("<!-- zeroaimemory:begin v4 -->\n"), "{md}");
+    assert!(md.starts_with("<!-- zeroaimemory:begin v5 -->\n"), "{md}");
     assert!(md.contains(&format!("ZeroAIMemoryUrl={url}\n")), "{md}");
     assert!(md.contains(&guid) && md.contains("«Демо»"), "{md}");
     assert!(!md.contains(&tok), "токен в CLAUDE.md");
@@ -267,7 +267,7 @@ fn init_creates_solution_block_hooks_mcp() {
     let o = p.cmd().arg("status").output().unwrap();
     ok(&o);
     assert!(
-        out(&o).contains("Блок инструкции: v4 (актуален)"),
+        out(&o).contains("Блок инструкции: v5 (актуален)"),
         "{}",
         out(&o)
     );
@@ -334,7 +334,7 @@ fn init_is_idempotent_and_preserves_foreign_text_and_hooks() {
     assert!(md.starts_with(head), "{md:?}");
     assert!(md.ends_with(tail), "{md:?}");
     assert!(
-        md.contains("<!-- zeroaimemory:begin v4 -->\r\n"),
+        md.contains("<!-- zeroaimemory:begin v5 -->\r\n"),
         "CRLF файла: {md:?}"
     );
     assert!(!md.contains(&tok), "прежний токен убран из блока");
@@ -409,7 +409,7 @@ fn init_codex_writes_codex_hooks() {
     ok(&o);
     let md = p.read("AGENTS.md");
     assert!(
-        md.starts_with("<!-- zeroaimemory:begin v4 -->\n## ZeroAIMemory memory\n"),
+        md.starts_with("<!-- zeroaimemory:begin v5 -->\n## ZeroAIMemory memory\n"),
         "{md}"
     );
     assert!(!p.repo.join("CLAUDE.md").exists());
@@ -449,10 +449,32 @@ fn init_codex_writes_codex_hooks() {
     assert_eq!(h["hooks"]["Stop"].as_array().unwrap().len(), 1, "{h}");
 }
 
+/// Прогрев сервера без сроков: первый запрос пользователя открывает его базу (миграции) — под
+/// нагрузкой полного прогона дольше 5 с `zam status` (профиль `Probe`), и блок пропадал из
+/// вывода. Проверяется предупреждение об устаревшем блоке, а не время первого ответа.
+fn warm(p: &Proj) {
+    let a = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build(),
+    );
+    for path in ["/spaces", "/agent-setup"] {
+        let st = a
+            .get(&format!("{}/api/v1{path}", p.url))
+            .header("Authorization", format!("Bearer {}", p.token))
+            .call()
+            .unwrap()
+            .status();
+        assert_eq!(st.as_u16(), 200, "прогрев {path}");
+    }
+}
+
 #[test]
 fn status_warns_outdated_block() {
     let (url, tok) = start("status");
     let p = Proj::new("status", &url, &tok);
+    warm(&p);
     std::fs::write(
         p.repo.join("CLAUDE.md"),
         format!("<!-- zeroaimemory:begin v1 -->\nZeroAIMemoryUrl={url}\nZeroAIMemoryToken={tok}\n<!-- zeroaimemory:end -->\n"),
@@ -462,7 +484,7 @@ fn status_warns_outdated_block() {
     ok(&o);
     let s = out(&o);
     assert_eq!(
-        s.matches("Блок ZeroAIMemory устарел (v1 → v4): обнови через `zam init` или WebUI")
+        s.matches("Блок ZeroAIMemory устарел (v1 → v5): обнови через `zam init` или WebUI")
             .count(),
         1,
         "{s}"
@@ -472,7 +494,7 @@ fn status_warns_outdated_block() {
     let j: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(
         j["agent_block"],
-        json!({"version": 1, "current": 4, "outdated": true})
+        json!({"version": 1, "current": 5, "outdated": true})
     );
 }
 
@@ -597,7 +619,7 @@ fn init_bom_files_and_v1_token_without_flag() {
     let stdout = out(&o);
     let md = p.read("CLAUDE.md");
     assert!(
-        md.starts_with("\u{feff}<!-- zeroaimemory:begin v4 -->\n"),
+        md.starts_with("\u{feff}<!-- zeroaimemory:begin v5 -->\n"),
         "{md:?}"
     );
     assert!(md.ends_with("<!-- zeroaimemory:end -->\nхвост\n"), "{md:?}");
@@ -883,7 +905,7 @@ fn init_keeps_symlink_and_writes_target() {
         t.starts_with(
             "# свой текст
 
-<!-- zeroaimemory:begin v4 -->"
+<!-- zeroaimemory:begin v5 -->"
         ),
         "{t}"
     );
@@ -1057,7 +1079,7 @@ fn init_updates_pre_tool_matcher() {
     assert_eq!(p.snapshot(), before);
 }
 
-/// Хуки и блок M4 (v2) заменяются текущим набором (v4): прежние обработчики `zam hook`
+/// Хуки и блок M4 (v2) заменяются текущим набором (v5): прежние обработчики `zam hook`
 /// удаляются, а не дублируются; чужие обработчики остаются на местах.
 #[test]
 fn init_replaces_v2_handlers() {
@@ -1098,7 +1120,7 @@ fn init_replaces_v2_handlers() {
     ok(&o);
     let md = p.read("CLAUDE.md");
     assert!(
-        md.starts_with("# Проект\n\n<!-- zeroaimemory:begin v4 -->\n"),
+        md.starts_with("# Проект\n\n<!-- zeroaimemory:begin v5 -->\n"),
         "{md}"
     );
     assert!(!md.contains("старые правила"), "{md}");

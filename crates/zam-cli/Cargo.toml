@@ -26,6 +26,8 @@ globset.workspace = true
 regex.workspace = true
 # короткий хэш id сессии в именах файлов кэша (CC0-1.0 OR Apache-2.0, уже в дереве)
 blake3.workspace = true
+# карта кода (M5.6): экстрактор tree-sitter — фича `parse` только у клиента (сервер без C-кода)
+zam-code = { path = "../zam-code", features = ["parse"] }
 
 [dev-dependencies]
 zam-server = { path = "../zam-server" }
@@ -35,3 +37,5 @@ zam-markdown = { path = "../zam-markdown" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 axum.workspace = true
 assert_cmd.workspace = true
+# приёмка M5.6: причина устарелости ссылки — из базы сервера соединением только для чтения
+rusqlite.workspace = true

@@ -63,6 +63,9 @@ pub struct SecretHit {
 struct Prefix {
     family: &'static str,
     re: Regex,
+    /// Тот же шаблон без границы слова, с якорем `^`: ключ вплотную к найденному секрету
+    /// ([`glued_prefixes`]).
+    glued: Regex,
 }
 
 fn rx(p: &str) -> Regex {
@@ -79,18 +82,97 @@ static PREFIXES: LazyLock<Vec<Prefix>> = LazyLock::new(|| {
         ("slack", r"(?-u:\b)xox[abprs]-[A-Za-z0-9-]{10,}"),
         ("api", r"(?-u:\b)sk-(?:ant-)?[A-Za-z0-9_-]{20,}"),
         ("google", r"(?-u:\b)AIza[0-9A-Za-z_-]{35}"),
+        // ревью задачи 5 M5.6, M8: Hugging Face, npm, SendGrid (ASIA и пароль в URL — выше)
+        // ровно 34: иначе жадный повтор съел бы `hf` вплотную следующего ключа
+        ("huggingface", r"(?-u:\b)hf_[A-Za-z0-9]{34}"),
+        ("npm", r"(?-u:\b)npm_[A-Za-z0-9]{36}"),
+        (
+            "sendgrid",
+            r"(?-u:\b)SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}",
+        ),
         // формат zam_core::token: `zam_` + 40 символов base62
         ("zeroaimemory", r"(?-u:\b)zam_[A-Za-z0-9]{40}"),
     ]
     .into_iter()
-    .map(|(family, p)| Prefix { family, re: rx(p) })
+    .map(|(family, p)| Prefix {
+        family,
+        re: rx(p),
+        glued: rx(&format!(
+            "^(?:{})",
+            p.strip_prefix(r"(?-u:\b)").unwrap_or(p)
+        )),
+    })
     .collect()
 });
+
+/// Окно проверки ключа внутри конца находки, байт ([`glued_prefixes`]): правило с жадным
+/// хвостом (`xox…-[A-Za-z0-9-]{10,}`, `sk-…`, `glpat-…`, JWT) поглощает начало вплотную
+/// следующего ключа (`xoxb-…hf` + `_<34>`); его начало — не дальше окна от конца находки
+/// (самый длинный литерал префикса — `github_pat_`, заголовок JWT — десятки символов).
+const GLUED_INNER_WINDOW: usize = 256;
+
+/// Первые байты шаблонов [`PREFIXES`] и JWT: проверка внутри находки — только с них.
+const GLUED_FIRST: &[u8] = b"AghxsSnze";
+
+/// Ключи (префиксные и JWT) с позиции `at` — якорем, без границы слова.
+fn anchored_at(text: &str, at: usize, out: &mut Vec<(Range<usize>, SecretKind)>) {
+    let rest = &text[at..];
+    for p in PREFIXES.iter() {
+        if let Some(m) = p.glued.find(rest) {
+            out.push((at..at + m.end(), SecretKind::KnownPrefix(p.family)));
+        }
+    }
+    if let Some(m) = JWT_GLUED.find(rest) {
+        out.push((at..at + m.end(), SecretKind::Jwt));
+    }
+}
+
+/// Ключи вплотную к найденным секретам (`SG.<22>.<43>hf_<34>`, `ghp_…ghp_…`, `ghp_…eyJ…`,
+/// `xoxb-…hf_…`): правило префикса требует границы слова слева, а её у слипшегося ключа нет —
+/// без этого шага второй ключ уходил бы открытым в чанки и индекс, а маскировка не была бы
+/// идемпотентной (ревью задачи 9A, M2). Для каждой находки: от её конца шаблоны префиксов и JWT
+/// проверяются якорем; у префиксной и JWT — ещё и с позиций последних [`GLUED_INNER_WINDOW`]
+/// байт внутри неё (жадный хвост съел начало следующего ключа; берутся ключи, выходящие за
+/// конец находки). Найденное — снова в работу. Повторы отсекает множество `(начало, конец)`:
+/// цепочка из 50 000 ключей — линейно (ревью повторное 9A).
+fn glued_prefixes(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
+    let mut seen: std::collections::HashSet<(usize, usize)> =
+        raw.iter().map(|(r, _)| (r.start, r.end)).collect();
+    let mut ends: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut work: Vec<(Range<usize>, SecretKind)> = raw.clone();
+    let mut found = Vec::new();
+    while let Some((h, kind)) = work.pop() {
+        found.clear();
+        if h.end < text.len() && text.is_char_boundary(h.end) && ends.insert(h.end) {
+            anchored_at(text, h.end, &mut found);
+        }
+        if matches!(kind, SecretKind::KnownPrefix(_) | SecretKind::Jwt) {
+            let from = (h.start + 1).max(h.end.saturating_sub(GLUED_INNER_WINDOW));
+            let mut inner = Vec::new();
+            for pos in from..h.end {
+                if GLUED_FIRST.contains(&text.as_bytes()[pos]) && text.is_char_boundary(pos) {
+                    anchored_at(text, pos, &mut inner);
+                }
+            }
+            found.extend(inner.into_iter().filter(|(r, _)| r.end > h.end));
+        }
+        for (r, k) in found.drain(..) {
+            if seen.insert((r.start, r.end)) {
+                raw.push((r.clone(), k));
+                work.push((r, k));
+            }
+        }
+    }
+}
 
 /// JWT: заголовок `eyJ…` (base64 от `{"`) и ещё две части, каждая от 10 символов
 /// [решение исполнителя: требование `eyJ` отсекает имена вида `a.b.c`].
 static JWT: LazyLock<Regex> =
     LazyLock::new(|| rx(r"(?-u:\b)eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"));
+
+/// JWT без границы слова, с якорем `^` — для [`glued_prefixes`] (`ghp_<36>eyJ…`).
+static JWT_GLUED: LazyLock<Regex> =
+    LazyLock::new(|| rx(r"^eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"));
 
 /// Блок закрытого ключа целиком; без `END` — заголовок и следующие строки base64.
 static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
@@ -215,9 +297,118 @@ fn url_token_around<'a>(text: &'a str, r: &Range<usize>) -> &'a str {
     text.get(s..e).unwrap_or("")
 }
 
+/// Конец маски, которая покроет позицию `at`: цепочка пересекающихся диапазонов (как при их
+/// объединении в [`merge_ranges`]) — находок энтропии текущего кандидата `local` и находок
+/// остальных правил `others` (объединены, по возрастанию: из них цепочку продолжает только
+/// последний с началом не правее конца — двоичный поиск).
+fn masked_span_end(
+    local: &[(Range<usize>, SecretKind)],
+    others: &[Range<usize>],
+    at: usize,
+) -> usize {
+    let joins = |h: &Range<usize>, end: usize| {
+        h.start <= end && (h.start <= at || h.start < end) && h.end > end
+    };
+    let mut end = at;
+    let mut grown = true;
+    while grown {
+        grown = false;
+        for (h, _) in local {
+            if joins(h, end) {
+                end = h.end;
+                grown = true;
+            }
+        }
+        let i = others.partition_point(|h| h.start <= end);
+        if i > 0 && joins(&others[i - 1], end) {
+            end = others[i - 1].end;
+            grown = true;
+        }
+    }
+    end
+}
+
+/// Позиция `at` внутри одной из находок `others` (объединены, по возрастанию).
+fn covered_by(others: &[Range<usize>], at: usize) -> bool {
+    let i = others.partition_point(|h| h.start <= at);
+    i > 0 && at < others[i - 1].end
+}
+
+/// URL-токен вокруг `r`, если текст от `r.end` до `masked_end` заменён маской: левая часть — как
+/// в [`url_token_around`], правая продолжается за маской до границы.
+fn url_token_masked(text: &str, r: &Range<usize>, masked_end: usize) -> String {
+    let b = text.as_bytes();
+    let mut s = r.start;
+    while s > 0 && !is_url_delim(b[s - 1]) {
+        s -= 1;
+    }
+    let mut e = masked_end;
+    while e < b.len() && !is_url_delim(b[e]) {
+        e += 1;
+    }
+    let mut out = String::new();
+    out.push_str(text.get(s..r.end).unwrap_or(""));
+    out.push_str(SECRET_MARK);
+    out.push_str(text.get(masked_end..e).unwrap_or(""));
+    out
+}
+
+/// Предел повторных сканов вида с масками в [`scan_secrets`]: каждый скан линеен, их число —
+/// константа. На практике хватает одного-двух (маска одного правила открывает находку другого).
+const FIXPOINT_MAX: usize = 4;
+
 /// Находит секреты. Результат отсортирован по началу, диапазоны не пересекаются
 /// (пересёкшиеся объединяются, вид берётся у первого), `line` считается с 1.
+///
+/// Скан — до неподвижной точки (полный прогон перед слиянием M5.6, `mask_is_idempotent`):
+/// после первого прохода по тексту все правила повторяются по [`MaskedView`] — тексту, каким его
+/// увидит повторная маскировка. Маска одного правила меняет контекст другого: убирает `://` из
+/// URL-токена кандидата энтропии (`Ahf_<34>‹secret›password=…postgres://…`), `/` и `"` из имени
+/// пользователя в URL (`s://x,Ab/<40>:пароль@h`), — и находка, которую иначе открыл бы только
+/// второй проход, маскируется сразу. Находки первого прохода остаются: вид их не отменяет
+/// (энтропия по тексту видит длинного кандидата целиком, по виду — обрывки между масками).
+/// Скан останавливается, когда вид не даёт находок, — тогда `mask_text` идемпотентна; не дольше
+/// [`FIXPOINT_MAX`] повторов.
 pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
+    let mut raw = scan_rules(text);
+    for _ in 0..FIXPOINT_MAX {
+        if raw.is_empty() {
+            break;
+        }
+        let view = MaskedView::new(text, &raw);
+        // вид из одних масок находок не даст (ни одно правило не совпадает внутри `‹secret›`):
+        // цепочка из десятков тысяч ключей не сканируется второй раз
+        if view.all_masked() {
+            break;
+        }
+        let found = scan_rules(&view.text);
+        if found.is_empty() {
+            break;
+        }
+        raw.extend(
+            found
+                .into_iter()
+                .map(|(r, k)| (view.start_in_text(r.start)..view.end_in_text(r.end), k)),
+        );
+    }
+    let merged = merge_ranges(raw);
+    // номера строк одним проходом
+    let (mut line, mut pos) = (1usize, 0usize);
+    merged
+        .into_iter()
+        .map(|(range, kind)| {
+            line += text.as_bytes()[pos..range.start]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count();
+            pos = range.start;
+            SecretHit { kind, range, line }
+        })
+        .collect()
+}
+
+/// Все правила по `text` (один проход, без объединения).
+fn scan_rules(text: &str) -> Vec<(Range<usize>, SecretKind)> {
     let mut raw: Vec<(Range<usize>, SecretKind)> = Vec::new();
     for p in PREFIXES.iter() {
         for m in p.re.find_iter(text) {
@@ -244,16 +435,131 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
             raw.push((v.range(), SecretKind::UrlPassword));
         }
     }
+    glued_prefixes(text, &mut raw);
+    let others: Vec<Range<usize>> = merge_ranges(raw.clone())
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect();
+    raw.extend(
+        entropy_hits(text, &others)
+            .into_iter()
+            .map(|r| (r, SecretKind::HighEntropy)),
+    );
+    raw
+}
+
+/// Объединение находок: по началу (при равном — длинная первой), пересёкшиеся — в один
+/// диапазон с видом первого, смежные остаются раздельными (две маски подряд).
+fn merge_ranges(mut raw: Vec<(Range<usize>, SecretKind)>) -> Vec<(Range<usize>, SecretKind)> {
+    raw.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(b.0.end.cmp(&a.0.end)));
+    let mut merged: Vec<(Range<usize>, SecretKind)> = Vec::with_capacity(raw.len());
+    for (r, k) in raw {
+        match merged.last_mut() {
+            Some((last, _)) if r.start < last.end => last.end = last.end.max(r.end),
+            _ => merged.push((r, k)),
+        }
+    }
+    merged
+}
+
+/// Текст, каким его увидит повторный проход маскировки: находки заменены [`SECRET_MARK`]
+/// (объединение — [`merge_ranges`], как в [`mask_secrets`] над результатом [`scan_secrets`]).
+struct MaskedView {
+    text: String,
+    /// Куски без маски: (начало в виде, начало в тексте), по возрастанию; за куском `i` —
+    /// маска `marks[i]` (последний кусок — без маски).
+    segs: Vec<(usize, usize)>,
+    /// Диапазоны текста под масками.
+    marks: Vec<Range<usize>>,
+    /// Длина исходного текста.
+    src_len: usize,
+}
+
+impl MaskedView {
+    fn new(text: &str, raw: &[(Range<usize>, SecretKind)]) -> Self {
+        let marks: Vec<Range<usize>> = merge_ranges(raw.to_vec())
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        let mut out = String::with_capacity(text.len());
+        let mut segs = vec![(0, 0)];
+        let mut pos = 0;
+        for r in &marks {
+            out.push_str(&text[pos..r.start]);
+            out.push_str(SECRET_MARK);
+            pos = r.end;
+            segs.push((out.len(), pos));
+        }
+        out.push_str(&text[pos..]);
+        MaskedView {
+            text: out,
+            segs,
+            marks,
+            src_len: text.len(),
+        }
+    }
+
+    /// Вне масок нет ни байта.
+    fn all_masked(&self) -> bool {
+        self.text.len() == self.marks.len() * SECRET_MARK.len()
+    }
+
+    /// Кусок, в котором лежит позиция вида `at`, и смещение от его начала.
+    fn locate(&self, at: usize) -> (usize, usize) {
+        debug_assert!(at <= self.text.len(), "позиция вне вида: {at}");
+        let i = self.segs.partition_point(|s| s.0 <= at) - 1;
+        (i, at - self.segs[i].0)
+    }
+
+    /// Начало находки вида в тексте: внутри маски — начало замаскированного диапазона.
+    fn start_in_text(&self, at: usize) -> usize {
+        let (i, off) = self.locate(at);
+        let t = self.segs[i].1;
+        let r = match self.marks.get(i) {
+            Some(m) if t + off > m.start => m.start,
+            _ => t + off,
+        };
+        debug_assert!(r <= self.src_len, "начало вне текста: {r}");
+        r
+    }
+
+    /// Конец находки вида в тексте: внутри маски — конец замаскированного диапазона.
+    fn end_in_text(&self, at: usize) -> usize {
+        let (i, off) = self.locate(at);
+        let t = self.segs[i].1;
+        let r = match self.marks.get(i) {
+            Some(m) if t + off > m.start => m.end,
+            _ => t + off,
+        };
+        debug_assert!(r <= self.src_len, "конец вне текста: {r}");
+        r
+    }
+}
+
+/// Находки правила энтропии в `text`; `others` — объединённые находки остальных правил того же
+/// текста (по возрастанию): имя перед замаскированным ими значением проверяется сразу.
+fn entropy_hits(text: &str, others: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    // находки текущего кандидата: находки прежних кончаются до его начала (кандидаты не
+    // пересекаются, идут слева направо) и на проверки ниже не влияют — перебор только их
+    // держит цепочку `<имя>=<значение> …` линейной (ревью b854b22, M1)
+    let mut raw: Vec<(Range<usize>, SecretKind)> = Vec::new();
     for m in ENTROPY_CANDIDATE.find_iter(text) {
+        out.extend(raw.drain(..).map(|(r, _)| r));
         let start = m.start();
         let mut end = m.end();
+        // конец замаскированного значения справа от проверяемого имени (см. ниже)
+        let mut masked_end: Option<usize> = None;
         loop {
             // `имя=значение`: `=` внутри строки — разделитель, а не base64-дополнение (оно в
             // конце); проверяется значение
             let inner = text[start..end].trim_end_matches('=').rfind('=');
             let r = inner.map_or(start..end, |i| start + i + 1..end);
-            if r.len() >= 32 && is_high_entropy_secret(&text[r.clone()], url_token_around(text, &r))
-            {
+            let token = match masked_end {
+                Some(me) => url_token_masked(text, &r, me),
+                None => url_token_around(text, &r).to_string(),
+            };
+            if r.len() >= 32 && is_high_entropy_secret(&text[r.clone()], &token) {
                 raw.push((r.clone(), SecretKind::HighEntropy));
             }
             // значение замаскировано (этим или другим правилом): повторный проход увидит
@@ -264,37 +570,23 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
             // `long_name_left_of_masked_value`)
             match inner {
                 Some(_)
-                    if raw
-                        .iter()
-                        .any(|(h, _)| h.start <= r.start && r.start < h.end) =>
+                    if covered_by(others, r.start)
+                        || raw
+                            .iter()
+                            .any(|(h, _)| h.start <= r.start && r.start < h.end) =>
                 {
+                    // окрестность имени — как во втором проходе, где значение уже заменено
+                    // маской: иначе `://` замаскированного значения скрывает имя только в первом
+                    // проходе (CI 41605984321, `mask_is_idempotent`)
+                    masked_end = Some(masked_span_end(&raw, others, r.start));
                     end = r.start;
                 }
                 _ => break,
             }
         }
     }
-    raw.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(b.0.end.cmp(&a.0.end)));
-    let mut merged: Vec<(Range<usize>, SecretKind)> = Vec::with_capacity(raw.len());
-    for (r, k) in raw {
-        match merged.last_mut() {
-            Some((last, _)) if r.start < last.end => last.end = last.end.max(r.end),
-            _ => merged.push((r, k)),
-        }
-    }
-    // номера строк одним проходом
-    let (mut line, mut pos) = (1usize, 0usize);
-    merged
-        .into_iter()
-        .map(|(range, kind)| {
-            line += text.as_bytes()[pos..range.start]
-                .iter()
-                .filter(|&&b| b == b'\n')
-                .count();
-            pos = range.start;
-            SecretHit { kind, range, line }
-        })
-        .collect()
+    out.extend(raw.into_iter().map(|(r, _)| r));
+    out
 }
 
 /// Заменяет диапазоны `hits` на [`SECRET_MARK`]; остальные байты не меняются.

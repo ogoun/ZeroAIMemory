@@ -342,7 +342,10 @@ pub(crate) fn note_meta(content: &str, agent_l0: Option<&str>) -> NoteMeta {
             m.insert("index".into(), i.into());
         }
         // ссылки на файлы и проверка заметки (M4.5 §6.1, §7) — только заданные
-        let refs = crate::file_refs::note_ref_paths(Some(f));
+        let refs: Vec<String> = crate::file_refs::note_refs(Some(f))
+            .iter()
+            .map(crate::file_refs::FileRef::display)
+            .collect();
         if !refs.is_empty() {
             m.insert("refs".into(), serde_json::json!(refs));
         }
@@ -1124,6 +1127,27 @@ pub(crate) async fn rechunk_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ревью задачи 9A, M2: слипшиеся ключи (`SG.…hf_…`) не попадают в чанки открытыми.
+    #[test]
+    fn glued_secrets_masked_in_chunks() {
+        let hf = format!("hf_{}", "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb");
+        let sg = format!(
+            "SG.{}.{}",
+            "Ab3dEf6hIj9kLm2nOp5qRs", "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe9fGhJ"
+        );
+        let src = format!("# Ключи\n\nконфиг: {sg}{hf} конец.\n");
+        let doc = parse(&src);
+        let ch = note_chunks(&src, &doc, "n", &ApproxCounter);
+        assert!(!ch.is_empty());
+        for c in &ch {
+            assert!(
+                !c.text.contains("hf_") && !c.text.contains("SG."),
+                "{}",
+                c.text
+            );
+        }
+    }
 
     #[test]
     fn truncate_at_word_boundary() {

@@ -169,7 +169,7 @@ async fn session_start_digest_within_budget() {
         j["hooks"],
         json!({"session_start": true, "prompt": true, "pre_tool": true, "post_tool": true,
                "checkpoint": true, "subagent_start": true, "file_context": true,
-               "session_journal": true, "recovery": true})
+               "session_journal": true, "recovery": true, "code_map": true})
     );
     for k in ["collect_ms", "record_ms", "total_ms"] {
         assert!(j["timings"][k].is_number(), "{k}: {j}");
@@ -287,7 +287,7 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
     );
     assert!(
         text.contains(
-            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v4): обнови через `zam init` или WebUI"
+            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v5): обнови через `zam init` или WebUI"
         ),
         "{text}"
     );
@@ -1092,7 +1092,8 @@ async fn recall_disabled_hook_kind_is_silent() {
         j["hooks"],
         json!({"session_start": false, "prompt": false, "pre_tool": true,
                "post_tool": false, "checkpoint": true, "subagent_start": true,
-               "file_context": true, "session_journal": true, "recovery": true})
+               "file_context": true, "session_journal": true, "recovery": true,
+               "code_map": true})
     );
     let j = ok(
         &a,
@@ -1132,4 +1133,238 @@ async fn recall_disabled_hook_kind_is_silent() {
     )
     .await;
     assert_eq!(j["hooks"]["session_start"], true, "{j}");
+}
+
+// ---- M5.6 задача 6: строка карты кода в дайджесте и пакете восстановления (§10) ----
+
+/// Карта решения `G` токеном `tok`: файлы `(путь, [(qual, строка)])`, снимок `main@abcdef1`,
+/// машина `box`.
+async fn load_map(a: &Api, tok: &str, files: &[(&str, &[(&str, u32)])]) {
+    let h = |n: usize| format!("{n:064x}");
+    let manifest: Vec<Value> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (p, _))| json!({"path": p, "hash": h(i + 1)}))
+        .collect();
+    let r = a
+        .tok(
+            tok,
+            Method::POST,
+            "/api/v1/code/sync",
+            Some(
+                json!({"solution": G, "commit": "abcdef1234", "branch": "main",
+                        "machine": "box", "manifest": manifest}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let up: Vec<Value> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (p, syms))| {
+            let symbols: Vec<Value> = syms
+                .iter()
+                .map(|(q, line)| {
+                    let name = q.rsplit("::").next().unwrap();
+                    json!({"name": name, "qual": q, "kind": "function", "line": line,
+                           "end_line": line + 2, "sig": format!("fn {name}()"),
+                           "body_hash": format!("{line:016x}"), "exported": true})
+                })
+                .collect();
+            json!({"path": p, "lang": "rust", "hash": h(i + 1), "size": 10,
+                   "parse_state": "ok", "symbols": symbols, "refs": []})
+        })
+        .collect();
+    let r = a
+        .tok(
+            tok,
+            Method::PUT,
+            "/api/v1/code/files",
+            Some(
+                json!({"solution": G, "commit": "abcdef1234", "branch": "main",
+                        "machine": "box", "files": up}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// Строка карты кода в тексте или `None`.
+fn code_line(j: &Value) -> Option<String> {
+    j["text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with("ZeroAIMemory: карта кода:"))
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn digest_code_line_under_80_tokens_after_verified() {
+    let a = server("code-line").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    note_as(
+        &a,
+        &a.token,
+        G,
+        "Команды/Сборка",
+        "---\nverified_at: 2026-11-01\n---\n# Сборка\n\ncargo build\n",
+    )
+    .await;
+    load_map(
+        &a,
+        &a.token,
+        &[
+            ("src/store.rs", &[("Store::open", 1), ("Store::close", 9)]),
+            ("src/api.rs", &[("route", 1)]),
+        ],
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("code-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let line = code_line(&j).unwrap_or_else(|| panic!("нет строки карты: {j}"));
+    assert!(
+        line.starts_with("ZeroAIMemory: карта кода: 2 файла, 3 символа, снимок 0 мин (main@abcdef1); центральные: "),
+        "{line}"
+    );
+    assert!(line.ends_with(" — `memory_code`/`zam code map`"), "{line}");
+    assert!(!line.contains("box"), "без машины: {line}");
+    assert!(zam_store::count_tokens(&line) <= 80, "{line}");
+    // сразу после строки проверенных команд
+    let text = j["text"].as_str().unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let v = lines
+        .iter()
+        .position(|l| l.starts_with("Проверенные команды:"))
+        .unwrap_or_else(|| panic!("нет проверенных команд: {text}"));
+    assert!(
+        lines[v + 1].starts_with("ZeroAIMemory: карта кода:"),
+        "{text}"
+    );
+    // длинные имена: центральные сокращаются, строка ≤ 80 токенов
+    let long: Vec<String> = (0..3)
+        .map(|k| format!("VeryLongTypeNameNumber{k}ForDigestBudget::method_with_long_name_{k}"))
+        .collect();
+    let syms: Vec<(&str, u32)> = long.iter().map(|q| (q.as_str(), 1)).collect();
+    let files: Vec<(String, Vec<(&str, u32)>)> = syms
+        .iter()
+        .enumerate()
+        .map(|(k, s)| (format!("src/long{k}.rs"), vec![*s]))
+        .collect();
+    let refs: Vec<(&str, &[(&str, u32)])> = files
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_slice()))
+        .collect();
+    load_map(&a, &a.token, &refs).await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("code-2"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let line = code_line(&j).unwrap_or_else(|| panic!("нет строки карты: {j}"));
+    assert!(zam_store::count_tokens(&line) <= 80, "{line}");
+}
+
+#[tokio::test]
+async fn digest_no_map_no_line() {
+    let a = server("code-none").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let j = ok(
+        &a,
+        &a.token,
+        Some("none-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    assert_eq!(code_line(&j), None, "{j}");
+}
+
+#[tokio::test]
+async fn digest_code_map_off_no_line() {
+    let a = server("code-off").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    load_map(&a, &a.token, &[("src/a.rs", &[("alpha", 1)])]).await;
+    let uri = format!("/api/v1/admin/users/{}/settings", a.admin_id());
+    let r = a
+        .adm(
+            Method::PATCH,
+            &uri,
+            Some(json!({"hooks": {"code_map": false}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // хуки (`session_start`, запрос с полем `code_map`) — без строки
+    for body in [
+        json!({"event": "session_start", "solution": G}),
+        json!({"event": "recovery", "solution": G, "code_map": true}),
+    ] {
+        let j = ok(&a, &a.token, Some("off-1"), body.clone()).await;
+        assert_eq!(code_line(&j), None, "{body}: {j}");
+    }
+    // ревью задачи 6, M2: явный вызов (MCP `memory_recall`, REST без `code_map`) не гасится
+    let j = ok(
+        &a,
+        &a.token,
+        Some("off-1"),
+        json!({"event": "recovery", "solution": G}),
+    )
+    .await;
+    assert!(code_line(&j).is_some(), "{j}");
+    // `[hooks] code_map = false` клиента (поле запроса) — без строки и при включённом сервере
+    let r = a
+        .adm(
+            Method::PATCH,
+            &uri,
+            Some(json!({"hooks": {"code_map": true}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = ok(
+        &a,
+        &a.token,
+        Some("off-2"),
+        json!({"event": "session_start", "solution": G, "code_map": false}),
+    )
+    .await;
+    assert_eq!(code_line(&j), None, "{j}");
+    // `code.enabled = false` сервера — тоже без строки
+    let b = api("recall-code-disabled", |c| {
+        roomy(c);
+        c.code.enabled = false;
+    })
+    .await;
+    assert_eq!(register(&b, &b.token).await.status, StatusCode::CREATED);
+    let j = ok(
+        &b,
+        &b.token,
+        Some("dis-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    assert_eq!(code_line(&j), None, "{j}");
+}
+
+#[tokio::test]
+async fn recovery_has_code_line() {
+    let a = server("code-recovery").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    load_map(&a, &a.token, &[("src/a.rs", &[("alpha", 1)])]).await;
+    for body in [
+        json!({"event": "recovery", "solution": G}),
+        json!({"event": "session_start", "solution": G, "source": "compact"}),
+    ] {
+        let j = ok(&a, &a.token, Some("rec-1"), body.clone()).await;
+        let line = code_line(&j).unwrap_or_else(|| panic!("{body}: нет строки: {j}"));
+        assert!(line.contains("1 файл, 1 символ"), "{line}");
+        assert!(line.contains("центральные: alpha"), "{line}");
+    }
 }

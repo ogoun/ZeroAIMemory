@@ -17,6 +17,8 @@
 //! M4.5: `PreCompact` пишет в журнал сессии `Ev::Compact {trigger}` (ключ `session_journal`);
 //! на `Stop` и `PreCompact` очередь изменённых файлов сессии уходит `POST /files/changed`
 //! параллельно с `GET /sessions/{id}` в том же бюджете ([`cache::flush_changed`]).
+//! M5.6 §5: были правки в сессии — после запросов хука запуск фоновой
+//! `zam code sync --background`, если пора ([`crate::cmd::code::auto::maybe_spawn_sync`]).
 use super::cache;
 use super::input::Input;
 use super::journal::{self, Ev};
@@ -55,6 +57,20 @@ pub fn task_line(v: &serde_json::Value) -> Option<String> {
 }
 
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
+    let out = checkpoint(env, inp, s);
+    // карта кода (M5.6 §5): после правок сессии — фоновая синхронизация, если пора
+    if inp
+        .session_id
+        .as_deref()
+        .is_some_and(|id| cache::had_edits(env, id))
+    {
+        crate::cmd::code::auto::maybe_spawn_sync(env, s);
+    }
+    out
+}
+
+/// Журнал, очереди и напоминание (см. модуль).
+fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
     let session = inp.session_id.as_deref();
     if inp.event == "PreCompact"
         && let Some(id) = session

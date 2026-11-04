@@ -4,6 +4,7 @@ pub mod agent_setup;
 pub mod big_body;
 pub mod blobs;
 pub mod cache;
+pub mod code;
 pub mod doc_locator;
 pub mod downloads;
 pub mod entries;
@@ -107,7 +108,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
             state.clone(),
             sessions::count_memory_writes,
         ))
-        .merge(service_routes())
+        .merge(service_routes(&state.cfg))
 }
 
 /// Маршруты записи в память (и чтения тех же ресурсов): узлы, вложения, записи журналов,
@@ -181,9 +182,32 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/cache/{id}/promote", post(cache::promote))
 }
 
-/// Остальные маршруты: служебные, чтение, поиск, сессии, администрирование.
-fn service_routes() -> Router<AppState> {
+/// Предел тела `PUT /code/files`, `POST /code/impact` — `code.max_request_bytes`; у
+/// `POST /code/sync` свой — манифест на `code.max_files` путей ([`code::sync_body_max`]). Больше —
+/// 413 с пределом в `detail`.
+fn code_body_limit(c: &ServerConfig) -> DefaultBodyLimit {
+    DefaultBodyLimit::max(usize::try_from(c.code.max_request_bytes).unwrap_or(usize::MAX))
+}
+
+/// Остальные маршруты: служебные, чтение, поиск, сессии, администрирование, карта кода.
+fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
+    let code_limit = code_body_limit(cfg);
     Router::new()
+        // карта кода (M5.6): производные данные, не запись памяти — `memory_writes` не растёт
+        .route("/api/v1/code", delete(code::clear))
+        .route(
+            "/api/v1/code/sync",
+            post(code::sync).layer(DefaultBodyLimit::max(code::sync_body_max(&cfg.code))),
+        )
+        .route(
+            "/api/v1/code/files",
+            get(code::files).put(code::put_files).layer(code_limit),
+        )
+        .route("/api/v1/code/status", get(code::status))
+        .route("/api/v1/code/map", get(code::map))
+        .route("/api/v1/code/symbols", get(code::symbols))
+        .route("/api/v1/code/symbols/{id}", get(code::symbol))
+        .route("/api/v1/code/impact", post(code::impact).layer(code_limit))
         .route("/api/v1/health", get(health::health))
         .route("/api/v1/ready", get(health::ready))
         .route("/api/v1/auth/login", post(login::login))
@@ -271,8 +295,15 @@ fn service_routes() -> Router<AppState> {
         .route("/api/v1/triggers", get(triggers::list))
         // ссылки на файлы (M4.5 §6): состояние ссылок, не текст памяти — вне `memory_routes`
         .route("/api/v1/file-refs", get(files::index))
-        .route("/api/v1/files/changed", post(files::changed))
-        .route("/api/v1/files/verified", post(files::verified))
+        // тела с хэшами символов (M5.6 §8) — до `code.max_request_bytes`, как загрузка карты
+        .route(
+            "/api/v1/files/changed",
+            post(files::changed).layer(code_body_limit(cfg)),
+        )
+        .route(
+            "/api/v1/files/verified",
+            post(files::verified).layer(code_body_limit(cfg)),
+        )
         .route(
             "/api/v1/sessions",
             get(sessions::list).post(sessions::create),
@@ -326,7 +357,8 @@ pub(crate) fn parse_id(s: &str) -> Result<Id, ApiError> {
         .map_err(|_| ApiError::BadRequest("некорректный идентификатор".into()))
 }
 
-pub(crate) fn parse_body<T: DeserializeOwned>(b: &Bytes) -> Result<T, ApiError> {
+/// Тело JSON (тип может заимствовать из `b`, например `&RawValue`); ошибка — 400.
+pub(crate) fn parse_body<'a, T: serde::Deserialize<'a>>(b: &'a Bytes) -> Result<T, ApiError> {
     serde_json::from_slice(b).map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))
 }
 

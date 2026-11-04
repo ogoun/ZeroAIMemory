@@ -194,6 +194,11 @@ impl Client {
         &self.base
     }
 
+    /// Имя машины (`X-Zam-Machine`), если известно.
+    pub fn machine(&self) -> Option<&str> {
+        self.machine.as_deref()
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}/api/v1{path}", self.base)
     }
@@ -307,6 +312,12 @@ impl Client {
             rb.content_type("application/json")
                 .send(body.to_string().as_bytes()),
         )
+    }
+
+    /// PUT JSON без `If-Match` (готовое тело: размер пачки считает вызывающий).
+    pub fn put_json_body(&self, path: &str, body: Vec<u8>) -> Result<Response<Body>, CliError> {
+        let rb = self.prepare(self.agent.put(&self.url(path)));
+        self.check(rb.content_type("application/json").send(&body[..]))
     }
 
     /// POST тела потоком известной длины (`Content-Length`, без chunked).

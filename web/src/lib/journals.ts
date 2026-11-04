@@ -6,6 +6,7 @@ export const JOURNAL_TITLE: Record<Journal, string> = {
   changelog: 'Changelog',
   releases: 'Releases',
   reports: 'Отчёты',
+  code: 'Код',
   insights: 'Insights',
   glossary: 'Словарь',
   tasks: 'Задачи',
@@ -13,10 +14,10 @@ export const JOURNAL_TITLE: Record<Journal, string> = {
   vault: 'Vault',
 };
 
-/** Журналы пространства: у решения — все, у Knowledge — без Changelog, Releases и Отчётов
- * (отчёты пишутся только в решение, M5.5), иначе — нет. */
+/** Журналы пространства: у решения — все, у Knowledge — без Changelog, Releases, Отчётов
+ * (отчёты пишутся только в решение, M5.5) и Кода (карта кода — у решения, M5.6), иначе — нет. */
 export function journalsOf(kind: string): Journal[] {
-  if (kind === 'solution') return ['changelog', 'releases', 'reports', 'insights', 'glossary', 'tasks', 'questions', 'vault'];
+  if (kind === 'solution') return ['changelog', 'releases', 'reports', 'code', 'insights', 'glossary', 'tasks', 'questions', 'vault'];
   if (kind === 'knowledge') return ['insights', 'glossary', 'tasks', 'questions', 'vault'];
   return [];
 }

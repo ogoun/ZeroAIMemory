@@ -22,6 +22,9 @@ ipnet.workspace = true
 thiserror.workspace = true
 argon2.workspace = true
 zam-store = { path = "../zam-store" }
+# M5.6: карта кода — протокол, ранжирование и упаковка карты (без фичи `parse`: C-код
+# грамматик tree-sitter сервер не тянет)
+zam-code = { path = "../zam-code" }
 zam-index = { path = "../zam-index" }
 zam-ml = { path = "../zam-ml" }
 zam-fetch = { path = "../zam-fetch" }
@@ -30,7 +33,8 @@ zam-search = { path = "../zam-search" }
 # `doc-worker`
 zam-docs = { path = "../zam-docs", features = ["pdfium", "images"] }
 jiff.workspace = true
-serde_json.workspace = true
+# `raw_value`: файлы `PUT /code/files` разбираются по одному без промежуточного `Value`
+serde_json = { workspace = true, features = ["raw_value"] }
 # ETag кэша триггеров (§10.3)
 blake3.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
@@ -52,6 +56,8 @@ sha2.workspace = true
 mime_guess.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
+# `LengthLimitError` чтения тела `POST /code/sync` (413 против 400); уже в дереве через axum
+http-body-util.workspace = true
 tower = { workspace = true, features = ["util"] }
 # Vault (§7.6): шифрование, мастер-ключ в base64, случайность ОС
 chacha20poly1305.workspace = true
@@ -92,6 +98,5 @@ zip.workspace = true
 # PDF-фикстуры тестов рабочего процесса (tests/doc_worker.rs)
 zam-docs = { path = "../zam-docs", features = ["pdfium", "test-pdf", "images"] }
 tower = { workspace = true, features = ["util"] }
-http-body-util.workspace = true
 # изображения-фикстуры превью (tests/previews.rs)
 image.workspace = true

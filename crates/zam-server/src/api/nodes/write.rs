@@ -77,14 +77,19 @@ fn note_warnings(content: &str) -> Vec<String> {
         {
             out.push(VERIFIED_AT_COMMIT_INVALID.to_string());
         }
-        let mut valid = 0;
+        // ссылки — как их берёт хранилище (`note_refs`): `путь` или `путь#qual`, без повторов
+        // `(путь, символ)` (M8 ревью задачи 3 M5.6)
+        let mut valid: std::collections::HashSet<(String, Option<String>)> = Default::default();
         for r in &f.refs {
-            match zam_store::normalize_ref_path(r) {
-                Ok(_) => valid += 1,
-                Err(e) => out.push(format!("invalid_ref: {r} ({e})")),
+            let fr = zam_store::FileRef::parse(r);
+            match zam_store::normalize_ref_path(&fr.path) {
+                Ok(p) => {
+                    valid.insert((p, fr.symbol));
+                }
+                Err(e) => out.push(format!("invalid_ref: {} ({e})", zam_store::shown_ref(r))),
             }
         }
-        if valid > zam_store::file_refs::REFS_MAX {
+        if valid.len() > zam_store::file_refs::REFS_MAX {
             out.push(format!(
                 "refs_truncated: учтены первые {}",
                 zam_store::file_refs::REFS_MAX

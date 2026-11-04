@@ -43,7 +43,11 @@
 //!   `Словарь: N терминов — memory_search kinds=[term]` (N > 0, термины решения и Knowledge) и
 //!   строка `Проверенные команды: <путь> (проверено <verified_at>)[; …]` — до
 //!   [`VERIFIED_COMMANDS_MAX`] заметок пространства решения с `verified_at`, новые проверки
-//!   первыми (M4.5 §7, решение владельца 2026-10-28).
+//!   первыми (M4.5 §7, решение владельца 2026-10-28), за ней — строка карты кода решения
+//!   (M5.6 §10, [`super::code::code_line`]: размер, возраст снимка, центральные символы;
+//!   ≤ 80 токенов; нет карты или `code.enabled = false` — строки нет; у хуков (`session_start`
+//!   и запрос с полем `code_map`) её гасят и `hooks.code_map`, и `code_map: false` клиента;
+//!   так же в пакете восстановления).
 //!   Ответ несёт `hooks: {session_start, prompt, pre_tool, post_tool, checkpoint,
 //!   subagent_start, file_context, session_journal, recovery}` — настройки типов подсказок
 //!   пользователя `hooks.<тип>` (R5, [`super::user_settings`], задача 13). Тип запроса выключен у
@@ -104,7 +108,12 @@
 //!   (действующие `decision` с `axiom`/`theorem` по поиску `task`, до 3), `### Термины`
 //!   (термины словаря в `task`, до 5, с определением), `### Ловушки` (действующие
 //!   `gotcha`/`failure` по поиску `task`, до 3), `### Файлы` (записи со ссылками на пути из
-//!   `task` — индекс `file_refs` решения, до 3). Без `task` — мини-дайджест: правила L0,
+//!   `task` — индекс `file_refs` решения, до 3), `### Код` (M5.6 §10: символы карты с именами
+//!   или `qual` из `task` — точные `qual` первыми, затем символы путей из `task`, до
+//!   [`BRIEF_CODE_MAX`], строка `<путь>:<line> <kind> <sig или qual>`, бюджет раздела —
+//!   `min(code.brief_tokens, остаток)`; у хука `subagent-start` (поле `code_map`) выключенный
+//!   `hooks.code_map` или `code_map: false` — раздела нет, явный вызов не гасится; учёта показа
+//!   нет). Без `task` — мини-дайджест: правила L0,
 //!   ловушки решения и Knowledge, `### Задачи` (захваченные `parent_id` или сессией — первыми).
 //!   Поиск — `mode=brief`, балл ≥ `recall.prompt_min_score`. Повторы не отсекаются (у субагента
 //!   свой контекст); показ учитывается (`usage.source = brief`), кроме записей раздела
@@ -266,6 +275,10 @@ const SECTION_TASKS: &str = "### Задачи";
 const SECTION_TERMS: &str = "### Термины";
 const SECTION_TRAPS: &str = "### Ловушки";
 const SECTION_FILES: &str = "### Файлы";
+/// Раздел пакета под задачу с символами карты кода (M5.6 §10).
+const SECTION_CODE: &str = "### Код";
+/// Символов карты в разделе [`SECTION_CODE`].
+pub const BRIEF_CODE_MAX: usize = 5;
 
 /// `source` хука `SessionStart`, после которого строится пакет восстановления.
 const RECOVERY_SOURCES: [&str; 2] = ["compact", "resume"];
@@ -298,6 +311,10 @@ pub struct RecallReq {
     task: Option<String>,
     /// Сессия родителя (`brief` субагента): её захваченные задачи — первыми в мини-дайджесте.
     parent_id: Option<String>,
+    /// Карта кода в ответе по настройке клиента `[hooks] code_map` (M5.6 §10): поле шлют хуки
+    /// (`session-start`, `subagent-start`); есть поле — действует и `hooks.code_map`
+    /// пользователя, нет (явный вызов REST/MCP `recovery`/`brief`) — не гасится.
+    code_map: Option<bool>,
 }
 
 /// Кандидат в подсказки.
@@ -745,12 +762,14 @@ async fn environment_cands(
 
 /// Разделы дайджеста `session_start` (см. модуль); каждый — кандидаты по приоритету.
 /// `recovery` — пакет восстановления: после ответов — раздел решений ([`decision_cands`]).
+#[allow(clippy::too_many_arguments)]
 async fn digest(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
     req: &RecallReq,
     recovery: bool,
+    code_on: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Digest, ApiError> {
@@ -954,6 +973,10 @@ async fn digest(
         .into_iter()
         .collect();
     after_rules.extend(verified_line(health, deadline, sol).await);
+    // строка карты кода — после проверенных команд (M5.6 §10)
+    if code_on {
+        after_rules.extend(code_digest_line(req, headers, health, deadline).await);
+    }
     Ok((notices, sections, after_rules, open_line))
 }
 
@@ -1385,6 +1408,122 @@ type Digest = (
     Vec<String>,
     Option<String>,
 );
+
+/// Цель с картой кода решения запроса: `(индекс цели, GUID)` — решение в области
+/// ([`scoped_solution`]); карта хранится в базе владельца решения (у участника — чужая цель).
+fn code_target(
+    targets: &[SearchTarget],
+    req: &RecallReq,
+    headers: &HeaderMap,
+) -> Option<(usize, SolutionGuid)> {
+    let guid = scoped_solution(targets, req, headers)?;
+    let i = targets.iter().position(|t| match &t.solution {
+        Some(info) => info.guid == guid,
+        None => t.spaces.iter().any(|s| {
+            s.kind == SpaceKind::Solution && s.solution_guid.as_deref() == Some(guid.as_str())
+        }),
+    })?;
+    Some((i, guid))
+}
+
+/// Строка карты кода дайджеста (M5.6 §10, [`super::code::code_line`]); нет решения, карты или
+/// срок вышел — `None`.
+async fn code_digest_line(
+    req: &RecallReq,
+    headers: &HeaderMap,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Option<String> {
+    let (i, guid) = code_target(health.targets(), req, headers)?;
+    if !health.alive[i] {
+        return None;
+    }
+    let db = health.targets()[i].db.clone();
+    deadline
+        .step(super::code::code_line(&db, guid.as_str()))
+        .await
+        .flatten()
+}
+
+/// Имена символов из `task` для раздела `### Код`: слова вида `Тип::метод` или `a.b` (кандидаты
+/// `qual`, первыми), затем идентификаторы [`zam_code::focus_idents`]; без повторов.
+fn task_idents(task: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in task.split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';')) {
+        let w = w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
+        if w.contains("::") && !out.iter().any(|o| o == w) {
+            out.push(w.to_string());
+        }
+    }
+    for w in zam_code::focus_idents(task) {
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// Строки раздела `### Код` пакета под задачу (M5.6 §10): символы карты решения с именами или
+/// `qual` из `task` (точные `qual` первыми), затем символы путей из `task`
+/// (`code_symbols_named`), до [`BRIEF_CODE_MAX`]; строка — `<путь>:<line> <kind> <sig или
+/// qual>`; вместе с заголовком — не больше `code.brief_tokens` (остаток общего бюджета
+/// соблюдает упаковка). Нет решения, карты или срок вышел — пусто; сбой чтения — WARN.
+async fn code_brief_lines(
+    st: &AppState,
+    req: &RecallReq,
+    headers: &HeaderMap,
+    task: &str,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Vec<String> {
+    let budget = st.cfg.code.brief_tokens;
+    let Some((i, guid)) = code_target(health.targets(), req, headers) else {
+        return Vec::new();
+    };
+    if budget == 0 || !health.alive[i] {
+        return Vec::new();
+    }
+    let (names, paths) = (task_idents(task), task_paths(task));
+    if names.is_empty() && paths.is_empty() {
+        return Vec::new();
+    }
+    let db = health.targets()[i].db.clone();
+    let Some(r) = deadline
+        .step(zam_store::code::code_symbols_named(
+            &db,
+            guid.as_str(),
+            &names,
+            &paths,
+            BRIEF_CODE_MAX,
+        ))
+        .await
+    else {
+        return Vec::new();
+    };
+    let hits = match r {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: символы карты кода не прочитаны");
+            return Vec::new();
+        }
+    };
+    let mut used = count_tokens(&format!("\n{SECTION_CODE}\n"));
+    let mut out = Vec::new();
+    for h in hits {
+        let what = h
+            .sig
+            .as_deref()
+            .map(one_line)
+            .unwrap_or_else(|| h.qual.clone());
+        let line = format!("{}:{} {} {what}", h.path, h.line, h.kind.as_str());
+        let cost = count_tokens(&format!("{line}\n"));
+        if used + cost <= budget {
+            used += cost;
+            out.push(line);
+        }
+    }
+    out
+}
 
 /// Проверенных команд в строке дайджеста (M4.5 §7).
 pub const VERIFIED_COMMANDS_MAX: usize = 3;
@@ -2113,6 +2252,12 @@ pub async fn recall(
                 .as_deref()
                 .is_some_and(|s| RECOVERY_SOURCES.contains(&s.trim())));
     let brief_event = req.event == Event::Brief;
+    // карта кода (M5.6 §10): сервер с картой и тип подсказок `code_map` пользователя
+    // `session_start` — всегда хук; `recovery`/`brief` — хук, если прислал `code_map`
+    // (ревью задачи 6, M2: явные вызовы REST/MCP/CLI тип подсказок не гасит, §10)
+    let from_hook = req.event == Event::SessionStart || req.code_map.is_some();
+    let code_on = st.cfg.code.enabled
+        && (!from_hook || (hooks.enabled("code_map") && req.code_map != Some(false)));
     let budget = req.budget_tokens.unwrap_or(if recovery {
         st.cfg.recall.recovery_tokens
     } else if brief_event {
@@ -2160,13 +2305,23 @@ pub async fn recall(
     };
 
     // сбор кандидатов
+    let mut code_section: Vec<String> = Vec::new();
     let (notices, sections, repeatable, after_rules, open_line) = match req.event {
         _ if !enabled => (Vec::new(), Vec::new(), true, Vec::new(), None),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
         Event::SessionStart | Event::Recovery => {
-            let (n, s, g, o) =
-                digest(&st, &p, &sh, &req, recovery, &mut health, &mut deadline).await?;
+            let (n, s, g, o) = digest(
+                &st,
+                &p,
+                &sh,
+                &req,
+                recovery,
+                code_on,
+                &mut health,
+                &mut deadline,
+            )
+            .await?;
             (n, s, true, g, o)
         }
         Event::Prompt => {
@@ -2191,6 +2346,10 @@ pub async fn recall(
         Event::Brief => {
             let t = task.as_deref();
             let s = brief(&st, &p, &sh, &req, t, &mut health, &mut deadline).await?;
+            if let (true, Some(t)) = (code_on, t) {
+                code_section =
+                    code_brief_lines(&st, &req, &sh, t, &mut health, &mut deadline).await;
+            }
             (Vec::new(), s, true, Vec::new(), None)
         }
     };
@@ -2230,7 +2389,15 @@ pub async fn recall(
             (*title, chosen)
         })
         .collect();
-    let (packed, picked) = arrange(recovery, notices, open_line, &after_rules, chosen);
+    let (mut packed, mut picked) = arrange(recovery, notices, open_line, &after_rules, chosen);
+    if !code_section.is_empty() {
+        // раздел `### Код` — после `### Файлы`; строки карты не подсказки записей (без учёта)
+        packed.push(Section {
+            title: Some(SECTION_CODE.to_string()),
+            blocks: code_section,
+        });
+        picked.push(Vec::new());
+    }
     let (text, taken) = pack_sections(&packed, budget, &count_tokens);
     let shown_now: Vec<&Cand> = taken
         .iter()

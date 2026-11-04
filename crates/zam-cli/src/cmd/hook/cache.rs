@@ -13,7 +13,8 @@
 //!   (M4.5 §6.3; как `triggers.json`): знание о файле для `post-tool` и `pre-tool` без сети;
 //! - `changed-<сессия>.jsonl` — очередь `{path, hash}` правленых файлов (M4.5 §6.2): пишет
 //!   `post-tool`, отправляют `POST /files/changed` `prompt`, `session-start` и `checkpoint`
-//!   ([`flush_changed`]);
+//!   ([`flush_changed`]); файл меняют только под замком `.changed-….jsonl.lock`, уплотняют
+//!   (больше [`CHANGED_QUEUE_MAX`]) `session-start` и возврат неотправленного, не `post-tool`;
 //! - `events-<сессия>.jsonl` — журнал событий сессии ([`super::journal`]);
 //! - `tokens-<сессия>.jsonl` — выданное хуками с локальным выводом (M4.5 §9.5): строка
 //!   `{e, t}` (событие `pre_tool` | `post_tool_local` | `subagent_local`, оценка токенов) на
@@ -266,7 +267,8 @@ pub fn refresh_triggers(
     Ok((Refresh::Updated(c.triggers.len()), warnings))
 }
 
-/// Запись индекса `GET /file-refs`: ссылка (`n:`/`i:`/…), вид, заголовок, состояние.
+/// Запись индекса `GET /file-refs`: ссылка (`n:`/`i:`/…), вид, заголовок, состояние и символ
+/// (`qual`, если ссылка на символ — M5.6 §8; кэш клиента M4.5 без поля читается).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RefItem {
@@ -274,6 +276,8 @@ pub struct RefItem {
     pub kind: String,
     pub title: String,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
 }
 
 /// Путь индекса `GET /file-refs`: последний записанный хэш и до 5 записей.
@@ -303,6 +307,12 @@ impl FileRefsCache {
             .iter()
             .find(|r| crate::cmd::refs::same_path(&r.path, path))
     }
+
+    /// У пути есть ссылки на символы (хук правки разбирает файл, M5.6 §8).
+    pub fn has_symbol_refs(&self, path: &str) -> bool {
+        self.find(path)
+            .is_some_and(|p| p.items.iter().any(|i| i.symbol.is_some()))
+    }
 }
 
 pub fn file_refs_path(root: &Path) -> PathBuf {
@@ -314,18 +324,30 @@ pub fn file_refs_path(root: &Path) -> PathBuf {
 /// Индекс ссылок для сервера `server` (если известен) и решения проекта; битый — `None` и
 /// строка в журнал.
 pub fn usable_file_refs(env: &Env, server: Option<&str>) -> Option<FileRefsCache> {
-    let c: FileRefsCache = match read_json_file(&file_refs_path(&env.root)) {
-        Ok(c) => c?,
+    let sol = env.solution.as_ref().map(|s| s.id.as_str())?;
+    match file_refs_for(&env.root, sol, server) {
+        Ok(c) => c,
         Err(e) => {
             env.log(&format!("кэш file-refs битый, пропущен: {e}"));
-            return None;
+            None
         }
-    };
-    let sol = env.solution.as_ref().map(|s| s.id.as_str());
-    if sol.is_none() || c.solution.as_deref() != sol || server.is_some_and(|s| s != c.server) {
-        return None;
     }
-    Some(c)
+}
+
+/// Индекс ссылок проекта `root` решения `solution` для сервера `server` (если известен): нет
+/// файла или он другого решения/сервера — `Ok(None)`, битый — `Err`.
+pub fn file_refs_for(
+    root: &Path,
+    solution: &str,
+    server: Option<&str>,
+) -> Result<Option<FileRefsCache>, String> {
+    let Some(c) = read_json_file::<FileRefsCache>(&file_refs_path(root))? else {
+        return Ok(None);
+    };
+    if c.solution.as_deref() != Some(solution) || server.is_some_and(|s| s != c.server) {
+        return Ok(None);
+    }
+    Ok(Some(c))
 }
 
 /// `GET /file-refs?solution=` с `If-None-Match` и запись `file-refs.json` (304 — кэш остаётся,
@@ -372,11 +394,15 @@ pub fn refresh_file_refs(env: &Env, client: &Client) -> Result<Option<Refresh>, 
     Ok(Some(Refresh::Updated(c.refs.len())))
 }
 
-/// Строка очереди `changed-<сессия>.jsonl`.
+/// Строка очереди `changed-<сессия>.jsonl` и файл `POST /files/changed`: путь, хэш и (M5.6 §8)
+/// хэши тел **всех** символов файла — только при полном разборе; строка клиента M4.5 без поля
+/// читается.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Changed {
     pub path: String,
     pub hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbols: Option<Vec<zam_code::SymbolHash>>,
 }
 
 pub fn changed_path(env: &Env, session: &str) -> PathBuf {
@@ -396,24 +422,179 @@ fn append_options() -> std::fs::OpenOptions {
     o
 }
 
-/// Дописывает файлы в очередь изменённых: строка на файл, все одним `write` с append.
+/// Предел очереди изменённых файлов сессии, байт: больше — очередь уплотняется
+/// ([`compact_changed`]; ревью задачи 6, I1).
+pub const CHANGED_QUEUE_MAX: u64 = 4 * 1024 * 1024;
+/// Предел тела одного `POST /files/changed` из очереди и `zam refs check`, байт.
+pub const CHANGED_BATCH_BYTES: usize = 256 * 1024;
+
+/// Пачки строк для `POST /files/changed`: не больше [`crate::cmd::refs::FILES_MAX`] путей и
+/// `max_bytes` JSON; строка, которая не влезает и одна, уходит без `symbols` (её ссылки на
+/// символы сервер судит по хэшу файла — как неполный разбор).
+pub fn changed_batches(files: &[Changed], max_bytes: usize) -> Vec<Vec<Changed>> {
+    let mut out: Vec<Vec<Changed>> = Vec::new();
+    let mut cur: Vec<Changed> = Vec::new();
+    let mut size = 0usize;
+    for c in files {
+        let mut c = c.clone();
+        let mut n = serde_json::to_vec(&c).map_or(0, |v| v.len()) + 1;
+        if n > max_bytes && c.symbols.is_some() {
+            c.symbols = None;
+            n = serde_json::to_vec(&c).map_or(0, |v| v.len()) + 1;
+        }
+        if !cur.is_empty() && (size + n > max_bytes || cur.len() >= crate::cmd::refs::FILES_MAX) {
+            out.push(std::mem::take(&mut cur));
+            size = 0;
+        }
+        size += n;
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Уплотнение строк очереди: повтор пути заменяет прежнюю строку; сверх `max` байт у самых
+/// старых строк снимаются `symbols` (ссылки на символы этих файлов сервер судит по хэшу).
+pub fn compact_changed(lines: Vec<Changed>, max: u64) -> Vec<Changed> {
+    let mut out: Vec<Changed> = Vec::new();
+    for c in lines {
+        out.retain(|f| !crate::cmd::refs::same_path(&f.path, &c.path));
+        out.push(c);
+    }
+    let len = |c: &Changed| serde_json::to_vec(c).map_or(0, |v| v.len() as u64) + 1;
+    let mut total: u64 = out.iter().map(len).sum();
+    for c in out.iter_mut() {
+        if total <= max {
+            break;
+        }
+        if c.symbols.is_some() {
+            let before = len(c);
+            c.symbols = None;
+            total = total - before + len(c);
+        }
+    }
+    out
+}
+
+/// Ожидание замка очереди изменённых файлов у `post-tool` (дописывание): дольше — без замка.
+const CHANGED_APPEND_WAIT: Duration = Duration::from_millis(20);
+/// Ожидание замка у отправки и уплотнения (`flush_changed`, `session-start`).
+const CHANGED_LOCK_WAIT: Duration = Duration::from_millis(50);
+/// Жёсткий предел очереди, байт: сверх него `post-tool` строки не дописывает (строка в
+/// `hooks.log`) — до уплотнения `session-start` или отправки.
+pub const CHANGED_QUEUE_HARD: u64 = 4 * CHANGED_QUEUE_MAX;
+
+/// Замок очереди `changed-…jsonl` (`.changed-….jsonl.lock`, как у очереди запусков): все, кто
+/// меняет файл очереди, — под ним, иначе дописанная параллельным `post-tool` строка терялась бы
+/// при переписывании (ревью задачи 6).
+struct QueueLock(Option<FileLock>);
+
+impl QueueLock {
+    fn take(queue: &Path, wait: Duration) -> QueueLock {
+        QueueLock(file_lock(queue, wait))
+    }
+
+    fn held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+/// Строки очереди (битые пропускаются) и прочитанная длина файла, байт.
+fn read_changed(path: &Path) -> (Vec<Changed>, u64) {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let lines = bytes
+        .split(|b| *b == b'\n')
+        .filter_map(|l| serde_json::from_slice::<Changed>(l).ok())
+        .collect();
+    (lines, bytes.len() as u64)
+}
+
+/// Переписывает очередь `q` содержимым `out` (под замком): если файл вырос после чтения
+/// (`read_len` байт) — дописанное мимо замка (fail-open `post-tool`) переносится в конец
+/// (ревью задачи 9A, M1).
+fn replace_queue(q: &Path, read_len: u64, mut out: Vec<u8>) -> std::io::Result<()> {
+    if std::fs::metadata(q).is_ok_and(|m| m.len() > read_len) {
+        let all = std::fs::read(q)?;
+        if let Some(tail) = all.get(read_len as usize..) {
+            if !out.is_empty() && !out.ends_with(b"\n") {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(tail);
+        }
+    }
+    write_atomic(q, &out)
+}
+
+fn changed_bytes<'a>(lines: impl IntoIterator<Item = &'a Changed>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in lines {
+        out.extend(serde_json::to_vec(c).unwrap_or_default());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Дописывает файлы в очередь изменённых под замком очереди: строка на файл, все одним `write`
+/// с append. Уплотнения здесь нет (ревью задачи 6: 20–40 мс на 4 МиБ — в бюджете `post-tool`):
+/// очередь больше [`CHANGED_QUEUE_MAX`] — у новых строк снимаются `symbols` (ссылки на символы
+/// сервер судит по хэшу файла), больше [`CHANGED_QUEUE_HARD`] — строки не дописываются.
+/// Уплотняют очередь отправка ([`flush_changed`]) и `session-start` ([`compact_changed_queues`]).
 pub fn queue_changed(env: &Env, session: &str, files: &[Changed]) {
     if files.is_empty() {
         return;
     }
-    let mut buf = Vec::new();
-    for c in files {
-        buf.extend(serde_json::to_vec(c).unwrap_or_default());
-        buf.push(b'\n');
-    }
-    let r = std::fs::create_dir_all(env.cache_dir()).and_then(|_| {
-        use std::io::Write;
-        append_options()
-            .open(changed_path(env, session))?
-            .write_all(&buf)
-    });
-    if let Err(e) = r {
+    let path = changed_path(env, session);
+    if let Err(e) = std::fs::create_dir_all(env.cache_dir()) {
         env.log(&format!("очередь изменённых файлов: {e}"));
+        return;
+    }
+    let _lock = QueueLock::take(&path, CHANGED_APPEND_WAIT);
+    let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+    let mut buf = changed_bytes(files);
+    if len + buf.len() as u64 > CHANGED_QUEUE_MAX {
+        let lean: Vec<Changed> = files
+            .iter()
+            .map(|c| Changed {
+                symbols: None,
+                ..c.clone()
+            })
+            .collect();
+        buf = changed_bytes(&lean);
+    }
+    if len + buf.len() as u64 > CHANGED_QUEUE_HARD {
+        env.log(&format!(
+            "очередь изменённых файлов больше {CHANGED_QUEUE_HARD} байт: {} путей не записано",
+            files.len()
+        ));
+        return;
+    }
+    use std::io::Write;
+    if let Err(e) = append_options()
+        .open(&path)
+        .and_then(|mut f| f.write_all(&buf))
+    {
+        env.log(&format!("очередь изменённых файлов: {e}"));
+    }
+}
+
+/// Уплотнение очередей изменённых файлов больше [`CHANGED_QUEUE_MAX`] (`session-start`, вне
+/// бюджета `post-tool`): под замком очереди — чтение, [`compact_changed`], атомарная запись.
+pub fn compact_changed_queues(env: &Env) {
+    for q in queue_files(env, None) {
+        if std::fs::metadata(&q).map_or(0, |m| m.len()) <= CHANGED_QUEUE_MAX {
+            continue;
+        }
+        let lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
+        if !lock.held() {
+            continue; // замок занят — в другой раз
+        }
+        let (lines, len) = read_changed(&q);
+        let out = changed_bytes(&compact_changed(lines, CHANGED_QUEUE_MAX));
+        if let Err(e) = replace_queue(&q, len, out) {
+            env.log(&format!("уплотнение очереди изменённых файлов: {e}"));
+        }
     }
 }
 
@@ -465,6 +646,8 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     for (i, q) in queue_files(env, session).into_iter().enumerate() {
         let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("changed");
         let t = q.with_file_name(format!(".{name}.{}.{nanos}.{i}.tmp", std::process::id()));
+        // под замком: `post-tool`, открывший очередь до rename, допишет уже в забранный файл
+        let _lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
         if std::fs::rename(&q, &t).is_ok() {
             taken.push((q, t));
         }
@@ -472,7 +655,7 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     if taken.is_empty() {
         return;
     }
-    // (путь, хэш, номер очереди) — повтор пути: последний хэш
+    // (строка, номер очереди) — повтор пути: последняя строка (хэш и символы)
     let mut files: Vec<(Changed, usize)> = Vec::new();
     for (qi, (_, t)) in taken.iter().enumerate() {
         let bytes = std::fs::read(t).unwrap_or_default();
@@ -484,47 +667,64 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
             files.push((c, qi));
         }
     }
-    let n = files.len().min(crate::cmd::refs::FILES_MAX);
-    let back: Vec<(Changed, usize)> = if n == 0 {
-        Vec::new()
-    } else if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
-        files.clone()
-    } else {
-        let pairs: Vec<(String, String)> = files[..n]
-            .iter()
-            .map(|(c, _)| (c.path.clone(), c.hash.clone()))
-            .collect();
-        match crate::cmd::refs::post_changed(client, &sol, &pairs) {
-            Ok(_) => files[n..].to_vec(),
+    // пачки по байтам (ревью задачи 6, I1): строки с хэшами символов — десятки КиБ каждая
+    let lines: Vec<Changed> = files.iter().map(|(c, _)| c.clone()).collect();
+    let mut done = 0usize;
+    for b in changed_batches(&lines, CHANGED_BATCH_BYTES) {
+        if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+            break;
+        }
+        let n = b.len();
+        match crate::cmd::refs::post_changed_batch(client, &sol, &b) {
+            Ok(_) => done += n,
             Err(e) if permanent(&e) => {
-                env.log(&format!(
-                    "files/changed: очередь ({} путей) отброшена: {e}",
-                    files.len()
-                ));
-                Vec::new()
+                env.log(&format!("files/changed: пачка ({n} путей) отброшена: {e}"));
+                done += n;
             }
             Err(e) => {
                 env.log(&format!("files/changed: {e}"));
-                files.clone()
+                break;
             }
         }
-    };
+    }
+    let back: Vec<(Changed, usize)> = files[done..].to_vec();
     for (qi, (q, _)) in taken.iter().enumerate() {
-        let mut out = Vec::new();
-        for (c, _) in back.iter().filter(|(_, i)| *i == qi) {
-            out.extend(serde_json::to_vec(c).unwrap_or_default());
-            out.push(b'\n');
-        }
-        if out.is_empty() {
-            continue;
-        }
-        use std::io::Write;
-        if let Err(e) = append_options().open(q).and_then(|mut f| f.write_all(&out)) {
-            env.log(&format!("возврат очереди изменённых файлов: {e}"));
+        let mine: Vec<Changed> = back
+            .iter()
+            .filter(|(_, i)| *i == qi)
+            .map(|(c, _)| c.clone())
+            .collect();
+        if !mine.is_empty() {
+            return_changed(env, q, mine);
         }
     }
     for (_, t) in &taken {
         let _ = std::fs::remove_file(t);
+    }
+}
+
+/// Возврат неотправленных строк в очередь `q` (ревью задачи 6): под замком — **перед**
+/// строками, дописанными за время отправки (они новее: повтор пути — последний хэш), вместе
+/// уплотнённые ([`compact_changed`]). Замок не взят — дописывание в конец (fail-open, без потерь).
+fn return_changed(env: &Env, q: &Path, back: Vec<Changed>) {
+    let lock = QueueLock::take(q, CHANGED_LOCK_WAIT);
+    let r = if lock.held() {
+        let mut lines = back;
+        let (newer, len) = read_changed(q);
+        lines.extend(newer);
+        replace_queue(
+            q,
+            len,
+            changed_bytes(&compact_changed(lines, CHANGED_QUEUE_MAX)),
+        )
+    } else {
+        use std::io::Write;
+        append_options()
+            .open(q)
+            .and_then(|mut f| f.write_all(&changed_bytes(&back)))
+    };
+    if let Err(e) = r {
+        env.log(&format!("возврат очереди изменённых файлов: {e}"));
     }
 }
 
@@ -778,17 +978,27 @@ pub fn spawn_path(env: &Env, session: &str) -> PathBuf {
         .join(format!("spawn-{}.json", session_file_part(session)))
 }
 
-/// Замок очереди запусков: файл `.spawn-….lock` (создаётся только новым); брошенный старше
-/// [`SPAWN_LOCK_TTL`] снимается; не взят за `wait` — `None` (без замка).
-fn spawn_lock(path: &Path, wait: Duration) -> Option<PathBuf> {
+/// Замок-файл `.<имя>.lock` очереди запусков и очереди изменённых файлов (создаётся только
+/// новым, внутри — токен владельца); брошенный старше [`SPAWN_LOCK_TTL`] снимается; не взят за
+/// `wait` — `None` (без замка).
+fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
+    use std::io::Write;
     let name = path.file_name()?.to_str()?;
     let lock = path.with_file_name(format!(".{name}.lock"));
+    let token = format!(
+        "{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     let t0 = std::time::Instant::now();
     loop {
-        if o.open(&lock).is_ok() {
-            return Some(lock);
+        if let Ok(mut f) = o.open(&lock) {
+            let _ = f.write_all(token.as_bytes());
+            return Some(FileLock { path: lock, token });
         }
         let stale = std::fs::metadata(&lock)
             .and_then(|m| m.modified())
@@ -806,6 +1016,22 @@ fn spawn_lock(path: &Path, wait: Duration) -> Option<PathBuf> {
     }
 }
 
+/// Взятый замок-файл: снимается при `Drop`, только если в файле всё ещё свой токен
+/// (`pid.nanos`) — замок, снятый как брошенный и взятый другим процессом, не удаляется
+/// (ревью задачи 9A, M1).
+struct FileLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if std::fs::read(&self.path).is_ok_and(|b| b == self.token.as_bytes()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Очередь запусков под замком: живые записи (моложе [`SPAWN_TTL`], старейшие первыми)
 /// передаются `f`, итог пишется обратно (пусто — файл удаляется). Результат `f`; `wait` —
 /// ожидание замка.
@@ -817,7 +1043,7 @@ fn with_spawns<T>(
 ) -> T {
     let path = spawn_path(env, session);
     let _ = std::fs::create_dir_all(env.cache_dir());
-    let lock = spawn_lock(&path, wait);
+    let lock = file_lock(&path, wait);
     let mut q: Vec<Spawn> = match read_json_file::<Vec<Spawn>>(&path) {
         Ok(v) => v.unwrap_or_default(),
         Err(e) => {
@@ -849,9 +1075,7 @@ fn with_spawns<T>(
             env.log(&format!("запись очереди запусков субагентов: {e}"));
         }
     }
-    if let Some(l) = lock {
-        let _ = std::fs::remove_file(l);
-    }
+    drop(lock);
     out
 }
 
@@ -1013,6 +1237,97 @@ pub fn sync(ctx: &super::super::Ctx) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ревью задачи 9A, M1: замок, перехваченный другим процессом (токен в файле чужой), при
+    /// `Drop` не удаляется; свой — удаляется.
+    #[test]
+    fn file_lock_removed_only_by_owner() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/zam-cli-file-lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = dir.join("changed-x.jsonl");
+        let l = file_lock(&q, Duration::ZERO).unwrap();
+        let path = l.path.clone();
+        assert!(file_lock(&q, Duration::ZERO).is_none(), "занят");
+        drop(l);
+        assert!(!path.exists(), "свой замок снят");
+        let l = file_lock(&q, Duration::ZERO).unwrap();
+        std::fs::write(&path, b"999.1").unwrap();
+        drop(l);
+        assert!(path.exists(), "чужой замок не тронут");
+    }
+
+    fn line(path: &str, symbols: usize) -> Changed {
+        Changed {
+            path: path.into(),
+            hash: "a".repeat(64),
+            symbols: (symbols > 0).then(|| {
+                (0..symbols)
+                    .map(|k| zam_code::SymbolHash {
+                        qual: format!("function_name_{k:05}"),
+                        body_hash: format!("{k:016x}"),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// Ревью задачи 6, I1: пачки по байтам и числу путей; строка больше пачки — без `symbols`.
+    #[test]
+    fn changed_batches_by_bytes_and_count() {
+        let files: Vec<Changed> = (0..40)
+            .map(|i| line(&format!("src/f{i}.rs"), 1500))
+            .collect();
+        let one = serde_json::to_vec(&files[0]).unwrap().len();
+        assert!(one > 64 * 1024, "{one}");
+        let b = changed_batches(&files, CHANGED_BATCH_BYTES);
+        assert!(b.len() > 1);
+        assert_eq!(b.iter().map(Vec::len).sum::<usize>(), 40, "без потерь");
+        for p in &b {
+            let size: usize = p
+                .iter()
+                .map(|c| serde_json::to_vec(c).unwrap().len() + 1)
+                .sum();
+            assert!(size <= CHANGED_BATCH_BYTES, "{size}");
+            assert!(p.iter().all(|c| c.symbols.is_some()));
+        }
+        // строка больше пачки — уходит без символов
+        let huge = changed_batches(&[line("src/big.rs", 6000)], CHANGED_BATCH_BYTES);
+        assert_eq!(huge.len(), 1);
+        assert!(huge[0][0].symbols.is_none());
+        // путей — не больше FILES_MAX в пачке
+        let small: Vec<Changed> = (0..1200).map(|i| line(&format!("f{i}"), 0)).collect();
+        let b = changed_batches(&small, CHANGED_BATCH_BYTES);
+        assert!(b.iter().all(|p| p.len() <= crate::cmd::refs::FILES_MAX));
+        assert_eq!(b.iter().map(Vec::len).sum::<usize>(), 1200);
+    }
+
+    /// Уплотнение очереди: повтор пути — последняя строка; сверх предела — старые без `symbols`.
+    #[test]
+    fn compact_changed_dedup_and_strip_oldest() {
+        let mut a2 = line("src/a.rs", 0);
+        a2.hash = "b".repeat(64);
+        let out = compact_changed(
+            vec![line("src/a.rs", 10), line("src/b.rs", 10), a2.clone()],
+            u64::MAX,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], a2, "повтор пути — последняя строка");
+        let lines: Vec<Changed> = (0..20)
+            .map(|i| line(&format!("src/f{i}.rs"), 1500))
+            .collect();
+        let max = 300 * 1024;
+        let out = compact_changed(lines, max);
+        let total: u64 = out
+            .iter()
+            .map(|c| serde_json::to_vec(c).unwrap().len() as u64 + 1)
+            .sum();
+        assert!(total <= max, "{total}");
+        assert_eq!(out.len(), 20);
+        assert!(out[0].symbols.is_none(), "старые — без символов");
+        assert!(out[19].symbols.is_some(), "новые — с символами");
+    }
 
     #[test]
     fn rfc3339_known_dates() {

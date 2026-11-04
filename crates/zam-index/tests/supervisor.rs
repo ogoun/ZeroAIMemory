@@ -225,7 +225,11 @@ async fn external_kill_restarts_and_five_crashes_break() {
     for i in 1..=5u32 {
         wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
         let pid = sup.pid().expect("pid");
-        assert!(!pids.contains(&pid), "pid не сменился после перезапуска");
+        // Windows сразу отдаёт освободившийся PID новому процессу (CI 41605984312): там
+        // перезапуск доказывают `Restarting { attempt }` и новый `Ready`, а не новый PID.
+        if cfg!(not(windows)) {
+            assert!(!pids.contains(&pid), "pid не сменился после перезапуска");
+        }
         pids.push(pid);
         kill_external(pid);
         if i < 5 {

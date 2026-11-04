@@ -1,8 +1,10 @@
 //! Шаблоны по умолчанию блока инструкции агента (§14.2) и полный протокол `GET /agent-guide`.
 //!
-//! Блок v4 (M4.5 §11, M5.5 — строка об отчётах `zam report`): правило — одна строка, не больше
-//! 500 токенов bge-m3 в худшем случае теста (ru и en); пояснения — в протоколе
-//! (`guide.{ru,en}.md`), а не в блоке.
+//! Блок v5 (M4.5 §11, M5.5 — строка об отчётах `zam report`, M5.6 — строка о карте кода и
+//! ссылках `путь#Тип::метод`): правило — одна строка, не больше 500 токенов bge-m3 в худшем
+//! случае теста (ru и en); пояснения — в протоколе (`guide.{ru,en}.md`), а не в блоке. Ради
+//! строки v5 в протокол перенесены «исследование — `insight_kinds=[experiment,failure]`»,
+//! «не про проект — `scope=global`» и «пиши каноническими терминами». Строки ru и en синхронны.
 //!
 //! Шаблон — текст между маркерами `<!-- zeroaimemory:begin vN -->` и `<!-- zeroaimemory:end -->`
 //! (маркеры добавляет [`super::render_block`]). Подстановки:
@@ -20,13 +22,13 @@ ZeroAIMemoryUrl={url}
 Решение: {solution}.
 Без MCP — `zam`; протокол — `zam guide`.
 
-- Перед задачей — `memory_search` (исследование — `insight_kinds=[experiment,failure]`) → `[cache]` или `memory_read` пачкой → сводку в `memory_cache_put`.
+- Перед задачей — `memory_search` → `[cache]` или `memory_read` пачкой → сводку в `memory_cache_put`.
 - `memory_log <kind>` пишет, `memory_update_entry` с `rev` правит (409 — перечитай).
-- Ловушка, сбой → `insight` gotcha|failure с триггерами (не про проект — scope=global); изменение → `changelog`; устарело → supersede/retract.
+- Ловушка, сбой → `insight` gotcha|failure с триггерами; изменение → `changelog`; устарело → supersede/retract.
 - Итог исследования, эксперимента, сравнения — пользователю `zam report`, себе — `insight`.
 - Задача → `task`: claim перед работой, `status` с `next_step`.
 - Вопрос человеку → `question`; его ответ в чате → `answer`.
-- Код — с `refs.files`; новое понятие → `term`, пиши каноническими терминами.
+- Код — `refs.files`, функция — `путь#Тип::метод`; карта — `zam code map`, символ — `zam code sym`; новое понятие → `term`.
 - `axiom` — только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` с `contradicts` и скажи ему; `certainty` меняй с `reason`.
 - Секреты, хосты → `memory_vault`; заметке — `l0`. {rules}
 - Без хуков `memory_recall`: новый тип файла, ошибка; после сжатия — `recovery`; субагенту — `brief`.
@@ -39,13 +41,13 @@ ZeroAIMemoryUrl={url}
 Solution: {solution}.
 No MCP — `zam`; protocol — `zam guide`.
 
-- Before a task — `memory_search` (research — `insight_kinds=[experiment,failure]`) → `[cache]` or `memory_read` in one call → summary into `memory_cache_put`.
+- Before a task — `memory_search` → `[cache]` or `memory_read` in one call → summary into `memory_cache_put`.
 - `memory_log <kind>` writes, `memory_update_entry` with `rev` edits (409 — reread).
-- Gotcha, failure → `insight` gotcha|failure with triggers (not about the project — scope=global); change → `changelog`; outdated → supersede/retract.
-- Outcome of research, an experiment, a comparison — for the user `zam report <file.md>`, for yourself — `insight`.
+- Gotcha, failure → `insight` gotcha|failure with triggers; change → `changelog`; outdated → supersede/retract.
+- Outcome of research, an experiment, a comparison — for the user `zam report`, for yourself — `insight`.
 - Task → `task`: claim before work, `status` with `next_step`.
 - Question for the human → `question`; their answer in chat → `answer`.
-- Code — with `refs.files`; new concept → `term`, write with canonical terms.
+- Code — `refs.files`, a function — `path#Type::method`; map — `zam code map`, symbol — `zam code sym`; new concept → `term`.
 - `axiom` — only on the user's direct instruction; if you disagree — `hypothesis`/`theorem` with `contradicts` and tell the user; change `certainty` with a `reason`.
 - Secrets, hosts → `memory_vault`; give notes an `l0`. {rules}
 - Without hooks `memory_recall`: new file type, error; after compaction — `recovery`; for a subagent — `brief`.

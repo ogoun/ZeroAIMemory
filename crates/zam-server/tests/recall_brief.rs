@@ -606,3 +606,221 @@ async fn mcp_recall_brief() {
     assert!(t.contains("### Задачи"), "{t}");
     assert!(t.contains(&format!("k:{}", w.task)), "{t}");
 }
+
+// ---- M5.6 задача 6: раздел `### Код` пакета под задачу (§10, §17 п. 5) ----
+
+/// Символ карты теста: `(имя, qual, строка, sig)`.
+type MapSym = (String, String, u32, String);
+
+/// Карта решения `G` первым токеном: файлы `(путь, [символ])`.
+async fn load_map(a: &Api, files: &[(&str, Vec<MapSym>)]) {
+    let h = |n: usize| format!("{n:064x}");
+    let manifest: Vec<Value> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (p, _))| json!({"path": p, "hash": h(i + 1)}))
+        .collect();
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/code/sync",
+            Some(json!({"solution": G, "branch": "main", "manifest": manifest})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let up: Vec<Value> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (p, syms))| {
+            let symbols: Vec<Value> = syms
+                .iter()
+                .map(|(name, qual, line, sig)| {
+                    json!({"name": name, "qual": qual, "kind": "function", "line": line,
+                           "end_line": line + 2, "sig": sig,
+                           "body_hash": format!("{line:016x}"), "exported": true})
+                })
+                .collect();
+            json!({"path": p, "lang": "rust", "hash": h(i + 1), "size": 10,
+                   "parse_state": "ok", "symbols": symbols, "refs": []})
+        })
+        .collect();
+    let r = a
+        .t(
+            Method::PUT,
+            "/api/v1/code/files",
+            Some(json!({"solution": G, "branch": "main", "files": up})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+fn fsym(name: &str, line: u32, sig: &str) -> MapSym {
+    (name.into(), name.into(), line, sig.into())
+}
+
+/// Сервер с решением `G` и картой: `open_store` в `src/store.rs`, шум в `src/other.rs`.
+async fn code_world(name: &str, tweak: impl FnOnce(&mut ServerConfig)) -> Api {
+    let a = api(&format!("brief-code-{name}"), |c| {
+        roomy(c);
+        tweak(c);
+    })
+    .await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    load_map(
+        &a,
+        &[
+            (
+                "src/store.rs",
+                vec![
+                    fsym(
+                        "open_store",
+                        12,
+                        "pub fn open_store(path: &Path) -> Result<Store>",
+                    ),
+                    fsym("close_store", 40, "pub fn close_store(s: Store)"),
+                ],
+            ),
+            ("src/other.rs", vec![fsym("unrelated", 3, "fn unrelated()")]),
+        ],
+    )
+    .await;
+    a
+}
+
+/// Текст раздела `### Код` (до следующего заголовка) или `None`.
+fn code_section(t: &str) -> Option<String> {
+    let start = t.find("### Код\n")?;
+    let rest = &t[start..];
+    let end = rest[1..].find("\n### ").map_or(rest.len(), |i| i + 1);
+    Some(rest[..end].trim_end().to_string())
+}
+
+#[tokio::test]
+async fn brief_code_section_existing_function_sig_and_path() {
+    let a = code_world("sig", |_| {}).await;
+    let j = brief(
+        &a,
+        &a.token,
+        "c1:ag",
+        json!({"event": "brief", "solution": G, "task": "Почини open_store: падает на пустом пути"}),
+    )
+    .await;
+    let t = text(&j);
+    let sec = code_section(t).unwrap_or_else(|| panic!("нет раздела:\n{t}"));
+    let lines: Vec<&str> = sec.lines().skip(1).collect();
+    assert_eq!(
+        lines[0], "src/store.rs:12 function pub fn open_store(path: &Path) -> Result<Store>",
+        "{sec}"
+    );
+    assert!(!sec.contains("unrelated"), "{sec}");
+    assert!(
+        j["tokens"].as_u64().unwrap() <= 800,
+        "пакет ≤ recall.brief_tokens: {j}"
+    );
+    // символы файла из `task` — после точных имён
+    let j = brief(
+        &a,
+        &a.token,
+        "c2:ag",
+        json!({"event": "brief", "solution": G, "task": "Перепиши src/store.rs целиком"}),
+    )
+    .await;
+    let sec = code_section(text(&j)).unwrap_or_else(|| panic!("нет раздела: {j}"));
+    assert!(sec.contains("src/store.rs:12 function"), "{sec}");
+    assert!(sec.contains("src/store.rs:40 function"), "{sec}");
+    // задача без имён и путей карты — раздела нет
+    let j = brief(
+        &a,
+        &a.token,
+        "c3:ag",
+        json!({"event": "brief", "solution": G, "task": "Обнови документацию"}),
+    )
+    .await;
+    assert_eq!(code_section(text(&j)), None, "{j}");
+}
+
+#[tokio::test]
+async fn brief_code_off_no_section() {
+    let a = code_world("off", |_| {}).await;
+    let uri = format!("/api/v1/admin/users/{}/settings", a.admin_id());
+    let r = a
+        .adm(
+            Method::PATCH,
+            &uri,
+            Some(json!({"hooks": {"code_map": false}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // хук `subagent-start` (поле `code_map`) — раздела нет
+    let j = brief(
+        &a,
+        &a.token,
+        "off:ag",
+        json!({"event": "brief", "solution": G, "task": "Почини open_store", "code_map": true}),
+    )
+    .await;
+    assert_eq!(code_section(text(&j)), None, "{j}");
+    // ревью задачи 6, M2: явный вызов (MCP, REST без `code_map`) — раздел есть
+    let j = brief(
+        &a,
+        &a.token,
+        "off2:ag",
+        json!({"event": "brief", "solution": G, "task": "Почини open_store"}),
+    )
+    .await;
+    assert!(code_section(text(&j)).is_some(), "{j}");
+    // `[hooks] code_map = false` клиента — раздела нет и при включённом сервере
+    let c = code_world("off-client", |_| {}).await;
+    let j = brief(
+        &c,
+        &c.token,
+        "off3:ag",
+        json!({"event": "brief", "solution": G, "task": "Почини open_store", "code_map": false}),
+    )
+    .await;
+    assert_eq!(code_section(text(&j)), None, "{j}");
+    // `code.brief_tokens = 0` — тоже без раздела
+    let b = code_world("zero", |c| c.code.brief_tokens = 0).await;
+    let j = brief(
+        &b,
+        &b.token,
+        "zero:ag",
+        json!({"event": "brief", "solution": G, "task": "Почини open_store"}),
+    )
+    .await;
+    assert_eq!(code_section(text(&j)), None, "{j}");
+}
+
+#[tokio::test]
+async fn brief_code_section_budget_150() {
+    let a = api("brief-code-budget", roomy).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let long = "x".repeat(110);
+    let syms: Vec<MapSym> = (0..20)
+        .map(|k| {
+            let name = format!("handler_{k}");
+            let sig = format!("pub fn handler_{k}(arg: Value) -> {long}");
+            (name.clone(), name, k + 1, sig)
+        })
+        .collect();
+    load_map(&a, &[("src/handlers.rs", syms)]).await;
+    let names: Vec<String> = (0..20).map(|k| format!("handler_{k}")).collect();
+    let j = brief(
+        &a,
+        &a.token,
+        "b:ag",
+        json!({"event": "brief", "solution": G,
+               "task": format!("Проверь {} в src/handlers.rs", names.join(", "))}),
+    )
+    .await;
+    let sec = code_section(text(&j)).unwrap_or_else(|| panic!("нет раздела: {j}"));
+    assert!(sec.lines().count() - 1 <= 5, "до 5 строк: {sec}");
+    assert!(sec.lines().count() > 1, "{sec}");
+    assert!(
+        zam_store::count_tokens(&format!("\n{sec}\n")) <= 150,
+        "раздел ≤ code.brief_tokens: {}",
+        zam_store::count_tokens(&sec)
+    );
+    assert!(j["tokens"].as_u64().unwrap() <= 800, "{j}");
+}

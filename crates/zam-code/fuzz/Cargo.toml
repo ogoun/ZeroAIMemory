@@ -1,0 +1,22 @@
+# Фаззинг экстрактора карты кода (спецификация M5.6 §13). Отдельный пакет вне workspace:
+# собирается только nightly-тулчейном, в CI не входит (в CI — proptest `extract_never_panics`).
+#   cargo +nightly fuzz run extract -- -max_total_time=120
+[package]
+name = "zam-code-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zam-code = { path = "..", features = ["parse"] }
+
+[[bin]]
+name = "extract"
+path = "fuzz_targets/extract.rs"
+test = false
+doc = false
+bench = false

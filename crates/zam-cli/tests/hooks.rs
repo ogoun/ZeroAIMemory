@@ -122,10 +122,18 @@ impl Proj {
         let repo = root.join("repo");
         let home = root.join("home");
         std::fs::create_dir_all(repo.join(".zeroaimemory")).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(home.join(".zeroaimemory")).unwrap();
         std::fs::write(
             repo.join(".zeroaimemory/solution.toml"),
             format!("agent_solution_id = \"{G}\"\nname = \"Хуки\"\n"),
+        )
+        .unwrap();
+        // ревью задачи 6, M8: хуки тестов не запускают настоящую `zam code sync --background`
+        // (каталог теста занят, лишние запросы к тестовому серверу); автозапуск проверяют
+        // тесты, снявшие это ([`Proj::auto_on`])
+        std::fs::write(
+            home.join(".zeroaimemory/config.toml"),
+            "[code]\nauto = false\n",
         )
         .unwrap();
         Proj {
@@ -184,6 +192,11 @@ impl Proj {
             v[k] = x.clone();
         }
         v
+    }
+
+    /// Автозапуск фоновой синхронизации карты — по умолчанию клиента (снимает `auto = false`).
+    fn auto_on(&self) {
+        let _ = std::fs::remove_file(self.home.join(".zeroaimemory/config.toml"));
     }
 
     fn cache(&self) -> PathBuf {
@@ -539,7 +552,7 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
         "{c}"
     );
     // R2: блок v1 устарел — сервер напоминает
-    assert!(c.contains("устарел (v1 → v4)"), "{c}");
+    assert!(c.contains("устарел (v1 → v5)"), "{c}");
     let s = p.session("ss-1");
     assert_eq!(s["agent"], "claude-code", "{s}");
     assert_eq!(s["solution"], G, "{s}");
@@ -1123,6 +1136,29 @@ fn hooks_settings_disable_types() {
     empty(&pre("c"));
     // правка при выключенных подсказках всё равно отмечается для checkpoint
     assert!(p.session_file("edits", "c", "").is_some());
+    // M5.6: `code_map` выключен в клиенте — фоновой синхронизации карты нет
+    git_head(&p, &sha(1));
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]
+pre_tool = true
+code_map = false
+",
+    )
+    .unwrap();
+    let ev = p.ev("SessionStart", "d", json!({"source": "startup"}));
+    let _ = p.hook_at(DEAD, "session-start", "claude", ev.to_string().as_bytes());
+    assert!(spawns_logged(&p).is_empty(), "{}", p.log());
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]
+pre_tool = true
+",
+    )
+    .unwrap();
+    let ev = p.ev("SessionStart", "e", json!({"source": "startup"}));
+    let _ = p.hook_at(DEAD, "session-start", "claude", ev.to_string().as_bytes());
+    assert_eq!(spawns_logged(&p).len(), 1, "{}", p.log());
 }
 
 /// R3: время `session-start` (≤ 1200 мс), `prompt` и `post-tool` (≤ 1000 мс), `checkpoint`
@@ -1535,15 +1571,45 @@ fn codex_apply_patch_edit_events() {
     assert_eq!(queue(&p, "cx").len(), 3);
 }
 
-/// Успешный `post-tool` без сети — 100 запусков (чтение со знанием о файле и журналом):
-/// p95 ≤ 200 мс (×4 от бюджета 50 мс, как `pre_tool_under_50ms`); значения — в журнал этапа.
+/// Успешный `post-tool` без сети — 100 запусков (чтение со знанием о файле и журналом, правка
+/// файла с символьной ссылкой в кэше — разбор ≤ 20 мс, M5.6): p95 ≤ 200 мс (×4 от бюджета
+/// 50 мс, как `pre_tool_under_50ms`); значения — в журнал этапа.
 #[test]
 fn post_tool_success_under_50ms() {
     let _g = serial();
     let p = Proj::new("post-timing", DEAD, "zam_x");
-    write_file_refs(&p, DEAD);
+    write_symbol_refs(
+        &p,
+        DEAD,
+        &[(
+            "src/pool.rs",
+            &[
+                ("i:E7", "gotcha", "Пул соединений течёт", Some("Pool::get")),
+                ("n:N1", "note", "Архитектура пула", None),
+            ],
+        )],
+    );
     std::fs::create_dir_all(p.repo.join("src")).unwrap();
-    std::fs::write(p.repo.join("src/pool.rs"), "x".repeat(64 * 1024)).unwrap();
+    let mut src = String::from(
+        "pub struct Pool;
+impl Pool {
+    pub fn get(&self) -> u32 { 0 }
+}
+",
+    );
+    let mut k = 0;
+    while src.len() < 64 * 1024 {
+        src.push_str(&format!(
+            "pub fn f{k}(x: u32) -> u32 {{
+    x + {k}
+}}
+"
+        ));
+        k += 1;
+    }
+    std::fs::write(p.repo.join("src/pool.rs"), &src).unwrap();
+    let line = "ZeroAIMemory: о файле src/pool.rs в памяти: `Pool::get`: Пул соединений течёт \
+                [gotcha] — i:E7; Архитектура пула [note] — n:N1";
     let mut times = Vec::new();
     for i in 0..100 {
         let (tool, input) = if i % 2 == 0 {
@@ -1557,12 +1623,19 @@ fn post_tool_success_under_50ms() {
         let v = post_ok(&p, &format!("pt{i}"), tool, input);
         let (o, d) = p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes());
         if tool == "Read" {
-            assert_eq!(context(&o, "PostToolUse"), POOL_LINE);
+            assert_eq!(context(&o, "PostToolUse"), line);
         } else {
             empty(&o);
         }
         times.push(d);
     }
+    // правки с символьной ссылкой: в очереди — хэши символов (или строка без них по отсечке)
+    let q = queue(&p, "pt1");
+    assert_eq!(q.len(), 1, "{q:?}");
+    eprintln!(
+        "ZAM_TIMING post-tool: символов в очереди {}",
+        q[0]["symbols"].as_array().map_or(0, Vec::len)
+    );
     let q = p95(times.clone());
     let min = times.iter().min().unwrap();
     eprintln!("ZAM_TIMING post-tool (успех) p95={q:?} min={min:?} (100 запусков)");
@@ -2724,4 +2797,550 @@ fn token_queue_capped_at_64k() {
         "{}",
         p.log()
     );
+}
+
+// ---------- M5.6, задача 6: символы в хуках и автосинхронизация карты кода ----------
+
+/// Элемент индекса: `(id, вид, заголовок, символ)`.
+type Item<'a> = (&'a str, &'a str, &'a str, Option<&'a str>);
+
+/// Индекс `file-refs.json` с элементами по путям.
+fn write_symbol_refs(p: &Proj, server: &str, paths: &[(&str, &[Item])]) {
+    let refs: Vec<Value> = paths
+        .iter()
+        .map(|(path, items)| {
+            let items: Vec<Value> = items
+                .iter()
+                .map(|(id, kind, title, symbol)| {
+                    let mut o = json!({"id": id, "kind": kind, "title": title, "state": "ok"});
+                    if let Some(s) = symbol {
+                        o["symbol"] = json!(s);
+                    }
+                    o
+                })
+                .collect();
+            json!({"path": path, "items": items})
+        })
+        .collect();
+    let c = json!({"etag": "s1", "fetched_at": "2026-11-03T00:00:00Z", "server": server,
+                   "solution": G, "refs": refs});
+    std::fs::create_dir_all(p.cache()).unwrap();
+    std::fs::write(p.cache().join("file-refs.json"), c.to_string()).unwrap();
+}
+
+const LIB_RS: &[u8] = b"pub fn foo() -> u32 {\n    1\n}\n\npub fn bar() -> u32 {\n    2\n}\n";
+
+#[test]
+fn post_tool_edit_queues_symbol_hashes_for_symbol_refs() {
+    let _g = serial();
+    let p = Proj::new("post-edit-sym", DEAD, "zam_x");
+    write_symbol_refs(
+        &p,
+        DEAD,
+        &[
+            ("src/lib.rs", &[("n:N1", "note", "О foo", Some("foo"))]),
+            ("src/plain.rs", &[("i:I1", "gotcha", "Файл", None)]),
+            ("src/gone.rs", &[("n:N2", "note", "О baz", Some("baz"))]),
+        ],
+    );
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/lib.rs"), LIB_RS).unwrap();
+    std::fs::write(p.repo.join("src/plain.rs"), LIB_RS).unwrap();
+    for f in ["src/lib.rs", "src/plain.rs", "src/gone.rs"] {
+        let v = post_ok(
+            &p,
+            "sy1",
+            "Edit",
+            json!({"file_path": p.repo.join(f), "old_string": "1", "new_string": "1"}),
+        );
+        empty(
+            &p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes())
+                .0,
+        );
+    }
+    let q = queue(&p, "sy1");
+    assert_eq!(q.len(), 3, "{q:?}");
+    assert_eq!(q[0]["path"], "src/lib.rs");
+    assert_eq!(q[0]["hash"], blake(LIB_RS));
+    // все символы файла, а не только из ссылок (решение составителя плана 5)
+    let syms = q[0]["symbols"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{q:?}"));
+    let quals: Vec<&str> = syms.iter().map(|s| s["qual"].as_str().unwrap()).collect();
+    assert_eq!(quals, ["foo", "bar"], "{q:?}");
+    for s in syms {
+        let b = s["body_hash"].as_str().unwrap();
+        assert_eq!(b.len(), 16, "{s}");
+        assert!(b.bytes().all(|c| c.is_ascii_hexdigit()), "{s}");
+    }
+    // у пути без символьных ссылок — без symbols (как M4.5)
+    assert_eq!(q[1], json!({"path": "src/plain.rs", "hash": blake(LIB_RS)}));
+    // удалённый — нули без символов (сервер: symbol_removed)
+    assert_eq!(q[2], json!({"path": "src/gone.rs", "hash": "0".repeat(64)}));
+}
+
+#[test]
+fn post_tool_edit_big_file_no_symbols() {
+    let _g = serial();
+    let p = Proj::new("post-edit-big", DEAD, "zam_x");
+    write_symbol_refs(
+        &p,
+        DEAD,
+        &[("src/big.rs", &[("n:N1", "note", "О foo", Some("foo"))])],
+    );
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    let mut big = LIB_RS.to_vec();
+    while big.len() <= 512 * 1024 {
+        big.extend_from_slice(b"// padding padding padding padding padding padding padding\n");
+    }
+    std::fs::write(p.repo.join("src/big.rs"), &big).unwrap();
+    let v = post_ok(
+        &p,
+        "big1",
+        "Write",
+        json!({"file_path": p.repo.join("src/big.rs"), "content": "x"}),
+    );
+    empty(
+        &p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes())
+            .0,
+    );
+    assert_eq!(
+        queue(&p, "big1"),
+        vec![json!({"path": "src/big.rs", "hash": blake(&big)})]
+    );
+}
+
+/// Обе формы строки знания о файле (решение составителя плана 13): только ссылки на один
+/// символ — «о `Sym` в <путь>», смесь — «о файле <путь>: `Sym`: …» (символьные первыми).
+#[test]
+fn file_hint_names_symbol() {
+    let _g = serial();
+    let p = Proj::new("hint-sym", DEAD, "zam_x");
+    write_symbol_refs(
+        &p,
+        DEAD,
+        &[
+            (
+                "src/store.rs",
+                &[
+                    ("i:I1", "gotcha", "Открытие базы", Some("Store::open")),
+                    ("n:N1", "note", "Схема", Some("Store::open")),
+                ],
+            ),
+            (
+                "src/api.rs",
+                &[
+                    ("c:C1", "changelog", "Маршруты", None),
+                    ("i:I2", "gotcha", "Ошибки", Some("ApiError")),
+                ],
+            ),
+        ],
+    );
+    let read = |s: &str, f: &str| {
+        let v = post_ok(&p, s, "Read", json!({"file_path": p.repo.join(f)}));
+        context(
+            &p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes())
+                .0,
+            "PostToolUse",
+        )
+    };
+    assert_eq!(
+        read("h1", "src/store.rs"),
+        "ZeroAIMemory: о `Store::open` в src/store.rs в памяти: Открытие базы [gotcha] — i:I1; \
+         Схема [note] — n:N1"
+    );
+    assert_eq!(
+        read("h1", "src/api.rs"),
+        "ZeroAIMemory: о файле src/api.rs в памяти: `ApiError`: Ошибки [gotcha] — i:I2; \
+         Маршруты [changelog] — c:C1"
+    );
+    // pre-tool перед правкой — та же строка
+    let pre = p.ev(
+        "PreToolUse",
+        "h2",
+        json!({"tool_name": "Edit", "tool_input": {"file_path": p.repo.join("src/store.rs")}}),
+    );
+    let c = context(
+        &p.hook_at(DEAD, "pre-tool", "claude", pre.to_string().as_bytes())
+            .0,
+        "PreToolUse",
+    );
+    assert!(
+        c.starts_with("ZeroAIMemory: о `Store::open` в src/store.rs в памяти:"),
+        "{c}"
+    );
+}
+
+/// §17 п. 12: кэш `file-refs.json` без поля `symbol` (клиент M4.5) читается.
+#[test]
+fn old_file_refs_cache_without_symbol_reads() {
+    let _g = serial();
+    let p = Proj::new("old-refs-cache", DEAD, "zam_x");
+    write_file_refs(&p, DEAD);
+    let raw = std::fs::read_to_string(p.cache().join("file-refs.json")).unwrap();
+    assert!(!raw.contains("symbol"), "{raw}");
+    let v = post_ok(
+        &p,
+        "old1",
+        "Read",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    let (o, _) = p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes());
+    assert_eq!(context(&o, "PostToolUse"), POOL_LINE);
+}
+
+/// Строки очереди `changed-*.jsonl` без `symbols` (клиент M4.5) и с ними — обе уходят на сервер.
+#[test]
+fn old_changed_queue_line_without_symbols_reads() {
+    let _g = serial();
+    let (url, tok) = start("old-queue");
+    let p = Proj::new("old-queue", &url, &tok);
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/x.rs"), b"x").unwrap();
+    let o = p.zam(
+        &[
+            "log", "insight", "--kind", "gotcha", "--title", "О x", "--scope", "solution", "--ref",
+            "src/x.rs",
+        ],
+        "Подробно.\n".as_bytes(),
+    );
+    ok(&o);
+    let line_old = json!({"path": "src/x.rs", "hash": "1".repeat(64)});
+    let line_new = json!({"path": "src/y.rs", "hash": "2".repeat(64),
+                          "symbols": [{"qual": "foo", "body_hash": "a".repeat(16)}]});
+    // очереди создаёт хук правки (имя файла — с хэшем id); затем строки подменяются
+    for (s, l) in [("oq1", &line_old), ("oq2", &line_new)] {
+        let v = post_ok(
+            &p,
+            s,
+            "Write",
+            json!({"file_path": p.repo.join("src/x.rs")}),
+        );
+        let _ = p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes());
+        let f = p.session_file("changed", s, ".jsonl").expect("очередь");
+        std::fs::write(&f, format!("{l}\n")).unwrap();
+    }
+    let o = p.hook(
+        "session-start",
+        &p.ev("SessionStart", "oq3", json!({"source": "startup"})),
+    );
+    ok(&o);
+    assert!(
+        p.session_file("changed", "oq1", ".jsonl").is_none(),
+        "{}",
+        p.log()
+    );
+    assert!(
+        p.session_file("changed", "oq2", ".jsonl").is_none(),
+        "{}",
+        p.log()
+    );
+    assert!(!p.log().contains("files/changed"), "{}", p.log());
+    let idx = file_refs_index(&p);
+    assert_eq!(ref_state(&idx, "src/x.rs"), ["stale"], "{idx}");
+}
+
+/// Ненастроенный адрес: фоновая `zam code sync` запускается (хуку сервер для запуска не нужен)
+/// и сразу выходит с ошибкой конфигурации — без замка и сети.
+const NO_URL: &str = "no-url";
+
+/// Фиктивный `.git` проекта: `HEAD` → ветка `main` с коммитом `sha`.
+fn git_head(p: &Proj, sha: &str) {
+    let g = p.repo.join(".git");
+    std::fs::create_dir_all(g.join("refs/heads")).unwrap();
+    std::fs::write(g.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(g.join("refs/heads/main"), format!("{sha}\n")).unwrap();
+}
+
+/// Запуски фоновой синхронизации в `hooks.log`: время запуска, мс.
+fn spawns_logged(p: &Proj) -> Vec<f64> {
+    p.log()
+        .lines()
+        .filter_map(|l| {
+            let rest = l.split("фоновая синхронизация карты запущена за ").nth(1)?;
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
+}
+
+fn sha(n: u32) -> String {
+    format!("{n:040x}")
+}
+
+#[test]
+fn session_start_spawns_background_sync_once_per_interval() {
+    let _g = serial();
+    let p = Proj::new("auto-sync", NO_URL, "zam_x");
+    p.auto_on();
+    git_head(&p, &sha(1));
+    let start = |s: &str| {
+        let ev = p.ev("SessionStart", s, json!({"source": "startup"}));
+        p.hook_at(NO_URL, "session-start", "claude", ev.to_string().as_bytes())
+    };
+    let _ = start("a1");
+    assert_eq!(spawns_logged(&p).len(), 1, "{}", p.log());
+    // в интервале и при том же HEAD — не стартует
+    let _ = start("a2");
+    assert_eq!(spawns_logged(&p).len(), 1, "{}", p.log());
+    // смена HEAD (файл ветки) — стартует
+    git_head(&p, &sha(2));
+    let _ = start("a3");
+    assert_eq!(spawns_logged(&p).len(), 2, "{}", p.log());
+    // ветка только в packed-refs
+    std::fs::remove_file(p.repo.join(".git/refs/heads/main")).unwrap();
+    std::fs::write(
+        p.repo.join(".git/packed-refs"),
+        format!(
+            "# pack-refs with: peeled fully-peeled sorted\n{} refs/heads/main\n",
+            sha(3)
+        ),
+    )
+    .unwrap();
+    let _ = start("a4");
+    assert_eq!(spawns_logged(&p).len(), 3, "{}", p.log());
+    // замок занят (идёт синхронизация — блокировка ОС) — не стартует даже при новом HEAD
+    let lock = p.cache().join("code-sync.lock");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    held.lock().unwrap();
+    git_head(&p, &sha(4));
+    let _ = start("a5");
+    assert_eq!(spawns_logged(&p).len(), 3, "{}", p.log());
+    // отпущен, файл остался — стартует
+    held.unlock().unwrap();
+    drop(held);
+    git_head(&p, &sha(5));
+    let _ = start("a6");
+    assert_eq!(spawns_logged(&p).len(), 4, "{}", p.log());
+    // 20 запусков, каждый со сменой HEAD (отсоединённый): время запуска p95 ≤ 10 мс
+    let mut hook_times = Vec::new();
+    for i in 0..20 {
+        std::fs::write(p.repo.join(".git/HEAD"), format!("{}\n", sha(200 + i))).unwrap();
+        let (o, d) = start(&format!("t{i}"));
+        empty(&o);
+        hook_times.push(d);
+    }
+    let t: Vec<f64> = spawns_logged(&p).into_iter().skip(4).collect();
+    assert_eq!(t.len(), 20, "{}", p.log());
+    let mut sorted = t.clone();
+    sorted.sort_by(f64::total_cmp);
+    let q = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+    eprintln!(
+        "ZAM_TIMING запуск фоновой синхронизации p95={q:.2} мс; хук p95={:?}",
+        p95(hook_times.clone())
+    );
+    // ≤ 10 мс (§10) — у release; отладочная сборка под нагрузкой соседних тестов — ×4, как
+    // `PRE_TOOL_P95_MAX` (замер release — в журнале этапа)
+    let max = if cfg!(debug_assertions) { 40.0 } else { 10.0 };
+    assert!(q <= max, "запуск p95 {q} мс: {t:?}");
+    // хук не ждёт фоновый процесс
+    assert!(p95(hook_times) <= max_for("session-start"));
+}
+
+#[test]
+fn checkpoint_spawns_only_after_edits() {
+    let _g = serial();
+    let p = Proj::new("auto-checkpoint", NO_URL, "zam_x");
+    p.auto_on();
+    git_head(&p, &sha(1));
+    let stop = |s: &str| {
+        let ev = p.ev("Stop", s, json!({"stop_hook_active": false}));
+        p.hook_at(NO_URL, "checkpoint", "claude", ev.to_string().as_bytes())
+    };
+    let _ = stop("c1");
+    assert!(spawns_logged(&p).is_empty(), "без правок: {}", p.log());
+    p.hook_at(
+        NO_URL,
+        "pre-tool",
+        "claude",
+        write_ev(&p, "c1", "a.txt").to_string().as_bytes(),
+    );
+    let _ = stop("c1");
+    assert_eq!(spawns_logged(&p).len(), 1, "после правок: {}", p.log());
+    // повтор в интервале — нет
+    let _ = stop("c1");
+    assert_eq!(spawns_logged(&p).len(), 1, "{}", p.log());
+}
+
+#[test]
+fn code_map_flag_off_no_spawn() {
+    let _g = serial();
+    let p = Proj::new("auto-off", NO_URL, "zam_x");
+    p.auto_on();
+    git_head(&p, &sha(1));
+    let start = |s: &str| {
+        let ev = p.ev("SessionStart", s, json!({"source": "startup"}));
+        let _ = p.hook_at(NO_URL, "session-start", "claude", ev.to_string().as_bytes());
+    };
+    // тип подсказок `code_map` выключен на сервере (кэш hooks.json)
+    std::fs::create_dir_all(p.cache()).unwrap();
+    std::fs::write(
+        p.cache().join("hooks.json"),
+        json!({"fetched_at": "x", "server": NO_URL, "hooks": {"code_map": false}}).to_string(),
+    )
+    .unwrap();
+    start("f1");
+    assert!(spawns_logged(&p).is_empty(), "{}", p.log());
+    std::fs::remove_file(p.cache().join("hooks.json")).unwrap();
+    // `[hooks] code_map = false`, `code.auto = false`, `code.enabled = false`
+    for (i, cfg) in [
+        "[hooks]\ncode_map = false\n",
+        "[code]\nauto = false\n",
+        "[code]\nenabled = false\n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        std::fs::write(p.repo.join(".zeroaimemory/config.toml"), cfg).unwrap();
+        git_head(&p, &sha(10 + i as u32));
+        start("f2");
+        assert!(spawns_logged(&p).is_empty(), "{cfg}: {}", p.log());
+    }
+    // без решения — нет
+    std::fs::remove_file(p.repo.join(".zeroaimemory/config.toml")).unwrap();
+    std::fs::remove_file(p.repo.join(".zeroaimemory/solution.toml")).unwrap();
+    git_head(&p, &sha(77));
+    start("f3");
+    assert!(spawns_logged(&p).is_empty(), "{}", p.log());
+}
+
+/// Ревью задачи 6, I1: очередь из 30 файлов × 1500 символов (≈ 2,5 МБ) уходит пачками по
+/// байтам без потерь — каждая символьная ссылка получает `symbol_changed`.
+#[test]
+fn changed_queue_with_many_symbols_flushed_without_loss() {
+    let _g = serial();
+    let (url, tok) = start("big-queue");
+    let p = Proj::new("big-queue", &url, &tok);
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    let mut args: Vec<String> = ["log", "insight", "--kind", "gotcha", "--title", "Много"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for i in 0..30 {
+        std::fs::write(
+            p.repo.join(format!("src/f{i}.rs")),
+            b"pub fn f0() -> u32 {\n    0\n}\n",
+        )
+        .unwrap();
+        args.push("--ref".into());
+        args.push(format!("src/f{i}.rs#f0"));
+    }
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    ok(&p.zam(&a, "Подробно.\n".as_bytes()));
+    // очередь сессии: у каждого файла 1500 символов, тело `f0` другое
+    let v = post_ok(
+        &p,
+        "bq1",
+        "Write",
+        json!({"file_path": p.repo.join("src/f0.rs")}),
+    );
+    let _ = p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes());
+    let q = p.session_file("changed", "bq1", ".jsonl").expect("очередь");
+    let mut text = String::new();
+    for i in 0..30 {
+        let mut syms: Vec<Value> = (0..1500)
+            .map(|k| json!({"qual": format!("other_function_{k:05}"), "body_hash": format!("{k:016x}")}))
+            .collect();
+        syms.push(json!({"qual": "f0", "body_hash": "f".repeat(16)}));
+        text.push_str(
+            &json!({"path": format!("src/f{i}.rs"), "hash": "1".repeat(64), "symbols": syms})
+                .to_string(),
+        );
+        text.push('\n');
+    }
+    assert!(text.len() > 2 * 1024 * 1024, "{}", text.len());
+    std::fs::write(&q, text).unwrap();
+    for i in 0..20 {
+        if p.session_file("changed", "bq1", ".jsonl").is_none() {
+            break;
+        }
+        let ev = p.ev(
+            "SessionStart",
+            &format!("bqs{i}"),
+            json!({"source": "startup"}),
+        );
+        ok(&p.hook("session-start", &ev));
+    }
+    assert!(
+        p.session_file("changed", "bq1", ".jsonl").is_none(),
+        "очередь не ушла: {}",
+        p.log()
+    );
+    assert!(!p.log().contains("отброшена"), "{}", p.log());
+    let idx = file_refs_index(&p);
+    for i in 0..30 {
+        assert_eq!(
+            ref_state(&idx, &format!("src/f{i}.rs")),
+            ["stale"],
+            "f{i}: {idx}"
+        );
+    }
+}
+
+/// Ревью задачи 6: частичный сбой отправки очереди пачками — постоянная ошибка на второй пачке
+/// или тайм-аут посередине: первая пачка снята, остаток возвращён в очередь без потерь и
+/// повторов.
+#[test]
+fn changed_flush_partial_failure_returns_rest() {
+    let _g = serial();
+    for (name, code, delay) in [
+        ("flush-part-500", 500u16, Duration::ZERO),
+        ("flush-part-slow", 200, Duration::from_secs(3)),
+    ] {
+        let (url, seen) =
+            common::stub_with(std::sync::Arc::new(move |_: &str, path: &str, n: usize| {
+                if path == "/api/v1/files/changed" && n >= 1 {
+                    (code, r#"{"status":500,"detail":"x"}"#, delay)
+                } else {
+                    (200, r#"{"stale":0}"#, Duration::ZERO)
+                }
+            }));
+        let p = Proj::new(name, &url, "zam_x");
+        std::fs::create_dir_all(p.cache()).unwrap();
+        let all: Vec<String> = (0..8).map(|i| format!("src/f{i}.rs")).collect();
+        let mut text = String::new();
+        for path in &all {
+            let syms: Vec<Value> = (0..1500)
+                .map(|k| json!({"qual": format!("other_function_{k:05}"), "body_hash": format!("{k:016x}")}))
+                .collect();
+            text.push_str(
+                &json!({"path": path, "hash": "1".repeat(64), "symbols": syms}).to_string(),
+            );
+            text.push('\n');
+        }
+        let part = format!("pq-{}", &blake(b"pq")[..8]);
+        std::fs::write(p.cache().join(format!("changed-{part}.jsonl")), text).unwrap();
+        let ss = p.ev("SessionStart", "pq-new", json!({"source": "startup"}));
+        let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+        let posts: Vec<Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert!(posts.len() >= 2, "{name}: пачек {}", posts.len());
+        let sent: Vec<String> = posts[0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect();
+        let left: Vec<String> = queue(&p, "pq")
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !sent.is_empty() && !left.is_empty(),
+            "{name}: {sent:?} / {left:?}"
+        );
+        let mut both: Vec<String> = sent.iter().chain(&left).cloned().collect();
+        both.sort();
+        assert_eq!(both, all, "{name}: первая пачка снята, остаток возвращён");
+    }
 }

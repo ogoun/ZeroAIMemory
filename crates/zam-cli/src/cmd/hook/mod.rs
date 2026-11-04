@@ -14,7 +14,8 @@
 //!   домашнего), затем настройка сервера из ответа `/recall(session_start)` (кэш
 //!   `cache/hooks.json`): тип выключен, если выключен в клиенте или на сервере. С M4.5 (§9.6)
 //!   ключей девять ([`Flag`]): к типам команд добавлены `subagent_start`, `file_context`
-//!   (знание о файле), `session_journal` (журнал сессии [`journal`]) и `recovery`; нет ключа
+//!   (знание о файле), `session_journal` (журнал сессии [`journal`]) и `recovery`; с M5.6 —
+//!   десятый `code_map` (автосинхронизация карты кода, [`crate::cmd::code::auto`]); нет ключа
 //!   — `true` (старый `hooks.json` и старый сервер новое не выключают).
 //! - **`post-tool`** — два режима: ошибка (как M4: `/recall(post_tool)`, бюджет 250 мс) и
 //!   успех (M4.5: журнал, знание о файле, очередь изменённых — без сети, 50 мс).
@@ -148,6 +149,9 @@ pub enum Flag {
     SessionJournal,
     /// Пакет восстановления после сжатия и `resume` (§9.2).
     Recovery,
+    /// Карта кода (M5.6 §10): строка дайджеста, раздел `### Код` пакета под задачу и
+    /// автосинхронизация из `session-start`/`checkpoint`.
+    CodeMap,
 }
 
 /// Включённость типов подсказок (R5): именованные ключи, нет ключа — `None` (включён).
@@ -172,6 +176,8 @@ pub struct HookFlags {
     pub session_journal: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_map: Option<bool>,
 }
 
 impl HookFlags {
@@ -186,6 +192,7 @@ impl HookFlags {
             Flag::FileContext => self.file_context,
             Flag::SessionJournal => self.session_journal,
             Flag::Recovery => self.recovery,
+            Flag::CodeMap => self.code_map,
         }
     }
 
@@ -201,6 +208,7 @@ impl HookFlags {
             file_context: self.file_context.or(base.file_context),
             session_journal: self.session_journal.or(base.session_journal),
             recovery: self.recovery.or(base.recovery),
+            code_map: self.code_map.or(base.code_map),
         }
     }
 }
@@ -362,27 +370,31 @@ impl Env {
     /// Строка в `hooks.log` (ротация по [`LOG_MAX`]); сбой журнала молча игнорируется.
     /// Текст промптов, команд и содержимого файлов сюда не передаётся.
     pub fn log(&self, msg: &str) {
-        let path = self.log_path();
-        let _ = (|| -> std::io::Result<()> {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() >= LOG_MAX) {
-                let _ = std::fs::rename(&path, path.with_extension("log.1"));
-            }
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            let line = format!(
-                "{} {} {}\n",
-                cache::now_rfc3339(),
-                self.kind.as_str(),
-                msg.replace(['\r', '\n'], " ")
-            );
-            f.write_all(line.as_bytes())
-        })();
+        log_line(&self.log_path(), self.kind.as_str(), msg);
     }
+}
+
+/// Строка `<время> <источник> <текст>` в журнал хуков `path` (ротация по [`LOG_MAX`]); сбой
+/// журнала молча игнорируется. Пишут хуки ([`Env::log`]) и фоновая `zam code sync`.
+pub fn log_line(path: &Path, source: &str, msg: &str) {
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if std::fs::metadata(path).is_ok_and(|m| m.len() >= LOG_MAX) {
+            let _ = std::fs::rename(path, path.with_extension("log.1"));
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let line = format!(
+            "{} {source} {}\n",
+            cache::now_rfc3339(),
+            msg.replace(['\r', '\n'], " ")
+        );
+        f.write_all(line.as_bytes())
+    })();
 }
 
 /// Корень проекта (fix round 1, m-6; fix round 2): ближайший вверх от `cwd` каталог с

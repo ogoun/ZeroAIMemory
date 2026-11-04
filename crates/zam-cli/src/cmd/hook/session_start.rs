@@ -20,6 +20,9 @@
 //! дописывает после его текста сводку журнала сессии ([`journal::render_summary`], ключи
 //! `recovery` и `session_journal`); общий предел — прежний ([`output::with_tail`]). Сервер
 //! недоступен — только сводка; журнала нет — только текст сервера.
+//! M5.6 §5: после запросов хука (их бюджет — не делить с синхронизацией за тот же сервер) —
+//! запуск фоновой `zam code sync --background`, если пора
+//! ([`crate::cmd::code::auto::maybe_spawn_sync`]; сервер для запуска не нужен).
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -37,7 +40,17 @@ const MD_MAX: u64 = 1024 * 1024;
 const BEGIN: &str = "<!-- zeroaimemory:begin";
 
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
+    let out = digest(env, inp, s);
+    // карта кода (M5.6 §5): фоновая синхронизация, если пора; хук её не ждёт (≤ 10 мс)
+    crate::cmd::code::auto::maybe_spawn_sync(env, s);
+    out
+}
+
+/// Регистрация сессии, дайджест, кэши и очереди (см. модуль).
+fn digest(env: &Env, inp: &Input, s: &Settings) -> Output {
     cache::gc_cache(env);
+    // очереди изменённых файлов больше 4 МиБ — уплотнение здесь, не в бюджете `post-tool`
+    cache::compact_changed_queues(env);
     let session = inp.session_id.as_deref();
     let source = inp.str("source");
     if let Some(id) = session {
@@ -88,6 +101,8 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
                 "session_id": session,
                 "solution": solution,
                 "source": source,
+                // строка карты кода — по `[hooks] code_map` клиента (M5.6 §10)
+                "code_map": s.client.get(Flag::CodeMap) != Some(false),
             });
             // `recovery` выключен в клиенте — сервер не строит пакет (по `source` он его и
             // выбирает; иначе `source` только в журнал DEBUG)

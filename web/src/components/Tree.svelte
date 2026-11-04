@@ -367,6 +367,8 @@
       <path d="M2.5 8.2L8 2.5h5.5V8L8 13.5z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /><circle cx="10.6" cy="5.4" r="1" fill="currentColor" />
     {:else if kind === 'j-reports'}
       <path d="M3 2.5h10v11H3z M5.5 11V8.5 M8 11V5.5 M10.5 11V7.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" />
+    {:else if kind === 'j-code'}
+      <path d="M5.5 4.5L2 8l3.5 3.5 M10.5 4.5L14 8l-3.5 3.5 M9 3l-2 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
     {:else if kind === 'j-insights'}
       <path d="M8 1.8a4.2 4.2 0 0 0-2.4 7.6V11h4.8V9.4A4.2 4.2 0 0 0 8 1.8z M6 13.3h4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" />
     {:else if kind === 'j-glossary'}

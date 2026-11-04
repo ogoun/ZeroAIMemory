@@ -79,6 +79,19 @@ fn detects_each_rule() {
         one(&format!("AI{}{}", "za", rnd(35, 8))),
         SecretKind::KnownPrefix("google")
     ));
+    // Hugging Face, npm, SendGrid (ревью задачи 5 M5.6, M8)
+    assert!(matches!(
+        one(&format!("token {}{}", "hf_", rnd(34, 30))),
+        SecretKind::KnownPrefix("huggingface")
+    ));
+    assert!(matches!(
+        one(&format!("authToken {}{}", "npm_", rnd(36, 31))),
+        SecretKind::KnownPrefix("npm")
+    ));
+    assert!(matches!(
+        one(&format!("key {}.{}.{}", "SG", rnd(22, 32), rnd(43, 33))),
+        SecretKind::KnownPrefix("sendgrid")
+    ));
     // токен ZeroAIMemory (формат zam_core::token)
     let zam = format!("za{}_{}", "m", rnd(40, 9));
     assert!(matches!(
@@ -143,6 +156,10 @@ fn ignores_identifiers() {
         "password: $DB_PASSWORD".to_string(),
         "src/components/UserProfileCard/Details2/ProfileCardDetailsView.tsx".to_string(),
         "ВерблюжийРегистрДлинныйИдентификаторБезЦифр".to_string(),
+        // имена с префиксами новых правил — не секреты
+        "fn hf_model_loader_from_pretrained_v2() npm_package_version SG.Config.load".to_string(),
+        "pub fn handle_incoming_websocket_message_v2(&self) -> useQueryClientInvalidationOnMount2x"
+            .to_string(),
         "обычный текст про токены и пароли: без значений".to_string(),
     ];
     for s in &samples {
@@ -362,8 +379,23 @@ proptest! {
                 "[A-Za-z0-9=]{32,60}",
                 Just("postgres://u:pw12345@h/".to_string()),
                 Just(SECRET_MARK.to_string()),
+                Just(format!("hf_{}", rnd(34, 40))),
+                Just(format!("SG.{}.{}", rnd(22, 41), rnd(43, 42))),
+                Just(format!("npm_{}", rnd(36, 43))),
+                // ревью b854b22, I2: маска одного правила меняет контекст другого (URL-пароль
+                // после маски энтропии или закрытого ключа, ключи после буквы)
+                "[A-Za-z0-9=/,:@\"]{1,10}",
+                "[A-Za-z0-9/]{32,60}",
+                Just("s://".to_string()),
+                Just(":hunter22@".to_string()),
+                Just(",".to_string()),
+                Just("A".to_string()),
+                Just(format!("gh{}_{}", "p", rnd(36, 44))),
+                Just(format!("{}{}", "AK", "IA") + &rnd(16, 45).to_ascii_uppercase()),
+                Just(format!("ey{}{}.{}.{}", "J", rnd(20, 46), rnd(30, 47), rnd(20, 48))),
+                Just(format!("xo{}-{}", "xb", rnd(20, 49))),
             ],
-            0..12,
+            0..14,
         )
     ) {
         let text = parts.concat();
@@ -396,4 +428,204 @@ fn bench_scan_100kb() {
     let per = t.elapsed() / n;
     println!("scan_secrets: {per:?} на {} байт", text.len());
     assert!(per.as_millis() <= 2, "бюджет 2 мс превышен: {per:?}");
+}
+
+/// Регрессия (CI 41605984321): `://` замаскированного значения не должен скрывать длинное имя
+/// слева только в первом проходе.
+#[test]
+fn name_left_of_masked_url_value_idempotent() {
+    let name = "a020abAb0bC0e13h2cA45aaf6cgDEi1B";
+    for tail in [
+        "password=abcdef123postgres://u:pw12345@h/",
+        "password=abcdef123password=abcdef123postgres://u:pw12345@h/",
+    ] {
+        let t = format!("{name}{tail}");
+        let once = mask_text(&t);
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+}
+
+/// Полный прогон перед слиянием M5.6 (`mask_is_idempotent`, seed `cc ef3a6e…`): ключ вплотную
+/// после буквы (`Ahf_<34>`, граница слова правила префикса не срабатывает — ловит правило
+/// энтропии), дальше в том же URL-токене — `password=…postgres://…`. Первый проход видел `://`
+/// ещё не замаскированного значения и отбрасывал кандидата как часть URL, второй — уже нет:
+/// ключ уходил открытым. Правило энтропии смотрит на текст, каким его увидит повторный проход.
+#[test]
+fn key_glued_after_letter_before_masked_url_value() {
+    let tail = format!("{SECRET_MARK}password=abcdef123postgres://u:pw12345@h/");
+    let keys = [
+        // тело — как у генератора `mask_is_idempotent` (`rnd(34, 40)`)
+        format!("{}_{}", "hf", rnd(34, 40)),
+        format!("{}_{}", "hf", rnd(34, 70)),
+        format!("gh{}_{}", "p", rnd(36, 71)),
+        format!("np{}_{}", "m", rnd(36, 72)),
+        format!("za{}_{}", "m", rnd(40, 73)),
+        format!("AI{}{}", "za", rnd(35, 74)),
+        format!("s{}-{}", "k", rnd(40, 75)),
+        format!("xo{}-{}", "xb", rnd(40, 76)),
+        format!("gl{}-{}", "pat", rnd(40, 77)),
+        format!("github{}pat_{}", "_", rnd(70, 78)),
+        format!("ey{}{}.{}.{}", "J", rnd(20, 79), rnd(30, 80), rnd(20, 81)),
+        format!("{}.{}.{}", "SG", rnd(22, 82), rnd(43, 83)),
+        format!("{}{}", "AK", "IA") + &rnd(16, 84).to_ascii_uppercase(),
+    ];
+    for lead in ["A", "7", "x "] {
+        for key in &keys {
+            for t in [
+                format!("{lead}{key}{tail}"),
+                format!("{lead}{key} {tail}"),
+                format!("{lead}{key}{tail} x"),
+            ] {
+                let once = mask_text(&t);
+                assert_eq!(mask_text(&once), once, "{t}");
+            }
+        }
+    }
+    // исходный вход: ключ маскируется с первого прохода
+    let key = &keys[0];
+    let once = mask_text(&format!("A{key}{tail}"));
+    assert!(!once.contains(&key[3..]), "{once}");
+    assert_eq!(
+        once,
+        format!("{SECRET_MARK}{SECRET_MARK}password={SECRET_MARK}")
+    );
+}
+
+/// Ревью b854b22, I1: правило энтропии по виду с масками видит только обрывки между ними —
+/// находки по исходному тексту остаются (base64 с `AKIA…` внутри, хвост за `hf_<34>`).
+#[test]
+fn entropy_over_text_kept_with_masks() {
+    let aws = format!("{}{}{}", "AK", "IA", rnd(16, 23).to_ascii_uppercase());
+    let b64 = format!("{}+{aws}/{}", rnd(14, 22), rnd(14, 24));
+    let hf = format!("{}_{}{}", "hf", rnd(34, 20), rnd(12, 21));
+    for v in [b64, hf] {
+        let t = format!("k {v} y");
+        let once = mask_text(&t);
+        assert_eq!(once, format!("k {SECRET_MARK} y"), "{t}");
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+}
+
+/// Ревью b854b22, I2: маска энтропии или закрытого ключа убирает из имени пользователя URL
+/// `/`, `"`, `,` — пароль находится в первом же проходе (скан до неподвижной точки).
+#[test]
+fn url_password_after_other_mask_first_pass() {
+    let cases = [
+        (format!("s://x,Ab/{}:hunter22@h", rnd(40, 1)), "hunter22"),
+        (
+            format!("redis://x\"Q/{}:Sup3rPass@host", rnd(40, 2)),
+            "Sup3rPass",
+        ),
+        (
+            "s://-----BEGIN PRIVATE KEY-----:hunter22@".to_string(),
+            "hunter22",
+        ),
+    ];
+    for (t, pw) in cases {
+        let once = mask_text(&t);
+        assert!(!once.contains(pw), "{t} -> {once}");
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+}
+
+/// Ревью b854b22, M1: цепочка `<имя>=<значение> ` (текст вложений) — линейно: проверки имени
+/// перед маской перебирают только находки текущего кандидата.
+#[test]
+fn name_value_chain_linear() {
+    let unit = format!("{}={} ", rnd(10, 9), rnd(40, 10));
+    let time = |mb: usize| {
+        let t = unit.repeat(mb * 1_000_000 / unit.len());
+        let t0 = std::time::Instant::now();
+        let hits = scan_secrets(&t);
+        let el = t0.elapsed();
+        assert_eq!(hits.len(), t.len() / unit.len());
+        el
+    };
+    time(1); // прогрев ленивых регулярных выражений
+    let (t1, t2) = (time(1), time(2));
+    eprintln!("цепочка имя=значение: 1 МБ {t1:?}, 2 МБ {t2:?}");
+    // квадратичная (до правки) — ×4 и секунды в debug; линейная — ×2
+    assert!(
+        t2 < t1 * 3 + std::time::Duration::from_millis(300),
+        "{t1:?} / {t2:?}"
+    );
+}
+
+/// Ревью задачи 9A, M2: ключи вплотную друг к другу (`SG.…hf_…`, `ghp_…ghp_…`, `AKIA…npm_…`)
+/// — находки сканера (детекторы, нарезка) покрывают оба ключа целиком, маскировка — одним
+/// проходом. Пересекающиеся находки (правило энтропии) сливаются в одну.
+#[test]
+fn glued_keys_each_detected() {
+    let up = rnd(16, 50).to_ascii_uppercase();
+    let cases = [
+        (
+            format!("SG.{}.{}", rnd(22, 51), rnd(43, 52)),
+            format!("hf_{}", rnd(34, 53)),
+        ),
+        (
+            format!("ghp_{}", rnd(36, 54)),
+            format!("ghp_{}", rnd(36, 55)),
+        ),
+        (format!("AKIA{up}"), format!("npm_{}", rnd(36, 56))),
+        // второй ключ — только правило префикса (нижний регистр без цифр — не энтропия)
+        (
+            format!("AKIA{up}"),
+            format!("hf_{}", &"abcdefghij".repeat(4)[..34]),
+        ),
+    ];
+    for (a, b) in cases {
+        let t = format!("x {a}{b} y");
+        let hits = scan_secrets(&t);
+        let covered = |at: usize| hits.iter().any(|h| h.range.contains(&at));
+        assert!((2..2 + a.len() + b.len()).all(covered), "{t}: {hits:?}");
+        let once = mask_text(&t);
+        assert!(!once.contains(&a) && !once.contains(&b[3..]), "{once}");
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+}
+
+/// Повторное ревью 9A: жадный хвост правила (Slack `xox…-[A-Za-z0-9-]{10,}`) съедает начало
+/// следующего ключа (`hf`) — ключ всё равно находится (тело без энтропии: ловит только правило
+/// префикса); JWT вплотную за ключом (`ghp_<36>eyJ…`) — тоже, одной маской: кандидат энтропии
+/// по исходному тексту покрывает оба (ревью b854b22, I1).
+#[test]
+fn glued_after_greedy_tail_and_jwt() {
+    let low = "abcdefghij".repeat(4);
+    let cases = [
+        (
+            format!("xo{}-{}", "xb", "1234567890"),
+            format!("hf_{}", &low[..34]),
+        ),
+        (
+            format!("xo{}-{}", "xp", "abcdefghijklmn"),
+            format!("npm_{}", &low[..36]),
+        ),
+        (
+            format!("ghp_{}", rnd(36, 60)),
+            format!("ey{}{}.{}.{}", "J", rnd(20, 61), rnd(30, 62), rnd(20, 63)),
+        ),
+    ];
+    for (a, b) in cases {
+        let t = format!("x {a}{b} y");
+        let hits = scan_secrets(&t);
+        let covered = |at: usize| hits.iter().any(|h| h.range.contains(&at));
+        assert!((2..2 + a.len() + b.len()).all(covered), "{t}: {hits:?}");
+        let once = mask_text(&t);
+        assert_eq!(once, format!("x {SECRET_MARK} y"), "{t}");
+        assert_eq!(mask_text(&once), once);
+    }
+}
+
+/// Повторное ревью 9A: цепочка слипшихся ключей не квадратична — 1 МБ из `AKIA<16>` подряд
+/// (≈ 52 000 ключей) сканируется быстро (замер — в журнале этапа).
+#[test]
+fn glued_chain_1mb_linear() {
+    let key = format!("{}{}{}", "AK", "IA", "ABCDEFGH23456789");
+    let t = key.repeat(1_048_576 / key.len());
+    let t0 = std::time::Instant::now();
+    let hits = scan_secrets(&t);
+    let ms = t0.elapsed().as_millis();
+    eprintln!("1 МБ AKIA-цепочки: {} находок за {ms} мс", hits.len());
+    assert_eq!(hits.len(), t.len() / key.len());
+    assert!(ms < 5000, "{ms} мс");
 }

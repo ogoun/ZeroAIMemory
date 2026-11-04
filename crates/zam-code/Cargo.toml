@@ -1,0 +1,39 @@
+[package]
+name = "zam-code"
+description = "Карта кода ZeroAIMemory: протокол, нормализация имён, экстрактор символов tree-sitter (фича parse)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Экстрактор на tree-sitter (C-код рантайма и грамматик). Включает только клиент `zam`: сервер
+# берёт крейт без фич — типы протокола, имена, ранжирование
+parse = [
+    "dep:tree-sitter",
+    "dep:streaming-iterator",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-c-sharp",
+]
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+streaming-iterator = { workspace = true, optional = true }
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-c-sharp = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true

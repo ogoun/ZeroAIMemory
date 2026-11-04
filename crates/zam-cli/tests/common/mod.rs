@@ -90,9 +90,21 @@ pub const REPO_LITTER: [&str; 6] = [
 /// Запрос, принятый заглушкой: метод, путь, тело (JSON или `Null`).
 pub type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
 
+/// Ответ заглушки на запрос `(метод, путь, номер запроса с этим путём с 0)`: статус, тело,
+/// задержка.
+pub type Reply =
+    dyn Fn(&str, &str, usize) -> (u16, &'static str, std::time::Duration) + Send + Sync + 'static;
+
 /// Заглушка HTTP в фоновом потоке: на любой запрос — `status` с телом `body` (JSON) после
 /// задержки `delay` (запрос сначала читается целиком); принятые запросы — в [`Seen`].
 pub fn stub(status: u16, body: &'static str, delay: std::time::Duration) -> (String, Seen) {
+    stub_with(std::sync::Arc::new(move |_: &str, _: &str, _: usize| {
+        (status, body, delay)
+    }))
+}
+
+/// Заглушка с ответом по запросу ([`Reply`]): например, ошибка на второй пачке.
+pub fn stub_with(reply: std::sync::Arc<Reply>) -> (String, Seen) {
     use std::io::{BufRead, BufReader, Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -101,6 +113,7 @@ pub fn stub(status: u16, body: &'static str, delay: std::time::Duration) -> (Str
     std::thread::spawn(move || {
         for conn in l.incoming().flatten() {
             let s3 = s2.clone();
+            let reply = reply.clone();
             std::thread::spawn(move || {
                 let mut r = BufReader::new(conn.try_clone().unwrap());
                 let mut line = String::new();
@@ -127,7 +140,12 @@ pub fn stub(status: u16, body: &'static str, delay: std::time::Duration) -> (Str
                 let mut b = vec![0u8; len];
                 let _ = r.read_exact(&mut b);
                 let v = serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null);
-                s3.lock().unwrap().push((m, p, v));
+                let (status, body, delay) = {
+                    let mut s = s3.lock().unwrap();
+                    let n = s.iter().filter(|(_, q, _)| *q == p).count();
+                    s.push((m.clone(), p.clone(), v));
+                    reply(&m, &p, n)
+                };
                 std::thread::sleep(delay);
                 let mut c = conn;
                 let _ = write!(

@@ -6,7 +6,8 @@
 //! `zam refs check`; документы (M5): pdfium рядом с `zam-server` грузится рабочим процессом
 //! (`doc-worker`, `ping`), вложения PDF/DOCX/XLSX → извлечение → поиск фрагмента с `locator` →
 //! `zam read --locator` → превью листа и миниатюра PDF; для Windows — статический CRT наших exe
-//! и app-local MSVC runtime библиотек (в том числе pdfium).
+//! и app-local MSVC runtime библиотек (в том числе pdfium); карта кода (M5.6): `zam code sync`
+//! проекта из трёх файлов, `/code/status`, `zam code map` и `zam code sym`.
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -887,7 +888,7 @@ pub fn run(
         vault_roundtrip(&zam, &dir, &base, &token),
     )?;
     s.run(
-        "M4: MCP tools/list — 10 инструментов",
+        "M4/M5.6: MCP tools/list — 11 инструментов",
         mcp_tools_list(&base, &token),
     )?;
     let hook_id = s.run(
@@ -913,6 +914,10 @@ pub fn run(
     s.run(
         "M4.5: zam log insight --ref → правка файла → zam refs check → stale",
         refs_check(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M5.6: проект из 3 файлов → zam code sync → /code/status files = 3 → zam code map, sym",
+        code_map_check(&zam, &dir, &base, &token),
     )?;
     let with_log = |e: anyhow::Error, srv: &Server| {
         anyhow!(
@@ -1490,7 +1495,7 @@ fn vault_roundtrip(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()
 // ---- M4: агенты ----
 
 /// Инструменты MCP сервера (§13.1).
-const MCP_TOOLS: [&str; 10] = [
+const MCP_TOOLS: [&str; 11] = [
     "memory_search",
     "memory_read",
     "memory_cache_put",
@@ -1501,6 +1506,7 @@ const MCP_TOOLS: [&str; 10] = [
     "memory_link",
     "memory_recall",
     "memory_vault",
+    "memory_code",
 ];
 
 /// Insight с триггерами smoke-теста M4: заголовок и текст (не похожи на insight M3 — без 409).
@@ -1509,7 +1515,7 @@ const HOOK_BODY: &str = "A CRLF shebang breaks the deploy run on Linux runners."
 /// Ошибка инструмента для `/recall(post_tool)`.
 const HOOK_ERROR: &str = "/bin/bash^M: bad interpreter: No such file or directory";
 
-/// Критерий M4: `POST /mcp` `tools/list` по токену — все 10 инструментов (§13.1).
+/// Критерий M4 (M5.6 — `memory_code`): `POST /mcp` `tools/list` по токену — все 11 инструментов (§13.1).
 fn mcp_tools_list(base: &str, token: &str) -> Result<()> {
     let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
     let mut r = agent()
@@ -1994,6 +2000,86 @@ fn refs_check(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
         .map(|r| r["items"][0]["state"].clone());
     if status != 200 || state != Some(Value::from("stale")) {
         bail!("GET /file-refs: HTTP {status}, ссылка src/wm.rs не stale: {idx}");
+    }
+    Ok(())
+}
+
+// ---- M5.6: карта кода ----
+
+/// Карта кода (M5.6 §17): проект из трёх файлов (`.rs`, `.ts`, `.py`) решения smoke →
+/// `zam code sync` загружает три → `GET /code/status` показывает `files = 3` → `zam code map`
+/// непуст → `zam code sym` находит символ с путём (экстрактор tree-sitter собран в `zam`
+/// комплекта, в том числе musl).
+fn code_map_check(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let home = dir.join("code-home");
+    let project = dir.join("code-project");
+    fs::create_dir_all(project.join(".zeroaimemory"))?;
+    fs::create_dir_all(project.join("src"))?;
+    fs::create_dir_all(home.join(".zeroaimemory"))?;
+    // хуки smoke не запускают фоновую синхронизацию: проверяется явная `zam code sync`
+    fs::write(
+        home.join(".zeroaimemory").join("config.toml"),
+        "[code]\nauto = false\n",
+    )?;
+    fs::write(
+        project.join(".zeroaimemory").join("solution.toml"),
+        format!("agent_solution_id = \"{SMOKE_SOLUTION}\"\nname = \"smoke\"\n"),
+    )?;
+    fs::write(
+        project.join("src").join("store.rs"),
+        "pub struct SmokeStore;\n\nimpl SmokeStore {\n    pub fn smoke_open() -> SmokeStore {\n        SmokeStore\n    }\n}\n",
+    )?;
+    fs::write(
+        project.join("src").join("client.ts"),
+        "export function smokeClient(n: number): number {\n  return n + 1;\n}\n",
+    )?;
+    fs::write(
+        project.join("src").join("tool.py"),
+        "def smoke_tool(x):\n    return x * 2\n",
+    )?;
+    let run = |args: &[&str]| -> Result<String> {
+        let out = zam_run(zam, (&home, &project), conn, args, None, &[])?;
+        if out.status.code() != Some(0) {
+            bail!(
+                "zam {}: код {:?}\n{}{}",
+                args.join(" "),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let sync: Value = serde_json::from_str(&run(&["code", "sync", "--json"])?)
+        .context("zam code sync --json: не JSON")?;
+    if sync["files"] != 3 || sync["uploaded"] != 3 {
+        bail!("zam code sync: ожидалось 3 файла и 3 загрузки: {sync}");
+    }
+    let (status, st) = api(
+        base,
+        token,
+        &format!("/api/v1/code/status?solution={SMOKE_SOLUTION}"),
+        None,
+    )?;
+    if status != 200 || st["files"] != 3 {
+        bail!("GET /code/status: HTTP {status}, files ≠ 3: {st}");
+    }
+    let map = run(&["code", "map"])?;
+    if map.trim().is_empty() || !map.contains("src/store.rs") {
+        bail!("zam code map пуст или без src/store.rs:\n{map}");
+    }
+    // символ каждого языка проекта: Rust (метод в `impl`), TypeScript, Python
+    for (qual, path) in [
+        ("SmokeStore::smoke_open", "src/store.rs"),
+        ("smokeClient", "src/client.ts"),
+        ("smoke_tool", "src/tool.py"),
+    ] {
+        let sym: Value = serde_json::from_str(&run(&["code", "sym", qual, "--json"])?)
+            .with_context(|| format!("zam code sym {qual} --json: не JSON"))?;
+        if sym["symbol"]["path"] != path || sym["symbol"]["qual"] != qual {
+            bail!("zam code sym не нашёл {qual} в {path}: {sym}");
+        }
     }
     Ok(())
 }
