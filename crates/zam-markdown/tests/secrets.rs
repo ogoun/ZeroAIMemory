@@ -382,8 +382,20 @@ proptest! {
                 Just(format!("hf_{}", rnd(34, 40))),
                 Just(format!("SG.{}.{}", rnd(22, 41), rnd(43, 42))),
                 Just(format!("npm_{}", rnd(36, 43))),
+                // ревью b854b22, I2: маска одного правила меняет контекст другого (URL-пароль
+                // после маски энтропии или закрытого ключа, ключи после буквы)
+                "[A-Za-z0-9=/,:@\"]{1,10}",
+                "[A-Za-z0-9/]{32,60}",
+                Just("s://".to_string()),
+                Just(":hunter22@".to_string()),
+                Just(",".to_string()),
+                Just("A".to_string()),
+                Just(format!("gh{}_{}", "p", rnd(36, 44))),
+                Just(format!("{}{}", "AK", "IA") + &rnd(16, 45).to_ascii_uppercase()),
+                Just(format!("ey{}{}.{}.{}", "J", rnd(20, 46), rnd(30, 47), rnd(20, 48))),
+                Just(format!("xo{}-{}", "xb", rnd(20, 49))),
             ],
-            0..12,
+            0..14,
         )
     ) {
         let text = parts.concat();
@@ -479,6 +491,66 @@ fn key_glued_after_letter_before_masked_url_value() {
     );
 }
 
+/// Ревью b854b22, I1: правило энтропии по виду с масками видит только обрывки между ними —
+/// находки по исходному тексту остаются (base64 с `AKIA…` внутри, хвост за `hf_<34>`).
+#[test]
+fn entropy_over_text_kept_with_masks() {
+    let aws = format!("{}{}{}", "AK", "IA", rnd(16, 23).to_ascii_uppercase());
+    let b64 = format!("{}+{aws}/{}", rnd(14, 22), rnd(14, 24));
+    let hf = format!("{}_{}{}", "hf", rnd(34, 20), rnd(12, 21));
+    for v in [b64, hf] {
+        let t = format!("k {v} y");
+        let once = mask_text(&t);
+        assert_eq!(once, format!("k {SECRET_MARK} y"), "{t}");
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+}
+
+/// Ревью b854b22, I2: маска энтропии или закрытого ключа убирает из имени пользователя URL
+/// `/`, `"`, `,` — пароль находится в первом же проходе (скан до неподвижной точки).
+#[test]
+fn url_password_after_other_mask_first_pass() {
+    let cases = [
+        (format!("s://x,Ab/{}:hunter22@h", rnd(40, 1)), "hunter22"),
+        (
+            format!("redis://x\"Q/{}:Sup3rPass@host", rnd(40, 2)),
+            "Sup3rPass",
+        ),
+        (
+            "s://-----BEGIN PRIVATE KEY-----:hunter22@".to_string(),
+            "hunter22",
+        ),
+    ];
+    for (t, pw) in cases {
+        let once = mask_text(&t);
+        assert!(!once.contains(pw), "{t} -> {once}");
+        assert_eq!(mask_text(&once), once, "{t}");
+    }
+}
+
+/// Ревью b854b22, M1: цепочка `<имя>=<значение> ` (текст вложений) — линейно: проверки имени
+/// перед маской перебирают только находки текущего кандидата.
+#[test]
+fn name_value_chain_linear() {
+    let unit = format!("{}={} ", rnd(10, 9), rnd(40, 10));
+    let time = |mb: usize| {
+        let t = unit.repeat(mb * 1_000_000 / unit.len());
+        let t0 = std::time::Instant::now();
+        let hits = scan_secrets(&t);
+        let el = t0.elapsed();
+        assert_eq!(hits.len(), t.len() / unit.len());
+        el
+    };
+    time(1); // прогрев ленивых регулярных выражений
+    let (t1, t2) = (time(1), time(2));
+    eprintln!("цепочка имя=значение: 1 МБ {t1:?}, 2 МБ {t2:?}");
+    // квадратичная (до правки) — ×4 и секунды в debug; линейная — ×2
+    assert!(
+        t2 < t1 * 3 + std::time::Duration::from_millis(300),
+        "{t1:?} / {t2:?}"
+    );
+}
+
 /// Ревью задачи 9A, M2: ключи вплотную друг к другу (`SG.…hf_…`, `ghp_…ghp_…`, `AKIA…npm_…`)
 /// — находки сканера (детекторы, нарезка) покрывают оба ключа целиком, маскировка — одним
 /// проходом. Пересекающиеся находки (правило энтропии) сливаются в одну.
@@ -514,9 +586,8 @@ fn glued_keys_each_detected() {
 
 /// Повторное ревью 9A: жадный хвост правила (Slack `xox…-[A-Za-z0-9-]{10,}`) съедает начало
 /// следующего ключа (`hf`) — ключ всё равно находится (тело без энтропии: ловит только правило
-/// префикса); JWT вплотную за ключом (`ghp_<36>eyJ…`) — тоже. Пересёкшиеся находки (жадный
-/// хвост) — одна маска, смежные (`ghp_<36>` и JWT) — две: правило энтропии не склеивает их
-/// кандидатом поверх уже найденного (полный прогон перед слиянием M5.6).
+/// префикса); JWT вплотную за ключом (`ghp_<36>eyJ…`) — тоже, одной маской: кандидат энтропии
+/// по исходному тексту покрывает оба (ревью b854b22, I1).
 #[test]
 fn glued_after_greedy_tail_and_jwt() {
     let low = "abcdefghij".repeat(4);
@@ -524,26 +595,23 @@ fn glued_after_greedy_tail_and_jwt() {
         (
             format!("xo{}-{}", "xb", "1234567890"),
             format!("hf_{}", &low[..34]),
-            1,
         ),
         (
             format!("xo{}-{}", "xp", "abcdefghijklmn"),
             format!("npm_{}", &low[..36]),
-            1,
         ),
         (
             format!("ghp_{}", rnd(36, 60)),
             format!("ey{}{}.{}.{}", "J", rnd(20, 61), rnd(30, 62), rnd(20, 63)),
-            2,
         ),
     ];
-    for (a, b, marks) in cases {
+    for (a, b) in cases {
         let t = format!("x {a}{b} y");
         let hits = scan_secrets(&t);
         let covered = |at: usize| hits.iter().any(|h| h.range.contains(&at));
         assert!((2..2 + a.len() + b.len()).all(covered), "{t}: {hits:?}");
         let once = mask_text(&t);
-        assert_eq!(once, format!("x {} y", SECRET_MARK.repeat(marks)), "{t}");
+        assert_eq!(once, format!("x {SECRET_MARK} y"), "{t}");
         assert_eq!(mask_text(&once), once);
     }
 }
