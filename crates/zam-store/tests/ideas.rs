@@ -1788,3 +1788,40 @@ fn stored_links_survive_broken_item() {
     assert_eq!(d.links, vec!["a", "b"]);
     assert_eq!(IdeaData::from_stored(&d.to_value()).links, vec!["a", "b"]);
 }
+
+/// Восстановление пачки: удалены и идея, и её вопрос-предложение; в любом порядке
+/// восстановления идея — `new` без `question_id`, вопрос — `obsolete`.
+#[tokio::test]
+async fn restore_idea_and_question_any_order() {
+    let (db, sol, _) = setup("restore-both").await;
+    for idea_first in [true, false] {
+        let i = new_idea(&db, sol, &format!("Идея {idea_first}"), "human", "normal").await;
+        let (_, q) = propose_idea(&db, i.id, None, None, None, &agent())
+            .await
+            .unwrap();
+        delete_entry(&db, i.id, None, &human()).await.unwrap();
+        delete_entry(&db, q.id, None, &human()).await.unwrap();
+        let order = if idea_first {
+            [i.id, q.id]
+        } else {
+            [q.id, i.id]
+        };
+        for id in order {
+            restore_entry(&db, id, None, &human()).await.unwrap();
+        }
+        let idea = get_entry(&db, i.id).await.unwrap();
+        let q = get_entry(&db, q.id).await.unwrap();
+        assert_eq!(
+            idea.status,
+            Some(EntryStatus::New),
+            "idea_first={idea_first}"
+        );
+        assert_eq!(data_of(&idea).question_id, None, "idea_first={idea_first}");
+        assert_eq!(
+            q.status,
+            Some(EntryStatus::Obsolete),
+            "idea_first={idea_first}"
+        );
+        assert!(idea.deleted_at.is_none() && q.deleted_at.is_none());
+    }
+}

@@ -311,8 +311,15 @@ impl IdeaData {
 
     /// Применяет клиентский патч `data`: `priority`, `horizon`, `links`; `null` снимает поле
     /// (`priority` — к `normal`). `origin` (только при создании) и поля сервера — ошибка
-    /// `data.<поле>: …` (422). Ошибка не оставляет частичного результата.
+    /// `data.<поле>: …` (422). Ошибка не оставляет частичного результата. `horizon` — строго
+    /// позже сегодняшней даты UTC ([`check_horizon`]).
     pub fn apply_patch(&mut self, patch: &Value) -> Result<(), String> {
+        self.patch_at(patch, Some(utc_today()))
+    }
+
+    /// [`IdeaData::apply_patch`] с датой проверки `horizon`: `None` — без проверки даты
+    /// (нормализация уже записанного запроса, не зависит от часов).
+    fn patch_at(&mut self, patch: &Value, today: Option<Date>) -> Result<(), String> {
         let o = patch
             .as_object()
             .ok_or_else(|| "data должно быть JSON-объектом".to_string())?;
@@ -337,8 +344,8 @@ impl IdeaData {
                 "priority" => next.priority = priority_field(v)?,
                 "horizon" => {
                     next.horizon = horizon_field(v)?;
-                    if let Some(h) = next.horizon {
-                        check_horizon(h, utc_today()).map_err(|e| format!("data.{e}"))?;
+                    if let (Some(h), Some(t)) = (next.horizon, today) {
+                        check_horizon(h, t).map_err(|e| format!("data.{e}"))?;
                     }
                 }
                 "links" => next.links = links_field(v)?,
@@ -393,6 +400,15 @@ impl IdeaData {
 /// Новая идея: `origin` — уже решённое сервером происхождение (WebUI → `human`; токен — из
 /// `data`). `data.origin`, если есть, должен совпадать с ним; поля сервера — ошибка.
 pub fn check_idea(data: &Value, origin: IdeaOrigin) -> Result<IdeaData, String> {
+    check_idea_at(data, origin, Some(utc_today()))
+}
+
+/// [`check_idea`] с датой проверки `horizon` (`None` — без проверки даты).
+fn check_idea_at(
+    data: &Value,
+    origin: IdeaOrigin,
+    today: Option<Date>,
+) -> Result<IdeaData, String> {
     let mut o = data
         .as_object()
         .cloned()
@@ -411,18 +427,28 @@ pub fn check_idea(data: &Value, origin: IdeaOrigin) -> Result<IdeaData, String> 
         origin,
         ..IdeaData::default()
     };
-    d.apply_patch(&Value::Object(o))?;
+    d.patch_at(&Value::Object(o), today)?;
     Ok(d)
 }
 
 /// `data` новой идеи из запроса записи: `data.origin` обязателен (`human | agent`).
 pub(crate) fn idea_from_request(data: &Value) -> Result<IdeaData, String> {
+    request_at(data, Some(utc_today()))
+}
+
+/// Нормализованная `data` запроса идеи без проверки даты `horizon`: сверка повтора по
+/// `Idempotency-Key` не зависит от часов (повтор после полуночи UTC — та же запись).
+pub(crate) fn idea_request_value(data: &Value) -> Result<Value, String> {
+    request_at(data, None).map(|d| d.to_value())
+}
+
+fn request_at(data: &Value, today: Option<Date>) -> Result<IdeaData, String> {
     let origin = data
         .get("origin")
         .and_then(Value::as_str)
         .and_then(|s| IdeaOrigin::parse(s.trim()))
         .ok_or_else(|| ORIGIN_REQUIRED.to_string())?;
-    check_idea(data, origin)
+    check_idea_at(data, origin, today)
 }
 
 /// Состояние задачи идеи для выхода из `accepted` (§5).
@@ -1327,6 +1353,30 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(xs, vec![2]);
+    }
+
+    /// Нормализация запроса для сверки `Idempotency-Key` не зависит от часов: `horizon`, который к
+    /// повтору стал «сегодня» (или прошёл), даёт тот же вид, что при первой записи.
+    #[test]
+    fn request_value_ignores_clock() {
+        for h in [utc_today(), Date::new(2020, 1, 1).unwrap()] {
+            let data = json!({"origin": "human", "horizon": h.to_string(), "priority": "high"});
+            assert!(idea_from_request(&data).is_err(), "{h}");
+            let v = idea_request_value(&data).unwrap();
+            assert_eq!(v["horizon"], json!(h.to_string()));
+            assert_eq!(
+                (v["origin"].clone(), v["priority"].clone()),
+                (json!("human"), json!("high"))
+            );
+        }
+        // остальные правила те же
+        assert!(idea_request_value(&json!({"horizon": "2099-01-02"})).is_err());
+        assert!(idea_request_value(&json!({"origin": "human", "task_id": null})).is_err());
+        let future = json!({"origin": "agent", "horizon": "2099-01-02"});
+        assert_eq!(
+            idea_request_value(&future).unwrap(),
+            idea_from_request(&future).unwrap().to_value()
+        );
     }
 
     #[test]

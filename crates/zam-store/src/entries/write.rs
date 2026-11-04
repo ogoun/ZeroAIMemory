@@ -205,11 +205,11 @@ pub(super) fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<En
     let data: serde_json::Value =
         serde_json::from_str(&data).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     // `data` идеи хранится нормализованной (`priority`, `origin` — всегда): запрос сравнивается
-    // в том же виде (M5.7)
+    // в том же виде и без проверки даты `horizon` — сверка не зависит от часов (M5.7)
     let asked = match e.kind {
-        EntryKind::Idea => crate::ideas::idea_from_request(&e.data)
-            .map(|d| d.to_value())
-            .unwrap_or_else(|_| e.data.clone()),
+        EntryKind::Idea => {
+            crate::ideas::idea_request_value(&e.data).unwrap_or_else(|_| e.data.clone())
+        }
         _ => e.data.clone(),
     };
     if ex.space_id != e.space_id
