@@ -606,6 +606,41 @@ mod tests {
         assert!(d.lo <= d.mean && d.mean <= d.hi);
         let same = paired_diff_weighted(&base, &base, &w, BOOTSTRAP_M6, 1);
         assert_eq!((same.mean, same.lo, same.hi), (0.0, 0.0, 0.0));
+        // границы — 5-й и 95-й перцентили выборок (односторонние 95 %), не 2,5 / 97,5
+        let a: Vec<f64> = (0..20).map(|i| f64::from(i % 3) / 2.0).collect();
+        let b: Vec<f64> = (0..20).map(|i| f64::from((i + 1) % 3) / 2.0).collect();
+        let w: Vec<f64> = (0..20).map(|i| f64::from(1 + i % 4)).collect();
+        let d = paired_diff_weighted(&a, &b, &w, 500, 9);
+        let mut rng = Rng(9);
+        let mut s: Vec<f64> = (0..500)
+            .map(|_| {
+                let (mut x, mut ws) = (0.0, 0.0);
+                for _ in 0..20 {
+                    let i = rng.below(20);
+                    x += w[i] * (b[i] - a[i]);
+                    ws += w[i];
+                }
+                x / ws
+            })
+            .collect();
+        s.sort_by(f64::total_cmp);
+        assert_eq!((d.lo, d.hi), (percentile(&s, 0.05), percentile(&s, 0.95)));
+    }
+
+    /// Бутстреп парный: сценарий берётся в выборку обоими плечами сразу. У коррелированных
+    /// плеч (тяжёлый сценарий тяжёл в обоих) интервал R уже, чем у тех же чисел без пар.
+    #[test]
+    fn paired_bootstrap_uses_pairs() {
+        let base: Vec<f64> = (0..40).map(|i| f64::from(200 + (i * 97) % 3000)).collect();
+        let arm: Vec<f64> = base.iter().map(|x| x * 0.7).collect();
+        let paired: Vec<(f64, f64)> = arm.iter().copied().zip(base.iter().copied()).collect();
+        // те же значения, пары перемешаны (сдвиг на 17)
+        let shuffled: Vec<(f64, f64)> = (0..40).map(|i| (arm[(i + 17) % 40], base[i])).collect();
+        let p = ratio_estimate_with(&paired, BOOTSTRAP_M6, SEED).unwrap();
+        let u = ratio_estimate_with(&shuffled, BOOTSTRAP_M6, SEED).unwrap();
+        assert!((p.mean - 0.7).abs() < 1e-12 && (u.mean - 0.7).abs() < 1e-12);
+        assert!(p.hi - p.lo < 1e-9, "{p:?}");
+        assert!(u.hi - u.lo > 0.05, "{u:?}");
     }
 
     #[test]

@@ -101,7 +101,9 @@
 - **Бинарники баз** (теги `v0.0.5-m4`, `v0.0.9-m5.6`, `v0.0.10-m5.7`):
   - исходники — `git archive <тег> | tar -x -C .tmp/m6/tags/<тег>`. Не `git worktree`: см. память
     о junction;
-  - сборка — `cargo build --release -p zam-server -p zam-cli -j 2 --target-dir target/tags/<тег>`;
+  - сборка — `$env:ZAM_GIT_SHA=<12 знаков коммита тега>; cargo build --release -p zam-server -p
+    zam-cli -j 2 --target-dir target/tags/<тег>` (без `ZAM_GIT_SHA` замер отвергнет бинарник:
+    задача 1a1);
   - затем удаляются `deps`, `incremental` и `build`, остаются бинарники;
   - перед каждой сборкой — H: ≥ 100 ГБ. Тулчейн у тегов тот же (1.99.1, проверено);
   - сбой сборки тега — в журнал, и база этого тега исключается из плеч с причиной в отчёте.
@@ -333,7 +335,11 @@ CLI xtask:
   crates/zam-server/tests/fixtures/idea_hints_m57.json`.
 
 - [ ] **Step 1: Бинарники тегов** — по Global Constraints («Бинарники баз»). Лог —
-  `.tmp/m6/task1a2/build-<тег>.log`.
+  `.tmp/m6/task1a2/build-<тег>.log`. Сборка — с `ZAM_GIT_SHA=<12 знаков коммита тега>`
+  (`git rev-parse --short=12 <тег>^{commit}`): иначе `build.rs` внутри распаковки `git archive` в
+  рабочей копии возьмёт коммит текущей ветки, и замер (`xtask/src/eval/caps.rs`, таблица
+  `RELEASES`) откажется брать такой бинарник базой (задача 1a1, правки ревью). Проверка —
+  `GET /api/v1/health`: `git` равен коммиту тега, `features` нет.
 - [ ] **Step 2: Пилот** — B4, B5.6, B5.7 на текущих 20 сценариях:
   `cargo xtask eval --tokens --via mcp --server-bin <…> --zam-bin <…> --split dev --out
   .tmp/m6/task1a2/pilot-<тег>`.

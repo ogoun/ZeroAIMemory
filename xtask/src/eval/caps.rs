@@ -1,15 +1,25 @@
-//! Возможности сервера по версии из `GET /api/v1/health` (спецификация M6 §3.3, I8).
+//! Возможности сервера по `GET /api/v1/health` (спецификация M6 §3.3, I8).
 //!
-//! Базы замера — бинарники тегов `v0.0.5-m4`, `v0.0.9-m5.6`, `v0.0.10-m5.7` и текущая сборка.
+//! Базы замера — бинарники тегов `v0.0.5-m4`, `v0.0.9-m5.6`, `v0.0.10-m5.7` и сборка ветки M6.
 //! У старого сервера конфигурация с `deny_unknown_fields`: переопределение `ZAM_*` ключа, которого
-//! в его версии нет, уронило бы старт. Поэтому xtask узнаёт версию (`version`, `git`) и шлёт
-//! только ключи из таблицы [`KEYS`] «ключ → версия появления» ([`filter_overrides`]).
+//! в его версии нет, уронило бы старт. Поэтому xtask узнаёт возможности сервера и шлёт только
+//! ключи, которые он знает ([`filter_overrides`]).
 //!
-//! Версия разбирается вручную (`0.0.10-m5.7` → 0, 0, 10, `m5.7`), без `semver`. Сборка этапа M6
-//! до выпуска сообщает ещё `0.0.10-m5.7` (версия меняется в задаче 13c), поэтому `0.0.10-m5.7` с
-//! `git`, отличным от коммита выпуска ([`RELEASE_M57_GIT`]), считается сборкой M6 **[решение
-//! исполнителя задачи 1a1]**. Бинарник тега, собранный из `git archive` внутри рабочей копии,
-//! получил бы `git` текущей ветки — его собирают с `ZAM_GIT_SHA=<коммит тега>` (eval/README.md).
+//! **Как узнаётся сервер** ([`caps_from`]):
+//! - сборка ветки M6 объявляет себя сама: `/health` отдаёт `features` — массив строк
+//!   (`zam_server::api::health::FEATURES`), в нём всегда `"m6"`. **Правило для задач M6**: задача,
+//!   которая вводит ключ конфигурации M6 или возможность, добавляет в `FEATURES` её строку, а
+//!   ключ в [`KEYS`] помечен этой строкой ([`Since::Feature`]): `budget` (§4.2, задача 5),
+//!   `snippet` (§4.3, задача 5), `focus` (§6, задача 7b), `digest` (§8, задача 8a),
+//!   `hint_thresholds` (§9, задача 9), `kind_boost` (§10), `attach_weight` (§11), `snapshot`
+//!   (§8а, задача 17c). Пока строки нет, ключ этой сборке не шлётся (а прогон с ним — не
+//!   сравнивается);
+//! - `features` нет — выпуск по таблице [`RELEASES`]: версия и коммит (`git`, 12 знаков) должны
+//!   совпасть с тегом. `git = unknown` или другой коммит у старой версии — ошибка: бинарник тега
+//!   собран не из тега или без `ZAM_GIT_SHA` (из `git archive` внутри рабочей копии `build.rs`
+//!   взял бы коммит текущей ветки) — его собирают с `ZAM_GIT_SHA=<12 знаков коммита тега>`.
+//!
+//! Версия разбирается вручную (`0.0.10-m5.7` → 0, 0, 10, `m5.7`), без `semver`.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -20,6 +30,19 @@ use serde_json::Value;
 
 /// Коммит выпуска `v0.0.10-m5.7` (`git rev-parse --short=12`).
 pub const RELEASE_M57_GIT: &str = "91363056d3ba";
+
+/// Выпуски, которые можно взять базой: версия и коммит тега (12 знаков).
+pub const RELEASES: &[(&str, &str)] = &[
+    ("0.0.5-m4", "56f1873c18b9"),
+    ("0.0.6-m4.5", "6dee9f90ad8a"),
+    ("0.0.7-m5", "f3a247f8bd53"),
+    ("0.0.8-m5.5", "075c51fb7696"),
+    ("0.0.9-m5.6", "97825a10bc19"),
+    ("0.0.10-m5.7", RELEASE_M57_GIT),
+];
+
+/// Строка `features` сборки ветки M6.
+pub const FEATURE_M6: &str = "m6";
 
 /// Версия сервера `major.minor.patch[-stage]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -67,30 +90,53 @@ pub fn parse_version(s: &str) -> Option<Version> {
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerCaps {
     pub version: Version,
-    /// `git` из `/health` (`None` — поля нет).
+    /// `git` из `/health`.
     pub git: Option<String>,
-    /// Сборка после выпуска своей версии (этап M6 до `0.0.11-m6`).
-    pub next: bool,
-    /// Явное фокусное чтение (M6 §6).
+    /// `features` из `/health` (пусто у выпусков до M6).
+    pub features: Vec<String>,
+    /// Сборка ветки M6 (`features` содержит `"m6"`).
+    pub m6: bool,
+    /// Явное фокусное чтение (M6 §6, `features`: `focus`).
     pub focus: bool,
     /// Вид `idea` и подсказки идей (M5.7).
     pub ideas: bool,
-    /// Снимок сессии (M6 §8а).
+    /// Снимок сессии (M6 §8а, `features`: `snapshot`).
     pub snapshot: bool,
     pub keys: BTreeSet<&'static str>,
 }
 
-const M4: (u32, u32, u32) = (0, 0, 5);
-const M45: (u32, u32, u32) = (0, 0, 6);
-const M5: (u32, u32, u32) = (0, 0, 7);
-const M56: (u32, u32, u32) = (0, 0, 9);
-const M57: (u32, u32, u32) = (0, 0, 10);
-const M6: (u32, u32, u32) = (0, 0, 11);
+impl ServerCaps {
+    /// Метка сервера в имени отчёта: `0.0.10-m5.7` или `0.0.10-m5.7+m6`.
+    pub fn tag(&self) -> String {
+        if self.m6 {
+            format!("{}+{FEATURE_M6}", self.version)
+        } else {
+            self.version.to_string()
+        }
+    }
+}
 
-/// Ключи конфигурации сервера, которые замер может переопределить, и версия их появления
-/// (сверено с `crates/zam-server/src/config.rs` тегов `v0.0.5-m4` … `v0.0.10-m5.7`; ключи M6 —
-/// спецификация M6 §14). Ключ M6 сборка этапа знает, только когда его ввела своя задача.
-pub const KEYS: &[(&str, (u32, u32, u32))] = &[
+/// С какой версии или возможности сервер знает ключ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Since {
+    /// Выпуск (major, minor, patch).
+    Version((u32, u32, u32)),
+    /// Строка `features` сборки ветки M6.
+    Feature(&'static str),
+}
+
+use Since::{Feature as F, Version as V};
+
+const M4: Since = V((0, 0, 5));
+const M45: Since = V((0, 0, 6));
+const M5: Since = V((0, 0, 7));
+const M56: Since = V((0, 0, 9));
+const M57: Since = V((0, 0, 10));
+
+/// Ключи конфигурации сервера, которые замер может переопределить, и с какой версии или
+/// возможности они есть (сверено с `crates/zam-server/src/config.rs` тегов `v0.0.5-m4` …
+/// `v0.0.10-m5.7`; ключи M6 — спецификация M6 §14). Ключ вне таблицы — ошибка до старта.
+pub const KEYS: &[(&str, Since)] = &[
     ("search.rrf_k", M4),
     ("search.w_vector", M4),
     ("search.w_fts", M4),
@@ -149,45 +195,82 @@ pub const KEYS: &[(&str, (u32, u32, u32))] = &[
     ("ideas.prompt_max", M57),
     ("ideas.prompt_top_k", M57),
     ("ideas.defer_days", M57),
-    ("search.budget_tokens", M6),
-    ("search.brief_min_rel", M6),
-    ("search.kind_boost_mode", M6),
-    ("search.w_attach", M6),
-    ("read.focus_leaves", M6),
-    ("read.focus_min_tokens", M6),
-    ("read.focus_timeout_ms", M6),
-    ("recall.digest_entries", M6),
-    ("recall.digest_code_map_tokens", M6),
-    ("recall.snippet_tokens", M6),
-    ("recall.prompt_min_score_fts", M6),
-    ("recall.snapshot_tokens", M6),
-    ("recall.snapshot_stale_min", M6),
-    ("recall.snapshot_digest_days", M6),
-    ("snapshot.max_bytes", M6),
-    ("snapshot.keep_days", M6),
+    ("search.budget_tokens", F("budget")),
+    ("search.brief_min_rel", F("budget")),
+    ("recall.snippet_tokens", F("snippet")),
+    ("read.focus_leaves", F("focus")),
+    ("read.focus_min_tokens", F("focus")),
+    ("read.focus_timeout_ms", F("focus")),
+    ("recall.digest_entries", F("digest")),
+    ("recall.digest_code_map_tokens", F("digest")),
+    ("recall.prompt_min_score_fts", F("hint_thresholds")),
+    ("search.kind_boost_mode", F("kind_boost")),
+    ("search.w_attach", F("attach_weight")),
+    ("recall.snapshot_tokens", F("snapshot")),
+    ("recall.snapshot_stale_min", F("snapshot")),
+    ("recall.snapshot_digest_days", F("snapshot")),
+    ("snapshot.max_bytes", F("snapshot")),
+    ("snapshot.keep_days", F("snapshot")),
 ];
 
-/// Возможности версии `v` с `git` из `/health`.
-pub fn caps_for(v: &Version, git: Option<&str>) -> ServerCaps {
-    let release = |g: &str| {
-        !g.is_empty() && (RELEASE_M57_GIT.starts_with(g) || g.starts_with(RELEASE_M57_GIT))
+/// Возможности по ответу `/health`.
+pub fn caps_from(health: &Value) -> Result<ServerCaps> {
+    let raw = health["version"]
+        .as_str()
+        .context("нет version в /health")?;
+    let ver = parse_version(raw).with_context(|| format!("версия сервера «{raw}»"))?;
+    let git = health["git"].as_str().map(str::to_string);
+    let features: Option<Vec<String>> = health["features"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    });
+    let (m6, features, max_release) = match features {
+        Some(f) => {
+            if !f.iter().any(|x| x == FEATURE_M6) {
+                bail!("сервер {ver}: в features {f:?} нет «{FEATURE_M6}» — неизвестная сборка");
+            }
+            (true, f, (0, 0, 10))
+        }
+        None => {
+            let Some((_, sha)) = RELEASES.iter().find(|(v, _)| *v == raw) else {
+                bail!(
+                    "сервер {ver}: версии нет среди выпусков-баз ({}) и features нет — неизвестная \
+                     сборка",
+                    RELEASES.iter().map(|r| r.0).collect::<Vec<_>>().join(", ")
+                );
+            };
+            let g = git.as_deref().unwrap_or("");
+            let same = !g.is_empty() && g.len() >= 7 && (sha.starts_with(g) || g.starts_with(sha));
+            if !same {
+                bail!(
+                    "сервер {ver}: git «{g}» ≠ коммиту тега {sha}. Бинарник базы собирают из тега \
+                     с ZAM_GIT_SHA={sha} (иначе git archive внутри рабочей копии даёт коммит \
+                     текущей ветки), сборка ветки M6 объявляет себя features"
+                );
+            }
+            (false, Vec::new(), ver.triple())
+        }
     };
-    // сборка этапа M6 до выпуска: 0.0.10-m5.7 не с коммита выпуска
-    let next = v.triple() == M57 && !git.is_some_and(release);
-    let eff = if next { M6 } else { v.triple() };
-    ServerCaps {
-        version: v.clone(),
-        git: git.map(str::to_string),
-        next,
-        focus: eff >= M6,
-        ideas: eff >= M57,
-        snapshot: eff >= M6,
-        keys: KEYS
-            .iter()
-            .filter(|(_, since)| *since <= eff)
-            .map(|(k, _)| *k)
-            .collect(),
-    }
+    let has = |f: &str| features.iter().any(|x| x == f);
+    let keys = KEYS
+        .iter()
+        .filter(|(_, since)| match since {
+            Since::Version(v) => *v <= max_release,
+            Since::Feature(f) => has(f),
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    Ok(ServerCaps {
+        ideas: m6 || ver.triple() >= (0, 0, 10),
+        focus: has("focus"),
+        snapshot: has("snapshot"),
+        version: ver,
+        git,
+        m6,
+        features,
+        keys,
+    })
 }
 
 /// `ZAM_SEARCH__BUDGET_TOKENS` → `search.budget_tokens`; не переопределение раздела — `None`.
@@ -200,32 +283,62 @@ pub fn env_to_key(env: &str) -> Option<String> {
     ))
 }
 
-/// Переопределения `ZAM_*`, ключи которых есть в версии сервера (порядок сохраняется).
-pub fn filter_overrides(caps: &ServerCaps, env: &[(String, String)]) -> Vec<(String, String)> {
-    env.iter()
-        .filter(|(k, _)| known(caps, k))
+/// Ключ таблицы [`KEYS`] для имени `ZAM_*`.
+fn table_key(env: &str) -> Option<&'static str> {
+    let k = env_to_key(env)?;
+    KEYS.iter().find(|(x, _)| *x == k).map(|(x, _)| *x)
+}
+
+/// Все переопределения — ключи таблицы [`KEYS`]; иначе ошибка (опечатка в сетке не должна
+/// молча превращаться в точку без изменения).
+pub fn check_known(env: &[(String, String)]) -> Result<()> {
+    let bad: Vec<&str> = env
+        .iter()
+        .filter(|(k, _)| table_key(k).is_none())
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !bad.is_empty() {
+        bail!(
+            "переопределения вне таблицы ключей замера (xtask/src/eval/caps.rs, KEYS): {} — \
+             опечатка или ключ, которого замер не знает",
+            bad.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Переопределения, ключи которых знает сервер (порядок сохраняется); ключ таблицы новее
+/// сервера отбрасывается, ключ вне таблицы — ошибка.
+pub fn filter_overrides(
+    caps: &ServerCaps,
+    env: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    check_known(env)?;
+    Ok(env
+        .iter()
+        .filter(|(k, _)| table_key(k).is_some_and(|key| caps.keys.contains(key)))
         .cloned()
-        .collect()
+        .collect())
 }
 
-fn known(caps: &ServerCaps, env: &str) -> bool {
-    env_to_key(env).is_some_and(|key| caps.keys.contains(key.as_str()))
-}
+/// Переопределения `ZAM_*`: (имя, значение).
+pub type Overrides = Vec<(String, String)>;
 
-/// [`filter_overrides`] и имена отброшенных (в отчёт прогона).
+/// [`filter_overrides`] и имена отброшенных (в отчёт; плечо с ними к сравнению не допускается).
 pub fn split_overrides(
     caps: &ServerCaps,
     env: &[(String, String)],
-) -> (Vec<(String, String)>, Vec<String>) {
+) -> Result<(Overrides, Vec<String>)> {
+    let kept = filter_overrides(caps, env)?;
     let dropped = env
         .iter()
-        .filter(|(k, _)| !known(caps, k))
+        .filter(|(k, _)| !kept.iter().any(|(x, _)| x == k))
         .map(|(k, _)| k.clone())
         .collect();
-    (filter_overrides(caps, env), dropped)
+    Ok((kept, dropped))
 }
 
-/// `GET <base>/api/v1/health` → возможности сервера. Версия старше `0.0.5-m4` не поддерживается.
+/// `GET <base>/api/v1/health` → возможности сервера ([`caps_from`]).
 pub fn probe(base: &str) -> Result<ServerCaps> {
     let a = crate::smoke::agent_with(Duration::from_secs(10));
     let mut r = a
@@ -238,12 +351,7 @@ pub fn probe(base: &str) -> Result<ServerCaps> {
         bail!("GET /api/v1/health: HTTP {st}: {text}");
     }
     let v: Value = serde_json::from_str(&text).context("ответ /health — не JSON")?;
-    let raw = v["version"].as_str().context("нет version в /health")?;
-    let ver = parse_version(raw).with_context(|| format!("версия сервера «{raw}»"))?;
-    if ver.triple() < M4 {
-        bail!("сервер {ver}: замер M6 поддерживает версии от 0.0.5-m4");
-    }
-    Ok(caps_for(&ver, v["git"].as_str()))
+    caps_from(&v)
 }
 
 #[cfg(test)]
@@ -268,8 +376,56 @@ mod tests {
         assert!(parse_version("").is_none());
     }
 
-    /// Ключа нет в версии сервера — переопределение отбрасывается (у старого сервера
-    /// `deny_unknown_fields`: неизвестный ключ уронил бы старт).
+    fn health(v: &str, git: &str, features: Option<&[&str]>) -> Value {
+        let mut h = serde_json::json!({ "status": "ok", "version": v, "git": git });
+        if let Some(f) = features {
+            h["features"] = serde_json::json!(f);
+        }
+        h
+    }
+
+    /// Старые теги — по версии и коммиту выпуска; сборка ветки M6 объявляет себя `features`;
+    /// `git = unknown` и чужой коммит у старой версии — ошибка.
+    #[test]
+    fn caps_from_health_by_release_or_features() {
+        let m57 = caps_from(&health("0.0.10-m5.7", "91363056d3ba", None)).unwrap();
+        assert!(m57.ideas && !m57.m6 && !m57.focus && !m57.snapshot);
+        let m4 = caps_from(&health("0.0.5-m4", "56f1873c18b9", None)).unwrap();
+        assert!(!m4.ideas && m4.keys.contains("search.w_fts"));
+        for git in ["unknown", "535910eba54f", ""] {
+            let e = caps_from(&health("0.0.10-m5.7", git, None))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("ZAM_GIT_SHA") && e.contains("91363056d3ba"),
+                "{e}"
+            );
+        }
+        // версии без выпуска в таблице и без features — ошибка
+        assert!(caps_from(&health("0.0.4-m3", "x", None)).is_err());
+        assert!(caps_from(&health("0.0.11-m6", "x", None)).is_err());
+        // сборка M6: git любой, ключи M6 — по возможностям сборки
+        let m6 = caps_from(&health("0.0.10-m5.7", "unknown", Some(&["m6"]))).unwrap();
+        assert!(m6.m6 && m6.ideas && !m6.focus && !m6.snapshot);
+        assert!(m6.keys.contains("ideas.proactive") && !m6.keys.contains("search.budget_tokens"));
+        let full = caps_from(&health(
+            "0.0.10-m5.7",
+            "abc",
+            Some(&["m6", "budget", "focus", "snapshot"]),
+        ))
+        .unwrap();
+        assert!(full.focus && full.snapshot);
+        assert!(
+            full.keys.contains("search.budget_tokens")
+                && full.keys.contains("read.focus_min_tokens")
+        );
+        assert!(!full.keys.contains("search.kind_boost_mode"));
+        // features без "m6" — не сборка ветки M6
+        assert!(caps_from(&health("0.0.10-m5.7", "abc", Some(&["focus"]))).is_err());
+    }
+
+    /// Ключ из таблицы, которого нет в версии сервера, отбрасывается (у старого сервера
+    /// `deny_unknown_fields`: он уронил бы старт); ключ вне таблицы — ошибка до старта.
     #[test]
     fn filter_overrides_drops_unknown_keys() {
         let env = |k: &str, v: &str| (k.to_string(), v.to_string());
@@ -278,33 +434,31 @@ mod tests {
             env("ZAM_SEARCH__W_FTS", "0.8"),
             env("ZAM_RECALL__BRIEF_TOKENS", "500"),
             env("ZAM_IDEAS__PROACTIVE", "false"),
-            env("ZAM_NO_SUCH__KEY", "1"),
         ];
-        let m4 = caps_for(&parse_version("0.0.5-m4").unwrap(), None);
+        let m4 = caps_from(&health("0.0.5-m4", "56f1873c18b9", None)).unwrap();
         assert_eq!(
-            filter_overrides(&m4, &over),
+            filter_overrides(&m4, &over).unwrap(),
             [env("ZAM_SEARCH__W_FTS", "0.8")]
         );
-        let m57 = caps_for(
-            &parse_version("0.0.10-m5.7").unwrap(),
-            Some(RELEASE_M57_GIT),
-        );
-        assert!(m57.ideas && !m57.focus && !m57.snapshot && !m57.next);
+        let m57 = caps_from(&health("0.0.10-m5.7", RELEASE_M57_GIT, None)).unwrap();
+        let (kept, dropped) = split_overrides(&m57, &over).unwrap();
         assert_eq!(
-            filter_overrides(&m57, &over),
+            kept,
             [
                 env("ZAM_SEARCH__W_FTS", "0.8"),
                 env("ZAM_RECALL__BRIEF_TOKENS", "500"),
                 env("ZAM_IDEAS__PROACTIVE", "false"),
             ]
         );
-        let (_, dropped) = split_overrides(&m57, &over);
-        assert_eq!(dropped, ["ZAM_SEARCH__BUDGET_TOKENS", "ZAM_NO_SUCH__KEY"]);
-        // сборка после выпуска 0.0.10-m5.7 (другой git) — ключи M6
-        let dev = caps_for(&parse_version("0.0.10-m5.7").unwrap(), Some("04f9d85aaaaa"));
-        assert!(dev.focus && dev.snapshot && dev.next);
-        assert_eq!(filter_overrides(&dev, &over).len(), 4);
-        let m6 = caps_for(&parse_version("0.0.11-m6").unwrap(), None);
-        assert!(m6.keys.contains("search.budget_tokens") && !m6.next);
+        assert_eq!(dropped, ["ZAM_SEARCH__BUDGET_TOKENS"]);
+        let m6 = caps_from(&health("0.0.10-m5.7", "x", Some(&["m6", "budget"]))).unwrap();
+        assert_eq!(filter_overrides(&m6, &over).unwrap().len(), 4);
+        // ключ вне таблицы (опечатка, неизвестный раздел) — ошибка, а не молчаливый пропуск
+        let bad = [env("ZAM_SEARCH__BUDGET_TOKEN", "600")];
+        let e = filter_overrides(&m6, &bad).unwrap_err().to_string();
+        assert!(e.contains("ZAM_SEARCH__BUDGET_TOKEN"), "{e}");
+        assert!(check_known(&bad).is_err());
+        assert!(check_known(&[env("SEARCH", "1")]).is_err());
+        assert!(check_known(&over).is_ok());
     }
 }

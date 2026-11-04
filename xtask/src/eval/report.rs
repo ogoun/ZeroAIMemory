@@ -383,10 +383,10 @@ pub fn tokens_m6_md(r: &super::tokens::mcp::McpResult) -> String {
          бюджет {}; токены — {}.\n",
         i.git,
         i.server_version,
-        if i.server_next {
-            " (сборка M6)"
+        if i.server_m6 {
+            format!(" (сборка M6, features {:?})", i.server_features)
         } else {
-            ""
+            String::new()
         },
         i.server_git.as_deref().unwrap_or("—"),
         i.corpus_fingerprint,
@@ -407,7 +407,8 @@ pub fn tokens_m6_md(r: &super::tokens::mcp::McpResult) -> String {
             .collect();
         let _ = writeln!(
             s,
-            "Переопределения: {}; отброшены (нет в версии сервера): {}.\n",
+            "Переопределения: {}; отброшены (нет в версии сервера; к сравнению плечо не \
+             допускается): {}.\n",
             if kept.is_empty() {
                 "—".into()
             } else {
@@ -458,22 +459,28 @@ pub fn tokens_m6_md(r: &super::tokens::mcp::McpResult) -> String {
     let _ = writeln!(
         s,
         "\nСценариев {}, нагетов {}; (а) / (в): {}; выжимки агента (вывод, не ответ сервера): {} \
-         токенов.\n",
+         токенов; чужих попаданий в кэш (первая строка (а) или (в) — выжимка): {}.\n",
         u.scenarios,
         u.nuggets_total,
         u.protocol_to_naive.as_ref().map_or("—".into(), est),
-        u.summary_tokens_total
+        u.summary_tokens_total,
+        u.foreign_cache_hits
     );
     let _ = writeln!(
         s,
         "| id | вид | (а) токены | нагеты | дочитано | справочно | (в) | примечание |\n|---|---|---:|---|---|---:|---:|---|"
     );
     for x in &r.scenarios {
-        let note: Vec<&str> = [&x.protocol.note, &x.cached.note]
-            .into_iter()
-            .filter(|n| !n.is_empty())
-            .map(String::as_str)
-            .collect();
+        let note: Vec<&str> = [
+            &x.protocol.note,
+            &x.reference.note,
+            &x.naive.note,
+            &x.cached.note,
+        ]
+        .into_iter()
+        .filter(|n| !n.is_empty())
+        .map(String::as_str)
+        .collect();
         let _ = writeln!(
             s,
             "| {} | {} | {} | {}/{} | {} | {} | {} | {} |",
@@ -512,7 +519,7 @@ pub fn comparison_md(c: &super::tokens::mcp::Comparison) -> String {
          нижней ≥ {});",
         c.base_micro,
         c.arm_micro,
-        est(&c.d_micro),
+        c.d_micro.as_ref().map_or("— (нагетов нет)".into(), est),
         super::tokens::mcp::MIN_D_MICRO
     );
     let _ = writeln!(
@@ -521,6 +528,11 @@ pub fn comparison_md(c: &super::tokens::mcp::Comparison) -> String {
         c.net_losses,
         super::tokens::mcp::MAX_NET_LOSSES,
         if c.noninferior { "да" } else { "нет" }
+    );
+    let _ = writeln!(
+        s,
+        "- бутстреп: {} выборок, зерно {:#x}.",
+        c.bootstrap.samples, c.bootstrap.seed
     );
     if !c.only_base.is_empty() || !c.only_arm.is_empty() {
         let _ = writeln!(

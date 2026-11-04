@@ -54,6 +54,15 @@ async fn health_ok_under_base_path() {
     assert_eq!(j["status"], "ok");
     assert_eq!(j["version"], env!("CARGO_PKG_VERSION"));
     assert!(j["git"].is_string() && j["uptime_s"].is_u64());
+    // возможности сборки для загрузчика замера M6 (xtask eval caps): сборка ветки M6 — "m6"
+    let f: Vec<&str> = j["features"]
+        .as_array()
+        .expect("features — массив")
+        .iter()
+        .map(|v| v.as_str().expect("строка"))
+        .collect();
+    assert_eq!(f, zam_server::api::health::FEATURES);
+    assert!(f.contains(&"m6"), "{f:?}");
     // вне base_path маршрута нет
     let r = app.oneshot(get("/api/v1/health")).await.unwrap();
     assert_eq!(r.status(), 404);

@@ -121,7 +121,46 @@ fn grid_refuses_holdout() {
     ]);
     assert!(!o.status.success(), "{}", stdout(&o));
     let e = stderr(&o);
-    assert!(e.contains("holdout") && e.contains("dev"), "{e}");
+    assert!(e.contains("только на dev") && e.contains("holdout"), "{e}");
+}
+
+/// Ключ точки сетки вне таблицы ключей (опечатка) и `--set` вместе с `--grid` — ошибка до
+/// сборки и запуска сервера.
+#[test]
+fn grid_rejects_unknown_key_and_set() {
+    let d = tmp("grid-keys");
+    mini_set(&d);
+    let grid = d.join("grid.toml");
+    fs::write(
+        &grid,
+        "[[point]]\nname = \"base\"\n\n[[point]]\nname = \"typo\"\nenv = { ZAM_SEARCH__BUDGET_TOKEN = \"600\" }\n",
+    )
+    .unwrap();
+    let mut args = set_args(&d);
+    args.extend([
+        "--server-bin".into(),
+        s(&d.join("nope").join("zam-server.exe")),
+    ]);
+    args.extend(["--grid".into(), s(&grid)]);
+    let o = run(
+        &["eval", "--tokens", "--via", "mcp", "--split", "dev"],
+        &args,
+    );
+    assert!(!o.status.success());
+    let e = stderr(&o);
+    assert!(
+        e.contains("ZAM_SEARCH__BUDGET_TOKEN") && !e.contains("нет "),
+        "{e}"
+    );
+    fs::write(&grid, "[[point]]\nname = \"base\"\n").unwrap();
+    args.extend(["--set".into(), "search.w_fts=0.8".into()]);
+    let o = run(
+        &["eval", "--tokens", "--via", "mcp", "--split", "dev"],
+        &args,
+    );
+    assert!(!o.status.success());
+    let e = stderr(&o);
+    assert!(e.contains("--set") && e.contains("--grid"), "{e}");
 }
 
 /// Нагеты или корпус изменены после заморозки (`nuggets.lock`) — `--check` и прогон падают.
@@ -209,6 +248,14 @@ fn arms_must_share_corpus_fingerprint() {
     ]);
     assert!(o.status.success(), "{}\n{}", stdout(&o), stderr(&o));
     assert!(stdout(&o).contains("0.700"), "{}", stdout(&o));
+    // сравнение записано рядом с плечом: <префикс плеча>-vs-<база>.{json,md}
+    let j: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(d.join("m6-vs-base.json")).unwrap()).unwrap();
+    assert_eq!(j["scenarios"], 3);
+    assert!(j["only_base"].is_array() && j["only_arm"].is_array(), "{j}");
+    assert_eq!(j["bootstrap"]["samples"], 10_000);
+    assert!(j["bootstrap"]["seed"].is_u64(), "{j}");
+    assert!(d.join("m6-vs-base.md").is_file());
     let o = xtask(&[
         "eval",
         "--tokens",

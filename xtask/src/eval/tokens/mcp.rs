@@ -8,19 +8,27 @@
 //!   `memory_read` выбранных, бюджет [`READ_BUDGET`] → **дочитывание** один раз на источник, если
 //!   нагет не выдан, а у элемента есть пометка пропуска (`…ещё N токенов`, `(budget)`,
 //!   `[пропущено: <путь> · ~N t]`; сначала названные секции, иначе L2 источника отдельным
-//!   вызовом, бюджет [`READ_BUDGET`]) → `memory_cache_put` выжимки;
+//!   вызовом, бюджет [`READ_BUDGET`]) → `memory_cache_put` выжимки прочитанного и дочитанного;
 //! - **справочная политика без оракула** — карточки 1–3 того же поиска по порядку, чтение и
 //!   дочитывание по тем же правилам (своя сессия, без выжимки);
 //! - **(б) повтор** — `memory_search` brief другой сессией: выжимка кэша первой.
 //!
+//! **Кэш между сценариями.** После (б) выжимка сценария удаляется (`DELETE /api/v1/cache/{id}`,
+//! есть с M4; вне MCP, токены не считаются): иначе похожий вопрос следующего сценария получил бы
+//! чужую выжимку семантическим совпадением. Сторож — первая строка ответов (а) и (в): `[cache]`
+//! там — чужое попадание (счётчик и примечание в отчёте; на holdout — ошибка).
+//!
 //! Токены — сумма текстов `result.content` вызовов (токенизатор bge-m3). Полнота — нагеты
 //! (§3.2): найдены, если целиком есть в выданном агенту тексте пути. Отчёт хранит ответы
 //! целиком. Перед прогоном сверяются отпечатки с `eval/nuggets.lock`; сравнение плеч
-//! ([`compare`]) — только на одних отпечатках корпуса и нагетов и одной части разбиения.
+//! ([`compare`]) — только на одних отпечатках, части разбиения, бюджете чтения, счётчике,
+//! модели и устройстве, без отброшенных переопределений. Сравнение пишется в
+//! `<префикс плеча>-vs-<база>.{json,md}`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -49,6 +57,8 @@ pub const REFERENCE_CARDS: usize = 3;
 pub const MIN_D_MICRO: f64 = -0.02;
 /// Порог чистых потерь.
 pub const MAX_NET_LOSSES: i64 = 1;
+/// Пометка выжимки кэша в первой строке ответа поиска.
+const CACHE_MARK: &str = "[cache]";
 
 /// Путь агента с нагетами.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -89,6 +99,14 @@ impl AgentPath {
     fn delivered(&self) -> String {
         self.path_run().delivered()
     }
+
+    /// Дописать примечание через «; ».
+    fn add_note(&mut self, n: &str) {
+        if !self.note.is_empty() {
+            self.note.push_str("; ");
+        }
+        self.note.push_str(n);
+    }
 }
 
 /// Итог сценария.
@@ -107,6 +125,9 @@ pub struct McpScenario {
     pub reference: AgentPath,
     pub cached: PathRun,
     pub naive: AgentPath,
+    /// Пути, где первой пришла чужая выжимка кэша (`(а)`, `(в)`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub foreign_cache: Vec<String>,
 }
 
 /// Сводка пути.
@@ -132,6 +153,8 @@ pub struct McpSummary {
     pub summary_tokens_total: usize,
     /// `Σ (а) / Σ (в)` с 95 % интервалом ([`BOOTSTRAP_M6`] выборок).
     pub protocol_to_naive: Option<Estimate>,
+    /// Чужих попаданий в кэш (первая строка (а) или (в) — `[cache]`).
+    pub foreign_cache_hits: usize,
 }
 
 /// Сведения о прогоне (плече).
@@ -149,19 +172,21 @@ pub struct McpInfo {
     pub device: Option<String>,
     pub server_version: String,
     pub server_git: Option<String>,
-    /// Сборка этапа M6 до выпуска ([`caps::ServerCaps::next`]).
-    pub server_next: bool,
+    /// Сборка ветки M6 (`features` в `/health`, [`caps::ServerCaps::m6`]).
+    pub server_m6: bool,
+    pub server_features: Vec<String>,
     pub focus: bool,
     pub ideas: bool,
     pub snapshot: bool,
-    /// Переопределения, отправленные серверу, и отброшенные (ключа нет в его версии).
+    /// Переопределения, отправленные серверу, и отброшенные (ключа нет в его версии): плечо с
+    /// отброшенными к сравнению не допускается.
     pub overrides: BTreeMap<String, String>,
     pub overrides_dropped: Vec<String>,
     pub corpus_fingerprint: String,
     pub nuggets_fingerprint: String,
     /// Отпечатки сверены с `nuggets.lock` (`false` — замка нет, прогон до заморозки).
     pub frozen: bool,
-    /// Цели и сценарии, исключённые из всех плеч (старый сервер их не умеет), с причиной.
+    /// Сценарии, исключённые из всех плеч (старый сервер их не умеет): `<id>: <причина>`.
     pub excluded: Vec<String>,
     pub counter: String,
     pub read_budget: usize,
@@ -174,6 +199,28 @@ pub struct McpResult {
     pub info: McpInfo,
     pub summary: McpSummary,
     pub scenarios: Vec<McpScenario>,
+}
+
+impl McpResult {
+    /// id исключённых сценариев (`<id>: <причина>`).
+    fn excluded_ids(&self) -> BTreeSet<&str> {
+        self.info
+            .excluded
+            .iter()
+            .map(|e| e.split_once(':').map_or(e.as_str(), |(id, _)| id).trim())
+            .collect()
+    }
+}
+
+/// Параметры бутстрепа сравнения.
+#[derive(Debug, Clone, Serialize)]
+pub struct Bootstrap {
+    pub samples: usize,
+    pub seed: u64,
+    /// Интервал `R`.
+    pub r_interval: &'static str,
+    /// Границы Δ микро-полноты.
+    pub d_micro_interval: &'static str,
 }
 
 /// Сравнение плеча с базой (спецификация M6 §3.5).
@@ -192,11 +239,12 @@ pub struct Comparison {
     pub r: Option<Estimate>,
     pub base_micro: f64,
     pub arm_micro: f64,
-    /// Δ микро-полноты (плечо − база), односторонние 95 % границы.
-    pub d_micro: Estimate,
+    /// Δ микро-полноты (плечо − база), односторонние 95 % границы; `None` — нагетов нет.
+    pub d_micro: Option<Estimate>,
     pub net_losses: i64,
-    /// `d_micro.lo ≥ −0,02` и `L ≤ 1`.
+    /// `d_micro.lo ≥ −0,02` и `L ≤ 1` (без нагетов — нет).
     pub noninferior: bool,
+    pub bootstrap: Bootstrap,
 }
 
 /// Сводка пути по сценариям.
@@ -235,11 +283,21 @@ pub fn summarize(runs: &[McpScenario]) -> McpSummary {
         naive: totals(&col(|r| &r.naive)),
         summary_tokens_total: runs.iter().map(|r| r.summary_tokens).sum(),
         protocol_to_naive: ratio_estimate_with(&pairs, BOOTSTRAP_M6, SEED),
+        foreign_cache_hits: runs.iter().map(|r| r.foreign_cache.len()).sum(),
     }
 }
 
-/// Сравнение плеча `arm` с базой `base`: отпечатки корпуса и нагетов и часть разбиения должны
-/// совпадать; сценарии — общие по id.
+/// Поле условий замера должно совпасть у плеч.
+fn same<T: PartialEq + std::fmt::Debug>(errs: &mut Vec<String>, name: &str, arm: &T, base: &T) {
+    if arm != base {
+        errs.push(format!("{name} {arm:?} (плечо) ≠ {base:?} (база)"));
+    }
+}
+
+/// Сравнение плеча `arm` с базой `base`. Условия замера должны совпадать: отпечатки корпуса и
+/// нагетов, часть разбиения, бюджет чтения, счётчик, модель и устройство; у обоих нет
+/// отброшенных переопределений. Сценарии — общие по id; на holdout сценарий только в одном
+/// плече допустим лишь как исключённый (`info.excluded`).
 pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result<Comparison> {
     let (bi, ai) = (&base.info, &arm.info);
     let mut errs = Vec::new();
@@ -255,15 +313,22 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
             ai.nuggets_fingerprint, bi.nuggets_fingerprint
         ));
     }
-    if bi.split != ai.split {
-        errs.push(format!(
-            "часть разбиения {} (плечо) ≠ {} (база)",
-            ai.split, bi.split
-        ));
+    same(&mut errs, "часть разбиения", &ai.split, &bi.split);
+    same(&mut errs, "read_budget", &ai.read_budget, &bi.read_budget);
+    same(&mut errs, "counter", &ai.counter, &bi.counter);
+    same(&mut errs, "модель", &ai.model, &bi.model);
+    same(&mut errs, "устройство", &ai.device, &bi.device);
+    for (who, i) in [("плечо", ai), ("база", bi)] {
+        if !i.overrides_dropped.is_empty() {
+            errs.push(format!(
+                "{who}: переопределения отброшены сервером ({}) — точка не та, что задана",
+                i.overrides_dropped.join(", ")
+            ));
+        }
     }
     if !errs.is_empty() {
         bail!(
-            "плечи сняты на разных наборах — сравнение запрещено (спецификация M6 §3.2): {}",
+            "плечи сняты в разных условиях — сравнение запрещено (спецификация M6 §3.2, §3.5): {}",
             errs.join("; ")
         );
     }
@@ -275,6 +340,34 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
         .iter()
         .filter_map(|a| by_id.get(a.id.as_str()).map(|b| (*b, a)))
         .collect();
+    let only_base: Vec<String> = by_id
+        .keys()
+        .filter(|id| !arm_ids.contains(*id))
+        .map(|s| s.to_string())
+        .collect();
+    let only_arm: Vec<String> = arm_ids
+        .iter()
+        .filter(|id| !by_id.contains_key(*id))
+        .map(|s| s.to_string())
+        .collect();
+    if ai.split == Part::Holdout.as_str() {
+        let excluded: BTreeSet<&str> = base
+            .excluded_ids()
+            .into_iter()
+            .chain(arm.excluded_ids())
+            .collect();
+        let stray: Vec<&String> = only_base
+            .iter()
+            .chain(&only_arm)
+            .filter(|id| !excluded.contains(id.as_str()))
+            .collect();
+        if !stray.is_empty() {
+            bail!(
+                "holdout: сценарии только в одном плече и не исключённые (info.excluded): \
+                 {stray:?} — приёмка идёт на одном наборе"
+            );
+        }
+    }
     let frac = |p: &AgentPath, n: usize| {
         if n == 0 {
             0.0
@@ -291,7 +384,8 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
         .iter()
         .map(|(b, a)| frac(&a.protocol, b.nuggets_total))
         .collect();
-    let d_micro = paired_diff_weighted(&bf, &af, &w, BOOTSTRAP_M6, SEED);
+    let d_micro = (w.iter().sum::<f64>() > 0.0)
+        .then(|| paired_diff_weighted(&bf, &af, &w, BOOTSTRAP_M6, SEED));
     let l = net_losses(
         &pairs
             .iter()
@@ -306,39 +400,35 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
         .iter()
         .map(|(b, a)| (a.protocol.tokens as f64, b.protocol.tokens as f64))
         .collect();
+    let micro = |f: fn(&(&McpScenario, &McpScenario)) -> usize| {
+        micro_recall(
+            &pairs
+                .iter()
+                .map(|p| (f(p), p.0.nuggets_total))
+                .collect::<Vec<_>>(),
+        )
+    };
     Ok(Comparison {
         base: names.0.to_string(),
         arm: names.1.to_string(),
         split: ai.split.clone(),
         scenarios: pairs.len(),
-        only_base: by_id
-            .keys()
-            .filter(|id| !arm_ids.contains(*id))
-            .map(|s| s.to_string())
-            .collect(),
-        only_arm: arm_ids
-            .iter()
-            .filter(|id| !by_id.contains_key(*id))
-            .map(|s| s.to_string())
-            .collect(),
+        only_base,
+        only_arm,
         base_tokens: pairs.iter().map(|(b, _)| b.protocol.tokens).sum(),
         arm_tokens: pairs.iter().map(|(_, a)| a.protocol.tokens).sum(),
         r: ratio_estimate_with(&ratio_pairs, BOOTSTRAP_M6, SEED),
-        base_micro: micro_recall(
-            &pairs
-                .iter()
-                .map(|(b, _)| (b.protocol.found, b.nuggets_total))
-                .collect::<Vec<_>>(),
-        ),
-        arm_micro: micro_recall(
-            &pairs
-                .iter()
-                .map(|(b, a)| (a.protocol.found, b.nuggets_total))
-                .collect::<Vec<_>>(),
-        ),
-        noninferior: d_micro.lo >= MIN_D_MICRO && l <= MAX_NET_LOSSES,
+        base_micro: micro(|(b, _)| b.protocol.found),
+        arm_micro: micro(|(_, a)| a.protocol.found),
+        noninferior: d_micro.is_some_and(|d| d.lo >= MIN_D_MICRO) && l <= MAX_NET_LOSSES,
         d_micro,
         net_losses: l,
+        bootstrap: Bootstrap {
+            samples: BOOTSTRAP_M6,
+            seed: SEED,
+            r_interval: "двусторонний 95 % (перцентили 2,5 и 97,5), парный бутстреп сценариев",
+            d_micro_interval: "односторонние 95 % (перцентили 5 и 95), веса — число нагетов",
+        },
     })
 }
 
@@ -351,6 +441,33 @@ fn file_name(p: &Path) -> String {
     p.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
+}
+
+/// Пишет сравнение в `<префикс плеча>-vs-<база>.{json,md}`.
+fn write_comparison(arm_prefix: &Path, c: &Comparison) -> Result<(PathBuf, PathBuf)> {
+    let stem = format!("{}-vs-{}", arm_prefix.display(), c.base);
+    let j = PathBuf::from(format!("{stem}.json"));
+    let m = PathBuf::from(format!("{stem}.md"));
+    if let Some(d) = j.parent() {
+        fs::create_dir_all(d)?;
+    }
+    fs::write(&j, serde_json::to_string_pretty(c)? + "\n")?;
+    fs::write(&m, crate::eval::report::comparison_md(c))?;
+    Ok((j, m))
+}
+
+/// Сравнение с выводом и записью рядом с плечом.
+fn compare_and_write(
+    base: &McpResult,
+    arm: &McpResult,
+    names: (&str, &str),
+    arm_prefix: &Path,
+) -> Result<()> {
+    let c = compare(base, arm, names)?;
+    print!("{}", crate::eval::report::comparison_md(&c));
+    let (j, m) = write_comparison(arm_prefix, &c)?;
+    println!("  {}\n  {}", j.display(), m.display());
+    Ok(())
 }
 
 /// Нагеты сценария, найденные в тексте.
@@ -371,7 +488,8 @@ fn source_missing(sc: &Scenario, source: &str, delivered_norm: &str) -> bool {
     ns.peek().is_none() || ns.any(|n| !nuggets::found(delivered_norm, &n.text))
 }
 
-/// Чтение выбранных `(источник набора, ссылка)` и дочитывание (§3.4, п. 2–3).
+/// Чтение выбранных `(источник набора, ссылка)` и дочитывание (§3.4, п. 2–3); возвращает
+/// прочитанное и дочитанное одним текстом (для выжимки).
 fn read_and_reread(
     c: &McpClient,
     counter: &Counter,
@@ -388,13 +506,16 @@ fn read_and_reread(
     path.read = picked.iter().map(|(r, _)| r.clone()).collect();
     let raws: Vec<String> = picked.iter().map(|(_, raw)| raw.clone()).collect();
     let elements = read_elements(&read, &raws);
+    let mut all = read.clone();
     let mut pending = Vec::new();
+    let mut unparsed = Vec::new();
     for (r, raw) in picked {
         let delivered = normalize_md(&path.delivered());
         if !source_missing(sc, r, &delivered) {
             continue;
         }
         let Some(e) = elements.iter().find(|e| &e.raw == raw) else {
+            unparsed.push(r.clone());
             continue;
         };
         if let Some(need) = reread_need(&e.text) {
@@ -404,15 +525,22 @@ fn read_and_reread(
             )?;
             path.push(&format!("memory_read дочитывание {r}"), &again, counter);
             path.reread.push(r.clone());
+            all.push('\n');
+            all.push_str(&again);
             if reread_need(&again).is_some() {
                 pending.push(r.clone());
             }
         }
     }
-    if !pending.is_empty() {
-        path.note = format!("после дочитывания ещё пропуски: {pending:?}");
+    if !unparsed.is_empty() {
+        path.add_note(&format!(
+            "элемент ответа memory_read не разобран (дочитывание невозможно): {unparsed:?}"
+        ));
     }
-    Ok(read)
+    if !pending.is_empty() {
+        path.add_note(&format!("после дочитывания ещё пропуски: {pending:?}"));
+    }
+    Ok(all)
 }
 
 /// Полнота пути: все нагеты (у сценария без нагетов — все ожидаемые прочитаны без пометок).
@@ -423,6 +551,42 @@ fn finish(sc: &Scenario, path: &mut AgentPath) {
     } else {
         path.found == sc.nuggets.len()
     };
+}
+
+/// Первая непустая строка ответа поиска — выжимка кэша.
+fn cache_first(text: &str) -> bool {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.contains(CACHE_MARK))
+}
+
+/// Ссылка выжимки `c_<id>` из ответа `memory_cache_put`.
+fn cache_ref(put: &str) -> Option<String> {
+    let b = put.as_bytes();
+    (0..b.len().saturating_sub(27)).find_map(|i| {
+        let prev_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        let ok = prev_ok
+            && &b[i..i + 2] == b"c_"
+            && b[i + 2..i + 28].iter().all(u8::is_ascii_alphanumeric)
+            && b.get(i + 28).is_none_or(|c| !c.is_ascii_alphanumeric());
+        ok.then(|| put[i..i + 28].to_string())
+    })
+}
+
+/// `DELETE /api/v1/cache/{id}` — выжимка сценария больше не попадёт следующим.
+fn delete_cache(s: &Session, id: &str) -> Result<()> {
+    let a = crate::smoke::agent_with(Duration::from_secs(30));
+    let r = a
+        .delete(&format!("{}/api/v1/cache/{id}", s.base))
+        .header("Authorization", &format!("Bearer {}", s.token()))
+        .header("X-Zam-Solution", EVAL_SOLUTION)
+        .call()
+        .with_context(|| format!("DELETE /cache/{id}"))?;
+    let st = r.status().as_u16();
+    if st != 204 && st != 200 {
+        bail!("DELETE /cache/{id}: HTTP {st}");
+    }
+    Ok(())
 }
 
 fn run_scenario(
@@ -442,6 +606,7 @@ fn run_scenario(
     };
     let scope = json!({ "solution": EVAL_SOLUTION });
     let brief = json!({ "query": sc.question, "scope": scope, "mode": "brief" });
+    let mut foreign = Vec::new();
     // (в) наивный — первым: MCP не передаёт no_cache, после (а) в кэше была бы выжимка
     let mut naive = AgentPath::default();
     let chunks = client("c")?.call(
@@ -450,6 +615,10 @@ fn run_scenario(
                 "budget_tokens": NAIVE_BUDGET }),
     )?;
     naive.push("memory_search chunks 4000", &chunks, counter);
+    if cache_first(&chunks) {
+        foreign.push("(в)".to_string());
+        naive.add_note("первой пришла чужая выжимка кэша");
+    }
     naive.read = mapped_refs(s, &chunks)
         .into_iter()
         .map(|(r, _)| r)
@@ -463,6 +632,10 @@ fn run_scenario(
     let mut protocol = AgentPath::default();
     let cards = ca.call("memory_search", brief.clone())?;
     protocol.push("memory_search brief", &cards, counter);
+    if cache_first(&cards) {
+        foreign.push("(а)".to_string());
+        protocol.add_note("первой пришла чужая выжимка кэша");
+    }
     let mut selected: Vec<(String, String)> = Vec::new();
     for (r, raw) in mapped_refs(s, &cards) {
         if sc.expect.contains(&r) && !selected.iter().any(|(x, _)| *x == r) {
@@ -470,8 +643,9 @@ fn run_scenario(
         }
     }
     let mut summary_tokens = 0;
+    let mut own_cache = None;
     if selected.is_empty() {
-        protocol.note = "ни одного ожидаемого источника в карточках".into();
+        protocol.add_note("ни одного ожидаемого источника в карточках");
     } else {
         let read = read_and_reread(&ca, counter, sc, &selected, &mut protocol)?;
         let summary = summary_of(&sc.question, &read);
@@ -485,19 +659,17 @@ fn run_scenario(
             json!({ "query": sc.question, "summary": summary, "sources": sources }),
         )?;
         protocol.push("memory_cache_put", &put, counter);
+        own_cache = cache_ref(&put);
+        if own_cache.is_none() {
+            protocol.add_note("ссылки выжимки нет в ответе memory_cache_put — не удалена");
+        }
         let missing: Vec<&String> = sc
             .expect
             .iter()
             .filter(|e| !selected.iter().any(|(r, _)| r == *e))
             .collect();
         if !missing.is_empty() {
-            let n = format!("нет в карточках: {missing:?}");
-            protocol.note = [protocol.note.as_str(), n.as_str()]
-                .iter()
-                .filter(|x| !x.is_empty())
-                .copied()
-                .collect::<Vec<_>>()
-                .join("; ");
+            protocol.add_note(&format!("нет в карточках: {missing:?}"));
         }
     }
     finish(sc, &mut protocol);
@@ -518,7 +690,7 @@ fn run_scenario(
         })
         .collect();
     if first.is_empty() {
-        reference.note = "карточек нет".into();
+        reference.add_note("карточек нет");
     } else {
         read_and_reread(&client("r")?, counter, sc, &first, &mut reference)?;
     }
@@ -531,12 +703,23 @@ fn run_scenario(
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or_default();
-    let hit = first_line.contains("[cache]");
+    let hit = first_line.contains(CACHE_MARK);
     cached.complete = protocol.complete && hit;
     if !hit {
         cached.note = format!(
             "первая строка: {}",
             first_line.chars().take(80).collect::<String>()
+        );
+    }
+    // выжимка сценария не должна достаться следующему
+    if let Some(id) = own_cache {
+        delete_cache(s, &id)?;
+    }
+    if !foreign.is_empty() && part == Part::Holdout {
+        bail!(
+            "{}: чужая выжимка кэша первой в {} — на holdout замер недействителен",
+            sc.id,
+            foreign.join(", ")
         );
     }
     Ok(McpScenario {
@@ -551,6 +734,7 @@ fn run_scenario(
         reference,
         cached,
         naive,
+        foreign_cache: foreign,
     })
 }
 
@@ -590,7 +774,7 @@ pub fn load_set(a: &EvalArgs, p: &Paths) -> Result<Set> {
         })
         .collect();
     let summary = nuggets::validate(&checks, &corpus)?;
-    let nf = nuggets::nuggets_fingerprint(&p.scenarios, &p.corpus);
+    let nf = nuggets::nuggets_fingerprint(&p.scenarios, &p.corpus, &p.insights)?;
     let cf = nuggets::corpus_fingerprint(&[&p.corpus, &p.docs, &p.insights]);
     let lock = nuggets::check_lock(&nuggets::lock_path(&p.scenarios), &nf, &cf)?;
     Ok(Set {
@@ -628,23 +812,34 @@ pub fn print_set(set: &Set, p: &Paths) {
     }
 }
 
-/// Префикс файлов результата: `--out` — каталог (имя по умолчанию в нём) или префикс пути.
-fn out_prefix(a: &EvalArgs, p: &Paths, stem: &str, point: Option<&str>) -> PathBuf {
+/// `--out` — каталог: существующий или с `/` (`\`) на конце (создаётся).
+fn out_is_dir(o: &Path) -> bool {
+    let s = o.to_string_lossy();
+    o.is_dir() || s.ends_with('/') || s.ends_with('\\')
+}
+
+/// Префикс файлов результата: `--out` — каталог (имя по умолчанию в нём) или префикс пути;
+/// каталог префикса создаётся.
+fn out_prefix(a: &EvalArgs, p: &Paths, stem: &str, point: Option<&str>) -> Result<PathBuf> {
     let with_point = |base: String| match point {
         Some(pt) => format!("{base}-{pt}"),
         None => base,
     };
-    match &a.out {
-        Some(o) if !o.is_dir() => PathBuf::from(with_point(o.to_string_lossy().into_owned())),
-        Some(o) => o.join(with_point(stem.to_string())),
+    let prefix = match &a.out {
+        Some(o) if out_is_dir(o) => {
+            fs::create_dir_all(o).with_context(|| format!("каталог --out {}", o.display()))?;
+            o.join(with_point(stem.to_string()))
+        }
+        Some(o) => PathBuf::from(with_point(o.to_string_lossy().into_owned())),
         None => p.results.join(with_point(stem.to_string())),
+    };
+    if let Some(d) = prefix.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(d).with_context(|| format!("каталог {}", d.display()))?;
     }
+    Ok(prefix)
 }
 
 fn write(prefix: &Path, r: &McpResult) -> Result<(PathBuf, PathBuf)> {
-    if let Some(d) = prefix.parent() {
-        fs::create_dir_all(d)?;
-    }
     let j = PathBuf::from(format!("{}.json", prefix.display()));
     let m = PathBuf::from(format!("{}.md", prefix.display()));
     fs::write(&j, serde_json::to_string(r)? + "\n")?;
@@ -652,35 +847,66 @@ fn write(prefix: &Path, r: &McpResult) -> Result<(PathBuf, PathBuf)> {
     Ok((j, m))
 }
 
-/// Режим без прогона: `--arm <json>` сравнивается с каждым `--compare <json>`.
+/// Префикс плеча из пути его JSON (без `.json`).
+fn prefix_of(json_path: &Path) -> PathBuf {
+    json_path.with_extension("")
+}
+
+/// Режим без прогона: `--arm <json>` сравнивается с каждым `--compare <json>`; сравнения —
+/// рядом с плечом.
 fn compare_files(arm_path: &Path, bases: &[PathBuf]) -> Result<()> {
     if bases.is_empty() {
         bail!("--arm: укажите базы --compare <json>");
     }
     let arm = read_result(arm_path)?;
-    let mut out = String::new();
     for b in bases {
         let base = read_result(b)?;
-        let c = compare(&base, &arm, (&file_name(b), &file_name(arm_path)))?;
-        out.push_str(&crate::eval::report::comparison_md(&c));
+        compare_and_write(
+            &base,
+            &arm,
+            (&file_name(b), &file_name(arm_path)),
+            &prefix_of(arm_path),
+        )?;
     }
-    print!("{out}");
     Ok(())
 }
 
-/// Точки прогона: сетка или одна точка из `--set`.
+/// Точки прогона: сетка или одна точка из `--set`. `--set` вместе с `--grid` — ошибка: точка
+/// сетки описана файлом целиком, иначе результат не воспроизводится по файлу. Ключи вне
+/// таблицы замера — ошибка до старта.
 fn points(a: &EvalArgs) -> Result<Vec<grid::Point>> {
-    if let Some(g) = &a.grid {
-        return grid::load_points(g);
+    let pts = match &a.grid {
+        Some(g) => {
+            if !a.sets.is_empty() {
+                bail!(
+                    "--set вместе с --grid: переопределения точки — только в файле сетки ({})",
+                    g.display()
+                );
+            }
+            grid::load_points(g)?
+        }
+        None => {
+            let env = run::parse_sets(&a.sets)?
+                .into_iter()
+                .map(|(k, v)| (run::env_key(&k), v))
+                .collect();
+            vec![grid::Point {
+                name: String::new(),
+                env,
+            }]
+        }
+    };
+    for pt in &pts {
+        let env: Vec<(String, String)> = pt.env.clone().into_iter().collect();
+        caps::check_known(&env).with_context(|| {
+            if pt.name.is_empty() {
+                "--set".to_string()
+            } else {
+                format!("точка {}", pt.name)
+            }
+        })?;
     }
-    let env = run::parse_sets(&a.sets)?
-        .into_iter()
-        .map(|(k, v)| (run::env_key(&k), v))
-        .collect();
-    Ok(vec![grid::Point {
-        name: String::new(),
-        env,
-    }])
+    Ok(pts)
 }
 
 /// `cargo xtask eval --tokens --via mcp`.
@@ -741,22 +967,23 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     probe.stop()?;
     let caps = caps?;
     println!(
-        "сервер {}{} (git {}): фокус {}, идеи {}, снимок {}",
-        caps.version,
-        if caps.next { " (сборка M6)" } else { "" },
+        "сервер {} (git {}, features {:?}): фокус {}, идеи {}, снимок {}",
+        caps.tag(),
         caps.git.as_deref().unwrap_or("—"),
+        caps.features,
         caps.focus,
         caps.ideas,
         caps.snapshot
     );
-    let mut results: Vec<(String, McpResult)> = Vec::new();
+    let mut results: Vec<(String, PathBuf, McpResult)> = Vec::new();
     for pt in &pts {
         let env: Vec<(String, String)> = pt.env.clone().into_iter().collect();
-        let (kept, dropped) = caps::split_overrides(&caps, &env);
+        let (kept, dropped) = caps::split_overrides(&caps, &env)?;
         if !dropped.is_empty() {
             println!(
-                "точка {}: ключей нет в версии сервера, отброшены: {}",
+                "точка {}: ключей нет у сервера {}, отброшены: {} — к сравнению не допускается",
                 pt.name,
+                caps.tag(),
                 dropped.join(", ")
             );
         }
@@ -812,7 +1039,8 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 }),
                 server_version: caps.version.to_string(),
                 server_git: caps.git.clone(),
-                server_next: caps.next,
+                server_m6: caps.m6,
+                server_features: caps.features.clone(),
                 focus: caps.focus,
                 ideas: caps.ideas,
                 snapshot: caps.snapshot,
@@ -829,32 +1057,36 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             scenarios: runs,
         };
         let stem = format!(
-            "{}-m6-{}-tokens{}-{}",
+            "{}-m6-{}-tokens{}-srv{}-{}",
             r.info.date,
             model.as_deref().unwrap_or("fts"),
             a.label
                 .as_deref()
                 .map_or(String::new(), |l| format!("-{l}")),
+            caps.tag(),
             part.as_str()
         );
-        let (j, m) = write(&out_prefix(a, p, &stem, point.as_deref()), &r)?;
+        let prefix = out_prefix(a, p, &stem, point.as_deref())?;
+        let (j, m) = write(&prefix, &r)?;
         print!("{}", crate::eval::report::tokens_m6_md(&r));
         println!("  {}\n  {}", j.display(), m.display());
-        results.push((point.unwrap_or_else(|| "default".into()), r));
+        results.push((point.unwrap_or_else(|| "default".into()), prefix, r));
     }
-    // сетка: каждая точка против первой
+    // сетка: каждая точка против первой (точки с отброшенными ключами не сравниваются)
     if results.len() > 1 {
-        let (base_name, base) = &results[0];
-        for (name, r) in &results[1..] {
-            let c = compare(base, r, (base_name, name))?;
-            print!("{}", crate::eval::report::comparison_md(&c));
+        let (base_name, _, base) = &results[0];
+        for (name, prefix, r) in &results[1..] {
+            if !r.info.overrides_dropped.is_empty() || !base.info.overrides_dropped.is_empty() {
+                println!("точка {name}: не сравнивается — сервер не знает части ключей");
+                continue;
+            }
+            compare_and_write(base, r, (base_name, name), prefix)?;
         }
     }
     for b in &a.compare {
         let base = read_result(b)?;
-        for (name, r) in &results {
-            let c = compare(&base, r, (&file_name(b), name))?;
-            print!("{}", crate::eval::report::comparison_md(&c));
+        for (name, prefix, r) in &results {
+            compare_and_write(&base, r, (&file_name(b), name), prefix)?;
         }
     }
     Ok(())
@@ -889,6 +1121,8 @@ mod tests {
                 corpus_fingerprint: fp.into(),
                 nuggets_fingerprint: "n".into(),
                 split: "dev".into(),
+                read_budget: READ_BUDGET,
+                counter: "bge-m3".into(),
                 ..McpInfo::default()
             },
             summary: McpSummary::default(),
@@ -923,13 +1157,74 @@ mod tests {
         );
         assert!((c.r.unwrap().mean - 0.7).abs() < 1e-12);
         assert_eq!(c.net_losses, 0);
-        assert!((c.d_micro.mean - 0.0).abs() < 1e-12);
+        assert!(c.d_micro.unwrap().mean.abs() < 1e-12);
         assert_eq!((c.base_micro, c.arm_micro), (0.75, 0.75));
+        assert_eq!(
+            (c.bootstrap.samples, c.bootstrap.seed),
+            (BOOTSTRAP_M6, SEED)
+        );
         let other = arm("d", vec![]);
         let e = compare(&base, &other, ("b4", "m6"))
             .unwrap_err()
             .to_string();
         assert!(e.contains("corpus_fingerprint d (плечо) ≠ c (база)"), "{e}");
+    }
+
+    /// Условия замера должны совпадать: отпечаток нагетов, часть, бюджет чтения, счётчик,
+    /// модель, устройство, без отброшенных переопределений.
+    #[test]
+    fn compare_rejects_other_conditions() {
+        let base = arm("c", vec![scen("a", 1, path(10, 1, true))]);
+        type Spoil = fn(&mut McpInfo);
+        let cases: [(&str, Spoil); 7] = [
+            ("nuggets_fingerprint", |i| {
+                i.nuggets_fingerprint = "n2".into()
+            }),
+            ("часть разбиения", |i| {
+                i.split = "holdout".into()
+            }),
+            ("read_budget", |i| i.read_budget = 1500),
+            ("counter", |i| i.counter = "chars/4".into()),
+            ("модель", |i| i.model = Some("bge-m3-int8".into())),
+            ("устройство", |i| i.device = Some("cuda".into())),
+            ("отброшены", |i| {
+                i.overrides_dropped = vec!["ZAM_SEARCH__BUDGET_TOKENS".into()]
+            }),
+        ];
+        for (what, f) in cases {
+            let mut m6 = base.clone();
+            f(&mut m6.info);
+            let e = compare(&base, &m6, ("b", "m")).unwrap_err().to_string();
+            assert!(e.contains(what), "{what}: {e}");
+        }
+    }
+
+    /// Без нагетов Δ микро-полноты нет и неинфериорность не утверждается.
+    #[test]
+    fn compare_without_nuggets_is_not_noninferior() {
+        let base = arm("c", vec![scen("a", 0, path(10, 0, true))]);
+        let c = compare(&base, &base.clone(), ("b", "m")).unwrap();
+        assert!(c.d_micro.is_none() && !c.noninferior);
+    }
+
+    /// На holdout сценарий только в одном плече допустим лишь как исключённый.
+    #[test]
+    fn holdout_requires_same_scenarios() {
+        let mut base = arm(
+            "c",
+            vec![
+                scen("a", 1, path(10, 1, true)),
+                scen("x", 1, path(5, 1, true)),
+            ],
+        );
+        base.info.split = "holdout".into();
+        let mut m6 = arm("c", vec![scen("a", 1, path(8, 1, true))]);
+        m6.info.split = "holdout".into();
+        let e = compare(&base, &m6, ("b", "m")).unwrap_err().to_string();
+        assert!(e.contains("\"x\""), "{e}");
+        m6.info.excluded = vec!["x: вид idea не создаётся в B4".into()];
+        let c = compare(&base, &m6, ("b", "m")).unwrap();
+        assert_eq!(c.only_base, ["x"]);
     }
 
     /// Дочитывание нужно только ожидаемому источнику с невыданным нагетом.
@@ -951,5 +1246,24 @@ mod tests {
         // ожидаемый без нагетов — дочитывается всегда; чужой — никогда
         assert!(source_missing(&sc, "ru/b", &shown));
         assert!(!source_missing(&sc, "ru/zzz", ""));
+    }
+
+    /// Выжимка кэша первой строкой и ссылка выжимки из ответа `memory_cache_put`.
+    #[test]
+    fn cache_marks() {
+        assert!(cache_first("\n[cache] c_X «вопрос»\n### n:..."));
+        assert!(!cache_first("### n:x\n[cache] ниже\n"));
+        let id = format!("c_{}", "0".repeat(10) + &"A".repeat(16));
+        let put = format!("Выжимка {id} сохранена: «q» · 12 tok · источников 1 · valid\n~20 tok");
+        assert_eq!(cache_ref(&put), Some(id));
+        assert_eq!(cache_ref("Выжимка ? сохранена"), None);
+    }
+
+    /// `--out` с разделителем на конце — каталог (создаётся), без — префикс пути.
+    #[test]
+    fn out_dir_or_prefix() {
+        assert!(out_is_dir(Path::new("x/")) && out_is_dir(Path::new("x\\")));
+        assert!(!out_is_dir(Path::new("no-such-dir-zz/run")));
+        assert_eq!(prefix_of(Path::new("d/a.json")), Path::new("d/a"));
     }
 }

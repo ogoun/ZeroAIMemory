@@ -104,41 +104,43 @@ struct ScenarioNuggets {
     nuggets: Vec<Nugget>,
 }
 
-/// Файл источника нагета: заметка `<corpus>/<путь>.md`, `insight:` — `insights.toml` рядом с
-/// корпусом, иначе файл `<corpus>/<источник>` (документы — задача 1b).
-fn source_file(corpus: &Path, source: &str) -> PathBuf {
-    if source.starts_with(INSIGHT_REF) {
-        return corpus.parent().unwrap_or(corpus).join("insights.toml");
-    }
-    let md = corpus.join(format!("{source}.md"));
-    if md.is_file() {
-        md
+/// Файл источника нагета: заметка `<corpus>/<путь>.md`, `insight:` — файл insight набора
+/// (`--insights`); файла нет — ошибка (источник документа появится вместе со сценариями на
+/// вложения, задача 1b: пока источник — только заметка или insight).
+fn source_file(corpus: &Path, insights: &Path, source: &str) -> Result<PathBuf> {
+    let f = if source.starts_with(INSIGHT_REF) {
+        insights.to_path_buf()
     } else {
-        corpus.join(source)
+        corpus.join(format!("{source}.md"))
+    };
+    if !f.is_file() {
+        bail!("источник нагета {source}: нет файла {}", f.display());
     }
+    Ok(f)
 }
 
-/// Отпечаток сценариев, нагетов и текстов источников нагетов.
-pub fn nuggets_fingerprint(scenarios: &Path, corpus: &Path) -> String {
+/// Отпечаток сценариев, нагетов и текстов источников нагетов; нет файла сценариев или
+/// источника — ошибка.
+pub fn nuggets_fingerprint(scenarios: &Path, corpus: &Path, insights: &Path) -> Result<String> {
     let mut h = blake3::Hasher::new();
     h.update(b"zam-m6-nuggets-v1\0");
-    let bytes = file_bytes(scenarios);
-    put(&mut h, "scenarios", bytes.as_deref());
-    let sources: BTreeSet<String> = bytes
-        .as_deref()
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|t| toml::from_str::<NuggetsOnly>(t).ok())
-        .map(|f| {
-            f.scenario
-                .into_iter()
-                .flat_map(|s| s.nuggets.into_iter().map(|n| n.source))
-                .collect()
-        })
-        .unwrap_or_default();
+    let bytes = file_bytes(scenarios).with_context(|| format!("чтение {}", scenarios.display()))?;
+    put(&mut h, "scenarios", Some(&bytes));
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{} — не UTF-8", scenarios.display()))?;
+    let f: NuggetsOnly =
+        toml::from_str(text).with_context(|| format!("разбор {}", scenarios.display()))?;
+    let sources: BTreeSet<String> = f
+        .scenario
+        .into_iter()
+        .flat_map(|s| s.nuggets.into_iter().map(|n| n.source))
+        .collect();
     for s in &sources {
-        put(&mut h, s, file_bytes(&source_file(corpus, s)).as_deref());
+        let file = source_file(corpus, insights, s)?;
+        let b = file_bytes(&file).with_context(|| format!("чтение {}", file.display()))?;
+        put(&mut h, s, Some(&b));
     }
-    hex(h.finalize())
+    Ok(hex(h.finalize()))
 }
 
 /// Файлы каталога рекурсивно (`/` в относительных путях), по порядку путей; `large/` верхнего
@@ -229,7 +231,8 @@ pub fn check_lock(lock: &Path, nuggets: &str, corpus: &str) -> Result<Option<Loc
         bail!(
             "набор ТС-1 изменён после заморозки ({}): {}. Правка нагетов и корпуса — только при \
              доказанной ошибке разметки, с записью в журнал, новым замком и переснятием всех плеч \
-             (спецификация M6 §3.2)",
+             (спецификация M6 §3.2). eval/docs не в git: если каталог стёрт или собран другой \
+             версией, пересоздайте его — cargo xtask docs-corpus",
             lock.display(),
             errs.join("; ")
         );
@@ -555,20 +558,31 @@ mod tests {
             "[[scenario]]\nid = \"x\"\nnuggets = [{ source = \"ru/a\", text = \"текст a\" }]\n",
         )
         .unwrap();
-        let n1 = nuggets_fingerprint(&sc, &c);
+        let ins = d.join("insights.toml");
+        let n1 = nuggets_fingerprint(&sc, &c, &ins).unwrap();
         let c1 = corpus_fingerprint(&[&c]);
         assert_eq!(n1.len(), 32);
         // CRLF не меняет отпечаток
         fs::write(c.join("ru/a.md"), "текст a\n").unwrap();
-        assert_eq!(nuggets_fingerprint(&sc, &c), n1);
+        assert_eq!(nuggets_fingerprint(&sc, &c, &ins).unwrap(), n1);
         assert_eq!(corpus_fingerprint(&[&c]), c1);
         // заметка без нагетов меняет только отпечаток корпуса
         fs::write(c.join("ru/b.md"), "текст b2\n").unwrap();
-        assert_eq!(nuggets_fingerprint(&sc, &c), n1);
+        assert_eq!(nuggets_fingerprint(&sc, &c, &ins).unwrap(), n1);
         assert_ne!(corpus_fingerprint(&[&c]), c1);
         // источник нагета — оба
         fs::write(c.join("ru/a.md"), "текст a2\n").unwrap();
-        assert_ne!(nuggets_fingerprint(&sc, &c), n1);
+        assert_ne!(nuggets_fingerprint(&sc, &c, &ins).unwrap(), n1);
+        // нет файла источника (заметки или insight) — ошибка, а не пометка в отпечатке
+        let sc2 = d.join("scenarios2.toml");
+        for src in ["ru/zzz", "insight:k1"] {
+            let toml = format!(
+                "[[scenario]]\nid = \"x\"\nnuggets = [{{ source = \"{src}\", text = \"t\" }}]\n"
+            );
+            fs::write(&sc2, toml).unwrap();
+            let e = nuggets_fingerprint(&sc2, &c, &ins).unwrap_err().to_string();
+            assert!(e.contains(src), "{e}");
+        }
         // замок
         let lock = lock_path(&sc);
         assert!(check_lock(&lock, "a", "b").unwrap().is_none());
