@@ -79,7 +79,7 @@ test('code_item_in_solution_tree_not_knowledge', async ({ page }) => {
   await t.getByRole('button', { name: new RegExp(`^${SOLUTION_NAME}`) }).first().click();
   const journals = t.getByRole('list', { name: `Журналы: ${SOLUTION_NAME}` });
   await expect(journals.getByRole('link')).toHaveText([
-    'Changelog', 'Releases', 'Отчёты', 'Код', 'Insights', 'Словарь', 'Задачи', 'Вопросы', 'Vault',
+    'Changelog', 'Releases', 'Отчёты', 'Код', 'Insights', 'Словарь', 'Задачи', 'Идеи', 'Вопросы', 'Vault',
   ]);
   await journals.getByRole('link', { name: 'Код', exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/s/${SOLUTION_GUID}/j/code$`));

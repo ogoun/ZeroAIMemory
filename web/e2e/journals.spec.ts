@@ -47,7 +47,7 @@ async function openJournal(page: Page, journal: string) {
   await sol.click();
   // журналы — над деревом заметок решения
   const journals = t.getByRole('list', { name: `Журналы: ${SOLUTION_NAME}` });
-  await expect(journals.getByRole('link')).toHaveText(['Changelog', 'Releases', 'Отчёты', 'Код', 'Insights', 'Словарь', 'Задачи', 'Вопросы', 'Vault']);
+  await expect(journals.getByRole('link')).toHaveText(['Changelog', 'Releases', 'Отчёты', 'Код', 'Insights', 'Словарь', 'Задачи', 'Идеи', 'Вопросы', 'Vault']);
   await journals.getByRole('link', { name: journal, exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/s/${SOLUTION_GUID}/j/${journal.toLowerCase()}`));
   await expect(page.getByRole('heading', { level: 1, name: journal })).toBeVisible();
@@ -83,6 +83,7 @@ test('Changelog: лента и фильтры по виду и области', 
     'Insights',
     'Словарь',
     'Задачи',
+    'Идеи',
     'Вопросы',
     'Vault',
   ]);

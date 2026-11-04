@@ -10,15 +10,18 @@ export const JOURNAL_TITLE: Record<Journal, string> = {
   insights: 'Insights',
   glossary: 'Словарь',
   tasks: 'Задачи',
+  ideas: 'Идеи',
   questions: 'Вопросы',
   vault: 'Vault',
 };
 
 /** Журналы пространства: у решения — все, у Knowledge — без Changelog, Releases, Отчётов
- * (отчёты пишутся только в решение, M5.5) и Кода (карта кода — у решения, M5.6), иначе — нет. */
+ * (отчёты пишутся только в решение, M5.5) и Кода (карта кода — у решения, M5.6), иначе — нет.
+ * «Идеи» (M5.7) — после «Задач» у обоих. */
 export function journalsOf(kind: string): Journal[] {
-  if (kind === 'solution') return ['changelog', 'releases', 'reports', 'code', 'insights', 'glossary', 'tasks', 'questions', 'vault'];
-  if (kind === 'knowledge') return ['insights', 'glossary', 'tasks', 'questions', 'vault'];
+  if (kind === 'solution')
+    return ['changelog', 'releases', 'reports', 'code', 'insights', 'glossary', 'tasks', 'ideas', 'questions', 'vault'];
+  if (kind === 'knowledge') return ['insights', 'glossary', 'tasks', 'ideas', 'questions', 'vault'];
   return [];
 }
 
@@ -30,6 +33,7 @@ export const JOURNAL_OF_KIND: Record<string, Journal> = {
   report: 'reports',
   term: 'glossary',
   task: 'tasks',
+  idea: 'ideas',
   question: 'questions',
 };
 
@@ -41,6 +45,7 @@ const REF_LETTER: Record<string, string> = {
   report: 'p',
   term: 't',
   task: 'k',
+  idea: 'w',
   question: 'q',
 };
 export const entryRef = (kind: string, id: string): string => `${REF_LETTER[kind] ?? 'e'}:${id}`;
@@ -131,7 +136,37 @@ export const STATUS_TEXT: Record<EntryStatus, string> = {
   dropped: 'снят',
   answered: 'отвечен',
   obsolete: 'неактуален',
+  // статусы идеи (M5.7) — для поиска Ctrl+K; в журнале «Идеи» — IDEA_STATUS_TEXT
+  new: 'новая',
+  proposed: 'предложена',
+  accepted: 'начата',
+  deferred: 'отложена',
+  declined: 'отклонена',
 };
+
+/** Статусы идеи (M5.7 §5) в порядке фильтра журнала «Идеи». */
+export const IDEA_STATUSES: EntryStatus[] = ['new', 'proposed', 'deferred', 'accepted', 'done', 'declined'];
+/** «Активные» идеи — фильтр журнала по умолчанию (§10). */
+export const IDEA_ACTIVE: EntryStatus[] = ['new', 'proposed', 'deferred'];
+
+export type IdeaPriority = 'low' | 'normal' | 'high';
+export const PRIORITIES: IdeaPriority[] = ['high', 'normal', 'low'];
+export const PRIORITY_TEXT: Record<IdeaPriority, string> = { low: 'низкий', normal: 'обычный', high: 'высокий' };
+
+/** Подписи статусов идеи (женский род: «идея»); STATUS_TEXT общий — для задач и вопросов. */
+export const IDEA_STATUS_TEXT: Record<'new' | 'proposed' | 'accepted' | 'deferred' | 'declined' | 'done', string> = {
+  new: 'новая',
+  proposed: 'предложена',
+  accepted: 'начата',
+  deferred: 'отложена',
+  declined: 'отклонена',
+  done: 'выполнена',
+};
+
+/** Дата `YYYY-MM-DD` по UTC через `days` дней от сегодняшней (сервер сравнивает `horizon` с
+ * сегодняшней датой UTC: «отложить до» — не раньше завтрашней по UTC). */
+export const utcDate = (days: number, now = Date.now()): string =>
+  new Date(now + days * 86_400_000).toISOString().slice(0, 10);
 
 export const TRIGGER_TYPES: TriggerType[] = ['file_glob', 'command_regex', 'error_regex', 'keyword'];
 

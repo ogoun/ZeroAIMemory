@@ -14,8 +14,8 @@
 //   вложения заметки (M5), `locator` — место в документе (`page:12`, `sheet:Итоги!A1:F40`,
 //   `slide:3`, `para:40`): переход из выдачи поиска;
 // - `#/u/<user_id>/s/<space_ref>/j/<журнал>[/<entry_id>]` — журнал пространства
-//   (`changelog`, `releases`, `reports`, `code`, `insights`, `glossary`, `tasks`, `questions`,
-//   `vault`), необязательно — открытая запись (у `reports` — страница отчёта, у `code` —
+//   (`changelog`, `releases`, `reports`, `code`, `insights`, `glossary`, `tasks`, `ideas`,
+//   `questions`, `vault`), необязательно — открытая запись (у `reports` — страница отчёта, у `code` —
 //   карточка символа: `путь#qual` в percent-encoding, M5.6).
 // Пустой или неизвестный адрес — `home` без пользователя (Shell выбирает своего).
 
@@ -29,6 +29,7 @@ export type Journal =
   | 'insights'
   | 'glossary'
   | 'tasks'
+  | 'ideas'
   | 'questions'
   | 'vault';
 export const JOURNALS: Journal[] = [
@@ -39,6 +40,7 @@ export const JOURNALS: Journal[] = [
   'insights',
   'glossary',
   'tasks',
+  'ideas',
   'questions',
   'vault',
 ];

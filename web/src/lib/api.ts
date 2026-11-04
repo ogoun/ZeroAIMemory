@@ -647,10 +647,11 @@ export const reindex = (full: boolean) =>
 /** Эпистемический статус (§7.5): `axiom` ставит и меняет только человек. */
 export type Certainty = 'axiom' | 'theorem' | 'hypothesis';
 /** Вид записи (спецификация M4.5 §1.3): с M4.5 — термин словаря, задача, вопрос; с M5.5 —
- * отчёт (`report`, только WebUI). */
-export type EntryKind = 'changelog' | 'release' | 'report' | 'insight' | 'term' | 'task' | 'question';
+ * отчёт (`report`, только WebUI); с M5.7 — идея (`idea`, ссылка `w:`). */
+export type EntryKind = 'changelog' | 'release' | 'report' | 'insight' | 'term' | 'task' | 'question' | 'idea';
 /** Статус по виду: insight/term — `active…retracted` (у term без `revisit`), task —
- * `open…dropped`, question — `open`, `answered`, `obsolete`. */
+ * `open…dropped`, question — `open`, `answered`, `obsolete`, idea — `new`, `proposed`,
+ * `accepted`, `deferred`, `declined`, `done` (M5.7 §5). */
 export type EntryStatus =
   | 'active'
   | 'revisit'
@@ -662,7 +663,12 @@ export type EntryStatus =
   | 'done'
   | 'dropped'
   | 'answered'
-  | 'obsolete';
+  | 'obsolete'
+  | 'new'
+  | 'proposed'
+  | 'accepted'
+  | 'deferred'
+  | 'declined';
 export type TriggerType = 'file_glob' | 'command_regex' | 'error_regex' | 'keyword';
 
 export interface AuthorView {
@@ -722,6 +728,10 @@ export interface Entry {
   usage?: UsageCounts;
   /** У задачи `done`: минуты от `started_at` до `done_at` (`null` — старта не было). */
   duration_min?: number | null;
+  /** У идеи в `GET /entries/{id}`: задача из «начать» (удалённая — `deleted`, M5.7 §7.1). */
+  task?: { id: string; status?: EntryStatus; title?: string; deleted?: boolean };
+  /** У идеи в `GET /entries/{id}`: последний вопрос-предложение. */
+  question?: { id: string; status?: EntryStatus; deleted?: boolean };
 }
 
 export interface EntryQuery {
@@ -734,6 +744,10 @@ export interface EntryQuery {
   dataKind?: string;
   /** Решения по `data.decision.decided_by` (M4.5 §5). */
   decidedBy?: 'human' | 'agent';
+  /** Только `kind: idea`: происхождение `data.origin` (M5.7 §7.1). */
+  origin?: 'human' | 'agent';
+  /** Только `kind: idea`: `data.priority`. */
+  priority?: 'low' | 'normal' | 'high';
   cursor?: string | null;
   limit?: number;
 }
@@ -748,6 +762,8 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
   if (f.tag) p.set('tag', f.tag);
   if (f.dataKind) p.set('data_kind', f.dataKind);
   if (f.decidedBy) p.set('decided_by', f.decidedBy);
+  if (f.origin) p.set('origin', f.origin);
+  if (f.priority) p.set('priority', f.priority);
   if (f.cursor) p.set('cursor', f.cursor);
   if (f.limit) p.set('limit', String(f.limit));
   return call<{ items: Entry[]; next_cursor: string | null }>(
@@ -900,9 +916,15 @@ export function termConflicts(e: unknown): { id: string; title: string; matched:
 export const releaseTask = (user: string, id: string) =>
   call<Entry>('POST', `entries/${q(id)}/release`, undefined, user);
 
-/** Ответ человека на вопрос; из WebUI — всегда `channel: webui`. Создаёт решение (`decision_id`). */
-export const answerQuestion = (user: string, id: string, a: { text?: string; option?: string }) =>
-  call<{ entry: Entry; decision: Entry; decision_id: string }>(
+/** Ответ человека на вопрос; из WebUI — всегда `channel: webui`. Создаёт решение (`decision_id`).
+ * У вопроса-предложения идеи (`data.idea`) `option` обязателен, `horizon` — только у `defer`; в
+ * ответе — ещё идея и задача «начать» (M5.7 §5.3). */
+export const answerQuestion = (
+  user: string,
+  id: string,
+  a: { text?: string; option?: string; horizon?: string },
+) =>
+  call<{ entry: Entry; decision: Entry; decision_id: string; idea?: Entry; task?: Entry }>(
     'POST',
     `entries/${q(id)}/answer`,
     { ...a, channel: 'webui' },
@@ -916,6 +938,48 @@ export const answeredDecision = (e: unknown): string | null =>
       ? e.problem.decision_id
       : ''
     : null;
+
+// ---- идеи (M5.7 §5): решение человека и «принять как свою»; propose — действие агента ----
+
+export type IdeaDecision = 'accept' | 'defer' | 'decline' | 'reopen';
+
+/** `POST /entries/{id}/decide` из WebUI (`by: human`, `channel: webui` ставит сервер). `horizon` —
+ * только у `defer` (дата UTC позже сегодняшней), `reason` — у `decline`, обязателен у `reopen`,
+ * `space` — пространство задачи `accept` (идея Knowledge). Открытый вопрос-предложение сервер
+ * отвечает в той же транзакции. */
+export const decideIdea = (
+  user: string,
+  id: string,
+  decision: IdeaDecision,
+  opts: { horizon?: string; reason?: string; space?: string } = {},
+) =>
+  call<{ entry: Entry; task?: Entry; question?: Entry }>(
+    'POST',
+    `entries/${q(id)}/decide`,
+    { decision, ...opts },
+    user,
+  );
+
+/** «Принять как свою»: идея «от агента» → `origin: human` (только человек в WebUI). */
+export const adoptIdea = (user: string, id: string) =>
+  call<Entry>('POST', `entries/${q(id)}/adopt`, undefined, user);
+
+/** Поиск идей пространства по заголовку и тексту: `POST /search` `kinds: [idea]`. */
+export const searchIdeas = (user: string, space: string, query: string, status: EntryStatus[]) =>
+  call<SearchResult>(
+    'POST',
+    'search',
+    {
+      query,
+      scope: { spaces: [space] },
+      filters: { kinds: ['idea'], ...(status.length ? { status } : {}) },
+      mode: 'brief',
+      top_k: 50,
+      budget_tokens: 8000,
+      format: 'json',
+    },
+    user,
+  );
 
 // ---- ссылки знаний на файлы (M4.5 §6) ----
 
@@ -1224,13 +1288,21 @@ export const HOOK_KINDS: HookKind[] = [
 ];
 export type HookFlags = Record<HookKind, boolean>;
 
+/** Настройки пользователя: типы подсказок хуков и проактивность идей (`ideas.proactive`, M5.7 §8). */
+export interface UserSettings {
+  hooks: HookFlags;
+  ideas: { proactive: boolean };
+}
+
 /** Свои настройки (`own`) или пользователя `userId` (администратор). */
 const settingsPath = (userId: string | null) =>
   userId ? `admin/users/${q(userId)}/settings` : 'auth/settings';
 export const getUserSettings = (userId: string | null) =>
-  call<{ hooks: HookFlags }>('GET', settingsPath(userId));
+  call<UserSettings>('GET', settingsPath(userId));
 export const setUserHooks = (userId: string | null, hooks: Partial<HookFlags>) =>
-  call<{ hooks: HookFlags }>('PATCH', settingsPath(userId), { hooks });
+  call<UserSettings>('PATCH', settingsPath(userId), { hooks });
+export const setUserIdeas = (userId: string | null, proactive: boolean) =>
+  call<UserSettings>('PATCH', settingsPath(userId), { ideas: { proactive } });
 
 // ---- кэш выжимок (§9.4, §15.4) ----
 

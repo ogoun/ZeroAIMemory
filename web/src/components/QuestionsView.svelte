@@ -3,6 +3,9 @@
   // (рекомендация агента отмечена), ответ в один клик или текстом. Ответ идёт с
   // `channel: webui` и создаёт решение (insight `decision`, `decided_by: human`) — после
   // ответа карточка ссылается на него. Отвеченные и неактуальные — ниже, с ответом.
+  // Вопрос-предложение идеи (`data.idea`, M5.7 §5.3) — со ссылкой «Идея w:<id>»; ответ — только
+  // вариантом, у «отложить» — дата «не раньше» (UTC, не раньше завтрашней).
+
   import { tick, untrack } from 'svelte';
   import {
     ApiError,
@@ -12,7 +15,7 @@
     listEntries,
     type Entry,
   } from '../lib/api';
-  import { AUTHOR_TEXT, STATUS_TEXT, fmtTime } from '../lib/journals';
+  import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime, utcDate } from '../lib/journals';
   import { href } from '../lib/router';
 
   interface Props {
@@ -43,6 +46,9 @@
   let texts = $state<Record<string, string>>({});
   /** Решение, созданное ответом только что (до перечитывания списка). */
   let created = $state<Record<string, string>>({});
+  /** Вопрос-предложение, у которого открыт выбор даты «отложить», и сама дата. */
+  let deferFor = $state('');
+  let deferDate = $state('');
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
@@ -83,6 +89,29 @@
           (o): o is Opt => !!o && typeof o === 'object' && typeof (o as Opt).key === 'string' && typeof (o as Opt).text === 'string',
         )
       : [];
+  /** Идея вопроса-предложения (`data.idea`) или пустая строка. */
+  const ideaOf = (e: Entry): string => (typeof e.data.idea === 'string' ? e.data.idea : '');
+  const ideaHref = (id: string) => href({ name: 'journal', user, space, journal: 'ideas', entry: id });
+
+  function pick(q: Entry, key: string) {
+    if (ideaOf(q) && key === 'defer') {
+      deferFor = q.id;
+      deferDate = utcDate(30);
+      errors[q.id] = '';
+      return;
+    }
+    answer(q, { option: key });
+  }
+
+  function submitDefer(e: SubmitEvent, q: Entry) {
+    e.preventDefault();
+    if (!deferDate || deferDate < utcDate(1)) {
+      errors[q.id] = `Дата — не раньше ${utcDate(1)} (UTC).`;
+      return;
+    }
+    answer(q, { option: 'defer', horizon: deferDate });
+  }
+
   const recommended = (e: Entry): string =>
     typeof e.data.recommendation === 'string' ? e.data.recommendation : '';
 
@@ -106,7 +135,7 @@
   /** Открытые первыми (новые вопросы сверху внутри группы — как отдаёт сервер). */
   let ordered = $derived([...items.filter((q) => q.status === 'open'), ...items.filter((q) => q.status !== 'open')]);
 
-  async function answer(q: Entry, a: { text?: string; option?: string }) {
+  async function answer(q: Entry, a: { text?: string; option?: string; horizon?: string }) {
     if (busy) return;
     busy = q.id;
     errors[q.id] = '';
@@ -114,6 +143,7 @@
       const r = await answerQuestion(user, q.id, a);
       created[q.id] = r.decision_id;
       texts[q.id] = '';
+      if (deferFor === q.id) deferFor = '';
       await load(user, space, true);
     } catch (e) {
       const d = answeredDecision(e);
@@ -158,6 +188,9 @@
           <span class="muted small">{AUTHOR_TEXT[q.author.kind] ?? q.author.kind} · {fmtTime(q.created_at)}</span>
         </header>
         {#if q.body}<p class="body">{q.body}</p>{/if}
+        {#if ideaOf(q)}
+          <p><a href={ideaHref(ideaOf(q))} data-testid="idea-link">Идея {entryRef('idea', ideaOf(q))}</a></p>
+        {/if}
 
         {#if q.status === 'open'}
           {#if opts.length}
@@ -168,22 +201,35 @@
                   class:primary={o.key === recommended(q)}
                   disabled={busy !== ''}
                   title={o.key === recommended(q) ? 'Рекомендация агента' : ''}
-                  onclick={() => answer(q, { option: o.key })}
+                  onclick={() => pick(q, o.key)}
                 >
                   {o.text}{#if o.key === recommended(q)}<span class="rec"> · рекомендуется</span>{/if}
                 </button>
               {/each}
             </div>
           {/if}
-          <form class="row" onsubmit={(e) => submitText(e, q)} aria-label="Ответ текстом">
-            <input
-              bind:value={texts[q.id]}
-              placeholder={opts.length ? 'или свой ответ' : 'ответ'}
-              aria-label="Ответ на вопрос «{q.title}»"
-              maxlength="4000"
-            />
-            <button type="submit" disabled={busy !== ''}>Ответить</button>
-          </form>
+          {#if deferFor === q.id}
+            <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label="Отложить идею">
+              <label class="row">
+                Не раньше
+                <input type="date" bind:value={deferDate} min={utcDate(1)} required aria-label="Отложить до" />
+                <span class="muted small" title="Даты хранятся в UTC">UTC</span>
+              </label>
+              <button type="submit" disabled={busy !== ''}>Отложить</button>
+              <button type="button" onclick={() => (deferFor = '')}>Отмена</button>
+            </form>
+          {/if}
+          {#if !ideaOf(q)}
+            <form class="row" onsubmit={(e) => submitText(e, q)} aria-label="Ответ текстом">
+              <input
+                bind:value={texts[q.id]}
+                placeholder={opts.length ? 'или свой ответ' : 'ответ'}
+                aria-label="Ответ на вопрос «{q.title}»"
+                maxlength="4000"
+              />
+              <button type="submit" disabled={busy !== ''}>Ответить</button>
+            </form>
+          {/if}
           {#if errors[q.id]}<p class="error" role="alert">{errors[q.id]}</p>{/if}
         {:else if a}
           <p class="answer">
