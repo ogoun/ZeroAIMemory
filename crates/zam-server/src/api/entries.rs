@@ -601,6 +601,15 @@ pub async fn list(
         }
         trash_allowed(&st, &p, sc.owner, sc.role)?;
     }
+    // фильтры по `data` идеи — только у ленты идей (M5.7 §7.1)
+    let idea_filter = [&q.origin, &q.priority]
+        .into_iter()
+        .any(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()));
+    if idea_filter && kind != Some(EntryKind::Idea) {
+        return Err(unprocessable(
+            "origin и priority — фильтры ленты идей (kind=idea)",
+        ));
+    }
     let f = EntryFilter {
         space_id: sc.space.id,
         kind,
@@ -1015,6 +1024,8 @@ pub async fn restore(
 ) -> Result<Json<Entry>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     report_trash_allowed(&st, &p, &sc)?;
+    // идею человека из корзины возвращает человек (M5.7 §7.1, §9)
+    super::ideas::deny_token_on_human_idea(&p, &sc.entry, true)?;
     let rev = optional_if_match(&headers)?;
     let attrib = attribution(&p, &headers, None)?;
     let e = restore_entry(&sc.db, sc.entry.id, rev, &attrib).await?;

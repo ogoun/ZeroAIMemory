@@ -566,6 +566,7 @@ fn target_filter(
     )?;
     insight_kinds.sort();
     insight_kinds.dedup();
+    let with_idea = kinds.iter().any(|k| k == IDEA);
     Ok(TargetFilter {
         kinds,
         // include_history снимает фильтр статусов; без явного `kinds` открытые вопросы и задачи
@@ -573,9 +574,12 @@ fn target_filter(
         statuses: match (include_history, explicit) {
             (false, _) => statuses,
             (true, true) => Vec::new(),
+            // статусы идей — только если идеи среди видов (у токена без явного idea их нет):
+            // список истории и ключ кэша выжимок токена прежние
             (true, false) => STATUSES
                 .iter()
                 .filter(|s| **s != "open")
+                .filter(|s| with_idea || !IDEA_STATUSES.contains(s))
                 .map(|s| s.to_string())
                 .collect(),
         },
@@ -638,10 +642,13 @@ fn scope_key(sc: &ScopeReq, t: &TargetFilter, solution: Option<&SolutionGuid>) -
         .filter(|k| *k != REPORT && *k != IDEA)
         .cloned()
         .collect();
+    // статусы идей не входят в ключ, только когда в видах есть idea (умолчания WebUI или явный
+    // вид): без idea они — обычный фильтр других видов и меняют выдачу
+    let with_idea = t.kinds.iter().any(|k| k == IDEA);
     let statuses: Vec<String> = t
         .statuses
         .iter()
-        .filter(|s| !IDEA_STATUSES.contains(&s.as_str()))
+        .filter(|s| !(with_idea && IDEA_STATUSES.contains(&s.as_str())))
         .cloned()
         .collect();
     let mut filters = json!({
@@ -3477,7 +3484,12 @@ mod tests {
         let f = target_filter(&Filters::default(), true, false).unwrap();
         assert!(!f.statuses.contains(&"open".to_string()));
         assert!(f.statuses.contains(&"superseded".to_string()));
-        assert_eq!(excluded_statuses(&f), ["open"]);
+        // статусы идей — только при идеях среди видов (M5.7): у токена их нет, у WebUI — есть
+        let mut want = vec!["open"];
+        want.extend(IDEA_STATUSES);
+        assert_eq!(excluded_statuses(&f), want);
+        let web = target_filter(&Filters::default(), true, true).unwrap();
+        assert_eq!(excluded_statuses(&web), ["open"]);
         let f = target_filter(
             &Filters {
                 kinds: Some(vec!["question".into()]),
@@ -3622,6 +3634,12 @@ mod tests {
         assert_eq!(a, b, "порядок и повторы не меняют ключ");
     }
 
+    /// Ключ кэша выжимок M5.6 запроса по умолчанию (без решения) и с `include_history`.
+    const M56_DEFAULT_KEY: &str =
+        "c31dfa31c9c09b6586b0cdda868871345d33c71cd0d52cc8014eab4257b9158f";
+    const M56_HISTORY_KEY: &str =
+        "1ce9365890aceb9666a59596f7216cb168b0d9d20986ec89a529db2f4dd8c469";
+
     /// M5.7 (I9): вид `idea` и статусы идей не входят в ключ кэша выжимок — ключи M5.6
     /// (фикстура) сохраняются у токена и у WebUI, с историей и без.
     #[test]
@@ -3659,6 +3677,13 @@ mod tests {
             "revisit",
             "superseded",
         ]);
+        // замороженные ключи M5.6 (`M56_*_KEY`): hex — `zam_store::scope_hash` структур
+        // `current` и `history`, посчитан 2026-11-04 на коде после 4361d39 для запроса по
+        // умолчанию; структуры сверены вручную со `scope_key` на 1ceeec0 (DEFAULT_KINDS — 7
+        // видов, DEFAULT_STATUSES + answered; история — STATUSES без open), `scope_hash`
+        // (`zam-store/src/cache`) с 1ceeec0 не менялся
+        assert_eq!(current, M56_DEFAULT_KEY);
+        assert_eq!(history, M56_HISTORY_KEY);
         for human in [false, true] {
             assert_eq!(key(&d, false, human), current, "human = {human}");
             assert_eq!(key(&d, true, human), history, "human = {human}");
@@ -3670,6 +3695,20 @@ mod tests {
         assert_eq!(
             key(&kinds(&["note", "idea"]), false, false),
             key(&kinds(&["note"]), false, false)
+        );
+        // без idea в kinds статусы идей — обычный фильтр и входят в ключ
+        let with_status = |k: &[&str], s: &[&str]| Filters {
+            kinds: Some(k.iter().map(|x| x.to_string()).collect()),
+            status: Some(s.iter().map(|x| x.to_string()).collect()),
+            ..Filters::default()
+        };
+        assert_ne!(
+            key(&with_status(&["insight"], &["active", "new"]), false, false),
+            key(&with_status(&["insight"], &["active"]), false, false)
+        );
+        assert_ne!(
+            key(&with_status(&["insight"], &["new"]), false, false),
+            key(&kinds(&["insight"]), false, false)
         );
         // у WebUI idea в умолчаниях, у токена — только явно
         assert!(

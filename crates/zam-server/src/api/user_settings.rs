@@ -144,28 +144,28 @@ impl Current {
 #[serde(deny_unknown_fields)]
 struct SettingsPatch {
     hooks: Option<Map<String, Value>>,
-    ideas: Option<IdeasPatch>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IdeasPatch {
-    proactive: Option<Value>,
+    ideas: Option<Map<String, Value>>,
 }
 
 /// Правки из тела `PATCH`: `(ключ, значение)`.
 fn parse_patch(body: &Bytes) -> Result<Vec<(String, Value)>, ApiError> {
     let req: SettingsPatch = parse_body(body)?;
     let hooks = req.hooks.unwrap_or_default();
-    let ideas = req.ideas.and_then(|i| i.proactive);
-    if hooks.is_empty() && ideas.is_none() {
+    let ideas = req.ideas.unwrap_or_default();
+    if hooks.is_empty() && ideas.is_empty() {
         return Err(ApiError::BadRequest(format!(
             "нужно поле hooks: {{{}: bool}} или ideas: {{proactive: bool}}",
             HOOK_KINDS.join("|")
         )));
     }
-    let mut out = Vec::with_capacity(hooks.len() + 1);
-    if let Some(v) = ideas {
+    let mut out = Vec::with_capacity(hooks.len() + ideas.len());
+    for (k, v) in ideas {
+        if k != "proactive" {
+            return Err(ApiError::BadRequest(format!(
+                "ideas: неизвестное поле «{k}» — proactive"
+            )));
+        }
+        // null — не «оставить как есть», а ошибка: значение задаётся явно
         let Value::Bool(b) = v else {
             return Err(ApiError::BadRequest(
                 "ideas.proactive: true или false".into(),
@@ -338,6 +338,7 @@ mod tests {
             r#"{"ideas":{}}"#,
             r#"{"ideas":{"proactive":1}}"#,
             r#"{"ideas":{"digest":false}}"#,
+            r#"{"ideas":{"proactive":null}}"#,
         ] {
             assert!(parse_patch(&Bytes::from(bad.to_string())).is_err(), "{bad}");
         }

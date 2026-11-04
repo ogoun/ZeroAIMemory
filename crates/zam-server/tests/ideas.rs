@@ -227,6 +227,19 @@ async fn create_idea_spaces_and_origin() {
         ids.push(id(&r.json()));
     }
     assert_eq!(ids[0], ids[1]);
+    // ошибка структуры data на повторе — 422, как у первого запроса
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &sol(),
+            Some(json!({"kind": "idea", "title": "Повтор",
+                        "data": {"origin": "agent", "priority": "urgent"}})),
+            &[("idempotency-key", "idea-1")],
+        )
+        .await;
+    problem(&r, StatusCode::UNPROCESSABLE_ENTITY, "unprocessable");
+    assert!(r.text().contains("data.priority"), "{}", r.text());
 }
 
 #[tokio::test]
@@ -332,6 +345,27 @@ async fn token_cannot_adopt_rewrite_or_delete_human_idea() {
     let rows = audit(&a).await;
     assert_eq!(actions(&rows, "entry.idea.adopt"), 0);
     assert_eq!(actions(&rows, "entry.delete"), 1, "только идея агента");
+    // идею человека из корзины возвращает человек: токену 403
+    ok(
+        &adm_rev(&a, Method::DELETE, &ent(&i), None).await,
+        StatusCode::NO_CONTENT,
+    );
+    let r = a
+        .t(Method::POST, &format!("{}/restore", ent(&i)), None)
+        .await;
+    problem(&r, StatusCode::FORBIDDEN, "idea-human-owned");
+    let r = a.adm(Method::GET, &ent(&i), None, None).await;
+    ok(&r, StatusCode::NOT_FOUND);
+    assert_eq!(actions(&audit(&a).await, "entry.restore"), 0);
+    let r = a
+        .adm(Method::POST, &format!("{}/restore", ent(&i)), None, None)
+        .await;
+    ok(&r, StatusCode::OK);
+    // свою идею агент возвращает сам
+    let r = a
+        .t(Method::POST, &format!("{}/restore", ent(&ag)), None)
+        .await;
+    ok(&r, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -375,6 +409,18 @@ async fn token_by_agent_cannot_decide_human_idea() {
     )
     .await;
     ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    // сессия WebUI — всегда человек: явный by: agent — 422
+    let ag = idea_web(&a, &sol(), "WebUI не агент").await;
+    for x in [&i, &ag] {
+        let r = post_web(
+            &a,
+            x,
+            "decide",
+            json!({"decision": "decline", "by": "agent"}),
+        )
+        .await;
+        ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }
 
 #[tokio::test]
@@ -821,11 +867,11 @@ async fn list_filters_origin_priority_status() {
     assert_eq!(count("kind=idea&origin=human&priority=low").await, 1);
     assert_eq!(count("kind=idea&status=new").await, 3);
     assert_eq!(count("kind=idea&status=accepted").await, 0);
-    for bad in [
-        "origin=human",
-        "kind=idea&origin=robot",
-        "kind=idea&priority=urgent",
-    ] {
+    for bad in ["origin=human", "priority=high", "kind=task&origin=agent"] {
+        let r = a.t(Method::GET, &format!("{}?{bad}", sol()), None).await;
+        ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    for bad in ["kind=idea&origin=robot", "kind=idea&priority=urgent"] {
         let r = a.t(Method::GET, &format!("{}?{bad}", sol()), None).await;
         ok(&r, StatusCode::BAD_REQUEST);
     }
@@ -1167,6 +1213,27 @@ async fn shared_solution_rights_matrix() {
     )
     .await;
     problem(&r, StatusCode::CONFLICT, "already-adopted");
+    // корзина: идею человека возвращает человек, токен участника — 403
+    let r = web_rev(&a, &o_web, Method::DELETE, &ent(&own), None).await;
+    ok(&r, StatusCode::NO_CONTENT);
+    let r = a
+        .tok(
+            &m_tok,
+            Method::POST,
+            &format!("{}/restore", ent(&own)),
+            None,
+        )
+        .await;
+    problem(&r, StatusCode::FORBIDDEN, "idea-human-owned");
+    let r = web(
+        &a,
+        &o_web,
+        Method::POST,
+        &format!("{}/restore", ent(&own)),
+        None,
+    )
+    .await;
+    ok(&r, StatusCode::OK);
 
     // ro: читает, но не пишет — ни WebUI, ни токен
     set_access(&a, &o_tok, &m_id, "ro").await;
@@ -1235,4 +1302,92 @@ async fn shared_solution_rights_matrix() {
             .await
             .is_ok()
     );
+}
+
+/// Отзыв доступа участника (§9): его токен больше не предлагает и не решает идеи общего решения.
+#[tokio::test]
+async fn revoked_member_cannot_decide_or_propose() {
+    let a = api("ideas-revoked", |_| {}).await;
+    let (_, o_tok) = a.new_user("Ольга").await;
+    let (m_id, m_tok) = a.new_user("Марк").await;
+    let r = a
+        .tok(
+            &o_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let r = a
+        .tok(
+            &m_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    ok(&r, StatusCode::ACCEPTED);
+    set_access(&a, &o_tok, &m_id, "rw").await;
+    let mut ids = Vec::new();
+    for t in ["Первая", "Вторая"] {
+        let r = a
+            .tok(
+                &m_tok,
+                Method::POST,
+                &sol(),
+                Some(json!({"kind": "idea", "title": t, "data": {"origin": "human"}})),
+            )
+            .await;
+        ok(&r, StatusCode::CREATED);
+        ids.push(id(&r.json()));
+    }
+    // до отзыва — работает
+    let r = a
+        .tok(
+            &m_tok,
+            Method::POST,
+            &format!("{}/propose", ent(&ids[0])),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let r = a
+        .tok(
+            &o_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{m_id}/revoke"),
+            None,
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    for (x, op, body) in [
+        (&ids[1], "propose", json!({})),
+        (
+            &ids[0],
+            "decide",
+            json!({"decision": "accept", "by": "human"}),
+        ),
+        (
+            &ids[1],
+            "decide",
+            json!({"decision": "decline", "by": "human"}),
+        ),
+    ] {
+        let r = a
+            .tok(
+                &m_tok,
+                Method::POST,
+                &format!("{}/{op}", ent(x)),
+                Some(body),
+            )
+            .await;
+        problem(&r, StatusCode::FORBIDDEN, "solution-access");
+    }
+    // владелец видит идеи без изменений
+    for (x, st) in [(&ids[0], "proposed"), (&ids[1], "new")] {
+        let r = a.tok(&o_tok, Method::GET, &ent(x), None).await;
+        ok(&r, StatusCode::OK);
+        assert_eq!(r.json()["status"], st);
+    }
 }

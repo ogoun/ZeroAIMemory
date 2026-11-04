@@ -345,9 +345,7 @@ impl From<StoreError> for ApiError {
                 }
             }
             // клиентская связь `derived_from` на идею — 422 в `POST /edges` и `links` (M5.7 §4)
-            StoreError::BadInput(m) if m == zam_store::IDEA_DERIVED_FROM_DENIED => {
-                ApiError::Unprocessable(m)
-            }
+            e @ StoreError::IdeaLinkDenied => ApiError::Unprocessable(e.to_string()),
             StoreError::BadInput(m) => ApiError::BadRequest(m),
             StoreError::TermConflict(c) => ApiError::TermConflict(c),
             StoreError::IdempotencyMismatch(m) => ApiError::IdempotencyMismatch(m),

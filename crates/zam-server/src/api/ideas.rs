@@ -59,7 +59,7 @@ impl From<IdeaError> for ApiError {
             }
             e @ IdeaError::ReasonRequired => ApiError::ReasonRequired(e.to_string()),
             IdeaError::BadHorizon(m) | IdeaError::TaskSpace(m) => unprocessable(m),
-            e @ (IdeaError::IdeaDeleted | IdeaError::StaleProposal) => {
+            e @ (IdeaError::IdeaDeleted | IdeaError::StaleProposal | IdeaError::OriginChanged) => {
                 ApiError::conflict(e.to_string())
             }
             // ошибки проверки тела операции идеи (`text`, `reason` длиннее предела) — 422
@@ -82,7 +82,7 @@ fn origin_of(e: &Entry) -> IdeaOrigin {
 /// `data` новой идеи (`POST /spaces/{space}/entries` `kind: idea`, §4): у сессии WebUI
 /// `origin` всегда `human` (нет поля — подставляется, `agent` — 422); у токена поле обязательно
 /// (нет — 422 [`zam_store::IDEA_ORIGIN_REQUIRED`]). `check_date: false` — повтор по
-/// `Idempotency-Key`: дата `horizon` не проверяется (сверку делает хранилище, без часов).
+/// `Idempotency-Key`: структура `data` проверяется, дата `horizon` — нет (сверка без часов).
 pub(crate) fn create_data(
     p: &Principal,
     data: &Value,
@@ -109,8 +109,11 @@ pub(crate) fn create_data(
     o.insert("origin".into(), json!(origin.as_str()));
     let data = Value::Object(o);
     if check_date {
-        zam_store::check_idea(&data, origin).map_err(unprocessable)?;
+        zam_store::check_idea(&data, origin)
+    } else {
+        zam_store::check_idea_shape(&data, origin)
     }
+    .map_err(unprocessable)?;
     Ok(data)
 }
 
@@ -358,7 +361,7 @@ pub(crate) fn default_horizon(st: &AppState) -> Result<Date, ApiError> {
 }
 
 /// `channel` и `by` решения или ответа человека по правилам `answer` (§7.9): у сессии WebUI по
-/// умолчанию `webui`/`human`; у токена `channel` — `chat|cli` (`webui` — 422), `by` обязателен
+/// умолчанию `webui`/`human`, `by: agent` — 422; у токена `channel` — `chat|cli` (`webui` — 422), `by` обязателен
 /// (нет — 400 `by-required`).
 pub(crate) fn by_channel(
     p: &Principal,
@@ -377,6 +380,12 @@ pub(crate) fn by_channel(
         ));
     }
     let by = match by {
+        // в WebUI отвечает и решает человек: оформиться агентом сессия не может
+        Some(AnswerBy::Agent) if session => {
+            return Err(unprocessable(
+                "by: agent — у агента; в WebUI отвечает и решает человек (by: human)",
+            ));
+        }
         Some(b) => b,
         None if session => AnswerBy::Human,
         None => return Err(ApiError::ByRequired),
@@ -429,6 +438,8 @@ pub async fn decide(
             task_space: space,
             request_solution,
             defer_days: st.cfg.ideas.defer_days,
+            // права «кто решает» проверены по этому происхождению; сверка — в транзакции
+            expected_origin: Some(origin_of(&sc.entry)),
         },
         &attrib,
     )

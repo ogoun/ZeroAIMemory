@@ -104,8 +104,8 @@ pub use graph::{
 pub use ideas::{
     Decided, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS, IDEA_LINKS_MAX, IDEA_OPTIONS,
     IDEA_ORIGIN_REQUIRED, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewDecision,
-    PROPOSE_TEXT_MAX_CHARS, TaskState, adopt_idea, check_idea, check_idea_transition, decide_idea,
-    idea_candidate, proactive_ideas, propose_idea,
+    PROPOSE_TEXT_MAX_CHARS, TaskState, adopt_idea, check_idea, check_idea_shape,
+    check_idea_transition, decide_idea, idea_candidate, proactive_ideas, propose_idea,
 };
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
@@ -196,6 +196,10 @@ pub enum StoreError {
     /// захват и ответ над ним запрещены (сервер — 409 `/problems/report-immutable`).
     #[error("отчёт неизменяем — напишите новый")]
     ReportImmutable,
+    /// Клиентская связь `derived_from` с целью-идеей (M5.7 §4): её ставит только «начать»
+    /// (сервер — 422).
+    #[error("{}", graph::IDEA_DERIVED_FROM_DENIED)]
+    IdeaLinkDenied,
     /// Нарушение матрицы прав `certainty` ([`certainty::check_certainty`]).
     #[error(transparent)]
     Certainty(#[from] CertaintyError),

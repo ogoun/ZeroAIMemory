@@ -1231,6 +1231,7 @@ async fn user_ideas_settings_rest() {
         json!({"ideas": {"proactive": "no"}}),
         json!({"ideas": {}}),
         json!({"ideas": true}),
+        json!({"ideas": {"proactive": null}}),
     ] {
         let r = web(&a, &w, Method::PATCH, "/api/v1/auth/settings", Some(bad)).await;
         ok(&r, StatusCode::BAD_REQUEST);

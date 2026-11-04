@@ -118,6 +118,7 @@ fn nd(decision: IdeaDecision) -> NewDecision {
         task_space: None,
         request_solution: None,
         defer_days: 30,
+        expected_origin: None,
     }
 }
 
@@ -1273,10 +1274,8 @@ async fn client_derived_from_to_idea_rejected() {
     t.kind = EntryKind::Task;
     t.links = vec![(EdgeType::DerivedFrom, entry_ref(i.id))];
     let r = create_entry(&db, t.clone(), &agent()).await;
-    assert!(
-        matches!(&r, Err(StoreError::BadInput(m)) if m.contains("начать")),
-        "{r:?}"
-    );
+    assert!(matches!(&r, Err(StoreError::IdeaLinkDenied)), "{r:?}");
+    assert!(r.unwrap_err().to_string().contains("«начать»"));
     t.links = vec![(EdgeType::RelatesTo, entry_ref(i.id))];
     let (task, _) = create_entry(&db, t, &agent()).await.unwrap();
     let r = db
@@ -1289,10 +1288,32 @@ async fn client_derived_from_to_idea_rejected() {
             &agent(),
         )
         .await;
-    assert!(
-        matches!(&r, Err(StoreError::BadInput(m)) if m.contains("начать")),
-        "{r:?}"
-    );
+    assert!(matches!(&r, Err(StoreError::IdeaLinkDenied)), "{r:?}");
+}
+
+/// Ревью задачи 2: права «кто решает» сервер проверяет по `origin` до транзакции; ожидаемое
+/// происхождение сверяется внутри неё — расхождение (идею приняли как свою между чтением и
+/// записью) — `OriginChanged` без записи.
+#[tokio::test]
+async fn decide_checks_expected_origin_in_tx() {
+    let (db, sol, _) = setup("expected-origin").await;
+    let i = new_idea(&db, sol, "Чья идея", "human", "normal").await;
+    let d = NewDecision {
+        by: AnswerBy::Agent,
+        channel: Channel::Chat,
+        expected_origin: Some(IdeaOrigin::Agent),
+        ..nd(IdeaDecision::Decline)
+    };
+    let r = decide_idea(&db, i.id, d, &agent()).await;
+    assert!(matches!(r, Err(IdeaError::OriginChanged)), "{r:?}");
+    let e = get_entry(&db, i.id).await.unwrap();
+    assert_eq!((e.rev, e.status), (i.rev, Some(EntryStatus::New)));
+    let d = NewDecision {
+        expected_origin: Some(IdeaOrigin::Human),
+        ..nd(IdeaDecision::Decline)
+    };
+    let r = decide_idea(&db, i.id, d, &human()).await.unwrap();
+    assert_eq!(r.idea.status, Some(EntryStatus::Declined));
 }
 
 // ---------- отбор и лента ----------

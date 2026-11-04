@@ -650,6 +650,8 @@ pub async fn answer_question(
                 task_space: None,
                 request_solution: None,
                 defer_days: IDEA_DEFER_DAYS_DEFAULT,
+                // ответ агента за себя на предложение отклонён раньше (`ByAgentOnProposal`)
+                expected_origin: None,
             };
             Ok(
                 apply_decision_tx(tx, &idea, &nd, Some(&question), &attrib, &now)?

@@ -403,6 +403,12 @@ pub fn check_idea(data: &Value, origin: IdeaOrigin) -> Result<IdeaData, String> 
     check_idea_at(data, origin, Some(utc_today()))
 }
 
+/// [`check_idea`] без проверки даты `horizon` (только структура): повтор по `Idempotency-Key`
+/// после полуночи UTC — та же запись, а ошибки структуры — те же, что у первого запроса.
+pub fn check_idea_shape(data: &Value, origin: IdeaOrigin) -> Result<IdeaData, String> {
+    check_idea_at(data, origin, None)
+}
+
 /// [`check_idea`] с датой проверки `horizon` (`None` — без проверки даты).
 fn check_idea_at(
     data: &Value,
@@ -520,6 +526,10 @@ pub struct NewDecision {
     pub request_solution: Option<Id>,
     /// `horizon` отсрочки по умолчанию, дней.
     pub defer_days: u32,
+    /// Происхождение идеи, по которому вызывающий проверил права «кто решает»; другое в
+    /// транзакции — [`IdeaError::OriginChanged`] (идею приняли как свою между чтением и
+    /// записью). `None` — без сверки.
+    pub expected_origin: Option<IdeaOrigin>,
 }
 
 /// Итог `decide`: идея, задача `accept` и вопрос-предложение, отвеченный этим решением.
@@ -561,6 +571,9 @@ pub enum IdeaError {
     /// Идея удалена (ответ на её вопрос-предложение): 409.
     #[error("идея удалена")]
     IdeaDeleted,
+    /// Происхождение идеи изменилось после проверки прав вызывающим: 409.
+    #[error("происхождение идеи изменилось (принята как своя) — перечитайте её и повторите")]
+    OriginChanged,
     /// Вопрос — не действующее предложение идеи (у неё другой `question_id`): 409.
     #[error("предложение устарело: у идеи другой вопрос-предложение или его нет")]
     StaleProposal,
@@ -864,6 +877,9 @@ pub(crate) fn apply_decision_tx(
     now: &str,
 ) -> Result<Result<(Entry, Option<Entry>), IdeaError>, StoreError> {
     let mut data = IdeaData::from_stored(&idea.data);
+    if d.expected_origin.is_some_and(|o| o != data.origin) {
+        return Ok(Err(IdeaError::OriginChanged));
+    }
     let cur = idea.status.unwrap_or(EntryStatus::New);
     let task = if matches!(cur, EntryStatus::Accepted | EntryStatus::Done) {
         task_state(tx, &data)?
