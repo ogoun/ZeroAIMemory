@@ -1,5 +1,6 @@
 //! Настройки пользователя на сервере (§10.3 «Настройки», решение контроллера R5, задача 13 M4):
-//! переключатели типов подсказок хуков `hooks.<тип>`.
+//! переключатели типов подсказок хуков `hooks.<тип>` и с M5.7 (§8) выключатель проактивности
+//! идей `ideas.proactive`.
 //!
 //! - Хранение — `system.db`, таблица `user_settings` (миграция 0007): настройка — часть учётной
 //!   записи, как пароль и токены, а не память; читается без открытия базы пользователя
@@ -7,13 +8,14 @@
 //! - Ключи — `hooks.session_start | hooks.prompt | hooks.pre_tool | hooks.post_tool |
 //!   hooks.checkpoint` и с M4.5 (§9.6) `hooks.subagent_start | hooks.file_context |
 //!   hooks.session_journal | hooks.recovery`, с M5.6 (§10) `hooks.code_map`, значение — `bool`;
-//!   нет строки — `true` (новые ключи у старых пользователей включены).
+//!   нет строки — `true` (новые ключи у старых пользователей включены); `ideas.proactive` —
+//!   `bool`, нет строки — `true`, действует вместе с `[ideas] proactive` сервера.
 //! - `GET/PATCH /auth/settings` — свои (сессия пользователя; администратор — своего
 //!   пользователя); по токену — 403: агент свои подсказки не выключает.
 //!   `GET/PATCH /admin/users/{id}/settings` — администратор, любой пользователь.
-//! - `PATCH {hooks: {<тип>: bool, …}}`: неизвестный тип или поле — 400, пустая правка — 400.
-//!   Ответ — все настройки `{hooks: {…}}`. Аудит `user.settings.update {key, from, to}` на
-//!   каждое изменение.
+//! - `PATCH {hooks?: {<тип>: bool, …}, ideas?: {proactive: bool}}`: неизвестный тип или поле —
+//!   400, пустая правка — 400. Ответ — все настройки `{hooks: {…}, ideas: {proactive}}`. Аудит
+//!   `user.settings.update {key, from, to}` на каждое изменение.
 //! - Сервер отдаёт их в `/recall(session_start)` полем `hooks`; выключенный тип `/recall`
 //!   (`session_start`, `prompt`, `post_tool`) отвечает пустым `text` и показ не учитывает (N4).
 
@@ -49,6 +51,8 @@ pub const HOOK_KINDS: [&str; 10] = [
 
 /// Префикс ключей переключателей в `user_settings`.
 const HOOKS_PREFIX: &str = "hooks.";
+/// Ключ выключателя проактивности идей (M5.7 §8).
+pub const IDEAS_PROACTIVE: &str = "ideas.proactive";
 
 /// Переключатели типов подсказок пользователя (по умолчанию все включены).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,23 +97,82 @@ pub async fn hook_flags(sys: &SystemStore, user: Id) -> Result<HookFlags, zam_st
     Ok(f)
 }
 
+/// Проактивность идей пользователя (`ideas.proactive`); нет строки или значение нечитаемо —
+/// `true`.
+pub async fn ideas_proactive(sys: &SystemStore, user: Id) -> Result<bool, ApiError> {
+    Ok(sys
+        .user_settings(user)
+        .await?
+        .into_iter()
+        .find(|(k, _)| k == IDEAS_PROACTIVE)
+        .and_then(|(_, v)| v.as_bool())
+        .unwrap_or(true))
+}
+
+/// Действующие значения всех настроек пользователя (нет строки — `true`).
+struct Current {
+    hooks: HookFlags,
+    ideas_proactive: bool,
+}
+
+impl Current {
+    async fn load(sys: &SystemStore, user: Id) -> Result<Current, ApiError> {
+        Ok(Current {
+            hooks: hook_flags(sys, user).await?,
+            ideas_proactive: ideas_proactive(sys, user).await?,
+        })
+    }
+
+    /// Значение по ключу `user_settings`.
+    fn value(&self, key: &str) -> bool {
+        if key == IDEAS_PROACTIVE {
+            return self.ideas_proactive;
+        }
+        self.hooks
+            .enabled(key.strip_prefix(HOOKS_PREFIX).unwrap_or(key))
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "hooks": self.hooks.to_json(),
+            "ideas": {"proactive": self.ideas_proactive},
+        })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsPatch {
     hooks: Option<Map<String, Value>>,
+    ideas: Option<IdeasPatch>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdeasPatch {
+    proactive: Option<Value>,
 }
 
 /// Правки из тела `PATCH`: `(ключ, значение)`.
 fn parse_patch(body: &Bytes) -> Result<Vec<(String, Value)>, ApiError> {
     let req: SettingsPatch = parse_body(body)?;
     let hooks = req.hooks.unwrap_or_default();
-    if hooks.is_empty() {
+    let ideas = req.ideas.and_then(|i| i.proactive);
+    if hooks.is_empty() && ideas.is_none() {
         return Err(ApiError::BadRequest(format!(
-            "нужно поле hooks: {{{}: bool}}",
+            "нужно поле hooks: {{{}: bool}} или ideas: {{proactive: bool}}",
             HOOK_KINDS.join("|")
         )));
     }
-    let mut out = Vec::with_capacity(hooks.len());
+    let mut out = Vec::with_capacity(hooks.len() + 1);
+    if let Some(v) = ideas {
+        let Value::Bool(b) = v else {
+            return Err(ApiError::BadRequest(
+                "ideas.proactive: true или false".into(),
+            ));
+        };
+        out.push((IDEAS_PROACTIVE.to_string(), Value::Bool(b)));
+    }
     for (k, v) in hooks {
         if !HOOK_KINDS.contains(&k.as_str()) {
             return Err(ApiError::BadRequest(format!(
@@ -126,7 +189,7 @@ fn parse_patch(body: &Bytes) -> Result<Vec<(String, Value)>, ApiError> {
 }
 
 async fn settings_json(st: &AppState, user: Id) -> Result<Value, ApiError> {
-    Ok(json!({ "hooks": hook_flags(&st.system, user).await?.to_json() }))
+    Ok(Current::load(&st.system, user).await?.to_json())
 }
 
 /// Сохраняет правки и пишет аудит каждого изменения. Правка сравнивается с действующим
@@ -139,18 +202,14 @@ async fn apply(
     body: &Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let edits = parse_patch(body)?;
-    let current = hook_flags(&st.system, user).await?;
+    let current = Current::load(&st.system, user).await?;
     let edits: Vec<(String, Value)> = edits
         .into_iter()
-        .filter(|(key, v)| {
-            let kind = key.strip_prefix(HOOKS_PREFIX).unwrap_or(key);
-            v.as_bool() != Some(current.enabled(kind))
-        })
+        .filter(|(key, v)| v.as_bool() != Some(current.value(key)))
         .collect();
     if !edits.is_empty() {
         let changed = st.system.set_user_settings(user, edits.clone()).await?;
         for (key, _) in changed {
-            let kind = key.strip_prefix(HOOKS_PREFIX).unwrap_or(&key);
             let to = edits
                 .iter()
                 .find(|(k, _)| *k == key)
@@ -163,7 +222,7 @@ async fn apply(
                     "user.settings.update",
                     Some(&user.to_string()),
                     Some(ip),
-                    json!({ "key": key, "from": current.enabled(kind), "to": to }),
+                    json!({ "key": key, "from": current.value(&key), "to": to }),
                 )
                 .await?;
         }
@@ -184,13 +243,13 @@ fn own_user(st: &AppState, p: &Principal) -> Result<Id, ApiError> {
     }
 }
 
-/// `GET /auth/settings` → `{hooks: {…}}`.
+/// `GET /auth/settings` → `{hooks: {…}, ideas: {proactive}}`.
 pub async fn get_own(State(st): State<AppState>, p: Principal) -> Result<Json<Value>, ApiError> {
     let user = own_user(&st, &p)?;
     Ok(Json(settings_json(&st, user).await?))
 }
 
-/// `PATCH /auth/settings {hooks: {<тип>: bool}}` → `{hooks: {…}}`.
+/// `PATCH /auth/settings {hooks?: {<тип>: bool}, ideas?: {proactive}}` → все настройки.
 pub async fn patch_own(
     State(st): State<AppState>,
     client: Client,
@@ -207,7 +266,7 @@ async fn existing_user(st: &AppState, id: &str) -> Result<Id, ApiError> {
     Ok(id)
 }
 
-/// `GET /admin/users/{id}/settings` → `{hooks: {…}}`.
+/// `GET /admin/users/{id}/settings` → `{hooks: {…}, ideas: {proactive}}`.
 pub async fn get_user(
     _: AdminOnly,
     State(st): State<AppState>,
@@ -217,7 +276,7 @@ pub async fn get_user(
     Ok(Json(settings_json(&st, user).await?))
 }
 
-/// `PATCH /admin/users/{id}/settings {hooks: {<тип>: bool}}` → `{hooks: {…}}`.
+/// `PATCH /admin/users/{id}/settings` — как `PATCH /auth/settings`, любой пользователь.
 pub async fn patch_user(
     _: AdminOnly,
     State(st): State<AppState>,
@@ -247,6 +306,21 @@ mod tests {
     }
 
     #[test]
+    fn patch_ideas_proactive() {
+        let ok = parse_patch(&Bytes::from_static(
+            br#"{"ideas":{"proactive":false},"hooks":{"prompt":true}}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            ok,
+            vec![
+                (IDEAS_PROACTIVE.to_string(), Value::Bool(false)),
+                ("hooks.prompt".to_string(), Value::Bool(true)),
+            ]
+        );
+    }
+
+    #[test]
     fn patch_validation() {
         let ok = parse_patch(&Bytes::from_static(br#"{"hooks":{"prompt":false}}"#)).unwrap();
         assert_eq!(ok, vec![("hooks.prompt".to_string(), Value::Bool(false))]);
@@ -261,6 +335,9 @@ mod tests {
             r#"{"hooks":{"stop":false}}"#,
             r#"{"hooks":{"prompt":"no"}}"#,
             r#"{"other":1}"#,
+            r#"{"ideas":{}}"#,
+            r#"{"ideas":{"proactive":1}}"#,
+            r#"{"ideas":{"digest":false}}"#,
         ] {
             assert!(parse_patch(&Bytes::from(bad.to_string())).is_err(), "{bad}");
         }

@@ -125,6 +125,9 @@ const ENTRY_KINDS: [&str; 6] = [
 /// включает, агенту отчёты не выдаются (спецификация M5.5 §7; вид в фильтре токена отсекает
 /// сервер).
 const REPORT_KIND: &str = "report";
+/// Идея (M5.7 §4) — тоже только по явному виду в `kinds`: пустой список видов её не включает,
+/// поэтому поиски без видов (подсказки `/recall`) идей не получают.
+const IDEA_KIND: &str = "idea";
 
 /// Параметры SQL фильтра целей.
 struct TargetArgs {
@@ -155,10 +158,9 @@ impl TargetFilter {
             .into_iter()
             .filter(|k| all || self.kinds.iter().any(|x| x == k))
             .chain(
-                self.kinds
-                    .iter()
-                    .any(|k| k == REPORT_KIND)
-                    .then_some(REPORT_KIND),
+                [REPORT_KIND, IDEA_KIND]
+                    .into_iter()
+                    .filter(|x| self.kinds.iter().any(|k| k == x)),
             )
             .collect();
         TargetArgs {

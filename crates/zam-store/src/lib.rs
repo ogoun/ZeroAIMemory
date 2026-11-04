@@ -99,11 +99,11 @@ pub use glossary::{
 };
 pub use graph::{
     EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,
-    GraphNode, GraphStore, NewEdge, get_edge, graph_node, graph_nodes,
+    GraphNode, GraphStore, IDEA_DERIVED_FROM_DENIED, NewEdge, get_edge, graph_node, graph_nodes,
 };
 pub use ideas::{
     Decided, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS, IDEA_LINKS_MAX, IDEA_OPTIONS,
-    IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewDecision,
+    IDEA_ORIGIN_REQUIRED, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewDecision,
     PROPOSE_TEXT_MAX_CHARS, TaskState, adopt_idea, check_idea, check_idea_transition, decide_idea,
     idea_candidate, proactive_ideas, propose_idea,
 };

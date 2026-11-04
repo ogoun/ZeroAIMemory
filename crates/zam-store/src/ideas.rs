@@ -228,7 +228,7 @@ const SERVER_KEYS: [&str; 8] = [
     "done_at",
 ];
 /// Подсказка обязательного `data.origin` (по образцу обязательного `by` ответа, §4).
-const ORIGIN_REQUIRED: &str = "data.origin: укажите human — идея человека (записана по его \
+pub const IDEA_ORIGIN_REQUIRED: &str = "data.origin: укажите human — идея человека (записана по его \
                                словам) или agent — своя";
 
 fn priority_field(v: &Value) -> Result<IdeaPriority, String> {
@@ -447,7 +447,7 @@ fn request_at(data: &Value, today: Option<Date>) -> Result<IdeaData, String> {
         .get("origin")
         .and_then(Value::as_str)
         .and_then(|s| IdeaOrigin::parse(s.trim()))
-        .ok_or_else(|| ORIGIN_REQUIRED.to_string())?;
+        .ok_or_else(|| IDEA_ORIGIN_REQUIRED.to_string())?;
     check_idea_at(data, origin, today)
 }
 

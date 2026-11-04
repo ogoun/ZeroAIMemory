@@ -63,6 +63,11 @@ pub const GRAPH_MAX_NODES: usize = 500;
 /// Предел рёбер подграфа (по порядку создания) — сверх него `truncated`.
 pub const GRAPH_MAX_EDGES: usize = 2000;
 
+/// Отказ клиентскому `derived_from` с целью-идеей (M5.7 §4): текст `BadInput`, сервер отдаёт его
+/// с 422.
+pub const IDEA_DERIVED_FROM_DENIED: &str =
+    "связь задачи с идеей создаёт только «начать» (decide accept)";
+
 /// Тип связи (§8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -718,9 +723,7 @@ fn add_checked(
     let src = end(e.src)?;
     let dst = end(e.dst)?;
     if origin == EdgeOrigin::Explicit && e.kind == EdgeType::DerivedFrom && dst.idea {
-        return Err(StoreError::BadInput(
-            "связь задачи с идеей создаёт только «начать» (decide accept)".into(),
-        ));
+        return Err(StoreError::BadInput(IDEA_DERIVED_FROM_DENIED.into()));
     }
     // ребро по матрице certainty: с M4 от axiom — любому автору (§7.5, §8.5)
     check_certainty(

@@ -646,3 +646,155 @@ async fn insight_kinds_filter() {
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
+
+/// Идея Knowledge токеном администратора (M5.7).
+async fn idea(a: &Api, title: &str) -> String {
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(
+                json!({"kind": "idea", "title": title, "body": "Замысел: гиперкуб в отчётах.",
+                        "data": {"origin": "human"}}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    r.json()["id"].as_str().unwrap().to_string()
+}
+
+/// Виды элементов выдачи.
+fn kinds(j: &Value) -> Vec<String> {
+    j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["kind"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// M5.7 §4: у токена идеи — только явным `filters.kinds` (как task); статусы по умолчанию —
+/// `new, proposed, deferred, accepted`.
+#[tokio::test]
+async fn search_token_idea_only_explicit_kinds() {
+    let a = api("search-idea-token", |_| {}).await;
+    let id = idea(&a, "Гиперкуб отчётов").await;
+    let r = search(&a, json!({"query": "гиперкуб"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains(&id), "без kinds идей нет: {}", r.text());
+    let r = search(
+        &a,
+        json!({"query": "гиперкуб", "filters": {"kinds": ["idea"]}}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert!(r.text().contains(&id), "{j}");
+    assert_eq!(kinds(&j), ["idea"], "{j}");
+    // отказ по умолчанию не находится, явным статусом — находится
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/entries/{id}/decide"),
+            Some(json!({"decision": "decline", "by": "human"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = search(
+        &a,
+        json!({"query": "гиперкуб", "filters": {"kinds": ["idea"]}}),
+    )
+    .await;
+    assert!(!r.text().contains(&id), "{}", r.text());
+    let r = search(
+        &a,
+        json!({"query": "гиперкуб", "filters": {"kinds": ["idea"], "status": ["declined"]}}),
+    )
+    .await;
+    assert!(r.text().contains(&id), "{}", r.text());
+}
+
+/// Ctrl+K WebUI находит идею умолчаниями видов.
+#[tokio::test]
+async fn search_webui_default_finds_idea() {
+    let a = api("search-idea-webui", |_| {}).await;
+    let id = idea(&a, "Гиперкуб для WebUI").await;
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "гиперкуб"})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains(&id), "{}", r.text());
+    assert!(kinds(&r.json()).contains(&"idea".to_string()));
+}
+
+/// Ключ кэша выжимок при умолчаниях M5.6 — как до этапа (I9, Review Focus 5): вид `idea` и
+/// статусы идей в ключ не входят ни у токена, ни у WebUI (у WebUI `idea` — в умолчаниях).
+#[tokio::test]
+async fn scope_key_ignores_idea_kind_and_statuses() {
+    let a = api("search-idea-scope", |_| {}).await;
+    corpus(&a).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(
+                json!({"kind": "insight", "title": "Источник выжимки", "body": "Вывод.",
+                        "data": {"kind": "discovery"}}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let src = r.json()["id"].as_str().unwrap().to_string();
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/cache",
+            Some(
+                json!({"query": "итог", "summary": "Кратко.", "solution": GUID,
+                        "sources": [{"id": format!("i:{src}")}]}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let cid = r.json()["id"].as_str().unwrap().to_string();
+    // фикстура — ключ M5.6 (до вида idea)
+    let want = zam_store::scope_hash(&json!({
+        "solution": GUID,
+        "include_knowledge": true,
+        "include_rules": true,
+        "path_prefix": null,
+        "area": null,
+        "filters": {
+            "kinds": ["attachment", "changelog", "insight", "note", "question", "release", "term"],
+            "status": ["active", "answered", "revisit"],
+            "certainty": [],
+        },
+    }));
+    let raw = cid.strip_prefix("c_").unwrap_or(&cid).to_string();
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let got: String = db
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT scope_hash FROM answer_cache WHERE id = ?1",
+                [&raw],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(got, want);
+    // выжимку находит и агент, и поиск WebUI с умолчаниями (там есть idea и report)
+    let body = json!({"query": "итог", "scope": {"solution": GUID}});
+    let r = search(&a, body.clone()).await;
+    assert!(r.text().contains(&cid), "агент: {}", r.text());
+    let r = a
+        .adm(Method::POST, "/api/v1/search", Some(body), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains(&cid), "WebUI: {}", r.text());
+}
