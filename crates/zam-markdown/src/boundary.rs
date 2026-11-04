@@ -155,7 +155,11 @@ const STOP_WORDS: &str = concat!(
 /// Служебное ли слово (ru/en, в нижнем регистре) — общий стоп-список границ разделов и
 /// подтверждения подсказок-идей сервера.
 pub fn is_stop_word(w: &str) -> bool {
-    STOP_WORDS.split_whitespace().any(|s| s == w)
+    // множество строится один раз: линейный разбор строки на каждом слове стоил подсказкам-идеям
+    // сервера ~3 мс на `prompt` в отладочной сборке
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| STOP_WORDS.split_whitespace().collect())
+        .contains(w)
 }
 
 fn stemmer(cyrillic: bool) -> &'static Stemmer {

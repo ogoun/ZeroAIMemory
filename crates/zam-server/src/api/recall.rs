@@ -1019,13 +1019,13 @@ async fn any_prompt_candidates(
 /// отдельного поиска только по идеям нормирован по непустым каналам, и без порога вектора
 /// ближайшая идея получала бы 1,0 на любой запрос. Нужны канал `fts`, `alias` или `trigram` в
 /// `sources` и совпадение слов запроса со словами идеи по основам ([`idea_words_match`]).
-fn idea_lexically_matched(item: &Value, e: &Entry, terms: &[String]) -> bool {
+fn idea_lexically_matched(item: &Value, e: &Entry, q: &IdeaQuery) -> bool {
     let lexical = item["sources"]
         .as_array()
         .into_iter()
         .flatten()
         .any(|s| matches!(s.as_str(), Some("fts" | "alias" | "trigram")));
-    lexical && idea_words_match(terms, &e.title, &e.body)
+    lexical && q.matches(&e.title, &e.body)
 }
 
 /// Значимых слов идеи в пороге [`idea_words_match`], не больше: длинное тело не делает порог
@@ -1072,11 +1072,9 @@ fn idea_stem(w: &str) -> String {
 /// короче [`STEM_MIN_CHARS`] — только точное совпадение. Ложные совпадения длинных слов с общим
 /// началом («план» ~ «планета») допускаются сознательно: это подтверждение к вектору и FTS, а
 /// не самостоятельный поиск.
+#[cfg(test)]
 fn idea_stem_match(a: &str, b: &str) -> bool {
-    if a.chars().count() < STEM_MIN_CHARS || b.chars().count() < STEM_MIN_CHARS {
-        return a == b;
-    }
-    b.starts_with(&idea_stem(a)) || a.starts_with(&idea_stem(b))
+    StemWord::new(a.to_string()).matches(&StemWord::new(b.to_string()))
 }
 
 /// Слова запроса `terms` ([`error_terms`]) подтверждаются заголовком `title` и телом `body`
@@ -1088,30 +1086,75 @@ fn idea_stem_match(a: &str, b: &str) -> bool {
 /// [`IDEA_WORDS_CAP`]). Порог ограничен словами самой идеи: к длинному запросу Claude Code
 /// короткая идея иначе не подходила бы никогда. Только для подсказок-идей; общий
 /// [`term_coverage`] у `post_tool` прежний.
+#[cfg(test)]
 fn idea_words_match(terms: &[String], title: &str, body: &str) -> bool {
-    let q = idea_terms(terms);
-    if q.is_empty() {
-        return false;
+    IdeaQuery::new(terms).matches(title, body)
+}
+
+/// Слово с готовой основой для [`idea_stem_match`] без повторных аллокаций на каждой паре.
+struct StemWord {
+    word: String,
+    stem: String,
+    short: bool,
+}
+
+impl StemWord {
+    fn new(word: String) -> StemWord {
+        let short = word.chars().count() < STEM_MIN_CHARS;
+        let stem = if short {
+            word.clone()
+        } else {
+            idea_stem(&word)
+        };
+        StemWord { word, stem, short }
     }
-    let title_words = idea_terms(&error_terms(title));
-    if !q
-        .iter()
-        .any(|t| title_words.iter().any(|w| idea_stem_match(t, w)))
-    {
-        return false;
+
+    /// То же правило, что [`idea_stem_match`].
+    fn matches(&self, o: &StemWord) -> bool {
+        if self.short || o.short {
+            return self.word == o.word;
+        }
+        o.word.starts_with(&self.stem) || self.word.starts_with(&o.stem)
     }
-    let words = idea_terms(&error_terms(&format!("{title}\n{body}")));
-    let covered = q
-        .iter()
-        .filter(|t| words.iter().any(|w| idea_stem_match(t, w)))
-        .count();
-    if covered == q.len() {
-        return true;
+}
+
+/// Значимые слова с основами ([`idea_terms`]).
+fn stem_words(terms: &[String]) -> Vec<StemWord> {
+    idea_terms(terms).into_iter().map(StemWord::new).collect()
+}
+
+/// Слова запроса подсказки-идеи, подготовленные один раз на запрос (перф: раньше стоп-список,
+/// нормализация и основы запроса пересчитывались на каждого кандидата).
+struct IdeaQuery(Vec<StemWord>);
+
+impl IdeaQuery {
+    fn new(terms: &[String]) -> IdeaQuery {
+        IdeaQuery(stem_words(terms))
     }
-    let n = q.len();
-    let query_need = n.div_ceil(3).clamp(2, 4).min(n);
-    let k = words.len().min(IDEA_WORDS_CAP);
-    covered >= query_need.min(k.div_ceil(2).max(1))
+
+    /// Правило [`idea_words_match`] для заголовка `title` и тела `body` идеи.
+    fn matches(&self, title: &str, body: &str) -> bool {
+        let q = &self.0;
+        if q.is_empty() {
+            return false;
+        }
+        let title_words = stem_words(&error_terms(title));
+        if !q.iter().any(|t| title_words.iter().any(|w| t.matches(w))) {
+            return false;
+        }
+        let words = stem_words(&error_terms(&format!("{title}\n{body}")));
+        let covered = q
+            .iter()
+            .filter(|t| words.iter().any(|w| t.matches(w)))
+            .count();
+        if covered == q.len() {
+            return true;
+        }
+        let n = q.len();
+        let query_need = n.div_ceil(3).clamp(2, 4).min(n);
+        let k = words.len().min(IDEA_WORDS_CAP);
+        covered >= query_need.min(k.div_ceil(2).max(1))
+    }
 }
 
 /// Идея подсказки: (цель, идея, общая из Knowledge, пометка «задача снята»).
@@ -1186,7 +1229,7 @@ async fn released_prompt_ideas(
     d: &mut Deadline,
     want: usize,
 ) -> Vec<Cand> {
-    let terms = error_terms(query);
+    let iq = IdeaQuery::new(&error_terms(query));
     let today = zam_store::time::utc_today();
     #[cfg(feature = "test-hooks")]
     if let Ok(mut runs) = TEST_SECOND_PASS_QUERIES.lock() {
@@ -1292,7 +1335,7 @@ async fn released_prompt_ideas(
                 }
             };
             // строгий FTS (все слова запроса) проходит сразу; ослабленный — по основам слов
-            if ch.relaxed && !idea_words_match(&terms, &e.title, &e.body) {
+            if ch.relaxed && !iq.matches(&e.title, &e.body) {
                 continue;
             }
             let shared = t
@@ -1371,7 +1414,7 @@ async fn search_prompt_ideas(
     };
     let min = st.cfg.recall.prompt_min_score;
     let today = zam_store::time::utc_today();
-    let terms = error_terms(query);
+    let iq = IdeaQuery::new(&error_terms(query));
     let targets = health.targets();
     let mut found: Vec<FoundIdea> = Vec::new();
     for it in v["items"].as_array().into_iter().flatten() {
@@ -1414,7 +1457,7 @@ async fn search_prompt_ideas(
                 continue;
             }
         };
-        if !shared && !idea_lexically_matched(it, &e, &terms) {
+        if !shared && !idea_lexically_matched(it, &e, &iq) {
             continue;
         }
         // у `accepted` — состояние задачи (§16): кандидат, только если она снята или удалена
