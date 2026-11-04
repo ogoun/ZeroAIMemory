@@ -733,25 +733,45 @@ fn task_state(c: &Connection, d: &IdeaData) -> Result<Option<TaskState>, StoreEr
     }))
 }
 
-/// Есть ли в пространствах `spaces` живая идея человека `accepted` со снятой или удалённой
-/// задачей (кандидат §16 без учёта показа и открытого вопроса; один SQL `LIMIT 1`). Нужна,
-/// чтобы второй проход поиска подсказки (`status: accepted`) шёл, только когда есть что искать
-/// (ревью задачи 7, I1).
-pub async fn any_released_idea(db: &Db, spaces: &[Id]) -> Result<bool, StoreError> {
-    if spaces.is_empty() {
-        return Ok(false);
+/// Id живых идей человека `accepted` со снятой или удалённой задачей и без открытого вопроса
+/// «вернуть» в пространствах `spaces`, кроме `exclude` (показанное сессии): новые первыми, не
+/// больше `limit`. Второй проход подсказки к `prompt` (ревью задачи 7, I1′) — без поиска по
+/// всем принятым идеям.
+pub async fn released_ideas(
+    db: &Db,
+    spaces: &[Id],
+    exclude: &[Id],
+    limit: usize,
+) -> Result<Vec<Id>, StoreError> {
+    if spaces.is_empty() || limit == 0 {
+        return Ok(Vec::new());
     }
     let args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+    let exclude: HashSet<Id> = exclude.iter().copied().collect();
+    // в выдаче SQL не больше `exclude` лишних: их отсекает фильтр ниже
+    let fetch = limit.saturating_add(exclude.len());
     db.read(move |c| {
         let mut st = c.prepare(&format!(
-            "SELECT 1 FROM entries e
+            "SELECT e.id FROM entries e
              WHERE e.space_id IN ({}) AND e.kind = 'idea' AND e.deleted_at IS NULL
                AND e.status = 'accepted' AND json_extract(e.data, '$.origin') = 'human'
                AND {RELEASED_SQL} AND {NOT_REOPEN_PROPOSED_SQL}
-             LIMIT 1",
+             ORDER BY e.updated_at DESC, e.id DESC
+             LIMIT {fetch}",
             in_list(args.len())
         ))?;
-        Ok(st.exists(params_from_iter(args))?)
+        let ids = st.query_map(params_from_iter(args), |r| r.get::<_, Id>(0))?;
+        let mut out = Vec::new();
+        for id in ids {
+            let id = id?;
+            if !exclude.contains(&id) {
+                out.push(id);
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     })
     .await
 }

@@ -1083,3 +1083,46 @@ async fn prompt_live_accepted_does_not_crowd_new_idea() {
     let j = prompt(&a, "s2", "импорт заметок Obsidian").await;
     assert_eq!(idea_items(&j), [format!("w:{rel}")], "{j}");
 }
+
+/// Ревью задачи 7, I1′ (а): первый проход уже дал `prompt_max` непоказанных — второй проход
+/// (принятые со снятой задачей) не выполняется; когда новая идея показана, он идёт.
+#[tokio::test]
+async fn prompt_second_pass_skipped_when_first_full() {
+    let a = server("second-skip", |_| {}).await;
+    let (_, task) = accepted(&a, "Импорт заметок Obsidian", json!({})).await;
+    drop_task(&a, &task).await;
+    let fresh = idea(&a, &sol(), "Экспорт отчётов в PDF архивом", json!({})).await;
+    let q = "экспорт отчётов в PDF архивом";
+    let ran = || {
+        zam_server::api::recall::TEST_SECOND_PASS_QUERIES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|x| x.as_str() == q)
+            .count()
+    };
+    let j = prompt(&a, "s1", q).await;
+    assert_eq!(idea_items(&j), [format!("w:{fresh}")], "{j}");
+    assert_eq!(ran(), 0, "второй проход не нужен");
+    // новая показана — второй проход идёт (и ничего не находит: снятая идея не про это)
+    let j = prompt(&a, "s1", q).await;
+    assert!(idea_items(&j).is_empty(), "{j}");
+    assert_eq!(ran(), 1);
+}
+
+/// Ревью задачи 7, I1′ (в): просрочка второго прохода не гасит новую идею первого.
+#[tokio::test]
+async fn prompt_second_pass_timeout_keeps_first() {
+    let a = api("ideas-recall-second-timeout", |c| {
+        c.recall.timeout_ms = 3000;
+        c.ideas.prompt_max = 2;
+    })
+    .await;
+    register(&a, &a.token).await;
+    let mark = zam_server::api::recall::TEST_SLOW_IDEA_MARK;
+    let fresh = idea(&a, &sol(), "Экспорт отчётов в PDF", json!({})).await;
+    let (_, task) = accepted(&a, &format!("Экспорт отчётов в PDF {mark}"), json!({})).await;
+    drop_task(&a, &task).await;
+    let j = prompt(&a, "s1", "экспорт отчётов в PDF").await;
+    assert_eq!(idea_items(&j), [format!("w:{fresh}")], "{j}");
+}

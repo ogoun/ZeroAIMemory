@@ -2362,12 +2362,34 @@ async fn proactive_limit_skips_reopen_proposed_in_sql() {
         .await
         .unwrap();
     assert_eq!(got.iter().map(|e| e.id).collect::<Vec<_>>(), [older.id]);
-    assert!(zam_store::any_released_idea(&db, &[sol]).await.unwrap());
-    // единственная снятая — с открытым вопросом: SQL-проверка второго прохода подсказки — нет
+    assert_eq!(
+        zam_store::released_ideas(&db, &[sol], &[], 5)
+            .await
+            .unwrap(),
+        [older.id]
+    );
+    // показанное сессии исключается
+    assert!(
+        zam_store::released_ideas(&db, &[sol], &[older.id], 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // единственная снятая — с открытым вопросом: второму проходу подсказки нечего искать
     let (db2, sol2, _) = setup("reopen-limit-2").await;
     reopen_proposed(&db2, sol2, "Только с вопросом").await;
-    assert!(!zam_store::any_released_idea(&db2, &[sol2]).await.unwrap());
-    assert!(!zam_store::any_released_idea(&db2, &[]).await.unwrap());
+    assert!(
+        zam_store::released_ideas(&db2, &[sol2], &[], 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        zam_store::released_ideas(&db2, &[], &[], 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Ревью задачи 7, M1: идея принята ответом на вопрос «начать» (`question_id` — отвеченный
