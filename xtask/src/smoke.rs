@@ -921,7 +921,7 @@ pub fn run(
         code_map_check(&zam, &dir, &base, &token),
     )?;
     s.run(
-        "M5.7: zam idea new --origin human → hook session-start с w: → zam idea accept --by human          → zam task list",
+        "M5.7: zam idea new --origin human → hook session-start с w: → zam idea accept --by human → zam task list",
         idea_flow(&zam, &dir, &base, &token),
     )?;
     let with_log = |e: anyhow::Error, srv: &Server| {

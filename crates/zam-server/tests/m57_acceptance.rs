@@ -439,6 +439,9 @@ async fn acceptance_prompt_hint_rules() {
     let j = prompt(&a, "p1", p).await;
     assert!(idea_items(&j).is_empty(), "{j}");
     // показанная дайджестом идея в prompt той же сессии не приходит
+    // положительный контроль: в чистой сессии тот же запрос подсказывает эту идею
+    let j = prompt(&a, "p2c", "dark theme for the web interface").await;
+    assert_eq!(idea_items(&j), [w(&dark)], "{j}");
     let d = start(&a, "p2").await;
     assert!(idea_items(&d).contains(&w(&dark)), "{d}");
     let j = prompt(&a, "p2", "dark theme for the web interface").await;
@@ -1451,8 +1454,26 @@ fn new_entry(space: Id, kind: EntryKind, title: &str, data: Value) -> NewEntry {
 /// Объект `sqlite_master`: тип, имя, нормализованный SQL.
 type Obj = (String, String, String);
 
-/// Объекты `sqlite_master` и строки `entries` (id, вид, статус, `data`, ревизия).
-fn schema_and_rows(c: &rusqlite::Connection) -> rusqlite::Result<(Vec<Obj>, Vec<String>)> {
+/// Снимок базы: объекты `sqlite_master`, строки `entries` (id, вид, статус, `data`, ревизия) и
+/// строки связанных таблиц (`entry_revisions`, `entry_attachments`, `spaces`) целиком.
+type Snapshot = (Vec<Obj>, Vec<String>, Vec<String>);
+
+/// Строки `entry_revisions`, `entry_attachments` и `spaces` с префиксом таблицы.
+const RELATED_ROWS: &str = "
+    SELECT 'rev ' || entry_id || ' ' || rev || ' ' || title || ' ' || coalesce(body, '') || ' ' ||
+           coalesce(data, '') || ' ' || coalesce(tags, '') || ' ' || coalesce(status, '-') || ' ' ||
+           coalesce(certainty, '-') || ' ' || ts || ' ' || author_kind
+    FROM entry_revisions
+    UNION ALL
+    SELECT 'att ' || entry_id || ' ' || blob_sha256 || ' ' || filename || ' ' || mime || ' ' ||
+           size || ' ' || created_at
+    FROM entry_attachments
+    UNION ALL
+    SELECT 'space ' || id || ' ' || kind || ' ' || coalesce(solution_guid, '-') || ' ' || name
+    FROM spaces
+    ORDER BY 1";
+
+fn schema_and_rows(c: &rusqlite::Connection) -> rusqlite::Result<Snapshot> {
     let mut st =
         c.prepare("SELECT type, name, coalesce(sql, '') FROM sqlite_master ORDER BY type, name")?;
     let objs = st
@@ -1470,7 +1491,9 @@ fn schema_and_rows(c: &rusqlite::Connection) -> rusqlite::Result<(Vec<Obj>, Vec<
                 current_rev FROM entries ORDER BY id",
     )?;
     let rows = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-    Ok((objs, rows))
+    let mut st = c.prepare(RELATED_ROWS)?;
+    let related = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok((objs, rows, related))
 }
 
 /// Ошибка прямого SQL — срабатывание триггера отчёта.
@@ -1580,6 +1603,14 @@ async fn acceptance_migration_from_m56_db() {
             .unwrap();
     }
     assert_eq!(before.1.len(), 7, "{:?}", before.1);
+    // ревизии (по одной на запись), файл отчёта, четыре пространства
+    let count = |p: &str| before.2.iter().filter(|r| r.starts_with(p)).count();
+    assert_eq!(
+        (count("rev "), count("att "), count("space ")),
+        (7, 1, 4),
+        "{:?}",
+        before.2
+    );
     let u = a.st.system.create_user("Мира", false).await.unwrap();
     let (_, tok) =
         a.st.system
@@ -1617,6 +1648,10 @@ async fn acceptance_migration_from_m56_db() {
     assert!(version >= 24);
     assert_eq!(violations, 0, "foreign_key_check не пуст");
     assert_eq!(after.1, before.1, "строки entries на месте");
+    assert_eq!(
+        after.2, before.2,
+        "строки entry_revisions, entry_attachments, spaces на месте"
+    );
     let is_entries = |o: &&Obj| o.0 == "table" && o.1 == "entries";
     assert_eq!(
         after
