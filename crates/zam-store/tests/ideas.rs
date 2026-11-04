@@ -19,7 +19,7 @@ use zam_store::{
     NewEntry, QuestionData, QuestionError, SpaceKind, StoreError, TaskData, TaskState, UserDbs,
     adopt_idea, answer_question, check_idea, check_idea_transition, create_entry, create_solution,
     decide_idea, delete_entry, get_entry, idea_candidate, list_entries, list_spaces,
-    proactive_ideas, propose_idea, update_entry,
+    proactive_ideas, propose_idea, restore_entry, update_entry,
 };
 
 // ---------- окружение ----------
@@ -185,11 +185,11 @@ fn idea_data_rules() {
         assert!(e.contains("data.horizon"), "{bad}: {e}");
     }
     let ok = check_idea(
-        &json!({"horizon": "2027-01-02", "links": ["a", " a ", ""], "priority": "high"}),
+        &json!({"horizon": "2099-01-02", "links": ["a", " a ", ""], "priority": "high"}),
         Human,
     )
     .unwrap();
-    assert_eq!(ok.horizon, Some(jiff::civil::date(2027, 1, 2)));
+    assert_eq!(ok.horizon, Some(jiff::civil::date(2099, 1, 2)));
     assert_eq!(ok.links, vec!["a"]);
     assert_eq!(ok.priority, IdeaPriority::High);
     let many: Vec<String> = (0..=IDEA_LINKS_MAX).map(|i| format!("l{i}")).collect();
@@ -1323,6 +1323,32 @@ async fn proactive_ideas_selection() {
         .unwrap();
     let seen_idea = new_idea(&db, sol, "Уже показана", "human", "high").await;
     let other_space = new_idea(&db, kn, "Общая", "human", "high").await;
+    let accepted = new_idea(&db, sol, "Начатая", "human", "high").await;
+    decide_idea(&db, accepted.id, nd(IdeaDecision::Accept), &human())
+        .await
+        .unwrap();
+    let done = new_idea(&db, sol, "Сделанная", "human", "high").await;
+    let done_task = decide_idea(&db, done.id, nd(IdeaDecision::Accept), &human())
+        .await
+        .unwrap()
+        .task
+        .unwrap();
+    update_entry(
+        &db,
+        done_task.id,
+        None,
+        EntryPatch {
+            status: Some(EntryStatus::Done),
+            ..EntryPatch::default()
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        get_entry(&db, done.id).await.unwrap().status,
+        Some(EntryStatus::Done)
+    );
     // наступивший horizon и порядок по updated_at — прямым SQL
     let yesterday = (today() - days(1)).to_string();
     exec(
@@ -1371,6 +1397,8 @@ async fn proactive_ideas_selection() {
         future.id,
         past.id,
         other_space.id,
+        accepted.id,
+        done.id,
     ] {
         let e = get_entry(&db, id).await.unwrap();
         let expected = ids.contains(&id) || id == other_space.id;
@@ -1509,7 +1537,7 @@ fn json_value() -> impl Strategy<Value = Value> {
         any::<bool>().prop_map(Value::from),
         any::<i64>().prop_map(Value::from),
         "[a-z0-9:-]{0,12}".prop_map(Value::from),
-        Just(Value::from("2027-01-02")),
+        Just(Value::from("2099-01-02")),
         Just(Value::from("high")),
     ];
     leaf.prop_recursive(3, 24, 4, |inner| {
@@ -1545,4 +1573,218 @@ proptest! {
         let stored = IdeaData::from_stored(&v);
         prop_assert_eq!(IdeaData::from_stored(&stored.to_value()), stored);
     }
+}
+
+// ---------- рецензия задачи 1 ----------
+
+/// I1: варианты вопроса-предложения фиксирует сервер — содержимое такого вопроса не правится;
+/// устаревание (статус с причиной) по-прежнему разрешено.
+#[tokio::test]
+async fn proposal_question_content_locked() {
+    let (db, sol, _) = setup("proposal-locked").await;
+    let i = new_idea(&db, sol, "Идея", "human", "normal").await;
+    let (_, q) = propose_idea(&db, i.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    for p in [
+        EntryPatch {
+            data: Some(json!({"options": [{"key": "accept", "text": "отказаться"}]})),
+            ..EntryPatch::default()
+        },
+        EntryPatch {
+            data: Some(json!({"recommendation": "accept"})),
+            ..EntryPatch::default()
+        },
+        EntryPatch {
+            title: Some("Начать сразу?".into()),
+            ..EntryPatch::default()
+        },
+        EntryPatch {
+            append_body: Some("ещё".into()),
+            ..EntryPatch::default()
+        },
+    ] {
+        let r = update_entry(&db, q.id, None, p, &agent()).await;
+        assert!(
+            matches!(&r, Err(StoreError::Conflict(m)) if m.contains("предложени")),
+            "{r:?}"
+        );
+    }
+    assert_eq!(snap(&get_entry(&db, q.id).await.unwrap()), snap(&q));
+    // decline из WebUI по-прежнему отвечает вопрос
+    let dec = decide_idea(&db, i.id, nd(IdeaDecision::Decline), &human())
+        .await
+        .unwrap();
+    assert_eq!(dec.question.unwrap().status, Some(EntryStatus::Answered));
+}
+
+/// I2: вопрос-предложение удалён (идея → new) и восстановлен — он устаревает при восстановлении,
+/// ответ на него ничего не создаёт.
+#[tokio::test]
+async fn restored_proposal_becomes_obsolete() {
+    let (db, sol, _) = setup("restore-proposal").await;
+    let i = new_idea(&db, sol, "Идея", "human", "normal").await;
+    let (_, q) = propose_idea(&db, i.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    delete_entry(&db, q.id, None, &human()).await.unwrap();
+    let back = restore_entry(&db, q.id, None, &human()).await.unwrap();
+    assert_eq!(back.status, Some(EntryStatus::Obsolete));
+    let idea = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(idea.status, Some(EntryStatus::New));
+    let r = answer_question(
+        &db,
+        q.id,
+        answer(Some("accept"), None, AnswerBy::Human),
+        &agent(),
+    )
+    .await;
+    assert!(matches!(r, Err(QuestionError::Obsolete)), "{r:?}");
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM entries WHERE kind = 'task'").await,
+        0
+    );
+    assert_eq!(count(&db, DECISIONS).await, 0);
+}
+
+/// I2: ответ на старый вопрос-предложение q1 (идея уже предложена вопросом q2) — 409
+/// «предложение устарело» без записи; q2 и идея прежние.
+#[tokio::test]
+async fn answer_on_stale_proposal_conflict() {
+    let (db, sol, _) = setup("stale-proposal").await;
+    let i = new_idea(&db, sol, "Идея", "human", "normal").await;
+    let (_, q1) = propose_idea(&db, i.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    update_entry(
+        &db,
+        q1.id,
+        None,
+        EntryPatch {
+            status: Some(EntryStatus::Obsolete),
+            reason: Some("неактуально".into()),
+            ..EntryPatch::default()
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let (idea, q2) = propose_idea(&db, i.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    // q1 снова открыт в обход правил — прямым SQL
+    exec(
+        &db,
+        format!("UPDATE entries SET status = 'open' WHERE id = '{}'", q1.id),
+    )
+    .await
+    .unwrap();
+    let q1 = get_entry(&db, q1.id).await.unwrap();
+    let r = answer_question(
+        &db,
+        q1.id,
+        answer(Some("accept"), None, AnswerBy::Human),
+        &agent(),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(QuestionError::Idea(IdeaError::StaleProposal))),
+        "{r:?}"
+    );
+    assert_eq!(snap(&get_entry(&db, q1.id).await.unwrap()), snap(&q1));
+    assert_eq!(snap(&get_entry(&db, q2.id).await.unwrap()), snap(&q2));
+    assert_eq!(snap(&get_entry(&db, i.id).await.unwrap()), snap(&idea));
+    assert_eq!(count(&db, DECISIONS).await, 0);
+    // ответ на действующий q2 — задача в его task_space
+    let ok = answer_question(
+        &db,
+        q2.id,
+        answer(Some("accept"), None, AnswerBy::Human),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.task.unwrap().space_id, sol);
+}
+
+/// Minor 3: восстановленная идея `proposed`, чей вопрос устарел при удалении, возвращается в
+/// `new` без `question_id`.
+#[tokio::test]
+async fn restored_proposed_idea_returns_to_new() {
+    let (db, sol, _) = setup("restore-idea").await;
+    let i = new_idea(&db, sol, "Идея", "human", "normal").await;
+    let (_, q) = propose_idea(&db, i.id, None, None, None, &agent())
+        .await
+        .unwrap();
+    delete_entry(&db, i.id, None, &human()).await.unwrap();
+    assert_eq!(
+        get_entry(&db, q.id).await.unwrap().status,
+        Some(EntryStatus::Obsolete)
+    );
+    let back = restore_entry(&db, i.id, None, &human()).await.unwrap();
+    assert_eq!(back.status, Some(EntryStatus::New));
+    assert_eq!(data_of(&back).question_id, None);
+    propose_idea(&db, i.id, None, None, None, &agent())
+        .await
+        .unwrap();
+}
+
+/// Minor 4: `horizon` правкой — те же правила, что у `defer`; `accept` и `decline` его снимают.
+#[tokio::test]
+async fn horizon_rules_patch_and_decisions() {
+    let (db, sol, _) = setup("horizon-rules").await;
+    let i = new_idea(&db, sol, "Идея", "human", "normal").await;
+    for bad in [today() - days(1), today()] {
+        let r = update_entry(
+            &db,
+            i.id,
+            None,
+            EntryPatch {
+                data: Some(json!({ "horizon": bad.to_string() })),
+                ..EntryPatch::default()
+            },
+            &human(),
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(StoreError::BadInput(m)) if m.contains("не раньше завтрашней")),
+            "{bad}: {r:?}"
+        );
+        let mut d = nd(IdeaDecision::Defer);
+        d.horizon = Some(bad);
+        match decide_idea(&db, i.id, d, &human()).await {
+            Err(IdeaError::BadHorizon(m)) => assert!(m.contains("не раньше завтрашней"), "{m}"),
+            r => panic!("{r:?}"),
+        }
+    }
+    let e = create_entry(
+        &db,
+        idea_entry(
+            sol,
+            "Сразу с датой",
+            json!({"origin": "human", "horizon": "2020-01-01"}),
+        ),
+        &human(),
+    )
+    .await;
+    assert!(matches!(e, Err(StoreError::BadInput(_))), "{e:?}");
+    for dec in [IdeaDecision::Accept, IdeaDecision::Decline] {
+        let j = new_idea(&db, sol, dec.as_str(), "human", "normal").await;
+        decide_idea(&db, j.id, nd(IdeaDecision::Defer), &human())
+            .await
+            .unwrap();
+        let r = decide_idea(&db, j.id, nd(dec), &human()).await.unwrap();
+        assert_eq!(data_of(&r.idea).horizon, None, "{dec:?}");
+    }
+}
+
+/// Minor 5: битый элемент `links` не роняет остальные и не теряется их следующей ревизией.
+#[test]
+fn stored_links_survive_broken_item() {
+    let d = IdeaData::from_stored(&json!({
+        "origin": "human",
+        "links": ["a", 5, " b ", null, "a", "x".repeat(1001)]
+    }));
+    assert_eq!(d.links, vec!["a", "b"]);
+    assert_eq!(IdeaData::from_stored(&d.to_value()).links, vec!["a", "b"]);
 }

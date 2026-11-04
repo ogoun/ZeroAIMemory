@@ -691,6 +691,16 @@ pub async fn update_entry(
                 "вопрос уже не открыт: содержимое не меняется — задайте новый вопрос".into(),
             ));
         }
+        // вопрос-предложение идеи: варианты и текст фиксирует сервер (M5.7 §5.1); устаревание
+        // (статус с причиной) — разрешено
+        if content
+            && cur.kind == EntryKind::Question
+            && QuestionData::from_stored(&cur.data).idea.is_some()
+        {
+            return Err(StoreError::Conflict(
+                "вопрос-предложение идеи не правится: варианты и текст ведёт сервер".into(),
+            ));
+        }
         if content
             && cur.kind == EntryKind::Idea
             && !matches!(cur.status, Some(EntryStatus::New | EntryStatus::Deferred))
@@ -918,18 +928,19 @@ pub async fn delete_entry(
 
 /// Восстанавливает удалённую запись: чанки из текущих полей, `upsert`. Нет → `NotFound`;
 /// `if_rev` (необязателен) не совпал с текущей ревизией → `StaleRevision`; не удалена →
-/// `BadInput`.
+/// `BadInput`. Идея и вопрос-предложение без пары после восстановления приводятся в согласие
+/// (M5.7 §5.6, `ideas::on_entry_restored_tx`).
 pub async fn restore_entry(
     db: &Db,
     id: Id,
     if_rev: Option<i64>,
     a: &Attribution,
 ) -> Result<Entry, StoreError> {
-    let author = a.author_kind;
+    let a = a.clone();
     db.write(move |tx| {
         let cur = load_entry(tx, id)?;
         check_rev(&cur, if_rev)?;
-        ensure_may_modify(&cur, author)?;
+        ensure_may_modify(&cur, a.author_kind)?;
         if cur.deleted_at.is_none() {
             return Err(bad("запись не удалена"));
         }
@@ -953,6 +964,7 @@ pub async fn restore_entry(
         if cur.kind == EntryKind::Term {
             terms_written(tx, cur.space_id)?;
         }
+        crate::ideas::on_entry_restored_tx(tx, &load_entry(tx, id)?, &a, &now)?;
         load_entry(tx, id)
     })
     .await

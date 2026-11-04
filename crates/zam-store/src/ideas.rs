@@ -252,6 +252,30 @@ fn horizon_field(v: &Value) -> Result<Option<Date>, String> {
     }
 }
 
+/// `horizon` — строго позже сегодняшней даты (UTC): одно правило у `defer` и правки `data`.
+pub(crate) fn check_horizon(h: Date, today: Date) -> Result<(), String> {
+    if h <= today {
+        return Err(format!(
+            "horizon: не раньше завтрашней даты (UTC), а не {h}"
+        ));
+    }
+    Ok(())
+}
+
+/// `links` из базы: битые элементы (не строка, пустая, длиннее предела) пропускаются по
+/// одному, остальные сохраняются.
+fn stored_links(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in v.as_array().into_iter().flatten().filter_map(Value::as_str) {
+        let s = s.trim();
+        if !s.is_empty() && s.chars().count() <= IDEA_LINK_MAX_CHARS && !out.iter().any(|o| o == s)
+        {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
 fn id_of(v: &Value) -> Option<Id> {
     v.as_str()?.parse().ok()
 }
@@ -266,9 +290,7 @@ impl IdeaData {
                 .and_then(|v| priority_field(v).ok())
                 .unwrap_or(IdeaPriority::Normal),
             horizon: get("horizon").and_then(|v| horizon_field(v).ok().flatten()),
-            links: get("links")
-                .and_then(|v| links_field(v).ok())
-                .unwrap_or_default(),
+            links: get("links").map(stored_links).unwrap_or_default(),
             origin: get("origin")
                 .and_then(Value::as_str)
                 .and_then(IdeaOrigin::parse)
@@ -313,7 +335,12 @@ impl IdeaData {
         for (k, v) in o {
             match k.as_str() {
                 "priority" => next.priority = priority_field(v)?,
-                "horizon" => next.horizon = horizon_field(v)?,
+                "horizon" => {
+                    next.horizon = horizon_field(v)?;
+                    if let Some(h) = next.horizon {
+                        check_horizon(h, utc_today()).map_err(|e| format!("data.{e}"))?;
+                    }
+                }
                 "links" => next.links = links_field(v)?,
                 _ => unreachable!("ключи проверены выше"),
             }
@@ -508,6 +535,9 @@ pub enum IdeaError {
     /// Идея удалена (ответ на её вопрос-предложение): 409.
     #[error("идея удалена")]
     IdeaDeleted,
+    /// Вопрос — не действующее предложение идеи (у неё другой `question_id`): 409.
+    #[error("предложение устарело: у идеи другой вопрос-предложение или его нет")]
+    StaleProposal,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -530,21 +560,27 @@ fn transition_error(
     }
 }
 
-/// Шаг транзакции «всё или ничего»: логическая ошибка `Ok(Err(_))` после записи откатывает
-/// записи шага (точка сохранения), ошибка хранилища — всю транзакцию писателя.
+/// Шаг транзакции «всё или ничего» (точка сохранения): и логическая ошибка `Ok(Err(_))`, и
+/// ошибка хранилища `Err(_)` откатывают записи шага.
 pub(crate) fn atomic<T, E>(
     tx: &Connection,
     f: impl FnOnce(&Connection) -> Result<Result<T, E>, StoreError>,
 ) -> Result<Result<T, E>, StoreError> {
     tx.execute_batch("SAVEPOINT zam_atomic")?;
-    match f(tx)? {
-        Ok(v) => {
+    match f(tx) {
+        Ok(Ok(v)) => {
             tx.execute_batch("RELEASE zam_atomic")?;
             Ok(Ok(v))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tx.execute_batch("ROLLBACK TO zam_atomic; RELEASE zam_atomic")?;
             Ok(Err(e))
+        }
+        Err(e) => {
+            // шаг откатывается и здесь: вызывающий может продолжить транзакцию после ошибки;
+            // сбой отката не заслоняет исходную ошибку
+            let _ = tx.execute_batch("ROLLBACK TO zam_atomic; RELEASE zam_atomic");
+            Err(e)
         }
     }
 }
@@ -789,14 +825,15 @@ pub async fn propose_idea(
 /// Переход идеи в транзакции писателя (§5.2): проверка [`check_idea_transition`], у `accept` —
 /// задача (`insert_entry`, системное ребро `derived_from` задача → идея) в пространстве по
 /// §5.2, п. 1, затем новая ревизия идеи (`decided`, `task_id`, `horizon`, `prev_task_ids`).
-/// `answered`: `Some(decision_id)` — вопрос уже отвечен вызывающим (`answer_question`);
-/// `None` — открытый вопрос-предложение отвечается здесь (`answer_tx`) вариантом решения.
+/// `answered`: `Some(вопрос)` — действующий вопрос-предложение уже отвечен вызывающим
+/// (`answer_question`, его `task_space` выбирает пространство задачи); `None` — открытый
+/// вопрос-предложение `data.question_id` отвечается здесь (`answer_tx`) вариантом решения.
 /// Возвращает `(идея, задача)`. Логическая ошибка — до записи или под [`atomic`] вызывающего.
 pub(crate) fn apply_decision_tx(
     tx: &Connection,
     idea: &Entry,
     d: &NewDecision,
-    answered: Option<Id>,
+    answered: Option<&Entry>,
     attrib: &Attribution,
     now: &str,
 ) -> Result<Result<(Entry, Option<Entry>), IdeaError>, StoreError> {
@@ -835,10 +872,8 @@ pub(crate) fn apply_decision_tx(
                     Err(e) => return Ok(Err(IdeaError::BadHorizon(format!("horizon: {e}")))),
                 },
             };
-            if h <= today {
-                return Ok(Err(IdeaError::BadHorizon(format!(
-                    "horizon: не раньше завтрашней даты (UTC), а не {h}"
-                ))));
+            if let Err(e) = check_horizon(h, today) {
+                return Ok(Err(IdeaError::BadHorizon(e)));
             }
             Some(h)
         }
@@ -850,18 +885,14 @@ pub(crate) fn apply_decision_tx(
         _ => None,
     };
     // вопрос-предложение: отвеченный вызывающим или открытый
-    let question = match data.question_id {
-        Some(qid) => live_opt(tx, qid)?.filter(|q| q.kind == EntryKind::Question),
-        None => None,
+    let open_q = match answered {
+        Some(_) => None,
+        None => open_question(tx, &data)?,
     };
-    let open_q = question
-        .clone()
-        .filter(|q| answered.is_none() && q.status == Some(EntryStatus::Open));
     let mut task_id = None;
     if d.decision == IdeaDecision::Accept {
-        let from_question = question
-            .as_ref()
-            .filter(|q| answered.is_some() || q.status == Some(EntryStatus::Open))
+        let from_question = answered
+            .or(open_q.as_ref())
             .and_then(|q| QuestionData::from_stored(&q.data).task_space);
         let space =
             match resolve_task_space(tx, idea, d.task_space, from_question, d.request_solution)? {
@@ -901,7 +932,8 @@ pub(crate) fn apply_decision_tx(
                 data.prev_task_ids.push(t);
             }
         }
-        IdeaDecision::Accept | IdeaDecision::Decline => {}
+        // «не раньше» имеет смысл только у отложенной идеи (§5.2)
+        IdeaDecision::Accept | IdeaDecision::Decline => data.horizon = None,
     }
     data.decided = Some(Decided {
         decision: d.decision,
@@ -1128,6 +1160,63 @@ pub(crate) fn on_entry_deleted_tx(
     }
 }
 
+/// Причина устаревания восстановленного вопроса-предложения.
+const STALE_PROPOSAL_REASON: &str = "предложение устарело";
+
+/// Восстановление записи из корзины (из `restore_entry`, та же транзакция; §5.6). Связанные
+/// статусы не откатываются, но и рассогласования не остаётся:
+/// - открытый вопрос-предложение, который идея уже не считает своим (`question_id` другой,
+///   идея не `proposed`, удалена), становится `obsolete` с причиной «предложение устарело»;
+/// - идея `proposed` без открытого вопроса-предложения возвращается в `new` без `question_id`.
+pub(crate) fn on_entry_restored_tx(
+    tx: &Connection,
+    e: &Entry,
+    attrib: &Attribution,
+    now: &str,
+) -> Result<(), StoreError> {
+    match e.kind {
+        EntryKind::Question if e.status == Some(EntryStatus::Open) => {
+            let Some(iid) = QuestionData::from_stored(&e.data).idea else {
+                return Ok(());
+            };
+            let current = live_opt(tx, iid)?.is_some_and(|i| {
+                i.kind == EntryKind::Idea
+                    && i.status == Some(EntryStatus::Proposed)
+                    && IdeaData::from_stored(&i.data).question_id == Some(e.id)
+            });
+            if !current {
+                revise_with(
+                    tx,
+                    e,
+                    Some(EntryStatus::Obsolete),
+                    e.data.clone(),
+                    Some(STALE_PROPOSAL_REASON),
+                    attrib,
+                    now,
+                )?;
+            }
+            Ok(())
+        }
+        EntryKind::Idea if e.status == Some(EntryStatus::Proposed) => {
+            let mut d = IdeaData::from_stored(&e.data);
+            if open_question(tx, &d)?.is_some() {
+                return Ok(());
+            }
+            d.question_id = None;
+            revise_with(
+                tx,
+                e,
+                Some(EntryStatus::New),
+                d.to_value(),
+                None,
+                attrib,
+                now,
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Кандидат проактивности §6: живая идея `origin: human` в `new` или в `deferred` с
 /// `horizon ≤ today` (UTC). Тот же предикат — у дайджеста и подсказки `prompt`.
 pub fn idea_candidate(e: &Entry, today: Date) -> bool {
@@ -1210,6 +1299,34 @@ mod tests {
             assert_eq!(d.option_key(), Some(k));
         }
         assert_eq!(IdeaDecision::from_option("reopen"), None);
+    }
+
+    /// Ошибка хранилища внутри шага откатывает его записи до точки сохранения: внешняя
+    /// транзакция, продолженная после ошибки, их не фиксирует.
+    #[test]
+    fn atomic_rolls_back_on_store_error() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        let tx = c.transaction().unwrap();
+        let r: Result<Result<(), ()>, StoreError> = atomic(&tx, |c| {
+            c.execute("INSERT INTO t VALUES (1)", [])?;
+            Err(StoreError::Conflict("сбой".into()))
+        });
+        assert!(r.is_err());
+        let ok: Result<Result<(), ()>, StoreError> = atomic(&tx, |c| {
+            c.execute("INSERT INTO t VALUES (2)", [])?;
+            Ok(Ok(()))
+        });
+        assert!(matches!(ok, Ok(Ok(()))));
+        tx.commit().unwrap();
+        let xs: Vec<i64> = c
+            .prepare("SELECT x FROM t")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(xs, vec![2]);
     }
 
     #[test]

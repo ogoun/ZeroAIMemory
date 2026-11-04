@@ -632,6 +632,11 @@ pub async fn answer_question(
                 }
                 Err(e) => return Err(e),
             };
+            // действующее предложение — только `data.question_id` идеи (восстановленный из
+            // корзины или старый вопрос — 409 без записи)
+            if crate::ideas::IdeaData::from_stored(&idea.data).question_id != Some(q.id) {
+                return Ok(Err(IdeaError::StaleProposal.into()));
+            }
             let (question, answer) = match answer_tx(tx, &q, &na, &attrib, &now)? {
                 Ok(v) => v,
                 Err(e) => return Ok(Err(e)),
@@ -647,7 +652,7 @@ pub async fn answer_question(
                 defer_days: IDEA_DEFER_DAYS_DEFAULT,
             };
             Ok(
-                apply_decision_tx(tx, &idea, &nd, Some(answer.id), &attrib, &now)?
+                apply_decision_tx(tx, &idea, &nd, Some(&question), &attrib, &now)?
                     .map(|(idea, task)| Answered {
                         question,
                         decision: answer,
