@@ -1,10 +1,10 @@
 {
   "name": "zam-web",
   "private": true,
-  "version": "0.0.9-m5.6",
+  "version": "0.0.10-m5.7",
   "type": "module",
   "engines": {
-    "node": ">=22.6"
+    "node": ">=22.13"
   },
   "scripts": {
     "dev": "vite",
