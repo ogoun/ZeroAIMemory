@@ -225,17 +225,18 @@ fn init_creates_solution_block_hooks_mcp() {
         assert_eq!(s["hooks"][ev][0]["hooks"][0]["command"], "zam", "{ev}");
         assert_eq!(s["hooks"][ev][0]["hooks"][0]["timeout"], 2, "{ev}");
     }
-    // .mcp.json — без токена, с решением
+    // .mcp.json — stdio `zam mcp` (M6 §7.1): без токена и адреса, решение — из solution.toml
     let m = p.json(".mcp.json");
     let z = &m["mcpServers"]["zeroaimemory"];
-    assert_eq!(z["type"], "http");
-    assert_eq!(z["url"], format!("{url}/mcp"));
-    assert_eq!(z["headers"]["Authorization"], "Bearer ${ZAM_TOKEN}");
-    assert_eq!(z["headers"]["X-Zam-Solution"], guid.as_str());
+    assert_eq!(
+        *z,
+        json!({"type": "stdio", "command": "zam", "args": ["mcp"]}),
+        "{m}"
+    );
     assert!(!p.read(".mcp.json").contains(&tok));
     assert!(!p.read(".claude/settings.json").contains(&tok));
     assert_eq!(p.read(".zeroaimemory/.gitignore"), "cache/\nlogs/\n");
-    // токен — в домашнем конфиге; подсказка про ZAM_TOKEN для Windows и Linux
+    // токен — в домашнем конфиге; zam mcp берёт его оттуда же — подсказки про ZAM_TOKEN нет
     let home: toml::Table =
         toml::from_str(&std::fs::read_to_string(p.home.join(".zeroaimemory/config.toml")).unwrap())
             .unwrap();
@@ -247,14 +248,10 @@ fn init_creates_solution_block_hooks_mcp() {
     );
     assert!(stdout.contains("Токен и адрес сохранены"), "{stdout}");
     assert!(!stdout.contains(">> ~/.profile"), "{stdout}");
-    assert!(stdout.contains("ZAM_TOKEN"), "{stdout}");
-    assert!(
-        stdout.contains("SetEnvironmentVariable('ZAM_TOKEN'"),
-        "{stdout}"
-    );
-    assert!(stdout.contains("export ZAM_TOKEN="), "{stdout}");
-    // ZAM_MACHINE в окружении теста нет — подсказка для MCP (финальное ревью M4, M-4)
-    assert!(stdout.contains("ZAM_MACHINE"), "{stdout}");
+    assert!(!stdout.contains("ZAM_TOKEN"), "{stdout}");
+    assert!(stdout.contains("zam mcp"), "{stdout}");
+    // машину zam mcp берёт сам (ZAM_MACHINE или имя хоста) — подсказки нет
+    assert!(!stdout.contains("ZAM_MACHINE"), "{stdout}");
     assert!(
         !stdout.contains(&tok) && !err(&o).contains(&tok),
         "токен в выводе"
@@ -368,10 +365,7 @@ fn init_is_idempotent_and_preserves_foreign_text_and_hooks() {
     );
     let m = p.json(".mcp.json");
     assert_eq!(m["mcpServers"]["other"], json!({"command": "x"}));
-    assert_eq!(
-        m["mcpServers"]["zeroaimemory"]["headers"]["X-Zam-Solution"],
-        g
-    );
+    assert_eq!(m["mcpServers"]["zeroaimemory"]["command"], "zam");
 
     // повторный запуск ничего не меняет
     let before = p.snapshot();

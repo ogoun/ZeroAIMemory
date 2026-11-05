@@ -37,8 +37,9 @@
 //!   поиск, `/read` и `/recall` с неявной сессией не пишут `session_seen` и не помечают
 //!   выданное. Учёт выданного — один на вызов инструмента, событием `mcp` ([`account`]): с явной
 //!   сессией — в `session_tokens`, иначе — в `tokens_unattributed` пользователя (`GET
-//!   /sessions/unattributed`). Явную сессию задаёт `zam mcp` (`ZAM_SESSION_ID`,
-//!   `CLAUDE_CODE_SESSION_ID` или файл привязки хука `session-start`). В DEBUG — `implicit`.
+//!   /sessions/unattributed`). Явную сессию задаёт `zam mcp` (`ZAM_SESSION_ID` или
+//!   файл привязки хука `session-start`; `.mcp.json` Claude Code с M6 — stdio `zam mcp`). В
+//!   DEBUG — `implicit` и `no_session`; учёт пишется в фоне после ответа.
 pub mod tools;
 
 use std::net::SocketAddr;
@@ -267,25 +268,27 @@ impl ServerHandler for McpServer {
         tracing::debug!(
             tool = tool.as_str(),
             is_error = out.is_error,
-            implicit = !explicit,
+            implicit = rest.origin.implicit,
+            no_session = !explicit && !rest.origin.implicit,
             ms = t.elapsed().as_millis() as u64,
             "инструмент MCP"
         );
-        account(&self.state, parts, explicit, out.tokens()).await;
+        // учёт — в фоне: ответ агенту его не ждёт (ревью задачи 3, M2)
+        if let Some(p) = parts.extensions.get::<Principal>().cloned() {
+            let (st, headers, tokens) = (self.state.clone(), parts.headers.clone(), out.tokens());
+            tokio::spawn(async move { account(&st, &p, &headers, explicit, tokens).await });
+        }
         Ok(out.into_result().into())
     }
 }
 
 /// Учёт выданного вызовом инструмента (M6 §7.1) — событие `mcp`: с явной сессией — в
 /// `session_tokens` этой сессии, без неё — в `tokens_unattributed` пользователя (сутки UTC).
-/// Вложенные `/search`, `/read`, `/recall` своих событий не пишут (`McpOrigin`). Сбой учёта
-/// ответ не портит (WARN без id и текста).
-async fn account(st: &AppState, parts: &Parts, explicit: bool, tokens: u64) {
-    let Some(p) = parts.extensions.get::<Principal>() else {
-        return;
-    };
+/// Вложенные `/search`, `/read`, `/recall` своих событий не пишут (`McpOrigin`). Идёт в фоне
+/// после ответа; сбой учёта ответ не портит (WARN без id и текста).
+async fn account(st: &AppState, p: &Principal, headers: &HeaderMap, explicit: bool, tokens: u64) {
     // некорректные заголовки отклонил сам маршрут REST — учёта нет
-    let Ok(user) = crate::auth::target_user_id(st, p, &parts.headers) else {
+    let Ok(user) = crate::auth::target_user_id(st, p, headers) else {
         return;
     };
     let db = match st.users.get(user).await {
@@ -296,7 +299,7 @@ async fn account(st: &AppState, parts: &Parts, explicit: bool, tokens: u64) {
         }
     };
     let r = if explicit {
-        match crate::attrib::session_touch(p, &parts.headers, None) {
+        match crate::attrib::session_touch(p, headers, None) {
             Ok(Some(touch)) => zam_store::add_tokens(&db, &touch, MCP_TOKEN_EVENT, tokens).await,
             _ => return,
         }

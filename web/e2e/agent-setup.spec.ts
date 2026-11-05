@@ -57,7 +57,9 @@ test('Подключение агента: опции меняют фрагме�
   await expect(block).toContainText('<!-- zeroaimemory:begin v');
   await expect(block).toContainText('ZeroAIMemoryUrl=');
   await expect(block).not.toContainText('zam_');
-  await expect(frag(page, 'Фрагмент .mcp.json')).toContainText('Bearer ${ZAM_TOKEN}');
+  // M6: stdio-прокси zam mcp (привязка к сессии агента)
+  await expect(frag(page, 'Фрагмент .mcp.json')).toContainText('"command": "zam"');
+  await expect(frag(page, 'Фрагмент .mcp.json')).not.toContainText('ZAM_TOKEN');
   await expect(frag(page, 'Хуки Claude Code')).toContainText('PostToolUseFailure');
   await expect(frag(page, 'solution.toml')).toHaveCount(0);
   await expect(frag(page, /zam init — Linux/)).toContainText('zam init');

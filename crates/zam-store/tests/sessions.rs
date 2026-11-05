@@ -750,4 +750,8 @@ async fn unattributed_upsert_adds() {
         zam_store::unattributed_tokens(&db, d2).await.unwrap(),
         [row("2026-11-06", "mcp", 1, 1)]
     );
+    // id `unattributed` занят путём `GET /sessions/unattributed` (ревью задачи 3, M3)
+    assert!(zam_store::check_session_id("unattributed").is_err());
+    assert!(zam_store::check_session_id(" unattributed ").is_err());
+    assert!(zam_store::check_session_id("unattributed-1").is_ok());
 }

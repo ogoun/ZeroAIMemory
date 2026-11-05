@@ -2850,6 +2850,39 @@ async fn unattributed(a: &Api) -> Vec<Value> {
     r.json()["items"].as_array().unwrap().clone()
 }
 
+/// Учёт MCP пишется в фоне после ответа (ревью задачи 3, M2): опрос `tokens` сессии, пока у
+/// события `mcp` не станет `calls` вызовов (до 10 с).
+async fn session_tokens_when(a: &Api, id: &str, calls: i64) -> Value {
+    let t = std::time::Instant::now();
+    loop {
+        let r = a
+            .t(Method::GET, &format!("/api/v1/sessions/{id}"), None)
+            .await;
+        let v = r.json()["tokens"].clone();
+        if v["mcp"]["calls"] == calls || t.elapsed() > std::time::Duration::from_secs(10) {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Как [`session_tokens_when`], для `GET /sessions/unattributed` (сумма `calls` события `mcp`).
+async fn unattributed_when(a: &Api, calls: i64) -> Vec<Value> {
+    let t = std::time::Instant::now();
+    loop {
+        let items = unattributed(a).await;
+        let n: i64 = items
+            .iter()
+            .filter(|i| i["event"] == "mcp")
+            .map(|i| i["calls"].as_i64().unwrap())
+            .sum();
+        if n == calls || t.elapsed() > std::time::Duration::from_secs(10) {
+            return items;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// REST-поиск «квазар» с заголовками `extra`.
 async fn rest_search(a: &Api, extra: &[(&str, &str)], mode: &str, format: &str) -> Resp {
     let r = a
@@ -2929,7 +2962,7 @@ async fn mcp_explicit_session_marks_seen() {
     );
     assert!(!md.contains("светит"), "{md}");
     // учёт: три вызова MCP — событие `mcp`
-    let t = session_tokens(&a, SESSION).await;
+    let t = session_tokens_when(&a, SESSION, 3).await;
     assert_eq!(t["mcp"]["calls"], 3, "{t}");
     let want = tok_of(&r) + tok_of(&s) + tok_of(&j);
     assert_eq!(t["mcp"]["tokens"], want, "{t}");
@@ -2988,14 +3021,14 @@ async fn implicit_session_no_marks_goes_unattributed() {
     let hs = [("x-zam-session", "hook-s"), ("x-zam-machine", MACHINE)];
     let j = rest_search(&a, &hs, "brief", "json").await.json();
     assert_eq!(j["items"][0]["seen"], false, "{j}");
-    // запись засчитана неявной сессии (R13), учёт выданного — нет
+    // учёт (в фоне) — в unattributed; запись засчитана неявной сессии (R13), учёт выданного — нет
+    let items = unattributed_when(&a, 3).await;
     let g = a
         .t(Method::GET, "/api/v1/sessions/hook-s", None)
         .await
         .json();
     assert_eq!(g["memory_writes"], 1, "{g}");
     assert!(g["tokens"].get("mcp").is_none(), "{g}");
-    let items = unattributed(&a).await;
     assert_eq!(items.len(), 1, "{items:?}");
     let today = jiff::Timestamp::now()
         .to_zoned(jiff::tz::TimeZone::UTC)
@@ -3089,7 +3122,7 @@ async fn mcp_search_counts_once() {
     )
     .await;
     assert!(c.text.contains("Всегда пиши тесты"), "{}", c.text);
-    let t = session_tokens(&a, SESSION).await;
+    let t = session_tokens_when(&a, SESSION, 3).await;
     let keys: Vec<&String> = t.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["mcp"], "{t}");
     assert_eq!(t["mcp"]["calls"], 3, "{t}");

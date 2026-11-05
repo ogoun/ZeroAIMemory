@@ -1,7 +1,8 @@
 //! Привязка `zam mcp` к сессии агента (M6 §7.1, задача 3): хук `session-start` пишет
 //! `.zeroaimemory/cache/agent-<pid>.json` на предков до процесса агента, `zam mcp` ищет файл
-//! по своей цепочке предков и шлёт `X-Zam-Session`. Сильнее файла — `ZAM_SESSION_ID`, затем
-//! `CLAUDE_CODE_SESSION_ID`.
+//! по своей цепочке предков и шлёт `X-Zam-Session`. Сильнее файла — `ZAM_SESSION_ID`.
+//! `stdio_mcp_session_accounting` — тот же путь против настоящего сервера: отметки выданного,
+//! пометка «(выдавалось)» и учёт `mcp` в сессии агента.
 //!
 //! У процесса `zam` в тесте агента среди предков нет (родитель — сам процесс теста), поэтому
 //! файл пишется на непосредственного родителя — pid теста; `zam mcp`, запущенный тем же
@@ -209,7 +210,8 @@ fn mcp_uses_binding_without_env() {
     assert_eq!(mcp_sessions(&p, &[]), [s.clone(), s]);
 }
 
-/// `ZAM_SESSION_ID` сильнее `CLAUDE_CODE_SESSION_ID`, а та — файла привязки.
+/// `ZAM_SESSION_ID` сильнее файла привязки; `CLAUDE_CODE_SESSION_ID` не читается (у Claude Code
+/// такой переменной для локальной сессии нет — ревью задачи 3, I4).
 #[test]
 fn env_session_beats_binding() {
     let _g = serial();
@@ -222,21 +224,158 @@ fn env_session_beats_binding() {
     );
     assert_eq!(
         mcp_sessions(&p, &[("CLAUDE_CODE_SESSION_ID", "sess-cc")]),
-        one("sess-cc")
-    );
-    assert_eq!(
-        mcp_sessions(
-            &p,
-            &[
-                ("CLAUDE_CODE_SESSION_ID", "sess-cc"),
-                ("ZAM_SESSION_ID", "sess-env")
-            ]
-        ),
-        one("sess-env")
+        one("sess-bound")
     );
     // некорректное значение переменной не используется — дальше по порядку
     assert_eq!(
         mcp_sessions(&p, &[("ZAM_SESSION_ID", "  ")]),
         one("sess-bound")
     );
+}
+
+/// Сервер в фоновом потоке (без моделей, FTS): адрес и токен `rw` пользователя «Анна».
+fn server(name: &str) -> (String, String) {
+    use zam_server::build;
+    use zam_server::config::ServerConfig;
+    let data = common::sandbox("cli-mcp-bind-data", name);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut cfg = ServerConfig {
+                data_dir: data,
+                ..ServerConfig::default()
+            };
+            cfg.recall.timeout_ms = 30_000;
+            let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
+            let u = st.system.create_user("Анна", false).await.unwrap();
+            let (_, t) = st
+                .system
+                .issue_token(u.id, "t", zam_store::Access::Rw)
+                .await
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tx.send((url, t)).unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+    });
+    rx.recv().unwrap()
+}
+
+/// Тело ответа как JSON.
+fn body(r: ureq::http::Response<ureq::Body>) -> Value {
+    let t = r.into_body().read_to_string().unwrap();
+    serde_json::from_str(&t).unwrap_or(Value::Null)
+}
+
+fn http() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build(),
+    )
+}
+
+/// `zam mcp` против настоящего сервера: `initialize` и один `tools/call`; текст результата.
+fn mcp_call(p: &Proj, url: &str, tok: &str, name: &str, args: Value) -> String {
+    let stdin = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "t", "version": "1"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": name, "arguments": args}}),
+    ]
+    .map(|v| v.to_string())
+    .join("\n")
+        + "\n";
+    let o = p
+        .cmd()
+        .env("ZAM_URL", url)
+        .env("ZAM_TOKEN", tok)
+        .arg("mcp")
+        .write_stdin(stdin)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    let call = out
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["id"] == 2)
+        .unwrap_or_else(|| panic!("нет ответа на tools/call: {out}"));
+    assert_ne!(call["result"]["isError"], true, "{call}");
+    call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// stdio-путь целиком (ревью задачи 3, I4): `session-start` пишет привязку, `zam mcp` шлёт
+/// сессию — `/read` отмечает выданное, `memory_search` даёт «(выдавалось)» с фрагментом, учёт
+/// — событие `mcp` сессии агента, а не `unattributed`.
+#[test]
+fn stdio_mcp_session_accounting() {
+    let _g = serial();
+    let (url, tok) = server("stdio");
+    let p = Proj::new("stdio");
+    let a = http();
+    let auth = format!("Bearer {tok}");
+    let r = a
+        .post(&format!("{url}/api/v1/nodes"))
+        .header("Authorization", &auth)
+        .content_type("application/json")
+        .send(
+            json!({"space": "knowledge", "path": "Астро/Квазар", "kind": "note",
+                   "content": "# Квазар\n\nКвазар светит ярко.\n"})
+            .to_string(),
+        )
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let id = body(r)["id"].as_str().unwrap().to_string();
+    p.session_start("sess-stdio", "startup");
+    let read = mcp_call(
+        &p,
+        &url,
+        &tok,
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}]}),
+    );
+    assert!(read.contains("светит ярко"), "{read}");
+    let found = mcp_call(&p, &url, &tok, "memory_search", json!({"query": "квазар"}));
+    assert!(
+        found.contains("(выдавалось)") && found.contains("светит"),
+        "{found}"
+    );
+    // учёт пишется в фоне — опрос до 10 с
+    let t = std::time::Instant::now();
+    let tokens = loop {
+        let v: Value = a
+            .get(&format!("{url}/api/v1/sessions/sess-stdio"))
+            .header("Authorization", &auth)
+            .call()
+            .map(body)
+            .unwrap();
+        if v["tokens"]["mcp"]["calls"] == 2 || t.elapsed() > std::time::Duration::from_secs(10) {
+            break v["tokens"].clone();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(tokens["mcp"]["calls"], 2, "{tokens}");
+    let u: Value = a
+        .get(&format!("{url}/api/v1/sessions/unattributed?days=1"))
+        .header("Authorization", &auth)
+        .call()
+        .map(body)
+        .unwrap();
+    assert_eq!(u["items"], json!([]), "{u}");
 }

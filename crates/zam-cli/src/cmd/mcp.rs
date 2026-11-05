@@ -4,10 +4,12 @@
 //!   пачка). Каждое уходит отдельным `POST /mcp` с `Authorization: Bearer`, `X-Zam-Solution`
 //!   (из `solution.toml`) и `X-Zam-Machine`; `Origin` не шлётся.
 //! - **Сессия** (M6 §7.1, [`SessionSource`]): `X-Zam-Session` — по порядку `ZAM_SESSION_ID`,
-//!   `CLAUDE_CODE_SESSION_ID`, файл привязки хука `session-start` по своей цепочке предков
-//!   ([`hook::binding::read_binding`]; читается при `initialize` и затем не чаще раза в
-//!   [`BINDING_REFRESH`]). Нет ни одного — без заголовка, сессию выбирает сервер неявно (R13),
-//!   без учёта выданного в сессии. `ZAM_SESSION` и `session.json` хуков, как и раньше, на MCP
+//!   затем файл привязки хука `session-start` по своей цепочке предков
+//!   ([`hook::binding::find_binding`]; цепочка — один раз при запуске; пока привязки нет — поиск
+//!   не чаще раза в [`BINDING_MISS_RETRY`], найдена — раз в [`BINDING_REFRESH`] сверка времени
+//!   изменения файла). Переменной с id локальной сессии у Claude Code нет (решение контролёра,
+//!   ревью задачи 3, I4), `CLAUDE_CODE_SESSION_ID` не читается. Нет ни одного источника — без
+//!   заголовка, сессию выбирает сервер неявно (R13), без учёта выданного в сессии. `ZAM_SESSION` и `session.json` хуков, как и раньше, на MCP
 //!   не влияют (fix round 1, I-4): `session.json` общий у параллельных агентов проекта.
 //! - Ответ `application/json` пишется в stdout одной строкой; `text/event-stream` (SSE)
 //!   разворачивается: каждое событие `data:` — отдельная строка. 202/204 — без вывода.
@@ -31,48 +33,79 @@ use serde_json::{Value, json};
 use super::{Ctx, hook};
 use crate::client::{CliError, Client};
 
-/// Как часто `zam mcp` перечитывает файл привязки (новая сессия после `/clear`, `resume`).
+/// Как часто `zam mcp` проверяет время изменения найденного файла привязки (новая сессия
+/// после `/clear`, `resume`: `session-start` перезаписывает файл).
 pub const BINDING_REFRESH: Duration = Duration::from_secs(30);
+/// Как часто `zam mcp` ищет привязку, пока её нет (хук `session-start` мог ещё не отработать).
+pub const BINDING_MISS_RETRY: Duration = Duration::from_secs(1);
+
+/// Состояние привязки: найденный файл и время последней проверки.
+#[derive(Default)]
+struct Bound {
+    found: Option<hook::binding::Found>,
+    checked: Option<Instant>,
+}
 
 /// Источник `X-Zam-Session` (см. модуль): переменная окружения или файл привязки.
 struct SessionSource {
-    /// `ZAM_SESSION_ID` или `CLAUDE_CODE_SESSION_ID` — на всё время процесса.
+    /// `ZAM_SESSION_ID` — на всё время процесса.
     fixed: Option<String>,
     /// Корень проекта: там `.zeroaimemory/cache/agent-<pid>.json`.
     root: PathBuf,
-    /// Сессия из файла и когда он читался.
-    bound: Mutex<(Option<String>, Option<Instant>)>,
+    /// Цепочка предков — один раз при запуске (ревью задачи 3, I2).
+    chain: Vec<hook::procs::Proc>,
+    bound: Mutex<Bound>,
 }
 
 impl SessionSource {
     fn new(get: impl Fn(&str) -> Option<String>, root: PathBuf) -> SessionSource {
-        let fixed = hook::session_var(get(zam_core::MCP_SESSION_ENV))
-            .or_else(|| hook::session_var(get("CLAUDE_CODE_SESSION_ID")));
+        let fixed = hook::session_var(get(zam_core::MCP_SESSION_ENV));
+        // с переменной цепочка не нужна
+        let chain = if fixed.is_some() {
+            Vec::new()
+        } else {
+            hook::binding::chain()
+        };
         SessionSource {
             fixed,
             root,
-            bound: Mutex::new((None, None)),
+            chain,
+            bound: Mutex::new(Bound::default()),
         }
     }
 
-    /// Сессия запроса; `initialize` (`fresh`) перечитывает файл привязки сразу.
-    fn current(&self, fresh: bool) -> Option<String> {
+    /// Сессия запроса в момент `now`: без привязки — поиск не чаще [`BINDING_MISS_RETRY`];
+    /// с привязкой — раз в [`BINDING_REFRESH`] сверка времени изменения её файла, изменился
+    /// или пропал — поиск заново.
+    fn current_at(&self, now: Instant) -> Option<String> {
         if let Some(s) = &self.fixed {
             return Some(s.clone());
         }
         let mut b = self.bound.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        if refresh_due(b.1, now, fresh) {
-            *b = (hook::binding::read_binding(&self.root), Some(now));
+        let elapsed = b.checked.map(|t| now.saturating_duration_since(t));
+        let due = match &b.found {
+            None => elapsed.is_none_or(|d| d >= BINDING_MISS_RETRY),
+            Some(f) => {
+                elapsed.is_none_or(|d| d >= BINDING_REFRESH) && {
+                    let mtime = std::fs::metadata(&f.path).and_then(|m| m.modified()).ok();
+                    mtime != Some(f.mtime)
+                }
+            }
+        };
+        if !due && b.found.is_some() && elapsed.is_none_or(|d| d >= BINDING_REFRESH) {
+            // файл не менялся — следующая сверка через BINDING_REFRESH
+            b.checked = Some(now);
         }
-        b.0.clone()
+        if due {
+            b.found = hook::binding::find_binding(&self.root, &self.chain);
+            b.checked = Some(now);
+        }
+        b.found.as_ref().map(|f| f.session.clone())
     }
-}
 
-/// Пора ли перечитать файл привязки: ни разу не читался, `initialize` или прошло
-/// [`BINDING_REFRESH`].
-fn refresh_due(last: Option<Instant>, now: Instant, fresh: bool) -> bool {
-    fresh || last.is_none_or(|t| now.saturating_duration_since(t) >= BINDING_REFRESH)
+    fn current(&self) -> Option<String> {
+        self.current_at(Instant::now())
+    }
 }
 
 /// Состояние сеанса MCP, общее для потоков запросов.
@@ -212,7 +245,7 @@ fn forward(client: &Client, state: &Mutex<Session>, source: &SessionSource, line
     if let Some(s) = sid.as_deref() {
         headers.push(("Mcp-Session-Id", s));
     }
-    let agent_session = source.current(initialize);
+    let agent_session = source.current();
     if let Some(s) = agent_session.as_deref() {
         headers.push(("X-Zam-Session", s));
     }
@@ -400,8 +433,17 @@ fn read_line_limited(r: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> std
 mod tests {
     use super::*;
 
+    fn tmp_root(name: &str) -> PathBuf {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/zam-cli-mcp")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
     #[test]
-    fn session_source_order_and_refresh() {
+    fn session_env_beats_binding_claude_var_ignored() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| {
                 pairs
@@ -410,22 +452,57 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             }
         };
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let s = SessionSource::new(
-            env(&[("ZAM_SESSION_ID", "a"), ("CLAUDE_CODE_SESSION_ID", "b")]),
-            root.clone(),
-        );
-        assert_eq!(s.current(true).as_deref(), Some("a"));
+        let root = tmp_root("env");
+        hook::procs::set_fake_ancestors(vec![hook::procs::Proc {
+            pid: 801,
+            name: "claude".into(),
+        }]);
+        hook::binding::write_binding(&root, "bound").unwrap();
+        let s = SessionSource::new(env(&[("ZAM_SESSION_ID", "a")]), root.clone());
+        assert_eq!(s.current().as_deref(), Some("a"));
+        // CLAUDE_CODE_SESSION_ID не документирован (I4) — не читается
         let s = SessionSource::new(
             env(&[("ZAM_SESSION_ID", " "), ("CLAUDE_CODE_SESSION_ID", "b")]),
             root,
         );
-        assert_eq!(s.current(false).as_deref(), Some("b"));
+        assert_eq!(s.current().as_deref(), Some("bound"));
+    }
+
+    /// I2: без привязки — поиск не чаще раза в секунду; с привязкой — раз в 30 с сверка
+    /// времени изменения файла (после `/clear` хук перезаписывает файл).
+    #[test]
+    fn binding_refresh_schedule() {
+        use hook::procs::{Proc, set_fake_ancestors};
+        let root = tmp_root("refresh");
+        set_fake_ancestors(vec![Proc {
+            pid: 901,
+            name: "claude".into(),
+        }]);
+        let s = SessionSource::new(|_| None, root.clone());
         let t0 = Instant::now();
-        assert!(refresh_due(None, t0, false));
-        assert!(refresh_due(Some(t0), t0, true));
-        assert!(!refresh_due(Some(t0), t0 + Duration::from_secs(29), false));
-        assert!(refresh_due(Some(t0), t0 + BINDING_REFRESH, false));
+        assert_eq!(s.current_at(t0), None);
+        hook::binding::write_binding(&root, "s1").unwrap();
+        assert_eq!(s.current_at(t0 + Duration::from_millis(500)), None);
+        let t1 = t0 + BINDING_MISS_RETRY;
+        assert_eq!(s.current_at(t1).as_deref(), Some("s1"));
+        // `/clear`: файл перезаписан новой сессией (время изменения — другое)
+        hook::binding::write_binding(&root, "s2").unwrap();
+        let path = hook::binding::binding_path(&root, 901);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            s.current_at(t1 + Duration::from_secs(10)).as_deref(),
+            Some("s1")
+        );
+        let t2 = t1 + BINDING_REFRESH;
+        assert_eq!(s.current_at(t2).as_deref(), Some("s2"));
+        // файл пропал — поиск заново, без привязки
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(s.current_at(t2 + BINDING_REFRESH), None);
     }
 
     #[test]

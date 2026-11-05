@@ -341,16 +341,13 @@ async fn agent_setup_hooks_exec_form() {
     }});
     assert_eq!(j["claude_settings"], want);
     assert!(j.get("codex_hooks").is_none(), "{j}");
+    // M6 §7.1 (ревью задачи 3, I4): stdio `zam mcp` — общий предок с хуками, привязка к сессии
     assert_eq!(
         j["mcp_json"],
         json!({"mcpServers": {"zeroaimemory": {
-            "type": "http",
-            "url": "http://memory.lan:7700/mcp",
-            "headers": {
-                "Authorization": "Bearer ${ZAM_TOKEN}",
-                "X-Zam-Solution": g,
-                "X-Zam-Machine": "${ZAM_MACHINE:-}",
-            },
+            "type": "stdio",
+            "command": "zam",
+            "args": ["mcp"],
         }}})
     );
     assert_eq!(
@@ -454,11 +451,10 @@ async fn agent_setup_hooks_exec_form() {
     assert_eq!(h["PreToolUse"][0]["hooks"][0]["timeout"], 1);
     assert_eq!(h["Stop"][0]["hooks"][0]["timeout"], 2);
     assert!(h.get("PostToolUseFailure").is_none(), "{h}");
-    // без решения — без X-Zam-Solution и solution_toml
-    assert!(
-        j["mcp_json"]["mcpServers"]["zeroaimemory"]["headers"]
-            .get("X-Zam-Solution")
-            .is_none()
+    // без решения — без solution_toml; фрагмент .mcp.json от решения не зависит
+    assert_eq!(
+        j["mcp_json"]["mcpServers"]["zeroaimemory"]["command"],
+        "zam"
     );
     assert!(j.get("solution_toml").is_none(), "{j}");
 

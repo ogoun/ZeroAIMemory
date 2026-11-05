@@ -1710,6 +1710,10 @@ cargo xtask transfer-check bindings --data-dir <D> --old-path "<старый dat
 8. **Явная сессия** — поля `explicit` и `via_mcp` в существующем `RequestSession`. Признак MCP —
    расширение запроса `McpOrigin`, которое ставит только `Rest`. Учёт MCP пишет `tools::call`, а
    вложенные search/read — нет.
+   **Отступление (задача 3, журнал — решение 3):** учёт пишет `McpServer::call_tool`
+   (`mcp::account`, в фоне после ответа), а не `tools::call`: нужны `AppState` и принципал
+   исходного запроса. `CLAUDE_CODE_SESSION_ID` снят (ревью задачи 3, I4): `.mcp.json` Claude
+   Code — stdio `zam mcp`.
 9. **Цепочка предков** — `procs::ancestors()`: ToolHelp32 через `windows` на Windows и `/proc` на
    Linux; подмена — фича `test-hooks` новой `zam-cli`.
 10. **Дата без `jiff` в `zam-core`/`zam-cli`** — `agent_ts(&str)` из RFC 3339. Замороженные часы —

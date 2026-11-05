@@ -18,7 +18,8 @@
 //!
 //! - Доступ — токен (любой, `ro` тоже) или сессия WebUI (администратор или пользователь).
 //!   `token=` — только сессии WebUI (по токену — 400): открытый текст токена подставляется в
-//!   `install` и `init_cmd`, в `block` и `mcp_json` токена нет никогда (`Bearer ${ZAM_TOKEN}`).
+//!   `install` и `init_cmd`, в `block` и `mcp_json` токена нет никогда (`mcp_json` — stdio
+//!   `zam mcp`, M6 §7.1).
 //!   Параметр — для вызовов API: токен в адресе виден журналам прокси; сам WebUI его не
 //!   передаёт, а подставляет токен вместо заглушки `<токен>` в браузере (задача 13 fix
 //!   round 1, I-1). Ответ — с `Cache-Control: no-store`.
@@ -250,7 +251,7 @@ pub async fn setup(
         out["solution_toml"] = json!(agent_setup::solution_toml(s));
     }
     if mcp {
-        out["mcp_json"] = agent_setup::mcp_json(&url, sol.as_ref());
+        out["mcp_json"] = agent_setup::mcp_json();
     }
     if hooks {
         match agent {

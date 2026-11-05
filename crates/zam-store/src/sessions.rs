@@ -175,10 +175,20 @@ fn check_field(what: &str, v: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Id сессии: непустой, до [`SESSION_ID_MAX_CHARS`] печатных символов.
+/// Id, занятые путями REST `/sessions/…` (M6 §7.1: `GET /sessions/unattributed`).
+pub const RESERVED_SESSION_IDS: [&str; 1] = ["unattributed"];
+
+/// Id сессии: непустой, до [`SESSION_ID_MAX_CHARS`] печатных символов, не из
+/// [`RESERVED_SESSION_IDS`].
 pub fn check_session_id(id: &str) -> Result<(), StoreError> {
     if id.trim().is_empty() {
         return Err(StoreError::BadInput("id сессии пуст".into()));
+    }
+    if RESERVED_SESSION_IDS.contains(&id.trim()) {
+        return Err(StoreError::BadInput(format!(
+            "id сессии «{}» зарезервирован",
+            id.trim()
+        )));
     }
     check_field("id сессии", id)
 }

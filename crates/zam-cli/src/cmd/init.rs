@@ -20,8 +20,8 @@
 //! `~/.zeroaimemory/config.toml` (права 0600 на unix) — там его находят `zam` и хуки
 //! ([`locate::resolve`]). Другой токен там заменяет только `--token` (с предупреждением), без
 //! него — предупреждение; после переноса из блока — совет сменить токен (fix round 1, I-6).
-//! MCP по HTTP (`.mcp.json`, только Claude Code) берёт токен из `ZAM_TOKEN`; для Codex —
-//! подсказка про `~/.codex/config.toml`. Файлы проекта пишутся атомарно, BOM и CRLF
+//! MCP Claude Code (`.mcp.json`) — stdio-прокси `zam mcp` (M6 §7.1): токен, адрес и решение
+//! — те же, что у `zam`; для Codex — подсказка про `~/.codex/config.toml`. Файлы проекта пишутся атомарно, BOM и CRLF
 //! сохраняются. Повторный запуск идемпотентен.
 mod merge;
 mod ojson;
@@ -554,35 +554,16 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         );
     }
     if !o.no_mcp && claude && agent_ok {
-        let set = std::env::var("ZAM_TOKEN").is_ok_and(|v| !v.trim().is_empty());
-        if set {
-            println!("MCP (.mcp.json) берёт токен из ZAM_TOKEN — переменная задана.");
-        } else {
-            println!(
-                "MCP по HTTP (.mcp.json) берёт токен из переменной ZAM_TOKEN; zam и хуки — из \
-                 ~/.zeroaimemory/config.toml (права 0600, его пишет zam init --token).\n\
-                 Задайте ZAM_TOKEN в окружении агента и перезапустите его:\n  \
-                 Windows (PowerShell): [Environment]::SetEnvironmentVariable('ZAM_TOKEN', '<токен>', 'User')\n  \
-                 Linux: export ZAM_TOKEN=<токен> — в файле, который читает только ваш пользователь \
-                 (chmod 600): переменную видят все процессы агента"
-            );
-        }
-    }
-    if !o.no_mcp && claude && agent_ok {
-        let machine = std::env::var(zam_core::MACHINE_ENV).is_ok_and(|v| !v.trim().is_empty());
-        if !machine {
-            println!(
-                "Имя машины для MCP (.mcp.json) — переменная ZAM_MACHINE (zam и хуки берут её же \
-                 первой). Задайте её и перезапустите агента:\n  \
-                 Windows (PowerShell): [Environment]::SetEnvironmentVariable('ZAM_MACHINE', \
-                 $env:COMPUTERNAME, 'User')\n  \
-                 Linux: export ZAM_MACHINE=$(uname -n) — в файле профиля оболочки"
-            );
-        }
+        // M6 §7.1: stdio `zam mcp` — адрес, токен, решение и машина те же, что у zam и хуков
+        println!(
+            "MCP (.mcp.json) — stdio-прокси zam mcp: адрес, токен и решение — как у zam и хуков; \
+             сессию агента он берёт из привязки хука session-start. Перезапустите агента."
+        );
     }
     if !o.no_mcp && codex {
         println!(
-            "MCP для Codex: [mcp_servers.zeroaimemory] в ~/.codex/config.toml — пример в \
+            "MCP для Codex: [mcp_servers.zeroaimemory] (command = \"zam\", args = [\"mcp\"]) в \
+             ~/.codex/config.toml — пример в \
              deploy/README-install.md («Подключение агента»)."
         );
     }

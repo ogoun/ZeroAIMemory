@@ -1250,7 +1250,8 @@ export function agentSetup(f: AgentSetupQuery, user?: string) {
 const TOKEN_SLOT = "'<токен>'";
 
 /** Ответ `/agent-setup` с открытым токеном вместо заглушки — только в командах установки и
- * `zam init` (в блоке и `.mcp.json` токена нет). Токен — `zam_` и base62: кавычки не нужны. */
+ * `zam init` (в блоке и `.mcp.json` — stdio `zam mcp` — токена нет). Токен — `zam_` и base62:
+ * кавычки не нужны. */
 export function withToken(s: AgentSetup, token: string): AgentSetup {
   if (!/^zam_[0-9A-Za-z]+$/.test(token)) return s;
   const put = (t: string) => t.split(TOKEN_SLOT).join(`'${token}'`);

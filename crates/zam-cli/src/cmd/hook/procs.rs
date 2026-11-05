@@ -7,7 +7,7 @@
 //!   скобки — берётся до последней `)`) и поле 4 (`ppid`).
 //! - Прочие ОС и любая ошибка — пустой список (привязки нет, `zam mcp` идёт неявным путём).
 //! - Имя — без расширения `.exe`, в нижнем регистре ([`norm_name`]).
-//! - Фича `test-hooks` — подмена списка для юнит-тестов ([`set_fake_ancestors`], на поток).
+//! - Юнит-тесты (и фича `test-hooks`) — подмена списка ([`set_fake_ancestors`], на поток).
 
 /// Процесс цепочки: pid и имя (без расширения, нижний регистр).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,9 +20,15 @@ pub struct Proc {
 /// бинарник и Node.js).
 pub const AGENT_PROC_NAMES: [&str; 3] = ["codex", "claude", "node"];
 
-/// Процесс агента по имени ([`AGENT_PROC_NAMES`]).
+/// Процесс агента по имени ([`AGENT_PROC_NAMES`]): точное имя или имя с суффиксом через `-`
+/// (`codex-x86_64-pc-windows-msvc`, `claude-2.1`) — сборки агентов называют бинарник по-разному.
 pub fn is_agent(p: &Proc) -> bool {
-    AGENT_PROC_NAMES.contains(&p.name.as_str())
+    AGENT_PROC_NAMES.iter().any(|n| {
+        p.name == *n
+            || p.name
+                .strip_prefix(n)
+                .is_some_and(|rest| rest.starts_with('-'))
+    })
 }
 
 /// Имя исполняемого файла без расширения `.exe`, в нижнем регистре.
@@ -31,13 +37,13 @@ pub fn norm_name(exe: &str) -> String {
     n.strip_suffix(".exe").map(str::to_string).unwrap_or(n)
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     static FAKE: std::cell::RefCell<Option<Vec<Proc>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Подменяет цепочку предков текущего потока (только тесты, фича `test-hooks`).
-#[cfg(feature = "test-hooks")]
+/// Подменяет цепочку предков текущего потока (юнит-тесты и фича `test-hooks`).
+#[cfg(any(test, feature = "test-hooks"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn set_fake_ancestors(v: Vec<Proc>) {
     FAKE.with(|f| *f.borrow_mut() = Some(v));
@@ -45,7 +51,7 @@ pub fn set_fake_ancestors(v: Vec<Proc>) {
 
 /// Предки текущего процесса, от родителя вверх, не больше `max`; сбой — пустой список.
 pub fn ancestors(max: usize) -> Vec<Proc> {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     if let Some(v) = FAKE.with(|f| f.borrow().clone()) {
         return v.into_iter().take(max).collect();
     }
@@ -168,6 +174,15 @@ mod tests {
             pid: 1,
             name: "bash".into()
         }));
+        let agent = |n: &str| {
+            is_agent(&Proc {
+                pid: 1,
+                name: norm_name(n),
+            })
+        };
+        assert!(agent("codex-x86_64-pc-windows-msvc.exe") && agent("claude-2.1"));
+        assert!(agent("Claude.exe") && agent("node.exe"));
+        assert!(!agent("codexer") && !agent("claudette") && !agent("nodemon"));
     }
 
     #[test]

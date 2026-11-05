@@ -169,8 +169,8 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo 'Добавьте ~/.local/
 [ -n "$ZAM_MACHINE" ] || echo "Добавьте в профиль оболочки: export ZAM_MACHINE=$(uname -n)"
 ```
 
-Токен `zam` и хуки берут из `~/.zeroaimemory/config.toml` (права 0600) — его вместе с адресом
-записывает `zam init --token`. `ZAM_TOKEN` нужна только MCP по HTTP (см. ниже).
+Токен `zam`, хуки и `zam mcp` берут из `~/.zeroaimemory/config.toml` (права 0600) — его вместе с
+адресом записывает `zam init --token`. `ZAM_TOKEN` нужна только MCP по HTTP (см. ниже).
 
 В корне проекта:
 
@@ -184,8 +184,8 @@ zam init --url http://<хост>:7700 --token <токен> --agent claude   # cl
 - вставляет блок инструкции между `<!-- zeroaimemory:begin vN -->` и `<!-- zeroaimemory:end -->` в
   `CLAUDE.md` (`claude`) и/или `AGENTS.md` (`codex`); текст вне блока не меняется;
 - после подтверждения (`--yes` — без вопроса) добавляет хуки `zam hook …` в
-  `.claude/settings.json` / `.codex/hooks.json` и сервер `zeroaimemory` в `.mcp.json`; чужие хуки
-  и серверы остаются; `--no-hooks`, `--no-mcp` — пропустить;
+  `.claude/settings.json` / `.codex/hooks.json` и сервер `zeroaimemory` в `.mcp.json` (с M6 —
+  stdio-прокси `"command": "zam", "args": ["mcp"]`); чужие хуки и серверы остаются; `--no-hooks`, `--no-mcp` — пропустить;
 - пишет `.zeroaimemory/.gitignore` (`cache/`, `logs/`);
 - сохраняет токен и адрес в `~/.zeroaimemory/config.toml` (не в файлы проекта): из `--token` или
   из прежнего блока v1 (тогда советует выпустить новый токен — старый лежал в файле проекта);
@@ -199,12 +199,14 @@ zam init --url http://<хост>:7700 --token <токен> --agent claude   # cl
 `zam status` и дайджест в начале сессии агента). Битый JSON в `.claude/settings.json` или
 `.mcp.json` `zam init` не перезаписывает — исправьте файл и повторите.
 
-**Токен для MCP.** В `.mcp.json` токена нет — `"Authorization": "Bearer ${ZAM_TOKEN}"`, поэтому
-агент должен видеть переменную `ZAM_TOKEN` (перезапустите агента после задания). Windows — команда
-выше (переменная пользователя). Linux — `export ZAM_TOKEN=<токен>` в файле профиля, доступном
-только вам (`chmod 600`): токен в открытом виде, переменную видят все процессы агента. Без
-переменной можно подключить MCP через stdio-прокси `zam mcp` — он берёт токен из
-`~/.zeroaimemory/config.toml`.
+**MCP Claude Code (M6).** `.mcp.json` подключает stdio-прокси `zam mcp`: адрес, токен
+(`~/.zeroaimemory/config.toml` или `ZAM_TOKEN`), решение и имя машины он берёт так же, как `zam`,
+токена в файле нет. Прокси — подпроцесс агента, как и хуки, поэтому находит сессию агента (см.
+«Сессия `zam mcp`» ниже): без неё нет пометок «уже выдавалось» и учёта токенов по сессии.
+`.mcp.json` прежних версий (`"type": "http"`, `Bearer ${ZAM_TOKEN}`) продолжает работать, но без
+сессии — пересоздайте его: `zam init` или фрагмент страницы «Подключение агента». HTTP-транспорт
+по-прежнему годится агентам без хуков; ему нужна переменная `ZAM_TOKEN` в окружении агента
+(Windows — команда выше; Linux — `export ZAM_TOKEN=<токен>` в файле профиля с `chmod 600`).
 
 **Страница WebUI «Подключение агента»** собирает те же фрагменты по выбранным опциям (агент,
 решение, MCP, хуки, запись в Rules, язык) с кнопкой «Копировать» у каждого; токен можно выпустить
@@ -215,23 +217,23 @@ zam init --url http://<хост>:7700 --token <токен> --agent claude   # cl
 файла `config.toml` клиента. Текст блока администратор правит в «Настройки → Шаблон инструкции».
 
 **Codex.** Хуки — `.codex/hooks.json` (Codex попросит подтвердить их в `/hooks`). MCP Codex
-читает из `config.toml`, `zam init` его не пишет; пример для `~/.codex/config.toml` или
-`.codex/config.toml` доверенного проекта:
+читает из `config.toml`, `zam init` его не пишет. Рекомендуемый вариант (M6) — stdio-прокси
+`zam mcp`: адрес, токен и решение — как у остальных команд `zam`, сессия — из привязки хука
+`session-start`; пример для `~/.codex/config.toml` или `.codex/config.toml` доверенного проекта:
+
+```toml
+[mcp_servers.zeroaimemory]
+command = "zam"
+args = ["mcp"]
+```
+
+HTTP-транспорт тоже работает, но без сессии (без пометок «уже выдавалось» и учёта по сессии):
 
 ```toml
 [mcp_servers.zeroaimemory]
 url = "http://<хост>:7700/mcp"
 bearer_token_env_var = "ZAM_TOKEN"
 http_headers = { "X-Zam-Solution" = "<agent_solution_id из solution.toml>" }
-```
-
-Без HTTP-транспорта MCP — stdio-прокси `zam mcp` (адрес, токен и решение — как у остальных
-команд `zam`):
-
-```toml
-[mcp_servers.zeroaimemory]
-command = "zam"
-args = ["mcp"]
 ```
 
 **Порядок ответов `zam mcp`.** Прокси выполняет до 16 запросов параллельно, поэтому ответы
@@ -242,12 +244,13 @@ args = ["mcp"]
 ответа сами; это важно для своих скриптов поверх stdio.
 
 **Сессия `zam mcp` (M6).** Пометки «уже выдавалось» и учёт токенов по сессии работают только
-с явной сессией. `zam mcp` берёт её по порядку: переменная `ZAM_SESSION_ID`, переменная
-`CLAUDE_CODE_SESSION_ID` (если агент передаёт её MCP-процессу), файл привязки
-`.zeroaimemory/cache/agent-<pid>.json`, который пишет хук `session-start` (файл ищется по
-общему с хуком процессу агента и перечитывается раз в 30 с — новая сессия после `/clear`
-подхватывается сама). Без сессии MCP работает как раньше, а выданные токены идут в общий
-счётчик пользователя (`GET /api/v1/sessions/unattributed`).
+с явной сессией. `zam mcp` берёт её по порядку: переменная `ZAM_SESSION_ID` (скрипты, прогоны
+замеров), затем файл привязки `.zeroaimemory/cache/agent-<pid>.json`, который пишет хук
+`session-start` (`zam mcp` ищет его по общему с хуком процессу агента; файл не старше 12 ч;
+пока его нет — поиск раз в секунду, потом раз в 30 с проверка, не перезаписан ли он: новая
+сессия после `/clear` подхватывается сама). Переменной с id сессии Claude Code не даёт. Без
+сессии MCP работает как раньше, а выданные токены идут в общий счётчик пользователя
+(`GET /api/v1/sessions/unattributed`).
 
 Полный протокол работы агента с памятью — `zam guide` (`GET /api/v1/agent-guide`).
 
