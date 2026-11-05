@@ -46,9 +46,19 @@ pub const MIN_PER_CLASS: usize = 15;
 pub const LONG_WORDS: usize = 30;
 /// Не меньше стольких длинных запросов.
 pub const MIN_LONG: usize = 4;
-/// Предел `recall.timeout_ms` прогона: просрочка дала бы «тишину по идеям» и нестабильный
-/// эталон.
-const RECALL_TIMEOUT_MS: &str = "60000";
+/// Конфигурация прогона — явно, а не умолчаниями сервера (ревью задачи 1a2, I-2): умолчания
+/// v0.0.10-m5.7 для подсказок-идей и `recall.timeout_ms = 60000` (просрочка дала бы «тишину по
+/// идеям» и нестабильный эталон). Тест эквивалентности (задачи 9, 16) ставит те же значения.
+pub const RUN_CONFIG: [(&str, &str); 5] = [
+    ("ideas.proactive", "true"),
+    ("ideas.prompt_max", "1"),
+    ("ideas.prompt_top_k", "5"),
+    ("recall.prompt_min_score", "0.6"),
+    ("recall.timeout_ms", "60000"),
+];
+/// Ключ M6 (§9, задача 9): у v0.0.10-m5.7 его нет — порог FTS-only там тот же
+/// `recall.prompt_min_score`; в эталоне — `null`.
+pub const ABSENT_IN_M57: &str = "recall.prompt_min_score_fts";
 /// Предупреждение сервера о просрочке сбора `/recall`.
 const WARN_RECALL_TIMEOUT: &str = "recall timeout";
 
@@ -291,7 +301,8 @@ pub struct IdeaHintsFixture {
     pub queries_blake3: String,
     /// Как снят: режим поиска, сессии, повторы, переопределения конфигурации.
     pub protocol: String,
-    pub config: BTreeMap<String, String>,
+    /// Действующие ключи прогона (`null` — ключа у сервера нет).
+    pub config: BTreeMap<String, Value>,
     pub rows: Vec<IdeaHintRow>,
 }
 
@@ -509,10 +520,10 @@ pub fn run(a: &EvalArgs, p: &Paths, queries_path: &Path) -> Result<()> {
         corpus.ideas.len()
     );
     let server = run::build_server(&p.repo, a.server_bin.as_deref())?;
-    let sets = vec![(
-        "recall.timeout_ms".to_string(),
-        RECALL_TIMEOUT_MS.to_string(),
-    )];
+    let sets: Vec<(String, String)> = RUN_CONFIG
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     let spec = RunSpec {
         name: "idea-hints".into(),
         model: None,
@@ -583,7 +594,7 @@ pub fn run(a: &EvalArgs, p: &Paths, queries_path: &Path) -> Result<()> {
              приходят новые подсказки-идеи (items[].reason = idea), не больше {TOP}; \
              w:<id> → idea:<key>"
         ),
-        config: sets.into_iter().collect(),
+        config: run_config(),
         rows,
     };
     print_summary(&queries, &fx);
@@ -600,6 +611,20 @@ pub fn run(a: &EvalArgs, p: &Paths, queries_path: &Path) -> Result<()> {
     fs::write(&out, serde_json::to_string_pretty(&fx)? + "\n")?;
     println!("  {}", out.display());
     Ok(())
+}
+
+/// Поле `config` эталона: [`RUN_CONFIG`] (числа и логические — JSON-значениями) и
+/// [`ABSENT_IN_M57`] = `null`.
+pub fn run_config() -> BTreeMap<String, Value> {
+    let mut m: BTreeMap<String, Value> = RUN_CONFIG
+        .iter()
+        .map(|(k, v)| {
+            let val = serde_json::from_str::<Value>(v).unwrap_or_else(|_| json!(v));
+            (k.to_string(), val)
+        })
+        .collect();
+    m.insert(ABSENT_IN_M57.to_string(), Value::Null);
+    m
 }
 
 /// Сводка эталона против ожиданий автора (справочно).
@@ -734,6 +759,23 @@ mod tests {
         ]});
         assert_eq!(idea_hints(&v), ["w:b", "w:a"]);
         assert!(idea_hints(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn run_config_is_explicit() {
+        let c = run_config();
+        assert_eq!(c["ideas.prompt_max"], json!(1));
+        assert_eq!(c["ideas.prompt_top_k"], json!(5));
+        assert_eq!(c["ideas.proactive"], json!(true));
+        assert_eq!(c["recall.prompt_min_score"], json!(0.6));
+        assert_eq!(c["recall.timeout_ms"], json!(60000));
+        assert!(c["recall.prompt_min_score_fts"].is_null());
+        // ключи прогона знает и B5.7 (иначе старт упал бы на deny_unknown_fields)
+        let env: Vec<(String, String)> = RUN_CONFIG
+            .iter()
+            .map(|(k, v)| (crate::eval::run::env_key(k), v.to_string()))
+            .collect();
+        assert!(caps::check_known(&env).is_ok());
     }
 
     #[test]

@@ -3,10 +3,15 @@
   "server_git": "91363056d3ba",
   "date": "2026-11-05",
   "ideas_blake3": "196ba783b6c8f633eb1601e4beb419c9b2b50cd0441bd7e92633f2b5f7b19477",
-  "queries_blake3": "31f0cf5f39e0a4bcc2237de57fe62310a6bde5805170ef059d974f297a8879ff",
+  "queries_blake3": "0355c1397b992809350670622364db12bd1d76685cba8fad9b230331998b6b98",
   "protocol": "FTS без моделей; решение 5e7a1e00-2026-4e3a-9a11-000000000e01; идеи — через API (by: human), horizon_days = 0 — SQL data.horizon = сегодня UTC; на запрос — своя сессия X-Zam-Session idea-hints-<id>, POST /recall {event: prompt} повторяется, пока приходят новые подсказки-идеи (items[].reason = idea), не больше 5; w:<id> → idea:<key>",
   "config": {
-    "recall.timeout_ms": "60000"
+    "ideas.proactive": true,
+    "ideas.prompt_max": 1,
+    "ideas.prompt_top_k": 5,
+    "recall.prompt_min_score": 0.6,
+    "recall.prompt_min_score_fts": null,
+    "recall.timeout_ms": 60000
   },
   "rows": [
     {
@@ -401,6 +406,40 @@
       "id": "ih-62",
       "query": "status page for customers",
       "ideas": []
+    },
+    {
+      "id": "ih-63",
+      "query": "в каталоге магазина нужна подписка на снижение цены, плюс отдельно проверь логирование ошибок, мониторинг очереди, ротацию секретов, настройки алертов и бэкапы",
+      "ideas": [
+        "idea:i46"
+      ]
+    },
+    {
+      "id": "ih-64",
+      "query": "our payment team asks whether gift cards could work, and also review the logging setup, queue monitoring, secret rotation, alert thresholds and nightly backups",
+      "ideas": [
+        "idea:i45"
+      ]
+    },
+    {
+      "id": "ih-65",
+      "query": "maybe gift cards someday, but today review the logging setup, queue monitoring, secret rotation, alert thresholds, nightly backups and disk usage",
+      "ideas": []
+    },
+    {
+      "id": "ih-66",
+      "query": "исправить сортировку каталога по цене и починить нестабильные e2e тесты корзины",
+      "ideas": [
+        "idea:i13",
+        "idea:i33"
+      ]
+    },
+    {
+      "id": "ih-67",
+      "query": "починить нестабильные e2e корзины",
+      "ideas": [
+        "idea:i33"
+      ]
     }
   ]
 }

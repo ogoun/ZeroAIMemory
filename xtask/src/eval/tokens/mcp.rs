@@ -186,8 +186,12 @@ pub struct McpInfo {
     pub nuggets_fingerprint: String,
     /// Отпечатки сверены с `nuggets.lock` (`false` — замка нет, прогон до заморозки).
     pub frozen: bool,
-    /// Сценарии, исключённые из всех плеч (старый сервер их не умеет): `<id>: <причина>`.
+    /// Цели корпуса, которых старый сервер не умеет (не созданы в этом плече): `<цель>: <причина>`,
+    /// например `contradicts p01-h→p01-t: …` — только перечень для отчёта.
     pub excluded: Vec<String>,
+    /// Сценарии, исключённые из сравнения всех плеч (их цель старый сервер не умеет): `<id>:
+    /// <причина>`; [`compare`] их не сравнивает ни в одном плече.
+    pub excluded_scenarios: Vec<String>,
     pub counter: String,
     pub read_budget: usize,
 }
@@ -202,10 +206,10 @@ pub struct McpResult {
 }
 
 impl McpResult {
-    /// id исключённых сценариев (`<id>: <причина>`).
+    /// id исключённых сценариев (`info.excluded_scenarios`, `<id>: <причина>`).
     fn excluded_ids(&self) -> BTreeSet<&str> {
         self.info
-            .excluded
+            .excluded_scenarios
             .iter()
             .map(|e| e.split_once(':').map_or(e.as_str(), |(id, _)| id).trim())
             .collect()
@@ -297,7 +301,8 @@ fn same<T: PartialEq + std::fmt::Debug>(errs: &mut Vec<String>, name: &str, arm:
 /// Сравнение плеча `arm` с базой `base`. Условия замера должны совпадать: отпечатки корпуса и
 /// нагетов, часть разбиения, бюджет чтения, счётчик, модель и устройство; у обоих нет
 /// отброшенных переопределений. Сценарии — общие по id; на holdout сценарий только в одном
-/// плече допустим лишь как исключённый (`info.excluded`).
+/// плече допустим лишь как исключённый (`info.excluded_scenarios`), а исключённый в любом плече не
+/// сравнивается ни в одном.
 pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result<Comparison> {
     let (bi, ai) = (&base.info, &arm.info);
     let mut errs = Vec::new();
@@ -365,7 +370,7 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
             .collect();
         if !stray.is_empty() {
             bail!(
-                "holdout: сценарии только в одном плече и не исключённые (info.excluded): \
+                "holdout: сценарии только в одном плече и не исключённые (info.excluded_scenarios): \
                  {stray:?} — приёмка идёт на одном наборе"
             );
         }
@@ -740,15 +745,16 @@ fn run_scenario(
     })
 }
 
-/// Перечень `info.excluded` по парам `contradicts`, которых нет у сервера `server` (B4): каждая
-/// пара (`contradicts <a>→<b>: …`) и сценарий, у которого ожидаемый источник — insight пары
-/// (`<id>: …`): его выдача у старого сервера без связи иная, и в сравнении плеч его нет.
+/// Исключения по парам `contradicts`, которых нет у сервера `server` (B4): цели
+/// (`info.excluded`: `contradicts <a>→<b>: …`) и сценарии, у которых ожидаемый источник — insight
+/// пары (`info.excluded_scenarios`: `<id>: …`): выдача старого сервера без связи по ним иная, и в
+/// сравнении плеч их нет.
 pub fn excluded_by_edges(
     scenarios: &[&Scenario],
     skipped: &[(String, String)],
     server: &str,
-) -> Vec<String> {
-    let mut out: Vec<String> = skipped
+) -> (Vec<String>, Vec<String>) {
+    let targets: Vec<String> = skipped
         .iter()
         .map(|(a, b)| {
             format!(
@@ -757,6 +763,7 @@ pub fn excluded_by_edges(
             )
         })
         .collect();
+    let mut out = Vec::new();
     for sc in scenarios {
         let pairs: Vec<String> = skipped
             .iter()
@@ -775,7 +782,7 @@ pub fn excluded_by_edges(
             ));
         }
     }
-    out
+    (targets, out)
 }
 
 /// Набор ТС-1: корпус, сценарии, отпечатки (сверенные с замком).
@@ -1048,9 +1055,19 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             s.without_contradicts();
         }
         s.load_corpus(&set.corpus)?;
-        let excluded = excluded_by_edges(&chosen, s.skipped_edges(), &caps.tag());
-        if !excluded.is_empty() {
-            println!("исключено (сервер {}): {}", caps.tag(), excluded.join("; "));
+        let (excluded, excluded_scenarios) =
+            excluded_by_edges(&chosen, s.skipped_edges(), &caps.tag());
+        if !excluded.is_empty() || !excluded_scenarios.is_empty() {
+            println!(
+                "исключено (сервер {}): {}",
+                caps.tag(),
+                excluded
+                    .iter()
+                    .chain(&excluded_scenarios)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
         }
         if model.is_some() {
             s.wait_indexed()?;
@@ -1097,6 +1114,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 nuggets_fingerprint: set.nuggets_fingerprint.clone(),
                 frozen: set.frozen,
                 excluded,
+                excluded_scenarios,
                 counter: "bge-m3 tokenizer.json".into(),
                 read_budget: READ_BUDGET,
             },
@@ -1308,6 +1326,9 @@ mod tests {
         let e = compare(&base, &m6, ("b", "m")).unwrap_err().to_string();
         assert!(e.contains("\"x\""), "{e}");
         m6.info.excluded = vec!["x: вид idea не создаётся в B4".into()];
+        // цель в `excluded` сценарий не исключает
+        assert!(compare(&base, &m6, ("b", "m")).is_err());
+        m6.info.excluded_scenarios = vec!["x: вид idea не создаётся в B4".into()];
         let c = compare(&base, &m6, ("b", "m")).unwrap();
         assert_eq!(c.only_base, ["x"]);
     }
@@ -1322,10 +1343,8 @@ mod tests {
                 scen("s-19", 1, path(100, 0, false)),
             ],
         );
-        b4.info.excluded = vec![
-            "contradicts p09-h→p09-t: связь не создана".into(),
-            "s-19: ожидаемый источник в паре contradicts".into(),
-        ];
+        b4.info.excluded = vec!["contradicts p09-h→p09-t: связь не создана".into()];
+        b4.info.excluded_scenarios = vec!["s-19: ожидаемый источник в паре contradicts".into()];
         let m6 = arm(
             "c",
             vec![
@@ -1357,12 +1376,13 @@ mod tests {
             ("p09-h".to_string(), "p09-t".to_string()),
             ("p02-h".to_string(), "p02-t".to_string()),
         ];
-        let ex = excluded_by_edges(&[&s19, &s20, &s1], &skipped, "0.0.5-m4");
-        assert_eq!(ex.len(), 4, "{ex:?}");
-        assert!(ex[0].starts_with("contradicts p09-h→p09-t:"), "{ex:?}");
-        assert!(ex[2].starts_with("s-19: ") && ex[2].contains("p09-h→p09-t"));
-        assert!(ex[3].starts_with("s-20: ") && ex[3].contains("p02-h→p02-t"));
-        assert!(excluded_by_edges(&[&s19], &[], "0.0.10-m5.7").is_empty());
+        let (t, ex) = excluded_by_edges(&[&s19, &s20, &s1], &skipped, "0.0.5-m4");
+        assert_eq!((t.len(), ex.len()), (2, 2), "{t:?} {ex:?}");
+        assert!(t[0].starts_with("contradicts p09-h→p09-t:"), "{t:?}");
+        assert!(ex[0].starts_with("s-19: ") && ex[0].contains("p09-h→p09-t"));
+        assert!(ex[1].starts_with("s-20: ") && ex[1].contains("p02-h→p02-t"));
+        let (t, ex) = excluded_by_edges(&[&s19], &[], "0.0.10-m5.7");
+        assert!(t.is_empty() && ex.is_empty());
     }
 
     /// Точка сетки с отброшенным ключом пропускается с сообщением, остальные сравниваются, в том

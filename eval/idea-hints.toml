@@ -480,3 +480,41 @@ class = "negative"
 expect = []
 about = ["idea:i40"]
 note = "proposed"
+
+# ---- дополнение по ревью задачи 1a2 (M-1) ----
+
+[[query]]
+id = "ih-63"
+prompt = "в каталоге магазина нужна подписка на снижение цены, плюс отдельно проверь логирование ошибок, мониторинг очереди, ротацию секретов, настройки алертов и бэкапы"
+class = "positive"
+expect = ["idea:i46"]
+note = "решает ⌈k/2⌉: значимых слов запроса ≥ 10 (порог покрытия запроса 4), с идеей совпадают 3"
+
+[[query]]
+id = "ih-64"
+prompt = "our payment team asks whether gift cards could work, and also review the logging setup, queue monitoring, secret rotation, alert thresholds and nightly backups"
+class = "positive"
+expect = ["idea:i45"]
+note = "решает ⌈k/2⌉ (en): gift, cards, payment из ≥ 10 значимых слов"
+
+[[query]]
+id = "ih-65"
+prompt = "maybe gift cards someday, but today review the logging setup, queue monitoring, secret rotation, alert thresholds, nightly backups and disk usage"
+class = "negative"
+expect = []
+about = ["idea:i45"]
+note = "граница ⌈k/2⌉: с идеей совпадают 2 слова из ≥ 10 — меньше 3"
+
+[[query]]
+id = "ih-66"
+prompt = "исправить сортировку каталога по цене и починить нестабильные e2e тесты корзины"
+class = "positive"
+expect = ["idea:i13", "idea:i33"]
+note = "две снятые идеи в одном ответе: порядок bm25 второго прохода"
+
+[[query]]
+id = "ih-67"
+prompt = "починить нестабильные e2e корзины"
+class = "positive"
+expect = ["idea:i33"]
+note = "строгий FTS второго прохода по снятой идее (IdeaQuery::matches не применяется)"

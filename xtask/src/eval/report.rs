@@ -422,7 +422,14 @@ pub fn tokens_m6_md(r: &super::tokens::mcp::McpResult) -> String {
         );
     }
     if !i.excluded.is_empty() {
-        let _ = writeln!(s, "Исключено из всех плеч: {}.\n", i.excluded.join("; "));
+        let _ = writeln!(s, "Не созданы у сервера: {}.\n", i.excluded.join("; "));
+    }
+    if !i.excluded_scenarios.is_empty() {
+        let _ = writeln!(
+            s,
+            "Исключено из сравнения всех плеч: {}.\n",
+            i.excluded_scenarios.join("; ")
+        );
     }
     let _ = writeln!(
         s,

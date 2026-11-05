@@ -218,6 +218,21 @@ pub fn build_server(repo: &Path, server_bin: Option<&Path>) -> Result<PathBuf> {
     Ok(exe.parent().context("каталог zam-server")?.to_path_buf())
 }
 
+/// Соседние попадания с **равным** баллом — по пути (M6, задача 1a2, ревью I-1): порядок равных
+/// сервер берёт по случайному id записи, у каждой загрузки свой, и метрики двух прогонов одного
+/// поведения различались бы. Порядок разных баллов не меняется.
+pub fn order_ties(hits: &mut [Hit]) {
+    let mut i = 0;
+    while i < hits.len() {
+        let mut j = i + 1;
+        while j < hits.len() && hits[j].score == hits[i].score {
+            j += 1;
+        }
+        hits[i..j].sort_by(|a, b| a.path.cmp(&b.path));
+        i = j;
+    }
+}
+
 /// Запущенный сервер прогона.
 pub struct Session {
     srv: Server,
@@ -414,6 +429,32 @@ impl Session {
             contradicts: true,
             skipped_edges: Vec::new(),
         })
+    }
+
+    /// Корпус целиком **до старта индексатора** (M6, ревью задачи 1a2, I-1): сервер без моделей
+    /// принимает записи (FTS — в транзакции, векторные задания копятся в очереди), затем
+    /// перезапуск на том же каталоге с моделью `spec` — индексатор получает всю очередь сразу, и
+    /// состав пачек эмбеддера не зависит от темпа загрузки. Время индексации — от перезапуска.
+    pub fn start_preloaded(
+        p: &Paths,
+        spec: &RunSpec,
+        server: &Path,
+        corpus: &Corpus,
+    ) -> Result<Session> {
+        let fts = RunSpec {
+            model: None,
+            device: Device::Cpu,
+            reranker: None,
+            ..spec.clone()
+        };
+        let mut s0 = Session::start(p, &fts, server, true)?;
+        s0.load_corpus(corpus)?;
+        let probes = std::mem::take(&mut s0.area_probes);
+        s0.stop()?;
+        let mut s = Session::start(p, spec, server, false)?;
+        s.area_probes = probes;
+        s.begin_load();
+        Ok(s)
     }
 
     /// Загрузчик не создаёт связи `contradicts`: у сервера их нет (B4, `v0.0.5-m4`; спецификация
@@ -653,6 +694,13 @@ impl Session {
     /// Элементы выдачи: путь заметки или `insight:<key>` записи набора (чужая запись —
     /// `entry:<id>`).
     fn hits(&self, v: &Value) -> Vec<Hit> {
+        let mut hits = self.raw_hits(v);
+        order_ties(&mut hits);
+        hits
+    }
+
+    /// Попадания ответа поиска в порядке сервера.
+    fn raw_hits(&self, v: &Value) -> Vec<Hit> {
         v["items"]
             .as_array()
             .map(|a| {
@@ -1251,13 +1299,23 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
         keep_cuda_path: a.keep_cuda_path,
         ctrl_break: false,
     };
-    let mut s = Session::start(p, &spec, &server, !a.reuse)?;
+    let mut s = if a.preload {
+        Session::start_preloaded(p, &spec, &server, corpus)?
+    } else {
+        Session::start(p, &spec, &server, !a.reuse)?
+    };
     s.check_model()?;
     println!(
         "сервер {}: модель {}, устройство {}",
         s.base, s.status["model"]["id"], s.status["device"]
     );
-    if !a.reuse {
+    if a.preload {
+        println!(
+            "корпус загружен до старта индексатора: {} заметок и {} insight",
+            corpus.notes.len(),
+            corpus.insights.len()
+        );
+    } else if !a.reuse {
         let t0 = Instant::now();
         s.load_corpus(corpus)?;
         println!(
@@ -1385,6 +1443,29 @@ pub fn queries_fingerprint(queries: &[Query]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Равные баллы — по пути, разные — в порядке сервера (в том числе не по убыванию: реранк).
+    #[test]
+    fn ties_ordered_by_path() {
+        let h = |path: &str, score: f64| Hit {
+            path: path.into(),
+            score,
+            sources: Vec::new(),
+            reranked: false,
+        };
+        let mut hits = vec![
+            h("z", 0.9),
+            h("c", 0.7625),
+            h("a", 0.7625),
+            h("b", 0.7625),
+            h("y", 0.5),
+            h("x", 0.6),
+            h("w", 0.6),
+        ];
+        order_ties(&mut hits);
+        let got: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(got, ["z", "a", "b", "c", "y", "w", "x"]);
+    }
 
     #[test]
     fn history_control_fails_on_zero() {

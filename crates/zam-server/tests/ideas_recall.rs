@@ -1254,6 +1254,19 @@ fn idea_hints_fixture_is_wellformed() {
     .expect("эталон — JSON");
     assert_eq!(fx["server_version"], "0.0.10-m5.7", "эталон — с тега M5.7");
     assert_eq!(fx["server_git"], "91363056d3ba");
+    // конфигурация снятия — явно (ревью задачи 1a2, I-2): тест эквивалентности ставит те же
+    // значения, а не полагается на умолчания своей версии
+    let c = &fx["config"];
+    assert_eq!(c["ideas.proactive"], json!(true), "{c}");
+    assert_eq!(c["ideas.prompt_max"], json!(1), "{c}");
+    assert_eq!(c["ideas.prompt_top_k"], json!(5), "{c}");
+    assert_eq!(c["recall.prompt_min_score"], json!(0.6), "{c}");
+    assert_eq!(c["recall.timeout_ms"], json!(60000), "{c}");
+    assert!(
+        c.get("recall.prompt_min_score_fts")
+            .is_some_and(Value::is_null),
+        "ключа M6 у M5.7 нет: {c}"
+    );
     assert_eq!(
         fx["ideas_blake3"].as_str().unwrap(),
         file_blake3(&ideas_path),
