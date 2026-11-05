@@ -325,7 +325,7 @@ expect = ["en/long/dns-outage-postmortem"]
 nuggets = [
   { source = "en/long/dns-outage-postmortem", text = "the resolver software used one shared pool of workers for all queries, with no isolation between forwarded zones and everything else" },
   { source = "en/long/dns-outage-postmortem", text = "slow forwarded queries exhausted the pool and blocked resolution of every other name" },
-  { source = "en/long/dns-outage-postmortem", text = "The resolver supports a per-upstream limit on concurrent queries, which would have contained the damage, but it was not configured." },
+  { source = "en/long/dns-outage-postmortem", text = "The resolvers themselves had no alert on worker pool saturation" },
   { source = "en/long/dns-outage-postmortem", text = "For forwarded zones inside our own network, an answer that does not arrive within a few hundred milliseconds is not going to arrive." },
 ]
 
@@ -374,6 +374,7 @@ nuggets = [
   { source = "ru/long/tls-certificate-rotation", text = "сертификаты для серверов выпускаются максимум на девяносто дней и только автоматически" },
   { source = "ru/long/tls-certificate-rotation", text = "сам выпускает его, кладёт в секрет и обновляет за тридцать дней до истечения" },
   { source = "ru/long/tls-certificate-rotation", text = "обновляет те, у которых осталось меньше трети срока" },
+  { source = "ru/long/tls-certificate-rotation", text = "для них настроены напоминания за шестьдесят и тридцать дней с назначенным владельцем" },
   { source = "ru/ops/tls-expired-certificate", text = "Перезагрузки не было, и в памяти процесса жил старый сертификат до самого истечения." },
   { source = "ru/ops/tls-expired-certificate", text = "Хук перезагрузки когда-то был в cron-скрипте, который удалили при переезде на systemd-таймер." },
 ]
@@ -387,7 +388,7 @@ nuggets = [
   { source = "ru/long/kafka-consumer-lag-analysis", text = "В каждый момент роста отставания группа уходила в перебалансировку, и не одну, а серию из нескольких подряд." },
   { source = "ru/long/kafka-consumer-lag-analysis", text = "преобразование одного такого события в документы занимало до двадцати секунд из-за неэффективного кода сопоставления категорий" },
   { source = "ru/long/kafka-consumer-lag-analysis", text = "Мы перешли на кооперативную стратегию назначения разделов" },
-  { source = "ru/long/kafka-consumer-lag-analysis", text = "Мы заменили обход на словарь, который строится один раз при загрузке дерева категорий" },
+  { source = "ru/long/kafka-consumer-lag-analysis", text = "Исправление состояло из трёх частей: временное уменьшение размера пачки, переход на кооперативную стратегию назначения разделов и исправление алгоритма сопоставления категорий" },
 ]
 
 [[scenario]]
@@ -422,7 +423,7 @@ question = "Благодаря чему прогоны CI стали намно�
 expect = ["ru/long/ci-pipeline-retrospective"]
 nuggets = [
   { source = "ru/long/ci-pipeline-retrospective", text = "в ключ кеша попадал путь к рабочему каталогу агента, а он содержал номер сборки" },
-  { source = "ru/long/ci-pipeline-retrospective", text = "медианное время компиляции на ветке упало с девяти минут до трёх" },
+  { source = "ru/long/ci-pipeline-retrospective", text = "Самый ценный шаг сделан в первую неделю — обёртка, которая пишет время каждого шага" },
   { source = "ru/long/ci-pipeline-retrospective", text = "политику удаления артефактов, к которым не обращались четырнадцать дней" },
   { source = "ru/long/ci-pipeline-retrospective", text = "тест помечается атрибутом, продолжает выполняться в каждом прогоне" },
 ]
@@ -434,7 +435,7 @@ question = "I just got paged — what should I do in the first few minutes, how 
 expect = ["en/long/oncall-handbook"]
 nuggets = [
   { source = "en/long/oncall-handbook", text = "acknowledge it immediately, even before you look at it, so that it does not escalate to the secondary" },
-  { source = "en/long/oncall-handbook", text = "what is broken, since when, who is affected, and what changed recently" },
+  { source = "en/long/oncall-handbook", text = "any page that is still unresolved after thirty minutes is declared an incident" },
   { source = "en/long/oncall-handbook", text = "if users are affected now or will be soon, if data is at risk, or if you need help from anyone outside the rotation" },
   { source = "en/long/oncall-handbook", text = "rollback is cheap and quick, and confirming causation can take an hour" },
 ]
