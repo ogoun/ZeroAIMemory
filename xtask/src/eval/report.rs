@@ -585,49 +585,67 @@ fn tally(t: &super::sessions::Tally) -> String {
 
 /// Строки сводки ТС-2 (общие у плеча и сравнения).
 fn sessions_summary_md(s: &mut String, name: &str, x: &super::sessions::SessionsSummary) {
-    let by: Vec<String> = x
-        .tokens_by_label
+    let kv = |m: &std::collections::BTreeMap<String, usize>| -> String {
+        if m.is_empty() {
+            return "0".into();
+        }
+        m.iter()
+            .map(|(l, n)| format!("{l} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = writeln!(
+        s,
+        "- **{name}**: сессий {}{}, токенов {} ({}); обязательные строки {}; нагеты вопросов {}; \
+         дайджест при двух стартах {}",
+        x.sessions,
+        if x.reps > 1 {
+            format!(" × {} повторов", x.reps)
+        } else {
+            String::new()
+        },
+        x.tokens_total,
+        kv(&x.tokens_by_label),
+        tally(&x.required),
+        tally(&x.nuggets),
+        tally(&x.digest_match)
+    );
+    let kinds: Vec<String> = x
+        .hint_by_kind
         .iter()
-        .map(|(l, n)| format!("{l} {n}"))
+        .map(|(k, t)| {
+            let st = x.hint_by_kind_strict.get(k).copied().unwrap_or_default();
+            format!("{k} {} (строго {})", tally(t), tally(&st))
+        })
         .collect();
     let _ = writeln!(
         s,
-        "- **{name}**: сессий {}, токенов {} ({}); обязательные строки {}; hint_recall общий {}, \
-         (только в ответе события {}), подсказки-идеи {}; нагеты вопросов {}; повторная выдача {}; \
-         дайджест при двух стартах {}",
-        x.sessions,
-        x.tokens_total,
-        by.join(", "),
-        tally(&x.required),
+        "  - hint_recall общий {} (строго в событии {}); подсказки-идеи {} (строго {}); по видам: \
+         {}; зачёт: {}",
         tally(&x.hint_recall),
         tally(&x.hint_recall_strict),
         tally(&x.idea_hint_recall),
-        tally(&x.nuggets),
-        tally(&x.repeated),
-        tally(&x.digest_match)
+        tally(&x.idea_hint_recall_strict),
+        kinds.join("; "),
+        kv(&x.hint_credit)
     );
-    let ideas: Vec<String> = x
-        .idea_tokens
-        .iter()
-        .map(|(l, n)| format!("{l} {n}"))
-        .collect();
-    let snap: Vec<String> = x
-        .snapshot_tokens
-        .iter()
-        .map(|(l, n)| format!("{l} {n}"))
-        .collect();
     let _ = writeln!(
         s,
-        "  - идеи: {}; снимок сессии: {}",
-        if ideas.is_empty() {
-            "0".into()
+        "  - повторная выдача {} (между каналами {}); идеи: {}; снимок сессии: {}{}{}",
+        tally(&x.repeated),
+        tally(&x.repeated_cross),
+        kv(&x.idea_tokens),
+        kv(&x.snapshot_tokens),
+        x.rep_noise_p95.map_or(String::new(), |p| format!(
+            "; шум повторов (p95 |Δ|/повтор 0): {p:.4}"
+        )),
+        if x.bad_outputs > 0 || x.hook_budget_misses > 0 {
+            format!(
+                "; неразобранных выводов хука: {}, хуков сверх бюджета: {}",
+                x.bad_outputs, x.hook_budget_misses
+            )
         } else {
-            ideas.join(", ")
-        },
-        if snap.is_empty() {
-            "0".into()
-        } else {
-            snap.join(", ")
+            String::new()
         }
     );
     if !x.required_missing.is_empty() {
@@ -701,17 +719,13 @@ pub fn sessions_md(r: &super::sessions::SessionsResult) -> String {
     s
 }
 
-/// Сравнение плеч ТС-2 на пересечении событий (§3.3).
+/// Сравнение плеч ТС-2 на пересечении событий (§3.3): весь набор и профили.
 pub fn sessions_comparison_md(c: &super::sessions::SessionsComparison) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "\n## ТС-2: {} ({}) против {} ({}), сессий {}\n",
-        c.arm_name,
-        c.arm_server,
-        c.base_name,
-        c.base_server,
-        c.sessions.len()
+        "\n## ТС-2: {} ({}) против {} ({})\n",
+        c.arm_name, c.arm_server, c.base_name, c.base_server
     );
     let _ = writeln!(
         s,
@@ -719,20 +733,36 @@ pub fn sessions_comparison_md(c: &super::sessions::SessionsComparison) -> String
          ожидания {:?}",
         c.exclusions.labels, c.exclusions.classes, c.exclusions.required, c.exclusions.expect
     );
-    let _ = writeln!(s, "\n| Событие | база | плечо | R |\n|---|---:|---:|---|");
-    for l in c.by_label.iter().chain(std::iter::once(&c.total)) {
+    let d = |e: &Option<super::metrics::Estimate>| e.as_ref().map_or("—".into(), est);
+    for p in &c.parts {
         let _ = writeln!(
             s,
-            "| {} | {} | {} | {} |",
-            l.label,
-            l.base,
-            l.arm,
-            l.r.as_ref().map_or("—".into(), est)
+            "\n### {} (сессий {})\n\n| Событие | база | плечо | R |\n|---|---:|---:|---|",
+            p.part,
+            p.sessions.len()
         );
+        for l in p.by_label.iter().chain(std::iter::once(&p.total)) {
+            let _ = writeln!(
+                s,
+                "| {} | {:.0} | {:.0} | {} |",
+                l.label,
+                l.base,
+                l.arm,
+                l.r.as_ref().map_or("—".into(), est)
+            );
+        }
+        let _ = writeln!(
+            s,
+            "\n- Δ (плечо − база, общие элементы, односторонние 95 %): hint_recall {}, строго {}, \
+             обязательные строки {}",
+            d(&p.d_hint_recall),
+            d(&p.d_hint_recall_strict),
+            d(&p.d_required)
+        );
+        sessions_summary_md(&mut s, "база", &p.base_summary);
+        sessions_summary_md(&mut s, "плечо", &p.arm_summary);
     }
     let _ = writeln!(s);
-    sessions_summary_md(&mut s, "база", &c.base_summary);
-    sessions_summary_md(&mut s, "плечо", &c.arm_summary);
     if let Some(m) = &c.idea_hints_match {
         let _ = writeln!(s, "- подсказки-идеи prompt совпали с базой: {}", tally(m));
     }
@@ -749,7 +779,8 @@ pub fn sessions_comparison_md(c: &super::sessions::SessionsComparison) -> String
     }
     let _ = writeln!(
         s,
-        "- бутстреп: {} выборок, зерно {:#x} (парный по сессиям).",
+        "- бутстреп: {} выборок, зерно {:#x} (парный по сессиям; токены сессии — среднее по \
+         повторам).",
         c.bootstrap_samples, c.bootstrap_seed
     );
     if !c.only_base.is_empty() || !c.only_arm.is_empty() {

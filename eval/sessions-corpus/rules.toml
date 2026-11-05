@@ -131,3 +131,85 @@ text = """
 A change is merged after one approval from the owning team. The author answers every comment
 before merging. Changes to payments, authentication and migrations need a second reviewer.
 """
+
+# ---- задача 4 M6 (ревью): Rules 13–20 — миры тяжёлого профиля до RULES_MAX = 20 ----
+
+[[rule]]
+key = "payments-idempotency"
+path = "backend/payments-idempotency"
+text = """
+# Идемпотентность платежей
+
+Каждый запрос к платёжному провайдеру несёт ключ идемпотентности из номера заказа и попытки.
+Повтор после тайм-аута идёт с тем же ключом: новый ключ на повторе означает двойное списание.
+"""
+
+[[rule]]
+key = "feature-flags"
+path = "process/feature-flags"
+text = """
+# Feature flags
+
+Every flag has an owner and a removal date in its description. A flag older than two releases
+after full rollout is removed together with its dead code branch in the next release.
+"""
+
+[[rule]]
+key = "metrics"
+path = "backend/metrics"
+text = """
+# Метрики сервисов
+
+Метрики — в формате Prometheus с префиксом имени сервиса. Метка не может содержать id заказа,
+пользователя или адрес: высокая кардинальность роняет хранилище метрик.
+"""
+
+[[rule]]
+key = "db-indexes"
+path = "backend/db-indexes"
+text = """
+# Indexes
+
+New indexes on large tables are created with CREATE INDEX CONCURRENTLY in a migration of their
+own. The query plan before and after is attached to the task.
+"""
+
+[[rule]]
+key = "errors-api"
+path = "backend/api-errors"
+text = """
+# Ошибки API
+
+Ошибки API отдаются в формате problem+json с полем code. Текст ошибки не раскрывает SQL,
+пути файлов и имена внутренних сервисов.
+"""
+
+[[rule]]
+key = "i18n"
+path = "frontend/i18n"
+text = """
+# Translations
+
+User-facing strings of the storefront live in the locale files only; a hard-coded string in a
+component fails the lint step. Russian and English locales are updated in the same commit.
+"""
+
+[[rule]]
+key = "cache-headers"
+path = "frontend/cache-headers"
+text = """
+# Заголовки кэша
+
+Статика витрины с хэшем в имени отдаётся с Cache-Control immutable на год. HTML и /config.json
+— только no-cache: иначе после релиза покупатели получают старую сборку.
+"""
+
+[[rule]]
+key = "oncall"
+path = "process/on-call"
+text = """
+# On-call
+
+The on-call engineer acknowledges a page within fifteen minutes. A production change during an
+incident is announced in the incident channel before it is made.
+"""

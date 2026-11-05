@@ -56,6 +56,34 @@ lang = "en"
 title = "Cache dependency checks of /health"
 status = "done"
 
+[[task]]
+key = "t-price-import"
+lang = "ru"
+title = "Фоновый импорт прайс-листов с отчётом об ошибках строк"
+body = "Импорт прайс-листа идёт в запросе и падает по тайм-ауту на больших файлах."
+status = "in_progress"
+next_step = "вынести разбор в очередь задач и отдавать продавцу отчёт по строкам"
+
+[[task]]
+key = "t-cdn-cache"
+lang = "en"
+title = "Serve storefront static files from the CDN with immutable caching"
+status = "in_progress"
+next_step = "switch the build to hashed file names"
+
+[[task]]
+key = "t-sitemap"
+lang = "ru"
+title = "Карта сайта витрины для поисковиков"
+status = "blocked"
+blocked_by = "нет решения, какие разделы каталога открывать для индексации"
+
+[[task]]
+key = "t-old-cart"
+lang = "en"
+title = "Remove the old cart code"
+status = "done"
+
 # ---- вопросы к человеку ----
 
 [[question]]
@@ -87,8 +115,30 @@ lang = "ru"
 title = "Нужна ли тёмная тема в кабинете продавца в этом квартале?"
 body = "Дизайн готов, но есть задачи по импорту прайс-листов."
 
+[[question]]
+key = "q-cache-ttl"
+lang = "ru"
+title = "Сколько хранить карточки товаров в кэше CDN?"
+answer = { text = "Пять минут, сброс при изменении цены" }
+
+[[question]]
+key = "q-import-limit"
+lang = "en"
+title = "What is the maximum price list size for one import?"
+answer = { text = "50 MB per file, larger files are split by the seller" }
+
+[[question]]
+key = "q-oncall-window"
+lang = "ru"
+title = "Можно ли выкатывать исправления ночью без дежурного?"
+answer = { text = "Нет, только при дежурном на связи" }
+
 # ---- запросы доступа ----
 
 [[access]]
 key = "a-maria"
 user = "maria"
+
+[[access]]
+key = "a-ivan"
+user = "ivan"

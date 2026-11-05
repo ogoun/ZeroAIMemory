@@ -172,6 +172,10 @@ pub struct EvalArgs {
     /// --sessions: база — бинарники тега target/tags/<тег>/release (вместо --server-bin/--zam-bin)
     #[arg(long, value_enum, requires = "sessions", conflicts_with_all = ["server_bin", "cli_bin"])]
     pub base: Option<sessions::Base>,
+    /// --sessions: повторов каждой сессии на свежем сервере (гибрид недетерминирован: K ≥ 3;
+    /// сравнение — по среднему на сессию, шум внутри плеча — в сводке)
+    #[arg(long, default_value_t = 1, requires = "sessions")]
+    pub repeat: usize,
     /// --sessions: `zam mcp` без ZAM_SESSION_ID и файла привязки (неявный путь R13) и у M6
     #[arg(long, requires = "sessions")]
     pub implicit_mcp: bool,

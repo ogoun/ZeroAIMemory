@@ -34,7 +34,9 @@ use serde_json::{Value, json};
 use super::caps::{self, ServerCaps};
 use super::corpus::EVAL_SOLUTION;
 use super::hints::{self, Hooks};
-use super::metrics::{BOOTSTRAP_M6, Estimate, SEED, quantile, ratio_estimate_with};
+use super::metrics::{
+    BOOTSTRAP_M6, Estimate, SEED, paired_diff_weighted, quantile, ratio_estimate_with,
+};
 use super::nuggets;
 use super::run::{self, RunSpec, Session};
 use super::sessions_corpus::{self, IdeaState, SessionsCorpus};
@@ -44,9 +46,12 @@ use super::{Device, EvalArgs, Mode, Paths};
 use crate::smoke::{admin_login, agent_with, api_with, scrub_zam_env};
 
 /// Минимум сессий набора, стандартного и тяжёлого профилей (§3.1).
-pub const MIN_SESSIONS: usize = 12;
-pub const MIN_STANDARD: usize = 8;
-pub const MIN_HEAVY: usize = 4;
+/// Ревью задачи 4 (I1): стандартных ≥ 16 — holdout профиля ≥ 6; тяжёлых ≥ 6 с разными мирами.
+pub const MIN_SESSIONS: usize = 22;
+pub const MIN_STANDARD: usize = 16;
+pub const MIN_HEAVY: usize = 6;
+/// Минимум разных миров тяжёлого профиля (число Rules, задач, ответов, идей).
+pub const MIN_HEAVY_WORLDS: usize = 4;
 /// Все записи файла корпуса в списке мира сессии.
 pub const ALL: &str = "*";
 /// Предел ответа `zam mcp` на вызов.
@@ -299,6 +304,8 @@ pub struct SetSummary {
     pub events: BTreeMap<String, usize>,
     pub prompts_with_idea: usize,
     pub nuggets: usize,
+    /// Разные миры тяжёлого профиля.
+    pub heavy_worlds: usize,
 }
 
 /// Проверка набора по §3.1 (все нарушения — одной ошибкой).
@@ -307,6 +314,7 @@ pub fn validate_set(set: &[SessionSpec], c: &SessionsCorpus) -> Result<SetSummar
     let mut ids = BTreeSet::new();
     let mut sum = SetSummary::default();
     let mut idea_prompt_by_profile: BTreeSet<Profile> = BTreeSet::new();
+    let mut heavy_worlds: BTreeSet<(usize, usize, usize, usize)> = BTreeSet::new();
     for s in set {
         let e = |m: String| format!("{}: {m}", s.id);
         let prefix = match s.profile {
@@ -339,6 +347,13 @@ pub fn validate_set(set: &[SessionSpec], c: &SessionsCorpus) -> Result<SetSummar
             }
             Profile::Heavy => {
                 sum.heavy += 1;
+                heavy_worlds.insert((w.rules.len(), w.active_tasks(), w.answers(), w.ideas.len()));
+                if w.active_tasks() > 5 || w.answers() > 5 || w.rules.len() > 20 {
+                    errs.push(e(
+                        "тяжёлый профиль: не больше 5 задач и 5 ответов (пределы разделов),                          20 Rules (RULES_MAX) — иначе строка обязана выпасть"
+                            .into(),
+                    ));
+                }
                 let human_open: Vec<_> = w
                     .ideas
                     .iter()
@@ -487,6 +502,12 @@ pub fn validate_set(set: &[SessionSpec], c: &SessionsCorpus) -> Result<SetSummar
             sum.sessions, sum.standard, sum.heavy
         ));
     }
+    if sum.heavy > 0 && heavy_worlds.len() < MIN_HEAVY_WORLDS.min(sum.heavy) {
+        errs.push(format!(
+            "миров тяжёлого профиля {} (число Rules, задач, ответов, идей): нужно ≥ {MIN_HEAVY_WORLDS}",
+            heavy_worlds.len()
+        ));
+    }
     for p in [Profile::Standard, Profile::Heavy] {
         if !idea_prompt_by_profile.contains(&p) && !set.is_empty() {
             errs.push(format!(
@@ -495,6 +516,7 @@ pub fn validate_set(set: &[SessionSpec], c: &SessionsCorpus) -> Result<SetSummar
             ));
         }
     }
+    sum.heavy_worlds = heavy_worlds.len();
     if !errs.is_empty() {
         bail!("набор сессий ТС-2:\n  {}", errs.join("\n  "));
     }
@@ -699,6 +721,35 @@ impl RefMap {
     }
 }
 
+/// Текст для счёта токенов: `<буква>:<id>` и `c_<id>` (id — 26 символов) — постоянной
+/// заглушкой той же длины: число токенов не зависит от случайных id загрузки.
+pub fn fixed_ids(text: &str) -> String {
+    const STUB: &str = "00000000000000000000000000";
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i + 28 <= b.len() {
+        let prev_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        let head =
+            (b[i].is_ascii_lowercase() && b[i + 1] == b':') || (b[i] == b'c' && b[i + 1] == b'_');
+        if prev_ok
+            && head
+            && b[i + 2..i + 28].iter().all(u8::is_ascii_alphanumeric)
+            && b.get(i + 28).is_none_or(|c| !c.is_ascii_alphanumeric())
+        {
+            out.push_str(&text[last..i + 2]);
+            out.push_str(STUB);
+            i += 28;
+            last = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Строка помечена «уже выдавалось» (`(seen)` или `(выдавалось)`).
 fn marked_seen(line: &str) -> bool {
     line.contains("(seen)") || line.contains("(выдавалось)")
@@ -761,81 +812,72 @@ pub fn classify(text: &str, count: &dyn Fn(&str) -> usize) -> BTreeMap<String, u
 // ---------------------------------------------------------------------------------------------
 // Обязательные строки
 
-/// Обязательная строка дайджеста или восстановления: вид, ключ, текст-признак.
+/// Признак обязательной строки: ссылка набора (`rule:`, `task:`, `question:`, `idea:`) — строка
+/// найдена, если в тексте есть ссылка на её id (`n:`/`k:`/`q:`/`w:`), — или текст.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Needle {
+    Ref(String),
+    Text(String),
+}
+
+/// Обязательная строка дайджеста или восстановления: вид, ключ, признак.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Required {
     pub kind: &'static str,
     pub key: String,
-    pub needle: String,
+    pub needle: Needle,
 }
 
-/// Строка дайджеста об ожидающих запросах доступа (одинакова с M4).
+/// Строка дайджеста об ожидающих запросах доступа (одинакова с M4): логина в ней нет, ссылки —
+/// тоже, поэтому признак — текст.
 const ACCESS_LINE: &str = "запросы доступа к вашим решениям ждут ответа";
-
-/// Заголовок заметки Rules (`# …`).
-fn rule_title(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find_map(|l| l.strip_prefix("# "))
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
 
 /// Обязательные строки мира (§3.1): все Rules, задачи `in_progress`/`blocked`, ответы человека,
 /// запросы доступа, идеи раздела `### Идеи` (`digest_ideas`). `ideas` — включать идеи.
 pub fn required_lines(s: &SessionSpec, w: &World, ideas: bool) -> Vec<Required> {
+    let r = |kind: &'static str, key: &str, set_ref: String| Required {
+        kind,
+        key: key.to_string(),
+        needle: Needle::Ref(set_ref),
+    };
     let mut out = Vec::new();
-    for r in &w.rules {
-        out.push(Required {
-            kind: req::RULE,
-            key: r.key.clone(),
-            needle: rule_title(&r.text),
-        });
+    for x in &w.rules {
+        out.push(r(req::RULE, &x.key, format!("rule:{}", x.key)));
     }
     for t in &w.tasks {
         if matches!(t.status.as_str(), "in_progress" | "blocked") {
-            out.push(Required {
-                kind: req::TASK,
-                key: t.key.clone(),
-                needle: t.title.clone(),
-            });
+            out.push(r(req::TASK, &t.key, format!("task:{}", t.key)));
         }
     }
     for q in &w.questions {
         if q.answer.is_some() {
-            out.push(Required {
-                kind: req::ANSWER,
-                key: q.key.clone(),
-                needle: q.title.clone(),
-            });
+            out.push(r(req::ANSWER, &q.key, format!("question:{}", q.key)));
         }
     }
     for a in &w.access {
-        // строка дайджеста называет число запросов, а не логин (с M4)
         out.push(Required {
             kind: req::ACCESS,
             key: a.key.clone(),
-            needle: ACCESS_LINE.to_string(),
+            needle: Needle::Text(ACCESS_LINE.to_string()),
         });
     }
     if ideas {
         for k in &s.digest_ideas {
-            if let Some(i) = w.ideas.iter().find(|i| &i.key == k) {
-                out.push(Required {
-                    kind: req::IDEA,
-                    key: k.clone(),
-                    needle: i.title.clone(),
-                });
+            if w.ideas.iter().any(|i| &i.key == k) {
+                out.push(r(req::IDEA, k, format!("idea:{k}")));
             }
         }
     }
     out
 }
 
-/// Строка выдана: признак целиком в тексте (оба — после [`nuggets::normalize_md`]).
-fn line_found(text_norm: &str, needle: &str) -> bool {
-    nuggets::found(text_norm, needle)
+/// Строка выдана: ссылка на id признака (через `refs`) или текст признака целиком (после
+/// [`nuggets::normalize_md`]).
+fn line_found(text: &str, needle: &Needle, refs: &RefMap) -> bool {
+    match needle {
+        Needle::Ref(k) => refs.keys(text).iter().any(|x| x == k),
+        Needle::Text(t) => nuggets::found(&nuggets::normalize_md(text), t),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -846,6 +888,8 @@ fn line_found(text_norm: &str, needle: &str) -> bool {
 pub struct HookOut {
     pub text: String,
     pub log: Vec<String>,
+    /// Непустой вывод, который не разобрался как JSON хука.
+    pub bad_output: bool,
 }
 
 /// Исполнитель событий: хуки и MCP одной сессии (настоящий — процессы `zam`, в тестах — мок).
@@ -865,8 +909,16 @@ pub struct StepRun {
     /// Номер события набора (`None` — старт сессии).
     pub event: Option<usize>,
     pub tool: String,
+    /// Токены текста, в котором id ссылок заменены постоянной заглушкой ([`fixed_ids`]):
+    /// случайные id каждой загрузки не дают шума (ревью задачи 4); решающая величина.
     pub tokens: usize,
-    /// Токены классов строк ([`classify`]).
+    /// Токены текста как есть (справочно).
+    #[serde(default)]
+    pub tokens_raw: usize,
+    /// Вывод хука не разобрался как JSON Claude Code (текст агенту неизвестен).
+    #[serde(default)]
+    pub bad_output: bool,
+    /// Токены классов строк ([`classify`], на тексте [`fixed_ids`]).
     pub classes: BTreeMap<String, usize>,
     /// Ссылки набора в строках без пометки «уже выдавалось».
     pub refs: Vec<String>,
@@ -888,6 +940,19 @@ pub struct HintCheck {
     /// идея из `### Идеи`, повтор insight).
     #[serde(default)]
     pub earlier: Vec<String>,
+    /// Источник раньше выданной ожидаемой (по порядку `expect`; пусто — раньше не было):
+    /// `digest` (`session_start`/`recovery`), `mcp`, `hooks` (прочие хуки).
+    #[serde(default)]
+    pub credit: Vec<String>,
+}
+
+/// Источник зачёта «было раньше» по метке шага.
+fn source_of(l: &str) -> &'static str {
+    match l {
+        label::SESSION_START | label::RECOVERY => "digest",
+        label::QUESTION | label::REPEAT | label::SUBAGENT_MCP => "mcp",
+        _ => "hooks",
+    }
 }
 
 /// Проверка обязательной строки в выдаче шага `step` (`session_start` или `recovery`).
@@ -927,6 +992,9 @@ pub struct SessionRun {
     /// События, которые плечо не воспроизводит (метки шагов).
     pub skipped: Vec<String>,
     pub notes: Vec<String>,
+    /// Номер повтора сессии (`--repeat K`: свежий сервер на каждый повтор).
+    #[serde(default)]
+    pub rep: usize,
 }
 
 /// Счётчик токенов.
@@ -956,16 +1024,16 @@ impl Play<'_> {
                 }
             }
         }
+        let fixed = fixed_ids(&text);
+        let n = |t: &str| if t.is_empty() { 0 } else { (self.count)(t) };
         self.run.steps.push(StepRun {
             label: label.to_string(),
             event,
             tool: tool.to_string(),
-            tokens: if text.is_empty() {
-                0
-            } else {
-                (self.count)(&text)
-            },
-            classes: classify(&text, self.count),
+            tokens: n(&fixed),
+            tokens_raw: n(&text),
+            bad_output: false,
+            classes: classify(&fixed, self.count),
             refs,
             marked,
             text,
@@ -984,7 +1052,14 @@ impl Play<'_> {
         for l in out.log {
             self.run.notes.push(format!("hooks.log ({cmd}): {l}"));
         }
-        Ok(self.step(label, event, cmd, out.text))
+        let i = self.step(label, event, cmd, out.text);
+        if out.bad_output {
+            self.run.steps[i].bad_output = true;
+            self.run
+                .notes
+                .push(format!("{cmd} ({label}): вывод хука — не JSON Claude Code"));
+        }
+        Ok(i)
     }
 
     fn mcp(&mut self, label: &str, event: usize, tool: &str, args: Value) -> Result<usize> {
@@ -997,14 +1072,14 @@ impl Play<'_> {
     }
 
     fn required(&mut self, step: usize, req: &[Required], kinds_skip: &[&str]) {
-        let norm = nuggets::normalize_md(&self.run.steps[step].text);
         let label = self.run.steps[step].label.clone();
         for r in req.iter().filter(|r| !kinds_skip.contains(&r.kind)) {
+            let found = line_found(&self.run.steps[step].text, &r.needle, self.refs);
             self.run.required.push(RequiredCheck {
                 step: label.clone(),
                 kind: r.kind.to_string(),
                 key: r.key.clone(),
-                found: line_found(&norm, &r.needle),
+                found,
             });
         }
     }
@@ -1013,15 +1088,27 @@ impl Play<'_> {
         let mut shown: Vec<String> = Vec::new();
         let mut ideas: Vec<String> = Vec::new();
         let first = steps.iter().copied().min().unwrap_or(self.run.steps.len());
-        let before: BTreeSet<&String> = self.run.steps[..first]
+        // после compact контекст агента потерян: «было раньше» — только с последнего пакета
+        // восстановления (он сам — дайджест)
+        let from = self.run.steps[..first]
             .iter()
-            .flat_map(|s| s.refs.iter().chain(&s.marked))
-            .collect();
-        let earlier: Vec<String> = expect
-            .iter()
-            .filter(|e| before.contains(e))
-            .cloned()
-            .collect();
+            .rposition(|s| s.label == label::RECOVERY)
+            .unwrap_or(0);
+        let mut earlier: Vec<String> = Vec::new();
+        let mut credit: Vec<String> = Vec::new();
+        for e in expect {
+            let src = self.run.steps[from..first]
+                .iter()
+                .find(|s| s.refs.contains(e) || s.marked.contains(e))
+                .map(|s| source_of(&s.label));
+            match src {
+                Some(src) => {
+                    earlier.push(e.clone());
+                    credit.push(src.to_string());
+                }
+                None => credit.push(String::new()),
+            }
+        }
         for &s in steps {
             for k in self.refs.keys(&self.run.steps[s].text) {
                 if k.starts_with("idea:") && !ideas.contains(&k) {
@@ -1039,6 +1126,7 @@ impl Play<'_> {
             shown,
             idea_hints: ideas,
             earlier,
+            credit,
         });
     }
 
@@ -1395,12 +1483,40 @@ pub struct SessionsSummary {
     pub hint_recall_strict: Tally,
     /// `hint_recall` подсказок-идей.
     pub idea_hint_recall: Tally,
+    /// То же, только в ответе события.
+    #[serde(default)]
+    pub idea_hint_recall_strict: Tally,
+    /// `hint_recall` по видам ожиданий (`rule`, `insight`, `term`, `idea`): зачёт и строго.
+    #[serde(default)]
+    pub hint_by_kind: BTreeMap<String, Tally>,
+    #[serde(default)]
+    pub hint_by_kind_strict: BTreeMap<String, Tally>,
+    /// Чем засчитаны выданные ожидаемые: `event` (ответ события), `digest`, `mcp`, `hooks`.
+    #[serde(default)]
+    pub hint_credit: BTreeMap<String, usize>,
     /// Нагеты вопросов (микро-полнота).
     pub nuggets: Tally,
     /// Совпадение дайджеста при двух стартах.
     pub digest_match: Tally,
-    /// Повторная выдача: ссылки строк без пометки, уже выданные раньше в сессии.
+    /// Повторная выдача: ссылки строк без пометки, уже выданные раньше в сессии тем же каналом
+    /// (хуки, MCP агента, MCP субагента).
     pub repeated: Tally,
+    /// То же между каналами (справочно).
+    #[serde(default)]
+    pub repeated_cross: Tally,
+    /// Шаги с неразобранным выводом хука.
+    #[serde(default)]
+    pub bad_outputs: usize,
+    /// Хуки, не уложившиеся в бюджет (`hooks.log`: «бюджет исчерпан», «тайм-аут»): ответ агенту
+    /// пуст или неполон — так ведёт себя продукт, шаг считается как есть.
+    #[serde(default)]
+    pub hook_budget_misses: usize,
+    /// Повторов на сессию (`--repeat`) и 95-й перцентиль |Δ| / повтор 0 токенов сессии между
+    /// повторами — шум A/A внутри плеча.
+    #[serde(default)]
+    pub reps: usize,
+    #[serde(default)]
+    pub rep_noise_p95: Option<f64>,
     /// Токены идей по меткам (`session_start`, `prompt`).
     pub idea_tokens: BTreeMap<String, usize>,
     /// Токены снимка сессии по меткам.
@@ -1422,11 +1538,10 @@ pub fn step_tokens(s: &StepRun, ex: &BTreeSet<String>) -> usize {
 /// выданных тем же каналом (хуки или MCP) в **прошлых** событиях сессии (карточка и чтение того
 /// же источника в одном вопросе — не повтор); пакет восстановления (контекст потерян) не
 /// считается.
-fn repeats(r: &SessionRun, labels_ex: &BTreeSet<String>) -> Tally {
-    let mcp = [label::QUESTION, label::REPEAT, label::SUBAGENT_MCP];
-    // (канал MCP?, ссылка) прошлых событий и текущего
-    let mut seen: BTreeSet<(bool, &str)> = BTreeSet::new();
-    let mut current: BTreeSet<(bool, &str)> = BTreeSet::new();
+fn repeats(r: &SessionRun, labels_ex: &BTreeSet<String>, cross: bool) -> Tally {
+    // (канал, ссылка) прошлых событий и текущего; `cross` — один общий канал
+    let mut seen: BTreeSet<(u8, &str)> = BTreeSet::new();
+    let mut current: BTreeSet<(u8, &str)> = BTreeSet::new();
     let mut event: Option<Option<usize>> = None;
     let mut t = Tally::default();
     for s in &r.steps {
@@ -1437,7 +1552,12 @@ fn repeats(r: &SessionRun, labels_ex: &BTreeSet<String>) -> Tally {
             seen.append(&mut current);
             event = Some(s.event);
         }
-        let ch = mcp.contains(&s.label.as_str());
+        let ch = match s.label.as_str() {
+            _ if cross => 0,
+            label::QUESTION | label::REPEAT => 1,
+            label::SUBAGENT_MCP => 2,
+            _ => 0,
+        };
         for k in &s.refs {
             if current.insert((ch, k.as_str())) {
                 t.add(seen.contains(&(ch, k.as_str())));
@@ -1533,9 +1653,24 @@ pub fn summarize(runs: &[SessionRun], ex: &Exclusions) -> SessionsSummary {
                 let hit = now || h.earlier.contains(e);
                 if k == "idea" {
                     sum.idea_hint_recall.add(hit);
+                    sum.idea_hint_recall_strict.add(now);
                 } else {
                     sum.hint_recall.add(hit);
                     sum.hint_recall_strict.add(now);
+                }
+                sum.hint_by_kind.entry(k.to_string()).or_default().add(hit);
+                sum.hint_by_kind_strict
+                    .entry(k.to_string())
+                    .or_default()
+                    .add(now);
+                let src = if now {
+                    "event".to_string()
+                } else {
+                    let i = h.expect.iter().position(|x| x == e).unwrap_or(0);
+                    h.credit.get(i).cloned().unwrap_or_default()
+                };
+                if !src.is_empty() {
+                    *sum.hint_credit.entry(src).or_default() += 1;
                 }
             }
         }
@@ -1547,10 +1682,41 @@ pub fn summarize(runs: &[SessionRun], ex: &Exclusions) -> SessionsSummary {
         if let Some(m) = r.digest_match {
             sum.digest_match.add(m);
         }
-        let t = repeats(r, &ex.labels);
+        let t = repeats(r, &ex.labels, false);
         sum.repeated.found += t.found;
         sum.repeated.total += t.total;
+        let t = repeats(r, &ex.labels, true);
+        sum.repeated_cross.found += t.found;
+        sum.repeated_cross.total += t.total;
+        sum.bad_outputs += r.steps.iter().filter(|s| s.bad_output).count();
+        sum.hook_budget_misses += r
+            .notes
+            .iter()
+            .filter(|n| {
+                n.starts_with("hooks.log")
+                    && (n.contains("бюджет исчерпан") || n.contains("тайм-аут"))
+            })
+            .count();
     }
+    let mut by_id: BTreeMap<&str, Vec<&SessionRun>> = BTreeMap::new();
+    for r in runs {
+        by_id.entry(r.id.as_str()).or_default().push(r);
+    }
+    sum.sessions = by_id.len();
+    sum.reps = by_id.values().map(Vec::len).max().unwrap_or(0);
+    let mut d = Vec::new();
+    for rs in by_id.values() {
+        let tot = |r: &SessionRun| session_tokens(r, ex).values().sum::<usize>() as f64;
+        if let Some(r0) = rs.iter().find(|r| r.rep == 0) {
+            let t0 = tot(r0);
+            for r in rs.iter().filter(|r| r.rep > 0) {
+                if t0 > 0.0 {
+                    d.push((tot(r) - t0).abs() / t0);
+                }
+            }
+        }
+    }
+    sum.rep_noise_p95 = (!d.is_empty()).then(|| quantile(&d, 0.95));
     sum
 }
 
@@ -1577,6 +1743,13 @@ pub struct SessionsInfo {
     pub mcp: String,
     pub counter: String,
     pub sessions_blake3: String,
+    /// Отпечаток корпуса ТС-2 (`eval/sessions-corpus` целиком, с `code/`; blake3, `\r\n` → `\n`).
+    #[serde(default)]
+    pub corpus_blake3: String,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub repeat: usize,
     pub notes: Vec<String>,
 }
 
@@ -1588,13 +1761,30 @@ pub struct SessionsResult {
     pub sessions: Vec<SessionRun>,
 }
 
-/// `R` по метке.
+/// `R` по метке: Σ средних по повторам токенов сессий.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelRatio {
     pub label: String,
-    pub base: usize,
-    pub arm: usize,
+    pub base: f64,
+    pub arm: f64,
     pub r: Option<Estimate>,
+}
+
+/// Сравнение на части сессий (весь набор или профиль).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartComparison {
+    /// `всего`, `standard`, `heavy`.
+    pub part: String,
+    pub sessions: Vec<String>,
+    pub by_label: Vec<LabelRatio>,
+    pub total: LabelRatio,
+    pub base_summary: SessionsSummary,
+    pub arm_summary: SessionsSummary,
+    /// Δ = плечо − база на общих элементах (односторонние 95 % границы, бутстреп по сессиям):
+    /// `hint_recall` общий (зачёт и строго) и полнота обязательных строк.
+    pub d_hint_recall: Option<Estimate>,
+    pub d_hint_recall_strict: Option<Estimate>,
+    pub d_required: Option<Estimate>,
 }
 
 /// Сравнение плеча с базой на пересечении событий.
@@ -1604,14 +1794,11 @@ pub struct SessionsComparison {
     pub arm_name: String,
     pub base_server: String,
     pub arm_server: String,
-    pub sessions: Vec<String>,
     pub only_base: Vec<String>,
     pub only_arm: Vec<String>,
     pub exclusions: Exclusions,
-    pub by_label: Vec<LabelRatio>,
-    pub total: LabelRatio,
-    pub base_summary: SessionsSummary,
-    pub arm_summary: SessionsSummary,
+    /// Весь набор, затем профили.
+    pub parts: Vec<PartComparison>,
     /// Подсказки-идеи `prompt`: доля событий с тем же списком идей, что у базы (обе с идеями).
     pub idea_hints_match: Option<Tally>,
     /// 95-й перцентиль |Δ| / база токенов сессии (порог шума A/A, если плечи одной версии).
@@ -1621,11 +1808,11 @@ pub struct SessionsComparison {
     pub bootstrap_seed: u64,
 }
 
-/// Подсказки-идеи `prompt` плеча и базы: доля общих событий с тем же списком.
+/// Подсказки-идеи `prompt` плеча и базы (повтор 0): доля общих событий с тем же списком.
 pub fn idea_hints_match(base: &[SessionRun], arm: &[SessionRun]) -> Tally {
     let mut t = Tally::default();
-    for a in arm {
-        let Some(b) = base.iter().find(|b| b.id == a.id) else {
+    for a in arm.iter().filter(|r| r.rep == 0) {
+        let Some(b) = base.iter().find(|b| b.id == a.id && b.rep == 0) else {
             continue;
         };
         for h in a.hints.iter().filter(|h| h.kind == "prompt") {
@@ -1637,90 +1824,217 @@ pub fn idea_hints_match(base: &[SessionRun], arm: &[SessionRun]) -> Tally {
     t
 }
 
-/// Сравнение плеча `arm` с базой `base` (§3.3, §3.5): общие сессии, исключения обоих плеч.
-pub fn compare(
-    base: &SessionsResult,
-    arm: &SessionsResult,
-    names: (&str, &str),
-) -> Result<SessionsComparison> {
-    if base.info.split != arm.info.split {
-        bail!(
-            "части набора разные: база {}, плечо {}",
-            base.info.split,
-            arm.info.split
-        );
+/// Средние по повторам токены сессии `id` по меткам.
+fn mean_tokens(rs: &[SessionRun], id: &str, ex: &Exclusions) -> BTreeMap<String, f64> {
+    let reps: Vec<&SessionRun> = rs.iter().filter(|r| r.id == id).collect();
+    let mut m: BTreeMap<String, f64> = BTreeMap::new();
+    for r in &reps {
+        for (l, n) in session_tokens(r, ex) {
+            *m.entry(l).or_default() += n as f64 / reps.len() as f64;
+        }
     }
-    if base.info.sessions_blake3 != arm.info.sessions_blake3 {
-        bail!("набор сессий разный (blake3 eval/sessions.toml): плечи не сравниваются");
+    m
+}
+
+/// Элементы зачёта сессии (повтор 0): ключ → (засчитан, строго).
+fn hint_elements(r: &SessionRun, ex: &Exclusions) -> BTreeMap<(usize, String), (bool, bool)> {
+    let mut m = BTreeMap::new();
+    for h in &r.hints {
+        for e in &h.expect {
+            let k = expect_kind(e);
+            if ex.expect.contains(k) || k == "idea" {
+                continue;
+            }
+            let now = h.shown.contains(e);
+            m.insert((h.event, e.clone()), (now || h.earlier.contains(e), now));
+        }
     }
-    if base.info.counter != arm.info.counter || base.info.mode != arm.info.mode {
-        bail!("счётчик токенов или режим поиска разные");
+    m
+}
+
+fn required_elements(r: &SessionRun, ex: &Exclusions) -> BTreeMap<(String, String, String), bool> {
+    r.required
+        .iter()
+        .filter(|c| !ex.required.contains(&c.kind) && !ex.labels.contains(&c.step))
+        .map(|c| ((c.step.clone(), c.kind.clone(), c.key.clone()), c.found))
+        .collect()
+}
+
+/// Δ доли на общих элементах сессий: `get(сессия) → (база, плечо)` долей и число элементов.
+fn delta(per: &[(f64, f64, f64)]) -> Option<Estimate> {
+    let per: Vec<&(f64, f64, f64)> = per.iter().filter(|p| p.2 > 0.0).collect();
+    if per.is_empty() {
+        return None;
     }
-    let ex = base.info.exclusions.union(&arm.info.exclusions);
-    let ids_b: BTreeSet<&str> = base.sessions.iter().map(|s| s.id.as_str()).collect();
-    let ids_a: BTreeSet<&str> = arm.sessions.iter().map(|s| s.id.as_str()).collect();
-    let common: Vec<String> = ids_b.intersection(&ids_a).map(|s| s.to_string()).collect();
-    let pick = |rs: &[SessionRun]| -> Vec<SessionRun> {
-        common
-            .iter()
-            .filter_map(|id| rs.iter().find(|r| &r.id == id).cloned())
-            .collect()
+    let a: Vec<f64> = per.iter().map(|p| p.0).collect();
+    let b: Vec<f64> = per.iter().map(|p| p.1).collect();
+    let w: Vec<f64> = per.iter().map(|p| p.2).collect();
+    Some(paired_diff_weighted(&a, &b, &w, BOOTSTRAP_M6, SEED))
+}
+
+fn part(
+    name: &str,
+    ids: &[String],
+    base: &[SessionRun],
+    arm: &[SessionRun],
+    ex: &Exclusions,
+) -> PartComparison {
+    let keep = |rs: &[SessionRun]| -> Vec<SessionRun> {
+        rs.iter().filter(|r| ids.contains(&r.id)).cloned().collect()
     };
-    let (bs, as_) = (pick(&base.sessions), pick(&arm.sessions));
-    let tb: Vec<BTreeMap<String, usize>> = bs.iter().map(|r| session_tokens(r, &ex)).collect();
-    let ta: Vec<BTreeMap<String, usize>> = as_.iter().map(|r| session_tokens(r, &ex)).collect();
+    let (bs, as_) = (keep(base), keep(arm));
+    let tb: Vec<BTreeMap<String, f64>> = ids.iter().map(|i| mean_tokens(&bs, i, ex)).collect();
+    let ta: Vec<BTreeMap<String, f64>> = ids.iter().map(|i| mean_tokens(&as_, i, ex)).collect();
     let labels: BTreeSet<String> = tb
         .iter()
         .chain(&ta)
         .flat_map(|m| m.keys().cloned())
         .collect();
     let ratio = |l: Option<&str>| -> LabelRatio {
-        let get = |m: &BTreeMap<String, usize>| -> f64 {
+        let get = |m: &BTreeMap<String, f64>| -> f64 {
             match l {
-                Some(l) => m.get(l).copied().unwrap_or(0) as f64,
-                None => m.values().sum::<usize>() as f64,
+                Some(l) => m.get(l).copied().unwrap_or(0.0),
+                None => m.values().sum::<f64>(),
             }
         };
         let pairs: Vec<(f64, f64)> = ta.iter().zip(&tb).map(|(a, b)| (get(a), get(b))).collect();
         LabelRatio {
             label: l.unwrap_or("всего").to_string(),
-            base: pairs.iter().map(|p| p.1).sum::<f64>() as usize,
-            arm: pairs.iter().map(|p| p.0).sum::<f64>() as usize,
+            base: pairs.iter().map(|p| p.1).sum(),
+            arm: pairs.iter().map(|p| p.0).sum(),
             r: ratio_estimate_with(&pairs, BOOTSTRAP_M6, SEED),
         }
     };
-    let by_label = labels.iter().map(|l| ratio(Some(l))).collect();
-    let total = ratio(None);
-    let diffs: Vec<f64> = ta
+    let rep0 = |rs: &[SessionRun], id: &str| rs.iter().find(|r| r.id == id && r.rep == 0).cloned();
+    let mut dh = Vec::new();
+    let mut dhs = Vec::new();
+    let mut dr = Vec::new();
+    for id in ids {
+        let (Some(b), Some(a)) = (rep0(&bs, id), rep0(&as_, id)) else {
+            continue;
+        };
+        let (hb, ha) = (hint_elements(&b, ex), hint_elements(&a, ex));
+        let common: Vec<_> = hb.keys().filter(|k| ha.contains_key(*k)).collect();
+        let n = common.len() as f64;
+        let sh = |m: &BTreeMap<(usize, String), (bool, bool)>, strict: bool| {
+            common
+                .iter()
+                .filter(|k| {
+                    let v = m[**k];
+                    if strict { v.1 } else { v.0 }
+                })
+                .count() as f64
+                / n.max(1.0)
+        };
+        dh.push((sh(&hb, false), sh(&ha, false), n));
+        dhs.push((sh(&hb, true), sh(&ha, true), n));
+        let (rb, ra) = (required_elements(&b, ex), required_elements(&a, ex));
+        let common: Vec<_> = rb.keys().filter(|k| ra.contains_key(*k)).collect();
+        let n = common.len() as f64;
+        let sr = |m: &BTreeMap<(String, String, String), bool>| {
+            common.iter().filter(|k| m[**k]).count() as f64 / n.max(1.0)
+        };
+        dr.push((sr(&rb), sr(&ra), n));
+    }
+    PartComparison {
+        part: name.to_string(),
+        sessions: ids.to_vec(),
+        by_label: labels.iter().map(|l| ratio(Some(l))).collect(),
+        total: ratio(None),
+        base_summary: summarize(&bs, ex),
+        arm_summary: summarize(&as_, ex),
+        d_hint_recall: delta(&dh),
+        d_hint_recall_strict: delta(&dhs),
+        d_required: delta(&dr),
+    }
+}
+
+/// Сравнение плеча `arm` с базой `base` (§3.3, §3.5): общие сессии, исключения обоих плеч;
+/// весь набор и профили отдельно.
+pub fn compare(
+    base: &SessionsResult,
+    arm: &SessionsResult,
+    names: (&str, &str),
+) -> Result<SessionsComparison> {
+    let (bi, ai) = (&base.info, &arm.info);
+    let mut errs = Vec::new();
+    let mut same = |what: &str, x: &dyn std::fmt::Debug, y: &dyn std::fmt::Debug, eq: bool| {
+        if !eq {
+            errs.push(format!("{what}: база {x:?}, плечо {y:?}"));
+        }
+    };
+    same("часть набора", &bi.split, &ai.split, bi.split == ai.split);
+    same(
+        "набор (blake3 eval/sessions.toml)",
+        &bi.sessions_blake3,
+        &ai.sessions_blake3,
+        bi.sessions_blake3 == ai.sessions_blake3,
+    );
+    same(
+        "корпус ТС-2 (blake3 eval/sessions-corpus)",
+        &bi.corpus_blake3,
+        &ai.corpus_blake3,
+        bi.corpus_blake3 == ai.corpus_blake3,
+    );
+    same(
+        "счётчик",
+        &bi.counter,
+        &ai.counter,
+        bi.counter == ai.counter,
+    );
+    same("режим", &bi.mode, &ai.mode, bi.mode == ai.mode);
+    same("модель", &bi.model, &ai.model, bi.model == ai.model);
+    same("устройство", &bi.device, &ai.device, bi.device == ai.device);
+    // окна дайджеста (ответы, решения, горизонты идей) считаются от суток UTC прогона
+    same("дата UTC", &bi.date, &ai.date, bi.date == ai.date);
+    if !errs.is_empty() {
+        bail!("плечи не сравниваются:\n  {}", errs.join("\n  "));
+    }
+    let ex = bi.exclusions.union(&ai.exclusions);
+    let ids_b: BTreeSet<&str> = base.sessions.iter().map(|s| s.id.as_str()).collect();
+    let ids_a: BTreeSet<&str> = arm.sessions.iter().map(|s| s.id.as_str()).collect();
+    let common: Vec<String> = ids_b.intersection(&ids_a).map(|s| s.to_string()).collect();
+    let profile_of = |id: &str| {
+        base.sessions
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.profile.clone())
+            .unwrap_or_default()
+    };
+    let mut parts = vec![part("всего", &common, &base.sessions, &arm.sessions, &ex)];
+    for p in [Profile::Standard, Profile::Heavy] {
+        let ids: Vec<String> = common
+            .iter()
+            .filter(|i| profile_of(i) == p.as_str())
+            .cloned()
+            .collect();
+        if !ids.is_empty() {
+            parts.push(part(p.as_str(), &ids, &base.sessions, &arm.sessions, &ex));
+        }
+    }
+    let diffs: Vec<f64> = common
         .iter()
-        .zip(&tb)
-        .filter_map(|(a, b)| {
-            let (a, b) = (
-                a.values().sum::<usize>() as f64,
-                b.values().sum::<usize>() as f64,
-            );
+        .filter_map(|id| {
+            let a: f64 = mean_tokens(&arm.sessions, id, &ex).values().sum();
+            let b: f64 = mean_tokens(&base.sessions, id, &ex).values().sum();
             (b > 0.0).then(|| (a - b).abs() / b)
         })
         .collect();
-    let both_ideas = base.info.feats.ideas_on && arm.info.feats.ideas_on;
+    let both_ideas = bi.feats.ideas_on && ai.feats.ideas_on;
     Ok(SessionsComparison {
         base_name: names.0.to_string(),
         arm_name: names.1.to_string(),
-        base_server: base.info.server_version.clone(),
-        arm_server: arm.info.server_version.clone(),
-        sessions: common,
+        base_server: bi.server_version.clone(),
+        arm_server: ai.server_version.clone(),
         only_base: ids_b.difference(&ids_a).map(|s| s.to_string()).collect(),
         only_arm: ids_a.difference(&ids_b).map(|s| s.to_string()).collect(),
-        base_summary: summarize(&bs, &ex),
-        arm_summary: summarize(&as_, &ex),
         exclusions: ex,
-        by_label,
-        total,
-        idea_hints_match: both_ideas.then(|| idea_hints_match(&bs, &as_)),
+        parts,
+        idea_hints_match: both_ideas.then(|| idea_hints_match(&base.sessions, &arm.sessions)),
         abs_rel_diff_p95: (!diffs.is_empty()).then(|| quantile(&diffs, 0.95)),
-        same_server: base.info.server_version == arm.info.server_version
-            && base.info.server_git == arm.info.server_git
-            && base.info.ideas_flag == arm.info.ideas_flag,
+        same_server: bi.server_version == ai.server_version
+            && bi.server_git == ai.server_git
+            && bi.ideas_flag == ai.ideas_flag,
         bootstrap_samples: BOOTSTRAP_M6,
         bootstrap_seed: SEED,
     })
@@ -1830,6 +2144,28 @@ impl Drop for StdioMcp {
     }
 }
 
+/// Текст агенту из вывода хука: `hookSpecificOutput.additionalContext` или `reason` блокировки
+/// (`decision: block`, `checkpoint`); пустой вывод — тишина; непустой не-JSON или JSON без
+/// текста — `(_, true)`: такой шаг помечается, а не считается молча нулём.
+pub fn hook_text(out: &str) -> (String, bool) {
+    let t = out.trim();
+    if t.is_empty() {
+        return (String::new(), false);
+    }
+    let Ok(v) = serde_json::from_str::<Value>(t) else {
+        return (String::new(), true);
+    };
+    if let Some(c) = v["hookSpecificOutput"]["additionalContext"].as_str() {
+        return (c.to_string(), false);
+    }
+    if v["decision"] == "block"
+        && let Some(r) = v["reason"].as_str()
+    {
+        return (r.to_string(), false);
+    }
+    (String::new(), true)
+}
+
 /// Процессы `zam` одной сессии.
 struct RealDriver {
     hooks: Hooks,
@@ -1841,9 +2177,11 @@ impl Driver for RealDriver {
         input["cwd"] = json!(self.hooks.project.to_string_lossy());
         let before = self.hooks.log_lines();
         let (out, _) = self.hooks.run(cmd, &input)?;
+        let (text, bad_output) = hook_text(&out);
         Ok(HookOut {
-            text: hints::hook_context(&out),
+            text,
             log: self.hooks.new_log(before),
+            bad_output,
         })
     }
 
@@ -2175,6 +2513,164 @@ fn compare_files(arm_path: &Path, bases: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// Одна сессия на свежем сервере: загрузка мира, перезапуск (во всех плечах одинаково: после
+/// SQL-правки горизонтов идей или без неё), карта кода, прогрев, воспроизведение, ожидание
+/// фоновой синхронизации карты кода хуков, остановка.
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    p: &Paths,
+    spec: &dyn Fn(String, Vec<(String, String)>) -> RunSpec,
+    sets: &[(String, String)],
+    server: &Path,
+    zam: &Path,
+    corpus: &SessionsCorpus,
+    f: &Feats,
+    sp: &SessionSpec,
+    rep: usize,
+    label: &str,
+    count: Count<'_>,
+) -> Result<SessionRun> {
+    let w = world(sp, corpus)?;
+    let name = if rep == 0 {
+        format!("sessions-{label}-{}", sp.id)
+    } else {
+        format!("sessions-{label}-{}-r{rep}", sp.id)
+    };
+    let mut s = Session::start(p, &spec(name.clone(), sets.to_vec()), server, true)?;
+    s.check_model()?;
+    let (refs, due, wnotes) = load_world(&mut s, &w, f)?;
+    let data = s.data.clone();
+    s.stop()?;
+    if !due.is_empty() {
+        hints::ideas::set_horizon_today(&data, &due)?;
+    }
+    s = Session::start(p, &spec(name.clone(), sets.to_vec()), server, false)?;
+    load_access(&s, &w)?;
+    if s.spec.model.is_some() {
+        s.wait_indexed()?;
+    }
+    let dir = p.work.join(&name);
+    let hooks = Hooks::prepare(&dir, zam.to_path_buf(), &s.base, s.token())?;
+    // свой репозиторий git: иначе карта кода видит ветку и коммит рабочей копии разработчика
+    let gi = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&hooks.project)
+        .status()
+        .context("git init каталога проекта сессии")?;
+    if !gi.success() {
+        bail!("git init {}: {gi}", hooks.project.display());
+    }
+    let mut snotes = wnotes;
+    if w.code_map {
+        if f.code_map {
+            let out = code_sync(&hooks, &p.sessions_corpus.join("code"))?;
+            snotes.push(format!("zam code sync: {out}"));
+        } else {
+            snotes.push("карта кода не загружена: у сервера её нет (M5.6)".into());
+        }
+    }
+    // прогрев внутреннего поиска: первый /recall(prompt) холодного сервера не уложился бы в
+    // бюджет хука
+    let warm = json!({ "event": "prompt", "solution": EVAL_SOLUTION, "prompt": "warm up",
+                       "record": false });
+    let _ = post(&s, "/api/v1/recall", &warm);
+    let sid = format!("ts2-{}-{}-r{rep}", run::today(), sp.id);
+    let mcp_dir = if f.mcp_explicit {
+        hooks.project.clone()
+    } else {
+        implicit_mcp_dir(&dir)?
+    };
+    let mcp = StdioMcp::spawn(&hooks, &mcp_dir, f.mcp_explicit.then_some(sid.as_str()))?;
+    let mut d = RealDriver { hooks, mcp };
+    let mut r =
+        play(&mut d, sp, &w, f, &refs, count, &sid).with_context(|| format!("сессия {}", sp.id))?;
+    if let Some(n) = wait_code_sync(&d.hooks) {
+        snotes.push(n);
+    }
+    drop(d);
+    r.rep = rep;
+    r.notes.splice(0..0, snotes);
+    s.stop()?;
+    Ok(r)
+}
+
+/// Фоновая синхронизация карты кода, которую запускают хуки M5.6+, должна закончиться до
+/// остановки сервера: число строк «… запущена» и итогов `code-sync` в `hooks.log` сравнивается,
+/// не дольше 20 с. Не дождались — примечание.
+fn wait_code_sync(h: &Hooks) -> Option<String> {
+    let log = h
+        .project
+        .join(".zeroaimemory")
+        .join("logs")
+        .join("hooks.log");
+    let t0 = std::time::Instant::now();
+    loop {
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        let started = text
+            .lines()
+            .filter(|l| l.contains("синхронизация карты запущена"))
+            .count();
+        let done = text.lines().filter(|l| l.contains(" code-sync ")).count();
+        if done >= started {
+            return None;
+        }
+        if t0.elapsed() > Duration::from_secs(20) {
+            return Some(format!(
+                "фоновая синхронизация карты кода не закончилась за 20 с ({done} из {started})"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// blake3 каталога: относительные пути (`/`) и содержимое файлов по порядку путей, у текста
+/// `\r\n` → `\n` (как у отпечатков ТС-1).
+pub fn dir_blake3(dir: &Path) -> Result<String> {
+    fn walk(d: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        for e in fs::read_dir(d).with_context(|| d.display().to_string())? {
+            let e = e?;
+            if e.file_type()?.is_dir() {
+                walk(&e.path(), out)?;
+            } else {
+                out.push(e.path());
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(dir, &mut files)?;
+    let rel = |f: &PathBuf| {
+        f.strip_prefix(dir)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    files.sort_by_key(rel);
+    let mut h = blake3::Hasher::new();
+    for f in &files {
+        h.update(rel(f).as_bytes());
+        h.update(&[0]);
+        let b = fs::read(f)?;
+        let mut prev_cr = false;
+        let mut norm = Vec::with_capacity(b.len());
+        for &c in &b {
+            if prev_cr && c != b'\n' {
+                norm.push(b'\r');
+            }
+            prev_cr = c == b'\r';
+            if !prev_cr {
+                norm.push(c);
+            }
+        }
+        if prev_cr {
+            norm.push(b'\r');
+        }
+        h.update(&norm);
+        h.update(&[0]);
+    }
+    Ok(h.finalize().to_hex()[..32].to_string())
+}
+
 /// Исключения своей сводки плеча: только виды ожиданий и обязательных строк, которых плечо не
 /// умеет (события оно и так не воспроизводит, а классы строк вычитает только сравнение).
 pub fn own_exclusions(f: &Feats) -> Exclusions {
@@ -2306,75 +2802,44 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         .collect();
     let mut runs = Vec::new();
     let mut notes = Vec::new();
-    for sp in &chosen {
-        let w = world(sp, &corpus)?;
-        let name = format!("sessions-{label}-{}", sp.id);
-        let mut s = Session::start(p, &spec(name.clone(), sets.clone()), &server, true)?;
-        s.check_model()?;
-        let (refs, due, wnotes) = load_world(&mut s, &w, &f)?;
-        if !due.is_empty() {
-            let data = s.data.clone();
-            s.stop()?;
-            hints::ideas::set_horizon_today(&data, &due)?;
-            s = Session::start(p, &spec(name.clone(), sets.clone()), &server, false)?;
-        }
-        load_access(&s, &w)?;
-        if model.is_some() {
-            s.wait_indexed()?;
-        }
-        let dir = p.work.join(&name);
-        let hooks = Hooks::prepare(&dir, zam.clone(), &s.base, s.token())?;
-        let mut snotes = wnotes;
-        if w.code_map {
-            if f.code_map {
-                let out = code_sync(&hooks, &p.sessions_corpus.join("code"))?;
-                snotes.push(format!("zam code sync: {out}"));
-            } else {
-                snotes.push("карта кода не загружена: у сервера её нет (M5.6)".into());
+    let reps = a.repeat.max(1);
+    for rep in 0..reps {
+        for sp in &chosen {
+            let r = run_session(
+                p, &spec, &sets, &server, &zam, &corpus, &f, sp, rep, label, &count,
+            )?;
+            let mut r = r;
+            r.split = part.as_str().to_string();
+            let ss = summarize(std::slice::from_ref(&r), &own_exclusions(&f));
+            println!(
+                "  {}{} [{}]: токенов {}, обязательных строк {}/{}, hint {}/{} (строго {}), идеи \
+                 {}/{}, дайджест {}",
+                r.id,
+                if reps > 1 {
+                    format!(" r{rep}")
+                } else {
+                    String::new()
+                },
+                r.profile,
+                ss.tokens_total,
+                ss.required.found,
+                ss.required.total,
+                ss.hint_recall.found,
+                ss.hint_recall.total,
+                ss.hint_recall_strict.found,
+                ss.idea_hint_recall.found,
+                ss.idea_hint_recall.total,
+                match r.digest_match {
+                    Some(true) => "=",
+                    Some(false) => "≠",
+                    None => "—",
+                }
+            );
+            for m in &ss.required_missing {
+                println!("    нет строки: {m}");
             }
+            runs.push(r);
         }
-        // прогрев внутреннего поиска: первый /recall(prompt) холодного сервера не уложился бы в
-        // бюджет хука
-        let warm = json!({ "event": "prompt", "solution": EVAL_SOLUTION, "prompt": "warm up",
-                           "record": false });
-        let _ = post(&s, "/api/v1/recall", &warm);
-        let sid = format!("ts2-{}-{}", run::today(), sp.id);
-        let mcp_dir = if f.mcp_explicit {
-            hooks.project.clone()
-        } else {
-            implicit_mcp_dir(&dir)?
-        };
-        let mcp = StdioMcp::spawn(&hooks, &mcp_dir, f.mcp_explicit.then_some(sid.as_str()))?;
-        let mut d = RealDriver { hooks, mcp };
-        let mut r = play(&mut d, sp, &w, &f, &refs, &count, &sid)
-            .with_context(|| format!("сессия {}", sp.id))?;
-        drop(d);
-        r.split = part.as_str().to_string();
-        r.notes.splice(0..0, snotes);
-        let ss = summarize(std::slice::from_ref(&r), &own_exclusions(&f));
-        println!(
-            "  {} [{}]: токенов {}, обязательных строк {}/{}, hint {}/{}, идеи {}/{}, дайджест \
-             {}",
-            r.id,
-            r.profile,
-            ss.tokens_total,
-            ss.required.found,
-            ss.required.total,
-            ss.hint_recall.found,
-            ss.hint_recall.total,
-            ss.idea_hint_recall.found,
-            ss.idea_hint_recall.total,
-            match r.digest_match {
-                Some(true) => "=",
-                Some(false) => "≠",
-                None => "—",
-            }
-        );
-        for m in &ss.required_missing {
-            println!("    нет строки: {m}");
-        }
-        s.stop()?;
-        runs.push(r);
     }
     if f.mcp_explicit {
         notes.push("MCP — zam mcp с ZAM_SESSION_ID (явная сессия)".to_string());
@@ -2411,6 +2876,9 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             },
             counter: "bge-m3 tokenizer.json".into(),
             sessions_blake3: hints::ideas::file_blake3(&set_path)?,
+            corpus_blake3: dir_blake3(&p.sessions_corpus)?,
+            device: model.as_ref().map(|_| a.device.as_str().to_string()),
+            repeat: reps,
             notes,
         },
         summary: summarize(&runs, &own_exclusions(&f)),
@@ -2474,7 +2942,7 @@ mod tests {
                 .push(format!("hook {cmd} {}", input["hook_event_name"]));
             Ok(HookOut {
                 text: (self.hook)(cmd, &input),
-                log: Vec::new(),
+                ..HookOut::default()
             })
         }
         fn mcp(&mut self, tool: &str, args: Value) -> Result<String> {
@@ -2509,7 +2977,7 @@ mod tests {
         RefMap(
             [
                 (ID_RULE, "rule:migrations"),
-                (ID_TASK, "task:t-keyset-orders"),
+                (ID_TASK, "task:t-export-stream"),
                 (ID_IDEA, "idea:i01"),
                 (ID_TERM, "term:storefront"),
                 (ID_INS, "insight:s-migration-lock"),
@@ -2582,7 +3050,9 @@ type = "checkpoint"
             hook: Box::new(|cmd, inp| match (cmd, inp["source"].as_str()) {
                 ("session-start", Some("startup")) => digest(),
                 ("session-start", Some("compact")) => {
-                    "### Задачи\n[in_progress] Потоковая выгрузка заказов в CSV\n".into()
+                    format!(
+                        "### Задачи\n[in_progress] Потоковая выгрузка заказов в CSV — k:{ID_TASK}\n"
+                    )
                 }
                 ("prompt", _) => prompt_text(),
                 ("subagent-start", _) => "### Правила\nМиграции".into(),
@@ -2709,7 +3179,7 @@ type = "checkpoint"
         .unwrap();
         assert_eq!(c1.idea_hints_match, Some(Tally { found: 1, total: 1 }));
         assert_eq!(
-            c1.arm_summary.idea_hint_recall,
+            c1.parts[0].arm_summary.idea_hint_recall,
             Tally { found: 1, total: 1 }
         );
         let c2 = compare(
@@ -2722,10 +3192,15 @@ type = "checkpoint"
         // идея уже была в `### Идеи` дайджеста — ожидание выполнено, но подсказка prompt с B5.7
         // не совпала: это и ловит idea_hints_match
         assert_eq!(
-            c2.arm_summary.idea_hint_recall,
+            c2.parts[0].arm_summary.idea_hint_recall,
             Tally { found: 1, total: 1 }
         );
-        assert!(!c2.arm_summary.idea_tokens.contains_key(label::PROMPT));
+        assert!(
+            !c2.parts[0]
+                .arm_summary
+                .idea_tokens
+                .contains_key(label::PROMPT)
+        );
         // база без идей (B5.6) — совпадения нет: сравнивать не с чем
         let b56 = caps_from(&json!({ "version": "0.0.9-m5.6", "git": "97825a10bc19" })).unwrap();
         let f56 = feats(&b56, true, false);
@@ -2781,8 +3256,14 @@ type = "checkpoint"
             label::FILE_CONTEXT,
         ] {
             assert!(cmp.exclusions.labels.contains(l), "{l}");
-            assert!(!cmp.arm_summary.tokens_by_label.contains_key(l), "{l}");
-            assert!(!cmp.base_summary.tokens_by_label.contains_key(l), "{l}");
+            assert!(
+                !cmp.parts[0].arm_summary.tokens_by_label.contains_key(l),
+                "{l}"
+            );
+            assert!(
+                !cmp.parts[0].base_summary.tokens_by_label.contains_key(l),
+                "{l}"
+            );
         }
         // разделы дайджеста M4.5 и подсказки терминов вычитаются из плеча M6
         let start = r6
@@ -2791,18 +3272,21 @@ type = "checkpoint"
             .find(|s| s.label == label::SESSION_START)
             .unwrap();
         assert!(start.classes[class::JOURNAL] > 0);
-        let arm_start = cmp.arm_summary.tokens_by_label[label::SESSION_START];
+        let arm_start = cmp.parts[0].arm_summary.tokens_by_label[label::SESSION_START];
         assert_eq!(arm_start, start.tokens - start.classes[class::JOURNAL]);
         let pr = r6.steps.iter().find(|s| s.label == label::PROMPT).unwrap();
         assert_eq!(
-            cmp.arm_summary.tokens_by_label[label::PROMPT],
+            cmp.parts[0].arm_summary.tokens_by_label[label::PROMPT],
             pr.tokens - pr.classes[class::TERMS]
         );
         // задачи — не обязательные строки ни в одном плече, термины — не ожидания
         assert!(cmp.exclusions.required.contains(req::TASK));
-        assert_eq!(cmp.arm_summary.hint_recall.total, 2);
-        assert_eq!(cmp.base_summary.hint_recall.total, 2);
-        assert!(cmp.total.r.is_some());
+        assert_eq!(cmp.parts[0].arm_summary.hint_recall.total, 2);
+        assert_eq!(cmp.parts[0].base_summary.hint_recall.total, 2);
+        assert!(cmp.parts[0].total.r.is_some());
+        // профиль сессии мока — standard: часть «всего» и часть профиля
+        let names: Vec<&str> = cmp.parts.iter().map(|p| p.part.as_str()).collect();
+        assert_eq!(names, vec!["всего", "standard"]);
     }
 
     #[test]
@@ -2881,5 +3365,150 @@ queries = ["c"]
         assert!(s.tokens_by_label[label::SUBAGENT_MCP] > 0);
         // хуки: три ссылки дайджеста — впервые; MCP: правило дважды (повтор во 2-м событии)
         assert_eq!(s.repeated, Tally { found: 1, total: 5 });
+    }
+
+    #[test]
+    fn required_lines_by_refs_not_text() {
+        let c = corpus();
+        let sp = spec();
+        let w = world(&sp, &c).unwrap();
+        let f = feats(&m6_caps(), true, false);
+        let mut m = mock();
+        // заголовок правила есть текстом, ссылки нет — строка не найдена; ссылка без текста —
+        // найдена
+        m.hook = Box::new(|cmd, inp| match (cmd, inp["source"].as_str()) {
+            ("session-start", Some("startup")) => format!(
+                "# Миграции базы\nПотоковая выгрузка заказов в CSV — k:{ID_TASK}\nw:{ID_IDEA}\n"
+            ),
+            _ => String::new(),
+        });
+        let r = play(&mut m, &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        let got: Vec<(&str, bool)> = r
+            .required
+            .iter()
+            .filter(|c| c.step == label::SESSION_START)
+            .map(|c| (c.key.as_str(), c.found))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("migrations", false),
+                ("commits", false),
+                ("t-export-stream", true),
+                ("i01", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn hint_credit_resets_after_compact() {
+        let c = corpus();
+        let mut sp = spec();
+        // после compact — тот же prompt: правило было в дайджесте до compact, в восстановлении
+        // его нет — не засчитывается
+        sp.events.insert(
+            3,
+            Event::Prompt {
+                text: "ещё раз про миграции".into(),
+                expect: vec!["rule:migrations".into()],
+            },
+        );
+        let w = world(&sp, &c).unwrap();
+        let f = feats(&m6_caps(), true, false);
+        let mut m = mock();
+        m.hook = Box::new(|cmd, inp| match (cmd, inp["source"].as_str()) {
+            ("session-start", Some("startup")) => digest(),
+            ("session-start", Some("compact")) => "### Задачи\n".into(),
+            _ => String::new(),
+        });
+        let r = play(&mut m, &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        let first = &r.hints[0];
+        assert_eq!(first.credit[0], "digest");
+        let after = r.hints.iter().find(|h| h.event == 3).unwrap();
+        assert!(after.earlier.is_empty(), "{after:?}");
+        let s = summarize(&[r], &Exclusions::default());
+        assert_eq!(s.hint_by_kind["rule"], Tally { found: 1, total: 2 });
+        assert_eq!(s.hint_by_kind_strict["rule"], Tally { found: 0, total: 2 });
+        assert_eq!(s.hint_credit["digest"], 2);
+    }
+
+    #[test]
+    fn fixed_ids_and_hook_text() {
+        let t = format!("правило — n:{ID_RULE}; выжимка c_{ID_IDEA}; abn:{ID_RULE}");
+        let f = fixed_ids(&t);
+        assert!(f.contains("n:00000000000000000000000000;"));
+        assert!(f.contains("c_00000000000000000000000000;"));
+        // не ссылка: буква-префикс внутри слова
+        assert!(f.ends_with(&format!("abn:{ID_RULE}")));
+        assert_eq!(hook_text(""), (String::new(), false));
+        assert_eq!(hook_text("oops"), (String::new(), true));
+        assert_eq!(
+            hook_text(r#"{"decision":"block","reason":"запиши"}"#),
+            ("запиши".to_string(), false)
+        );
+        assert_eq!(
+            hook_text(r#"{"hookSpecificOutput":{"additionalContext":"x"}}"#),
+            ("x".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn compare_rejects_other_corpus_date_or_model() {
+        let c = corpus();
+        let sp = spec();
+        let w = world(&sp, &c).unwrap();
+        let f = feats(&m6_caps(), true, false);
+        let r = play(&mut mock(), &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        let base = result(vec![r.clone()], f, "m6");
+        for (what, change) in [
+            (
+                "корпус",
+                Box::new(|i: &mut SessionsInfo| i.corpus_blake3 = "x".into())
+                    as Box<dyn Fn(&mut SessionsInfo)>,
+            ),
+            (
+                "дата",
+                Box::new(|i: &mut SessionsInfo| i.date = "2000-01-01".into()),
+            ),
+            (
+                "модель",
+                Box::new(|i: &mut SessionsInfo| i.model = Some("m".into())),
+            ),
+            (
+                "устройство",
+                Box::new(|i: &mut SessionsInfo| i.device = Some("cuda".into())),
+            ),
+        ] {
+            let mut arm = result(vec![r.clone()], f, "m6");
+            change(&mut arm.info);
+            let e = format!("{:#}", compare(&base, &arm, ("a", "b")).unwrap_err());
+            assert!(e.contains(what), "{what}: {e}");
+        }
+    }
+
+    #[test]
+    fn compare_deltas_on_common_elements_and_repeats() {
+        let c = corpus();
+        let sp = spec();
+        let w = world(&sp, &c).unwrap();
+        let f = feats(&m6_caps(), true, false);
+        let good = play(&mut mock(), &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        let mut m = mock();
+        m.hook = Box::new(|cmd, inp| match (cmd, inp["source"].as_str()) {
+            ("session-start", Some("startup")) => "### Правила\n".into(),
+            _ => String::new(),
+        });
+        let bad = play(&mut m, &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        let mut bad1 = bad.clone();
+        bad1.rep = 1;
+        let base = result(vec![good], f, "m6");
+        let arm = result(vec![bad, bad1], f, "m6");
+        assert_eq!(arm.summary.reps, 2);
+        assert_eq!(arm.summary.rep_noise_p95, Some(0.0));
+        let cmp = compare(&base, &arm, ("a", "b")).unwrap();
+        let all = &cmp.parts[0];
+        assert!(all.d_required.as_ref().unwrap().mean < -0.5);
+        assert!(all.d_hint_recall.as_ref().unwrap().mean < 0.0);
+        assert!(all.total.arm < all.total.base);
     }
 }
