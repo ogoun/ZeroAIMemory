@@ -13,105 +13,635 @@
 # Метрика — токены ответов сервера (токенизатор bge-m3) и полнота: все ожидаемые источники
 # прочитаны (а), выжимка действительна и основана на них (б), есть в выдаче (в).
 #
-# `expect` — пути заметок корпуса или `insight:<key>`; вопросы — своими словами агента, не текст
-# запросов queries.toml.
+# `expect` — пути заметок корпуса, `insight:<key>` или документ набора `doc:<путь в eval/docs>`;
+# вопросы — своими словами агента, не текст запросов queries.toml.
+#
+# M6 (ТС-1, спецификация M6 §3.1–§3.2, задача 1b): 48 сценариев, `kind` — слой разбиения dev/holdout
+# (long, insight, attachment, multi, single, pair), `nuggets` — дословные фрагменты источников,
+# без которых ответа нет. Набор заморожен (eval/nuggets.lock): правка — только при доказанной
+# ошибке разметки, с записью в журнал M6, новым замком и переснятием всех плеч.
 
 [[scenario]]
 id = "s-01"
+kind = "pair"
 question = "почему bash-скрипт из репозитория падает в Linux, а на Windows всё нормально, и как настроить git"
 expect = ["ru/windows/crlf-bash-scripts", "ru/windows/git-autocrlf-gitattributes"]
+nuggets = [
+  { source = "ru/windows/crlf-bash-scripts", text = "при `core.autocrlf=true` он при checkout переписывает LF в CRLF, и скрипт портится уже в рабочем каталоге" },
+  { source = "ru/windows/crlf-bash-scripts", text = "Переменная, прочитанная через `read` из файла с CRLF, содержит хвостовой `\\r`" },
+  { source = "ru/windows/git-autocrlf-gitattributes", text = "Атрибуты из `.gitattributes` имеют приоритет над `core.autocrlf`, поэтому при наличии полного файла атрибутов личная настройка разработчика почти ни на что не влияет" },
+  { source = "ru/windows/git-autocrlf-gitattributes", text = "Установщик Git for Windows по умолчанию предлагает `true`." },
+  { source = "ru/windows/git-autocrlf-gitattributes", text = "Правило `*.sh text eol=lf` убирает зависимость от настроек агента." },
+]
 
 [[scenario]]
 id = "s-02"
+kind = "pair"
 question = "в консоли Windows русские буквы выводятся кракозябрами, как исправить"
 expect = ["ru/windows/powershell-encoding", "ru/windows/cmd-chcp-65001"]
+nuggets = [
+  { source = "ru/windows/powershell-encoding", text = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)" },
+  { source = "ru/windows/powershell-encoding", text = "Программа пишет UTF-8, PowerShell читает как 866" },
+  { source = "ru/windows/powershell-encoding", text = "В 5.1 по умолчанию это ASCII, и вся кириллица превращается в `?`." },
+  { source = "ru/windows/cmd-chcp-65001", text = "Если BOM есть, cmd воспримет его как часть первой команды, и `@echo off` не сработает" },
+  { source = "ru/windows/cmd-chcp-65001", text = "`chcp` меняет страницу для всего окна, после завершения bat-файла она остаётся 65001." },
+  { source = "ru/windows/cmd-chcp-65001", text = "Для программ на Python в той же консоли пригодится `set PYTHONUTF8=1`." },
+]
 
 [[scenario]]
 id = "s-03"
+kind = "multi"
 question = "how do I safely rewrite history of my branch and push it"
 expect = ["en/git/interactive-rebase-autosquash", "en/git/merge-vs-rebase", "en/git/force-with-lease"]
+nuggets = [
+  { source = "en/git/interactive-rebase-autosquash", text = "The todo list arrives already sorted: every `fixup!` line sits right under its target and is marked `fixup`." },
+  { source = "en/git/interactive-rebase-autosquash", text = "git rebase -i --autosquash origin/main" },
+  { source = "en/git/interactive-rebase-autosquash", text = "Only on commits that nobody else has based work on." },
+  { source = "en/git/merge-vs-rebase", text = "do not rebase commits that exist outside your repository and that others may have built on" },
+  { source = "en/git/merge-vs-rebase", text = "merge main into it, do not rebase" },
+  { source = "en/git/force-with-lease", text = "git push --force-with-lease --force-if-includes" },
+  { source = "en/git/force-with-lease", text = "a background `git fetch` (IDEs do this) updates `origin/feature` without you seeing the new commit" },
+]
 
 [[scenario]]
 id = "s-04"
+kind = "pair"
 question = "нужно выбросить локальные изменения и лишние файлы из рабочей копии"
 expect = ["ru/git/revert-vs-reset", "ru/git/clean-fdx"]
+nuggets = [
+  { source = "ru/git/revert-vs-reset", text = "Незакоммиченные правки после `--hard` не восстанавливаются ничем: их нет ни в reflog, ни в объектах" },
+  { source = "ru/git/revert-vs-reset", text = "git reset --hard origin/main" },
+  { source = "ru/git/revert-vs-reset", text = "Одну незакоммиченную правку в файле → `git restore <файл>`." },
+  { source = "ru/git/clean-fdx", text = "Это два независимых шага: `reset --hard` возвращает отслеживаемые файлы, `clean` удаляет неотслеживаемые." },
+  { source = "ru/git/clean-fdx", text = "git clean -fdx -e .env -e .idea/" },
+  { source = "ru/git/clean-fdx", text = "В корзину они не попадают, и git восстановить их не может: их никогда не было в репозитории." },
+]
 
 [[scenario]]
 id = "s-05"
+kind = "pair"
 question = "container got killed with exit code 137, was it the container limit or the host OOM killer"
 expect = ["en/linux/oom-killer-dmesg", "en/docker/exit-code-137-container-oom"]
+nuggets = [
+  { source = "en/linux/oom-killer-dmesg", text = "`constraint=CONSTRAINT_NONE` means the whole machine ran out of memory, not a cgroup." },
+  { source = "en/linux/oom-killer-dmesg", text = "If it says `CONSTRAINT_MEMCG`, the limit of a cgroup (a systemd slice or a container) was hit instead" },
+  { source = "en/linux/oom-killer-dmesg", text = "dmesg -T | grep -i -E \"out of memory|oom-kill|killed process\"" },
+  { source = "en/docker/exit-code-137-container-oom", text = "docker inspect --format '{{.State.OOMKilled}} {{.State.ExitCode}}' worker" },
+  { source = "en/docker/exit-code-137-container-oom", text = "`OOMKilled` is reliable only when the killed process is PID 1 of the container." },
+  { source = "en/docker/exit-code-137-container-oom", text = "The kernel's cgroup OOM handling kills a process inside that cgroup even if the host has free RAM" },
+]
 
 [[scenario]]
 id = "s-06"
+kind = "pair"
 question = "как забэкапить данные контейнера и не дать его логам заполнить диск"
 expect = ["ru/docker/named-volume-backup", "ru/docker/container-log-rotation"]
+nuggets = [
+  { source = "ru/docker/named-volume-backup", text = "docker run --rm -v pgdata:/src:ro -v \"$PWD\":/dst alpine" },
+  { source = "ru/docker/named-volume-backup", text = "Для баз данных копия файлов работающего сервера не консистентна." },
+  { source = "ru/docker/named-volume-backup", text = "либо делать логический дамп (`pg_dump` через `docker exec`)" },
+  { source = "ru/docker/container-log-rotation", text = "\"log-opts\": { \"max-size\": \"20m\", \"max-file\": \"5\" }" },
+  { source = "ru/docker/container-log-rotation", text = "Срочно освободить место без перезапуска: `truncate -s 0` на файл лога." },
+  { source = "ru/docker/container-log-rotation", text = "dockerd держит файл открытым, и место не вернётся" },
+]
 
 [[scenario]]
 id = "s-07"
+kind = "pair"
 question = "speed up our Docker image builds and produce images for arm64 too"
 expect = ["en/docker/multistage-build-layer-cache", "en/docker/buildx-multi-arch"]
+nuggets = [
+  { source = "en/docker/multistage-build-layer-cache", text = "RUN --mount=type=cache,target=/go/pkg/mod go mod download" },
+  { source = "en/docker/multistage-build-layer-cache", text = "So order instructions from \"changes rarely\" to \"changes on every commit\"." },
+  { source = "en/docker/multistage-build-layer-cache", text = "`mode=max` stores layers of all stages, not just the final one; without it the build stage is never reused." },
+  { source = "en/docker/buildx-multi-arch", text = "docker buildx create --name multi --driver docker-container --use" },
+  { source = "en/docker/buildx-multi-arch", text = "The default `docker` driver cannot build several platforms at once and cannot hold a manifest list locally" },
+  { source = "en/docker/buildx-multi-arch", text = "FROM --platform=$BUILDPLATFORM golang:1.23 AS build" },
+]
 
 [[scenario]]
 id = "s-08"
+kind = "pair"
 question = "выбираю между Mutex и RwLock для общего состояния, и у нас был дедлок"
 expect = ["ru/rust/arc-mutex-deadlock", "ru/rust/rwlock-vs-mutex"]
+nuggets = [
+  { source = "ru/rust/arc-mutex-deadlock", text = "Решение — один глобальный порядок." },
+  { source = "ru/rust/arc-mutex-deadlock", text = "`std::sync::Mutex` не реентерабельный." },
+  { source = "ru/rust/arc-mutex-deadlock", text = "Временное значение в выражении `match` живёт до конца всего `match`." },
+  { source = "ru/rust/arc-mutex-deadlock", text = "внутри критической секции не ждать ничего внешнего — ни канала, ни сети, ни другого потока" },
+  { source = "ru/rust/rwlock-vs-mutex", text = "При секции в десятки наносекунд `Mutex` обычно не хуже, а часто лучше." },
+  { source = "ru/rust/rwlock-vs-mutex", text = "Взять `read()` второй раз в том же потоке опасно" },
+  { source = "ru/rust/rwlock-vs-mutex", text = "`ArcSwap<Config>` — чтение без блокировок (`load()`)" },
+]
 
 [[scenario]]
 id = "s-09"
+kind = "multi"
 question = "set up cargo features, shared workspace dependencies and a build script that does not rerun every time"
 expect = ["en/rust/cargo-feature-unification-resolver", "en/rust/workspace-dependencies-and-profiles", "en/rust/build-rs-rerun-if-changed"]
+nuggets = [
+  { source = "en/rust/cargo-feature-unification-resolver", text = "For a virtual manifest (no root package) it must be set explicitly, otherwise cargo warns and falls back to \"1\"" },
+  { source = "en/rust/cargo-feature-unification-resolver", text = "cargo tree -e features -i tokio" },
+  { source = "en/rust/cargo-feature-unification-resolver", text = "Stabilised in Rust 1.84 and default for edition 2024." },
+  { source = "en/rust/workspace-dependencies-and-profiles", text = "A member cannot override `version` or `path`; only `features` and `optional` can be added locally." },
+  { source = "en/rust/workspace-dependencies-and-profiles", text = "`[profile.*]` sections in member manifests are ignored with a warning." },
+  { source = "en/rust/workspace-dependencies-and-profiles", text = "`default-features = false` must be in the workspace entry" },
+  { source = "en/rust/build-rs-rerun-if-changed", text = "As soon as the script prints at least one `rerun-if-changed` or `rerun-if-env-changed`, the default is switched off" },
+  { source = "en/rust/build-rs-rerun-if-changed", text = "println!(\"cargo::rerun-if-changed=build.rs\");" },
+  { source = "en/rust/build-rs-rerun-if-changed", text = "A path that does not exist makes Cargo re-run the script on every build" },
+]
 
 [[scenario]]
 id = "s-10"
+kind = "pair"
 question = "как агенту экономить контекст при чтении памяти ZeroAIMemory"
 expect = ["ru/zam/l0-l1-levels", "ru/zam/hybrid-search-rrf"]
+nuggets = [
+  { source = "ru/zam/l0-l1-levels", text = "В API то же самое: `GET /nodes/{id}?tier=L0|L1|L2`." },
+  { source = "ru/zam/l0-l1-levels", text = "экстрактивно берём предложение, ближайшее к центроиду эмбеддингов чанков заметки, и обрезаем до 50 токенов" },
+  { source = "ru/zam/hybrid-search-rrf", text = "Цель — 10 карточек не дороже 500 токенов." },
+  { source = "ru/zam/hybrid-search-rrf", text = "Затем всё упаковывается в `budget_tokens` по `token_count` чанков; минимум один элемент попадает всегда." },
+]
 
 [[scenario]]
 id = "s-11"
+kind = "multi"
 question = "как сервер управляет процессом Qdrant и восстанавливает векторный индекс"
 expect = ["ru/zam/qdrant-managed-process", "ru/zam/index-jobs-outbox", "ru/zam/reindex-from-embeddings"]
+nuggets = [
+  { source = "ru/zam/qdrant-managed-process", text = "назначается в Job Object с флагом `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`" },
+  { source = "ru/zam/qdrant-managed-process", text = "В `pre_exec` вызываем `prctl(PR_SET_PDEATHSIG, SIGKILL)`." },
+  { source = "ru/zam/qdrant-managed-process", text = "Пять падений за 10 минут — срабатывает circuit breaker" },
+  { source = "ru/zam/qdrant-managed-process", text = "стираем `storage/` и пересобираем индекс из таблицы `embeddings` без инференса" },
+  { source = "ru/zam/index-jobs-outbox", text = "id точки — детерминированный UUIDv5 от id чанка, повтор просто перезапишет те же точки" },
+  { source = "ru/zam/index-jobs-outbox", text = "При старте сервера всё, что зависло в `running`, возвращается в `queued`." },
+  { source = "ru/zam/index-jobs-outbox", text = "задержка `2^attempts` секунд, но не больше часа" },
+  { source = "ru/zam/reindex-from-embeddings", text = "Прерванный reindex (остановка, сбой) автоматически повторяется при следующем запуске." },
+  { source = "ru/zam/reindex-from-embeddings", text = "Ключ кэша — blake3 от строки, которая реально ушла в модель" },
+]
 
 [[scenario]]
 id = "s-12"
+kind = "pair"
 question = "what are the alternatives to single-vector dense retrieval: late interaction and learned sparse"
 expect = ["en/research/colbert-late-interaction", "en/research/learned-sparse-splade"]
+nuggets = [
+  { source = "en/research/colbert-late-interaction", text = "Each query token finds its best-matching document token (MaxSim), and the maxima are summed." },
+  { source = "en/research/colbert-late-interaction", text = "Storage is the main issue: one vector per token instead of one per passage." },
+  { source = "en/research/colbert-late-interaction", text = "compute MaxSim on 100 candidates, no special index needed" },
+  { source = "en/research/colbert-late-interaction", text = "ColBERTv2 (Santhanam et al., 2022) stores each token vector as a centroid id plus a quantized residual" },
+  { source = "en/research/learned-sparse-splade", text = "Terms that never appear in the text can get non-zero weight (\"car\" activates \"vehicle\")." },
+  { source = "en/research/learned-sparse-splade", text = "A FLOPS regularizer penalizes the expected number of shared non-zero terms between queries and documents" },
+  { source = "en/research/learned-sparse-splade", text = "only tokens actually present in the input get a weight (no expansion)" },
+]
 
 [[scenario]]
 id = "s-13"
+kind = "pair"
 question = "как считать метрики качества поиска и доверительные интервалы к ним"
 expect = ["ru/research/metriki-ir", "ru/research/butstrep-intervaly"]
+nuggets = [
+  { source = "ru/research/metriki-ir", text = "MRR смотрит только на первый релевантный результат." },
+  { source = "ru/research/metriki-ir", text = "`IDCG@k` — DCG идеального упорядочивания" },
+  { source = "ru/research/metriki-ir", text = "Нужно схлопывать до документа (оставлять лучшую позицию) до подсчёта, иначе DCG завышается." },
+  { source = "ru/research/metriki-ir", text = "Если у запроса пять релевантных, а k = 3, максимум R@3 = 0.6." },
+  { source = "ru/research/butstrep-intervaly", text = "B раз (1000–10000) выбрать n запросов с возвращением и посчитать среднее." },
+  { source = "ru/research/butstrep-intervaly", text = "Если интервал разности не содержит ноль, улучшение считаем значимым." },
+  { source = "ru/research/butstrep-intervaly", text = "Фиксировать зерно генератора, чтобы интервал воспроизводился." },
+]
 
 [[scenario]]
 id = "s-14"
+kind = "multi"
 question = "как в проекте на Python держать зависимости и виртуальные окружения"
 expect = ["ru/devtools/python-venv", "ru/devtools/uv-package-manager", "ru/devtools/pyproject-editable-install"]
+nuggets = [
+  { source = "ru/devtools/python-venv", text = "Окружение не переносится: внутри абсолютные пути." },
+  { source = "ru/devtools/python-venv", text = "можно звать `.venv/bin/python` напрямую — так надёжнее в скриптах и cron" },
+  { source = "ru/devtools/python-venv", text = "голый `pip install` в системный Python запрещён (PEP 668" },
+  { source = "ru/devtools/uv-package-manager", text = "`--locked` — аналог строгой установки по lock-файлу" },
+  { source = "ru/devtools/uv-package-manager", text = "`uv.lock` кроссплатформенный (универсальное разрешение)" },
+  { source = "ru/devtools/uv-package-manager", text = "uv по умолчанию не ставит pip в окружение" },
+  { source = "ru/devtools/pyproject-editable-install", text = "pip install -e \".[dev]\"" },
+  { source = "ru/devtools/pyproject-editable-install", text = "импорт идёт прямо из рабочей копии: правки в исходниках видны без переустановки" },
+  { source = "ru/devtools/pyproject-editable-install", text = "Не путать: диапазоны — что допустимо, lock — что установлено." },
+]
 
 [[scenario]]
 id = "s-15"
+kind = "multi"
 question = "review our GitHub Actions setup: matrix builds, concurrency, caches and secrets in PR workflows"
 expect = ["en/devtools/gha-matrix-strategy", "en/devtools/gha-workflow-concurrency", "en/devtools/gha-cache-keys", "en/devtools/gha-pull-request-target-secrets"]
+nuggets = [
+  { source = "en/devtools/gha-matrix-strategy", text = "YAML reads `3.10` as the float `3.1`." },
+  { source = "en/devtools/gha-matrix-strategy", text = "One red cell cancels every other cell still running." },
+  { source = "en/devtools/gha-matrix-strategy", text = "We added a final aggregator job with `needs: test` and made only that one required." },
+  { source = "en/devtools/gha-workflow-concurrency", text = "group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}" },
+  { source = "en/devtools/gha-workflow-concurrency", text = "`head_ref` is set only for pull_request events, hence the fallback to `ref` for pushes." },
+  { source = "en/devtools/gha-workflow-concurrency", text = "interrupting a half-applied migration is worse than waiting" },
+  { source = "en/devtools/gha-cache-keys", text = "If `key` hit exactly, nothing is saved at the end, even if you added new packages during the job." },
+  { source = "en/devtools/gha-cache-keys", text = "`hashFiles` returns an empty string when no file matches the pattern." },
+  { source = "en/devtools/gha-cache-keys", text = "Entries created in a PR are useless for everyone else and just consume quota." },
+  { source = "en/devtools/gha-pull-request-target-secrets", text = "a separate `workflow_run` workflow (privileged) downloads the artifact and posts the comment" },
+  { source = "en/devtools/gha-pull-request-target-secrets", text = "pass them through `env:` to avoid script injection" },
+]
 
 [[scenario]]
 id = "s-16"
+kind = "pair"
 question = "внешний сервис отвечает медленно: какие таймауты и повторы ставить"
 expect = ["ru/ops/timeouts", "ru/ops/retries-backoff-jitter"]
+nuggets = [
+  { source = "ru/ops/timeouts", text = "Короткий, 1–3 с: если хост недоступен, ждать дольше бессмысленно." },
+  { source = "ru/ops/timeouts", text = "Подбирается по p99 апстрима с запасом" },
+  { source = "ru/ops/timeouts", text = "если у входящего запроса осталось 800 мс, исходящий вызов не должен ждать 5 с" },
+  { source = "ru/ops/timeouts", text = "Таймаут прокси (`proxy_read_timeout` у nginx) должен быть больше таймаута приложения" },
+  { source = "ru/ops/retries-backoff-jitter", text = "yield random.uniform(0, min(cap, base * 2 ** n))" },
+  { source = "ru/ops/retries-backoff-jitter", text = "Ответ 400, 401, 404, 409 повтором не лечится." },
+  { source = "ru/ops/retries-backoff-jitter", text = "Бюджет повторов: не больше ~10 % от числа обычных запросов за окно." },
+  { source = "ru/ops/retries-backoff-jitter", text = "Если сервер прислал `Retry-After` — уважать его." },
+]
 
 [[scenario]]
 id = "s-17"
+kind = "pair"
 question = "postgres is slow and runs out of connections under load"
 expect = ["en/db/postgres-explain-analyze", "en/db/connection-pool-exhaustion"]
+nuggets = [
+  { source = "en/db/postgres-explain-analyze", text = "Column order: equality columns first, then the range or sort column." },
+  { source = "en/db/postgres-explain-analyze", text = "`rows=12` estimated against `rows=48210` actual means the planner is working from bad statistics" },
+  { source = "en/db/postgres-explain-analyze", text = "ON orders (customer_id, status, created_at DESC);" },
+  { source = "en/db/postgres-explain-analyze", text = "sort by `total_exec_time`, not by mean." },
+  { source = "en/db/connection-pool-exhaustion", text = "Moved the external call outside the transaction" },
+  { source = "en/db/connection-pool-exhaustion", text = "PgBouncer in transaction mode in front of the database" },
+  { source = "en/db/connection-pool-exhaustion", text = "throughput peaks at a small number of active connections, roughly a few per CPU core" },
+]
 
 [[scenario]]
 id = "s-18"
+kind = "multi"
 question = "настрой SQLite под конкурентную запись и чтобы файл базы не разрастался"
 expect = ["ru/db/sqlite-wal", "ru/db/sqlite-busy-timeout", "ru/db/sqlite-vacuum"]
+nuggets = [
+  { source = "ru/db/sqlite-wal", text = "PRAGMA journal_mode = WAL;" },
+  { source = "ru/db/sqlite-wal", text = "читатели не блокируют писателя и писатель не блокирует читателей" },
+  { source = "ru/db/sqlite-wal", text = "checkpoint не может перенести страницы, которые ещё нужны какому-то открытому читателю" },
+  { source = "ru/db/sqlite-busy-timeout", text = "PRAGMA busy_timeout = 5000;" },
+  { source = "ru/db/sqlite-busy-timeout", text = "транзакции, которые будут писать, начинать с `BEGIN IMMEDIATE`" },
+  { source = "ru/db/sqlite-busy-timeout", text = "Настройка действует на соединение, задаётся при каждом открытии." },
+  { source = "ru/db/sqlite-vacuum", text = "`freelist_count * page_size` — столько байт можно вернуть." },
+  { source = "ru/db/sqlite-vacuum", text = "нужно свободное место до двух размеров базы (временная копия плюс журнал)" },
+  { source = "ru/db/sqlite-vacuum", text = "PRAGMA auto_vacuum = INCREMENTAL;" },
+]
 
 [[scenario]]
 id = "s-19"
+kind = "insight"
 question = "robocopy в скрипте вернул ненулевой код — это ошибка?"
 expect = ["insight:p09-t"]
+nuggets = [
+  { source = "insight:p09-t", text = "robocopy возвращает битовую маску: 1 — файлы скопированы, 2 — есть лишние файлы, 4 — несовпадения" },
+  { source = "insight:p09-t", text = "ошибкой считается код 8 и выше" },
+  { source = "insight:p09-t", text = "Обёртка для планировщика должна переводить коды 0–7 в 0." },
+]
 
 [[scenario]]
 id = "s-20"
+kind = "insight"
 question = "можно ли включать Docker для запуска Qdrant в разработке"
 expect = ["insight:p12-a", "insight:p02-t"]
+nuggets = [
+  { source = "insight:p12-a", text = "Решение владельца: проект работает без Docker." },
+  { source = "insight:p12-a", text = "нативные бинарники для Windows x64 и Linux x64, которые сервер запускает и обновляет сам" },
+  { source = "insight:p02-t", text = "The Qdrant release archive for Windows contains qdrant.exe" },
+  { source = "insight:p02-t", text = "runs as a normal process with a config file; no Docker or WSL is involved" },
+]
+
+[[scenario]]
+id = "s-21"
+kind = "long"
+question = "What actually caused the internal DNS outage that lasted over an hour, and what else made it so much worse than expected?"
+expect = ["en/long/dns-outage-postmortem"]
+nuggets = [
+  { source = "en/long/dns-outage-postmortem", text = "the resolver software used one shared pool of workers for all queries, with no isolation between forwarded zones and everything else" },
+  { source = "en/long/dns-outage-postmortem", text = "slow forwarded queries exhausted the pool and blocked resolution of every other name" },
+  { source = "en/long/dns-outage-postmortem", text = "The resolver supports a per-upstream limit on concurrent queries, which would have contained the damage, but it was not configured." },
+  { source = "en/long/dns-outage-postmortem", text = "For forwarded zones inside our own network, an answer that does not arrive within a few hundred milliseconds is not going to arrive." },
+]
+
+[[scenario]]
+id = "s-22"
+kind = "long"
+question = "When we moved to Redis Cluster, what did we have to rework in the code that touches several keys in one command?"
+expect = ["en/long/redis-cluster-migration"]
+nuggets = [
+  { source = "en/long/redis-cluster-migration", text = "hash tags must contain an identifier with at least tens of thousands of distinct values in production" },
+  { source = "en/long/redis-cluster-migration", text = "We split the check into two independent scripts, one for the per-user counter and one for the global counter" },
+  { source = "en/long/redis-cluster-migration", text = "a cluster client splits the pipeline by node and sends each part to the right primary" },
+  { source = "en/long/redis-cluster-migration", text = "The ones that genuinely needed atomicity got hash tags." },
+]
+
+[[scenario]]
+id = "s-23"
+kind = "long"
+question = "How do we process payment provider webhooks safely when they may come more than once and in any order?"
+expect = ["en/long/payment-webhooks-reliability"]
+nuggets = [
+  { source = "en/long/payment-webhooks-reliability", text = "it inserts the raw event into an inbox table with the event id as the primary key" },
+  { source = "en/long/payment-webhooks-reliability", text = "the webhook is treated as a notification that something changed, not as the source of truth about what the state is now" },
+  { source = "en/long/payment-webhooks-reliability", text = "the worker takes a lock per payment id for the duration of processing" },
+  { source = "en/long/payment-webhooks-reliability", text = "a check that the timestamp is no older than five minutes to limit replay" },
+]
+
+[[scenario]]
+id = "s-24"
+kind = "long"
+question = "How did we figure out which indexes on the orders database were dead weight, get rid of them without risk, and add new ones while the system stayed online?"
+expect = ["en/long/postgres-index-tuning-notes"]
+nuggets = [
+  { source = "en/long/postgres-index-tuning-notes", text = "statistics are per server, so an index that is never used on the primary may be used heavily on a replica" },
+  { source = "en/long/postgres-index-tuning-notes", text = "inside a transaction that dropped the index first and rolled back at the end" },
+  { source = "en/long/postgres-index-tuning-notes", text = "using the concurrent form of drop to avoid blocking writes" },
+  { source = "en/long/postgres-index-tuning-notes", text = "We now check for invalid indexes after every concurrent build" },
+]
+
+[[scenario]]
+id = "s-25"
+kind = "long"
+question = "Почему сертификат всё-таки истёк, хотя продление шло автоматически, и как у нас вообще организована смена сертификатов?"
+expect = ["ru/long/tls-certificate-rotation", "ru/ops/tls-expired-certificate"]
+nuggets = [
+  { source = "ru/long/tls-certificate-rotation", text = "сертификаты для серверов выпускаются максимум на девяносто дней и только автоматически" },
+  { source = "ru/long/tls-certificate-rotation", text = "сам выпускает его, кладёт в секрет и обновляет за тридцать дней до истечения" },
+  { source = "ru/long/tls-certificate-rotation", text = "обновляет те, у которых осталось меньше трети срока" },
+  { source = "ru/ops/tls-expired-certificate", text = "Перезагрузки не было, и в памяти процесса жил старый сертификат до самого истечения." },
+  { source = "ru/ops/tls-expired-certificate", text = "Хук перезагрузки когда-то был в cron-скрипте, который удалили при переезде на systemd-таймер." },
+]
+
+[[scenario]]
+id = "s-26"
+kind = "long"
+question = "Почему у консьюмеров Kafka в индексаторе поиска периодически рос лаг и что в итоге это исправило?"
+expect = ["ru/long/kafka-consumer-lag-analysis"]
+nuggets = [
+  { source = "ru/long/kafka-consumer-lag-analysis", text = "В каждый момент роста отставания группа уходила в перебалансировку, и не одну, а серию из нескольких подряд." },
+  { source = "ru/long/kafka-consumer-lag-analysis", text = "преобразование одного такого события в документы занимало до двадцати секунд из-за неэффективного кода сопоставления категорий" },
+  { source = "ru/long/kafka-consumer-lag-analysis", text = "Мы перешли на кооперативную стратегию назначения разделов" },
+  { source = "ru/long/kafka-consumer-lag-analysis", text = "Мы заменили обход на словарь, который строится один раз при загрузке дерева категорий" },
+]
+
+[[scenario]]
+id = "s-27"
+kind = "long"
+question = "Как перевести PostgreSQL на следующую мажорную версию и как вернуться назад, если после переезда что-то сломается?"
+expect = ["ru/long/postgres-major-upgrade-runbook"]
+nuggets = [
+  { source = "ru/long/postgres-major-upgrade-runbook", text = "логическая репликация со старого кластера на новый с последующим переключением приложений" },
+  { source = "ru/long/postgres-major-upgrade-runbook", text = "выставляет на новом значение с запасом в десять тысяч" },
+  { source = "ru/long/postgres-major-upgrade-runbook", text = "Перевести приложения в режим только чтения флагом конфигурации" },
+  { source = "ru/long/postgres-major-upgrade-runbook", text = "новый кластер стал публикатором, старый — подписчиком" },
+]
+
+[[scenario]]
+id = "s-28"
+kind = "long"
+question = "Что произошло, когда журналы забили диск на сервере, и как ограничить разрастание логов контейнеров?"
+expect = ["ru/long/incident-disk-full-logs", "ru/docker/container-log-rotation"]
+nuggets = [
+  { source = "ru/long/incident-disk-full-logs", text = "Причиной стало заполнение корневого раздела файлами журналов, которые после недавнего изменения конфигурации перестали ротироваться." },
+  { source = "ru/long/incident-disk-full-logs", text = "Конфигурацию ротации никто не обновил, потому что она жила в другом репозитории" },
+  { source = "ru/long/incident-disk-full-logs", text = "проверка здоровья запрашивала лёгкий служебный путь, который не пишет на диск" },
+  { source = "ru/docker/container-log-rotation", text = "\"log-opts\": { \"max-size\": \"20m\", \"max-file\": \"5\" }" },
+  { source = "ru/docker/container-log-rotation", text = "dockerd держит файл открытым, и место не вернётся" },
+]
+
+[[scenario]]
+id = "s-29"
+kind = "long"
+question = "Благодаря чему прогоны CI стали намного короче — что дали общий кеш компиляции, его чистка и изоляция ненадёжных тестов?"
+expect = ["ru/long/ci-pipeline-retrospective"]
+nuggets = [
+  { source = "ru/long/ci-pipeline-retrospective", text = "в ключ кеша попадал путь к рабочему каталогу агента, а он содержал номер сборки" },
+  { source = "ru/long/ci-pipeline-retrospective", text = "медианное время компиляции на ветке упало с девяти минут до трёх" },
+  { source = "ru/long/ci-pipeline-retrospective", text = "политику удаления артефактов, к которым не обращались четырнадцать дней" },
+  { source = "ru/long/ci-pipeline-retrospective", text = "тест помечается атрибутом, продолжает выполняться в каждом прогоне" },
+]
+
+[[scenario]]
+id = "s-30"
+kind = "long"
+question = "I just got paged — what should I do in the first few minutes, how do I decide whether this counts as an incident, and why stop the damage before digging into the cause?"
+expect = ["en/long/oncall-handbook"]
+nuggets = [
+  { source = "en/long/oncall-handbook", text = "acknowledge it immediately, even before you look at it, so that it does not escalate to the secondary" },
+  { source = "en/long/oncall-handbook", text = "what is broken, since when, who is affected, and what changed recently" },
+  { source = "en/long/oncall-handbook", text = "if users are affected now or will be soon, if data is at risk, or if you need help from anyone outside the rotation" },
+  { source = "en/long/oncall-handbook", text = "rollback is cheap and quick, and confirming causation can take an hour" },
+]
+
+[[scenario]]
+id = "s-31"
+kind = "insight"
+question = "Как долго у нас хранятся закешированные расценки на доставку и что с ними делаем перед большой акцией?"
+expect = ["insight:c01-b"]
+nuggets = [
+  { source = "insight:c01-b", text = "Срок жизни кеша тарифов доставки увеличен до 60 минут" },
+  { source = "insight:c01-b", text = "тарифы меняются раз в сутки, а при обновлении договора кеш сбрасывается событием" },
+  { source = "insight:c01-b", text = "задача прогрева заполняет все сочетания региона и типа доставки за последний месяц" },
+]
+
+[[scenario]]
+id = "s-32"
+kind = "insight"
+question = "Right after we roll out a new release the GPU reranker is sluggish for a while — what caused that and what did we change?"
+expect = ["insight:r04-fix"]
+nuggets = [
+  { source = "insight:r04-fix", text = "up to ten times slower while the runtime compiled kernels and allocated memory for new input shapes" },
+  { source = "insight:r04-fix", text = "The server now replays recorded requests of varied length before reporting ready." },
+]
+
+[[scenario]]
+id = "s-33"
+kind = "insight"
+question = "Почему шлюз отвечает 502, когда заливают крупные файлы, и какие лимиты на размер выставлены на входе?"
+expect = ["insight:r05-fix", "ru/infra/upload-size-limits"]
+nuggets = [
+  { source = "insight:r05-fix", text = "Большие тела запросов шлюз буферизует во временный файл на корневом разделе" },
+  { source = "insight:r05-fix", text = "Когда раздел заполнился журналами без ротации, запись буфера падала" },
+  { source = "insight:r05-fix", text = "хотя вышестоящий сервис хранения не участвовал" },
+  { source = "ru/infra/upload-size-limits", text = "разрешает 64 МБ, остальные маршруты API — значение по умолчанию" },
+  { source = "ru/infra/upload-size-limits", text = "Балансировщик ограничивает тело 100 МБ." },
+]
+
+[[scenario]]
+id = "s-34"
+kind = "insight"
+question = "What validity periods do we use for internal TLS certificates across different kinds of hosts and clients?"
+expect = ["insight:c14-c"]
+nuggets = [
+  { source = "insight:c14-c", text = "Server certificates stay at 90 days" },
+  { source = "insight:c14-c", text = "in the payment and personal data zones they are issued for 30 days" },
+  { source = "insight:c14-c", text = "Client certificates for service-to-service mTLS live 24 hours and are renewed every 8 hours" },
+]
+
+[[scenario]]
+id = "s-35"
+kind = "insight"
+question = "Безопасно ли переотправить списание денег, если ответ не пришёл вовремя, и как поведёт себя провайдер оплаты, если продублировать вызов с тем же ключом идемпотентности?"
+expect = ["insight:k01-t", "insight:k01-n"]
+nuggets = [
+  { source = "insight:k01-t", text = "Шлюз провёл оба платежа, и 37 покупателей получили двойное списание" },
+  { source = "insight:k01-t", text = "Повтор неидемпотентного запроса без Idempotency-Key запрещён" },
+  { source = "insight:k01-t", text = "у платежей ключ — идентификатор операции заказа" },
+  { source = "insight:k01-n", text = "в течение 24 часов не создаёт новый платёж, а возвращает сохранённый ответ первого запроса" },
+  { source = "insight:k01-n", text = "Ключ с другим телом запроса получает 422." },
+]
+
+[[scenario]]
+id = "s-36"
+kind = "single"
+question = "Добавлял каталог в PATH командой setx, и теперь часть утилит перестала запускаться — в чём причина и как делать это корректно?"
+expect = ["ru/windows/path-setx-truncation"]
+nuggets = [
+  { source = "ru/windows/path-setx-truncation", text = "записывает значение не длиннее 1024 символов и молча (только с предупреждением) обрезает остальное" },
+  { source = "ru/windows/path-setx-truncation", text = "В результате весь системный PATH копируется в пользовательский, дублируется" },
+  { source = "ru/windows/path-setx-truncation", text = "они приходят уже раскрытыми, и ссылка превращается в жёсткий путь" },
+  { source = "ru/windows/path-setx-truncation", text = "Через PowerShell, работая только с пользовательским уровнем" },
+]
+
+[[scenario]]
+id = "s-37"
+kind = "single"
+question = "I did a hard reset and my unpushed work vanished — how can I bring those commits back?"
+expect = ["en/git/reflog-recovery"]
+nuggets = [
+  { source = "en/git/reflog-recovery", text = "The commits themselves stay in the object database until garbage collection removes them" },
+  { source = "en/git/reflog-recovery", text = "gc does not touch anything still referenced from the reflog" },
+  { source = "en/git/reflog-recovery", text = "find the line before \"reset: moving to\"" },
+  { source = "en/git/reflog-recovery", text = "git reset --hard HEAD@{1}" },
+]
+
+[[scenario]]
+id = "s-38"
+kind = "single"
+question = "Скрипт нормально отрабатывает, если запустить его вручную, а через cron ничего не происходит — в чём может быть дело?"
+expect = ["ru/linux/crontab-gotchas"]
+nuggets = [
+  { source = "ru/linux/crontab-gotchas", text = "падает с «command not found». Решение: абсолютные пути" },
+  { source = "ru/linux/crontab-gotchas", text = "если почта не настроена, вывод теряется" },
+  { source = "ru/linux/crontab-gotchas", text = "cron не знает, что прошлый запуск ещё идёт" },
+]
+
+[[scenario]]
+id = "s-39"
+kind = "single"
+question = "My app keeps failing with ENOSPC even though df -h says the disk has plenty of room — what could be going on?"
+expect = ["en/linux/disk-full-but-df-shows-space"]
+nuggets = [
+  { source = "en/linux/disk-full-but-df-shows-space", text = "a directory with millions of tiny files can exhaust inodes while gigabytes remain free" },
+  { source = "en/linux/disk-full-but-df-shows-space", text = "the blocks are freed only when the last descriptor is closed" },
+  { source = "en/linux/disk-full-but-df-shows-space", text = "Ext4 reserves 5 % of blocks for root by default" },
+  { source = "en/linux/disk-full-but-df-shows-space", text = "the old files are hidden under the mount point and still use space on the parent filesystem" },
+]
+
+[[scenario]]
+id = "s-40"
+kind = "single"
+question = "Пересобираю проект, а компоновщик не может записать исполняемый файл, потому что он кем-то используется — как найти виновника и обойти это?"
+expect = ["ru/windows/file-locked-running-exe"]
+nuggets = [
+  { source = "ru/windows/file-locked-running-exe", text = "Самое частое — забытый экземпляр программы" },
+  { source = "ru/windows/file-locked-running-exe", text = "Sysinternals Handle: `handle64.exe app.exe` печатает процессы и дескрипторы" },
+  { source = "ru/windows/file-locked-running-exe", text = "Перед пересборкой останавливать запущенный бинарник" },
+]
+
+[[scenario]]
+id = "s-41"
+kind = "single"
+question = "My async function won't compile inside tokio::spawn because the compiler says its future isn't Send — it holds a std lock guard over an await; how do I fix it?"
+expect = ["en/rust/future-not-send-mutexguard-await"]
+nuggets = [
+  { source = "en/rust/future-not-send-mutexguard-await", text = "Copy out what you need and let the guard go." },
+  { source = "en/rust/future-not-send-mutexguard-await", text = "`lock().await` yields instead of blocking the thread" },
+]
+
+[[scenario]]
+id = "s-42"
+kind = "multi"
+question = "Our monorepo is enormous and full of heavy binary assets — how do we keep fresh clones lightweight and have several branches open side by side?"
+expect = ["en/git/lfs", "en/git/sparse-checkout-partial-clone", "en/git/worktree"]
+nuggets = [
+  { source = "en/git/lfs", text = "on a CI runner yields pointer files instead of images" },
+  { source = "en/git/lfs", text = "clones without downloading content; fetch selectively" },
+  { source = "en/git/sparse-checkout-partial-clone", text = "but file contents (blobs) are downloaded lazily when needed" },
+  { source = "en/git/sparse-checkout-partial-clone", text = "only the blobs for the sparse set at the current commit are downloaded" },
+  { source = "en/git/worktree", text = "A stash made in one worktree is visible in all of them" },
+  { source = "en/git/worktree", text = "so the first build is a full one" },
+]
+
+[[scenario]]
+id = "s-43"
+kind = "multi"
+question = "На Windows сборка ползёт и иногда падает — подозреваю антивирус, слишком глубокую вложенность каталогов и то, что репозиторий лежит на /mnt/c под WSL; что с этим делать?"
+expect = ["ru/windows/defender-exclusions-build", "ru/windows/long-paths-max-path", "ru/windows/wsl-mnt-c-performance"]
+nuggets = [
+  { source = "ru/windows/defender-exclusions-build", text = "отдельный том ReFS, на котором Defender работает в асинхронном режиме производительности" },
+  { source = "ru/windows/defender-exclusions-build", text = "Исключать только каталоги с исходниками и кэшами сборки, а не весь профиль или диск" },
+  { source = "ru/windows/long-paths-max-path", text = "-Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force" },
+  { source = "ru/windows/long-paths-max-path", text = "git config --system core.longpaths true" },
+  { source = "ru/windows/long-paths-max-path", text = "без манифеста приложения ничего не изменится" },
+  { source = "ru/windows/wsl-mnt-c-performance", text = "доступ к ним идёт по сети через протокол 9P" },
+  { source = "ru/windows/wsl-mnt-c-performance", text = "Держать исходники внутри WSL" },
+]
+
+[[scenario]]
+id = "s-44"
+kind = "attachment"
+question = "По регламенту насосной: с какой периодичностью обновляют подшипники основного насоса, что делать, если агрегат сильно трясёт, и с кем согласовывали, как измерять вибрацию?"
+expect = ["doc:files/regulations-ru.docx"]
+nuggets = [
+  { source = "doc:files/regulations-ru.docx", text = "заменяют каждые 4200 моточасов" },
+  { source = "doc:files/regulations-ru.docx", text = "при вибрации выше 7,1 мм/с — немедленно" },
+  { source = "doc:files/regulations-ru.docx", text = "согласована с заводом-изготовителем в марте 2024 года" },
+]
+
+[[scenario]]
+id = "s-45"
+kind = "attachment"
+question = "Что сказано в регламенте станции: чем и где стравливают давление в аварийной ситуации и как тестируют запасной генератор?"
+expect = ["doc:files/regulations-ru.docx"]
+nuggets = [
+  { source = "doc:files/regulations-ru.docx", text = "Аварийный сброс давления выполняется задвижкой З-17" },
+  { source = "doc:files/regulations-ru.docx", text = "у восточной стены машинного зала" },
+  { source = "doc:files/regulations-ru.docx", text = "проверяют под нагрузкой по первым понедельникам месяца не менее 40 минут" },
+]
+
+[[scenario]]
+id = "s-46"
+kind = "attachment"
+question = "According to the onboarding guide, what does a newcomer have to go through before being let into the data hall, and how is remote VPN access handed out?"
+expect = ["doc:files/onboarding-en.docx"]
+nuggets = [
+  { source = "doc:files/onboarding-en.docx", text = "only after completing the fire suppression briefing" },
+  { source = "doc:files/onboarding-en.docx", text = "hardware VPN token issued by the IT desk, expires after 90 days" },
+]
+
+[[scenario]]
+id = "s-47"
+kind = "attachment"
+question = "What does the roadmap say about the timing of the billing switch to the new ledger, and how is the storage period for recorded calls changing?"
+expect = ["doc:files/roadmap.pptx"]
+nuggets = [
+  { source = "doc:files/roadmap.pptx", text = "is scheduled for the third quarter" },
+  { source = "doc:files/roadmap.pptx", text = "reduced from five years to eighteen months" },
+]
+
+[[scenario]]
+id = "s-48"
+kind = "attachment"
+question = "Что по дорожной карте показал пробный запуск голосового помощника в колл-центре и кто одобрил деньги на него?"
+expect = ["doc:files/roadmap.pptx"]
+nuggets = [
+  { source = "doc:files/roadmap.pptx", text = "сократил среднее время ожидания на 18 %" },
+  { source = "doc:files/roadmap.pptx", text = "согласован с финансовой дирекцией до конца октября" },
+]

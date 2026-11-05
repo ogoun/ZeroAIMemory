@@ -58,7 +58,8 @@ fn mini_set(d: &Path) {
          Флаг --hard у reset выбрасывает незакоммиченные правки рабочего каталога безвозвратно.\n",
     )
     .unwrap();
-    fs::create_dir_all(d.join("docs")).unwrap();
+    fs::create_dir_all(d.join("docs").join("files")).unwrap();
+    fs::write(d.join("docs").join("manifest.json"), "{\"version\": 3}\n").unwrap();
     fs::write(
         d.join("scenarios.toml"),
         r#"[[scenario]]
@@ -175,13 +176,32 @@ fn eval_rejects_fingerprint_mismatch() {
     let out = stdout(&o);
     let nf = printed(&out, "nuggets_fingerprint");
     let cf = printed(&out, "corpus_fingerprint");
+    let ms = printed(&out, "docs_manifest_sha256");
     fs::write(
         d.join("nuggets.lock"),
-        format!("nuggets_fingerprint = \"{nf}\"\ncorpus_fingerprint = \"{cf}\"\n"),
+        format!(
+            "nuggets_fingerprint = \"{nf}\"\ncorpus_fingerprint = \"{cf}\"\n\
+             docs_manifest_sha256 = \"{ms}\"\nscenarios = 1\nnuggets = 2\n"
+        ),
     )
     .unwrap();
     let o = run(&["eval", "--check"], &set);
     assert!(o.status.success(), "{}\n{}", stdout(&o), stderr(&o));
+    // посторонний файл в корне eval/docs замок не нарушает
+    fs::write(d.join("docs").join("README.txt"), "заметки").unwrap();
+    let o = run(&["eval", "--check"], &set);
+    assert!(o.status.success(), "{}\n{}", stdout(&o), stderr(&o));
+    // другой manifest.json набора документов — причина названа: генератор документов
+    let manifest = d.join("docs").join("manifest.json");
+    fs::write(&manifest, "{\"version\": 4}\n").unwrap();
+    let o = run(&["eval", "--check"], &set);
+    assert!(!o.status.success(), "{}", stdout(&o));
+    let e = stderr(&o);
+    assert!(
+        e.contains("corpus_fingerprint") && e.contains("генератором документов"),
+        "{e}"
+    );
+    fs::write(&manifest, "{\"version\": 3}\n").unwrap();
     // правка текста источника нагета меняет оба отпечатка
     let note = d.join("corpus/ru/git/reset.md");
     let t = fs::read_to_string(&note).unwrap();

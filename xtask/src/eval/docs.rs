@@ -582,7 +582,7 @@ fn multipart(node: &str, file: &str, data: &[u8]) -> Vec<u8> {
     b
 }
 
-fn upload(s: &Session, node: &str, file: &str, data: &[u8]) -> Result<Value> {
+pub(crate) fn upload(s: &Session, node: &str, file: &str, data: &[u8]) -> Result<Value> {
     let a = agent_with(REQ_TIMEOUT);
     let mut r = a
         .post(format!("{}/api/v1/blobs", s.base))
@@ -879,13 +879,13 @@ fn sources(it: &Value) -> String {
 }
 
 /// Путь заметки-владельца файла набора.
-fn owner_path(file: &str) -> String {
+pub(crate) fn owner_path(file: &str) -> String {
     let stem = file.replace(['/', '.'], "-");
     format!("eval-docs/{stem}")
 }
 
 /// Ждёт конечного состояния всех документов (`done` | `failed` | `unsupported`).
-fn wait_extracted(
+pub(crate) fn wait_extracted(
     s: &mut Session,
     owners: &[(String, String, Instant)],
 ) -> Result<BTreeMap<String, (Value, f64)>> {

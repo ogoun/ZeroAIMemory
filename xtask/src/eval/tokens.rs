@@ -27,15 +27,20 @@ use serde_json::{Value, json};
 use super::corpus::{Corpus, EVAL_SOLUTION, INSIGHT_REF, fnv1a};
 use super::hints::refs_in_text;
 use super::metrics::{Estimate, estimate, ratio_estimate};
-use super::nuggets::Nugget;
+use super::nuggets::{DOC_REF, Nugget};
 use super::run::{self, RunSpec, Session};
 use super::{Device, EvalArgs, Mode, Paths};
 use crate::smoke::api_text;
 
 pub mod mcp;
 
-/// Не меньше стольких сценариев.
+/// Не меньше стольких сценариев (набор M4).
 pub const MIN_SCENARIOS: usize = 15;
+/// Не меньше стольких сценариев у набора ТС-1 M6 (спецификация M6 §3.1).
+pub const MIN_SCENARIOS_M6: usize = 45;
+/// Виды сценариев ТС-1 M6 — слои разбиения dev/holdout (§3.1, §3.5): длинная заметка, insight,
+/// вложение, три и больше источников, один источник, два источника.
+pub const KINDS_M6: [&str; 6] = ["long", "insight", "attachment", "multi", "single", "pair"];
 /// Бюджет «наивного» пути (`mode=chunks`).
 pub const NAIVE_BUDGET: usize = 4000;
 /// Бюджет чтения пути (а): выбранные источники читаются целиком (L2) в том же бюджете, что у
@@ -67,6 +72,113 @@ pub struct Scenario {
 /// Вид сценария без поля `kind`.
 pub const DEFAULT_KIND: &str = "general";
 
+/// Состав набора по признакам сценария (§3.1; сценарий может считаться в нескольких).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Composition {
+    /// Ожидаемый источник — длинная заметка `<язык>/long/…`.
+    pub long: usize,
+    /// Ожидаемый источник — insight.
+    pub insight: usize,
+    /// Ожидаемый источник — документ набора (`doc:`).
+    pub attachment: usize,
+    /// Три и больше источников.
+    pub multi: usize,
+    /// Один источник.
+    pub single: usize,
+}
+
+/// Минимальный состав набора ТС-1 M6 (спецификация M6 §3.1, «Состав пополнения»).
+pub const MIN_COMPOSITION: Composition = Composition {
+    long: 8,
+    insight: 6,
+    attachment: 4,
+    multi: 6,
+    single: 4,
+};
+
+/// Признаки сценария для состава и проверки вида.
+fn traits(s: &Scenario) -> Composition {
+    let has = |f: &dyn Fn(&str) -> bool| usize::from(s.expect.iter().any(|e| f(e)));
+    Composition {
+        long: has(&|e: &str| super::corpus::is_long_path(e)),
+        insight: has(&|e: &str| e.starts_with(INSIGHT_REF)),
+        attachment: has(&|e: &str| e.starts_with(DOC_REF)),
+        multi: usize::from(s.expect.len() >= 3),
+        single: usize::from(s.expect.len() == 1),
+    }
+}
+
+/// Состав набора.
+pub fn composition(sc: &[Scenario]) -> Composition {
+    sc.iter()
+        .map(traits)
+        .fold(Composition::default(), |a, t| Composition {
+            long: a.long + t.long,
+            insight: a.insight + t.insight,
+            attachment: a.attachment + t.attachment,
+            multi: a.multi + t.multi,
+            single: a.single + t.single,
+        })
+}
+
+/// Проверки полного набора ТС-1 M6: объём, вид каждого сценария из [`KINDS_M6`] и согласован с
+/// источниками (`long` — есть длинная заметка, `insight` — insight, `attachment` — документ,
+/// `multi` — ≥ 3 источников, `single` — 1, `pair` — 2 заметки), состав не меньше
+/// [`MIN_COMPOSITION`].
+pub fn validate_m6_set(sc: &[Scenario]) -> Result<Composition> {
+    let mut errs = Vec::new();
+    if sc.len() < MIN_SCENARIOS_M6 {
+        errs.push(format!("сценариев {} < {MIN_SCENARIOS_M6}", sc.len()));
+    }
+    for s in sc {
+        let t = traits(s);
+        let ok = match s.kind.as_deref() {
+            Some("long") => t.long == 1,
+            Some("insight") => t.insight == 1,
+            Some("attachment") => t.attachment == 1,
+            Some("multi") => t.multi == 1,
+            Some("single") => t.single == 1,
+            Some("pair") => s.expect.len() == 2 && t.long + t.insight + t.attachment == 0,
+            Some(k) => {
+                errs.push(format!("{}: вид {k} не из {KINDS_M6:?}", s.id));
+                continue;
+            }
+            None => {
+                errs.push(format!(
+                    "{}: нет вида (kind), нужен один из {KINDS_M6:?}",
+                    s.id
+                ));
+                continue;
+            }
+        };
+        if !ok {
+            errs.push(format!(
+                "{}: вид {} не согласован с источниками {:?}",
+                s.id,
+                s.kind(),
+                s.expect
+            ));
+        }
+    }
+    let c = composition(sc);
+    let m = MIN_COMPOSITION;
+    for (name, have, need) in [
+        ("длинные заметки", c.long, m.long),
+        ("insight", c.insight, m.insight),
+        ("вложения", c.attachment, m.attachment),
+        ("три и больше источников", c.multi, m.multi),
+        ("один источник", c.single, m.single),
+    ] {
+        if have < need {
+            errs.push(format!("сценариев «{name}» {have} < {need}"));
+        }
+    }
+    if !errs.is_empty() {
+        bail!("набор ТС-1 M6 (§3.1):\n  {}", errs.join("\n  "));
+    }
+    Ok(c)
+}
+
 impl Scenario {
     pub fn kind(&self) -> &str {
         self.kind.as_deref().unwrap_or(DEFAULT_KIND)
@@ -93,15 +205,29 @@ pub fn load_scenarios(path: &Path) -> Result<(Vec<Scenario>, String)> {
     Ok((f.scenario, fnv1a(text.into_bytes())))
 }
 
-/// Проверка полного набора: не меньше [`MIN_SCENARIOS`] сценариев, см.
+/// Проверка полного набора M4 (без документов): не меньше [`MIN_SCENARIOS`] сценариев, см.
 /// [`validate_scenarios_with`].
 pub fn validate_scenarios(sc: &[Scenario], corpus: &Corpus) -> Result<()> {
-    validate_scenarios_with(sc, corpus, MIN_SCENARIOS)
+    validate_scenarios_with(sc, corpus, None, MIN_SCENARIOS)
+}
+
+/// Сценарии без документов-источников (`doc:`): путь M4 (REST, `eval --tokens` без `--via
+/// mcp`) вложения не грузит; второе — id отброшенных.
+pub fn without_docs(sc: Vec<Scenario>) -> (Vec<Scenario>, Vec<String>) {
+    let (docs, rest): (Vec<Scenario>, Vec<Scenario>) = sc
+        .into_iter()
+        .partition(|s| s.expect.iter().any(|e| e.starts_with(DOC_REF)));
+    (rest, docs.into_iter().map(|s| s.id).collect())
 }
 
 /// Проверка: объём (не меньше `min`), уникальные id, ожидаемые источники существуют (заметка
-/// корпуса с индексацией или действующий insight).
-pub fn validate_scenarios_with(sc: &[Scenario], corpus: &Corpus, min: usize) -> Result<()> {
+/// корпуса, действующий insight или — при `docs` — файл набора документов `doc:<путь>`).
+pub fn validate_scenarios_with(
+    sc: &[Scenario],
+    corpus: &Corpus,
+    docs: Option<&Path>,
+    min: usize,
+) -> Result<()> {
     let mut errs = Vec::new();
     let mut ids = BTreeSet::new();
     for s in sc {
@@ -112,13 +238,17 @@ pub fn validate_scenarios_with(sc: &[Scenario], corpus: &Corpus, min: usize) -> 
             errs.push(format!("{}: нужны question и expect", s.id));
         }
         for e in &s.expect {
-            let ok = match e.strip_prefix(INSIGHT_REF) {
-                Some(k) => corpus.insight_active(k),
-                None => corpus.get(e).is_some(),
+            let ok = if let Some(k) = e.strip_prefix(INSIGHT_REF) {
+                corpus.insight_active(k)
+            } else if let Some(rel) = e.strip_prefix(DOC_REF) {
+                docs.is_some_and(|d| d.join(rel).is_file())
+            } else {
+                corpus.get(e).is_some()
             };
             if !ok {
                 errs.push(format!(
-                    "{}: {e} — нет такой заметки или действующего insight",
+                    "{}: {e} — нет такой заметки, действующего insight или файла набора \
+                     документов (eval/docs: cargo xtask docs-corpus)",
                     s.id
                 ));
             }
@@ -380,6 +510,47 @@ pub(super) fn mapped_refs(s: &Session, text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Длина id фрагмента вложения в ссылке `a:<chunk>` (32 шестнадцатеричных знака).
+const CHUNK_REF_HEX: usize = 32;
+
+/// Ссылки фрагментов вложений `a:<chunk>` в md (карточки поиска, заголовки чтения): позиция,
+/// ссылка и путь заметки-владельца — слово после ссылки без первого компонента (пространства):
+/// `1. a:<chunk> knowledge/eval-docs/files-x-docx › x.docx` → `eval-docs/files-x-docx`.
+pub(super) fn attachment_refs(text: &str) -> Vec<(usize, String, String)> {
+    let b = text.as_bytes();
+    let mut out: Vec<(usize, String, String)> = Vec::new();
+    let mut i = 0;
+    while i + 2 + CHUNK_REF_HEX <= b.len() {
+        let prev_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        let end = i + 2 + CHUNK_REF_HEX;
+        let ok = prev_ok
+            && &b[i..i + 2] == b"a:"
+            && b[i + 2..end]
+                .iter()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+            && b.get(end).is_none_or(|c| !c.is_ascii_alphanumeric());
+        if !ok {
+            i += 1;
+            continue;
+        }
+        let raw = text[i..end].to_string();
+        let path = text[end..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .and_then(|w| w.split_once('/'))
+            .map(|(_, p)| p.to_string())
+            .unwrap_or_default();
+        if !out.iter().any(|(_, r, _)| *r == raw) {
+            out.push((i, raw, path));
+        }
+        i = end;
+    }
+    out
+}
+
 /// Выжимка «агента»: начало прочитанного текста без заголовков элементов и служебной строки.
 pub(super) fn summary_of(question: &str, read_md: &str) -> String {
     let body: String = read_md
@@ -625,6 +796,13 @@ pub struct TokensResult {
 /// `cargo xtask eval --tokens`.
 pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus) -> Result<()> {
     let (sc, fingerprint) = load_scenarios(&p.scenarios)?;
+    let (sc, skipped) = without_docs(sc);
+    if !skipped.is_empty() {
+        println!(
+            "сценарии на вложения пропущены (путь M4 документов не грузит; ТС-1 M6 — --via mcp): \
+             {skipped:?}"
+        );
+    }
     validate_scenarios(&sc, corpus)?;
     let counter = Counter::load(&p.repo)?;
     let server = run::server_dir(a, p)?;
@@ -902,18 +1080,128 @@ mod tests {
     }
 
     #[test]
+    fn attachment_refs_with_owner_path() {
+        let a = format!("a:{}", "0123456789abcdef".repeat(2));
+        let b = format!("a:{}", "fedcba9876543210".repeat(2));
+        let md = format!(
+            "1. n:{n} knowledge/ru/git/x  [.8] rev1
+   текст
+             2. {a} knowledge/eval-docs/files-roadmap-pptx › roadmap.pptx · слайд 4  [.7]
+             3. {b} knowledge/eval-docs/files-onboarding-en-docx › onboarding-en.docx
+             4. {a} knowledge/eval-docs/files-roadmap-pptx › roadmap.pptx · слайд 5
+             ### {b} knowledge/eval-docs/files-onboarding-en-docx › onboarding-en.docx
+             a:{bad} knowledge/z
+",
+            n = "N".repeat(26),
+            bad = "0123456789ABCDEF".repeat(2)
+        );
+        let r = attachment_refs(&md);
+        let got: Vec<(&str, &str)> = r.iter().map(|(_, x, p)| (x.as_str(), p.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (a.as_str(), "eval-docs/files-roadmap-pptx"),
+                (b.as_str(), "eval-docs/files-onboarding-en-docx")
+            ]
+        );
+        assert!(r[0].0 < r[1].0 && md[r[0].0..].starts_with(&a));
+    }
+
+    #[test]
     fn tok_line_parses_service_line() {
         assert_eq!(tok_line("### n:x a\nтекст\n~523 tok\n"), Some(523));
         assert_eq!(tok_line("нет строки"), None);
     }
 
-    /// Сценарии `eval/scenarios.toml` проходят проверку на корпусе eval.
+    /// Набор документов для проверки сценариев: `eval/docs` (не в git), а если его нет (CI) —
+    /// полный набор генератора с сидом по умолчанию в `target/test-tmp` (один раз).
+    fn docs_for_tests() -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let eval_docs = root.join("eval").join("docs");
+        if eval_docs.join("manifest.json").is_file() {
+            return eval_docs;
+        }
+        let d = root.join("target/test-tmp/xtask/docs-full");
+        if !d.join("manifest.json").is_file() {
+            let p = crate::docs_corpus::Profile {
+                small: false,
+                large: false,
+            };
+            crate::docs_corpus::write(&d, crate::docs_corpus::DEFAULT_SEED, p).unwrap();
+        }
+        d
+    }
+
+    /// Сценарии `eval/scenarios.toml` проходят проверку на корпусе eval: путь M4 (без
+    /// документов) и полный набор ТС-1 M6 — состав §3.1 и нагеты §3.2.
     #[test]
     fn scenarios_are_valid() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../eval");
         let mut corpus = Corpus::load(&root.join("corpus")).unwrap();
         corpus.insights = super::super::corpus::load_insights(&root.join("insights.toml")).unwrap();
         let (sc, _) = load_scenarios(&root.join("scenarios.toml")).unwrap();
-        validate_scenarios(&sc, &corpus).unwrap();
+        let docs = docs_for_tests();
+        validate_scenarios_with(&sc, &corpus, Some(&docs), MIN_SCENARIOS_M6).unwrap();
+        validate_m6_set(&sc).unwrap();
+        let checks: Vec<super::super::nuggets::Check> = sc
+            .iter()
+            .map(|s| super::super::nuggets::Check {
+                id: &s.id,
+                question: &s.question,
+                expect: &s.expect,
+                nuggets: &s.nuggets,
+            })
+            .collect();
+        let n = super::super::nuggets::validate(&checks, &corpus, &docs).unwrap();
+        assert_eq!(n.scenarios_without, 0);
+        let (m4, skipped) = without_docs(sc);
+        assert!(!skipped.is_empty());
+        validate_scenarios(&m4, &corpus).unwrap();
+    }
+
+    #[test]
+    fn m6_set_kinds_and_composition() {
+        let s = |id: &str, kind: Option<&str>, expect: &[&str]| Scenario {
+            id: id.into(),
+            kind: kind.map(String::from),
+            question: "q".into(),
+            expect: expect.iter().map(|e| e.to_string()).collect(),
+            nuggets: Vec::new(),
+        };
+        let one = [
+            s("a", Some("long"), &["ru/long/x", "ru/git/y"]),
+            s("b", Some("insight"), &["insight:k"]),
+            s("c", Some("attachment"), &["doc:files/x.docx"]),
+            s("d", Some("multi"), &["ru/a/b", "ru/a/c", "ru/a/d"]),
+            s("e", Some("single"), &["ru/a/b"]),
+            s("f", Some("pair"), &["ru/a/b", "ru/a/c"]),
+        ];
+        let c = composition(&one);
+        assert_eq!(
+            (c.long, c.insight, c.attachment, c.multi, c.single),
+            (1, 1, 1, 1, 3)
+        );
+        // вид не согласован с источниками, вида нет, мало сценариев и состав
+        let bad = [
+            s("x", Some("long"), &["ru/a/b"]),
+            s("y", None, &["ru/a/b"]),
+            s("z", Some("pair"), &["insight:k", "ru/a/b"]),
+            s("w", Some("other"), &["ru/a/b"]),
+        ];
+        let e = validate_m6_set(&bad).unwrap_err().to_string();
+        for want in [
+            "x: вид long не согласован",
+            "y: нет вида",
+            "z: вид pair не согласован",
+            "w: вид other не из",
+            "сценариев 4 < 45",
+            "«длинные заметки» 0 < 8",
+            "«вложения» 0 < 4",
+        ] {
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        // M4: сценарии на вложения отбрасываются
+        let (rest, skipped) = without_docs(one.to_vec());
+        assert_eq!((rest.len(), skipped), (5, vec!["c".to_string()]));
     }
 }

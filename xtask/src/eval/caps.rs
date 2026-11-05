@@ -103,6 +103,9 @@ pub struct ServerCaps {
     /// Связь `contradicts` (`POST /edges`, M4.5): у B4 её нет — пары корпуса не связываются,
     /// затронутые сценарии исключаются (`info.excluded`).
     pub contradicts: bool,
+    /// Вложения-документы (`POST /blobs`, фрагменты `a:<chunk>` в поиске; M5): у B4 их нет —
+    /// набор `eval/docs` не грузится, сценарии на вложения исключаются (`info.excluded`).
+    pub attachments: bool,
     /// Снимок сессии (M6 §8а, `features`: `snapshot`).
     pub snapshot: bool,
     pub keys: BTreeSet<&'static str>,
@@ -267,6 +270,7 @@ pub fn caps_from(health: &Value) -> Result<ServerCaps> {
     Ok(ServerCaps {
         ideas: m6 || ver.triple() >= (0, 0, 10),
         contradicts: m6 || ver.triple() >= (0, 0, 6),
+        attachments: m6 || ver.triple() >= (0, 0, 7),
         focus: has("focus"),
         snapshot: has("snapshot"),
         version: ver,
@@ -400,6 +404,10 @@ mod tests {
         assert!(!m4.contradicts && m57.contradicts);
         let m45 = caps_from(&health("0.0.6-m4.5", "6dee9f90ad8a", None)).unwrap();
         assert!(m45.contradicts && !m45.ideas);
+        // вложения — с M5 (у B4 и B4.5 их нет)
+        assert!(!m4.attachments && !m45.attachments && m57.attachments);
+        let m5 = caps_from(&health("0.0.7-m5", "f3a247f8bd53", None)).unwrap();
+        assert!(m5.attachments);
         for git in ["unknown", "535910eba54f", ""] {
             let e = caps_from(&health("0.0.10-m5.7", git, None))
                 .unwrap_err()
@@ -414,7 +422,7 @@ mod tests {
         assert!(caps_from(&health("0.0.11-m6", "x", None)).is_err());
         // сборка M6: git любой, ключи M6 — по возможностям сборки
         let m6 = caps_from(&health("0.0.10-m5.7", "unknown", Some(&["m6"]))).unwrap();
-        assert!(m6.m6 && m6.ideas && m6.contradicts && !m6.focus && !m6.snapshot);
+        assert!(m6.m6 && m6.ideas && m6.contradicts && m6.attachments && !m6.focus && !m6.snapshot);
         assert!(m6.keys.contains("ideas.proactive") && !m6.keys.contains("search.budget_tokens"));
         let full = caps_from(&health(
             "0.0.10-m5.7",

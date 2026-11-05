@@ -18,6 +18,16 @@
 //! чужую выжимку семантическим совпадением. Сторож — первая строка ответов (а) и (в): `[cache]`
 //! там — чужое попадание (счётчик и примечание в отчёте; на holdout — ошибка).
 //!
+//! **Вложения.** Плечо с вложениями (с M5) грузит, кроме корпуса, документы набора `eval/docs`
+//! роли `content` — заметка-владелец `eval-docs/<файл>` и `POST /blobs`, ожидание извлечения и
+//! индексации. Источник сценария `doc:<файл>` — все фрагменты `a:<chunk>` этого документа в
+//! карточках (оракул читает каждый: `memory_read` фрагмента отдаёт его единицу документа). У B4
+//! вложений нет — сценарии на них исключаются из сравнения (`info.excluded_scenarios`).
+//!
+//! **L0 сервера.** После загрузки L0 каждой заметки-источника нагета читается с сервера
+//! (`POST /read`, `tier: L0`): нагет в L0 сервера — ошибка прогона; расхождение L0 сервера с
+//! приближением xtask ([`nuggets::l0_of`]) — перечень в `info.l0_mismatch`.
+//!
 //! Токены — сумма текстов `result.content` вызовов (токенизатор bge-m3). Полнота — нагеты
 //! (§3.2): найдены, если целиком есть в выданном агенту тексте пути. Отчёт хранит ответы
 //! целиком. Перед прогоном сверяются отпечатки с `eval/nuggets.lock`; сравнение плеч
@@ -35,8 +45,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    Counter, NAIVE_BUDGET, PathRun, READ_BUDGET, Scenario, load_scenarios, mapped_refs,
-    read_elements, reread_items, reread_need, summary_of, validate_scenarios_with,
+    Composition, Counter, NAIVE_BUDGET, PathRun, READ_BUDGET, Scenario, attachment_refs,
+    load_scenarios, read_elements, reread_items, reread_need, summary_of, validate_m6_set,
+    validate_scenarios_with,
 };
 use crate::eval::caps;
 use crate::eval::corpus::{Corpus, EVAL_SOLUTION, INSIGHT_REF, load_insights};
@@ -46,7 +57,7 @@ use crate::eval::metrics::{
     BOOTSTRAP_M6, Estimate, SEED, micro_recall, net_losses, paired_diff_weighted,
     ratio_estimate_with,
 };
-use crate::eval::nuggets::{self, normalize_md};
+use crate::eval::nuggets::{self, DOC_REF, normalize_md};
 use crate::eval::run::{self, RunSpec, Session};
 use crate::eval::split::{Part, split};
 use crate::eval::{Device, EvalArgs, Mode, Paths, grid};
@@ -192,6 +203,13 @@ pub struct McpInfo {
     /// Сценарии, исключённые из сравнения всех плеч (их цель старый сервер не умеет): `<id>:
     /// <причина>`; [`compare`] их не сравнивает ни в одном плече.
     pub excluded_scenarios: Vec<String>,
+    /// Документы набора, загруженные вложениями (`doc:<файл>`; пусто — плечо без вложений).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub docs_loaded: Vec<String>,
+    /// Заметки-источники нагетов, у которых L0 сервера не равен приближению xtask
+    /// ([`nuggets::l0_of`]): `<путь>: сервер «…» ≠ xtask «…»` (нагет в L0 сервера — ошибка).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub l0_mismatch: Vec<String>,
     pub counter: String,
     pub read_budget: usize,
 }
@@ -477,6 +495,81 @@ fn compare_and_write(
     Ok(())
 }
 
+/// Документы набора, загруженные вложениями: путь заметки-владельца → `doc:<файл>`.
+pub type DocMap = BTreeMap<String, String>;
+
+/// Карты ссылок набора: узел → путь заметки, запись → ключ insight, владелец → документ.
+struct RefMaps<'a> {
+    nodes: &'a BTreeMap<String, String>,
+    entries: &'a BTreeMap<String, String>,
+    docs: &'a DocMap,
+}
+
+impl<'a> RefMaps<'a> {
+    fn of(s: &'a Session, docs: &'a DocMap) -> Self {
+        RefMaps {
+            nodes: s.node_paths(),
+            entries: s.entry_keys(),
+            docs,
+        }
+    }
+
+    /// Ссылки ответа md в порядке текста: `(позиция, источник набора или None, ссылка)` —
+    /// `n:`/`i:`/`e:` по [`refs_in_text`] (как [`super::mapped_refs`]), фрагменты вложений
+    /// `a:<chunk>` — источник `doc:<файл>` по пути заметки-владельца.
+    fn ordered(&self, text: &str) -> Vec<(usize, Option<String>, String)> {
+        let mut all: Vec<(usize, Option<String>, String)> = refs_in_text(text)
+            .into_iter()
+            .filter(|(k, _)| matches!(k, 'n' | 'i' | 'e'))
+            .map(|(k, id)| {
+                let raw = format!("{k}:{id}");
+                let src = match k {
+                    'n' => self.nodes.get(&id).cloned(),
+                    _ => self
+                        .entries
+                        .get(&id)
+                        .map(|key| format!("{INSIGHT_REF}{key}")),
+                };
+                (text.find(&raw).unwrap_or(usize::MAX), src, raw)
+            })
+            .collect();
+        for (pos, raw, owner) in attachment_refs(text) {
+            all.push((pos, self.docs.get(&owner).cloned(), raw));
+        }
+        all.sort_by_key(|(pos, _, _)| *pos);
+        all
+    }
+
+    /// Известные ссылки по порядку текста → `(источник набора, ссылка)`; у документа — каждый
+    /// его фрагмент.
+    fn known(&self, text: &str) -> Vec<(String, String)> {
+        self.ordered(text)
+            .into_iter()
+            .filter_map(|(_, src, raw)| src.map(|s| (s, raw)))
+            .collect()
+    }
+
+    /// Карточки по порядку (заметки, insight, фрагменты вложений) — справочная политика
+    /// «карточки 1–3»: источник — путь набора, если ссылка известна, иначе сама ссылка.
+    fn cards(&self, text: &str) -> Vec<(String, String)> {
+        self.ordered(text)
+            .into_iter()
+            .filter(|(_, _, raw)| !raw.starts_with("e:"))
+            .map(|(_, src, raw)| (src.unwrap_or_else(|| raw.clone()), raw))
+            .collect()
+    }
+}
+
+/// Ссылки ответа md в порядке текста → `(источник набора, ссылка)` ([`RefMaps::known`]).
+fn card_refs(s: &Session, docs: &DocMap, text: &str) -> Vec<(String, String)> {
+    RefMaps::of(s, docs).known(text)
+}
+
+/// Карточки ответа по порядку для справочной политики ([`RefMaps::cards`]).
+fn ordered_raws(s: &Session, docs: &DocMap, text: &str) -> Vec<(String, String)> {
+    RefMaps::of(s, docs).cards(text)
+}
+
 /// Нагеты сценария, найденные в тексте.
 fn found_nuggets(sc: &Scenario, delivered: &str) -> usize {
     let norm = normalize_md(delivered);
@@ -510,7 +603,12 @@ fn read_and_reread(
         json!({ "items": items, "budget_tokens": READ_BUDGET }),
     )?;
     path.push("memory_read", &read, counter);
-    path.read = picked.iter().map(|(r, _)| r.clone()).collect();
+    path.read = picked
+        .iter()
+        .map(|(r, _)| r.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let raws: Vec<String> = picked.iter().map(|(_, raw)| raw.clone()).collect();
     let elements = read_elements(&read, &raws);
     let mut all = read.clone();
@@ -598,6 +696,7 @@ fn delete_cache(s: &Session, id: &str) -> Result<()> {
 
 fn run_scenario(
     s: &Session,
+    docs: &DocMap,
     counter: &Counter,
     sc: &Scenario,
     part: Part,
@@ -626,7 +725,7 @@ fn run_scenario(
         foreign.push("(в)".to_string());
         naive.add_note("первой пришла чужая выжимка кэша");
     }
-    naive.read = mapped_refs(s, &chunks)
+    naive.read = card_refs(s, docs, &chunks)
         .into_iter()
         .map(|(r, _)| r)
         .filter(|r| sc.expect.contains(r))
@@ -643,9 +742,11 @@ fn run_scenario(
         foreign.push("(а)".to_string());
         protocol.add_note("первой пришла чужая выжимка кэша");
     }
+    // оракул: ожидаемые источники карточек; у документа — каждый его фрагмент (ссылки
+    // уникальны: у заметки и insight — одна на источник)
     let mut selected: Vec<(String, String)> = Vec::new();
-    for (r, raw) in mapped_refs(s, &cards) {
-        if sc.expect.contains(&r) && !selected.iter().any(|(x, _)| *x == r) {
+    for (r, raw) in card_refs(s, docs, &cards) {
+        if sc.expect.contains(&r) && !selected.iter().any(|(_, x)| *x == raw) {
             selected.push((r, raw));
         }
     }
@@ -683,18 +784,9 @@ fn run_scenario(
     // справочно: карточки 1–3 по порядку, без оракула (поиск — тот же ответ)
     let mut reference = AgentPath::default();
     reference.push("memory_search brief", &cards, counter);
-    let first: Vec<(String, String)> = refs_in_text(&cards)
+    let first: Vec<(String, String)> = ordered_raws(s, docs, &cards)
         .into_iter()
-        .filter(|(k, _)| matches!(k, 'n' | 'i'))
         .take(REFERENCE_CARDS)
-        .map(|(k, id)| {
-            let raw = format!("{k}:{id}");
-            let r = mapped_refs(s, &raw)
-                .into_iter()
-                .next()
-                .map_or_else(|| raw.clone(), |(r, _)| r);
-            (r, raw)
-        })
         .collect();
     if first.is_empty() {
         reference.add_note("карточек нет");
@@ -785,6 +877,121 @@ pub fn excluded_by_edges(
     (targets, out)
 }
 
+/// Исключения по вложениям, которых нет у сервера `server` (B4): сценарии, у которых ожидаемый
+/// источник — документ набора (`info.excluded_scenarios`: `<id>: …`).
+pub fn excluded_by_attachments(scenarios: &[&Scenario], server: &str) -> Vec<String> {
+    scenarios
+        .iter()
+        .filter(|sc| sc.expect.iter().any(|e| e.starts_with(DOC_REF)))
+        .map(|sc| {
+            format!(
+                "{}: ожидаемый источник — документ набора eval/docs, у сервера {server} вложений \
+                 нет (с 0.0.7-m5)",
+                sc.id
+            )
+        })
+        .collect()
+}
+
+/// Документы набора `eval/docs` роли `content` вложениями: заметка-владелец `eval-docs/<файл>`
+/// в Knowledge и `POST /blobs`; ждёт конечного состояния извлечения — все `done`, иначе ошибка.
+/// Индексацию фрагментов ждёт [`Session::wait_indexed`]. Возвращает карту владельцев.
+fn load_docs(s: &mut Session, dir: &Path) -> Result<DocMap> {
+    let m = crate::docs_corpus::Manifest::load(dir).with_context(|| {
+        format!(
+            "набор документов {} (cargo xtask docs-corpus)",
+            dir.display()
+        )
+    })?;
+    let mut map = DocMap::new();
+    let mut owners = Vec::new();
+    for f in m.files.iter().filter(|f| f.role == "content") {
+        let owner = crate::eval::docs::owner_path(&f.path);
+        let body = json!({
+            "space": "knowledge",
+            "path": owner,
+            "kind": "note",
+            "content": format!("# Вложение набора документов\n\nФайл `{}` ({}).\n", f.path, f.role),
+        });
+        let (st, v) = s.api("/api/v1/nodes", Some(&body))?;
+        if st != 201 {
+            bail!("POST /nodes {}: HTTP {st}: {v}", f.path);
+        }
+        let node = v["id"].as_str().context("id узла")?.to_string();
+        let data = fs::read(dir.join(&f.path)).with_context(|| f.path.clone())?;
+        let name = Path::new(&f.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        crate::eval::docs::upload(s, &node, &name, &data)?;
+        owners.push((f.path.clone(), node, std::time::Instant::now()));
+        map.insert(owner, format!("{DOC_REF}{}", f.path));
+    }
+    let done = crate::eval::docs::wait_extracted(s, &owners)?;
+    let bad: Vec<String> = done
+        .iter()
+        .filter(|(_, (d, _))| d["extract_state"] != "done")
+        .map(|(f, (d, _))| format!("{f}: {} {}", d["extract_state"], d["extract_error"]))
+        .collect();
+    if !bad.is_empty() {
+        bail!(
+            "извлечение документов набора не удалось: {}",
+            bad.join("; ")
+        );
+    }
+    Ok(map)
+}
+
+/// L0 сервера заметок-источников нагетов (`POST /read`, `tier: L0`): нагет в L0 сервера — ошибка;
+/// возвращает расхождения L0 сервера с [`nuggets::l0_of`] (`<путь>: сервер «…» ≠ xtask «…»`).
+fn verify_server_l0(s: &Session, set: &Set) -> Result<Vec<String>> {
+    let by_path: BTreeMap<&str, &str> = s
+        .node_paths()
+        .iter()
+        .map(|(id, p)| (p.as_str(), id.as_str()))
+        .collect();
+    let mut sources: BTreeMap<&str, Vec<&nuggets::Nugget>> = BTreeMap::new();
+    for sc in &set.scenarios {
+        for n in &sc.nuggets {
+            if !n.source.starts_with(INSIGHT_REF) && !n.source.starts_with(DOC_REF) {
+                sources.entry(n.source.as_str()).or_default().push(n);
+            }
+        }
+    }
+    let mut errs = Vec::new();
+    let mut mismatch = Vec::new();
+    for (path, ns) in sources {
+        let id = by_path
+            .get(path)
+            .with_context(|| format!("заметка-источник {path} не загружена"))?;
+        let body = json!({ "items": [{ "id": format!("n:{id}"), "tier": "L0" }] });
+        let (st, v) = s.api("/api/v1/read", Some(&body))?;
+        if st != 200 {
+            bail!("/read L0 {path}: HTTP {st}: {v}");
+        }
+        let server = v["items"][0]["text"].as_str().unwrap_or_default();
+        for n in nuggets::in_server_l0(&ns, server) {
+            errs.push(format!(
+                "{path}: нагет «{}» входит в L0 сервера «{server}»",
+                n.text
+            ));
+        }
+        let ours = set
+            .corpus
+            .get(path)
+            .map(|n| nuggets::l0_of(&n.text))
+            .unwrap_or_default();
+        let norm = |t: &str| crate::eval::corpus::squash_ws(t);
+        if norm(server) != norm(&ours) {
+            mismatch.push(format!("{path}: сервер «{server}» ≠ xtask «{ours}»"));
+        }
+    }
+    if !errs.is_empty() {
+        bail!("нагеты в L0 сервера:\n  {}", errs.join("\n  "));
+    }
+    Ok(mismatch)
+}
+
 /// Набор ТС-1: корпус, сценарии, отпечатки (сверенные с замком).
 pub struct Set {
     pub corpus: Corpus,
@@ -793,6 +1000,10 @@ pub struct Set {
     pub corpus_fingerprint: String,
     pub frozen: bool,
     pub nuggets: nuggets::Summary,
+    /// sha256 `eval/docs/manifest.json` (нет файла — `None`).
+    pub docs_manifest: Option<String>,
+    /// Состав полного набора (§3.1; `None` — свой файл сценариев).
+    pub composition: Option<Composition>,
 }
 
 /// Файл сценариев — свой (`--scenarios`): проверка как у фрагмента (без требований к объёму).
@@ -810,7 +1021,12 @@ pub fn load_set(a: &EvalArgs, p: &Paths) -> Result<Set> {
     } else {
         super::MIN_SCENARIOS
     };
-    validate_scenarios_with(&scenarios, &corpus, min)?;
+    validate_scenarios_with(&scenarios, &corpus, Some(&p.docs), min)?;
+    let composition = if custom_scenarios(a) {
+        None
+    } else {
+        Some(validate_m6_set(&scenarios)?)
+    };
     let checks: Vec<nuggets::Check> = scenarios
         .iter()
         .map(|s| nuggets::Check {
@@ -820,10 +1036,21 @@ pub fn load_set(a: &EvalArgs, p: &Paths) -> Result<Set> {
             nuggets: &s.nuggets,
         })
         .collect();
-    let summary = nuggets::validate(&checks, &corpus)?;
-    let nf = nuggets::nuggets_fingerprint(&p.scenarios, &p.corpus, &p.insights)?;
-    let cf = nuggets::corpus_fingerprint(&[&p.corpus, &p.docs, &p.insights]);
-    let lock = nuggets::check_lock(&nuggets::lock_path(&p.scenarios), &nf, &cf)?;
+    let summary = nuggets::validate(&checks, &corpus, &p.docs)?;
+    let src = nuggets::Sources {
+        corpus: &p.corpus,
+        insights: &p.insights,
+        docs: &p.docs,
+    };
+    let nf = nuggets::nuggets_fingerprint(&p.scenarios, src)?;
+    let cf = nuggets::corpus_fingerprint(src);
+    let docs_manifest = nuggets::docs_manifest_sha256(&p.docs);
+    let lock = nuggets::check_lock(
+        &nuggets::lock_path(&p.scenarios),
+        &nf,
+        &cf,
+        docs_manifest.as_deref(),
+    )?;
     Ok(Set {
         corpus,
         scenarios,
@@ -831,6 +1058,8 @@ pub fn load_set(a: &EvalArgs, p: &Paths) -> Result<Set> {
         corpus_fingerprint: cf,
         frozen: lock.is_some(),
         nuggets: summary,
+        docs_manifest,
+        composition,
     })
 }
 
@@ -846,15 +1075,59 @@ pub fn print_set(set: &Set, p: &Paths) {
         n.nuggets,
         n.low_share() * 100.0
     );
+    if let Some(c) = &set.composition {
+        let items: Vec<(String, String)> = set
+            .scenarios
+            .iter()
+            .map(|s| (s.id.clone(), s.kind().to_string()))
+            .collect();
+        let holdout = split(&items);
+        let mut kinds: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for s in &set.scenarios {
+            let e = kinds.entry(s.kind()).or_default();
+            if holdout.contains(&s.id) {
+                e.1 += 1;
+            } else {
+                e.0 += 1;
+            }
+        }
+        let k: Vec<String> = kinds
+            .iter()
+            .map(|(k, (d, h))| format!("{k} {d}+{h}"))
+            .collect();
+        println!(
+            "  состав (§3.1): длинные {}, insight {}, вложения {}, ≥ 3 источников {}, один \
+             источник {}; виды dev+holdout: {}",
+            c.long,
+            c.insight,
+            c.attachment,
+            c.multi,
+            c.single,
+            k.join(", ")
+        );
+    }
     println!("  nuggets_fingerprint = \"{}\"", set.nuggets_fingerprint);
     println!("  corpus_fingerprint = \"{}\"", set.corpus_fingerprint);
+    println!(
+        "  docs_manifest_sha256 = \"{}\"",
+        set.docs_manifest
+            .as_deref()
+            .unwrap_or("<нет eval/docs/manifest.json>")
+    );
     let lock = nuggets::lock_path(&p.scenarios);
     if set.frozen {
         println!("  отпечатки совпадают с {}", lock.display());
     } else {
         println!(
-            "  замка {} нет — набор не заморожен (задача 1b)",
-            lock.display()
+            "  замка {} нет — набор не заморожен (задача 1b); содержимое замка:\n\
+             nuggets_fingerprint = \"{}\"\ncorpus_fingerprint = \"{}\"\n\
+             docs_manifest_sha256 = \"{}\"\nscenarios = {}\nnuggets = {}",
+            lock.display(),
+            set.nuggets_fingerprint,
+            set.corpus_fingerprint,
+            set.docs_manifest.as_deref().unwrap_or_default(),
+            set.scenarios.len(),
+            set.nuggets.nuggets
         );
     }
 }
@@ -1034,10 +1307,19 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 dropped.join(", ")
             );
         }
-        let sets: Vec<(String, String)> = kept
+        let mut sets: Vec<(String, String)> = kept
             .iter()
             .filter_map(|(k, v)| caps::env_to_key(k).map(|key| (key, v.clone())))
             .collect();
+        if caps.attachments {
+            // PDF набора разбирает pdfium сервера (`docs.pdfium_dylib` — с M5, как у eval --docs)
+            sets.push((
+                "docs.pdfium_dylib".into(),
+                crate::eval::docs::extract::pdfium_lib(&p.repo)
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
         let point = (!pt.name.is_empty()).then(|| pt.name.clone());
         let run_label = match &point {
             Some(n) => format!("tokens-{label}-{n}"),
@@ -1055,8 +1337,20 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             s.without_contradicts();
         }
         s.load_corpus(&set.corpus)?;
-        let (excluded, excluded_scenarios) =
+        let docs = if caps.attachments {
+            load_docs(&mut s, &p.docs)?
+        } else {
+            DocMap::new()
+        };
+        let (mut excluded, mut excluded_scenarios) =
             excluded_by_edges(&chosen, s.skipped_edges(), &caps.tag());
+        if !caps.attachments {
+            excluded.push(format!(
+                "вложения eval/docs: у сервера {} нет (с 0.0.7-m5) — не загружены",
+                caps.tag()
+            ));
+            excluded_scenarios.extend(excluded_by_attachments(&chosen, &caps.tag()));
+        }
         if !excluded.is_empty() || !excluded_scenarios.is_empty() {
             println!(
                 "исключено (сервер {}): {}",
@@ -1072,6 +1366,16 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         if model.is_some() {
             s.wait_indexed()?;
         }
+        let l0_mismatch = verify_server_l0(&s, &set)?;
+        if !l0_mismatch.is_empty() {
+            println!(
+                "L0 сервера ≠ приближения xtask у {} заметок-источников (нагетов в L0 сервера нет):",
+                l0_mismatch.len()
+            );
+            for m in &l0_mismatch {
+                println!("  {m}");
+            }
+        }
         let mut runs = Vec::with_capacity(chosen.len());
         for sc in &chosen {
             let tag = format!(
@@ -1080,7 +1384,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 sc.id,
                 point.as_deref().map_or(String::new(), |n| format!("-{n}"))
             );
-            runs.push(run_scenario(&s, &counter, sc, part, &tag)?);
+            runs.push(run_scenario(&s, &docs, &counter, sc, part, &tag)?);
         }
         let st = s.status.clone();
         s.stop()?;
@@ -1115,6 +1419,8 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 frozen: set.frozen,
                 excluded,
                 excluded_scenarios,
+                docs_loaded: docs.values().cloned().collect(),
+                l0_mismatch,
                 counter: "bge-m3 tokenizer.json".into(),
                 read_budget: READ_BUDGET,
             },
@@ -1438,6 +1744,44 @@ mod tests {
     }
 
     /// Выжимка кэша первой строкой и ссылка выжимки из ответа `memory_cache_put`.
+    #[test]
+    fn card_refs_map_notes_insights_and_attachment_fragments() {
+        let n = "N".repeat(26);
+        let i = "I".repeat(26);
+        let a1 = format!("a:{}", "0123456789abcdef".repeat(2));
+        let a2 = format!("a:{}", "00112233445566778899aabbccddeeff");
+        let a3 = format!("a:{}", "ffeeddccbbaa99887766554433221100");
+        let nodes = BTreeMap::from([(n.clone(), "ru/git/x".to_string())]);
+        let entries = BTreeMap::from([(i.clone(), "p01-t".to_string())]);
+        let docs = DocMap::from([(
+            "eval-docs/files-roadmap-pptx".to_string(),
+            "doc:files/roadmap.pptx".to_string(),
+        )]);
+        let m = RefMaps {
+            nodes: &nodes,
+            entries: &entries,
+            docs: &docs,
+        };
+        let md = format!(
+            "1. {a1} knowledge/eval-docs/files-roadmap-pptx › roadmap.pptx · слайд 4\n\
+             2. n:{n} knowledge/ru/git/x  [.7]\n\
+             3. {a2} knowledge/eval-docs/files-other-docx › other.docx\n\
+             4. i:{i} insight/gotcha «т»\n\
+             5. {a3} knowledge/eval-docs/files-roadmap-pptx › roadmap.pptx · слайд 9\n"
+        );
+        assert_eq!(
+            m.known(&md),
+            [
+                ("doc:files/roadmap.pptx".to_string(), a1.clone()),
+                ("ru/git/x".to_string(), format!("n:{n}")),
+                ("insight:p01-t".to_string(), format!("i:{i}")),
+                ("doc:files/roadmap.pptx".to_string(), a3.clone()),
+            ]
+        );
+        let cards: Vec<String> = m.cards(&md).into_iter().map(|(s, _)| s).take(3).collect();
+        assert_eq!(cards, ["doc:files/roadmap.pptx", "ru/git/x", a2.as_str()]);
+    }
+
     #[test]
     fn cache_marks() {
         assert!(cache_first("\n[cache] c_X «вопрос»\n### n:..."));
