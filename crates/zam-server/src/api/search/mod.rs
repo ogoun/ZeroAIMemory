@@ -2030,7 +2030,7 @@ async fn mark_seen_items(
         .filter(|it| seen_tracked(it))
         .flat_map(parts)
         .collect();
-    let revs = seen_revs(&s.db, &s.touch.id, &keys).await?;
+    let revs = seen_revs(&s.db, &s.touch.id, s.touch.epoch, &keys).await?;
     let same = |k: &SeenKey, rev: i64| revs.get(k) == Some(&rev);
     for it in items.iter_mut().filter(|it| seen_tracked(it)) {
         let rev = it.hit.rev;

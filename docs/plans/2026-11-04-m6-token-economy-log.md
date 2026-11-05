@@ -608,6 +608,83 @@ idea_hints_fixture` — PASS; `cargo fmt --all -- --check`, `cargo clippy -p xta
 
 ### Задача 2. Схема `0025`
 
+Коммит — `feat(store): миграция 0025 — эпохи, holdout, учёт, снимки, recv_count` (sha — в отчёте
+контроллеру).
+
+Сделано:
+- `crates/zam-store/migrations/user/0025_session_epochs.sql` (`rebuild: true`, `user_db.rs`):
+  пересборка `session_seen` с `epoch` в первичном ключе (строки — в эпоху 0);
+  `sessions.seen_epoch`, `sessions.holdout`, `session_tokens.reread_calls`,
+  `code_refs.recv_count` — `ADD COLUMN … DEFAULT 0`; новые `tokens_unattributed` (`WITHOUT ROWID`) и
+  `session_snapshots`. Схема снята с базы 0024: у `session_seen` нет своих индексов (кроме
+  автоиндекса PK), триггеров и представлений, и в теле чужих триггеров она не упоминается; дочерних
+  FK нет. Поэтому, в отличие от 0024, чужие объекты не снимаются и не пересоздаются. Автоиндекс
+  `sqlite_autoindex_session_seen_1` после `RENAME` получает прежнее имя (проверено тестом).
+  `ALTER` таблицы `sessions` не задевает M4.5: `parent_id`/`agent_type`, индексы
+  `sessions_last_seen`/`sessions_parent` и FK `session_tokens`, `session_seen` остаются как были.
+- `zam-core::snapshot` — `SnapStatus`, `SnapTrigger` (`ALL`, `as_str`, `parse`; JSON — snake_case),
+  `SnapCommand`, `SnapshotData` (JSON `{compact_summary?, prompts, files, commands[{cmd, failed?}]}`).
+- `zam-store::sessions` — `SessionTouch.epoch`, `mark_seen*` пишут эпоху касания (`ON CONFLICT`
+  по новому ключу), `seen_revs(db, session, epoch, keys)`, `seen_entry_ids` — без эпохи,
+  `DISTINCT`; `bump_epoch`, `session_epoch`, `set_holdout`; `gc_sessions` — явный список
+  `SESSION_CHILDREN = [session_seen, session_tokens, session_snapshots]`.
+- `zam-store::usage::add_unattributed` (UPSERT с прибавкой); `zam-store::snapshots` —
+  `SnapshotRow`, `put_snapshot` (перезапись), `get_snapshot`, `gc_snapshots`.
+- Все вызовы `seen_revs` в workspace получают эпоху: сервер (`recall.rs`, `search/mod.rs`) —
+  `s.touch.epoch`, тесты — 0. `SessionTouch` строят `attrib::session_touch` (за ним
+  `request_session`) и `POST /sessions` — `epoch: 0` до задачи 7a. `ON CONFLICT` по старому ключу
+  `session_seen` в коде был один (`mark_seen_with_tokens`).
+- Тесты: `migrate_rebuild.rs::migrate_0025_from_m57_db` (база 0023 → 0024 → наполнение M5.7 →
+  жёсткая ссылка закрытой базы в `users/` → 0025; все проверки брифа, плюс строки `sessions`,
+  `session_tokens`, `code_refs` целиком с новыми столбцами по умолчанию и повтор отметки после
+  миграции — та же строка); `sessions.rs` — `bump_epoch_hides_old_marks`,
+  `seen_ideas_ignore_epoch`, `unattributed_upsert_adds`, сверх брифа `set_holdout_flag`;
+  `snapshots.rs` (новый) — `snapshot_put_overwrites`, `gc_snapshots_by_cutoff`,
+  `gc_sessions_drops_snapshots`; `zam-core` — `names_round_trip`, `data_json_shape`. RED — сборка
+  тестов падала на отсутствующих функциях и поле `epoch`.
+- Сверка объектов схемы в `migrate_0024_keeps_report_triggers_and_rows` и
+  `m57_acceptance::acceptance_migration_from_m56_db` (база открывается последней схемой)
+  исключает таблицы 0025: их объекты точно сверяет новый тест.
+
+Решения:
+1. **[решение исполнителя задачи 2]** `bump_epoch` сессии, которой нет, создаёт её с эпохой 1
+   (каждый вызов — +1 от 0) и отмечает обращение (`last_seen_at`). Нужно 7a
+   (`epoch_bump_without_session_start`): `POST /sessions {id, new_epoch: true}` приходит и до
+   `session_start`.
+2. **[решение исполнителя задачи 2]** `session_epoch` неизвестной сессии — 0, а не `NotFound`:
+   отметок у неё нет, эпоха 0 ничего не скрывает.
+3. **[решение исполнителя задачи 2]** `set_holdout` — upsert сессии с обращением, как
+   `bump_epoch`: отдельный запрос `POST /sessions {id, holdout}` (задача 12) не зависит от порядка.
+4. **[решение исполнителя задачи 2]** `put_snapshot` без сессии — `StoreError::NotFound`
+   (проверка в транзакции записи), а не ошибка внешнего ключа SQLite: сервер (17c) отдаст 404/400
+   без разбора текста ошибки. `bytes`, `status`, `skipped` пишутся как прислал клиент; предел
+   размера — на сервере (17c).
+5. **[решение исполнителя задачи 2]** `session_snapshots.trigger` без CHECK (комментарий в
+   миграции): новый повод снимка не потребует пересборки; значение проверяет
+   `SnapTrigger::parse` при чтении (неизвестное — `Corrupt`). `status` — с CHECK, как в брифе.
+6. **[решение исполнителя задачи 2]** Типы `zam-core::snapshot` без `deny_unknown_fields`:
+   `data` хранится в базе, и снимок нового клиента со своим полем читается старым кодом.
+   Строгость тела `PUT` — на сервере (17c).
+7. **[решение исполнителя задачи 2]** `seen_entry_ids` — `SELECT DISTINCT`: идея, отмеченная в
+   двух эпохах, — один id (`proactive_ideas` и `any_idea` получают множество).
+8. **[решение исполнителя задачи 2]** Эпоха в `request_session` пока не читается из базы
+   (`epoch: 0` в `attrib::session_touch`): до 7a её никто не увеличивает, а чтение добавило бы
+   запрос на горячем пути `/recall`. 7a заменяет 0 на `session_epoch`.
+9. **[решение исполнителя задачи 2]** `Session` (JSON `GET /sessions`) и `TokenStat` новых полей
+   (`seen_epoch`, `holdout`, `reread_calls`) пока не отдают: форма ответа меняется в 7a/8b/12
+   вместе с тестами API.
+10. **[решение исполнителя задачи 2]** Фикстура 0024 наполняет `session_seen` и `session_tokens`
+    прямым SQL схемы 0024: `mark_seen_with_tokens` уже пишет `epoch` (и готовит этот оператор
+    даже при пустом списке отметок).
+
+Прогоны: `cargo test -p zam-store -p zam-core` — 466 passed, 0 failed, 7 ignored (34 набора);
+`cargo test -p zam-server --test sessions --test session_tokens --test m57_acceptance --test
+m56_acceptance --test cache_api --test ideas_recall --test m3_acceptance --test mcp --test
+read_attachments --test read_batch --test read_since_rev --test recall --test recall_brief --test
+recall_recovery --test vault --test search` (все наборы, где есть `session_seen`, `seen`,
+`X-Zam-Session`, `session_tokens`) — 204 passed, 0 failed, 2 ignored; `cargo fmt --all -- --check`,
+`cargo clippy -p zam-store -p zam-core -p zam-server --all-targets -- -D warnings` чисто.
+
 ### Задача 1b. Набор ТС-1, нагеты, заморозка
 
 ### Задача 3. Привязка MCP к сессии

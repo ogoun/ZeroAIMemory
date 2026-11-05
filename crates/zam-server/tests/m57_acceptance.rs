@@ -1657,18 +1657,32 @@ async fn acceptance_migration_from_m56_db() {
         "строки entry_revisions, entry_attachments, spaces на месте"
     );
     let is_entries = |o: &&Obj| o.0 == "table" && o.1 == "entries";
+    // база открывается последней схемой: объекты таблиц 0025 (M6) сверяет
+    // `zam-store/tests/migrate_rebuild.rs::migrate_0025_from_m57_db`
+    let m6 = |o: &&Obj| {
+        [
+            "sessions",
+            "session_seen",
+            "session_tokens",
+            "code_refs",
+            "tokens_unattributed",
+            "session_snapshots",
+            "sqlite_autoindex_session_snapshots_1",
+        ]
+        .contains(&o.1.as_str())
+    };
     assert_eq!(
         after
             .0
             .iter()
-            .filter(|o| !is_entries(o))
+            .filter(|o| !is_entries(o) && !m6(o))
             .collect::<Vec<_>>(),
         before
             .0
             .iter()
-            .filter(|o| !is_entries(o))
+            .filter(|o| !is_entries(o) && !m6(o))
             .collect::<Vec<_>>(),
-        "объекты схемы, кроме entries"
+        "объекты схемы, кроме entries и таблиц 0025"
     );
     let entries_sql = &after.0.iter().find(is_entries).unwrap().2;
     assert!(entries_sql.contains("'idea'"), "{entries_sql}");

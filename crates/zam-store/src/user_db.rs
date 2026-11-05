@@ -138,6 +138,12 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0024_ideas.sql"),
         rebuild: true,
     },
+    // M6: эпохи `session_seen` (пересборка), holdout, учёт без сессии, снимки, `recv_count`
+    Migration {
+        version: 25,
+        sql: include_str!("../migrations/user/0025_session_epochs.sql"),
+        rebuild: true,
+    },
 ];
 
 /// Вид пространства.

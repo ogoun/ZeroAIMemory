@@ -3,6 +3,9 @@
 //! Таблица лежит в базе, где лежит цель: владелец решения видит показы и оценки записей своего
 //! решения, в том числе от участников (`user_id` — кто показал или оценил). Хранится бессрочно,
 //! только дописывается.
+//!
+//! Учёт выданного без сессии (`tokens_unattributed`, спецификация M6 §7.1, миграция 0025) —
+//! здесь же, в базе пользователя запроса: сутки UTC × событие, [`add_unattributed`].
 use std::collections::HashMap;
 
 use jiff::Timestamp;
@@ -120,6 +123,30 @@ pub async fn record_usages(db: &Db, events: &[UsageEvent]) -> Result<(), StoreEr
                 u.source.map(UsageSource::as_str)
             ])?;
         }
+        Ok(())
+    })
+    .await
+}
+
+/// Выдача без сессии (MCP без явной сессии и прочие, M6 §7.1): прибавляет `calls` и `tokens` к
+/// строке `(day, event)` (UPSERT). Событие — как у `session_tokens` (`[a-z0-9_]`, до 32).
+pub async fn add_unattributed(
+    db: &Db,
+    day: jiff::civil::Date,
+    event: &str,
+    calls: u32,
+    tokens: u64,
+) -> Result<(), StoreError> {
+    crate::sessions::check_event(event)?;
+    let (day, event) = (day.strftime("%Y-%m-%d").to_string(), event.to_string());
+    let tokens = i64::try_from(tokens).unwrap_or(i64::MAX);
+    db.write(move |t| {
+        t.prepare_cached(
+            "INSERT INTO tokens_unattributed (day, event, calls, tokens) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (day, event) DO UPDATE SET
+               calls = calls + excluded.calls, tokens = tokens + excluded.tokens",
+        )?
+        .execute(params![day, event, calls, tokens])?;
         Ok(())
     })
     .await

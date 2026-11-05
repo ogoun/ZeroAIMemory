@@ -67,7 +67,7 @@ async fn seen_rev(
         .into(),
         part: WHOLE_TARGET.to_string(),
     };
-    seen_revs(&db, session, std::slice::from_ref(&key))
+    seen_revs(&db, session, 0, std::slice::from_ref(&key))
         .await
         .unwrap()
         .get(&key)

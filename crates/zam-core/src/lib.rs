@@ -1,6 +1,7 @@
 //! Ядро ZeroAIMemory: общие типы и логика.
 
 pub mod id;
+pub mod snapshot;
 pub mod solution;
 pub mod target;
 pub mod token;

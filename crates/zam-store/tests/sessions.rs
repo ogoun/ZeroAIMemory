@@ -184,15 +184,15 @@ async fn mark_seen_keeps_latest_rev() {
         foreign,
         entry,
     ];
-    let got = seen_revs(&db, "a", &all).await.unwrap();
+    let got = seen_revs(&db, "a", 0, &all).await.unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[&chunk], 5);
     // цель целиком — своя часть
     mark_seen(&db, &s, &[item(&whole, 6)]).await.unwrap();
-    let got = seen_revs(&db, "a", &all).await.unwrap();
+    let got = seen_revs(&db, "a", 0, &all).await.unwrap();
     assert_eq!((got[&chunk], got[&whole], got.len()), (5, 6, 2));
-    assert!(seen_revs(&db, "b", &[chunk]).await.unwrap().is_empty());
-    assert!(seen_revs(&db, "a", &[]).await.unwrap().is_empty());
+    assert!(seen_revs(&db, "b", 0, &[chunk]).await.unwrap().is_empty());
+    assert!(seen_revs(&db, "a", 0, &[]).await.unwrap().is_empty());
 }
 
 /// Показ вложения (M5, задача 7) — ключ `blob` с sha256 и частью (`locator` или `chunk_id`):
@@ -221,7 +221,7 @@ async fn mark_seen_blob_parts() {
     )
     .await
     .unwrap();
-    let got = seen_revs(&db, "blob", &[p1.clone(), p2, other])
+    let got = seen_revs(&db, "blob", 0, &[p1.clone(), p2, other])
         .await
         .unwrap();
     assert_eq!(got.len(), 1);
@@ -332,7 +332,7 @@ async fn gc_sessions_by_last_seen() {
     assert_eq!(gc_sessions(&db, later - ttl).await.unwrap(), 1);
     assert_eq!(get_session(&db, "old").await.unwrap(), None);
     assert!(get_session(&db, "fresh").await.unwrap().is_some());
-    assert!(seen_revs(&db, "old", &[key]).await.unwrap().is_empty());
+    assert!(seen_revs(&db, "old", 0, &[key]).await.unwrap().is_empty());
 }
 
 /// Переход схемы v12 → v13 на базе с данными: копия `bak-v12`, новые таблицы пусты и
@@ -563,5 +563,172 @@ async fn session_tokens_accumulate() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+// ---------- M6, миграция 0025: эпохи `session_seen`, holdout, учёт без сессии ----------
+
+/// Отметка цели целиком `n` владельца `owner` в эпохе `epoch` (ревизия `rev`).
+async fn seen_in_epoch(db: &zam_store::Db, session: &str, epoch: u32, key: &SeenKey, rev: i64) {
+    let s = SessionTouch {
+        id: session.into(),
+        epoch,
+        ..SessionTouch::default()
+    };
+    let item = SeenItem {
+        key: key.clone(),
+        rev,
+    };
+    mark_seen(db, &s, &[item]).await.unwrap();
+}
+
+async fn seen_rows(db: &zam_store::Db, session: &'static str) -> Vec<(u32, i64)> {
+    db.read(move |c| {
+        let mut st =
+            c.prepare("SELECT epoch, rev FROM session_seen WHERE session_id = ?1 ORDER BY epoch")?;
+        let rows = st.query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+    .unwrap()
+}
+
+/// Спецификация M6 §7.2: новая эпоха (`bump_epoch`) скрывает отметки прежних от `seen_revs`, но
+/// они хранятся (аналитика); отметка в новой эпохе — своя строка; эпоха растёт на 1 за вызов,
+/// сессия без касаний создаётся; `session_epoch` неизвестной сессии — 0.
+#[tokio::test]
+async fn bump_epoch_hides_old_marks() {
+    let (_dd, db) = db("epoch").await;
+    let key = SeenKey {
+        owner_id: Id::new(),
+        target: node(Id::new()).into(),
+        part: WHOLE_TARGET.into(),
+    };
+    assert_eq!(zam_store::session_epoch(&db, "e").await.unwrap(), 0);
+    seen_in_epoch(&db, "e", 0, &key, 3).await;
+    let k = std::slice::from_ref(&key);
+    assert_eq!(seen_revs(&db, "e", 0, k).await.unwrap()[&key], 3);
+    assert_eq!(zam_store::bump_epoch(&db, "e").await.unwrap(), 1);
+    assert_eq!(zam_store::session_epoch(&db, "e").await.unwrap(), 1);
+    assert!(seen_revs(&db, "e", 1, k).await.unwrap().is_empty());
+    // прежняя эпоха хранится
+    assert_eq!(seen_revs(&db, "e", 0, k).await.unwrap()[&key], 3);
+    seen_in_epoch(&db, "e", 1, &key, 2).await;
+    assert_eq!(seen_revs(&db, "e", 1, k).await.unwrap()[&key], 2);
+    // повтор в той же эпохе — та же строка, большая ревизия
+    seen_in_epoch(&db, "e", 1, &key, 1).await;
+    assert_eq!(seen_rows(&db, "e").await, [(0, 3), (1, 2)]);
+    // эпоха касанием не меняется и не откатывается
+    touch_session(&db, &touch("e")).await.unwrap();
+    assert_eq!(zam_store::session_epoch(&db, "e").await.unwrap(), 1);
+    assert_eq!(zam_store::bump_epoch(&db, "e").await.unwrap(), 2);
+    // сессии нет — создаётся с эпохой 1
+    assert_eq!(zam_store::bump_epoch(&db, "new").await.unwrap(), 1);
+    assert!(get_session(&db, "new").await.unwrap().is_some());
+    assert!(zam_store::bump_epoch(&db, " ").await.is_err());
+}
+
+/// §7.2, исключение — показ идей: `seen_entry_ids` (а за ним `any_idea`) видит отметку любой
+/// эпохи сессии, одна запись в двух эпохах — один id.
+#[tokio::test]
+async fn seen_ideas_ignore_epoch() {
+    let (_dd, db) = db("ideas-epoch").await;
+    let owner = Id::new();
+    let (idea, other) = (Id::new(), Id::new());
+    let key = |id| SeenKey {
+        owner_id: owner,
+        target: TargetRef {
+            kind: TargetKind::Entry,
+            id,
+        }
+        .into(),
+        part: zam_store::RECALL_PART.into(),
+    };
+    seen_in_epoch(&db, "i", 0, &key(idea), 1).await;
+    zam_store::bump_epoch(&db, "i").await.unwrap();
+    let ids = zam_store::seen_entry_ids(&db, "i", owner, zam_store::RECALL_PART)
+        .await
+        .unwrap();
+    assert_eq!(ids, [idea]);
+    seen_in_epoch(&db, "i", 1, &key(idea), 1).await;
+    seen_in_epoch(&db, "i", 1, &key(other), 1).await;
+    let mut ids = zam_store::seen_entry_ids(&db, "i", owner, zam_store::RECALL_PART)
+        .await
+        .unwrap();
+    ids.sort();
+    let mut want = vec![idea, other];
+    want.sort();
+    assert_eq!(ids, want);
+}
+
+/// `holdout` сессии (§12): ставится и снимается, сессии нет — создаётся.
+#[tokio::test]
+async fn set_holdout_flag() {
+    let (_dd, db) = db("holdout").await;
+    let holdout = |db: &zam_store::Db| {
+        let db = db.clone();
+        async move {
+            db.read(|c| {
+                Ok(
+                    c.query_row("SELECT holdout FROM sessions WHERE id = 'h'", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap()
+        }
+    };
+    zam_store::set_holdout(&db, "h", true).await.unwrap();
+    assert_eq!(holdout(&db).await, 1);
+    touch_session(&db, &touch("h")).await.unwrap();
+    assert_eq!(holdout(&db).await, 1);
+    zam_store::set_holdout(&db, "h", false).await.unwrap();
+    assert_eq!(holdout(&db).await, 0);
+    assert!(zam_store::set_holdout(&db, "", true).await.is_err());
+}
+
+/// Учёт без сессии (`tokens_unattributed`, §7.1): UPSERT прибавляет к строке `(day, event)`,
+/// другие день и событие — свои строки; некорректное событие — ошибка ввода.
+#[tokio::test]
+async fn unattributed_upsert_adds() {
+    let (_dd, db) = db("unattributed").await;
+    let d1 = jiff::civil::date(2026, 11, 5);
+    let d2 = jiff::civil::date(2026, 11, 6);
+    zam_store::add_unattributed(&db, d1, "mcp", 1, 100)
+        .await
+        .unwrap();
+    zam_store::add_unattributed(&db, d1, "mcp", 2, 50)
+        .await
+        .unwrap();
+    zam_store::add_unattributed(&db, d1, "search", 1, 7)
+        .await
+        .unwrap();
+    zam_store::add_unattributed(&db, d2, "mcp", 1, 1)
+        .await
+        .unwrap();
+    assert!(
+        zam_store::add_unattributed(&db, d1, "Bad-Event", 1, 1)
+            .await
+            .is_err()
+    );
+    let rows: Vec<(String, String, i64, i64)> = db
+        .read(|c| {
+            let mut st = c.prepare(
+                "SELECT day, event, calls, tokens FROM tokens_unattributed ORDER BY day, event",
+            )?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        rows,
+        [
+            (s("2026-11-05"), s("mcp"), 3, 150),
+            (s("2026-11-05"), s("search"), 1, 7),
+            (s("2026-11-06"), s("mcp"), 1, 1),
+        ]
     );
 }

@@ -187,6 +187,8 @@ pub async fn create(
         agent: blank(req.agent),
         parent_id: blank(req.parent_id),
         agent_type: blank(req.agent_type),
+        // регистрация и учёт хуков отметок `session_seen` не пишут
+        epoch: 0,
     };
     let db = requester_db(&st, &p, &headers).await?;
     match tokens.filter(|t| !t.is_empty()) {

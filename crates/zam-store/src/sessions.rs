@@ -11,13 +11,19 @@
 //!   и её ревизия. Вложение (M5) — цель [`SeenTarget::Blob`] (sha256), часть — `locator`,
 //!   отданный `/read` целиком, или `chunk_id` фрагмента `mode=chunks`, ревизия 0. Хранится большая из выданных ревизий: ревизии только растут, и повторная
 //!   выдача старой не откатывает отметку;
+//! - эпоха (спецификация M6 §7.2, миграция 0025): `sessions.seen_epoch` растёт [`bump_epoch`]
+//!   (сжатие контекста, `resume`, `clear`, восстановление), отметка пишется в эпоху касания
+//!   ([`SessionTouch::epoch`]), [`seen_revs`] читает только её. Отметки прежних эпох хранятся до
+//!   срока сессии (аналитика). Показ идей — без эпохи ([`seen_entry_ids`]): одна идея — один
+//!   показ за сессию;
+//! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12);
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
 //!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя;
 //! - `session_tokens` — выданное сессии по событию (§9.5): число выдач `calls` и оценка размера в
 //!   токенах `tokens`; `/recall` прибавляет свои события ([`mark_seen_with_tokens`]), хуки с
 //!   локальным выводом — пачкой через `POST /sessions` ([`add_token_counts`]);
 //! - срок хранения — [`gc_sessions`]: сессии без обращений дольше срока удаляются вместе с
-//!   выданным им (воркер обслуживания сервера, раз в сутки, 30 дней).
+//!   выданным им, учётом и снимком (воркер обслуживания сервера, раз в сутки, 30 дней).
 use std::collections::HashMap;
 
 use jiff::Timestamp;
@@ -50,6 +56,9 @@ pub struct SessionTouch {
     pub parent_id: Option<String>,
     /// Тип субагента (`Explore`, `Plan`, свои).
     pub agent_type: Option<String>,
+    /// Эпоха `session_seen` (M6 §7.2): в неё пишет [`mark_seen`]. Заполняет сессия запроса
+    /// сервера (`request_session`); `sessions.seen_epoch` касание не меняет.
+    pub epoch: u32,
 }
 
 /// Сессия агента.
@@ -343,7 +352,7 @@ pub async fn mark_seen(db: &Db, s: &SessionTouch, items: &[SeenItem]) -> Result<
 }
 
 /// Имя события учёта: 1..=[`TOKEN_EVENT_MAX_CHARS`] символов `[a-z0-9_]`.
-fn check_event(e: &str) -> Result<(), StoreError> {
+pub(crate) fn check_event(e: &str) -> Result<(), StoreError> {
     let ok = !e.is_empty()
         && e.chars().count() <= TOKEN_EVENT_MAX_CHARS
         && e.chars()
@@ -442,9 +451,9 @@ pub async fn mark_seen_with_tokens(
         let now = fmt_ts(Timestamp::now());
         let mut st = t.prepare_cached(
             "INSERT INTO session_seen (session_id, owner_id, target_kind, target_id, part, rev,
-                                       seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT (session_id, owner_id, target_kind, target_id, part) DO UPDATE SET
+                                       seen_at, epoch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (session_id, owner_id, target_kind, target_id, part, epoch) DO UPDATE SET
                rev = max(rev, excluded.rev), seen_at = excluded.seen_at",
         )?;
         for it in &items {
@@ -456,7 +465,8 @@ pub async fn mark_seen_with_tokens(
                 id,
                 it.key.part,
                 it.rev,
-                now
+                now,
+                s.epoch
             ])?;
         }
         Ok(())
@@ -464,10 +474,12 @@ pub async fn mark_seen_with_tokens(
     .await
 }
 
-/// Ревизии частей целей, уже выданных сессии (того, что сессия не получала, в ответе нет).
+/// Ревизии частей целей, уже выданных сессии в эпоху `epoch` (того, что сессия в ней не
+/// получала, в ответе нет): отметки прежних эпох выданными не считаются (M6 §7.2).
 pub async fn seen_revs(
     db: &Db,
     session: &str,
+    epoch: u32,
     targets: &[SeenKey],
 ) -> Result<HashMap<SeenKey, i64>, StoreError> {
     if targets.is_empty() {
@@ -478,13 +490,15 @@ pub async fn seen_revs(
         let mut st = c.prepare_cached(
             "SELECT rev FROM session_seen
              WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = ?3 AND target_id = ?4
-               AND part = ?5",
+               AND part = ?5 AND epoch = ?6",
         )?;
         let mut out = HashMap::new();
         for k in targets {
             let (kind, id) = seen_cols(&k.target)?;
             let rev: Option<i64> = st
-                .query_row(params![session, k.owner_id, kind, id, k.part], |r| r.get(0))
+                .query_row(params![session, k.owner_id, kind, id, k.part, epoch], |r| {
+                    r.get(0)
+                })
                 .optional()?;
             if let Some(rev) = rev {
                 out.insert(k, rev);
@@ -496,8 +510,9 @@ pub async fn seen_revs(
 }
 
 /// Записи журналов (`target_kind = entry`) базы владельца `owner`, выданные сессии с частью
-/// `part` (любая ревизия): по ним вызывающий узнаёт, показывалась ли сессии запись нужного вида
-/// (раздел идей M5.7 §6.1 — только на первом `session_start` сессии).
+/// `part` (любая ревизия, **любая эпоха** — показ идей, M6 §7.2): по ним вызывающий узнаёт,
+/// показывалась ли сессии запись нужного вида (раздел идей M5.7 §6.1 — только на первом
+/// `session_start` сессии). Запись, отмеченная в нескольких эпохах, — один id.
 pub async fn seen_entry_ids(
     db: &Db,
     session: &str,
@@ -507,7 +522,7 @@ pub async fn seen_entry_ids(
     let (session, part) = (session.to_string(), part.to_string());
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT target_id FROM session_seen
+            "SELECT DISTINCT target_id FROM session_seen
              WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = 'entry' AND part = ?3",
         )?;
         let rows = st.query_map(params![session, owner, part], |r| r.get::<_, String>(0))?;
@@ -522,12 +537,15 @@ pub async fn seen_entry_ids(
     .await
 }
 
-/// Удаляет сессии без обращений с `cutoff` (`last_seen_at < cutoff`) и выданное им; число
-/// удалённых сессий.
+/// Таблицы с `session_id → sessions(id)` без каскада: [`gc_sessions`] чистит их до сессий.
+const SESSION_CHILDREN: [&str; 3] = ["session_seen", "session_tokens", "session_snapshots"];
+
+/// Удаляет сессии без обращений с `cutoff` (`last_seen_at < cutoff`) и выданное им (отметки,
+/// учёт, снимок — [`SESSION_CHILDREN`]); число удалённых сессий.
 pub async fn gc_sessions(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError> {
     let cutoff = fmt_ts(cutoff);
     db.write(move |t| {
-        for table in ["session_seen", "session_tokens"] {
+        for table in SESSION_CHILDREN {
             t.execute(
                 &format!(
                     "DELETE FROM {table} WHERE session_id IN
@@ -538,6 +556,62 @@ pub async fn gc_sessions(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError> 
         }
         let n = t.execute("DELETE FROM sessions WHERE last_seen_at < ?1", [&cutoff])?;
         Ok(n as u64)
+    })
+    .await
+}
+
+/// Новая эпоха `session_seen` сессии (M6 §7.2): `seen_epoch + 1`, обращение (`last_seen_at`);
+/// сессии нет — создаётся с эпохой 1. Возвращает новую эпоху.
+pub async fn bump_epoch(db: &Db, session: &str) -> Result<u32, StoreError> {
+    check_session_id(session)?;
+    let id = session.to_string();
+    db.write(move |t| {
+        let now = fmt_ts(Timestamp::now());
+        let epoch: i64 = t.query_row(
+            "INSERT INTO sessions (id, started_at, last_seen_at, seen_epoch) VALUES (?1, ?2, ?2, 1)
+             ON CONFLICT (id) DO UPDATE SET
+               seen_epoch = seen_epoch + 1, last_seen_at = excluded.last_seen_at
+             RETURNING seen_epoch",
+            params![id, now],
+            |r| r.get(0),
+        )?;
+        epoch_u32(epoch)
+    })
+    .await
+}
+
+/// Текущая эпоха `session_seen` сессии; сессии нет — 0 (её отметок тоже нет).
+pub async fn session_epoch(db: &Db, session: &str) -> Result<u32, StoreError> {
+    let id = session.to_string();
+    db.read(move |c| {
+        let epoch: Option<i64> = c
+            .query_row("SELECT seen_epoch FROM sessions WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        epoch_u32(epoch.unwrap_or(0))
+    })
+    .await
+}
+
+fn epoch_u32(v: i64) -> Result<u32, StoreError> {
+    u32::try_from(v).map_err(|_| StoreError::Corrupt(format!("sessions.seen_epoch = {v}")))
+}
+
+/// Признак `holdout` сессии (контрольная группа агентного A/B, M6 §12) с обращением; сессии
+/// нет — создаётся.
+pub async fn set_holdout(db: &Db, session: &str, on: bool) -> Result<(), StoreError> {
+    check_session_id(session)?;
+    let id = session.to_string();
+    db.write(move |t| {
+        let now = fmt_ts(Timestamp::now());
+        t.execute(
+            "INSERT INTO sessions (id, started_at, last_seen_at, holdout) VALUES (?1, ?2, ?2, ?3)
+             ON CONFLICT (id) DO UPDATE SET
+               holdout = excluded.holdout, last_seen_at = excluded.last_seen_at",
+            params![id, now, on],
+        )?;
+        Ok(())
     })
     .await
 }

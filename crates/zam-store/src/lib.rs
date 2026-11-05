@@ -7,7 +7,8 @@
 //! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5), вложения как
 //! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5), отчёты (вид записи
 //! `report`, файлы `entry_attachments`; M5.5), карта кода решения (`code_*`, ссылки на символы;
-//! M5.6), журнал идей (вид записи `idea`; M5.7).
+//! M5.6), журнал идей (вид записи `idea`; M5.7), эпохи выданного сессии, учёт без сессии и
+//! снимки сессий (`session_snapshots`; M6).
 
 pub mod access;
 pub mod attachments;
@@ -31,6 +32,7 @@ pub mod paths;
 pub mod questions;
 pub mod search;
 pub mod sessions;
+pub mod snapshots;
 pub mod solution_registry;
 pub mod system;
 pub mod tasks;
@@ -141,10 +143,11 @@ pub use search::{
 pub use sessions::{
     RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,
     TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
-    add_tokens, check_session_id, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, mark_seen_with_tokens, seen_entry_ids, seen_revs, session_tokens,
-    touch_session,
+    add_tokens, bump_epoch, check_session_id, end_session, gc_sessions, get_session,
+    latest_session, list_sessions, mark_seen, mark_seen_with_tokens, seen_entry_ids, seen_revs,
+    session_epoch, session_tokens, set_holdout, touch_session,
 };
+pub use snapshots::{SnapshotRow, gc_snapshots, get_snapshot, put_snapshot};
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,
@@ -155,8 +158,8 @@ pub use tasks::{
     check_task, check_task_transition, claim_task, claimed_tasks, release_task,
 };
 pub use usage::{
-    UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, record_usages, usage_counts,
-    usage_counts_many,
+    UsageCounts, UsageEvent, UsageKind, UsageSource, add_unattributed, record_usage, record_usages,
+    usage_counts, usage_counts_many,
 };
 pub use user_db::{
     RechunkNotice, RechunkProgress, RechunkReason, Space, SpaceKind, USER_MIGRATIONS, UserDbs,

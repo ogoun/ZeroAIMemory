@@ -566,7 +566,8 @@ fn put_file(
             s.kind.as_str()
         ])?;
     }
-    // повтор `(name, kind)` в загрузке складывается
+    // повтор `(name, kind)` в загрузке складывается; `recv_count` (0025, M6 §12а) — по
+    // умолчанию 0, то есть все вызовы прямые, пока протокол не несёт счётчика (задача 14 M6)
     let mut rf = tx.prepare_cached(
         "INSERT INTO code_refs (file_id, name, kind, count, first_line)
          VALUES (?1, ?2, ?3, ?4, ?5)

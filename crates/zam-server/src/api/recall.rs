@@ -2915,7 +2915,7 @@ async fn shown(
         return HashSet::new();
     };
     let keys: Vec<SeenKey> = cands.iter().map(|c| seen_key(targets, c)).collect();
-    match seen_revs(&s.db, &s.touch.id, &keys).await {
+    match seen_revs(&s.db, &s.touch.id, s.touch.epoch, &keys).await {
         Ok(m) => m.into_keys().collect(),
         Err(e) => {
             tracing::warn!(error = %e, "recall: показанное сессии не прочитано, без фильтра повторов");
