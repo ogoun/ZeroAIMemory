@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Редакция 3 (2026-11-05) — задачи 18a–18c «перенос памяти» (решение владельца 2026-11-05, ответ
+Редакция 4 (2026-11-05) — правки рецензии переноса (спецификация 4.5: `restore` через
+`.zam-reindex`, новые id для чужого архива, `imported_from`, 18b → 18b1/18b2). Редакция 3 — задачи
+18a–18c «перенос памяти» (решение владельца 2026-11-05, ответ
 В; спецификация §12б, редакция 4.4). Редакция 2 (2026-11-04) — по рецензии плана (CHANGES REQUESTED: C1–C3, I1–I10, Minor); спецификация —
 редакция 4.4. Пункты «ждёт ответа владельца» реализуются по варианту по умолчанию из
 спецификации, пока ответа нет.
@@ -36,7 +38,7 @@
 **Tech Stack.** Rust 1.99.1, workspace без новых внешних библиотек. Новые **связи** между уже
 используемыми крейтами (аудит владельца: только из workspace):
 - новый крейт `crates/zam-secrets` (MIT, свой) с зависимостью `regex`;
-- `zam-cli` получает `zam-secrets` и `windows` (cfg(windows), фича
+- `zam-cli` получает `zip` (импорт каталога, задача 18b2), `zam-secrets` и `windows` (cfg(windows), фича
   `Win32_System_Diagnostics_ToolHelp`; крейт уже есть у xtask);
 - `xtask` получает `blake3` (уже у `zam-cli`);
 - `zam-server` получает `zip` в основных зависимостях (сейчас — dev; крейт workspace) для
@@ -47,7 +49,7 @@
 3339 (задача 6). xtask остаётся синхронным (`ureq`), без `tokio` и `semver`. WebUI — Svelte 5, без
 новых пакетов.
 
-**Spec:** `docs/specs/2026-11-04-m6-token-economy.md`, редакция 4.4 (далее — «спецификация»; `§N` —
+**Spec:** `docs/specs/2026-11-04-m6-token-economy.md`, редакция 4.5 (далее — «спецификация»; `§N` —
 её разделы). Исследование — `docs/research/2026-11-04-m6-token-economy.md`, baton —
 `docs/research/2026-11-04-baton-review.md`, события хуков — `docs/research/2026-10-28-agent-hook-events.md`.
 Основа — ТЗ `docs/specs/2026-10-17-zeroaimemory-tz.md` v1.23. Журнал —
@@ -265,14 +267,15 @@ deploy/licenses/*, about.toml
 | 17c | Снимок: сервер, показ, WebUI | 17b, 8a | M |
 | 17d | Снимок: бюджеты, ТС-2, полный прогон | 17c | S |
 | 18a | `zam-server backup`/`restore`, автокопии | 2, 6 | M |
-| 18b | Экспорт и импорт пространства | 18a | L |
-| 18c | Инструкция и проверка переезда Windows → Linux | 18a, 18b | M |
+| 18b1 | Экспорт пространства | 18a | M |
+| 18b2 | Импорт пространства (свой/чужой архив, id, аксиомы → `theorem`) | 18b1 | L |
+| 18c | Инструкция и проверка переезда Windows → Linux | 18a, 18b2 | M |
 | 13a | Блок v7 и протокол | все выше | S |
 | 13b | Переснятие на holdout, приёмка, совместимость | 13a | L |
 | 13c | Документы и выпуск `0.0.11-m6` | 13b | M |
 
 Строгий порядок исполнения: **1a1 → 1c → 1a2 → 2 → 1b → 3 → 4 → 5 → 6 → 7a → 7b → 8a → 8b → 8c → 9 →
-10 → 11 → 12 → 14 → 15a → 15b → 15c → 16 → 17a → 17b → 17c → 17d → 18a → 18b → 18c → 13a → 13b → 13c.** 15b стоит
+10 → 11 → 12 → 14 → 15a → 15b → 15c → 16 → 17a → 17b → 17c → 17d → 18a → 18b1 → 18b2 → 18c → 13a → 13b → 13c.** 15b стоит
 раньше 17a, потому что 17a маскирует снимок через `zam-secrets`. Таблица «Зависит от» описывает
 связи, а не разрешение на параллельность.
 
@@ -1282,182 +1285,270 @@ pub fn mask_and_limit(s: Snapshot, max_bytes: usize) -> Snapshot;
   `crates/zam-server/tests/backup.rs`.
 - Modify:
   - `crates/zam-server/src/main.rs` — `Cmd::Backup`, `Cmd::Restore`;
-  - `crates/zam-server/src/{config.rs,maintenance.rs}`, `crates/zam-server/src/api/index.rs` (поле
-    `backup`), `deploy/config.example.toml`;
-  - `crates/zam-store/src/{db.rs,system.rs,datadir.rs}`;
+  - `crates/zam-server/src/config.rs` — `[backup]`;
+  - `crates/zam-server/src/maintenance.rs` — `schedule::tick`, контрольная точка `PASSIVE` при
+    `.zam-backup`;
+  - `crates/zam-server/src/api/index.rs` — поле `backup`;
+  - `deploy/config.example.toml`;
+  - `crates/zam-store/src/{db.rs,system.rs,datadir.rs}` — метка `restore` в `.zam.lock`;
   - `crates/zam-server/Cargo.toml` — `zip` из dev-зависимостей в основные (крейт workspace).
+    `windows` с `Win32_Storage_FileSystem` уже есть.
 
 **Interfaces — Produces:**
 ```rust
 // zam-store
-pub fn vacuum_into(src: &Path, dst: &Path) -> Result<(), StoreError>; // своё соединение только для чтения
+pub fn vacuum_into(src: &Path, dst: &Path) -> Result<(), StoreError>;
+//   соединение READ_WRITE + query_only=1 (создаёт -shm); каталог только для чтения и база закрыта —
+//   URI immutable=1
 pub fn integrity_ok(path: &Path) -> Result<(u32 /*user_version*/, bool), StoreError>;
+pub fn meta_value(path: &Path, key: &str) -> Result<Option<String>, StoreError>; // meta.chunker*
 impl SystemDb { pub async fn clear_web_sessions(&self) -> Result<u64, StoreError>; }
+pub fn lock_mark(data_dir: &Path) -> Option<LockMark>;   // Serve | Restore — из содержимого .zam.lock
 // zam-server/src/backup
 pub const MANIFEST_FORMAT: u32 = 1;
 pub struct FileEntry { pub path: String, pub size: u64, pub sha256: String }
 pub struct Manifest { pub format: u32, pub server_version: String, pub created_at: String,
     pub source_machine: Option<String>, pub schemas: BTreeMap<String, u32>, pub files: Vec<FileEntry>,
-    pub embedding_models: BTreeMap<String, Vec<String>>, pub master_key_included: bool }
+    pub embedding_models: BTreeMap<String, Vec<String>>, pub chunkers: BTreeMap<String, Chunkers>,
+    pub drift: Vec<String>, pub master_key_included: bool }
 pub struct BackupOpts { pub dir: Option<PathBuf>, pub zip: Option<PathBuf> }
 pub struct BackupReport { pub path: PathBuf, pub dbs: usize, pub blobs: usize, pub linked: usize,
-                          pub bytes: u64, pub ms: u64 }
+                          pub copied: usize, pub bytes: u64, pub ms: u64, pub drift: Vec<String> }
 pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, BackupError>;
-//   .zam.lock не берёт; блобы — по таблице blobs копии; повтор sha из предыдущей копии — hard link
+//   порядок: место → .zam-backup → system.db → users из копии system.db → users/<id>.db → блобы
+//   (hard link из предыдущей копии, иначе копия) → опись → снять .zam-backup
 pub struct RestoreOpts { pub replace: bool, pub reindex: bool }
+pub enum VectorPlan { FromCache, Recompute { reason: &'static str /*"model"|"chunker"*/, chunks: u64 } }
 pub struct RestoreReport { pub dbs: usize, pub blobs: usize, pub schemas: BTreeMap<String, u32>,
-                           pub vectors_cached: u64, pub vectors_computed: u64, pub vault_ok: bool }
+                           pub drift: Vec<String>, pub vectors: VectorPlan, pub vault_ok: bool }
 pub async fn restore(cfg: &ServerConfig, src: &Path, opts: &RestoreOpts) -> Result<RestoreReport, BackupError>;
-//   берёт .zam.lock; проверки сумм и версий — до записи; --replace → backups/pre-restore-<ts>/
-#[derive(thiserror::Error)] pub enum BackupError { Locked, NotEmpty, SchemaTooNew { file: String, have: u32, max: u32 },
-    BadSum { path: String }, MissingBlob { user: String, sha: String }, Io(#[from] io::Error), Store(#[from] StoreError) }
-// config [backup]: dir, schedule: Off|Daily, at: "HH:MM" (UTC), keep 1..=365 (7), warn_days 1..=365 (7)
-// GET /index/status → backup: {last_at: Option<String>, schedule, warning: Option<"no_recent_backup">}
+//   .zam.lock с меткой restore; проверки до записи; блобы копируются; web_sessions очищается;
+//   reindex не запускает — ставит .zam-reindex (при opts.reindex)
+#[derive(thiserror::Error)] pub enum BackupError { Locked, RestoreInProgress, NotEmpty, NoSpace { need: u64, free: u64 },
+    SchemaTooNew { file: String, have: u32, max: u32 }, BadSum { path: String },
+    MissingBlob { user: String, sha: String }, Io(#[from] io::Error), Store(#[from] StoreError) }
+// schedule.rs — чистая функция, тесты зовут её напрямую
+pub enum Action { Skip, Backup, Prune(Vec<PathBuf>) }
+pub fn tick(now: jiff::Timestamp, last: Option<jiff::Timestamp>, existing: &[PathBuf], cfg: &BackupConfig) -> Vec<Action>;
+// config [backup]: dir, schedule Off|Daily, at "HH:MM" UTC, keep 1..=365 (7), warn_days 1..=365 (7)
+// GET /index/status → backup: {last_at, schedule, warning: Option<"no_recent_backup">}
 // CLI: zam-server backup [--config P] [--dir D] [--zip F] [--json];
 //      zam-server restore <D|F.zip> [--config P] [--replace] [--no-reindex]
 ```
 
 - [ ] **Step 1: Тесты** (FAIL), `crates/zam-server/tests/backup.rs`:
-  - копия и опись:
-    - `backup_while_writing_is_consistent` — писатель вставляет записи во время копии; копия
-      проходит `integrity_check`, а число строк соответствует моменту снимка;
-    - `backup_manifest_sums_and_schemas`;
+  - копия:
+    - `backup_while_writing_invariants` — писатель вставляет записи во время копии. Копия проходит
+      `integrity_check` и `foreign_key_check`; число записей в диапазоне [до копии, после копии];
+      ревизии каждой записи полны;
+    - `backup_writer_latency_and_wal_bound` — во время копии p99 записи ≤ 200 мс, `-wal` ≤ 64 МиБ
+      на фикстуре 20 000 записей;
+    - `backup_reads_closed_db_without_wal_shm`;
+    - `backup_order_users_from_system_copy` — пользователь, созданный после снимка `system.db`, —
+      в `drift`, а не ошибка;
+    - `backup_checks_free_space` — подмена свободного места точкой `test-hooks`;
+    - `backup_refuses_during_restore`;
+    - `backup_manifest_sums_schemas_chunkers`;
     - `backup_excludes_key_qdrant_previews_models_logs`;
-    - `backup_second_run_hardlinks_blobs` (unix и NTFS);
+  - блобы:
+    - `backup_second_run_hardlinks_blobs` — число ссылок: unix `st_nlink`, Windows
+      `GetFileInformationByHandle` (`nNumberOfLinks`);
+    - `backup_blob_fallback_copy` — отказ жёсткой ссылки подменяется `test-hooks`, итог
+      `linked: 0, copied: N`;
     - `backup_missing_blob_fails_listed`;
   - отказы `restore`:
-    - `restore_refuses_nonempty`;
-    - `restore_replace_moves_old`;
-    - `restore_refuses_locked` — живой сервер держит `.zam.lock`;
-    - `restore_schema_too_new`;
+    - `restore_refuses_nonempty`, `restore_replace_moves_old`;
+    - `restore_refuses_locked`, `restore_schema_too_new`;
     - `restore_bad_sum_before_any_write`;
   - восстановление:
-    - `restore_older_schema_migrates` — копия базы 0024 из фикстуры задачи 2 → 0025 и `bak-v24`;
-    - `restore_clears_web_sessions`;
+    - `restore_older_schema_migrates` — копия базы 0024 (фикстура задачи 2) → 0025, `bak-v24`;
+    - `restore_copies_blobs_not_links`;
+    - `restore_clears_web_sessions`, `restore_sets_reindex_flag`;
     - `restore_without_key_vault_unavailable`;
-    - `restore_reindex_from_embeddings_no_inference` (ML) — счётчик вызовов модели = 0, топ-5 на 10
-      запросах совпадают;
+    - `restore_vector_plan_model_and_chunker` — разные `model_id` или `meta.chunker` дают
+      `Recompute` с причиной;
+    - `restore_then_serve_rebuilds_from_cache_no_inference` (ML) — при совпадающих `model_id` и
+      `meta.chunker` первый `serve` пересобирает Qdrant: вызовов модели — 0, перенарезки нет, топ-5
+      на 10 запросах совпадают;
   - расписание:
-    - `schedule_daily_frozen_clock_keep` — `freeze_now`, 9 суток → остаётся 7 копий;
+    - `schedule_tick_cases` — `tick` на сериях `now`: до `at` — пропуск, после — копия, 9 суток →
+      удаление двух старших;
     - `index_status_no_recent_backup`.
 - [ ] **Step 2: Реализация** по §12б.2–§12б.4. Предупреждение о мастер-ключе печатается в stderr
   дословно, как в спецификации.
 - [ ] **Step 3: Проверка.**
   - `cargo test -p zam-store $T vacuum`;
-  - `cargo test -p zam-server --test backup $T`;
-  - `$env:ZAM_REQUIRE_ML=1; cargo test -p zam-server --test backup $T restore_reindex`.
+  - `cargo test -p zam-server --test backup --features test-hooks $T`;
+  - `$env:ZAM_REQUIRE_ML=1; cargo test -p zam-server --test backup $T restore_then_serve`.
 
   Всё — PASS.
 - [ ] **Step 4: Commit** `feat(server): zam-server backup/restore и автокопии`.
 
-### Task 18b: Экспорт и импорт пространства (§12б.5)
+### Task 18b1: Экспорт пространства (§12б.5)
 
 **Files.**
 - Create:
-  - `crates/zam-server/src/api/transfer/{mod.rs,archive.rs,export.rs,import.rs}`;
-  - `crates/zam-store/src/import.rs`;
-  - `crates/zam-cli/src/cmd/transfer.rs` (регистрация `export`, `import` в `cmd/mod.rs`, `main.rs`);
-  - тесты `crates/zam-server/tests/transfer.rs`, `crates/zam-cli/tests/transfer.rs`;
+  - `crates/zam-server/src/api/transfer/{mod.rs,archive.rs,export.rs}`;
+  - `crates/zam-cli/src/cmd/transfer.rs` — `export`, регистрация в `cmd/mod.rs` и `main.rs`;
+  - тесты `crates/zam-server/tests/transfer_export.rs`, `crates/zam-cli/tests/transfer.rs`;
   - `web/e2e/export.spec.ts`.
-- Modify: `crates/zam-server/src/api/mod.rs` (маршруты), `crates/zam-server/src/config.rs`
-  (`[import]`), `web/src/components/Tree.svelte` (пункт «Экспорт (.zip)»), `web/src/lib/api.ts`.
+- Modify: `crates/zam-server/src/api/mod.rs` (маршрут), `web/src/components/Tree.svelte` (пункт
+  «Экспорт (.zip)»), `web/src/lib/api.ts`.
 
-**Interfaces — Consumes:** `Manifest` (18a), запись записей и заметок `zam-store`, сканер секретов,
-`create_report`. **Produces:**
+**Interfaces — Produces:**
 ```rust
 pub const EXPORT_FORMAT: u32 = 1;
 pub struct ExportFilter { pub paths: Vec<String>, pub kinds: Vec<EntryKind>, pub history: bool }
-// GET /spaces/{space}/export?paths=&kinds=&history= → application/zip (поток; zip64)
-//   раскладка: manifest.json, <path>.md, _attachments/<path>/<file>, _journals/<kind>/<id>.md,
-//   _journals/report/<id>/<file>, _links.jsonl, _history/<id>.jsonl
-pub enum OnConflict { Skip, Revision }
-pub enum AxiomPolicy { Demote, Keep }          // по умолчанию: свой архив → Keep, чужой/неизвестный → Demote
-pub struct ImportOptions { pub on_conflict: OnConflict, pub axioms: Option<AxiomPolicy>, pub dry_run: bool }
-pub struct ImportReport { pub created: u64, pub revised: u64, pub skipped: u64,
-    pub conflicts: Vec<Conflict>, pub demoted_axioms: u64, pub warnings: Vec<String> }
-// POST /spaces/{space}/import?on_conflict=&axioms=&dry_run= (тело — zip) → 200 ImportReport
-//   права: владелец пространства или администратор; участник решения → 403
-// zam-store/src/import.rs
-pub fn validate_archive(zip: &mut ZipArchive<File>, limits: &ImportLimits) -> Result<Plan, ImportError>;
-//   пути (.., абсолютные, \, ссылки), max_bytes 2 ГиБ, коэффициент ≤ 100, max_files 100000
-pub async fn apply_plan(db: &Db, space: Id, plan: Plan, opts: &ImportOptions, attrib: &Attribution)
-    -> Result<ImportReport, ImportError>;    // пачки по 200 элементов в транзакции; повтор идемпотентен
-// аудит system.db: space.export {space, user, files, bytes}, space.import {space, user, created, skipped}
+pub struct ExportManifest { pub format: u32, pub server_version: String, pub source_user_id: Id,
+    pub space: Id, pub created_at: String, pub filter: ExportFilter, pub files: usize,
+    pub archive_fingerprint: String }
+pub fn file_name_for(path: &str, taken: &mut HashSet<String>) -> String;
+//   Windows: : ? * | < > " → %XX; CON/PRN/AUX/NUL/COM1-9/LPT1-9 → суффикс _; конечные «.»/пробел;
+//   пары по регистру → ~2; исходный путь — во frontmatter path
+// GET /spaces/{space}/export?paths=&kinds=&history= → application/zip (поток, zip64)
+//   manifest.json, <file_name_for(path)>.md, _attachments/<sha256[0..16]>/<имя> (один раз на блоб),
+//   _journals/<kind>/<id>.md, _links.jsonl, _history/<id>.jsonl
+// аудит system.db: space.export {space, user, files, bytes}
 // CLI: zam export [--space S] [--path P]… [--kind K]… [--no-history] -o F.zip
-//      zam import <F.zip|DIR> [--space S] [--on-conflict skip|revision] [--axioms demote|keep] [--dry-run]
 ```
 
 - [ ] **Step 1: Тесты** (FAIL):
-  - сервер, экспорт:
-    - `export_import_roundtrip_all_kinds` — заметки с вложениями; `changelog`, `insight`,
-      `release`, `term`, `task`, `question`, `idea`, `report`; статусы, `certainty` с историей,
-      связи, id;
-    - `export_excludes_vault_codemap_trash_sessions`;
-    - `token_export_no_human_no_reports`;
-    - `member_exports_but_cannot_import`;
-    - `export_audit_written`;
-  - сервер, импорт:
-    - `import_demotes_foreign_axioms`, `import_keeps_own_axioms`, `import_axioms_keep_explicit`;
-    - `import_on_conflict_skip_and_revision`, `import_dry_run_writes_nothing`;
-    - `import_rejects_traversal_abs_symlink`, `import_rejects_zip_bomb`;
-    - `import_drops_claims`, `import_orphan_proposal_obsolete`;
-    - `import_report_with_images_keeps_immutability`;
-    - `import_secrets_detected_warning`;
-    - `import_resume_is_idempotent`;
-  - CLI: `cli_import_folder_md` (каталог без описи — все заметки, автор неизвестен → `Demote`),
-    `cli_export_old_server_404_message`;
+  - `export_layout_and_manifest` — вложения по пути тела, одно вложение двух заметок — один файл;
+  - `export_windows_names` — `a:b`, `CON`, `x.`, пара `Readme`/`README`;
+  - `export_excludes_vault_codemap_trash_sessions`;
+  - `token_export_no_human_no_reports`, `member_can_export`;
+  - `export_audit_written`;
+  - `export_filter_paths_kinds_history`;
+  - `cli_export_old_server_404_message`;
   - e2e: «Экспорт (.zip)» скачивает архив с `manifest.json`.
-- [ ] **Step 2: Реализация** по §12б.5. Импорт идёт служебной операцией `system` (ТЗ §6.3) с
-  исходной атрибуцией из `_history`.
-- [ ] **Step 3: Проверка.**
-  - `cargo test -p zam-store $T import`;
-  - `cargo test -p zam-server --test transfer $T`;
-  - `cargo test -p zam-cli --test transfer $T`;
+- [ ] **Step 2: Реализация.** Проверка:
+  - `cargo test -p zam-server --test transfer_export $T`;
+  - `cargo test -p zam-cli --test transfer $T export`;
   - `npm run check`, `npm run build`, `npm run size`;
   - `npm run e2e -- export` на release.
 
   Всё — PASS.
-- [ ] **Step 4: Commit** `feat(transfer): экспорт и импорт пространства`.
+- [ ] **Step 3: Commit** `feat(transfer): экспорт пространства`.
+
+### Task 18b2: Импорт пространства (§12б.5)
+
+**Files.**
+- Create: `crates/zam-server/src/api/transfer/import.rs`, `crates/zam-store/src/import.rs`,
+  `crates/zam-server/tests/transfer_import.rs`.
+- Modify:
+  - `crates/zam-server/src/api/mod.rs` — маршрут со своим пределом тела;
+  - `crates/zam-server/src/config.rs` — `[import]`;
+  - `crates/zam-cli/src/cmd/transfer.rs` — `import`;
+  - `crates/zam-cli/Cargo.toml` — `zip` (крейт workspace).
+
+**Interfaces — Consumes:** `ExportManifest`, `file_name_for` (18b1); запись записей и заметок
+`zam-store`, сканер секретов, `create_report`; `.incoming` блобов (`blobs.rs`). **Produces:**
+```rust
+pub enum OnConflict { Skip, Revision }
+pub enum AxiomPolicy { Demote /*→ theorem*/, Keep }   // по умолчанию: свой архив → Keep, чужой → Demote
+pub struct ImportOptions { pub on_conflict: OnConflict, pub axioms: Option<AxiomPolicy>, pub dry_run: bool }
+pub struct ImportedFrom { pub archive_fingerprint: String, pub source_id: String,
+                          pub source_rev: u32, pub content_hash: String }  // data.imported_from / meta узла
+pub struct ImportReport { pub created: u64, pub revised: u64, pub skipped: u64,
+    pub conflicts: Vec<Conflict>, pub demoted_axioms: u64, pub id_remapped: u64,
+    pub unresolved: Vec<String>, pub links_skipped: u64, pub warnings: Vec<String> }
+// POST /spaces/{space}/import?on_conflict=&axioms=&dry_run= (тело — zip ≤ import.max_bytes; поток
+//   в <data_dir>/.incoming/<id>.part, удаление при любом исходе) → 200 ImportReport
+//   права: владелец пространства или администратор; участник решения → 403
+// zam-store/src/import.rs
+pub struct ImportLimits { pub max_bytes: u64, pub max_files: usize, pub max_ratio: u32 /*100*/ }
+pub fn validate_archive(zip: &mut ZipArchive<File>, limits: &ImportLimits) -> Result<Plan, ImportError>;
+pub fn remap_ids(plan: &mut Plan, own: bool) -> IdMap;  // чужой архив: новые UUIDv7, ссылки
+    // n:/i:/c:/r:/t:/k:/q:/w:/p: в телах и data (task_id, prev_task_ids, question_id, idea, links),
+    // _links.jsonl, derived_from, связка идея↔задача↔вопрос; неизвестные — unresolved
+pub async fn apply_plan(db: &Db, space: Id, plan: Plan, opts: &ImportOptions, attrib: &Attribution)
+    -> Result<ImportReport, ImportError>;   // пачки по 200; повтор — по imported_from + content_hash;
+    // заметки: id/imported_from.source_id сильнее пути; путь занят другим — path-taken
+// CLI: zam import <F.zip|DIR> [--space S] [--on-conflict skip|revision] [--axioms demote|keep] [--dry-run]
+//   DIR упаковывается в zip локально (крейт zip), без manifest.json — архив чужой
+```
+
+- [ ] **Step 1: Тесты** (FAIL):
+  - круговой путь:
+    - `roundtrip_own_archive_keeps_ids` — все виды журналов, вложения, `certainty` с историей,
+      связи;
+    - `foreign_archive_new_ids_and_rewritten_refs` — ссылки `k:`/`i:`/`w:` в теле и `data`,
+      `derived_from`, идея ↔ задача ↔ вопрос;
+    - `foreign_import_same_server_keeps_owner_search` — архив A импортирует B; поиск A (топ-5 и
+      точки Qdrant A) не изменился;
+  - аксиомы:
+    - `import_foreign_axioms_to_theorem_with_revision`;
+    - `import_own_axioms_kept`, `import_axioms_keep_explicit`;
+  - повторы и конфликты:
+    - `reimport_same_archive_only_skipped`;
+    - `import_on_conflict_skip_and_revision`;
+    - `note_id_wins_over_path`, `note_path_taken_conflict`;
+    - `import_dry_run_writes_nothing`;
+  - защита архива:
+    - `import_rejects_traversal_abs_symlink`, `import_rejects_zip_bomb`;
+    - `import_body_over_limit_413_and_part_removed`, `import_aborted_upload_part_removed`;
+  - содержимое:
+    - `import_drops_claims`, `import_orphan_proposal_obsolete`;
+    - `import_report_with_images_keeps_immutability`;
+    - `import_links_outside_skipped_reported`;
+    - `import_secrets_detected_warning`;
+    - `member_cannot_import`;
+  - CLI: `cli_import_folder_md` — каталог без описи: архив чужой, новые id, `Demote`.
+- [ ] **Step 2: Реализация** по §12б.5. Импорт идёт служебной операцией `system` (ТЗ §6.3, с
+  изменением про аксиомы) с исходной атрибуцией из `_history`.
+- [ ] **Step 3: Проверка.**
+  - `cargo test -p zam-store $T import`;
+  - `cargo test -p zam-server --test transfer_import $T`;
+  - `$env:ZAM_REQUIRE_ML=1; cargo test -p zam-server --test transfer_import $T
+    foreign_import_same_server`;
+  - `cargo test -p zam-cli --test transfer $T import`.
+
+  Всё — PASS.
+- [ ] **Step 4: Commit** `feat(transfer): импорт пространства`.
 
 ### Task 18c: Инструкция и проверка переезда Windows → Linux (§12б.1, §12б.6)
 
 **Files.** Create: `xtask/src/transfer_check.rs` (регистрация в `xtask/src/main.rs`). Modify:
-`deploy/README-install.md` — раздел «Перенос на другую машину»; `crates/zam-server/tests/backup.rs` —
-тест привязок; `eval/README.md` — ссылка.
+`deploy/README-install.md` — раздел «Перенос на другую машину»; `crates/zam-server/tests/backup.rs`
+— тест привязок.
 
 **Interfaces — Produces:**
 ```text
 cargo xtask transfer-check seed   --server <url> --token <T> --out .tmp/m6/task18c/expect.json
     # корпус: заметки, PDF и DOCX, секрет Vault, идеи, отчёт с картинкой, карта кода (zam code sync
-    # на фикстуре-репозитории); в expect.json — id, топ-5 на 10 запросах, sha вложений, имя секрета
+    # на фикстуре-репозитории); в expect.json — id, топ-5 на 10 запросах, sha вложений, имя секрета,
+    # model_id и meta.chunker
 cargo xtask transfer-check verify --server <url> --token <T> --expect expect.json [--no-key]
-    # то же по HTTP; --no-key — Vault отвечает понятной ошибкой, остальное зелёное
 cargo xtask transfer-check bindings --data-dir <D> --old-path "<старый data_dir>" --old-machine "<имя>"
     # все TEXT-ячейки всех баз, кроме столбцов machine, не содержат old-path и old-machine
 ```
-Тест `restore_has_no_machine_bindings` (в `tests/backup.rs`) — тот же разбор `bindings` на копии,
-восстановленной в другой каталог.
 
-- [ ] **Step 1: Тест** (FAIL) `restore_has_no_machine_bindings`; `cargo test -p zam-server --test
+- [ ] **Step 1: Тест** (FAIL) `restore_has_no_machine_bindings`: `cargo test -p zam-server --test
   backup $T bindings`.
-- [ ] **Step 2: `transfer-check`** и раздел инструкции — шаги §12б.6 дословными командами для
-  Windows (PowerShell) и Linux (bash), предупреждение о мастер-ключе, путь через `export/import`.
+- [ ] **Step 2: `transfer-check` и раздел инструкции.**
+  - Шаги §12б.6 — дословными командами для Windows (PowerShell) и Linux (bash), в порядке: модель и
+    Qdrant **до** `restore`, затем `serve` пересобирает индекс из кэша.
+  - Предупреждения:
+    - мастер-ключ хранится отдельно;
+    - при другой модели или нарезке векторы считаются заново, а на 2 ядрах это долго.
+  - Отдельно — путь через `export/import`.
+
   Тест — PASS.
 - [ ] **Step 3: Переезд на стенде.**
   - **Windows 11:**
-    - release-комплект cpu;
+    - release-комплект cpu (та же модель int8, что на стенде);
     - `seed`;
     - `zam-server backup` при работающем сервере, параллельно `zam write` в цикле.
-  - **Перенос** копии и `master.key` на стенд Linux (Debian 13, 2 ядра / 2 ГБ, доступ — как в
-    памяти «тестовый стенд»).
+  - **Перенос** копии и `master.key` на стенд Linux (Debian 13, 2 ядра / 2 ГБ).
   - **На стенде:**
-    - комплект Linux x64 cpu — артефакт CI сборки ветки;
-    - `zam-server restore`, затем `serve`;
-    - `transfer-check verify`;
+    - комплект Linux x64 cpu — артефакт CI ветки;
+    - `models fetch`, `qdrant fetch`;
+    - `restore`, затем `serve`;
+    - `verify`;
     - `bindings`;
     - повтор без ключа (`--no-key`).
-  - Шаги — дословно по `deploy/README-install.md`. Числа (размер копии, время `backup`,
-    `restore`, `reindex`) и лог — `.tmp/m6/task18c/`, итог — в журнал.
+  - Шаги — дословно по `deploy/README-install.md`. Числа и лог — в `.tmp/m6/task18c/`. **§17 п.
+    24 подтверждается записью в журнале этапа** (журнал стенда).
 - [ ] **Step 4: Commit** `docs(deploy): перенос на другую машину; test: проверка переезда`.
 
 ### Task 13a: Блок v7 и протокол (§13)
@@ -1606,10 +1697,15 @@ cargo xtask transfer-check bindings --data-dir <D> --old-path "<старый dat
 20. **Бэкап — модуль `zam-server/src/backup/`**, а не `zam-store`: ему нужны конфиг (`data_dir`,
     `[vault]`, `[backup]`) и `reindex`. В хранилище — только `vacuum_into` и `integrity_ok`.
 21. **Импорт — пачками по 200 элементов в транзакции.** Архив проверяется целиком до первой
-    записи, а повтор того же архива идемпотентен (пропуски по id и ревизии). Одна транзакция на
+    записи, а повтор того же архива идемпотентен: пропуск по `imported_from {source_id,
+    content_hash}`, а не по ревизии, которую меняет системная ревизия импорта. Одна транзакция на
     100 000 файлов надолго заблокировала бы писателей базы.
 22. **Проверка переезда — `cargo xtask transfer-check` по HTTP** (`seed`, `verify`, `bindings`).
     Её можно запустить на любой ОС; комплект Linux — артефакт CI ветки.
+24. **Свой или чужой архив** — по `source_user_id` описи. Для чужого архива — новые id и
+    `remap_ids`: коллекция Qdrant общая, а id точки — UUIDv5 от `chunk_id`.
+25. **`restore` не пересчитывает векторы**, а ставит `.zam-reindex`; пересборка из кэша — на
+    первом `serve`, после установки модели и Qdrant.
 23. **В M6 из переноса** — CLI, REST, автокопии, предупреждение `no_recent_backup` и ссылка
     «Экспорт (.zip)». Страница бэкапа и импорт в WebUI — M7: переезд выполняется командами, а
     интерфейс не меняет проверяемость.
@@ -1652,7 +1748,7 @@ cargo xtask transfer-check bindings --data-dir <D> --old-path "<старый dat
 | §14 конфигурация | 5, 7a, 7b, 8a, 9, 10, 11, 12, 14, 17b, 17c |
 | §16 15 долги M5.5/M5.6, упаковка | 15a, 15b, 15c |
 | §16 16 долги M5.7 | 16 (и 7a, 9) |
-| §12б перенос памяти, §17 п. 22–24 | 18a, 18b, 18c |
+| §12б перенос памяти, §17 п. 22–24 | 18a, 18b1, 18b2, 18c |
 | §17 п. 1–21 | 13b (приёмка); по пунктам — задачи выше |
 
 Проверено:
