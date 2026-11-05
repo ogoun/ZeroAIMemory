@@ -93,7 +93,17 @@ pub enum Timeouts {
     /// Хуки агента (§10.3): весь запрос, включая чтение ответа, — не дольше срока
     /// (бюджет хука минус 30 мс).
     Deadline(Duration),
+    /// `zam mcp`: как `Transfer`, но ответ ждётся до [`MCP_RECV_RESPONSE`] — сервер (`json_response`)
+    /// отдаёт заголовки только после конца инструмента.
+    Mcp,
 }
+
+/// Ожидание ответа `POST /mcp` (ревью задачи 3, m1). Сервер синхронно ждёт инструмент, а
+/// своего предела на запрос у него нет; самые долгие пути — разбор вложения рабочим процессом
+/// (`docs.timeout_ms`, 60 с по умолчанию, в очереди из `docs.workers` = 2), реранк на CPU и
+/// карта кода. 10 мин покрывают несколько таких сроков подряд при умолчаниях; дольше — пусть
+/// решает тайм-аут инструмента самого агента.
+pub const MCP_RECV_RESPONSE: Duration = Duration::from_secs(10 * 60);
 
 pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
     let mut b = ureq::Agent::config_builder()
@@ -109,6 +119,11 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
             .timeout_send_request(Some(Duration::from_secs(30)))
             .timeout_send_body(Some(Duration::from_secs(30 * 60)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_recv_body(Some(Duration::from_secs(5 * 60))),
+        Timeouts::Mcp => b
+            .timeout_send_request(Some(Duration::from_secs(30)))
+            .timeout_send_body(Some(Duration::from_secs(30 * 60)))
+            .timeout_recv_response(Some(MCP_RECV_RESPONSE))
             .timeout_recv_body(Some(Duration::from_secs(5 * 60))),
         Timeouts::Deadline(d) => b
             .timeout_resolve(Some(d))
@@ -182,6 +197,11 @@ impl Client {
             solution,
             session: None,
         }
+    }
+
+    /// Сменить профиль таймаутов (`zam mcp` — [`Timeouts::Mcp`]).
+    pub fn set_timeouts(&mut self, t: Timeouts) {
+        self.agent = agent(&self.base, t);
     }
 
     /// Сессия агента для `X-Zam-Session` (запись в память учитывается в её `memory_writes`).
@@ -455,6 +475,24 @@ pub fn into_reader(resp: Response<Body>) -> impl Read {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// m1: `zam mcp` ждёт ответа инструмента до 10 мин, команды заметок — по-прежнему 60 с.
+    #[test]
+    fn mcp_profile_waits_long_for_response() {
+        let t = |p| agent("http://127.0.0.1:1", p).config().timeouts();
+        assert_eq!(t(Timeouts::Mcp).recv_response, Some(MCP_RECV_RESPONSE));
+        assert!(MCP_RECV_RESPONSE >= Duration::from_secs(10 * 60));
+        assert_eq!(
+            t(Timeouts::Transfer).recv_response,
+            Some(Duration::from_secs(60))
+        );
+        let mut c = Client::new("http://127.0.0.1:1", "t", None);
+        c.set_timeouts(Timeouts::Mcp);
+        assert_eq!(
+            c.agent.config().timeouts().recv_response,
+            Some(MCP_RECV_RESPONSE)
+        );
+    }
 
     #[test]
     fn loopback_hosts_bypass_proxy() {

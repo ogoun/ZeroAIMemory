@@ -560,6 +560,15 @@ pub fn run(o: Opts) -> Result<(), CliError> {
              сессию агента он берёт из привязки хука session-start. Перезапустите агента."
         );
     }
+    // хуки и `zam mcp` агент запускает по имени `zam` (абсолютный путь в файлы проекта не
+    // пишется: они бывают общими для машин) — без него в PATH ни то, ни другое не заработает
+    let uses_zam = agent_ok && ((!o.no_mcp && claude) || !o.no_hooks);
+    if uses_zam && !in_path(std::env::var_os("PATH").as_deref()) {
+        eprintln!(
+            "предупреждение: zam не найден в PATH — агент не запустит хуки и zam mcp \
+             (.mcp.json). Добавьте каталог zam в PATH и перезапустите агента."
+        );
+    }
     if !o.no_mcp && codex {
         println!(
             "MCP для Codex: [mcp_servers.zeroaimemory] (command = \"zam\", args = [\"mcp\"]) в \
@@ -573,4 +582,31 @@ pub fn run(o: Opts) -> Result<(), CliError> {
 /// Строка TOML в кавычках.
 fn toml_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Есть ли исполняемый `zam` в каталогах `path` (значение `PATH`); на Windows — `zam.exe`.
+fn in_path(path: Option<&std::ffi::OsStr>) -> bool {
+    let name = if cfg!(windows) { "zam.exe" } else { "zam" };
+    path.is_some_and(|p| std::env::split_paths(p).any(|d| d.join(name).is_file()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_path;
+
+    #[test]
+    fn zam_in_path_lookup() {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/zam-cli-init-path");
+        let _ = std::fs::remove_dir_all(&d);
+        let (with, without) = (d.join("with"), d.join("without"));
+        std::fs::create_dir_all(&with).unwrap();
+        std::fs::create_dir_all(&without).unwrap();
+        let name = if cfg!(windows) { "zam.exe" } else { "zam" };
+        std::fs::write(with.join(name), b"").unwrap();
+        let joined = |dirs: &[&std::path::Path]| std::env::join_paths(dirs).unwrap();
+        assert!(in_path(Some(&joined(&[&without, &with]))));
+        assert!(!in_path(Some(&joined(&[&without]))));
+        assert!(!in_path(None));
+    }
 }

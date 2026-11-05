@@ -5,10 +5,11 @@
 //!   (из `solution.toml`) и `X-Zam-Machine`; `Origin` не шлётся.
 //! - **Сессия** (M6 §7.1, [`SessionSource`]): `X-Zam-Session` — по порядку `ZAM_SESSION_ID`,
 //!   затем файл привязки хука `session-start` по своей цепочке предков
-//!   ([`hook::binding::find_binding`]; цепочка — один раз при запуске; пока привязки нет — поиск
-//!   не чаще раза в [`BINDING_MISS_RETRY`], найдена — раз в [`BINDING_REFRESH`] сверка времени
-//!   изменения файла). Переменной с id локальной сессии у Claude Code нет (решение контролёра,
-//!   ревью задачи 3, I4), `CLAUDE_CODE_SESSION_ID` не читается. Нет ни одного источника — без
+//!   ([`hook::binding::find_binding`]; цепочка — один раз при запуске, не прочиталась —
+//!   снова при поиске; поиск — не чаще раза в [`BINDING_RECHECK`], так что новая сессия после
+//!   `/clear` приходит со следующим вызовом). `CLAUDE_CODE_SESSION_ID` не читается (ревью задачи 3, I4): по
+//!   журналу изменений Claude Code 2.1.132 она есть у подпроцессов Bash, но не у
+//!   MCP-подпроцесса, и в справочнике переменных её нет. Нет ни одного источника — без
 //!   заголовка, сессию выбирает сервер неявно (R13), без учёта выданного в сессии. `ZAM_SESSION` и `session.json` хуков, как и раньше, на MCP
 //!   не влияют (fix round 1, I-4): `session.json` общий у параллельных агентов проекта.
 //! - Ответ `application/json` пишется в stdout одной строкой; `text/event-stream` (SSE)
@@ -33,16 +34,17 @@ use serde_json::{Value, json};
 use super::{Ctx, hook};
 use crate::client::{CliError, Client};
 
-/// Как часто `zam mcp` проверяет время изменения найденного файла привязки (новая сессия
-/// после `/clear`, `resume`: `session-start` перезаписывает файл).
-pub const BINDING_REFRESH: Duration = Duration::from_secs(30);
-/// Как часто `zam mcp` ищет привязку, пока её нет (хук `session-start` мог ещё не отработать).
-pub const BINDING_MISS_RETRY: Duration = Duration::from_secs(1);
+/// Как часто `zam mcp` заново ищет привязку (ревью задачи 3, m2): после `/clear` и `resume`
+/// `session-start` перезаписывает файлы, и новая сессия должна прийти уже со следующим
+/// вызовом. Поиск — до [`hook::binding::BINDING_ANCESTORS_MAX`] файлов, не чаще раза в секунду.
+pub const BINDING_RECHECK: Duration = Duration::from_secs(1);
 
-/// Состояние привязки: найденный файл и время последней проверки.
+/// Состояние привязки: цепочка предков, найденная сессия и время последнего поиска.
 #[derive(Default)]
 struct Bound {
-    found: Option<hook::binding::Found>,
+    /// Цепочка — один раз при запуске (I2); не прочиталась — снова при поиске (m4).
+    chain: Vec<hook::procs::Proc>,
+    session: Option<String>,
     checked: Option<Instant>,
 }
 
@@ -52,8 +54,6 @@ struct SessionSource {
     fixed: Option<String>,
     /// Корень проекта: там `.zeroaimemory/cache/agent-<pid>.json`.
     root: PathBuf,
-    /// Цепочка предков — один раз при запуске (ревью задачи 3, I2).
-    chain: Vec<hook::procs::Proc>,
     bound: Mutex<Bound>,
 }
 
@@ -69,38 +69,31 @@ impl SessionSource {
         SessionSource {
             fixed,
             root,
-            chain,
-            bound: Mutex::new(Bound::default()),
+            bound: Mutex::new(Bound {
+                chain,
+                ..Bound::default()
+            }),
         }
     }
 
-    /// Сессия запроса в момент `now`: без привязки — поиск не чаще [`BINDING_MISS_RETRY`];
-    /// с привязкой — раз в [`BINDING_REFRESH`] сверка времени изменения её файла, изменился
-    /// или пропал — поиск заново.
+    /// Сессия запроса в момент `now`: поиск привязки не чаще [`BINDING_RECHECK`], между
+    /// поисками — прежний результат.
     fn current_at(&self, now: Instant) -> Option<String> {
         if let Some(s) = &self.fixed {
             return Some(s.clone());
         }
         let mut b = self.bound.lock().unwrap_or_else(|e| e.into_inner());
-        let elapsed = b.checked.map(|t| now.saturating_duration_since(t));
-        let due = match &b.found {
-            None => elapsed.is_none_or(|d| d >= BINDING_MISS_RETRY),
-            Some(f) => {
-                elapsed.is_none_or(|d| d >= BINDING_REFRESH) && {
-                    let mtime = std::fs::metadata(&f.path).and_then(|m| m.modified()).ok();
-                    mtime != Some(f.mtime)
-                }
-            }
-        };
-        if !due && b.found.is_some() && elapsed.is_none_or(|d| d >= BINDING_REFRESH) {
-            // файл не менялся — следующая сверка через BINDING_REFRESH
-            b.checked = Some(now);
-        }
+        let due = b
+            .checked
+            .is_none_or(|t| now.saturating_duration_since(t) >= BINDING_RECHECK);
         if due {
-            b.found = hook::binding::find_binding(&self.root, &self.chain);
+            if b.chain.is_empty() {
+                b.chain = hook::binding::chain();
+            }
+            b.session = hook::binding::find_binding(&self.root, &b.chain).map(|f| f.session);
             b.checked = Some(now);
         }
-        b.found.as_ref().map(|f| f.session.clone())
+        b.session.clone()
     }
 
     fn current(&self) -> Option<String> {
@@ -325,6 +318,8 @@ pub fn run(ctx: Ctx) -> Result<(), CliError> {
     let mut client = ctx.client;
     // не `session.json` хуков (I-4): сессия — из [`SessionSource`] (M6 §7.1)
     client.set_session(None);
+    // долгие инструменты (вложения, реранк на CPU): ответ ждётся до 10 мин (m1)
+    client.set_timeouts(crate::client::Timeouts::Mcp);
     let client = Arc::new(client);
     let state = Arc::new(Mutex::new(Session::default()));
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -460,7 +455,7 @@ mod tests {
         hook::binding::write_binding(&root, "bound").unwrap();
         let s = SessionSource::new(env(&[("ZAM_SESSION_ID", "a")]), root.clone());
         assert_eq!(s.current().as_deref(), Some("a"));
-        // CLAUDE_CODE_SESSION_ID не документирован (I4) — не читается
+        // CLAUDE_CODE_SESSION_ID MCP-подпроцессу не передаётся (I4) — не читается
         let s = SessionSource::new(
             env(&[("ZAM_SESSION_ID", " "), ("CLAUDE_CODE_SESSION_ID", "b")]),
             root,
@@ -468,41 +463,36 @@ mod tests {
         assert_eq!(s.current().as_deref(), Some("bound"));
     }
 
-    /// I2: без привязки — поиск не чаще раза в секунду; с привязкой — раз в 30 с сверка
-    /// времени изменения файла (после `/clear` хук перезаписывает файл).
+    /// I2, m2, m4: поиск привязки не чаще раза в секунду; новая сессия после `/clear` — со
+    /// следующей проверкой; цепочка, не прочитанная при запуске, читается снова.
     #[test]
     fn binding_refresh_schedule() {
         use hook::procs::{Proc, set_fake_ancestors};
         let root = tmp_root("refresh");
+        // при запуске цепочка не прочиталась
+        set_fake_ancestors(Vec::new());
+        let s = SessionSource::new(|_| None, root.clone());
         set_fake_ancestors(vec![Proc {
             pid: 901,
             name: "claude".into(),
         }]);
-        let s = SessionSource::new(|_| None, root.clone());
         let t0 = Instant::now();
         assert_eq!(s.current_at(t0), None);
         hook::binding::write_binding(&root, "s1").unwrap();
         assert_eq!(s.current_at(t0 + Duration::from_millis(500)), None);
-        let t1 = t0 + BINDING_MISS_RETRY;
+        let t1 = t0 + BINDING_RECHECK;
         assert_eq!(s.current_at(t1).as_deref(), Some("s1"));
-        // `/clear`: файл перезаписан новой сессией (время изменения — другое)
+        // `/clear`: файл перезаписан новой сессией — со следующей проверкой
         hook::binding::write_binding(&root, "s2").unwrap();
-        let path = hook::binding::binding_path(&root, 901);
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
-            .unwrap();
         assert_eq!(
-            s.current_at(t1 + Duration::from_secs(10)).as_deref(),
+            s.current_at(t1 + Duration::from_millis(500)).as_deref(),
             Some("s1")
         );
-        let t2 = t1 + BINDING_REFRESH;
+        let t2 = t1 + BINDING_RECHECK;
         assert_eq!(s.current_at(t2).as_deref(), Some("s2"));
-        // файл пропал — поиск заново, без привязки
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(s.current_at(t2 + BINDING_REFRESH), None);
+        // файл пропал — без привязки
+        std::fs::remove_file(hook::binding::binding_path(&root, 901)).unwrap();
+        assert_eq!(s.current_at(t2 + BINDING_RECHECK), None);
     }
 
     #[test]

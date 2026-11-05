@@ -264,8 +264,8 @@ pub fn codex_hooks() -> Value {
 
 /// Фрагмент `.mcp.json` (Claude Code): stdio-сервер `zam mcp` (M6 §7.1, ревью задачи 3, I4).
 /// Подпроцесс агента — общий предок с хуками, поэтому `zam mcp` находит привязку к сессии,
-/// которую пишет `session-start`; у HTTP-транспорта сессии нет (переменной с id локальной
-/// сессии Claude Code не даёт). Адрес, токен (`~/.zeroaimemory/config.toml` или `ZAM_TOKEN`),
+/// которую пишет `session-start`; у HTTP-транспорта сессии нет (MCP-процессу и в заголовки
+/// Claude Code id сессии не передаёт). Адрес, токен (`~/.zeroaimemory/config.toml` или `ZAM_TOKEN`),
 /// решение (`solution.toml`) и машину `zam` берёт сам, как остальные команды: в файле нет ни
 /// токена, ни имени машины — `.mcp.json` бывает общим для машин в репозитории.
 pub fn mcp_json() -> Value {

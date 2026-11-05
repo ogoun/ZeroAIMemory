@@ -210,8 +210,8 @@ fn mcp_uses_binding_without_env() {
     assert_eq!(mcp_sessions(&p, &[]), [s.clone(), s]);
 }
 
-/// `ZAM_SESSION_ID` сильнее файла привязки; `CLAUDE_CODE_SESSION_ID` не читается (у Claude Code
-/// такой переменной для локальной сессии нет — ревью задачи 3, I4).
+/// `ZAM_SESSION_ID` сильнее файла привязки; `CLAUDE_CODE_SESSION_ID` не читается: MCP-подпроцессу
+/// Claude Code её не передаёт (ревью задачи 3, I4).
 #[test]
 fn env_session_beats_binding() {
     let _g = serial();

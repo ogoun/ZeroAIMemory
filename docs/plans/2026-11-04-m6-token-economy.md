@@ -531,8 +531,8 @@ pub struct RequestSession { pub touch: SessionTouch, pub db: Db, pub explicit: b
 //   search/read внутри MCP (via_mcp) событий search/read не пишут — двойного счёта нет
 // GET /sessions/unattributed?days=N → {items: [{day, event, calls, tokens}]}
 ```
-`zam mcp` ставит `X-Zam-Session` по порядку: `ZAM_SESSION_ID` → `CLAUDE_CODE_SESSION_ID` →
-`read_binding` (при `initialize` и раз в 30 с). Прогоны ТС-2 из xtask задают `ZAM_SESSION_ID`.
+`zam mcp` ставит `X-Zam-Session` по порядку: `ZAM_SESSION_ID` → `read_binding` (поиск не чаще
+раза в 1 с; `CLAUDE_CODE_SESSION_ID` снят правками ревью задачи 3, I4). Прогоны ТС-2 из xtask задают `ZAM_SESSION_ID`.
 
 - [ ] **Step 1: Тесты** (FAIL):
   - CLI (`tests/mcp_bind.rs`): `binding_written_on_session_start_clear_resume` (после `resume` —

@@ -6,7 +6,7 @@
 //! предка до первого процесса агента включительно ([`procs::AGENT_PROC_NAMES`], не глубже
 //! [`BINDING_ANCESTORS_MAX`]): у Codex хук и MCP могут идти через разные промежуточные
 //! оболочки (`sh -c`), а общий у них — сам агент. `zam mcp` идёт по своей цепочке так же и
-//! берёт первый подходящий файл. Несколько агентов в одном проекте различаются pid.
+//! берёт самый свежий подходящий файл. Несколько агентов в одном проекте различаются pid.
 //!
 //! **Переиспользование pid** (ревью задачи 3, I1). Файлы на эфемерных оболочках остаются
 //! после их выхода, а Windows быстро отдаёт pid новым процессам. Поэтому в файле —
@@ -86,32 +86,45 @@ pub fn write_binding(root: &Path, session: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Первая подходящая привязка по цепочке `chain` (см. модуль): файл не старше
-/// [`SESSION_TTL`], `agent_pid` из этой же цепочки, корректный id (непустой, до 128 печатных
-/// символов).
+/// Самая свежая (по времени изменения файла; при равенстве — ближняя) подходящая привязка по
+/// цепочке `chain` (см. модуль): файл не старше [`SESSION_TTL`], `agent_pid` из этой же
+/// цепочки, корректный id (непустой, до 128 печатных символов). Свежая, а не ближняя (ревью
+/// задачи 3, m3): файл промежуточной оболочки мог остаться от прежней сессии того же агента.
 pub fn find_binding(root: &Path, chain: &[Proc]) -> Option<Found> {
-    chain.iter().find_map(|p| {
-        let path = binding_path(root, p.pid);
-        let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
-        // время в будущем (часы сдвинуты) — как свежий файл
-        let age = SystemTime::now()
-            .duration_since(mtime)
-            .unwrap_or(Duration::ZERO);
-        if age > SESSION_TTL {
-            return None;
+    let mut best: Option<Found> = None;
+    for p in chain {
+        let Some(f) = one(root, chain, p.pid) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|b| f.mtime > b.mtime) {
+            best = Some(f);
         }
-        let b: Binding = cache::read_json_file(&path).ok()??;
-        if !chain.iter().any(|c| c.pid == b.agent_pid) {
-            return None;
+    }
+    best
+}
+
+/// Привязка из файла процесса `pid`, если она подходит цепочке `chain`.
+fn one(root: &Path, chain: &[Proc], pid: u32) -> Option<Found> {
+    let path = binding_path(root, pid);
+    let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
+    // время в будущем (часы сдвинуты) — как свежий файл
+    let age = SystemTime::now()
+        .duration_since(mtime)
+        .unwrap_or(Duration::ZERO);
+    if age > SESSION_TTL {
+        return None;
+    }
+    let b: Binding = cache::read_json_file(&path).ok()??;
+    if !chain.iter().any(|c| c.pid == b.agent_pid) {
+        return None;
+    }
+    let id = b.session_id.trim();
+    (!id.is_empty() && id.chars().count() <= 128 && !id.chars().any(char::is_control)).then(|| {
+        Found {
+            session: id.to_string(),
+            path,
+            mtime,
         }
-        let id = b.session_id.trim();
-        (!id.is_empty() && id.chars().count() <= 128 && !id.chars().any(char::is_control)).then(
-            || Found {
-                session: id.to_string(),
-                path,
-                mtime,
-            },
-        )
     })
 }
 
@@ -218,6 +231,33 @@ mod tests {
         assert_eq!(read_binding(&root), None);
         put(&root, 202, "mine", 202);
         assert_eq!(read_binding(&root).as_deref(), Some("mine"));
+    }
+
+    /// m3: из подходящих файлов цепочки берётся самый свежий: старая привязка на оболочке
+    /// (прежняя сессия) не перекрывает новую на агенте.
+    #[test]
+    fn freshest_binding_wins() {
+        let root = tmp("freshest");
+        put(&root, 111, "old", 222);
+        put(&root, 222, "new", 222);
+        let older = SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(binding_path(&root, 111))
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        set_fake_ancestors(vec![p(111, "bash"), p(222, "codex")]);
+        assert_eq!(read_binding(&root).as_deref(), Some("new"));
+        // ближний свежее — он
+        let newer = SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(binding_path(&root, 111))
+            .unwrap()
+            .set_modified(newer)
+            .unwrap();
+        assert_eq!(read_binding(&root).as_deref(), Some("old"));
     }
 
     /// Файл старше `SESSION_TTL` не читается.
