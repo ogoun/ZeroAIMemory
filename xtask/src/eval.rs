@@ -29,6 +29,10 @@
 //! Эталон подсказок-идей M5.7 (M6, задача 1a2): `--idea-hints eval/idea-hints.toml --out <json>`
 //! — топ-5 подсказок-идей к `prompt` на идеях корпуса ТС-2 ([`hints::ideas`]).
 //!
+//! Набор ТС-2 «сессия» (M6, задача 4): `--sessions --split dev|holdout [--profile] [--ideas on|off]
+//! [--base B4|B5.6|B5.7]` — сессии `eval/sessions.toml` через `zam hook` и `zam mcp`
+//! ([`sessions`]).
+//!
 //! Eval M4.5 (задача 15): `--glossary` — словарь RU↔EN `eval/glossary.toml`, канал `alias` и
 //! его вес, основной набор со словарём и связями `contradicts` ([`glossary`]).
 
@@ -47,6 +51,7 @@ pub mod metrics;
 pub mod nuggets;
 pub mod report;
 pub mod run;
+pub mod sessions;
 pub mod sessions_corpus;
 pub mod split;
 pub mod tokens;
@@ -152,15 +157,35 @@ pub struct EvalArgs {
     /// Транспорт агента --tokens: mcp — ТС-1 M6 через POST /mcp (без флага — REST M4)
     #[arg(long, value_enum, requires = "tokens")]
     pub via: Option<Via>,
-    /// Часть набора замера M6: dev (подбор, сетки) | holdout (приёмка; без --grid)
-    #[arg(long, value_enum, requires = "via")]
+    /// Набор ТС-2 «сессия» (M6, eval/sessions.toml): хуки `zam hook`, MCP — `zam mcp`
+    #[arg(
+        long,
+        conflicts_with_all = ["tokens", "hints", "check", "glossary", "docs", "quality_gate", "idea_hints"]
+    )]
+    pub sessions: bool,
+    /// --sessions: только сессии профиля
+    #[arg(long, value_enum, requires = "sessions")]
+    pub profile: Option<sessions::Profile>,
+    /// --sessions: идеи корпуса и `ideas.proactive` (по умолчанию on; у сервера без идей — нет)
+    #[arg(long, value_enum, requires = "sessions")]
+    pub ideas: Option<sessions::Toggle>,
+    /// --sessions: база — бинарники тега target/tags/<тег>/release (вместо --server-bin/--zam-bin)
+    #[arg(long, value_enum, requires = "sessions", conflicts_with_all = ["server_bin", "cli_bin"])]
+    pub base: Option<sessions::Base>,
+    /// --sessions: `zam mcp` без ZAM_SESSION_ID и файла привязки (неявный путь R13) и у M6
+    #[arg(long, requires = "sessions")]
+    pub implicit_mcp: bool,
+    /// Часть набора замера M6 (--via mcp, --sessions): dev (подбор, сетки) | holdout (приёмка;
+    /// без --grid)
+    #[arg(long, value_enum)]
     pub split: Option<split::Part>,
     /// Файл сценариев вместо eval/scenarios.toml (замок отпечатков — nuggets.lock рядом); с
     /// --check — проверка только набора ТС-1
     #[arg(long, value_name = "FILE")]
     pub scenarios: Option<PathBuf>,
-    /// --via mcp без прогона: сохранённое плечо (JSON) сравнивается с каждым --compare
-    #[arg(long, value_name = "FILE", requires = "via")]
+    /// --via mcp и --sessions без прогона: сохранённое плечо (JSON) сравнивается с каждым
+    /// --compare
+    #[arg(long, value_name = "FILE")]
     pub arm: Option<PathBuf>,
     /// Гейт без справочного прогона fp16 на CUDA (GPU занят): вердикт — по int8 и fp32 на CPU
     #[arg(long, requires = "quality_gate")]
@@ -379,6 +404,12 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     if a.tokens && a.via == Some(Via::Mcp) {
         return tokens::mcp::main(&a, &p);
     }
+    if a.sessions {
+        return sessions::main(&a, &p);
+    }
+    if a.split.is_some() || a.arm.is_some() {
+        bail!("--split и --arm — только у --tokens --via mcp и --sessions");
+    }
     if a.tokens && a.grid.is_some() {
         bail!("--grid с --tokens — только у замера M6 (--via mcp)");
     }
@@ -450,6 +481,18 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
                 is.long,
                 is.states.len()
             );
+            let set = sessions::load_set(&p.repo.join("eval").join("sessions.toml"))?;
+            let ts2 = sessions::validate_set(&set, &sc)?;
+            println!(
+                "набор ТС-2 M6: сессий {} (стандартных {}, тяжёлых {}), событий {:?}, prompt с \
+                 подсказкой-идеей {}, нагетов {}",
+                ts2.sessions,
+                ts2.standard,
+                ts2.heavy,
+                ts2.events,
+                ts2.prompts_with_idea,
+                ts2.nuggets
+            );
         }
         println!("EVAL-CHECK OK");
         return Ok(());
@@ -475,4 +518,13 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
         bail!("укажите --mode");
     }
     run::run_modes(&a, &p, &corpus, &queries)
+}
+
+/// Корень репозитория для тестов модулей eval.
+#[cfg(test)]
+pub(crate) fn tests_repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("корень репозитория")
+        .to_path_buf()
 }

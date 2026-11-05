@@ -355,7 +355,7 @@ fn utc_date_plus(days: u32) -> Result<String> {
 }
 
 /// `PATCH /entries/{id}` с `If-Match` текущей ревизии.
-fn patch_entry(s: &Session, id: &str, body: &Value) -> Result<(u16, Value)> {
+pub(crate) fn patch_entry(s: &Session, id: &str, body: &Value) -> Result<(u16, Value)> {
     let path = format!("/api/v1/entries/{id}");
     let (st, cur) = api_with(
         &s.base,
@@ -487,7 +487,7 @@ pub fn load_ideas(s: &Session, ideas: &[Idea]) -> Result<(BTreeMap<String, Strin
 }
 
 /// Горизонт идей `ids` — сегодня (UTC), прямым SQL по базе пользователя (сервер остановлен).
-fn set_horizon_today(data: &Path, ids: &[String]) -> Result<()> {
+pub(crate) fn set_horizon_today(data: &Path, ids: &[String]) -> Result<()> {
     let db = crate::eval::gate::user_db(data)?;
     let c = rusqlite::Connection::open(&db).with_context(|| db.display().to_string())?;
     let today = utc_date_plus(0)?;

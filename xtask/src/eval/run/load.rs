@@ -14,7 +14,7 @@ use crate::smoke::api;
 impl Session {
     /// Создаёт, замещает и отзывает insight набора (порядок файла: замещаемая запись
     /// определена раньше); проверяет итоговый `certainty`.
-    pub(super) fn load_insights(&mut self, insights: &[Insight]) -> Result<()> {
+    pub(crate) fn load_insights(&mut self, insights: &[Insight]) -> Result<()> {
         if insights.is_empty() {
             return Ok(());
         }

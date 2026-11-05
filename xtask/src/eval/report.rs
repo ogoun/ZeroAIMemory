@@ -574,3 +574,190 @@ pub fn comparison_md(c: &super::tokens::mcp::Comparison) -> String {
     }
     s
 }
+
+/// `found/total (0.750)`.
+fn tally(t: &super::sessions::Tally) -> String {
+    match t.share() {
+        Some(x) => format!("{}/{} ({x:.3})", t.found, t.total),
+        None => "—".into(),
+    }
+}
+
+/// Строки сводки ТС-2 (общие у плеча и сравнения).
+fn sessions_summary_md(s: &mut String, name: &str, x: &super::sessions::SessionsSummary) {
+    let by: Vec<String> = x
+        .tokens_by_label
+        .iter()
+        .map(|(l, n)| format!("{l} {n}"))
+        .collect();
+    let _ = writeln!(
+        s,
+        "- **{name}**: сессий {}, токенов {} ({}); обязательные строки {}; hint_recall общий {}, \
+         (только в ответе события {}), подсказки-идеи {}; нагеты вопросов {}; повторная выдача {}; \
+         дайджест при двух стартах {}",
+        x.sessions,
+        x.tokens_total,
+        by.join(", "),
+        tally(&x.required),
+        tally(&x.hint_recall),
+        tally(&x.hint_recall_strict),
+        tally(&x.idea_hint_recall),
+        tally(&x.nuggets),
+        tally(&x.repeated),
+        tally(&x.digest_match)
+    );
+    let ideas: Vec<String> = x
+        .idea_tokens
+        .iter()
+        .map(|(l, n)| format!("{l} {n}"))
+        .collect();
+    let snap: Vec<String> = x
+        .snapshot_tokens
+        .iter()
+        .map(|(l, n)| format!("{l} {n}"))
+        .collect();
+    let _ = writeln!(
+        s,
+        "  - идеи: {}; снимок сессии: {}",
+        if ideas.is_empty() {
+            "0".into()
+        } else {
+            ideas.join(", ")
+        },
+        if snap.is_empty() {
+            "0".into()
+        } else {
+            snap.join(", ")
+        }
+    );
+    if !x.required_missing.is_empty() {
+        let _ = writeln!(s, "  - нет строк: {}", x.required_missing.join("; "));
+    }
+}
+
+/// Отчёт плеча ТС-2 (спецификация M6 §3.6).
+pub fn sessions_md(r: &super::sessions::SessionsResult) -> String {
+    let i = &r.info;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "# ТС-2 «сессия» — {} ({}, сервер {}, {}, идеи {}, MCP {})\n",
+        i.date,
+        i.split,
+        i.server_version,
+        i.model.as_deref().unwrap_or("fts"),
+        if i.ideas_flag { "on" } else { "off" },
+        i.mcp
+    );
+    let _ = writeln!(s, "- возможности: {:?}", i.feats);
+    let _ = writeln!(
+        s,
+        "- не воспроизводятся у сервера: {:?}; классы строк, которых нет: {:?}; виды \
+         обязательных строк, которых нет: {:?}",
+        i.exclusions.labels, i.exclusions.classes, i.exclusions.required
+    );
+    for n in &i.notes {
+        let _ = writeln!(s, "- {n}");
+    }
+    sessions_summary_md(&mut s, "итог", &r.summary);
+    let _ = writeln!(
+        s,
+        "\n| Сессия | профиль | токенов | обязательные | hint общий | идеи | нагеты | дайджест = |\n\
+         |---|---|---:|---|---|---|---|---|"
+    );
+    for x in &r.sessions {
+        let one = super::sessions::summarize(
+            std::slice::from_ref(x),
+            &super::sessions::own_exclusions(&r.info.feats),
+        );
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            x.id,
+            x.profile,
+            one.tokens_total,
+            tally(&one.required),
+            tally(&one.hint_recall),
+            tally(&one.idea_hint_recall),
+            tally(&one.nuggets),
+            match x.digest_match {
+                Some(true) => "да",
+                Some(false) => "нет",
+                None => "—",
+            }
+        );
+    }
+    let notes: Vec<String> = r
+        .sessions
+        .iter()
+        .flat_map(|x| x.notes.iter().map(move |n| format!("{}: {n}", x.id)))
+        .collect();
+    if !notes.is_empty() {
+        let _ = writeln!(s, "\nПримечания:");
+        for n in notes {
+            let _ = writeln!(s, "- {n}");
+        }
+    }
+    s
+}
+
+/// Сравнение плеч ТС-2 на пересечении событий (§3.3).
+pub fn sessions_comparison_md(c: &super::sessions::SessionsComparison) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "\n## ТС-2: {} ({}) против {} ({}), сессий {}\n",
+        c.arm_name,
+        c.arm_server,
+        c.base_name,
+        c.base_server,
+        c.sessions.len()
+    );
+    let _ = writeln!(
+        s,
+        "- исключено из обоих плеч: события {:?}; классы строк {:?}; обязательные строки {:?}; \
+         ожидания {:?}",
+        c.exclusions.labels, c.exclusions.classes, c.exclusions.required, c.exclusions.expect
+    );
+    let _ = writeln!(s, "\n| Событие | база | плечо | R |\n|---|---:|---:|---|");
+    for l in c.by_label.iter().chain(std::iter::once(&c.total)) {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} |",
+            l.label,
+            l.base,
+            l.arm,
+            l.r.as_ref().map_or("—".into(), est)
+        );
+    }
+    let _ = writeln!(s);
+    sessions_summary_md(&mut s, "база", &c.base_summary);
+    sessions_summary_md(&mut s, "плечо", &c.arm_summary);
+    if let Some(m) = &c.idea_hints_match {
+        let _ = writeln!(s, "- подсказки-идеи prompt совпали с базой: {}", tally(m));
+    }
+    if let Some(p) = c.abs_rel_diff_p95 {
+        let _ = writeln!(
+            s,
+            "- |Δ| / база токенов сессии, 95-й перцентиль: {p:.4}{}",
+            if c.same_server {
+                " — порог шума A/A (плечи одной версии)"
+            } else {
+                ""
+            }
+        );
+    }
+    let _ = writeln!(
+        s,
+        "- бутстреп: {} выборок, зерно {:#x} (парный по сессиям).",
+        c.bootstrap_samples, c.bootstrap_seed
+    );
+    if !c.only_base.is_empty() || !c.only_arm.is_empty() {
+        let _ = writeln!(
+            s,
+            "- вне сравнения: только в базе {:?}, только в плече {:?}.",
+            c.only_base, c.only_arm
+        );
+    }
+    s
+}

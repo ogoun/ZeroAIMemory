@@ -742,16 +742,16 @@ fn recall_budget(device: Option<&str>) -> f64 {
 
 /// Каталог проекта для хуков: `.zeroaimemory/solution.toml` решения набора; свой «дом» без
 /// `~/.zeroaimemory/config.toml` (адрес и токен — `ZAM_URL`, `ZAM_TOKEN`).
-struct Hooks {
-    zam: PathBuf,
-    project: PathBuf,
-    home: PathBuf,
-    base: String,
-    token: String,
+pub(crate) struct Hooks {
+    pub(crate) zam: PathBuf,
+    pub(crate) project: PathBuf,
+    pub(crate) home: PathBuf,
+    pub(crate) base: String,
+    pub(crate) token: String,
 }
 
 impl Hooks {
-    fn prepare(dir: &Path, zam: PathBuf, base: &str, token: &str) -> Result<Hooks> {
+    pub(crate) fn prepare(dir: &Path, zam: PathBuf, base: &str, token: &str) -> Result<Hooks> {
         let project = dir.join("project");
         let home = dir.join("home");
         if project.exists() {
@@ -773,7 +773,7 @@ impl Hooks {
     }
 
     /// `zam hook <cmd>` со входом `stdin`: вывод и время процесса, мс.
-    fn run(&self, cmd: &str, stdin: &Value) -> Result<(String, f64)> {
+    pub(crate) fn run(&self, cmd: &str, stdin: &Value) -> Result<(String, f64)> {
         let mut c = Command::new(&self.zam);
         scrub_zam_env(&mut c, &[]);
         for k in zam_core::AGENT_ENV_VARS {
@@ -849,12 +849,12 @@ impl Hooks {
     }
 
     /// Строки журнала хуков проекта.
-    fn log_lines(&self) -> usize {
+    pub(crate) fn log_lines(&self) -> usize {
         self.log_text().lines().count()
     }
 
     /// Строки журнала после первых `before`.
-    fn new_log(&self, before: usize) -> Vec<String> {
+    pub(crate) fn new_log(&self, before: usize) -> Vec<String> {
         self.log_text()
             .lines()
             .skip(before)
@@ -883,7 +883,7 @@ fn kill_pid(pid: u32) {
 }
 
 /// Текст подсказки хука из вывода (`hookSpecificOutput.additionalContext`).
-fn hook_context(out: &str) -> String {
+pub(crate) fn hook_context(out: &str) -> String {
     serde_json::from_str::<Value>(out.trim())
         .ok()
         .and_then(|v| {
@@ -1030,7 +1030,7 @@ fn prompt_candidates(s: &Session, refs: &RefMap, prompt: &str) -> Result<Vec<Pro
 /// Загрузка заметок Rules набора (`POST /nodes`, пространство `rules`): id → `rule:<key>`.
 /// Пишет администратор через сессию WebUI: агенту запись в Rules по умолчанию запрещена
 /// (`rules.agent_write = false`, §11), человек пишет в свои Rules всегда (решение T12-a).
-fn load_rules(s: &mut Session, rules: &[Rule]) -> Result<()> {
+pub(crate) fn load_rules(s: &mut Session, rules: &[Rule]) -> Result<()> {
     let admin = admin_login(&s.base)?;
     let agent = agent_with(CALL_TIMEOUT);
     for r in rules {

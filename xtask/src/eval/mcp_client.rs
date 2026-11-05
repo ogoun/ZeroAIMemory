@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 /// Предел одного вызова (реранк на CPU, первая загрузка реранкера).
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Версия протокола в `initialize`.
-const PROTOCOL: &str = "2025-06-18";
+pub const PROTOCOL: &str = "2025-06-18";
 const SESSION_ID: &str = "Mcp-Session-Id";
 
 /// Клиент MCP одной сессии агента.
