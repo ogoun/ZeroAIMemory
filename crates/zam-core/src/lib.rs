@@ -70,6 +70,10 @@ pub const AGENT_ENV_VARS: [&str; 6] = [
     "CODEX_THREAD_ID",
 ];
 
+/// Строка `hooks.log`: у хука кончился бюджет до запроса к серверу. Общая для клиента `zam` и
+/// замера ТС-2 (xtask считает такие строки промахами бюджета хука).
+pub const HOOK_BUDGET_SPENT: &str = "бюджет исчерпан до запроса к серверу";
+
 /// Явная сессия `zam mcp` (M6 §7.1): сильнее `CLAUDE_CODE_SESSION_ID` и файла привязки.
 pub const MCP_SESSION_ENV: &str = "ZAM_SESSION_ID";
 

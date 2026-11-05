@@ -637,7 +637,7 @@ fn sessions_summary_md(s: &mut String, name: &str, x: &super::sessions::Sessions
         kv(&x.idea_tokens),
         kv(&x.snapshot_tokens),
         x.rep_noise_p95.map_or(String::new(), |p| format!(
-            "; шум повторов (p95 |Δ|/повтор 0): {p:.4}"
+            "; шум повторов (p95 |Δ|/среднее сессии): {p:.4}"
         )),
         if x.bad_outputs > 0 || x.hook_budget_misses > 0 {
             format!(
@@ -648,6 +648,26 @@ fn sessions_summary_md(s: &mut String, name: &str, x: &super::sessions::Sessions
             String::new()
         }
     );
+    if x.required_by_rep.len() > 1 {
+        let worst = x
+            .required_by_rep
+            .iter()
+            .min_by(|a, b| {
+                let (sa, sb) = (a.1.share().unwrap_or(1.0), b.1.share().unwrap_or(1.0));
+                sa.total_cmp(&sb)
+            })
+            .map(|(r, t)| format!("r{r} {}", tally(t)))
+            .unwrap_or_default();
+        let _ = writeln!(s, "  - обязательные строки, худший повтор: {worst}");
+    }
+    if !x.reps_with_misses.is_empty() {
+        let _ = writeln!(
+            s,
+            "  - повторы с промахом бюджета хука или неразобранным выводом (действительны; блокируют \
+             приёмку 13b): {}",
+            x.reps_with_misses.join(", ")
+        );
+    }
     if !x.required_missing.is_empty() {
         let _ = writeln!(s, "  - нет строк: {}", x.required_missing.join("; "));
     }
@@ -753,8 +773,8 @@ pub fn sessions_comparison_md(c: &super::sessions::SessionsComparison) -> String
         }
         let _ = writeln!(
             s,
-            "\n- Δ (плечо − база, общие элементы, односторонние 95 %): hint_recall {}, строго {}, \
-             обязательные строки {}",
+            "\n- Δ (плечо − база, общие элементы, доли сессий — среднее по повторам, односторонние \
+             95 %): hint_recall {}, строго {}, обязательные строки {}",
             d(&p.d_hint_recall),
             d(&p.d_hint_recall_strict),
             d(&p.d_required)

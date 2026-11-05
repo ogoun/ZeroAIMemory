@@ -721,10 +721,15 @@ impl RefMap {
     }
 }
 
+/// Заглушка id для [`fixed_ids`]: ULID, у которого `n:<id>` стоит 19 токенов bge-m3 — как
+/// средний id набора (повторное ревью задачи 4: 1514 разных id пилота на гибриде, среднее
+/// 19,17, разброс 14–24). Цифры `0…0` стоили бы 6 токенов и занизили бы счёт ~18 %.
+pub const ID_STUB: &str = "01M6NYKVK8E7DVZVME2RR071DW";
+
 /// Текст для счёта токенов: `<буква>:<id>` и `c_<id>` (id — 26 символов) — постоянной
-/// заглушкой той же длины: число токенов не зависит от случайных id загрузки.
+/// заглушкой [`ID_STUB`] средней стоимости: число токенов не зависит от случайных id загрузки.
 pub fn fixed_ids(text: &str) -> String {
-    const STUB: &str = "00000000000000000000000000";
+    const STUB: &str = ID_STUB;
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
@@ -1511,8 +1516,15 @@ pub struct SessionsSummary {
     /// пуст или неполон — так ведёт себя продукт, шаг считается как есть.
     #[serde(default)]
     pub hook_budget_misses: usize,
-    /// Повторов на сессию (`--repeat`) и 95-й перцентиль |Δ| / повтор 0 токенов сессии между
-    /// повторами — шум A/A внутри плеча.
+    /// Повторы (`<сессия> r<повтор>`) с промахом бюджета хука или неразобранным выводом: они
+    /// действительны (поведение продукта), но любой такой повтор в плече блокирует приёмку 13b.
+    #[serde(default)]
+    pub reps_with_misses: Vec<String>,
+    /// Обязательные строки по повторам (все сессии повтора): критерий «= 1,0» — по худшему.
+    #[serde(default)]
+    pub required_by_rep: BTreeMap<usize, Tally>,
+    /// Повторов на сессию (`--repeat`) и 95-й перцентиль |токены повтора − среднее| / среднее
+    /// сессии — шум A/A внутри плеча.
     #[serde(default)]
     pub reps: usize,
     #[serde(default)]
@@ -1565,6 +1577,16 @@ fn repeats(r: &SessionRun, labels_ex: &BTreeSet<String>, cross: bool) -> Tally {
         }
     }
     t
+}
+
+/// Строка `hooks.log` (в примечаниях сессии) — хук не уложился в бюджет: остаток бюджета
+/// кончился до запроса ([`zam_core::HOOK_BUDGET_SPENT`] — та же константа у клиента) или запрос
+/// оборвался по сроку (ошибка сети `ureq` — «timeout» / «timed out»).
+pub fn budget_miss(note: &str) -> bool {
+    note.starts_with("hooks.log")
+        && (note.contains(zam_core::HOOK_BUDGET_SPENT)
+            || (note.contains("недоступен")
+                && (note.contains("timeout") || note.contains("timed out"))))
 }
 
 /// Исключения сравнения: метки шагов, классы строк, виды обязательных строк, виды ожиданий.
@@ -1638,6 +1660,7 @@ pub fn summarize(runs: &[SessionRun], ex: &Exclusions) -> SessionsSummary {
                 continue;
             }
             sum.required.add(c.found);
+            sum.required_by_rep.entry(r.rep).or_default().add(c.found);
             if !c.found {
                 sum.required_missing
                     .push(format!("{} {} {}:{}", r.id, c.step, c.kind, c.key));
@@ -1689,14 +1712,11 @@ pub fn summarize(runs: &[SessionRun], ex: &Exclusions) -> SessionsSummary {
         sum.repeated_cross.found += t.found;
         sum.repeated_cross.total += t.total;
         sum.bad_outputs += r.steps.iter().filter(|s| s.bad_output).count();
-        sum.hook_budget_misses += r
-            .notes
-            .iter()
-            .filter(|n| {
-                n.starts_with("hooks.log")
-                    && (n.contains("бюджет исчерпан") || n.contains("тайм-аут"))
-            })
-            .count();
+        let misses = r.notes.iter().filter(|n| budget_miss(n)).count();
+        sum.hook_budget_misses += misses;
+        if misses > 0 || r.steps.iter().any(|s| s.bad_output) {
+            sum.reps_with_misses.push(format!("{} r{}", r.id, r.rep));
+        }
     }
     let mut by_id: BTreeMap<&str, Vec<&SessionRun>> = BTreeMap::new();
     for r in runs {
@@ -1704,16 +1724,16 @@ pub fn summarize(runs: &[SessionRun], ex: &Exclusions) -> SessionsSummary {
     }
     sum.sessions = by_id.len();
     sum.reps = by_id.values().map(Vec::len).max().unwrap_or(0);
+    // разброс повторов относительно среднего сессии (повторное ревью задачи 4)
     let mut d = Vec::new();
-    for rs in by_id.values() {
-        let tot = |r: &SessionRun| session_tokens(r, ex).values().sum::<usize>() as f64;
-        if let Some(r0) = rs.iter().find(|r| r.rep == 0) {
-            let t0 = tot(r0);
-            for r in rs.iter().filter(|r| r.rep > 0) {
-                if t0 > 0.0 {
-                    d.push((tot(r) - t0).abs() / t0);
-                }
-            }
+    for rs in by_id.values().filter(|rs| rs.len() > 1) {
+        let tot: Vec<f64> = rs
+            .iter()
+            .map(|r| session_tokens(r, ex).values().sum::<usize>() as f64)
+            .collect();
+        let mean = tot.iter().sum::<f64>() / tot.len() as f64;
+        if mean > 0.0 {
+            d.extend(tot.iter().map(|t| (t - mean).abs() / mean));
         }
     }
     sum.rep_noise_p95 = (!d.is_empty()).then(|| quantile(&d, 0.95));
@@ -1836,8 +1856,13 @@ fn mean_tokens(rs: &[SessionRun], id: &str, ex: &Exclusions) -> BTreeMap<String,
     m
 }
 
-/// Элементы зачёта сессии (повтор 0): ключ → (засчитан, строго).
-fn hint_elements(r: &SessionRun, ex: &Exclusions) -> BTreeMap<(usize, String), (bool, bool)> {
+/// Элементы зачёта повтора сессии: (событие, ожидание) → (засчитан, строго).
+type HintElems = BTreeMap<(usize, String), (bool, bool)>;
+/// Обязательные строки повтора: (шаг, вид, ключ) → найдена.
+type ReqElems = BTreeMap<(String, String, String), bool>;
+
+/// Элементы зачёта повтора сессии.
+fn hint_elements(r: &SessionRun, ex: &Exclusions) -> HintElems {
     let mut m = BTreeMap::new();
     for h in &r.hints {
         for e in &h.expect {
@@ -1852,7 +1877,7 @@ fn hint_elements(r: &SessionRun, ex: &Exclusions) -> BTreeMap<(usize, String), (
     m
 }
 
-fn required_elements(r: &SessionRun, ex: &Exclusions) -> BTreeMap<(String, String, String), bool> {
+fn required_elements(r: &SessionRun, ex: &Exclusions) -> ReqElems {
     r.required
         .iter()
         .filter(|c| !ex.required.contains(&c.kind) && !ex.labels.contains(&c.step))
@@ -1905,36 +1930,61 @@ fn part(
             r: ratio_estimate_with(&pairs, BOOTSTRAP_M6, SEED),
         }
     };
-    let rep0 = |rs: &[SessionRun], id: &str| rs.iter().find(|r| r.id == id && r.rep == 0).cloned();
+    // доли на сессию — среднее по всем повторам плеча (повторное ревью задачи 4, I2); элементы —
+    // общие для всех повторов обоих плеч
     let mut dh = Vec::new();
     let mut dhs = Vec::new();
     let mut dr = Vec::new();
     for id in ids {
-        let (Some(b), Some(a)) = (rep0(&bs, id), rep0(&as_, id)) else {
+        let rb: Vec<&SessionRun> = bs.iter().filter(|r| &r.id == id).collect();
+        let ra: Vec<&SessionRun> = as_.iter().filter(|r| &r.id == id).collect();
+        if rb.is_empty() || ra.is_empty() {
             continue;
-        };
-        let (hb, ha) = (hint_elements(&b, ex), hint_elements(&a, ex));
-        let common: Vec<_> = hb.keys().filter(|k| ha.contains_key(*k)).collect();
+        }
+        let hints: Vec<_> = rb.iter().chain(&ra).map(|r| hint_elements(r, ex)).collect();
+        let common: Vec<(usize, String)> = hints[0]
+            .keys()
+            .filter(|k| hints.iter().all(|m| m.contains_key(*k)))
+            .cloned()
+            .collect();
         let n = common.len() as f64;
-        let sh = |m: &BTreeMap<(usize, String), (bool, bool)>, strict: bool| {
-            common
-                .iter()
-                .filter(|k| {
-                    let v = m[**k];
-                    if strict { v.1 } else { v.0 }
+        let mean_share = |ms: &[HintElems], strict: bool| {
+            ms.iter()
+                .map(|m| {
+                    common
+                        .iter()
+                        .filter(|k| {
+                            let v = m[*k];
+                            if strict { v.1 } else { v.0 }
+                        })
+                        .count() as f64
+                        / n.max(1.0)
                 })
-                .count() as f64
-                / n.max(1.0)
+                .sum::<f64>()
+                / ms.len() as f64
         };
-        dh.push((sh(&hb, false), sh(&ha, false), n));
-        dhs.push((sh(&hb, true), sh(&ha, true), n));
-        let (rb, ra) = (required_elements(&b, ex), required_elements(&a, ex));
-        let common: Vec<_> = rb.keys().filter(|k| ra.contains_key(*k)).collect();
+        let (hb, ha) = hints.split_at(rb.len());
+        dh.push((mean_share(hb, false), mean_share(ha, false), n));
+        dhs.push((mean_share(hb, true), mean_share(ha, true), n));
+        let reqs: Vec<_> = rb
+            .iter()
+            .chain(&ra)
+            .map(|r| required_elements(r, ex))
+            .collect();
+        let common: Vec<(String, String, String)> = reqs[0]
+            .keys()
+            .filter(|k| reqs.iter().all(|m| m.contains_key(*k)))
+            .cloned()
+            .collect();
         let n = common.len() as f64;
-        let sr = |m: &BTreeMap<(String, String, String), bool>| {
-            common.iter().filter(|k| m[**k]).count() as f64 / n.max(1.0)
+        let mean_req = |ms: &[ReqElems]| {
+            ms.iter()
+                .map(|m| common.iter().filter(|k| m[*k]).count() as f64 / n.max(1.0))
+                .sum::<f64>()
+                / ms.len() as f64
         };
-        dr.push((sr(&rb), sr(&ra), n));
+        let (qb, qa) = reqs.split_at(rb.len());
+        dr.push((mean_req(qb), mean_req(qa), n));
     }
     PartComparison {
         part: name.to_string(),
@@ -2495,13 +2545,32 @@ fn write_pair(prefix: &Path, json_v: &impl Serialize, md: &str) -> Result<(PathB
     Ok((j, m))
 }
 
-fn compare_files(arm_path: &Path, bases: &[PathBuf]) -> Result<()> {
+/// Пересчёт токенов шагов по сохранённым текстам текущим правилом счёта ([`fixed_ids`],
+/// [`classify`]) и сводки — сравнения сохранённых плеч не зависят от версии раннера, снявшего их.
+pub fn recount(r: &mut SessionsResult, count: Count<'_>) {
+    for x in &mut r.sessions {
+        for st in &mut x.steps {
+            let fixed = fixed_ids(&st.text);
+            let n = |t: &str| if t.is_empty() { 0 } else { count(t) };
+            st.tokens = n(&fixed);
+            st.tokens_raw = n(&st.text);
+            st.classes = classify(&fixed, count);
+        }
+    }
+    r.summary = summarize(&r.sessions, &own_exclusions(&r.info.feats));
+}
+
+fn compare_files(repo: &Path, arm_path: &Path, bases: &[PathBuf]) -> Result<()> {
     if bases.is_empty() {
         bail!("--arm без --compare: сравнивать не с чем");
     }
-    let arm = read_result(arm_path)?;
+    let counter = Counter::load(repo)?;
+    let count = |t: &str| counter.count(t);
+    let mut arm = read_result(arm_path)?;
+    recount(&mut arm, &count);
     for b in bases {
-        let base = read_result(b)?;
+        let mut base = read_result(b)?;
+        recount(&mut base, &count);
         let c = compare(&base, &arm, (&file_name(b), &file_name(arm_path)))?;
         let prefix =
             arm_path.with_file_name(format!("{}-vs-{}", file_name(arm_path), file_name(b)));
@@ -2688,7 +2757,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         bail!("--sessions с --grid — сетки ТС-2 у задачи 8c");
     }
     if let Some(arm) = &a.arm {
-        return compare_files(arm, &a.compare);
+        return compare_files(&p.repo, arm, &a.compare);
     }
     let Some(part) = a.split else {
         bail!("--sessions: укажите --split dev|holdout");
@@ -2903,7 +2972,8 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     print!("{md}");
     println!("  {}\n  {}", j.display(), m.display());
     for b in &a.compare {
-        let base = read_result(b)?;
+        let mut base = read_result(b)?;
+        recount(&mut base, &count);
         let c = compare(&base, &r, (&file_name(b), &stem))?;
         let cp = PathBuf::from(format!("{}-vs-{}", prefix.display(), file_name(b)));
         let cmd = super::report::sessions_comparison_md(&c);
@@ -3436,8 +3506,8 @@ queries = ["c"]
     fn fixed_ids_and_hook_text() {
         let t = format!("правило — n:{ID_RULE}; выжимка c_{ID_IDEA}; abn:{ID_RULE}");
         let f = fixed_ids(&t);
-        assert!(f.contains("n:00000000000000000000000000;"));
-        assert!(f.contains("c_00000000000000000000000000;"));
+        assert!(f.contains(&format!("n:{ID_STUB};")));
+        assert!(f.contains(&format!("c_{ID_STUB};")));
         // не ссылка: буква-префикс внутри слова
         assert!(f.ends_with(&format!("abn:{ID_RULE}")));
         assert_eq!(hook_text(""), (String::new(), false));
@@ -3510,5 +3580,85 @@ queries = ["c"]
         assert!(all.d_required.as_ref().unwrap().mean < -0.5);
         assert!(all.d_hint_recall.as_ref().unwrap().mean < 0.0);
         assert!(all.total.arm < all.total.base);
+    }
+
+    /// Средняя стоимость `<буква>:<id>` в токенах bge-m3 (пилот на гибриде, задача 4).
+    const ID_MEAN_TOKENS: f64 = 19.17;
+
+    #[test]
+    fn id_stub_costs_mean_id() {
+        let repo = crate::eval::tests_repo();
+        let Ok(c) = Counter::load(&repo) else {
+            eprintln!("нет tokenizer.json bge-m3 в target/models — проверка стоимости пропущена");
+            return;
+        };
+        let n = c.count(&format!("n:{ID_STUB}")) as f64;
+        assert!(
+            (n - ID_MEAN_TOKENS).abs() <= 1.0,
+            "n:<заглушка> = {n} токенов"
+        );
+        // в тексте: заглушка стоит столько же, сколько настоящий id средней стоимости
+        let real = format!("правило — n:{ID_STUB} x");
+        assert_eq!(c.count(&fixed_ids(&real)), c.count(&real));
+    }
+
+    #[test]
+    fn budget_miss_matches_client_texts() {
+        let t0 = "hooks.log (session-start): 2026-11-05T14:39:13Z session-start";
+        assert!(budget_miss(&format!(
+            "{t0} {}",
+            zam_core::HOOK_BUDGET_SPENT
+        )));
+        // ошибка сети клиента по сроку: «сервер … недоступен: <ureq>»
+        let e = ureq::Error::Timeout(ureq::Timeout::Global);
+        assert!(budget_miss(&format!(
+            "{t0} recall(session_start): сервер http://127.0.0.1:1 недоступен: {e}"
+        )));
+        assert!(!budget_miss(&format!(
+            "{t0} code-sync карта кода: файлов 0"
+        )));
+        assert!(
+            !budget_miss(zam_core::HOOK_BUDGET_SPENT),
+            "только строки hooks.log"
+        );
+    }
+
+    #[test]
+    fn miss_only_in_rep1_counts_in_mean_and_worst() {
+        let c = corpus();
+        let sp = spec();
+        let w = world(&sp, &c).unwrap();
+        let f = feats(&m6_caps(), true, false);
+        let good = play(&mut mock(), &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        let mut m = mock();
+        m.hook = Box::new(|cmd, inp| match (cmd, inp["source"].as_str()) {
+            ("session-start", Some("startup")) => "### Правила\n".into(),
+            _ => String::new(),
+        });
+        let mut bad = play(&mut m, &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        bad.rep = 1;
+        bad.notes.push(format!(
+            "hooks.log (session-start): x {}",
+            zam_core::HOOK_BUDGET_SPENT
+        ));
+        let base = result(
+            vec![good.clone(), {
+                let mut g = good.clone();
+                g.rep = 1;
+                g
+            }],
+            f,
+            "m6",
+        );
+        let arm = result(vec![good.clone(), bad], f, "m6");
+        // худший повтор плеча — 1, промах в нём виден в сводке
+        assert_eq!(arm.summary.required_by_rep[&0].share(), Some(4.0 / 7.0));
+        assert!(arm.summary.required_by_rep[&1].share().unwrap() < 4.0 / 7.0);
+        assert_eq!(arm.summary.reps_with_misses, vec!["ss-01 r1".to_string()]);
+        assert_eq!(arm.summary.hook_budget_misses, 1);
+        let cmp = compare(&base, &arm, ("a", "b")).unwrap();
+        let d = cmp.parts[0].d_required.as_ref().unwrap().mean;
+        // повтор 0 одинаков, повтор 1 хуже — Δ среднего по повторам отрицательна, а не 0
+        assert!(d < 0.0, "{d}");
     }
 }

@@ -350,7 +350,7 @@ impl Env {
             return None;
         }
         let Some(left) = self.http_left() else {
-            self.log("бюджет исчерпан до запроса к серверу");
+            self.log(zam_core::HOOK_BUDGET_SPENT);
             return None;
         };
         Some(Client::with_timeouts(
