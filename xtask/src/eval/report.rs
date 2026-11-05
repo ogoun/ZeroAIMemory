@@ -431,6 +431,18 @@ pub fn tokens_m6_md(r: &super::tokens::mcp::McpResult) -> String {
             i.excluded_scenarios.join("; ")
         );
     }
+    if !i.l0_excluded.is_empty() {
+        let l: Vec<String> = i
+            .l0_excluded
+            .iter()
+            .map(|e| format!("{}#{} {}", e.scenario, e.nugget, e.source))
+            .collect();
+        let _ = writeln!(
+            s,
+            "Нагеты в L0 сервера (вне полноты; в сравнении — обоих плеч): {}.\n",
+            l.join("; ")
+        );
+    }
     let _ = writeln!(
         s,
         "| Путь | токенов всего | в среднем на сценарий | микро-полнота | полных |\n|---|---:|---|---:|---:|"
@@ -546,6 +558,18 @@ pub fn comparison_md(c: &super::tokens::mcp::Comparison) -> String {
             s,
             "- вне сравнения: только в базе {:?}, только в плече {:?}.",
             c.only_base, c.only_arm
+        );
+    }
+    if !c.l0_excluded.is_empty() {
+        let l: Vec<String> = c
+            .l0_excluded
+            .iter()
+            .map(|e| format!("{}#{} {}", e.scenario, e.nugget, e.source))
+            .collect();
+        let _ = writeln!(
+            s,
+            "- нагеты в L0 сервера хотя бы одного плеча — вне полноты обоих: {}.",
+            l.join("; ")
         );
     }
     s

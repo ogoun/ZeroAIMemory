@@ -212,6 +212,10 @@ pub struct EvalArgs {
     /// моделью на том же каталоге — состав пачек эмбеддера не зависит от темпа загрузки (M6)
     #[arg(long, conflicts_with = "reuse")]
     pub preload: bool,
+    /// --tokens --via mcp: нагет в L0 сервера — ошибка прогона (приёмка); без флага такой нагет
+    /// исключается из полноты плеча и, в сравнении, обоих плеч (`info.l0_excluded`)
+    #[arg(long)]
+    pub strict_l0: bool,
     /// Префикс имени результата после даты (`--hints` и прогоны `--mode`):
     /// `<дата>-<префикс>-<модель|fts>-…`, например `m45` — итоги этапа под общим префиксом без
     /// ручного переименования (у `--glossary` имена свои)
@@ -382,6 +386,7 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
         // только набор ТС-1 (свой файл сценариев): нагеты, отпечатки, замок
         let set = tokens::mcp::load_set(&a, &p)?;
         tokens::mcp::print_set(&set, &p);
+        tokens::mcp::print_foreign(&set, &p);
         println!("EVAL-CHECK OK");
         return Ok(());
     }
@@ -402,6 +407,7 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
                 sc.len()
             );
             tokens::mcp::print_set(&set, &p);
+            tokens::mcp::print_foreign(&set, &p);
             let (g, _) = glossary::load_glossary(&p.glossary)?;
             glossary::validate_glossary(&g, &corpus, true)?;
             println!(

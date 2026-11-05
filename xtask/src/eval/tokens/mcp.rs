@@ -25,8 +25,12 @@
 //! вложений нет — сценарии на них исключаются из сравнения (`info.excluded_scenarios`).
 //!
 //! **L0 сервера.** После загрузки L0 каждой заметки-источника нагета читается с сервера
-//! (`POST /read`, `tier: L0`): нагет в L0 сервера — ошибка прогона; расхождение L0 сервера с
-//! приближением xtask ([`nuggets::l0_of`]) — перечень в `info.l0_mismatch`.
+//! (`POST /read`, `tier: L0`). С моделью L0 — предложение, ближайшее к центроиду эмбеддингов
+//! (`zam-index::rollup`), и зависит от модели и плеча. Нагет, который входит в L0 плеча,
+//! исключается из полноты этого плеча и пишется в `info.l0_excluded`; [`compare`] исключает его
+//! из **обоих** плеч (объединение исключений). `--strict-l0` (приёмка) — такой нагет — ошибка
+//! прогона. Расхождение L0 сервера с приближением xtask ([`nuggets::l0_of`]) — перечень
+//! `info.l0_mismatch`, только без модели (с моделью он совпадает почти ни с чем).
 //!
 //! Токены — сумма текстов `result.content` вызовов (токенизатор bge-m3). Полнота — нагеты
 //! (§3.2): найдены, если целиком есть в выданном агенту тексте пути. Отчёт хранит ответы
@@ -77,8 +81,12 @@ const CACHE_MARK: &str = "[cache]";
 pub struct AgentPath {
     pub steps: Vec<super::Step>,
     pub tokens: usize,
-    /// Найдено нагетов.
+    /// Найдено нагетов (без исключённых по L0 этого плеча).
     pub found: usize,
+    /// Нагет сценария (по порядку `nuggets`) найден в выданном тексте — все, в том числе
+    /// исключённые: [`compare`] пересчитывает полноту по объединению исключений двух плеч.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hits: Vec<bool>,
     /// Все нагеты найдены (сценарий без нагетов — все ожидаемые источники прочитаны без
     /// пропусков).
     pub complete: bool,
@@ -206,12 +214,61 @@ pub struct McpInfo {
     /// Документы набора, загруженные вложениями (`doc:<файл>`; пусто — плечо без вложений).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub docs_loaded: Vec<String>,
-    /// Заметки-источники нагетов, у которых L0 сервера не равен приближению xtask
-    /// ([`nuggets::l0_of`]): `<путь>: сервер «…» ≠ xtask «…»` (нагет в L0 сервера — ошибка).
+    /// Заметки-источники нагетов, у которых L0 сервера без модели не равен приближению xtask
+    /// ([`nuggets::l0_of`]): `<путь>: сервер «…» ≠ xtask «…»`; с моделью не заполняется.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub l0_mismatch: Vec<String>,
+    /// Нагеты, входящие в L0 сервера этого плеча: вне полноты этого плеча, а в сравнении — обоих.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub l0_excluded: Vec<L0Excluded>,
     pub counter: String,
     pub read_budget: usize,
+}
+
+/// Нагет, входящий в L0 сервера плеча (`nugget` — номер в `nuggets` сценария).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct L0Excluded {
+    pub scenario: String,
+    pub nugget: usize,
+    pub source: String,
+    pub text: String,
+}
+
+/// Исключения по L0: сценарий → номера нагетов.
+pub type L0Set = BTreeMap<String, BTreeSet<usize>>;
+
+/// Объединение исключений по L0 плеч.
+pub fn l0_union<'a>(infos: impl IntoIterator<Item = &'a McpInfo>) -> L0Set {
+    let mut out = L0Set::new();
+    for i in infos {
+        for e in &i.l0_excluded {
+            out.entry(e.scenario.clone()).or_default().insert(e.nugget);
+        }
+    }
+    out
+}
+
+/// Полнота пути: `(найдено, всего, полон)`.
+pub type Recall = (usize, usize, bool);
+
+/// Полнота пути без исключённых нагетов: `(найдено, всего, полон)`. Без исключений — как
+/// записано; с исключениями нужны `hits` (иначе ошибка: отчёт до задачи 1b-ревью).
+pub fn adjusted(p: &AgentPath, total: usize, ex: Option<&BTreeSet<usize>>) -> Result<Recall> {
+    let Some(ex) = ex.filter(|e| !e.is_empty()) else {
+        return Ok((p.found, total, p.complete));
+    };
+    if p.hits.is_empty() {
+        bail!("в отчёте нет hits по нагетам — пересчитать исключения по L0 нельзя");
+    }
+    let keep: Vec<bool> = p
+        .hits
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !ex.contains(i))
+        .map(|(_, h)| *h)
+        .collect();
+    let found = keep.iter().filter(|h| **h).count();
+    Ok((found, keep.len(), found == keep.len()))
 }
 
 /// Итог плеча.
@@ -266,6 +323,9 @@ pub struct Comparison {
     pub net_losses: i64,
     /// `d_micro.lo ≥ −0,02` и `L ≤ 1` (без нагетов — нет).
     pub noninferior: bool,
+    /// Нагеты, исключённые из полноты обоих плеч: входят в L0 сервера хотя бы одного плеча.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub l0_excluded: Vec<L0Excluded>,
     pub bootstrap: Bootstrap,
 }
 
@@ -393,45 +453,40 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
             );
         }
     }
-    let frac = |p: &AgentPath, n: usize| {
-        if n == 0 {
-            0.0
-        } else {
-            p.found as f64 / n as f64
-        }
-    };
-    let w: Vec<f64> = pairs.iter().map(|(b, _)| b.nuggets_total as f64).collect();
-    let bf: Vec<f64> = pairs
+    // нагеты из L0 любого плеча — вне полноты обоих (полнота пересчитывается по hits)
+    let l0 = l0_union([bi, ai]);
+    let l0_excluded: Vec<L0Excluded> = bi
+        .l0_excluded
         .iter()
-        .map(|(b, _)| frac(&b.protocol, b.nuggets_total))
+        .chain(&ai.l0_excluded)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
-    let af: Vec<f64> = pairs
-        .iter()
-        .map(|(b, a)| frac(&a.protocol, b.nuggets_total))
-        .collect();
+    let mut adj: Vec<(Recall, Recall)> = Vec::new();
+    for (b, a) in &pairs {
+        let ex = l0.get(&b.id);
+        adj.push((
+            adjusted(&b.protocol, b.nuggets_total, ex)?,
+            adjusted(&a.protocol, a.nuggets_total, ex)?,
+        ));
+    }
+    let frac = |f: usize, n: usize| if n == 0 { 0.0 } else { f as f64 / n as f64 };
+    let w: Vec<f64> = adj.iter().map(|(b, _)| b.1 as f64).collect();
+    let bf: Vec<f64> = adj.iter().map(|(b, _)| frac(b.0, b.1)).collect();
+    let af: Vec<f64> = adj.iter().map(|(b, a)| frac(a.0, b.1)).collect();
     let d_micro = (w.iter().sum::<f64>() > 0.0)
         .then(|| paired_diff_weighted(&bf, &af, &w, BOOTSTRAP_M6, SEED));
     let l = net_losses(
-        &pairs
-            .iter()
-            .map(|(b, _)| b.protocol.complete)
-            .collect::<Vec<_>>(),
-        &pairs
-            .iter()
-            .map(|(_, a)| a.protocol.complete)
-            .collect::<Vec<_>>(),
+        &adj.iter().map(|(b, _)| b.2).collect::<Vec<_>>(),
+        &adj.iter().map(|(_, a)| a.2).collect::<Vec<_>>(),
     );
     let ratio_pairs: Vec<(f64, f64)> = pairs
         .iter()
         .map(|(b, a)| (a.protocol.tokens as f64, b.protocol.tokens as f64))
         .collect();
-    let micro = |f: fn(&(&McpScenario, &McpScenario)) -> usize| {
-        micro_recall(
-            &pairs
-                .iter()
-                .map(|p| (f(p), p.0.nuggets_total))
-                .collect::<Vec<_>>(),
-        )
+    let micro = |f: fn(&(Recall, Recall)) -> usize| {
+        micro_recall(&adj.iter().map(|p| (f(p), p.0.1)).collect::<Vec<_>>())
     };
     Ok(Comparison {
         base: names.0.to_string(),
@@ -443,8 +498,9 @@ pub fn compare(base: &McpResult, arm: &McpResult, names: (&str, &str)) -> Result
         base_tokens: pairs.iter().map(|(b, _)| b.protocol.tokens).sum(),
         arm_tokens: pairs.iter().map(|(_, a)| a.protocol.tokens).sum(),
         r: ratio_estimate_with(&ratio_pairs, BOOTSTRAP_M6, SEED),
-        base_micro: micro(|(b, _)| b.protocol.found),
-        arm_micro: micro(|(_, a)| a.protocol.found),
+        base_micro: micro(|(b, _)| b.0),
+        arm_micro: micro(|(_, a)| a.0),
+        l0_excluded,
         noninferior: d_micro.is_some_and(|d| d.lo >= MIN_D_MICRO) && l <= MAX_NET_LOSSES,
         d_micro,
         net_losses: l,
@@ -570,13 +626,13 @@ fn ordered_raws(s: &Session, docs: &DocMap, text: &str) -> Vec<(String, String)>
     RefMaps::of(s, docs).cards(text)
 }
 
-/// Нагеты сценария, найденные в тексте.
-fn found_nuggets(sc: &Scenario, delivered: &str) -> usize {
+/// Нагеты сценария (по порядку), найденные в тексте.
+fn nugget_hits(sc: &Scenario, delivered: &str) -> Vec<bool> {
     let norm = normalize_md(delivered);
     sc.nuggets
         .iter()
-        .filter(|n| nuggets::found(&norm, &n.text))
-        .count()
+        .map(|n| nuggets::found(&norm, &n.text))
+        .collect()
 }
 
 /// Источник нужно дочитать: он ожидаемый и его нагет не выдан (без нагетов — всегда).
@@ -648,13 +704,22 @@ fn read_and_reread(
     Ok(all)
 }
 
-/// Полнота пути: все нагеты (у сценария без нагетов — все ожидаемые прочитаны без пометок).
-fn finish(sc: &Scenario, path: &mut AgentPath) {
-    path.found = found_nuggets(sc, &path.delivered());
-    path.complete = if sc.nuggets.is_empty() {
+/// Полнота пути: все нагеты, кроме исключённых по L0 этого плеча (`ex` — их номера); без
+/// нагетов (или все исключены) — все ожидаемые прочитаны без пометок.
+fn finish(sc: &Scenario, path: &mut AgentPath, ex: &BTreeSet<usize>) {
+    path.hits = nugget_hits(sc, &path.delivered());
+    let keep: Vec<bool> = path
+        .hits
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !ex.contains(i))
+        .map(|(_, h)| *h)
+        .collect();
+    path.found = keep.iter().filter(|h| **h).count();
+    path.complete = if keep.is_empty() {
         sc.expect.iter().all(|e| path.read.contains(e)) && path.note.is_empty()
     } else {
-        path.found == sc.nuggets.len()
+        path.found == keep.len()
     };
 }
 
@@ -697,11 +762,14 @@ fn delete_cache(s: &Session, id: &str) -> Result<()> {
 fn run_scenario(
     s: &Session,
     docs: &DocMap,
+    l0: &L0Set,
     counter: &Counter,
     sc: &Scenario,
     part: Part,
     tag: &str,
 ) -> Result<McpScenario> {
+    let no_ex = BTreeSet::new();
+    let ex = l0.get(&sc.id).unwrap_or(&no_ex);
     let client = |suffix: &str| {
         McpClient::connect(
             &s.base,
@@ -732,7 +800,7 @@ fn run_scenario(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    finish(sc, &mut naive);
+    finish(sc, &mut naive, ex);
     // (а) протокол
     let ca = client("a")?;
     let mut protocol = AgentPath::default();
@@ -780,7 +848,7 @@ fn run_scenario(
             protocol.add_note(&format!("нет в карточках: {missing:?}"));
         }
     }
-    finish(sc, &mut protocol);
+    finish(sc, &mut protocol, ex);
     // справочно: карточки 1–3 по порядку, без оракула (поиск — тот же ответ)
     let mut reference = AgentPath::default();
     reference.push("memory_search brief", &cards, counter);
@@ -793,7 +861,7 @@ fn run_scenario(
     } else {
         read_and_reread(&client("r")?, counter, sc, &first, &mut reference)?;
     }
-    finish(sc, &mut reference);
+    finish(sc, &mut reference, ex);
     // (б) повтор другой сессией: выжимка кэша первым элементом
     let mut cached = PathRun::default();
     let again = client("b")?.call("memory_search", brief)?;
@@ -827,7 +895,7 @@ fn run_scenario(
         split: part.as_str().to_string(),
         question: sc.question.clone(),
         expect: sc.expect.clone(),
-        nuggets_total: sc.nuggets.len(),
+        nuggets_total: sc.nuggets.len() - ex.len(),
         summary_tokens,
         protocol,
         reference,
@@ -942,25 +1010,68 @@ fn load_docs(s: &mut Session, dir: &Path) -> Result<DocMap> {
     Ok(map)
 }
 
-/// L0 сервера заметок-источников нагетов (`POST /read`, `tier: L0`): нагет в L0 сервера — ошибка;
-/// возвращает расхождения L0 сервера с [`nuggets::l0_of`] (`<путь>: сервер «…» ≠ xtask «…»`).
-fn verify_server_l0(s: &Session, set: &Set) -> Result<Vec<String>> {
+/// Итог сверки L0 сервера.
+#[derive(Debug, Default)]
+pub struct L0Check {
+    /// Нагеты, входящие в L0 сервера (исключаются из полноты, [`L0Excluded`]).
+    pub excluded: Vec<L0Excluded>,
+    /// L0 сервера ≠ приближения xtask (`<путь>: сервер «…» ≠ xtask «…»`).
+    pub mismatch: Vec<String>,
+}
+
+/// Сверка нагетов с L0 сервера заметок-источников: `l0` — путь → L0 сервера, `ours` — путь →
+/// приближение xtask (`None` — не сравнивать: с моделью L0 другой по построению).
+pub fn l0_check(
+    scenarios: &[Scenario],
+    l0: &BTreeMap<String, String>,
+    ours: Option<&BTreeMap<String, String>>,
+) -> L0Check {
+    let mut c = L0Check::default();
+    for sc in scenarios {
+        for (i, n) in sc.nuggets.iter().enumerate() {
+            let Some(server) = l0.get(&n.source) else {
+                continue;
+            };
+            if !nuggets::in_server_l0(&[n], server).is_empty() {
+                c.excluded.push(L0Excluded {
+                    scenario: sc.id.clone(),
+                    nugget: i,
+                    source: n.source.clone(),
+                    text: n.text.clone(),
+                });
+            }
+        }
+    }
+    if let Some(ours) = ours {
+        let norm = |t: &str| crate::eval::corpus::squash_ws(t);
+        for (path, server) in l0 {
+            let x = ours.get(path).map(String::as_str).unwrap_or_default();
+            if norm(server) != norm(x) {
+                c.mismatch
+                    .push(format!("{path}: сервер «{server}» ≠ xtask «{x}»"));
+            }
+        }
+    }
+    c
+}
+
+/// L0 сервера заметок-источников нагетов (`POST /read`, `tier: L0`) → [`l0_check`]; `model` —
+/// прогон с моделью (сравнение с приближением xtask не ведётся).
+fn verify_server_l0(s: &Session, set: &Set, model: bool) -> Result<L0Check> {
     let by_path: BTreeMap<&str, &str> = s
         .node_paths()
         .iter()
         .map(|(id, p)| (p.as_str(), id.as_str()))
         .collect();
-    let mut sources: BTreeMap<&str, Vec<&nuggets::Nugget>> = BTreeMap::new();
-    for sc in &set.scenarios {
-        for n in &sc.nuggets {
-            if !n.source.starts_with(INSIGHT_REF) && !n.source.starts_with(DOC_REF) {
-                sources.entry(n.source.as_str()).or_default().push(n);
-            }
-        }
-    }
-    let mut errs = Vec::new();
-    let mut mismatch = Vec::new();
-    for (path, ns) in sources {
+    let sources: BTreeSet<&str> = set
+        .scenarios
+        .iter()
+        .flat_map(|sc| sc.nuggets.iter().map(|n| n.source.as_str()))
+        .filter(|s| !s.starts_with(INSIGHT_REF) && !s.starts_with(DOC_REF))
+        .collect();
+    let mut l0 = BTreeMap::new();
+    let mut ours = BTreeMap::new();
+    for path in sources {
         let id = by_path
             .get(path)
             .with_context(|| format!("заметка-источник {path} не загружена"))?;
@@ -970,26 +1081,12 @@ fn verify_server_l0(s: &Session, set: &Set) -> Result<Vec<String>> {
             bail!("/read L0 {path}: HTTP {st}: {v}");
         }
         let server = v["items"][0]["text"].as_str().unwrap_or_default();
-        for n in nuggets::in_server_l0(&ns, server) {
-            errs.push(format!(
-                "{path}: нагет «{}» входит в L0 сервера «{server}»",
-                n.text
-            ));
-        }
-        let ours = set
-            .corpus
-            .get(path)
-            .map(|n| nuggets::l0_of(&n.text))
-            .unwrap_or_default();
-        let norm = |t: &str| crate::eval::corpus::squash_ws(t);
-        if norm(server) != norm(&ours) {
-            mismatch.push(format!("{path}: сервер «{server}» ≠ xtask «{ours}»"));
+        l0.insert(path.to_string(), server.to_string());
+        if let Some(n) = set.corpus.get(path) {
+            ours.insert(path.to_string(), nuggets::l0_of(&n.text));
         }
     }
-    if !errs.is_empty() {
-        bail!("нагеты в L0 сервера:\n  {}", errs.join("\n  "));
-    }
-    Ok(mismatch)
+    Ok(l0_check(&set.scenarios, &l0, (!model).then_some(&ours)))
 }
 
 /// Набор ТС-1: корпус, сценарии, отпечатки (сверенные с замком).
@@ -1050,6 +1147,7 @@ pub fn load_set(a: &EvalArgs, p: &Paths) -> Result<Set> {
         &nf,
         &cf,
         docs_manifest.as_deref(),
+        (scenarios.len(), summary.nuggets),
     )?;
     Ok(Set {
         corpus,
@@ -1061,6 +1159,31 @@ pub fn load_set(a: &EvalArgs, p: &Paths) -> Result<Set> {
         docs_manifest,
         composition,
     })
+}
+
+/// Справочно (`eval --check`): нагеты, которые встречаются и в других источниках корпуса.
+pub fn print_foreign(set: &Set, p: &Paths) {
+    let checks: Vec<nuggets::Check> = set
+        .scenarios
+        .iter()
+        .map(|s| nuggets::Check {
+            id: &s.id,
+            question: &s.question,
+            expect: &s.expect,
+            nuggets: &s.nuggets,
+        })
+        .collect();
+    let f = nuggets::foreign_occurrences(&checks, &set.corpus, &p.docs, &p.repo);
+    println!(
+        "  справочно: нагетов, которые есть и в других источниках корпуса, {}",
+        f.hits.len()
+    );
+    for h in &f.hits {
+        println!("    {h}");
+    }
+    for s in &f.skipped {
+        println!("    не проверено: {s}");
+    }
 }
 
 /// Печать сводки набора и отпечатков (`eval --check`).
@@ -1366,16 +1489,41 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         if model.is_some() {
             s.wait_indexed()?;
         }
-        let l0_mismatch = verify_server_l0(&s, &set)?;
+        let L0Check {
+            excluded: l0_excluded,
+            mismatch: l0_mismatch,
+        } = verify_server_l0(&s, &set, model.is_some())?;
         if !l0_mismatch.is_empty() {
             println!(
-                "L0 сервера ≠ приближения xtask у {} заметок-источников (нагетов в L0 сервера нет):",
+                "L0 сервера ≠ приближения xtask у {} заметок-источников:",
                 l0_mismatch.len()
             );
             for m in &l0_mismatch {
                 println!("  {m}");
             }
         }
+        if !l0_excluded.is_empty() {
+            let list: Vec<String> = l0_excluded
+                .iter()
+                .map(|e| format!("{}#{} {}: «{}»", e.scenario, e.nugget, e.source, e.text))
+                .collect();
+            if a.strict_l0 {
+                bail!(
+                    "--strict-l0: нагеты в L0 сервера {}:\n  {}",
+                    caps.tag(),
+                    list.join("\n  ")
+                );
+            }
+            println!(
+                "нагеты в L0 сервера {} — вне полноты этого плеча (в сравнении — обоих): {}",
+                caps.tag(),
+                list.join("; ")
+            );
+        }
+        let l0_set = l0_union([&McpInfo {
+            l0_excluded: l0_excluded.clone(),
+            ..McpInfo::default()
+        }]);
         let mut runs = Vec::with_capacity(chosen.len());
         for sc in &chosen {
             let tag = format!(
@@ -1384,7 +1532,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 sc.id,
                 point.as_deref().map_or(String::new(), |n| format!("-{n}"))
             );
-            runs.push(run_scenario(&s, &docs, &counter, sc, part, &tag)?);
+            runs.push(run_scenario(&s, &docs, &l0_set, &counter, sc, part, &tag)?);
         }
         let st = s.status.clone();
         s.stop()?;
@@ -1421,6 +1569,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 excluded_scenarios,
                 docs_loaded: docs.values().cloned().collect(),
                 l0_mismatch,
+                l0_excluded,
                 counter: "bge-m3 tokenizer.json".into(),
                 read_budget: READ_BUDGET,
             },
@@ -1537,6 +1686,98 @@ mod tests {
             summary: McpSummary::default(),
             scenarios: sc,
         }
+    }
+
+    fn hits_path(tokens: usize, hits: &[bool], ex: &[usize]) -> AgentPath {
+        let keep: Vec<bool> = hits
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !ex.contains(i))
+            .map(|(_, h)| *h)
+            .collect();
+        let found = keep.iter().filter(|h| **h).count();
+        AgentPath {
+            tokens,
+            found,
+            complete: found == keep.len(),
+            hits: hits.to_vec(),
+            ..AgentPath::default()
+        }
+    }
+
+    /// Нагет из L0 одного плеча исключается из полноты обоих (I-2 ревью 1b): база нашла нагет
+    /// №1 только потому, что он в её L0, — без исключения плечо «потеряло бы» его.
+    #[test]
+    fn l0_excluded_nugget_leaves_both_arms() {
+        let ex = L0Excluded {
+            scenario: "a".into(),
+            nugget: 1,
+            source: "ru/x".into(),
+            text: "t".into(),
+        };
+        let mut base = arm(
+            "c",
+            vec![scen("a", 2, hits_path(1000, &[true, true, true], &[1]))],
+        );
+        base.info.l0_excluded = vec![ex.clone()];
+        let plain = arm(
+            "c",
+            vec![scen("a", 3, hits_path(1000, &[true, false, true], &[]))],
+        );
+        let c = compare(&base, &plain, ("base", "arm")).unwrap();
+        assert_eq!((c.base_micro, c.arm_micro, c.net_losses), (1.0, 1.0, 0));
+        assert!(c.noninferior);
+        assert_eq!(c.l0_excluded, vec![ex.clone()]);
+        // обратный порядок плеч — то же
+        let c = compare(&plain, &base, ("arm", "base")).unwrap();
+        assert_eq!((c.base_micro, c.arm_micro, c.net_losses), (1.0, 1.0, 0));
+        // без исключения плечо теряет нагет: полнота 2/3, чистые потери 1
+        let mut base2 = arm(
+            "c",
+            vec![scen("a", 3, hits_path(1000, &[true, true, true], &[]))],
+        );
+        base2.info.l0_excluded.clear();
+        let c = compare(&base2, &plain, ("base", "arm")).unwrap();
+        assert_eq!(c.net_losses, 1);
+        // исключение есть, а hits в отчёте нет — ошибка, а не тихий пересчёт
+        let mut old = plain.clone();
+        old.scenarios[0].protocol.hits.clear();
+        assert!(compare(&base, &old, ("base", "arm")).is_err());
+    }
+
+    #[test]
+    fn l0_check_excludes_nuggets_and_reports_mismatch_only_without_model() {
+        let sc = Scenario {
+            id: "s".into(),
+            kind: Some("pair".into()),
+            question: "q".into(),
+            expect: vec!["ru/a".into(), "insight:k".into()],
+            nuggets: vec![
+                Nugget {
+                    source: "ru/a".into(),
+                    text: "ключевой факт заметки целиком".into(),
+                },
+                Nugget {
+                    source: "ru/a".into(),
+                    text: "другой факт глубже в тексте".into(),
+                },
+            ],
+        };
+        let l0 = BTreeMap::from([(
+            "ru/a".to_string(),
+            "Здесь `ключевой` факт заметки целиком.".to_string(),
+        )]);
+        let ours = BTreeMap::from([("ru/a".to_string(), "Первый абзац.".to_string())]);
+        let c = l0_check(std::slice::from_ref(&sc), &l0, Some(&ours));
+        assert_eq!(c.excluded.len(), 1);
+        assert_eq!(
+            (c.excluded[0].scenario.as_str(), c.excluded[0].nugget),
+            ("s", 0)
+        );
+        assert_eq!(c.mismatch.len(), 1);
+        // с моделью расхождение с приближением xtask не пишется
+        let c = l0_check(std::slice::from_ref(&sc), &l0, None);
+        assert!(c.mismatch.is_empty() && c.excluded.len() == 1);
     }
 
     /// R, Δ микро-полноты и чистые потери — по общим сценариям; лишние — в списках.

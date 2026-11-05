@@ -273,11 +273,18 @@ pub fn check_lock(
     nuggets: &str,
     corpus: &str,
     docs_manifest: Option<&str>,
+    counts: (usize, usize),
 ) -> Result<Option<Lock>> {
     let Some(l) = read_lock(lock)? else {
         return Ok(None);
     };
     let mut errs = Vec::new();
+    if (l.scenarios, l.nuggets) != counts {
+        errs.push(format!(
+            "сценариев и нагетов {} и {} ≠ замороженных {} и {}",
+            counts.0, counts.1, l.scenarios, l.nuggets
+        ));
+    }
     if l.nuggets_fingerprint != nuggets {
         errs.push(format!(
             "nuggets_fingerprint {nuggets} ≠ замороженного {}",
@@ -524,6 +531,101 @@ fn source_text(corpus: &Corpus, docs: &Path, source: &str) -> Result<Option<(Str
         return doc_text(docs, rel).map(|t| Some((t, String::new())));
     }
     Ok(corpus.get(source).map(|n| (n.text.clone(), l0_of(&n.text))))
+}
+
+/// Справочная проверка (`--check`): нагет встречается и в **других** источниках корпуса ТС-1 —
+/// заметках, insight, документах `eval/docs` роли `content` (DOCX/PPTX/XLSX — `zam-docs`, PDF —
+/// pdfium, если он есть). Такой нагет может «найтись» в выдаче чужого источника.
+#[derive(Debug, Default)]
+pub struct Foreign {
+    /// `<сценарий>: «нагет» (<источник>) — ещё в <другой источник>`.
+    pub hits: Vec<String>,
+    /// Что не проверено (нет pdfium, документ не разобран).
+    pub skipped: Vec<String>,
+}
+
+/// Тексты всех источников корпуса ТС-1 (после сведения пробелов): `(источник, текст)`.
+fn all_source_texts(
+    corpus: &Corpus,
+    docs: &Path,
+    repo: &Path,
+    skipped: &mut Vec<String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = corpus
+        .notes
+        .values()
+        .map(|n| (n.path.clone(), squash_ws(&n.text)))
+        .collect();
+    out.extend(corpus.insights.iter().map(|i| {
+        (
+            format!("{INSIGHT_REF}{}", i.key),
+            squash_ws(&format!("{}\n{}", i.title, i.body)),
+        )
+    }));
+    let Ok(m) = crate::docs_corpus::Manifest::load(docs) else {
+        skipped.push(format!(
+            "{}: нет манифеста набора документов",
+            docs.display()
+        ));
+        return out;
+    };
+    let pdfium = crate::eval::docs::extract::pdfium_lib(repo).is_file();
+    for f in m.files.iter().filter(|f| f.role == "content") {
+        if f.path.ends_with(".pdf") && !pdfium {
+            skipped.push(format!(
+                "{DOC_REF}{}: нет pdfium (cargo xtask fetch-deps)",
+                f.path
+            ));
+            continue;
+        }
+        let Ok(bytes) = fs::read(docs.join(&f.path)) else {
+            skipped.push(format!("{DOC_REF}{}: нет файла", f.path));
+            continue;
+        };
+        let x = crate::eval::docs::extract::extract_here(
+            repo,
+            crate::eval::docs::extract::PdfBackend::Pdfium,
+            &bytes,
+            1,
+        );
+        if !x.ok {
+            skipped.push(format!(
+                "{DOC_REF}{}: {}",
+                f.path,
+                x.error.unwrap_or_default()
+            ));
+            continue;
+        }
+        let text: Vec<&str> = x.pages.iter().map(|(_, t)| t.as_str()).collect();
+        out.push((format!("{DOC_REF}{}", f.path), squash_ws(&text.join("\n"))));
+    }
+    out
+}
+
+/// Нагеты набора, которые встречаются и в других источниках корпуса ([`Foreign`]).
+pub fn foreign_occurrences(set: &[Check], corpus: &Corpus, docs: &Path, repo: &Path) -> Foreign {
+    let mut f = Foreign::default();
+    let texts = all_source_texts(corpus, docs, repo, &mut f.skipped);
+    for c in set {
+        for n in c.nuggets {
+            let needle = squash_ws(&n.text);
+            let others: Vec<&str> = texts
+                .iter()
+                .filter(|(src, t)| *src != n.source && t.contains(&needle))
+                .map(|(src, _)| src.as_str())
+                .collect();
+            if !others.is_empty() {
+                f.hits.push(format!(
+                    "{}: «{}» ({}) — ещё в {}",
+                    c.id,
+                    n.text,
+                    n.source,
+                    others.join(", ")
+                ));
+            }
+        }
+    }
+    f
 }
 
 /// Нагеты, которые входят в L0 источника, выданный сервером (сверка приближения [`l0_of`] с
@@ -935,6 +1037,34 @@ mod tests {
     }
 
     #[test]
+    fn nugget_in_other_source_is_reported() {
+        let other = "# Другая\n\nСводка.\n\nТам тоже: reflog хранит прежние положения HEAD девяносто дней.\n";
+        let c = corpus_of(&[("ru/git/reset", NOTE), ("ru/git/other", other)]);
+        let docs = tmp("nuggets-foreign");
+        let expect = vec!["ru/git/reset".to_string()];
+        let n = [
+            nug(
+                "ru/git/reset",
+                "reflog хранит прежние положения HEAD девяносто дней",
+            ),
+            nug(
+                "ru/git/reset",
+                "Флаг --hard выбрасывает незакоммиченные правки",
+            ),
+        ];
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let f = foreign_occurrences(&check("q", &expect, &n), &c, &docs, &repo);
+        assert_eq!(f.hits.len(), 1, "{:?}", f.hits);
+        assert!(f.hits[0].contains("ещё в ru/git/other"), "{:?}", f.hits);
+        // нет набора документов — пометка, а не ошибка
+        assert!(
+            f.skipped.iter().any(|s| s.contains("нет манифеста")),
+            "{:?}",
+            f.skipped
+        );
+    }
+
+    #[test]
     fn fingerprints_follow_content() {
         let d = tmp("nuggets-fp");
         let c = d.join("corpus");
@@ -1002,16 +1132,27 @@ mod tests {
     fn lock_names_docs_generator() {
         let d = tmp("nuggets-lock");
         let lock = d.join(LOCK_FILE);
-        assert!(check_lock(&lock, "a", "b", Some("m")).unwrap().is_none());
+        assert!(
+            check_lock(&lock, "a", "b", Some("m"), (1, 2))
+                .unwrap()
+                .is_none()
+        );
         fs::write(
             &lock,
             "nuggets_fingerprint = \"a\"\ncorpus_fingerprint = \"b\"\n\
              docs_manifest_sha256 = \"m\"\nscenarios = 1\nnuggets = 2\n",
         )
         .unwrap();
-        let l = check_lock(&lock, "a", "b", Some("m")).unwrap().unwrap();
+        let l = check_lock(&lock, "a", "b", Some("m"), (1, 2))
+            .unwrap()
+            .unwrap();
         assert_eq!((l.scenarios, l.nuggets), (1, 2));
-        let e = check_lock(&lock, "a", "z", Some("m"))
+        // число сценариев и нагетов сверяется
+        let e = check_lock(&lock, "a", "b", Some("m"), (1, 3))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("1 и 3 ≠ замороженных 1 и 2"), "{e}");
+        let e = check_lock(&lock, "a", "z", Some("m"), (1, 2))
             .unwrap_err()
             .to_string();
         assert!(
@@ -1020,14 +1161,16 @@ mod tests {
         );
         assert!(!e.contains("генератором"), "{e}");
         // другой манифест набора документов — причина названа
-        let e = check_lock(&lock, "a", "z", Some("m2"))
+        let e = check_lock(&lock, "a", "z", Some("m2"), (1, 2))
             .unwrap_err()
             .to_string();
         assert!(
             e.contains("другим генератором документов") && e.contains("m2"),
             "{e}"
         );
-        let e = check_lock(&lock, "a", "b", None).unwrap_err().to_string();
+        let e = check_lock(&lock, "a", "b", None, (1, 2))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("<нет файла>"), "{e}");
         // старый формат замка (без полей задачи 1b) — ошибка разбора
         fs::write(
@@ -1035,7 +1178,7 @@ mod tests {
             "nuggets_fingerprint = \"a\"\ncorpus_fingerprint = \"b\"\n",
         )
         .unwrap();
-        assert!(check_lock(&lock, "a", "b", Some("m")).is_err());
+        assert!(check_lock(&lock, "a", "b", Some("m"), (1, 2)).is_err());
     }
 
     /// Замороженный sha256 манифеста — тот, что даёт генератор документов сейчас (полный набор,
