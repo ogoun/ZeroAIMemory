@@ -71,13 +71,13 @@ pub async fn put_snapshot(db: &Db, row: &SnapshotRow) -> Result<(), StoreError> 
             return Err(StoreError::NotFound);
         }
         t.execute(
-            "INSERT INTO session_snapshots (session_id, taken_at, trigger, agent, status, skipped,
-                                            bytes, data)
+            "INSERT INTO session_snapshots (session_id, taken_at, trigger_kind, agent, status,
+                                            skipped, bytes, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (session_id) DO UPDATE SET
-               taken_at = excluded.taken_at, trigger = excluded.trigger, agent = excluded.agent,
-               status = excluded.status, skipped = excluded.skipped, bytes = excluded.bytes,
-               data = excluded.data",
+               taken_at = excluded.taken_at, trigger_kind = excluded.trigger_kind,
+               agent = excluded.agent, status = excluded.status, skipped = excluded.skipped,
+               bytes = excluded.bytes, data = excluded.data",
             params![
                 row.session_id,
                 fmt_ts(row.taken_at),
@@ -99,7 +99,7 @@ pub async fn get_snapshot(db: &Db, session: &str) -> Result<Option<SnapshotRow>,
     let session = session.to_string();
     db.read(move |c| {
         Ok(c.query_row(
-            "SELECT session_id, taken_at, trigger, agent, status, skipped, bytes, data
+            "SELECT session_id, taken_at, trigger_kind, agent, status, skipped, bytes, data
              FROM session_snapshots WHERE session_id = ?1",
             [session],
             snapshot_row,

@@ -659,7 +659,7 @@ idea_hints_fixture` — PASS; `cargo fmt --all -- --check`, `cargo clippy -p xta
    (проверка в транзакции записи), а не ошибка внешнего ключа SQLite: сервер (17c) отдаст 404/400
    без разбора текста ошибки. `bytes`, `status`, `skipped` пишутся как прислал клиент; предел
    размера — на сервере (17c).
-5. **[решение исполнителя задачи 2]** `session_snapshots.trigger` без CHECK (комментарий в
+5. **[решение исполнителя задачи 2]** `session_snapshots.trigger_kind` (по ревью — M7) без CHECK (комментарий в
    миграции): новый повод снимка не потребует пересборки; значение проверяет
    `SnapTrigger::parse` при чтении (неизвестное — `Corrupt`). `status` — с CHECK, как в брифе.
 6. **[решение исполнителя задачи 2]** Типы `zam-core::snapshot` без `deny_unknown_fields`:
@@ -684,6 +684,41 @@ read_attachments --test read_batch --test read_since_rev --test recall --test re
 recall_recovery --test vault --test search` (все наборы, где есть `session_seen`, `seen`,
 `X-Zam-Session`, `session_tokens`) — 204 passed, 0 failed, 2 ignored; `cargo fmt --all -- --check`,
 `cargo clippy -p zam-store -p zam-core -p zam-server --all-targets -- -D warnings` чисто.
+
+#### Правки ревью задачи 2 (APPROVED)
+
+Коммит — `fix(store): правки ревью задачи 2` (sha — в отчёте контроллеру).
+- **M7.** Столбец `session_snapshots.trigger` → `trigger_kind` (TRIGGER — ключевое слово SQL; до
+  выпуска бесплатно). Поле `SnapshotRow::trigger` осталось.
+- **M2.** `migrate_0024_keeps_report_triggers_and_rows` открывает базу `Db::open(&path,
+  &USER_MIGRATIONS[..24])` (версия ровно 24), сверка схемы 0024 снова полная (кроме SQL
+  `entries`).
+- **M3.** `migrate_0025_from_m57_db` сверяет `sqlite_master` целиком: всё, кроме таблиц 0025, и их
+  индексы — как были; таблицы с `ADD COLUMN` — прежний SQL с хвостом столбцов (`add_columns`: SQLite
+  вписывает столбец после последнего определения столбца — перед `PRIMARY KEY (…)` таблицы, а
+  без него перед закрывающей скобкой); `session_seen`, `tokens_unattributed`,
+  `session_snapshots` — SQL из файла миграции (`migration_create`; у `session_seen` после
+  `RENAME` имя в кавычках).
+- **M4.** Тот же тест открывает `bak-v24`: `user_version = 24`, строки `session_seen` — прежние.
+- **M6.** Doc `bump_epoch`/`set_holdout`: сессия создаётся без `token_id`, `machine`,
+  `solution_guid`; безвредно — поля дописывает первое касание (`coalesce`), до него сессия ничего
+  не получала, `latest_session` с фильтром машины/решения её не выберет, без касаний — срок
+  `gc_sessions`.
+- Doc модуля `sessions.rs` уточнён по I1: подсказка идей `prompt` пока проверяет повтор по
+  `seen_revs` текущей эпохи (вопрос открыт до 7a).
+
+**Передать:**
+- **I1 → задаче 7a.** Первый проход `prompt_ideas` идёт через общий `shown()` → `seen_revs`
+  текущей эпохи (`crates/zam-server/src/api/recall.rs:2915`, вызовы 934 и 3296): в новой эпохе идея
+  вернётся в подсказку — противоречит §7.2. Исправление: для `kind == idea` проверять через
+  `seen_entry_ids` или дать `seen_revs` `epoch: Option<u32>` (`None` — любая эпоха). Тест
+  `ideas_seen_across_epochs` это ловит.
+- **M1 → задаче 13c.** Откат на 0.0.10-m5.7 — только вручную: остановить сервер, вернуть
+  `<user>.db.bak-v24` (или `bak-v23` при миграции с 0023) на место базы, удалить `-wal`/`-shm`;
+  записанное после миграции теряется. Описать в README-install и CHANGELOG.
+- **M5 → задаче 7a.** Гонка чтения эпохи (`session_epoch` в `request_session`) и `mark_seen` при
+  параллельном `bump_epoch`: отметка может уйти в прежнюю эпоху — допустимо (один лишний повтор
+  выдачи). Альтернатива — подзапрос `(SELECT seen_epoch FROM sessions WHERE id = ?1)` в `INSERT`.
 
 ### Задача 1b. Набор ТС-1, нагеты, заморозка
 

@@ -14,8 +14,10 @@
 //! - эпоха (спецификация M6 §7.2, миграция 0025): `sessions.seen_epoch` растёт [`bump_epoch`]
 //!   (сжатие контекста, `resume`, `clear`, восстановление), отметка пишется в эпоху касания
 //!   ([`SessionTouch::epoch`]), [`seen_revs`] читает только её. Отметки прежних эпох хранятся до
-//!   срока сессии (аналитика). Показ идей — без эпохи ([`seen_entry_ids`]): одна идея — один
-//!   показ за сессию;
+//!   срока сессии (аналитика). Раздел идей дайджеста читает показ без эпохи
+//!   ([`seen_entry_ids`]). Подсказка идей к запросу (`prompt`) пока проверяет повтор через
+//!   [`seen_revs`] текущей эпохи и после новой эпохи повторила бы идею — правило §7.2 «одна
+//!   идея — один показ за сессию» для неё доводит задача 7a;
 //! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12);
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
 //!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя;
@@ -562,6 +564,11 @@ pub async fn gc_sessions(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError> 
 
 /// Новая эпоха `session_seen` сессии (M6 §7.2): `seen_epoch + 1`, обращение (`last_seen_at`);
 /// сессии нет — создаётся с эпохой 1. Возвращает новую эпоху.
+///
+/// Созданная так сессия — без `token_id`, `machine`, `solution_guid` и прочих полей касания.
+/// Это безвредно: поля дописывает первое же касание ([`touch_session`], [`mark_seen`] —
+/// `coalesce`), до него сессия ничего не получала; `latest_session` с фильтром по машине или
+/// решению её не выберет, а без касаний она уйдёт по сроку [`gc_sessions`].
 pub async fn bump_epoch(db: &Db, session: &str) -> Result<u32, StoreError> {
     check_session_id(session)?;
     let id = session.to_string();
@@ -599,7 +606,7 @@ fn epoch_u32(v: i64) -> Result<u32, StoreError> {
 }
 
 /// Признак `holdout` сессии (контрольная группа агентного A/B, M6 §12) с обращением; сессии
-/// нет — создаётся.
+/// нет — создаётся, как в [`bump_epoch`] (без полей касания; это безвредно по тем же причинам).
 pub async fn set_holdout(db: &Db, session: &str, on: bool) -> Result<(), StoreError> {
     check_session_id(session)?;
     let id = session.to_string();

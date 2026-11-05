@@ -52,11 +52,12 @@ CREATE TABLE tokens_unattributed (
 -- Один снимок на сессию (повторная запись заменяет прежний); `data` — JSON нейтрального снимка
 -- `zam_core::snapshot::SnapshotData` после маскировки. Каскада нет: таблица — в явном списке
 -- `gc_sessions`, срок `snapshot.keep_days` соблюдает воркер обслуживания (`gc_snapshots`).
--- `owner_id` не нужен: сессия принадлежит пользователю базы.
+-- `owner_id` не нужен: сессия принадлежит пользователю базы. Повод — `trigger_kind`, а не
+-- `trigger`: TRIGGER — ключевое слово SQL (как `git_commit` в 0023).
 CREATE TABLE session_snapshots (
   session_id TEXT PRIMARY KEY REFERENCES sessions(id),
   taken_at TEXT NOT NULL,
-  trigger TEXT NOT NULL,              -- zam_core::snapshot::SnapTrigger (CHECK нет: новые поводы)
+  trigger_kind TEXT NOT NULL,         -- zam_core::snapshot::SnapTrigger (CHECK нет: новые поводы)
   agent TEXT,
   status TEXT NOT NULL CHECK (status IN ('complete','partial')),
   skipped INTEGER NOT NULL,

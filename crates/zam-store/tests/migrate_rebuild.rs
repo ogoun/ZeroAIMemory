@@ -810,9 +810,8 @@ async fn migrate_0024_keeps_report_triggers_and_rows() {
         );
     }
 
-    let dbs = UserDbs::new(dd.users_dir());
-    let db = dbs.get(user).await.unwrap();
-    dbs.wait_rechunk(user).await;
+    // ровно до 0024: последнюю схему сверяет `migrate_0025_from_m57_db`
+    let db = Db::open(&path, &USER_MIGRATIONS[..24]).unwrap();
     assert!(path.with_file_name(format!("{user}.db.bak-v23")).exists());
     let (counts_after, objects_after, rows_after, version, violations, fk) = db
         .read(|c| {
@@ -827,8 +826,7 @@ async fn migrate_0024_keeps_report_triggers_and_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, USER_MIGRATIONS.len() as u32);
-    assert!(version >= 24);
+    assert_eq!(version, 24);
     assert_eq!(violations, 0, "foreign_key_check не пуст");
     assert!(fk, "foreign_keys выключены после миграции");
     // строки (в том числе Idempotency-Key) и счётчики всех таблиц
@@ -837,12 +835,10 @@ async fn migrate_0024_keeps_report_triggers_and_rows() {
         assert_eq!(counts_after.get(t), Some(n), "таблица {t}");
     }
     assert!(!counts_after.contains_key("entries_new"));
-    // объекты схемы: меняется только SQL таблицы `entries` (объекты таблиц 0025 сверяет
-    // `migrate_0025_from_m57_db`: база открывается последней схемой)
+    // объекты схемы: меняется только SQL таблицы `entries`
     let is_entries = |o: &&MasterObject| o.0 == "table" && o.1 == "entries";
-    let keep = |o: &&MasterObject| !is_entries(o) && !TABLES_0025.contains(&o.2.as_str());
-    let before: Vec<&MasterObject> = objects_before.iter().filter(keep).collect();
-    let after: Vec<&MasterObject> = objects_after.iter().filter(keep).collect();
+    let before: Vec<&MasterObject> = objects_before.iter().filter(|o| !is_entries(o)).collect();
+    let after: Vec<&MasterObject> = objects_after.iter().filter(|o| !is_entries(o)).collect();
     assert_eq!(after, before);
     let sql_of = |s: &BTreeSet<MasterObject>| s.iter().find(is_entries).unwrap().3.clone();
     let (sql_before, sql_after) = (sql_of(&objects_before), sql_of(&objects_after));
@@ -879,16 +875,6 @@ async fn migrate_0024_keeps_report_triggers_and_rows() {
 }
 
 // ---------- 0025 (M6): эпохи `session_seen`, holdout, учёт, снимки, `recv_count` ----------
-
-/// Таблицы, которые меняет или создаёт 0025: их объекты сверяет `migrate_0025_from_m57_db`.
-const TABLES_0025: [&str; 6] = [
-    "sessions",
-    "session_seen",
-    "session_tokens",
-    "code_refs",
-    "tokens_unattributed",
-    "session_snapshots",
-];
 
 fn human() -> Attribution {
     Attribution {
@@ -1111,6 +1097,32 @@ fn probe(c: &Connection, epoch: bool) -> Probe {
     )
 }
 
+/// SQL `CREATE TABLE <name>` из 0025 как его хранит `sqlite_master` (без лишних пробелов).
+fn migration_create(name: &str) -> String {
+    const SQL: &str = include_str!("../migrations/user/0025_session_epochs.sql");
+    let head = format!("CREATE TABLE {name} (");
+    let start = SQL.find(&head).unwrap();
+    let rest = &SQL[start..];
+    let end = rest.find(';').unwrap();
+    rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// SQL таблицы после `ALTER TABLE ADD COLUMN`: SQLite вписывает `, <столбец>` сразу после
+/// последнего определения столбца — перед ограничением таблицы (`PRIMARY KEY (…)`), а без него
+/// перед закрывающей скобкой (и перед `WITHOUT ROWID`).
+fn add_columns(sql: &str, cols: &[&str]) -> String {
+    let cols = cols.join(", ");
+    if let Some(at) = sql.find(", PRIMARY KEY (") {
+        return format!("{}, {cols}{}", &sql[..at], &sql[at..]);
+    }
+    let (head, tail) = match sql.strip_suffix(" WITHOUT ROWID") {
+        Some(h) => (h, " WITHOUT ROWID"),
+        None => (sql, ""),
+    };
+    let head = head.strip_suffix(')').unwrap();
+    format!("{head}, {cols}){tail}")
+}
+
 /// Спецификация M6 §13: база M5.7 (0024, получена из базы 0023 прогоном миграции и дополнена
 /// идеями, вопросом-предложением, задачей «начать», отметками `session_seen`, учётом и картой
 /// кода) открывается последней схемой: копия `bak-v24`; строки на месте (`session_seen` — в
@@ -1174,6 +1186,7 @@ async fn migrate_0025_from_m57_db() {
     assert_eq!(integrity, "ok");
 
     // строки: `session_seen` — те же, в эпохе 0; добавленные столбцы — значения по умолчанию
+    let seen_before_bak = seen_before.clone();
     let want: Vec<(SeenRow, Option<i64>)> =
         seen_before.into_iter().map(|(r, _)| (r, Some(0))).collect();
     assert_eq!(seen_after, want);
@@ -1195,47 +1208,68 @@ async fn migrate_0025_from_m57_db() {
     assert_eq!(counts_after.get("session_snapshots"), Some(&0));
     assert!(!counts_after.keys().any(|t| t.ends_with("_new")));
 
-    // объекты схемы: вне таблиц 0025 — без изменений; в них — ровно ожидаемое
-    let outside = |o: &&MasterObject| !TABLES_0025.contains(&o.2.as_str());
-    assert_eq!(
-        objects_after.iter().filter(outside).collect::<Vec<_>>(),
-        objects_before.iter().filter(outside).collect::<Vec<_>>()
+    // объекты схемы целиком: вне таблиц 0025 и их индексы — как были; `ADD COLUMN` — прежний
+    // SQL с хвостом столбцов; пересобранная и новые таблицы — SQL миграции
+    let mut want = BTreeSet::new();
+    for o in &objects_before {
+        let added: &[&str] = match (o.0.as_str(), o.1.as_str()) {
+            ("table", "sessions") => &[
+                "seen_epoch INTEGER NOT NULL DEFAULT 0",
+                "holdout INTEGER NOT NULL DEFAULT 0",
+            ],
+            ("table", "session_tokens") => &["reread_calls INTEGER NOT NULL DEFAULT 0"],
+            ("table", "code_refs") => &["recv_count INTEGER NOT NULL DEFAULT 0"],
+            ("table", "session_seen") => {
+                let sql = migration_create("session_seen_new").replace(
+                    "CREATE TABLE session_seen_new",
+                    "CREATE TABLE \"session_seen\"",
+                );
+                want.insert((o.0.clone(), o.1.clone(), o.2.clone(), sql));
+                continue;
+            }
+            _ => &[],
+        };
+        let sql = if added.is_empty() {
+            o.3.clone()
+        } else {
+            add_columns(&o.3, added)
+        };
+        want.insert((o.0.clone(), o.1.clone(), o.2.clone(), sql));
+    }
+    for t in ["tokens_unattributed", "session_snapshots"] {
+        let s = |v: &str| v.to_string();
+        want.insert((s("table"), s(t), s(t), migration_create(t)));
+    }
+    let s = |v: &str| v.to_string();
+    want.insert((
+        s("index"),
+        s("sqlite_autoindex_session_snapshots_1"),
+        s("session_snapshots"),
+        String::new(),
+    ));
+    let extra: Vec<_> = objects_after.difference(&want).collect();
+    let missing: Vec<_> = want.difference(&objects_after).collect();
+    assert!(
+        extra.is_empty() && missing.is_empty(),
+        "лишние: {extra:#?}\nнет: {missing:#?}"
     );
-    let names = |s: &BTreeSet<MasterObject>| -> Vec<String> {
-        s.iter()
-            .filter(|o| !outside(o))
-            .map(|o| format!("{} {}", o.0, o.1))
-            .collect()
-    };
-    let new = [
-        "index sqlite_autoindex_session_snapshots_1",
-        "table session_snapshots",
-        "table tokens_unattributed",
-    ];
-    let mut want: Vec<String> = names(&objects_before)
-        .into_iter()
-        .chain(new.iter().map(|s| s.to_string()))
-        .collect();
-    want.sort();
-    assert_eq!(names(&objects_after), want);
-    let sql = |name: &str| {
-        objects_after
-            .iter()
-            .find(|o| o.0 == "table" && o.1 == name)
-            .unwrap()
-            .3
-            .clone()
-    };
-    let seen_sql = sql("session_seen");
+    let seen_sql = &objects_after
+        .iter()
+        .find(|o| o.0 == "table" && o.1 == "session_seen")
+        .unwrap()
+        .3;
     assert!(
         seen_sql
-            .contains("PRIMARY KEY (session_id, owner_id, target_kind, target_id, part, epoch)")
-            && seen_sql.contains("REFERENCES sessions(id)")
-            && seen_sql.contains("CHECK (target_kind IN ('node','entry','blob'))"),
+            .contains("PRIMARY KEY (session_id, owner_id, target_kind, target_id, part, epoch)"),
         "{seen_sql}"
     );
-    assert!(sql("code_refs").contains("recv_count INTEGER NOT NULL DEFAULT 0"));
-    assert!(sql("tokens_unattributed").ends_with("WITHOUT ROWID"));
+
+    // копия перед миграцией: схема 0024 и прежние отметки
+    {
+        let bak = conn(&path.with_file_name(format!("{user}.db.bak-v24")));
+        assert_eq!(user_version(&bak), 24);
+        assert_eq!(seen_rows(&bak, false), seen_before_bak);
+    }
 
     assert_report_triggers(&db, report, &sha).await;
 
