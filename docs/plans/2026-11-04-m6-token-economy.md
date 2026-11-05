@@ -2,7 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Редакция 4 (2026-11-05) — правки рецензии переноса (спецификация 4.5: `restore` через
+Редакция 5 (2026-11-05) — правки повторной рецензии переноса (спецификация 4.6). Редакция 4 —
+правки рецензии переноса (спецификация 4.5: `restore` через
 `.zam-reindex`, новые id для чужого архива, `imported_from`, 18b → 18b1/18b2). Редакция 3 — задачи
 18a–18c «перенос памяти» (решение владельца 2026-11-05, ответ
 В; спецификация §12б, редакция 4.4). Редакция 2 (2026-11-04) — по рецензии плана (CHANGES REQUESTED: C1–C3, I1–I10, Minor); спецификация —
@@ -49,7 +50,7 @@
 3339 (задача 6). xtask остаётся синхронным (`ureq`), без `tokio` и `semver`. WebUI — Svelte 5, без
 новых пакетов.
 
-**Spec:** `docs/specs/2026-11-04-m6-token-economy.md`, редакция 4.5 (далее — «спецификация»; `§N` —
+**Spec:** `docs/specs/2026-11-04-m6-token-economy.md`, редакция 4.6 (далее — «спецификация»; `§N` —
 её разделы). Исследование — `docs/research/2026-11-04-m6-token-economy.md`, baton —
 `docs/research/2026-11-04-baton-review.md`, события хуков — `docs/research/2026-10-28-agent-hook-events.md`.
 Основа — ТЗ `docs/specs/2026-10-17-zeroaimemory-tz.md` v1.23. Журнал —
@@ -1286,20 +1287,25 @@ pub fn mask_and_limit(s: Snapshot, max_bytes: usize) -> Snapshot;
 - Modify:
   - `crates/zam-server/src/main.rs` — `Cmd::Backup`, `Cmd::Restore`;
   - `crates/zam-server/src/config.rs` — `[backup]`;
-  - `crates/zam-server/src/maintenance.rs` — `schedule::tick`, контрольная точка `PASSIVE` при
-    `.zam-backup`;
+  - `crates/zam-server/src/maintenance.rs` — `schedule::tick`;
+  - `crates/zam-store/src/db.rs` — `backup_active: AtomicBool`; фоновый поток контрольных точек
+    читает `.zam-backup` раз в `checkpoint_interval`; при признаке оба места `RESTART` (фоновый
+    поток и страховка писателя по `wal_limit_bytes`) делают только `PASSIVE`;
   - `crates/zam-server/src/api/index.rs` — поле `backup`;
   - `deploy/config.example.toml`;
-  - `crates/zam-store/src/{db.rs,system.rs,datadir.rs}` — метка `restore` в `.zam.lock`;
+  - `crates/zam-store/src/{system.rs,datadir.rs,jobs.rs}` — метка `restore` в `.zam.lock`,
+    `set_reindex_pending` (`REINDEX_KEY`) для `restore`;
   - `crates/zam-server/Cargo.toml` — `zip` из dev-зависимостей в основные (крейт workspace).
     `windows` с `Win32_Storage_FileSystem` уже есть.
 
 **Interfaces — Produces:**
 ```rust
 // zam-store
-pub fn vacuum_into(src: &Path, dst: &Path) -> Result<(), StoreError>;
-//   соединение READ_WRITE + query_only=1 (создаёт -shm); каталог только для чтения и база закрыта —
-//   URI immutable=1
+pub fn vacuum_into(src: &Path, dst: &Path, mode: OpenMode) -> Result<(), StoreError>;
+pub enum OpenMode { QueryOnly /*READ_WRITE + query_only=1, создаёт -shm*/, Immutable /*только под своим .zam.lock*/ }
+pub struct BackupFlag { pub pid: u32, pub started_at: String }   // .zam-backup
+pub fn backup_flag_active(data_dir: &Path, max_age: Duration) -> bool; // мёртвый pid или старше — false + WARN
+pub async fn set_reindex_pending(db: &Db, spec: &serde_json::Value) -> Result<(), StoreError>; // «вся база, из кэша»
 pub fn integrity_ok(path: &Path) -> Result<(u32 /*user_version*/, bool), StoreError>;
 pub fn meta_value(path: &Path, key: &str) -> Result<Option<String>, StoreError>; // meta.chunker*
 impl SystemDb { pub async fn clear_web_sessions(&self) -> Result<u64, StoreError>; }
@@ -1323,14 +1329,15 @@ pub struct RestoreReport { pub dbs: usize, pub blobs: usize, pub schemas: BTreeM
                            pub drift: Vec<String>, pub vectors: VectorPlan, pub vault_ok: bool }
 pub async fn restore(cfg: &ServerConfig, src: &Path, opts: &RestoreOpts) -> Result<RestoreReport, BackupError>;
 //   .zam.lock с меткой restore; проверки до записи; блобы копируются; web_sessions очищается;
-//   reindex не запускает — ставит .zam-reindex (при opts.reindex)
+//   reindex не запускает: meta.reindex_pending в каждой базе (+ .zam-reindex в qdrant/), при opts.reindex
 #[derive(thiserror::Error)] pub enum BackupError { Locked, RestoreInProgress, NotEmpty, NoSpace { need: u64, free: u64 },
     SchemaTooNew { file: String, have: u32, max: u32 }, BadSum { path: String },
     MissingBlob { user: String, sha: String }, Io(#[from] io::Error), Store(#[from] StoreError) }
 // schedule.rs — чистая функция, тесты зовут её напрямую
 pub enum Action { Skip, Backup, Prune(Vec<PathBuf>) }
 pub fn tick(now: jiff::Timestamp, last: Option<jiff::Timestamp>, existing: &[PathBuf], cfg: &BackupConfig) -> Vec<Action>;
-// config [backup]: dir, schedule Off|Daily, at "HH:MM" UTC, keep 1..=365 (7), warn_days 1..=365 (7)
+// config [backup]: dir, schedule Off|Daily, at "HH:MM" UTC, keep 1..=365 (7), warn_days 1..=365 (7),
+//   flag_max_hours 1..=168 (6)
 // GET /index/status → backup: {last_at, schedule, warning: Option<"no_recent_backup">}
 // CLI: zam-server backup [--config P] [--dir D] [--zip F] [--json];
 //      zam-server restore <D|F.zip> [--config P] [--replace] [--no-reindex]
@@ -1341,9 +1348,15 @@ pub fn tick(now: jiff::Timestamp, last: Option<jiff::Timestamp>, existing: &[Pat
     - `backup_while_writing_invariants` — писатель вставляет записи во время копии. Копия проходит
       `integrity_check` и `foreign_key_check`; число записей в диапазоне [до копии, после копии];
       ревизии каждой записи полны;
-    - `backup_writer_latency_and_wal_bound` — во время копии p99 записи ≤ 200 мс, `-wal` ≤ 64 МиБ
-      на фикстуре 20 000 записей;
+    - `backup_writer_no_busy_and_wal_bound` — параллельный сервер не получает `SQLITE_BUSY` сверх
+      `busy_timeout`; рост `-wal` ≤ (байт записано за время копии) × 1,5 + 4 МиБ; после снятия
+      признака WAL ≤ `wal_restart_bytes`;
+    - `db_checkpoint_passive_while_backup_flag` (`zam-store`) — при `backup_active` нет `RESTART`
+      ни в фоновом потоке, ни в страховке писателя;
+    - `stale_backup_flag_ignored_with_warn` — мёртвый `pid` и файл старше 6 ч;
     - `backup_reads_closed_db_without_wal_shm`;
+    - `backup_immutable_only_under_own_lock` — без своего `.zam.lock` и в каталоге только для
+      чтения → код 1;
     - `backup_order_users_from_system_copy` — пользователь, созданный после снимка `system.db`, —
       в `drift`, а не ошибка;
     - `backup_checks_free_space` — подмена свободного места точкой `test-hooks`;
@@ -1363,7 +1376,10 @@ pub fn tick(now: jiff::Timestamp, last: Option<jiff::Timestamp>, existing: &[Pat
   - восстановление:
     - `restore_older_schema_migrates` — копия базы 0024 (фикстура задачи 2) → 0025, `bak-v24`;
     - `restore_copies_blobs_not_links`;
-    - `restore_clears_web_sessions`, `restore_sets_reindex_flag`;
+    - `restore_clears_web_sessions`;
+    - `restore_sets_reindex_pending_each_db` — и `.zam-reindex` в `qdrant/`;
+    - `restore_external_qdrant_rebuilds_from_cache` — внешний Qdrant (без супервизора) получает
+      точки из кэша на первом открытии;
     - `restore_without_key_vault_unavailable`;
     - `restore_vector_plan_model_and_chunker` — разные `model_id` или `meta.chunker` дают
       `Recompute` с причиной;
@@ -1377,7 +1393,7 @@ pub fn tick(now: jiff::Timestamp, last: Option<jiff::Timestamp>, existing: &[Pat
 - [ ] **Step 2: Реализация** по §12б.2–§12б.4. Предупреждение о мастер-ключе печатается в stderr
   дословно, как в спецификации.
 - [ ] **Step 3: Проверка.**
-  - `cargo test -p zam-store $T vacuum`;
+  - `cargo test -p zam-store $T vacuum checkpoint_passive`;
   - `cargo test -p zam-server --test backup --features test-hooks $T`;
   - `$env:ZAM_REQUIRE_ML=1; cargo test -p zam-server --test backup $T restore_then_serve`.
 
@@ -1446,7 +1462,8 @@ pub fn file_name_for(path: &str, taken: &mut HashSet<String>) -> String;
 ```rust
 pub enum OnConflict { Skip, Revision }
 pub enum AxiomPolicy { Demote /*→ theorem*/, Keep }   // по умолчанию: свой архив → Keep, чужой → Demote
-pub struct ImportOptions { pub on_conflict: OnConflict, pub axioms: Option<AxiomPolicy>, pub dry_run: bool }
+pub struct ImportOptions { pub own: bool /*прямое указание «это мой архив»*/, pub on_conflict: OnConflict,
+                          pub axioms: Option<AxiomPolicy>, pub dry_run: bool }
 pub struct ImportedFrom { pub archive_fingerprint: String, pub source_id: String,
                           pub source_rev: u32, pub content_hash: String }  // data.imported_from / meta узла
 pub struct ImportReport { pub created: u64, pub revised: u64, pub skipped: u64,
@@ -1458,13 +1475,21 @@ pub struct ImportReport { pub created: u64, pub revised: u64, pub skipped: u64,
 // zam-store/src/import.rs
 pub struct ImportLimits { pub max_bytes: u64, pub max_files: usize, pub max_ratio: u32 /*100*/ }
 pub fn validate_archive(zip: &mut ZipArchive<File>, limits: &ImportLimits) -> Result<Plan, ImportError>;
-pub fn remap_ids(plan: &mut Plan, own: bool) -> IdMap;  // чужой архив: новые UUIDv7, ссылки
-    // n:/i:/c:/r:/t:/k:/q:/w:/p: в телах и data (task_id, prev_task_ids, question_id, idea, links),
-    // _links.jsonl, derived_from, связка идея↔задача↔вопрос; неизвестные — unresolved
+pub const REF_LETTERS: &[&str];   // ENTRY_REF_LETTERS (i c r t k q p w e) ∪ {n, d}, канон TargetRef
+pub const REF_COLUMNS: &[&str] = &["supersedes_id", "superseded_by_id", "data.task_id",
+    "data.prev_task_ids", "data.question_id", "data.idea", "data.blocked_by", "data.links"];
+pub fn scan_refs(text: &str) -> Vec<RefSpan>;   // один сканер для всех текстовых полей (по образцу refs_in_text)
+pub fn plan_ids(db: &Db, plan: &Plan, own: bool) -> IdMap;
+//   чужой: все id новые; свой: исходные, кроме коллизий (id в базах сервера или точка Qdrant UUIDv5 чанка)
+pub fn remap_refs(plan: &mut Plan, map: &IdMap) -> RemapReport;
+//   тела, l0, frontmatter, title, строки data/refs; REF_COLUMNS; _links.jsonl;
+//   a:<chunk> и ссылки не из map → unresolved; dst_space_id вне архива/базы → links_skipped
+// производные (рёбра wikilink/frontmatter, file_refs, triggers, глоссарий, связи идей, документы
+//   вложений, чанки) из архива не копируются — их строит обычная запись zam-store
 pub async fn apply_plan(db: &Db, space: Id, plan: Plan, opts: &ImportOptions, attrib: &Attribution)
     -> Result<ImportReport, ImportError>;   // пачки по 200; повтор — по imported_from + content_hash;
     // заметки: id/imported_from.source_id сильнее пути; путь занят другим — path-taken
-// CLI: zam import <F.zip|DIR> [--space S] [--on-conflict skip|revision] [--axioms demote|keep] [--dry-run]
+// CLI: zam import <F.zip|DIR> [--space S] [--own] [--on-conflict skip|revision] [--axioms demote|keep] [--dry-run]
 //   DIR упаковывается в zip локально (крейт zip), без manifest.json — архив чужой
 ```
 
@@ -1476,6 +1501,12 @@ pub async fn apply_plan(db: &Db, space: Id, plan: Plan, opts: &ImportOptions, at
       `derived_from`, идея ↔ задача ↔ вопрос;
     - `foreign_import_same_server_keeps_owner_search` — архив A импортирует B; поиск A (топ-5 и
       точки Qdrant A) не изменился;
+    - `remap_all_letters_and_columns` — `e:`, `d:`, `n:`, `supersedes_id`/`superseded_by_id`,
+      `data.blocked_by`; `a:` → `unresolved`;
+    - `roundtrip_derived_tables_match` — `file_refs` и `triggers` после круга совпадают (с поправкой
+      на новые id), рёбра wikilink построены записью;
+    - `own_flag_keeps_ids_and_axioms_on_new_server` — другой `user_id`, `own=true`;
+    - `own_flag_collision_remaps_with_report`;
   - аксиомы:
     - `import_foreign_axioms_to_theorem_with_revision`;
     - `import_own_axioms_kept`, `import_axioms_keep_explicit`;
@@ -1531,7 +1562,8 @@ cargo xtask transfer-check bindings --data-dir <D> --old-path "<старый dat
   - Предупреждения:
     - мастер-ключ хранится отдельно;
     - при другой модели или нарезке векторы считаются заново, а на 2 ядрах это долго.
-  - Отдельно — путь через `export/import`.
+  - Отдельно — путь через `export/import`: на новом сервере свой архив импортируется с `--own`
+    (там другой `user_id`).
 
   Тест — PASS.
 - [ ] **Step 3: Переезд на стенде.**
