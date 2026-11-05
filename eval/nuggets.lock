@@ -1,0 +1,7 @@
+# Замок набора ТС-1 M6 (задача 1b, 2026-11-05): отпечатки сценариев, нагетов и корпуса.
+# Расхождение — ошибка `cargo xtask eval --check` и прогона (спецификация M6 §3.2).
+nuggets_fingerprint = "a1a0468e8fad623ff8ae702552a3418f"
+corpus_fingerprint = "bd45efd45b6267f8d3994a9060626ad1"
+docs_manifest_sha256 = "e41b4142f42078299f8a70c6aa1f4b8c248f719081f4842d950bb4cf72a29c39"
+scenarios = 48
+nuggets = 241
