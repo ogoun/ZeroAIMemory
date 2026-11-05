@@ -731,4 +731,23 @@ async fn unattributed_upsert_adds() {
             (s("2026-11-06"), s("mcp"), 1, 1),
         ]
     );
+    // чтение с суток (M6 задача 3): свежие первыми, внутри суток — по событию
+    let row = |d: &str, e: &str, calls, tokens| zam_store::UnattributedRow {
+        day: s(d),
+        event: s(e),
+        calls,
+        tokens,
+    };
+    assert_eq!(
+        zam_store::unattributed_tokens(&db, d1).await.unwrap(),
+        [
+            row("2026-11-06", "mcp", 1, 1),
+            row("2026-11-05", "mcp", 3, 150),
+            row("2026-11-05", "search", 1, 7),
+        ]
+    );
+    assert_eq!(
+        zam_store::unattributed_tokens(&db, d2).await.unwrap(),
+        [row("2026-11-06", "mcp", 1, 1)]
+    );
 }

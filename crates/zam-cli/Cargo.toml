@@ -29,6 +29,15 @@ blake3.workspace = true
 # карта кода (M5.6): экстрактор tree-sitter — фича `parse` только у клиента (сервер без C-кода)
 zam-code = { path = "../zam-code", features = ["parse"] }
 
+# цепочка предков процесса (привязка `zam mcp` к сессии, M6 §7.1): ToolHelp32 (MIT OR
+# Apache-2.0, крейт workspace, уже у xtask)
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+
+[features]
+# точки подмены для тестов (цепочка предков процесса `hook::procs`)
+test-hooks = []
+
 [dev-dependencies]
 zam-server = { path = "../zam-server" }
 zam-store = { path = "../zam-store" }

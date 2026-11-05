@@ -312,6 +312,7 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
             "/api/v1/sessions",
             get(sessions::list).post(sessions::create),
         )
+        .route("/api/v1/sessions/unattributed", get(sessions::unattributed))
         .route(
             "/api/v1/sessions/{id}",
             get(sessions::get).patch(sessions::patch),

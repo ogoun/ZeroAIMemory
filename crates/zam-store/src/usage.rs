@@ -5,7 +5,8 @@
 //! только дописывается.
 //!
 //! Учёт выданного без сессии (`tokens_unattributed`, спецификация M6 §7.1, миграция 0025) —
-//! здесь же, в базе пользователя запроса: сутки UTC × событие, [`add_unattributed`].
+//! здесь же, в базе пользователя запроса: сутки UTC × событие, [`add_unattributed`] и
+//! [`unattributed_tokens`].
 use std::collections::HashMap;
 
 use jiff::Timestamp;
@@ -148,6 +149,40 @@ pub async fn add_unattributed(
         )?
         .execute(params![day, event, calls, tokens])?;
         Ok(())
+    })
+    .await
+}
+
+/// Строка учёта выданного без сессии: сутки UTC (`YYYY-MM-DD`), событие, вызовы и токены.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnattributedRow {
+    pub day: String,
+    pub event: String,
+    pub calls: i64,
+    pub tokens: i64,
+}
+
+/// Учёт выданного без сессии с суток `since` (включительно): свежие сутки первыми, внутри
+/// суток — по событию.
+pub async fn unattributed_tokens(
+    db: &Db,
+    since: jiff::civil::Date,
+) -> Result<Vec<UnattributedRow>, StoreError> {
+    let since = since.strftime("%Y-%m-%d").to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT day, event, calls, tokens FROM tokens_unattributed WHERE day >= ?1
+             ORDER BY day DESC, event",
+        )?;
+        let rows = st.query_map([since], |r| {
+            Ok(UnattributedRow {
+                day: r.get(0)?,
+                event: r.get(1)?,
+                calls: r.get(2)?,
+                tokens: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
 }

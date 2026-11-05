@@ -827,6 +827,12 @@ fn hook_budgets() {
         "session-start не записал file-refs.json; hooks.log:\n{}",
         p.log()
     );
+    // M6 §7.1: замер `session-start` — с записью привязки `zam mcp` к сессии
+    let bound = std::fs::read_dir(p.repo.join(".zeroaimemory/cache"))
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with("agent-"));
+    assert!(bound, "session-start не записал agent-<pid>.json");
     // прогрев (fix round 1, M-2): после массовой загрузки корпуса отдельные `session-start`
     // упирались в бюджет (запись сессии ждала диск, занятый фоновой записью на HDD, — выбросы
     // шли и через 5–10 с после загрузки) — замер начинается, когда 20 вызовов подряд проходят

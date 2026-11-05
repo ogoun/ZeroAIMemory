@@ -2,8 +2,13 @@
 //!
 //! - Читает stdin построчно: строка — одно сообщение JSON-RPC (запрос, уведомление, ответ или
 //!   пачка). Каждое уходит отдельным `POST /mcp` с `Authorization: Bearer`, `X-Zam-Solution`
-//!   (из `solution.toml`) и `X-Zam-Machine`; `X-Zam-Session` прокси не шлёт — сессию выбирает
-//!   сервер (R13; fix round 1, I-4); `Origin` не шлётся.
+//!   (из `solution.toml`) и `X-Zam-Machine`; `Origin` не шлётся.
+//! - **Сессия** (M6 §7.1, [`SessionSource`]): `X-Zam-Session` — по порядку `ZAM_SESSION_ID`,
+//!   `CLAUDE_CODE_SESSION_ID`, файл привязки хука `session-start` по своей цепочке предков
+//!   ([`hook::binding::read_binding`]; читается при `initialize` и затем не чаще раза в
+//!   [`BINDING_REFRESH`]). Нет ни одного — без заголовка, сессию выбирает сервер неявно (R13),
+//!   без учёта выданного в сессии. `ZAM_SESSION` и `session.json` хуков, как и раньше, на MCP
+//!   не влияют (fix round 1, I-4): `session.json` общий у параллельных агентов проекта.
 //! - Ответ `application/json` пишется в stdout одной строкой; `text/event-stream` (SSE)
 //!   разворачивается: каждое событие `data:` — отдельная строка. 202/204 — без вывода.
 //! - После `initialize` прокси шлёт `MCP-Protocol-Version` с согласованной версией, а
@@ -17,12 +22,58 @@
 //!   первым); stdout пишется построчно под блокировкой. Конец stdin — выход с кодом 0 после всех
 //!   ответов. Токен и тексты сообщений никуда, кроме сервера, не пишутся.
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::Ctx;
+use super::{Ctx, hook};
 use crate::client::{CliError, Client};
+
+/// Как часто `zam mcp` перечитывает файл привязки (новая сессия после `/clear`, `resume`).
+pub const BINDING_REFRESH: Duration = Duration::from_secs(30);
+
+/// Источник `X-Zam-Session` (см. модуль): переменная окружения или файл привязки.
+struct SessionSource {
+    /// `ZAM_SESSION_ID` или `CLAUDE_CODE_SESSION_ID` — на всё время процесса.
+    fixed: Option<String>,
+    /// Корень проекта: там `.zeroaimemory/cache/agent-<pid>.json`.
+    root: PathBuf,
+    /// Сессия из файла и когда он читался.
+    bound: Mutex<(Option<String>, Option<Instant>)>,
+}
+
+impl SessionSource {
+    fn new(get: impl Fn(&str) -> Option<String>, root: PathBuf) -> SessionSource {
+        let fixed = hook::session_var(get(zam_core::MCP_SESSION_ENV))
+            .or_else(|| hook::session_var(get("CLAUDE_CODE_SESSION_ID")));
+        SessionSource {
+            fixed,
+            root,
+            bound: Mutex::new((None, None)),
+        }
+    }
+
+    /// Сессия запроса; `initialize` (`fresh`) перечитывает файл привязки сразу.
+    fn current(&self, fresh: bool) -> Option<String> {
+        if let Some(s) = &self.fixed {
+            return Some(s.clone());
+        }
+        let mut b = self.bound.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if refresh_due(b.1, now, fresh) {
+            *b = (hook::binding::read_binding(&self.root), Some(now));
+        }
+        b.0.clone()
+    }
+}
+
+/// Пора ли перечитать файл привязки: ни разу не читался, `initialize` или прошло
+/// [`BINDING_REFRESH`].
+fn refresh_due(last: Option<Instant>, now: Instant, fresh: bool) -> bool {
+    fresh || last.is_none_or(|t| now.saturating_duration_since(t) >= BINDING_REFRESH)
+}
 
 /// Состояние сеанса MCP, общее для потоков запросов.
 #[derive(Default)]
@@ -136,7 +187,7 @@ fn fail_unanswered(ids: &[Value], answered: &[Value], reason: &str) {
 }
 
 /// Одно сообщение: запрос к серверу и вывод ответа.
-fn forward(client: &Client, state: &Mutex<Session>, line: &str) {
+fn forward(client: &Client, state: &Mutex<Session>, source: &SessionSource, line: &str) {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -160,6 +211,10 @@ fn forward(client: &Client, state: &Mutex<Session>, line: &str) {
     }
     if let Some(s) = sid.as_deref() {
         headers.push(("Mcp-Session-Id", s));
+    }
+    let agent_session = source.current(initialize);
+    if let Some(s) = agent_session.as_deref() {
+        headers.push(("X-Zam-Session", s));
     }
     let body = msg.to_string();
     let mut resp = match client.post_mcp(body.as_bytes(), &headers) {
@@ -235,10 +290,15 @@ fn fail_unanswered_quiet(ids: &[Value], answered: &[Value], reason: &str) {
 
 pub fn run(ctx: Ctx) -> Result<(), CliError> {
     let mut client = ctx.client;
-    // сессию MCP выбирает сервер (R13), а не `session.json` хуков (I-4)
+    // не `session.json` хуков (I-4): сессия — из [`SessionSource`] (M6 §7.1)
     client.set_session(None);
     let client = Arc::new(client);
     let state = Arc::new(Mutex::new(Session::default()));
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let source = Arc::new(SessionSource::new(
+        |k| std::env::var(k).ok(),
+        hook::project_root(&cwd, &super::home_dir()),
+    ));
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut stdin = std::io::stdin().lock();
     let mut buf = Vec::new();
@@ -278,8 +338,8 @@ pub fn run(ctx: Ctx) -> Result<(), CliError> {
             let _ = workers.remove(0).join();
             workers.retain(|w| !w.is_finished());
         }
-        let (c, s) = (client.clone(), state.clone());
-        let h = std::thread::spawn(move || forward(&c, &s, &line));
+        let (c, s, src) = (client.clone(), state.clone(), source.clone());
+        let h = std::thread::spawn(move || forward(&c, &s, &src, &line));
         if first {
             let _ = h.join();
         } else {
@@ -339,6 +399,34 @@ fn read_line_limited(r: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> std
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_source_order_and_refresh() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let s = SessionSource::new(
+            env(&[("ZAM_SESSION_ID", "a"), ("CLAUDE_CODE_SESSION_ID", "b")]),
+            root.clone(),
+        );
+        assert_eq!(s.current(true).as_deref(), Some("a"));
+        let s = SessionSource::new(
+            env(&[("ZAM_SESSION_ID", " "), ("CLAUDE_CODE_SESSION_ID", "b")]),
+            root,
+        );
+        assert_eq!(s.current(false).as_deref(), Some("b"));
+        let t0 = Instant::now();
+        assert!(refresh_due(None, t0, false));
+        assert!(refresh_due(Some(t0), t0, true));
+        assert!(!refresh_due(Some(t0), t0 + Duration::from_secs(29), false));
+        assert!(refresh_due(Some(t0), t0 + BINDING_REFRESH, false));
+    }
 
     #[test]
     fn sse_events_become_lines() {

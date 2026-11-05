@@ -26,6 +26,7 @@
 //!   [`cache::estimate_tokens`]); сетевые хуки (`session-start`, `prompt`, `post-tool` ошибки,
 //!   `checkpoint`, `subagent-start` — для сессии родителя) отправляют её параллельно со своим
 //!   запросом ([`cache::flush_tokens`]). Вывод сетевых хуков сервер считает сам (`/recall`).
+pub mod binding;
 pub mod cache;
 pub mod checkpoint;
 pub mod input;
@@ -33,6 +34,7 @@ pub mod journal;
 pub mod output;
 pub mod post_tool;
 pub mod pre_tool;
+pub mod procs;
 pub mod prompt;
 pub mod session_start;
 pub mod subagent_start;
@@ -481,7 +483,7 @@ pub fn launched_by_agent(get: &impl Fn(&str) -> Option<String>, names: &[String]
 }
 
 /// Id сессии из переменной: непустой, до 128 печатных символов.
-fn session_var(v: Option<String>) -> Option<String> {
+pub(crate) fn session_var(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s.chars().count() <= 128 && !s.chars().any(char::is_control))
 }

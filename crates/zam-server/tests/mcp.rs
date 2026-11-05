@@ -2820,3 +2820,352 @@ async fn mcp_propose_reopen_dropped_task() {
     .await;
     assert!(o.text.contains(&format!("Идея w:{id}: new")), "{}", o.text);
 }
+
+// ---- M6 §7.1: сессия MCP — явная или никакая ----
+
+/// `~N tok` последней строки ответа инструмента.
+fn tok_of(o: &Out) -> i64 {
+    let last = o.text.trim_end().rsplit('\n').next().unwrap();
+    last.trim_start_matches('~')
+        .trim_end_matches(" tok")
+        .parse()
+        .unwrap_or_else(|_| panic!("нет ~N tok: {}", o.text))
+}
+
+/// Учёт выданного сессии: `GET /sessions/{id}` → `tokens`.
+async fn session_tokens(a: &Api, id: &str) -> Value {
+    let r = a
+        .t(Method::GET, &format!("/api/v1/sessions/{id}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["tokens"].clone()
+}
+
+/// `GET /sessions/unattributed?days=1` → `items`.
+async fn unattributed(a: &Api) -> Vec<Value> {
+    let r = a
+        .t(Method::GET, "/api/v1/sessions/unattributed?days=1", None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"].as_array().unwrap().clone()
+}
+
+/// REST-поиск «квазар» с заголовками `extra`.
+async fn rest_search(a: &Api, extra: &[(&str, &str)], mode: &str, format: &str) -> Resp {
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "квазар", "mode": mode, "format": format})),
+            extra,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r
+}
+
+/// Заметка о квазаре; id узла.
+async fn quasar(a: &Api) -> String {
+    let n = a
+        .note(
+            "knowledge",
+            "Астро/Квазар",
+            "# Квазар\n\nКвазар светит ярко.\n",
+        )
+        .await;
+    n["id"].as_str().unwrap().to_string()
+}
+
+/// Явная сессия (`X-Zam-Session` запроса MCP): `/read` отмечает выданное, следующий
+/// `memory_search` — карточка с фрагментом и пометкой «(выдавалось)»; REST той же сессии —
+/// прежнее `(seen)` без фрагмента. Учёт — событие `mcp` сессии.
+#[tokio::test]
+async fn mcp_explicit_session_marks_seen() {
+    let a = api("mcp-explicit-seen", |_| {}).await;
+    let id = quasar(&a).await;
+    let h = sess();
+    let r = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}]}),
+    )
+    .await;
+    assert!(r.text.contains("светит ярко"), "{}", r.text);
+    let s = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар"}),
+    )
+    .await;
+    assert!(s.text.contains(&format!("n:{id}")), "{}", s.text);
+    assert!(s.text.contains("(выдавалось)"), "{}", s.text);
+    assert!(s.text.contains("светит"), "фрагмент остаётся: {}", s.text);
+    assert!(!s.text.contains("(seen)"), "{}", s.text);
+    // JSON: `seen: true` и фрагмент
+    let j = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар", "format": "json"}),
+    )
+    .await;
+    let it = j.json()["items"][0].clone();
+    assert_eq!(it["seen"], true, "{it}");
+    assert!(
+        it["snippet"].as_str().is_some_and(|s| s.contains("светит")),
+        "{it}"
+    );
+    // REST той же сессии — прежнее поведение
+    let md = rest_search(&a, &h, "brief", "md").await.text();
+    assert!(
+        md.contains("(seen)") && !md.contains("(выдавалось)"),
+        "{md}"
+    );
+    assert!(!md.contains("светит"), "{md}");
+    // учёт: три вызова MCP — событие `mcp`
+    let t = session_tokens(&a, SESSION).await;
+    assert_eq!(t["mcp"]["calls"], 3, "{t}");
+    let want = tok_of(&r) + tok_of(&s) + tok_of(&j);
+    assert_eq!(t["mcp"]["tokens"], want, "{t}");
+    assert!(unattributed(&a).await.is_empty());
+}
+
+/// Без `X-Zam-Session` (неявная сессия R13 — последняя сессия хуков): запись по-прежнему
+/// засчитывается ей, но отметок `session_seen` и пометок нет, а токены — в счётчик
+/// `unattributed` пользователя по дням.
+#[tokio::test]
+async fn implicit_session_no_marks_goes_unattributed() {
+    let a = api("mcp-implicit-unattributed", |_| {}).await;
+    let id = quasar(&a).await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "hook-s", "agent": "claude-code"})),
+            &[("x-zam-machine", MACHINE)],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let m = [("x-zam-machine", MACHINE)];
+    let r = ok(
+        &a,
+        &a.token,
+        &m,
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}]}),
+    )
+    .await;
+    assert!(r.text.contains("светит ярко"), "{}", r.text);
+    let s = ok(
+        &a,
+        &a.token,
+        &m,
+        "memory_search",
+        json!({"query": "квазар", "mode": "chunks"}),
+    )
+    .await;
+    assert!(
+        !s.text.contains("(выдавалось)") && !s.text.contains("(seen)"),
+        "{}",
+        s.text
+    );
+    let w = ok(
+        &a,
+        &a.token,
+        &m,
+        "memory_write",
+        json!({"path": "Неявная/A", "content": "# A\n\nтекст\n"}),
+    )
+    .await;
+    // отметок нет: та же сессия явно по REST видит цель невыданной
+    let hs = [("x-zam-session", "hook-s"), ("x-zam-machine", MACHINE)];
+    let j = rest_search(&a, &hs, "brief", "json").await.json();
+    assert_eq!(j["items"][0]["seen"], false, "{j}");
+    // запись засчитана неявной сессии (R13), учёт выданного — нет
+    let g = a
+        .t(Method::GET, "/api/v1/sessions/hook-s", None)
+        .await
+        .json();
+    assert_eq!(g["memory_writes"], 1, "{g}");
+    assert!(g["tokens"].get("mcp").is_none(), "{g}");
+    let items = unattributed(&a).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let today = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .to_string();
+    assert_eq!(items[0]["day"], today.as_str(), "{items:?}");
+    assert_eq!(items[0]["event"], "mcp");
+    assert_eq!(items[0]["calls"], 3);
+    assert_eq!(items[0]["tokens"], tok_of(&r) + tok_of(&s) + tok_of(&w));
+    // параметр days: 1..=366
+    for bad in ["0", "367", "x"] {
+        let r = a
+            .t(
+                Method::GET,
+                &format!("/api/v1/sessions/unattributed?days={bad}"),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+}
+
+/// Признак MCP (`McpOrigin`) ставит только внутренний клиент: внешний запрос REST с любыми
+/// заголовками — обычный REST (`(seen)` прячет фрагмент, отметки пишутся, учёта `mcp` нет).
+#[tokio::test]
+async fn mcp_origin_not_forgeable_by_header() {
+    let a = api("mcp-origin-forge", |_| {}).await;
+    quasar(&a).await;
+    let forged = [
+        ("x-zam-session", "forge-s"),
+        ("x-zam-machine", MACHINE),
+        ("mcp-origin", "implicit"),
+        ("x-zam-mcp", "1"),
+        ("x-zam-mcp-origin", "{\"implicit\":true}"),
+        ("mcp-session-id", "abc"),
+        ("mcp-protocol-version", "2025-06-18"),
+    ];
+    // chunks отмечает выданное — «неявность» заголовками не подделать
+    rest_search(&a, &forged, "chunks", "json").await;
+    let md = rest_search(&a, &forged, "brief", "md").await.text();
+    assert!(
+        md.contains("(seen)") && !md.contains("(выдавалось)"),
+        "{md}"
+    );
+    assert!(!md.contains("светит"), "{md}");
+    let t = session_tokens(&a, "forge-s").await;
+    assert!(t.get("mcp").is_none(), "{t}");
+    assert!(unattributed(&a).await.is_empty());
+}
+
+/// Вызов MCP учитывается один раз — событием `mcp`: вложенные `/search`, `/read` и `/recall`
+/// своих событий не пишут.
+#[tokio::test]
+async fn mcp_search_counts_once() {
+    let a = api("mcp-counts-once", |_| {}).await;
+    let r = a
+        .adm(
+            Method::PATCH,
+            "/api/v1/admin/settings",
+            Some(json!({"rules": {"agent_write": true}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    a.note("rules", "правило.md", "# Правило\n\nВсегда пиши тесты.")
+        .await;
+    let id = quasar(&a).await;
+    let h = sess();
+    let s = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар"}),
+    )
+    .await;
+    let r = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}]}),
+    )
+    .await;
+    let c = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_recall",
+        json!({"event": "session_start"}),
+    )
+    .await;
+    assert!(c.text.contains("Всегда пиши тесты"), "{}", c.text);
+    let t = session_tokens(&a, SESSION).await;
+    let keys: Vec<&String> = t.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["mcp"], "{t}");
+    assert_eq!(t["mcp"]["calls"], 3, "{t}");
+    assert_eq!(
+        t["mcp"]["tokens"],
+        tok_of(&s) + tok_of(&r) + tok_of(&c),
+        "{t}"
+    );
+}
+
+/// Субагент на общем подключении MCP приходит с сессией родителя: выданное родителем остаётся
+/// в карточке с фрагментом и пометкой «(выдавалось)»; прячет только явный `skip_seen: true`.
+#[tokio::test]
+async fn subagent_on_shared_mcp_keeps_snippet() {
+    let a = api("mcp-subagent-shared", |_| {}).await;
+    let id = quasar(&a).await;
+    let h = sess();
+    // родитель получил текст целиком
+    ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар", "mode": "chunks"}),
+    )
+    .await;
+    // «субагент» на том же подключении: фрагмент и пометка
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар"}),
+    )
+    .await;
+    assert!(o.text.contains(&format!("n:{id}")), "{}", o.text);
+    assert!(
+        o.text.contains("(выдавалось)") && o.text.contains("светит"),
+        "{}",
+        o.text
+    );
+    // chunks повторно — текст отдаётся
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар", "mode": "chunks"}),
+    )
+    .await;
+    assert!(o.text.contains("светит ярко"), "{}", o.text);
+    // явный skip_seen: true — как в REST: без фрагмента
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар", "skip_seen": true}),
+    )
+    .await;
+    assert!(
+        o.text.contains("(seen)") && !o.text.contains("светит"),
+        "{}",
+        o.text
+    );
+    // схема инструмента знает skip_seen
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let search = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_search")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        search["inputSchema"]["properties"]["skip_seen"]["type"], "boolean",
+        "{search}"
+    );
+}

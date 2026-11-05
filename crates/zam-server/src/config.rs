@@ -10,10 +10,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml::{Table, Value};
 
 /// Переменные `ZAM_*`, которые не являются слоем конфигурации:
-/// секреты и адрес клиента, переменные клиента `zam` (сессия, признак агента, имя машины —
+/// секреты и адрес клиента, переменные клиента `zam` (сессия, признак агента, имя машины, сессия `zam mcp` —
 /// `zam_core::CLIENT_ENV_VARS`: без этого `ZAM_MACHINE` в окружении пользователя ломала бы
 /// ручной запуск сервера), а также сборочные (build.rs, xtask), попадающие в окружение CI.
-const RESERVED_ENV: [&str; 12] = [
+const RESERVED_ENV: [&str; 13] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
@@ -26,6 +26,7 @@ const RESERVED_ENV: [&str; 12] = [
     zam_core::CLIENT_ENV_VARS[0],
     zam_core::CLIENT_ENV_VARS[1],
     zam_core::CLIENT_ENV_VARS[2],
+    zam_core::CLIENT_ENV_VARS[3],
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

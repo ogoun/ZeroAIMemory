@@ -70,9 +70,13 @@ pub const AGENT_ENV_VARS: [&str; 6] = [
     "CODEX_THREAD_ID",
 ];
 
-/// Клиентские переменные `zam` (не агента): явная сессия хуков, признак агента, имя машины.
-/// Сервер не читает их как ключи конфигурации, тесты убирают из окружения дочернего `zam`.
-pub const CLIENT_ENV_VARS: [&str; 3] = ["ZAM_SESSION", "ZAM_AGENT", MACHINE_ENV];
+/// Явная сессия `zam mcp` (M6 §7.1): сильнее `CLAUDE_CODE_SESSION_ID` и файла привязки.
+pub const MCP_SESSION_ENV: &str = "ZAM_SESSION_ID";
+
+/// Клиентские переменные `zam` (не агента): явная сессия хуков, признак агента, имя машины,
+/// сессия `zam mcp`. Сервер не читает их как ключи конфигурации, тесты убирают из окружения
+/// дочернего `zam`.
+pub const CLIENT_ENV_VARS: [&str; 4] = ["ZAM_SESSION", "ZAM_AGENT", MACHINE_ENV, MCP_SESSION_ENV];
 
 #[cfg(test)]
 mod machine_tests {

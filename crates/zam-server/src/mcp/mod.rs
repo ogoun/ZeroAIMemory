@@ -32,6 +32,13 @@
 //!   [`IMPLICIT_SESSION_HOURS`] ч назад (её создаёт хук `session-start`); с `X-Zam-Machine` —
 //!   только сессией той же машины, с `X-Zam-Solution` — того же решения ([`implicit_session`]). Так запись через MCP попадает в
 //!   `memory_writes` сессии хуков и `checkpoint` не напоминает зря. Подходящей нет — без сессии.
+//! - **Явная сессия или никакая** (M6 §7.1): неявная сессия годится только счётчику записей.
+//!   Внутренние запросы несут расширение [`McpOrigin`] (`implicit` — сессию подставил сервер);
+//!   поиск, `/read` и `/recall` с неявной сессией не пишут `session_seen` и не помечают
+//!   выданное. Учёт выданного — один на вызов инструмента, событием `mcp` ([`account`]): с явной
+//!   сессией — в `session_tokens`, иначе — в `tokens_unattributed` пользователя (`GET
+//!   /sessions/unattributed`). Явную сессию задаёт `zam mcp` (`ZAM_SESSION_ID`,
+//!   `CLAUDE_CODE_SESSION_ID` или файл привязки хука `session-start`). В DEBUG — `implicit`.
 pub mod tools;
 
 use std::net::SocketAddr;
@@ -56,10 +63,14 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::Value;
 use tower::ServiceExt;
 
+pub use crate::api::sessions::McpOrigin;
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, MACHINE_HEADER, SESSION_HEADER};
 use crate::auth::Principal;
 use crate::error::ApiError;
+
+/// Событие учёта выданного вызовом инструмента MCP (M6 §7.1).
+pub const MCP_TOKEN_EVENT: &str = "mcp";
 
 /// Окно поиска сессии для MCP без `X-Zam-Session`, часов (R13).
 pub const IMPLICIT_SESSION_HOURS: i64 = 12;
@@ -240,22 +251,63 @@ impl ServerHandler for McpServer {
         };
         let mut rest = Rest::new(self.rest.clone(), parts);
         rest.cancel = Some(context.ct.clone());
-        if rest.header(SESSION_HEADER).is_none()
+        // явная сессия — заголовок запроса (`zam mcp` с привязкой, M6 §7.1); иначе — неявная
+        // сессия R13 только для счётчика записей
+        let explicit = rest.header(SESSION_HEADER).is_some();
+        if !explicit
             && let Some(id) = implicit_session(&self.state, parts).await
             && let Ok(v) = HeaderValue::from_str(&id)
         {
             rest.headers
                 .insert(HeaderName::from_static(SESSION_HEADER), v);
+            rest.origin.implicit = true;
         }
         let t = Instant::now();
         let out = tools::call(tool, &rest, request.arguments.unwrap_or_default()).await;
         tracing::debug!(
             tool = tool.as_str(),
             is_error = out.is_error,
+            implicit = !explicit,
             ms = t.elapsed().as_millis() as u64,
             "инструмент MCP"
         );
+        account(&self.state, parts, explicit, out.tokens()).await;
         Ok(out.into_result().into())
+    }
+}
+
+/// Учёт выданного вызовом инструмента (M6 §7.1) — событие `mcp`: с явной сессией — в
+/// `session_tokens` этой сессии, без неё — в `tokens_unattributed` пользователя (сутки UTC).
+/// Вложенные `/search`, `/read`, `/recall` своих событий не пишут (`McpOrigin`). Сбой учёта
+/// ответ не портит (WARN без id и текста).
+async fn account(st: &AppState, parts: &Parts, explicit: bool, tokens: u64) {
+    let Some(p) = parts.extensions.get::<Principal>() else {
+        return;
+    };
+    // некорректные заголовки отклонил сам маршрут REST — учёта нет
+    let Ok(user) = crate::auth::target_user_id(st, p, &parts.headers) else {
+        return;
+    };
+    let db = match st.users.get(user).await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(error = %e, "MCP: учёт выданного — база пользователя недоступна");
+            return;
+        }
+    };
+    let r = if explicit {
+        match crate::attrib::session_touch(p, &parts.headers, None) {
+            Ok(Some(touch)) => zam_store::add_tokens(&db, &touch, MCP_TOKEN_EVENT, tokens).await,
+            _ => return,
+        }
+    } else {
+        let day = jiff::Timestamp::now()
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .date();
+        zam_store::add_unattributed(&db, day, MCP_TOKEN_EVENT, 1, tokens).await
+    };
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "MCP: учёт выданного не записан");
     }
 }
 
@@ -301,6 +353,8 @@ pub struct Rest {
     /// Отмена вызова (`RequestContext::ct`): клиент прислал `notifications/cancelled` или оборвал
     /// соединение — дальше внутренних запросов нет.
     cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Признак MCP внутренних запросов (M6 §7.1): расширение запроса, снаружи не подделать.
+    origin: McpOrigin,
 }
 
 /// Ответ внутреннего вызова REST.
@@ -346,6 +400,7 @@ impl Rest {
                 .get::<crate::api::big_body::OuterPermit>()
                 .cloned(),
             cancel: None,
+            origin: McpOrigin::default(),
         }
     }
 
@@ -396,6 +451,7 @@ impl Rest {
         if let Some(c) = self.connect {
             req.extensions_mut().insert(c);
         }
+        req.extensions_mut().insert(self.origin);
         let Ok(r) = self.router.clone().oneshot(req).await;
         let (status, headers) = (r.status(), r.headers().clone());
         let body = axum::body::to_bytes(r.into_body(), usize::MAX)

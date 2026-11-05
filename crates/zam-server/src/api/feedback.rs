@@ -7,6 +7,7 @@
 //! с пользователем запроса, сессией (`session_id` из тела или `X-Zam-Session`; сессия
 //! создаётся или отмечается в базе пользователя запроса) и источником:
 //! токен — `agent`, WebUI — `webui`. Счётчики отдаёт `GET /entries/{id}` полем `usage`.
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, State};
@@ -17,7 +18,7 @@ use zam_store::{UsageEvent, UsageKind, UsageSource, record_usage};
 
 use super::json_body;
 use super::scope::{Mode, deny_report_mutation, entry_scope, live_entry};
-use super::sessions::touch_from_request;
+use super::sessions::{McpOrigin, touch_from_request};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -42,6 +43,7 @@ pub async fn entry(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<StatusCode, ApiError> {
@@ -53,9 +55,15 @@ pub async fn entry(
     // оценка отчёта — его изменение (§4): 409 человеку, токену — 404
     deny_report_mutation(&p, &sc)?;
     // сессия создаётся или отмечается, как у остальных запросов с ней
-    let session = touch_from_request(&st, &p, &headers, req.session_id.as_deref())
-        .await?
-        .map(|s| s.touch.id);
+    let session = touch_from_request(
+        &st,
+        &p,
+        &headers,
+        origin.as_deref(),
+        req.session_id.as_deref(),
+    )
+    .await?
+    .map(|s| s.touch.id);
     let event = UsageEvent {
         user_id: sc.user.id,
         session_id: session,

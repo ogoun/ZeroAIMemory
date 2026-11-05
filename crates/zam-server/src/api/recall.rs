@@ -140,6 +140,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -166,7 +167,7 @@ use super::json_body;
 use super::nodes::read::l1;
 use super::search::targets::{ScopeReq, SearchTarget, dedup_keep_order, resolve_targets};
 use super::search::{Health, SOLUTION_HEADER};
-use super::sessions::{RequestSession, request_session};
+use super::sessions::{McpOrigin, RequestSession, explicit_only, request_session};
 use super::user_settings::{UserFlags, user_flags};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, SESSION_HEADER};
@@ -2698,6 +2699,7 @@ async fn inner_search(
         State(st.clone()),
         p.clone(),
         h,
+        None,
         Ok(Bytes::from(body.to_string())),
     );
     let Some(r) = deadline.step(search).await else {
@@ -3095,6 +3097,7 @@ pub async fn recall(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let t0 = Instant::now();
@@ -3122,8 +3125,17 @@ pub async fn recall(
         return Err(ApiError::BadRequest("solution: GUID решения".into()));
     }
     // сессия: некорректный id — 400; сбой её базы подсказки не валит (без учёта повторов)
-    let mut session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
-        Ok(s) => s,
+    let mut session = match request_session(
+        &st,
+        &p,
+        &headers,
+        origin.as_deref(),
+        req.session_id.as_deref(),
+    )
+    .await
+    {
+        // неявная сессия MCP (M6 §7.1) — без отметок, фильтра повторов и учёта
+        Ok(s) => explicit_only(s),
         // некорректный id — 400, несуществующий пользователь (`X-Zam-User`) — 404
         Err(e @ (ApiError::BadRequest(_) | ApiError::NotFound)) => return Err(e),
         Err(e) => {
@@ -3344,8 +3356,9 @@ pub async fn recall(
     let record_ms = if req.record == Some(false) {
         None
     } else if rt < total_deadline {
-        // выданное сессии по событию (§9.5): пустой ответ — не выдача
-        let tokens: Vec<TokenCount> = (!text.is_empty())
+        // выданное сессии по событию (§9.5): пустой ответ — не выдача; вызов из MCP учитывает
+        // сам инструмент событием `mcp` (M6 §7.1) — без двойного счёта
+        let tokens: Vec<TokenCount> = (!text.is_empty() && origin.is_none())
             .then(|| TokenCount {
                 event: token_event(req.event, recovery).into(),
                 calls: 1,

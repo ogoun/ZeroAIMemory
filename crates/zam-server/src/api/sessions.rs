@@ -15,7 +15,9 @@
 //!   tokens: {<событие>: {calls, tokens}}}` (решение контроллера R6, читает хук `checkpoint`;
 //!   `claimed_tasks` — задачи журнала, захваченные сессией, M4.5; `tokens` — выданное сессии
 //!   по событию, §9.5);
-//! - `GET /sessions?solution=&limit=` → `{items}` — свои, свежие первыми (50, до 500).
+//! - `GET /sessions?solution=&limit=` → `{items}` — свои, свежие первыми (50, до 500);
+//! - `GET /sessions/unattributed?days=N` → `{items: [{day, event, calls, tokens}]}` — выданное
+//!   без явной сессии по суткам UTC (M6 §7.1, [`unattributed`]).
 //!
 //! Сессия лежит в базе пользователя запроса (у администратора — `X-Zam-User` или он сам):
 //! чужая сессия — 404. Помимо явного `POST` сессия создаётся первым запросом с
@@ -71,17 +73,35 @@ async fn requester_db(st: &AppState, p: &Principal, headers: &HeaderMap) -> Resu
 }
 
 /// Сессия запроса (касание по запросу) и база пользователя запроса, где она лежит.
+///
+/// M6 §7.1: учёт `session_tokens`, отметки `session_seen` и пометки выданного — только при
+/// **явной** сессии (`explicit`). Неявная — сессия, которую подставил MCP без
+/// `X-Zam-Session` (R13): она нужна счётчику записей, но не учёту выдачи.
 pub struct RequestSession {
     pub touch: SessionTouch,
     pub db: Db,
+    /// Сессия задана телом или заголовком запроса, а не подставлена MCP (см. [`McpOrigin`]).
+    pub explicit: bool,
+    /// Запрос пришёл из инструмента MCP (внутренний клиент `Rest`): учёт ведёт `tools::call`
+    /// событием `mcp`, а `(seen)` не прячет фрагмент (субагенты на общем подключении).
+    pub via_mcp: bool,
+}
+
+/// Признак внутреннего запроса MCP — расширение запроса (`http::Extensions`). Его ставит только
+/// внутренний клиент `mcp::Rest`: снаружи заголовками его не подделать. `implicit` — сессию
+/// подставил сервер ([`crate::mcp`], R13), агент её не задавал.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct McpOrigin {
+    pub implicit: bool,
 }
 
 /// Сессия запроса без записи: `session_id` из тела сильнее `X-Zam-Session`; `None` — запрос
-/// без сессии. Некорректный id — 400.
+/// без сессии. Некорректный id — 400. `origin` — признак MCP из расширений запроса.
 pub async fn request_session(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
+    origin: Option<&McpOrigin>,
     body_session: Option<&str>,
 ) -> Result<Option<RequestSession>, ApiError> {
     let Some(touch) = session_touch(p, headers, body_session)? else {
@@ -91,7 +111,21 @@ pub async fn request_session(
     // `users/<id>.db` (финальное ревью M4, M-3)
     let user = crate::auth::target_user(st, p, headers).await?;
     let db = st.users.get(user.id).await?;
-    Ok(Some(RequestSession { touch, db }))
+    let via_mcp = origin.is_some();
+    // id в теле агент задал сам; заголовок неявен, только если его подставил MCP
+    let body = body_session.is_some_and(|s| !s.trim().is_empty());
+    let explicit = body || !origin.is_some_and(|o| o.implicit);
+    Ok(Some(RequestSession {
+        touch,
+        db,
+        explicit,
+        via_mcp,
+    }))
+}
+
+/// Сессия запроса с явной сессией (M6 §7.1); неявная — `None`, как запрос без сессии.
+pub fn explicit_only(s: Option<RequestSession>) -> Option<RequestSession> {
+    s.filter(|s| s.explicit)
 }
 
 /// Отмечает обращение сессии запроса (оценка, `/read`, `/recall`): сессия создаётся, если её
@@ -100,9 +134,10 @@ pub async fn touch_from_request(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
+    origin: Option<&McpOrigin>,
     body_session: Option<&str>,
 ) -> Result<Option<RequestSession>, ApiError> {
-    let Some(s) = request_session(st, p, headers, body_session).await? else {
+    let Some(s) = request_session(st, p, headers, origin, body_session).await? else {
         return Ok(None);
     };
     touch_session(&s.db, &s.touch).await?;
@@ -320,6 +355,44 @@ pub async fn list(
         .transpose()?;
     let db = requester_db(&st, &p, &headers).await?;
     let items = list_sessions(&db, solution.as_ref(), limit).await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+/// Окно `GET /sessions/unattributed` по умолчанию, суток.
+const UNATTRIBUTED_DAYS_DEFAULT: i64 = 30;
+/// Предел окна `GET /sessions/unattributed`, суток.
+const UNATTRIBUTED_DAYS_MAX: i64 = 366;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnattributedQuery {
+    days: Option<i64>,
+}
+
+/// `GET /sessions/unattributed?days=N` (M6 §7.1) → `{items: [{day, event, calls, tokens}]}` —
+/// выданное без явной сессии (MCP без привязки) в базе пользователя запроса за N суток UTC
+/// (сегодня — первые; 30 по умолчанию, до 366), свежие первыми.
+pub async fn unattributed(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    q: Result<Query<UnattributedQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let q = query(q)?;
+    let days = q.days.unwrap_or(UNATTRIBUTED_DAYS_DEFAULT);
+    if !(1..=UNATTRIBUTED_DAYS_MAX).contains(&days) {
+        return Err(ApiError::BadRequest(format!(
+            "days: от 1 до {UNATTRIBUTED_DAYS_MAX}"
+        )));
+    }
+    let today = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date();
+    let since = today
+        .checked_sub(jiff::Span::new().days(days - 1))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let db = requester_db(&st, &p, &headers).await?;
+    let items = zam_store::unattributed_tokens(&db, since).await?;
     Ok(Json(json!({ "items": items })))
 }
 

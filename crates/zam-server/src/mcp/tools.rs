@@ -84,8 +84,8 @@ impl ToolName {
         match self {
             ToolName::Search => {
                 "Поиск в памяти (Knowledge, Rules, решение): сначала выжимки кэша, затем \
-                 карточки — id, путь, ревизия, возраст, ~токены, seen (уже выдано); вложение — \
-                 a:<id>, файл, locator. filters: kinds (и term, task, question, attachment), \
+                 карточки — id, путь, ревизия, возраст, ~токены, пометка (выдавалось); \
+                 вложение — a:<id>, файл, locator. filters: kinds (и term, task, question, attachment), \
                  insight_kinds, file — знание о файле, decided_by. Дальше — memory_read."
             }
             ToolName::Read => {
@@ -171,6 +171,8 @@ impl ToolName {
                     "budget_tokens": {"type": "integer", "minimum": 1},
                     "expand": {"type": "string", "enum": ["none", "section", "neighbors", "graph"]},
                     "rerank": {"type": "string", "enum": ["off", "on"]},
+                    "skip_seen": {"type": "boolean", "description":
+                        "true — выданное в сессии без фрагмента (seen); по умолчанию фрагмент и (выдавалось)"},
                     "format": fmt,
                 }),
                 &["query"],
@@ -416,6 +418,18 @@ pub struct Output {
 }
 
 impl Output {
+    /// Расход вызова — число последней строки `~N tok` (то, что видит агент; M6 §7.1).
+    pub fn tokens(&self) -> u64 {
+        self.text
+            .trim_end()
+            .rsplit('\n')
+            .next()
+            .and_then(|l| l.trim().strip_prefix('~'))
+            .and_then(|l| l.strip_suffix(" tok"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| count_tokens(&self.text) as u64)
+    }
+
     pub fn into_result(self) -> CallToolResult {
         let content = vec![ContentBlock::text(self.text)];
         if self.is_error {
@@ -769,6 +783,7 @@ async fn search(rest: &Rest, args: &JsonObject) -> Res {
             "expand",
             "rerank",
             "include_history",
+            "skip_seen",
         ],
     );
     body.insert("format".into(), json!(fmt_str(f)));

@@ -26,7 +26,7 @@
 //!   просроченные записи снимает и `session-start` ([`prune_spawns`]), файл без изменений
 //!   дольше [`SPAWN_FILE_TTL`] удаляет [`gc_cache`];
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
-//!   `shown-*`/`edits-*`/`events-*`/`changed-*`/`tokens-*` старше [`SHOWN_TTL`] и `.*.tmp`
+//!   `shown-*`/`edits-*`/`events-*`/`changed-*`/`tokens-*`/`agent-*` старше [`SHOWN_TTL`] и `.*.tmp`
 //!   старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
@@ -163,7 +163,9 @@ pub fn private_options() -> std::fs::OpenOptions {
     o
 }
 
-fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, String> {
+pub(super) fn read_json_file<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+) -> Result<Option<T>, String> {
     match std::fs::metadata(path) {
         Ok(m) if m.len() > CACHE_MAX => return Err("файл слишком велик".into()),
         Ok(_) => {}
@@ -176,7 +178,7 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>
         .map_err(|e| e.to_string())
 }
 
-fn write_json_file<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
+pub(super) fn write_json_file<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(v).map_err(std::io::Error::other)?;
     write_atomic(path, &bytes)
 }
@@ -1107,7 +1109,7 @@ pub fn prune_spawns(env: &Env, session: &str) {
 }
 
 /// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`,
-/// `tokens-*.jsonl`) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
+/// `tokens-*.jsonl`) и привязки `agent-*.json` (M6 §7.1) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
 /// временные `.*.tmp` и замки старше [`TMP_TTL`].
 pub fn gc_cache(env: &Env) {
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
@@ -1120,7 +1122,9 @@ pub fn gc_cache(env: &Env) {
             || n.starts_with("edits-")
             || (n.starts_with("events-") && n.ends_with(".jsonl"))
             || (n.starts_with("changed-") && n.ends_with(".jsonl"))
-            || (n.starts_with("tokens-") && n.ends_with(".jsonl"));
+            || (n.starts_with("tokens-") && n.ends_with(".jsonl"))
+            // привязка `zam mcp` к сессии (M6 §7.1): pid агента, перезаписывается каждым стартом
+            || (n.starts_with(super::binding::BINDING_PREFIX) && n.ends_with(".json"));
         let ttl = if session_file {
             SHOWN_TTL
         } else if n.starts_with("spawn-") && n.ends_with(".json") {

@@ -64,6 +64,7 @@
 //!
 //! Маршрут — служебный, не в `memory_routes`: `/read` читает память и не пишет в неё, потому
 //! `memory_writes` сессии не растёт (решение контроллера R12).
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
@@ -92,7 +93,7 @@ use super::scope::{
     node_scope, space_scope,
 };
 use super::search::md_inline;
-use super::sessions::request_session;
+use super::sessions::{McpOrigin, explicit_only, request_session};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -1312,6 +1313,7 @@ pub async fn read(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
     let req: ReadRequest = json_body(body)?;
@@ -1358,8 +1360,17 @@ pub async fn read(
         tiers.push(tier);
     }
     // сессия: некорректный id — 400; сбой её базы чтение не валит (WARN)
-    let session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
-        Ok(s) => s,
+    let session = match request_session(
+        &st,
+        &p,
+        &headers,
+        origin.as_deref(),
+        req.session_id.as_deref(),
+    )
+    .await
+    {
+        // неявная сессия MCP (M6 §7.1) — без отметок выданного
+        Ok(s) => explicit_only(s),
         // некорректный id — 400, несуществующий пользователь (`X-Zam-User`) — 404
         Err(e @ (ApiError::BadRequest(_) | ApiError::NotFound)) => return Err(e),
         Err(e) => {

@@ -158,8 +158,8 @@ pub use tasks::{
     check_task, check_task_transition, claim_task, claimed_tasks, release_task,
 };
 pub use usage::{
-    UsageCounts, UsageEvent, UsageKind, UsageSource, add_unattributed, record_usage, record_usages,
-    usage_counts, usage_counts_many,
+    UnattributedRow, UsageCounts, UsageEvent, UsageKind, UsageSource, add_unattributed,
+    record_usage, record_usages, unattributed_tokens, usage_counts, usage_counts_many,
 };
 pub use user_db::{
     RechunkNotice, RechunkProgress, RechunkReason, Space, SpaceKind, USER_MIGRATIONS, UserDbs,

@@ -23,10 +23,14 @@
 //! M5.6 §5: после запросов хука (их бюджет — не делить с синхронизацией за тот же сервер) —
 //! запуск фоновой `zam code sync --background`, если пора
 //! ([`crate::cmd::code::auto::maybe_spawn_sync`]; сервер для запуска не нужен).
+//! M6 §7.1: каждый старт с `session_id` (новая сессия, `/clear`, `resume`, `compact`) пишет
+//! привязку `zam mcp` к сессии — `cache/agent-<pid>.json` ([`binding::write_binding`]), до
+//! запросов и без сети.
 use std::path::Path;
 
 use serde_json::{Value, json};
 
+use super::binding;
 use super::cache;
 use super::input::Input;
 use super::journal;
@@ -55,6 +59,10 @@ fn digest(env: &Env, inp: &Input, s: &Settings) -> Output {
     let source = inp.str("source");
     if let Some(id) = session {
         cache::write_current_session(env, id);
+        // привязка `zam mcp` к сессии (M6 §7.1): на предков до процесса агента
+        if let Err(e) = binding::write_binding(&env.root, id) {
+            env.log(&format!("привязка MCP к сессии: {e}"));
+        }
         // просроченные запуски субагентов (§9.4) не ждут следующего `subagent-start`
         cache::prune_spawns(env, id);
         if matches!(source, Some("compact" | "clear")) {

@@ -124,3 +124,55 @@ async fn post_sessions_local_tokens() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(tokens(&a, "s-empty").await, json!({}));
 }
+
+/// `GET /sessions/unattributed?days=N` (M6 §7.1): строки `tokens_unattributed` базы пользователя
+/// за последние N суток UTC (сегодня — первые сутки), свежие первыми, внутри дня — по событию.
+#[tokio::test]
+async fn unattributed_by_days_window() {
+    let a = api("tokens-unattributed", |_| {}).await;
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let today = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date();
+    let ago = |d: i64| today.checked_sub(jiff::Span::new().days(d)).unwrap();
+    for (day, event, calls, tokens) in [
+        (today, "mcp", 2, 30),
+        (today, "brief", 1, 5),
+        (ago(3), "mcp", 1, 7),
+        (ago(40), "mcp", 4, 100),
+    ] {
+        zam_store::add_unattributed(&db, day, event, calls, tokens)
+            .await
+            .unwrap();
+    }
+    let get = async |q: &str| {
+        let r = a
+            .t(
+                Method::GET,
+                &format!("/api/v1/sessions/unattributed{q}"),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        r.json()
+    };
+    let t = today.to_string();
+    assert_eq!(
+        get("?days=1").await,
+        json!({"items": [
+            {"day": t, "event": "brief", "calls": 1, "tokens": 5},
+            {"day": t, "event": "mcp", "calls": 2, "tokens": 30},
+        ]})
+    );
+    let j = get("?days=7").await;
+    let days: Vec<&str> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["day"].as_str().unwrap())
+        .collect();
+    assert_eq!(days, [t.as_str(), t.as_str(), ago(3).to_string().as_str()]);
+    // по умолчанию — 30 суток
+    assert_eq!(get("").await["items"].as_array().unwrap().len(), 3);
+    assert_eq!(get("?days=366").await["items"].as_array().unwrap().len(), 4);
+}

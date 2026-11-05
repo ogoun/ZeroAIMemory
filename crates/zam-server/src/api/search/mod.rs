@@ -22,7 +22,11 @@
 //!   контроллера R11. Чанки `mode=chunks`, отданные целиком (не усечённые бюджетом),
 //!   записываются в `session_seen` базы пользователя запроса (`part = chunk_id`, владелец —
 //!   владелец базы цели) одной транзакцией с касанием сессии. Карточки папок не отмечаются;
-//!   сбой учёта сессии поиск не валит (WARN, ответ без пометок);
+//!   сбой учёта сессии поиск не валит (WARN, ответ без пометок).
+//!   M6 §7.1: учитывается только **явная** сессия — неявную, подставленную MCP без
+//!   `X-Zam-Session`, поиск не видит. Запрос из инструмента MCP без явного `skip_seen`
+//!   помечает выданное (`seen: true`, в md — `(выдавалось)`), но оставляет фрагмент и текст:
+//!   субагенты на общем подключении MCP приходят с сессией родителя;
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release`, `attachment`
 //!   (фрагменты вложений, M5; см. «Вложения») — по умолчанию все, `folder` — карточки папок
 //!   (см. «Папки»); `filters.status` — статусы insight (по умолчанию `active`,
@@ -206,6 +210,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -241,7 +246,7 @@ use self::targets::{
 use super::doc_locator::{self, Sheets, secret_sheet};
 use super::json_body;
 use super::scope::skip_foreign;
-use super::sessions::{RequestSession, request_session};
+use super::sessions::{McpOrigin, RequestSession, explicit_only, request_session};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
@@ -922,8 +927,18 @@ struct Item {
     folder: Option<i64>,
     /// Уже выдан этой сессии в той же ревизии (`skip_seen`, §9.3): без фрагмента и текста.
     seen: bool,
+    /// Уже выдан, но фрагмент и текст оставлены (запрос MCP без явного `skip_seen: true`,
+    /// M6 §7.1: субагенты на общем подключении): пометка «(выдавалось)» вместо `(seen)`.
+    seen_kept: bool,
     /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
     stale_refs: Vec<String>,
+}
+
+impl Item {
+    /// Выданное прячется: без фрагмента и текста (`seen` без `seen_kept`).
+    fn hidden(&self) -> bool {
+        self.seen && !self.seen_kept
+    }
 }
 
 /// Текст пары реранкера: заголовок секции и текст чанка.
@@ -1393,7 +1408,7 @@ struct Packed {
 /// Строка карточки без текста: по ней считается стоимость в токенах. У вложения L0 нет — в
 /// `notes` тоже сниппет.
 fn card_summary(it: &Item, mode: SearchMode) -> &str {
-    if it.seen {
+    if it.hidden() {
         return "";
     }
     match mode {
@@ -1580,7 +1595,7 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Tim
     // у вложения L0 нет: и в `notes` — сниппет
     if mode == SearchMode::Notes && h.attachment.is_none() {
         o.insert("l0".into(), json!(p.item.l0));
-    } else if !p.item.seen {
+    } else if !p.item.hidden() {
         o.insert("snippet".into(), json!(h.snippet));
     }
     if let Some((t, truncated)) = &p.text {
@@ -1750,12 +1765,17 @@ fn item_md(
         }
         line.push_str(&format!(" · via {} ← {from}\n", t.as_str()));
     }
-    // выдан этой сессии в той же ревизии: пометка вместо фрагмента (§9.3)
+    // выдан этой сессии в той же ревизии: пометка вместо фрагмента (§9.3); у MCP — пометка
+    // при фрагменте (M6 §7.1)
     if p.item.seen {
         if line.ends_with('\n') {
             line.pop();
         }
-        line.push_str("   (seen)\n");
+        line.push_str(if p.item.seen_kept {
+            "   (выдавалось)\n"
+        } else {
+            "   (seen)\n"
+        });
     }
     // устаревшие ссылки на файлы — строкой под заголовком карточки (M4.5 §6.2)
     if let Some(s) = stale_line(&p.item.stale_refs) {
@@ -1763,7 +1783,7 @@ fn item_md(
         line.push_str(&s);
         line.push('\n');
     }
-    if p.item.seen {
+    if p.item.hidden() {
         return line;
     }
     match &p.text {
@@ -1984,6 +2004,7 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
         via: None,
         folder: Some(f.child_count),
         seen: false,
+        seen_kept: false,
         stale_refs: Vec::new(),
     }
 }
@@ -2011,11 +2032,13 @@ fn seen_tracked(it: &Item) -> bool {
 
 /// Помечает элементы, уже выданные сессии в той же ревизии (`seen`), и снимает их текст:
 /// выдана цель целиком, все чанки элемента (`chunk_ids`) или — у вложения — его `locator`
-/// (`/read` отдал единицу документа целиком).
+/// (`/read` отдал единицу документа целиком). `keep` — пометить, но оставить фрагмент и текст
+/// (`seen_kept`, MCP без явного `skip_seen`, M6 §7.1).
 async fn mark_seen_items(
     s: &RequestSession,
     targets: &[SearchTarget],
     items: &mut [Item],
+    keep: bool,
 ) -> Result<(), StoreError> {
     let locator = |it: &Item| it.hit.attachment.as_ref().and_then(|a| a.locator.clone());
     let parts = |it: &Item| -> Vec<SeenKey> {
@@ -2043,7 +2066,10 @@ async fn mark_seen_items(
                 .all(|c| same(&seen_key(targets, it, c), rev));
         if whole || chunks {
             it.seen = true;
-            it.text = None;
+            it.seen_kept = keep;
+            if !keep {
+                it.text = None;
+            }
         }
     }
     Ok(())
@@ -2087,6 +2113,7 @@ pub async fn search(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
     let total_t = Instant::now();
@@ -2110,8 +2137,17 @@ pub async fn search(
     let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
     // сессия: некорректный id — 400; сбой её базы поиск не валит (WARN, без пометок)
-    let session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
-        Ok(s) => s,
+    let session = match request_session(
+        &st,
+        &p,
+        &headers,
+        origin.as_deref(),
+        req.session_id.as_deref(),
+    )
+    .await
+    {
+        // неявная сессия MCP (M6 §7.1) — как без сессии: без отметок и пометок
+        Ok(s) => explicit_only(s),
         // некорректный id — 400, несуществующий пользователь (`X-Zam-User`) — 404
         Err(e @ (ApiError::BadRequest(_) | ApiError::NotFound)) => return Err(e),
         Err(e) => {
@@ -2456,6 +2492,7 @@ pub async fn search(
                 via: None,
                 folder: None,
                 seen: false,
+                seen_kept: false,
                 stale_refs: Vec::new(),
             })
         })
@@ -2558,9 +2595,17 @@ pub async fn search(
     let mut warnings = health.warnings;
     dedup_keep_order(&mut warnings);
     // выданное этой сессии в той же ревизии — без фрагмента и текста (§9.3)
+    // MCP (M6 §7.1): субагенты идут с сессией родителя — без явного `skip_seen` фрагмент
+    // остаётся, с пометкой «(выдавалось)»
     if let Some(s) = &session
         && req.skip_seen.unwrap_or(true)
-        && let Err(e) = mark_seen_items(s, &targets, &mut items).await
+        && let Err(e) = mark_seen_items(
+            s,
+            &targets,
+            &mut items,
+            s.via_mcp && req.skip_seen.is_none(),
+        )
+        .await
     {
         session_failed("чтение выданного", &e);
     }
@@ -2699,6 +2744,7 @@ mod tests {
                 via: None,
                 folder: None,
                 seen: false,
+                seen_kept: false,
                 stale_refs: Vec::new(),
             })
             .collect()

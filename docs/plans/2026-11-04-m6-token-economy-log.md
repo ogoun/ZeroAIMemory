@@ -963,6 +963,117 @@ c29ceb06c4c0bf37d99cf1959220ce2f`, `docs_manifest_sha256 = e41b4142…29c39` (н
 
 ### Задача 3. Привязка MCP к сессии
 
+Коммит — `feat(mcp): привязка zam mcp к сессии, явная сессия и учёт без неё` (sha — в отчёте
+контроллеру).
+
+Сделано:
+- **Сервер.** `RequestSession {touch, db, explicit, via_mcp}` и расширение запроса
+  `McpOrigin {implicit}` (`api/sessions.rs`, реэкспорт `mcp::McpOrigin`). Ставит его только
+  `mcp::Rest::send` во внутренние запросы; `request_session(st, p, headers, origin, body)` —
+  `explicit = тело с id || !(origin.implicit)`. `/search`, `/read`, `/recall` берут сессию через
+  `explicit_only`: неявная сессия R13 для них — как без сессии (без `session_seen`, `(seen)`,
+  фильтра повторов и учёта); счётчик `memory_writes` по неявной сессии остаётся (R13).
+  `/feedback` — касание как раньше (с `origin`).
+- **Учёт MCP** — `mcp::account` после каждого вызова инструмента: событие `mcp` с `~N tok`
+  ответа; явная сессия (`X-Zam-Session` исходного запроса) → `session_tokens`, иначе →
+  `add_unattributed` (сутки UTC). `/recall` из MCP своего события не пишет; `/search` и
+  `/read` событий пока не пишут вовсе (их добавляет 8b — с проверкой `via_mcp`). DEBUG
+  «инструмент MCP» — поле `implicit`.
+- **`(seen)` у MCP** (§7.1, субагенты): `/search` из MCP без явного `skip_seen` помечает
+  выданное (`seen: true`), но оставляет фрагмент и текст — в md `   (выдавалось)`
+  (`Item.seen_kept`, `Item::hidden`); `skip_seen: true` — прежнее `(seen)` без фрагмента. В
+  схему `memory_search` добавлен `skip_seen` (boolean), описание — «пометка (выдавалось)» (300/300
+  символов). `guide.{ru,en}.md`, п. 1 «Карточки»: «`(выдавалось)` (MCP) — уже было в сессии,
+  перечитывать не нужно, если текст у тебя есть; `(seen)` — то же без фрагмента».
+- **`GET /sessions/unattributed?days=N`** → `{items: [{day, event, calls, tokens}]}` (свежие
+  первыми, внутри суток — по событию; N 1..=366, по умолчанию 30); `zam_store::unattributed_tokens`
+  и `UnattributedRow`.
+- **Клиент.** `hook/procs.rs` — `Proc`, `ancestors(max)` (Windows — ToolHelp32 через
+  `windows`, фичи `Win32_Foundation` и `Win32_System_Diagnostics_ToolHelp`; Linux —
+  `/proc/<pid>/stat`, `comm` до последней `)`; без циклов и pid 0; прочие ОС и сбой — пусто),
+  `AGENT_PROC_NAMES`, `norm_name`, под фичей `test-hooks` — `set_fake_ancestors` (thread_local).
+  `hook/binding.rs` — `BINDING_ANCESTORS_MAX = 4`, `write_binding`, `read_binding`. Хук
+  `session-start` пишет привязку при каждом старте с `session_id` (до сети); `gc_cache` удаляет
+  `agent-*.json` старше 7 дней. `zam mcp` шлёт `X-Zam-Session`: `ZAM_SESSION_ID` →
+  `CLAUDE_CODE_SESSION_ID` → `read_binding` (при `initialize` и не чаще раза в 30 с,
+  `BINDING_REFRESH`). Фича `test-hooks = []` у `zam-cli`.
+- `zam_core::MCP_SESSION_ENV = "ZAM_SESSION_ID"` входит в `CLIENT_ENV_VARS` (их снимает
+  `common::zam_cmd`, сервер не читает как ключ конфигурации — `RESERVED_ENV`).
+- `deploy/README-install.md` — абзац «Сессия `zam mcp` (M6)».
+- Тесты: сервер (`mcp.rs`) — `mcp_explicit_session_marks_seen`,
+  `implicit_session_no_marks_goes_unattributed`, `mcp_origin_not_forgeable_by_header`,
+  `mcp_search_counts_once`, `subagent_on_shared_mcp_keeps_snippet`; `session_tokens.rs` —
+  `unattributed_by_days_window`; `zam-store` `sessions.rs::unattributed_upsert_adds` дополнен
+  чтением. CLI: `tests/mcp_bind.rs` — `binding_written_on_session_start_clear_resume`,
+  `mcp_uses_binding_without_env`, `env_session_beats_binding`; юнит — `binding.rs::
+  binding_found_via_fake_ancestors`, `procs.rs` (имена, разбор `stat`, циклы, настоящая цепочка),
+  `mcp.rs::session_source_order_and_refresh`. RED: серверные тесты на коде до правки (`git stash`
+  исходников сервера, хранилища и ядра) — 6 из 6 FAILED; клиентские — не собирались (нет
+  `procs`/`binding`).
+
+Решения:
+1. **[решение исполнителя задачи 3]** Неявная сессия для `/search`, `/read`, `/recall` — как
+   отсутствие сессии (`explicit_only`), без касания: касание нужно было только выбору неявной
+   сессии, а её свежесть поддерживают хуки.
+2. **[решение исполнителя задачи 3]** `session_id` в теле (у `memory_recall` он есть в схеме) —
+   явная сессия и в MCP: агент задал её сам.
+3. **[решение исполнителя задачи 3]** Учёт `mcp` пишет `McpServer::call_tool` (`mcp::account`), а
+   не `tools::call`: нужен `AppState` и принципал исходного запроса, которых у `Rest` нет.
+   Учитываются все инструменты, в том числе ответы-ошибки; размер — число строки `~N tok` (что
+   видит агент). Запись — до ответа (одна строка UPSERT), чтобы тесты и `GET` видели её сразу.
+4. **[решение исполнителя задачи 3]** `/recall` из MCP не пишет своё событие
+   (`session_start`/`recovery`/`brief`) — иначе двойной счёт с `mcp`. Отметки `session_seen` при
+   явной сессии пишет как раньше.
+5. **[решение исполнителя задачи 3]** MCP с явным `skip_seen: false` — как REST: без отметок
+   чтения выданного и без пометок; `skip_seen: true` — `(seen)` без фрагмента. Пометка
+   `(выдавалось)` — с тем же отступом, что `(seen)`; в JSON — `seen: true` при `snippet`/`text`.
+6. **[решение исполнителя задачи 3]** `zam mcp` читает `ZAM_SESSION_ID` (спецификация), а не
+   `ZAM_SESSION` команд `zam`: тот и `session.json` по-прежнему на MCP не влияют (I-4).
+   Некорректное значение переменной (пустое, > 128, управляющие) — пропуск к следующему
+   источнику.
+7. **[решение исполнителя задачи 3]** Агента среди 4 предков нет — привязка только на
+   непосредственного родителя (и читается только он): иначе файл лёг бы на терминал или
+   оболочку, общую с другим агентом. Чтение — тоже только до первого агента включительно.
+8. **[решение исполнителя задачи 3]** Проверки переиспользования pid нет (время старта процесса
+   против `started_at` потребовало бы `OpenProcess`/`GetProcessTimes` и новых фич `windows`):
+   окно — устаревший файл на pid нового процесса-агента или оболочки без своего
+   `session-start`; срок файла — 7 дней (`gc_cache`). Вопрос — в «Уточнить».
+9. **[решение исполнителя задачи 3]** `GET /sessions/unattributed` — статический путь сильнее
+   `/sessions/{id}`: сессия с id `unattributed` недоступна по `GET` (id агентов — UUID).
+10. **[решение исполнителя задачи 3]** Привязку пишет и `session-start` с `source=compact`
+    (та же сессия — та же запись, `started_at` обновляется).
+
+Прогоны (Windows, `-j 2 --target-dir target/r1-new`):
+- RED: серверные тесты задачи на коде до правки — 6 FAILED из 6;
+- `cargo test -p zam-cli --bin zam --features test-hooks` — 142 passed (в том числе `binding`,
+  `procs`, `session_source_order_and_refresh`);
+- `cargo test -p zam-server --lib --test sessions --test session_tokens --test m57_acceptance
+  --test m56_acceptance --test cache_api --test ideas_recall --test m3_acceptance --test mcp
+  --test read_attachments --test read_batch --test read_since_rev --test recall --test
+  recall_brief --test recall_recovery --test search --test agent_setup --test insights --test
+  boot --test vault` — 495 passed, 0 failed, 3 ignored (20 наборов);
+- `cargo test -p zam-store --test sessions` — 13 passed;
+- `cargo test -p zam-cli --bin zam --test hooks --test mcp_bind --test init --test
+  m45_acceptance --test repo_clean --test status` — 233 passed, 0 failed;
+- `cargo test -p zam-cli --test m4_acceptance hook_budgets` (с проверкой файла привязки) —
+  PASS, `session-start` n=40 p50 47,98 мс, p95 52,66 мс, max 72,0 мс (бюджет 300);
+- `cargo fmt --all -- --check`; `cargo clippy -p zam-server -p zam-cli -p zam-store -p zam-core
+  --all-targets -- -D warnings` и `cargo clippy -p zam-cli --all-targets --features test-hooks
+  -- -D warnings` — чисто.
+- Linux-ветка `procs` (`/proc`) локально не собиралась — проверит CI ветки.
+
+**Передать:**
+- **→ 8b.** События `search`/`read` писать только при `!via_mcp` (поле уже есть); `mcp` — в
+  таблице «событие · вызовов · токенов» и в `unattributed`.
+- **→ 13c.** ТЗ §13.1 (строка `zam mcp`): «`X-Zam-Session` прокси не шлёт» заменить порядком
+  §7.1; описание `memory_search` и протокол — «(выдавалось)»; `GET /sessions/unattributed`.
+- **→ владельцу / 13a.** HTTP-транспорт `.mcp.json` (`zam init` для Claude Code) сессию не шлёт
+  — там привязки нет, путь всегда неявный. Вариант — заголовок `X-Zam-Session:
+  ${CLAUDE_CODE_SESSION_ID}` в `.mcp.json`, если Claude Code раскрывает эту переменную в
+  заголовках (проверить на живом агенте).
+- **→ CI.** `cargo test --workspace` не включает `--features test-hooks` у `zam-cli`: юнит-тест
+  `binding_found_via_fake_ancestors` в CI не идёт (команда плана — отдельная).
+
 ### Задача 4. Сессионный набор ТС-2
 
 ### Задача 5. Карточки v2, честный бюджет, ответы записи
@@ -1050,9 +1161,16 @@ c29ceb06c4c0bf37d99cf1959220ce2f`, `docs_manifest_sha256 = e41b4142…29c39` (н
 3. **Чек-лист на живом агенте** (не блокирует): передаётся ли `CLAUDE_CODE_SESSION_ID` процессу MCP;
    передаёт ли Codex `transcript_path` в хуки; приходит ли `SessionEnd` у Claude Code при закрытии
    окна; цепочка процессов хука и MCP у Codex (общий предок, §7.1).
+   Дополнено задачей 3: cwd процесса `zam mcp` — корень проекта (иначе файл привязки не
+   найдётся); имя процесса агента на Windows и Linux (`claude`/`node`/`codex`) и глубина до
+   него ≤ 4; HTTP-транспорт `.mcp.json` сессию не шлёт — нужен ли заголовок
+   `X-Zam-Session: ${CLAUDE_CODE_SESSION_ID}`.
 4. **Прогон агентного A/B** (задача 12) — владельцем, ≥ 10 задач × 2 плеча × 2 повтора, после
    финализации; приёмку M6 не блокирует.
 5. ~~Вопрос 11 M5.7~~ — **ответ А (2026-11-05)**: значок «Предложено вернуть» только в карточке.
+6. **Переиспользование pid в привязке MCP** (задача 3, решение 8): достаточно ли срока файла
+   7 дней или нужна сверка времени старта процесса (новые фичи `windows`). По умолчанию — без
+   сверки.
 
 ## Передать в M7
 
