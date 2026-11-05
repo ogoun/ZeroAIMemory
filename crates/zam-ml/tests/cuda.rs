@@ -119,3 +119,54 @@ fn cpu_model_stays_on_cpu_with_cuda_pref() {
         e.embed_query("cpu only").unwrap();
     }
 }
+
+/// Диагностика недетерминизма векторного канала (M6, задача 5, шаг 0): эмбеддинг одних и тех
+/// же запросов двумя загрузками модели (кэш запросов у каждой свой) и дважды внутри одной
+/// сессии (`embed_passages` без кэша) — побайтово, на CUDA fp16 и на CPU int8.
+/// Запуск: `cargo test --release -p zam-ml --test cuda -- --ignored --nocapture query_embedding`.
+#[test]
+#[ignore = "нужны GPU, CUDA, bge-m3-fp16 и bge-m3-int8"]
+fn query_embedding_bitwise_repeatable() {
+    let queries = [
+        "как настроить окончания строк LF в bash на Windows?",
+        "почему падает миграция базы при параллельном деплое",
+        "how do we rotate TLS certificates before they expire",
+        "kafka consumer lag alert threshold",
+        "ошибка $'\r': command not found",
+        "idempotency key for payment retries",
+    ];
+    let bits = |e: &zam_ml::Embedding| -> (Vec<u32>, Vec<(u32, u32)>) {
+        (
+            e.dense.iter().map(|x| x.to_bits()).collect(),
+            e.sparse.iter().map(|(i, w)| (*i, w.to_bits())).collect(),
+        )
+    };
+    for (model, pref, ort) in [
+        ("bge-m3-fp16", DevicePref::Cuda, ort_gpu()),
+        ("bge-m3-int8", DevicePref::Cpu, ort_gpu()), // одна библиотека ORT на процесс
+    ] {
+        if !have(&ort, model) {
+            continue;
+        }
+        let (a, rep) = Embedder::load(&config(ort.clone(), models_dir(), pref), model).unwrap();
+        let (b, _) = Embedder::load(&config(ort.clone(), models_dir(), pref), model).unwrap();
+        let mut diff_load = 0;
+        let mut diff_run = 0;
+        for q in queries {
+            if bits(&a.embed_query(q).unwrap()) != bits(&b.embed_query(q).unwrap()) {
+                diff_load += 1;
+            }
+            let p1 = a.embed_passages(&[q]).unwrap().remove(0);
+            let p2 = a.embed_passages(&[q]).unwrap().remove(0);
+            if bits(&p1) != bits(&p2) {
+                diff_run += 1;
+            }
+        }
+        eprintln!(
+            "{model} {}: различий между загрузками {diff_load}/{n}, между прогонами {diff_run}/{n}",
+            rep.device,
+            n = queries.len()
+        );
+        assert_eq!((diff_load, diff_run), (0, 0), "{model}");
+    }
+}

@@ -40,8 +40,8 @@ pub(crate) use chunks::{
     stored_prefix_hit, token_counter,
 };
 pub use chunks::{
-    PREFIX_L0_MAX_TOKENS, chunk_params, count_tokens, prefix_l0, set_chunk_params, set_prefix_l0,
-    set_token_counter, token_counter_exact,
+    PREFIX_L0_MAX_TOKENS, chunk_params, count_tokens, count_tokens_chunker, prefix_l0,
+    set_chunk_params, set_prefix_l0, set_token_counter, token_counter_exact,
 };
 pub use history::{RevisionInfo, entry_snapshot_text, list_revisions, unified_diff};
 pub use l0::{set_auto_l0, set_folder_l0};

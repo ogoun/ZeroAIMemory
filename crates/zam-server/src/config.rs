@@ -548,6 +548,16 @@ pub struct SearchSection {
     /// выдаче (axiom → axiom и theorem → theorem не переставляются). `false` — порядок
     /// реранкера без поправки (по умолчанию `true`).
     pub contradicts_order: bool,
+    /// Бюджет выдачи `POST /search` и `memory_search` без явного `budget_tokens`, токенов
+    /// счётчика сервера (1..=200000, 800; M6 §4.2): Markdown `brief`/`notes` целиком, вместе
+    /// со строкой `~N tok` MCP, укладывается в него; первая карточка отдаётся всегда.
+    pub budget_tokens: usize,
+    /// Отсечка слабых карточек `brief`/`notes` (0..=1, 0 — выключена, поведение v0.0.9; M6
+    /// §4.2): карточка с баллом ниже `brief_min_rel × лучший` не выдаётся, явный `top_k` её
+    /// не снимает. По умолчанию 0 — сетка ТС-1 dev задачи 5 M6: 0,4 ничего не отсекает, 0,5
+    /// экономит 0,16 %, но выбрасывает находки только канала `alias` (его вес 0,5 — балл вдвое
+    /// ниже: приёмка M4.5 `glossary_ru_en`), поэтому остаётся значение v0.0.9.
+    pub brief_min_rel: f64,
 }
 
 impl SearchSection {
@@ -598,6 +608,12 @@ impl SearchSection {
         }
         if !(self.graph_weight.is_finite() && (0.0..=1.0).contains(&self.graph_weight)) {
             return Err(bad("graph_weight", "должно быть в 0..=1"));
+        }
+        if !(1..=200_000).contains(&self.budget_tokens) {
+            return Err(bad("budget_tokens", "от 1 до 200000"));
+        }
+        if !(self.brief_min_rel.is_finite() && (0.0..=1.0).contains(&self.brief_min_rel)) {
+            return Err(bad("brief_min_rel", "должно быть в 0..=1"));
         }
         Ok(())
     }
@@ -727,6 +743,9 @@ pub struct RecallSection {
     /// Бюджет сервера на сбор подсказок, мс (1..=60000, 200): по превышении отдаётся собранное
     /// и `warnings: ["recall timeout"]`.
     pub timeout_ms: u64,
+    /// Фрагмент под подсказкой поиска (правило, insight), токенов (0..=200, 60; M6 §4.3);
+    /// 0 — без фрагмента.
+    pub snippet_tokens: usize,
 }
 
 impl RecallSection {
@@ -750,6 +769,9 @@ impl RecallSection {
         }
         if !(1..=60_000).contains(&self.timeout_ms) {
             return Err(bad("timeout_ms", "от 1 до 60000"));
+        }
+        if self.snippet_tokens > 200 {
+            return Err(bad("snippet_tokens", "от 0 до 200"));
         }
         Ok(())
     }
@@ -1173,6 +1195,8 @@ impl Default for ServerConfig {
                 w_folder: 0.0,
                 max_folders: 2,
                 contradicts_order: true,
+                budget_tokens: 800,
+                brief_min_rel: 0.0,
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
@@ -1196,6 +1220,7 @@ impl Default for ServerConfig {
                 brief_tokens: 800,
                 prompt_min_score: 0.6,
                 timeout_ms: 200,
+                snippet_tokens: 60,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,

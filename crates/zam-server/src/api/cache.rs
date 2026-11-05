@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! POST   /cache {query, summary, sources: [{id, rev?, section?}], solution?, scope?, filters?,
-//!                include_history?, promote?: {as: note|insight, path?, kind?}}   → 201
+//!                include_history?, promote?: {as: note|insight, path?, kind?}, echo?}  → 201
 //! GET    /cache?q=&solution=&session=&author=&state=valid|stale&limit=        → {items}
 //! GET    /cache/{id}                                                          → выжимка
 //! DELETE /cache/{id}                                                          → 204
@@ -41,6 +41,8 @@
 //!   на источники, у выжимки — `promoted_to`; `POST /cache` с `promote` сохраняет и
 //!   превращает одной транзакцией (409 на занятом пути — выжимки нет);
 //! - `query_vec` хранится с `model_id` текущей модели: вектор другой модели не сравнивается.
+//! - **ответ `POST /cache`** (M6 §5): выжимка без `summary` (агент только что прислал этот
+//!   текст), остальные поля прежние; `echo: true` — прежняя форма v0.0.10 с `summary`.
 //!
 //! Изменяющие маршруты (`POST /cache`, `DELETE`, `promote`) — в `memory_routes` (решение
 //! контроллера R12: счётчик `memory_writes` сессии), чтение — служебное.
@@ -106,6 +108,10 @@ pub struct PutReq {
     #[serde(default)]
     include_history: bool,
     promote: Option<Promote>,
+    /// Вернуть `summary` в ответе (форма v0.0.10, M6 §5); по умолчанию — без него: агент
+    /// только что прислал этот текст.
+    #[serde(default)]
+    echo: bool,
 }
 
 /// Ссылка выжимки в Markdown: `c_<id>`.
@@ -617,8 +623,14 @@ pub async fn put(
         .map_err(cache_error)?;
     let h = cache_get(&sc.db, e.id).await?.ok_or(ApiError::NotFound)?;
     let mut v = cache_json(&st, &h, Some(&sc.space)).await;
-    if let (Some(t), Value::Object(m)) = (made, &mut v) {
-        m.insert("promoted".into(), json!(t));
+    if let Value::Object(m) = &mut v {
+        if let Some(t) = made {
+            m.insert("promoted".into(), json!(t));
+        }
+        // без эха — только `summary` долой (M6 §5, I5): остальные поля прежние
+        if !req.echo {
+            m.remove("summary");
+        }
     }
     Ok((StatusCode::CREATED, Json(v)))
 }

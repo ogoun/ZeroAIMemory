@@ -114,7 +114,7 @@ fn assert_marked(j: &Value) {
     for id in ids(j) {
         let line = text
             .lines()
-            .find(|l| l.ends_with(&format!("— {id}")))
+            .find(|l| l.ends_with(&format!(" {id}")))
             .unwrap_or_else(|| panic!("нет строки {id}: {text}"));
         assert!(line.starts_with("ZeroAIMemory: "), "{line}");
     }
@@ -282,7 +282,7 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
     }
     assert!(!got.contains(&format!("c:{}", changes[0])), "{text}");
     assert!(
-        text.contains("ZeroAIMemory: LF в bash-скриптах [gotcha, hypothesis] — i:"),
+        text.contains("ZeroAIMemory: LF в bash-скриптах [gotcha·hyp] i:"),
         "{text}"
     );
     assert!(
@@ -399,7 +399,7 @@ async fn prompt_returns_0_to_3_above_threshold() {
         j["text"]
             .as_str()
             .unwrap()
-            .starts_with("ZeroAIMemory: правило телескоп › Телескоп — n:"),
+            .starts_with("ZeroAIMemory: правило телескоп › Телескоп n:"),
         "{j}"
     );
     // ничего похожего — тишина
@@ -495,7 +495,7 @@ async fn post_tool_matches_error_regex_and_fts() {
     assert_eq!(j["items"][0]["reason"], "error_regex");
     assert!(
         j["text"].as_str().unwrap().starts_with(&format!(
-            "ZeroAIMemory: эта ошибка уже разбиралась: CRLF в скриптах [gotcha, hypothesis] — i:{crlf}"
+            "ZeroAIMemory: эта ошибка уже разбиралась: CRLF в скриптах [gotcha·hyp] i:{crlf}"
         )),
         "{j}"
     );

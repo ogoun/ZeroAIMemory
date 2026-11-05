@@ -213,7 +213,9 @@ pub async fn setup(
             lang,
         },
     );
-    let tokens = zam_store::count_tokens(&block);
+    // размер блока — счётчиком чанкера (M6, задача 5): без модели оценка сверху бюджетов
+    // выдачи дала бы ложное предупреждение
+    let tokens = zam_store::count_tokens_chunker(&block);
     // бюджет блока (§14.2): шаблон администратора или длинный адрес могут его превысить
     let mut warnings = Vec::new();
     if tokens > BLOCK_TOKENS_MAX {
@@ -323,7 +325,9 @@ pub async fn preview(
             lang,
         },
     );
-    let tokens = zam_store::count_tokens(&block);
+    // размер блока — счётчиком чанкера (M6, задача 5): без модели оценка сверху бюджетов
+    // выдачи дала бы ложное предупреждение
+    let tokens = zam_store::count_tokens_chunker(&block);
     let mut warnings = Vec::new();
     if tokens > BLOCK_TOKENS_MAX {
         warnings.push(format!(

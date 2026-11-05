@@ -1272,11 +1272,12 @@ async fn map_two_phase_many_files_tail_counts_all() {
         let syms = m["symbols_shown"].as_u64().unwrap() + m["symbols_left"].as_u64().unwrap();
         assert_eq!(syms, 300);
     }
-    // дешёвые файлы (без символов, ≈ 3 токена): показано больше первой порции (бюджет / 8)
+    // дешёвые файлы (без символов; `q/NNN.rs` — ≈ 4 токена bge-m3, ≈ 7 оценки сверху без модели,
+    // M6 задача 5): показано больше первой порции (бюджет / 8)
     let b = world("two-phase-cheap", |_| {}).await;
     for part in [0..300u64, 300..600] {
         let cheap: Vec<Value> = part
-            .map(|i| file(&format!("q/a{i}.rs"), i + 1, vec![], &[]))
+            .map(|i| file(&format!("q/{i:03}.rs"), i + 1, vec![], &[]))
             .collect();
         put(&b, cheap).await;
     }
@@ -1296,7 +1297,7 @@ async fn map_two_phase_many_files_tail_counts_all() {
         "непрочитанные файлы не показаны: {text}"
     );
     assert_eq!(
-        text.lines().filter(|l| l.starts_with("q/a")).count() as u64,
+        text.lines().filter(|l| l.starts_with("q/")).count() as u64,
         shown
     );
     let md = get_ok(

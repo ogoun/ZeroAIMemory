@@ -265,7 +265,7 @@ async fn age_by(a: &Api, table: &'static str, id: &str, days: i64) {
 }
 
 /// `age_days` у элементов поиска и подсказок `/recall`: от `updated_at`, у заметки с
-/// `verified_at` — от более позднего; в md поиска — «N дн. назад» / «сегодня».
+/// `verified_at` — от более позднего; в md поиска возраста нет (M6 §4.1) — дата обновления UTC.
 #[tokio::test]
 async fn age_days_in_search_and_hints() {
     let a = api("age-days", roomy).await;
@@ -324,18 +324,21 @@ async fn age_days_in_search_and_hints() {
             .unwrap_or_else(|| panic!("нет {needle}: {md}"))
             .to_string()
     };
+    // карточка v2: точная дата обновления UTC вместо «N дн. назад» / «сегодня»
+    let days_ago = |d: i64| {
+        (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * d))
+            .strftime("%Y-%m-%d")
+            .to_string()
+    };
     assert!(
-        line(&format!("i:{e}")).contains(" · 3 дн. назад · ~"),
+        line(&format!("i:{e}")).contains(&format!(" {} ", days_ago(3))),
         "{md}"
     );
     assert!(
-        line(&format!("n:{stale}")).contains(" · 10 дн. назад · ~"),
+        line(&format!("n:{stale}")).contains(&format!(" {} ", days_ago(10))),
         "{md}"
     );
-    assert!(
-        line(&format!("n:{checked}")).contains(" · сегодня · ~"),
-        "{md}"
-    );
+    assert!(!md.contains("дн. назад") && !md.contains("сегодня"), "{md}");
     // подсказки дайджеста: ловушка с возрастом
     let r = a
         .t(

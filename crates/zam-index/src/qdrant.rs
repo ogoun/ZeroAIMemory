@@ -24,6 +24,10 @@
 //! - с `VectorFilter::folders` (M3, канал папок §8.3) — ещё prefetch dense top-10 по точкам
 //!   папок со своим фильтром ([`VectorFilter::folder_filter`]); итоговый лимит растёт на
 //!   его размер, так что точки папок не вытесняют чанки из выдачи M2.
+//! - **слияние RRF детерминировано** (M6, задача 5): Qdrant упорядочивает равные баллы RRF
+//!   по-разному от вызова к вызову (замер — журнал M6, задача 5, шаг 0), поэтому запрос берёт
+//!   всех кандидатов (лимит — сумма лимитов prefetch), а порядок (балл ↓, `chunk_id` ↑) и отбор
+//!   первых — [`order_fused`].
 //!
 //! Задача 19 M3 — первый старт после жёсткой остановки ([`CollectionTuning`]): клиент
 //! супервизора создаёт коллекцию с заданными `flush_interval_sec` и `wal_capacity_mb`, у
@@ -559,6 +563,8 @@ impl QdrantIndex {
         let mut q = QueryPointsBuilder::new(COLLECTION);
         let mut prefetches = 0;
         let mut limit = QUERY_LIMIT;
+        // сумма лимитов prefetch: слияние отдаёт всех кандидатов, отбор — здесь (см. ниже)
+        let mut fetch = 0;
         // фрагменты вложений — своим prefetch dense и sparse (см. модуль)
         let window = attachment_window(f) as u64;
         if window > 0
@@ -574,6 +580,7 @@ impl QdrantIndex {
                         .limit(window),
                 );
                 prefetches += 1;
+                fetch += window;
             }
             if !q_sparse.is_empty() {
                 let mut sparse = PrefetchQueryBuilder::default()
@@ -586,6 +593,7 @@ impl QdrantIndex {
                 }
                 q = q.add_prefetch(sparse);
                 prefetches += 1;
+                fetch += window;
             }
             limit += window;
         }
@@ -599,6 +607,7 @@ impl QdrantIndex {
                     .limit(LEAF_PREFETCH),
             );
             prefetches += 1;
+            fetch += LEAF_PREFETCH;
         }
         if !leaf_levels.is_empty() && !q_sparse.is_empty() {
             let mut sparse = PrefetchQueryBuilder::default()
@@ -611,6 +620,7 @@ impl QdrantIndex {
             }
             q = q.add_prefetch(sparse);
             prefetches += 1;
+            fetch += LEAF_PREFETCH;
         }
         if !note_levels.is_empty() && !q_dense.is_empty() {
             q = q.add_prefetch(
@@ -622,6 +632,7 @@ impl QdrantIndex {
                     .limit(NOTE_PREFETCH),
             );
             prefetches += 1;
+            fetch += NOTE_PREFETCH;
         }
         // точки папок — своим prefetch; лимит слияния растёт на его размер: папки не
         // занимают места чанков (каждая точка — только в одном prefetch, RRF не меняет
@@ -639,21 +650,31 @@ impl QdrantIndex {
                     .limit(FOLDER_PREFETCH),
             );
             prefetches += 1;
+            fetch += FOLDER_PREFETCH;
             limit += FOLDER_PREFETCH;
         }
         if prefetches == 0 {
             return Ok(Vec::new());
         }
+        // RRF Qdrant упорядочивает равные баллы (а их много: ранг r в dense и ранг r в sparse
+        // дают один балл) по-разному от вызова к вызову и на границе лимита отдаёт разный
+        // состав (M6, задача 5, шаг 0). Поэтому слияние берёт всех кандидатов, а порядок и
+        // отбор — детерминированные ([`order_fused`]).
         let q = q
             .query(Query::new_rrf(RrfBuilder::with_k(RRF_K)))
-            .limit(limit)
+            .limit(fetch.max(limit))
             .with_payload(hit_payload());
         let resp = self
             .client
             .query(q)
             .await
             .map_err(|e| map_err("query", e))?;
-        resp.result.into_iter().map(to_hit).collect()
+        let hits = resp
+            .result
+            .into_iter()
+            .map(to_hit)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(order_fused(hits, limit as usize))
     }
 
     async fn nearest_dense_impl(
@@ -970,6 +991,18 @@ fn hit_payload() -> SelectorOptions {
     SelectorOptions::Include(PayloadIncludeSelector {
         fields: HIT_FIELDS.iter().map(|f| (*f).to_string()).collect(),
     })
+}
+
+/// Порядок слияния: балл по убыванию, при равенстве — `chunk_id` по возрастанию; первые
+/// `limit`. Детерминирован при любом порядке входа (равные баллы RRF — обычное дело).
+pub(crate) fn order_fused(mut hits: Vec<VectorHit>, limit: usize) -> Vec<VectorHit> {
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
+    hits.truncate(limit);
+    hits
 }
 
 /// Точка выдачи → [`VectorHit`].

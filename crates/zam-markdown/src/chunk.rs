@@ -79,6 +79,82 @@ impl TokenCounter for ApproxCounter {
     }
 }
 
+/// Оценка сверху без токенизатора — для **бюджетов выдачи** (M6, задача 5): не меньше счёта
+/// bge-m3 на корпусе eval (заметки целиком и карточки поиска с полными id; тест
+/// `upper_estimate_not_below_bge_on_eval_corpus` в `zam-ml`), завышение около 20–30 %.
+/// [`ApproxCounter`] на выдаче сервера занижал ~15 %: id в Crockford base32 (26 символов ≈
+/// 19 токенов) и знаки стоят дороже 3,5 символа на токен. Чанкер её не использует: размеры
+/// листов подобраны под [`ApproxCounter`] и токенизатор модели.
+///
+/// Текст делится на серии букв и цифр, серии пробелов и отдельные прочие символы; стоимость
+/// (в тысячных токена) — [`UPPER_WORD`] за серию букв и цифр плюс за каждый её символ: смешанная
+/// серия (буквы и цифры: id, хэши) [`UPPER_MIXED`], только цифры [`UPPER_DIGIT`], только ASCII
+/// буквы [`UPPER_LATIN`], прочие буквы [`UPPER_OTHER`]; знак — [`UPPER_PUNCT`]; пробелы — 0.
+/// Коэффициенты — верхняя линейная оценка (линейное программирование по корпусу eval и выдаче
+/// пилотов M6, журнал задачи 5). Оценка монотонна на префиксах.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpperCounter;
+
+/// Серия букв и цифр, тысячных токена.
+pub const UPPER_WORD: usize = 1000;
+/// Символ смешанной серии (буквы и цифры).
+pub const UPPER_MIXED: usize = 950;
+/// Символ серии из одних цифр.
+pub const UPPER_DIGIT: usize = 340;
+/// Символ серии из одних ASCII букв.
+pub const UPPER_LATIN: usize = 110;
+/// Символ серии с не-ASCII буквами (кириллица и др.).
+pub const UPPER_OTHER: usize = 130;
+/// Знак (не буква, не цифра, не пробел).
+pub const UPPER_PUNCT: usize = 1334;
+
+/// Стоимость серии букв и цифр: `chars` символов, есть ли цифры, буквы и не-ASCII.
+fn upper_run(chars: usize, digit: bool, alpha: bool, non_ascii: bool) -> usize {
+    let per = match (digit, alpha) {
+        (true, true) => UPPER_MIXED,
+        (true, false) => UPPER_DIGIT,
+        _ if non_ascii => UPPER_OTHER,
+        _ => UPPER_LATIN,
+    };
+    UPPER_WORD + per * chars
+}
+
+impl TokenCounter for UpperCounter {
+    fn count(&self, text: &str) -> usize {
+        let mut milli = 0usize;
+        // текущая серия букв и цифр: длина, цифры, буквы, не-ASCII
+        let mut run = (0usize, false, false, false);
+        for c in text.chars() {
+            if c.is_alphanumeric() {
+                run.0 += 1;
+                run.1 |= c.is_numeric();
+                run.2 |= !c.is_numeric();
+                run.3 |= !c.is_ascii();
+                continue;
+            }
+            if run.0 > 0 {
+                milli += upper_run(run.0, run.1, run.2, run.3);
+                run = (0, false, false, false);
+            }
+            if !c.is_whitespace() {
+                milli += UPPER_PUNCT;
+            }
+        }
+        if run.0 > 0 {
+            milli += upper_run(run.0, run.1, run.2, run.3);
+        }
+        milli.div_ceil(1000)
+    }
+
+    fn is_exact(&self) -> bool {
+        false
+    }
+
+    fn tokenizer_id(&self) -> String {
+        "upper-v1".into()
+    }
+}
+
 /// Пороги чанкера (§8.2); значения по умолчанию подбираются на eval (§18.2).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChunkParams {

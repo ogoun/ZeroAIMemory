@@ -37,7 +37,8 @@ impl PassageScorer for Stub {
 /// Сервер с двумя выводами: `hypothesis` (метка «маркергипотезы») и `theorem` с доказательством
 /// (метка «маркертеоремы»); оба находятся запросом «сборка кэша».
 async fn setup(name: &str, marks: Vec<(&'static str, f32)>) -> Api {
-    let a = api(name, |_| {}).await;
+    // без отсечки слабых карточек (M6 §4.2): тесты — о баллах реранка
+    let a = api(name, |c| c.search.brief_min_rel = 0.0).await;
     a.st.rerank.install(Arc::new(Stub(marks))).await;
     for (title, body, certainty) in [
         (
@@ -141,5 +142,5 @@ async fn rerank_score_raw_in_output() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let md = r.text();
-    assert!(md.contains("[1.00]") && md.contains("[0.48]"), "{md}");
+    assert!(md.contains("[1.0]") && md.contains("[.48]"), "{md}");
 }

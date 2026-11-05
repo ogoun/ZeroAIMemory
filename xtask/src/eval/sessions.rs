@@ -726,6 +726,10 @@ impl RefMap {
 /// 19,17, разброс 14–24). Цифры `0…0` стоили бы 6 токенов и занизили бы счёт ~18 %.
 pub const ID_STUB: &str = "01M6NYKVK8E7DVZVME2RR071DW";
 
+/// Правило решающего счёта токенов (`SessionsInfo.count_rule`): id ссылок — заглушкой
+/// средней стоимости [`ID_STUB`] (v1 — заглушка из нулей, до повторного ревью задачи 4).
+pub const COUNT_RULE: &str = "fixed_ids v2 (ID_STUB)";
+
 /// Текст для счёта токенов: `<буква>:<id>` и `c_<id>` (id — 26 символов) — постоянной
 /// заглушкой [`ID_STUB`] средней стоимости: число токенов не зависит от случайных id загрузки.
 pub fn fixed_ids(text: &str) -> String {
@@ -1581,9 +1585,16 @@ fn repeats(r: &SessionRun, labels_ex: &BTreeSet<String>, cross: bool) -> Tally {
 
 /// Строка `hooks.log` (в примечаниях сессии) — хук не уложился в бюджет: остаток бюджета
 /// кончился до запроса ([`zam_core::HOOK_BUDGET_SPENT`] — та же константа у клиента) или запрос
-/// оборвался по сроку (ошибка сети `ureq` — «timeout» / «timed out»).
+/// оборвался по сроку (ошибка сети `ureq` — «timeout» / «timed out»). Строки фоновой
+/// синхронизации карты кода (`code-sync`) — не промах хука.
 pub fn budget_miss(note: &str) -> bool {
+    // строки фоновой `zam code sync` (источник `code-sync`): её сроки — не бюджет хука
+    let code_sync = note
+        .split_whitespace()
+        .nth(3)
+        .is_some_and(|src| src == "code-sync");
     note.starts_with("hooks.log")
+        && !code_sync
         && (note.contains(zam_core::HOOK_BUDGET_SPENT)
             || (note.contains("недоступен")
                 && (note.contains("timeout") || note.contains("timed out"))))
@@ -1770,6 +1781,10 @@ pub struct SessionsInfo {
     pub device: Option<String>,
     #[serde(default)]
     pub repeat: usize,
+    /// Правило решающего счёта ([`COUNT_RULE`]; пусто — файл до правила v2). Сохранённые
+    /// плечи при `--arm`/`--compare` пересчитываются текущим правилом ([`recount`]).
+    #[serde(default)]
+    pub count_rule: String,
     pub notes: Vec<String>,
 }
 
@@ -2469,7 +2484,7 @@ fn load_access(s: &Session, w: &World) -> Result<()> {
 
 /// Копия фикстуры карты кода в каталог проекта и `zam code sync`.
 fn code_sync(h: &Hooks, fixture: &Path) -> Result<String> {
-    copy_dir(fixture, &h.project)?;
+    run::copy_dir(fixture, &h.project)?;
     let mut c = Command::new(&h.zam);
     scrub_zam_env(&mut c, &[]);
     for k in zam_core::AGENT_ENV_VARS {
@@ -2492,20 +2507,6 @@ fn code_sync(h: &Hooks, fixture: &Path) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
-    for e in fs::read_dir(from).with_context(|| from.display().to_string())? {
-        let e = e?;
-        let dst = to.join(e.file_name());
-        if e.file_type()?.is_dir() {
-            fs::create_dir_all(&dst)?;
-            copy_dir(&e.path(), &dst)?;
-        } else {
-            fs::copy(e.path(), &dst)?;
-        }
-    }
-    Ok(())
 }
 
 /// Каталог процесса `zam mcp` неявного пути: `solution.toml` без файлов привязки хуков.
@@ -2558,6 +2559,7 @@ pub fn recount(r: &mut SessionsResult, count: Count<'_>) {
         }
     }
     r.summary = summarize(&r.sessions, &own_exclusions(&r.info.feats));
+    r.info.count_rule = COUNT_RULE.into();
 }
 
 fn compare_files(repo: &Path, arm_path: &Path, bases: &[PathBuf]) -> Result<()> {
@@ -2948,6 +2950,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             corpus_blake3: dir_blake3(&p.sessions_corpus)?,
             device: model.as_ref().map(|_| a.device.as_str().to_string()),
             repeat: reps,
+            count_rule: COUNT_RULE.into(),
             notes,
         },
         summary: summarize(&runs, &own_exclusions(&f)),
@@ -3588,18 +3591,29 @@ queries = ["c"]
     #[test]
     fn id_stub_costs_mean_id() {
         let repo = crate::eval::tests_repo();
-        let Ok(c) = Counter::load(&repo) else {
-            eprintln!("нет tokenizer.json bge-m3 в target/models — проверка стоимости пропущена");
-            return;
+        let c = match Counter::load(&repo) {
+            Ok(c) => c,
+            // в CI с моделями (`ZAM_REQUIRE_ML=1`) отсутствие токенизатора — ошибка, а не пропуск
+            Err(e) if std::env::var_os("ZAM_REQUIRE_ML").is_some() => {
+                panic!("ZAM_REQUIRE_ML=1, а токенизатора bge-m3 нет: {e}")
+            }
+            Err(_) => {
+                eprintln!(
+                    "нет tokenizer.json bge-m3 в target/models — проверка стоимости пропущена"
+                );
+                return;
+            }
         };
         let n = c.count(&format!("n:{ID_STUB}")) as f64;
         assert!(
             (n - ID_MEAN_TOKENS).abs() <= 1.0,
             "n:<заглушка> = {n} токенов"
         );
-        // в тексте: заглушка стоит столько же, сколько настоящий id средней стоимости
-        let real = format!("правило — n:{ID_STUB} x");
-        assert_eq!(c.count(&fixed_ids(&real)), c.count(&real));
+        // в тексте: настоящий id пилота pilot2 средней стоимости (n:<id> = 19 токенов) после
+        // замены заглушкой стоит столько же
+        let real = "правило — n:01M6P1EQJRE1DV7NHBDRNPYS5C x";
+        assert_eq!(c.count("n:01M6P1EQJRE1DV7NHBDRNPYS5C"), 19);
+        assert_eq!(c.count(&fixed_ids(real)), c.count(real));
     }
 
     #[test]
@@ -3616,6 +3630,10 @@ queries = ["c"]
         )));
         assert!(!budget_miss(&format!(
             "{t0} code-sync карта кода: файлов 0"
+        )));
+        // фоновая синхронизация карты кода с тайм-аутом сети — не промах бюджета хука
+        assert!(!budget_miss(&format!(
+            "hooks.log (session-start): 2026-11-05T14:39:13Z code-sync карта кода: сервер http://127.0.0.1:1 недоступен: {e}"
         )));
         assert!(
             !budget_miss(zam_core::HOOK_BUDGET_SPENT),

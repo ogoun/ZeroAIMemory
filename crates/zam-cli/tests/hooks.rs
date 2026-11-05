@@ -337,7 +337,7 @@ fn pre_tool_matches_glob_from_cache_without_network() {
     let c = context(&o, "PreToolUse");
     assert_eq!(
         c,
-        "ZeroAIMemory: для **/*.sh: Скрипты — только LF [gotcha, theorem] — i:E1"
+        "ZeroAIMemory: для **/*.sh: Скрипты — только LF [gotcha·th] i:E1"
     );
     // команда — command_regex; не совпало — тишина
     let bash = |cmd: &str, s: &str| {
@@ -353,7 +353,7 @@ fn pre_tool_matches_glob_from_cache_without_network() {
         "claude",
         bash("git push --force origin", "s1").to_string().as_bytes(),
     );
-    assert!(context(&o, "PreToolUse").contains("Не форсить main [gotcha, theorem] — i:E2"));
+    assert!(context(&o, "PreToolUse").contains("Не форсить main [gotcha·th] i:E2"));
     let (o, _) = p.hook_at(
         DEAD,
         "pre-tool",
@@ -546,9 +546,7 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
     );
     let c = context(&p.hook("session-start", &ev), "SessionStart");
     assert!(
-        c.contains(&format!(
-            "Скрипты — только LF [gotcha, hypothesis] — i:{id}"
-        )),
+        c.contains(&format!("Скрипты — только LF [gotcha·hyp] i:{id}")),
         "{c}"
     );
     // R2: блок v1 устарел — сервер напоминает
@@ -604,6 +602,45 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
     assert_eq!(read()["triggers"].as_array().unwrap().len(), 2);
 }
 
+/// M6, задача 5 (A): привязка `zam mcp` к сессии (цепочка предков и файл `agent-<pid>.json`)
+/// и прочая локальная уборка хука не тратят бюджет `session-start` до запроса: после `compact`
+/// пакет восстановления приходит с сервера, даже когда привязка пишется медленно (подмена
+/// `ZAM_TEST_BINDING_STALL_MS`, фича `test-hooks`), в том числе в проекте без файла привязки.
+/// Раньше уборка шла до запроса, и задержка ≥ 270 мс давала «бюджет исчерпан» и пакет без
+/// сервера (пилот ТС-2, `sh-01` r1: 1543 → 80 токенов).
+#[test]
+fn session_start_compact_budget_kept_with_slow_binding() {
+    let _g = serial();
+    let (url, tok) = start("ss-compact-budget");
+    let p = Proj::new("ss-compact-budget", &url, &tok);
+    let id = p.insight("Миграции — под замком", "gotcha", "solution", &[]);
+    assert!(
+        std::fs::read_dir(p.cache())
+            .map(|rd| rd
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with("agent-")))
+            .unwrap_or(true),
+        "в проекте ещё нет файла привязки"
+    );
+    let ev = p.ev("SessionStart", "ss-compact", json!({"source": "compact"}));
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_BINDING_STALL_MS", "600")
+        .args(["hook", "session-start", "--agent", "claude"])
+        .write_stdin(ev.to_string().into_bytes());
+    let t = Instant::now();
+    let o = c.output().unwrap();
+    let took = t.elapsed();
+    let log = p.log();
+    assert!(!log.contains(zam_core::HOOK_BUDGET_SPENT), "{log}");
+    let text = context(&o, "SessionStart");
+    assert!(
+        text.contains(&format!("i:{id}")),
+        "пакет восстановления сервера: {text}\n{log}"
+    );
+    // хук не ждёт медленную уборку дольше своего бюджета (запас — как у R3)
+    assert!(took < max_for("session-start"), "{took:?}");
+}
+
 /// `PostToolUseFailure`: `error_regex` — с сервером и (сервер выключен) по кэшу.
 #[test]
 fn post_tool_failure_error_regex_hint() {
@@ -623,9 +660,8 @@ fn post_tool_failure_error_regex_hint() {
                "error": "Exit code 126\n/bin/bash^M: bad interpreter: No such file or directory"}),
     );
     let c = context(&p.hook("post-tool", &ev), "PostToolUseFailure");
-    let line = format!(
-        "ZeroAIMemory: эта ошибка уже разбиралась: CRLF в shebang [failure, hypothesis] — i:{id}"
-    );
+    let line =
+        format!("ZeroAIMemory: эта ошибка уже разбиралась: CRLF в shebang [failure·hyp] i:{id}");
     assert!(c.contains(&line), "{c}");
     assert_eq!(c.matches(&format!("i:{id}")).count(), 1, "без дублей: {c}");
     // повторная ошибка — снова подсказка
@@ -642,7 +678,7 @@ fn post_tool_failure_error_regex_hint() {
     let (o, d) = p.hook_at(DEAD, "post-tool", "claude", ev.to_string().as_bytes());
     let c = context(&o, "PostToolUseFailure");
     assert!(
-        c.contains("эта ошибка уже разбиралась: CRLF в shebang [gotcha, theorem] — i:E3"),
+        c.contains("эта ошибка уже разбиралась: CRLF в shebang [gotcha·th] i:E3"),
         "{c}"
     );
     assert!(d <= OTHER_MAX, "{d:?}");

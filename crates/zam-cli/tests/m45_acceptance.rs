@@ -880,9 +880,8 @@ fn glossary_ru_en() {
     );
     assert!(t.contains("term_alias: «summary» → «Выжимка»"), "{t}");
     // подсказка термина к промпту и строка словаря в дайджесте
-    let term_line = format!(
-        "ZeroAIMemory: термин «Выжимка» — Краткое изложение найденного для агента — t:{tid}"
-    );
+    let term_line =
+        format!("ZeroAIMemory: термин «Выжимка» — Краткое изложение найденного для агента t:{tid}");
     for (agent, s) in [("claude", "wm-g1"), ("codex", "wm-g2")] {
         let d = p.session_start_until(agent, s, "startup", |c| !c.is_empty());
         assert!(

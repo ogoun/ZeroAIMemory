@@ -66,6 +66,8 @@ async fn setup(name: &str) -> Option<(Api, TestQdrant, Db, Id)> {
     }
     let q = TestQdrant::start(name);
     let a = api(name, |c| {
+        // все карточки, без отсечки слабых (M6 §4.2): тесты — о записях в выдаче
+        c.search.brief_min_rel = 0.0;
         ml(c, MINILM);
         external(c, &q);
     })
@@ -319,7 +321,9 @@ async fn search_returns_entry_items_with_kind_status() {
         )),
         "{t}"
     );
-    assert!(t.contains("] active · hypothesis · сегодня · ~"), "{t}");
+    // карточка v2 (M6 §4.1): статус `active` не выводится, надёжность — `hyp`, дата UTC
+    assert!(t.contains("»  [") && t.contains("] hyp · "), "{t}");
+    assert!(!t.contains("сегодня") && !t.contains(" tok\n"), "{t}");
     assert!(
         t.contains(&format!(
             "c:{} changelog/fix «Converted deploy scripts to LF»  [",

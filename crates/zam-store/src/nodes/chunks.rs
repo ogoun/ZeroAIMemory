@@ -24,8 +24,8 @@ use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::{
-    ApproxCounter, ChunkLevel, ChunkParams, Doc, TokenCounter, chunk_note, first_paragraph,
-    mask_secrets, mask_text, parse, scan_secrets,
+    ApproxCounter, ChunkLevel, ChunkParams, Doc, TokenCounter, UpperCounter, chunk_note,
+    first_paragraph, mask_secrets, mask_text, parse, scan_secrets,
 };
 
 use super::{hex, revision_text};
@@ -280,8 +280,23 @@ pub fn token_counter_exact() -> bool {
     token_counter().is_exact()
 }
 
-/// Число токенов `text` текущим счётчиком чанкера (бюджет выдачи поиска).
+/// Число токенов `text` для бюджетов выдачи: токенизатор модели, без неё (или при откате
+/// токенизатора на оценку) — оценка сверху [`UpperCounter`] (M6, задача 5): прежняя оценка
+/// чанкера `ApproxCounter` на выдаче занижала ~15 %, и бюджеты не соблюдались. Чанкер
+/// по-прежнему режет своим счётчиком ([`token_counter`]).
 pub fn count_tokens(text: &str) -> usize {
+    let c = token_counter();
+    if c.is_exact() {
+        c.count(text)
+    } else {
+        UpperCounter.count(text)
+    }
+}
+
+/// Число токенов `text` счётчиком чанкера (токенизатор модели или `ApproxCounter`): размер
+/// для сведения, а не бюджет выдачи — например, блок инструкции агенту, проверяемый тестом по
+/// bge-m3 (без модели оценка сверху [`count_tokens`] давала бы ложное «больше 500»).
+pub fn count_tokens_chunker(text: &str) -> usize {
     token_counter().count(text)
 }
 

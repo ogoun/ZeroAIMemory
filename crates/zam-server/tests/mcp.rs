@@ -213,7 +213,8 @@ async fn mcp_search_returns_md_cards() {
     .await;
     assert!(o.text.contains(&format!("n:{id}")), "{}", o.text);
     assert!(o.text.contains("Инструменты/Ripgrep"), "{}", o.text);
-    assert!(o.text.contains("rev1"), "{}", o.text);
+    // карточка v2 (M6 §4.1): `r1` и дата UTC
+    assert!(o.text.contains("] r1 · "), "{}", o.text);
     // format=json — JSON ответа REST в тексте
     let o = ok(
         &a,
@@ -3201,4 +3202,140 @@ async fn subagent_on_shared_mcp_keeps_snippet() {
         search["inputSchema"]["properties"]["skip_seen"]["type"], "boolean",
         "{search}"
     );
+}
+
+// ---- ответы записи (M6 §5, задача 5) ----
+
+/// Строки ответа без последней `~N tok`.
+fn body_lines(o: &Out) -> Vec<String> {
+    let t = o.text.trim_end();
+    let (body, _) = t.rsplit_once('\n').unwrap_or(("", t));
+    body.lines().map(str::to_string).collect()
+}
+
+/// `memory_cache_put` — одна строка (≤ 80 токенов вместе с `~N tok`), без эха запроса.
+#[tokio::test]
+async fn mcp_cache_put_one_line_le_80_tokens() {
+    let a = api("mcp-cache-one-line", |_| {}).await;
+    let n = a
+        .note(
+            "knowledge",
+            "Сборка/Кэш cargo",
+            "# Кэш cargo\n\nCARGO_TARGET_DIR общий для всех веток ускоряет сборку.\n",
+        )
+        .await;
+    let id = n["id"].as_str().unwrap();
+    let long_q = "как ускорить сборку cargo в рабочем пространстве с десятком крейтов, \
+                  общим каталогом target и несколькими ветками одновременно на HDD";
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_cache_put",
+        json!({"query": long_q,
+               "summary": "Общий CARGO_TARGET_DIR для веток ускоряет сборку.",
+               "sources": [{"id": format!("n:{id}"), "rev": 1}],
+               "promote": {"as": "note"}}),
+    )
+    .await;
+    let lines = body_lines(&o);
+    assert_eq!(lines.len(), 1, "{}", o.text);
+    assert!(lines[0].contains("c_"), "{}", o.text);
+    assert!(
+        !o.text.contains("десятком крейтов"),
+        "эхо запроса: {}",
+        o.text
+    );
+    let n = zam_store::count_tokens(&o.text);
+    assert!(n <= 80, "{n} токенов: {}", o.text);
+}
+
+/// `memory_update_entry` — одна строка (≤ 80 токенов) при длинном заголовке; замещение — тоже.
+#[tokio::test]
+async fn mcp_update_entry_one_line_le_80_tokens() {
+    let a = api("mcp-update-one-line", |_| {}).await;
+    let title = "Очень длинный заголовок ловушки про сборку на Windows с путями, пробелами \
+                 и кавычками в именах каталогов проекта";
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "insight", "title": title, "body": "Разобрано.",
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let id = o
+        .text
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("i:"))
+        .unwrap()
+        .to_string();
+    let mut rev = 1;
+    for mut args in [
+        json!({"id": format!("i:{id}"), "action": "revisit"}),
+        json!({"id": format!("i:{id}"), "action": "certify", "certainty": "theorem",
+               "reason": "проверено на двух машинах",
+               "data": {"kind": "gotcha", "evidence": {"checked": "сборка на двух машинах",
+                        "method": "повтор", "result": "воспроизводится"}}}),
+        json!({"id": format!("i:{id}"), "action": "supersede", "title": title,
+               "body": "Разобрано заново.", "data": {"kind": "gotcha"}}),
+    ] {
+        args["rev"] = json!(rev);
+        let o = ok(&a, &a.token, &sess(), "memory_update_entry", args.clone()).await;
+        // ревизия — из ответа (`i:<id> rev<N>`)
+        if let Some(n) = o
+            .text
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("rev").and_then(|n| n.parse::<i64>().ok()))
+        {
+            rev = n;
+        }
+        let lines = body_lines(&o);
+        assert_eq!(lines.len(), 1, "{args}: {}", o.text);
+        let n = zam_store::count_tokens(&o.text);
+        assert!(n <= 80, "{args}: {n} токенов: {}", o.text);
+        if args["action"] == "supersede" {
+            assert!(
+                o.text.contains(&format!("i:{id}")),
+                "замещённая: {}",
+                o.text
+            );
+        }
+    }
+}
+
+/// `memory_log` с предупреждениями: строка записи и по строке на предупреждение.
+#[tokio::test]
+async fn memory_log_warnings_line_per_warning() {
+    let a = api("mcp-log-warnings", |_| {}).await;
+    ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "term", "title": "Выжимка", "body": "Подробности.",
+               "data": {"definition": "Короткая сводка", "aliases": ["summary", "digest"]}}),
+    )
+    .await;
+    let key = ["AK", "IA", "IOSFODNN7", "EXAMPLE"].concat();
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "insight", "title": "Про summary и digest",
+               "body": format!("summary и digest; ключ {key}"),
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let lines = body_lines(&o);
+    let warns: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("> warning: "))
+        .collect();
+    assert!(warns.len() >= 3, "{}", o.text);
+    assert_eq!(lines.len(), 1 + warns.len(), "{}", o.text);
+    assert!(lines[0].starts_with("Записано i:"), "{}", o.text);
+    assert!(!o.text.contains(&key), "{}", o.text);
 }

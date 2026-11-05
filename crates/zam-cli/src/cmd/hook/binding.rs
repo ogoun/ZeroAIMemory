@@ -71,6 +71,15 @@ pub fn chain() -> Vec<Proc> {
 /// Пишет привязку сессии `session` на предков текущего процесса (см. модуль). Цепочка не
 /// прочиталась — ничего не пишется.
 pub fn write_binding(root: &Path, session: &str) -> io::Result<()> {
+    // медленная цепочка или диск (тесты бюджета хука, M6 задача 5): только отладочная сборка
+    // (бинарник интеграционных тестов) и фича `test-hooks`
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::env::var("ZAM_TEST_BINDING_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let chain = chain();
     let Some(agent) = chain.last() else {
         return Ok(());

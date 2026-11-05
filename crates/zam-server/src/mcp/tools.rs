@@ -83,10 +83,10 @@ impl ToolName {
     fn description(self) -> &'static str {
         match self {
             ToolName::Search => {
-                "Поиск в памяти (Knowledge, Rules, решение): сначала выжимки кэша, затем \
-                 карточки — id, путь, ревизия, возраст, ~токены, пометка (выдавалось); \
-                 вложение — a:<id>, файл, locator. filters: kinds (и term, task, question, attachment), \
-                 insight_kinds, file — знание о файле, decided_by. Дальше — memory_read."
+                "Поиск в памяти (Knowledge, Rules, решение): выжимки кэша, затем карточки — id, \
+                 путь › секция, [балл] rN · ax|th|hyp · дата UTC · Nt, (выдавалось); вложение — \
+                 a:<id>, файл, locator. filters: kinds (+term, task, question, attachment), \
+                 insight_kinds, file, decided_by. Дальше — memory_read."
             }
             ToolName::Read => {
                 "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id>, путь <пространство>:/<путь>; \
@@ -862,17 +862,17 @@ async fn cache_put(rest: &Rest, args: &JsonObject) -> Res {
         &[],
     )
     .await?;
+    // одна строка без эха запроса и выжимки (M6 §5): агент их только что прислал
     done(f, &r, |v| {
         let n = v["sources"].as_array().map_or(0, Vec::len);
         let mut s = format!(
-            "Выжимка {} сохранена: «{}» · {} tok · источников {n} · {}",
+            "Выжимка {} · {}t · ист. {n} · {}",
             v["ref"].as_str().unwrap_or("?"),
-            v["query"].as_str().unwrap_or(""),
             v["tokens"],
             v["state"].as_str().unwrap_or("")
         );
         if let Some(p) = v["promoted"].as_str() {
-            s.push_str(&format!("\nПревращена в {p}"));
+            s.push_str(&format!(" → {p}"));
         }
         s
     })
@@ -1043,6 +1043,26 @@ fn idea_outcome(v: &Value) -> String {
     s
 }
 
+/// Ссылка записи журнала `i:<id>` (буква — по виду).
+fn entry_ref_of(e: &Value) -> String {
+    let kind = e["kind"].as_str().unwrap_or("entry");
+    let prefix = zam_store::EntryKind::parse(kind).map_or("e", zam_store::EntryKind::ref_letter);
+    format!("{prefix}:{}", e["id"].as_str().unwrap_or("?"))
+}
+
+/// Короткая строка записи журнала для ответов изменения (M6 §5): `i:<id> rev<N>[ · статус][ ·
+/// ax|th|hyp]` — без заголовка (агент знает, что менял), статус — только не `active`.
+fn entry_short(e: &Value) -> String {
+    let mut s = format!("{} rev{}", entry_ref_of(e), e["rev"]);
+    if let Some(x) = e["status"].as_str().filter(|x| *x != "active") {
+        s.push_str(&format!(" · {x}"));
+    }
+    if let Some(x) = e["certainty"].as_str() {
+        s.push_str(&format!(" · {}", crate::api::search::certainty_short(x)));
+    }
+    s
+}
+
 /// Строка записи журнала: `i:<id> insight/<вид> «заголовок» rev<N> · status · certainty`.
 fn entry_line(e: &Value) -> String {
     let kind = e["kind"].as_str().unwrap_or("entry");
@@ -1127,7 +1147,7 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
             s.push_str(&format!(" · dedup {d}"));
         }
         if let Some(old) = v.get("superseded").filter(|o| o.is_object()) {
-            s.push_str(&format!("\nЗамещена {}", entry_line(old)));
+            s.push_str(&format!(" · замещена {}", entry_ref_of(old)));
         }
         s.push_str(&warnings_md(v));
         s
@@ -1241,13 +1261,13 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             .await?;
             return done(f, &r, |v| {
                 let mut s = format!(
-                    "Ответ записан {}\nРешение {}",
-                    entry_line(&v["entry"]),
-                    entry_line(&v["decision"])
+                    "Ответ записан {} · решение {}",
+                    entry_short(&v["entry"]),
+                    entry_short(&v["decision"])
                 );
                 // ответ на вопрос-предложение: переход идеи (и задача при «начать»)
                 if v["idea"].is_object() {
-                    s.push('\n');
+                    s.push_str(" · ");
                     s.push_str(&idea_outcome(v));
                 }
                 s
@@ -1271,13 +1291,13 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
                 // вопрос «вернуть» идею со снятой задачей (§16)
                 if v["question"]["data"]["proposal"] == "reopen" {
                     return format!(
-                        "Предложено вернуть w:{idea} → вопрос q:{q}\nСпроси человека: вернуть \
-                         или отказаться; решает человек."
+                        "Предложено вернуть w:{idea} → вопрос q:{q} · спроси человека: вернуть \
+                         или отказаться, решает человек."
                     );
                 }
                 format!(
-                    "Предложено w:{idea} → вопрос q:{q}\nСпроси человека: начать, отложить или \
-                     отказаться; без ответа «начать» не начинай."
+                    "Предложено w:{idea} → вопрос q:{q} · спроси человека: начать, отложить или \
+                     отказаться, без ответа «начать» не начинай."
                 )
             });
         }
@@ -1343,15 +1363,16 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         .map_err(|e| {
             e.hint("Ревизию записи (rev) даёт memory_read её id или карточка memory_search.")
         })?;
+    // одна строка (M6 §5); предупреждения — по строке на каждое
     done(f, &r, |v| match v.get("entry").filter(|e| e.is_object()) {
         // замещение: {entry, superseded}
         Some(new) => format!(
-            "Новая {}\nЗамещена {}{}",
-            entry_line(new),
-            entry_line(&v["superseded"]),
+            "Новая {} · замещена {}{}",
+            entry_short(new),
+            entry_ref_of(&v["superseded"]),
             warnings_md(v)
         ),
-        None => format!("Обновлено {}{}", entry_line(v), warnings_md(v)),
+        None => format!("Обновлено {}{}", entry_short(v), warnings_md(v)),
     })
 }
 

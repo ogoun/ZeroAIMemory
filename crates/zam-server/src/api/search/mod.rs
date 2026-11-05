@@ -225,10 +225,10 @@ use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
-    Boosts, ChunkMeta, Cost, Fit, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights,
-    apply_boosts, apply_boosts_to, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed,
-    in_section, note_to_leaf, overflow_divisor, pack, rescale_overflow, summaries_without_leaf,
-    target_cap, truncate_to_tokens,
+    Boosts, ChunkMeta, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights, apply_boosts,
+    apply_boosts_to, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed, in_section,
+    note_to_leaf, overflow_divisor, rescale_overflow, summaries_without_leaf, target_cap,
+    truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
@@ -259,7 +259,6 @@ use crate::rerank;
 /// Заголовок текущего решения агента.
 pub const SOLUTION_HEADER: &str = "x-zam-solution";
 const DEFAULT_TOP_K: usize = 10;
-const DEFAULT_BUDGET_TOKENS: usize = 800;
 /// Предел top_k в FTS (`zam_store::search`).
 const TOP_K_MAX: usize = 100;
 /// Кандидатов слитого канала `bm25` нескольких баз (как в одной базе, `zam_store`).
@@ -707,6 +706,9 @@ struct SearchReq {
     mode: Option<SearchMode>,
     top_k: Option<usize>,
     budget_tokens: Option<usize>,
+    /// Отсечка слабых карточек запроса (0..=1); нет — `search.brief_min_rel` (M6 §4.2).
+    /// Внутренний поиск подсказок `/recall` передаёт 0: у подсказок свой порог.
+    brief_min_rel: Option<f64>,
     format: Option<OutFormat>,
     expand: Option<Expand>,
     rerank: Option<RerankMode>,
@@ -908,6 +910,7 @@ async fn best_leaves(
 }
 
 /// Элемент выдачи до упаковки.
+#[derive(Clone)]
 struct Item {
     /// Индекс цели (базы) элемента.
     target: usize,
@@ -1417,47 +1420,154 @@ fn card_summary(it: &Item, mode: SearchMode) -> &str {
     }
 }
 
-/// Упаковка в бюджет (см. модуль).
-fn pack_items(items: Vec<Item>, mode: SearchMode, budget_tokens: usize) -> Vec<Packed> {
-    let costs: Vec<Cost> = items
-        .iter()
-        .map(|it| Cost {
-            base: count_tokens(&format!(
-                "{} {} {} {}",
-                it.hit.path,
-                it.hit
-                    .attachment
-                    .as_ref()
-                    .map_or("", |a| a.filename.as_str()),
-                it.hit.heading_path,
-                card_summary(it, mode)
-            )),
-            text: it.text.as_ref().map_or(0, |t| t.1),
-        })
-        .collect();
-    let fits = pack(&costs, budget_tokens);
-    items
-        .into_iter()
-        .zip(fits)
-        .map(|(mut it, fit)| {
-            let text = it.text.take().map(|(t, n_full)| match fit {
-                Fit::Whole => (t, false, n_full),
-                Fit::Truncated(n) => {
-                    let t = truncate_to_tokens(&t, n, &count_tokens).to_string();
-                    let n = count_tokens(&t);
-                    (t, true, n)
-                }
-            });
-            let tokens = text
+/// Строки деградации и предупреждений в конце Markdown.
+fn md_tail(degraded: Option<DegradedReason>, warnings: &[String]) -> String {
+    let mut s = String::new();
+    if let Some(r) = degraded {
+        s.push_str(&format!(
+            "> degraded: {} — {} (только FTS)\n",
+            r.as_str(),
+            r.text()
+        ));
+    }
+    for w in warnings {
+        s.push_str(&format!("> warning: {w}\n"));
+    }
+    s
+}
+
+/// Markdown ответа: выжимки шага 0, карточки по порядку и строки [`md_tail`].
+fn md_body(
+    cache_md: &str,
+    packed: &[Packed],
+    mode: SearchMode,
+    spaces: &HashMap<Id, Space>,
+    tail: &str,
+) -> String {
+    let mut body = cache_md.to_string();
+    body.extend(
+        packed
+            .iter()
+            .enumerate()
+            .map(|(i, p)| item_md(i + 1, p, mode, spaces)),
+    );
+    body.push_str(tail);
+    body
+}
+
+/// Фрагмент или L0 карточки, урезанный до `room` токенов карточки целиком (по границе символа,
+/// незакрытый маркер совпадения закрывается, в конце — `…`).
+fn cut_summary(full: &str, cost: &dyn Fn(&str) -> usize, room: usize) -> String {
+    let close = |t: &str| -> String {
+        let opened = t.matches(MARK_START).count() > t.matches(MARK_END).count();
+        let mut t = t.to_string();
+        if opened {
+            t.push(MARK_END);
+        }
+        if !t.is_empty() {
+            t.push('…');
+        }
+        t
+    };
+    let cut = truncate_to_tokens(full, room, &|pre: &str| cost(&close(pre)));
+    close(cut)
+}
+
+/// Упаковка в бюджет (M6 §4.2): стоимость элемента — **вся** его карточка Markdown
+/// ([`item_md`]: номер, id, путь, секция, хвост, пометки, фрагмент или текст) счётчиком
+/// `count`; элементы берутся по порядку, пока помещаются. Первая карточка отдаётся всегда:
+/// не помещается — урезается её фрагмент (L0) или текст (`chunks`), вплоть до пустого. У
+/// следующей в `chunks` урезается текст до остатка, в `brief`/`notes` — стоп.
+fn pack_items(
+    items: Vec<Item>,
+    mode: SearchMode,
+    budget_tokens: usize,
+    count: &dyn Fn(&str) -> usize,
+    spaces: &HashMap<Id, Space>,
+) -> Vec<Packed> {
+    let mut out: Vec<Packed> = Vec::new();
+    let mut used = 0usize;
+    for mut it in items {
+        let n = out.len() + 1;
+        let text = it.text.take();
+        let mut p = Packed {
+            tokens: text
                 .as_ref()
-                .map_or(it.hit.token_count.max(0) as usize, |t| t.2);
-            Packed {
-                item: it,
-                text: text.map(|(t, tr, _)| (t, tr)),
-                tokens,
+                .map_or(it.hit.token_count.max(0) as usize, |t| t.1),
+            text: text.map(|(t, _)| (t, false)),
+            item: it,
+        };
+        let cost = count(&item_md(n, &p, mode, spaces));
+        if used + cost <= budget_tokens {
+            used += cost;
+            out.push(p);
+            continue;
+        }
+        let room = budget_tokens.saturating_sub(used);
+        let first = out.is_empty();
+        match p.text.take() {
+            // текст `chunks`: урезается до остатка (у не первой — если остаток есть)
+            Some((full, _)) if first || room > 0 => {
+                let render = |t: &str| -> usize {
+                    let q = Packed {
+                        item: p.item.clone(),
+                        text: Some((t.to_string(), true)),
+                        tokens: count(t),
+                    };
+                    count(&item_md(n, &q, mode, spaces))
+                };
+                let cut = truncate_to_tokens(&full, room, &render).to_string();
+                if !first && cut.is_empty() {
+                    break;
+                }
+                p.tokens = count(&cut);
+                p.text = Some((cut, true));
+                out.push(p);
             }
-        })
-        .collect()
+            Some(_) => {}
+            // `brief`/`notes`: первая карточка — с урезанным фрагментом
+            None if first => {
+                let notes_l0 = mode == SearchMode::Notes && p.item.hit.attachment.is_none();
+                let full = card_summary(&p.item, mode).to_string();
+                let render = |sum: &str| -> usize {
+                    let mut q = Packed {
+                        item: p.item.clone(),
+                        text: None,
+                        tokens: p.tokens,
+                    };
+                    if notes_l0 {
+                        q.item.l0 = Some(sum.to_string());
+                    } else {
+                        q.item.hit.snippet = sum.to_string();
+                    }
+                    count(&item_md(n, &q, mode, spaces))
+                };
+                let cut = cut_summary(&full, &render, room);
+                if notes_l0 {
+                    p.item.l0 = Some(cut);
+                } else {
+                    p.item.hit.snippet = cut;
+                }
+                out.push(p);
+            }
+            None => {}
+        }
+        break;
+    }
+    out
+}
+
+/// Отсечка слабых карточек `brief`/`notes` (M6 §4.2, `search.brief_min_rel`): балл ниже
+/// `min_rel × лучший` — вон; соседи `expand=graph` (явный запрос) не отсекаются.
+fn drop_weak(items: &mut Vec<Item>, mode: SearchMode, min_rel: f64) {
+    if min_rel <= 0.0 || !matches!(mode, SearchMode::Brief | SearchMode::Notes) {
+        return;
+    }
+    let best = items.iter().map(|it| it.score).fold(f64::MIN, f64::max);
+    if !best.is_finite() {
+        return;
+    }
+    items.retain(|it| it.via.is_some() || it.score >= min_rel * best);
 }
 
 /// Балл ответа: 0..1 с точностью 1e-4. Переполнение после бустов и канала папок уже снято
@@ -1613,13 +1723,50 @@ fn hit_age(h: &FtsHit, now: Timestamp) -> u32 {
     zam_store::time::age_days(now, h.updated_at, h.verified_at.as_deref())
 }
 
-/// Возраст в Markdown (M4.5 §7): `сегодня` или `N дн. назад`.
-pub(crate) fn age_text(days: u32) -> String {
-    if days == 0 {
-        "сегодня".into()
-    } else {
-        format!("{days} дн. назад")
+/// Балл карточки v2 (M6 §4.1): два знака без ведущего нуля — `.82`; единица — `1.0`.
+pub(crate) fn score_text(score: f64) -> String {
+    let t = format!("{:.2}", score.clamp(0.0, 1.0));
+    match t.strip_prefix('0') {
+        Some(rest) => rest.to_string(),
+        None => "1.0".into(),
     }
+}
+
+/// Сокращение надёжности в тексте агенту (M6 §4.1): `ax`, `th`, `hyp`; прочее — как есть.
+pub(crate) fn certainty_short(c: &str) -> &str {
+    match c {
+        "axiom" => "ax",
+        "theorem" => "th",
+        "hypothesis" => "hyp",
+        other => other,
+    }
+}
+
+/// Хвост карточки v2 (M6 §4.1): `[.82] r7 · th · 2026-10-10 14:03:22 · 340t` — балл, ревизия
+/// (`rev = 0` — без неё: записи журнала, вложения), надёжность, статус записи (только не
+/// `active`), дата обновления UTC `yyyy-MM-dd HH:mm:ss`, размер в токенах. Возраста «N дн.
+/// назад» нет: строка детерминирована, `age_days` остаётся в JSON.
+pub(crate) fn card_tail(
+    score: f64,
+    rev: i64,
+    updated: Timestamp,
+    tokens: usize,
+    certainty: Option<&str>,
+    status: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if rev > 0 {
+        parts.push(format!("r{rev}"));
+    }
+    if let Some(c) = certainty.filter(|c| !c.is_empty()) {
+        parts.push(certainty_short(c).to_string());
+    }
+    if let Some(st) = status.filter(|st| !st.is_empty() && *st != "active") {
+        parts.push(st.to_string());
+    }
+    parts.push(updated.strftime("%Y-%m-%d %H:%M:%S").to_string());
+    parts.push(format!("{tokens}t"));
+    format!("[{}] {}", score_text(score), parts.join(" · "))
 }
 
 /// Пометка Markdown об устаревших ссылках (M4.5 §6.2):
@@ -1648,9 +1795,15 @@ pub(crate) fn md_inline(s: &str) -> String {
         .replace([MARK_START, MARK_END], "**")
 }
 
-/// Заголовок карточки записи журнала (§9.3):
-/// `i:<id> insight/<вид> «<заголовок>»  [0.77] active · hypothesis · 3 дн. назад · ~120 tok`.
-fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, age: u32, tokens: usize) -> String {
+/// Заголовок карточки записи журнала (§9.3, M6 §4.1):
+/// `i:<id> insight/<вид> «<заголовок>»  [.77] hyp · 2026-09-28 08:00:01 · 120t`.
+fn entry_card(
+    e: &zam_store::EntryHit,
+    id: Id,
+    score: f64,
+    updated: Timestamp,
+    tokens: usize,
+) -> String {
     let letter = EntryKind::parse(&e.kind).map_or("e", EntryKind::ref_letter);
     let mut line = format!("{letter}:{id} {}", e.kind);
     if let Some(k) = &e.insight_kind {
@@ -1658,25 +1811,25 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, age: u32, tokens: usi
         line.push_str(&md_inline(k));
     }
     line.push_str(&format!(" «{}»", md_inline(&e.title)));
-    let mut parts: Vec<String> = [&e.status, &e.certainty]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect();
-    parts.push(age_text(age));
-    parts.push(format!("~{tokens} tok"));
-    line.push_str(&format!("  [{score:.2}] {}\n", parts.join(" · ")));
+    let tail = card_tail(
+        score,
+        0,
+        updated,
+        tokens,
+        e.certainty.as_deref(),
+        e.status.as_deref(),
+    );
+    line.push_str(&format!("  {tail}\n"));
     line
 }
 
 /// Заголовок карточки фрагмента вложения (без номера): `a:<chunk> <space>/<путь заметки> › <файл>
-/// › <путь заголовков> · стр. 12  [0.82] · <certainty> · 2026-10-10 · сегодня · ~120 tok`.
+/// › <путь заголовков> · стр. 12  [.82] th · 2026-10-10 14:03:22 · 120t`.
 fn attachment_card(
     h: &FtsHit,
     a: &AttachmentHit,
     space: &str,
     score: f64,
-    age: u32,
     tokens: usize,
 ) -> String {
     let mut line = format!(
@@ -1693,49 +1846,36 @@ fn attachment_card(
         line.push_str(" · ");
         line.push_str(&md_inline(&l));
     }
-    let certainty = h
-        .certainty
-        .as_ref()
-        .map(|c| format!(" · {c}"))
-        .unwrap_or_default();
-    line.push_str(&format!(
-        "  [{score:.2}]{certainty} · {} · {} · ~{tokens} tok\n",
-        h.updated_at.strftime("%Y-%m-%d"),
-        age_text(age),
-    ));
+    let tail = card_tail(score, 0, h.updated_at, tokens, h.certainty.as_deref(), None);
+    line.push_str(&format!("  {tail}\n"));
     line
 }
 
-/// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · 3 дн. назад
-/// · ~340 tok` (у записи журнала — [`entry_card`], у вложения — [`attachment_card`]).
-fn item_md(
-    n: usize,
-    p: &Packed,
-    mode: SearchMode,
-    spaces: &HashMap<Id, Space>,
-    now: Timestamp,
-) -> String {
+/// Карточка §9.3, M6 §4.1: `1. n:<id> <space>/<path> › <секция>  [.82] r7 · 2026-10-10 14:03:22
+/// · 340t` (у записи журнала — [`entry_card`], у вложения — [`attachment_card`]).
+fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
     let h = &p.item.hit;
-    let age = hit_age(h, now);
     // у переставленных реранкером `score` — его балл с бустами (§9.2 п. 5)
     let score = p.item.score.min(1.0);
     let mut line = match (&h.entry, p.item.folder) {
-        // карточка папки: `f:<id> <пространство>/<путь>/  [0.61] · 4 детей`
+        // карточка папки: `f:<id> <пространство>/<путь>/  [.61] · 4 детей`
         (_, Some(children)) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             format!(
-                "{n}. f:{} {space}/{}/  [{score:.2}] · {children} детей\n",
-                h.target.id, h.path
+                "{n}. f:{} {space}/{}/  [{}] · {children} детей\n",
+                h.target.id,
+                h.path,
+                score_text(score)
             )
         }
-        (Some(e), None) => format!("{n}. {}", entry_card(e, h.target.id, score, age, p.tokens)),
+        (Some(e), None) => format!(
+            "{n}. {}",
+            entry_card(e, h.target.id, score, h.updated_at, p.tokens)
+        ),
         (None, None) if h.attachment.is_some() => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             let a = h.attachment.as_ref().expect("проверено выше");
-            format!(
-                "{n}. {}",
-                attachment_card(h, a, space, score, age, p.tokens)
-            )
+            format!("{n}. {}", attachment_card(h, a, space, score, p.tokens))
         }
         (None, None) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
@@ -1744,18 +1884,15 @@ fn item_md(
                 line.push_str(" › ");
                 line.push_str(&h.heading_path);
             }
-            let certainty = h
-                .certainty
-                .as_ref()
-                .map(|c| format!(" · {c}"))
-                .unwrap_or_default();
-            line.push_str(&format!(
-                "  [{score:.2}] rev{}{certainty} · {} · {} · ~{} tok\n",
+            let tail = card_tail(
+                score,
                 h.rev,
-                h.updated_at.strftime("%Y-%m-%d"),
-                age_text(age),
-                p.tokens
-            ));
+                h.updated_at,
+                p.tokens,
+                h.certainty.as_deref(),
+                None,
+            );
+            line.push_str(&format!("  {tail}\n"));
             line
         }
     };
@@ -2131,7 +2268,11 @@ pub async fn search(
             zam_store::search::QUERY_MAX_CHARS
         )));
     }
-    let budget = req.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS);
+    let budget = req.budget_tokens.unwrap_or(st.cfg.search.budget_tokens);
+    let min_rel = req.brief_min_rel.unwrap_or(st.cfg.search.brief_min_rel);
+    if !(min_rel.is_finite() && (0.0..=1.0).contains(&min_rel)) {
+        return Err(ApiError::BadRequest("brief_min_rel: от 0 до 1".into()));
+    }
     let mut kinds = target_filter(&req.filters, req.include_history, p.is_human())?;
     kinds.area = area_filter(req.scope.area.as_deref())?;
     let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
@@ -2613,9 +2754,39 @@ pub async fn search(
     attach_stale_refs(&targets, &mut items).await;
     // лист с секретом в имени — номером, как в `/read` (задача 7 M5, раунд правок 2)
     number_secret_sheets(&targets, &mut items).await;
-    // выжимки шага 0 — из того же бюджета
-    let cache_tokens: usize = cache_items.iter().map(cache_step::CacheItem::tokens).sum();
-    let packed = pack_items(items, mode, budget.saturating_sub(cache_tokens).max(1));
+    // слабые карточки `brief`/`notes` — вон (M6 §4.2, `search.brief_min_rel`)
+    drop_weak(&mut items, mode, min_rel);
+    let degraded = available.err().or(vrun.failed);
+    let now = Timestamp::now();
+    let by_id: HashMap<Id, Space> = targets
+        .iter()
+        .flat_map(|t| t.spaces.iter().cloned())
+        .map(|s| (s.id, s))
+        .collect();
+    // честный бюджет (M6 §4.2): Markdown целиком — выжимки шага 0, карточки, строки
+    // деградации и предупреждений и строка MCP `~N tok` — счётчиком сервера; JSON — тот же отбор
+    let tail_md = md_tail(degraded, &warnings);
+    let cache_md: String = cache_items.iter().map(cache_step::item_md).collect();
+    let reserve = count_tokens(&cache_md)
+        + count_tokens(&tail_md)
+        + count_tokens(&format!("~{budget} tok"))
+        + 1;
+    let mut packed = pack_items(
+        items,
+        mode,
+        budget.saturating_sub(reserve),
+        &count_tokens,
+        &by_id,
+    );
+    // суммы частей и счёт целого могут разойтись на стыках: с конца снимаются карточки
+    while packed.len() > 1 {
+        let body = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
+        let n = count_tokens(&body);
+        if count_tokens(&format!("{body}~{n} tok")) <= budget {
+            break;
+        }
+        packed.pop();
+    }
     // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
     if let (Some(s), SearchMode::Chunks) = (&session, mode) {
         let given: Vec<SeenItem> = packed
@@ -2632,13 +2803,6 @@ pub async fn search(
             session_failed("отметка выданного", &e);
         }
     }
-    let degraded = available.err().or(vrun.failed);
-    let now = Timestamp::now();
-    let by_id: HashMap<Id, Space> = targets
-        .into_iter()
-        .flat_map(|t| t.spaces)
-        .map(|s| (s.id, s))
-        .collect();
 
     Ok(match format {
         OutFormat::Json => {
@@ -2671,23 +2835,7 @@ pub async fn search(
             .into_response()
         }
         OutFormat::Md => {
-            let mut body: String = cache_items.iter().map(cache_step::item_md).collect();
-            body.extend(
-                packed
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| item_md(i + 1, p, mode, &by_id, now)),
-            );
-            if let Some(r) = degraded {
-                body.push_str(&format!(
-                    "> degraded: {} — {} (только FTS)\n",
-                    r.as_str(),
-                    r.text()
-                ));
-            }
-            for w in &warnings {
-                body.push_str(&format!("> warning: {w}\n"));
-            }
+            let body = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
             let mut r = body.into_response();
             r.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -2728,6 +2876,11 @@ mod tests {
             verified_at: None,
             attachment: None,
         }
+    }
+
+    /// Упаковка счётчиком сервера без пространств (карточки — `?/<путь>`).
+    fn pk(items: Vec<Item>, mode: SearchMode, budget: usize) -> Vec<Packed> {
+        pack_items(items, mode, budget, &count_tokens, &HashMap::new())
     }
 
     fn items(hits: Vec<FtsHit>, with_text: bool) -> Vec<Item> {
@@ -2813,18 +2966,17 @@ mod tests {
         h.heading_path = "Глава 1".into();
         let owner = h.attachment.as_ref().unwrap().node_id;
         let card = |h: FtsHit| {
-            let mut p = pack_items(items(vec![h], false), SearchMode::Brief, 1000).remove(0);
+            let mut p = pk(items(vec![h], false), SearchMode::Brief, 1000).remove(0);
             p.tokens = 7;
             p
         };
         let p = card(h.clone());
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         let chunk = "ab".repeat(16);
         assert!(
             s.starts_with(&format!(
-                "1. a:{chunk} ?/docs/отчёт › книга.pdf › Глава 1 · стр. 12  [0.50] · {} · \
-                 сегодня · ~7 tok\n",
-                now.strftime("%Y-%m-%d")
+                "1. a:{chunk} ?/docs/отчёт › книга.pdf › Глава 1 · стр. 12  [.50] {} · 7t\n",
+                p.item.hit.updated_at.strftime("%Y-%m-%d %H:%M:%S")
             )),
             "{s}"
         );
@@ -2844,7 +2996,7 @@ mod tests {
         s.attachment.as_mut().unwrap().locator = Some("sheet:AKIAIOSFODNN7EXAMPLE!A1:B2".into());
         let p = card(s);
         let j = item_json(&p, SearchMode::Brief, &HashMap::new(), now);
-        let md = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let md = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         for t in [j["locator"].to_string(), j["locator_text"].to_string(), md] {
             assert!(!t.contains("AKIAIOSFODNN7EXAMPLE"), "{t}");
         }
@@ -2859,7 +3011,7 @@ mod tests {
             h.attachment.as_mut().unwrap().locator = Some(loc.into());
             let p = card(h);
             assert!(
-                item_md(1, &p, SearchMode::Brief, &HashMap::new(), now)
+                item_md(1, &p, SearchMode::Brief, &HashMap::new())
                     .contains(&format!("› Глава 1 · {text}  [")),
                 "{loc}"
             );
@@ -2873,8 +3025,8 @@ mod tests {
         h.attachment.as_mut().unwrap().locator = None;
         let p = card(h);
         assert!(
-            item_md(1, &p, SearchMode::Brief, &HashMap::new(), now)
-                .starts_with(&format!("1. a:{chunk} ?/docs/отчёт › книга.pdf  [0.50]")),
+            item_md(1, &p, SearchMode::Brief, &HashMap::new())
+                .starts_with(&format!("1. a:{chunk} ?/docs/отчёт › книга.pdf  [.50]")),
         );
         assert!(item_json(&p, SearchMode::Brief, &HashMap::new(), now)["locator_text"].is_null());
         // в `notes` у вложения нет L0 — карточка несёт сниппет
@@ -2887,17 +3039,19 @@ mod tests {
     fn budget_trims_text_and_keeps_one() {
         let long = "слово ".repeat(100);
         let hs = vec![hit(Id::new(), &long), hit(Id::new(), "бб")];
-        let p = pack_items(items(hs, true), SearchMode::Chunks, 10);
+        // бюджет — вся карточка (M6 §4.2): заголовок и урезанный текст
+        let p = pk(items(hs, true), SearchMode::Chunks, 80);
         assert_eq!(p.len(), 1);
         let (t, tr) = p[0].text.clone().unwrap();
-        assert!(tr && count_tokens(&t) <= 10 && !t.is_empty(), "{t}");
-        let p = pack_items(
+        let md = item_md(1, &p[0], SearchMode::Chunks, &HashMap::new());
+        assert!(tr && count_tokens(&md) <= 80 && !t.is_empty(), "{md}");
+        let p = pk(
             items(vec![hit(Id::new(), "x")], true),
             SearchMode::Chunks,
             0,
         );
         assert_eq!(p.len(), 1);
-        let p = pack_items(
+        let p = pk(
             items(vec![hit(Id::new(), "x"), hit(Id::new(), "y")], false),
             SearchMode::Brief,
             0,
@@ -3392,6 +3546,42 @@ mod tests {
         assert_eq!(sections[&(0, out[1].hit.target, SectionKey::At(2))], 1);
     }
 
+    /// Хвост карточки §4.1 дословно (примеры спецификации).
+    #[test]
+    fn card_tail_v2_strings() {
+        let t = |s: &str| -> Timestamp { s.parse().unwrap() };
+        assert_eq!(
+            card_tail(0.82, 7, t("2026-10-10T14:03:22Z"), 340, None, None),
+            "[.82] r7 · 2026-10-10 14:03:22 · 340t"
+        );
+        assert_eq!(
+            card_tail(
+                0.77,
+                0,
+                t("2026-09-28T08:00:01Z"),
+                120,
+                Some("hypothesis"),
+                Some("active")
+            ),
+            "[.77] hyp · 2026-09-28 08:00:01 · 120t"
+        );
+        assert_eq!(
+            card_tail(1.0, 3, t("2026-01-02T03:04:05Z"), 5, Some("axiom"), None),
+            "[1.0] r3 · ax · 2026-01-02 03:04:05 · 5t"
+        );
+        assert_eq!(
+            card_tail(
+                0.051,
+                0,
+                t("2026-01-02T03:04:05Z"),
+                0,
+                Some("theorem"),
+                Some("superseded")
+            ),
+            "[.05] th · superseded · 2026-01-02 03:04:05 · 0t"
+        );
+    }
+
     #[test]
     fn md_card_format() {
         let mut it = items(vec![hit(Id::new(), "текст")], false).remove(0);
@@ -3402,10 +3592,9 @@ mod tests {
             text: None,
             tokens: 7,
         };
-        let now = "2026-10-13T09:00:00Z".parse().unwrap();
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         let want = format!(
-            "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · 3 дн. назад · ~7 tok\n   **s**\n",
+            "1. n:{} ?/p › A > B  [.50] r1 · 2026-10-10 08:00:00 · 7t\n   **s**\n",
             p.item.hit.target.id
         );
         assert_eq!(s, want);
@@ -3433,12 +3622,14 @@ mod tests {
             tokens: 120,
         };
         let now = p.item.hit.updated_at;
-        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new(), now);
+        let at = now.strftime("%Y-%m-%d %H:%M:%S");
+        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new());
+        // §4.1 дословно: статус `active` не выводится, надёжность — `hyp`
         assert_eq!(
             s,
             format!(
-                "2. i:{id} insight/gotcha «Bash-скрипты должны иметь LF»  [0.50] active · \
-                 hypothesis · сегодня · ~120 tok\n   **s**\n"
+                "2. i:{id} insight/gotcha «Bash-скрипты должны иметь LF»  [.50] hyp · {at} · \
+                 120t\n   **s**\n"
             )
         );
         // changelog без статуса и certainty
@@ -3451,10 +3642,10 @@ mod tests {
             created_at: jiff::Timestamp::UNIX_EPOCH,
         });
         p.tokens = 9;
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         assert!(
             s.starts_with(&format!(
-                "1. c:{id} changelog/fix «Исправлен CRLF»  [0.50] сегодня · ~9 tok\n"
+                "1. c:{id} changelog/fix «Исправлен CRLF»  [.50] {at} · 9t\n"
             )),
             "{s}"
         );

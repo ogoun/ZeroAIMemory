@@ -35,7 +35,9 @@ zam-code = { path = "../zam-code", features = ["parse"] }
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
 
 [features]
-# точки подмены для тестов (цепочка предков процесса `hook::procs`)
+# точки подмены для тестов (цепочка предков процесса `hook::procs`; задержка записи привязки
+# `ZAM_TEST_BINDING_STALL_MS` — бюджет хука, M6 задача 5; она же есть в отладочной сборке —
+# бинарник интеграционных тестов)
 test-hooks = []
 
 [dev-dependencies]

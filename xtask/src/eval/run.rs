@@ -1440,6 +1440,22 @@ pub fn queries_fingerprint(queries: &[Query]) -> String {
     super::corpus::fnv1a(text.into_bytes())
 }
 
+/// Рекурсивная копия каталога `from` в существующий `to` (каталог прогона на точку сетки,
+/// фикстура проекта сессии).
+pub fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    for e in fs::read_dir(from).with_context(|| from.display().to_string())? {
+        let e = e?;
+        let dst = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            fs::create_dir_all(&dst)?;
+            copy_dir(&e.path(), &dst)?;
+        } else {
+            fs::copy(e.path(), &dst)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -289,7 +289,8 @@ async fn read_attachment_toc_without_locator() {
     assert!(!t.contains("ниобий"), "оглавление ограничено: {t}");
     assert!(t.contains("ещё"), "{t}");
     let tokens = it["tokens"].as_u64().unwrap();
-    assert!(tokens < 4000, "оглавление {tokens} токенов");
+    // без модели — оценка сверху (M6, задача 5): ×1,2–1,4 к bge-m3
+    assert!(tokens < 5000, "оглавление {tokens} токенов");
     a.st.shutdown().await;
 }
 
@@ -587,7 +588,9 @@ async fn read_attachment_access_like_missing() {
     };
     let missing = [
         "a:0123456789abcdef0123456789abcdef".to_string(),
-        format!("b:{}", "0".repeat(64)),
+        // буквы и цифры, как у настоящего sha256: стоимость `~N tok` без модели — по классам
+        // символов (M6, задача 5), у одних цифр она другая
+        format!("b:{}", "0f".repeat(32)),
         format!("d:{}", Id::new()),
     ];
     // ответ на ссылку `r` — тело элемента без самой ссылки

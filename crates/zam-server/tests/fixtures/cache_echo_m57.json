@@ -1,0 +1,27 @@
+{
+  "area": null,
+  "author": "admin",
+  "author_user_id": "<author_user_id>",
+  "created_at": "<time>",
+  "hits": 0,
+  "id": "<id>",
+  "last_used_at": "<time>",
+  "machine": null,
+  "promoted_to": null,
+  "query": "bash скрипты на windows",
+  "ref": "c_<id>",
+  "session_id": "s-echo",
+  "sources": [
+    {
+      "id": "n:<node>",
+      "rev": 1,
+      "section": null
+    }
+  ],
+  "space": "Knowledge",
+  "space_id": "<space_id>",
+  "stale": [],
+  "state": "valid",
+  "summary": "Пишите bash-скрипты с LF (n:x).",
+  "tokens": "<tokens>"
+}

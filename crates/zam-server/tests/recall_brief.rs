@@ -237,7 +237,7 @@ async fn brief_sections_and_budget() {
     let files = &t[pos(t, "### Файлы")..];
     assert!(
         files.contains(&format!(
-            "файл docs/plan.md: Схема плана [insight] — i:{}",
+            "файл docs/plan.md: Схема плана [insight] i:{}",
             w.file_note
         )),
         "{t}"
@@ -292,11 +292,11 @@ async fn brief_sections_and_budget() {
         a,
         &a.token,
         "p1:ag2",
-        json!({"event": "brief", "solution": G, "task": TASK, "budget_tokens": 40}),
+        json!({"event": "brief", "solution": G, "task": TASK, "budget_tokens": 70}),
     )
     .await;
     let t = text(&j);
-    assert!(j["tokens"].as_u64().unwrap() <= 40, "{t}");
+    assert!(j["tokens"].as_u64().unwrap() <= 70, "{t}");
     assert!(t.starts_with("### Правила\n"), "{t}");
     assert!(!t.contains("### Файлы"), "{t}");
 

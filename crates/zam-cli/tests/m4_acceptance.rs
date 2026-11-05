@@ -643,7 +643,7 @@ fn crlf_scenario() {
     let (o, d) = b.hook_at(&b.url, "pre-tool", &b.write_ev("crlf-b-1", "deploy.sh"));
     let c = context(&o, "PreToolUse");
     assert!(
-        c.starts_with("ZeroAIMemory: для **/*.sh: Скрипты *.sh — только LF [gotcha, hypothesis]"),
+        c.starts_with("ZeroAIMemory: для **/*.sh: Скрипты *.sh — только LF [gotcha·hyp]"),
         "{c}"
     );
     assert!(c.contains(&format!("i:{id}")), "{c}");
@@ -659,8 +659,8 @@ fn crlf_scenario() {
     let c = context(&o, "PostToolUseFailure");
     assert!(
         c.contains(&format!(
-            "ZeroAIMemory: эта ошибка уже разбиралась: Скрипты *.sh — только LF [gotcha, \
-             hypothesis] — i:{id}"
+            "ZeroAIMemory: эта ошибка уже разбиралась: Скрипты *.sh — только LF [gotcha·hyp] \
+             i:{id}"
         )),
         "{c}"
     );

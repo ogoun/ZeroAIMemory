@@ -24,8 +24,10 @@
 //! запуск фоновой `zam code sync --background`, если пора
 //! ([`crate::cmd::code::auto::maybe_spawn_sync`]; сервер для запуска не нужен).
 //! M6 §7.1: каждый старт с `session_id` (новая сессия, `/clear`, `resume`, `compact`) пишет
-//! привязку `zam mcp` к сессии — `cache/agent-<pid>.json` ([`binding::write_binding`]), до
-//! запросов и без сети.
+//! привязку `zam mcp` к сессии — `cache/agent-<pid>.json` ([`binding::write_binding`]) без сети.
+//! M6, задача 5: локальная уборка (кэш, `session.json`, привязка, очередь субагентов, сброс
+//! показанного) идёт в своём потоке параллельно запросам и не тратит их бюджет; хук ждёт её не
+//! дольше остатка бюджета ([`housekeeping`]).
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -50,29 +52,63 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     out
 }
 
-/// Регистрация сессии, дайджест, кэши и очереди (см. модуль).
-fn digest(env: &Env, inp: &Input, s: &Settings) -> Output {
+/// Локальная уборка старта (без сети): кэш, текущая сессия, привязка `zam mcp`, очередь
+/// субагентов, сброс показанного после `compact`/`clear`.
+fn housekeeping(env: &Env, session: Option<&str>, source: Option<&str>) {
     cache::gc_cache(env);
-    // очереди изменённых файлов больше 4 МиБ — уплотнение здесь, не в бюджете `post-tool`
-    cache::compact_changed_queues(env);
-    let session = inp.session_id.as_deref();
-    let source = inp.str("source");
-    if let Some(id) = session {
-        cache::write_current_session(env, id);
-        // привязка `zam mcp` к сессии (M6 §7.1): на предков до процесса агента
-        if let Err(e) = binding::write_binding(&env.root, id) {
-            env.log(&format!("привязка MCP к сессии: {e}"));
-        }
-        // просроченные запуски субагентов (§9.4) не ждут следующего `subagent-start`
-        cache::prune_spawns(env, id);
-        if matches!(source, Some("compact" | "clear")) {
-            let mut sh = cache::read_shown(env, id);
-            if !sh.shown.is_empty() {
-                sh.shown.clear();
-                cache::write_shown(env, id, &sh);
-            }
+    let Some(id) = session else {
+        return;
+    };
+    cache::write_current_session(env, id);
+    // привязка `zam mcp` к сессии (M6 §7.1): на предков до процесса агента
+    if let Err(e) = binding::write_binding(&env.root, id) {
+        env.log(&format!("привязка MCP к сессии: {e}"));
+    }
+    // просроченные запуски субагентов (§9.4) не ждут следующего `subagent-start`
+    cache::prune_spawns(env, id);
+    if matches!(source, Some("compact" | "clear")) {
+        let mut sh = cache::read_shown(env, id);
+        if !sh.shown.is_empty() {
+            sh.shown.clear();
+            cache::write_shown(env, id, &sh);
         }
     }
+}
+
+/// Регистрация сессии, дайджест, кэши и очереди (см. модуль).
+fn digest(env: &Env, inp: &Input, s: &Settings) -> Output {
+    let session = inp.session_id.as_deref();
+    let source = inp.str("source");
+    // уборка — в своём потоке, параллельно запросам (M6, задача 5, A): снимок процессов и
+    // запись файлов на занятом HDD съедали бюджет до запроса («бюджет исчерпан», пакет
+    // восстановления без сервера). Хук ждёт её не дольше остатка бюджета.
+    let done = {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let env2 = env.clone();
+        let (sid, src) = (session.map(str::to_string), source.map(str::to_string));
+        std::thread::spawn(move || {
+            housekeeping(&env2, sid.as_deref(), src.as_deref());
+            let _ = tx.send(());
+        });
+        rx
+    };
+    let out = digest_net(env, inp, s, session, source);
+    // остаток бюджета минус резерв на вывод; не успела — процесс выходит без неё (файлы
+    // кэша пишутся атомарно, брошенные `.tmp` убирает `gc_cache`)
+    if let Some(left) = env.http_left() {
+        let _ = done.recv_timeout(left);
+    }
+    out
+}
+
+/// Запросы к серверу старта и дайджест (см. модуль).
+fn digest_net(
+    env: &Env,
+    inp: &Input,
+    s: &Settings,
+    session: Option<&str>,
+    source: Option<&str>,
+) -> Output {
     // сводка журнала до сжатия (§9.2): только после `compact`/`resume`
     let summary = |st: &Settings| -> String {
         match session {
@@ -136,6 +172,9 @@ fn digest(env: &Env, inp: &Input, s: &Settings) -> Output {
         let want_refs = s.flag_on(Flag::FileContext) && env.solution.is_some();
         let c = &client;
         let refs = sc.spawn(move || {
+            // очереди изменённых файлов больше 4 МиБ — уплотнение здесь, не в бюджете
+            // `post-tool`, и до их отправки
+            cache::compact_changed_queues(env);
             cache::flush_changed(env, c, None);
             want_refs.then(|| cache::refresh_file_refs(env, c))
         });

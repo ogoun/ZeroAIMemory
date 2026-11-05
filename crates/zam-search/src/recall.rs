@@ -207,15 +207,25 @@ pub fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Строка подсказки (§10.3): `ZeroAIMemory: <lead><title> [<теги через «, »>] — <ссылка>`;
-/// пустые теги опускаются вместе со скобками.
+/// Строка подсказки (§10.3, M6 §4.3): `ZeroAIMemory: <lead><title> [<теги через «·»>] <ссылка>`;
+/// пустые теги опускаются вместе со скобками, надёжность сокращается (`ax`, `th`, `hyp`).
 pub fn hint_line(lead: &str, title: &str, tags: &[&str], reference: &str) -> String {
-    let tags: Vec<&str> = tags.iter().copied().filter(|t| !t.is_empty()).collect();
+    let tags: Vec<&str> = tags
+        .iter()
+        .copied()
+        .filter(|t| !t.is_empty())
+        .map(|t| match t {
+            "axiom" => "ax",
+            "theorem" => "th",
+            "hypothesis" => "hyp",
+            other => other,
+        })
+        .collect();
     let mut s = format!("{HINT_PREFIX} {lead}{}", one_line(title));
     if !tags.is_empty() {
-        s.push_str(&format!(" [{}]", tags.join(", ")));
+        s.push_str(&format!(" [{}]", tags.join("·")));
     }
-    s.push_str(&format!(" — {reference}"));
+    s.push_str(&format!(" {reference}"));
     s
 }
 
@@ -356,15 +366,30 @@ mod tests {
         assert!(!error_regex_matches(r"(", "("));
     }
 
+    /// M6 §4.3: `ZeroAIMemory: <заголовок> [<вид>·<cert>] i:<id>`, надёжность сокращена.
     #[test]
-    fn hint_line_format() {
+    fn recall_hint_line_v2() {
+        let id = "01M60A7Q4T7QK2M9ZWAXPHBK9C";
         assert_eq!(
-            hint_line("", "LF в\nскриптах", &["gotcha", "hypothesis"], "i:1"),
-            "ZeroAIMemory: LF в скриптах [gotcha, hypothesis] — i:1"
+            hint_line(
+                "",
+                "LF в\nскриптах",
+                &["gotcha", "hypothesis"],
+                &format!("i:{id}")
+            ),
+            format!("ZeroAIMemory: LF в скриптах [gotcha·hyp] i:{id}")
+        );
+        assert_eq!(
+            hint_line("правило ", "Rules/x", &["theorem"], "n:1"),
+            "ZeroAIMemory: правило Rules/x [th] n:1"
+        );
+        assert_eq!(
+            hint_line("", "A", &["axiom"], "n:2"),
+            "ZeroAIMemory: A [ax] n:2"
         );
         assert_eq!(
             hint_line("эта ошибка уже разбиралась: ", "x", &["", ""], "i:2"),
-            "ZeroAIMemory: эта ошибка уже разбиралась: x — i:2"
+            "ZeroAIMemory: эта ошибка уже разбиралась: x i:2"
         );
     }
 

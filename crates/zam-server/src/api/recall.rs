@@ -9,7 +9,7 @@
 //! ```
 //!
 //! - `text` — готовый Markdown для `additionalContext`; пусто — тишина. Каждая подсказка — строка
-//!   `ZeroAIMemory: <заголовок> [<вид>, <certainty>] — i:<id>` (у заметки — `n:<id>`, у
+//!   `ZeroAIMemory: <заголовок> [<вид>·<cert>] i:<id>` (M6 §4.3; у заметки — `n:<id>`, у
 //!   changelog — `c:<id>`), под ней с отступом может идти пояснение (L1 правила, фрагмент).
 //!   `items` — показанные подсказки по порядку: `id` — та же ссылка, `kind` — `insight`,
 //!   `changelog`, `note` или `folder`, `reason` — откуда подсказка (`rules`, `solution`,
@@ -59,7 +59,7 @@
 //!   заметки Rules с баллом ≥ `recall.prompt_min_score` (0,6), не больше [`PROMPT_MAX`];
 //!   перед ними — до [`TERM_HINTS_MAX`] строк словаря (M4.5): имя или псевдоним действующего
 //!   термина решения и Knowledge в первых 512 символах `prompt` —
-//!   `ZeroAIMemory: термин «<имя>» — <определение> — t:<id>`, `reason: glossary`, каждый термин
+//!   `ZeroAIMemory: термин «<имя>» — <определение> t:<id>`, `reason: glossary`, каждый термин
 //!   раз за сессию (`session_seen`); словарь — из кэша [`crate::glossary::GlossaryCache`];
 //! - **идеи** (M5.7 §6; `[ideas] proactive` сервера и `ideas.proactive` пользователя): в
 //!   дайджесте `session_start` — раздел `### Идеи` сразу после строки открытых вопросов
@@ -216,8 +216,6 @@ const BUDGET_MAX: usize = 200_000;
 const PROMPT_SEARCH_TOP_K: usize = 20;
 /// Бюджет карточек внутреннего поиска `prompt` (не текста подсказок), токенов.
 const PROMPT_SEARCH_BUDGET: usize = 4000;
-/// Предел фрагмента под подсказкой `prompt`, токенов.
-const SNIPPET_TOKENS: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1404,6 +1402,8 @@ async fn search_prompt_ideas(
         "mode": "brief",
         "top_k": st.cfg.ideas.prompt_top_k,
         "budget_tokens": PROMPT_SEARCH_BUDGET,
+        // отсечка карточек поиска (M6 §4.2) — не для подсказок: у них свой порог балла
+        "brief_min_rel": 0.0,
         "rerank": "off",
         "skip_seen": false,
         "no_cache": true,
@@ -2012,6 +2012,8 @@ async fn brief_search(
         "mode": "brief",
         "top_k": BRIEF_SEARCH_TOP_K,
         "budget_tokens": PROMPT_SEARCH_BUDGET,
+        // отсечка карточек поиска (M6 §4.2) — не для подсказок: у них свой порог балла
+        "brief_min_rel": 0.0,
         "rerank": "off",
         "skip_seen": false,
         "no_cache": true,
@@ -2571,6 +2573,8 @@ async fn prompt_hints(
         "mode": "brief",
         "top_k": PROMPT_SEARCH_TOP_K,
         "budget_tokens": PROMPT_SEARCH_BUDGET,
+        // отсечка карточек поиска (M6 §4.2) — не для подсказок: у них свой порог балла
+        "brief_min_rel": 0.0,
         "rerank": "off",
         "skip_seen": false,
         "no_cache": true,
@@ -2616,7 +2620,8 @@ async fn prompt_hints(
                 .unwrap_or_default()
                 .replace([zam_store::MARK_START, zam_store::MARK_END], ""),
         );
-        let snippet = truncate_to_tokens(&snippet, SNIPPET_TOKENS, &count_tokens).to_string();
+        let snippet =
+            truncate_to_tokens(&snippet, st.cfg.recall.snippet_tokens, &count_tokens).to_string();
         let (reference, title, lead, tags, out_kind, reason) = match tref {
             TargetKind::Entry => (
                 format!("i:{id}"),

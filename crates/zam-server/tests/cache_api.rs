@@ -874,3 +874,101 @@ async fn cache_put_section_tail_stores_full_path() {
     assert_eq!(c.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", c.text());
     assert!(c.text().contains("неоднозначен"), "{}", c.text());
 }
+
+// ---- ответ записи без эха (M6 §5, задача 5) ----
+
+/// Эталон ответа `POST /cache` v0.0.10-m5.7 (снят тестом [`snapshot_cache_echo_fixture`] до
+/// правки): изменчивые значения (id, время) заменены метками, `tokens` — меткой после снятия.
+const ECHO_FIXTURE: &str = "tests/fixtures/cache_echo_m57.json";
+
+/// Ответ с метками вместо id и времени (порядок ключей — `serde_json`, отсортированный).
+fn echo_shape(v: &Value, n: &str) -> String {
+    let mut v = v.clone();
+    let o = v.as_object_mut().unwrap();
+    for k in ["id", "author_user_id", "space_id"] {
+        if o.contains_key(k) {
+            o.insert(k.into(), json!(format!("<{k}>")));
+        }
+    }
+    for k in ["created_at", "last_used_at"] {
+        if o.contains_key(k) {
+            o.insert(k.into(), json!("<time>"));
+        }
+    }
+    if o.contains_key("ref") {
+        o.insert("ref".into(), json!("c_<id>"));
+    }
+    // число токенов — счётчик сервера без модели: в M6 оценка сверху (задача 5, B), а форма
+    // ответа — та же
+    if o.contains_key("tokens") {
+        o.insert("tokens".into(), json!("<tokens>"));
+    }
+    let text = serde_json::to_string_pretty(&v).unwrap();
+    text.replace(n, "<node>") + "\n"
+}
+
+/// Выжимка в личной базе и её ответ (`echo` — поле запроса, `None` — без поля).
+async fn put_for_echo(name: &str, echo: Option<bool>) -> (Value, String) {
+    let a = api(&format!("cache-echo-{name}"), |_| {}).await;
+    let n = id(&a
+        .note(
+            "knowledge",
+            "Инструменты/Bash",
+            "# Bash\n\nСкрипты bash на windows пишите с LF.\n",
+        )
+        .await);
+    let mut body = json!({"query": "bash скрипты на windows",
+                          "summary": "Пишите bash-скрипты с LF (n:x).",
+                          "sources": [{"id": format!("n:{n}"), "rev": 1}]});
+    if let Some(e) = echo {
+        body["echo"] = json!(e);
+    }
+    let r = put(&a, &a.token, body, &[("x-zam-session", "s-echo")]).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    (r.json(), n)
+}
+
+/// Снимает эталон [`ECHO_FIXTURE`] (до правки §5: ответ v0.0.10-m5.7 — полный, с `summary`).
+#[tokio::test]
+#[ignore = "снимает эталон; запускать только на коде до правки M6 §5"]
+async fn snapshot_cache_echo_fixture() {
+    let (v, n) = put_for_echo("snap", None).await;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ECHO_FIXTURE);
+    std::fs::write(&path, echo_shape(&v, &n)).unwrap();
+}
+
+/// `echo: true` — прежняя форма ответа, побайтово с эталоном (CHANGELOG «Изменения ответа»).
+#[tokio::test]
+async fn cache_put_echo_true_old_shape() {
+    let (v, n) = put_for_echo("true", Some(true)).await;
+    let want = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ECHO_FIXTURE),
+    )
+    .unwrap();
+    assert_eq!(echo_shape(&v, &n), want.replace("\r\n", "\n"));
+}
+
+/// Без `echo` — без `summary`, остальные поля прежние (M6 §5, I5).
+#[tokio::test]
+async fn cache_put_without_echo_has_no_summary() {
+    let (v, n) = put_for_echo("none", None).await;
+    assert!(v.get("summary").is_none(), "{v}");
+    let mut want: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ECHO_FIXTURE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    want.as_object_mut().unwrap().remove("summary");
+    let got: Value = serde_json::from_str(&echo_shape(&v, &n)).unwrap();
+    assert_eq!(got, want);
+    for k in [
+        "id", "ref", "query", "tokens", "state", "sources", "space", "stale",
+    ] {
+        assert!(v.get(k).is_some(), "нет {k}: {v}");
+    }
+    // `echo: false` — так же
+    let (v, _) = put_for_echo("false", Some(false)).await;
+    assert!(v.get("summary").is_none(), "{v}");
+}

@@ -870,3 +870,32 @@ async fn insight_kinds_filter_in_vector_channel() {
     }
     a.st.shutdown().await;
 }
+
+/// Честный бюджет с моделью (M6 §4.2): Markdown `brief` целиком со строкой MCP `~N tok` —
+/// не больше 100, 400, 800, 2000 токенов точного счётчика сервера (без строки деградации).
+#[tokio::test]
+async fn brief_markdown_within_budget_hybrid() {
+    let Some((a, _q, _)) = indexed("hy-md-budget").await else {
+        return;
+    };
+    let mut cards = Vec::new();
+    for budget in [100usize, 400, 800, 2000] {
+        let md = search(
+            &a,
+            json!({"query": "bread oven dough water", "format": "md", "top_k": 20,
+                   "budget_tokens": budget}),
+        )
+        .await
+        .text();
+        assert!(!md.contains("> degraded"), "{md}");
+        let n = zam_store::count_tokens(&md);
+        let cost = zam_store::count_tokens(&format!("{md}~{n} tok"));
+        assert!(cost <= budget, "{budget}: {cost} токенов\n{md}");
+        cards.push(
+            md.lines()
+                .filter(|l| l.starts_with(char::is_numeric))
+                .count(),
+        );
+    }
+    assert!(cards[0] >= 1 && cards[3] > cards[0], "{cards:?}");
+}

@@ -77,21 +77,25 @@ impl Trigger {
         }
     }
 
-    /// Строка подсказки §10.3: `ZeroAIMemory: <lead><title> [<вид>, <certainty>] — i:<id>`.
+    /// Строка подсказки §10.3, M6 §4.3 (как у сервера, `zam_search::hint_line`):
+    /// `ZeroAIMemory: <lead><title> [<вид>·<cert>] i:<id>`, надёжность — `ax`, `th`, `hyp`.
     pub fn hint(&self, lead: &str) -> String {
         let title = self.title.split_whitespace().collect::<Vec<_>>().join(" ");
-        let tags: Vec<&str> = [
-            self.insight_kind.as_str(),
-            self.certainty.as_deref().unwrap_or(""),
-        ]
-        .into_iter()
-        .filter(|t| !t.is_empty())
-        .collect();
+        let cert = match self.certainty.as_deref().unwrap_or("") {
+            "axiom" => "ax",
+            "theorem" => "th",
+            "hypothesis" => "hyp",
+            other => other,
+        };
+        let tags: Vec<&str> = [self.insight_kind.as_str(), cert]
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .collect();
         let mut s = format!("ZeroAIMemory: {lead}{title}");
         if !tags.is_empty() {
-            s.push_str(&format!(" [{}]", tags.join(", ")));
+            s.push_str(&format!(" [{}]", tags.join("·")));
         }
-        s.push_str(&format!(" — i:{}", self.entry_id));
+        s.push_str(&format!(" i:{}", self.entry_id));
         s
     }
 }
@@ -1351,14 +1355,14 @@ mod tests {
         };
         assert_eq!(
             t.hint("для **/*.sh: "),
-            "ZeroAIMemory: для **/*.sh: LF в скриптах [gotcha, theorem] — i:01J"
+            "ZeroAIMemory: для **/*.sh: LF в скриптах [gotcha·th] i:01J"
         );
         let bare = Trigger {
             entry_id: "01K".into(),
             title: "x".into(),
             ..Trigger::default()
         };
-        assert_eq!(bare.hint(""), "ZeroAIMemory: x — i:01K");
+        assert_eq!(bare.hint(""), "ZeroAIMemory: x i:01K");
         assert!(bare.for_tool(Some("Bash")));
         let only = Trigger {
             tools: Some(vec!["bash".into()]),

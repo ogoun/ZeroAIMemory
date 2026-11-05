@@ -1418,6 +1418,111 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         caps.ideas,
         caps.snapshot
     );
+    // один индекс на все точки (план, «Методика замера при недетерминизме», правило 1):
+    // корпус грузится и индексируется один раз, каждая точка — на свежей копии каталога (выжимки
+    // и `session_seen` прошлой точки исказили бы путь (а)) с перезапуском под своими `ZAM_*`
+    for pt in &pts {
+        if pt.env.keys().any(|k| k.starts_with("ZAM_INDEX__")) {
+            bail!(
+                "точка {}: ключи index.* меняют индекс — сетка параметров индексации — \
+                 отдельно (методика, правило 3)",
+                pt.name
+            );
+        }
+    }
+    let mut index_sets: Vec<(String, String)> = Vec::new();
+    if caps.attachments {
+        // PDF набора разбирает pdfium сервера (`docs.pdfium_dylib` — с M5, как у eval --docs)
+        index_sets.push((
+            "docs.pdfium_dylib".into(),
+            crate::eval::docs::extract::pdfium_lib(&p.repo)
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
+    let index_name = run::run_name(model.as_deref(), Some(&format!("tokens-{label}-index")));
+    // штатная остановка (Ctrl+Break): Qdrant и SQLite сбрасывают WAL до копирования, иначе
+    // каждая копия восстанавливает коллекцию по WAL (на HDD — до 1,5 мин)
+    let index_spec = RunSpec {
+        ctrl_break: true,
+        ..spec(index_name.clone(), index_sets.clone())
+    };
+    let mut s0 = Session::start(p, &index_spec, &server, true)?;
+    s0.check_model()?;
+    if !caps.contradicts {
+        s0.without_contradicts();
+    }
+    s0.load_corpus(&set.corpus)?;
+    let docs = if caps.attachments {
+        load_docs(&mut s0, &p.docs)?
+    } else {
+        DocMap::new()
+    };
+    let (excluded, excluded_scenarios) = {
+        let (mut excluded, mut excluded_scenarios) =
+            excluded_by_edges(&chosen, s0.skipped_edges(), &caps.tag());
+        if !caps.attachments {
+            excluded.push(format!(
+                "вложения eval/docs: у сервера {} нет (с 0.0.7-m5) — не загружены",
+                caps.tag()
+            ));
+            excluded_scenarios.extend(excluded_by_attachments(&chosen, &caps.tag()));
+        }
+        (excluded, excluded_scenarios)
+    };
+    if !excluded.is_empty() || !excluded_scenarios.is_empty() {
+        println!(
+            "исключено (сервер {}): {}",
+            caps.tag(),
+            excluded
+                .iter()
+                .chain(&excluded_scenarios)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    if model.is_some() {
+        s0.wait_indexed()?;
+        println!("индексация: {:.1} с", s0.index_secs);
+    }
+    let L0Check {
+        excluded: l0_excluded,
+        mismatch: l0_mismatch,
+    } = verify_server_l0(&s0, &set, model.is_some())?;
+    if !l0_mismatch.is_empty() {
+        println!(
+            "L0 сервера ≠ приближения xtask у {} заметок-источников:",
+            l0_mismatch.len()
+        );
+        for m in &l0_mismatch {
+            println!("  {m}");
+        }
+    }
+    if !l0_excluded.is_empty() {
+        let list: Vec<String> = l0_excluded
+            .iter()
+            .map(|e| format!("{}#{} {}: «{}»", e.scenario, e.nugget, e.source, e.text))
+            .collect();
+        if a.strict_l0 {
+            bail!(
+                "--strict-l0: нагеты в L0 сервера {}:\n  {}",
+                caps.tag(),
+                list.join("\n  ")
+            );
+        }
+        println!(
+            "нагеты в L0 сервера {} — вне полноты этого плеча (в сравнении — обоих): {}",
+            caps.tag(),
+            list.join("; ")
+        );
+    }
+    let l0_set = l0_union([&McpInfo {
+        l0_excluded: l0_excluded.clone(),
+        ..McpInfo::default()
+    }]);
+    let index_dir = p.work.join(&index_name);
+    s0.stop_graceful(std::time::Duration::from_secs(120))?;
     let mut results: Vec<(String, PathBuf, McpResult)> = Vec::new();
     for pt in &pts {
         let env: Vec<(String, String)> = pt.env.clone().into_iter().collect();
@@ -1434,96 +1539,26 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             .iter()
             .filter_map(|(k, v)| caps::env_to_key(k).map(|key| (key, v.clone())))
             .collect();
-        if caps.attachments {
-            // PDF набора разбирает pdfium сервера (`docs.pdfium_dylib` — с M5, как у eval --docs)
-            sets.push((
-                "docs.pdfium_dylib".into(),
-                crate::eval::docs::extract::pdfium_lib(&p.repo)
-                    .to_string_lossy()
-                    .into_owned(),
-            ));
-        }
+        sets.extend(index_sets.iter().cloned());
         let point = (!pt.name.is_empty()).then(|| pt.name.clone());
         let run_label = match &point {
             Some(n) => format!("tokens-{label}-{n}"),
             None => format!("tokens-{label}"),
         };
-        // каталог всегда свежий: выжимки и session_seen прошлой точки исказили бы путь (а)
-        let mut s = Session::start(
-            p,
-            &spec(run::run_name(model.as_deref(), Some(&run_label)), sets),
-            &server,
-            true,
-        )?;
+        let name = run::run_name(model.as_deref(), Some(&run_label));
+        // свежая копия проиндексированного каталога, перезапуск под переопределениями точки
+        let dir = p.work.join(&name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).with_context(|| format!("очистка {}", dir.display()))?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        run::copy_dir(&index_dir, &dir)?;
+        let mut s = Session::start(p, &spec(name, sets), &server, false)?;
         s.check_model()?;
-        if !caps.contradicts {
-            s.without_contradicts();
-        }
-        s.load_corpus(&set.corpus)?;
-        let docs = if caps.attachments {
-            load_docs(&mut s, &p.docs)?
-        } else {
-            DocMap::new()
-        };
-        let (mut excluded, mut excluded_scenarios) =
-            excluded_by_edges(&chosen, s.skipped_edges(), &caps.tag());
-        if !caps.attachments {
-            excluded.push(format!(
-                "вложения eval/docs: у сервера {} нет (с 0.0.7-m5) — не загружены",
-                caps.tag()
-            ));
-            excluded_scenarios.extend(excluded_by_attachments(&chosen, &caps.tag()));
-        }
-        if !excluded.is_empty() || !excluded_scenarios.is_empty() {
-            println!(
-                "исключено (сервер {}): {}",
-                caps.tag(),
-                excluded
-                    .iter()
-                    .chain(&excluded_scenarios)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            );
-        }
         if model.is_some() {
+            // индекс тот же: ожидание лишь подтверждает, что переиндексации нет
             s.wait_indexed()?;
         }
-        let L0Check {
-            excluded: l0_excluded,
-            mismatch: l0_mismatch,
-        } = verify_server_l0(&s, &set, model.is_some())?;
-        if !l0_mismatch.is_empty() {
-            println!(
-                "L0 сервера ≠ приближения xtask у {} заметок-источников:",
-                l0_mismatch.len()
-            );
-            for m in &l0_mismatch {
-                println!("  {m}");
-            }
-        }
-        if !l0_excluded.is_empty() {
-            let list: Vec<String> = l0_excluded
-                .iter()
-                .map(|e| format!("{}#{} {}: «{}»", e.scenario, e.nugget, e.source, e.text))
-                .collect();
-            if a.strict_l0 {
-                bail!(
-                    "--strict-l0: нагеты в L0 сервера {}:\n  {}",
-                    caps.tag(),
-                    list.join("\n  ")
-                );
-            }
-            println!(
-                "нагеты в L0 сервера {} — вне полноты этого плеча (в сравнении — обоих): {}",
-                caps.tag(),
-                list.join("; ")
-            );
-        }
-        let l0_set = l0_union([&McpInfo {
-            l0_excluded: l0_excluded.clone(),
-            ..McpInfo::default()
-        }]);
         let mut runs = Vec::with_capacity(chosen.len());
         for sc in &chosen {
             let tag = format!(
@@ -1565,11 +1600,11 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 corpus_fingerprint: set.corpus_fingerprint.clone(),
                 nuggets_fingerprint: set.nuggets_fingerprint.clone(),
                 frozen: set.frozen,
-                excluded,
-                excluded_scenarios,
+                excluded: excluded.clone(),
+                excluded_scenarios: excluded_scenarios.clone(),
                 docs_loaded: docs.values().cloned().collect(),
-                l0_mismatch,
-                l0_excluded,
+                l0_mismatch: l0_mismatch.clone(),
+                l0_excluded: l0_excluded.clone(),
                 counter: "bge-m3 tokenizer.json".into(),
                 read_budget: READ_BUDGET,
             },

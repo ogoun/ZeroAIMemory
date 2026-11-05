@@ -985,7 +985,8 @@ fn items(r: &Resp) -> Vec<(String, Value)> {
 
 #[tokio::test]
 async fn search_shows_certainty_and_filters() {
-    let a = api("cert-search", |_| {}).await;
+    // все карточки, без отсечки слабых (M6 §4.2): тест — о certainty в выдаче
+    let a = api("cert-search", |c| c.search.brief_min_rel = 0.0).await;
     let ax = created_note(
         &a,
         Who::Web,
@@ -1043,10 +1044,11 @@ async fn search_shows_certainty_and_filters() {
             .unwrap_or_else(|| panic!("нет {path}: {md}"))
             .to_string()
     };
-    assert!(line("s/ax").contains("rev1 · axiom ·"), "{md}");
-    assert!(line("s/hy").contains("rev1 · hypothesis ·"), "{md}");
-    assert!(!line("s/pl").contains("axiom"), "{md}");
-    assert!(line("квазар вывод").contains("theorem"), "{md}");
+    // карточка v2 (M6 §4.1): надёжность сокращена — `ax`, `th`, `hyp`
+    assert!(line("s/ax").contains("] r1 · ax · "), "{md}");
+    assert!(line("s/hy").contains("] r1 · hyp · "), "{md}");
+    assert!(!line("s/pl").contains(" · ax · "), "{md}");
+    assert!(line("квазар вывод").contains("] th · "), "{md}");
 
     // GET /triggers отдаёт certainty
     let mut body = insight("триггер квазара");

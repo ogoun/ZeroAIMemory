@@ -1079,6 +1079,39 @@ mod tests {
         assert_eq!(reread_items("n:x", &Reread::Whole), [json!({"id": "n:x"})]);
     }
 
+    /// Markdown v2 (M6 §4.1, §4.3, §13): ссылки карточек и подсказок с новым хвостом.
+    #[test]
+    fn refs_in_text_parses_v2() {
+        let (n, i) = ("01M5ZW9X5TEXXA5Z35ZWAXPHBK", "01M60A7Q4T7QK2M9ZWAXPHBK9C");
+        let a = format!("a:{}", "0123456789abcdef".repeat(2));
+        let md = format!(
+            "1. n:{n} Knowledge/ru/windows/crlf-bash-scripts › Причина  [.82] r7 · 2026-10-10 \
+             14:03:22 · 340t\n   Скрипт с CRLF падает в bash…\n\
+             2. i:{i} insight/gotcha «Bash-скрипты должны иметь LF»  [.77] hyp · 2026-09-28 \
+             08:00:01 · 120t   (seen)\n\
+             3. {a} Knowledge/eval-docs/files-roadmap-pptx › roadmap.pptx · слайд 4  [1.0] \
+             2026-10-10 14:03:22 · 88t\n\
+             ZeroAIMemory: LF в скриптах [gotcha·hyp] i:{i}\n\
+             ZeroAIMemory: правило Rules/x [th] n:{n}\n"
+        );
+        assert_eq!(
+            refs_in_text(&md),
+            [('n', n.to_string()), ('i', i.to_string())]
+        );
+        let r = attachment_refs(&md);
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            (r[0].1.as_str(), r[0].2.as_str()),
+            (a.as_str(), "eval-docs/files-roadmap-pptx")
+        );
+        // хвост `r7` и `340t` — не ссылки
+        assert!(
+            !refs_in_text("[.82] r7 · 2026-10-10 14:03:22 · 340t")
+                .iter()
+                .any(|(k, _)| *k == 'r')
+        );
+    }
+
     #[test]
     fn attachment_refs_with_owner_path() {
         let a = format!("a:{}", "0123456789abcdef".repeat(2));

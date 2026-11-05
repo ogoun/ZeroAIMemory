@@ -270,6 +270,7 @@ fn read_flags(path: &Path, env: &Env) -> HookFlags {
 }
 
 /// Окружение запуска хука: команда, агент, корень, решение, начало отсчёта бюджета.
+#[derive(Clone)]
 pub struct Env {
     pub kind: Kind,
     pub agent: Agent,
@@ -350,7 +351,12 @@ impl Env {
             return None;
         }
         let Some(left) = self.http_left() else {
-            self.log(zam_core::HOOK_BUDGET_SPENT);
+            // сколько прошло от старта процесса — для разбора промаха (журнал задачи 5 M6)
+            self.log(&format!(
+                "{} (прошло {} мс)",
+                zam_core::HOOK_BUDGET_SPENT,
+                self.started.elapsed().as_millis()
+            ));
             return None;
         };
         Some(Client::with_timeouts(

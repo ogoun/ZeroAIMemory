@@ -228,3 +228,80 @@ async fn ensure_adds_indexes_to_existing_collection() {
     // повторный ensure — без изменений
     assert!(!idx.ensure(MODEL, DIM).await.unwrap().created);
 }
+
+/// Недетерминизм векторного канала (M6, задача 5, шаг 0): слияние RRF внутри Qdrant отдаёт
+/// точки с равным баллом в разном порядке от вызова к вызову, а на границе лимита — разный
+/// состав. Пары «лист dense ранга r» и «лист sparse ранга r» дают равные баллы: выдача
+/// обязана быть упорядочена по (балл ↓, `chunk_id` ↑), одинакова в каждом повторе и брать на
+/// границе лимита меньшие `chunk_id`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rrf_ties_are_ordered_by_chunk_id_and_repeatable() {
+    let (idx, _q) = managed("rrf-ties");
+    idx.ensure(MODEL, DIM).await.unwrap();
+    let ctx = Ctx {
+        user: Id::new(),
+        space: Id::new(),
+    };
+    let q = vec_for(1);
+    let norm = |v: Vec<f32>| {
+        let n = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+        v.into_iter().map(|a| a / n).collect::<Vec<f32>>()
+    };
+    let mut pts = Vec::new();
+    for i in 0..50u64 {
+        // «dense»: близко к запросу, сходство убывает с i; sparse не пересекается с запросом
+        let mut p = point(
+            &ctx,
+            Id::new(),
+            &format!("z-dense-{i:02}"),
+            100 + i,
+            "a",
+            "chunk",
+        );
+        let noise = vec_for(100 + i);
+        p.dense = norm(
+            q.iter()
+                .zip(&noise)
+                .map(|(a, b)| a + b * (0.05 + i as f32 * 0.01))
+                .collect(),
+        );
+        p.sparse = vec![(5000 + i as u32, 0.5)];
+        pts.push(p);
+        // «sparse»: dense далеко от запроса, sparse совпадает с убывающим весом
+        let mut p = point(
+            &ctx,
+            Id::new(),
+            &format!("a-sparse-{i:02}"),
+            200 + i,
+            "a",
+            "chunk",
+        );
+        let noise = vec_for(200 + i);
+        p.dense = norm(q.iter().zip(&noise).map(|(a, b)| -a + b * 0.1).collect());
+        p.sparse = vec![(7, 1.0 - i as f32 * 0.01)];
+        pts.push(p);
+    }
+    idx.upsert(pts).await.unwrap();
+    let f = filter(&ctx);
+    let first = idx.search(&q, &[(7, 1.0)], &f).await.unwrap();
+    let ids = |h: &[zam_index::VectorHit]| h.iter().map(|x| x.chunk_id.clone()).collect::<Vec<_>>();
+    assert!(!first.is_empty());
+    for w in first.windows(2) {
+        let ok =
+            w[0].score > w[1].score || (w[0].score == w[1].score && w[0].chunk_id < w[1].chunk_id);
+        assert!(
+            ok,
+            "порядок: {:?} {} / {:?} {}",
+            w[0].chunk_id, w[0].score, w[1].chunk_id, w[1].score
+        );
+    }
+    let ties = first
+        .windows(2)
+        .filter(|w| w[0].score == w[1].score)
+        .count();
+    assert!(ties >= 20, "равных баллов {ties}: набор не проверяет ничьи");
+    for _ in 0..20 {
+        let again = idx.search(&q, &[(7, 1.0)], &f).await.unwrap();
+        assert_eq!(ids(&again), ids(&first));
+    }
+}

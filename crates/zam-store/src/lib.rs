@@ -121,11 +121,11 @@ pub use jobs::{
 pub use migrate::Migration;
 pub use nodes::{
     Attribution, AuthorKind, NewNote, Node, NodeKind, PREFIX_L0_MAX_TOKENS, RevisionInfo,
-    WriteError, chunk_params, count_tokens, create_folder, create_note, delete_node,
-    entry_snapshot_text, find_by_name, get_node, get_node_by_path, list_children, list_revisions,
-    list_trash, move_node, node_content, patch_note, patch_note_within, prefix_l0, restore_node,
-    revert_note, set_auto_l0, set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter,
-    token_counter_exact, unified_diff, update_note,
+    WriteError, chunk_params, count_tokens, count_tokens_chunker, create_folder, create_note,
+    delete_node, entry_snapshot_text, find_by_name, get_node, get_node_by_path, list_children,
+    list_revisions, list_trash, move_node, node_content, patch_note, patch_note_within, prefix_l0,
+    restore_node, revert_note, set_auto_l0, set_chunk_params, set_folder_l0, set_prefix_l0,
+    set_token_counter, token_counter_exact, unified_diff, update_note,
 };
 pub use paths::{NodePath, path_ancestors};
 pub use questions::{
