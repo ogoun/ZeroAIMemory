@@ -157,6 +157,14 @@ pub fn run(ctx: &Ctx, flag: Option<&str>, action: &Action) -> Result<(), CliErro
 
 #[cfg(test)]
 mod tests {
+    /// Время запроса доступа — UTC без `T`/`Z` (M6 §4.4, ревью задачи 6).
+    #[test]
+    fn request_line_agent_time() {
+        let m = json!({"user_name": "борис", "user_id": "01B", "state": "pending",
+                       "access": "ro", "requested_at": "2026-10-10T14:03:22.123456Z"});
+        assert_eq!(line(&m), "борис  01B  pending  ro  2026-10-10 14:03:22\n");
+    }
+
     use super::*;
 
     #[test]

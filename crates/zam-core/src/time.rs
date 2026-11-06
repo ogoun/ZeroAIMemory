@@ -1,11 +1,13 @@
 //! Дата и время в тексте агенту (M6 §4.4): `yyyy-MM-dd HH:mm:ss` UTC, без `T`, `Z` и смещения.
 //! Без `jiff`: вход — строка RFC 3339 (так время приходит из JSON API и из `fmt_ts` хранилища);
-//! сервер вызывает `agent_ts(&fmt_ts(t))`, CLI — на строках JSON ответа.
+//! сервер вызывает `agent_ts(&fmt_ts(t))`, CLI — на строках JSON ответа. Здесь же — секунды
+//! Unix ⇄ RFC 3339 для клиента без jiff (`zam`: кэши хуков, отметки синхронизации); своих
+//! календарей в CLI нет.
 
 /// Момент RFC 3339 → `yyyy-MM-dd HH:mm:ss` UTC (смещение пересчитывается, доли секунды
 /// отбрасываются). Не RFC 3339 (в том числе дата без времени) — `None`.
 pub fn agent_ts(rfc3339: &str) -> Option<String> {
-    let u = parse_utc(rfc3339)?;
+    let u = utc_of(unix_secs(rfc3339)?);
     Some(format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         u.year, u.month, u.day, u.hour, u.minute, u.second
@@ -14,7 +16,7 @@ pub fn agent_ts(rfc3339: &str) -> Option<String> {
 
 /// Дата момента RFC 3339 по UTC, `yyyy-MM-dd`; не RFC 3339 — `None`.
 pub fn agent_date(rfc3339: &str) -> Option<String> {
-    let u = parse_utc(rfc3339)?;
+    let u = utc_of(unix_secs(rfc3339)?);
     Some(format!("{:04}-{:02}-{:02}", u.year, u.month, u.day))
 }
 
@@ -28,8 +30,33 @@ struct Utc {
     second: u32,
 }
 
-/// `YYYY-MM-DDTHH:MM:SS[.доли](Z|±HH:MM)` → UTC; иное — `None`.
-fn parse_utc(s: &str) -> Option<Utc> {
+/// Секунды Unix → RFC 3339 UTC с секундами, `2026-10-27T12:01:01Z`.
+pub fn rfc3339_from_secs(secs: i64) -> String {
+    let u = utc_of(secs);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        u.year, u.month, u.day, u.hour, u.minute, u.second
+    )
+}
+
+/// Разбивка секунд Unix на поля UTC.
+fn utc_of(secs: i64) -> Utc {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (year, month, day) = civil_from_days(days);
+    let rem = rem as u32;
+    Utc {
+        year,
+        month,
+        day,
+        hour: rem / 3600,
+        minute: rem / 60 % 60,
+        second: rem % 60,
+    }
+}
+
+/// Момент RFC 3339 `YYYY-MM-DDTHH:MM:SS[.доли](Z|±HH:MM)` → секунды Unix (UTC, доли
+/// отбрасываются); иное — `None`.
+pub fn unix_secs(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || !b.is_ascii() {
         return None;
@@ -77,18 +104,7 @@ fn parse_utc(s: &str) -> Option<Utc> {
     };
     let local =
         days_from_civil(year, month, day) * 86_400 + i64::from(hour * 3600 + minute * 60 + second);
-    let utc = local - offset_min * 60;
-    let (days, secs) = (utc.div_euclid(86_400), utc.rem_euclid(86_400));
-    let (year, month, day) = civil_from_days(days);
-    let secs = u32::try_from(secs).ok()?;
-    Some(Utc {
-        year,
-        month,
-        day,
-        hour: secs / 3600,
-        minute: secs / 60 % 60,
-        second: secs % 60,
-    })
+    Some(local - offset_min * 60)
 }
 
 fn is_leap(y: i64) -> bool {
@@ -105,7 +121,7 @@ fn days_in_month(y: i64, m: u32) -> u32 {
 }
 
 /// Дней от 1970-01-01 (алгоритм Хиннанта, пролептический григорианский календарь).
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -115,8 +131,8 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Обратное к [`days_from_civil`].
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// Обратное к [`days_from_civil`]: (год, месяц, день).
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -200,5 +216,20 @@ mod tests {
             Some("2026-10-09")
         );
         assert_eq!(agent_date("2026-10-10"), None);
+    }
+
+    #[test]
+    fn secs_rfc3339_round_trip() {
+        assert_eq!(rfc3339_from_secs(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_from_secs(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339_from_secs(1_793_102_461), "2026-10-27T12:01:01Z");
+        assert_eq!(rfc3339_from_secs(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(unix_secs("2026-10-27T12:01:01.123Z"), Some(1_793_102_461));
+        assert_eq!(unix_secs("2026-10-27T15:01:01+03:00"), Some(1_793_102_461));
+        for s in (-86_400_i64 * 400..86_400 * 40_000).step_by(7_919_993) {
+            assert_eq!(unix_secs(&rfc3339_from_secs(s)), Some(s), "{s}");
+        }
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(civil_from_days(20_000), (2024, 10, 4));
     }
 }

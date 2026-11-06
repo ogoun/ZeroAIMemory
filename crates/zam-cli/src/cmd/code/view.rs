@@ -54,6 +54,13 @@ pub fn status(ctx: &Ctx, guid: &str, root: &Path) -> Result<(), CliError> {
     if v["exists"] != true {
         return emit("карты кода нет: zam code sync\n".as_bytes());
     }
+    let mark = SyncMark::load(root).filter(|m| m.solution == guid);
+    emit(status_text(&v, mark.as_ref()).as_bytes())
+}
+
+/// Текст `zam code status` по ответу `/code/status` и отметке синхронизации этой машины; время —
+/// UTC `yyyy-MM-dd HH:mm:ss` (M6 §4.4).
+fn status_text(v: &Value, mark: Option<&SyncMark>) -> String {
     let mut s = format!(
         "карта кода: файлов {}, символов {}; снимок {}",
         v["files"],
@@ -105,13 +112,13 @@ pub fn status(ctx: &Ctx, guid: &str, root: &Path) -> Result<(), CliError> {
     if !central.is_empty() {
         s.push_str(&format!("центральные: {}\n", central.join(", ")));
     }
-    if let Some(m) = SyncMark::load(root).filter(|m| m.solution == guid) {
+    if let Some(m) = mark {
         s.push_str(&format!(
             "синхронизация с этой машины: {}\n",
             agent_time(&m.last_ok_at)
         ));
     }
-    emit(s.as_bytes())
+    s
 }
 
 /// Коммит (40 или 64 hex) — первые 12 символов; прочее (ветка, машина) — как есть.
@@ -455,6 +462,29 @@ pub fn impact(
 
 #[cfg(test)]
 mod tests {
+    /// Время снимка и синхронизации — UTC без `T`/`Z` (M6 §4.4, ревью задачи 6).
+    #[test]
+    fn status_text_agent_time() {
+        let v = json!({"exists": true, "files": 2, "symbols": 3,
+                       "updated_at": "2026-10-10T14:03:22.123456Z", "branch": "main",
+                       "rank_state": "ready", "by_lang": [], "skipped": [], "central": []});
+        let m = SyncMark {
+            server: "s".into(),
+            solution: "g".into(),
+            last_ok_at: "2026-10-11T08:00:00Z".into(),
+            head: None,
+        };
+        let s = status_text(&v, Some(&m));
+        assert!(
+            s.starts_with("карта кода: файлов 2, символов 3; снимок 2026-10-10 14:03:22 (main)"),
+            "{s}"
+        );
+        assert!(
+            s.contains("синхронизация с этой машины: 2026-10-11 08:00:00\n"),
+            "{s}"
+        );
+    }
+
     use super::*;
 
     #[test]

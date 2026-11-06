@@ -2237,7 +2237,10 @@ JSON с метками `<time>`); вид строк карточек и `[cache]
 
 Передать:
 - **→ 8a/9/17:** `freeze_now` — в отдельном тестовом файле (см. отклонения); пример —
-  `crates/zam-server/tests/agent_dates.rs`.
+  `crates/zam-server/tests/agent_dates.rs`, `crates/zam-store/tests/freeze.rs`. Правила guard:
+  пока `FreezeGuard` жив, фоновая перенарезка при открытии базы (`rechunk_gate`) стоит до его
+  drop; повторный `freeze_now` или `hold_rechunk` из того же потока при живом guard — паника
+  («блокировка тестовых точек уже у этого потока»), из другого потока — ожидание снятия.
 - **→ 8b:** `zam sessions` — время через `zam_cli::cmd::agent_time`; страница сессий WebUI — через
   `localTime`.
 - **→ 13a CHANGELOG** «Изменения ответа»: текстовый вывод `zam` (`history`, `cache show`, `code
@@ -2245,6 +2248,39 @@ JSON с метками `<time>`); вид строк карточек и `[cache]
   RFC 3339; `--json` и JSON API без изменений.
 - Данные записей (`data` задач в диффе `since_rev`, тела заметок) — содержимое, а не выдача
   сервера: метки RFC 3339 внутри них не переписываются.
+
+#### Правки Minor после приёмки задачи 6 (APPROVED)
+
+Коммит — `fix(time): Minor после приёмки задачи 6` поверх `4d38233`.
+1. `freeze_now_applies` перенесён из юнит-тестов `zam-store` в `crates/zam-store/tests/freeze.rs`
+   (`[[test]] required-features = ["test-hooks"]`): при `cargo test --workspace` фича
+   объединяется, и заморозка шла бы параллельно с `ideas::request_value_ignores_clock`. Проверка
+   настоящих часов после снятия — под `hold_rechunk` (блокировка без заморозки).
+2. Повторный захват `GATE` тем же потоком — паника вместо вечного ожидания: `try_write_owned`,
+   держатель записи — `ThreadId` в `GateGuard` (его же теперь возвращает `hold_rechunk`); занято
+   другим потоком — ожидание. Тесты `freeze_twice_same_thread_panics`,
+   `freeze_after_hold_rechunk_same_thread_panics`, `freeze_waits_for_other_thread` (RED: зависание,
+   прогон снят по таймауту 60 с). В doc `freeze_now` — о `rechunk_gate`.
+3. WebUI: `Users.svelte` — `last_used_at` токена через `localTime`; прочих сырых `*_at` в `.svelte`
+   нет (grep по `{…_at}` вне `fmtTime`/`localTime`/`datetime=`; остальное — проверки `{#if …_at}`).
+4. `zam code status` — рендер вынесен в `code::view::status_text`, юнит-тест
+   `status_text_agent_time` (снимок и «синхронизация с этой машины»); `zam solution access
+   requests` — `solution::tests::request_line_agent_time`.
+5. Календарь в CLI один — `zam_core::time`: `rfc3339_from_secs`, `unix_secs`, `pub
+   days_from_civil`/`civil_from_days`; `hook/cache.rs::rfc3339` и `code/auto.rs::rfc3339_secs` —
+   обёртки. Прежние реализации сохранены в тестах как эталон: `rfc3339_matches_legacy`,
+   `rfc3339_secs_matches_legacy` (1140 моментов 1970–2100, с долями и без), в `zam-core` —
+   `secs_rfc3339_round_trip`. Новый разбор строже прежнего (день по календарю месяца, секунда ≤ 59)
+   и принимает смещение ±HH:MM; метки, которые пишет сам `zam`, разбираются так же.
+
+Проверки (`target/r1-t6b`, `ZAM_REQUIRE_ML=1`, `ZAM_TEST_MODELS_DIR=.tmp/ci-models`): fmt, clippy
+`--workspace --all-targets -D warnings` — чисто; `zam-core` + `zam-store` без фичи и `zam-store
+--features test-hooks` (в том числе `--test freeze`, 4/4) — PASS; `zam-cli` — PASS, кроме
+`hooks::post_tool_codex_stderr_hint` (пустой вывод хука под параллельной сборкой — повтором PASS)
+и `read_locator`, `search_attachments` (в чистом каталоге не был собран бинарник `zam-server`, —
+после `cargo build -p zam-server --bin zam-server` PASS); `zam-server --test index_rechunk --test
+agent_dates` — PASS (тип `hold_rechunk` изменён); web `npm run check` — 0 ошибок, `npm run
+test:build` — 9/9.
 
 ### Задача 7a. Эпохи и «уже выдавалось»
 

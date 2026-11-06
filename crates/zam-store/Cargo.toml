@@ -48,3 +48,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rusqlite.workspace = true
 # свойства разбора `data` идеи (M5.7, `idea_patch_never_panics`)
 proptest.workspace = true
+
+# замороженные часы — отдельный процесс: при `cargo test --workspace` фича объединяется, и
+# заморозка в юнит-тестах шла бы параллельно с тестами, читающими часы (M6, ревью задачи 6)
+[[test]]
+name = "freeze"
+required-features = ["test-hooks"]

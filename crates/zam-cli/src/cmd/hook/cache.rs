@@ -1192,25 +1192,9 @@ pub fn now_rfc3339() -> String {
     rfc3339(secs)
 }
 
-/// Секунды Unix → RFC 3339 UTC (алгоритм civil-from-days, Howard Hinnant).
+/// Секунды Unix → RFC 3339 UTC (`zam_core::time`: один календарь на сервер и клиент).
 fn rfc3339(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
+    zam_core::time::rfc3339_from_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
 /// `zam triggers sync`: принудительное обновление кэша триггеров проекта.
@@ -1377,6 +1361,38 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(1_793_102_461), "2026-10-27T12:01:01Z");
+    }
+
+    /// Прежний календарь клиента (до M6, задача 6) — эталон совпадения вывода.
+    fn legacy_rfc3339(secs: u64) -> String {
+        let days = (secs / 86_400) as i64;
+        let rem = secs % 86_400;
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        )
+    }
+
+    /// `zam_core::time::rfc3339_from_secs` выводит то же, что прежний календарь клиента.
+    #[test]
+    fn rfc3339_matches_legacy() {
+        for secs in (0..4_102_444_800_u64)
+            .step_by(3_599_993)
+            .chain([0, 951_782_400, 4_102_444_799])
+        {
+            assert_eq!(rfc3339(secs), legacy_rfc3339(secs), "{secs}");
+        }
     }
 
     #[test]

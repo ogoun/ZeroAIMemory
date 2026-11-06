@@ -22,6 +22,9 @@ pub fn now() -> Timestamp {
 /// часами не идут параллельно друг с другом и с прочими точками `test-hooks`. Часы общие для
 /// процесса — остальные тесты того же двоичного файла, идущие параллельно, видят то же время
 /// (сроки сессий WebUI, аренды задач): такие тесты держат в отдельном файле.
+///
+/// Пока guard жив, фоновая перенарезка при открытии базы (`rechunk_gate`) стоит до его drop.
+/// Повторный `freeze_now` или `hold_rechunk` из того же потока при живом guard — паника.
 #[cfg(feature = "test-hooks")]
 pub fn freeze_now(t: Timestamp) -> crate::test_hooks::FreezeGuard {
     crate::test_hooks::freeze(t)
@@ -160,29 +163,5 @@ mod tests {
         let c: Timestamp = "2026-10-18T12:00:01Z".parse().unwrap();
         let (sa, sb, sc) = (fmt_ts(a), fmt_ts(b), fmt_ts(c));
         assert!(sa < sb && sb < sc);
-    }
-}
-
-/// Замороженные часы (фича `test-hooks`): `cargo test -p zam-store --features test-hooks`.
-#[cfg(all(test, feature = "test-hooks"))]
-mod freeze_tests {
-    use super::*;
-
-    #[test]
-    fn freeze_now_applies() {
-        let t: Timestamp = "2026-10-10T14:03:22.123456Z".parse().unwrap();
-        {
-            let _g = freeze_now(t);
-            assert_eq!(now(), t);
-            assert_eq!(now(), t, "время не идёт");
-            assert_eq!(utc_today().to_string(), "2026-10-10");
-        }
-        // после снятия — настоящие часы
-        let real = Timestamp::now();
-        assert!((now().as_second() - real.as_second()).abs() <= 1);
-        // повторная заморозка после снятия — без взаимной блокировки
-        let t2: Timestamp = "2030-01-01T00:00:00Z".parse().unwrap();
-        let _g = freeze_now(t2);
-        assert_eq!(now(), t2);
     }
 }
