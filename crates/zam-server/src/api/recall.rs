@@ -348,7 +348,7 @@ struct Cand {
 /// Возраст подсказки (M4.5 §7): от `updated_at`, у заметки с `verified_at` — от более позднего.
 fn age_of(updated_at: jiff::Timestamp, verified_at: Option<&str>) -> Option<u32> {
     Some(zam_store::time::age_days(
-        jiff::Timestamp::now(),
+        zam_store::time::now(),
         updated_at,
         verified_at,
     ))
@@ -619,7 +619,7 @@ async fn task_cands(
         ..entry_filter(s, EntryKind::Task)
     })
     .await?;
-    let now = jiff::Timestamp::now();
+    let now = zam_store::time::now();
     let mine = |e: &Entry| {
         session.is_some_and(|sid| {
             zam_store::TaskData::from_stored(&e.data)
@@ -656,7 +656,7 @@ async fn question_cands(
     deadline: &mut Deadline,
     spaces: &[(usize, Id)],
 ) -> Result<(Vec<Cand>, Option<String>), ApiError> {
-    let since = zam_store::days_ago(jiff::Timestamp::now(), ANSWERS_DAYS);
+    let since = zam_store::days_ago(zam_store::time::now(), ANSWERS_DAYS);
     let mut answered: Vec<(usize, Entry, zam_store::Answer)> = Vec::new();
     // заголовки открытых вопросов всех баз с временем создания: берутся новейшие по общей сортировке
     let (mut open_n, mut titles) = (0usize, Vec::<(jiff::Timestamp, String)>::new());
@@ -1513,7 +1513,7 @@ async fn knowledge_ideas_related(
     });
     let mut tasks: Vec<Entry> = Vec::new();
     if let Some(sid) = session.as_deref() {
-        let now = jiff::Timestamp::now();
+        let now = zam_store::time::now();
         let spaces: Vec<(usize, Id)> = sol.into_iter().chain([(ki, kn)]).collect();
         for (i, space) in spaces {
             let f = EntryFilter {
@@ -2273,7 +2273,7 @@ async fn decision_cands(
     deadline: &mut Deadline,
     sol: Option<(usize, Id)>,
 ) -> Result<Vec<Cand>, ApiError> {
-    let since = zam_store::days_ago(jiff::Timestamp::now(), RECOVERY_DECISIONS_DAYS);
+    let since = zam_store::days_ago(zam_store::time::now(), RECOVERY_DECISIONS_DAYS);
     let spaces: Vec<(usize, Id)> = sol.into_iter().collect();
     Ok(entries_of(health, deadline, &spaces, |s| EntryFilter {
         statuses: vec![EntryStatus::Active],

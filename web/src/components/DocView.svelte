@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { localTime } from '../lib/time';
   // Просмотр заметки: HTML с сервера (санитизирован ammonia) вставляется через {@html}
   // и «оживляется» на клиенте — якоря, копирование кода, лайтбокс, вики-ссылки,
   // формулы (KaTeX) и диаграммы (Mermaid) лениво отдельными чанками.
@@ -217,10 +218,7 @@
     }
   }
 
-  const fmtTime = (ts: string) => {
-    const d = new Date(ts);
-    return Number.isNaN(d.getTime()) ? ts : d.toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' });
-  };
+  const fmtTime = (ts: string) => localTime(ts, { dateStyle: 'medium', timeStyle: 'short' });
 
   let crumbs = $derived(info ? info.path.split('/') : []);
   let tags = $derived.by(() => {

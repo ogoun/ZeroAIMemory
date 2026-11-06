@@ -1,4 +1,5 @@
 // Подписи журналов решения для WebUI (§7.2–7.6): виды записей, статусы, надёжность.
+import { localTime } from './time';
 import type { Certainty, EntryStatus, TriggerType } from './api';
 import type { Journal } from './router';
 
@@ -189,10 +190,5 @@ export const dataStr = (data: Record<string, unknown>, key: string): string => {
   return typeof v === 'string' ? v : '';
 };
 
-export const fmtTime = (ts: string | null | undefined): string => {
-  if (!ts) return '';
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime())
-    ? ts
-    : d.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
-};
+/** Момент API (RFC 3339 UTC) в локальном времени браузера, коротко; пусто — пустая строка. */
+export const fmtTime = (ts: string | null | undefined): string => (ts ? localTime(ts) : '');

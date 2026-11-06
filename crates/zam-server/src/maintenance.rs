@@ -43,8 +43,8 @@ impl Maintenance {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                gc_sessions_in(&system, &users, Timestamp::now()).await;
-                gc_cache_in(&system, &users, &cache, Timestamp::now()).await;
+                gc_sessions_in(&system, &users, zam_store::time::now()).await;
+                gc_cache_in(&system, &users, &cache, zam_store::time::now()).await;
             }
         });
         Maintenance {

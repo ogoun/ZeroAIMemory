@@ -25,7 +25,6 @@ use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::Id;
@@ -490,7 +489,7 @@ pub async fn reindex(
             "space": space,
             "full": req.full,
             "unavailable_dbs": unavailable,
-            "accepted_at": fmt_ts(Timestamp::now()),
+            "accepted_at": fmt_ts(zam_store::time::now()),
         })),
     ))
 }

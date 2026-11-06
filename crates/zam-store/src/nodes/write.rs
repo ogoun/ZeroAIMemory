@@ -2,7 +2,6 @@
 //! разбор, чанки, FTS и задание outbox (`index_jobs`) фиксируются вместе или не
 //! фиксируются вовсе (§8.1 ТЗ).
 
-use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 
@@ -25,7 +24,7 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
 
 /// [`create_note`] внутри транзакции писателя (превращение выжимки кэша в заметку, §9.4).
 pub(crate) fn insert_note(tx: &Connection, n: &NewNote) -> Result<Node, StoreError> {
-    let now = fmt_ts(Timestamp::now());
+    let now = fmt_ts(crate::time::now());
     let kind = ensure_space(tx, n.space_id)?;
     ensure_free(tx, n.space_id, &n.path)?;
     let parent = ensure_ancestors(tx, n.space_id, &n.path, &now)?;
@@ -72,7 +71,7 @@ pub(crate) fn insert_note(tx: &Connection, n: &NewNote) -> Result<Node, StoreErr
 /// Создаёт папку и недостающих предков. Путь занят живым узлом → `Conflict`.
 pub async fn create_folder(db: &Db, space_id: Id, path: NodePath) -> Result<Node, StoreError> {
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         ensure_space(tx, space_id)?;
         ensure_free(tx, space_id, &path)?;
         let parent = ensure_ancestors(tx, space_id, &path, &now)?;

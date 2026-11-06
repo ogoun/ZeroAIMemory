@@ -224,6 +224,12 @@ impl Ctx {
     }
 }
 
+/// Время из JSON ответа в тексте агенту (M6 §4.4): RFC 3339 → `yyyy-MM-dd HH:mm:ss` UTC, без
+/// `T`/`Z`; не время — как есть. `--json` печатает ответ API без изменений (RFC 3339).
+pub fn agent_time(s: &str) -> String {
+    zam_core::time::agent_ts(s).unwrap_or_else(|| s.to_string())
+}
+
 /// Запись в stdout; закрытый канал (`| head`) — не ошибка.
 pub fn emit(bytes: &[u8]) -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();

@@ -304,7 +304,7 @@ async fn account(st: &AppState, p: &Principal, headers: &HeaderMap, explicit: bo
             _ => return,
         }
     } else {
-        let day = jiff::Timestamp::now()
+        let day = zam_store::time::now()
             .to_zoned(jiff::tz::TimeZone::UTC)
             .date();
         zam_store::add_unattributed(&db, day, MCP_TOKEN_EVENT, 1, tokens).await
@@ -329,7 +329,7 @@ async fn implicit_session(st: &AppState, parts: &Parts) -> Option<String> {
             .ok()
             .flatten()
             .and_then(|g| g.trim().parse().ok());
-    let since = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(IMPLICIT_SESSION_HOURS);
+    let since = zam_store::time::now() - jiff::SignedDuration::from_hours(IMPLICIT_SESSION_HOURS);
     let found = match st.users.get(user).await {
         Ok(db) => {
             zam_store::latest_session(&db, machine.as_deref(), solution.as_ref(), since).await

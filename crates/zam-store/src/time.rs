@@ -6,9 +6,30 @@ use rusqlite::Row;
 
 use crate::StoreError;
 
+/// «Сейчас» сервера и хранилища (M6 §4.4): все записи времени, окна и сроки — через неё. С фичей
+/// `test-hooks` часы можно заморозить ([`freeze_now`]).
+pub fn now() -> Timestamp {
+    #[cfg(feature = "test-hooks")]
+    if let Some(t) = crate::test_hooks::frozen() {
+        return t;
+    }
+    Timestamp::now()
+}
+
+/// Замораживает [`now`] на `t`, пока жив результат (фича `test-hooks`).
+///
+/// Ждёт и держит блокировку тестовых точек (`test_hooks::GATE`, запись): тесты с замороженными
+/// часами не идут параллельно друг с другом и с прочими точками `test-hooks`. Часы общие для
+/// процесса — остальные тесты того же двоичного файла, идущие параллельно, видят то же время
+/// (сроки сессий WebUI, аренды задач): такие тесты держат в отдельном файле.
+#[cfg(feature = "test-hooks")]
+pub fn freeze_now(t: Timestamp) -> crate::test_hooks::FreezeGuard {
+    crate::test_hooks::freeze(t)
+}
+
 /// Сегодняшняя дата по UTC: «сегодня» идей (`horizon`) и релизов — одно определение.
 pub fn utc_today() -> jiff::civil::Date {
-    Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC).date()
+    now().to_zoned(jiff::tz::TimeZone::UTC).date()
 }
 
 /// Форматирует момент времени для хранения в TEXT-колонке.
@@ -109,6 +130,29 @@ mod tests {
         assert!(matches!(parse_ts("мусор"), Err(StoreError::Corrupt(_))));
     }
 
+    /// Текст агенту из строки хранения совпадает с `strftime` jiff (M6 §4.4): одна функция
+    /// `zam_core::time::agent_ts` для сервера и CLI.
+    #[test]
+    fn agent_ts_matches_jiff() {
+        let mut t: Timestamp = "1999-12-31T23:59:59.999999Z".parse().unwrap();
+        // шаг ~ 1 сут. 7 ч 13 мин 17,3 с: високосные годы, границы месяцев и суток
+        let step = jiff::SignedDuration::new(112_397, 300_000_000);
+        for _ in 0..20_000 {
+            let s = fmt_ts(t);
+            assert_eq!(
+                zam_core::time::agent_ts(&s).as_deref(),
+                Some(t.strftime("%Y-%m-%d %H:%M:%S").to_string().as_str()),
+                "{s}"
+            );
+            assert_eq!(
+                zam_core::time::agent_date(&s).as_deref(),
+                Some(t.strftime("%Y-%m-%d").to_string().as_str()),
+                "{s}"
+            );
+            t += step;
+        }
+    }
+
     #[test]
     fn lexicographic_order_is_chronological() {
         let a: Timestamp = "2026-10-18T12:00:00Z".parse().unwrap();
@@ -116,5 +160,29 @@ mod tests {
         let c: Timestamp = "2026-10-18T12:00:01Z".parse().unwrap();
         let (sa, sb, sc) = (fmt_ts(a), fmt_ts(b), fmt_ts(c));
         assert!(sa < sb && sb < sc);
+    }
+}
+
+/// Замороженные часы (фича `test-hooks`): `cargo test -p zam-store --features test-hooks`.
+#[cfg(all(test, feature = "test-hooks"))]
+mod freeze_tests {
+    use super::*;
+
+    #[test]
+    fn freeze_now_applies() {
+        let t: Timestamp = "2026-10-10T14:03:22.123456Z".parse().unwrap();
+        {
+            let _g = freeze_now(t);
+            assert_eq!(now(), t);
+            assert_eq!(now(), t, "время не идёт");
+            assert_eq!(utc_today().to_string(), "2026-10-10");
+        }
+        // после снятия — настоящие часы
+        let real = Timestamp::now();
+        assert!((now().as_second() - real.as_second()).abs() <= 1);
+        // повторная заморозка после снятия — без взаимной блокировки
+        let t2: Timestamp = "2030-01-01T00:00:00Z".parse().unwrap();
+        let _g = freeze_now(t2);
+        assert_eq!(now(), t2);
     }
 }

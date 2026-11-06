@@ -1076,7 +1076,7 @@ impl GraphStore for Db {
     async fn add_edge(&self, e: NewEdge, a: &Attribution) -> Result<EdgeView, StoreError> {
         let a = a.clone();
         self.write(move |tx| {
-            let now = fmt_ts(Timestamp::now());
+            let now = fmt_ts(crate::time::now());
             let id = add_explicit(tx, e, &a, &now)?;
             Ok(load_edge(tx, id)?.ok_or(StoreError::NotFound)?.0)
         })
@@ -1099,7 +1099,7 @@ impl GraphStore for Db {
             check_certainty(author, src, &CertaintyChange::ModifyOther, None, None)?;
             tx.execute(
                 "UPDATE edges SET deleted_at = ?2 WHERE id = ?1",
-                params![id, fmt_ts(Timestamp::now())],
+                params![id, fmt_ts(crate::time::now())],
             )?;
             Ok(())
         })
@@ -1156,7 +1156,7 @@ pub(crate) async fn backfill_edges(db: &Db) -> Result<u64, StoreError> {
         let cursor = after;
         let (n, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, i64)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT id, current_rev FROM nodes
@@ -1182,7 +1182,7 @@ pub(crate) async fn backfill_edges(db: &Db) -> Result<u64, StoreError> {
         }
     }
     db.write(|tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let pairs: Vec<(Id, Id, Id)> = {
             let mut st = tx.prepare(
                 "SELECT id, supersedes_id, space_id FROM entries WHERE supersedes_id IS NOT NULL",

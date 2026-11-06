@@ -1,4 +1,5 @@
 <script lang="ts" module>
+  import { localTime } from '../lib/time';
   import type { NodeInfo } from '../lib/api';
 
   /** Изменение узла из дерева — для Shell (открытый документ мог исчезнуть или переехать). */
@@ -314,11 +315,7 @@
   const spaceName = (uid: string, id: string) =>
     spaces[uid]?.find((s) => s.id === id)?.name ?? '';
 
-  const fmtTime = (ts: string | null) => {
-    if (!ts) return '';
-    const d = new Date(ts);
-    return Number.isNaN(d.getTime()) ? ts : d.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
-  };
+  const fmtTime = (ts: string | null) => (ts ? localTime(ts) : '');
 
   const isSelected = (uid: string, id: string) =>
     route.name === 'node' && route.user === uid && route.node === id;

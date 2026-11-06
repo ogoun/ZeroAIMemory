@@ -1535,7 +1535,7 @@ fn touch_if_snapshot(tx: &Connection, solution: &str) -> Result<(), StoreError> 
         .prepare_cached("SELECT 1 FROM code_snapshots WHERE solution_guid = ?1")?
         .exists([solution])?
     {
-        touch_snapshot(tx, solution, &fmt_ts(Timestamp::now()))?;
+        touch_snapshot(tx, solution, &fmt_ts(crate::time::now()))?;
     }
     Ok(())
 }

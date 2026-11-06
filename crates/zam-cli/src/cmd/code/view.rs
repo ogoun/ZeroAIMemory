@@ -10,7 +10,7 @@ use super::config::CodeConfig;
 use super::scan;
 use super::state::{CodeState, SyncMark};
 use crate::client::{CliError, EXIT_NOT_FOUND, read_json};
-use crate::cmd::{Ctx, emit, emit_json, refs};
+use crate::cmd::{Ctx, agent_time, emit, emit_json, refs};
 
 /// Предел бюджета карты (как у сервера `code.map_tokens`).
 pub const BUDGET_MAX: usize = 20_000;
@@ -58,7 +58,7 @@ pub fn status(ctx: &Ctx, guid: &str, root: &Path) -> Result<(), CliError> {
         "карта кода: файлов {}, символов {}; снимок {}",
         v["files"],
         v["symbols"],
-        v["updated_at"].as_str().unwrap_or("?")
+        agent_time(v["updated_at"].as_str().unwrap_or("?"))
     );
     let snap: Vec<String> = ["commit", "branch", "machine"]
         .iter()
@@ -106,7 +106,10 @@ pub fn status(ctx: &Ctx, guid: &str, root: &Path) -> Result<(), CliError> {
         s.push_str(&format!("центральные: {}\n", central.join(", ")));
     }
     if let Some(m) = SyncMark::load(root).filter(|m| m.solution == guid) {
-        s.push_str(&format!("синхронизация с этой машины: {}\n", m.last_ok_at));
+        s.push_str(&format!(
+            "синхронизация с этой машины: {}\n",
+            agent_time(&m.last_ok_at)
+        ));
     }
     emit(s.as_bytes())
 }

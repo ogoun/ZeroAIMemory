@@ -6,7 +6,6 @@
 //! как при создании. Текст с тем же `content_hash`, что у текущей ревизии, новой
 //! ревизии не создаёт — возвращается текущий узел.
 
-use jiff::Timestamp;
 use rusqlite::{Connection, params};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::{PatchError, PatchOp, apply_patch, section_bytes};
@@ -241,7 +240,7 @@ fn commit_text(
     if node.content_hash.as_deref() == Some(hash.as_str()) {
         return Ok(node);
     }
-    let now = fmt_ts(Timestamp::now());
+    let now = fmt_ts(crate::time::now());
     let meta = note_meta(content, agent_l0);
     let certainty = meta.certainty()?;
     // theorem агента — с непустым evidence: и после правки

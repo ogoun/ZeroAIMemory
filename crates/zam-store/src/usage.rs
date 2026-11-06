@@ -9,7 +9,6 @@
 //! [`unattributed_tokens`].
 use std::collections::HashMap;
 
-use jiff::Timestamp;
 use rusqlite::params;
 use serde::Serialize;
 use zam_core::{Id, TargetKind, TargetRef};
@@ -108,7 +107,7 @@ pub async fn record_usages(db: &Db, events: &[UsageEvent]) -> Result<(), StoreEr
     }
     let events = events.to_vec();
     db.write(move |t| {
-        let ts = fmt_ts(Timestamp::now());
+        let ts = fmt_ts(crate::time::now());
         let mut st = t.prepare_cached(
             "INSERT INTO usage (ts, user_id, session_id, target_kind, target_id, event, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

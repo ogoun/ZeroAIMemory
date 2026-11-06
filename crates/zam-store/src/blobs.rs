@@ -20,7 +20,6 @@
 
 use std::path::{Path, PathBuf};
 
-use jiff::Timestamp;
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -216,7 +215,7 @@ pub async fn attach(
             return Err(StoreError::NotFound);
         };
         check_certainty(author, certainty, &CertaintyChange::ModifyOther, None, None)?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         t.execute(
             "INSERT INTO blobs (sha256, size, mime, refcount, created_at)
              VALUES (?1, ?2, ?3, 0, ?4) ON CONFLICT (sha256) DO NOTHING",

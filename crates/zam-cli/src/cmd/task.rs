@@ -15,7 +15,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::log::read_text;
-use super::{Ctx, emit, emit_json, post_entry, solution_guid};
+use super::{Ctx, agent_time, emit, emit_json, post_entry, solution_guid};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
 // `k:<id>` / `e:<id>` / `t:<id>` … → голый id (буквы — общий источник `target`)
 use crate::target::bare_entry_id as bare_id;
@@ -54,7 +54,7 @@ fn card(e: &Value) -> String {
         out.push_str(&format!(
             "захвачена: сессия {} до {}{}\n",
             c.get("session").and_then(Value::as_str).unwrap_or("?"),
-            c.get("until").and_then(Value::as_str).unwrap_or("?"),
+            agent_time(c.get("until").and_then(Value::as_str).unwrap_or("?")),
             c.get("agent")
                 .and_then(Value::as_str)
                 .map(|a| format!(" ({a})"))
@@ -67,7 +67,8 @@ fn card(e: &Value) -> String {
         ("owner", "ведёт"),
     ] {
         if let Some(x) = d[k].as_str() {
-            out.push_str(&format!("{label}: {x}\n"));
+            // метки времени — в тексте агенту `yyyy-MM-dd HH:mm:ss` UTC, `owner` — как есть
+            out.push_str(&format!("{label}: {}\n", agent_time(x)));
         }
     }
     if let Some(n) = d["estimate_min"].as_i64() {
@@ -104,7 +105,7 @@ fn explain_claimed(e: CliError) -> CliError {
         msg: format!(
             "задача уже захвачена сессией {} до {}",
             c["session"].as_str().unwrap_or("?"),
-            c["until"].as_str().unwrap_or("?")
+            agent_time(c["until"].as_str().unwrap_or("?"))
         ),
         problem: e.problem,
     }
@@ -244,7 +245,7 @@ pub fn claim(ctx: &Ctx, id: &str, ttl: u32) -> Result<(), CliError> {
     if ctx.json {
         return emit_json(&e);
     }
-    let until = e["data"]["claimed_by"]["until"].as_str().unwrap_or("?");
+    let until = agent_time(e["data"]["claimed_by"]["until"].as_str().unwrap_or("?"));
     emit(format!("{id} захвачена до {until}\n").as_bytes())
 }
 
@@ -290,7 +291,14 @@ mod tests {
         let c = card(&e);
         assert!(c.contains("rev3"), "{c}");
         assert!(
-            c.contains("захвачена: сессия s1 до 2026-10-28T12:00:00.000000Z (claude)"),
+            c.contains("захвачена: сессия s1 до 2026-10-28 12:00:00 (claude)"),
+            "{c}"
+        );
+        assert!(
+            c.contains(
+                "начата: 2026-10-28 10:00:00
+"
+            ),
             "{c}"
         );
         assert!(c.contains("оценка: 90 мин"), "{c}");

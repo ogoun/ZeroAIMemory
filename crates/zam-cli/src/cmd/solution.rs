@@ -6,7 +6,7 @@
 //! Пользователь — по имени (как в списке запросов) или id.
 use serde_json::{Value, json};
 
-use super::{Ctx, emit, emit_json};
+use super::{Ctx, agent_time, emit, emit_json};
 use crate::client::{CliError, EXIT_NOT_FOUND, read_json};
 use crate::target::is_guid;
 
@@ -77,7 +77,7 @@ fn line(m: &Value) -> String {
         m["user_id"].as_str().unwrap_or("?"),
         m["state"].as_str().unwrap_or("?"),
         m["access"].as_str().unwrap_or("?"),
-        m["requested_at"].as_str().unwrap_or("?"),
+        agent_time(m["requested_at"].as_str().unwrap_or("?")),
     )
 }
 

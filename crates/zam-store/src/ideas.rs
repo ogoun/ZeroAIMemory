@@ -971,7 +971,7 @@ pub async fn propose_idea(
                 // вопрос «вернуть», а задача снова живая (рассогласование мимо хуков): вопрос
                 // устаревает «задача возобновлена», ответ — 409 (ревью задачи 7, M6)
                 if status == EntryStatus::Accepted && !task_released(task_state(tx, &d)?) {
-                    let now = fmt_ts(Timestamp::now());
+                    let now = fmt_ts(crate::time::now());
                     revive_task_tx(tx, idea, &attrib, &now)?;
                     return Ok(Ok(Err(q.id)));
                 }
@@ -1015,7 +1015,7 @@ pub async fn propose_idea(
                 }
                 ProposalKind::Reopen => qdata["proposal"] = json!(kind.as_str()),
             }
-            let now_ts = Timestamp::now();
+            let now_ts = crate::time::now();
             let now = fmt_ts(now_ts);
             let q = NewEntry {
                 refs: None,
@@ -1214,7 +1214,7 @@ pub async fn decide_idea(
                 Err(e) => return Ok(Err(e)),
             };
             let open = open_question(tx, &IdeaData::from_stored(&idea.data))?.map(|q| q.id);
-            let now = fmt_ts(Timestamp::now());
+            let now = fmt_ts(crate::time::now());
             let (idea, task) = match apply_decision_tx(tx, &idea, &d, None, &attrib, &now)? {
                 Ok(v) => v,
                 Err(e) => return Ok(Err(e)),
@@ -1256,7 +1256,7 @@ pub async fn adopt_idea(
                 to: "adopt",
             }));
         }
-        let now_ts = Timestamp::now();
+        let now_ts = crate::time::now();
         let now = fmt_ts(now_ts);
         d.origin = IdeaOrigin::Human;
         d.adopted_at = Some(now_ts);

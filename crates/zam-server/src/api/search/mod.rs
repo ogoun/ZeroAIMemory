@@ -1760,7 +1760,7 @@ pub(crate) fn card_tail(
     if let Some(st) = status.filter(|st| !st.is_empty() && *st != "active") {
         parts.push(st.to_string());
     }
-    parts.push(updated.strftime("%Y-%m-%d %H:%M:%S").to_string());
+    parts.push(zam_core::time::agent_ts(&fmt_ts(updated)).unwrap_or_default());
     parts.push(format!("{tokens}t"));
     format!("[{}] {}", score_text(score), parts.join(" · "))
 }
@@ -2536,7 +2536,7 @@ pub async fn search(
             .collect(),
     };
     let weights = st.cfg.search.weights();
-    let (mut ranked, norm_max) = fuse_normed(&inputs, &weights, jiff::Timestamp::now());
+    let (mut ranked, norm_max) = fuse_normed(&inputs, &weights, zam_store::time::now());
     apply_boosts(&mut ranked, &inputs.chunks, &boosts);
     // балл выше 1 после бустов и канала папок: все баллы делятся на лучший (порядок прежний)
     let overflow = rescale_overflow(&mut ranked);
@@ -2753,7 +2753,7 @@ pub async fn search(
     // слабые карточки `brief`/`notes` — вон (M6 §4.2, `search.brief_min_rel`)
     drop_weak(&mut items, mode, min_rel);
     let degraded = available.err().or(vrun.failed);
-    let now = Timestamp::now();
+    let now = zam_store::time::now();
     let by_id: HashMap<Id, Space> = targets
         .iter()
         .flat_map(|t| t.spaces.iter().cloned())
@@ -2863,7 +2863,7 @@ mod tests {
             token_count: count_tokens(text) as i64,
             score: 1.0,
             raw_score: 0.0,
-            updated_at: jiff::Timestamp::now(),
+            updated_at: zam_store::time::now(),
             snippet: format!("{MARK_START}s{MARK_END}"),
             text: text.into(),
             index_state: "indexed".into(),
@@ -2955,7 +2955,7 @@ mod tests {
     /// `file`, `blob_sha256`, `locator`, `locator_text`.
     #[test]
     fn md_card_locator_text() {
-        let now = Timestamp::now();
+        let now = zam_store::time::now();
         let doc = Id::new();
         let mut h = att_hit(doc, "Текст страницы");
         h.chunk_id = "ab".repeat(16);
@@ -3499,7 +3499,7 @@ mod tests {
             owner_id: Id::new(),
             space_id: sp.id,
             name: "x".into(),
-            created_at: jiff::Timestamp::now(),
+            created_at: zam_store::time::now(),
         };
         let targets = vec![mk(None), mk(Some(info))];
         let mut h = Health::new(&targets, vec!["solution access pending".into()]);

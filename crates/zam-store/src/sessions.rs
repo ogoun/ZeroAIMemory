@@ -212,7 +212,7 @@ fn check_touch(s: &SessionTouch) -> Result<(), StoreError> {
 /// Upsert сессии в транзакции записи: `last_seen_at` — сейчас, известные поля дописываются,
 /// `memory_writes` растёт на `writes`.
 fn upsert(t: &rusqlite::Transaction, s: &SessionTouch, writes: i64) -> Result<(), StoreError> {
-    let now = fmt_ts(Timestamp::now());
+    let now = fmt_ts(crate::time::now());
     t.execute(
         "INSERT INTO sessions (id, token_id, solution_guid, area, machine, agent,
                                started_at, last_seen_at, memory_writes, parent_id, agent_type)
@@ -261,7 +261,7 @@ pub async fn add_memory_write(db: &Db, s: &SessionTouch) -> Result<(), StoreErro
 pub async fn end_session(db: &Db, id: &str, ended: bool) -> Result<bool, StoreError> {
     let id = id.to_string();
     db.write(move |t| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let n = t.execute(
             "UPDATE sessions SET ended_at = CASE WHEN ?2 THEN coalesce(ended_at, ?3) END,
                                  last_seen_at = ?3
@@ -460,7 +460,7 @@ pub async fn mark_seen_with_tokens(
     db.write(move |t| {
         upsert(t, &s, 0)?;
         add_tokens_tx(t, &s.id, &counts)?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let mut st = t.prepare_cached(
             "INSERT INTO session_seen (session_id, owner_id, target_kind, target_id, part, rev,
                                        seen_at, epoch)
@@ -583,7 +583,7 @@ pub async fn bump_epoch(db: &Db, session: &str) -> Result<u32, StoreError> {
     check_session_id(session)?;
     let id = session.to_string();
     db.write(move |t| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let epoch: i64 = t.query_row(
             "INSERT INTO sessions (id, started_at, last_seen_at, seen_epoch) VALUES (?1, ?2, ?2, 1)
              ON CONFLICT (id) DO UPDATE SET
@@ -621,7 +621,7 @@ pub async fn set_holdout(db: &Db, session: &str, on: bool) -> Result<(), StoreEr
     check_session_id(session)?;
     let id = session.to_string();
     db.write(move |t| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         t.execute(
             "INSERT INTO sessions (id, started_at, last_seen_at, holdout) VALUES (?1, ?2, ?2, ?3)
              ON CONFLICT (id) DO UPDATE SET

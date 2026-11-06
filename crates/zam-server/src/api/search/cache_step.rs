@@ -153,7 +153,9 @@ pub(super) fn item_json(c: &CacheItem) -> Value {
 /// Markdown элемента шага 0 (§9.3).
 pub(super) fn item_md(c: &CacheItem) -> String {
     let e = &c.hit.entry;
-    let date = e.created_at.strftime("%Y-%m-%d");
+    // дата выжимки UTC `yyyy-MM-dd` (M6 §4.4: текст агенту без `T`/`Z`)
+    let date =
+        zam_core::time::agent_date(&zam_store::time::fmt_ts(e.created_at)).unwrap_or_default();
     let id = cache_ref(e.id);
     let query = md_inline(&e.query);
     if !c.hit.is_valid() {

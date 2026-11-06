@@ -751,7 +751,7 @@ pub async fn detach(
             "UPDATE blobs SET refcount = max(refcount - 1, 0) WHERE sha256 = ?1",
             [&sha],
         )?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let doc: Option<Id> = t
             .query_row(
                 "UPDATE attachment_docs SET deleted_at = ?4
@@ -885,7 +885,7 @@ pub async fn put_extract(
             units,
             warnings,
             ocr,
-            fmt_ts(Timestamp::now()),
+            fmt_ts(crate::time::now()),
             fp
         ])?;
         Ok(true)
@@ -1093,7 +1093,7 @@ fn write_chunks(t: &Connection, att: Id, units: &[Piece]) -> Result<bool, StoreE
             return Ok(false);
         };
         let points = kind != SpaceKind::Human;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         // документ извлечён: `done`, причина прежней неудачи и её задания сняты
         t.prepare_cached(
             "UPDATE attachment_docs
@@ -1280,7 +1280,7 @@ pub async fn put_extract_failure(
             kind,
             units,
             warnings,
-            fmt_ts(Timestamp::now()),
+            fmt_ts(crate::time::now()),
             src,
             fp
         ])?;
@@ -1549,7 +1549,7 @@ pub async fn enqueue_attachment_upserts(db: &Db, ids: Vec<Id>) -> Result<u64, St
         return Ok(0);
     }
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         for id in &ids {
             enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
         }
@@ -1567,7 +1567,7 @@ pub async fn enqueue_attachment_upserts(db: &Db, ids: Vec<Id>) -> Result<u64, St
 /// — задание. Возвращает число поставленных заданий.
 pub async fn reindex_docs(db: &Db, space: Option<Id>) -> Result<u64, StoreError> {
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         // полный reindex — способ повтора разбора (спецификация §2): закэшированные неудачи
         // блобов области снимаются, `failed` (кроме `too_large`) и `unsupported` — снова `pending`
         tx.prepare_cached(&format!(
@@ -1698,7 +1698,7 @@ pub async fn sync_doc_limits(db: &Db, limits: DocLimitsKey) -> Result<u64, Store
             return Ok(0);
         }
         let ids = repend_stale_docs(tx, None, Some(&limits))?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         for id in &ids {
             enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
         }
@@ -1719,7 +1719,7 @@ pub async fn sync_doc_limits(db: &Db, limits: DocLimitsKey) -> Result<u64, Store
 /// `delete`) и дозаполнения миграции 0019. Возвращает их число.
 pub async fn ensure_extract_jobs(db: &Db) -> Result<u64, StoreError> {
     db.write(|tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let ids: Vec<Id> = tx
             .prepare_cached(
                 "SELECT d.id FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
@@ -1758,7 +1758,7 @@ pub async fn has_failed_with(db: &Db, code: &str) -> Result<bool, StoreError> {
 pub async fn requeue_failed_with(db: &Db, code: &str) -> Result<u64, StoreError> {
     let like = format!("{code}%");
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let ids: Vec<Id> = tx
             .prepare_cached(
                 "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
@@ -1819,7 +1819,7 @@ pub async fn rechunk_docs_if_stale(db: &Db) -> Result<u64, StoreError> {
                 )?
                 .query_map([TOO_LARGE], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?;
-            let now = fmt_ts(Timestamp::now());
+            let now = fmt_ts(crate::time::now());
             for (id, live) in &ids {
                 if *live {
                     enqueue_doc(tx, *id, JobOp::Upsert, &now)?;

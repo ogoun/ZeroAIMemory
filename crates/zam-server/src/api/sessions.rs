@@ -285,7 +285,7 @@ async fn claimed_tasks_of(
     own: &Db,
     s: &zam_store::Session,
 ) -> Vec<zam_store::ClaimedTask> {
-    let now = jiff::Timestamp::now();
+    let now = zam_store::time::now();
     let mut dbs: Vec<(Db, Vec<Id>)> = Vec::new();
     match list_spaces(own).await {
         Ok(spaces) => dbs.push((
@@ -385,7 +385,7 @@ pub async fn unattributed(
             "days: от 1 до {UNATTRIBUTED_DAYS_MAX}"
         )));
     }
-    let today = jiff::Timestamp::now()
+    let today = zam_store::time::now()
         .to_zoned(jiff::tz::TimeZone::UTC)
         .date();
     let since = today

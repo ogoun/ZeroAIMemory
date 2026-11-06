@@ -808,7 +808,7 @@ impl Worker {
         };
         let outcome = ReindexOutcome {
             request: req,
-            finished_at: Timestamp::now(),
+            finished_at: zam_store::time::now(),
             result,
         };
         if let Ok(rep) = &outcome.result {
@@ -1233,7 +1233,7 @@ impl Worker {
                     Err(e) => tracing::warn!(user = %user, error = %e, "requeue_running"),
                 }
             }
-            let jobs = match claim_jobs(&db, self.cfg.batch_jobs, Timestamp::now()).await {
+            let jobs = match claim_jobs(&db, self.cfg.batch_jobs, zam_store::time::now()).await {
                 Ok(j) => j,
                 Err(e) => {
                     tracing::warn!(user = %user, error = %e, "выдача заданий");
@@ -1278,7 +1278,7 @@ impl Worker {
     }
 
     async fn fail(&self, db: &Db, j: &Job, err: &str) {
-        match fail_job(db, j.id, j.claim_gen, err, Timestamp::now()).await {
+        match fail_job(db, j.id, j.claim_gen, err, zam_store::time::now()).await {
             Ok(JobOutcome::Failed) if j.op == JobOp::Delete => tracing::warn!(
                 target = %j.target(),
                 error = err,

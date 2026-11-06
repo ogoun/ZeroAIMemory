@@ -618,7 +618,7 @@ pub async fn answer_question(
             if q.kind != EntryKind::Question {
                 return Ok(Err(QuestionError::NotQuestion));
             }
-            let now = fmt_ts(Timestamp::now());
+            let now = fmt_ts(crate::time::now());
             let qd = QuestionData::from_stored(&q.data);
             let Some(idea_id) = qd.idea else {
                 if horizon.is_some() {

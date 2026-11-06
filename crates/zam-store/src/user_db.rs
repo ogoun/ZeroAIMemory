@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use jiff::Timestamp;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
@@ -436,7 +435,7 @@ fn changed_text(changed: &[String]) -> String {
 /// Идемпотентно добавляет недостающие фиксированные пространства.
 async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
     db.write(|tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         for (kind, name) in FIXED {
             tx.execute(
                 "INSERT INTO spaces (id, kind, name, created_at)
@@ -1055,7 +1054,7 @@ pub async fn create_solution(db: &Db, guid: &str, name: &str) -> Result<(Space, 
         tx.execute(
             "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
              VALUES (?1, 'solution', ?2, ?3, ?4)",
-            params![id, guid, name, fmt_ts(Timestamp::now())],
+            params![id, guid, name, fmt_ts(crate::time::now())],
         )?;
         let s = solution_by_guid(tx, &guid)?.ok_or(StoreError::NotFound)?;
         Ok((s, true))
@@ -1094,7 +1093,7 @@ pub async fn create_solution_with_id(
         tx.execute(
             "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
              VALUES (?1, 'solution', ?2, ?3, ?4)",
-            params![space_id, guid, name, fmt_ts(Timestamp::now())],
+            params![space_id, guid, name, fmt_ts(crate::time::now())],
         )?;
         let s = solution_by_guid(tx, guid.as_str())?.ok_or(StoreError::NotFound)?;
         Ok((s, true))
@@ -1161,7 +1160,7 @@ pub async fn rename_solution_guid(
                 e.into()
             }
         })?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let notes: Vec<(Id, i64)> = {
             let mut st = tx.prepare(SPACE_NOTES_PENDING_SQL)?;
             st.query_map([space_id], |r| Ok((r.get(0)?, r.get(1)?)))?

@@ -474,7 +474,7 @@ pub(crate) fn complete_in(
         return Ok(JobOutcome::Stale);
     };
     if dirty {
-        return requeue_dirty(tx, id, &fmt_ts(Timestamp::now()));
+        return requeue_dirty(tx, id, &fmt_ts(crate::time::now()));
     }
     tx.execute("DELETE FROM index_jobs WHERE id = ?1", [id])?;
     if op == JobOp::Upsert && !has_active_target(tx, node)? {
@@ -589,7 +589,7 @@ pub async fn release_job(db: &Db, id: i64, claim_gen: i64) -> Result<JobOutcome,
         }
         tx.execute(
             "UPDATE index_jobs SET state = 'queued', dirty = 0, updated_at = ?2 WHERE id = ?1",
-            params![id, fmt_ts(Timestamp::now())],
+            params![id, fmt_ts(crate::time::now())],
         )?;
         Ok(JobOutcome::Requeued)
     })
@@ -623,7 +623,7 @@ pub(crate) fn give_up_in(
     let Some((target, rev, op, attempts, dirty)) = claimed(tx, id, claim_gen)? else {
         return Ok(JobOutcome::Stale);
     };
-    let stamp = fmt_ts(Timestamp::now());
+    let stamp = fmt_ts(crate::time::now());
     if dirty {
         return requeue_dirty(tx, id, &stamp);
     }
@@ -652,7 +652,7 @@ pub async fn defer_job(
         if claimed(tx, id, claim_gen)?.is_none() {
             return Ok(JobOutcome::Stale);
         }
-        let now = Timestamp::now();
+        let now = crate::time::now();
         let at = now + SignedDuration::try_from(delay).unwrap_or(SignedDuration::from_secs(1));
         tx.execute(
             "UPDATE index_jobs SET state = 'queued', dirty = 0, not_before = ?2, updated_at = ?3
@@ -706,7 +706,7 @@ async fn requeue_running_where(db: &Db, extract: bool) -> Result<u64, StoreError
                 "UPDATE index_jobs AS j SET state = 'queued', dirty = 0, updated_at = ?1
                  WHERE state = 'running' AND {not} ({EXTRACT_JOB})"
             ),
-            [fmt_ts(Timestamp::now())],
+            [fmt_ts(crate::time::now())],
         )?;
         Ok(n as u64)
     })
@@ -1014,7 +1014,7 @@ pub async fn enqueue_upserts(db: &Db, nodes: Vec<Id>) -> Result<u64, StoreError>
         return Ok(0);
     }
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let mut pick = tx.prepare_cached(&format!(
             "UPDATE nodes SET index_state = 'pending'
              WHERE id = ?1 AND EXISTS (SELECT 1 FROM nodes n JOIN spaces s ON s.id = n.space_id

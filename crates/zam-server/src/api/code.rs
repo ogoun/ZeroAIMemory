@@ -48,7 +48,6 @@ use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use jiff::Timestamp;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -468,7 +467,7 @@ fn upload_meta(
         branch: text(branch, "branch")?,
         machine: text(machine, "machine")?,
         user_id,
-        now: Timestamp::now(),
+        now: zam_store::time::now(),
     })
 }
 
@@ -602,7 +601,7 @@ async fn store_rank(rt: Arc<CodeRuntime>, owner: Id, db: Db, guid: String) -> Re
         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     let (inputs, ranked) =
         ranked.map_err(|e| format!("ранжирование прервано (panic = {})", e.is_panic()))?;
-    code_store_ranks(&db, &guid, &inputs, &ranked, Timestamp::now())
+    code_store_ranks(&db, &guid, &inputs, &ranked, zam_store::time::now())
         .await
         .map(|written| written.is_some())
         .map_err(|e| e.to_string())
@@ -727,7 +726,7 @@ fn age_text(secs: i64) -> String {
 }
 
 fn age_s(s: &CodeSnapshot) -> i64 {
-    (Timestamp::now().as_second() - s.updated_at.as_second()).max(0)
+    (zam_store::time::now().as_second() - s.updated_at.as_second()).max(0)
 }
 
 /// Снимок: `ветка@коммит (машина)` — что известно.
@@ -2341,7 +2340,7 @@ mod tests {
             commit: commit.map(str::to_string),
             branch: branch.map(str::to_string),
             machine: Some("box".into()),
-            updated_at: Timestamp::now(),
+            updated_at: zam_store::time::now(),
             files: 2,
             symbols: 5,
             etag: String::new(),

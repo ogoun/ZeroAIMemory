@@ -44,7 +44,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use jiff::Timestamp;
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 use zam_core::Id;
@@ -262,7 +261,7 @@ async fn run(inner: Arc<Inner>, mut stop: watch::Receiver<bool>) {
             if opened.insert(user) {
                 startup(&inner, user, &db).await;
             }
-            let jobs = match claim_extract_jobs(&db, 1, Timestamp::now()).await {
+            let jobs = match claim_extract_jobs(&db, 1, zam_store::time::now()).await {
                 Ok(j) => j,
                 Err(e) => {
                     tracing::warn!(user = %user, error = %e, "выдача заданий извлечения");
@@ -409,13 +408,20 @@ async fn process(inner: &Inner, user: Id, db: &Db, job: Job) {
             match finish_extract(db, job.id, job.claim_gen, att, end).await {
                 Ok(o) => Ok(o),
                 Err(e) => {
-                    fail_job(db, job.id, job.claim_gen, &e.to_string(), Timestamp::now()).await
+                    fail_job(
+                        db,
+                        job.id,
+                        job.claim_gen,
+                        &e.to_string(),
+                        zam_store::time::now(),
+                    )
+                    .await
                 }
             }
         }
         Step::Retry(e) => {
             tracing::debug!(user = %user, attachment = %att, error = %e, "извлечение: повтор");
-            fail_job(db, job.id, job.claim_gen, &e, Timestamp::now()).await
+            fail_job(db, job.id, job.claim_gen, &e, zam_store::time::now()).await
         }
     };
     match outcome {

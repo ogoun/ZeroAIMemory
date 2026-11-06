@@ -210,7 +210,7 @@ mod tests {
             filename: name.into(),
             mime: "image/png".into(),
             size: 1,
-            created_at: jiff::Timestamp::now(),
+            created_at: zam_store::time::now(),
         }
     }
 

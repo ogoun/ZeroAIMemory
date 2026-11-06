@@ -2146,6 +2146,106 @@ five_crashes_break` («процесс остался»). Тесты оценки
 
 ### Задача 6. Дата UTC, замороженные часы
 
+Коммит — `feat(render): дата UTC yyyy-MM-dd HH:mm:ss в тексте агенту, часы для тестов` поверх
+`5fd476d` (sha — в отчёте контролёру). Holdout не открывался.
+
+**Шаг 1. Инвентаризация** (`rg -n 'strftime|%Y-%m-%d|to_rfc3339|Timestamp::now' crates` — 228
+строк; в `src` трёх крейтов — 116 `Timestamp::now()` (7 из них в модулях тестов), 4 `strftime`, `to_rfc3339` нет; дополнительно —
+поиск вывода полей `*_at`/`ts`/`until` в `format!` сервера, MCP и `zam`; плюс тексты сохранённых
+прогонов ТС-1/ТС-2 задач 4–5 (`.tmp/m6/task4/pilot2/*m6*.json`, `.tmp/m6/task5/grid/*b400-r0.4.json`,
+скрипт `.tmp/m6/task6/iso_inv.py`): дата с `T` в тексте агенту там встречается **только в
+содержимом корпуса** (`--to-datetime 2024-…T…` в заметке Kafka), в выдаче самого сервера — нет;
+даты выдачи — хвост карточки (`yyyy-MM-dd HH:mm:ss`, задача 5) и строка `[cache]` (`yyyy-MM-dd`).
+
+| Место | Было | Стало |
+|---|---|---|
+| `api/search/mod.rs` `card_tail` | `strftime("%Y-%m-%d %H:%M:%S")` | `zam_core::time::agent_ts(&fmt_ts(t))` — вывод тот же |
+| `api/search/cache_step.rs` `item_md` (`[cache]`) | `strftime("%Y-%m-%d")` | `agent_date(&fmt_ts(t))` — вывод тот же |
+| `api/recall.rs` «Проверенные команды … (проверено …)» | `verified_at` как есть | без изменений: frontmatter принимает только `YYYY-MM-DD` (`zam-markdown::frontmatter::is_date`) |
+| `api/code.rs` заголовок карты, строка дайджеста («снимок N мин») | возраст от `Timestamp::now()` | возраст от `time::now()`; относительный возраст оставлен (не дата) |
+| `api/code.rs` `/code/status` `updated_at`, `ranked_at` | JSON (`Display` jiff, RFC 3339) | без изменений (JSON) |
+| `/read`, дайджест, пакеты, MCP-рендеры `mcp/tools.rs` | своих дат нет | без изменений |
+| `zam history` (`ts`) | RFC 3339 | `agent_time` |
+| `zam cache list` (`created_at`) | первые 10 символов | `agent_date` (вывод тот же) |
+| `zam cache show` (`created_at`) | RFC 3339 | `agent_time` |
+| `zam code status` (`updated_at`, «синхронизация с этой машины») | RFC 3339 | `agent_time` (2 места) |
+| `zam solution access requests` (`requested_at`) | RFC 3339 | `agent_time` |
+| `zam task show` (`until`, `started_at`, `done_at`), `task claim` («захвачена до»), 409 `task-claimed` | RFC 3339 | `agent_time` (4 места) |
+| «Сейчас» сервера и хранилища | `Timestamp::now()` | `zam_store::time::now()`: zam-store 82, zam-server 23 (+7 в модулях тестов), zam-index 3, `utc_today`; оставлен только журнал службы Windows (`service/windows.rs`, время записи лога) |
+
+Итого изменено мест выдачи: 2 на сервере (поведение то же, общий формат) и 10 в `zam`; источник
+времени — 108 вызовов в рабочем коде.
+
+**Сделано.**
+- `zam-core::time` (без jiff): `agent_ts(&str)`, `agent_date(&str)` — разбор RFC 3339 с долями
+  (отбрасываются, как `%S`), `Z`/`z`, смещением ±HH:MM (пересчёт в UTC через границы суток/года);
+  не RFC 3339 (в том числе голая дата) — `None`.
+- `zam-store::time::now()` — единый источник; `freeze_now(t) -> FreezeGuard` (фича `test-hooks`):
+  момент — `AtomicI64` микросекунд; guard держит запись `GATE` (`test_hooks.rs`) до drop,
+  ожидание — синхронное парковкой потока (`blocking_*` tokio паникуют в `#[tokio::test]`); при drop
+  часы снимаются раньше блокировки.
+- `zam-cli::cmd::agent_time` — `agent_ts` или строка как есть; `--json` не меняется.
+- WebUI: `web/src/lib/time.ts` `localTime(iso, opts?)` — единственный перевод в локальное время;
+  `journals.fmtTime` и локальные `fmtTime` (`DocView`, `History`, `Tree`, `IndexStatus`) — через
+  неё, вид прежний. Тест — `web/test/time.test.ts` (вне `src/`: у `svelte-check` нет `@types/node`),
+  подключён к `npm run test:build`.
+
+**Тесты.** RED → GREEN:
+- `zam-core` `time::tests::agent_ts_cases` (RED: заглушка `None`);
+- `zam-store` `time::freeze_tests::freeze_now_applies` (`--features test-hooks`, RED:
+  `unimplemented!`); сверх брифа — `agent_ts_matches_jiff` (20 000 моментов 1999–2061, сверка с
+  `strftime` jiff; прошёл сразу — оракул согласованности, а не RED);
+- `zam-server --test agent_dates`: `markdown_has_no_iso_t` (MCP как ТС-1: `memory_search` ×3,
+  `memory_read`, `memory_tree`, `memory_code` map/symbol, `memory_recall` recovery/brief,
+  `memory_vault`; хуки как ТС-2: `/recall` session_start, prompt, post_tool, recovery, brief —
+  нет `\d{4}-\d{2}-\d{2}T`, дата карточки и `[cache]` — по замороженным часам), `json_dates_unchanged`,
+  `utc_storage_audit` (все TEXT `*_at` и `ts` всех `.db` каталога данных — RFC 3339 с `Z`, кроме
+  `verified_at`), `freeze_now_applies` (RED: запись получала настоящее время);
+  `utc_storage_audit` прошёл сразу — нарушений хранения не найдено (аудит, а не правка);
+- `zam-cli`: `--test agent_dates` `markdown_has_no_iso_t` (`history`, `cache list|show`,
+  `task claim|status|show`; `--json` — RFC 3339; RED: `history` печатал `…T…Z`), юнит-тесты
+  `history::render_lines`, `task::lines_and_card` обновлены под новый вид (RED).
+
+**Эталоны eval.** `idea_hints_m57.json` и `cache_echo_m57.json` дат не содержат (`cache_echo` —
+JSON с метками `<time>`); вид строк карточек и `[cache]` не изменился — переснимать нечего,
+сравнений с нормализацией не добавлено. Тексты ТС-1/ТС-2 (решающая величина токенов) не меняются:
+выдача сервера побайтово прежняя, кроме возраста карты кода, который и раньше зависел от часов.
+
+**Отклонения от плана и брифа.**
+- Тесты сервера — в новом файле `tests/agent_dates.rs`, а не в `render.rs`: часы общие для
+  процесса, и замороженное время в одном тесте ломало бы сроки (сессии WebUI, аренды) параллельных
+  тестов того же двоичного файла; в `agent_dates.rs` часы замораживают все тесты (идут по очереди
+  через `GATE`). То же правило — для будущих `freeze_now` (8a, 9, 17): в отдельном файле или с
+  моментом, близким к настоящему.
+- `localTime(iso, opts?)` — второй необязательный аргумент (стиль, пояс): у страниц WebUI разные
+  стили, а тест проверяет пересчёт в явном поясе.
+- Строка `[cache]` оставлена датой `yyyy-MM-dd` (`agent_date`), как сказано в «Передать → 6»
+  задачи 5; время до секунд там лишнее (+~6 токенов на строку ТС-1 без пользы).
+- Код карты: относительный возраст («снимок 3 мин») не заменён датой — это возраст, а не дата;
+  детерминизм — через `freeze_now`.
+
+**Проверки** (каталог `target/r1-t6a`, `ZAM_REQUIRE_ML=1`, `ZAM_TEST_MODELS_DIR=.tmp/ci-models`;
+логи — `.tmp/m6/task6/t-*.log`): `cargo fmt --all -- --check` — чисто; `cargo clippy --workspace
+--all-targets -- -D warnings` — чисто; `zam-core`, `zam-store`, `zam-index` — все 41 цель PASS;
+`zam-store --features test-hooks --lib` — PASS; `zam-server` — все 72 цели PASS (983 теста, в том
+числе `render`, `search`, `recall`, `agent_dates`); `zam-cli` — 24 из 27 целей PASS, упали
+`hooks::post_tool_failure_error_regex_hint` (пустой вывод хука — бюджет под параллельной сборкой),
+`m56_acceptance::acceptance_symbol_staleness_via_hook` (известная нестабильность, журнал M5.6) и
+`m57_acceptance::acceptance_recall_p95_with_50_ideas` (тайминг p95) — повтором все три PASS. WebUI:
+`npm run check` — 0 ошибок, `npm run build`, `npm run size` — в пределах, `npm run test:build` —
+9/9.
+
+Передать:
+- **→ 8a/9/17:** `freeze_now` — в отдельном тестовом файле (см. отклонения); пример —
+  `crates/zam-server/tests/agent_dates.rs`.
+- **→ 8b:** `zam sessions` — время через `zam_cli::cmd::agent_time`; страница сессий WebUI — через
+  `localTime`.
+- **→ 13a CHANGELOG** «Изменения ответа»: текстовый вывод `zam` (`history`, `cache show`, `code
+  status`, `solution access requests`, `task show|claim`) — время UTC `yyyy-MM-dd HH:mm:ss` вместо
+  RFC 3339; `--json` и JSON API без изменений.
+- Данные записей (`data` задач в диффе `since_rev`, тела заметок) — содержимое, а не выдача
+  сервера: метки RFC 3339 внутри них не переписываются.
+
 ### Задача 7a. Эпохи и «уже выдавалось»
 
 ### Задача 7b. Явный фокус

@@ -20,7 +20,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::{
@@ -923,7 +922,7 @@ pub(crate) async fn backfill_certainty(db: &Db) -> Result<u64, StoreError> {
         let cursor = after;
         let (n, found, demoted, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, i64, String)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT n.id, n.current_rev, r.author_kind
@@ -1080,7 +1079,7 @@ pub(crate) async fn rescan_secrets(db: &Db, priority: i64) -> Result<u64, StoreE
         let cursor = after;
         let (n, found, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, i64, String, Option<String>)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT id, current_rev, index_state, l0 FROM nodes
@@ -1161,7 +1160,7 @@ pub(crate) async fn rechunk_notes(
         let cursor = after;
         let (n, u, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, i64, String, SpaceKind)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT n.id, n.current_rev, n.index_state, s.kind

@@ -2,7 +2,6 @@
 //! (`entry_revisions`), чанки, FTS и задание outbox фиксируются вместе или не фиксируются
 //! вовсе (§8.1 ТЗ). Ничего не удаляется: удаление мягкое, замещение и отзыв — смена статуса.
 
-use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::{Id, TargetKind, TargetRef};
 
@@ -644,7 +643,7 @@ pub async fn create_entry(
         {
             return same_request(tx, ex, &e).map(|ex| (ex, false));
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let id = insert_entry(tx, e, key, &a, None, &now)?;
         Ok((load_entry(tx, id)?, true))
     })
@@ -668,7 +667,7 @@ pub async fn update_entry(
 ) -> Result<Entry, StoreError> {
     let a = a.clone();
     db.write(move |tx| {
-        let now_ts = Timestamp::now();
+        let now_ts = crate::time::now();
         let cur = live_entry(tx, id)?;
         ensure_not_report(&cur)?;
         // конфликт ревизии — раньше прав (§7.5, §11.3)
@@ -910,7 +909,7 @@ pub async fn delete_entry(
         let cur = live_entry(tx, id)?;
         check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, a.author_kind)?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         tx.execute(
             "UPDATE entries SET deleted_at = ?2 WHERE id = ?1",
             params![id, now],
@@ -952,7 +951,7 @@ pub async fn restore_entry(
             let (title, td) = check_term(&cur.title, &cur.data).map_err(bad)?;
             ensure_names_free(tx, cur.space_id, &title, &td, Some(cur.id))?;
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         tx.execute(
             "UPDATE entries SET deleted_at = NULL,
                                 index_state = CASE WHEN index_state = 'excluded' THEN 'excluded'
@@ -1017,7 +1016,7 @@ pub async fn supersede_entry(
                 s.as_str()
             )));
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         // без `refs` новая запись наследует ссылки на файлы замещаемой (M4.5 §6.1) — вместе с
         // решением и состоянием ссылок
         let inherit = new.refs.is_none();
@@ -1066,7 +1065,7 @@ pub async fn retract_entry(
         if cur.status == Some(EntryStatus::Retracted) {
             return Err(StoreError::Conflict("запись уже отозвана".into()));
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         tx.execute(
             "UPDATE entries SET retract_reason = ?2 WHERE id = ?1",
             params![id, reason],

@@ -154,7 +154,7 @@ pub async fn create_report(
             }
             return same_request(tx, ex, &new).map(|ex| (ex, false));
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let id = insert_entry(tx, new, key, &a, None, &now)?;
         for f in &files {
             let size = i64::try_from(f.size).map_err(|_| bad("размер файла"))?;

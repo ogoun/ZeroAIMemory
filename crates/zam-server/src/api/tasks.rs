@@ -18,7 +18,6 @@ use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
-use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_store::{
@@ -116,7 +115,7 @@ pub async fn claim(
         session,
         req.agent.as_deref(),
         ttl,
-        Timestamp::now(),
+        zam_store::time::now(),
     )
     .await?;
     let mut details = audit_details(sc.space.id, EntryKind::Task);

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { localTime } from '../lib/time';
   // Страница «Индекс» (#/admin/index): состояние векторного индекса по GET /index/status
   // (обновление раз в 5 с, пока страница открыта и вкладка видна; при возвращении на
   // вкладку — сразу), причина деградации с действием (тексты — с сервера),
@@ -38,11 +39,8 @@
 
   const userName = (id: string) => users.find((u) => u.id === id)?.name ?? id;
 
-  const fmtTime = (ts: string | null | undefined) => {
-    if (!ts) return '—';
-    const d = new Date(ts);
-    return Number.isNaN(d.getTime()) ? ts : d.toLocaleString('ru-RU');
-  };
+  const fmtTime = (ts: string | null | undefined) =>
+    ts ? localTime(ts, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) : '—';
 
   const fmtBytes = (n: number | null) => (n === null ? '—' : `${(n / 1048576).toFixed(0)} МБ`);
   const num = (n: number | null | undefined) => (n === null || n === undefined ? '—' : n.toLocaleString('ru-RU'));

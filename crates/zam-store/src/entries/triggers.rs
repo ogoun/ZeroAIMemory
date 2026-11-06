@@ -289,7 +289,7 @@ pub async fn set_triggers(
             ));
         }
         super::write::ensure_editable(&e)?;
-        replace_triggers(tx, entry, &ts, &fmt_ts(Timestamp::now()))
+        replace_triggers(tx, entry, &ts, &fmt_ts(crate::time::now()))
     })
     .await
 }

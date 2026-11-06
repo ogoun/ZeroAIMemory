@@ -17,7 +17,6 @@
 use std::collections::HashMap;
 
 use half::f16;
-use jiff::Timestamp;
 use rusqlite::params;
 use zam_core::Id;
 
@@ -148,7 +147,7 @@ async fn put(
     }
     let model_id = model_id.to_string();
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let mut st = tx.prepare_cached(
             "INSERT OR REPLACE INTO embeddings (text_hash, model_id, dense, sparse, created_at,
                                                 owner)

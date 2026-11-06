@@ -181,7 +181,7 @@ fn register_in(
         return Err(StoreError::NotFound);
     }
     // время — с точностью хранения (микросекунды): возврат равен последующему чтению
-    let now = fmt_ts(Timestamp::now());
+    let now = fmt_ts(crate::time::now());
     let info = SolutionInfo {
         guid: guid.clone(),
         owner_id: owner,
@@ -249,7 +249,7 @@ fn request_in(
     tx.execute(
         "INSERT INTO solution_access (guid, user_id, access, state, requested_at, token_id)
          VALUES (?1, ?2, ?3, 'pending', ?4, ?5)",
-        params![guid, user, access, fmt_ts(Timestamp::now()), token],
+        params![guid, user, access, fmt_ts(crate::time::now()), token],
     )?;
     let actor = token.map_or_else(|| "system".to_string(), |t| t.to_string());
     audit_tx(
@@ -408,7 +408,7 @@ impl SystemStore {
             .write(move |tx| {
                 solution_in(tx, &guid)?.ok_or(StoreError::NotFound)?;
                 let (from, _) = access_in(tx, &guid, user)?.ok_or(StoreError::NotFound)?;
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let (action, details) = match &d {
                     AccessDecision::Approve(a) => {
                         tx.execute(
@@ -472,7 +472,7 @@ impl SystemStore {
                     "UPDATE solution_access SET state = 'revoked',
                          decided_at = ?3, decided_by = ?4, reason = NULL
                      WHERE guid = ?1 AND user_id = ?2",
-                    params![guid, user, fmt_ts(Timestamp::now()), by],
+                    params![guid, user, fmt_ts(crate::time::now()), by],
                 )?;
                 audit_tx(
                     tx,

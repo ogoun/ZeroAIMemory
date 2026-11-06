@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { localTime } from '../lib/time';
   // История ревизий заметки: список (новые сверху), дифф двух выбранных ревизий,
   // откат к выбранной (новая ревизия с её текстом, с подтверждением).
   import { untrack } from 'svelte';
@@ -100,10 +101,7 @@
     };
   }
 
-  const fmtTime = (ts: string) => {
-    const d = new Date(ts);
-    return Number.isNaN(d.getTime()) ? ts : d.toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'medium' });
-  };
+  const fmtTime = (ts: string) => localTime(ts, { dateStyle: 'medium', timeStyle: 'medium' });
   const short = (s: string) => (s.length > 10 ? `${s.slice(0, 8)}…` : s);
   let lo = $derived(pickA !== null && pickB !== null ? Math.min(pickA, pickB) : null);
   let hi = $derived(pickA !== null && pickB !== null ? Math.max(pickA, pickB) : null);

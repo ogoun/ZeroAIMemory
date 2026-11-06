@@ -383,7 +383,7 @@ pub async fn vault_put(
     let (kind, guid) = (scope.as_str(), scope.guid().map(str::to_string));
     let a = a.clone();
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let r = tx
             .prepare_cached(
                 "INSERT INTO vault_items (id, scope, agent_solution_id, title, data, secret,
@@ -452,7 +452,7 @@ pub async fn vault_update(
         };
         let secret = secret_blob;
         let rev = cur.rev + 1;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let r = tx
             .prepare_cached(
                 "UPDATE vault_items SET title = ?2, data = ?3, secret = ?4, current_rev = ?5,
@@ -476,7 +476,7 @@ pub async fn vault_update(
 /// Кто удалил — в аудите сервера (`vault.delete`): в схеме Vault столбцов для этого нет.
 pub async fn vault_delete(db: &Db, id: Id, _a: &Attribution) -> Result<(), StoreError> {
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let n = tx.execute(
             "UPDATE vault_items SET deleted_at = ?2, updated_at = ?2
              WHERE id = ?1 AND deleted_at IS NULL",
@@ -569,7 +569,7 @@ impl SystemStore {
                 tx.execute(
                     "INSERT INTO user_keys (user_id, wrapped, created_at) VALUES (?1, ?2, ?3)
                      ON CONFLICT(user_id) DO NOTHING",
-                    params![user, wrapped, fmt_ts(Timestamp::now())],
+                    params![user, wrapped, fmt_ts(crate::time::now())],
                 )?;
                 Ok(tx.query_row(
                     "SELECT wrapped FROM user_keys WHERE user_id = ?1",
