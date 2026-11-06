@@ -3521,16 +3521,28 @@ fn checkpoint_precompact_new_epoch_in_hook_budget() {
     // `n` вызовов `PreCompact` сессии `s`: эпоха растёт на число дошедших — от `ok` до
     // `ok + net` (срок запроса мог истечь после того, как сервер её начал); промах бюджета
     // отладочной сборки на занятом HDD (старт процесса дольше 70 мс) — поведение продукта
+    // не меньше `n` вызовов, и пока ни один не дошёл без промаха — ещё, всего до 5: эпоха
+    // обязана начаться хотя бы одним подтверждённым запросом (повторное ревью 7a, I-B)
     let run = |s: &str, n: usize| -> (usize, EpochMisses) {
         let before = EpochMisses::of(&p.log());
-        for _ in 0..n {
+        let mut calls = 0;
+        loop {
             let (o, d) = p.hook_at(&url, "checkpoint", "claude", pc(&p, s).as_bytes());
             empty(&o);
             assert!(d <= max_for("checkpoint"), "checkpoint {d:?}");
+            calls += 1;
+            let m = EpochMisses::of(&p.log()).since(before);
+            assert_eq!(m.http, 0, "ответ сервера с ошибкой: {}", p.log());
+            let ok = calls - m.budget - m.net;
+            if (calls >= n && ok >= 1) || calls >= 5 {
+                assert!(
+                    ok >= 1,
+                    "ни одного дошедшего запроса из {calls}: {}",
+                    p.log()
+                );
+                return (ok, m);
+            }
         }
-        let m = EpochMisses::of(&p.log()).since(before);
-        assert_eq!(m.http, 0, "ответ сервера с ошибкой: {}", p.log());
-        (n - m.budget - m.net, m)
     };
     let in_range = |s: &str, from: usize, m: EpochMisses| {
         let e = p.session(s)["seen_epoch"].as_u64().unwrap() as usize;
@@ -3543,8 +3555,7 @@ fn checkpoint_precompact_new_epoch_in_hook_budget() {
     };
     // без `SessionStart`: сессия создаётся (каждый дошедший вызов — +1 от 0)
     let (ok, m) = run("pe-0", 3);
-    assert!(ok + m.net >= 1, "все вызовы — промах бюджета: {}", p.log());
-    in_range("pe-0", ok, m);
+    assert!(in_range("pe-0", ok, m) >= ok);
     // сессия есть (регистрация, как у `session-start`): каждый `PreCompact` — +1
     let r = http()
         .post(&format!("{url}/api/v1/sessions"))
@@ -3555,8 +3566,8 @@ fn checkpoint_precompact_new_epoch_in_hook_budget() {
     assert_eq!(r.status(), 201);
     assert_eq!(p.session("pe-1")["seen_epoch"], 0);
     let (ok, m) = run("pe-1", 3);
-    assert!(ok + m.net >= 1, "все вызовы — промах бюджета: {}", p.log());
     let e = in_range("pe-1", ok, m);
+    assert!(e >= ok && ok >= 1, "эпоха {e}, дошло {ok}");
     // `Stop` эпоху не меняет
     let st = p.ev("Stop", "pe-1", json!({"stop_hook_active": false}));
     empty(&p.hook("checkpoint", &st));

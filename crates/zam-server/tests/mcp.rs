@@ -3604,3 +3604,96 @@ async fn mcp_seen_cache_section_source_only_that_section() {
         assert!(l.ends_with("(выдавалось)") && frag, "{l}: {}", o.text);
     }
 }
+
+/// Повторное ревью задачи 7a (I-A): источник-секция покрывает карточку, только если её чанк
+/// целиком лежит в секции. Карточки `n:<id>` с секцией `sec` в пути: `(пометка в конце, есть
+/// ли фрагмент)`.
+fn section_cards(text: &str, id: &str, sec: &str) -> Vec<(String, bool)> {
+    let lines: Vec<&str> = text.lines().collect();
+    (0..lines.len())
+        .filter(|&k| lines[k].contains(&format!("n:{id}")) && lines[k].contains(sec))
+        .map(|k| {
+            let frag = lines.get(k + 1).is_some_and(|l| l.starts_with("   "));
+            (lines[k].to_string(), frag)
+        })
+        .collect()
+}
+
+/// Заметка `path` с текстом `text`: прочитана целиком, выжимка по секции `sec`, поиск
+/// «квазар»; текст ответа MCP и id узла.
+async fn cache_section_search(name: &str, text: &str, sec: &str) -> (String, String) {
+    let a = api(name, |_| {}).await;
+    let n = a.note("knowledge", "Астро/Секции", text).await;
+    let id = n["id"].as_str().unwrap().to_string();
+    let h = sess();
+    read_and_cache(
+        &a,
+        &h,
+        "квазар",
+        json!([{"id": format!("n:{id}"), "rev": 1, "section": sec}]),
+    )
+    .await;
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар"}),
+    )
+    .await;
+    assert!(o.text.contains("все актуальны"), "{}", o.text);
+    (o.text, id)
+}
+
+/// Короткая секция «A > B» склеена чанкером со следующей «A > C» (путь склейки — первой):
+/// источник «A > B» карточку склеенного чанка не покрывает — `(выдавалось)` с фрагментом.
+#[tokio::test]
+async fn mcp_cache_section_merged_chunk_keeps_fragment() {
+    let (text, id) = cache_section_search(
+        "mcp-cache-merged",
+        "# A\n\n## B\nКвазар светит.\n\n## C\nКвазар гаснет.\n",
+        "A > B",
+    )
+    .await;
+    let cards = section_cards(&text, &id, "› A > B");
+    assert!(!cards.is_empty(), "нет карточки «A > B»: {text}");
+    for (l, frag) in cards {
+        assert!(l.ends_with("(выдавалось)") && frag, "{l}: {text}");
+    }
+    assert!(
+        text.contains("гаснет"),
+        "текст соседней секции — во фрагменте: {text}"
+    );
+}
+
+/// Вложенность: источник «Квазар» (H1 со всеми подсекциями) покрывает карточки «Квазар >
+/// Яркость» и «Квазар > Расстояние».
+#[tokio::test]
+async fn mcp_cache_parent_section_covers_nested() {
+    let (text, id) = cache_section_search("mcp-cache-nested", &section_note(), "Квазар").await;
+    let cards = section_cards(&text, &id, "› Квазар > ");
+    assert!(cards.len() >= 2, "{text}");
+    for (l, frag) in cards {
+        assert!(l.ends_with(IN_CACHE) && !frag, "{l}: {text}");
+    }
+}
+
+/// Лист с путём H4 (`heading_path_h4`): короткая H3 «C» с подзаголовком H4 «D» склеена со
+/// следующей H3 «F», путь листа — «A > B > C > D». Источник-секция — только H1–H3 (H4 как
+/// источник — 422), поэтому источник — «A > B > C»: проверка по префиксу пути покрывала лист,
+/// хотя в нём текст «F»; карточка сохраняет фрагмент.
+#[tokio::test]
+async fn mcp_cache_h4_leaf_spanning_next_keeps_fragment() {
+    let (text, id) = cache_section_search(
+        "mcp-cache-h4",
+        "# A\n\n## B\n\n### C\n\n#### D\nКвазар светит.\n\n### F\nКвазар гаснет.\n",
+        "A > B > C",
+    )
+    .await;
+    let cards = section_cards(&text, &id, &format!("n:{id}"));
+    assert!(!cards.is_empty(), "{text}");
+    for (l, frag) in cards {
+        assert!(!l.ends_with(IN_CACHE) && frag, "{l}: {text}");
+    }
+    assert!(text.contains("гаснет"), "{text}");
+}

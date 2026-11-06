@@ -28,11 +28,12 @@
 //!   помечает выданное (`seen: true`, в md — `(выдавалось)`), но оставляет фрагмент и текст:
 //!   субагенты на общем подключении MCP приходят с сессией родителя. Выданным считается только
 //!   отмеченное в текущей эпохе сессии (M6 §7.2): после сжатия контекста — снова фрагмент.
-//!   Исключение (решение контролёра 2026-11-06, §7.1): карточка `(выдавалось)`, чья цель — источник
-//!   действующей выжимки шага 0 **этого же** ответа (та же цель и ревизия; у источника-секции —
-//!   только карточки этой секции и вложенных в неё), идёт без фрагмента и текста с пометкой
-//!   `(выдавалось, в выжимке)`, в JSON — `seen: true`, `in_cache: true` ([`mark_cache_sources`]):
-//!   текст источника уже в ответе; у `[cache, stale: …]` фрагмент остаётся;
+//!   Исключение (решение контролёра 2026-11-06, §7.1): карточка `(выдавалось)`, чья цель —
+//!   источник действующей выжимки шага 0 **этого же** ответа (та же цель и ревизия; у
+//!   источника-секции — только карточки, чей чанк целиком лежит в тексте секции), идёт без
+//!   фрагмента и текста с пометкой `(выдавалось, в выжимке)`, в JSON — `seen: true`,
+//!   `in_cache: true` ([`mark_cache_sources`]): текст источника уже в ответе; у `[cache, stale:
+//!   …]` фрагмент остаётся;
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release`, `attachment`
 //!   (фрагменты вложений, M5; см. «Вложения») — по умолчанию все, `folder` — карточки папок
 //!   (см. «Папки»); `filters.status` — статусы insight (по умолчанию `active`,
@@ -2225,23 +2226,52 @@ async fn mark_seen_items(
 
 /// Карточки `(выдавалось)` (MCP, `seen_kept`), чья цель — источник действующей выжимки шага 0
 /// этого ответа (`cache`), — без фрагмента и текста, `in_cache` (M6 §7.1, решение контролёра
-/// 2026-11-06): цель и ревизия совпадают с источником точно; источник-секция покрывает только
-/// карточки своей секции и вложенных в неё (`heading_path` — она же или начинается с `<секция> > `).
-fn mark_cache_sources(cache: &[cache_step::CacheItem], items: &mut [Item]) {
+/// 2026-11-06). Цель и ревизия совпадают с источником точно. Источник-секция покрывает карточку,
+/// только если текст её чанка **целиком** лежит в тексте секции ([`zam_store::section_text`]
+/// ревизии карточки): чанкер склеивает короткие секции со следующей и даёт склейке путь первой
+/// (а лист H4 — путь первой H4), поэтому `heading_path` не доказывает, что в чанке нет текста
+/// соседней секции (повторное ревью задачи 7a, I-A). Сбой чтения текста или любой промах —
+/// фрагмент остаётся.
+async fn mark_cache_sources(
+    targets: &[SearchTarget],
+    cache: &[cache_step::CacheItem],
+    items: &mut [Item],
+) {
     let deps: Vec<&zam_store::CacheDep> = cache.iter().flat_map(|c| c.valid_sources()).collect();
     if deps.is_empty() {
         return;
     }
-    let covers = |d: &zam_store::CacheDep, it: &Item| {
-        d.target == it.hit.target
-            && d.rev == it.hit.rev
-            && d.section.as_deref().is_none_or(|sec| {
-                let hp = it.hit.heading_path.as_str();
-                hp == sec || hp.strip_prefix(sec).is_some_and(|r| r.starts_with(" > "))
-            })
-    };
+    // текст ревизии узла — один раз на (база, узел, ревизия)
+    let mut texts: HashMap<(usize, Id, i64), Option<String>> = HashMap::new();
     for it in items.iter_mut().filter(|it| it.seen && it.seen_kept) {
-        if deps.iter().any(|d| covers(d, it)) {
+        let mut covered = false;
+        for d in deps
+            .iter()
+            .filter(|d| d.target == it.hit.target && d.rev == it.hit.rev)
+        {
+            let Some(sec) = d.section.as_deref() else {
+                covered = true;
+                break;
+            };
+            if it.hit.target.kind != TargetKind::Node {
+                continue;
+            }
+            let key = (it.target, it.hit.target.id, it.hit.rev);
+            if let std::collections::hash_map::Entry::Vacant(v) = texts.entry(key) {
+                let db = &targets[it.target].db;
+                let r = node_content(db, it.hit.target.id, Some(it.hit.rev)).await;
+                v.insert(r.ok().map(|(_, t)| t));
+            }
+            let inside = texts[&key]
+                .as_deref()
+                .and_then(|t| zam_store::section_text(t, sec))
+                .is_some_and(|st| !it.hit.text.is_empty() && st.contains(it.hit.text.as_str()));
+            if inside {
+                covered = true;
+                break;
+            }
+        }
+        if covered {
             it.seen_kept = false;
             it.in_cache = true;
             it.text = None;
@@ -2789,7 +2819,7 @@ pub async fn search(
         session_failed("чтение выданного", &e);
     }
     // источник выжимки этого ответа — без фрагмента (M6 §7.1, решение контролёра 2026-11-06)
-    mark_cache_sources(&cache_items, &mut items);
+    mark_cache_sources(&targets, &cache_items, &mut items).await;
     // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется
     attach_stale_refs(&targets, &mut items).await;
     // лист с секретом в имени — номером, как в `/read` (задача 7 M5, раунд правок 2)
