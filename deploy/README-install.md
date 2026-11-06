@@ -1,9 +1,11 @@
 # ZeroAIMemory: установка
 
 Комплект содержит сервер `zam-server`, клиент `zam`, библиотеки ONNX Runtime и pdfium,
-Qdrant (`qdrant/<версия>/`), пример конфигурации `config.example.toml`, копии манифестов
-`deploy/` (что и откуда скачивают `qdrant fetch`, `models fetch` и `cuda fetch`; в
-`zam-server` они встроены) и лицензии (`LICENSES/`). Поддерживаются Windows x64 и Linux x64.
+Qdrant (`qdrant/<версия>/`), токенизатор bge-m3 (`tokenizers/bge-m3-int8/tokenizer.json`, 17 МБ;
+лицензия MIT — `LICENSES/BGE-M3-TOKENIZER-LICENSE-MIT.txt`), пример конфигурации
+`config.example.toml`, копии манифестов `deploy/` (что и откуда скачивают `qdrant fetch`,
+`models fetch` и `cuda fetch`; в `zam-server` они встроены) и лицензии (`LICENSES/`).
+Поддерживаются Windows x64 и Linux x64.
 
 | Архив релиза | Что внутри |
 |---|---|
@@ -641,6 +643,13 @@ zam-server qdrant reset --yes --config config.toml   # стереть храни
 Векторный поиск работает на встроенных ONNX-моделях (§8.4 ТЗ). Без моделей сервер стартует
 в режиме полнотекстового поиска (FTS-only): `degraded: true` в ответах поиска, причина и
 подсказка — в журнале.
+
+Размеры и бюджеты ответов агенту (`budget_tokens`, `~N tok`) считаются в токенах bge-m3. Счётчик
+берётся по порядку: токенизатор установленной модели; без модели — `tokenizer.json` из
+`tokenizers/` комплекта; без него — оценка с запасом (бюджет соблюдается, ответ на ~15 %
+короче). Активный счётчик — поле `token_counter` в `GET /api/v1/health` (`model`, `bundled`,
+`estimate`). Нарезку заметок без модели токенизатор комплекта не меняет: она считается оценкой и
+перенарезается после установки модели.
 
 | Модель | Назначение | Устройство | Лицензия | Размер |
 |---|---|---|---|---|

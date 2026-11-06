@@ -1108,7 +1108,7 @@ fn pack(fetched: Vec<Result<Fetched, (String, Fail)>>, budget: usize) -> (Vec<Pi
         let mut kept: &str = &text;
         // часть текста не прочитана (бюджет) — элемент уже обрезан
         let mut cut = f.omitted > 0;
-        if let Some(m) = f.max_tokens
+        if let Some(m) = f.max_tokens.map(zam_store::budget_cap)
             && full > m
         {
             kept = truncate_to_tokens(kept, m, &count_tokens);
@@ -1390,7 +1390,8 @@ pub async fn read(
         );
     }
     fill_stale_refs(&mut fetched).await?;
-    let (pieces, total) = pack(fetched, budget);
+    // упаковка суммами частей — против `budget_cap` (M6 §4.2: без модели — с запасом оценки)
+    let (pieces, total) = pack(fetched, zam_store::budget_cap(budget));
 
     if let Some(s) = &session {
         let given: Vec<SeenItem> = pieces

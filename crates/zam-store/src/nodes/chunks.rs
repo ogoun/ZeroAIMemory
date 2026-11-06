@@ -24,7 +24,7 @@ use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::{
-    ApproxCounter, ChunkLevel, ChunkParams, Doc, TokenCounter, UpperCounter, chunk_note,
+    ApproxCounter, ChunkLevel, ChunkParams, Doc, EstimateCounter, TokenCounter, chunk_note,
     first_paragraph, mask_secrets, mask_text, parse, scan_secrets,
 };
 
@@ -280,22 +280,88 @@ pub fn token_counter_exact() -> bool {
     token_counter().is_exact()
 }
 
-/// Число токенов `text` для бюджетов выдачи: токенизатор модели, без неё (или при откате
-/// токенизатора на оценку) — оценка сверху [`UpperCounter`] (M6, задача 5): прежняя оценка
-/// чанкера `ApproxCounter` на выдаче занижала ~15 %, и бюджеты не соблюдались. Чанкер
-/// по-прежнему режет своим счётчиком ([`token_counter`]).
-pub fn count_tokens(text: &str) -> usize {
+static BUNDLED_COUNTER: OnceLock<RwLock<Option<Arc<dyn TokenCounter>>>> = OnceLock::new();
+
+fn bundled_cell() -> &'static RwLock<Option<Arc<dyn TokenCounter>>> {
+    BUNDLED_COUNTER.get_or_init(|| RwLock::new(None))
+}
+
+/// Ставит точный счётчик **выдачи** без модели — `tokenizer.json` из комплекта сервера (M6,
+/// задача 5, решение владельца 2026-11-06). Чанкер его не использует: без модели он режет
+/// [`ApproxCounter`], как требует сопоставимость индекса ([`set_token_counter`]).
+pub fn set_bundled_counter(tc: Arc<dyn TokenCounter>) {
+    *bundled_cell().write().unwrap_or_else(|e| e.into_inner()) = Some(tc);
+}
+
+/// Какой счётчик считает размеры и бюджеты выдачи ([`budget_counter_kind`], `/health`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetCounterKind {
+    /// Токенизатор установленной модели (тот же, что у чанкера).
+    Model,
+    /// `tokenizer.json` комплекта сервера ([`set_bundled_counter`]).
+    Bundled,
+    /// Несмещённая оценка [`EstimateCounter`] с запасом бюджета `fits`.
+    Estimate,
+}
+
+impl BudgetCounterKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetCounterKind::Model => "model",
+            BudgetCounterKind::Bundled => "bundled",
+            BudgetCounterKind::Estimate => "estimate",
+        }
+    }
+}
+
+/// Счётчик размеров и бюджетов выдачи и его вид, по порядку (M6, задача 5): токенизатор модели
+/// (точный счётчик чанкера); иначе `tokenizer.json` комплекта ([`set_bundled_counter`]); иначе
+/// несмещённая оценка [`EstimateCounter`] с запасом бюджета. Чанкер режет своим счётчиком
+/// ([`token_counter`]).
+fn budget_counter_with_kind() -> (Arc<dyn TokenCounter>, BudgetCounterKind) {
     let c = token_counter();
     if c.is_exact() {
-        c.count(text)
-    } else {
-        UpperCounter.count(text)
+        return (c, BudgetCounterKind::Model);
     }
+    if let Some(b) = bundled_cell()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return (b, BudgetCounterKind::Bundled);
+    }
+    (Arc::new(EstimateCounter), BudgetCounterKind::Estimate)
+}
+
+fn budget_counter() -> Arc<dyn TokenCounter> {
+    budget_counter_with_kind().0
+}
+
+/// Вид активного счётчика выдачи — для `/health` и диагностики (eval сверяет, точен ли счёт).
+pub fn budget_counter_kind() -> BudgetCounterKind {
+    budget_counter_with_kind().1
+}
+
+/// Число токенов `text` для размеров, которые видит агент (`Nt`, `tokens`, `~N tok`): точный
+/// счёт или несмещённая оценка ([`budget_counter`]).
+pub fn count_tokens(text: &str) -> usize {
+    budget_counter().count(text)
+}
+
+/// Наибольший [`count_tokens`], который помещается в бюджет `budget` (M6 §4.2): упаковка
+/// суммами частей сравнивает сумму с ним; без модели — с запасом оценки.
+pub fn budget_cap(budget: usize) -> usize {
+    budget_counter().budget_cap(budget)
+}
+
+/// Помещается ли ответ `text` целиком в бюджет `budget` (M6 §4.2) — единая проверка бюджета.
+pub fn fits_budget(text: &str, budget: usize) -> bool {
+    budget_counter().fits(text, budget)
 }
 
 /// Число токенов `text` счётчиком чанкера (токенизатор модели или `ApproxCounter`): размер
 /// для сведения, а не бюджет выдачи — например, блок инструкции агенту, проверяемый тестом по
-/// bge-m3 (без модели оценка сверху [`count_tokens`] давала бы ложное «больше 500»).
+/// bge-m3 (оценка выдачи [`count_tokens`] без модели — другой счётчик со своим разбросом).
 pub fn count_tokens_chunker(text: &str) -> usize {
     token_counter().count(text)
 }

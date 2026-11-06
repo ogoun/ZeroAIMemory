@@ -288,7 +288,8 @@ fn fetch_models(ids: Vec<String>, test: bool, accept_nc: bool) -> Result<()> {
 
 /// Модель, токенизатор которой нужен тестам бюджета блока инструкции (§14.2: ≤ 500 токенов по
 /// счётчику модели; `zam-server/tests/agent_setup.rs`).
-const TEST_TOKENIZER_MODEL: &str = "bge-m3-int8";
+/// Тот же файл входит в комплект сервера ([`package::BUNDLED_TOKENIZER_MODEL`]).
+const TEST_TOKENIZER_MODEL: &str = package::BUNDLED_TOKENIZER_MODEL;
 /// Каталог одиночных токенизаторов в `target/models`: `tokenizers/<id>/tokenizer.json` — без
 /// весов и `model.toml`, поэтому модель не считается установленной.
 const TEST_TOKENIZERS_DIR: &str = "tokenizers";
@@ -320,6 +321,39 @@ fn fetch_test_tokenizer(manifest: &ModelsManifest, models: &Path) -> Result<()> 
         }
     );
     Ok(())
+}
+
+/// `tokenizer.json` для комплекта сервера (M6, задача 5, решение владельца 2026-11-06): тот же
+/// файл, что качает `fetch-models --test` (`target/models/tokenizers/<id>/`), с проверкой
+/// размера и SHA-256 по `deploy/models.toml` — подменённый или старый файл в комплект не попадёт.
+fn bundled_tokenizer(root: &Path) -> Result<PathBuf> {
+    let manifest = ModelsManifest::load(&root.join("deploy").join(MODELS_MANIFEST))?;
+    let m = manifest.get(TEST_TOKENIZER_MODEL)?;
+    let f = m
+        .files
+        .iter()
+        .find(|f| f.path == "tokenizer.json")
+        .with_context(|| format!("{TEST_TOKENIZER_MODEL}: нет tokenizer.json в манифесте"))?;
+    let path = root
+        .join("target")
+        .join("models")
+        .join(TEST_TOKENIZERS_DIR)
+        .join(&m.id)
+        .join("tokenizer.json");
+    let hint = "cargo xtask fetch-models --test";
+    let len = std::fs::metadata(&path)
+        .with_context(|| format!("нет {} ({hint})", path.display()))?
+        .len();
+    let sum = fetch::sha256_file(&path)?;
+    if len != f.size || !sum.eq_ignore_ascii_case(&f.sha256) {
+        bail!(
+            "{}: размер {len} / sha256 {sum} не совпадают с deploy/models.toml ({} / {}); удалите файл и выполните {hint}",
+            path.display(),
+            f.size,
+            f.sha256
+        );
+    }
+    Ok(path)
 }
 
 /// Аргументы `cargo xtask package`.
@@ -377,6 +411,7 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
         };
         let qv = package::qdrant_version(&deploy)?;
         let license = root.join("LICENSE");
+        let tokenizer = bundled_tokenizer(&root)?;
         archives.extend(package::package(&package::Inputs {
             platform: &platform,
             version: &a.version,
@@ -390,6 +425,7 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
             project_license: &license,
             crt_dir: crt.as_deref(),
             qdrant_version: &qv,
+            tokenizer: &tokenizer,
             out_dir: &dist,
         })?);
     }

@@ -41,32 +41,6 @@ async fn secret_report(w: &W) -> String {
     .await
 }
 
-/// Несуществующая ссылка того же вида, что `r`: префикс до `:` тот же, каждая цифра — другая
-/// цифра, буква — другая буква того же регистра (Crockford у id, `a`–`f` у hex). Оценка токенов
-/// без модели (M6, задача 5: подсерии по смене вида символа) у неё та же, что у `r`, и `~N tok`
-/// ответов совпадает.
-fn ghost_like(r: &str) -> String {
-    const CROCKFORD: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ";
-    let (pre, rest) = r.rsplit_once(':').map_or(("", r), |(p, x)| (p, x));
-    let body: String = rest
-        .chars()
-        .map(|c| match c {
-            '0'..='9' => char::from(b'0' + (c as u8 - b'0' + 1) % 10),
-            'a'..='f' => char::from(b'a' + (c as u8 - b'a' + 1) % 6),
-            'A'..='Z' => {
-                let i = CROCKFORD.iter().position(|&x| x == c as u8).unwrap_or(0);
-                char::from(CROCKFORD[(i + 1) % CROCKFORD.len()])
-            }
-            c => c,
-        })
-        .collect();
-    if pre.is_empty() {
-        body
-    } else {
-        format!("{pre}:{body}")
-    }
-}
-
 /// Ответ без id: статус и тело (id отчёта или несуществующий — `ID`).
 fn shape(r: &Resp, id: &str) -> (StatusCode, String) {
     (r.status, r.text().replace(id, "ID"))
@@ -108,7 +82,7 @@ async fn oracle(
     body: impl Fn(&str) -> Option<Value>,
     extra: &[(&str, &str)],
 ) -> Resp {
-    let g = ghost_like(report);
+    let g = common::ghost_like(report);
     let r = tok_call(a, tok, &m, &uri(report), body(report), extra).await;
     let n = tok_call(a, tok, &m, &uri(&g), body(&g), extra).await;
     assert_eq!(
@@ -443,7 +417,7 @@ async fn token_never_sees_report_matrix() {
         ok(&r, StatusCode::BAD_REQUEST, "лента kind=report");
         // MCP memory_read и memory_link
         for pre in ["p:", "e:"] {
-            let g = ghost_like(&id);
+            let g = common::ghost_like(&id);
             let a = mcp(
                 &w.a,
                 tok,
@@ -664,7 +638,7 @@ async fn token_read_p_and_e_not_found() {
     let id = secret_report(&w).await;
     for tok in [&w.o.tok, &w.rw.tok] {
         for pre in ["p:", "e:", ""] {
-            let g = ghost_like(&id);
+            let g = common::ghost_like(&id);
             let body = |x: &str| json!({"items": [{"id": format!("{pre}{x}")}]});
             let r =
                 w.a.tok(tok, Method::POST, "/api/v1/read", Some(body(&id)))
@@ -823,7 +797,7 @@ async fn token_cache_put_report_source_rejected() {
         ok(&r, StatusCode::UNPROCESSABLE_ENTITY, "cache_put Knowledge");
     }
     // MCP memory_cache_put
-    let g = ghost_like(&id);
+    let g = common::ghost_like(&id);
     let args = |x: &str| {
         json!({"query": "итог обучения", "summary": "Точность выросла.",
                "sources": [{"id": format!("p:{x}")}], "solution": G})
@@ -1228,7 +1202,7 @@ async fn token_mcp_update_link_feedback_oracle() {
     ] {
         for pre in ["p:", "e:", ""] {
             for args in &actions {
-                let g = ghost_like(&id);
+                let g = common::ghost_like(&id);
                 let with = |x: &str| {
                     let mut a = args.clone();
                     a["id"] = json!(format!("{pre}{x}"));
@@ -1243,7 +1217,7 @@ async fn token_mcp_update_link_feedback_oracle() {
         }
         // граф: связь от отчёта (к отчёту — в матрице)
         for pre in ["p:", "e:"] {
-            let g = ghost_like(&id);
+            let g = common::ghost_like(&id);
             let link =
                 |x: &str| json!({"src": format!("{pre}{x}"), "type": "relates_to", "dst": note});
             let a = mcp(&w.a, tok, "memory_link", link(&id)).await;

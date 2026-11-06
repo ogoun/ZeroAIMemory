@@ -154,7 +154,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about@0.9.2
-      # Архивы зависимостей и тестовая модель smoke; ключ — хэш манифестов deploy/*.toml.
+      # Архивы зависимостей, тестовая модель smoke и tokenizer.json bge-m3 (входит в комплект,
+      # M6: точный счёт выдачи без модели); ключ — хэш манифестов deploy/*.toml.
       # Библиотеки NVIDIA не кэшируются: ~2 ГБ вытеснили бы кэш.
       - name: кэш зависимостей поставки и тестовой модели
         uses: actions/cache@v4
@@ -162,11 +163,14 @@ jobs:
           path: |
             target/deps-cache
             target/models/minilm-l6-int8
+            target/models/tokenizers
           key: deps-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
       # обе сборки ONNX Runtime: упаковываются оба flavor
       - name: fetch-deps
         run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
-      - name: fetch-models (тестовая модель для smoke)
+      # тестовая модель smoke и tokenizer.json bge-m3 для комплекта (SHA-256 по models.toml;
+      # xtask package сверяет его ещё раз)
+      - name: fetch-models (тестовая модель для smoke, токенизатор комплекта)
         run: cargo xtask fetch-models --test
       # ZAM_GIT_SHA — только на шагах сборки: это сборочная переменная build.rs.
       - name: build (windows)

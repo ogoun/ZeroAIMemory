@@ -58,6 +58,19 @@ pub trait TokenCounter: Send + Sync {
     /// он совпадает, у разных — различается (например, хэш `tokenizer.json`). Смена
     /// идентификатора при точном счётчике перенарезает базу.
     fn tokenizer_id(&self) -> String;
+
+    /// Наибольший счёт [`TokenCounter::count`], который помещается в бюджет `budget` (M6 §4.2):
+    /// для упаковки суммами частей — сравнение суммы с ним, а не с бюджетом. У точного счётчика —
+    /// сам бюджет, у оценки — с запасом ([`EstimateCounter`]).
+    fn budget_cap(&self, budget: usize) -> usize {
+        budget
+    }
+
+    /// Помещается ли `text` целиком в бюджет `budget` (M6 §4.2): единая точка проверки бюджета
+    /// для всех потребителей. У точного счётчика — `count ≤ budget`, у оценки — с запасом.
+    fn fits(&self, text: &str, budget: usize) -> bool {
+        self.count(text) <= self.budget_cap(budget)
+    }
 }
 
 /// Оценка без токенизатора: `ceil(символы / 3,5)` (исследование 05 §10).
@@ -79,33 +92,44 @@ impl TokenCounter for ApproxCounter {
     }
 }
 
-/// Оценка сверху без токенизатора — для **бюджетов выдачи** (M6, задача 5; правки ревью I-2):
-/// не меньше счёта bge-m3 на корпусе eval — заметки целиком, карточки поиска с полными id,
-/// идентификаторы и пути кода (CamelCase, snake_case, C#/Java/TS), CJK, корейский, греческий,
-/// смешанные строки (тест `upper_estimate_not_below_bge_on_eval_corpus` в `zam-ml`). Цена
-/// гарантии — завышение к bge-m3: заметки ×1,58, карточки ×1,48, строки карты кода ×1,46, пути
-/// ×1,64, идентификаторы ×2,0 (C#/Java/TS ×1,83), CJK и прочие письменности ×1,45. Отдельные
-/// фрагменты строк (разделители таблиц Markdown и т. п.) не гарантируются: ~3 % из них ниже
-/// bge-m3 — бюджет считается по целым ответам. [`ApproxCounter`] на выдаче занижал
-/// ~15 %, на идентификаторах — до 60 %. Чанкер её не использует: размеры листов подобраны под
-/// [`ApproxCounter`] и токенизатор модели.
+/// Оценка без токенизатора для **размеров и бюджетов выдачи** (M6, задача 5; повторное ревью,
+/// I-2) — две роли:
+/// - [`TokenCounter::count`] — **несмещённая** оценка: размеры, которые видит агент (хвост `Nt`,
+///   `tokens` у `/read` и выжимок, `~N tok`). Сумма по слою к bge-m3 на отложенной половине —
+///   ×1,00–1,05 (проза, заметки eval, выдача с id, код, идентификаторы, письменности), у
+///   вспомогательных слоёв (пути, строки карты кода, синтетика C#/Java/TS, смешанные строки,
+///   карточки, фразы восьми письменностей по отдельности) — ×0,97–1,08 (журнал задачи 5);
+/// - [`TokenCounter::fits`] — `m · оценка + c ≤ бюджет` ([`ESTIMATE_M`], [`ESTIMATE_C`]): запас,
+///   подобранный на **целых ответах** dev-прогонов ТС-1/ТС-2 и синтетике (код, письменности): на
+///   отложенной половине ответов bge-m3 больше бюджета у 0,24 %, превышение не больше 1,3 %,
+///   недогрузка при бюджете — 14,5 %. Гарантия — на ответ целиком, не на отдельную строку:
+///   короткая строка редких слов (`Скрипт`, повтор `αβγ`) может расходиться с bge-m3 в разы.
 ///
-/// Текст делится на серии букв и цифр, пробелы и отдельные прочие символы. Серия режется на
-/// подсерии ([`upper_subruns`]): смена вида символа (цифра, ASCII, кириллица, прочие
-/// письменности), переход строчная→заглавная, конец серии заглавных перед строчной
-/// (`HTTPServer` → `HTTP|Server`). Серия «кодовая», если у неё больше одной подсерии или рядом
-/// знак кода (`_./\:#<>()[]{}=-@$`), иначе — слово прозы. Стоимость подсерии — по таблице
-/// [`UPPER_TABLE`] (основа + за символ, тысячные токена) для её класса; знак ASCII — 0,5, прочий
-/// знак — 1; прочие письменности (CJK, хангыль, греческий…) — не меньше 1 токена на символ.
-/// Коэффициенты — верхняя линейная оценка (линейное программирование по корпусу, журнал
-/// задачи 5, `.tmp/m6/task5/diag/upper3_fit.py`); «кодовая» подсерия не дешевле такой же в
-/// прозе, поэтому оценка не убывает при дописывании текста по символу.
+/// Текст делится на серии «слова» (буквы, цифры и знаки-модификаторы [`ESTIMATE_WORD_MARKS`]),
+/// пробелы и отдельные прочие символы. Серия режется на подсерии ([`estimate_subruns`]): смена
+/// вида символа (цифра, ASCII, кириллица, CJK, греческий, кана, хангыль, прочие письменности),
+/// переход строчная→заглавная, конец серии заглавных перед строчной (`HTTPServer` →
+/// `HTTP|Server`). Серия «кодовая», если у неё больше одной подсерии или рядом знак кода
+/// (`_./\:#<>()[]{}=-@$`), иначе — слово прозы. Стоимость подсерии — основа и цена символа по
+/// классу ([`ESTIMATE_TABLE`], тысячные токена), знака ASCII — 0,862, прочего знака — 1,717.
+/// Коэффициенты — медианная регрессия (линейная программа) к bge-m3 с ограничениями «сумма по
+/// слою в пределах» и монотонностью: «кодовая» подсерия не дешевле такой же в прозе, длинная —
+/// не дешевле короткой на границе классов, поэтому оценка не убывает при дописывании текста по
+/// символу (`.tmp/m6/task5/diag/est_fit4.py`). Чанкер её не использует: размеры листов подобраны
+/// под [`ApproxCounter`] и токенизатор модели.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct UpperCounter;
+pub struct EstimateCounter;
 
-/// Класс подсерии для [`UPPER_TABLE`].
+/// Множитель запаса бюджета у [`EstimateCounter`], тысячные (`m` = 1,13: максимум по слоям
+/// p99 отношения bge-m3 / оценка на целых ответах).
+pub const ESTIMATE_M: usize = 1130;
+/// Сдвиг запаса бюджета у [`EstimateCounter`], токенов (`c`: p99 остатка на ответах короче 150
+/// токенов).
+pub const ESTIMATE_C: usize = 1;
+
+/// Класс подсерии для [`ESTIMATE_TABLE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpperClass {
+enum EstClass {
     Digit,
     /// ASCII буквы, 1–3 символа.
     Latin,
@@ -119,53 +143,106 @@ enum UpperClass {
     Cyr,
     /// Кириллица, 6 и больше.
     Cyr6,
-    /// Прочие письменности.
+    /// Иероглифы CJK и полноширинные формы.
+    Cjk,
+    /// Греческий.
+    Greek,
+    /// Хирагана и катакана.
+    Kana,
+    /// Хангыль.
+    Hangul,
+    /// Прочие письменности (иврит, арабский, деванагари, тайский…).
     Other,
 }
 
 /// Стоимость подсерии, тысячные токена: `(основа, за символ)`.
-type UpperCost = (usize, usize);
+type EstCost = (usize, usize);
 
-/// Стоимость подсерии по классу: для прозы и для кода.
-const UPPER_TABLE: [(UpperClass, UpperCost, UpperCost); 8] = [
-    (UpperClass::Digit, (1000, 0), (1000, 320)),
-    (UpperClass::Latin, (1000, 0), (1000, 630)),
-    (UpperClass::Latin4, (4000, 0), (4000, 0)),
-    (UpperClass::Latin8, (1000, 500), (1000, 500)),
-    (UpperClass::Upper, (1000, 580), (1000, 580)),
-    (UpperClass::Cyr, (1000, 0), (1000, 0)),
-    (UpperClass::Cyr6, (1000, 200), (1000, 200)),
-    (UpperClass::Other, (1000, 1000), (1000, 1000)),
+/// Стоимость подсерии по классу: в прозе и в «кодовой» серии.
+const ESTIMATE_TABLE: [(EstClass, EstCost, EstCost); 12] = [
+    (EstClass::Digit, (637, 120), (637, 120)),
+    (EstClass::Latin, (1044, 0), (1081, 159)),
+    (EstClass::Latin4, (1044, 0), (1122, 109)),
+    (EstClass::Latin8, (2000, 0), (2000, 74)),
+    (EstClass::Upper, (511, 311), (511, 365)),
+    (EstClass::Cyr, (642, 0), (3019, 0)),
+    (EstClass::Cyr6, (2262, 0), (3019, 0)),
+    (EstClass::Cjk, (283, 727), (283, 727)),
+    (EstClass::Greek, (415, 218), (415, 218)),
+    (EstClass::Kana, (644, 319), (644, 319)),
+    (EstClass::Hangul, (854, 309), (854, 390)),
+    (EstClass::Other, (579, 249), (579, 279)),
 ];
 
 /// Знак ASCII (не буква, не цифра, не пробел), тысячные токена.
-const UPPER_PUNCT: usize = 500;
+const ESTIMATE_PUNCT: usize = 862;
 /// Прочий знак (не ASCII).
-const UPPER_SYMBOL: usize = 1000;
+const ESTIMATE_SYMBOL: usize = 1717;
 /// Знаки кода рядом с серией — серия «кодовая».
-const UPPER_CODE_PUNCT: &str = "_./\\:#<>()[]{}=-@$";
+const ESTIMATE_CODE_PUNCT: &str = "_./\\:#<>()[]{}=-@$";
 
-/// Вид символа серии: 0 — ASCII цифра, 1 — ASCII буква, 2 — кириллица, 3 — прочее.
-fn upper_kind(c: char) -> u8 {
+/// Диапазоны, символы которых — часть слова наравне с буквами: комбинируемые знаки, огласовки
+/// иврита и арабского, блоки индийских письменностей, тайский и лаосский (знаки гласных там —
+/// не буквы по Unicode, но токенизатор не режет по ним слово).
+const ESTIMATE_WORD_MARKS: [(u32, u32); 13] = [
+    (0x0300, 0x036F),
+    (0x0483, 0x0489),
+    (0x0591, 0x05C7),
+    (0x0610, 0x061A),
+    (0x064B, 0x065F),
+    (0x0670, 0x0670),
+    (0x06D6, 0x06ED),
+    (0x0900, 0x0DFF),
+    (0x0E00, 0x0EFF),
+    (0x1AB0, 0x1AFF),
+    (0x1DC0, 0x1DFF),
+    (0x20D0, 0x20FF),
+    (0xFE20, 0xFE2F),
+];
+
+/// Символ серии «слова»: буква, цифра или знак из [`ESTIMATE_WORD_MARKS`].
+fn estimate_word(c: char) -> bool {
+    let o = c as u32;
+    c.is_alphanumeric()
+        || ESTIMATE_WORD_MARKS
+            .iter()
+            .any(|&(a, b)| (a..=b).contains(&o))
+}
+
+/// Вид символа серии: 0 — ASCII цифра, 1 — ASCII буква, 2 — кириллица, 4 — CJK, 5 — греческий,
+/// 6 — кана, 7 — хангыль, 3 — прочее.
+fn estimate_kind(c: char) -> u8 {
+    let o = c as u32;
     if c.is_ascii_digit() {
         0
     } else if c.is_ascii() {
         1
-    } else if ('\u{0400}'..='\u{04FF}').contains(&c) {
+    } else if (0x0400..=0x04FF).contains(&o) {
         2
+    } else if (0x3040..=0x30FF).contains(&o) {
+        6
+    } else if (0xAC00..=0xD7AF).contains(&o) {
+        7
+    } else if (0x2E80..=0x9FFF).contains(&o)
+        || (0xF900..=0xFAFF).contains(&o)
+        || (0xFF00..=0xFFEF).contains(&o)
+    {
+        4
+    } else if (0x0370..=0x03FF).contains(&o) || (0x1F00..=0x1FFF).contains(&o) {
+        5
     } else {
         3
     }
 }
 
-/// Подсерии серии букв и цифр (см. [`UpperCounter`]): границы подсерий.
-fn upper_subruns(run: &[char]) -> Vec<&[char]> {
+/// Подсерии серии букв и цифр (см. [`EstimateCounter`]).
+fn estimate_subruns(run: &[char]) -> Vec<&[char]> {
     let mut out = Vec::new();
     let mut start = 0;
     for i in 1..run.len() {
         let (a, c) = (run[i - 1], run[i]);
         let next = run.get(i + 1).copied();
-        let split = upper_kind(a) != upper_kind(c)
+        let split = estimate_kind(a) != estimate_kind(c)
             || (c.is_uppercase() && a.is_lowercase())
             || (a.is_uppercase() && c.is_uppercase() && next.is_some_and(char::is_lowercase));
         if split {
@@ -178,44 +255,43 @@ fn upper_subruns(run: &[char]) -> Vec<&[char]> {
 }
 
 /// Класс подсерии.
-fn upper_class(s: &[char]) -> UpperClass {
-    match upper_kind(s[0]) {
-        0 => UpperClass::Digit,
-        1 if s.len() >= 2 && s.iter().all(|c| c.is_uppercase()) => UpperClass::Upper,
-        1 if s.len() >= 8 => UpperClass::Latin8,
-        1 if s.len() >= 4 => UpperClass::Latin4,
-        1 => UpperClass::Latin,
-        2 if s.len() >= 6 => UpperClass::Cyr6,
-        2 => UpperClass::Cyr,
-        _ => UpperClass::Other,
+fn estimate_class(s: &[char]) -> EstClass {
+    match estimate_kind(s[0]) {
+        0 => EstClass::Digit,
+        1 if s.len() >= 2 && s.iter().all(|c| c.is_uppercase()) => EstClass::Upper,
+        1 if s.len() >= 8 => EstClass::Latin8,
+        1 if s.len() >= 4 => EstClass::Latin4,
+        1 => EstClass::Latin,
+        2 if s.len() >= 6 => EstClass::Cyr6,
+        2 => EstClass::Cyr,
+        4 => EstClass::Cjk,
+        5 => EstClass::Greek,
+        6 => EstClass::Kana,
+        7 => EstClass::Hangul,
+        _ => EstClass::Other,
     }
 }
 
-impl TokenCounter for UpperCounter {
+impl TokenCounter for EstimateCounter {
     fn count(&self, text: &str) -> usize {
         let chars: Vec<char> = text.chars().collect();
-        // текст с не-ASCII знака: у SentencePiece префикс слова `▁` становится отдельным токеном
-        let lead = chars
-            .iter()
-            .find(|c| !c.is_whitespace())
-            .is_some_and(|c| !c.is_alphanumeric() && !c.is_ascii());
-        let mut milli = if lead { UPPER_SYMBOL } else { 0 };
+        let mut milli = 0;
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
-            if c.is_alphanumeric() {
+            if estimate_word(c) {
                 let mut j = i;
-                while j < chars.len() && chars[j].is_alphanumeric() {
+                while j < chars.len() && estimate_word(chars[j]) {
                     j += 1;
                 }
-                let subs = upper_subruns(&chars[i..j]);
-                let near = |k: Option<&char>| k.is_some_and(|c| UPPER_CODE_PUNCT.contains(*c));
+                let subs = estimate_subruns(&chars[i..j]);
+                let near = |k: Option<&char>| k.is_some_and(|c| ESTIMATE_CODE_PUNCT.contains(*c));
                 let code = subs.len() > 1
                     || near(i.checked_sub(1).and_then(|p| chars.get(p)))
                     || near(chars.get(j));
                 for s in subs {
-                    let class = upper_class(s);
-                    let (_, prose, kode) = UPPER_TABLE
+                    let class = estimate_class(s);
+                    let (_, prose, kode) = ESTIMATE_TABLE
                         .iter()
                         .find(|(k, _, _)| *k == class)
                         .copied()
@@ -228,14 +304,15 @@ impl TokenCounter for UpperCounter {
             }
             if !c.is_whitespace() {
                 milli += if c.is_ascii() {
-                    UPPER_PUNCT
+                    ESTIMATE_PUNCT
                 } else {
-                    UPPER_SYMBOL
+                    ESTIMATE_SYMBOL
                 };
             }
             i += 1;
         }
-        milli.div_ceil(1000)
+        // округление к ближайшему: оценка несмещённая
+        (milli + 500) / 1000
     }
 
     fn is_exact(&self) -> bool {
@@ -243,7 +320,11 @@ impl TokenCounter for UpperCounter {
     }
 
     fn tokenizer_id(&self) -> String {
-        "upper-v2".into()
+        "estimate-v4".into()
+    }
+
+    fn budget_cap(&self, budget: usize) -> usize {
+        budget.saturating_sub(ESTIMATE_C) * 1000 / ESTIMATE_M
     }
 }
 

@@ -1,0 +1,30 @@
+Токенизатор bge-m3 (tokenizers/bge-m3-int8/tokenizer.json комплекта сервера)
+Tokenizer of bge-m3 bundled with zam-server.
+
+Source file:  https://huggingface.co/Xenova/bge-m3/resolve/4de13258303883538bd53b696b452bf8099f0858/tokenizer.json
+SHA-256:      6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790
+Model card:   https://huggingface.co/Xenova/bge-m3 (license: mit, base_model: BAAI/bge-m3)
+Base model:   https://huggingface.co/BAAI/bge-m3 (license: mit)
+License text: https://github.com/FlagOpen/FlagEmbedding/blob/master/LICENSE
+
+MIT License
+
+Copyright (c) 2022 staoxiao
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

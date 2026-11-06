@@ -647,8 +647,12 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     for (i, q) in queue_files(env, session).into_iter().enumerate() {
         let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("changed");
         let t = q.with_file_name(format!(".{name}.{}.{nanos}.{i}.tmp", std::process::id()));
-        // под замком: `post-tool`, открывший очередь до rename, допишет уже в забранный файл
-        let _lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
+        // под замком: `post-tool`, открывший очередь до rename, допишет уже в забранный файл;
+        // замок занят (уплотнение, другой хук) — очередь уйдёт в другой раз (ревью задачи 5 M6)
+        let lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
+        if !lock.held() {
+            continue;
+        }
         if std::fs::rename(&q, &t).is_ok() {
             taken.push((q, t));
         }
@@ -1259,6 +1263,42 @@ mod tests {
         std::fs::write(&path, b"999.1").unwrap();
         drop(l);
         assert!(path.exists(), "чужой замок не тронут");
+    }
+
+    /// Ревью задачи 5 M6: очередь под чужим замком `flush_changed` не забирает (как
+    /// `compact_changed_queues`) — она остаётся на месте, запроса нет.
+    #[test]
+    fn flush_skips_locked_queue() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/zam-cli-flush-lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
+        std::fs::write(
+            dir.join(".zeroaimemory/solution.toml"),
+            "agent_solution_id = \"0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e77\"\nname = \"x\"\n",
+        )
+        .unwrap();
+        let env = Env::new(
+            super::super::Kind::SessionStart,
+            super::super::Agent::Claude,
+            std::time::Instant::now(),
+            dir.clone(),
+            dir.join("home"),
+        );
+        assert!(env.solution.is_some());
+        let q = changed_path(&env, "s1");
+        std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+        let body = changed_bytes([&line("src/a.rs", 0)]);
+        std::fs::write(&q, &body).unwrap();
+        let held = QueueLock::take(&q, Duration::ZERO);
+        assert!(held.held());
+        // сервер недоступен: попытка отправки оставила бы строку `files/changed` в журнале
+        let client = Client::new("http://127.0.0.1:9", "t", None);
+        flush_changed(&env, &client, Some("s1"));
+        assert_eq!(std::fs::read(&q).unwrap(), body, "очередь на месте");
+        let log = std::fs::read_to_string(env.log_path()).unwrap_or_default();
+        assert!(!log.contains("files/changed"), "{log}");
+        drop(held);
     }
 
     fn line(path: &str, symbols: usize) -> Changed {

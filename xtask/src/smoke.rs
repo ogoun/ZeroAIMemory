@@ -750,6 +750,38 @@ fn server_stopped(srv: &mut Server, addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// `/health` сообщает активный счётчик токенов выдачи `want` (`model`, `bundled`, `estimate`;
+/// M6, задача 5).
+fn token_counter_is(base: &str, want: &str) -> Result<()> {
+    let mut r = agent().get(&format!("{base}/api/v1/health")).call()?;
+    let v: Value = serde_json::from_str(&r.body_mut().read_to_string()?)?;
+    let got = v["token_counter"].as_str().unwrap_or("<нет поля>");
+    if got != want {
+        bail!("/health token_counter = {got}, ожидалось {want}: {v}");
+    }
+    Ok(())
+}
+
+/// Второй запуск на пустом каталоге данных без моделей: размеры и бюджеты выдачи считает
+/// `tokenizer.json` из комплекта (`tokenizers/<модель>/`), а не оценка (решение владельца
+/// 2026-11-06). Чанкер без модели по-прежнему режет оценкой — это проверяют тесты сервера.
+fn token_counter_without_model(root: &Path, dir: &Path, env: &SmokeEnv) -> Result<()> {
+    let tok = root.join(crate::package::bundled_tokenizer_path());
+    if !tok.is_file() {
+        bail!("в комплекте нет {}", tok.display());
+    }
+    let data = dir.join("data-nomodel");
+    let _ = std::fs::remove_dir_all(&data);
+    std::fs::create_dir_all(&data)?;
+    let log = dir.join("zam-server-nomodel.stderr.log");
+    let base = format!("http://{}", env.addr);
+    let mut srv = Server::start(root, &data, env, &log, false)?;
+    let r = wait_health(&mut srv, &base).and_then(|()| token_counter_is(&base, "bundled"));
+    let stopped = server_stopped(&mut srv, env.addr);
+    r.map_err(|e| anyhow!("{e:#}\nstderr сервера:\n{}", srv.log_tail()))?;
+    stopped
+}
+
 /// Выполняет smoke-тест комплекта; при успехе печатает `SMOKE OK`. `repo` — корень
 /// репозитория (тестовая модель — из `target/models/`, распаковка — в `target/smoke/`).
 pub fn run(
@@ -829,6 +861,10 @@ pub fn run(
     } else {
         s.run("ожидание /api/v1/health", wait_health(&mut srv, &base))?;
     }
+    s.run(
+        "M6: счётчик токенов выдачи с моделью — токенизатор модели (/health token_counter)",
+        token_counter_is(&base, "model"),
+    )?;
     let token = s.run(
         "первый токен (файл в каталоге данных)",
         srv.token_rx.recv_timeout(WAIT).map_err(|_| {
@@ -965,6 +1001,10 @@ pub fn run(
     s.run(
         "процесс Qdrant завершён вместе с сервером",
         qdrant_gone(&env, &root, &data),
+    )?;
+    s.run(
+        "M6: без модели счётчик выдачи точный — tokenizer.json комплекта (/health token_counter)",
+        token_counter_without_model(&root, &dir, &env),
     )?;
     let reason = if vr.reason.is_empty() {
         String::new()

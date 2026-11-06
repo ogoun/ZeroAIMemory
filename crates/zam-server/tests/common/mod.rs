@@ -48,3 +48,29 @@ pub fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
     }
     out
 }
+
+/// Несуществующая ссылка того же вида, что `r`: префикс до `:` тот же, каждая цифра — другая
+/// цифра, буква — другая буква того же регистра (Crockford у id, `a`–`f` у hex). Оценка токенов
+/// без модели (M6, задача 5: подсерии по смене вида символа) у неё та же, что у `r`, и `~N tok`
+/// ответов совпадает.
+pub fn ghost_like(r: &str) -> String {
+    const CROCKFORD: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ";
+    let (pre, rest) = r.rsplit_once(':').map_or(("", r), |(p, x)| (p, x));
+    let body: String = rest
+        .chars()
+        .map(|c| match c {
+            '0'..='9' => char::from(b'0' + (c as u8 - b'0' + 1) % 10),
+            'a'..='f' => char::from(b'a' + (c as u8 - b'a' + 1) % 6),
+            'A'..='Z' => {
+                let i = CROCKFORD.iter().position(|&x| x == c as u8).unwrap_or(0);
+                char::from(CROCKFORD[(i + 1) % CROCKFORD.len()])
+            }
+            c => c,
+        })
+        .collect();
+    if pre.is_empty() {
+        body
+    } else {
+        format!("{pre}:{body}")
+    }
+}

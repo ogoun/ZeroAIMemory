@@ -825,9 +825,10 @@ fn digest_snapshot(s: &CodeSnapshot) -> Option<String> {
 }
 
 /// Строка дайджеста (§10): размер карты, возраст снимка, центральные символы — до
-/// [`DIGEST_CENTRAL`]; строка длиннее [`DIGEST_LINE_TOKENS`] по `count` — центральных 2, 1, 0,
-/// а без центральных всё ещё длиннее — и без скобки снимка.
-fn digest_line(s: &CodeStatus, central: &[Value], count: &dyn Fn(&str) -> usize) -> String {
+/// [`DIGEST_CENTRAL`]; строка не помещается в [`DIGEST_LINE_TOKENS`] по `fits` (сервер —
+/// [`digest_fits`], M6 §4.2) — центральных 2, 1, 0, а без центральных всё ещё не помещается —
+/// и без скобки снимка.
+fn digest_line(s: &CodeStatus, central: &[Value], fits: &dyn Fn(&str) -> bool) -> String {
     let snap = &s.snapshot;
     let bare = format!(
         "ZeroAIMemory: карта кода: {}, {}, снимок {}",
@@ -856,8 +857,13 @@ fn digest_line(s: &CodeStatus, central: &[Value], count: &dyn Fn(&str) -> usize)
     (0..=names.len())
         .rev()
         .map(line)
-        .find(|l| count(l) <= DIGEST_LINE_TOKENS)
+        .find(|l| fits(l))
         .unwrap_or_else(|| format!("{bare} — `memory_code`/`zam code map`"))
+}
+
+/// Строка дайджеста помещается в [`DIGEST_LINE_TOKENS`] счётчиком сервера (`fits`, M6 §4.2).
+fn digest_fits(line: &str) -> bool {
+    zam_store::fits_budget(line, DIGEST_LINE_TOKENS)
 }
 
 /// Строка дайджеста карты решения `guid` в базе `db` (для `/recall`: `session_start` и
@@ -870,7 +876,7 @@ pub async fn code_line(db: &Db, guid: &str) -> Option<String> {
     let central = code_central(db, guid, DIGEST_CENTRAL, CENTRAL_FILES_MAX)
         .await
         .ok()?;
-    Some(digest_line(&s, &central_json(&central), &count_tokens))
+    Some(digest_line(&s, &central_json(&central), &digest_fits))
 }
 
 // ---- POST /code/sync ----
@@ -1235,7 +1241,7 @@ pub async fn status(
         return with_etag(&headers, &etag, || Value::Null);
     }
     let central = central_json(&store_central(&sc, &g, STATUS_CENTRAL).await?);
-    let digest = (snap.files > 0).then(|| digest_line(&s, &central, &count_tokens));
+    let digest = (snap.files > 0).then(|| digest_line(&s, &central, &digest_fits));
     let skipped: Vec<Value> = s
         .skipped
         .iter()
@@ -1692,7 +1698,13 @@ async fn build_map(
         );
         let (h, files) = (header.clone(), pack_input(&rows, loaded));
         let packed = tokio::task::spawn_blocking(move || {
-            render_map_rest(&h, &files, rest, budget, &count_tokens)
+            render_map_rest(
+                &h,
+                &files,
+                rest,
+                zam_store::budget_cap(budget),
+                &count_tokens,
+            )
         })
         .await
         .map_err(|e| ApiError::aborted("упаковка карты", &e))?;
@@ -2348,20 +2360,20 @@ mod tests {
         let chars = |t: &str| t.chars().count();
         let s = status(snap(Some("main"), Some("abcdef1234")));
         assert_eq!(
-            digest_line(&s, &central, &|_| 0),
+            digest_line(&s, &central, &|_| true),
             "ZeroAIMemory: карта кода: 2 файла, 5 символов, снимок 0 мин (main@abcdef1); \
              центральные: Store::open, Db, route — `memory_code`/`zam code map`"
         );
         // без ветки и коммита — без скобок; машина не показывается
         let s0 = status(snap(None, None));
-        let l = digest_line(&s0, &central[..1], &|_| 0);
+        let l = digest_line(&s0, &central[..1], &|_| true);
         assert!(l.contains("снимок 0 мин; центральные: Store::open"), "{l}");
         assert!(!l.contains("box"), "{l}");
         // предел по счётчику: длина строки с 3, 2, 1 центральным
-        let full = chars(&digest_line(&s, &central, &|_| 0));
+        let full = chars(&digest_line(&s, &central, &|_| true));
         let cut = |limit: usize| {
             digest_line(&s, &central, &|t: &str| {
-                (chars(t) * DIGEST_LINE_TOKENS).div_ceil(limit)
+                (chars(t) * DIGEST_LINE_TOKENS).div_ceil(limit) <= DIGEST_LINE_TOKENS
             })
         };
         assert!(cut(full).contains("route"));
@@ -2374,8 +2386,8 @@ mod tests {
         // ревью задачи 6, M1: ветка в 256 символов — обрезка до 40 с «…», строка ≤ 80 токенов
         let long = "b".repeat(256);
         let sl = status(snap(Some(&long), Some("abcdef1234")));
-        let l = digest_line(&sl, &central, &zam_store::count_tokens);
+        let l = digest_line(&sl, &central, &digest_fits);
         assert!(l.contains(&format!("({}…@abcdef1)", "b".repeat(40))), "{l}");
-        assert!(zam_store::count_tokens(&l) <= DIGEST_LINE_TOKENS, "{l}");
+        assert!(digest_fits(&l), "{l}");
     }
 }

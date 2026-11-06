@@ -76,7 +76,20 @@ pub struct Inputs<'a> {
     /// Каталог `Microsoft.VC*.CRT` с файлами [`crt_files`] (только Windows).
     pub crt_dir: Option<&'a Path>,
     pub qdrant_version: &'a str,
+    /// `tokenizer.json` модели [`BUNDLED_TOKENIZER_MODEL`] (`target/models/tokenizers/<id>/`,
+    /// `cargo xtask fetch-models --test`, SHA-256 сверяет `package_cmd`): точный счёт токенов
+    /// выдачи без модели (M6, задача 5, решение владельца 2026-11-06).
+    pub tokenizer: &'a Path,
     pub out_dir: &'a Path,
+}
+
+/// Модель, `tokenizer.json` которой входит в комплект сервера.
+pub const BUNDLED_TOKENIZER_MODEL: &str = "bge-m3-int8";
+
+/// Путь токенизатора в комплекте: `tokenizers/<модель>/tokenizer.json` рядом с `zam-server`
+/// (его ищет `zam_server::ml::BUNDLED_TOKENIZERS_DIR`).
+pub fn bundled_tokenizer_path() -> String {
+    format!("tokenizers/{BUNDLED_TOKENIZER_MODEL}/tokenizer.json")
 }
 
 #[derive(Debug)]
@@ -332,6 +345,8 @@ fn server_entries(i: &Inputs) -> Result<Vec<Entry>> {
             i.deploy_dir.join("systemd/zam-server.service"),
         ));
     }
+    // точный счётчик выдачи без модели (лицензия — deploy/licenses/BGE-M3-TOKENIZER-*)
+    v.push(Entry::file(bundled_tokenizer_path(), i.tokenizer));
     push_dir_files(&mut v, &i.deploy_dir.join("licenses"), "LICENSES")?;
     push_dir_files(&mut v, i.generated_licenses_dir, "LICENSES")?;
     v.push(Entry::file(
@@ -831,7 +846,7 @@ pub(crate) mod tests {
         let gen_dir = w.join("gen");
         touch(&gen_dir.join("THIRD-PARTY-RUST.html"));
         touch(&gen_dir.join("THIRD-PARTY-WEB.json"));
-        for f in ["zam-server.bin", "zam.bin", "LICENSE"] {
+        for f in ["zam-server.bin", "zam.bin", "LICENSE", "tokenizer.json"] {
             touch(&w.join(f));
         }
         let crt = w.join("crt");
@@ -874,6 +889,7 @@ pub(crate) mod tests {
             project_license: &lic,
             crt_dir: with_crt.then_some(crt.as_path()),
             qdrant_version: "1.19.2",
+            tokenizer: &w.join("tokenizer.json"),
             out_dir: &dist,
         })
     }
@@ -925,6 +941,7 @@ pub(crate) mod tests {
         "deploy/models.toml",
         "config.example.toml",
         "README-install.md",
+        "tokenizers/bge-m3-int8/tokenizer.json",
         "LICENSES/A.txt",
         "LICENSES/B.txt",
         "LICENSES/THIRD-PARTY-RUST.html",
@@ -1028,6 +1045,7 @@ pub(crate) mod tests {
             ("config.example.toml", 0o644),
             ("README-install.md", 0o644),
             ("systemd/zam-server.service", 0o644),
+            ("tokenizers/bge-m3-int8/tokenizer.json", 0o644),
             ("LICENSES/A.txt", 0o644),
             ("LICENSES/B.txt", 0o644),
             ("LICENSES/THIRD-PARTY-RUST.html", 0o644),
@@ -1195,6 +1213,7 @@ pub(crate) mod tests {
                 project_license: &lic,
                 crt_dir: Some(&crt),
                 qdrant_version: "1.19.2",
+                tokenizer: &w.join("tokenizer.json"),
                 out_dir: &dist,
             });
             let e = format!("{:#}", r.unwrap_err());

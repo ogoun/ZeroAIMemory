@@ -2767,10 +2767,11 @@ pub async fn search(
         + count_tokens(&tail_md)
         + count_tokens(&format!("~{budget} tok"))
         + 1;
+    // упаковка суммами частей — против `budget_cap` (без модели — с запасом оценки), итог — `fits`
     let mut packed = pack_items(
         items,
         mode,
-        budget.saturating_sub(reserve),
+        zam_store::budget_cap(budget).saturating_sub(reserve),
         &count_tokens,
         &by_id,
     );
@@ -2778,7 +2779,7 @@ pub async fn search(
     while packed.len() > 1 {
         let body = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
         let n = count_tokens(&body);
-        if count_tokens(&format!("{body}~{n} tok")) <= budget {
+        if zam_store::fits_budget(&format!("{body}~{n} tok"), budget) {
             break;
         }
         packed.pop();

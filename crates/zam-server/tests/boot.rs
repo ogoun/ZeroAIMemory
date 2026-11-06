@@ -54,6 +54,14 @@ async fn health_ok_under_base_path() {
     assert_eq!(j["status"], "ok");
     assert_eq!(j["version"], env!("CARGO_PKG_VERSION"));
     assert!(j["git"].is_string() && j["uptime_s"].is_u64());
+    // M6, задача 5: активный счётчик выдачи (model | bundled | estimate)
+    assert!(
+        matches!(
+            j["token_counter"].as_str(),
+            Some("model" | "bundled" | "estimate")
+        ),
+        "{j}"
+    );
     // возможности сборки для загрузчика замера M6 (xtask eval caps): сборка ветки M6 — "m6"
     let f: Vec<&str> = j["features"]
         .as_array()

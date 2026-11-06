@@ -78,16 +78,7 @@ pub fn chunk_model(cfg: &ServerConfig, embedder: Option<&Embedder>) -> Option<Ch
         });
     }
     let dir = cfg.ml.models_dir(&cfg.data_dir);
-    let ids: Vec<&str> = match cfg
-        .ml
-        .embed_model
-        .as_deref()
-        .filter(|m| !m.trim().is_empty())
-    {
-        Some(m) => vec![m],
-        None => vec![MODEL_CPU, MODEL_GPU],
-    };
-    ids.into_iter().find_map(|id| {
+    model_ids(cfg).into_iter().find_map(|id| {
         let spec = zam_ml::ModelSpec::load(&dir, id).ok()?;
         let counter = zam_ml::BgeTokenCounter::load(&dir, id).ok()?;
         Some(ChunkModel {
@@ -95,6 +86,44 @@ pub fn chunk_model(cfg: &ServerConfig, embedder: Option<&Embedder>) -> Option<Ch
             window: spec.max_tokens_passage,
         })
     })
+}
+
+/// Модели, токенизатор которых годится серверу: `ml.embed_model` или bge-m3 int8/fp16 (у них
+/// один токенизатор).
+fn model_ids(cfg: &ServerConfig) -> Vec<&str> {
+    match cfg
+        .ml
+        .embed_model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+    {
+        Some(m) => vec![m],
+        None => vec![MODEL_CPU, MODEL_GPU],
+    }
+}
+
+/// Каталог одиночных токенизаторов комплекта рядом с `zam-server`:
+/// `<каталог исполняемого файла>/tokenizers/<модель>/tokenizer.json` (M6, задача 5, решение
+/// владельца 2026-11-06: в комплект входит `tokenizer.json` bge-m3; `cargo xtask package`).
+pub const BUNDLED_TOKENIZERS_DIR: &str = "tokenizers";
+
+/// Точный счётчик выдачи без модели — `tokenizer.json` из комплекта ([`BUNDLED_TOKENIZERS_DIR`]):
+/// сначала для [`model_ids`], затем bge-m3 (в комплекте именно он; оценка без модели тоже
+/// откалибрована по bge-m3, так что при `ml.embed_model` другой, неустановленной модели bge-m3
+/// точнее оценки). Файла нет или он не читается — `None` (бюджеты считает оценка).
+pub fn bundled_tokenizer(cfg: &ServerConfig) -> Option<zam_ml::BgeTokenCounter> {
+    let dir = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join(BUNDLED_TOKENIZERS_DIR);
+    let mut ids = model_ids(cfg);
+    for id in [MODEL_CPU, MODEL_GPU] {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.into_iter()
+        .find_map(|id| zam_ml::BgeTokenCounter::load(&dir, id).ok())
 }
 
 /// Ставит счётчик токенов и пороги чанкера процесса (§8.2) до первого открытия базы
@@ -132,6 +161,17 @@ pub fn setup_chunker(cfg: &ServerConfig, embedder: Option<&Embedder>) -> bool {
                 "токенизатор модели недоступен: чанки считаются оценкой и будут перенарезаны \
                  после установки моделей (zam-server models fetch)"
             );
+            // размеры и бюджеты выдачи — точным tokenizer.json комплекта, чанкер — оценкой
+            // (сопоставимость индекса); нет файла — оценка с запасом (M6, задача 5)
+            match bundled_tokenizer(cfg) {
+                Some(c) => {
+                    zam_store::set_bundled_counter(Arc::new(c));
+                    tracing::info!("счётчик токенов выдачи — tokenizer.json комплекта");
+                }
+                None => tracing::warn!(
+                    "tokenizer.json комплекта не найден: размеры и бюджеты выдачи считает оценка"
+                ),
+            }
             false
         }
     }

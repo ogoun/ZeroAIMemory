@@ -289,37 +289,12 @@ async fn read_attachment_toc_without_locator() {
     assert!(!t.contains("ниобий"), "оглавление ограничено: {t}");
     assert!(t.contains("ещё"), "{t}");
     let tokens = it["tokens"].as_u64().unwrap();
-    // без модели — оценка сверху (M6, задача 5): у строк оглавления ×1,5–2 к bge-m3
-    assert!(tokens < 9000, "оглавление {tokens} токенов");
+    // без модели — несмещённая оценка (M6, задача 5, повторное ревью I-2)
+    assert!(tokens < 4000, "оглавление {tokens} токенов");
     a.st.shutdown().await;
 }
 
 /// `locator` у заметки, записи журнала и пути — 422 `/problems/locator-invalid`.
-/// Несуществующая ссылка того же вида, что `r`: префикс до `:` тот же, каждая цифра — другая
-/// цифра, буква — другая буква того же регистра (Crockford у id, `a`–`f` у hex). Оценка токенов
-/// без модели (M6, задача 5: подсерии по смене вида символа) у неё та же, что у `r`, и `~N tok`
-/// ответов совпадает.
-fn like(r: &str) -> String {
-    const CROCKFORD: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ";
-    let (pre, rest) = r.rsplit_once(':').map_or(("", r), |(p, x)| (p, x));
-    let body: String = rest
-        .chars()
-        .map(|c| match c {
-            '0'..='9' => char::from(b'0' + (c as u8 - b'0' + 1) % 10),
-            'a'..='f' => char::from(b'a' + (c as u8 - b'a' + 1) % 6),
-            'A'..='Z' => {
-                let i = CROCKFORD.iter().position(|&x| x == c as u8).unwrap_or(0);
-                char::from(CROCKFORD[(i + 1) % CROCKFORD.len()])
-            }
-            c => c,
-        })
-        .collect();
-    if pre.is_empty() {
-        body
-    } else {
-        format!("{pre}:{body}")
-    }
-}
 
 #[tokio::test]
 async fn read_note_with_locator_422() {
@@ -648,8 +623,8 @@ async fn read_attachment_access_like_missing() {
         for r in list.iter().chain(missing.iter()) {
             for loc in [None, Some("slide:1")] {
                 // `~N tok` зависит от вида символов ссылки: сравнение — с несуществующей того же
-                // вида ([`like`])
-                let same = like(r);
+                // вида (`common::ghost_like`)
+                let same = common::ghost_like(r);
                 let got = shape(who, r, loc).await;
                 let want = shape(who, &same, loc).await;
                 assert_eq!(got, want, "{r} {loc:?}");

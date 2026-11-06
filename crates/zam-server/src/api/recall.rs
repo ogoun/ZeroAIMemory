@@ -2395,6 +2395,8 @@ async fn code_brief_lines(
         }
     };
     let mut used = count_tokens(&format!("\n{SECTION_CODE}\n"));
+    // сумма строк — против `budget_cap` (M6 §4.2: без модели — с запасом оценки)
+    let budget = zam_store::budget_cap(budget);
     let mut out = Vec::new();
     for h in hits {
         let what = h
@@ -3349,7 +3351,8 @@ pub async fn recall(
         });
         picked.push(Vec::new());
     }
-    let (text, taken) = pack_sections(&packed, budget, &count_tokens);
+    // упаковка разделов суммами — против `budget_cap` (M6 §4.2)
+    let (text, taken) = pack_sections(&packed, zam_store::budget_cap(budget), &count_tokens);
     let shown_now: Vec<&Cand> = taken
         .iter()
         .filter_map(|&(si, bi)| picked[si].get(bi).copied())

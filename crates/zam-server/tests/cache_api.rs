@@ -226,7 +226,9 @@ async fn search_returns_cache_first() {
         .json();
     assert_eq!(l["items"].as_array().unwrap().len(), 1, "{l}");
     assert_eq!(l["items"][0]["hits"], 3, "{l}");
-    let big = "слово ".repeat(800);
+    // ~1600 токенов bge-m3 — заведомо больше предела 600 любым счётчиком (оценка без модели
+    // считает короткое русское слово дешевле bge-m3: «слово» ×800 — 514 при 800)
+    let big = "слово ".repeat(1600);
     let r = put(
         &a,
         &a.token,
@@ -898,7 +900,7 @@ fn echo_shape(v: &Value, n: &str) -> String {
     if o.contains_key("ref") {
         o.insert("ref".into(), json!("c_<id>"));
     }
-    // число токенов — счётчик сервера без модели: в M6 оценка сверху (задача 5, B), а форма
+    // число токенов — счётчик сервера без модели: в M6 несмещённая оценка (задача 5), а форма
     // ответа — та же
     if o.contains_key("tokens") {
         o.insert("tokens".into(), json!("<tokens>"));
