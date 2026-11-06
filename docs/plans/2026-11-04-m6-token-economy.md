@@ -1629,6 +1629,42 @@ cargo xtask transfer-check bindings --data-dir <D> --old-path "<старый dat
     24 подтверждается записью в журнале этапа** (журнал стенда).
 - [ ] **Step 4: Commit** `docs(deploy): перенос на другую машину; test: проверка переезда`.
 
+### Task 19: Нативный клиент — CR-8, CR-7, CR-20, `features` (§16 п. 19, §17 п. 25)
+
+Решение владельца 2026-11-06 (ответ «А») по `docs/research/2026-11-06-zero-agent-memory-requests.md`;
+ответ проекту zero-agent — `…-answer.md` (дополнить разделом «Что в описании неверно» по итогам
+тестов).
+
+**Files.** Modify: `crates/zam-server/src/mcp/{mod.rs,tools.rs}`, `crates/zam-server/src/api/
+{recall.rs,health.rs,nodes/*}`, `crates/zam-server/src/config.rs`, `deploy/config.example.toml`,
+`crates/zam-cli/src/cmd/hook/subagent_start.rs`. Create: `docs/api-compat.md`. Test:
+`crates/zam-server/tests/{mcp.rs,recall.rs,nodes*.rs,boot.rs}`, `crates/zam-cli/tests/hooks.rs`.
+
+**Interfaces — Produces:**
+```rust
+// config [recall]: max_timeout_ms: u64 (1..=60000, 2000)
+// RecallReq { …, timeout_ms: Option<u64> }  // > max_timeout_ms → 400
+// MCP: session_id в memory_search, memory_read (memory_recall — уже); заголовок важнее,
+//      оба и разные → 400; учёт account() — по сессии запроса, а не только по заголовку
+// POST /nodes, PUT|PATCH /nodes/{id}: Idempotency-Key (общий помощник с entries.rs:292)
+// /health: "features": [...] — официальный список, константа FEATURES, описана в docs/api-compat.md
+```
+
+- [ ] **Step 1: Тесты** (FAIL):
+  - `mcp_session_id_arg_accounts_session` (recall, search, read; `tokens_unattributed` не растёт),
+    `mcp_session_header_and_arg_conflict_400`;
+  - `recall_timeout_ms_param_full_digest` (точка задержки test-hooks 600 мс, `timeout_ms: 1000`),
+    `recall_timeout_ms_over_max_400`, `mcp_recall_schema_has_source_block_timeout`;
+  - `patch_append_idempotent`, `post_node_idempotent`, `idempotency_key_body_mismatch_422`,
+    `memory_write_idempotency_key`;
+  - `health_features_documented` — каждый флаг `FEATURES` описан в `docs/api-compat.md`;
+  - `subagent_brief_does_not_mute_parent_hints` (хуки);
+  - `mcp_ref_prefixes_include_w`.
+- [ ] **Step 2: Реализация.** Сверить каждое утверждение CR-7/8/20 и строк приложения с кодом и
+  тестом; расхождения — в файл ответа. Проверка: тесты шага 1 и затронутые цели — PASS.
+- [ ] **Step 3: Commit** `feat(api): нативный клиент — сессия в аргументах, срок recall,
+  идемпотентность заметок, features`.
+
 ### Task 13a: Блок v7 и протокол (§13)
 
 **Files.** Modify: `crates/zam-core/src/lib.rs` (`AGENT_BLOCK_VERSION = 7`),

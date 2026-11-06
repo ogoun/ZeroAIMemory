@@ -1879,6 +1879,27 @@ M5.7, «Передать в M6», п. 10), общий код совпадени�
 **18c. Инструкция и проверка переезда** (§12б.6): раздел `deploy/README-install.md`, тест
 `restore_has_no_machine_bindings`, переезд Windows → Linux на стенде. *После 18a и 18b2; до 13.*
 
+**19. Нативный клиент (предложения zero-agent, решение владельца 2026-11-06, ответ «А»;
+`docs/research/2026-11-06-zero-agent-memory-requests{,-answer}.md`):**
+- **CR-8** — учёт MCP идёт в сессию, заданную заголовком `X-Zam-Session` **или** аргументом
+  `session_id` (сейчас `mcp/mod.rs` смотрит только заголовок); `session_id` в схемах
+  `memory_search`, `memory_read`; при обоих — заголовок, расхождение — 400;
+- **CR-7** — `timeout_ms` в теле `/recall` (1..=`recall.max_timeout_ms`, по умолчанию 2000;
+  без поля — `recall.timeout_ms`); `source`, `agent_block_version`, `timeout_ms` в схеме
+  `memory_recall`;
+- **CR-20** — `Idempotency-Key` на `POST /nodes`, `PUT`/`PATCH /nodes/{id}` с семантикой записей
+  журнала (повтор — 200 и исходный ответ, другое тело — 422, срок хранения ключей — как у
+  записей); `idempotency_key` в `memory_write`;
+- **CR-9 (часть)** — `/health.features` официальный: флаг на функцию (`focus`, `snapshot`,
+  `epochs`, `idempotent_nodes`, `recall_timeout`, `backup`, `export`…), список и правило
+  совместимости `/api/v1` (добавление полей — без смены версии; удаление и смена смысла — только
+  `/api/v2`) — в `docs/` и README; OpenAPI — M7;
+- **мелочи приложения** — `brief` субагента без `session_id` не гасит подсказки родителя
+  (`subagent_start.rs`), префикс `w:` в списках ссылок MCP, полное описание `memory_update_entry`
+  (`propose`, `decide` без `rev`); `focus` — 7b, захваченная задача в `open` в дайджесте — 8a,
+  README и комментарии — 13c.
+*После 7b и 8a; до 13a.* Остальные CR — M7 или отдельный этап (файл ответа).
+
 **13. Инструкция, подтверждение, выпуск.**
 - блок v7 (основной вариант §13, замер худшего случая ru/en), `MOVED_TO_GUIDE`, напоминание
   v6 → v7, `INSTRUCTIONS`, описания MCP, `guide` (фокус, правило отвергнутых подходов, снимок
@@ -2224,3 +2245,9 @@ M5.7, «Передать в M6», п. 10), общий код совпадени�
     - инструкция `deploy/README-install.md` «Перенос на другую машину» пройдена по шагам дословно.
 
     Числа — в журнал и ТЗ §18. Пункт подтверждается журналом стенда.
+
+25. **Нативный клиент** (задача 19): `memory_recall`/`memory_search`/`memory_read` с
+    `session_id` в аргументах без заголовка учитываются в этой сессии, `tokens_unattributed` не
+    растёт; два одинаковых `PATCH append` с одним `Idempotency-Key` дают одну вставку;
+    `/recall` с `timeout_ms: 1000` при искусственной задержке шага 600 мс отдаёт полный дайджест
+    без `recall timeout`; клиент определяет каждую функцию M6 по `/health.features`.
