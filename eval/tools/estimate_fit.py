@@ -12,7 +12,11 @@
 Запуск (из корня репозитория; нужны numpy, scipy, tokenizers и
 `target/models/tokenizers/bge-m3-int8/tokenizer.json` — `cargo xtask fetch-models --test`):
 
-    python eval/tools/estimate_fit.py [--runs GLOB ...] [--out DIR] [--fixture PATH]
+    python -X utf8 eval/tools/estimate_fit.py [--sha SHA] [--runs GLOB ...] [--out DIR] [--fixture PATH]
+
+Исходники (идентификаторы, пути) и заметки eval читаются `git show` на закреплённом коммите
+`--sha` (по умолчанию `PINNED_SHA`); файлы прогонов и токенизатор — с SHA-256 в
+`estimate_coef.json`. Идентификаторы и ответы, похожие на секреты (`secret_like`), отбрасываются.
 
 `--runs` — JSON dev-прогонов `xtask eval --tokens` (ТС-1: `scenarios`, ТС-2: `sessions`;
 holdout отбрасывается); по умолчанию — прогоны задач 1b, 4, 5 в `.tmp/m6/`. Печатает
@@ -28,13 +32,18 @@ import math
 import os
 import random
 import re
+import subprocess
+import sys
 
 import numpy as np
 import scipy.sparse as sp
 from scipy.optimize import linprog
 from tokenizers import Tokenizer
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+PINNED_SHA = '1c61a1ca498d0ec1a4da1e6a0cd9d1cd9cc9f90b'
 DEFAULT_RUNS = [
     '.tmp/m6/task5/grid/*-dev*.json',
     '.tmp/m6/task1b/pilot2/*-dev.json',
@@ -138,7 +147,7 @@ def norm(t):
 
 def dev_answers(globs):
     """(текст, источник, группа) целых ответов dev-прогонов, без повторов после `norm`."""
-    out, seen = [], set()
+    out, seen, used = [], set(), []
 
     def add(t, src, group):
         if t and t.strip() and len(t) > 10:
@@ -151,6 +160,7 @@ def dev_answers(globs):
         for p in sorted(glob.glob(os.path.join(REPO, g))):
             if '-vs-' in p:
                 continue
+            used.append(p)
             d = json.load(open(p, encoding='utf-8'))
             for sc in d.get('scenarios', []):
                 if sc.get('split', 'dev') != 'dev':
@@ -163,7 +173,7 @@ def dev_answers(globs):
                     continue
                 for st in s.get('steps', []):
                     add(st.get('text'), 'ts2:' + st.get('label', '?'), 'ts2:' + s['id'])
-    return out
+    return out, used
 
 
 PARTS = ['get', 'set', 'User', 'Id', 'And', 'Tenant', 'From', 'Cache', 'Http', 'Client', 'Factory', 'Options',
@@ -197,16 +207,56 @@ MIX = ['Скрипт с CRLF падает', 'Скрипт с CRLF падает �
        'файл src/api/search/mod.rs › pack_items', 'ключ ZAM_SEARCH__BUDGET_TOKENS=800', 'Сервер 0.0.11-m6 на Windows']
 
 
-def code_corpus():
+# Похожие на секреты строки (правила zam_markdown::scan_secrets: префиксы провайдеров, JWT) и
+# длинные смешанные строки (кандидаты энтропии) — в синтетику и фикстуру не попадают.
+SECRET_RE = re.compile(
+    r'(?:AKIA|ASIA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|glpat-[\w-]{20,}'
+    r'|xox[abprs]-[A-Za-z0-9-]{10,}|sk-(?:ant-)?[\w-]{20,}|AIza[\w-]{30,}|hf_[A-Za-z0-9]{20,}'
+    r'|npm_[A-Za-z0-9]{30,}|SG\.[\w-]{16,}|zam_[A-Za-z0-9]{30,}|eyJ[\w-]{7,}\.[\w-]{10,}')
+
+
+def secret_like(s):
+    if SECRET_RE.search(s):
+        return True
+    return any(len(w) >= 32 and re.search(r'[0-9]', w) and re.search(r'[a-z]', w) and re.search(r'[A-Z]', w)
+               for w in re.findall(r'[A-Za-z0-9+/_=-]{32,}', s))
+
+
+def git(*args):
+    return subprocess.run(['git', '-C', REPO, *args], check=True, capture_output=True).stdout
+
+
+def code_corpus(sha):
+    """Идентификаторы и пути исходников на закреплённом коммите `sha` (`git show`)."""
+    names = git('ls-tree', '-r', '--name-only', sha).decode('utf-8').splitlines()
+    files = sorted(p for p in names if (p.startswith('crates/') and p.endswith('.rs'))
+                   or (p.startswith('web/src/') and p.endswith('.ts')))
     idents, paths = set(), []
-    for p in sorted(glob.glob(REPO + '/crates/**/*.rs', recursive=True) + glob.glob(REPO + '/web/src/**/*.ts', recursive=True)):
-        paths.append(os.path.relpath(p, REPO).replace('\\', '/'))
+    for p in files:
+        paths.append(p)
         try:
-            for m in re.finditer(r'\b[A-Za-z_][A-Za-z0-9_]{3,}\b', open(p, encoding='utf-8').read()):
+            src = git('show', f'{sha}:{p}').decode('utf-8')
+        except UnicodeDecodeError:
+            continue
+        for m in re.finditer(r'\b[A-Za-z_][A-Za-z0-9_]{3,}\b', src):
+            if not secret_like(m.group(0)):
                 idents.add(m.group(0))
-        except (OSError, UnicodeDecodeError):
-            pass
     return sorted(idents), paths
+
+
+def corpus_docs(sha):
+    """Заметки eval (`eval/corpus`, `eval/sessions-corpus`) на коммите `sha`."""
+    names = git('ls-tree', '-r', '--name-only', sha, 'eval/corpus', 'eval/sessions-corpus').decode('utf-8').splitlines()
+    files = sorted(p for p in names if p.endswith('.md'))
+    return files, [git('show', f'{sha}:{p}').decode('utf-8') for p in files]
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
 
 
 def synthetic(rng, idents, paths, docs):
@@ -270,26 +320,28 @@ def main():
     ap.add_argument('--runs', nargs='*', default=DEFAULT_RUNS)
     ap.add_argument('--out', default=os.path.join(REPO, '.tmp', 'm6', 'task5', 'diag'))
     ap.add_argument('--fixture')
+    ap.add_argument('--sha', default=PINNED_SHA)
     ap.add_argument('--tokenizer', default=os.path.join(REPO, 'target', 'models', 'tokenizers', 'bge-m3-int8', 'tokenizer.json'))
     a = ap.parse_args()
     tok = Tokenizer.from_file(a.tokenizer)
     bge = lambda t: len(tok.encode(t, add_special_tokens=False).ids)
 
-    real = dev_answers(a.runs)
+    real, used = dev_answers(a.runs)
     groups = sorted({g for _, _, g in real})
     print('ответов dev после дедупликации', len(real), '· групп', len(groups))
-    idents, paths = code_corpus()
-    doc_files = sorted(glob.glob(REPO + '/eval/corpus/**/*.md', recursive=True)
-                       + glob.glob(REPO + '/eval/sessions-corpus/**/*.md', recursive=True))
-    docs = [open(p, encoding='utf-8').read() for p in doc_files]
+    idents, paths = code_corpus(a.sha)
+    doc_files, docs = corpus_docs(a.sha)
 
     # (текст, источник, слой, половина)
     samples = [(t, s, answer_layer(t), half_of(g)) for t, s, g in real]
-    samples += [(d, 'doc', 'docs', half_of(os.path.relpath(p, REPO))) for d, p in zip(docs, doc_files)]
+    samples += [(d, 'doc', 'docs', half_of(p)) for d, p in zip(docs, doc_files)]
     samples += [(p, 'path', 'paths', half_of(p)) for p in paths]
     for h, seed in ((0, 11), (1, 12)):
         samples += [(t, s, l, h) for t, s, l in synthetic(random.Random(seed), idents, paths, docs)]
     samples += [(t, 'mix', 'mixed', half_of(t)) for t in MIX]
+    n0 = len(samples)
+    samples = [x for x in samples if not SECRET_RE.search(x[0])]
+    print('отброшено похожих на секреты текстов:', n0 - len(samples))
 
     X = np.array([feats(t) for t, *_ in samples])
     y = np.array([bge(t) for t, *_ in samples], float)
@@ -379,7 +431,13 @@ def main():
         print(f'{name}: ответов {sel.sum()}, превышений {over.mean() * 100:.2f} %, макс {max(0, exc.max()) * 100:.1f} %, '
               f'недогрузка (400–2000, n {band.sum()}) {(1 - y[band] / B[band]).mean() * 100:.1f} %')
     os.makedirs(a.out, exist_ok=True)
-    json.dump({'coef': coef, 'm': m, 'c': c, 'names': NAMES}, open(os.path.join(a.out, 'estimate_coef.json'), 'w'), indent=1)
+    inputs = {
+        'sha': a.sha,
+        'tokenizer': {'path': os.path.relpath(a.tokenizer, REPO).replace(os.sep, '/'), 'sha256': sha256(a.tokenizer)},
+        'runs': [{'path': os.path.relpath(p, REPO).replace(os.sep, '/'), 'sha256': sha256(p)} for p in used],
+    }
+    json.dump({'coef': coef, 'm': m, 'c': c, 'names': NAMES, 'inputs': inputs},
+              open(os.path.join(a.out, 'estimate_coef.json'), 'w', encoding='utf-8'), indent=1, ensure_ascii=False)
     if a.fixture:  # проверочная половина целых ответов, тексты целиком
         held = [(t, s, l) for (t, s, l, _), r, f_ in zip(samples, R, fit) if r and not f_]
         rng = random.Random(5)

@@ -2094,6 +2094,56 @@ five_crashes_break` («процесс остался»). Тесты оценки
   посчитаны другим токенизатором (оценка, токенизатор комплекта, токенизатор модели) — числа
   разных записей несопоставимы побайтно; `/health` — поля `token_counter`, `tokenizer_id`.
 
+#### После APPROVED задачи 5: Minor контролёра (поверх 1c61a1c)
+
+1. **Секреты в фикстуре.** `code_corpus` брал идентификаторы из исходников вместе с литералами
+   тестовых ключей (`ghp_…`, `AKIA…`). В `eval/tools/estimate_fit.py` — `secret_like`:
+   правила `zam_markdown::scan_secrets` (префиксы AWS, GitHub, GitLab, Slack, `sk-`, Google,
+   Hugging Face, npm, SendGrid, `zam_`, JWT) и кандидаты энтропии (≥ 32 символов, цифры и
+   буквы обоих регистров). Такие идентификаторы в синтетику не попадают, тексты с совпадением
+   правил отбрасываются (20 текстов). Фикстура пересобрана; grep по этим префиксам — пусто.
+2. **Воспроизводимость.** Исходники (идентификаторы, пути) и заметки eval читаются `git show` на
+   закреплённом коммите `PINNED_SHA` = `1c61a1ca498d0ec1a4da1e6a0cd9d1cd9cc9f90b`; входы и итог —
+   в `eval/tools/estimate_coef.json` (коммит, SHA-256 токенизатора и 20 файлов прогонов). Два
+   прогона подряд дают побайтно те же коэффициенты и фикстуру. Прогоны ТС-1/ТС-2 лежат только в
+   `.tmp/` — **воспроизводимы на машине владельца** по хэшам ниже. Токенизатор —
+   `target/models/tokenizers/bge-m3-int8/tokenizer.json`, SHA-256
+   `6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790`.
+
+   | Файл прогона | SHA-256 |
+   |---|---|
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-before-srv0.0.10-m5.7+m6-dev.json` | `564483fbc4f3360828d0bdaa872bc08ef4942e0a4e65755d31a5061d87c720d1` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b400-r0.4.json` | `8fae003bffb20afe7be6b095b8acab54ccbf2cfb6756220d9d29f99235946afb` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b400-r0.5.json` | `708b5c08f3def993df5335a5f15db3684bc20d9f35eb396c5c4a0f342b513a7c` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b400-r0.json` | `4556823b50fbc2b53164d4e674f27ee517a1c495e14f1b2f02e8761100453234` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b600-r0.4.json` | `f27d585da58cc22907c684903fc79739b3cc371fedf25690f9ccc03ea4dd14b2` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b600-r0.5.json` | `09b845cab49beb4630513ee430d2a55cdf02d52b7110cfd1baba456705c3ac8f` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b600-r0.json` | `ee92e0792bd9bc63494876bc697331a7b59fee28e4a028a80e1a9504459a1da2` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b800-r0-aa.json` | `a3980af1fb70cebd0c0ec106cbb9127f59d15b073d04d1a00eda8207428edf34` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b800-r0.4.json` | `98449dd66192d29f50dddaaf4946b03ac6bd5ddd64109fee923c2242c5a9cd63` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b800-r0.5.json` | `a0b1abb51ccb8e51d390291a7404d6e08bfa9022f01062186c99d41d322da431` |
+| `.tmp/m6/task5/grid/2026-11-05-m6-bge-m3-fp16-tokens-srv0.0.10-m5.7+m6-dev-b800-r0.json` | `c8ebd4eafdb2f1b57cac21c930d8fdfa8098aa639d275764900b9408195cdc1b` |
+| `.tmp/m6/task1b/pilot2/2026-11-05-m6-bge-m3-fp16-tokens-b56-srv0.0.9-m5.6-dev.json` | `6c0bc6d172b146d0a23de11153541d0dbc66cbd334d654d5badba8a00bdc2adc` |
+| `.tmp/m6/task1b/pilot2/2026-11-05-m6-bge-m3-fp16-tokens-m6-srv0.0.10-m5.7+m6-dev.json` | `af69f64d77f82db50816df0d180195bef249fc6faf9efc410b7f9f5445ad3b2b` |
+| `.tmp/m6/task5/snippet/2026-11-05-m6-bge-m3-fp16-sessions-s60-srv0.0.10-m5.7+m6-dev.json` | `06ecbe24d7c4fd8cd642a1494c1cbcfe78c29b5ea1bf342baa2e670afb4b2858` |
+| `.tmp/m6/task5/snippet/2026-11-06-m6-bge-m3-fp16-sessions-new1-srv0.0.10-m5.7+m6-dev.json` | `f6a53d8cc94f200ce8f71f0051f1a7405cb7d7c9379742f2f1df449ec162cdd3` |
+| `.tmp/m6/task5/snippet/2026-11-06-m6-bge-m3-fp16-sessions-old-srv0.0.10-m5.7+m6-dev.json` | `eaa814023d45748779e002839d32464e4f85c36cc40d3a79e4a1b3c3ecfe080a` |
+| `.tmp/m6/task5/snippet/2026-11-06-m6-bge-m3-fp16-sessions-s40-srv0.0.10-m5.7+m6-dev.json` | `e080415ada177a95db1ffffc6bf1fb67c2db32c5ab35d5057c93d5c25cfdb334` |
+| `.tmp/m6/task4/pilot2/2026-11-05-m6-bge-m3-fp16-sessions-b56-srv0.0.9-m5.6-dev.json` | `fba017d8922ab18536717598da30aae2d606dcb1ac573feace518b91290d68c8` |
+| `.tmp/m6/task4/pilot2/2026-11-05-m6-bge-m3-fp16-sessions-b57-srv0.0.10-m5.7-dev.json` | `4de875cae543107b6d89df9239c149c866fe64b961388b6926031b4925e22450` |
+| `.tmp/m6/task4/pilot2/2026-11-05-m6-bge-m3-fp16-sessions-m6-srv0.0.10-m5.7+m6-dev.json` | `05d4de47559528668c2879682e1769741a5a557e61be23a21c4c496e3a3db6ca` |
+
+   Пересчёт после п. 1: **m = 1,11, c = 3** (`ESTIMATE_M` = 1110, `ESTIMATE_C` = 3; было 1,12 и
+   2), новая `ESTIMATE_TABLE`, знак ASCII 0,854, прочий 1,446, `tokenizer_id` **`estimate-v6`**.
+   Расхождение ревьюера (1,11 / 1) — от незакреплённых входов (рабочее дерево исходников).
+   Несмещённость на проверке: проза 1,024, выдача с id 1,054, код 0,998, заметки 0,996,
+   идентификаторы 1,010, пути 1,003, строки карты 0,974, C#/Java/TS 0,971, смешанные 0,994,
+   карточки 1,050, фразы письменностей 0,988–1,089. p99 bge-m3 / оценка: проза 1,071, выдача
+   с id 1,108, код 1,039, письменности 1,056. **Критерии на проверочной половине** (512 целых
+   ответов): превышений **0 %** (≤ 1 %), наибольшее **0 %** (≤ 5 %), недогрузка (400–2000, 262
+   ответа) **13,4 %** (≤ 15 %); подбор — 0 %, 0 %, 12,8 %. Фикстура — 220 целых ответов, 976 КиБ.
+3. Скрипт: `sys.stdout.reconfigure(encoding="utf-8")`, запуск — `python -X utf8 …`.
+
 ### Задача 6. Дата UTC, замороженные часы
 
 ### Задача 7a. Эпохи и «уже выдавалось»

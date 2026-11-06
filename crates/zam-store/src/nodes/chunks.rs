@@ -343,7 +343,7 @@ pub fn budget_counter_kind() -> BudgetCounterKind {
 }
 
 /// `tokenizer_id` активного счётчика выдачи (`/health`): у токенизатора — по его
-/// `tokenizer.json`, у оценки — версия (`estimate-v5`).
+/// `tokenizer.json`, у оценки — версия (`estimate-v6`).
 pub fn budget_tokenizer_id() -> String {
     budget_counter().tokenizer_id()
 }
