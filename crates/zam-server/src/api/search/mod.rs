@@ -250,7 +250,7 @@ use self::targets::{
 use super::doc_locator::{self, Sheets, secret_sheet};
 use super::json_body;
 use super::scope::skip_foreign;
-use super::sessions::{McpOrigin, RequestSession, explicit_only, request_session};
+use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
@@ -2275,7 +2275,7 @@ pub async fn search(
     let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
     // сессия: некорректный id — 400; сбой её базы поиск не валит (WARN, без пометок)
-    let session = match request_session(
+    let session = match seen_session(
         &st,
         &p,
         &headers,

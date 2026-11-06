@@ -843,6 +843,30 @@ async fn read_without_session_byte_equal_m57() {
     // первое чтение в сессии — тот же ответ (пометки ещё нет)
     let got = l2_answers(&a, &ids, Some("s-first"), &["json"]).await;
     assert_eq!(got["json"], want["json"]);
+    // итог под меткой `<total>` — не произвольный: сумма заголовков md и `tokens` элементов
+    // (всё выдано целиком), одинаковый в json и md
+    let items: Vec<Value> = ids.iter().map(|i| json!({"id": i})).collect();
+    let j = read_ok(&a, json!({"items": items, "budget_tokens": 5000})).await;
+    let md = read(
+        &a,
+        json!({"items": items, "format": "md", "budget_tokens": 5000}),
+    )
+    .await
+    .text();
+    let heads: usize = md
+        .lines()
+        .filter(|l| l.starts_with("### "))
+        .map(count_tokens)
+        .sum();
+    let texts: u64 = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["tokens"].as_u64().unwrap())
+        .sum();
+    let total = j["total_tokens"].as_u64().unwrap();
+    assert_eq!(total, heads as u64 + texts, "{md}");
+    assert!(md.trim_end().ends_with(&format!("~{total} tok")), "{md}");
 }
 
 // ---- «уже выдавалось» (M6 §7.3, задача 7a) ----

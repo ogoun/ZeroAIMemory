@@ -108,7 +108,9 @@
 //!   выданное в прежних эпохах больше не считается показанным (повторы подсказок, ответы на
 //!   вопросы), а показ этого ответа отмечается в новой. Не зависит от `record` и настроек
 //!   подсказок: эпоха — состояние контекста агента. Показ идей — без эпохи: раздел `### Идеи` и
-//!   подсказки-идеи `prompt` видят показ любой эпохи. Сбой — WARN, эпоха прежняя;
+//!   подсказки-идеи `prompt` видят показ любой эпохи. Сбой — WARN, эпоха прежняя, и этот
+//!   ответ ничего не прячет как показанное (фильтра повторов текущей эпохи нет): лучше
+//!   повторить, чем потерять выданное до сжатия;
 //! - **пакет восстановления** (M4.5 §9.2) — `event: recovery` (MCP, агенты без
 //!   `SessionStart compact`) или `session_start` с `source` `compact | resume`: бюджет по
 //!   умолчанию `recall.recovery_tokens` (2000), разделы по порядку — `### Задачи` (захваченные
@@ -173,7 +175,7 @@ use super::json_body;
 use super::nodes::read::l1;
 use super::search::targets::{ScopeReq, SearchTarget, dedup_keep_order, resolve_targets};
 use super::search::{Health, SOLUTION_HEADER};
-use super::sessions::{McpOrigin, RequestSession, explicit_only, request_session};
+use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
 use super::user_settings::{UserFlags, user_flags};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, SESSION_HEADER};
@@ -193,6 +195,10 @@ pub const ACCOUNTING_RESERVE_MS: u64 = 40;
 pub const TEST_SLOW_RULE_MARK: &str = "zam-test-slow-rule";
 #[cfg(feature = "test-hooks")]
 const TEST_SLOW_RULE_MS: u64 = 40;
+/// Тестовое начало id сессии: новая эпоха `session_seen` в `/recall` «не записывается» (фича
+/// `test-hooks`, проверка ответа без фильтра повторов при сбое `bump_epoch`).
+#[cfg(feature = "test-hooks")]
+pub const TEST_EPOCH_FAIL_PREFIX: &str = "zam-test-epoch-fail";
 /// Заметок Rules в дайджесте.
 pub const RULES_MAX: usize = 20;
 /// Предел L1 одной заметки Rules в дайджесте, токенов.
@@ -3150,7 +3156,7 @@ pub async fn recall(
         return Err(ApiError::BadRequest("solution: GUID решения".into()));
     }
     // сессия: некорректный id — 400; сбой её базы подсказки не валит (без учёта повторов)
-    let mut session = match request_session(
+    let mut session = match seen_session(
         &st,
         &p,
         &headers,
@@ -3168,6 +3174,8 @@ pub async fn recall(
             None
         }
     };
+    // новая эпоха не записалась (M6 §7.2): ответ без фильтра повторов текущей эпохи
+    let mut epoch_failed = false;
     if let Some(s) = &mut session {
         // известное из тела дописывается в сессию
         if let Some(g) = &req.solution {
@@ -3184,9 +3192,20 @@ pub async fn recall(
                     .as_deref()
                     .is_some_and(|src| EPOCH_SOURCES.contains(&src.trim())));
         if new_epoch {
-            match bump_epoch(&s.db, &s.touch.id).await {
+            #[cfg(feature = "test-hooks")]
+            let r = if s.touch.id.starts_with(TEST_EPOCH_FAIL_PREFIX) {
+                Err(StoreError::Corrupt("тестовый сбой новой эпохи".into()))
+            } else {
+                bump_epoch(&s.db, &s.touch.id).await
+            };
+            #[cfg(not(feature = "test-hooks"))]
+            let r = bump_epoch(&s.db, &s.touch.id).await;
+            match r {
                 Ok(e) => s.touch.epoch = e,
-                Err(e) => tracing::warn!(error = %e, "recall: новая эпоха сессии не записана"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "recall: новая эпоха сессии не записана");
+                    epoch_failed = true;
+                }
             }
         }
     }
@@ -3333,7 +3352,7 @@ pub async fn recall(
     // вопрос показывается сессии один раз и в повторяемом дайджесте, а в пакете восстановления —
     // снова (контекст потерян, §9.2)
     let all: Vec<&Cand> = sections.iter().flat_map(|(_, c)| c).collect();
-    let seen = if recovery || brief_event {
+    let seen = if recovery || brief_event || epoch_failed {
         HashSet::new()
     } else if repeatable {
         let once: Vec<&Cand> = all

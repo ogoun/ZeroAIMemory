@@ -103,7 +103,7 @@ use super::scope::{
     node_scope, space_scope,
 };
 use super::search::md_inline;
-use super::sessions::{McpOrigin, RequestSession, explicit_only, request_session};
+use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -1426,7 +1426,7 @@ pub async fn read(
         tiers.push(tier);
     }
     // сессия: некорректный id — 400; сбой её базы чтение не валит (WARN)
-    let session = match request_session(
+    let session = match seen_session(
         &st,
         &p,
         &headers,

@@ -12,8 +12,10 @@
 //! На `source` `compact` и `clear` (контекст агента потерян) показанное `pre-tool` в сессии
 //! сбрасывается, факт правок остаётся.
 //! M6 §7.2: новую эпоху `session_seen` на `source` `compact | resume | clear` начинает сам
-//! сервер в этом же `/recall` (`source` уже в теле) — отдельного запроса хук не шлёт, и
-//! старый клиент получает эпохи тоже.
+//! сервер в этом же `/recall` (`source` уже в теле). Выключенный в клиенте `recovery` убирает
+//! `source` из тела — тогда хук шлёт отдельный `POST /sessions {id, new_epoch: true}`
+//! ([`super::checkpoint::new_epoch`]) параллельно с `/recall`, в том же бюджете. Клиент
+//! v0.0.10-m5.7 с выключенным `recovery` эпохи на старте не начинает (матрица 13b/13c).
 //! M4.5: в том же параллельном наборе — `GET /file-refs` с `If-None-Match` (кэш знания о файле
 //! `file-refs.json`; ключ `file_context` выключен — не запрашивается) и отправка очередей
 //! изменённых файлов всех сессий проекта (`POST /files/changed`, [`cache::flush_changed`]).
@@ -160,7 +162,13 @@ fn digest_net(
         return local(s);
     };
     let solution = env.solution.as_ref().map(|x| x.id.clone());
+    // `recovery` выключен в клиенте: `source` к серверу не уходит — эпоху начинает хук сам
+    let epoch_source = matches!(source, Some("compact" | "resume" | "clear"))
+        && s.client.get(Flag::Recovery) == Some(false);
     let (reg, recall, trig) = std::thread::scope(|sc| {
+        let bump = session
+            .filter(|_| epoch_source)
+            .map(|id| sc.spawn(|| super::checkpoint::new_epoch(env, &client, id)));
         let reg = session.map(|id| {
             let body = json!({"id": id, "agent": env.agent.name(), "solution": solution});
             let c = &client;
@@ -211,6 +219,11 @@ fn digest_net(
             && h.join().is_err()
         {
             env.log("sessions(tokens): паника");
+        }
+        if let Some(h) = bump
+            && h.join().is_err()
+        {
+            env.log("sessions(new_epoch): паника");
         }
         (reg.map(|h| h.join()), recall.join(), trig.join())
     });

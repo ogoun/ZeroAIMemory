@@ -106,12 +106,8 @@ pub struct McpOrigin {
 
 /// Сессия запроса без записи: `session_id` из тела сильнее `X-Zam-Session`; `None` — запрос
 /// без сессии. Некорректный id — 400. `origin` — признак MCP из расширений запроса.
-///
-/// У явной сессии `touch.epoch` — текущая эпоха `session_seen` (M6 §7.2), прочитанная здесь,
-/// в начале запроса: и чтение выданного, и отметки запроса идут в неё. Новая эпоха, пришедшая
-/// во время запроса, отметки не переносит — запрос отметит выданное в прежней эпохе, и оно
-/// один раз повторится (журнал задачи 2, M5: перенос отметки в новую эпоху спрятал бы текст,
-/// который агент потерял при сжатии контекста). Неявной сессии эпоха не нужна.
+/// Эпоха `session_seen` здесь не читается (`touch.epoch` — 0): она нужна только выдаче —
+/// [`seen_session`].
 pub async fn request_session(
     st: &AppState,
     p: &Principal,
@@ -130,16 +126,35 @@ pub async fn request_session(
     // id в теле агент задал сам; заголовок неявен, только если его подставил MCP
     let body = body_session.is_some_and(|s| !s.trim().is_empty());
     let explicit = body || !origin.is_some_and(|o| o.implicit);
-    let mut touch = touch;
-    if explicit {
-        touch.epoch = session_epoch(&db, &touch.id).await?;
-    }
     Ok(Some(RequestSession {
         touch,
         db,
         explicit,
         via_mcp,
     }))
+}
+
+/// Сессия запроса выдачи (`/read`, `/recall`, `/search`): только явная (M6 §7.1, неявная —
+/// `None`) и с текущей эпохой `session_seen` в `touch.epoch` (§7.2).
+///
+/// Эпоха читается в начале запроса: и чтение выданного, и отметки запроса идут в неё. Новая
+/// эпоха, пришедшая во время запроса, отметки не переносит — запрос отметит выданное в прежней
+/// эпохе, и оно один раз повторится (журнал задачи 2, M5: перенос отметки в новую эпоху спрятал
+/// бы текст, который агент потерял при сжатии контекста). Сбой чтения эпохи — ошибка хранилища
+/// (вызывающий выдаёт ответ без отметок и пометок, WARN).
+pub async fn seen_session(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    origin: Option<&McpOrigin>,
+    body_session: Option<&str>,
+) -> Result<Option<RequestSession>, ApiError> {
+    let Some(mut s) = explicit_only(request_session(st, p, headers, origin, body_session).await?)
+    else {
+        return Ok(None);
+    };
+    s.touch.epoch = session_epoch(&s.db, &s.touch.id).await?;
+    Ok(Some(s))
 }
 
 /// Сессия запроса с явной сессией (M6 §7.1); неявная — `None`, как запрос без сессии.

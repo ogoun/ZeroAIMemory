@@ -3444,43 +3444,107 @@ fn changed_flush_partial_failure_returns_rest() {
 /// Пометка `/read` о повторной выдаче (§7.3).
 const REREAD: &str = "· уже выдавалось в этой сессии";
 
-/// `PreCompact` (`checkpoint`): `POST /sessions {id, new_epoch: true}` в бюджете хука — и без
-/// `SessionStart` (сессии ещё нет), и после него; вывод — тишина.
+/// Причины, по которым запрос новой эпохи не дошёл, по строкам `hooks.log`: промах бюджета до
+/// запроса (`HOOK_BUDGET_SPENT` — запроса не было), сеть или срок запроса (`sessions(new_epoch):
+/// сеть` — сервер мог успеть начать эпоху), ответ с ошибкой (`sessions(new_epoch): HTTP` —
+/// эпохи нет).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EpochMisses {
+    budget: usize,
+    net: usize,
+    http: usize,
+}
+
+impl EpochMisses {
+    fn of(log: &str) -> EpochMisses {
+        EpochMisses {
+            budget: log.matches(zam_core::HOOK_BUDGET_SPENT).count(),
+            net: log.matches("sessions(new_epoch): сеть").count(),
+            http: log.matches("sessions(new_epoch): HTTP").count(),
+        }
+    }
+
+    fn since(self, before: EpochMisses) -> EpochMisses {
+        EpochMisses {
+            budget: self.budget - before.budget,
+            net: self.net - before.net,
+            http: self.http - before.http,
+        }
+    }
+}
+
+/// `PreCompact` (`checkpoint`, M6 §7.2: «в бюджете хука 100 мс»): `POST /sessions {id,
+/// new_epoch: true}` идёт с тайм-аутом по остатку бюджета (100 мс − резерв 30 мс = 70 мс на
+/// HTTP) — медленный сервер хук не задерживает; и без `SessionStart` (сессии ещё нет), и после
+/// него; вывод — тишина. Время процесса отладочной сборки — по правилу файла (×4, 400 мс).
 #[test]
-fn checkpoint_precompact_new_epoch_within_100ms() {
+fn checkpoint_precompact_new_epoch_in_hook_budget() {
     let _g = serial();
-    let (url, tok) = start("precompact-epoch");
-    let p = Proj::new("precompact-epoch", &url, &tok);
-    let pc = |s: &str| {
+    let pc = |p: &Proj, s: &str| {
         p.ev(
             "PreCompact",
             s,
             json!({"trigger": "auto", "custom_instructions": ""}),
         )
+        .to_string()
     };
+    // медленный сервер (ответ через 2 с): хук не ждёт его дольше своего бюджета HTTP
+    let (slow, seen) = common::stub(201, r#"{"id":"ps-1","epoch":1}"#, Duration::from_secs(2));
+    let q = Proj::new("precompact-slow", &slow, "zam_x");
+    let warm = q.ev("Stop", "ps-warm", json!({"stop_hook_active": false}));
+    let _ = q.hook_at(&slow, "checkpoint", "claude", warm.to_string().as_bytes());
+    let (o, d) = q.hook_at(&slow, "checkpoint", "claude", pc(&q, "ps-1").as_bytes());
+    empty(&o);
+    assert!(
+        d <= max_for("checkpoint"),
+        "медленный сервер задержал хук: {d:?}"
+    );
+    let m = EpochMisses::of(&q.log());
+    let posts = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, path, _)| m == "POST" && path == "/api/v1/sessions")
+        .count();
+    // запрос ушёл и снят по сроку — или до него не дошло (промах бюджета старта процесса)
+    assert!(
+        (posts == 1 && m.net == 1) || (posts == 0 && m.budget >= 1),
+        "запросов {posts}, {m:?}: {}",
+        q.log()
+    );
+
+    let (url, tok) = start("precompact-epoch");
+    let p = Proj::new("precompact-epoch", &url, &tok);
     // прогрев процесса `zam` (холодный запуск с HDD — не бюджет хука)
     let warm = p.ev("Stop", "pe-warm", json!({"stop_hook_active": false}));
     empty(&p.hook("checkpoint", &warm));
-    // `PreCompact` сессии `s`: время процесса и ушёл ли запрос. Промах бюджета до запроса
-    // (отладочная сборка на занятом HDD: старт процесса > 70 мс) — поведение продукта: хук
-    // молчит без эпохи, строка `HOOK_BUDGET_SPENT` в `hooks.log` (срок запроса —
-    // `sessions(new_epoch)`); такой вызов не считается
-    let misses = || {
-        let log = p.log();
-        log.matches(zam_core::HOOK_BUDGET_SPENT).count()
-            + log.matches("sessions(new_epoch)").count()
+    // `n` вызовов `PreCompact` сессии `s`: эпоха растёт на число дошедших — от `ok` до
+    // `ok + net` (срок запроса мог истечь после того, как сервер её начал); промах бюджета
+    // отладочной сборки на занятом HDD (старт процесса дольше 70 мс) — поведение продукта
+    let run = |s: &str, n: usize| -> (usize, EpochMisses) {
+        let before = EpochMisses::of(&p.log());
+        for _ in 0..n {
+            let (o, d) = p.hook_at(&url, "checkpoint", "claude", pc(&p, s).as_bytes());
+            empty(&o);
+            assert!(d <= max_for("checkpoint"), "checkpoint {d:?}");
+        }
+        let m = EpochMisses::of(&p.log()).since(before);
+        assert_eq!(m.http, 0, "ответ сервера с ошибкой: {}", p.log());
+        (n - m.budget - m.net, m)
     };
-    let run = |s: &str| {
-        let before = misses();
-        let (o, d) = p.hook_at(&url, "checkpoint", "claude", pc(s).to_string().as_bytes());
-        empty(&o);
-        assert!(d <= max_for("checkpoint"), "checkpoint {d:?}");
-        misses() == before
+    let in_range = |s: &str, from: usize, m: EpochMisses| {
+        let e = p.session(s)["seen_epoch"].as_u64().unwrap() as usize;
+        assert!(
+            (from..=from + m.net).contains(&e),
+            "{s}: эпоха {e}, дошло {from}, {m:?}: {}",
+            p.log()
+        );
+        e
     };
-    // без `SessionStart`: сессия создаётся с эпохой 1 (до 5 попыток при промахах бюджета)
-    let sent = (0..5).find(|_| run("pe-0")).is_some();
-    assert!(sent, "все 5 вызовов — промах бюджета: {}", p.log());
-    assert_eq!(p.session("pe-0")["seen_epoch"], 1);
+    // без `SessionStart`: сессия создаётся (каждый дошедший вызов — +1 от 0)
+    let (ok, m) = run("pe-0", 3);
+    assert!(ok + m.net >= 1, "все вызовы — промах бюджета: {}", p.log());
+    in_range("pe-0", ok, m);
     // сессия есть (регистрация, как у `session-start`): каждый `PreCompact` — +1
     let r = http()
         .post(&format!("{url}/api/v1/sessions"))
@@ -3490,23 +3554,24 @@ fn checkpoint_precompact_new_epoch_within_100ms() {
         .unwrap();
     assert_eq!(r.status(), 201);
     assert_eq!(p.session("pe-1")["seen_epoch"], 0);
-    let sent = (0..3).filter(|_| run("pe-1")).count();
-    assert!(sent >= 1, "все вызовы — промах бюджета: {}", p.log());
-    assert_eq!(p.session("pe-1")["seen_epoch"], sent, "{}", p.log());
+    let (ok, m) = run("pe-1", 3);
+    assert!(ok + m.net >= 1, "все вызовы — промах бюджета: {}", p.log());
+    let e = in_range("pe-1", ok, m);
     // `Stop` эпоху не меняет
     let st = p.ev("Stop", "pe-1", json!({"stop_hook_active": false}));
     empty(&p.hook("checkpoint", &st));
-    assert_eq!(p.session("pe-1")["seen_epoch"], sent);
+    assert_eq!(p.session("pe-1")["seen_epoch"], e);
 }
 
-/// Старый сервер (v0.0.10-m5.7) отвечает на `new_epoch` 400 (`deny_unknown_fields`): хук молчит,
-/// код 0, в `hooks.log` — ничего; запрос — отдельный, только `{id, new_epoch}` (§13).
+/// Старый сервер (v0.0.10-m5.7) отвечает на `new_epoch` 400 (`deny_unknown_fields`, «unknown
+/// field `new_epoch`»): хук молчит, код 0, в `hooks.log` — ничего; запрос — отдельный, только
+/// `{id, new_epoch}` (§13). Другой 400 — строка `sessions(new_epoch): HTTP 400` в журнале.
 #[test]
 fn old_server_new_epoch_400_silent() {
     let _g = serial();
     let (url, seen) = common::stub(
         400,
-        r#"{"type":"/problems/bad-request","status":400,"detail":"unknown field `new_epoch`"}"#,
+        r#"{"type":"/problems/bad-request","status":400,"detail":"некорректное тело: unknown field `new_epoch`, expected one of `id`, `agent`"}"#,
         Duration::ZERO,
     );
     let p = Proj::new("old-epoch", &url, "zam_x");
@@ -3524,13 +3589,89 @@ fn old_server_new_epoch_400_silent() {
         .filter(|(m, path, _)| m == "POST" && path == "/api/v1/sessions")
         .map(|(_, _, v)| v)
         .collect();
-    assert_eq!(
-        posts,
-        [&json!({"id": "oe-1", "new_epoch": true})],
-        "{sent:?}"
+    let log = p.log();
+    if log.contains(zam_core::HOOK_BUDGET_SPENT) {
+        // промах бюджета старта процесса: запроса не было
+        assert!(posts.is_empty(), "{sent:?}");
+    } else {
+        assert_eq!(
+            posts,
+            [&json!({"id": "oe-1", "new_epoch": true})],
+            "{sent:?}"
+        );
+    }
+    assert!(!log.contains("new_epoch"), "{log}");
+    // 400 по другой причине — не «старый сервер»: в журнал с кодом
+    let (url, _) = common::stub(
+        400,
+        r#"{"type":"/problems/bad-request","status":400,"detail":"id сессии «unattributed» зарезервирован"}"#,
+        Duration::ZERO,
     );
-    assert!(!p.log().contains("new_epoch"), "{}", p.log());
-    assert!(!p.log().contains("эпох"), "{}", p.log());
+    let p = Proj::new("other-400-epoch", &url, "zam_x");
+    // событие — со своим `cwd`: журнал хука лежит в проекте события
+    let pc = p.ev(
+        "PreCompact",
+        "oe-2",
+        json!({"trigger": "manual", "custom_instructions": ""}),
+    );
+    let (o, _) = p.hook_at(&url, "checkpoint", "claude", pc.to_string().as_bytes());
+    empty(&o);
+    let log = p.log();
+    assert!(
+        log.contains("sessions(new_epoch): HTTP 400") || log.contains(zam_core::HOOK_BUDGET_SPENT),
+        "{log}"
+    );
+}
+
+/// M6 §7.2, ревью задачи 7a (I1): выключенный в клиенте `recovery` убирает `source` из тела
+/// `/recall`, и сервер эпоху не начинает — тогда `session-start` с `source` `compact | resume |
+/// clear` шлёт `POST /sessions {id, new_epoch: true}` сам; `startup` эпоху не меняет.
+#[test]
+fn session_start_recovery_off_new_epoch() {
+    let _g = serial();
+    let (url, tok) = start("ss-recovery-off");
+    let p = Proj::new("ss-recovery-off", &url, &tok);
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]\nrecovery = false\n",
+    )
+    .unwrap();
+    let ss = |s: &str, src: &str| {
+        p.hook(
+            "session-start",
+            &p.ev("SessionStart", s, json!({"source": src})),
+        )
+    };
+    // регистрация — прямым запросом: промах бюджета `startup` тест не касается
+    let r = http()
+        .post(&format!("{url}/api/v1/sessions"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .content_type("application/json")
+        .send(r#"{"id":"ro-1","agent":"claude"}"#)
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    assert_eq!(p.session("ro-1")["seen_epoch"], 0);
+    let mut want = 0usize;
+    for src in ["compact", "resume", "clear", "startup"] {
+        let before = EpochMisses::of(&p.log());
+        ss("ro-1", src);
+        let m = EpochMisses::of(&p.log()).since(before);
+        assert_eq!(m.http, 0, "{}", p.log());
+        let e = p.session("ro-1")["seen_epoch"].as_u64().unwrap() as usize;
+        if src == "startup" {
+            assert_eq!(e, want, "startup эпоху не меняет");
+        } else {
+            // дошло — +1; промах бюджета — +0; срок запроса — +0 или +1
+            let lo = want + usize::from(m.budget == 0 && m.net == 0);
+            assert!(
+                (lo..=want + 1).contains(&e),
+                "{src}: эпоха {e}, было {want}, {m:?}: {}",
+                p.log()
+            );
+        }
+        want = e;
+    }
+    assert!(want >= 1, "ни одной эпохи: {}", p.log());
 }
 
 /// §17 п. 7 через хуки и `zam read --batch` (пачка — `POST /read`; побайтное чтение без пачки
@@ -3574,20 +3715,29 @@ fn compact_resets_seen() {
         s,
         json!({"trigger": "auto", "custom_instructions": ""}),
     );
+    // промахи считаются только у двух вызовов ниже (не у `startup` до чтения)
+    let log_before = p.log();
     empty(&p.hook("checkpoint", &pc));
     p.hook(
         "session-start",
         &p.ev("SessionStart", s, json!({"source": "compact"})),
     );
-    // обе новые эпохи; промах бюджета хука (отладочная сборка на занятом HDD) — только если он
-    // записан в `hooks.log`, и хотя бы одна эпоха должна начаться
-    let epoch = p.session(s)["seen_epoch"].as_u64().unwrap();
-    let missed = p.log().matches(zam_core::HOOK_BUDGET_SPENT).count() as u64;
-    assert!(
-        epoch >= 1 && epoch + missed >= 2,
-        "эпоха {epoch}: {}",
-        p.log()
-    );
+    // обе новые эпохи; без промахов — ровно 2. Промах бюджета (отладочная сборка на занятом
+    // HDD) или сбой запроса этих двух вызовов допускает меньше, но не 0
+    let after = p.log();
+    let fresh = after.strip_prefix(log_before.as_str()).unwrap_or(&after);
+    let missed = fresh.matches(zam_core::HOOK_BUDGET_SPENT).count()
+        + fresh.matches("sessions(new_epoch)").count()
+        + fresh.matches("recall(session_start)").count();
+    let epoch = p.session(s)["seen_epoch"].as_u64().unwrap() as usize;
+    if missed == 0 {
+        assert_eq!(epoch, 2, "{fresh}");
+    } else {
+        assert!(
+            (1..=2).contains(&epoch),
+            "эпоха {epoch}, промахов {missed}: {fresh}"
+        );
+    }
     let after = read();
     assert!(
         after.contains("Квазар светит ярко.") && !after.contains(REREAD),

@@ -136,15 +136,31 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
     })
 }
 
-/// Новая эпоха `session_seen` сессии (`PreCompact`, M6 §7.2): отдельный запрос, чтобы старый
-/// сервер (`deny_unknown_fields` тела, 400) не потерял ничего другого; 400 — молча.
-fn new_epoch(env: &Env, client: &Client, session: &str) {
+/// Новая эпоха `session_seen` сессии (M6 §7.2; `PreCompact`, а также `session-start` при
+/// выключенном в клиенте `recovery`): отдельный запрос, чтобы старый сервер
+/// (`deny_unknown_fields` тела) не потерял ничего другого. Молча — только 400 старого сервера
+/// про неизвестное поле `new_epoch` ([`old_server_epoch`]); прочее — в `hooks.log` с причиной:
+/// `sessions(new_epoch): HTTP <код>: …` (сервер ответил — эпохи нет) или `sessions(new_epoch):
+/// сеть: …` (сеть, срок запроса — сервер мог успеть её начать).
+pub fn new_epoch(env: &Env, client: &Client, session: &str) {
     let body = serde_json::json!({"id": session, "new_epoch": true});
     match client.post_json("/sessions", &body) {
         Ok(_) => {}
-        Err(e) if e.http_status() == Some(400) => {}
-        Err(e) => env.log(&format!("sessions(new_epoch): {e}")),
+        Err(e) if old_server_epoch(&e) => {}
+        Err(e) => match e.http_status() {
+            Some(code) => env.log(&format!("sessions(new_epoch): HTTP {code}: {e}")),
+            None => env.log(&format!("sessions(new_epoch): сеть: {e}")),
+        },
     }
+}
+
+/// 400 старого сервера (v0.0.10-m5.7) на неизвестное поле `new_epoch` тела `POST /sessions`.
+fn old_server_epoch(e: &crate::client::CliError) -> bool {
+    e.http_status() == Some(400)
+        && e.problem
+            .as_ref()
+            .and_then(|p| p["detail"].as_str())
+            .is_some_and(|d| d.contains("new_epoch"))
 }
 
 /// Напоминание возможно (`Stop`, включено, правки были, ещё не напоминали): сессия и
