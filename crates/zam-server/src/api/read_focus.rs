@@ -28,14 +28,17 @@
 //! (`max_tokens` элемента или бюджет пачки): листы отбираются по баллу, пока куски и резерв
 //! пометок влезают (первый — всегда); строка оглавления — на остаток.
 //!
-//! **Срок** `read.focus_timeout_ms` — один на весь вызов `/read` ([`FocusCtx`]): эмбеддинги
-//! различных текстов `focus` (только у целей, где фокус возможен: узел, путь, голый id, `d:`,
-//! `b:`) запускаются в начале вызова общими futures; цели вызова идут конкурентно, каждая ждёт
+//! **Срок** вызова `/read` — один на все цели ([`FocusCtx`], [`call_timeout`]):
+//! `focus_timeout_ms × K`, но не больше `focus_timeout_max_ms`; K — различных текстов `focus` у
+//! целей, где фокус возможен (узел, путь, голый id, `d:`, `b:`). Их эмбеддинги — одна блокирующая
+//! задача на вызов, по порядку элементов запроса: перед каждым текстом — проверка флага отмены,
+//! результат — в oneshot своего текста (общие futures; цели вызова идут конкурентно). Цель ждёт
 //! эмбеддинг и векторы листов не дольше остатка срока. Разбор текста, поиск листов и токенизация
 //! частей — в пуле блокирующих задач. Не успели, модели нет или векторов листов нет в кэше —
-//! только лексика и `focus lexical`. Эмбеддинг, не начавшийся до ответа, не запускается (флаг
-//! отмены — сессию запросов модели не занимает); начавшийся дорабатывает (инференс не
-//! прерывается). Пакетный эмбеддинг (`Embedder::embed_queries`) — [`FOCUS_BATCH_DEFAULT`].
+//! только лексика и `focus lexical`. После ответа тексты, до которых задача не дошла, не
+//! эмбеддятся; начатый инференс дорабатывает (ORT не прерывается). Пакетный эмбеддинг
+//! (`Embedder::embed_queries`) — [`FOCUS_BATCH_DEFAULT`]. Размер выдачи — один точный подсчёт
+//! готового текста.
 //!
 //! Целиком без фокуса: листов не больше `focus_leaves` (`focus skipped: short`); листов нет,
 //! нарезка другой ревизии или лист не нашёлся в тексте (секрет в листе: нарезка — по
@@ -122,7 +125,7 @@ impl FocusPart {
 pub struct FocusOut {
     /// Оглавление, куски и пропуски.
     pub text: String,
-    /// Токены `text` (сумма частей, пометок и оглавления — без повторной токенизации).
+    /// Токены `text` — один точный подсчёт готового текста (упаковка его не повторяет).
     pub tokens: usize,
     /// `chunk_id` выданных листов (отметка `session_seen`, `part = chunk_id`).
     pub leaves: Vec<String>,
@@ -149,66 +152,53 @@ type QueryFut = Shared<BoxFuture<'static, Option<Arc<Vec<f32>>>>>;
 pub const FOCUS_BATCH_DEFAULT: bool = false;
 
 /// Фокус одного вызова `/read`: настройки, общий срок и эмбеддинги текстов `focus`, запущенные в
-/// начале вызова (общие futures — цели вызова идут конкурентно).
+/// начале вызова одной блокирующей задачей (общие futures — цели вызова идут конкурентно).
 pub struct FocusCtx<'a> {
     st: &'a AppState,
     cfg: &'a ReadSection,
     deadline: Instant,
     queries: HashMap<String, QueryFut>,
-    /// Флаг отмены: эмбеддинг, не начавшийся до ответа, не запускается и не держит сессию
-    /// запросов модели.
+    /// Флаг отмены: тексты, до которых задача эмбеддинга не дошла к ответу, не эмбеддятся и
+    /// сессию запросов модели не занимают.
     cancel: Arc<AtomicBool>,
-    tasks: Vec<tokio::task::AbortHandle>,
 }
 
-/// Эмбеддинг текстов в пуле блокирующих задач, если вызов ещё не отменён.
-async fn embed_blocking(
-    emb: Arc<zam_ml::Embedder>,
-    texts: Vec<String>,
-    cancel: Arc<AtomicBool>,
-    batch: bool,
-) -> Option<Vec<Arc<Vec<f32>>>> {
-    let r = tokio::task::spawn_blocking(move || {
-        if cancel.load(Ordering::SeqCst) {
-            return Ok(Vec::new());
-        }
-        if batch && texts.len() > 1 {
-            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            emb.embed_queries(&refs)
-        } else {
-            texts.iter().map(|t| emb.embed_query(t)).collect()
-        }
-    })
-    .await;
-    match r {
-        Ok(Ok(v)) if !v.is_empty() => Some(v.into_iter().map(|e| Arc::new(e.dense)).collect()),
-        Ok(Ok(_)) => None,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "фокус: эмбеддинг запроса не удался");
-            None
-        }
-        Err(j) => {
-            tracing::error!(panic = j.is_panic(), "фокус: эмбеддинг аварийно");
-            None
-        }
+/// Срок вызова: `focus_timeout_ms × K` (K — различных текстов `focus` у целей, где фокус возможен),
+/// не больше `focus_timeout_max_ms`.
+pub fn call_timeout(cfg: &ReadSection, k: usize) -> Duration {
+    let k = u64::try_from(k.max(1)).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        cfg.focus_timeout_ms
+            .saturating_mul(k)
+            .min(cfg.focus_timeout_max_ms),
+    )
+}
+
+/// Задержка перед текстом (точка `test-hooks`), с проверкой отмены каждые 10 мс.
+#[cfg(feature = "test-hooks")]
+fn hook_delay(ms: u64, cancel: &AtomicBool) {
+    let until = Instant::now() + Duration::from_millis(ms);
+    while Instant::now() < until && !cancel.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 impl<'a> FocusCtx<'a> {
-    /// Срок — от этого момента; эмбеддинги различных `focus` запускаются сразу (модели нет —
-    /// не запускаются): по одному на текст или одним пакетом ([`FOCUS_BATCH_DEFAULT`]).
+    /// Срок — от этого момента ([`call_timeout`]); эмбеддинги различных `focus` — одной
+    /// блокирующей задачей по порядку элементов запроса (модели нет — не запускаются): перед
+    /// каждым текстом — проверка отмены, результат — сразу в свой oneshot. Пакетом
+    /// ([`FOCUS_BATCH_DEFAULT`]) — одним вызовом `embed_queries`.
     pub fn new<'f>(st: &'a AppState, focuses: impl IntoIterator<Item = &'f str>) -> FocusCtx<'a> {
         let cfg = &st.cfg.read;
-        let deadline = Instant::now() + Duration::from_millis(cfg.focus_timeout_ms);
-        let cancel = Arc::new(AtomicBool::new(false));
         let mut texts: Vec<String> = Vec::new();
         for f in focuses {
             if !texts.iter().any(|t| t == f) {
                 texts.push(f.to_string());
             }
         }
+        let deadline = Instant::now() + call_timeout(cfg, texts.len());
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut queries = HashMap::new();
-        let mut tasks = Vec::new();
         let Some(emb) = st.index.embedder.clone().filter(|_| !texts.is_empty()) else {
             return FocusCtx {
                 st,
@@ -216,13 +206,13 @@ impl<'a> FocusCtx<'a> {
                 deadline,
                 queries,
                 cancel,
-                tasks,
             };
         };
         #[cfg(feature = "test-hooks")]
-        let delay = st.focus_delay_ms.load(Ordering::SeqCst);
-        #[cfg(not(feature = "test-hooks"))]
-        let delay = 0u64;
+        let (delay, embeds) = (
+            st.focus_delay_ms.load(Ordering::SeqCst),
+            st.focus_embeds.clone(),
+        );
         #[cfg(feature = "test-hooks")]
         let batch = match st.focus_batch.load(Ordering::SeqCst) {
             1 => true,
@@ -231,42 +221,60 @@ impl<'a> FocusCtx<'a> {
         };
         #[cfg(not(feature = "test-hooks"))]
         let batch = FOCUS_BATCH_DEFAULT;
-        let spawn = |texts: Vec<String>, tasks: &mut Vec<tokio::task::AbortHandle>| {
-            let (emb, cancel) = (emb.clone(), cancel.clone());
-            let h = tokio::spawn(async move {
-                if delay > 0 {
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                }
-                embed_blocking(emb, texts, cancel, batch).await
-            });
-            tasks.push(h.abort_handle());
-            async move { h.await.ok().flatten() }.boxed().shared()
-        };
-        if batch && texts.len() > 1 {
-            let all = spawn(texts.clone(), &mut tasks);
-            for (i, t) in texts.into_iter().enumerate() {
-                let f = all.clone();
-                let q = async move { f.await.and_then(|v| v.get(i).cloned()) }
-                    .boxed()
-                    .shared();
-                queries.insert(t, q);
-            }
-        } else {
-            for t in texts {
-                let one = spawn(vec![t.clone()], &mut tasks);
-                let q = async move { one.await.and_then(|mut v| v.pop()) }
-                    .boxed()
-                    .shared();
-                queries.insert(t, q);
-            }
+        let mut senders = Vec::with_capacity(texts.len());
+        for t in &texts {
+            let (tx, rx) = tokio::sync::oneshot::channel::<Option<Arc<Vec<f32>>>>();
+            senders.push(tx);
+            let q = async move { rx.await.ok().flatten() }.boxed().shared();
+            queries.insert(t.clone(), q);
         }
+        let stop = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let warn = |e: &zam_ml::MlError| {
+                tracing::warn!(error = %e, "фокус: эмбеддинг запроса не удался");
+            };
+            if batch && texts.len() > 1 {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                #[cfg(feature = "test-hooks")]
+                embeds.fetch_add(texts.len(), Ordering::SeqCst);
+                let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                match emb.embed_queries(&refs) {
+                    Ok(v) => {
+                        for (tx, e) in senders.into_iter().zip(v) {
+                            let _ = tx.send(Some(Arc::new(e.dense)));
+                        }
+                    }
+                    Err(e) => warn(&e),
+                }
+                return;
+            }
+            for (t, tx) in texts.iter().zip(senders) {
+                #[cfg(feature = "test-hooks")]
+                if delay > 0 {
+                    hook_delay(delay, &stop);
+                }
+                // ответ уже отдан — следующий текст не эмбеддится
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                #[cfg(feature = "test-hooks")]
+                embeds.fetch_add(1, Ordering::SeqCst);
+                match emb.embed_query(t) {
+                    Ok(e) => {
+                        let _ = tx.send(Some(Arc::new(e.dense)));
+                    }
+                    Err(e) => warn(&e),
+                }
+            }
+        });
         FocusCtx {
             st,
             cfg,
             deadline,
             queries,
             cancel,
-            tasks,
         }
     }
 
@@ -288,11 +296,8 @@ impl<'a> FocusCtx<'a> {
 
 impl Drop for FocusCtx<'_> {
     fn drop(&mut self) {
-        // ответ готов: неначатые эмбеддинги не запускаются, задержки снимаются
+        // ответ готов: тексты, до которых задача не дошла, не эмбеддятся
         self.cancel.store(true, Ordering::SeqCst);
-        for t in &self.tasks {
-            t.abort();
-        }
     }
 }
 
@@ -721,16 +726,18 @@ fn note_focus(
     // размер выданного — из частей (без повторной токенизации текста)
     let shown: usize = fparts.iter().filter(|p| p.shown).map(|p| p.tokens).sum();
     let used = shown + count_tokens_markers(&body);
-    let (out, toc) = with_toc(
+    let (out, _) = with_toc(
         &titles,
         &marked,
         "заголовков",
         limit.saturating_sub(used),
         body,
     );
+    // размер выдачи — точно, одним подсчётом (сумма частей — для отбора и `~N`)
+    let tokens = count_tokens(&out);
     Some(FocusOut {
         text: out,
-        tokens: used + toc,
+        tokens,
         leaves: chosen.iter().map(|&i| leaves[i].chunk_id.clone()).collect(),
         warnings,
         parts: fparts,
@@ -878,10 +885,12 @@ fn doc_focus(
         });
         i = j + 1;
     }
-    let (out, toc) = with_toc(&titles, &marked, "частей", limit.saturating_sub(used), body);
+    let (out, _) = with_toc(&titles, &marked, "частей", limit.saturating_sub(used), body);
+    // размер выдачи — точно, одним подсчётом (сумма частей — для отбора и `~N`)
+    let tokens = count_tokens(&out);
     FocusOut {
         text: out,
-        tokens: used + toc,
+        tokens,
         leaves: chosen.iter().map(|&i| leaves[i].chunk_id.clone()).collect(),
         warnings,
         parts: fparts,

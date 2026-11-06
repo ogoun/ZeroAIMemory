@@ -80,6 +80,7 @@ async fn wait_indexed(a: &Api, ids: &[String]) {
 async fn focus_timeout_lexical_fallback() {
     let Some((a, _q)) = ml_api("focus-timeout", MINILM, |c| {
         c.read.focus_timeout_ms = 2000;
+        c.read.focus_timeout_max_ms = 2000;
     })
     .await
     else {
@@ -138,6 +139,57 @@ async fn focus_timeout_lexical_fallback() {
     assert!(
         spent < Duration::from_millis(2000 + 1500),
         "срок не общий на вызов: {spent:?}"
+    );
+}
+
+/// Срок вызова — `focus_timeout_ms × K`, не больше потолка: 5 разных `focus` при умолчаниях
+/// (80 мс × 5, потолок 300) — без откатов на лексику, ответ не дольше потолка и работы; после
+/// ответа с отменой (срок вышел на задержке) следующий текст не эмбеддится — счётчик
+/// `test-hooks` (повторное ревью 7b, пп. 1–2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn focus_call_timeout_scales_and_cancel_stops() {
+    let Some((a, _q)) = ml_api("focus-call-timeout", MINILM, |_| {}).await else {
+        return;
+    };
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let t = sections_note(8, 10, 2 + i);
+        ids.push(id(&a.note("knowledge", &format!("Срок/{i}"), &t).await));
+    }
+    wait_indexed(&a, &ids).await;
+    let body = |tag: &str| {
+        let items: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .map(|(k, n)| json!({"id": format!("n:{n}"), "focus": format!("детектор нейтрино {tag}{k}")}))
+            .collect();
+        json!({"items": items, "budget_tokens": 20000})
+    };
+    // прогрев модели
+    read_ok(&a, body("w")).await;
+    let before = a.st.focus_embeds.load(Ordering::SeqCst);
+    let t = Instant::now();
+    let j = read_ok(&a, body("a")).await;
+    let spent = t.elapsed();
+    for it in j["items"].as_array().unwrap() {
+        assert!(warnings(it).is_empty(), "откат на лексику: {it}");
+    }
+    assert!(spent < Duration::from_millis(300 + 3000), "{spent:?}");
+    assert_eq!(a.st.focus_embeds.load(Ordering::SeqCst) - before, 5);
+    // задержка перед каждым текстом дольше срока: ответ — лексика, после него задача видит
+    // отмену и ни один текст не эмбеддит
+    a.st.focus_delay_ms.store(1000, Ordering::SeqCst);
+    let before = a.st.focus_embeds.load(Ordering::SeqCst);
+    let j = read_ok(&a, body("b")).await;
+    a.st.focus_delay_ms.store(0, Ordering::SeqCst);
+    for it in j["items"].as_array().unwrap() {
+        assert_eq!(warnings(it), [LEXICAL], "{it}");
+    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        a.st.focus_embeds.load(Ordering::SeqCst),
+        before,
+        "после отмены эмбеддинг запущен"
     );
 }
 

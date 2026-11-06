@@ -408,6 +408,13 @@ async fn focus_budget_default_last_leaf_whole() {
     assert_eq!(it["tier"], "focus", "{it}");
     assert!(it.get("truncated").is_none(), "{it}");
     let got = it["text"].as_str().unwrap();
+    // размер выдачи — в бюджете по умолчанию (1500), счётчиком сервера
+    assert!(count_tokens(got) <= 1500, "{} токенов", count_tokens(got));
+    assert_eq!(
+        it["tokens"].as_u64().unwrap() as usize,
+        count_tokens(got),
+        "{it}"
+    );
     let d = db(&a, a.st.admin_id).await;
     let hot = node_leaves(&d, n.parse().unwrap())
         .await

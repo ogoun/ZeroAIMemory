@@ -666,8 +666,11 @@ pub struct ReadSection {
     /// Цель не длиннее (полный текст, токенов) — целиком без фокуса (0..=20000, по умолчанию 600).
     pub focus_min_tokens: usize,
     /// Срок эмбеддинга запроса и чтения векторов листов, мс; вышел — фокус по лексике
-    /// (1..=10000, по умолчанию 80).
+    /// (1..=10000, по умолчанию 80). Срок вызова — это × число различных `focus`, не больше
+    /// `focus_timeout_max_ms`.
     pub focus_timeout_ms: u64,
+    /// Потолок срока вызова фокуса, мс (1..=10000, не меньше `focus_timeout_ms`, по умолчанию 300).
+    pub focus_timeout_max_ms: u64,
 }
 
 impl ReadSection {
@@ -691,6 +694,15 @@ impl ReadSection {
         }
         if !(1..=10_000).contains(&self.focus_timeout_ms) {
             return Err(bad("focus_timeout_ms", "от 1 до 10000"));
+        }
+        if !(1..=10_000).contains(&self.focus_timeout_max_ms) {
+            return Err(bad("focus_timeout_max_ms", "от 1 до 10000"));
+        }
+        if self.focus_timeout_max_ms < self.focus_timeout_ms {
+            return Err(bad(
+                "focus_timeout_max_ms",
+                "не меньше read.focus_timeout_ms",
+            ));
         }
         Ok(())
     }
@@ -1224,6 +1236,7 @@ impl Default for ServerConfig {
                 focus_leaves: 3,
                 focus_min_tokens: 600,
                 focus_timeout_ms: 80,
+                focus_timeout_max_ms: 300,
             },
             cache: CacheSection {
                 summary_tokens: 600,

@@ -207,6 +207,7 @@ pub const KEYS: &[(&str, Since)] = &[
     ("read.focus_leaves", F("focus")),
     ("read.focus_min_tokens", F("focus")),
     ("read.focus_timeout_ms", F("focus")),
+    ("read.focus_timeout_max_ms", F("focus")),
     ("recall.digest_entries", F("digest")),
     ("recall.digest_code_map_tokens", F("digest")),
     ("recall.prompt_min_score_fts", F("hint_thresholds")),
