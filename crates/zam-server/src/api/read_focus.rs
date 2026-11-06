@@ -11,11 +11,13 @@
 //!   куском; кусок начинается со строк заголовков перед ним). У документа — чанки с `[подпись]`;
 //! - **пропуски** `[пропущено: <адрес> (<подпись>) · ~N t]` — один на промежуток между выданными
 //!   кусками (и по краям), всего не больше `focus_leaves + 1`. Адрес ведёт ровно к пропущенному:
-//!   у заметки `range:S-E` — байты `[S, E)` текста той же ревизии (`/read {id, range}` отдаёт
-//!   их), подпись — первая и последняя секция H1–H3, чей собственный текст пересекает промежуток,
+//!   у заметки `range:r<rev>:S-E` — байты `[S, E)` текста ревизии `rev` (`/read {id, range}`
+//!   отдаёт ровно их, и после правки заметки — той же ревизии с предупреждением), подпись — первая и последняя секция H1–H3, чей собственный текст пересекает промежуток,
 //!   и число таких секций (`начало` — текст до первого заголовка); у документа — `locator` первой
 //!   и последней части (`page:3 — page:7`; чтение по `locator` отдаёт единицы целиком), подпись —
-//!   `locator_text` справочно. `N` — токены пропущенного счётчиком сервера ([`count_tokens`]).
+//!   `locator_text` справочно. `N` у заметки — токены пропущенного счётчиком сервера
+//!   ([`count_tokens`]); у документа — оценка `chunks.token_count` (счётчик чанкера: без модели —
+//!   оценка, и с числом сервера она расходится), точный счётчик — только у выданных чанков.
 //!   У заметки куски и пропуски вместе — весь текст ревизии без пересечений (`focus_parts` в
 //!   json — адреса по порядку).
 //!
@@ -27,16 +29,24 @@
 //! пометок влезают (первый — всегда); строка оглавления — на остаток.
 //!
 //! **Срок** `read.focus_timeout_ms` — один на весь вызов `/read` ([`FocusCtx`]): эмбеддинги
-//! различных текстов `focus` запускаются в начале вызова (параллельно чтению целей), каждая цель
-//! ждёт эмбеддинг и векторы листов не дольше остатка срока. Не успели, модели нет или векторов
-//! листов нет в кэше — только лексика и `focus lexical`. Эмбеддинг запроса, уже готовый,
-//! переиспользуется и после сбоя чтения векторов другой цели.
+//! различных текстов `focus` (только у целей, где фокус возможен: узел, путь, голый id, `d:`,
+//! `b:`) запускаются в начале вызова общими futures; цели вызова идут конкурентно, каждая ждёт
+//! эмбеддинг и векторы листов не дольше остатка срока. Разбор текста, поиск листов и токенизация
+//! частей — в пуле блокирующих задач. Не успели, модели нет или векторов листов нет в кэше —
+//! только лексика и `focus lexical`. Эмбеддинг, не начавшийся до ответа, не запускается (флаг
+//! отмены — сессию запросов модели не занимает); начавшийся дорабатывает (инференс не
+//! прерывается). Пакетный эмбеддинг (`Embedder::embed_queries`) — [`FOCUS_BATCH_DEFAULT`].
 //!
 //! Целиком без фокуса: листов не больше `focus_leaves` (`focus skipped: short`); листов нет,
 //! нарезка другой ревизии или лист не нашёлся в тексте (секрет в листе: нарезка — по
 //! маскированному тексту) — `focus skipped: not indexed`.
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use futures_util::FutureExt;
+use futures_util::future::{BoxFuture, Shared};
 
 use serde_json::{Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
@@ -93,7 +103,7 @@ pub enum FocusTarget<'a> {
     },
 }
 
-/// Часть выдачи по порядку: адрес (`range:S-E` или `locator`), выдана ли, токены.
+/// Часть выдачи по порядку: адрес (`range:r<rev>:S-E` или `locator`), выдана ли, токены.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusPart {
     pub address: String,
@@ -112,6 +122,8 @@ impl FocusPart {
 pub struct FocusOut {
     /// Оглавление, куски и пропуски.
     pub text: String,
+    /// Токены `text` (сумма частей, пометок и оглавления — без повторной токенизации).
+    pub tokens: usize,
     /// `chunk_id` выданных листов (отметка `session_seen`, `part = chunk_id`).
     pub leaves: Vec<String>,
     /// `focus lexical` или пусто.
@@ -129,54 +141,123 @@ pub enum FocusResult {
     NotIndexed,
 }
 
-/// Эмбеддинг текста `focus`: идёт или готов (`None` — не удался).
-enum Query {
-    Pending(tokio::task::JoinHandle<Option<Vec<f32>>>),
-    Ready(Option<Vec<f32>>),
-}
+/// Эмбеддинг одного текста `focus` (общий для целей вызова).
+type QueryFut = Shared<BoxFuture<'static, Option<Arc<Vec<f32>>>>>;
+
+/// Пакетный эмбеддинг запросов фокуса (`Embedder::embed_queries`) при двух и более различных
+/// `focus` в вызове. Выключен по замеру задачи 7b (журнал этапа, правки повторного ревью).
+pub const FOCUS_BATCH_DEFAULT: bool = false;
 
 /// Фокус одного вызова `/read`: настройки, общий срок и эмбеддинги текстов `focus`, запущенные в
-/// начале вызова.
+/// начале вызова (общие futures — цели вызова идут конкурентно).
 pub struct FocusCtx<'a> {
     st: &'a AppState,
     cfg: &'a ReadSection,
     deadline: Instant,
-    queries: HashMap<String, Query>,
+    queries: HashMap<String, QueryFut>,
+    /// Флаг отмены: эмбеддинг, не начавшийся до ответа, не запускается и не держит сессию
+    /// запросов модели.
+    cancel: Arc<AtomicBool>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+/// Эмбеддинг текстов в пуле блокирующих задач, если вызов ещё не отменён.
+async fn embed_blocking(
+    emb: Arc<zam_ml::Embedder>,
+    texts: Vec<String>,
+    cancel: Arc<AtomicBool>,
+    batch: bool,
+) -> Option<Vec<Arc<Vec<f32>>>> {
+    let r = tokio::task::spawn_blocking(move || {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(Vec::new());
+        }
+        if batch && texts.len() > 1 {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            emb.embed_queries(&refs)
+        } else {
+            texts.iter().map(|t| emb.embed_query(t)).collect()
+        }
+    })
+    .await;
+    match r {
+        Ok(Ok(v)) if !v.is_empty() => Some(v.into_iter().map(|e| Arc::new(e.dense)).collect()),
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "фокус: эмбеддинг запроса не удался");
+            None
+        }
+        Err(j) => {
+            tracing::error!(panic = j.is_panic(), "фокус: эмбеддинг аварийно");
+            None
+        }
+    }
 }
 
 impl<'a> FocusCtx<'a> {
     /// Срок — от этого момента; эмбеддинги различных `focus` запускаются сразу (модели нет —
-    /// не запускаются).
+    /// не запускаются): по одному на текст или одним пакетом ([`FOCUS_BATCH_DEFAULT`]).
     pub fn new<'f>(st: &'a AppState, focuses: impl IntoIterator<Item = &'f str>) -> FocusCtx<'a> {
         let cfg = &st.cfg.read;
         let deadline = Instant::now() + Duration::from_millis(cfg.focus_timeout_ms);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut texts: Vec<String> = Vec::new();
+        for f in focuses {
+            if !texts.iter().any(|t| t == f) {
+                texts.push(f.to_string());
+            }
+        }
         let mut queries = HashMap::new();
-        if let Some(emb) = st.index.embedder.clone() {
-            for f in focuses {
-                if queries.contains_key(f) {
-                    continue;
+        let mut tasks = Vec::new();
+        let Some(emb) = st.index.embedder.clone().filter(|_| !texts.is_empty()) else {
+            return FocusCtx {
+                st,
+                cfg,
+                deadline,
+                queries,
+                cancel,
+                tasks,
+            };
+        };
+        #[cfg(feature = "test-hooks")]
+        let delay = st.focus_delay_ms.load(Ordering::SeqCst);
+        #[cfg(not(feature = "test-hooks"))]
+        let delay = 0u64;
+        #[cfg(feature = "test-hooks")]
+        let batch = match st.focus_batch.load(Ordering::SeqCst) {
+            1 => true,
+            2 => false,
+            _ => FOCUS_BATCH_DEFAULT,
+        };
+        #[cfg(not(feature = "test-hooks"))]
+        let batch = FOCUS_BATCH_DEFAULT;
+        let spawn = |texts: Vec<String>, tasks: &mut Vec<tokio::task::AbortHandle>| {
+            let (emb, cancel) = (emb.clone(), cancel.clone());
+            let h = tokio::spawn(async move {
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
-                let (emb, text) = (emb.clone(), f.to_string());
-                #[cfg(feature = "test-hooks")]
-                let delay = st.focus_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
-                let h = tokio::spawn(async move {
-                    #[cfg(feature = "test-hooks")]
-                    if delay > 0 {
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                    }
-                    match tokio::task::spawn_blocking(move || emb.embed_query(&text)).await {
-                        Ok(Ok(e)) => Some(e.dense),
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "фокус: эмбеддинг запроса не удался");
-                            None
-                        }
-                        Err(j) => {
-                            tracing::error!(panic = j.is_panic(), "фокус: эмбеддинг аварийно");
-                            None
-                        }
-                    }
-                });
-                queries.insert(f.to_string(), Query::Pending(h));
+                embed_blocking(emb, texts, cancel, batch).await
+            });
+            tasks.push(h.abort_handle());
+            async move { h.await.ok().flatten() }.boxed().shared()
+        };
+        if batch && texts.len() > 1 {
+            let all = spawn(texts.clone(), &mut tasks);
+            for (i, t) in texts.into_iter().enumerate() {
+                let f = all.clone();
+                let q = async move { f.await.and_then(|v| v.get(i).cloned()) }
+                    .boxed()
+                    .shared();
+                queries.insert(t, q);
+            }
+        } else {
+            for t in texts {
+                let one = spawn(vec![t.clone()], &mut tasks);
+                let q = async move { one.await.and_then(|mut v| v.pop()) }
+                    .boxed()
+                    .shared();
+                queries.insert(t, q);
             }
         }
         FocusCtx {
@@ -184,6 +265,8 @@ impl<'a> FocusCtx<'a> {
             cfg,
             deadline,
             queries,
+            cancel,
+            tasks,
         }
     }
 
@@ -197,41 +280,26 @@ impl<'a> FocusCtx<'a> {
     }
 
     /// Эмбеддинг запроса не дольше остатка срока (`None` — нет модели, сбой, срок).
-    async fn query(&mut self, focus: &str) -> Option<Vec<f32>> {
-        let left = self.left();
-        let q = self.queries.get_mut(focus)?;
-        if let Query::Pending(h) = q {
-            let v = match tokio::time::timeout(left, &mut *h).await {
-                Ok(Ok(v)) => v,
-                Ok(Err(_)) => None,
-                // срок общий: у следующих целей его не больше
-                Err(_) => {
-                    h.abort();
-                    None
-                }
-            };
-            *q = Query::Ready(v);
-        }
-        match q {
-            Query::Ready(v) => v.clone(),
-            Query::Pending(_) => None,
-        }
+    async fn query(&self, focus: &str) -> Option<Arc<Vec<f32>>> {
+        let q = self.queries.get(focus)?.clone();
+        tokio::time::timeout(self.left(), q).await.ok().flatten()
     }
 }
 
 impl Drop for FocusCtx<'_> {
     fn drop(&mut self) {
-        for q in self.queries.values() {
-            if let Query::Pending(h) = q {
-                h.abort();
-            }
+        // ответ готов: неначатые эмбеддинги не запускаются, задержки снимаются
+        self.cancel.store(true, Ordering::SeqCst);
+        for t in &self.tasks {
+            t.abort();
         }
     }
 }
 
-/// Фокус цели по тексту `focus` в пределах `limit` токенов текста элемента.
+/// Фокус цели по тексту `focus` в пределах `limit` токенов текста элемента. Разбор, поиск листов
+/// в тексте и токенизация частей — в пуле блокирующих задач.
 pub async fn focus_read(
-    fx: &mut FocusCtx<'_>,
+    fx: &FocusCtx<'_>,
     target: &FocusTarget<'_>,
     focus: &str,
     limit: usize,
@@ -265,46 +333,37 @@ pub async fn focus_read(
     if leaves.len() <= n {
         return Ok(FocusResult::Short);
     }
-    let ranges = match target {
-        FocusTarget::Note { text, .. } => match locate(text, &leaves) {
-            Some(r) => Some(r),
-            None => return Ok(FocusResult::NotIndexed),
-        },
-        FocusTarget::Doc { .. } => None,
-    };
     let mut warnings = Vec::new();
     let cos = dense_scores(fx, db, focus, &leaves).await;
     if cos.is_none() {
         warnings.push(FOCUS_LEXICAL.to_string());
     }
     let ranked = rank(&leaves, cos.as_ref());
-    let out = match (target, ranges) {
-        (FocusTarget::Note { text, .. }, Some(r)) => {
-            match note_focus(
-                text,
-                &leaves,
-                &r,
-                &ranked,
-                n,
-                limit,
-                fx.min_tokens(),
-                warnings,
-            ) {
-                Some(o) => o,
-                None => return Ok(FocusResult::Short),
+    let out = match target {
+        FocusTarget::Note { text, rev, .. } => {
+            let (text, rev, min) = (text.to_string(), *rev, fx.min_tokens());
+            let r = tokio::task::spawn_blocking(move || {
+                let ranges = locate(&text, &leaves)?;
+                Some(note_focus(
+                    &text, rev, &leaves, &ranges, &ranked, n, limit, min, warnings,
+                ))
+            })
+            .await
+            .map_err(|e| StoreError::Corrupt(format!("фокус: {e}")))?;
+            match r {
+                None => return Ok(FocusResult::NotIndexed),
+                Some(None) => return Ok(FocusResult::Short),
+                Some(Some(o)) => o,
             }
         }
-        (FocusTarget::Doc { sheets, .. }, _) => {
-            doc_focus(sheets, &leaves, &ranked, n, limit, warnings)
-        }
-        (FocusTarget::Note { .. }, None) => return Ok(FocusResult::NotIndexed),
+        FocusTarget::Doc { sheets, .. } => doc_focus(sheets, &leaves, &ranked, n, limit, warnings),
     };
     Ok(FocusResult::Focused(out))
 }
 
 /// Косинусы листов к запросу (`None` — лексика: нет модели или векторов, срок вышел).
 async fn dense_scores(
-    fx: &mut FocusCtx<'_>,
+    fx: &FocusCtx<'_>,
     db: &Db,
     focus: &str,
     leaves: &[FocusLeaf],
@@ -336,6 +395,35 @@ async fn dense_scores(
         .collect();
     // ни одного вектора в кэше (цель не проиндексирована) — лексика
     (!cos.is_empty()).then_some(cos)
+}
+
+/// Листы, целиком лежащие в байтах `[s, e)` текста ревизии `text` (`chunk_id`) — отметка
+/// выданного при чтении `range` (`session_seen`). Лист не нашёлся в тексте — пусто.
+pub async fn leaves_within(
+    db: &Db,
+    node: Id,
+    rev: i64,
+    text: &str,
+    s: usize,
+    e: usize,
+) -> Result<Vec<String>, StoreError> {
+    let t = TargetRef {
+        kind: TargetKind::Node,
+        id: node,
+    };
+    let leaves = focus_leaves(db, t, Vec::new()).await?;
+    if leaves.is_empty() || leaves.iter().any(|l| l.rev != rev) {
+        return Ok(Vec::new());
+    }
+    let Some(ranges) = locate(text, &leaves) else {
+        return Ok(Vec::new());
+    };
+    Ok(leaves
+        .iter()
+        .zip(ranges)
+        .filter(|(_, (a, b))| *a >= s && *b <= e)
+        .map(|(l, _)| l.chunk_id.clone())
+        .collect())
 }
 
 /// Листы с баллом по убыванию: RRF лексики и косинуса; без совпадений и векторов — все по порядку
@@ -573,6 +661,7 @@ fn pick(ranked: &[usize], n: usize, limit: usize, cost: impl Fn(&[usize]) -> usi
 #[allow(clippy::too_many_arguments)]
 fn note_focus(
     text: &str,
+    rev: i64,
     leaves: &[FocusLeaf],
     ranges: &[(usize, usize)],
     ranked: &[usize],
@@ -596,7 +685,7 @@ fn note_focus(
     for &(s, e, shown) in &parts {
         let piece = &text[s..e];
         let tokens = count_tokens(piece);
-        let address = format!("range:{s}-{e}");
+        let address = format!("range:r{rev}:{s}-{e}");
         if shown {
             body.push_str(piece);
         } else {
@@ -629,11 +718,19 @@ fn note_focus(
         return None;
     }
     let titles: Vec<String> = secs.iter().map(|s| s.title.clone()).collect();
+    // размер выданного — из частей (без повторной токенизации текста)
     let shown: usize = fparts.iter().filter(|p| p.shown).map(|p| p.tokens).sum();
-    let room = limit.saturating_sub(shown + count_tokens_markers(&body));
-    let out = with_toc(&titles, &marked, "заголовков", room, body);
+    let used = shown + count_tokens_markers(&body);
+    let (out, toc) = with_toc(
+        &titles,
+        &marked,
+        "заголовков",
+        limit.saturating_sub(used),
+        body,
+    );
     Some(FocusOut {
         text: out,
+        tokens: used + toc,
         leaves: chosen.iter().map(|&i| leaves[i].chunk_id.clone()).collect(),
         warnings,
         parts: fparts,
@@ -648,21 +745,24 @@ fn count_tokens_markers(body: &str) -> usize {
         .sum()
 }
 
-/// Строка оглавления (если влезает в `room`) и текст.
+/// Строка оглавления (если влезает в `room`) и текст; второе — токены строки оглавления.
 fn with_toc(
     titles: &[String],
     marked: &HashSet<usize>,
     noun: &str,
     room: usize,
     body: String,
-) -> String {
+) -> (String, usize) {
     let max = room.min(TOC_MAX_TOKENS);
     match (max >= TOC_MIN_TOKENS)
         .then(|| toc_line(titles, marked, noun, max))
         .flatten()
     {
-        Some(line) => format!("{line}\n{body}"),
-        None => body,
+        Some(line) => {
+            let t = count_tokens(&line);
+            (format!("{line}\n{body}"), t)
+        }
+        None => (body, 0),
     }
 }
 
@@ -705,7 +805,9 @@ fn doc_focus(
     limit: usize,
     warnings: Vec<String>,
 ) -> FocusOut {
-    let tokens: Vec<usize> = leaves.iter().map(|l| count_tokens(l.text.trim())).collect();
+    // размер пропусков — `chunks.token_count` (счётчик чанкера: без модели — оценка, у выдачи —
+    // tokenizer.json комплекта, числа расходятся); точный счётчик сервера — у выданных чанков
+    let tokens: Vec<usize> = leaves.iter().map(|l| l.token_count).collect();
     let addr: Vec<(String, String)> = leaves.iter().map(|l| chunk_address(sheets, l)).collect();
     let runs = |c: &[usize]| -> usize {
         let set: HashSet<usize> = c.iter().copied().collect();
@@ -735,6 +837,7 @@ fn doc_focus(
     }
     let mut body = String::new();
     let mut fparts = Vec::new();
+    let mut used = 0usize;
     let mut i = 0;
     let mut last_label: Option<&str> = None;
     while i < leaves.len() {
@@ -743,19 +846,28 @@ fn doc_focus(
         while j + 1 < leaves.len() && set.contains(&(j + 1)) == shown {
             j += 1;
         }
-        let t: usize = tokens[i..=j].iter().sum();
+        let mut t: usize = tokens[i..=j].iter().sum();
         let address = span(&addr[i].0, &addr[j].0);
         if shown {
+            t = 0;
             for k in i..=j {
                 if last_label != Some(addr[k].1.as_str()) {
-                    body.push_str(&format!("[{}]\n", addr[k].1));
+                    let head = format!("[{}]", addr[k].1);
+                    used += count_tokens(&head);
+                    body.push_str(&head);
+                    body.push('\n');
                 }
                 last_label = Some(addr[k].1.as_str());
-                body.push_str(leaves[k].text.trim());
+                let piece = leaves[k].text.trim();
+                t += count_tokens(piece);
+                body.push_str(piece);
                 body.push('\n');
             }
+            used += t;
         } else {
-            body.push_str(&skip_line(&address, &span(&addr[i].1, &addr[j].1), t));
+            let line = skip_line(&address, &span(&addr[i].1, &addr[j].1), t);
+            used += count_tokens(&line);
+            body.push_str(&line);
             body.push('\n');
             last_label = None;
         }
@@ -766,10 +878,10 @@ fn doc_focus(
         });
         i = j + 1;
     }
-    let room = limit.saturating_sub(count_tokens(&body));
-    let out = with_toc(&titles, &marked, "частей", room, body);
+    let (out, toc) = with_toc(&titles, &marked, "частей", limit.saturating_sub(used), body);
     FocusOut {
         text: out,
+        tokens: used + toc,
         leaves: chosen.iter().map(|&i| leaves[i].chunk_id.clone()).collect(),
         warnings,
         parts: fparts,

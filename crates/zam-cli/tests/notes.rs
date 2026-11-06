@@ -536,7 +536,7 @@ fn read_since_rev_cli() {
 }
 
 /// `zam read <цель> --focus "<запрос>"` (M6 §6): пачкой с `focus` — оглавление, лист и пометки
-/// `[пропущено: range:S-E …]` (дочитать — `--range`), `--json` — `tier: "focus"`, `--tier focus`; с
+/// `[пропущено: range:r<rev>:S-E …]` (дочитать — `--range`), `--json` — `tier: "focus"`, `--tier focus`; с
 /// `--section` и `--tier focus` без `--focus` — код 6.
 #[test]
 fn read_focus_cli() {
@@ -559,7 +559,7 @@ fn read_focus_cli() {
     assert!(s.contains(" · фокус · ~"), "{s}");
     assert!(s.contains("*Глава 6"), "{s}");
     assert!(s.contains("протокол квазиметрии"), "{s}");
-    assert!(s.contains("[пропущено: range:0-"), "{s}");
+    assert!(s.contains("[пропущено: range:r1:0-"), "{s}");
     assert!(s.contains(" (Справочник — Справочник > Глава "), "{s}");
     // дочитывание по адресу пометки — `--range`
     let addr = s

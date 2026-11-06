@@ -253,12 +253,14 @@ async fn focus_p95() {
         pct(&em, 0.5),
         pct(&em, 0.95)
     );
-    for same in [true, false] {
+    // (один `focus`), (разные, по одному эмбеддингу), (разные, пакетом)
+    for (same, batch) in [(true, 2u8), (false, 2), (false, 1)] {
+        a.st.focus_batch.store(batch, Ordering::SeqCst);
         let mut ms = Vec::new();
         let mut lexical = 0;
         for q in 0..60 {
             let t = Instant::now();
-            let j = read_ok(&a, run(same, q)).await;
+            let j = read_ok(&a, run(same, q + usize::from(batch) * 100)).await;
             ms.push(t.elapsed().as_secs_f64() * 1000.0);
             lexical += j["items"]
                 .as_array()
@@ -273,10 +275,10 @@ async fn focus_p95() {
              p95 {:.1} мс, max {:.1} мс, откатов по сроку {lexical} из {}",
             if cuda { "GPU" } else { "CPU" },
             ms.len(),
-            if same {
-                "один на запрос"
-            } else {
-                "свой у каждой цели"
+            match (same, batch) {
+                (true, _) => "один на запрос",
+                (false, 1) => "свой у каждой цели, пакетом",
+                _ => "свой у каждой цели, по одному",
             },
             pct(&ms, 0.5),
             pct(&ms, 0.95),
@@ -284,4 +286,58 @@ async fn focus_p95() {
             ms.len() * ids.len()
         );
     }
+    a.st.focus_batch.store(0, Ordering::SeqCst);
+    // согласие топ-3 листов: пакет против одиночного эмбеддинга (повторное ревью 7b, п. 4)
+    let model_id = a.st.index.model_id().unwrap().to_string();
+    let d = a.st.users.get(a.st.admin_id).await.unwrap();
+    let mut leaf_vecs: Vec<Vec<(String, Vec<f32>)>> = Vec::new();
+    for n in &ids {
+        let leaves = zam_store::node_leaves(&d, n.parse().unwrap())
+            .await
+            .unwrap();
+        let keys: Vec<String> = leaves.iter().map(|l| l.embed_key.clone()).collect();
+        let embs = zam_store::get_embeddings(&d, &model_id, &keys)
+            .await
+            .unwrap();
+        leaf_vecs.push(
+            leaves
+                .iter()
+                .filter_map(|l| Some((l.chunk_id.clone(), embs.get(&l.embed_key)?.dense.clone())))
+                .collect(),
+        );
+    }
+    let top3 = |q: &[f32], lv: &[(String, Vec<f32>)]| {
+        let mut v: Vec<(f32, &str)> = lv
+            .iter()
+            .map(|(c, e)| (q.iter().zip(e).map(|(a, b)| a * b).sum::<f32>(), c.as_str()))
+            .collect();
+        v.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut t: Vec<&str> = v.iter().take(3).map(|x| x.1).collect();
+        t.sort_unstable();
+        t.into_iter().map(String::from).collect::<Vec<_>>()
+    };
+    let emb = a.st.index.embedder.clone().unwrap();
+    let (mut same_top, mut pairs, mut min_cos) = (0usize, 0usize, 1.0f32);
+    for round in 0..10 {
+        let texts: Vec<String> = (0..5)
+            .map(|k| format!("{} {round}-{k} пакет", queries[(round + k) % queries.len()]))
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let batch = emb.embed_queries(&refs).unwrap();
+        for (t, b) in texts.iter().zip(&batch) {
+            let one = emb.embed_query(t).unwrap();
+            let c: f32 = one.dense.iter().zip(&b.dense).map(|(x, y)| x * y).sum();
+            min_cos = min_cos.min(c);
+            for lv in &leaf_vecs {
+                pairs += 1;
+                same_top += usize::from(top3(&one.dense, lv) == top3(&b.dense, lv));
+            }
+        }
+    }
+    eprintln!(
+        "T7B-METRIC focus_batch {model} ({}): согласие топ-3 листов пакет/одиночный {:.3} \
+         ({same_top} из {pairs}), мин. косинус векторов {min_cos:.5}",
+        if cuda { "GPU" } else { "CPU" },
+        same_top as f64 / pairs as f64
+    );
 }

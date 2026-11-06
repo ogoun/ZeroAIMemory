@@ -1545,7 +1545,7 @@ async fn mcp_read_focus() {
     assert!(o.text.contains("Оглавление: "), "{}", o.text);
     assert!(o.text.contains("*Глава 6"), "{}", o.text);
     assert!(
-        o.text.contains("[пропущено: range:0-")
+        o.text.contains("[пропущено: range:r1:0-")
             && o.text.contains(" (Справочник — Справочник > Глава "),
         "{}",
         o.text

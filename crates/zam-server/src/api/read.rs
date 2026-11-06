@@ -72,8 +72,13 @@
 //!   фрагмент `a:` — целиком с `warnings: ["focus skipped: short"]`; листов нет или нарезка
 //!   отстала — целиком с `focus skipped: not indexed`; в `session_seen` — только выданные листы
 //!   (`part = chunk_id`). Без `focus` ответ прежний;
-//! - **`range: "S-E"`** (адрес пропуска фокуса, M6 §6) — байты `[S, E)` текста L2 текущей ревизии
-//!   (узел; у записи — тело), `range` в json, ` › range:S-E` в заголовке md; не L2, с `section` или
+//! - **`range: "r<rev>:S-E"`** (адрес пропуска фокуса, M6 §6) — байты `[S, E)` текста L2 ревизии
+//!   `rev` узла (той, по которой выдан фокус; устарела — её текст и предупреждение `range: rev7,
+//!   текущая rev8`; снята сроком хранения — `not_found` «ревизия N недоступна — перечитайте с
+//!   focus»); без ревизии — 400; середина символа и выход за текст — `invalid` с причиной; у записи
+//!   и вложения — `invalid`. Права, Vault и маскирование — как у L2 (тот же текст и путь доступа).
+//!   Листы, целиком лежащие в диапазоне текущей ревизии, отмечаются выданными сессии. `range` в
+//!   json, ` › range:r<rev>:S-E` в заголовке md; не L2, с `section` или
 //!   `since_rev` — 400, вне текста или не на границе символа — `invalid`, у вложения — `invalid`;
 //! - если у какого-то элемента ошибка, в ответе (md и json) заголовок
 //!   `X-Zam-Read-Error: <код первой>`:
@@ -112,7 +117,7 @@ use super::nodes::diff_blocking;
 use super::nodes::read::{Tier, l1, parse_tier, section_slice};
 use super::read_focus::{
     FOCUS_NOT_INDEXED, FOCUS_SKIPPED, FocusCtx, FocusOut, FocusPart, FocusResult, FocusTarget,
-    focus_read,
+    focus_read, leaves_within,
 };
 use super::scope::{
     AttachmentScope, EntryScope, Mode, NodeScope, attachment_scope, entry_scope, live, live_entry,
@@ -274,8 +279,12 @@ struct Fetched {
     focus: bool,
     /// Части фокуса по порядку (`focus_parts` в json).
     focus_parts: Vec<FocusPart>,
-    /// Выданы байты `S-E` текста (`range`).
+    /// Выданы байты `r<rev>:S-E` текста (`range`).
     range: Option<String>,
+    /// В `seen` — части цели (листы фокуса или `range`): отмечаются, если текст не обрезан.
+    parts_seen: bool,
+    /// Токены текста, уже посчитанные (фокус — суммой частей): упаковка не токенизирует его снова.
+    tokens_hint: Option<usize>,
 }
 
 /// Что выдано из документа вложения.
@@ -366,6 +375,15 @@ fn split_ref(raw: &str) -> (Option<&str>, &str) {
             (Some(k), rest)
         }
         _ => (None, raw),
+    }
+}
+
+/// Фокус у цели возможен (эмбеддинг `focus` запускается заранее): узел (`n:`, путь, голый id) и
+/// документ `d:`/`b:`; не запись журнала и не фрагмент `a:`.
+fn focus_possible(raw: &str) -> bool {
+    match split_ref(raw.trim()) {
+        (Some(k), _) => k == "n" || k == BLOB_REF_LETTER || k == DOC_REF_LETTER,
+        (None, _) => true,
     }
 }
 
@@ -469,7 +487,7 @@ async fn fetch_node(
     sc: NodeScope,
     it: &ReadItem,
     tier: Tier,
-    fx: &mut FocusCtx<'_>,
+    fx: &FocusCtx<'_>,
     focus: Option<&str>,
     limit: usize,
 ) -> Result<Fetched, Failure> {
@@ -477,6 +495,9 @@ async fn fetch_node(
     let node = &sc.node;
     let mut warnings = Vec::new();
     let mut focused: Option<FocusOut> = None;
+    // `range`: ревизия адреса и листы, целиком лежащие в диапазоне
+    let mut range_rev: Option<i64> = None;
+    let mut range_leaves: Vec<String> = Vec::new();
     let section = (tier != Tier::L0)
         .then(|| {
             it.section
@@ -501,13 +522,41 @@ async fn fetch_node(
             Err(e) => return Err(e.into()),
         };
         changes(old, new, since, node.current_rev).await?
+    } else if let Some(r) = it.range.as_deref().filter(|_| section.is_none()) {
+        let (rev, a, b) = parse_range(r).map_err(Failure::Fatal)?;
+        if rev > node.current_rev {
+            return Err(Failure::Item(Fail::new(
+                "invalid",
+                Some(format!(
+                    "range: ревизии {rev} нет (текущая rev{})",
+                    node.current_rev
+                )),
+            )));
+        }
+        let text = match node_content(&sc.db, node.id, Some(rev)).await {
+            Ok((_, t)) => t,
+            Err(StoreError::NotFound) => {
+                return Err(Failure::Item(Fail::new(
+                    "not_found",
+                    Some(format!("ревизия {rev} недоступна — перечитайте с focus")),
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let piece = byte_range(&text, a, b, rev)?.to_string();
+        if rev != node.current_rev {
+            warnings.push(format!("range: rev{rev}, текущая rev{}", node.current_rev));
+        } else {
+            range_leaves = leaves_within(&sc.db, node.id, rev, &text, a, b).await?;
+        }
+        range_rev = Some(rev);
+        Content::plain(piece, false)
     } else {
         // ровно та ревизия, что в снимке узла
         let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
-        let (text, whole) = match (section, &it.range) {
-            (Some(s), _) => (slice(&text, s)?.to_string(), false),
-            (None, Some(r)) => (byte_range(&text, r, node.current_rev)?.to_string(), false),
-            (None, None) => (text, true),
+        let (text, whole) = match section {
+            Some(s) => (slice(&text, s)?.to_string(), false),
+            None => (text, true),
         };
         // фокус (M6 §6): `section` и `range` с ним отвергнуты до чтения, уровень — L2
         if let Some(q) = focus.filter(|_| whole && tier == Tier::L2) {
@@ -545,6 +594,7 @@ async fn fetch_node(
             warnings.extend(o.warnings.iter().cloned());
             (o.leaves.clone(), o.parts.clone())
         }
+        None if range_rev.is_some() => (range_leaves, Vec::new()),
         None => (vec![WHOLE_TARGET.to_string()], Vec::new()),
     };
     Ok(Fetched {
@@ -559,7 +609,7 @@ async fn fetch_node(
         certainty: node.certainty.map(|c| c.as_str().to_string()),
         section: section.map(str::to_string),
         tier,
-        rev: node.current_rev,
+        rev: range_rev.unwrap_or(node.current_rev),
         max_tokens: it.max_tokens,
         seen: parts
             .into_iter()
@@ -578,7 +628,9 @@ async fn fetch_node(
         reread: false,
         focus: focused.is_some(),
         focus_parts,
-        range: it.range.clone().filter(|_| section.is_none()),
+        range: range_rev.and(it.range.clone()),
+        parts_seen: focused.is_some() || range_rev.is_some(),
+        tokens_hint: focused.as_ref().map(|o| o.tokens),
     })
 }
 
@@ -629,10 +681,15 @@ async fn fetch_entry(
         let new = snap(e.rev).unwrap_or_else(|| entry_snapshot_text(&e.title, &e.body, &e.data));
         changes(snap(since), new, since, e.rev).await?
     } else {
-        let (text, whole) = match (section, &it.range) {
-            (Some(s), _) => (slice(&e.body, s)?.to_string(), false),
-            (None, Some(r)) => (byte_range(&e.body, r, e.rev)?.to_string(), false),
-            (None, None) => (e.body.clone(), true),
+        if it.range.is_some() {
+            return Err(Failure::Item(Fail::new(
+                "invalid",
+                Some("range — только у заметки (адрес пропуска фокуса)".into()),
+            )));
+        }
+        let (text, whole) = match section {
+            Some(s) => (slice(&e.body, s)?.to_string(), false),
+            None => (e.body.clone(), true),
         };
         match tier {
             Tier::L1 => {
@@ -695,40 +752,56 @@ async fn fetch_entry(
         reread: false,
         focus: false,
         focus_parts: Vec::new(),
-        range: it.range.clone().filter(|_| section.is_none()),
+        range: None,
+        parts_seen: false,
+        tokens_hint: None,
     })
 }
 
-/// Байты `S-E` (`range`, можно с префиксом `range:`) текста ревизии `rev`: вне текста или не на
-/// границе символа — `invalid`.
-fn byte_range<'a>(text: &'a str, raw: &str, rev: i64) -> Result<&'a str, Failure> {
-    let bad = || {
-        Failure::Item(Fail::new(
-            "invalid",
-            Some(format!(
-                "range: вне текста rev{rev} ({} байт) или не на границе символа",
-                text.len()
-            )),
-        ))
-    };
-    let (a, b) = parse_range(raw).map_err(|_| bad())?;
-    text.get(a..b).ok_or_else(bad)
+/// Байты `[a, b)` текста ревизии `rev`: за концом текста или на середине символа — `invalid` с
+/// причиной.
+fn byte_range(text: &str, a: usize, b: usize, rev: i64) -> Result<&str, Failure> {
+    let bad = |why: String| Failure::Item(Fail::new("invalid", Some(why)));
+    if b > text.len() {
+        return Err(bad(format!(
+            "range: {a}-{b} за концом текста rev{rev} ({} байт)",
+            text.len()
+        )));
+    }
+    for x in [a, b] {
+        if !text.is_char_boundary(x) {
+            return Err(bad(format!(
+                "range: байт {x} — середина символа UTF-8 (адрес не из пометки фокуса)"
+            )));
+        }
+    }
+    Ok(&text[a..b])
 }
 
-/// `S-E` (`range:S-E`) → `(S, E)`, `S < E`.
-fn parse_range(raw: &str) -> Result<(usize, usize), ApiError> {
+/// `r<rev>:S-E` (можно с префиксом `range:`) → `(rev, S, E)`, `S < E`; без ревизии — 400.
+fn parse_range(raw: &str) -> Result<(i64, usize, usize), ApiError> {
     let r = raw.trim();
     let r = r.strip_prefix("range:").unwrap_or(r);
-    let bad = || ApiError::BadRequest("range: S-E — байты текста L2, S < E".into());
-    let (a, b) = r.split_once('-').ok_or_else(bad)?;
+    let bad = || {
+        ApiError::BadRequest(
+            "range: r<ревизия>:S-E — байты текста L2 этой ревизии, S < E (адрес пометки фокуса)"
+                .into(),
+        )
+    };
+    let (rev, span) = r
+        .strip_prefix('r')
+        .and_then(|x| x.split_once(':'))
+        .ok_or_else(bad)?;
+    let rev: i64 = rev.parse().map_err(|_| bad())?;
+    let (a, b) = span.split_once('-').ok_or_else(bad)?;
     let (a, b): (usize, usize) = (
         a.trim().parse().map_err(|_| bad())?,
         b.trim().parse().map_err(|_| bad())?,
     );
-    if a >= b {
+    if a >= b || rev < 1 {
         return Err(bad());
     }
-    Ok((a, b))
+    Ok((rev, a, b))
 }
 
 /// `since_rev` больше текущей ревизии — 400 запроса (а не ошибка элемента): клиент прислал
@@ -1009,7 +1082,7 @@ async fn fetch_attachment(
     tier: Tier,
     locator: Option<Locator>,
     limit: usize,
-    fx: &mut FocusCtx<'_>,
+    fx: &FocusCtx<'_>,
     focus: Option<&str>,
 ) -> Result<Fetched, Failure> {
     let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
@@ -1036,6 +1109,7 @@ async fn fetch_attachment(
     let mut view = AttView::Part;
     let mut fwarn: Vec<String> = Vec::new();
     let mut fparts: Vec<FocusPart> = Vec::new();
+    let mut focus_tokens: Option<usize> = None;
     let chunk_ref = reference.starts_with(&format!("{CHUNK_REF_LETTER}:"));
     let content = if it.if_rev == Some(DOC_REV) {
         Content::Unchanged
@@ -1078,6 +1152,7 @@ async fn fetch_attachment(
                             fwarn = o.warnings;
                             parts = o.leaves;
                             fparts = o.parts;
+                            focus_tokens = Some(o.tokens);
                             Content::plain(o.text, false)
                         }
                         other => {
@@ -1205,9 +1280,11 @@ async fn fetch_attachment(
         }),
         warnings,
         reread: false,
+        tokens_hint: focus_tokens,
         focus: focus_view,
         focus_parts: fparts,
         range: None,
+        parts_seen: focus_view,
     })
 }
 
@@ -1220,7 +1297,7 @@ async fn fetch(
     tier: Tier,
     locator: Option<Locator>,
     budget: usize,
-    fx: &mut FocusCtx<'_>,
+    fx: &FocusCtx<'_>,
     focus: Option<&str>,
 ) -> Result<Fetched, Failure> {
     // больше бюджета пачки (и `max_tokens` элемента) выдано не будет — дальше не читается;
@@ -1358,7 +1435,7 @@ fn floor_cost(r: &Result<Fetched, (String, Fail)>) -> usize {
         Ok(f) => match &f.content {
             Content::Unchanged => count_tokens(&header(f, "unchanged")),
             Content::Text { text, .. } => {
-                let full = count_tokens(text) + f.omitted;
+                let full = f.tokens_hint.unwrap_or_else(|| count_tokens(text)) + f.omitted;
                 count_tokens(&header(f, &format!("~{full} tok"))) + count_tokens(BUDGET_LINE)
             }
         },
@@ -1398,7 +1475,7 @@ fn pack(fetched: Vec<Result<Fetched, (String, Fail)>>, budget: usize) -> (Vec<Pi
             Content::Text { text, form, .. } => (text.clone(), *form),
         };
         let whole = matches!(f.content, Content::Text { whole: true, .. });
-        let full = count_tokens(&text) + f.omitted;
+        let full = f.tokens_hint.unwrap_or_else(|| count_tokens(&text)) + f.omitted;
         let hc = count_tokens(&header(&f, &format!("~{full} tok")));
         if exhausted {
             total += hc + count_tokens(BUDGET_LINE);
@@ -1683,6 +1760,11 @@ pub async fn read(
         }
         if let Some(r) = &it.range {
             parse_range(r)?;
+            if is_doc_ref(&it.id) {
+                return Err(ApiError::BadRequest(
+                    "range — только у заметки: часть документа — locator".into(),
+                ));
+            }
             let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
             let l2 = it
                 .tier
@@ -1733,19 +1815,46 @@ pub async fn read(
         }
     };
 
+    // срок фокуса — один на вызов; эмбеддинги различных `focus` — сразу, параллельно чтению, и
+    // только у целей, где фокус возможен (не запись журнала и не фрагмент `a:`)
+    let fx = FocusCtx::new(
+        &st,
+        req.items
+            .iter()
+            .zip(&focuses)
+            .filter(|(it, _)| focus_possible(&it.id))
+            .filter_map(|(_, f)| f.as_deref()),
+    );
+    // цели вызова — конкурентно (чтение, фокус); порядок ответа — порядок запроса
+    let jobs = req.items.iter().zip(tiers).zip(locators).zip(&focuses).map(
+        |(((it, tier), locator), focus)| {
+            let (st, p, headers, fx) = (&st, &p, &headers, &fx);
+            async move {
+                let r = fetch(
+                    st,
+                    p,
+                    headers,
+                    it,
+                    tier,
+                    locator,
+                    budget,
+                    fx,
+                    focus.as_deref(),
+                )
+                .await;
+                (it.id.clone(), r)
+            }
+        },
+    );
     let mut fetched = Vec::with_capacity(req.items.len());
-    // срок фокуса — один на вызов; эмбеддинги различных `focus` — сразу, параллельно чтению
-    let mut fx = FocusCtx::new(&st, focuses.iter().flatten().map(String::as_str));
-    for (((it, tier), locator), focus) in req.items.iter().zip(tiers).zip(locators).zip(&focuses) {
-        let focus = focus.as_deref();
-        fetched.push(
-            match fetch(&st, &p, &headers, it, tier, locator, budget, &mut fx, focus).await {
-                Ok(f) => Ok(f),
-                Err(Failure::Item(fail)) => Err((it.id.clone(), fail)),
-                Err(Failure::Fatal(e)) => return Err(e),
-            },
-        );
+    for (id, r) in futures_util::future::join_all(jobs).await {
+        fetched.push(match r {
+            Ok(f) => Ok(f),
+            Err(Failure::Item(fail)) => Err((id, fail)),
+            Err(Failure::Fatal(e)) => return Err(e),
+        });
     }
+    drop(fx);
     fill_stale_refs(&mut fetched).await?;
     // повторная выдача (§7.3) — до упаковки: пометка входит в бюджет
     if let Some(s) = &session {
@@ -1764,7 +1873,7 @@ pub async fn read(
                     given_whole,
                     more,
                     ..
-                } if *given_whole || (f.focus && *more == 0) => {
+                } if *given_whole || (f.parts_seen && *more == 0) => {
                     Some(f.seen.iter().map(|k| SeenItem {
                         key: k.clone(),
                         rev: f.rev,

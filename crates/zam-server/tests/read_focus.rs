@@ -88,22 +88,23 @@ fn toc_line(text: &str) -> &str {
         .unwrap_or_else(|| panic!("нет оглавления: {text}"))
 }
 
-/// `range:S-E` → `(S, E)`.
-fn range_of(addr: &str) -> (usize, usize) {
-    let (a, b) = addr
-        .strip_prefix("range:")
-        .and_then(|r| r.split_once('-'))
+/// `range:r<rev>:S-E` → `(rev, S, E)`.
+fn range_of(addr: &str) -> (i64, usize, usize) {
+    let (rev, span) = addr
+        .strip_prefix("range:r")
+        .and_then(|r| r.split_once(':'))
         .unwrap_or_else(|| panic!("не range: {addr}"));
-    (a.parse().unwrap(), b.parse().unwrap())
+    let (a, b) = span.split_once('-').unwrap();
+    (rev.parse().unwrap(), a.parse().unwrap(), b.parse().unwrap())
 }
 
 /// Дочитывание по адресу пометки: элемент `/read {id, range}` — ровно байты текста `full`,
 /// `~N` пометки — токены этих байт счётчиком сервера.
 async fn reread_exact(a: &Api, id: &str, full: &str, s: &Skip) -> String {
-    let (x, y) = range_of(&s.addr);
+    let (rev, x, y) = range_of(&s.addr);
     let r = read_ok(
         a,
-        json!({"items": [{"id": id, "range": format!("{x}-{y}")}], "budget_tokens": 20000}),
+        json!({"items": [{"id": id, "range": format!("r{rev}:{x}-{y}")}], "budget_tokens": 20000}),
     )
     .await;
     let it = &r["items"][0];
@@ -123,7 +124,7 @@ fn check_parts(it: &Value, full: &str) {
     let text = it["text"].as_str().unwrap();
     let mut at = 0usize;
     for p in parts {
-        let (x, y) = range_of(p["part"].as_str().unwrap());
+        let (_, x, y) = range_of(p["part"].as_str().unwrap());
         assert_eq!(x, at, "{it}");
         if p["shown"] == true {
             assert!(
@@ -211,7 +212,7 @@ async fn focus_toc_le_150_tokens() {
 }
 
 /// Пропуск — один на промежуток между выданными кусками и по краям (не больше `focus_leaves` + 1),
-/// адрес `range:S-E` ведёт ровно к пропущенному, `~N` — его токены; подпись — первая и последняя
+/// адрес `range:r<rev>:S-E` ведёт ровно к пропущенному, `~N` — его токены; подпись — первая и последняя
 /// секция и их число; куски и пропуски вместе — весь текст (`focus_parts`).
 #[tokio::test]
 async fn focus_skip_marker_format() {
@@ -490,39 +491,214 @@ async fn focus_not_indexed_and_few_leaves() {
     assert_eq!(warnings(it), [SKIPPED], "{it}");
 }
 
-/// `range` — байты L2: вне текста и не на границе символа — `invalid`; с `section`, `since_rev`,
-/// `focus`, другим `tier` — 400; у вложения — `invalid`.
+/// `range` — `r<rev>:S-E`, байты L2 ревизии: без ревизии, с `section`, `since_rev`, `focus`,
+/// другим `tier` и у вложения — 400; за концом текста и на середине символа — `invalid` с
+/// причиной; ревизии ещё нет — `invalid`.
 #[tokio::test]
 async fn read_range_validation() {
     let a = api("focus-range", |_| {}).await;
     let text = "# Ёж\n\nтекст\n";
     let n = format!("n:{}", id(&a.note("knowledge", "Ёж", text).await));
-    let j = read_ok(&a, json!({"items": [{"id": &n, "range": "0-8"}]})).await;
+    let j = read_ok(&a, json!({"items": [{"id": &n, "range": "r1:0-8"}]})).await;
     assert_eq!(j["items"][0]["text"], &text[0..8], "{j}");
-    assert_eq!(j["items"][0]["range"], "0-8", "{j}");
-    let md = read_md(&a, json!({"items": [{"id": &n, "range": "range:0-8"}]})).await;
-    assert!(md.contains(" › range:0-8  rev1"), "{md}");
-    for r in ["0-999", "0-3"] {
+    assert_eq!(j["items"][0]["range"], "r1:0-8", "{j}");
+    let md = read_md(&a, json!({"items": [{"id": &n, "range": "range:r1:0-8"}]})).await;
+    assert!(md.contains(" › range:r1:0-8  rev1"), "{md}");
+    for (r, why) in [
+        ("r1:0-999", "за концом текста"),
+        ("r1:0-3", "середина символа"),
+        ("r5:0-3", "ревизии 5 нет"),
+    ] {
         let j = read_ok(&a, json!({"items": [{"id": &n, "range": r}]})).await;
-        assert_eq!(j["items"][0]["error"], "invalid", "{r}: {j}");
+        let it = &j["items"][0];
+        assert_eq!(it["error"], "invalid", "{r}: {j}");
+        assert!(it["detail"].as_str().unwrap().contains(why), "{r}: {j}");
     }
     for item in [
-        json!({"id": &n, "range": "8-2"}),
+        json!({"id": &n, "range": "0-8"}),
+        json!({"id": &n, "range": "r1:8-2"}),
         json!({"id": &n, "range": "x"}),
-        json!({"id": &n, "range": "0-8", "section": "Ёж"}),
-        json!({"id": &n, "range": "0-8", "since_rev": 1}),
-        json!({"id": &n, "range": "0-8", "tier": "L1"}),
-        json!({"id": &n, "range": "0-8", "focus": "x"}),
+        json!({"id": &n, "range": "r1:0-8", "section": "Ёж"}),
+        json!({"id": &n, "range": "r1:0-8", "since_rev": 1}),
+        json!({"id": &n, "range": "r1:0-8", "tier": "L1"}),
+        json!({"id": &n, "range": "r1:0-8", "focus": "x"}),
+        json!({"id": format!("d:{}", Id::new()), "range": "r1:0-8"}),
     ] {
         let r = read(&a, json!({"items": [item.clone()]})).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{item}: {}", r.text());
     }
+}
+
+/// Правка между фокусом и дочитыванием: адрес ведёт в ту ревизию, по которой выдан фокус —
+/// её байты и предупреждение `range: rev1, текущая rev2`; ревизия снята сроком хранения — ошибка
+/// элемента «ревизия 1 недоступна — перечитайте с focus» (повторное ревью 7b, I-A).
+#[tokio::test]
+async fn range_after_edit_and_removed_revision() {
+    let a = api("focus-range-rev", |_| {}).await;
+    let text = sections_note(8, 7, 5);
+    let n = id(&a.note("knowledge", "Правка", &text).await);
+    let nid = format!("n:{n}");
     let j = read_ok(
         &a,
-        json!({"items": [{"id": format!("d:{}", Id::new()), "range": "0-8"}]}),
+        json!({"items": [{"id": &nid, "focus": "нейтрино"}], "budget_tokens": 20000}),
     )
     .await;
-    assert!(j["items"][0]["error"].is_string(), "{j}");
+    let s = skips(j["items"][0]["text"].as_str().unwrap());
+    let (rev, x, y) = range_of(&s[0].addr);
+    assert_eq!(rev, 1, "{s:?}");
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{n}"),
+            Some(json!({"content": format!("# Новое начало\n\n{text}")})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = read_ok(
+        &a,
+        json!({"items": [{"id": &nid, "range": format!("r1:{x}-{y}")}], "budget_tokens": 20000}),
+    )
+    .await;
+    let it = &j["items"][0];
+    assert_eq!(it["text"], &text[x..y], "байты ревизии 1: {it}");
+    assert_eq!(it["rev"], 1, "{it}");
+    assert_eq!(warnings(it), ["range: rev1, текущая rev2"], "{it}");
+    // ревизии нет (ревизии узлов только дописываются — снятие моделируется в обход триггера
+    // append-only: путь «ревизия недоступна» защитный, как у `since_rev`)
+    let d = db(&a, a.st.admin_id).await;
+    let node: Id = n.parse().unwrap();
+    d.write(move |t| {
+        t.execute_batch("DROP TRIGGER revisions_no_delete")?;
+        t.execute(
+            "DELETE FROM revisions WHERE node_id = ?1 AND rev = 1",
+            [node.to_string()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let j = read_ok(
+        &a,
+        json!({"items": [{"id": &nid, "range": format!("r1:{x}-{y}")}]}),
+    )
+    .await;
+    let it = &j["items"][0];
+    assert_eq!(it["error"], "not_found", "{it}");
+    assert_eq!(
+        it["detail"], "ревизия 1 недоступна — перечитайте с focus",
+        "{it}"
+    );
+}
+
+/// `range` идёт тем же путём доступа и по тому же тексту, что L2: байты заметки с секретом — те
+/// же, что в L2 (L2 не маскируется, маскирует только нарезка индекса); чужой токен — как у L2.
+#[tokio::test]
+async fn range_same_text_and_access_as_l2() {
+    let a = api("focus-range-acl", |_| {}).await;
+    let key = ["AK", "IA", "Z7Q4", "MRT2", "WXPH", "BK9C"].concat();
+    let text = format!("# Склад\n\nКлюч доступа {key} для склада. Ещё текст.\n");
+    let n = id(&a.note("knowledge", "Склад", &text).await);
+    let nid = format!("n:{n}");
+    let l2 = read_ok(&a, json!({"items": [{"id": &nid}]})).await;
+    let l2 = l2["items"][0]["text"].as_str().unwrap().to_string();
+    let (x, y) = (l2.find("Ключ").unwrap(), l2.find(" Ещё").unwrap());
+    let j = read_ok(
+        &a,
+        json!({"items": [{"id": &nid, "range": format!("r1:{x}-{y}")}]}),
+    )
+    .await;
+    assert_eq!(j["items"][0]["text"], &l2[x..y], "{j}");
+    let (_, tok) = a.new_user("other7b").await;
+    let plain = a
+        .tok(
+            &tok,
+            Method::POST,
+            READ,
+            Some(json!({"items": [{"id": &nid}]})),
+        )
+        .await;
+    let ranged = a
+        .tok(
+            &tok,
+            Method::POST,
+            READ,
+            Some(json!({"items": [{"id": &nid, "range": format!("r1:{x}-{y}")}]})),
+        )
+        .await;
+    assert_eq!(plain.status, ranged.status);
+    assert_eq!(
+        plain.json()["items"][0]["error"],
+        ranged.json()["items"][0]["error"],
+        "{}",
+        ranged.text()
+    );
+    assert!(
+        ranged.json()["items"][0]["text"].is_null(),
+        "{}",
+        ranged.text()
+    );
+}
+
+/// Дочитывание `range` в сессии отмечает выданными листы, целиком лежащие в диапазоне
+/// (повторное ревью 7b, M-new-1).
+#[tokio::test]
+async fn range_marks_leaves_within_seen() {
+    let a = api("focus-range-seen", |_| {}).await;
+    let text = sections_note(8, 7, 5);
+    let n = id(&a.note("knowledge", "Отметки", &text).await);
+    let nid = format!("n:{n}");
+    let j = read_ok(
+        &a,
+        json!({"items": [{"id": &nid, "focus": "нейтрино"}], "budget_tokens": 20000}),
+    )
+    .await;
+    let s = skips(j["items"][0]["text"].as_str().unwrap());
+    let (rev, x, y) = range_of(&s[0].addr);
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            READ,
+            Some(
+                json!({"items": [{"id": &nid, "range": format!("r{rev}:{x}-{y}")}],
+                        "budget_tokens": 20000}),
+            ),
+            &[("x-zam-session", "s-range")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let user: Id = a.st.admin_id;
+    let d = db(&a, user).await;
+    let nid_: Id = n.parse().unwrap();
+    let target: SeenTarget = TargetRef {
+        kind: TargetKind::Node,
+        id: nid_,
+    }
+    .into();
+    let leaves = node_leaves(&d, nid_).await.unwrap();
+    let keys: Vec<SeenKey> = leaves
+        .iter()
+        .map(|l| SeenKey {
+            owner_id: user,
+            target: target.clone(),
+            part: l.chunk_id.clone(),
+        })
+        .collect();
+    let revs = seen_revs(&d, "s-range", 0, &keys).await.unwrap();
+    let gap = &text[x..y];
+    let mut marked = 0;
+    for (l, k) in leaves.iter().zip(&keys) {
+        let inside = gap.contains(l.text.trim());
+        if inside {
+            assert_eq!(revs.get(k).copied(), Some(1), "{}", l.heading_path);
+            marked += 1;
+        } else {
+            assert!(!revs.contains_key(k), "{}", l.heading_path);
+        }
+    }
+    assert!(marked >= 4, "{marked}");
 }
 
 // ---- целиком без фокуса ----

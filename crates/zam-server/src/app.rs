@@ -69,6 +69,11 @@ pub struct AppState {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub focus_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Пакетный эмбеддинг запросов фокуса (фича `test-hooks`, замер): 0 — по умолчанию
+    /// (`read_focus::FOCUS_BATCH_DEFAULT`), 1 — включён, 2 — выключен.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub focus_batch: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl AppState {
@@ -332,6 +337,8 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         search_hold: Arc::default(),
         #[cfg(feature = "test-hooks")]
         focus_delay_ms: Arc::default(),
+        #[cfg(feature = "test-hooks")]
+        focus_batch: Arc::default(),
     };
     let router = router(state.clone());
     Ok((router, state, BootReport { initial_token }))

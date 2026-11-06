@@ -77,8 +77,8 @@ enum Cmd {
         /// Пачка: явный фокус — оглавление, ближайшие к запросу листы, «[пропущено: путь · ~N t]»
         #[arg(long, value_name = "ЗАПРОС")]
         focus: Option<String>,
-        /// Пачка: байты S-E текста L2 — адрес «[пропущено: range:S-E …]» фокуса
-        #[arg(long, value_name = "S-E")]
+        /// Пачка: r<rev>:S-E — байты ревизии, адрес «[пропущено: range:r<rev>:S-E …]» фокуса
+        #[arg(long, value_name = "rREV:S-E")]
         range: Option<String>,
         #[command(flatten)]
         common: Common,

@@ -187,7 +187,7 @@ impl ToolName {
                             "focus": {"type": "string", "description":
                                 "запрос: оглавление, ближайшие листы, [пропущено: адрес · ~N t]"},
                             "range": {"type": "string",
-                                      "description": "байты S-E текста L2 (адрес [пропущено])"},
+                                      "description": "r<rev>:S-E — байты ревизии (адрес [пропущено])"},
                             "section": {"type": "string", "description": "путь заголовков «A > B»"},
                             "max_tokens": {"type": "integer", "minimum": 1},
                             "if_rev": {"type": "integer"},

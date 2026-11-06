@@ -741,7 +741,7 @@ fn numbered(loc: &str) -> Option<(&str, u32)> {
         .map(|n| (k, n))
 }
 
-/// Элементы дочитывания по адресу пометки: `range:S-E` → `range`; `page:3 — page:7` → `locator`
+/// Элементы дочитывания по адресу пометки: `range:r<rev>:S-E` → `range`; `page:3 — page:7` → `locator`
 /// каждой части (не больше [`REREAD_LOCATORS_MAX`]; не нумерованные — первая и последняя);
 /// `оглавление` — L2; иначе — путь секции (пометка без адреса).
 fn address_parts(addr: &str) -> Vec<(String, String)> {
@@ -1120,21 +1120,21 @@ mod tests {
     /// Пометки явного фокуса называют секции: дочитываются они, а не L2 целиком.
     #[test]
     fn reread_prefers_named_sections() {
-        let t = "### n:x a\nлист\n[пропущено: range:0-120 (начало — A > B, секций: 2) · ~40 t]\n\
-                 [пропущено: range:300-420 (FAQ) · ~80 t]\n…ещё 10 токенов\n";
+        let t = "### n:x a\nлист\n[пропущено: range:r3:0-120 (начало — A > B, секций: 2) · ~40 t]\n\
+                 [пропущено: range:r3:300-420 (FAQ) · ~80 t]\n…ещё 10 токенов\n";
         let need = reread_need(t).unwrap();
         assert_eq!(
             need,
             Reread::Parts(vec![
-                ("range".into(), "0-120".into()),
-                ("range".into(), "300-420".into())
+                ("range".into(), "r3:0-120".into()),
+                ("range".into(), "r3:300-420".into())
             ])
         );
         assert_eq!(
             reread_items("n:x", &need),
             [
-                json!({"id": "n:x", "range": "0-120"}),
-                json!({"id": "n:x", "range": "300-420"})
+                json!({"id": "n:x", "range": "r3:0-120"}),
+                json!({"id": "n:x", "range": "r3:300-420"})
             ]
         );
         assert_eq!(reread_items("n:x", &Reread::Whole), [json!({"id": "n:x"})]);
