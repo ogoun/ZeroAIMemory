@@ -33,8 +33,8 @@ use crate::paths::NodePath;
 use crate::time::{conv_err, ts_at, ts_opt};
 
 pub use chunks::{
-    BudgetCounterKind, PREFIX_L0_MAX_TOKENS, budget_cap, budget_counter_kind, chunk_params,
-    count_tokens, count_tokens_chunker, fits_budget, prefix_l0, set_bundled_counter,
+    BudgetCounterKind, PREFIX_L0_MAX_TOKENS, budget_cap, budget_counter_kind, budget_tokenizer_id,
+    chunk_params, count_tokens, count_tokens_chunker, fits_budget, prefix_l0, set_bundled_counter,
     set_chunk_params, set_prefix_l0, set_token_counter, token_counter_exact,
 };
 pub(crate) use chunks::{

@@ -342,6 +342,12 @@ pub fn budget_counter_kind() -> BudgetCounterKind {
     budget_counter_with_kind().1
 }
 
+/// `tokenizer_id` активного счётчика выдачи (`/health`): у токенизатора — по его
+/// `tokenizer.json`, у оценки — версия (`estimate-v5`).
+pub fn budget_tokenizer_id() -> String {
+    budget_counter().tokenizer_id()
+}
+
 /// Число токенов `text` для размеров, которые видит агент (`Nt`, `tokens`, `~N tok`): точный
 /// счёт или несмещённая оценка ([`budget_counter`]).
 pub fn count_tokens(text: &str) -> usize {

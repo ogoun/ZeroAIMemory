@@ -33,29 +33,6 @@ async fn setup(a: &Api, tok: &str, q: &str) -> Value {
     r.json()
 }
 
-/// Счётчик токенов модели bge-m3 (как у чанкера) из `target/models`: установленная модель или
-/// одиночный токенизатор `tokenizers/bge-m3-int8/` (его качает `cargo xtask fetch-models
-/// --test`, в том числе в CI); нет — `None` (в CI с `ZAM_REQUIRE_ML` — падение).
-fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/models");
-    let tokenizers = dir.join("tokenizers");
-    for (d, id) in [
-        (&dir, "bge-m3-int8"),
-        (&dir, "bge-m3-fp16"),
-        (&tokenizers, "bge-m3-int8"),
-    ] {
-        if let Ok(c) = zam_ml::BgeTokenCounter::load(d, id) {
-            return Some(c);
-        }
-    }
-    assert!(
-        std::env::var_os("ZAM_REQUIRE_ML").is_none(),
-        "нет токенизатора bge-m3: cargo xtask fetch-models --test"
-    );
-    eprintln!("пропуск: нет токенизатора bge-m3 в target/models");
-    None
-}
-
 /// Фразы, которые блоки v5 (M5.6) и v6 (M5.7) перенесли в протокол `zam guide` ради бюджета
 /// 500 токенов (ru и en): v5 — исследование по прошлым опытам, `scope=global` у insight,
 /// канонические термины; v6 — «(409 — перечитай)», «заметке — `l0`», «перед работой», «в чате».
@@ -83,7 +60,7 @@ const MOVED_TO_GUIDE: [&str; 14] = [
 
 #[tokio::test]
 async fn agent_setup_block_v6_under_500_tokens_ru_en() {
-    let Some(counter) = bge_counter() else {
+    let Some(counter) = common::ml::bge_counter() else {
         return;
     };
     assert!(counter.is_exact());

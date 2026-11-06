@@ -62,6 +62,10 @@ async fn health_ok_under_base_path() {
         ),
         "{j}"
     );
+    assert!(
+        j["tokenizer_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "{j}"
+    );
     // возможности сборки для загрузчика замера M6 (xtask eval caps): сборка ветки M6 — "m6"
     let f: Vec<&str> = j["features"]
         .as_array()

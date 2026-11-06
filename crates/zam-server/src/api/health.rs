@@ -20,6 +20,7 @@ pub async fn health(State(st): State<AppState>) -> Json<Value> {
         "git": GIT_SHA,
         "features": FEATURES,
         "token_counter": zam_store::budget_counter_kind().as_str(),
+        "tokenizer_id": zam_store::budget_tokenizer_id(),
         "uptime_s": st.started_at.elapsed().as_secs(),
     }))
 }

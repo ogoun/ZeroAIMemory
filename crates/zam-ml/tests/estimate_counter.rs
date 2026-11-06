@@ -6,8 +6,9 @@
 //! Слои корпуса: заметки eval целиком, карточки поиска с полными id (26 символов Crockford
 //! base32), идентификаторы и пути исходников проекта, строки карты кода, синтетика C#/Java/TS,
 //! CJK, корейский, греческий и другие письменности, смешанные строки. Ответы целиком —
-//! фикстура `fixtures/estimate_responses.json` (отложенная половина подбора, обезличена: dev-
-//! прогоны ТС-1/ТС-2, синтетика кода и письменностей; holdout не входит).
+//! фикстура `fixtures/estimate_responses.json`: 220 **целых, необрезанных** ответов проверочной
+//! половины `eval/tools/estimate_fit.py` (деление группами — сценарий ТС-1, сессия ТС-2, зерно
+//! синтетики; dev-прогоны ТС-1/ТС-2 без holdout, синтетика кода и письменностей).
 
 mod common;
 
@@ -15,9 +16,6 @@ use std::path::Path;
 
 use common::*;
 use zam_markdown::{ESTIMATE_C, ESTIMATE_M, EstimateCounter, TokenCounter};
-
-/// Токенизатор bge-m3 (только `tokenizer.json`, без ORT).
-const BGE: &str = "bge-m3-int8";
 
 /// Все `*.md` каталога (рекурсивно).
 fn md_files(dir: &Path, out: &mut Vec<String>) {
@@ -397,17 +395,9 @@ fn synthetic_idents() -> Vec<String> {
 
 #[test]
 fn estimate_unbiased_by_layer() {
-    let path = models_dir().join(BGE).join("tokenizer.json");
-    if !path.is_file() {
-        assert!(
-            std::env::var_os("ZAM_REQUIRE_ML").is_none(),
-            "нет {}: cargo xtask fetch-models --id {BGE}",
-            path.display()
-        );
-        eprintln!("пропуск: нет токенизатора {BGE}");
+    let Some(bge) = bge_tokenizer() else {
         return;
-    }
-    let bge = zam_ml::BgeTokenCounter::load(&models_dir(), BGE).unwrap();
+    };
     let mut docs = Vec::new();
     md_files(&repo_root().join("eval").join("corpus"), &mut docs);
     md_files(&repo_root().join("eval").join("sessions-corpus"), &mut docs);
@@ -515,17 +505,9 @@ struct Response {
 /// bge-m3. Превышений `bge > B` — не больше 1 %, наибольшее превышение — не больше 5 %.
 #[test]
 fn estimate_fits_responses() {
-    let path = models_dir().join(BGE).join("tokenizer.json");
-    if !path.is_file() {
-        assert!(
-            std::env::var_os("ZAM_REQUIRE_ML").is_none(),
-            "нет {}: cargo xtask fetch-models --id {BGE}",
-            path.display()
-        );
-        eprintln!("пропуск: нет токенизатора {BGE}");
+    let Some(bge) = bge_tokenizer() else {
         return;
-    }
-    let bge = zam_ml::BgeTokenCounter::load(&models_dir(), BGE).unwrap();
+    };
     let raw = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/estimate_responses.json"),
     )

@@ -50,8 +50,37 @@ pub fn ort_gpu() -> PathBuf {
 }
 
 /// `target/models` (`cargo xtask fetch-models`).
+/// Каталог моделей тестов: `target/models`, или `ZAM_TEST_MODELS_DIR` — так локально
+/// воспроизводится набор CI (`fetch-models --test`: тестовая модель и одиночный токенизатор
+/// `tokenizers/bge-m3-int8/`) без удаления полных моделей.
 pub fn models_dir() -> PathBuf {
-    repo_root().join("target").join("models")
+    std::env::var_os("ZAM_TEST_MODELS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("target").join("models"))
+}
+
+/// Токенизатор bge-m3 для тестов счёта токенов: сначала одиночный `tokenizers/bge-m3-int8/`
+/// (его качает `cargo xtask fetch-models --test`, в том числе в CI), затем установленные
+/// `bge-m3-int8`, `bge-m3-fp16`. Нет — `None`; с `ZAM_REQUIRE_ML` — падение.
+pub fn bge_tokenizer() -> Option<zam_ml::BgeTokenCounter> {
+    let dir = models_dir();
+    let tokenizers = dir.join("tokenizers");
+    for (d, id) in [
+        (&tokenizers, "bge-m3-int8"),
+        (&dir, "bge-m3-int8"),
+        (&dir, "bge-m3-fp16"),
+    ] {
+        if let Ok(c) = zam_ml::BgeTokenCounter::load(d, id) {
+            return Some(c);
+        }
+    }
+    assert!(
+        std::env::var_os("ZAM_REQUIRE_ML").is_none(),
+        "нет токенизатора bge-m3 в {}: cargo xtask fetch-models --test",
+        dir.display()
+    );
+    eprintln!("пропуск: нет токенизатора bge-m3 в {}", dir.display());
+    None
 }
 
 /// Отдельный каталог для временных данных теста (внутри `target/`).

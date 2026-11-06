@@ -1297,27 +1297,6 @@ async fn acceptance_task_lifecycle_and_dead_ends() {
 
 // ---------- п. 11 ----------
 
-/// Счётчик токенов bge-m3 из `target/models` (как `tests/agent_setup.rs`); нет — `None` (с
-/// `ZAM_REQUIRE_ML` — падение).
-fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/models");
-    let tokenizers = dir.join("tokenizers");
-    for (d, id) in [
-        (&dir, "bge-m3-int8"),
-        (&dir, "bge-m3-fp16"),
-        (&tokenizers, "bge-m3-int8"),
-    ] {
-        if let Ok(c) = zam_ml::BgeTokenCounter::load(d, id) {
-            return Some(c);
-        }
-    }
-    assert!(
-        std::env::var_os("ZAM_REQUIRE_ML").is_none(),
-        "нет токенизатора bge-m3: cargo xtask fetch-models --test"
-    );
-    None
-}
-
 /// §13 п. 11: блок v6 (ru, en) со строкой идей ≤ 500 токенов bge-m3 и без четырёх перенесённых
 /// фраз (они — в протоколе вместе с разделом «Идеи» и `--channel chat`); напоминание v5 → v6 —
 /// одно; MCP — 11 инструментов, описания ≤ 300 символов, `propose`/`decide`/`horizon` в схеме.
@@ -1326,7 +1305,7 @@ fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
 async fn acceptance_block_v6_and_mcp() {
     use zam_markdown::TokenCounter as _;
     let a = world("block", |_| {}).await;
-    let counter = bge_counter();
+    let counter = common::ml::bge_counter();
     let cases = [
         (
             "ru",

@@ -28,6 +28,7 @@
 | `glossary.toml` | M4.5: словарь домена — 16 терминов с псевдонимами RU↔EN (сленг, транслитерация, сокращения) и 24 запроса на псевдонимах |
 | `docs/` | M5: набор документов (не в git, `.gitignore`): генерирует `cargo xtask docs-corpus` из сида — DOCX, XLSX, PPTX, PDF (одна и две колонки, кириллица, CJK, 500 страниц, «скан»), враждебные файлы, `manifest.json` (факты, эталон порядка строк PDF) |
 | `docs-queries.toml` | M5: 45 запросов к фактам набора документов (`exact` 23, `paraphrase` 11, `cross-lang` 8, `date` 3) |
+| `tools/estimate_fit.py` | M6, задача 5: подбор оценки токенов без модели `EstimateCounter` (таблица, `m`, `c`) и фикстуры её теста по dev-прогонам ТС-1/ТС-2 и синтетике; запуск: `python eval/tools/estimate_fit.py [--fixture crates/zam-ml/tests/fixtures/estimate_responses.json]` (numpy, scipy, tokenizers; `cargo xtask fetch-models --test`) |
 | `results/` | результаты прогонов: `.json` (полные, по запросам) и `.md` (таблицы) |
 
 **Корпус** — заметки инженера по темам: Windows и кодировки (CRLF, PowerShell), git, Linux и
