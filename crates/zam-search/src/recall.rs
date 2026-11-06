@@ -226,25 +226,41 @@ pub fn hint_line(lead: &str, title: &str, tags: &[&str], reference: &str) -> Str
 
 /// Раздел дайджеста: заголовок (строка `### …`, ставится, только если в раздел вошёл хоть
 /// один блок) и блоки — по одному на подсказку (строка и, возможно, строки с отступом).
+/// `reserved` — раздел-резерв (Rules дайджеста и пакета восстановления, M6 §8): выводится
+/// целиком сверх бюджета и в бюджете не считается.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
     pub title: Option<String>,
     pub blocks: Vec<String>,
+    pub reserved: bool,
 }
 
-/// Упаковка разделов в `budget` токенов по счётчику `count`: разделы и блоки — по порядку
-/// (приоритет), блок, который не влезает, пропускается, следующие короткие ещё пробуются.
-/// Итог — текст (блоки через перевод строки, перед заголовком раздела — пустая строка) и
-/// вошедшие блоки `(раздел, блок)`. Гарантия: `count(text) <= budget` (при расхождении суммы
-/// частей с подсчётом целого с конца снимаются блоки).
+impl Section {
+    /// Раздел в бюджете.
+    pub fn new(title: Option<String>, blocks: Vec<String>) -> Self {
+        Self {
+            title,
+            blocks,
+            reserved: false,
+        }
+    }
+}
+
+/// Упаковка разделов в `cap` по счётчику `count` (M6 §4.2, §8): разделы-резервы — целиком и вне
+/// бюджета; остальные разделы и блоки — по порядку (приоритет), блок, который не влезает,
+/// пропускается, следующие короткие ещё пробуются. `cap` — наибольший счёт, что помещается в
+/// бюджет (`TokenCounter::budget_cap`): с ним сравниваются суммы частей, и с ним же — счёт
+/// текста разделов в бюджете целиком (при расхождении суммы с целым с конца снимаются блоки).
+/// Итог — текст всех вошедших блоков в порядке разделов (блоки через перевод строки, перед
+/// заголовком раздела — пустая строка) и вошедшие блоки `(раздел, блок)`.
 pub fn pack_sections(
     sections: &[Section],
-    budget: usize,
+    cap: usize,
     count: &dyn Fn(&str) -> usize,
 ) -> (String, Vec<(usize, usize)>) {
     let mut used = 0usize;
-    let mut taken: Vec<(usize, usize)> = Vec::new();
-    for (si, sec) in sections.iter().enumerate() {
+    let mut budgeted: Vec<(usize, usize)> = Vec::new();
+    for (si, sec) in sections.iter().enumerate().filter(|(_, s)| !s.reserved) {
         let mut opened = false;
         for (bi, block) in sec.blocks.iter().enumerate() {
             let head = match (&sec.title, opened) {
@@ -252,20 +268,36 @@ pub fn pack_sections(
                 _ => 0,
             };
             let cost = head + count(&format!("{block}\n"));
-            if used + cost <= budget {
+            if used + cost <= cap {
                 used += cost;
                 opened = true;
-                taken.push((si, bi));
+                budgeted.push((si, bi));
             }
         }
     }
-    loop {
-        let text = render(sections, &taken);
-        if count(&text) <= budget || taken.is_empty() {
-            return (text, taken);
-        }
-        taken.pop();
+    while !budgeted.is_empty() && count(&render(sections, &budgeted)) > cap {
+        budgeted.pop();
     }
+    let mut taken: Vec<(usize, usize)> = sections
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.reserved)
+        .flat_map(|(si, s)| (0..s.blocks.len()).map(move |bi| (si, bi)))
+        .chain(budgeted)
+        .collect();
+    taken.sort_unstable();
+    (render(sections, &taken), taken)
+}
+
+/// Текст разделов-резервов целиком (размер резерва — отдельной строкой ответа, M6 §17 п. 3).
+pub fn reserved_text(sections: &[Section]) -> String {
+    let taken: Vec<(usize, usize)> = sections
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.reserved)
+        .flat_map(|(si, s)| (0..s.blocks.len()).map(move |bi| (si, bi)))
+        .collect();
+    render(sections, &taken)
 }
 
 /// Текст вошедших блоков (см. [`pack_sections`]).
@@ -392,18 +424,12 @@ mod tests {
     fn pack_sections_respects_budget_and_skips_big_blocks() {
         let words = |s: &str| s.split_whitespace().count();
         let secs = vec![
-            Section {
-                title: Some("### A".into()),
-                blocks: vec!["a1 a1".into(), "big ".repeat(50)],
-            },
-            Section {
-                title: Some("### B".into()),
-                blocks: vec!["b1".into()],
-            },
-            Section {
-                title: None,
-                blocks: vec!["c1 c1 c1".into()],
-            },
+            Section::new(
+                Some("### A".into()),
+                vec!["a1 a1".into(), "big ".repeat(50)],
+            ),
+            Section::new(Some("### B".into()), vec!["b1".into()]),
+            Section::new(None, vec!["c1 c1 c1".into()]),
         ];
         let (text, taken) = pack_sections(&secs, 10, &words);
         assert_eq!(taken, [(0, 0), (1, 0), (2, 0)]);
@@ -415,5 +441,31 @@ mod tests {
         assert_eq!(text, "### A\na1 a1\n");
         let (text, taken) = pack_sections(&secs, 0, &words);
         assert!(taken.is_empty() && text.is_empty());
+    }
+
+    /// M6 §8: раздел-резерв (Rules) выводится целиком сверх бюджета и в нём не считается;
+    /// остальные — в бюджете, в порядке разделов.
+    #[test]
+    fn pack_sections_reserved_outside_budget() {
+        let words = |s: &str| s.split_whitespace().count();
+        let mut rules = Section::new(
+            Some("### R".into()),
+            vec!["r1 r1 r1".into(), "r2 r2".into()],
+        );
+        rules.reserved = true;
+        let secs = vec![
+            Section::new(Some("### A".into()), vec!["a1 a1".into()]),
+            rules,
+            Section::new(None, vec!["c1 c1 c1".into(), "c2".into()]),
+        ];
+        // бюджет 5: «### A a1 a1» (4) + «c2» (1); Rules — сверх
+        let (text, taken) = pack_sections(&secs, 5, &words);
+        assert_eq!(taken, [(0, 0), (1, 0), (1, 1), (2, 1)]);
+        assert_eq!(text, "### A\na1 a1\n\n### R\nr1 r1 r1\nr2 r2\nc2\n");
+        assert_eq!(reserved_text(&secs), "### R\nr1 r1 r1\nr2 r2\n");
+        // нулевой бюджет — только резерв
+        let (text, taken) = pack_sections(&secs, 0, &words);
+        assert_eq!(taken, [(1, 0), (1, 1)]);
+        assert_eq!(text, "### R\nr1 r1 r1\nr2 r2\n");
     }
 }

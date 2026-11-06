@@ -35,6 +35,15 @@ pub fn utc_today() -> jiff::civil::Date {
     now().to_zoned(jiff::tz::TimeZone::UTC).date()
 }
 
+/// Начало суток UTC момента `t` (M6 §8: окна дайджеста — от начала текущих суток, чтобы два
+/// старта в одни сутки видели одно и то же).
+pub fn day_start_utc(t: Timestamp) -> Timestamp {
+    let z = t.to_zoned(jiff::tz::TimeZone::UTC);
+    z.date()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .map_or(t, |d| d.timestamp())
+}
+
 /// Форматирует момент времени для хранения в TEXT-колонке.
 pub fn fmt_ts(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%S.%6fZ").to_string()
@@ -118,6 +127,15 @@ mod tests {
         assert_eq!(age_days(now, upd, Some("2026-10-29T11:00:00Z")), 0);
         assert_eq!(age_days(now, upd, Some("мусор")), 9);
         assert_eq!(age_days(upd, now, None), 0);
+    }
+
+    /// M6 §8: окна дайджеста — от начала суток UTC момента.
+    #[test]
+    fn day_start_utc_of_moment() {
+        let t: Timestamp = "2026-10-18T23:59:59.5Z".parse().unwrap();
+        assert_eq!(fmt_ts(day_start_utc(t)), "2026-10-18T00:00:00.000000Z");
+        let t: Timestamp = "2026-10-18T00:00:00Z".parse().unwrap();
+        assert_eq!(day_start_utc(t), t);
     }
 
     #[test]

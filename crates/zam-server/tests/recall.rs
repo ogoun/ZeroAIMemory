@@ -108,15 +108,20 @@ fn ids(j: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Каждая строка подсказки начинается с `ZeroAIMemory:` и несёт свою ссылку.
+/// Каждая строка подсказки начинается с `ZeroAIMemory:` и несёт свою ссылку; строка-индекс
+/// (M6 §8: changelog, revisit) — начинается со ссылки.
 fn assert_marked(j: &Value) {
     let text = j["text"].as_str().unwrap();
     for id in ids(j) {
+        let index = format!("{id} «");
         let line = text
             .lines()
-            .find(|l| l.ends_with(&format!(" {id}")))
+            .find(|l| l.ends_with(&format!(" {id}")) || l.starts_with(&index))
             .unwrap_or_else(|| panic!("нет строки {id}: {text}"));
-        assert!(line.starts_with("ZeroAIMemory: "), "{line}");
+        assert!(
+            line.starts_with("ZeroAIMemory: ") || line.starts_with(&index),
+            "{line}"
+        );
     }
 }
 
@@ -160,9 +165,15 @@ async fn session_start_digest_within_budget() {
     }
     let j = ok(&a, &a.token, Some("s1"), json!({"event": "session_start"})).await;
     let tokens = j["tokens"].as_u64().unwrap();
-    assert!(tokens > 0 && tokens <= 1500, "{tokens}");
     let text = j["text"].as_str().unwrap();
     assert_eq!(zam_store::count_tokens(text) as u64, tokens);
+    // M6 §8: Rules — сверх бюджета, остальное — в `digest_tokens`
+    let rest = without_section(text, "### Правила");
+    assert!(
+        !rest.is_empty() && zam_store::fits_budget(&rest, 1500),
+        "{tokens}: {rest}"
+    );
+    assert!(j["rules_tokens"].as_u64().unwrap() > 0, "{j}");
     assert!(!j["items"].as_array().unwrap().is_empty());
     assert_marked(&j);
     assert_eq!(
@@ -182,8 +193,12 @@ async fn session_start_digest_within_budget() {
         json!({"event": "session_start", "budget_tokens": 120}),
     )
     .await;
-    let tokens = j["tokens"].as_u64().unwrap();
-    assert!(tokens > 0 && tokens <= 120, "{tokens}: {}", j["text"]);
+    let rest = without_section(j["text"].as_str().unwrap(), "### Правила");
+    assert!(
+        !rest.is_empty() && zam_store::fits_budget(&rest, 120),
+        "{}",
+        j["text"]
+    );
     // некорректный бюджет и событие — 400
     for bad in [
         json!({"event": "session_start", "budget_tokens": 0}),
@@ -1229,7 +1244,10 @@ async fn digest_code_line_under_80_tokens_after_verified() {
     .await;
     let line = code_line(&j).unwrap_or_else(|| panic!("нет строки карты: {j}"));
     assert!(
-        line.starts_with("ZeroAIMemory: карта кода: 2 файла, 3 символа, снимок 0 мин (main@abcdef1); центральные: "),
+        line.starts_with(&format!(
+            "ZeroAIMemory: карта кода: 2 файла, 3 символа, снимок {} (main@abcdef1); центральные: ",
+            zam_store::time::utc_today()
+        )),
         "{line}"
     );
     assert!(line.ends_with(" — `memory_code`/`zam code map`"), "{line}");
@@ -1400,4 +1418,483 @@ async fn prompt_hint_returns_after_new_epoch() {
     assert_eq!(ids(&j), [me.as_str()], "{j}");
     let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
     assert_eq!(j["text"], "", "{j}");
+}
+
+// ---- задача 8a M6 (§8): Rules-резерв, компактные индексы, ключи `[recall]` ----
+
+/// Текст без раздела `title` (заголовок, его строки и пустая строка перед ним) — часть
+/// дайджеста, что упаковывается в бюджет (Rules — сверх него, M6 §8).
+fn without_section(text: &str, title: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let Some(start) = lines.iter().position(|l| *l == title) else {
+        return text.to_string();
+    };
+    let end = lines[start..]
+        .iter()
+        .position(|l| l.is_empty())
+        .map_or(lines.len(), |k| start + k);
+    let mut kept: Vec<&str> = Vec::new();
+    if start > 0 && lines[start - 1].is_empty() {
+        // пустая строка перед заголовком уходит вместе с разделом
+        kept.extend(&lines[..start - 1]);
+        kept.extend(&lines[end..]);
+    } else {
+        // раздел первый: уходит пустая строка после него
+        kept.extend(lines.get(end + 1..).unwrap_or_default());
+    }
+    kept.join("\n")
+}
+
+/// Строки раздела `title` (без заголовка); нет раздела — пусто.
+fn section(text: &str, title: &str) -> Vec<String> {
+    let Some(rest) = text.split(&format!("{title}\n")).nth(1) else {
+        return Vec::new();
+    };
+    rest.split("\n\n")
+        .next()
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// M6 §8, §17 п. 9: все Rules (до 20, L1 ≤ 200 токенов) выдаются сверх `digest_tokens` даже
+/// при бюджете 100, в дайджесте и в пакете восстановления; остальное — в бюджете;
+/// `rules_tokens` — размер раздела Rules.
+#[tokio::test]
+async fn rules_reserved_never_cut() {
+    let a = api("recall-rules-reserved", |c| {
+        roomy(c);
+        c.recall.digest_tokens = 100;
+        c.recall.recovery_tokens = 100;
+    })
+    .await;
+    allow_rules(&a).await;
+    let long = "Длинное пояснение правила с подробностями и примерами. ".repeat(40);
+    let mut rules = Vec::new();
+    for i in 0..21 {
+        let n = a
+            .note(
+                "rules",
+                &format!("правило-{i:02}"),
+                &format!("# Правило {i}\n\n{long}\n"),
+            )
+            .await;
+        rules.push(format!("n:{}", n["id"].as_str().unwrap()));
+    }
+    for i in 0..8 {
+        insight(
+            &a,
+            &a.token,
+            "knowledge",
+            &format!("Ловушка номер {i} с длинным заголовком про сборку и окружение"),
+            "текст",
+            "gotcha",
+        )
+        .await;
+    }
+    for event in ["session_start", "recovery"] {
+        let j = ok(&a, &a.token, Some("rr-1"), json!({"event": event})).await;
+        let text = j["text"].as_str().unwrap();
+        let got = ids(&j);
+        // до RULES_MAX = 20: первые 20 по порядку Rules — все на месте
+        for r in &rules[..20] {
+            assert!(got.contains(r), "{event}: {r}: {text}");
+        }
+        assert!(
+            !got.contains(&rules[20]),
+            "{event}: сверх RULES_MAX: {text}"
+        );
+        let rest = without_section(text, "### Правила");
+        assert!(
+            zam_store::fits_budget(&rest, 100),
+            "{event}: без Rules {} > 100: {rest}",
+            zam_store::count_tokens(&rest)
+        );
+        let rules_tokens = j["rules_tokens"].as_u64().unwrap_or_else(|| panic!("{j}"));
+        assert!(rules_tokens > 100, "{event}: {j}");
+    }
+    // пакет под задачу — L0 Rules в своём бюджете, как раньше
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rr-2"),
+        json!({"event": "brief", "budget_tokens": 100}),
+    )
+    .await;
+    assert!(j["tokens"].as_u64().unwrap() <= 100, "{j}");
+}
+
+/// M6 §8: порядок разделов не зависит от `usage` (`recall_shown`, `useful`) и показов других
+/// сессий — два старта разных сессий подряд дают одинаковый `text`.
+#[tokio::test]
+async fn digest_order_ignores_recall_shown() {
+    let a = server("order-usage").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let mut traps = Vec::new();
+    for i in 0..8 {
+        traps.push(insight(&a, &a.token, G, &format!("Ловушка {i}"), "x", "gotcha").await);
+    }
+    for i in 0..8 {
+        entry(
+            &a,
+            &a.token,
+            G,
+            json!({"kind": "changelog", "title": format!("Изменение {i}"), "body": "x",
+                   "data": {"kind": "fix"}}),
+        )
+        .await;
+    }
+    let body = json!({"event": "session_start", "solution": G});
+    let first = ok(&a, &a.token, Some("ou-1"), body.clone()).await;
+    // показы и полезность самой старой ловушки — много раз, в других сессиях
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let old = traps[0].clone();
+    db.write(move |tx| {
+        for k in 0..50 {
+            for ev in ["recall_shown", "useful"] {
+                tx.execute(
+                    "INSERT INTO usage (target_kind, target_id, event, source, session_id, \
+                     user_id, ts) SELECT 'entry', ?1, ?2, source, ?3, user_id, ts FROM usage \
+                     LIMIT 1",
+                    rusqlite::params![old, ev, format!("other-{k}")],
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let second = ok(&a, &a.token, Some("ou-2"), body.clone()).await;
+    assert_eq!(first["text"], second["text"], "{first}\n---\n{second}");
+}
+
+/// M6 §8: раздел `### Идеи` (как задачи и ответы человека) идёт в бюджет первым — компактные
+/// индексы его не вытесняют; Rules — сверх бюджета.
+#[tokio::test]
+async fn ideas_section_not_cut_by_budget() {
+    let a = api("recall-ideas-budget", |c| {
+        roomy(c);
+        c.recall.digest_tokens = 260;
+    })
+    .await;
+    allow_rules(&a).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    for i in 0..6 {
+        a.note(
+            "rules",
+            &format!("п{i}"),
+            &format!("# Правило {i}\n\nТекст правила {i}."),
+        )
+        .await;
+    }
+    let mut ideas = Vec::new();
+    for t in ["Кэш миниатюр", "Экспорт отчётов", "Тёмная тема"] {
+        let r = a
+            .t(
+                Method::POST,
+                &format!("/api/v1/spaces/{G}/entries"),
+                Some(json!({"kind": "idea", "title": t, "body": "Замысел.",
+                            "data": {"origin": "human", "priority": "high"}})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        ideas.push(format!("w:{}", r.json()["id"].as_str().unwrap()));
+    }
+    for i in 0..10 {
+        insight(
+            &a,
+            &a.token,
+            G,
+            &format!("Ловушка сборки номер {i}"),
+            "x",
+            "gotcha",
+        )
+        .await;
+        entry(
+            &a,
+            &a.token,
+            G,
+            json!({"kind": "changelog", "title": format!("Изменение {i}"), "body": "x",
+                   "data": {"kind": "fix"}}),
+        )
+        .await;
+    }
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ib-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let got = ids(&j);
+    for w in &ideas {
+        assert!(got.contains(w), "{w}: {text}");
+    }
+    // правило — строка-заголовок и строка L1
+    assert_eq!(section(text, "### Правила").len(), 12, "{text}");
+}
+
+/// Строка-индекс `<ссылка> «<заголовок>» · <N>t`.
+fn index_line(line: &str, reference: &str, title: &str) -> bool {
+    line.strip_prefix(&format!("{reference} «{title}» · "))
+        .and_then(|n| n.strip_suffix('t'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// M6 §8: changelog и revisit — компактные строки-индексы `<ссылка> «заголовок» · Nt`.
+#[tokio::test]
+async fn changelog_index_line_format() {
+    let a = server("index-lines").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let body = "Исправлен разбор дат в отчёте. ".repeat(10);
+    let c = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "changelog", "title": "Разбор дат", "body": body,
+               "data": {"kind": "fix"}}),
+    )
+    .await;
+    let r = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "insight", "title": "Проверить таймауты", "body": "Таймауты шлюза.",
+               "data": {"kind": "decision"}, "status": "revisit"}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("il-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let changes = section(text, "### Последние изменения");
+    assert_eq!(changes.len(), 1, "{text}");
+    let line = &changes[0];
+    assert!(index_line(line, &format!("c:{c}"), "Разбор дат"), "{line}");
+    let n: usize = line
+        .rsplit(" · ")
+        .next()
+        .unwrap()
+        .trim_end_matches('t')
+        .parse()
+        .unwrap();
+    assert!(n > 20, "размер записи: {line}");
+    let revisit = section(text, "### Пересмотреть (revisit)");
+    assert_eq!(revisit.len(), 1, "{text}");
+    assert!(
+        index_line(&revisit[0], &format!("i:{r}"), "Проверить таймауты"),
+        "{}",
+        revisit[0]
+    );
+    // индексы — тоже подсказки: в `items[]` и в учёте показов
+    let got = ids(&j);
+    assert!(
+        got.contains(&format!("c:{c}")) && got.contains(&format!("i:{r}")),
+        "{j}"
+    );
+}
+
+/// M6 §8: `recall.digest_entries` — предел записей в разделах дайджеста (ловушки, changelog).
+#[tokio::test]
+async fn digest_entries_limits_sections() {
+    let a = api("recall-digest-entries", |c| {
+        roomy(c);
+        c.recall.digest_entries = 2;
+    })
+    .await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    for i in 0..4 {
+        insight(&a, &a.token, G, &format!("Ловушка {i}"), "x", "gotcha").await;
+        entry(
+            &a,
+            &a.token,
+            G,
+            json!({"kind": "changelog", "title": format!("Изменение {i}"), "body": "x",
+                   "data": {"kind": "fix"}}),
+        )
+        .await;
+    }
+    let j = ok(
+        &a,
+        &a.token,
+        Some("de-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert_eq!(section(text, "### Ловушки и сбои").len(), 2, "{text}");
+    assert_eq!(section(text, "### Последние изменения").len(), 2, "{text}");
+}
+
+/// M6 §8: корень решения — одна строка, L0 — до 20 токенов.
+#[tokio::test]
+async fn solution_root_l0_cut_to_20_tokens() {
+    let a = server("root-l0").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let l0 = "Сервис расчёта доставки заказов по регионам с учётом тарифов перевозчиков, \
+              весовых коэффициентов, праздников и окон приёма на складах партнёров";
+    let root = note_as(
+        &a,
+        &a.token,
+        G,
+        "README",
+        &format!("---\nl0: {l0}\n---\n# README\n\nТекст.\n"),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rl-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let line = section(text, "### Решение")
+        .into_iter()
+        .find(|l| l.ends_with(&format!("n:{root}")))
+        .unwrap_or_else(|| panic!("нет корня: {text}"));
+    let shown = line
+        .split_once(" — ")
+        .map(|(_, s)| s)
+        .unwrap_or_else(|| panic!("нет L0: {line}"));
+    let shown = shown.rsplit_once(" n:").map_or(shown, |(s, _)| s);
+    assert!(shown.starts_with("Сервис расчёта доставки"), "{line}");
+    assert!(
+        shown.chars().count() < l0.chars().count(),
+        "L0 не сокращён: {line}"
+    );
+    assert!(zam_store::count_tokens(shown) <= 21, "{line}");
+}
+
+/// M6 §8, решение 16: `recall.digest_code_map_tokens = 0` (умолчание) — только строка-указатель
+/// карты; больше 0 — мини-карта `### Карта кода` (центральные символы) в пределах ключа.
+#[tokio::test]
+async fn code_map_pointer_only_at_zero() {
+    let files: &[(&str, &[(&str, u32)])] = &[
+        ("src/store.rs", &[("Store::open", 1), ("Store::close", 9)]),
+        ("src/api.rs", &[("route", 1), ("handler", 7)]),
+        ("src/db.rs", &[("Db::query", 3)]),
+    ];
+    let a = server("code-pointer").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    load_map(&a, &a.token, files).await;
+    let body = json!({"event": "session_start", "solution": G});
+    let j = ok(&a, &a.token, Some("cp-1"), body.clone()).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(code_line(&j).is_some(), "{text}");
+    assert!(!text.contains("### Карта кода"), "{text}");
+    let b = api("recall-code-mini", |c| {
+        roomy(c);
+        c.recall.digest_code_map_tokens = 60;
+    })
+    .await;
+    assert_eq!(register(&b, &b.token).await.status, StatusCode::CREATED);
+    load_map(&b, &b.token, files).await;
+    let j = ok(&b, &b.token, Some("cp-2"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(code_line(&j).is_some(), "{text}");
+    let mini = section(text, "### Карта кода");
+    assert!(!mini.is_empty(), "{text}");
+    assert!(
+        mini.iter()
+            .all(|l| l.starts_with("src/") && l.contains(':')),
+        "{mini:?}"
+    );
+    let block = format!("\n### Карта кода\n{}\n", mini.join("\n"));
+    assert!(
+        zam_store::fits_budget(&block, 60),
+        "{}: {mini:?}",
+        zam_store::count_tokens(&block)
+    );
+}
+
+/// Предложение zero-agent (приложение исследования 2026-11-06): задача в `open`, захваченная
+/// сессией (`claim`), видна в дайджесте — своя первой с пометкой, чужая — после задач в работе,
+/// с пометкой; незахваченная `open` — нет.
+#[tokio::test]
+async fn digest_shows_claimed_open_tasks() {
+    let a = server("claimed-open").await;
+    let mut ids_of = Vec::new();
+    for title in [
+        "Моя захваченная",
+        "Чужая захваченная",
+        "Свободная",
+        "В работе",
+    ] {
+        ids_of.push(
+            entry(
+                &a,
+                &a.token,
+                "knowledge",
+                json!({"kind": "task", "title": title, "data": {"next_step": "шаг"}}),
+            )
+            .await,
+        );
+    }
+    let (mine, other, free, busy) = (&ids_of[0], &ids_of[1], &ids_of[2], &ids_of[3]);
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{busy}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for (t, s) in [(mine, "cl-me"), (other, "cl-other")] {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                &format!("/api/v1/entries/{t}/claim"),
+                Some(json!({})),
+                &[("x-zam-session", s)],
+            )
+            .await;
+        assert!(r.status.is_success(), "{}", r.text());
+    }
+    let j = ok(
+        &a,
+        &a.token,
+        Some("cl-me"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let lines = section(text, "### Задачи");
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(
+        lines[0].contains("Моя захваченная") && lines[0].contains("захвачена этой сессией"),
+        "{text}"
+    );
+    assert!(lines[0].contains(&format!("k:{mine}")), "{text}");
+    assert!(lines[1].contains("[in_progress] В работе"), "{text}");
+    assert!(
+        lines[2].contains("Чужая захваченная") && lines[2].contains("захвачена другой сессией"),
+        "{text}"
+    );
+    assert!(!text.contains(free.as_str()), "{text}");
+    // у другой сессии — наоборот
+    let j = ok(
+        &a,
+        &a.token,
+        Some("cl-other"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let lines = section(j["text"].as_str().unwrap(), "### Задачи");
+    assert!(
+        lines[0].contains("Чужая захваченная") && lines[0].contains("захвачена этой сессией"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[2].contains("Моя захваченная") && lines[2].contains("захвачена другой сессией"),
+        "{lines:?}"
+    );
 }

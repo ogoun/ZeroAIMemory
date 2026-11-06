@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub mod api;
 pub mod attach;
+pub mod heavy;
 pub mod ml;
 pub mod process;
 pub mod qdrant;

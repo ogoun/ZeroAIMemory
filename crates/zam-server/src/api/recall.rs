@@ -4,8 +4,8 @@
 //! ```text
 //! POST /recall {event, session_id?, solution?, area?, prompt?, error?, tool?, budget_tokens?,
 //!               agent_block_version?, task?, parent_id?}
-//!   → 200 {text, items: [{id, kind, title, certainty, reason, age_days?}], tokens, timings,
-//!          warnings, hooks?}
+//!   → 200 {text, items: [{id, kind, title, certainty, reason, age_days?}], tokens,
+//!          rules_tokens, timings, warnings, hooks?}
 //! ```
 //!
 //! - `text` — готовый Markdown для `additionalContext`; пусто — тишина. Каждая подсказка — строка
@@ -16,38 +16,50 @@
 //!   `gotcha`, `failure`, `revisit`, `changelog`, `search`, `error_regex`, `error_fts`),
 //!   `age_days` — возраст записи в сутках (M4.5 §7; нет у строк окружения, файлов, терминов и
 //!   триггеров `error_regex`: время там неизвестно); `tokens` — размер `text` (счётчик
-//!   чанкера), `timings {collect_ms, record_ms, total_ms}`;
+//!   выдачи), `rules_tokens` — размер раздела-резерва Rules (M6 §8, §17 п. 3; 0 — резерва нет),
+//!   `timings {collect_ms, record_ms, total_ms}`;
 //! - **учёт выданного** (M4.5 §9.5): непустой `text` прибавляется к `session_tokens` сессии —
 //!   событие `session_start`, `recovery` (и `session_start` после `compact | resume`),
 //!   `prompt`, `post_tool` или `brief`, `calls + 1`, `tokens + tokens` ответа — в той же
 //!   транзакции, что `session_seen` (без лишней синхронизации диска); `record: false`, нет
 //!   сессии или вышел срок учёта — без прибавки;
-//! - **`session_start`** — дайджест не больше `budget_tokens` (по умолчанию
-//!   `recall.digest_tokens` = 1500) по приоритету: напоминание об устаревшем блоке инструкции
+//! - **`session_start`** — дайджест: Rules — **резерв сверх бюджета** (M6 §8: все заметки до
+//!   [`RULES_MAX`], L1 каждой до [`RULE_L1_TOKENS`], не вытесняются), остальное — не больше
+//!   `budget_tokens` (по умолчанию `recall.digest_tokens` = 1500) по приоритету — порядку
+//!   разделов (уведомления, задачи, ответы и идеи — первыми, их не вытесняют индексы; проверка —
+//!   `budget_cap`, M6 §4.2); детерминирован (M6 §8: порядок не зависит от `usage` и показов
+//!   других сессий, окна — от начала суток UTC, в тексте нет возраста): напоминание об
+//!   устаревшем блоке инструкции
 //!   (`agent_block_version` меньше версии сервера [`crate::agent_setup::current_version`] —
 //!   `max(AGENT_BLOCK_VERSION, версия шаблонов)`), ожидающие запросы доступа к решениям
 //!   пользователя (`access_requests_pending`), `### Задачи` (M4.5 §3: задачи `in_progress` и
-//!   `blocked` решения и Knowledge, до 5, захваченные сессией запроса — первыми, затем недавно
-//!   менявшиеся; строка `[<статус>] <заголовок> — далее: … — k:<id>`, у `blocked` — ещё
-//!   ` — блокер: …`; `reason: task`), `### Ответы человека` (M4.5 §4: вопросы, отвеченные за
-//!   [`ANSWERS_DAYS`] дней и ещё не показанные этой сессии — `session_seen`, до 5; строка
+//!   `blocked` решения и Knowledge и `open` с живым захватом `claim` (задача 8a), до
+//!   `recall.digest_entries` (5), захваченные сессией запроса — первыми, затем `in_progress` и
+//!   `blocked`, затем `open`, захваченные другими; внутри — недавно менявшиеся; строка
+//!   `[<статус>] <заголовок> — далее: … — k:<id>`, у `open` — `[open · захвачена этой сессией]`
+//!   или `[open · захвачена другой сессией]`, у `blocked` — ещё ` — блокер: …`;
+//!   `reason: task`), `### Ответы человека` (M4.5 §4: вопросы, отвеченные за [`ANSWERS_DAYS`]
+//!   суток от начала текущих суток UTC и ещё не показанные этой сессии — `session_seen`; строка
 //!   `ZeroAIMemory: ответ на «<вопрос>»: <ответ> — q:<id> → i:<решение>`, `reason: answer`) и
 //!   `### Открытые вопросы` (`N открытых: «…», «…», «…»`, до [`OPEN_QUESTIONS_TITLES`]
 //!   заголовков, не подсказка записи), `### Окружение` (M4.5 §8: до [`ENVIRONMENT_MAX`] записей
 //!   Vault `host`/`environment`, `<имя> — <purpose>; <address>; ограничения: … — v:<id>`; без
 //!   учёта показа; в `recovery` и `brief` нет), Rules (L1 каждой заметки, до
 //!   [`RULES_MAX`] заметок, L1 — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
-//!   пространства решения с L0 (до [`SOLUTION_ROOT_MAX`]), до 5 действующих (`active`)
-//!   `gotcha`/`failure` решения и Knowledge (новые первыми), до 5 записей `revisit`, последние
-//!   5 записей changelog решения **[решение исполнителя]**; сразу после правил — строка
+//!   пространства решения, строка на корень — путь и L0 до [`SOLUTION_ROOT_L0_TOKENS`] (до
+//!   [`SOLUTION_ROOT_MAX`]), действующие (`active`) `gotcha`/`failure` решения и Knowledge
+//!   (новые первыми; строка — заголовок, без фрагмента), записи `revisit` и последние записи
+//!   changelog решения — индексы `<ссылка> «<заголовок>» · Nt` (M6 §8; разделов — до
+//!   `recall.digest_entries`); сразу после правил — строка
 //!   `Словарь: N терминов — memory_search kinds=[term]` (N > 0, термины решения и Knowledge) и
 //!   строка `Проверенные команды: <путь> (проверено <verified_at>)[; …]` — до
 //!   [`VERIFIED_COMMANDS_MAX`] заметок пространства решения с `verified_at`, новые проверки
 //!   первыми (M4.5 §7, решение владельца 2026-10-28), за ней — строка карты кода решения
-//!   (M5.6 §10, [`super::code::code_line`]: размер, возраст снимка, центральные символы;
+//!   (M5.6 §10, [`super::code::code_line`]: размер, дата снимка UTC, центральные символы;
 //!   ≤ 80 токенов; нет карты или `code.enabled = false` — строки нет; у хуков (`session_start`
 //!   и запрос с полем `code_map`) её гасят и `hooks.code_map`, и `code_map: false` клиента;
-//!   так же в пакете восстановления).
+//!   так же в пакете восстановления), при `recall.digest_code_map_tokens > 0` — мини-карта
+//!   `### Карта кода` (центральные символы в пределах ключа; по умолчанию 0 — нет).
 //!   Ответ несёт `hooks: {session_start, prompt, pre_tool, post_tool, checkpoint,
 //!   subagent_start, file_context, session_journal, recovery}` — настройки типов подсказок
 //!   пользователя `hooks.<тип>` (R5, [`super::user_settings`], задача 13). Тип запроса выключен у
@@ -116,8 +128,9 @@
 //!   умолчанию `recall.recovery_tokens` (2000), разделы по порядку — `### Задачи` (захваченные
 //!   сессией первыми), `### Ответы человека` **без** фильтра `session_seen` (контекст агента
 //!   потерян; показ всё равно отмечается), `### Решения` (действующие `decision` пространства
-//!   решения за [`RECOVERY_DECISIONS_DAYS`] дней, до 5, `reason: decision`), затем обычный
-//!   дайджест в остатке бюджета (уведомления, открытые вопросы, правила, словарь, …).
+//!   решения за [`RECOVERY_DECISIONS_DAYS`] суток от начала текущих суток UTC, до
+//!   `recall.digest_entries`, `reason: decision`), затем обычный дайджест в остатке бюджета
+//!   (уведомления, открытые вопросы, словарь, …); Rules — резерв сверх бюджета, как в дайджесте.
 //!   У `session_start` ключ пользователя `hooks.recovery` выключен — обычный дайджест,
 //!   `hooks.session_start` выключен — тишина. `event: recovery` (MCP) от настроек подсказок
 //!   хуков не зависит (§0, §10). `hooks` в ответе — только у `session_start`;
@@ -160,7 +173,7 @@ use tokio::time::Instant;
 use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
     Section, coverage_enough, error_regex_matches, error_terms, hint_line, normalize_error,
-    one_line, pack_sections, term_coverage,
+    one_line, pack_sections, reserved_text, term_coverage,
 };
 use zam_search::truncate_to_tokens;
 use zam_store::{
@@ -205,8 +218,8 @@ pub const RULES_MAX: usize = 20;
 pub const RULE_L1_TOKENS: usize = 200;
 /// Корневых узлов решения («L1 решения») в дайджесте.
 pub const SOLUTION_ROOT_MAX: usize = 10;
-/// Действующих `gotcha`/`failure`, записей `revisit` и changelog в дайджесте — каждого.
-pub const DIGEST_ENTRIES_MAX: usize = 5;
+/// Предел L0 корня решения в строке дайджеста, токенов (M6 §8: индекс корней).
+pub const SOLUTION_ROOT_L0_TOKENS: usize = 20;
 /// Подсказок к запросу пользователя.
 pub const PROMPT_MAX: usize = 3;
 /// Строк словаря в подсказке к запросу пользователя (M4.5, спецификация §2.2 п. 2).
@@ -448,6 +461,15 @@ fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Can
     }
 }
 
+/// Подсказка-индекс записи журнала (M6 §8: changelog и revisit): `<ссылка> «<заголовок>» · Nt`,
+/// `N` — размер записи (заголовок и тело) счётчиком выдачи: агент решает, читать ли её.
+fn index_cand(target: usize, e: &Entry, reason: &'static str) -> Cand {
+    let mut c = entry_cand(target, e, reason, "");
+    let size = count_tokens(&format!("{}\n\n{}", e.title, e.body));
+    c.block = format!("{} «{}» · {size}t", c.reference, one_line(&e.title));
+    c
+}
+
 /// Пространства цели для записей журналов (insight, changelog): решение и Knowledge.
 fn entry_spaces(t: &SearchTarget) -> Vec<Id> {
     t.spaces
@@ -602,10 +624,15 @@ fn clip(s: &str, max: usize) -> String {
 /// Строка задачи дайджеста: `ZeroAIMemory: [<статус>] <заголовок> — далее: <next_step> —
 /// k:<id>`, у `blocked` после ссылки — ` — блокер: <blocked_by>`. `next_step` и `blocked_by` —
 /// свободный текст до 1000 символов (туда попадают команды с ключами): секреты маскируются, как
-/// в L1 правил и ответах (финальное ревью M4.5, M-2).
-fn task_block(e: &Entry) -> String {
+/// в L1 правил и ответах (финальное ревью M4.5, M-2). `claim` — пометка захвата у `open`:
+/// `[open · <пометка>]`.
+fn task_block(e: &Entry, claim: Option<&str>) -> String {
     let t = zam_store::TaskData::from_stored(&e.data);
     let status = e.status.map_or("open", EntryStatus::as_str);
+    let status = match claim {
+        Some(m) => format!("{status} · {m}"),
+        None => status.to_string(),
+    };
     let mut s = format!("ZeroAIMemory: [{status}] {}", one_line(&e.title));
     if let Some(n) = &t.next_step {
         let n = clip(&zam_markdown::mask_text(n), TASK_LINE_TEXT_CHARS);
@@ -621,33 +648,60 @@ fn task_block(e: &Entry) -> String {
     s
 }
 
-/// Задачи `in_progress` и `blocked` пространств `spaces`: захваченные сессией запроса —
-/// первыми, затем недавно менявшиеся.
+/// Пометка захваченной задачи `open` в строке дайджеста (предложение zero-agent, задача 8a).
+const CLAIMED_MINE: &str = "захвачена этой сессией";
+/// Пометка задачи `open`, захваченной другой сессией.
+const CLAIMED_OTHER: &str = "захвачена другой сессией";
+/// Пометка захваченной задачи `open` в ответе без сессии (чья — неизвестно).
+const CLAIMED_ANY: &str = "захвачена";
+
+/// Задачи `in_progress` и `blocked` пространств `spaces` и задачи `open` с живым захватом
+/// (`claim` статус не меняет — без них захваченная задача не видна): захваченные сессией
+/// запроса — первыми, затем `in_progress`/`blocked`, затем `open`, захваченные другими; внутри —
+/// недавно менявшиеся первыми. У `open` в строке — пометка захвата ([`CLAIMED_MINE`],
+/// [`CLAIMED_OTHER`]).
 async fn task_cands(
     health: &mut Health<'_>,
     deadline: &mut Deadline,
     spaces: &[(usize, Id)],
     session: Option<&str>,
 ) -> Result<Vec<Cand>, ApiError> {
+    let now = zam_store::time::now();
+    let claimed = |e: &Entry| {
+        zam_store::TaskData::from_stored(&e.data)
+            .claimed_by
+            .filter(|c| c.live(now))
+    };
     let mut rows = entries_of(health, deadline, spaces, |s| EntryFilter {
         statuses: vec![EntryStatus::InProgress, EntryStatus::Blocked],
         ..entry_filter(s, EntryKind::Task)
     })
     .await?;
-    let now = zam_store::time::now();
-    let mine = |e: &Entry| {
-        session.is_some_and(|sid| {
-            zam_store::TaskData::from_stored(&e.data)
-                .claimed_by
-                .is_some_and(|c| c.session == sid && c.live(now))
-        })
+    // `open` — отдельной выборкой (последние `ENTRY_FETCH` по пространству): незахваченные
+    // задачи `open` не вытесняют из выборки задачи в работе
+    let open = entries_of(health, deadline, spaces, |s| EntryFilter {
+        statuses: vec![EntryStatus::Open],
+        ..entry_filter(s, EntryKind::Task)
+    })
+    .await?;
+    rows.extend(open.into_iter().filter(|(_, e)| claimed(e).is_some()));
+    let mine = |e: &Entry| session.is_some_and(|sid| claimed(e).is_some_and(|c| c.session == sid));
+    let rank = |e: &Entry| match (mine(e), e.status) {
+        (true, _) => 0,
+        (false, Some(EntryStatus::Open)) => 2,
+        _ => 1,
     };
-    rows.sort_by_key(|(_, e)| (!mine(e), std::cmp::Reverse((e.updated_at, e.id))));
+    rows.sort_by_key(|(_, e)| (rank(e), std::cmp::Reverse((e.updated_at, e.id))));
     Ok(rows
         .iter()
         .map(|(i, e)| {
             let mut c = entry_cand(*i, e, "task", "");
-            c.block = task_block(e);
+            let mark = (e.status == Some(EntryStatus::Open)).then(|| match session {
+                _ if mine(e) => CLAIMED_MINE,
+                Some(_) => CLAIMED_OTHER,
+                None => CLAIMED_ANY,
+            });
+            c.block = task_block(e, mark);
             c
         })
         .collect())
@@ -671,7 +725,10 @@ async fn question_cands(
     deadline: &mut Deadline,
     spaces: &[(usize, Id)],
 ) -> Result<(Vec<Cand>, Option<String>), ApiError> {
-    let since = zam_store::days_ago(zam_store::time::now(), ANSWERS_DAYS);
+    let since = zam_store::days_ago(
+        zam_store::time::day_start_utc(zam_store::time::now()),
+        ANSWERS_DAYS,
+    );
     let mut answered: Vec<(usize, Entry, zam_store::Answer)> = Vec::new();
     // заголовки открытых вопросов всех баз с временем создания: берутся новейшие по общей сортировке
     let (mut open_n, mut titles) = (0usize, Vec::<(jiff::Timestamp, String)>::new());
@@ -1772,7 +1829,9 @@ async fn digest(
                 );
                 // секреты в тексте правила маскируются, как в чанках и L0 (§7.6)
                 let summary = zam_markdown::mask_text(&l1(&text));
-                let summary = truncate_to_tokens(&summary, RULE_L1_TOKENS, &count_tokens);
+                // предел — через `budget_cap` (M6 §4.2: без модели — с запасом оценки)
+                let cap = zam_store::budget_cap(RULE_L1_TOKENS);
+                let summary = truncate_to_tokens(&summary, cap, &count_tokens);
                 for line in summary.lines().filter(|l| !l.trim().is_empty()) {
                     block.push_str("\n  ");
                     block.push_str(line.trim_end());
@@ -1812,9 +1871,14 @@ async fn digest(
                 if folder {
                     title.push('/');
                 }
+                // индекс корней (M6 §8): путь и L0 до `SOLUTION_ROOT_L0_TOKENS`
                 if let Some(l0) = n.l0.as_deref().map(one_line).filter(|s| !s.is_empty()) {
-                    title.push_str(" — ");
-                    title.push_str(&l0);
+                    let cap = zam_store::budget_cap(SOLUTION_ROOT_L0_TOKENS);
+                    let l0 = truncate_to_tokens(&l0, cap, &count_tokens);
+                    if !l0.is_empty() {
+                        title.push_str(" — ");
+                        title.push_str(l0);
+                    }
                 }
                 let certainty = certainty_str(n.certainty);
                 let reference = format!("n:{}", n.id);
@@ -1853,7 +1917,7 @@ async fn digest(
     })
     .await?
     .iter()
-    .map(|(i, e)| entry_cand(*i, e, "revisit", ""))
+    .map(|(i, e)| index_cand(*i, e, "revisit"))
     .collect();
     sections.push((Some("### Пересмотреть (revisit)"), revisit));
     let changes = entries_of(
@@ -1864,7 +1928,7 @@ async fn digest(
     )
     .await?
     .iter()
-    .map(|(i, e)| entry_cand(*i, e, "changelog", ""))
+    .map(|(i, e)| index_cand(*i, e, "changelog"))
     .collect();
     sections.push((Some("### Последние изменения"), changes));
     // строки после правил: словарь и проверенные команды решения (M4.5 §7)
@@ -1874,10 +1938,19 @@ async fn digest(
         .collect();
     after_rules.extend(verified_line(health, deadline, sol).await);
     // строка карты кода — после проверенных команд (M5.6 §10)
+    let mut code_map = Vec::new();
     if code_on {
         after_rules.extend(code_digest_line(req, headers, health, deadline).await);
+        // мини-карта (M6 §8, решение 16) — только при `digest_code_map_tokens > 0`
+        code_map = code_digest_map(st, req, headers, health, deadline).await;
     }
-    Ok((notices, sections, after_rules, open_line))
+    let lines = Lines {
+        notices,
+        open_line,
+        after_rules,
+        code_map,
+    };
+    Ok((lines, sections))
 }
 
 /// Действующие `gotcha`/`failure` пространств `spaces`, новые первыми.
@@ -2288,7 +2361,10 @@ async fn decision_cands(
     deadline: &mut Deadline,
     sol: Option<(usize, Id)>,
 ) -> Result<Vec<Cand>, ApiError> {
-    let since = zam_store::days_ago(zam_store::time::now(), RECOVERY_DECISIONS_DAYS);
+    let since = zam_store::days_ago(
+        zam_store::time::day_start_utc(zam_store::time::now()),
+        RECOVERY_DECISIONS_DAYS,
+    );
     let spaces: Vec<(usize, Id)> = sol.into_iter().collect();
     Ok(entries_of(health, deadline, &spaces, |s| EntryFilter {
         statuses: vec![EntryStatus::Active],
@@ -2302,14 +2378,51 @@ async fn decision_cands(
     .collect())
 }
 
-/// Дайджест `session_start`: уведомления, разделы-кандидаты, строка словаря и строка открытых
-/// вопросов.
-type Digest = (
-    Vec<String>,
-    Vec<(Option<&'static str>, Vec<Cand>)>,
-    Vec<String>,
-    Option<String>,
-);
+/// Строки дайджеста, что не подсказки записей (ни `session_seen`, ни `usage`): уведомления,
+/// строка открытых вопросов, строки после правил (словарь, проверенные команды, строка карты
+/// кода) и мини-карта кода `### Карта кода`.
+#[derive(Default)]
+struct Lines {
+    notices: Vec<String>,
+    open_line: Option<String>,
+    after_rules: Vec<String>,
+    code_map: Vec<String>,
+}
+
+/// Дайджест `session_start`: строки [`Lines`] и разделы-кандидаты.
+type Digest = (Lines, Vec<(Option<&'static str>, Vec<Cand>)>);
+
+/// Заголовок мини-карты кода дайджеста (M6 §8).
+const SECTION_CODE_MAP: &str = super::code::DIGEST_MAP_TITLE;
+
+/// Мини-карта кода дайджеста: центральные символы карты решения строками `<путь>:<line> <kind>
+/// <qual>` в пределах `recall.digest_code_map_tokens` (с заголовком, `budget_cap`); 0 — пусто.
+async fn code_digest_map(
+    st: &AppState,
+    req: &RecallReq,
+    headers: &HeaderMap,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Vec<String> {
+    let budget = st.cfg.recall.digest_code_map_tokens;
+    if budget == 0 {
+        return Vec::new();
+    }
+    let Some((i, guid)) = code_target(health.targets(), req, headers) else {
+        return Vec::new();
+    };
+    if !health.alive[i] {
+        return Vec::new();
+    }
+    let db = health.targets()[i].db.clone();
+    let Some(lines) = deadline
+        .step(super::code::digest_map_lines(&db, guid.as_str(), budget))
+        .await
+    else {
+        return Vec::new();
+    };
+    lines
+}
 
 /// Цель с картой кода решения запроса: `(индекс цели, GUID)` — решение в области
 /// ([`scoped_solution`]); карта хранится в базе владельца решения (у участника — чужая цель).
@@ -3003,13 +3116,15 @@ async fn record(
 }
 
 /// Предел подсказок раздела `title`: у пакета под задачу — свои (§9.4), у дайджеста — по
-/// разделу, у разделов без заголовка — строки словаря или общий предел события `limit`.
+/// разделу (`entries` — `recall.digest_entries`, M6 §8), у разделов без заголовка — строки
+/// словаря или общий предел события `limit`.
 fn section_limit(
     event: Event,
     title: Option<&str>,
     cands: &[Cand],
     limit: usize,
     ideas_max: usize,
+    entries: usize,
 ) -> usize {
     if event == Event::Brief {
         return match title {
@@ -3022,7 +3137,7 @@ fn section_limit(
         Some(SECTION_RULES) => RULES_MAX,
         Some(SECTION_ENVIRONMENT) => ENVIRONMENT_MAX,
         Some("### Решение") => SOLUTION_ROOT_MAX,
-        Some(_) => DIGEST_ENTRIES_MAX,
+        Some(_) => entries,
         None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,
         None if cands.iter().any(|c| c.reason == REASON_IDEA) => ideas_max,
         None => limit,
@@ -3030,24 +3145,30 @@ fn section_limit(
 }
 
 /// Раскладка отобранных разделов в разделы упаковки и подсказки каждого (у строк, что не
-/// подсказки записей — уведомления, словарь, открытые вопросы, — пустой список: ни
+/// подсказки записей — уведомления, словарь, открытые вопросы, карта кода, — пустой список: ни
 /// `session_seen`, ни `usage`). Уведомления — первыми; в пакете восстановления — после задач,
 /// ответов и решений (§9.2), а если других разделов нет — в конце. Открытые вопросы — после
 /// ответов (в пакете — вместе с уведомлениями), за ними — раздел [`SECTION_IDEAS`] (`ideas`,
 /// строка-указание — в заголовке: она выводится, только если вошла хоть одна идея), строки
-/// словаря и проверенных команд — после правил.
+/// словаря, проверенных команд и карты кода и мини-карта [`SECTION_CODE_MAP`] — после правил.
+/// `rules_reserved` — раздел Rules — резерв сверх бюджета (дайджест и пакет восстановления,
+/// M6 §8; у `brief` — L0 Rules в бюджете).
 fn arrange<'c>(
     recovery: bool,
-    notices: Vec<String>,
-    open_line: Option<String>,
+    rules_reserved: bool,
+    lines: Lines,
     ideas: Vec<&'c Cand>,
-    after_rules: &[String],
     chosen: Vec<(Option<&'static str>, Vec<&'c Cand>)>,
 ) -> (Vec<Section>, Vec<Vec<&'c Cand>>) {
+    let Lines {
+        notices,
+        mut open_line,
+        after_rules,
+        code_map,
+    } = lines;
     let mut out = Arranged::default();
     let mut ideas = ideas;
     let mut notices = Some(notices);
-    let mut open_line = open_line;
     if !recovery {
         out.line(None, notices.take().unwrap_or_default());
     }
@@ -3061,10 +3182,12 @@ fn arrange<'c>(
         {
             out.notices(&mut notices, &mut open_line);
         }
-        out.packed.push(Section {
-            title: title.map(str::to_string),
-            blocks: cands.iter().map(|c| c.block.clone()).collect(),
-        });
+        let mut sec = Section::new(
+            title.map(str::to_string),
+            cands.iter().map(|c| c.block.clone()).collect(),
+        );
+        sec.reserved = rules_reserved && title == Some(SECTION_RULES);
+        out.packed.push(sec);
         out.picked.push(cands);
         if title == Some(SECTION_ANSWERS)
             && !recovery
@@ -3073,8 +3196,8 @@ fn arrange<'c>(
             out.line(Some(SECTION_OPEN_QUESTIONS), vec![line]);
         }
         if title == Some(SECTION_ANSWERS) && !recovery && !ideas.is_empty() {
-            out.packed.push(Section {
-                title: Some(format!(
+            out.packed.push(Section::new(
+                Some(format!(
                     "{SECTION_IDEAS}\n{IDEAS_HINT}{}",
                     if ideas.iter().any(|c| c.block.contains(REOPEN_MARK_TAIL)) {
                         IDEAS_HINT_REOPEN
@@ -3082,12 +3205,17 @@ fn arrange<'c>(
                         ""
                     }
                 )),
-                blocks: ideas.iter().map(|c| c.block.clone()).collect(),
-            });
+                ideas.iter().map(|c| c.block.clone()).collect(),
+            ));
             out.picked.push(std::mem::take(&mut ideas));
         }
-        if title == Some(SECTION_RULES) && !after_rules.is_empty() {
-            out.line(None, after_rules.to_vec());
+        if title == Some(SECTION_RULES) {
+            if !after_rules.is_empty() {
+                out.line(None, after_rules.clone());
+            }
+            if !code_map.is_empty() {
+                out.line(Some(SECTION_CODE_MAP), code_map.clone());
+            }
         }
     }
     // пакет восстановления без раздела после трёх первых: уведомления и вопросы не теряются
@@ -3105,10 +3233,8 @@ struct Arranged<'c> {
 impl Arranged<'_> {
     /// Раздел строк, что не подсказки записей.
     fn line(&mut self, title: Option<&str>, blocks: Vec<String>) {
-        self.packed.push(Section {
-            title: title.map(str::to_string),
-            blocks,
-        });
+        self.packed
+            .push(Section::new(title.map(str::to_string), blocks));
         self.picked.push(Vec::new());
     }
 
@@ -3292,12 +3418,12 @@ pub async fn recall(
         && !recovery
         && ideas_enabled(&st, &flags);
     let mut idea_cands: Vec<Cand> = Vec::new();
-    let (notices, sections, repeatable, after_rules, open_line) = match req.event {
-        _ if !enabled => (Vec::new(), Vec::new(), true, Vec::new(), None),
+    let (lines, sections, repeatable) = match req.event {
+        _ if !enabled => (Lines::default(), Vec::new(), true),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
         Event::SessionStart | Event::Recovery => {
-            let (n, s, g, o) = digest(
+            let (l, s) = digest(
                 &st,
                 &p,
                 &sh,
@@ -3311,7 +3437,7 @@ pub async fn recall(
             if ideas_on {
                 idea_cands = digest_ideas(&st, &p, session.as_ref(), &health, &mut deadline).await;
             }
-            (n, s, true, g, o)
+            (l, s, true)
         }
         Event::Prompt => {
             // строки словаря — перед подсказками insight; у каждого свой предел
@@ -3326,16 +3452,14 @@ pub async fn recall(
                 Vec::new()
             };
             (
-                Vec::new(),
+                Lines::default(),
                 vec![(None, terms), (None, c), (None, ideas)],
                 false,
-                Vec::new(),
-                None,
             )
         }
         Event::PostTool => {
             let c = error_hints(&req, &mut health, &mut deadline).await?;
-            (Vec::new(), vec![(None, c)], true, Vec::new(), None)
+            (Lines::default(), vec![(None, c)], true)
         }
         // у субагента свой контекст: пакет повторяется (показ отмечается)
         Event::Brief => {
@@ -3345,7 +3469,7 @@ pub async fn recall(
                 code_section =
                     code_brief_lines(&st, &req, &sh, t, &mut health, &mut deadline).await;
             }
-            (Vec::new(), s, true, Vec::new(), None)
+            (Lines::default(), s, true)
         }
     };
     // без повторов: показанное сессии, повторы между разделами, исключённые цели; ответ на
@@ -3370,11 +3494,12 @@ pub async fn recall(
         Event::PostTool => POST_TOOL_MAX,
     };
     let ideas_max = st.cfg.ideas.prompt_max as usize;
+    let entries = st.cfg.recall.digest_entries;
     let mut dup: HashSet<TargetRef> = HashSet::new();
     let chosen: Vec<(Option<&'static str>, Vec<&Cand>)> = sections
         .iter()
         .map(|(title, cands)| {
-            let per = section_limit(req.event, *title, cands, limit, ideas_max);
+            let per = section_limit(req.event, *title, cands, limit, ideas_max, entries);
             let chosen: Vec<&Cand> = cands
                 .iter()
                 .filter(|c| health.alive[c.target])
@@ -3391,18 +3516,18 @@ pub async fn recall(
         .filter(|c| health.alive[c.target])
         .filter(|c| dup.insert(c.tref))
         .collect();
-    let (mut packed, mut picked) =
-        arrange(recovery, notices, open_line, ideas, &after_rules, chosen);
+    // Rules дайджеста и пакета восстановления — резерв сверх бюджета (M6 §8)
+    let rules_reserved = matches!(req.event, Event::SessionStart | Event::Recovery);
+    let (mut packed, mut picked) = arrange(recovery, rules_reserved, lines, ideas, chosen);
     if !code_section.is_empty() {
         // раздел `### Код` — после `### Файлы`; строки карты не подсказки записей (без учёта)
-        packed.push(Section {
-            title: Some(SECTION_CODE.to_string()),
-            blocks: code_section,
-        });
+        packed.push(Section::new(Some(SECTION_CODE.to_string()), code_section));
         picked.push(Vec::new());
     }
-    // упаковка разделов суммами — против `budget_cap` (M6 §4.2)
+    // упаковка разделов суммами — против `budget_cap` (M6 §4.2); резерв Rules — вне бюджета,
+    // его размер — отдельным полем `rules_tokens` (§17 п. 3)
     let (text, taken) = pack_sections(&packed, zam_store::budget_cap(budget), &count_tokens);
+    let rules_tokens = count_tokens(&reserved_text(&packed));
     let shown_now: Vec<&Cand> = taken
         .iter()
         .filter_map(|&(si, bi)| picked[si].get(bi).copied())
@@ -3465,6 +3590,7 @@ pub async fn recall(
         "text": text,
         "items": items,
         "tokens": count_tokens(&text),
+        "rules_tokens": rules_tokens,
         "timings": {
             "collect_ms": collect_ms,
             "record_ms": record_ms,
@@ -3581,14 +3707,12 @@ mod tests {
             (Some(SECTION_ANSWERS), Vec::new()),
         ];
         let notices = vec!["ZeroAIMemory: уведомление".to_string()];
-        let (packed, picked) = arrange(
-            true,
+        let lines = Lines {
             notices,
-            Some("1 открытых: «в»".into()),
-            Vec::new(),
-            &[],
-            chosen,
-        );
+            open_line: Some("1 открытых: «в»".into()),
+            ..Lines::default()
+        };
+        let (packed, picked) = arrange(true, true, lines, Vec::new(), chosen);
         assert_eq!(packed.len(), picked.len());
         let titles: Vec<Option<&str>> = packed.iter().map(|s| s.title.as_deref()).collect();
         assert_eq!(
@@ -3608,17 +3732,19 @@ mod tests {
             (Some(SECTION_ANSWERS), Vec::new()),
             (Some(SECTION_RULES), Vec::new()),
         ];
-        let (packed, _) = arrange(
-            false,
-            vec!["n".into()],
-            Some("q".into()),
-            Vec::new(),
-            &[
+        let lines = Lines {
+            notices: vec!["n".into()],
+            open_line: Some("q".into()),
+            after_rules: vec![
                 "Словарь".to_string(),
                 "Проверенные команды: a (проверено 2026-10-28)".into(),
             ],
-            chosen,
-        );
+            code_map: Vec::new(),
+        };
+        let (packed, _) = arrange(false, true, lines, Vec::new(), chosen);
+        // раздел Rules — резерв сверх бюджета (M6 §8), прочие — в бюджете
+        let reserved: Vec<bool> = packed.iter().map(|s| s.reserved).collect();
+        assert_eq!(reserved, [false, false, false, false, true, false]);
         let blocks: Vec<&str> = packed
             .iter()
             .flat_map(|s| s.blocks.iter().map(String::as_str))

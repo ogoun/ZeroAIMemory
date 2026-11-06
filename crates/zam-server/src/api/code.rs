@@ -791,14 +791,10 @@ pub const DIGEST_LINE_TOKENS: usize = 80;
 /// Предел имени ветки в строке дайджеста, символов (длиннее — обрезка с `…`).
 const DIGEST_BRANCH_MAX: usize = 40;
 
-/// Возраст снимка в строке дайджеста (Minor 7 ревью задачи 4): «N мин» (меньше часа), «N ч»
-/// (меньше 48 ч), иначе «N дн.».
-fn digest_age(secs: i64) -> String {
-    match secs.max(0) {
-        s @ ..3600 => format!("{} мин", s / 60),
-        s @ ..172_800 => format!("{} ч", s / 3600),
-        s => format!("{} дн.", s / 86_400),
-    }
+/// Дата снимка в строке дайджеста — `yyyy-MM-dd` UTC (M6 §8: в тексте дайджеста нет
+/// относительного возраста, два старта в одни сутки дают одну строку; прежде — «N мин»).
+fn digest_date(s: &CodeSnapshot) -> String {
+    zam_core::time::agent_date(&zam_store::time::fmt_ts(s.updated_at)).unwrap_or_default()
 }
 
 /// Снимок строки дайджеста: `ветка@коммит7` — что известно, без машины (Minor 7).
@@ -823,7 +819,7 @@ fn digest_snapshot(s: &CodeSnapshot) -> Option<String> {
     }
 }
 
-/// Строка дайджеста (§10): размер карты, возраст снимка, центральные символы — до
+/// Строка дайджеста (§10): размер карты, дата снимка UTC (M6 §8), центральные символы — до
 /// [`DIGEST_CENTRAL`]; строка не помещается в [`DIGEST_LINE_TOKENS`] по `fits` (сервер —
 /// [`digest_fits`], M6 §4.2) — центральных 2, 1, 0, а без центральных всё ещё не помещается —
 /// и без скобки снимка.
@@ -833,7 +829,7 @@ fn digest_line(s: &CodeStatus, central: &[Value], fits: &dyn Fn(&str) -> bool) -
         "ZeroAIMemory: карта кода: {}, {}, снимок {}",
         files_text(snap.files),
         symbols_text(snap.symbols),
-        digest_age(age_s(snap))
+        digest_date(snap)
     );
     let mut head = bare.clone();
     if let Some(t) = digest_snapshot(snap) {
@@ -876,6 +872,32 @@ pub async fn code_line(db: &Db, guid: &str) -> Option<String> {
         .await
         .ok()?;
     Some(digest_line(&s, &central_json(&central), &digest_fits))
+}
+
+/// Символов-кандидатов мини-карты дайджеста (до бюджета ключа).
+const DIGEST_MAP_SYMBOLS: usize = 20;
+/// Заголовок раздела мини-карты дайджеста.
+pub const DIGEST_MAP_TITLE: &str = "### Карта кода";
+
+/// Мини-карта дайджеста (M6 §8, `recall.digest_code_map_tokens`): центральные символы карты
+/// решения `guid` строками `<путь>:<line> <kind> <qual>`, пока раздел `### Карта кода` с ними
+/// помещается в `budget` (сумма частей — против `budget_cap`, M6 §4.2); карты нет — пусто.
+pub async fn digest_map_lines(db: &Db, guid: &str, budget: usize) -> Vec<String> {
+    let Ok(central) = code_central(db, guid, DIGEST_MAP_SYMBOLS, CENTRAL_FILES_MAX).await else {
+        return Vec::new();
+    };
+    let cap = zam_store::budget_cap(budget);
+    let mut used = zam_store::count_tokens(&format!("\n{DIGEST_MAP_TITLE}\n"));
+    let mut out = Vec::new();
+    for s in central {
+        let line = format!("{}:{} {} {}", s.path, s.line, s.kind.as_str(), s.qual);
+        let cost = zam_store::count_tokens(&format!("{line}\n"));
+        if used + cost <= cap {
+            used += cost;
+            out.push(line);
+        }
+    }
+    out
 }
 
 // ---- POST /code/sync ----
@@ -2326,21 +2348,17 @@ mod tests {
         assert!(hex_of("xyz", &[16]).is_none());
     }
 
-    /// Minor 7 ревью задачи 4: возраст «N мин / N ч / N дн.», без машины, центральные
-    /// сокращаются 3 → 2 → 1 → 0, пока строка длиннее предела.
+    /// Minor 7 ревью задачи 4: без машины, центральные сокращаются 3 → 2 → 1 → 0, пока строка
+    /// длиннее предела; M6 §8 (задача 8a): вместо возраста — дата снимка UTC (в тексте
+    /// дайджеста нет относительного возраста).
     #[test]
-    fn digest_line_age_snapshot_and_central_cut() {
-        assert_eq!(digest_age(59), "0 мин");
-        assert_eq!(digest_age(3599), "59 мин");
-        assert_eq!(digest_age(3600), "1 ч");
-        assert_eq!(digest_age(47 * 3600 + 59), "47 ч");
-        assert_eq!(digest_age(48 * 3600), "2 дн.");
+    fn digest_line_date_snapshot_and_central_cut() {
         let snap = |branch: Option<&str>, commit: Option<&str>| CodeSnapshot {
             solution: "g".into(),
             commit: commit.map(str::to_string),
             branch: branch.map(str::to_string),
             machine: Some("box".into()),
-            updated_at: zam_store::time::now(),
+            updated_at: "2026-10-10T14:03:22Z".parse().unwrap(),
             files: 2,
             symbols: 5,
             etag: String::new(),
@@ -2360,13 +2378,16 @@ mod tests {
         let s = status(snap(Some("main"), Some("abcdef1234")));
         assert_eq!(
             digest_line(&s, &central, &|_| true),
-            "ZeroAIMemory: карта кода: 2 файла, 5 символов, снимок 0 мин (main@abcdef1); \
+            "ZeroAIMemory: карта кода: 2 файла, 5 символов, снимок 2026-10-10 (main@abcdef1); \
              центральные: Store::open, Db, route — `memory_code`/`zam code map`"
         );
         // без ветки и коммита — без скобок; машина не показывается
         let s0 = status(snap(None, None));
         let l = digest_line(&s0, &central[..1], &|_| true);
-        assert!(l.contains("снимок 0 мин; центральные: Store::open"), "{l}");
+        assert!(
+            l.contains("снимок 2026-10-10; центральные: Store::open"),
+            "{l}"
+        );
         assert!(!l.contains("box"), "{l}");
         // предел по счётчику: длина строки с 3, 2, 1 центральным
         let full = chars(&digest_line(&s, &central, &|_| true));

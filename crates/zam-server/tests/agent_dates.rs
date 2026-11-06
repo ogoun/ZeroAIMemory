@@ -454,8 +454,7 @@ async fn freeze_now_applies() {
     let r = a.t(Method::GET, &format!("/api/v1/nodes/{n}"), None).await;
     assert_eq!(r.json()["node"]["updated_at"], T0, "{}", r.text());
     assert_eq!(zam_store::time::utc_today().to_string(), "2026-10-10");
-    // карта кода: возраст снимка по тем же часам — «0 мин» (без замороженных часов запись и
-    // чтение разошлись бы на доли секунды, но не на минуты)
+    // карта кода: дата снимка по тем же часам (M6 §8: в дайджесте — дата, а не возраст)
     let j = recall(
         &a,
         "freeze-1",
@@ -463,7 +462,7 @@ async fn freeze_now_applies() {
     )
     .await;
     let text = j["text"].as_str().unwrap();
-    assert!(text.contains("снимок 0 мин"), "{text}");
+    assert!(text.contains("снимок 2026-10-10"), "{text}");
 }
 
 fn sqlite_files(dir: &Path) -> Vec<std::path::PathBuf> {

@@ -774,6 +774,12 @@ pub struct RecallSection {
     /// Фрагмент под подсказкой поиска (правило, insight), токенов (0..=200, 60; M6 §4.3);
     /// 0 — без фрагмента.
     pub snippet_tokens: usize,
+    /// Записей в разделе дайджеста и пакета восстановления (задачи, ответы, ловушки, revisit,
+    /// changelog, решения), 1..=20, 5 (M6 §8; прежде константа `DIGEST_ENTRIES_MAX`).
+    pub digest_entries: usize,
+    /// Мини-карта кода дайджеста `### Карта кода` (центральные символы), токенов, 0..=1000,
+    /// 0 — только строка-указатель карты (M6 §8, решение 16; включение — по A/B).
+    pub digest_code_map_tokens: usize,
 }
 
 impl RecallSection {
@@ -800,6 +806,12 @@ impl RecallSection {
         }
         if self.snippet_tokens > 200 {
             return Err(bad("snippet_tokens", "от 0 до 200"));
+        }
+        if !(1..=20).contains(&self.digest_entries) {
+            return Err(bad("digest_entries", "от 1 до 20"));
+        }
+        if self.digest_code_map_tokens > 1000 {
+            return Err(bad("digest_code_map_tokens", "от 0 до 1000"));
         }
         Ok(())
     }
@@ -1253,6 +1265,8 @@ impl Default for ServerConfig {
                 prompt_min_score: 0.6,
                 timeout_ms: 200,
                 snippet_tokens: 60,
+                digest_entries: 5,
+                digest_code_map_tokens: 0,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -2263,6 +2277,9 @@ master_key = \"x\"
             ("ZAM_RECALL__BRIEF_TOKENS", "20001"),
             ("ZAM_RECALL__PROMPT_MIN_SCORE", "1.5"),
             ("ZAM_RECALL__TIMEOUT_MS", "0"),
+            ("ZAM_RECALL__DIGEST_ENTRIES", "0"),
+            ("ZAM_RECALL__DIGEST_ENTRIES", "21"),
+            ("ZAM_RECALL__DIGEST_CODE_MAP_TOKENS", "1001"),
         ] {
             let e = load(None, &[env(k, v)], &Default::default())
                 .unwrap_err()
@@ -2279,6 +2296,22 @@ master_key = \"x\"
         assert_eq!(c.recall.digest_tokens, 1500);
         assert_eq!(c.recall.recovery_tokens, 2000);
         assert_eq!(c.recall.brief_tokens, 800);
+        // M6 §8: записей в разделах дайджеста и мини-карта кода (0 — только строка-указатель)
+        assert_eq!(c.recall.digest_entries, 5);
+        assert_eq!(c.recall.digest_code_map_tokens, 0);
+        let c = load(
+            None,
+            &[
+                env("ZAM_RECALL__DIGEST_ENTRIES", "20"),
+                env("ZAM_RECALL__DIGEST_CODE_MAP_TOKENS", "1000"),
+            ],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (c.recall.digest_entries, c.recall.digest_code_map_tokens),
+            (20, 1000)
+        );
     }
 
     #[test]
