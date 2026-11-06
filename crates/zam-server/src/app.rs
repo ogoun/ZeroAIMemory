@@ -64,6 +64,11 @@ pub struct AppState {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub search_hold: Arc<zam_index::test_hooks::Hold>,
+    /// Задержка эмбеддинга и векторов явного фокуса `/read`, мс (фича `test-hooks`): тест отката
+    /// по сроку `read.focus_timeout_ms` (M6 §6). 0 — без задержки.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub focus_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -325,6 +330,8 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         cfg: Arc::new(cfg),
         #[cfg(feature = "test-hooks")]
         search_hold: Arc::default(),
+        #[cfg(feature = "test-hooks")]
+        focus_delay_ms: Arc::default(),
     };
     let router = router(state.clone());
     Ok((router, state, BootReport { initial_token }))

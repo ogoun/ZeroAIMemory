@@ -74,6 +74,9 @@ enum Cmd {
         /// оглавление
         #[arg(long)]
         locator: Option<String>,
+        /// Пачка: явный фокус — оглавление, ближайшие к запросу листы, «[пропущено: путь · ~N t]»
+        #[arg(long, value_name = "ЗАПРОС")]
+        focus: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -1555,10 +1558,12 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             if_rev,
             since_rev,
             locator,
+            focus,
             common,
         } => {
             let o = cmd::read::Opts {
                 locator: locator.as_deref(),
+                focus: focus.as_deref(),
                 tier: tier.as_deref(),
                 section: section.as_deref(),
                 rev,

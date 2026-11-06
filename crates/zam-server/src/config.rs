@@ -661,6 +661,13 @@ pub struct ReadSection {
     pub max_items: usize,
     /// Бюджет токенов на весь ответ по умолчанию (1..=200000, по умолчанию 1500).
     pub budget_tokens: usize,
+    /// Явный фокус (M6 §6): не больше листов в выдаче (1..=10, по умолчанию 3).
+    pub focus_leaves: usize,
+    /// Цель не длиннее (полный текст, токенов) — целиком без фокуса (0..=20000, по умолчанию 600).
+    pub focus_min_tokens: usize,
+    /// Срок эмбеддинга запроса и чтения векторов листов, мс; вышел — фокус по лексике
+    /// (1..=10000, по умолчанию 80).
+    pub focus_timeout_ms: u64,
 }
 
 impl ReadSection {
@@ -675,6 +682,15 @@ impl ReadSection {
         }
         if !(1..=200_000).contains(&self.budget_tokens) {
             return Err(bad("budget_tokens", "от 1 до 200000"));
+        }
+        if !(1..=10).contains(&self.focus_leaves) {
+            return Err(bad("focus_leaves", "от 1 до 10"));
+        }
+        if self.focus_min_tokens > 20_000 {
+            return Err(bad("focus_min_tokens", "от 0 до 20000"));
+        }
+        if !(1..=10_000).contains(&self.focus_timeout_ms) {
+            return Err(bad("focus_timeout_ms", "от 1 до 10000"));
         }
         Ok(())
     }
@@ -1205,6 +1221,9 @@ impl Default for ServerConfig {
             read: ReadSection {
                 max_items: 20,
                 budget_tokens: 1500,
+                focus_leaves: 3,
+                focus_min_tokens: 600,
+                focus_timeout_ms: 80,
             },
             cache: CacheSection {
                 summary_tokens: 600,

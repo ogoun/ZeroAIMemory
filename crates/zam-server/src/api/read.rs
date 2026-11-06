@@ -1,7 +1,7 @@
 //! Чтение пачкой `POST /read` (§9.3 шаг 2, §12; задача 6 M4).
 //!
 //! ```text
-//! POST /read {items: [{id, tier?, section?, locator?, max_tokens?, if_rev?}],
+//! POST /read {items: [{id, tier?, section?, locator?, max_tokens?, if_rev?, since_rev?, focus?}],
 //!             session_id?, format?: "json"|"md", budget_tokens?}
 //! ```
 //!
@@ -63,6 +63,12 @@
 //!   `since_rev`, секции, L0/L1, `unchanged` и ошибки — без пометки. Вызов с хотя бы одной
 //!   пометкой прибавляет 1 к `session_tokens.reread_calls` события `read` (той же транзакцией,
 //!   что и отметка выданного). Без сессии ответ прежний (эталон `read_l2_m57.json`);
+//! - **явный фокус** (M6 §6, [`super::read_focus`]): `focus: "<запрос>"` (или `tier: "focus"` с
+//!   ним) — оглавление, лучшие листы и пометки `[пропущено: <путь> · ~N t]`, `tier: "focus"` в
+//!   json, `· фокус` в заголовке md; без текста — 400 «нужен текст focus», с `section`, `locator`,
+//!   `since_rev` или другим `tier` — 400. Цель не длиннее `read.focus_min_tokens`, запись журнала
+//!   и фрагмент `a:` — целиком с `warnings: ["focus skipped: short"]`; в `session_seen` —
+//!   только выданные листы (`part = chunk_id`). Без `focus` ответ прежний;
 //! - если у какого-то элемента ошибка, в ответе (md и json) заголовок
 //!   `X-Zam-Read-Error: <код первой>`:
 //!   клиенту не нужно разбирать Markdown, где текст заметки мог бы выглядеть как заголовок ошибки;
@@ -98,6 +104,7 @@ use super::doc_locator::Sheets;
 use super::json_body;
 use super::nodes::diff_blocking;
 use super::nodes::read::{Tier, l1, parse_tier, section_slice};
+use super::read_focus::{FOCUS_SKIPPED, FocusCtx, FocusOut, FocusTarget, focus_read};
 use super::scope::{
     AttachmentScope, EntryScope, Mode, NodeScope, attachment_scope, entry_scope, live, live_entry,
     node_scope, space_scope,
@@ -129,6 +136,8 @@ pub struct ReadItem {
     if_rev: Option<i64>,
     /// Изменения с этой ревизии (M4.5 §7).
     since_rev: Option<i64>,
+    /// Явный фокус (M6 §6): текст запроса; `tier: "focus"` требует его.
+    focus: Option<String>,
 }
 
 /// Ошибка элемента: код, пояснение и дополнительные поля.
@@ -250,6 +259,21 @@ struct Fetched {
     warnings: Vec<String>,
     /// Уже выдан этой сессии целиком в той же ревизии и эпохе (M6 §7.3, [`mark_rereads`]).
     reread: bool,
+    /// Текст — явный фокус (M6 §6): `tier: "focus"`, в `seen` — выданные листы (`chunk_id`).
+    focus: bool,
+}
+
+/// Что выдано из документа вложения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttView {
+    /// Оглавление (без `locator`, L0/L1).
+    Toc,
+    /// Часть по `locator`.
+    Part,
+    /// Документ целиком: `focus` у документа короче `read.focus_min_tokens` (M6 §6).
+    Whole,
+    /// Явный фокус (M6 §6).
+    Focus,
 }
 
 /// Поля элемента-вложения.
@@ -258,7 +282,8 @@ struct AttMeta {
     attachment_id: Id,
     node_id: Id,
     blob_sha256: String,
-    /// `locator` выданной части (имя листа — через сканер секретов); `None` — оглавление.
+    view: AttView,
+    /// `locator` выданной части (имя листа — через сканер секретов); `None` — не часть.
     locator: Option<String>,
     /// Подпись `locator` (`стр. 12`, `лист «Итоги» A1:F40`), тоже замаскирована.
     locator_text: Option<String>,
@@ -425,9 +450,17 @@ fn slice<'a>(text: &'a str, section: &str) -> Result<&'a str, Failure> {
     })
 }
 
-async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched, Failure> {
+async fn fetch_node(
+    sc: NodeScope,
+    it: &ReadItem,
+    tier: Tier,
+    fx: &mut FocusCtx<'_>,
+    focus: Option<&str>,
+) -> Result<Fetched, Failure> {
     live(&sc)?;
     let node = &sc.node;
+    let mut warnings = Vec::new();
+    let mut focused: Option<FocusOut> = None;
     let section = (tier != Tier::L0)
         .then(|| {
             it.section
@@ -459,15 +492,40 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
             Some(s) => (slice(&text, s)?.to_string(), false),
             None => (text, true),
         };
-        match tier {
-            Tier::L1 => Content::plain(l1(&text), false),
-            _ => Content::plain(text, whole),
+        // фокус (M6 §6): `section` с ним отвергнут до чтения, уровень — L2
+        if let Some(q) = focus.filter(|_| whole && tier == Tier::L2) {
+            if count_tokens(&text) <= fx.min_tokens() {
+                warnings.push(FOCUS_SKIPPED.to_string());
+            } else {
+                let t = FocusTarget::Note {
+                    db: &sc.db,
+                    node: node.id,
+                    text: &text,
+                    rev: node.current_rev,
+                };
+                match focus_read(fx, &t, q).await? {
+                    Some(o) => focused = Some(o),
+                    None => warnings.push(FOCUS_SKIPPED.to_string()),
+                }
+            }
+        }
+        match (&focused, tier) {
+            (Some(o), _) => Content::plain(o.text.clone(), false),
+            (None, Tier::L1) => Content::plain(l1(&text), false),
+            (None, _) => Content::plain(text, whole),
         }
     };
     let reference = format!("n:{}", node.id);
     let target = TargetRef {
         kind: TargetKind::Node,
         id: node.id,
+    };
+    let parts: Vec<String> = match &focused {
+        Some(o) => {
+            warnings.extend(o.warnings.iter().cloned());
+            o.leaves.clone()
+        }
+        None => vec![WHOLE_TARGET.to_string()],
     };
     Ok(Fetched {
         raw: it.id.clone(),
@@ -483,18 +541,22 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
         tier,
         rev: node.current_rev,
         max_tokens: it.max_tokens,
-        seen: vec![SeenKey {
-            owner_id: sc.owner,
-            target: target.into(),
-            part: WHOLE_TARGET.to_string(),
-        }],
+        seen: parts
+            .into_iter()
+            .map(|part| SeenKey {
+                owner_id: sc.owner,
+                target: target.into(),
+                part,
+            })
+            .collect(),
         content,
         omitted: 0,
         stale_refs: Vec::new(),
         stale_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
-        warnings: Vec::new(),
+        warnings,
         reread: false,
+        focus: focused.is_some(),
     })
 }
 
@@ -513,7 +575,12 @@ fn summary_of(e: &zam_store::Entry) -> String {
     e.title.clone()
 }
 
-async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetched, Failure> {
+async fn fetch_entry(
+    sc: EntryScope,
+    it: &ReadItem,
+    tier: Tier,
+    focus: bool,
+) -> Result<Fetched, Failure> {
     live_entry(&sc)?;
     let e = &sc.entry;
     let section = (tier != Tier::L0)
@@ -567,6 +634,12 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
         EntryKind::Release => None,
         _ => e.data.get("kind").and_then(Value::as_str),
     };
+    // запись журнала с фокусом — целиком (M6 §6)
+    let warnings = if focus && matches!(content, Content::Text { .. }) {
+        vec![FOCUS_SKIPPED.to_string()]
+    } else {
+        Vec::new()
+    };
     let label = match sub {
         Some(k) => format!("{kind}/{}", md_inline(k)),
         None => kind.to_string(),
@@ -595,8 +668,9 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
         stale_refs: Vec::new(),
         stale_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
-        warnings: Vec::new(),
+        warnings,
         reread: false,
+        focus: false,
     })
 }
 
@@ -867,8 +941,10 @@ fn within_budget(
     (taken, omitted)
 }
 
-/// Вложение: текст по `locator` (явному или фрагмента `a:`) либо оглавление; текст читается не
-/// дальше `limit` токенов ([`within_budget`]).
+/// Вложение: текст по `locator` (явному или фрагмента `a:`), фокус `d:`/`b:` (M6 §6; короткий
+/// документ — целиком) либо оглавление; текст читается не дальше `limit` токенов
+/// ([`within_budget`]). Фрагмент `a:` с фокусом — целиком (он и есть единица).
+#[allow(clippy::too_many_arguments)]
 async fn fetch_attachment(
     sc: AttachmentScope,
     reference: String,
@@ -876,6 +952,8 @@ async fn fetch_attachment(
     tier: Tier,
     locator: Option<Locator>,
     limit: usize,
+    fx: &mut FocusCtx<'_>,
+    focus: Option<&str>,
 ) -> Result<Fetched, Failure> {
     let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
     if section || it.since_rev.is_some() {
@@ -898,6 +976,9 @@ async fn fetch_attachment(
     let mut parts: Vec<String> = Vec::new();
     let mut omitted = 0usize;
     let mut shown: Option<(String, String)> = None;
+    let mut view = AttView::Part;
+    let mut fwarn: Vec<String> = Vec::new();
+    let chunk_ref = reference.starts_with(&format!("{CHUNK_REF_LETTER}:"));
     let content = if it.if_rev == Some(DOC_REV) {
         Content::Unchanged
     } else {
@@ -913,7 +994,55 @@ async fn fetch_attachment(
         }
         let sheets = Sheets::of(heads.iter().filter_map(|h| h.locator.as_deref()));
         match &want {
-            None => Content::plain(toc(&sc.db, doc.id, &heads, &sheets).await?, false),
+            None => match focus.filter(|_| !chunk_ref) {
+                None => {
+                    view = AttView::Toc;
+                    Content::plain(toc(&sc.db, doc.id, &heads, &sheets).await?, false)
+                }
+                Some(q) => {
+                    let total: usize = heads
+                        .iter()
+                        .map(|h| usize::try_from(h.token_count).unwrap_or(0))
+                        .sum();
+                    let out = if total <= fx.min_tokens() {
+                        None
+                    } else {
+                        let t = FocusTarget::Doc {
+                            db: &sc.db,
+                            att: doc.id,
+                            sheets: &sheets,
+                        };
+                        focus_read(fx, &t, q).await?
+                    };
+                    match out {
+                        Some(o) => {
+                            view = AttView::Focus;
+                            fwarn = o.warnings;
+                            parts = o.leaves;
+                            Content::plain(o.text, false)
+                        }
+                        None => {
+                            // короткий документ — целиком, как часть по `locator`
+                            view = AttView::Whole;
+                            fwarn.push(FOCUS_SKIPPED.to_string());
+                            let all: Vec<i64> = heads.iter().map(|h| h.ordinal).collect();
+                            let (ordinals, rest) = within_budget(&heads, &all, limit);
+                            omitted = rest;
+                            let chosen: HashSet<i64> = ordinals.iter().copied().collect();
+                            let mut uniq: HashSet<&str> = HashSet::new();
+                            for h in heads.iter().filter(|h| chosen.contains(&h.ordinal)) {
+                                if let Some(l) = &h.locator
+                                    && uniq.insert(l)
+                                {
+                                    parts.push(l.clone());
+                                }
+                            }
+                            let texts = doc_chunk_texts(&sc.db, doc.id, ordinals, None).await?;
+                            Content::plain(join_chunks(&heads, &texts), true)
+                        }
+                    }
+                }
+            },
             Some(w) => {
                 let raw = sheets.resolve(w);
                 let ordinals = raw.as_ref().map(|r| select(&heads, r)).unwrap_or_default();
@@ -953,6 +1082,9 @@ async fn fetch_attachment(
         want.as_ref()
             .map(|w| (mask_text(&w.render()), mask_text(&w.label())))
     });
+    if chunk_ref && focus.is_some() && matches!(content, Content::Text { .. }) {
+        fwarn.push(FOCUS_SKIPPED.to_string());
+    }
     let mut warnings = Vec::new();
     if sc.others > 0 {
         warnings.push(format!(
@@ -963,6 +1095,9 @@ async fn fetch_attachment(
             doc.path
         ));
     }
+    warnings.extend(fwarn);
+    // выдан фокус — листы документа (`chunk_id`), иначе — `locator` единиц
+    let focus_view = view == AttView::Focus;
     Ok(Fetched {
         raw: it.id.clone(),
         head: format!(
@@ -999,14 +1134,17 @@ async fn fetch_attachment(
             attachment_id: doc.id,
             node_id: doc.node_id,
             blob_sha256: doc.blob_sha256.clone(),
+            view,
             locator: shown.as_ref().map(|s| s.0.clone()),
             locator_text: shown.map(|s| s.1),
         }),
         warnings,
         reread: false,
+        focus: focus_view,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch(
     st: &AppState,
     p: &Principal,
@@ -1015,14 +1153,16 @@ async fn fetch(
     tier: Tier,
     locator: Option<Locator>,
     budget: usize,
+    fx: &mut FocusCtx<'_>,
+    focus: Option<&str>,
 ) -> Result<Fetched, Failure> {
     match resolve(st, p, headers, &it.id).await? {
-        Located::Node(sc) => fetch_node(sc, it, tier).await,
-        Located::Entry(sc) => fetch_entry(sc, it, tier).await,
+        Located::Node(sc) => fetch_node(sc, it, tier, fx, focus).await,
+        Located::Entry(sc) => fetch_entry(sc, it, tier, focus.is_some()).await,
         Located::Attachment(sc, reference) => {
             // больше бюджета пачки (и `max_tokens` элемента) выдано не будет — дальше не читается
             let limit = it.max_tokens.unwrap_or(budget).min(budget);
-            fetch_attachment(*sc, reference, it, tier, locator, limit).await
+            fetch_attachment(*sc, reference, it, tier, locator, limit, fx, focus).await
         }
     }
 }
@@ -1034,10 +1174,15 @@ fn header(f: &Fetched, tail: &str) -> String {
         line.push_str(" › ");
         line.push_str(s);
     }
-    // вложение: подпись части или «оглавление»; ревизий у документа нет
+    // вложение: подпись части, «оглавление», «весь документ» или «фокус»; ревизий у документа нет
     if let Some(a) = &f.att {
         line.push_str(" · ");
-        line.push_str(a.locator_text.as_deref().unwrap_or("оглавление"));
+        line.push_str(match a.view {
+            AttView::Part => a.locator_text.as_deref().unwrap_or("оглавление"),
+            AttView::Toc => "оглавление",
+            AttView::Whole => "весь документ",
+            AttView::Focus => FOCUS_MARK,
+        });
     }
     let mut parts: Vec<String> = [&f.status, &f.certainty]
         .into_iter()
@@ -1046,6 +1191,9 @@ fn header(f: &Fetched, tail: &str) -> String {
         .collect();
     if f.att.is_none() {
         parts.push(format!("rev{}", f.rev));
+        if f.focus {
+            parts.push(FOCUS_MARK.to_string());
+        }
     }
     parts.push(tail.to_string());
     if f.reread {
@@ -1054,6 +1202,12 @@ fn header(f: &Fetched, tail: &str) -> String {
     line.push_str(&format!("  {}", parts.join(" · ")));
     line
 }
+
+/// `tier` явного фокуса (M6 §6): требует `focus`, без него — 400.
+const FOCUS_TIER: &str = "focus";
+
+/// Пометка заголовка элемента с явным фокусом (M6 §6): `… rev3 · фокус · ~420 tok`.
+const FOCUS_MARK: &str = "фокус";
 
 /// Пометка заголовка повторной выдачи (M6 §7.3): `… · ~120 tok · уже выдавалось в этой сессии`.
 pub const REREAD_MARK: &str = "уже выдавалось в этой сессии";
@@ -1227,7 +1381,8 @@ fn item_json(piece: &Piece) -> Value {
         if let Some(s) = &f.section {
             o.insert("section".into(), json!(s));
         }
-        o.insert("tier".into(), json!(tier_str(f.tier)));
+        let tier = if f.focus { "focus" } else { tier_str(f.tier) };
+        o.insert("tier".into(), json!(tier));
         o.insert("rev".into(), json!(f.rev));
         if !f.stale_refs.is_empty() {
             o.insert("stale_refs".into(), json!(f.stale_refs));
@@ -1237,14 +1392,16 @@ fn item_json(piece: &Piece) -> Value {
             o.insert("attachment_id".into(), json!(a.attachment_id));
             o.insert("node_id".into(), json!(a.node_id));
             o.insert("blob_sha256".into(), json!(a.blob_sha256));
-            match (&a.locator, &a.locator_text) {
-                (Some(l), Some(t)) => {
+            match (a.view, &a.locator, &a.locator_text) {
+                (AttView::Part, Some(l), Some(t)) => {
                     o.insert("locator".into(), json!(l));
                     o.insert("locator_text".into(), json!(t));
                 }
-                _ => {
+                (AttView::Part | AttView::Toc, _, _) => {
                     o.insert("toc".into(), json!(true));
                 }
+                // документ целиком или фокус: части — в тексте
+                (AttView::Whole | AttView::Focus, _, _) => {}
             }
         }
         if !f.warnings.is_empty() {
@@ -1400,6 +1557,7 @@ pub async fn read(
     }
     let mut tiers = Vec::with_capacity(req.items.len());
     let mut locators = Vec::with_capacity(req.items.len());
+    let mut focuses: Vec<Option<String>> = Vec::with_capacity(req.items.len());
     for it in &req.items {
         let locator = parse_locator(it.locator.as_ref())?;
         if locator.is_some() && !is_doc_ref(&it.id) {
@@ -1407,11 +1565,38 @@ pub async fn read(
                 "locator — только у вложений: a:<фрагмент>, b:<sha256>, d:<документ>".into(),
             ));
         }
-        locators.push(locator);
+        locators.push(locator.clone());
         if it.max_tokens == Some(0) {
             return Err(ApiError::BadRequest("max_tokens: больше 0".into()));
         }
-        let tier = parse_tier(it.tier.as_deref())?;
+        // явный фокус (M6 §6): `tier: "focus"` или поле `focus`; уровень — L2
+        let tier_focus = it
+            .tier
+            .as_deref()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(FOCUS_TIER));
+        let focus = it.focus.as_deref().map(str::trim);
+        if tier_focus || focus.is_some() {
+            if focus.is_none_or(str::is_empty) {
+                return Err(ApiError::BadRequest("focus: нужен текст focus".into()));
+            }
+            if it.tier.is_some() && !tier_focus {
+                return Err(ApiError::BadRequest(
+                    "focus: только без tier или с tier focus".into(),
+                ));
+            }
+            let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
+            if section || locator.is_some() || it.since_rev.is_some() {
+                return Err(ApiError::BadRequest(
+                    "focus несовместим с section, locator и since_rev".into(),
+                ));
+            }
+        }
+        focuses.push(focus.map(str::to_string));
+        let tier = if tier_focus {
+            Tier::L2
+        } else {
+            parse_tier(it.tier.as_deref())?
+        };
         if let Some(since) = it.since_rev {
             if since < 1 {
                 return Err(ApiError::BadRequest("since_rev: от 1".into()));
@@ -1446,9 +1631,11 @@ pub async fn read(
     };
 
     let mut fetched = Vec::with_capacity(req.items.len());
-    for ((it, tier), locator) in req.items.iter().zip(tiers).zip(locators) {
+    let mut fx = FocusCtx::new(&st);
+    for (((it, tier), locator), focus) in req.items.iter().zip(tiers).zip(locators).zip(&focuses) {
+        let focus = focus.as_deref();
         fetched.push(
-            match fetch(&st, &p, &headers, it, tier, locator, budget).await {
+            match fetch(&st, &p, &headers, it, tier, locator, budget, &mut fx, focus).await {
                 Ok(f) => Ok(f),
                 Err(Failure::Item(fail)) => Err((it.id.clone(), fail)),
                 Err(Failure::Fatal(e)) => return Err(e),
@@ -1467,14 +1654,18 @@ pub async fn read(
         let given: Vec<SeenItem> = pieces
             .iter()
             .filter_map(|p| match p {
+                // целиком — цель; фокус без обрезки — его листы (M6 §6)
                 Piece::Text {
                     f,
-                    given_whole: true,
+                    given_whole,
+                    more,
                     ..
-                } => Some(f.seen.iter().map(|k| SeenItem {
-                    key: k.clone(),
-                    rev: f.rev,
-                })),
+                } if *given_whole || (f.focus && *more == 0) => {
+                    Some(f.seen.iter().map(|k| SeenItem {
+                        key: k.clone(),
+                        rev: f.rev,
+                    }))
+                }
                 _ => None,
             })
             .flatten()

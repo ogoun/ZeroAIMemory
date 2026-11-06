@@ -475,6 +475,17 @@ pub fn tokens_m6_md(r: &super::tokens::mcp::McpResult) -> String {
         "| (б) повтор: кэш | {} | — | — | {} из {} |",
         u.cached.tokens_total, u.cached.full, u.scenarios
     );
+    if let Some(p) = &u.focus {
+        let _ = writeln!(
+            s,
+            "| справочно: явный фокус (`~T` > `read.focus_min_tokens`) | {} | {} | {:.3} | {} из {} |",
+            p.tokens_total,
+            mean(&p.tokens_mean),
+            p.micro_recall,
+            p.full,
+            u.scenarios
+        );
+    }
     let _ = writeln!(
         s,
         "\nСценариев {}, нагетов {}; (а) / (в): {}; выжимки агента (вывод, не ответ сервера): {} \

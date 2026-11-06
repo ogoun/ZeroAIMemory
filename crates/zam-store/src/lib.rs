@@ -136,10 +136,11 @@ pub use questions::{
     days_ago, open_questions, question_duplicates, recent_answered,
 };
 pub use search::{
-    AliasGroup, AttachmentHit, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery,
-    LeafChunk, LeafHit, MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits,
-    leaves_of_targets, live_chunks, live_folders, neighbor_leaves, node_leaves, pending_count,
-    query_needles, query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
+    AliasGroup, AttachmentHit, ChunkScope, EntryHit, FocusLeaf, FolderRow, FtsChannels, FtsHit,
+    FtsQuery, LeafChunk, LeafHit, MARK_END, MARK_START, TargetFilter, first_leaves, focus_leaves,
+    leaf_term_hits, leaves_of_targets, live_chunks, live_folders, neighbor_leaves, node_leaves,
+    pending_count, query_needles, query_terms, sanitize_fts, search_fts, search_fts_channels,
+    text_snippet,
 };
 pub use sessions::{
     RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,

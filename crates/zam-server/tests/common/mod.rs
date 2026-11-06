@@ -7,6 +7,7 @@ pub mod attach;
 pub mod ml;
 pub mod process;
 pub mod qdrant;
+pub mod read;
 pub mod reports;
 
 use zam_server::config::ServerConfig;

@@ -11,6 +11,10 @@
 //!   вызовом, бюджет [`READ_BUDGET`]) → `memory_cache_put` выжимки прочитанного и дочитанного;
 //! - **справочная политика без оракула** — карточки 1–3 того же поиска по порядку, чтение и
 //!   дочитывание по тем же правилам (своя сессия, без выжимки);
+//! - **справочная политика «явный фокус»** (§3.1, §6; только сервер с `focus` в `features`) —
+//!   те же источники оракула, что у (а), но цели с `~T` карточки больше `read.focus_min_tokens`
+//!   (600 или переопределение точки) читаются с `focus` = вопрос сценария, как советует блок v7;
+//!   дочитывание — по пометкам `[пропущено: …]` (секции) и прочим тем же правилам, без выжимки;
 //! - **(б) повтор** — `memory_search` brief другой сессией: выжимка кэша первой.
 //!
 //! **Кэш между сценариями.** После (б) выжимка сценария удаляется (`DELETE /api/v1/cache/{id}`,
@@ -68,6 +72,11 @@ use crate::eval::{Device, EvalArgs, Mode, Paths, grid};
 
 /// Карточек справочной политики без оракула.
 pub const REFERENCE_CARDS: usize = 3;
+/// Порог справочной политики «явный фокус»: `~T` карточки больше — читать с `focus`
+/// (`read.focus_min_tokens` сервера по умолчанию, §14).
+pub const FOCUS_MIN_TOKENS: usize = 600;
+/// Переопределение порога фокуса в точке сетки.
+const FOCUS_MIN_ENV: &str = "ZAM_READ__FOCUS_MIN_TOKENS";
 /// Порог неинфериорности: нижняя граница одностороннего 95 % интервала Δ микро-полноты.
 pub const MIN_D_MICRO: f64 = -0.02;
 /// Порог чистых потерь.
@@ -144,6 +153,9 @@ pub struct McpScenario {
     pub reference: AgentPath,
     pub cached: PathRun,
     pub naive: AgentPath,
+    /// Справочная политика «явный фокус» (у сервера без `focus` — нет).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<AgentPath>,
     /// Пути, где первой пришла чужая выжимка кэша (`(а)`, `(в)`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub foreign_cache: Vec<String>,
@@ -169,6 +181,9 @@ pub struct McpSummary {
     pub reference: PathTotals,
     pub cached: PathTotals,
     pub naive: PathTotals,
+    /// Справочная политика «явный фокус» (сценарии, где она снята).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<PathTotals>,
     pub summary_tokens_total: usize,
     /// `Σ (а) / Σ (в)` с 95 % интервалом ([`BOOTSTRAP_M6`] выборок).
     pub protocol_to_naive: Option<Estimate>,
@@ -363,6 +378,13 @@ pub fn summarize(runs: &[McpScenario]) -> McpSummary {
         reference: totals(&col(|r| &r.reference)),
         cached,
         naive: totals(&col(|r| &r.naive)),
+        focus: {
+            let f: Vec<(&AgentPath, usize)> = runs
+                .iter()
+                .filter_map(|r| r.focus.as_ref().map(|p| (p, r.nuggets_total)))
+                .collect();
+            (!f.is_empty()).then(|| totals(&f))
+        },
         summary_tokens_total: runs.iter().map(|r| r.summary_tokens).sum(),
         protocol_to_naive: ratio_estimate_with(&pairs, BOOTSTRAP_M6, SEED),
         foreign_cache_hits: runs.iter().map(|r| r.foreign_cache.len()).sum(),
@@ -626,6 +648,38 @@ fn ordered_raws(s: &Session, docs: &DocMap, text: &str) -> Vec<(String, String)>
     RefMaps::of(s, docs).cards(text)
 }
 
+/// Размер цели из карточки поиска (`… · 340t` хвоста строки карточки v2 с ссылкой `raw`).
+pub fn card_tokens(cards: &str, raw: &str) -> Option<usize> {
+    let line = cards.lines().find(|l| {
+        l.split_whitespace()
+            .nth(1)
+            .is_some_and(|w| w == raw || w.trim_end_matches(':') == raw)
+    })?;
+    line.split(" · ")
+        .filter_map(|seg| {
+            let w = seg.split_whitespace().next()?;
+            w.strip_suffix('t')?.parse::<usize>().ok()
+        })
+        .last()
+}
+
+/// Элементы `memory_read` справочной политики «явный фокус»: цель с `~T` карточки больше
+/// `min` — с `focus` = вопрос сценария, остальные (и без размера в карточке) — L2.
+pub fn focus_items(
+    cards: &str,
+    question: &str,
+    picked: &[(String, String)],
+    min: usize,
+) -> Vec<Value> {
+    picked
+        .iter()
+        .map(|(_, raw)| match card_tokens(cards, raw) {
+            Some(t) if t > min => json!({ "id": raw, "focus": question }),
+            _ => json!({ "id": raw }),
+        })
+        .collect()
+}
+
 /// Нагеты сценария (по порядку), найденные в тексте.
 fn nugget_hits(sc: &Scenario, delivered: &str) -> Vec<bool> {
     let norm = normalize_md(delivered);
@@ -654,6 +708,19 @@ fn read_and_reread(
     path: &mut AgentPath,
 ) -> Result<String> {
     let items: Vec<Value> = picked.iter().map(|(_, raw)| json!({ "id": raw })).collect();
+    read_items_and_reread(c, counter, sc, picked, items, path)
+}
+
+/// [`read_and_reread`] с готовыми элементами первого `memory_read` (справочная политика «явный
+/// фокус» — с `focus` у длинных целей).
+fn read_items_and_reread(
+    c: &McpClient,
+    counter: &Counter,
+    sc: &Scenario,
+    picked: &[(String, String)],
+    items: Vec<Value>,
+    path: &mut AgentPath,
+) -> Result<String> {
     let read = c.call(
         "memory_read",
         json!({ "items": items, "budget_tokens": READ_BUDGET }),
@@ -759,6 +826,7 @@ fn delete_cache(s: &Session, id: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_scenario(
     s: &Session,
     docs: &DocMap,
@@ -767,6 +835,7 @@ fn run_scenario(
     sc: &Scenario,
     part: Part,
     tag: &str,
+    focus_min: Option<usize>,
 ) -> Result<McpScenario> {
     let no_ex = BTreeSet::new();
     let ex = l0.get(&sc.id).unwrap_or(&no_ex);
@@ -862,6 +931,25 @@ fn run_scenario(
         read_and_reread(&client("r")?, counter, sc, &first, &mut reference)?;
     }
     finish(sc, &mut reference, ex);
+    // справочно: «явный фокус» (§3.1) — источники оракула, длинные — с `focus`
+    let focus = match focus_min {
+        Some(min) if !selected.is_empty() => {
+            let mut fp = AgentPath::default();
+            fp.push("memory_search brief", &cards, counter);
+            let items = focus_items(&cards, &sc.question, &selected, min);
+            read_items_and_reread(&client("f")?, counter, sc, &selected, items, &mut fp)?;
+            finish(sc, &mut fp, ex);
+            Some(fp)
+        }
+        Some(_) => {
+            let mut fp = AgentPath::default();
+            fp.push("memory_search brief", &cards, counter);
+            fp.add_note("ни одного ожидаемого источника в карточках");
+            finish(sc, &mut fp, ex);
+            Some(fp)
+        }
+        None => None,
+    };
     // (б) повтор другой сессией: выжимка кэша первым элементом
     let mut cached = PathRun::default();
     let again = client("b")?.call("memory_search", brief)?;
@@ -901,6 +989,7 @@ fn run_scenario(
         reference,
         cached,
         naive,
+        focus,
         foreign_cache: foreign,
     })
 }
@@ -1548,6 +1637,13 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             .filter_map(|(k, v)| caps::env_to_key(k).map(|key| (key, v.clone())))
             .collect();
         sets.extend(index_sets.iter().cloned());
+        // справочная политика «явный фокус» — только у сервера с фокусом; порог — как у сервера
+        let focus_min = caps.focus.then(|| {
+            kept.iter()
+                .find(|(k, _)| k == FOCUS_MIN_ENV)
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(FOCUS_MIN_TOKENS)
+        });
         let point = (!pt.name.is_empty()).then(|| pt.name.clone());
         let run_label = match &point {
             Some(n) => format!("tokens-{label}-{n}"),
@@ -1575,7 +1671,9 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 sc.id,
                 point.as_deref().map_or(String::new(), |n| format!("-{n}"))
             );
-            runs.push(run_scenario(&s, &docs, &l0_set, &counter, sc, part, &tag)?);
+            runs.push(run_scenario(
+                &s, &docs, &l0_set, &counter, sc, part, &tag, focus_min,
+            )?);
         }
         let st = s.status.clone();
         s.stop()?;
@@ -1696,6 +1794,41 @@ fn compare_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Справочная политика «явный фокус»: размер цели — из хвоста карточки v2 (`· 340t`, в том
+    /// числе с пометкой после него), `focus` — только у целей длиннее порога.
+    #[test]
+    fn focus_policy_by_card_tokens() {
+        let (n1, n2) = ("n:01M5ZW9X5TEXXA5Z35ZWAXPHBK", "n:01M60A7Q4T7QK2M9ZWAXPHBK");
+        let i = "i:01M60A7Q4T7QK2M9ZWAXPHBK9C";
+        let cards = format!(
+            "1. {n1} Knowledge/ru/kafka › Причина  [.82] r7 · 2026-10-10 14:03:22 · 4340t\n   \
+             Фрагмент…\n\
+             2. {i} insight/gotcha «LF»  [.77] hyp · 2026-09-28 08:00:01 · 120t   (выдавалось)\n\
+             3. {n2} Knowledge/en/dns  [.70] r2 · 2026-10-10 14:03:22 · 601t   (seen)\n"
+        );
+        assert_eq!(card_tokens(&cards, n1), Some(4340));
+        assert_eq!(card_tokens(&cards, i), Some(120));
+        assert_eq!(card_tokens(&cards, n2), Some(601));
+        assert_eq!(card_tokens(&cards, "n:нет"), None);
+        let picked: Vec<(String, String)> = [n1, i, n2, "n:нет"]
+            .iter()
+            .map(|r| (r.to_string(), r.to_string()))
+            .collect();
+        assert_eq!(
+            focus_items(&cards, "вопрос", &picked, 600),
+            [
+                json!({"id": n1, "focus": "вопрос"}),
+                json!({"id": i}),
+                json!({"id": n2, "focus": "вопрос"}),
+                json!({"id": "n:нет"}),
+            ]
+        );
+        assert_eq!(
+            focus_items(&cards, "вопрос", &picked[2..3], 601),
+            [json!({"id": n2})]
+        );
+    }
 
     /// Ревью задачи 5, M8: точка сетки ТС-1 не может менять индекс — ни нарезку, ни модель.
     #[test]

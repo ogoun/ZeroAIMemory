@@ -1,0 +1,262 @@
+//! Явный фокус `/read` с моделью (M6 §6, задача 7b): откат на лексику по сроку
+//! `read.focus_timeout_ms` и замер p95. Отдельный файл от `read_focus`: модель ставит счётчик
+//! токенов процесса (`zam_store::set_token_counter`), и тесты без модели в том же процессе
+//! считали бы токены её токенизатором (эталон `read_l2_m57.json` снят счётчиком bge-m3).
+mod common;
+
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use common::api::{Api, api};
+use common::ml::{MINILM, external, have, ml, until, vector_ready};
+use common::qdrant::TestQdrant;
+use common::read::sections_note;
+use serde_json::{Value, json};
+
+const READ: &str = "/api/v1/read";
+/// Предупреждение: фокус только по FTS-лексике листов.
+const LEXICAL: &str = "focus lexical";
+
+fn id(v: &Value) -> String {
+    v["id"].as_str().unwrap().to_string()
+}
+
+async fn read_ok(a: &Api, body: Value) -> Value {
+    let r = a.t(axum::http::Method::POST, READ, Some(body)).await;
+    assert_eq!(r.status, axum::http::StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+fn warnings(it: &Value) -> Vec<String> {
+    it["warnings"]
+        .as_array()
+        .map(|w| w.iter().map(|s| s.as_str().unwrap().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Сервер с моделью `model` и внешним Qdrant; `None` — нет ORT/модели/Qdrant (вне CI).
+async fn ml_api(
+    name: &str,
+    model: &str,
+    tweak: impl FnOnce(&mut zam_server::config::ServerConfig),
+) -> Option<(Api, TestQdrant)> {
+    if !have(model) {
+        return None;
+    }
+    let q = TestQdrant::start(name);
+    let a = api(name, |c| {
+        ml(c, model);
+        external(c, &q);
+        tweak(c);
+    })
+    .await;
+    vector_ready(&a).await;
+    Some((a, q))
+}
+
+/// Ждёт индексации узлов (эмбеддинги листов — в кэше `embeddings`).
+async fn wait_indexed(a: &Api, ids: &[String]) {
+    let d = a.st.users.get(a.st.admin_id).await.unwrap();
+    until(
+        "заметки проиндексированы",
+        Duration::from_secs(240),
+        async || {
+            for n in ids {
+                let node = zam_store::get_node(&d, n.parse().unwrap()).await.unwrap();
+                if node.index_state != "indexed" {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+}
+
+/// С моделью фокус — по лексике и косинусу листов (без `focus lexical`); срок
+/// `read.focus_timeout_ms` вышел (задержка точкой `test-hooks`) — только лексика с
+/// `focus lexical`, и ответ не ждёт задержки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn focus_timeout_lexical_fallback() {
+    let Some((a, _q)) = ml_api("focus-timeout", MINILM, |c| {
+        c.read.focus_timeout_ms = 2000;
+    })
+    .await
+    else {
+        return;
+    };
+    let n = id(&a
+        .note("knowledge", "Восемь", &sections_note(8, 10, 5))
+        .await);
+    wait_indexed(&a, std::slice::from_ref(&n)).await;
+    let body = json!({"items": [{"id": format!("n:{n}"), "focus": "детектор нейтрино"}],
+                      "budget_tokens": 20000});
+    let j = read_ok(&a, body.clone()).await;
+    let it = &j["items"][0];
+    assert_eq!(it["tier"], "focus", "{it}");
+    assert!(warnings(it).is_empty(), "{it}");
+    assert!(
+        it["text"].as_str().unwrap().contains("детектор нейтрино"),
+        "{it}"
+    );
+    a.st.focus_delay_ms.store(60_000, Ordering::SeqCst);
+    let t = Instant::now();
+    let j = read_ok(&a, body).await;
+    let spent = t.elapsed();
+    a.st.focus_delay_ms.store(0, Ordering::SeqCst);
+    let it = &j["items"][0];
+    assert_eq!(warnings(it), [LEXICAL], "{it}");
+    assert!(
+        it["text"].as_str().unwrap().contains("детектор нейтрино"),
+        "{it}"
+    );
+    assert!(
+        spent < Duration::from_secs(10),
+        "ответ ждал задержку: {spent:?}"
+    );
+}
+
+fn pct(sorted: &[f64], p: f64) -> f64 {
+    let i = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[i]
+}
+
+/// Замер p95 `/read` с фокусом на 5 целях (§6, §17 п. 8): CPU int8 ≤ 120 мс, GPU ≤ 50 мс.
+/// Устройство — `ZAM_FOCUS_P95_DEVICE` (`cpu` по умолчанию, `cuda`): bge-m3-int8 на CPU-сборке ORT
+/// или bge-m3-fp16 на GPU-сборке (`target/deps/<платформа>/onnxruntime-gpu/`). Модели — из
+/// `ZAM_TEST_MODELS_DIR` (полные bge-m3). Запуск: `cargo test -p zam-server --test read_focus_ml
+/// focus_p95 -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "замер для журнала: bge-m3, CPU int8 или GPU fp16"]
+async fn focus_p95() {
+    let cuda = std::env::var("ZAM_FOCUS_P95_DEVICE").is_ok_and(|d| d == "cuda");
+    let model = if cuda { "bge-m3-fp16" } else { "bge-m3-int8" };
+    let Some((a, _q)) = ml_api(&format!("focus-p95-{model}"), model, |c| {
+        if cuda {
+            c.ml.device = zam_server::config::MlDevice::Cuda;
+            c.ml.ort_dylib = Some(
+                common::ml::repo()
+                    .join("target")
+                    .join("deps")
+                    .join(common::ml::platform())
+                    .join("onnxruntime-gpu")
+                    .join(if cfg!(windows) {
+                        "onnxruntime.dll"
+                    } else {
+                        "libonnxruntime.so"
+                    }),
+            );
+        }
+    })
+    .await
+    else {
+        return;
+    };
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let t = sections_note(12, 25, 3 + i);
+        ids.push(id(&a.note("knowledge", &format!("p95/{i}"), &t).await));
+    }
+    wait_indexed(&a, &ids).await;
+    let queries = [
+        "детектор нейтрино",
+        "калибровка детектора",
+        "журналы сервера",
+        "порядок работы с конфигурацией",
+        "раздел про нейтрино",
+        "как настроить журналы",
+        "конфигурация сервера",
+        "калибровка",
+        "детектор",
+        "введение к руководству",
+    ];
+    let run = |same: bool, q: usize| {
+        let items: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .map(|(k, n)| {
+                let f = if same {
+                    format!("{} {q}", queries[q % queries.len()])
+                } else {
+                    format!("{} {q}-{k}", queries[(q + k) % queries.len()])
+                };
+                json!({"id": format!("n:{n}"), "focus": f})
+            })
+            .collect();
+        json!({"items": items, "budget_tokens": 20000})
+    };
+    // прогрев
+    for q in 0..5 {
+        read_ok(&a, run(true, 1000 + q)).await;
+    }
+    eprintln!(
+        "T7B-METRIC focus_p95 {model}: устройство {:?}, сборка {}",
+        a.st.index.device,
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    // база: те же 5 целей без фокуса (L2 целиком) — доля самого `/read`
+    let plain = json!({"items": ids.iter().map(|n| json!({"id": format!("n:{n}")})).collect::<Vec<_>>(),
+                       "budget_tokens": 20000});
+    let mut base = Vec::new();
+    for _ in 0..30 {
+        let t = Instant::now();
+        read_ok(&a, plain.clone()).await;
+        base.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    base.sort_by(f64::total_cmp);
+    eprintln!(
+        "T7B-METRIC focus_p95 {model}: без фокуса (L2, 5 целей): p50 {:.1} мс, p95 {:.1} мс",
+        pct(&base, 0.5),
+        pct(&base, 0.95)
+    );
+    // эмбеддинг запроса отдельно
+    let emb = a.st.index.embedder.clone().unwrap();
+    let mut em = Vec::new();
+    for q in 0..30 {
+        let t = Instant::now();
+        emb.embed_query(&format!("{} {q}", queries[q % queries.len()]))
+            .unwrap();
+        em.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    em.sort_by(f64::total_cmp);
+    eprintln!(
+        "T7B-METRIC focus_p95 {model}: эмбеддинг запроса: p50 {:.1} мс, p95 {:.1} мс",
+        pct(&em, 0.5),
+        pct(&em, 0.95)
+    );
+    for same in [true, false] {
+        let mut ms = Vec::new();
+        let mut lexical = 0;
+        for q in 0..60 {
+            let t = Instant::now();
+            let j = read_ok(&a, run(same, q)).await;
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            lexical += j["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|it| warnings(it).iter().any(|w| w == LEXICAL))
+                .count();
+        }
+        ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "T7B-METRIC focus_p95 {model} ({}), 5 целей, {} запросов, focus {}: p50 {:.1} мс, \
+             p95 {:.1} мс, max {:.1} мс, откатов по сроку {lexical} из {}",
+            if cuda { "GPU" } else { "CPU" },
+            ms.len(),
+            if same {
+                "один на запрос"
+            } else {
+                "свой у каждой цели"
+            },
+            pct(&ms, 0.5),
+            pct(&ms, 0.95),
+            ms[ms.len() - 1],
+            ms.len() * ids.len()
+        );
+    }
+}

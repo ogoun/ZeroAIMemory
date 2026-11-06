@@ -183,7 +183,9 @@ impl ToolName {
                         "type": "object",
                         "properties": {
                             "id": {"type": "string"},
-                            "tier": {"type": "string", "enum": ["L0", "L1", "L2"]},
+                            "tier": {"type": "string", "enum": ["L0", "L1", "L2", "focus"]},
+                            "focus": {"type": "string", "description":
+                                "запрос: оглавление, ближайшие листы, [пропущено: путь · ~N t]"},
                             "section": {"type": "string", "description": "путь заголовков «A > B»"},
                             "max_tokens": {"type": "integer", "minimum": 1},
                             "if_rev": {"type": "integer"},

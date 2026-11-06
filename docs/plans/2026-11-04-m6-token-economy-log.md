@@ -2608,6 +2608,128 @@ clippy `--workspace --all-targets -D warnings` — чисто; `zam-server --tes
 
 ### Задача 7b. Явный фокус
 
+Коммит — `feat(read): явное фокусное чтение` (sha — в отчёте контролёру).
+
+**Сделано.**
+- `api/read_focus.rs` (новый): `FocusCtx` (настройки `[read]`, доступность векторов, эмбеддинги
+  запросов одного вызова `/read`), `focus_read(fx, &FocusTarget, focus) -> Option<FocusOut>`
+  (`FocusTarget::Note {db, node, text, rev}` | `Doc {db, att, sheets}`; `None` — листов нет или
+  нарезка не той ревизии). Выдача: строка `Оглавление: A · *B · … · …ещё N заголовков` (≤ 40
+  записей и ≤ 150 токенов; у документа — части по `locator_text`, лист книги без диапазона,
+  `…ещё N частей`), выбранные листы в порядке документа с `[<путь заголовков>]` при смене (у
+  документа — `[<подпись части>]`), пометки `[пропущено: <путь> · ~N t]` — по секции H1–H3 подряд
+  идущих невыданных листов (путь годен для `section`; преамбула — `начало`), у документа — подряд
+  идущие части одной пометкой `<первая> — <последняя>`; `N` — `chunks.token_count`. Балл — RRF
+  (k = 60) порядка по числу слов `focus`, найденных FTS в листе, и порядка по dense-косинусу листа
+  (векторы — кэш `embeddings`), без реранкера; без совпадений и векторов — первые листы.
+- Срок `read.focus_timeout_ms` — общий на эмбеддинг запроса и чтение векторов (`tokio::time::timeout`);
+  вышел, модели нет, `vector_available()` — ошибка (поиск `degraded`), векторов листов в кэше нет —
+  только лексика и `warnings: ["focus lexical"]`. Текст `focus`, не уложившийся в срок, у
+  следующих целей того же вызова — сразу лексика; уложившийся — эмбеддинг переиспользуется.
+  Точка `test-hooks` — `AppState.focus_delay_ms` (задержка внутри срока).
+- `api/read.rs`: `ReadItem.focus`, `tier: "focus"` (= `focus` без `tier`); 400 до чтения:
+  «focus: нужен текст focus» (пусто или `tier: focus` без текста), `focus` с другим `tier`, с
+  `section`, `locator`, `since_rev`. Узел длиннее `read.focus_min_tokens` — фокус (`tier: "focus"`
+  в json, `· фокус` в заголовке md), короче — L2 целиком с `focus skipped: short`; запись журнала и
+  `a:<chunk>` — целиком с тем же предупреждением; `d:`/`b:` — фокус по чанкам документа или (сумма
+  `token_count` ≤ порога) весь документ (`· весь документ`, без `toc`). Вид части вложения —
+  `AttView {Toc, Part, Whole, Focus}`; без `focus` заголовок и json прежние. В `session_seen` у
+  фокуса — только выданные листы (`part = chunk_id`, у документа — блоб и `chunk_id`), не цель;
+  обрезанный бюджетом фокус не отмечается; пометки «уже выдавалось» у фокуса нет.
+- `config.rs`: `[read] focus_leaves` 1..=10 (3), `focus_min_tokens` 0..=20000 (600),
+  `focus_timeout_ms` 1..=10000 (80); `deploy/config.example.toml`. `/health.features` — `focus`.
+- `zam-store::focus_leaves(db, TargetRef, needles)` — листы цели (`chunk`; у документа —
+  `attachment`) с текстом, `token_count`, `embed_key`, ревизией и числом совпадений слов — одна
+  читающая транзакция (как `leaf_term_hits`).
+- MCP: `memory_read.items[].focus` и `tier: focus` в схеме — **закрывает находку zero-agent** (раньше
+  `focus` уходил в `deny_unknown_fields` `ReadItem` → 400). CLI: `zam read <цель> --focus
+  "<запрос>"` (пачкой; с `--tier`, `--section`, `--locator`, `--since-rev` — код 6).
+- xtask: справочная политика «явный фокус» (`McpScenario.focus`, `McpSummary.focus`, строка отчёта
+  md): источники оракула (а), цели с `~T` карточки > `read.focus_min_tokens` (600 или
+  `ZAM_READ__FOCUS_MIN_TOKENS` точки) — с `focus` = вопрос, дочитывание по тем же правилам; только
+  сервер с `focus` в `features`. `card_tokens`, `focus_items`; `eval/README.md`.
+- Спецификация §6 — абзац «Уточнения задачи 7b»; §7.1 — Minor ревью 7a (ниже).
+- **Minor ревью 7a:** doc `mark_cache_sources` и §7.1 — заметка с секретами (чанки по
+  маскированному тексту) и чанк с повторённым заголовком блока сохраняют фрагмент — ожидаемо.
+
+**Тесты.** RED — сборка `read_focus` падала на отсутствующих `read.focus_*` и
+`AppState.focus_delay_ms` (на коде до правки все тесты с `focus` дали бы 400 `unknown field`).
+`crates/zam-server/tests/read_focus.rs` (без модели): `read_without_focus_byte_equal_l2` (эталон
+7a `read_l2_m57.json` побайтово, без `focus` и с `tier: "L2"`, сравнение как в 7a — метка
+`<total>`), `focus_toc_le_150_tokens`, `focus_skip_marker_format`, `focus_short_target_skipped`,
+`focus_journal_entry_whole`, `focus_invalid_combinations_400` (сверх брифа), `focus_doc_blob_locator`,
+`focus_chunk_whole`, `focus_marks_only_leaves_seen`; `read_focus_ml.rs` (MiniLM + Qdrant):
+`focus_timeout_lexical_fallback`, `focus_p95` (`--ignored`); `mcp::mcp_read_focus`;
+`zam-cli` `notes::read_focus_cli`; модульные `read_focus::tests::{choose_lexical_and_first,
+toc_limits, render_gaps}`; xtask `focus_policy_by_card_tokens`. Мир эталона L2 (`l2_world`,
+`l2_answers[_with]`) и заметки фокуса — `tests/common/read.rs` (из `read_batch.rs`).
+
+**Замер `focus_p95`** (5 целей по 12 разделов ≈ 4000 токенов, 60 запросов, после прогрева;
+`ZAM_TEST_MODELS_DIR` = `target/models`; GPU — RTX 3090, свободен: 0 %, 2,2 ГиБ чужих процессов
+до и после; логи `.tmp/m6/task7b/p95-*.log`):
+
+| Сборка, устройство | L2 без фокуса, p95 | эмбеддинг запроса, p95 | фокус, один `focus` на запрос: p50 / p95 / max | фокус, свой у каждой цели: p95 | цель §6 |
+|---|---:|---:|---|---:|---|
+| release, CPU bge-m3-int8 | 88,5 | 29,7 | 56,8 / **64,5** / 66,9 | 180,7 | ≤ 120 — да |
+| release, GPU bge-m3-fp16 (CUDA 0) | 93,4 | 15,7 | 43,5 / **48,5** / 54,8 | 93,7 | ≤ 50 — да (запас 1,5 мс) |
+| debug, CPU int8 (после оптимизации) | 144,6 | 30,2 | 88,1 / 100,4 / 102,2 | 217,2 | — |
+| debug, GPU fp16 | 143,6 | 22,6 | 79,3 / 96,7 / 102,4 | 159,6 | — |
+
+Все значения — мс; откатов по сроку (80 мс) — 0 из 300 в каждом прогоне. Первый замер debug CPU
+до оптимизации — p95 137,4. Решающий — release (`cargo test --release`; в debug сама L2-пачка 5
+целей стоит 144 мс). GPU до и после прогонов: 1 %, 2,2 ГиБ (чужих процессов нет, не трогался).
+Цель §6 «5 целей» понята как один вызов `/read` с 5 целями и одним `focus`; при разных `focus` у
+каждой цели эмбеддится 5 запросов подряд, и цель не выполняется (CPU 181, GPU 94).
+
+**Отклонения от плана и брифа.**
+- Тесты с моделью — в отдельном `read_focus_ml.rs` (сверх брифа): модель ставит счётчик токенов
+  процесса (`set_token_counter`), и `read_without_focus_byte_equal_l2` в том же процессе считал
+  `tokens` токенизатором MiniLM (38 вместо 20). Команда замера — `--test read_focus_ml`.
+- Сигнатура: `focus_read(fx: &mut FocusCtx, target: &FocusTarget, focus) ->
+  Result<Option<FocusOut>, StoreError>` вместо `(st, target, focus, cfg) -> Result<FocusOut,
+  ApiError>`: контекст вызова держит эмбеддинги запросов (один эмбеддинг на текст `focus` за
+  вызов) и настройки.
+- `focus_skip_marker_format`: ожидаемые пути пометок считаются по листам базы (`node_leaves`) —
+  нарезка FTS-сервера идёт оценкой, и число листов раздела от счётчика зависит; первый вариант
+  с жёстким списком упал на разбиении раздела 5 на два листа (поправлено ожидание, не код).
+- Модульный `choose_lexical_and_first`: ожидание RRF в первом варианте было посчитано неверно
+  (лист, второй в обоих порядках, обходит первый только по косинусу) — исправлен тест.
+- xtask-политика написана до своего модульного теста (тест `focus_policy_by_card_tokens` — после).
+- Оптимизация после первого замера CPU (debug p95 137 мс → 100 мс): размер листа в пометке — из
+  `chunks.token_count` (не токенизация каждого листа), строка оглавления — суммой токенов записей
+  с одной точной проверкой (было по вызову счётчика на запись).
+
+**Проверки** (`target/r1-t7b`, `-j 2`, `CARGO_INCREMENTAL=0`, `ZAM_REQUIRE_ML=1`,
+`ZAM_TEST_MODELS_DIR` — абсолютный путь к `.tmp/ci-models`; логи `.tmp/m6/task7b/`): `cargo fmt
+--all -- --check` — чисто; `cargo clippy --workspace --all-targets -- -D warnings` — чисто;
+`zam-server --lib` 244 PASS (1 ignored); `--test read_focus` 9, `read_focus_ml` 1 (+1 ignored),
+`read_batch` 13 (+1), `read_attachments` 10, `read_since_rev`, `read_budget_memory`, `sessions`,
+`search`, `mcp` 58, `boot` 13, `cache_api`, `attachments_search` — все PASS (13 целей);
+`zam-store --lib` 86 PASS; `zam-cli --test notes` 9, `--test read_locator` 1 — PASS; `xtask` 172 +
+5 PASS. Полный прогон — не по плану (8c/17d/13b).
+
+**Пункты «→ 7b» журнала.**
+- Задача 1b, «Задаче 5 и 7b»: фокус на ТС-1 — справочно; политика «явный фокус» в отчёте `eval
+  --tokens` есть (снимается в 8c/13b, где идут прогоны ТС-1).
+- Правки ревью 1b, I-1, «указание задачам 5 и 7b»: хвост длинной заметки находит пометка
+  `[пропущено: <секция> · ~N t]` → дочитывание `section` (xtask `reread_need` уже их разбирает);
+  путь пометки — секция H1–H3, годная для `section` (тест `focus_skip_marker_format` читает каждую).
+- `freeze_now` — тесты 7b часов не замораживают; `test-hooks` — точка задержки `focus_delay_ms`
+  (фича включена у dev-зависимости `zam-server`).
+
+**Передать:**
+- **→ 13a:** описание `memory_read` (≤ 300 символов) — `focus` и легенда `[пропущено: …]`; блок v7
+  — когда звать фокус (§6, §13); CHANGELOG «Изменения ответа»: `focus`/`tier: focus`, `warnings`
+  `focus skipped: short`/`focus lexical`, `· фокус` и `· весь документ` в заголовке md, ключи
+  `[read] focus_*`, `zam read --focus`, `features: focus`.
+- **→ 8c/13b:** строка «справочно: явный фокус» отчёта `eval --tokens` (ТС-1 dev/holdout).
+- **→ контролёру (замер):** при разных `focus` у каждой из 5 целей одного вызова p95 выше цели (CPU 181 мс, GPU 94 мс):
+эмбеддинги идут по одному. Варианты — пакетный эмбеддинг запросов вызова (`embed_passages` у bge-m3
+без префикса) или общий срок на вызов; блок v7 (13a) может советовать один `focus` на пачку. GPU с
+одним `focus` — 48,5 мс при цели 50: запас мал, переснять в 13b на финальном коде.
+- **→ 13b/13c (совместимость):** `zam` M6 с сервером v0.0.10-m5.7: `--focus` → 400 «unknown field
+  `focus`» (старый `ReadItem`); в матрицу.
+
 ### Задача 8a. Rules-резерв, индексы, детерминированность, идеи
 
 ### Задача 8b. Учёт, `zam sessions`, страница сессий, `rules_heavy`

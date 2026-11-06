@@ -534,3 +534,47 @@ fn read_since_rev_cli() {
     let o = e.run(&["read", "knowledge:s1", "knowledge:s1", "--since-rev", "1"]);
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
 }
+
+/// `zam read <цель> --focus "<запрос>"` (M6 §6): пачкой с `focus` — оглавление, лист и пометки
+/// `[пропущено: …]`, `--json` — `tier: "focus"`; с `--section` — код 6.
+#[test]
+fn read_focus_cli() {
+    let e = Env::new("read-focus");
+    let mut t = String::from("# Справочник\n\n");
+    for i in 1..=8 {
+        t.push_str(&format!("## Глава {i}\n\n"));
+        for k in 0..12 {
+            t.push_str(&format!(
+                "Абзац {k} главы {i} рассказывает о настройке и обслуживании сервера. "
+            ));
+        }
+        if i == 6 {
+            t.push_str("Здесь описан протокол квазиметрии. ");
+        }
+        t.push_str("\n\n");
+    }
+    ok(&e.run_stdin(&["write", "knowledge:f1"], t.as_bytes()));
+    let s = ok(&e.run(&["read", "knowledge:f1", "--focus", "протокол квазиметрии"]));
+    assert!(s.contains(" · фокус · ~"), "{s}");
+    assert!(s.contains("*Глава 6"), "{s}");
+    assert!(s.contains("протокол квазиметрии"), "{s}");
+    assert!(s.contains("[пропущено: Справочник > Глава 1 · ~"), "{s}");
+    let v: serde_json::Value = serde_json::from_str(&ok(&e.run(&[
+        "read",
+        "knowledge:f1",
+        "--focus",
+        "квазиметрии",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(v["items"][0]["tier"], "focus", "{v}");
+    let o = e.run(&[
+        "read",
+        "knowledge:f1",
+        "--focus",
+        "x",
+        "--section",
+        "Глава 1",
+    ]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+}

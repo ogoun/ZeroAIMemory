@@ -1,4 +1,5 @@
-//! `zam read <target>… [--tier L0|L1|L2] [--section "A > B"] [--rev N] [--locator <loc>]`.
+//! `zam read <target>… [--tier L0|L1|L2] [--section "A > B"] [--rev N] [--locator <loc>]
+//! [--focus "<запрос>"]`.
 //!
 //! - L2 (по умолчанию) — байты ревизии как сохранены (CRLF, BOM), без добавлений;
 //! - L0 и L1 — текст сводки и перевод строки;
@@ -28,6 +29,11 @@
 //!
 //! Нет секции `--section` — код 5 с подсказкой: путь секции — заголовки от верхнего или
 //! однозначный хвост пути.
+//!
+//! **Явный фокус** (`--focus "<запрос>"`, M6 §6): пачкой, у каждой цели `focus` — сервер отдаёт
+//! оглавление, ближайшие к запросу листы и пометки `[пропущено: <путь> · ~N t]` (дочитать —
+//! `--section <путь>`); короткая цель и запись журнала — целиком. С `--section`, `--locator`,
+//! `--since-rev` и `--tier` несовместим (код 6).
 //!
 //! **Вложения** (M5, задача 7): `a:<chunk>` из выдачи `zam search` — фрагмент по `locator`
 //! чанка, `b:<sha256>` и `d:<id>` — документ; `--locator page:12|slide:3|para:40|
@@ -59,6 +65,8 @@ pub struct Opts<'a> {
     pub since_rev: Option<i64>,
     /// Часть вложения (M5): `page:12`, `sheet:Итоги!A1:F40`.
     pub locator: Option<&'a str>,
+    /// Явный фокус (M6 §6): текст запроса.
+    pub focus: Option<&'a str>,
 }
 
 impl Opts<'_> {
@@ -69,6 +77,7 @@ impl Opts<'_> {
             || self.if_rev.is_some()
             || self.since_rev.is_some()
             || self.locator.is_some()
+            || self.focus.is_some()
     }
 }
 
@@ -272,6 +281,13 @@ fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
             "--if-rev и --since-rev задают ревизию одной цели: передайте ровно одну цель",
         ));
     }
+    if o.focus.is_some()
+        && (o.tier.is_some() || o.section.is_some() || o.locator.is_some() || o.since_rev.is_some())
+    {
+        return Err(CliError::input(
+            "--focus несовместим с --tier, --section, --locator и --since-rev",
+        ));
+    }
     let mut items = Vec::with_capacity(targets.len());
     for t in targets {
         let mut it = json!({ "id": item_id(ctx, t)? });
@@ -292,6 +308,9 @@ fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
         }
         if let Some(v) = o.locator {
             it["locator"] = json!(v);
+        }
+        if let Some(v) = o.focus {
+            it["focus"] = json!(v);
         }
         items.push(it);
     }

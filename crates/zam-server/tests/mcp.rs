@@ -1495,6 +1495,72 @@ async fn mcp_read_locator() {
     assert!(o.text.contains("locator"), "{}", o.text);
 }
 
+/// `memory_read` с `focus` (M6 §6, задача 7b; zero-agent: раньше — 400 `unknown field focus`):
+/// поле объявлено в схеме, ответ — оглавление, лист и пропуски; без текста — ошибка инструмента.
+#[tokio::test]
+async fn mcp_read_focus() {
+    let a = api("mcp-read-focus", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let t = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_read")
+        .unwrap();
+    let props = &t["inputSchema"]["properties"]["items"]["items"]["properties"];
+    assert_eq!(props["focus"]["type"], "string", "{t}");
+    assert!(
+        props["tier"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("focus")),
+        "{t}"
+    );
+    let mut text = String::from("# Справочник\n\n");
+    for i in 1..=8 {
+        text.push_str(&format!("## Глава {i}\n\n"));
+        for k in 0..12 {
+            text.push_str(&format!(
+                "Абзац {k} главы {i} рассказывает о настройке и обслуживании сервера. "
+            ));
+        }
+        if i == 6 {
+            text.push_str("Здесь описан протокол квазиметрии. ");
+        }
+        text.push_str("\n\n");
+    }
+    let n = a.note("knowledge", "Справочник", &text).await;
+    let id = n["id"].as_str().unwrap();
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}"), "focus": "протокол квазиметрии"}],
+               "budget_tokens": 20000}),
+    )
+    .await;
+    assert!(o.text.contains("протокол квазиметрии"), "{}", o.text);
+    assert!(o.text.contains("Оглавление: "), "{}", o.text);
+    assert!(o.text.contains("*Глава 6"), "{}", o.text);
+    assert!(
+        o.text.contains("[пропущено: Справочник > Глава 1 · ~"),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("главы 2 "), "{}", o.text);
+    let o = tool(
+        &a,
+        &a.token,
+        &[],
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}"), "tier": "focus"}]}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("нужен текст focus"), "{}", o.text);
+}
+
 // ---- отчёты (M5.5, задача 5) ----
 
 /// PNG-подобные байты: сигнатура и `n` байт по `seed`.

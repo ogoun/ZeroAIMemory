@@ -5,6 +5,7 @@ mod common;
 
 use axum::http::{Method, StatusCode};
 use common::api::{Api, Resp, api, req};
+use common::read::{READ_L2_FIXTURE, l2_answers, l2_world, long_text};
 use serde_json::{Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{SeenKey, WHOLE_TARGET, count_tokens, seen_revs};
@@ -37,15 +38,6 @@ async fn insight(a: &Api, title: &str, body: &str) -> String {
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     id(&r.json())
-}
-
-/// Длинный текст: `n` строк по ~10 токенов.
-fn long_text(title: &str, n: usize) -> String {
-    let mut t = format!("# {title}\n\n");
-    for i in 0..n {
-        t.push_str(&format!("Строка номер {i} про квазар и далёкие звёзды.\n"));
-    }
-    t
 }
 
 /// Ревизия цели `node` целиком, выданной сессии, в базе пользователя `user`.
@@ -714,106 +706,7 @@ async fn read_section_ambiguous_invalid() {
     assert!(r.headers.get("x-zam-read-error").is_none());
 }
 
-// ---- эталон `/read` без сессии (M6 §7.3, задача 7a, шаг 0) ----
-
-/// Эталон ответа `POST /read` без сессии на 10 целях L2 (снят [`snapshot_read_l2_fixture`] до
-/// правки 7a): id заменены метками `<t0>`…`<t9>`, итог `total_tokens` — меткой `<total>`.
-/// Пометка «уже выдавалось» без сессии не появляется — ответ побайтово прежний.
-const READ_L2_FIXTURE: &str = "tests/fixtures/read_l2_m57.json";
-
-/// 10 целей L2: шесть заметок (заголовки, код, таблица, длинный текст, вложенная папка, пустая
-/// секция) и четыре записи (три insight разных видов и term; changelog — только в решении);
-/// `(сервер, id по порядку)`.
-async fn l2_world(name: &str) -> (Api, Vec<String>) {
-    let a = api(&format!("read-l2-{name}"), |_| {}).await;
-    let mut ids = Vec::new();
-    for (path, text) in [
-        (
-            "Инструменты/Bash",
-            "# Bash\n\nСкрипты пишите с LF.\n## Ловушки\nCRLF ломает shebang.\n",
-        ),
-        (
-            "Код/Пример",
-            "# Пример\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n",
-        ),
-        ("Таблица", "# Таблица\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"),
-        ("Длинная", &long_text("Длинная", 30)),
-        (
-            "Папка/Вложенная/Заметка",
-            "# Вложенная\n\nТекст вложенной заметки.\n",
-        ),
-        ("Пустая секция", "# Пусто\n## Ничего\n## Что-то\nтекст\n"),
-    ] {
-        ids.push(format!("n:{}", id(&a.note("knowledge", path, text).await)));
-    }
-    let entry = |body: Value| {
-        let a = &a;
-        async move {
-            let r = a
-                .t(Method::POST, "/api/v1/spaces/knowledge/entries", Some(body))
-                .await;
-            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-            id(&r.json())
-        }
-    };
-    let i1 = entry(
-        json!({"kind": "insight", "title": "LF в bash", "body": "Используйте LF.",
-                         "data": {"kind": "gotcha"}}),
-    )
-    .await;
-    let c = entry(
-        json!({"kind": "insight", "title": "Сбой разбора", "body": "Разбор падал.",
-                        "data": {"kind": "failure"}}),
-    )
-    .await;
-    let t = entry(
-        json!({"kind": "term", "title": "Выжимка", "body": "Подробности.",
-                        "data": {"definition": "Сводка ответа агента", "aliases": []}}),
-    )
-    .await;
-    let i2 = entry(
-        json!({"kind": "insight", "title": "Миграции", "body": "Ставьте lock_timeout.",
-                         "data": {"kind": "pattern"}}),
-    )
-    .await;
-    ids.push(format!("i:{i1}"));
-    ids.push(format!("i:{c}"));
-    ids.push(format!("t:{t}"));
-    ids.push(format!("i:{i2}"));
-    (a, ids)
-}
-
-/// Сырые ответы (тело как есть) в форматах `formats` с метками вместо id: `{формат: текст}`;
-/// `session` — с этой сессией. Итог (`total_tokens`, строка `~N tok`) зависит от токенизации
-/// случайных id в заголовках — он заменён меткой `<total>`.
-async fn l2_answers(a: &Api, ids: &[String], session: Option<&str>, formats: &[&str]) -> Value {
-    let items: Vec<Value> = ids.iter().map(|i| json!({"id": i})).collect();
-    let mut out = serde_json::Map::new();
-    for &format in formats {
-        let mut body = json!({"items": items, "format": format, "budget_tokens": 5000});
-        if let Some(s) = session {
-            body["session_id"] = json!(s);
-        }
-        let r = read(a, body).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-        let t = r.text();
-        let mut text = if format == "json" {
-            let at = t.rfind("\"total_tokens\":").unwrap();
-            let end = at + t[at..].find('}').unwrap();
-            format!("{}\"total_tokens\":\"<total>\"{}", &t[..at], &t[end..])
-        } else {
-            let last = t.trim_end().rfind('\n').map_or(0, |i| i + 1);
-            assert!(t[last..].starts_with('~'), "{t}");
-            format!("{}~<total> tok\n", &t[..last])
-        };
-        for (k, i) in ids.iter().enumerate() {
-            let bare = i.split_once(':').unwrap().1;
-            text = text.replace(bare, &format!("<t{k}>"));
-        }
-        out.insert(format.to_string(), json!(text));
-    }
-    Value::Object(out)
-}
+// ---- эталон `/read` без сессии (M6 §7.3, задача 7a, шаг 0; мир — `common::read`) ----
 
 /// Снимает эталон [`READ_L2_FIXTURE`] (до правки 7a: ответ v0.0.10-m5.7 + задачи 1–6 M6).
 #[tokio::test]

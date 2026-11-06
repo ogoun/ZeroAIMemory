@@ -1314,6 +1314,87 @@ pub async fn leaf_term_hits(
     .await
 }
 
+/// Лист цели фокуса: текст, размер, ключ кэша эмбеддинга и число слов фокуса, найденных FTS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusLeaf {
+    pub chunk_id: String,
+    pub heading_path: String,
+    pub ordinal: i64,
+    /// `locator` чанка документа (у листов заметки — `None`).
+    pub locator: Option<String>,
+    pub text: String,
+    /// Размер листа счётчиком чанкера (`chunks.token_count`).
+    pub token_count: usize,
+    /// Ревизия, с которой нарезан лист (у документа — 0).
+    pub rev: i64,
+    pub embed_key: String,
+    /// Сколько слов фокуса (`needles`, как запрос [`sanitize_fts`]) найдено в листе.
+    pub hits: usize,
+}
+
+/// Листы цели явного фокуса `/read` (M6 §6) по порядку и совпадения слов `needles` (FTS5,
+/// только `rowid`) — в одной читающей транзакции, как [`leaf_term_hits`]. Узел и запись журнала —
+/// листы `level = 'chunk'`, документ вложения (`TargetKind::Attachment`) — его чанки.
+pub async fn focus_leaves(
+    db: &Db,
+    target: TargetRef,
+    needles: Vec<String>,
+) -> Result<Vec<FocusLeaf>, StoreError> {
+    let (col, level) = match target.kind {
+        TargetKind::Node => ("node_id", "chunk"),
+        TargetKind::Entry => ("entry_id", "chunk"),
+        TargetKind::Attachment => ("attachment_id", "attachment"),
+    };
+    let id = target.id;
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let mut st = tx.prepare_cached(&format!(
+            "SELECT seq, id, heading_path, ordinal, locator, text, rev, embed_key, token_count
+             FROM chunks
+             WHERE {col} = ?1 AND {col} IS NOT NULL AND level = ?2 ORDER BY ordinal"
+        ))?;
+        let rows = st.query_map(params![id, level], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                FocusLeaf {
+                    chunk_id: r.get(1)?,
+                    heading_path: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    ordinal: r.get(3)?,
+                    locator: r.get(4)?,
+                    text: r.get(5)?,
+                    rev: r.get(6)?,
+                    embed_key: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    token_count: usize::try_from(r.get::<_, i64>(8)?).unwrap_or(0),
+                    hits: 0,
+                },
+            ))
+        })?;
+        let mut seqs: HashMap<i64, usize> = HashMap::new();
+        let mut leaves = Vec::new();
+        for row in rows {
+            let (seq, l) = row?;
+            seqs.insert(seq, leaves.len());
+            leaves.push(l);
+        }
+        if leaves.is_empty() {
+            return Ok(leaves);
+        }
+        let mut st = tx.prepare_cached("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1")?;
+        for n in needles.iter().take(MAX_TERMS) {
+            let Some(fts) = sanitize_fts(n) else {
+                continue;
+            };
+            for seq in st.query_map([fts], |r| r.get::<_, i64>(0))? {
+                if let Some(&i) = seqs.get(&seq?) {
+                    leaves[i].hits += 1;
+                }
+            }
+        }
+        Ok(leaves)
+    })
+    .await
+}
+
 /// Тексты соседних листов того же узла: `(предыдущий, следующий)` по `ordinal`
 /// (`expand=neighbors`). Нет чанка или он не лист — `(None, None)`.
 pub async fn neighbor_leaves(
