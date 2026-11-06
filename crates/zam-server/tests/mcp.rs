@@ -3377,3 +3377,230 @@ async fn memory_log_warnings_line_per_warning() {
     assert!(lines[0].starts_with("Записано i:"), "{}", o.text);
     assert!(!o.text.contains(&key), "{}", o.text);
 }
+
+// ---- источник выжимки в том же ответе (M6 §7.1, решение контролёра 2026-11-06) ----
+
+/// Пометка карточки MCP: выдавалось, текст источника — в выжимке этого же ответа.
+const IN_CACHE: &str = "(выдавалось, в выжимке)";
+
+/// Текст из двух секций о квазаре, каждая длиннее чанка: карточки секций — отдельные.
+fn section_note() -> String {
+    let mut t = String::from("# Квазар\n\n## Яркость\nКвазар светит ярко.\n");
+    for i in 0..60 {
+        t.push_str(&format!("Строка {i}: свет квазара виден издалека.\n"));
+    }
+    t.push_str("\n## Расстояние\nКвазар далеко и квазар стар.\n");
+    for i in 0..60 {
+        t.push_str(&format!("Строка {i}: до квазара миллиарды лет пути.\n"));
+    }
+    t
+}
+
+/// Заметка с двумя секциями о квазаре; id узла.
+async fn quasar_sections(a: &Api) -> String {
+    let n = a.note("knowledge", "Астро/Квазар2", &section_note()).await;
+    n["id"].as_str().unwrap().to_string()
+}
+
+/// Под карточкой цели `n:<id>` есть строка фрагмента (с отступом).
+fn fragment_under(text: &str, id: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .iter()
+        .position(|l| l.contains(&format!("n:{id}")))
+        .is_some_and(|k| lines.get(k + 1).is_some_and(|l| l.starts_with("   ")))
+}
+
+/// Сессия получила цель целиком (`memory_read`), затем выжимка по ней (`memory_cache_put`).
+async fn read_and_cache(a: &Api, h: &[(&str, &str)], query: &str, sources: Value) {
+    for s in sources.as_array().unwrap() {
+        ok(
+            a,
+            &a.token,
+            h,
+            "memory_read",
+            json!({"items": [{"id": s["id"]}], "budget_tokens": 8000}),
+        )
+        .await;
+    }
+    let o = ok(
+        a,
+        &a.token,
+        h,
+        "memory_cache_put",
+        json!({"query": query, "summary": "Сводка: объект яркий.", "sources": sources}),
+    )
+    .await;
+    assert!(o.text.contains("c_"), "{}", o.text);
+}
+
+/// Карточка `(выдавалось)`, чья цель — источник действующей выжимки этого же ответа: без
+/// фрагмента и с пометкой `(выдавалось, в выжимке)`; в JSON — `seen: true`, `in_cache: true`,
+/// без `snippet`. Выжимка в ответе есть (`[cache] … все актуальны`).
+#[tokio::test]
+async fn mcp_seen_cache_source_without_fragment() {
+    let a = api("mcp-cache-source", |_| {}).await;
+    let id = quasar(&a).await;
+    let h = sess();
+    let q = "чем светит квазар";
+    read_and_cache(&a, &h, q, json!([{"id": format!("n:{id}"), "rev": 1}])).await;
+    let o = ok(&a, &a.token, &h, "memory_search", json!({"query": q})).await;
+    assert!(
+        o.text.contains("[cache]") && o.text.contains("все актуальны"),
+        "{}",
+        o.text
+    );
+    assert!(
+        o.text.contains("Сводка: объект яркий."),
+        "выжимка в ответе: {}",
+        o.text
+    );
+    let card = o
+        .text
+        .lines()
+        .find(|l| l.contains(&format!("n:{id}")))
+        .unwrap_or_else(|| panic!("нет карточки: {}", o.text));
+    assert!(card.ends_with(IN_CACHE), "{card}");
+    // под карточкой нет строки фрагмента (в тексте выдачи «светит» — только в запросе выжимки)
+    let lines: Vec<&str> = o.text.lines().collect();
+    let k = lines.iter().position(|l| *l == card).unwrap();
+    assert!(
+        !lines.get(k + 1).is_some_and(|l| l.starts_with("   ")),
+        "фрагмента нет: {}",
+        o.text
+    );
+    assert!(!o.text.contains("**светит**"), "{}", o.text);
+    let j = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": q, "format": "json"}),
+    )
+    .await;
+    let v = j.json();
+    let it = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["node_id"] == id.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(it["seen"], true, "{it}");
+    assert_eq!(it["in_cache"], true, "{it}");
+    assert!(it.get("snippet").is_none(), "{it}");
+    assert_eq!(v["items"][0]["kind"], "cache", "{v}");
+}
+
+/// Отрицательные: выжимки в ответе нет (другой запрос — кэш не находит; у MCP нет `no_cache`),
+/// выжимка `stale`, явный `skip_seen: false` —
+/// карточка с фрагментом, как по §7.1.
+#[tokio::test]
+async fn mcp_seen_cache_source_keeps_fragment_otherwise() {
+    let a = api("mcp-cache-source-neg", |_| {}).await;
+    let id = quasar(&a).await;
+    let other = a
+        .note(
+            "knowledge",
+            "Астро/Пульсар",
+            "# Пульсар\n\nПульсар мигает.\n",
+        )
+        .await;
+    let other = other["id"].as_str().unwrap().to_string();
+    let h = sess();
+    let q = "чем светит квазар";
+    read_and_cache(
+        &a,
+        &h,
+        q,
+        json!([{"id": format!("n:{id}"), "rev": 1}, {"id": format!("n:{other}"), "rev": 1}]),
+    )
+    .await;
+    let card = |text: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(&format!("n:{id}")))
+            .unwrap_or_else(|| panic!("нет карточки: {text}"))
+            .to_string()
+    };
+    // выжимки в ответе нет — фрагмент остаётся
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар ярко"}),
+    )
+    .await;
+    assert!(!o.text.contains("[cache"), "{}", o.text);
+    assert!(card(&o.text).ends_with("(выдавалось)"), "{}", o.text);
+    assert!(fragment_under(&o.text, &id), "{}", o.text);
+    // явный `skip_seen: false` — фрагмент без пометки
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": q, "skip_seen": false}),
+    )
+    .await;
+    assert!(o.text.contains("[cache]"), "{}", o.text);
+    assert!(!card(&o.text).contains("(выдавалось"), "{}", o.text);
+    assert!(fragment_under(&o.text, &id), "{}", o.text);
+    // второй источник изменился — `[cache, stale: …]`: фрагмент у первого остаётся
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{other}"),
+            Some(json!({"content": "# Пульсар\n\nПульсар мигает часто.\n"})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let o = ok(&a, &a.token, &h, "memory_search", json!({"query": q})).await;
+    assert!(o.text.contains("[cache, stale:"), "{}", o.text);
+    assert!(card(&o.text).ends_with("(выдавалось)"), "{}", o.text);
+    assert!(fragment_under(&o.text, &id), "{}", o.text);
+}
+
+/// Источник — секция: без фрагмента только карточка этой секции, карточка другой секции той же
+/// заметки — `(выдавалось)` с фрагментом.
+#[tokio::test]
+async fn mcp_seen_cache_section_source_only_that_section() {
+    let a = api("mcp-cache-section", |_| {}).await;
+    let id = quasar_sections(&a).await;
+    let h = sess();
+    let q = "квазар";
+    read_and_cache(
+        &a,
+        &h,
+        q,
+        json!([{"id": format!("n:{id}"), "rev": 1, "section": "Квазар > Яркость"}]),
+    )
+    .await;
+    let o = ok(&a, &a.token, &h, "memory_search", json!({"query": q})).await;
+    assert!(o.text.contains("все актуальны"), "{}", o.text);
+    let lines: Vec<&str> = o.text.lines().collect();
+    // карточки секции и есть ли под ними фрагмент (строка с отступом)
+    let cards = |sec: &str| -> Vec<(&str, bool)> {
+        (0..lines.len())
+            .filter(|&k| lines[k].contains(&format!("n:{id}")) && lines[k].contains(sec))
+            .map(|k| {
+                (
+                    lines[k],
+                    lines.get(k + 1).is_some_and(|l| l.starts_with("   ")),
+                )
+            })
+            .collect()
+    };
+    let bright = cards("› Квазар > Яркость");
+    let far = cards("› Квазар > Расстояние");
+    assert!(!bright.is_empty(), "нет карточки «Яркость»: {}", o.text);
+    assert!(!far.is_empty(), "нет карточки «Расстояние»: {}", o.text);
+    for (l, frag) in bright {
+        assert!(l.ends_with(IN_CACHE) && !frag, "{l}: {}", o.text);
+    }
+    for (l, frag) in far {
+        assert!(l.ends_with("(выдавалось)") && frag, "{l}: {}", o.text);
+    }
+}

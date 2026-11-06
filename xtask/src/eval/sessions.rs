@@ -764,6 +764,7 @@ pub fn fixed_ids(text: &str) -> String {
 fn marked_seen(line: &str) -> bool {
     line.contains("(seen)")
         || line.contains("(выдавалось)")
+        || line.contains("(выдавалось, в выжимке)")
         || line.contains("· уже выдавалось в этой сессии")
 }
 
@@ -3413,6 +3414,10 @@ type = "checkpoint"
         )));
         assert!(!marked_seen(&format!(
             "### i:{ID_INS} insight/gotcha «x»  active · rev1 · ~5 tok"
+        )));
+        // карточка источника выжимки того же ответа (M6 §7.1, решение контролёра 2026-11-06)
+        assert!(marked_seen(&format!(
+            "1. i:{ID_INS} insight/gotcha «x»  [1.0] hyp · 64t   (выдавалось, в выжимке)"
         )));
     }
 

@@ -735,6 +735,12 @@ ideas_recall.rs,read_batch.rs}`, `crates/zam-cli/tests/hooks.rs`.
   --test recall --test ideas_recall --test read_batch $T`; `cargo test -p zam-cli --test hooks $T` —
   PASS.
 - [ ] **Step 3: Commit** `feat(sessions): эпохи seen и пометка «уже выдавалось»`.
+- [ ] **Step 4 (решение контролёра 2026-11-06, ревью задачи 7a):** карточка MCP `(выдавалось)`
+  источника действующей выжимки `[cache]` того же ответа — без фрагмента, `(выдавалось, в
+  выжимке)` (спецификация §7.1). Тесты `mcp_seen_cache_source_without_fragment` и отрицательные
+  (stale, другая секция, `skip_seen: false`, выжимки нет в ответе); короткий перезамер `repeat`
+  ТС-2 dev (гибрид, `--repeat 2`, по профилям). Commit `feat(search): карточка (выдавалось) без
+  фрагмента при выжимке в ответе`.
 
 ### Task 7b: Явный фокус (§6)
 

@@ -31,6 +31,16 @@ pub(super) struct CacheItem {
 }
 
 impl CacheItem {
+    /// Источники **действующей** выжимки (у `stale` — пусто): карточку `(выдавалось)` такого
+    /// источника этот же ответ отдаёт без фрагмента (M6 §7.1, решение контролёра 2026-11-06).
+    pub(super) fn valid_sources(&self) -> &[zam_store::CacheDep] {
+        if self.hit.is_valid() {
+            &self.hit.entry.sources
+        } else {
+            &[]
+        }
+    }
+
     /// Токены выданного текста (у недействительной текста нет).
     pub(super) fn tokens(&self) -> usize {
         if self.hit.is_valid() {

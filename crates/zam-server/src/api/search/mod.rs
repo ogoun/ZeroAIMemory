@@ -27,7 +27,12 @@
 //!   `X-Zam-Session`, поиск не видит. Запрос из инструмента MCP без явного `skip_seen`
 //!   помечает выданное (`seen: true`, в md — `(выдавалось)`), но оставляет фрагмент и текст:
 //!   субагенты на общем подключении MCP приходят с сессией родителя. Выданным считается только
-//!   отмеченное в текущей эпохе сессии (M6 §7.2): после сжатия контекста — снова фрагмент;
+//!   отмеченное в текущей эпохе сессии (M6 §7.2): после сжатия контекста — снова фрагмент.
+//!   Исключение (решение контролёра 2026-11-06, §7.1): карточка `(выдавалось)`, чья цель — источник
+//!   действующей выжимки шага 0 **этого же** ответа (та же цель и ревизия; у источника-секции —
+//!   только карточки этой секции и вложенных в неё), идёт без фрагмента и текста с пометкой
+//!   `(выдавалось, в выжимке)`, в JSON — `seen: true`, `in_cache: true` ([`mark_cache_sources`]):
+//!   текст источника уже в ответе; у `[cache, stale: …]` фрагмент остаётся;
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release`, `attachment`
 //!   (фрагменты вложений, M5; см. «Вложения») — по умолчанию все, `folder` — карточки папок
 //!   (см. «Папки»); `filters.status` — статусы insight (по умолчанию `active`,
@@ -937,6 +942,9 @@ struct Item {
     /// Уже выдан, но фрагмент и текст оставлены (запрос MCP без явного `skip_seen: true`,
     /// M6 §7.1: субагенты на общем подключении): пометка «(выдавалось)» вместо `(seen)`.
     seen_kept: bool,
+    /// Уже выдан, и текст цели — в действующей выжимке этого же ответа (M6 §7.1, решение
+    /// контролёра 2026-11-06): без фрагмента, пометка «(выдавалось, в выжимке)».
+    in_cache: bool,
     /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
     stale_refs: Vec<String>,
 }
@@ -1706,6 +1714,9 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Tim
         }
     }
     o.insert("seen".into(), json!(p.item.seen));
+    if p.item.in_cache {
+        o.insert("in_cache".into(), json!(true));
+    }
     if !p.item.stale_refs.is_empty() {
         o.insert("stale_refs".into(), json!(p.item.stale_refs));
     }
@@ -1905,7 +1916,9 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
         if line.ends_with('\n') {
             line.pop();
         }
-        line.push_str(if p.item.seen_kept {
+        line.push_str(if p.item.in_cache {
+            "   (выдавалось, в выжимке)\n"
+        } else if p.item.seen_kept {
             "   (выдавалось)\n"
         } else {
             "   (seen)\n"
@@ -2139,6 +2152,7 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
         folder: Some(f.child_count),
         seen: false,
         seen_kept: false,
+        in_cache: false,
         stale_refs: Vec::new(),
     }
 }
@@ -2207,6 +2221,32 @@ async fn mark_seen_items(
         }
     }
     Ok(())
+}
+
+/// Карточки `(выдавалось)` (MCP, `seen_kept`), чья цель — источник действующей выжимки шага 0
+/// этого ответа (`cache`), — без фрагмента и текста, `in_cache` (M6 §7.1, решение контролёра
+/// 2026-11-06): цель и ревизия совпадают с источником точно; источник-секция покрывает только
+/// карточки своей секции и вложенных в неё (`heading_path` — она же или начинается с `<секция> > `).
+fn mark_cache_sources(cache: &[cache_step::CacheItem], items: &mut [Item]) {
+    let deps: Vec<&zam_store::CacheDep> = cache.iter().flat_map(|c| c.valid_sources()).collect();
+    if deps.is_empty() {
+        return;
+    }
+    let covers = |d: &zam_store::CacheDep, it: &Item| {
+        d.target == it.hit.target
+            && d.rev == it.hit.rev
+            && d.section.as_deref().is_none_or(|sec| {
+                let hp = it.hit.heading_path.as_str();
+                hp == sec || hp.strip_prefix(sec).is_some_and(|r| r.starts_with(" > "))
+            })
+    };
+    for it in items.iter_mut().filter(|it| it.seen && it.seen_kept) {
+        if deps.iter().any(|d| covers(d, it)) {
+            it.seen_kept = false;
+            it.in_cache = true;
+            it.text = None;
+        }
+    }
 }
 
 /// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
@@ -2631,6 +2671,7 @@ pub async fn search(
                 folder: None,
                 seen: false,
                 seen_kept: false,
+                in_cache: false,
                 stale_refs: Vec::new(),
             })
         })
@@ -2747,6 +2788,8 @@ pub async fn search(
     {
         session_failed("чтение выданного", &e);
     }
+    // источник выжимки этого ответа — без фрагмента (M6 §7.1, решение контролёра 2026-11-06)
+    mark_cache_sources(&cache_items, &mut items);
     // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется
     attach_stale_refs(&targets, &mut items).await;
     // лист с секретом в имени — номером, как в `/read` (задача 7 M5, раунд правок 2)
@@ -2896,6 +2939,7 @@ mod tests {
                 folder: None,
                 seen: false,
                 seen_kept: false,
+                in_cache: false,
                 stale_refs: Vec::new(),
             })
             .collect()

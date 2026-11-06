@@ -174,6 +174,7 @@ pub(super) async fn expand_graph(
                 folder: None,
                 seen: false,
                 seen_kept: false,
+                in_cache: false,
                 stale_refs: Vec::new(),
             }
         })
