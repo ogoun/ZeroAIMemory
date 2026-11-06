@@ -9,12 +9,20 @@
 //!   (токены, одна выдача) или `{calls, tokens}` (пачка, которую хук копил до сетевого
 //!   вызова); прочие ключи и значения вне `0..=`[`TOKENS_MAX`] — 400 (события `/recall`
 //!   сервер считает сам);
+//! - `POST /sessions {id, new_epoch: true}` → 201 `{id, epoch}` (M6 §7.2): новая эпоха
+//!   `session_seen` — выданное раньше выданным больше не считается (`(seen)`, подсказки,
+//!   «уже выдавалось»; показ идей — без эпохи). Шлёт хук `checkpoint` на `PreCompact`
+//!   отдельным запросом: старый сервер отвечает на неизвестное поле 400, и хук молча
+//!   продолжает. Без `id` — 400; сессии нет — она создаётся с эпохой 1. Прочие источники
+//!   новой эпохи — `/recall` (`session_start` с `source` `compact | resume | clear`,
+//!   `event: recovery`);
 //! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
 //! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, parent_id, agent_type,
-//!   started_at, last_seen_at, ended_at, memory_writes, claimed_tasks: [{id, title, status}],
-//!   tokens: {<событие>: {calls, tokens}}}` (решение контроллера R6, читает хук `checkpoint`;
-//!   `claimed_tasks` — задачи журнала, захваченные сессией, M4.5; `tokens` — выданное сессии
-//!   по событию, §9.5);
+//!   started_at, last_seen_at, ended_at, memory_writes, seen_epoch, claimed_tasks: [{id, title,
+//!   status}], tokens: {<событие>: {calls, tokens, reread_calls?}}}` (решение контроллера R6,
+//!   читает хук `checkpoint`; `claimed_tasks` — задачи журнала, захваченные сессией, M4.5;
+//!   `tokens` — выданное сессии по событию, §9.5; `reread_calls` — повторные выдачи `/read`,
+//!   есть только ненулевое, M6 §7.3; `seen_epoch` — эпоха `session_seen`, M6 §7.2);
 //! - `GET /sessions?solution=&limit=` → `{items}` — свои, свежие первыми (50, до 500);
 //! - `GET /sessions/unattributed?days=N` → `{items: [{day, event, calls, tokens}]}` — выданное
 //!   без явной сессии по суткам UTC (M6 §7.1, [`unattributed`]).
@@ -46,8 +54,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, claimed_tasks,
-    end_session, get_session, list_sessions, list_spaces, session_tokens, touch_session,
+    Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, bump_epoch,
+    claimed_tasks, end_session, get_session, list_sessions, list_spaces, session_epoch,
+    session_tokens, touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -97,6 +106,12 @@ pub struct McpOrigin {
 
 /// Сессия запроса без записи: `session_id` из тела сильнее `X-Zam-Session`; `None` — запрос
 /// без сессии. Некорректный id — 400. `origin` — признак MCP из расширений запроса.
+///
+/// У явной сессии `touch.epoch` — текущая эпоха `session_seen` (M6 §7.2), прочитанная здесь,
+/// в начале запроса: и чтение выданного, и отметки запроса идут в неё. Новая эпоха, пришедшая
+/// во время запроса, отметки не переносит — запрос отметит выданное в прежней эпохе, и оно
+/// один раз повторится (журнал задачи 2, M5: перенос отметки в новую эпоху спрятал бы текст,
+/// который агент потерял при сжатии контекста). Неявной сессии эпоха не нужна.
 pub async fn request_session(
     st: &AppState,
     p: &Principal,
@@ -115,6 +130,10 @@ pub async fn request_session(
     // id в теле агент задал сам; заголовок неявен, только если его подставил MCP
     let body = body_session.is_some_and(|s| !s.trim().is_empty());
     let explicit = body || !origin.is_some_and(|o| o.implicit);
+    let mut touch = touch;
+    if explicit {
+        touch.epoch = session_epoch(&db, &touch.id).await?;
+    }
     Ok(Some(RequestSession {
         touch,
         db,
@@ -154,6 +173,8 @@ pub struct NewSession {
     parent_id: Option<String>,
     agent_type: Option<String>,
     tokens: Option<serde_json::Map<String, Value>>,
+    /// Новая эпоха `session_seen` (M6 §7.2); нужен `id`.
+    new_epoch: Option<bool>,
 }
 
 /// Прибавки `tokens` тела `POST /sessions` (см. модуль).
@@ -189,6 +210,7 @@ fn local_tokens(m: &serde_json::Map<String, Value>) -> Result<Vec<TokenCount>, A
             event: k.clone(),
             calls,
             tokens,
+            reread_calls: 0,
         });
     }
     Ok(out)
@@ -213,8 +235,13 @@ pub async fn create(
         .transpose()?;
     let tokens = req.tokens.as_ref().map(local_tokens).transpose()?;
     let blank = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let new_epoch = req.new_epoch == Some(true);
+    let id = blank(req.id);
+    if new_epoch && id.is_none() {
+        return Err(ApiError::BadRequest("new_epoch: нужен id сессии".into()));
+    }
     let touch = SessionTouch {
-        id: blank(req.id).unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        id: id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
         token_id: p.token_id(),
         solution_guid,
         area: blank(req.area),
@@ -229,6 +256,13 @@ pub async fn create(
     match tokens.filter(|t| !t.is_empty()) {
         Some(t) => add_token_counts(&db, &touch, &t).await?,
         None => touch_session(&db, &touch).await?,
+    }
+    if new_epoch {
+        let epoch = bump_epoch(&db, &touch.id).await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(json!({ "id": touch.id, "epoch": epoch })),
+        ));
     }
     Ok((StatusCode::CREATED, Json(json!({ "id": touch.id }))))
 }

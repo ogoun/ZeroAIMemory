@@ -713,3 +713,277 @@ async fn read_section_ambiguous_invalid() {
     let r = read(&a, json!({"items": [{"id": &nid}]})).await;
     assert!(r.headers.get("x-zam-read-error").is_none());
 }
+
+// ---- эталон `/read` без сессии (M6 §7.3, задача 7a, шаг 0) ----
+
+/// Эталон ответа `POST /read` без сессии на 10 целях L2 (снят [`snapshot_read_l2_fixture`] до
+/// правки 7a): id заменены метками `<t0>`…`<t9>`, итог `total_tokens` — меткой `<total>`.
+/// Пометка «уже выдавалось» без сессии не появляется — ответ побайтово прежний.
+const READ_L2_FIXTURE: &str = "tests/fixtures/read_l2_m57.json";
+
+/// 10 целей L2: шесть заметок (заголовки, код, таблица, длинный текст, вложенная папка, пустая
+/// секция) и четыре записи (три insight разных видов и term; changelog — только в решении);
+/// `(сервер, id по порядку)`.
+async fn l2_world(name: &str) -> (Api, Vec<String>) {
+    let a = api(&format!("read-l2-{name}"), |_| {}).await;
+    let mut ids = Vec::new();
+    for (path, text) in [
+        (
+            "Инструменты/Bash",
+            "# Bash\n\nСкрипты пишите с LF.\n## Ловушки\nCRLF ломает shebang.\n",
+        ),
+        (
+            "Код/Пример",
+            "# Пример\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n",
+        ),
+        ("Таблица", "# Таблица\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"),
+        ("Длинная", &long_text("Длинная", 30)),
+        (
+            "Папка/Вложенная/Заметка",
+            "# Вложенная\n\nТекст вложенной заметки.\n",
+        ),
+        ("Пустая секция", "# Пусто\n## Ничего\n## Что-то\nтекст\n"),
+    ] {
+        ids.push(format!("n:{}", id(&a.note("knowledge", path, text).await)));
+    }
+    let entry = |body: Value| {
+        let a = &a;
+        async move {
+            let r = a
+                .t(Method::POST, "/api/v1/spaces/knowledge/entries", Some(body))
+                .await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+            id(&r.json())
+        }
+    };
+    let i1 = entry(
+        json!({"kind": "insight", "title": "LF в bash", "body": "Используйте LF.",
+                         "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let c = entry(
+        json!({"kind": "insight", "title": "Сбой разбора", "body": "Разбор падал.",
+                        "data": {"kind": "failure"}}),
+    )
+    .await;
+    let t = entry(
+        json!({"kind": "term", "title": "Выжимка", "body": "Подробности.",
+                        "data": {"definition": "Сводка ответа агента", "aliases": []}}),
+    )
+    .await;
+    let i2 = entry(
+        json!({"kind": "insight", "title": "Миграции", "body": "Ставьте lock_timeout.",
+                         "data": {"kind": "pattern"}}),
+    )
+    .await;
+    ids.push(format!("i:{i1}"));
+    ids.push(format!("i:{c}"));
+    ids.push(format!("t:{t}"));
+    ids.push(format!("i:{i2}"));
+    (a, ids)
+}
+
+/// Сырые ответы (тело как есть) в форматах `formats` с метками вместо id: `{формат: текст}`;
+/// `session` — с этой сессией. Итог (`total_tokens`, строка `~N tok`) зависит от токенизации
+/// случайных id в заголовках — он заменён меткой `<total>`.
+async fn l2_answers(a: &Api, ids: &[String], session: Option<&str>, formats: &[&str]) -> Value {
+    let items: Vec<Value> = ids.iter().map(|i| json!({"id": i})).collect();
+    let mut out = serde_json::Map::new();
+    for &format in formats {
+        let mut body = json!({"items": items, "format": format, "budget_tokens": 5000});
+        if let Some(s) = session {
+            body["session_id"] = json!(s);
+        }
+        let r = read(a, body).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let t = r.text();
+        let mut text = if format == "json" {
+            let at = t.rfind("\"total_tokens\":").unwrap();
+            let end = at + t[at..].find('}').unwrap();
+            format!("{}\"total_tokens\":\"<total>\"{}", &t[..at], &t[end..])
+        } else {
+            let last = t.trim_end().rfind('\n').map_or(0, |i| i + 1);
+            assert!(t[last..].starts_with('~'), "{t}");
+            format!("{}~<total> tok\n", &t[..last])
+        };
+        for (k, i) in ids.iter().enumerate() {
+            let bare = i.split_once(':').unwrap().1;
+            text = text.replace(bare, &format!("<t{k}>"));
+        }
+        out.insert(format.to_string(), json!(text));
+    }
+    Value::Object(out)
+}
+
+/// Снимает эталон [`READ_L2_FIXTURE`] (до правки 7a: ответ v0.0.10-m5.7 + задачи 1–6 M6).
+#[tokio::test]
+#[ignore = "снимает эталон; запускать только на коде до правки M6 §7.3"]
+async fn snapshot_read_l2_fixture() {
+    let (a, ids) = l2_world("snap").await;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(READ_L2_FIXTURE);
+    let v = l2_answers(&a, &ids, None, &["json", "md"]).await;
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap() + "\n").unwrap();
+}
+
+/// Без сессии — побайтово как эталон до 7a; с сессией первое чтение — так же (пометки нет).
+#[tokio::test]
+async fn read_without_session_byte_equal_m57() {
+    let want: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(READ_L2_FIXTURE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let (a, ids) = l2_world("eq").await;
+    let got = l2_answers(&a, &ids, None, &["json", "md"]).await;
+    for f in ["json", "md"] {
+        assert_eq!(got[f], want[f], "{f}");
+    }
+    // первое чтение в сессии — тот же ответ (пометки ещё нет)
+    let got = l2_answers(&a, &ids, Some("s-first"), &["json"]).await;
+    assert_eq!(got["json"], want["json"]);
+}
+
+// ---- «уже выдавалось» (M6 §7.3, задача 7a) ----
+
+/// Пометка заголовка `/read` о повторной выдаче.
+const REREAD: &str = " · уже выдавалось в этой сессии";
+
+async fn read_in(a: &Api, session: &str, body: Value) -> Resp {
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            READ,
+            Some(body),
+            &[("x-zam-session", session)],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r
+}
+
+/// Цель, выданная сессии целиком в той же ревизии и эпохе, снова отдаётся **полным текстом** с
+/// пометкой в заголовке (md) и `seen: true` (json); первое чтение, другая сессия, новая
+/// ревизия, секция и L1 — без пометки.
+#[tokio::test]
+async fn reread_full_text_with_mark() {
+    let a = api("read-reread", |_| {}).await;
+    let text = "# A\nПервое.\n## B\nТекст B.\n";
+    let n = id(&a.note("knowledge", "Повтор", text).await);
+    let e = insight(&a, "LF в bash", "Используйте LF.").await;
+    let items = json!([{"id": format!("n:{n}")}, {"id": format!("i:{e}")}]);
+    let first = read_in(&a, "rr", json!({"items": items, "format": "md"}))
+        .await
+        .text();
+    assert!(!first.contains(REREAD), "{first}");
+    let again = read_in(&a, "rr", json!({"items": items, "format": "md"}))
+        .await
+        .text();
+    let heads: Vec<&str> = again.lines().filter(|l| l.starts_with("### ")).collect();
+    assert_eq!(heads.len(), 2, "{again}");
+    for h in &heads {
+        assert!(h.ends_with(&format!(" tok{REREAD}")), "{h}");
+    }
+    // текст тот же, полный
+    assert_eq!(
+        again
+            .replace(REREAD, "")
+            .lines()
+            .filter(|l| !l.starts_with('~'))
+            .collect::<Vec<_>>(),
+        first
+            .lines()
+            .filter(|l| !l.starts_with('~'))
+            .collect::<Vec<_>>()
+    );
+    let j = read_in(&a, "rr", json!({"items": items})).await.json();
+    for it in j["items"].as_array().unwrap() {
+        assert_eq!(it["seen"], true, "{it}");
+    }
+    assert_eq!(j["items"][0]["text"], text);
+    // другая сессия и без сессии — без пометки
+    let j = read_in(&a, "rr-other", json!({"items": items}))
+        .await
+        .json();
+    assert!(j["items"][0].get("seen").is_none(), "{j}");
+    let j = read_ok(&a, json!({"items": items})).await;
+    assert!(j["items"][0].get("seen").is_none(), "{j}");
+    // секция и L1 — не полный текст: без пометки
+    let j = read_in(
+        &a,
+        "rr",
+        json!({"items": [{"id": format!("n:{n}"), "section": "A > B"},
+                         {"id": format!("n:{n}"), "tier": "L1"}]}),
+    )
+    .await
+    .json();
+    for it in j["items"].as_array().unwrap() {
+        assert!(it.get("seen").is_none(), "{it}");
+    }
+    // новая ревизия — без пометки, затем снова с ней
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{n}"),
+            Some(json!({"content": "# A\nВторое.\n"})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = read_in(&a, "rr", json!({"items": [{"id": format!("n:{n}")}]}))
+        .await
+        .json();
+    assert!(j["items"][0].get("seen").is_none(), "{j}");
+    assert_eq!(j["items"][0]["text"], "# A\nВторое.\n");
+    let j = read_in(&a, "rr", json!({"items": [{"id": format!("n:{n}")}]}))
+        .await
+        .json();
+    assert_eq!(j["items"][0]["seen"], true, "{j}");
+}
+
+/// Повторная выдача считается в `session_tokens.reread_calls` строки события `read`: +1 на
+/// вызов `/read` с пометкой (сколько бы целей ни было помечено); первое чтение — 0, строки нет.
+#[tokio::test]
+async fn reread_counter_in_session_tokens() {
+    let a = api("read-reread-count", |_| {}).await;
+    let n = id(&a.note("knowledge", "Счёт", "# С\nтекст\n").await);
+    let e = insight(&a, "LF в bash", "Используйте LF.").await;
+    let items = json!([{"id": format!("n:{n}")}, {"id": format!("i:{e}")}]);
+    let tokens =
+        || async { a.t(Method::GET, "/api/v1/sessions/rc", None).await.json()["tokens"].clone() };
+    read_in(&a, "rc", json!({"items": items})).await;
+    assert!(tokens().await.get("read").is_none(), "{}", tokens().await);
+    read_in(&a, "rc", json!({"items": items})).await;
+    assert_eq!(
+        tokens().await["read"]["reread_calls"],
+        1,
+        "{}",
+        tokens().await
+    );
+    read_in(
+        &a,
+        "rc",
+        json!({"items": [{"id": format!("n:{n}")}], "format": "md"}),
+    )
+    .await;
+    assert_eq!(
+        tokens().await["read"]["reread_calls"],
+        2,
+        "{}",
+        tokens().await
+    );
+    // другие события — без поля
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "rc", "tokens": {"pre_tool": 5}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let t = tokens().await;
+    assert_eq!(t["pre_tool"], json!({"calls": 1, "tokens": 5}), "{t}");
+}

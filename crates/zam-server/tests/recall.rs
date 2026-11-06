@@ -1368,3 +1368,36 @@ async fn recovery_has_code_line() {
         assert!(line.contains("центральные: alpha"), "{line}");
     }
 }
+
+/// M6 §7.2: подсказка `prompt`, показанная в прежней эпохе, после новой эпохи (`new_epoch`) снова
+/// показывается — контекст агента потерян; в той же эпохе — один раз.
+#[tokio::test]
+async fn prompt_hint_returns_after_new_epoch() {
+    let a = server("prompt-epoch").await;
+    let g = entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "insight", "title": "Квазар коварен", "body": "Квазар светит ярко.",
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let me = format!("i:{g}");
+    let prompt = json!({"event": "prompt", "prompt": "квазар"});
+    let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
+    assert_eq!(ids(&j), [me.as_str()], "{j}");
+    let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
+    assert_eq!(j["text"], "", "{j}");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "pe", "new_epoch": true})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
+    assert_eq!(ids(&j), [me.as_str()], "{j}");
+    let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
+    assert_eq!(j["text"], "", "{j}");
+}

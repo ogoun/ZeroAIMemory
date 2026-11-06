@@ -522,6 +522,7 @@ async fn session_tokens_accumulate() {
         event: e.into(),
         calls,
         tokens,
+        reread_calls: 0,
     };
     zam_store::add_token_counts(&db, &s, &[c("pre_tool", 4, 50), c("brief", 0, 0)])
         .await
@@ -754,4 +755,90 @@ async fn unattributed_upsert_adds() {
     assert!(zam_store::check_session_id("unattributed").is_err());
     assert!(zam_store::check_session_id(" unattributed ").is_err());
     assert!(zam_store::check_session_id("unattributed-1").is_ok());
+}
+
+// ---------- M6, задача 7a: показ без эпохи, счётчик повторной выдачи ----------
+
+/// `seen_revs_any_epoch` (подсказки-идеи `prompt`, M6 §7.2): отметка любой эпохи сессии —
+/// большая ревизия; чужая сессия и неотмеченное — нет в ответе.
+#[tokio::test]
+async fn seen_revs_any_epoch_takes_max() {
+    let (_dd, db) = db("any-epoch").await;
+    let key = SeenKey {
+        owner_id: Id::new(),
+        target: node(Id::new()).into(),
+        part: WHOLE_TARGET.into(),
+    };
+    let other = SeenKey {
+        part: "chunk".into(),
+        ..key.clone()
+    };
+    seen_in_epoch(&db, "a", 0, &key, 2).await;
+    seen_in_epoch(&db, "a", 3, &key, 5).await;
+    seen_in_epoch(&db, "b", 0, &other, 1).await;
+    let keys = [key.clone(), other.clone()];
+    let m = zam_store::seen_revs_any_epoch(&db, "a", &keys)
+        .await
+        .unwrap();
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!(m[&key], 5);
+    assert!(seen_revs(&db, "a", 1, &keys).await.unwrap().is_empty());
+    assert_eq!(seen_revs(&db, "a", 0, &keys).await.unwrap()[&key], 2);
+    assert!(
+        zam_store::seen_revs_any_epoch(&db, "a", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// `reread_calls` (M6 §7.3): прибавка без выдач заводит строку события, суммируется и
+/// отдаётся в `TokenStat`; `Session.seen_epoch` — текущая эпоха.
+#[tokio::test]
+async fn reread_calls_accumulate() {
+    let (_dd, db) = db("reread").await;
+    let s = touch("s-r");
+    let c = |calls, tokens, reread_calls| zam_store::TokenCount {
+        event: "read".into(),
+        calls,
+        tokens,
+        reread_calls,
+    };
+    zam_store::add_token_counts(&db, &s, &[c(0, 0, 1)])
+        .await
+        .unwrap();
+    zam_store::add_token_counts(&db, &s, &[c(2, 30, 1)])
+        .await
+        .unwrap();
+    let t = zam_store::session_tokens(&db, "s-r").await.unwrap();
+    assert_eq!(
+        t["read"],
+        zam_store::TokenStat {
+            calls: 2,
+            tokens: 30,
+            reread_calls: 2
+        }
+    );
+    let v = serde_json::to_value(t["read"]).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"calls": 2, "tokens": 30, "reread_calls": 2})
+    );
+    // без повторов поле не выводится
+    let v = serde_json::to_value(zam_store::TokenStat {
+        calls: 1,
+        tokens: 5,
+        reread_calls: 0,
+    })
+    .unwrap();
+    assert_eq!(v, serde_json::json!({"calls": 1, "tokens": 5}));
+    assert_eq!(
+        get_session(&db, "s-r").await.unwrap().unwrap().seen_epoch,
+        0
+    );
+    zam_store::bump_epoch(&db, "s-r").await.unwrap();
+    assert_eq!(
+        get_session(&db, "s-r").await.unwrap().unwrap().seen_epoch,
+        1
+    );
 }

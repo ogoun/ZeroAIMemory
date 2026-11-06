@@ -866,3 +866,172 @@ async fn session_parent_and_agent_type() {
         .unwrap();
     assert_eq!(it["agent_type"], "Explore", "{r}");
 }
+
+// ---- эпохи `session_seen` и «уже выдавалось» (M6 §7.2–§7.3, задача 7a) ----
+
+/// Пометка `/read` о повторной выдаче (§7.3).
+const REREAD: &str = "· уже выдавалось в этой сессии";
+
+/// `POST /sessions {id, new_epoch: true}` → 201 `{id, epoch}`.
+async fn new_epoch(a: &Api, id: &str) -> u64 {
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": id, "new_epoch": true})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["id"], id, "{j}");
+    j["epoch"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("нет epoch: {j}"))
+}
+
+/// `/read` заметки целиком в сессии `s` (md): текст ответа.
+async fn read_md(a: &Api, s: &str, nid: &str) -> String {
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/read",
+            Some(json!({"items": [{"id": nid}], "format": "md"})),
+            &sess(s),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.text()
+}
+
+/// `brief`-поиск «квазар» в сессии `s`: `seen` первой карточки.
+async fn first_seen(a: &Api, s: &str) -> bool {
+    let j = search_as(a, s, "brief", "json").await.json();
+    j["items"][0]["seen"].as_bool().unwrap()
+}
+
+/// `/recall` в сессии `s`.
+async fn recall_in(a: &Api, s: &str, body: Value) -> Value {
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/recall",
+            Some(body),
+            &sess(s),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+/// §17 п. 7 по REST: поиск → чтение → `PreCompact` (`new_epoch`) и `session_start
+/// source=compact` → поиск → чтение. До compact повторное чтение — полный текст с пометкой,
+/// после — без пометки, и `brief` не помечает `(seen)` выданное до compact.
+#[tokio::test]
+async fn compact_resets_seen() {
+    let a = api("sessions-compact-seen", |_| {}).await;
+    let n = a
+        .note("knowledge", "Астро", "# Астро\n\nКвазар светит ярко.\n")
+        .await;
+    let nid = format!("n:{}", id(&n));
+    let s = "cs-1";
+    assert!(!first_seen(&a, s).await);
+    let first = read_md(&a, s, &nid).await;
+    assert!(!first.contains(REREAD), "{first}");
+    assert!(first_seen(&a, s).await);
+    // до compact: повторное чтение — полный текст с пометкой
+    let again = read_md(&a, s, &nid).await;
+    assert!(again.contains(REREAD), "{again}");
+    assert!(again.contains("Квазар светит ярко."), "{again}");
+    // PreCompact и SessionStart compact
+    assert_eq!(new_epoch(&a, s).await, 1);
+    recall_in(
+        &a,
+        s,
+        json!({"event": "session_start", "source": "compact"}),
+    )
+    .await;
+    let j = session(&a, &a.token, s).await.json();
+    assert_eq!(j["seen_epoch"], 2, "{j}");
+    // после compact: карточка без `(seen)`, чтение без пометки
+    assert!(!first_seen(&a, s).await);
+    let after = read_md(&a, s, &nid).await;
+    assert!(!after.contains(REREAD), "{after}");
+    // и снова: в новой эпохе повтор — с пометкой
+    assert!(first_seen(&a, s).await);
+    assert!(read_md(&a, s, &nid).await.contains(REREAD));
+}
+
+/// Эпоха растёт и без `session_start` (`new_epoch` до первого касания, Review Focus 2):
+/// сессия создаётся с эпохой 1, отметки пишутся в неё; `new_epoch` без `id` — 400.
+#[tokio::test]
+async fn epoch_bump_without_session_start() {
+    let a = api("sessions-epoch-first", |_| {}).await;
+    let n = a
+        .note("knowledge", "Астро", "# Астро\n\nКвазар светит ярко.\n")
+        .await;
+    let nid = format!("n:{}", id(&n));
+    assert_eq!(new_epoch(&a, "eb-1").await, 1);
+    let j = session(&a, &a.token, "eb-1").await.json();
+    assert_eq!(j["seen_epoch"], 1, "{j}");
+    // отметка — в текущую эпоху 1: поиск и повторное чтение её видят
+    read_md(&a, "eb-1", &nid).await;
+    assert!(first_seen(&a, "eb-1").await);
+    assert!(read_md(&a, "eb-1", &nid).await.contains(REREAD));
+    // `event: recovery` — тоже новая эпоха
+    recall_in(&a, "eb-1", json!({"event": "recovery"})).await;
+    assert_eq!(session(&a, &a.token, "eb-1").await.json()["seen_epoch"], 2);
+    assert!(!first_seen(&a, "eb-1").await);
+    // без id — 400; `new_epoch: false` — обычная регистрация без `epoch`
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"new_epoch": true})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "eb-1", "new_epoch": false})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert!(r.json().get("epoch").is_none(), "{}", r.text());
+    assert_eq!(session(&a, &a.token, "eb-1").await.json()["seen_epoch"], 2);
+}
+
+/// Две эпохи подряд (`PreCompact` и `session_start compact`, `resume`, `clear`): каждая +1,
+/// выданное в прежних эпохах выданным не считается; обычный `startup` эпоху не меняет.
+#[tokio::test]
+async fn double_epoch_bump() {
+    let a = api("sessions-epoch-double", |_| {}).await;
+    let n = a
+        .note("knowledge", "Астро", "# Астро\n\nКвазар светит ярко.\n")
+        .await;
+    let nid = format!("n:{}", id(&n));
+    let s = "db-1";
+    read_md(&a, s, &nid).await;
+    assert!(first_seen(&a, s).await);
+    assert_eq!(new_epoch(&a, s).await, 1);
+    assert_eq!(new_epoch(&a, s).await, 2);
+    assert!(!first_seen(&a, s).await);
+    read_md(&a, s, &nid).await;
+    assert!(first_seen(&a, s).await);
+    let mut want = 2;
+    for source in ["startup", "compact", "resume", "clear", "fork"] {
+        recall_in(&a, s, json!({"event": "session_start", "source": source})).await;
+        if matches!(source, "compact" | "resume" | "clear") {
+            want += 1;
+        }
+        let j = session(&a, &a.token, s).await.json();
+        assert_eq!(j["seen_epoch"], want, "{source}: {j}");
+    }
+    assert!(!first_seen(&a, s).await);
+    // другая сессия эпохой не задета
+    read_md(&a, "db-2", &nid).await;
+    assert!(first_seen(&a, "db-2").await);
+}

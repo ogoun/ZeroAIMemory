@@ -14,16 +14,17 @@
 //! - эпоха (спецификация M6 §7.2, миграция 0025): `sessions.seen_epoch` растёт [`bump_epoch`]
 //!   (сжатие контекста, `resume`, `clear`, восстановление), отметка пишется в эпоху касания
 //!   ([`SessionTouch::epoch`]), [`seen_revs`] читает только её. Отметки прежних эпох хранятся до
-//!   срока сессии (аналитика). Раздел идей дайджеста читает показ без эпохи
-//!   ([`seen_entry_ids`]). Подсказка идей к запросу (`prompt`) пока проверяет повтор через
-//!   [`seen_revs`] текущей эпохи и после новой эпохи повторила бы идею — правило §7.2 «одна
-//!   идея — один показ за сессию» для неё доводит задача 7a;
+//!   срока сессии (аналитика). Показ идей — без эпохи (§7.2, «одна идея — один показ за
+//!   сессию»): раздел идей дайджеста читает [`seen_entry_ids`], подсказка идей к запросу —
+//!   [`seen_revs_any_epoch`];
 //! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12);
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
 //!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя;
-//! - `session_tokens` — выданное сессии по событию (§9.5): число выдач `calls` и оценка размера в
-//!   токенах `tokens`; `/recall` прибавляет свои события ([`mark_seen_with_tokens`]), хуки с
-//!   локальным выводом — пачкой через `POST /sessions` ([`add_token_counts`]);
+//! - `session_tokens` — выданное сессии по событию (§9.5): число выдач `calls`, оценка размера в
+//!   токенах `tokens` и число повторных выдач `reread_calls` (M6 §7.3: `/read` с пометкой «уже
+//!   выдавалось» — у события `read`); `/recall` прибавляет свои события
+//!   ([`mark_seen_with_tokens`]), хуки с локальным выводом — пачкой через `POST /sessions`
+//!   ([`add_token_counts`]);
 //! - срок хранения — [`gc_sessions`]: сессии без обращений дольше срока удаляются вместе с
 //!   выданным им, учётом и снимком (воркер обслуживания сервера, раз в сутки, 30 дней).
 use std::collections::HashMap;
@@ -84,6 +85,8 @@ pub struct Session {
     #[serde(serialize_with = "ser_ts_opt")]
     pub ended_at: Option<Timestamp>,
     pub memory_writes: i64,
+    /// Текущая эпоха `session_seen` (M6 §7.2, [`bump_epoch`]).
+    pub seen_epoch: u32,
 }
 
 /// Предел имени события `session_tokens`, символов.
@@ -97,6 +100,8 @@ pub struct TokenCount {
     pub event: String,
     pub calls: u64,
     pub tokens: u64,
+    /// Повторных выдач (M6 §7.3: вызов `/read` с пометкой «уже выдавалось»).
+    pub reread_calls: u64,
 }
 
 /// Выданное сессии по одному событию.
@@ -104,6 +109,13 @@ pub struct TokenCount {
 pub struct TokenStat {
     pub calls: i64,
     pub tokens: i64,
+    /// Повторных выдач (M6 §7.3); 0 — поля в JSON нет (прежняя форма `{calls, tokens}`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reread_calls: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 /// Цель выданного: узел или запись журнала ([`TargetRef`]) либо блоб вложения по sha256 (M5,
@@ -274,7 +286,8 @@ pub async fn end_session(db: &Db, id: &str, ended: bool) -> Result<bool, StoreEr
 }
 
 const SESSION_COLS: &str = "id, token_id, solution_guid, area, machine, agent, started_at, \
-                            last_seen_at, ended_at, memory_writes, parent_id, agent_type";
+                            last_seen_at, ended_at, memory_writes, parent_id, agent_type, \
+                            seen_epoch";
 
 fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -290,6 +303,7 @@ fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         memory_writes: r.get(9)?,
         parent_id: r.get(10)?,
         agent_type: r.get(11)?,
+        seen_epoch: r.get(12)?,
     })
 }
 
@@ -384,14 +398,24 @@ fn add_tokens_tx(
     counts: &[TokenCount],
 ) -> Result<(), StoreError> {
     let mut st = t.prepare_cached(
-        "INSERT INTO session_tokens (session_id, event, calls, tokens) VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO session_tokens (session_id, event, calls, tokens, reread_calls)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT (session_id, event) DO UPDATE SET
-           calls = calls + excluded.calls, tokens = tokens + excluded.tokens",
+           calls = calls + excluded.calls, tokens = tokens + excluded.tokens,
+           reread_calls = reread_calls + excluded.reread_calls",
     )?;
-    for c in counts.iter().filter(|c| c.calls > 0 || c.tokens > 0) {
-        let calls = i64::try_from(c.calls).unwrap_or(i64::MAX);
-        let tokens = i64::try_from(c.tokens).unwrap_or(i64::MAX);
-        st.execute(params![session, c.event, calls, tokens])?;
+    let big = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    for c in counts
+        .iter()
+        .filter(|c| c.calls > 0 || c.tokens > 0 || c.reread_calls > 0)
+    {
+        st.execute(params![
+            session,
+            c.event,
+            big(c.calls),
+            big(c.tokens),
+            big(c.reread_calls)
+        ])?;
     }
     Ok(())
 }
@@ -407,6 +431,7 @@ pub async fn add_tokens(
         event: event.to_string(),
         calls: 1,
         tokens,
+        reread_calls: 0,
     };
     add_token_counts(db, s, &[c]).await
 }
@@ -428,7 +453,7 @@ pub async fn session_tokens(
     let session = session.to_string();
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT event, calls, tokens FROM session_tokens WHERE session_id = ?1",
+            "SELECT event, calls, tokens, reread_calls FROM session_tokens WHERE session_id = ?1",
         )?;
         let rows = st.query_map([session], |r| {
             Ok((
@@ -436,6 +461,7 @@ pub async fn session_tokens(
                 TokenStat {
                     calls: r.get(1)?,
                     tokens: r.get(2)?,
+                    reread_calls: r.get(3)?,
                 },
             ))
         })?;
@@ -494,15 +520,35 @@ pub async fn seen_revs(
     epoch: u32,
     targets: &[SeenKey],
 ) -> Result<HashMap<SeenKey, i64>, StoreError> {
+    seen_revs_in(db, session, Some(epoch), targets).await
+}
+
+/// Как [`seen_revs`], но по **всем** эпохам сессии (большая ревизия): показ идей учитывается
+/// без эпохи (M6 §7.2, подсказка идей `prompt`).
+pub async fn seen_revs_any_epoch(
+    db: &Db,
+    session: &str,
+    targets: &[SeenKey],
+) -> Result<HashMap<SeenKey, i64>, StoreError> {
+    seen_revs_in(db, session, None, targets).await
+}
+
+/// [`seen_revs`] эпохи `epoch` или всех эпох (`None`).
+async fn seen_revs_in(
+    db: &Db,
+    session: &str,
+    epoch: Option<u32>,
+    targets: &[SeenKey],
+) -> Result<HashMap<SeenKey, i64>, StoreError> {
     if targets.is_empty() {
         return Ok(HashMap::new());
     }
     let (session, targets) = (session.to_string(), targets.to_vec());
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT rev FROM session_seen
+            "SELECT max(rev) FROM session_seen
              WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = ?3 AND target_id = ?4
-               AND part = ?5 AND epoch = ?6",
+               AND part = ?5 AND (?6 IS NULL OR epoch = ?6)",
         )?;
         let mut out = HashMap::new();
         for k in targets {
@@ -510,8 +556,7 @@ pub async fn seen_revs(
             let rev: Option<i64> = st
                 .query_row(params![session, k.owner_id, kind, id, k.part, epoch], |r| {
                     r.get(0)
-                })
-                .optional()?;
+                })?;
             if let Some(rev) = rev {
                 out.insert(k, rev);
             }

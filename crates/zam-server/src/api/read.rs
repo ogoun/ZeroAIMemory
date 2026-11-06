@@ -53,7 +53,16 @@
 //!   целиком, — ключ `blob` (sha256), часть — `locator`, ревизия 0; оглавление не отмечается.
 //!   Касание сессии и отметка — одна
 //!   транзакция; сбой учёта — WARN (без id сессии и текста), ответ не портится. Некорректный
-//!   id сессии — 400;
+//!   id сессии — 400. Учитывается только явная сессия (M6 §7.1) и её текущая эпоха (§7.2);
+//! - **«уже выдавалось»** (M6 §7.3, решение владельца 7): полный текст L2 без `section` (или
+//!   часть вложения по `locator`), который сессия уже получила целиком в той же ревизии и эпохе
+//!   (все ключи элемента отмечены), отдаётся **полностью**, как раньше, но с пометкой
+//!   ([`REREAD_MARK`]) в конце заголовка md и `seen: true` в json — агент видит, что текст уже
+//!   у него, если контекст не сжат. Пометка — до упаковки, её токены входят в бюджет;
+//!   обрезанный бюджетом или `max_tokens` повтор и `(budget)` помечаются так же. Дифф
+//!   `since_rev`, секции, L0/L1, `unchanged` и ошибки — без пометки. Вызов с хотя бы одной
+//!   пометкой прибавляет 1 к `session_tokens.reread_calls` события `read` (той же транзакцией,
+//!   что и отметка выданного). Без сессии ответ прежний (эталон `read_l2_m57.json`);
 //! - если у какого-то элемента ошибка, в ответе (md и json) заголовок
 //!   `X-Zam-Read-Error: <код первой>`:
 //!   клиенту не нужно разбирать Markdown, где текст заметки мог бы выглядеть как заголовок ошибки;
@@ -80,8 +89,9 @@ use zam_markdown::mask_text;
 use zam_search::truncate_to_tokens;
 use zam_store::{
     CHUNK_REF_LETTER, DocLookup, EntryKind, NodeKind, NodePath, SeenItem, SeenKey, SeenTarget,
-    StoreError, WHOLE_TARGET, count_tokens, doc_chunk_heads, doc_chunk_texts, entry_revisions,
-    entry_snapshot_text, get_node_by_path, mark_seen, node_content,
+    StoreError, TokenCount, WHOLE_TARGET, count_tokens, doc_chunk_heads, doc_chunk_texts,
+    entry_revisions, entry_snapshot_text, get_node_by_path, mark_seen_with_tokens, node_content,
+    seen_revs,
 };
 
 use super::doc_locator::Sheets;
@@ -93,7 +103,7 @@ use super::scope::{
     node_scope, space_scope,
 };
 use super::search::md_inline;
-use super::sessions::{McpOrigin, explicit_only, request_session};
+use super::sessions::{McpOrigin, RequestSession, explicit_only, request_session};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -238,6 +248,8 @@ struct Fetched {
     att: Option<AttMeta>,
     /// Предупреждения элемента (`b:` с несколькими вложениями).
     warnings: Vec<String>,
+    /// Уже выдан этой сессии целиком в той же ревизии и эпохе (M6 §7.3, [`mark_rereads`]).
+    reread: bool,
 }
 
 /// Поля элемента-вложения.
@@ -482,6 +494,7 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
         stale_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
         warnings: Vec::new(),
+        reread: false,
     })
 }
 
@@ -583,6 +596,7 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
         stale_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
         warnings: Vec::new(),
+        reread: false,
     })
 }
 
@@ -989,6 +1003,7 @@ async fn fetch_attachment(
             locator_text: shown.map(|s| s.1),
         }),
         warnings,
+        reread: false,
     })
 }
 
@@ -1033,8 +1048,56 @@ fn header(f: &Fetched, tail: &str) -> String {
         parts.push(format!("rev{}", f.rev));
     }
     parts.push(tail.to_string());
+    if f.reread {
+        parts.push(REREAD_MARK.to_string());
+    }
     line.push_str(&format!("  {}", parts.join(" · ")));
     line
+}
+
+/// Пометка заголовка повторной выдачи (M6 §7.3): `… · ~120 tok · уже выдавалось в этой сессии`.
+pub const REREAD_MARK: &str = "уже выдавалось в этой сессии";
+
+/// Событие `session_tokens`, у которого считается повторная выдача `/read` (`reread_calls`).
+pub const READ_TOKEN_EVENT: &str = "read";
+
+/// Элемент — полный текст, который повтором можно отдать с пометкой: L2 без секции (или часть
+/// вложения по `locator`), не дифф `since_rev`; есть ключи выданного.
+fn rereadable(f: &Fetched) -> bool {
+    !f.seen.is_empty()
+        && matches!(
+            f.content,
+            Content::Text { whole: true, form, .. } if !matches!(form, Form::Diff { .. })
+        )
+}
+
+/// Помечает элементы, выданные сессии целиком в той же ревизии и текущей эпохе (§7.3): все
+/// ключи элемента отмечены с ревизией не меньше текущей. Сбой чтения — WARN, без пометок.
+async fn mark_rereads(s: &RequestSession, fetched: &mut [Result<Fetched, (String, Fail)>]) {
+    let keys: Vec<SeenKey> = fetched
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .filter(|f| rereadable(f))
+        .flat_map(|f| f.seen.iter().cloned())
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    let revs = match seen_revs(&s.db, &s.touch.id, s.touch.epoch, &keys).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "чтение: выданное сессии не прочитано, без пометок");
+            return;
+        }
+    };
+    for f in fetched.iter_mut().filter_map(|r| r.as_mut().ok()) {
+        if rereadable(f) {
+            f.reread = f
+                .seen
+                .iter()
+                .all(|k| revs.get(k).is_some_and(|&r| r >= f.rev));
+        }
+    }
 }
 
 fn err_line(raw: &str, fail: &Fail) -> String {
@@ -1186,6 +1249,9 @@ fn item_json(piece: &Piece) -> Value {
         }
         if !f.warnings.is_empty() {
             o.insert("warnings".into(), json!(f.warnings));
+        }
+        if f.reread {
+            o.insert("seen".into(), json!(true));
         }
     };
     match piece {
@@ -1390,6 +1456,10 @@ pub async fn read(
         );
     }
     fill_stale_refs(&mut fetched).await?;
+    // повторная выдача (§7.3) — до упаковки: пометка входит в бюджет
+    if let Some(s) = &session {
+        mark_rereads(s, &mut fetched).await;
+    }
     // упаковка суммами частей — против `budget_cap` (M6 §4.2: без модели — с запасом оценки)
     let (pieces, total) = pack(fetched, zam_store::budget_cap(budget));
 
@@ -1409,7 +1479,19 @@ pub async fn read(
             })
             .flatten()
             .collect();
-        if let Err(e) = mark_seen(&s.db, &s.touch, &given).await {
+        let reread = pieces
+            .iter()
+            .any(|p| matches!(p, Piece::Text { f, .. } | Piece::Budget { f, .. } if f.reread));
+        let counts: Vec<TokenCount> = reread
+            .then(|| TokenCount {
+                event: READ_TOKEN_EVENT.into(),
+                calls: 0,
+                tokens: 0,
+                reread_calls: 1,
+            })
+            .into_iter()
+            .collect();
+        if let Err(e) = mark_seen_with_tokens(&s.db, &s.touch, &given, &counts).await {
             tracing::warn!(error = %e, "чтение: отметка выданного сессии не выполнена");
         }
     }

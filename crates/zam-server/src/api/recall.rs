@@ -103,6 +103,12 @@
 //! - `record: false` (по умолчанию `true`) — ответ без учёта: ни `session_seen`, ни `usage`,
 //!   `timings.record_ms: null` (хук `session-start` с выключенным в клиенте дайджестом берёт
 //!   только `hooks`; задача 10, fix round 2);
+//! - **эпоха `session_seen`** (M6 §7.2): `session_start` с `source` `compact | resume | clear`
+//!   и `event: recovery` начинают новую эпоху сессии ([`EPOCH_SOURCES`], `bump_epoch`) до сбора:
+//!   выданное в прежних эпохах больше не считается показанным (повторы подсказок, ответы на
+//!   вопросы), а показ этого ответа отмечается в новой. Не зависит от `record` и настроек
+//!   подсказок: эпоха — состояние контекста агента. Показ идей — без эпохи: раздел `### Идеи` и
+//!   подсказки-идеи `prompt` видят показ любой эпохи. Сбой — WARN, эпоха прежняя;
 //! - **пакет восстановления** (M4.5 §9.2) — `event: recovery` (MCP, агенты без
 //!   `SessionStart compact`) или `session_start` с `source` `compact | resume`: бюджет по
 //!   умолчанию `recall.recovery_tokens` (2000), разделы по порядку — `### Задачи` (захваченные
@@ -158,9 +164,9 @@ use zam_search::truncate_to_tokens;
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, GraphStore, NodeKind,
     RECALL_PART, SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind,
-    UsageEvent, UsageKind, UsageSource, active_triggers, count_tokens, list_children, list_entries,
-    mark_seen_with_tokens, node_content, record_usages, search_fts_channels, seen_revs,
-    touch_session,
+    UsageEvent, UsageKind, UsageSource, active_triggers, bump_epoch, count_tokens, list_children,
+    list_entries, mark_seen_with_tokens, node_content, record_usages, search_fts_channels,
+    seen_revs, seen_revs_any_epoch, touch_session,
 };
 
 use super::json_body;
@@ -292,6 +298,9 @@ pub const BRIEF_CODE_MAX: usize = 5;
 
 /// `source` хука `SessionStart`, после которого строится пакет восстановления.
 const RECOVERY_SOURCES: [&str; 2] = ["compact", "resume"];
+/// `source` хука `SessionStart`, начинающие новую эпоху `session_seen` (M6 §7.2): контекст
+/// агента сжат, восстановлен или очищен.
+pub const EPOCH_SOURCES: [&str; 3] = ["compact", "resume", "clear"];
 /// Давность решений (`decision`) в пакете восстановления, дней (§9.2).
 pub const RECOVERY_DECISIONS_DAYS: i64 = 7;
 /// Заголовок раздела решений пакета восстановления.
@@ -2914,7 +2923,8 @@ fn seen_key(targets: &[SearchTarget], c: &Cand) -> SeenKey {
     }
 }
 
-/// Уже показанные этой сессии подсказки (любая ревизия). Сбой чтения — WARN, без фильтра.
+/// Уже показанные этой сессии подсказки (любая ревизия): в текущей эпохе, а идеи — в любой
+/// (M6 §7.2: одна идея — один показ за сессию). Сбой чтения — WARN, без фильтра.
 async fn shown(
     s: Option<&RequestSession>,
     targets: &[SearchTarget],
@@ -2923,8 +2933,16 @@ async fn shown(
     let Some(s) = s else {
         return HashSet::new();
     };
-    let keys: Vec<SeenKey> = cands.iter().map(|c| seen_key(targets, c)).collect();
-    match seen_revs(&s.db, &s.touch.id, s.touch.epoch, &keys).await {
+    let idea = EntryKind::Idea.as_str();
+    let (ideas, rest): (Vec<&Cand>, Vec<&Cand>) = cands.iter().partition(|c| c.kind == idea);
+    let keys = |cs: &[&Cand]| -> Vec<SeenKey> { cs.iter().map(|c| seen_key(targets, c)).collect() };
+    let (rest, ideas) = (keys(&rest), keys(&ideas));
+    let r = async {
+        let mut m = seen_revs(&s.db, &s.touch.id, s.touch.epoch, &rest).await?;
+        m.extend(seen_revs_any_epoch(&s.db, &s.touch.id, &ideas).await?);
+        Ok::<_, StoreError>(m)
+    };
+    match r.await {
         Ok(m) => m.into_keys().collect(),
         Err(e) => {
             tracing::warn!(error = %e, "recall: показанное сессии не прочитано, без фильтра повторов");
@@ -3158,6 +3176,19 @@ pub async fn recall(
         if area.is_some() {
             s.touch.area = area.clone();
         }
+        // новая эпоха `session_seen` (M6 §7.2) — до чтения показанного и отметок ответа
+        let new_epoch = req.event == Event::Recovery
+            || (req.event == Event::SessionStart
+                && req
+                    .source
+                    .as_deref()
+                    .is_some_and(|src| EPOCH_SOURCES.contains(&src.trim())));
+        if new_epoch {
+            match bump_epoch(&s.db, &s.touch.id).await {
+                Ok(e) => s.touch.epoch = e,
+                Err(e) => tracing::warn!(error = %e, "recall: новая эпоха сессии не записана"),
+            }
+        }
     }
     let user = target_user_id(&st, &p, &headers)?;
     // R5: настройки пользователя (`hooks.<тип>`, `ideas.proactive`) одним чтением; сбой
@@ -3371,6 +3402,7 @@ pub async fn recall(
                 event: token_event(req.event, recovery).into(),
                 calls: 1,
                 tokens: count_tokens(&text) as u64,
+                reread_calls: 0,
             })
             .into_iter()
             .collect();

@@ -1317,3 +1317,67 @@ fn idea_hints_fixture_is_wellformed() {
         "с подсказками {with_hints}"
     );
 }
+
+/// M6 §7.2: показ идей — без эпохи. Идея показана дайджестом в эпохе 0, затем `PreCompact`
+/// (`new_epoch`) и `session_start source=compact` (эпоха 2): ни раздела `### Идеи`, ни
+/// подсказки `prompt`, в том числе после `clear`. В новой сессии идея есть.
+#[tokio::test]
+async fn ideas_seen_across_epochs() {
+    let a = server("epochs", |_| {}).await;
+    let id = idea(&a, &sol(), "Экспорт отчётов в PDF", json!({})).await;
+    let j = start(&a, "s1").await;
+    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "s1", "new_epoch": true})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = ok(
+        &a,
+        Some("s1"),
+        json!({"event": "session_start", "solution": G, "source": "compact"}),
+    )
+    .await;
+    assert!(idea_items(&j).is_empty(), "{j}");
+    let j = prompt(&a, "s1", "как сделать экспорт отчётов в PDF").await;
+    assert!(idea_items(&j).is_empty(), "{j}");
+    // `clear` в той же сессии (обычный дайджест, новая эпоха) — раздела нет
+    let j = ok(
+        &a,
+        Some("s1"),
+        json!({"event": "session_start", "solution": G, "source": "clear"}),
+    )
+    .await;
+    assert!(section_lines(&j).is_none(), "{j}");
+    assert!(idea_items(&j).is_empty(), "{j}");
+    let j = prompt(&a, "s1", "экспорт отчётов в PDF").await;
+    assert!(idea_items(&j).is_empty(), "{j}");
+    let s = a.t(Method::GET, "/api/v1/sessions/s1", None).await.json();
+    assert_eq!(s["seen_epoch"], 3, "{s}");
+    // новая сессия — идея снова
+    let j = prompt(&a, "s2", "экспорт отчётов в PDF").await;
+    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
+}
+
+/// M6 §7.2: идея, показанная подсказкой `prompt` в эпохе 0, после новой эпохи в `prompt` не
+/// возвращается (первый проход `prompt_ideas` — без эпохи; журнал задачи 2, I1).
+#[tokio::test]
+async fn prompt_idea_not_repeated_after_new_epoch() {
+    let a = server("prompt-epoch", |_| {}).await;
+    let id = idea(&a, &sol(), "Экспорт отчётов в PDF", json!({})).await;
+    let j = prompt(&a, "s1", "как сделать экспорт отчётов в PDF").await;
+    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "s1", "new_epoch": true})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = prompt(&a, "s1", "как сделать экспорт отчётов в PDF").await;
+    assert!(idea_items(&j).is_empty(), "{j}");
+}

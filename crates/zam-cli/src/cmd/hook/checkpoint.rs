@@ -17,6 +17,10 @@
 //! M4.5: `PreCompact` пишет в журнал сессии `Ev::Compact {trigger}` (ключ `session_journal`);
 //! на `Stop` и `PreCompact` очередь изменённых файлов сессии уходит `POST /files/changed`
 //! параллельно с `GET /sessions/{id}` в том же бюджете ([`cache::flush_changed`]).
+//! M6 §7.2: на `PreCompact` — новая эпоха `session_seen` отдельным `POST /sessions {id,
+//! new_epoch: true}` параллельно с очередями, в том же бюджете ([`new_epoch`]): выданное до
+//! сжатия контекста больше не считается выданным. Старый сервер отвечает 400 (неизвестное
+//! поле) — хук молча продолжает без эпохи.
 //! M5.6 §5: были правки в сессии — после запросов хука запуск фоновой
 //! `zam code sync --background`, если пора ([`crate::cmd::code::auto::maybe_spawn_sync`]).
 use super::cache;
@@ -88,7 +92,9 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
         env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
     let tokens = cache::tokens_queued(env, session);
     let remind = needs_reminder(env, inp, s);
-    if remind.is_none() && !queued && !tokens {
+    // новая эпоха `session_seen` на сжатии контекста (M6 §7.2)
+    let epoch = session.filter(|_| inp.event == "PreCompact");
+    if remind.is_none() && !queued && !tokens && epoch.is_none() {
         return Output::Empty;
     }
     let Some(client) = env.client() else {
@@ -100,6 +106,7 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
         let flush_tokens = session
             .filter(|_| tokens)
             .map(|id| sc.spawn(|| cache::flush_tokens(env, &client, id)));
+        let bump = epoch.map(|id| sc.spawn(|| new_epoch(env, &client, id)));
         let out = match remind {
             Some((id, sh)) => {
                 let fix = s
@@ -120,8 +127,24 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
         {
             env.log("sessions(tokens): паника");
         }
+        if let Some(h) = bump
+            && h.join().is_err()
+        {
+            env.log("sessions(new_epoch): паника");
+        }
         out
     })
+}
+
+/// Новая эпоха `session_seen` сессии (`PreCompact`, M6 §7.2): отдельный запрос, чтобы старый
+/// сервер (`deny_unknown_fields` тела, 400) не потерял ничего другого; 400 — молча.
+fn new_epoch(env: &Env, client: &Client, session: &str) {
+    let body = serde_json::json!({"id": session, "new_epoch": true});
+    match client.post_json("/sessions", &body) {
+        Ok(_) => {}
+        Err(e) if e.http_status() == Some(400) => {}
+        Err(e) => env.log(&format!("sessions(new_epoch): {e}")),
+    }
 }
 
 /// Напоминание возможно (`Stop`, включено, правки были, ещё не напоминали): сессия и

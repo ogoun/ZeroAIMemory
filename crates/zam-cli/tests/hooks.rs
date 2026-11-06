@@ -3438,3 +3438,160 @@ fn changed_flush_partial_failure_returns_rest() {
         assert_eq!(both, all, "{name}: первая пачка снята, остаток возвращён");
     }
 }
+
+// ---- эпохи `session_seen` (M6 §7.2, задача 7a) ----
+
+/// Пометка `/read` о повторной выдаче (§7.3).
+const REREAD: &str = "· уже выдавалось в этой сессии";
+
+/// `PreCompact` (`checkpoint`): `POST /sessions {id, new_epoch: true}` в бюджете хука — и без
+/// `SessionStart` (сессии ещё нет), и после него; вывод — тишина.
+#[test]
+fn checkpoint_precompact_new_epoch_within_100ms() {
+    let _g = serial();
+    let (url, tok) = start("precompact-epoch");
+    let p = Proj::new("precompact-epoch", &url, &tok);
+    let pc = |s: &str| {
+        p.ev(
+            "PreCompact",
+            s,
+            json!({"trigger": "auto", "custom_instructions": ""}),
+        )
+    };
+    // прогрев процесса `zam` (холодный запуск с HDD — не бюджет хука)
+    let warm = p.ev("Stop", "pe-warm", json!({"stop_hook_active": false}));
+    empty(&p.hook("checkpoint", &warm));
+    // `PreCompact` сессии `s`: время процесса и ушёл ли запрос. Промах бюджета до запроса
+    // (отладочная сборка на занятом HDD: старт процесса > 70 мс) — поведение продукта: хук
+    // молчит без эпохи, строка `HOOK_BUDGET_SPENT` в `hooks.log` (срок запроса —
+    // `sessions(new_epoch)`); такой вызов не считается
+    let misses = || {
+        let log = p.log();
+        log.matches(zam_core::HOOK_BUDGET_SPENT).count()
+            + log.matches("sessions(new_epoch)").count()
+    };
+    let run = |s: &str| {
+        let before = misses();
+        let (o, d) = p.hook_at(&url, "checkpoint", "claude", pc(s).to_string().as_bytes());
+        empty(&o);
+        assert!(d <= max_for("checkpoint"), "checkpoint {d:?}");
+        misses() == before
+    };
+    // без `SessionStart`: сессия создаётся с эпохой 1 (до 5 попыток при промахах бюджета)
+    let sent = (0..5).find(|_| run("pe-0")).is_some();
+    assert!(sent, "все 5 вызовов — промах бюджета: {}", p.log());
+    assert_eq!(p.session("pe-0")["seen_epoch"], 1);
+    // сессия есть (регистрация, как у `session-start`): каждый `PreCompact` — +1
+    let r = http()
+        .post(&format!("{url}/api/v1/sessions"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .content_type("application/json")
+        .send(r#"{"id":"pe-1","agent":"claude"}"#)
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    assert_eq!(p.session("pe-1")["seen_epoch"], 0);
+    let sent = (0..3).filter(|_| run("pe-1")).count();
+    assert!(sent >= 1, "все вызовы — промах бюджета: {}", p.log());
+    assert_eq!(p.session("pe-1")["seen_epoch"], sent, "{}", p.log());
+    // `Stop` эпоху не меняет
+    let st = p.ev("Stop", "pe-1", json!({"stop_hook_active": false}));
+    empty(&p.hook("checkpoint", &st));
+    assert_eq!(p.session("pe-1")["seen_epoch"], sent);
+}
+
+/// Старый сервер (v0.0.10-m5.7) отвечает на `new_epoch` 400 (`deny_unknown_fields`): хук молчит,
+/// код 0, в `hooks.log` — ничего; запрос — отдельный, только `{id, new_epoch}` (§13).
+#[test]
+fn old_server_new_epoch_400_silent() {
+    let _g = serial();
+    let (url, seen) = common::stub(
+        400,
+        r#"{"type":"/problems/bad-request","status":400,"detail":"unknown field `new_epoch`"}"#,
+        Duration::ZERO,
+    );
+    let p = Proj::new("old-epoch", &url, "zam_x");
+    let pc = p.ev(
+        "PreCompact",
+        "oe-1",
+        json!({"trigger": "manual", "custom_instructions": ""}),
+    );
+    let (o, d) = p.hook_at(&url, "checkpoint", "claude", pc.to_string().as_bytes());
+    empty(&o);
+    assert!(d <= max_for("checkpoint"), "checkpoint {d:?}");
+    let sent = seen.lock().unwrap().clone();
+    let posts: Vec<&Value> = sent
+        .iter()
+        .filter(|(m, path, _)| m == "POST" && path == "/api/v1/sessions")
+        .map(|(_, _, v)| v)
+        .collect();
+    assert_eq!(
+        posts,
+        [&json!({"id": "oe-1", "new_epoch": true})],
+        "{sent:?}"
+    );
+    assert!(!p.log().contains("new_epoch"), "{}", p.log());
+    assert!(!p.log().contains("эпох"), "{}", p.log());
+}
+
+/// §17 п. 7 через хуки и `zam read --batch` (пачка — `POST /read`; побайтное чтение без пачки
+/// идёт через `GET /nodes` и выданное не отмечает): чтение → повтор с пометкой → `PreCompact`
+/// и `SessionStart compact` → чтение без пометки (новая эпоха), повтор — снова с пометкой.
+#[test]
+fn compact_resets_seen() {
+    let _g = serial();
+    let (url, tok) = start("compact-seen");
+    let p = Proj::new("compact-seen", &url, &tok);
+    let n = id_of(&ok(&p.zam(
+        &["write", "knowledge:Астро"],
+        "# Астро\n\nКвазар светит ярко.\n".as_bytes(),
+    )));
+    let s = "hc-1";
+    p.hook(
+        "session-start",
+        &p.ev("SessionStart", s, json!({"source": "startup"})),
+    );
+    let read = || {
+        let o = p
+            .cmd(&p.url)
+            .env("ZAM_SESSION", s)
+            .args(["read", "--batch", &format!("n:{n}")])
+            .output()
+            .unwrap();
+        ok(&o)
+    };
+    let first = read();
+    assert!(
+        first.contains("Квазар светит ярко.") && !first.contains(REREAD),
+        "{first}"
+    );
+    let again = read();
+    assert!(
+        again.contains("Квазар светит ярко.") && again.contains(REREAD),
+        "{again}"
+    );
+    let pc = p.ev(
+        "PreCompact",
+        s,
+        json!({"trigger": "auto", "custom_instructions": ""}),
+    );
+    empty(&p.hook("checkpoint", &pc));
+    p.hook(
+        "session-start",
+        &p.ev("SessionStart", s, json!({"source": "compact"})),
+    );
+    // обе новые эпохи; промах бюджета хука (отладочная сборка на занятом HDD) — только если он
+    // записан в `hooks.log`, и хотя бы одна эпоха должна начаться
+    let epoch = p.session(s)["seen_epoch"].as_u64().unwrap();
+    let missed = p.log().matches(zam_core::HOOK_BUDGET_SPENT).count() as u64;
+    assert!(
+        epoch >= 1 && epoch + missed >= 2,
+        "эпоха {epoch}: {}",
+        p.log()
+    );
+    let after = read();
+    assert!(
+        after.contains("Квазар светит ярко.") && !after.contains(REREAD),
+        "{after}"
+    );
+    assert!(read().contains(REREAD));
+}

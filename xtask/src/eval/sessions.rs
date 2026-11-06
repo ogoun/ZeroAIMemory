@@ -759,9 +759,12 @@ pub fn fixed_ids(text: &str) -> String {
     out
 }
 
-/// Строка помечена «уже выдавалось» (`(seen)` или `(выдавалось)`).
+/// Строка помечена «уже выдавалось»: `(seen)`, `(выдавалось)` карточки или пометка заголовка
+/// `/read` (M6 §7.3, `· уже выдавалось в этой сессии`).
 fn marked_seen(line: &str) -> bool {
-    line.contains("(seen)") || line.contains("(выдавалось)")
+    line.contains("(seen)")
+        || line.contains("(выдавалось)")
+        || line.contains("· уже выдавалось в этой сессии")
 }
 
 /// Заголовки разделов дайджеста класса [`class::JOURNAL`].
@@ -3399,6 +3402,18 @@ type = "checkpoint"
         assert!(!c.contains_key(class::TERMS));
         let p = classify(&prompt_text(), &words);
         assert!(p[class::TERMS] > 0 && p[class::IDEAS] > 0);
+    }
+
+    /// M6 §7.3: заголовок `/read` с пометкой «уже выдавалось в этой сессии» — помеченная строка
+    /// (повтор с пометкой не считается неотмеченным).
+    #[test]
+    fn reread_header_is_marked() {
+        assert!(marked_seen(&format!(
+            "### i:{ID_INS} insight/gotcha «x»  active · rev1 · ~5 tok · уже выдавалось в этой сессии"
+        )));
+        assert!(!marked_seen(&format!(
+            "### i:{ID_INS} insight/gotcha «x»  active · rev1 · ~5 tok"
+        )));
     }
 
     #[test]
