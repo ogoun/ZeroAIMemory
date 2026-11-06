@@ -769,6 +769,7 @@ pub async fn focus_read(st: &AppState, target: &Target, focus: &str, cfg: &ReadC
   - `focus_chunk_whole` — `a:<chunk>` целиком;
   - `focus_marks_only_leaves_seen`;
   - `focus_p95` (`--ignored`): CPU int8 ≤ 120 мс, GPU ≤ 50 мс, 5 целей.
+    «5 целей» — один вызов с 5 целями и одним `focus` (решение контролёра, ревью 7b, I-5).
 - [ ] **Step 2: Реализация.** Проверка: `cargo test -p zam-server --test read_focus $T` — PASS;
   `cargo test -p zam-server --test read_focus $T -- --ignored focus_p95` — числа в журнал.
   Справочная политика «явный фокус» — в отчёте `eval --tokens`.

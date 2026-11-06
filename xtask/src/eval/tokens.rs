@@ -671,7 +671,7 @@ fn run_scenario(s: &Session, c: &Client, counter: &Counter, sc: &Scenario) -> Re
     })
 }
 
-/// Пометка явного фокуса (M6 §6): `[пропущено: <путь заголовков> · ~N t]`.
+/// Пометка явного фокуса (M6 §6): `[пропущено: <адрес> (<подпись>) · ~N t]`.
 const SKIPPED_OPEN: &str = "[пропущено: ";
 
 /// Элемент ответа `memory_read` в Markdown: ссылка цели и текст (заголовок `### <ref> …` и всё
@@ -714,8 +714,9 @@ pub fn read_elements(md: &str, raws: &[String]) -> Vec<ReadElement> {
 /// Что дочитать по пометке пропуска элемента (спецификация M6 §3.4, п. 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reread {
-    /// Названные пометками `[пропущено: …]` секции.
-    Sections(Vec<String>),
+    /// Адреса пометок `[пропущено: …]` явного фокуса: `(поле элемента, значение)` — `range`
+    /// (байты заметки), `locator` (часть документа) или `section` (пометка без адреса).
+    Parts(Vec<(String, String)>),
     /// L2 источника целиком (обрезка `…ещё N токенов` или `(budget)`).
     Whole,
 }
@@ -728,43 +729,99 @@ fn is_cut_marker(line: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Пути секций пометок `[пропущено: <путь> · ~N t]` в тексте.
-fn skipped_sections(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+/// Предел элементов дочитывания по одному диапазону частей документа.
+const REREAD_LOCATORS_MAX: u32 = 20;
+
+/// Адрес части документа `page:3` → `("page", 3)`.
+fn numbered(loc: &str) -> Option<(&str, u32)> {
+    let (k, n) = loc.split_once(':')?;
+    matches!(k, "page" | "slide" | "para")
+        .then(|| n.parse().ok())
+        .flatten()
+        .map(|n| (k, n))
+}
+
+/// Элементы дочитывания по адресу пометки: `range:S-E` → `range`; `page:3 — page:7` → `locator`
+/// каждой части (не больше [`REREAD_LOCATORS_MAX`]; не нумерованные — первая и последняя);
+/// `оглавление` — L2; иначе — путь секции (пометка без адреса).
+fn address_parts(addr: &str) -> Vec<(String, String)> {
+    if let Some(r) = addr.strip_prefix("range:") {
+        return vec![("range".into(), r.to_string())];
+    }
+    if addr == "оглавление" {
+        return Vec::new();
+    }
+    let (first, last) = addr.split_once(" — ").unwrap_or((addr, addr));
+    if first.contains(':') {
+        if let (Some((k1, a)), Some((k2, b))) = (numbered(first), numbered(last))
+            && k1 == k2
+            && a <= b
+        {
+            return (a..=b.min(a + REREAD_LOCATORS_MAX - 1))
+                .map(|n| ("locator".to_string(), format!("{k1}:{n}")))
+                .collect();
+        }
+        let mut v = vec![("locator".to_string(), first.to_string())];
+        if last != first {
+            v.push(("locator".to_string(), last.to_string()));
+        }
+        return v;
+    }
+    vec![("section".into(), addr.to_string())]
+}
+
+/// Адреса пометок `[пропущено: <адрес> (<подпись>) · ~N t]` в тексте (подпись — справочно).
+fn skipped_parts(text: &str) -> (Vec<(String, String)>, bool) {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut whole = false;
     let mut rest = text;
     while let Some(i) = rest.find(SKIPPED_OPEN) {
         let after = &rest[i + SKIPPED_OPEN.len()..];
-        let Some(end) = after.find(']') else {
+        let Some(end) = after.find(" t]") else {
             break;
         };
         let inner = &after[..end];
-        let path = inner.rsplit_once(" · ~").map_or(inner, |(p, _)| p).trim();
-        if !path.is_empty() && !out.iter().any(|p| p == path) {
-            out.push(path.to_string());
+        let head = inner.rsplit_once(" · ~").map_or(inner, |(p, _)| p);
+        let addr = head.split_once(" (").map_or(head, |(a, _)| a).trim();
+        if !addr.is_empty() {
+            let parts = address_parts(addr);
+            if parts.is_empty() {
+                whole = true;
+            }
+            for p in parts {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
         }
         rest = &after[end..];
     }
-    out
+    (out, whole)
 }
 
-/// Пометка пропуска в элементе: секции явного фокуса важнее обрезки; пометок нет — `None`.
+/// Пометка пропуска в элементе: адреса явного фокуса важнее обрезки; пометок нет — `None`.
 pub fn reread_need(element_text: &str) -> Option<Reread> {
-    let sections = skipped_sections(element_text);
-    if !sections.is_empty() {
-        return Some(Reread::Sections(sections));
+    let (parts, whole) = skipped_parts(element_text);
+    if !parts.is_empty() && !whole {
+        return Some(Reread::Parts(parts));
     }
-    element_text
-        .lines()
-        .any(|l| l.trim() == "(budget)" || is_cut_marker(l))
-        .then_some(Reread::Whole)
+    (whole
+        || element_text
+            .lines()
+            .any(|l| l.trim() == "(budget)" || is_cut_marker(l)))
+    .then_some(Reread::Whole)
 }
 
-/// Цели дочитывания одного источника: секции из пометки или L2 целиком (`tier` по умолчанию).
+/// Цели дочитывания одного источника: адреса пометок или L2 целиком (`tier` по умолчанию).
 pub fn reread_items(raw: &str, need: &Reread) -> Vec<Value> {
     match need {
-        Reread::Sections(s) => s
+        Reread::Parts(p) => p
             .iter()
-            .map(|p| json!({ "id": raw, "section": p }))
+            .map(|(k, v)| {
+                let mut o = json!({ "id": raw });
+                o[k.as_str()] = json!(v);
+                o
+            })
             .collect(),
         Reread::Whole => vec![json!({ "id": raw })],
     }
@@ -1063,20 +1120,40 @@ mod tests {
     /// Пометки явного фокуса называют секции: дочитываются они, а не L2 целиком.
     #[test]
     fn reread_prefers_named_sections() {
-        let t = "### n:x a\nлист\n[пропущено: Установка › Linux · ~420 t]\n[пропущено: FAQ · ~80 t]\n…ещё 10 токенов\n";
+        let t = "### n:x a\nлист\n[пропущено: range:0-120 (начало — A > B, секций: 2) · ~40 t]\n\
+                 [пропущено: range:300-420 (FAQ) · ~80 t]\n…ещё 10 токенов\n";
         let need = reread_need(t).unwrap();
         assert_eq!(
             need,
-            Reread::Sections(vec!["Установка › Linux".into(), "FAQ".into()])
+            Reread::Parts(vec![
+                ("range".into(), "0-120".into()),
+                ("range".into(), "300-420".into())
+            ])
         );
         assert_eq!(
             reread_items("n:x", &need),
             [
-                json!({"id": "n:x", "section": "Установка › Linux"}),
-                json!({"id": "n:x", "section": "FAQ"})
+                json!({"id": "n:x", "range": "0-120"}),
+                json!({"id": "n:x", "range": "300-420"})
             ]
         );
         assert_eq!(reread_items("n:x", &Reread::Whole), [json!({"id": "n:x"})]);
+        // документ: диапазон нумерованных частей — каждая; листы — первая и последняя
+        let d = "[пропущено: page:3 — page:5 (стр. 3 — стр. 5) · ~90 t]\n\
+                 [пропущено: sheet:#1!A1:B2 — sheet:#1!A9:B9 (лист) · ~9 t]\n";
+        assert_eq!(
+            reread_items("d:x", &reread_need(d).unwrap()),
+            [
+                json!({"id": "d:x", "locator": "page:3"}),
+                json!({"id": "d:x", "locator": "page:4"}),
+                json!({"id": "d:x", "locator": "page:5"}),
+                json!({"id": "d:x", "locator": "sheet:#1!A1:B2"}),
+                json!({"id": "d:x", "locator": "sheet:#1!A9:B9"}),
+            ]
+        );
+        // часть без адреса — L2
+        let w = "[пропущено: оглавление (оглавление) · ~9 t]\n";
+        assert_eq!(reread_need(w), Some(Reread::Whole));
     }
 
     /// Markdown v2 (M6 §4.1, §4.3, §13): ссылки карточек и подсказок с новым хвостом.

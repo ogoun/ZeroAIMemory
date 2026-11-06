@@ -45,8 +45,8 @@ enum Cmd {
     Read {
         #[arg(required = true)]
         targets: Vec<String>,
-        /// Уровень: L0 (сводка), L1 (оглавление), L2 (полный текст)
-        #[arg(long, value_parser = ["L0", "L1", "L2", "l0", "l1", "l2"])]
+        /// Уровень: L0 (сводка), L1 (оглавление), L2 (полный текст), focus (с --focus)
+        #[arg(long, value_parser = ["L0", "L1", "L2", "l0", "l1", "l2", "focus"])]
         tier: Option<String>,
         /// Секция по пути заголовков: "A > B"
         #[arg(long)]
@@ -77,6 +77,9 @@ enum Cmd {
         /// Пачка: явный фокус — оглавление, ближайшие к запросу листы, «[пропущено: путь · ~N t]»
         #[arg(long, value_name = "ЗАПРОС")]
         focus: Option<String>,
+        /// Пачка: байты S-E текста L2 — адрес «[пропущено: range:S-E …]» фокуса
+        #[arg(long, value_name = "S-E")]
+        range: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -1559,11 +1562,13 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             since_rev,
             locator,
             focus,
+            range,
             common,
         } => {
             let o = cmd::read::Opts {
                 locator: locator.as_deref(),
                 focus: focus.as_deref(),
+                range: range.as_deref(),
                 tier: tier.as_deref(),
                 section: section.as_deref(),
                 rev,

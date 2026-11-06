@@ -75,7 +75,7 @@ async fn wait_indexed(a: &Api, ids: &[String]) {
 
 /// С моделью фокус — по лексике и косинусу листов (без `focus lexical`); срок
 /// `read.focus_timeout_ms` вышел (задержка точкой `test-hooks`) — только лексика с
-/// `focus lexical`, и ответ не ждёт задержки.
+/// `focus lexical`, и ответ не ждёт задержки; срок — один на вызов (5 целей с разными `focus`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn focus_timeout_lexical_fallback() {
     let Some((a, _q)) = ml_api("focus-timeout", MINILM, |c| {
@@ -113,6 +113,31 @@ async fn focus_timeout_lexical_fallback() {
     assert!(
         spent < Duration::from_secs(10),
         "ответ ждал задержку: {spent:?}"
+    );
+    // срок — один на вызов (ревью 7b, I-5): 5 целей с разными `focus` и задержкой эмбеддинга —
+    // ответ не дольше срока (2 с) с допуском, у каждой цели — лексика
+    let mut ids = vec![n];
+    for i in 0..4 {
+        let t = sections_note(8, 10, 2 + i);
+        ids.push(id(&a.note("knowledge", &format!("Пять/{i}"), &t).await));
+    }
+    wait_indexed(&a, &ids).await;
+    let items: Vec<Value> = ids
+        .iter()
+        .enumerate()
+        .map(|(k, n)| json!({"id": format!("n:{n}"), "focus": format!("детектор нейтрино {k}")}))
+        .collect();
+    a.st.focus_delay_ms.store(60_000, Ordering::SeqCst);
+    let t = Instant::now();
+    let j = read_ok(&a, json!({"items": items, "budget_tokens": 20000})).await;
+    let spent = t.elapsed();
+    a.st.focus_delay_ms.store(0, Ordering::SeqCst);
+    for it in j["items"].as_array().unwrap() {
+        assert_eq!(warnings(it), [LEXICAL], "{it}");
+    }
+    assert!(
+        spent < Duration::from_millis(2000 + 1500),
+        "срок не общий на вызов: {spent:?}"
     );
 }
 

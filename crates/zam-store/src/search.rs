@@ -1332,8 +1332,9 @@ pub struct FocusLeaf {
     pub hits: usize,
 }
 
-/// Листы цели явного фокуса `/read` (M6 §6) по порядку и совпадения слов `needles` (FTS5,
-/// только `rowid`) — в одной читающей транзакции, как [`leaf_term_hits`]. Узел и запись журнала —
+/// Листы цели явного фокуса `/read` (M6 §6) по порядку и совпадения слов `needles` (FTS5 по
+/// колонкам `text` и `heading_path`, только `rowid` в диапазоне листов цели) — в одной читающей
+/// транзакции, как [`leaf_term_hits`]. Узел и запись журнала —
 /// листы `level = 'chunk'`, документ вложения (`TargetKind::Attachment`) — его чанки.
 pub async fn focus_leaves(
     db: &Db,
@@ -1379,12 +1380,20 @@ pub async fn focus_leaves(
         if leaves.is_empty() {
             return Ok(leaves);
         }
-        let mut st = tx.prepare_cached("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1")?;
+        // только колонки текста и пути заголовков (не `context_prefix`: он общий у всех листов
+        // цели) и только `rowid` листов цели — индекс FTS не проходится целиком
+        let (lo, hi) = seqs
+            .keys()
+            .fold((i64::MAX, i64::MIN), |(a, b), &k| (a.min(k), b.max(k)));
+        let mut st = tx.prepare_cached(
+            "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3",
+        )?;
         for n in needles.iter().take(MAX_TERMS) {
             let Some(fts) = sanitize_fts(n) else {
                 continue;
             };
-            for seq in st.query_map([fts], |r| r.get::<_, i64>(0))? {
+            let q = format!("{{text heading_path}} : ({fts})");
+            for seq in st.query_map(params![q, lo, hi], |r| r.get::<_, i64>(0))? {
                 if let Some(&i) = seqs.get(&seq?) {
                     leaves[i].hits += 1;
                 }

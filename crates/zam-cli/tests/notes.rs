@@ -536,7 +536,8 @@ fn read_since_rev_cli() {
 }
 
 /// `zam read <цель> --focus "<запрос>"` (M6 §6): пачкой с `focus` — оглавление, лист и пометки
-/// `[пропущено: …]`, `--json` — `tier: "focus"`; с `--section` — код 6.
+/// `[пропущено: range:S-E …]` (дочитать — `--range`), `--json` — `tier: "focus"`, `--tier focus`; с
+/// `--section` и `--tier focus` без `--focus` — код 6.
 #[test]
 fn read_focus_cli() {
     let e = Env::new("read-focus");
@@ -558,7 +559,30 @@ fn read_focus_cli() {
     assert!(s.contains(" · фокус · ~"), "{s}");
     assert!(s.contains("*Глава 6"), "{s}");
     assert!(s.contains("протокол квазиметрии"), "{s}");
-    assert!(s.contains("[пропущено: Справочник > Глава 1 · ~"), "{s}");
+    assert!(s.contains("[пропущено: range:0-"), "{s}");
+    assert!(s.contains(" (Справочник — Справочник > Глава "), "{s}");
+    // дочитывание по адресу пометки — `--range`
+    let addr = s
+        .split("[пропущено: range:")
+        .nth(1)
+        .and_then(|r| r.split_once(' '))
+        .map(|(a, _)| a.to_string())
+        .unwrap();
+    let r = ok(&e.run(&["read", "knowledge:f1", "--range", &addr]));
+    assert!(r.contains(&format!(" › range:{addr}")), "{r}");
+    assert!(r.contains("Абзац 0 главы 1 "), "{r}");
+    // `--tier focus` с `--focus` — то же; без `--focus` — код 6
+    let s2 = ok(&e.run(&[
+        "read",
+        "knowledge:f1",
+        "--tier",
+        "focus",
+        "--focus",
+        "протокол квазиметрии",
+    ]));
+    assert!(s2.contains(" · фокус · ~"), "{s2}");
+    let o = e.run(&["read", "knowledge:f1", "--tier", "focus"]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
     let v: serde_json::Value = serde_json::from_str(&ok(&e.run(&[
         "read",
         "knowledge:f1",

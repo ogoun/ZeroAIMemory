@@ -1509,6 +1509,7 @@ async fn mcp_read_focus() {
         .unwrap();
     let props = &t["inputSchema"]["properties"]["items"]["items"]["properties"];
     assert_eq!(props["focus"]["type"], "string", "{t}");
+    assert_eq!(props["range"]["type"], "string", "{t}");
     assert!(
         props["tier"]["enum"]
             .as_array()
@@ -1544,7 +1545,8 @@ async fn mcp_read_focus() {
     assert!(o.text.contains("Оглавление: "), "{}", o.text);
     assert!(o.text.contains("*Глава 6"), "{}", o.text);
     assert!(
-        o.text.contains("[пропущено: Справочник > Глава 1 · ~"),
+        o.text.contains("[пропущено: range:0-")
+            && o.text.contains(" (Справочник — Справочник > Глава "),
         "{}",
         o.text
     );
