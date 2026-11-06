@@ -214,12 +214,7 @@ pub fn hint_line(lead: &str, title: &str, tags: &[&str], reference: &str) -> Str
         .iter()
         .copied()
         .filter(|t| !t.is_empty())
-        .map(|t| match t {
-            "axiom" => "ax",
-            "theorem" => "th",
-            "hypothesis" => "hyp",
-            other => other,
-        })
+        .map(zam_core::certainty_short)
         .collect();
     let mut s = format!("{HINT_PREFIX} {lead}{}", one_line(title));
     if !tags.is_empty() {

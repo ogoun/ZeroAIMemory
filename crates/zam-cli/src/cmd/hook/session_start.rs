@@ -25,10 +25,13 @@
 //! ([`crate::cmd::code::auto::maybe_spawn_sync`]; сервер для запуска не нужен).
 //! M6 §7.1: каждый старт с `session_id` (новая сессия, `/clear`, `resume`, `compact`) пишет
 //! привязку `zam mcp` к сессии — `cache/agent-<pid>.json` ([`binding::write_binding`]) без сети.
-//! M6, задача 5: локальная уборка (кэш, `session.json`, привязка, очередь субагентов, сброс
-//! показанного) идёт в своём потоке параллельно запросам и не тратит их бюджет; хук ждёт её не
-//! дольше остатка бюджета ([`housekeeping`]).
+//! M6, задача 5: локальная запись идёт в своём потоке параллельно запросам и не тратит их
+//! бюджет. Сначала обязательное — `session.json`, привязка, сброс показанного ([`critical`]):
+//! хук ждёт его после запросов до [`CRITICAL_WAIT_MAX`] (неверная сессия у `zam mcp` хуже
+//! опоздания хука); затем уборка ([`best_effort`]: срок кэша, субагенты, уплотнение очередей) —
+//! только в остатке бюджета.
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -52,10 +55,13 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     out
 }
 
-/// Локальная уборка старта (без сети): кэш, текущая сессия, привязка `zam mcp`, очередь
-/// субагентов, сброс показанного после `compact`/`clear`.
-fn housekeeping(env: &Env, session: Option<&str>, source: Option<&str>) {
-    cache::gc_cache(env);
+/// Потолок ожидания записи привязки сессии и `session.json` после запросов хука (ревью задачи
+/// 5 M6, I-1): опоздание хука лучше неверной сессии у `zam mcp` (§7.1).
+pub const CRITICAL_WAIT_MAX: Duration = Duration::from_millis(1500);
+
+/// Обязательная запись старта (без сети): текущая сессия (`session.json`), привязка `zam mcp`
+/// (§7.1) и сброс показанного после `compact`/`clear`. Хук ждёт её до [`CRITICAL_WAIT_MAX`].
+fn critical(env: &Env, session: Option<&str>, source: Option<&str>) {
     let Some(id) = session else {
         return;
     };
@@ -64,8 +70,6 @@ fn housekeeping(env: &Env, session: Option<&str>, source: Option<&str>) {
     if let Err(e) = binding::write_binding(&env.root, id) {
         env.log(&format!("привязка MCP к сессии: {e}"));
     }
-    // просроченные запуски субагентов (§9.4) не ждут следующего `subagent-start`
-    cache::prune_spawns(env, id);
     if matches!(source, Some("compact" | "clear")) {
         let mut sh = cache::read_shown(env, id);
         if !sh.shown.is_empty() {
@@ -75,28 +79,48 @@ fn housekeeping(env: &Env, session: Option<&str>, source: Option<&str>) {
     }
 }
 
+/// Уборка «по возможности»: срок кэша, очередь запусков субагентов, уплотнение очередей
+/// изменённых файлов больше 4 МиБ. Хук ждёт её только в остатке бюджета; не успела — процесс
+/// выходит без неё (файлы пишутся атомарно, брошенные `.tmp` убирает следующий `gc_cache`).
+/// Уплотнение держит замок очереди, и `flush_changed` того же старта ждёт его не дольше 50 мс
+/// (`CHANGED_LOCK_WAIT`), — бюджет запросов оно не съедает.
+fn best_effort(env: &Env, session: Option<&str>) {
+    cache::gc_cache(env);
+    if let Some(id) = session {
+        // просроченные запуски субагентов (§9.4) не ждут следующего `subagent-start`
+        cache::prune_spawns(env, id);
+    }
+    cache::compact_changed_queues(env);
+}
+
 /// Регистрация сессии, дайджест, кэши и очереди (см. модуль).
 fn digest(env: &Env, inp: &Input, s: &Settings) -> Output {
     let session = inp.session_id.as_deref();
     let source = inp.str("source");
-    // уборка — в своём потоке, параллельно запросам (M6, задача 5, A): снимок процессов и
-    // запись файлов на занятом HDD съедали бюджет до запроса («бюджет исчерпан», пакет
-    // восстановления без сервера). Хук ждёт её не дольше остатка бюджета.
-    let done = {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
+    // локальная запись — в своём потоке, параллельно запросам (M6, задача 5, A): снимок
+    // процессов и запись файлов на занятом HDD съедали бюджет до запроса («бюджет исчерпан»,
+    // пакет восстановления без сервера). Сначала — обязательное, затем уборка.
+    let (crit_rx, rest_rx) = {
+        let (crit_tx, crit_rx) = std::sync::mpsc::channel::<()>();
+        let (rest_tx, rest_rx) = std::sync::mpsc::channel::<()>();
         let env2 = env.clone();
         let (sid, src) = (session.map(str::to_string), source.map(str::to_string));
         std::thread::spawn(move || {
-            housekeeping(&env2, sid.as_deref(), src.as_deref());
-            let _ = tx.send(());
+            critical(&env2, sid.as_deref(), src.as_deref());
+            let _ = crit_tx.send(());
+            best_effort(&env2, sid.as_deref());
+            let _ = rest_tx.send(());
         });
-        rx
+        (crit_rx, rest_rx)
     };
     let out = digest_net(env, inp, s, session, source);
-    // остаток бюджета минус резерв на вывод; не успела — процесс выходит без неё (файлы
-    // кэша пишутся атомарно, брошенные `.tmp` убирает `gc_cache`)
+    // привязку и `session.json` — дождаться (потолок — [`CRITICAL_WAIT_MAX`]), уборку — только
+    // в остатке бюджета
+    if crit_rx.recv_timeout(CRITICAL_WAIT_MAX).is_err() {
+        env.log("привязка MCP к сессии: запись не завершилась за 1,5 с");
+    }
     if let Some(left) = env.http_left() {
-        let _ = done.recv_timeout(left);
+        let _ = rest_rx.recv_timeout(left);
     }
     out
 }
@@ -172,9 +196,6 @@ fn digest_net(
         let want_refs = s.flag_on(Flag::FileContext) && env.solution.is_some();
         let c = &client;
         let refs = sc.spawn(move || {
-            // очереди изменённых файлов больше 4 МиБ — уплотнение здесь, не в бюджете
-            // `post-tool`, и до их отправки
-            cache::compact_changed_queues(env);
             cache::flush_changed(env, c, None);
             want_refs.then(|| cache::refresh_file_refs(env, c))
         });

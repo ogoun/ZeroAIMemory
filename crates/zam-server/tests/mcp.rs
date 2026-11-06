@@ -3305,6 +3305,44 @@ async fn mcp_update_entry_one_line_le_80_tokens() {
     }
 }
 
+/// `memory_update_entry` с предупреждениями (секрет в дописанном теле): одна строка, они — в ней
+/// через «; », ≤ 80 токенов (M6 §5, ревью задачи 5, M3).
+#[tokio::test]
+async fn mcp_update_entry_warnings_one_line() {
+    let a = api("mcp-update-warn", |_| {}).await;
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "insight", "title": "Ключи в конфиге", "body": "Разобрано.",
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let id = o
+        .text
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("i:"))
+        .unwrap()
+        .to_string();
+    let key = ["AK", "IA", "IOSFODNN7", "EXAMPLE"].concat();
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("i:{id}"), "action": "append", "rev": 1,
+               "body": format!("Ключ {key} в конфиге.")}),
+    )
+    .await;
+    let lines = body_lines(&o);
+    assert_eq!(lines.len(), 1, "{}", o.text);
+    assert!(lines[0].contains(" · warning: "), "{}", o.text);
+    assert!(!o.text.contains(&key), "{}", o.text);
+    let n = zam_store::count_tokens(&o.text);
+    assert!(n <= 80, "{n} токенов: {}", o.text);
+}
+
 /// `memory_log` с предупреждениями: строка записи и по строке на предупреждение.
 #[tokio::test]
 async fn memory_log_warnings_line_per_warning() {

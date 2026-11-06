@@ -185,12 +185,15 @@
 //! `status`, `insight_kind` (`data.kind`), `certainty`, `title`; путь у записи пуст,
 //! `expand` и L0 к записям не применяются.
 //!
-//! **Формат `md`** — карточки §9.3, по одной на элемент:
-//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N>[ · <certainty>] · <дата> ·
-//! <возраст> · ~<N> tok` (возраст — `N дн. назад` или `сегодня`, его же получает MCP);
-//! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> ·
-//! <возраст> · ~<N> tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются; у
-//! соседа `expand=graph` — ` · via <тип> ← <родитель>`),
+//! **Формат `md`** — карточки v2 (§9.3, M6 §4.1), по одной на элемент:
+//! `<n>. n:<id> <пространство>/<путь> › <секция>  [.82] r<N>[ · ax|th|hyp] · <дата UTC
+//! yyyy-MM-dd HH:mm:ss> · <N>t` ([`card_tail`]; возраста нет, `age_days` — в JSON); у записи —
+//! `<n>. i:<id> insight/<вид> «<заголовок>»  [.77][ hyp ·][ <статус, если не active> ·] <дата> ·
+//! <N>t` (`c:` — changelog, `r:` — release; ревизии в хвосте записи нет), у папки —
+//! `f:<id> <пространство>/<путь>/  [.61] <N> детей`; у соседа `expand=graph` — ` · via <тип> ←
+//! <родитель>`. **Бюджет** Markdown — вся карточка счётчиком сервера вместе со строками
+//! деградации, предупреждений и строкой MCP `~N tok` ([`pack_items`]); `brief`/`notes` без
+//! карточек с баллом ниже `brief_min_rel × лучший` (поле запроса или `search.brief_min_rel`).
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
 //! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
 //! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
@@ -1456,7 +1459,10 @@ fn md_body(
 }
 
 /// Фрагмент или L0 карточки, урезанный до `room` токенов карточки целиком (по границе символа,
-/// незакрытый маркер совпадения закрывается, в конце — `…`).
+/// незакрытый маркер совпадения закрывается, в конце — `…`). Стоимость считается по префиксу
+/// с закрытием, но `truncate_to_tokens` ещё отступает к границе слова; на стыке счёт токенизатора
+/// неаддитивен, так что первая карточка может выйти на 1 токен дороже `room` — только она:
+/// следующие берутся целиком или не берутся, а итог проверяет цикл по Markdown целиком.
 fn cut_summary(full: &str, cost: &dyn Fn(&str) -> usize, room: usize) -> String {
     let close = |t: &str| -> String {
         let opened = t.matches(MARK_START).count() > t.matches(MARK_END).count();
@@ -1732,16 +1738,6 @@ pub(crate) fn score_text(score: f64) -> String {
     }
 }
 
-/// Сокращение надёжности в тексте агенту (M6 §4.1): `ax`, `th`, `hyp`; прочее — как есть.
-pub(crate) fn certainty_short(c: &str) -> &str {
-    match c {
-        "axiom" => "ax",
-        "theorem" => "th",
-        "hypothesis" => "hyp",
-        other => other,
-    }
-}
-
 /// Хвост карточки v2 (M6 §4.1): `[.82] r7 · th · 2026-10-10 14:03:22 · 340t` — балл, ревизия
 /// (`rev = 0` — без неё: записи журнала, вложения), надёжность, статус записи (только не
 /// `active`), дата обновления UTC `yyyy-MM-dd HH:mm:ss`, размер в токенах. Возраста «N дн.
@@ -1759,7 +1755,7 @@ pub(crate) fn card_tail(
         parts.push(format!("r{rev}"));
     }
     if let Some(c) = certainty.filter(|c| !c.is_empty()) {
-        parts.push(certainty_short(c).to_string());
+        parts.push(zam_core::certainty_short(c).to_string());
     }
     if let Some(st) = status.filter(|st| !st.is_empty() && *st != "active") {
         parts.push(st.to_string());
@@ -1858,11 +1854,11 @@ fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) 
     // у переставленных реранкером `score` — его балл с бустами (§9.2 п. 5)
     let score = p.item.score.min(1.0);
     let mut line = match (&h.entry, p.item.folder) {
-        // карточка папки: `f:<id> <пространство>/<путь>/  [.61] · 4 детей`
+        // карточка папки: `f:<id> <пространство>/<путь>/  [.61] 4 детей`
         (_, Some(children)) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             format!(
-                "{n}. f:{} {space}/{}/  [{}] · {children} детей\n",
+                "{n}. f:{} {space}/{}/  [{}] {children} детей\n",
                 h.target.id,
                 h.path,
                 score_text(score)

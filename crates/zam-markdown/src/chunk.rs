@@ -79,69 +79,161 @@ impl TokenCounter for ApproxCounter {
     }
 }
 
-/// Оценка сверху без токенизатора — для **бюджетов выдачи** (M6, задача 5): не меньше счёта
-/// bge-m3 на корпусе eval (заметки целиком и карточки поиска с полными id; тест
-/// `upper_estimate_not_below_bge_on_eval_corpus` в `zam-ml`), завышение около 20–30 %.
-/// [`ApproxCounter`] на выдаче сервера занижал ~15 %: id в Crockford base32 (26 символов ≈
-/// 19 токенов) и знаки стоят дороже 3,5 символа на токен. Чанкер её не использует: размеры
-/// листов подобраны под [`ApproxCounter`] и токенизатор модели.
+/// Оценка сверху без токенизатора — для **бюджетов выдачи** (M6, задача 5; правки ревью I-2):
+/// не меньше счёта bge-m3 на корпусе eval — заметки целиком, карточки поиска с полными id,
+/// идентификаторы и пути кода (CamelCase, snake_case, C#/Java/TS), CJK, корейский, греческий,
+/// смешанные строки (тест `upper_estimate_not_below_bge_on_eval_corpus` в `zam-ml`). Цена
+/// гарантии — завышение к bge-m3: заметки ×1,58, карточки ×1,48, строки карты кода ×1,46, пути
+/// ×1,64, идентификаторы ×2,0 (C#/Java/TS ×1,83), CJK и прочие письменности ×1,45. Отдельные
+/// фрагменты строк (разделители таблиц Markdown и т. п.) не гарантируются: ~3 % из них ниже
+/// bge-m3 — бюджет считается по целым ответам. [`ApproxCounter`] на выдаче занижал
+/// ~15 %, на идентификаторах — до 60 %. Чанкер её не использует: размеры листов подобраны под
+/// [`ApproxCounter`] и токенизатор модели.
 ///
-/// Текст делится на серии букв и цифр, серии пробелов и отдельные прочие символы; стоимость
-/// (в тысячных токена) — [`UPPER_WORD`] за серию букв и цифр плюс за каждый её символ: смешанная
-/// серия (буквы и цифры: id, хэши) [`UPPER_MIXED`], только цифры [`UPPER_DIGIT`], только ASCII
-/// буквы [`UPPER_LATIN`], прочие буквы [`UPPER_OTHER`]; знак — [`UPPER_PUNCT`]; пробелы — 0.
-/// Коэффициенты — верхняя линейная оценка (линейное программирование по корпусу eval и выдаче
-/// пилотов M6, журнал задачи 5). Оценка монотонна на префиксах.
+/// Текст делится на серии букв и цифр, пробелы и отдельные прочие символы. Серия режется на
+/// подсерии ([`upper_subruns`]): смена вида символа (цифра, ASCII, кириллица, прочие
+/// письменности), переход строчная→заглавная, конец серии заглавных перед строчной
+/// (`HTTPServer` → `HTTP|Server`). Серия «кодовая», если у неё больше одной подсерии или рядом
+/// знак кода (`_./\:#<>()[]{}=-@$`), иначе — слово прозы. Стоимость подсерии — по таблице
+/// [`UPPER_TABLE`] (основа + за символ, тысячные токена) для её класса; знак ASCII — 0,5, прочий
+/// знак — 1; прочие письменности (CJK, хангыль, греческий…) — не меньше 1 токена на символ.
+/// Коэффициенты — верхняя линейная оценка (линейное программирование по корпусу, журнал
+/// задачи 5, `.tmp/m6/task5/diag/upper3_fit.py`); «кодовая» подсерия не дешевле такой же в
+/// прозе, поэтому оценка не убывает при дописывании текста по символу.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpperCounter;
 
-/// Серия букв и цифр, тысячных токена.
-pub const UPPER_WORD: usize = 1000;
-/// Символ смешанной серии (буквы и цифры).
-pub const UPPER_MIXED: usize = 950;
-/// Символ серии из одних цифр.
-pub const UPPER_DIGIT: usize = 340;
-/// Символ серии из одних ASCII букв.
-pub const UPPER_LATIN: usize = 110;
-/// Символ серии с не-ASCII буквами (кириллица и др.).
-pub const UPPER_OTHER: usize = 130;
-/// Знак (не буква, не цифра, не пробел).
-pub const UPPER_PUNCT: usize = 1334;
+/// Класс подсерии для [`UPPER_TABLE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpperClass {
+    Digit,
+    /// ASCII буквы, 1–3 символа.
+    Latin,
+    /// ASCII буквы, 4–7.
+    Latin4,
+    /// ASCII буквы, 8 и больше.
+    Latin8,
+    /// Только заглавные ASCII, от 2 символов.
+    Upper,
+    /// Кириллица, 1–5.
+    Cyr,
+    /// Кириллица, 6 и больше.
+    Cyr6,
+    /// Прочие письменности.
+    Other,
+}
 
-/// Стоимость серии букв и цифр: `chars` символов, есть ли цифры, буквы и не-ASCII.
-fn upper_run(chars: usize, digit: bool, alpha: bool, non_ascii: bool) -> usize {
-    let per = match (digit, alpha) {
-        (true, true) => UPPER_MIXED,
-        (true, false) => UPPER_DIGIT,
-        _ if non_ascii => UPPER_OTHER,
-        _ => UPPER_LATIN,
-    };
-    UPPER_WORD + per * chars
+/// Стоимость подсерии, тысячные токена: `(основа, за символ)`.
+type UpperCost = (usize, usize);
+
+/// Стоимость подсерии по классу: для прозы и для кода.
+const UPPER_TABLE: [(UpperClass, UpperCost, UpperCost); 8] = [
+    (UpperClass::Digit, (1000, 0), (1000, 320)),
+    (UpperClass::Latin, (1000, 0), (1000, 630)),
+    (UpperClass::Latin4, (4000, 0), (4000, 0)),
+    (UpperClass::Latin8, (1000, 500), (1000, 500)),
+    (UpperClass::Upper, (1000, 580), (1000, 580)),
+    (UpperClass::Cyr, (1000, 0), (1000, 0)),
+    (UpperClass::Cyr6, (1000, 200), (1000, 200)),
+    (UpperClass::Other, (1000, 1000), (1000, 1000)),
+];
+
+/// Знак ASCII (не буква, не цифра, не пробел), тысячные токена.
+const UPPER_PUNCT: usize = 500;
+/// Прочий знак (не ASCII).
+const UPPER_SYMBOL: usize = 1000;
+/// Знаки кода рядом с серией — серия «кодовая».
+const UPPER_CODE_PUNCT: &str = "_./\\:#<>()[]{}=-@$";
+
+/// Вид символа серии: 0 — ASCII цифра, 1 — ASCII буква, 2 — кириллица, 3 — прочее.
+fn upper_kind(c: char) -> u8 {
+    if c.is_ascii_digit() {
+        0
+    } else if c.is_ascii() {
+        1
+    } else if ('\u{0400}'..='\u{04FF}').contains(&c) {
+        2
+    } else {
+        3
+    }
+}
+
+/// Подсерии серии букв и цифр (см. [`UpperCounter`]): границы подсерий.
+fn upper_subruns(run: &[char]) -> Vec<&[char]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 1..run.len() {
+        let (a, c) = (run[i - 1], run[i]);
+        let next = run.get(i + 1).copied();
+        let split = upper_kind(a) != upper_kind(c)
+            || (c.is_uppercase() && a.is_lowercase())
+            || (a.is_uppercase() && c.is_uppercase() && next.is_some_and(char::is_lowercase));
+        if split {
+            out.push(&run[start..i]);
+            start = i;
+        }
+    }
+    out.push(&run[start..]);
+    out
+}
+
+/// Класс подсерии.
+fn upper_class(s: &[char]) -> UpperClass {
+    match upper_kind(s[0]) {
+        0 => UpperClass::Digit,
+        1 if s.len() >= 2 && s.iter().all(|c| c.is_uppercase()) => UpperClass::Upper,
+        1 if s.len() >= 8 => UpperClass::Latin8,
+        1 if s.len() >= 4 => UpperClass::Latin4,
+        1 => UpperClass::Latin,
+        2 if s.len() >= 6 => UpperClass::Cyr6,
+        2 => UpperClass::Cyr,
+        _ => UpperClass::Other,
+    }
 }
 
 impl TokenCounter for UpperCounter {
     fn count(&self, text: &str) -> usize {
-        let mut milli = 0usize;
-        // текущая серия букв и цифр: длина, цифры, буквы, не-ASCII
-        let mut run = (0usize, false, false, false);
-        for c in text.chars() {
+        let chars: Vec<char> = text.chars().collect();
+        // текст с не-ASCII знака: у SentencePiece префикс слова `▁` становится отдельным токеном
+        let lead = chars
+            .iter()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| !c.is_alphanumeric() && !c.is_ascii());
+        let mut milli = if lead { UPPER_SYMBOL } else { 0 };
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
             if c.is_alphanumeric() {
-                run.0 += 1;
-                run.1 |= c.is_numeric();
-                run.2 |= !c.is_numeric();
-                run.3 |= !c.is_ascii();
+                let mut j = i;
+                while j < chars.len() && chars[j].is_alphanumeric() {
+                    j += 1;
+                }
+                let subs = upper_subruns(&chars[i..j]);
+                let near = |k: Option<&char>| k.is_some_and(|c| UPPER_CODE_PUNCT.contains(*c));
+                let code = subs.len() > 1
+                    || near(i.checked_sub(1).and_then(|p| chars.get(p)))
+                    || near(chars.get(j));
+                for s in subs {
+                    let class = upper_class(s);
+                    let (_, prose, kode) = UPPER_TABLE
+                        .iter()
+                        .find(|(k, _, _)| *k == class)
+                        .copied()
+                        .expect("класс в таблице");
+                    let (base, per) = if code { kode } else { prose };
+                    milli += base + per * s.len();
+                }
+                i = j;
                 continue;
             }
-            if run.0 > 0 {
-                milli += upper_run(run.0, run.1, run.2, run.3);
-                run = (0, false, false, false);
-            }
             if !c.is_whitespace() {
-                milli += UPPER_PUNCT;
+                milli += if c.is_ascii() {
+                    UPPER_PUNCT
+                } else {
+                    UPPER_SYMBOL
+                };
             }
-        }
-        if run.0 > 0 {
-            milli += upper_run(run.0, run.1, run.2, run.3);
+            i += 1;
         }
         milli.div_ceil(1000)
     }
@@ -151,7 +243,7 @@ impl TokenCounter for UpperCounter {
     }
 
     fn tokenizer_id(&self) -> String {
-        "upper-v1".into()
+        "upper-v2".into()
     }
 }
 

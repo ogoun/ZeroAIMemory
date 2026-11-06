@@ -92,6 +92,11 @@ pub fn put(ctx: &Ctx, o: &PutOpts) -> Result<(), CliError> {
     if let Some(g) = o.solution {
         body["solution"] = json!(super::solution_guid(ctx, Some(g))?);
     }
+    // `--json` — прежняя форма ответа для скриптов (с `summary`; сервер M6 без `echo` её не
+    // отдаёт, §5); старый сервер поле `echo` не знает — без `--json` оно не шлётся
+    if ctx.json {
+        body["echo"] = json!(true);
+    }
     let v = read_json(ctx.client.post_json("/cache", &body)?)?;
     if ctx.json {
         return emit_json(&v);

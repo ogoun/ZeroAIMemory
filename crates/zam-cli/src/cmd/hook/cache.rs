@@ -81,12 +81,7 @@ impl Trigger {
     /// `ZeroAIMemory: <lead><title> [<вид>·<cert>] i:<id>`, надёжность — `ax`, `th`, `hyp`.
     pub fn hint(&self, lead: &str) -> String {
         let title = self.title.split_whitespace().collect::<Vec<_>>().join(" ");
-        let cert = match self.certainty.as_deref().unwrap_or("") {
-            "axiom" => "ax",
-            "theorem" => "th",
-            "hypothesis" => "hyp",
-            other => other,
-        };
+        let cert = zam_core::certainty_short(self.certainty.as_deref().unwrap_or(""));
         let tags: Vec<&str> = [self.insight_kind.as_str(), cert]
             .into_iter()
             .filter(|t| !t.is_empty())

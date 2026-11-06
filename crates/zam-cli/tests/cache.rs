@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use serde_json::Value;
+
 use zam_server::build;
 use zam_server::config::ServerConfig;
 use zam_store::Access;
@@ -190,4 +192,34 @@ CRLF ломает всё.
         b"",
     );
     assert_eq!(o.status.code(), Some(6));
+}
+
+/// `zam cache put --json` — прежняя форма ответа `POST /cache` с `summary` (сервер M6 без
+/// `echo: true` его не отдаёт; ревью задачи 5, M6); без `--json` — только ссылка.
+#[test]
+fn cache_put_json_keeps_summary() {
+    let (url, tok) = start("put-json");
+    let r = tmp("put-json-repo");
+    let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
+    let b = ok(&z(
+        &["write", "knowledge:Инструменты/Git"],
+        "# Git\n\nLF.\n".as_bytes(),
+    ));
+    let b_id = b.trim().split('@').next().unwrap().to_string();
+    let put = |q: &str, json: bool| {
+        let src = format!("n:{b_id}");
+        let mut args = vec!["cache", "put", "--query", q, "--sources", src.as_str()];
+        if json {
+            args.push("--json");
+        }
+        ok(&z(&args, "Пишите с LF.\n".as_bytes()))
+    };
+    let j: Value = serde_json::from_str(put("git и переводы строк", true).trim()).unwrap();
+    assert_eq!(j["summary"], "Пишите с LF.\n", "{j}");
+    assert!(j["ref"].as_str().unwrap().starts_with("c_"), "{j}");
+    let plain = put("git и переводы строк ещё", false);
+    assert!(
+        plain.trim().starts_with("c_") && !plain.contains("Пишите"),
+        "{plain}"
+    );
 }

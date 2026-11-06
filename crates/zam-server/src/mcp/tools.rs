@@ -766,6 +766,24 @@ fn warnings_md(v: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Предупреждения ответа в ту же строку (`memory_update_entry`, M6 §5: ответ — одна строка):
+/// ` · warning: <a>; <b>`; нет предупреждений — пусто.
+fn warnings_inline(v: &Value) -> String {
+    let items: Vec<String> = v["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.is_empty() {
+        String::new()
+    } else {
+        format!(" · warning: {}", items.join("; "))
+    }
+}
+
 // ---- инструменты ----
 
 async fn search(rest: &Rest, args: &JsonObject) -> Res {
@@ -1058,7 +1076,7 @@ fn entry_short(e: &Value) -> String {
         s.push_str(&format!(" · {x}"));
     }
     if let Some(x) = e["certainty"].as_str() {
-        s.push_str(&format!(" · {}", crate::api::search::certainty_short(x)));
+        s.push_str(&format!(" · {}", zam_core::certainty_short(x)));
     }
     s
 }
@@ -1363,16 +1381,16 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         .map_err(|e| {
             e.hint("Ревизию записи (rev) даёт memory_read её id или карточка memory_search.")
         })?;
-    // одна строка (M6 §5); предупреждения — по строке на каждое
+    // одна строка (M6 §5), предупреждения — в ней же через «; »
     done(f, &r, |v| match v.get("entry").filter(|e| e.is_object()) {
         // замещение: {entry, superseded}
         Some(new) => format!(
             "Новая {} · замещена {}{}",
             entry_short(new),
             entry_ref_of(&v["superseded"]),
-            warnings_md(v)
+            warnings_inline(v)
         ),
-        None => format!("Обновлено {}{}", entry_short(v), warnings_md(v)),
+        None => format!("Обновлено {}{}", entry_short(v), warnings_inline(v)),
     })
 }
 

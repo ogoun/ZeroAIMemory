@@ -1352,6 +1352,14 @@ fn points(a: &EvalArgs) -> Result<Vec<grid::Point>> {
     Ok(pts)
 }
 
+/// Ключ точки меняет индекс (один индекс на все точки — методика, правило 1): `[index]`
+/// (пороги нарезки `chunk_*` и прочее), `[ml]` (модель, устройство, окна) и `[qdrant]`.
+pub(crate) fn changes_index(env_key: &str) -> bool {
+    ["ZAM_INDEX__", "ZAM_ML__", "ZAM_QDRANT__"]
+        .iter()
+        .any(|p| env_key.starts_with(p))
+}
+
 /// `cargo xtask eval --tokens --via mcp`.
 pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     // до любой работы: сетка на holdout запрещена
@@ -1422,10 +1430,10 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     // корпус грузится и индексируется один раз, каждая точка — на свежей копии каталога (выжимки
     // и `session_seen` прошлой точки исказили бы путь (а)) с перезапуском под своими `ZAM_*`
     for pt in &pts {
-        if pt.env.keys().any(|k| k.starts_with("ZAM_INDEX__")) {
+        if let Some(k) = pt.env.keys().find(|k| changes_index(k)) {
             bail!(
-                "точка {}: ключи index.* меняют индекс — сетка параметров индексации — \
-                 отдельно (методика, правило 3)",
+                "точка {}: {k} меняет индекс (нарезка или модель) — сетка параметров индексации \
+                 — отдельно (методика, правило 3)",
                 pt.name
             );
         }
@@ -1688,6 +1696,23 @@ fn compare_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ревью задачи 5, M8: точка сетки ТС-1 не может менять индекс — ни нарезку, ни модель.
+    #[test]
+    fn one_index_guard_covers_chunker_and_ml() {
+        for k in [
+            "ZAM_INDEX__CHUNK_TARGET_MAX",
+            "ZAM_INDEX__CHUNK_PREFIX_L0",
+            "ZAM_ML__EMBED_MODEL",
+            "ZAM_ML__DEVICE",
+            "ZAM_QDRANT__EXACT_SEARCH",
+        ] {
+            assert!(changes_index(k), "{k}");
+        }
+        for k in ["ZAM_SEARCH__BUDGET_TOKENS", "ZAM_RECALL__SNIPPET_TOKENS"] {
+            assert!(!changes_index(k), "{k}");
+        }
+    }
     use crate::eval::nuggets::Nugget;
 
     fn path(tokens: usize, found: usize, complete: bool) -> AgentPath {
@@ -2063,8 +2088,14 @@ mod tests {
         assert!(cache_first("\n[cache] c_X «вопрос»\n### n:..."));
         assert!(!cache_first("### n:x\n[cache] ниже\n"));
         let id = format!("c_{}", "0".repeat(10) + &"A".repeat(16));
-        let put = format!("Выжимка {id} сохранена: «q» · 12 tok · источников 1 · valid\n~20 tok");
-        assert_eq!(cache_ref(&put), Some(id));
+        // ответ MCP v2 (M6 §5): одна строка без эха запроса
+        let put = format!("Выжимка {id} · 12t · ист. 1 · valid\n~20 tok");
+        assert_eq!(cache_ref(&put), Some(id.clone()));
+        let promoted = format!(
+            "Выжимка {id} · 12t · ист. 1 · valid → n:{}\n~30 tok",
+            "B".repeat(26)
+        );
+        assert_eq!(cache_ref(&promoted), Some(id));
         assert_eq!(cache_ref("Выжимка ? сохранена"), None);
     }
 

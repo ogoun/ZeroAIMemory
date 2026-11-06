@@ -637,8 +637,66 @@ fn session_start_compact_budget_kept_with_slow_binding() {
         text.contains(&format!("i:{id}")),
         "пакет восстановления сервера: {text}\n{log}"
     );
-    // хук не ждёт медленную уборку дольше своего бюджета (запас — как у R3)
+    // хук ждёт запись привязки (ревью задачи 5, I-1), но не дольше потолка 1,5 с
+    assert!(
+        took < max_for("session-start") + Duration::from_millis(1500),
+        "{took:?}"
+    );
+    // после выхода хука привязка `zam mcp` и `session.json` — уже новой сессии (§7.1)
+    assert_eq!(binding_session(&p).as_deref(), Some("ss-compact"));
+    let cur = std::fs::read_to_string(p.cache().join("session.json")).unwrap();
+    assert!(cur.contains("ss-compact"), "{cur}");
+    // `/clear` — новая сессия того же агента: привязка перезаписана, хотя запись медленная
+    let ev = p.ev("SessionStart", "ss-after-clear", json!({"source": "clear"}));
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_BINDING_STALL_MS", "600")
+        .args(["hook", "session-start", "--agent", "claude"])
+        .write_stdin(ev.to_string().into_bytes());
+    c.output().unwrap();
+    assert_eq!(binding_session(&p).as_deref(), Some("ss-after-clear"));
+    let cur = std::fs::read_to_string(p.cache().join("session.json")).unwrap();
+    assert!(cur.contains("ss-after-clear"), "{cur}");
+}
+
+/// Сессия из файла привязки `zam mcp` (`agent-<pid>.json`): у `zam` в тесте агента среди
+/// предков нет, файл пишется на непосредственного родителя — процесс теста.
+fn binding_session(p: &Proj) -> Option<String> {
+    let f = p.cache().join(format!("agent-{}.json", std::process::id()));
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(f).ok()?).ok()?;
+    v["session_id"].as_str().map(str::to_string)
+}
+
+/// Ревью задачи 5, I-1: уборка большого кэша (`gc_cache` тысяч просроченных файлов) идёт после
+/// записи привязки и не задерживает её: после выхода хука привязка — новой сессии, хук не
+/// ждёт уборку дольше бюджета.
+#[test]
+fn session_start_big_cache_gc_does_not_delay_binding() {
+    let _g = serial();
+    let (url, tok) = start("ss-big-gc");
+    let p = Proj::new("ss-big-gc", &url, &tok);
+    std::fs::create_dir_all(p.cache()).unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+    for i in 0..3000 {
+        let f = p
+            .cache()
+            .join(format!("shown-old-{i}-0000000{}.json", i % 10));
+        std::fs::write(&f, "{}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    // прогрев: первый запуск нового бинарника на Windows проверяет антивирус
+    p.zam(&["--version"], b"");
+    let ev = p.ev("SessionStart", "ss-big", json!({"source": "startup"}));
+    let (o, took) = p.hook_at(&url, "session-start", "claude", ev.to_string().as_bytes());
+    assert!(o.status.success());
+    assert_eq!(binding_session(&p).as_deref(), Some("ss-big"));
     assert!(took < max_for("session-start"), "{took:?}");
+    let log = p.log();
+    assert!(!log.contains(zam_core::HOOK_BUDGET_SPENT), "{log}");
 }
 
 /// `PostToolUseFailure`: `error_regex` — с сервером и (сервер выключен) по кэшу.
