@@ -3393,6 +3393,41 @@ codex`; базы — плечи B5.6/B5.7 того же дня; результа
 двух и `session_start_fits_channel_codex_and_claude` (со щедрым бюджетом) — PASS; `xtask` — 177
 PASS (прогон `r3`, xtask с тех пор не менялся).
 
+#### Ревью задачи 8a, круг 3 (CHANGES REQUESTED, мелкие правки)
+
+Коммит — `fix(recall): правки ревью 8a, круг 3` поверх `e82c9cb`. Механика `pack_limited`,
+`loses_kept`, `with_omits` признана корректной; ТС-2 не перемерялся (меняются только тексты
+строк).
+- I-a: строки о снятом — без склонения: «ZeroAIMemory: не показано — <что>: N (<где>)»
+  (`Section::omit_line`), для правил — «не показано — правил: N (memory_tree Rules)»
+  (`rules_hidden_line`).
+- I-b: если у L0 правила есть вторая фраза, первая кончается «…» вместо точки
+  (`rule_l0_phrase`; юнит-тест `rule_l0_phrase_marks_dropped_second_sentence`: «A. Исключение:
+  B.» → «A…»).
+- m-a: §8 — первая ловушка снимается последней (`KEEP_FIRST_TRAP` = 3), противоречие убрано.
+- m-b: адреса снятых строк без раздела: открытые вопросы — `memory_search kinds=[question]`,
+  словарь — `kinds=[term]` (как в строке словаря), проверенные команды — `memory_tree`
+  (заметки решения с `verified_at`); строки после правил — по разделу на строку; общий
+  `memory_recall` — только уведомлениям.
+- m-c, m-d, оговорка п. 4 — в §8: строки о снятом — сверх `digest_tokens` (в пределе канала
+  учитываются); `first_sentence` режет по «. » внутри сокращений — известное ограничение; сверх
+  бюджета идут Rules и строка карты кода, учёт резерва `rules_tokens` — только Rules.
+- Комментарий `ZAM_TEST_HOOK_BUDGET_MS` — «отладочная сборка или фича `test-hooks`».
+
+**→ 8b (дополнение):** сверх `digest_tokens` идут Rules и строка карты кода; отдельная строка
+учёта резерва (`rules_tokens`, §17 п. 3) — только Rules, строка карты кода остаётся в учёте
+события.
+
+**Проверки** (`target/r1-t8a5`, `ZAM_REQUIRE_ML=1`, `ZAM_TEST_MODELS_DIR` — абсолютный путь;
+логи — `.tmp/m6/task8a/r6-*.log`): `cargo fmt --all -- --check` — чисто; `cargo clippy --workspace
+--all-targets -D warnings` — чисто; `zam-search` — PASS; `zam-server` `--lib` — 245 PASS (после
+поправки ожидания `recovery_notices_kept_without_later_section`: строки после правил — по
+разделу на строку), `recall`, `recall_recovery`, `recall_frozen`, `recall_heavy`,
+`recall_heavy_ml`, `recall_brief`, `agent_dates`, `ideas_recall` — PASS; `zam-cli --test hooks`
+— 64 PASS. `heavy_sh05_fits_output_limit`: у Codex и старого клиента текст в 7500 байт, все 20
+правил L0 (у всех в `sh-05` есть вторая фраза L0 — у всех «…»), карта кода, 1 ловушка из 3 и
+строки «не показано — …».
+
 ### Задача 8b. Учёт, `zam sessions`, страница сессий, `rules_heavy`
 
 ### Задача 8c. Сетки ТС-2 и полный прогон

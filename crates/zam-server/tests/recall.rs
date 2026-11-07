@@ -1509,7 +1509,7 @@ async fn rules_reserved_never_cut() {
         let rules_part = section(text, "### Правила");
         assert_eq!(
             rules_part.last().map(String::as_str),
-            Some("ZeroAIMemory: ещё 1 правил не показаны — memory_tree Rules"),
+            Some("ZeroAIMemory: не показано — правил: 1 (memory_tree Rules)"),
             "{event}: {text}"
         );
         let rest = without_section(text, "### Правила");
@@ -1994,7 +1994,7 @@ fn assert_rules_accounted(what: &str, text: &str, ids: &[String]) {
     let missing = ids.iter().filter(|r| !text.contains(r.as_str())).count();
     if missing > 0 {
         assert!(
-            text.contains(&format!("ZeroAIMemory: ещё {missing} правил не показаны")),
+            text.contains(&format!("ZeroAIMemory: не показано — правил: {missing} (")),
             "{what}: {missing} правил пропали молча: {text}"
         );
     }
@@ -2175,7 +2175,10 @@ async fn rules_priority_not_alphabetical() {
         !text.contains(&format!("n:{}", ids[18])),
         "новейшее — сверх RULES_MAX: {text}"
     );
-    assert!(text.contains("ещё 1 правил не показаны"), "{text}");
+    assert!(
+        text.contains("не показано — правил: 1 (memory_tree Rules)"),
+        "{text}"
+    );
     // вывод — по пути
     let a_pos = text.find("правило a/п00").unwrap();
     let s_pos = text.find("правило security/secrets").unwrap();

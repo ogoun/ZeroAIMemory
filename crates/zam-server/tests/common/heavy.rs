@@ -648,8 +648,8 @@ pub fn shape(text: &str, w: &World) -> String {
 }
 
 /// Повторное ревью 8a (2в): снятое пределом вывода не пропадает молча — у ловушек число
-/// непоказанных называет строка «ещё N ловушек не показаны», у снятых строк-указателей (открытые
-/// вопросы, словарь) — «ещё N строк не показаны — memory_recall».
+/// непоказанных называет строка «не показано — ловушек: N», у снятых строк-указателей (открытые
+/// вопросы, словарь) — строка со своим адресом (`kinds=[question]`, `kinds=[term]`).
 pub fn check_omits(what: &str, text: &str, w: &World) {
     let shown = w
         .traps
@@ -659,15 +659,23 @@ pub fn check_omits(what: &str, text: &str, w: &World) {
     let missing = w.traps.len() - shown;
     if missing > 0 {
         assert!(
-            text.contains(&format!("ZeroAIMemory: ещё {missing} ловушек не показаны")),
+            text.contains(&format!("ZeroAIMemory: не показано — ловушек: {missing} (")),
             "{what}: {missing} ловушек сняты молча:\n{text}"
         );
     }
-    let pointers = ["### Открытые вопросы", "Словарь:"];
-    if pointers.iter().any(|p| !text.contains(p)) {
-        assert!(
-            text.contains("строк не показаны — memory_recall"),
-            "{what}: строки-указатели сняты молча:\n{text}"
-        );
+    // снятые строки-указатели — со своим адресом
+    for (line, omit) in [
+        (
+            "### Открытые вопросы",
+            "строк открытых вопросов: 1 (memory_search kinds=[question])",
+        ),
+        ("Словарь:", "строк словаря: 1 (memory_search kinds=[term])"),
+    ] {
+        if !text.contains(line) {
+            assert!(
+                text.contains(&format!("не показано — {omit}")),
+                "{what}: «{line}» снята молча:\n{text}"
+            );
+        }
     }
 }

@@ -239,7 +239,8 @@ pub struct Section {
     /// Стойкость первого блока, если выше `keep` (первая ловушка — наравне с обязательными).
     pub keep_head: Option<u8>,
     /// Строка о снятых пределом вывода блоках: `(что, где полностью)` →
-    /// `ZeroAIMemory: ещё N <что> не показаны — <где>`; `None` — «строк», `memory_recall`.
+    /// `ZeroAIMemory: не показано — <что>: N (<где>)` (без склонения по числу); `None` —
+    /// «строк», `memory_recall`.
     pub omit: Option<(String, String)>,
 }
 
@@ -270,7 +271,7 @@ impl Section {
             .omit
             .clone()
             .unwrap_or_else(|| ("строк".to_string(), "memory_recall".to_string()));
-        format!("ZeroAIMemory: ещё {n} {what} не показаны — {whole}")
+        format!("ZeroAIMemory: не показано — {what}: {n} ({whole})")
     }
 }
 
@@ -558,13 +559,16 @@ mod tests {
         let (text, taken) = pack_sections(&secs, 5, &words, &|t: &str| t.len() <= 30);
         let own: Vec<(usize, usize)> = taken.iter().copied().filter(|&(si, _)| si < 3).collect();
         assert_eq!(own, [(1, 0), (1, 1)], "{text}");
-        assert!(text.contains("ещё 2 строк не показаны"), "{text}");
+        assert!(
+            text.contains("не показано — строк: 2 (memory_recall)"),
+            "{text}"
+        );
         // снятое пределом — честной строкой: в конце раздела или текста (повторное ревью 8a)
         let mut secs2 = secs.clone();
         secs2[2].omit = Some(("строк c".into(), "memory_tree C".into()));
         let (text, _) = pack_sections(&secs2, 5, &words, &|t: &str| !t.contains("c2"));
         assert!(
-            text.ends_with("ZeroAIMemory: ещё 1 строк c не показаны — memory_tree C\n"),
+            text.ends_with("ZeroAIMemory: не показано — строк c: 1 (memory_tree C)\n"),
             "{text}"
         );
         // нулевой бюджет — только резерв

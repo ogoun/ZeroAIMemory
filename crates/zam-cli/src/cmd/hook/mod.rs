@@ -329,7 +329,7 @@ impl Env {
         #[allow(unused_mut)]
         let mut budget = self.kind.budget_ms();
         // щедрый бюджет для тестов содержимого (отладочная сборка под нагрузкой; повторное
-        // ревью 8a M6, п. 3) — только отладочный бинарник и фича `test-hooks`
+        // ревью 8a M6, п. 3) — отладочная сборка или фича `test-hooks`
         #[cfg(any(feature = "test-hooks", debug_assertions))]
         if let Some(ms) = std::env::var("ZAM_TEST_HOOK_BUDGET_MS")
             .ok()

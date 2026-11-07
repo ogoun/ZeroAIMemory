@@ -155,7 +155,7 @@
 //!   (`startup | clear | fork`) — обычный дайджест, `source` пишется в журнал DEBUG;
 //! - `output_limit {unit: chars|bytes, max}` (ревью 8a M6, C1) — предел канала хука: весь
 //!   `text` в нём (Rules — первыми, хвост их приоритета — L0, затем снимаются разделы с меньшим
-//!   `keep`, правила — со строкой «ещё N правил не показаны»); хук без поля (есть `source` или
+//!   `keep`, правила — со строкой «не показано — правил: N»); хук без поля (есть `source` или
 //!   `code_map`) — 7500 байт; `max` вне 1..=1 000 000 или иная единица — 400;
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
 //!   recovery | brief` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
@@ -2023,7 +2023,7 @@ async fn digest(
     }
 
     // Rules — L1 каждой заметки; больше `RULES_MAX` — первые по приоритету ([`rule_order`]),
-    // остальные — строкой «ещё N правил не показаны»; вывод — по пути
+    // остальные — строкой «не показано — правил: N»; вывод — по пути
     let mut rules: Vec<Cand> = Vec::new();
     let mut rules_short: HashMap<TargetRef, (usize, String)> = HashMap::new();
     let mut rules_hidden = 0usize;
@@ -2676,8 +2676,7 @@ fn rule_l0_block(n: &zam_store::Node) -> String {
     let mut title = n.path.clone();
     if let Some(l0) = n.l0.as_deref().map(one_line).filter(|s| !s.is_empty()) {
         let l0 = zam_markdown::mask_text(&l0);
-        let cap = zam_store::budget_cap(RULE_L0_TOKENS);
-        let (l0, _) = truncate_marked(first_sentence(&l0), cap, &count_tokens);
+        let l0 = rule_l0_phrase(&l0, zam_store::budget_cap(RULE_L0_TOKENS));
         if !l0.is_empty() {
             title.push_str(" — ");
             title.push_str(&l0);
@@ -2696,7 +2695,30 @@ fn rule_l0_block(n: &zam_store::Node) -> String {
     .to_string()
 }
 
+/// Фраза L0 правила: первая фраза до `cap` токенов (длиннее — обрезка с «…»); если за ней в
+/// L0 есть ещё текст — точка в конце заменяется на «…» (повторное ревью 8a, I-b: вторая фраза
+/// часто несёт исключение или запрет, её потеря не молчит).
+fn rule_l0_phrase(l0: &str, cap: usize) -> String {
+    let l0 = l0.trim();
+    let first = first_sentence(l0);
+    let (mut out, cut) = truncate_marked(first, cap, &count_tokens);
+    if !cut && first.len() < l0.len() {
+        let base = out.trim_end_matches('.').to_string();
+        let marked = format!("{base}…");
+        out = if count_tokens(&marked) <= cap {
+            marked
+        } else {
+            truncate_marked(&base, cap.saturating_sub(1), &count_tokens).0
+        };
+        if !out.ends_with('…') {
+            out.push('…');
+        }
+    }
+    out
+}
+
 /// Первая фраза текста: до `.`, `!`, `?` или `…` с пробелом или концом после; нет — весь текст.
+/// Известное ограничение: точка сокращения с пробелом («т. е.», «e.g. ») считается концом фразы.
 fn first_sentence(s: &str) -> &str {
     let mut it = s.char_indices().peekable();
     while let Some((i, c)) = it.next() {
@@ -2715,7 +2737,7 @@ const RULES_SHORT_NOTE: &str =
 
 /// Строка о правилах, что не показаны (сверх `RULES_MAX` или не вошли в предел вывода).
 fn rules_hidden_line(n: usize) -> String {
-    format!("ZeroAIMemory: ещё {n} правил не показаны — memory_tree Rules")
+    format!("ZeroAIMemory: не показано — правил: {n} (memory_tree Rules)")
 }
 
 /// Дайджест `session_start`: строки [`Lines`] и разделы-кандидаты.
@@ -3536,6 +3558,7 @@ fn arrange<'c>(
             && let Some(line) = open_line.take()
         {
             out.line(Some(SECTION_OPEN_QUESTIONS), vec![line], KEEP_POINTERS);
+            out.omit_last(OMIT_OPEN_QUESTIONS);
         }
         if title == Some(SECTION_ANSWERS) && !recovery && !ideas.is_empty() {
             let mut sec = Section::new(
@@ -3555,8 +3578,10 @@ fn arrange<'c>(
             out.picked.push(std::mem::take(&mut ideas));
         }
         if title == Some(SECTION_RULES) {
-            if !after_rules.is_empty() {
-                out.line(None, after_rules.clone(), KEEP_POINTERS);
+            // строки словаря и проверенных команд — по разделу на строку: свой адрес снятого
+            for l in &after_rules {
+                out.line(None, vec![l.clone()], KEEP_POINTERS);
+                out.omit_last(omit_after_rules(l));
             }
             if let Some(l) = &code_line {
                 let mut sec = Section::new(None, vec![l.clone()]);
@@ -3591,6 +3616,22 @@ fn keep_of(title: Option<&str>) -> u8 {
         Some(SECTION_TASKS | SECTION_ANSWERS) => KEEP_MANDATORY,
         Some(SECTION_TRAPS_DIGEST) => KEEP_POINTERS,
         _ => 0,
+    }
+}
+
+/// Адрес снятой строки открытых вопросов.
+const OMIT_OPEN_QUESTIONS: (&str, &str) =
+    ("строк открытых вопросов", "memory_search kinds=[question]");
+
+/// Адрес снятой строки после правил: словарь — `kinds=[term]`, проверенные команды — заметки
+/// решения (`memory_tree`), прочее — `memory_recall` (MCP без предела).
+fn omit_after_rules(line: &str) -> (&'static str, &'static str) {
+    if line.starts_with("Словарь:") {
+        ("строк словаря", "memory_search kinds=[term]")
+    } else if line.starts_with("Проверенные команды:") {
+        ("строк проверенных команд", "memory_tree")
+    } else {
+        ("строк", "memory_recall")
     }
 }
 
@@ -3633,6 +3674,13 @@ impl Arranged<'_> {
         self.picked.push(Vec::new());
     }
 
+    /// Строка о снятом у последнего раздела: `(что, где)`.
+    fn omit_last(&mut self, omit: (&str, &str)) {
+        if let Some(s) = self.packed.last_mut() {
+            s.omit = Some((omit.0.to_string(), omit.1.to_string()));
+        }
+    }
+
     /// Уведомления и строка открытых вопросов, если ещё не выведены.
     fn notices(&mut self, notices: &mut Option<Vec<String>>, open_line: &mut Option<String>) {
         if let Some(n) = notices.take() {
@@ -3640,6 +3688,7 @@ impl Arranged<'_> {
         }
         if let Some(l) = open_line.take() {
             self.line(Some(SECTION_OPEN_QUESTIONS), vec![l], KEEP_POINTERS);
+            self.omit_last(OMIT_OPEN_QUESTIONS);
         }
     }
 }
@@ -4160,7 +4209,7 @@ mod tests {
         let (packed, _) = arrange(false, true, lines, Vec::new(), chosen);
         // раздел Rules — резерв сверх бюджета (M6 §8), прочие — в бюджете
         let reserved: Vec<bool> = packed.iter().map(|s| s.reserved).collect();
-        assert_eq!(reserved, [false, false, false, false, true, false]);
+        assert_eq!(reserved, [false, false, false, false, true, false, false]);
         let blocks: Vec<&str> = packed
             .iter()
             .flat_map(|s| s.blocks.iter().map(String::as_str))
@@ -4175,6 +4224,17 @@ mod tests {
                 "Проверенные команды: a (проверено 2026-10-28)"
             ]
         );
+    }
+
+    /// Повторное ревью 8a, I-b: вторая фраза L0 не теряется молча — первая кончается «…».
+    #[test]
+    fn rule_l0_phrase_marks_dropped_second_sentence() {
+        assert_eq!(rule_l0_phrase("A. Исключение: B.", 40), "A…");
+        assert_eq!(rule_l0_phrase("Одна фраза.", 40), "Одна фраза.");
+        assert_eq!(rule_l0_phrase("Без точки", 40), "Без точки");
+        let long = "слово ".repeat(80);
+        let out = rule_l0_phrase(&long, 10);
+        assert!(out.ends_with('…') && count_tokens(&out) <= 10, "{out}");
     }
 
     #[test]
