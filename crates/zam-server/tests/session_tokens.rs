@@ -228,8 +228,9 @@ async fn wait_mcp(a: &Api, session: &str, calls: u64) -> Value {
 
 /// M6 §8 (задача 8b): `/search` и `/read` REST с явной сессией — события `search` и `read`
 /// (вызов и токены ответа), повтор `/read` той же ревизии — `reread_calls` строки `read`;
-/// вызовы из MCP — одна строка `mcp` (вложенные `/search`, `/read` своих строк не пишут), повтор
-/// чтения из MCP — `reread_calls` строки `mcp`; без сессии — учёта нет.
+/// вызовы из MCP — строка `mcp` (вложенные `/search`, `/read` строк `search`/`read` не пишут),
+/// чтения из MCP — строка `mcp_read` (вызов, `reread_calls`, токенов 0 — ревью 8b); без сессии —
+/// учёта нет.
 #[tokio::test]
 async fn session_tokens_search_read_mcp() {
     let a = seeded("tokens-search-read-mcp").await;
@@ -301,8 +302,14 @@ async fn session_tokens_search_read_mcp() {
     wait_mcp(&a, "s-mcp", 2).await;
     mcp_call(&a, "s-mcp", "memory_read", json!({"items": [{"id": id}]})).await;
     let t = wait_mcp(&a, "s-mcp", 3).await;
-    assert_eq!(t["mcp"]["reread_calls"], 1, "{t}");
+    assert!(t["mcp"].get("reread_calls").is_none(), "{t}");
     assert!(t["mcp"]["tokens"].as_u64().unwrap() > 0, "{t}");
+    // доля повторов MCP — к чтениям MCP: 1 из 2, а не 1 из 3 вызовов
+    assert_eq!(
+        t["mcp_read"],
+        json!({"calls": 2, "tokens": 0, "reread_calls": 1}),
+        "{t}"
+    );
     assert!(t.get("search").is_none() && t.get("read").is_none(), "{t}");
 }
 

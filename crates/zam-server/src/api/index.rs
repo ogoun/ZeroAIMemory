@@ -150,10 +150,20 @@ pub const RULES_HEAVY_COUNT: usize = 10;
 /// L1 Rules в сумме больше этого числа токенов — предупреждение `rules_heavy` (M6 §8).
 pub const RULES_HEAVY_L1_TOKENS: usize = 1500;
 
+/// L1 правил пространства Rules по снимку `(заметка, ревизия)`: полный `/index/status` WebUI
+/// запрашивает раз в 5 с, а L1 зависит только от текста ревизии — пока набор `(id, rev)` заметок
+/// пространства тот же, сумма берётся из кэша (точность прежняя: любая правка, перенос в Rules,
+/// удаление или восстановление меняют набор). Ключ — id пространства (ULID, уникален между базами).
+type RulesSnapshot = Vec<(Id, i64)>;
+static RULES_L1_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Id, (RulesSnapshot, usize)>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Rules базы `db` (M6 §8): число заметок пространства Rules и сумма их L1 так, как их выдаёт
 /// дайджест (текст правила до `RULE_L1_TOKENS`, [`super::recall::rule_l1`]), и предупреждение
 /// `rules_heavy` при больше [`RULES_HEAVY_COUNT`] правил или L1 в сумме больше
-/// [`RULES_HEAVY_L1_TOKENS`]. Нет пространства Rules — нули.
+/// [`RULES_HEAVY_L1_TOKENS`]. Нет пространства Rules — нули. Сумма L1 — из [`RULES_L1_CACHE`],
+/// пока снимок ревизий тот же.
 async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::StoreError> {
     let mut count = 0usize;
     let mut l1_tokens = 0usize;
@@ -162,18 +172,45 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
         .into_iter()
         .find(|s| s.kind == SpaceKind::Rules)
     {
-        for n in list_children(db, space.id, None, 16).await? {
-            if n.kind != NodeKind::Note {
-                continue;
+        let notes: Vec<zam_store::Node> = list_children(db, space.id, None, 16)
+            .await?
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Note)
+            .collect();
+        let snapshot: RulesSnapshot = notes.iter().map(|n| (n.id, n.current_rev)).collect();
+        count = notes.len();
+        let cached = RULES_L1_CACHE.lock().ok().and_then(|c| {
+            c.get(&space.id)
+                .filter(|(s, _)| *s == snapshot)
+                .map(|(_, t)| *t)
+        });
+        l1_tokens = match cached {
+            Some(t) => t,
+            None => {
+                let mut sum = 0usize;
+                let mut seen: RulesSnapshot = Vec::with_capacity(notes.len());
+                for n in &notes {
+                    let (rev, text) = match node_content(db, n.id, None).await {
+                        Ok(v) => v,
+                        // узел удалён между чтениями — без него (и снимок не кэшируется)
+                        Err(zam_store::StoreError::NotFound) => {
+                            count -= 1;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    seen.push((n.id, rev));
+                    sum += zam_store::count_tokens(&super::recall::rule_l1(&text).0);
+                }
+                // кэш — только если прочитано ровно то, что в снимке (без гонки с записью)
+                if seen == snapshot
+                    && let Ok(mut c) = RULES_L1_CACHE.lock()
+                {
+                    c.insert(space.id, (snapshot, sum));
+                }
+                sum
             }
-            let text = match node_content(db, n.id, None).await {
-                Ok((_, t)) => t,
-                Err(zam_store::StoreError::NotFound) => continue,
-                Err(e) => return Err(e),
-            };
-            count += 1;
-            l1_tokens += zam_store::count_tokens(&super::recall::rule_l1(&text).0);
-        }
+        };
     }
     let heavy = count > RULES_HEAVY_COUNT || l1_tokens > RULES_HEAVY_L1_TOKENS;
     Ok(json!({
@@ -182,6 +219,13 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
         "l1_tokens": l1_tokens,
         "warning": heavy.then_some("rules_heavy"),
     }))
+}
+
+/// Пересчитано ли L1 Rules пространства `space` (нет записи кэша с этим снимком) — для теста
+/// кэша [`RULES_L1_CACHE`].
+#[doc(hidden)]
+pub fn rules_l1_cached(space: Id) -> Option<usize> {
+    RULES_L1_CACHE.lock().ok()?.get(&space).map(|(_, t)| *t)
 }
 
 /// Rules базы для ответа: сбой чтения — `null` (WARN без текста).

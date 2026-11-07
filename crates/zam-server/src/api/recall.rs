@@ -501,6 +501,29 @@ impl<'c> RulesFit<'c> {
         true
     }
 
+    /// У правила с конца приоритета, ещё не голого, — строка пути `<путь> … n:<id>` (шаг (1″));
+    /// нечего — `false`.
+    fn strip(&mut self, short: &HashMap<TargetRef, RuleShort>) -> bool {
+        let next = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                short
+                    .get(&r.cand.tref)
+                    .is_some_and(|s| s.bare != r.block && s.bare.len() < r.block.len())
+            })
+            .max_by_key(|(_, r)| r.rank)
+            .map(|(k, _)| k);
+        let Some(k) = next else {
+            return false;
+        };
+        let item = &mut self.items[k];
+        item.block = short[&item.cand.tref].bare.clone();
+        item.cut = true;
+        true
+    }
+
     /// Правило с конца приоритета — прочь (его учитывает строка о непоказанных).
     fn drop_last(&mut self) -> bool {
         let Some(k) = (0..self.items.len()).max_by_key(|&k| self.items[k].rank) else {
@@ -528,7 +551,9 @@ fn l0_text(line: &str) -> &str {
 /// (1) у правил с конца приоритета ([`rule_order`]) L1 заменяется строкой L0 (первая фраза,
 /// до [`RULE_L0_TOKENS`], обрезка — с «…»; правило с L1 ≤ L0 × 1,4 пропускается), пока правила
 /// и разделы в бюджете не уложатся, и в разделе — строка [`RULES_SHORT_NOTE`]; (2) снимаются
-/// блоки в бюджете по стойкости `Section::keep` (0 → 1 → 2), внутри раздела — с конца;
+/// блоки в бюджете по стойкости `Section::keep` (0 → 1 → 2), внутри раздела — с конца; (1″)
+/// прежде чем снять блок со стойкостью ≥ 2 (обязательные строки), строки L0 правил с конца
+/// приоритета сокращаются до пути `<путь> … n:<id>` ([`rule_bare_block`]);
 /// (3) правила (уже L0) снимаются с конца, а строка [`rules_hidden_line`] называет их число —
 /// ни одно правило не пропадает молча.
 fn pack_limited(
@@ -553,6 +578,13 @@ fn pack_limited(
         // (1′) предел снял бы ловушки, указатели или обязательные строки (`keep` ≥ 1) — L1 → L0
         // у остальных правил (L0 — целая первая фраза), прежде чем их снимать
         while loses_kept(packed, cap, &fits) && f.degrade(short, 10) {
+            f.apply(packed, picked);
+        }
+        // (1″) предел снял бы обязательные строки (`keep` ≥ 2: уведомления, задачи, ответы, идеи,
+        // первая ловушка) — у правил с конца приоритета строка L0 сокращается до пути
+        // (`<путь> … n:<id>`; ТС-2 Codex sh-05, правки ревью 8b): правило остаётся на месте со
+        // ссылкой, обязательная строка — тоже
+        while loses_at(packed, cap, &fits, KEEP_MANDATORY) && f.strip(short) {
             f.apply(packed, picked);
         }
         // (3) сами правила (L0) не влезают — с конца, со строкой о непоказанных
@@ -580,10 +612,16 @@ fn pack_limited(
 /// Снимет ли упаковка в пределе хоть один блок со стойкостью ≥ [`KEEP_POINTERS`] (ловушки,
 /// указатели, обязательные строки), что вошёл бы в бюджет без предела, — условие шага (1′).
 fn loses_kept(packed: &[Section], cap: usize, fits: &dyn Fn(&str) -> bool) -> bool {
+    loses_at(packed, cap, fits, KEEP_POINTERS)
+}
+
+/// Снимет ли упаковка в пределе хоть один блок со стойкостью ≥ `keep`, что вошёл бы в бюджет без
+/// предела.
+fn loses_at(packed: &[Section], cap: usize, fits: &dyn Fn(&str) -> bool, keep: u8) -> bool {
     let (_, all) = pack_sections(packed, cap, &count_tokens, &|_| true);
     let (_, got) = pack_sections(packed, cap, &count_tokens, fits);
     all.iter().any(|&(si, bi)| {
-        !packed[si].reserved && packed[si].keep_of(bi) >= KEEP_POINTERS && !got.contains(&(si, bi))
+        !packed[si].reserved && packed[si].keep_of(bi) >= keep && !got.contains(&(si, bi))
     })
 }
 
@@ -2100,6 +2138,7 @@ async fn digest(
                     RuleShort {
                         rank: rank[&n.id],
                         l0: rule_l0_block(&n),
+                        bare: rule_bare_block(&n),
                         cut,
                     },
                 );
@@ -2689,6 +2728,8 @@ struct Lines {
 struct RuleShort {
     rank: usize,
     l0: String,
+    /// Строка пути без фразы `<путь> … n:<id>` (шаг (1″) [`pack_limited`]).
+    bare: String,
     cut: bool,
 }
 
@@ -2744,6 +2785,21 @@ fn rule_l0_block(n: &zam_store::Node) -> String {
         &format!("n:{}", n.id),
     )
     // под заголовком `### Правила` метка подсказки лишняя — ≈ 14 байт строки у Codex
+    .trim_start_matches(HINT_PREFIX)
+    .trim_start()
+    .to_string()
+}
+
+/// Строка правила без фразы — `<путь> … [<cert>] n:<id>` (шаг (1″) [`pack_limited`]: место под
+/// обязательные строки; «…» — текст правила опущен, полностью — `memory_read n:<id>`).
+fn rule_bare_block(n: &zam_store::Node) -> String {
+    let certainty = certainty_str(n.certainty);
+    hint_line(
+        "",
+        &format!("{} …", n.path),
+        &[certainty.as_deref().unwrap_or_default()],
+        &format!("n:{}", n.id),
+    )
     .trim_start_matches(HINT_PREFIX)
     .trim_start()
     .to_string()

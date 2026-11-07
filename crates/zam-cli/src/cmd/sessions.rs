@@ -4,9 +4,9 @@
 //!   токенов · уже выдавалось» (`session_tokens` сервера: события `/recall` — `session_start`,
 //!   `recovery`, резерв Rules этих событий `rules`, `prompt`, `post_tool`, `brief`; хуки с
 //!   локальным выводом — `pre_tool`, `post_tool_local`, `subagent_local`; `search` и `read` —
-//!   REST и CLI с сессией; `mcp` — инструменты MCP) и строка доли «уже выдавалось»: у `read` —
-//!   вызовов `/read` с пометкой из вызовов `/read`, у `mcp` — чтений из MCP с пометкой из вызовов
-//!   MCP. `<id>` — одна сессия; `--last N` — сумма по N последним (свежие первыми, 1..=500); без
+//!   REST и CLI с сессией; `mcp` — инструменты MCP; `mcp_read` — из них чтения `/read`, токенов 0)
+//!   и строка доли «уже выдавалось»: у `read` — вызовов `/read` с пометкой из вызовов `/read`, у
+//!   MCP — чтений MCP с пометкой из чтений MCP (`mcp_read`). `<id>` — одна сессия; `--last N` — сумма по N последним (свежие первыми, 1..=500); без
 //!   обоих — сессия агента (`ZAM_SESSION`, сессия хуков проекта), иначе последняя.
 //!   `--by-holdout` — суммы отдельно по контрольной группе A/B (`holdout`, M6 §12) и остальным.
 //!   Время — UTC `yyyy-MM-dd HH:mm:ss` ([`agent_time`]); `--json` — сессии с `tokens` и суммы.
@@ -19,7 +19,7 @@ use super::{Ctx, agent_time, emit, emit_json};
 use crate::client::{CliError, read_json};
 
 /// Порядок строк таблицы: события сервера, затем хуков с локальным выводом; прочие — по имени.
-const ORDER: [&str; 12] = [
+const ORDER: [&str; 13] = [
     "session_start",
     "rules",
     "recovery",
@@ -32,6 +32,7 @@ const ORDER: [&str; 12] = [
     "search",
     "read",
     "mcp",
+    "mcp_read",
 ];
 
 /// Выбор сессий `zam sessions tokens`.
@@ -103,9 +104,10 @@ fn table(stats: &BTreeMap<String, Stat>) -> String {
     let tokens: u64 = rows.iter().map(|(_, st)| st.tokens).sum();
     s.push_str(&format!("итого\t\t{tokens}\t\n"));
     let mut shares = Vec::new();
-    for event in ["read", "mcp"] {
+    // у MCP — из них чтения (`mcp_read`): доля к чтениям MCP, а не ко всем вызовам MCP
+    for (event, title) in [("read", "read"), ("mcp_read", "чтения MCP")] {
         if let Some(st) = stats.get(event).filter(|st| st.calls > 0) {
-            shares.push(format!("{event} {}", share(st)));
+            shares.push(format!("{title} {}", share(st)));
         }
     }
     if !shares.is_empty() {
@@ -149,7 +151,15 @@ fn fetch(ctx: &Ctx, pick: &Pick) -> Result<Vec<Value>, CliError> {
             "/sessions",
             &[("limit", limit.as_str()), ("tokens", "true")],
         )?)?;
-        Ok(v["items"].as_array().cloned().unwrap_or_default())
+        let items = v["items"].as_array().cloned().unwrap_or_default();
+        // сервер до M6 (задача 8b) `tokens=true` не знает и отдаёт сессии без учёта: «итого 0»
+        // было бы неправдой
+        if items.iter().any(|s| s.get("tokens").is_none()) {
+            return Err(CliError::config(
+                "сервер не поддерживает учёт по сессиям (GET /sessions?tokens=true): обновите zam-server",
+            ));
+        }
+        Ok(items)
     };
     match pick {
         Pick::Id(id) => one(id),
@@ -236,7 +246,8 @@ mod tests {
             "session_start": {"calls": 1, "tokens": 900},
             "rules": {"calls": 1, "tokens": 300},
             "custom": {"calls": 2, "tokens": 5},
-            "mcp": {"calls": 3, "tokens": 120, "reread_calls": 2},
+            "mcp": {"calls": 5, "tokens": 120},
+            "mcp_read": {"calls": 3, "tokens": 0, "reread_calls": 2},
         }});
         let t = table(&sum([&s]));
         assert_eq!(
@@ -245,10 +256,11 @@ mod tests {
              session_start\t1\t900\t\n\
              rules\t1\t300\t\n\
              read\t4\t400\t1\n\
-             mcp\t3\t120\t2\n\
+             mcp\t5\t120\t\n\
+             mcp_read\t3\t0\t2\n\
              custom\t2\t5\t\n\
              итого\t\t1725\t\n\
-             уже выдавалось: read 1 из 4 (25 %); mcp 2 из 3 (67 %)\n"
+             уже выдавалось: read 1 из 4 (25 %); чтения MCP 2 из 3 (67 %)\n"
         );
     }
 

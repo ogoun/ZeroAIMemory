@@ -66,7 +66,8 @@ fn start(name: &str) -> (String, String) {
                     count("session_start", 1, 700, 0),
                     count("rules", 1, 300, 0),
                     count("read", 4, 400, 1),
-                    count("mcp", 3, 90, 2),
+                    count("mcp", 5, 90, 0),
+                    count("mcp_read", 3, 0, 2),
                 ],
             )
             .await
@@ -111,7 +112,8 @@ fn ok(o: &Output) -> String {
 }
 
 /// Одна сессия по id и сессия агента (`ZAM_SESSION`): строка сессии, таблица по событиям в
-/// порядке событий, итог и доля «уже выдавалось» у `read` и `mcp`; неизвестная сессия — код 5.
+/// порядке событий, итог и доля «уже выдавалось» у `read` и чтений MCP;
+/// неизвестная сессия — код 5.
 #[test]
 fn cli_sessions_tokens_table() {
     let (url, tok) = start("table");
@@ -120,9 +122,10 @@ fn cli_sessions_tokens_table() {
                 session_start\t1\t700\t\n\
                 rules\t1\t300\t\n\
                 read\t4\t400\t1\n\
-                mcp\t3\t90\t2\n\
+                mcp\t5\t90\t\n\
+                mcp_read\t3\t0\t2\n\
                 итого\t\t1490\t\n\
-                уже выдавалось: read 1 из 4 (25 %); mcp 2 из 3 (67 %)\n";
+                уже выдавалось: read 1 из 4 (25 %); чтения MCP 2 из 3 (67 %)\n";
     let out = ok(&zam(&url, &tok, &r, &["sessions", "tokens", "s-new"], None));
     let (head, table) = out.split_once('\n').unwrap();
     assert!(
@@ -200,4 +203,34 @@ fn cli_sessions_tokens_last() {
         None,
     );
     assert_eq!(o.status.code(), Some(6), "{o:?}");
+}
+
+/// Сервер до M6 (задача 8b) не знает `GET /sessions?tokens=true` и отдаёт сессии без `tokens`:
+/// `--last` — ошибка «сервер не поддерживает учёт по сессиям», а не «итого 0» (ревью 8b).
+#[test]
+fn cli_sessions_tokens_old_server() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut s in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let body = r#"{"items":[{"id":"s-old","started_at":"2026-11-01T00:00:00Z"}]}"#;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let r = tmp("old-repo");
+    let o = zam(&url, "t", &r, &["sessions", "tokens", "--last", "3"], None);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("сервер не поддерживает учёт по сессиям"),
+        "{err}"
+    );
 }

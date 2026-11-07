@@ -2366,6 +2366,44 @@ async fn short_l1_rule_stays_l1() {
     assert!(text.contains("— Кратко о правиле"), "{text}");
 }
 
+/// Правки ревью 8b (ТС-2 Codex sh-05): обязательные строки (задача в работе) не снимаются, пока у
+/// правил есть фраза L0 — сначала строки правил с конца приоритета сокращаются до пути
+/// `<путь> … n:<id>` (шаг (1″)); правило при этом остаётся со ссылкой.
+#[tokio::test]
+async fn mandatory_lines_kept_before_rule_phrases() {
+    let (a, ids) = heavy_rules_world("limit-bare", 20).await;
+    let mut bare_seen = false;
+    for max in (2_000..=7_500).step_by(250) {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(&format!("bare-{max}")),
+            json!({"event": "session_start", "solution": G, "source": "startup",
+                   "output_limit": {"unit": "bytes", "max": max}}),
+        )
+        .await;
+        let text = j["text"].as_str().unwrap();
+        assert!(text.len() <= max, "{max}: {}", text.len());
+        let task = text.contains("Задача в работе");
+        let phrase = text.contains("— Кратко о правиле");
+        let bare = text.lines().any(|l| l.contains(" … n:"));
+        bare_seen |= bare;
+        // фраза у какого-то правила есть — обязательная строка на месте
+        assert!(
+            !phrase || task,
+            "{max}: задача снята раньше фраз правил: {text}"
+        );
+        // пока правила только сокращены до пути, они все на месте
+        if bare && task {
+            assert!(
+                ids.iter().all(|r| text.contains(r.as_str())),
+                "{max}: {text}"
+            );
+        }
+    }
+    assert!(bare_seen, "шаг (1″) не встретился ни при одном пределе");
+}
+
 /// Повторное ревью 8a, m2: MCP `memory_recall` с `source` (восстановление) — без предела
 /// канала: хуков в MCP нет, текст не урезается под 7500 байт.
 #[tokio::test]

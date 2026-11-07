@@ -548,6 +548,47 @@ async fn index_status_rules_heavy_shape() {
     assert_eq!(j["rules"]["warning"], Value::Null, "{j}");
     let small = j["rules"]["l1_tokens"].as_u64().unwrap();
     assert!(small > 0 && small < 1500, "{j}");
+    // кэш L1 по снимку ревизий (ревью 8b): повтор — то же из кэша; правка правила меняет снимок,
+    // сумма пересчитывается и совпадает со счётом заново
+    let db = a.st.users.get(uid(&a)).await.unwrap();
+    let rules_space = zam_store::list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == zam_store::SpaceKind::Rules)
+        .unwrap()
+        .id;
+    assert_eq!(
+        zam_server::api::index::rules_l1_cached(rules_space),
+        Some(small as usize)
+    );
+    assert_eq!(only(None).await, j);
+    let p0 = a
+        .tok(
+            &a.token,
+            Method::GET,
+            "/api/v1/nodes/by-path?space=rules&path=п0&format=json",
+            None,
+        )
+        .await
+        .json();
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{}", p0["node"]["id"].as_str().unwrap()),
+            Some(json!({"content": "# П0\n\nКороткое правило 0, теперь с длинной оговоркой про исключения.\n"})),
+            &[("if-match", &p0["rev"].to_string())],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j2 = only(None).await;
+    let grown = j2["rules"]["l1_tokens"].as_u64().unwrap();
+    assert!(grown > small, "{j2}");
+    assert_eq!(
+        zam_server::api::index::rules_l1_cached(rules_space),
+        Some(grown as usize)
+    );
     // 11-е — rules_heavy; GUID решения из заголовка — в `solution`
     a.note("rules", "п10", "# П10\n\nКороткое правило 10.\n")
         .await;

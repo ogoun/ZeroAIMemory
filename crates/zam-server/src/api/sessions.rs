@@ -26,7 +26,8 @@
 //!   контрольная группа A/B, M6 §12). События учёта (M6 §8): `/recall` — `session_start`,
 //!   `recovery` (без Rules), `rules` (резерв Rules этих двух), `prompt`, `post_tool`, `brief`;
 //!   `/search` и `/read` с явной сессией, не из MCP — `search`, `read` (выдача в токенах);
-//!   инструменты MCP — `mcp` (`/read` из MCP — `reread_calls` строки `mcp`); хуки с локальным
+//!   инструменты MCP — `mcp`, чтения `/read` из MCP — ещё `mcp_read` (вызов и `reread_calls`,
+//!   токенов 0 — их считает `mcp`); хуки с локальным
 //!   выводом — `pre_tool`, `post_tool_local`, `subagent_local`;
 //! - `GET /sessions?solution=&limit=&tokens=` → `{items}` — свои, свежие первыми (50, до 500);
 //!   `tokens=true` — у каждой ещё `tokens`, как в `GET /sessions/{id}` (`zam sessions tokens

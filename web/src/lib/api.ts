@@ -1382,7 +1382,7 @@ export const promoteCache = (
 // ---- сессии агентов и выданное им (M4.5 §9.5, M6 §8) ----
 
 /** Выданное сессии по событию: `reread_calls` — вызовов с пометкой «уже выдавалось» (M6 §7.3;
- * у `read` — REST и CLI, у `mcp` — чтения из MCP); нет поля — 0. */
+ * у `read` — REST и CLI, у `mcp_read` — чтения из MCP); нет поля — 0. */
 export interface TokenStat {
   calls: number;
   tokens: number;
@@ -1391,7 +1391,8 @@ export interface TokenStat {
 
 /** Сессия агента (`GET /sessions`, `GET /sessions/{id}`). `tokens` — по событию
  * (`session_start`, `recovery`, `rules` — резерв Rules этих событий, `prompt`, `post_tool`,
- * `brief`, `pre_tool`, `post_tool_local`, `subagent_local`, `search`, `read`, `mcp`). */
+ * `brief`, `pre_tool`, `post_tool_local`, `subagent_local`, `search`, `read`, `mcp`, `mcp_read` —
+ * чтения из MCP с токенами 0: их токены — в `mcp`). */
 export interface SessionItem {
   id: string;
   agent: string | null;

@@ -243,10 +243,11 @@ use zam_search::{
 use zam_store::time::fmt_ts;
 use zam_store::{
     AttachmentHit, ChunkScope, Db, EntryKind, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START,
-    SeenItem, SeenKey, SeenTarget, Space, SpaceKind, StoreError, TargetFilter, WHOLE_TARGET,
-    chunk_ref, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_targets,
-    live_chunks, live_folders, mark_seen, neighbor_leaves, node_content, pending_count,
-    query_needles, search_fts_channels, seen_revs, text_snippet, touch_session,
+    SeenItem, SeenKey, SeenTarget, Space, SpaceKind, StoreError, TargetFilter, TokenCount,
+    WHOLE_TARGET, chunk_ref, count_tokens, get_embeddings, get_node, leaf_term_hits,
+    leaves_of_targets, live_chunks, live_folders, mark_seen_with_tokens, neighbor_leaves,
+    node_content, pending_count, query_needles, search_fts_channels, seen_revs, text_snippet,
+    touch_session,
 };
 
 use self::merge::merge_channels;
@@ -2280,10 +2281,10 @@ async fn mark_cache_sources(
     }
 }
 
-/// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
 /// Событие `session_tokens` поиска REST и CLI (M6 §8).
 pub const SEARCH_TOKEN_EVENT: &str = "search";
 
+/// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
 fn session_failed(what: &str, e: &StoreError) {
     tracing::warn!(error = %e, "поиск: {what} сессии не выполнено, ответ без пометок seen");
 }
@@ -2854,47 +2855,50 @@ pub async fn search(
         &by_id,
     );
     // суммы частей и счёт целого могут разойтись на стыках: с конца снимаются карточки
+    // Markdown ответа (он же — размер выдачи для учёта) считается один раз на итог отбора
+    let mut md_text = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
     while packed.len() > 1 {
-        let body = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
-        let n = count_tokens(&body);
-        if zam_store::fits_budget(&format!("{body}~{n} tok"), budget) {
+        let n = count_tokens(&md_text);
+        if zam_store::fits_budget(&format!("{md_text}~{n} tok"), budget) {
             break;
         }
         packed.pop();
+        md_text = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
     }
-    // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
-    if let (Some(s), SearchMode::Chunks) = (&session, mode) {
-        let given: Vec<SeenItem> = packed
-            .iter()
-            .filter(|p| matches!(p.text, Some((_, false))) && seen_tracked(&p.item))
-            .flat_map(|p| {
-                p.item.chunk_ids.iter().map(|c| SeenItem {
-                    key: seen_key(&targets, &p.item, c),
-                    rev: p.item.hit.rev,
+    if let Some(s) = &session {
+        // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
+        let given: Vec<SeenItem> = if mode == SearchMode::Chunks {
+            packed
+                .iter()
+                .filter(|p| matches!(p.text, Some((_, false))) && seen_tracked(&p.item))
+                .flat_map(|p| {
+                    p.item.chunk_ids.iter().map(|c| SeenItem {
+                        key: seen_key(&targets, &p.item, c),
+                        rev: p.item.hit.rev,
+                    })
                 })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // учёт выданного (M6 §8): REST и CLI с явной сессией — событие `search`, токены —
+        // Markdown того же отбора (у `format=json` — тоже он: размер выдачи, а не обёртки JSON);
+        // из MCP вызов считает инструмент событием `mcp`
+        let counts: Vec<TokenCount> = (!s.via_mcp)
+            .then(|| TokenCount {
+                event: SEARCH_TOKEN_EVENT.into(),
+                calls: 1,
+                tokens: count_tokens(&md_text) as u64,
+                reread_calls: 0,
             })
+            .into_iter()
             .collect();
-        if let Err(e) = mark_seen(&s.db, &s.touch, &given).await {
-            session_failed("отметка выданного", &e);
+        // отметки и учёт — одной транзакцией базы сессии, как у `/recall` и `/read`
+        if (mode == SearchMode::Chunks || !counts.is_empty())
+            && let Err(e) = mark_seen_with_tokens(&s.db, &s.touch, &given, &counts).await
+        {
+            session_failed("отметка и учёт выданного", &e);
         }
-    }
-    // Markdown ответа — для `format=md` и для учёта выдачи
-    let accounted = session.as_ref().filter(|s| !s.via_mcp);
-    let md_text = (format == OutFormat::Md || accounted.is_some())
-        .then(|| md_body(&cache_md, &packed, mode, &by_id, &tail_md));
-    // учёт выданного (M6 §8): REST и CLI с явной сессией — событие `search`, токены — Markdown
-    // того же отбора (у `format=json` — тоже он: размер выдачи, а не обёртки JSON); из MCP
-    // вызов считает инструмент событием `mcp`
-    if let (Some(s), Some(body)) = (accounted, md_text.as_deref())
-        && let Err(e) = zam_store::add_tokens(
-            &s.db,
-            &s.touch,
-            SEARCH_TOKEN_EVENT,
-            count_tokens(body) as u64,
-        )
-        .await
-    {
-        session_failed("учёт выданного", &e);
     }
 
     Ok(match format {
@@ -2928,7 +2932,7 @@ pub async fn search(
             .into_response()
         }
         OutFormat::Md => {
-            let mut r = md_text.unwrap_or_default().into_response();
+            let mut r = md_text.into_response();
             r.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/markdown; charset=utf-8"),

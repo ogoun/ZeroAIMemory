@@ -1,8 +1,8 @@
 <script lang="ts">
   // «Сессии» (#/sessions, M6 §8): сессии агентов базы пользователя, свежие первыми, и выданное
   // им по событию — «событие · вызовов · токенов» (`session_tokens`, учёт сервера и хуков) — и
-  // доля пометок «уже выдавалось» (`reread_calls`: у `read` — чтения REST и CLI, у `mcp` — чтения
-  // из MCP). Сводка — по показанным сессиям; строка сессии открывает её таблицу. Время — локальное
+  // доля пометок «уже выдавалось» (`reread_calls`: у `read` — чтения REST и CLI, у `mcp_read` —
+  // чтения из MCP; токены MCP — в `mcp`). Сводка — по показанным сессиям; строка сессии открывает её таблицу. Время — локальное
   // время браузера (`localTime`, M6 §4.4). Администратор выбирает пользователя (`X-Zam-User`).
   import { ApiError, errorText, isAdminSession, listSessions, type Me, type SessionItem, type TokenStat, type User } from '../lib/api';
   import { localTime } from '../lib/time';
@@ -24,6 +24,7 @@
     search: 'поиск (REST, CLI)',
     read: 'чтение (REST, CLI)',
     mcp: 'инструменты MCP',
+    mcp_read: 'из них чтения MCP',
   };
   /** Порядок строк: события сервера, затем локальные хуков, затем прочие по имени. */
   const ORDER = Object.keys(EVENT_TITLE);
@@ -92,7 +93,7 @@
 
 {#snippet table(rs: Row[], label: string)}
   {@const read = share(rs, 'read')}
-  {@const mcp = share(rs, 'mcp')}
+  {@const mcp = share(rs, 'mcp_read')}
   <table aria-label={label}>
     <thead><tr><th>Событие</th><th class="n">Вызовов</th><th class="n">Токенов</th><th class="n">Уже выдавалось</th></tr></thead>
     <tbody>
@@ -110,7 +111,7 @@
   <p class="small share" data-share>
     Доля «уже выдавалось»: чтения —
     {#if read}{num(read.reread)} из {num(read.calls)} ({pct(read.reread, read.calls)}){:else}—{/if}{#if mcp && mcp.reread},
-      MCP — {num(mcp.reread)} из {num(mcp.calls)} вызовов ({pct(mcp.reread, mcp.calls)}){/if}.
+      чтения MCP — {num(mcp.reread)} из {num(mcp.calls)} ({pct(mcp.reread, mcp.calls)}){/if}.
   </p>
 {/snippet}
 

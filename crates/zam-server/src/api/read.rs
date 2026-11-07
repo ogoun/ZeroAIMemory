@@ -63,9 +63,10 @@
 //!   обрезанный бюджетом или `max_tokens` повтор и `(budget)` помечаются так же. Дифф
 //!   `since_rev`, секции, L0/L1, `unchanged` и ошибки — без пометки. Вызов с хотя бы одной
 //!   пометкой прибавляет 1 к `session_tokens.reread_calls` (той же транзакцией, что и отметка
-//!   выданного): у REST и CLI — события `read`, из MCP — события `mcp`. Учёт выдачи (M6 §8):
-//!   вызов `/read` с явной сессией не из MCP — событие `read` (`calls` + 1, `tokens` —
-//!   `total_tokens` ответа); из MCP вызов и токены считает инструмент (`mcp`). Без сессии ответ
+//!   выданного): у REST и CLI — события `read`, из MCP — события `mcp_read`. Учёт выдачи (M6
+//!   §8): вызов `/read` с явной сессией не из MCP — событие `read` (`calls` + 1, `tokens` —
+//!   `total_tokens` ответа); из MCP — `mcp_read` (`calls` + 1, `tokens` 0: токены вызова считает
+//!   инструмент событием `mcp`, итог не удваивается). Без сессии ответ
 //!   прежний (эталон `read_l2_m57.json`);
 //! - **явный фокус** (M6 §6, [`super::read_focus`]): `focus: "<запрос>"` (или `tier: "focus"` с
 //!   ним) — оглавление, лучшие листы и пометки `[пропущено: <адрес> (<подпись>) · ~N t]`,
@@ -1378,8 +1379,9 @@ pub const REREAD_MARK: &str = "уже выдавалось в этой сесс�
 /// Событие `session_tokens` вызова `/read` REST и CLI (M6 §8: вызов, токены ответа и повторная
 /// выдача `reread_calls`).
 pub const READ_TOKEN_EVENT: &str = "read";
-/// Событие `session_tokens` инструментов MCP (M6 §7.1): у `/read` из MCP — только `reread_calls`.
-const MCP_TOKEN_EVENT: &str = crate::mcp::MCP_TOKEN_EVENT;
+/// Событие `session_tokens` чтений `/read` из MCP (ревью 8b): вызов и `reread_calls`, токенов 0
+/// (их считает событие `mcp` инструмента).
+pub const MCP_READ_TOKEN_EVENT: &str = "mcp_read";
 
 /// Элемент — полный текст, который повтором можно отдать с пометкой: L2 без секции (или часть
 /// вложения по `locator`), не дифф `since_rev`; есть ключи выданного.
@@ -1893,12 +1895,13 @@ pub async fn read(
             .iter()
             .any(|p| matches!(p, Piece::Text { f, .. } | Piece::Budget { f, .. } if f.reread));
         // учёт выданного (M6 §8): REST и CLI — событие `read` (вызов и токены ответа); из MCP
-        // вызов и токены считает инструмент событием `mcp`, сюда — только пометка повтора в ту
-        // же строку `mcp` (доля «уже выдавалось» — к вызовам своего канала)
+        // токены считает инструмент событием `mcp`, сюда — строка `mcp_read` (вызов чтения и
+        // пометка повтора, токенов 0 — итог не удваивается; ревью 8b, решение контролёра): доля
+        // «уже выдавалось» MCP — к чтениям MCP, а не ко всем вызовам MCP
         let counts = vec![if s.via_mcp {
             TokenCount {
-                event: MCP_TOKEN_EVENT.into(),
-                calls: 0,
+                event: MCP_READ_TOKEN_EVENT.into(),
+                calls: 1,
                 tokens: 0,
                 reread_calls: u64::from(reread),
             }

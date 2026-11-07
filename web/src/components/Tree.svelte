@@ -171,6 +171,8 @@
     for (const k of Object.keys(open)) {
       if (open[k] && k.startsWith(prefix)) loads.push(loadKids(uid, ref, k.slice(prefix.length)));
     }
+    // создание, перемещение, удаление и восстановление в Rules меняют плашку `rules_heavy`
+    if (spaces[uid]?.some((s) => s.kind === 'rules' && spaceRef(s) === ref)) loads.push(loadRules(uid));
     await Promise.all(loads);
   }
 
