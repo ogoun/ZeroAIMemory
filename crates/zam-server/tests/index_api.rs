@@ -498,3 +498,102 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
     assert!(!out.status.success());
     b.st.shutdown().await;
 }
+
+/// M6 §8 (задача 8b): `rules` в `GET /index/status` — Rules пользователя запроса `{solution,
+/// count, l1_tokens, warning}`, `rules_heavy` — при больше 10 правил или L1 в сумме больше 1500
+/// токенов; то же у базы в `dbs[]` (администратору без `X-Zam-User` — только там, `rules` —
+/// `null`); `?only=rules` — лёгкий ответ. Без моделей.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn index_status_rules_heavy_shape() {
+    let a = api("ia-rules", |_| {}).await;
+    let r = a
+        .adm(
+            Method::PATCH,
+            "/api/v1/admin/settings",
+            Some(json!({"rules": {"agent_write": true}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let only = async |sol: Option<&str>| {
+        let h: Vec<(&str, &str)> = sol.map(|g| ("x-zam-solution", g)).into_iter().collect();
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::GET,
+                "/api/v1/index/status?only=rules",
+                None,
+                &h,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        r.json()
+    };
+    // правил нет
+    assert_eq!(
+        only(None).await,
+        json!({"rules": {"solution": null, "count": 0, "l1_tokens": 0, "warning": null}})
+    );
+    // 10 коротких — ещё не много
+    for i in 0..10 {
+        a.note(
+            "rules",
+            &format!("п{i}"),
+            &format!("# П{i}\n\nКороткое правило {i}.\n"),
+        )
+        .await;
+    }
+    let j = only(None).await;
+    assert_eq!(j["rules"]["count"], 10, "{j}");
+    assert_eq!(j["rules"]["warning"], Value::Null, "{j}");
+    let small = j["rules"]["l1_tokens"].as_u64().unwrap();
+    assert!(small > 0 && small < 1500, "{j}");
+    // 11-е — rules_heavy; GUID решения из заголовка — в `solution`
+    a.note("rules", "п10", "# П10\n\nКороткое правило 10.\n")
+        .await;
+    let g = "11111111-2222-4333-8444-555555555555";
+    let j = only(Some(g)).await;
+    assert_eq!(j["rules"]["count"], 11, "{j}");
+    assert_eq!(j["rules"]["warning"], "rules_heavy", "{j}");
+    assert_eq!(j["rules"]["solution"], g, "{j}");
+    // полный статус: `rules` и `dbs[].rules`
+    let s = status(&a).await;
+    assert_eq!(s["rules"]["warning"], "rules_heavy", "{s}");
+    assert_eq!(s["dbs"][0]["rules"]["count"], 11, "{s}");
+    // администратор по всем базам — `rules: null`, у базы — свои
+    let s = adm_status(&a).await;
+    assert_eq!(s["rules"], Value::Null, "{s}");
+    let mine = s["dbs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["user_id"] == json!(uid(&a)))
+        .unwrap();
+    assert_eq!(mine["rules"]["warning"], "rules_heavy", "{s}");
+    // 10 правил (не больше порога), но L1 в сумме больше 1500 токенов — тоже rules_heavy
+    let b = api("ia-rules-long", |_| {}).await;
+    let r = b
+        .adm(
+            Method::PATCH,
+            "/api/v1/admin/settings",
+            Some(json!({"rules": {"agent_write": true}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let long = "Длинное пояснение правила с подробностями и примерами. ".repeat(40);
+    for i in 0..10 {
+        b.note("rules", &format!("д{i}"), &format!("# Д{i}\n\n{long}\n"))
+            .await;
+    }
+    let r = b
+        .t(Method::GET, "/api/v1/index/status?only=rules", None)
+        .await;
+    let j = r.json();
+    assert_eq!(j["rules"]["count"], 10, "{j}");
+    assert!(j["rules"]["l1_tokens"].as_u64().unwrap() > 1500, "{j}");
+    assert_eq!(j["rules"]["warning"], "rules_heavy", "{j}");
+    // неизвестный `only` — 400
+    let r = b.t(Method::GET, "/api/v1/index/status?only=zz", None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}

@@ -62,8 +62,11 @@
 //!   у него, если контекст не сжат. Пометка — до упаковки, её токены входят в бюджет;
 //!   обрезанный бюджетом или `max_tokens` повтор и `(budget)` помечаются так же. Дифф
 //!   `since_rev`, секции, L0/L1, `unchanged` и ошибки — без пометки. Вызов с хотя бы одной
-//!   пометкой прибавляет 1 к `session_tokens.reread_calls` события `read` (той же транзакцией,
-//!   что и отметка выданного). Без сессии ответ прежний (эталон `read_l2_m57.json`);
+//!   пометкой прибавляет 1 к `session_tokens.reread_calls` (той же транзакцией, что и отметка
+//!   выданного): у REST и CLI — события `read`, из MCP — события `mcp`. Учёт выдачи (M6 §8):
+//!   вызов `/read` с явной сессией не из MCP — событие `read` (`calls` + 1, `tokens` —
+//!   `total_tokens` ответа); из MCP вызов и токены считает инструмент (`mcp`). Без сессии ответ
+//!   прежний (эталон `read_l2_m57.json`);
 //! - **явный фокус** (M6 §6, [`super::read_focus`]): `focus: "<запрос>"` (или `tier: "focus"` с
 //!   ним) — оглавление, лучшие листы и пометки `[пропущено: <адрес> (<подпись>) · ~N t]`,
 //!   `tier: "focus"` и `focus_parts` в json, `· фокус` в заголовке md; без текста — 400 «нужен
@@ -1372,8 +1375,11 @@ const FOCUS_MARK: &str = "фокус";
 /// Пометка заголовка повторной выдачи (M6 §7.3): `… · ~120 tok · уже выдавалось в этой сессии`.
 pub const REREAD_MARK: &str = "уже выдавалось в этой сессии";
 
-/// Событие `session_tokens`, у которого считается повторная выдача `/read` (`reread_calls`).
+/// Событие `session_tokens` вызова `/read` REST и CLI (M6 §8: вызов, токены ответа и повторная
+/// выдача `reread_calls`).
 pub const READ_TOKEN_EVENT: &str = "read";
+/// Событие `session_tokens` инструментов MCP (M6 §7.1): у `/read` из MCP — только `reread_calls`.
+const MCP_TOKEN_EVENT: &str = crate::mcp::MCP_TOKEN_EVENT;
 
 /// Элемент — полный текст, который повтором можно отдать с пометкой: L2 без секции (или часть
 /// вложения по `locator`), не дифф `since_rev`; есть ключи выданного.
@@ -1886,15 +1892,24 @@ pub async fn read(
         let reread = pieces
             .iter()
             .any(|p| matches!(p, Piece::Text { f, .. } | Piece::Budget { f, .. } if f.reread));
-        let counts: Vec<TokenCount> = reread
-            .then(|| TokenCount {
-                event: READ_TOKEN_EVENT.into(),
+        // учёт выданного (M6 §8): REST и CLI — событие `read` (вызов и токены ответа); из MCP
+        // вызов и токены считает инструмент событием `mcp`, сюда — только пометка повтора в ту
+        // же строку `mcp` (доля «уже выдавалось» — к вызовам своего канала)
+        let counts = vec![if s.via_mcp {
+            TokenCount {
+                event: MCP_TOKEN_EVENT.into(),
                 calls: 0,
                 tokens: 0,
-                reread_calls: 1,
-            })
-            .into_iter()
-            .collect();
+                reread_calls: u64::from(reread),
+            }
+        } else {
+            TokenCount {
+                event: READ_TOKEN_EVENT.into(),
+                calls: 1,
+                tokens: total as u64,
+                reread_calls: u64::from(reread),
+            }
+        }];
         if let Err(e) = mark_seen_with_tokens(&s.db, &s.touch, &given, &counts).await {
             tracing::warn!(error = %e, "чтение: отметка выданного сессии не выполнена");
         }

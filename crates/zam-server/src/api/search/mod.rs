@@ -2281,6 +2281,9 @@ async fn mark_cache_sources(
 }
 
 /// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
+/// Событие `session_tokens` поиска REST и CLI (M6 §8).
+pub const SEARCH_TOKEN_EVENT: &str = "search";
+
 fn session_failed(what: &str, e: &StoreError) {
     tracing::warn!(error = %e, "поиск: {what} сессии не выполнено, ответ без пометок seen");
 }
@@ -2875,6 +2878,24 @@ pub async fn search(
             session_failed("отметка выданного", &e);
         }
     }
+    // Markdown ответа — для `format=md` и для учёта выдачи
+    let accounted = session.as_ref().filter(|s| !s.via_mcp);
+    let md_text = (format == OutFormat::Md || accounted.is_some())
+        .then(|| md_body(&cache_md, &packed, mode, &by_id, &tail_md));
+    // учёт выданного (M6 §8): REST и CLI с явной сессией — событие `search`, токены — Markdown
+    // того же отбора (у `format=json` — тоже он: размер выдачи, а не обёртки JSON); из MCP
+    // вызов считает инструмент событием `mcp`
+    if let (Some(s), Some(body)) = (accounted, md_text.as_deref())
+        && let Err(e) = zam_store::add_tokens(
+            &s.db,
+            &s.touch,
+            SEARCH_TOKEN_EVENT,
+            count_tokens(body) as u64,
+        )
+        .await
+    {
+        session_failed("учёт выданного", &e);
+    }
 
     Ok(match format {
         OutFormat::Json => {
@@ -2907,8 +2928,7 @@ pub async fn search(
             .into_response()
         }
         OutFormat::Md => {
-            let body = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
-            let mut r = body.into_response();
+            let mut r = md_text.unwrap_or_default().into_response();
             r.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/markdown; charset=utf-8"),

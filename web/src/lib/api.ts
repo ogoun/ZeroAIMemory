@@ -616,8 +616,12 @@ export interface IndexStatus {
   rebuild_skipped: { user_id: string; error: string; attempts: number }[];
   /** Базы пользователей, которые не открылись (повреждены или недоступны). */
   unavailable_dbs: { user_id: string; error: string }[];
-  /** Видимые базы: ход фоновой перенарезки после смены настроек нарезки (`null` — не идёт). */
-  dbs: { user_id: string; rechunk: Rechunk | null }[];
+  /** Видимые базы: ход фоновой перенарезки после смены настроек нарезки (`null` — не идёт) и
+   * Rules базы (M6 §8; старый сервер — без поля). */
+  dbs: { user_id: string; rechunk: Rechunk | null; rules?: RulesStatus | null }[];
+  /** Rules пользователя запроса (токен, пользователь, администратор с `X-Zam-User`); у
+   * администратора по всем базам — `null` (Rules каждой — в `dbs`). */
+  rules?: RulesStatus | null;
 }
 
 /** Перенарезка базы (§8.2): `reason` — `params` | `algorithm` | `tokenizer` | `unknown`;
@@ -1374,6 +1378,62 @@ export const promoteCache = (
   to: { as: 'note'; path?: string } | { as: 'insight'; kind?: string },
   user?: string,
 ) => call<CacheItem>('POST', `cache/${q(id)}/promote`, to, user);
+
+// ---- сессии агентов и выданное им (M4.5 §9.5, M6 §8) ----
+
+/** Выданное сессии по событию: `reread_calls` — вызовов с пометкой «уже выдавалось» (M6 §7.3;
+ * у `read` — REST и CLI, у `mcp` — чтения из MCP); нет поля — 0. */
+export interface TokenStat {
+  calls: number;
+  tokens: number;
+  reread_calls?: number;
+}
+
+/** Сессия агента (`GET /sessions`, `GET /sessions/{id}`). `tokens` — по событию
+ * (`session_start`, `recovery`, `rules` — резерв Rules этих событий, `prompt`, `post_tool`,
+ * `brief`, `pre_tool`, `post_tool_local`, `subagent_local`, `search`, `read`, `mcp`). */
+export interface SessionItem {
+  id: string;
+  agent: string | null;
+  solution: string | null;
+  area: string | null;
+  machine: string | null;
+  parent_id: string | null;
+  agent_type: string | null;
+  started_at: string;
+  last_seen_at: string;
+  ended_at: string | null;
+  memory_writes: number;
+  seen_epoch: number;
+  /** Контрольная группа агентного A/B (M6 §12). */
+  holdout?: boolean;
+  tokens?: Record<string, TokenStat>;
+}
+
+/** Свои сессии, свежие первыми, с выданным по событию; администратор — пользователя `user`. */
+export function listSessions(f: { solution?: string; limit?: number }, user?: string) {
+  const p = new URLSearchParams({ tokens: 'true' });
+  if (f.solution) p.set('solution', f.solution);
+  if (f.limit) p.set('limit', String(f.limit));
+  return call<{ items: SessionItem[] }>('GET', `sessions?${p}`, undefined, user);
+}
+
+/** Rules пользователя (`GET /index/status?only=rules`, M6 §8): `warning` — `rules_heavy` при
+ * больше 10 правил или L1 в сумме больше 1500 токенов. */
+export interface RulesStatus {
+  solution: string | null;
+  count: number;
+  l1_tokens: number;
+  warning: 'rules_heavy' | null;
+}
+
+export const rulesStatus = (user?: string) =>
+  call<{ rules: RulesStatus | null }>('GET', 'index/status?only=rules', undefined, user);
+
+/** Текст плашки `rules_heavy`. */
+export const rulesHeavyText = (r: RulesStatus): string =>
+  `Правил много: ${r.count}, L1 в сумме ≈ ${r.l1_tokens} токенов — дайджест каждой сессии ` +
+  'выдаёт их сверх бюджета. Порог — 10 правил или 1500 токенов: объедините или сократите правила.';
 
 // ---- оценки и показы записей (§10.5) ----
 

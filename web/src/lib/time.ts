@@ -6,11 +6,16 @@ const DEFAULT_STYLE: Intl.DateTimeFormatOptions = { dateStyle: 'short', timeStyl
 
 /**
  * Момент RFC 3339 → локальное время браузера (`ru-RU`). `opts` — стиль и при необходимости пояс
- * (`timeZone`); без `dateStyle`/`timeStyle` — короткие дата и время. Не время — строка как есть.
+ * (`timeZone`); без `dateStyle`/`timeStyle` и полей (`year`…`second`) — короткие дата и время. Не
+ * время — строка как есть.
  */
 export function localTime(iso: string, opts: Intl.DateTimeFormatOptions = {}): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  const styled = opts.dateStyle !== undefined || opts.timeStyle !== undefined;
+  // стиль или поля даты/времени заданы — без умолчания: `dateStyle`/`timeStyle` вместе с
+  // `year`…`second` браузер отвергает (TypeError «Invalid option»)
+  const fields = ['year', 'month', 'day', 'weekday', 'hour', 'minute', 'second'] as const;
+  const styled =
+    opts.dateStyle !== undefined || opts.timeStyle !== undefined || fields.some((f) => opts[f] !== undefined);
   return d.toLocaleString('ru-RU', styled ? opts : { ...DEFAULT_STYLE, ...opts });
 }

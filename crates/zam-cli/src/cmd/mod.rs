@@ -18,6 +18,7 @@ pub mod refs;
 pub mod release;
 pub mod report;
 pub mod search;
+pub mod sessions;
 pub mod solution;
 pub mod status;
 pub mod task;

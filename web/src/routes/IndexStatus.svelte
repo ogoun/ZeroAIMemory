@@ -5,11 +5,13 @@
   // вкладку — сразу), причина деградации с действием (тексты — с сервера),
   // повреждённые и исключённые из пересборки базы, неудавшиеся задания и переиндексация
   // (POST /admin/reindex) с подтверждением; баннер перенарезки баз после смены настроек
-  // нарезки («Идёт перенарезка: изменились <ключи>, N из M», §8.2) — общий RechunkBanner.
+  // нарезки («Идёт перенарезка: изменились <ключи>, N из M», §8.2) — общий RechunkBanner;
+  // плашка `rules_heavy` по базам, где Rules больше 10 или их L1 в сумме больше 1500 токенов
+  // (M6 §8: дайджест выдаёт Rules сверх бюджета).
   import { Dialog } from 'bits-ui';
   import { onMount } from 'svelte';
   import RechunkBanner from '../components/RechunkBanner.svelte';
-  import { ApiError, indexStatus, reindex, type IndexStatus, type User } from '../lib/api';
+  import { ApiError, indexStatus, reindex, rulesHeavyText, type IndexStatus, type User } from '../lib/api';
   import { hintParts, reasonText, transient } from '../lib/indexing';
   import { href } from '../lib/router';
 
@@ -121,6 +123,8 @@
   let busyReindex = $derived(!!st && (st.reindex.running || st.reindex.queued));
   /** Имена пользователей для баннера перенарезки (старый сервер без `dbs` — баннера нет). */
   let userNames = $derived(Object.fromEntries(users.map((u) => [u.id, u.name])));
+  /** Базы с `rules_heavy` (M6 §8; старый сервер без `dbs[].rules` — плашки нет). */
+  let heavy = $derived((st?.dbs ?? []).filter((d) => d.rules?.warning === 'rules_heavy'));
 </script>
 
 <section class="panel index-page">
@@ -192,6 +196,17 @@
     </dl>
 
     <RechunkBanner dbs={st.dbs ?? []} names={userNames} />
+
+    {#if heavy.length}
+      <div class="alert alert-warn" role="note" aria-label="Много правил">
+        <p class="alert-title">Много правил (rules_heavy): баз — {heavy.length}</p>
+        <ul class="dbs">
+          {#each heavy as d (d.user_id)}
+            <li><b>{userName(d.user_id)}</b> <span class="muted">({d.user_id})</span>: {rulesHeavyText(d.rules!)}</li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
 
     {#if st.unavailable_dbs.length}
       <div class="alert">

@@ -214,6 +214,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CacheCmd,
     },
+    /// Сессии агентов: выданное по событию (токены, «уже выдавалось»)
+    Sessions {
+        #[command(subcommand)]
+        cmd: SessionsCmd,
+    },
     /// Vault: секреты (значение — только из stdin или скрытого ввода)
     Vault {
         #[command(subcommand)]
@@ -944,6 +949,43 @@ enum CacheCmd {
         #[command(flatten)]
         common: Common,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionsCmd {
+    /// Таблица «событие · вызовов · токенов · уже выдавалось»: сессия по id, сумма по --last N;
+    /// без них — сессия агента (ZAM_SESSION, сессия хуков) или последняя
+    Tokens {
+        /// Id сессии
+        id: Option<String>,
+        /// Сумма по N последним сессиям (свежие первыми)
+        #[arg(long, conflicts_with = "id", value_parser = clap::value_parser!(u32).range(1..=500))]
+        last: Option<u32>,
+        /// Отдельно контрольная группа A/B (holdout) и остальные
+        #[arg(long)]
+        by_holdout: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn sessions(c: SessionsCmd) -> Result<(), CliError> {
+    use cmd::sessions::{Pick, tokens};
+    match c {
+        SessionsCmd::Tokens {
+            id,
+            last,
+            by_holdout,
+            common,
+        } => {
+            let pick = match (id.as_deref(), last) {
+                (Some(id), _) => Pick::Id(id),
+                (None, Some(n)) => Pick::Last(n),
+                (None, None) => Pick::Current,
+            };
+            tokens(&cmd::connect(&common)?, &pick, by_holdout)
+        }
+    }
 }
 
 fn cache(c: CacheCmd) -> Result<(), CliError> {
@@ -1740,6 +1782,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Question { cmd } => question(cmd),
         Cmd::Idea { cmd } => idea(cmd),
         Cmd::Cache { cmd } => cache(cmd),
+        Cmd::Sessions { cmd } => sessions(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {
             cmd:

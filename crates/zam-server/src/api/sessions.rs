@@ -19,11 +19,18 @@
 //! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
 //! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, parent_id, agent_type,
 //!   started_at, last_seen_at, ended_at, memory_writes, seen_epoch, claimed_tasks: [{id, title,
-//!   status}], tokens: {<событие>: {calls, tokens, reread_calls?}}}` (решение контроллера R6,
+//!   status}], holdout, tokens: {<событие>: {calls, tokens, reread_calls?}}}` (решение контроллера R6,
 //!   читает хук `checkpoint`; `claimed_tasks` — задачи журнала, захваченные сессией, M4.5;
 //!   `tokens` — выданное сессии по событию, §9.5; `reread_calls` — повторные выдачи `/read`,
-//!   есть только ненулевое, M6 §7.3; `seen_epoch` — эпоха `session_seen`, M6 §7.2);
-//! - `GET /sessions?solution=&limit=` → `{items}` — свои, свежие первыми (50, до 500);
+//!   есть только ненулевое, M6 §7.3; `seen_epoch` — эпоха `session_seen`, M6 §7.2; `holdout` —
+//!   контрольная группа A/B, M6 §12). События учёта (M6 §8): `/recall` — `session_start`,
+//!   `recovery` (без Rules), `rules` (резерв Rules этих двух), `prompt`, `post_tool`, `brief`;
+//!   `/search` и `/read` с явной сессией, не из MCP — `search`, `read` (выдача в токенах);
+//!   инструменты MCP — `mcp` (`/read` из MCP — `reread_calls` строки `mcp`); хуки с локальным
+//!   выводом — `pre_tool`, `post_tool_local`, `subagent_local`;
+//! - `GET /sessions?solution=&limit=&tokens=` → `{items}` — свои, свежие первыми (50, до 500);
+//!   `tokens=true` — у каждой ещё `tokens`, как в `GET /sessions/{id}` (`zam sessions tokens
+//!   --last N`, страница сессий WebUI);
 //! - `GET /sessions/unattributed?days=N` → `{items: [{day, event, calls, tokens}]}` — выданное
 //!   без явной сессии по суткам UTC (M6 §7.1, [`unattributed`]).
 //!
@@ -56,7 +63,7 @@ use zam_core::{Id, SolutionGuid};
 use zam_store::{
     Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, bump_epoch,
     claimed_tasks, end_session, get_session, list_sessions, list_spaces, session_epoch,
-    session_tokens, touch_session,
+    session_tokens, sessions_tokens, touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -379,6 +386,8 @@ async fn claimed_tasks_of(
 pub struct ListQuery {
     solution: Option<String>,
     limit: Option<usize>,
+    /// `true` — у каждой сессии `tokens` (выданное по событию).
+    tokens: Option<bool>,
 }
 
 /// `GET /sessions`.
@@ -404,6 +413,19 @@ pub async fn list(
         .transpose()?;
     let db = requester_db(&st, &p, &headers).await?;
     let items = list_sessions(&db, solution.as_ref(), limit).await?;
+    if q.tokens != Some(true) {
+        return Ok(Json(json!({ "items": items })));
+    }
+    let ids: Vec<String> = items.iter().map(|s| s.id.clone()).collect();
+    let mut tokens = sessions_tokens(&db, &ids).await?;
+    let items: Vec<Value> = items
+        .iter()
+        .map(|s| {
+            let mut v = json!(s);
+            v["tokens"] = json!(tokens.remove(&s.id).unwrap_or_default());
+            v
+        })
+        .collect();
     Ok(Json(json!({ "items": items })))
 }
 

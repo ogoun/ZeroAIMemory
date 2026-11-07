@@ -862,7 +862,8 @@ async fn reread_full_text_with_mark() {
 }
 
 /// Повторная выдача считается в `session_tokens.reread_calls` строки события `read`: +1 на
-/// вызов `/read` с пометкой (сколько бы целей ни было помечено); первое чтение — 0, строки нет.
+/// вызов `/read` с пометкой (сколько бы целей ни было помечено); первое чтение — 0 (с M6 задачи
+/// 8b строка `read` есть и без повторов: вызов и токены ответа, поля `reread_calls` нет).
 #[tokio::test]
 async fn reread_counter_in_session_tokens() {
     let a = api("read-reread-count", |_| {}).await;
@@ -872,7 +873,9 @@ async fn reread_counter_in_session_tokens() {
     let tokens =
         || async { a.t(Method::GET, "/api/v1/sessions/rc", None).await.json()["tokens"].clone() };
     read_in(&a, "rc", json!({"items": items})).await;
-    assert!(tokens().await.get("read").is_none(), "{}", tokens().await);
+    let t = tokens().await;
+    assert_eq!(t["read"]["calls"], 1, "{t}");
+    assert!(t["read"].get("reread_calls").is_none(), "{t}");
     read_in(&a, "rc", json!({"items": items})).await;
     assert_eq!(
         tokens().await["read"]["reread_calls"],

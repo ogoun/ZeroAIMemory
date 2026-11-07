@@ -24,6 +24,14 @@ test('localTime: стиль по умолчанию и свой', () => {
   assert.equal(localTime(iso, { timeZone: 'UTC', dateStyle: 'medium' }).includes('2026'), true);
 });
 
+test('localTime: поля даты и времени — без стиля по умолчанию (страница «Индекс»)', () => {
+  const iso = '2026-10-10T14:03:22Z';
+  const o: Intl.DateTimeFormatOptions = {
+    timeZone: 'UTC', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+  };
+  assert.equal(localTime(iso, o), new Date(iso).toLocaleString('ru-RU', o));
+});
+
 test('localTime: не время — как есть', () => {
   assert.equal(localTime('мусор'), 'мусор');
   assert.equal(localTime(''), '');

@@ -87,6 +87,8 @@ pub struct Session {
     pub memory_writes: i64,
     /// Текущая эпоха `session_seen` (M6 §7.2, [`bump_epoch`]).
     pub seen_epoch: u32,
+    /// Сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12).
+    pub holdout: bool,
 }
 
 /// Предел имени события `session_tokens`, символов.
@@ -95,8 +97,10 @@ pub const TOKEN_EVENT_MAX_CHARS: usize = 32;
 /// Прибавка к учёту выданного сессии по событию.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenCount {
-    /// Событие: `session_start`, `recovery`, `prompt`, `post_tool`, `brief` (`/recall`) или
-    /// `pre_tool`, `post_tool_local`, `subagent_local` (хуки с локальным выводом).
+    /// Событие: `session_start`, `recovery`, `rules` (резерв Rules этих двух, M6 §8), `prompt`,
+    /// `post_tool`, `brief` (`/recall`), `search`, `read` (REST и CLI с явной сессией), `mcp`
+    /// (инструменты MCP) или `pre_tool`, `post_tool_local`, `subagent_local` (хуки с локальным
+    /// выводом).
     pub event: String,
     pub calls: u64,
     pub tokens: u64,
@@ -287,7 +291,7 @@ pub async fn end_session(db: &Db, id: &str, ended: bool) -> Result<bool, StoreEr
 
 const SESSION_COLS: &str = "id, token_id, solution_guid, area, machine, agent, started_at, \
                             last_seen_at, ended_at, memory_writes, parent_id, agent_type, \
-                            seen_epoch";
+                            seen_epoch, holdout";
 
 fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -304,6 +308,7 @@ fn session_row(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         parent_id: r.get(10)?,
         agent_type: r.get(11)?,
         seen_epoch: r.get(12)?,
+        holdout: r.get(13)?,
     })
 }
 
@@ -466,6 +471,41 @@ pub async fn session_tokens(
             ))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// Выданное сессиям `sessions` по событиям ([`session_tokens`] пачкой; сессии без выдач — без
+/// ключа).
+pub async fn sessions_tokens(
+    db: &Db,
+    sessions: &[String],
+) -> Result<HashMap<String, std::collections::BTreeMap<String, TokenStat>>, StoreError> {
+    let sessions = sessions.to_vec();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT event, calls, tokens, reread_calls FROM session_tokens WHERE session_id = ?1",
+        )?;
+        let mut out: HashMap<String, std::collections::BTreeMap<String, TokenStat>> =
+            HashMap::new();
+        for id in sessions {
+            let rows = st.query_map([&id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    TokenStat {
+                        calls: r.get(1)?,
+                        tokens: r.get(2)?,
+                        reread_calls: r.get(3)?,
+                    },
+                ))
+            })?;
+            let m: std::collections::BTreeMap<String, TokenStat> =
+                rows.collect::<Result<_, _>>()?;
+            if !m.is_empty() {
+                out.insert(id, m);
+            }
+        }
+        Ok(out)
     })
     .await
 }

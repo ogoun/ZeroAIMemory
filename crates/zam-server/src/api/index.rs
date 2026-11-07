@@ -12,6 +12,14 @@
 //!   перенарезки после смены настроек нарезки `{reason, changed, total, done}` или `null`
 //!   (§8.2). `?only=rechunk` — лёгкий ответ для баннера WebUI: только `{dbs}` (без Qdrant,
 //!   очереди и неудавшихся заданий; базы не открываются, задача 13 fix round 1, M-1).
+//!   **Rules** (M6 §8, задача 8b): `rules: {solution, count, l1_tokens, warning}` — Rules
+//!   пользователя запроса (личное пространство Rules — то же, что идёт в дайджест при любом
+//!   решении; `solution` — GUID из `X-Zam-Solution` или `null`), `count` — заметок, `l1_tokens` —
+//!   их L1 в сумме так, как их выдаёт дайджест (текст правила до 200 токенов), `warning:
+//!   "rules_heavy"` — при больше [`RULES_HEAVY_COUNT`] правил или L1 больше
+//!   [`RULES_HEAVY_L1_TOKENS`] токенов; администратору без `X-Zam-User` — `null`. То же поле
+//!   (без `solution`) — у каждой базы `dbs[]`. `?only=rules` — лёгкий ответ `{rules}` (плашка у
+//!   Rules в дереве WebUI). Сбой чтения Rules ответ не валит: `rules` — `null` (WARN).
 //! - `POST /admin/reindex {user?, space?, full?}` — только администратор, аудит
 //!   `index.reindex`, ответ 202 с `job_count` (заметок области). Без `full` — точки
 //!   области удаляются и пишутся заново из кэша `embeddings` без инференса (промахи кэша —
@@ -33,7 +41,8 @@ use zam_index::{ReindexOutcome, ReindexRequest, VectorFilter, VectorScope};
 use zam_ml::Device;
 use zam_store::time::fmt_ts;
 use zam_store::{
-    FailedJob, JobStats, RechunkProgress, failed_jobs, indexable_count, job_stats, list_spaces,
+    Db, FailedJob, JobStats, NodeKind, RechunkProgress, SpaceKind, failed_jobs, indexable_count,
+    job_stats, list_children, list_spaces, node_content,
 };
 
 use crate::app::AppState;
@@ -136,10 +145,69 @@ fn reindex_json(o: &ReindexOutcome) -> Value {
     v
 }
 
+/// Rules больше этого числа — предупреждение `rules_heavy` (M6 §8).
+pub const RULES_HEAVY_COUNT: usize = 10;
+/// L1 Rules в сумме больше этого числа токенов — предупреждение `rules_heavy` (M6 §8).
+pub const RULES_HEAVY_L1_TOKENS: usize = 1500;
+
+/// Rules базы `db` (M6 §8): число заметок пространства Rules и сумма их L1 так, как их выдаёт
+/// дайджест (текст правила до `RULE_L1_TOKENS`, [`super::recall::rule_l1`]), и предупреждение
+/// `rules_heavy` при больше [`RULES_HEAVY_COUNT`] правил или L1 в сумме больше
+/// [`RULES_HEAVY_L1_TOKENS`]. Нет пространства Rules — нули.
+async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::StoreError> {
+    let mut count = 0usize;
+    let mut l1_tokens = 0usize;
+    if let Some(space) = list_spaces(db)
+        .await?
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Rules)
+    {
+        for n in list_children(db, space.id, None, 16).await? {
+            if n.kind != NodeKind::Note {
+                continue;
+            }
+            let text = match node_content(db, n.id, None).await {
+                Ok((_, t)) => t,
+                Err(zam_store::StoreError::NotFound) => continue,
+                Err(e) => return Err(e),
+            };
+            count += 1;
+            l1_tokens += zam_store::count_tokens(&super::recall::rule_l1(&text).0);
+        }
+    }
+    let heavy = count > RULES_HEAVY_COUNT || l1_tokens > RULES_HEAVY_L1_TOKENS;
+    Ok(json!({
+        "solution": solution,
+        "count": count,
+        "l1_tokens": l1_tokens,
+        "warning": heavy.then_some("rules_heavy"),
+    }))
+}
+
+/// Rules базы для ответа: сбой чтения — `null` (WARN без текста).
+async fn rules_json(db: &Db, solution: Option<&str>) -> Value {
+    match rules_of(db, solution).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "статус: Rules базы не прочитаны");
+            Value::Null
+        }
+    }
+}
+
+/// GUID решения из `X-Zam-Solution` для поля `rules.solution` (некорректный — `null`).
+fn header_solution(headers: &HeaderMap) -> Option<String> {
+    crate::attrib::header_value(headers, crate::api::search::SOLUTION_HEADER)
+        .ok()
+        .flatten()
+        .and_then(|g| g.trim().parse::<zam_core::SolutionGuid>().ok())
+        .map(|g| g.as_str().to_string())
+}
+
 /// Лишние параметры запроса игнорируются (как до `only`): строгий разбор сломал бы клиентов.
 #[derive(Deserialize)]
 pub struct StatusQuery {
-    /// `rechunk` — только ход перенарезки баз (`dbs`).
+    /// `rechunk` — только ход перенарезки баз (`dbs`); `rules` — только Rules (`rules`).
     only: Option<String>,
 }
 
@@ -164,7 +232,17 @@ pub async fn status(
             }
             return Ok(Json(json!({ "dbs": dbs })));
         }
-        Some(_) => return Err(ApiError::BadRequest("only: rechunk".into())),
+        Some("rules") => {
+            let rules = match (all, users.first()) {
+                (false, Some(u)) => {
+                    let db = st.users.get(*u).await?;
+                    rules_json(&db, header_solution(&headers).as_deref()).await
+                }
+                _ => Value::Null,
+            };
+            return Ok(Json(json!({ "rules": rules })));
+        }
+        Some(_) => return Err(ApiError::BadRequest("only: rechunk | rules".into())),
     }
     let rt = &st.index;
     // очередь и неудавшиеся задания видимых пользователей
@@ -177,15 +255,17 @@ pub async fn status(
     let mut scopes: Vec<VectorScope> = Vec::new();
     // перенарезка по базам (§8.2)
     let mut dbs: Vec<Value> = Vec::new();
+    // Rules пользователя запроса (M6 §8); у администратора по всем базам — `null`
+    let mut own_rules = Value::Null;
     for u in &users {
         let one = async {
             let db = st.users.get(*u).await?;
             let s = job_stats(&db).await?;
             let f = failed_jobs(&db, FAILED_ITEMS).await?;
             let sp: Vec<Id> = list_spaces(&db).await?.into_iter().map(|s| s.id).collect();
-            Ok::<_, zam_store::StoreError>((s, f, sp))
+            Ok::<_, zam_store::StoreError>((s, f, sp, db))
         };
-        let (s, f, sp) = match one.await {
+        let (s, f, sp, db) = match one.await {
             Ok(v) => v,
             Err(e) if all => {
                 unavailable.push(json!({ "user_id": u, "error": e.to_string() }));
@@ -197,9 +277,17 @@ pub async fn status(
             user_id: *u,
             space_ids: sp,
         });
+        let rules = rules_json(&db, None).await;
+        if !all {
+            own_rules = rules.clone();
+            if let Some(o) = own_rules.as_object_mut() {
+                o.insert("solution".into(), json!(header_solution(&headers)));
+            }
+        }
         dbs.push(json!({
             "user_id": u,
             "rechunk": st.users.rechunk_progress(*u).await.map(|r| rechunk_json(&r)),
+            "rules": rules,
         }));
         queue.queued += s.queued;
         queue.running += s.running;
@@ -287,6 +375,7 @@ pub async fn status(
     };
     Ok(Json(json!({
         "docs": docs,
+        "rules": own_rules,
         "vector": {
             "available": reason.is_none(),
             "reason": reason.map(|r| r.as_str()),

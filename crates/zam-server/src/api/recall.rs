@@ -21,8 +21,10 @@
 //! - **учёт выданного** (M4.5 §9.5): непустой `text` прибавляется к `session_tokens` сессии —
 //!   событие `session_start`, `recovery` (и `session_start` после `compact | resume`),
 //!   `prompt`, `post_tool` или `brief`, `calls + 1`, `tokens + tokens` ответа — в той же
-//!   транзакции, что `session_seen` (без лишней синхронизации диска); `record: false`, нет
-//!   сессии или вышел срок учёта — без прибавки;
+//!   транзакции, что `session_seen` (без лишней синхронизации диска); резерв Rules — отдельной
+//!   строкой `rules` (M6 §8, §17 п. 3: `calls + 1`, `tokens + rules_tokens`), событие — без него;
+//!   вызов из MCP считает инструмент (`mcp`); `record: false`, нет сессии или вышел срок учёта —
+//!   без прибавки;
 //! - **`session_start`** — дайджест: Rules — **резерв сверх бюджета** (M6 §8: все заметки до
 //!   [`RULES_MAX`], текст каждой до [`RULE_L1_TOKENS`], длиннее — с «…», не вытесняются),
 //!   остальное — не больше `budget_tokens` (по умолчанию `recall.digest_tokens` = 1500) по
@@ -2084,10 +2086,7 @@ async fn digest(
                 // текст правила целиком до `RULE_L1_TOKENS` (решение контролёра по ревью 8a:
                 // оглавление с первыми фразами секций теряло вторую фразу правила); длиннее —
                 // с «…» и строкой [`RULES_SHORT_NOTE`]; секреты маскируются, как в чанках и L0
-                let summary = zam_markdown::mask_text(rule_body(&text));
-                // предел — через `budget_cap` (M6 §4.2: без модели — с запасом оценки)
-                let cap = zam_store::budget_cap(RULE_L1_TOKENS);
-                let (summary, cut) = truncate_marked(summary.trim(), cap, &count_tokens);
+                let (summary, cut) = rule_l1(&text);
                 for line in summary.lines().filter(|l| !l.trim().is_empty()) {
                     block.push_str("\n  ");
                     block.push_str(line.trim_end());
@@ -2699,6 +2698,18 @@ fn rule_body(text: &str) -> &str {
         .unwrap_or(text)
 }
 
+/// L1 правила (M6 §8, решение контролёра по ревью 8a): текст правила с маскированными секретами
+/// до `budget_cap(RULE_L1_TOKENS)` (M6 §4.2: без модели — с запасом оценки); `true` — обрезан с
+/// «…». Тот же текст считает `GET /index/status` (`rules.l1_tokens`, `rules_heavy`).
+pub(crate) fn rule_l1(text: &str) -> (String, bool) {
+    let body = zam_markdown::mask_text(rule_body(text));
+    truncate_marked(
+        body.trim(),
+        zam_store::budget_cap(RULE_L1_TOKENS),
+        &count_tokens,
+    )
+}
+
 /// Приоритет правил (ревью 8a, I1; M6 §8): надёжность (`axiom` → `theorem` → прочие), затем
 /// давность создания (старые — основа проекта, новые чаще уточняют), затем путь. Детерминирован
 /// при неизменной базе и не зависит от имён: `security/*` и `process/*` не уходят первыми из-за
@@ -2778,6 +2789,9 @@ fn first_sentence(s: &str) -> &str {
 /// 8a): в стиле прочих пометок подсказок.
 const RULES_SHORT_NOTE: &str =
     "ZeroAIMemory: правила сокращены («…» — обрезано) — полностью memory_read n:<id>";
+
+/// Событие `session_tokens` резерва Rules дайджеста и пакета восстановления (M6 §8).
+pub const RULES_TOKEN_EVENT: &str = "rules";
 
 /// Строка о правилах, что не показаны (сверх `RULES_MAX` или не вошли в предел вывода).
 fn rules_hidden_line(n: usize) -> String {
@@ -4048,15 +4062,27 @@ pub async fn recall(
     } else if rt < total_deadline {
         // выданное сессии по событию (§9.5): пустой ответ — не выдача; вызов из MCP учитывает
         // сам инструмент событием `mcp` (M6 §7.1) — без двойного счёта
-        let tokens: Vec<TokenCount> = (!text.is_empty() && origin.is_none())
-            .then(|| TokenCount {
+        // Rules — отдельной строкой учёта `rules` (M6 §8, §17 п. 3), событие — без резерва Rules:
+        // строки складываются без двойного счёта
+        let mut tokens: Vec<TokenCount> = Vec::new();
+        if !text.is_empty() && origin.is_none() {
+            let all = count_tokens(&text) as u64;
+            let rules = (rules_tokens as u64).min(all);
+            tokens.push(TokenCount {
                 event: token_event(req.event, recovery).into(),
                 calls: 1,
-                tokens: count_tokens(&text) as u64,
+                tokens: all - rules,
                 reread_calls: 0,
-            })
-            .into_iter()
-            .collect();
+            });
+            if rules > 0 {
+                tokens.push(TokenCount {
+                    event: RULES_TOKEN_EVENT.into(),
+                    calls: 1,
+                    tokens: rules,
+                    reread_calls: 0,
+                });
+            }
+        }
         record(
             session.as_ref(),
             &targets,
