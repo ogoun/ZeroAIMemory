@@ -3430,6 +3430,48 @@ PASS (прогон `r3`, xtask с тех пор не менялся).
 
 ### Задача 8b. Учёт, `zam sessions`, страница сессий, `rules_heavy`
 
+#### Коммит 1 — решения контролёра по ревью 8a
+
+Коммит — `fix(recall): полный текст Rules в дайджесте` поверх `31fb73d`.
+
+1. **Текст правила вместо `note_l1`.** L1 правила в дайджесте и пакете восстановления было
+   `note_l1` (оглавление и первая фраза каждой секции, `api/nodes/read.rs:244-248`): вторая
+   фраза правила (исключение, запрет) пропадала молча и у Claude, где предела канала нет.
+   Теперь блок правила — строка правила и под ней текст правила (`rule_body`: тело заметки без
+   frontmatter, секреты маскированы) до `budget_cap(RULE_L1_TOKENS)` (200) через
+   `truncate_marked`: длиннее — кончается «…», и в разделе Rules — та же строка
+   `RULES_SHORT_NOTE` («правила сокращены («…» — обрезано) — полностью memory_read n:<id>»),
+   что и при L0 под пределом канала; строка одна на раздел. Признак обрезки — у правила
+   (`RuleShort.cut`, `FitRule.cut`), а не флагом раздела: `RulesFit::apply` ставит строку, если
+   сокращено хоть одно правило — текстом с «…» или строкой L0. Механика 8a под пределом канала
+   (шаги (1)/(1′) L1 → L0, `keep`, строки «не показано — …») не менялась; сравнение «L1 длиннее
+   L0 × 1,4» идёт по тексту правила.
+2. **`rule_l0_phrase`** — `trim_end_matches(['.', '…'])`: первая фраза, что уже кончается «…»,
+   даёт одну пометку, а не «……».
+3. **`omit_after_rules` снят.** Строки после правил собираются парами `(строка, Omit)`
+   (`OMIT_GLOSSARY`, `OMIT_VERIFIED`; тип `Omit = (&str, &str)`), адрес снятой строки — с ней,
+   а не по префиксу «Словарь:»/«Проверенные команды:».
+
+Тесты: `recall::rule_text_whole_and_long_cut_marked` (правило из двух фраз с frontmatter — вторая
+фраза в дайджесте без предела, frontmatter нет, строки-пояснения нет; правило > 200 токенов — «…»,
+текст ≤ 200, строка-пояснение есть); юнит `rule_l0_phrase_marks_dropped_second_sentence` («…» в
+конце первой фразы), `recovery_notices_kept_without_later_section` (адрес снятой строки — из
+пары). Под новое поведение обновлены: `ideas_section_not_cut_by_budget` (строк раздела Rules
+18: строка правила, заголовок, фраза), `short_l1_rule_stays_l1` (текст под строкой правила —
+`# К` и фраза),
+`digest_fits_output_limit_codex_and_claude` (без предела правила мира длиннее 200 токенов —
+строка-пояснение одна). `heavy_sh05_fits_output_limit`, `recall_heavy_ml` и `zam-cli` `hooks`
+(в том числе `session_start_fits_channel_codex_and_claude`) — зелёные без правок ожиданий
+(`hooks` — 63 PASS, 1 FAIL под нагрузкой сборки: `post_tool_failure_error_regex_hint` — пустой
+вывод хука по бюджету, повтор отдельно — PASS). Проверки коммита (`target/r1-t8b`,
+`ZAM_REQUIRE_ML=1`): `cargo fmt --all -- --check`, `cargo clippy -p zam-server --all-targets -D
+warnings` — чисто; `zam-server` `--lib` 245 PASS, `recall` 34, `recall_heavy` 2,
+`recall_heavy_ml` 1, `recall_recovery` 6, `recall_frozen` 4, `recall_brief` 9, `ideas_recall` 26,
+`mcp` 58, `session_tokens` 3 — PASS.
+
+**→ 13c:** ТЗ §10.3 (`session_start` — «Rules (L1)») — уточнить: L1 правила — текст правила до
+200 токенов.
+
 ### Задача 8c. Сетки ТС-2 и полный прогон
 
 ### Задача 9. Пороги подсказок, общий код совпадения слов

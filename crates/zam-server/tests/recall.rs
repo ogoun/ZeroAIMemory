@@ -1532,6 +1532,81 @@ async fn rules_reserved_never_cut() {
     assert!(j["tokens"].as_u64().unwrap() <= 100, "{j}");
 }
 
+/// Решение контролёра по ревью 8a: в разделе Rules — текст правила до `RULE_L1_TOKENS` (200), а
+/// не оглавление с первой фразой секции: вторая фраза правила видна без предела канала; текст
+/// длиннее — с «…» и строкой «правила сокращены … memory_read n:<id>».
+#[tokio::test]
+async fn rule_text_whole_and_long_cut_marked() {
+    let a = api("recall-rule-text", roomy).await;
+    allow_rules(&a).await;
+    let short = a
+        .note(
+            "rules",
+            "process/short",
+            "---\ntags: [rule]\n---\n# Короткое\n\nПервая фраза правила. Исключение: только \
+             по пятницам.\n",
+        )
+        .await;
+    let short_ref = format!("n:{}", short["id"].as_str().unwrap());
+    // REST без `source` и `output_limit` — без предела канала: только текст правила
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rt-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила").join("\n");
+    assert!(rules.contains(&short_ref), "{text}");
+    assert!(
+        rules.contains("Исключение: только по пятницам."),
+        "вторая фраза правила потеряна: {text}"
+    );
+    assert!(
+        !rules.contains("tags:"),
+        "frontmatter в тексте правила: {text}"
+    );
+    assert!(!rules.contains("правила сокращены"), "{text}");
+
+    let long = "Подробность правила с примером и оговоркой. ".repeat(60);
+    let n = a
+        .note("rules", "process/long", &format!("# Длинное\n\n{long}\n"))
+        .await;
+    let long_ref = format!("n:{}", n["id"].as_str().unwrap());
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rt-2"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила");
+    let at = rules
+        .iter()
+        .position(|l| l.contains(&long_ref))
+        .unwrap_or_else(|| panic!("{text}"));
+    let body: Vec<&String> = rules[at + 1..]
+        .iter()
+        .take_while(|l| l.starts_with("  "))
+        .collect();
+    let body = body.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+    assert!(body.ends_with('…'), "длинное правило без «…»: {body}");
+    assert!(
+        zam_store::fits_budget(&body, 200),
+        "текст правила {} > 200: {body}",
+        zam_store::count_tokens(&body)
+    );
+    assert!(
+        rules.iter().any(|l| l
+            == "ZeroAIMemory: правила сокращены («…» — обрезано) — полностью memory_read n:<id>"),
+        "{text}"
+    );
+    // короткое — по-прежнему целиком
+    assert!(text.contains("Исключение: только по пятницам."), "{text}");
+}
+
 /// M6 §8: порядок разделов не зависит от `usage` (`recall_shown`, `useful`) и показов других
 /// сессий — два старта разных сессий подряд дают одинаковый `text`.
 #[tokio::test]
@@ -1639,8 +1714,8 @@ async fn ideas_section_not_cut_by_budget() {
     for w in &ideas {
         assert!(got.contains(w), "{w}: {text}");
     }
-    // правило — строка-заголовок и строка L1
-    assert_eq!(section(text, "### Правила").len(), 12, "{text}");
+    // правило — строка правила и его текст (заголовок и фраза; решение контролёра по ревью 8a)
+    assert_eq!(section(text, "### Правила").len(), 18, "{text}");
 }
 
 /// Строка-индекс `<ссылка> «<заголовок>» · <N>t`.
@@ -2049,7 +2124,8 @@ async fn digest_fits_output_limit_codex_and_claude() {
         }
         assert_eq!(text.matches(SHORT_NOTE).count(), 1, "{unit}: {text}");
     }
-    // без предела (REST, MCP) — L1 у всех
+    // без предела (REST, MCP) — текст у всех (без L0); правила мира длиннее `RULE_L1_TOKENS` —
+    // обрезаны с «…», строка-пояснение — одна (решение контролёра по ревью 8a)
     let j = ok(
         &a,
         &a.token,
@@ -2060,7 +2136,7 @@ async fn digest_fits_output_limit_codex_and_claude() {
     let text = j["text"].as_str().unwrap();
     assert!(text.len() > CODEX_MAX_BYTES, "{}", text.len());
     assert!(!text.contains("— Кратко о правиле"), "{text}");
-    assert!(!text.contains(SHORT_NOTE), "{text}");
+    assert_eq!(text.matches(SHORT_NOTE).count(), 1, "{text}");
 }
 
 /// Ревью 8a, C1: хук старого клиента (есть `source`/`code_map`, нет `output_limit`) —
@@ -2283,8 +2359,8 @@ async fn short_l1_rule_stays_l1() {
     assert!(text.len() <= 12_000, "{}", text.len());
     // 19 правил мира и короткое — все 20 на месте
     assert!(ids.iter().all(|r| text.contains(r.as_str())), "{text}");
-    // короткое правило — L1 (строка правила и строка L1 под ней)
-    let l1 = format!("ZeroAIMemory: правило zz/коротко n:{short}\n  К");
+    // короткое правило — L1 (строка правила и текст правила под ней)
+    let l1 = format!("ZeroAIMemory: правило zz/коротко n:{short}\n  # К\n  Одна фраза правила.");
     assert!(text.contains(&l1), "короткое правило не L1: {text}");
     // урезаны другие правила
     assert!(text.contains("— Кратко о правиле"), "{text}");

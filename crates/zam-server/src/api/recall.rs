@@ -24,10 +24,10 @@
 //!   транзакции, что `session_seen` (без лишней синхронизации диска); `record: false`, нет
 //!   сессии или вышел срок учёта — без прибавки;
 //! - **`session_start`** — дайджест: Rules — **резерв сверх бюджета** (M6 §8: все заметки до
-//!   [`RULES_MAX`], L1 каждой до [`RULE_L1_TOKENS`], не вытесняются), остальное — не больше
-//!   `budget_tokens` (по умолчанию `recall.digest_tokens` = 1500) по приоритету — порядку
-//!   разделов (уведомления, задачи, ответы и идеи — первыми, их не вытесняют индексы; проверка —
-//!   `budget_cap`, M6 §4.2); детерминирован (M6 §8: порядок не зависит от `usage` и показов
+//!   [`RULES_MAX`], текст каждой до [`RULE_L1_TOKENS`], длиннее — с «…», не вытесняются),
+//!   остальное — не больше `budget_tokens` (по умолчанию `recall.digest_tokens` = 1500) по
+//!   приоритету — порядку разделов (уведомления, задачи, ответы и идеи — первыми, их не
+//!   вытесняют индексы; проверка — `budget_cap`, M6 §4.2); детерминирован (M6 §8: порядок не зависит от `usage` и показов
 //!   других сессий, окна — от начала суток UTC, в тексте нет возраста): напоминание об
 //!   устаревшем блоке инструкции
 //!   (`agent_block_version` меньше версии сервера [`crate::agent_setup::current_version`] —
@@ -44,8 +44,8 @@
 //!   `### Открытые вопросы` (`N открытых: «…», «…», «…»`, до [`OPEN_QUESTIONS_TITLES`]
 //!   заголовков, не подсказка записи), `### Окружение` (M4.5 §8: до [`ENVIRONMENT_MAX`] записей
 //!   Vault `host`/`environment`, `<имя> — <purpose>; <address>; ограничения: … — v:<id>`; без
-//!   учёта показа; в `recovery` и `brief` нет), Rules (L1 каждой заметки, до
-//!   [`RULES_MAX`] заметок, L1 — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
+//!   учёта показа; в `recovery` и `brief` нет), Rules (текст каждой заметки, до
+//!   [`RULES_MAX`] заметок, текст — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
 //!   пространства решения, строка на корень — путь и L0 до [`SOLUTION_ROOT_L0_TOKENS`] (до
 //!   [`SOLUTION_ROOT_MAX`]), действующие (`active`) `gotcha`/`failure` решения и Knowledge
 //!   (новые первыми; строка — заголовок, без фрагмента), записи `revisit` и последние записи
@@ -189,7 +189,6 @@ use zam_store::{
 };
 
 use super::json_body;
-use super::nodes::read::l1;
 use super::search::targets::{ScopeReq, SearchTarget, dedup_keep_order, resolve_targets};
 use super::search::{Health, SOLUTION_HEADER};
 use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
@@ -218,7 +217,8 @@ const TEST_SLOW_RULE_MS: u64 = 40;
 pub const TEST_EPOCH_FAIL_PREFIX: &str = "zam-test-epoch-fail";
 /// Заметок Rules в дайджесте.
 pub const RULES_MAX: usize = 20;
-/// Предел L1 одной заметки Rules в дайджесте, токенов.
+/// Предел текста одной заметки Rules в дайджесте и пакете восстановления (L1 правила, M6 §8),
+/// токенов.
 pub const RULE_L1_TOKENS: usize = 200;
 /// Корневых узлов решения («L1 решения») в дайджесте.
 pub const SOLUTION_ROOT_MAX: usize = 10;
@@ -414,15 +414,23 @@ fn output_limit(req: &RecallReq, mcp: bool) -> Option<OutputLimit> {
     })
 }
 
-/// Правила раздела-резерва при укладке в предел вывода (ревью 8a, C1): в порядке вывода —
-/// место в приоритете ([`rule_order`]), кандидат и блок (L1 или L0); `hidden` — правил, что не
-/// показаны (строка [`rules_hidden_line`]).
+/// Правило раздела-резерва при укладке в предел вывода (ревью 8a, C1).
+struct FitRule<'c> {
+    /// Место в приоритете ([`rule_order`]).
+    rank: usize,
+    cand: &'c Cand,
+    /// Блок: текст правила (до [`RULE_L1_TOKENS`]) или строка L0.
+    block: String,
+    /// Блок сокращён — текст обрезан с «…» или заменён строкой L0 (строка [`RULES_SHORT_NOTE`]).
+    cut: bool,
+}
+
+/// Правила раздела-резерва при укладке в предел вывода (ревью 8a, C1) — в порядке вывода;
+/// `hidden` — правил, что не показаны (строка [`rules_hidden_line`]).
 struct RulesFit<'c> {
     ri: usize,
-    items: Vec<(usize, &'c Cand, String)>,
+    items: Vec<FitRule<'c>>,
     hidden: usize,
-    /// Хоть одно правило показано строкой L0 (строка [`RULES_SHORT_NOTE`]).
-    shortened: bool,
 }
 
 impl<'c> RulesFit<'c> {
@@ -430,7 +438,7 @@ impl<'c> RulesFit<'c> {
     fn of(
         packed: &[Section],
         picked: &[Vec<&'c Cand>],
-        short: &HashMap<TargetRef, (usize, String)>,
+        short: &HashMap<TargetRef, RuleShort>,
         hidden: usize,
     ) -> Option<Self> {
         let ri = packed.iter().position(|s| s.reserved)?;
@@ -438,59 +446,62 @@ impl<'c> RulesFit<'c> {
             .iter()
             .zip(packed[ri].blocks.iter())
             .map(|(c, b)| {
-                let rank = short.get(&c.tref).map_or(usize::MAX, |(r, _)| *r);
-                (rank, *c, b.clone())
+                let s = short.get(&c.tref);
+                FitRule {
+                    rank: s.map_or(usize::MAX, |s| s.rank),
+                    cand: c,
+                    block: b.clone(),
+                    cut: s.is_some_and(|s| s.cut),
+                }
             })
             .collect();
-        Some(Self {
-            ri,
-            items,
-            hidden,
-            shortened: false,
-        })
+        Some(Self { ri, items, hidden })
     }
 
     /// Блоки и подсказки раздела — в упаковку.
     fn apply(&self, packed: &mut [Section], picked: &mut [Vec<&'c Cand>]) {
         let sec = &mut packed[self.ri];
-        sec.blocks = self.items.iter().map(|(_, _, b)| b.clone()).collect();
-        if self.shortened {
+        sec.blocks = self.items.iter().map(|r| r.block.clone()).collect();
+        if self.items.iter().any(|r| r.cut) {
             sec.blocks.push(RULES_SHORT_NOTE.to_string());
         }
         if self.hidden > 0 {
             sec.blocks.push(rules_hidden_line(self.hidden));
         }
-        picked[self.ri] = self.items.iter().map(|(_, c, _)| *c).collect();
+        picked[self.ri] = self.items.iter().map(|r| r.cand).collect();
     }
 
     /// У правила с конца приоритета, ещё с L1, — строка L0, если L1 длиннее L0 больше чем в
     /// `gain_x10 / 10` раза ([`RULE_L0_GAIN_X10`] — шаг (1), 10 — шаг (1′)); нечего — `false`.
-    fn degrade(&mut self, short: &HashMap<TargetRef, (usize, String)>, gain_x10: usize) -> bool {
+    fn degrade(&mut self, short: &HashMap<TargetRef, RuleShort>, gain_x10: usize) -> bool {
         let next = self
             .items
             .iter()
             .enumerate()
-            .filter(|(_, (_, c, b))| {
-                short.get(&c.tref).is_some_and(|(_, l0)| {
+            .filter(|(_, r)| {
+                short.get(&r.cand.tref).is_some_and(|s| {
                     // сравнивается смысл: строки L1 под заголовком правила и фраза L0
-                    l0 != b
-                        && l0.len() < b.len()
-                        && l1_text(b).chars().count() * 10 > l0_text(l0).chars().count() * gain_x10
+                    let b = &r.block;
+                    s.l0 != *b
+                        && s.l0.len() < b.len()
+                        && l1_text(b).chars().count() * 10
+                            > l0_text(&s.l0).chars().count() * gain_x10
                 })
             })
-            .max_by_key(|(_, (r, _, _))| *r)
+            .max_by_key(|(_, r)| r.rank)
             .map(|(k, _)| k);
         let Some(k) = next else {
             return false;
         };
-        self.items[k].2 = short[&self.items[k].1.tref].1.clone();
-        self.shortened = true;
+        let item = &mut self.items[k];
+        item.block = short[&item.cand.tref].l0.clone();
+        item.cut = true;
         true
     }
 
     /// Правило с конца приоритета — прочь (его учитывает строка о непоказанных).
     fn drop_last(&mut self) -> bool {
-        let Some(k) = (0..self.items.len()).max_by_key(|&k| self.items[k].0) else {
+        let Some(k) = (0..self.items.len()).max_by_key(|&k| self.items[k].rank) else {
             return false;
         };
         self.items.remove(k);
@@ -521,7 +532,7 @@ fn l0_text(line: &str) -> &str {
 fn pack_limited(
     packed: &mut [Section],
     picked: &mut [Vec<&Cand>],
-    short: &HashMap<TargetRef, (usize, String)>,
+    short: &HashMap<TargetRef, RuleShort>,
     hidden: usize,
     cap: usize,
     limit: Option<OutputLimit>,
@@ -2022,11 +2033,12 @@ async fn digest(
         sections.push((Some(SECTION_DECISIONS), decisions));
     }
 
-    // Rules — L1 каждой заметки; больше `RULES_MAX` — первые по приоритету ([`rule_order`]),
-    // остальные — строкой «не показано — правил: N»; вывод — по пути
+    // Rules — текст каждой заметки (до `RULE_L1_TOKENS`); больше `RULES_MAX` — первые по
+    // приоритету ([`rule_order`]), остальные — строкой «не показано — правил: N»; вывод — по пути
     let mut rules: Vec<Cand> = Vec::new();
-    let mut rules_short: HashMap<TargetRef, (usize, String)> = HashMap::new();
+    let mut rules_short: HashMap<TargetRef, RuleShort> = HashMap::new();
     let mut rules_hidden = 0usize;
+    let mut rules_cut = false;
     if let Some((i, space)) = personal_space(targets, SpaceKind::Rules) {
         let db = targets[i].db.clone();
         if let Some(r) = deadline.step(list_children(&db, space, None, 16)).await {
@@ -2069,21 +2081,28 @@ async fn digest(
                     &[certainty.as_deref().unwrap_or_default()],
                     &reference,
                 );
-                // секреты в тексте правила маскируются, как в чанках и L0 (§7.6)
-                let summary = zam_markdown::mask_text(&l1(&text));
+                // текст правила целиком до `RULE_L1_TOKENS` (решение контролёра по ревью 8a:
+                // оглавление с первыми фразами секций теряло вторую фразу правила); длиннее —
+                // с «…» и строкой [`RULES_SHORT_NOTE`]; секреты маскируются, как в чанках и L0
+                let summary = zam_markdown::mask_text(rule_body(&text));
                 // предел — через `budget_cap` (M6 §4.2: без модели — с запасом оценки)
                 let cap = zam_store::budget_cap(RULE_L1_TOKENS);
-                let summary = truncate_to_tokens(&summary, cap, &count_tokens);
+                let (summary, cut) = truncate_marked(summary.trim(), cap, &count_tokens);
                 for line in summary.lines().filter(|l| !l.trim().is_empty()) {
                     block.push_str("\n  ");
                     block.push_str(line.trim_end());
                 }
+                rules_cut |= cut;
                 rules_short.insert(
                     TargetRef {
                         kind: TargetKind::Node,
                         id: n.id,
                     },
-                    (rank[&n.id], rule_l0_block(&n)),
+                    RuleShort {
+                        rank: rank[&n.id],
+                        l0: rule_l0_block(&n),
+                        cut,
+                    },
                 );
                 rules.push(Cand {
                     target: i,
@@ -2181,11 +2200,17 @@ async fn digest(
     .collect();
     sections.push((Some("### Последние изменения"), changes));
     // строки после правил: словарь и проверенные команды решения (M4.5 §7)
-    let mut after_rules: Vec<String> = glossary_line(st, health, deadline)
+    // адрес снятой строки — вместе со строкой (ревью 8a, круг 3)
+    let mut after_rules: Vec<(String, Omit)> = glossary_line(st, health, deadline)
         .await
         .into_iter()
+        .map(|l| (l, OMIT_GLOSSARY))
         .collect();
-    after_rules.extend(verified_line(health, deadline, sol).await);
+    after_rules.extend(
+        verified_line(health, deadline, sol)
+            .await
+            .map(|l| (l, OMIT_VERIFIED)),
+    );
     // строка карты кода — после проверенных команд (M5.6 §10)
     let mut code_map = Vec::new();
     let mut code_line = None;
@@ -2202,6 +2227,7 @@ async fn digest(
         code_map,
         rules_short,
         rules_hidden,
+        rules_cut,
     };
     Ok((lines, sections))
 }
@@ -2644,16 +2670,33 @@ async fn decision_cands(
 struct Lines {
     notices: Vec<String>,
     open_line: Option<String>,
-    after_rules: Vec<String>,
+    /// Строки словаря и проверенных команд — с адресом снятой строки ([`Omit`]).
+    after_rules: Vec<(String, Omit)>,
     /// Строка карты кода (M5.6 §10): в дайджесте и восстановлении — резерв вместе с Rules, под
     /// пределом канала не снимается (повторное ревью 8a, 2а).
     code_line: Option<String>,
     code_map: Vec<String>,
     /// Правила раздела: место в приоритете ([`rule_order`]) и строка L0 — для урезания под
     /// предел вывода канала ([`fit_rules`]).
-    rules_short: HashMap<TargetRef, (usize, String)>,
+    rules_short: HashMap<TargetRef, RuleShort>,
     /// Правил сверх `RULES_MAX` (строка [`rules_hidden_line`]).
     rules_hidden: usize,
+    /// Текст хоть одного правила обрезан до [`RULE_L1_TOKENS`] (строка [`RULES_SHORT_NOTE`]).
+    rules_cut: bool,
+}
+
+/// Правило раздела для урезания под предел вывода: место в приоритете ([`rule_order`]),
+/// строка L0 ([`rule_l0_block`]) и обрезан ли его текст в разделе (с «…»).
+struct RuleShort {
+    rank: usize,
+    l0: String,
+    cut: bool,
+}
+
+/// Текст правила для раздела Rules — тело заметки без frontmatter.
+fn rule_body(text: &str) -> &str {
+    text.get(zam_markdown::parse(text).body_start..)
+        .unwrap_or(text)
 }
 
 /// Приоритет правил (ревью 8a, I1; M6 §8): надёжность (`axiom` → `theorem` → прочие), затем
@@ -2703,7 +2746,8 @@ fn rule_l0_phrase(l0: &str, cap: usize) -> String {
     let first = first_sentence(l0);
     let (mut out, cut) = truncate_marked(first, cap, &count_tokens);
     if !cut && first.len() < l0.len() {
-        let base = out.trim_end_matches('.').to_string();
+        // точка или «…» в конце первой фразы — одна пометка «…», не «……»
+        let base = out.trim_end_matches(['.', '…']).to_string();
         let marked = format!("{base}…");
         out = if count_tokens(&marked) <= cap {
             marked
@@ -3518,6 +3562,7 @@ fn arrange<'c>(
         code_line,
         code_map,
         rules_hidden,
+        rules_cut,
         ..
     } = lines;
     let mut out = Arranged::default();
@@ -3547,6 +3592,9 @@ fn arrange<'c>(
             // первая ловушка — выше обязательных строк: шаг (2) её не снимает (решения контролёра
             // по 421b75d, 2б)
             sec.keep_head = Some(KEEP_FIRST_TRAP);
+        }
+        if title == Some(SECTION_RULES) && rules_cut && !cands.is_empty() {
+            sec.blocks.push(RULES_SHORT_NOTE.to_string());
         }
         if title == Some(SECTION_RULES) && rules_hidden > 0 {
             sec.blocks.push(rules_hidden_line(rules_hidden));
@@ -3579,9 +3627,9 @@ fn arrange<'c>(
         }
         if title == Some(SECTION_RULES) {
             // строки словаря и проверенных команд — по разделу на строку: свой адрес снятого
-            for l in &after_rules {
+            for (l, omit) in &after_rules {
                 out.line(None, vec![l.clone()], KEEP_POINTERS);
-                out.omit_last(omit_after_rules(l));
+                out.omit_last(*omit);
             }
             if let Some(l) = &code_line {
                 let mut sec = Section::new(None, vec![l.clone()]);
@@ -3620,20 +3668,14 @@ fn keep_of(title: Option<&str>) -> u8 {
 }
 
 /// Адрес снятой строки открытых вопросов.
-const OMIT_OPEN_QUESTIONS: (&str, &str) =
-    ("строк открытых вопросов", "memory_search kinds=[question]");
+const OMIT_OPEN_QUESTIONS: Omit = ("строк открытых вопросов", "memory_search kinds=[question]");
 
-/// Адрес снятой строки после правил: словарь — `kinds=[term]`, проверенные команды — заметки
-/// решения (`memory_tree`), прочее — `memory_recall` (MCP без предела).
-fn omit_after_rules(line: &str) -> (&'static str, &'static str) {
-    if line.starts_with("Словарь:") {
-        ("строк словаря", "memory_search kinds=[term]")
-    } else if line.starts_with("Проверенные команды:") {
-        ("строк проверенных команд", "memory_tree")
-    } else {
-        ("строк", "memory_recall")
-    }
-}
+/// Адрес снятого блока `(что, где полностью)` — строка «не показано — <что>: N (<где>)».
+type Omit = (&'static str, &'static str);
+/// Адрес снятой строки словаря.
+const OMIT_GLOSSARY: Omit = ("строк словаря", "memory_search kinds=[term]");
+/// Адрес снятой строки проверенных команд — заметки решения.
+const OMIT_VERIFIED: Omit = ("строк проверенных команд", "memory_tree");
 
 /// Заголовок раздела ловушек дайджеста.
 const SECTION_TRAPS_DIGEST: &str = "### Ловушки и сбои";
@@ -4200,9 +4242,13 @@ mod tests {
         let lines = Lines {
             notices: vec!["n".into()],
             open_line: Some("q".into()),
+            // адрес снятой строки — со строкой, не по её префиксу (ревью 8a, круг 3)
             after_rules: vec![
-                "Словарь".to_string(),
-                "Проверенные команды: a (проверено 2026-10-28)".into(),
+                ("Словарь".to_string(), OMIT_GLOSSARY),
+                (
+                    "Проверенные команды: a (проверено 2026-10-28)".into(),
+                    OMIT_VERIFIED,
+                ),
             ],
             ..Lines::default()
         };
@@ -4210,6 +4256,10 @@ mod tests {
         // раздел Rules — резерв сверх бюджета (M6 §8), прочие — в бюджете
         let reserved: Vec<bool> = packed.iter().map(|s| s.reserved).collect();
         assert_eq!(reserved, [false, false, false, false, true, false, false]);
+        let omit = |k: usize| packed[k].omit.clone();
+        let own = |o: Omit| Some((o.0.to_string(), o.1.to_string()));
+        assert_eq!(omit(5), own(OMIT_GLOSSARY));
+        assert_eq!(omit(6), own(OMIT_VERIFIED));
         let blocks: Vec<&str> = packed
             .iter()
             .flat_map(|s| s.blocks.iter().map(String::as_str))
@@ -4232,6 +4282,12 @@ mod tests {
         assert_eq!(rule_l0_phrase("A. Исключение: B.", 40), "A…");
         assert_eq!(rule_l0_phrase("Одна фраза.", 40), "Одна фраза.");
         assert_eq!(rule_l0_phrase("Без точки", 40), "Без точки");
+        // первая фраза на «…» — одна пометка, не «……» (ревью 8a, круг 3)
+        assert_eq!(
+            rule_l0_phrase("Сначала так… Потом иначе.", 40),
+            "Сначала так…"
+        );
+        assert_eq!(rule_l0_phrase("Так.… Иначе.", 40), "Так…");
         let long = "слово ".repeat(80);
         let out = rule_l0_phrase(&long, 10);
         assert!(out.ends_with('…') && count_tokens(&out) <= 10, "{out}");
