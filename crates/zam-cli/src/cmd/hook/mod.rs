@@ -326,7 +326,18 @@ impl Env {
 
     /// Остаток бюджета на HTTP: бюджет минус [`HTTP_RESERVE_MS`] от старта процесса.
     pub fn http_left(&self) -> Option<Duration> {
-        let total = Duration::from_millis(self.kind.budget_ms().saturating_sub(HTTP_RESERVE_MS));
+        #[allow(unused_mut)]
+        let mut budget = self.kind.budget_ms();
+        // щедрый бюджет для тестов содержимого (отладочная сборка под нагрузкой; повторное
+        // ревью 8a M6, п. 3) — только отладочный бинарник и фича `test-hooks`
+        #[cfg(any(feature = "test-hooks", debug_assertions))]
+        if let Some(ms) = std::env::var("ZAM_TEST_HOOK_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            budget = ms;
+        }
+        let total = Duration::from_millis(budget.saturating_sub(HTTP_RESERVE_MS));
         total
             .checked_sub(self.started.elapsed())
             .filter(|d| !d.is_zero())

@@ -1933,7 +1933,7 @@ const RULE_L0_TAIL: &str = "проверять каждое изменение �
     стенды и секреты, сообщать о сбоях в канал команды";
 /// Строка-пояснение раздела Rules о сокращённых правилах.
 const SHORT_NOTE: &str =
-    "ZeroAIMemory: правила одной строкой сокращены («…» — обрезано) — полностью memory_read n:<id>";
+    "ZeroAIMemory: правила сокращены («…» — обрезано) — полностью memory_read n:<id>";
 
 /// Мир «20 правил × 200 токенов кириллицей» с решением, ловушками, задачей и картой кода; id
 /// правил по порядку создания.
@@ -2264,7 +2264,7 @@ async fn short_l1_rule_stays_l1() {
         &a.token,
         "rules",
         "zz/коротко",
-        "---\nl0: Коротко. Одна фраза.\n---\n# Коротко\n\nОдна фраза.\n",
+        "---\nl0: Одна фраза правила.\n---\n# К\n\nОдна фраза правила.\n",
     )
     .await;
     let j = ok(
@@ -2272,21 +2272,17 @@ async fn short_l1_rule_stays_l1() {
         &a.token,
         Some("short-1"),
         json!({"event": "session_start", "solution": G, "source": "startup",
-               "output_limit": {"unit": "bytes", "max": CODEX_MAX_BYTES}}),
+               "output_limit": {"unit": "bytes", "max": 12_000}}),
     )
     .await;
     let text = j["text"].as_str().unwrap();
-    assert!(text.len() <= CODEX_MAX_BYTES, "{}", text.len());
+    // предел, где хватает шага (1): сокращаются длинные правила, короткое — пропускается
+    assert!(text.len() <= 12_000, "{}", text.len());
     // 19 правил мира и короткое — все 20 на месте
     assert!(ids.iter().all(|r| text.contains(r.as_str())), "{text}");
-    let block = text
-        .split("ZeroAIMemory: правило ")
-        .find(|b| b.contains(&format!("n:{short}")))
-        .unwrap_or_else(|| panic!("нет правила: {text}"));
-    assert!(
-        block.contains("\n  Коротко"),
-        "короткий L1 остался L1: {block}"
-    );
+    // короткое правило — L1 (строка правила и строка L1 под ней)
+    let l1 = format!("ZeroAIMemory: правило zz/коротко n:{short}\n  К");
+    assert!(text.contains(&l1), "короткое правило не L1: {text}");
     // урезаны другие правила
     assert!(text.contains("— Кратко о правиле"), "{text}");
 }

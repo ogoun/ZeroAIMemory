@@ -631,8 +631,7 @@ pub fn shape(text: &str, w: &World) -> String {
         .count();
     let l0: Vec<&str> = rules
         .lines()
-        .filter(|l| l.starts_with("ZeroAIMemory: ") && l.contains(" — ") && l.contains(" n:"))
-        .filter(|l| !l.starts_with("ZeroAIMemory: правило ") && !l.contains("memory_read n:<id>"))
+        .filter(|l| !l.starts_with("ZeroAIMemory:") && !l.starts_with(' ') && l.contains(" n:"))
         .collect();
     let cut = l0.iter().filter(|l| l.contains('…')).count();
     let traps = w
@@ -646,4 +645,29 @@ pub fn shape(text: &str, w: &World) -> String {
         w.traps.len(),
         text.contains("ZeroAIMemory: карта кода:")
     )
+}
+
+/// Повторное ревью 8a (2в): снятое пределом вывода не пропадает молча — у ловушек число
+/// непоказанных называет строка «ещё N ловушек не показаны», у снятых строк-указателей (открытые
+/// вопросы, словарь) — «ещё N строк не показаны — memory_recall».
+pub fn check_omits(what: &str, text: &str, w: &World) {
+    let shown = w
+        .traps
+        .iter()
+        .filter(|t| text.split_whitespace().any(|x| x == t.as_str()))
+        .count();
+    let missing = w.traps.len() - shown;
+    if missing > 0 {
+        assert!(
+            text.contains(&format!("ZeroAIMemory: ещё {missing} ловушек не показаны")),
+            "{what}: {missing} ловушек сняты молча:\n{text}"
+        );
+    }
+    let pointers = ["### Открытые вопросы", "Словарь:"];
+    if pointers.iter().any(|p| !text.contains(p)) {
+        assert!(
+            text.contains("строк не показаны — memory_recall"),
+            "{what}: строки-указатели сняты молча:\n{text}"
+        );
+    }
 }

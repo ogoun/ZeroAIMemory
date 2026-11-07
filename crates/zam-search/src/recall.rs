@@ -236,6 +236,11 @@ pub struct Section {
     /// Стойкость к пределу вывода канала (ревью 8a, C1): при превышении сначала снимаются блоки
     /// разделов с меньшим `keep` (внутри — с конца); бюджет токенов идёт по порядку разделов.
     pub keep: u8,
+    /// Стойкость первого блока, если выше `keep` (первая ловушка — наравне с обязательными).
+    pub keep_head: Option<u8>,
+    /// Строка о снятых пределом вывода блоках: `(что, где полностью)` →
+    /// `ZeroAIMemory: ещё N <что> не показаны — <где>`; `None` — «строк», `memory_recall`.
+    pub omit: Option<(String, String)>,
 }
 
 impl Section {
@@ -246,7 +251,26 @@ impl Section {
             blocks,
             reserved: false,
             keep: 0,
+            keep_head: None,
+            omit: None,
         }
+    }
+
+    /// Стойкость блока `bi`.
+    pub fn keep_of(&self, bi: usize) -> u8 {
+        match self.keep_head {
+            Some(h) if bi == 0 => h.max(self.keep),
+            _ => self.keep,
+        }
+    }
+
+    /// Строка о `n` снятых пределом вывода блоках раздела.
+    fn omit_line(&self, n: usize) -> String {
+        let (what, whole) = self
+            .omit
+            .clone()
+            .unwrap_or_else(|| ("строк".to_string(), "memory_recall".to_string()));
+        format!("ZeroAIMemory: ещё {n} {what} не показаны — {whole}")
     }
 }
 
@@ -297,17 +321,63 @@ pub fn pack_sections(
         t.sort_unstable();
         t
     };
-    // предел вывода канала (весь текст вместе с резервом): с конца снимаются блоки в бюджете
-    let mut taken = all(&budgeted);
-    while !budgeted.is_empty() && !fits_all(&render(sections, &taken)) {
-        // наименее стойкий раздел, в нём — последний блок
+    // предел вывода канала (весь текст вместе с резервом и строками о снятом): снимаются блоки в
+    // бюджете, наименее стойкие — первыми, внутри — с конца
+    let mut popped: Vec<usize> = vec![0; sections.len()];
+    loop {
+        let (text, taken) = with_omits(sections, &all(&budgeted), &popped);
+        if budgeted.is_empty() || fits_all(&text) {
+            return (text, taken);
+        }
         let k = (0..budgeted.len())
-            .min_by_key(|&k| (sections[budgeted[k].0].keep, std::cmp::Reverse(k)))
+            .min_by_key(|&k| {
+                let (si, bi) = budgeted[k];
+                (sections[si].keep_of(bi), std::cmp::Reverse(k))
+            })
             .unwrap_or(budgeted.len() - 1);
+        popped[budgeted[k].0] += 1;
         budgeted.remove(k);
-        taken = all(&budgeted);
     }
-    (render(sections, &taken), taken)
+}
+
+/// Текст с честными строками о снятом пределом вывода (повторное ревью 8a): у раздела, где
+/// снят хоть один блок, — строка [`Section::omit_line`] в конце раздела; снят целиком — та же
+/// строка в конце текста. Строки — дополнительные блоки (индексы за пределами `blocks`
+/// раздела; раздел конца — индекс `sections.len()`).
+fn with_omits(
+    sections: &[Section],
+    taken: &[(usize, usize)],
+    popped: &[usize],
+) -> (String, Vec<(usize, usize)>) {
+    if popped.iter().all(|&n| n == 0) {
+        return (render(sections, taken), taken.to_vec());
+    }
+    let mut ext: Vec<Section> = sections.to_vec();
+    let mut taken = taken.to_vec();
+    let mut tail: Vec<String> = Vec::new();
+    // снятые целиком разделы с одинаковой строкой (что и где) — одной строкой с суммой
+    let mut whole: Vec<(usize, usize)> = Vec::new();
+    for (si, &n) in popped.iter().enumerate().filter(|(_, n)| **n > 0) {
+        if taken.iter().any(|&(s, _)| s == si) {
+            ext[si].blocks.push(sections[si].omit_line(n));
+            taken.push((si, ext[si].blocks.len() - 1));
+        } else if let Some(w) = whole
+            .iter_mut()
+            .find(|(s, _)| sections[*s].omit == sections[si].omit)
+        {
+            w.1 += n;
+        } else {
+            whole.push((si, n));
+        }
+    }
+    tail.extend(whole.iter().map(|&(si, n)| sections[si].omit_line(n)));
+    if !tail.is_empty() {
+        let n = tail.len();
+        ext.push(Section::new(None, tail));
+        taken.extend((0..n).map(|bi| (sections.len(), bi)));
+    }
+    taken.sort_unstable();
+    (render(&ext, &taken), taken)
 }
 
 /// Текст разделов-резервов целиком (размер резерва — отдельной строкой ответа, M6 §17 п. 3).
@@ -486,7 +556,17 @@ mod tests {
         assert_eq!(reserved_text(&secs), "### R\nr1 r1 r1\nr2 r2\n");
         // предел всего текста (ревью 8a, C1): резерв остаётся, с конца снимаются блоки бюджета
         let (text, taken) = pack_sections(&secs, 5, &words, &|t: &str| t.len() <= 30);
-        assert_eq!(taken, [(1, 0), (1, 1)], "{text}");
+        let own: Vec<(usize, usize)> = taken.iter().copied().filter(|&(si, _)| si < 3).collect();
+        assert_eq!(own, [(1, 0), (1, 1)], "{text}");
+        assert!(text.contains("ещё 2 строк не показаны"), "{text}");
+        // снятое пределом — честной строкой: в конце раздела или текста (повторное ревью 8a)
+        let mut secs2 = secs.clone();
+        secs2[2].omit = Some(("строк c".into(), "memory_tree C".into()));
+        let (text, _) = pack_sections(&secs2, 5, &words, &|t: &str| !t.contains("c2"));
+        assert!(
+            text.ends_with("ZeroAIMemory: ещё 1 строк c не показаны — memory_tree C\n"),
+            "{text}"
+        );
         // нулевой бюджет — только резерв
         let (text, taken) = pack_sections(&secs, 0, &words, &|_| true);
         assert_eq!(taken, [(1, 0), (1, 1)]);

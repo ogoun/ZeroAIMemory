@@ -176,8 +176,8 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
-    Section, coverage_enough, error_regex_matches, error_terms, hint_line, normalize_error,
-    one_line, pack_sections, reserved_text, term_coverage,
+    HINT_PREFIX, Section, coverage_enough, error_regex_matches, error_terms, hint_line,
+    normalize_error, one_line, pack_sections, reserved_text, term_coverage,
 };
 use zam_search::{truncate_marked, truncate_to_tokens};
 use zam_store::{
@@ -472,7 +472,10 @@ impl<'c> RulesFit<'c> {
             .enumerate()
             .filter(|(_, (_, c, b))| {
                 short.get(&c.tref).is_some_and(|(_, l0)| {
-                    l0 != b && b.chars().count() * 10 > l0.chars().count() * gain_x10
+                    // сравнивается смысл: строки L1 под заголовком правила и фраза L0
+                    l0 != b
+                        && l0.len() < b.len()
+                        && l1_text(b).chars().count() * 10 > l0_text(l0).chars().count() * gain_x10
                 })
             })
             .max_by_key(|(_, (r, _, _))| *r)
@@ -496,6 +499,17 @@ impl<'c> RulesFit<'c> {
     }
 }
 
+/// Текст L1 блока правила — строки под строкой правила.
+fn l1_text(block: &str) -> &str {
+    block.split_once('\n').map_or("", |(_, rest)| rest.trim())
+}
+
+/// Фраза строки L0 правила (`<путь> — <фраза> n:<id>`).
+fn l0_text(line: &str) -> &str {
+    let tail = line.split_once(" — ").map_or("", |(_, t)| t);
+    tail.rsplit_once(" n:").map_or(tail, |(t, _)| t).trim()
+}
+
 /// Упаковка в бюджет и предел вывода `limit` (ревью 8a, C1; M6 §8): Rules — первыми по
 /// приоритету и сверх `digest_tokens`, остальное — в `min(cap, остаток предела)`. Не влезает:
 /// (1) у правил с конца приоритета ([`rule_order`]) L1 заменяется строкой L0 (первая фраза,
@@ -517,15 +531,15 @@ fn pack_limited(
         return free(packed);
     };
     let fits = |t: &str| limit.fits(t);
-    if let Some(mut f) = RulesFit::of(packed, picked, short, hidden) {
+    let mut fit = RulesFit::of(packed, picked, short, hidden);
+    if let Some(f) = fit.as_mut() {
         // (1) L1 → L0 с заметным выигрышем, пока правила с разделами в бюджете не влезут
         while !fits(&free(packed).0) && f.degrade(short, RULE_L0_GAIN_X10) {
             f.apply(packed, picked);
         }
-        // (1′) не влезает и без наименее стойких разделов (`keep` 0) — L1 → L0 у остальных
-        // правил (L0 — целая первая фраза), прежде чем снимать ловушки, карту кода и
-        // обязательные строки задач, ответов и идей
-        while !fits(&free(&without_keep_below(packed, KEEP_POINTERS)).0) && f.degrade(short, 10) {
+        // (1′) предел снял бы ловушки, указатели или обязательные строки (`keep` ≥ 1) — L1 → L0
+        // у остальных правил (L0 — целая первая фраза), прежде чем их снимать
+        while loses_kept(packed, cap, &fits) && f.degrade(short, 10) {
             f.apply(packed, picked);
         }
         // (3) сами правила (L0) не влезают — с конца, со строкой о непоказанных
@@ -533,23 +547,31 @@ fn pack_limited(
             f.apply(packed, picked);
         }
     }
-    // (2) разделы в бюджете — с конца, пока весь текст не влезет
-    pack_sections(packed, cap, &count_tokens, &fits)
+    // (2) разделы в бюджете — по стойкости, пока весь текст (со строками о снятом) не влезет;
+    // не влезает и без них — правила с конца, со строкой о непоказанных
+    loop {
+        let r = pack_sections(packed, cap, &count_tokens, &fits);
+        if fits(&r.0) {
+            return r;
+        }
+        let Some(f) = fit.as_mut() else {
+            return r;
+        };
+        if !f.drop_last() {
+            return r;
+        }
+        f.apply(packed, picked);
+    }
 }
 
-/// Копия упаковки без блоков разделов с `keep` меньше `below` (резерв — как есть): проверка,
-/// хватит ли снять их (шаг (2) [`pack_limited`]).
-fn without_keep_below(packed: &[Section], below: u8) -> Vec<Section> {
-    packed
-        .iter()
-        .map(|s| {
-            let mut s = s.clone();
-            if !s.reserved && s.keep < below {
-                s.blocks.clear();
-            }
-            s
-        })
-        .collect()
+/// Снимет ли упаковка в пределе хоть один блок со стойкостью ≥ [`KEEP_POINTERS`] (ловушки,
+/// указатели, обязательные строки), что вошёл бы в бюджет без предела, — условие шага (1′).
+fn loses_kept(packed: &[Section], cap: usize, fits: &dyn Fn(&str) -> bool) -> bool {
+    let (_, all) = pack_sections(packed, cap, &count_tokens, &|_| true);
+    let (_, got) = pack_sections(packed, cap, &count_tokens, fits);
+    all.iter().any(|&(si, bi)| {
+        !packed[si].reserved && packed[si].keep_of(bi) >= KEEP_POINTERS && !got.contains(&(si, bi))
+    })
 }
 
 /// Кандидат в подсказки.
@@ -2166,8 +2188,9 @@ async fn digest(
     after_rules.extend(verified_line(health, deadline, sol).await);
     // строка карты кода — после проверенных команд (M5.6 §10)
     let mut code_map = Vec::new();
+    let mut code_line = None;
     if code_on {
-        after_rules.extend(code_digest_line(req, headers, health, deadline).await);
+        code_line = code_digest_line(req, headers, health, deadline).await;
         // мини-карта (M6 §8, решение 16) — только при `digest_code_map_tokens > 0`
         code_map = code_digest_map(st, req, headers, health, deadline).await;
     }
@@ -2175,6 +2198,7 @@ async fn digest(
         notices,
         open_line,
         after_rules,
+        code_line,
         code_map,
         rules_short,
         rules_hidden,
@@ -2621,6 +2645,9 @@ struct Lines {
     notices: Vec<String>,
     open_line: Option<String>,
     after_rules: Vec<String>,
+    /// Строка карты кода (M5.6 §10): в дайджесте и восстановлении — резерв вместе с Rules, под
+    /// пределом канала не снимается (повторное ревью 8a, 2а).
+    code_line: Option<String>,
     code_map: Vec<String>,
     /// Правила раздела: место в приоритете ([`rule_order`]) и строка L0 — для урезания под
     /// предел вывода канала ([`fit_rules`]).
@@ -2642,9 +2669,9 @@ fn rule_order(a: &zam_store::Node, b: &zam_store::Node) -> std::cmp::Ordering {
     (rank(a), a.created_at, &a.path).cmp(&(rank(b), b.created_at, &b.path))
 }
 
-/// Строка L0 правила под пределом канала: `ZeroAIMemory: <путь> — <первая фраза L0> [<cert>]
-/// n:<id>` (под заголовком `### Правила` слово «правило» лишнее — экономия канала); фраза — до
-/// [`RULE_L0_TOKENS`], длиннее — с «…».
+/// Строка L0 правила под пределом канала: `<путь> — <первая фраза L0> [<cert>] n:<id>` (под
+/// заголовком `### Правила` метка `ZeroAIMemory:` и слово «правило» лишние — экономия канала);
+/// фраза — до [`RULE_L0_TOKENS`], длиннее — с «…».
 fn rule_l0_block(n: &zam_store::Node) -> String {
     let mut title = n.path.clone();
     if let Some(l0) = n.l0.as_deref().map(one_line).filter(|s| !s.is_empty()) {
@@ -2663,6 +2690,10 @@ fn rule_l0_block(n: &zam_store::Node) -> String {
         &[certainty.as_deref().unwrap_or_default()],
         &format!("n:{}", n.id),
     )
+    // под заголовком `### Правила` метка подсказки лишняя — ≈ 14 байт строки у Codex
+    .trim_start_matches(HINT_PREFIX)
+    .trim_start()
+    .to_string()
 }
 
 /// Первая фраза текста: до `.`, `!`, `?` или `…` с пробелом или концом после; нет — весь текст.
@@ -2680,7 +2711,7 @@ fn first_sentence(s: &str) -> &str {
 /// Строка-пояснение раздела Rules, если хоть одно правило показано строкой L0 (повторное ревью
 /// 8a): в стиле прочих пометок подсказок.
 const RULES_SHORT_NOTE: &str =
-    "ZeroAIMemory: правила одной строкой сокращены («…» — обрезано) — полностью memory_read n:<id>";
+    "ZeroAIMemory: правила сокращены («…» — обрезано) — полностью memory_read n:<id>";
 
 /// Строка о правилах, что не показаны (сверх `RULES_MAX` или не вошли в предел вывода).
 fn rules_hidden_line(n: usize) -> String {
@@ -3462,6 +3493,7 @@ fn arrange<'c>(
         notices,
         mut open_line,
         after_rules,
+        code_line,
         code_map,
         rules_hidden,
         ..
@@ -3488,6 +3520,12 @@ fn arrange<'c>(
         );
         sec.reserved = rules_reserved && title == Some(SECTION_RULES);
         sec.keep = keep_of(title);
+        sec.omit = omit_of(title);
+        if title == Some(SECTION_TRAPS_DIGEST) {
+            // первая ловушка — выше обязательных строк: шаг (2) её не снимает (решения контролёра
+            // по 421b75d, 2б)
+            sec.keep_head = Some(KEEP_FIRST_TRAP);
+        }
         if title == Some(SECTION_RULES) && rules_hidden > 0 {
             sec.blocks.push(rules_hidden_line(rules_hidden));
         }
@@ -3512,12 +3550,20 @@ fn arrange<'c>(
                 ideas.iter().map(|c| c.block.clone()).collect(),
             );
             sec.keep = KEEP_MANDATORY;
+            sec.omit = Some(("идей".into(), "memory_search kinds=[idea]".into()));
             out.packed.push(sec);
             out.picked.push(std::mem::take(&mut ideas));
         }
         if title == Some(SECTION_RULES) {
             if !after_rules.is_empty() {
                 out.line(None, after_rules.clone(), KEEP_POINTERS);
+            }
+            if let Some(l) = &code_line {
+                let mut sec = Section::new(None, vec![l.clone()]);
+                sec.reserved = rules_reserved;
+                sec.keep = KEEP_POINTERS;
+                out.packed.push(sec);
+                out.picked.push(Vec::new());
             }
             if !code_map.is_empty() {
                 out.line(Some(SECTION_CODE_MAP), code_map.clone(), 0);
@@ -3532,6 +3578,8 @@ fn arrange<'c>(
 /// Стойкость к пределу вывода (ревью 8a, C1; [`Section::keep`]): обязательные строки ТС-2 —
 /// уведомления, задачи, ответы, идеи.
 const KEEP_MANDATORY: u8 = 2;
+/// Первая (самая новая) ловушка: шаг (2) снимает её последней — после обязательных строк.
+const KEEP_FIRST_TRAP: u8 = 3;
 /// Строки-указатели: открытые вопросы, строки после правил (словарь, проверенные команды, карта
 /// кода) и ловушки; при снятии — с конца, то есть открытые вопросы — последними.
 const KEEP_POINTERS: u8 = 1;
@@ -3541,9 +3589,32 @@ const KEEP_POINTERS: u8 = 1;
 fn keep_of(title: Option<&str>) -> u8 {
     match title {
         Some(SECTION_TASKS | SECTION_ANSWERS) => KEEP_MANDATORY,
-        Some("### Ловушки и сбои") => KEEP_POINTERS,
+        Some(SECTION_TRAPS_DIGEST) => KEEP_POINTERS,
         _ => 0,
     }
+}
+
+/// Заголовок раздела ловушек дайджеста.
+const SECTION_TRAPS_DIGEST: &str = "### Ловушки и сбои";
+
+/// Строка о блоках раздела, снятых пределом вывода (повторное ревью 8a, 2в): что и где полностью.
+fn omit_of(title: Option<&str>) -> Option<(String, String)> {
+    let (what, whole) = match title? {
+        SECTION_TASKS => ("задач", "memory_search kinds=[task]"),
+        SECTION_ANSWERS => ("ответов человека", "memory_search kinds=[question]"),
+        SECTION_DECISIONS => ("решений", "memory_search kinds=[insight]"),
+        SECTION_TRAPS_DIGEST => ("ловушек", "memory_search kinds=[insight]"),
+        "### Пересмотреть (revisit)" => {
+            ("записей revisit", "memory_search kinds=[insight]")
+        }
+        "### Последние изменения" => {
+            ("изменений", "memory_search kinds=[changelog]")
+        }
+        "### Решение" => ("корней решения", "memory_tree"),
+        SECTION_ENVIRONMENT => ("записей окружения", "memory_vault"),
+        _ => return None,
+    };
+    Some((what.to_string(), whole.to_string()))
 }
 
 /// Накопитель [`arrange`].
@@ -3870,10 +3941,12 @@ pub async fn recall(
         zam_store::budget_cap(budget),
         limit,
     );
-    let rules_tokens = count_tokens(&reserved_text(&packed));
+    let rules_tokens = packed.iter().position(|s| s.reserved).map_or(0, |ri| {
+        count_tokens(&reserved_text(std::slice::from_ref(&packed[ri])))
+    });
     let shown_now: Vec<&Cand> = taken
         .iter()
-        .filter_map(|&(si, bi)| picked[si].get(bi).copied())
+        .filter_map(|&(si, bi)| picked.get(si).and_then(|p| p.get(bi)).copied())
         .collect();
     let collect_ms = ms(t0);
 

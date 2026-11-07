@@ -3842,6 +3842,17 @@ fn heavy_rules(p: &Proj) -> Vec<String> {
     ids
 }
 
+/// `zam hook session-start --agent <agent>` со щедрым бюджетом (`ZAM_TEST_HOOK_BUDGET_MS`,
+/// отладочная сборка): тест проверяет содержимое вывода, а не скорость (повторное ревью 8a).
+fn hook_roomy(p: &Proj, agent: &str, ev: &Value) -> Output {
+    p.cmd(&p.url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+        .args(["hook", "session-start", "--agent", agent])
+        .write_stdin(ev.to_string().into_bytes())
+        .output()
+        .unwrap()
+}
+
 /// Ревью 8a M6, C1: `session-start` Claude Code и Codex на мире «20 правил × 200 токенов
 /// кириллицей» — вывод агенту (`Output::render`) без клиентской обрезки: все правила (хвост
 /// приоритета — L0), строка карты кода и «Ловушки» на месте; после `compact` — то же вместе со
@@ -3862,12 +3873,7 @@ fn session_start_fits_channel_codex_and_claude() {
         };
         let sid = format!("fit-{agent}");
         let ss = |src: &str| p.ev("SessionStart", &sid, json!({"source": src}));
-        let (o, _) = p.hook_at(
-            &url,
-            "session-start",
-            agent,
-            ss("startup").to_string().as_bytes(),
-        );
+        let o = hook_roomy(&p, agent, &ss("startup"));
         let c = context(&o, "SessionStart");
         assert!(size(&c) <= max, "{agent}: {} > {max}", size(&c));
         assert!(!c.contains(CUT_MARK), "{agent}: обрезка клиентом: {c}");
@@ -3878,12 +3884,7 @@ fn session_start_fits_channel_codex_and_claude() {
         assert!(c.contains("### Ловушки и сбои"), "{agent}: {c}");
         // compact: пакет восстановления и сводка журнала — в общем пределе
         fix_pair(&p, &sid);
-        let (o, _) = p.hook_at(
-            &url,
-            "session-start",
-            agent,
-            ss("compact").to_string().as_bytes(),
-        );
+        let o = hook_roomy(&p, agent, &ss("compact"));
         let c = context(&o, "SessionStart");
         assert!(size(&c) <= max, "{agent} compact: {} > {max}", size(&c));
         assert!(
