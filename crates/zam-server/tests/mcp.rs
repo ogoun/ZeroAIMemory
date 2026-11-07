@@ -3149,7 +3149,8 @@ async fn mcp_origin_not_forgeable_by_header() {
 }
 
 /// Вызов MCP учитывается один раз — событием `mcp`: вложенные `/search`, `/read` и `/recall`
-/// своих событий не пишут.
+/// событий `search`, `read` и `session_start` не пишут; чтение из MCP — ещё строкой `mcp_read`
+/// (вызов, токенов 0 — токены в `mcp`; правки ревью 8b M6).
 #[tokio::test]
 async fn mcp_search_counts_once() {
     let a = api("mcp-counts-once", |_| {}).await;
@@ -3193,7 +3194,8 @@ async fn mcp_search_counts_once() {
     assert!(c.text.contains("Всегда пиши тесты"), "{}", c.text);
     let t = session_tokens_when(&a, SESSION, 3).await;
     let keys: Vec<&String> = t.as_object().unwrap().keys().collect();
-    assert_eq!(keys, ["mcp"], "{t}");
+    assert_eq!(keys, ["mcp", "mcp_read"], "{t}");
+    assert_eq!(t["mcp_read"], json!({"calls": 1, "tokens": 0}), "{t}");
     assert_eq!(t["mcp"]["calls"], 3, "{t}");
     assert_eq!(
         t["mcp"]["tokens"],

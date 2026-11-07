@@ -417,6 +417,7 @@ fn output_limit(req: &RecallReq, mcp: bool) -> Option<OutputLimit> {
 }
 
 /// Правило раздела-резерва при укладке в предел вывода (ревью 8a, C1).
+#[derive(Clone)]
 struct FitRule<'c> {
     /// Место в приоритете ([`rule_order`]).
     rank: usize,
@@ -429,6 +430,7 @@ struct FitRule<'c> {
 
 /// Правила раздела-резерва при укладке в предел вывода (ревью 8a, C1) — в порядке вывода;
 /// `hidden` — правил, что не показаны (строка [`rules_hidden_line`]).
+#[derive(Clone)]
 struct RulesFit<'c> {
     ri: usize,
     items: Vec<FitRule<'c>>,
@@ -583,9 +585,14 @@ fn pack_limited(
         // (1″) предел снял бы обязательные строки (`keep` ≥ 2: уведомления, задачи, ответы, идеи,
         // первая ловушка) — у правил с конца приоритета строка L0 сокращается до пути
         // (`<путь> … n:<id>`; ТС-2 Codex sh-05, правки ревью 8b): правило остаётся на месте со
-        // ссылкой, обязательная строка — тоже
-        while loses_at(packed, cap, &fits, KEEP_MANDATORY) && f.strip(short) {
-            f.apply(packed, picked);
+        // ссылкой, обязательная строка — тоже. Впустую не сокращается: если обязательную строку
+        // не спасти и со всеми правилами до пути, шаг пропускается (повторное ревью 8b)
+        if loses_at(packed, cap, &fits, KEEP_MANDATORY)
+            && rescues_mandatory(f, packed, picked, short, cap, &fits)
+        {
+            while loses_at(packed, cap, &fits, KEEP_MANDATORY) && f.strip(short) {
+                f.apply(packed, picked);
+            }
         }
         // (3) сами правила (L0) не влезают — с конца, со строкой о непоказанных
         while limit.size(&reserved_text(packed)) + 1 > limit.max && f.drop_last() {
@@ -613,6 +620,23 @@ fn pack_limited(
 /// указатели, обязательные строки), что вошёл бы в бюджет без предела, — условие шага (1′).
 fn loses_kept(packed: &[Section], cap: usize, fits: &dyn Fn(&str) -> bool) -> bool {
     loses_at(packed, cap, fits, KEEP_POINTERS)
+}
+
+/// Спасёт ли шаг (1″) обязательные строки: пробная укладка со всеми правилами до пути не снимает
+/// блоков со стойкостью ≥ [`KEEP_MANDATORY`].
+fn rescues_mandatory<'c>(
+    f: &RulesFit<'c>,
+    packed: &[Section],
+    picked: &[Vec<&'c Cand>],
+    short: &HashMap<TargetRef, RuleShort>,
+    cap: usize,
+    fits: &dyn Fn(&str) -> bool,
+) -> bool {
+    let mut trial = f.clone();
+    while trial.strip(short) {}
+    let (mut tp, mut tk) = (packed.to_vec(), picked.to_vec());
+    trial.apply(&mut tp, &mut tk);
+    !loses_at(&tp, cap, fits, KEEP_MANDATORY)
 }
 
 /// Снимет ли упаковка в пределе хоть один блок со стойкостью ≥ `keep`, что вошёл бы в бюджет без

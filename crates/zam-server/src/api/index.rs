@@ -153,8 +153,10 @@ pub const RULES_HEAVY_L1_TOKENS: usize = 1500;
 /// L1 правил пространства Rules по снимку `(заметка, ревизия)`: полный `/index/status` WebUI
 /// запрашивает раз в 5 с, а L1 зависит только от текста ревизии — пока набор `(id, rev)` заметок
 /// пространства тот же, сумма берётся из кэша (точность прежняя: любая правка, перенос в Rules,
-/// удаление или восстановление меняют набор). Ключ — id пространства (ULID, уникален между базами).
-type RulesSnapshot = Vec<(Id, i64)>;
+/// удаление или восстановление меняют набор). Ключ — id пространства (ULID, уникален между базами);
+/// в снимке — и `tokenizer_id` счётчика выдачи (повторное ревью 8b): после смены счётчика
+/// (оценка → токенизатор модели) сумма пересчитывается.
+type RulesSnapshot = (String, Vec<(Id, i64)>);
 static RULES_L1_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<Id, (RulesSnapshot, usize)>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -177,7 +179,10 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
             .into_iter()
             .filter(|n| n.kind == NodeKind::Note)
             .collect();
-        let snapshot: RulesSnapshot = notes.iter().map(|n| (n.id, n.current_rev)).collect();
+        let snapshot: RulesSnapshot = (
+            zam_store::budget_tokenizer_id(),
+            notes.iter().map(|n| (n.id, n.current_rev)).collect(),
+        );
         count = notes.len();
         let cached = RULES_L1_CACHE.lock().ok().and_then(|c| {
             c.get(&space.id)
@@ -188,7 +193,7 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
             Some(t) => t,
             None => {
                 let mut sum = 0usize;
-                let mut seen: RulesSnapshot = Vec::with_capacity(notes.len());
+                let mut seen: Vec<(Id, i64)> = Vec::with_capacity(notes.len());
                 for n in &notes {
                     let (rev, text) = match node_content(db, n.id, None).await {
                         Ok(v) => v,
@@ -203,7 +208,7 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
                     sum += zam_store::count_tokens(&super::recall::rule_l1(&text).0);
                 }
                 // кэш — только если прочитано ровно то, что в снимке (без гонки с записью)
-                if seen == snapshot
+                if seen == snapshot.1
                     && let Ok(mut c) = RULES_L1_CACHE.lock()
                 {
                     c.insert(space.id, (snapshot, sum));
@@ -221,11 +226,27 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
     }))
 }
 
-/// Пересчитано ли L1 Rules пространства `space` (нет записи кэша с этим снимком) — для теста
-/// кэша [`RULES_L1_CACHE`].
+/// Запись кэша [`RULES_L1_CACHE`] пространства `space`: `tokenizer_id` счётчика и сумма L1 —
+/// для теста кэша.
 #[doc(hidden)]
-pub fn rules_l1_cached(space: Id) -> Option<usize> {
-    RULES_L1_CACHE.lock().ok()?.get(&space).map(|(_, t)| *t)
+pub fn rules_l1_cached(space: Id) -> Option<(String, usize)> {
+    RULES_L1_CACHE
+        .lock()
+        .ok()?
+        .get(&space)
+        .map(|((tok, _), t)| (tok.clone(), *t))
+}
+
+/// Подмена записи кэша пространства `space` (`tokenizer_id` и сумма) при том же снимке
+/// ревизий — для теста: запись другого счётчика не должна отдаваться.
+#[doc(hidden)]
+pub fn rules_l1_cache_poison(space: Id, tokenizer: &str, sum: usize) {
+    if let Ok(mut c) = RULES_L1_CACHE.lock()
+        && let Some(((tok, _), t)) = c.get_mut(&space)
+    {
+        *tok = tokenizer.to_string();
+        *t = sum;
+    }
 }
 
 /// Rules базы для ответа: сбой чтения — `null` (WARN без текста).

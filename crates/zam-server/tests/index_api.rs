@@ -558,11 +558,20 @@ async fn index_status_rules_heavy_shape() {
         .find(|s| s.kind == zam_store::SpaceKind::Rules)
         .unwrap()
         .id;
+    let tok = zam_store::budget_tokenizer_id();
     assert_eq!(
         zam_server::api::index::rules_l1_cached(rules_space),
-        Some(small as usize)
+        Some((tok.clone(), small as usize))
     );
     assert_eq!(only(None).await, j);
+    // запись другого счётчика (смена оценки на токенизатор модели) при том же снимке ревизий —
+    // не отдаётся: сумма пересчитывается текущим счётчиком (повторное ревью 8b)
+    zam_server::api::index::rules_l1_cache_poison(rules_space, "другой-счётчик", 1);
+    assert_eq!(only(None).await, j);
+    assert_eq!(
+        zam_server::api::index::rules_l1_cached(rules_space),
+        Some((tok.clone(), small as usize))
+    );
     let p0 = a
         .tok(
             &a.token,
@@ -587,7 +596,7 @@ async fn index_status_rules_heavy_shape() {
     assert!(grown > small, "{j2}");
     assert_eq!(
         zam_server::api::index::rules_l1_cached(rules_space),
-        Some(grown as usize)
+        Some((tok, grown as usize))
     );
     // 11-е — rules_heavy; GUID решения из заголовка — в `solution`
     a.note("rules", "п10", "# П10\n\nКороткое правило 10.\n")
