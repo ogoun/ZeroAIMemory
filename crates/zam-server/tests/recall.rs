@@ -1926,14 +1926,23 @@ fn rule_text(title: &str, l0: &str, n: usize) -> String {
     format!("---\nl0: {l0}\n---\n# {title}\n\n{body}")
 }
 
+/// Хвост первой фразы L0 правил мира: длиннее предела L0 правила (40 токенов) — строка L0
+/// обрезается с «…».
+const RULE_L0_TAIL: &str = "проверять каждое изменение на стенде, записывать решение и его причину в \
+    журнал задачи, согласовывать выпуск с дежурным и владельцем сервиса, не трогать чужие ветки, \
+    стенды и секреты, сообщать о сбоях в канал команды";
+/// Строка-пояснение раздела Rules о сокращённых правилах.
+const SHORT_NOTE: &str =
+    "ZeroAIMemory: правила одной строкой сокращены («…» — обрезано) — полностью memory_read n:<id>";
+
 /// Мир «20 правил × 200 токенов кириллицей» с решением, ловушками, задачей и картой кода; id
 /// правил по порядку создания.
-async fn heavy_rules_world(name: &str) -> (Api, Vec<String>) {
+async fn heavy_rules_world(name: &str, rules: usize) -> (Api, Vec<String>) {
     let a = server(name).await;
     assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
     let mut ids = Vec::new();
     let dirs = ["security", "process", "backend", "frontend", "infra"];
-    for i in 0..20 {
+    for i in 0..rules {
         let path = format!("{}/правило-{i:02}", dirs[i % dirs.len()]);
         let r = note_as(
             &a,
@@ -1942,7 +1951,7 @@ async fn heavy_rules_world(name: &str) -> (Api, Vec<String>) {
             &path,
             &rule_text(
                 &format!("Правило {i}"),
-                &format!("Кратко о правиле {i}"),
+                &format!("Кратко о правиле {i}: {RULE_L0_TAIL}. Вторая фраза L0."),
                 12,
             ),
         )
@@ -1996,7 +2005,7 @@ fn assert_rules_accounted(what: &str, text: &str, ids: &[String]) {
 /// «Ловушки» — на месте.
 #[tokio::test]
 async fn digest_fits_output_limit_codex_and_claude() {
-    let (a, ids) = heavy_rules_world("limit-agents").await;
+    let (a, ids) = heavy_rules_world("limit-agents", 20).await;
     for (unit, max) in [("bytes", CODEX_MAX_BYTES), ("chars", CLAUDE_MAX_CHARS)] {
         let j = ok(
             &a,
@@ -2026,6 +2035,19 @@ async fn digest_fits_output_limit_codex_and_claude() {
         );
         assert!(code_line(&j).is_some(), "{unit}: нет карты кода: {text}");
         assert!(text.contains("### Ловушки и сбои"), "{unit}: {text}");
+        // повторное ревью 8a: обрезанный L0 — с «…», строка-пояснение — ровно одна
+        let l0_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("— Кратко о правиле"))
+            .collect();
+        assert!(!l0_lines.is_empty(), "{unit}: {text}");
+        for l in &l0_lines {
+            assert!(
+                l.contains("…") && !l.contains("Вторая фраза"),
+                "{unit}: {l}"
+            );
+        }
+        assert_eq!(text.matches(SHORT_NOTE).count(), 1, "{unit}: {text}");
     }
     // без предела (REST, MCP) — L1 у всех
     let j = ok(
@@ -2038,13 +2060,14 @@ async fn digest_fits_output_limit_codex_and_claude() {
     let text = j["text"].as_str().unwrap();
     assert!(text.len() > CODEX_MAX_BYTES, "{}", text.len());
     assert!(!text.contains("— Кратко о правиле"), "{text}");
+    assert!(!text.contains(SHORT_NOTE), "{text}");
 }
 
 /// Ревью 8a, C1: хук старого клиента (есть `source`/`code_map`, нет `output_limit`) —
 /// консервативные 7500 байт; восстановление с местом под сводку журнала — в своём пределе.
 #[tokio::test]
 async fn old_hook_client_gets_conservative_limit() {
-    let (a, ids) = heavy_rules_world("limit-old").await;
+    let (a, ids) = heavy_rules_world("limit-old", 20).await;
     let j = ok(
         &a,
         &a.token,
@@ -2082,7 +2105,7 @@ async fn old_hook_client_gets_conservative_limit() {
 /// строка называет их число; правило с `axiom` остаётся.
 #[tokio::test]
 async fn rules_over_limit_dropped_with_honest_line() {
-    let (a, ids) = heavy_rules_world("limit-drop").await;
+    let (a, ids) = heavy_rules_world("limit-drop", 20).await;
     let j = ok(
         &a,
         &a.token,
@@ -2228,4 +2251,79 @@ async fn index_title_cut_like_root_l0() {
         .0;
     assert!(title.chars().count() < long.chars().count(), "{line}");
     assert!(zam_store::count_tokens(title) <= 21, "{line}");
+}
+
+/// Повторное ревью 8a, п. 3: правило, у которого L1 не длиннее L0 больше чем в 1,4 раза, не
+/// переводится в L0 — шаг урезания идёт к следующему правилу.
+#[tokio::test]
+async fn short_l1_rule_stays_l1() {
+    let (a, ids) = heavy_rules_world("limit-short-l1", 19).await;
+    // самое новое (хвост приоритета) — с коротким L1, равным по длине L0
+    let short = note_as(
+        &a,
+        &a.token,
+        "rules",
+        "zz/коротко",
+        "---\nl0: Коротко. Одна фраза.\n---\n# Коротко\n\nОдна фраза.\n",
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("short-1"),
+        json!({"event": "session_start", "solution": G, "source": "startup",
+               "output_limit": {"unit": "bytes", "max": CODEX_MAX_BYTES}}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() <= CODEX_MAX_BYTES, "{}", text.len());
+    // 19 правил мира и короткое — все 20 на месте
+    assert!(ids.iter().all(|r| text.contains(r.as_str())), "{text}");
+    let block = text
+        .split("ZeroAIMemory: правило ")
+        .find(|b| b.contains(&format!("n:{short}")))
+        .unwrap_or_else(|| panic!("нет правила: {text}"));
+    assert!(
+        block.contains("\n  Коротко"),
+        "короткий L1 остался L1: {block}"
+    );
+    // урезаны другие правила
+    assert!(text.contains("— Кратко о правиле"), "{text}");
+}
+
+/// Повторное ревью 8a, m2: MCP `memory_recall` с `source` (восстановление) — без предела
+/// канала: хуков в MCP нет, текст не урезается под 7500 байт.
+#[tokio::test]
+async fn mcp_recall_with_source_has_no_limit() {
+    let (a, _) = heavy_rules_world("limit-mcp", 20).await;
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "memory_recall",
+                                 "arguments": {"event": "recovery", "source": "compact"}}});
+    let r = a
+        .send(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(axum::http::header::HOST, "memory.lan:7700")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {}", a.token),
+                )
+                .header("x-zam-session", "mcp-limit-1")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let text = r.text();
+    assert!(
+        !text.contains("— Кратко о правиле"),
+        "MCP — L1 у всех: {text}"
+    );
+    assert!(text.len() > CODEX_MAX_BYTES, "{}", text.len());
 }

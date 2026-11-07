@@ -572,6 +572,12 @@ pub fn found(text: &str, r: &Required) -> bool {
 /// Проверка дайджеста тяжёлой сессии: все обязательные строки ТС-2, строка карты кода (если
 /// карта есть), раздел ловушек с хотя бы одной ловушкой мира.
 pub fn check_digest(what: &str, text: &str, w: &World, code_map: bool) {
+    check_required(what, text, w);
+    check_extras(what, text, w, code_map);
+}
+
+/// Все обязательные строки ТС-2 (правила — блоком L1 или строкой L0 с той же ссылкой).
+pub fn check_required(what: &str, text: &str, w: &World) {
     let missing: Vec<String> = w
         .required
         .iter()
@@ -583,6 +589,10 @@ pub fn check_digest(what: &str, text: &str, w: &World, code_map: bool) {
         "{what}: нет обязательных строк {missing:?} из {}:\n{text}",
         w.required.len()
     );
+}
+
+/// Строка карты кода (если карта есть) и раздел ловушек с ловушкой мира.
+pub fn check_extras(what: &str, text: &str, w: &World, code_map: bool) {
     if code_map {
         assert!(
             text.lines()
@@ -605,4 +615,35 @@ pub fn check_digest(what: &str, text: &str, w: &World, code_map: bool) {
         )),
         "{what}: нет ни одной ловушки:\n{text}"
     );
+}
+
+/// Сводка вывода тяжёлой сессии в пределе канала: правил блоком L1, строкой L0, из них с «…»;
+/// ловушек мира; есть ли строка карты кода.
+pub fn shape(text: &str, w: &World) -> String {
+    let rules = text
+        .split("\n### Правила\n")
+        .nth(1)
+        .map(|r| r.split("\n\n").next().unwrap_or_default())
+        .unwrap_or_default();
+    let l1 = rules
+        .lines()
+        .filter(|l| l.starts_with("ZeroAIMemory: правило "))
+        .count();
+    let l0: Vec<&str> = rules
+        .lines()
+        .filter(|l| l.starts_with("ZeroAIMemory: ") && l.contains(" — ") && l.contains(" n:"))
+        .filter(|l| !l.starts_with("ZeroAIMemory: правило ") && !l.contains("memory_read n:<id>"))
+        .collect();
+    let cut = l0.iter().filter(|l| l.contains('…')).count();
+    let traps = w
+        .traps
+        .iter()
+        .filter(|t| text.split_whitespace().any(|x| x == t.as_str()))
+        .count();
+    format!(
+        "правил L1 {l1}, L0 {} (с «…» {cut}), ловушек {traps}/{}, карта кода {}",
+        l0.len(),
+        w.traps.len(),
+        text.contains("ZeroAIMemory: карта кода:")
+    )
 }

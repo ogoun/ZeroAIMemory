@@ -31,4 +31,4 @@ pub use hybrid::{
     Channel, ChunkMeta, FolderHit, Level, Ranked, SearchInputs, Weights, folder_score, fuse,
     fuse_normed,
 };
-pub use pack::{Cost, Fit, pack, truncate_to_tokens};
+pub use pack::{Cost, ELLIPSIS, Fit, pack, truncate_marked, truncate_to_tokens};

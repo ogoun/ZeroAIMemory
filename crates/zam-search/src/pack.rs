@@ -78,9 +78,43 @@ pub fn truncate_to_tokens<'a>(text: &'a str, max: usize, count: &dyn Fn(&str) ->
     }
 }
 
+/// Пометка обрезки [`truncate_marked`].
+pub const ELLIPSIS: &str = "…";
+
+/// [`truncate_to_tokens`] с пометкой (ревью 8a M6): длиннее `max` — префикс и «…», вместе не
+/// длиннее `max` токенов по `count` (многоточие учтено); влезает — `text` как есть. Второе
+/// значение — была ли обрезка.
+pub fn truncate_marked(text: &str, max: usize, count: &dyn Fn(&str) -> usize) -> (String, bool) {
+    if count(text) <= max {
+        return (text.to_string(), false);
+    }
+    let mut room = max.saturating_sub(count(ELLIPSIS));
+    loop {
+        let cut = truncate_to_tokens(text, room, count);
+        let out = format!("{cut}{ELLIPSIS}");
+        if count(&out) <= max || room == 0 {
+            return (out, true);
+        }
+        room -= 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_marked_ends_with_ellipsis_within_max() {
+        let words = |s: &str| s.split_whitespace().count() + s.matches(ELLIPSIS).count();
+        assert_eq!(
+            truncate_marked("a b c", 3, &words),
+            ("a b c".to_string(), false)
+        );
+        let (t, cut) = truncate_marked("a b c d e", 3, &words);
+        assert!(cut);
+        assert!(t.starts_with('a') && t.ends_with(ELLIPSIS), "{t}");
+        assert!(words(&t) <= 3, "{t}");
+    }
 
     fn c(base: usize, text: usize) -> Cost {
         Cost { base, text }
