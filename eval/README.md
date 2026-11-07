@@ -21,6 +21,7 @@
 | `grid-chunking.toml`, `grid-chunking-cpu.toml` | нарезка с учётом силы границ: λ, связность, L0 в префиксе, размер листа (задача 17 M3) |
 | `grid-m3.toml` | веса поиска M3: канал папок `w_folder`, бусты вида insight и `certainty` (задача 18 M3, ≤ 10 конфигураций) |
 | `grid-m3-kind.toml` | буст вида insight ниже буста `theorem`: 1,0 / 1,05 / 1,10 (задача 18 M3, fix round 1) |
+| `grid-m6-recall.toml` | M6 §3.5 п. 3–5 (задача 8c): `recall.digest_tokens` × `digest_entries`, `recovery_tokens`, `brief_tokens` × `code.brief_tokens` на dev ТС-2 (`eval --sessions --grid`), первая точка — умолчания |
 | `grid-m6-search.toml` | M6 §3.5 п. 1 (задача 5): `search.budget_tokens` {400, 600, 800} × `search.brief_min_rel` {0; 0,4; 0,5} на dev ТС-1, первая точка дважды — A/A-гейт |
 | `hints.toml` | M4: точность подсказок хуков — 72 случая (`prompt` 30, `post_tool` 24, `pre_tool` 18; половина «нерелевантно»), 17 insight с триггерами и без и 3 заметки Rules |
 | `scenarios.toml` | M4: 20 сценариев расхода токенов «вопрос агента → источники» (протокол §9.3, повтор через кэш, наивный `mode=chunks`); M6 — ТС-1 с видами и нагетами (`kind`, `nuggets`, разметка — задача 1b) |
@@ -672,6 +673,7 @@ cargo xtask eval --sessions --split dev --ideas off ...                         
 cargo xtask eval --sessions --split dev --profile heavy --implicit-mcp ...      # только тяжёлый, неявный MCP
 cargo xtask eval --sessions --arm <плечо.json> --compare <база.json>             # сравнение без прогона
 cargo xtask eval --sessions --split dev --device cuda --repeat 2 --hook-agent codex ...  # хуки Codex (предел 7500 байт)
+cargo xtask eval --sessions --split dev --device cuda --repeat 3 --hook-agent claude --grid eval/grid-m6-recall.toml --compare <база того же агента и дня UTC>  # сетки §3.5 п. 3–5 (8c)
 ```
 
 `--base B4|B5.6|B5.7` берёт `zam-server` и `zam` тега из `target/tags/<тег>/release/` (собирает
@@ -681,6 +683,16 @@ cargo xtask eval --sessions --split dev --device cuda --repeat 2 --hook-agent co
 `--mode fts` — только отладка набора: без модели сервер считает токены упаковки дайджеста
 приближённо (занижает ~15 %), бюджеты дайджеста не соблюдаются, и вывод о вытеснении разделов на
 FTS неверен.
+
+**Сетка** (`--grid`, задача 8c): точки `[[point]]` — как у ТС-1 (`grid::load_points`, только dev,
+`--set` вместе с сеткой — ошибка, ключи индекса — ошибка); каждая точка — все сессии на свежих
+серверах, файлы `<…>-dev-<точка>.{json,md}`, сравнение каждой точки с первой и с базами
+`--compare`. Сравнение сверяет сутки **UTC** прогона (`run::today_utc`) и агента хуков
+(`info.hook_agent`): Claude и Codex не сравниваются. Кроме полного `R` — те же части **без раздела
+Rules** (класс строк `rules`: раздел `### Правила` у `session_start` и `recovery`, §17 п. 2 —
+рост из-за Rules-резерва допускается), сводка плеча — токены раздела Rules по событиям. Каталог
+сессии (`target/eval/sessions-…`, ≈ 0,4 ГБ) удаляется после её прогона; оставить —
+`ZAM_EVAL_KEEP_SESSIONS=1`.
 
 **Сессия** — `[[session]] {id, profile, rules, tasks, questions, access, terms, insights, ideas,
 code_map, digest_ideas, transcript?}` и события `[[session.event]]` (формат — шапка файла).

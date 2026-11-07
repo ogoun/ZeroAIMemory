@@ -1,0 +1,64 @@
+# Сетки M6 §3.5 п. 3–5 (задача 8c) на dev ТС-2: бюджеты дайджеста, пакета восстановления и
+# пакета субагенту. Только гибрид bge-m3 fp16 CUDA, `--repeat 3`, оба агента хуков:
+#   cargo xtask eval --sessions --split dev --device cuda --repeat 3 --hook-agent claude \
+#     --grid eval/grid-m6-recall.toml [--compare <база B5.6 того же дня UTC и агента>]
+#   (и то же с --hook-agent codex)
+# Первая точка — текущие умолчания (v0.0.9: digest 1500, entries 5, recovery 2000, brief 800,
+# code.brief 150); остальные меняют одну координату (последняя — две координаты пакета
+# субагенту). Каждая точка — все сессии dev на свежих серверах, сравнение — с первой точкой.
+#
+# Координаты сеток §3.5 «покоординатно при умолчаниях предыдущих» здесь в одном прогоне: бюджеты
+# действуют на разные события (`recall.rs`, `budget`: `session_start` — digest_tokens и
+# digest_entries, `recovery` — recovery_tokens, `subagent_start` — brief_tokens и
+# code.brief_tokens; digest_entries — и в пакете восстановления), поэтому точка одной сетки не
+# меняет выдачу событий другой — проверяется по токенам событий точки против первой.
+#
+# `recall.digest_tokens` — без Rules (резерв сверх бюджета, M6 §8, решение 10). Условие выбора —
+# полнота обязательных строк = 1,0 (задачи, ответы, идеи, запросы доступа; Rules — всегда) у
+# обоих агентов и все повторы без промахов бюджета хука; выбор — самое дешёвое по среднему на
+# сессию, разница ≤ 2 % или в пределах шума A/A (`rep_noise_p95`) — больший бюджет (§3.5).
+#
+# `digest_entries` 3 и 8 — только при digest 1500: у тяжёлых миров ТС-2 до 5 задач и 5 ответов
+# (пределы разделов, `validate_set`), при 3 обязательные строки обязаны выпасть (проверка
+# условия), а 8 добавляет записи индексов (ловушки, changelog, revisit) — дороже 5 при любом
+# бюджете, где 5 укладывается.
+
+[[point]]
+name = "d1500-e5"
+env = { ZAM_RECALL__DIGEST_TOKENS = "1500", ZAM_RECALL__DIGEST_ENTRIES = "5" }
+
+[[point]]
+name = "d1000-e5"
+env = { ZAM_RECALL__DIGEST_TOKENS = "1000", ZAM_RECALL__DIGEST_ENTRIES = "5" }
+
+[[point]]
+name = "d800-e5"
+env = { ZAM_RECALL__DIGEST_TOKENS = "800", ZAM_RECALL__DIGEST_ENTRIES = "5" }
+
+[[point]]
+name = "d1500-e3"
+env = { ZAM_RECALL__DIGEST_TOKENS = "1500", ZAM_RECALL__DIGEST_ENTRIES = "3" }
+
+[[point]]
+name = "d1500-e8"
+env = { ZAM_RECALL__DIGEST_TOKENS = "1500", ZAM_RECALL__DIGEST_ENTRIES = "8" }
+
+[[point]]
+name = "r1500"
+env = { ZAM_RECALL__RECOVERY_TOKENS = "1500" }
+
+[[point]]
+name = "r1200"
+env = { ZAM_RECALL__RECOVERY_TOKENS = "1200" }
+
+[[point]]
+name = "b500-c150"
+env = { ZAM_RECALL__BRIEF_TOKENS = "500", ZAM_CODE__BRIEF_TOKENS = "150" }
+
+[[point]]
+name = "b800-c100"
+env = { ZAM_RECALL__BRIEF_TOKENS = "800", ZAM_CODE__BRIEF_TOKENS = "100" }
+
+[[point]]
+name = "b500-c100"
+env = { ZAM_RECALL__BRIEF_TOKENS = "500", ZAM_CODE__BRIEF_TOKENS = "100" }

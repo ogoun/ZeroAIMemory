@@ -595,6 +595,11 @@ pub mod class {
     pub const JOURNAL: &str = "journal";
     /// Раздел снимка сессии «Последнее известное состояние» (M6 §8а).
     pub const SNAPSHOT: &str = "snapshot";
+    /// Раздел `### Правила` дайджеста и пакета восстановления — резерв Rules (M6 §8, решение 10;
+    /// строка учёта `rules`, §17 п. 3). Вычитается только у `session_start` и `recovery`
+    /// ([`step_tokens`]): у пакета субагенту L0 Rules — в бюджете. Строки словаря, проверенных
+    /// команд и карты кода под ним — класс [`JOURNAL`].
+    pub const RULES: &str = "rules";
 }
 
 /// Агент хуков ТС-2 (`zam hook --agent`): вывод хука — то, что агент получит, с пределом
@@ -799,6 +804,7 @@ const JOURNAL_LINES: [&str; 3] = [
     "ZeroAIMemory: карта кода",
 ];
 const IDEAS_SECTION: &str = "### Идеи";
+const RULES_SECTION: &str = "### Правила";
 const SNAPSHOT_SECTION: &str = "### Последнее известное состояние";
 
 /// Токены классов строк текста ([`class`]): строка — в класс своего раздела `### …` или по
@@ -816,9 +822,17 @@ pub fn classify(text: &str, count: &dyn Fn(&str) -> usize) -> BTreeMap<String, u
                 section = Some(class::IDEAS);
             } else if t.starts_with(SNAPSHOT_SECTION) {
                 section = Some(class::SNAPSHOT);
+            } else if t.starts_with(RULES_SECTION) {
+                section = Some(class::RULES);
             }
         }
-        let cls = if let Some(s) = section {
+        // строки после правил (словарь, проверенные команды, карта кода) идут под тем же
+        // заголовком, но к Rules не относятся
+        let after_rules =
+            section == Some(class::RULES) && JOURNAL_LINES.iter().any(|p| t.starts_with(p));
+        let cls = if after_rules {
+            Some(class::JOURNAL)
+        } else if let Some(s) = section {
             Some(s)
         } else if t.contains("идея «") || t.contains("idea «") {
             Some(class::IDEAS)
@@ -1558,14 +1572,19 @@ pub struct SessionsSummary {
     pub idea_tokens: BTreeMap<String, usize>,
     /// Токены снимка сессии по меткам.
     pub snapshot_tokens: BTreeMap<String, usize>,
+    /// Токены раздела Rules (резерв) по меткам `session_start`, `recovery` ([`class::RULES`]).
+    #[serde(default)]
+    pub rules_tokens: BTreeMap<String, usize>,
 }
 
-/// Токены шага после вычета классов `ex`.
+/// Токены шага после вычета классов `ex`; класс [`class::RULES`] — только у `session_start` и
+/// `recovery` (резерв Rules).
 pub fn step_tokens(s: &StepRun, ex: &BTreeSet<String>) -> usize {
+    let reserve = s.label == label::SESSION_START || s.label == label::RECOVERY;
     let minus: usize = s
         .classes
         .iter()
-        .filter(|(c, _)| ex.contains(*c))
+        .filter(|(c, _)| ex.contains(*c) && (c.as_str() != class::RULES || reserve))
         .map(|(_, n)| *n)
         .sum();
     s.tokens.saturating_sub(minus)
@@ -1685,6 +1704,11 @@ pub fn summarize(runs: &[SessionRun], ex: &Exclusions) -> SessionsSummary {
             }
             if let Some(n) = s.classes.get(class::SNAPSHOT) {
                 *sum.snapshot_tokens.entry(s.label.clone()).or_default() += n;
+            }
+            if let Some(n) = s.classes.get(class::RULES)
+                && (s.label == label::SESSION_START || s.label == label::RECOVERY)
+            {
+                *sum.rules_tokens.entry(s.label.clone()).or_default() += n;
             }
         }
         for c in &r.required {
@@ -1806,6 +1830,15 @@ pub struct SessionsInfo {
     /// плечи при `--arm`/`--compare` пересчитываются текущим правилом ([`recount`]).
     #[serde(default)]
     pub count_rule: String,
+    /// Агент хуков (`--hook-agent`; `None` — файл до задачи 8c, агент — в `notes`).
+    #[serde(default)]
+    pub hook_agent: Option<String>,
+    /// Точка сетки `--grid` (задача 8c).
+    #[serde(default)]
+    pub point: Option<String>,
+    /// Переопределения конфигурации прогона (ключ, значение), в том числе точки.
+    #[serde(default)]
+    pub overrides: Vec<(String, String)>,
     pub notes: Vec<String>,
 }
 
@@ -1855,6 +1888,10 @@ pub struct SessionsComparison {
     pub exclusions: Exclusions,
     /// Весь набор, затем профили.
     pub parts: Vec<PartComparison>,
+    /// То же без раздела Rules дайджеста и восстановления в обоих плечах ([`class::RULES`]; §17
+    /// п. 2: рост из-за Rules-резерва допускается, решение 10) — справочно.
+    #[serde(default)]
+    pub parts_no_rules: Vec<PartComparison>,
     /// Подсказки-идеи `prompt`: доля событий с тем же списком идей, что у базы (обе с идеями).
     pub idea_hints_match: Option<Tally>,
     /// 95-й перцентиль |Δ| / база токенов сессии (порог шума A/A, если плечи одной версии).
@@ -2073,6 +2110,11 @@ pub fn compare(
     same("устройство", &bi.device, &ai.device, bi.device == ai.device);
     // окна дайджеста (ответы, решения, горизонты идей) считаются от суток UTC прогона
     same("дата UTC", &bi.date, &ai.date, bi.date == ai.date);
+    // вывод хука — с пределом канала агента: Claude и Codex не сравниваются (у файлов до 8c
+    // агента в сведениях нет — не проверяется)
+    if let (Some(x), Some(y)) = (&bi.hook_agent, &ai.hook_agent) {
+        same("агент хуков", x, y, x == y);
+    }
     if !errs.is_empty() {
         bail!("плечи не сравниваются:\n  {}", errs.join("\n  "));
     }
@@ -2087,7 +2129,18 @@ pub fn compare(
             .map(|r| r.profile.clone())
             .unwrap_or_default()
     };
+    // §17 п. 2 и решение 10: рост из-за Rules-резерва допускается — те же части без раздела
+    // Rules дайджеста и восстановления в обоих плечах (справочно, рядом с полным R)
+    let mut ex_nr = ex.clone();
+    ex_nr.classes.insert(class::RULES.to_string());
     let mut parts = vec![part("всего", &common, &base.sessions, &arm.sessions, &ex)];
+    let mut parts_no_rules = vec![part(
+        "всего",
+        &common,
+        &base.sessions,
+        &arm.sessions,
+        &ex_nr,
+    )];
     for p in [Profile::Standard, Profile::Heavy] {
         let ids: Vec<String> = common
             .iter()
@@ -2096,6 +2149,13 @@ pub fn compare(
             .collect();
         if !ids.is_empty() {
             parts.push(part(p.as_str(), &ids, &base.sessions, &arm.sessions, &ex));
+            parts_no_rules.push(part(
+                p.as_str(),
+                &ids,
+                &base.sessions,
+                &arm.sessions,
+                &ex_nr,
+            ));
         }
     }
     let diffs: Vec<f64> = common
@@ -2116,6 +2176,7 @@ pub fn compare(
         only_arm: ids_a.difference(&ids_b).map(|s| s.to_string()).collect(),
         exclusions: ex,
         parts,
+        parts_no_rules,
         idea_hints_match: both_ideas.then(|| idea_hints_match(&base.sessions, &arm.sessions)),
         abs_rel_diff_p95: (!diffs.is_empty()).then(|| quantile(&diffs, 0.95)),
         same_server: bi.server_version == ai.server_version
@@ -2668,7 +2729,7 @@ fn run_session(
     let warm = json!({ "event": "prompt", "solution": EVAL_SOLUTION, "prompt": "warm up",
                        "record": false });
     let _ = post(&s, "/api/v1/recall", &warm);
-    let sid = format!("ts2-{}-{}-r{rep}", run::today(), sp.id);
+    let sid = format!("ts2-{}-{}-r{rep}", run::today_utc(), sp.id);
     let mcp_dir = if f.mcp_explicit {
         hooks.project.clone()
     } else {
@@ -2685,6 +2746,15 @@ fn run_session(
     r.rep = rep;
     r.notes.splice(0..0, snotes);
     s.stop()?;
+    // каталог сессии (сервер, Qdrant, модель) — ≈ 0,4 ГБ; сетка из 10 точек × 3 повтора × 14
+    // сессий заняла бы ≈ 180 ГБ (задача 8c: диск H: кончился посреди сетки). Результат уже в
+    // `SessionRun` (тексты шагов), каталог удаляется; оставить — `ZAM_EVAL_KEEP_SESSIONS=1`
+    if std::env::var_os("ZAM_EVAL_KEEP_SESSIONS").is_none() {
+        let dir = p.work.join(&name);
+        if let Err(e) = fs::remove_dir_all(&dir) {
+            println!("    каталог {} не удалён: {e}", dir.display());
+        }
+    }
     Ok(r)
 }
 
@@ -2778,15 +2848,15 @@ pub fn own_exclusions(f: &Feats) -> Exclusions {
 
 /// `cargo xtask eval --sessions`.
 pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
-    if a.grid.is_some() {
-        bail!("--sessions с --grid — сетки ТС-2 у задачи 8c");
-    }
+    // до любой работы: сетка на holdout запрещена (§3.5)
+    super::grid::refuse_holdout(a.grid.as_deref(), a.split)?;
     if let Some(arm) = &a.arm {
         return compare_files(&p.repo, arm, &a.compare);
     }
     let Some(part) = a.split else {
         bail!("--sessions: укажите --split dev|holdout");
     };
+    let pts = session_points(a)?;
     let set_path = p.repo.join("eval").join("sessions.toml");
     let set = load_set(&set_path)?;
     let corpus = sessions_corpus::load(&p.sessions_corpus)?;
@@ -2870,159 +2940,232 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         caps.tag(),
         caps.git.as_deref().unwrap_or("—")
     );
-    let mut sets: Vec<(String, String)> = Vec::new();
+    let mut base_sets: Vec<(String, String)> = Vec::new();
     if f.ideas {
-        sets.push(("ideas.proactive".into(), f.ideas_on.to_string()));
+        base_sets.push(("ideas.proactive".into(), f.ideas_on.to_string()));
     }
     for (k, v) in run::parse_sets(&a.sets)? {
-        sets.push((k, v));
+        base_sets.push((k, v));
     }
-    let env: Vec<(String, String)> = sets
+    let base_env: Vec<(String, String)> = base_sets
         .iter()
         .map(|(k, v)| (run::env_key(k), v.clone()))
         .collect();
-    caps::check_known(&env)?;
-    let (kept, dropped) = caps::split_overrides(&caps, &env)?;
-    if !dropped.is_empty() {
-        bail!(
-            "ключей нет у сервера {}: {}",
-            caps.tag(),
-            dropped.join(", ")
-        );
-    }
-    let sets: Vec<(String, String)> = kept
-        .iter()
-        .filter_map(|(k, v)| caps::env_to_key(k).map(|key| (key, v.clone())))
-        .collect();
-    let mut runs = Vec::new();
-    let mut notes = Vec::new();
-    let reps = a.repeat.max(1);
-    for rep in 0..reps {
-        for sp in &chosen {
-            let r = run_session(
-                p,
-                &spec,
-                &sets,
-                &server,
-                &zam,
-                &corpus,
-                &f,
-                sp,
-                rep,
-                label,
-                &count,
-                a.hook_agent,
-            )?;
-            let mut r = r;
-            r.split = part.as_str().to_string();
-            let ss = summarize(std::slice::from_ref(&r), &own_exclusions(&f));
-            println!(
-                "  {}{} [{}]: токенов {}, обязательных строк {}/{}, hint {}/{} (строго {}), идеи \
-                 {}/{}, дайджест {}",
-                r.id,
-                if reps > 1 {
-                    format!(" r{rep}")
-                } else {
+    caps::check_known(&base_env)?;
+    // точки: сетка (задача 8c) или одна точка без имени; переопределения точки — поверх общих
+    let mut results: Vec<(String, PathBuf, SessionsResult)> = Vec::new();
+    for pt in &pts {
+        let mut env = base_env.clone();
+        for (k, v) in &pt.env {
+            env.retain(|(x, _)| x != k);
+            env.push((k.clone(), v.clone()));
+        }
+        let (kept, dropped) = caps::split_overrides(&caps, &env)?;
+        if !dropped.is_empty() {
+            bail!(
+                "{}ключей нет у сервера {}: {}",
+                if pt.name.is_empty() {
                     String::new()
+                } else {
+                    format!("точка {}: ", pt.name)
                 },
-                r.profile,
-                ss.tokens_total,
-                ss.required.found,
-                ss.required.total,
-                ss.hint_recall.found,
-                ss.hint_recall.total,
-                ss.hint_recall_strict.found,
-                ss.idea_hint_recall.found,
-                ss.idea_hint_recall.total,
-                match r.digest_match {
-                    Some(true) => "=",
-                    Some(false) => "≠",
-                    None => "—",
-                }
+                caps.tag(),
+                dropped.join(", ")
             );
-            for m in &ss.required_missing {
-                println!("    нет строки: {m}");
+        }
+        let sets: Vec<(String, String)> = kept
+            .iter()
+            .filter_map(|(k, v)| caps::env_to_key(k).map(|key| (key, v.clone())))
+            .collect();
+        let point = (!pt.name.is_empty()).then(|| pt.name.clone());
+        let run_label = match &point {
+            Some(n) => format!("{label}-{n}"),
+            None => label.to_string(),
+        };
+        if let Some(n) = &point {
+            println!("точка {n}: {sets:?}");
+        }
+        let mut runs = Vec::new();
+        let mut notes = Vec::new();
+        let reps = a.repeat.max(1);
+        for rep in 0..reps {
+            for sp in &chosen {
+                let r = run_session(
+                    p,
+                    &spec,
+                    &sets,
+                    &server,
+                    &zam,
+                    &corpus,
+                    &f,
+                    sp,
+                    rep,
+                    &run_label,
+                    &count,
+                    a.hook_agent,
+                )?;
+                let mut r = r;
+                r.split = part.as_str().to_string();
+                let ss = summarize(std::slice::from_ref(&r), &own_exclusions(&f));
+                println!(
+                    "  {}{} [{}]: токенов {}, обязательных строк {}/{}, hint {}/{} (строго {}), \
+                     идеи {}/{}, дайджест {}",
+                    r.id,
+                    if reps > 1 {
+                        format!(" r{rep}")
+                    } else {
+                        String::new()
+                    },
+                    r.profile,
+                    ss.tokens_total,
+                    ss.required.found,
+                    ss.required.total,
+                    ss.hint_recall.found,
+                    ss.hint_recall.total,
+                    ss.hint_recall_strict.found,
+                    ss.idea_hint_recall.found,
+                    ss.idea_hint_recall.total,
+                    match r.digest_match {
+                        Some(true) => "=",
+                        Some(false) => "≠",
+                        None => "—",
+                    }
+                );
+                for m in &ss.required_missing {
+                    println!("    нет строки: {m}");
+                }
+                runs.push(r);
             }
-            runs.push(r);
+        }
+        notes.push(format!(
+            "агент хуков — {} (`zam hook --agent`, вывод с пределом канала)",
+            a.hook_agent.map_or("claude", HookAgent::as_str)
+        ));
+        if f.mcp_explicit {
+            notes.push("MCP — zam mcp с ZAM_SESSION_ID (явная сессия)".to_string());
+        } else {
+            notes.push(
+                "MCP — zam mcp без ZAM_SESSION_ID и без файла привязки (неявный путь R13)"
+                    .to_string(),
+            );
+        }
+        let ex = Exclusions::of(&f);
+        let r = SessionsResult {
+            info: SessionsInfo {
+                date: run::today_utc(),
+                git: run::git_rev(&p.repo),
+                label: a.label.clone(),
+                split: part.as_str().to_string(),
+                profile: a.profile.map(|x| x.as_str().to_string()),
+                base: a.base.map(|b| b.name().to_string()),
+                mode: if only_fts {
+                    "fts".into()
+                } else {
+                    "hybrid".into()
+                },
+                model: model.clone(),
+                server_version: caps.tag(),
+                server_git: caps.git.clone(),
+                server_m6: caps.m6,
+                ideas_flag,
+                feats: f,
+                exclusions: ex.clone(),
+                mcp: if f.mcp_explicit {
+                    "explicit".into()
+                } else {
+                    "implicit".into()
+                },
+                counter: "bge-m3 tokenizer.json".into(),
+                sessions_blake3: hints::ideas::file_blake3(&set_path)?,
+                corpus_blake3: dir_blake3(&p.sessions_corpus)?,
+                device: model.as_ref().map(|_| a.device.as_str().to_string()),
+                repeat: reps,
+                count_rule: COUNT_RULE.into(),
+                hook_agent: Some(a.hook_agent.map_or("claude", HookAgent::as_str).to_string()),
+                point: point.clone(),
+                overrides: sets.clone(),
+                notes,
+            },
+            summary: summarize(&runs, &own_exclusions(&f)),
+            sessions: runs,
+        };
+        let stem = format!(
+            "{}-m6-{}-sessions-{}-srv{}{}-{}{}",
+            r.info.date,
+            model.as_deref().unwrap_or("fts"),
+            label,
+            caps.tag(),
+            if ideas_flag { "" } else { "-ideas-off" },
+            part.as_str(),
+            point.as_deref().map_or(String::new(), |n| format!("-{n}"))
+        );
+        let prefix = match &a.out {
+            Some(o) if o.is_dir() || o.to_string_lossy().ends_with(['/', '\\']) => o.join(&stem),
+            Some(o) => match &point {
+                Some(n) => PathBuf::from(format!("{}-{n}", o.display())),
+                None => o.clone(),
+            },
+            None => p.results.join(&stem),
+        };
+        let md = super::report::sessions_md(&r);
+        let (j, m) = write_pair(&prefix, &r, &md)?;
+        print!("{md}");
+        println!("  {}\n  {}", j.display(), m.display());
+        for b in &a.compare {
+            let mut base = read_result(b)?;
+            recount(&mut base, &count);
+            let c = compare(&base, &r, (&file_name(b), &stem))?;
+            let cp = PathBuf::from(format!("{}-vs-{}", prefix.display(), file_name(b)));
+            let cmd = super::report::sessions_comparison_md(&c);
+            let (j, m) = write_pair(&cp, &c, &cmd)?;
+            print!("{cmd}");
+            println!("  {}\n  {}", j.display(), m.display());
+        }
+        results.push((stem, prefix, r));
+    }
+    // точки сетки — против первой (у неё — умолчания или текущие значения)
+    if let Some((first_stem, _, first)) = results.first() {
+        for (stem, prefix, r) in &results[1..] {
+            let c = compare(first, r, (first_stem, stem))?;
+            let cp = PathBuf::from(format!("{}-vs-{first_stem}", prefix.display()));
+            let cmd = super::report::sessions_comparison_md(&c);
+            let (j, m) = write_pair(&cp, &c, &cmd)?;
+            print!("{cmd}");
+            println!("  {}\n  {}", j.display(), m.display());
         }
     }
-    notes.push(format!(
-        "агент хуков — {} (`zam hook --agent`, вывод с пределом канала)",
-        a.hook_agent.map_or("claude", HookAgent::as_str)
-    ));
-    if f.mcp_explicit {
-        notes.push("MCP — zam mcp с ZAM_SESSION_ID (явная сессия)".to_string());
-    } else {
-        notes.push(
-            "MCP — zam mcp без ZAM_SESSION_ID и без файла привязки (неявный путь R13)".to_string(),
-        );
-    }
-    let ex = Exclusions::of(&f);
-    let r = SessionsResult {
-        info: SessionsInfo {
-            date: run::today(),
-            git: run::git_rev(&p.repo),
-            label: a.label.clone(),
-            split: part.as_str().to_string(),
-            profile: a.profile.map(|x| x.as_str().to_string()),
-            base: a.base.map(|b| b.name().to_string()),
-            mode: if only_fts {
-                "fts".into()
-            } else {
-                "hybrid".into()
-            },
-            model: model.clone(),
-            server_version: caps.tag(),
-            server_git: caps.git.clone(),
-            server_m6: caps.m6,
-            ideas_flag,
-            feats: f,
-            exclusions: ex.clone(),
-            mcp: if f.mcp_explicit {
-                "explicit".into()
-            } else {
-                "implicit".into()
-            },
-            counter: "bge-m3 tokenizer.json".into(),
-            sessions_blake3: hints::ideas::file_blake3(&set_path)?,
-            corpus_blake3: dir_blake3(&p.sessions_corpus)?,
-            device: model.as_ref().map(|_| a.device.as_str().to_string()),
-            repeat: reps,
-            count_rule: COUNT_RULE.into(),
-            notes,
-        },
-        summary: summarize(&runs, &own_exclusions(&f)),
-        sessions: runs,
-    };
-    let stem = format!(
-        "{}-m6-{}-sessions-{}-srv{}{}-{}",
-        r.info.date,
-        model.as_deref().unwrap_or("fts"),
-        label,
-        caps.tag(),
-        if ideas_flag { "" } else { "-ideas-off" },
-        part.as_str()
-    );
-    let prefix = match &a.out {
-        Some(o) if o.is_dir() || o.to_string_lossy().ends_with(['/', '\\']) => o.join(&stem),
-        Some(o) => o.clone(),
-        None => p.results.join(&stem),
-    };
-    let md = super::report::sessions_md(&r);
-    let (j, m) = write_pair(&prefix, &r, &md)?;
-    print!("{md}");
-    println!("  {}\n  {}", j.display(), m.display());
-    for b in &a.compare {
-        let mut base = read_result(b)?;
-        recount(&mut base, &count);
-        let c = compare(&base, &r, (&file_name(b), &stem))?;
-        let cp = PathBuf::from(format!("{}-vs-{}", prefix.display(), file_name(b)));
-        let cmd = super::report::sessions_comparison_md(&c);
-        let (j, m) = write_pair(&cp, &c, &cmd)?;
-        print!("{cmd}");
-        println!("  {}\n  {}", j.display(), m.display());
-    }
     Ok(())
+}
+
+/// Точки прогона ТС-2: сетка `--grid` (только dev; `--set` вместе с ней — ошибка: точка описана
+/// файлом целиком) или одна точка без имени. Ключи вне таблицы замера — ошибка до старта.
+fn session_points(a: &EvalArgs) -> Result<Vec<super::grid::Point>> {
+    let pts = match &a.grid {
+        Some(g) => {
+            if !a.sets.is_empty() {
+                bail!(
+                    "--set вместе с --grid: переопределения точки — только в файле сетки ({})",
+                    g.display()
+                );
+            }
+            super::grid::load_points(g)?
+        }
+        None => vec![super::grid::Point {
+            name: String::new(),
+            env: BTreeMap::new(),
+        }],
+    };
+    for pt in &pts {
+        let env: Vec<(String, String)> = pt.env.clone().into_iter().collect();
+        caps::check_known(&env).with_context(|| format!("точка {}", pt.name))?;
+        if let Some(k) = pt.env.keys().find(|k| super::tokens::mcp::changes_index(k)) {
+            bail!(
+                "точка {}: {k} меняет индекс — сетки ТС-2 только по ключам выдачи",
+                pt.name
+            );
+        }
+    }
+    Ok(pts)
 }
 
 /// Переключатель `on|off`.
@@ -3586,7 +3729,8 @@ queries = ["c"]
         let w = world(&sp, &c).unwrap();
         let f = feats(&m6_caps(), true, false);
         let r = play(&mut mock(), &sp, &w, &f, &refs(), &words, "sid").unwrap();
-        let base = result(vec![r.clone()], f, "m6");
+        let mut base = result(vec![r.clone()], f, "m6");
+        base.info.hook_agent = Some("claude".into());
         for (what, change) in [
             (
                 "корпус",
@@ -3605,12 +3749,94 @@ queries = ["c"]
                 "устройство",
                 Box::new(|i: &mut SessionsInfo| i.device = Some("cuda".into())),
             ),
+            (
+                "агент хуков",
+                Box::new(|i: &mut SessionsInfo| i.hook_agent = Some("codex".into())),
+            ),
         ] {
             let mut arm = result(vec![r.clone()], f, "m6");
             change(&mut arm.info);
             let e = format!("{:#}", compare(&base, &arm, ("a", "b")).unwrap_err());
             assert!(e.contains(what), "{what}: {e}");
         }
+    }
+
+    /// Задача 8c: сетка ТС-2 — файл `eval/grid-m6-recall.toml` (ключи таблицы замера, первая
+    /// точка — умолчания), `--set` вместе с `--grid` и ключ индекса — ошибка; без сетки — одна
+    /// точка без имени.
+    #[test]
+    fn session_grid_points() {
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(flatten)]
+            a: EvalArgs,
+        }
+        let parse = |args: &[&str]| {
+            <T as clap::Parser>::try_parse_from(std::iter::once("eval").chain(args.iter().copied()))
+                .unwrap()
+                .a
+        };
+        let grid = crate::eval::tests_repo().join("eval/grid-m6-recall.toml");
+        let g = grid.to_string_lossy().into_owned();
+        let pts = session_points(&parse(&["--sessions", "--split", "dev", "--grid", &g])).unwrap();
+        assert!(pts.len() >= 2, "{}", pts.len());
+        assert_eq!(pts[0].name, "d1500-e5");
+        assert_eq!(pts[0].env["ZAM_RECALL__DIGEST_TOKENS"], "1500");
+        let e = session_points(&parse(&[
+            "--sessions",
+            "--split",
+            "dev",
+            "--grid",
+            &g,
+            "--set",
+            "recall.digest_tokens=800",
+        ]))
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("--set вместе с --grid"), "{e:#}");
+        let one = session_points(&parse(&["--sessions", "--split", "dev"])).unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(one[0].name.is_empty() && one[0].env.is_empty());
+        let d = crate::eval::tests_repo().join("target/test-tmp/xtask/sessions-grid");
+        fs::create_dir_all(&d).unwrap();
+        let f = d.join("index.toml");
+        fs::write(
+            &f,
+            "[[point]]\nname = \"x\"\nenv = { ZAM_INDEX__CHUNK_TARGET_MAX = \"600\" }\n",
+        )
+        .unwrap();
+        let fs_ = f.to_string_lossy().into_owned();
+        let e =
+            session_points(&parse(&["--sessions", "--split", "dev", "--grid", &fs_])).unwrap_err();
+        assert!(format!("{e:#}").contains("меняет индекс"), "{e:#}");
+        // holdout с сеткой — отказ до любой работы
+        assert!(crate::eval::grid::refuse_holdout(Some(&grid), Some(Part::Holdout)).is_err());
+    }
+
+    /// Задача 8c: раздел `### Правила` — класс `rules`; строки словаря и карты кода под ним —
+    /// `journal`; вычитается только у `session_start` и `recovery`.
+    #[test]
+    fn rules_class_only_in_digest_and_recovery() {
+        let text = "### Задачи\nZeroAIMemory: [in_progress] t — k:1\n\n### Правила\na/b n:1\n  текст \
+                    правила\nСловарь: 3 термина — memory_search kinds=[term]\nZeroAIMemory: карта \
+                    кода: 1 файл\n\n### Ловушки и сбои\nx i:2\n";
+        let c = classify(text, &words);
+        // заголовок раздела — часть резерва
+        assert_eq!(
+            c[class::RULES],
+            words("### Правила\na/b n:1\n  текст правила")
+        );
+        assert!(c[class::JOURNAL] >= words("Словарь: 3 термина — memory_search kinds=[term]"));
+        let step = |label: &str| StepRun {
+            label: label.into(),
+            tokens: words(text),
+            classes: c.clone(),
+            ..StepRun::default()
+        };
+        let ex: BTreeSet<String> = [class::RULES.to_string()].into();
+        let n = words(text) - c[class::RULES];
+        assert_eq!(step_tokens(&step(label::SESSION_START), &ex), n);
+        assert_eq!(step_tokens(&step(label::RECOVERY), &ex), n);
+        assert_eq!(step_tokens(&step(label::SUBAGENT_START), &ex), words(text));
     }
 
     #[test]

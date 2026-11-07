@@ -1193,6 +1193,16 @@ pub fn today() -> String {
     jiff::Zoned::now().strftime("%Y-%m-%d").to_string()
 }
 
+/// Сутки UTC (`yyyy-MM-dd`): окна дайджеста сервера (ответы, решения, горизонты идей) считаются
+/// от них, и сравнение ТС-2 сверяет именно их (задача 8c: локальная дата `today` у UTC+3 после
+/// полуночи разошлась с сутками UTC прогона).
+pub fn today_utc() -> String {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .strftime("%Y-%m-%d")
+        .to_string()
+}
+
 /// Модель и устройство по умолчанию для `--device`.
 pub fn default_model(device: Device) -> &'static str {
     match device {

@@ -642,11 +642,13 @@ fn sessions_summary_md(s: &mut String, name: &str, x: &super::sessions::Sessions
     );
     let _ = writeln!(
         s,
-        "  - повторная выдача {} (между каналами {}); идеи: {}; снимок сессии: {}{}{}",
+        "  - повторная выдача {} (между каналами {}); идеи: {}; снимок сессии: {}; раздел Rules: \
+         {}{}{}",
         tally(&x.repeated),
         tally(&x.repeated_cross),
         kv(&x.idea_tokens),
         kv(&x.snapshot_tokens),
+        kv(&x.rules_tokens),
         x.rep_noise_p95.map_or(String::new(), |p| format!(
             "; шум повторов (p95 |Δ|/среднее сессии): {p:.4}"
         )),
@@ -793,6 +795,34 @@ pub fn sessions_comparison_md(c: &super::sessions::SessionsComparison) -> String
         sessions_summary_md(&mut s, "база", &p.base_summary);
         sessions_summary_md(&mut s, "плечо", &p.arm_summary);
     }
+    if !c.parts_no_rules.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n### Без раздела Rules (резерв `session_start`/`recovery` вычтен в обоих плечах; §17 \
+             п. 2, решение 10)\n\n| Часть | база | плечо | R | session_start R | recovery R |\n\
+             |---|---:|---:|---|---|---|"
+        );
+        for p in &c.parts_no_rules {
+            let by = |l: &str| {
+                p.by_label
+                    .iter()
+                    .find(|x| x.label == l)
+                    .and_then(|x| x.r.as_ref())
+                    .map_or("—".into(), est)
+            };
+            let _ = writeln!(
+                s,
+                "| {} ({}) | {:.0} | {:.0} | {} | {} | {} |",
+                p.part,
+                p.sessions.len(),
+                p.total.base,
+                p.total.arm,
+                p.total.r.as_ref().map_or("—".into(), est),
+                by("session_start"),
+                by("recovery")
+            );
+        }
+    }
     let _ = writeln!(s);
     if let Some(m) = &c.idea_hints_match {
         let _ = writeln!(s, "- подсказки-идеи prompt совпали с базой: {}", tally(m));
@@ -813,6 +843,13 @@ pub fn sessions_comparison_md(c: &super::sessions::SessionsComparison) -> String
         "- бутстреп: {} выборок, зерно {:#x} (парный по сессиям; токены сессии — среднее по \
          повторам).",
         c.bootstrap_samples, c.bootstrap_seed
+    );
+    // журнал задачи 7a, «→ 8b/13»: пометка «уже выдавалось» есть только у M6
+    let _ = writeln!(
+        s,
+        "- повторная выдача — справочно и смещена в пользу M6: повтор `/read` с пометкой «уже \
+         выдавалось» считается помеченным, у плеча без пометки (до M6) тот же повтор — \
+         неотмеченным."
     );
     if !c.only_base.is_empty() || !c.only_arm.is_empty() {
         let _ = writeln!(
