@@ -319,3 +319,66 @@ async fn recovery_decisions_window_from_utc_day_start() {
     let j = recall(&a, "dw-3", body).await;
     assert!(!j["text"].as_str().unwrap().contains(&d), "{j}");
 }
+
+/// Ревью 8a, I3 (M6 §8): захваты задач и статусы задач — состояние сессий, на них гарантия
+/// детерминизма не распространяется. Две сессии подряд при захвате задачи одной из них:
+/// тексты различаются **только** строками захвата.
+#[tokio::test]
+async fn digest_differs_only_by_claim_lines() {
+    let a = {
+        let _clock = freeze_now(ts("2026-10-10T01:00:00Z"));
+        world("claims").await
+    };
+    {
+        let _clock = freeze_now(ts("2026-10-10T01:30:00Z"));
+        let t = created(
+            a.t(
+                Method::POST,
+                KN,
+                Some(json!({"kind": "task", "title": "Захваченная задача",
+                            "data": {"next_step": "взять"}})),
+            )
+            .await,
+        )
+        .await;
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                &format!("/api/v1/entries/{t}/claim"),
+                Some(json!({})),
+                &[("x-zam-session", "cl-a")],
+            )
+            .await;
+        assert!(r.status.is_success(), "{}", r.text());
+    }
+    let body = json!({"event": "session_start", "solution": G});
+    let mine = {
+        let _clock = freeze_now(ts("2026-10-10T02:00:00Z"));
+        recall(&a, "cl-a", body.clone()).await
+    };
+    let other = {
+        let _clock = freeze_now(ts("2026-10-10T02:30:00Z"));
+        recall(&a, "cl-b", body.clone()).await
+    };
+    let (m, o) = (
+        mine["text"].as_str().unwrap(),
+        other["text"].as_str().unwrap(),
+    );
+    assert_ne!(m, o);
+    assert!(
+        m.contains("[open · захвачена этой сессией] Захваченная задача"),
+        "{m}"
+    );
+    assert!(
+        o.contains("[open · захвачена другой сессией] Захваченная задача"),
+        "{o}"
+    );
+    let strip = |t: &str| -> String {
+        t.lines()
+            .filter(|l| !l.contains("захвачена"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(strip(m), strip(o), "{m}\n---\n{o}");
+}

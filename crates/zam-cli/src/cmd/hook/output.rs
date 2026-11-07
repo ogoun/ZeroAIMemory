@@ -104,6 +104,35 @@ pub fn with_tail(head: &str, tail: &str, agent: Agent) -> String {
     format!("{}\n\n{tail}", limit_to(head, room, agent))
 }
 
+/// Поле `output_limit` тела `/recall` (ревью 8a M6, C1): предел канала агента в его единицах
+/// (`chars` у Claude Code, `bytes` у Codex) за вычетом места под `tail` — сводку журнала,
+/// которую хук допишет после текста сервера ([`with_tail`]). Укладывает сервер; обрезка клиента
+/// остаётся страховкой ([`overflow`]).
+pub fn output_limit(agent: Agent, tail: &str) -> serde_json::Value {
+    let tail = tail.trim();
+    let reserve = if tail.is_empty() {
+        0
+    } else {
+        size(tail, agent) + 2
+    };
+    let unit = match agent {
+        Agent::Claude => "chars",
+        Agent::Codex => "bytes",
+    };
+    json!({"unit": unit, "max": max_of(agent).saturating_sub(reserve).max(1)})
+}
+
+/// Сработает ли страховочная обрезка клиента на `text`: `Some(строка для hooks.log)` —
+/// текст длиннее предела агента (сервер не уложил: старый сервер или сбой).
+pub fn overflow(text: &str, agent: Agent) -> Option<String> {
+    let (n, max) = (size(text.trim_end(), agent), max_of(agent));
+    let unit = match agent {
+        Agent::Claude => "символов",
+        Agent::Codex => "байт",
+    };
+    (n > max).then(|| format!("вывод хука обрезан клиентом: {n} > {max} {unit}"))
+}
+
 /// Текст в `max` единиц агента: целые строки и пометка обрезки.
 fn limit_to(text: &str, max: usize, agent: Agent) -> String {
     if size(text, agent) <= max {
@@ -132,6 +161,30 @@ fn limit_to(text: &str, max: usize, agent: Agent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ревью 8a M6, C1: предел канала для `/recall` — единица агента, минус сводка и
+    /// разделитель; страховочная обрезка видна заранее.
+    #[test]
+    fn output_limit_and_overflow() {
+        assert_eq!(
+            output_limit(Agent::Claude, ""),
+            json!({"unit": "chars", "max": CLAUDE_MAX_CHARS})
+        );
+        assert_eq!(
+            output_limit(Agent::Codex, "сводка"),
+            json!({"unit": "bytes", "max": CODEX_MAX_BYTES - "сводка".len() - 2})
+        );
+        assert_eq!(
+            output_limit(Agent::Claude, "сводка"),
+            json!({"unit": "chars", "max": CLAUDE_MAX_CHARS - 6 - 2})
+        );
+        let fit = "я".repeat(CODEX_MAX_BYTES / 2);
+        assert_eq!(overflow(&fit, Agent::Codex), None);
+        assert!(overflow(&format!("{fit}я"), Agent::Codex).is_some());
+        // текст в пределе — `render` его не режет
+        let s = Output::context("SessionStart", &fit).render(Agent::Codex);
+        assert!(!s.contains("обрезаны"), "{s}");
+    }
 
     #[test]
     fn render_shapes() {

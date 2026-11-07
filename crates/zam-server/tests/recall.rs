@@ -1497,13 +1497,20 @@ async fn rules_reserved_never_cut() {
         let j = ok(&a, &a.token, Some("rr-1"), json!({"event": event})).await;
         let text = j["text"].as_str().unwrap();
         let got = ids(&j);
-        // до RULES_MAX = 20: первые 20 по порядку Rules — все на месте
+        // до RULES_MAX = 20 по приоритету (надёжность, затем давность создания): первые 20
+        // созданных — на месте, самое новое — строкой о непоказанных (ревью 8a, I1)
         for r in &rules[..20] {
             assert!(got.contains(r), "{event}: {r}: {text}");
         }
         assert!(
             !got.contains(&rules[20]),
             "{event}: сверх RULES_MAX: {text}"
+        );
+        let rules_part = section(text, "### Правила");
+        assert_eq!(
+            rules_part.last().map(String::as_str),
+            Some("ZeroAIMemory: ещё 1 правил не показаны — memory_tree Rules"),
+            "{event}: {text}"
         );
         let rest = without_section(text, "### Правила");
         assert!(
@@ -1897,4 +1904,328 @@ async fn digest_shows_claimed_open_tasks() {
         lines[2].contains("Моя захваченная") && lines[2].contains("захвачена другой сессией"),
         "{lines:?}"
     );
+}
+
+// ---- ревью задачи 8a (C1, I1, I3, M1, M3): предел вывода канала, приоритет правил ----
+
+/// Пределы каналов агентов (`zam-cli` `hook::output`): Claude Code — символы, Codex — байты.
+const CLAUDE_MAX_CHARS: usize = 9000;
+const CODEX_MAX_BYTES: usize = 7500;
+
+/// Текст правила: `n` разделов кириллицей (L1 — оглавление с первыми фразами, ≈ 200 токенов при
+/// `n = 12`) и `l0` во frontmatter.
+fn rule_text(title: &str, l0: &str, n: usize) -> String {
+    let body: String = (0..n)
+        .map(|k| {
+            format!(
+                "## Пункт {k}\n\nПредложение {k} правила «{title}» требует проверки изменений и \
+                 записи в журнал.\n\n"
+            )
+        })
+        .collect();
+    format!("---\nl0: {l0}\n---\n# {title}\n\n{body}")
+}
+
+/// Мир «20 правил × 200 токенов кириллицей» с решением, ловушками, задачей и картой кода; id
+/// правил по порядку создания.
+async fn heavy_rules_world(name: &str) -> (Api, Vec<String>) {
+    let a = server(name).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let mut ids = Vec::new();
+    let dirs = ["security", "process", "backend", "frontend", "infra"];
+    for i in 0..20 {
+        let path = format!("{}/правило-{i:02}", dirs[i % dirs.len()]);
+        let r = note_as(
+            &a,
+            &a.token,
+            "rules",
+            &path,
+            &rule_text(
+                &format!("Правило {i}"),
+                &format!("Кратко о правиле {i}"),
+                12,
+            ),
+        )
+        .await;
+        ids.push(format!("n:{r}"));
+    }
+    for i in 0..3 {
+        insight(
+            &a,
+            &a.token,
+            G,
+            &format!("Ловушка сборки {i}"),
+            "x",
+            "gotcha",
+        )
+        .await;
+    }
+    let t = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": "Задача в работе", "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{t}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    load_map(&a, &a.token, &[("src/store.rs", &[("Store::open", 1)])]).await;
+    (a, ids)
+}
+
+/// Все правила в тексте — блоком (L1 или L0) или учтены строкой «ещё N правил не показаны».
+fn assert_rules_accounted(what: &str, text: &str, ids: &[String]) {
+    let missing = ids.iter().filter(|r| !text.contains(r.as_str())).count();
+    if missing > 0 {
+        assert!(
+            text.contains(&format!("ZeroAIMemory: ещё {missing} правил не показаны")),
+            "{what}: {missing} правил пропали молча: {text}"
+        );
+    }
+}
+
+/// Ревью 8a, C1: с `output_limit` канала (Codex — байты, Claude — символы) весь текст в
+/// пределе — клиенту резать нечего; правила — первыми (хвост приоритета — L0), карта кода и
+/// «Ловушки» — на месте.
+#[tokio::test]
+async fn digest_fits_output_limit_codex_and_claude() {
+    let (a, ids) = heavy_rules_world("limit-agents").await;
+    for (unit, max) in [("bytes", CODEX_MAX_BYTES), ("chars", CLAUDE_MAX_CHARS)] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(&format!("lim-{unit}")),
+            json!({"event": "session_start", "solution": G, "source": "startup",
+                   "code_map": true, "output_limit": {"unit": unit, "max": max}}),
+        )
+        .await;
+        let text = j["text"].as_str().unwrap();
+        let size = if unit == "bytes" {
+            text.len()
+        } else {
+            text.chars().count()
+        };
+        assert!(size <= max, "{unit}: {size} > {max}");
+        assert_rules_accounted(unit, text, &ids);
+        assert!(
+            ids.iter().all(|r| text.contains(r.as_str())),
+            "{unit}: L0 всех 20 правил помещается: {text}"
+        );
+        // хвост приоритета — L0 (без L1), голова — с L1
+        assert!(text.contains("— Кратко о правиле 19"), "{unit}: {text}");
+        assert!(
+            text.contains("Предложение 0 правила «Правило 0»"),
+            "{unit}: {text}"
+        );
+        assert!(code_line(&j).is_some(), "{unit}: нет карты кода: {text}");
+        assert!(text.contains("### Ловушки и сбои"), "{unit}: {text}");
+    }
+    // без предела (REST, MCP) — L1 у всех
+    let j = ok(
+        &a,
+        &a.token,
+        Some("lim-none"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() > CODEX_MAX_BYTES, "{}", text.len());
+    assert!(!text.contains("— Кратко о правиле"), "{text}");
+}
+
+/// Ревью 8a, C1: хук старого клиента (есть `source`/`code_map`, нет `output_limit`) —
+/// консервативные 7500 байт; восстановление с местом под сводку журнала — в своём пределе.
+#[tokio::test]
+async fn old_hook_client_gets_conservative_limit() {
+    let (a, ids) = heavy_rules_world("limit-old").await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("old-1"),
+        json!({"event": "session_start", "solution": G, "source": "startup", "code_map": true}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() <= CODEX_MAX_BYTES, "{}", text.len());
+    assert_rules_accounted("old", text, &ids);
+    // пакет восстановления: клиент вычел 1500 байт под сводку журнала
+    let j = ok(
+        &a,
+        &a.token,
+        Some("old-1"),
+        json!({"event": "session_start", "solution": G, "source": "compact", "code_map": true,
+               "output_limit": {"unit": "bytes", "max": CODEX_MAX_BYTES - 1500}}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() <= CODEX_MAX_BYTES - 1500, "{}", text.len());
+    assert_rules_accounted("recovery", text, &ids);
+    assert!(text.contains("### Задачи"), "{text}");
+    // некорректный предел — 400
+    for bad in [
+        json!({"event": "session_start", "output_limit": {"unit": "bytes", "max": 0}}),
+        json!({"event": "session_start", "output_limit": {"unit": "words", "max": 10}}),
+    ] {
+        let r = recall(&a, &a.token, None, bad.clone()).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+}
+
+/// Ревью 8a, C1: правила не влезают в предел и строками L0 — с конца приоритета снимаются, а
+/// строка называет их число; правило с `axiom` остаётся.
+#[tokio::test]
+async fn rules_over_limit_dropped_with_honest_line() {
+    let (a, ids) = heavy_rules_world("limit-drop").await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("drop-1"),
+        json!({"event": "session_start", "solution": G, "source": "startup",
+               "output_limit": {"unit": "bytes", "max": 1200}}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() <= 1200, "{}", text.len());
+    let shown = ids.iter().filter(|r| text.contains(r.as_str())).count();
+    assert!(shown > 0 && shown < 20, "{shown}: {text}");
+    assert_rules_accounted("drop", text, &ids);
+    // первые по приоритету (старые) — на месте, последние — сняты
+    assert!(text.contains(ids[0].as_str()), "{text}");
+    assert!(!text.contains(ids[19].as_str()), "{text}");
+}
+
+/// Ревью 8a, I1: приоритет правил — надёжность, затем давность создания, не алфавит: при
+/// 21 правиле не показывается самое новое, а не `security/*` в хвосте алфавита; `axiom` —
+/// всегда в числе показанных.
+#[tokio::test]
+async fn rules_priority_not_alphabetical() {
+    let a = server("rules-priority").await;
+    let mut ids = Vec::new();
+    // сначала — `security/secrets` (хвост алфавита), затем `a/…`
+    let sec = note_as(
+        &a,
+        &a.token,
+        "rules",
+        "security/secrets",
+        "# Secrets\n\nНе в репозиторий.",
+    )
+    .await;
+    for i in 0..19 {
+        ids.push(
+            note_as(
+                &a,
+                &a.token,
+                "rules",
+                &format!("a/п{i:02}"),
+                &format!("# П{i}\n\nТекст."),
+            )
+            .await,
+        );
+    }
+    // новейшее — `axiom`: надёжность важнее давности
+    let ax = note_as(
+        &a,
+        &a.token,
+        "rules",
+        "zz/axiom",
+        "---\ncertainty: axiom\n---\n# Аксиома\n\nВсегда.",
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("pr-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.contains(&format!("n:{sec}")), "{text}");
+    assert!(text.contains(&format!("n:{ax}")), "{text}");
+    assert!(
+        !text.contains(&format!("n:{}", ids[18])),
+        "новейшее — сверх RULES_MAX: {text}"
+    );
+    assert!(text.contains("ещё 1 правил не показаны"), "{text}");
+    // вывод — по пути
+    let a_pos = text.find("правило a/п00").unwrap();
+    let s_pos = text.find("правило security/secrets").unwrap();
+    assert!(a_pos < s_pos, "{text}");
+}
+
+/// Ревью 8a, M1: в пакете субагенту задача, захваченная родителем, — «захвачена родительской
+/// сессией».
+#[tokio::test]
+async fn brief_marks_parent_claim() {
+    let a = server("brief-parent").await;
+    let t = entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "task", "title": "Задача родителя", "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{t}/claim"),
+            Some(json!({})),
+            &[("x-zam-session", "parent-1")],
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let j = ok(
+        &a,
+        &a.token,
+        Some("parent-1:sub"),
+        json!({"event": "brief", "parent_id": "parent-1"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(
+        text.contains("[open · захвачена родительской сессией] Задача родителя"),
+        "{text}"
+    );
+}
+
+/// Ревью 8a, M3: заголовок в строке-индексе changelog — до 20 токенов, как L0 корня.
+#[tokio::test]
+async fn index_title_cut_like_root_l0() {
+    let a = server("index-title").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let long = "Исправлен разбор дат в отчёте продавца по возвратам товаров с учётом часовых \
+                поясов, летнего времени и праздничных дней всех регионов доставки";
+    let c = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "changelog", "title": long, "body": "x", "data": {"kind": "fix"}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("it-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let line = section(text, "### Последние изменения")
+        .into_iter()
+        .find(|l| l.starts_with(&format!("c:{c} «")))
+        .unwrap_or_else(|| panic!("{text}"));
+    let title = line
+        .trim_start_matches(&format!("c:{c} «"))
+        .rsplit_once("» · ")
+        .unwrap()
+        .0;
+    assert!(title.chars().count() < long.chars().count(), "{line}");
+    assert!(zam_store::count_tokens(title) <= 21, "{line}");
 }

@@ -167,6 +167,8 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
             "solution": env.solution.as_ref().map(|x| x.id.clone()),
             "error": error,
             "tool": tool,
+            // предел канала агента (ревью 8a M6, C1)
+            "output_limit": super::output::output_limit(env.agent, ""),
         });
         let session = inp.session_id.as_deref();
         std::thread::scope(|sc| {

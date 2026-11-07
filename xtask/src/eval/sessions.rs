@@ -597,6 +597,23 @@ pub mod class {
     pub const SNAPSHOT: &str = "snapshot";
 }
 
+/// Агент хуков ТС-2 (`zam hook --agent`): вывод хука — то, что агент получит, с пределом
+/// канала (ревью 8a M6, C1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HookAgent {
+    Claude,
+    Codex,
+}
+
+impl HookAgent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookAgent::Claude => "claude",
+            HookAgent::Codex => "codex",
+        }
+    }
+}
+
 /// Виды обязательных строк.
 pub mod req {
     pub const RULE: &str = "rule";
@@ -2604,6 +2621,7 @@ fn run_session(
     rep: usize,
     label: &str,
     count: Count<'_>,
+    agent: Option<HookAgent>,
 ) -> Result<SessionRun> {
     let w = world(sp, corpus)?;
     let name = if rep == 0 {
@@ -2625,7 +2643,8 @@ fn run_session(
         s.wait_indexed()?;
     }
     let dir = p.work.join(&name);
-    let hooks = Hooks::prepare(&dir, zam.to_path_buf(), &s.base, s.token())?;
+    let mut hooks = Hooks::prepare(&dir, zam.to_path_buf(), &s.base, s.token())?;
+    hooks.agent = agent.map(HookAgent::as_str);
     // свой репозиторий git: иначе карта кода видит ветку и коммит рабочей копии разработчика
     let gi = Command::new("git")
         .args(["init", "-q"])
@@ -2881,7 +2900,18 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     for rep in 0..reps {
         for sp in &chosen {
             let r = run_session(
-                p, &spec, &sets, &server, &zam, &corpus, &f, sp, rep, label, &count,
+                p,
+                &spec,
+                &sets,
+                &server,
+                &zam,
+                &corpus,
+                &f,
+                sp,
+                rep,
+                label,
+                &count,
+                a.hook_agent,
             )?;
             let mut r = r;
             r.split = part.as_str().to_string();
@@ -2916,6 +2946,10 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             runs.push(r);
         }
     }
+    notes.push(format!(
+        "агент хуков — {} (`zam hook --agent`, вывод с пределом канала)",
+        a.hook_agent.map_or("claude", HookAgent::as_str)
+    ));
     if f.mcp_explicit {
         notes.push("MCP — zam mcp с ZAM_SESSION_ID (явная сессия)".to_string());
     } else {

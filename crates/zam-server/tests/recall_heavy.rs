@@ -59,3 +59,55 @@ async fn heavy_sh05_digest_complete_fts() {
     assert!(!text.contains("### Идеи"), "{text}");
     check_digest("recovery", text, &wr, s.code_map);
 }
+
+/// Ревью 8a, C1: `sh-05` в пределе канала Codex (7500 байт) и Claude Code (9000 символов),
+/// в том числе хук старого клиента без `output_limit` и восстановление с местом под сводку
+/// журнала: весь текст в пределе, обязательные строки, карта кода и «Ловушки» — на месте.
+#[tokio::test]
+async fn heavy_sh05_fits_output_limit() {
+    let s = spec("sh-05");
+    let a = api("recall-heavy-sh05-limit", |c| c.recall.timeout_ms = 30_000).await;
+    let w = load(&a, &s).await;
+    let cases = [
+        (
+            "codex",
+            Some(json!({"unit": "bytes", "max": 7500})),
+            7500,
+            true,
+        ),
+        (
+            "claude",
+            Some(json!({"unit": "chars", "max": 9000})),
+            9000,
+            false,
+        ),
+        ("old", None, 7500, true),
+    ];
+    for (who, limit, max, bytes) in cases {
+        let size = |t: &str| if bytes { t.len() } else { t.chars().count() };
+        let mut body = json!({"event": "session_start", "solution": SOL, "source": "startup",
+                              "code_map": true});
+        if let Some(l) = &limit {
+            body["output_limit"] = l.clone();
+        }
+        let j = recall(&a, &format!("sh05-{who}"), body).await;
+        let text = j["text"].as_str().unwrap();
+        assert!(size(text) <= max, "{who}: {} > {max}", size(text));
+        check_digest(who, text, &w, s.code_map);
+        // восстановление: клиент вычел 400 единиц под сводку журнала (обычная сводка — 150–350)
+        let mut body = json!({"event": "session_start", "solution": SOL, "source": "compact",
+                              "code_map": true});
+        let unit = if bytes { "bytes" } else { "chars" };
+        body["output_limit"] = json!({"unit": unit, "max": max - 400});
+        let j = recall(&a, &format!("sh05-{who}"), body).await;
+        let text = j["text"].as_str().unwrap();
+        assert!(size(text) <= max - 400, "{who} recovery: {}", size(text));
+        let mut wr = common::heavy::World {
+            required: w.required.clone(),
+            traps: w.traps.clone(),
+            rules: w.rules,
+        };
+        wr.required.retain(|r| r.kind != "idea");
+        check_digest(&format!("{who} recovery"), text, &wr, s.code_map);
+    }
+}

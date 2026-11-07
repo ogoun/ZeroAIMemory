@@ -161,6 +161,8 @@ fn digest_net(
     let Some(client) = env.client() else {
         return local(s);
     };
+    // сводка журнала — заранее: её место вычитается из предела канала (ревью 8a M6, C1)
+    let tail_pre = summary(s);
     let solution = env.solution.as_ref().map(|x| x.id.clone());
     // `recovery` выключен в клиенте: `source` к серверу не уходит — эпоху начинает хук сам
     let epoch_source = matches!(source, Some("compact" | "resume" | "clear"))
@@ -182,6 +184,8 @@ fn digest_net(
                 "source": source,
                 // строка карты кода — по `[hooks] code_map` клиента (M5.6 §10)
                 "code_map": s.client.get(Flag::CodeMap) != Some(false),
+                // предел канала минус сводка журнала: весь текст укладывает сервер
+                "output_limit": output::output_limit(env.agent, &tail_pre),
             });
             // `recovery` выключен в клиенте — сервер не строит пакет (по `source` он его и
             // выбирает; иначе `source` только в журнал DEBUG)
@@ -271,11 +275,23 @@ fn digest_net(
     if !now.on(Kind::SessionStart) {
         return Output::Empty;
     }
-    let text = output::with_tail(
-        v["text"].as_str().unwrap_or_default(),
-        &summary(&now),
-        env.agent,
-    );
+    // сводка — та же, если флаги сервера её не изменили (журнал читается один раз)
+    let same = |f: Flag| now.flag_on(f) == s.flag_on(f);
+    let tail = if same(Flag::Recovery) && same(Flag::SessionJournal) {
+        tail_pre
+    } else {
+        summary(&now)
+    };
+    let head = v["text"].as_str().unwrap_or_default();
+    let joined = if tail.trim().is_empty() {
+        head.to_string()
+    } else {
+        format!("{}\n\n{}", head.trim_end(), tail.trim())
+    };
+    if let Some(m) = output::overflow(&joined, env.agent) {
+        env.log(&format!("session-start: {m}"));
+    }
+    let text = output::with_tail(head, &tail, env.agent);
     Output::context(&inp.event, &text)
 }
 

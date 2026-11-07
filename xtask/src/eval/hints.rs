@@ -748,6 +748,8 @@ pub(crate) struct Hooks {
     pub(crate) home: PathBuf,
     pub(crate) base: String,
     pub(crate) token: String,
+    /// `zam hook --agent <агент>`; `None` — умолчание `zam` (claude).
+    pub(crate) agent: Option<&'static str>,
 }
 
 impl Hooks {
@@ -769,6 +771,7 @@ impl Hooks {
             home,
             base: base.to_string(),
             token: token.to_string(),
+            agent: None,
         })
     }
 
@@ -779,8 +782,11 @@ impl Hooks {
         for k in zam_core::AGENT_ENV_VARS {
             c.env_remove(k);
         }
-        c.args(["hook", cmd])
-            .current_dir(&self.project)
+        c.args(["hook", cmd]);
+        if let Some(agent) = self.agent {
+            c.args(["--agent", agent]);
+        }
+        c.current_dir(&self.project)
             .env("ZAM_URL", &self.base)
             .env("ZAM_TOKEN", &self.token)
             .env("USERPROFILE", &self.home)

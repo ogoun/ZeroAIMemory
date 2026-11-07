@@ -233,6 +233,9 @@ pub struct Section {
     pub title: Option<String>,
     pub blocks: Vec<String>,
     pub reserved: bool,
+    /// Стойкость к пределу вывода канала (ревью 8a, C1): при превышении сначала снимаются блоки
+    /// разделов с меньшим `keep` (внутри — с конца); бюджет токенов идёт по порядку разделов.
+    pub keep: u8,
 }
 
 impl Section {
@@ -242,6 +245,7 @@ impl Section {
             title,
             blocks,
             reserved: false,
+            keep: 0,
         }
     }
 }
@@ -251,12 +255,16 @@ impl Section {
 /// пропускается, следующие короткие ещё пробуются. `cap` — наибольший счёт, что помещается в
 /// бюджет (`TokenCounter::budget_cap`): с ним сравниваются суммы частей, и с ним же — счёт
 /// текста разделов в бюджете целиком (при расхождении суммы с целым с конца снимаются блоки).
-/// Итог — текст всех вошедших блоков в порядке разделов (блоки через перевод строки, перед
-/// заголовком раздела — пустая строка) и вошедшие блоки `(раздел, блок)`.
+/// `fits_all` — предел вывода канала на весь текст (ревью 8a, C1): не влезает — снимаются блоки
+/// в бюджете, начиная с разделов с меньшим `keep`, внутри — с конца (резерв укладывается до
+/// упаковки). Итог — текст всех
+/// вошедших блоков в порядке разделов (блоки через перевод строки, перед заголовком раздела —
+/// пустая строка) и вошедшие блоки `(раздел, блок)`.
 pub fn pack_sections(
     sections: &[Section],
     cap: usize,
     count: &dyn Fn(&str) -> usize,
+    fits_all: &dyn Fn(&str) -> bool,
 ) -> (String, Vec<(usize, usize)>) {
     let mut used = 0usize;
     let mut budgeted: Vec<(usize, usize)> = Vec::new();
@@ -278,14 +286,27 @@ pub fn pack_sections(
     while !budgeted.is_empty() && count(&render(sections, &budgeted)) > cap {
         budgeted.pop();
     }
-    let mut taken: Vec<(usize, usize)> = sections
+    let reserved: Vec<(usize, usize)> = sections
         .iter()
         .enumerate()
         .filter(|(_, s)| s.reserved)
         .flat_map(|(si, s)| (0..s.blocks.len()).map(move |bi| (si, bi)))
-        .chain(budgeted)
         .collect();
-    taken.sort_unstable();
+    let all = |budgeted: &[(usize, usize)]| {
+        let mut t: Vec<(usize, usize)> = reserved.iter().chain(budgeted).copied().collect();
+        t.sort_unstable();
+        t
+    };
+    // предел вывода канала (весь текст вместе с резервом): с конца снимаются блоки в бюджете
+    let mut taken = all(&budgeted);
+    while !budgeted.is_empty() && !fits_all(&render(sections, &taken)) {
+        // наименее стойкий раздел, в нём — последний блок
+        let k = (0..budgeted.len())
+            .min_by_key(|&k| (sections[budgeted[k].0].keep, std::cmp::Reverse(k)))
+            .unwrap_or(budgeted.len() - 1);
+        budgeted.remove(k);
+        taken = all(&budgeted);
+    }
     (render(sections, &taken), taken)
 }
 
@@ -431,15 +452,15 @@ mod tests {
             Section::new(Some("### B".into()), vec!["b1".into()]),
             Section::new(None, vec!["c1 c1 c1".into()]),
         ];
-        let (text, taken) = pack_sections(&secs, 10, &words);
+        let (text, taken) = pack_sections(&secs, 10, &words, &|_| true);
         assert_eq!(taken, [(0, 0), (1, 0), (2, 0)]);
         assert_eq!(text, "### A\na1 a1\n\n### B\nb1\nc1 c1 c1\n");
         assert!(words(&text) <= 10);
         // раздел без вошедших блоков — без заголовка
-        let (text, taken) = pack_sections(&secs, 4, &words);
+        let (text, taken) = pack_sections(&secs, 4, &words, &|_| true);
         assert_eq!(taken, [(0, 0)]);
         assert_eq!(text, "### A\na1 a1\n");
-        let (text, taken) = pack_sections(&secs, 0, &words);
+        let (text, taken) = pack_sections(&secs, 0, &words, &|_| true);
         assert!(taken.is_empty() && text.is_empty());
     }
 
@@ -459,12 +480,15 @@ mod tests {
             Section::new(None, vec!["c1 c1 c1".into(), "c2".into()]),
         ];
         // бюджет 5: «### A a1 a1» (4) + «c2» (1); Rules — сверх
-        let (text, taken) = pack_sections(&secs, 5, &words);
+        let (text, taken) = pack_sections(&secs, 5, &words, &|_| true);
         assert_eq!(taken, [(0, 0), (1, 0), (1, 1), (2, 1)]);
         assert_eq!(text, "### A\na1 a1\n\n### R\nr1 r1 r1\nr2 r2\nc2\n");
         assert_eq!(reserved_text(&secs), "### R\nr1 r1 r1\nr2 r2\n");
+        // предел всего текста (ревью 8a, C1): резерв остаётся, с конца снимаются блоки бюджета
+        let (text, taken) = pack_sections(&secs, 5, &words, &|t: &str| t.len() <= 30);
+        assert_eq!(taken, [(1, 0), (1, 1)], "{text}");
         // нулевой бюджет — только резерв
-        let (text, taken) = pack_sections(&secs, 0, &words);
+        let (text, taken) = pack_sections(&secs, 0, &words, &|_| true);
         assert_eq!(taken, [(1, 0), (1, 1)]);
         assert_eq!(text, "### R\nr1 r1 r1\nr2 r2\n");
     }

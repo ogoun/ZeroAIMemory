@@ -179,6 +179,10 @@ pub struct EvalArgs {
     /// --sessions: `zam mcp` без ZAM_SESSION_ID и файла привязки (неявный путь R13) и у M6
     #[arg(long, requires = "sessions")]
     pub implicit_mcp: bool,
+    /// --sessions: агент хуков (`zam hook --agent`): формат вывода и предел текста канала —
+    /// Claude Code 9000 символов, Codex 7500 байт (ревью 8a M6, C1); по умолчанию claude
+    #[arg(long, value_enum, requires = "sessions")]
+    pub hook_agent: Option<sessions::HookAgent>,
     /// Часть набора замера M6 (--via mcp, --sessions): dev (подбор, сетки) | holdout (приёмка;
     /// без --grid)
     #[arg(long, value_enum)]

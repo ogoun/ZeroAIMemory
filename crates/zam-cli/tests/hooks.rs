@@ -58,6 +58,11 @@ fn tmp(name: &str) -> PathBuf {
 
 /// Сервер в фоновом потоке: адрес и токен `rw` пользователя «Анна».
 fn start(name: &str) -> (String, String) {
+    start_opt(name, false)
+}
+
+/// [`start`]; `rules_write` — агентам разрешена запись в Rules (`rules.agent_write`).
+fn start_opt(name: &str, rules_write: bool) -> (String, String) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -73,6 +78,12 @@ fn start(name: &str) -> (String, String) {
             // отладочная сборка на HDD: сервер не обрезает сбор (бюджет — у клиента)
             cfg.recall.timeout_ms = 30_000;
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
+            if rules_write {
+                st.system
+                    .set_setting("rules.agent_write", &true)
+                    .await
+                    .unwrap();
+            }
             let u = st.system.create_user("Анна", false).await.unwrap();
             let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3755,4 +3766,134 @@ fn compact_resets_seen() {
         "{after}"
     );
     assert!(read().contains(REREAD));
+}
+
+// ---- ревью задачи 8a M6 (C1): предел канала агента укладывает сервер ----
+
+/// Пометка клиентской обрезки (`hook::output::CUT_MARK`).
+const CUT_MARK: &str = "(подсказки ZeroAIMemory обрезаны)";
+
+/// `POST <path>` токеном проекта; тело ответа.
+fn api_post(p: &Proj, path: &str, body: Value) -> Value {
+    let r = http()
+        .post(&format!("{}/api/v1{path}", p.url))
+        .header("Authorization", format!("Bearer {}", p.token))
+        .content_type("application/json")
+        .send(body.to_string())
+        .unwrap();
+    let st = r.status().as_u16();
+    let text = r.into_body().read_to_string().unwrap();
+    assert!((200..300).contains(&st), "{path}: {st}: {text}");
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// Мир «20 правил × 200 токенов кириллицей»: решение, ловушки, карта кода; id правил.
+fn heavy_rules(p: &Proj) -> Vec<String> {
+    api_post(
+        p,
+        "/solutions",
+        json!({"agent_solution_id": G, "name": "Хуки"}),
+    );
+    let mut ids = Vec::new();
+    let dirs = ["security", "process", "backend", "frontend", "infra"];
+    for i in 0..20 {
+        let body: String = (0..12)
+            .map(|k| {
+                format!(
+                    "## Пункт {k}\n\nПредложение {k} правила {i} требует проверки изменений \
+                     и записи в журнал.\n\n"
+                )
+            })
+            .collect();
+        let v = api_post(
+            p,
+            "/nodes",
+            json!({"space": "rules", "path": format!("{}/правило-{i:02}", dirs[i % 5]),
+                   "kind": "note",
+                   "content": format!("---\nl0: Кратко о правиле {i}\n---\n# Правило {i}\n\n{body}\n")}),
+        );
+        ids.push(format!("n:{}", v["id"].as_str().unwrap()));
+    }
+    for i in 0..3 {
+        p.insight(&format!("Ловушка сборки {i}"), "gotcha", "solution", &[]);
+    }
+    let h = format!("{:064x}", 1);
+    api_post(
+        p,
+        "/code/sync",
+        json!({"solution": G, "commit": "abcdef1234", "branch": "main", "machine": "box",
+               "manifest": [{"path": "src/a.rs", "hash": h}]}),
+    );
+    let r = http()
+        .put(&format!("{}/api/v1/code/files", p.url))
+        .header("Authorization", format!("Bearer {}", p.token))
+        .content_type("application/json")
+        .send(
+            json!({"solution": G, "commit": "abcdef1234", "branch": "main", "machine": "box",
+                   "files": [{"path": "src/a.rs", "lang": "rust", "hash": h, "size": 10,
+                              "parse_state": "ok", "refs": [],
+                              "symbols": [{"name": "alpha", "qual": "alpha", "kind": "function",
+                                           "line": 1, "end_line": 3, "sig": "fn alpha()",
+                                           "body_hash": "0000000000000001", "exported": true}]}]})
+            .to_string(),
+        )
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    ids
+}
+
+/// Ревью 8a M6, C1: `session-start` Claude Code и Codex на мире «20 правил × 200 токенов
+/// кириллицей» — вывод агенту (`Output::render`) без клиентской обрезки: все правила (хвост
+/// приоритета — L0), строка карты кода и «Ловушки» на месте; после `compact` — то же вместе со
+/// сводкой журнала (`with_tail`); в `hooks.log` нет записи об обрезке.
+#[test]
+fn session_start_fits_channel_codex_and_claude() {
+    let _g = serial();
+    let (url, tok) = start_opt("fit-channel", true);
+    let p = Proj::new("fit-channel", &url, &tok);
+    let ids = heavy_rules(&p);
+    for (agent, max) in [("codex", 7500usize), ("claude", 9000)] {
+        let size = |t: &str| {
+            if agent == "codex" {
+                t.len()
+            } else {
+                t.chars().count()
+            }
+        };
+        let sid = format!("fit-{agent}");
+        let ss = |src: &str| p.ev("SessionStart", &sid, json!({"source": src}));
+        let (o, _) = p.hook_at(
+            &url,
+            "session-start",
+            agent,
+            ss("startup").to_string().as_bytes(),
+        );
+        let c = context(&o, "SessionStart");
+        assert!(size(&c) <= max, "{agent}: {} > {max}", size(&c));
+        assert!(!c.contains(CUT_MARK), "{agent}: обрезка клиентом: {c}");
+        for r in &ids {
+            assert!(c.contains(r.as_str()), "{agent}: нет {r}: {c}");
+        }
+        assert!(c.contains("ZeroAIMemory: карта кода:"), "{agent}: {c}");
+        assert!(c.contains("### Ловушки и сбои"), "{agent}: {c}");
+        // compact: пакет восстановления и сводка журнала — в общем пределе
+        fix_pair(&p, &sid);
+        let (o, _) = p.hook_at(
+            &url,
+            "session-start",
+            agent,
+            ss("compact").to_string().as_bytes(),
+        );
+        let c = context(&o, "SessionStart");
+        assert!(size(&c) <= max, "{agent} compact: {} > {max}", size(&c));
+        assert!(
+            !c.contains(CUT_MARK),
+            "{agent} compact: обрезка клиентом: {c}"
+        );
+        assert!(c.contains("До сжатия в этой сессии"), "{agent}: {c}");
+        for r in &ids {
+            assert!(c.contains(r.as_str()), "{agent} compact: нет {r}: {c}");
+        }
+    }
+    assert!(!p.log().contains("обрезан клиентом"), "{}", p.log());
 }

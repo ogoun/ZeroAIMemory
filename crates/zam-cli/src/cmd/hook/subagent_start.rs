@@ -89,6 +89,8 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             "task": spawn.as_ref().map(|x| x.task.as_str()).filter(|t| !t.trim().is_empty()),
             // раздел `### Код` — по `[hooks] code_map` клиента (сервер добавит свой ключ)
             "code_map": s.client.get(Flag::CodeMap) != Some(false),
+            // предел канала агента: текст укладывает сервер (ревью 8a M6, C1)
+            "output_limit": super::output::output_limit(env.agent, ""),
         });
         let c = &client;
         let recall = sc.spawn(move || c.post_json("/recall", &body).and_then(read_json));
@@ -120,7 +122,11 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     for w in cache::strings(&v["warnings"]) {
         env.log(&format!("recall(brief): предупреждение сервера: {w}"));
     }
-    Output::context(&inp.event, v["text"].as_str().unwrap_or_default())
+    let text = v["text"].as_str().unwrap_or_default();
+    if let Some(m) = super::output::overflow(text, env.agent) {
+        env.log(&format!("subagent-start: {m}"));
+    }
+    Output::context(&inp.event, text)
 }
 
 #[cfg(test)]

@@ -153,6 +153,10 @@
 //!   не зависит: хук `subagent-start` гейтится на клиенте;
 //! - неизвестные поля тела игнорируются (клиент хуков может быть новее); прочие `source` хука
 //!   (`startup | clear | fork`) — обычный дайджест, `source` пишется в журнал DEBUG;
+//! - `output_limit {unit: chars|bytes, max}` (ревью 8a M6, C1) — предел канала хука: весь
+//!   `text` в нём (Rules — первыми, хвост их приоритета — L0, затем снимаются разделы с меньшим
+//!   `keep`, правила — со строкой «ещё N правил не показаны»); хук без поля (есть `source` или
+//!   `code_map`) — 7500 байт; `max` вне 1..=1 000 000 или иная единица — 400;
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
 //!   recovery | brief` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
 //!
@@ -353,6 +357,158 @@ pub struct RecallReq {
     /// (`session-start`, `subagent-start`); есть поле — действует и `hooks.code_map`
     /// пользователя, нет (явный вызов REST/MCP `recovery`/`brief`) — не гасится.
     code_map: Option<bool>,
+    /// Предел канала вывода хука (ревью 8a, C1): весь `text` укладывается в него сервером,
+    /// клиент режет только страховочно. Нет у хука (старый клиент) — [`HOOK_OUTPUT_LIMIT`].
+    output_limit: Option<OutputLimit>,
+}
+
+/// Единица предела вывода: символы (Claude Code) или байты UTF-8 (Codex).
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum LimitUnit {
+    Chars,
+    Bytes,
+}
+
+/// Предел вывода канала `{unit, max}`.
+#[derive(Deserialize, Clone, Copy, Debug)]
+struct OutputLimit {
+    unit: LimitUnit,
+    max: usize,
+}
+
+impl OutputLimit {
+    /// Размер текста в единицах предела.
+    fn size(&self, text: &str) -> usize {
+        match self.unit {
+            LimitUnit::Chars => text.chars().count(),
+            LimitUnit::Bytes => text.len(),
+        }
+    }
+
+    fn fits(&self, text: &str) -> bool {
+        self.size(text) <= self.max
+    }
+}
+
+/// Предел вывода хука без поля `output_limit` (клиент до ревью 8a): самый строгий из
+/// клиентских — Codex, 7500 байт (`zam-cli` `hook::output::CODEX_MAX_BYTES`).
+const HOOK_OUTPUT_LIMIT: OutputLimit = OutputLimit {
+    unit: LimitUnit::Bytes,
+    max: 7500,
+};
+/// Наибольший `output_limit.max`.
+const OUTPUT_LIMIT_MAX: usize = 1_000_000;
+
+/// Предел вывода ответа: из запроса; у хука без поля (есть `source` или `code_map` — их шлют
+/// только хуки, MCP — нет) — [`HOOK_OUTPUT_LIMIT`]; MCP и прочие — без предела.
+fn output_limit(req: &RecallReq, mcp: bool) -> Option<OutputLimit> {
+    req.output_limit.or_else(|| {
+        (!mcp && (req.source.is_some() || req.code_map.is_some())).then_some(HOOK_OUTPUT_LIMIT)
+    })
+}
+
+/// Правила раздела-резерва при укладке в предел вывода (ревью 8a, C1): в порядке вывода —
+/// место в приоритете ([`rule_order`]), кандидат и блок (L1 или L0); `hidden` — правил, что не
+/// показаны (строка [`rules_hidden_line`]).
+struct RulesFit<'c> {
+    ri: usize,
+    items: Vec<(usize, &'c Cand, String)>,
+    hidden: usize,
+}
+
+impl<'c> RulesFit<'c> {
+    /// Раздел-резерв упаковки; нет — `None`.
+    fn of(
+        packed: &[Section],
+        picked: &[Vec<&'c Cand>],
+        short: &HashMap<TargetRef, (usize, String)>,
+        hidden: usize,
+    ) -> Option<Self> {
+        let ri = packed.iter().position(|s| s.reserved)?;
+        let items = picked[ri]
+            .iter()
+            .zip(packed[ri].blocks.iter())
+            .map(|(c, b)| {
+                let rank = short.get(&c.tref).map_or(usize::MAX, |(r, _)| *r);
+                (rank, *c, b.clone())
+            })
+            .collect();
+        Some(Self { ri, items, hidden })
+    }
+
+    /// Блоки и подсказки раздела — в упаковку.
+    fn apply(&self, packed: &mut [Section], picked: &mut [Vec<&'c Cand>]) {
+        let sec = &mut packed[self.ri];
+        sec.blocks = self.items.iter().map(|(_, _, b)| b.clone()).collect();
+        if self.hidden > 0 {
+            sec.blocks.push(rules_hidden_line(self.hidden));
+        }
+        picked[self.ri] = self.items.iter().map(|(_, c, _)| *c).collect();
+    }
+
+    /// У правила с конца приоритета, ещё с L1, — строка L0; нечего урезать — `false`.
+    fn degrade(&mut self, short: &HashMap<TargetRef, (usize, String)>) -> bool {
+        let next = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, c, b))| {
+                short
+                    .get(&c.tref)
+                    .is_some_and(|(_, l0)| l0 != b && l0.len() < b.len())
+            })
+            .max_by_key(|(_, (r, _, _))| *r)
+            .map(|(k, _)| k);
+        let Some(k) = next else {
+            return false;
+        };
+        self.items[k].2 = short[&self.items[k].1.tref].1.clone();
+        true
+    }
+
+    /// Правило с конца приоритета — прочь (его учитывает строка о непоказанных).
+    fn drop_last(&mut self) -> bool {
+        let Some(k) = (0..self.items.len()).max_by_key(|&k| self.items[k].0) else {
+            return false;
+        };
+        self.items.remove(k);
+        self.hidden += 1;
+        true
+    }
+}
+
+/// Упаковка в бюджет и предел вывода `limit` (ревью 8a, C1; M6 §8): Rules — первыми по
+/// приоритету и сверх `digest_tokens`, остальное — в `min(cap, остаток предела)`. Не влезает:
+/// (1) у правил с конца приоритета ([`rule_order`]) L1 заменяется строкой L0, пока правила и
+/// разделы в бюджете не уложатся; (2) с конца снимаются блоки в бюджете; (3) правила (уже L0)
+/// снимаются с конца, а строка [`rules_hidden_line`] называет их число — ни одно правило не
+/// пропадает молча.
+fn pack_limited(
+    packed: &mut [Section],
+    picked: &mut [Vec<&Cand>],
+    short: &HashMap<TargetRef, (usize, String)>,
+    hidden: usize,
+    cap: usize,
+    limit: Option<OutputLimit>,
+) -> (String, Vec<(usize, usize)>) {
+    let free = |p: &[Section]| pack_sections(p, cap, &count_tokens, &|_| true);
+    let Some(limit) = limit else {
+        return free(packed);
+    };
+    let fits = |t: &str| limit.fits(t);
+    if let Some(mut f) = RulesFit::of(packed, picked, short, hidden) {
+        // (1) L1 → L0, пока правила с разделами в бюджете не влезут
+        while !fits(&free(packed).0) && f.degrade(short) {
+            f.apply(packed, picked);
+        }
+        // (3) сами правила (L0) не влезают — с конца, со строкой о непоказанных
+        while limit.size(&reserved_text(packed)) + 1 > limit.max && f.drop_last() {
+            f.apply(packed, picked);
+        }
+    }
+    // (2) разделы в бюджете — с конца, пока весь текст не влезет
+    pack_sections(packed, cap, &count_tokens, &fits)
 }
 
 /// Кандидат в подсказки.
@@ -466,7 +622,11 @@ fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Can
 fn index_cand(target: usize, e: &Entry, reason: &'static str) -> Cand {
     let mut c = entry_cand(target, e, reason, "");
     let size = count_tokens(&format!("{}\n\n{}", e.title, e.body));
-    c.block = format!("{} «{}» · {size}t", c.reference, one_line(&e.title));
+    // заголовок — до `SOLUTION_ROOT_L0_TOKENS`, как L0 корня (ревью 8a, M3)
+    let title = one_line(&e.title);
+    let cap = zam_store::budget_cap(SOLUTION_ROOT_L0_TOKENS);
+    let title = truncate_to_tokens(&title, cap, &count_tokens);
+    c.block = format!("{} «{title}» · {size}t", c.reference);
     c
 }
 
@@ -654,6 +814,8 @@ const CLAIMED_MINE: &str = "захвачена этой сессией";
 const CLAIMED_OTHER: &str = "захвачена другой сессией";
 /// Пометка захваченной задачи `open` в ответе без сессии (чья — неизвестно).
 const CLAIMED_ANY: &str = "захвачена";
+/// Пометка задачи `open`, захваченной родителем, в пакете субагенту (`brief`, ревью 8a, M1).
+const CLAIMED_PARENT: &str = "захвачена родительской сессией";
 
 /// Задачи `in_progress` и `blocked` пространств `spaces` и задачи `open` с живым захватом
 /// (`claim` статус не меняет — без них захваченная задача не видна): захваченные сессией
@@ -665,6 +827,7 @@ async fn task_cands(
     deadline: &mut Deadline,
     spaces: &[(usize, Id)],
     session: Option<&str>,
+    mine_mark: &'static str,
 ) -> Result<Vec<Cand>, ApiError> {
     let now = zam_store::time::now();
     let claimed = |e: &Entry| {
@@ -697,7 +860,7 @@ async fn task_cands(
         .map(|(i, e)| {
             let mut c = entry_cand(*i, e, "task", "");
             let mark = (e.status == Some(EntryStatus::Open)).then(|| match session {
-                _ if mine(e) => CLAIMED_MINE,
+                _ if mine(e) => mine_mark,
                 Some(_) => CLAIMED_OTHER,
                 None => CLAIMED_ANY,
             });
@@ -1773,7 +1936,14 @@ async fn digest(
             .ok()
             .flatten()
     });
-    let tasks = task_cands(health, deadline, &insight_spaces, session.as_deref()).await?;
+    let tasks = task_cands(
+        health,
+        deadline,
+        &insight_spaces,
+        session.as_deref(),
+        CLAIMED_MINE,
+    )
+    .await?;
     sections.push((Some(SECTION_TASKS), tasks));
     // ответы человека и открытые вопросы — сразу после задач (M4.5 §4)
     let (answers, open_line) = question_cands(health, deadline, &insight_spaces).await?;
@@ -1789,16 +1959,25 @@ async fn digest(
         sections.push((Some(SECTION_DECISIONS), decisions));
     }
 
-    // Rules — L1 каждой заметки
+    // Rules — L1 каждой заметки; больше `RULES_MAX` — первые по приоритету ([`rule_order`]),
+    // остальные — строкой «ещё N правил не показаны»; вывод — по пути
     let mut rules: Vec<Cand> = Vec::new();
+    let mut rules_short: HashMap<TargetRef, (usize, String)> = HashMap::new();
+    let mut rules_hidden = 0usize;
     if let Some((i, space)) = personal_space(targets, SpaceKind::Rules) {
         let db = targets[i].db.clone();
         if let Some(r) = deadline.step(list_children(&db, space, None, 16)).await {
-            let notes: Vec<zam_store::Node> = r?
+            let mut notes: Vec<zam_store::Node> = r?
                 .into_iter()
                 .filter(|n| n.kind == NodeKind::Note)
-                .take(RULES_MAX)
                 .collect();
+            notes.sort_by(rule_order);
+            rules_hidden = notes.len().saturating_sub(RULES_MAX);
+            notes.truncate(RULES_MAX);
+            // место в приоритете — для урезания под предел вывода (сначала — последние)
+            let rank: HashMap<Id, usize> =
+                notes.iter().enumerate().map(|(k, n)| (n.id, k)).collect();
+            notes.sort_by(|a, b| a.path.cmp(&b.path));
             for n in notes {
                 let Some(r) = deadline.step(node_content(&db, n.id, None)).await else {
                     break;
@@ -1836,6 +2015,13 @@ async fn digest(
                     block.push_str("\n  ");
                     block.push_str(line.trim_end());
                 }
+                rules_short.insert(
+                    TargetRef {
+                        kind: TargetKind::Node,
+                        id: n.id,
+                    },
+                    (rank[&n.id], rule_l0_block(&n)),
+                );
                 rules.push(Cand {
                     target: i,
                     tref: TargetRef {
@@ -1949,6 +2135,8 @@ async fn digest(
         open_line,
         after_rules,
         code_map,
+        rules_short,
+        rules_hidden,
     };
     Ok((lines, sections))
 }
@@ -2060,7 +2248,13 @@ async fn brief(
                     .ok()
                     .flatten()
             });
-        let tasks = task_cands(health, deadline, &insight_spaces, session.as_deref()).await?;
+        // захваченные родителем (`parent_id`) — «родительской сессией» (ревью 8a, M1)
+        let mark = if req.parent_id.is_some() {
+            CLAIMED_PARENT
+        } else {
+            CLAIMED_MINE
+        };
+        let tasks = task_cands(health, deadline, &insight_spaces, session.as_deref(), mark).await?;
         sections.push((Some(SECTION_TASKS), tasks));
         return Ok(sections);
     };
@@ -2387,6 +2581,51 @@ struct Lines {
     open_line: Option<String>,
     after_rules: Vec<String>,
     code_map: Vec<String>,
+    /// Правила раздела: место в приоритете ([`rule_order`]) и строка L0 — для урезания под
+    /// предел вывода канала ([`fit_rules`]).
+    rules_short: HashMap<TargetRef, (usize, String)>,
+    /// Правил сверх `RULES_MAX` (строка [`rules_hidden_line`]).
+    rules_hidden: usize,
+}
+
+/// Приоритет правил (ревью 8a, I1; M6 §8): надёжность (`axiom` → `theorem` → прочие), затем
+/// давность создания (старые — основа проекта, новые чаще уточняют), затем путь. Детерминирован
+/// при неизменной базе и не зависит от имён: `security/*` и `process/*` не уходят первыми из-за
+/// алфавита. Отбор `RULES_MAX` и урезание под предел вывода идут с конца этого порядка.
+fn rule_order(a: &zam_store::Node, b: &zam_store::Node) -> std::cmp::Ordering {
+    let rank = |n: &zam_store::Node| match n.certainty {
+        Some(Certainty::Axiom) => 0,
+        Some(Certainty::Theorem) => 1,
+        _ => 2,
+    };
+    (rank(a), a.created_at, &a.path).cmp(&(rank(b), b.created_at, &b.path))
+}
+
+/// Строка L0 правила (как в `brief`): `ZeroAIMemory: правило <путь> — <L0> [<cert>] n:<id>`,
+/// L0 — до [`SOLUTION_ROOT_L0_TOKENS`] (автоматический L0 бывает длиннее L1).
+fn rule_l0_block(n: &zam_store::Node) -> String {
+    let mut title = n.path.clone();
+    if let Some(l0) = n.l0.as_deref().map(one_line).filter(|s| !s.is_empty()) {
+        let l0 = zam_markdown::mask_text(&l0);
+        let cap = zam_store::budget_cap(SOLUTION_ROOT_L0_TOKENS);
+        let l0 = truncate_to_tokens(&l0, cap, &count_tokens);
+        if !l0.is_empty() {
+            title.push_str(" — ");
+            title.push_str(l0);
+        }
+    }
+    let certainty = certainty_str(n.certainty);
+    hint_line(
+        "правило ",
+        &title,
+        &[certainty.as_deref().unwrap_or_default()],
+        &format!("n:{}", n.id),
+    )
+}
+
+/// Строка о правилах, что не показаны (сверх `RULES_MAX` или не вошли в предел вывода).
+fn rules_hidden_line(n: usize) -> String {
+    format!("ZeroAIMemory: ещё {n} правил не показаны — memory_tree Rules")
 }
 
 /// Дайджест `session_start`: строки [`Lines`] и разделы-кандидаты.
@@ -3165,12 +3404,14 @@ fn arrange<'c>(
         mut open_line,
         after_rules,
         code_map,
+        rules_hidden,
+        ..
     } = lines;
     let mut out = Arranged::default();
     let mut ideas = ideas;
     let mut notices = Some(notices);
     if !recovery {
-        out.line(None, notices.take().unwrap_or_default());
+        out.line(None, notices.take().unwrap_or_default(), KEEP_MANDATORY);
     }
     for (title, cands) in chosen {
         if recovery
@@ -3187,16 +3428,20 @@ fn arrange<'c>(
             cands.iter().map(|c| c.block.clone()).collect(),
         );
         sec.reserved = rules_reserved && title == Some(SECTION_RULES);
+        sec.keep = keep_of(title);
+        if title == Some(SECTION_RULES) && rules_hidden > 0 {
+            sec.blocks.push(rules_hidden_line(rules_hidden));
+        }
         out.packed.push(sec);
         out.picked.push(cands);
         if title == Some(SECTION_ANSWERS)
             && !recovery
             && let Some(line) = open_line.take()
         {
-            out.line(Some(SECTION_OPEN_QUESTIONS), vec![line]);
+            out.line(Some(SECTION_OPEN_QUESTIONS), vec![line], KEEP_MANDATORY);
         }
         if title == Some(SECTION_ANSWERS) && !recovery && !ideas.is_empty() {
-            out.packed.push(Section::new(
+            let mut sec = Section::new(
                 Some(format!(
                     "{SECTION_IDEAS}\n{IDEAS_HINT}{}",
                     if ideas.iter().any(|c| c.block.contains(REOPEN_MARK_TAIL)) {
@@ -3206,21 +3451,39 @@ fn arrange<'c>(
                     }
                 )),
                 ideas.iter().map(|c| c.block.clone()).collect(),
-            ));
+            );
+            sec.keep = KEEP_MANDATORY;
+            out.packed.push(sec);
             out.picked.push(std::mem::take(&mut ideas));
         }
         if title == Some(SECTION_RULES) {
             if !after_rules.is_empty() {
-                out.line(None, after_rules.clone());
+                out.line(None, after_rules.clone(), KEEP_POINTERS);
             }
             if !code_map.is_empty() {
-                out.line(Some(SECTION_CODE_MAP), code_map.clone());
+                out.line(Some(SECTION_CODE_MAP), code_map.clone(), 0);
             }
         }
     }
     // пакет восстановления без раздела после трёх первых: уведомления и вопросы не теряются
     out.notices(&mut notices, &mut open_line);
     (out.packed, out.picked)
+}
+
+/// Стойкость к пределу вывода (ревью 8a, C1; [`Section::keep`]): обязательные строки ТС-2 —
+/// уведомления, задачи, ответы, открытые вопросы, идеи.
+const KEEP_MANDATORY: u8 = 2;
+/// Строки-указатели после правил (словарь, проверенные команды, карта кода) и ловушки.
+const KEEP_POINTERS: u8 = 1;
+
+/// Стойкость раздела дайджеста: обязательные — [`KEEP_MANDATORY`], ловушки — [`KEEP_POINTERS`],
+/// прочие (решения, окружение, корни, revisit, changelog, разделы `brief`) — 0.
+fn keep_of(title: Option<&str>) -> u8 {
+    match title {
+        Some(SECTION_TASKS | SECTION_ANSWERS) => KEEP_MANDATORY,
+        Some("### Ловушки и сбои") => KEEP_POINTERS,
+        _ => 0,
+    }
 }
 
 /// Накопитель [`arrange`].
@@ -3232,19 +3495,20 @@ struct Arranged<'c> {
 
 impl Arranged<'_> {
     /// Раздел строк, что не подсказки записей.
-    fn line(&mut self, title: Option<&str>, blocks: Vec<String>) {
-        self.packed
-            .push(Section::new(title.map(str::to_string), blocks));
+    fn line(&mut self, title: Option<&str>, blocks: Vec<String>, keep: u8) {
+        let mut sec = Section::new(title.map(str::to_string), blocks);
+        sec.keep = keep;
+        self.packed.push(sec);
         self.picked.push(Vec::new());
     }
 
     /// Уведомления и строка открытых вопросов, если ещё не выведены.
     fn notices(&mut self, notices: &mut Option<Vec<String>>, open_line: &mut Option<String>) {
         if let Some(n) = notices.take() {
-            self.line(None, n);
+            self.line(None, n, KEEP_MANDATORY);
         }
         if let Some(l) = open_line.take() {
-            self.line(Some(SECTION_OPEN_QUESTIONS), vec![l]);
+            self.line(Some(SECTION_OPEN_QUESTIONS), vec![l], KEEP_MANDATORY);
         }
     }
 }
@@ -3265,6 +3529,14 @@ pub async fn recall(
     {
         return Err(ApiError::BadRequest(format!(
             "budget_tokens: от 1 до {BUDGET_MAX}"
+        )));
+    }
+    if req
+        .output_limit
+        .is_some_and(|l| !(1..=OUTPUT_LIMIT_MAX).contains(&l.max))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "output_limit.max: от 1 до {OUTPUT_LIMIT_MAX}"
         )));
     }
     let area = zam_store::normalize_area(req.area.as_deref());
@@ -3418,7 +3690,7 @@ pub async fn recall(
         && !recovery
         && ideas_enabled(&st, &flags);
     let mut idea_cands: Vec<Cand> = Vec::new();
-    let (lines, sections, repeatable) = match req.event {
+    let (mut lines, sections, repeatable) = match req.event {
         _ if !enabled => (Lines::default(), Vec::new(), true),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
@@ -3518,6 +3790,8 @@ pub async fn recall(
         .collect();
     // Rules дайджеста и пакета восстановления — резерв сверх бюджета (M6 §8)
     let rules_reserved = matches!(req.event, Event::SessionStart | Event::Recovery);
+    let rules_short = std::mem::take(&mut lines.rules_short);
+    let rules_hidden = lines.rules_hidden;
     let (mut packed, mut picked) = arrange(recovery, rules_reserved, lines, ideas, chosen);
     if !code_section.is_empty() {
         // раздел `### Код` — после `### Файлы`; строки карты не подсказки записей (без учёта)
@@ -3526,7 +3800,16 @@ pub async fn recall(
     }
     // упаковка разделов суммами — против `budget_cap` (M6 §4.2); резерв Rules — вне бюджета,
     // его размер — отдельным полем `rules_tokens` (§17 п. 3)
-    let (text, taken) = pack_sections(&packed, zam_store::budget_cap(budget), &count_tokens);
+    // предел канала хука (ревью 8a, C1): Rules — первыми, остальное — в остатке
+    let limit = output_limit(&req, origin.is_some());
+    let (text, taken) = pack_limited(
+        &mut packed,
+        &mut picked,
+        &rules_short,
+        rules_hidden,
+        zam_store::budget_cap(budget),
+        limit,
+    );
     let rules_tokens = count_tokens(&reserved_text(&packed));
     let shown_now: Vec<&Cand> = taken
         .iter()
@@ -3739,7 +4022,7 @@ mod tests {
                 "Словарь".to_string(),
                 "Проверенные команды: a (проверено 2026-10-28)".into(),
             ],
-            code_map: Vec::new(),
+            ..Lines::default()
         };
         let (packed, _) = arrange(false, true, lines, Vec::new(), chosen);
         // раздел Rules — резерв сверх бюджета (M6 §8), прочие — в бюджете

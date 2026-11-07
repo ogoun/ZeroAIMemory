@@ -671,6 +671,7 @@ cargo xtask eval --sessions --split dev --mode fts --server-bin <…> --zam-bin 
 cargo xtask eval --sessions --split dev --ideas off ...                          # «на пересечении» (§3.3 п. 2)
 cargo xtask eval --sessions --split dev --profile heavy --implicit-mcp ...      # только тяжёлый, неявный MCP
 cargo xtask eval --sessions --arm <плечо.json> --compare <база.json>             # сравнение без прогона
+cargo xtask eval --sessions --split dev --device cuda --repeat 2 --hook-agent codex ...  # хуки Codex (предел 7500 байт)
 ```
 
 `--base B4|B5.6|B5.7` берёт `zam-server` и `zam` тега из `target/tags/<тег>/release/` (собирает
