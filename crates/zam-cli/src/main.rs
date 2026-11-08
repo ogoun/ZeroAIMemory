@@ -46,7 +46,9 @@ enum Cmd {
         /// Без истории ревизий
         #[arg(long)]
         no_history: bool,
-        /// Файл архива
+        /// Файл архива; загрузка идёт в `<файл>.<pid>.part` рядом и при сбое удаляется (после
+        /// убитого процесса `.part` остаётся — удалите вручную); сервер молчит дольше
+        /// ZAM_EXPORT_IDLE_SECS (300 с) — выход с кодом 2
         #[arg(short = 'o', long = "out", required = true)]
         out: PathBuf,
         #[command(flatten)]

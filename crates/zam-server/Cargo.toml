@@ -37,6 +37,8 @@ jiff.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 # ETag кэша триггеров (§10.3)
 blake3.workspace = true
+# ключ имён архива экспорта без учёта регистра и формы Unicode (NFC; MIT OR Apache-2.0, уже у zam-store)
+unicode-normalization.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 axum = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true, features = ["fs"] }

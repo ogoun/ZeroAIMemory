@@ -21,11 +21,29 @@
 //! (у заметки — вместе с её собственным frontmatter, если он есть).
 //!
 //! **Отпечаток** ([`Fingerprint`]) — blake3 по всем файлам архива, кроме описи, в порядке
-//! записи: для каждого файла длина имени (u64 LE), имя UTF-8, длина содержимого (u64 LE),
-//! содержимое.
+//! записи: для каждого файла длина имени (u64 LE), имя UTF-8, длина содержимого (u64 LE) и
+//! blake3 содержимого (32 байта). Хэш содержимого считается потоком — длина заранее не нужна
+//! (история пишется по ревизии).
+//!
+//! **Имена и ссылки тела** (передать в документацию, 13c). Ссылка тела заметки —
+//! `_attachments/<sha16>/<имя>` с percent-кодированием Markdown ([`zam_store::attachment_link`]),
+//! файл в архиве — то же имя после декодирования, кроме случаев, когда имя меняется для
+//! Windows: запрещённые символы (`%XX`), имя устройства (`_`), конечные точка и пробел,
+//! совпадение без учёта регистра или формы Unicode (`~N`), длинный сегмент (`~h<8 hex>`). Тогда
+//! ссылка тела в распакованном архиве не открывается; верное соответствие — поле
+//! `attachments[].file` frontmatter заметки (`files[].file` у записи), импорт берёт его оттуда.
+//! Ссылки тела ведут от корня архива: из вложенной заметки обычный просмотрщик Markdown ищет
+//! `_attachments/` рядом с ней и не находит.
+//!
+//! **Длина пути.** Сегмент после кодирования длиннее [`SEGMENT_MAX`] байт укорачивается с
+//! суффиксом `~h<8 hex>` (blake3 исходного сегмента; расширение до 16 байт сохраняется). Весь
+//! путь не укорачивается: путь заметки — до 1024 байт, а предел Windows в 260 символов зависит
+//! от каталога распаковки. Распаковка глубоких деревьев на Windows требует длинных путей
+//! (`LongPathsEnabled`) или короткого каталога назначения **[решение исполнителя 18b1]**.
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 use zam_core::Id;
 use zam_store::EntryKind;
 
@@ -45,6 +63,10 @@ pub const LINKS_FILE: &str = "_links.jsonl";
 pub const FOLDERS_FILE: &str = "_folders.jsonl";
 /// Длина префикса sha256 в пути вложения.
 pub const SHA_PREFIX: usize = 16;
+/// Предел сегмента имени после кодирования, байт (предел ФС — 255; запас на `~N` и `.md`).
+pub const SEGMENT_MAX: usize = 200;
+/// Длиннее — не расширение (при укорачивании сегмента).
+const EXT_MAX: usize = 16;
 
 /// Фильтр экспорта. Пустые `paths` и `kinds` вместе — всё пространство; задан один —
 /// только его часть (`paths` — заметки и папки под префиксами, без записей журналов; `kinds` —
@@ -86,10 +108,10 @@ pub struct ExportManifest {
 const FORBIDDEN: [char; 10] = [':', '?', '*', '|', '<', '>', '"', '%', '\\', '/'];
 
 /// Зарезервированные имена устройств Windows (без учёта регистра и расширения).
-const RESERVED: [&str; 28] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "COM¹", "COM²",
-    "COM³", "LPT¹", "LPT²", "LPT³",
+const RESERVED: [&str; 32] = [
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
 ];
 
 fn pct(out: &mut String, ch: char) {
@@ -101,7 +123,7 @@ fn pct(out: &mut String, ch: char) {
 
 /// Один сегмент имени для Windows: запрещённые символы и управляющие — `%XX`, конечные точки
 /// и пробелы — `%2E`/`%20`, зарезервированное имя устройства — суффикс `_` у части до первой
-/// точки (`CON` → `CON_`, `con.txt` → `con_.txt`).
+/// точки (`CON` → `CON_`, `con.txt` → `con_.txt`), длиннее [`SEGMENT_MAX`] — укорачивание.
 pub fn encode_segment(seg: &str) -> String {
     let mut out = String::with_capacity(seg.len());
     for ch in seg.chars() {
@@ -125,12 +147,36 @@ pub fn encode_segment(seg: &str) -> String {
     if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(base)) {
         out.insert(base_end, '_');
     }
-    out
+    shorten(out, seg)
 }
 
-/// Ключ занятого имени: регистр не различается (NTFS, APFS по умолчанию).
+/// Сегмент длиннее [`SEGMENT_MAX`] — `<начало>~h<8 hex blake3 исходного><.расширение>`;
+/// разрез — по границе символа и не посреди `%XX`.
+fn shorten(enc: String, original: &str) -> String {
+    if enc.len() <= SEGMENT_MAX {
+        return enc;
+    }
+    let tag = format!("~h{}", &blake3::hash(original.as_bytes()).to_hex()[..8]);
+    let ext = match enc.rfind('.') {
+        Some(i) if i > 0 && enc.len() - i <= EXT_MAX => &enc[i..],
+        _ => "",
+    };
+    let mut cut = SEGMENT_MAX - tag.len() - ext.len();
+    while !enc.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if let Some(i) = enc[..cut].rfind('%')
+        && cut - i < 3
+    {
+        cut = i;
+    }
+    format!("{}{tag}{ext}", &enc[..cut])
+}
+
+/// Ключ занятого имени: регистр и форма Unicode не различаются (NTFS и APFS — без учёта
+/// регистра, APFS и HFS+ сравнивают имена после нормализации).
 fn key(s: &str) -> String {
-    s.to_lowercase()
+    s.nfc().collect::<String>().to_lowercase()
 }
 
 /// Свободное имя `<stem>[~N]<ext>`: файл `<stem><ext>` или каталог с тем же именем уже есть
@@ -158,11 +204,11 @@ fn claim(stem: &str, ext: &str, taken: &mut HashSet<String>) -> String {
 
 /// Имя файла заметки `path` в архиве без расширения (файл — `<имя>.md`): сегменты —
 /// [`encode_segment`], первый символ `_` первого сегмента — `%5F` (служебные имена архива);
-/// второй и следующие пути, совпадающие с занятыми без учёта регистра (`Readme`/`README`) или
-/// с занятым каталогом, получают `~2`, `~3`, … Исходный путь пишется во frontmatter (`path`).
-/// `taken` — занятые имена архива в нижнем регистре (файлы и каталоги `<путь>/`); порядок
-/// вызовов решает, кто из пары «второй». Каталог, совпавший с ранее занятым файлом, не
-/// переименовывается — поэтому экспорт зовёт функцию от глубоких путей к мелким.
+/// второй и следующие пути, совпадающие с занятыми без учёта регистра и формы Unicode
+/// (`Readme`/`README`) или с занятым каталогом, получают `~2`, `~3`, … Исходный путь пишется во
+/// frontmatter (`path`). `taken` — занятые имена архива (ключи [`key`]: файлы и каталоги
+/// `<путь>/`); порядок вызовов решает, кто из пары «второй». Каталог, совпавший с ранее занятым
+/// файлом, не переименовывается — поэтому экспорт зовёт функцию от глубоких путей к мелким.
 pub fn file_name_for(path: &str, taken: &mut HashSet<String>) -> String {
     let mut segs: Vec<String> = path.split('/').map(encode_segment).collect();
     if let Some(first) = segs.first_mut()
@@ -175,13 +221,22 @@ pub fn file_name_for(path: &str, taken: &mut HashSet<String>) -> String {
     name.strip_suffix(".md").unwrap_or(&name).to_string()
 }
 
-/// Путь файла вложения в архиве: `_attachments/<sha16>/<имя>`; имя (возможно, с `/` у файлов
-/// отчёта) — по сегментам [`encode_segment`], совпадение без учёта регистра — `~N` перед
-/// расширением.
+/// Путь файла вложения в архиве: `_attachments/<sha16>/<имя>`; имя — по сегментам
+/// [`encode_segment`] (имя с `/` запись не пропускает — `check_filename`; если такое всё же есть
+/// в базе, пустые сегменты отбрасываются: `a//b`, `/x`), совпадение без учёта регистра — `~N`
+/// перед расширением.
 pub fn attachment_file(sha256: &str, filename: &str, taken: &mut HashSet<String>) -> String {
     let sha16 = &sha256[..SHA_PREFIX.min(sha256.len())];
-    let enc: Vec<String> = filename.split('/').map(encode_segment).collect();
-    let enc = enc.join("/");
+    let segs: Vec<String> = filename
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(encode_segment)
+        .collect();
+    let enc = if segs.is_empty() {
+        "%5F".to_string()
+    } else {
+        segs.join("/")
+    };
     let last = enc.rfind('/').map_or(0, |i| i + 1);
     let (stem, ext) = match enc[last..].rfind('.') {
         Some(i) if i > 0 => enc.split_at(last + i),
@@ -204,34 +259,56 @@ pub fn front_matter(fields: &[(&str, serde_json::Value)]) -> String {
 }
 
 /// Отпечаток содержимого архива (см. модуль).
-pub struct Fingerprint(blake3::Hasher);
+pub struct Fingerprint {
+    outer: blake3::Hasher,
+    /// Текущий файл: имя, длина, хэш содержимого.
+    cur: Option<(String, u64, blake3::Hasher)>,
+}
 
 impl Default for Fingerprint {
     fn default() -> Self {
-        Fingerprint(blake3::Hasher::new())
+        Fingerprint {
+            outer: blake3::Hasher::new(),
+            cur: None,
+        }
     }
 }
 
 impl Fingerprint {
-    /// Начало файла `name` длиной `len`; затем — [`Fingerprint::update`] содержимым.
-    pub fn begin(&mut self, name: &str, len: u64) {
-        self.0.update(&(name.len() as u64).to_le_bytes());
-        self.0.update(name.as_bytes());
-        self.0.update(&len.to_le_bytes());
+    /// Начало файла `name`; затем [`Fingerprint::update`] содержимым и [`Fingerprint::end`].
+    pub fn begin(&mut self, name: &str) {
+        self.end();
+        self.cur = Some((name.to_string(), 0, blake3::Hasher::new()));
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
+        if let Some((_, len, h)) = &mut self.cur {
+            *len += data.len() as u64;
+            h.update(data);
+        }
+    }
+
+    /// Конец текущего файла (нет файла — ничего).
+    pub fn end(&mut self) {
+        if let Some((name, len, h)) = self.cur.take() {
+            self.outer.update(&(name.len() as u64).to_le_bytes());
+            self.outer.update(name.as_bytes());
+            self.outer.update(&len.to_le_bytes());
+            self.outer.update(h.finalize().as_bytes());
+        }
     }
 
     /// Файл целиком.
     pub fn file(&mut self, name: &str, data: &[u8]) {
-        self.begin(name, data.len() as u64);
+        self.begin(name);
         self.update(data);
+        self.end();
     }
 
-    pub fn hex(&self) -> String {
-        self.0.finalize().to_hex().to_string()
+    /// Отпечаток (текущий файл завершается).
+    pub fn hex(&mut self) -> String {
+        self.end();
+        self.outer.finalize().to_hex().to_string()
     }
 }
 
@@ -251,6 +328,32 @@ mod tests {
         assert_eq!(encode_segment("x."), "x%2E");
         assert_eq!(encode_segment("x. "), "x%2E%20");
         assert_eq!(encode_segment("обычное имя"), "обычное имя");
+        assert_eq!(encode_segment("COM0"), "COM0_");
+        assert_eq!(encode_segment("lpt0.log"), "lpt0_.log");
+        assert_eq!(encode_segment("CONIN$"), "CONIN$_");
+        assert_eq!(encode_segment("conout$.txt"), "conout$_.txt");
+        assert_eq!(encode_segment("COM10"), "COM10");
+    }
+
+    #[test]
+    fn long_segment_shortened_with_hash() {
+        let long = format!("{}.png", ":".repeat(100));
+        let e = encode_segment(&long);
+        assert!(e.len() <= SEGMENT_MAX, "{}", e.len());
+        assert!(e.ends_with(".png"), "{e}");
+        // разрез не посреди %XX
+        let head = e.split("~h").next().unwrap();
+        assert!(head.ends_with("%3A"), "{head}");
+        // разные исходные сегменты с общим началом — разные имена
+        let other = format!("{}x.png", ":".repeat(100));
+        assert_ne!(encode_segment(&other), e);
+        let cyr = encode_segment(&"я".repeat(150));
+        assert!(cyr.len() <= SEGMENT_MAX && cyr.contains("~h"), "{cyr}");
+        assert_eq!(encode_segment(&"a".repeat(200)), "a".repeat(200));
+        // файл заметки и каталог с длинным сегментом — в пределе 255 байт с `.md` и `~N`
+        let mut t = HashSet::new();
+        let n = file_name_for(&format!("{}/x", "я".repeat(200)), &mut t);
+        assert!(n.split('/').all(|s| s.len() <= SEGMENT_MAX), "{n}");
     }
 
     #[test]
@@ -264,6 +367,15 @@ mod tests {
         // файл «x.md» и каталог «x.md/»: глубокий путь первым — файл получает ~2
         assert_eq!(file_name_for("x.md/y", &mut t), "x.md/y");
         assert_eq!(file_name_for("x", &mut t), "x~2");
+    }
+
+    #[test]
+    fn nfc_and_nfd_collide() {
+        let mut t = HashSet::new();
+        let nfc = "\u{e9}t\u{e9}";
+        let nfd = "e\u{301}te\u{301}";
+        assert_eq!(file_name_for(nfc, &mut t), nfc);
+        assert_eq!(file_name_for(nfd, &mut t), format!("{nfd}~2"));
     }
 
     #[test]
@@ -285,6 +397,19 @@ mod tests {
         assert_eq!(
             attachment_file(sha, ".env", &mut t),
             "_attachments/0123456789abcdef/.env"
+        );
+        // пустые сегменты (имя из базы до проверки `check_filename`) схлопываются
+        assert_eq!(
+            attachment_file(sha, "c//d.txt", &mut t),
+            "_attachments/0123456789abcdef/c/d.txt"
+        );
+        assert_eq!(
+            attachment_file(sha, "/e.txt", &mut t),
+            "_attachments/0123456789abcdef/e.txt"
+        );
+        assert_eq!(
+            attachment_file(sha, "/", &mut t),
+            "_attachments/0123456789abcdef/%5F"
         );
     }
 
@@ -308,8 +433,9 @@ mod tests {
             fp(&[("a", b"1"), ("b", b"2")]),
             fp(&[("b", b"2"), ("a", b"1")])
         );
+        assert_ne!(fp(&[("a", b"")]), fp(&[]));
         let mut s = Fingerprint::default();
-        s.begin("a", 2);
+        s.begin("a");
         s.update(b"b");
         s.update(b"c");
         assert_eq!(s.hex(), fp(&[("a", b"bc")]));

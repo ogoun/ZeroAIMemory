@@ -101,8 +101,8 @@ pub use entries::{
     supersede_entry, title_duplicates, update_entry, validate_trigger,
 };
 pub use export::{
-    EntryDump, ExportSelect, NodeRevision, NoteAttachment, NoteDump, RefRow, SpaceDump,
-    export_space, under_prefix,
+    EntryDump, ExportSelect, NodeRevision, NoteAttachment, RefRow, SpaceReader, export_space,
+    under_prefix,
 };
 pub use file_refs::{
     ChangedFile, FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit,

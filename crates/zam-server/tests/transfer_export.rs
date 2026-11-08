@@ -526,16 +526,7 @@ async fn export_audit_written() {
     let r = export_tok(a, &o.tok, G, "").await;
     let z = Zip::of(&r);
     let space = z.manifest().space.to_string();
-    let r = a.adm(Method::GET, "/api/v1/admin/audit", None, None).await;
-    ok(&r, StatusCode::OK, "аудит");
-    let all = r.json();
-    let e = all["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["action"] == "space.export")
-        .unwrap_or_else(|| panic!("нет space.export: {all}"))
-        .clone();
+    let e = export_audits(a, 1).await.remove(0);
     assert_eq!(e["user_id"], json!(o.id));
     assert_eq!(e["target"], json!(space));
     assert_eq!(e["details"]["space"], json!(space));
@@ -548,7 +539,112 @@ async fn export_audit_written() {
         .map(|n| z.files[n].len())
         .sum();
     assert_eq!(e["details"]["bytes"], json!(bytes));
+    assert_eq!(e["details"]["complete"], json!(true));
     assert!(!e.to_string().contains("AUDIT-TEXT-MARK"));
+    // проверка `probe=true` аудита не пишет
+    let r = export_tok(a, &o.tok, G, "?probe=true").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    assert!(r.body.is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(export_audits(a, 1).await.len(), 1);
+}
+
+/// Записи аудита `space.export` (новые первыми); ждёт, пока их станет не меньше `n` (аудит
+/// пишется по окончании потока).
+async fn export_audits(a: &Api, n: usize) -> Vec<Value> {
+    for _ in 0..100 {
+        let r = a.adm(Method::GET, "/api/v1/admin/audit", None, None).await;
+        ok(&r, StatusCode::OK, "аудит");
+        let all: Vec<Value> = r.json()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "space.export")
+            .cloned()
+            .collect();
+        if all.len() >= n {
+            return all;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("нет {n} записей space.export");
+}
+
+/// Слоты экспорта заняты — 503 `/problems/busy` с `Retry-After` (и у `probe`); слот
+/// освободился — экспорт идёт. Слот держится до конца потока.
+#[tokio::test]
+async fn export_busy_when_slots_taken() {
+    let w = world("export-busy").await;
+    let (a, o) = (&w.a, &w.o);
+    note_as(a, &o.tok, G, "x", "x").await;
+    let n = zam_server::api::transfer::export::EXPORT_SLOTS as u32;
+    let held =
+        a.st.export_slots
+            .clone()
+            .acquire_many_owned(n)
+            .await
+            .unwrap();
+    for q in ["", "?probe=true"] {
+        let r = export_tok(a, &o.tok, G, q).await;
+        assert_eq!(
+            r.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{q}: {}",
+            r.text()
+        );
+        assert_eq!(r.header("retry-after"), "30");
+        assert_eq!(r.json()["type"], json!("/problems/busy"));
+    }
+    drop(held);
+    Zip::of(&export_tok(a, &o.tok, G, "").await);
+    // поток закончен — все слоты свободны
+    for _ in 0..100 {
+        if a.st.export_slots.available_permits() == n as usize {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(a.st.export_slots.available_permits(), n as usize);
+    // проверка прав — раньше слота: Human токену — 404 и при занятых слотах
+    let _held =
+        a.st.export_slots
+            .clone()
+            .acquire_many_owned(n)
+            .await
+            .unwrap();
+    let r = export_tok(a, &o.tok, "human", "?probe=true").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
+/// Связь на отчёт API не создаёт (422), но если такое ребро есть в базе, токену оно не
+/// выдаётся, сессии WebUI — выдаётся.
+#[tokio::test]
+async fn export_link_to_report_hidden_from_token() {
+    let w = world("export-replink").await;
+    let (a, o) = (&w.a, &w.o);
+    let rep = w.report("Отчёт").await;
+    let n = note_as(a, &o.tok, G, "заметка", "т").await;
+    let space = Zip::of(&export_tok(a, &o.tok, G, "").await)
+        .manifest()
+        .space;
+    let ts = zam_store::time::fmt_ts(zam_store::time::now());
+    let sql = format!(
+        "INSERT INTO edges (id, space_id, src_kind, src_id, dst_kind, dst_id, dst_space_id, type,
+                            origin, created_at)
+         VALUES ('{}', '{space}', 'node', '{n}', 'entry', '{rep}', '{space}', 'relates_to',
+                 'explicit', '{ts}')",
+        zam_core::Id::new()
+    );
+    w.db()
+        .await
+        .write(move |tx| Ok(tx.execute(&sql, [])?))
+        .await
+        .unwrap();
+    let z = Zip::of(&export_tok(a, &o.tok, G, "").await);
+    assert!(!z.files.contains_key("_links.jsonl"), "{:?}", z.names);
+    assert!(z.contains(&rep).is_empty());
+    let z = Zip::of(&export_web(a, o, G, "").await);
+    assert!(z.text("_links.jsonl").contains(&rep));
 }
 
 /// Фильтры: `paths` — заметки под префиксами (по целым сегментам), без журналов; `kinds` —

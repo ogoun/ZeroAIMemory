@@ -7145,6 +7145,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
  "windows",
  "windows-service",

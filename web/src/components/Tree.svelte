@@ -16,6 +16,7 @@
     ApiError,
     createNode,
     deleteNode,
+    exportProbe,
     exportUrl,
     listChildren,
     listSpaces,
@@ -238,9 +239,25 @@
         { label: 'Удалить', danger: true, action: () => askDelete(t, node) },
       );
     } else {
-      items.push({ label: 'Экспорт (.zip)', action: () => download(exportUrl(t.uid, spaceRef(t.space))) });
+      items.push({ label: 'Экспорт (.zip)', action: () => void exportSpace(t) });
     }
     return items;
+  }
+
+  const kExport = (u: string, ref: string) => `x|${u}|${ref}`;
+
+  /** Экспорт пространства: проверка (права, занятость сервера) с ошибкой текстом под строкой
+   * пространства, затем скачивание по ссылке — архив идёт браузером на диск, не в память. */
+  async function exportSpace(t: Target) {
+    const ref = spaceRef(t.space);
+    const k = kExport(t.uid, ref);
+    delete errs[k];
+    try {
+      await exportProbe(t.uid, ref);
+      download(exportUrl(t.uid, ref));
+    } catch (e) {
+      fail(k, e);
+    }
   }
 
   /** Скачивание по ссылке (архив экспорта): имя файла даёт `Content-Disposition` сервера. */
@@ -509,6 +526,7 @@
       </button>
       <button type="button" class="more" aria-label="Действия: {s.name}" onclick={(e) => menuBelow(e, target)}>⋯</button>
     </div>
+    {@render status(kExport(uid, ref))}
     {#if open[k]}
       {@const js = journalsOf(s.kind)}
       {#if s.kind === 'rules' && rules[uid]?.warning === 'rules_heavy'}

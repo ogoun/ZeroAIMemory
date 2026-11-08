@@ -211,3 +211,61 @@ fn cli_export_truncated_stream_keeps_target() {
     assert_eq!(std::fs::read(r.join("a.zip.part")).unwrap(), b"foreign");
     assert_eq!(parts(&r), vec!["a.zip.part"]);
 }
+
+/// Конец вложенного zip (несжатый `.docx` в конце обрезанного потока) — не конец архива: код 2,
+/// цели нет.
+#[test]
+fn cli_export_inner_zip_tail_rejected() {
+    // локальный заголовок внешнего архива, затем «docx»: пустой zip из одной записи конца
+    let (url, _) = common::stub(
+        200,
+        "PK\u{3}\u{4}outer-header-docx-data:PK\u{5}\u{6}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}",
+        Duration::ZERO,
+    );
+    let r = tmp("inner-repo");
+    let o = zam(&url, "t", &r, &["export", "-o", "a.zip"]);
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
+    assert!(stderr(&o).contains("архив не завершён"), "{}", stderr(&o));
+    assert!(!r.join("a.zip").exists());
+    assert!(parts(&r).is_empty(), "{:?}", parts(&r));
+}
+
+/// Сервер прислал заголовки и часть тела и замолчал (полуоткрытое соединение): через
+/// `ZAM_EXPORT_IDLE_SECS` — код 2, свой `.part` удалён, цели нет.
+#[test]
+fn cli_export_idle_watchdog() {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf);
+            let _ = c.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n4\r\nPK\x03\x04\r\n",
+            );
+            let _ = c.flush();
+            // молчим, соединение открыто
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    });
+    let r = tmp("idle-repo");
+    let t0 = std::time::Instant::now();
+    let o = common::zam_cmd()
+        .env("ZAM_URL", &url)
+        .env("ZAM_TOKEN", "t")
+        .env("HOME", &r)
+        .env("USERPROFILE", &r)
+        .env("ZAM_EXPORT_IDLE_SECS", "1")
+        .current_dir(&r)
+        .args(["export", "-o", "a.zip"])
+        .timeout(Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
+    assert!(t0.elapsed() < Duration::from_secs(20), "{:?}", t0.elapsed());
+    assert!(stderr(&o).contains("сервер молчит"), "{}", stderr(&o));
+    assert!(!r.join("a.zip").exists());
+    assert!(parts(&r).is_empty(), "{:?}", parts(&r));
+}

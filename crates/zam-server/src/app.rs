@@ -59,6 +59,9 @@ pub struct AppState {
     /// Карта кода (M5.6 §7): пересчёты рангов (single-flight на решение), слоты и кэш входов
     /// ранжирования с фокусом.
     pub code: Arc<api::code::CodeRuntime>,
+    /// Слоты экспорта пространства (M6 §12б.5): не больше
+    /// [`api::transfer::export::EXPORT_SLOTS`] одновременно, занято — 503 с `Retry-After`.
+    pub export_slots: Arc<tokio::sync::Semaphore>,
     /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
     /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
     #[cfg(feature = "test-hooks")]
@@ -322,6 +325,9 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         maintenance,
         glossary: Arc::default(),
         code: Arc::default(),
+        export_slots: Arc::new(tokio::sync::Semaphore::new(
+            api::transfer::export::EXPORT_SLOTS,
+        )),
         big_bodies: api::big_body::BigBodies::new(
             api::big_body::BIG_BODY_PERMITS,
             api::note_body_max(&cfg.limits),

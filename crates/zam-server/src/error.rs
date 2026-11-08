@@ -121,6 +121,10 @@ pub enum ApiError {
     /// ([`crate::api::big_body`]).
     #[error("сервер занят обработкой больших запросов — повторите позже")]
     Busy { retry_after_s: u64 },
+    /// 503 `/problems/busy` с `Retry-After`: заняты слоты экспорта пространства
+    /// ([`crate::api::transfer::export`], M6 §12б.5).
+    #[error("уже идут другие экспорты пространств — повторите позже")]
+    ExportBusy { retry_after_s: u64 },
     #[error("{0}")]
     Unavailable(String),
     /// 408 `/problems/timeout`: тело запроса не получено в срок ([`crate::api::big_body`]).
@@ -278,7 +282,7 @@ impl ApiError {
                 "/problems/rate-limited",
                 "Too Many Requests",
             ),
-            ApiError::Busy { .. } => (
+            ApiError::Busy { .. } | ApiError::ExportBusy { .. } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "/problems/busy",
                 "Service Unavailable",
@@ -404,7 +408,9 @@ impl IntoResponse for ApiError {
             HeaderValue::from_static("application/problem+json"),
         );
         match self {
-            ApiError::RateLimited { retry_after_s } | ApiError::Busy { retry_after_s } => {
+            ApiError::RateLimited { retry_after_s }
+            | ApiError::Busy { retry_after_s }
+            | ApiError::ExportBusy { retry_after_s } => {
                 h.insert(header::RETRY_AFTER, HeaderValue::from(retry_after_s));
             }
             // RFC 9110 §15.5.2: 401 обязан нести схему.
