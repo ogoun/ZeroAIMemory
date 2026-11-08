@@ -5271,3 +5271,33 @@ PASS.
 **Передать.** → 13a/13c: в CHANGELOG и ТЗ — маркер `cache/holdout-<сессия>` и полная тишина
 контрольной группы на клиенте, `--allow-missing` у `cargo xtask ab`, наследование `holdout`
 только в сторону `true`.
+
+### Повторное ревью задачи 12 — Minor (2026-11-09)
+
+Одобрено с четырьмя Minor, исправлены в этом круге: коммит `a388726` `fix(hooks): повторное
+ревью задачи 12 — метка только на первом старте, маркер по ответу сервера`.
+- **m1** `session_start.rs`: `POST /sessions {holdout}` — только на первом старте сессии,
+  `source` `startup | clear` (**[решение исполнителя]** `clear` у Claude Code — новый
+  `session_id`, то есть тоже первый старт); compact и resume берут флаг сервера из `/recall`.
+  Неудача метки на первом старте — `sessions(holdout): …` в `hooks.log`, сессия вне группы
+  (400 старого сервера — по-прежнему молча, §13). Тест `session_start_holdout_only_on_first_start`
+  (метка не успевает в срок — дайджест есть, строка в журнале; compact и resume — метка не
+  шлётся, маркера нет).
+- **m2–m3** `cache::note_holdout`: каждый успешный ответ (`/recall` `prompt`/`post-tool`,
+  `GET /sessions/{id}` у `checkpoint`) сверяет маркер с сервером — `holdout: true` ставит и
+  освежает время файла (уборка 7 суток его не снимет), `false` или нет поля — снимает;
+  `post-tool` сверяет на каждом ответе, а не только в группе. README — абзац о сверке. Тест
+  `holdout_marker_cleared_by_server_response` (метка снята — ответ `prompt`, а затем и `post-tool`
+  снимают маркер, подсказки возвращаются).
+- **m4** `checkpoint.rs`: после ожидания сигнала потока влияния очередь изменённых уходит новым
+  `env.client()` по остатку бюджета (нет времени — не уходит, «бюджет исчерпан» в журнале);
+  без потока влияния — прежним клиентом.
+
+Тесты: `zam-cli --test hooks` — 74 PASS; fmt, `clippy --workspace --all-targets -D warnings`,
+`clippy -p zam-cli --features test-hooks` — чисто. Откаты (`.tmp/m6/task12/rollback3.log`): R23
+(m1: метка на любом старте) → `session_start_holdout_only_on_first_start` FAIL; R24 (m2: маркер не
+снимается) → `holdout_marker_cleared_by_server_response` FAIL; дерево после откатов чистое.
+`hook_budgets` (m4 — горячий путь `checkpoint`; окно 01:47:15–01:48:38, из чужих — только
+простаивающий `cargo` 254868): `checkpoint` p50 24,1, p95 25,7, max 59,8 мс (бюджет 100),
+тайм-аутов 0, строк влияния 40/40; `session-start-holdout` p95 49,1, max 60,8, тишина;
+`session-start` p95 46,5; `post-tool` — 1 тайм-аут из 112 (≤ 5 %).
