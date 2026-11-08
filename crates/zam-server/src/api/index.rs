@@ -153,10 +153,11 @@ pub const RULES_HEAVY_L1_TOKENS: usize = 1500;
 /// L1 правил пространства Rules по снимку `(заметка, ревизия)`: полный `/index/status` WebUI
 /// запрашивает раз в 5 с, а L1 зависит только от текста ревизии — пока набор `(id, rev)` заметок
 /// пространства тот же, сумма берётся из кэша (точность прежняя: любая правка, перенос в Rules,
-/// удаление или восстановление меняют набор). Ключ — id пространства (ULID, уникален между базами);
+/// удаление или восстановление меняют набор; путь — в снимке: заголовок, повторяющий путь, L1 не
+/// входит, задача 8c). Ключ — id пространства (ULID, уникален между базами);
 /// в снимке — и `tokenizer_id` счётчика выдачи (повторное ревью 8b): после смены счётчика
 /// (оценка → токенизатор модели) сумма пересчитывается.
-type RulesSnapshot = (String, Vec<(Id, i64)>);
+type RulesSnapshot = (String, Vec<(Id, i64, String)>);
 static RULES_L1_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<Id, (RulesSnapshot, usize)>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -181,7 +182,10 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
             .collect();
         let snapshot: RulesSnapshot = (
             zam_store::budget_tokenizer_id(),
-            notes.iter().map(|n| (n.id, n.current_rev)).collect(),
+            notes
+                .iter()
+                .map(|n| (n.id, n.current_rev, n.path.clone()))
+                .collect(),
         );
         count = notes.len();
         let cached = RULES_L1_CACHE.lock().ok().and_then(|c| {
@@ -193,7 +197,7 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
             Some(t) => t,
             None => {
                 let mut sum = 0usize;
-                let mut seen: Vec<(Id, i64)> = Vec::with_capacity(notes.len());
+                let mut seen: Vec<(Id, i64, String)> = Vec::with_capacity(notes.len());
                 for n in &notes {
                     let (rev, text) = match node_content(db, n.id, None).await {
                         Ok(v) => v,
@@ -204,8 +208,8 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
                         }
                         Err(e) => return Err(e),
                     };
-                    seen.push((n.id, rev));
-                    sum += zam_store::count_tokens(&super::recall::rule_l1(&text).0);
+                    seen.push((n.id, rev, n.path.clone()));
+                    sum += zam_store::count_tokens(&super::recall::rule_l1(&text, &n.path).0);
                 }
                 // кэш — только если прочитано ровно то, что в снимке (без гонки с записью)
                 if seen == snapshot.1

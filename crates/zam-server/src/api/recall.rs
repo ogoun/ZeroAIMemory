@@ -2139,16 +2139,14 @@ async fn digest(
                 }
                 let certainty = certainty_str(n.certainty);
                 let reference = format!("n:{}", n.id);
-                let mut block = hint_line(
-                    "правило ",
-                    &n.path,
-                    &[certainty.as_deref().unwrap_or_default()],
-                    &reference,
-                );
+                // строка правила — `<путь> [надёжность] n:<id>`: под заголовком `### Правила`
+                // метка подсказки и слово «правило» лишние, как у строки L0 (задача 8c)
+                let mut block = rule_head(&n.path, certainty.as_deref(), &reference);
                 // текст правила целиком до `RULE_L1_TOKENS` (решение контролёра по ревью 8a:
                 // оглавление с первыми фразами секций теряло вторую фразу правила); длиннее —
-                // с «…» и строкой [`RULES_SHORT_NOTE`]; секреты маскируются, как в чанках и L0
-                let (summary, cut) = rule_l1(&text);
+                // с «…» и строкой [`RULES_SHORT_NOTE`]; секреты маскируются, как в чанках и L0;
+                // абзац — одной строкой, заголовок `# `, повторяющий путь, опущен (задача 8c)
+                let (summary, cut) = rule_l1(&text, &n.path);
                 for line in summary.lines().filter(|l| !l.trim().is_empty()) {
                     block.push_str("\n  ");
                     block.push_str(line.trim_end());
@@ -2765,14 +2763,108 @@ fn rule_body(text: &str) -> &str {
 
 /// L1 правила (M6 §8, решение контролёра по ревью 8a): текст правила с маскированными секретами
 /// до `budget_cap(RULE_L1_TOKENS)` (M6 §4.2: без модели — с запасом оценки); `true` — обрезан с
-/// «…». Тот же текст считает `GET /index/status` (`rules.l1_tokens`, `rules_heavy`).
-pub(crate) fn rule_l1(text: &str) -> (String, bool) {
+/// «…». Обвязка без потери смысла (задача 8c): строки абзаца — одной строкой ([`unwrap_lines`]),
+/// первый заголовок `# `, слова которого все есть в пути правила, опущен ([`heading_repeats`]).
+/// Тот же текст считает `GET /index/status` (`rules.l1_tokens`, `rules_heavy`).
+pub(crate) fn rule_l1(text: &str, path: &str) -> (String, bool) {
     let body = zam_markdown::mask_text(rule_body(text));
+    let body = unwrap_lines(body.trim());
+    let body = match body.split_once('\n') {
+        Some((first, rest)) if heading_repeats(first, path) => rest.trim_start().to_string(),
+        None if heading_repeats(&body, path) => String::new(),
+        _ => body,
+    };
     truncate_marked(
         body.trim(),
         zam_store::budget_cap(RULE_L1_TOKENS),
         &count_tokens,
     )
+}
+
+/// Строка правила раздела Rules: `<путь> [надёжность] n:<id>` — без метки подсказки и слова
+/// «правило» (под заголовком `### Правила` они лишние; так же у строки L0, [`rule_l0_block`]).
+fn rule_head(path: &str, certainty: Option<&str>, reference: &str) -> String {
+    hint_line("", path, &[certainty.unwrap_or_default()], reference)
+        .trim_start_matches(HINT_PREFIX)
+        .trim_start()
+        .to_string()
+}
+
+/// Заголовок `# …` повторяет путь правила: все его слова (буквы и цифры, без регистра) есть среди
+/// слов пути (`process/code-review` — `code`, `review`). Такой заголовок — обвязка: путь в строке
+/// правила уже называет его.
+fn heading_repeats(line: &str, path: &str) -> bool {
+    let Some(h) = line.strip_prefix("# ") else {
+        return false;
+    };
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let p = words(path);
+    let hw = words(h);
+    !hw.is_empty() && hw.iter().all(|w| p.contains(w))
+}
+
+/// Абзацы Markdown — одной строкой (задача 8c): мягкий перенос внутри абзаца — пробел (так его и
+/// читает Markdown), пустые строки между блоками опускаются. Не склеиваются: заголовки, элементы
+/// списков, цитаты, таблицы, строки с отступом от 4 пробелов, строки с жёстким переносом (два
+/// пробела или `\` в конце) и всё внутри блока кода ```/~~~ — они остаются отдельными строками
+/// как есть.
+fn unwrap_lines(text: &str) -> String {
+    let starts_block = |l: &str| {
+        let t = l.trim_start();
+        let lead = l.len() - t.len();
+        lead >= 4
+            || t.starts_with('#')
+            || t.starts_with('>')
+            || t.starts_with('|')
+            || t.starts_with("```")
+            || t.starts_with("~~~")
+            || ["- ", "* ", "+ "].iter().any(|m| t.starts_with(m))
+            || {
+                let d = t.bytes().take_while(u8::is_ascii_digit).count();
+                d > 0 && matches!(t.as_bytes().get(d..d + 2), Some([b'.' | b')', b' ']))
+            }
+    };
+    let mut out: Vec<String> = Vec::new();
+    // последняя строка открыта для продолжения абзаца
+    let mut open = false;
+    let mut fence: Option<&str> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(f) = fence {
+            out.push(line.trim_end().to_string());
+            if t.starts_with(f) {
+                fence = None;
+            }
+            continue;
+        }
+        if t.is_empty() {
+            open = false;
+            continue;
+        }
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fence = Some(&t[..3]);
+            out.push(line.trim_end().to_string());
+            open = false;
+            continue;
+        }
+        let hard = line.ends_with("  ") || line.ends_with('\\');
+        if open && !starts_block(line) {
+            let last = out.last_mut().expect("открытая строка есть");
+            last.push(' ');
+            last.push_str(line.trim());
+        } else {
+            out.push(line.trim_end().to_string());
+        }
+        // заголовок и строка таблицы абзац не продолжают; элемент списка — продолжает (ленивое
+        // продолжение Markdown)
+        open = !hard && !t.starts_with('#') && !t.starts_with('|');
+    }
+    out.join("\n")
 }
 
 /// Приоритет правил (ревью 8a, I1; M6 §8): надёжность (`axiom` → `theorem` → прочие), затем
@@ -4397,6 +4489,43 @@ mod tests {
         let long = "слово ".repeat(80);
         let out = rule_l0_phrase(&long, 10);
         assert!(out.ends_with('…') && count_tokens(&out) <= 10, "{out}");
+    }
+
+    /// Задача 8c: абзац — одной строкой; списки, цитаты, таблицы, заголовки, жёсткий перенос и
+    /// блок кода — как есть; пустые строки опускаются.
+    #[test]
+    fn unwrap_lines_joins_paragraphs_only() {
+        let text = "# Заголовок\n\nПервая строка\nвторая строка.\n\n- пункт один\n  продолжение\n- пункт \
+                    два\n1. нумерованный\n> цитата\n| a | b |\n| c | d |\nжёсткий  \nперенос\n\n```\nкод\n\
+                    строка\n```\nхвост\nабзаца";
+        assert_eq!(
+            unwrap_lines(text),
+            "# Заголовок\nПервая строка вторая строка.\n- пункт один продолжение\n- пункт два\n\
+             1. нумерованный\n> цитата\n| a | b |\n| c | d |\nжёсткий\nперенос\n```\nкод\nстрока\n```\n\
+             хвост абзаца"
+        );
+    }
+
+    /// Задача 8c: заголовок опускается, только если все его слова есть в пути правила.
+    #[test]
+    fn rule_l1_drops_heading_repeating_path() {
+        assert!(heading_repeats("# Secrets", "security/secrets"));
+        assert!(heading_repeats("# Code review", "process/code-review"));
+        assert!(!heading_repeats("# Миграции базы", "backend/migrations"));
+        assert!(!heading_repeats("Secrets", "security/secrets"));
+        assert!(!heading_repeats("## Secrets", "security/secrets"));
+        let (t, cut) = rule_l1(
+            "---\nl0: x\n---\n# Secrets\n\nSecrets never go\ninto logs.\n",
+            "security/secrets",
+        );
+        assert_eq!((t.as_str(), cut), ("Secrets never go into logs.", false));
+        let (t, _) = rule_l1(
+            "# Миграции базы\n\nТолько\nдобавляют.\n",
+            "backend/migrations",
+        );
+        assert_eq!(t, "# Миграции базы\nТолько добавляют.");
+        // правило из одного заголовка, повторяющего путь, — пустой текст
+        assert_eq!(rule_l1("# Tests\n", "process/tests").0, "");
     }
 
     #[test]

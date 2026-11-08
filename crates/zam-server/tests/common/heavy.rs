@@ -625,13 +625,17 @@ pub fn shape(text: &str, w: &World) -> String {
         .nth(1)
         .map(|r| r.split("\n\n").next().unwrap_or_default())
         .unwrap_or_default();
-    let l1 = rules
-        .lines()
-        .filter(|l| l.starts_with("ZeroAIMemory: правило "))
-        .count();
-    let l0: Vec<&str> = rules
-        .lines()
-        .filter(|l| !l.starts_with("ZeroAIMemory:") && !l.starts_with(' ') && l.contains(" n:"))
+    // строка правила (`<путь> n:<id>`, задача 8c) — L1, если под ней текст с отступом, иначе L0
+    let lines: Vec<&str> = rules.lines().collect();
+    let head = |k: usize| {
+        let l = lines[k];
+        !l.starts_with("ZeroAIMemory:") && !l.starts_with(' ') && l.contains(" n:")
+    };
+    let has_body = |k: usize| lines.get(k + 1).is_some_and(|n| n.starts_with(' '));
+    let l1 = (0..lines.len()).filter(|&k| head(k) && has_body(k)).count();
+    let l0: Vec<&str> = (0..lines.len())
+        .filter(|&k| head(k) && !has_body(k))
+        .map(|k| lines[k])
         .collect();
     let cut = l0.iter().filter(|l| l.contains('…')).count();
     let traps = w

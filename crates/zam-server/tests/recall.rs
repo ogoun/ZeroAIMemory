@@ -109,9 +109,11 @@ fn ids(j: &Value) -> Vec<String> {
 }
 
 /// Каждая строка подсказки начинается с `ZeroAIMemory:` и несёт свою ссылку; строка-индекс
-/// (M6 §8: changelog, revisit) — начинается со ссылки.
+/// (M6 §8: changelog, revisit) — начинается со ссылки; строка правила под `### Правила` —
+/// `<путь> … n:<id>` без метки (задача 8c).
 fn assert_marked(j: &Value) {
     let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила");
     for id in ids(j) {
         let index = format!("{id} «");
         let line = text
@@ -119,7 +121,9 @@ fn assert_marked(j: &Value) {
             .find(|l| l.ends_with(&format!(" {id}")) || l.starts_with(&index))
             .unwrap_or_else(|| panic!("нет строки {id}: {text}"));
         assert!(
-            line.starts_with("ZeroAIMemory: ") || line.starts_with(&index),
+            line.starts_with("ZeroAIMemory: ")
+                || line.starts_with(&index)
+                || rules.iter().any(|r| r == line),
             "{line}"
         );
     }
@@ -2256,8 +2260,8 @@ async fn rules_priority_not_alphabetical() {
         "{text}"
     );
     // вывод — по пути
-    let a_pos = text.find("правило a/п00").unwrap();
-    let s_pos = text.find("правило security/secrets").unwrap();
+    let a_pos = text.find("\na/п00 ").unwrap();
+    let s_pos = text.find("\nsecurity/secrets ").unwrap();
     assert!(a_pos < s_pos, "{text}");
 }
 
@@ -2360,7 +2364,7 @@ async fn short_l1_rule_stays_l1() {
     // 19 правил мира и короткое — все 20 на месте
     assert!(ids.iter().all(|r| text.contains(r.as_str())), "{text}");
     // короткое правило — L1 (строка правила и текст правила под ней)
-    let l1 = format!("ZeroAIMemory: правило zz/коротко n:{short}\n  # К\n  Одна фраза правила.");
+    let l1 = format!("zz/коротко n:{short}\n  # К\n  Одна фраза правила.");
     assert!(text.contains(&l1), "короткое правило не L1: {text}");
     // урезаны другие правила
     assert!(text.contains("— Кратко о правиле"), "{text}");
