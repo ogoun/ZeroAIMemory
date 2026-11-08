@@ -1965,3 +1965,32 @@ async fn restore_repeated_failures_single_pre_restore() {
             .is_file()
     );
 }
+
+/// P4: сборку, лок которой держит живой процесс копии, чистильщик не трогает даже старой; с
+/// освобождённым локом (копия умерла) — удаляет сразу.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_keeps_live_stage_removes_dead() {
+    let (a, _) = seeded("bk-live-stage").await;
+    let cfg = cfg_of(&a);
+    let copies = cfg.backup.dir(&cfg.data_dir);
+    let live = copies.join("2026-01-02_000000.partial");
+    let dead = copies.join("2026-01-03_000000.partial");
+    for d in [&live, &dead] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join(".zam-building"), b"").unwrap();
+    }
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(live.join(".zam-building"))
+        .unwrap();
+    fs4::FileExt::lock(&lock).unwrap();
+    run_backup(&cfg, BackupOpts::default()).await.unwrap();
+    assert!(live.is_dir(), "живая сборка удалена");
+    assert!(!dead.exists(), "брошенная сборка осталась");
+    fs4::FileExt::unlock(&lock).unwrap();
+    drop(lock);
+    run_backup(&cfg, BackupOpts::default()).await.unwrap();
+    assert!(!live.exists(), "сборка с освобождённым локом осталась");
+    stop(a).await;
+}

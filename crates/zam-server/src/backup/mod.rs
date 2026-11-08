@@ -410,15 +410,68 @@ fn copy_name(dir: &Path, now: jiff::Timestamp) -> String {
         .expect("бесконечный ряд")
 }
 
-/// Удаляет брошенную сборку `p` (каталог или файл) старше `max_age`: её оставил прерванный
-/// `backup` (более свежую может собирать параллельная копия).
-fn remove_stale(p: &Path, max_age: Duration) {
-    let old = std::fs::symlink_metadata(p)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|a| a > max_age);
-    if !old {
+/// Файл-лок сборки копии внутри `<сборка>.partial/`: пока `backup` жив, он держит на нём
+/// исключительный лок ОС (снимается ОС при любой смерти процесса).
+const STAGE_LOCK: &str = ".zam-building";
+
+/// Лок сборки копии; при уничтожении лок снимается и файл удаляется (до переименования или
+/// удаления сборки — в копию он не попадает).
+struct StageLock {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl StageLock {
+    fn take(stage: &Path) -> std::io::Result<StageLock> {
+        let path = stage.join(STAGE_LOCK);
+        let file = std::fs::File::create(&path)?;
+        fs4::FileExt::lock(&file)?;
+        Ok(StageLock {
+            path,
+            file: Some(file),
+        })
+    }
+}
+
+impl Drop for StageLock {
+    fn drop(&mut self) {
+        if let Some(f) = self.file.take() {
+            let _ = fs4::FileExt::unlock(&f);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Сборку `stage` сейчас собирает живой `backup`: лок её файла-лока занят.
+fn stage_alive(stage: &Path) -> Option<bool> {
+    let f = std::fs::File::open(stage.join(STAGE_LOCK)).ok()?;
+    Some(match fs4::FileExt::try_lock(&f) {
+        Ok(()) => {
+            let _ = fs4::FileExt::unlock(&f);
+            false
+        }
+        Err(_) => true,
+    })
+}
+
+/// Удаляет брошенную сборку `p` (каталог `*.partial` или `<архив>.tmp`). Решение — по локу
+/// сборки ([`STAGE_LOCK`]): лок занят — сборку собирает живая копия, свободен — копия умерла.
+/// Сборка без файла-лока (не успел появиться, копия старой версии) — только старше `max_age`
+/// **[решение исполнителя, ревью P4]**. `lock_of` — каталог сборки, чей лок решает
+/// (у `<архив>.tmp` — `<архив>.partial`).
+fn remove_stale(p: &Path, lock_of: &Path, max_age: Duration) {
+    let old = || {
+        std::fs::symlink_metadata(p)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|a| a > max_age)
+    };
+    let abandoned = match stage_alive(lock_of) {
+        Some(alive) => !alive,
+        None => old(),
+    };
+    if !abandoned {
         return;
     }
     let r = if p.is_dir() {
@@ -446,7 +499,8 @@ fn clean_partials(dir: &Path, max_age: Duration) {
             .strip_suffix(".partial")
             .is_some_and(|n| copy_time(n).is_some())
         {
-            remove_stale(&e.path(), max_age);
+            let p = e.path();
+            remove_stale(&p, &p, max_age);
         }
     }
 }
@@ -454,27 +508,54 @@ fn clean_partials(dir: &Path, max_age: Duration) {
 /// Брошенная сборка архива `zip`: только `<архив>.partial` и `<архив>.tmp` (любое расширение
 /// архива) — каталог архива может быть чужим.
 fn clean_zip_leftovers(zip: &Path, max_age: Duration) {
-    for suffix in [".partial", ".tmp"] {
+    let with = |suffix: &str| {
         let mut s = zip.as_os_str().to_owned();
         s.push(suffix);
-        let p = PathBuf::from(s);
-        if p.exists() {
-            remove_stale(&p, max_age);
+        PathBuf::from(s)
+    };
+    let (partial, tmp) = (with(".partial"), with(".tmp"));
+    // `.tmp` пишется, пока сборка `.partial` жива и залочена; сборки нет — `.tmp` брошен
+    if tmp.exists() {
+        if partial.exists() {
+            remove_stale(&tmp, &partial, max_age);
+        } else {
+            remove_stale(&tmp, &tmp, Duration::ZERO);
         }
+    }
+    if partial.exists() {
+        remove_stale(&partial, &partial, max_age);
     }
 }
 
+/// Суммарное ожидание повторов [`rename_retry`].
+const RENAME_RETRY_TOTAL: Duration = Duration::from_secs(10);
+
 /// `rename` с повтором на Windows: антивирус и индексатор ненадолго держат только что
-/// записанные файлы (`ERROR_ACCESS_DENIED` 5, `ERROR_SHARING_VIOLATION` 32) — до 10 попыток с
-/// паузой 200 мс. На других ОС — одна попытка.
+/// записанные файлы (`ERROR_ACCESS_DENIED` 5, `ERROR_SHARING_VIOLATION` 32). Паузы растут
+/// вдвое от 50 мс, пока сумма не превысит [`RENAME_RETRY_TOTAL`]; каждая — WARN с номером
+/// попытки и кодом. На других ОС — одна попытка.
 pub(crate) fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut tries = 0;
+    let (mut attempt, mut pause, mut waited) = (1u32, Duration::from_millis(50), Duration::ZERO);
     loop {
         match std::fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32)) && tries < 9 => {
-                tries += 1;
-                std::thread::sleep(Duration::from_millis(200));
+            Err(e)
+                if cfg!(windows)
+                    && matches!(e.raw_os_error(), Some(5 | 32))
+                    && waited + pause <= RENAME_RETRY_TOTAL =>
+            {
+                tracing::warn!(
+                    from = %from.display(),
+                    to = %to.display(),
+                    attempt,
+                    code = e.raw_os_error().unwrap_or_default(),
+                    pause_ms = pause.as_millis() as u64,
+                    "переименование не удалось (файл занят), повтор"
+                );
+                std::thread::sleep(pause);
+                waited += pause;
+                pause *= 2;
+                attempt += 1;
             }
             Err(e) => return Err(e),
         }
@@ -607,6 +688,7 @@ pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, Bac
     }
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)?;
+    let stage_lock = StageLock::take(&stage)?;
     // при своём локе сервера нет — признак не нужен
     let flag = if own { None } else { hold_flag(root) };
     if flag.is_some() {
@@ -616,11 +698,19 @@ pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, Bac
     let staged = match res {
         Ok(s) => s,
         Err((e, missing)) => {
+            drop(stage_lock);
             fail_stage(&stage, &target, missing);
             return Err(e);
         }
     };
-    let finished = finish(&staged, &stage, &target, opts.zip.as_deref(), root);
+    let finished = finish(
+        &staged,
+        &stage,
+        &target,
+        opts.zip.as_deref(),
+        root,
+        stage_lock,
+    );
     let (path, bytes) = match finished {
         Ok(v) => v,
         Err(e) => {
@@ -648,6 +738,7 @@ fn finish(
     target: &Path,
     zip: Option<&Path>,
     root: &Path,
+    lock: StageLock,
 ) -> Result<(PathBuf, u64), BackupError> {
     let text = serde_json::to_string_pretty(&staged.manifest).map_err(std::io::Error::other)?;
     {
@@ -658,13 +749,17 @@ fn finish(
     sync_dir(stage)?;
     match zip {
         Some(z) => {
+            // сборка залочена, пока пишется `<архив>.tmp`: чистильщик его не тронет
             let r = write_zip(stage, &staged.manifest, z, root);
+            drop(lock);
             let _ = std::fs::remove_dir_all(stage);
             r?;
             restrict_tree(z)?;
             Ok((z.to_path_buf(), std::fs::metadata(z)?.len()))
         }
         None => {
+            // файл-лок — не часть копии: снимается до переименования
+            drop(lock);
             restrict_tree(stage)?;
             rename_retry(stage, target)?;
             if let Some(d) = target.parent() {

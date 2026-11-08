@@ -334,20 +334,30 @@ fn nonempty(root: &Path) -> bool {
 }
 
 /// Признак незавершённого восстановления: пишется до первого изменения каталога данных и
-/// хранит каталог прежних данных (`moved_to <путь>`) — повтор после сбоя дописывает в него.
+/// хранит каталог прежних данных — имя внутри `backups/` (`moved_to pre-restore-…`, только
+/// ASCII: путь каталога данных в признак не попадает и не теряется на не-UTF-8). Повтор после
+/// сбоя дописывает в него. Запись — во временный файл, `fsync`, переименование поверх
+/// признака: прежний признак не усекается на месте и не пропадает при сбое посреди записи.
 fn mark_incomplete(root: &Path, moved_to: Option<&Path>) -> std::io::Result<()> {
     let p = root.join(zam_store::RESTORE_INCOMPLETE_FILE);
-    let mut f = std::fs::File::create(&p)?;
-    writeln!(
-        f,
-        "restore {} {}",
-        std::process::id(),
-        zam_store::time::now()
-    )?;
-    if let Some(m) = moved_to {
-        writeln!(f, "moved_to {}", m.display())?;
+    let tmp = root.join(format!("{}.tmp", zam_store::RESTORE_INCOMPLETE_FILE));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        writeln!(
+            f,
+            "restore {} {}",
+            std::process::id(),
+            zam_store::time::now()
+        )?;
+        if let Some(name) = moved_to
+            .and_then(|m| m.file_name())
+            .and_then(|n| n.to_str())
+        {
+            writeln!(f, "moved_to {name}")?;
+        }
+        f.sync_all()?;
     }
-    f.sync_all()?;
+    super::rename_retry(&tmp, &p)?;
     super::sync_dir(root)
 }
 
@@ -356,7 +366,8 @@ fn incomplete_moved_to(root: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(root.join(zam_store::RESTORE_INCOMPLETE_FILE)).ok()?;
     text.lines()
         .find_map(|l| l.strip_prefix("moved_to "))
-        .map(PathBuf::from)
+        .filter(|n| n.starts_with("pre-restore-") && !n.contains(['/', '\\']))
+        .map(|n| root.join("backups").join(n))
         .filter(|p| p.is_dir())
 }
 
