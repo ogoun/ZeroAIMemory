@@ -11,7 +11,14 @@ use crate::error::ApiError;
 /// сборка ветки M6; задача M6, которая вводит ключ конфигурации или возможность, добавляет сюда
 /// её строку (`budget`, `snippet`, `focus`, `digest`, `hint_thresholds`, `kind_boost`,
 /// `attach_weight`, `snapshot` — таблица `KEYS` в `xtask/src/eval/caps.rs`).
-pub const FEATURES: &[&str] = &["m6", "budget", "snippet", "focus", "digest"];
+pub const FEATURES: &[&str] = &[
+    "m6",
+    "budget",
+    "snippet",
+    "focus",
+    "digest",
+    "hint_thresholds",
+];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {
     Json(json!({

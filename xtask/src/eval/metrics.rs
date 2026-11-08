@@ -321,6 +321,32 @@ pub fn paired_ratio_diff(
     b_num: &[f64],
     b_den: &[f64],
 ) -> Option<Estimate> {
+    paired_ratio_q(a_num, a_den, b_num, b_den, BOOTSTRAP, (0.025, 0.975))
+}
+
+/// [`paired_ratio_diff`] с **односторонними** 95 % границами (`lo` — 5-й перцентиль, `hi` —
+/// 95-й) и `samples` выборками (M6 §3.5: 10 000, правило «нижняя граница ≥ −0,02»; сетки порогов
+/// подсказок §9).
+pub fn paired_ratio_diff_one_sided(
+    a_num: &[f64],
+    a_den: &[f64],
+    b_num: &[f64],
+    b_den: &[f64],
+    samples: usize,
+) -> Option<Estimate> {
+    paired_ratio_q(a_num, a_den, b_num, b_den, samples, (0.05, 0.95))
+}
+
+/// Разность отношений сумм, бутстреп `samples` выборок (зерно [`SEED`]), перцентили `q` =
+/// (нижний, верхний).
+fn paired_ratio_q(
+    a_num: &[f64],
+    a_den: &[f64],
+    b_num: &[f64],
+    b_den: &[f64],
+    samples: usize,
+    q: (f64, f64),
+) -> Option<Estimate> {
     let n = a_num.len();
     assert!(
         a_den.len() == n && b_num.len() == n && b_den.len() == n,
@@ -339,8 +365,8 @@ pub fn paired_ratio_diff(
         });
     }
     let mut rng = Rng(SEED);
-    let mut d: Vec<f64> = Vec::with_capacity(BOOTSTRAP);
-    for _ in 0..BOOTSTRAP {
+    let mut d: Vec<f64> = Vec::with_capacity(samples);
+    for _ in 0..samples {
         let (mut an, mut ad, mut bn, mut bd) = (0.0, 0.0, 0.0, 0.0);
         for _ in 0..n {
             let i = rng.below(n);
@@ -356,8 +382,8 @@ pub fn paired_ratio_diff(
     d.sort_by(f64::total_cmp);
     Some(Estimate {
         mean: m,
-        lo: percentile(&d, 0.025),
-        hi: percentile(&d, 0.975),
+        lo: percentile(&d, q.0),
+        hi: percentile(&d, q.1),
     })
 }
 

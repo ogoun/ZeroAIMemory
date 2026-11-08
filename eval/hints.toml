@@ -173,6 +173,80 @@ scope = "solution"
 title = "LNK1104 cannot open file in target: antivirus holds freshly built files"
 body = "fatal error LNK1104: cannot open file under target\\debug appears when real-time antivirus scanning locks the file the linker just wrote. Exclude the target directory and the cargo cache from scanning."
 
+# ---- M6 §9 (задача 9): классы ошибок — сборка, тесты, git, кодировки, сеть; без триггеров ----
+
+[[insight]]
+key = "h18-py-charmap"
+lang = "en"
+kind = "failure"
+scope = "global"
+title = "UnicodeDecodeError: 'charmap' codec can't decode byte when Python reads a file on Windows"
+body = "Python on Windows opens text files in the ANSI code page by default, so UTF-8 input fails with a charmap codec error. Pass encoding='utf-8' to open() or set PYTHONUTF8=1 for the process."
+
+[[insight]]
+key = "h19-git-autocrlf"
+lang = "en"
+kind = "gotcha"
+scope = "solution"
+title = "warning: LF will be replaced by CRLF — core.autocrlf rewrites line endings"
+body = "With core.autocrlf=true Git converts line endings on checkout and commit, and scripts break. The repository pins eol in .gitattributes; set core.autocrlf=false for this clone."
+
+[[insight]]
+key = "h20-git-index-lock"
+lang = "en"
+kind = "failure"
+scope = "global"
+title = "Unable to create index.lock: File exists — another git process holds the lock"
+body = "A crashed git command or the editor's git integration left .git/index.lock behind. Make sure no git process is running, then delete the stale index.lock file."
+
+[[insight]]
+key = "h21-proxy-ca"
+lang = "en"
+kind = "gotcha"
+scope = "global"
+title = "SSL certificate problem: unable to get local issuer certificate behind the corporate proxy"
+body = "The corporate proxy re-signs TLS traffic with its own root certificate. Add the proxy root CA to the system store and point CARGO_HTTP_CAINFO or the npm cafile at it; never disable certificate verification."
+
+[[insight]]
+key = "h22-cargo-net-retry"
+lang = "en"
+kind = "gotcha"
+scope = "global"
+title = "Cargo fetch times out: spurious network error on the crates.io index"
+body = "Over a slow proxy the sparse index download times out even though cargo retries spurious network errors. Set CARGO_NET_RETRY=10 and CARGO_HTTP_TIMEOUT=120 instead of switching to the git index."
+
+[[insight]]
+key = "h23-test-conn-refused"
+lang = "en"
+kind = "failure"
+scope = "solution"
+title = "Integration tests fail with connection refused when the test server is not ready yet"
+body = "Tests that connect right after spawning the server get connection refused (os error 10061 on Windows, ECONNREFUSED on Linux). Wait for the health endpoint instead of a fixed sleep."
+
+[[insight]]
+key = "h24-tests-shared-dir"
+lang = "ru"
+kind = "failure"
+scope = "solution"
+title = "Тесты с общим каталогом данных падают при параллельном запуске"
+body = "Тесты, которые пишут в один и тот же каталог, мешают друг другу: «Отказано в доступе» и «процесс не может получить доступ к файлу, так как этот файл занят другим процессом». Каждому тесту — свой каталог в target, а не --test-threads=1."
+
+[[insight]]
+key = "h25-msvc-linker"
+lang = "en"
+kind = "failure"
+scope = "global"
+title = "linker link.exe not found: the MSVC build tools are missing"
+body = "error: linker `link.exe` not found means the Visual Studio Build Tools with the C++ workload are not installed or the developer environment is not loaded. Install the workload, then rerun cargo build."
+
+[[insight]]
+key = "h26-console-cp866"
+lang = "ru"
+kind = "gotcha"
+scope = "global"
+title = "Вывод консоли Windows с кириллицей превращается в кракозябры"
+body = "Кодовая страница консоли 866 не совпадает с UTF-8 вывода программы. Перед запуском — chcp 65001 и [Console]::OutputEncoding = [Text.Encoding]::UTF8."
+
 # ======================= заметки Rules (prompt, дайджест session_start) =======================
 
 [[rule]]
@@ -417,6 +491,148 @@ input = "выведи список файлов, изменённых в пос�
 expected = []
 note = "трудный: коммит, но не оформление"
 
+# ---- M6 §9 (задача 9): дополнительные случаи prompt (сетка порога FTS-only) ----
+
+[[case]]
+id = "p-31"
+event = "prompt"
+input = "почему консоль Windows показывает кракозябры вместо кириллицы"
+expected = ["insight:h26-console-cp866"]
+note = "кодировки, M6"
+
+[[case]]
+id = "p-32"
+event = "prompt"
+input = "Python on Windows fails with UnicodeDecodeError charmap when reading a CSV"
+expected = ["insight:h18-py-charmap"]
+note = "кодировки, M6"
+
+[[case]]
+id = "p-33"
+event = "prompt"
+input = "git warns that LF will be replaced by CRLF, which setting should I change"
+expected = ["insight:h19-git-autocrlf"]
+note = "git, M6"
+
+[[case]]
+id = "p-34"
+event = "prompt"
+input = "cargo cannot download crates through the corporate proxy: SSL certificate problem"
+expected = ["insight:h21-proxy-ca", "insight:h22-cargo-net-retry"]
+note = "сеть, M6: обе записи о прокси"
+
+[[case]]
+id = "p-35"
+event = "prompt"
+input = "integration tests get connection refused right after starting the test server"
+expected = ["insight:h23-test-conn-refused"]
+note = "тесты, M6"
+
+[[case]]
+id = "p-36"
+event = "prompt"
+input = "set statement_timeout for queries behind pgbouncer"
+expected = ["insight:k07-t", "insight:k07-n"]
+note = "M6: ловушка и наблюдение одной темы"
+
+[[case]]
+id = "p-37"
+event = "prompt"
+input = "как проверить, что резервная копия базы действительно восстанавливается"
+expected = ["insight:c13-b"]
+note = "M6: действующая запись цепочки"
+
+[[case]]
+id = "p-38"
+event = "prompt"
+input = "what synchronous mode should the WAL index database use"
+expected = ["insight:c03-b"]
+note = "M6: действующая запись цепочки"
+
+[[case]]
+id = "p-39"
+event = "prompt"
+input = "restore a Qdrant collection snapshot without restarting the server"
+expected = ["insight:c04-b"]
+note = "M6: действующая запись цепочки"
+
+[[case]]
+id = "p-40"
+event = "prompt"
+input = "белый экран после релиза: service worker отдаёт старый index.html"
+expected = ["insight:k04-t"]
+note = "M6: ловушка, смешанный язык"
+
+[[case]]
+id = "p-41"
+event = "prompt"
+input = "rename the variable count to total in this loop"
+expected = []
+note = "M6: рутинная правка"
+
+[[case]]
+id = "p-42"
+event = "prompt"
+input = "напиши хайку про осень"
+expected = []
+note = "M6: вопрос без памяти"
+
+[[case]]
+id = "p-43"
+event = "prompt"
+input = "добавь проверку email в форму регистрации"
+expected = []
+note = "M6: рутинная правка"
+
+[[case]]
+id = "p-44"
+event = "prompt"
+input = "convert this JSON snippet to YAML"
+expected = []
+note = "M6: вопрос без памяти"
+
+[[case]]
+id = "p-45"
+event = "prompt"
+input = "сделай кнопку оформления заказа синей"
+expected = []
+note = "M6: UI"
+
+[[case]]
+id = "p-46"
+event = "prompt"
+input = "explain the difference between let and const in JavaScript"
+expected = []
+note = "M6: вопрос без памяти"
+
+[[case]]
+id = "p-47"
+event = "prompt"
+input = "посчитай среднее значение массива цен"
+expected = []
+note = "M6: вопрос без памяти"
+
+[[case]]
+id = "p-48"
+event = "prompt"
+input = "update the copyright year in the license header"
+expected = []
+note = "M6: рутинная правка"
+
+[[case]]
+id = "p-49"
+event = "prompt"
+input = "почему тест сортировки падает на пустом списке"
+expected = []
+note = "M6, трудный: «тест», но не уведомления и не общий каталог"
+
+[[case]]
+id = "p-50"
+event = "prompt"
+input = "how do I center a div with flexbox"
+expected = []
+note = "M6: UI"
+
 # ======================= случаи: post_tool =======================
 
 [[case]]
@@ -586,6 +802,205 @@ event = "post_tool"
 input = "npm ERR! code ENOENT\nnpm ERR! syscall open\nnpm ERR! path C:\\work\\package.json"
 expected = []
 note = "трудный: npm ERR! code"
+
+# ---- M6 §9 (задача 9): корзины длины ошибки после normalize_error (≤ 3 слов, 4–8, 9–20,
+# > 20 — слова error_terms), классы — сборка, тесты, git, кодировки, сеть ----
+
+[[case]]
+id = "e-25"
+event = "post_tool"
+input = "npm ERR! ERESOLVE"
+expected = ["insight:h12-npm-eresolve"]
+note = "≤ 3, сборка: строгий FTS"
+
+[[case]]
+id = "e-26"
+event = "post_tool"
+input = "fatal: index.lock exists"
+expected = ["insight:h20-git-index-lock"]
+note = "≤ 3, git"
+
+[[case]]
+id = "e-27"
+event = "post_tool"
+input = "UnicodeDecodeError: 'charmap' codec"
+expected = ["insight:h18-py-charmap"]
+note = "≤ 3, кодировки"
+
+[[case]]
+id = "e-28"
+event = "post_tool"
+input = "connection refused (os error 10061)"
+expected = ["insight:h23-test-conn-refused"]
+note = "≤ 3, тесты/сеть"
+
+[[case]]
+id = "e-29"
+event = "post_tool"
+input = "link.exe missing"
+expected = ["insight:h25-msvc-linker"]
+note = "≤ 3, сборка"
+
+[[case]]
+id = "e-30"
+event = "post_tool"
+input = "консоль: кракозябры"
+expected = ["insight:h26-console-cp866"]
+note = "≤ 3, кодировки: другая форма слова (основы)"
+
+[[case]]
+id = "e-31"
+event = "post_tool"
+input = "Killed"
+expected = []
+note = "≤ 3, посторонняя (OOM killer)"
+
+[[case]]
+id = "e-32"
+event = "post_tool"
+input = "Permission denied"
+expected = []
+note = "≤ 3, трудный: permissions у h04"
+
+[[case]]
+id = "e-33"
+event = "post_tool"
+input = "Out of memory"
+expected = []
+note = "≤ 3, посторонняя"
+
+[[case]]
+id = "e-34"
+event = "post_tool"
+input = "Bus error"
+expected = []
+note = "≤ 3, посторонняя"
+
+[[case]]
+id = "e-35"
+event = "post_tool"
+input = "No space left on device"
+expected = []
+note = "≤ 3, посторонняя"
+
+[[case]]
+id = "e-36"
+event = "post_tool"
+input = "error: timed out"
+expected = []
+note = "≤ 3, трудный: «times out» у h22 (основы)"
+
+[[case]]
+id = "e-37"
+event = "post_tool"
+input = "error: failed to get `serde` as a dependency of package `app v0.1.0`\nCaused by: download of config.json failed: spurious network error: Timeout was reached"
+expected = ["insight:h22-cargo-net-retry"]
+note = "9–20, сеть: ослабленный FTS"
+
+[[case]]
+id = "e-38"
+event = "post_tool"
+input = "warning: in the working copy of 'scripts/build.sh', LF will be replaced by CRLF the next time Git touches it"
+expected = ["insight:h19-git-autocrlf"]
+note = "9–20, git/кодировки"
+
+[[case]]
+id = "e-39"
+event = "post_tool"
+input = "error[E0308]: mismatched types\n  --> src/lib.rs:12:5\n   |\n12 |     x + 1\n   |     ^^^^^ expected `String`, found integer\nhelp: try using a conversion method: `.to_string()`"
+expected = []
+note = "9–20, сборка: посторонняя"
+
+[[case]]
+id = "e-40"
+event = "post_tool"
+input = "java.lang.NullPointerException: Cannot invoke \"String.length()\" because \"name\" is null\n\tat com.shop.Cart.total(Cart.java:42)"
+expected = []
+note = "9–20, тесты: посторонняя"
+
+[[case]]
+id = "e-41"
+event = "post_tool"
+input = "Traceback (most recent call last):\n  File \"C:\\work\\tools\\import_orders.py\", line 18, in <module>\n    rows = list(csv.reader(f))\n  File \"C:\\Python312\\Lib\\encodings\\cp1252.py\", line 23, in decode\n    return codecs.charmap_decode(input,self.errors,decoding_table)[0]\nUnicodeDecodeError: 'charmap' codec can't decode byte 0x98 in position 2172: character maps to <undefined>"
+expected = ["insight:h18-py-charmap"]
+note = "> 20, кодировки: traceback"
+
+[[case]]
+id = "e-42"
+event = "post_tool"
+input = "   Compiling proc-macro2 v1.0.86\n   Compiling unicode-ident v1.0.12\nerror: linker `link.exe` not found\n  |\n  = note: program not found\n\nnote: the msvc targets depend on the msvc linker but `link.exe` was not found\n\nnote: please ensure that Visual Studio 2017 or later, or Build Tools for Visual Studio were installed with the Visual C++ option.\n\nerror: could not compile `proc-macro2` (build script) due to 1 previous error"
+expected = ["insight:h25-msvc-linker"]
+note = "> 20, сборка: вывод cargo build"
+
+[[case]]
+id = "e-43"
+event = "post_tool"
+input = "npm ERR! code UNABLE_TO_GET_ISSUER_CERT_LOCALLY\nnpm ERR! errno UNABLE_TO_GET_ISSUER_CERT_LOCALLY\nnpm ERR! request to https://registry.npmjs.org/react failed, reason: unable to get local issuer certificate\nnpm ERR! While fetching: react@18.3.1 over the configured proxy\n\nnpm ERR! A complete log of this run can be found in:\nnpm ERR!     C:\\Users\\dev\\AppData\\Local\\npm-cache\\_logs\\2026-11-08T10_15_02_118Z-debug-0.log"
+expected = ["insight:h21-proxy-ca"]
+note = "> 20, сеть: npm за прокси"
+
+[[case]]
+id = "e-44"
+event = "post_tool"
+input = "warning: in the working copy of 'web/src/App.tsx', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'web/src/main.ts', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'scripts/release.sh', LF will be replaced by CRLF the next time Git touches it\n[m6 4f2c1d9] chore: update build scripts\n 3 files changed, 41 insertions(+), 12 deletions(-)\nhint: run git config core.autocrlf to see the current setting"
+expected = ["insight:h19-git-autocrlf"]
+note = "> 20, git: вывод git add и commit"
+
+[[case]]
+id = "e-45"
+event = "post_tool"
+input = "running 12 tests\ntest api::orders_list ... FAILED\ntest api::health ... ok\n\nfailures:\n\n---- api::orders_list stdout ----\nthread 'api::orders_list' panicked at tests/api.rs:31:10:\ncalled `Result::unwrap()` on an `Err` value: reqwest::Error { kind: Request, url: \"http://127.0.0.1:18080/orders\", source: hyper::Error(Connect, ConnectError(\"tcp connect error\", Os { code: 10061, kind: ConnectionRefused, message: \"No connection could be made because the target machine actively refused it.\" })) }\n\ntest result: FAILED. 11 passed; 1 failed"
+expected = ["insight:h23-test-conn-refused"]
+note = "> 20, тесты: cargo test, первые 32 слова"
+
+[[case]]
+id = "e-46"
+event = "post_tool"
+input = "---- storage::tests::writes_snapshot stdout ----\nthread 'storage::tests::writes_snapshot' panicked at src/storage.rs:88:14:\ncalled `Result::unwrap()` on an `Err` value: Os { code: 32, kind: Uncategorized, message: \"Процесс не может получить доступ к файлу, так как этот файл занят другим процессом.\" }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nfailures:\n    storage::tests::writes_snapshot\n\ntest result: FAILED. 41 passed; 1 failed; 0 ignored"
+expected = ["insight:h24-tests-shared-dir"]
+note = "> 20, тесты: файл занят, русский текст ОС"
+
+[[case]]
+id = "e-47"
+event = "post_tool"
+input = "TypeError: Cannot read properties of undefined (reading 'items')\n    at CartView.render (webpack-internal:///./src/components/CartView.tsx:57:31)\n    at finishClassComponent (react-dom.development.js:19752:31)\n    at updateClassComponent (react-dom.development.js:19698:24)\n    at beginWork (react-dom.development.js:21611:16)\n    at HTMLUnknownElement.callCallback (react-dom.development.js:4164:14)\n    at Object.invokeGuardedCallbackDev (react-dom.development.js:4213:16)\n    at Object.invokeGuardedCallback (react-dom.development.js:4277:31)\nThe above error occurred in the <CartView> component"
+expected = []
+note = "> 20, тесты: посторонний stack trace"
+
+[[case]]
+id = "e-48"
+event = "post_tool"
+input = "FAILURE: Build failed with an exception.\n\n* What went wrong:\nExecution failed for task ':app:compileDebugKotlin'.\n> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction\n   > Compilation error. See log for more details\n\n* Try:\n> Run with --stacktrace option to get the stack trace.\n> Run with --info or --debug option to get more log output."
+expected = []
+note = "> 20, сборка, трудный: build, failed, error, log"
+
+[[case]]
+id = "e-49"
+event = "post_tool"
+input = "Traceback (most recent call last):\n  File \"sync.py\", line 40, in <module>\n    r = requests.get(API_URL, timeout=10)\nrequests.exceptions.ConnectionError: HTTPSConnectionPool(host='api.partner.local', port=443): Max retries exceeded with url: /v1/orders (Caused by NameResolutionError(\"<urllib3.connection.HTTPSConnection object at 0x0000021F>: Failed to resolve 'api.partner.local' ([Errno 11001] getaddrinfo failed)\"))"
+expected = []
+note = "> 20, сеть, трудный: connection, timeout — но имя хоста не разрешается"
+
+[[case]]
+id = "e-50"
+event = "post_tool"
+input = "error[E0502]: cannot borrow `self.items` as mutable because it is also borrowed as immutable\n  --> src/cart.rs:41:9\n   |\n39 |         let first = self.items.first();\n   |                     ---------- immutable borrow occurs here\n41 |         self.items.push(item);\n   |         ^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here\n42 |         first.map(|f| f.price)\n   |         ----- immutable borrow later used here\n\nFor more information about this error, try `rustc --explain E0502`."
+expected = []
+note = "> 20, сборка: посторонняя"
+
+[[case]]
+id = "e-51"
+event = "post_tool"
+input = "Auto-merging src/orders.rs\nCONFLICT (content): Merge conflict in src/orders.rs\nAuto-merging web/src/App.tsx\nCONFLICT (content): Merge conflict in web/src/App.tsx\nAutomatic merge failed; fix conflicts and then commit the result.\nhint: Resolve all conflicts manually, mark them as resolved with\nhint: \"git add/rm <conflicted_files>\", then run \"git commit\".\nhint: You can instead abort this merge with \"git merge --abort\"."
+expected = []
+note = "> 20, git, трудный: git, commit, run"
+
+[[case]]
+id = "e-52"
+event = "post_tool"
+input = "ssh: connect to host git.internal port 22: Connection timed out\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists."
+expected = []
+note = "> 20, сеть/git, трудный: connect, connection, timed out"
 
 # ======================= случаи: pre_tool =======================
 

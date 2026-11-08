@@ -1,13 +1,17 @@
 //! Проактивное вспоминание `POST /recall` (§10.3) — чистые функции без ввода-вывода:
 //! нормализация ошибки инструмента ([`normalize_error`]), сопоставление `error_regex`
 //! ([`error_regex_matches`]), покрытие слов ошибки найденным текстом ([`error_terms`],
-//! [`term_coverage`], [`coverage_enough`]), строка подсказки ([`hint_line`]) и упаковка
-//! дайджеста в бюджет токенов ([`pack_sections`]).
+//! [`term_coverage`], [`coverage_enough`] по правилу [`CoverageRule`]: слова как есть или
+//! основы [`StemWord`] — общий код с подсказками-идеями сервера, M6 §9), строка подсказки
+//! ([`hint_line`]) и упаковка дайджеста в бюджет токенов ([`pack_sections`]).
 //!
 //! Сервер собирает кандидатов (SQLite, поиск), здесь — только то, что от данных не зависит.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+
+use serde::{Deserialize, Serialize};
+use zam_core::text::is_stop_word;
 
 /// Предел нормализованной ошибки, символов (§10.3).
 pub const ERROR_MAX_CHARS: usize = 512;
@@ -187,19 +191,211 @@ pub fn term_coverage(terms: &[String], text: &str) -> usize {
         .count()
 }
 
-/// Наибольший порог покрытия: длинная ошибка (stack trace) не должна требовать от короткой
-/// записи десятков совпадений.
-const COVERAGE_CAP: usize = 4;
+/// Короче — слово сравнивается целиком: у трёхбуквенных слов («код», «api», «pdf») окончание
+/// неотличимо от корня.
+pub const STEM_MIN_CHARS: usize = 4;
 
-/// Покрытие достаточно для подсказки по ослабленному FTS (любое слово): не меньше
-/// `min(max(2, ⌈total / 3⌉), 4)` слов и не больше `total` **[решение исполнителя, задача 8
-/// M4]** — иначе общие слова ошибки («file», «error») поднимали бы случайные записи.
-pub fn coverage_enough(matched: usize, total: usize) -> bool {
-    if total == 0 {
-        return false;
+/// Слово для сравнения основ: нижний регистр, `ё` → `е` (бывш. `idea_norm_word` сервера).
+pub fn norm_word(w: &str) -> String {
+    w.to_lowercase().replace('ё', "е")
+}
+
+/// Основа слова: первые `max(4, длина − 3)` символов — срез типичных русских и английских
+/// окончаний («отчётов» → «отчё», «экспортировать» → «экспортиров», «reports» → «repo»); слова
+/// короче [`STEM_MIN_CHARS`] — целиком (бывш. `idea_stem` сервера).
+pub fn stem(w: &str) -> String {
+    let c: Vec<char> = w.chars().collect();
+    if c.len() < STEM_MIN_CHARS {
+        return w.to_string();
     }
-    let need = total.div_ceil(3).clamp(2, COVERAGE_CAP).min(total);
-    matched >= need
+    c[..c.len().saturating_sub(3).max(STEM_MIN_CHARS)]
+        .iter()
+        .collect()
+}
+
+/// Слово с готовой основой ([`stem`]) — сравнение без повторных аллокаций на каждой паре.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StemWord {
+    word: String,
+    stem: String,
+    short: bool,
+}
+
+impl StemWord {
+    /// `w` — уже [`norm_word`].
+    pub fn new(w: String) -> Self {
+        let short = w.chars().count() < STEM_MIN_CHARS;
+        let stem = if short { w.clone() } else { stem(&w) };
+        StemWord {
+            word: w,
+            stem,
+            short,
+        }
+    }
+
+    /// Слова совпадают по основе: одно начинается с основы другого; короче [`STEM_MIN_CHARS`] —
+    /// только точное совпадение. Ложные совпадения длинных слов с общим началом («план» ~
+    /// «планета») допускаются сознательно: это подтверждение к FTS, а не самостоятельный поиск.
+    pub fn matches(&self, o: &StemWord) -> bool {
+        if self.short || o.short {
+            return self.word == o.word;
+        }
+        o.word.starts_with(&self.stem) || self.word.starts_with(&o.stem)
+    }
+}
+
+/// Правило совпадения слова запроса со словом текста.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WordMatch {
+    /// Как есть (M4): нижний регистр, слово текста начинается со слова запроса ([`term_coverage`]).
+    #[default]
+    Plain,
+    /// Основы: [`norm_word`], без служебных слов (`zam_core::text::is_stop_word`), совпадение
+    /// [`StemWord::matches`] — как у подсказок-идей M5.7.
+    Stems,
+}
+
+/// Слова запроса `terms` ([`error_terms`]) под правило `m`: `Plain` — как есть; `Stems` — без
+/// служебных слов ru/en, [`norm_word`], без повторов (после `ё` → `е` повторы могут быть не
+/// соседними; порядок — по алфавиту) — бывш. `idea_terms` сервера.
+pub fn prepared_terms(terms: &[String], m: WordMatch) -> Vec<String> {
+    match m {
+        WordMatch::Plain => terms.to_vec(),
+        WordMatch::Stems => {
+            let mut out: Vec<String> = terms
+                .iter()
+                .filter(|t| !is_stop_word(&t.to_lowercase()))
+                .map(|t| norm_word(t))
+                .filter(|t| !is_stop_word(t))
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        }
+    }
+}
+
+/// Значимые слова с основами: [`prepared_terms`] при [`WordMatch::Stems`].
+pub fn stem_words(terms: &[String]) -> Vec<StemWord> {
+    prepared_terms(terms, WordMatch::Stems)
+        .into_iter()
+        .map(StemWord::new)
+        .collect()
+}
+
+/// Порог покрытия слов запроса текстом записи у ослабленного FTS (любое слово):
+/// `need = clamp(⌈n / divisor⌉, 2, cap)`, не больше `n` — иначе общие слова ошибки («file»,
+/// «error») поднимали бы случайные записи, а длинная ошибка (stack trace) требовала бы от
+/// короткой записи десятков совпадений. Ключ `recall.post_tool_coverage` (M6 §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageRule {
+    /// Делитель числа слов запроса, 1..=10.
+    pub divisor: u32,
+    /// Наибольший порог, 2..=32.
+    pub cap: u32,
+    pub word_match: WordMatch,
+}
+
+impl CoverageRule {
+    /// Правило M4 **[решение исполнителя, задача 8 M4]**: ⌈n/3⌉, от 2 до 4, слова как есть.
+    pub const M4: CoverageRule = CoverageRule {
+        divisor: 3,
+        cap: 4,
+        word_match: WordMatch::Plain,
+    };
+
+    /// Умолчание M6 по сетке §9 (задача 9, `eval/grid-m6-hints.toml`): ⌈n/3⌉, от 2 до 6, основы
+    /// слов — Δ hint_precision +0,161 [+0,069…], Δ hint_recall +0,032 [0,000…] к [`Self::M4`] на 52
+    /// случаях `post_tool`.
+    pub const M6: CoverageRule = CoverageRule {
+        divisor: 3,
+        cap: 6,
+        word_match: WordMatch::Stems,
+    };
+
+    /// Нужно совпавших слов из `n` (`n` — после [`prepared_terms`]).
+    pub fn need(&self, n: usize) -> usize {
+        let cap = (self.cap as usize).max(2);
+        n.div_ceil((self.divisor as usize).max(1))
+            .clamp(2, cap)
+            .min(n)
+    }
+}
+
+impl Default for CoverageRule {
+    fn default() -> Self {
+        CoverageRule::M6
+    }
+}
+
+/// Слова запроса, подготовленные один раз под правило (сервер проверяет десятки находок FTS).
+#[derive(Debug, Clone)]
+pub struct CoverageQuery {
+    rule: CoverageRule,
+    plain: Vec<String>,
+    stems: Vec<StemWord>,
+}
+
+impl CoverageQuery {
+    /// `query` — слова ошибки ([`error_terms`]).
+    pub fn new(query: &[String], rule: &CoverageRule) -> Self {
+        let (plain, stems) = match rule.word_match {
+            WordMatch::Plain => (query.to_vec(), Vec::new()),
+            WordMatch::Stems => (Vec::new(), stem_words(query)),
+        };
+        CoverageQuery {
+            rule: *rule,
+            plain,
+            stems,
+        }
+    }
+
+    /// Слов запроса после подготовки (знаменатель порога).
+    pub fn len(&self) -> usize {
+        match self.rule.word_match {
+            WordMatch::Plain => self.plain.len(),
+            WordMatch::Stems => self.stems.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Совпавших слов запроса в `text`.
+    pub fn covered(&self, text: &str) -> usize {
+        match self.rule.word_match {
+            WordMatch::Plain => term_coverage(&self.plain, text),
+            WordMatch::Stems => {
+                // все слова текста (без предела слов запроса): запись длиннее 32 слов
+                let words: Vec<StemWord> = text
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| !w.is_empty())
+                    .map(norm_word)
+                    .filter(|w| !is_stop_word(w))
+                    .map(StemWord::new)
+                    .collect();
+                self.stems
+                    .iter()
+                    .filter(|t| words.iter().any(|w| t.matches(w)))
+                    .count()
+            }
+        }
+    }
+
+    /// Покрытие `text` достаточно ([`CoverageRule::need`]); пустой запрос — нет.
+    pub fn enough(&self, text: &str) -> bool {
+        let n = self.len();
+        n > 0 && self.covered(text) >= self.rule.need(n)
+    }
+}
+
+/// Покрытие слов запроса `query` ([`error_terms`]) текстом `text` достаточно по правилу `rule`
+/// (см. [`CoverageQuery`]).
+pub fn coverage_enough(query: &[String], text: &str, rule: &CoverageRule) -> bool {
+    CoverageQuery::new(query, rule).enough(text)
 }
 
 /// Одна строка без переводов строк и с обрезанными краями (заголовок, путь).
@@ -471,18 +667,117 @@ mod tests {
         let f = vec!["file".to_string()];
         assert_eq!(term_coverage(&f, "no files here"), 1);
         assert_eq!(term_coverage(&f, "profile"), 0);
-        assert!(coverage_enough(2, 5));
-        assert!(!coverage_enough(1, 5));
-        assert!(coverage_enough(1, 1));
-        assert!(!coverage_enough(0, 0));
-        assert!(!coverage_enough(3, 10));
-        assert!(coverage_enough(4, 10));
+        let m4 = |matched_terms: &[&str], total: &[&str]| {
+            let q: Vec<String> = total.iter().map(|s| s.to_string()).collect();
+            coverage_enough(&q, &matched_terms.join(" "), &CoverageRule::M4)
+        };
+        let w = [
+            "aa1", "bb2", "cc3", "dd4", "ee5", "ff6", "gg7", "hh8", "ii9", "jj0",
+        ];
+        assert!(m4(&w[..2], &w[..5]));
+        assert!(!m4(&w[..1], &w[..5]));
+        assert!(m4(&w[..1], &w[..1]));
+        assert!(!m4(&[], &[]));
+        assert!(!m4(&w[..3], &w));
+        assert!(m4(&w[..4], &w));
         // длинная ошибка: порог не выше 4
-        assert!(coverage_enough(4, 32));
-        assert!(!coverage_enough(3, 32));
+        let long: Vec<String> = (0..32).map(|i| format!("w{i:02}")).collect();
+        let text = |k: usize| long[..k].join(" ");
+        assert!(coverage_enough(&long, &text(4), &CoverageRule::M4));
+        assert!(!coverage_enough(&long, &text(3), &CoverageRule::M4));
         // кэш шаблонов: повтор и некорректный шаблон
         assert!(error_regex_matches(r"bad interpreter", "bad interpreter"));
         assert!(!error_regex_matches(r"(", "("));
+    }
+
+    /// Правило M4 через [`CoverageRule::need`] — та же формула, что прежний
+    /// `coverage_enough(matched, total)` (задача 8 M4), при любых `n` и `m`.
+    #[test]
+    fn coverage_rule_m4_equals_old_formula() {
+        let old = |m: usize, n: usize| n > 0 && m >= n.div_ceil(3).clamp(2, 4).min(n);
+        for n in 0..40usize {
+            for m in 0..=n {
+                let r = CoverageRule::M4;
+                assert_eq!(n > 0 && m >= r.need(n), old(m, n), "n={n} m={m}");
+            }
+        }
+        let r = |divisor, cap| CoverageRule {
+            divisor,
+            cap,
+            word_match: WordMatch::Plain,
+        };
+        assert_eq!(r(2, 6).need(20), 6);
+        assert_eq!(r(2, 6).need(9), 5);
+        assert_eq!(r(3, 3).need(20), 3);
+        assert_eq!(r(2, 3).need(1), 1);
+        assert_eq!(r(3, 6).need(3), 2);
+    }
+
+    /// Финальное ревью M5.7, I-1′ (перенесено из сервера): основы слов — формы, короткие слова.
+    #[test]
+    fn stem_word_match_forms_and_short_words() {
+        let m =
+            |a: &str, b: &str| StemWord::new(norm_word(a)).matches(&StemWord::new(norm_word(b)));
+        // формы одного слова
+        assert!(m("отчёты", "отчётов"));
+        assert!(m("отчеты", "Отчётов"));
+        assert!(m("экспортировать", "экспорт"));
+        assert!(m("экспорт", "экспортировать"));
+        assert!(m("reports", "report"));
+        assert!(m("PDF", "pdf"));
+        // короткие слова — только целиком
+        assert!(!m("код", "кодекс"));
+        assert!(!m("pdf", "pdfium"));
+        // длинные с общим началом — совпадают (сознательно: это подтверждение, не поиск)
+        assert!(m("план", "планета"));
+        // разные слова
+        assert!(!m("логирование", "экспорт"));
+        assert!(!m("сервера", "скачать"));
+        assert_eq!(stem("отчётов"), "отчё");
+        assert_eq!(stem("экспортировать"), "экспортиров");
+        assert_eq!(stem("код"), "код");
+        assert_eq!(norm_word("ЁЛКА"), "елка");
+    }
+
+    /// `prepared_terms`: `Plain` — как есть; `Stems` — без служебных слов, `ё` → `е`, без повторов.
+    #[test]
+    fn prepared_terms_by_word_match() {
+        let t = error_terms("Ещё еще отчёты отчеты для the Reports");
+        assert_eq!(prepared_terms(&t, WordMatch::Plain), t);
+        assert_eq!(prepared_terms(&t, WordMatch::Stems), ["reports", "отчеты"]);
+        assert_eq!(stem_words(&t).len(), 2);
+    }
+
+    /// `Stems`: формы слов и `ё` совпадают, служебные слова не считаются ни в запросе, ни в
+    /// пороге; `Plain` — прежнее сравнение по началу слова.
+    #[test]
+    fn coverage_stems_vs_plain() {
+        let stems = CoverageRule {
+            word_match: WordMatch::Stems,
+            ..CoverageRule::M4
+        };
+        let q = error_terms("консоль кракозябры");
+        let text = "Вывод консоли Windows с кириллицей превращается в кракозябры";
+        assert!(!coverage_enough(&q, text, &CoverageRule::M4));
+        assert!(coverage_enough(&q, text, &stems));
+        // служебные слова: «error timed out» → в Stems остаются error, timed, out (out — 3 буквы,
+        // не стоп-слово), «times out» совпадает по основе
+        let q = error_terms("error: timed out");
+        let text = "Cargo fetch times out: spurious network error";
+        assert_eq!(CoverageQuery::new(&q, &CoverageRule::M4).covered(text), 2);
+        assert_eq!(CoverageQuery::new(&q, &stems).covered(text), 3);
+        // запрос только из служебных слов — пусто, подсказки нет
+        let q = error_terms("that this with from");
+        assert!(CoverageQuery::new(&q, &stems).is_empty());
+        assert!(!coverage_enough(&q, "that this with from", &stems));
+        assert!(coverage_enough(
+            &q,
+            "that this with from",
+            &CoverageRule::M4
+        ));
+        // слово с «ё» в тексте
+        let q = error_terms("ещё отчеты выгрузка");
+        assert!(coverage_enough(&q, "Выгрузка отчётов", &stems));
     }
 
     /// M6 §4.3: `ZeroAIMemory: <заголовок> [<вид>·<cert>] i:<id>`, надёжность сокращена.

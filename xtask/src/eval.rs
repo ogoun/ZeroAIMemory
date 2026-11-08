@@ -139,8 +139,9 @@ pub struct EvalArgs {
     /// поиск Qdrant, `qdrant.exact_search = true`)
     #[arg(long, conflicts_with_all = ["grid", "check", "hints", "tokens"])]
     pub quality_gate: bool,
-    /// Точность подсказок хуков (eval/hints.toml), калибровка порогов, задержки /recall и хуков
-    #[arg(long, conflicts_with_all = ["grid", "check", "tokens"])]
+    /// Точность подсказок хуков (eval/hints.toml), калибровка порогов, задержки /recall и хуков;
+    /// с --grid — сетка порогов подсказок M6 §9 (eval/grid-m6-hints*.toml)
+    #[arg(long, conflicts_with_all = ["check", "tokens"])]
     pub hints: bool,
     /// Расход токенов агента по сценариям eval/scenarios.toml (протокол §9.3, кэш, chunks);
     /// с --via mcp — замер M6 через MCP (спецификация M6 §3)
@@ -445,6 +446,16 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
                 h.irrelevant,
                 sc.len()
             );
+            let buckets: Vec<String> = h
+                .post_tool_buckets
+                .iter()
+                .map(|(b, (r, i))| format!("{b}: {r}/{i}"))
+                .collect();
+            println!(
+                "подсказки M6 §9: post_tool {:?} (рел./нерел.), по длине ошибки — {}",
+                h.by_event.get("post_tool"),
+                buckets.join(", ")
+            );
             tokens::mcp::print_set(&set, &p);
             tokens::mcp::print_foreign(&set, &p);
             let (g, _) = glossary::load_glossary(&p.glossary)?;
@@ -511,6 +522,9 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
         return gate::run(&a, &p, &corpus, &queries);
     }
     if a.hints {
+        if let Some(g) = &a.grid {
+            return hints::grid::run(&a, &p, &corpus, g);
+        }
         return hints::run(&a, &p, &corpus, &queries);
     }
     if a.tokens {

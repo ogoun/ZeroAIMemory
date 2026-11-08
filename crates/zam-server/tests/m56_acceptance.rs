@@ -46,6 +46,8 @@ async fn world(name: &str, tweak: impl FnOnce(&mut ServerConfig)) -> Api {
     let a = api(&format!("m56-{name}"), |c| {
         c.recall.timeout_ms = 30_000;
         c.recall.prompt_min_score = 0.0;
+        // сервер теста без модели: порог `prompt` — FTS-only (M6 §9)
+        c.recall.prompt_min_score_fts = 0.0;
         tweak(c);
     })
     .await;

@@ -1,0 +1,59 @@
+# Сетка порога покрытия слов ошибки у ослабленного FTS `post_tool` (M6 §9, задача 9):
+#   cargo xtask eval --hints --grid eval/grid-m6-hints.toml --mode fts
+# Делитель {3, 2} × cap {3, 4, 6} × правило совпадения слов {plain, stems} на случаях `post_tool`
+# eval/hints.toml; отчёт — по корзинам длины ошибки (слов error_terms: ≤ 3, 4–8, 9–20, > 20).
+# Первая точка — текущее правило (⌈n/3⌉ от 2 до 4, слова как есть); `plain` идут раньше `stems`
+# (при равенстве остаётся «как есть»). Выбор §9: (1) Δ hint_recall — нижняя граница ≥ −0,02;
+# (2) среди прошедших — наибольшая Δ hint_precision с нижней границей > 0; (3) иначе как есть.
+# Подсказки `post_tool` — error_regex и FTS по insight, без векторного канала: точки снимаются
+# на FTS (детерминирован, A/A — побайтово), один индекс на все точки.
+
+rule = "post_tool_coverage"
+
+[[point]]
+name = "d3-c4-plain"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "3", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "4", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "plain" }
+
+[[point]]
+name = "d3-c3-plain"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "3", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "3", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "plain" }
+
+[[point]]
+name = "d3-c6-plain"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "3", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "6", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "plain" }
+
+[[point]]
+name = "d2-c3-plain"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "2", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "3", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "plain" }
+
+[[point]]
+name = "d2-c4-plain"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "2", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "4", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "plain" }
+
+[[point]]
+name = "d2-c6-plain"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "2", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "6", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "plain" }
+
+[[point]]
+name = "d3-c3-stems"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "3", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "3", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "stems" }
+
+[[point]]
+name = "d3-c4-stems"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "3", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "4", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "stems" }
+
+[[point]]
+name = "d3-c6-stems"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "3", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "6", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "stems" }
+
+[[point]]
+name = "d2-c3-stems"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "2", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "3", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "stems" }
+
+[[point]]
+name = "d2-c4-stems"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "2", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "4", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "stems" }
+
+[[point]]
+name = "d2-c6-stems"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR = "2", ZAM_RECALL__POST_TOOL_COVERAGE__CAP = "6", ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH = "stems" }

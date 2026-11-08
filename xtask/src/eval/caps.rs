@@ -211,6 +211,9 @@ pub const KEYS: &[(&str, Since)] = &[
     ("recall.digest_entries", F("digest")),
     ("recall.digest_code_map_tokens", F("digest")),
     ("recall.prompt_min_score_fts", F("hint_thresholds")),
+    ("recall.post_tool_coverage.divisor", F("hint_thresholds")),
+    ("recall.post_tool_coverage.cap", F("hint_thresholds")),
+    ("recall.post_tool_coverage.word_match", F("hint_thresholds")),
     ("search.kind_boost_mode", F("kind_boost")),
     ("search.w_attach", F("attach_weight")),
     ("recall.snapshot_tokens", F("snapshot")),
@@ -282,14 +285,22 @@ pub fn caps_from(health: &Value) -> Result<ServerCaps> {
     })
 }
 
-/// `ZAM_SEARCH__BUDGET_TOKENS` → `search.budget_tokens`; не переопределение раздела — `None`.
+/// `ZAM_SEARCH__BUDGET_TOKENS` → `search.budget_tokens`, вложенный ключ —
+/// `ZAM_RECALL__POST_TOOL_COVERAGE__CAP` → `recall.post_tool_coverage.cap` (как у сервера: `__` —
+/// уровень); не переопределение раздела — `None`.
 pub fn env_to_key(env: &str) -> Option<String> {
-    let (section, key) = env.strip_prefix("ZAM_")?.split_once("__")?;
-    Some(format!(
-        "{}.{}",
-        section.to_ascii_lowercase(),
-        key.to_ascii_lowercase()
-    ))
+    let rest = env.strip_prefix("ZAM_")?;
+    let parts: Vec<&str> = rest.split("__").collect();
+    if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    Some(
+        parts
+            .iter()
+            .map(|p| p.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("."),
+    )
 }
 
 /// Ключ таблицы [`KEYS`] для имени `ZAM_*`.

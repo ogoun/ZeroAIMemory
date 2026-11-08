@@ -8,6 +8,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString, rand_core:
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml::{Table, Value};
+use zam_search::recall::CoverageRule;
 
 /// Переменные `ZAM_*`, которые не являются слоем конфигурации:
 /// секреты и адрес клиента, переменные клиента `zam` (сессия, признак агента, имя машины, сессия `zam mcp` —
@@ -774,6 +775,14 @@ pub struct RecallSection {
     pub brief_tokens: usize,
     /// Наименьший балл поиска подсказки к запросу пользователя (0..=1, 0,6).
     pub prompt_min_score: f64,
+    /// Тот же порог, когда поиск `prompt` деградировал до FTS (`degraded`, нет модели или Qdrant;
+    /// M6 §9, M4.5 M-9), 0..=1 — подсказки решений и идей. 0,6 — как `prompt_min_score` до M6;
+    /// сетка задачи 9 {0,2…0,6}: условия §9 (тишина ≥ 0,7) не выполнены ни при одном — 0,6.
+    pub prompt_min_score_fts: f64,
+    /// Порог покрытия слов ошибки у ослабленного FTS `post_tool` (M6 §9):
+    /// `{divisor, cap, word_match}` — `clamp(⌈n / divisor⌉, 2, cap)`, слова `plain` | `stems`;
+    /// `{3, 6, stems}` — по сетке задачи 9 (до M6 — `{3, 4, plain}`).
+    pub post_tool_coverage: CoverageRule,
     /// Бюджет сервера на сбор подсказок, мс (1..=60000, 200): по превышении отдаётся собранное
     /// и `warnings: ["recall timeout"]`.
     pub timeout_ms: u64,
@@ -807,6 +816,17 @@ impl RecallSection {
         }
         if !(self.prompt_min_score.is_finite() && (0.0..=1.0).contains(&self.prompt_min_score)) {
             return Err(bad("prompt_min_score", "должно быть в 0..=1"));
+        }
+        let fts = self.prompt_min_score_fts;
+        if !(fts.is_finite() && (0.0..=1.0).contains(&fts)) {
+            return Err(bad("prompt_min_score_fts", "должно быть в 0..=1"));
+        }
+        let cov = &self.post_tool_coverage;
+        if !(1..=10).contains(&cov.divisor) {
+            return Err(bad("post_tool_coverage.divisor", "от 1 до 10"));
+        }
+        if !(2..=32).contains(&cov.cap) {
+            return Err(bad("post_tool_coverage.cap", "от 2 до 32"));
         }
         if !(1..=60_000).contains(&self.timeout_ms) {
             return Err(bad("timeout_ms", "от 1 до 60000"));
@@ -1271,6 +1291,8 @@ impl Default for ServerConfig {
                 recovery_tokens: 2000,
                 brief_tokens: 800,
                 prompt_min_score: 0.6,
+                prompt_min_score_fts: 0.6,
+                post_tool_coverage: CoverageRule::M6,
                 timeout_ms: 200,
                 snippet_tokens: 60,
                 digest_entries: 5,
@@ -2473,6 +2495,44 @@ master_key = \"x\"
         assert_eq!(c.rank_timeout_ms, 0, "0 — пересчёт только в фоне");
         let e = load(None, &[env("ZAM_CODE__AUTO", "true")], &Default::default());
         assert!(e.is_err(), "неизвестный ключ секции — ошибка");
+    }
+
+    /// M6 §9: `recall.prompt_min_score_fts` и `recall.post_tool_coverage` — умолчания, `ZAM_*`
+    /// вложенного ключа, диапазоны.
+    #[test]
+    fn recall_hint_threshold_keys() {
+        use zam_search::recall::WordMatch;
+        let d = load(None, &[], &Default::default()).unwrap().recall;
+        assert_eq!(d.prompt_min_score_fts, 0.6);
+        assert_eq!(d.post_tool_coverage, CoverageRule::M6);
+        let e = vec![
+            env("ZAM_RECALL__PROMPT_MIN_SCORE_FTS", "0.3"),
+            env("ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR", "2"),
+            env("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "6"),
+            env("ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH", "stems"),
+        ];
+        let r = load(None, &e, &Default::default()).unwrap().recall;
+        assert_eq!(r.prompt_min_score_fts, 0.3);
+        assert_eq!(
+            r.post_tool_coverage,
+            CoverageRule {
+                divisor: 2,
+                cap: 6,
+                word_match: WordMatch::Stems
+            }
+        );
+        for (k, v) in [
+            ("ZAM_RECALL__PROMPT_MIN_SCORE_FTS", "1.5"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR", "0"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "1"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "33"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH", "snowball"),
+        ] {
+            assert!(
+                load(None, &[env(k, v)], &Default::default()).is_err(),
+                "{k}={v}"
+            );
+        }
     }
 
     #[test]

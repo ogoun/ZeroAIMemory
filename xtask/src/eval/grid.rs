@@ -599,15 +599,21 @@ pub fn load_points(path: &Path) -> Result<Vec<Point>> {
         .with_context(|| format!("чтение сетки {}", path.display()))?;
     let f: PointFile =
         toml::from_str(&text).with_context(|| format!("разбор сетки {}", path.display()))?;
+    validate_points(&f.point, path)?;
+    Ok(f.point)
+}
+
+/// Проверка точек сетки M6 ([`load_points`]; у сетки подсказок — свой файл с правилом).
+pub fn validate_points(points: &[Point], path: &Path) -> Result<()> {
     let mut errs = Vec::new();
-    if f.point.is_empty() {
+    if points.is_empty() {
         errs.push("нет ни одной [[point]]".to_string());
     }
-    if f.point.len() > MAX_CONFIGS {
-        errs.push(format!("точек {} > {MAX_CONFIGS}", f.point.len()));
+    if points.len() > MAX_CONFIGS {
+        errs.push(format!("точек {} > {MAX_CONFIGS}", points.len()));
     }
     let mut names = std::collections::BTreeSet::new();
-    for p in &f.point {
+    for p in points {
         let ok_name = !p.name.is_empty()
             && p.name
                 .chars()
@@ -627,7 +633,7 @@ pub fn load_points(path: &Path) -> Result<Vec<Point>> {
     if !errs.is_empty() {
         bail!("сетка {}:\n  {}", path.display(), errs.join("\n  "));
     }
-    Ok(f.point)
+    Ok(())
 }
 
 #[cfg(test)]

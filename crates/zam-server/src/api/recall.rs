@@ -70,7 +70,8 @@
 //!   нет;
 //! - **`prompt`** — поиск `mode=brief` (без реранка, без кэша выжимок, `skip_seen: false`) по
 //!   первым 512 символам `prompt` в Knowledge, Rules и решении; из выдачи — только insight и
-//!   заметки Rules с баллом ≥ `recall.prompt_min_score` (0,6), не больше [`PROMPT_MAX`];
+//!   заметки Rules с баллом ≥ `recall.prompt_min_score` (0,6; поиск только FTS —
+//!   `recall.prompt_min_score_fts`, M6 §9), не больше [`PROMPT_MAX`];
 //!   перед ними — до [`TERM_HINTS_MAX`] строк словаря (M4.5): имя или псевдоним действующего
 //!   термина решения и Knowledge в первых 512 символах `prompt` —
 //!   `ZeroAIMemory: термин «<имя>» — <определение> t:<id>`, `reason: glossary`, каждый термин
@@ -91,7 +92,7 @@
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
 //!   нормализованной ошибке ([`normalize_error`]): строгий запрос (все слова) — как есть,
 //!   ослабленный (любое слово) — если запись покрывает достаточно слов ошибки
-//!   ([`coverage_enough`]). Не больше [`POST_TOOL_MAX`]; строка — «ZeroAIMemory: эта ошибка уже
+//!   ([`CoverageQuery`], правило `recall.post_tool_coverage`, M6 §9). Не больше [`POST_TOOL_MAX`]; строка — «ZeroAIMemory: эта ошибка уже
 //!   разбиралась: …»;
 //! - **без повторов**: подсказка `prompt` показывается не больше раза за сессию — по
 //!   `session_seen` с частью [`RECALL_PART`] (любая ревизия). Дайджест `session_start` не
@@ -178,8 +179,8 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
-    HINT_PREFIX, Section, coverage_enough, error_regex_matches, error_terms, hint_line,
-    normalize_error, one_line, pack_sections, reserved_text, term_coverage,
+    CoverageQuery, CoverageRule, HINT_PREFIX, Section, StemWord, WordMatch, error_regex_matches,
+    error_terms, hint_line, normalize_error, one_line, pack_sections, reserved_text, stem_words,
 };
 use zam_search::{truncate_marked, truncate_to_tokens};
 use zam_store::{
@@ -1253,7 +1254,7 @@ async fn digest_ideas(
 /// Подсказки-идеи к `prompt` (§6.2): отдельный лёгкий поиск после основного (`mode=brief`,
 /// первые 512 символов, `kinds [idea]`, `status [new, deferred]`, `top_k`
 /// `ideas.prompt_top_k`), основной поиск `prompt` не меняется. Идея — кандидат
-/// ([`zam_store::idea_candidate`]); идея решения — с баллом ≥ `recall.prompt_min_score`, общая
+/// ([`zam_store::idea_candidate`]); идея решения — с баллом ≥ [`prompt_min_score`], общая
 /// идея Knowledge — по [`knowledge_ideas_related`]. Показанное сессии и предел
 /// `ideas.prompt_max` отсекает общий отбор [`recall`].
 ///
@@ -1403,96 +1404,26 @@ fn idea_lexically_matched(item: &Value, e: &Entry, q: &IdeaQuery) -> bool {
 /// Значимых слов идеи в пороге [`idea_words_match`], не больше: длинное тело не делает порог
 /// недостижимым (половина от 6 — 3 слова, не больше порога покрытия запроса 4).
 const IDEA_WORDS_CAP: usize = 6;
-/// Короче — слово сравнивается целиком: у трёхбуквенных слов («код», «api», «pdf») окончание
-/// неотличимо от корня.
-const STEM_MIN_CHARS: usize = 4;
-
-/// Слово для сравнения основ: нижний регистр, `ё` → `е`.
-fn idea_norm_word(w: &str) -> String {
-    w.to_lowercase().replace('ё', "е")
-}
-
-/// Значимые слова текста для подтверждения идей: [`error_terms`] без служебных слов ru/en
-/// (общий стоп-список [`zam_markdown::is_stop_word`]), нормализованные [`idea_norm_word`], без
-/// повторов (после `ё` → `е` повторы могут быть не соседними).
-fn idea_terms(terms: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = terms
-        .iter()
-        .filter(|t| !zam_markdown::is_stop_word(&t.to_lowercase()))
-        .map(|t| idea_norm_word(t))
-        .filter(|t| !zam_markdown::is_stop_word(t))
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// Основа слова: первые `max(4, длина − 3)` символов — срез типичных русских и английских
-/// окончаний («отчётов» → «отче», «экспортировать» → «экспортиров», «reports» → «repo»); слова
-/// короче [`STEM_MIN_CHARS`] — целиком.
-fn idea_stem(w: &str) -> String {
-    let c: Vec<char> = w.chars().collect();
-    if c.len() < STEM_MIN_CHARS {
-        return w.to_string();
-    }
-    c[..c.len().saturating_sub(3).max(STEM_MIN_CHARS)]
-        .iter()
-        .collect()
-}
-
-/// Слова совпадают по основе (оба уже [`idea_norm_word`]): одно начинается с основы другого;
-/// короче [`STEM_MIN_CHARS`] — только точное совпадение. Ложные совпадения длинных слов с общим
-/// началом («план» ~ «планета») допускаются сознательно: это подтверждение к вектору и FTS, а
-/// не самостоятельный поиск.
-#[cfg(test)]
-fn idea_stem_match(a: &str, b: &str) -> bool {
-    StemWord::new(a.to_string()).matches(&StemWord::new(b.to_string()))
-}
+/// Порог покрытия слов запроса у подсказок-идей — свой и фиксированный (M5.7: ⌈n/3⌉ от 2 до 4,
+/// основы): ключ `recall.post_tool_coverage` (M6 §9) на него не влияет.
+const IDEA_QUERY_RULE: CoverageRule = CoverageRule {
+    divisor: 3,
+    cap: 4,
+    word_match: WordMatch::Stems,
+};
 
 /// Слова запроса `terms` ([`error_terms`]) подтверждаются заголовком `title` и телом `body`
 /// идеи (финальное ревью M5.7, I-1′ и I-1″). Служебные слова не считаются ни в запросе, ни в
-/// идее ([`idea_terms`]). Нужно хотя бы одно совпадение по основе со словом **заголовка**:
+/// идее ([`stem_words`]). Нужно хотя бы одно совпадение по основе со словом **заголовка**:
 /// совпадения только с телом («пользователь», «server») связи с замыслом не доказывают. Далее:
 /// покрыты все слова запроса — да; иначе нужно не меньше
 /// `min(порог покрытия запроса, max(1, ⌈k / 2⌉))` совпавших, где `k` — значимые слова идеи (до
 /// [`IDEA_WORDS_CAP`]). Порог ограничен словами самой идеи: к длинному запросу Claude Code
-/// короткая идея иначе не подходила бы никогда. Только для подсказок-идей; общий
-/// [`term_coverage`] у `post_tool` прежний.
+/// короткая идея иначе не подходила бы никогда. Общий код слов — `zam_search::recall`
+/// ([`StemWord`], задача 9 M6).
 #[cfg(test)]
 fn idea_words_match(terms: &[String], title: &str, body: &str) -> bool {
     IdeaQuery::new(terms).matches(title, body)
-}
-
-/// Слово с готовой основой для [`idea_stem_match`] без повторных аллокаций на каждой паре.
-struct StemWord {
-    word: String,
-    stem: String,
-    short: bool,
-}
-
-impl StemWord {
-    fn new(word: String) -> StemWord {
-        let short = word.chars().count() < STEM_MIN_CHARS;
-        let stem = if short {
-            word.clone()
-        } else {
-            idea_stem(&word)
-        };
-        StemWord { word, stem, short }
-    }
-
-    /// То же правило, что [`idea_stem_match`].
-    fn matches(&self, o: &StemWord) -> bool {
-        if self.short || o.short {
-            return self.word == o.word;
-        }
-        o.word.starts_with(&self.stem) || self.word.starts_with(&o.stem)
-    }
-}
-
-/// Значимые слова с основами ([`idea_terms`]).
-fn stem_words(terms: &[String]) -> Vec<StemWord> {
-    idea_terms(terms).into_iter().map(StemWord::new).collect()
 }
 
 /// Слова запроса подсказки-идеи, подготовленные один раз на запрос (перф: раньше стоп-список,
@@ -1522,8 +1453,7 @@ impl IdeaQuery {
         if covered == q.len() {
             return true;
         }
-        let n = q.len();
-        let query_need = n.div_ceil(3).clamp(2, 4).min(n);
+        let query_need = IDEA_QUERY_RULE.need(q.len());
         let k = words.len().min(IDEA_WORDS_CAP);
         covered >= query_need.min(k.div_ceil(2).max(1))
     }
@@ -1585,8 +1515,8 @@ const RELEASED_PROMPT_IDS: usize = 50;
 ///   пусто — FTS не идёт;
 /// - релевантность — FTS (`search_fts_channels`, `kinds [idea]`, `status [accepted]`) только
 ///   среди этих id: строгий запрос (все слова) проходит, ослабленный (любое слово) — при
-///   покрытии слов запроса [`coverage_enough`], как у подсказок `post_tool`. Принятые идеи с
-///   живой задачей сюда не попадают и мест не занимают;
+///   подтверждении по основам слов, как у первого прохода ([`IdeaQuery::matches`]). Принятые
+///   идеи с живой задачей сюда не попадают и мест не занимают;
 /// - общая идея Knowledge — по [`knowledge_ideas_related`].
 ///
 /// Не больше `want` кандидатов, после основных. Ошибки — WARN, `health.alive` не трогается.
@@ -1786,7 +1716,7 @@ async fn search_prompt_ideas(
     let Some(v) = inner_search(st, p, headers, area, body, health, d).await? else {
         return Ok(Some(Vec::new()));
     };
-    let min = st.cfg.recall.prompt_min_score;
+    let min = prompt_min_score(st, &v);
     let today = zam_store::time::utc_today();
     let iq = IdeaQuery::new(&error_terms(query));
     let targets = health.targets();
@@ -3310,7 +3240,7 @@ async fn prompt_hints(
     let Some(v) = inner_search(st, p, headers, area, body, health, deadline).await? else {
         return Ok(Vec::new());
     };
-    let min = st.cfg.recall.prompt_min_score;
+    let min = prompt_min_score(st, &v);
     let targets = health.targets();
     let mut out: Vec<Cand> = Vec::new();
     for it in v["items"].as_array().into_iter().flatten() {
@@ -3403,6 +3333,16 @@ async fn prompt_hints(
     Ok(out)
 }
 
+/// Порог балла подсказки к `prompt` по ответу внутреннего поиска `search`: поиск деградировал до
+/// FTS (`degraded`) — `recall.prompt_min_score_fts`, иначе `recall.prompt_min_score` (M6 §9).
+fn prompt_min_score(st: &AppState, search: &Value) -> f64 {
+    if search["degraded"].as_bool() == Some(true) {
+        st.cfg.recall.prompt_min_score_fts
+    } else {
+        st.cfg.recall.prompt_min_score
+    }
+}
+
 /// Внутренний `POST /search` подсказок (тело `body`): без сессии (показанное учитывает сам
 /// `/recall`), `area` — в `X-Zam-Area`, если его нет. Срок вышел — `None`; сбой поиска —
 /// `None` и `warnings: ["recall search failed"]`; предупреждения поиска переходят в ответ.
@@ -3469,6 +3409,7 @@ async fn inner_search(
 /// `post_tool`: `error_regex`, затем FTS по insight (см. модуль).
 async fn error_hints(
     req: &RecallReq,
+    rule: &CoverageRule,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Vec<Cand>, ApiError> {
@@ -3552,6 +3493,8 @@ async fn error_hints(
     // 2. FTS по insight по нормализованной ошибке
     let normalized = normalize_error(raw);
     let terms = error_terms(&normalized);
+    // порог покрытия ослабленного FTS — `recall.post_tool_coverage` (M6 §9)
+    let cover = CoverageQuery::new(&terms, rule);
     if out.len() < POST_TOOL_MAX && !terms.is_empty() {
         let mut hits: Vec<(f64, usize, zam_store::FtsHit, bool)> = Vec::new();
         for (i, t) in targets.iter().enumerate() {
@@ -3595,12 +3538,7 @@ async fn error_hints(
             if taken.contains(&h.target) {
                 continue;
             }
-            if relaxed
-                && !coverage_enough(
-                    term_coverage(&terms, &format!("{}\n{}", e.title, h.text)),
-                    terms.len(),
-                )
-            {
+            if relaxed && !cover.enough(&format!("{}\n{}", e.title, h.text)) {
                 continue;
             }
             taken.insert(h.target);
@@ -4153,7 +4091,8 @@ pub async fn recall(
             )
         }
         Event::PostTool => {
-            let c = error_hints(&req, &mut health, &mut deadline).await?;
+            let rule = st.cfg.recall.post_tool_coverage;
+            let c = error_hints(&req, &rule, &mut health, &mut deadline).await?;
             (Lines::default(), vec![(None, c)], true)
         }
         // у субагента свой контекст: пакет повторяется (показ отмечается)
@@ -4328,31 +4267,10 @@ pub async fn recall(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zam_search::recall::prepared_terms;
 
-    /// Финальное ревью M5.7, I-1′: сравнение основ слов подсказок-идей — совпадения форм и
-    /// поведение коротких слов (зафиксировано).
-    #[test]
-    fn idea_stem_match_forms_and_short_words() {
-        let m = |a: &str, b: &str| idea_stem_match(&idea_norm_word(a), &idea_norm_word(b));
-        // формы одного слова
-        assert!(m("отчёты", "отчётов"));
-        assert!(m("отчеты", "Отчётов"));
-        assert!(m("экспортировать", "экспорт"));
-        assert!(m("экспорт", "экспортировать"));
-        assert!(m("reports", "report"));
-        assert!(m("PDF", "pdf"));
-        // короткие слова — только целиком
-        assert!(!m("код", "кодекс"));
-        assert!(!m("pdf", "pdfium"));
-        // длинные с общим началом — совпадают (сознательно: это подтверждение, не поиск)
-        assert!(m("план", "планета"));
-        // разные слова
-        assert!(!m("логирование", "экспорт"));
-        assert!(!m("сервера", "скачать"));
-        assert_eq!(idea_stem("отчётов"), "отчё");
-        assert_eq!(idea_stem("экспортировать"), "экспортиров");
-        assert_eq!(idea_stem("код"), "код");
-    }
+    // основы слов (бывш. `idea_stem_match_forms_and_short_words`) — тест `zam_search::recall`
+    // `stem_word_match_forms_and_short_words` (задача 9 M6)
 
     /// Порог подтверждения ограничен словами идеи: длинный запрос к короткой идее подходит.
     #[test]
@@ -4392,9 +4310,9 @@ mod tests {
             "This would make the server UI nicer."
         ));
         // служебные слова не считаются
-        assert!(zam_markdown::is_stop_word("чтобы") && zam_markdown::is_stop_word("the"));
+        assert!(zam_core::text::is_stop_word("чтобы") && zam_core::text::is_stop_word("the"));
         assert_eq!(
-            idea_terms(&error_terms("Ещё еще отчёты отчеты для")),
+            prepared_terms(&error_terms("Ещё еще отчёты отчеты для"), WordMatch::Stems),
             ["отчеты"]
         );
     }

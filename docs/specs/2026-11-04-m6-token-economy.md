@@ -1094,6 +1094,16 @@ v1.24 §10.7 переписывается явно, с этой оговорко
   деградировал до FTS. Сетка на `hints.toml --mode fts`: {0,2; 0,3; 0,4; 0,5; 0,6}. Правило —
   наибольшее значение, при котором `hint_recall` FTS-only ≥ 0,5 и `silence_rate` ≥ 0,7. Иначе 0,6.
 - Сетки — после задачи формата (§16, 5) и перепроверка после задачи 7: строки подсказок меняются.
+- **Итог задачи 9 (2026-11-08)**, `eval/results/2026-11-08-fts-hints-grid-m6-hints{,-fts}.md`
+  (FTS, A/A побайтово; набор 120, `post_tool` 52 по корзинам ≤ 3 / 4–8 / 9–20 / > 20 — 11/17/12/12):
+  - `recall.post_tool_coverage` — новый ключ `{divisor, cap, word_match}`, умолчание
+    **`{3, 6, stems}`** (было `{3, 4, plain}`): Δ `hint_precision` +0,161 [+0,069…+0,266], Δ
+    `hint_recall` +0,032 [0,000…], Δ `silence_rate` +0,231 (односторонние 95 %); выигрыш — на
+    ошибках > 20 слов (точность 0,194 → 0,857);
+  - `recall.prompt_min_score_fts` — **0,6**: тишина FTS-only 0,200 при любом значении 0,2–0,6
+    (условие ≥ 0,7 не выполнено); действует на подсказки `prompt` и подсказки-идеи.
+  - Общий код слов — `zam_core::text` (стоп-список) и `zam_search::recall` (`StemWord`,
+    `WordMatch`, `CoverageRule`); подсказки-идеи — на нём, топ-5 = эталон M5.7 (67/67).
 
 ## 10. Буст вида (решение 11)
 
@@ -1725,6 +1735,7 @@ v1.24 §10.7 переписывается явно, с этой оговорко
 | `recall.digest_code_map_tokens` | 0..=1000 | 0 | §8 |
 | `recall.snippet_tokens` | 0..=200 | 60 | §4.3 |
 | `recall.prompt_min_score_fts` | 0..=1 | 0,6 | §9 |
+| `recall.post_tool_coverage` | `{divisor 1..=10, cap 2..=32, word_match plain \| stems}` | `{3, 4, plain}` (по сетке — `{3, 6, stems}`) | §9 (задача 9) |
 | `code.brief_tokens` | 0..=1000 | 150 | §8 |
 | клиент `hooks.checkpoint_impact` | bool | `false` | §12 |
 | клиент `hooks.holdout` | 0..=0,5 | 0 | §12 |

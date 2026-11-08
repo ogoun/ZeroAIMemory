@@ -4080,6 +4080,98 @@ UTC, без прогонов на GPU): 182 цели, **2600 PASS, 3 FAIL, 34 ig
 
 ### Задача 9. Пороги подсказок, общий код совпадения слов
 
+Исполнитель — 2026-11-08, ветка `m6-token-economy` (основной каталог; параллельно 18a в
+`.tmp/m6/wt-b`). Бриф `task-9-brief.md` повреждён в начале (первые строки — служебный вывод
+записи, не UTF-8): задача взята из плана (Task 9) целиком, расхождений с остатком брифа нет.
+
+**Шаг 1 — эквивалентность (до переноса — PASS, после — PASS).**
+- `ideas_recall::idea_hints_top5_match_m57` — протокол поля `protocol` эталона в процессе:
+  сервер без моделей, конфигурация из поля `config` (`ideas.proactive = true`, `prompt_max = 1`,
+  `prompt_top_k = 5`, `prompt_min_score = 0,6`, `timeout_ms = 60000`), `prompt_min_score_fts` =
+  `prompt_min_score` (у M5.7 ключа нет — `null`, тест это проверяет); 50 идей `ideas.toml` через
+  API (`propose`, `decide by: human`, задача `dropped`/`done`), `horizon_days = 0` — `defer` на
+  завтра и SQL `data.horizon` = сегодня UTC (часы сервера — настоящие, тест не замораживает);
+  сессия на запрос, `prompt` до 5 новых подсказок-идей, без событий эпохи; `w:<id>` →
+  `idea:<key>`. 67 из 67 строк эталона совпали до и после переноса.
+- `zam-markdown boundary::stop_words_identical_after_move` — побайтовое равенство стоп-списка
+  замороженной копии M5.7 (до переноса — приватной константе, после — `zam_core::text::STOP_WORDS`)
+  и реэкспорт `zam_markdown::is_stop_word`.
+
+**Шаг 3 — перенос.**
+- `zam-core::text` — `STOP_WORDS`, `is_stop_word` (без зависимостей); `zam-markdown` берёт их
+  оттуда (`zam-core` стал обычной зависимостью), `pub use zam_core::text::is_stop_word`.
+- `zam-search::recall` — `STEM_MIN_CHARS`, `norm_word`, `stem`, `StemWord`, `WordMatch {Plain,
+  Stems}`, `prepared_terms`, `stem_words`, `CoverageRule {divisor, cap, word_match}` (`M4`, `M6`,
+  `need`), `CoverageQuery` (запрос готовится один раз на ошибку), `coverage_enough(query, text,
+  rule)` вместо прежнего `coverage_enough(matched, total)`; `serde` — для ключа конфигурации.
+  `Stems` по тексту записи берёт все слова (без предела 32 слов запроса).
+- Сервер: `IdeaQuery` идей — на `stem_words`/`StemWord`, свой фиксированный порог
+  `IDEA_QUERY_RULE` (⌈n/3⌉ от 2 до 4) — `recall.post_tool_coverage` на идеи не влияет;
+  `idea_norm_word`/`idea_stem`/`idea_terms`/`stem_words` сервера удалены (тест основ — в
+  `zam-search`). `post_tool` — `CoverageQuery` по `recall.post_tool_coverage`.
+- **[решение исполнителя]** `recall.prompt_min_score_fts` действует на подсказки `prompt` и
+  подсказки-идеи (обе по ответу внутреннего поиска с `degraded: true`; `prompt_min_score(st,
+  &v)`); пакет субагенту (`brief`) — по-прежнему `prompt_min_score` (§9 говорит о `prompt`).
+- `/health.features` += `hint_thresholds`; xtask `caps::KEYS` += `recall.post_tool_coverage.*`;
+  `caps::env_to_key` понимает вложенные ключи (`ZAM_A__B__C` → `a.b.c`, как сервер).
+- Тесты: `zam-search` — `coverage_rule_m4_equals_old_formula` (вся сетка n ≤ 39, m ≤ n),
+  `stem_word_match_forms_and_short_words`, `prepared_terms_by_word_match`,
+  `coverage_stems_vs_plain`; `zam-core` — `stop_words_lowercase_only`; сервер —
+  `config::recall_hint_threshold_keys`, `recall::post_tool_coverage_word_match_from_config`,
+  `recall::prompt_fts_only_uses_fts_threshold`. Правлены под новый ключ (сервер теста без модели —
+  порог FTS-only): `recall::prompt_returns_0_to_3_above_threshold` (RED: 2 подсказки при
+  `prompt_min_score = 1`), `m56_acceptance` (порог 0 для негативной проверки).
+
+**Шаг 2 — набор `hints.toml`: 120 случаев** (prompt 50, post_tool 52, pre_tool 18; релевантных
+60). Новые insight `h18`–`h26` (кодировки, git, сеть, тесты, сборка, без триггеров), случаи
+`p-31`–`p-50`, `e-25`–`e-52`. `post_tool` 26/26; корзины длины — слов `error_terms`
+нормализованной ошибки (`n` порога покрытия, **[решение исполнителя]**): ≤ 3 — 11 (5/6), 4–8 — 17
+(9/8), 9–20 — 12 (6/6), > 20 — 12 (6/6). Проверка — `validate_hints` (≥ 120, `post_tool` ≥ 48 и
+половина, корзины ≥ 10), `eval --check` печатает корзины. Оговорка: случаи и insight написаны
+исполнителем вместе с сеткой (в т. ч. трудные на основы `e-30`, `e-36`) — выбор может быть
+оптимистичен к `stems`; перемер на живых ошибках — в A/B (задача 12).
+
+**Шаг 4 — сетки** (`cargo xtask eval --hints --grid <файл> --mode fts`, xtask
+`hints/grid.rs`): один индекс, каждая точка — копия каталога и сервер с `ZAM_*` точки; A/A —
+первая точка дважды: **побайтово** в обеих сетках (порог шума 0). Бутстреп случаев 10 000,
+односторонние 95 %. `post_tool` идёт без векторного канала (`error_regex` + FTS) — сетка на FTS
+(GPU не понадобился). Результаты — `eval/results/2026-11-08-fts-hints-grid-m6-hints{,-fts}.{json,md}`.
+- `recall.post_tool_coverage` (52 случая `post_tool`; база `{3, 4, plain}`: precision 0,321,
+  recall 0,806, silence 0,462). Прошли п. 1–2: `d2-c4-plain` (Δp +0,058 [+0,023…]),
+  `d2-c4-stems` (+0,136 [+0,060…]), **`d3-c6-stems` (+0,161 [+0,069…+0,266], Δrecall +0,032
+  [0,000…], Δsilence +0,231)** — выбор по п. 2. Не прошли по полноте: `*-c6-plain`, `d2-c6-stems`
+  (Δrecall −0,032…, нижняя граница −0,097/−0,129). По корзинам у выбора: ≤ 3 — recall 0,8 → 1,0,
+  precision −0,175; 4–8 — precision 0, silence −0,25 (`e-16`, `e-19`: ложные по основам); 9–20 —
+  +0,100 / silence +0,333; > 20 — precision 0,194 → 0,857, silence 0 → 1,0. **Решение:
+  умолчание `{divisor 3, cap 6, word_match stems}`** (`CoverageRule::M6`; `M4` — константа).
+- `recall.prompt_min_score_fts` {0,6; 0,2; 0,3; 0,4; 0,5} (50 случаев `prompt`, FTS-only):
+  recall 0,868–0,921, **silence_rate 0,200 у всех** (< 0,7) — условие §9 не выполнено ни при одном
+  значении → **0,6** (правило «иначе 0,6»). Порог балла FTS-only тишину не даёт: нормированный по
+  непустым каналам балл лучшего FTS-попадания ≈ 1 на любой запрос (→ M7 ниже).
+- Перепроверка «после 7» — эти же прогоны (7a/7b уже в ветке).
+
+**Проверки** (`target/r1-t9`, `-j 2`, `CARGO_INCREMENTAL=0`; логи `.tmp/m6/task9/`):
+`cargo fmt --all -- --check` — чисто; `cargo clippy --workspace --all-targets -- -D warnings` — чисто;
+`zam-core` 19, `zam-search` 37, `zam-markdown` (lib 27 и др.), `xtask` 181 + 5 — PASS (в т. ч.
+`hint_set_is_valid`, `hints::grid::*`); `zam-server` `--lib` 249 (+1 ignored), `recall` 38, `ideas_recall`
+27 (+1 ignored, с `idea_hints_top5_match_m57`), `boot` 13, `m56_acceptance` 8, `m57_acceptance`
+13, `recall_brief` 9 — PASS; `zam-cli` `hooks` 64, `m4_acceptance` 5 — PASS (первый прогон
+`hooks` — известный флак `session_start_spawns_background_sync_once_per_interval`, → 15a;
+повтор зелёный). Полный `cargo test --workspace` не запускался (решение владельца — контролёр).
+
+**Передать:**
+- **→ 13a/13c:** CHANGELOG и ТЗ: ключи `recall.prompt_min_score_fts` (0,6) и
+  `recall.post_tool_coverage` (`{3, 6, stems}`, было `{3, 4, plain}`), `features:
+  hint_thresholds`, `zam_core::text`; `eval --hints --grid`, набор 120.
+- **→ 13b:** `hints` с гибридом справочно (`post_tool` от модели не зависит; `prompt` —
+  `prompt_min_score` 0,6 не менялся).
+- **→ M7:** FTS-only подсказки `prompt` — тишина 0,20 при любом пороге: нужен иной признак
+  (абсолютный bm25, покрытие слов запроса как у `post_tool`), а не порог нормированного балла.
+- **→ 15a (вне задачи):** `zam-core/src/lib.rs` — doc-комментарий `HOOK_BUDGET_SPENT` стоит над
+  `certainty_short` (строки перепутаны при правке); модель отбора `post_tool_pick` в
+  `eval --hints` (калибровка M4) знает только `plain` — её «совпадение с сервером» при новом
+  умолчании ниже, это справочная модель M4.
+
 ### Задача 10. Буст вида
 
 ### Задача 11. `boost_area`, `w_attach`

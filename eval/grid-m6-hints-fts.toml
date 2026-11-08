@@ -1,0 +1,29 @@
+# Сетка порога подсказок к `prompt` при поиске только FTS — `recall.prompt_min_score_fts` (M6 §9,
+# M4.5 M-9; задача 9):
+#   cargo xtask eval --hints --grid eval/grid-m6-hints-fts.toml --mode fts
+# Сервер без модели: поиск `prompt` деградирует до FTS (`degraded`), действует этот порог.
+# Первая точка — значение до M6 (0,6 = `prompt_min_score`). Выбор §9: наибольшее значение, при
+# котором hint_recall FTS-only ≥ 0,5 и silence_rate ≥ 0,7; иначе 0,6. Случаи — `prompt`
+# eval/hints.toml; один индекс на все точки, A/A — побайтово.
+
+rule = "prompt_min_score_fts"
+
+[[point]]
+name = "fts-0.6"
+env = { ZAM_RECALL__PROMPT_MIN_SCORE_FTS = "0.6" }
+
+[[point]]
+name = "fts-0.2"
+env = { ZAM_RECALL__PROMPT_MIN_SCORE_FTS = "0.2" }
+
+[[point]]
+name = "fts-0.3"
+env = { ZAM_RECALL__PROMPT_MIN_SCORE_FTS = "0.3" }
+
+[[point]]
+name = "fts-0.4"
+env = { ZAM_RECALL__PROMPT_MIN_SCORE_FTS = "0.4" }
+
+[[point]]
+name = "fts-0.5"
+env = { ZAM_RECALL__PROMPT_MIN_SCORE_FTS = "0.5" }

@@ -4,6 +4,7 @@ pub mod id;
 pub mod snapshot;
 pub mod solution;
 pub mod target;
+pub mod text;
 pub mod time;
 pub mod token;
 

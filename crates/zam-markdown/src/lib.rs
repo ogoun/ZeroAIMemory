@@ -20,7 +20,6 @@ mod sanitize;
 mod secrets;
 mod sentences;
 
-pub use boundary::is_stop_word;
 pub use chunk::{
     ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, ESTIMATE_C, ESTIMATE_M, EstimateCounter,
     TokenCounter, chunk_note, split_plain,
@@ -45,3 +44,4 @@ pub use render::{
 pub use sanitize::sanitize_html;
 pub use secrets::{SECRET_MARK, SecretHit, SecretKind, mask_secrets, mask_text, scan_secrets};
 pub use sentences::split_sentences;
+pub use zam_core::text::is_stop_word;

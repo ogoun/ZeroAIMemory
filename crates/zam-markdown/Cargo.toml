@@ -17,9 +17,10 @@ serde.workspace = true
 syntect.workspace = true
 thiserror.workspace = true
 unicode-segmentation.workspace = true
+# стоп-список ru/en (`zam_core::text`, общий с совпадением слов подсказок `zam-search`)
+zam-core = { path = "../zam-core" }
 
 [dev-dependencies]
 serde_json.workspace = true
 proptest.workspace = true
 pulldown-cmark.workspace = true
-zam-core = { path = "../zam-core" }

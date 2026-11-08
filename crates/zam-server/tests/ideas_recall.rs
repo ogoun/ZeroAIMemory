@@ -1381,3 +1381,172 @@ async fn prompt_idea_not_repeated_after_new_epoch() {
     let j = prompt(&a, "s1", "как сделать экспорт отчётов в PDF").await;
     assert!(idea_items(&j).is_empty(), "{j}");
 }
+
+/// Задача 9 M6 (спецификация §9, план — шаг 1): подсказки-идеи к `prompt` совпадают с эталоном
+/// M5.7 `idea_hints_m57.json` — общий код совпадения слов (`zam_search::recall`) не меняет
+/// поведения. Протокол — поле `protocol` эталона (xtask `hints::ideas`): сервер без моделей,
+/// конфигурация — явно из поля `config` (`recall.prompt_min_score_fts` у M5.7 нет — ставится
+/// равным `prompt_min_score`); 50 идей корпуса через API (`by: human`), горизонт
+/// `horizon_days = 0` — SQL `data.horizon` = сегодня UTC по часам сервера; на запрос — своя
+/// сессия, `prompt` повторяется до 5 новых подсказок-идей (эпоха не меняется); `w:<id>` →
+/// `idea:<key>`. Правило идей держит свой делитель 3, `recall.post_tool_coverage` не влияет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idea_hints_top5_match_m57() {
+    let root = repo();
+    let fx: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/idea_hints_m57.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let c = fx["config"].clone();
+    let a = server("m57-top5", |cfg| {
+        cfg.ideas.proactive = c["ideas.proactive"].as_bool().unwrap();
+        cfg.ideas.prompt_max = c["ideas.prompt_max"].as_u64().unwrap() as u32;
+        cfg.ideas.prompt_top_k = c["ideas.prompt_top_k"].as_u64().unwrap() as u32;
+        cfg.recall.prompt_min_score = c["recall.prompt_min_score"].as_f64().unwrap();
+        cfg.recall.timeout_ms = c["recall.timeout_ms"].as_u64().unwrap();
+        // у M5.7 ключа нет (`null`): порог FTS-only там — `prompt_min_score`
+        assert!(c["recall.prompt_min_score_fts"].is_null());
+        cfg.recall.prompt_min_score_fts = cfg.recall.prompt_min_score;
+    })
+    .await;
+    let ideas: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("eval/sessions-corpus/ideas/ideas.toml")).unwrap(),
+    )
+    .unwrap();
+    let today = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .to_string();
+    let mut keys: std::collections::BTreeMap<String, String> = Default::default();
+    for i in ideas["idea"].as_array().unwrap() {
+        let key = i["key"].as_str().unwrap();
+        let mut data = json!({"origin": i["origin"].as_str().unwrap()});
+        if let Some(p) = i.get("priority").and_then(|p| p.as_str()) {
+            data["priority"] = json!(p);
+        }
+        let body = i.get("body").and_then(|b| b.as_str()).unwrap_or_default();
+        let r = a
+            .t(
+                Method::POST,
+                &sol(),
+                Some(
+                    json!({"kind": "idea", "title": i["title"].as_str().unwrap(),
+                            "body": body, "data": data}),
+                ),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{key}: {}", r.text());
+        let id = r.json()["id"].as_str().unwrap().to_string();
+        let decide = |body: Value| post(&a, &id, "decide", body);
+        let accept = || decide(json!({"decision": "accept", "by": "human"}));
+        match i["state"].as_str().unwrap() {
+            "new" => {}
+            "proposed" => {
+                let r = post(&a, &id, "propose", json!({"text": "пора обсудить"})).await;
+                assert_eq!(r.status, StatusCode::OK, "{key}: {}", r.text());
+            }
+            "declined" => {
+                let r = decide(json!({"decision": "decline", "by": "human"})).await;
+                assert_eq!(r.status, StatusCode::OK, "{key}: {}", r.text());
+            }
+            st @ ("accepted" | "released" | "done") => {
+                let r = accept().await;
+                assert_eq!(r.status, StatusCode::OK, "{key}: {}", r.text());
+                let task = r.json()["task"]["id"].as_str().unwrap().to_string();
+                let status = match st {
+                    "released" => Some(json!({"status": "dropped", "reason": "не до того"})),
+                    "done" => Some(json!({"status": "done"})),
+                    _ => None,
+                };
+                if let Some(b) = status {
+                    let r = a
+                        .tok_rev(
+                            &a.token,
+                            Method::PATCH,
+                            &format!("/api/v1/entries/{task}"),
+                            Some(b),
+                        )
+                        .await;
+                    assert_eq!(r.status, StatusCode::OK, "{key}: {}", r.text());
+                }
+            }
+            "deferred" => {
+                let days = i["horizon_days"].as_integer().unwrap();
+                let horizon = jiff::Timestamp::now()
+                    .to_zoned(jiff::tz::TimeZone::UTC)
+                    .date()
+                    .checked_add(jiff::Span::new().days(days.max(1)))
+                    .unwrap()
+                    .to_string();
+                let r =
+                    decide(json!({"decision": "defer", "by": "human", "horizon": horizon})).await;
+                assert_eq!(r.status, StatusCode::OK, "{key}: {}", r.text());
+                if days == 0 {
+                    // API принимает горизонт не раньше завтра: «наступил» — прямой SQL
+                    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+                    let (id2, t) = (id.clone(), today.clone());
+                    let n = db
+                        .write(move |tx| {
+                            Ok(tx.execute(
+                                "UPDATE entries SET data = json_set(data, '$.horizon', ?2) \
+                                 WHERE id = ?1",
+                                [id2, t],
+                            )?)
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(n, 1, "{key}");
+                }
+            }
+            other => panic!("{key}: состояние {other}"),
+        }
+        keys.insert(format!("w:{id}"), format!("idea:{key}"));
+    }
+    assert_eq!(keys.len(), 50);
+    let mut diffs = Vec::new();
+    for row in fx["rows"].as_array().unwrap() {
+        let qid = row["id"].as_str().unwrap();
+        let session = format!("idea-hints-{qid}");
+        let mut got: Vec<String> = Vec::new();
+        while got.len() < 5 {
+            let j = prompt(&a, &session, row["query"].as_str().unwrap()).await;
+            assert!(
+                !j["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|w| w.as_str().is_some_and(|w| w.contains("recall timeout"))),
+                "{qid}: {j}"
+            );
+            let items = idea_items(&j);
+            if items.is_empty() {
+                break;
+            }
+            for w in items {
+                let k = keys.get(&w).unwrap_or_else(|| panic!("{qid}: чужая {w}"));
+                assert!(!got.contains(k), "{qid}: {k} повторилась в сессии");
+                if got.len() < 5 {
+                    got.push(k.clone());
+                }
+            }
+        }
+        let want: Vec<String> = row["ideas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        if got != want {
+            diffs.push(format!("{qid}: M6 {got:?}, M5.7 {want:?}"));
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "расхождения с эталоном M5.7:\n{}",
+        diffs.join("\n")
+    );
+}

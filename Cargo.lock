@@ -7103,6 +7103,7 @@ version = "0.0.10-m5.7"
 dependencies = [
  "jiff",
  "regex",
+ "serde",
  "zam-core",
 ]
 

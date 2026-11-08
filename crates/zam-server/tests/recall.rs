@@ -448,10 +448,12 @@ async fn prompt_returns_0_to_3_above_threshold() {
     .await;
     assert_eq!(j["text"], "", "{j}");
     assert!(j["items"].as_array().unwrap().is_empty());
-    // порог выше любого балла — тишина и для релевантного запроса
+    // порог выше любого балла — тишина и для релевантного запроса (сервер теста без модели:
+    // действует порог FTS-only, M6 §9)
     let b = api("recall-prompt-strict", |c| {
         roomy(c);
         c.recall.prompt_min_score = 1.0;
+        c.recall.prompt_min_score_fts = 1.0;
     })
     .await;
     insight(
@@ -930,6 +932,87 @@ async fn post_tool_long_trace_finds_short_insight() {
     let got = ids(&j);
     assert!(got.contains(&format!("i:{short}")), "{j}");
     assert!(!got.contains(&format!("i:{decoy}")), "{j}");
+}
+
+/// M6 §9: `recall.post_tool_coverage.word_match` — `plain` сравнивает начало слова (форма
+/// «консоль» не находит «консоли»), `stems` — основы, без служебных слов, `ё` → `е`.
+#[tokio::test]
+async fn post_tool_coverage_word_match_from_config() {
+    use zam_search::recall::WordMatch;
+    let mut got = Vec::new();
+    for (name, wm) in [("plain", WordMatch::Plain), ("stems", WordMatch::Stems)] {
+        let a = api(&format!("recall-post-tool-{name}"), |c| {
+            roomy(c);
+            c.recall.post_tool_coverage.word_match = wm;
+        })
+        .await;
+        let id = insight(
+            &a,
+            &a.token,
+            "knowledge",
+            "Вывод консоли Windows с кириллицей превращается в кракозябры",
+            "Кодовая страница консоли 866 не совпадает с UTF-8: chcp 65001 перед запуском.",
+            "gotcha",
+        )
+        .await;
+        let j = ok(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "post_tool", "error": "консоль: кракозябры"}),
+        )
+        .await;
+        got.push((ids(&j).contains(&format!("i:{id}")), j));
+    }
+    assert!(!got[0].0, "plain: «консоль» ≠ «консоли»: {}", got[0].1);
+    assert!(got[1].0, "stems: основа «конс»: {}", got[1].1);
+}
+
+/// M6 §9: поиск `prompt` без модели деградировал до FTS — порог балла подсказки
+/// `recall.prompt_min_score_fts`, а `recall.prompt_min_score` не действует.
+#[tokio::test]
+async fn prompt_fts_only_uses_fts_threshold() {
+    let mut counts = Vec::new();
+    for (name, min, fts) in [("fts-low", 1.0, 0.0), ("fts-high", 0.0, 1.0)] {
+        let a = api(&format!("recall-prompt-{name}"), |c| {
+            roomy(c);
+            c.recall.prompt_min_score = min;
+            c.recall.prompt_min_score_fts = fts;
+        })
+        .await;
+        insight(
+            &a,
+            &a.token,
+            "knowledge",
+            "Квазар",
+            "Квазар светит ярче галактики.",
+            "discovery",
+        )
+        .await;
+        for i in 0..4 {
+            let filler = "длинное описание наблюдений и приборов обсерватории ".repeat(i + 2);
+            insight(
+                &a,
+                &a.token,
+                "knowledge",
+                &format!("Наблюдения, серия {i}"),
+                &format!("{filler} Квазар в поле зрения."),
+                "discovery",
+            )
+            .await;
+        }
+        let j = ok(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "prompt", "prompt": "квазар"}),
+        )
+        .await;
+        counts.push((ids(&j).len(), j));
+    }
+    // порог 0 при FTS — все 3 места; порог 1 — только лучшие (балл 1,0), меньше
+    assert_eq!(counts[0].0, 3, "{}", counts[0].1);
+    assert!(counts[1].0 < 3, "{}", counts[1].1);
 }
 
 // ---- замер бюджета (§10.3, §17) ----
