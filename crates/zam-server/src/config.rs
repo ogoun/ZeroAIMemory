@@ -522,13 +522,15 @@ pub struct SearchSection {
     /// документов задачи 10 M5 (`eval/results/2026-11-02-m5-docs-summary.md`).
     pub attach_prefetch: usize,
     /// Множители слитого балла (§9.2 п. 4) для insight вида `gotcha` и `failure` и для узлов и
-    /// записей текущей области (`X-Zam-Area`). По умолчанию 1,05 / 1,05 / 1,10 — сетка eval задачи
-    /// 18 M3: буст вида должен быть ниже буста `theorem` (1,10), иначе гипотеза `gotcha` обходит
+    /// записей текущей области (`X-Zam-Area`). По умолчанию 1,05 / 1,05 / 1,0. Буст вида — сетка
+    /// eval задачи 18 M3: буст вида должен быть ниже буста `theorem` (1,10), иначе гипотеза `gotcha` обходит
     /// противоречащую ей теорему (при 1,15 и 1,10 `reliable_first` 0,857, при 1,05 — 1,000);
     /// 1,05 против 1,0 — Δ nDCG@10 −0,001 [−0,004…+0,003] и сохраняет подъём `failure`-записи над
-    /// заметками (`s-29`). Буст области 1,10 — сетка задачи 11 M6 по набору областей
-    /// (`eval/area-queries.toml`): правило выбора, записанное до прогона, оставляет 1,10 (журнал;
-    /// без буста лучше запросы с ответом вне области, с бустом — в области).
+    /// заметками (`s-29`). Буст области 1,0 (без буста) — сетка задачи 11 M6 по набору областей
+    /// (`eval/area-queries.toml`, решение контролёра): при 1,10 запросы с ответом без области
+    /// теряют −0,110 nDCG@10 (5 из 12 хуже), с ответом в другой области — −0,026, а выигрыш своей
+    /// области (+0,035, 4/0) по знаковому тесту незначим (p = 0,0625); весь набор 1,0 − 1,10 =
+    /// +0,033. Прежние 1,10 (M3) — без замера.
     pub boost_gotcha: f64,
     pub boost_failure: f64,
     pub boost_area: f64,
@@ -1358,7 +1360,7 @@ impl Default for ServerConfig {
                 attach_prefetch: zam_index::ATTACH_PREFETCH,
                 boost_gotcha: 1.05,
                 boost_failure: 1.05,
-                boost_area: 1.10,
+                boost_area: 1.0,
                 boost_axiom: 1.20,
                 boost_theorem: 1.10,
                 boost_hypothesis: 1.00,
@@ -1725,8 +1727,9 @@ mod tests {
                 c.search.boost_failure,
                 c.search.boost_area
             ),
-            // сетка задачи 18 M3 (fix round 1): буст вида ниже буста theorem — 1,05
-            (1.05, 1.05, 1.10)
+            // сетка задачи 18 M3 (fix round 1): буст вида ниже буста theorem — 1,05; буст
+            // области — 1,0 (сетка задачи 11 M6)
+            (1.05, 1.05, 1.0)
         );
         assert_eq!(
             (
@@ -1795,7 +1798,7 @@ mod tests {
     #[test]
     fn boosts_and_dedup_threshold_validated() {
         let ok = vec![
-            env("ZAM_SEARCH__BOOST_AREA", "1.0"),
+            env("ZAM_SEARCH__BOOST_AREA", "1.3"),
             env("ZAM_INSIGHTS__DEDUP_THRESHOLD", "0.85"),
             env("ZAM_INSIGHTS__DECISION_CONFLICT_THRESHOLD", "0.7"),
             env("ZAM_SEARCH__CONTRADICTS_ORDER", "false"),
@@ -1805,7 +1808,7 @@ mod tests {
         assert!(!c.search.contradicts_order);
         assert_eq!(
             (c.search.boost_area, c.insights.dedup_threshold),
-            (1.0, 0.85)
+            (1.3, 0.85)
         );
         for (k, v) in [
             ("ZAM_SEARCH__BOOST_GOTCHA", "0"),

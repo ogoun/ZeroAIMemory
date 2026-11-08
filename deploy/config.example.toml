@@ -178,7 +178,9 @@ attach_prefetch = 30
 # выдачи на лучший.
 boost_gotcha = 1.05
 boost_failure = 1.05
-boost_area = 1.10
+# boost_area 1.0 (без буста) — сетка задачи 11 M6 по набору областей: при 1.10 запросы с
+# ответом без области или в другой области хуже, выигрыш своей области незначим.
+boost_area = 1.0
 # Эпистемический статус certainty заметок и записей (§7.5): axiom > theorem > hypothesis
 # (подтверждено сеткой eval: слабее — ниже reliable_first и nDCG@10).
 boost_axiom = 1.20

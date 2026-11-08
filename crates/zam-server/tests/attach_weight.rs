@@ -234,7 +234,6 @@ fn w_fixture(rel: &str) -> std::path::PathBuf {
 }
 
 /// Снимает эталон [`W_ATTACH_FIXTURE_FTS`] (код до задачи 11).
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "снимает эталон; запускать только на коде до правки M6 §11 (w_attach)"]
 async fn snapshot_w_attach_fixture() {
