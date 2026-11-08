@@ -4176,3 +4176,97 @@ UTC, без прогонов на GPU): 182 цели, **2600 PASS, 3 FAIL, 34 ig
 - → 15a: дата точки сетки берётся на старте, а сессии точки могут перейти полночь UTC — в конце точки сверять `today_utc()` с `info.date` и при расхождении писать примечание в `notes`.
 - → 15a: `rule_line_shape` в `tests/recall.rs` предполагает путь без пробелов — комментарий или поддержка пробелов.
 - → 13b: после смены строки L0 правил в пакете субагента (около −7 токенов на правило) ТС-2 не перемерялся — перемер на holdout.
+
+### Задача 18a. `zam-server backup`/`restore`, автокопии — исполнение (2026-11-08)
+
+Ветка `m6-portability` (worktree `.tmp/m6/wt-b`), сборка — `target/r1-t18a`.
+
+**Сделано.**
+- `zam-store`:
+  - новый модуль `backup.rs`: `vacuum_into(src, dst, OpenMode)` (`QueryOnly` — `READ_WRITE`
+    без записи, `Immutable` — `immutable=1` только под своим `.zam.lock`), `integrity_ok`
+    (`integrity_check` + `foreign_key_check`), `meta_value`, `chunkers_of`, `stale_chunkers`,
+    `chunk_count`, `blob_list`, `query_strings`, `header_user_version` (версия схемы из
+    заголовка файла без SQLite); признак копии `.zam-backup`: `hold_backup_flag` (лок ОС до
+    конца копии), `backup_flag_active(data_dir, max_age)`, `set_backup_flag_max_age`;
+  - `db.rs`: `DbOptions::backup_flag`; фоновый поток раз в `checkpoint_interval` читает
+    признак и выставляет `backup_active`; пока он стоит, ни фоновый `RESTART`, ни страховка
+    писателя по `wal_limit_bytes` не делаются (страховка — только `PASSIVE`);
+    `Db::backup_active()`, `Db::restart_count()`; путь признака передают `SystemStore::open` и
+    `UserDbs::get`;
+  - `datadir.rs`: `DataDir::open_for_restore` (метка `restore <pid>` в `.zam.lock` и дубль
+    `.zam-restore`), `lock_mark(root) -> Option<LockMark>`, `try_lock_dir` (лок без создания
+    подкаталогов); обычное открытие снимает дубль прерванного restore;
+  - `jobs.rs`: `set_reindex_pending(db, spec)` (обёртка `mark_reindex`, «вся база, из кэша»);
+  - `system.rs`: `SystemStore::clear_web_sessions`.
+- `zam-ml`: `installed_model_id(models_dir, id)` — `model_id` установленной модели без ORT.
+- `zam-index`: `supervisor::mark_storage_reindex(qdir, reason)` — флаг `.zam-reindex`.
+- `zam-server`:
+  - `backup/{mod,manifest,restore,schedule}.rs` — порядок §12б.2 (место → признак →
+    `system.db` → пользователи из копии `system.db` → базы → блобы по таблице `blobs` копии с
+    жёсткой ссылкой на предыдущую копию, иначе копией с проверкой SHA-256 → проверка копий →
+    опись → переименование `<имя>.partial` в `yyyy-MM-dd_HHmmss`); `--zip` — zip64 (базы
+    deflate, блобы store); отсутствующие блобы — отказ, опись со списком в `<имя>.failed/`;
+  - `restore`: лок с меткой, проверки до записи (пути описи — только базы и блобы, суммы,
+    размеры, версии схем, место), `--replace` → `backups/pre-restore-<время>/`, копирование
+    файлов, миграции при открытии, очистка `web_sessions`, аудит `server.restore`, отметки
+    reindex в каждой базе и `.zam-reindex`, прогноз векторов (`VectorPlan`), проверка ключа
+    Vault (`vault::keys::restored_key_fits`, ничего не создаёт), сброс `RULES_L1_CACHE`
+    (пункт «→ 18a» ревью 8b);
+  - `schedule::tick` — чистая функция; воркер обслуживания раз в минуту при
+    `schedule = "daily"`; `[backup]` в конфиге и `deploy/config.example.toml`;
+    `GET /index/status` → `backup: {last_at, schedule, warning}`;
+  - CLI `zam-server backup [--dir|--zip] [--json]`, `zam-server restore <src> [--replace]
+    [--no-reindex]`; все отказы — код 1; предупреждения о мастер-ключе и Vault — в stderr.
+
+**Решения исполнителя.**
+1. `PRAGMA query_only = 1` спецификации не ставится: SQLite с ним отказывает и в записи файла
+   `INTO` («attempt to write a readonly database», тест `vacuum_into_query_only_and_immutable`
+   поймал). Соединение копии — `READ_WRITE`, выполняет только `VACUUM INTO` (на источнике —
+   транзакция чтения), писателю не мешает (`backup_writer_no_busy_and_wal_bound`).
+2. Живость признака `.zam-backup` — по локу ОС на файле (fs4), а не по `pid` (как просило
+   одобрение спецификации 4.6 в progress): лок снимается ОС при любой смерти процесса, `pid`
+   мог бы достаться другому. Возраст — по времени изменения файла. Первые 10 с без лока —
+   действующий (окно между созданием файла и локом).
+3. На Windows занятый `LockFileEx` диапазон `.zam.lock` другим дескрипторам не читается, поэтому
+   метка `restore` дублируется файлом `.zam-restore`; `lock_mark` сначала пробует лок
+   (свободен — `None`), затем читает метку.
+4. `BackupError` дополнен `ReadOnly`, `NoData`, `BadArchive`; `RestoreOpts` — `model_id`
+   (прогноз векторов в тестах; `None` — по конфигурации); `RestoreReport` — `moved_to`.
+5. Копия ждёт 1,5 с после записи признака (интервал фонового потока сервера — 1 с), только
+   при занятом локе.
+6. Пропущенный вчерашний срок автокопии не догоняется до сегодняшнего `at`.
+7. Предупреждение о мастер-ключе — текст спецификации без markdown-кавычек: «Мастер-ключ Vault
+   не входит в копию: сохраните <путь> или ZAM_MASTER_KEY отдельно; без него секреты Vault на
+   новой машине не раскрыть».
+8. Для ML-тестов в worktree скопированы (не связаны) `target/deps/windows-x64/{onnxruntime,
+   qdrant,pdfium}` из основного каталога; модели — `ZAM_TEST_MODELS_DIR`.
+
+**Тесты.** `crates/zam-server/tests/backup.rs` — 29 тестов (копия 11, блобы 3, отказы restore 5,
+восстановление 7 + zip, расписание 2), `zam-store/tests/db.rs` — `db_checkpoint_passive_while_backup_flag`,
+`vacuum_into_query_only_and_immutable`; юнит-тесты `config::backup_section_defaults_and_ranges`,
+`manifest::classify_rejects_escapes`, `backup::immutable_uri_escapes`. Каталог только для чтения в
+`backup_immutable_only_under_own_lock`: Windows — запрет ACL `WD,AD` для `*S-1-1-0` (`icacls`,
+снимается в Drop), Linux — 0555 (под root — пропуск). Топ-5 в
+`restore_then_serve_*` сравнивается в новых сессиях (`X-Zam-Session`: сессии переезжают с копией,
+выданное сессии понижается) и с допуском на ничьи баллов (1e-4).
+
+**Проверки** (`target/r1-t18a`, логи — `.tmp/m6/task18a/`): `cargo fmt --all -- --check` — чисто;
+`cargo clippy --workspace --all-targets -- -D warnings` — чисто; `zam-store` (все цели) — 457 PASS;
+`zam-ml --lib` 17, `zam-index --lib` 40 PASS; `zam-server --test backup --features test-hooks` с
+`ZAM_REQUIRE_ML=1` — 29 PASS (в том числе оба ML-теста); `index_api`, `boot`, `vault`, `sessions`,
+`web` — 62 PASS; `zam-server --lib` — 250 PASS, 1 FAIL `ml::tests::chunk_model_without_embedder_uses_tokenizer`
+только при `ZAM_REQUIRE_ML=1` в worktree: тест берёт модели из `<repo>/target/models` и не смотрит
+`ZAM_TEST_MODELS_DIR` (к задаче не относится, см. ниже).
+
+**Найдено вне задачи.**
+- → 18c: после `restore` на управляемом (и на любом свежем) Qdrant пересборка идёт дважды:
+  `meta.reindex_pending` пишет точки из кэша, а затем воркер видит «коллекция создана заново при
+  проиндексированных узлах» (и флаг `.zam-reindex`) и делает `enqueue_reindex` — перенарезку и
+  задания всем заметкам (векторы снова из кэша, инференса нет: `embedded_texts = 0`). Верно, но на
+  большой базе стенда 2×CPU — лишняя перенарезка. Варианты: не ставить `.zam-reindex` при
+  отметках в базах, или воркеру пропускать `enqueue_reindex` для баз с `reindex_pending`. Решение —
+  при проверке переезда на стенде.
+- → контролёру: `zam-server/src/ml.rs::tests::chunk_model_without_embedder_uses_tokenizer`
+  ищет модели в `target/models` без учёта `ZAM_TEST_MODELS_DIR` — в worktree с `ZAM_REQUIRE_ML=1`
+  падает; в основном каталоге — нет.
