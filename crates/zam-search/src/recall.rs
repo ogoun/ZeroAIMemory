@@ -322,13 +322,15 @@ impl CoverageRule {
         word_match: WordMatch::Plain,
     };
 
-    /// Умолчание M6 по сетке §9 (задача 9, `eval/grid-m6-hints.toml`): ⌈n/3⌉, от 2 до 6, основы
-    /// слов — Δ hint_precision +0,161 [+0,069…], Δ hint_recall +0,032 [0,000…] к [`Self::M4`] на 52
-    /// случаях `post_tool`.
+    /// Умолчание M6 по сетке §9 (задача 9 с правками ревью, `eval/grid-m6-hints.toml`):
+    /// ⌈n/2⌉, от 2 до 6, слова как есть. Решение — на случаях M4 и двух независимых наборах (84 случая, 42
+    /// релевантных; случаи исполнителя задачи 9 — справочно): Δ hint_precision +0,252
+    /// (Бонферрони — нижняя граница +0,156), потерь ожидаемых подсказок 0 из 42, Δ silence_rate
+    /// +0,357; рост точности в каждой части — M4 +0,247, независимые +0,254.
     pub const M6: CoverageRule = CoverageRule {
-        divisor: 3,
+        divisor: 2,
         cap: 6,
-        word_match: WordMatch::Stems,
+        word_match: WordMatch::Plain,
     };
 
     /// Нужно совпавших слов из `n` (`n` — после [`prepared_terms`]).

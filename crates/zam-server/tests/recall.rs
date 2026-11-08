@@ -487,7 +487,14 @@ async fn prompt_returns_0_to_3_above_threshold() {
 /// строка «эта ошибка уже разбиралась»; случайное общее слово подсказку не поднимает.
 #[tokio::test]
 async fn post_tool_matches_error_regex_and_fts() {
-    let a = server("post-tool").await;
+    // правило покрытия M4 (⌈n/3⌉): у ошибки докера совпадают 2 слова из 6; при умолчании M6
+    // (⌈n/2⌉ от 2 до 6, сетка задачи 9) нужно 3 — подсказки не было бы
+    let a = api("recall-post-tool", |c| {
+        roomy(c);
+        c.recall.post_tool_coverage = zam_search::recall::CoverageRule::M4;
+    })
+    .await;
+    allow_rules(&a).await;
     let crlf = entry(
         &a,
         &a.token,
