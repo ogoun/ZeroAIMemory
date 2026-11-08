@@ -1,22 +1,35 @@
 //! `zam-server backup` и `restore`, автокопии (M6 §12б.2–§12б.4).
 //!
 //! **Копия** ([`backup`]) — отдельный процесс без остановки сервера:
-//! 1. место в каталоге копий (базы + новые блобы + 10 %) — до записи;
+//! 1. место в каталоге копий (базы + новые блобы + 10 %; архив — вдвое: сборка и zip) — до
+//!    записи; брошенные `*.partial` старше `backup.flag_max_hours` удаляются;
 //! 2. признак `.zam-backup` в каталоге данных: поток контрольных точек сервера перестаёт
 //!    делать `RESTART` (`zam_store::Db`), писатель не ждёт читателя копии;
-//! 3. `system.db` → `VACUUM INTO`; список пользователей — **из копии** `system.db`;
-//! 4. `users/<id>.db` каждого пользователя → `VACUUM INTO`;
-//! 5. блобы по таблице `blobs` копии каждой базы: жёсткая ссылка на тот же файл предыдущей
-//!    копии, иначе копия с проверкой SHA-256;
-//! 6. проверка копий баз (`integrity_check`, `foreign_key_check`), опись `manifest.json`;
-//! 7. признак снимается при любом исходе.
+//! 3. первый снимок `system.db` → **список пользователей**;
+//! 4. `users/<id>.db` каждого пользователя из списка → `VACUUM INTO`;
+//! 5. второй снимок `system.db` — он и идёт в копию: всё, на что ссылаются снимки баз
+//!    (ключи Vault `user_keys` первого секрета, решения, доступы), в нём уже есть; признак
+//!    снимается (блобы неизменяемы — копирование файлов писателю не мешает);
+//! 6. блобы по таблице `blobs` копии каждой базы: жёсткая ссылка на тот же файл предыдущей
+//!    копии, иначе копия с проверкой SHA-256 при записи;
+//! 7. проверка копий баз (`integrity_check`, `foreign_key_check`), `fsync`, опись
+//!    `manifest.json`, переименование `<имя>.partial` → `<yyyy-MM-dd_HHmmss>`.
 //!
-//! Каждая база — свой снимок; расхождения между ними (пользователь создан после снимка
-//! `system.db`, база ещё не создана) — в `drift` описи. Каталог копии пишется под именем
-//! `<имя>.partial` и переименовывается в `<yyyy-MM-dd_HHmmss>` только целиком готовым.
+//! Каждая база — свой снимок; расхождения между ними (пользователь создан после первого
+//! снимка `system.db`, база ещё не создана) — в `drift` описи.
 //!
-//! Без сервера (`.zam.lock` свободен) копия берёт лок сама и читает базы `immutable=1`; при
-//! занятом локе — `READ_WRITE` + `query_only` (может создать `-shm` закрытой базы).
+//! **Режим чтения баз.** При занятом локе (сервер запущен) — `READ_WRITE` без записи
+//! (`OpenMode::QueryOnly`, может создать `-shm` закрытой базы). Без сервера копия берёт лок
+//! сама; база без `-wal` (или с пустым) читается `immutable=1`, а база с непустым `-wal`
+//! (аварийная остановка) — `QueryOnly`: SQLite восстанавливает кадры WAL, `immutable=1` их бы
+//! не увидел. Каталог только для чтения с таким WAL — отказ с причиной.
+//!
+//! **Жёсткие ссылки** на блобы предыдущей копии не перепроверяются: блоб адресуется своей
+//! SHA-256, неизменяем и был проверен при записи в ту копию; суммы всех файлов проверяет
+//! `restore` до записи **[решение исполнителя 18a, ревью M3]**.
+//!
+//! На Linux копия получает права только владельца (каталоги 0700, файлы 0600): в ней токены
+//! и шифротексты Vault.
 //!
 //! **Восстановление** — [`restore`], **расписание** — [`schedule`].
 
@@ -29,7 +42,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use zam_store::{LockMark, OpenMode, StoreError};
+use zam_store::{BackupFlagHold, LockMark, OpenMode, StoreError};
 
 pub use manifest::{FileEntry, MANIFEST_FILE, MANIFEST_FORMAT, Manifest};
 pub use restore::{RestoreOpts, RestoreReport, VectorPlan, restore};
@@ -43,9 +56,11 @@ pub enum BackupError {
     Locked,
     #[error("идёт восстановление (zam-server restore): копия сейчас невозможна")]
     RestoreInProgress,
+    #[error("идёт копия (zam-server backup): дождитесь её конца")]
+    BackupInProgress,
     #[error(
-        "каталог данных не пуст (есть system.db или базы пользователей): укажите пустой \
-         каталог или --replace (прежние данные переносятся в backups/pre-restore-…)"
+        "каталог данных не пуст (есть system.db, её -wal/-shm, базы или блобы): укажите \
+         пустой каталог или --replace (прежние данные переносятся в backups/pre-restore-…)"
     )]
     NotEmpty,
     #[error("мало места: нужно {need} байт, свободно {free}")]
@@ -62,10 +77,28 @@ pub enum BackupError {
         .path.display()
     )]
     ReadOnly { path: PathBuf },
+    #[error(
+        "у базы {} незавершённый WAL (сервер остановлен аварийно), а каталог только для \
+         чтения: дайте права записи или запустите и штатно остановите сервер, затем повторите \
+         копию",
+        .path.display()
+    )]
+    UnrecoveredWal { path: PathBuf },
     #[error("в каталоге данных {} нет system.db", .0.display())]
     NoData(PathBuf),
     #[error("копия повреждена: {0}")]
     BadArchive(String),
+    /// Сбой после начала записи в каталог данных: каталог помечен незавершённым
+    /// восстановлением, сервер его не примет до повтора `restore --replace`.
+    #[error(
+        "восстановление прервано: {reason}. Каталог данных помечен незавершённым — повторите \
+         zam-server restore <копия> --replace{}",
+        .moved_to.as_ref().map(|p| format!("; прежние данные — в {}", p.display())).unwrap_or_default()
+    )]
+    RestoreFailed {
+        reason: String,
+        moved_to: Option<PathBuf>,
+    },
     #[error("ошибка ввода-вывода: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -126,7 +159,7 @@ pub fn master_key_warning(cfg: &ServerConfig) -> String {
 }
 
 /// Сколько ждать после записи признака, пока его заметят потоки контрольных точек сервера
-/// (их интервал — 1 с): `RESTART`, начатый до этого, задержал бы писателя.
+/// (их интервал — 1 с). Страховка писателя проверяет и сам файл признака.
 const FLAG_SETTLE: Duration = Duration::from_millis(1500);
 
 /// Имя каталога копии: `yyyy-MM-dd_HHmmss` (UTC).
@@ -150,7 +183,9 @@ pub fn copy_time(name: &str) -> Option<jiff::Timestamp> {
         .map(|z| z.timestamp())
 }
 
-/// Готовые копии каталога копий (с описью), от старых к новым.
+/// Готовые копии каталога копий (с описью), от старых к новым. Сюда входят и копии,
+/// снятые вручную `zam-server backup` в тот же каталог: ротация автокопий (`keep`) считает
+/// и удаляет их наравне с автокопиями.
 pub fn list_copies(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -190,50 +225,74 @@ pub fn status_json(cfg: &ServerConfig, now: jiff::Timestamp) -> serde_json::Valu
 
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
-    //! Тестовые точки копии (фича `test-hooks`): подмена свободного места и отказ жёсткой
-    //! ссылки — по каталогу данных, чтобы параллельные тесты не мешали друг другу.
+    //! Тестовые точки копии и восстановления (фича `test-hooks`) — по каталогу данных, чтобы
+    //! параллельные тесты не мешали друг другу: подмена свободного места, отказ жёсткой
+    //! ссылки, действие после первого снимка `system.db`, сбой в точке `zip` (запись
+    //! архива) или `restore_place` (середина переноса файлов в каталог данных).
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
 
     static FREE: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
     static NO_LINK: Mutex<Option<HashMap<PathBuf, ()>>> = Mutex::new(None);
+    static AFTER_FIRST: Mutex<Option<HashMap<PathBuf, Hook>>> = Mutex::new(None);
+    static FAIL: Mutex<Option<HashMap<PathBuf, &'static str>>> = Mutex::new(None);
+
+    fn set<T>(m: &Mutex<Option<HashMap<PathBuf, T>>>, k: &Path, v: Option<T>) {
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        let h = g.get_or_insert_with(HashMap::new);
+        match v {
+            Some(v) => h.insert(k.to_path_buf(), v),
+            None => h.remove(k),
+        };
+    }
+
+    fn get<T: Clone>(m: &Mutex<Option<HashMap<PathBuf, T>>>, k: &Path) -> Option<T> {
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()?
+            .get(k)
+            .cloned()
+    }
 
     /// Свободное место для копий каталога данных `data_dir` (`None` — настоящее).
     pub fn set_free_space(data_dir: &Path, free: Option<u64>) {
-        let mut g = FREE.lock().unwrap_or_else(|e| e.into_inner());
-        let m = g.get_or_insert_with(HashMap::new);
-        match free {
-            Some(f) => m.insert(data_dir.to_path_buf(), f),
-            None => m.remove(data_dir),
-        };
+        set(&FREE, data_dir, free);
     }
 
     /// Жёсткие ссылки копии каталога данных `data_dir` «не поддерживаются».
     pub fn set_link_fails(data_dir: &Path, fails: bool) {
-        let mut g = NO_LINK.lock().unwrap_or_else(|e| e.into_inner());
-        let m = g.get_or_insert_with(HashMap::new);
-        if fails {
-            m.insert(data_dir.to_path_buf(), ());
-        } else {
-            m.remove(data_dir);
-        }
+        set(&NO_LINK, data_dir, fails.then_some(()));
+    }
+
+    /// Действие после первого снимка `system.db` копии каталога `data_dir` (до баз).
+    pub fn set_after_first_snapshot(data_dir: &Path, f: Option<Hook>) {
+        set(&AFTER_FIRST, data_dir, f);
+    }
+
+    /// Сбой в точке `point` (`zip`, `restore_place`) для каталога данных `data_dir`.
+    pub fn set_fail_point(data_dir: &Path, point: Option<&'static str>) {
+        set(&FAIL, data_dir, point);
     }
 
     pub(super) fn free_space(data_dir: &Path) -> Option<u64> {
-        FREE.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()?
-            .get(data_dir)
-            .copied()
+        get(&FREE, data_dir)
     }
 
     pub(super) fn link_fails(data_dir: &Path) -> bool {
-        NO_LINK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|m| m.contains_key(data_dir))
+        get(&NO_LINK, data_dir).is_some()
+    }
+
+    pub(super) fn after_first(data_dir: &Path) {
+        if let Some(f) = get(&AFTER_FIRST, data_dir) {
+            f();
+        }
+    }
+
+    pub(super) fn fails(data_dir: &Path, point: &str) -> bool {
+        get(&FAIL, data_dir) == Some(point)
     }
 }
 
@@ -256,14 +315,67 @@ fn link_fails(data_dir: &Path) -> bool {
     false
 }
 
+/// Тестовая точка сбоя `point` (без фичи `test-hooks` — никогда).
+pub(crate) fn fail_point(data_dir: &Path, point: &str) -> Result<(), BackupError> {
+    #[cfg(feature = "test-hooks")]
+    if test_hooks::fails(data_dir, point) {
+        return Err(BackupError::Io(std::io::Error::other(format!(
+            "тестовый сбой в точке {point}"
+        ))));
+    }
+    let _ = (data_dir, point);
+    Ok(())
+}
+
+fn after_first_snapshot(data_dir: &Path) {
+    #[cfg(feature = "test-hooks")]
+    test_hooks::after_first(data_dir);
+    let _ = data_dir;
+}
+
 /// Нужно места: сумма и 10 % запаса.
 fn with_margin(n: u64) -> u64 {
     n.saturating_add(n / 10)
 }
 
+/// fsync каталога: имена новых файлов переживают сбой питания (Linux). На Windows каталог так
+/// не синхронизируется — NTFS журналирует метаданные сама.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// fsync файла.
+fn sync_file(p: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(p)?.sync_all()
+}
+
+/// Linux: права только владельца на дерево копии (каталоги 0700, файлы 0600).
+pub(crate) fn restrict_tree(p: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let md = std::fs::metadata(p)?;
+        if md.is_dir() {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+            for e in std::fs::read_dir(p)? {
+                restrict_tree(&e?.path())?;
+            }
+        } else {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = p;
+    Ok(())
+}
+
 /// Ставит признак копии (лок держится до уничтожения результата). Не вышло — WARN: копия
 /// идёт и без него, но сервер может задержать запись на время копии.
-fn hold_flag(data_dir: &Path) -> Option<zam_store::BackupFlagHold> {
+fn hold_flag(data_dir: &Path) -> Option<BackupFlagHold> {
     match zam_store::hold_backup_flag(data_dir) {
         Ok(h) => Some(h),
         Err(e) => {
@@ -279,12 +391,7 @@ fn hold_flag(data_dir: &Path) -> Option<zam_store::BackupFlagHold> {
 
 /// Размер файла и его `-wal` (0 — нет).
 fn db_size(p: &Path) -> u64 {
-    let wal = {
-        let mut s = p.as_os_str().to_owned();
-        s.push("-wal");
-        PathBuf::from(s)
-    };
-    std::fs::metadata(p).map_or(0, |m| m.len()) + std::fs::metadata(wal).map_or(0, |m| m.len())
+    std::fs::metadata(p).map_or(0, |m| m.len()) + zam_store::backup::wal_size(p)
 }
 
 /// Уникальное имя каталога копии в `dir` на момент `now`.
@@ -303,13 +410,58 @@ fn copy_name(dir: &Path, now: jiff::Timestamp) -> String {
         .expect("бесконечный ряд")
 }
 
-/// `VACUUM INTO` с переводом «каталог только для чтения» в [`BackupError::ReadOnly`].
-fn snapshot(src: &Path, dst: &Path, mode: OpenMode) -> Result<(), BackupError> {
+/// Удаляет брошенные сборки `*.partial` (и `*.zip.tmp`) каталога `dir` старше `max_age`:
+/// их оставил прерванный `backup` (более свежие может собирать параллельная копия).
+fn clean_partials(dir: &Path, max_age: Duration) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.ends_with(".partial") || name.ends_with(".zip.tmp")) {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|a| a > max_age);
+        if old {
+            let p = e.path();
+            let r = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+            match r {
+                Ok(()) => tracing::info!(path = %p.display(), "удалена брошенная сборка копии"),
+                Err(err) => {
+                    tracing::warn!(path = %p.display(), error = %err, "брошенная сборка копии не удалена")
+                }
+            }
+        }
+    }
+}
+
+/// Как читать базу `src`: при чужом локе — `QueryOnly`; под своим — `immutable=1`, если WAL
+/// пуст, иначе `QueryOnly` (восстановление кадров WAL).
+fn mode_for(src: &Path, own_lock: bool) -> OpenMode {
+    if own_lock && zam_store::backup::wal_size(src) == 0 {
+        OpenMode::Immutable
+    } else {
+        OpenMode::QueryOnly
+    }
+}
+
+/// `VACUUM INTO` с переводом «каталог только для чтения» в понятную ошибку; копия — `fsync`.
+fn snapshot(src: &Path, dst: &Path, own_lock: bool) -> Result<(), BackupError> {
     if let Some(d) = dst.parent() {
         std::fs::create_dir_all(d)?;
     }
+    let mode = mode_for(src, own_lock);
     match zam_store::vacuum_into(src, dst, mode) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)))
             if mode == OpenMode::QueryOnly
                 && matches!(
@@ -317,27 +469,31 @@ fn snapshot(src: &Path, dst: &Path, mode: OpenMode) -> Result<(), BackupError> {
                     rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly
                 ) =>
         {
-            Err(BackupError::ReadOnly {
-                path: src.to_path_buf(),
-            })
+            let path = src.to_path_buf();
+            return Err(if own_lock {
+                BackupError::UnrecoveredWal { path }
+            } else {
+                BackupError::ReadOnly { path }
+            });
         }
-        Err(e) => Err(e.into()),
+        Err(e) => return Err(e.into()),
     }
+    sync_file(dst)?;
+    Ok(())
 }
 
-/// Копирует `src` в `dst`, считая SHA-256; `(sha256, размер)`.
-pub(crate) fn copy_hashed(src: &Path, dst: &Path) -> std::io::Result<(String, u64)> {
+/// Копирует `src` в `dst`, считая SHA-256 при записи (одно чтение); `(sha256, размер)`.
+pub(crate) fn copy_hashed(src: &mut dyn Read, dst: &Path) -> std::io::Result<(String, u64)> {
     use sha2::Digest;
     if let Some(d) = dst.parent() {
         std::fs::create_dir_all(d)?;
     }
-    let mut r = std::fs::File::open(src)?;
     let mut w = std::fs::File::create(dst)?;
     let mut h = sha2::Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     let mut n = 0u64;
     loop {
-        let k = r.read(&mut buf)?;
+        let k = src.read(&mut buf)?;
         if k == 0 {
             break;
         }
@@ -368,19 +524,20 @@ pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, Bac
     if zam_store::lock_mark(root) == Some(LockMark::Restore) {
         return Err(BackupError::RestoreInProgress);
     }
-    // сервер не запущен — лок берёт копия и держит до конца: тогда `immutable=1` безопасен
+    if zam_store::restore_incomplete(root) {
+        return Err(StoreError::RestoreIncomplete(root.to_path_buf()).into());
+    }
+    // сервер не запущен — лок берёт копия и держит до конца
     let own_lock = zam_store::try_lock_dir(root);
-    let mode = if own_lock.is_some() {
-        OpenMode::Immutable
-    } else {
+    if own_lock.is_none() && zam_store::lock_mark(root) == Some(LockMark::Restore) {
         // между проверкой метки и попыткой лока мог начаться restore
-        if zam_store::lock_mark(root) == Some(LockMark::Restore) {
-            return Err(BackupError::RestoreInProgress);
-        }
-        OpenMode::QueryOnly
-    };
+        return Err(BackupError::RestoreInProgress);
+    }
+    let own = own_lock.is_some();
     let dest = opts.dir.clone().unwrap_or_else(|| cfg.backup.dir(root));
     std::fs::create_dir_all(&dest)?;
+    let max_age = Duration::from_secs(u64::from(cfg.backup.flag_max_hours) * 3600);
+    clean_partials(&dest, max_age);
     let prev = list_copies(&dest).pop();
     let now = zam_store::time::now();
     let (stage, target) = match &opts.zip {
@@ -394,26 +551,31 @@ pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, Bac
             (dest.join(format!("{name}.partial")), dest.join(name))
         }
     };
-    // место: базы и блобы, которых нет в предыдущей копии (те связываются), плюс 10 %
     let stage_dir = stage.parent().unwrap_or(&dest).to_path_buf();
     std::fs::create_dir_all(&stage_dir)?;
-    let need = with_margin(estimate(root, prev.as_deref(), opts.zip.is_some())?);
+    if opts.zip.is_some() {
+        clean_partials(&stage_dir, max_age);
+    }
+    // место: базы и блобы, которых нет в предыдущей копии (те связываются), плюс 10 %;
+    // архив собирается рядом и пишется целиком — вдвое
+    let est = estimate(root, prev.as_deref(), opts.zip.is_some())?;
+    let need = with_margin(if opts.zip.is_some() {
+        est.saturating_mul(2)
+    } else {
+        est
+    });
     let free = free_space(root, &stage_dir)?;
     if need > free {
         return Err(BackupError::NoSpace { need, free });
     }
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)?;
-    let flag = if mode == OpenMode::QueryOnly {
-        hold_flag(root)
-    } else {
-        None
-    };
+    // при своём локе сервера нет — признак не нужен
+    let flag = if own { None } else { hold_flag(root) };
     if flag.is_some() {
         std::thread::sleep(FLAG_SETTLE);
     }
-    let res = stage_copy(root, &stage, prev.as_deref(), mode, now);
-    drop(flag);
+    let res = stage_copy(root, &stage, prev.as_deref(), own, flag, now);
     let staged = match res {
         Ok(s) => s,
         Err((e, missing)) => {
@@ -421,43 +583,66 @@ pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, Bac
             return Err(e);
         }
     };
-    let dbs = staged.dbs;
-    let blobs = staged.linked + staged.copied;
-    let (linked, copied, mut bytes) = (staged.linked, staged.copied, staged.bytes);
-    let drift = staged.manifest.drift.clone();
-    let text = serde_json::to_string_pretty(&staged.manifest).map_err(std::io::Error::other)?;
-    std::fs::write(stage.join(MANIFEST_FILE), &text)?;
-    bytes += text.len() as u64;
-    let path = match &opts.zip {
-        Some(z) => {
-            let r = write_zip(&stage, &staged.manifest, z);
+    let finished = finish(&staged, &stage, &target, opts.zip.as_deref(), root);
+    let (path, bytes) = match finished {
+        Ok(v) => v,
+        Err(e) => {
             let _ = std::fs::remove_dir_all(&stage);
-            r?;
-            bytes = std::fs::metadata(z)?.len();
-            z.clone()
-        }
-        None => {
-            std::fs::rename(&stage, &target)?;
-            target
+            return Err(e);
         }
     };
     drop(own_lock);
     Ok(BackupReport {
         path,
-        dbs,
-        blobs,
-        linked,
-        copied,
+        dbs: staged.dbs,
+        blobs: staged.linked + staged.copied,
+        linked: staged.linked,
+        copied: staged.copied,
         bytes,
         ms: t0.elapsed().as_millis() as u64,
-        drift,
+        drift: staged.manifest.drift.clone(),
     })
+}
+
+/// Опись (с `fsync`) и публикация копии: переименование каталога или архив.
+fn finish(
+    staged: &Staged,
+    stage: &Path,
+    target: &Path,
+    zip: Option<&Path>,
+    root: &Path,
+) -> Result<(PathBuf, u64), BackupError> {
+    let text = serde_json::to_string_pretty(&staged.manifest).map_err(std::io::Error::other)?;
+    {
+        let mut f = std::fs::File::create(stage.join(MANIFEST_FILE))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    sync_dir(stage)?;
+    match zip {
+        Some(z) => {
+            let r = write_zip(stage, &staged.manifest, z, root);
+            let _ = std::fs::remove_dir_all(stage);
+            r?;
+            restrict_tree(z)?;
+            Ok((z.to_path_buf(), std::fs::metadata(z)?.len()))
+        }
+        None => {
+            restrict_tree(stage)?;
+            std::fs::rename(stage, target)?;
+            if let Some(d) = target.parent() {
+                sync_dir(d)?;
+            }
+            Ok((target.to_path_buf(), staged.bytes + text.len() as u64))
+        }
+    }
 }
 
 /// Оценка места копии: размеры баз (с `-wal`) и блобов, которых нет в предыдущей копии
 /// (для архива — все блобы).
 fn estimate(root: &Path, prev: Option<&Path>, zip: bool) -> std::io::Result<u64> {
-    let mut n = db_size(&root.join("system.db"));
+    // system.db снимается дважды (первый снимок удаляется после второго)
+    let mut n = db_size(&root.join("system.db")).saturating_mul(2);
     if let Ok(rd) = std::fs::read_dir(root.join("users")) {
         for e in rd.flatten() {
             let p = e.path();
@@ -492,11 +677,10 @@ fn estimate(root: &Path, prev: Option<&Path>, zip: bool) -> std::io::Result<u64>
 /// Неудавшаяся копия: при отсутствующих блобах остаётся только опись с их списком
 /// (`<имя>.failed/manifest.json`), иначе каталог удаляется.
 fn fail_stage(stage: &Path, target: &Path, missing: Option<Box<Manifest>>) {
+    let _ = std::fs::remove_dir_all(stage);
     let Some(m) = missing else {
-        let _ = std::fs::remove_dir_all(stage);
         return;
     };
-    let _ = std::fs::remove_dir_all(stage);
     let mut failed = target.as_os_str().to_owned();
     failed.push(".failed");
     let failed = PathBuf::from(failed);
@@ -519,12 +703,13 @@ fn file_entry(stage: &Path, rel: &str) -> Result<FileEntry, BackupError> {
     })
 }
 
-/// Шаги 3–6 копии в каталог `stage`.
+/// Шаги 3–6 копии в каталог `stage`; признак `flag` снимается после последней базы.
 fn stage_copy(
     root: &Path,
     stage: &Path,
     prev: Option<&Path>,
-    mode: OpenMode,
+    own_lock: bool,
+    flag: Option<BackupFlagHold>,
     now: jiff::Timestamp,
 ) -> Result<Staged, StageErr> {
     let e = |e: BackupError| (e, None);
@@ -535,32 +720,17 @@ fn stage_copy(
     let mut drift = Vec::new();
     let mut bytes = 0u64;
 
-    // 1. system.db
-    let sys_copy = stage.join("system.db");
-    snapshot(&root.join("system.db"), &sys_copy, mode).map_err(e)?;
-    // 2. пользователи — из копии system.db
+    // 1. первый снимок system.db — только список пользователей
+    let first = stage.join(".system.first.db");
+    snapshot(&root.join("system.db"), &first, own_lock).map_err(e)?;
     let users: Vec<String> =
-        zam_store::backup::query_strings(&sys_copy, "users", "SELECT id FROM users ORDER BY id")
+        zam_store::backup::query_strings(&first, "users", "SELECT id FROM users ORDER BY id")
             .map_err(|x| e(x.into()))?;
+    let _ = std::fs::remove_file(&first);
+    after_first_snapshot(root);
     let listed: BTreeSet<&str> = users.iter().map(String::as_str).collect();
-    if let Ok(rd) = std::fs::read_dir(root.join("users")) {
-        let mut late: Vec<String> = rd
-            .flatten()
-            .filter_map(|d| {
-                let n = d.file_name().into_string().ok()?;
-                let id = n.strip_suffix(".db")?.to_string();
-                (!listed.contains(id.as_str())).then_some(id)
-            })
-            .collect();
-        late.sort();
-        for id in late {
-            drift.push(format!(
-                "пользователь {id}: создан после снимка system.db — в копию не входит"
-            ));
-        }
-    }
-    let mut dbs = vec![("system.db".to_string(), sys_copy)];
-    // 3. базы пользователей
+    // 2. базы пользователей списка
+    let mut dbs = Vec::new();
     for id in &users {
         let src = root.join("users").join(format!("{id}.db"));
         if !src.is_file() {
@@ -569,9 +739,33 @@ fn stage_copy(
         }
         let rel = format!("users/{id}.db");
         let dst = manifest::local(stage, &rel);
-        snapshot(&src, &dst, mode).map_err(e)?;
+        snapshot(&src, &dst, own_lock).map_err(e)?;
         dbs.push((rel, dst));
     }
+    // 3. второй снимок system.db — в копию: в нём всё, на что ссылаются снимки баз
+    let sys_copy = stage.join("system.db");
+    snapshot(&root.join("system.db"), &sys_copy, own_lock).map_err(e)?;
+    // базы сняты — признак больше не нужен (блобы неизменяемы)
+    drop(flag);
+    let mut late: BTreeSet<String> =
+        zam_store::backup::query_strings(&sys_copy, "users", "SELECT id FROM users ORDER BY id")
+            .map_err(|x| e(x.into()))?
+            .into_iter()
+            .filter(|id| !listed.contains(id.as_str()))
+            .collect();
+    if let Ok(rd) = std::fs::read_dir(root.join("users")) {
+        late.extend(rd.flatten().filter_map(|d| {
+            let n = d.file_name().into_string().ok()?;
+            let id = n.strip_suffix(".db")?.to_string();
+            (!listed.contains(id.as_str())).then_some(id)
+        }));
+    }
+    for id in late {
+        drift.push(format!(
+            "пользователь {id}: создан после снимка system.db — в копию не входит"
+        ));
+    }
+    dbs.insert(0, ("system.db".to_string(), sys_copy));
     // проверка копий, версии схем, модели и нарезка
     for (rel, p) in &dbs {
         let (ver, ok) = zam_store::integrity_ok(p).map_err(|x| e(x.into()))?;
@@ -635,11 +829,11 @@ fn stage_copy(
                 }
             }
             if !done {
-                let (got, n) = copy_hashed(&src, &dst).map_err(|x| e(x.into()))?;
+                let mut r = std::fs::File::open(&src).map_err(|x| e(x.into()))?;
+                let (got, _) = copy_hashed(&mut r, &dst).map_err(|x| e(x.into()))?;
                 if got != sha {
                     return Err(e(BackupError::BadSum { path: brel }));
                 }
-                let _ = n;
                 copied += 1;
             }
             bytes += size;
@@ -678,14 +872,29 @@ fn stage_copy(
     })
 }
 
-/// Архив zip64 копии: базы и опись сжаты, блобы — `store`.
-fn write_zip(stage: &Path, m: &Manifest, out: &Path) -> Result<(), BackupError> {
-    use zip::CompressionMethod;
-    use zip::write::SimpleFileOptions;
+/// Архив zip64 копии: базы и опись сжаты, блобы — `store`. Пишется в `<архив>.tmp`, который
+/// удаляется при любой ошибке; готовый — `fsync` и переименование.
+fn write_zip(stage: &Path, m: &Manifest, out: &Path, root: &Path) -> Result<(), BackupError> {
     let mut tmp = out.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    let f = std::fs::File::create(&tmp)?;
+    let r = write_zip_to(stage, m, &tmp, root).and_then(|()| {
+        std::fs::rename(&tmp, out)?;
+        if let Some(d) = out.parent() {
+            sync_dir(d)?;
+        }
+        Ok(())
+    });
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+fn write_zip_to(stage: &Path, m: &Manifest, tmp: &Path, root: &Path) -> Result<(), BackupError> {
+    use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
+    let f = std::fs::File::create(tmp)?;
     let mut z = zip::ZipWriter::new(std::io::BufWriter::new(f));
     let zerr = |e: zip::result::ZipError| BackupError::Io(std::io::Error::other(e));
     let deflate = SimpleFileOptions::default()
@@ -707,7 +916,10 @@ fn write_zip(stage: &Path, m: &Manifest, out: &Path) -> Result<(), BackupError> 
         })
         .collect();
     names.push((MANIFEST_FILE, deflate));
-    for (name, opt) in names {
+    for (i, (name, opt)) in names.into_iter().enumerate() {
+        if i == 1 {
+            fail_point(root, "zip")?;
+        }
         z.start_file(name, opt).map_err(zerr)?;
         let mut r = std::fs::File::open(manifest::local(stage, name))?;
         std::io::copy(&mut r, &mut z)?;
@@ -717,7 +929,6 @@ fn write_zip(stage: &Path, m: &Manifest, out: &Path) -> Result<(), BackupError> 
     w.into_inner()
         .map_err(|e| BackupError::Io(e.into_error()))?
         .sync_all()?;
-    std::fs::rename(&tmp, out)?;
     Ok(())
 }
 
@@ -725,8 +936,8 @@ fn write_zip(stage: &Path, m: &Manifest, out: &Path) -> Result<(), BackupError> 
 pub fn prune(paths: &[PathBuf]) {
     for p in paths {
         match std::fs::remove_dir_all(p) {
-            Ok(()) => tracing::info!(path = %p.display(), "автокопия удалена (сверх backup.keep)"),
-            Err(e) => tracing::warn!(path = %p.display(), error = %e, "автокопия не удалена"),
+            Ok(()) => tracing::info!(path = %p.display(), "копия удалена (сверх backup.keep)"),
+            Err(e) => tracing::warn!(path = %p.display(), error = %e, "копия не удалена"),
         }
     }
 }

@@ -798,6 +798,14 @@ impl Worker {
                 for (u, f) in &rep.missed_folders {
                     self.rollups.schedule(*u, *f, self.cfg.rollup_debounce);
                 }
+                // reindex всей базы из кэша уже записал её точки: пересборке (стёртое
+                // хранилище, новая коллекция) перенарезать и ставить задания ей не нужно
+                if let (Some(u), None, false, Some(p)) =
+                    (req.user, req.space, req.full, self.pending.as_mut())
+                    && !rep.failed_users.iter().any(|(f, _)| *f == u)
+                {
+                    p.done.insert(u);
+                }
                 Ok(rep)
             }
         };
@@ -1000,8 +1008,14 @@ impl Worker {
             if p.done.contains(&u.id) || self.stopped() {
                 continue;
             }
+            // база с отметкой reindex из кэша (`zam-server restore`, прерванный reindex) —
+            // пересобирает её отметка: точки из кэша без перенарезки и заданий
             let res = match self.deps.users.get(u.id).await {
-                Ok(db) => enqueue_reindex(&db, None).await,
+                Ok(db) => match pending_reindex(&db).await {
+                    Ok(Some(_)) => Ok(0),
+                    Ok(None) => enqueue_reindex(&db, None).await,
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             };
             match res {

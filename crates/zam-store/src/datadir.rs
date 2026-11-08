@@ -5,6 +5,12 @@
 //! `LockFileEx` диапазон другим дескрипторам не читается, поэтому `restore` дублирует метку в
 //! файле `.zam-restore` рядом; обычное открытие каталога его снимает. [`lock_mark`] отвечает,
 //! кто держит лок, — по нему `backup` отказывает во время восстановления.
+//!
+//! **Незавершённое восстановление.** Перед первым изменением каталога данных `restore` пишет
+//! [`RESTORE_INCOMPLETE_FILE`] и снимает его только в самом конце. Файл переживает сбой
+//! (питание, `kill`): пока он есть, [`DataDir::open`] отказывает
+//! ([`StoreError::RestoreIncomplete`]) — сервер не примет полувосстановленный каталог (иначе
+//! создал бы пустую `system.db` и нового администратора), а `backup` не снимет его копию.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -21,6 +27,14 @@ const SUBDIRS: [&str; 7] = [
 
 /// Файл-дубль метки `restore` (см. документацию модуля).
 pub const RESTORE_MARK_FILE: &str = ".zam-restore";
+
+/// Признак незавершённого восстановления (см. документацию модуля).
+pub const RESTORE_INCOMPLETE_FILE: &str = ".zam-restore-incomplete";
+
+/// Восстановление в каталог `root` начато и не завершено.
+pub fn restore_incomplete(root: &Path) -> bool {
+    root.join(RESTORE_INCOMPLETE_FILE).exists()
+}
 
 /// Кто держит `.zam.lock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +155,9 @@ impl DataDir {
         let dd = Self::open_marked(root, None)?;
         // дубль метки прерванного restore больше не нужен: лок теперь у этого процесса
         let _ = std::fs::remove_file(root.join(RESTORE_MARK_FILE));
+        if restore_incomplete(root) {
+            return Err(StoreError::RestoreIncomplete(root.to_path_buf()));
+        }
         Ok(dd)
     }
 

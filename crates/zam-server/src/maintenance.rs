@@ -55,9 +55,10 @@ impl Maintenance {
             handles.push(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(BACKUP_TICK);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut state = BackupState::default();
                 loop {
                     tick.tick().await;
-                    backup_tick(&cfg, zam_store::time::now()).await;
+                    backup_tick(&cfg, zam_store::time::now(), &mut state).await;
                 }
             }));
         }
@@ -175,31 +176,84 @@ async fn gc_cache_in(
     total
 }
 
-/// Один шаг расписания автокопий на момент `now`: копия и/или удаление лишних копий.
-pub async fn backup_tick(cfg: &ServerConfig, now: Timestamp) {
+/// Состояние автокопий между шагами: последняя попытка (удачная или нет) и подряд неудач.
+#[derive(Debug, Clone, Default)]
+pub struct BackupState {
+    pub last_attempt: Option<Timestamp>,
+    pub failures: u32,
+}
+
+/// Что сделал шаг автокопий.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// Копия запускалась; `Some(true)` — успешно.
+    pub backup: Option<bool>,
+    /// Удалено копий сверх `keep`.
+    pub pruned: usize,
+}
+
+/// Один шаг расписания автокопий на момент `now`. Неудачная копия занимает слот (повтор — в
+/// следующий срок `backup.at`, а не каждую минуту), WARN — один на неудачу; лишние копии
+/// удаляются только после успешной копии (или когда копия не нужна), по фактическому списку.
+pub async fn backup_tick(
+    cfg: &ServerConfig,
+    now: Timestamp,
+    state: &mut BackupState,
+) -> TickOutcome {
     let dir = cfg.backup.dir(&cfg.data_dir);
-    let existing = crate::backup::list_copies(&dir);
-    let last = crate::backup::last_copy_at(&dir);
-    for a in schedule::tick(now, last, &existing, &cfg.backup) {
-        match a {
-            Action::Skip => {}
-            Action::Backup => {
-                let c = cfg.clone();
-                let r = tokio::task::spawn_blocking(move || {
-                    crate::backup::backup(&c, &crate::backup::BackupOpts::default())
-                })
-                .await;
-                match r {
-                    Ok(Ok(rep)) => tracing::info!("автокопия: {}", rep.line()),
-                    Ok(Err(e)) => tracing::warn!(error = %e, "автокопия не снята"),
-                    Err(e) => tracing::warn!(error = %e, "автокопия завершилась аварийно"),
+    let mut out = TickOutcome::default();
+    for round in 0..2 {
+        let existing = crate::backup::list_copies(&dir);
+        let last = crate::backup::last_copy_at(&dir).max(state.last_attempt);
+        let mut again = false;
+        for a in schedule::tick(now, last, &existing, &cfg.backup) {
+            match a {
+                Action::Skip => {}
+                Action::Backup if round == 0 => {
+                    state.last_attempt = Some(now);
+                    let c = cfg.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        crate::backup::backup(&c, &crate::backup::BackupOpts::default())
+                    })
+                    .await;
+                    let ok = matches!(r, Ok(Ok(_)));
+                    match r {
+                        Ok(Ok(rep)) => {
+                            state.failures = 0;
+                            tracing::info!("автокопия: {}", rep.line());
+                        }
+                        Ok(Err(e)) => {
+                            state.failures += 1;
+                            tracing::warn!(
+                                error = %e,
+                                failures = state.failures,
+                                "автокопия не снята: повтор в следующий срок backup.at"
+                            );
+                        }
+                        Err(e) => {
+                            state.failures += 1;
+                            tracing::warn!(
+                                error = %e,
+                                "автокопия завершилась аварийно: повтор в следующий срок backup.at"
+                            );
+                        }
+                    }
+                    out.backup = Some(ok);
+                    // после успешной копии — ротация по новому списку
+                    again = ok;
+                }
+                Action::Backup => {}
+                Action::Prune(list) => {
+                    out.pruned += list.len();
+                    tokio::task::spawn_blocking(move || crate::backup::prune(&list))
+                        .await
+                        .ok();
                 }
             }
-            Action::Prune(list) => {
-                tokio::task::spawn_blocking(move || crate::backup::prune(&list))
-                    .await
-                    .ok();
-            }
+        }
+        if !again {
+            break;
         }
     }
+    out
 }

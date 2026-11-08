@@ -435,7 +435,10 @@ struct NoCreate(Vec<PathBuf>);
 
 impl NoCreate {
     fn apply(dirs: &[PathBuf]) -> Option<NoCreate> {
+        // guard — до первого icacls: паника посреди цикла снимет уже наложенные запреты
+        let mut guard = NoCreate(Vec::new());
         for d in dirs {
+            guard.0.push(d.clone());
             #[cfg(windows)]
             {
                 let st = Command::new("icacls")
@@ -455,7 +458,6 @@ impl NoCreate {
                 std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
             }
         }
-        let guard = NoCreate(dirs.to_vec());
         // root на Linux права каталога не ограничивают — проверку пропускаем
         let probe = dirs[0].join("probe.tmp");
         if std::fs::write(&probe, b"x").is_ok() {
@@ -1388,6 +1390,11 @@ async fn restore_then_serve_rebuilds_from_cache_no_inference() {
         .await
         .unwrap();
     assert_eq!(r.vectors, VectorPlan::FromCache, "{}", r.text());
+    let restored = dst
+        .data_dir
+        .join("users")
+        .join(format!("{}.db", r_user(&rep.path)));
+    let seq_before = count(&restored, "SELECT coalesce(max(seq), 0) FROM chunks");
     let b = api_with(dst.clone()).await;
     common::ml::until_diag(
         "точки из кэша",
@@ -1409,26 +1416,26 @@ async fn restore_then_serve_rebuilds_from_cache_no_inference() {
         async || zam_store::pending_reindex(&db).await.unwrap().is_none(),
     )
     .await;
-    // коллекция новая, а узлы уже проиндексированы: воркер ещё раз ставит задания всем
-    // заметкам (векторы — из кэша); сравнение выдачи — после затихания
-    common::ml::until(
-        "задания после пересборки выполнены",
-        common::ml::READY,
-        async || {
-            db.read(|c| {
-                Ok(c.query_row(
+    // стёртое хранилище и новая коллекция не перенарезают базу с отметкой reindex: ни
+    // новых чанков, ни заданий
+    assert_eq!(settled_points(&b).await, want);
+    let (seq, jobs) = db
+        .read(|c| {
+            Ok((
+                c.query_row("SELECT coalesce(max(seq), 0) FROM chunks", [], |r| {
+                    r.get::<_, i64>(0)
+                })?,
+                c.query_row(
                     "SELECT count(*) FROM nodes WHERE kind = 'note' AND index_state <> 'indexed'",
                     [],
                     |r| r.get::<_, i64>(0),
-                )?)
-            })
-            .await
-            .unwrap()
-                == 0
-        },
-    )
-    .await;
-    assert_eq!(settled_points(&b).await, want);
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(seq, seq_before, "чанки не перенарезаны");
+    assert_eq!(jobs, 0, "заметки не ставились в очередь заново");
     assert_eq!(
         b.st.index.worker.embedded_texts(),
         0,
@@ -1440,6 +1447,20 @@ async fn restore_then_serve_rebuilds_from_cache_no_inference() {
     );
     same_top5(&before, &top6(&b, &token, "t18a-after").await);
     stop(b).await;
+}
+
+/// Пользователь единственной базы копии.
+fn r_user(copy: &Path) -> String {
+    let m = read_manifest(copy);
+    m.files
+        .iter()
+        .find_map(|f| {
+            f.path
+                .strip_prefix("users/")
+                .and_then(|x| x.strip_suffix(".db"))
+                .map(str::to_string)
+        })
+        .unwrap()
 }
 
 // ---------------------------------------------------------------- расписание
@@ -1514,7 +1535,7 @@ fn schedule_tick_cases() {
         ),
         vec![Action::Prune(nine[..2].to_vec())]
     );
-    // с новой копией — на одну больше
+    // срок копии — только копия: лишние удаляются следующим шагом после успешной копии
     let eight = copies(&[1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(
         tick(
@@ -1523,7 +1544,7 @@ fn schedule_tick_cases() {
             &eight,
             &daily
         ),
-        vec![Action::Backup, Action::Prune(eight[..2].to_vec())]
+        vec![Action::Backup]
     );
 }
 
@@ -1551,5 +1572,280 @@ async fn index_status_no_recent_backup() {
         zam_server::backup::status_json(&cfg, later)["warning"],
         "no_recent_backup"
     );
+    stop(a).await;
+}
+
+// ---------------------------------------------------------------- правки ревью 18a
+
+/// Копирует дерево каталога (без лока) — «снимок диска» в момент аварии.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let p = e.path();
+        let name = e.file_name();
+        if name == ".zam.lock" {
+            continue;
+        }
+        if p.is_dir() {
+            copy_tree(&p, &to.join(&name));
+        } else {
+            std::fs::copy(&p, to.join(&name)).unwrap();
+        }
+    }
+}
+
+/// C1: сервер убит — у базы `-wal` с закоммиченными кадрами, лок свободен. Копия под своим
+/// локом читает базу с восстановлением WAL (не `immutable=1`): в копии все записи.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_crashed_wal_under_own_lock_keeps_commits() {
+    let (a, _) = seeded("bk-crash-wal").await;
+    let cfg = cfg_of(&a);
+    let user = uid(&a);
+    stop(a).await;
+    let udb = cfg.data_dir.join("users").join(format!("{user}.db"));
+    // писатель «падает» с кадрами в WAL: контрольных точек нет, соединение живо, пока
+    // делается снимок диска
+    let c = rusqlite::Connection::open(&udb).unwrap();
+    c.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    let mode: String = c
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+    for i in 0..100 {
+        c.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, 'x')",
+            [format!("t18a-crash-{i}")],
+        )
+        .unwrap();
+    }
+    let crashed = common::tmp("bk-crash-wal-disk").join("d");
+    copy_tree(&cfg.data_dir, &crashed);
+    drop(c);
+    let cudb = crashed.join("users").join(format!("{user}.db"));
+    assert!(
+        zam_store::backup::wal_size(&cudb) > 0,
+        "в снимке диска нет WAL"
+    );
+    let mut c2 = cfg.clone();
+    c2.data_dir = crashed.clone();
+    let rep = run_backup(&c2, BackupOpts::default()).await.unwrap();
+    let copy = rep.path.join("users").join(format!("{user}.db"));
+    assert_eq!(
+        count(
+            &copy,
+            "SELECT count(*) FROM meta WHERE key LIKE 't18a-crash-%'"
+        ),
+        100
+    );
+}
+
+/// I2: секрет Vault первого пользователя, созданный во время копии (ключ `user_keys` — после
+/// первого снимка `system.db`): в копию идёт второй снимок `system.db`, ключ в нём есть.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_system_snapshot_after_user_dbs() {
+    let (a, _) = seeded("bk-sys-second").await;
+    let cfg = cfg_of(&a);
+    let user = uid(&a);
+    let sys = cfg.data_dir.join("system.db");
+    let uid_s = user.to_string();
+    test_hooks::set_after_first_snapshot(
+        &cfg.data_dir,
+        Some(Arc::new(move || {
+            let c = rusqlite::Connection::open(&sys).unwrap();
+            c.busy_timeout(Duration::from_secs(10)).unwrap();
+            c.execute(
+                "INSERT OR IGNORE INTO user_keys (user_id, wrapped, created_at)
+                 VALUES (?1, x'00', '2026-11-08T00:00:00Z')",
+                [&uid_s],
+            )
+            .unwrap();
+        })),
+    );
+    let r = run_backup(&cfg, BackupOpts::default()).await;
+    test_hooks::set_after_first_snapshot(&cfg.data_dir, None);
+    let rep = r.unwrap();
+    assert_eq!(
+        count(
+            &rep.path.join("system.db"),
+            &format!("SELECT count(*) FROM user_keys WHERE user_id = '{user}'")
+        ),
+        1,
+        "ключ Vault, записанный во время копии, в копии system.db"
+    );
+    stop(a).await;
+}
+
+/// I5: архив — место с запасом на сборку и zip; сбой записи архива не оставляет `.tmp` и
+/// сборки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_zip_space_and_tmp_cleanup() {
+    let (a, _) = seeded("bk-zip-fail").await;
+    let cfg = cfg_of(&a);
+    let out = common::tmp("bk-zip-fail-out");
+    let zip = out.join("copy.zip");
+    let opts = BackupOpts {
+        dir: None,
+        zip: Some(zip.clone()),
+    };
+    // места хватает каталогу, но не сборке и архиву вместе
+    test_hooks::set_free_space(&cfg.data_dir, Some(1));
+    let r = run_backup(&cfg, BackupOpts::default()).await;
+    test_hooks::set_free_space(&cfg.data_dir, None);
+    let dir_need = match r {
+        Err(BackupError::NoSpace { need, .. }) => need,
+        other => panic!("{other:?}"),
+    };
+    test_hooks::set_free_space(&cfg.data_dir, Some(dir_need + dir_need / 2));
+    let r = run_backup(&cfg, opts.clone()).await;
+    test_hooks::set_free_space(&cfg.data_dir, None);
+    assert!(matches!(r, Err(BackupError::NoSpace { .. })), "{r:?}");
+    test_hooks::set_fail_point(&cfg.data_dir, Some("zip"));
+    let r = run_backup(&cfg, opts.clone()).await;
+    test_hooks::set_fail_point(&cfg.data_dir, None);
+    assert!(r.is_err());
+    assert_eq!(tree(&out), Vec::<String>::new(), "остатки архива");
+    run_backup(&cfg, opts).await.unwrap();
+    assert_eq!(tree(&out), vec!["copy.zip".to_string()]);
+    stop(a).await;
+}
+
+/// I6: остаток `system.db-wal` без `system.db` — каталог не пуст; с `--replace` он уходит в
+/// `pre-restore-…`, а не применяется к восстановленной базе.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_leftover_wal_is_nonempty() {
+    let (copy, _, _, _) = copy_of("rs-leftover").await;
+    let dst = dst_cfg("rs-leftover-dst");
+    std::fs::create_dir_all(&dst.data_dir).unwrap();
+    std::fs::write(dst.data_dir.join("system.db-wal"), b"stale wal").unwrap();
+    let r = restore(&dst, &copy, &RestoreOpts::default()).await;
+    assert!(matches!(r, Err(BackupError::NotEmpty)), "{r:?}");
+    let opts = RestoreOpts {
+        replace: true,
+        ..RestoreOpts::default()
+    };
+    let rep = restore(&dst, &copy, &opts).await.unwrap();
+    let moved = rep.moved_to.unwrap();
+    assert!(moved.join("system.db-wal").is_file());
+    assert!(
+        !dst.data_dir.join("system.db-wal").exists() || {
+            // открытие восстановленной базы создаёт свой WAL — не прежний
+            std::fs::read(dst.data_dir.join("system.db-wal")).unwrap() != b"stale wal"
+        }
+    );
+}
+
+/// I1: сбой посередине переноса на место (тестовая точка) — каталог помечен незавершённым:
+/// сервер и копия отказывают; повтор `restore --replace` восстанавливает.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_crash_mid_place_refused_until_replace() {
+    let (copy, _, user, _) = copy_of("rs-crash").await;
+    let dst = dst_cfg("rs-crash-dst");
+    test_hooks::set_fail_point(&dst.data_dir, Some("restore_place"));
+    let r = restore(&dst, &copy, &RestoreOpts::default()).await;
+    test_hooks::set_fail_point(&dst.data_dir, None);
+    match &r {
+        Err(e @ BackupError::RestoreFailed { .. }) => {
+            assert!(e.to_string().contains("--replace"), "{e}");
+        }
+        other => panic!("ожидался RestoreFailed: {other:?}"),
+    }
+    assert!(zam_store::restore_incomplete(&dst.data_dir));
+    // сервер не принимает полувосстановленный каталог
+    let Err(e) = zam_server::build(dst.clone(), Some("pw".into())).await else {
+        panic!("сервер принял полувосстановленный каталог");
+    };
+    assert!(e.to_string().contains("не завершено"), "{e}");
+    assert!(matches!(
+        run_backup(&dst, BackupOpts::default()).await,
+        Err(BackupError::Store(
+            zam_store::StoreError::RestoreIncomplete(_)
+        ))
+    ));
+    // без --replace — «не пуст»
+    assert!(matches!(
+        restore(&dst, &copy, &RestoreOpts::default()).await,
+        Err(BackupError::NotEmpty)
+    ));
+    let opts = RestoreOpts {
+        replace: true,
+        ..RestoreOpts::default()
+    };
+    let rep = restore(&dst, &copy, &opts).await.unwrap();
+    assert!(rep.moved_to.is_some());
+    assert!(!zam_store::restore_incomplete(&dst.data_dir));
+    assert!(
+        dst.data_dir
+            .join("users")
+            .join(format!("{user}.db"))
+            .is_file()
+    );
+    let b = api_with(dst).await;
+    assert_eq!(uid(&b), user, "прежний администратор, не новый");
+    stop(b).await;
+}
+
+/// M7: во время копии (признак `.zam-backup` удерживается) restore отказывает.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_refuses_during_backup() {
+    let (copy, _, _, _) = copy_of("rs-during-backup").await;
+    let dst = dst_cfg("rs-during-backup-dst");
+    std::fs::create_dir_all(&dst.data_dir).unwrap();
+    let hold = zam_store::hold_backup_flag(&dst.data_dir).unwrap();
+    let r = restore(&dst, &copy, &RestoreOpts::default()).await;
+    assert!(matches!(r, Err(BackupError::BackupInProgress)), "{r:?}");
+    drop(hold);
+    restore(&dst, &copy, &RestoreOpts::default()).await.unwrap();
+}
+
+/// I3, I4: неудачная автокопия не удаляет хорошие копии (`keep = 1`) и не повторяется каждую
+/// минуту — следующая попытка в следующий срок; удачная — ротация по новому списку.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_tick_failure_keeps_copies_and_waits_slot() {
+    use zam_server::maintenance::{BackupState, backup_tick};
+    let (a, _) = seeded("bk-tick").await;
+    let mut cfg = cfg_of(&a);
+    cfg.backup.schedule = BackupSchedule::Daily;
+    cfg.backup.keep = 1;
+    let dir = cfg.backup.dir(&cfg.data_dir);
+    let good = run_backup(&cfg, BackupOpts::default()).await.unwrap().path;
+    // копия «вчерашняя»: срок сегодняшнего at наступил
+    let yesterday = dir.join("2000-01-01_033000");
+    std::fs::rename(&good, &yesterday).unwrap();
+    let now = at("2026-11-08T04:00:00Z");
+    let mut st = BackupState::default();
+    test_hooks::set_free_space(&cfg.data_dir, Some(1));
+    let o = backup_tick(&cfg, now, &mut st).await;
+    assert_eq!((o.backup, o.pruned), (Some(false), 0));
+    assert!(
+        yesterday.join(MANIFEST_FILE).is_file(),
+        "хорошая копия цела"
+    );
+    // минута спустя — без новой попытки
+    let o = backup_tick(&cfg, now + jiff::SignedDuration::from_mins(1), &mut st).await;
+    assert_eq!((o.backup, o.pruned), (None, 0));
+    assert_eq!(st.failures, 1);
+    test_hooks::set_free_space(&cfg.data_dir, None);
+    // следующий срок — копия и ротация по фактическому списку
+    let o = backup_tick(&cfg, now + jiff::SignedDuration::from_hours(24), &mut st).await;
+    assert_eq!((o.backup, o.pruned), (Some(true), 1));
+    let left = zam_server::backup::list_copies(&dir);
+    assert_eq!(left.len(), 1);
+    assert_ne!(left[0], yesterday);
+    stop(a).await;
+}
+
+/// M11: на Linux копия доступна только владельцу.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let (a, _) = seeded("bk-perms").await;
+    let rep = run_backup(&cfg_of(&a), BackupOpts::default())
+        .await
+        .unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&rep.path), 0o700);
+    assert_eq!(mode(&rep.path.join("system.db")), 0o600);
+    assert_eq!(mode(&rep.path.join(MANIFEST_FILE)), 0o600);
     stop(a).await;
 }

@@ -364,6 +364,7 @@ impl Db {
         let wal = wal_path(path);
         let limit = opts.wal_limit_bytes;
         let wflags = flags.clone();
+        let wflag_path = opts.backup_flag.clone();
         let (tx, rx) = mpsc::channel::<WriterJob>();
         let thread = std::thread::Builder::new()
             .name("zam-db-writer".into())
@@ -377,9 +378,16 @@ impl Db {
                     }
                     // Страховка от неограниченного WAL, если фоновый checkpoint отстал или умер;
                     // на время копии ослаблена: RESTART ждал бы читателя `VACUUM INTO`
-                    // до WRITER_BUSY_TIMEOUT — только PASSIVE
+                    // до WRITER_BUSY_TIMEOUT — только PASSIVE. Признак проверяется и по файлу:
+                    // фоновый поток мог ещё не заметить только что поставленный признак (или
+                    // его нет); страховка срабатывает редко, проверка файла дешева
                     if wal_len(&wal) > limit {
-                        if wflags.backup_active.load(Ordering::SeqCst) {
+                        let backup = wflags.backup_active.load(Ordering::SeqCst)
+                            || wflag_path.as_deref().is_some_and(|f| {
+                                crate::backup::flag_state(f, crate::backup::backup_flag_max_age())
+                                    == crate::backup::FlagState::Active
+                            });
+                        if backup {
                             let _ = checkpoint(&conn, "PASSIVE");
                         } else {
                             wflags.restarts.fetch_add(1, Ordering::Relaxed);

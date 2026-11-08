@@ -29,13 +29,16 @@ fn slot(now: Timestamp, cfg: &BackupSection) -> Option<Timestamp> {
         .map(|z| z.timestamp())
 }
 
-/// Что делать в момент `now`: `last` — время последней копии, `existing` — готовые копии
-/// каталога копий от старых к новым ([`super::list_copies`]).
+/// Что делать в момент `now`: `last` — время последней копии **или попытки** (неудачная
+/// попытка тоже занимает слот: повтор — в следующий, без копии каждую минуту), `existing` —
+/// готовые копии каталога копий от старых к новым ([`super::list_copies`]).
 ///
 /// - `schedule = "off"` — [`Action::Skip`];
-/// - копия — если `now` не раньше сегодняшнего `at` (UTC) и сегодня после `at` копии ещё не
-///   было (пропущенный вчерашний срок не догоняется до сегодняшнего `at`);
-/// - удаление — копии сверх `keep` с учётом снимаемой сейчас, начиная с самых старых.
+/// - копия — если `now` не раньше сегодняшнего `at` (UTC) и сегодня после `at` копии (попытки)
+///   ещё не было (пропущенный вчерашний срок не догоняется до сегодняшнего `at`); удаления в
+///   этом же шаге нет: лишние копии удаляются следующим шагом **после успешной** копии, по
+///   фактическому списку — неудачная копия не стоит хороших;
+/// - иначе удаление копий сверх `keep`, начиная с самых старых.
 pub fn tick(
     now: Timestamp,
     last: Option<Timestamp>,
@@ -45,19 +48,12 @@ pub fn tick(
     if cfg.schedule == BackupSchedule::Off {
         return vec![Action::Skip];
     }
-    let mut out = Vec::new();
-    let due = slot(now, cfg).is_some_and(|s| now >= s && last.is_none_or(|l| l < s));
-    if due {
-        out.push(Action::Backup);
+    if slot(now, cfg).is_some_and(|s| now >= s && last.is_none_or(|l| l < s)) {
+        return vec![Action::Backup];
     }
-    let total = existing.len() + usize::from(due);
     let keep = cfg.keep as usize;
-    if total > keep {
-        let n = (total - keep).min(existing.len());
-        out.push(Action::Prune(existing[..n].to_vec()));
+    if existing.len() > keep {
+        return vec![Action::Prune(existing[..existing.len() - keep].to_vec())];
     }
-    if out.is_empty() {
-        out.push(Action::Skip);
-    }
-    out
+    vec![Action::Skip]
 }

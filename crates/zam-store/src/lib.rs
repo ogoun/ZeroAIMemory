@@ -78,8 +78,8 @@ pub use certainty::{
     default_certainty,
 };
 pub use datadir::{
-    DataDir, DirLock, LockMark, MAX_DATA_DIR_CHARS_WINDOWS, RESTORE_MARK_FILE, check_data_dir_len,
-    lock_mark, try_lock_dir,
+    DataDir, DirLock, LockMark, MAX_DATA_DIR_CHARS_WINDOWS, RESTORE_INCOMPLETE_FILE,
+    RESTORE_MARK_FILE, check_data_dir_len, lock_mark, restore_incomplete, try_lock_dir,
 };
 pub use db::{Db, DbOptions};
 pub use embeddings::{
@@ -222,6 +222,12 @@ pub enum StoreError {
     Certainty(#[from] CertaintyError),
     #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
     DataDirLocked(std::path::PathBuf),
+    /// В каталоге данных прервано `zam-server restore` (M6 §12б.3): данные неполны.
+    #[error(
+        "восстановление каталога данных {} не завершено: повторите zam-server restore <копия>          --replace (прежние данные — в backups/pre-restore-…)",
+        .0.display()
+    )]
+    RestoreIncomplete(std::path::PathBuf),
     /// Windows: путь каталога данных так длинен, что файлы внутри него (базы SQLite, их
     /// копии перед миграцией, рабочий каталог Qdrant) выходят за MAX_PATH (260).
     #[error(

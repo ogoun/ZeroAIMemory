@@ -3,17 +3,22 @@
 //! 1. Лок `.zam.lock` с меткой `restore` (`DataDir::open_for_restore`): сервер запущен — отказ.
 //! 2. Каталог данных пуст (нет `system.db`, баз и блобов), иначе отказ; с `--replace` прежние
 //!    `system.db`, `users/`, `blobs/` переносятся в `backups/pre-restore-<время>/`.
-//! 3. **До записи хоть одного файла**: пути описи (только базы и блобы), размер и SHA-256
-//!    каждого файла, версия схемы каждой базы (новее программы — `SchemaTooNew`; старше —
-//!    миграция вперёд с `bak-v<N>` при открытии), место на диске.
-//! 4. Базы и блобы **копируются** (не ссылки: данные не делят файлы с копией).
+//! 3. **До записи в каталог данных**: пути описи (только базы и блобы), место (с копиями
+//!    `bak-v<N>` мигрирующих баз); файлы копии **копируются** (не ссылки: данные не делят файлы
+//!    с копией) в сборку `<data_dir>/.restore-staging/` с SHA-256 при записи (одно чтение),
+//!    там же сверяются размеры, суммы и версии схем (новее программы — `SchemaTooNew`; старше
+//!    — миграция вперёд с `bak-v<N>` при открытии). Любой сбой — сборка удаляется.
+//! 4. Признак [`zam_store::RESTORE_INCOMPLETE_FILE`] (переживает сбой: сервер и `backup`
+//!    отказывают, пока его нет), перенос прежних данных (`--replace`) и сборки на место
+//!    переименованием.
 //! 5. Открытие баз (миграции), очистка `web_sessions`, отметка «пересобрать индекс из кэша»
 //!    (`meta.reindex_pending`) в каждой базе и `.zam-reindex` в `qdrant/` — `reindex` выполнит
 //!    сервер при первом открытии базы (для любого Qdrant).
-//! 6. Прогноз векторов ([`VectorPlan`]) и проверка мастер-ключа Vault.
+//! 6. Прогноз векторов ([`VectorPlan`]) и проверка мастер-ключа Vault; признак незавершённого
+//!    восстановления снимается последним.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use zam_store::{DataDir, Db, LockMark, StoreError, SystemStore, USER_MIGRATIONS};
@@ -83,6 +88,8 @@ pub struct RestoreReport {
     pub vault_ok: bool,
     /// Куда перенесены прежние данные (`--replace`).
     pub moved_to: Option<PathBuf>,
+    /// Замечания для человека (внешний Qdrant после `--replace`).
+    pub notes: Vec<String>,
 }
 
 /// Предупреждение о ключе Vault (§12б.3) — дословно.
@@ -109,6 +116,9 @@ impl RestoreReport {
             s.push_str(&format!("\nрасхождения снимков: {}", self.drift.join("; ")));
         }
         s.push_str(&format!("\nвекторы: {}", self.vectors.text()));
+        for n in &self.notes {
+            s.push_str(&format!("\n{n}"));
+        }
         s
     }
 }
@@ -189,8 +199,13 @@ fn side(p: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Проверки до записи: пути, суммы, размеры, версии схем. Возвращает виды файлов описи.
-fn verify(src: &mut Source, m: &Manifest) -> Result<Vec<Kind>, BackupError> {
+/// Имя каталога сборки восстановления в каталоге данных: файлы копии пишутся сюда (с проверкой
+/// сумм при записи), а в каталог данных попадают только переименованием целиком проверенными.
+const STAGING: &str = ".restore-staging";
+
+/// Копирует файлы описи в `staging`, считая SHA-256 при записи (одно чтение источника), и
+/// проверяет суммы, размеры и версии схем баз. Каталог данных не трогается.
+fn stage_files(src: &mut Source, m: &Manifest, staging: &Path) -> Result<Vec<Kind>, BackupError> {
     let kinds: Vec<Kind> = m
         .files
         .iter()
@@ -202,23 +217,19 @@ fn verify(src: &mut Source, m: &Manifest) -> Result<Vec<Kind>, BackupError> {
     let sys_max = zam_store::SYSTEM_MIGRATIONS.len() as u32;
     let user_max = USER_MIGRATIONS.len() as u32;
     for (f, k) in m.files.iter().zip(&kinds) {
-        let is_db = !matches!(k, Kind::Blob { .. });
-        let (sha, size, version) = src.with_reader(&f.path, |r, _| {
-            let mut head = Vec::with_capacity(100);
-            if is_db {
-                (&mut *r).take(100).read_to_end(&mut head)?;
-            }
-            let mut chain = std::io::Cursor::new(head.clone()).chain(r);
-            let (sha, size) = manifest::sha256_reader(&mut chain)?;
-            Ok((sha, size, head))
-        })?;
+        let dst = manifest::local(staging, &f.path);
+        let (sha, size) = src.with_reader(&f.path, |r, _| Ok(super::copy_hashed(r, &dst)?))?;
         if sha != f.sha256 || size != f.size {
             return Err(BackupError::BadSum {
                 path: f.path.clone(),
             });
         }
-        if is_db {
-            let have = zam_store::backup::header_user_version(&version)?;
+        if !matches!(k, Kind::Blob { .. }) {
+            let mut head = Vec::with_capacity(100);
+            std::fs::File::open(&dst)?
+                .take(100)
+                .read_to_end(&mut head)?;
+            let have = zam_store::backup::header_user_version(&head)?;
             let max = if *k == Kind::SystemDb {
                 sys_max
             } else {
@@ -233,7 +244,33 @@ fn verify(src: &mut Source, m: &Manifest) -> Result<Vec<Kind>, BackupError> {
             }
         }
     }
+    for d in ["", "users", "blobs"] {
+        let p = staging.join(d);
+        if p.is_dir() {
+            super::sync_dir(&p)?;
+        }
+    }
     Ok(kinds)
+}
+
+/// Место восстановления: файлы копии и копии `bak-v<N>` баз, которые при открытии мигрируют
+/// (схема старше программы), плюс 10 %.
+fn need_space(m: &Manifest, kinds: &[Kind]) -> u64 {
+    let sys_max = zam_store::SYSTEM_MIGRATIONS.len() as u32;
+    let user_max = USER_MIGRATIONS.len() as u32;
+    let mut n = 0u64;
+    for (f, k) in m.files.iter().zip(kinds) {
+        n += f.size;
+        let max = match k {
+            Kind::SystemDb => sys_max,
+            Kind::UserDb(_) => user_max,
+            Kind::Blob { .. } => continue,
+        };
+        if m.schemas.get(&f.path).is_some_and(|v| *v < max) {
+            n += f.size;
+        }
+    }
+    with_margin(n)
 }
 
 /// Переносит прежние `system.db` (с `-wal`/`-shm`), `users/`, `blobs/` в
@@ -262,29 +299,62 @@ fn move_old(root: &Path) -> Result<PathBuf, BackupError> {
         if p.exists() {
             std::fs::rename(&p, dst.join(d))?;
         }
-        std::fs::create_dir_all(&p)?;
     }
+    super::sync_dir(&dst)?;
     Ok(dst)
 }
 
-/// Копирует файлы описи в каталог данных.
-fn write_files(src: &mut Source, m: &Manifest, root: &Path) -> Result<(), BackupError> {
-    for f in &m.files {
-        let dst = manifest::local(root, &f.path);
-        if let Some(d) = dst.parent() {
-            std::fs::create_dir_all(d)?;
+/// Каталог данных не пуст: `system.db` или её `-wal`/`-shm` (остатки применились бы к
+/// восстановленной базе), файлы в `users/` и `blobs/`, след прерванного восстановления.
+fn nonempty(root: &Path) -> bool {
+    let sys = root.join("system.db");
+    sys.exists()
+        || side(&sys, "-wal").exists()
+        || side(&sys, "-shm").exists()
+        || has_files(&root.join("users"))
+        || has_files(&root.join("blobs"))
+        || zam_store::restore_incomplete(root)
+}
+
+/// Признак незавершённого восстановления: пишется до первого изменения каталога данных.
+fn mark_incomplete(root: &Path) -> std::io::Result<()> {
+    let p = root.join(zam_store::RESTORE_INCOMPLETE_FILE);
+    let mut f = std::fs::File::create(&p)?;
+    writeln!(
+        f,
+        "restore {} {}",
+        std::process::id(),
+        zam_store::time::now()
+    )?;
+    f.sync_all()?;
+    super::sync_dir(root)
+}
+
+/// Перенос проверенной сборки на место: `system.db`, `users/`, `blobs/` — переименованием.
+fn place_staged(staging: &Path, root: &Path) -> Result<(), BackupError> {
+    std::fs::rename(staging.join("system.db"), root.join("system.db"))?;
+    super::fail_point(root, "restore_place")?;
+    for d in ["users", "blobs"] {
+        let from = staging.join(d);
+        let to = root.join(d);
+        // пустой каталог (создан открытием каталога данных) уступает место сборке
+        if to.is_dir() && !has_files(&to) {
+            std::fs::remove_dir_all(&to)?;
         }
-        src.with_reader(&f.path, |r, _| {
-            let mut w = std::fs::File::create(&dst)?;
-            std::io::copy(r, &mut w)?;
-            w.sync_all()?;
-            Ok(())
-        })?;
+        if from.is_dir() {
+            std::fs::rename(&from, &to)?;
+        } else {
+            std::fs::create_dir_all(&to)?;
+        }
     }
+    super::sync_dir(root)?;
+    let _ = std::fs::remove_dir_all(staging);
     Ok(())
 }
 
-/// Синхронная часть: проверки, перенос прежних данных, запись файлов.
+/// Синхронная часть: проверки и сборка вне каталога данных, затем (признак незавершённого
+/// восстановления) перенос прежних данных и сборки на место. Ошибка после признака —
+/// [`BackupError::RestoreFailed`] с путём перенесённых данных.
 fn place(
     src: &Path,
     root: &Path,
@@ -292,24 +362,41 @@ fn place(
 ) -> Result<(Manifest, Vec<Kind>, Option<PathBuf>), BackupError> {
     let mut source = Source::open(src)?;
     let m = source.manifest()?;
-    let nonempty = root.join("system.db").exists()
-        || has_files(&root.join("users"))
-        || has_files(&root.join("blobs"));
-    if nonempty && !replace {
+    let busy = nonempty(root);
+    if busy && !replace {
         return Err(BackupError::NotEmpty);
     }
-    let kinds = verify(&mut source, &m)?;
-    let need = with_margin(m.files.iter().map(|f| f.size).sum());
+    let kinds: Vec<Kind> = m
+        .files
+        .iter()
+        .map(|f| manifest::classify(&f.path))
+        .collect::<Result<_, _>>()?;
+    let need = need_space(&m, &kinds);
     let free = super::free_space(root, root)?;
     if need > free {
         return Err(BackupError::NoSpace { need, free });
     }
-    let moved = if nonempty {
-        Some(move_old(root)?)
-    } else {
-        None
-    };
-    write_files(&mut source, &m, root)?;
+    let staging = root.join(STAGING);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    if let Err(e) = stage_files(&mut source, &m, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    mark_incomplete(root)?;
+    let mut moved = None;
+    let res = (|| {
+        if busy {
+            moved = Some(move_old(root)?);
+        }
+        place_staged(&staging, root)
+    })();
+    if let Err(e) = res {
+        return Err(BackupError::RestoreFailed {
+            reason: e.to_string(),
+            moved_to: moved,
+        });
+    }
     Ok((m, kinds, moved))
 }
 
@@ -332,14 +419,63 @@ pub async fn restore(
         }
         Err(e) => return Err(e.into()),
     };
+    if zam_store::backup_flag_active(&root, zam_store::backup::backup_flag_max_age()) {
+        return Err(BackupError::BackupInProgress);
+    }
     let (src_path, replace) = (src.to_path_buf(), opts.replace);
     let r2 = root.clone();
     let (m, kinds, moved_to) = tokio::task::spawn_blocking(move || place(&src_path, &r2, replace))
         .await
         .map_err(|e| BackupError::Io(std::io::Error::other(e)))??;
+    let failed = |e: &dyn std::fmt::Display| BackupError::RestoreFailed {
+        reason: e.to_string(),
+        moved_to: moved_to.clone(),
+    };
+    let res = finish_restore(cfg, &dd, opts, &m, &kinds).await;
+    let (vault_ok, vectors) = res.map_err(|e| failed(&e))?;
+    // всё на месте: каталог больше не «незавершённый»
+    std::fs::remove_file(root.join(zam_store::RESTORE_INCOMPLETE_FILE)).map_err(|e| failed(&e))?;
+    let schemas = m.schemas.clone();
+    let dbs = kinds
+        .iter()
+        .filter(|k| !matches!(k, Kind::Blob { .. }))
+        .count();
+    let blobs = kinds.len() - dbs;
+    let mut notes = Vec::new();
+    if moved_to.is_some() && cfg.qdrant.mode == crate::config::QdrantMode::External {
+        // внешний Qdrant restore не трогает (соединения нет): точки прежних пространств
+        // остаются, но поиск их не видит — фильтр по пространствам восстановленных баз
+        notes.push(
+            "внешний Qdrant: точки прежних данных остаются в коллекции (поиск их не видит); \
+             освободить место — пересоздать коллекцию: zam-server reindex на остановленном \
+             сервере пересобирает её целиком"
+                .to_string(),
+        );
+    }
+    drop(dd);
+    Ok(RestoreReport {
+        dbs,
+        blobs,
+        schemas,
+        drift: m.drift.clone(),
+        vectors,
+        vault_ok,
+        moved_to,
+        notes,
+    })
+}
 
+/// Шаг 5–6: открытие баз (миграции), сессии WebUI, аудит, отметки пересборки индекса,
+/// прогноз векторов и ключ Vault.
+async fn finish_restore(
+    cfg: &ServerConfig,
+    dd: &DataDir,
+    opts: &RestoreOpts,
+    m: &Manifest,
+    kinds: &[Kind],
+) -> Result<(bool, VectorPlan), BackupError> {
     // system.db: миграции, сессии WebUI, ключ Vault
-    let system = SystemStore::open(&dd)?;
+    let system = SystemStore::open(dd)?;
     let cleared = system.clear_web_sessions().await?;
     let env_key = std::env::var(crate::vault::keys::MASTER_KEY_ENV).ok();
     let vault_ok = crate::vault::keys::restored_key_fits(cfg, &system, env_key.as_deref())
@@ -363,7 +499,7 @@ pub async fn restore(
 
     // базы пользователей: миграции вперёд (`bak-v<N>`), отметка пересборки индекса из кэша
     let mut user_dbs = Vec::new();
-    for k in &kinds {
+    for k in kinds {
         if let Kind::UserDb(id) = k {
             let path = dd.user_db(id);
             let db = Db::open(&path, USER_MIGRATIONS)?;
@@ -379,29 +515,16 @@ pub async fn restore(
         }
     }
     if opts.reindex {
+        // управляемый Qdrant стирает прежнее хранилище (после --replace в нём — точки старых
+        // данных); базы с отметкой воркер пересобирает из кэша без перенарезки
         zam_index::supervisor::mark_storage_reindex(&dd.qdrant(), "zam-server restore")?;
     }
-    // кэш L1 правил процесса: пара (id, ревизия) восстановленной базы может совпасть с другим
-    // текстом (журнал 8b, «→ 18a»)
+    // Кэш L1 правил — память процесса: у CLI `restore` (отдельный процесс) он пуст, сброс
+    // нужен восстановлению внутри процесса сервера (тесты; страница бэкапа WebUI — M7): пара
+    // (id, ревизия) восстановленной базы может совпасть с другим текстом (журнал 8b, «→ 18a»)
     crate::api::index::reset_rules_l1_cache();
-
-    let vectors = plan(cfg, opts, &m, &user_dbs).await?;
-    let schemas = m.schemas.clone();
-    let dbs = kinds
-        .iter()
-        .filter(|k| !matches!(k, Kind::Blob { .. }))
-        .count();
-    let blobs = kinds.len() - dbs;
-    drop(dd);
-    Ok(RestoreReport {
-        dbs,
-        blobs,
-        schemas,
-        drift: m.drift.clone(),
-        vectors,
-        vault_ok,
-        moved_to,
-    })
+    let vectors = plan(cfg, opts, m, &user_dbs).await?;
+    Ok((vault_ok, vectors))
 }
 
 /// Прогноз векторов: модель этой машины против `model_id` кэша копии, затем нарезка
