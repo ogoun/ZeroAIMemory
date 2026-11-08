@@ -24,14 +24,14 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CaseRun, Deltas, Event, HintMetrics, LEN_BUCKETS, Outcome, RefMap, api_case, capped_hit,
-    case_run, hint_metrics, len_bucket, load_hints, load_rules, recall_cap, validate_hints,
-    with_hint_insights,
+    CaseRun, Deltas, Event, HintMetrics, LEN_BUCKETS, Outcome, RefMap, SOURCES, api_case,
+    capped_hit, case_run, hint_metrics, len_bucket, load_hints, load_rules, recall_cap,
+    validate_hints, with_hint_insights,
 };
 use crate::eval::corpus::Corpus;
 use crate::eval::grid::{Point, validate_points};
 use crate::eval::metrics::{
-    BOOTSTRAP_M6, Estimate, SEED, paired_diff_weighted, paired_ratio_diff_one_sided,
+    BOOTSTRAP_M6, Estimate, SEED, paired_diff_weighted, paired_ratio_diff_one_sided, paired_ratio_q,
 };
 use crate::eval::run::{self, RunSpec, Session};
 use crate::eval::{Device, EvalArgs, Mode, Paths, caps};
@@ -117,20 +117,55 @@ fn fts_value(p: &Point) -> Option<f64> {
     p.env.get(FTS_ENV).and_then(|v| v.trim().parse().ok())
 }
 
+/// Происхождения случаев, по которым принимается решение (ревью задачи 9, I-1): старые случаи
+/// M4 и оба независимых набора (`x-*`, `y-*`); случаи исполнителя задачи 9 (`task9`) — только
+/// справочно.
+pub const DECISION_SOURCES: [&str; 3] = ["m4", "independent", "independent_b"];
+/// Части, в каждой из которых точность не должна падать (п. 2): старые M4 и независимые x + y.
+pub const STABLE_PARTS: [&str; 2] = ["m4", "independent_all"];
+/// Допуск дискретности п. 1 (ревью задачи 9, I-1): при `N` релевантных случаях одна потерянная
+/// ожидаемая подсказка — шаг `1/N` (при 31 — 0,032 > 0,02), и граница бутстрепа ниже −0,02 при
+/// любой потере: правило вырождается в «ни одной потери». Поэтому п. 1 выполнен и при чистой
+/// потере не больше [`LOSS_TOLERANCE`] ожидаемой подсказки, если `N ≥`
+/// [`LOSS_TOLERANCE_MIN_N`] (не больше 4 % полноты).
+pub const LOSS_TOLERANCE: f64 = 1.0;
+pub const LOSS_TOLERANCE_MIN_N: usize = 25;
+
+/// Метрики части набора.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PartResult {
+    pub cases: usize,
+    pub metrics: HintMetrics,
+    /// Парные разности с базой на тех же случаях.
+    pub delta: Deltas,
+    /// Чистая потеря ожидаемых подсказок к базе (Σ попаданий базы − Σ точки; < 0 — прирост).
+    pub lost: f64,
+    /// Релевантных случаев.
+    pub relevant: usize,
+}
+
 /// Итог точки сетки.
 #[derive(Debug, Clone, Serialize)]
 pub struct PointResult {
     pub name: String,
     pub env: BTreeMap<String, String>,
-    /// Метрики случаев события правила.
+    /// Метрики решающей части ([`DECISION_SOURCES`]).
     pub metrics: HintMetrics,
-    /// `post_tool` — по корзинам длины ошибки.
+    /// `post_tool` — по корзинам длины ошибки (все случаи).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub by_bucket: BTreeMap<String, HintMetrics>,
-    /// Парные разности с базой (первой точкой), односторонние границы.
+    /// Парные разности с базой (первой точкой) на решающей части, односторонние границы.
     pub delta: Deltas,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub delta_by_bucket: BTreeMap<String, Deltas>,
+    /// Нижняя граница Δ `hint_precision` решающей части с поправкой Бонферрони на число
+    /// сравнений (`0,05 / k`, `k` — точек кроме базы).
+    pub precision_lo_bonf: Option<f64>,
+    /// Решающая часть: чистая потеря ожидаемых подсказок и релевантных случаев.
+    pub lost: f64,
+    pub relevant: usize,
+    /// Части набора по происхождению (`m4`, `task9`, `independent`) и `all`.
+    pub parts: BTreeMap<String, PartResult>,
     /// Прошла условия правила (у базы покрытия — `false`).
     pub passes: bool,
     /// Показанные подсказки по случаям: `(id, ссылки)`.
@@ -217,7 +252,7 @@ pub fn deltas_one_sided(a: &[Outcome], b: &[Outcome]) -> Deltas {
     }
 }
 
-/// Выбор по правилу покрытия (§9): индекс точки и пояснение.
+/// Выбор по правилу покрытия (§9 с правками ревью задачи 9): индекс точки и пояснение.
 pub fn choose_coverage(points: &[PointResult]) -> (usize, String) {
     let mut best: Option<(usize, f64)> = None;
     for (i, p) in points.iter().enumerate().skip(1) {
@@ -233,24 +268,38 @@ pub fn choose_coverage(points: &[PointResult]) -> (usize, String) {
         Some((i, g)) => (
             i,
             format!(
-                "Δ hint_recall: нижняя граница ≥ {RECALL_MARGIN}; среди прошедших наибольшая Δ \
-                 hint_precision ({g:+.3}) с нижней границей > 0"
+                "решающая часть {DECISION_SOURCES:?}: п. 1 — Δ hint_recall ≥ {RECALL_MARGIN} или \
+                 потеря ≤ {LOSS_TOLERANCE} подсказки при N ≥ {LOSS_TOLERANCE_MIN_N}; п. 2 — \
+                 наибольшая Δ hint_precision ({g:+.3}) с нижней границей (Бонферрони) > 0 и Δ ≥ 0 \
+                 в каждой части {STABLE_PARTS:?}"
             ),
         ),
         None => (
             0,
-            "ни одна точка не дала Δ hint_precision с нижней границей > 0 при Δ hint_recall ≥ \
-             −0,02 — как есть (база)"
-                .to_string(),
+            format!(
+                "ни одна точка не прошла п. 1–2 на решающей части {DECISION_SOURCES:?} — как есть \
+                 (база)"
+            ),
         ),
     }
 }
 
-/// Точка покрытия прошла условия §9 п. 1–2.
-fn coverage_passes(d: &Deltas) -> bool {
-    let recall_ok = d.hint_recall.is_none_or(|e| e.lo >= RECALL_MARGIN);
-    let precision_up = d.hint_precision.is_some_and(|e| e.lo > 0.0);
-    recall_ok && precision_up
+/// П. 1 (неинфериорность полноты) с допуском дискретности.
+fn recall_ok(d: &Deltas, lost: f64, relevant: usize) -> bool {
+    d.hint_recall.is_none_or(|e| e.lo >= RECALL_MARGIN)
+        || (lost <= LOSS_TOLERANCE && relevant >= LOSS_TOLERANCE_MIN_N)
+}
+
+/// Точка покрытия прошла п. 1–2: полнота решающей части, рост точности с границей Бонферрони
+/// больше 0 и без ухудшения точности в каждой решающей части.
+fn coverage_passes(p: &PointResult) -> bool {
+    let precision_up = p.precision_lo_bonf.is_some_and(|lo| lo > 0.0);
+    let parts_ok = STABLE_PARTS.iter().all(|s| {
+        p.parts
+            .get(*s)
+            .is_none_or(|r| r.delta.hint_precision.is_none_or(|e| e.mean >= 0.0))
+    });
+    recall_ok(&p.delta, p.lost, p.relevant) && precision_up && parts_ok
 }
 
 /// Точка порога FTS-only прошла условия §9.
@@ -290,56 +339,125 @@ pub fn choose_fts(points: &[PointResult]) -> (usize, String) {
     }
 }
 
-/// Итоги точки по запускам случаев.
+/// Исходы запусков.
+fn outcomes_of(rs: &[&CaseRun]) -> Vec<Outcome> {
+    rs.iter()
+        .map(|r| Outcome {
+            shown: r.shown.clone(),
+            expected: r.expected.clone(),
+        })
+        .collect()
+}
+
+/// Часть набора: метрики, разности и потеря к базе.
+fn part(base: &[&CaseRun], runs: &[&CaseRun]) -> PartResult {
+    let (a, b) = (outcomes_of(base), outcomes_of(runs));
+    let hits = |v: &[Outcome]| {
+        v.iter()
+            .filter(|o| !o.expected.is_empty())
+            .map(capped_hit)
+            .sum::<f64>()
+    };
+    PartResult {
+        cases: runs.len(),
+        metrics: hint_metrics(&b),
+        delta: deltas_one_sided(&a, &b),
+        lost: hits(&a) - hits(&b),
+        relevant: b.iter().filter(|o| !o.expected.is_empty()).count(),
+    }
+}
+
+/// Запуски из частей `src`.
+fn of_sources<'a>(v: &[&'a CaseRun], src: &[&str]) -> Vec<&'a CaseRun> {
+    v.iter()
+        .copied()
+        .filter(|r| src.contains(&r.source.as_str()))
+        .collect()
+}
+
+/// Запуски корзины длины `b`.
+fn of_bucket<'a>(v: &[&'a CaseRun], b: &str) -> Vec<&'a CaseRun> {
+    v.iter()
+        .copied()
+        .filter(|r| len_bucket(&r.input) == b)
+        .collect()
+}
+
+/// Итоги точки по запускам случаев; `comparisons` — точек кроме базы (поправка Бонферрони).
 fn point_result(
     rule: GridRule,
     p: &Point,
     runs: &[CaseRun],
     base: Option<&[CaseRun]>,
+    comparisons: usize,
 ) -> PointResult {
-    let out = |rs: &[&CaseRun]| -> Vec<Outcome> {
-        rs.iter()
-            .map(|r| Outcome {
-                shown: r.shown.clone(),
-                expected: r.expected.clone(),
-            })
-            .collect()
-    };
     let all: Vec<&CaseRun> = runs.iter().collect();
     let base_all: Vec<&CaseRun> = base.unwrap_or(runs).iter().collect();
-    let metrics = hint_metrics(&out(&all));
-    let delta = deltas_one_sided(&out(&base_all), &out(&all));
+    let mut parts = BTreeMap::new();
+    for s in SOURCES {
+        let (pa, pb) = (of_sources(&base_all, &[s]), of_sources(&all, &[s]));
+        if !pb.is_empty() {
+            parts.insert(s.to_string(), part(&pa, &pb));
+        }
+    }
+    let ind = ["independent", "independent_b"];
+    let (ia, ib) = (of_sources(&base_all, &ind), of_sources(&all, &ind));
+    if !ib.is_empty() {
+        parts.insert("independent_all".to_string(), part(&ia, &ib));
+    }
+    parts.insert("all".to_string(), part(&base_all, &all));
+    let da = of_sources(&base_all, &DECISION_SOURCES);
+    let db = of_sources(&all, &DECISION_SOURCES);
+    let decision = part(&da, &db);
+    let precision_lo_bonf = {
+        let (a, b) = (outcomes_of(&da), outcomes_of(&db));
+        let hit = |o: &Outcome| o.shown.iter().filter(|s| o.expected.contains(s)).count() as f64;
+        let shown = |o: &Outcome| o.shown.len() as f64;
+        let col = |v: &[Outcome], f: &dyn Fn(&Outcome) -> f64| v.iter().map(f).collect::<Vec<_>>();
+        let q = 0.05 / comparisons.max(1) as f64;
+        paired_ratio_q(
+            &col(&a, &hit),
+            &col(&a, &shown),
+            &col(&b, &hit),
+            &col(&b, &shown),
+            BOOTSTRAP_M6,
+            (q, 1.0 - q),
+        )
+        .map(|e| e.lo)
+    };
     let (mut by_bucket, mut delta_by_bucket) = (BTreeMap::new(), BTreeMap::new());
     if rule == GridRule::PostToolCoverage {
         for b in LEN_BUCKETS {
-            fn pick<'a>(v: &[&'a CaseRun], b: &str) -> Vec<&'a CaseRun> {
-                v.iter()
-                    .copied()
-                    .filter(|r| len_bucket(&r.input) == b)
-                    .collect()
-            }
-            let (pa, pb) = (pick(&base_all, b), pick(&all, b));
-            by_bucket.insert(b.to_string(), hint_metrics(&out(&pb)));
-            delta_by_bucket.insert(b.to_string(), deltas_one_sided(&out(&pa), &out(&pb)));
+            let (pa, pb) = (of_bucket(&base_all, b), of_bucket(&all, b));
+            by_bucket.insert(b.to_string(), hint_metrics(&outcomes_of(&pb)));
+            delta_by_bucket.insert(
+                b.to_string(),
+                deltas_one_sided(&outcomes_of(&pa), &outcomes_of(&pb)),
+            );
         }
     }
-    let passes = match rule {
-        GridRule::PostToolCoverage => base.is_some() && coverage_passes(&delta),
-        GridRule::PromptMinScoreFts => fts_passes(&metrics),
-    };
-    PointResult {
+    let mut r = PointResult {
         name: p.name.clone(),
         env: p.env.clone(),
-        metrics,
+        metrics: decision.metrics.clone(),
         by_bucket,
-        delta,
+        delta: decision.delta.clone(),
         delta_by_bucket,
-        passes,
+        precision_lo_bonf,
+        lost: decision.lost,
+        relevant: decision.relevant,
+        parts,
+        passes: false,
         shown: runs
             .iter()
             .map(|r| (r.id.clone(), r.shown.clone()))
             .collect(),
-    }
+    };
+    r.passes = match rule {
+        GridRule::PostToolCoverage => base.is_some() && coverage_passes(&r),
+        GridRule::PromptMinScoreFts => fts_passes(&r.metrics),
+    };
+    r
 }
 
 /// A/A: два снятия первой точки.
@@ -481,7 +599,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, grid_path: &Path) -> Result
         .enumerate()
         .map(|(i, pt)| {
             let base = (i > 0).then_some(base_runs.as_slice());
-            point_result(rule, pt, &runs[i + 1], base)
+            point_result(rule, pt, &runs[i + 1], base, points.len().saturating_sub(1))
         })
         .collect();
     let (ci, reason) = match rule {
@@ -595,6 +713,34 @@ pub fn render_md(r: &GridResult) -> String {
         };
         s.push_str(&row(&format!("`{}`", p.name), &p.metrics, &p.delta, mark));
     }
+    s.push_str(
+        "\nРешающая часть: потеря ожидаемых подсказок к базе / релевантных; нижняя граница Δ \
+         precision с поправкой Бонферрони:\n\n",
+    );
+    for p in r.points.iter().skip(1) {
+        s.push_str(&format!(
+            "- `{}`: потеря {:+.0} из {}, Δ precision lo (Бонферрони) {}\n",
+            p.name,
+            p.lost,
+            p.relevant,
+            p.precision_lo_bonf
+                .map_or("—".to_string(), |v| format!("{v:+.3}"))
+        ));
+    }
+    let names: Vec<&String> = r
+        .points
+        .first()
+        .map(|p| p.parts.keys().collect())
+        .unwrap_or_default();
+    for part in names {
+        s.push_str(&format!("\n## Часть «{part}»\n\n{HEAD}"));
+        for p in &r.points {
+            if let Some(x) = p.parts.get(part) {
+                let mark = format!(" ({} сл., потеря {:+.0})", x.cases, x.lost);
+                s.push_str(&row(&format!("`{}`", p.name), &x.metrics, &x.delta, &mark));
+            }
+        }
+    }
     if r.points.iter().any(|p| !p.by_bucket.is_empty()) {
         for b in LEN_BUCKETS {
             s.push_str(&format!("\n## Корзина «слов {b}»\n\n{HEAD}"));
@@ -664,8 +810,12 @@ mod tests {
             env: point(name, env).env,
             metrics: HintMetrics::default(),
             by_bucket: BTreeMap::new(),
+            precision_lo_bonf: d.hint_precision.map(|e| e.lo),
             delta: d,
             delta_by_bucket: BTreeMap::new(),
+            lost: 0.0,
+            relevant: 40,
+            parts: BTreeMap::new(),
             passes,
             shown: Vec::new(),
         }
@@ -680,9 +830,29 @@ mod tests {
             hint_recall: r,
             silence_rate: None,
         };
-        assert!(coverage_passes(&d(est(0.05, 0.01), est(0.0, -0.01))));
-        assert!(!coverage_passes(&d(est(0.05, 0.01), est(-0.01, -0.03))));
-        assert!(!coverage_passes(&d(est(0.05, 0.0), est(0.0, 0.0))));
+        let cp = |dd: Deltas, lost: f64, relevant: usize| {
+            let mut p = pr("p", &[], dd, false);
+            p.lost = lost;
+            p.relevant = relevant;
+            coverage_passes(&p)
+        };
+        assert!(cp(d(est(0.05, 0.01), est(0.0, -0.01)), 0.0, 40));
+        // потеря двух подсказок — п. 1 не выполнен
+        assert!(!cp(d(est(0.05, 0.01), est(-0.05, -0.1)), 2.0, 40));
+        // допуск дискретности: одна потеря при N ≥ 25 — выполнен, при N < 25 — нет
+        assert!(cp(d(est(0.05, 0.01), est(-0.03, -0.09)), 1.0, 31));
+        assert!(!cp(d(est(0.05, 0.01), est(-0.05, -0.15)), 1.0, 20));
+        assert!(!cp(d(est(0.05, 0.0), est(0.0, 0.0)), 0.0, 40));
+        // точность падает в одной из устойчивых частей — не проходит
+        let mut p = pr("p", &[], d(est(0.05, 0.01), est(0.0, 0.0)), false);
+        p.parts.insert(
+            "m4".into(),
+            PartResult {
+                delta: d(est(-0.01, -0.05), None),
+                ..PartResult::default()
+            },
+        );
+        assert!(!coverage_passes(&p));
         let pts = vec![
             pr("base", &[], Deltas::default(), false),
             pr("a", &[], d(est(0.04, 0.01), est(0.0, 0.0)), true),
@@ -732,6 +902,7 @@ mod tests {
                 tool: None,
                 expected: vec!["x".into()],
                 note: String::new(),
+                source: "m4".into(),
             })
         };
         let a = vec![run("e-1", &["x"]), run("e-2", &[])];

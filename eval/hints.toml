@@ -499,6 +499,7 @@ event = "prompt"
 input = "почему консоль Windows показывает кракозябры вместо кириллицы"
 expected = ["insight:h26-console-cp866"]
 note = "кодировки, M6"
+source = "task9"
 
 [[case]]
 id = "p-32"
@@ -506,6 +507,7 @@ event = "prompt"
 input = "Python on Windows fails with UnicodeDecodeError charmap when reading a CSV"
 expected = ["insight:h18-py-charmap"]
 note = "кодировки, M6"
+source = "task9"
 
 [[case]]
 id = "p-33"
@@ -513,6 +515,7 @@ event = "prompt"
 input = "git warns that LF will be replaced by CRLF, which setting should I change"
 expected = ["insight:h19-git-autocrlf"]
 note = "git, M6"
+source = "task9"
 
 [[case]]
 id = "p-34"
@@ -520,6 +523,7 @@ event = "prompt"
 input = "cargo cannot download crates through the corporate proxy: SSL certificate problem"
 expected = ["insight:h21-proxy-ca", "insight:h22-cargo-net-retry"]
 note = "сеть, M6: обе записи о прокси"
+source = "task9"
 
 [[case]]
 id = "p-35"
@@ -527,6 +531,7 @@ event = "prompt"
 input = "integration tests get connection refused right after starting the test server"
 expected = ["insight:h23-test-conn-refused"]
 note = "тесты, M6"
+source = "task9"
 
 [[case]]
 id = "p-36"
@@ -534,6 +539,7 @@ event = "prompt"
 input = "set statement_timeout for queries behind pgbouncer"
 expected = ["insight:k07-t", "insight:k07-n"]
 note = "M6: ловушка и наблюдение одной темы"
+source = "task9"
 
 [[case]]
 id = "p-37"
@@ -541,6 +547,7 @@ event = "prompt"
 input = "как проверить, что резервная копия базы действительно восстанавливается"
 expected = ["insight:c13-b"]
 note = "M6: действующая запись цепочки"
+source = "task9"
 
 [[case]]
 id = "p-38"
@@ -548,6 +555,7 @@ event = "prompt"
 input = "what synchronous mode should the WAL index database use"
 expected = ["insight:c03-b"]
 note = "M6: действующая запись цепочки"
+source = "task9"
 
 [[case]]
 id = "p-39"
@@ -555,6 +563,7 @@ event = "prompt"
 input = "restore a Qdrant collection snapshot without restarting the server"
 expected = ["insight:c04-b"]
 note = "M6: действующая запись цепочки"
+source = "task9"
 
 [[case]]
 id = "p-40"
@@ -562,6 +571,7 @@ event = "prompt"
 input = "белый экран после релиза: service worker отдаёт старый index.html"
 expected = ["insight:k04-t"]
 note = "M6: ловушка, смешанный язык"
+source = "task9"
 
 [[case]]
 id = "p-41"
@@ -569,6 +579,7 @@ event = "prompt"
 input = "rename the variable count to total in this loop"
 expected = []
 note = "M6: рутинная правка"
+source = "task9"
 
 [[case]]
 id = "p-42"
@@ -576,6 +587,7 @@ event = "prompt"
 input = "напиши хайку про осень"
 expected = []
 note = "M6: вопрос без памяти"
+source = "task9"
 
 [[case]]
 id = "p-43"
@@ -583,6 +595,7 @@ event = "prompt"
 input = "добавь проверку email в форму регистрации"
 expected = []
 note = "M6: рутинная правка"
+source = "task9"
 
 [[case]]
 id = "p-44"
@@ -590,6 +603,7 @@ event = "prompt"
 input = "convert this JSON snippet to YAML"
 expected = []
 note = "M6: вопрос без памяти"
+source = "task9"
 
 [[case]]
 id = "p-45"
@@ -597,6 +611,7 @@ event = "prompt"
 input = "сделай кнопку оформления заказа синей"
 expected = []
 note = "M6: UI"
+source = "task9"
 
 [[case]]
 id = "p-46"
@@ -604,6 +619,7 @@ event = "prompt"
 input = "explain the difference between let and const in JavaScript"
 expected = []
 note = "M6: вопрос без памяти"
+source = "task9"
 
 [[case]]
 id = "p-47"
@@ -611,6 +627,7 @@ event = "prompt"
 input = "посчитай среднее значение массива цен"
 expected = []
 note = "M6: вопрос без памяти"
+source = "task9"
 
 [[case]]
 id = "p-48"
@@ -618,6 +635,7 @@ event = "prompt"
 input = "update the copyright year in the license header"
 expected = []
 note = "M6: рутинная правка"
+source = "task9"
 
 [[case]]
 id = "p-49"
@@ -625,6 +643,7 @@ event = "prompt"
 input = "почему тест сортировки падает на пустом списке"
 expected = []
 note = "M6, трудный: «тест», но не уведомления и не общий каталог"
+source = "task9"
 
 [[case]]
 id = "p-50"
@@ -632,6 +651,7 @@ event = "prompt"
 input = "how do I center a div with flexbox"
 expected = []
 note = "M6: UI"
+source = "task9"
 
 # ======================= случаи: post_tool =======================
 
@@ -812,6 +832,7 @@ event = "post_tool"
 input = "npm ERR! ERESOLVE"
 expected = ["insight:h12-npm-eresolve"]
 note = "≤ 3, сборка: строгий FTS"
+source = "task9"
 
 [[case]]
 id = "e-26"
@@ -819,6 +840,7 @@ event = "post_tool"
 input = "fatal: index.lock exists"
 expected = ["insight:h20-git-index-lock"]
 note = "≤ 3, git"
+source = "task9"
 
 [[case]]
 id = "e-27"
@@ -826,6 +848,7 @@ event = "post_tool"
 input = "UnicodeDecodeError: 'charmap' codec"
 expected = ["insight:h18-py-charmap"]
 note = "≤ 3, кодировки"
+source = "task9"
 
 [[case]]
 id = "e-28"
@@ -833,6 +856,7 @@ event = "post_tool"
 input = "connection refused (os error 10061)"
 expected = ["insight:h23-test-conn-refused"]
 note = "≤ 3, тесты/сеть"
+source = "task9"
 
 [[case]]
 id = "e-29"
@@ -840,6 +864,7 @@ event = "post_tool"
 input = "link.exe missing"
 expected = ["insight:h25-msvc-linker"]
 note = "≤ 3, сборка"
+source = "task9"
 
 [[case]]
 id = "e-30"
@@ -847,6 +872,7 @@ event = "post_tool"
 input = "консоль: кракозябры"
 expected = ["insight:h26-console-cp866"]
 note = "≤ 3, кодировки: другая форма слова (основы)"
+source = "task9"
 
 [[case]]
 id = "e-31"
@@ -854,6 +880,7 @@ event = "post_tool"
 input = "Killed"
 expected = []
 note = "≤ 3, посторонняя (OOM killer)"
+source = "task9"
 
 [[case]]
 id = "e-32"
@@ -861,6 +888,7 @@ event = "post_tool"
 input = "Permission denied"
 expected = []
 note = "≤ 3, трудный: permissions у h04"
+source = "task9"
 
 [[case]]
 id = "e-33"
@@ -868,6 +896,7 @@ event = "post_tool"
 input = "Out of memory"
 expected = []
 note = "≤ 3, посторонняя"
+source = "task9"
 
 [[case]]
 id = "e-34"
@@ -875,6 +904,7 @@ event = "post_tool"
 input = "Bus error"
 expected = []
 note = "≤ 3, посторонняя"
+source = "task9"
 
 [[case]]
 id = "e-35"
@@ -882,6 +912,7 @@ event = "post_tool"
 input = "No space left on device"
 expected = []
 note = "≤ 3, посторонняя"
+source = "task9"
 
 [[case]]
 id = "e-36"
@@ -889,6 +920,7 @@ event = "post_tool"
 input = "error: timed out"
 expected = []
 note = "≤ 3, трудный: «times out» у h22 (основы)"
+source = "task9"
 
 [[case]]
 id = "e-37"
@@ -896,6 +928,7 @@ event = "post_tool"
 input = "error: failed to get `serde` as a dependency of package `app v0.1.0`\nCaused by: download of config.json failed: spurious network error: Timeout was reached"
 expected = ["insight:h22-cargo-net-retry"]
 note = "9–20, сеть: ослабленный FTS"
+source = "task9"
 
 [[case]]
 id = "e-38"
@@ -903,6 +936,7 @@ event = "post_tool"
 input = "warning: in the working copy of 'scripts/build.sh', LF will be replaced by CRLF the next time Git touches it"
 expected = ["insight:h19-git-autocrlf"]
 note = "9–20, git/кодировки"
+source = "task9"
 
 [[case]]
 id = "e-39"
@@ -910,6 +944,7 @@ event = "post_tool"
 input = "error[E0308]: mismatched types\n  --> src/lib.rs:12:5\n   |\n12 |     x + 1\n   |     ^^^^^ expected `String`, found integer\nhelp: try using a conversion method: `.to_string()`"
 expected = []
 note = "9–20, сборка: посторонняя"
+source = "task9"
 
 [[case]]
 id = "e-40"
@@ -917,6 +952,7 @@ event = "post_tool"
 input = "java.lang.NullPointerException: Cannot invoke \"String.length()\" because \"name\" is null\n\tat com.shop.Cart.total(Cart.java:42)"
 expected = []
 note = "9–20, тесты: посторонняя"
+source = "task9"
 
 [[case]]
 id = "e-41"
@@ -924,6 +960,7 @@ event = "post_tool"
 input = "Traceback (most recent call last):\n  File \"C:\\work\\tools\\import_orders.py\", line 18, in <module>\n    rows = list(csv.reader(f))\n  File \"C:\\Python312\\Lib\\encodings\\cp1252.py\", line 23, in decode\n    return codecs.charmap_decode(input,self.errors,decoding_table)[0]\nUnicodeDecodeError: 'charmap' codec can't decode byte 0x98 in position 2172: character maps to <undefined>"
 expected = ["insight:h18-py-charmap"]
 note = "> 20, кодировки: traceback"
+source = "task9"
 
 [[case]]
 id = "e-42"
@@ -931,6 +968,7 @@ event = "post_tool"
 input = "   Compiling proc-macro2 v1.0.86\n   Compiling unicode-ident v1.0.12\nerror: linker `link.exe` not found\n  |\n  = note: program not found\n\nnote: the msvc targets depend on the msvc linker but `link.exe` was not found\n\nnote: please ensure that Visual Studio 2017 or later, or Build Tools for Visual Studio were installed with the Visual C++ option.\n\nerror: could not compile `proc-macro2` (build script) due to 1 previous error"
 expected = ["insight:h25-msvc-linker"]
 note = "> 20, сборка: вывод cargo build"
+source = "task9"
 
 [[case]]
 id = "e-43"
@@ -938,6 +976,7 @@ event = "post_tool"
 input = "npm ERR! code UNABLE_TO_GET_ISSUER_CERT_LOCALLY\nnpm ERR! errno UNABLE_TO_GET_ISSUER_CERT_LOCALLY\nnpm ERR! request to https://registry.npmjs.org/react failed, reason: unable to get local issuer certificate\nnpm ERR! While fetching: react@18.3.1 over the configured proxy\n\nnpm ERR! A complete log of this run can be found in:\nnpm ERR!     C:\\Users\\dev\\AppData\\Local\\npm-cache\\_logs\\2026-11-08T10_15_02_118Z-debug-0.log"
 expected = ["insight:h21-proxy-ca"]
 note = "> 20, сеть: npm за прокси"
+source = "task9"
 
 [[case]]
 id = "e-44"
@@ -945,6 +984,7 @@ event = "post_tool"
 input = "warning: in the working copy of 'web/src/App.tsx', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'web/src/main.ts', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'scripts/release.sh', LF will be replaced by CRLF the next time Git touches it\n[m6 4f2c1d9] chore: update build scripts\n 3 files changed, 41 insertions(+), 12 deletions(-)\nhint: run git config core.autocrlf to see the current setting"
 expected = ["insight:h19-git-autocrlf"]
 note = "> 20, git: вывод git add и commit"
+source = "task9"
 
 [[case]]
 id = "e-45"
@@ -952,6 +992,7 @@ event = "post_tool"
 input = "running 12 tests\ntest api::orders_list ... FAILED\ntest api::health ... ok\n\nfailures:\n\n---- api::orders_list stdout ----\nthread 'api::orders_list' panicked at tests/api.rs:31:10:\ncalled `Result::unwrap()` on an `Err` value: reqwest::Error { kind: Request, url: \"http://127.0.0.1:18080/orders\", source: hyper::Error(Connect, ConnectError(\"tcp connect error\", Os { code: 10061, kind: ConnectionRefused, message: \"No connection could be made because the target machine actively refused it.\" })) }\n\ntest result: FAILED. 11 passed; 1 failed"
 expected = ["insight:h23-test-conn-refused"]
 note = "> 20, тесты: cargo test, первые 32 слова"
+source = "task9"
 
 [[case]]
 id = "e-46"
@@ -959,6 +1000,7 @@ event = "post_tool"
 input = "---- storage::tests::writes_snapshot stdout ----\nthread 'storage::tests::writes_snapshot' panicked at src/storage.rs:88:14:\ncalled `Result::unwrap()` on an `Err` value: Os { code: 32, kind: Uncategorized, message: \"Процесс не может получить доступ к файлу, так как этот файл занят другим процессом.\" }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nfailures:\n    storage::tests::writes_snapshot\n\ntest result: FAILED. 41 passed; 1 failed; 0 ignored"
 expected = ["insight:h24-tests-shared-dir"]
 note = "> 20, тесты: файл занят, русский текст ОС"
+source = "task9"
 
 [[case]]
 id = "e-47"
@@ -966,6 +1008,7 @@ event = "post_tool"
 input = "TypeError: Cannot read properties of undefined (reading 'items')\n    at CartView.render (webpack-internal:///./src/components/CartView.tsx:57:31)\n    at finishClassComponent (react-dom.development.js:19752:31)\n    at updateClassComponent (react-dom.development.js:19698:24)\n    at beginWork (react-dom.development.js:21611:16)\n    at HTMLUnknownElement.callCallback (react-dom.development.js:4164:14)\n    at Object.invokeGuardedCallbackDev (react-dom.development.js:4213:16)\n    at Object.invokeGuardedCallback (react-dom.development.js:4277:31)\nThe above error occurred in the <CartView> component"
 expected = []
 note = "> 20, тесты: посторонний stack trace"
+source = "task9"
 
 [[case]]
 id = "e-48"
@@ -973,6 +1016,7 @@ event = "post_tool"
 input = "FAILURE: Build failed with an exception.\n\n* What went wrong:\nExecution failed for task ':app:compileDebugKotlin'.\n> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction\n   > Compilation error. See log for more details\n\n* Try:\n> Run with --stacktrace option to get the stack trace.\n> Run with --info or --debug option to get more log output."
 expected = []
 note = "> 20, сборка, трудный: build, failed, error, log"
+source = "task9"
 
 [[case]]
 id = "e-49"
@@ -980,6 +1024,7 @@ event = "post_tool"
 input = "Traceback (most recent call last):\n  File \"sync.py\", line 40, in <module>\n    r = requests.get(API_URL, timeout=10)\nrequests.exceptions.ConnectionError: HTTPSConnectionPool(host='api.partner.local', port=443): Max retries exceeded with url: /v1/orders (Caused by NameResolutionError(\"<urllib3.connection.HTTPSConnection object at 0x0000021F>: Failed to resolve 'api.partner.local' ([Errno 11001] getaddrinfo failed)\"))"
 expected = []
 note = "> 20, сеть, трудный: connection, timeout — но имя хоста не разрешается"
+source = "task9"
 
 [[case]]
 id = "e-50"
@@ -987,6 +1032,7 @@ event = "post_tool"
 input = "error[E0502]: cannot borrow `self.items` as mutable because it is also borrowed as immutable\n  --> src/cart.rs:41:9\n   |\n39 |         let first = self.items.first();\n   |                     ---------- immutable borrow occurs here\n41 |         self.items.push(item);\n   |         ^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here\n42 |         first.map(|f| f.price)\n   |         ----- immutable borrow later used here\n\nFor more information about this error, try `rustc --explain E0502`."
 expected = []
 note = "> 20, сборка: посторонняя"
+source = "task9"
 
 [[case]]
 id = "e-51"
@@ -994,6 +1040,7 @@ event = "post_tool"
 input = "Auto-merging src/orders.rs\nCONFLICT (content): Merge conflict in src/orders.rs\nAuto-merging web/src/App.tsx\nCONFLICT (content): Merge conflict in web/src/App.tsx\nAutomatic merge failed; fix conflicts and then commit the result.\nhint: Resolve all conflicts manually, mark them as resolved with\nhint: \"git add/rm <conflicted_files>\", then run \"git commit\".\nhint: You can instead abort this merge with \"git merge --abort\"."
 expected = []
 note = "> 20, git, трудный: git, commit, run"
+source = "task9"
 
 [[case]]
 id = "e-52"
@@ -1001,6 +1048,631 @@ event = "post_tool"
 input = "ssh: connect to host git.internal port 22: Connection timed out\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists."
 expected = []
 note = "> 20, сеть/git, трудный: connect, connection, timed out"
+source = "task9"
+
+# ---- ревью задачи 9 (I-1): независимый набор A (x-01…x-30) — автор не видел код, сетки,
+# результаты и случаи набора; .tmp/m6/task9/independent-post_tool.{toml,md} ----
+
+# Независимый набор случаев post_tool (x-01…x-30), задача 9 M6.
+# Составлен только по записям eval/insights.toml и [[insight]] h01–h26 из eval/hints.toml,
+# без чтения кода, случаев [[case]] и сеток. Описание — independent-post_tool.md.
+
+# ---------------- короткие (1–3 значимых слова) ----------------
+
+[[case]]
+id = "x-01"
+event = "post_tool"
+input = "Error: database is locked"
+expected = ["insight:h09-sqlite-busy"]
+note = "независимый набор: тесты, короткая, релевантно — SQLITE_BUSY от второго писателя (h09)"
+source = "independent"
+
+[[case]]
+id = "x-02"
+event = "post_tool"
+input = "$'\\r': command not found"
+expected = ["insight:h11-crlf-bash"]
+note = "независимый набор: кодировки, короткая, релевантно — CR в конце строк скрипта (h11)"
+source = "independent"
+
+[[case]]
+id = "x-03"
+event = "post_tool"
+input = "npm error code ERESOLVE"
+expected = ["insight:h12-npm-eresolve"]
+note = "независимый набор: сборка, короткая, релевантно — новый формат npm 10 («npm error», а не «npm ERR!») того же ERESOLVE (h12)"
+source = "independent"
+
+[[case]]
+id = "x-04"
+event = "post_tool"
+input = "Killed"
+expected = []
+note = "независимый набор: сборка, короткая, нерелевантно — rustc убит OOM killer при сборке; записи о нехватке памяти при сборке нет (p17 — про перезапуск юнита systemd, не про это)"
+source = "independent"
+
+[[case]]
+id = "x-05"
+event = "post_tool"
+input = "Segmentation fault (core dumped)"
+expected = []
+note = "независимый набор: тесты, короткая, нерелевантно — падение тестового бинарника, записи нет"
+source = "independent"
+
+[[case]]
+id = "x-06"
+event = "post_tool"
+input = "git@github.com: Permission denied (publickey)."
+expected = []
+note = "независимый набор: git, короткая, трудный негатив — общее слово git и «denied» (как «Отказано в доступе» в h24), но это SSH-ключ; записи нет"
+source = "independent"
+
+[[case]]
+id = "x-07"
+event = "post_tool"
+input = "stream did not contain valid UTF-8"
+expected = []
+note = "независимый набор: кодировки, короткая, трудный негатив — UTF-8 как в h18/h26, но это ошибка Rust std::io при чтении не-UTF-8 файла; записи нет"
+source = "independent"
+
+# ---------------- средние (одна строка) ----------------
+
+[[case]]
+id = "x-08"
+event = "post_tool"
+input = "LINK : fatal error LNK1181: cannot open input file 'onnxruntime.lib'"
+expected = ["insight:h08-lnk1181"]
+note = "независимый набор: сборка, средняя, релевантно — статическая линковка ort (h08)"
+source = "independent"
+
+[[case]]
+id = "x-09"
+event = "post_tool"
+input = "    Blocking waiting for file lock on build directory"
+expected = ["insight:h16-cargo-lock"]
+note = "независимый набор: сборка, средняя, релевантно — второй cargo держит блокировку target (h16)"
+source = "independent"
+
+[[case]]
+id = "x-10"
+event = "post_tool"
+input = " ! [rejected]        m6-token-economy -> m6-token-economy (non-fast-forward)"
+expected = ["insight:h15-git-nonff"]
+note = "независимый набор: git, средняя, релевантно — отказ push без fast-forward (h15)"
+source = "independent"
+
+[[case]]
+id = "x-11"
+event = "post_tool"
+input = "warning: in the working copy of 'scripts/release.sh', LF will be replaced by CRLF the next time Git touches it"
+expected = ["insight:h19-git-autocrlf"]
+note = "независимый набор: кодировки (переводы строк), средняя, релевантно — формулировка Git 2.37+ вместо старой «LF will be replaced by CRLF in <file>» (h19)"
+source = "independent"
+
+[[case]]
+id = "x-12"
+event = "post_tool"
+input = "fatal: не найден git репозиторий (или один из родительских каталогов): .git"
+expected = []
+note = "независимый набор: git, средняя, трудный негатив — русская локаль, слова git и fatal; команда запущена вне репозитория, записи нет"
+source = "independent"
+
+[[case]]
+id = "x-13"
+event = "post_tool"
+input = "curl: (6) Could not resolve host: static.rust-lang.org"
+expected = []
+note = "независимый набор: сеть, средняя, нерелевантно — DNS не разрешает имя; записей о DNS на машине разработчика нет (r02 — авария корпоративного DNS-резолвера, не это)"
+source = "independent"
+
+[[case]]
+id = "x-14"
+event = "post_tool"
+input = "zam_server.exe : fatal error LNK1120: 2 unresolved externals"
+expected = []
+note = "независимый набор: сборка, средняя, трудный негатив — другой код LNK (1120, а не 1181/1104): неразрешённые символы, записи нет"
+source = "independent"
+
+[[case]]
+id = "x-15"
+event = "post_tool"
+input = "SyntaxError: Non-UTF-8 code starting with '\\xd0' in file H:\\src\\zam\\scripts\\report.py on line 3, but no encoding declared; see https://peps.python.org/pep-0263/ for details"
+expected = []
+note = "независимый набор: кодировки, средняя, трудный негатив — Python и UTF-8 как в h18, но исходник .py сохранён в cp1251 (PEP 263), а не чтение файла через open(); записи нет"
+source = "independent"
+
+# ---------------- длинные (одна-две строки) ----------------
+
+[[case]]
+id = "x-16"
+event = "post_tool"
+input = "thread 'server::tests::starts_on_configured_port' panicked at crates\\zam-server\\src\\server.rs:212:38:\ncalled `Result::unwrap()` on an `Err` value: Os { code: 10048, kind: AddrInUse, message: \"Обычно разрешается только одно использование адреса сокета (протокол/сетевой адрес/порт).\" }"
+expected = ["insight:h10-port-in-use", "insight:p21-t"]
+note = "независимый набор: тесты, длинная, релевантно — порт занят (os error 10048) в тесте: старый экземпляр (h10) или параллельные тесты на фиксированном порту (p21-t); текст Windows на русском"
+source = "independent"
+
+[[case]]
+id = "x-17"
+event = "post_tool"
+input = "fatal: Unable to create 'H:/src/zam/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository, e.g. an editor opened by 'git commit'."
+expected = ["insight:h20-git-index-lock"]
+note = "независимый набор: git, длинная, релевантно — оставшийся index.lock (h20)"
+source = "independent"
+
+[[case]]
+id = "x-18"
+event = "post_tool"
+input = "error: failed to get `serde` as a dependency of package `zam-core v0.0.11 (H:\\src\\zam\\crates\\zam-core)`\nCaused by: [60] SSL peer certificate or SSH remote key was not OK (SSL certificate problem: unable to get local issuer certificate)"
+expected = ["insight:h21-proxy-ca"]
+note = "независимый набор: сеть, длинная, релевантно — корневой сертификат корпоративного прокси не в хранилище (h21)"
+source = "independent"
+
+[[case]]
+id = "x-19"
+event = "post_tool"
+input = "thread 'store::tests::reopen_after_crash' panicked at crates\\zam-store\\tests\\reopen.rs:30:5:\nне удалось удалить target\\test-data\\store\\index.db: Процесс не может получить доступ к файлу, так как этот файл занят другим процессом. (os error 32)"
+expected = ["insight:h24-tests-shared-dir"]
+note = "независимый набор: тесты, длинная, релевантно — общий каталог данных у параллельных тестов, русское сообщение Windows (h24)"
+source = "independent"
+
+[[case]]
+id = "x-20"
+event = "post_tool"
+input = "error: Your local changes to the following files would be overwritten by checkout:\n\tcrates/zam-core/src/recall.rs\nPlease commit your changes or stash them before you switch branches.\nAborting"
+expected = []
+note = "независимый набор: git, длинная, трудный негатив — git, error, file, checkout (как в p04); незакоммиченные правки мешают переключению ветки, записи нет"
+source = "independent"
+
+[[case]]
+id = "x-21"
+event = "post_tool"
+input = "npm error code ETIMEDOUT\nnpm error network request to https://registry.npmjs.org/vite failed, reason: connect ETIMEDOUT 104.16.27.34:443"
+expected = []
+note = "независимый набор: сеть, длинная, трудный негатив — npm (как h12) и тайм-аут сети (как h22, но h22 — индекс crates.io и переменные cargo); записи о тайм-аутах npm нет"
+source = "independent"
+
+[[case]]
+id = "x-22"
+event = "post_tool"
+input = "error[E0502]: cannot borrow `self.cache` as mutable because it is also borrowed as immutable\n  --> crates\\zam-core\\src\\cache.rs:88:9"
+expected = []
+note = "независимый набор: сборка, длинная, трудный негатив — код Rust E0xxx и слово cache (как в k03/c01), ошибка заимствования; записи нет"
+source = "independent"
+
+[[case]]
+id = "x-23"
+event = "post_tool"
+input = "thread 'recall::tests::digest_limit' panicked at crates\\zam-core\\src\\recall.rs:418:9:\nassertion `left == right` failed: дайджест должен содержать 3 правила\n  left: 4\n right: 3"
+expected = []
+note = "независимый набор: тесты, длинная, трудный негатив — тот же формат паники теста, что в x-16/x-19, но логическая ошибка утверждения; записи нет"
+source = "independent"
+
+# ---------------- очень длинные (многострочный лог, 25+ слов) ----------------
+
+[[case]]
+id = "x-24"
+event = "post_tool"
+input = "   Compiling zam-core v0.0.11 (H:\\src\\zam\\crates\\zam-core)\n   Compiling zam-server v0.0.11 (H:\\src\\zam\\crates\\zam-server)\nerror: linker `link.exe` not found\n  |\n  = note: program not found\n\nnote: the msvc targets depend on the msvc linker but `link.exe` was not found\n\nnote: please ensure that Visual Studio 2017 or later, or Build Tools for Visual Studio were installed with the Visual C++ option.\n\nnote: VS Code is a different product, and is not sufficient.\n\nerror: could not compile `zam-server` (bin \"zam-server\") due to 1 previous error"
+expected = ["insight:h25-msvc-linker"]
+note = "независимый набор: сборка, очень длинная, релевантно — нет MSVC Build Tools (h25)"
+source = "independent"
+
+[[case]]
+id = "x-25"
+event = "post_tool"
+input = "    Updating crates.io index\nwarning: spurious network error (3 tries remaining): [28] Timeout was reached (Operation timed out after 30000 milliseconds with 0 bytes received)\nwarning: spurious network error (2 tries remaining): [28] Timeout was reached (Operation timed out after 30001 milliseconds with 0 bytes received)\nwarning: spurious network error (1 tries remaining): [28] Timeout was reached\nerror: failed to get `tokio` as a dependency of package `zam-server v0.0.11 (H:\\src\\zam\\crates\\zam-server)`\n\nCaused by:\n  download of to/ki/tokio failed\n\nCaused by:\n  failed to download from `https://index.crates.io/to/ki/tokio`\n\nCaused by:\n  [28] Timeout was reached (Operation timed out after 30000 milliseconds with 0 bytes received)"
+expected = ["insight:h22-cargo-net-retry"]
+note = "независимый набор: сеть, очень длинная, релевантно — тайм-аут sparse-индекса crates.io при исчерпании повторов (h22)"
+source = "independent"
+
+[[case]]
+id = "x-26"
+event = "post_tool"
+input = "Traceback (most recent call last):\n  File \"H:\\src\\zam\\scripts\\gen_fixtures.py\", line 57, in <module>\n    main()\n  File \"H:\\src\\zam\\scripts\\gen_fixtures.py\", line 41, in main\n    text = f.read()\n           ^^^^^^^^\n  File \"C:\\Python312\\Lib\\encodings\\cp1251.py\", line 23, in decode\n    return codecs.charmap_decode(input,self.errors,decoding_table)[0]\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nUnicodeDecodeError: 'charmap' codec can't decode byte 0x98 in position 1204: character maps to <undefined>"
+expected = ["insight:h18-py-charmap"]
+note = "независимый набор: кодировки, очень длинная, релевантно — open() без encoding читает UTF-8 в cp1251 (h18)"
+source = "independent"
+
+[[case]]
+id = "x-27"
+event = "post_tool"
+input = "running 12 tests\ntest health::ready_after_start ... ok\ntest api::search_returns_hits ... FAILED\ntest api::create_entry ... FAILED\n\nfailures:\n\n---- api::search_returns_hits stdout ----\nthread 'api::search_returns_hits' panicked at crates\\zam-server\\tests\\api.rs:63:14:\nrequest failed: reqwest::Error { kind: Request, url: \"http://127.0.0.1:49731/search\", source: hyper_util::client::legacy::Error(Connect, ConnectError(\"tcp connect error\", Os { code: 10061, kind: ConnectionRefused, message: \"Подключение не установлено, т.к. конечный компьютер отверг запрос на подключение.\" })) }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nfailures:\n    api::create_entry\n    api::search_returns_hits\n\ntest result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s\n\nerror: test failed, to rerun pass `-p zam-server --test api`"
+expected = ["insight:h23-test-conn-refused"]
+note = "независимый набор: тесты, очень длинная, релевантно — тест подключается до готовности сервера, os error 10061 с русским текстом Windows (h23)"
+source = "independent"
+
+[[case]]
+id = "x-28"
+event = "post_tool"
+input = "Traceback (most recent call last):\n  File \"C:\\Python312\\Lib\\site-packages\\urllib3\\connectionpool.py\", line 466, in _make_request\n    self._validate_conn(conn)\n  File \"C:\\Python312\\Lib\\site-packages\\urllib3\\connectionpool.py\", line 1095, in _validate_conn\n    conn.connect()\nssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired (_ssl.c:1006)\n\nDuring handling of the above exception, another exception occurred:\n\nrequests.exceptions.SSLError: HTTPSConnectionPool(host='models.internal.example', port=443): Max retries exceeded with url: /bge-m3/model.onnx (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired (_ssl.c:1006)')))"
+expected = []
+note = "независимый набор: сеть, очень длинная, трудный негатив — SSL и certificate verify failed как в h21, но причина — истёкший сертификат сервера, а не корень прокси; совет h21 не поможет, записи нет"
+source = "independent"
+
+[[case]]
+id = "x-29"
+event = "post_tool"
+input = "Auto-merging crates/zam-core/src/recall.rs\nCONFLICT (content): Merge conflict in crates/zam-core/src/recall.rs\nAuto-merging docs/CHANGELOG.md\nCONFLICT (content): Merge conflict in docs/CHANGELOG.md\nerror: could not apply 3f9c2d1... feat(recall): пороги подсказок\nhint: Resolve all conflicts manually, mark them as resolved with\nhint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\".\nhint: You can instead skip this commit: run \"git rebase --skip\".\nhint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\".\nCould not apply 3f9c2d1... feat(recall): пороги подсказок"
+expected = []
+note = "независимый набор: git, очень длинная, трудный негатив — git rebase (совет h15 — pull --rebase) и много слов git/error; конфликт слияния при rebase, записи нет"
+source = "independent"
+
+[[case]]
+id = "x-30"
+event = "post_tool"
+input = "> python scripts\\import_log.py data\\export.txt\nTraceback (most recent call last):\n  File \"H:\\src\\zam\\scripts\\import_log.py\", line 22, in <module>\n    for line in open(path, encoding='utf-8'):\n  File \"H:\\src\\zam\\scripts\\import_log.py\", line 14, in read_rows\n    rows.append(parse(line))\n  File \"<frozen codecs>\", line 322, in decode\nUnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"
+expected = []
+note = "независимый набор: кодировки, очень длинная, трудный негатив — UnicodeDecodeError в Python как в h18, но кодек уже utf-8, а файл в UTF-16 (BOM FF FE); совет h18 «encoding='utf-8'» здесь уже применён, записи нет"
+source = "independent"
+
+# ---- ревью задачи 9 (I-1): независимый набор B (y-01…y-30; у автора — x-01…x-30) — автор
+# не видел код отбора, сетки и результаты (смотрел e-01…e-04, e-25…e-27 ради формата);
+# .tmp/m6/task9/independent-post_tool-b.{toml,md} ----
+
+# Независимый набор случаев post_tool для замера подсказок (M6 §9, задача 9), вариант B.
+# Автор — отдельный исполнитель, не видевший кода отбора (recall.rs, text.rs, api/recall.rs),
+# eval-обвязки, сеток, результатов и случаев [[case]] прежнего набора (кроме e-01…e-04 и
+# e-25…e-27, просмотренных ради формата). Формат — как [[case]] в eval/hints.toml; ожидаемые
+# записи — только существующие insight (eval/hints.toml и eval/insights.toml), новых записей нет.
+# Поля-пометки источника формат не предусматривает: у каждого случая комментарий `# independent`,
+# а `note` начинается со слова `independent`.
+# Корзина длины в note — оценка автора по числу словоформ (нормализацию сервера автор не видел),
+# см. independent-post_tool-b.md.
+
+# ======================= релевантные (15) =======================
+
+# independent
+[[case]]
+id = "y-01"
+event = "post_tool"
+input = "ERESOLVE could not resolve"
+expected = ["insight:h12-npm-eresolve"]
+note = "independent; relevant; ≤ 3; npm 7+ (без слов 'unable' и 'tree')"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-02"
+event = "post_tool"
+input = "Error: listen EADDRINUSE :::3000"
+expected = ["insight:h10-port-in-use"]
+note = "independent; relevant; ≤ 3; node, код ошибки без текста"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-03"
+event = "post_tool"
+input = "Error: database is locked"
+expected = ["insight:h09-sqlite-busy"]
+note = "independent; relevant; ≤ 3; rusqlite/sqlite3 без кода SQLITE_BUSY"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-04"
+event = "post_tool"
+input = "    + FullyQualifiedErrorId : UnauthorizedAccess"
+expected = ["insight:h14-exec-policy"]
+note = "independent; relevant; ≤ 3; хвост ошибки PowerShell при запрете скриптов — трудный случай без слов 'scripts disabled'"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-05"
+event = "post_tool"
+input = "Connection refused (os error 10061)"
+expected = ["insight:h23-test-conn-refused"]
+note = "independent; relevant; 4–8; тест обращается к ещё не поднятому серверу (Windows)"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-06"
+event = "post_tool"
+input = "error: linker `link.exe` not found"
+expected = ["insight:h25-msvc-linker"]
+note = "independent; relevant; 4–8; дословный вывод rustc, совпадение с заголовком неизбежно"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-07"
+event = "post_tool"
+input = "./scripts/bootstrap.sh: line 4: $'\\r': command not found"
+expected = ["insight:h11-crlf-bash", "insight:h01-sh-lf"]
+note = "independent; relevant; 4–8; error_regex + запись о LF"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-08"
+event = "post_tool"
+input = "    Blocking waiting for file lock on build directory"
+expected = ["insight:h16-cargo-lock"]
+note = "independent; relevant; 4–8; дословная строка cargo"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-09"
+event = "post_tool"
+input = "fatal: unable to access 'https://github.com/acme/billing.git/': SSL certificate problem: unable to get local issuer certificate"
+expected = ["insight:h21-proxy-ca"]
+note = "independent; relevant; 9–20; git за корпоративным прокси"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-10"
+event = "post_tool"
+input = "warning: in the working copy of 'tools/gen.py', LF will be replaced by CRLF the next time Git touches it"
+expected = ["insight:h19-git-autocrlf"]
+note = "independent; relevant; 9–20; формулировка git ≥ 2.37 (иная, чем в заголовке записи)"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-11"
+event = "post_tool"
+input = "[E:onnxruntime:Default, provider_bridge_ort.cc:1744 onnxruntime::TryGetProviderInfo_CUDA] LoadLibrary failed with error 126 \"\" when trying to load \"C:\\zam\\bin\\onnxruntime_providers_cuda.dll\""
+expected = ["insight:h13-cuda-dll", "insight:p03-t"]
+note = "independent; relevant; 9–20 (с путями — возможно > 20); формат журнала ORT; p03-t — о библиотеках NVIDIA рядом"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-12"
+event = "post_tool"
+input = '''
+Traceback (most recent call last):
+  File "C:\Users\dev\proj\tools\import_notes.py", line 58, in <module>
+    main()
+  File "C:\Users\dev\proj\tools\import_notes.py", line 41, in main
+    text = fh.read()
+  File "C:\Python311\Lib\encodings\cp1252.py", line 23, in decode
+    return codecs.charmap_decode(input,self.errors,decoding_table)[0]
+UnicodeDecodeError: 'charmap' codec can't decode byte 0x81 in position 2047: character maps to <undefined>
+'''
+expected = ["insight:h18-py-charmap"]
+note = "independent; relevant; > 20; полный traceback Python на Windows"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-13"
+event = "post_tool"
+input = '''
+    Updating crates.io index
+warning: spurious network error (3 tries remaining): [28] Timeout was reached (Operation timed out after 30001 milliseconds with 0 out of 0 bytes received)
+warning: spurious network error (2 tries remaining): [28] Timeout was reached (Operation timed out after 30000 milliseconds with 0 out of 0 bytes received)
+error: failed to get `tokio` as a dependency of package `zam-core v0.0.11 (H:\src\zam\crates\zam-core)`
+
+Caused by:
+  download of config.json failed
+
+Caused by:
+  failed to download from `https://index.crates.io/config.json`
+
+Caused by:
+  [28] Timeout was reached (Operation timed out after 30000 milliseconds with 0 out of 0 bytes received)
+'''
+expected = ["insight:h22-cargo-net-retry"]
+note = "independent; relevant; > 20; реальный вид вывода cargo при медленном прокси"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-14"
+event = "post_tool"
+input = '''
+To github.com:acme/billing.git
+ ! [rejected]        main -> main (fetch first)
+error: failed to push some refs to 'github.com:acme/billing.git'
+hint: Updates were rejected because the remote contains work that you do not
+hint: have locally. This is usually caused by another repository pushing to
+hint: the same ref. If you want to integrate the remote changes, use
+hint: 'git pull' before pushing again.
+hint: See the 'Note about fast-forwards' in 'git push --help' for details.
+'''
+expected = ["insight:h15-git-nonff"]
+note = "independent; relevant; > 20; вариант 'fetch first' (не 'non-fast-forward')"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-15"
+event = "post_tool"
+input = '''
+running 14 tests
+test store::tests::open_creates_schema ... ok
+test store::tests::reopen_keeps_rows ... FAILED
+test store::tests::vacuum_shrinks_file ... ok
+
+failures:
+
+---- store::tests::reopen_keeps_rows stdout ----
+thread 'store::tests::reopen_keeps_rows' panicked at crates\zam-store\src\tests.rs:112:47:
+called `Result::unwrap()` on an `Err` value: Os { code: 32, kind: Uncategorized, message: "Процесс не может получить доступ к файлу, так как этот файл занят другим процессом." }
+
+failures:
+    store::tests::reopen_keeps_rows
+
+test result: FAILED. 13 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+'''
+expected = ["insight:h24-tests-shared-dir"]
+note = "independent; relevant; > 20; cargo test на Windows с русской локалью, os error 32"
+source = "independent_b"
+
+# ======================= нерелевантные (15) =======================
+
+# independent
+[[case]]
+id = "y-16"
+event = "post_tool"
+input = "Permission denied (publickey)."
+expected = []
+note = "independent; silence; ≤ 3; ловушка: 'Permission denied' ↔ «Отказано в доступе» (h24), git (h15)"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-17"
+event = "post_tool"
+input = "npm ERR! ETIMEDOUT"
+expected = []
+note = "independent; silence; ≤ 3; ловушка: таймаут сети, но не cargo (h22), npm (h12)"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-18"
+event = "post_tool"
+input = "HRESULT: 0x80070643"
+expected = []
+note = "independent; silence; ≤ 3; сбой установщика MSI (winget/Windows Update)"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-19"
+event = "post_tool"
+input = "BUILD FAILED"
+expected = []
+note = "independent; silence; ≤ 3; общие слова build/failed"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-20"
+event = "post_tool"
+input = "error[E0382]: borrow of moved value: `cfg`"
+expected = []
+note = "independent; silence; 4–8; ошибка rustc без записи"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-21"
+event = "post_tool"
+input = "LINK : fatal error LNK1120: 1 unresolved externals"
+expected = []
+note = "independent; silence; 4–8; ловушка: тот же LINK/fatal error, код соседний с LNK1104/LNK1181"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-22"
+event = "post_tool"
+input = "fatal: refusing to merge unrelated histories"
+expected = []
+note = "independent; silence; 4–8; ловушка: git pull/merge рядом с h15"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-23"
+event = "post_tool"
+input = "getaddrinfo ENOTFOUND registry.npmjs.org"
+expected = []
+note = "independent; silence; 4–8; ловушка: сеть/DNS у клиента — ни прокси-CA (h21), ни DNS-инцидент сервера (r02)"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-24"
+event = "post_tool"
+input = "UnicodeEncodeError: 'utf-8' codec can't encode character '\\udc8f' in position 12: surrogates not allowed"
+expected = []
+note = "independent; silence; 9–20; ловушка: кодировки Python (h18), но причина — суррогаты, а не ANSI"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-25"
+event = "post_tool"
+input = "Get-Item : Cannot find path 'C:\\build\\out\\package.zip' because it does not exist."
+expected = []
+note = "independent; silence; 9–20; ловушка: PowerShell (h14), «build»"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-26"
+event = "post_tool"
+input = "error: pathspec 'feature/login-form' did not match any file(s) known to git"
+expected = []
+note = "independent; silence; 9–20; git без записи"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-27"
+event = "post_tool"
+input = "npm ERR! code EPERM npm ERR! syscall rename npm ERR! path C:\\app\\node_modules\\esbuild npm ERR! errno -4048 npm ERR! Error: EPERM: operation not permitted, rename"
+expected = []
+note = "independent; silence; 9–20 (может уйти в > 20); ловушка: Windows-блокировка файла (h17 антивирус у линкера, h24 тесты), npm (h12)"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-28"
+event = "post_tool"
+input = '''
+error[E0277]: `Rc<RefCell<Index>>` cannot be sent between threads safely
+   --> crates\zam-search\src\worker.rs:57:18
+    |
+57  |     let handle = tokio::spawn(async move {
+    |                  ^^^^^^^^^^^^ `Rc<RefCell<Index>>` cannot be sent between threads safely
+    |
+    = help: within `{async block@crates\zam-search\src\worker.rs:57:31}`, the trait `Send` is not implemented for `Rc<RefCell<Index>>`
+note: required by a bound in `tokio::spawn`
+   --> C:\Users\dev\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tokio-1.40.0\src\task\spawn.rs:167:21
+
+error: could not compile `zam-search` (lib) due to 1 previous error
+'''
+expected = []
+note = "independent; silence; > 20; длинный вывод rustc; ловушка: tokio::spawn (p19), threads (p16), compile/error"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-29"
+event = "post_tool"
+input = '''
+   Compiling zam-tls v0.1.0 (H:\src\zam\crates\zam-tls)
+error: linking with `link.exe` failed: exit code: 1120
+  |
+  = note: "C:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.40.33807\\bin\\HostX64\\x64\\link.exe" "/NOLOGO" "/OUT:H:\\src\\zam\\target\\debug\\deps\\zam_tls-1c9e.exe"
+  = note: zam_tls.store.o : error LNK2019: unresolved external symbol __imp_CertFreeCertificateContext referenced in function zam_tls::store::load_roots
+          zam_tls.store.o : error LNK2019: unresolved external symbol __imp_CertOpenSystemStoreW referenced in function zam_tls::store::load_roots
+          H:\src\zam\target\debug\deps\zam_tls-1c9e.exe : fatal error LNK1120: 2 unresolved externals
+
+error: could not compile `zam-tls` (bin "zam-tls") due to 1 previous error
+'''
+expected = []
+note = "independent; silence; > 20; сильная ловушка: link.exe (h25), LNK/target\\debug (h17), certificate (h21); нужна crypt32.lib"
+source = "independent_b"
+
+# independent
+[[case]]
+id = "y-30"
+event = "post_tool"
+input = '''
+Traceback (most recent call last):
+  File "C:\Python311\Lib\site-packages\urllib3\connection.py", line 203, in _new_conn
+    sock = connection.create_connection(
+socket.gaierror: [Errno 11001] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+urllib3.exceptions.NewConnectionError: <urllib3.connection.HTTPSConnection object at 0x0000021F>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed
+
+requests.exceptions.ConnectionError: HTTPSConnectionPool(host='api.internal.acme', port=443): Max retries exceeded with url: /v1/health (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x0000021F>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+'''
+expected = []
+note = "independent; silence; > 20; ловушка: connection/health/retries (h23, k24, h22), DNS (r02), Python traceback"
+source = "independent_b"
 
 # ======================= случаи: pre_tool =======================
 

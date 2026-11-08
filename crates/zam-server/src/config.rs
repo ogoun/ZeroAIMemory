@@ -776,9 +776,11 @@ pub struct RecallSection {
     /// Наименьший балл поиска подсказки к запросу пользователя (0..=1, 0,6).
     pub prompt_min_score: f64,
     /// Тот же порог, когда поиск `prompt` деградировал до FTS (`degraded`, нет модели или Qdrant;
-    /// M6 §9, M4.5 M-9), 0..=1 — подсказки решений и идей. 0,6 — как `prompt_min_score` до M6;
-    /// сетка задачи 9 {0,2…0,6}: условия §9 (тишина ≥ 0,7) не выполнены ни при одном — 0,6.
-    pub prompt_min_score_fts: f64,
+    /// M6 §9, M4.5 M-9), 0..=1 — подсказки `prompt` и подсказки-идеи (пакет субагенту — всегда
+    /// `prompt_min_score`). Не задан — равен `prompt_min_score`, как до M6 (ревью задачи 9, M-1):
+    /// сетка {0,2…0,6} условий §9 не выполнила ни при одном значении (тишина 0,20 < 0,7).
+    #[serde(default)]
+    pub prompt_min_score_fts: Option<f64>,
     /// Порог покрытия слов ошибки у ослабленного FTS `post_tool` (M6 §9):
     /// `{divisor, cap, word_match}` — `clamp(⌈n / divisor⌉, 2, cap)`, слова `plain` | `stems`;
     /// `{3, 6, stems}` — по сетке задачи 9 (до M6 — `{3, 4, plain}`).
@@ -817,8 +819,9 @@ impl RecallSection {
         if !(self.prompt_min_score.is_finite() && (0.0..=1.0).contains(&self.prompt_min_score)) {
             return Err(bad("prompt_min_score", "должно быть в 0..=1"));
         }
-        let fts = self.prompt_min_score_fts;
-        if !(fts.is_finite() && (0.0..=1.0).contains(&fts)) {
+        if let Some(fts) = self.prompt_min_score_fts
+            && !(fts.is_finite() && (0.0..=1.0).contains(&fts))
+        {
             return Err(bad("prompt_min_score_fts", "должно быть в 0..=1"));
         }
         let cov = &self.post_tool_coverage;
@@ -1291,7 +1294,7 @@ impl Default for ServerConfig {
                 recovery_tokens: 2000,
                 brief_tokens: 800,
                 prompt_min_score: 0.6,
-                prompt_min_score_fts: 0.6,
+                prompt_min_score_fts: None,
                 post_tool_coverage: CoverageRule::M6,
                 timeout_ms: 200,
                 snippet_tokens: 60,
@@ -2503,7 +2506,10 @@ master_key = \"x\"
     fn recall_hint_threshold_keys() {
         use zam_search::recall::WordMatch;
         let d = load(None, &[], &Default::default()).unwrap().recall;
-        assert_eq!(d.prompt_min_score_fts, 0.6);
+        assert_eq!(
+            d.prompt_min_score_fts, None,
+            "не задан — как prompt_min_score"
+        );
         assert_eq!(d.post_tool_coverage, CoverageRule::M6);
         let e = vec![
             env("ZAM_RECALL__PROMPT_MIN_SCORE_FTS", "0.3"),
@@ -2512,7 +2518,7 @@ master_key = \"x\"
             env("ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH", "stems"),
         ];
         let r = load(None, &e, &Default::default()).unwrap().recall;
-        assert_eq!(r.prompt_min_score_fts, 0.3);
+        assert_eq!(r.prompt_min_score_fts, Some(0.3));
         assert_eq!(
             r.post_tool_coverage,
             CoverageRule {

@@ -3334,10 +3334,14 @@ async fn prompt_hints(
 }
 
 /// Порог балла подсказки к `prompt` по ответу внутреннего поиска `search`: поиск деградировал до
-/// FTS (`degraded`) — `recall.prompt_min_score_fts`, иначе `recall.prompt_min_score` (M6 §9).
+/// FTS (`degraded`) — `recall.prompt_min_score_fts` (не задан — `prompt_min_score`), иначе
+/// `recall.prompt_min_score` (M6 §9).
 fn prompt_min_score(st: &AppState, search: &Value) -> f64 {
     if search["degraded"].as_bool() == Some(true) {
-        st.cfg.recall.prompt_min_score_fts
+        st.cfg
+            .recall
+            .prompt_min_score_fts
+            .unwrap_or(st.cfg.recall.prompt_min_score)
     } else {
         st.cfg.recall.prompt_min_score
     }

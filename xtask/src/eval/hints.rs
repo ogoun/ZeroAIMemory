@@ -70,8 +70,9 @@ pub const MIN_PER_BUCKET: usize = 10;
 /// Корзины длины ошибки `post_tool` (M6 §9, I11): слов [`error_len`] — ≤ 3, 4–8, 9–20, > 20.
 pub const LEN_BUCKETS: [&str; 4] = ["≤3", "4–8", "9–20", ">20"];
 
-/// Длина ошибки для порога покрытия: слов [`error_terms`] нормализованной ошибки
-/// ([`normalize_error`]) — то `n`, от которого считается порог сервера.
+/// Длина ошибки для корзин: слов [`error_terms`] нормализованной ошибки ([`normalize_error`]) —
+/// `n` порога покрытия **по правилу `plain`** (у `stems` `n` после служебных слов меньше; корзины
+/// у всех точек сетки одни и те же — по `plain`).
 pub fn error_len(input: &str) -> usize {
     error_terms(&normalize_error(input)).len()
 }
@@ -163,6 +164,18 @@ pub struct Case {
     pub expected: Vec<String>,
     #[serde(default)]
     pub note: String,
+    /// Происхождение случая ([`SOURCES`]): `m4` (по умолчанию), `task9` (исполнитель задачи 9
+    /// M6), `independent` и `independent_b` (два независимых набора ревью задачи 9 — авторы не видели
+    /// код, сетки и результаты).
+    #[serde(default = "default_source")]
+    pub source: String,
+}
+
+/// Происхождения случаев набора.
+pub const SOURCES: [&str; 4] = ["m4", "task9", "independent", "independent_b"];
+
+fn default_source() -> String {
+    SOURCES[0].to_string()
 }
 
 /// Набор `eval/hints.toml`.
@@ -259,6 +272,9 @@ pub fn validate_hints(set: &HintSet, corpus: &Corpus) -> Result<HintSummary> {
         }
         if c.input.trim().is_empty() {
             bad("пустой input".into());
+        }
+        if !SOURCES.contains(&c.source.as_str()) {
+            bad(format!("source {} — ожидается {SOURCES:?}", c.source));
         }
         match (c.event, c.tool.as_deref()) {
             (Event::PreTool, Some("Write" | "Edit" | "Bash")) => {}
@@ -636,6 +652,8 @@ pub struct CaseRun {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     pub note: String,
+    /// Происхождение случая ([`Case::source`]).
+    pub source: String,
 }
 
 /// Строка перебора порога.
@@ -1143,6 +1161,7 @@ fn case_run(c: &Case) -> CaseRun {
         ms: 0.0,
         warnings: Vec::new(),
         note: c.note.clone(),
+        source: c.source.clone(),
     }
 }
 
@@ -1761,7 +1780,10 @@ pub fn render_md(r: &HintsResult) -> String {
     ));
     sweep_rows(&mut s, "порог", &r.calibration.prompt);
     s.push_str(&format!(
-        "\nПорог покрытия ослабленного FTS `post_tool` (модель совпала с `/recall` при текущем правиле в {:.0} % случаев):\n\n",
+        "\nПорог покрытия ослабленного FTS `post_tool` (модель отбора M4 знает только правило \
+         `plain`, у сервера — `recall.post_tool_coverage`; при `stems` совпадение ниже, перебор \
+         справочный — сетка M6 — `--hints --grid`; модель совпала с `/recall` в {:.0} % \
+         случаев):\n\n",
         r.calibration.post_tool_agreement * 100.0
     ));
     sweep_rows(&mut s, "правило", &r.calibration.post_tool);

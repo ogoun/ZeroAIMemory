@@ -448,12 +448,11 @@ async fn prompt_returns_0_to_3_above_threshold() {
     .await;
     assert_eq!(j["text"], "", "{j}");
     assert!(j["items"].as_array().unwrap().is_empty());
-    // порог выше любого балла — тишина и для релевантного запроса (сервер теста без модели:
-    // действует порог FTS-only, M6 §9)
+    // порог выше любого балла — тишина и для релевантного запроса (порог FTS-only не задан —
+    // тот же `prompt_min_score`, M6 §9)
     let b = api("recall-prompt-strict", |c| {
         roomy(c);
         c.recall.prompt_min_score = 1.0;
-        c.recall.prompt_min_score_fts = 1.0;
     })
     .await;
     insight(
@@ -968,6 +967,46 @@ async fn post_tool_coverage_word_match_from_config() {
     assert!(got[1].0, "stems: основа «конс»: {}", got[1].1);
 }
 
+/// Ревью задачи 9, I-2 (M-5): при `stems` код ошибки с цифрами совпадает только целиком —
+/// `LNK1181` не подтверждается записью о `LNK1104` по общему началу основы.
+#[tokio::test]
+async fn post_tool_stems_codes_match_whole() {
+    use zam_search::recall::WordMatch;
+    let a = api("recall-post-tool-codes", |c| {
+        roomy(c);
+        c.recall.post_tool_coverage.word_match = WordMatch::Stems;
+    })
+    .await;
+    let other = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "LNK1104 onnxruntime",
+        "Компоновщик не открыл файл onnxruntime.",
+        "failure",
+    )
+    .await;
+    let same = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "LNK1181 onnxruntime",
+        "Статическая линковка onnxruntime.",
+        "failure",
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "post_tool", "error": "lnk1181 onnxruntime.dll"}),
+    )
+    .await;
+    let got = ids(&j);
+    assert!(got.contains(&format!("i:{same}")), "{j}");
+    assert!(!got.contains(&format!("i:{other}")), "{j}");
+}
+
 /// M6 §9: поиск `prompt` без модели деградировал до FTS — порог балла подсказки
 /// `recall.prompt_min_score_fts`, а `recall.prompt_min_score` не действует.
 #[tokio::test]
@@ -977,7 +1016,7 @@ async fn prompt_fts_only_uses_fts_threshold() {
         let a = api(&format!("recall-prompt-{name}"), |c| {
             roomy(c);
             c.recall.prompt_min_score = min;
-            c.recall.prompt_min_score_fts = fts;
+            c.recall.prompt_min_score_fts = Some(fts);
         })
         .await;
         insight(

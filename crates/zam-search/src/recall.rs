@@ -233,6 +233,21 @@ impl StemWord {
         }
     }
 
+    /// Слово с цифрой — только целиком (`post_tool`, ревью задачи 9, I-2): коды ошибок
+    /// (`lnk1181`/`lnk1104`, `e0382`/`e0384`) различаются хвостом, который [`stem`] срезает.
+    /// Остальные слова — как [`StemWord::new`]. Подсказки-идеи этим не пользуются (эталон M5.7).
+    pub fn exact_codes(w: String) -> Self {
+        if w.chars().any(|c| c.is_ascii_digit()) {
+            StemWord {
+                stem: w.clone(),
+                word: w,
+                short: true,
+            }
+        } else {
+            StemWord::new(w)
+        }
+    }
+
     /// Слова совпадают по основе: одно начинается с основы другого; короче [`STEM_MIN_CHARS`] —
     /// только точное совпадение. Ложные совпадения длинных слов с общим началом («план» ~
     /// «планета») допускаются сознательно: это подтверждение к FTS, а не самостоятельный поиск.
@@ -252,7 +267,8 @@ pub enum WordMatch {
     #[default]
     Plain,
     /// Основы: [`norm_word`], без служебных слов (`zam_core::text::is_stop_word`), совпадение
-    /// [`StemWord::matches`] — как у подсказок-идей M5.7.
+    /// [`StemWord::matches`] — как у подсказок-идей M5.7; у `post_tool` слова с цифрой (коды
+    /// ошибок) — только целиком ([`StemWord::exact_codes`]).
     Stems,
 }
 
@@ -343,7 +359,13 @@ impl CoverageQuery {
     pub fn new(query: &[String], rule: &CoverageRule) -> Self {
         let (plain, stems) = match rule.word_match {
             WordMatch::Plain => (query.to_vec(), Vec::new()),
-            WordMatch::Stems => (Vec::new(), stem_words(query)),
+            WordMatch::Stems => (
+                Vec::new(),
+                prepared_terms(query, WordMatch::Stems)
+                    .into_iter()
+                    .map(StemWord::exact_codes)
+                    .collect(),
+            ),
         };
         CoverageQuery {
             rule: *rule,
@@ -375,7 +397,7 @@ impl CoverageQuery {
                     .filter(|w| !w.is_empty())
                     .map(norm_word)
                     .filter(|w| !is_stop_word(w))
-                    .map(StemWord::new)
+                    .map(StemWord::exact_codes)
                     .collect();
                 self.stems
                     .iter()
@@ -778,6 +800,38 @@ mod tests {
         // слово с «ё» в тексте
         let q = error_terms("ещё отчеты выгрузка");
         assert!(coverage_enough(&q, "Выгрузка отчётов", &stems));
+    }
+
+    /// Ревью задачи 9, I-2 (M-5): коды ошибок с цифрами не совпадают по общему началу —
+    /// `lnk1181` ≠ `lnk1104`, `e0382` ≠ `e0384`, `0x80070005` ≠ `0x80070002`; у идей (`new`) —
+    /// прежнее сравнение основ.
+    #[test]
+    fn stems_codes_with_digits_match_whole() {
+        let stems = CoverageRule {
+            word_match: WordMatch::Stems,
+            ..CoverageRule::M4
+        };
+        for (q, t) in [
+            ("lnk1181 onnxruntime", "LNK1104 onnxruntime"),
+            ("e0382 borrow", "E0384 borrow"),
+            ("0x80070005 access", "0x80070002 access"),
+        ] {
+            let q = error_terms(q);
+            assert_eq!(CoverageQuery::new(&q, &stems).covered(t), 1, "{q:?} / {t}");
+            assert!(!coverage_enough(&q, t, &stems), "{q:?} / {t}");
+        }
+        // тот же код целиком совпадает
+        let q = error_terms("lnk1181 onnxruntime");
+        assert!(coverage_enough(&q, "LNK1181: onnxruntime.lib", &stems));
+        // идеи: основы прежние (эталон M5.7)
+        let a = StemWord::new("lnk1181".into());
+        assert!(a.matches(&StemWord::new("lnk1104".into())));
+        let c = StemWord::exact_codes("lnk1181".into());
+        assert!(!c.matches(&StemWord::exact_codes("lnk1104".into())));
+        assert!(
+            StemWord::exact_codes("отчетов".into())
+                .matches(&StemWord::exact_codes("отчеты".into()))
+        );
     }
 
     /// M6 §4.3: `ZeroAIMemory: <заголовок> [<вид>·<cert>] i:<id>`, надёжность сокращена.

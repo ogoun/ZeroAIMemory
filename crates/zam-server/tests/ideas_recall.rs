@@ -1408,9 +1408,9 @@ async fn idea_hints_top5_match_m57() {
         cfg.ideas.prompt_top_k = c["ideas.prompt_top_k"].as_u64().unwrap() as u32;
         cfg.recall.prompt_min_score = c["recall.prompt_min_score"].as_f64().unwrap();
         cfg.recall.timeout_ms = c["recall.timeout_ms"].as_u64().unwrap();
-        // у M5.7 ключа нет (`null`): порог FTS-only там — `prompt_min_score`
+        // у M5.7 ключа нет (`null`): не задан — порог FTS-only равен `prompt_min_score`
         assert!(c["recall.prompt_min_score_fts"].is_null());
-        cfg.recall.prompt_min_score_fts = cfg.recall.prompt_min_score;
+        cfg.recall.prompt_min_score_fts = None;
     })
     .await;
     let ideas: toml::Value = toml::from_str(
