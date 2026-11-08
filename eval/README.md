@@ -26,6 +26,7 @@
 | `hints.toml` | M4: точность подсказок хуков — 72 случая (`prompt` 30, `post_tool` 24, `pre_tool` 18; половина «нерелевантно»), 17 insight с триггерами и без и 3 заметки Rules |
 | `scenarios.toml` | M4: 20 сценариев расхода токенов «вопрос агента → источники» (протокол §9.3, повтор через кэш, наивный `mode=chunks`); M6 — ТС-1 с видами и нагетами (`kind`, `nuggets`, разметка — задача 1b) |
 | `nuggets.lock` | M6: замороженные `nuggets_fingerprint` и `corpus_fingerprint` ТС-1 (создаёт задача 1b) |
+| `kind-queries.toml` | M6, задача 10: 35 запросов буста вида (§10) — 26 к группам `k01`–`k24` (ответ — insight `gotcha`/`failure`, соседи — заметка темы и `k<NN>-n`) и 9 `certainty` к парам «`hypothesis` `gotcha` → `theorem` `gotcha`»; составил независимый агент без доступа к коду поиска и сеткам, разметка перенесена без правок; прогон — `--queries eval/kind-queries.toml` или часть `kind` сеток `grid-m6-kind*.toml` |
 | `glossary.toml` | M4.5: словарь домена — 16 терминов с псевдонимами RU↔EN (сленг, транслитерация, сокращения) и 24 запроса на псевдонимах |
 | `docs/` | M5: набор документов (не в git, `.gitignore`): генерирует `cargo xtask docs-corpus` из сида — DOCX, XLSX, PPTX, PDF (одна и две колонки, кириллица, CJK, 500 страниц, «скан»), враждебные файлы, `manifest.json` (факты, эталон порядка строк PDF) |
 | `docs-queries.toml` | M5: 45 запросов к фактам набора документов (`exact` 23, `paraphrase` 11, `cross-lang` 8, `date` 3) |
