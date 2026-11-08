@@ -4432,3 +4432,113 @@ C1, I1–I6, M1–M12 закрыты; новые замечания исправ
 warnings` — чисто; `zam-server --test backup --features test-hooks` (`ZAM_REQUIRE_ML=1`) — 40
 PASS (первый прогон до `RwLock`: флейк выше и отказ открытия каталога для `set_modified` —
 исправлены).
+
+### Задача 18b1. Экспорт пространства — исполнение (2026-11-08)
+
+Ветка `m6-portability` (worktree `.tmp/m6/wt-b`), сборка — `target/r1-t18b1`, логи —
+`.tmp/m6/task18b1/`.
+
+**Сделано.**
+- `zam-store/src/export.rs` — `export_space(db, ExportSelect)`: снимок пространства **одной
+  транзакцией чтения** (живые папки и заметки с текстом текущей ревизии, вложениями и
+  `file_refs`; живые записи с триггерами, `file_refs` и файлами отчёта; явные живые связи;
+  ревизии). Vault, `code_*`, эмбеддинги, чанки, кэш, сессии, снимки, задания не читаются вовсе.
+  Связь выдаётся, только если источник в снимке, цель жива, в пространстве из `link_spaces`
+  (что принципал читает) и не отчёт при `with_reports = false`. Для этого `EDGE_COLS`/`edge_row`,
+  `ATT_COLS`/`att_row`, `tools_col` стали `pub(crate)`.
+- `zam-server/src/api/transfer/`:
+  - `archive.rs` — `EXPORT_FORMAT`, `ExportFilter`, `ExportManifest`, `file_name_for`,
+    `encode_segment`, `attachment_file`, `front_matter`, `Fingerprint` (общие с 18b2);
+  - `export.rs` — `GET /spaces/{space}/export?paths=&kinds=&history=` (`?user=` администратора,
+    как у вложений): права → снимок → план (тексты в памяти, блобы путями) → аудит → поток zip
+    (`ZipWriter::new_stream`, zip64 для файлов ≥ 4 ГиБ − 64 КиБ, тексты deflate, блобы store) из
+    потока ОС через канал на 8 кусков по 256 КиБ. Соединение с базой — только на снимок.
+- CLI `zam export [--space S] [--path P]… [--kind K]… [--no-history] -o F.zip [--json]`
+  (`cmd/transfer.rs`): поток в новый `F.zip.<pid>.part` (`create_new`), проверка конца каталога
+  zip, `fsync`, `rename_retry`; ошибка — свой `.part` удаляется. Профиль `Timeouts::Download`
+  (заголовки до 10 мин, тело без предела). 404 → проба `GET /spaces/{space}/tree`: есть —
+  «сервер не поддерживает экспорт пространства: нужен zam-server 0.0.11-m6 или новее» (код 1).
+- WebUI: `exportUrl` (`api.ts`), пункт «Экспорт (.zip)» в меню пространства (`Tree.svelte`).
+- `rename_retry` 18a перенесён в `zam_core::fsx::rename_retry` (журнал — колбэком), у сервера —
+  обёртка с WARN, у CLI — тот же цикл; `blobs::admin_user` принимает `Option<&str>`.
+- README: строка `zam export`.
+
+**Решения исполнителя.**
+1. Фильтр: нет `paths` и `kinds` — всё; задан один — только его часть (`paths` — заметки и
+   папки под префиксами по целым сегментам с учётом регистра, без журналов; `kinds` — записи,
+   без заметок); оба — обе части. Неизвестный вид, неверный путь, `history` не bool — 400.
+   Токену `kinds=report` — пусто, без ошибки (отчёта для агента нет).
+2. Запятая — разделитель `paths`: префикс с `,` не выражается (CLI отказывает с пояснением).
+3. Frontmatter — `key: <JSON>` по строке (JSON — подмножество YAML 1.2): без YAML-зависимости,
+   `---` внутри блока невозможна. Тело заметки — байт в байт, **вместе с её собственным
+   frontmatter**: наш блок всегда первый, импорт отрезает ровно его.
+4. Сверх списка спецификации: у заметки — `l0_source` и `attachments [{sha256, name, mime,
+   size, created_at, file}]` (импорту нужен список вложений: ссылки тела перечисляют не все),
+   у записи — `kind`, `supersedes_id`, `superseded_by_id`, `retract_reason`, `rev`, `author`,
+   `files`; файл `_folders.jsonl` (пустые папки и L0 папок); в описи — `space_kind`,
+   `space_name`, `solution_guid`, `missing_blobs`.
+5. `_links.jsonl` — только явные связи (`origin = explicit`): wikilink, frontmatter, связи идей и
+   задач импорт строит заново (§12б.5). Поля `{src, type, dst, dst_space, anchor}`.
+6. Имя вложения в архиве — **без** percent-кодирования ссылки Markdown (`схема 1.png`, в теле
+   `схема%201.png`): распакованный архив открывает ссылку тела. Пара (sha256, имя) — один файл;
+   имена — по сегментам `encode_segment`, совпадение без учёта регистра — `~N` перед
+   расширением. Каталог `_attachments/` — в корне архива, как в спецификации: из вложенной
+   заметки относительная ссылка `_attachments/…` в обычном просмотрщике Markdown не откроется
+   (WebUI и импорт разрешают её от корня).
+7. Имена Windows: кроме `: ? * | < > "` кодируются `%` (однозначность), `\`, `/` внутри
+   сегмента (имена файлов отчёта) и управляющие; зарезервированы также `COM¹–³`, `LPT¹–³`;
+   первый `_` первого сегмента пути заметки — `%5F` (служебные имена архива). `~N` — и при
+   совпадении файла с каталогом; имена раздаются от глубоких путей к мелким. Длина сегмента после
+   кодирования не ограничивается (сегмент 255 байт из `:` станет 765) — предел ФС не проверяется.
+8. Отпечаток — blake3 по (длина имени, имя, длина, содержимое) файлов без описи в порядке
+   записи; опись — последним файлом.
+9. Аудит `space.export {space, user, owner, files, bytes}` пишется **до** отдачи тела (`bytes` —
+   несжатый объём файлов без описи): запись остаётся и при оборванной загрузке.
+10. Нет файла блоба — экспорт не прерывается: пара в `missing_blobs`, WARN, `file: null` во
+    frontmatter. Ошибка чтения посреди потока — тело обрывается, CLI это видит.
+11. Связи на отчёт API не создаёт (422 «отчёт концом связи не бывает»), фильтр отчётов в
+    выборке связей — страховка; тестом не покрыт.
+
+**Тесты.** `zam-server/tests/transfer_export.rs` — 8: `export_layout_and_manifest`,
+`export_windows_names`, `export_excludes_vault_codemap_trash_sessions` (Vault — значение,
+название, описание; карта кода; корзина — заметка и запись; id сессии; другое пространство и
+другой пользователь — токеном и сессией), `token_export_no_human_no_reports`, `member_can_export`
+(`rw` и `ro`; связь на knowledge владельца не выдаётся), `export_audit_written`,
+`export_filter_paths_kinds_history`, `export_missing_blob_listed`; отпечаток пересчитывается в
+тестах. `zam-cli/tests/transfer.rs` — 4: `cli_export_writes_zip`, `cli_export_old_server_404_message`,
+`cli_export_missing_space_not_found`, `cli_export_truncated_stream_keeps_target` (чужой
+`a.zip.part` и прежний `a.zip` целы). Юнит: `archive` 5, `export::tests` 2 (сервер),
+`export::tests::prefix_by_whole_segments` (store), `transfer::tests` 2 (CLI). e2e
+`web/e2e/export.spec.ts`.
+
+**Проверка на откате** (коммит `2e2124c`, правки скриптом `.tmp/m6/task18b1/revert.py`, после —
+`git checkout -- <файлы>`; логи `rev-*.log`):
+- пакет s1 (разные тесты): корзина (`deleted_at` у узлов) → `excludes…` FAIL (TRASHED-TEXT-MARK);
+  отчёты токену (`with_reports: true`) → `token_export…` FAIL; фильтр пространств целей связей →
+  `member_can_export` FAIL; аудит убран → `export_audit_written` FAIL; один файл на пару убран →
+  `export_layout…` FAIL (zip: Duplicate filename); `~N` убран → `export_windows_names` FAIL;
+  фильтр путей → `export_filter…` FAIL; `export_missing_blob_listed` — PASS (откат его не касался);
+- пакет s2: префикс `_` → `export_windows_names` FAIL; фильтр `space_id` узлов → `excludes…`,
+  `token…` (Human), `member…` FAIL;
+- c1: проба старого сервера → `cli_export_old_server_404_message` FAIL (код 5); проверка конца
+  zip → `cli_export_truncated…` FAIL (код 0);
+- c2: `.part` по фиксированному имени с усечением → `cli_export_truncated…` FAIL (чужой
+  `a.zip.part` удалён);
+- после отката всех правок — PASS.
+
+**Проверки** (`target/r1-t18b1`; ML-тестов задача не касается, модели и Qdrant не нужны):
+`cargo fmt --all -- --check` — чисто; `cargo clippy --workspace --all-targets -- -D warnings` —
+чисто; `zam-server --test transfer_export` — 8 PASS; `zam-cli --test transfer` — 4 PASS;
+`zam-server --lib transfer` — 7 PASS; `zam-store --lib export` — 1 PASS; `zam --bin transfer` —
+2 PASS; `zam-server --test backup --features test-hooks` (после переноса `rename_retry`) — 40
+PASS; `zam-core` — 18 PASS; `npm run check` — 0 ошибок; `npm run build`, `npm run size` — в
+пределах; `npm run e2e -- export` на release (`E2E_SERVER`/`E2E_ZAM` из `target/r1-t18b1`) —
+1 PASS. `node_modules` в worktree — `npm ci --prefer-offline` из `.tmp/npm-cache`.
+
+**Найдено вне задачи.**
+- → 18b2: импорт берёт список вложений из `attachments` frontmatter (не из ссылок тела), тело
+  заметки — всё после первого блока `---`; отпечаток — `archive::Fingerprint` по порядку файлов
+  центрального каталога; `_folders.jsonl` — папки и их L0; `missing_blobs` описи — в `warnings`.
+- → 18b2/M7: путь-префикс с `,` в `paths` не выражается; при необходимости — повторяемый
+  параметр.
+- → 13c: README дополнен строкой `zam export`; ТЗ §12/§13 — экспорт в v1.24.
