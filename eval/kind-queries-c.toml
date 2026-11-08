@@ -1,0 +1,252 @@
+# Набор C запросов буста вида (M6, задача 10) — независимый составитель (см. README-set.md).
+# Формат — eval/queries.toml. Ответ групп k — insight gotcha/failure (k<NN>-t); пары certainty —
+# theorem gotcha против hypothesis gotcha со связью contradicts. Вопросы — о симптоме, механизм в ответе.
+
+# ======================= группы k01–k24 (ответ — k<NN>-t) =======================
+
+[[query]]
+id = "kc-01"
+text = "после тайм-аута при оплате у части покупателей деньги списались дважды, хотя платёжный шлюз умеет отдавать первый ответ на повторный POST — как так вышло?"
+lang = "ru"
+expect = ["insight:k01-t"]
+kind = "paraphrase"
+also = ["ru/api/http-client-retries"]
+# k01-t: повтор POST без Idempotency-Key; сосед k01-n (шлюз, повторный POST, первый ответ) описывает работу ключа, но не причину двойного списания; заметка в also — правило «POST без ключа неидемпотентен, ключ во все попытки».
+
+[[query]]
+id = "kc-02"
+text = "after the first attempt times out, every retry of our fetch wrapper rejects instantly instead of waiting for the backoff — what is wrong with the retries?"
+lang = "en"
+expect = ["insight:k02-t"]
+kind = "paraphrase"
+# k02-t: общий уже отменённый AbortController; соседи en/web/fetch-retry-abort (timeouts, retries, backoff) и k02-n (повторы с backoff) — о политике повторов, причину мгновенного отказа не называют.
+
+[[query]]
+id = "kc-03"
+text = "во время распродажи каталог несколько минут отвечал 503, а пул соединений к Postgres забился, хотя кэш карточек товаров был прогрет — в чём причина?"
+lang = "ru"
+expect = ["insight:k03-t"]
+kind = "cross-lang"
+# k03-t (en): карточки записаны одновременно с одинаковым TTL и истекли разом; сосед на языке запроса ru/api/redis-cache-ttl (кэш, сроки, разброс) — правило без связи с перегрузкой базы, k03-n — о доле попаданий.
+
+[[query]]
+id = "kc-04"
+text = "after a storefront release some visitors see a blank white page until they clear site data, although hashed assets are cached forever — what causes it?"
+lang = "en"
+expect = ["insight:k04-t"]
+kind = "cross-lang"
+also = ["ru/web/service-worker-cache"]
+# k04-t (ru): service worker отдаёт старый index.html «сначала кэш»; сосед на языке запроса en/web/browser-http-cache (hashed assets, HTML shell, release) — про HTTP-кэш, о service worker нет; ru-заметка в also объясняет, почему оболочку нельзя брать из кэша.
+
+[[query]]
+id = "kc-05"
+text = "в сборщике журналов нашлись телефоны и адреса почты из обработчика регистрации, хотя request_id и поля span у нас настроены как положено — откуда они там?"
+lang = "ru"
+expect = ["insight:k05-t"]
+kind = "paraphrase"
+also = ["ru/api/structured-logging"]
+# k05-t: #[instrument] без skip пишет аргументы; сосед k05-n (request_id, span, сборщик) — о разборе инцидентов; заметка в also прямо запрещает #[instrument] со всеми аргументами, поэтому релевантна.
+
+[[query]]
+id = "kc-06"
+text = "right after a release our client error collector started rejecting all reports, even from pages that had no errors — what happened?"
+lang = "en"
+expect = ["insight:k06-t"]
+kind = "paraphrase"
+# k06-t: цикл отрисовки бросал на каждом кадре и завалил сборщик; соседи en/web/client-error-reporting (reports, release, collector) и k06-n (группировка ошибок) — не объясняют отказ сборщика.
+
+[[query]]
+id = "kc-07"
+text = "we set statement_timeout to 5s once right after connecting, yet a slow report still held database connections for minutes — why didn't the limit apply?"
+lang = "en"
+expect = ["insight:k07-t"]
+kind = "paraphrase"
+# k07-t: SET на сессию теряется за pgbouncer в transaction pooling; соседи en/api/database-statement-timeout (per role) и k07-n (5 s, pool connections) — о пользе лимита, не о его потере.
+
+[[query]]
+id = "kc-08"
+text = "новая корзина за флагом на медленном интернете сначала показывается в старом виде, а нажатия на кнопку оформления иногда пропадают — в чём дело?"
+lang = "ru"
+expect = ["insight:k09-t"]
+kind = "paraphrase"
+also = ["ru/web/feature-flags-first-paint"]
+# k09-t: флаг приходит после первой отрисовки; сосед k09-n (встраивание флагов) — о решении, а не о симптоме; заметка в also: useFlag возвращает значение по умолчанию (старое поведение), пока нет ответа /api/flags.
+
+[[query]]
+id = "kc-09"
+text = "after the orders service was restarted during a flag service outage, checkout started returning 404 — how did the flags break it?"
+lang = "en"
+expect = ["insight:k10-t"]
+kind = "paraphrase"
+# k10-t: SDK вернул значения по умолчанию, new_checkout=false, старой оплаты уже нет; сосед k10-n (flag service down, restart, snapshot) — способ избежать, не причина 404; en/api/feature-flag-evaluation — когда возвращается default, без вывода о 404.
+
+[[query]]
+id = "kc-10"
+text = "пользователей с несколькими открытыми вкладками витрины по нескольку раз в день выкидывает из аккаунта сразу на всех устройствах — почему?"
+lang = "ru"
+expect = ["insight:k11-t"]
+kind = "cross-lang"
+also = ["en/web/token-refresh-tabs"]
+# k11-t (en): две вкладки обновляют токен одновременно, повтор ротированного refresh-токена отзывает семейство; сосед на языке запроса k12-t и ru/api/jwt-validation (401, токены) — другая причина; en-заметка в also описывает отзыв семейства при повторе.
+
+[[query]]
+id = "kc-11"
+text = "users get 401 immediately after logging in, but only when their requests land on one particular orders-service instance — what is going on?"
+lang = "en"
+expect = ["insight:k12-t"]
+kind = "cross-lang"
+# k12-t (ru): часы узла отстали, nbf «в будущем»; сосед на языке запроса en/web/token-refresh-tabs и k11-t (401, logout) — про обновление токена; k12-n (leeway) — эксперимент с допуском, о сбое узла не говорит.
+
+[[query]]
+id = "kc-12"
+text = "the partner export of orders, fetched page by page, ended up with some orders twice and some missing entirely — why?"
+lang = "en"
+expect = ["insight:k13-t"]
+kind = "cross-lang"
+# k13-t (ru): OFFSET сдвигается новыми вставками; сосед на языке запроса k14-t и en/web/infinite-scroll (duplicate cards, page, cursor) — дубли из-за наблюдателя, не пропуски из-за вставок; k13-n — о скорости keyset.
+
+[[query]]
+id = "kc-13"
+text = "на высоких мониторах в бесконечной ленте товаров карточки повторяются — почему одна и та же страница приходит дважды?"
+lang = "ru"
+expect = ["insight:k14-t"]
+kind = "cross-lang"
+# k14-t (en): sentinel остаётся видимым, повторный запрос того же курсора; сосед на языке запроса k13-t (дубли заказов при постраничной выгрузке) и ru/api/keyset-pagination — другая причина дублей; k14-n — о памяти.
+
+[[query]]
+id = "kc-14"
+text = "после перевода часов на летнее время часть заказов попала не в тот день по правилу отгрузки день-в-день — в чём причина?"
+lang = "ru"
+expect = ["insight:k15-t"]
+kind = "cross-lang"
+# k15-t (en): локальное время без смещения в timestamp, неоднозначный час; сосед на языке запроса k16-t (дата на день раньше) и ru/web/date-formatting-intl (пояс склада) — фронтенд и другой механизм; k15-n — о timestamptz без сбоя.
+
+[[query]]
+id = "kc-15"
+text = "delivery dates in the storefront show up one day earlier for customers in the Americas — what's wrong with how we display them?"
+lang = "en"
+expect = ["insight:k16-t"]
+kind = "cross-lang"
+# k16-t (ru): new Date('ГГГГ-ММ-ДД') — полночь UTC; сосед на языке запроса k15-t (orders shifted, wrong day) и en/api/timestamps-utc (delivery day, zone) — бэкенд и переход на летнее время, не разбор даты в браузере.
+
+[[query]]
+id = "kc-16"
+text = "when sellers upload a price list the progress bar sits at 100 % for a long time, and afterwards we find duplicate imports — why?"
+lang = "en"
+expect = ["insight:k17-t"]
+kind = "paraphrase"
+# k17-t: прогресс только по отправке, обработка на сервере без индикации, повторные загрузки; соседи en/web/large-file-upload (progress events, parts) и k17-n (upload parts) — о передаче частей, дубли не объясняют.
+
+[[query]]
+id = "kc-17"
+text = "ключ внешней службы, который мы передали в сборку витрины через переменную окружения, обнаружился в открытом доступе — как он утёк?"
+lang = "ru"
+expect = ["insight:k21-t"]
+kind = "paraphrase"
+# k21-t: VITE_-переменная подставлена в бандл, секреты в сборку нельзя; соседи ru/web/vite-env-variables и k21-n (подстановка при сборке) — о стендах и адресе API, про утечку секрета не говорят.
+
+[[query]]
+id = "kc-18"
+text = "during a short Postgres failover Kubernetes restarted every pod of the service at the same time, and caches took minutes to warm up again — why?"
+lang = "en"
+expect = ["insight:k23-t"]
+kind = "cross-lang"
+also = ["ru/infra/readiness-liveness-probes"]
+# k23-t (ru): проверка базы в пробе живости; сосед на языке запроса en/infra/load-balancer-health-checks и k24-t (health checks, database) — балансировщик и стоимость запроса; ru-заметка в also: зависимости не проверяет проба живости.
+
+[[query]]
+id = "kc-19"
+text = "в пик трафика треть процессора базы заказов уходила на проверки здоровья сервиса — почему эндпоинт здоровья оказался таким тяжёлым?"
+lang = "ru"
+expect = ["insight:k24-t"]
+kind = "cross-lang"
+# k24-t (en): SELECT count(*) в /health; сосед на языке запроса k23-t и ru/infra/readiness-liveness-probes (пробы, база) — о перезапусках; k24-n (кэш проверок) — решение, а не причина.
+
+# ======================= пары противоречий (certainty) =======================
+
+[[query]]
+id = "kc-20"
+text = "Out-File and Set-Content with utf8 in Windows PowerShell 5.1 always add a BOM — is writing UTF-8 without BOM from 5.1 possible at all, or do I need PowerShell 7?"
+lang = "en"
+expect = ["insight:p01-t"]
+kind = "certainty"
+weaker = ["insight:p01-h"]
+also = ["ru/windows/powershell-encoding"]
+# p01-t: WriteAllText с UTF8Encoding($false); формулировка повторяет гипотезу p01-h; заметка в also приводит тот же приём.
+
+[[query]]
+id = "kc-21"
+text = "git на Windows всегда выписывает символические ссылки как маленькие текстовые файлы с путём цели — можно ли вообще получить настоящие симлинки при клонировании?"
+lang = "ru"
+expect = ["insight:p04-t"]
+kind = "certainty"
+weaker = ["insight:p04-h"]
+also = ["ru/windows/symlinks-developer-mode"]
+# p04-t: core.symlinks и режим разработчика; текст повторяет объяснение p04-h; заметка в also (index: false) называет те же условия.
+
+[[query]]
+id = "kc-22"
+text = "robocopy in a scheduled task returned a non-zero exit code — does that mean the copy failed and the task should be treated as failed?"
+lang = "en"
+expect = ["insight:p09-t"]
+kind = "certainty"
+weaker = ["insight:p09-h"]
+also = ["ru/windows/services-schtasks-robocopy"]
+# p09-t: коды меньше 8 — успех; вопрос повторяет p09-h; заметка в also содержит таблицу кодов и обёртку.
+
+[[query]]
+id = "kc-23"
+text = "SQLite ведь однопоточная: если воркер выгрузки откроет базу из нескольких потоков, она испортится, и все запросы надо гнать через один поток?"
+lang = "ru"
+expect = ["insight:p16-t"]
+kind = "certainty"
+weaker = ["insight:p16-h"]
+# p16-t: режим serialized, соединение на поток; вопрос пересказывает p16-h; заметки ru/db/sqlite-* о потоках прямо не отвечают.
+
+[[query]]
+id = "kc-24"
+text = "if the OOM killer kills our service, will systemd treat it as a normal stop and skip the restart even with Restart=on-failure, so we need an external watchdog?"
+lang = "en"
+expect = ["insight:p17-t"]
+kind = "certainty"
+weaker = ["insight:p17-h"]
+also = ["en/linux/systemd-unit-restart"]
+# p17-t: SIGKILL — неуспех, перезапуск есть; вопрос повторяет p17-h; заметка в also: on-failure перезапускает при сигнале, кроме штатных.
+
+[[query]]
+id = "kc-25"
+text = "position: sticky не работает внутри flex-контейнера — сводку заказа в боковой панели оформления придётся делать через position: fixed и обработчики прокрутки?"
+lang = "ru"
+expect = ["insight:p18-t"]
+kind = "certainty"
+weaker = ["insight:p18-h"]
+# p18-t: sticky во flex работает, мешают overflow предка и растянутый элемент; вопрос пересказывает p18-h; заметок по теме в корпусе нет.
+
+[[query]]
+id = "kc-26"
+text = "integration tests in a single tests/*.rs file run one after another, so can they all start the test server on the fixed port 8080?"
+lang = "en"
+expect = ["insight:p21-t"]
+kind = "certainty"
+weaker = ["insight:p21-h"]
+also = ["ru/rust/cargo-test-parallel-flaky-proptest"]
+# p21-t: тесты бинарника идут параллельно, нужен порт 0; вопрос повторяет p21-h; заметка в also прямо называет общий порт 8080 источником гонок.
+
+[[query]]
+id = "kc-27"
+text = "функция очистки из useEffect вызывается только при размонтировании компонента — значит, подписка из эффекта не может утечь, пока компонент на экране?"
+lang = "ru"
+expect = ["insight:p22-t"]
+kind = "certainty"
+weaker = ["insight:p22-h"]
+# p22-t: очистка перед каждым повторным запуском эффекта; вопрос пересказывает p22-h; заметок о React в корпусе нет.
+
+[[query]]
+id = "kc-28"
+text = "certbot renew заменил файлы сертификата, а nginx читает их при каждом TLS-рукопожатии — нужно ли что-то делать после продления?"
+lang = "ru"
+expect = ["insight:p23-t"]
+kind = "certainty"
+weaker = ["insight:p23-h"]
+also = ["ru/ops/tls-expired-certificate"]
+# p23-t: nginx держит сертификат в памяти, нужен reload; вопрос повторяет p23-h; заметка в also — инцидент с той же причиной и deploy-hook.

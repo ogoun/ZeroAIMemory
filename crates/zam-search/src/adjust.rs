@@ -10,12 +10,28 @@
 //!
 //! `superseded`/`retracted` исключает фильтр статусов поиска (сервер), а не поправка.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::hybrid::{ChunkMeta, Level, Ranked};
+
+/// Когда действует буст вида insight (`search.kind_boost_mode`, M6 §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KindBoostMode {
+    /// Всегда (v0.0.9).
+    #[default]
+    Always,
+    /// Кроме записей, которым противоречит связью `contradicts` действующая более надёжная
+    /// запись среди кандидатов поиска после слияния (до отсечения `top_k`): их цели —
+    /// [`Boosts::kind_exempt`] (отбирает вызывающий).
+    UnlessContradicted,
+    /// Только у `theorem`/`axiom`.
+    ReliableOnly,
+}
 
 /// Множители балла (§9.2 п. 4). Пустые таблицы и `area: None` — без бустов.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -27,18 +43,25 @@ pub struct Boosts {
     pub certainty: HashMap<String, f64>,
     /// Текущая область и её множитель (`search.boost_area`).
     pub area: Option<(String, f64)>,
+    /// Режим буста вида ([`KindBoostMode`]).
+    pub kind_mode: KindBoostMode,
+    /// Цели без буста вида при [`KindBoostMode::UnlessContradicted`].
+    pub kind_exempt: HashSet<TargetRef>,
 }
 
 impl Boosts {
     /// Итоговый множитель чанка: произведение подходящих бустов (нет подходящих — 1).
     /// `area` — область кандидата (`None` — из `m.area`).
     fn factor(&self, m: &ChunkMeta, area: Option<&str>) -> f64 {
-        let kind = m
-            .insight_kind
-            .as_ref()
-            .and_then(|k| self.insight_kinds.get(k))
-            .copied()
-            .unwrap_or(1.0);
+        let kind = if self.kind_applies(m) {
+            m.insight_kind
+                .as_ref()
+                .and_then(|k| self.insight_kinds.get(k))
+                .copied()
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
         let certainty = m
             .certainty
             .as_ref()
@@ -50,6 +73,25 @@ impl Boosts {
             _ => 1.0,
         };
         kind * certainty * area
+    }
+
+    /// Буст вида применим к кандидату по режиму [`KindBoostMode`].
+    fn kind_applies(&self, m: &ChunkMeta) -> bool {
+        match self.kind_mode {
+            KindBoostMode::Always => true,
+            KindBoostMode::ReliableOnly => {
+                matches!(m.certainty.as_deref(), Some("theorem" | "axiom"))
+            }
+            KindBoostMode::UnlessContradicted => !self.kind_exempt.contains(&m.target),
+        }
+    }
+
+    /// Кандидат получил бы буст вида (вид с множителем ≠ 1): только такие проверяет
+    /// [`KindBoostMode::UnlessContradicted`].
+    pub fn kind_boosted(&self, insight_kind: Option<&str>) -> bool {
+        insight_kind
+            .and_then(|k| self.insight_kinds.get(k))
+            .is_some_and(|f| *f != 1.0)
     }
 }
 
@@ -334,7 +376,48 @@ mod tests {
                 .collect(),
             certainty: HashMap::new(),
             area: None,
+            ..Boosts::default()
         }
+    }
+
+    /// M6 §10: `reliable_only` — буст вида только у `theorem`/`axiom`; `unless_contradicted`
+    /// — без буста у целей `kind_exempt`; `always` — как прежде.
+    #[test]
+    fn kind_boost_modes() {
+        let with = |c: Option<&str>| ChunkMeta {
+            certainty: c.map(String::from),
+            ..meta(Some("gotcha"), None)
+        };
+        let (hyp, thm, ax) = (
+            with(Some("hypothesis")),
+            with(Some("theorem")),
+            with(Some("axiom")),
+        );
+        let f = |b: &Boosts, m: &ChunkMeta| apply_boosts_to(1.0, m, b, None);
+        let always = boosts();
+        for m in [&hyp, &thm, &ax] {
+            assert!((f(&always, m) - 1.15).abs() < 1e-12);
+        }
+        let ro = Boosts {
+            kind_mode: KindBoostMode::ReliableOnly,
+            ..boosts()
+        };
+        assert_eq!(f(&ro, &hyp), 1.0);
+        assert!((f(&ro, &thm) - 1.15).abs() < 1e-12 && (f(&ro, &ax) - 1.15).abs() < 1e-12);
+        let uc = Boosts {
+            kind_mode: KindBoostMode::UnlessContradicted,
+            kind_exempt: [hyp.target].into_iter().collect(),
+            ..boosts()
+        };
+        assert_eq!(f(&uc, &hyp), 1.0);
+        assert!((f(&uc, &thm) - 1.15).abs() < 1e-12);
+        assert!(always.kind_boosted(Some("gotcha")) && !always.kind_boosted(Some("discovery")));
+        assert!(!always.kind_boosted(None));
+        let one = Boosts {
+            insight_kinds: [("gotcha".to_string(), 1.0)].into_iter().collect(),
+            ..Boosts::default()
+        };
+        assert!(!one.kind_boosted(Some("gotcha")));
     }
 
     fn metas(v: Vec<(&str, ChunkMeta)>) -> HashMap<String, ChunkMeta> {

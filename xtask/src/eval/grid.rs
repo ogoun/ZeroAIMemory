@@ -10,6 +10,13 @@
 //!
 //! Сравнение с базовой — парный бутстреп разности по запросам ([`paired_diff`]): выигрыш
 //! считается устойчивым, если нижняя граница 95 % интервала разности nDCG@10 больше нуля.
+//!
+//! M6 (задача 10, методика замера при недетерминизме): `mode = "hybrid+rerank"` — сетка с
+//! серверным реранком; `aa = true` — A/A-гейт: базовая конфигурация снимается дважды на том же
+//! индексе, расхождение выдачи (путь и балл каждого попадания) и порог шума — в отчёте;
+//! `[[part]] name, queries` — дополнительные наборы запросов на том же индексе: отчёт по частям
+//! (основной набор — часть `main`) с односторонними границами Δ nDCG@10 (без поправки и с
+//! поправкой Бонферрони на число сравнений с базой) и долей запросов с nDCG@10 < 1.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -35,8 +42,59 @@ struct GridFile {
     /// Вторая база: имя конфигурации, с которой считаются дополнительные разности (вклад
     /// изменения поверх промежуточной конфигурации, ruling R11 задачи 17 M3).
     second_base: Option<String>,
+    /// Режим поиска: `hybrid` (по умолчанию) | `hybrid+rerank`.
+    mode: Option<String>,
+    /// A/A-гейт: базовая конфигурация снимается дважды на том же индексе.
+    #[serde(default)]
+    aa: bool,
+    /// Дополнительные наборы запросов (части отчёта) поверх основного (`main`).
+    #[serde(default)]
+    part: Vec<PartFile>,
     #[serde(default)]
     config: Vec<GridConfig>,
+}
+
+/// Часть сетки: имя и файл запросов (от корня репозитория).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartFile {
+    name: String,
+    queries: String,
+}
+
+/// Имя основного набора в отчёте по частям.
+pub const MAIN_PART: &str = "main";
+/// Объединение дополнительных частей (если их больше одной).
+pub const EXTRA_ALL: &str = "extra_all";
+
+/// Итог части набора у конфигурации (M6, задача 10).
+#[derive(Debug, Clone, Serialize)]
+pub struct PartResult {
+    pub n: usize,
+    pub ndcg10: f64,
+    /// Доля запросов с nDCG@10 < 1 (условие «не на потолке», §10).
+    pub below1: f64,
+    pub reliable_first: Option<f64>,
+    pub n_reliable: usize,
+    /// Δ nDCG@10 к базе: среднее и односторонние 95 % границы (`lo` — 5-й перцентиль).
+    pub d_ndcg10: Estimate,
+    /// Нижняя граница Δ nDCG@10 с поправкой Бонферрони (`0,05 / сравнений`).
+    pub d_ndcg10_lo_bonf: f64,
+    /// Запросов лучше / хуже / равно базе по nDCG@10.
+    pub wins: usize,
+    pub losses: usize,
+    pub ties: usize,
+}
+
+/// A/A-гейт: два снятия базовой конфигурации на одном индексе.
+#[derive(Debug, Clone, Serialize)]
+pub struct AaGate {
+    /// Выдача совпала побайтово (путь и балл каждого попадания каждого запроса).
+    pub equal: bool,
+    /// Запросы с расхождением выдачи.
+    pub differ: Vec<String>,
+    /// 95-й перцентиль |Δ nDCG@10| запроса между снятиями — по частям.
+    pub noise_p95: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -113,6 +171,9 @@ pub struct ConfigResult {
     pub worse: bool,
     /// `(id, recall@5, nDCG@10, chunk-recall@5)` по запросам.
     pub per_query: Vec<(String, f64, f64, Option<f64>)>,
+    /// Итоги по частям набора (`main` и `[[part]]`).
+    #[serde(default)]
+    pub parts: BTreeMap<String, PartResult>,
 }
 
 /// Разности конфигурации со второй базой сетки.
@@ -134,7 +195,158 @@ pub struct GridResult {
     pub device: String,
     pub notes: usize,
     pub queries: usize,
+    pub mode: String,
+    /// A/A-гейт базовой конфигурации (`aa = true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa: Option<AaGate>,
     pub configs: Vec<ConfigResult>,
+}
+
+fn parse_mode(s: Option<&str>) -> Result<Mode> {
+    Ok(match s {
+        None | Some("hybrid") => Mode::Hybrid,
+        Some("hybrid+rerank") => Mode::HybridRerank,
+        Some(x) => bail!("mode = \"{x}\": hybrid | hybrid+rerank"),
+    })
+}
+
+/// Части набора: основной (`main`) и `[[part]]` сетки; id запросов уникальны во всех частях.
+fn load_parts(
+    p: &Paths,
+    corpus: &Corpus,
+    main: &[Query],
+    extra: &[PartFile],
+) -> Result<(Vec<Query>, BTreeMap<String, String>)> {
+    let mut all: Vec<Query> = main.to_vec();
+    let mut part_of: BTreeMap<String, String> = main
+        .iter()
+        .map(|q| (q.id.clone(), MAIN_PART.to_string()))
+        .collect();
+    for pf in extra {
+        if pf.name == MAIN_PART
+            || pf.name == EXTRA_ALL
+            || extra.iter().filter(|x| x.name == pf.name).count() > 1
+        {
+            bail!("часть «{}»: имя занято", pf.name);
+        }
+        let qs = super::corpus::load_queries(&p.repo.join(&pf.queries))?;
+        super::corpus::validate(corpus, &qs, false)
+            .with_context(|| format!("часть «{}» ({})", pf.name, pf.queries))?;
+        for q in qs {
+            if part_of.insert(q.id.clone(), pf.name.clone()).is_some() {
+                bail!("запрос {} повторяется в частях сетки", q.id);
+            }
+            all.push(q);
+        }
+    }
+    Ok((all, part_of))
+}
+
+/// Выдача запроса в сравнимом виде (путь и балл попаданий) — A/A-гейт.
+fn hits_key(q: &QueryRun) -> Vec<(String, u64)> {
+    q.hits
+        .iter()
+        .map(|h| (h.path.clone(), h.score.to_bits()))
+        .collect()
+}
+
+/// 95-й перцентиль (ближайший ранг сверху).
+fn p95(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    let i = ((v.len() as f64) * 0.95).ceil() as usize;
+    v[i.clamp(1, v.len()) - 1]
+}
+
+fn part_name(part_of: &BTreeMap<String, String>, id: &str) -> String {
+    part_of.get(id).cloned().unwrap_or_else(|| MAIN_PART.into())
+}
+
+/// A/A-гейт по двум снятиям базы.
+fn aa_gate(a: &[QueryRun], b: &[QueryRun], part_of: &BTreeMap<String, String>) -> AaGate {
+    let differ: Vec<String> = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| hits_key(x) != hits_key(y))
+        .map(|(x, _)| x.id.clone())
+        .collect();
+    let mut by_part: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for (x, y) in a.iter().zip(b) {
+        by_part
+            .entry(part_name(part_of, &x.id))
+            .or_default()
+            .push((x.metrics.ndcg10 - y.metrics.ndcg10).abs());
+    }
+    AaGate {
+        equal: differ.is_empty(),
+        differ,
+        noise_p95: by_part.into_iter().map(|(k, v)| (k, p95(v))).collect(),
+    }
+}
+
+/// Итоги частей конфигурации `q` против базы `base`; `comparisons` — сравнений с базой
+/// (поправка Бонферрони).
+pub fn part_results(
+    base: &[QueryRun],
+    q: &[QueryRun],
+    part_of: &BTreeMap<String, String>,
+    comparisons: usize,
+) -> BTreeMap<String, PartResult> {
+    let mut groups: BTreeMap<String, Vec<(&QueryRun, &QueryRun)>> = BTreeMap::new();
+    for (x, y) in base.iter().zip(q) {
+        groups
+            .entry(part_name(part_of, &x.id))
+            .or_default()
+            .push((x, y));
+    }
+    // несколько дополнительных частей — ещё и их объединение
+    let extra: Vec<(&QueryRun, &QueryRun)> = groups
+        .iter()
+        .filter(|(k, _)| k.as_str() != MAIN_PART)
+        .flat_map(|(_, v)| v.iter().copied())
+        .collect();
+    if groups.keys().filter(|k| k.as_str() != MAIN_PART).count() > 1 {
+        groups.insert(EXTRA_ALL.to_string(), extra);
+    }
+    groups
+        .into_iter()
+        .map(|(name, pairs)| {
+            let a: Vec<f64> = pairs.iter().map(|(x, _)| x.metrics.ndcg10).collect();
+            let b: Vec<f64> = pairs.iter().map(|(_, y)| y.metrics.ndcg10).collect();
+            let rel: Vec<f64> = pairs
+                .iter()
+                .filter_map(|(_, y)| flag(y.metrics.reliable_first))
+                .collect();
+            (name, part_result(&a, &b, &rel, comparisons))
+        })
+        .collect()
+}
+
+/// [`PartResult`] по nDCG@10 базы `a` и точки `b` (одни запросы) и флагам `reliable_first`
+/// точки `rel`.
+fn part_result(a: &[f64], b: &[f64], rel: &[f64], comparisons: usize) -> PartResult {
+    use super::metrics::{BOOTSTRAP_M6, paired_ratio_q};
+    const EPS: f64 = 1e-12;
+    let ones = vec![1.0; a.len()];
+    let d = |lo: f64| {
+        paired_ratio_q(a, &ones, b, &ones, BOOTSTRAP_M6, (lo, 1.0 - lo)).unwrap_or_default()
+    };
+    let n = a.len().max(1) as f64;
+    let count = |f: &dyn Fn(f64, f64) -> bool| a.iter().zip(b).filter(|(x, y)| f(**x, **y)).count();
+    PartResult {
+        n: a.len(),
+        ndcg10: b.iter().sum::<f64>() / n,
+        below1: b.iter().filter(|v| **v < 1.0 - EPS).count() as f64 / n,
+        reliable_first: (!rel.is_empty()).then(|| rel.iter().sum::<f64>() / rel.len() as f64),
+        n_reliable: rel.len(),
+        d_ndcg10: d(0.05),
+        d_ndcg10_lo_bonf: d(0.05 / comparisons.max(1) as f64).lo,
+        wins: count(&|x, y| y > x + EPS),
+        losses: count(&|x, y| y < x - EPS),
+        ties: count(&|x, y| (y - x).abs() <= EPS),
+    }
 }
 
 fn parse_device(s: Option<&str>, fallback: Device) -> Result<Device> {
@@ -159,6 +371,10 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
         );
     }
     let device = parse_device(g.device.as_deref(), a.device)?;
+    let mode = parse_mode(g.mode.as_deref())?;
+    let (all_queries, part_of) = load_parts(p, corpus, queries, &g.part)?;
+    let queries = &all_queries[..];
+    let mut aa: Option<AaGate> = None;
     let model = a
         .model
         .clone()
@@ -215,8 +431,24 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
             if fresh {
                 index_secs = s.index_secs;
             }
-            let runs = s.run_queries(queries, Mode::Hybrid)?;
-            let r = run::result(&s, p, corpus, queries, Mode::Hybrid, Some(&c.name), runs);
+            let runs = s.run_queries(queries, mode)?;
+            if g.aa && ci == 0 {
+                // A/A-гейт: второе снятие базы на том же индексе и том же сервере
+                let again = s.run_queries(queries, mode)?;
+                let gate = aa_gate(&runs, &again, &part_of);
+                if gate.equal {
+                    println!("A/A {}: побайтово", c.name);
+                } else {
+                    println!(
+                        "A/A {}: расходятся {} запросов: {:?}",
+                        c.name,
+                        gate.differ.len(),
+                        gate.differ
+                    );
+                }
+                aa = Some(gate);
+            }
+            let r = run::result(&s, p, corpus, queries, mode, Some(&c.name), runs);
             println!(
                 "[{}/{}] {}: nDCG@10 {}, recall@5 {}",
                 ci + 1,
@@ -341,6 +573,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
                         )
                     })
                     .collect(),
+                parts: part_results(base, q, &part_of, g.config.len().saturating_sub(1)),
             }
         })
         .collect();
@@ -351,6 +584,8 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
         device: device.as_str().into(),
         notes: corpus.notes.len(),
         queries: queries.len(),
+        mode: mode.as_str().into(),
+        aa,
         configs,
     };
     // eval/grid.toml → `<дата>-grid-<модель>`, eval/grid-confirm.toml → `<дата>-grid-confirm-<модель>`
@@ -359,7 +594,11 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
         .and_then(|s| s.to_str())
         .filter(|s| s.starts_with("grid"))
         .unwrap_or("grid");
-    let stem = format!("{}-{name}-{}", gr.date, gr.model);
+    // режим — в имени, кроме гибрида (имена прежних сеток не меняются)
+    let stem = match mode {
+        Mode::Hybrid => format!("{}-{name}-{}", gr.date, gr.model),
+        m => format!("{}-{name}-{}-{}", gr.date, gr.model, m.file_tag()),
+    };
     let md = grid_md(&gr);
     let (json, mdp) = report::write_pair(&p.results, &stem, &gr, &md)?;
     println!("{md}\n{}\n{}", json.display(), mdp.display());
@@ -422,10 +661,10 @@ fn opt_diff(e: &Option<Estimate>) -> String {
 /// Markdown сетки.
 pub fn grid_md(g: &GridResult) -> String {
     let mut s = format!(
-        "# Сетка весов и чанкинга: {} ({})\n\n- дата {}, коммит `{}`, {} заметок, {} запросов\n\
+        "# Сетка весов и чанкинга: {} ({}, {})\n\n- дата {}, коммит `{}`, {} заметок, {} запросов\n\
          - разности — с первой (базовой) конфигурацией, парный бутстреп по запросам, 95 %\n\
          - «лучше»/«хуже» — интервал разности nDCG@10 целиком выше/ниже нуля\n\n",
-        g.model, g.device, g.date, g.git, g.notes, g.queries
+        g.model, g.device, g.mode, g.date, g.git, g.notes, g.queries
     );
     s.push_str(
         "| Конфигурация | переопределения | индексация, с | листов | чанков / токенов индексации | recall@5 | nDCG@10 | chunk-recall@5 | Δ recall@5 | Δ MRR@10 | Δ nDCG@10 | Δ nDCG@10 без общих слов | Δ chunk-recall@5 | Δ chunk-recall@5 с перекрытием | Δ chunk-recall@5 сторожей «:» | разрезано evidence | Δ chunk-nDCG@10 | Δ nDCG@10 длинных | итог |\n\
@@ -526,6 +765,62 @@ pub fn grid_md(g: &GridResult) -> String {
                     opt_diff(&v.d_chunk_recall5),
                     opt_diff(&v.d_chunk_recall5_intro),
                     opt_diff(&v.d_ndcg10_long)
+                );
+            }
+        }
+    }
+    if let Some(gate) = &g.aa {
+        let _ = writeln!(
+            s,
+            "\n## A/A-гейт базы\n\n- выдача {}; порог шума (p95 |Δ nDCG@10| запроса): {}",
+            if gate.equal {
+                "побайтово равна".to_string()
+            } else {
+                format!(
+                    "расходится у {} запросов: {}",
+                    gate.differ.len(),
+                    gate.differ.join(", ")
+                )
+            },
+            gate.noise_p95
+                .iter()
+                .map(|(k, v)| format!("{k} {v:.3}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let part_names: Vec<&String> = g
+        .configs
+        .first()
+        .map(|c| c.parts.keys().collect())
+        .unwrap_or_default();
+    for pn in part_names {
+        let _ = write!(
+            s,
+            "\n## Часть «{pn}»\n\nΔ — к первой конфигурации, парный бутстреп запросов 10 000, \
+             односторонние 95 % (`lo`); «lo Бонф.» — с поправкой Бонферрони на {} сравнений.\n\n\
+             | Конфигурация | n | nDCG@10 | доля nDCG@10 < 1 | reliable_first (n) | Δ nDCG@10 [lo…hi] | lo Бонф. | лучше / хуже / равно |\n\
+             |---|---:|---:|---:|---|---|---:|---|\n",
+            g.configs.len().saturating_sub(1)
+        );
+        for c in &g.configs {
+            if let Some(r) = c.parts.get(pn) {
+                let _ = writeln!(
+                    s,
+                    "| {} | {} | {:.3} | {:.3} | {} | {:+.4} [{:+.4}…{:+.4}] | {:+.4} | {} / {} / {} |",
+                    c.config.name,
+                    r.n,
+                    r.ndcg10,
+                    r.below1,
+                    r.reliable_first
+                        .map_or("—".into(), |v| format!("{v:.3} ({})", r.n_reliable)),
+                    r.d_ndcg10.mean,
+                    r.d_ndcg10.lo,
+                    r.d_ndcg10.hi,
+                    r.d_ndcg10_lo_bonf,
+                    r.wins,
+                    r.losses,
+                    r.ties
                 );
             }
         }
@@ -674,6 +969,26 @@ mod tests {
         assert!(!is_intro_evidence(
             "##### Заголовок\n\nТекст после заголовка."
         ));
+    }
+
+    #[test]
+    fn part_result_one_sided_and_counts() {
+        // 10 запросов: 4 лучше на 0,5, 1 хуже на 0,5, 5 равно
+        let a = vec![0.5; 10];
+        let mut b = vec![0.5; 10];
+        for v in b.iter_mut().take(4) {
+            *v = 1.0;
+        }
+        b[9] = 0.0;
+        let r = part_result(&a, &b, &[1.0, 0.0], 8);
+        assert_eq!((r.wins, r.losses, r.ties), (4, 1, 5));
+        assert!((r.d_ndcg10.mean - 0.15).abs() < 1e-12);
+        assert!(r.d_ndcg10_lo_bonf <= r.d_ndcg10.lo, "{r:?}");
+        assert!((r.below1 - 0.6).abs() < 1e-12);
+        assert_eq!((r.reliable_first, r.n_reliable), (Some(0.5), 2));
+        assert_eq!(p95(vec![0.0; 19].into_iter().chain([1.0]).collect()), 0.0);
+        assert_eq!(p95(vec![0.0, 1.0]), 1.0);
+        assert!(parse_mode(Some("hybrid+rerank")).is_ok() && parse_mode(Some("fts")).is_err());
     }
 
     #[test]

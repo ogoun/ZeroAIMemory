@@ -21,12 +21,14 @@
 | `grid-chunking.toml`, `grid-chunking-cpu.toml` | нарезка с учётом силы границ: λ, связность, L0 в префиксе, размер листа (задача 17 M3) |
 | `grid-m3.toml` | веса поиска M3: канал папок `w_folder`, бусты вида insight и `certainty` (задача 18 M3, ≤ 10 конфигураций) |
 | `grid-m3-kind.toml` | буст вида insight ниже буста `theorem`: 1,0 / 1,05 / 1,10 (задача 18 M3, fix round 1) |
+| `grid-m6-kind.toml`, `grid-m6-kind-rerank.toml`, `grid-m6-kind-cpu.toml` | M6 §10 (задача 10): `search.kind_boost_mode` {`always`, `unless_contradicted`} × {1,0; 1,05; 1,10; 1,15} и `reliable_only` × 1,10 — гибрид CUDA (решающий), `rerank=on` CUDA и гибрид CPU int8 (контроль); части `main` и `kind` (`[[part]]`), база `always × 1,05` дважды (`aa = true`) |
 | `grid-m6-recall.toml` | M6 §3.5 п. 3–5 (задача 8c): `recall.digest_tokens` × `digest_entries`, `recovery_tokens`, `brief_tokens` × `code.brief_tokens` на dev ТС-2 (`eval --sessions --grid`), первая точка — умолчания |
 | `grid-m6-search.toml` | M6 §3.5 п. 1 (задача 5): `search.budget_tokens` {400, 600, 800} × `search.brief_min_rel` {0; 0,4; 0,5} на dev ТС-1, первая точка дважды — A/A-гейт |
 | `hints.toml` | M4: точность подсказок хуков — 72 случая (`prompt` 30, `post_tool` 24, `pre_tool` 18; половина «нерелевантно»), 17 insight с триггерами и без и 3 заметки Rules |
 | `scenarios.toml` | M4: 20 сценариев расхода токенов «вопрос агента → источники» (протокол §9.3, повтор через кэш, наивный `mode=chunks`); M6 — ТС-1 с видами и нагетами (`kind`, `nuggets`, разметка — задача 1b) |
 | `nuggets.lock` | M6: замороженные `nuggets_fingerprint` и `corpus_fingerprint` ТС-1 (создаёт задача 1b) |
 | `kind-queries.toml` | M6, задача 10: 35 запросов буста вида (§10) — 26 к группам `k01`–`k24` (ответ — insight `gotcha`/`failure`, соседи — заметка темы и `k<NN>-n`) и 9 `certainty` к парам «`hypothesis` `gotcha` → `theorem` `gotcha`»; составил независимый агент без доступа к коду поиска и сеткам, разметка перенесена без правок; прогон — `--queries eval/kind-queries.toml` или часть `kind` сеток `grid-m6-kind*.toml` |
+| `kind-queries-b.toml`, `kind-queries-c.toml` | M6, задача 10: ещё два независимых набора буста вида (26 и 28 запросов: группы `k` и 9 пар `certainty` у каждого) — дополнение по условию «не на потолке» (§10); составили другие независимые агенты (им сообщено только, что прежний набор слишком лёгкий), разметка без правок |
 | `glossary.toml` | M4.5: словарь домена — 16 терминов с псевдонимами RU↔EN (сленг, транслитерация, сокращения) и 24 запроса на псевдонимах |
 | `docs/` | M5: набор документов (не в git, `.gitignore`): генерирует `cargo xtask docs-corpus` из сида — DOCX, XLSX, PPTX, PDF (одна и две колонки, кириллица, CJK, 500 страниц, «скан»), враждебные файлы, `manifest.json` (факты, эталон порядка строк PDF) |
 | `docs-queries.toml` | M5: 45 запросов к фактам набора документов (`exact` 23, `paraphrase` 11, `cross-lang` 8, `date` 3) |
@@ -243,6 +245,7 @@ cargo xtask eval --grid eval/grid-chunking.toml                         # сил
 cargo xtask eval --grid eval/grid-chunking-cpu.toml                     # то же, проверка на int8 CPU
 cargo xtask eval --grid eval/grid-m3.toml                               # веса поиска M3 (задача 18)
 cargo xtask eval --grid eval/grid-m3-kind.toml                          # буст вида ниже theorem (задача 18)
+cargo xtask eval --grid eval/grid-m6-kind.toml                          # режим буста вида M6 §10 (задача 10; -rerank, -cpu — контроль)
 cargo xtask eval --device cuda --corpus <каталог> --insights <файл> --queries <файл> \
   --label <метка> --out <каталог>                                         # контрольный прогон
 cargo xtask eval --hints                                  # подсказки хуков, int8 CPU (M4)
@@ -251,6 +254,16 @@ cargo xtask eval --tokens --device cuda                   # расход ток�
 cargo xtask eval --glossary --mode fts --compare <fts M4>  # словарь и канал alias (M4.5)
 cargo xtask eval --glossary --device cuda --mode hybrid --mode hybrid+rerank   --compare <гибрид M4> --compare <rerank M4>              # то же на fp16 CUDA, по файлу на режим
 ```
+
+**Сетка поиска** (`--grid eval/grid*.toml`): `model`, `device`, `[[config]] {name, set, server_bin?}`
+(до 12, первая — база), `second_base?`; M6 (задача 10): `mode = "hybrid" | "hybrid+rerank"`,
+`aa = true` — база снимается дважды на том же индексе (A/A-гейт: побайтово ли выдача, порог шума
+p95 |Δ nDCG@10| по частям), `[[part]] {name, queries}` — ещё наборы запросов на том же индексе
+(проверяются как фрагмент); отчёт по частям (`main` — основной набор): nDCG@10, доля nDCG@10 < 1,
+`reliable_first`, Δ к базе с односторонними 95 % границами (бутстреп 10 000) и с поправкой
+Бонферрони на число сравнений, запросы лучше/хуже/равно. Во фрагменте виды M2 могут ждать insight
+(вид описывает формулировку), `certainty` может быть межъязыковым; дословность идентификатора
+проверяется по заметкам.
 
 `--prefix <имя>` (`--hints` и прогоны `--mode`) ставит префикс в имя результата сразу после даты:
 `<дата>-m45-<модель>-<режим>` — итоги этапа воспроизводятся одной командой.

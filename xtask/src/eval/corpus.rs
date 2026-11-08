@@ -636,6 +636,10 @@ pub fn is_identifier(tok: &str) -> bool {
     if n < 2 {
         return false;
     }
+    // атрибут Rust `#[instrument]` (M6, задача 10: набор буста вида)
+    if let Some(inner) = tok.strip_prefix("#[").and_then(|t| t.strip_suffix(']')) {
+        return !inner.is_empty() && inner.chars().next().is_some_and(char::is_alphabetic);
+    }
     let has_digit = tok.chars().any(|c| c.is_ascii_digit());
     let has_alpha = tok.chars().any(char::is_alphabetic);
     let punct = tok
@@ -654,10 +658,15 @@ pub fn is_identifier(tok: &str) -> bool {
 /// Идентификаторы запроса (по пробелам, без обрамляющей пунктуации).
 pub fn identifiers(text: &str) -> Vec<String> {
     text.split_whitespace()
-        // кавычки и скобки вокруг токена; точка и двоеточие в конце — пунктуация фразы,
-        // в начале — часть имени (`.gitignore`), дефисы флага (`--cached`) сохраняются
-        .map(|t| t.trim_matches(|c: char| "\"'`()[]{},;!?«»".contains(c)))
-        .map(|t| t.trim_end_matches(['.', ':']))
+        // атрибут `#[name]`/`#[name(…)]` — целиком до `]` (скобки — часть имени)
+        .map(|t| match (t.find("#["), t.find(']')) {
+            (Some(a), Some(b)) if b > a => &t[a..=b],
+            // кавычки и скобки вокруг токена; точка и двоеточие в конце — пунктуация фразы,
+            // в начале — часть имени (`.gitignore`), дефисы флага (`--cached`) сохраняются
+            _ => t
+                .trim_matches(|c: char| "\"'`()[]{},;!?«»".contains(c))
+                .trim_end_matches(['.', ':']),
+        })
         .filter(|t| is_identifier(t))
         .map(str::to_string)
         .collect()
@@ -1103,7 +1112,9 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         if q.area.as_deref().is_some_and(|a| !AREAS.contains(&a)) {
             bad(format!("область — одна из {}", AREAS.join(", ")));
         }
-        if Kind::M2.contains(&q.kind) && notes.len() != targets.len() {
+        // полный набор: виды M2 — поиск заметок; во фрагменте (`--queries`, наборы M6 вроде
+        // `kind-queries.toml`) вид описывает формулировку, и ответом может быть insight
+        if full && Kind::M2.contains(&q.kind) && notes.len() != targets.len() {
             bad("запросы видов M2 ждут только заметки".into());
         }
         match q.kind {
@@ -1125,6 +1136,8 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                 if toks.is_empty() {
                     bad("identifier без идентификатора в тексте".into());
                 }
+                // дословность проверяется по заметкам (как в M2); у insight фрагмента
+                // идентификатор может быть фразой («new Date») — её разметчик сверяет сам
                 for n in &notes {
                     let low = n.text.to_lowercase();
                     if !toks.iter().any(|t| low.contains(&t.to_lowercase())) {
@@ -1213,7 +1226,8 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                             if corpus.insight_certainty(&i.key) == Some("hypothesis")
                                 && corpus.insight_active(&i.key) =>
                         {
-                            if i.lang != q.lang {
+                            // фрагмент (наборы M6): `certainty` может быть и межъязыковым
+                            if full && i.lang != q.lang {
                                 bad(format!("язык weaker {w} отличается от запроса"));
                             }
                             for e in &q.expect {
@@ -1273,6 +1287,7 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         }
         // broad может собирать тему на обоих языках
         if !matches!(q.kind, Kind::CrossLang | Kind::Broad)
+            && (full || q.kind != Kind::Certainty)
             && let Some(t) = targets.iter().find(|t| t.lang() != q.lang)
         {
             bad(format!(
@@ -1506,6 +1521,11 @@ mod tests {
             ["HashMap", "BTreeMap"]
         );
         assert!(identifiers("обычный вопрос про git").is_empty());
+        assert_eq!(
+            identifiers("почему #[instrument] на обработчике"),
+            ["#[instrument]"]
+        );
+        assert!(!is_identifier("#[]"));
     }
 
     fn note(path: &str, text: &str) -> Note {

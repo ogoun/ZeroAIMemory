@@ -201,6 +201,84 @@ pub(super) fn contradicts_applies(src_rel: u8, dst_rel: u8, dst_live: bool) -> b
     dst_live && dst_rel >= reliability(Some(Certainty::Theorem)) && dst_rel > src_rel
 }
 
+/// Надёжность ([`reliability`]) и «действует» узлов подграфа: у заметки статуса нет, запись
+/// действует при `active`/`revisit`; удалённое не действует.
+fn reliabilities(g: &zam_store::Graph) -> HashMap<Id, (u8, bool)> {
+    g.nodes
+        .iter()
+        .map(|n| {
+            let live = !n.deleted
+                && matches!(
+                    n.status,
+                    None | Some(EntryStatus::Active | EntryStatus::Revisit)
+                );
+            (n.r.id, (reliability(n.certainty), live))
+        })
+        .collect()
+}
+
+/// Кандидат поиска для [`kind_boost_exempt`]: индекс цели поиска, цель элемента и получил бы
+/// он буст вида.
+pub(super) struct KindCandidate {
+    pub target: usize,
+    pub r: TargetRef,
+    pub boosted: bool,
+}
+
+/// Цели без буста вида при `search.kind_boost_mode = unless_contradicted` (M6 §10): кандидат с
+/// бустом вида, связанный `contradicts` (в любую сторону **[решение исполнителя]**: связь —
+/// противоречие, направление в данных — от гипотезы к теореме) с действующей записью, которая
+/// надёжнее его по [`contradicts_applies`] и тоже среди кандидатов `cands` — всех после слияния,
+/// до отсечения `top_k` (не только видимых). Граф читается от кандидатов с бустом; сбой чтения
+/// графа чужого решения исключает решение ([`Health::soft`]).
+pub(super) async fn kind_boost_exempt(
+    health: &mut Health<'_>,
+    cands: &[KindCandidate],
+) -> Result<HashSet<TargetRef>, ApiError> {
+    let targets = health.targets;
+    let mut by_db: BTreeMap<usize, (Vec<TargetRef>, HashSet<TargetRef>)> = BTreeMap::new();
+    for c in cands {
+        if !health.alive[c.target] || !matches!(c.r.kind, TargetKind::Node | TargetKind::Entry) {
+            continue;
+        }
+        let (boosted, all) = by_db.entry(c.target).or_default();
+        all.insert(c.r);
+        if c.boosted && !boosted.contains(&c.r) {
+            boosted.push(c.r);
+        }
+    }
+    let mut out = HashSet::new();
+    for (ti, (boosted, all)) in by_db {
+        if boosted.is_empty() || all.len() < 2 {
+            continue;
+        }
+        let t = &targets[ti];
+        let r =
+            t.db.neighbors(&boosted, 1, &[EdgeType::Contradicts], &t.space_ids())
+                .await;
+        let Some(g) = health.soft(ti, r)? else {
+            continue;
+        };
+        let rel = reliabilities(&g);
+        for e in &g.edges {
+            let Some(d) = e.dst.filter(|_| e.kind == EdgeType::Contradicts) else {
+                continue;
+            };
+            for (x, y) in [(e.src, d), (d, e.src)] {
+                let xr = rel.get(&x.id).map_or(0, |r| r.0);
+                if boosted.contains(&x)
+                    && all.contains(&y)
+                    && let Some(&(yr, live)) = rel.get(&y.id)
+                    && contradicts_applies(xr, yr, live)
+                {
+                    out.insert(x);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Порядок по `contradicts` (M4.5, §5.2): элемент выдачи с исходящим `contradicts` к действующей
 /// записи той же выдачи, которая надёжнее его (`axiom` — любого элемента, кроме другой
 /// аксиомы; `theorem` — гипотезы или заметки), не стоит выше неё
@@ -235,20 +313,7 @@ pub(super) async fn order_by_contradicts(
         let Some(g) = health.soft(ti, r)? else {
             continue;
         };
-        // надёжность записей подграфа; цель связи — только действующая
-        let rel: HashMap<Id, (u8, bool)> = g
-            .nodes
-            .iter()
-            .map(|n| {
-                let live = !n.deleted
-                    // у заметки статуса нет; у записи — только действующая
-                    && matches!(
-                        n.status,
-                        None | Some(EntryStatus::Active | EntryStatus::Revisit)
-                    );
-                (n.r.id, (reliability(n.certainty), live))
-            })
-            .collect();
+        let rel = reliabilities(&g);
         for e in &g.edges {
             if e.kind != EdgeType::Contradicts {
                 continue;

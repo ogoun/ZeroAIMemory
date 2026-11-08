@@ -196,6 +196,10 @@ max_folders = 2
 # перед записью; axiom → axiom и theorem → theorem не переставляются).
 # false — порядок реранкера без поправки.
 contradicts_order = true
+# Когда действует буст вида insight boost_gotcha/boost_failure (M6 §10): always — всегда;
+# unless_contradicted — не у записи, которой противоречит (contradicts) действующая более надёжная
+# запись (theorem/axiom) среди всех кандидатов поиска; reliable_only — только у theorem/axiom.
+kind_boost_mode = "always"
 # Бюджет выдачи POST /search и memory_search без явного budget_tokens, токенов счётчика сервера
 # (1..=200000; M6 §4.2): Markdown brief/notes целиком, со строкой MCP «~N tok», укладывается в
 # него; первая карточка отдаётся всегда (фрагмент урезается).

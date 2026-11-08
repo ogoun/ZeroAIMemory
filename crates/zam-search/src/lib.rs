@@ -23,7 +23,7 @@ pub mod pack;
 pub mod recall;
 
 pub use adjust::{
-    Boosts, LeafRef, RECENCY_FLOOR, apply_boosts, apply_boosts_to, cap_per_node,
+    Boosts, KindBoostMode, LeafRef, RECENCY_FLOOR, apply_boosts, apply_boosts_to, cap_per_node,
     drop_unresolved_tail, in_section, note_to_leaf, order_contradicted, overflow_divisor,
     recency_factor, rescale_overflow, summaries_without_leaf, target_cap,
 };

@@ -235,10 +235,10 @@ use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
-    Boosts, ChunkMeta, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights, apply_boosts,
-    apply_boosts_to, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed, in_section,
-    note_to_leaf, overflow_divisor, rescale_overflow, summaries_without_leaf, target_cap,
-    truncate_to_tokens,
+    Boosts, ChunkMeta, FolderHit, KindBoostMode, LeafRef, Level, Ranked, SearchInputs, Weights,
+    apply_boosts, apply_boosts_to, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed,
+    in_section, note_to_leaf, overflow_divisor, rescale_overflow, summaries_without_leaf,
+    target_cap, truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
@@ -508,6 +508,8 @@ impl SearchSection {
             .into_iter()
             .collect(),
             area: area.map(|a| (a, self.boost_area)),
+            kind_mode: self.kind_boost_mode,
+            kind_exempt: HashSet::new(),
         }
     }
 }
@@ -2347,7 +2349,7 @@ pub async fn search(
     }
     let mut kinds = target_filter(&req.filters, req.include_history, p.is_human())?;
     kinds.area = area_filter(req.scope.area.as_deref())?;
-    let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
+    let mut boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
     // сессия: некорректный id — 400; сбой её базы поиск не валит (WARN, без пометок)
     let session = match seen_session(
@@ -2613,6 +2615,25 @@ pub async fn search(
     };
     let weights = st.cfg.search.weights();
     let (mut ranked, norm_max) = fuse_normed(&inputs, &weights, zam_store::time::now());
+    // M6 §10: без буста вида — записи, которым противоречит более надёжная запись среди всех
+    // кандидатов слияния (до `top_k`); тот же набор действует и на баллы реранкера
+    if boosts.kind_mode == KindBoostMode::UnlessContradicted {
+        let cands: Vec<graph::KindCandidate> = ranked
+            .iter()
+            .filter_map(|r| {
+                let (i, h) = hits.get(&r.chunk_id)?;
+                let kind = inputs.chunks.get(&r.chunk_id)?.insight_kind.as_deref();
+                Some(graph::KindCandidate {
+                    target: *i,
+                    r: h.target,
+                    boosted: boosts.kind_boosted(kind),
+                })
+            })
+            .collect();
+        if cands.iter().any(|c| c.boosted) {
+            boosts.kind_exempt = graph::kind_boost_exempt(&mut health, &cands).await?;
+        }
+    }
     apply_boosts(&mut ranked, &inputs.chunks, &boosts);
     // балл выше 1 после бустов и канала папок: все баллы делятся на лучший (порядок прежний)
     let overflow = rescale_overflow(&mut ranked);

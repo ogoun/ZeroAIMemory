@@ -1,0 +1,58 @@
+# M6 §10 (задача 10): режим и множитель буста вида insight — rerank=on на CUDA (контроль).
+#   cargo xtask eval --grid eval/grid-m6-kind-rerank.toml
+# Части: main — eval/queries.toml (контроль, Δ ≥ −0,005); kind, kind_b, kind_c — три независимых
+# набора буста вида (eval/kind-queries{,-b,-c}.toml); решающая — их объединение extra_all.
+# Первая конфигурация — база always × 1,05 (v0.0.9), снимается дважды (A/A-гейт).
+# Правило выбора — журнал задачи 10 (записано до прогона).
+model = "bge-m3-fp16"
+device = "cuda"
+mode = "hybrid+rerank"
+aa = true
+
+[[part]]
+name = "kind"
+queries = "eval/kind-queries.toml"
+
+[[part]]
+name = "kind_b"
+queries = "eval/kind-queries-b.toml"
+
+[[part]]
+name = "kind_c"
+queries = "eval/kind-queries-c.toml"
+
+[[config]]
+name = "always-1.05"
+set = { "search.kind_boost_mode" = "always" }
+
+[[config]]
+name = "always-1.0"
+set = { "search.kind_boost_mode" = "always", "search.boost_gotcha" = "1.0", "search.boost_failure" = "1.0" }
+
+[[config]]
+name = "always-1.10"
+set = { "search.kind_boost_mode" = "always", "search.boost_gotcha" = "1.10", "search.boost_failure" = "1.10" }
+
+[[config]]
+name = "always-1.15"
+set = { "search.kind_boost_mode" = "always", "search.boost_gotcha" = "1.15", "search.boost_failure" = "1.15" }
+
+[[config]]
+name = "uc-1.0"
+set = { "search.kind_boost_mode" = "unless_contradicted", "search.boost_gotcha" = "1.0", "search.boost_failure" = "1.0" }
+
+[[config]]
+name = "uc-1.05"
+set = { "search.kind_boost_mode" = "unless_contradicted" }
+
+[[config]]
+name = "uc-1.10"
+set = { "search.kind_boost_mode" = "unless_contradicted", "search.boost_gotcha" = "1.10", "search.boost_failure" = "1.10" }
+
+[[config]]
+name = "uc-1.15"
+set = { "search.kind_boost_mode" = "unless_contradicted", "search.boost_gotcha" = "1.15", "search.boost_failure" = "1.15" }
+
+[[config]]
+name = "ro-1.10"
+set = { "search.kind_boost_mode" = "reliable_only", "search.boost_gotcha" = "1.10", "search.boost_failure" = "1.10" }

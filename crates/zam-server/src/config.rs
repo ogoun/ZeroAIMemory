@@ -8,6 +8,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString, rand_core:
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml::{Table, Value};
+use zam_search::KindBoostMode;
 use zam_search::recall::CoverageRule;
 
 /// Переменные `ZAM_*`, которые не являются слоем конфигурации:
@@ -549,6 +550,12 @@ pub struct SearchSection {
     /// выдаче (axiom → axiom и theorem → theorem не переставляются). `false` — порядок
     /// реранкера без поправки (по умолчанию `true`).
     pub contradicts_order: bool,
+    /// Когда действует буст вида insight `boost_gotcha`/`boost_failure` (M6 §10): `always` —
+    /// всегда (v0.0.9); `unless_contradicted` — не у записи, которой противоречит связью
+    /// `contradicts` действующая более надёжная запись (`theorem`/`axiom`) среди всех кандидатов
+    /// после слияния, до отсечения `top_k`; `reliable_only` — только у `theorem`/`axiom`.
+    /// По умолчанию `always` — сетка задачи 10 M6 (журнал).
+    pub kind_boost_mode: KindBoostMode,
     /// Бюджет выдачи `POST /search` и `memory_search` без явного `budget_tokens`, токенов
     /// счётчика сервера (1..=200000, 800; M6 §4.2): Markdown `brief`/`notes` целиком, вместе
     /// со строкой `~N tok` MCP, укладывается в него; первая карточка отдаётся всегда.
@@ -1266,6 +1273,7 @@ impl Default for ServerConfig {
                 w_folder: 0.0,
                 max_folders: 2,
                 contradicts_order: true,
+                kind_boost_mode: KindBoostMode::Always,
                 budget_tokens: 800,
                 brief_min_rel: 0.0,
             },
@@ -1639,6 +1647,33 @@ mod tests {
         // M4.5: близкие аксиомы решений и порядок по `contradicts`
         assert_eq!(c.insights.decision_conflict_threshold, 0.80);
         assert!(c.search.contradicts_order);
+        assert_eq!(c.search.kind_boost_mode, KindBoostMode::Always);
+    }
+
+    /// M6 §10: `search.kind_boost_mode` из `ZAM_*`, неизвестное значение — ошибка.
+    #[test]
+    fn kind_boost_mode_key() {
+        for (v, want) in [
+            ("always", KindBoostMode::Always),
+            ("unless_contradicted", KindBoostMode::UnlessContradicted),
+            ("reliable_only", KindBoostMode::ReliableOnly),
+        ] {
+            let c = load(
+                None,
+                &[env("ZAM_SEARCH__KIND_BOOST_MODE", v)],
+                &Default::default(),
+            )
+            .unwrap();
+            assert_eq!(c.search.kind_boost_mode, want, "{v}");
+        }
+        assert!(
+            load(
+                None,
+                &[env("ZAM_SEARCH__KIND_BOOST_MODE", "sometimes")],
+                &Default::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
