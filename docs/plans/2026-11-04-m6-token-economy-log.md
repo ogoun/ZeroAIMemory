@@ -4345,3 +4345,37 @@ pdfium скопированы в `wt-b/target/deps` и после удалены
 нагрузкой HDD, при повторе — PASS; правка этого кода не касается); `zam-server --lib` — 251
 PASS (в том числе `chunk_model_without_embedder_uses_tokenizer`); `index_api`, `boot`, `vault`,
 `sessions`, `web`, `qdrant_lifecycle`, `index_worker` — 76 PASS.
+
+### Повторное ревью задачи 18a — правки (2026-11-08)
+
+C1, I1–I6, M1–M12 закрыты; новые замечания исправлены в этом же круге.
+- **N1 (Important).** Пересборка воркера (`rebuild_pass`) пропускает `enqueue_reindex` только
+  при отметке reindex **всей базы** (`space: null`, в том числе `full`); отметка одного
+  пространства (прерванный `reindex --space`, её ставит сам `reindex`) пересборку не отменяет —
+  иначе остальные пространства базы остались бы без точек в новой коллекции. Тест
+  `zam-index/tests/worker.rs::space_reindex_mark_does_not_skip_rebuild_of_other_spaces`.
+- **N2 (Important).** Удаляются только свои брошенные сборки: в каталоге копий —
+  `yyyy-MM-dd_HHmmss[-N].partial`, для архива — ровно `<архив>.partial` и `<архив>.tmp` (любое
+  расширение). Чужие `*.partial`/`*.tmp` (каталог архива может быть пользовательским) не
+  трогаются. Тест `backup_cleans_only_own_partials`.
+- **N3.** Признак `.zam-restore-incomplete` хранит `moved_to <путь>`; повтор после сбоя
+  дописывает в тот же `pre-restore-…` прежние данные, оставшиеся на месте, а остатки
+  прерванного переноса сборки (имя уже занято) — в `restore-remnants-<время>/` внутри него.
+  Тест `restore_repeated_failures_single_pre_restore` (два сбоя подряд и успех — один каталог,
+  прежние данные целы).
+- **N4.** `rename_retry`: на Windows повтор `rename` до 10 раз через 200 мс при
+  `ERROR_ACCESS_DENIED`/`ERROR_SHARING_VIOLATION` — публикация копии и архива, перенос
+  прежних данных и сборки в `restore`.
+- **N5.** Литерал `StoreError::RestoreIncomplete` — продолжение строки через `\`, без лишних
+  пробелов.
+- **N6.** `drift`: пользователь, созданный между снимками, — «учётная запись в копии
+  system.db есть, его базы и блобов в копии нет»; база без записи в `system.db` — отдельной
+  строкой «в копию не входит».
+
+**Проверки** (`ZAM_REQUIRE_ML=1`, Qdrant/ORT/pdfium скопированы в `wt-b/target/deps` и после
+удалены; логи — `.tmp/m6/task18a/q-*.log`): `fmt --check` — чисто; `clippy --workspace
+--all-targets -D warnings` — чисто; `zam-server --test backup --features test-hooks` — 38 PASS;
+`zam-index --test worker` — 19 тестов (17 PASS, 2 ignored — замеры), в том числе новый
+`space_reindex_mark_*` (первая редакция теста ждала точки до создания коллекции — добавлена
+запись, после которой `ensure` создаёт коллекцию, как в `dropped_collection_*`); `zam-store` —
+457 PASS.
