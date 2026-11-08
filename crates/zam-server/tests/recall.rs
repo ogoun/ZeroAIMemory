@@ -123,10 +123,27 @@ fn assert_marked(j: &Value) {
         assert!(
             line.starts_with("ZeroAIMemory: ")
                 || line.starts_with(&index)
-                || rules.iter().any(|r| r == line),
+                || (rules.iter().any(|r| r == line) && rule_line_shape(line, &id)),
             "{line}"
         );
     }
+}
+
+/// Строка правила раздела Rules (задача 8c, ревью п. 11): `<путь>( [..])? <id>` (L1),
+/// `<путь> — <фраза>( [..])? <id>` (L0) или `<путь> …( [..])? <id>` (до пути); путь — без
+/// пробелов и не начинается с метки подсказки.
+fn rule_line_shape(line: &str, id: &str) -> bool {
+    let Some(rest) = line.strip_suffix(&format!(" {id}")) else {
+        return false;
+    };
+    let rest = match rest.rsplit_once(" [") {
+        Some((head, tag)) if tag.ends_with(']') && !tag[..tag.len() - 1].contains(' ') => head,
+        _ => rest,
+    };
+    let (path, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    !path.is_empty()
+        && !path.starts_with("ZeroAIMemory:")
+        && (tail.is_empty() || tail.starts_with("— ") || tail == "…")
 }
 
 async fn shown(a: &Api, owner: &str, kind: TargetKind, id: &str) -> zam_store::UsageCounts {
@@ -1534,6 +1551,74 @@ async fn rules_reserved_never_cut() {
     )
     .await;
     assert!(j["tokens"].as_u64().unwrap() <= 100, "{j}");
+}
+
+/// Задача 8c (ревью, п. 10): строка правила — `<путь> n:<id>` без метки; абзац — одной строкой;
+/// `# заголовок`, повторяющий путь, опущен, не повтор — остаётся; правило из одного заголовка-
+/// повтора — с заголовком. В пакете субагенту L0 правила — та же строка без метки (п. 13).
+#[tokio::test]
+async fn rule_heading_repeating_path_dropped() {
+    let a = api("recall-rule-heading", roomy).await;
+    allow_rules(&a).await;
+    let id = |n: &Value| format!("n:{}", n["id"].as_str().unwrap());
+    let sec = id(&a
+        .note(
+            "rules",
+            "security/secrets",
+            "# Secrets\n\nSecrets never go\ninto logs.\n",
+        )
+        .await);
+    let mig = id(&a
+        .note(
+            "rules",
+            "backend/migrations",
+            "# Миграции базы\n\nТолько\nдобавляют.\n",
+        )
+        .await);
+    let only = id(&a.note("rules", "process/tests", "# Tests\n").await);
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rh-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила").join("\n");
+    assert!(
+        rules.contains(&format!(
+            "security/secrets {sec}\n  Secrets never go into logs."
+        )),
+        "{text}"
+    );
+    assert!(
+        rules.contains(&format!(
+            "backend/migrations {mig}\n  # Миграции базы\n  Только добавляют."
+        )),
+        "{text}"
+    );
+    assert!(
+        rules.contains(&format!("process/tests {only}\n  # Tests")),
+        "{text}"
+    );
+    assert!(!text.contains("правило "), "{text}");
+    assert_marked(&j);
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rh-2"),
+        json!({"event": "brief", "task": "миграции и секреты"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила");
+    assert!(
+        rules
+            .iter()
+            .any(|l| l.starts_with("security/secrets") && l.ends_with(&format!(" {sec}"))),
+        "{text}"
+    );
+    assert!(!text.contains("ZeroAIMemory: правило"), "{text}");
 }
 
 /// Решение контролёра по ревью 8a: в разделе Rules — текст правила до `RULE_L1_TOKENS` (200), а

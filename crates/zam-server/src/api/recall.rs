@@ -2324,7 +2324,8 @@ async fn trap_cands(
         .collect())
 }
 
-/// L0 заметок Rules (пакет под задачу): `ZeroAIMemory: правило <путь> — <L0> — n:<id>`.
+/// L0 заметок Rules (пакет под задачу): `<путь> — <L0> [надёжность] n:<id>` — под заголовком
+/// `### Правила` без метки подсказки и слова «правило», как в дайджесте (ревью 8c, п. 13).
 async fn rules_l0(health: &mut Health<'_>, deadline: &mut Deadline) -> Result<Vec<Cand>, ApiError> {
     let targets = health.targets();
     let Some((i, space)) = personal_space(targets, SpaceKind::Rules) else {
@@ -2346,12 +2347,7 @@ async fn rules_l0(health: &mut Health<'_>, deadline: &mut Deadline) -> Result<Ve
             }
             let certainty = certainty_str(n.certainty);
             let reference = format!("n:{}", n.id);
-            let block = hint_line(
-                "правило ",
-                &title,
-                &[certainty.as_deref().unwrap_or_default()],
-                &reference,
-            );
+            let block = rule_head(&title, certainty.as_deref(), &reference);
             Cand {
                 target: i,
                 tref: TargetRef {
@@ -2769,9 +2765,11 @@ fn rule_body(text: &str) -> &str {
 pub(crate) fn rule_l1(text: &str, path: &str) -> (String, bool) {
     let body = zam_markdown::mask_text(rule_body(text));
     let body = unwrap_lines(body.trim());
+    // правило из одного заголовка-повтора остаётся с заголовком: пустого текста не бывает
     let body = match body.split_once('\n') {
-        Some((first, rest)) if heading_repeats(first, path) => rest.trim_start().to_string(),
-        None if heading_repeats(&body, path) => String::new(),
+        Some((first, rest)) if heading_repeats(first, path) && !rest.trim().is_empty() => {
+            rest.trim_start().to_string()
+        }
         _ => body,
     };
     truncate_marked(
@@ -2811,13 +2809,30 @@ fn heading_repeats(line: &str, path: &str) -> bool {
 /// Абзацы Markdown — одной строкой (задача 8c): мягкий перенос внутри абзаца — пробел (так его и
 /// читает Markdown), пустые строки между блоками опускаются. Не склеиваются: заголовки, элементы
 /// списков, цитаты, таблицы, строки с отступом от 4 пробелов, строки с жёстким переносом (два
-/// пробела или `\` в конце) и всё внутри блока кода ```/~~~ — они остаются отдельными строками
-/// как есть.
+/// пробела или `\` в конце), подчёркивания setext (`===`, `---`) и разделители (`---`, `***`,
+/// `___`) и всё внутри блока кода ```/~~~ — они остаются отдельными строками как есть.
+///
+/// Известные ограничения (разбор построчный, без полного парсера CommonMark): строка таблицы без
+/// ведущего `|` склеивается с соседней; табуляция в отступе считается одним символом (строка с
+/// отступом в один таб склеивается); ограждение кода из 4 бэктиков закрывается первой строкой с
+/// 3 бэктиками внутри него; ленивое продолжение цитаты (`>` только в первой строке) склеивается
+/// с ней. Все случаи сохраняют текст, меняется только перенос строки.
 fn unwrap_lines(text: &str) -> String {
+    // подчёркивание setext или разделитель: строка из одного символа `=`, `-`, `*`, `_`
+    // (пробелы между ними допустимы), `=` — от одного, прочие — от трёх
+    let rule_line = |t: &str| {
+        let c: Vec<char> = t.chars().filter(|c| !c.is_whitespace()).collect();
+        match c.first() {
+            Some('=') => c.iter().all(|&x| x == '='),
+            Some(&f @ ('-' | '*' | '_')) => c.len() >= 3 && c.iter().all(|&x| x == f),
+            _ => false,
+        }
+    };
     let starts_block = |l: &str| {
         let t = l.trim_start();
         let lead = l.len() - t.len();
         lead >= 4
+            || rule_line(t)
             || t.starts_with('#')
             || t.starts_with('>')
             || t.starts_with('|')
@@ -2860,9 +2875,9 @@ fn unwrap_lines(text: &str) -> String {
         } else {
             out.push(line.trim_end().to_string());
         }
-        // заголовок и строка таблицы абзац не продолжают; элемент списка — продолжает (ленивое
-        // продолжение Markdown)
-        open = !hard && !t.starts_with('#') && !t.starts_with('|');
+        // заголовок, строка таблицы и подчёркивание/разделитель абзац не продолжают; элемент
+        // списка — продолжает (ленивое продолжение Markdown)
+        open = !hard && !t.starts_with('#') && !t.starts_with('|') && !rule_line(t);
     }
     out.join("\n")
 }
@@ -4524,8 +4539,57 @@ mod tests {
             "backend/migrations",
         );
         assert_eq!(t, "# Миграции базы\nТолько добавляют.");
-        // правило из одного заголовка, повторяющего путь, — пустой текст
-        assert_eq!(rule_l1("# Tests\n", "process/tests").0, "");
+        // правило из одного заголовка, повторяющего путь, остаётся с заголовком (ревью 8c, п. 9)
+        assert_eq!(rule_l1("# Tests\n", "process/tests").0, "# Tests");
+        assert_eq!(rule_l1("# Tests\n\n\n", "process/tests").0, "# Tests");
+        // буквы любых письменностей и цифры — слова; пунктуация — разделитель
+        assert!(heading_repeats("# 日本 2", "docs/日本-2"));
+        assert!(heading_repeats("# V2 API", "backend/api_v2"));
+        assert!(!heading_repeats("# 日本 3", "docs/日本-2"));
+        assert!(!heading_repeats("# ", "docs/x"));
+    }
+
+    /// Ревью 8c, п. 8 и 10: setext и разделители, `~~~`, отступ 4 пробела, `\` в конце строки,
+    /// нумерация `1)` — отдельными строками; маскировка секрета и склейка вместе.
+    #[test]
+    fn unwrap_lines_block_edges() {
+        assert_eq!(
+            unwrap_lines("Заголовок\n=========\nтекст\nдалее\n\nВторой\n---\nабзац"),
+            "Заголовок\n=========\nтекст далее\nВторой\n---\nабзац"
+        );
+        assert_eq!(unwrap_lines("а\n***\nб\n_ _ _\nв"), "а\n***\nб\n_ _ _\nв");
+        assert_eq!(
+            unwrap_lines("до\n~~~\nкод\n  строка\n~~~\nпосле\nхвост"),
+            "до\n~~~\nкод\n  строка\n~~~\nпосле хвост"
+        );
+        assert_eq!(
+            unwrap_lines("абзац\n    код с отступом"),
+            "абзац\n    код с отступом"
+        );
+        assert_eq!(
+            unwrap_lines("строка\\\nперенос\nдальше"),
+            "строка\\\nперенос дальше"
+        );
+        assert_eq!(
+            unwrap_lines("1) первое\nвторое\n2) третье"),
+            "1) первое второе\n2) третье"
+        );
+        // ключ AWS маскируется, переносы склеиваются (порядок `rule_l1`: маска, затем склейка)
+        let key = format!("{}{}", "AKIA", "ABCDEFGHIJKLMNOP");
+        let (t, _) = rule_l1(&format!("Ключ {key}\nне хранить.\n"), "security/keys");
+        assert!(!t.contains(&key) && !t.contains('\n'), "{t}");
+        assert!(t.ends_with("не хранить."), "{t}");
+    }
+
+    /// Ревью 8c, п. 10: строка правила с надёжностью — `<путь> [th] n:<id>`.
+    #[test]
+    fn rule_head_with_certainty() {
+        assert_eq!(rule_head("a/b", Some("theorem"), "n:1"), "a/b [th] n:1");
+        assert_eq!(rule_head("a/b", None, "n:1"), "a/b n:1");
+        assert_eq!(
+            rule_head("a/b — фраза", Some("axiom"), "n:2"),
+            "a/b — фраза [ax] n:2"
+        );
     }
 
     #[test]

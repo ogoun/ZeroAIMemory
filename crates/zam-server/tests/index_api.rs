@@ -596,7 +596,34 @@ async fn index_status_rules_heavy_shape() {
     assert!(grown > small, "{j2}");
     assert_eq!(
         zam_server::api::index::rules_l1_cached(rules_space),
-        Some((tok, grown as usize))
+        Some((tok.clone(), grown as usize))
+    );
+    // перенос без новой ревизии текста (ревью 8c, п. 10): заголовок «П1» повторял путь «п1» и в L1
+    // не входил; у нового пути он не повтор — L1 растёт, снимок кэша (с путём) пересчитывается
+    let p1 = a
+        .tok(
+            &a.token,
+            Method::GET,
+            "/api/v1/nodes/by-path?space=rules&path=п1&format=json",
+            None,
+        )
+        .await
+        .json();
+    let r = a
+        .tok(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/nodes/{}/move", p1["node"]["id"].as_str().unwrap()),
+            Some(json!({"path": "другое-имя"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j3 = only(None).await;
+    let moved = j3["rules"]["l1_tokens"].as_u64().unwrap();
+    assert!(moved > grown, "{grown} → {j3}");
+    assert_eq!(
+        zam_server::api::index::rules_l1_cached(rules_space),
+        Some((tok, moved as usize))
     );
     // 11-е — rules_heavy; GUID решения из заголовка — в `solution`
     a.note("rules", "п10", "# П10\n\nКороткое правило 10.\n")

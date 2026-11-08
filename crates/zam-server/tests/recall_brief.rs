@@ -339,7 +339,12 @@ async fn brief_sections_and_budget() {
     .await;
     let tokens = j["tokens"].as_u64().unwrap();
     assert!(tokens > 0 && tokens <= 100, "{tokens}: {j}");
-    assert!(text(&j).matches("правило правило-").count() < 10, "{j}");
+    // строка правила пакета — `<путь> — <L0> n:<id>` без метки (ревью 8c, п. 13)
+    let shown = text(&j)
+        .lines()
+        .filter(|l| l.starts_with("правило-"))
+        .count();
+    assert!(shown < 10, "{j}");
 }
 
 /// Без `task` — мини-дайджест: правила L0, ловушки, задачи (захваченная родителем — первой);
