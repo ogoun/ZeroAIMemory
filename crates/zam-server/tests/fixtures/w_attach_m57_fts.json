@@ -1,0 +1,424 @@
+{
+  "answers": [
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/pump-bearings",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9683,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "замена подшипников главного насоса"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/filter-backwash",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "промывка фильтра обратным током"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.9839,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/generator-test",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.9683,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9385,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/pump-bearings",
+          "score": 0.9242,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.8971,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "проверка генератора под нагрузкой"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/pump-bearings",
+          "score": 0.9839,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/compressor-oil",
+          "score": 0.9531,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.9385,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "остаток подшипников на складе"
+    },
+    {
+      "attach": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.9839,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.9839,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "it/backup-rotation",
+          "score": 0.9531,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "график внедрения системы учёта"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "quality/sample-retention",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9683,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "сколько хранить контрольные пробы"
+    },
+    {
+      "attach": [],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/pump-bearings",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "как часто меняют подшипники"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/filter-backwash",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9683,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/compressor-oil",
+          "score": 0.9531,
+          "sources": [
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.9385,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "перепад давления на фильтре"
+    },
+    {
+      "attach": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "it/backup-rotation",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "ротация резервных копий"
+    },
+    {
+      "attach": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "hr/ppe-issue",
+          "score": 1.0,
+          "sources": [
+            "fts"
+          ]
+        }
+      ],
+      "query": "срок носки перчаток"
+    }
+  ],
+  "platform": "windows"
+}

@@ -1,0 +1,1616 @@
+{
+  "answers": [
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9621,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.5,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.4919,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.4841,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.4552,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.8854,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/pump-bearings",
+          "score": 0.8765,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "docs/регламенты",
+          "score": 0.5,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.4841,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.4766,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/compressor-oil",
+          "score": 0.4692,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/fire-drill",
+          "score": 0.4552,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.4485,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.442,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.4122,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "замена подшипников главного насоса"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9625,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.7871,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7746,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.7284,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/filter-backwash",
+          "score": 0.891,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.5,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.4841,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.4766,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "docs/регламенты",
+          "score": 0.4692,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.4552,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.4485,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "quality/sample-retention",
+          "score": 0.442,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.4296,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/fire-drill",
+          "score": 0.4236,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "промывка фильтра обратным током"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9746,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.933,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.9251,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.7871,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/generator-test",
+          "score": 0.9508,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9009,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.8298,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.8106,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/fire-drill",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.7894,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.7746,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.7625,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.7394,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/pump-bearings",
+          "score": 0.7366,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        }
+      ],
+      "query": "проверка генератора под нагрузкой"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9625,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9362,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.7871,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.7284,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.8971,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/compressor-oil",
+          "score": 0.8893,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.8667,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.8327,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.7746,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/pump-bearings",
+          "score": 0.7642,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/forklift-charge",
+          "score": 0.7625,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "hr/ppe-issue",
+          "score": 0.7508,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.7394,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "остаток подшипников на складе"
+    },
+    {
+      "attach": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.9839,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7746,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7508,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.7284,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.9746,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.9593,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "docs/регламенты",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "it/backup-rotation",
+          "score": 0.7686,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "hr/ppe-issue",
+          "score": 0.7508,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/fire-drill",
+          "score": 0.7284,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.7176,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7072,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.6685,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.6507,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "график внедрения системы учёта"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9625,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.7871,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7508,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.7284,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "quality/sample-retention",
+          "score": 1.0,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.8908,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.7871,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.7625,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.7508,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/fire-drill",
+          "score": 0.7394,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/conveyor-belt",
+          "score": 0.7072,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "docs/регламенты",
+          "score": 0.6778,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.6595,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "it/vpn-access",
+          "score": 0.6338,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "сколько хранить контрольные пробы"
+    },
+    {
+      "attach": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.9839,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9683,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9385,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.9104,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.7746,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/compressor-oil",
+          "score": 0.7625,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.7508,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/pump-bearings",
+          "score": 0.7451,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7284,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "hr/ppe-issue",
+          "score": 0.7176,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "docs/регламенты",
+          "score": 0.7072,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.6685,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "quality/sample-retention",
+          "score": 0.6595,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "как часто меняют подшипники"
+    },
+    {
+      "attach": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9593,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.9508,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.7871,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.7284,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.8766,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/compressor-oil",
+          "score": 0.8722,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.8621,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/filter-backwash",
+          "score": 0.8025,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.8,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.7746,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.763,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:1",
+          "path": "docs/регламенты",
+          "score": 0.7625,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "it/vpn-access",
+          "score": 0.7508,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "quality/sample-retention",
+          "score": 0.7394,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "перепад давления на фильтре"
+    },
+    {
+      "attach": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7871,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.7746,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7625,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.7284,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "it/backup-rotation",
+          "score": 0.9621,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "docs/регламенты",
+          "score": 0.5,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.4841,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.4766,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.4552,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "it/vpn-access",
+          "score": 0.4485,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.4357,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/compressor-oil",
+          "score": 0.4296,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "hr/ppe-issue",
+          "score": 0.4236,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.4013,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "ротация резервных копий"
+    },
+    {
+      "attach": [
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 1.0,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.7871,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.7625,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7508,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.7394,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "mixed": [
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "hr/ppe-issue",
+          "score": 0.9919,
+          "sources": [
+            "vector",
+            "fts"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:2",
+          "path": "docs/регламенты",
+          "score": 0.4841,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/forklift-charge",
+          "score": 0.4766,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/fire-drill",
+          "score": 0.4692,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "план.pptx",
+          "kind": "attachment",
+          "locator": "slide:3",
+          "path": "docs/регламенты",
+          "score": 0.4621,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "safety/hot-work",
+          "score": 0.442,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/boiler-water",
+          "score": 0.4357,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "склад.xlsx",
+          "kind": "attachment",
+          "locator": "sheet:Остатки!A2:C5",
+          "path": "docs/регламенты",
+          "score": 0.4236,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": "регламент.docx",
+          "kind": "attachment",
+          "locator": "para:1",
+          "path": "docs/регламенты",
+          "score": 0.4178,
+          "sources": [
+            "vector"
+          ]
+        },
+        {
+          "file": null,
+          "kind": "note",
+          "locator": null,
+          "path": "ops/conveyor-belt",
+          "score": 0.4122,
+          "sources": [
+            "vector"
+          ]
+        }
+      ],
+      "query": "срок носки перчаток"
+    }
+  ],
+  "platform": "windows"
+}

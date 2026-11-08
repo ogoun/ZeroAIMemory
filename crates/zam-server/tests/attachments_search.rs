@@ -805,3 +805,244 @@ async fn secret_sheet_cards_numbered_and_readable() {
     assert_ne!(seen[0], seen[1]);
     a.st.shutdown().await;
 }
+
+// ------------------------------------------------------------- M6 §11: вес вложений w_attach
+
+/// Эталоны выдачи до задачи 11 (M6 §11, `search.w_attach`): мир FTS (без модели) и гибрид
+/// (MiniLM + Qdrant). Гибрид сверяется на платформе, где снят эталон: порядок близких косинусов
+/// малого корпуса разный на Linux и Windows (см. `common::attach::fts_card`).
+const W_ATTACH_FIXTURE_FTS: &str = "tests/fixtures/w_attach_m57_fts.json";
+const W_ATTACH_FIXTURE_HYBRID: &str = "tests/fixtures/w_attach_m57_hybrid.json";
+
+/// Заметки мира вложений: темы эксплуатации, частью те же, что у документов (вложения и заметки
+/// соревнуются в выдаче).
+const W_NOTES: &[(&str, &str)] = &[
+    (
+        "ops/pump-bearings",
+        "# Подшипники насоса\n\nЗамена подшипников главного насоса — по вибрации и наработке в моточасах; журнал вибрации ведёт смена.\n",
+    ),
+    (
+        "ops/filter-backwash",
+        "# Промывка фильтра\n\nФильтр грубой очистки промывают обратным током раз в смену; перепад давления — признак засора.\n",
+    ),
+    (
+        "ops/generator-test",
+        "# Дизель-генератор\n\nРезервный генератор проверяют под нагрузкой ежемесячно, протокол — в папке энергетика.\n",
+    ),
+    (
+        "ops/valve-lockout",
+        "# Блокировка задвижек\n\nПеред ремонтом задвижку закрывают, вешают замок и бирку; ключ — у ответственного.\n",
+    ),
+    (
+        "ops/compressor-oil",
+        "# Масло компрессора\n\nУровень масла компрессора смотрят на остановленной машине; доливают маслом той же марки.\n",
+    ),
+    (
+        "ops/boiler-water",
+        "# Вода котла\n\nЖёсткость питательной воды котла меряют ежедневно; превышение — продувка и проверка умягчителя.\n",
+    ),
+    (
+        "ops/conveyor-belt",
+        "# Лента конвейера\n\nСход ленты конвейера правят натяжной станцией; износ кромки — повод заказать ленту.\n",
+    ),
+    (
+        "ops/forklift-charge",
+        "# Зарядка погрузчиков\n\nТяговые батареи погрузчиков заряжают в отдельном помещении с вытяжкой, полный цикл — восемь часов.\n",
+    ),
+    (
+        "it/backup-rotation",
+        "# Ротация резервных копий\n\nКопии сервера учёта хранят по схеме дед-отец-сын: дневные неделю, недельные месяц, месячные год.\n",
+    ),
+    (
+        "it/printer-queue",
+        "# Очередь печати\n\nЗависшую очередь печати сбрасывают перезапуском службы диспетчера печати.\n",
+    ),
+    (
+        "it/vpn-access",
+        "# Удалённый доступ\n\nДоступ к VPN выдаёт отдел ИТ по заявке руководителя; ключи действуют год.\n",
+    ),
+    (
+        "hr/shift-handover",
+        "# Передача смены\n\nПри передаче смены старший расписывается в журнале и называет незакрытые наряды.\n",
+    ),
+    (
+        "hr/ppe-issue",
+        "# Средства защиты\n\nКаски, очки и перчатки выдают по ведомости; срок носки перчаток — месяц.\n",
+    ),
+    (
+        "safety/fire-drill",
+        "# Учебная тревога\n\nУчебную пожарную тревогу проводят раз в полгода, сбор — у главной проходной.\n",
+    ),
+    (
+        "safety/hot-work",
+        "# Огневые работы\n\nНа огневые работы оформляют наряд-допуск, место очищают от горючего, рядом — огнетушитель.\n",
+    ),
+    (
+        "quality/sample-retention",
+        "# Хранение проб\n\nКонтрольные пробы партии хранят три месяца с этикеткой даты и номера партии.\n",
+    ),
+];
+
+/// Запросы мира вложений: слова документов, слова заметок, общие темы и пересказ.
+const W_QUERIES: &[&str] = &[
+    "замена подшипников главного насоса",
+    "промывка фильтра обратным током",
+    "проверка генератора под нагрузкой",
+    "остаток подшипников на складе",
+    "график внедрения системы учёта",
+    "сколько хранить контрольные пробы",
+    "как часто меняют подшипники",
+    "перепад давления на фильтре",
+    "ротация резервных копий",
+    "срок носки перчаток",
+];
+
+/// Мир M6 §11: 16 заметок и три документа (DOCX — регламент, XLSX — склад, PPTX — план) одной
+/// заметки-владельца; без затухания по свежести (баллы не зависят от времени между снятиями).
+/// С вектором — ждёт точек вложений и векторной индексации всех заметок.
+async fn w_attach_world(
+    name: &str,
+    vector: bool,
+    tweak: impl FnOnce(&mut zam_server::config::ServerConfig),
+) -> common::attach::World {
+    let w = common::attach::world_with(name, vector, |c| {
+        c.search.recency_half_life_days = 0.0;
+        tweak(c);
+    })
+    .await;
+    let a = &w.a;
+    let user = a.st.admin_id;
+    let mut ids = Vec::new();
+    for (path, body) in W_NOTES {
+        ids.push(note(a, &a.token, "knowledge", path, body, None).await);
+    }
+    let owner = note(
+        a,
+        &a.token,
+        "knowledge",
+        "docs/регламенты",
+        "# Регламенты\n\nДокументы службы эксплуатации.\n",
+        None,
+    )
+    .await;
+    ids.push(owner.clone());
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "регламент.docx",
+            docx(&[
+                "Замена подшипников главного насоса выполняется после 8000 моточасов или при росте вибрации выше 7 мм/с.",
+                "Фильтр грубой очистки промывается обратным током при перепаде давления 0,5 бар.",
+                "Резервный дизель-генератор проверяется под нагрузкой не реже одного раза в месяц.",
+                "Методику измерения вибраций согласовали с главным механиком и службой надёжности.",
+                "Контрольные пробы каждой партии хранятся девяносто дней в лаборатории.",
+                "Огневые работы на складе масел запрещены без письменного наряда-допуска.",
+            ]),
+        ),
+        (
+            "склад.xlsx",
+            xlsx(&[(
+                "Остатки",
+                &[
+                    &["Позиция", "Количество", "Место"],
+                    &["Подшипник 6312", "14", "стеллаж А3"],
+                    &["Сальник насоса", "40", "стеллаж А4"],
+                    &["Фильтроэлемент ФГО", "6", "стеллаж Б1"],
+                    &["Перчатки рабочие", "300", "кладовая"],
+                ],
+            )]),
+        ),
+        (
+            "план.pptx",
+            pptx(&[
+                (
+                    "План внедрения",
+                    "Система учёта ремонтов: пилот в цехе насосов",
+                ),
+                (
+                    "Сроки",
+                    "График внедрения: пилот в марте, весь завод к сентябрю",
+                ),
+                ("Риски", "Нет резервных копий базы учёта до перехода"),
+            ]),
+        ),
+    ];
+    for (file, data) in &files {
+        upload(a, &a.token, &owner, file, data).await;
+    }
+    let mut total = 0;
+    for (file, _) in &files {
+        let d = wait_done(a, user, &owner, file).await;
+        total += chunk_locators(a, user, d.id).await.len() as u64;
+    }
+    if w.vector {
+        wait_points(a, user, total).await;
+        let db = common::attach::db(a, user).await;
+        common::ml::until(
+            "заметки проиндексированы",
+            std::time::Duration::from_secs(240),
+            async || {
+                for id in &ids {
+                    let n = zam_store::get_node(&db, id.parse().unwrap()).await.unwrap();
+                    if n.index_state != "indexed" {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await;
+    }
+    w
+}
+
+/// Выдача запросов мира: по запросу — вид, путь, файл, `locator`, каналы и балл каждой карточки
+/// (смешанная выдача и одни вложения).
+async fn w_attach_answers(a: &Api) -> Value {
+    let card = |i: &Value| {
+        json!({
+            "kind": i["kind"], "path": i["path"], "file": i["file"], "locator": i["locator"],
+            "sources": i["sources"], "score": i["score"],
+        })
+    };
+    let mut out = Vec::new();
+    for q in W_QUERIES {
+        let body = json!({"query": q, "top_k": 10, "budget_tokens": 100000});
+        let mixed = search(a, &a.token, body.clone()).await;
+        let mut only = body;
+        only["filters"] = json!({"kinds": ["attachment"]});
+        let only = search(a, &a.token, only).await;
+        out.push(json!({
+            "query": q,
+            "mixed": items(&mixed).iter().map(card).collect::<Vec<_>>(),
+            "attach": items(&only).iter().map(card).collect::<Vec<_>>(),
+        }));
+    }
+    json!(out)
+}
+
+fn w_fixture(rel: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+/// Снимает эталоны [`W_ATTACH_FIXTURE_FTS`] и [`W_ATTACH_FIXTURE_HYBRID`] (код до задачи 11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "снимает эталон; запускать только на коде до правки M6 §11 (w_attach)"]
+async fn snapshot_w_attach_fixture() {
+    let w = w_attach_world("watt-snap-fts", false, |_| {}).await;
+    let v = json!({"platform": std::env::consts::OS, "answers": w_attach_answers(&w.a).await});
+    std::fs::write(
+        w_fixture(W_ATTACH_FIXTURE_FTS),
+        serde_json::to_string_pretty(&v).unwrap() + "\n",
+    )
+    .unwrap();
+    w.a.st.shutdown().await;
+    let w = w_attach_world("watt-snap-hyb", true, |_| {}).await;
+    assert!(w.vector, "эталон гибрида — с MiniLM и Qdrant");
+    let v = json!({"platform": std::env::consts::OS, "answers": w_attach_answers(&w.a).await});
+    std::fs::write(
+        w_fixture(W_ATTACH_FIXTURE_HYBRID),
+        serde_json::to_string_pretty(&v).unwrap() + "\n",
+    )
+    .unwrap();
+    w.a.st.shutdown().await;
+}
