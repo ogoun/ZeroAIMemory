@@ -410,36 +410,73 @@ fn copy_name(dir: &Path, now: jiff::Timestamp) -> String {
         .expect("бесконечный ряд")
 }
 
-/// Удаляет брошенные сборки `*.partial` (и `*.zip.tmp`) каталога `dir` старше `max_age`:
-/// их оставил прерванный `backup` (более свежие может собирать параллельная копия).
+/// Удаляет брошенную сборку `p` (каталог или файл) старше `max_age`: её оставил прерванный
+/// `backup` (более свежую может собирать параллельная копия).
+fn remove_stale(p: &Path, max_age: Duration) {
+    let old = std::fs::symlink_metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|a| a > max_age);
+    if !old {
+        return;
+    }
+    let r = if p.is_dir() {
+        std::fs::remove_dir_all(p)
+    } else {
+        std::fs::remove_file(p)
+    };
+    match r {
+        Ok(()) => tracing::info!(path = %p.display(), "удалена брошенная сборка копии"),
+        Err(err) => {
+            tracing::warn!(path = %p.display(), error = %err, "брошенная сборка копии не удалена")
+        }
+    }
+}
+
+/// Брошенные сборки каталога копий `dir`: только свои — `yyyy-MM-dd_HHmmss[-N].partial`;
+/// прочие файлы и каталоги (в том числе чужие `*.partial`) не трогаются.
 fn clean_partials(dir: &Path, max_age: Duration) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if !(name.ends_with(".partial") || name.ends_with(".zip.tmp")) {
-            continue;
+        if name
+            .strip_suffix(".partial")
+            .is_some_and(|n| copy_time(n).is_some())
+        {
+            remove_stale(&e.path(), max_age);
         }
-        let old = e
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|a| a > max_age);
-        if old {
-            let p = e.path();
-            let r = if p.is_dir() {
-                std::fs::remove_dir_all(&p)
-            } else {
-                std::fs::remove_file(&p)
-            };
-            match r {
-                Ok(()) => tracing::info!(path = %p.display(), "удалена брошенная сборка копии"),
-                Err(err) => {
-                    tracing::warn!(path = %p.display(), error = %err, "брошенная сборка копии не удалена")
-                }
+    }
+}
+
+/// Брошенная сборка архива `zip`: только `<архив>.partial` и `<архив>.tmp` (любое расширение
+/// архива) — каталог архива может быть чужим.
+fn clean_zip_leftovers(zip: &Path, max_age: Duration) {
+    for suffix in [".partial", ".tmp"] {
+        let mut s = zip.as_os_str().to_owned();
+        s.push(suffix);
+        let p = PathBuf::from(s);
+        if p.exists() {
+            remove_stale(&p, max_age);
+        }
+    }
+}
+
+/// `rename` с повтором на Windows: антивирус и индексатор ненадолго держат только что
+/// записанные файлы (`ERROR_ACCESS_DENIED` 5, `ERROR_SHARING_VIOLATION` 32) — до 10 попыток с
+/// паузой 200 мс. На других ОС — одна попытка.
+pub(crate) fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32)) && tries < 9 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(200));
             }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -553,8 +590,8 @@ pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, Bac
     };
     let stage_dir = stage.parent().unwrap_or(&dest).to_path_buf();
     std::fs::create_dir_all(&stage_dir)?;
-    if opts.zip.is_some() {
-        clean_partials(&stage_dir, max_age);
+    if let Some(z) = &opts.zip {
+        clean_zip_leftovers(z, max_age);
     }
     // место: базы и блобы, которых нет в предыдущей копии (те связываются), плюс 10 %;
     // архив собирается рядом и пишется целиком — вдвое
@@ -629,7 +666,7 @@ fn finish(
         }
         None => {
             restrict_tree(stage)?;
-            std::fs::rename(stage, target)?;
+            rename_retry(stage, target)?;
             if let Some(d) = target.parent() {
                 sync_dir(d)?;
             }
@@ -747,23 +784,34 @@ fn stage_copy(
     snapshot(&root.join("system.db"), &sys_copy, own_lock).map_err(e)?;
     // базы сняты — признак больше не нужен (блобы неизменяемы)
     drop(flag);
-    let mut late: BTreeSet<String> =
+    // пользователь, созданный между снимками system.db, в копии system.db есть, а его данных
+    // (базы, блобов) в копии нет; база без записи в копии system.db — не входит совсем
+    let in_sys: BTreeSet<String> =
         zam_store::backup::query_strings(&sys_copy, "users", "SELECT id FROM users ORDER BY id")
             .map_err(|x| e(x.into()))?
             .into_iter()
-            .filter(|id| !listed.contains(id.as_str()))
             .collect();
-    if let Ok(rd) = std::fs::read_dir(root.join("users")) {
-        late.extend(rd.flatten().filter_map(|d| {
-            let n = d.file_name().into_string().ok()?;
-            let id = n.strip_suffix(".db")?.to_string();
-            (!listed.contains(id.as_str())).then_some(id)
-        }));
-    }
-    for id in late {
+    for id in in_sys.iter().filter(|id| !listed.contains(id.as_str())) {
         drift.push(format!(
-            "пользователь {id}: создан после снимка system.db — в копию не входит"
+            "пользователь {id}: создан во время копии — учётная запись в копии system.db есть, \
+             его базы и блобов в копии нет"
         ));
+    }
+    if let Ok(rd) = std::fs::read_dir(root.join("users")) {
+        let mut orphans: Vec<String> = rd
+            .flatten()
+            .filter_map(|d| {
+                let n = d.file_name().into_string().ok()?;
+                let id = n.strip_suffix(".db")?.to_string();
+                (!listed.contains(id.as_str()) && !in_sys.contains(&id)).then_some(id)
+            })
+            .collect();
+        orphans.sort();
+        for id in orphans {
+            drift.push(format!(
+                "база users/{id}.db: пользователя нет в system.db — в копию не входит"
+            ));
+        }
     }
     dbs.insert(0, ("system.db".to_string(), sys_copy));
     // проверка копий, версии схем, модели и нарезка
@@ -879,7 +927,7 @@ fn write_zip(stage: &Path, m: &Manifest, out: &Path, root: &Path) -> Result<(), 
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     let r = write_zip_to(stage, m, &tmp, root).and_then(|()| {
-        std::fs::rename(&tmp, out)?;
+        rename_retry(&tmp, out)?;
         if let Some(d) = out.parent() {
             sync_dir(d)?;
         }

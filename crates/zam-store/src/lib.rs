@@ -224,7 +224,8 @@ pub enum StoreError {
     DataDirLocked(std::path::PathBuf),
     /// В каталоге данных прервано `zam-server restore` (M6 §12б.3): данные неполны.
     #[error(
-        "восстановление каталога данных {} не завершено: повторите zam-server restore <копия>          --replace (прежние данные — в backups/pre-restore-…)",
+        "восстановление каталога данных {} не завершено: повторите zam-server restore \
+         <копия> --replace (прежние данные — в backups/pre-restore-…)",
         .0.display()
     )]
     RestoreIncomplete(std::path::PathBuf),

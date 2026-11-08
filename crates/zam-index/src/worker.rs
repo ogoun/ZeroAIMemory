@@ -1008,12 +1008,16 @@ impl Worker {
             if p.done.contains(&u.id) || self.stopped() {
                 continue;
             }
-            // база с отметкой reindex из кэша (`zam-server restore`, прерванный reindex) —
-            // пересобирает её отметка: точки из кэша без перенарезки и заданий
+            // база с отметкой reindex **всей базы** (`zam-server restore`, прерванный reindex
+            // без пространства) — пересобирает её отметка: точки из кэша без перенарезки и
+            // заданий. Отметка одного пространства (прерванный reindex `--space`) остальные
+            // пространства не вернёт — тогда пересборка как обычно
             let res = match self.deps.users.get(u.id).await {
                 Ok(db) => match pending_reindex(&db).await {
-                    Ok(Some(_)) => Ok(0),
-                    Ok(None) => enqueue_reindex(&db, None).await,
+                    Ok(Some(spec)) if ReindexRequest::from_spec(u.id, &spec).space.is_none() => {
+                        Ok(0)
+                    }
+                    Ok(_) => enqueue_reindex(&db, None).await,
                     Err(e) => Err(e),
                 },
                 Err(e) => Err(e),

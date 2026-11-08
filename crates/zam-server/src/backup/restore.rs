@@ -273,13 +273,17 @@ fn need_space(m: &Manifest, kinds: &[Kind]) -> u64 {
     with_margin(n)
 }
 
-/// Переносит прежние `system.db` (с `-wal`/`-shm`), `users/`, `blobs/` в
-/// `backups/pre-restore-<время>/`; ничего не удаляется.
-fn move_old(root: &Path) -> Result<PathBuf, BackupError> {
-    let ts = zam_store::time::now()
+/// Время для имён каталогов (`yyyy-MM-dd_HHmmss`, UTC).
+fn ts_name() -> String {
+    zam_store::time::now()
         .to_zoned(jiff::tz::TimeZone::UTC)
         .strftime("%Y-%m-%d_%H%M%S")
-        .to_string();
+        .to_string()
+}
+
+/// Новый каталог `backups/pre-restore-<время>/` для прежних данных.
+fn new_pre_restore(root: &Path) -> PathBuf {
+    let ts = ts_name();
     let backups = root.join("backups");
     let mut dst = backups.join(format!("pre-restore-{ts}"));
     let mut k = 2;
@@ -287,21 +291,34 @@ fn move_old(root: &Path) -> Result<PathBuf, BackupError> {
         dst = backups.join(format!("pre-restore-{ts}-{k}"));
         k += 1;
     }
-    std::fs::create_dir_all(&dst)?;
+    dst
+}
+
+/// Переносит `system.db` (с `-wal`/`-shm`), `users/`, `blobs/` каталога данных в `dst`; ничего
+/// не удаляется. При повторе после сбоя `dst` — каталог прошлой попытки: прежние данные, ещё
+/// оставшиеся на месте, дописываются в него, а то, чьё имя в нём уже занято (остатки
+/// прерванного переноса сборки), — в `dst/restore-remnants-<время>/`.
+fn move_old(root: &Path, dst: &Path) -> Result<(), BackupError> {
+    std::fs::create_dir_all(dst)?;
+    let remnants = dst.join(format!("restore-remnants-{}", ts_name()));
     let sys = root.join("system.db");
-    for p in [sys.clone(), side(&sys, "-wal"), side(&sys, "-shm")] {
-        if p.exists() {
-            std::fs::rename(&p, dst.join(p.file_name().unwrap_or_default()))?;
+    let mut items = vec![sys.clone(), side(&sys, "-wal"), side(&sys, "-shm")];
+    items.push(root.join("users"));
+    items.push(root.join("blobs"));
+    for p in items {
+        if !p.exists() {
+            continue;
         }
-    }
-    for d in ["users", "blobs"] {
-        let p = root.join(d);
-        if p.exists() {
-            std::fs::rename(&p, dst.join(d))?;
+        let name = p.file_name().unwrap_or_default().to_os_string();
+        let mut to = dst.join(&name);
+        if to.exists() {
+            std::fs::create_dir_all(&remnants)?;
+            to = remnants.join(&name);
         }
+        super::rename_retry(&p, &to)?;
     }
-    super::sync_dir(&dst)?;
-    Ok(dst)
+    super::sync_dir(dst)?;
+    Ok(())
 }
 
 /// Каталог данных не пуст: `system.db` или её `-wal`/`-shm` (остатки применились бы к
@@ -316,8 +333,9 @@ fn nonempty(root: &Path) -> bool {
         || zam_store::restore_incomplete(root)
 }
 
-/// Признак незавершённого восстановления: пишется до первого изменения каталога данных.
-fn mark_incomplete(root: &Path) -> std::io::Result<()> {
+/// Признак незавершённого восстановления: пишется до первого изменения каталога данных и
+/// хранит каталог прежних данных (`moved_to <путь>`) — повтор после сбоя дописывает в него.
+fn mark_incomplete(root: &Path, moved_to: Option<&Path>) -> std::io::Result<()> {
     let p = root.join(zam_store::RESTORE_INCOMPLETE_FILE);
     let mut f = std::fs::File::create(&p)?;
     writeln!(
@@ -326,13 +344,25 @@ fn mark_incomplete(root: &Path) -> std::io::Result<()> {
         std::process::id(),
         zam_store::time::now()
     )?;
+    if let Some(m) = moved_to {
+        writeln!(f, "moved_to {}", m.display())?;
+    }
     f.sync_all()?;
     super::sync_dir(root)
 }
 
+/// Каталог прежних данных прерванного восстановления (из признака), если он есть.
+fn incomplete_moved_to(root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join(zam_store::RESTORE_INCOMPLETE_FILE)).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("moved_to "))
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+}
+
 /// Перенос проверенной сборки на место: `system.db`, `users/`, `blobs/` — переименованием.
 fn place_staged(staging: &Path, root: &Path) -> Result<(), BackupError> {
-    std::fs::rename(staging.join("system.db"), root.join("system.db"))?;
+    super::rename_retry(&staging.join("system.db"), &root.join("system.db"))?;
     super::fail_point(root, "restore_place")?;
     for d in ["users", "blobs"] {
         let from = staging.join(d);
@@ -342,7 +372,7 @@ fn place_staged(staging: &Path, root: &Path) -> Result<(), BackupError> {
             std::fs::remove_dir_all(&to)?;
         }
         if from.is_dir() {
-            std::fs::rename(&from, &to)?;
+            super::rename_retry(&from, &to)?;
         } else {
             std::fs::create_dir_all(&to)?;
         }
@@ -383,11 +413,12 @@ fn place(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
-    mark_incomplete(root)?;
-    let mut moved = None;
+    // прежние данные — в каталог прерванной попытки (если была), иначе в новый
+    let moved = busy.then(|| incomplete_moved_to(root).unwrap_or_else(|| new_pre_restore(root)));
+    mark_incomplete(root, moved.as_deref())?;
     let res = (|| {
-        if busy {
-            moved = Some(move_old(root)?);
+        if let Some(dst) = &moved {
+            move_old(root, dst)?;
         }
         place_staged(&staging, root)
     })();

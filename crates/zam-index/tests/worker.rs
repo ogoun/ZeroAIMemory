@@ -877,6 +877,39 @@ async fn interrupted_reindex_is_resumed_on_start() {
     w.shutdown().await;
 }
 
+/// Отметка reindex **одного пространства** (прерванный `reindex --space`) не отменяет
+/// пересборку базы при новой коллекции: точки получают все пространства (ревью 18a, N1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn space_reindex_mark_does_not_skip_rebuild_of_other_spaces() {
+    let e = env("space-mark").await;
+    let a = e.note(e.knowledge, "a", NOTE).await;
+    let r = e
+        .note(e.rules, "r", "Правило: перед коммитом — тесты.\n")
+        .await;
+    {
+        let w = e.spawn();
+        e.indexed(a).await;
+        e.indexed(r).await;
+        w.shutdown().await;
+    }
+    e.vector.drop_all().await.unwrap();
+    let spec = format!("{{\"full\":false,\"space\":\"{}\"}}", e.knowledge);
+    mark_reindex(&e.db, Some(spec)).await.unwrap();
+    let w = e.spawn();
+    // новая запись: коллекцию создаёт `ensure` (как в `dropped_collection_is_rebuilt_*`)
+    let n = e
+        .note(e.knowledge, "n", "Отдельная заметка о деплое.\n")
+        .await;
+    w.notify();
+    e.indexed(n).await;
+    e.until("точки обоих пространств", async || {
+        e.count(Some(e.knowledge), Some("a"), &[]).await == e.chunks(a).await
+            && e.count(Some(e.rules), Some("r"), &[]).await == e.chunks(r).await
+    })
+    .await;
+    w.shutdown().await;
+}
+
 /// Сборка мусора кэша в простое: сироты уходят, живые ключи остаются.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_gc_removes_orphan_embeddings() {

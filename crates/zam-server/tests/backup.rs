@@ -1849,3 +1849,119 @@ async fn backup_owner_only_permissions() {
     assert_eq!(mode(&rep.path.join(MANIFEST_FILE)), 0o600);
     stop(a).await;
 }
+
+// ---------------------------------------------------------------- повторное ревью 18a
+
+/// Делает файл «старым» (время изменения — `h` часов назад).
+fn age_file(p: &Path, h: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(h * 3600))
+        .unwrap();
+}
+
+/// N2: удаляются только свои брошенные сборки — `yyyy-MM-dd_HHmmss.partial` каталога копий и
+/// `<архив>.partial`/`<архив>.tmp` (любое расширение архива); чужие `*.partial`/`*.tmp` остаются.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_cleans_only_own_partials() {
+    let (a, _) = seeded("bk-own-partials").await;
+    let mut cfg = cfg_of(&a);
+    cfg.backup.flag_max_hours = 1;
+    let copies = cfg.backup.dir(&cfg.data_dir);
+    let out = common::tmp("bk-own-partials-out");
+    std::fs::create_dir_all(&copies).unwrap();
+    let mine = [
+        copies.join("2026-01-01_000000.partial"),
+        out.join("copy.bin.tmp"),
+        out.join("copy.bin.partial"),
+    ];
+    let foreign = [
+        copies.join("notes.partial"),
+        copies.join("x.zip.tmp"),
+        out.join("other.zip.tmp"),
+        out.join("my.partial"),
+        out.join("copy.tmp"),
+    ];
+    for p in mine.iter().chain(&foreign) {
+        std::fs::write(p, b"x").unwrap();
+        age_file(p, 2);
+    }
+    run_backup(&cfg, BackupOpts::default()).await.unwrap();
+    run_backup(
+        &cfg,
+        BackupOpts {
+            dir: None,
+            zip: Some(out.join("copy.bin")),
+        },
+    )
+    .await
+    .unwrap();
+    for p in &mine {
+        assert!(!p.exists(), "своя сборка осталась: {}", p.display());
+    }
+    for p in &foreign {
+        assert!(p.exists(), "чужой файл удалён: {}", p.display());
+    }
+    stop(a).await;
+}
+
+/// N3: повторные сбои восстановления складывают прежние данные в один `pre-restore-…`
+/// (из признака незавершённого восстановления), остатки прерванного переноса — в его
+/// `restore-remnants-…`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_repeated_failures_single_pre_restore() {
+    let (copy, _, user, _) = copy_of("rs-repeat").await;
+    let dst = dst_cfg("rs-repeat-dst");
+    let old = api_with(dst.clone()).await;
+    let old_admin = uid(&old);
+    stop(old).await;
+    let opts = RestoreOpts {
+        replace: true,
+        ..RestoreOpts::default()
+    };
+    let mut first = None;
+    for _ in 0..2 {
+        test_hooks::set_fail_point(&dst.data_dir, Some("restore_place"));
+        let r = restore(&dst, &copy, &opts).await;
+        test_hooks::set_fail_point(&dst.data_dir, None);
+        match r {
+            Err(BackupError::RestoreFailed {
+                moved_to: Some(m), ..
+            }) => {
+                assert_eq!(
+                    first.get_or_insert(m.clone()),
+                    &m,
+                    "один каталог прежних данных"
+                );
+            }
+            other => panic!("ожидался RestoreFailed с moved_to: {other:?}"),
+        }
+    }
+    let rep = restore(&dst, &copy, &opts).await.unwrap();
+    let pre = first.unwrap();
+    assert_eq!(rep.moved_to.as_ref(), Some(&pre));
+    let pres: Vec<_> = std::fs::read_dir(dst.data_dir.join("backups"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        .collect();
+    assert_eq!(pres.len(), 1, "{:?}", tree(&dst.data_dir.join("backups")));
+    // прежние данные целы и на месте в одном каталоге
+    assert!(pre.join("users").join(format!("{old_admin}.db")).is_file());
+    let sys = pre.join("system.db");
+    assert_eq!(
+        count(
+            &sys,
+            &format!("SELECT count(*) FROM users WHERE id = '{old_admin}'")
+        ),
+        1
+    );
+    assert!(
+        dst.data_dir
+            .join("users")
+            .join(format!("{user}.db"))
+            .is_file()
+    );
+}
