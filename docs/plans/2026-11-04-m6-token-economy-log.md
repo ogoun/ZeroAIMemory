@@ -5162,13 +5162,112 @@ PASS.
   `guide`: строки «правка затрагивает» в напоминании `Stop`.
 - **→ 13b:** `hook_budgets` на release с `checkpoint_impact = true`; матрица совместимости —
   `zam` M6 ↔ сервер v0.0.10-m5.7 с `hooks.holdout > 0` (400 молча, тест на заглушке есть).
-- **→ контролёру (вопрос):** holdout гасит только `/recall` (как в §12); локальный вывод хуков
-  без сети — знание о файле `pre-tool`/`post-tool`, триггеры `pre-tool`, напоминание `checkpoint`
-  — в контрольной группе остаётся. Для чистого контроля их тоже стоит гасить (клиент знает
-  метку из ответа `/recall` старта — нужен маркер в кэше сессии). Не делалось: вне §12 и брифа.
+- ~~**→ контролёру (вопрос):** holdout гасит только `/recall`~~ — решено контролёром (ревью,
+  I4): маркер кэша и полная тишина клиента, см. «Правки ревью задачи 12».
 - **→ 12 (A/B, владельцу):** запасные точки `post_tool_coverage` `{2, 4, plain}` и
   `{3, 6, plain}` (задача 9) и `recall.brief_tokens` 500 (8c) — кандидаты для пары плеч, если
   прогон покажет потерю подсказок `post_tool` или много субагентов; плечи — через `ZAM_*`
   сервера, в `tasks.toml` не заведены (сервер один на оба плеча).
 - **→ M7:** счёт токенов памяти субагентов `<сессия>:<agent_id>` в отчёте A/B (сейчас — только
   сессия прогона; субагентские сессии сервера не суммируются).
+
+### Правки ревью задачи 12 (2026-11-09)
+
+Коммит `35cd2ce` `fix(ab): правки ревью задачи 12 — тихая контрольная группа, бюджет метки,
+отчёт без пустышек`. Ревью — Changes requested (I1–I4, M1–M7), всё исправлено в этом круге.
+
+- **I1** `post_tool.rs`: ответ `/recall(post_tool)` с `holdout: true` — `Output::Empty` до
+  локальных `error_regex` и строки петли, маркер сессии ставится. Тест
+  `post_tool_error_regex_silent_in_holdout` (кэш триггеров с `error_regex`, сессия с меткой на
+  сервере, три повтора — тишина; обычная сессия — локальная подсказка; журнал ведётся).
+- **I2** `session_start.rs`: метка — `env.client_within(HOLDOUT_MS = 100)`, `/recall` после неё —
+  новым `env.client()` по остатку бюджета (нет времени — ошибка «бюджет исчерпан», без запроса).
+  Тест `session_start_holdout_within_budget` (заглушка не отвечает ни на метку, ни на `/recall`:
+  лучший из 5 запусков < 450 мс; прежняя схема — 270 + 270 мс сроков). `hook_budgets` — вид
+  `session-start-holdout`: `hooks.holdout = 0.5`, 40 сессий из группы (по `holdout_pick`),
+  ожидается тишина и метка на сервере у каждой.
+- **I3** `ab.rs`: прогон без журнала — ошибка с перечнем сессий; `--allow-missing` — отдельный
+  список `missing` (`{task, arm, rep, session, outcome}`) и раздел «Без журнала», в `run`,
+  агрегаты плеч и сравнения не входит (плечо только из пустышек в `arms` не появляется), память
+  для них не запрашивается. Тесты: пустышка в фикстуре `ab_report_on_fixture` (все агрегаты — как
+  без неё), `ab_missing_transcript_and_bad_outcome` (без флага — ошибка, отчёта нет).
+- **I4 (решение контролёра)** маркер `cache/holdout-<сессия>` (`cache::{mark_holdout,
+  is_holdout, note_holdout}`, в уборке `gc_cache` — как `edits-*`): ставит `session-start`
+  (метка прошла или ответ `/recall` с `holdout: true`; ответ без неё — снимает), а также ответы
+  `prompt`, `post-tool` и `GET /sessions/{id}` у `checkpoint` с `holdout: true`. С маркером
+  `hook::handle` возвращает `Output::Empty` у любого хука после его служебной работы (журнал,
+  очереди, привязка MCP, `flush_tokens`, синхронизация карты); `note_tokens` не пишет учёт
+  локального вывода; `checkpoint` не шлёт `/code/impact`. Субагенты Claude Code и Codex шлют
+  события с id родителя — маркер покрывает и их. Тест `holdout_marker_silences_all_hooks`
+  (сессия из группы по `holdout_pick`: `pre-tool` с `file_glob`, `post-tool` `Read` со знанием о
+  файле, `checkpoint` — тишина, очереди `tokens-…` нет, журнал ведётся; сессия вне группы — всё
+  выводится). `checkpoint_impact_lines_inside_single_reminder` (сессия `ci-3`) теперь ждёт
+  тишину целиком и маркер. README — что гасится, что остаётся, остаточный канал (блок
+  инструкции и MCP, допустим по §12).
+- **M1** `ab.rs`: разбор каталога — один `Scan`: строка относится к своей `sessionId` (без неё —
+  сессия файла: `session_meta`, последняя `sessionId`, имя файла), сообщение Claude Code — раз на
+  (сессия, `message.id`) по всему каталогу; Codex — последний итог каждого файла, итоги файлов
+  сессии складываются. README: предупреждение про несколько rollout-файлов и `codex resume`.
+- **M2** `est_p`: не посчитанная оценка (`null`) — «—».
+- **M3** `consistency_warnings`: плечо `holdout` с `holdout = false`, `main` с `true`, `off` с
+  памятью > 0 — в `warnings` и раздел «Предупреждения».
+- **M4** README: проверка плеча `off` — нет MCP и хуков пользовательского уровня, нет блока в
+  `~/.claude/CLAUDE.md` (`~/.codex/AGENTS.md`) и в инструкциях worktree.
+- **M5** `checkpoint.rs`: `peek_changed` и `journal::read` — в потоке влияния; поток сообщает
+  каналом, что очередь прочитана, и `flush_changed` ждёт этого до `IMPACT_READ_WAIT` (50 мс).
+  Тест — вариант `session_journal = false` в `checkpoint_impact_timeout_60ms_no_lines` (путь —
+  только из очереди, очередь отправлена тем же `checkpoint`).
+- **M6** `sessions.rs`: наследование — только в сторону `true`: `holdout: false` у сессии с
+  родителем контрольной группы (родитель — `parent_id` тела или строки) оставляет `true`,
+  ответ — `holdout: true`; задокументировано в модуле. Тест — в
+  `holdout_empty_text_and_inherited`.
+- **M7** копия `holdout_pick` в `tests/common` (`zam` — только бинарник), закреплённые значения
+  `pin-0..7` при p = 0,5 — в юнит-тесте хука и `hooks::holdout_pick_copy_pinned`;
+  `session_start_holdout_quiet_group` сверяет группу каждой сессии с ней.
+
+**Тесты** (окно 2026-11-09 00:45–01:20; параллельно — чужие `cargo` 254868 и 263380/253172 без
+постоянного `rustc`):
+- `xtask --test ab` — 3, `--bin xtask ab::` — 5;
+- `zam-server --test sessions` — 17;
+- `zam-cli --bin zam hook::` — 48, `--test hooks` — 72 (новые: `post_tool_error_regex_silent_in_holdout`,
+  `holdout_marker_silences_all_hooks`, `session_start_holdout_within_budget`,
+  `holdout_pick_copy_pinned`), `--test m4_acceptance` — 5;
+- `hook_budgets` (debug, 2026-11-09 ~01:07, под чужой сборкой): `checkpoint` (с
+  `checkpoint_impact`) p50 24,2 мс, p95 88,7, max 109,1, тайм-аутов 2 из 40 (≤ 5 %), строк
+  влияния 40/40; `session-start-holdout` n=40 p50 46,3, p95 88,7, max 89,5, ответов 0 (тишина),
+  тайм-аутов 0; `session-start` p95 70,1. Перепрогон в тихом окне 01:28:06–01:29:44 (из чужих —
+  только простаивающий `cargo` 254868, `rustc` нет): `checkpoint` p50 29,3, **p95 34,8, max
+  90,2 мс** (бюджет 100), тайм-аутов 0, строк влияния 40/40; `session-start-holdout` p95 60,2,
+  max 108,4, тайм-аутов 0, ответов 0 (тишина); `session-start` p95 109,2, `subagent-start` 75,4;
+- fmt, `clippy --workspace --all-targets -D warnings`, `clippy -p zam-cli --features
+  test-hooks` — чисто.
+
+**Откаты второго круга** (`.tmp/m6/task12/rollback2.{py,log}`, правка → тест → `git checkout`):
+- R9 (I1) `post_tool.rs`: `holdout` ответа не гасит локальные → `post_tool_error_regex_silent_in_holdout` FAIL;
+- R10 (I4) `mod.rs`: без общей тишины по маркеру → `holdout_marker_silences_all_hooks` FAIL;
+- R11 (I4) `cache.rs`: `note_tokens` учитывает и в группе → тот же тест FAIL (первая версия теста
+  смотрела очередь после `checkpoint`, который её отправил, — откат прошёл незамеченным; тест
+  переделан: очередь сверяется до `checkpoint`, коммит `79a3631`, откат повторён — FAIL);
+- R12 (I4) `session_start.rs`: маркер не ставится → тот же тест FAIL;
+- R13 (I2) `session_start.rs`: метка и `/recall` одним клиентом со сроком старта →
+  `session_start_holdout_within_budget` FAIL;
+- R14 (M5) `checkpoint.rs`: поток влияния не читает очередь → `checkpoint_impact_timeout_60ms_no_lines`
+  FAIL (вариант без журнала);
+- R15 (M6) `sessions.rs`: `holdout: false` снимает унаследованную метку → `holdout_empty_text_and_inherited` FAIL;
+- R16 (I3) `ab.rs`: пустышка входит в агрегаты → `ab_report_on_fixture` FAIL;
+- R17 (I3) `ab.rs`: без `--allow-missing` не ошибка → `ab_missing_transcript_and_bad_outcome` FAIL;
+- R18 (M1) первая формулировка отката (сессия файла вместо строки) оказалась тождественной коду
+  (сессия файла обновляется каждой строкой) — PASS не означал дыры; правильный откат R18b
+  «весь файл — к первой `sessionId`» → `ab::tests::claude_dedup_by_session_and_message_id` FAIL;
+- R19 (M1) дедупликация по файлу, а не по каталогу → тот же тест FAIL;
+- R20 (M2) «0.000» вместо «—» → `est_null_is_dash` FAIL;
+- R21 (M3) без предупреждения `off` с памятью → `consistency_warned` FAIL;
+- R22 (M7) соль хэша хука изменена → `holdout_pick_copy_pinned` и `session_start_holdout_quiet_group`
+  FAIL (и юнит-тест хука с закреплёнными значениями).
+
+Дерево после откатов чистое. R4 первого круга (строки влияния в holdout) теперь перекрыт общей
+тишиной I4: `if !holdout` в `reminder` оставлен как вторая защита (маркер мог не записаться).
+
+**Передать.** → 13a/13c: в CHANGELOG и ТЗ — маркер `cache/holdout-<сессия>` и полная тишина
+контрольной группы на клиенте, `--allow-missing` у `cargo xtask ab`, наследование `holdout`
+только в сторону `true`.
