@@ -401,12 +401,18 @@ mod tests {
     use super::*;
     use crate::test_util::dir_in_target;
 
+    /// Каталог моделей тестов: `ZAM_TEST_MODELS_DIR` (как у интеграционных тестов,
+    /// `tests/common/ml.rs`), иначе `<repo>/target/models`.
     fn repo_models() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("models")
+        std::env::var_os("ZAM_TEST_MODELS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("target")
+                    .join("models")
+            })
     }
 
     /// Без эмбеддера (ORT нет) счётчик и окно берутся из токенизатора и описателя модели.
