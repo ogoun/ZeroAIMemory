@@ -49,9 +49,9 @@ fn bad(msg: impl Into<String>) -> StoreError {
     StoreError::BadInput(msg.into())
 }
 
-const ATT_COLS: &str = "entry_id, blob_sha256, filename, mime, size, created_at";
+pub(crate) const ATT_COLS: &str = "entry_id, blob_sha256, filename, mime, size, created_at";
 
-fn att_row(r: &Row) -> rusqlite::Result<EntryAttachment> {
+pub(crate) fn att_row(r: &Row) -> rusqlite::Result<EntryAttachment> {
     let size: i64 = r.get(4)?;
     Ok(EntryAttachment {
         entry_id: r.get(0)?,

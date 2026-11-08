@@ -529,39 +529,19 @@ fn clean_zip_leftovers(zip: &Path, max_age: Duration) {
     }
 }
 
-/// Суммарное ожидание повторов [`rename_retry`].
-const RENAME_RETRY_TOTAL: Duration = Duration::from_secs(10);
-
-/// `rename` с повтором на Windows: антивирус и индексатор ненадолго держат только что
-/// записанные файлы (`ERROR_ACCESS_DENIED` 5, `ERROR_SHARING_VIOLATION` 32). Паузы растут
-/// вдвое от 50 мс, пока сумма не превысит [`RENAME_RETRY_TOTAL`]; каждая — WARN с номером
-/// попытки и кодом. На других ОС — одна попытка.
+/// `rename` с повтором на Windows ([`zam_core::fsx::rename_retry`]); каждая пауза — WARN с
+/// номером попытки и кодом.
 pub(crate) fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    let (mut attempt, mut pause, mut waited) = (1u32, Duration::from_millis(50), Duration::ZERO);
-    loop {
-        match std::fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e)
-                if cfg!(windows)
-                    && matches!(e.raw_os_error(), Some(5 | 32))
-                    && waited + pause <= RENAME_RETRY_TOTAL =>
-            {
-                tracing::warn!(
-                    from = %from.display(),
-                    to = %to.display(),
-                    attempt,
-                    code = e.raw_os_error().unwrap_or_default(),
-                    pause_ms = pause.as_millis() as u64,
-                    "переименование не удалось (файл занят), повтор"
-                );
-                std::thread::sleep(pause);
-                waited += pause;
-                pause *= 2;
-                attempt += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    zam_core::fsx::rename_retry(from, to, |attempt, code, pause| {
+        tracing::warn!(
+            from = %from.display(),
+            to = %to.display(),
+            attempt,
+            code,
+            pause_ms = pause.as_millis() as u64,
+            "переименование не удалось (файл занят), повтор"
+        );
+    })
 }
 
 /// Как читать базу `src`: при чужом локе — `QueryOnly`; под своим — `immutable=1`, если WAL

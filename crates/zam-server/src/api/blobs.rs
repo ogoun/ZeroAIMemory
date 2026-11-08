@@ -306,7 +306,7 @@ pub async fn remove(
 #[derive(Deserialize, Default)]
 pub struct BlobQuery {
     /// Пользователь (только для администратора).
-    user: Option<String>,
+    pub(crate) user: Option<String>,
 }
 
 /// Показывается в браузере сам (`inline`); остальное — только скачивание.
@@ -481,7 +481,7 @@ pub async fn download(
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
     check_sha(&sha)?;
-    admin_user(&p, &mut headers, &q)?;
+    admin_user(&p, &mut headers, q.user.as_deref())?;
     let (owner, mime) = locate_blob(&st, &p, &headers, &sha, &filename).await?;
     serve(&st, owner, &sha, &filename, &mime, method, &headers).await
 }
@@ -502,10 +502,10 @@ pub(crate) fn check_sha(sha: &str) -> Result<(), ApiError> {
 pub(crate) fn admin_user(
     p: &Principal,
     headers: &mut HeaderMap,
-    q: &BlobQuery,
+    user: Option<&str>,
 ) -> Result<(), ApiError> {
     if p.is_admin()
-        && let Some(u) = q.user.as_deref()
+        && let Some(u) = user
     {
         let v = HeaderValue::from_str(u)
             .map_err(|_| ApiError::BadRequest("некорректный user".into()))?;

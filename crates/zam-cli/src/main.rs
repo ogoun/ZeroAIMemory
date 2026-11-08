@@ -32,6 +32,26 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Экспорт пространства в архив .zip (заметки .md, вложения, журналы, связи, история)
+    Export {
+        /// Пространство: rules | human | knowledge | solution | GUID | id (иначе решение или knowledge)
+        #[arg(long)]
+        space: Option<String>,
+        /// Только заметки под префиксом пути (можно повторять)
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Только записи журнала этого вида (можно повторять)
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Без истории ревизий
+        #[arg(long)]
+        no_history: bool,
+        /// Файл архива
+        #[arg(short = 'o', long = "out", required = true)]
+        out: PathBuf,
+        #[command(flatten)]
+        common: Common,
+    },
     /// Дерево пространства с L0: [space:]path (без префикса — решение или knowledge)
     Tree {
         target: Option<String>,
@@ -1587,6 +1607,23 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         }),
         Cmd::Guide { lang, common } => cmd::guide::run(&cmd::connect(&common)?, &lang),
         Cmd::Mcp { common } => cmd::mcp::run(cmd::connect(&common)?),
+        Cmd::Export {
+            space,
+            paths,
+            kinds,
+            no_history,
+            out,
+            common,
+        } => cmd::transfer::export(
+            &mut cmd::connect(&common)?,
+            &cmd::transfer::ExportArgs {
+                space: space.as_deref(),
+                paths: &paths,
+                kinds: &kinds,
+                no_history,
+                out: &out,
+            },
+        ),
         Cmd::Tree {
             target,
             depth,

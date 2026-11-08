@@ -147,7 +147,7 @@ pub async fn attachment(
     }
     let q = query(q)?;
     blobs::check_sha(&sha)?;
-    blobs::admin_user(&p, &mut headers, &q)?;
+    blobs::admin_user(&p, &mut headers, q.user.as_deref())?;
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
     if sc.entry.kind != EntryKind::Report {

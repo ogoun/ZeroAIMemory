@@ -21,6 +21,7 @@ pub mod datadir;
 pub mod db;
 pub mod embeddings;
 pub mod entries;
+pub mod export;
 pub mod file_refs;
 pub mod glossary;
 pub mod graph;
@@ -98,6 +99,10 @@ pub use entries::{
     has_certainty, initial_status, is_entry_ref_letter, list_entries, normalize_area,
     normalize_title, reindex_entries_page, restore_entry, retract_entry, set_triggers,
     supersede_entry, title_duplicates, update_entry, validate_trigger,
+};
+pub use export::{
+    EntryDump, ExportSelect, NodeRevision, NoteAttachment, NoteDump, RefRow, SpaceDump,
+    export_space, under_prefix,
 };
 pub use file_refs::{
     ChangedFile, FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit,

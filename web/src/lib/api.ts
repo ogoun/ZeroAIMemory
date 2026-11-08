@@ -399,6 +399,14 @@ export const detachAttachment = (user: string, node: string, sha: string, filena
 export const blobUrl = (user: string, sha: string, filename: string) =>
   `api/v1/blobs/${q(sha)}/${q(filename)}?user=${q(user)}`;
 
+/**
+ * Адрес архива экспорта пространства (M6 §12б.5): zip с заметками, вложениями, журналами,
+ * связями и историей; браузер скачивает его по ссылке (cookie сессии), у администратора
+ * пользователь — параметром `user`, как у вложений.
+ */
+export const exportUrl = (user: string, space: string) =>
+  `api/v1/spaces/${q(space)}/export?user=${q(user)}`;
+
 /** Байты файла вложения (просмотрщики PDF и DOCX разбирают его в браузере). */
 export const blobBytes = async (user: string, sha: string, filename: string): Promise<ArrayBuffer> =>
   (await request('GET', `blobs/${q(sha)}/${q(filename)}`, { user })).arrayBuffer();

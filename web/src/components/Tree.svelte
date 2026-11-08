@@ -16,6 +16,7 @@
     ApiError,
     createNode,
     deleteNode,
+    exportUrl,
     listChildren,
     listSpaces,
     listTrash,
@@ -236,8 +237,20 @@
         { label: 'Переименовать/переместить', action: () => askMove(t, node) },
         { label: 'Удалить', danger: true, action: () => askDelete(t, node) },
       );
+    } else {
+      items.push({ label: 'Экспорт (.zip)', action: () => download(exportUrl(t.uid, spaceRef(t.space))) });
     }
     return items;
+  }
+
+  /** Скачивание по ссылке (архив экспорта): имя файла даёт `Content-Disposition` сервера. */
+  function download(url: string) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    document.body.append(a);
+    a.click();
+    a.remove();
   }
 
   function menuAt(e: MouseEvent, t: Target) {
