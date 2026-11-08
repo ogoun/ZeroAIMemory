@@ -489,6 +489,20 @@ fn aa_gate(a: &[CaseRun], b: &[CaseRun]) -> AaGate {
     }
 }
 
+/// Срок сбора подсказок сетки, мс: срок 200 мс по умолчанию на длинных ошибках (FTS по 100
+/// находкам) отдаёт неполный ответ с `recall timeout`, и A/A расходится (ревью задачи 9);
+/// сетка мерит отбор, а не срок, — как протокол эталона идей (`timeout_ms = 60000`).
+const GRID_TIMEOUT_MS: &str = "60000";
+
+/// Переопределения `--set` и срок сбора [`GRID_TIMEOUT_MS`] (если `--set` его не задал).
+fn grid_sets(raw: &[String]) -> Result<Vec<(String, String)>> {
+    let mut sets = run::parse_sets(raw)?;
+    if !sets.iter().any(|(k, _)| k == "recall.timeout_ms") {
+        sets.push(("recall.timeout_ms".into(), GRID_TIMEOUT_MS.into()));
+    }
+    Ok(sets)
+}
+
 /// `cargo xtask eval --hints --grid <файл>`.
 pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, grid_path: &Path) -> Result<()> {
     let (rule, points) = load(grid_path)?;
@@ -514,7 +528,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, grid_path: &Path) -> Result
         model: model.clone(),
         device: if only_fts { Device::Cpu } else { a.device },
         reranker: None,
-        sets: run::parse_sets(&a.sets)?,
+        sets: grid_sets(&a.sets)?,
         keep_cuda_path: a.keep_cuda_path,
         ctrl_break: false,
     };
@@ -578,6 +592,14 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, grid_path: &Path) -> Result
         for c in &cases {
             let mut r = case_run(c);
             api_case(&s, &refs, c, &mut r).with_context(|| format!("{}: {}", pt.name, c.id))?;
+            if r.warnings.iter().any(|w| w == super::WARN_RECALL_TIMEOUT) {
+                bail!(
+                    "{}: {}: {} — сбор подсказок не уложился в recall.timeout_ms, точка неполна",
+                    pt.name,
+                    c.id,
+                    super::WARN_RECALL_TIMEOUT
+                );
+            }
             rs.push(r);
         }
         s.stop()?;
@@ -587,10 +609,16 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, grid_path: &Path) -> Result
     }
     let aa = aa_gate(&runs[0], &runs[1]);
     if only_fts && !aa.identical {
+        let detail: Vec<String> = runs[0]
+            .iter()
+            .zip(&runs[1])
+            .filter(|(x, y)| x.shown != y.shown)
+            .map(|(x, y)| format!("{}: {:?} / {:?}", x.id, x.shown, y.shown))
+            .collect();
         bail!(
-            "A/A-гейт FTS не пройден: первая точка дважды разошлась в {:?} — FTS обязан совпасть \
+            "A/A-гейт FTS не пройден: первая точка дважды разошлась — {} — FTS обязан совпасть \
              побайтово (методика, правило 2)",
-            aa.differing
+            detail.join("; ")
         );
     }
     let base_runs = runs[1].clone();
