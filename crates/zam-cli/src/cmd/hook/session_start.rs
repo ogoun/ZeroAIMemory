@@ -28,6 +28,13 @@
 //! M5.6 §5: после запросов хука (их бюджет — не делить с синхронизацией за тот же сервер) —
 //! запуск фоновой `zam code sync --background`, если пора
 //! ([`crate::cmd::code::auto::maybe_spawn_sync`]; сервер для запуска не нужен).
+//! M6 §12: `hooks.holdout = p` (клиент, 0..=0,5) — контрольная группа агентного A/B: сессия
+//! попадает в неё с вероятностью p по хэшу своего id ([`holdout_pick`]: решение одно и то же на
+//! каждом старте сессии, в том числе после compact, и не требует состояния). Такой сессии хук
+//! шлёт отдельный `POST /sessions {id, holdout: true}` **до** `/recall` того же потока: сервер
+//! отдаёт пустой `text` уже первому дайджесту. Старый сервер отвечает 400 (неизвестное поле) —
+//! хук молча продолжает без контрольной группы. Ответ `/recall` с `holdout: true` (метка на
+//! сервере — в том числе поставленная раньше или унаследованная) — тишина: и без сводки журнала.
 //! M6 §7.1: каждый старт с `session_id` (новая сессия, `/clear`, `resume`, `compact`) пишет
 //! привязку `zam mcp` к сессии — `cache/agent-<pid>.json` ([`binding::write_binding`]) без сети.
 //! M6, задача 5: локальная запись идёт в своём потоке параллельно запросам и не тратит их
@@ -176,6 +183,8 @@ fn digest_net(
             let c = &client;
             sc.spawn(move || c.post_json("/sessions", &body).map(|_| ()))
         });
+        // контрольная группа A/B (M6 §12): метка — до `/recall`, в том же потоке
+        let hold = session.filter(|id| holdout_pick(id, s.holdout()));
         let recall = {
             let mut body = json!({
                 "event": "session_start",
@@ -199,7 +208,12 @@ fn digest_net(
                 body["agent_block_version"] = json!(v);
             }
             let c = &client;
-            sc.spawn(move || c.post_json("/recall", &body).and_then(read_json))
+            sc.spawn(move || {
+                if let Some(id) = hold {
+                    set_holdout(env, c, id);
+                }
+                c.post_json("/recall", &body).and_then(read_json)
+            })
         };
         let trig = sc.spawn(|| cache::refresh_triggers(env, &client, false));
         // очередь учёта локального вывода прошлой сессии хуков (M4.5 §9.5)
@@ -271,8 +285,10 @@ fn digest_net(
     let now = Settings {
         client: s.client,
         server,
+        keys: s.keys,
     };
-    if !now.on(Kind::SessionStart) {
+    // контрольная группа A/B (M6 §12): ни дайджеста, ни сводки журнала
+    if !now.on(Kind::SessionStart) || v["holdout"].as_bool() == Some(true) {
         return Output::Empty;
     }
     // сводка — та же, если флаги сервера её не изменили (журнал читается один раз)
@@ -293,6 +309,42 @@ fn digest_net(
     }
     let text = output::with_tail(head, &tail, env.agent);
     Output::context(&inp.event, &text)
+}
+
+/// Соль хэша контрольной группы A/B (смена — новое разбиение сессий).
+const HOLDOUT_SALT: &[u8] = b"zam-holdout-v1\0";
+
+/// Сессия `id` — в контрольной группе A/B при доле `p` (M6 §12): первые 8 байт
+/// blake3(соль ‖ id) как доля от 2^64 меньше `p`. Детерминировано: повторный старт той же сессии
+/// (compact, resume) даёт то же решение; `p = 0` — никогда.
+pub fn holdout_pick(id: &str, p: f64) -> bool {
+    if p <= 0.0 {
+        return false;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(HOLDOUT_SALT);
+    h.update(id.as_bytes());
+    let b = h.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&b.as_bytes()[..8]);
+    (u64::from_le_bytes(first) as f64 / 18_446_744_073_709_551_616.0) < p
+}
+
+/// `POST /sessions {id, holdout: true}` (M6 §12) — отдельный запрос: старый сервер
+/// (`deny_unknown_fields`) отвечает 400 про неизвестное поле `holdout` — молча; прочее — в
+/// `hooks.log` (`sessions(holdout): …`).
+fn set_holdout(env: &Env, client: &crate::client::Client, id: &str) {
+    let body = json!({"id": id, "holdout": true});
+    match client.post_json("/sessions", &body) {
+        Ok(_) => {}
+        Err(e)
+            if e.http_status() == Some(400)
+                && e.problem
+                    .as_ref()
+                    .and_then(|p| p["detail"].as_str())
+                    .is_some_and(|d| d.contains("holdout")) => {}
+        Err(e) => env.log(&format!("sessions(holdout): {e}")),
+    }
 }
 
 /// Версия блока инструкции (R2): маркер `<!-- zeroaimemory:begin vN -->` ближайшего
@@ -349,6 +401,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Доля контрольной группы по хэшу близка к p, решение детерминировано, `p = 0` — никого.
+    #[test]
+    fn holdout_pick_share_and_determinism() {
+        let ids: Vec<String> = (0..4000).map(|i| format!("s-{i}")).collect();
+        for p in [0.1, 0.25, 0.5] {
+            let n = ids.iter().filter(|id| holdout_pick(id, p)).count() as f64;
+            let share = n / ids.len() as f64;
+            assert!((share - p).abs() < 0.03, "p={p}: {share}");
+        }
+        assert!(ids.iter().all(|id| !holdout_pick(id, 0.0)));
+        // меньшая доля — подмножество большей (одна и та же сессия не «перескакивает»)
+        assert!(
+            ids.iter()
+                .filter(|id| holdout_pick(id, 0.1))
+                .all(|id| holdout_pick(id, 0.5))
+        );
+        assert_eq!(holdout_pick("s-7", 0.5), holdout_pick("s-7", 0.5));
     }
 
     #[test]

@@ -17,7 +17,8 @@
 //!   срока сессии (аналитика). Показ идей — без эпохи (§7.2, «одна идея — один показ за
 //!   сессию»): раздел идей дайджеста читает [`seen_entry_ids`], подсказка идей к запросу —
 //!   [`seen_revs_any_epoch`];
-//! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12);
+//! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12); признак с
+//!   наследованием от родителя — [`session_holdout`];
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
 //!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя;
 //! - `session_tokens` — выданное сессии по событию (§9.5): число выдач `calls`, оценка размера в
@@ -698,6 +699,27 @@ pub async fn session_epoch(db: &Db, session: &str) -> Result<u32, StoreError> {
 
 fn epoch_u32(v: i64) -> Result<u32, StoreError> {
     u32::try_from(v).map_err(|_| StoreError::Corrupt(format!("sessions.seen_epoch = {v}")))
+}
+
+/// Сессия — в контрольной группе агентного A/B (M6 §12): `holdout` у неё самой, у её родителя
+/// (`parent_id` строки) или у `parent` (родитель из запроса: `brief` субагента приходит
+/// параллельно с регистрацией его сессии). Сессии нет — по `parent`.
+pub async fn session_holdout(
+    db: &Db,
+    session: &str,
+    parent: Option<&str>,
+) -> Result<bool, StoreError> {
+    let (id, parent) = (session.to_string(), parent.map(str::to_string));
+    db.read(move |c| {
+        let on: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE holdout = 1 AND (id = ?1 OR id = ?2
+               OR id = (SELECT parent_id FROM sessions WHERE id = ?1)))",
+            params![id, parent],
+            |r| r.get(0),
+        )?;
+        Ok(on)
+    })
+    .await
 }
 
 /// Признак `holdout` сессии (контрольная группа агентного A/B, M6 §12) с обращением; сессии

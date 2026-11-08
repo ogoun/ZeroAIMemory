@@ -16,6 +16,12 @@
 //!   продолжает. Без `id` — 400; сессии нет — она создаётся с эпохой 1. Прочие источники
 //!   новой эпохи — `/recall` (`session_start` с `source` `compact | resume | clear`,
 //!   `event: recovery`);
+//! - `POST /sessions {id, holdout: true|false}` → 201 `{id, holdout}` (M6 §12): контрольная
+//!   группа агентного A/B — в такой сессии `/recall` хуков отдаёт пустой `text` (учёт ведётся,
+//!   [`super::recall`]); `false` снимает. Шлёт хук `session-start` (`hooks.holdout`) отдельным
+//!   запросом: старый сервер отвечает 400, хук молча продолжает. Без `id` — 400. Сессия
+//!   субагента (`parent_id`) при регистрации наследует метку родителя; после compact метка
+//!   остаётся (та же сессия);
 //! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
 //! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, parent_id, agent_type,
 //!   started_at, last_seen_at, ended_at, memory_writes, seen_epoch, claimed_tasks: [{id, title,
@@ -64,7 +70,7 @@ use zam_core::{Id, SolutionGuid};
 use zam_store::{
     Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, bump_epoch,
     claimed_tasks, end_session, get_session, list_sessions, list_spaces, session_epoch,
-    session_tokens, sessions_tokens, touch_session,
+    session_holdout, session_tokens, sessions_tokens, set_holdout, touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -198,6 +204,8 @@ pub struct NewSession {
     tokens: Option<serde_json::Map<String, Value>>,
     /// Новая эпоха `session_seen` (M6 §7.2); нужен `id`.
     new_epoch: Option<bool>,
+    /// Контрольная группа агентного A/B (M6 §12): `true` ставит, `false` снимает; нужен `id`.
+    holdout: Option<bool>,
 }
 
 /// Прибавки `tokens` тела `POST /sessions` (см. модуль).
@@ -263,6 +271,9 @@ pub async fn create(
     if new_epoch && id.is_none() {
         return Err(ApiError::BadRequest("new_epoch: нужен id сессии".into()));
     }
+    if req.holdout.is_some() && id.is_none() {
+        return Err(ApiError::BadRequest("holdout: нужен id сессии".into()));
+    }
     let touch = SessionTouch {
         id: id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
         token_id: p.token_id(),
@@ -280,14 +291,25 @@ pub async fn create(
         Some(t) => add_token_counts(&db, &touch, &t).await?,
         None => touch_session(&db, &touch).await?,
     }
-    if new_epoch {
-        let epoch = bump_epoch(&db, &touch.id).await?;
-        return Ok((
-            StatusCode::CREATED,
-            Json(json!({ "id": touch.id, "epoch": epoch })),
-        ));
+    let mut out = json!({ "id": touch.id });
+    match req.holdout {
+        Some(on) => {
+            set_holdout(&db, &touch.id, on).await?;
+            out["holdout"] = json!(on);
+        }
+        // сессия субагента наследует метку родителя (M6 §12)
+        None => {
+            if let Some(parent) = &touch.parent_id
+                && session_holdout(&db, parent, None).await?
+            {
+                set_holdout(&db, &touch.id, true).await?;
+            }
+        }
     }
-    Ok((StatusCode::CREATED, Json(json!({ "id": touch.id }))))
+    if new_epoch {
+        out["epoch"] = json!(bump_epoch(&db, &touch.id).await?);
+    }
+    Ok((StatusCode::CREATED, Json(out)))
 }
 
 #[derive(Deserialize)]

@@ -3898,3 +3898,332 @@ fn session_start_fits_channel_codex_and_claude() {
     }
     assert!(!p.log().contains("обрезан клиентом"), "{}", p.log());
 }
+
+// ---- M6 §12 (задача 12): влияние диффа в `checkpoint`, контрольная группа `holdout` ----
+
+/// Строка влияния правки в напоминании `Stop` (§12).
+const IMPACT_MARK: &str = "правка затрагивает";
+
+/// Хук `kind` с щедрым бюджетом процесса и сроком `POST /code/impact` (отладочная сборка под
+/// нагрузкой; проверка содержимого, а не времени).
+fn hook_slow(p: &Proj, url: &str, kind: &str, ev: &Value) -> Output {
+    p.cmd(url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+        .env("ZAM_TEST_HOOK_IMPACT_MS", "10000")
+        .args(["hook", kind, "--agent", "claude"])
+        .write_stdin(ev.to_string().into_bytes())
+        .output()
+        .unwrap()
+}
+
+/// `[hooks]` проекта (`<repo>/.zeroaimemory/config.toml`).
+fn project_hooks(p: &Proj, body: &str) {
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        format!("[hooks]\n{body}\n"),
+    )
+    .unwrap();
+}
+
+/// §12: `hooks.checkpoint_impact = true` — до 3 строк «правка затрагивает `<путь>` → i:<id> «…»»
+/// **внутри** единственного напоминания `Stop` (одно `decision: block`, второго нет); сами строки
+/// напоминания не вызывают (в память уже писали — тишина); ключ выключен — строк нет; сессия
+/// контрольной группы (`holdout` в `GET /sessions/{id}`) — строк нет.
+#[test]
+fn checkpoint_impact_lines_inside_single_reminder() {
+    let _g = serial();
+    let (url, tok) = start("cp-impact");
+    let p = Proj::new("cp-impact", &url, &tok);
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), b"pub fn pool() {}\n").unwrap();
+    let mut ids = Vec::new();
+    for t in [
+        "Пул течёт при панике",
+        "Пул не закрывается",
+        "Пул и таймауты",
+        "Пул: четвёртое",
+    ] {
+        let o = p.zam(
+            &[
+                "log",
+                "insight",
+                "--kind",
+                "gotcha",
+                "--title",
+                t,
+                "--ref",
+                "src/pool.rs",
+            ],
+            "Разобрано.\n".as_bytes(),
+        );
+        ids.push(format!("i:{}", id_of(&ok(&o))));
+    }
+    let edit = |s: &str| {
+        std::fs::write(
+            p.repo.join("src/pool.rs"),
+            format!("pub fn pool() {{}} // {s}\n"),
+        )
+        .unwrap();
+        let ev = post_ok(
+            &p,
+            s,
+            "Edit",
+            json!({"file_path": p.repo.join("src/pool.rs"), "old_string": "a", "new_string": "b"}),
+        );
+        ok(&hook_slow(&p, &url, "post-tool", &ev));
+    };
+    let stop = |s: &str| {
+        let ev = p.ev("Stop", s, json!({"stop_hook_active": false}));
+        hook_json(&hook_slow(&p, &url, "checkpoint", &ev))
+    };
+    let start_s = |s: &str| {
+        let ev = p.ev("SessionStart", s, json!({"source": "startup"}));
+        ok(&hook_slow(&p, &url, "session-start", &ev));
+    };
+    // ключ включён: строки — внутри единственного напоминания
+    project_hooks(&p, "checkpoint_impact = true");
+    start_s("ci-1");
+    edit("ci-1");
+    let v = stop("ci-1");
+    assert_eq!(v["decision"], "block", "{v}\n{}", p.log());
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains("zam log changelog"), "{reason}");
+    let lines: Vec<&str> = reason.lines().filter(|l| l.contains(IMPACT_MARK)).collect();
+    assert_eq!(lines.len(), 3, "до 3 строк: {reason}\n{}", p.log());
+    for l in &lines {
+        assert!(
+            l.starts_with("ZeroAIMemory: правка затрагивает `src/pool.rs`"),
+            "{l}"
+        );
+        assert!(ids.iter().any(|i| l.contains(&format!("→ {i} «"))), "{l}");
+    }
+    assert_eq!(stop("ci-1"), Value::Null, "второго напоминания нет");
+    // в память уже писали: строки влияния напоминания не вызывают
+    start_s("ci-2");
+    edit("ci-2");
+    let o = p
+        .cmd(&p.url)
+        .env("CLAUDECODE", "1")
+        .args(["log", "changelog", "--kind", "fix", "--title", "Итог"])
+        .write_stdin("Сделано.\n")
+        .output()
+        .unwrap();
+    ok(&o);
+    assert_eq!(stop("ci-2"), Value::Null, "{}", p.log());
+    // контрольная группа: строк нет, напоминание — как обычно
+    let r = http()
+        .post(&format!("{url}/api/v1/sessions"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .content_type("application/json")
+        .send(r#"{"id":"ci-3","holdout":true}"#)
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    edit("ci-3");
+    let v = stop("ci-3");
+    assert_eq!(v["decision"], "block", "{v}");
+    assert!(!v["reason"].as_str().unwrap().contains(IMPACT_MARK), "{v}");
+    // ключ выключен (по умолчанию): строк нет
+    project_hooks(&p, "");
+    edit("ci-4");
+    let v = stop("ci-4");
+    assert_eq!(v["decision"], "block", "{v}");
+    assert!(!v["reason"].as_str().unwrap().contains(IMPACT_MARK), "{v}");
+    let log = p.log();
+    assert!(!log.contains("code/impact"), "{log}");
+}
+
+/// §12: `POST /code/impact` — со своим сроком 60 мс внутри бюджета `checkpoint` (100 мс) и
+/// параллельно с `GET /sessions/{id}`: сервер влияния не ответил — напоминание без строк, хук
+/// его не ждёт; причина — в `hooks.log`. Тело запроса — решение и путь правки без символов.
+#[test]
+fn checkpoint_impact_timeout_60ms_no_lines() {
+    let _g = serial();
+    let knowledge = r#"{"changed":[],"removed":[],"consumers":[],"paths_only":["src/pool.rs"],"knowledge_left":0,"knowledge":[{"path":"src/pool.rs","id":"i:01J0000000000000000000000","kind":"insight","title":"Пул течёт","state":"ok","space":null}],"warnings":[],"tokens":10}"#;
+    let (url, seen) = common::stub_body(std::sync::Arc::new(
+        move |m: &str, path: &str, _: usize, _: &Value| {
+            if path.starts_with("/api/v1/code/impact") {
+                (200, knowledge.to_string(), Duration::from_millis(1500))
+            } else if m == "GET" && path.starts_with("/api/v1/sessions/") {
+                (
+                    200,
+                    r#"{"memory_writes":0,"claimed_tasks":[]}"#.to_string(),
+                    Duration::ZERO,
+                )
+            } else {
+                (200, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ));
+    let p = Proj::new("cp-impact-slow", &url, "zam_x");
+    project_hooks(&p, "checkpoint_impact = true");
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), b"pub fn pool() {}\n").unwrap();
+    let ev = post_ok(
+        &p,
+        "cs-1",
+        "Edit",
+        json!({"file_path": p.repo.join("src/pool.rs"), "old_string": "a", "new_string": "b"}),
+    );
+    ok(&p
+        .hook_at(DEAD, "post-tool", "claude", ev.to_string().as_bytes())
+        .0);
+    // щедрый бюджет процесса — но не срок влияния (60 мс по умолчанию)
+    let stop = p.ev("Stop", "cs-1", json!({"stop_hook_active": false}));
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+        .args(["hook", "checkpoint", "--agent", "claude"])
+        .write_stdin(stop.to_string().into_bytes());
+    let t = Instant::now();
+    let o = c.output().unwrap();
+    let d = t.elapsed();
+    let v = hook_json(&o);
+    assert_eq!(v["decision"], "block", "{v}\n{}", p.log());
+    assert!(!v["reason"].as_str().unwrap().contains(IMPACT_MARK), "{v}");
+    assert!(
+        d < Duration::from_millis(1000),
+        "хук ждал сервер влияния: {d:?}"
+    );
+    let sent = seen.lock().unwrap().clone();
+    let imp: Vec<&Value> = sent
+        .iter()
+        .filter(|(m, path, _)| m == "POST" && path == "/api/v1/code/impact")
+        .map(|(_, _, b)| b)
+        .collect();
+    assert_eq!(imp.len(), 1, "{sent:?}");
+    assert_eq!(imp[0]["solution"], G);
+    assert_eq!(
+        imp[0]["files"],
+        json!([{"path": "src/pool.rs"}]),
+        "{sent:?}"
+    );
+    assert!(p.log().contains("code/impact"), "{}", p.log());
+}
+
+/// §12: `hooks.holdout = p` — `session-start` ставит сессии «тихий» режим (решение по хэшу id,
+/// вероятность p) отдельным `POST /sessions {id, holdout: true}` **до** `/recall`: дайджест
+/// пустой с первого старта, после compact — тоже (метка на сервере); остальные сессии — как
+/// обычно; `0` — ни одной; вне 0..=0,5 — строка в журнале и ни одной.
+#[test]
+fn session_start_holdout_quiet_group() {
+    let _g = serial();
+    let (url, tok) = start("ss-holdout");
+    let p = Proj::new("ss-holdout", &url, &tok);
+    ok(&p.zam(
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "LF в скриптах",
+            "--scope",
+            "global",
+        ],
+        "CRLF ломает shebang.\n".as_bytes(),
+    ));
+    let ss = |s: &str, src: &str| {
+        let ev = p.ev("SessionStart", s, json!({"source": src}));
+        hook_slow(&p, &url, "session-start", &ev)
+    };
+    project_hooks(&p, "holdout = 0.5");
+    let (mut quiet, mut loud) = (Vec::new(), Vec::new());
+    for i in 0..16 {
+        let s = format!("hd-{i}");
+        let o = ss(&s, "startup");
+        if p.session(&s)["holdout"] == true {
+            empty(&o);
+            quiet.push(s);
+        } else {
+            assert!(context(&o, "SessionStart").contains("LF в скриптах"), "{s}");
+            loud.push(s);
+        }
+    }
+    assert!(
+        !quiet.is_empty() && !loud.is_empty(),
+        "q={quiet:?} l={loud:?}"
+    );
+    // решение детерминировано: повторный старт той же сессии — та же группа
+    empty(&ss(&quiet[0], "compact"));
+    assert_eq!(p.session(&quiet[0])["holdout"], true);
+    assert!(!out(&ss(&loud[0], "resume")).trim().is_empty());
+    assert_eq!(p.session(&loud[0])["holdout"], false);
+    // метка на сервере переживает выключение ключа (та же сессия после compact); новые
+    // сессии — без неё
+    project_hooks(&p, "");
+    empty(&ss(&quiet[0], "compact"));
+    for s in &quiet {
+        let id = format!("{s}-new");
+        assert!(!out(&ss(&id, "startup")).trim().is_empty());
+        assert_eq!(p.session(&id)["holdout"], false);
+    }
+    // вне диапазона — строка в журнале, контрольной группы нет
+    project_hooks(&p, "holdout = 0.9");
+    for s in &quiet {
+        let id = format!("{s}-bad");
+        assert!(!out(&ss(&id, "startup")).trim().is_empty());
+        assert_eq!(p.session(&id)["holdout"], false);
+    }
+    assert!(p.log().contains("hooks.holdout"), "{}", p.log());
+}
+
+/// §12, §13: старый сервер (v0.0.10-m5.7) отвечает на `POST /sessions {id, holdout}` 400
+/// (`deny_unknown_fields`) — хук молча продолжает: дайджест выводится, в `hooks.log` о нём ничего;
+/// запрос — отдельный, только `{id, holdout: true}`, и уходит до `/recall`.
+#[test]
+fn session_start_holdout_old_server_400_ignored() {
+    let _g = serial();
+    let (url, seen) = common::stub_body(std::sync::Arc::new(
+        |m: &str, path: &str, _: usize, b: &Value| {
+            let reply = |code: u16, body: &str| (code, body.to_string(), Duration::ZERO);
+            if m == "POST" && path == "/api/v1/sessions" && b.get("holdout").is_some() {
+                reply(
+                    400,
+                    r#"{"type":"/problems/bad-request","status":400,"detail":"некорректное тело: unknown field `holdout`, expected one of `id`, `agent`"}"#,
+                )
+            } else if path == "/api/v1/sessions" {
+                reply(201, r#"{"id":"x"}"#)
+            } else if path == "/api/v1/recall" {
+                reply(
+                    200,
+                    r#"{"text":"дайджест старого сервера","items":[],"tokens":3,"warnings":[]}"#,
+                )
+            } else {
+                reply(200, "{}")
+            }
+        },
+    ));
+    let p = Proj::new("ss-holdout-old", &url, "zam_x");
+    project_hooks(&p, "holdout = 0.5");
+    let mut asked = 0;
+    for i in 0..12 {
+        let s = format!("ho-{i}");
+        let ev = p.ev("SessionStart", &s, json!({"source": "startup"}));
+        let o = hook_slow(&p, &url, "session-start", &ev);
+        assert!(
+            context(&o, "SessionStart").contains("дайджест старого сервера"),
+            "{s}"
+        );
+        let sent = seen.lock().unwrap().clone();
+        let hold = sent.iter().position(|(m, path, b)| {
+            m == "POST"
+                && path == "/api/v1/sessions"
+                && b["id"] == s.as_str()
+                && b.get("holdout").is_some()
+        });
+        if let Some(h) = hold {
+            asked += 1;
+            assert_eq!(sent[h].2, json!({"id": s, "holdout": true}), "{sent:?}");
+            let recall = sent
+                .iter()
+                .position(|(_, path, b)| path == "/api/v1/recall" && b["session_id"] == s.as_str())
+                .expect("recall");
+            assert!(h < recall, "holdout — до /recall: {sent:?}");
+        }
+    }
+    assert!(asked > 0, "ни одной контрольной сессии из 12");
+    let log = p.log();
+    assert!(
+        !log.contains("holdout"),
+        "400 старого сервера — молча: {log}"
+    );
+}

@@ -1,5 +1,6 @@
 //! Вспомогательные задачи сборки: `cargo xtask <команда>`.
 
+mod ab;
 mod bench;
 mod bundles;
 mod changelog;
@@ -115,6 +116,9 @@ enum Cmd {
         #[arg(long, value_enum)]
         expect_device: Option<smoke::DeviceKind>,
     },
+    /// Агентный A/B (M6 §12): отчёт по плечам с интервалами из транскриптов агента (только
+    /// поля usage), меток eval/ab/runs.toml и GET /sessions/{id} сервера
+    Ab(ab::AbArgs),
     /// Eval качества поиска (ТЗ §18.2): корпус eval/, метрики recall@5, MRR@10, nDCG@10
     /// по режимам и видам запросов; --quality-gate — int8 против fp32; --grid — подбор весов
     Eval(eval::EvalArgs),
@@ -520,6 +524,7 @@ fn run(cmd: Cmd) -> Result<()> {
             &repo_root(),
         ),
         Cmd::SmokeCuda { archive } => smoke::run_cuda(&archive, &repo_root()),
+        Cmd::Ab(a) => ab::main(a),
         Cmd::Eval(a) => eval::main(a, &repo_root()),
         Cmd::DocsCorpus(a) => docs_corpus::main(a, &repo_root()),
         Cmd::DocsExtract(a) => eval::docs::extract::child_main(a, &repo_root()),

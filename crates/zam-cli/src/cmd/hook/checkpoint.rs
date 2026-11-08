@@ -21,14 +21,38 @@
 //! new_epoch: true}` параллельно с очередями, в том же бюджете ([`new_epoch`]): выданное до
 //! сжатия контекста больше не считается выданным. Старый сервер отвечает 400 (неизвестное
 //! поле) — хук молча продолжает без эпохи.
+//! M6 §12: `hooks.checkpoint_impact = true` (клиент, по умолчанию выключен) — к напоминанию
+//! `Stop` до [`IMPACT_LINES_MAX`] строк «правка затрагивает `<путь>[#<символ>]` → i:<id> «…»»
+//! **внутри** того же единственного напоминания ([`impact_lines`]). Вход — пути правок сессии
+//! из журнала (`Ev::Edit`, новые первыми) и из очереди изменённых файлов (с хэшами символов, если
+//! они есть), до [`IMPACT_FILES_MAX`] файлов ([`impact_files`]). `POST /code/impact` идёт
+//! параллельно с `GET /sessions/{id}` со своим сроком [`IMPACT_MS`] внутри бюджета хука; не
+//! ответил — без строк (причина — в `hooks.log`). Сами строки напоминания не вызывают
+//! (`decision: block` — по прежним условиям); сессия контрольной группы A/B (`holdout` в
+//! `GET /sessions/{id}`) их не получает.
 //! M5.6 §5: были правки в сессии — после запросов хука запуск фоновой
 //! `zam code sync --background`, если пора ([`crate::cmd::code::auto::maybe_spawn_sync`]).
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
 use super::cache;
 use super::input::Input;
 use super::journal::{self, Ev};
 use super::output::Output;
 use super::{Env, Flag, Kind, Settings, encode_segment};
 use crate::client::{Client, EXIT_NOT_FOUND, read_json};
+
+/// Срок `POST /code/impact` внутри бюджета `checkpoint` (100 мс), мс (M6 §12).
+pub const IMPACT_MS: u64 = 60;
+/// Файлов во входе влияния.
+pub const IMPACT_FILES_MAX: usize = 20;
+/// Строк влияния в напоминании.
+pub const IMPACT_LINES_MAX: usize = 3;
+/// Предел тела запроса влияния, байт: больше — у самых старых файлов снимаются символы.
+const IMPACT_BODY_MAX: usize = 64 * 1024;
+/// Предел заголовка записи в строке влияния, символов.
+const IMPACT_TITLE_MAX: usize = 60;
 
 /// Текст напоминания.
 pub const REMINDER: &str = "ZeroAIMemory: в этой сессии были правки файлов, а в память ничего не \
@@ -92,6 +116,18 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
         env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
     let tokens = cache::tokens_queued(env, session);
     let remind = needs_reminder(env, inp, s);
+    let events = match remind.as_ref() {
+        Some((id, _)) if s.flag_on(Flag::SessionJournal) => journal::read(&env.root, id),
+        _ => Vec::new(),
+    };
+    // влияние диффа (M6 §12): вход — до отправки очереди (она забирает файл очереди)
+    let impact_in = match (remind.as_ref(), env.solution.as_ref()) {
+        (Some((id, _)), Some(sol)) if s.checkpoint_impact() => {
+            let files = impact_files(&events, &cache::peek_changed(env, id));
+            (!files.is_empty()).then(|| (sol.id.clone(), files))
+        }
+        _ => None,
+    };
     // новая эпоха `session_seen` на сжатии контекста (M6 §7.2)
     let epoch = session.filter(|_| inp.event == "PreCompact");
     if remind.is_none() && !queued && !tokens && epoch.is_none() {
@@ -107,13 +143,22 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
             .filter(|_| tokens)
             .map(|id| sc.spawn(|| cache::flush_tokens(env, &client, id)));
         let bump = epoch.map(|id| sc.spawn(|| new_epoch(env, &client, id)));
+        // параллельно с `GET /sessions/{id}` напоминания, со своим сроком
+        let impact = impact_in.map(|(sol, files)| sc.spawn(move || impact(env, &sol, files)));
         let out = match remind {
             Some((id, sh)) => {
                 let fix = s
                     .flag_on(Flag::SessionJournal)
-                    .then(|| fix_line(&journal::read(&env.root, id)))
+                    .then(|| fix_line(&events))
                     .flatten();
-                reminder(env, &client, id, sh, fix)
+                let lines = || match impact {
+                    Some(h) => h.join().unwrap_or_else(|_| {
+                        env.log("code/impact: паника");
+                        Vec::new()
+                    }),
+                    None => Vec::new(),
+                };
+                reminder(env, &client, id, sh, fix, lines)
             }
             None => Output::Empty,
         };
@@ -200,29 +245,35 @@ pub fn fix_line(events: &[(journal::Timestamp, Ev)]) -> Option<String> {
     ))
 }
 
-/// `GET /sessions/{id}` и решение о напоминании (R1, M4.5 §3, §9.3).
+/// `GET /sessions/{id}` и решение о напоминании (R1, M4.5 §3, §9.3); `impact` — строки влияния
+/// диффа (M6 §12, ожидание параллельного запроса): идут только внутрь напоминания, которое и
+/// без них состоялось, и не в контрольной группе (`holdout`).
 fn reminder(
     env: &Env,
     client: &Client,
     session: &str,
     mut sh: cache::Shown,
     fix: Option<String>,
+    impact: impl FnOnce() -> Vec<String>,
 ) -> Output {
-    let (writes, tasks) = match client.get(&format!("/sessions/{}", encode_segment(session)), &[]) {
-        Ok(r) => match read_json(r) {
-            Ok(v) => (v["memory_writes"].as_i64(), task_line(&v)),
-            Err(e) => {
-                env.log(&format!("сессия: {e}"));
-                return Output::Empty;
-            }
-        },
-        Err(e) if e.code == EXIT_NOT_FOUND => (Some(0), None),
+    let got = client
+        .get(&format!("/sessions/{}", encode_segment(session)), &[])
+        .and_then(read_json);
+    // запрос влияния — дождаться всегда (свой срок; строки нужны не всегда)
+    let impact = impact();
+    let (writes, tasks, holdout) = match got {
+        Ok(v) => (
+            v["memory_writes"].as_i64(),
+            task_line(&v),
+            v["holdout"].as_bool() == Some(true),
+        ),
+        Err(e) if e.code == EXIT_NOT_FOUND => (Some(0), None, false),
         Err(e) => {
             env.log(&format!("сессия: {e}"));
             return Output::Empty;
         }
     };
-    let lines: Vec<String> = (writes == Some(0))
+    let mut lines: Vec<String> = (writes == Some(0))
         .then(|| REMINDER.to_string())
         .into_iter()
         .chain(tasks)
@@ -231,8 +282,198 @@ fn reminder(
     if lines.is_empty() {
         return Output::Empty;
     }
+    if !holdout {
+        lines.extend(impact);
+    }
     let reason = lines.join("\n");
     sh.reminded = true;
     cache::write_shown(env, session, &sh);
     Output::Block { reason }
+}
+
+/// Вход `POST /code/impact` (M6 §12): пути правок сессии — из журнала (`Ev::Edit`, новые
+/// первыми), затем из очереди изменённых файлов (новые первыми), без повторов, до
+/// [`IMPACT_FILES_MAX`]; хэши символов — из последней строки очереди пути (нет — путь без
+/// символов: сервер отдаёт все знания о файле). Тело больше [`IMPACT_BODY_MAX`] — у самых старых
+/// путей символы снимаются.
+pub fn impact_files(events: &[(journal::Timestamp, Ev)], queued: &[cache::Changed]) -> Vec<Value> {
+    let mut paths: Vec<&str> = Vec::new();
+    let edits = events.iter().rev().filter_map(|(_, e)| match e {
+        Ev::Edit { path } => Some(path.as_str()),
+        _ => None,
+    });
+    for p in edits.chain(queued.iter().rev().map(|c| c.path.as_str())) {
+        if paths.len() >= IMPACT_FILES_MAX {
+            break;
+        }
+        if !paths.iter().any(|x| crate::cmd::refs::same_path(x, p)) {
+            paths.push(p);
+        }
+    }
+    let mut files: Vec<Value> = paths
+        .iter()
+        .map(|p| {
+            let symbols = queued
+                .iter()
+                .rev()
+                .find(|c| crate::cmd::refs::same_path(&c.path, p))
+                .and_then(|c| c.symbols.as_ref());
+            match symbols {
+                Some(s) => json!({"path": p, "symbols": s}),
+                None => json!({"path": p}),
+            }
+        })
+        .collect();
+    let size = |f: &[Value]| serde_json::to_vec(f).map_or(0, |v| v.len());
+    for i in (0..files.len()).rev() {
+        if size(&files) <= IMPACT_BODY_MAX {
+            break;
+        }
+        if let Some(o) = files[i].as_object_mut() {
+            o.remove("symbols");
+        }
+    }
+    files
+}
+
+/// Срок запроса влияния, мс: [`IMPACT_MS`]; отладочная сборка или фича `test-hooks` —
+/// `ZAM_TEST_HOOK_IMPACT_MS` (тесты содержимого под нагрузкой).
+fn impact_ms() -> u64 {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::env::var("ZAM_TEST_HOOK_IMPACT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return ms;
+    }
+    IMPACT_MS
+}
+
+/// `POST /code/impact {solution, files}` со сроком [`impact_ms`] и строки влияния; сбой и срок —
+/// без строк (`code/impact: …` в `hooks.log`).
+fn impact(env: &Env, solution: &str, files: Vec<Value>) -> Vec<String> {
+    let Some(client) = env.client_within(Duration::from_millis(impact_ms())) else {
+        return Vec::new();
+    };
+    let body = json!({"solution": solution, "files": files});
+    match client.post_json("/code/impact", &body).and_then(read_json) {
+        Ok(v) => impact_lines(&v),
+        Err(e) => {
+            env.log(&format!("code/impact: {e}"));
+            Vec::new()
+        }
+    }
+}
+
+/// Строки влияния по ответу `POST /code/impact` (порядок сервера: знания о символах первыми):
+/// «ZeroAIMemory: правка затрагивает `<путь>[#<символ>]` → <ссылка> «<заголовок>»», без
+/// повторов, до [`IMPACT_LINES_MAX`].
+pub fn impact_lines(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for k in v["knowledge"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        if out.len() >= IMPACT_LINES_MAX {
+            break;
+        }
+        let (Some(path), Some(id)) = (k["path"].as_str(), k["id"].as_str()) else {
+            continue;
+        };
+        let target = match k["symbol"].as_str() {
+            Some(sym) => format!("{path}#{sym}"),
+            None => path.to_string(),
+        };
+        let title: String = k["title"]
+            .as_str()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(IMPACT_TITLE_MAX)
+            .collect();
+        let line = format!("ZeroAIMemory: правка затрагивает `{target}` → {id} «{title}»");
+        if !out.contains(&line) {
+            out.push(line);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edit(p: &str) -> (journal::Timestamp, Ev) {
+        (journal::Timestamp(0), Ev::Edit { path: p.into() })
+    }
+
+    /// Вход влияния: журнал (новые первыми), затем очередь; повтор пути — один раз; до 20
+    /// файлов; символы — из последней строки очереди пути.
+    #[test]
+    fn impact_files_from_journal_and_queue() {
+        let sym = |q: &str| zam_code::SymbolHash {
+            qual: q.into(),
+            body_hash: "h".repeat(16),
+        };
+        let q = |p: &str, s: Option<Vec<zam_code::SymbolHash>>| cache::Changed {
+            path: p.into(),
+            hash: "x".into(),
+            symbols: s,
+        };
+        let events = [edit("a.rs"), edit("b.rs"), edit("a.rs")];
+        let queued = [
+            q("b.rs", Some(vec![sym("old")])),
+            q("b.rs", Some(vec![sym("B::f")])),
+            q("c.rs", None),
+        ];
+        let f = impact_files(&events, &queued);
+        assert_eq!(
+            f,
+            [
+                json!({"path": "a.rs"}),
+                json!({"path": "b.rs", "symbols": [{"qual": "B::f", "body_hash": "h".repeat(16)}]}),
+                json!({"path": "c.rs"}),
+            ]
+        );
+        let many: Vec<_> = (0..30).map(|i| edit(&format!("f{i}.rs"))).collect();
+        let f = impact_files(&many, &[]);
+        assert_eq!(f.len(), IMPACT_FILES_MAX);
+        assert_eq!(f[0]["path"], "f29.rs");
+        assert!(impact_files(&[], &[]).is_empty());
+    }
+
+    /// Строки влияния: символ — `путь#символ`, заголовок — до 60 символов в одну строку, не
+    /// больше трёх, без повторов.
+    #[test]
+    fn impact_lines_format_and_cap() {
+        let k = |p: &str, s: Option<&str>, id: &str, t: &str| {
+            let mut v = json!({"path": p, "id": id, "kind": "insight", "title": t, "state": "ok"});
+            if let Some(s) = s {
+                v["symbol"] = json!(s);
+            }
+            v
+        };
+        let v = json!({"knowledge": [
+            k("src/a.rs", Some("Pool::get"), "i:1", "Пул\nтечёт"),
+            k("src/a.rs", Some("Pool::get"), "i:1", "Пул\nтечёт"),
+            k("src/a.rs", None, "n:2", &"д".repeat(80)),
+            k("src/b.rs", None, "c:3", "Итог"),
+            k("src/c.rs", None, "i:4", "Лишняя"),
+        ]});
+        let l = impact_lines(&v);
+        assert_eq!(l.len(), 3, "{l:?}");
+        assert_eq!(
+            l[0],
+            "ZeroAIMemory: правка затрагивает `src/a.rs#Pool::get` → i:1 «Пул течёт»"
+        );
+        assert_eq!(
+            l[1],
+            format!(
+                "ZeroAIMemory: правка затрагивает `src/a.rs` → n:2 «{}»",
+                "д".repeat(60)
+            )
+        );
+        assert!(l[2].contains("`src/b.rs` → c:3 «Итог»"));
+        assert!(impact_lines(&json!({"knowledge": []})).is_empty());
+        assert!(impact_lines(&json!({})).is_empty());
+    }
 }

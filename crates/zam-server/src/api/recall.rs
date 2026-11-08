@@ -5,7 +5,7 @@
 //! POST /recall {event, session_id?, solution?, area?, prompt?, error?, tool?, budget_tokens?,
 //!               agent_block_version?, task?, parent_id?}
 //!   → 200 {text, items: [{id, kind, title, certainty, reason, age_days?}], tokens,
-//!          rules_tokens, timings, warnings, hooks?}
+//!          rules_tokens, timings, warnings, hooks?, holdout?}
 //! ```
 //!
 //! - `text` — готовый Markdown для `additionalContext`; пусто — тишина. Каждая подсказка — строка
@@ -18,6 +18,11 @@
 //!   триггеров `error_regex`: время там неизвестно); `tokens` — размер `text` (счётчик
 //!   выдачи), `rules_tokens` — размер раздела-резерва Rules (M6 §8, §17 п. 3; 0 — резерва нет),
 //!   `timings {collect_ms, record_ms, total_ms}`;
+//! - **контрольная группа A/B** (M6 §12): сессия с `holdout` (своим, родителя `parent_id`
+//!   строки сессии или `parent_id` тела — [`zam_store::session_holdout`]) получает у хуков
+//!   пустой `text`, `items: []`, `tokens: 0` и поле `holdout: true`; сбор идёт как обычно (время
+//!   ответа сравнимо с основной группой), показ не отмечается (`session_seen`, `usage`), учёт —
+//!   вызов события с 0 токенов. Вызов из MCP (агент зовёт сам) — как обычно;
 //! - **учёт выданного** (M4.5 §9.5): непустой `text` прибавляется к `session_tokens` сессии —
 //!   событие `session_start`, `recovery` (и `session_start` после `compact | resume`),
 //!   `prompt`, `post_tool` или `brief`, `calls + 1`, `tokens + tokens` ответа — в той же
@@ -188,7 +193,7 @@ use zam_store::{
     RECALL_PART, SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind,
     UsageEvent, UsageKind, UsageSource, active_triggers, bump_epoch, count_tokens, list_children,
     list_entries, mark_seen_with_tokens, node_content, record_usages, search_fts_channels,
-    seen_revs, seen_revs_any_epoch, touch_session,
+    seen_revs, seen_revs_any_epoch, session_holdout, touch_session,
 };
 
 use super::json_body;
@@ -3972,6 +3977,18 @@ pub async fn recall(
             }
         }
     }
+    // контрольная группа агентного A/B (M6 §12): хукам — пустой `text` (сбор идёт как обычно,
+    // учёт — вызов без токенов); инструмент MCP агент зовёт сам — ему как обычно. Сбой чтения
+    // — WARN, не контрольная группа
+    let holdout = match (&session, origin.is_none()) {
+        (Some(s), true) => session_holdout(&s.db, &s.touch.id, req.parent_id.as_deref())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "recall: признак holdout сессии не прочитан");
+                false
+            }),
+        _ => false,
+    };
     let user = target_user_id(&st, &p, &headers)?;
     // R5: настройки пользователя (`hooks.<тип>`, `ideas.proactive`) одним чтением; сбой
     // чтения — всё включено (подсказки не валятся)
@@ -4183,6 +4200,12 @@ pub async fn recall(
         .iter()
         .filter_map(|&(si, bi)| picked.get(si).and_then(|p| p.get(bi)).copied())
         .collect();
+    // контрольная группа (M6 §12): ничего не выдано — ни текста, ни отметок показа
+    let (text, rules_tokens, shown_now) = if holdout {
+        (String::new(), 0, Vec::new())
+    } else {
+        (text, rules_tokens, shown_now)
+    };
     let collect_ms = ms(t0);
 
     // учёт показа — если полный срок ещё не вышел; иначе собранное отдаётся без учёта
@@ -4195,7 +4218,15 @@ pub async fn recall(
         // Rules — отдельной строкой учёта `rules` (M6 §8, §17 п. 3), событие — без резерва Rules:
         // строки складываются без двойного счёта
         let mut tokens: Vec<TokenCount> = Vec::new();
-        if !text.is_empty() && origin.is_none() {
+        if holdout {
+            // учёт контрольной группы: вызов события, выдано 0
+            tokens.push(TokenCount {
+                event: token_event(req.event, recovery).into(),
+                calls: 1,
+                tokens: 0,
+                reread_calls: 0,
+            });
+        } else if !text.is_empty() && origin.is_none() {
             let all = count_tokens(&text) as u64;
             let rules = (rules_tokens as u64).min(all);
             tokens.push(TokenCount {
@@ -4264,6 +4295,9 @@ pub async fn recall(
     if req.event == Event::SessionStart {
         // R5: настройки типов подсказок пользователя (`hooks.<тип>`, задача 13)
         out["hooks"] = hooks.to_json();
+    }
+    if holdout {
+        out["holdout"] = json!(true);
     }
     Ok(Json(out))
 }

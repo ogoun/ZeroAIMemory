@@ -156,8 +156,8 @@ pub use sessions::{
     TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
     add_tokens, bump_epoch, check_session_id, end_session, gc_sessions, get_session,
     latest_session, list_sessions, mark_seen, mark_seen_with_tokens, seen_entry_ids, seen_revs,
-    seen_revs_any_epoch, session_epoch, session_tokens, sessions_tokens, set_holdout,
-    touch_session,
+    seen_revs_any_epoch, session_epoch, session_holdout, session_tokens, sessions_tokens,
+    set_holdout, touch_session,
 };
 pub use snapshots::{SnapshotRow, gc_snapshots, get_snapshot, put_snapshot};
 pub use solution_registry::{RegistryReport, register_user_solutions};

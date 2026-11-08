@@ -502,6 +502,12 @@ impl QueueLock {
     }
 }
 
+/// Строки очереди изменённых файлов сессии без замка и без изменения файла (вход влияния
+/// диффа `checkpoint`, M6 §12); нет очереди — пусто.
+pub fn peek_changed(env: &Env, session: &str) -> Vec<Changed> {
+    read_changed(&changed_path(env, session)).0
+}
+
 /// Строки очереди (битые пропускаются) и прочитанная длина файла, байт.
 fn read_changed(path: &Path) -> (Vec<Changed>, u64) {
     let bytes = std::fs::read(path).unwrap_or_default();

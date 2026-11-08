@@ -106,6 +106,23 @@ pub fn stub(status: u16, body: &'static str, delay: std::time::Duration) -> (Str
 
 /// Заглушка с ответом по запросу ([`Reply`]): например, ошибка на второй пачке.
 pub fn stub_with(reply: std::sync::Arc<Reply>) -> (String, Seen) {
+    stub_body(std::sync::Arc::new(
+        move |m: &str, p: &str, n: usize, _: &serde_json::Value| {
+            let (status, body, delay) = reply(m, p, n);
+            (status, body.to_string(), delay)
+        },
+    ))
+}
+
+/// Ответ заглушки по запросу и его телу ([`stub_body`]): статус, тело, задержка.
+pub type BodyReply = dyn Fn(&str, &str, usize, &serde_json::Value) -> (u16, String, std::time::Duration)
+    + Send
+    + Sync
+    + 'static;
+
+/// Заглушка с ответом и по телу запроса ([`BodyReply`]): например, 400 старого сервера только
+/// на `POST /sessions {holdout}`, а регистрация той же сессии — 201 (M6 §12).
+pub fn stub_body(reply: std::sync::Arc<BodyReply>) -> (String, Seen) {
     use std::io::{BufRead, BufReader, Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -144,8 +161,9 @@ pub fn stub_with(reply: std::sync::Arc<Reply>) -> (String, Seen) {
                 let (status, body, delay) = {
                     let mut s = s3.lock().unwrap();
                     let n = s.iter().filter(|(_, q, _)| *q == p).count();
+                    let out = reply(&m, &p, n, &v);
                     s.push((m.clone(), p.clone(), v));
-                    reply(&m, &p, n)
+                    out
                 };
                 std::thread::sleep(delay);
                 let mut c = conn;

@@ -215,17 +215,51 @@ impl HookFlags {
     }
 }
 
+/// Ключи `[hooks]` только клиента (M6 §12; сервер их не знает и не присылает): нет ключа —
+/// `None` (умолчание).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+pub struct ClientKeys {
+    /// Влияние диффа в напоминании `checkpoint` (`POST /code/impact`), по умолчанию `false`.
+    #[serde(default)]
+    pub checkpoint_impact: Option<bool>,
+    /// Доля сессий контрольной группы агентного A/B, 0..=[`HOLDOUT_MAX`], по умолчанию 0.
+    #[serde(default)]
+    pub holdout: Option<f64>,
+}
+
+/// Предел `hooks.holdout`: контрольная группа — не больше половины сессий (M6 §12).
+pub const HOLDOUT_MAX: f64 = 0.5;
+
+impl ClientKeys {
+    fn over(self, base: ClientKeys) -> ClientKeys {
+        ClientKeys {
+            checkpoint_impact: self.checkpoint_impact.or(base.checkpoint_impact),
+            holdout: self.holdout.or(base.holdout),
+        }
+    }
+}
+
+/// `[hooks]` файла настроек: включённость типов подсказок и ключи клиента.
+#[derive(Deserialize, Default)]
+struct HooksSection {
+    #[serde(flatten)]
+    flags: HookFlags,
+    #[serde(flatten)]
+    keys: ClientKeys,
+}
+
 #[derive(Deserialize, Default)]
 struct ConfigFile {
     #[serde(default)]
-    hooks: HookFlags,
+    hooks: HooksSection,
 }
 
-/// Настройки типов подсказок: клиент (проект сильнее домашнего) и кэш сервера.
+/// Настройки типов подсказок: клиент (проект сильнее домашнего) и кэш сервера; ключи клиента.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Settings {
     pub client: HookFlags,
     pub server: HookFlags,
+    pub keys: ClientKeys,
 }
 
 impl Settings {
@@ -243,15 +277,29 @@ impl Settings {
     pub fn flag_on(&self, f: Flag) -> bool {
         self.client.get(f).unwrap_or(true) && self.server.get(f).unwrap_or(true)
     }
+
+    /// `hooks.checkpoint_impact` клиента (по умолчанию выключен).
+    pub fn checkpoint_impact(&self) -> bool {
+        self.keys.checkpoint_impact == Some(true)
+    }
+
+    /// `hooks.holdout` клиента в 0..=[`HOLDOUT_MAX`]; нет ключа или вне диапазона — 0 (вне
+    /// диапазона пишет в журнал [`Env::settings`]).
+    pub fn holdout(&self) -> f64 {
+        self.keys
+            .holdout
+            .filter(|p| (0.0..=HOLDOUT_MAX).contains(p))
+            .unwrap_or(0.0)
+    }
 }
 
 /// `[hooks]` из `config.toml`; нет файла — пусто, битый — пусто и строка в журнал.
-fn read_flags(path: &Path, env: &Env) -> HookFlags {
+fn read_flags(path: &Path, env: &Env) -> HooksSection {
     let Ok(meta) = std::fs::metadata(path) else {
-        return HookFlags::default();
+        return HooksSection::default();
     };
     if !meta.is_file() || meta.len() > CONFIG_MAX {
-        return HookFlags::default();
+        return HooksSection::default();
     }
     let parsed = std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
@@ -264,7 +312,7 @@ fn read_flags(path: &Path, env: &Env) -> HookFlags {
         Ok(c) => c.hooks,
         Err(e) => {
             env.log(&format!("{} пропущен: {e}", path.display()));
-            HookFlags::default()
+            HooksSection::default()
         }
     }
 }
@@ -318,9 +366,18 @@ impl Env {
     pub fn settings(&self) -> Settings {
         let home = read_flags(&self.home.join(".zeroaimemory").join("config.toml"), self);
         let project = read_flags(&self.root.join(".zeroaimemory").join("config.toml"), self);
+        let keys = project.keys.over(home.keys);
+        if let Some(p) = keys.holdout
+            && !(0.0..=HOLDOUT_MAX).contains(&p)
+        {
+            self.log(&format!(
+                "hooks.holdout = {p} вне 0..={HOLDOUT_MAX}: контрольной группы нет"
+            ));
+        }
         Settings {
-            client: project.over(home),
+            client: project.flags.over(home.flags),
             server: cache::read_server_hooks(self).unwrap_or_default(),
+            keys,
         }
     }
 
@@ -346,6 +403,12 @@ impl Env {
     /// Клиент API с тайм-аутом по остатку бюджета; нет адреса, токена или времени — `None`
     /// (причина — в журнал).
     pub fn client(&self) -> Option<Client> {
+        self.client_within(Duration::MAX)
+    }
+
+    /// [`Env::client`] со сроком запроса не больше `cap` (свой срок запроса внутри бюджета
+    /// хука: `POST /code/impact` у `checkpoint`, M6 §12).
+    pub fn client_within(&self, cap: Duration) -> Option<Client> {
         let r = match locate::resolve(&Flags::default(), &super::zam_env(), &self.cwd, &self.home) {
             Ok(r) => r,
             Err(e) => {
@@ -374,7 +437,7 @@ impl Env {
             &url.value,
             &token.value,
             self.solution.as_ref().map(|s| s.id.clone()),
-            Timeouts::Deadline(left),
+            Timeouts::Deadline(left.min(cap)),
         ))
     }
 
@@ -574,12 +637,39 @@ mod tests {
                 checkpoint: Some(false),
                 ..HookFlags::default()
             },
+            keys: ClientKeys::default(),
         };
         assert!(s.on(Kind::Prompt));
         assert!(!s.on(Kind::PreTool));
         assert!(!s.on(Kind::Checkpoint));
         assert!(s.client_on(Kind::Checkpoint));
         assert!(s.on(Kind::SessionStart));
+    }
+
+    /// `[hooks]` с ключами клиента (M6 §12): типы подсказок и ключи — из одной таблицы, проект
+    /// сильнее домашнего; `holdout` вне 0..=0,5 — 0.
+    #[test]
+    fn client_keys_parsed_and_layered() {
+        let parse = |t: &str| toml::from_str::<ConfigFile>(t).unwrap().hooks;
+        let home = parse("[hooks]\nprompt = false\ncheckpoint_impact = true\nholdout = 0.2\n");
+        let project = parse("[hooks]\nholdout = 0.5\n");
+        let s = Settings {
+            client: project.flags.over(home.flags),
+            server: HookFlags::default(),
+            keys: project.keys.over(home.keys),
+        };
+        assert!(!s.on(Kind::Prompt));
+        assert!(s.checkpoint_impact());
+        assert_eq!(s.holdout(), 0.5);
+        let bad = Settings {
+            keys: parse("[hooks]\nholdout = 0.9\n").keys,
+            ..Settings::default()
+        };
+        assert_eq!(bad.holdout(), 0.0);
+        assert!(!Settings::default().checkpoint_impact());
+        assert_eq!(Settings::default().holdout(), 0.0);
+        // неизвестный ключ (конфигурация новее клиента) — пропускается
+        assert_eq!(parse("[hooks]\nfuture = 1\n").keys, ClientKeys::default());
     }
 
     #[test]

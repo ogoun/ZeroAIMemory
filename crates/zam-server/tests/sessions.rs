@@ -1035,3 +1035,170 @@ async fn double_epoch_bump() {
     read_md(&a, "db-2", &nid).await;
     assert!(first_seen(&a, "db-2").await);
 }
+
+// ---- контрольная группа агентного A/B `holdout` (M6 §12, задача 12) ----
+
+/// `POST /sessions {id, holdout}` → 201 `{id, holdout}`.
+async fn set_holdout(a: &Api, body: Value) -> Value {
+    let r = a.t(Method::POST, "/api/v1/sessions", Some(body)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    r.json()
+}
+
+/// `tokens.<event>` сессии: `(calls, tokens)`.
+async fn event_tokens(a: &Api, s: &str, event: &str) -> (u64, u64) {
+    let j = session(a, &a.token, s).await.json();
+    let t = &j["tokens"][event];
+    (
+        t["calls"].as_u64().unwrap_or(0),
+        t["tokens"].as_u64().unwrap_or(0),
+    )
+}
+
+/// `memory_recall` через `POST /mcp` в сессии `s`: текст ответа инструмента.
+async fn mcp_recall(a: &Api, s: &str, args: Value) -> String {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "memory_recall", "arguments": args}});
+    let r = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::HOST, "memory.lan:7700")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::AUTHORIZATION, format!("Bearer {}", a.token))
+        .header("x-zam-session", s)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let r = a.send(r).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// §12: `POST /sessions {id, holdout: true}` ставит «тихий» режим — `GET` отдаёт `holdout`,
+/// `/recall` хуков в сессии отдаёт пустой `text` (учёт: вызов есть, токенов 0, `holdout: true`
+/// в ответе); метку наследует субагент (`parent_id`: и зарегистрированный, и тот, чей `brief`
+/// пришёл раньше регистрации), после compact она сохраняется (та же сессия); MCP-инструменты
+/// работают; `holdout: false` снимает метку; без `id` — 400.
+#[tokio::test]
+async fn holdout_empty_text_and_inherited() {
+    let a = api("sessions-holdout", |_| {}).await;
+    let e = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(
+                json!({"kind": "insight", "title": "LF в скриптах оболочки", "body": "CRLF ломает shebang",
+                        "data": {"kind": "gotcha"}, "scope": "global"}),
+            ),
+        )
+        .await;
+    assert_eq!(e.status, StatusCode::CREATED, "{}", e.text());
+    let digest = json!({"event": "session_start", "source": "startup"});
+    // контроль: обычная сессия получает дайджест
+    let c = recall_in(&a, "ho-ctl", digest.clone()).await;
+    assert!(!c["text"].as_str().unwrap().is_empty(), "{c}");
+    assert!(c.get("holdout").is_none(), "{c}");
+    assert_eq!(
+        session(&a, &a.token, "ho-ctl").await.json()["holdout"],
+        false
+    );
+
+    let j = set_holdout(&a, json!({"id": "ho-1", "holdout": true})).await;
+    assert_eq!(j, json!({"id": "ho-1", "holdout": true}));
+    assert_eq!(session(&a, &a.token, "ho-1").await.json()["holdout"], true);
+    let r = recall_in(&a, "ho-1", digest.clone()).await;
+    assert_eq!(r["text"], "", "{r}");
+    assert_eq!(r["items"], json!([]), "{r}");
+    assert_eq!(r["tokens"], 0, "{r}");
+    assert_eq!(r["holdout"], true, "{r}");
+    assert!(r["hooks"].is_object(), "настройки хуков — как обычно: {r}");
+    // учёт ведётся: вызов есть, выдано 0
+    assert_eq!(event_tokens(&a, "ho-1", "session_start").await, (1, 0));
+    let p = recall_in(
+        &a,
+        "ho-1",
+        json!({"event": "prompt", "prompt": "почему ломается shebang LF в скриптах оболочки"}),
+    )
+    .await;
+    assert_eq!(p["text"], "", "{p}");
+    let pt = recall_in(
+        &a,
+        "ho-1",
+        json!({"event": "post_tool", "error": "bad interpreter: /bin/sh^M", "tool": "Bash"}),
+    )
+    .await;
+    assert_eq!(pt["text"], "", "{pt}");
+
+    // субагент: зарегистрирован с `parent_id` — метка наследуется
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "ho-1:a1", "parent_id": "ho-1", "agent_type": "Explore"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(
+        session(&a, &a.token, "ho-1:a1").await.json()["holdout"],
+        true
+    );
+    let b = recall_in(
+        &a,
+        "ho-1:a1",
+        json!({"event": "brief", "parent_id": "ho-1"}),
+    )
+    .await;
+    assert_eq!(b["text"], "", "{b}");
+    // `brief` раньше регистрации (хук шлёт их параллельно) — тоже тихо, по `parent_id`
+    let b2 = recall_in(
+        &a,
+        "ho-1:a2",
+        json!({"event": "brief", "parent_id": "ho-1"}),
+    )
+    .await;
+    assert_eq!(b2["text"], "", "{b2}");
+    // субагент обычной сессии — не тихий
+    let b3 = recall_in(
+        &a,
+        "ho-ctl:a1",
+        json!({"event": "brief", "parent_id": "ho-ctl"}),
+    )
+    .await;
+    assert!(!b3["text"].as_str().unwrap().is_empty(), "{b3}");
+
+    // после compact — та же сессия, метка сохраняется
+    assert_eq!(new_epoch(&a, "ho-1").await, 1);
+    let r = recall_in(
+        &a,
+        "ho-1",
+        json!({"event": "session_start", "source": "compact"}),
+    )
+    .await;
+    assert_eq!(r["text"], "", "{r}");
+    let j = session(&a, &a.token, "ho-1").await.json();
+    assert_eq!(j["holdout"], true, "{j}");
+    assert_eq!(j["seen_epoch"], 2, "{j}");
+
+    // MCP-инструменты работают: агент зовёт их сам
+    let m = mcp_recall(&a, "ho-1", json!({"event": "session_start"})).await;
+    assert!(m.contains("LF в скриптах оболочки"), "{m}");
+
+    // снятие метки и ошибки
+    let j = set_holdout(&a, json!({"id": "ho-1", "holdout": false})).await;
+    assert_eq!(j["holdout"], false, "{j}");
+    let r = recall_in(&a, "ho-1", digest).await;
+    assert!(!r["text"].as_str().unwrap().is_empty(), "{r}");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"holdout": true})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}

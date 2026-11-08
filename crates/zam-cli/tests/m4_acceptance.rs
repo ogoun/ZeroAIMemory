@@ -7,7 +7,9 @@
 //!   (Write `deploy.sh`) и `post-tool` («bad interpreter») выдают подсказки без сети;
 //! - `hook_budgets` — p95 каждого хука на корпусе eval в пределах бюджетов §10.3 с запасом ×2
 //!   (M4.5: и `post-tool` успеха — 50 мс без сети, и `subagent-start` — 300 мс; M5.7 — с 50
-//!   идеями в решении: раздел `### Идеи` и отдельный поиск идей к `prompt`);
+//!   идеями в решении: раздел `### Идеи` и отдельный поиск идей к `prompt`; M6 §12 —
+//!   `checkpoint` с `hooks.checkpoint_impact = true`: `POST /code/impact` по правке файла со
+//!   знанием параллельно с `GET /sessions/{id}`);
 //! - `source_change_marks_cache_stale` — изменение источника выжимки → `stale` (критерий §19);
 //! - `fail_open_when_server_down` — все пять хуков при выключенном и при зависшем сервере;
 //! - `shared_solution_cache_and_recall` — участник общего решения видит общий кэш и подсказки
@@ -820,6 +822,12 @@ fn hook_budgets() {
     }
     std::fs::create_dir_all(p.repo.join("src")).unwrap();
     std::fs::write(p.repo.join("src/pool.rs"), "pub fn pool() {}\n").unwrap();
+    // M6 §12 (§17 п. 15): `checkpoint` меряется с влиянием диффа
+    std::fs::write(
+        p.repo.join(".zeroaimemory/config.toml"),
+        "[hooks]\ncheckpoint_impact = true\n",
+    )
+    .unwrap();
     // кэш триггеров — до pre-tool
     p.session_start_until("bud-warm", |c| !c.is_empty());
     assert!(
@@ -1004,9 +1012,20 @@ fn hook_budgets() {
     let mut fails = Vec::new();
     for (kind, evs) in &runs {
         if *kind == "checkpoint" {
-            // правка в сессии — иначе checkpoint молчит без запроса к серверу
+            // правка в сессии — иначе checkpoint молчит без запроса к серверу; правка файла со
+            // знанием (`src/pool.rs`) — вход влияния диффа (M6 §12)
             for i in 0..evs.len() {
-                p.hook("pre-tool", &p.write_ev(&format!("bud-cp-{i}"), "a.txt"));
+                let s = format!("bud-cp-{i}");
+                p.hook("pre-tool", &p.write_ev(&s, "a.txt"));
+                let edit = p.ev(
+                    "PostToolUse",
+                    &s,
+                    json!({"tool_name": "Edit", "tool_use_id": "u1",
+                           "tool_input": {"file_path": p.repo.join("src/pool.rs"),
+                                          "old_string": "a", "new_string": "b"},
+                           "tool_response": {"success": true}}),
+                );
+                p.hook("post-tool", &edit);
             }
         }
         if *kind == "subagent-start" {
@@ -1037,12 +1056,13 @@ fn hook_budgets() {
             p.hook_at(&p.url, cmd, &w);
         }
         let mut times = Vec::new();
-        let (mut timeouts, mut spoke) = (0, 0);
+        let (mut timeouts, mut spoke, mut impact) = (0, 0, 0);
         for (ev, want) in evs {
             let before = p.log().lines().count();
             let (o, d) = p.hook_at(&p.url, cmd, ev);
             let said = !ok(&o).trim().is_empty();
             spoke += usize::from(said);
+            impact += usize::from(out(&o).contains("правка затрагивает"));
             times.push(d);
             let lines: Vec<String> = p.log().lines().skip(before).map(String::from).collect();
             let late = lines.iter().any(|l| is_timeout(l));
@@ -1072,10 +1092,20 @@ fn hook_budgets() {
         let limit = Duration::from_millis(budget_ms(kind) * CI_MARGIN);
         report.push(format!(
             "{kind} n={n} p50={:?} p95={q:?} max={max:?} ответов={spoke} тайм-аутов={timeouts} \
-             (бюджет {} мс)",
+             (бюджет {} мс){}",
             sorted[n / 2],
-            budget_ms(kind)
+            budget_ms(kind),
+            if *kind == "checkpoint" {
+                format!(" со строками влияния={impact}")
+            } else {
+                String::new()
+            }
         ));
+        // влияние диффа (M6 §12) уложилось в свой срок 60 мс хотя бы раз: иначе замер
+        // `checkpoint` шёл бы без `POST /code/impact` (молчание по сроку — не отказ)
+        if *kind == "checkpoint" && impact == 0 {
+            fails.push("checkpoint: ни одной строки влияния диффа".into());
+        }
         if q > limit {
             fails.push(format!("{kind}: p95 {q:?} > {limit:?}"));
         }
