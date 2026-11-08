@@ -1361,8 +1361,14 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
             }
         }
         // broad может собирать тему на обоих языках
+        // фрагмент (набор областей M6 §11): цели на двух языках — вид по формулировке, если хотя
+        // бы одна цель на языке запроса (cross-lang такому запросу не подходит, иначе — ни один)
+        let mixed_ok = !full
+            && q.area_kind.is_some()
+            && targets.iter().any(|t| t.lang() == q.lang);
         if !matches!(q.kind, Kind::CrossLang | Kind::Broad)
             && (full || q.kind != Kind::Certainty)
+            && !mixed_ok
             && let Some(t) = targets.iter().find(|t| t.lang() != q.lang)
         {
             bad(format!(
@@ -1762,6 +1768,14 @@ mod tests {
             );
         }
         assert!(err.contains("запрос x: area_kind без area"), "{err}");
+        // цели на двух языках: вид по формулировке, если одна цель на языке запроса
+        c.insights[1].area = Some("backend".into());
+        c.insights[1].lang = Lang::Ru;
+        let mut two = mk("m", Some("backend"), AreaKind::Same, "insight:old");
+        two.expect.push(format!("{INSIGHT_REF}{}", c.insights[1].key));
+        validate(&c, &[two.clone()], false).unwrap();
+        two.area_kind = None;
+        assert!(validate(&c, &[two], false).is_err(), "без area_kind — прежнее правило");
         let t: QueryFile = toml::from_str(
             "[[query]]\nid = \"a\"\ntext = \"t\"\nlang = \"en\"\nexpect = [\"x\"]\n\
              kind = \"exact\"\narea = \"infra\"\narea_kind = \"none\"\n",

@@ -198,6 +198,9 @@ pub struct SecondDiff {
     pub d_chunk_recall5: Option<Estimate>,
     pub d_chunk_recall5_intro: Option<Estimate>,
     pub d_ndcg10_long: Option<Estimate>,
+    /// Итоги частей против второй базы (поправка Бонферрони — на сравнения с ней).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parts: BTreeMap<String, PartResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -588,6 +591,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
                         d_chunk_recall5: subset_diff(b, q, |x| x.metrics.chunk_recall5),
                         d_chunk_recall5_intro: intro_diff(b, q, &intro),
                         d_ndcg10_long: subset_diff(b, q, |x| x.long.then_some(x.metrics.ndcg10)),
+                        parts: part_results(b, q, &part_of, g.config.len().saturating_sub(1)),
                     }
                 }),
                 leaf_chunks,
@@ -856,6 +860,31 @@ pub fn grid_md(g: &GridResult) -> String {
                     r.below1,
                     r.reliable_first
                         .map_or("—".into(), |v| format!("{v:.3} ({})", r.n_reliable)),
+                    r.d_ndcg10.mean,
+                    r.d_ndcg10.lo,
+                    r.d_ndcg10.hi,
+                    r.d_ndcg10_lo_bonf,
+                    r.wins,
+                    r.losses,
+                    r.ties
+                );
+            }
+        }
+        // те же части против второй базы (`second_base`)
+        for c in &g.configs {
+            if let Some(r) = c
+                .vs_second
+                .as_ref()
+                .and_then(|v| v.parts.get(pn).map(|r| (v.base.as_str(), r)))
+            {
+                let (b, r) = r;
+                let _ = writeln!(
+                    s,
+                    "| {} − {b} | {} | {:.3} | {:.3} | — | {:+.4} [{:+.4}…{:+.4}] | {:+.4} | {} / {} / {} |",
+                    c.config.name,
+                    r.n,
+                    r.ndcg10,
+                    r.below1,
                     r.d_ndcg10.mean,
                     r.d_ndcg10.lo,
                     r.d_ndcg10.hi,

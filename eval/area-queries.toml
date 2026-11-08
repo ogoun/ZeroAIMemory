@@ -1,0 +1,344 @@
+# Набор областей (M6 §11, задача 11): 36 запросов для проверки буста текущей области поиска.
+# Составил независимый агент без доступа к коду поиска, сеткам и результатам прогонов; разметка —
+# только по смыслу (какой документ отвечает на вопрос). Формат — eval/README.md.
+# Область цели: заметка — eval/corpus/areas.toml, insight — поле `area` в eval/insights.toml.
+#
+# Раскладка:
+#   area_kind: same 12, other 12, none 12
+#   area:      backend 12, frontend 12, infra 12 (по 4 в каждом виде area_kind)
+#   lang:      ru 18, en 18
+#   kind:      paraphrase 14, cross-lang 14, identifier 4, exact 2, broad 2
+#   (по штатной проверке: aq-28 — kind = cross-lang; у aq-05 и aq-24 цели на двух языках —
+#   метки paraphrase / identifier сохранены, журнал задачи 11)
+# Смысл area_kind: same — все цели в текущей области, рядом сосед той же темы из другой;
+# other — все цели в другой области; none — все цели без области.
+
+# ---- same: ответ в текущей области ----
+
+[[query]]
+id = "aq-01"
+text = "сколько повторов допускать при сбое внешней зависимости, какие паузы и бюджет, чтобы повторы не добили её окончательно"
+lang = "ru"
+expect = ["ru/api/http-client-retries", "ru/ops/retries-backoff-jitter"]
+kind = "broad"
+area = "backend"
+area_kind = "same"
+
+[[query]]
+id = "aq-02"
+text = "how long does a cached product card live, and what removes it from the cache when the product changes"
+lang = "en"
+expect = ["en/api/product-cache-invalidation"]
+kind = "paraphrase"
+area = "backend"
+area_kind = "same"
+
+[[query]]
+id = "aq-03"
+text = "which claims and which signing algorithm must be checked on an incoming access token, and when to answer 401 versus 403"
+lang = "en"
+expect = ["ru/api/jwt-validation"]
+kind = "cross-lang"
+area = "backend"
+area_kind = "same"
+
+[[query]]
+id = "aq-04"
+text = "a query failed with SQLSTATE 57014, what does that mean and what should the API return"
+lang = "en"
+expect = ["en/api/database-statement-timeout"]
+kind = "identifier"
+area = "backend"
+area_kind = "same"
+
+[[query]]
+id = "aq-05"
+text = "какие запросы повторять автоматически при плохой связи, а какие отдавать человеку с кнопкой Повторить"
+lang = "ru"
+expect = ["ru/web/fetch-retry-ui", "en/web/fetch-retry-abort"]
+kind = "paraphrase"
+area = "frontend"
+area_kind = "same"
+
+[[query]]
+id = "aq-06"
+text = "how to display timestamps in the visitor's own time zone and language without slowing down long tables"
+lang = "en"
+expect = ["ru/web/date-formatting-intl", "insight:k16-n"]
+kind = "cross-lang"
+area = "frontend"
+area_kind = "same"
+
+[[query]]
+id = "aq-07"
+text = "как докачать файл на пару гигабайт после обрыва связи посередине, не начиная заново"
+lang = "ru"
+expect = ["en/web/large-file-upload"]
+kind = "cross-lang"
+area = "frontend"
+area_kind = "same"
+
+[[query]]
+id = "aq-08"
+text = "после релиза новая версия приложения не включается, пока у пользователя открыты старые вкладки, как предложить ему обновиться"
+lang = "ru"
+expect = ["ru/web/service-worker-cache"]
+kind = "paraphrase"
+area = "frontend"
+area_kind = "same"
+
+[[query]]
+id = "aq-09"
+text = "выгрузка обрывается с 504 ровно через минуту, хотя сервис ещё считает; откуда эта минута и как поднять предел только для одного маршрута"
+lang = "ru"
+expect = ["ru/infra/proxy-timeouts-long-requests", "insight:k08-t"]
+kind = "paraphrase"
+area = "infra"
+area_kind = "same"
+
+[[query]]
+id = "aq-10"
+text = "should the liveness probe check the database connection, or is that the job of the other probe"
+lang = "en"
+expect = ["ru/infra/readiness-liveness-probes", "insight:k23-t"]
+kind = "cross-lang"
+area = "infra"
+area_kind = "same"
+
+[[query]]
+id = "aq-11"
+text = "per-IP request limits at the edge: zone size, letting short bursts through, the status code for rejected requests and trying a new limit safely"
+lang = "en"
+expect = ["en/infra/nginx-limit-req", "insight:k20-t", "insight:k20-n"]
+kind = "broad"
+area = "infra"
+area_kind = "same"
+
+[[query]]
+id = "aq-12"
+text = "пределы размера тела запроса на входе: текущие значения и где менять предел маршрута"
+lang = "ru"
+expect = ["ru/infra/upload-size-limits"]
+kind = "exact"
+area = "infra"
+area_kind = "same"
+
+# ---- other: ответ в другой области ----
+
+[[query]]
+id = "aq-13"
+text = "what retry budget and backoff delays does the shared HTTP client of the orders service use for calls to external APIs"
+lang = "en"
+expect = ["ru/api/http-client-retries"]
+kind = "cross-lang"
+area = "frontend"
+area_kind = "other"
+
+[[query]]
+id = "aq-14"
+text = "белый экран после релиза: service worker отдаёт старую страницу-оболочку, которая ссылается на удалённые файлы сборки"
+lang = "ru"
+expect = ["insight:k04-t", "ru/web/service-worker-cache"]
+kind = "paraphrase"
+area = "backend"
+area_kind = "other"
+
+[[query]]
+id = "aq-15"
+text = "what does a service respond and log when its own 30-second limit on handling an incoming request fires"
+lang = "en"
+expect = ["ru/api/service-request-timeouts"]
+kind = "cross-lang"
+area = "infra"
+area_kind = "other"
+
+[[query]]
+id = "aq-16"
+text = "версия формата ответа в ключе кэша Redis: зачем она и что делает релиз, меняющий формат"
+lang = "ru"
+expect = ["ru/api/redis-cache-ttl"]
+kind = "exact"
+area = "frontend"
+area_kind = "other"
+
+[[query]]
+id = "aq-17"
+text = "как собирать ошибки, случившиеся у покупателей в браузере, и превращать минифицированные стеки в исходные файлы"
+lang = "ru"
+expect = ["en/web/client-error-reporting"]
+kind = "cross-lang"
+area = "backend"
+area_kind = "other"
+
+[[query]]
+id = "aq-18"
+text = "какой статус отдаёт эндпоинт здоровья сервиса, когда одна зависимость лежит, но часть запросов он ещё обслуживает"
+lang = "ru"
+expect = ["en/api/health-endpoint-design"]
+kind = "cross-lang"
+area = "infra"
+area_kind = "other"
+
+[[query]]
+id = "aq-19"
+text = "why must every time value sent to the API carry an explicit offset, and what happens to a value without one"
+lang = "en"
+expect = ["en/api/timestamps-utc"]
+kind = "paraphrase"
+area = "frontend"
+area_kind = "other"
+
+[[query]]
+id = "aq-20"
+text = "под перестал проходить проверку готовности: его перезапустят или только уберут из балансировки"
+lang = "ru"
+expect = ["ru/infra/readiness-liveness-probes", "insight:k23-n"]
+kind = "paraphrase"
+area = "backend"
+area_kind = "other"
+
+[[query]]
+id = "aq-21"
+text = "the staging build shows the production API address because variables are substituted at build time; how to ship one build to every environment"
+lang = "en"
+expect = ["ru/web/vite-env-variables", "insight:k21-n"]
+kind = "cross-lang"
+area = "infra"
+area_kind = "other"
+
+[[query]]
+id = "aq-22"
+text = "IntersectionObserver rootMargin to request the next page before the user reaches the end of the list"
+lang = "en"
+expect = ["en/web/infinite-scroll"]
+kind = "identifier"
+area = "backend"
+area_kind = "other"
+
+[[query]]
+id = "aq-23"
+text = "импорт файла чуть больше мегабайта на свежем стенде отвергается ещё до сервиса, хотя сервис принимает гораздо больше, почему"
+lang = "ru"
+expect = ["insight:k18-t", "ru/infra/upload-size-limits"]
+kind = "paraphrase"
+area = "frontend"
+area_kind = "other"
+
+[[query]]
+id = "aq-24"
+text = "set lock_timeout for a migration so that waiting for an exclusive lock does not block all readers behind it"
+lang = "en"
+expect = ["en/api/database-statement-timeout", "ru/db/postgres-zero-downtime-migrations"]
+kind = "identifier"
+area = "infra"
+area_kind = "other"
+
+# ---- none: ответ без области ----
+
+[[query]]
+id = "aq-25"
+text = "почему http.Client в Go без явного тайм-аута может положить весь сервис, и какие тайм-ауты задавать отдельно"
+lang = "ru"
+expect = ["ru/ops/timeouts"]
+kind = "identifier"
+area = "backend"
+area_kind = "none"
+
+[[query]]
+id = "aq-26"
+text = "how long do we keep delivery tariffs in cache, and is that cache warmed up before a sale starts"
+lang = "en"
+expect = ["insight:c01-b", "ru/long/checkout-load-testing-report"]
+kind = "cross-lang"
+area = "backend"
+area_kind = "none"
+
+[[query]]
+id = "aq-27"
+text = "можно ли копировать файл базы SQLite обычным cp, пока приложение работает в режиме WAL"
+lang = "ru"
+expect = ["ru/db/sqlite-wal"]
+kind = "paraphrase"
+area = "backend"
+area_kind = "none"
+
+[[query]]
+id = "aq-28"
+text = "MGET после перехода на кластер Redis падает с CROSSSLOT, как держать связанные ключи в одном слоте"
+lang = "ru"
+expect = ["en/long/redis-cluster-migration"]
+kind = "cross-lang"
+area = "backend"
+area_kind = "none"
+
+[[query]]
+id = "aq-29"
+text = "an experiment configured as fifty-fifty ended up 53 to 47; is that just chance or a bug, and how do we catch it"
+lang = "en"
+expect = ["en/long/feature-flag-platform"]
+kind = "paraphrase"
+area = "frontend"
+area_kind = "none"
+
+[[query]]
+id = "aq-30"
+text = "на какой версии Node.js сейчас собирается фронтенд и откуда CI берёт эту версию"
+lang = "ru"
+expect = ["insight:c05-c"]
+kind = "paraphrase"
+area = "frontend"
+area_kind = "none"
+
+[[query]]
+id = "aq-31"
+text = "a commit hook fixed a file by itself and the commit still failed, what am I supposed to do next"
+lang = "en"
+expect = ["ru/devtools/pre-commit-hooks"]
+kind = "cross-lang"
+area = "frontend"
+area_kind = "none"
+
+[[query]]
+id = "aq-32"
+text = "a tiny PR comes with a huge package-lock diff; why does that happen and how should merge conflicts in it be resolved"
+lang = "en"
+expect = ["en/devtools/npm-install-and-lockfile"]
+kind = "paraphrase"
+area = "frontend"
+area_kind = "none"
+
+[[query]]
+id = "aq-33"
+text = "загрузки больших файлов отвечают 502, хотя сервис хранения живой и до него запросы не доходят"
+lang = "ru"
+expect = ["insight:r05-fix", "ru/long/incident-disk-full-logs"]
+kind = "paraphrase"
+area = "infra"
+area_kind = "none"
+
+[[query]]
+id = "aq-34"
+text = "which branches may write the shared CI dependency cache, and why does every new branch start with a cold cache"
+lang = "en"
+expect = ["insight:c08-b", "en/devtools/gha-cache-keys"]
+kind = "paraphrase"
+area = "infra"
+area_kind = "none"
+
+[[query]]
+id = "aq-35"
+text = "browsers accept our certificate but curl and Java or Android clients fail with unable to get local issuer certificate"
+lang = "en"
+expect = ["ru/ops/tls-incomplete-chain", "ru/long/tls-certificate-rotation"]
+kind = "cross-lang"
+area = "infra"
+area_kind = "none"
+
+[[query]]
+id = "aq-36"
+text = "как ядро выбирает, какой процесс убить, когда память кончилась на всём хосте, и как защитить базу от этого"
+lang = "ru"
+expect = ["en/linux/oom-killer-dmesg"]
+kind = "cross-lang"
+area = "infra"
+area_kind = "none"
