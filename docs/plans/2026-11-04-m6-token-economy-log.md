@@ -5037,3 +5037,138 @@ PASS.
 ### Повторное ревью задачи 11 (2026-11-09)
 
 Одобрено. → 13c: формулировку ТЗ §9.2 п. 4 дать с числами §11 «Итог» и пометкой, что при `rerank=on` буст на `other`/`none` не влияет; CHANGELOG — новой записью в разделе M6 (строку M3 не менять).
+
+### Задача 12 (исполнитель). Стенд A/B, `checkpoint_impact`, `holdout` (§12)
+
+Коммит `a7e6f3d` `feat(ab): стенд агентного A/B, checkpoint_impact, holdout`. Прогон A/B на
+живом агенте — владелец, вне приёмки M6 (шаг 3 — только инструкция). Журналы агентов владельца
+не читались: фикстуры теста стенда синтетические (только поля, которые читает стенд, и
+текст-приманка).
+
+**Сделано.**
+- **`cargo xtask ab`** (`xtask/src/ab.rs`) — `--transcripts <каталог> --runs <runs.toml>
+  [--server <url> --token|ZAM_TOKEN] [--out <json>]`; Markdown в stdout, JSON в `--out`.
+  - Транскрипты — рекурсивно `*.jsonl`, построчно в типы только с нужными полями (serde
+    пропускает остальное): Claude Code — `message.usage` (4 поля §12), сообщение, записанное
+    строкой на блок, — один раз по `message.id`; сессия — `sessionId` (файлы субагентов
+    `<id>/subagents/*.jsonl` складываются с сессией); Codex — последний `token_count.info.
+    total_token_usage` (вход без кэша = `input_tokens − cached_input_tokens`), сессия —
+    `session_meta.payload.id`. **[решение исполнителя]** вызовы инструментов (их требует отчёт
+    §12) считаются по **типу** блоков: `tool_use` у Claude Code, `function_call`,
+    `custom_tool_call`, `local_shell_call` у Codex — текст, команды и ответы не читаются в
+    отчёт. Формат Codex взят из знания о rollout-журналах, на реальном журнале не проверен (→
+    владельцу при прогоне: `missing` и нули покажут расхождение).
+  - Память — `GET /sessions/{id}`: сумма `tokens` по событиям и `holdout`; 404 (плечо `off`) —
+    0; без `--server` — `null`.
+  - Отчёт: по прогонам; по плечам — суммы, средние на задачу с 95 % интервалом бутстрепа задач
+    (`BOOTSTRAP_M6` = 10 000, `SEED`; повторы усредняются до бутстрепа), доля успешных; пары —
+    `R = Σ плеча / Σ базы` по общим задачам (всего, вход, чтение кэша, выход, инструменты;
+    `ratio_estimate_with`) и Δ доли успешных. Пары — `[[compare]]` или известные (`off→memory`,
+    `nomap→map`, `noimpact→impact`, `holdout→main`), иначе единственная пара.
+  - Шаблоны: `eval/ab/tasks.toml` — 10 задач по репозиторию (`prompt`, `check`, `expect`: проверка
+    — код 0 **и** строка «1 passed» в выводе, иначе `cargo test` с фильтром проходит с 0 тестов),
+    шесть плеч, `base = "v0.0.11-m6"`; `eval/ab/runs.toml` — описание полей без прогонов.
+    Инструкция — `eval/README.md`, «Агентный A/B (M6 §12)»: ≥ 10 × 2 × 2, чистый worktree на
+    прогон, чередование порядка плеч по задачам, одна модель агента.
+- **`hooks.checkpoint_impact`** (клиент, `false`): `ClientKeys` в `Settings` (`[hooks]` —
+  `HooksSection` с двумя `flatten`: типы подсказок и ключи клиента, проект сильнее домашнего).
+  `checkpoint` на `Stop` с напоминанием: вход — `Ev::Edit` журнала (новые первыми) и очередь
+  изменённых (`cache::peek_changed` — до отправки очереди, она забирает файл; хэши символов из
+  последней строки пути), без повторов, ≤ 20 файлов, тело ≤ 64 КиБ (у старых путей символы
+  снимаются). `POST /code/impact` — в своём потоке, параллельно с `GET /sessions/{id}`, клиент
+  `Env::client_within(60 мс)` (срок — min(60 мс, остаток бюджета)); не ответил — без строк,
+  `code/impact: …` в `hooks.log`. Строки (≤ 3, `impact_lines`): «ZeroAIMemory: правка
+  затрагивает `<путь>[#<символ>]` → <ссылка> «<заголовок ≤ 60>»» — добавляются **только** в
+  напоминание, которое состоялось и без них (`decision: block` по прежним условиям), и не в
+  сессии с `holdout` из `GET /sessions/{id}`. Тестовый срок — `ZAM_TEST_HOOK_IMPACT_MS` (как
+  `ZAM_TEST_HOOK_BUDGET_MS`: только debug или `test-hooks`).
+- **`hooks.holdout`** (клиент, 0..=0,5, 0; вне диапазона — строка `hooks.holdout = … вне …` в
+  `hooks.log` и 0). **[решение исполнителя]** «с вероятностью p» — по хэшу: первые 8 байт
+  blake3(`zam-holdout-v1\0` ‖ id) / 2^64 < p (`holdout_pick`): решение одно на все старты сессии
+  (compact, resume), без состояния; меньшая p — подмножество большей. Метка — отдельным `POST
+  /sessions {id, holdout: true}` **до** `/recall` в том же потоке (иначе первый дайджест ушёл бы
+  до метки; цена — один RTT только у контрольных сессий); 400 старого сервера с `holdout` в
+  `detail` — молча, прочее — `sessions(holdout): …`. Ответ `/recall` с `holdout: true` — тишина и
+  без сводки журнала.
+- **Сервер.** `POST /sessions {id, holdout}` → 201 `{id, holdout}` (без `id` — 400; `false`
+  снимает); регистрация с `parent_id` наследует метку родителя. `zam_store::session_holdout(db,
+  id, parent)` — метка своя, родителя строки или `parent_id` тела (`brief` субагента идёт
+  параллельно с регистрацией). `/recall` не из MCP в такой сессии: сбор как обычно (время ответа
+  сравнимо), затем `text: ""`, `items: []`, `tokens: 0`, `rules_tokens: 0`, `holdout: true`;
+  **[решение исполнителя]** «учёт ведётся» = вызов события `calls + 1` с 0 токенов, без
+  `session_seen` и `usage` (выдачи не было; иначе `--by-holdout` показал бы неполученное). MCP
+  (`origin` есть) — как обычно (§12: «MCP-инструменты работают»).
+
+**Тесты** (окно — 2026-11-08 23:52 … 2026-11-09 00:40; параллельно — чужие `cargo` 254868 с 23:09
+и 243792 с 00:13 без `rustc` в моменты бюджетных прогонов):
+- `xtask --test ab` — 3 (`ab_report_on_fixture`, `ab_missing_transcript_and_bad_outcome`,
+  `ab_templates_valid`), `--bin xtask ab::` — 3; фикстура: Claude Code с повтором строки
+  сообщения и субагентом в отдельном файле, Codex с `info: null`, приманка в тексте; проверено,
+  что каталог транскриптов побайтно тот же, в каталоге теста нет лишних файлов, приманки нет в
+  stdout, stderr и JSON, сервер получил только `GET /sessions/{id}` с токеном;
+- `zam-server --test sessions` — 17 (в т. ч. `holdout_empty_text_and_inherited`), `session_tokens`
+  9, `recall` 40 (+1 ignored), `recall_brief` 6, `recall_recovery` 5; `zam-store --test sessions`
+  15;
+- `zam-cli --bin zam hook::` — 48 (новые: `client_keys_parsed_and_layered`,
+  `holdout_pick_share_and_determinism`, `impact_files_from_journal_and_queue`,
+  `impact_lines_format_and_cap`); `--test hooks` — 68 (новые:
+  `checkpoint_impact_lines_inside_single_reminder`, `checkpoint_impact_timeout_60ms_no_lines`,
+  `session_start_holdout_quiet_group`, `session_start_holdout_old_server_400_ignored`);
+  `--test m4_acceptance` — 5;
+- **`hook_budgets`** (debug, `checkpoint_impact = true`, правка `src/pool.rs` со знанием в каждой
+  сессии `checkpoint`; 2026-11-09 00:13:47–00:15:16): `checkpoint` n=40 p50 24,9 мс, p95 28,2 мс,
+  max 74,0 мс (бюджет 100), строк влияния 40 из 40, тайм-аутов 0; `session-start` p95 53,3 мс,
+  `prompt` 78,7, `post-tool` 84,3, `pre-tool` 63,3, `post-tool-ok` 22,1, `subagent-start` 62,6.
+  В тест добавлено: каждая сессия `checkpoint` правит файл со знанием, и хотя бы одна строка
+  влияния обязательна (иначе замер шёл бы без `POST /code/impact`). Release — справочно не
+  гонялся (§17 п. 15: критерий — release `zam` в 13b);
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -j 2 -- -D warnings` —
+  чисто.
+- **TDD.** Тесты писались до кода; красный прогон сервера не зафиксирован: сборка шла 6 мин и
+  подхватила уже внесённую реализацию (тест сразу PASS). Красное состояние подтверждено откатами
+  ниже.
+
+**Откаты защит** (правка → тест → `git checkout -- <файл>`; `.tmp/m6/task12/rollback.{py,log}`):
+- R1 `recall.rs`: пустой `text` в holdout снят → `holdout_empty_text_and_inherited` FAIL;
+- R2 `sessions.rs`: наследование `parent_id` снято → тот же тест FAIL (`ho-1:a1` без метки);
+- R3 `checkpoint.rs`: срок `/code/impact` 60 мс → 60 с → `checkpoint_impact_timeout_60ms_no_lines`
+  FAIL (хук ждал заглушку 1,5 с и вывел строки);
+- R4 `checkpoint.rs`: строки и в holdout → `checkpoint_impact_lines_inside_single_reminder` FAIL;
+- R5 `session_start.rs`: без `POST /sessions {holdout}` → `session_start_holdout_quiet_group`
+  FAIL;
+- R6 `session_start.rs`: 400 старого сервера не молча → `session_start_holdout_old_server_400_ignored`
+  FAIL;
+- R7 `ab.rs`: сообщение Claude Code суммируется по строкам → `ab_report_on_fixture` FAIL;
+- R8 `ab.rs`: копия транскрипта рядом (`*.jsonl.copy`) → `ab_report_on_fixture` FAIL (снимок
+  каталога транскриптов).
+
+Все восемь — FAIL на откате, после `git checkout -- <файл>` дерево чистое. Дополнительно —
+`cargo clippy -p zam-cli --all-targets --features test-hooks -- -D warnings` чисто.
+
+**Отступления.**
+- Файлы вне брифа: `crates/zam-store/src/{sessions.rs,lib.rs}` (`session_holdout`),
+  `crates/zam-cli/src/cmd/hook/cache.rs` (`peek_changed`), `crates/zam-cli/tests/common/mod.rs`
+  (`stub_body` — заглушка с ответом по телу: 400 только на `{holdout}`), `crates/zam-cli/tests/
+  m4_acceptance.rs` (`checkpoint_impact = true` в `hook_budgets`).
+- Символы правок из журнала: `Ev::Edit` хранит только путь — символы берутся из очереди
+  изменённых (хэши тел, если у пути есть ссылки на символы), иначе путь без символов (сервер
+  отдаёт все знания о файле). Если карта уже синхронизирована после правки, хэши совпадут и
+  строк по символам не будет — это поведение `/code/impact`.
+
+**Передать.**
+- **→ 13a/13c:** CHANGELOG и ТЗ: `cargo xtask ab`, `eval/ab/`, ключи клиента
+  `hooks.checkpoint_impact`, `hooks.holdout`; `POST /sessions {id, holdout}` → `{id, holdout}`,
+  наследование `parent_id`; поле `holdout` ответа `/recall`; `ZAM_TEST_HOOK_IMPACT_MS`. Блок v7 /
+  `guide`: строки «правка затрагивает» в напоминании `Stop`.
+- **→ 13b:** `hook_budgets` на release с `checkpoint_impact = true`; матрица совместимости —
+  `zam` M6 ↔ сервер v0.0.10-m5.7 с `hooks.holdout > 0` (400 молча, тест на заглушке есть).
+- **→ контролёру (вопрос):** holdout гасит только `/recall` (как в §12); локальный вывод хуков
+  без сети — знание о файле `pre-tool`/`post-tool`, триггеры `pre-tool`, напоминание `checkpoint`
+  — в контрольной группе остаётся. Для чистого контроля их тоже стоит гасить (клиент знает
+  метку из ответа `/recall` старта — нужен маркер в кэше сессии). Не делалось: вне §12 и брифа.
+- **→ 12 (A/B, владельцу):** запасные точки `post_tool_coverage` `{2, 4, plain}` и
+  `{3, 6, plain}` (задача 9) и `recall.brief_tokens` 500 (8c) — кандидаты для пары плеч, если
+  прогон покажет потерю подсказок `post_tool` или много субагентов; плечи — через `ZAM_*`
+  сервера, в `tasks.toml` не заведены (сервер один на оба плеча).
+- **→ M7:** счёт токенов памяти субагентов `<сессия>:<agent_id>` в отчёте A/B (сейчас — только
+  сессия прогона; субагентские сессии сервера не суммируются).
