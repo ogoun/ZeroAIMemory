@@ -4379,3 +4379,36 @@ C1, I1–I6, M1–M12 закрыты; новые замечания исправ
 `space_reindex_mark_*` (первая редакция теста ждала точки до создания коллекции — добавлена
 запись, после которой `ensure` создаёт коллекцию, как в `dropped_collection_*`); `zam-store` —
 457 PASS.
+
+### Третье ревью задачи 18a — правки (2026-11-08)
+
+Код N1–N6 верен; тест N1 (`space_reindex_mark_*`) дефекта не ловил: шаг 2a воркера (reindex)
+идёт до шага 3 (`ensure`), коллекцию создавал сам `reindex()` (`created`, `recreated`) и
+пересобирал всё — исход от `rebuild_pass` не зависел (ревьюер откатил правку N1 — тест PASS).
+- **T1.** Решение пересборки одной базы вынесено в `zam_index::worker::rebuild_db(db, user)`
+  (`rebuild_pass` зовёт её); тест вызывает её напрямую: отметка `{"space": null}` — 0 заданий,
+  заметки `indexed`; отметка `{"space": <knowledge>}` — задания и `pending` у заметок обоих
+  пространств (knowledge и rules). **Проверка на откатанной правке N1**: команда ревьюера
+  `git diff 89c6f13 8549596 -- crates/zam-index/src/worker.rs | git apply -R` после переноса
+  кода в `rebuild_db` не применяется («patch does not apply»), поэтому откат сделан
+  эквивалентной правкой в `rebuild_db` (условие пропуска `Some(spec) if … space.is_none()` →
+  `Some(_)`, как до N1): тест **FAILED** («заданий 0», `worker.rs:917`); после
+  `git checkout -- crates/zam-index/src/worker.rs` — **PASS** (полный `--test worker`: 17 PASS,
+  2 ignored). Лог отката — `.tmp/m6/task18a/t4-revert.log`.
+- **P1.** `mark_incomplete` пишет `.zam-restore-incomplete.tmp`, `fsync`, `rename_retry` поверх
+  признака, `fsync` каталога — признак не усекается на месте.
+- **P2.** `moved_to` хранится именем внутри `backups/` (`pre-restore-…`, ASCII); при чтении —
+  только имя `pre-restore-*` без разделителей.
+- **P3.** `rename_retry`: паузы 50 мс, удваиваются, пока сумма ≤ 10 с; каждая попытка — WARN с
+  номером, кодом ошибки и паузой.
+- **P4.** В сборке `<имя>.partial/` — файл-лок `.zam-building` с исключительным локом ОС на
+  всё время копии (снимается и удаляется до переименования, в копию не попадает; у архива — до
+  удаления сборки, после записи `<архив>.tmp`). Чистильщик удаляет сборку, только если её лок
+  свободен (копия умерла — сразу, без срока); сборку без файла-лока (не успел появиться, копия
+  старой версии) — только старше `flag_max_hours`; `<архив>.tmp` — если сборка `<архив>.partial`
+  не залочена или её нет **[решение исполнителя]**. Тест `backup_keeps_live_stage_removes_dead`.
+
+**Проверки** (`ZAM_REQUIRE_ML=1`, Qdrant/ORT/pdfium скопированы в `wt-b/target/deps` и после
+удалены): `fmt --check` — чисто; `clippy -p zam-index -p zam-server -p zam-store --all-targets
+-D warnings` — чисто; `zam-index --test worker` — 17 PASS, 2 ignored; `zam-server --test backup
+--features test-hooks` — 39 PASS.
