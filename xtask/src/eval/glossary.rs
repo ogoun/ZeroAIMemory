@@ -160,6 +160,7 @@ impl GlossarySet {
                     evidence: None,
                     also: Vec::new(),
                     area: None,
+                    area_kind: None,
                 }
             })
             .collect()
@@ -1166,6 +1167,7 @@ expect = ["ru/zam/cache"]
             evidence: None,
             also: Vec::new(),
             area: None,
+            area_kind: None,
         }];
         let mut e = Fake {
             notes: c

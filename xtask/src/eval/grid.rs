@@ -16,7 +16,9 @@
 //! индексе, расхождение выдачи (путь и балл каждого попадания) и порог шума — в отчёте;
 //! `[[part]] name, queries` — дополнительные наборы запросов на том же индексе: отчёт по частям
 //! (основной набор — часть `main`) с односторонними границами Δ nDCG@10 (без поправки и с
-//! поправкой Бонферрони на число сравнений с базой) и долей запросов с nDCG@10 < 1.
+//! поправкой Бонферрони на число сравнений с базой) и долей запросов с nDCG@10 < 1. Запросы
+//! части с `area_kind` (набор областей, M6 §11) отчитываются частями `<часть>_<вид>`
+//! (`area_same`, `area_other`, `area_none`).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -47,6 +49,8 @@ struct GridFile {
     /// A/A-гейт: базовая конфигурация снимается дважды на том же индексе.
     #[serde(default)]
     aa: bool,
+    /// Снятий базы в A/A-гейте (≥ 2; по умолчанию 2): каждое следующее сравнивается с первым.
+    aa_k: Option<usize>,
     /// Дополнительные наборы запросов (части отчёта) поверх основного (`main`).
     #[serde(default)]
     part: Vec<PartFile>,
@@ -95,6 +99,15 @@ pub struct AaGate {
     pub differ: Vec<String>,
     /// 95-й перцентиль |Δ nDCG@10| запроса между снятиями — по частям.
     pub noise_p95: BTreeMap<String, f64>,
+    /// Снятий базы (K).
+    #[serde(default)]
+    pub snapshots: usize,
+    /// A/A по метрике: запросов с Δ nDCG@10 ≠ 0 хотя бы в одной паре снятий — по частям.
+    #[serde(default)]
+    pub ndcg_changed: BTreeMap<String, usize>,
+    /// A/A по метрике: максимум |Δ nDCG@10| запроса по парам снятий — по частям.
+    #[serde(default)]
+    pub ndcg_max_abs: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -233,7 +246,12 @@ fn load_parts(
         super::corpus::validate(corpus, &qs, false)
             .with_context(|| format!("часть «{}» ({})", pf.name, pf.queries))?;
         for q in qs {
-            if part_of.insert(q.id.clone(), pf.name.clone()).is_some() {
+            // набор областей (§11): виды `same`/`other`/`none` — отдельные части отчёта
+            let part = match q.area_kind {
+                Some(k) => format!("{}_{}", pf.name, k.as_str()),
+                None => pf.name.clone(),
+            };
+            if part_of.insert(q.id.clone(), part).is_some() {
                 bail!("запрос {} повторяется в частях сетки", q.id);
             }
             all.push(q);
@@ -264,25 +282,36 @@ fn part_name(part_of: &BTreeMap<String, String>, id: &str) -> String {
     part_of.get(id).cloned().unwrap_or_else(|| MAIN_PART.into())
 }
 
-/// A/A-гейт по двум снятиям базы.
-fn aa_gate(a: &[QueryRun], b: &[QueryRun], part_of: &BTreeMap<String, String>) -> AaGate {
-    let differ: Vec<String> = a
-        .iter()
-        .zip(b)
-        .filter(|(x, y)| hits_key(x) != hits_key(y))
-        .map(|(x, _)| x.id.clone())
-        .collect();
+/// A/A-гейт по снятиям базы: `a` — первое, `rest` — следующие (каждое сравнивается с первым).
+fn aa_gate(a: &[QueryRun], rest: &[Vec<QueryRun>], part_of: &BTreeMap<String, String>) -> AaGate {
+    const EPS: f64 = 1e-12;
+    let mut differ: Vec<String> = Vec::new();
     let mut by_part: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for (x, y) in a.iter().zip(b) {
-        by_part
-            .entry(part_name(part_of, &x.id))
-            .or_default()
-            .push((x.metrics.ndcg10 - y.metrics.ndcg10).abs());
+    let mut changed: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    let mut max_abs: BTreeMap<String, f64> = BTreeMap::new();
+    for b in rest {
+        for (x, y) in a.iter().zip(b) {
+            if hits_key(x) != hits_key(y) && !differ.contains(&x.id) {
+                differ.push(x.id.clone());
+            }
+            let part = part_name(part_of, &x.id);
+            let d = (x.metrics.ndcg10 - y.metrics.ndcg10).abs();
+            by_part.entry(part.clone()).or_default().push(d);
+            let set = changed.entry(part.clone()).or_default();
+            if d > EPS {
+                set.insert(x.id.clone());
+            }
+            let m = max_abs.entry(part).or_insert(0.0);
+            *m = m.max(d);
+        }
     }
     AaGate {
         equal: differ.is_empty(),
         differ,
         noise_p95: by_part.into_iter().map(|(k, v)| (k, p95(v))).collect(),
+        snapshots: rest.len() + 1,
+        ndcg_changed: changed.into_iter().map(|(k, v)| (k, v.len())).collect(),
+        ndcg_max_abs: max_abs,
     }
 }
 
@@ -433,8 +462,11 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query], file: &P
             }
             let runs = s.run_queries(queries, mode)?;
             if g.aa && ci == 0 {
-                // A/A-гейт: второе снятие базы на том же индексе и том же сервере
-                let again = s.run_queries(queries, mode)?;
+                // A/A-гейт: ещё K − 1 снятий базы на том же индексе и том же сервере
+                let mut again = Vec::new();
+                for _ in 1..g.aa_k.unwrap_or(2).max(2) {
+                    again.push(s.run_queries(queries, mode)?);
+                }
                 let gate = aa_gate(&runs, &again, &part_of);
                 if gate.equal {
                     println!("A/A {}: побайтово", c.name);
@@ -772,7 +804,9 @@ pub fn grid_md(g: &GridResult) -> String {
     if let Some(gate) = &g.aa {
         let _ = writeln!(
             s,
-            "\n## A/A-гейт базы\n\n- выдача {}; порог шума (p95 |Δ nDCG@10| запроса): {}",
+            "\n## A/A-гейт базы\n\n- снятий {}; выдача {}; порог шума (p95 |Δ nDCG@10| запроса): {}\n\
+             - по метрике (запросов с Δ nDCG@10 ≠ 0 / максимум |Δ|): {}",
+            gate.snapshots,
             if gate.equal {
                 "побайтово равна".to_string()
             } else {
@@ -785,6 +819,14 @@ pub fn grid_md(g: &GridResult) -> String {
             gate.noise_p95
                 .iter()
                 .map(|(k, v)| format!("{k} {v:.3}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            gate.ndcg_changed
+                .iter()
+                .map(|(k, n)| format!(
+                    "{k} {n} / {:.3}",
+                    gate.ndcg_max_abs.get(k).copied().unwrap_or(0.0)
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -989,6 +1031,59 @@ mod tests {
         assert_eq!(p95(vec![0.0; 19].into_iter().chain([1.0]).collect()), 0.0);
         assert_eq!(p95(vec![0.0, 1.0]), 1.0);
         assert!(parse_mode(Some("hybrid+rerank")).is_ok() && parse_mode(Some("fts")).is_err());
+    }
+
+    /// A/A-гейт по K снятиям: выдача (путь и балл) и метрика по частям — число запросов с
+    /// Δ nDCG@10 ≠ 0 хотя бы в одной паре и максимум |Δ| (задача 11).
+    #[test]
+    fn aa_gate_k_snapshots_by_metric() {
+        let run = |id: &str, ndcg: f64, score: f64| QueryRun {
+            id: id.into(),
+            text: String::new(),
+            kind: crate::eval::corpus::Kind::Paraphrase,
+            lang: crate::eval::corpus::Lang::En,
+            disjoint: false,
+            expect: Vec::new(),
+            also: Vec::new(),
+            forbid: Vec::new(),
+            weaker: Vec::new(),
+            long: false,
+            fts_only: false,
+            metrics: crate::eval::metrics::QueryMetrics {
+                ndcg10: ndcg,
+                ..Default::default()
+            },
+            cancelled5_history: None,
+            reliable_first_no_boost: None,
+            leaves: Vec::new(),
+            hits: vec![run::Hit {
+                path: "p".into(),
+                score,
+                sources: Vec::new(),
+                reranked: false,
+            }],
+            ms: 0.0,
+            server_ms: serde_json::Value::Null,
+        };
+        let part_of: BTreeMap<String, String> = [("a", "main"), ("b", "area_same")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let first = vec![run("a", 1.0, 0.5), run("b", 0.5, 0.4)];
+        let g = aa_gate(&first, &[first.clone(), first.clone()], &part_of);
+        assert!(g.equal && g.differ.is_empty(), "{g:?}");
+        assert_eq!(g.snapshots, 3);
+        assert_eq!(g.ndcg_changed["area_same"], 0);
+        // третье снятие: у «a» сдвинут балл (метрика та же), у «b» nDCG@10 другой
+        let third = vec![run("a", 1.0, 0.51), run("b", 0.25, 0.4)];
+        let g = aa_gate(&first, &[first.clone(), third], &part_of);
+        assert!(!g.equal);
+        assert_eq!(g.differ, vec!["a".to_string()]);
+        assert_eq!(
+            (g.ndcg_changed["main"], g.ndcg_changed["area_same"]),
+            (0, 1)
+        );
+        assert!((g.ndcg_max_abs["area_same"] - 0.25).abs() < 1e-12);
     }
 
     #[test]

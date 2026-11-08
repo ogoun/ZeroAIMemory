@@ -251,11 +251,38 @@ pub struct Query {
     /// Текущая область запроса (M6 §11): уходит заголовком `X-Zam-Area` (буст области).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub area: Option<String>,
+    /// Вид запроса набора областей (M6 §11, `eval/area-queries.toml`): где ответ относительно
+    /// текущей области `area`. Требует `area`; проверяется по областям целей; сетка отчитывается
+    /// по видам отдельными частями (`<часть>_<вид>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area_kind: Option<AreaKind>,
     /// Дополнительно релевантные цели (`insight:<key>` или заметки M3): засчитываются в метриках
     /// прогона вместе с `expect`, в сравнении с прежним прогоном (`--compare`) не участвуют —
     /// разметка M2 (`id`, `expect`) не меняется.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also: Vec<String>,
+}
+
+/// Вид запроса набора областей (M6 §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AreaKind {
+    /// Ответ в текущей области; рядом сосед той же темы из другой.
+    Same,
+    /// Ответ в другой области.
+    Other,
+    /// Ответ без области.
+    None,
+}
+
+impl AreaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AreaKind::Same => "same",
+            AreaKind::Other => "other",
+            AreaKind::None => "none",
+        }
+    }
 }
 
 impl Query {
@@ -939,6 +966,14 @@ impl Target<'_> {
             Target::Insight(i) => format!("{INSIGHT_REF}{}", i.key),
         }
     }
+
+    /// Область цели: заметки — по [`AREAS_FILE`], insight — поле `area`.
+    fn area<'c>(&'c self, corpus: &'c Corpus) -> Option<&'c str> {
+        match self {
+            Target::Note(n) => corpus.areas.get(&n.path).map(String::as_str),
+            Target::Insight(i) => i.area.as_deref(),
+        }
+    }
 }
 
 fn resolve<'a>(corpus: &'a Corpus, r: &str) -> Option<Target<'a>> {
@@ -1125,6 +1160,29 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         }
         if q.area.as_deref().is_some_and(|a| !AREAS.contains(&a)) {
             bad(format!("область — одна из {}", AREAS.join(", ")));
+        }
+        if let Some(ak) = q.area_kind {
+            match q.area.as_deref() {
+                None => bad("area_kind без area".into()),
+                Some(cur) => {
+                    for t in &targets {
+                        let ta = t.area(corpus);
+                        let ok = match ak {
+                            AreaKind::Same => ta == Some(cur),
+                            AreaKind::Other => ta.is_some_and(|a| a != cur),
+                            AreaKind::None => ta.is_none(),
+                        };
+                        if !ok {
+                            bad(format!(
+                                "area_kind = {}, область {} — {}",
+                                ak.as_str(),
+                                t.name(),
+                                ta.unwrap_or("нет")
+                            ));
+                        }
+                    }
+                }
+            }
         }
         // полный набор: виды M2 — поиск заметок; во фрагменте (`--queries`, наборы M6 вроде
         // `kind-queries.toml`) вид описывает формулировку, и ответом может быть insight
@@ -1488,6 +1546,7 @@ pub fn tests_query(id: &str, note: &str) -> Query {
         evidence: None,
         also: Vec::new(),
         area: None,
+        area_kind: None,
     }
 }
 
@@ -1575,6 +1634,7 @@ mod tests {
             evidence: None,
             also: Vec::new(),
             area: None,
+            area_kind: None,
         }
     }
 
@@ -1659,6 +1719,55 @@ mod tests {
             err.contains("IntersectionObserver") && err.contains("insight:old"),
             "{err}"
         );
+    }
+
+    /// Набор областей (M6 §11): `area_kind` требует `area` и сверяется с областью каждой цели
+    /// (заметка — `areas.toml`, insight — поле `area`); разбор `same`/`other`/`none`.
+    #[test]
+    fn area_kind_checked_against_target_areas() {
+        let mut c = m3_corpus();
+        c.insights[0].area = Some("backend".into());
+        c.areas.insert("en/long/ingest".into(), "infra".into());
+        let mk = |id: &str, area: Option<&str>, ak: AreaKind, expect: &str| {
+            let mut x = q(
+                id,
+                "query text",
+                Lang::En,
+                &[expect],
+                Kind::Paraphrase,
+                false,
+            );
+            x.area = area.map(String::from);
+            x.area_kind = Some(ak);
+            x
+        };
+        let ok = [
+            mk("s", Some("backend"), AreaKind::Same, "insight:old"),
+            mk("o", Some("frontend"), AreaKind::Other, "en/long/ingest"),
+            mk("n", Some("infra"), AreaKind::None, "insight:new"),
+        ];
+        validate(&c, &ok, false).unwrap();
+        let bad = [
+            mk("s2", Some("infra"), AreaKind::Same, "insight:old"),
+            mk("o2", Some("infra"), AreaKind::Other, "en/long/ingest"),
+            mk("o3", Some("infra"), AreaKind::Other, "insight:new"),
+            mk("n2", Some("infra"), AreaKind::None, "insight:old"),
+            mk("x", None, AreaKind::Same, "insight:old"),
+        ];
+        let err = validate(&c, &bad, false).unwrap_err().to_string();
+        for id in ["s2", "o2", "o3", "n2"] {
+            assert!(
+                err.contains(&format!("запрос {id}: area_kind")),
+                "{id}: {err}"
+            );
+        }
+        assert!(err.contains("запрос x: area_kind без area"), "{err}");
+        let t: QueryFile = toml::from_str(
+            "[[query]]\nid = \"a\"\ntext = \"t\"\nlang = \"en\"\nexpect = [\"x\"]\n\
+             kind = \"exact\"\narea = \"infra\"\narea_kind = \"none\"\n",
+        )
+        .unwrap();
+        assert_eq!(t.query[0].area_kind, Some(AreaKind::None));
     }
 
     /// Пары §10 считаются двояко: все «`hypothesis` `gotcha` → `theorem`» и только те, где

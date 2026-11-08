@@ -400,6 +400,81 @@ pub struct QueryResult {
     pub ms: f64,
     /// Первые 5 выдачи: `файл · locator` или путь заметки.
     pub top5: Vec<String>,
+    /// Выдача целиком (первые 10): сверка прогонов побайтово (A/A, `w_attach = 1,0`, M6 §11).
+    #[serde(default)]
+    pub hits: Vec<DocHit>,
+    /// То же при `filters.kinds = ["attachment"]`.
+    #[serde(default)]
+    pub hits_attach: Vec<DocHit>,
+}
+
+/// Попадание выдачи для побайтовой сверки: вид, путь заметки (у вложения — владельца), файл и
+/// `locator` вложения, балл.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocHit {
+    pub kind: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+    pub score: f64,
+}
+
+fn doc_hits(v: &Value) -> Vec<DocHit> {
+    v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(TOP_K)
+        .map(|it| DocHit {
+            kind: it["kind"].as_str().unwrap_or_default().to_string(),
+            path: it["path"].as_str().unwrap_or_default().to_string(),
+            file: it["file"].as_str().map(String::from),
+            locator: it["locator"].as_str().map(String::from),
+            score: it["score"].as_f64().unwrap_or(f64::NAN),
+        })
+        .collect()
+}
+
+/// Основной набор `eval/queries.toml` на сервере с вложениями (M6 §11: «основной набор без
+/// регрессии» при `search.w_attach`): метрики и выдача каждого запроса.
+#[derive(Debug, Clone, Serialize)]
+pub struct MainQuality {
+    pub n: usize,
+    pub ndcg10: Estimate,
+    pub recall5: Estimate,
+    pub queries: Vec<MainQuery>,
+}
+
+/// Запрос основного набора: nDCG@10, recall@5 и выдача (путь, балл).
+#[derive(Debug, Clone, Serialize)]
+pub struct MainQuery {
+    pub id: String,
+    pub text: String,
+    pub ndcg10: f64,
+    pub recall5: f64,
+    pub hits: Vec<(String, f64)>,
+}
+
+fn main_quality(runs: &[super::run::QueryRun]) -> MainQuality {
+    let n: Vec<f64> = runs.iter().map(|q| q.metrics.ndcg10).collect();
+    let r: Vec<f64> = runs.iter().map(|q| q.metrics.recall5).collect();
+    MainQuality {
+        n: runs.len(),
+        ndcg10: estimate(&n),
+        recall5: estimate(&r),
+        queries: runs
+            .iter()
+            .map(|q| MainQuery {
+                id: q.id.clone(),
+                text: q.text.clone(),
+                ndcg10: q.metrics.ndcg10,
+                recall5: q.metrics.recall5,
+                hits: q.hits.iter().map(|h| (h.path.clone(), h.score)).collect(),
+            })
+            .collect(),
+    }
 }
 
 /// Метрики подмножества запросов.
@@ -561,6 +636,9 @@ pub struct DocsReport {
     pub previews: Vec<PreviewTime>,
     pub cache: Option<CacheStats>,
     pub server_alive: bool,
+    /// Основной набор на сервере с вложениями (кроме `--docs-only`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main: Option<MainQuality>,
 }
 
 /// Тело `POST /blobs`.
@@ -990,10 +1068,12 @@ fn run_server(
     };
     let server = server_dir(a, p)?;
     let mut s = Session::start(p, &spec, &server, !a.reuse)?;
+    let mut main_queries = Vec::new();
     let main_texts: Vec<String> = if a.docs_only {
         Vec::new()
     } else {
         let (corpus, queries, _) = load_set(p, true)?;
+        main_queries = queries.clone();
         if !a.reuse {
             println!("загрузка корпуса заметок eval/corpus…");
             s.load_corpus(&corpus)?;
@@ -1166,6 +1246,7 @@ fn run_server(
         };
         let rank = items.iter().take(TOP_K).position(is_fact).map(|i| i + 1);
         let only = search_attachments(&s, &q.text, mode)?;
+        let hits_attach = doc_hits(&only);
         let rank_attach = only["items"]
             .as_array()
             .and_then(|a| a.iter().take(TOP_K).position(is_fact))
@@ -1218,8 +1299,20 @@ fn run_server(
             loc5,
             ms,
             top5,
+            hits: doc_hits(&v),
+            hits_attach,
         });
     }
+    // качество основного набора с вложениями (выдача и метрики по запросам)
+    let main = if main_queries.is_empty() {
+        None
+    } else {
+        println!(
+            "основной набор с вложениями: качество ({} запросов)…",
+            main_queries.len()
+        );
+        Some(main_quality(&s.run_queries(&main_queries, mode)?))
+    };
     let latency_after = if main_texts.is_empty() {
         None
     } else {
@@ -1316,6 +1409,7 @@ fn run_server(
         previews,
         cache,
         server_alive,
+        main,
     })
 }
 
@@ -1367,6 +1461,14 @@ pub fn docs_md(r: &DocsReport) -> String {
         "\nЛатентность запросов набора (клиент): p50 {:.1} мс, p95 {:.1} мс.\n",
         r.latency_docs.p50, r.latency_docs.p95
     ));
+    if let Some(m) = &r.main {
+        s.push_str(&format!(
+            "Основной набор с вложениями ({} запросов): nDCG@10 {}, recall@5 {}.\n",
+            m.n,
+            est(&m.ndcg10),
+            est(&m.recall5)
+        ));
+    }
     if let (Some(b), Some(a)) = (&r.latency_before, &r.latency_after) {
         s.push_str(&format!(
             "Основной набор ({} запросов, второй проход): без вложений p50 {:.1} / p95 {:.1} мс, \
@@ -1459,6 +1561,36 @@ fn per_query(v: &Value, metric: &str, format: Option<&str>) -> BTreeMap<String, 
         .collect()
 }
 
+/// Односторонняя нижняя граница Δ среднего `b − a` (парный бутстреп [`super::metrics::BOOTSTRAP_M6`],
+/// перцентиль `alpha`).
+fn one_sided_lo(a: &[f64], b: &[f64], alpha: f64) -> f64 {
+    let ones = vec![1.0; a.len()];
+    super::metrics::paired_ratio_q(
+        a,
+        &ones,
+        b,
+        &ones,
+        super::metrics::BOOTSTRAP_M6,
+        (alpha, 1.0 - alpha),
+    )
+    .map_or(f64::NAN, |q| q.lo)
+}
+
+/// Основной набор прогона (`main` JSON отчёта): id → (nDCG@10, выдача). Нет — `None`.
+fn main_per_query(v: &Value) -> Option<BTreeMap<String, (f64, Value)>> {
+    let qs = v["main"]["queries"].as_array()?;
+    Some(
+        qs.iter()
+            .map(|q| {
+                (
+                    q["id"].as_str().unwrap_or_default().to_string(),
+                    (q["ndcg10"].as_f64().unwrap_or(0.0), q["hits"].clone()),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Общие запросы пары прогонов, у которых разный текст или факт (набор запросов правили между
 /// прогонами — разности по `id` тогда сравнивали бы разные вопросы). Текст — с задачи 12 M5;
 /// у прогонов раньше его нет, тогда сверяется только факт.
@@ -1493,10 +1625,17 @@ fn compare_runs(a: &EvalArgs, p: &Paths) -> Result<()> {
         bail!("--compare: пары файлов «база новый»");
     }
     let fmt = a.docs_format.as_deref();
+    // поправка Бонферрони — на число пар одного вызова (сравнения с базой)
+    let pairs = (a.compare.len() / 2).max(1);
     let mut md = format!(
         "# Парные разности прогонов eval документов ({})\n\nБутстреп по запросам, {} выборок \
          (`metrics::paired_diff_with`); запросы — общие у пары{}.\n\n\
-         | Новый − база | n | Δ recall@5 | Δ MRR@10 | Δ loc@5 |\n|---|---:|---|---|---|\n",
+         У Δ документов в скобках — односторонние нижние границы 95 %: без поправки и с поправкой \
+         Бонферрони на число пар вызова. Δ nDCG@10 основного — `eval/queries.toml` на сервере \
+         с вложениями (односторонняя нижняя \
+         граница 95 % — 5-й перцентиль); «≠ выдача» — запросов, у которых первые 10 (вид, путь, \
+         файл, `locator`, балл) различаются: документы (смешанная / одни вложения) и основной.\n\n\
+         | Новый − база | n | Δ recall@5 | Δ MRR@10 | Δ loc@5 | Δ nDCG@10 основного [lo 5 %] | ≠ выдача док. / влож. / осн. |\n|---|---:|---|---|---|---|---|\n",
         today(),
         PAIRED_BOOTSTRAP,
         fmt.map(|f| format!(", только формат `{f}`"))
@@ -1527,8 +1666,60 @@ fn compare_runs(a: &EvalArgs, p: &Paths) -> Result<()> {
             let xa: Vec<f64> = ids.iter().map(|k| x[*k]).collect();
             let ya: Vec<f64> = ids.iter().map(|k| y[*k]).collect();
             let e = super::metrics::paired_diff_with(&xa, &ya, PAIRED_BOOTSTRAP);
-            cells.push(super::report::diff(&e));
+            cells.push(format!(
+                "{} [{:+.4}; {:+.4}]",
+                super::report::diff(&e),
+                one_sided_lo(&xa, &ya, 0.05),
+                one_sided_lo(&xa, &ya, 0.05 / pairs as f64)
+            ));
         }
+        let main_cell = match (main_per_query(&base), main_per_query(&new)) {
+            (Some(x), Some(y)) => {
+                let ids: Vec<&String> = x.keys().filter(|k| y.contains_key(*k)).collect();
+                let xa: Vec<f64> = ids.iter().map(|k| x[*k].0).collect();
+                let ya: Vec<f64> = ids.iter().map(|k| y[*k].0).collect();
+                let e = super::metrics::paired_diff_with(&xa, &ya, PAIRED_BOOTSTRAP);
+                format!(
+                    "{} [{:+.4}]",
+                    super::report::diff(&e),
+                    one_sided_lo(&xa, &ya, 0.05)
+                )
+            }
+            _ => "—".into(),
+        };
+        let differ = |key: &str| -> usize {
+            let index = |v: &Value| -> BTreeMap<String, Value> {
+                v["queries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|q| {
+                        (
+                            q["id"].as_str().unwrap_or_default().to_string(),
+                            q[key].clone(),
+                        )
+                    })
+                    .collect()
+            };
+            let (x, y) = (index(&base), index(&new));
+            x.iter()
+                .filter(|(k, v)| y.get(*k).is_some_and(|w| w != *v))
+                .count()
+        };
+        let main_differ = match (main_per_query(&base), main_per_query(&new)) {
+            (Some(x), Some(y)) => x
+                .iter()
+                .filter(|(k, v)| y.get(*k).is_some_and(|w| w.1 != v.1))
+                .count()
+                .to_string(),
+            _ => "—".into(),
+        };
+        cells.push(main_cell);
+        cells.push(format!(
+            "{} / {} / {main_differ}",
+            differ("hits"),
+            differ("hits_attach")
+        ));
         let name = |f: &PathBuf| {
             f.file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -1691,6 +1882,8 @@ mod tests {
             loc5: ok == Some(true),
             ms: 1.0,
             top5: Vec::new(),
+            hits: Vec::new(),
+            hits_attach: Vec::new(),
         };
         let rs = [q(Some(1), Some(true)), q(Some(7), None), q(None, None)];
         let agg = aggregate(&rs.iter().collect::<Vec<_>>());
