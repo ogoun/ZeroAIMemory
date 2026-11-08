@@ -814,7 +814,9 @@ pub fn classify(text: &str, count: &dyn Fn(&str) -> usize) -> BTreeMap<String, u
     let mut section: Option<&str> = None;
     for line in text.lines() {
         let t = line.trim_start();
-        if t.starts_with("### ") || t.starts_with("## ") {
+        // заголовок раздела — с начала строки: `## ` внутри текста правила (строки с отступом)
+        // раздел не закрывает (ревью 8c)
+        if line.starts_with("### ") || line.starts_with("## ") {
             section = None;
             if JOURNAL_SECTIONS.iter().any(|s| t.starts_with(s)) {
                 section = Some(class::JOURNAL);
@@ -825,6 +827,12 @@ pub fn classify(text: &str, count: &dyn Fn(&str) -> usize) -> BTreeMap<String, u
             } else if t.starts_with(RULES_SECTION) {
                 section = Some(class::RULES);
             }
+        }
+        // раздел Rules кончается пустой строкой: блоки правил пустых строк не содержат, а у
+        // B5.6/B5.7 без «Ловушек» сразу за Rules через пустую строку идёт сводка журнала клиента
+        // «ZeroAIMemory: До сжатия …» (ревью 8c) — она не Rules
+        if t.is_empty() && section == Some(class::RULES) {
+            section = None;
         }
         // строки после правил (словарь, проверенные команды, карта кода) идут под тем же
         // заголовком, но к Rules не относятся
@@ -2685,11 +2693,7 @@ fn run_session(
     agent: Option<HookAgent>,
 ) -> Result<SessionRun> {
     let w = world(sp, corpus)?;
-    let name = if rep == 0 {
-        format!("sessions-{label}-{}", sp.id)
-    } else {
-        format!("sessions-{label}-{}-r{rep}", sp.id)
-    };
+    let name = session_dir_name(label, &sp.id, rep);
     let mut s = Session::start(p, &spec(name.clone(), sets.to_vec()), server, true)?;
     s.check_model()?;
     let (refs, due, wnotes) = load_world(&mut s, &w, f)?;
@@ -2748,14 +2752,42 @@ fn run_session(
     s.stop()?;
     // каталог сессии (сервер, Qdrant, модель) — ≈ 0,4 ГБ; сетка из 10 точек × 3 повтора × 14
     // сессий заняла бы ≈ 180 ГБ (задача 8c: диск H: кончился посреди сетки). Результат уже в
-    // `SessionRun` (тексты шагов), каталог удаляется; оставить — `ZAM_EVAL_KEEP_SESSIONS=1`
-    if std::env::var_os("ZAM_EVAL_KEEP_SESSIONS").is_none() {
+    // `SessionRun` (тексты шагов), каталог удаляется; оставить — `ZAM_EVAL_KEEP_SESSIONS` с
+    // непустым значением, кроме «0». При ошибке сессии каталог остаётся для разбора: прогон на
+    // этом обрывается, так что остаётся один каталог (`main` называет его в ошибке)
+    if !keep_sessions(std::env::var("ZAM_EVAL_KEEP_SESSIONS").ok().as_deref()) {
         let dir = p.work.join(&name);
         if let Err(e) = fs::remove_dir_all(&dir) {
             println!("    каталог {} не удалён: {e}", dir.display());
         }
     }
     Ok(r)
+}
+
+/// `--arm` (сравнение сохранённых плеч без прогона) с `--grid` — ошибка: сетка молча не
+/// прогналась бы (ревью 8c).
+fn refuse_grid_with_arm(a: &EvalArgs) -> Result<()> {
+    if let (Some(_), Some(g)) = (&a.arm, &a.grid) {
+        bail!(
+            "--arm вместе с --grid ({}): сравнение сохранённых плеч идёт без прогона",
+            g.display()
+        );
+    }
+    Ok(())
+}
+
+/// Имя каталога сессии в `target/eval` (`run_session`).
+fn session_dir_name(label: &str, id: &str, rep: usize) -> String {
+    if rep == 0 {
+        format!("sessions-{label}-{id}")
+    } else {
+        format!("sessions-{label}-{id}-r{rep}")
+    }
+}
+
+/// Оставлять каталоги сессий: `ZAM_EVAL_KEEP_SESSIONS` задана, не пуста и не «0».
+fn keep_sessions(v: Option<&str>) -> bool {
+    v.is_some_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
 /// Фоновая синхронизация карты кода, которую запускают хуки M5.6+, должна закончиться до
@@ -2850,6 +2882,7 @@ pub fn own_exclusions(f: &Feats) -> Exclusions {
 pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     // до любой работы: сетка на holdout запрещена (§3.5)
     super::grid::refuse_holdout(a.grid.as_deref(), a.split)?;
+    refuse_grid_with_arm(a)?;
     if let Some(arm) = &a.arm {
         return compare_files(&p.repo, arm, &a.compare);
     }
@@ -2954,7 +2987,11 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     caps::check_known(&base_env)?;
     // точки: сетка (задача 8c) или одна точка без имени; переопределения точки — поверх общих
     let mut results: Vec<(String, PathBuf, SessionsResult)> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     for pt in &pts {
+        // сутки UTC точки — на её старте: точка, перешедшая полночь UTC, остаётся точкой своего
+        // дня (окна дайджеста сервер считает от суток загрузки мира)
+        let date = run::today_utc();
         let mut env = base_env.clone();
         for (k, v) in &pt.env {
             env.retain(|(x, _)| x != k);
@@ -3003,7 +3040,17 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                     &run_label,
                     &count,
                     a.hook_agent,
-                )?;
+                )
+                .with_context(|| {
+                    format!(
+                        "сессия {} r{rep}: каталог {} оставлен для разбора (≈ 0,4 ГБ — удалить \
+                         после разбора)",
+                        sp.id,
+                        p.work
+                            .join(session_dir_name(&run_label, &sp.id, rep))
+                            .display()
+                    )
+                })?;
                 let mut r = r;
                 r.split = part.as_str().to_string();
                 let ss = summarize(std::slice::from_ref(&r), &own_exclusions(&f));
@@ -3052,7 +3099,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         let ex = Exclusions::of(&f);
         let r = SessionsResult {
             info: SessionsInfo {
-                date: run::today_utc(),
+                date: date.clone(),
                 git: run::git_rev(&p.repo),
                 label: a.label.clone(),
                 split: part.as_str().to_string(),
@@ -3111,30 +3158,57 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         let (j, m) = write_pair(&prefix, &r, &md)?;
         print!("{md}");
         println!("  {}\n  {}", j.display(), m.display());
+        // сбой сравнения (другая дата UTC, агент, набор, нечитаемая база) сетку не рвёт:
+        // точки дороже сравнений — сообщение сейчас и итог в конце (ненулевой код)
         for b in &a.compare {
-            let mut base = read_result(b)?;
-            recount(&mut base, &count);
-            let c = compare(&base, &r, (&file_name(b), &stem))?;
             let cp = PathBuf::from(format!("{}-vs-{}", prefix.display(), file_name(b)));
-            let cmd = super::report::sessions_comparison_md(&c);
-            let (j, m) = write_pair(&cp, &c, &cmd)?;
-            print!("{cmd}");
-            println!("  {}\n  {}", j.display(), m.display());
+            let base = read_result(b).map(|mut base| {
+                recount(&mut base, &count);
+                base
+            });
+            try_compare(&mut failed, base, &r, (&file_name(b), &stem), &cp);
         }
         results.push((stem, prefix, r));
     }
     // точки сетки — против первой (у неё — умолчания или текущие значения)
     if let Some((first_stem, _, first)) = results.first() {
         for (stem, prefix, r) in &results[1..] {
-            let c = compare(first, r, (first_stem, stem))?;
             let cp = PathBuf::from(format!("{}-vs-{first_stem}", prefix.display()));
-            let cmd = super::report::sessions_comparison_md(&c);
-            let (j, m) = write_pair(&cp, &c, &cmd)?;
-            print!("{cmd}");
-            println!("  {}\n  {}", j.display(), m.display());
+            try_compare(&mut failed, Ok(first.clone()), r, (first_stem, stem), &cp);
         }
     }
+    if !failed.is_empty() {
+        bail!(
+            "прогон записан, но сравнений не записано: {} — сравнить --arm/--compare:\n  {}",
+            failed.len(),
+            failed.join("\n  ")
+        );
+    }
     Ok(())
+}
+
+/// Сравнение плеча с базой (файлы `<cp>.{json,md}` и отчёт в stdout); сбой — сообщение в
+/// `failed` и в stdout, прогон продолжается (сетку сравнение не рвёт, ревью 8c).
+fn try_compare(
+    failed: &mut Vec<String>,
+    base: Result<SessionsResult>,
+    arm: &SessionsResult,
+    names: (&str, &str),
+    cp: &Path,
+) {
+    let one = base.and_then(|base| {
+        let c = compare(&base, arm, names)?;
+        let cmd = super::report::sessions_comparison_md(&c);
+        let (j, m) = write_pair(cp, &c, &cmd)?;
+        print!("{cmd}");
+        println!("  {}\n  {}", j.display(), m.display());
+        Ok(())
+    });
+    if let Err(e) = one {
+        let msg = format!("{} против {}: {e:#}", names.1, names.0);
+        println!("  сравнение не записано: {msg}");
+        failed.push(msg);
+    }
 }
 
 /// Точки прогона ТС-2: сетка `--grid` (только dev; `--set` вместе с ней — ошибка: точка описана
@@ -3808,6 +3882,10 @@ queries = ["c"]
         let e =
             session_points(&parse(&["--sessions", "--split", "dev", "--grid", &fs_])).unwrap_err();
         assert!(format!("{e:#}").contains("меняет индекс"), "{e:#}");
+        // --arm вместе с --grid — ошибка (ревью 8c, п. 12)
+        let both = parse(&["--sessions", "--arm", "x.json", "--grid", &g]);
+        assert!(format!("{:#}", refuse_grid_with_arm(&both).unwrap_err()).contains("--arm вместе"));
+        assert!(refuse_grid_with_arm(&parse(&["--sessions", "--arm", "x.json"])).is_ok());
         // holdout с сеткой — отказ до любой работы
         assert!(crate::eval::grid::refuse_holdout(Some(&grid), Some(Part::Holdout)).is_err());
     }
@@ -3837,6 +3915,77 @@ queries = ["c"]
         assert_eq!(step_tokens(&step(label::SESSION_START), &ex), n);
         assert_eq!(step_tokens(&step(label::RECOVERY), &ex), n);
         assert_eq!(step_tokens(&step(label::SUBAGENT_START), &ex), words(text));
+        // ревью 8c, п. 3: `## ` в тексте правила (с отступом) раздел не закрывает; пустая строка
+        // закрывает — сводка журнала клиента B5.6/B5.7 после Rules к ним не относится
+        let t2 = "### Правила\na/b n:1\n  ## подзаголовок правила\n  текст\n\nZeroAIMemory: До сжатия \
+                  в этой сессии: ошибки: 1\n";
+        let c2 = classify(t2, &words);
+        assert_eq!(
+            c2[class::RULES],
+            words("### Правила\na/b n:1\n  ## подзаголовок правила\n  текст")
+        );
+        assert_eq!(c2.len(), 1, "{c2:?}");
+    }
+
+    /// Ревью 8c, п. 12: каталоги сессий оставляются только при непустом значении, кроме «0».
+    #[test]
+    fn keep_sessions_env_values() {
+        assert!(!keep_sessions(None));
+        assert!(!keep_sessions(Some("")));
+        assert!(!keep_sessions(Some(" ")));
+        assert!(!keep_sessions(Some("0")));
+        assert!(keep_sessions(Some("1")));
+        assert!(keep_sessions(Some("yes")));
+        assert_eq!(session_dir_name("t", "ss-01", 0), "sessions-t-ss-01");
+        assert_eq!(session_dir_name("t", "ss-01", 2), "sessions-t-ss-01-r2");
+    }
+
+    /// Ревью 8c, п. 2: сбой сравнения не рвёт сетку — сообщение в списке, файлы не пишутся;
+    /// удачное сравнение пишет пару файлов.
+    #[test]
+    fn try_compare_collects_failures() {
+        let c = corpus();
+        let sp = spec();
+        let w = world(&sp, &c).unwrap();
+        let f = feats(&m6_caps(), true, false);
+        let r = play(&mut mock(), &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        let base = result(vec![r.clone()], f, "m6");
+        let mut other_day = result(vec![r], f, "m6");
+        other_day.info.date = "2000-01-01".into();
+        let d = crate::eval::tests_repo().join("target/test-tmp/xtask/sessions-try-compare");
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let mut failed = Vec::new();
+        try_compare(
+            &mut failed,
+            Ok(base.clone()),
+            &other_day,
+            ("b", "a"),
+            &d.join("bad"),
+        );
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0].contains("a против b") && failed[0].contains("дата"),
+            "{failed:?}"
+        );
+        assert!(!d.join("bad.json").exists());
+        try_compare(
+            &mut failed,
+            Err(anyhow::anyhow!("нет файла")),
+            &base,
+            ("x", "a"),
+            &d.join("x"),
+        );
+        assert_eq!(failed.len(), 2);
+        try_compare(
+            &mut failed,
+            Ok(base.clone()),
+            &base,
+            ("b", "a"),
+            &d.join("ok"),
+        );
+        assert_eq!(failed.len(), 2);
+        assert!(d.join("ok.json").exists() && d.join("ok.md").exists());
     }
 
     #[test]
