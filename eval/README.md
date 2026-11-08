@@ -21,7 +21,7 @@
 | `grid-chunking.toml`, `grid-chunking-cpu.toml` | нарезка с учётом силы границ: λ, связность, L0 в префиксе, размер листа (задача 17 M3) |
 | `grid-m3.toml` | веса поиска M3: канал папок `w_folder`, бусты вида insight и `certainty` (задача 18 M3, ≤ 10 конфигураций) |
 | `grid-m3-kind.toml` | буст вида insight ниже буста `theorem`: 1,0 / 1,05 / 1,10 (задача 18 M3, fix round 1) |
-| `grid-m6-kind.toml`, `grid-m6-kind-rerank.toml`, `grid-m6-kind-cpu.toml` | M6 §10 (задача 10): `search.kind_boost_mode` {`always`, `unless_contradicted`} × {1,0; 1,05; 1,10; 1,15} и `reliable_only` × 1,10 — гибрид CUDA (решающий), `rerank=on` CUDA и гибрид CPU int8 (контроль); части `main` и `kind` (`[[part]]`), база `always × 1,05` дважды (`aa = true`) |
+| `grid-m6-kind.toml`, `grid-m6-kind-rerank.toml`, `grid-m6-kind-cpu.toml` | M6 §10 (задача 10): `search.kind_boost_mode` {`always`, `unless_contradicted`} × {1,0; 1,05; 1,10; 1,15} и `reliable_only` × 1,10 — гибрид CUDA (решающий), `rerank=on` CUDA и гибрид CPU int8 (контроль); части `main`, `kind`, `kind_b`, `kind_c` (`[[part]]`) и их объединение `extra_all` (решающее), база `always × 1,05` дважды (`aa = true`) |
 | `grid-m6-recall.toml` | M6 §3.5 п. 3–5 (задача 8c): `recall.digest_tokens` × `digest_entries`, `recovery_tokens`, `brief_tokens` × `code.brief_tokens` на dev ТС-2 (`eval --sessions --grid`), первая точка — умолчания |
 | `grid-m6-search.toml` | M6 §3.5 п. 1 (задача 5): `search.budget_tokens` {400, 600, 800} × `search.brief_min_rel` {0; 0,4; 0,5} на dev ТС-1, первая точка дважды — A/A-гейт |
 | `hints.toml` | M4: точность подсказок хуков — 72 случая (`prompt` 30, `post_tool` 24, `pre_tool` 18; половина «нерелевантно»), 17 insight с триггерами и без и 3 заметки Rules |

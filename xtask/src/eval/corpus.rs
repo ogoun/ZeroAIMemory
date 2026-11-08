@@ -657,6 +657,20 @@ pub fn is_identifier(tok: &str) -> bool {
 
 /// Идентификаторы запроса (по пробелам, без обрамляющей пунктуации).
 pub fn identifiers(text: &str) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    // вызов конструктора `new Date` — одно имя из двух слов (JS/Java/C#)
+    let ctors = words.windows(2).filter_map(|w| {
+        let name = w[1].trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        (w[0] == "new" && name.starts_with(|c: char| c.is_ascii_uppercase()))
+            .then(|| format!("new {name}"))
+    });
+    let mut out: Vec<String> = ctors.collect();
+    out.extend(identifier_tokens(text));
+    out
+}
+
+/// Однословные идентификаторы запроса ([`identifiers`]).
+fn identifier_tokens(text: &str) -> Vec<String> {
     text.split_whitespace()
         // атрибут `#[name]`/`#[name(…)]` — целиком до `]` (скобки — часть имени)
         .map(|t| match (t.find("#["), t.find(']')) {
@@ -1136,14 +1150,17 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                 if toks.is_empty() {
                     bad("identifier без идентификатора в тексте".into());
                 }
-                // дословность проверяется по заметкам (как в M2); у insight фрагмента
-                // идентификатор может быть фразой («new Date») — её разметчик сверяет сам
-                for n in &notes {
-                    let low = n.text.to_lowercase();
-                    if !toks.iter().any(|t| low.contains(&t.to_lowercase())) {
+                // идентификатор дословно есть в каждой цели: заметке (как в M2) или insight
+                // (заголовок и тело; наборы M6)
+                for t in &targets {
+                    let low = match t {
+                        Target::Note(n) => n.text.to_lowercase(),
+                        Target::Insight(i) => format!("{} {}", i.title, i.body).to_lowercase(),
+                    };
+                    if !toks.iter().any(|x| low.contains(&x.to_lowercase())) {
                         bad(format!(
                             "ни один идентификатор {toks:?} не встречается в {}",
-                            n.path
+                            t.name()
                         ));
                     }
                 }
@@ -1526,6 +1543,11 @@ mod tests {
             ["#[instrument]"]
         );
         assert!(!is_identifier("#[]"));
+        assert_eq!(
+            identifiers("почему new Date от строки вида ГГГГ-ММ-ДД"),
+            ["new Date", "ГГГГ-ММ-ДД"]
+        );
+        assert!(identifiers("new работа над new версией").is_empty());
     }
 
     fn note(path: &str, text: &str) -> Note {
@@ -1607,6 +1629,36 @@ mod tests {
             retracted,
         ];
         c
+    }
+
+    /// `identifier` с ответом-insight (фрагмент M6): идентификатор сверяется с заголовком и
+    /// телом записи; виды M2 во фрагменте могут ждать insight.
+    #[test]
+    fn identifier_checked_against_insight_text() {
+        let mut c = m3_corpus();
+        c.insights[0].body = "Retry loop reused AbortController after timeout".into();
+        let ok = [q(
+            "i",
+            "why does AbortController make retries fail",
+            Lang::En,
+            &["insight:old"],
+            Kind::Identifier,
+            false,
+        )];
+        validate(&c, &ok, false).unwrap();
+        let bad = [q(
+            "j",
+            "why does IntersectionObserver fire twice",
+            Lang::En,
+            &["insight:old"],
+            Kind::Identifier,
+            false,
+        )];
+        let err = validate(&c, &bad, false).unwrap_err().to_string();
+        assert!(
+            err.contains("IntersectionObserver") && err.contains("insight:old"),
+            "{err}"
+        );
     }
 
     /// Пары §10 считаются двояко: все «`hypothesis` `gotcha` → `theorem`» и только те, где
