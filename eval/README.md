@@ -22,11 +22,13 @@
 | `grid-m3.toml` | веса поиска M3: канал папок `w_folder`, бусты вида insight и `certainty` (задача 18 M3, ≤ 10 конфигураций) |
 | `grid-m3-kind.toml` | буст вида insight ниже буста `theorem`: 1,0 / 1,05 / 1,10 (задача 18 M3, fix round 1) |
 | `grid-m6-kind.toml`, `grid-m6-kind-rerank.toml`, `grid-m6-kind-cpu.toml` | M6 §10 (задача 10): `search.kind_boost_mode` {`always`, `unless_contradicted`} × {1,0; 1,05; 1,10; 1,15} и `reliable_only` × 1,10 — гибрид CUDA (решающий), `rerank=on` CUDA и гибрид CPU int8 (контроль); части `main`, `kind`, `kind_b`, `kind_c` (`[[part]]`) и их объединение `extra_all` (решающее), база `always × 1,05` дважды (`aa = true`) |
+| `grid-m6-area.toml`, `grid-m6-area-rerank.toml`, `grid-m6-area-cpu.toml` | M6 §11 (задача 11): `search.boost_area` ∈ {1,0; 1,05; 1,10; 1,20; 1,30}, `recency_half_life_days = 0` — гибрид CUDA (решающий), `rerank=on` CUDA и гибрид CPU int8 (контроль); части `main` и `area` (`area-queries.toml`, отчёт по `area_same`/`area_other`/`area_none`), база 1,0, вторая база 1,10, A/A K = 3 |
 | `grid-m6-recall.toml` | M6 §3.5 п. 3–5 (задача 8c): `recall.digest_tokens` × `digest_entries`, `recovery_tokens`, `brief_tokens` × `code.brief_tokens` на dev ТС-2 (`eval --sessions --grid`), первая точка — умолчания |
 | `grid-m6-search.toml` | M6 §3.5 п. 1 (задача 5): `search.budget_tokens` {400, 600, 800} × `search.brief_min_rel` {0; 0,4; 0,5} на dev ТС-1, первая точка дважды — A/A-гейт |
 | `hints.toml` | M4: точность подсказок хуков — 72 случая (`prompt` 30, `post_tool` 24, `pre_tool` 18; половина «нерелевантно»), 17 insight с триггерами и без и 3 заметки Rules |
 | `scenarios.toml` | M4: 20 сценариев расхода токенов «вопрос агента → источники» (протокол §9.3, повтор через кэш, наивный `mode=chunks`); M6 — ТС-1 с видами и нагетами (`kind`, `nuggets`, разметка — задача 1b) |
 | `nuggets.lock` | M6: замороженные `nuggets_fingerprint` и `corpus_fingerprint` ТС-1 (создаёт задача 1b) |
+| `area-queries.toml` | M6, задача 11: 36 запросов набора областей (§11) — `same`/`other`/`none` по 12, в каждом виде по 4 на `backend`/`frontend`/`infra`; у всех `area` (заголовок `X-Zam-Area`) и `area_kind`; составил независимый агент без доступа к коду поиска и сеткам, разметка без правок (метки формулировки `kind` — журнал задачи 11) |
 | `kind-queries.toml` | M6, задача 10: 35 запросов буста вида (§10) — 26 к группам `k01`–`k24` (ответ — insight `gotcha`/`failure`, соседи — заметка темы и `k<NN>-n`) и 9 `certainty` к парам «`hypothesis` `gotcha` → `theorem` `gotcha`»; составил независимый агент без доступа к коду поиска и сеткам, разметка перенесена без правок; прогон — `--queries eval/kind-queries.toml` или часть `kind` сеток `grid-m6-kind*.toml` |
 | `kind-queries-b.toml`, `kind-queries-c.toml` | M6, задача 10: ещё два независимых набора буста вида (26 и 28 запросов: группы `k` и 9 пар `certainty` у каждого) — дополнение по условию «не на потолке» (§10); составили другие независимые агенты (им сообщено только, что прежний набор слишком лёгкий), разметка без правок |
 | `glossary.toml` | M4.5: словарь домена — 16 терминов с псевдонимами RU↔EN (сленг, транслитерация, сокращения) и 24 запроса на псевдонимах |
@@ -254,6 +256,8 @@ cargo xtask eval --grid eval/grid-chunking-cpu.toml                     # то �
 cargo xtask eval --grid eval/grid-m3.toml                               # веса поиска M3 (задача 18)
 cargo xtask eval --grid eval/grid-m3-kind.toml                          # буст вида ниже theorem (задача 18)
 cargo xtask eval --grid eval/grid-m6-kind.toml                          # режим буста вида M6 §10 (задача 10; -rerank, -cpu — контроль)
+cargo xtask eval --grid eval/grid-m6-area.toml                          # буст области M6 §11 (задача 11; -rerank, -cpu — контроль)
+cargo xtask eval --docs --device cuda --mode hybrid --reuse --set search.w_attach=1.3 --label w1.3  # вес вложений M6 §11
 cargo xtask eval --device cuda --corpus <каталог> --insights <файл> --queries <файл> \
   --label <метка> --out <каталог>                                         # контрольный прогон
 cargo xtask eval --hints                                  # подсказки хуков, int8 CPU (M4)
