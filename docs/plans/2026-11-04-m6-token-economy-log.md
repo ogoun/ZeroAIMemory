@@ -4412,3 +4412,23 @@ C1, I1–I6, M1–M12 закрыты; новые замечания исправ
 удалены): `fmt --check` — чисто; `clippy -p zam-index -p zam-server -p zam-store --all-targets
 -D warnings` — чисто; `zam-index --test worker` — 17 PASS, 2 ignored; `zam-server --test backup
 --features test-hooks` — 39 PASS.
+
+### Четвёртое ревью задачи 18a — одобрено, Minor (2026-11-08)
+
+- **Q1.** `backup_keeps_live_stage_removes_dead`: «живая» сборка состарена старше
+  `flag_max_hours` (`age_dir`: Windows — `FILE_WRITE_ATTRIBUTES` + `FILE_FLAG_BACKUP_SEMANTICS`,
+  Linux — `touch -d @…`) и остаётся — лок важнее возраста.
+- **Q2.** `backup()`: сборку того же архива держит живая копия (лок `.zam-building` занят) —
+  отказ `StageBusy` («копия в … уже идёт»), сборка не трогается. Тест
+  `backup_zip_refuses_when_stage_busy`.
+- **Q3.** Оставлено как есть по решению ревью.
+- Попутно (флейк `restore_external_qdrant_*`: «пересчёт: другая нарезка»): отпечаток нарезки —
+  глобальное состояние процесса, а `setup_chunker` соседних тестов (сервер или `restore` без
+  модели) ставил пороги под окно по умолчанию посреди ML-теста (у MiniLM окно меньше). В
+  `tests/backup.rs` блокировка `CHUNKER` стала `RwLock`: сверяющие отпечаток тесты (оба ML и
+  `restore_vector_plan_*`) — `write`, остальные — `read`.
+
+Проверки: `fmt --check` — чисто; `clippy -p zam-server --all-targets --features test-hooks -D
+warnings` — чисто; `zam-server --test backup --features test-hooks` (`ZAM_REQUIRE_ML=1`) — 40
+PASS (первый прогон до `RwLock`: флейк выше и отказ открытия каталога для `set_modified` —
+исправлены).

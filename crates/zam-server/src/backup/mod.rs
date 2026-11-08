@@ -58,6 +58,8 @@ pub enum BackupError {
     RestoreInProgress,
     #[error("идёт копия (zam-server backup): дождитесь её конца")]
     BackupInProgress,
+    #[error("копия в {} уже идёт (её сборку держит другой процесс zam-server backup)", .0.display())]
+    StageBusy(PathBuf),
     #[error(
         "каталог данных не пуст (есть system.db, её -wal/-shm, базы или блобы): укажите \
          пустой каталог или --replace (прежние данные переносятся в backups/pre-restore-…)"
@@ -685,6 +687,10 @@ pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, Bac
     let free = free_space(root, &stage_dir)?;
     if need > free {
         return Err(BackupError::NoSpace { need, free });
+    }
+    // сборку того же архива держит живая копия — её не трогаем
+    if stage_alive(&stage) == Some(true) {
+        return Err(BackupError::StageBusy(target.clone()));
     }
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)?;

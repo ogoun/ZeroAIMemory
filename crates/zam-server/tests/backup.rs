@@ -24,9 +24,11 @@ use zam_server::backup::{
 use zam_server::config::{BackupSchedule, BackupSection, ServerConfig};
 use zam_store::{DataDir, Db, SystemStore, USER_MIGRATIONS};
 
-/// Тесты, сверяющие отпечаток нарезки процесса (`setup_chunker` меняет его глобально), — по
-/// одному: иначе сервер с моделью в соседнем тесте подменил бы счётчик токенов посреди сверки.
-static CHUNKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Отпечаток нарезки процесса глобален: `setup_chunker` (старт сервера, `restore`) ставит
+/// пороги под окно модели конфигурации — у MiniLM оно меньше, чем без модели. Тесты, сверяющие
+/// отпечаток (`write`), идут одни; остальные (`read`) — параллельно друг с другом, но не с ними:
+/// иначе сервер без модели в соседнем тесте сменил бы пороги посреди сверки.
+static CHUNKER: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 fn cfg_of(a: &Api) -> ServerConfig {
     (*a.st.cfg).clone()
@@ -158,6 +160,7 @@ fn write_conf(dir: &Path, c: &ServerConfig) -> String {
 /// `foreign_key_check`, число заметок — между числом до и после копии, ревизии каждой полны.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_while_writing_invariants() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-writing").await;
     let a = Arc::new(a);
     let db = a.st.users.get(uid(&a)).await.unwrap();
@@ -248,6 +251,7 @@ async fn backup_while_writing_invariants() {
 /// признака WAL снова начинается сначала (кадров не больше `wal_restart_bytes`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_writer_no_busy_and_wal_bound() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-wal").await;
     let db = a.st.users.get(uid(&a)).await.unwrap();
     // база побольше — `VACUUM INTO` держит снимок заметное время
@@ -410,6 +414,7 @@ impl std::io::Write for Capture {
 /// открывает их `READ_WRITE` + `query_only` и проходит.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_reads_closed_db_without_wal_shm() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-closed").await;
     let cfg = cfg_of(&a);
     let user = uid(&a);
@@ -493,6 +498,7 @@ impl Drop for NoCreate {
 /// `immutable=1` (без `-shm`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_immutable_only_under_own_lock() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-immutable").await;
     let cfg = cfg_of(&a);
     stop(a).await;
@@ -533,6 +539,7 @@ async fn backup_immutable_only_under_own_lock() {
 /// не ошибка; пользователь без базы — пропуск с отметкой.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_order_users_from_system_copy() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-order").await;
     let late = Id::new();
     let users = a.st.cfg.data_dir.join("users");
@@ -571,6 +578,7 @@ async fn backup_order_users_from_system_copy() {
 /// Мало места (тестовая точка) — отказ до записи: каталог копии не создан.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_checks_free_space() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-space").await;
     let cfg = cfg_of(&a);
     test_hooks::set_free_space(&cfg.data_dir, Some(1000));
@@ -591,6 +599,7 @@ async fn backup_checks_free_space() {
 /// Во время `restore` (`.zam.lock` с меткой `restore`) копия отказывает.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_refuses_during_restore() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-during-restore").await;
     let cfg = cfg_of(&a);
     stop(a).await;
@@ -617,6 +626,7 @@ async fn backup_refuses_during_restore() {
 /// мастер-ключ не входит.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_manifest_sums_schemas_chunkers() {
+    let _g = CHUNKER.read().await;
     let (a, shas) = seeded("bk-manifest").await;
     let user = uid(&a);
     let db = a.st.users.get(user).await.unwrap();
@@ -669,6 +679,7 @@ async fn backup_manifest_sums_schemas_chunkers() {
 /// В копию не входят мастер-ключ, Qdrant, превью, модели и журналы.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_excludes_key_qdrant_previews_models_logs() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-excl").await;
     let root = a.st.cfg.data_dir.clone();
     for d in ["qdrant/storage", "previews/u", "models/m", "logs"] {
@@ -699,6 +710,7 @@ async fn backup_excludes_key_qdrant_previews_models_logs() {
 /// Вторая копия связывает блобы жёсткими ссылками с первой.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_second_run_hardlinks_blobs() {
+    let _g = CHUNKER.read().await;
     let (a, shas) = seeded("bk-links").await;
     let cfg = cfg_of(&a);
     let r1 = run_backup(&cfg, BackupOpts::default()).await.unwrap();
@@ -719,6 +731,7 @@ async fn backup_second_run_hardlinks_blobs() {
 /// Жёсткая ссылка не создаётся (тестовая точка) — блоб копируется: `linked: 0, copied: N`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_blob_fallback_copy() {
+    let _g = CHUNKER.read().await;
     let (a, shas) = seeded("bk-nolink").await;
     let cfg = cfg_of(&a);
     test_hooks::set_link_fails(&cfg.data_dir, true);
@@ -733,6 +746,7 @@ async fn backup_blob_fallback_copy() {
 /// Файла блоба нет — копия не проходит, отсутствующие перечислены в описи `.failed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_missing_blob_fails_listed() {
+    let _g = CHUNKER.read().await;
     let (a, shas) = seeded("bk-missing").await;
     let cfg = cfg_of(&a);
     let user = uid(&a);
@@ -783,6 +797,7 @@ fn dst_cfg(name: &str) -> ServerConfig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_refuses_nonempty() {
+    let _g = CHUNKER.read().await;
     let (copy, src_cfg, _, _) = copy_of("rs-nonempty").await;
     // каталог-источник не пуст
     let r = restore(&src_cfg, &copy, &RestoreOpts::default()).await;
@@ -791,6 +806,7 @@ async fn restore_refuses_nonempty() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_replace_moves_old() {
+    let _g = CHUNKER.read().await;
     let (copy, _, user, _) = copy_of("rs-replace").await;
     let dst = dst_cfg("rs-replace-dst");
     let old = api_with(dst.clone()).await;
@@ -826,6 +842,7 @@ async fn restore_replace_moves_old() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_refuses_locked() {
+    let _g = CHUNKER.read().await;
     let (copy, _, _, _) = copy_of("rs-locked").await;
     let dst = dst_cfg("rs-locked-dst");
     let lock = DataDir::open(&dst.data_dir).unwrap();
@@ -850,6 +867,7 @@ fn reseal(copy: &Path, rel: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_schema_too_new() {
+    let _g = CHUNKER.read().await;
     let (copy, _, user, _) = copy_of("rs-too-new").await;
     let rel = format!("users/{user}.db");
     rusqlite::Connection::open(copy.join(&rel))
@@ -870,6 +888,7 @@ async fn restore_schema_too_new() {
 /// Испорченный блоб копии — отказ до записи хоть одного файла.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_bad_sum_before_any_write() {
+    let _g = CHUNKER.read().await;
     let (copy, _, user, shas) = copy_of("rs-badsum").await;
     let rel = format!("blobs/{user}/{}/{}", &shas[1][..2], shas[1]);
     let mut b = std::fs::read(copy.join(&rel)).unwrap();
@@ -891,6 +910,7 @@ async fn restore_bad_sum_before_any_write() {
 /// Копия базы 0024 (M5.7) восстанавливается и при открытии мигрирует до 0025 с `bak-v24`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_older_schema_migrates() {
+    let _g = CHUNKER.read().await;
     let src = common::cfg_in(common::tmp("rs-v24").join("d"));
     let user = {
         let dd = DataDir::open(&src.data_dir).unwrap();
@@ -922,6 +942,7 @@ async fn restore_older_schema_migrates() {
 /// Восстановленные блобы — копии, а не жёсткие ссылки на файлы копии.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_copies_blobs_not_links() {
+    let _g = CHUNKER.read().await;
     let (copy, _, user, shas) = copy_of("rs-blobs").await;
     let dst = dst_cfg("rs-blobs-dst");
     let r = restore(&dst, &copy, &RestoreOpts::default()).await.unwrap();
@@ -941,6 +962,7 @@ async fn restore_copies_blobs_not_links() {
 /// `web_sessions` после восстановления пусты: cookie старой машины не действуют.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_clears_web_sessions() {
+    let _g = CHUNKER.read().await;
     let (copy, _, _, _) = copy_of("rs-web").await;
     assert!(count(&copy.join("system.db"), "SELECT count(*) FROM web_sessions") > 0);
     let dst = dst_cfg("rs-web-dst");
@@ -969,6 +991,7 @@ fn reindex_mark(p: &Path) -> Option<String> {
 /// `.zam-reindex`; с `--no-reindex` отметок нет.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_sets_reindex_pending_each_db() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("rs-reindex").await;
     let (second, tok) = a.new_user("второй").await;
     let r = a
@@ -1013,6 +1036,7 @@ async fn restore_sets_reindex_pending_each_db() {
 /// `master.key` на месте — `true`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_without_key_vault_unavailable() {
+    let _g = CHUNKER.read().await;
     let (copy, src_cfg, _, _) = copy_of("rs-vault").await;
     let dst = dst_cfg("rs-vault-dst");
     let r = restore(&dst, &copy, &RestoreOpts::default()).await.unwrap();
@@ -1034,7 +1058,7 @@ async fn restore_without_key_vault_unavailable() {
 /// перенарезка; совпали оба — из кэша.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_vector_plan_model_and_chunker() {
-    let _g = CHUNKER.lock().await;
+    let _g = CHUNKER.write().await;
     let (a, _) = seeded("rs-plan").await;
     let user = uid(&a);
     let db = a.st.users.get(user).await.unwrap();
@@ -1107,6 +1131,7 @@ async fn restore_vector_plan_model_and_chunker() {
 /// Копия архивом zip восстанавливается так же, как каталог.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_zip_and_restore_from_zip() {
+    let _g = CHUNKER.read().await;
     let (a, shas) = seeded("bk-zip").await;
     let cfg = cfg_of(&a);
     let user = uid(&a);
@@ -1309,7 +1334,7 @@ async fn restore_external_qdrant_rebuilds_from_cache() {
     if !have(MINILM) {
         return;
     }
-    let _g = CHUNKER.lock().await;
+    let _g = CHUNKER.write().await;
     let qa = common::qdrant::TestQdrant::start("rs-ext-a");
     let a = api("rs-ext-a", |c| {
         ml(c, MINILM);
@@ -1362,7 +1387,7 @@ async fn restore_then_serve_rebuilds_from_cache_no_inference() {
     if !have(MINILM) {
         return;
     }
-    let _g = CHUNKER.lock().await;
+    let _g = CHUNKER.write().await;
     let qa = common::qdrant::TestQdrant::start("rs-serve-a");
     let a = api("rs-serve-a", |c| {
         ml(c, MINILM);
@@ -1552,6 +1577,7 @@ fn schedule_tick_cases() {
 /// предупреждения.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn index_status_no_recent_backup() {
+    let _g = CHUNKER.read().await;
     let a = api("bk-status", |_| {}).await;
     let s = a.t(Method::GET, "/api/v1/index/status", None).await;
     assert_eq!(s.status, StatusCode::OK, "{}", s.text());
@@ -1598,6 +1624,7 @@ fn copy_tree(from: &Path, to: &Path) {
 /// локом читает базу с восстановлением WAL (не `immutable=1`): в копии все записи.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_crashed_wal_under_own_lock_keeps_commits() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-crash-wal").await;
     let cfg = cfg_of(&a);
     let user = uid(&a);
@@ -1643,6 +1670,7 @@ async fn backup_crashed_wal_under_own_lock_keeps_commits() {
 /// первого снимка `system.db`): в копию идёт второй снимок `system.db`, ключ в нём есть.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_system_snapshot_after_user_dbs() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-sys-second").await;
     let cfg = cfg_of(&a);
     let user = uid(&a);
@@ -1679,6 +1707,7 @@ async fn backup_system_snapshot_after_user_dbs() {
 /// сборки.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_zip_space_and_tmp_cleanup() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-zip-fail").await;
     let cfg = cfg_of(&a);
     let out = common::tmp("bk-zip-fail-out");
@@ -1713,6 +1742,7 @@ async fn backup_zip_space_and_tmp_cleanup() {
 /// `pre-restore-…`, а не применяется к восстановленной базе.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_leftover_wal_is_nonempty() {
+    let _g = CHUNKER.read().await;
     let (copy, _, _, _) = copy_of("rs-leftover").await;
     let dst = dst_cfg("rs-leftover-dst");
     std::fs::create_dir_all(&dst.data_dir).unwrap();
@@ -1738,6 +1768,7 @@ async fn restore_leftover_wal_is_nonempty() {
 /// сервер и копия отказывают; повтор `restore --replace` восстанавливает.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_crash_mid_place_refused_until_replace() {
+    let _g = CHUNKER.read().await;
     let (copy, _, user, _) = copy_of("rs-crash").await;
     let dst = dst_cfg("rs-crash-dst");
     test_hooks::set_fail_point(&dst.data_dir, Some("restore_place"));
@@ -1787,6 +1818,7 @@ async fn restore_crash_mid_place_refused_until_replace() {
 /// M7: во время копии (признак `.zam-backup` удерживается) restore отказывает.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_refuses_during_backup() {
+    let _g = CHUNKER.read().await;
     let (copy, _, _, _) = copy_of("rs-during-backup").await;
     let dst = dst_cfg("rs-during-backup-dst");
     std::fs::create_dir_all(&dst.data_dir).unwrap();
@@ -1801,6 +1833,7 @@ async fn restore_refuses_during_backup() {
 /// минуту — следующая попытка в следующий срок; удачная — ротация по новому списку.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_tick_failure_keeps_copies_and_waits_slot() {
+    let _g = CHUNKER.read().await;
     use zam_server::maintenance::{BackupState, backup_tick};
     let (a, _) = seeded("bk-tick").await;
     let mut cfg = cfg_of(&a);
@@ -1838,6 +1871,7 @@ async fn backup_tick_failure_keeps_copies_and_waits_slot() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_owner_only_permissions() {
+    let _g = CHUNKER.read().await;
     use std::os::unix::fs::PermissionsExt;
     let (a, _) = seeded("bk-perms").await;
     let rep = run_backup(&cfg_of(&a), BackupOpts::default())
@@ -1866,6 +1900,7 @@ fn age_file(p: &Path, h: u64) {
 /// `<архив>.partial`/`<архив>.tmp` (любое расширение архива); чужие `*.partial`/`*.tmp` остаются.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_cleans_only_own_partials() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-own-partials").await;
     let mut cfg = cfg_of(&a);
     cfg.backup.flag_max_hours = 1;
@@ -1912,6 +1947,7 @@ async fn backup_cleans_only_own_partials() {
 /// `restore-remnants-…`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_repeated_failures_single_pre_restore() {
+    let _g = CHUNKER.read().await;
     let (copy, _, user, _) = copy_of("rs-repeat").await;
     let dst = dst_cfg("rs-repeat-dst");
     let old = api_with(dst.clone()).await;
@@ -1970,6 +2006,7 @@ async fn restore_repeated_failures_single_pre_restore() {
 /// освобождённым локом (копия умерла) — удаляет сразу.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_keeps_live_stage_removes_dead() {
+    let _g = CHUNKER.read().await;
     let (a, _) = seeded("bk-live-stage").await;
     let cfg = cfg_of(&a);
     let copies = cfg.backup.dir(&cfg.data_dir);
@@ -1985,6 +2022,8 @@ async fn backup_keeps_live_stage_removes_dead() {
         .open(live.join(".zam-building"))
         .unwrap();
     fs4::FileExt::lock(&lock).unwrap();
+    // живая сборка старше flag_max_hours: решает лок, а не возраст
+    age_dir(&live, cfg.backup.flag_max_hours as u64 + 2);
     run_backup(&cfg, BackupOpts::default()).await.unwrap();
     assert!(live.is_dir(), "живая сборка удалена");
     assert!(!dead.exists(), "брошенная сборка осталась");
@@ -1992,5 +2031,74 @@ async fn backup_keeps_live_stage_removes_dead() {
     drop(lock);
     run_backup(&cfg, BackupOpts::default()).await.unwrap();
     assert!(!live.exists(), "сборка с освобождённым локом осталась");
+    stop(a).await;
+}
+
+/// Делает каталог «старым» (время изменения — `h` часов назад).
+fn age_dir(p: &Path, h: u64) {
+    let t = std::time::SystemTime::now() - Duration::from_secs(h * 3600);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_WRITE_ATTRIBUTES (SetFileTime) и FILE_FLAG_BACKUP_SEMANTICS (открыть каталог)
+        std::fs::File::options()
+            .access_mode(0x0100)
+            .custom_flags(0x0200_0000)
+            .open(p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+    #[cfg(unix)]
+    {
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let st = Command::new("touch")
+            .arg("-m")
+            .arg("-d")
+            .arg(format!("@{secs}"))
+            .arg(p)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+    let age = std::fs::metadata(p)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .elapsed()
+        .unwrap();
+    assert!(
+        age > Duration::from_secs((h - 1) * 3600),
+        "каталог не состарен"
+    );
+}
+
+/// Q2: сборку того же архива держит живая копия — вторая копия отказывает, сборку не трогает.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_zip_refuses_when_stage_busy() {
+    let _g = CHUNKER.read().await;
+    let (a, _) = seeded("bk-zip-busy").await;
+    let cfg = cfg_of(&a);
+    let zip = common::tmp("bk-zip-busy-out").join("copy.zip");
+    let mut s = zip.as_os_str().to_owned();
+    s.push(".partial");
+    let stage = PathBuf::from(s);
+    std::fs::create_dir_all(&stage).unwrap();
+    let lock = std::fs::File::create(stage.join(".zam-building")).unwrap();
+    fs4::FileExt::lock(&lock).unwrap();
+    let opts = BackupOpts {
+        dir: None,
+        zip: Some(zip.clone()),
+    };
+    let r = run_backup(&cfg, opts.clone()).await;
+    assert!(matches!(r, Err(BackupError::StageBusy(_))), "{r:?}");
+    assert!(
+        stage.join(".zam-building").is_file(),
+        "чужую сборку тронули"
+    );
+    fs4::FileExt::unlock(&lock).unwrap();
+    drop(lock);
+    run_backup(&cfg, opts).await.unwrap();
+    assert!(zip.is_file());
     stop(a).await;
 }
