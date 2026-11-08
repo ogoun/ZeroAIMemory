@@ -1,8 +1,10 @@
 //! Карта кода решения (спецификация M5.6 §5, §7, §9, §12–§13; хранилище — [`zam_store::code`]).
 //!
 //! - `POST /code/sync {solution, commit?, branch?, machine?, manifest: [{path, hash}]}` →
-//!   `{need, removed, etag}`: файлы карты вне манифеста удаляются, `need` — пути без строки или с
-//!   другим хэшем. Повтор пути (после нормализации) — 422 `manifest[i]: повтор пути`.
+//!   `{need, removed, etag, recv_count: true}`: файлы карты вне манифеста удаляются, `need` —
+//!   пути без строки или с другим хэшем. Повтор пути (после нормализации) — 422 `manifest[i]:
+//!   повтор пути`. `recv_count: true` — сервер принимает `refs[].recv_count` (M6 §12а; ≤ `count`,
+//!   только у `call`, иначе 422): клиент M6 без этого признака шлёт прежнюю форму ссылок.
 //! - `PUT /code/files {solution, commit?, branch?, machine?, files: [FileUpload]}` (до 500, а
 //!   карта целиком — до `code.max_files`) → `{accepted, stale_refs, warnings}`; сигнатуры
 //!   маскируются (`zam_markdown::mask_text`) и хранятся маскированными; правило карты для ссылок
@@ -53,7 +55,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use zam_code::{
     FileUpload, Focus, Graph, ManifestItem, MapFile, MapSym, NAME_MAX_CHARS, Packed, ParseState,
-    QUAL_MAX_CHARS, SIG_MAX_CHARS, SymbolHash, SymbolKind, UPLOAD_FILES_MAX, edges_among,
+    QUAL_MAX_CHARS, RefKind, SIG_MAX_CHARS, SymbolHash, SymbolKind, UPLOAD_FILES_MAX, edges_among,
     focus_restart, rank_on_graph, render_map_rest, split_ref,
 };
 use zam_core::Id;
@@ -950,7 +952,7 @@ fn parse_manifest(m: Vec<ManifestIn>, max: u32) -> Result<Vec<ManifestItem>, Api
     Ok(out)
 }
 
-/// `POST /code/sync` → `{need, removed, stale_refs, etag}`. С заголовком `X-Zam-Solution`
+/// `POST /code/sync` → `{need, removed, stale_refs, etag, recv_count: true}`. С заголовком `X-Zam-Solution`
 /// права проверяются до чтения тела (манифест — до десятков мегабайт), и `solution` тела
 /// обязан совпадать с ним.
 pub async fn sync(
@@ -1032,6 +1034,9 @@ pub async fn sync(
         "removed": out.removed,
         "stale_refs": stale_refs,
         "etag": out.etag,
+        // сервер принимает `refs[].recv_count` (M6 §12а): клиент M6 шлёт счётчик, только видя
+        // этот признак, — серверу до M6 (`deny_unknown_fields`) уходит прежняя форма
+        "recv_count": true,
     })))
 }
 
@@ -1109,6 +1114,17 @@ fn check_upload(
         check_text(&r.name, NAME_MAX_CHARS, &format!("{w}.name"), false)?;
         if r.count == 0 {
             return Err(unprocessable(format!("{w}.count: больше 0")));
+        }
+        // вызовы по получателю (M6 §12а) — часть вызовов `count`
+        if let Some(n) = r.recv_count {
+            if r.kind != RefKind::Call {
+                return Err(unprocessable(format!(
+                    "{w}.recv_count: только у ссылок вида call"
+                )));
+            }
+            if n > r.count {
+                return Err(unprocessable(format!("{w}.recv_count: не больше count")));
+            }
         }
     }
     Ok(masked)

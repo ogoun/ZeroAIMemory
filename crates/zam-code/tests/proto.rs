@@ -244,3 +244,28 @@ fn body_hash_ignores_indent_and_blank_lines() {
     );
     assert_eq!(body_hash("a\r\nb"), body_hash("a\nb"));
 }
+
+/// M6 §12а: `RefAgg.recv_count` — необязательное поле: клиент до M6 его не шлёт (→ `None`),
+/// `None` не сериализуется (форма ссылки для сервера до M6 прежняя), неизвестное поле — ошибка.
+#[test]
+fn ref_agg_recv_count_optional() {
+    let old: zam_code::RefAgg =
+        serde_json::from_str(r#"{"name":"f","kind":"call","count":3,"first_line":2}"#).unwrap();
+    assert_eq!(old.recv_count, None);
+    assert_eq!(
+        serde_json::to_string(&old).unwrap(),
+        r#"{"name":"f","kind":"call","count":3,"first_line":2}"#
+    );
+    let new: zam_code::RefAgg = serde_json::from_str(
+        r#"{"name":"f","kind":"call","count":3,"first_line":2,"recv_count":2}"#,
+    )
+    .unwrap();
+    assert_eq!(new.recv_count, Some(2));
+    assert!(
+        serde_json::from_str::<zam_code::RefAgg>(
+            r#"{"name":"f","kind":"call","count":3,"first_line":2,"recv":true}"#
+        )
+        .is_err()
+    );
+    assert_eq!(zam_code::EXTRACT_VERSION, 3);
+}

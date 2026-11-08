@@ -6906,6 +6906,7 @@ dependencies = [
  "toml",
  "ureq",
  "windows",
+ "zam-code",
  "zam-core",
  "zam-docs",
  "zam-fetch",

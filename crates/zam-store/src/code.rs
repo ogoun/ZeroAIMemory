@@ -165,7 +165,7 @@ pub struct CodeStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankInputs {
     /// Файлы по `id`; `defs` — символы файла по `id`, `refs` — строки `code_refs`
-    /// `(name, kind, count)` (порядок не задан).
+    /// `(name, kind, count, recv_count)` (порядок не задан).
     pub files: Vec<RankFile>,
     pub generation: i64,
 }
@@ -177,7 +177,7 @@ impl RankInputs {
     pub fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
         let def = size_of::<(String, SymbolKind, Option<bool>)>();
-        let rf = size_of::<(String, zam_code::RefKind, u32)>();
+        let rf = size_of::<(String, zam_code::RefKind, u32, u32)>();
         let s = |x: &String| x.capacity() + if x.capacity() > 0 { ALLOC_OVERHEAD } else { 0 };
         let v = |cap: usize, item: usize| cap * item + if cap > 0 { ALLOC_OVERHEAD } else { 0 };
         v(self.files.capacity(), size_of::<RankFile>())
@@ -566,16 +566,25 @@ fn put_file(
             s.kind.as_str()
         ])?;
     }
-    // повтор `(name, kind)` в загрузке складывается; `recv_count` (0025, M6 §12а) — по
-    // умолчанию 0, то есть все вызовы прямые, пока протокол не несёт счётчика (задача 14 M6)
+    // повтор `(name, kind)` в загрузке складывается; `recv_count` (0025, M6 §12а) — сколько из
+    // `count` вызовы по получателю: нет поля (клиент до M6) — 0, то есть все вызовы прямые
     let mut rf = tx.prepare_cached(
-        "INSERT INTO code_refs (file_id, name, kind, count, first_line)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO code_refs (file_id, name, kind, count, first_line, recv_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT (file_id, name, kind) DO UPDATE SET
-           count = count + excluded.count, first_line = min(first_line, excluded.first_line)",
+           count = count + excluded.count, first_line = min(first_line, excluded.first_line),
+           recv_count = recv_count + excluded.recv_count",
     )?;
     for r in &f.refs {
-        rf.execute(params![id, r.name, r.kind.as_str(), r.count, r.first_line])?;
+        let recv = r.recv_count.unwrap_or(0).min(r.count);
+        rf.execute(params![
+            id,
+            r.name,
+            r.kind.as_str(),
+            r.count,
+            r.first_line,
+            recv
+        ])?;
     }
     Ok(id)
 }
@@ -785,7 +794,7 @@ pub async fn code_rank_inputs(db: &Db, solution: &str) -> Result<RankInputs, Sto
             }
         }
         let mut st = tx.prepare_cached(
-            "SELECT r.file_id, r.name, r.kind, r.count FROM code_files f
+            "SELECT r.file_id, r.name, r.kind, r.count, r.recv_count FROM code_files f
              JOIN code_refs r ON r.file_id = f.id WHERE f.solution_guid = ?1",
         )?;
         let rows = st.query_map([&solution], |r| {
@@ -795,12 +804,13 @@ pub async fn code_rank_inputs(db: &Db, solution: &str) -> Result<RankInputs, Sto
                 r.get::<_, String>(1)?,
                 RefKind::parse(&k).ok_or_else(|| corrupt("вид ссылки", &k))?,
                 r.get::<_, u32>(3)?,
+                r.get::<_, u32>(4)?,
             ))
         })?;
         for row in rows {
-            let (fid, name, kind, n) = row?;
+            let (fid, name, kind, n, recv) = row?;
             if let Some(&i) = at.get(&fid) {
-                files[i].refs.push((name, kind, n));
+                files[i].refs.push((name, kind, n, recv));
             }
         }
         Ok(RankInputs { files, generation })
@@ -1336,16 +1346,18 @@ pub async fn code_symbol(
             .collect::<Result<_, _>>()?;
         let uses: Vec<RefAgg> = tx
             .prepare_cached(
-                "SELECT name, kind, count, first_line FROM code_refs WHERE file_id = ?1
-                 ORDER BY count DESC, name, kind LIMIT ?2",
+                "SELECT name, kind, count, first_line, recv_count FROM code_refs
+                 WHERE file_id = ?1 ORDER BY count DESC, name, kind LIMIT ?2",
             )?
             .query_map(params![symbol.file_id, USES_MAX], |r| {
                 let k: String = r.get(1)?;
+                let recv: u32 = r.get(4)?;
                 Ok(RefAgg {
                     name: r.get(0)?,
                     kind: RefKind::parse(&k).ok_or_else(|| corrupt("вид ссылки", &k))?,
                     count: r.get(2)?,
                     first_line: r.get(3)?,
+                    recv_count: (recv > 0).then_some(recv),
                 })
             })?
             .collect::<Result<_, _>>()?;

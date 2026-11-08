@@ -3767,3 +3767,71 @@ async fn mcp_cache_h4_leaf_spanning_next_keeps_fragment() {
     }
     assert!(text.contains("гаснет"), "{text}");
 }
+
+/// M6 §12а (отложено финальным ревью M5.6): символ с `qual` вида якоря строки (`L10`, `L1-L2`) —
+/// `путь#L10` адресует строку файла (REST 400), поэтому `memory_code` даёт карточку по `id` с
+/// подсказкой «уточните path»; в списке кандидатов — `id`, а `query=<id>` открывает карточку.
+#[tokio::test]
+async fn line_anchor_symbol_link_by_id() {
+    let w = code_world("line-anchor").await;
+    let a = &w.a;
+    code_put(
+        a,
+        vec![code_file(
+            "d.rs",
+            4,
+            vec![
+                code_sym("L10", "const", 1),
+                code_sym("other", "function", 5),
+            ],
+            &[],
+        )],
+    )
+    .await;
+    let call = |args: Value| async move { ok(a, &a.token, &SOL, "memory_code", args).await.text };
+    // REST по адресу `путь#L10` — не символ (400), поэтому адрес карточки — id
+    let r = a
+        .t(
+            Method::GET,
+            &format!(
+                "/api/v1/code/symbols/{}?solution={G}",
+                common::api::enc("d.rs#L10")
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let card = call(json!({"action": "symbol", "query": "L10"})).await;
+    assert!(card.contains("### `d.rs · L10 · id "), "{card}");
+    assert!(card.contains("const"), "{card}");
+    assert!(card.contains("уточните path"), "подсказка: {card}");
+    let id: String = card
+        .split("· id ")
+        .nth(1)
+        .unwrap()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let by_id = call(json!({"action": "symbol", "query": id})).await;
+    assert_eq!(
+        body_of(&by_id).lines().next(),
+        body_of(&card).lines().next(),
+        "{by_id}"
+    );
+    // два символа `L10` — список кандидатов с id и подсказкой
+    code_put(
+        a,
+        vec![code_file("e.rs", 5, vec![code_sym("L10", "const", 2)], &[])],
+    )
+    .await;
+    let list = call(json!({"action": "symbol", "query": "L10"})).await;
+    assert!(
+        list.contains("`d.rs · L10 · id ") && list.contains("`e.rs · L10 · id "),
+        "{list}"
+    );
+    assert!(!list.contains("d.rs#L10"), "{list}");
+    assert!(list.contains("уточните path"), "{list}");
+    // обычный символ — по-прежнему адрес путь#qual
+    let other = call(json!({"action": "symbol", "query": "other"})).await;
+    assert!(other.contains("`d.rs#other`"), "{other}");
+}

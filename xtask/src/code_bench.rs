@@ -12,6 +12,12 @@
 //! п. 2 и п. 8 не достигнуты — ошибка (после записи отчёта), п. 3 (ключевые типы) — только
 //! отчёт: промах разбирается в журнале и идёт вопросом владельцу (веса под список не
 //! подгоняются).
+//!
+//! M6 §12а: карта — с умолчаниями клиента M6 (`**/tests/fixtures/**` исключены); развилка — та
+//! же карта с `exclude_defaults = false`. **Абляция** (справочно, выбор из неё не делается):
+//! входы ранжирования читаются из базы прогона, ранги считает `zam_code::rank_with` по вариантам
+//! «как M5.7», «только fixtures», «только получатель», «только веса вида», «все три»; «все три»
+//! сверяется с ответом сервера.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +26,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+
+use zam_code::{RankFile, RankWeights, RefKind, SymbolKind};
 
 use crate::eval::run::{build_cli, build_server, qdrant_bin};
 use crate::smoke::{Server, SmokeEnv, agent_with, scrub_zam_env, wait_health_for};
@@ -57,8 +65,9 @@ const SPAWN_RUNS: usize = 20;
 const WARMUP_RUNS: usize = 3;
 /// Запусков каждого хука в замере с картой.
 const HOOK_RUNS: usize = 20;
-/// Эталоны экстрактора (развилка п. 3: карта без них).
-const FIXTURES_GLOB: &str = "crates/zam-code/tests/fixtures/**";
+/// Развилка п. 3 (M6 §12а): карта с эталонами экстрактора — умолчание клиента M6 их исключает
+/// (`**/tests/fixtures/**`), развилка его выключает.
+const WITH_FIXTURES_CONFIG: &str = "[code]\nexclude_defaults = false\n";
 /// Файл правки и удаления (есть в любом `HEAD` проекта): правка — комментарий в конце.
 const EDIT_FILE: &str = "crates/zam-core/src/id.rs";
 const REMOVE_FILE: &str = "xtask/src/changelog.rs";
@@ -223,27 +232,28 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
                          "ms_p50": pct(&times, 50), "ms_max": pct(&times, 100)}));
     }
     let central = central_report(&ctx, &status)?;
+    // входы ранжирования карты без эталонов — для абляции (база прогона, только чтение)
+    let inputs_nf = rank_inputs(&data)?;
     let hooks = hooks_with_map(&ctx, &copy, &work)?;
-    // развилка для владельца (п. 3): та же карта без эталонов экстрактора — исключением
-    // `[code] exclude` конфигурации проекта, без правки ранжирования; не гейт
-    fs::write(
-        copy.join(".zeroaimemory/config.toml"),
-        format!("[code]\nexclude = [\"{FIXTURES_GLOB}\"]\n"),
-    )?;
+    // развилка (п. 3, M6 §12а): та же карта с эталонами экстрактора — умолчание исключений
+    // выключено конфигурацией проекта, без правки ранжирования; не гейт
+    fs::write(copy.join(".zeroaimemory/config.toml"), WITH_FIXTURES_CONFIG)?;
     // фоновая синхронизация, запущенная `session-start` в замере хуков, держит замок проекта:
     // явная `zam code sync` при занятом замке не стартует (код 0) — ждать его снятия
     wait_sync_lock(&copy)?;
-    let no_fixtures_sync = ctx.sync(&copy)?;
-    let status_nf = ctx.wait_ranked()?;
-    if status_nf["files"].as_u64() >= status["files"].as_u64() {
+    let fixtures_sync = ctx.sync(&copy)?;
+    let status_fx = ctx.wait_ranked()?;
+    if status_fx["files"].as_u64() <= status["files"].as_u64() {
         bail!(
             "развилка посчитана на старой карте: файлов {} (было {}), отчёт sync: {}",
-            status_nf["files"],
+            status_fx["files"],
             status["files"],
-            no_fixtures_sync.report
+            fixtures_sync.report
         );
     }
-    let central_nf = central_report(&ctx, &status_nf)?;
+    let central_fx = central_report(&ctx, &status_fx)?;
+    let inputs_fx = rank_inputs(&data)?;
+    let ablation = ablation_report(&inputs_nf, &inputs_fx, &central);
     // замеры старта клиента — без работающего рядом сервера замеров (Qdrant, фоновые задачи
     // на том же HDD): у агента сервер обычно на другой машине
     srv.stop()?;
@@ -311,8 +321,9 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
         "status": {"files": status["files"], "symbols": status["symbols"],
                    "by_lang": status["by_lang"], "skipped_total": status["skipped_total"]},
         "central": central,
-        "central_without_fixtures": {"exclude": FIXTURES_GLOB, "sync": row(&no_fixtures_sync),
-                                     "files": status_nf["files"], "report": central_nf},
+        "central_with_fixtures": {"config": WITH_FIXTURES_CONFIG, "sync": row(&fixtures_sync),
+                                  "files": status_fx["files"], "report": central_fx},
+        "ablation": ablation,
         "hooks_with_map": hooks,
         "zam_version": version,
         "background_spawn": spawn,
@@ -926,12 +937,21 @@ fn print_table(r: &Value) {
             h["budget_ms"]
         );
     }
-    let nf = &r["central_without_fixtures"];
+    let nf = &r["central_with_fixtures"];
     println!(
-        "| развилка: без `{}` (файлов {}) — ключевые типы в первых 15 | {}/10 | ≥ 6 |",
-        nf["exclude"].as_str().unwrap_or(""),
-        nf["files"],
-        nf["report"]["top15_hits"]
+        "| развилка: с `tests/fixtures` (`exclude_defaults = false`, файлов {}) — ключевые типы в первых 15 | {}/10 | — |",
+        nf["files"], nf["report"]["top15_hits"]
+    );
+    for v in r["ablation"]["variants"].as_array().into_iter().flatten() {
+        println!(
+            "| абляция (справочно): {} — ключевые типы в первых 15 | {}/10 | — |",
+            v["variant"].as_str().unwrap_or(""),
+            v["top15_hits"]
+        );
+    }
+    println!(
+        "| абляция «все три» = ответ сервера (первые 15) | {} | да |",
+        r["ablation"]["matches_server"]
     );
     let v = &r["zam_version"];
     println!(
@@ -959,7 +979,7 @@ fn print_table(r: &Value) {
             t["path"].as_str().unwrap_or("")
         );
     }
-    println!("развилка без эталонов — первые 15:");
+    println!("развилка с эталонами — первые 15:");
     for (i, t) in nf["report"]["top15"]
         .as_array()
         .into_iter()
@@ -986,6 +1006,156 @@ fn print_table(r: &Value) {
     for k in c["key_type_places"].as_array().into_iter().flatten() {
         println!("  {} — {}", k["qual"].as_str().unwrap_or(""), k["place"]);
     }
+}
+
+/// Входы ранжирования карты решения из базы прогона (как `zam_store::code::code_rank_inputs`:
+/// файлы и символы по `id`) и `(qual, путь)` каждого определения.
+struct Inputs {
+    files: Vec<RankFile>,
+    quals: Vec<Vec<String>>,
+}
+
+fn rank_inputs(data: &Path) -> Result<Inputs> {
+    let db = crate::eval::gate::user_db(data)?;
+    let c = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| db.display().to_string())?;
+    let mut files: Vec<RankFile> = Vec::new();
+    let mut quals: Vec<Vec<String>> = Vec::new();
+    let mut at = std::collections::HashMap::new();
+    let mut st =
+        c.prepare("SELECT id, path FROM code_files WHERE solution_guid = ?1 ORDER BY id")?;
+    for row in st.query_map([SOLUTION], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, path) = row?;
+        at.insert(id, files.len());
+        files.push(RankFile {
+            id,
+            path,
+            defs: Vec::new(),
+            refs: Vec::new(),
+        });
+        quals.push(Vec::new());
+    }
+    let mut st = c.prepare(
+        "SELECT s.file_id, s.name, s.kind, s.exported, s.qual FROM code_files f
+         JOIN code_symbols s ON s.file_id = f.id WHERE f.solution_guid = ?1 ORDER BY s.id",
+    )?;
+    let rows = st.query_map([SOLUTION], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<bool>>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (fid, name, kind, exported, qual) = row?;
+        let kind = SymbolKind::parse(&kind).with_context(|| format!("вид символа {kind}"))?;
+        if let Some(&i) = at.get(&fid) {
+            files[i].defs.push((name, kind, exported));
+            quals[i].push(qual);
+        }
+    }
+    let mut st = c.prepare(
+        "SELECT r.file_id, r.name, r.kind, r.count, r.recv_count FROM code_files f
+         JOIN code_refs r ON r.file_id = f.id WHERE f.solution_guid = ?1",
+    )?;
+    let rows = st.query_map([SOLUTION], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, u32>(3)?,
+            r.get::<_, u32>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (fid, name, kind, n, recv) = row?;
+        let kind = RefKind::parse(&kind).with_context(|| format!("вид ссылки {kind}"))?;
+        if let Some(&i) = at.get(&fid) {
+            files[i].refs.push((name, kind, n, recv));
+        }
+    }
+    Ok(Inputs { files, quals })
+}
+
+/// Первые [`CENTRAL_TOP`] по рангу символа (ранг файла × доля, без ограничения на файл, как
+/// [`central_report`]) при правилах `w`: `(qual, путь)`; и места ключевых типов.
+fn offline_top(inp: &Inputs, w: RankWeights) -> (Vec<(String, String)>, Vec<Option<usize>>) {
+    let r = zam_code::rank_with(&inp.files, None, w);
+    let mut all: Vec<(f64, usize, usize)> = Vec::new();
+    for (i, f) in inp.files.iter().enumerate() {
+        for j in 0..f.defs.len() {
+            all.push((r.file_rank[i] * r.symbol_share[i][j], i, j));
+        }
+    }
+    all.sort_by(|a, b| b.0.total_cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
+    let id =
+        |&(_, i, j): &(f64, usize, usize)| (inp.quals[i][j].clone(), inp.files[i].path.clone());
+    let top = all.iter().take(CENTRAL_TOP).map(id).collect();
+    let places = KEY_TYPES
+        .iter()
+        .map(|(q, p)| {
+            all.iter()
+                .position(|x| {
+                    let (aq, ap) = id(x);
+                    aq == *q && ap == *p
+                })
+                .map(|i| i + 1)
+        })
+        .collect();
+    (top, places)
+}
+
+/// Абляция M6 §12а (справочно): каждое из трёх изменений отдельно и вместе на входах прогона —
+/// карта без эталонов (`nf`) и с ними (`fx`); «все три» сверяется с первыми 15 сервера.
+fn ablation_report(nf: &Inputs, fx: &Inputs, server: &Value) -> Value {
+    let only = |kind_table: bool, recv: bool| RankWeights { kind_table, recv };
+    let variants: [(&str, &Inputs, RankWeights); 5] = [
+        (
+            "как M5.7 (с fixtures, виды равны, без получателя)",
+            fx,
+            RankWeights::M57,
+        ),
+        ("только исключение fixtures", nf, RankWeights::M57),
+        ("только вызов по получателю", fx, only(false, true)),
+        ("только веса вида", fx, only(true, false)),
+        ("все три (M6)", nf, RankWeights::M6),
+    ];
+    let key = |q: &str, p: &str| KEY_TYPES.iter().any(|(kq, kp)| *kq == q && *kp == p);
+    let mut out = Vec::new();
+    let mut all_three = Vec::new();
+    for (name, inp, w) in variants {
+        let (top, places) = offline_top(inp, w);
+        let hits = top.iter().filter(|(q, p)| key(q, p)).count();
+        if w == RankWeights::M6 {
+            all_three = top.clone();
+        }
+        out.push(json!({
+            "variant": name,
+            "files": inp.files.len(),
+            "top15_hits": hits,
+            "top15": top.iter().map(|(q, p)| json!({"qual": q, "path": p, "key": key(q, p)}))
+                .collect::<Vec<_>>(),
+            "key_type_places": KEY_TYPES.iter().zip(&places)
+                .map(|((q, _), pl)| json!({"qual": q, "place": pl})).collect::<Vec<_>>(),
+        }));
+    }
+    let server_top: Vec<(String, String)> = server["top15"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            (
+                t["qual"].as_str().unwrap_or("").to_string(),
+                t["path"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    json!({"variants": out, "matches_server": all_three == server_top,
+           "note": "справочно (M6 §12а): выбор из абляции не делается"})
 }
 
 #[cfg(test)]

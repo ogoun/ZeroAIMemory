@@ -1854,3 +1854,64 @@ async fn map_files_param_limits_files_and_edges() {
         );
     }
 }
+
+/// M6 §12а: ответ `POST /code/sync` несёт `recv_count: true` (клиент M6 по нему шлёт счётчик);
+/// `refs[].recv_count` принимается у `call` (≤ `count`), иначе 422; файл старого клиента (без
+/// поля) принимается, его вызовы — прямые. Ранги карты с получателем ниже, чем у прямых вызовов.
+#[tokio::test]
+async fn refs_recv_count_accepted_validated() {
+    let a = world("recv-count", |_| {}).await;
+    let r = sync(&a, &[("src/lib.rs", 1)]).await;
+    ok(&r, StatusCode::OK, "sync");
+    assert_eq!(r.json()["recv_count"], true, "{}", r.text());
+    let with = |kind: &str, count: u32, recv: u32| {
+        json!({"path": "src/x.rs", "lang": "rust", "hash": h(9), "size": 10, "parse_state": "ok",
+               "symbols": [], "refs": [{"name": "go", "kind": kind, "count": count,
+                                        "first_line": 1, "recv_count": recv}]})
+    };
+    unprocessable(
+        &put_raw(&a, vec![with("call", 2, 3)]).await,
+        "recv_count: не больше count",
+        "recv > count",
+    );
+    unprocessable(
+        &put_raw(&a, vec![with("type", 2, 1)]).await,
+        "recv_count: только у ссылок вида call",
+        "recv у type",
+    );
+    // один файл вызывает `go` только по получателю ×4, а `stop` — прямо ×4 (у старого клиента
+    // поля нет — тоже прямые): исходящий вес файла делится √(4 × 0,25) : √4 = 1 : 2
+    let mut user = file(
+        "src/user.rs",
+        3,
+        vec![func("o_user", 1)],
+        &[("go", "call", 4), ("stop", "call", 4)],
+    );
+    user["refs"][0]["recv_count"] = json!(4);
+    put(
+        &a,
+        vec![
+            file("src/go.rs", 1, vec![func("go", 1)], &[]),
+            file("src/stop.rs", 2, vec![func("stop", 1)], &[]),
+            user,
+        ],
+    )
+    .await;
+    wait_ranked(&a).await;
+    let m = map_json(&a, "").await;
+    let rank_of = |path: &str| {
+        m["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == path)
+            .unwrap_or_else(|| panic!("{path}: {m}"))["rank"]
+            .as_f64()
+            .unwrap()
+    };
+    let (go, stop) = (rank_of("src/go.rs"), rank_of("src/stop.rs"));
+    assert!(
+        go < stop,
+        "вызовы по получателю весят меньше прямых: {go} / {stop}: {m}"
+    );
+}

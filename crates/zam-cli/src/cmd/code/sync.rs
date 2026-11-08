@@ -673,10 +673,19 @@ pub fn sync(
         warnings,
         ..SyncReport::default()
     };
+    // `refs[].recv_count` (M6 §12а) — только серверу, который его принимает: у сервера до M6
+    // тело файла — `deny_unknown_fields`, вызовы по получателю у него остаются в `call`
+    let recv_ok = resp["recv_count"] == true;
+    let known_state = state.solution == guid && !state.files.is_empty();
     // разбор сменился (`EXTRACT_VERSION`) — карта этого клиента перезагружается целиком
-    let reparse = state.solution == guid
-        && !state.files.is_empty()
-        && state.extractor != zam_code::EXTRACT_VERSION;
+    let reparse = known_state && state.extractor != zam_code::EXTRACT_VERSION;
+    // сервер стал принимать `recv_count` (обновился после загрузки) — тоже целиком
+    let resend = known_state && recv_ok && !state.recv_count && !reparse;
+    if resend {
+        report.warnings.push(
+            "сервер принимает вызовы по получателю: файлы карты загружаются заново".to_string(),
+        );
+    }
     if reparse {
         // журнал падений относится к прежнему разбору: новый пробует файлы заново (ревью 9A, M8)
         state.crashed.clear();
@@ -686,7 +695,7 @@ pub fn sync(
             zam_code::EXTRACT_VERSION
         ));
     }
-    let need: Vec<&Fingerprint> = if opts.full || reparse {
+    let need: Vec<&Fingerprint> = if opts.full || reparse || resend {
         live.clone()
     } else {
         let set: HashSet<&str> = resp["need"]
@@ -725,6 +734,9 @@ pub fn sync(
         let Some(mut file) = parse_file(root, fp, h, &state, cfg, &crash) else {
             continue;
         };
+        if !recv_ok {
+            file.refs.iter_mut().for_each(|r| r.recv_count = None);
+        }
         let ser = |f: &FileUpload| {
             serde_json::to_vec(f).map_err(|e| CliError::config(format!("сериализация файла: {e}")))
         };
@@ -778,6 +790,7 @@ pub fn sync(
         files,
         crashed,
         extractor: zam_code::EXTRACT_VERSION,
+        recv_count: recv_ok,
     };
     let io = |e: std::io::Error| CliError::config(format!("кэш карты кода: {e}"));
     new_state.save(root).map_err(io)?;

@@ -7,6 +7,7 @@
 //! **Ссылки** — шаблоны `@reference.*` встроенного `TAGS_QUERY` грамматики (TypeScript/TSX — ещё
 //! и JavaScript: грамматика TS наследует JS) плюс `queries/<язык>.scm`; у C# — только свой запрос.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use tree_sitter::{Language, Node, Query};
@@ -435,6 +436,60 @@ pub(super) fn exported(
             .children(&mut c)
             .any(|ch| ch.kind() == "modifier" && ch.utf8_text(src).is_ok_and(|t| t == "public")),
     })
+}
+
+/// Операнд доступа к члену, чьё имя — имя вызова (M6 §12а): выражение или простой
+/// идентификатор (его текст — для правила «квалификатора»).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Operand {
+    Expr,
+    Ident(String),
+}
+
+/// Узел доступа к члену: `(узел имени члена, операнд)`. Rust `field_expression.field`, TS/TSX/JS
+/// `member_expression.property`, Python `attribute.attribute`, Go `selector_expression.field`, Java
+/// `method_invocation.name` при поле `object`, C# `member_access_expression.name` (у
+/// `generic_name` — его идентификатор). Иные узлы — `None`.
+pub(super) fn member_access<'t>(
+    lang: Lang,
+    node: Node<'t>,
+    src: &[u8],
+) -> Option<(Node<'t>, Operand)> {
+    let (name_field, obj_field) = match (lang, node.kind()) {
+        (Lang::Rust, "field_expression") => ("field", "value"),
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "member_expression") => {
+            ("property", "object")
+        }
+        (Lang::Python, "attribute") => ("attribute", "object"),
+        (Lang::Go, "selector_expression") => ("field", "operand"),
+        (Lang::Java, "method_invocation") => ("name", "object"),
+        (Lang::CSharp, "member_access_expression") => ("name", "expression"),
+        _ => return None,
+    };
+    let mut name = node.child_by_field_name(name_field)?;
+    if name.kind() == "generic_name" {
+        name = name.named_child(0).filter(|n| n.kind() == "identifier")?;
+    }
+    let obj = node.child_by_field_name(obj_field)?;
+    // Rust: путь `T::f` — `scoped_identifier`, а `field_expression` — всегда значение-получатель
+    let op = if lang != Lang::Rust && matches!(obj.kind(), "identifier" | "type_identifier") {
+        Operand::Ident(text(obj, src))
+    } else {
+        Operand::Expr
+    };
+    Some((name, op))
+}
+
+/// Вызов члена с операндом `op` — по получателю (M6 §12а): операнд не «квалификатор». Квалификатор —
+/// простой идентификатор с заглавной буквы (тип или класс: `Math.max`, `Console.WriteLine`) или имя
+/// импорта файла (пакет, модуль: `fmt.Println`, `os.getcwd`).
+pub(super) fn is_recv(op: &Operand, imports: &HashSet<String>) -> bool {
+    match op {
+        Operand::Expr => true,
+        Operand::Ident(t) => {
+            !(t.chars().next().is_some_and(char::is_uppercase) || imports.contains(t.as_str()))
+        }
+    }
 }
 
 /// Вид ссылки по суффиксу захвата `@reference.*` и виду узла.

@@ -1,4 +1,4 @@
-//! Секция `[code]` клиента (спецификация M5.6 §12): `~/.zeroaimemory/config.toml` и
+//! Секция `[code]` клиента (спецификация M5.6 §12, M6 §12а): `~/.zeroaimemory/config.toml` и
 //! `<корень>/.zeroaimemory/config.toml`, проект сильнее домашнего по каждому ключу. Неизвестный
 //! ключ, значение вне диапазона, неизвестный язык или неверная маска — ошибка конфигурации
 //! (код 1) с именем ключа и файла: молча выключенная карта хуже явной ошибки.
@@ -13,6 +13,11 @@ use crate::client::CliError;
 /// Предел файла настроек, байт (как у `[hooks]`).
 const CONFIG_MAX: u64 = 1024 * 1024;
 
+/// Исключения карты по умолчанию (M6 §12а): эталоны тестов (`tests/fixtures`) определяют общие
+/// имена (`Result`, `Option`, `format`) и забирают места центральных символов. Список
+/// пользователя `exclude` их дополняет; `exclude_defaults = false` их отключает.
+pub const DEFAULT_EXCLUDE: &[&str] = &["**/tests/fixtures/**"];
+
 /// Настройки карты кода клиента.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeConfig {
@@ -22,8 +27,10 @@ pub struct CodeConfig {
     pub auto_interval_min: u32,
     /// `None` — все собранные языки.
     pub languages: Option<Vec<Lang>>,
-    /// Маски `globset` относительно корня (`/`).
+    /// Маски `globset` относительно корня (`/`) — пользователя, без [`DEFAULT_EXCLUDE`].
     pub exclude: Vec<String>,
+    /// Добавлять [`DEFAULT_EXCLUDE`] к `exclude` (M6 §12а).
+    pub exclude_defaults: bool,
     pub max_file_bytes: u64,
     pub max_files: u32,
     pub parse_timeout_ms: u64,
@@ -38,6 +45,7 @@ impl Default for CodeConfig {
             auto_interval_min: 30,
             languages: None,
             exclude: Vec::new(),
+            exclude_defaults: true,
             max_file_bytes: 1_048_576,
             max_files: 50_000,
             parse_timeout_ms: 200,
@@ -52,9 +60,18 @@ impl CodeConfig {
         self.languages.as_ref().is_none_or(|v| v.contains(&l))
     }
 
-    /// Набор масок `exclude` (проверены при загрузке).
+    /// Действующие маски: [`DEFAULT_EXCLUDE`] (если `exclude_defaults`) и `exclude`.
+    pub fn exclude_all(&self) -> Vec<String> {
+        let defaults = DEFAULT_EXCLUDE.iter().filter(|_| self.exclude_defaults);
+        defaults
+            .map(|m| (*m).to_string())
+            .chain(self.exclude.iter().cloned())
+            .collect()
+    }
+
+    /// Набор действующих масок (проверены при загрузке).
     pub fn exclude_set(&self) -> GlobSet {
-        globs(&self.exclude).unwrap_or_else(|_| GlobSet::empty())
+        globs(&self.exclude_all()).unwrap_or_else(|_| GlobSet::empty())
     }
 }
 
@@ -67,6 +84,7 @@ struct Section {
     auto_interval_min: Option<i64>,
     languages: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
+    exclude_defaults: Option<bool>,
     max_file_bytes: Option<i64>,
     max_files: Option<i64>,
     parse_timeout_ms: Option<i64>,
@@ -82,6 +100,7 @@ impl Section {
             auto_interval_min: self.auto_interval_min.or(weaker.auto_interval_min),
             languages: self.languages.or(weaker.languages),
             exclude: self.exclude.or(weaker.exclude),
+            exclude_defaults: self.exclude_defaults.or(weaker.exclude_defaults),
             max_file_bytes: self.max_file_bytes.or(weaker.max_file_bytes),
             max_files: self.max_files.or(weaker.max_files),
             parse_timeout_ms: self.parse_timeout_ms.or(weaker.parse_timeout_ms),
@@ -192,6 +211,7 @@ pub fn load(home: &Path, root: &Path) -> Result<CodeConfig, CliError> {
         auto_interval_min: ranged(s.auto_interval_min, 30, 1, 10_080, "auto_interval_min")? as u32,
         languages,
         exclude,
+        exclude_defaults: s.exclude_defaults.unwrap_or(d.exclude_defaults),
         max_file_bytes: ranged(
             s.max_file_bytes,
             d.max_file_bytes,

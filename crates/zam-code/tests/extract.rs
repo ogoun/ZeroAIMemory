@@ -846,3 +846,96 @@ fn rust_impl_dyn_edge_cases_current_behavior() {
         ]
     );
 }
+
+/// `(count, recv_count)` ссылки `name` вида `call`.
+fn call_counts(out: &Extracted, name: &str) -> (u32, Option<u32>) {
+    let r = out
+        .refs
+        .iter()
+        .find(|r| r.name == name && r.kind == RefKind::Call)
+        .unwrap_or_else(|| panic!("нет вызова {name}: {:?}", out.refs));
+    (r.count, r.recv_count)
+}
+
+/// M6 §12а: экстрактор различает вызов по получателю (`x.f()`, `self.f()`, `this.f()`, `a.b.f()`)
+/// и прямое упоминание (`f()`, `T::f()`, `T.f()` с типом по заглавной букве, вызов через имя
+/// импорта `fs.f()`, `use …::f`); отдельного вида нет — `call` с `recv_count`.
+#[test]
+fn recv_call_detected_rust_ts_py() {
+    let rs = run(
+        Lang::Rust,
+        "use m::f;\nfn g(x: X) {\n    x.f();\n    self.f();\n    a.b.f();\n    f();\n    T::f();\n}\n",
+    );
+    assert_eq!(call_counts(&rs, "f"), (5, Some(3)), "{:?}", rs.refs);
+    assert!(has_ref(&rs, "f", RefKind::Import));
+    let ts_src = "import { f } from './m';\nimport fs from 'fs';\nfunction g(x) {\n  x.f();\n  this.f();\n  a.b.f();\n  f();\n  T.f();\n  fs.f();\n}\n";
+    for lang in [Lang::TypeScript, Lang::Tsx, Lang::JavaScript] {
+        let ts = run(lang, ts_src);
+        assert_eq!(call_counts(&ts, "f"), (6, Some(3)), "{lang}: {:?}", ts.refs);
+    }
+    let py = run(
+        Lang::Python,
+        "import os\nfrom m import f\n\ndef g(self, x):\n    x.f()\n    self.f()\n    a.b.f()\n    f()\n    T.f()\n    os.f()\n",
+    );
+    assert_eq!(call_counts(&py, "f"), (6, Some(3)), "{:?}", py.refs);
+    // только прямые вызовы — поля нет (и в JSON его нет)
+    let direct = run(Lang::Rust, "fn g() {\n    f();\n    T::f();\n}\n");
+    assert_eq!(call_counts(&direct, "f"), (2, None));
+    let json = serde_json::to_value(&direct.refs).unwrap();
+    assert!(json.to_string().find("recv_count").is_none(), "{json}");
+    // у ссылок не-вызовов счётчика нет
+    for out in [&rs, &py, &direct] {
+        assert!(
+            out.refs
+                .iter()
+                .all(|r| r.kind == RefKind::Call || r.recv_count.is_none()),
+            "{:?}",
+            out.refs
+        );
+    }
+}
+
+/// M6 §12а: то же правило у Go, Java, C# (`fmt.f()` — имя импорта, `T.f()` — тип).
+#[test]
+fn recv_call_detected_go_java_csharp() {
+    let go = run(
+        Lang::Go,
+        "package p\n\nimport \"fmt\"\n\nfunc g(x X) {\n\tx.f()\n\ta.b.f()\n\tf()\n\tfmt.f()\n\tT.f()\n}\n",
+    );
+    assert_eq!(call_counts(&go, "f"), (5, Some(2)), "{:?}", go.refs);
+    let java = run(
+        Lang::Java,
+        "import a.b.F;\nclass C {\n  void g(X x) {\n    x.f();\n    this.f();\n    a.b.f();\n    f();\n    T.f();\n  }\n}\n",
+    );
+    assert_eq!(call_counts(&java, "f"), (5, Some(3)), "{:?}", java.refs);
+    let cs = run(
+        Lang::CSharp,
+        "using System;\nclass C {\n  void G(X x) {\n    x.F();\n    this.F();\n    a.b.F();\n    F();\n    T.F();\n    x.F<int>();\n  }\n}\n",
+    );
+    assert_eq!(call_counts(&cs, "F"), (6, Some(4)), "{:?}", cs.refs);
+}
+
+/// M6 §12а, контроль прочих целей: точность и полнота экстрактора на эталонах — 1,000 у всех
+/// восьми языков (смена версии разбора 2 → 3 символов не меняет).
+#[test]
+fn extractor_metrics_1_000() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for (lang, dir, file) in FIXTURES {
+        let src = std::fs::read(root.join(dir).join(file)).unwrap();
+        let expected: BTreeSet<String> =
+            std::fs::read_to_string(root.join(dir).join("expected.txt"))
+                .unwrap()
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+        let out = extract(lang, &src, &lim());
+        let got: BTreeSet<String> = out
+            .symbols
+            .iter()
+            .map(|s| format!("{} {} {}", s.kind.as_str(), s.qual, s.line))
+            .collect();
+        assert_eq!(got, expected, "{dir}: точность и полнота должны быть 1,000");
+    }
+}

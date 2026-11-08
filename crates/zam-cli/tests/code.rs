@@ -1393,3 +1393,216 @@ fn code_sync_skip_worktree_exclude_case_links_walk_limit() {
         err(&o)
     );
 }
+
+/// Ссылки `name` вида `call` в телах `PUT /code/files`.
+fn call_refs(puts: &[Value], name: &str) -> Vec<Value> {
+    puts.iter()
+        .flat_map(|b| b["files"].as_array().unwrap().iter())
+        .flat_map(|f| f["refs"].as_array().unwrap().iter())
+        .filter(|r| r["name"] == name && r["kind"] == "call")
+        .cloned()
+        .collect()
+}
+
+/// M6 §12а: серверу до M6 (ответ `POST /code/sync` без признака `recv_count`) уходит прежняя
+/// форма ссылок — без `recv_count` (его `deny_unknown_fields` отверг бы файл); серверу M6 — с
+/// ним. Сервер обновился после загрузки — следующая синхронизация перезагружает все файлы.
+#[test]
+fn old_server_gets_no_recv_count() {
+    const SRC: &[u8] = b"pub fn run(x: X) {\n    x.go();\n    self.go();\n    go();\n}\n";
+    let old = json!({"need": ["src/a.rs", "src/b.rs"], "removed": 0, "etag": "e",
+                     "accepted": 2, "stale_refs": 0, "warnings": []});
+    let (url, seen) = common::stub(
+        200,
+        Box::leak(old.to_string().into_boxed_str()),
+        Duration::ZERO,
+    );
+    let Some(p) = Proj::git("recv-old", &url, "zam_stub") else {
+        return;
+    };
+    p.file("src/a.rs", SRC);
+    p.file("src/b.rs", b"pub fn go() {}\n");
+    p.commit("init");
+    ok(&p.zam(&["code", "sync"]));
+    let puts = bodies(&seen, "PUT", "/api/v1/code/files");
+    let go = call_refs(&puts, "go");
+    assert_eq!(go.len(), 1, "{puts:?}");
+    assert_eq!(go[0]["count"], 3, "{go:?}");
+    assert!(go[0].get("recv_count").is_none(), "старому серверу: {go:?}");
+    let state = json_of(&std::fs::read_to_string(p.cache("code-state.json")).unwrap());
+    assert_eq!(state["recv_count"], false, "{state}");
+    assert_eq!(state["extractor"], 3, "{state}");
+
+    // тот же проект, сервер M6 (`recv_count: true`) и пустой `need`: всё загружается заново
+    let new = json!({"need": [], "removed": 0, "etag": "e", "accepted": 2, "stale_refs": 0,
+                     "warnings": [], "recv_count": true});
+    let (url2, seen2) = common::stub(
+        200,
+        Box::leak(new.to_string().into_boxed_str()),
+        Duration::ZERO,
+    );
+    let p2 = Proj {
+        url: url2,
+        token: "zam_stub".into(),
+        repo: p.repo.clone(),
+        home: p.home.clone(),
+    };
+    let r = json_of(&ok(&p2.zam(&["code", "sync", "--json"])));
+    assert_eq!(r["need"], 2, "{r}");
+    assert!(
+        r["warnings"].to_string().contains("вызовы по получателю"),
+        "{r}"
+    );
+    let puts = bodies(&seen2, "PUT", "/api/v1/code/files");
+    let go = call_refs(&puts, "go");
+    assert_eq!(go.len(), 1, "{puts:?}");
+    assert_eq!(
+        (go[0]["count"].clone(), go[0]["recv_count"].clone()),
+        (json!(3), json!(2))
+    );
+    let state = json_of(&std::fs::read_to_string(p.cache("code-state.json")).unwrap());
+    assert_eq!(state["recv_count"], true, "{state}");
+    // повтор с тем же сервером — по `need` (пусто), без перезагрузки
+    let r = json_of(&ok(&p2.zam(&["code", "sync", "--json"])));
+    assert_eq!(r["need"], 0, "{r}");
+
+    // настоящий сервер M6: счётчик доходит до карты (карточка символа файла — `uses`)
+    let (url, tok) = start("recv-real");
+    let Some(q) = Proj::git("recv-real", &url, &tok) else {
+        return;
+    };
+    q.file("src/a.rs", SRC);
+    q.file("src/b.rs", b"pub fn go() {}\n");
+    q.commit("init");
+    q.sync();
+    let hits = q.get(&format!("/code/symbols?solution={G}&q=run&limit=10"));
+    let id = hits["symbols"][0]["id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{hits}"));
+    let card = q.get(&format!("/code/symbols/{id}?solution={G}"));
+    let uses = card["uses"].as_array().unwrap();
+    let go = uses
+        .iter()
+        .find(|u| u["name"] == "go" && u["kind"] == "call")
+        .unwrap_or_else(|| panic!("{card}"));
+    assert_eq!(
+        (go["count"].clone(), go["recv_count"].clone()),
+        (json!(3), json!(2))
+    );
+}
+
+/// M6 §12а: `**/tests/fixtures/**` — в исключениях по умолчанию; уже загруженные файлы под
+/// шаблоном удаляются следующей синхронизацией (с предохранителем массового удаления `--prune`).
+#[test]
+fn fixtures_excluded_by_default_and_pruned() {
+    let (url, tok) = start("fixtures-default");
+    let Some(p) = Proj::git("fixtures-default", &url, &tok) else {
+        return;
+    };
+    p.file("src/a.rs", b"pub fn real() {}\n");
+    p.file(
+        "crates/x/tests/fixtures/sample.rs",
+        b"pub fn fixture_only() {}\n",
+    );
+    p.file(
+        "tests/fixtures/py/sample.py",
+        b"def fixture_py():\n    pass\n",
+    );
+    p.commit("init");
+    // по умолчанию эталонов в карте нет
+    let r = p.sync();
+    assert_eq!(r["files"], 1, "{r}");
+    assert!(p.symbol_paths("fixture_only").is_empty());
+
+    // карта с эталонами (как у клиента до M6) — следующая синхронизация с умолчанием их убирает
+    p.config("[code]\nexclude_defaults = false\n");
+    let r = p.sync();
+    assert_eq!(r["files"], 3, "{r}");
+    assert_eq!(
+        p.symbol_paths("fixture_only"),
+        ["crates/x/tests/fixtures/sample.rs"]
+    );
+    std::fs::remove_file(p.repo.join(".zeroaimemory/config.toml")).unwrap();
+    let r = p.sync();
+    assert_eq!(
+        (r["files"].clone(), r["removed"].clone()),
+        (json!(1), json!(2)),
+        "{r}"
+    );
+    assert!(p.symbol_paths("fixture_only").is_empty());
+    assert_eq!(p.status()["files"], 1);
+
+    // эталонов больше половины карты (≥ 20 файлов) — предохранитель, затем `--prune`
+    let (url, tok) = start("fixtures-prune");
+    let Some(q) = Proj::git("fixtures-prune", &url, &tok) else {
+        return;
+    };
+    q.file("src/a.rs", b"pub fn real() {}\n");
+    for i in 0..24 {
+        q.file(
+            &format!("pkg/tests/fixtures/f{i:02}.rs"),
+            format!("pub fn fx{i}() {{}}\n").as_bytes(),
+        );
+    }
+    q.commit("init");
+    q.config("[code]\nexclude_defaults = false\n");
+    assert_eq!(q.sync()["files"], 25);
+    std::fs::remove_file(q.repo.join(".zeroaimemory/config.toml")).unwrap();
+    let o = q.zam(&["code", "sync"]);
+    assert_eq!(o.status.code(), Some(1), "{}{}", out(&o), err(&o));
+    assert!(err(&o).contains("--prune"), "{}", err(&o));
+    assert_eq!(q.status()["files"], 25, "без --prune карта цела");
+    let r = json_of(&ok(&q.zam(&["code", "sync", "--prune", "--json"])));
+    assert_eq!(
+        (r["files"].clone(), r["removed"].clone()),
+        (json!(1), json!(24)),
+        "{r}"
+    );
+}
+
+/// M6 §12а: `exclude_defaults = false` оставляет эталоны в карте; список пользователя `exclude`
+/// умолчание дополняет (а не заменяет), и при `false` действует сам по себе.
+#[test]
+fn exclude_defaults_false_keeps() {
+    let (url, tok) = start("fixtures-keep");
+    let Some(p) = Proj::git("fixtures-keep", &url, &tok) else {
+        return;
+    };
+    p.file("src/a.rs", b"pub fn real() {}\n");
+    p.file("gen/out.rs", b"pub fn generated() {}\n");
+    p.file(
+        "crates/x/tests/fixtures/sample.rs",
+        b"pub fn fixture_only() {}\n",
+    );
+    p.commit("init");
+    // список пользователя дополняет умолчание
+    p.config("[code]\nexclude = [\"gen/**\"]\n");
+    assert_eq!(p.sync()["files"], 1);
+    // умолчание выключено — эталоны в карте, `gen/**` пользователя — по-прежнему нет
+    p.config("[code]\nexclude = [\"gen/**\"]\nexclude_defaults = false\n");
+    let r = p.sync();
+    assert_eq!(r["files"], 2, "{r}");
+    assert_eq!(
+        p.symbol_paths("fixture_only"),
+        ["crates/x/tests/fixtures/sample.rs"]
+    );
+    assert!(p.symbol_paths("generated").is_empty());
+    // домашний `exclude_defaults = false`, проект его не задаёт — действует домашний
+    std::fs::remove_file(p.repo.join(".zeroaimemory/config.toml")).unwrap();
+    std::fs::create_dir_all(p.home.join(".zeroaimemory")).unwrap();
+    std::fs::write(
+        p.home.join(".zeroaimemory/config.toml"),
+        "[code]\nexclude_defaults = false\n",
+    )
+    .unwrap();
+    assert_eq!(p.sync()["files"], 3);
+    // неверный тип — ошибка конфигурации (код 1) с файлом и секцией, как у прочих ключей
+    p.config("[code]\nexclude_defaults = \"no\"\n");
+    let o = p.zam(&["code", "sync"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(
+        err(&o).contains("config.toml") && err(&o).contains("[code]"),
+        "{}",
+        err(&o)
+    );
+}

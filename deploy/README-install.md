@@ -571,8 +571,13 @@ zam code impact               # что затронут правки рабоч�
   (итог — строкой в `.zeroaimemory/logs/hooks.log`).
 - Настройки клиента — секция `[code]` в `~/.zeroaimemory/config.toml` или
   `.zeroaimemory/config.toml` проекта: `enabled`, `auto` (фоновая синхронизация), `auto_interval_min`
-  (30), `languages`, `exclude` (маски, например `["**/tests/fixtures/**"]`), `max_file_bytes` (1 МиБ),
+  (30), `languages`, `exclude` (маски, например `["gen/**"]`; дополняют исключение по умолчанию
+  `**/tests/fixtures/**` — эталоны тестов с общими именами мешали ранжированию карты),
+  `exclude_defaults` (`true`; `false` — эталоны тестов в карте), `max_file_bytes` (1 МиБ),
   `max_files` (50 000), `parse_timeout_ms` (200), `send_signatures` (`false` — без сигнатур).
+  С M6 файлы под `**/tests/fixtures/**` уходят из карты при первой синхронизации (если их больше
+  половины карты — нужен `zam code sync --prune`), а клиент перезагружает карту целиком один раз
+  (новая версия разбора: вызовы по получателю `x.f()` весят меньше прямых).
   Сервер — секция `[code]` в `config.toml` (см. `config.example.toml`); `enabled = false` —
   маршруты карты отвечают 404.
 - Знание о функции привязывается ссылкой `путь#Тип::метод` (`zam log … --ref

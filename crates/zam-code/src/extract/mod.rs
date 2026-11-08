@@ -213,7 +213,9 @@ fn run(lang: Lang, src: &[u8], lim: &Limits, with_refs: bool, deadline: Instant)
     };
 
     let mut chain = Chain::default();
-    let Some(defs) = walk_defs(lang, &tree, src, &mut chain, deadline) else {
+    // имена членов в вызовах `x.f()` — только при разборе ссылок (хэшам хуков не нужны)
+    let mut members = with_refs.then(HashMap::new);
+    let Some(defs) = walk_defs(lang, &tree, src, &mut chain, members.as_mut(), deadline) else {
         return Extracted::skipped(SkipReason::Timeout);
     };
     let refs = if with_refs {
@@ -231,7 +233,7 @@ fn run(lang: Lang, src: &[u8], lim: &Limits, with_refs: bool, deadline: Instant)
         return Extracted::skipped(SkipReason::Timeout);
     };
     let def_names: HashSet<usize> = defs.iter().map(|d| d.name.id()).collect();
-    let mut refs = aggregate_refs(src, refs, &def_names);
+    let mut refs = aggregate_refs(src, refs, &def_names, &members.unwrap_or_default());
 
     let mut state = ParseState::Ok;
     if symbols.len() > lim.max_symbols {
@@ -254,11 +256,13 @@ fn run(lang: Lang, src: &[u8], lim: &Limits, with_refs: bool, deadline: Instant)
 /// Один обход дерева в глубину курсором (без рекурсии и без `Node::parent()`, который в
 /// tree-sitter 0.27 спускается от корня): определения с контекстом. Стек контекстов идёт
 /// параллельно пути курсора. Дедлайн — раз в [`DEADLINE_EVERY`] узлов; вышел — `None`.
+/// `members` — id узла имени члена → операнд доступа (вызовы по получателю, M6 §12а).
 fn walk_defs<'t>(
     lang: Lang,
     tree: &'t tree_sitter::Tree,
     src: &[u8],
     chain: &mut Chain,
+    mut members: Option<&mut HashMap<usize, lang::Operand>>,
     deadline: Instant,
 ) -> Option<Vec<RawDef<'t>>> {
     let root_ctx = Ctx {
@@ -290,6 +294,11 @@ fn walk_defs<'t>(
             export: ctx.export || place.parent == Some("export_statement"),
             ..ctx
         };
+        if let Some(m) = members.as_deref_mut()
+            && let Some((name, op)) = lang::member_access(lang, node, src)
+        {
+            m.insert(name.id(), op);
+        }
         for (name, k) in lang::defs_of(lang, node, place, src) {
             defs.push(RawDef {
                 node,
@@ -498,8 +507,20 @@ fn ref_priority(k: RefKind) -> u8 {
 }
 
 /// `(name, kind)` → число и первая строка; порядок — по первому вхождению. Узел имени
-/// определения и `Self` — не ссылки; один узел — один вид (по приоритету).
-fn aggregate_refs(src: &[u8], refs: Vec<RawRef>, def_names: &HashSet<usize>) -> Vec<RefAgg> {
+/// определения и `Self` — не ссылки; один узел — один вид (по приоритету). `call`, чьё имя —
+/// член доступа из `members` с операндом-получателем ([`lang::is_recv`]: не тип с заглавной
+/// буквы и не импорт файла), считается и в `recv_count` (M6 §12а).
+fn aggregate_refs(
+    src: &[u8],
+    refs: Vec<RawRef>,
+    def_names: &HashSet<usize>,
+    members: &HashMap<usize, lang::Operand>,
+) -> Vec<RefAgg> {
+    let imports: HashSet<String> = refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Import)
+        .map(|r| ref_name(&lang::text(r.name, src), r.name.kind()))
+        .collect();
     let mut by_node: HashMap<usize, (usize, RawRef)> = HashMap::new();
     for r in refs {
         if def_names.contains(&r.name.id()) {
@@ -523,8 +544,15 @@ fn aggregate_refs(src: &[u8], refs: Vec<RawRef>, def_names: &HashSet<usize>) -> 
             continue;
         }
         let line = r.name.start_position().row as u32 + 1;
-        match index.get(&(name.clone(), r.kind)) {
-            Some(&i) => out[i].count = out[i].count.saturating_add(1),
+        let recv = r.kind == RefKind::Call
+            && members
+                .get(&r.name.id())
+                .is_some_and(|op| lang::is_recv(op, &imports));
+        let i = match index.get(&(name.clone(), r.kind)) {
+            Some(&i) => {
+                out[i].count = out[i].count.saturating_add(1);
+                i
+            }
             None => {
                 index.insert((name.clone(), r.kind), out.len());
                 out.push(RefAgg {
@@ -532,8 +560,13 @@ fn aggregate_refs(src: &[u8], refs: Vec<RawRef>, def_names: &HashSet<usize>) -> 
                     kind: r.kind,
                     count: 1,
                     first_line: line,
+                    recv_count: None,
                 });
+                out.len() - 1
             }
+        };
+        if recv {
+            out[i].recv_count = Some(out[i].recv_count.unwrap_or(0).saturating_add(1));
         }
     }
     out

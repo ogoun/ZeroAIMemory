@@ -1785,14 +1785,32 @@ async fn code_map(rest: &Rest, args: &JsonObject, f: Fmt) -> Res {
     })
 }
 
-/// Адрес символа `путь#qual` строки поиска или карточки.
+/// Адрес символа `путь#qual` строки поиска или карточки для показа. У `qual` вида якоря строки
+/// (`L10`, `L1-L2`; M6 §12а) `путь#L10` адресует строку файла (REST — 400), поэтому показ —
+/// путь, `qual` и `id` карточки ([`sym_addr`]).
 fn sym_ref(v: &Value) -> String {
-    format!(
-        "{}#{}",
+    let (path, qual) = (
         v["path"].as_str().unwrap_or("?"),
-        v["qual"].as_str().unwrap_or("?")
-    )
+        v["qual"].as_str().unwrap_or("?"),
+    );
+    match v["id"].as_i64().filter(|_| zam_code::is_line_anchor(qual)) {
+        Some(id) => format!("{path} · {qual} · id {id}"),
+        None => format!("{path}#{qual}"),
+    }
 }
+
+/// Адрес карточки для `query`: `путь#qual`, у якоря строки — `id` (`GET /code/symbols/{id}`).
+fn sym_addr(v: &Value) -> String {
+    let qual = v["qual"].as_str().unwrap_or("?");
+    match v["id"].as_i64().filter(|_| zam_code::is_line_anchor(qual)) {
+        Some(id) => id.to_string(),
+        None => format!("{}#{qual}", v["path"].as_str().unwrap_or("?")),
+    }
+}
+
+/// Подсказка к символу с `qual` вида якоря строки (M6 §12а).
+const LINE_ANCHOR_HINT: &str = "имя — якорь строки: адрес путь#qual указывает на строку файла; \
+     карточка — query=<id> (id меняется при перезагрузке файла) или уточните path";
 
 /// Предупреждения `extra` и ответа `v` строками `> warning: …` (сначала свои).
 fn with_warnings(mut s: String, v: &Value, extra: &[String]) -> String {
@@ -1828,6 +1846,9 @@ async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) ->
     let path = opt_text(args, "path")?;
     let mut extra: Vec<String> = Vec::new();
     let addr = match zam_code::split_ref(query) {
+        // число — `id` карточки (так адресуется символ с `qual` вида якоря строки `L10`, M6 §12а;
+        // имя символа с цифры не начинается)
+        _ if !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()) => query.to_string(),
         (_, Some(_)) => {
             if let Some(p) = path {
                 extra.push(format!(
@@ -1863,7 +1884,10 @@ async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) ->
                             .filter_map(Value::as_str)
                             .map(str::to_string),
                     );
-                    sym_ref(one)
+                    if zam_code::is_line_anchor(one["qual"].as_str().unwrap_or("")) {
+                        extra.push(LINE_ANCHOR_HINT.to_string());
+                    }
+                    sym_addr(one)
                 }
                 _ => return done(f, &r, |v| symbols_md(v, query)),
             }
@@ -1933,6 +1957,9 @@ fn symbols_md(v: &Value, query: &str) -> String {
             h["kind"].as_str().unwrap_or("?"),
             h["line"]
         ));
+        if zam_code::is_line_anchor(h["qual"].as_str().unwrap_or("")) {
+            s.push_str(&format!(" ({LINE_ANCHOR_HINT})"));
+        }
         if let Some(sig) = h["sig"].as_str().filter(|x| !x.is_empty()) {
             s.push_str(&format!(" · {sig}"));
         }

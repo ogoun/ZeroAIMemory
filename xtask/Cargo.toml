@@ -10,6 +10,9 @@ publish = false
 zam-fetch = { path = "../crates/zam-fetch" }
 # переменные окружения агента (`AGENT_ENV_VARS`) — общий список для smoke и eval хуков
 zam-core = { path = "../crates/zam-core" }
+# M6 (задача 14): справочная абляция ранжирования карты `code-bench` — те же функции, что у
+# сервера (`zam_code::rank_with`, без фичи `parse`); свой крейт workspace
+zam-code = { path = "../crates/zam-code" }
 anyhow.workspace = true
 clap.workspace = true
 zip.workspace = true
