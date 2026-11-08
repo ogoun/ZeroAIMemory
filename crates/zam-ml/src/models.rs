@@ -144,6 +144,16 @@ pub(crate) fn sha8(path: &Path) -> Result<String, MlError> {
     Ok(v)
 }
 
+/// Идентификатор модели `"<id>@<sha8 model.onnx>"` установленной модели без загрузки ONNX
+/// Runtime — тот же, что [`crate::Embedder::model_id`] (сверка `embeddings.model_id` копии с
+/// моделью новой машины, `zam-server restore`).
+pub fn installed_model_id(models_dir: &Path, id: &str) -> Result<String, MlError> {
+    let spec = crate::ModelSpec::load(models_dir, id)?;
+    let model = model_dir(models_dir, id)?.join(MODEL_FILE);
+    require_file(&model)?;
+    Ok(format!("{}@{}", spec.id, sha8(&model)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

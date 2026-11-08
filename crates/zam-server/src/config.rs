@@ -52,6 +52,7 @@ pub struct ServerConfig {
     pub reports: ReportsSection,
     pub code: CodeSection,
     pub ideas: IdeasSection,
+    pub backup: BackupSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1189,6 +1190,89 @@ impl IdeasSection {
     }
 }
 
+/// Расписание автокопий (M6 §12б.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupSchedule {
+    Off,
+    Daily,
+}
+
+/// Секция `[backup]` (M6 §12б.2–§12б.4): копии `zam-server backup` и автокопии.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSection {
+    /// Каталог копий; по умолчанию `<data_dir>/backups`.
+    pub dir: Option<PathBuf>,
+    /// `off` (по умолчанию: копия на том же диске может его заполнить) или `daily`.
+    pub schedule: BackupSchedule,
+    /// Время автокопии, `HH:MM` UTC (по умолчанию `03:30`).
+    pub at: String,
+    /// Сколько автокопий хранить (1..=365, 7); сверх — удаляются самые старые.
+    pub keep: u32,
+    /// `GET /index/status` предупреждает `no_recent_backup`, если последней копии больше
+    /// стольких суток или её нет (1..=365, 7).
+    pub warn_days: u32,
+    /// Признак копии `.zam-backup` старше стольких часов — брошенный (1..=168, 6).
+    pub flag_max_hours: u32,
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            schedule: BackupSchedule::Off,
+            at: "03:30".into(),
+            keep: 7,
+            warn_days: 7,
+            flag_max_hours: 6,
+        }
+    }
+}
+
+impl BackupSection {
+    /// Каталог копий: `backup.dir` или `<data_dir>/backups`.
+    pub fn dir(&self, data_dir: &Path) -> PathBuf {
+        self.dir.clone().unwrap_or_else(|| data_dir.join("backups"))
+    }
+
+    /// `at` как (часы, минуты); проверено [`BackupSection::validate`].
+    pub fn at_hm(&self) -> (i8, i8) {
+        parse_hm(&self.at).unwrap_or((3, 30))
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("backup.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if parse_hm(&self.at).is_none() {
+            return Err(bad("at", "время HH:MM (UTC), например 03:30"));
+        }
+        if !(1..=365).contains(&self.keep) {
+            return Err(bad("keep", "от 1 до 365"));
+        }
+        if !(1..=365).contains(&self.warn_days) {
+            return Err(bad("warn_days", "от 1 до 365"));
+        }
+        if !(1..=168).contains(&self.flag_max_hours) {
+            return Err(bad("flag_max_hours", "от 1 до 168"));
+        }
+        Ok(())
+    }
+}
+
+/// `HH:MM` → (часы 0..=23, минуты 0..=59).
+fn parse_hm(s: &str) -> Option<(i8, i8)> {
+    let (h, m) = s.trim().split_once(':')?;
+    if h.len() != 2 || m.len() != 2 {
+        return None;
+    }
+    let (h, m): (i8, i8) = (h.parse().ok()?, m.parse().ok()?);
+    ((0..=23).contains(&h) && (0..=59).contains(&m)).then_some((h, m))
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -1318,6 +1402,7 @@ impl Default for ServerConfig {
             reports: ReportsSection::default(),
             code: CodeSection::default(),
             ideas: IdeasSection::default(),
+            backup: BackupSection::default(),
         }
     }
 }
@@ -1493,6 +1578,7 @@ pub fn load(
     cfg.reports.validate()?;
     cfg.code.validate()?;
     cfg.ideas.validate()?;
+    cfg.backup.validate()?;
     Ok(cfg)
 }
 
@@ -2573,6 +2659,40 @@ master_key = \"x\"
                 load(None, &[env(k, v)], &Default::default()).is_err(),
                 "{k}={v}"
             );
+        }
+    }
+
+    #[test]
+    fn backup_section_defaults_and_ranges() {
+        let b = load(None, &[], &Default::default()).unwrap().backup;
+        assert_eq!(b, BackupSection::default());
+        assert_eq!(b.schedule, BackupSchedule::Off);
+        assert_eq!(
+            (b.at_hm(), b.keep, b.warn_days, b.flag_max_hours),
+            ((3, 30), 7, 7, 6)
+        );
+        let ok = load(
+            None,
+            &[
+                env("ZAM_BACKUP__SCHEDULE", "daily"),
+                env("ZAM_BACKUP__AT", "23:05"),
+            ],
+            &Default::default(),
+        )
+        .unwrap()
+        .backup;
+        assert_eq!((ok.schedule, ok.at_hm()), (BackupSchedule::Daily, (23, 5)));
+        for (k, v) in [
+            ("ZAM_BACKUP__AT", "24:00"),
+            ("ZAM_BACKUP__AT", "3:30"),
+            ("ZAM_BACKUP__KEEP", "0"),
+            ("ZAM_BACKUP__KEEP", "366"),
+            ("ZAM_BACKUP__WARN_DAYS", "0"),
+            ("ZAM_BACKUP__FLAG_MAX_HOURS", "169"),
+            ("ZAM_BACKUP__SCHEDULE", "weekly"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default());
+            assert!(e.unwrap_err().to_string().contains("backup."), "{k}={v}");
         }
     }
 

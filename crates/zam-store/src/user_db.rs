@@ -304,7 +304,12 @@ impl UserDbs {
         if let Some(e) = cell.as_ref() {
             return Ok(e.db.clone());
         }
-        let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
+        // признак копии `backup` — в каталоге данных, родителе `users/` (M6 §12б.2)
+        let opts = crate::DbOptions {
+            backup_flag: self.dir.parent().map(crate::backup::backup_flag_path),
+            ..crate::DbOptions::default()
+        };
+        let db = Db::open_with(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS, opts)?;
         ensure_fixed_spaces(&db).await?;
         crate::nodes::backfill_embed_keys(&db).await?;
         // статус заметок из frontmatter (v9) — до первой записи: права certainty читают столбец

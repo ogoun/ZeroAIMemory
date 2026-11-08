@@ -37,6 +37,35 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
+    /// Копия сервера без остановки: базы (VACUUM INTO), блобы (жёсткие ссылки на предыдущую
+    /// копию), опись manifest.json. Мастер-ключ Vault в копию не входит
+    Backup {
+        #[command(flatten)]
+        opts: Opts,
+        /// Каталог копий вместо backup.dir (по умолчанию <data_dir>/backups)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Один архив zip64 вместо каталога
+        #[arg(long, conflicts_with = "dir")]
+        zip: Option<PathBuf>,
+        /// Итог в JSON в stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Восстановить копию (каталог или архив .zip) на остановленном сервере в пустой
+    /// каталог данных
+    Restore {
+        /// Каталог копии или архив .zip
+        src: PathBuf,
+        #[command(flatten)]
+        opts: Opts,
+        /// Каталог данных не пуст: прежние данные перенести в backups/pre-restore-…
+        #[arg(long)]
+        replace: bool,
+        /// Не ставить отметки пересборки векторного индекса
+        #[arg(long)]
+        no_reindex: bool,
+    },
     /// Управляемый Qdrant: загрузка бинарника, состояние, сброс хранилища
     Qdrant {
         #[command(subcommand)]
@@ -323,6 +352,58 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             let args = zam_server::reindex::ReindexArgs { user, space, full };
             println!("{}", zam_server::reindex::run(load(opts)?, args).await?);
             Ok(())
+        }
+        Cmd::Backup {
+            opts,
+            dir,
+            zip,
+            json,
+        } => {
+            let cfg = load(opts)?;
+            let bo = zam_server::backup::BackupOpts { dir, zip };
+            let c = cfg.clone();
+            let res =
+                tokio::task::spawn_blocking(move || zam_server::backup::backup(&c, &bo)).await?;
+            let rep = match res {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("ошибка: {e}");
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("{}", zam_server::backup::master_key_warning(&cfg));
+            if json {
+                println!("{}", serde_json::to_string(&rep)?);
+            } else {
+                println!("{}", rep.line());
+            }
+            Ok(())
+        }
+        Cmd::Restore {
+            src,
+            opts,
+            replace,
+            no_reindex,
+        } => {
+            let cfg = load(opts)?;
+            let ro = zam_server::backup::RestoreOpts {
+                replace,
+                reindex: !no_reindex,
+                model_id: None,
+            };
+            match zam_server::backup::restore(&cfg, &src, &ro).await {
+                Ok(rep) => {
+                    println!("{}", rep.text());
+                    if !rep.vault_ok {
+                        eprintln!("{}", zam_server::backup::restore::VAULT_WARNING);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("ошибка: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Cmd::Qdrant { cmd } => qdrant_cmd(cmd).await,
         Cmd::Models { cmd } => models_cmd(cmd).await,

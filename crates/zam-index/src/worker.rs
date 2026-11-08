@@ -798,6 +798,14 @@ impl Worker {
                 for (u, f) in &rep.missed_folders {
                     self.rollups.schedule(*u, *f, self.cfg.rollup_debounce);
                 }
+                // reindex всей базы из кэша уже записал её точки: пересборке (стёртое
+                // хранилище, новая коллекция) перенарезать и ставить задания ей не нужно
+                if let (Some(u), None, false, Some(p)) =
+                    (req.user, req.space, req.full, self.pending.as_mut())
+                    && !rep.failed_users.iter().any(|(f, _)| *f == u)
+                {
+                    p.done.insert(u);
+                }
                 Ok(rep)
             }
         };
@@ -1001,7 +1009,7 @@ impl Worker {
                 continue;
             }
             let res = match self.deps.users.get(u.id).await {
-                Ok(db) => enqueue_reindex(&db, None).await,
+                Ok(db) => rebuild_db(&db, u.id).await,
                 Err(e) => Err(e),
             };
             match res {
@@ -2111,6 +2119,20 @@ impl WorkerHandle {
     #[doc(hidden)]
     pub fn release_write(&self) {
         self.inner.hold.release();
+    }
+}
+
+/// Шаг пересборки одной базы `db` пользователя `user` ([`Worker`], `rebuild_pass`): число
+/// поставленных заданий. База с отметкой reindex **всей базы** (`space: null`, в том числе
+/// `full`: `zam-server restore`, прерванный reindex без пространства) пропускается — её
+/// пересоберёт отметка (точки из кэша без перенарезки и заданий). Отметка одного пространства
+/// (прерванный `reindex --space`) остальные пространства не вернёт — тогда перенарезка и
+/// задания всей базы, как без отметки (ревью 18a, N1).
+#[doc(hidden)]
+pub async fn rebuild_db(db: &Db, user: Id) -> Result<u64, StoreError> {
+    match pending_reindex(db).await? {
+        Some(spec) if ReindexRequest::from_spec(user, &spec).space.is_none() => Ok(0),
+        _ => enqueue_reindex(db, None).await,
     }
 }
 

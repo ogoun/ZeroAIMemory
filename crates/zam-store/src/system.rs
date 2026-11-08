@@ -250,9 +250,21 @@ pub(crate) fn audit_tx(
 impl SystemStore {
     /// Открывает `system.db` в каталоге данных.
     pub fn open(dir: &DataDir) -> Result<SystemStore, StoreError> {
+        let opts = crate::DbOptions {
+            backup_flag: Some(crate::backup::backup_flag_path(dir.root())),
+            ..crate::DbOptions::default()
+        };
         Ok(SystemStore {
-            db: Db::open(&dir.system_db(), SYSTEM_MIGRATIONS)?,
+            db: Db::open_with(&dir.system_db(), SYSTEM_MIGRATIONS, opts)?,
         })
+    }
+
+    /// Удаляет все сессии входа в WebUI (`restore`, M6 §12б.3: cookie старой машины на новой
+    /// не действуют); число удалённых.
+    pub async fn clear_web_sessions(&self) -> Result<u64, StoreError> {
+        self.db
+            .write(|tx| Ok(tx.execute("DELETE FROM web_sessions", [])? as u64))
+            .await
     }
 
     /// Проверка доступности `system.db` (для `/ready`).

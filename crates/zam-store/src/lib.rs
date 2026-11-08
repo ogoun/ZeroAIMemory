@@ -12,6 +12,7 @@
 
 pub mod access;
 pub mod attachments;
+pub mod backup;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
@@ -56,6 +57,11 @@ pub use attachments::{
     reindex_attachments_page, reindex_docs, replace_attachment_chunks, requeue_failed_with,
     set_extract_state, sync_doc_limits,
 };
+pub use backup::{
+    BACKUP_FLAG_FILE, BackupFlag, BackupFlagHold, Chunkers, OpenMode, backup_flag_active,
+    backup_flag_path, hold_backup_flag, integrity_ok, meta_value, set_backup_flag_max_age,
+    vacuum_into,
+};
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_by_sha,
     blob_meta_by_sha_in_space, blob_meta_in_space, resolve_attachment,
@@ -71,7 +77,10 @@ pub use certainty::{
     CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,
     default_certainty,
 };
-pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
+pub use datadir::{
+    DataDir, DirLock, LockMark, MAX_DATA_DIR_CHARS_WINDOWS, RESTORE_INCOMPLETE_FILE,
+    RESTORE_MARK_FILE, check_data_dir_len, lock_mark, restore_incomplete, try_lock_dir,
+};
 pub use db::{Db, DbOptions};
 pub use embeddings::{
     Embedding, adopt_owned_embeddings, adopt_owned_embeddings_batch, embed_input_of, embed_key_of,
@@ -116,7 +125,7 @@ pub use jobs::{
     claim_jobs, complete_job, defer_job, enqueue_reindex, enqueue_upserts, fail_job, failed_jobs,
     finish_reindexed, folder_embed_input, folders_for_index, give_up_job, indexable_count,
     indexed_count, job_stats, mark_reindex, pending_reindex, reindex_page, release_job,
-    requeue_running, requeue_running_extract, set_index_state,
+    requeue_running, requeue_running_extract, set_index_state, set_reindex_pending,
 };
 pub use migrate::Migration;
 pub use nodes::{
@@ -213,6 +222,13 @@ pub enum StoreError {
     Certainty(#[from] CertaintyError),
     #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
     DataDirLocked(std::path::PathBuf),
+    /// В каталоге данных прервано `zam-server restore` (M6 §12б.3): данные неполны.
+    #[error(
+        "восстановление каталога данных {} не завершено: повторите zam-server restore \
+         <копия> --replace (прежние данные — в backups/pre-restore-…)",
+        .0.display()
+    )]
+    RestoreIncomplete(std::path::PathBuf),
     /// Windows: путь каталога данных так длинен, что файлы внутри него (базы SQLite, их
     /// копии перед миграцией, рабочий каталог Qdrant) выходят за MAX_PATH (260).
     #[error(

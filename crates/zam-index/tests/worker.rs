@@ -877,6 +877,51 @@ async fn interrupted_reindex_is_resumed_on_start() {
     w.shutdown().await;
 }
 
+/// Шаг пересборки базы (`rebuild_pass` → [`zam_index::worker::rebuild_db`]): отметка reindex
+/// всей базы (`space: null`) — база пропускается, её пересоберёт отметка; отметка **одного
+/// пространства** (прерванный `reindex --space`) — перенарезка и задания всей базы, иначе
+/// остальные пространства остались бы без точек в новой коллекции (ревью 18a, N1). Проверка
+/// прямым вызовом: интеграционно исход зависит от порядка шагов воркера (reindex с созданием
+/// коллекции пересоберёт всё и без правки).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn space_reindex_mark_does_not_skip_rebuild_of_other_spaces() {
+    let e = env("space-mark").await;
+    let a = e.note(e.knowledge, "a", NOTE).await;
+    let r = e
+        .note(e.rules, "r", "Правило: перед коммитом — тесты.\n")
+        .await;
+    {
+        let w = e.spawn();
+        e.indexed(a).await;
+        e.indexed(r).await;
+        w.shutdown().await;
+    }
+    let state = async |n: Id| get_node(&e.db, n).await.unwrap().index_state;
+    // вся база: пропуск — ни заданий, ни перенарезки
+    mark_reindex(&e.db, Some("{\"full\":false,\"space\":null}".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        zam_index::worker::rebuild_db(&e.db, e.user).await.unwrap(),
+        0
+    );
+    assert_eq!(job_stats(&e.db).await.unwrap().queued, 0);
+    assert_eq!(
+        (state(a).await, state(r).await),
+        ("indexed".into(), "indexed".into())
+    );
+    // одно пространство: задания получают все пространства базы
+    let spec = format!("{{\"full\":false,\"space\":\"{}\"}}", e.knowledge);
+    mark_reindex(&e.db, Some(spec)).await.unwrap();
+    let n = zam_index::worker::rebuild_db(&e.db, e.user).await.unwrap();
+    assert!(n >= 2, "заданий {n}");
+    assert_eq!(
+        (state(a).await, state(r).await),
+        ("pending".into(), "pending".into())
+    );
+    assert!(job_stats(&e.db).await.unwrap().queued >= 2);
+}
+
 /// Сборка мусора кэша в простое: сироты уходят, живые ключи остаются.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_gc_removes_orphan_embeddings() {

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 pub use device::{Device, DevicePref, DeviceReport};
 pub use embed::{Embedder, Embedding, QuerySlot};
+pub use models::installed_model_id;
 pub use rerank::{Reranker, rerank_sessions_auto};
 pub use runtime::init_runtime;
 pub use sparse::SparseHead;
