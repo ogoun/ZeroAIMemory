@@ -4371,18 +4371,19 @@ fn holdout_marker_silences_all_hooks() {
         let ev = p.ev("Stop", s, json!({"stop_hook_active": false}));
         hook_slow(&p, &url, "checkpoint", &ev)
     };
-    // вне группы — подсказки и напоминание
+    // вне группы — подсказки; в группе — тишина
     assert!(context(&pre(&loud), "PreToolUse").contains("Скрипты — только LF"));
     assert!(context(&read(&loud), "PostToolUse").contains("Пул соединений течёт"));
-    assert_eq!(hook_json(&stop(&loud))["decision"], "block");
-    // в группе — тишина везде
     empty(&pre(&quiet));
     empty(&read(&quiet));
-    empty(&stop(&quiet));
+    // учёт локального вывода — только у вывода, который был (до отправки очереди `checkpoint`)
+    assert!(p.session_file("tokens", &loud, ".jsonl").is_some());
     assert!(
         p.session_file("tokens", &quiet, ".jsonl").is_none(),
         "локальный вывод не учитывается"
     );
+    assert_eq!(hook_json(&stop(&loud))["decision"], "block");
+    empty(&stop(&quiet));
     let ev = events(&p, &quiet);
     assert!(
         ev.iter().any(|e| e["ev"] == "read"),
