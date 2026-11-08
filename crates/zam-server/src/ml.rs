@@ -233,6 +233,37 @@ pub fn model_installed(cfg: &ServerConfig) -> bool {
     }
 }
 
+/// `model_id` (`"<id>@<sha8 model.onnx>"`), под которым [`load`] этой машины положит векторы, —
+/// без ONNX Runtime (`zam-server restore`, M6 §12б.3): `ml.embed_model`, иначе bge-m3 fp16
+/// при GPU-комплекте и установленной модели, иначе bge-m3 int8. Откат fp16 на CPU (CUDA
+/// недоступна при запуске) так не предсказать — тогда при старте векторы посчитаются заново.
+/// Модель не установлена — `None`.
+pub fn expected_model_id(cfg: &ServerConfig) -> Option<String> {
+    let dir = cfg.ml.models_dir(&cfg.data_dir);
+    let explicit = cfg
+        .ml
+        .embed_model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty());
+    let id = match explicit {
+        Some(m) => m.to_string(),
+        None => {
+            let ort = ort_path(
+                &cfg.ml
+                    .ort_dylib
+                    .clone()
+                    .unwrap_or_else(MlConfig::default_ort_dylib),
+            );
+            if cfg.ml.device != MlDevice::Cpu && gpu_kit(&ort) && have_model(&dir, MODEL_GPU) {
+                MODEL_GPU.to_string()
+            } else {
+                MODEL_CPU.to_string()
+            }
+        }
+    };
+    zam_ml::installed_model_id(&dir, &id).ok()
+}
+
 /// Загружает модель (блокирующий вызов: sha256 файла модели, сборка сессий).
 pub fn load(cfg: &ServerConfig) -> MlLoad {
     let fail = MlLoad::failed;

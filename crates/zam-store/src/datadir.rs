@@ -1,4 +1,10 @@
 //! Каталог данных: структура подкаталогов и эксклюзивный лок экземпляра.
+//!
+//! **Метка лока (M6 §12б.3).** `.zam.lock` держит сервер (`serve`, `reindex`, `migrate`) или
+//! `zam-server restore`; содержимое — pid, а у `restore` — `restore <pid>`. На Windows занятый
+//! `LockFileEx` диапазон другим дескрипторам не читается, поэтому `restore` дублирует метку в
+//! файле `.zam-restore` рядом; обычное открытие каталога его снимает. [`lock_mark`] отвечает,
+//! кто держит лок, — по нему `backup` отказывает во время восстановления.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -13,11 +19,81 @@ const SUBDIRS: [&str; 7] = [
     "users", "blobs", "previews", "models", "qdrant", "logs", "backups",
 ];
 
+/// Файл-дубль метки `restore` (см. документацию модуля).
+pub const RESTORE_MARK_FILE: &str = ".zam-restore";
+
+/// Кто держит `.zam.lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMark {
+    /// Сервер или другая команда под локом.
+    Serve,
+    /// Идёт `zam-server restore`.
+    Restore,
+}
+
+/// Кто держит лок каталога данных `root`; `None` — лок свободен (или файла лока нет).
+/// Проверка берёт лок на мгновение и сразу отпускает.
+pub fn lock_mark(root: &Path) -> Option<LockMark> {
+    let path = root.join(".zam.lock");
+    let file = OpenOptions::new().read(true).open(&path).ok()?;
+    match FileExt::try_lock(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            None
+        }
+        Err(_) => {
+            // Unix: содержимое читается и под flock; Windows — нет (берётся дубль)
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.trim_start().starts_with("restore") || root.join(RESTORE_MARK_FILE).exists() {
+                Some(LockMark::Restore)
+            } else {
+                Some(LockMark::Serve)
+            }
+        }
+    }
+}
+
+/// Лок каталога данных без создания подкаталогов (`backup` на остановленном сервере, в
+/// каталоге, возможно, только для чтения): `Ok(None)` — лок занят или файл лока не открыть.
+#[derive(Debug)]
+pub struct DirLock {
+    _file: File,
+}
+
+/// Берёт `.zam.lock` каталога `root`, если он свободен; содержимое не меняется.
+pub fn try_lock_dir(root: &Path) -> Option<DirLock> {
+    let path = root.join(".zam.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .or_else(|_| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        })
+        .ok()?;
+    FileExt::try_lock(&file).ok()?;
+    Some(DirLock { _file: file })
+}
+
 /// Каталог данных; пока значение живо, лок `.zam.lock` удерживается.
 #[derive(Debug)]
 pub struct DataDir {
     root: PathBuf,
     _lock: File,
+    /// Снять `.zam-restore` при уничтожении (открыт [`DataDir::open_for_restore`]).
+    restore_mark: bool,
+}
+
+impl Drop for DataDir {
+    fn drop(&mut self) {
+        if self.restore_mark {
+            let _ = std::fs::remove_file(self.root.join(RESTORE_MARK_FILE));
+        }
+    }
 }
 
 /// Предел длины абсолютного пути каталога данных на Windows, символов UTF-16 (так считает
@@ -62,6 +138,19 @@ fn win32_len(p: &str) -> usize {
 impl DataDir {
     /// Создаёт структуру каталогов и берёт эксклюзивный лок экземпляра.
     pub fn open(root: &Path) -> Result<DataDir, StoreError> {
+        let dd = Self::open_marked(root, None)?;
+        // дубль метки прерванного restore больше не нужен: лок теперь у этого процесса
+        let _ = std::fs::remove_file(root.join(RESTORE_MARK_FILE));
+        Ok(dd)
+    }
+
+    /// То же, что [`DataDir::open`], с меткой `restore` в `.zam.lock` и в `.zam-restore`
+    /// ([`lock_mark`] — [`LockMark::Restore`]). Дубль снимается при уничтожении значения.
+    pub fn open_for_restore(root: &Path) -> Result<DataDir, StoreError> {
+        Self::open_marked(root, Some("restore"))
+    }
+
+    fn open_marked(root: &Path, mark: Option<&str>) -> Result<DataDir, StoreError> {
         check_data_dir_len(root)?;
         std::fs::create_dir_all(root)?;
         for s in SUBDIRS {
@@ -84,12 +173,27 @@ impl DataDir {
         }
         // pid — только для диагностики; ошибка записи не критична.
         let _ = file.set_len(0);
-        let _ = write!(file, "{}", std::process::id());
+        let _ = match mark {
+            Some(m) => write!(file, "{m} {}", std::process::id()),
+            None => write!(file, "{}", std::process::id()),
+        };
         let _ = file.flush();
-        Ok(DataDir {
+        let dd = DataDir {
             root: root.to_path_buf(),
             _lock: file,
-        })
+            restore_mark: mark.is_some(),
+        };
+        if mark.is_some() {
+            std::fs::write(
+                root.join(RESTORE_MARK_FILE),
+                format!(
+                    "restore {}
+",
+                    std::process::id()
+                ),
+            )?;
+        }
+        Ok(dd)
     }
 
     pub fn root(&self) -> &Path {

@@ -6,6 +6,10 @@
 //! `usage` хранится бессрочно; срок жизни кэша выжимок (§9.4): выжимки без обращений дольше
 //! `cache.ttl_days` и сверх `cache.max_entries` на базу (LRU) удаляются, превращённые в записи
 //! — нет. Работает и без модели (в отличие от воркера индексации).
+//!
+//! Автокопии (M6 §12б.4): раз в [`BACKUP_TICK`] — решение [`crate::backup::schedule::tick`]
+//! по `[backup]`; копию снимает тот же код, что `zam-server backup` (в блокирующем потоке),
+//! копии сверх `keep` удаляются, начиная с самых старых.
 //! Задача держит только `system.db` и кэш баз пользователей (открытые соединения SQLite);
 //! останавливается [`Maintenance::stop`] (с ожиданием: после него соединений **этой** задачи
 //! нет) или с последней копией состояния приложения. Другие держатели `Db` при остановке —
@@ -16,7 +20,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::task::JoinHandle;
 use zam_store::{SystemStore, UserDbs};
 
-use crate::config::CacheSection;
+use crate::backup::schedule::{self, Action};
+use crate::config::{BackupSchedule, CacheSection, ServerConfig};
 
 use crate::app::AppState;
 
@@ -28,15 +33,34 @@ pub const PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// но и не откладывать на сутки (сервер могут перезапускать чаще).
 pub const FIRST_RUN: Duration = Duration::from_secs(10 * 60);
 
+/// Период проверки расписания автокопий.
+pub const BACKUP_TICK: Duration = Duration::from_secs(60);
+
 /// Фоновая задача обслуживания; снимается при уничтожении.
 #[derive(Debug)]
 pub struct Maintenance {
-    handle: std::sync::Mutex<Option<JoinHandle<()>>>,
+    handle: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Maintenance {
-    /// Запускает задачу в текущем рантайме tokio.
-    pub fn start(system: SystemStore, users: UserDbs, cache: CacheSection) -> Maintenance {
+    /// Запускает задачу в текущем рантайме tokio; `cfg` — для автокопий (`[backup]`).
+    pub fn start(
+        system: SystemStore,
+        users: UserDbs,
+        cache: CacheSection,
+        cfg: ServerConfig,
+    ) -> Maintenance {
+        let mut handles = Vec::new();
+        if cfg.backup.schedule != BackupSchedule::Off {
+            handles.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(BACKUP_TICK);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    backup_tick(&cfg, zam_store::time::now()).await;
+                }
+            }));
+        }
         let handle = tokio::spawn(async move {
             let start = tokio::time::Instant::now() + FIRST_RUN;
             let mut tick = tokio::time::interval_at(start, PERIOD);
@@ -47,8 +71,9 @@ impl Maintenance {
                 gc_cache_in(&system, &users, &cache, zam_store::time::now()).await;
             }
         });
+        handles.push(handle);
         Maintenance {
-            handle: std::sync::Mutex::new(Some(handle)),
+            handle: std::sync::Mutex::new(handles),
         }
     }
 
@@ -57,8 +82,8 @@ impl Maintenance {
     /// оставлял копию `UserDbs` живой после остановки: соединения закрывались позже, уже
     /// после [`crate::AppState::shutdown`].
     pub async fn stop(&self) {
-        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(h) = handle {
+        let handles = std::mem::take(&mut *self.handle.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in handles {
             h.abort();
             let _ = h.await;
         }
@@ -67,8 +92,8 @@ impl Maintenance {
 
 impl Drop for Maintenance {
     fn drop(&mut self) {
-        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(h) = handle {
+        let handles = std::mem::take(&mut *self.handle.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in handles {
             h.abort();
         }
     }
@@ -148,4 +173,33 @@ async fn gc_cache_in(
         }
     }
     total
+}
+
+/// Один шаг расписания автокопий на момент `now`: копия и/или удаление лишних копий.
+pub async fn backup_tick(cfg: &ServerConfig, now: Timestamp) {
+    let dir = cfg.backup.dir(&cfg.data_dir);
+    let existing = crate::backup::list_copies(&dir);
+    let last = crate::backup::last_copy_at(&dir);
+    for a in schedule::tick(now, last, &existing, &cfg.backup) {
+        match a {
+            Action::Skip => {}
+            Action::Backup => {
+                let c = cfg.clone();
+                let r = tokio::task::spawn_blocking(move || {
+                    crate::backup::backup(&c, &crate::backup::BackupOpts::default())
+                })
+                .await;
+                match r {
+                    Ok(Ok(rep)) => tracing::info!("автокопия: {}", rep.line()),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "автокопия не снята"),
+                    Err(e) => tracing::warn!(error = %e, "автокопия завершилась аварийно"),
+                }
+            }
+            Action::Prune(list) => {
+                tokio::task::spawn_blocking(move || crate::backup::prune(&list))
+                    .await
+                    .ok();
+            }
+        }
+    }
 }

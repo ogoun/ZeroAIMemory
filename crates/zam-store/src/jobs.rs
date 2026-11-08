@@ -754,6 +754,14 @@ pub async fn mark_reindex(db: &Db, spec: Option<String>) -> Result<(), StoreErro
     .await
 }
 
+/// Отметка пересборки индекса базы для `zam-server restore` (M6 §12б.3): спецификация
+/// запроса `spec` (`{"full": false, "space": null}` — «вся база, из кэша»). Её выполнит
+/// воркер индексации при первом открытии базы сервером (для любого Qdrant), прерванная
+/// пересборка повторится при следующем запуске — как у [`mark_reindex`].
+pub async fn set_reindex_pending(db: &Db, spec: &serde_json::Value) -> Result<(), StoreError> {
+    mark_reindex(db, Some(spec.to_string())).await
+}
+
 /// Незавершённая пересборка индекса базы ([`mark_reindex`]), если есть.
 pub async fn pending_reindex(db: &Db) -> Result<Option<String>, StoreError> {
     db.read(|c| {

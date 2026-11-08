@@ -66,6 +66,11 @@ base64.workspace = true
 rand.workspace = true
 # MCP `/mcp` (§13.1): streamable HTTP поверх REST-ядра
 rmcp.workspace = true
+# `zam-server backup --zip` и `restore` из архива (M6 §12б.2–§12б.3)
+zip.workspace = true
+# `backup`: VACUUM INTO, коды ошибок SQLite; свободное место тома
+rusqlite.workspace = true
+fs4.workspace = true
 
 # Vault: DACL файла мастер-ключа (только владелец, SYSTEM, администраторы);
 # служба: таймаут Preshutdown (ChangeServiceConfig2W / QueryServiceConfig2W)
@@ -94,7 +99,6 @@ zam-index = { path = "../zam-index", features = ["test-hooks"] }
 zam-store = { path = "../zam-store", features = ["test-hooks"] }
 # тестовые точки самого сервера (tests/search_rerank_boosts.rs)
 zam-server = { path = ".", features = ["test-hooks"] }
-zip.workspace = true
 # PDF-фикстуры тестов рабочего процесса (tests/doc_worker.rs)
 zam-docs = { path = "../zam-docs", features = ["pdfium", "test-pdf", "images"] }
 tower = { workspace = true, features = ["util"] }

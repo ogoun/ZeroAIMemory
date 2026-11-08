@@ -455,3 +455,74 @@ async fn background_restart_resets_wal_under_continuous_writes() {
     }
     assert!(wal_seq(&p) >= 1, "WAL не сброшен за {writes} записей");
 }
+
+/// Признак копии `.zam-backup` (M6 §12б.2): пока он стоит, ни фоновый поток, ни страховка
+/// писателя не делают `RESTART` (только `PASSIVE`); после снятия — снова делают.
+#[tokio::test]
+async fn db_checkpoint_passive_while_backup_flag() {
+    let p = tmp("backup-flag");
+    let root = p.parent().unwrap().to_path_buf();
+    let flag = zam_store::backup_flag_path(&root);
+    let hold = zam_store::hold_backup_flag(&root).unwrap();
+    let opts = DbOptions {
+        checkpoint_interval: std::time::Duration::from_millis(20),
+        wal_limit_bytes: 128 * 1024,
+        wal_restart_bytes: 64 * 1024,
+        backup_flag: Some(flag.clone()),
+        ..DbOptions::default()
+    };
+    let db = Db::open_with(&p, BLOB_MIGS, opts).unwrap();
+    let t = std::time::Instant::now();
+    while !db.backup_active() {
+        assert!(t.elapsed().as_secs() < 10, "признак не замечен");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // 6 МБ записей при пределе 128 КиБ: без признака — RESTART почти после каждой
+    for _ in 0..200 {
+        write_blobs(&db, 1, 32 * 1024).await;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(db.restart_count(), 0, "RESTART при стоящем признаке");
+    drop(hold);
+    assert!(!flag.exists());
+    let t = std::time::Instant::now();
+    while db.backup_active() {
+        assert!(t.elapsed().as_secs() < 10, "снятие признака не замечено");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    write_blobs(&db, 20, 32 * 1024).await;
+    assert!(db.restart_count() > 0, "после снятия признака RESTART нет");
+}
+
+/// `vacuum_into` в режиме `QueryOnly` при работающем писателе: согласованная копия, писатель
+/// не получает `SQLITE_BUSY`; закрытая база — и в режиме `Immutable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vacuum_into_query_only_and_immutable() {
+    let p = tmp("vacuum");
+    let db = Db::open(&p, BLOB_MIGS).unwrap();
+    write_blobs(&db, 50, 4096).await;
+    let w = {
+        let db = db.clone();
+        tokio::spawn(async move { write_blobs(&db, 200, 4096).await })
+    };
+    let dst = p.with_file_name("copy.db");
+    let (src, d2) = (p.clone(), dst.clone());
+    tokio::task::spawn_blocking(move || {
+        zam_store::vacuum_into(&src, &d2, zam_store::OpenMode::QueryOnly)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    w.await.unwrap();
+    let (ver, ok) = zam_store::integrity_ok(&dst).unwrap();
+    assert_eq!((ver, ok), (1, true));
+    drop(db);
+    assert!(!side_file(&p, "-wal").exists());
+    let dst2 = p.with_file_name("copy2.db");
+    zam_store::vacuum_into(&p, &dst2, zam_store::OpenMode::Immutable).unwrap();
+    let n: i64 = rusqlite::Connection::open(&dst2)
+        .unwrap()
+        .query_row("SELECT count(*) FROM b", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 250);
+}

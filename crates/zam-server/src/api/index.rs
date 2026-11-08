@@ -230,6 +230,14 @@ async fn rules_of(db: &Db, solution: Option<&str>) -> Result<Value, zam_store::S
     }))
 }
 
+/// Сбрасывает кэш [`RULES_L1_CACHE`] процесса (`zam-server restore`: пара `(id, ревизия)`
+/// восстановленной базы может совпасть с другим текстом).
+pub fn reset_rules_l1_cache() {
+    if let Ok(mut c) = RULES_L1_CACHE.lock() {
+        c.clear();
+    }
+}
+
 /// Запись кэша [`RULES_L1_CACHE`] пространства `space`: `tokenizer_id` счётчика и сумма L1 —
 /// для теста кэша.
 #[doc(hidden)]
@@ -442,7 +450,17 @@ pub async fn status(
         }
         Principal::Token(_) | Principal::User { .. } => Value::Null,
     };
+    // копии сервера (M6 §12б.4): время последней, расписание, `no_recent_backup`
+    let backup = {
+        let cfg = st.cfg.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::backup::status_json(&cfg, zam_store::time::now())
+        })
+        .await
+        .unwrap_or(Value::Null)
+    };
     Ok(Json(json!({
+        "backup": backup,
         "docs": docs,
         "rules": own_rules,
         "vector": {

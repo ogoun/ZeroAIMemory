@@ -278,6 +278,10 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     };
     // без эмбеддера — токенизатор установленной модели (если есть): чанки сразу точные
     ml::setup_chunker(&cfg, ml.embedder.as_deref());
+    // срок годности признака копии `.zam-backup` для потоков контрольных точек баз (§12б.2)
+    zam_store::set_backup_flag_max_age(std::time::Duration::from_secs(
+        u64::from(cfg.backup.flag_max_hours) * 3600,
+    ));
     let system = SystemStore::open(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
     bootstrap::warn_legacy_human_tokens(&system).await;
@@ -312,6 +316,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         system.clone(),
         users.clone(),
         cfg.cache.clone(),
+        cfg.clone(),
     ));
     let state = AppState {
         maintenance,
