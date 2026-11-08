@@ -159,10 +159,14 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
         let c = &client;
         let flush = queued.then(|| {
             sc.spawn(move || {
-                if wait_read {
-                    let _ = read_rx.recv_timeout(IMPACT_READ_WAIT);
+                if !wait_read {
+                    return cache::flush_changed(env, c, session);
                 }
-                cache::flush_changed(env, c, session)
+                let _ = read_rx.recv_timeout(IMPACT_READ_WAIT);
+                // после ожидания — новым клиентом по остатку бюджета (повторное ревью, m4)
+                if let Some(fresh) = env.client() {
+                    cache::flush_changed(env, &fresh, session);
+                }
             })
         });
         // очередь учёта локального вывода (M4.5 §9.5)

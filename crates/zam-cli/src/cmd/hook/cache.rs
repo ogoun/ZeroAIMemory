@@ -971,13 +971,17 @@ pub fn is_holdout(env: &Env, session: &str) -> bool {
     holdout_path(env, session).is_file()
 }
 
-/// Ответ сервера с `holdout: true` (`/recall`, `GET /sessions/{id}`) — маркер сессии ставится.
+/// Успешный ответ сервера (`/recall`, `GET /sessions/{id}`) сверяет маркер сессии с меткой
+/// сервера (повторное ревью задачи 12, m2–m3): `holdout: true` — маркер ставится и его время
+/// освежается ([`gc_cache`] не снимет его у живой сессии); `false` или нет поля (метку сняли,
+/// старый сервер) — маркер снимается.
 pub fn note_holdout(env: &Env, session: Option<&str>, v: &Value) {
-    if let Some(id) = session
-        && v["holdout"].as_bool() == Some(true)
-        && !is_holdout(env, id)
-    {
-        mark_holdout(env, id, true);
+    let Some(id) = session else {
+        return;
+    };
+    let on = v["holdout"].as_bool() == Some(true);
+    if on || is_holdout(env, id) {
+        mark_holdout(env, id, on);
     }
 }
 

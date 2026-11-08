@@ -196,9 +196,10 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
     let mut lines: Vec<String> = Vec::new();
     let mut known: Vec<String> = Vec::new();
     if let Some(v) = &remote {
-        // контрольная группа A/B (M6 §12): ни локальных совпадений, ни строки петли
+        // контрольная группа A/B (M6 §12): маркер — по ответу; в группе — ни локальных
+        // совпадений, ни строки петли
+        cache::note_holdout(env, inp.session_id.as_deref(), v);
         if v["holdout"].as_bool() == Some(true) {
-            cache::note_holdout(env, inp.session_id.as_deref(), v);
             return Output::Empty;
         }
         for w in cache::strings(&v["warnings"]) {

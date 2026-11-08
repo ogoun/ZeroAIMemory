@@ -4434,3 +4434,107 @@ fn session_start_holdout_within_budget() {
         "{sent:?}"
     );
 }
+
+/// Повторное ревью задачи 12, m1: метка контрольной группы — только на первом старте сессии.
+/// Метка не успела (сервер не ответил в срок) — сессия вне группы: дайджест выводится, причина —
+/// в `hooks.log`; повторный старт (compact) метку не шлёт и тихой сессию не делает.
+#[test]
+fn session_start_holdout_only_on_first_start() {
+    let _g = serial();
+    let (url, seen) = common::stub_body(std::sync::Arc::new(
+        |m: &str, path: &str, _: usize, b: &Value| {
+            if m == "POST" && path == "/api/v1/sessions" && b.get("holdout").is_some() {
+                (
+                    201,
+                    r#"{"id":"x","holdout":true}"#.to_string(),
+                    Duration::from_millis(1500),
+                )
+            } else if path == "/api/v1/recall" {
+                (
+                    200,
+                    r#"{"text":"дайджест","items":[],"tokens":1,"warnings":[]}"#.to_string(),
+                    Duration::ZERO,
+                )
+            } else {
+                (200, r#"{"id":"x"}"#.to_string(), Duration::ZERO)
+            }
+        },
+    ));
+    let p = Proj::new("ss-holdout-first", &url, "zam_x");
+    project_hooks(&p, "holdout = 0.5");
+    let s = common::holdout_session("hf", 0.5, true);
+    let start = |src: &str| {
+        let ev = p.ev("SessionStart", &s, json!({"source": src}));
+        // щедрый бюджет процесса; у метки — свой срок 100 мс, она его не дождётся
+        hook_slow(&p, &url, "session-start", &ev)
+    };
+    let holds = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, path, b)| {
+                m == "POST" && path == "/api/v1/sessions" && b.get("holdout").is_some()
+            })
+            .count()
+    };
+    assert!(context(&start("startup"), "SessionStart").contains("дайджест"));
+    assert_eq!(holds(), 1);
+    assert!(p.log().contains("sessions(holdout)"), "{}", p.log());
+    for src in ["compact", "resume"] {
+        assert!(
+            context(&start(src), "SessionStart").contains("дайджест"),
+            "{src}"
+        );
+        assert_eq!(holds(), 1, "{src}: метка повторно не шлётся");
+        assert!(p.session_file("holdout", &s, "").is_none(), "{src}");
+    }
+}
+
+/// Повторное ревью задачи 12, m2: метку на сервере сняли (`holdout: false`) — первый же успешный
+/// ответ без неё (`post-tool`, `prompt`, `checkpoint`) снимает маркер, и хуки снова говорят.
+#[test]
+fn holdout_marker_cleared_by_server_response() {
+    let _g = serial();
+    let (url, tok) = start("holdout-clear");
+    let p = Proj::new("holdout-clear", &url, &tok);
+    write_cache(&p, &url);
+    let post = |body: &str| {
+        let r = http()
+            .post(&format!("{url}/api/v1/sessions"))
+            .header("Authorization", format!("Bearer {tok}"))
+            .content_type("application/json")
+            .send(body)
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    };
+    let fail = p.ev(
+        "PostToolUseFailure",
+        "hc-1",
+        json!({"tool_name": "Bash", "tool_input": {"command": "./deploy.sh"},
+               "error": "/bin/bash^M: bad interpreter: No such file or directory"}),
+    );
+    post(r#"{"id":"hc-1","holdout":true}"#);
+    empty(&hook_slow(&p, &url, "post-tool", &fail));
+    assert!(p.session_file("holdout", "hc-1", "").is_some());
+    // метку сняли — ответ `prompt` без неё снимает маркер
+    post(r#"{"id":"hc-1","holdout":false}"#);
+    let pr = p.ev("UserPromptSubmit", "hc-1", json!({"prompt": "что-нибудь"}));
+    ok(&hook_slow(&p, &url, "prompt", &pr));
+    assert!(p.session_file("holdout", "hc-1", "").is_none());
+    let c = context(
+        &hook_slow(&p, &url, "post-tool", &fail),
+        "PostToolUseFailure",
+    );
+    assert!(c.contains("CRLF в shebang"), "{c}");
+    // и снова: метка — маркер (post-tool), снятие — по ответу `post-tool`
+    post(r#"{"id":"hc-1","holdout":true}"#);
+    empty(&hook_slow(&p, &url, "post-tool", &fail));
+    assert!(p.session_file("holdout", "hc-1", "").is_some());
+    post(r#"{"id":"hc-1","holdout":false}"#);
+    assert!(
+        !out(&hook_slow(&p, &url, "post-tool", &fail))
+            .trim()
+            .is_empty()
+    );
+    assert!(p.session_file("holdout", "hc-1", "").is_none());
+}
