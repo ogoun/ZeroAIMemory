@@ -96,7 +96,8 @@
 //!    `w_fts_relaxed`, если векторный канал работает и чанк ему виден, т. е. не Human и узел
 //!    проиндексирован) → бусты ([`zam_search::apply_boosts`], §9.2 п. 4: insight `gotcha` и
 //!    `failure` — `search.boost_gotcha`/`boost_failure`, узлы и записи области из
-//!    `X-Zam-Area` — `search.boost_area`; балл выше 1 после бустов и канала папок — деление
+//!    `X-Zam-Area` — `search.boost_area`, фрагменты вложений — `search.w_attach`, M6 §11;
+//!    балл выше 1 после бустов и канала папок — деление
 //!    всех баллов на лучший, `zam_search::rescale_overflow`) → `note_to_leaf` →
 //!    ≤ `max_per_node` с узла:
 //!    сводка (L1 заметки или секции) сливается с найденным листом своего узла (для
@@ -510,6 +511,7 @@ impl SearchSection {
             area: area.map(|a| (a, self.boost_area)),
             kind_mode: self.kind_boost_mode,
             kind_exempt: HashSet::new(),
+            attach: Some(self.w_attach),
         }
     }
 }

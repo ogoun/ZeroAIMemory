@@ -19,6 +19,7 @@ pub const FEATURES: &[&str] = &[
     "digest",
     "hint_thresholds",
     "kind_boost",
+    "attach_weight",
 ];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {

@@ -557,6 +557,10 @@ pub struct SearchSection {
     /// после слияния, до отсечения `top_k`; `reliable_only` — только у `theorem`/`axiom`.
     /// По умолчанию `always` — сетка задачи 10 M6 (журнал).
     pub kind_boost_mode: KindBoostMode,
+    /// Вес фрагментов документов-вложений (M6 §11, решение 14): множитель их балла рядом с
+    /// бустами — слитого и реранкера (0..=10, по умолчанию 1,0 — выдача побайтово как в v0.0.9).
+    /// Выбор 1,0 — сетка eval документов задачи 11 M6 (журнал).
+    pub w_attach: f64,
     /// Бюджет выдачи `POST /search` и `memory_search` без явного `budget_tokens`, токенов
     /// счётчика сервера (1..=200000, 800; M6 §4.2): Markdown `brief`/`notes` целиком, вместе
     /// со строкой `~N tok` MCP, укладывается в него; первая карточка отдаётся всегда.
@@ -617,6 +621,9 @@ impl SearchSection {
         }
         if !(self.graph_weight.is_finite() && (0.0..=1.0).contains(&self.graph_weight)) {
             return Err(bad("graph_weight", "должно быть в 0..=1"));
+        }
+        if !(self.w_attach.is_finite() && (0.0..=10.0).contains(&self.w_attach)) {
+            return Err(bad("w_attach", "должно быть в 0..=10"));
         }
         if !(1..=200_000).contains(&self.budget_tokens) {
             return Err(bad("budget_tokens", "от 1 до 200000"));
@@ -1358,6 +1365,7 @@ impl Default for ServerConfig {
                 max_folders: 2,
                 contradicts_order: true,
                 kind_boost_mode: KindBoostMode::Always,
+                w_attach: 1.0,
                 budget_tokens: 800,
                 brief_min_rel: 0.0,
             },
@@ -1760,6 +1768,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// M6 §11: `search.w_attach` — по умолчанию 1,0, из `ZAM_*`, вне 0..=10 — ошибка.
+    #[test]
+    fn w_attach_key() {
+        let c = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(c.search.w_attach, 1.0);
+        for (v, ok) in [
+            ("0", true),
+            ("1.3", true),
+            ("10", true),
+            ("10.5", false),
+            ("-0.1", false),
+        ] {
+            let r = load(None, &[env("ZAM_SEARCH__W_ATTACH", v)], &Default::default());
+            assert_eq!(r.is_ok(), ok, "{v}");
+            if let Ok(c) = r {
+                assert_eq!(c.search.w_attach, v.parse::<f64>().unwrap());
+            }
+        }
     }
 
     #[test]

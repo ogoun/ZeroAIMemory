@@ -3,7 +3,8 @@
 //! - затухание по свежести ([`recency_factor`], внутри слияния);
 //! - бусты ([`apply_boosts`]): вид инсайта (`gotcha`, `failure`), надёжность (`certainty`
 //!   заметки или записи: `search.boost_axiom` > `boost_theorem` > `boost_hypothesis`, §7.5) и
-//!   текущая область (`X-Zam-Area`) — множители слитого балла; балл выше 1 после них —
+//!   текущая область (`X-Zam-Area`) и вес фрагментов вложений (`search.w_attach`, M6 §11) —
+//!   множители слитого балла; балл выше 1 после них —
 //!   деление всех баллов на лучший ([`rescale_overflow`]); те же бусты — множители балла
 //!   серверного реранкера (§9.2 п. 5, [`apply_boosts_to`] — одна функция на оба пути);
 //! - замена сводки листом и лимит на цель.
@@ -47,6 +48,9 @@ pub struct Boosts {
     pub kind_mode: KindBoostMode,
     /// Цели без буста вида при [`KindBoostMode::UnlessContradicted`].
     pub kind_exempt: HashSet<TargetRef>,
+    /// Множитель фрагментов документов-вложений (цель `TargetKind::Attachment`,
+    /// `search.w_attach`, M6 §11); `None` — 1 (балл не меняется).
+    pub attach: Option<f64>,
 }
 
 impl Boosts {
@@ -72,7 +76,12 @@ impl Boosts {
             (Some((want, f)), Some(a)) if a == want => *f,
             _ => 1.0,
         };
-        kind * certainty * area
+        let attach = match self.attach {
+            Some(w) if m.target.kind == TargetKind::Attachment => w,
+            _ => 1.0,
+        };
+        // × 1,0 не меняет балл побайтово: при `w_attach = 1` выдача прежняя (v0.0.9)
+        kind * certainty * area * attach
     }
 
     /// Буст вида применим к кандидату по режиму [`KindBoostMode`].
@@ -378,6 +387,35 @@ mod tests {
             area: None,
             ..Boosts::default()
         }
+    }
+
+    /// M6 §11: `attach` (`search.w_attach`) умножает балл только фрагментов вложений, вместе с
+    /// бустом области; при 1,0 и `None` балл побайтово прежний.
+    #[test]
+    fn attach_weight_only_attachments() {
+        let mut att = meta(None, Some("web"));
+        att.target.kind = zam_core::TargetKind::Attachment;
+        let note = meta(None, Some("web"));
+        let b = |w: Option<f64>| Boosts {
+            area: Some(("web".into(), 1.10)),
+            attach: w,
+            ..Boosts::default()
+        };
+        let s = 0.123_456_789;
+        assert_eq!(
+            apply_boosts_to(s, &att, &b(Some(1.0)), None).to_bits(),
+            apply_boosts_to(s, &att, &b(None), None).to_bits()
+        );
+        assert_eq!(
+            apply_boosts_to(s, &att, &b(Some(1.0)), None).to_bits(),
+            (s * 1.10).to_bits()
+        );
+        assert!((apply_boosts_to(s, &att, &b(Some(0.5)), None) - s * 1.10 * 0.5).abs() < 1e-15);
+        assert_eq!(
+            apply_boosts_to(s, &note, &b(Some(0.5)), None),
+            apply_boosts_to(s, &note, &b(None), None)
+        );
+        assert_eq!(apply_boosts_to(s, &att, &b(Some(0.0)), None), 0.0);
     }
 
     /// M6 §10: `reliable_only` — буст вида только у `theorem`/`axiom`; `unless_contradicted`
