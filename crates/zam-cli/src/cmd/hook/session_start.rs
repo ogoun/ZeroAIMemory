@@ -32,9 +32,13 @@
 //! попадает в неё с вероятностью p по хэшу своего id ([`holdout_pick`]: решение одно и то же на
 //! каждом старте сессии, в том числе после compact, и не требует состояния). Такой сессии хук
 //! шлёт отдельный `POST /sessions {id, holdout: true}` **до** `/recall` того же потока: сервер
-//! отдаёт пустой `text` уже первому дайджесту. Старый сервер отвечает 400 (неизвестное поле) —
-//! хук молча продолжает без контрольной группы. Ответ `/recall` с `holdout: true` (метка на
-//! сервере — в том числе поставленная раньше или унаследованная) — тишина: и без сводки журнала.
+//! отдаёт пустой `text` уже первому дайджесту. У метки свой срок [`HOLDOUT_MS`], `/recall` после
+//! неё — с новым клиентом по остатку бюджета (ревью задачи 12, I2: общий бюджет не
+//! превышается). Старый сервер отвечает 400 (неизвестное поле) — хук молча продолжает без
+//! контрольной группы. Метка прошла или ответ `/recall` несёт `holdout: true` (метка на сервере —
+//! в том числе поставленная раньше или унаследованная) — маркер кэша сессии
+//! ([`cache::mark_holdout`]: тишина всех хуков сессии, и без сводки журнала); ответ без неё —
+//! маркер снимается.
 //! M6 §7.1: каждый старт с `session_id` (новая сессия, `/clear`, `resume`, `compact`) пишет
 //! привязку `zam mcp` к сессии — `cache/agent-<pid>.json` ([`binding::write_binding`]) без сети.
 //! M6, задача 5: локальная запись идёт в своём потоке параллельно запросам и не тратит их
@@ -44,6 +48,8 @@
 //! только в остатке бюджета.
 use std::path::Path;
 use std::time::Duration;
+
+use crate::client::{CliError, EXIT_UNREACHABLE};
 
 use serde_json::{Value, json};
 
@@ -209,10 +215,18 @@ fn digest_net(
             }
             let c = &client;
             sc.spawn(move || {
-                if let Some(id) = hold {
-                    set_holdout(env, c, id);
-                }
-                c.post_json("/recall", &body).and_then(read_json)
+                let Some(id) = hold else {
+                    return (c.post_json("/recall", &body).and_then(read_json), false);
+                };
+                // метка — со своим сроком, `/recall` — новым клиентом по остатку бюджета
+                let held = env
+                    .client_within(Duration::from_millis(HOLDOUT_MS))
+                    .is_some_and(|h| set_holdout(env, &h, id));
+                let r = match env.client() {
+                    Some(fresh) => fresh.post_json("/recall", &body).and_then(read_json),
+                    None => Err(CliError::new(EXIT_UNREACHABLE, zam_core::HOOK_BUDGET_SPENT)),
+                };
+                (r, held)
             })
         };
         let trig = sc.spawn(|| cache::refresh_triggers(env, &client, false));
@@ -260,8 +274,17 @@ fn digest_net(
         Err(_) => env.log("кэш триггеров: паника"),
     }
     let v: Value = match recall {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
+        Ok((Ok(v), held)) => {
+            // маркер контрольной группы (M6 §12): по метке и по ответу сервера
+            if let Some(id) = session {
+                cache::mark_holdout(env, id, held || v["holdout"].as_bool() == Some(true));
+            }
+            v
+        }
+        Ok((Err(e), held)) => {
+            if let (Some(id), true) = (session, held) {
+                cache::mark_holdout(env, id, true);
+            }
             env.log(&format!("recall(session_start): {e}"));
             return local(s);
         }
@@ -311,6 +334,9 @@ fn digest_net(
     Output::context(&inp.event, &text)
 }
 
+/// Срок `POST /sessions {id, holdout: true}` внутри бюджета `session-start`, мс.
+pub const HOLDOUT_MS: u64 = 100;
+
 /// Соль хэша контрольной группы A/B (смена — новое разбиение сессий).
 const HOLDOUT_SALT: &[u8] = b"zam-holdout-v1\0";
 
@@ -332,18 +358,24 @@ pub fn holdout_pick(id: &str, p: f64) -> bool {
 
 /// `POST /sessions {id, holdout: true}` (M6 §12) — отдельный запрос: старый сервер
 /// (`deny_unknown_fields`) отвечает 400 про неизвестное поле `holdout` — молча; прочее — в
-/// `hooks.log` (`sessions(holdout): …`).
-fn set_holdout(env: &Env, client: &crate::client::Client, id: &str) {
+/// `hooks.log` (`sessions(holdout): …`). `true` — метка поставлена.
+fn set_holdout(env: &Env, client: &crate::client::Client, id: &str) -> bool {
     let body = json!({"id": id, "holdout": true});
     match client.post_json("/sessions", &body) {
-        Ok(_) => {}
+        Ok(_) => true,
         Err(e)
             if e.http_status() == Some(400)
                 && e.problem
                     .as_ref()
                     .and_then(|p| p["detail"].as_str())
-                    .is_some_and(|d| d.contains("holdout")) => {}
-        Err(e) => env.log(&format!("sessions(holdout): {e}")),
+                    .is_some_and(|d| d.contains("holdout")) =>
+        {
+            false
+        }
+        Err(e) => {
+            env.log(&format!("sessions(holdout): {e}"));
+            false
+        }
     }
 }
 
@@ -420,7 +452,16 @@ mod tests {
                 .all(|id| holdout_pick(id, 0.5))
         );
         assert_eq!(holdout_pick("s-7", 0.5), holdout_pick("s-7", 0.5));
+        // закреплённые значения: та же функция повторена в тестах `zam-cli`
+        // (`tests/common::holdout_pick`) — смена соли или формулы должна сломать оба
+        let pinned: Vec<bool> = (0..8)
+            .map(|i| holdout_pick(&format!("pin-{i}"), 0.5))
+            .collect();
+        assert_eq!(pinned, PINNED_HOLDOUT, "{pinned:?}");
     }
+
+    /// `holdout_pick("pin-0".."pin-7", 0.5)`.
+    const PINNED_HOLDOUT: [bool; 8] = [false, true, true, true, false, true, true, false];
 
     #[test]
     fn block_version_nearest_file() {

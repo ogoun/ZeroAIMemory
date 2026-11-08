@@ -226,3 +226,27 @@ pub fn docs_server(data: PathBuf, worker: PathBuf) -> (String, String) {
     });
     rx.recv().unwrap()
 }
+
+/// Копия `cmd::hook::session_start::holdout_pick` (M6 §12; `zam` — только бинарник): сессия `id`
+/// в контрольной группе A/B при доле `p`. Совпадение закреплено значениями `PINNED_HOLDOUT`
+/// юнит-теста `holdout_pick_share_and_determinism` и тестом `hooks::holdout_pick_copy_pinned`.
+pub fn holdout_pick(id: &str, p: f64) -> bool {
+    if p <= 0.0 {
+        return false;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"zam-holdout-v1\0");
+    h.update(id.as_bytes());
+    let b = h.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&b.as_bytes()[..8]);
+    (u64::from_le_bytes(first) as f64 / 18_446_744_073_709_551_616.0) < p
+}
+
+/// Первая сессия `<prefix>-<n>` в контрольной группе (`in_group`) или вне её при `p`.
+pub fn holdout_session(prefix: &str, p: f64, in_group: bool) -> String {
+    (0..10_000)
+        .map(|i| format!("{prefix}-{i}"))
+        .find(|s| holdout_pick(s, p) == in_group)
+        .expect("сессия группы")
+}

@@ -73,6 +73,8 @@ fn recall(env: &Env, inp: &Input, client: &crate::client::Client, prompt: &str) 
             for w in cache::strings(&v["warnings"]) {
                 env.log(&format!("recall(prompt): предупреждение сервера: {w}"));
             }
+            // контрольная группа A/B (M6 §12): маркер сессии
+            cache::note_holdout(env, inp.session_id.as_deref(), &v);
             Output::context(&inp.event, v["text"].as_str().unwrap_or_default())
         }
         Err(e) => {

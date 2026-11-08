@@ -1147,6 +1147,19 @@ async fn holdout_empty_text_and_inherited() {
         session(&a, &a.token, "ho-1:a1").await.json()["holdout"],
         true
     );
+    // наследование — только в сторону `true` (ревью задачи 12, M6): `holdout: false` у
+    // субагента метку не снимает — ни с тем же `parent_id`, ни без него
+    for body in [
+        json!({"id": "ho-1:a1", "holdout": false}),
+        json!({"id": "ho-1:a1", "parent_id": "ho-1", "holdout": false}),
+    ] {
+        let j = set_holdout(&a, body).await;
+        assert_eq!(j["holdout"], true, "{j}");
+        assert_eq!(
+            session(&a, &a.token, "ho-1:a1").await.json()["holdout"],
+            true
+        );
+    }
     let b = recall_in(
         &a,
         "ho-1:a1",

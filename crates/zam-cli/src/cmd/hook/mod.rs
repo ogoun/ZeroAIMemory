@@ -21,6 +21,12 @@
 //!   успех (M4.5: журнал, знание о файле, очередь изменённых — без сети, 50 мс).
 //! - **`subagent-start`** (M4.5 §9.4, событие `SubagentStart` Claude и Codex, 300 мс) —
 //!   сессия субагента и пакет под задачу ([`subagent_start`]).
+//! - **Контрольная группа A/B** (M6 §12, `hooks.holdout`): у сессии с маркером
+//!   `cache/holdout-<сессия>` ([`cache::mark_holdout`]; ставят `session-start` и ответы сервера с
+//!   `holdout: true`) вывод любого хука — пустой, включая локальный (знание о файле, триггеры,
+//!   напоминание, петля, сводка журнала), и учёта локального вывода нет; журнал, очереди,
+//!   привязка MCP и отправка учёта — как обычно. Субагенты Claude Code и Codex шлют события
+//!   хуков с id родителя — маркер покрывает и их.
 //! - **Учёт выданного** (M4.5 §9.5): непустой вывод без сети (`pre-tool`, успешный
 //!   `post-tool`) — строка в очереди `cache/tokens-<сессия>.jsonl` (оценка токенов
 //!   [`cache::estimate_tokens`]); сетевые хуки (`session-start`, `prompt`, `post-tool` ошибки,
@@ -536,14 +542,24 @@ fn handle(kind: Kind, agent: Agent, started: Instant, raw: &input::Raw) -> Outpu
         .unwrap_or_default();
     let env = Env::new(kind, agent, started, cwd, super::home_dir());
     let settings = env.settings();
-    match kind {
+    let out = match kind {
         Kind::SessionStart => session_start::run(&env, &inp, &settings),
         Kind::Prompt => prompt::run(&env, &inp, &settings),
         Kind::PreTool => pre_tool::run(&env, &inp, &settings),
         Kind::PostTool => post_tool::run(&env, &inp, &settings),
         Kind::Checkpoint => checkpoint::run(&env, &inp, &settings),
         Kind::SubagentStart => subagent_start::run(&env, &inp, &settings),
+    };
+    // контрольная группа A/B (M6 §12): сессия с маркером — тишина у всех хуков (служебная
+    // работа выше уже сделана)
+    if inp
+        .session_id
+        .as_deref()
+        .is_some_and(|id| cache::is_holdout(&env, id))
+    {
+        return Output::Empty;
     }
+    out
 }
 
 /// Переменная, по которой видно, что `zam` запустил Codex (не настройка пользователя вроде

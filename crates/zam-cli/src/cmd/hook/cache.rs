@@ -9,6 +9,10 @@
 //!   сессии, и признак напоминания `checkpoint`;
 //! - `edits-<сессия>` — маркер правок Write/Edit/`apply_patch` (для `checkpoint`, R1): файл есть —
 //!   правки были; создаётся без чтения и перезаписи (fix round 1, m-2);
+//! - `holdout-<сессия>` — маркер контрольной группы агентного A/B (M6 §12, [`mark_holdout`]):
+//!   файл есть — все хуки сессии (и её субагентов: их события идут с id родителя) молчат,
+//!   локальный вывод не учитывается ([`note_tokens`]); служебная работа (журнал, очереди,
+//!   привязка MCP, отправка учёта) идёт как обычно;
 //! - `file-refs.json` — `{etag, fetched_at, server, solution, refs}` из `GET /file-refs`
 //!   (M4.5 §6.3; как `triggers.json`): знание о файле для `post-tool` и `pre-tool` без сети;
 //! - `changed-<сессия>.jsonl` — очередь `{path, hash}` правленых файлов (M4.5 §6.2): пишет
@@ -26,8 +30,8 @@
 //!   просроченные записи снимает и `session-start` ([`prune_spawns`]), файл без изменений
 //!   дольше [`SPAWN_FILE_TTL`] удаляет [`gc_cache`];
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
-//!   `shown-*`/`edits-*`/`events-*`/`changed-*`/`tokens-*`/`agent-*` старше [`SHOWN_TTL`] и `.*.tmp`
-//!   старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
+//!   `shown-*`/`edits-*`/`holdout-*`/`events-*`/`changed-*`/`tokens-*`/`agent-*` старше
+//!   [`SHOWN_TTL`] и `.*.tmp` старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
 //!   в `memory_writes` сессии хуков **[решение исполнителя]**.
@@ -769,7 +773,8 @@ pub fn estimate_tokens(text: &str) -> u64 {
 /// Отмечает локальный вывод хука в очереди учёта (пустой текст — ничего): одна строка одним
 /// `write` с append, без замка (параллельные хуки строк не смешивают).
 pub fn note_tokens(env: &Env, session: &str, event: &str, text: &str) {
-    if text.trim().is_empty() {
+    // контрольная группа (M6 §12): вывода агенту нет — нет и учёта
+    if text.trim().is_empty() || is_holdout(env, session) {
         return;
     }
     let line = TokenLine {
@@ -937,6 +942,43 @@ pub fn mark_edits(env: &Env, session: &str) {
 /// В сессии были правки.
 pub fn had_edits(env: &Env, session: &str) -> bool {
     edits_path(env, session).is_file()
+}
+
+pub fn holdout_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("holdout-{}", session_file_part(session)))
+}
+
+/// Ставит (`on`) или снимает маркер контрольной группы A/B сессии (M6 §12). Ставится каждый раз
+/// заново — время файла освежается, и [`gc_cache`] его не снимает у живой сессии.
+pub fn mark_holdout(env: &Env, session: &str, on: bool) {
+    let path = holdout_path(env, session);
+    let r = if on {
+        std::fs::create_dir_all(env.cache_dir()).and_then(|_| write_atomic(&path, b""))
+    } else {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
+    };
+    if let Err(e) = r {
+        env.log(&format!("маркер контрольной группы сессии: {e}"));
+    }
+}
+
+/// Сессия — в контрольной группе A/B по маркеру кэша (M6 §12).
+pub fn is_holdout(env: &Env, session: &str) -> bool {
+    holdout_path(env, session).is_file()
+}
+
+/// Ответ сервера с `holdout: true` (`/recall`, `GET /sessions/{id}`) — маркер сессии ставится.
+pub fn note_holdout(env: &Env, session: Option<&str>, v: &Value) {
+    if let Some(id) = session
+        && v["holdout"].as_bool() == Some(true)
+        && !is_holdout(env, id)
+    {
+        mark_holdout(env, id, true);
+    }
 }
 
 pub fn shown_path(env: &Env, session: &str) -> PathBuf {
@@ -1129,6 +1171,7 @@ pub fn gc_cache(env: &Env) {
         let Some(n) = name.to_str() else { continue };
         let session_file = (n.starts_with("shown-") && n.ends_with(".json"))
             || n.starts_with("edits-")
+            || n.starts_with("holdout-")
             || (n.starts_with("events-") && n.ends_with(".jsonl"))
             || (n.starts_with("changed-") && n.ends_with(".jsonl"))
             || (n.starts_with("tokens-") && n.ends_with(".jsonl"))

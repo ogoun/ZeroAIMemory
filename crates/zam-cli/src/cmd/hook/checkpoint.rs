@@ -25,7 +25,8 @@
 //! `Stop` до [`IMPACT_LINES_MAX`] строк «правка затрагивает `<путь>[#<символ>]` → i:<id> «…»»
 //! **внутри** того же единственного напоминания ([`impact_lines`]). Вход — пути правок сессии
 //! из журнала (`Ev::Edit`, новые первыми) и из очереди изменённых файлов (с хэшами символов, если
-//! они есть), до [`IMPACT_FILES_MAX`] файлов ([`impact_files`]). `POST /code/impact` идёт
+//! они есть), до [`IMPACT_FILES_MAX`] файлов ([`impact_files`]); оба читает поток влияния, очередь —
+//! до её отправки (`flush_changed` ждёт этого до [`IMPACT_READ_WAIT`]). `POST /code/impact` идёт
 //! параллельно с `GET /sessions/{id}` со своим сроком [`IMPACT_MS`] внутри бюджета хука; не
 //! ответил — без строк (причина — в `hooks.log`). Сами строки напоминания не вызывают
 //! (`decision: block` — по прежним условиям); сессия контрольной группы A/B (`holdout` в
@@ -53,6 +54,8 @@ pub const IMPACT_LINES_MAX: usize = 3;
 const IMPACT_BODY_MAX: usize = 64 * 1024;
 /// Предел заголовка записи в строке влияния, символов.
 const IMPACT_TITLE_MAX: usize = 60;
+/// Ожидание отправки очереди изменённых, пока поток влияния её прочтёт (обычно — микросекунды).
+const IMPACT_READ_WAIT: Duration = Duration::from_millis(50);
 
 /// Текст напоминания.
 pub const REMINDER: &str = "ZeroAIMemory: в этой сессии были правки файлов, а в память ничего не \
@@ -116,15 +119,10 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
         env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
     let tokens = cache::tokens_queued(env, session);
     let remind = needs_reminder(env, inp, s);
-    let events = match remind.as_ref() {
-        Some((id, _)) if s.flag_on(Flag::SessionJournal) => journal::read(&env.root, id),
-        _ => Vec::new(),
-    };
-    // влияние диффа (M6 §12): вход — до отправки очереди (она забирает файл очереди)
+    // влияние диффа (M6 §12): только к напоминанию и не в контрольной группе (её вывод пуст)
     let impact_in = match (remind.as_ref(), env.solution.as_ref()) {
-        (Some((id, _)), Some(sol)) if s.checkpoint_impact() => {
-            let files = impact_files(&events, &cache::peek_changed(env, id));
-            (!files.is_empty()).then(|| (sol.id.clone(), files))
+        (Some((id, _)), Some(sol)) if s.checkpoint_impact() && !cache::is_holdout(env, id) => {
+            Some((sol.id.clone(), *id))
         }
         _ => None,
     };
@@ -137,19 +135,46 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
         return Output::Empty;
     };
     std::thread::scope(|sc| {
-        let flush = queued.then(|| sc.spawn(|| cache::flush_changed(env, &client, session)));
+        // влияние диффа — в своём потоке параллельно с `GET /sessions/{id}`, со своим сроком;
+        // очередь изменённых он читает до её отправки (отправка забирает файл очереди)
+        let (read_tx, read_rx) = std::sync::mpsc::channel::<()>();
+        let impact = impact_in.map(|(sol, id)| {
+            let journal_on = s.flag_on(Flag::SessionJournal);
+            sc.spawn(move || {
+                let queued = cache::peek_changed(env, id);
+                let _ = read_tx.send(());
+                let events = if journal_on {
+                    journal::read(&env.root, id)
+                } else {
+                    Vec::new()
+                };
+                let files = impact_files(&events, &queued);
+                if files.is_empty() {
+                    return Vec::new();
+                }
+                impact(env, &sol, files)
+            })
+        });
+        let wait_read = impact.is_some();
+        let c = &client;
+        let flush = queued.then(|| {
+            sc.spawn(move || {
+                if wait_read {
+                    let _ = read_rx.recv_timeout(IMPACT_READ_WAIT);
+                }
+                cache::flush_changed(env, c, session)
+            })
+        });
         // очередь учёта локального вывода (M4.5 §9.5)
         let flush_tokens = session
             .filter(|_| tokens)
             .map(|id| sc.spawn(|| cache::flush_tokens(env, &client, id)));
         let bump = epoch.map(|id| sc.spawn(|| new_epoch(env, &client, id)));
-        // параллельно с `GET /sessions/{id}` напоминания, со своим сроком
-        let impact = impact_in.map(|(sol, files)| sc.spawn(move || impact(env, &sol, files)));
         let out = match remind {
             Some((id, sh)) => {
                 let fix = s
                     .flag_on(Flag::SessionJournal)
-                    .then(|| fix_line(&events))
+                    .then(|| fix_line(&journal::read(&env.root, id)))
                     .flatten();
                 let lines = || match impact {
                     Some(h) => h.join().unwrap_or_else(|_| {
@@ -262,11 +287,15 @@ fn reminder(
     // запрос влияния — дождаться всегда (свой срок; строки нужны не всегда)
     let impact = impact();
     let (writes, tasks, holdout) = match got {
-        Ok(v) => (
-            v["memory_writes"].as_i64(),
-            task_line(&v),
-            v["holdout"].as_bool() == Some(true),
-        ),
+        Ok(v) => {
+            // контрольная группа A/B (M6 §12): маркер сессии — тишина всех хуков
+            cache::note_holdout(env, Some(session), &v);
+            (
+                v["memory_writes"].as_i64(),
+                task_line(&v),
+                v["holdout"].as_bool() == Some(true),
+            )
+        }
         Err(e) if e.code == EXIT_NOT_FOUND => (Some(0), None, false),
         Err(e) => {
             env.log(&format!("сессия: {e}"));

@@ -20,8 +20,9 @@
 //!   группа агентного A/B — в такой сессии `/recall` хуков отдаёт пустой `text` (учёт ведётся,
 //!   [`super::recall`]); `false` снимает. Шлёт хук `session-start` (`hooks.holdout`) отдельным
 //!   запросом: старый сервер отвечает 400, хук молча продолжает. Без `id` — 400. Сессия
-//!   субагента (`parent_id`) при регистрации наследует метку родителя; после compact метка
-//!   остаётся (та же сессия);
+//!   субагента (`parent_id`) при регистрации наследует метку родителя — только в сторону `true`:
+//!   `holdout: false` у субагента контрольной группы метку не снимает (ответ — `holdout: true`);
+//!   после compact метка остаётся (та же сессия);
 //! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
 //! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, parent_id, agent_type,
 //!   started_at, last_seen_at, ended_at, memory_writes, seen_epoch, claimed_tasks: [{id, title,
@@ -292,19 +293,27 @@ pub async fn create(
         None => touch_session(&db, &touch).await?,
     }
     let mut out = json!({ "id": touch.id });
+    // сессия субагента наследует метку родителя (M6 §12) — только в сторону `true`: `holdout:
+    // false` у субагента метку родителя не снимает (родитель — по `parent_id` тела или строки)
+    let parent = match touch.parent_id.clone() {
+        Some(p) => Some(p),
+        None if req.holdout.is_some() => {
+            get_session(&db, &touch.id).await?.and_then(|x| x.parent_id)
+        }
+        None => None,
+    };
+    let inherited = match parent.as_deref() {
+        Some(p) => session_holdout(&db, p, None).await?,
+        None => false,
+    };
     match req.holdout {
         Some(on) => {
+            let on = on || inherited;
             set_holdout(&db, &touch.id, on).await?;
             out["holdout"] = json!(on);
         }
-        // сессия субагента наследует метку родителя (M6 §12)
-        None => {
-            if let Some(parent) = &touch.parent_id
-                && session_holdout(&db, parent, None).await?
-            {
-                set_holdout(&db, &touch.id, true).await?;
-            }
-        }
+        None if inherited => set_holdout(&db, &touch.id, true).await?,
+        None => {}
     }
     if new_epoch {
         out["epoch"] = json!(bump_epoch(&db, &touch.id).await?);

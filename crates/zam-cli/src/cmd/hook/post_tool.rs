@@ -9,7 +9,9 @@
 //! `post_tool`; в журнал сессии (ключ `session_journal`) — `Ev::Error` и, если известна
 //! команда, `Ev::Cmd {ok: false, err_fp}`. Петля (§9.3, ключ `session_journal`, и при
 //! выключенном `post_tool`): тот же `err_fp` в журнале [`LOOP_AT`]-й раз — строка «эта ошибка
-//! повторяется N-й раз в сессии…», раз на отпечаток ([`repeat_hint`]).
+//! повторяется N-й раз в сессии…», раз на отпечаток ([`repeat_hint`]). Ответ сервера с
+//! `holdout: true` (контрольная группа A/B, M6 §12) — тишина: ни локальных `error_regex`, ни
+//! строки петли, маркер сессии ставится ([`cache::note_holdout`]).
 //!
 //! **Успех** (M4.5 §6.3, §9.1; `PostToolUse` без ошибки; без сети, бюджет 50 мс):
 //! - `Read` — `Ev::Read` и знание о файле по `file-refs.json` ([`file_context_lines`], ключ
@@ -194,6 +196,11 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
     let mut lines: Vec<String> = Vec::new();
     let mut known: Vec<String> = Vec::new();
     if let Some(v) = &remote {
+        // контрольная группа A/B (M6 §12): ни локальных совпадений, ни строки петли
+        if v["holdout"].as_bool() == Some(true) {
+            cache::note_holdout(env, inp.session_id.as_deref(), v);
+            return Output::Empty;
+        }
         for w in cache::strings(&v["warnings"]) {
             env.log(&format!("recall(post_tool): предупреждение сервера: {w}"));
         }

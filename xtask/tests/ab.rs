@@ -237,6 +237,14 @@ arm = "off"
 rep = 1
 session = "s-t2-off"
 outcome = "pass"
+
+# пустышка: журнала нет — с --allow-missing в агрегаты не входит
+[[run]]
+task = "t1"
+arm = "memory"
+rep = 2
+session = "s-no-transcript"
+outcome = "fail"
 "#,
     )
     .unwrap();
@@ -268,7 +276,7 @@ outcome = "pass"
         .arg(&tr)
         .arg("--runs")
         .arg(&runs)
-        .args(["--server", &url, "--out"])
+        .args(["--allow-missing", "--server", &url, "--out"])
         .arg(&out)
         .output()
         .unwrap();
@@ -361,14 +369,22 @@ outcome = "pass"
         "{c0}"
     );
     assert!(approx(&c0["d_pass_rate"]["mean"], 0.5), "{c0}");
-    assert!(j["missing"].as_array().unwrap().is_empty(), "{j}");
+    // пустышка — отдельно, агрегаты выше её не учитывают (memory: 2 прогона, доля успешных 1,0)
+    assert_eq!(
+        j["missing"],
+        json!([{"task": "t1", "arm": "memory", "rep": 2, "session": "s-no-transcript",
+                "outcome": "fail"}]),
+        "{j}"
+    );
+    assert!(stdout.contains("Без журнала"), "{stdout}");
     // вывод по плечам — с интервалами
     for want in ["memory", "off", "R memory / off", "[", "доля успешных"] {
         assert!(stdout.contains(want), "нет «{want}»:\n{stdout}");
     }
 }
 
-/// Прогон без транскрипта — в `missing` (отчёт строится), неизвестный исход — ошибка до сети.
+/// Прогон без транскрипта — ошибка; с `--allow-missing` — в `missing`, в агрегаты не входит;
+/// неизвестный исход — ошибка до сети.
 #[test]
 fn ab_missing_transcript_and_bad_outcome() {
     let d = tmp("missing");
@@ -385,7 +401,7 @@ fn ab_missing_transcript_and_bad_outcome() {
     )
     .unwrap();
     let out = d.join("ab.json");
-    let o = xtask(&[
+    let base = [
         "ab",
         "--transcripts",
         tr.to_str().unwrap(),
@@ -393,10 +409,22 @@ fn ab_missing_transcript_and_bad_outcome() {
         runs.to_str().unwrap(),
         "--out",
         out.to_str().unwrap(),
-    ]);
+    ];
+    // без --allow-missing — ошибка с id сессии, отчёта нет
+    let o = xtask(&base);
+    assert!(!o.status.success());
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("s-none") && e.contains("--allow-missing"), "{e}");
+    assert!(!out.exists());
+    let mut args = base.to_vec();
+    args.push("--allow-missing");
+    let o = xtask(&args);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let j: Value = serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(j["missing"], json!(["s-none"]), "{j}");
+    assert_eq!(j["missing"][0]["session"], "s-none", "{j}");
+    assert_eq!(j["runs"], 1, "{j}");
+    // плечо только из пустышек в агрегатах не появляется
+    assert!(j["arms"].get("off").is_none(), "{j}");
     // без --server память не известна
     assert!(j["run"][0]["memory"].is_null(), "{j}");
     fs::write(

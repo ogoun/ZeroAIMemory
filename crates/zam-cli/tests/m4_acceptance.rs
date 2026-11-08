@@ -9,7 +9,9 @@
 //!   (M4.5: и `post-tool` успеха — 50 мс без сети, и `subagent-start` — 300 мс; M5.7 — с 50
 //!   идеями в решении: раздел `### Идеи` и отдельный поиск идей к `prompt`; M6 §12 —
 //!   `checkpoint` с `hooks.checkpoint_impact = true`: `POST /code/impact` по правке файла со
-//!   знанием параллельно с `GET /sessions/{id}`);
+//!   знанием параллельно с `GET /sessions/{id}`; `session-start` контрольной группы A/B —
+//!   `hooks.holdout = 0.5`, сессии из группы: метка `POST /sessions {holdout}` до `/recall` в
+//!   том же бюджете, вывод — тишина);
 //! - `source_change_marks_cache_stale` — изменение источника выжимки → `stale` (критерий §19);
 //! - `fail_open_when_server_down` — все пять хуков при выключенном и при зависшем сервере;
 //! - `shared_solution_cache_and_recall` — участник общего решения видит общий кэш и подсказки
@@ -57,7 +59,7 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// Бюджет хука по ТЗ §10.3, мс.
 fn budget_ms(kind: &str) -> u64 {
     match kind {
-        "session-start" | "subagent-start" => 300,
+        "session-start" | "subagent-start" | "session-start-holdout" => 300,
         "prompt" | "post-tool" => 250,
         // M4.5: `post-tool` успеха — весь процесс без сети (план M4.5, Global Constraints)
         "pre-tool" | "post-tool-ok" => 50,
@@ -1008,9 +1010,27 @@ fn hook_budgets() {
             })
             .collect(),
     ));
+    // M6 §12 (ревью задачи 12, I2): `session-start` контрольной группы — метка до `/recall` не
+    // выводит хук за бюджет; сессии — те, что гарантированно в группе при p = 0,5
+    runs.push((
+        "session-start-holdout",
+        (0..)
+            .map(|i| format!("bud-ho-{i}"))
+            .filter(|s| common::holdout_pick(s, 0.5))
+            .take(40)
+            .map(|s| (p.start_ev(&s), Some(false)))
+            .collect(),
+    ));
     let mut report = Vec::new();
     let mut fails = Vec::new();
     for (kind, evs) in &runs {
+        if *kind == "session-start-holdout" {
+            std::fs::write(
+                p.repo.join(".zeroaimemory/config.toml"),
+                "[hooks]\ncheckpoint_impact = true\nholdout = 0.5\n",
+            )
+            .unwrap();
+        }
         if *kind == "checkpoint" {
             // правка в сессии — иначе checkpoint молчит без запроса к серверу; правка файла со
             // знанием (`src/pool.rs`) — вход влияния диффа (M6 §12)
@@ -1043,10 +1063,10 @@ fn hook_budgets() {
             }
         }
         // команда хука: `post-tool-ok` — тот же `post-tool` с событием успеха
-        let cmd = if *kind == "post-tool-ok" {
-            "post-tool"
-        } else {
-            kind
+        let cmd = match *kind {
+            "post-tool-ok" => "post-tool",
+            "session-start-holdout" => "session-start",
+            k => k,
         };
         // прогрев вида (не в замер): после загрузки корпуса первые запросы отладочного сервера
         // читают холодные страницы SQLite с HDD — бюджет относится к рабочему серверу
@@ -1112,7 +1132,16 @@ fn hook_budgets() {
         if timeouts * 20 > n {
             fails.push(format!("{kind}: тайм-аутов {timeouts} из {n} (> 5 %)"));
         }
-        if spoke == 0 {
+        // контрольная группа молчит по построению; её метка — на сервере у каждой сессии
+        if *kind == "session-start-holdout" {
+            for (ev, _) in evs {
+                let id = ev["session_id"].as_str().unwrap();
+                let (code, v) = srv.call(0, "GET", &format!("/api/v1/sessions/{id}"), None, &[]);
+                if code != 200 || v["holdout"] != true {
+                    fails.push(format!("{kind} {id}: нет метки holdout ({code}: {v})"));
+                }
+            }
+        } else if spoke == 0 {
             fails.push(format!("{kind}: ни одного ответа из {n}"));
         }
     }

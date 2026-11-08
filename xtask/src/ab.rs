@@ -4,13 +4,18 @@
 //! - **Транскрипты** (`--transcripts <каталог>`, рекурсивно `*.jsonl`): Claude Code — строки с
 //!   `message.usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`,
 //!   `output_tokens`; сообщение, записанное несколькими строками — по блоку, — считается один раз
-//!   по `message.id`), сессия — `sessionId` (файлы субагентов той же сессии складываются с ней);
-//!   Codex — последний накопленный `token_count.info.total_token_usage` (`input_tokens` с кэшем,
+//!   на пару (сессия, `message.id`) по всему каталогу), сессия — `sessionId` **каждой строки**
+//!   (файлы субагентов той же сессии складываются с ней);
+//!   Codex — последний накопленный в файле `token_count.info.total_token_usage` (итоги файлов
+//!   одной сессии складываются; `input_tokens` с кэшем,
 //!   `cached_input_tokens`, `output_tokens`), сессия — `session_meta.payload.id`. Вызовы
 //!   инструментов — по **типу** блоков (`tool_use` у Claude Code; `function_call`,
 //!   `custom_tool_call`, `local_shell_call` у Codex). Строки разбираются в типы только с этими
 //!   полями: текст сообщений, команды и ответы инструментов не сохраняются, файлы не копируются
 //!   и не меняются (тест `xtask/tests/ab.rs`).
+//! - **Прогоны без журнала** — ошибка; с `--allow-missing` — в `missing`, в агрегаты и сравнения
+//!   не входят. Предупреждения — плечо `holdout` без метки сервера, `main` с меткой, `off` с
+//!   выдачей памяти.
 //! - **Память** — `GET /sessions/{id}` сервера (`--server`, токен `--token` или `ZAM_TOKEN`):
 //!   сумма `tokens` по событиям и `holdout`; 404 (плечо без памяти) — 0; без `--server` — нет.
 //! - **Метки** (`--runs`, `eval/ab/runs.toml`): `[[run]] task, arm, rep, session, outcome =
@@ -62,6 +67,9 @@ pub struct AbArgs {
     /// JSON-отчёт (каталог создаётся)
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Прогоны без журнала не ошибка: они перечисляются в `missing` и в агрегаты не входят
+    #[arg(long)]
+    pub allow_missing: bool,
 }
 
 /// Исход прогона.
@@ -201,33 +209,132 @@ struct CodexUsage {
 /// Вызовы инструментов Codex — типы `response_item.payload.type`.
 const CODEX_TOOL_ITEMS: [&str; 3] = ["function_call", "custom_tool_call", "local_shell_call"];
 
-/// Учёт одного файла транскрипта.
+/// Учёт транскриптов всего каталога (ревью задачи 12, M1): каждая строка относится к **своей**
+/// сессии (`sessionId` строки; без него — сессия файла: `session_meta` Codex, последняя
+/// встреченная `sessionId`, иначе имя файла), сообщение Claude Code — один раз на пару (сессия,
+/// `message.id`) по всему каталогу (одно сообщение в двух файлах — один раз).
 #[derive(Default)]
-struct FileUsage {
-    session: Option<String>,
-    /// Claude Code: `message.id` → usage (повтор строки сообщения — одна запись, большая).
-    claude: HashMap<String, ClaudeUsage>,
-    /// Claude Code: сообщения без id — сразу в сумму.
-    claude_anon: Usage,
-    /// Codex: последний накопленный итог.
-    codex: Option<CodexUsage>,
-    tool_calls: u64,
+struct Scan {
+    /// (сессия, `message.id`) → usage (повтор строки сообщения — одна запись, большая).
+    claude: HashMap<(String, String), ClaudeUsage>,
+    /// Сессия → сообщения Claude Code без id и итоги Codex (сумма по файлам сессии).
+    plain: HashMap<String, Usage>,
+    /// Сессия → вызовы инструментов.
+    tools: HashMap<String, u64>,
+    /// Сессия → файлы с её строками.
+    files: HashMap<String, BTreeSet<PathBuf>>,
 }
 
-impl FileUsage {
-    fn usage(&self) -> Usage {
-        let mut u = self.claude_anon;
-        for c in self.claude.values() {
-            u.add(&Usage {
-                input: c.input_tokens,
-                cache_read: c.cache_read_input_tokens,
-                cache_creation: c.cache_creation_input_tokens,
-                output: c.output_tokens,
-                tool_calls: 0,
-            });
+/// Состояние разбора одного файла.
+struct FileState {
+    path: PathBuf,
+    /// Сессия файла для строк без `sessionId`.
+    current: Option<String>,
+    /// Codex: сессия → последний накопленный итог в этом файле.
+    codex: HashMap<String, CodexUsage>,
+}
+
+impl FileState {
+    fn new(path: &Path) -> FileState {
+        FileState {
+            path: path.to_path_buf(),
+            current: None,
+            codex: HashMap::new(),
         }
-        if let Some(c) = self.codex {
-            u.add(&Usage {
+    }
+
+    fn fallback(&self) -> String {
+        self.current.clone().unwrap_or_else(|| {
+            self.path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+    }
+}
+
+fn claude_usage(u: &ClaudeUsage) -> Usage {
+    Usage {
+        input: u.input_tokens,
+        cache_read: u.cache_read_input_tokens,
+        cache_creation: u.cache_creation_input_tokens,
+        output: u.output_tokens,
+        tool_calls: 0,
+    }
+}
+
+impl Scan {
+    fn touch(&mut self, session: &str, f: &FileState) {
+        self.files
+            .entry(session.to_string())
+            .or_default()
+            .insert(f.path.clone());
+    }
+
+    fn line(&mut self, f: &mut FileState, l: Line) {
+        if let Some(s) = &l.session_id {
+            f.current = Some(s.clone());
+        }
+        if let (Some("session_meta"), Some(id)) = (
+            l.kind.as_deref(),
+            l.payload.as_ref().and_then(|p| p.id.clone()),
+        ) {
+            f.current = Some(id);
+        }
+        let session = l.session_id.clone().unwrap_or_else(|| f.fallback());
+        if let Some(m) = l.message {
+            let mut counted = false;
+            if let Content::Blocks(b) = &m.content {
+                let n = b
+                    .iter()
+                    .filter(|x| x.kind.as_deref() == Some("tool_use"))
+                    .count() as u64;
+                if n > 0 {
+                    *self.tools.entry(session.clone()).or_default() += n;
+                    counted = true;
+                }
+            }
+            if let Some(u) = m.usage {
+                match m.id {
+                    Some(id) => {
+                        let e = self.claude.entry((session.clone(), id)).or_default();
+                        if u.output_tokens >= e.output_tokens {
+                            *e = u;
+                        }
+                    }
+                    None => self
+                        .plain
+                        .entry(session.clone())
+                        .or_default()
+                        .add(&claude_usage(&u)),
+                }
+                counted = true;
+            }
+            if counted {
+                self.touch(&session, f);
+            }
+        }
+        if let Some(p) = l.payload {
+            match (l.kind.as_deref(), p.kind.as_deref()) {
+                (Some("event_msg"), Some("token_count")) => {
+                    if let Some(t) = p.info.and_then(|i| i.total_token_usage) {
+                        f.codex.insert(session.clone(), t);
+                        self.touch(&session, f);
+                    }
+                }
+                (Some("response_item"), Some(k)) if CODEX_TOOL_ITEMS.contains(&k) => {
+                    *self.tools.entry(session.clone()).or_default() += 1;
+                    self.touch(&session, f);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Конец файла: итоги Codex файла — в сумму сессии.
+    fn end(&mut self, f: FileState) {
+        for (s, c) in f.codex {
+            self.plain.entry(s).or_default().add(&Usage {
                 input: c.input_tokens.saturating_sub(c.cached_input_tokens),
                 cache_read: c.cached_input_tokens,
                 cache_creation: 0,
@@ -235,57 +342,46 @@ impl FileUsage {
                 tool_calls: 0,
             });
         }
-        u.tool_calls = self.tool_calls;
-        u
     }
 
-    fn line(&mut self, l: Line) {
-        if self.session.is_none() {
-            self.session = l.session_id.clone();
+    /// Сессия → (usage, число файлов).
+    fn finish(self) -> BTreeMap<String, (Usage, usize)> {
+        let mut out: BTreeMap<String, (Usage, usize)> = BTreeMap::new();
+        for ((s, _), u) in &self.claude {
+            out.entry(s.clone()).or_default().0.add(&claude_usage(u));
         }
-        if let Some(m) = l.message {
-            if let Content::Blocks(b) = &m.content {
-                self.tool_calls += b
-                    .iter()
-                    .filter(|x| x.kind.as_deref() == Some("tool_use"))
-                    .count() as u64;
-            }
-            if let Some(u) = m.usage {
-                match m.id {
-                    Some(id) => {
-                        let e = self.claude.entry(id).or_default();
-                        if u.output_tokens >= e.output_tokens {
-                            *e = u;
-                        }
-                    }
-                    None => self.claude_anon.add(&Usage {
-                        input: u.input_tokens,
-                        cache_read: u.cache_read_input_tokens,
-                        cache_creation: u.cache_creation_input_tokens,
-                        output: u.output_tokens,
-                        tool_calls: 0,
-                    }),
-                }
-            }
+        for (s, u) in &self.plain {
+            out.entry(s.clone()).or_default().0.add(u);
         }
-        if let Some(p) = l.payload {
-            match (l.kind.as_deref(), p.kind.as_deref()) {
-                (Some("session_meta"), _) => {
-                    if let Some(id) = p.id {
-                        self.session = Some(id);
-                    }
-                }
-                (Some("event_msg"), Some("token_count")) => {
-                    if let Some(t) = p.info.and_then(|i| i.total_token_usage) {
-                        self.codex = Some(t);
-                    }
-                }
-                (Some("response_item"), Some(k)) if CODEX_TOOL_ITEMS.contains(&k) => {
-                    self.tool_calls += 1;
-                }
-                _ => {}
+        for (s, n) in &self.tools {
+            out.entry(s.clone()).or_default().0.tool_calls += n;
+        }
+        for (s, f) in &self.files {
+            out.entry(s.clone()).or_default().1 = f.len();
+        }
+        out
+    }
+
+    /// Файл: строки читаются потоком; битая или слишком длинная строка пропускается.
+    fn file(&mut self, p: &Path) -> Result<()> {
+        let fh = fs::File::open(p).with_context(|| format!("транскрипт {}", p.display()))?;
+        let mut r = BufReader::new(fh);
+        let mut st = FileState::new(p);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            if r.read_until(b'\n', &mut buf)? == 0 {
+                break;
+            }
+            if buf.len() > LINE_MAX {
+                continue;
+            }
+            if let Ok(l) = serde_json::from_slice::<Line>(&buf) {
+                self.line(&mut st, l);
             }
         }
+        self.end(st);
+        Ok(())
     }
 }
 
@@ -307,43 +403,13 @@ fn jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Учёт файла: строки читаются потоком; битая или слишком длинная строка пропускается.
-fn read_file(p: &Path) -> Result<FileUsage> {
-    let f = fs::File::open(p).with_context(|| format!("транскрипт {}", p.display()))?;
-    let mut r = BufReader::new(f);
-    let mut fu = FileUsage::default();
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        if r.read_until(b'\n', &mut buf)? == 0 {
-            break;
-        }
-        if buf.len() > LINE_MAX {
-            continue;
-        }
-        if let Ok(l) = serde_json::from_slice::<Line>(&buf) {
-            fu.line(l);
-        }
-    }
-    if fu.session.is_none() {
-        fu.session = p.file_stem().map(|s| s.to_string_lossy().into_owned());
-    }
-    Ok(fu)
-}
-
 /// Учёт по сессиям: (usage, число файлов).
 fn transcripts(dir: &Path) -> Result<BTreeMap<String, (Usage, usize)>> {
-    let mut out: BTreeMap<String, (Usage, usize)> = BTreeMap::new();
+    let mut scan = Scan::default();
     for p in jsonl_files(dir)? {
-        let fu = read_file(&p)?;
-        let Some(s) = fu.session.clone() else {
-            continue;
-        };
-        let e = out.entry(s).or_default();
-        e.0.add(&fu.usage());
-        e.1 += 1;
+        scan.file(&p)?;
     }
-    Ok(out)
+    Ok(scan.finish())
 }
 
 /// Память сессии с сервера: (токены по всем событиям, holdout); 404 — `(0, false)`.
@@ -538,14 +604,42 @@ fn load_runs(p: &Path) -> Result<RunsFile> {
     Ok(f)
 }
 
+/// Оценка с интервалом, `prec` знаков; не посчитана (`null`: пустой знаменатель) — «—».
+fn est_p(e: &Value, prec: usize) -> String {
+    match (e["mean"].as_f64(), e["lo"].as_f64(), e["hi"].as_f64()) {
+        (Some(m), Some(lo), Some(hi)) => format!("{m:.prec$} [{lo:.prec$}–{hi:.prec$}]"),
+        _ => "—".to_string(),
+    }
+}
+
 fn est(e: &Value) -> String {
-    let f = |k: &str| e[k].as_f64().unwrap_or(0.0);
-    format!("{:.3} [{:.3}–{:.3}]", f("mean"), f("lo"), f("hi"))
+    est_p(e, 3)
 }
 
 fn est0(e: &Value) -> String {
-    let f = |k: &str| e[k].as_f64().unwrap_or(0.0);
-    format!("{:.0} [{:.0}–{:.0}]", f("mean"), f("lo"), f("hi"))
+    est_p(e, 0)
+}
+
+/// Несогласованность меток и сервера (ревью задачи 12, M3): плечо `holdout` без метки
+/// контрольной группы на сервере, `main` — с ней, у плеча `off` выдача памяти больше 0.
+fn consistency_warnings(rows: &[RunRow]) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in rows {
+        let who = format!("{} {} rep {} ({})", r.task, r.arm, r.rep, r.session);
+        match (r.arm.as_str(), r.holdout, r.memory) {
+            ("holdout", Some(false), _) => {
+                out.push(format!("{who}: плечо holdout, а у сессии holdout = false"))
+            }
+            ("main", Some(true), _) => {
+                out.push(format!("{who}: плечо main, а у сессии holdout = true"))
+            }
+            ("off", _, Some(m)) if m > 0 => {
+                out.push(format!("{who}: плечо off, а память выдала {m} токенов"))
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn markdown(j: &Value) -> String {
@@ -597,11 +691,23 @@ fn markdown(j: &Value) -> String {
     }
     let missing = j["missing"].as_array().cloned().unwrap_or_default();
     if !missing.is_empty() {
-        let ids: Vec<&str> = missing.iter().filter_map(Value::as_str).collect();
-        s.push_str(&format!(
-            "\nнет транскрипта (прогон в отчёте с нулями): {}\n",
-            ids.join(", ")
-        ));
+        s.push_str("\n## Без журнала (в агрегаты не вошли)\n\n");
+        for m in &missing {
+            s.push_str(&format!(
+                "- {} {} rep {}: сессия {}\n",
+                m["task"].as_str().unwrap_or(""),
+                m["arm"].as_str().unwrap_or(""),
+                m["rep"],
+                m["session"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    let warnings = j["warnings"].as_array().cloned().unwrap_or_default();
+    if !warnings.is_empty() {
+        s.push_str("\n## Предупреждения\n\n");
+        for w in warnings.iter().filter_map(Value::as_str) {
+            s.push_str(&format!("- {w}\n"));
+        }
     }
     s
 }
@@ -625,11 +731,14 @@ pub fn main(a: AbArgs) -> Result<()> {
         None => None,
     };
     let mut rows: Vec<RunRow> = Vec::with_capacity(file.run.len());
-    let mut missing = Vec::new();
+    // прогоны без журнала (ревью задачи 12, I3): в агрегаты не входят, перечисляются отдельно
+    let mut missing: Vec<Value> = Vec::new();
     for r in &file.run {
         let (u, n) = usage.get(&r.session).copied().unwrap_or_default();
         if n == 0 {
-            missing.push(r.session.clone());
+            missing.push(json!({"task": r.task, "arm": r.arm, "rep": r.rep,
+                                "session": r.session, "outcome": r.outcome}));
+            continue;
         }
         let mem = match &server {
             Some((ag, url, tok)) => Some(memory_of(ag, url, tok, &r.session)?),
@@ -652,6 +761,18 @@ pub fn main(a: AbArgs) -> Result<()> {
             holdout: mem.map(|m| m.1),
         });
     }
+    if !missing.is_empty() && !a.allow_missing {
+        let ids: Vec<&str> = missing
+            .iter()
+            .filter_map(|m| m["session"].as_str())
+            .collect();
+        bail!(
+            "нет журнала у {} прогонов: {} — проверьте id сессий и --transcripts \
+             (--allow-missing — отчёт без них)",
+            ids.len(),
+            ids.join(", ")
+        );
+    }
     let arms: BTreeSet<String> = rows.iter().map(|r| r.arm.clone()).collect();
     let tasks: BTreeSet<&str> = rows.iter().map(|r| r.task.as_str()).collect();
     let mut arms_j = serde_json::Map::new();
@@ -660,7 +781,7 @@ pub fn main(a: AbArgs) -> Result<()> {
         arms_j.insert(arm.clone(), arm_json(&rs));
     }
     let mut cmp = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = consistency_warnings(&rows);
     for (b, x) in pairs(&file, &arms) {
         match compare_json(&b, &x, &rows) {
             Some(c) => cmp.push(c),
@@ -701,52 +822,92 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
-    #[test]
-    fn claude_dedup_by_message_id_and_tool_blocks() {
-        let mut f = FileUsage::default();
-        let u = r#"{"input_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5,"output_tokens":6}"#;
-        f.line(line(&format!(
-            r#"{{"type":"assistant","sessionId":"s","message":{{"id":"m","usage":{u},"content":[{{"type":"text","text":"x"}}]}}}}"#
-        )));
-        f.line(line(&format!(
-            r#"{{"type":"assistant","sessionId":"s","message":{{"id":"m","usage":{u},"content":[{{"type":"tool_use","name":"Bash","input":{{}}}}]}}}}"#
-        )));
-        f.line(line(
-            r#"{"type":"user","sessionId":"s","message":{"role":"user","content":"строка"}}"#,
-        ));
-        let got = f.usage();
-        assert_eq!(f.session.as_deref(), Some("s"));
-        assert_eq!(
-            got,
-            Usage {
-                input: 3,
-                cache_read: 4,
-                cache_creation: 5,
-                output: 6,
-                tool_calls: 1
-            }
-        );
-        assert_eq!(got.total(), 18);
+    /// Строки одного «файла» `name`.
+    fn scan_file(scan: &mut Scan, name: &str, lines: &[String]) {
+        let mut f = FileState::new(Path::new(name));
+        for l in lines {
+            scan.line(&mut f, line(l));
+        }
+        scan.end(f);
     }
 
+    fn claude(session: &str, msg: &str, out: u64, block: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"{session}","message":{{"id":"{msg}","usage":{{"input_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5,"output_tokens":{out}}},"content":[{{"type":"{block}","text":"x"}}]}}}}"#
+        )
+    }
+
+    /// Сообщение — один раз на (сессию, id) по всему каталогу; строка относится к своей
+    /// `sessionId`, а не к сессии файла.
     #[test]
-    fn codex_last_total_minus_cache() {
-        let mut f = FileUsage::default();
-        f.line(line(r#"{"type":"session_meta","payload":{"id":"c1"}}"#));
-        f.line(line(
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":2}}}}"#,
-        ));
-        f.line(line(
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
-        ));
-        f.line(line(
-            r#"{"type":"response_item","payload":{"type":"local_shell_call"}}"#,
-        ));
-        let u = f.usage();
-        assert_eq!(f.session.as_deref(), Some("c1"));
+    fn claude_dedup_by_session_and_message_id() {
+        let mut sc = Scan::default();
+        scan_file(
+            &mut sc,
+            "a.jsonl",
+            &[
+                claude("s", "m", 6, "text"),
+                claude("s", "m", 6, "tool_use"),
+                r#"{"type":"user","sessionId":"s","message":{"role":"user","content":"строка"}}"#
+                    .to_string(),
+                // чужая сессия в том же файле
+                claude("t", "m", 1, "text"),
+            ],
+        );
+        // то же сообщение в другом файле (копия журнала, resume) — не повторяется
+        scan_file(&mut sc, "b.jsonl", &[claude("s", "m", 6, "text")]);
+        let got = sc.finish();
         assert_eq!(
-            (u.input, u.cache_read, u.output, u.tool_calls),
-            (6, 4, 2, 1)
+            got["s"],
+            (
+                Usage {
+                    input: 3,
+                    cache_read: 4,
+                    cache_creation: 5,
+                    output: 6,
+                    tool_calls: 1
+                },
+                2
+            )
+        );
+        assert_eq!(got["s"].0.total(), 18);
+        assert_eq!(got["t"].0.output, 1);
+        assert_eq!(got["t"].1, 1);
+    }
+
+    /// Codex: последний итог файла, вход без кэша; `info: null` итог не сбрасывает; итоги двух
+    /// файлов одной сессии складываются.
+    #[test]
+    fn codex_last_total_per_file_minus_cache() {
+        let tc = |i: u64, c: u64, o: u64| {
+            format!(
+                r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{i},"cached_input_tokens":{c},"output_tokens":{o}}}}}}}}}"#
+            )
+        };
+        let mut sc = Scan::default();
+        scan_file(
+            &mut sc,
+            "rollout-1.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"c1"}}"#.to_string(),
+                tc(5, 1, 1),
+                tc(10, 4, 2),
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#.to_string(),
+                r#"{"type":"response_item","payload":{"type":"local_shell_call"}}"#.to_string(),
+            ],
+        );
+        scan_file(
+            &mut sc,
+            "rollout-2.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"c1"}}"#.to_string(),
+                tc(3, 0, 1),
+            ],
+        );
+        let u = sc.finish()["c1"];
+        assert_eq!(
+            (u.0.input, u.0.cache_read, u.0.output, u.0.tool_calls, u.1),
+            (9, 4, 3, 1, 2)
         );
     }
 
@@ -766,5 +927,45 @@ mod tests {
             [("a".to_string(), "b".to_string())]
         );
         assert!(pairs(&f, &arms(&["a", "b", "c"])).is_empty());
+    }
+
+    /// Не посчитанная оценка (`null`) — «—», а не 0.
+    #[test]
+    fn est_null_is_dash() {
+        assert_eq!(est(&Value::Null), "—");
+        assert_eq!(est0(&json!({"mean": 1.4, "lo": 1.0, "hi": 2.0})), "1 [1–2]");
+    }
+
+    /// Предупреждения: `holdout` без метки, `main` с меткой, `off` с памятью.
+    #[test]
+    fn consistency_warned() {
+        let row = |arm: &str, holdout: Option<bool>, memory: Option<u64>| RunRow {
+            task: "t1".into(),
+            arm: arm.into(),
+            rep: 1,
+            session: format!("s-{arm}"),
+            outcome: Outcome::Pass,
+            transcripts: 1,
+            input: 0,
+            cache_read: 0,
+            cache_creation: 0,
+            output: 0,
+            total: 0,
+            tool_calls: 0,
+            memory,
+            holdout,
+        };
+        let w = consistency_warnings(&[
+            row("holdout", Some(false), Some(0)),
+            row("main", Some(true), Some(5)),
+            row("off", Some(false), Some(7)),
+            row("off", Some(false), Some(0)),
+            row("holdout", Some(true), Some(0)),
+            row("memory", None, None),
+        ]);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].contains("плечо holdout"), "{w:?}");
+        assert!(w[1].contains("плечо main"), "{w:?}");
+        assert!(w[2].contains("плечо off") && w[2].contains("7"), "{w:?}");
     }
 }

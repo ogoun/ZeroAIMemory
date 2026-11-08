@@ -3928,7 +3928,7 @@ fn project_hooks(p: &Proj, body: &str) {
 /// §12: `hooks.checkpoint_impact = true` — до 3 строк «правка затрагивает `<путь>` → i:<id> «…»»
 /// **внутри** единственного напоминания `Stop` (одно `decision: block`, второго нет); сами строки
 /// напоминания не вызывают (в память уже писали — тишина); ключ выключен — строк нет; сессия
-/// контрольной группы (`holdout` в `GET /sessions/{id}`) — строк нет.
+/// контрольной группы (`holdout` в `GET /sessions/{id}`) — тишина целиком (маркер).
 #[test]
 fn checkpoint_impact_lines_inside_single_reminder() {
     let _g = serial();
@@ -4010,7 +4010,8 @@ fn checkpoint_impact_lines_inside_single_reminder() {
         .unwrap();
     ok(&o);
     assert_eq!(stop("ci-2"), Value::Null, "{}", p.log());
-    // контрольная группа: строк нет, напоминание — как обычно
+    // контрольная группа (ревью задачи 12, I4): ответ `GET /sessions/{id}` с `holdout` ставит
+    // маркер — ни строк влияния, ни самого напоминания
     let r = http()
         .post(&format!("{url}/api/v1/sessions"))
         .header("Authorization", format!("Bearer {tok}"))
@@ -4019,9 +4020,8 @@ fn checkpoint_impact_lines_inside_single_reminder() {
         .unwrap();
     assert_eq!(r.status(), 201);
     edit("ci-3");
-    let v = stop("ci-3");
-    assert_eq!(v["decision"], "block", "{v}");
-    assert!(!v["reason"].as_str().unwrap().contains(IMPACT_MARK), "{v}");
+    assert_eq!(stop("ci-3"), Value::Null, "{}", p.log());
+    assert!(p.session_file("holdout", "ci-3", "").is_some());
     // ключ выключен (по умолчанию): строк нет
     project_hooks(&p, "");
     edit("ci-4");
@@ -4097,6 +4097,46 @@ fn checkpoint_impact_timeout_60ms_no_lines() {
         "{sent:?}"
     );
     assert!(p.log().contains("code/impact"), "{}", p.log());
+    // журнал выключен (ревью задачи 12, M5): путь — из очереди изменённых, прочитанной потоком
+    // влияния до её отправки тем же `checkpoint`
+    project_hooks(
+        &p,
+        "checkpoint_impact = true
+session_journal = false",
+    );
+    let ev = post_ok(
+        &p,
+        "cs-2",
+        "Edit",
+        json!({"file_path": p.repo.join("src/pool.rs"), "old_string": "a", "new_string": "b"}),
+    );
+    ok(&p
+        .hook_at(DEAD, "post-tool", "claude", ev.to_string().as_bytes())
+        .0);
+    assert_eq!(queue(&p, "cs-2").len(), 1);
+    let stop = p.ev("Stop", "cs-2", json!({"stop_hook_active": false}));
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+        .args(["hook", "checkpoint", "--agent", "claude"])
+        .write_stdin(stop.to_string().into_bytes());
+    assert_eq!(hook_json(&c.output().unwrap())["decision"], "block");
+    let sent = seen.lock().unwrap().clone();
+    let imp: Vec<&Value> = sent
+        .iter()
+        .filter(|(m, path, _)| m == "POST" && path == "/api/v1/code/impact")
+        .map(|(_, _, b)| b)
+        .collect();
+    assert_eq!(imp.len(), 2, "{sent:?}");
+    assert_eq!(
+        imp[1]["files"],
+        json!([{"path": "src/pool.rs"}]),
+        "{sent:?}"
+    );
+    assert!(
+        sent.iter()
+            .any(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed"),
+        "очередь отправлена: {sent:?}"
+    );
 }
 
 /// §12: `hooks.holdout = p` — `session-start` ставит сессии «тихий» режим (решение по хэшу id,
@@ -4130,7 +4170,10 @@ fn session_start_holdout_quiet_group() {
     for i in 0..16 {
         let s = format!("hd-{i}");
         let o = ss(&s, "startup");
-        if p.session(&s)["holdout"] == true {
+        let held = p.session(&s)["holdout"] == true;
+        // группа — та, что даёт `holdout_pick` хука (ревью задачи 12, M7)
+        assert_eq!(held, common::holdout_pick(&s, 0.5), "{s}");
+        if held {
             empty(&o);
             quiet.push(s);
         } else {
@@ -4225,5 +4268,168 @@ fn session_start_holdout_old_server_400_ignored() {
     assert!(
         !log.contains("holdout"),
         "400 старого сервера — молча: {log}"
+    );
+}
+
+/// Копия `holdout_pick` в `tests/common` совпадает с функцией хука: те же закреплённые значения,
+/// что в юнит-тесте `holdout_pick_share_and_determinism` (ревью задачи 12, M7).
+#[test]
+fn holdout_pick_copy_pinned() {
+    let pinned: Vec<bool> = (0..8)
+        .map(|i| common::holdout_pick(&format!("pin-{i}"), 0.5))
+        .collect();
+    assert_eq!(pinned, PINNED_HOLDOUT, "{pinned:?}");
+}
+
+/// `holdout_pick("pin-0".."pin-7", 0.5)` — как `PINNED_HOLDOUT` юнит-теста `session_start`.
+const PINNED_HOLDOUT: [bool; 8] = [false, true, true, true, false, true, true, false];
+
+/// Ревью задачи 12, I1: в сессии контрольной группы сервер отдаёт `items: []`, и локальные
+/// совпадения `error_regex` кэша триггеров не должны выйти агенту — ответ с `holdout: true`
+/// гасит и их, и строку петли; маркер сессии ставится. Обычная сессия — локальная подсказка.
+#[test]
+fn post_tool_error_regex_silent_in_holdout() {
+    let _g = serial();
+    let (url, tok) = start("pt-holdout");
+    let p = Proj::new("pt-holdout", &url, &tok);
+    write_cache(&p, &url);
+    let r = http()
+        .post(&format!("{url}/api/v1/sessions"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .content_type("application/json")
+        .send(r#"{"id":"ph-1","holdout":true}"#)
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let ev = |s: &str| {
+        p.ev(
+            "PostToolUseFailure",
+            s,
+            json!({"tool_name": "Bash", "tool_input": {"command": "./deploy.sh"},
+                   "error": "/bin/bash^M: bad interpreter: No such file or directory"}),
+        )
+    };
+    // обычная сессия: локальное совпадение `error_regex` из кэша
+    let c = context(
+        &hook_slow(&p, &url, "post-tool", &ev("ph-0")),
+        "PostToolUseFailure",
+    );
+    assert!(c.contains("CRLF в shebang [gotcha·th] i:E3"), "{c}");
+    // контрольная группа: тишина — и при третьем повторе (строка петли)
+    assert!(p.session_file("holdout", "ph-1", "").is_none());
+    for _ in 0..3 {
+        empty(&hook_slow(&p, &url, "post-tool", &ev("ph-1")));
+    }
+    assert!(
+        p.session_file("holdout", "ph-1", "").is_some(),
+        "маркер контрольной группы"
+    );
+    assert_eq!(
+        events(&p, "ph-1")
+            .iter()
+            .filter(|e| e["ev"] == "error")
+            .count(),
+        3,
+        "журнал ведётся"
+    );
+}
+
+/// Ревью задачи 12, I4: сессия контрольной группы (маркер `holdout-<сессия>` от `session-start`)
+/// молчит во **всех** хуках, включая локальный вывод без сети: `pre-tool` (триггер `file_glob`),
+/// `post-tool` `Read` (знание о файле), `checkpoint` (напоминание `Stop`); учёта локального
+/// вывода нет (очереди `tokens-…` нет), журнал сессии ведётся. Сессия вне группы — всё как
+/// обычно.
+#[test]
+fn holdout_marker_silences_all_hooks() {
+    let _g = serial();
+    let (url, tok) = start("holdout-marker");
+    let p = Proj::new("holdout-marker", &url, &tok);
+    project_hooks(&p, "holdout = 0.5");
+    let quiet = common::holdout_session("hm", 0.5, true);
+    let loud = common::holdout_session("hm", 0.5, false);
+    for s in [&quiet, &loud] {
+        let ev = p.ev("SessionStart", s, json!({"source": "startup"}));
+        ok(&hook_slow(&p, &url, "session-start", &ev));
+    }
+    assert!(p.session_file("holdout", &quiet, "").is_some());
+    assert!(p.session_file("holdout", &loud, "").is_none());
+    // кэши — после старта (старт перезаписывает их ответом сервера)
+    write_cache(&p, &url);
+    write_file_refs(&p, &url);
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), b"pub fn pool() {}\n").unwrap();
+    let pre = |s: &str| hook_slow(&p, &url, "pre-tool", &write_ev(&p, s, "deploy.sh"));
+    let read = |s: &str| {
+        let ev = post_ok(
+            &p,
+            s,
+            "Read",
+            json!({"file_path": p.repo.join("src/pool.rs")}),
+        );
+        hook_slow(&p, &url, "post-tool", &ev)
+    };
+    let stop = |s: &str| {
+        let ev = p.ev("Stop", s, json!({"stop_hook_active": false}));
+        hook_slow(&p, &url, "checkpoint", &ev)
+    };
+    // вне группы — подсказки и напоминание
+    assert!(context(&pre(&loud), "PreToolUse").contains("Скрипты — только LF"));
+    assert!(context(&read(&loud), "PostToolUse").contains("Пул соединений течёт"));
+    assert_eq!(hook_json(&stop(&loud))["decision"], "block");
+    // в группе — тишина везде
+    empty(&pre(&quiet));
+    empty(&read(&quiet));
+    empty(&stop(&quiet));
+    assert!(
+        p.session_file("tokens", &quiet, ".jsonl").is_none(),
+        "локальный вывод не учитывается"
+    );
+    let ev = events(&p, &quiet);
+    assert!(
+        ev.iter().any(|e| e["ev"] == "read"),
+        "журнал ведётся: {ev:?}"
+    );
+}
+
+/// Ревью задачи 12, I2: метка `POST /sessions {holdout}` и `/recall` старта не складывают свои
+/// сроки — у метки свой срок 100 мс, `/recall` — новым клиентом по остатку бюджета 300 мс.
+/// Заглушка не отвечает ни на то, ни на другое: хук укладывается в бюджет с запасом на запуск
+/// процесса, а не в сумму двух сроков (~540 мс).
+#[test]
+fn session_start_holdout_within_budget() {
+    let _g = serial();
+    let (url, seen) = common::stub_body(std::sync::Arc::new(
+        |m: &str, path: &str, _: usize, b: &Value| {
+            let slow = (m == "POST" && path == "/api/v1/sessions" && b.get("holdout").is_some())
+                || path == "/api/v1/recall";
+            let delay = if slow {
+                Duration::from_millis(1500)
+            } else {
+                Duration::ZERO
+            };
+            (200, r#"{"id":"x"}"#.to_string(), delay)
+        },
+    ));
+    let p = Proj::new("ss-holdout-budget", &url, "zam_x");
+    project_hooks(&p, "holdout = 0.5");
+    let s = common::holdout_session("hb", 0.5, true);
+    let ev = p.ev("SessionStart", &s, json!({"source": "startup"}));
+    // прогрев процесса (первый запуск отладочного бинарника — с диска)
+    let _ = p.hook_at(&url, "session-start", "claude", ev.to_string().as_bytes());
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let (o, d) = p.hook_at(&url, "session-start", "claude", ev.to_string().as_bytes());
+        ok(&o);
+        times.push(d);
+    }
+    let best = *times.iter().min().unwrap();
+    assert!(
+        best < Duration::from_millis(450),
+        "session-start {times:?}: метка и /recall сложили сроки"
+    );
+    let sent = seen.lock().unwrap().clone();
+    assert!(
+        sent.iter()
+            .any(|(_, path, b)| path == "/api/v1/sessions" && b.get("holdout").is_some()),
+        "{sent:?}"
     );
 }
