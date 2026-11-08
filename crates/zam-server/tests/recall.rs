@@ -578,6 +578,32 @@ async fn post_tool_matches_error_regex_and_fts() {
 }
 
 /// Подсказка `session_start`/`prompt` показывается сессии один раз (в другой сессии — снова),
+/// Цена умолчания M6 `{2, 6, plain}` (сетка задачи 9, повторное ревью M-c): ошибка docker
+/// совпадает с записью 2 словами из 6 (`permission`, `denied`), а нужно ⌈6/2⌉ = 3 — подсказки
+/// нет; при правиле M4 (⌈6/3⌉ = 2) — была (тест выше).
+#[tokio::test]
+async fn post_tool_default_needs_half_of_words() {
+    let a = server("post-tool-m6").await;
+    let docker = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Нет доступа к docker",
+        "permission denied при подключении к docker: добавь пользователя в группу docker",
+        "failure",
+    )
+    .await;
+    let err = "dial unix /var/run/docker.sock: connect: permission denied (code 13)";
+    let j = ok(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "post_tool", "tool": "Bash", "error": err}),
+    )
+    .await;
+    assert!(!ids(&j).contains(&format!("i:{docker}")), "{j}");
+}
+
 /// `post_tool` — при каждой ошибке; без сессии повторы не учитываются.
 #[tokio::test]
 async fn recall_no_repeat_in_session_except_post_tool() {
