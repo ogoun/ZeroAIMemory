@@ -85,7 +85,8 @@ pub struct State {
     pub ok_at: u64,
     /// Формат журнала (`claude` | `codex`).
     pub agent: String,
-    /// Повод последнего удавшегося снимка (опоздавшая попытка его не меняет).
+    /// Повод последнего удавшегося снимка (опоздавшая попытка его не меняет); пустая строка —
+    /// удавшихся снимков не было (только опоздавшие попытки, `ok_at == 0`).
     pub trigger: String,
     /// Пришёл `SessionEnd`: сессия закончилась, догоняющий снимок ей не нужен.
     #[serde(default)]
@@ -571,9 +572,10 @@ pub fn flush(env: &Env, session: &str) -> Option<Sent> {
     if item.old_server >= OLD_SERVER_ATTEMPTS {
         return None;
     }
-    if env.http_left().is_none_or(|d| d < cache::FLUSH_MIN_LEFT) {
-        return None;
-    }
+    let left = env.http_left().filter(|d| *d >= cache::FLUSH_MIN_LEFT)?;
+    // фактический срок клиента — меньшее из своего срока `PUT` и остатка бюджета хука (у
+    // `checkpoint` остаток бывает меньше 60 мс): с ним и сравнивается опоздание
+    let limit = left.min(Duration::from_millis(put_ms()));
     let mut client = env.client_within(Duration::from_millis(put_ms()))?;
     client.set_session(Some(item.session.clone()));
     let path = format!("/sessions/{}/snapshot", encode_segment(&item.session));
@@ -623,11 +625,8 @@ pub fn flush(env: &Env, session: &str) -> Option<Sent> {
             ))
         }
         // сеть: ответа нет за свой срок — отдельная причина (вечная очередь видна в журнале)
-        Err(e)
-            if e.http_status().is_none()
-                && spent + PUT_LATE_SLACK >= Duration::from_millis(put_ms()) =>
-        {
-            Sent::Queued(format!("срок PUT {} мс", put_ms()))
+        Err(e) if e.http_status().is_none() && spent + PUT_LATE_SLACK >= limit => {
+            Sent::Queued(format!("срок PUT {} мс", limit.as_millis()))
         }
         Err(e) => Sent::Queued(short(&e)),
     })
