@@ -359,7 +359,10 @@ impl Client {
     }
 
     /// POST тела потоком неизвестной длины (chunked): архив каталога `zam import` собирается на
-    /// лету, без временного файла.
+    /// лету, без временного файла. `Expect: 100-continue`: ureq читает ответ сервера только
+    /// после всего тела, а отказ до приёма (413, 503, 507, 404 старого сервера) так приходит
+    /// до тела — тело не уходит, и ответ не теряется в обрыве записи. Сервер молчит дольше
+    /// срока ожидания ureq (1 с) — тело уходит как обычно.
     pub fn send_stream(
         &self,
         path: &str,
@@ -368,7 +371,8 @@ impl Client {
     ) -> Result<Response<Body>, CliError> {
         let rb = self
             .prepare(self.agent.post(&self.url(path)))
-            .header("Content-Type", content_type);
+            .header("Content-Type", content_type)
+            .header("Expect", "100-continue");
         self.check(rb.send(ureq::SendBody::from_owned_reader(reader)))
     }
 

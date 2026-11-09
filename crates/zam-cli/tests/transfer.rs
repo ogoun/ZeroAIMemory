@@ -43,6 +43,15 @@ fn start_with(
     name: &str,
     tweak: impl FnOnce(&mut ServerConfig) + Send + 'static,
 ) -> (String, String) {
+    let (url, tok, _) = start_state(name, tweak);
+    (url, tok)
+}
+
+/// Как [`start_with`], плюс состояние сервера (аудит, задания).
+fn start_state(
+    name: &str,
+    tweak: impl FnOnce(&mut ServerConfig) + Send + 'static,
+) -> (String, String, zam_server::AppState) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -55,8 +64,6 @@ fn start_with(
                 data_dir: data,
                 ..ServerConfig::default()
             };
-            // запас 5 % диска на почти полном диске разработчика отверг бы импорт
-            cfg.import.min_free_percent = 0;
             tweak(&mut cfg);
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
@@ -79,7 +86,7 @@ fn start_with(
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            tx.send((url, t)).unwrap();
+            tx.send((url, t, st.clone())).unwrap();
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -485,6 +492,176 @@ fn cli_import_http_error_beats_broken_pipe() {
     assert_eq!(o.status.code(), Some(6), "{}", stderr(&o));
     assert!(stderr(&o).contains("HTTP 413"), "{}", stderr(&o));
     assert!(!stderr(&o).contains("упаковка"), "{}", stderr(&o));
+}
+
+/// Заглушка: читает заголовки (`expect` — запоминает, был ли `Expect: 100-continue`), затем
+/// `head` байт тела, отвечает `answer` и, не дочитав тело, держит соединение `hold`.
+fn stub_early(
+    answer: String,
+    head: usize,
+    hold: Duration,
+) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let expect = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = expect.clone();
+    std::thread::spawn(move || {
+        let Some(c) = l.incoming().flatten().next() else {
+            return;
+        };
+        let mut r = BufReader::new(c.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if line
+                .to_ascii_lowercase()
+                .starts_with("expect: 100-continue")
+            {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut body = vec![0u8; head];
+        let _ = r.read_exact(&mut body);
+        let mut c = c;
+        let _ = c.write_all(answer.as_bytes());
+        let _ = c.flush();
+        std::thread::sleep(hold);
+    });
+    (url, expect)
+}
+
+/// Плохо сжимаемый текст `n` байт (после deflate почти не меньше).
+fn noise(n: usize) -> String {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'a' + (x % 26) as u8)
+        })
+        .collect()
+}
+
+const ANSWER_503: &str = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/problem+json\r\n\
+     Retry-After: 7\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+/// Каталог `big` с 32 МиБ плохо сжимаемого текста (тело больше дочитывания сервера).
+fn big_repo(name: &str) -> PathBuf {
+    let r = tmp(name);
+    let src = r.join("big");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("big.md"), noise(32 << 20)).unwrap();
+    r
+}
+
+/// «Ответ сервера важнее `BrokenPipe`»: сервер ответил 503 до тела (на `Expect:
+/// 100-continue`) и тело не читает — упаковщик ловит `BrokenPipe`, но показывается ответ
+/// сервера (HTTP 503 с Retry-After), а не обрыв приёма или упаковка.
+#[test]
+fn cli_import_server_answer_beats_broken_pipe_stub() {
+    let (url, expect) = stub_early(ANSWER_503.to_string(), 0, Duration::from_secs(3));
+    let r = big_repo("imp-503-stub-repo");
+    let o = zam_idle(&url, &r, "30", &["import", "big", "--space", "knowledge"]);
+    let e = stderr(&o);
+    assert!(
+        expect.load(std::sync::atomic::Ordering::SeqCst),
+        "нет Expect: {e}"
+    );
+    assert!(e.contains("HTTP 503"), "{e}");
+    assert!(e.contains("7"), "Retry-After: {e}");
+    assert!(!e.contains("упаковка"), "{e}");
+    assert!(!e.contains("прервал"), "{e}");
+    assert!(!e.contains("ZipWriter"), "шум упаковщика: {e}");
+}
+
+/// Сервер прочёл несколько КиБ тела, ответил 503 и не дочитал: ureq читает ответ только после
+/// всего тела, запись обрывается — CLI показывает подсказку об обрыве приёма, не упаковку.
+#[test]
+fn cli_import_server_cut_mid_body_hint_stub() {
+    let (url, _) = stub_early(ANSWER_503.to_string(), 8 << 10, Duration::from_secs(3));
+    let r = big_repo("imp-503-cut-repo");
+    let o = zam_idle(&url, &r, "30", &["import", "big", "--space", "knowledge"]);
+    let e = stderr(&o);
+    assert_eq!(o.status.code(), Some(2), "{e}");
+    assert!(e.contains("сервер прервал приём архива"), "{e}");
+    assert!(!e.contains("упаковка"), "{e}");
+}
+
+/// Настоящий сервер, отказ до приёма (507: точка `import_disk_full`), тело 32 МиБ больше
+/// дочитывания: с `Expect` ответ приходит до тела — CLI показывает HTTP 507.
+#[test]
+fn cli_import_refusal_before_body_shown() {
+    let (url, tok, st) = start_state("imp-507", |_| {});
+    zam_server::backup::test_hooks::set_fail_point(&st.cfg.data_dir, Some("import_disk_full"));
+    let r = big_repo("imp-507-repo");
+    let o = zam(&url, &tok, &r, &["import", "big", "--space", "knowledge"]);
+    zam_server::backup::test_hooks::set_fail_point(&st.cfg.data_dir, None);
+    let e = stderr(&o);
+    assert!(e.contains("HTTP 507"), "{e}");
+    assert!(!e.contains("прервал"), "{e}");
+}
+
+/// Сбой упаковщика (файл каталога не открыть) — не нормальный конец тела: ureq обрывает
+/// запрос, сервер не принимает задание (аудит `reason: client`), CLI показывает причину
+/// упаковки.
+#[test]
+fn cli_import_pack_failure_aborts_body() {
+    let (url, tok, st) = start_state("imp-packfail", |_| {});
+    let r = tmp("imp-packfail-repo");
+    let src = r.join("notes");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.md"), noise(4 << 20)).unwrap();
+    let locked = src.join("z.md");
+    std::fs::write(&locked, "закрытый").unwrap();
+    // файл не открыть: Windows — без общего доступа, Unix — без прав чтения
+    #[cfg(windows)]
+    let _lock = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap()
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&locked).is_ok() {
+            eprintln!("права не ограничивают чтение (root) — тест пропущен");
+            return;
+        }
+    }
+    let o = zam(&url, &tok, &r, &["import", "notes", "--space", "knowledge"]);
+    let e = stderr(&o);
+    assert_ne!(o.status.code(), Some(0), "{e}");
+    assert!(e.contains("упаковка каталога"), "{e}");
+    assert!(e.contains("z.md"), "{e}");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let t0 = std::time::Instant::now();
+        loop {
+            let rows = st.system.list_audit(100, None).await.unwrap();
+            if let Some(d) = rows.iter().find(|r| r.action == "space.import.done") {
+                assert_eq!(d.details["reason"], "client", "{:?}", d.details);
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "нет аудита done: {:?}",
+                rows.iter().map(|r| &r.action).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    assert_eq!(st.imports.running(), 0);
 }
 
 /// Две разные папки с одинаковыми файлами не делят id: вторая — конфликт `path-taken`, а не

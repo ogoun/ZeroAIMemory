@@ -398,30 +398,116 @@ fn dir_files(root: &Path) -> std::io::Result<DirFiles> {
     Ok((out, hidden))
 }
 
+/// Тело запроса из канала упаковщика. Сбой упаковки — ошибка чтения, а не конец потока: ureq
+/// обрывает запрос, и сервер не примет усечённый архив (`ZipWriter` при уничтожении дописывает
+/// оглавление — без этой обёртки обрезанный архив выглядел бы целым).
+struct PackReader {
+    r: std::io::PipeReader,
+    /// Причина сбоя упаковщика: записывается до закрытия канала.
+    fail: Arc<std::sync::Mutex<Option<String>>>,
+    /// Сбой отдан ureq как ошибка чтения (иначе обрыв начал сервер).
+    reported: Arc<AtomicBool>,
+}
+
+impl PackReader {
+    fn failed(&self) -> std::io::Result<()> {
+        match &*self.fail.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(m) => {
+                self.reported.store(true, Ordering::SeqCst);
+                Err(std::io::Error::other(format!("упаковка каталога: {m}")))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+impl Read for PackReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.failed()?;
+        let n = self.r.read(buf)?;
+        if n == 0 {
+            // конец канала: упаковщик закончил или упал (причина записана до закрытия)
+            self.failed()?;
+        }
+        Ok(n)
+    }
+}
+
+/// Выход упаковщика в канал. После сбоя упаковки — «мёртвый»: записи выбрасываются, и
+/// `ZipWriter` при уничтожении не дописывает оглавление в канал и не шумит в stderr о
+/// `BrokenPipe`.
+struct PipeOut {
+    w: std::io::PipeWriter,
+    dead: Arc<AtomicBool>,
+}
+
+impl Write for PipeOut {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.dead.load(Ordering::SeqCst) {
+            return Ok(buf.len());
+        }
+        self.w.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.dead.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.w.flush()
+    }
+}
+
+/// Упаковщик каталога: итог и признак «сбой отдан ureq как ошибка чтения тела».
+struct Packer {
+    h: std::thread::JoinHandle<Result<(), String>>,
+    reported: Arc<AtomicBool>,
+}
+
 /// Архив каталога потоком (поток-упаковщик пишет zip в канал, тело запроса читает его):
-/// временного файла нет — прерванный `zam` ничего не оставляет. Ошибка упаковки — итог потока.
-fn pack_stream(
-    files: Vec<(String, PathBuf)>,
-) -> std::io::Result<(
-    std::io::PipeReader,
-    std::thread::JoinHandle<Result<(), String>>,
-)> {
+/// временного файла нет — прерванный `zam` ничего не оставляет. Ошибка упаковки — итог потока
+/// и ошибка чтения тела ([`PackReader`]).
+fn pack_stream(files: Vec<(String, PathBuf)>) -> std::io::Result<(PackReader, Packer)> {
     let (r, w) = std::io::pipe()?;
+    let fail = Arc::new(std::sync::Mutex::new(None));
+    let reported = Arc::new(AtomicBool::new(false));
+    let fail_w = fail.clone();
+    let dead = Arc::new(AtomicBool::new(false));
+    let out = PipeOut {
+        w,
+        dead: dead.clone(),
+    };
     let h = std::thread::spawn(move || -> Result<(), String> {
-        let mut z = zip::ZipWriter::new_stream(w);
+        let mut z = zip::ZipWriter::new_stream(out);
         let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .large_file(true);
-        for (rel, p) in &files {
-            z.start_file(rel.as_str(), opts)
-                .map_err(|e| format!("zip: {e}"))?;
-            let mut src = File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            std::io::copy(&mut src, &mut z).map_err(|e| format!("{}: {e}", p.display()))?;
+        let mut pack = || -> Result<(), String> {
+            for (rel, p) in &files {
+                z.start_file(rel.as_str(), opts)
+                    .map_err(|e| format!("zip: {e}"))?;
+                let mut src = File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+                std::io::copy(&mut src, &mut z).map_err(|e| format!("{}: {e}", p.display()))?;
+            }
+            Ok(())
+        };
+        if let Err(m) = pack() {
+            // причина — до закрытия канала: читатель на конце потока увидит её
+            *fail_w.lock().unwrap_or_else(|e| e.into_inner()) = Some(m.clone());
+            dead.store(true, Ordering::SeqCst);
+            drop(z);
+            return Err(m);
         }
         z.finish().map_err(|e| format!("zip: {e}"))?;
         Ok(())
     });
-    Ok((r, h))
+    Ok((
+        PackReader {
+            r,
+            fail,
+            reported: reported.clone(),
+        },
+        Packer { h, reported },
+    ))
 }
 
 /// Предел отсутствия хода: `ZAM_IMPORT_IDLE_SECS` (целое > 0), иначе [`IMPORT_IDLE_DEFAULT`].
@@ -611,7 +697,11 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
     };
     // ответ сервера с ошибкой (413, 503 с Retry-After…) важнее: упаковщик при этом ловит
     // BrokenPipe — сервер перестал читать тело
-    let packed = packer.map(|h| h.join());
+    // сбой упаковки отдан ureq как ошибка чтения тела — показывается причина упаковки
+    let pack_failed = packer
+        .as_ref()
+        .is_some_and(|p| p.reported.load(Ordering::SeqCst));
+    let packed = packer.map(|p| p.h.join());
     if let Err(e) = &sent
         && e.http_status().is_some()
     {
@@ -630,6 +720,7 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
     // сервер оборвал приём, не дав ответа (тело сильно больше предела): ошибка запроса — с
     // подсказкой, а не «упаковка каталога»
     if let Err(e) = &sent
+        && !pack_failed
         && matches!(packed, Some(Ok(Err(_))))
     {
         return Err(CliError::new(
