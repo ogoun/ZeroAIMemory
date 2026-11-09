@@ -65,6 +65,8 @@ fn start_state(
                 ..ServerConfig::default()
             };
             tweak(&mut cfg);
+            // место на диске раннера не влияет: свободное место подменено (1 ТиБ)
+            zam_server::backup::test_hooks::set_free_space(&cfg.data_dir, Some(1 << 40));
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
             let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
@@ -495,10 +497,12 @@ fn cli_import_http_error_beats_broken_pipe() {
 }
 
 /// Заглушка: читает заголовки (`expect` — запоминает, был ли `Expect: 100-continue`), затем
-/// `head` байт тела, отвечает `answer` и, не дочитав тело, держит соединение `hold`.
+/// `head` байт тела, через `delay` отвечает `answer` и, не дочитав тело, держит соединение
+/// `hold`.
 fn stub_early(
     answer: String,
     head: usize,
+    delay: Duration,
     hold: Duration,
 ) -> (String, Arc<std::sync::atomic::AtomicBool>) {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -525,6 +529,7 @@ fn stub_early(
         }
         let mut body = vec![0u8; head];
         let _ = r.read_exact(&mut body);
+        std::thread::sleep(delay);
         let mut c = c;
         let _ = c.write_all(answer.as_bytes());
         let _ = c.flush();
@@ -559,11 +564,17 @@ fn big_repo(name: &str) -> PathBuf {
 }
 
 /// «Ответ сервера важнее `BrokenPipe`»: сервер ответил 503 до тела (на `Expect:
-/// 100-continue`) и тело не читает — упаковщик ловит `BrokenPipe`, но показывается ответ
-/// сервера (HTTP 503 с Retry-After), а не обрыв приёма или упаковка.
+/// 100-continue`, через 2 с — дольше 1 с ожидания ureq по умолчанию) и тело не читает —
+/// упаковщик ловит `BrokenPipe`, но показывается ответ сервера (HTTP 503 с Retry-After), а не
+/// обрыв приёма или упаковка.
 #[test]
 fn cli_import_server_answer_beats_broken_pipe_stub() {
-    let (url, expect) = stub_early(ANSWER_503.to_string(), 0, Duration::from_secs(3));
+    let (url, expect) = stub_early(
+        ANSWER_503.to_string(),
+        0,
+        Duration::from_secs(2),
+        Duration::from_secs(3),
+    );
     let r = big_repo("imp-503-stub-repo");
     let o = zam_idle(&url, &r, "30", &["import", "big", "--space", "knowledge"]);
     let e = stderr(&o);
@@ -582,7 +593,12 @@ fn cli_import_server_answer_beats_broken_pipe_stub() {
 /// всего тела, запись обрывается — CLI показывает подсказку об обрыве приёма, не упаковку.
 #[test]
 fn cli_import_server_cut_mid_body_hint_stub() {
-    let (url, _) = stub_early(ANSWER_503.to_string(), 8 << 10, Duration::from_secs(3));
+    let (url, _) = stub_early(
+        ANSWER_503.to_string(),
+        8 << 10,
+        Duration::ZERO,
+        Duration::from_secs(3),
+    );
     let r = big_repo("imp-503-cut-repo");
     let o = zam_idle(&url, &r, "30", &["import", "big", "--space", "knowledge"]);
     let e = stderr(&o);
@@ -662,6 +678,48 @@ fn cli_import_pack_failure_aborts_body() {
         }
     });
     assert_eq!(st.imports.running(), 0);
+}
+
+/// Загрузка `.zip` больше дочитывания (32 МиБ) при отказе до приёма: `Expect` и для файла —
+/// ответ (HTTP 503 через 2 с) приходит до тела.
+#[test]
+fn cli_import_zip_answer_before_body_stub() {
+    let (url, expect) = stub_early(
+        ANSWER_503.to_string(),
+        0,
+        Duration::from_secs(2),
+        Duration::from_secs(3),
+    );
+    let r = tmp("imp-zip-503-repo");
+    std::fs::create_dir_all(&r).unwrap();
+    std::fs::write(r.join("big.zip"), noise(32 << 20)).unwrap();
+    let o = zam_idle(
+        &url,
+        &r,
+        "30",
+        &["import", "big.zip", "--space", "knowledge"],
+    );
+    let e = stderr(&o);
+    assert!(
+        expect.load(std::sync::atomic::Ordering::SeqCst),
+        "нет Expect: {e}"
+    );
+    assert!(e.contains("HTTP 503"), "{e}");
+}
+
+/// Каталог идёт с оценкой объёма: при малом свободном месте сервера (подмена: хватает на
+/// оценку, но не на `2 × max_bytes`) маленький каталог принят; `.zip` — по `Content-Length`.
+#[test]
+fn cli_import_dir_estimate_fits_low_disk() {
+    let (url, tok, st) = start_state("imp-est", |c| c.import.min_free_bytes = 0);
+    zam_server::backup::test_hooks::set_free_space(&st.cfg.data_dir, Some(64 << 20));
+    let r = tmp("imp-est-repo");
+    let src = r.join("notes");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.md"), "# А\n\nтекст").unwrap();
+    let o = zam(&url, &tok, &r, &["import", "notes", "--space", "knowledge"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(st.imports.disk_reserved(), 0);
 }
 
 /// Две разные папки с одинаковыми файлами не делят id: вторая — конфликт `path-taken`, а не

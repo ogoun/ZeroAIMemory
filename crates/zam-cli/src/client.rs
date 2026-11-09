@@ -107,6 +107,9 @@ pub enum Timeouts {
 /// карта кода. 10 мин покрывают несколько таких сроков подряд при умолчаниях; дольше — пусть
 /// решает тайм-аут инструмента самого агента.
 pub const MCP_RECV_RESPONSE: Duration = Duration::from_secs(10 * 60);
+/// Ожидание ответа на `Expect: 100-continue` при импорте (по умолчанию ureq — 1 с: под нагрузкой
+/// тело уходило до ответа сервера).
+pub const AWAIT_100: Duration = Duration::from_secs(30);
 
 pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
     let mut b = ureq::Agent::config_builder()
@@ -358,21 +361,31 @@ impl Client {
         self.send_multipart_with(path, content_type, len, reader, &[])
     }
 
-    /// POST тела потоком неизвестной длины (chunked): архив каталога `zam import` собирается на
-    /// лету, без временного файла. `Expect: 100-continue`: ureq читает ответ сервера только
-    /// после всего тела, а отказ до приёма (413, 503, 507, 404 старого сервера) так приходит
-    /// до тела — тело не уходит, и ответ не теряется в обрыве записи. Сервер молчит дольше
-    /// срока ожидания ureq (1 с) — тело уходит как обычно.
-    pub fn send_stream(
+    /// POST тела импорта: `.zip` — `len` (`Content-Length`), каталог — потоком (chunked, архив
+    /// собирается на лету) с оценкой объёма `expected` (`X-Zam-Expected-Bytes`: резерв места и
+    /// предел тела на сервере). `Expect: 100-continue`: ureq читает ответ сервера только после
+    /// всего тела, а так отказ до приёма (413, 503, 507, 404 старого сервера) приходит до тела —
+    /// тело не уходит, и ответ не теряется в обрыве записи. Ответ ждётся до [`AWAIT_100`];
+    /// сервер (прокси) молчит дольше — тело уходит как обычно.
+    pub fn send_import(
         &self,
         path: &str,
         content_type: &str,
+        len: Option<u64>,
+        expected: Option<u64>,
         reader: impl Read + 'static,
     ) -> Result<Response<Body>, CliError> {
-        let rb = self
+        let mut rb = self
             .prepare(self.agent.post(&self.url(path)))
             .header("Content-Type", content_type)
             .header("Expect", "100-continue");
+        if let Some(n) = len {
+            rb = rb.header("Content-Length", n.to_string());
+        }
+        if let Some(n) = expected {
+            rb = rb.header("X-Zam-Expected-Bytes", n.to_string());
+        }
+        let rb = rb.config().timeout_await_100(Some(AWAIT_100)).build();
         self.check(rb.send(ureq::SendBody::from_owned_reader(reader)))
     }
 

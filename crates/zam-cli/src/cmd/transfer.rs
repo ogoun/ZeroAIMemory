@@ -398,6 +398,22 @@ fn dir_files(root: &Path) -> std::io::Result<DirFiles> {
     Ok((out, hidden))
 }
 
+/// Оценка объёма архива каталога (`X-Zam-Expected-Bytes`) с запасом: сумма размеров файлов,
+/// 1/64 на расширение deflate несжимаемых данных, на файл — заголовки zip (локальный,
+/// дескриптор, оглавление, zip64) и два имени, 64 КиБ на конец архива. Сервер не примет тело
+/// больше оценки (с небольшим своим запасом).
+fn pack_estimate(files: &[(String, PathBuf)]) -> std::io::Result<u64> {
+    let mut n: u64 = 64 << 10;
+    for (rel, p) in files {
+        let len = std::fs::metadata(p)?.len();
+        n = n
+            .saturating_add(len)
+            .saturating_add(len / 64)
+            .saturating_add(256 + 2 * rel.len() as u64);
+    }
+    Ok(n)
+}
+
 /// Тело запроса из канала упаковщика. Сбой упаковки — ошибка чтения, а не конец потока: ureq
 /// обрывает запрос, и сервер не примет усечённый архив (`ZipWriter` при уничтожении дописывает
 /// оглавление — без этой обёртки обрезанный архив выглядел бы целым).
@@ -676,8 +692,13 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
                 a.src.display()
             )));
         }
+        let est = pack_estimate(&files).map_err(io)?;
         let (r, h) = pack_stream(files).map_err(io)?;
-        (ctx.client.send_stream(&path, "application/zip", r), Some(h))
+        (
+            ctx.client
+                .send_import(&path, "application/zip", None, Some(est), r),
+            Some(h),
+        )
     } else if a.src.is_file() {
         let f =
             File::open(a.src).map_err(|e| CliError::config(format!("{}: {e}", a.src.display())))?;
@@ -686,7 +707,8 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
             .map_err(|e| CliError::config(format!("{}: {e}", a.src.display())))?
             .len();
         (
-            ctx.client.send_multipart(&path, "application/zip", len, f),
+            ctx.client
+                .send_import(&path, "application/zip", Some(len), None, f),
             None,
         )
     } else {
