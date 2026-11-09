@@ -730,7 +730,7 @@ pub(crate) fn note_chunks(
 }
 
 /// Чанк заметки без текста тела (например, только `# Имя` из WebUI):
-/// путь и текст — первый заголовок, а без заголовков — имя узла.
+/// путь и текст — первый заголовок, а без заголовков — имя узла; секреты маскируются.
 pub(crate) fn title_chunk(doc: &Doc, name: &str, tc: &dyn TokenCounter) -> ChunkRow {
     let (heading_path, text) = match doc.sections.iter().find(|s| s.level > 0) {
         Some(s) => (
@@ -744,6 +744,9 @@ pub(crate) fn title_chunk(doc: &Doc, name: &str, tc: &dyn TokenCounter) -> Chunk
     } else {
         text
     };
+    // имя и заголовок задаёт автор: значение секрета маскируется, как в теле (ревью 15b, N4) —
+    // иначе разностная перепроверка находила бы такой чанк при каждом росте версии правил
+    let (text, heading_path) = (mask_text(&text), mask_text(&heading_path));
     ChunkRow {
         level: ChunkLevel::Chunk,
         heading_path,

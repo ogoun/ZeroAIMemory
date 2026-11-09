@@ -439,6 +439,74 @@ async fn meta_value(db: &Db, key: &'static str) -> String {
         .unwrap()
 }
 
+/// Совпадений значения в FTS чанков (`chunks_fts`, фраза).
+async fn fts_hits(db: &Db, value: &str) -> i64 {
+    let q = format!("\"{value}\"");
+    db.read(move |c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+            [q],
+            |r| r.get(0),
+        )?)
+    })
+    .await
+    .unwrap()
+}
+
+/// Ревью 15b, N4: заметка без тела с секретом в имени — чанк-заголовок замаскирован при
+/// записи, и разностная перепроверка (флаги `'1'`) его не находит повторно.
+#[tokio::test]
+async fn bodyless_note_with_secret_name_masked_and_not_refound() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("secrets-bodyless-name");
+    let _ = std::fs::remove_dir_all(&dir);
+    let dd = DataDir::open(&dir).unwrap();
+    let user = Id::new();
+    let value = format!("Sup3r{}", "S3cretValue1");
+    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    let k = knowledge(&db).await;
+    let n = note_in(&db, k, &format!("ops/password={value}"), String::new()).await;
+    let like = format!("%{value}%");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM chunks WHERE text LIKE ?1 OR heading_path LIKE ?1",
+            like.clone()
+        )
+        .await,
+        0,
+        "имя в чанке-заголовке замаскировано"
+    );
+    assert!(
+        count(
+            &db,
+            "SELECT count(*) FROM chunks WHERE node_id = ?1",
+            n.to_string()
+        )
+        .await
+            > 0,
+        "чанк-заголовок есть"
+    );
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE meta SET value = '1' WHERE key IN (?1, ?2)",
+            [FLAG, FLAG_V3],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    drain(&db).await;
+    drop(db);
+    let dbs = UserDbs::new(dd.users_dir());
+    let db = dbs.get(user).await.unwrap();
+    dbs.wait_rechunk(user).await;
+    assert_eq!(
+        job_of(&db, "node", n).await,
+        None,
+        "перепроверка не находит заметку снова"
+    );
+}
+
 /// Цель задания в очереди (`target_kind`, `op`) или `None`.
 async fn job_of(db: &Db, kind: &'static str, id: Id) -> Option<String> {
     db.read(move |c| {
@@ -632,9 +700,10 @@ async fn rules_version_bump_rescans_old_db_once() {
     dbs.wait_rechunk(user).await;
     assert_eq!(
         open_chunks(db.clone()).await,
-        1,
-        "значение убрано из chunks заметки и записи; вложение — до повторного извлечения"
+        0,
+        "значение убрано из chunks заметки, записи и (на месте, N1) вложения"
     );
+    assert_eq!(fts_hits(&db, &pw).await, 0, "и из FTS");
     assert_eq!(job_of(&db, "node", leaky).await.as_deref(), Some("upsert"));
     assert_eq!(job_of(&db, "entry", entry).await.as_deref(), Some("upsert"));
     assert_eq!(
@@ -658,6 +727,20 @@ async fn rules_version_bump_rescans_old_db_once() {
         Some("upsert")
     );
     assert_eq!(job_stats(&db).await.unwrap().queued, 4);
+    // N1: повторное извлечение не удалось — значения в chunks и FTS всё равно нет
+    set_extract_state(&db, doc.id, ExtractState::Failed, Some("parse_error: тест"))
+        .await
+        .unwrap();
+    assert_eq!(
+        open_chunks(db.clone()).await,
+        0,
+        "после неудачного извлечения"
+    );
+    assert_eq!(
+        fts_hits(&db, &pw).await,
+        0,
+        "FTS после неудачного извлечения"
+    );
     let reindex = count(
         &db,
         "SELECT count(*) FROM meta WHERE key = ?1",

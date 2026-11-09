@@ -29,11 +29,18 @@ use crate::jobs::PRIORITY_REINDEX;
 use crate::time::fmt_ts;
 use crate::{Db, StoreError};
 
-/// Строк сохранённого в одном чтении.
+/// Строк сохранённого в одном чтении (в юнит-тестах — 3: граница пакета проверяется на
+/// нескольких строках, `delta_hit_on_batch_boundary`).
+#[cfg(not(test))]
 const READ_BATCH: i64 = 2000;
+#[cfg(test)]
+const READ_BATCH: i64 = 3;
 
-/// Целей в одной транзакции писателя.
+/// Целей в одной транзакции писателя (в юнит-тестах — 2).
+#[cfg(not(test))]
 const WRITE_BATCH: usize = 200;
+#[cfg(test)]
+const WRITE_BATCH: usize = 2;
 
 /// Что нашлось в сохранённом.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -312,4 +319,80 @@ pub(crate) async fn run(db: &Db) -> Result<DeltaStats, StoreError> {
     };
     stats.scan_ms = scan_ms;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Attribution, AuthorKind, NewNote, NodePath, SpaceKind, UserDbs, list_spaces};
+
+    /// Ревью 15b, N2: находка в последней строке второго пакета чтения (пакет — 3 строки) и
+    /// цели во втором пакете записи (пакет — 2) доходят до `apply`.
+    #[tokio::test]
+    async fn delta_hit_on_batch_boundary() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/unit-tmp/zam-store-secrets-delta");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = UserDbs::new(dir).get(Id::new()).await.unwrap();
+        let k = list_spaces(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind == SpaceKind::Knowledge)
+            .unwrap()
+            .id;
+        let mut ids = Vec::new();
+        for i in 0..7 {
+            let n = crate::create_note(
+                &db,
+                NewNote {
+                    space_id: k,
+                    path: NodePath::parse(&format!("n/note{i}")).unwrap(),
+                    content: format!("# Заметка {i}\n\nобычный текст {i}\n"),
+                    l0: None,
+                    attrib: Attribution::new(AuthorKind::Agent),
+                },
+            )
+            .await
+            .unwrap();
+            ids.push(n.id);
+        }
+        // строки чанков по порядку; новая утечка — в шестой (последней второго пакета) и седьмой
+        let pw = format!("Sup3r{}", "S3cretValue");
+        let seqs: Vec<(i64, Id)> = db
+            .read(|c| {
+                let mut st = c.prepare("SELECT seq, node_id FROM chunks ORDER BY seq")?;
+                let rows = st
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert!(seqs.len() >= 7, "{seqs:?}");
+        let hit: Vec<(i64, Id)> = vec![seqs[5], seqs[seqs.len() - 1]];
+        let marks: Vec<i64> = hit.iter().map(|h| h.0).collect();
+        db.write(move |tx| {
+            for seq in marks {
+                tx.execute(
+                    "UPDATE chunks SET text = text || ?2 WHERE seq = ?1",
+                    params![seq, format!(" password=`{pw}`")],
+                )?;
+            }
+            tx.execute("DELETE FROM index_jobs", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let d = scan(&db).await.unwrap();
+        let want: BTreeSet<Id> = hit.iter().map(|h| h.1).collect();
+        assert_eq!(d.notes, want, "находки на границе пакетов");
+        let st = apply(&db, d).await.unwrap();
+        assert_eq!(st.notes, want.len() as u64);
+        assert_eq!(
+            crate::job_stats(&db).await.unwrap().queued,
+            want.len() as i64
+        );
+    }
 }
