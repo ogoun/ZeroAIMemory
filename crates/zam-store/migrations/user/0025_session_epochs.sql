@@ -68,3 +68,11 @@ CREATE TABLE session_snapshots (
 -- Сколько из `count` — вызовы по получателю (`x.f()`); данные старого клиента — 0 (все прямые).
 -- Первичный ключ `(file_id, name, kind)` не меняется.
 ALTER TABLE code_refs ADD COLUMN recv_count INTEGER NOT NULL DEFAULT 0;
+
+-- ---------- происхождение импорта (§12б.5, задача 18b2) ----------
+-- `{archive_fingerprint, source_id, source_rev, content_hash}` записи или заметки, пришедшей из
+-- архива `POST /spaces/{space}/import`: повтор того же архива сравнивается по `source_id` +
+-- `content_hash`. Отдельная колонка, а не поле `data`: `data` задач, вопросов, идей и терминов
+-- нормализуется типизированным разбором при каждой записи сервера и потеряла бы поле.
+ALTER TABLE nodes ADD COLUMN imported_from TEXT;
+ALTER TABLE entries ADD COLUMN imported_from TEXT;

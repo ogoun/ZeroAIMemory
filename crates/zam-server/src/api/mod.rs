@@ -183,6 +183,12 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
             "/api/v1/nodes/{id}/attachments/{sha256}/{filename}",
             delete(blobs::remove),
         )
+        // импорт пространства (M6 §12б.5): тело — zip потоком в файл со своим пределом
+        // `import.max_bytes` (обработчик читает `Body` сам, общий предел тела не действует)
+        .route(
+            "/api/v1/spaces/{space}/import",
+            post(transfer::import::import).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/v1/cache", post(cache::put))
         .route("/api/v1/cache/{id}", delete(cache::remove))
         .route("/api/v1/cache/{id}/promote", post(cache::promote))

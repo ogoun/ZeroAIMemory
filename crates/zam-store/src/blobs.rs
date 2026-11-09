@@ -89,6 +89,61 @@ impl BlobStore {
         }
     }
 
+    /// [`BlobStore::put`] для синхронного чтения (поток `spawn_blocking`: распаковка архива
+    /// импорта, M6 §12б.5). Временный файл — тот же `<root>/.incoming/<id>.part`, удаляется при
+    /// любой ошибке.
+    pub fn put_blocking<R: std::io::Read>(
+        &self,
+        mut r: R,
+        limit: u64,
+    ) -> Result<(String, u64), StoreError> {
+        use std::io::Write as _;
+        let incoming = self.root.join(INCOMING);
+        std::fs::create_dir_all(&incoming)?;
+        let part = incoming.join(format!("{}.part", Id::new()));
+        let res = (|| -> Result<(String, u64), StoreError> {
+            let mut f = std::fs::File::create(&part)?;
+            let mut hasher = Sha256::new();
+            let mut size: u64 = 0;
+            let mut buf = vec![0u8; BUF];
+            loop {
+                let n = r.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                size += n as u64;
+                if size > limit {
+                    return Err(StoreError::BadInput("too large".into()));
+                }
+                hasher.update(&buf[..n]);
+                f.write_all(&buf[..n])?;
+            }
+            f.sync_all()?;
+            drop(f);
+            let sha = hex(&hasher.finalize());
+            let target = self.path_of(&sha);
+            if let Some(dir) = target.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            if target.exists() {
+                std::fs::remove_file(&part)?;
+                return Ok((sha, size));
+            }
+            match std::fs::rename(&part, &target) {
+                Ok(()) => Ok((sha, size)),
+                Err(_) if target.exists() => {
+                    std::fs::remove_file(&part)?;
+                    Ok((sha, size))
+                }
+                Err(e) => Err(e.into()),
+            }
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        res
+    }
+
     async fn write_part<R: AsyncRead + Unpin>(
         &self,
         mut r: R,

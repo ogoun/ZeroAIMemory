@@ -54,6 +54,7 @@ pub struct ServerConfig {
     pub ideas: IdeasSection,
     pub backup: BackupSection,
     pub export: ExportSection,
+    pub import: ImportSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1303,6 +1304,43 @@ impl ExportSection {
     }
 }
 
+/// Секция `[import]` (M6 §12б.5): импорт пространства `POST /spaces/{space}/import`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportSection {
+    /// Предел тела запроса (zip) и распакованного объёма архива, байт (1024..=2⁴⁰, 2 ГиБ):
+    /// больше — 413 (тело) или 422 (распакованный объём).
+    pub max_bytes: u64,
+    /// Файлов в архиве не больше (1..=10 000 000, 100 000): больше — 422.
+    pub max_files: usize,
+}
+
+impl Default for ImportSection {
+    fn default() -> Self {
+        Self {
+            max_bytes: 2 << 30,
+            max_files: 100_000,
+        }
+    }
+}
+
+impl ImportSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("import.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1024..=1 << 40).contains(&self.max_bytes) {
+            return Err(bad("max_bytes", "от 1024 до 1099511627776 (1 ТиБ)"));
+        }
+        if !(1..=10_000_000).contains(&self.max_files) {
+            return Err(bad("max_files", "от 1 до 10000000"));
+        }
+        Ok(())
+    }
+}
+
 /// `HH:MM` → (часы 0..=23, минуты 0..=59).
 fn parse_hm(s: &str) -> Option<(i8, i8)> {
     let (h, m) = s.trim().split_once(':')?;
@@ -1445,6 +1483,7 @@ impl Default for ServerConfig {
             ideas: IdeasSection::default(),
             backup: BackupSection::default(),
             export: ExportSection::default(),
+            import: ImportSection::default(),
         }
     }
 }
@@ -1622,6 +1661,7 @@ pub fn load(
     cfg.ideas.validate()?;
     cfg.backup.validate()?;
     cfg.export.validate()?;
+    cfg.import.validate()?;
     Ok(cfg)
 }
 
@@ -2769,6 +2809,23 @@ master_key = \"x\"
             assert!(
                 r.unwrap_err().to_string().contains("export.max_secs"),
                 "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_section_defaults_and_ranges() {
+        let i = load(None, &[], &Default::default()).unwrap().import;
+        assert_eq!(i.max_bytes, 2 << 30);
+        assert_eq!(i.max_files, 100_000);
+        for (k, v) in [
+            ("ZAM_IMPORT__MAX_BYTES", "1023"),
+            ("ZAM_IMPORT__MAX_FILES", "0"),
+        ] {
+            let r = load(None, &[env(k, v)], &Default::default());
+            assert!(
+                r.unwrap_err().to_string().contains("import.max_"),
+                "{k}={v}"
             );
         }
     }

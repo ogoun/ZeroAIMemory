@@ -269,3 +269,51 @@ fn cli_export_idle_watchdog() {
     assert!(!r.join("a.zip").exists());
     assert!(parts(&r).is_empty(), "{:?}", parts(&r));
 }
+
+/// Каталог без описи — «папка `.md`»: архив чужой (новые id, `axiom` → `theorem`), временный zip
+/// рядом с каталогом удаляется; повтор — конфликты `path-taken` (у папки нет id для повтора).
+#[test]
+fn cli_import_folder_md() {
+    let (url, tok) = start("imp-dir");
+    let r = tmp("imp-dir-repo");
+    let src = r.join("notes");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(
+        src.join("rule.md"),
+        "---\ncertainty: axiom\n---\n# Правило\n\nLF везде\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("sub").join("b.md"), "# B\n\nтекст\n").unwrap();
+    std::fs::write(src.join("pic.png"), b"\x89PNG").unwrap();
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &["import", "notes", "--space", "knowledge", "--json"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let rep: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(rep["created"], 2, "{rep}");
+    assert_eq!(rep["demoted_axioms"], 1, "{rep}");
+    assert_eq!(rep["own"], false, "{rep}");
+    assert!(parts(&r).is_empty(), "{:?}", parts(&r));
+    let o = zam(&url, &tok, &r, &["read", "knowledge:rule"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        has(&o.stdout, "certainty: theorem"),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &["import", "notes", "--space", "knowledge", "--json"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let rep: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(rep["created"], 0, "{rep}");
+    let c = rep["conflicts"].as_array().unwrap();
+    assert_eq!(c.len(), 2, "{rep}");
+    assert!(c.iter().all(|x| x["reason"] == "path-taken"), "{rep}");
+}

@@ -38,19 +38,22 @@ pub use chunks::{
     set_chunk_params, set_prefix_l0, set_token_counter, token_counter_exact,
 };
 pub(crate) use chunks::{
-    ChunkInsert, PARAM_ALGORITHM, PARAM_TOKENIZER, backfill_certainty, backfill_embed_keys,
-    changed_params, chunk_id, chunker_base, chunker_fingerprint, chunker_params, context_prefix,
-    entry_chunker_fingerprint, frontmatter_tags, mask_tags, note_chunks, param_order,
-    params_from_fingerprint, rechunk_notes, replace_chunks, rescan_secrets, same_chunker,
-    stored_prefix_hit, token_counter,
+    ChunkInsert, NoteMeta, PARAM_ALGORITHM, PARAM_TOKENIZER, backfill_certainty,
+    backfill_embed_keys, changed_params, chunk_id, chunker_base, chunker_fingerprint,
+    chunker_params, context_prefix, entry_chunker_fingerprint, frontmatter_tags, mask_tags,
+    note_chunks, param_order, params_from_fingerprint, rechunk_notes, replace_chunks,
+    rescan_secrets, same_chunker, stored_prefix_hit, token_counter,
 };
+// импорт пространства (M6 §12б.5): запись узла с исходным id и историей
+pub(crate) use chunks::{index_note, index_state, note_meta, space_kind};
 pub use history::{RevisionInfo, entry_snapshot_text, list_revisions, unified_diff};
 pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
 pub use revise::{WriteError, patch_note, patch_note_within, revert_note, update_note};
+pub(crate) use tree_ops::move_tx;
 pub use tree_ops::{delete_node, list_trash, move_node, restore_node};
-pub(crate) use write::insert_note;
 pub use write::{create_folder, create_note};
+pub(crate) use write::{ensure_ancestors, insert_note, store_revision};
 
 /// Вид узла.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]

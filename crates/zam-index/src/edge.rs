@@ -393,6 +393,34 @@ impl EdgeIndex {
         Ok(n as u64)
     }
 
+    /// Точек вне тенанта `user` по целям `t` (узлы — без точек вложений).
+    async fn foreign_count(&self, user: Id, t: &[TargetRef]) -> Result<u64, IndexError> {
+        let s = split_targets(t);
+        let mut any = Vec::new();
+        if !s.nodes.is_empty() {
+            any.push(kw_any("node_id", s.nodes));
+        }
+        if !s.entries.is_empty() {
+            any.push(kw_any("entry_id", s.entries));
+        }
+        if any.is_empty() {
+            return Ok(0);
+        }
+        let shard = self.inner.shard()?;
+        let filter = Filter {
+            must_not: Some(vec![kw("user_id", user.to_string())]),
+            should: Some(any),
+            ..Filter::default()
+        };
+        let n = blocking("count", move || {
+            let mut req = CountRequest::new();
+            req.filter = Some(filter);
+            shard.count(req)
+        })
+        .await?;
+        Ok(n as u64)
+    }
+
     async fn drop_all_impl(&self) -> Result<(), IndexError> {
         let inner = self.inner.clone();
         run_blocking("drop_all", move || {
@@ -515,6 +543,27 @@ impl VectorIndex for EdgeIndex {
 
     fn count<'a>(&'a self, f: &'a VectorFilter) -> IndexFuture<'a, u64> {
         Box::pin(self.count_impl(f))
+    }
+
+    fn foreign_targets<'a>(
+        &'a self,
+        user: Id,
+        targets: &'a [TargetRef],
+    ) -> IndexFuture<'a, Vec<TargetRef>> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            for part in targets.chunks(500) {
+                if self.foreign_count(user, part).await? == 0 {
+                    continue;
+                }
+                for t in part {
+                    if self.foreign_count(user, std::slice::from_ref(t)).await? > 0 {
+                        out.push(*t);
+                    }
+                }
+            }
+            Ok(out)
+        })
     }
 
     fn drop_all(&self) -> IndexFuture<'_, ()> {

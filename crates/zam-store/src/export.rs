@@ -58,14 +58,22 @@ pub struct NoteAttachment {
     pub size: u64,
     #[serde(serialize_with = "crate::time::ser_ts")]
     pub created_at: Timestamp,
+    /// Документ вложения (`attachment_docs.id`, ссылка `d:<id>`): импорт переписывает ссылки
+    /// `d:` на документы, созданные заново (18b2).
+    pub doc: Option<Id>,
 }
 
 /// Ссылка на файл решения (`file_refs`) заметки или записи.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefRow {
     pub path: String,
+    /// Символ ссылки `путь#qual` (M5.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,8 +167,12 @@ impl SpaceReader<'_> {
     /// Вложения заметки.
     pub fn note_attachments(&self, node: Id) -> Result<Vec<NoteAttachment>, StoreError> {
         let mut st = self.c.prepare_cached(
-            "SELECT blob_sha256, filename, mime, size, created_at FROM attachments
-             WHERE node_id = ?1 ORDER BY created_at, blob_sha256, filename",
+            "SELECT a.blob_sha256, a.filename, a.mime, a.size, a.created_at, d.id
+             FROM attachments a
+             LEFT JOIN attachment_docs d ON d.node_id = a.node_id
+                  AND d.blob_sha256 = a.blob_sha256 AND d.filename = a.filename
+                  AND d.deleted_at IS NULL
+             WHERE a.node_id = ?1 ORDER BY a.created_at, a.blob_sha256, a.filename",
         )?;
         let rows = st.query_map([node], |r| {
             let size: i64 = r.get(3)?;
@@ -170,6 +182,7 @@ impl SpaceReader<'_> {
                 mime: r.get(2)?,
                 size: u64::try_from(size).unwrap_or_default(),
                 created_at: ts_at(r, 4)?,
+                doc: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -178,13 +191,16 @@ impl SpaceReader<'_> {
     /// Ссылки на файлы решения владельца (`node` | `entry`).
     pub fn refs(&self, kind: &str, owner: Id) -> Result<Vec<RefRow>, StoreError> {
         let mut st = self.c.prepare_cached(
-            "SELECT path, content_hash, git_commit, solution_guid FROM file_refs
-             WHERE owner_kind = ?1 AND owner_id = ?2 ORDER BY path",
+            "SELECT path, content_hash, git_commit, solution_guid, symbol, symbol_hash
+             FROM file_refs
+             WHERE owner_kind = ?1 AND owner_id = ?2 ORDER BY path, coalesce(symbol, '')",
         )?;
         let rows = st.query_map(params![kind, owner], |r| {
             Ok(RefRow {
                 path: r.get(0)?,
+                symbol: r.get(4)?,
                 hash: r.get(1)?,
+                symbol_hash: r.get(5)?,
                 commit: r.get(2)?,
                 solution: r.get(3)?,
             })

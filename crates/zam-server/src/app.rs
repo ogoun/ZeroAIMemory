@@ -69,6 +69,9 @@ pub struct AppState {
     pub stopping: Arc<std::sync::atomic::AtomicBool>,
     /// Идущие задачи экспорта: остановка ждёт их аудит `space.export.done` (не дольше 1 с).
     pub export_tasks: Arc<TaskCount>,
+    /// Слот импорта пространства (M6 §12б.5): один импорт на сервер, занято — 503 с
+    /// `Retry-After` ([`api::transfer::import::IMPORT_SLOTS`]).
+    pub import_slots: Arc<tokio::sync::Semaphore>,
     /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
     /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
     #[cfg(feature = "test-hooks")]
@@ -382,6 +385,9 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         export_users: Arc::default(),
         stopping: Arc::default(),
         export_tasks: Arc::default(),
+        import_slots: Arc::new(tokio::sync::Semaphore::new(
+            api::transfer::import::IMPORT_SLOTS,
+        )),
         big_bodies: api::big_body::BigBodies::new(
             api::big_body::BIG_BODY_PERMITS,
             api::note_body_max(&cfg.limits),

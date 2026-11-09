@@ -26,6 +26,7 @@ pub mod file_refs;
 pub mod glossary;
 pub mod graph;
 pub mod ideas;
+pub mod import;
 pub mod jobs;
 pub mod links;
 pub mod migrate;

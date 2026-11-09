@@ -558,7 +558,7 @@ fn write_parts<W: Write>(
             let file = a.attachment(&att.sha256, &att.filename);
             files.push(json!({
                 "sha256": att.sha256, "name": att.filename, "mime": att.mime, "size": att.size,
-                "created_at": fmt_ts(att.created_at), "file": file,
+                "created_at": fmt_ts(att.created_at), "file": file, "doc": att.doc,
             }));
         }
         let tags = node

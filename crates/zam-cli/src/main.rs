@@ -54,6 +54,29 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Импорт архива .zip (zam export) или каталога в пространство; каталог без manifest.json
+    /// — «папка .md»: все *.md — заметки, архив чужой (новые id, аксиомы → theorem)
+    Import {
+        /// Архив .zip или каталог (упаковывается в zip рядом с ним и удаляется после отправки)
+        src: PathBuf,
+        /// Пространство: rules | human | knowledge | solution | GUID | id (иначе решение или knowledge)
+        #[arg(long)]
+        space: Option<String>,
+        /// Это мой архив (переезд на новый сервер с другим пользователем): id и аксиомы как есть
+        #[arg(long)]
+        own: bool,
+        /// Изменившиеся при повторе: skip — в отчёт conflicts (по умолчанию), revision — новая ревизия
+        #[arg(long, value_parser = ["skip", "revision"])]
+        on_conflict: Option<String>,
+        /// Аксиомы чужого архива: demote — в theorem (по умолчанию), keep — как есть
+        #[arg(long, value_parser = ["demote", "keep"])]
+        axioms: Option<String>,
+        /// Только отчёт, без записи
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        common: Common,
+    },
     /// Дерево пространства с L0: [space:]path (без префикса — решение или knowledge)
     Tree {
         target: Option<String>,
@@ -1624,6 +1647,25 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 kinds: &kinds,
                 no_history,
                 out: &out,
+            },
+        ),
+        Cmd::Import {
+            src,
+            space,
+            own,
+            on_conflict,
+            axioms,
+            dry_run,
+            common,
+        } => cmd::transfer::import(
+            &mut cmd::connect(&common)?,
+            &cmd::transfer::ImportArgs {
+                src: &src,
+                space: space.as_deref(),
+                own,
+                on_conflict: on_conflict.as_deref(),
+                axioms: axioms.as_deref(),
+                dry_run,
             },
         ),
         Cmd::Tree {

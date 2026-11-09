@@ -29,18 +29,18 @@ use crate::{Db, StoreError};
 
 /// Поля записи, которые входят в ревизию.
 #[derive(Debug, Clone, PartialEq)]
-struct Fields {
-    title: String,
-    body: String,
-    data: serde_json::Value,
-    tags: Vec<String>,
-    area: Option<String>,
-    status: Option<EntryStatus>,
-    certainty: Option<Certainty>,
+pub(crate) struct Fields {
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) data: serde_json::Value,
+    pub(crate) tags: Vec<String>,
+    pub(crate) area: Option<String>,
+    pub(crate) status: Option<EntryStatus>,
+    pub(crate) certainty: Option<Certainty>,
 }
 
 impl Fields {
-    fn of(e: &Entry) -> Fields {
+    pub(crate) fn of(e: &Entry) -> Fields {
         Fields {
             title: e.title.clone(),
             body: e.body.clone(),
@@ -234,7 +234,7 @@ pub(super) fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<En
 /// Версия релиза свободна среди живых релизов пространства (кроме `except`) — иначе
 /// `Conflict`. Вызывается внутри транзакции писателя (`BEGIN IMMEDIATE`), поэтому проверка и
 /// запись атомарны.
-fn ensure_release_version_free(
+pub(crate) fn ensure_release_version_free(
     c: &Connection,
     space: Id,
     data: &serde_json::Value,
@@ -419,13 +419,13 @@ pub(crate) fn insert_entry_as(
     Ok(id)
 }
 
-fn tags_json(tags: &[String]) -> String {
+pub(crate) fn tags_json(tags: &[String]) -> String {
     serde_json::to_string(tags).expect("сериализация списка строк")
 }
 
 /// `data` для ревизии и сравнения «правка без изменений»: у task без `claimed_by` — захват
 /// это оперативное состояние, а не содержимое записи (решение контроллера, M4.5 задача 5).
-fn content_data(kind: EntryKind, data: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn content_data(kind: EntryKind, data: &serde_json::Value) -> serde_json::Value {
     let mut d = data.clone();
     if kind == EntryKind::Task
         && let Some(o) = d.as_object_mut()
@@ -476,7 +476,7 @@ fn insert_revision(
 
 /// Новая ревизия `cur.rev + 1` с полями `f`: строка записи, ревизия, чанки и задание
 /// `upsert` (payload меняется и при смене одного статуса или `certainty`).
-fn save(
+pub(crate) fn save(
     c: &Connection,
     cur: &Entry,
     f: &Fields,

@@ -1,5 +1,9 @@
 //! Перенос пространства (M6 §12б.5): `zam export [--space S] [--path P]… [--kind K]…
-//! [--no-history] -o <файл.zip>` — архив `GET /spaces/{space}/export` в файл. Импорт — 18b2.
+//! [--no-history] -o <файл.zip>` — архив `GET /spaces/{space}/export` в файл; `zam import
+//! <файл.zip|каталог> [--space S] [--own] [--on-conflict skip|revision] [--axioms demote|keep]
+//! [--dry-run]` — `POST /spaces/{space}/import` потоком (каталог упаковывается в zip рядом с
+//! ним, `<каталог>.zip.<pid>.part`, и удаляется после отправки; каталог без `manifest.json` —
+//! «папка `.md`»: на сервер уходят только `*.md`, архив чужой).
 //!
 //! - Пространство: `--space` (`rules` | `human` | `knowledge` | `solution` | GUID | id), иначе
 //!   решение из `solution.toml`, иначе `knowledge` — как у адресов заметок.
@@ -330,10 +334,224 @@ pub fn export(ctx: &mut Ctx, a: &ExportArgs) -> Result<(), CliError> {
     emit(format!("{} ({bytes} байт)\n", a.out.display()).as_bytes())
 }
 
+/// Сообщение для сервера без маршрута импорта.
+pub const OLD_SERVER_IMPORT: &str =
+    "сервер не поддерживает импорт пространства: нужен zam-server 0.0.11-m6 или новее";
+
+/// Аргументы `zam import`.
+pub struct ImportArgs<'a> {
+    pub src: &'a Path,
+    pub space: Option<&'a str>,
+    pub own: bool,
+    pub on_conflict: Option<&'a str>,
+    pub axioms: Option<&'a str>,
+    pub dry_run: bool,
+}
+
+/// Файлы каталога `root` для архива: относительные пути через `/`, по алфавиту; скрытые
+/// (`.git`, `.zeroaimemory`) пропускаются. Без описи — только `*.md`.
+fn dir_files(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let manifest = root.join("manifest.json").is_file();
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d)? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let p = e.path();
+            let t = e.file_type()?;
+            if t.is_dir() {
+                stack.push(p);
+            } else if t.is_file() && (manifest || name.ends_with(".md")) {
+                let rel = p
+                    .strip_prefix(root)
+                    .map_err(std::io::Error::other)?
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push((rel, p));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Каталог → zip в новом файле `<каталог>.zip.<pid>.part` рядом (удаляет вызывающий).
+fn pack_dir(dir: &Path) -> Result<PathBuf, CliError> {
+    let io = |e: std::io::Error| CliError::config(format!("{}: {e}", dir.display()));
+    let files = dir_files(dir).map_err(io)?;
+    if files.is_empty() {
+        return Err(CliError::input(format!(
+            "{}: нет файлов .md для импорта",
+            dir.display()
+        )));
+    }
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "import".into());
+    let (part, f) = create_part(&dir.with_file_name(format!("{name}.zip"))).map_err(io)?;
+    let res = (|| -> Result<(), CliError> {
+        let mut z = zip::ZipWriter::new(std::io::BufWriter::new(f));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
+        for (rel, p) in &files {
+            z.start_file(rel.as_str(), opts)
+                .map_err(|e| CliError::config(format!("zip: {e}")))?;
+            let mut src = File::open(p).map_err(io)?;
+            std::io::copy(&mut src, &mut z).map_err(io)?;
+        }
+        let mut w = z
+            .finish()
+            .map_err(|e| CliError::config(format!("zip: {e}")))?;
+        w.flush().map_err(io)?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    Ok(part)
+}
+
+/// Свой временный архив удаляется при любом исходе.
+struct Packed(Option<PathBuf>);
+
+impl Drop for Packed {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
+    let space = space_of(ctx, a.space)?;
+    let (file, _packed) = if a.src.is_dir() {
+        let p = pack_dir(a.src)?;
+        (p.clone(), Packed(Some(p)))
+    } else if a.src.is_file() {
+        (a.src.to_path_buf(), Packed(None))
+    } else {
+        return Err(CliError::input(format!(
+            "{}: нет такого файла или каталога",
+            a.src.display()
+        )));
+    };
+    let mut q: Vec<String> = Vec::new();
+    if a.own {
+        q.push("own=true".into());
+    }
+    if let Some(c) = a.on_conflict {
+        q.push(format!("on_conflict={c}"));
+    }
+    if let Some(x) = a.axioms {
+        q.push(format!("axioms={x}"));
+    }
+    if a.dry_run {
+        q.push("dry_run=true".into());
+    }
+    let path = if q.is_empty() {
+        format!("/spaces/{space}/import")
+    } else {
+        format!("/spaces/{space}/import?{}", q.join("&"))
+    };
+    let f = File::open(&file).map_err(|e| CliError::config(format!("{}: {e}", file.display())))?;
+    let len = f
+        .metadata()
+        .map_err(|e| CliError::config(format!("{}: {e}", file.display())))?
+        .len();
+    // ответ — после проверки и записи всего архива: заголовки ждём долго, как у экспорта
+    ctx.client.set_timeouts(Timeouts::Download);
+    let resp = match ctx.client.send_multipart(&path, "application/zip", len, f) {
+        Ok(r) => r,
+        Err(e) if e.http_status() == Some(404) => {
+            ctx.client.set_timeouts(Timeouts::Transfer);
+            if ctx
+                .client
+                .get(&format!("/spaces/{space}/tree"), &[])
+                .is_ok()
+            {
+                return Err(CliError::new(EXIT_CONFIG, OLD_SERVER_IMPORT));
+            }
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
+    let rep = crate::client::read_json(resp)?;
+    if ctx.json {
+        return emit_json(&rep);
+    }
+    emit(report_text(&space, &rep).as_bytes())
+}
+
+/// Отчёт импорта текстом.
+fn report_text(space: &str, rep: &serde_json::Value) -> String {
+    let n = |k: &str| rep[k].as_u64().unwrap_or(0);
+    let mut s = format!(
+        "{}импорт в {space}: создано {}, обновлено {}, пропущено {}, конфликтов {}, \
+         аксиом понижено {}, id переназначено {}, связей пропущено {}\n",
+        if rep["dry_run"] == json!(true) {
+            "пробный "
+        } else {
+            ""
+        },
+        n("created"),
+        n("revised"),
+        n("skipped"),
+        rep["conflicts"].as_array().map_or(0, Vec::len),
+        n("demoted_axioms"),
+        n("id_remapped"),
+        n("links_skipped"),
+    );
+    for c in rep["conflicts"].as_array().into_iter().flatten() {
+        let at = c["path"].as_str().or(c["id"].as_str()).unwrap_or("?");
+        s.push_str(&format!(
+            "конфликт: {at} — {}\n",
+            c["reason"].as_str().unwrap_or("?")
+        ));
+    }
+    for w in rep["warnings"].as_array().into_iter().flatten() {
+        s.push_str(&format!(
+            "предупреждение: {}\n",
+            w.as_str().unwrap_or_default()
+        ));
+    }
+    if let Some(u) = rep["unresolved"].as_array().filter(|u| !u.is_empty()) {
+        s.push_str(&format!("ссылок вне архива: {}\n", u.len()));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn dir_files_md_only_without_manifest() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/zam-cli/import-dir-unit");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::write(d.join("a.md"), "a").unwrap();
+        std::fs::write(d.join("sub").join("b.md"), "b").unwrap();
+        std::fs::write(d.join("pic.png"), "p").unwrap();
+        std::fs::write(d.join(".git").join("c.md"), "c").unwrap();
+        let names: Vec<String> = dir_files(&d).unwrap().into_iter().map(|x| x.0).collect();
+        assert_eq!(names, ["a.md", "sub/b.md"]);
+        std::fs::write(d.join("manifest.json"), "{}").unwrap();
+        let names: Vec<String> = dir_files(&d).unwrap().into_iter().map(|x| x.0).collect();
+        assert_eq!(names, ["a.md", "manifest.json", "pic.png", "sub/b.md"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn joined_rules() {

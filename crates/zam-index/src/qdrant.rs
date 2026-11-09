@@ -785,6 +785,58 @@ impl QdrantIndex {
         Ok(Some(out))
     }
 
+    /// Точек вне тенанта `user` по целям `t` (узлы — без точек вложений).
+    async fn foreign_count(&self, user: Id, t: &[TargetRef]) -> Result<u64, IndexError> {
+        let s = split_targets(t);
+        let mut any = Vec::new();
+        if !s.nodes.is_empty() {
+            any.push(kw_any("node_id", s.nodes));
+        }
+        if !s.entries.is_empty() {
+            any.push(kw_any("entry_id", s.entries));
+        }
+        if any.is_empty() {
+            return Ok(0);
+        }
+        let filter = Filter {
+            must_not: vec![kw("user_id", user.to_string())],
+            should: any,
+            ..Filter::default()
+        };
+        Ok(self
+            .client
+            .count(
+                CountPointsBuilder::new(COLLECTION)
+                    .filter(filter)
+                    .exact(true),
+            )
+            .await
+            .map_err(|e| map_err("count", e))?
+            .result
+            .map(|r| r.count)
+            .unwrap_or(0))
+    }
+
+    async fn foreign_targets_impl(
+        &self,
+        user: Id,
+        targets: &[TargetRef],
+    ) -> Result<Vec<TargetRef>, IndexError> {
+        let mut out = Vec::new();
+        for part in targets.chunks(500) {
+            // обычно чужих точек нет: один подсчёт на пачку, по одной цели — только при находке
+            if self.foreign_count(user, part).await? == 0 {
+                continue;
+            }
+            for t in part {
+                if self.foreign_count(user, std::slice::from_ref(t)).await? > 0 {
+                    out.push(*t);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn health_impl(&self) -> Result<(), IndexError> {
         // health_check в gRPC доступен без ключа; list_collections проверяет и ключ.
         self.client
@@ -844,6 +896,14 @@ impl VectorIndex for QdrantIndex {
 
     fn folder_hashes(&self, user: Id) -> IndexFuture<'_, Option<Vec<(Id, String)>>> {
         Box::pin(self.folder_hashes_impl(user))
+    }
+
+    fn foreign_targets<'a>(
+        &'a self,
+        user: Id,
+        targets: &'a [TargetRef],
+    ) -> IndexFuture<'a, Vec<TargetRef>> {
+        Box::pin(self.foreign_targets_impl(user, targets))
     }
 }
 

@@ -474,6 +474,22 @@ pub(crate) fn ensure_doc(
     intake: DocIntake,
     now: &str,
 ) -> Result<Id, StoreError> {
+    ensure_doc_as(c, None, node, sha, filename, mime, intake, now)
+}
+
+/// [`ensure_doc`] с id нового документа `want` (импорт пространства, M6 §12б.5: ссылки `d:`
+/// архива переписаны на заранее выбранные id); `None` — новый id.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ensure_doc_as(
+    c: &Connection,
+    want: Option<Id>,
+    node: Id,
+    sha: &str,
+    filename: &str,
+    mime: &str,
+    intake: DocIntake,
+    now: &str,
+) -> Result<Id, StoreError> {
     let (state, err) = intake.state();
     let row: Option<(Id, bool)> = c
         .prepare_cached(
@@ -495,7 +511,8 @@ pub(crate) fn ensure_doc(
             id
         }
         None => {
-            let id = Id::new();
+            // `Id::default()` — новый UUIDv7
+            let id = want.unwrap_or_default();
             c.prepare_cached(
                 "INSERT INTO attachment_docs (id, node_id, blob_sha256, filename, mime,
                                               extract_state, extract_error, created_at)

@@ -36,6 +36,8 @@ uuid.workspace = true
 zstd.workspace = true
 half.workspace = true
 tracing.workspace = true
+# импорт пространства (M6 §12б.5): разбор и проверка архива (крейт workspace, уже у zam-docs)
+zip.workspace = true
 
 [features]
 # Точка остановки фоновой перенарезки при открытии базы — только для тестов (включает

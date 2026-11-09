@@ -159,7 +159,18 @@ pub async fn move_node(
     new_path: NodePath,
     author: AuthorKind,
 ) -> Result<Node, StoreError> {
-    db.write(move |tx| {
+    db.write(move |tx| move_tx(tx, id, &new_path, author)).await
+}
+
+/// [`move_node`] внутри транзакции писателя (импорт пространства, M6 §12б.5: заметка с тем же
+/// id получила другой путь).
+pub(crate) fn move_tx(
+    tx: &Connection,
+    id: Id,
+    new_path: &NodePath,
+    author: AuthorKind,
+) -> Result<Node, StoreError> {
+    {
         let node = load_node(tx, id)?;
         if node.deleted_at.is_some() {
             return Err(StoreError::NotFound);
@@ -183,7 +194,7 @@ pub async fn move_node(
             .chain(descendants.iter().map(|d| d.0))
             .collect();
         ensure_may_modify_all(tx, &moved, author)?;
-        ensure_free(tx, node.space_id, &new_path)?;
+        ensure_free(tx, node.space_id, new_path)?;
         // прежние имена и пути: ссылки на них разрешаются заново
         let old_keys: Vec<(String, String)> =
             std::iter::once((node.name.clone(), node.path.clone()))
@@ -193,7 +204,7 @@ pub async fn move_node(
                 }))
                 .collect();
         let now = fmt_ts(crate::time::now());
-        let parent = ensure_ancestors(tx, node.space_id, &new_path, &now)?;
+        let parent = ensure_ancestors(tx, node.space_id, new_path, &now)?;
 
         tx.execute(
             "UPDATE nodes SET path = ?2, name = ?3, parent_id = ?4, updated_at = ?5
@@ -230,8 +241,7 @@ pub async fn move_node(
         }
         crate::graph::tree_changed(tx, node.space_id, &moved, &old_keys)?;
         load_node(tx, id)
-    })
-    .await
+    }
 }
 
 fn node_ref(id: Id) -> TargetRef {

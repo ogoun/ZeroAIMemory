@@ -233,7 +233,7 @@ pub async fn upload(
 /// `[Content_Types].xml`/`mimetype`, остальное — по началу файла. Размер против `max_bytes`
 /// решает вызывающий ([`DocIntake::classify`]). Ошибка чтения — `None` (вложение без
 /// индексации, загрузка не падает).
-async fn sniff_blob(
+pub(crate) async fn sniff_blob(
     path: std::path::PathBuf,
     filename: String,
     limits: zam_docs::Limits,

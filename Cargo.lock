@@ -6967,6 +6967,7 @@ dependencies = [
  "zam-markdown",
  "zam-server",
  "zam-store",
+ "zip",
 ]
 
 [[package]]
@@ -7193,6 +7194,7 @@ dependencies = [
  "zam-core",
  "zam-docs",
  "zam-markdown",
+ "zip",
  "zstd",
 ]
 
