@@ -1317,9 +1317,10 @@ pub struct ImportSection {
     /// держит в памяти план импорта — их объём не больше, байт (1 МиБ..=64 ГиБ, 256 МиБ): больше —
     /// 422.
     pub max_text_bytes: u64,
-    /// После приёма тела на диске каталога данных должно остаться не меньше
-    /// `max(1 ГиБ, min_free_percent % диска)`, иначе 507 (0..=50, 5).
-    pub min_free_percent: u8,
+    /// Запас свободного места, байт (0..=1 ТиБ, 2 ГиБ): перед приёмом тела на диске каталога
+    /// данных должно быть свободно `min_free_bytes + 2 × ожидаемый объём` сверх места,
+    /// зарезервированного идущими приёмами; иначе 507.
+    pub min_free_bytes: u64,
 }
 
 impl Default for ImportSection {
@@ -1328,7 +1329,7 @@ impl Default for ImportSection {
             max_bytes: 2 << 30,
             max_files: 100_000,
             max_text_bytes: zam_store::import::MAX_TEXT_BYTES_DEFAULT,
-            min_free_percent: 5,
+            min_free_bytes: 2 << 30,
         }
     }
 }
@@ -1351,8 +1352,8 @@ impl ImportSection {
         if !(1..=1_000_000).contains(&self.max_files) {
             return Err(bad("max_files", "от 1 до 1000000"));
         }
-        if self.min_free_percent > 50 {
-            return Err(bad("min_free_percent", "от 0 до 50"));
+        if self.min_free_bytes > 1 << 40 {
+            return Err(bad("min_free_bytes", "от 0 до 1099511627776 (1 ТиБ)"));
         }
         if !(MIB..=MAX).contains(&self.max_text_bytes) {
             return Err(bad(
@@ -2842,13 +2843,14 @@ master_key = \"x\"
         assert_eq!(i.max_bytes, 2 << 30);
         assert_eq!(i.max_files, 100_000);
         assert_eq!(i.max_text_bytes, 256 << 20);
+        assert_eq!(i.min_free_bytes, 2 << 30);
         for (k, v) in [
             ("ZAM_IMPORT__MAX_BYTES", "1048575"),
             ("ZAM_IMPORT__MAX_BYTES", "68719476737"),
             ("ZAM_IMPORT__MAX_FILES", "0"),
             ("ZAM_IMPORT__MAX_FILES", "1000001"),
             ("ZAM_IMPORT__MAX_TEXT_BYTES", "1048575"),
-            ("ZAM_IMPORT__MIN_FREE_PERCENT", "51"),
+            ("ZAM_IMPORT__MIN_FREE_BYTES", "1099511627777"),
         ] {
             let r = load(None, &[env(k, v)], &Default::default());
             assert!(

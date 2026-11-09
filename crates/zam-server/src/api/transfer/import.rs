@@ -79,8 +79,6 @@ pub const MAX_PENDING: usize = 4;
 /// Элементов в списках итога задания не больше (`conflicts`, `unresolved`, `warnings`,
 /// `remapped`); полные числа — в `*_total`.
 pub const REPORT_LIST_MAX: usize = 1000;
-/// Свободного места после приёма — не меньше (и не меньше `import.min_free_percent` диска).
-const MIN_FREE_BYTES: u64 = 1 << 30;
 /// `Retry-After` при занятом слоте, с.
 const RETRY_AFTER_S: u64 = 30;
 /// Каталог временных файлов тела в каталоге данных.
@@ -118,8 +116,13 @@ async fn drain(s: &mut axum::body::BodyDataStream) {
 }
 
 /// Отказ до приёма тела — с дочитыванием тела (см. [`drain`]).
-async fn refuse(body: Body, e: ApiError) -> ApiError {
-    drain(&mut body.into_data_stream()).await;
+///
+/// Клиент ждёт `100 Continue` (`Expect: 100-continue`, так шлёт `zam import`) — тело не
+/// читается: hyper не отвечает `100`, клиент получает отказ, не отправив тело.
+async fn refuse(body: Body, e: ApiError, expect: bool) -> ApiError {
+    if !expect {
+        drain(&mut body.into_data_stream()).await;
+    }
     e
 }
 
@@ -211,6 +214,9 @@ pub struct ImportRuntime {
     write: Arc<tokio::sync::Semaphore>,
     jobs: std::sync::Mutex<HashMap<Id, Job>>,
     seq: std::sync::atomic::AtomicU64,
+    /// Резерв места на диске: задание → ожидаемый объём (идущие приёмы и задания, у которых
+    /// ещё лежит `.part`).
+    disk: Arc<std::sync::Mutex<HashMap<Id, u64>>>,
 }
 
 impl Default for ImportRuntime {
@@ -221,6 +227,7 @@ impl Default for ImportRuntime {
             write: Arc::new(tokio::sync::Semaphore::new(WRITE_SLOTS)),
             jobs: std::sync::Mutex::default(),
             seq: std::sync::atomic::AtomicU64::new(0),
+            disk: Arc::default(),
         }
     }
 }
@@ -228,6 +235,15 @@ impl Default for ImportRuntime {
 impl ImportRuntime {
     fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<Id, Job>> {
         self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Зарезервировано места под приёмы и лежащие `.part`, байт (тесты и диагностика).
+    pub fn disk_reserved(&self) -> u64 {
+        self.disk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .sum()
     }
 
     /// Свободных слотов приёма (тесты и диагностика).
@@ -392,8 +408,16 @@ async fn problem(e: ApiError) -> Value {
 
 // ---------- приём тела ----------
 
-/// Временный файл тела: удаляется при уничтожении (любой исход, в том числе паника и обрыв).
-struct Part(PathBuf);
+/// Временный файл тела: удаляется при уничтожении (любой исход, в том числе паника и обрыв);
+/// вместе с ним снимается резерв места ([`DiskReserve`]).
+struct Part(
+    PathBuf,
+    #[allow(
+        dead_code,
+        reason = "резерв держится, пока жив `.part`, и снимается в Drop"
+    )]
+    Option<DiskReserve>,
+);
 
 impl Drop for Part {
     fn drop(&mut self) {
@@ -621,11 +645,27 @@ struct Target {
     space: Id,
 }
 
-/// Хватает ли места на диске каталога данных под тело `expected` байт: после приёма должно
-/// остаться не меньше `max(1 ГиБ, import.min_free_percent % диска)`; иначе 507. Тестовая точка
-/// `import_disk_full` — «места нет».
-fn disk_ok(st: &AppState, expected: u64) -> Result<(), ApiError> {
-    let root = st.data_dir.root();
+/// Резерв места на диске под приём: снимается при уничтожении (приём не удался, обработчик
+/// снят, `.part` удалён — [`Part`] держит резерв до своего удаления).
+struct DiskReserve {
+    map: Arc<std::sync::Mutex<HashMap<Id, u64>>>,
+    job: Id,
+}
+
+impl Drop for DiskReserve {
+    fn drop(&mut self) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.job);
+    }
+}
+
+/// Резерв места под тело `expected` байт: нужно `import.min_free_bytes + 2 × expected` (тело и
+/// распакованные из него вложения) сверх уже зарезервированного идущими приёмами и заданиями с
+/// лежащими `.part`; иначе 507. Проверка и запись резерва — под одной блокировкой. Тестовая
+/// точка `import_disk_full` — «места нет».
+fn disk_reserve(st: &AppState, job: Id, expected: u64) -> Result<DiskReserve, ApiError> {
     let full = || {
         ApiError::InsufficientStorage(
             "на диске сервера мало места для приёма архива — освободите место и повторите".into(),
@@ -634,15 +674,27 @@ fn disk_ok(st: &AppState, expected: u64) -> Result<(), ApiError> {
     if crate::backup::fail_point(&st.cfg.data_dir, "import_disk_full").is_err() {
         return Err(full());
     }
-    let (Ok(free), Ok(total)) = (fs4::available_space(root), fs4::total_space(root)) else {
-        tracing::warn!("импорт: свободное место не определено — проверка пропущена");
-        return Ok(());
-    };
-    let reserve = MIN_FREE_BYTES.max(total / 100 * u64::from(st.cfg.import.min_free_percent));
-    if free < expected.saturating_add(reserve) {
-        return Err(full());
+    let need = st
+        .cfg
+        .import
+        .min_free_bytes
+        .saturating_add(expected.saturating_mul(2));
+    let map = st.imports.disk.clone();
+    let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+    match fs4::available_space(st.data_dir.root()) {
+        Ok(free) => {
+            let reserved: u64 = m.values().sum();
+            if free.saturating_sub(reserved) < need {
+                return Err(full());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "импорт: свободное место не определено — проверка пропущена")
+        }
     }
-    Ok(())
+    m.insert(job, expected);
+    drop(m);
+    Ok(DiskReserve { map, job })
 }
 
 /// Страж обработчика на время приёма тела: обработчик снят (клиент оборвал соединение, hyper
@@ -704,23 +756,29 @@ pub async fn import(
         ));
     }
     let limit = st.cfg.import.max_bytes;
+    let expect = headers
+        .get(header::EXPECT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > limit) {
-        return Err(refuse(body, Recv::TooLarge.into_api(limit)).await);
-    }
-    if let Err(e) = disk_ok(&st, declared.unwrap_or(limit)) {
-        return Err(refuse(body, e).await);
+        return Err(refuse(body, Recv::TooLarge.into_api(limit), expect).await);
     }
     let slot = match recv_slot(&st.imports, sc.user.id) {
         Ok(s) => s,
-        Err(e) => return Err(refuse(body, e).await),
+        Err(e) => return Err(refuse(body, e, expect).await),
     };
     let job = Id::new();
+    // место: ожидаемый объём — Content-Length, без него — import.max_bytes
+    let disk = match disk_reserve(&st, job, declared.unwrap_or(limit)) {
+        Ok(d) => d,
+        Err(e) => return Err(refuse(body, e, expect).await),
+    };
     if let Err(e) = st.imports.reserve(job, sc.user.id, &space, opts.dry_run) {
-        return Err(refuse(body, e).await);
+        return Err(refuse(body, e, expect).await);
     }
     let mut attrib = match crate::attrib::attribution(&p, &headers, None) {
         Ok(a) => a,
@@ -759,6 +817,7 @@ pub async fn import(
             .root()
             .join(INCOMING)
             .join(format!("{}.part", Id::new())),
+        Some(disk),
     );
     let lim = RecvLimits {
         max_bytes: limit,
@@ -1200,7 +1259,7 @@ mod tests {
         assert!(matches!(r, Err(Recv::Slow)), "{r:?}");
         let r = run(lim(long, long, 0, long), true).await;
         assert!(matches!(r, Err(Recv::Stop)), "{r:?}");
-        drop(Part(p));
+        drop(Part(p, None));
         let _ = std::fs::remove_dir(&dir);
     }
 
@@ -1213,7 +1272,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(INCOMING)).unwrap();
         let p = dir.join("x.part");
         std::fs::write(&p, b"x").unwrap();
-        drop(Part(p.clone()));
+        drop(Part(p.clone(), None));
         assert!(!p.exists());
         // запуск сервера убирает старые .part
         let old = dir.join(INCOMING).join("old.part");

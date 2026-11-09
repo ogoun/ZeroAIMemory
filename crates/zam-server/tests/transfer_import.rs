@@ -2290,32 +2290,124 @@ async fn import_pending_limits_per_user_and_server() {
     report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
 }
 
-/// Мало места на диске: после приёма осталось бы меньше `max(1 ГиБ, min_free_percent %)` —
-/// 507 до чтения тела.
+/// Приём, тело которого никогда не кончается: заявленный `Content-Length` и пустой поток.
+fn hanging_import(a: &Api, tok: &str, declared: u64) -> tokio::task::JoinHandle<Resp> {
+    let app = a.app.clone();
+    let tok = tok.to_string();
+    let st = a.st.clone();
+    tokio::spawn(async move {
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let req = Request::post("/api/v1/spaces/knowledge/import")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_LENGTH, declared.to_string())
+            .body(body)
+            .unwrap();
+        let r = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let _ = st;
+        let status = r.status();
+        Resp {
+            status,
+            headers: r.headers().clone(),
+            body: Default::default(),
+        }
+    })
+}
+
+/// Место на диске с учётом резерва параллельного приёма: первый приём (10 ГиБ заявлено)
+/// резервирует 2 × 10 ГиБ; второй с тем же объёмом при запасе `min_free_bytes` = свободно − 30
+/// ГиБ не помещается — 507 до чтения тела. Резерв снимается, когда приём снят.
 #[tokio::test]
-async fn import_refused_when_disk_low() {
-    let w = world_cfg("imp-disk", |c| c.import.min_free_percent = 50).await;
-    note(&w.a, &w.o.tok, G, "x", "текст").await;
-    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
-    let root = w.a.st.data_dir.root().to_path_buf();
-    let free = fs4::available_space(&root).unwrap();
-    let total = fs4::total_space(&root).unwrap();
-    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
-    if free < (total / 2).max(1 << 30) {
-        ok(&r, StatusCode::INSUFFICIENT_STORAGE, "запас 50 %");
-    } else {
-        // свободно больше половины диска — та же проверка точкой теста
-        ok(&r, StatusCode::ACCEPTED, "места хватает");
-        wait_job(&w.a, Who::Tok(&w.rw.tok), r).await;
-        zam_server::backup::test_hooks::set_fail_point(
-            &w.a.st.cfg.data_dir,
-            Some("import_disk_full"),
+async fn import_refused_when_disk_low_with_reserve() {
+    const E: u64 = 10 << 30;
+    let probe = common::tmp("api-imp-disk-probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    let free = fs4::available_space(&probe).unwrap();
+    assert!(
+        free > 40 << 30,
+        "для теста нужно больше 40 ГиБ свободных: {free}"
+    );
+    let w = world_cfg("imp-disk", move |c| {
+        c.import.max_bytes = 64 << 30;
+        c.import.min_free_bytes = free - 3 * E;
+    })
+    .await;
+    let first = hanging_import(&w.a, &w.rw.tok, E);
+    let t0 = std::time::Instant::now();
+    while w.a.st.imports.disk_reserved() == 0 {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "первый приём не начался"
         );
-        let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
-        zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, None);
-        ok(&r, StatusCode::INSUFFICIENT_STORAGE, "точка места");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(w.a.st.imports.disk_reserved(), E);
+    // второй (другой пользователь): свободно − резерв < запас + 2 × E
+    let second = hanging_import(&w.a, &w.o.tok, E);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(15), second)
+        .await
+        .expect("второй приём не отвергнут: резерв первого не учтён")
+        .unwrap();
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE);
+    first.abort();
+    let _ = first.await;
+    let t0 = std::time::Instant::now();
+    while w.a.st.imports.disk_reserved() != 0 {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "резерв не снят"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(incoming_parts(&w.a).is_empty());
+}
+
+/// Запас по умолчанию (2 ГиБ) на обычном диске не отказывает; резерв снимается после задания;
+/// точка `import_disk_full` — 507.
+#[tokio::test]
+async fn import_default_disk_reserve_allows() {
+    let w = world("imp-disk-default").await;
+    assert_eq!(w.a.st.cfg.import.min_free_bytes, 2 << 30);
+    note(&w.a, &w.o.tok, G, "x", "текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await);
+    assert_eq!(w.a.st.imports.disk_reserved(), 0);
+    zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, Some("import_disk_full"));
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
+    zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, None);
+    ok(&r, StatusCode::INSUFFICIENT_STORAGE, "точка места");
+    assert_eq!(w.a.st.imports.disk_reserved(), 0);
+    assert_eq!(w.a.st.imports.running(), 0);
+}
+
+/// Отказ до приёма: клиенту с `Expect: 100-continue` тело не читается (hyper не шлёт `100`,
+/// клиент тело не отправит), без `Expect` — дочитывается (ответ дойдёт до потокового клиента).
+#[tokio::test]
+async fn import_refusal_skips_drain_on_expect() {
+    let w = world("imp-expect").await;
+    zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, Some("import_disk_full"));
+    for expect in [true, false] {
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let p = polled.clone();
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            p.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"PK"))
+        }));
+        let mut req = Request::post("/api/v1/spaces/knowledge/import")
+            .header(header::AUTHORIZATION, format!("Bearer {}", w.rw.tok));
+        if expect {
+            req = req.header(header::EXPECT, "100-continue");
+        }
+        let r = w.a.send(req.body(body).unwrap()).await;
+        ok(&r, StatusCode::INSUFFICIENT_STORAGE, "отказ места");
+        assert_eq!(
+            polled.load(std::sync::atomic::Ordering::SeqCst),
+            !expect,
+            "expect={expect}"
+        );
+    }
+    zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, None);
 }
 
 /// Паника внутри задания: задание кончается ошибкой 500, аудит `done` записан, слоты и учёт
