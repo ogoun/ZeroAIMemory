@@ -45,7 +45,7 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -74,6 +74,13 @@ pub const RECV_SLOTS: usize = 2;
 pub const WRITE_SLOTS: usize = 1;
 /// Итог задания хранится не меньше.
 pub const JOB_KEEP: Duration = Duration::from_secs(3600);
+/// Незавершённых заданий (приём, очередь, запись) на сервер не больше; у пользователя — одно.
+pub const MAX_PENDING: usize = 4;
+/// Элементов в списках итога задания не больше (`conflicts`, `unresolved`, `warnings`,
+/// `remapped`); полные числа — в `*_total`.
+pub const REPORT_LIST_MAX: usize = 1000;
+/// Свободного места после приёма — не меньше (и не меньше `import.min_free_percent` диска).
+const MIN_FREE_BYTES: u64 = 1 << 30;
 /// `Retry-After` при занятом слоте, с.
 const RETRY_AFTER_S: u64 = 30;
 /// Каталог временных файлов тела в каталоге данных.
@@ -90,6 +97,31 @@ const DEADLINE_SPEED: u64 = 1 << 20;
 const MIN_SPEED: u64 = 16 << 10;
 /// Первые секунды приёма скорость не проверяется.
 const SPEED_GRACE: Duration = Duration::from_secs(60);
+
+/// Сверх предела тела при отказе дочитывается не больше (клиент, пишущий тело потоком, иначе
+/// получает обрыв записи вместо ответа 413/503/507).
+const DRAIN_MAX: u64 = 16 << 20;
+/// Срок дочитывания при отказе.
+const DRAIN_TIME: Duration = Duration::from_secs(5);
+
+/// Дочитывает и выбрасывает тело (не больше [`DRAIN_MAX`] и [`DRAIN_TIME`]).
+async fn drain(s: &mut axum::body::BodyDataStream) {
+    let t0 = Instant::now();
+    let mut n = 0u64;
+    while n < DRAIN_MAX && t0.elapsed() < DRAIN_TIME {
+        match tokio::time::timeout(TICK, s.next()).await {
+            Ok(Some(Ok(c))) => n += c.len() as u64,
+            Ok(_) => return,
+            Err(_) => {}
+        }
+    }
+}
+
+/// Отказ до приёма тела — с дочитыванием тела (см. [`drain`]).
+async fn refuse(body: Body, e: ApiError) -> ApiError {
+    drain(&mut body.into_data_stream()).await;
+    e
+}
 
 /// Общий срок приёма тела до `max_bytes`.
 fn recv_deadline(max_bytes: u64) -> Duration {
@@ -120,6 +152,9 @@ pub struct ImportQuery {
     dry_run: Option<bool>,
     /// `X-Zam-User` администратора (как у экспорта).
     user: Option<String>,
+    /// Имя каталога «папки `.md`» (`zam import <каталог>`): входит в источник id назначения —
+    /// две разные папки не делят id.
+    folder: Option<String>,
 }
 
 fn options_of(q: &ImportQuery) -> Result<ImportOptions, ApiError> {
@@ -156,6 +191,8 @@ fn options_of(q: &ImportQuery) -> Result<ImportOptions, ApiError> {
 /// Состояние задания.
 #[derive(Clone)]
 struct Job {
+    /// Порядок создания (место в очереди).
+    seq: u64,
     user: Id,
     space: String,
     dry_run: bool,
@@ -173,6 +210,7 @@ pub struct ImportRuntime {
     recv_users: Arc<std::sync::Mutex<HashSet<Id>>>,
     write: Arc<tokio::sync::Semaphore>,
     jobs: std::sync::Mutex<HashMap<Id, Job>>,
+    seq: std::sync::atomic::AtomicU64,
 }
 
 impl Default for ImportRuntime {
@@ -182,6 +220,7 @@ impl Default for ImportRuntime {
             recv_users: Arc::default(),
             write: Arc::new(tokio::sync::Semaphore::new(WRITE_SLOTS)),
             jobs: std::sync::Mutex::default(),
+            seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -227,10 +266,54 @@ impl ImportRuntime {
             .count()
     }
 
-    fn insert(&self, id: Id, job: Job) {
+    /// Резерв задания до приёма тела (этап `receiving`): у пользователя — одно незавершённое
+    /// задание, на сервере — не больше [`MAX_PENDING`]; иначе 503 с `Retry-After`.
+    fn reserve(&self, id: Id, user: Id, space: &str, dry_run: bool) -> Result<(), ApiError> {
+        let busy = || ApiError::Busy {
+            retry_after_s: RETRY_AFTER_S,
+        };
         let mut j = self.jobs();
         j.retain(|_, x| x.finished.is_none_or(|t| t.elapsed() < JOB_KEEP));
-        j.insert(id, job);
+        let open: Vec<&Job> = j.values().filter(|x| x.finished.is_none()).collect();
+        if open.iter().any(|x| x.user == user) || open.len() >= MAX_PENDING {
+            return Err(busy());
+        }
+        j.insert(
+            id,
+            Job {
+                seq: self.seq.fetch_add(1, Ordering::SeqCst),
+                user,
+                space: space.to_string(),
+                dry_run,
+                stage: "receiving",
+                progress: Arc::new(Progress::default()),
+                report: None,
+                error: None,
+                finished: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Резерв снят (приём не удался).
+    fn drop_job(&self, id: Id) {
+        self.jobs().remove(&id);
+    }
+
+    /// Место задания в очереди: незавершённых заданий, созданных раньше и уже принятых.
+    fn queue_position(&self, id: Id) -> usize {
+        let j = self.jobs();
+        let Some(me) = j.get(&id) else { return 0 };
+        j.values()
+            .filter(|x| x.finished.is_none() && x.stage != "receiving" && x.seq < me.seq)
+            .count()
+    }
+
+    fn progress(&self, id: Id) -> Arc<Progress> {
+        self.jobs()
+            .get(&id)
+            .map(|j| j.progress.clone())
+            .unwrap_or_default()
     }
 
     fn stage(&self, id: Id, stage: &'static str) {
@@ -392,7 +475,7 @@ struct RecvLimits {
 /// Тело в файл `part` (см. [`RecvLimits`]); возвращает размер. Сервер останавливается
 /// (`stop`) — [`Recv::Stop`].
 async fn receive(
-    body: Body,
+    s: &mut axum::body::BodyDataStream,
     part: &FsPath,
     lim: &RecvLimits,
     stop: &AtomicBool,
@@ -401,7 +484,6 @@ async fn receive(
         tokio::fs::create_dir_all(dir).await.map_err(Recv::Io)?;
     }
     let mut f = tokio::fs::File::create(part).await.map_err(Recv::Io)?;
-    let mut s = body.into_data_stream();
     let mut n: u64 = 0;
     let t0 = Instant::now();
     let mut last = t0;
@@ -539,6 +621,64 @@ struct Target {
     space: Id,
 }
 
+/// Хватает ли места на диске каталога данных под тело `expected` байт: после приёма должно
+/// остаться не меньше `max(1 ГиБ, import.min_free_percent % диска)`; иначе 507. Тестовая точка
+/// `import_disk_full` — «места нет».
+fn disk_ok(st: &AppState, expected: u64) -> Result<(), ApiError> {
+    let root = st.data_dir.root();
+    let full = || {
+        ApiError::InsufficientStorage(
+            "на диске сервера мало места для приёма архива — освободите место и повторите".into(),
+        )
+    };
+    if crate::backup::fail_point(&st.cfg.data_dir, "import_disk_full").is_err() {
+        return Err(full());
+    }
+    let (Ok(free), Ok(total)) = (fs4::available_space(root), fs4::total_space(root)) else {
+        tracing::warn!("импорт: свободное место не определено — проверка пропущена");
+        return Ok(());
+    };
+    let reserve = MIN_FREE_BYTES.max(total / 100 * u64::from(st.cfg.import.min_free_percent));
+    if free < expected.saturating_add(reserve) {
+        return Err(full());
+    }
+    Ok(())
+}
+
+/// Страж обработчика на время приёма тела: обработчик снят (клиент оборвал соединение, hyper
+/// бросил запрос) — резерв задания снимается и пишется аудит `space.import.done` с
+/// `reason: client`. Снимается ([`RecvGuard::disarm`]), когда итог приёма записан явно.
+struct RecvGuard {
+    st: AppState,
+    job: Id,
+    audit: Option<Audit>,
+}
+
+impl RecvGuard {
+    fn disarm(mut self) -> Audit {
+        self.audit.take().expect("страж приёма снят один раз")
+    }
+}
+
+impl Drop for RecvGuard {
+    fn drop(&mut self) {
+        let Some(audit) = self.audit.take() else {
+            return;
+        };
+        self.st.imports.drop_job(self.job);
+        let st = self.st.clone();
+        tokio::spawn(async move {
+            let out = Outcome {
+                reason: Some("client"),
+                ..Outcome::default()
+            };
+            if let Err(e) = audit.done(&st, &out, false, None).await {
+                tracing::warn!(error = %e, "аудит оборванного импорта не записан");
+            }
+        });
+    }
+}
+
 pub async fn import(
     State(st): State<AppState>,
     p: Principal,
@@ -569,13 +709,30 @@ pub async fn import(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > limit) {
-        return Err(Recv::TooLarge.into_api(limit));
+        return Err(refuse(body, Recv::TooLarge.into_api(limit)).await);
     }
-    let slot = recv_slot(&st.imports, sc.user.id)?;
-    let mut attrib = crate::attrib::attribution(&p, &headers, None)?;
+    if let Err(e) = disk_ok(&st, declared.unwrap_or(limit)) {
+        return Err(refuse(body, e).await);
+    }
+    let slot = match recv_slot(&st.imports, sc.user.id) {
+        Ok(s) => s,
+        Err(e) => return Err(refuse(body, e).await),
+    };
+    let job = Id::new();
+    if let Err(e) = st.imports.reserve(job, sc.user.id, &space, opts.dry_run) {
+        return Err(refuse(body, e).await);
+    }
+    let mut attrib = match crate::attrib::attribution(&p, &headers, None) {
+        Ok(a) => a,
+        Err(e) => {
+            st.imports.drop_job(job);
+            return Err(e);
+        }
+    };
     attrib.area = None;
     opts.with_reports = p.is_human();
     opts.stop = Some(st.stopping.clone());
+    opts.folder = q.folder.clone();
     // точка теста повтора после обрыва: две записи в пачке, остановка после первой пачки
     if crate::backup::fail_point(&st.cfg.data_dir, "import_one_batch").is_err() {
         opts.batch = 2;
@@ -588,10 +745,15 @@ pub async fn import(
         space: sc.space.id,
         ip: client.ip.to_string(),
     };
-    audit
-        .start(&st, &q, &opts)
-        .await
-        .map_err(|e| ApiError::Internal(format!("аудит импорта: {e}")))?;
+    if let Err(e) = audit.start(&st, &q, &opts).await {
+        st.imports.drop_job(job);
+        return Err(ApiError::Internal(format!("аудит импорта: {e}")));
+    }
+    let guard = RecvGuard {
+        st: st.clone(),
+        job,
+        audit: Some(audit),
+    };
     let part = Part(
         st.data_dir
             .root()
@@ -606,9 +768,16 @@ pub async fn import(
         grace: SPEED_GRACE,
     };
     let mut out = Outcome::default();
-    match receive(body, &part.0, &lim, &st.stopping).await {
+    let mut stream = body.into_data_stream();
+    let received = receive(&mut stream, &part.0, &lim, &st.stopping).await;
+    if matches!(received, Err(Recv::TooLarge)) {
+        drain(&mut stream).await;
+    }
+    let audit = guard.disarm();
+    match received {
         Ok(n) => out.bytes = n,
         Err(e) => {
+            st.imports.drop_job(job);
             out.reason = Some(e.reason());
             let err = e.into_api(limit);
             if let Err(e) = audit.done(&st, &out, false, None).await {
@@ -618,30 +787,19 @@ pub async fn import(
         }
     }
     drop(slot);
-    let job = Id::new();
-    let progress = Arc::new(Progress::default());
-    opts.progress = Some(progress.clone());
-    st.imports.insert(
-        job,
-        Job {
-            user: sc.user.id,
-            space: space.clone(),
-            dry_run: opts.dry_run,
-            stage: "queued",
-            progress,
-            report: None,
-            error: None,
-            finished: None,
-        },
-    );
+    st.imports.stage(job, "queued");
+    opts.progress = Some(st.imports.progress(job));
     let target = Target {
         db: sc.db.clone(),
         owner: sc.owner,
         space: sc.space.id,
     };
     let st2 = st.clone();
+    let running = st.import_tasks.clone().enter();
     tokio::spawn(async move {
-        let res = run(
+        let _running = running;
+        // паника задания — ошибка задания, а не тихая потеря итога и аудита
+        let res = std::panic::AssertUnwindSafe(run(
             &st2,
             job,
             &target,
@@ -650,8 +808,18 @@ pub async fn import(
             opts.clone(),
             attrib,
             &mut out,
-        )
-        .await;
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            tracing::error!(job = %job, "задание импорта аварийно прервано");
+            Err(ApiError::Internal(
+                "задание импорта аварийно прервано".into(),
+            ))
+        });
+        if res.is_err() && out.reason.is_none() {
+            out.reason = Some("error");
+        }
         // записана хоть одна пачка — оповещения и на пути ошибки
         if opts
             .progress
@@ -667,7 +835,10 @@ pub async fn import(
             tracing::warn!(space = %target.space, error = %e, "аудит импорта не записан");
         }
         let res = match res {
-            Ok(r) => Ok(r),
+            Ok(mut r) => {
+                r.truncate_lists(REPORT_LIST_MAX);
+                Ok(r)
+            }
             Err(e) => {
                 tracing::warn!(job = %job, "импорт не завершён");
                 Err(problem(e).await)
@@ -706,10 +877,13 @@ pub async fn status(
         (Some(_), None) => "done",
         (Some(_), Some(_)) => "failed",
     };
+    // место в очереди — пока задание ждёт записи
+    let queue = (j.stage == "queued").then(|| st.imports.queue_position(id));
     Ok(Json(json!({
         "job": id,
         "state": state,
         "stage": j.stage,
+        "queue": queue,
         "dry_run": j.dry_run,
         "progress": {
             "total": j.progress.total.load(Ordering::SeqCst),
@@ -747,6 +921,10 @@ async fn run(
     out: &mut Outcome,
 ) -> Result<ImportReport, ApiError> {
     let _write = write_slot(st).await.map_err(|e| import_err(e, out))?;
+    // точка теста стража задания: паника внутри задания
+    if crate::backup::fail_point(&st.cfg.data_dir, "import_panic").is_err() {
+        panic!("тестовая паника задания импорта");
+    }
     st.imports.stage(job, "validating");
     let limits = ImportLimits {
         max_bytes: limit,
@@ -755,6 +933,7 @@ async fn run(
         max_text_bytes: st.cfg.import.max_text_bytes,
     };
     let path = part.0.clone();
+    let folder = opts.folder.clone();
     let mut plan: Plan = tokio::task::spawn_blocking(move || {
         let f = std::fs::File::open(&path).map_err(|e| ImportError::Store(e.into()))?;
         let mut z = zip::ZipArchive::new(std::io::BufReader::new(f))
@@ -764,6 +943,7 @@ async fn run(
     .await
     .map_err(|e| ApiError::Internal(format!("проверка архива: {e}")))?
     .map_err(|e| import_err(e, out))?;
+    plan.folder_label = folder;
     let own = plan.is_own(t.owner, opts.own);
     opts.own = own;
     let mut warnings = Vec::new();
@@ -853,6 +1033,7 @@ async fn run(
 }
 
 /// Аудит импорта без текста.
+#[derive(Clone)]
 struct Audit {
     actor: String,
     user: Id,
@@ -943,6 +1124,7 @@ mod tests {
             axioms: a.map(str::to_string),
             dry_run: None,
             user: None,
+            folder: None,
         }
     }
 
@@ -1003,7 +1185,8 @@ mod tests {
         let run = async |l: RecvLimits, stop: bool| {
             let t0 = Instant::now();
             let stop = AtomicBool::new(stop);
-            let r = tokio::time::timeout(limit, receive(silent(), &p, &l, &stop))
+            let mut s = silent().into_data_stream();
+            let r = tokio::time::timeout(limit, receive(&mut s, &p, &l, &stop))
                 .await
                 .expect("приём ждал молчащего клиента дольше 10 с");
             assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());

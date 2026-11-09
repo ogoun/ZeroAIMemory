@@ -35,6 +35,14 @@ fn stderr(o: &Output) -> String {
 
 /// Сервер в фоновом потоке с заметками `docs/a` и `other` в knowledge пользователя: адрес, токен.
 fn start(name: &str) -> (String, String) {
+    start_with(name, |_| {})
+}
+
+/// [`start`] с правкой конфигурации сервера.
+fn start_with(
+    name: &str,
+    tweak: impl FnOnce(&mut ServerConfig) + Send + 'static,
+) -> (String, String) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -43,10 +51,13 @@ fn start(name: &str) -> (String, String) {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let cfg = ServerConfig {
+            let mut cfg = ServerConfig {
                 data_dir: data,
                 ..ServerConfig::default()
             };
+            // запас 5 % диска на почти полном диске разработчика отверг бы импорт
+            cfg.import.min_free_percent = 0;
+            tweak(&mut cfg);
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
             let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
@@ -315,6 +326,193 @@ fn cli_import_folder_md() {
     // повтор «папки .md» идемпотентен: та же заметка по пути и хэшу
     assert_eq!(rep["created"], 0, "{rep}");
     assert_eq!(rep["skipped"], 2, "{rep}");
+    assert_eq!(rep["id_remapped"], 0, "{rep}");
     assert!(rep["conflicts"].as_array().unwrap().is_empty(), "{rep}");
     assert!(stderr(&o).contains("не отменяется"), "{}", stderr(&o));
+}
+
+/// Заглушка сервера: на каждое соединение — следующий ответ списка (`None` — закрыть соединение
+/// без ответа: сетевой сбой); тело запроса дочитывается по `Content-Length`.
+fn stub(answers: Vec<Option<String>>) -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut answers = answers.into_iter();
+        for c in l.incoming().flatten() {
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = r.read_exact(&mut body);
+            let Some(next) = answers.next() else { return };
+            let mut c = c;
+            match next {
+                None => drop(c),
+                Some(a) => {
+                    let _ = c.write_all(a.as_bytes());
+                    let _ = c.flush();
+                }
+            }
+        }
+    });
+    url
+}
+
+fn http(status: &str, body: &str) -> Option<String> {
+    Some(format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    ))
+}
+
+const ACCEPTED: &str = r#"{"job":"01J00000000000000000000000","status":"/spaces/knowledge/imports/01J00000000000000000000000"}"#;
+const DONE: &str = r#"{"state":"done","stage":"done","queue":null,"progress":{"total":1,"done":1},"report":{"created":1,"revised":0,"skipped":0,"conflicts":[],"demoted_axioms":0,"id_remapped":0,"links_skipped":0,"warnings":[],"unresolved":[],"dry_run":false}}"#;
+
+fn zip_file(r: &Path) -> PathBuf {
+    let p = r.join("a.zip");
+    std::fs::write(&p, b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+    p
+}
+
+fn zam_idle(url: &str, cwd: &Path, idle: &str, args: &[&str]) -> Output {
+    common::zam_cmd()
+        .env("ZAM_URL", url)
+        .env("ZAM_TOKEN", "t")
+        .env("HOME", cwd)
+        .env("USERPROFILE", cwd)
+        .env("ZAM_IMPORT_IDLE_SECS", idle)
+        .current_dir(cwd)
+        .args(args)
+        .timeout(Duration::from_secs(60))
+        .output()
+        .unwrap()
+}
+
+/// Задание пропало (сервер перезапущен, опрос — 404): понятное сообщение, код 2.
+#[test]
+fn cli_import_job_lost_404() {
+    let url = stub(vec![
+        http("202 Accepted", ACCEPTED),
+        http("404 Not Found", r#"{"status":404,"detail":"не найдено"}"#),
+    ]);
+    let r = tmp("imp-lost");
+    zip_file(&r);
+    let o = zam_idle(&url, &r, "30", &["import", "a.zip", "--space", "knowledge"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("сервер перезапущен"), "{}", stderr(&o));
+}
+
+/// Сетевой сбой опроса — повтор в пределах сторожа, итог получен.
+#[test]
+fn cli_import_poll_retries_network() {
+    let url = stub(vec![
+        http("202 Accepted", ACCEPTED),
+        None,
+        http("200 OK", DONE),
+    ]);
+    let r = tmp("imp-retry");
+    zip_file(&r);
+    let o = zam_idle(
+        &url,
+        &r,
+        "30",
+        &["import", "a.zip", "--space", "knowledge", "--json"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let rep: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(rep["created"], 1);
+}
+
+/// Ожидание в очереди — не простой: сторож 1 с, задание три опроса в очереди, итог получен;
+/// место в очереди напечатано.
+#[test]
+fn cli_import_queued_is_not_idle() {
+    let queued =
+        r#"{"state":"running","stage":"queued","queue":2,"progress":{"total":0,"done":0}}"#;
+    let url = stub(vec![
+        http("202 Accepted", ACCEPTED),
+        http("200 OK", queued),
+        http("200 OK", queued),
+        http("200 OK", queued),
+        http("200 OK", DONE),
+    ]);
+    let r = tmp("imp-queued");
+    zip_file(&r);
+    let o = zam_idle(
+        &url,
+        &r,
+        "1",
+        &["import", "a.zip", "--space", "knowledge", "--json"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("в очереди, впереди заданий: 2"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// Сервер отверг тело (413), пока упаковщик ещё пишет каталог (`BrokenPipe`): показывается
+/// ошибка запроса, а не упаковки.
+#[test]
+fn cli_import_http_error_beats_broken_pipe() {
+    let (url, tok) = start_with("imp-413", |c| c.import.max_bytes = 1 << 20);
+    let r = tmp("imp-413-repo");
+    let src = r.join("big");
+    std::fs::create_dir_all(&src).unwrap();
+    // плохо сжимаемый текст: после deflate больше 1 МиБ
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let text: String = (0..(4 << 20))
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'a' + (x % 26) as u8)
+        })
+        .collect();
+    std::fs::write(src.join("big.md"), text).unwrap();
+    let o = zam(&url, &tok, &r, &["import", "big", "--space", "knowledge"]);
+    assert_eq!(o.status.code(), Some(6), "{}", stderr(&o));
+    assert!(stderr(&o).contains("HTTP 413"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("упаковка"), "{}", stderr(&o));
+}
+
+/// Две разные папки с одинаковыми файлами не делят id: вторая — конфликт `path-taken`, а не
+/// «та же заметка»; повтор первой — пропуск без переназначений.
+#[test]
+fn cli_import_two_folders_distinct_ids() {
+    let (url, tok) = start("imp-2dirs");
+    let r = tmp("imp-2dirs-repo");
+    for d in ["one", "two"] {
+        std::fs::create_dir_all(r.join(d)).unwrap();
+        std::fs::write(r.join(d).join("x.md"), "# X\n\nодинаково\n").unwrap();
+    }
+    let run = |d: &str| {
+        let o = zam(
+            &url,
+            &tok,
+            &r,
+            &["import", d, "--space", "knowledge", "--json"],
+        );
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()
+    };
+    assert_eq!(run("one")["created"], 1);
+    let two = run("two");
+    assert_eq!(two["created"], 0, "{two}");
+    assert_eq!(two["skipped"], 0, "{two}");
+    assert_eq!(two["conflicts"][0]["reason"], "path-taken", "{two}");
+    let again = run("one");
+    assert_eq!(again["skipped"], 1, "{again}");
+    assert_eq!(again["id_remapped"], 0, "{again}");
 }

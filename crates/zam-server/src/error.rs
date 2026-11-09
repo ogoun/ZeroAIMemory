@@ -130,6 +130,10 @@ pub enum ApiError {
     ShuttingDown { retry_after_s: u64 },
     #[error("{0}")]
     Unavailable(String),
+    /// 507 `/problems/insufficient-storage`: на диске сервера мало места для приёма (импорт
+    /// пространства, M6 §12б.5).
+    #[error("{0}")]
+    InsufficientStorage(String),
     /// 408 `/problems/timeout`: тело запроса не получено в срок ([`crate::api::big_body`]).
     #[error("{0}")]
     RequestTimeout(String),
@@ -301,6 +305,11 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "about:blank",
                 "Service Unavailable",
+            ),
+            ApiError::InsufficientStorage(_) => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "/problems/insufficient-storage",
+                "Insufficient Storage",
             ),
             ApiError::VaultLocked(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,

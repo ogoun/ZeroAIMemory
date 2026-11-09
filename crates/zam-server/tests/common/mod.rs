@@ -29,6 +29,9 @@ pub fn cfg_in(dir: PathBuf) -> ServerConfig {
         ..ServerConfig::default()
     };
     c.docs.worker_program = Some(PathBuf::from(env!("CARGO_BIN_EXE_zam-server")));
+    // диск разработчика почти полон: запас 5 % диска отверг бы любой импорт в тестах (запас
+    // 1 ГиБ остаётся; сам отказ проверяет `import_refused_when_disk_low`)
+    c.import.min_free_percent = 0;
     c
 }
 

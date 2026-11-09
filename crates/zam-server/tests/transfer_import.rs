@@ -843,9 +843,24 @@ async fn foreign_import_same_server_keeps_owner_search() {
         v.sort();
         v
     };
+    // воркер затих (пачки и свёртки L0 папок закончены), точки A больше не меняются
+    let settle = async || {
+        let t = std::time::Instant::now();
+        let mut last = Vec::new();
+        loop {
+            let st = w.a.st.index.worker.status();
+            let now = points_of(&w.o.id);
+            if !st.batch_running && st.rollups_pending == 0 && now == last && !now.is_empty() {
+                return now;
+            }
+            assert!(t.elapsed() < common::ml::READY, "воркер не затих: {st:?}");
+            last = now;
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+    };
     let before = search().await;
     assert!(!before.is_empty());
-    let a_points = points_of(&w.o.id);
+    let a_points = settle().await;
     assert!(!a_points.is_empty());
     // коллизия своего архива видна по точкам Qdrant другого тенанта
     let a_node: Id = node_by_path(&adb, "kb/rust")
@@ -870,7 +885,7 @@ async fn foreign_import_same_server_keeps_owner_search() {
         async || all_indexed(&bdb).await && !points_of(&w.rw.id).is_empty(),
     )
     .await;
-    assert_eq!(points_of(&w.o.id), a_points, "точки A изменились");
+    assert_eq!(settle().await, a_points, "точки A изменились");
     assert_eq!(search().await, before, "поиск A изменился");
     let b_ids: BTreeSet<String> = points_of(&w.rw.id)
         .into_iter()
@@ -1240,6 +1255,7 @@ async fn reimport_same_archive_only_skipped() {
     assert_eq!(n(&r2, "created"), 0, "{r2}");
     assert_eq!(n(&r2, "revised"), 0, "{r2}");
     assert_eq!(n(&r2, "skipped"), n(&r1, "created"), "{r1} / {r2}");
+    assert_eq!(n(&r2, "id_remapped"), 0, "{r2}");
     assert!(r2["conflicts"].as_array().unwrap().is_empty(), "{r2}");
     assert_eq!(live_counts(&bdb).await, before);
 }
@@ -1801,6 +1817,8 @@ async fn import_busy_when_slot_taken() {
         (Some("running"), Some("queued")),
         "{s}"
     );
+    // место в очереди: впереди никого (слот держит тест, а не задание)
+    assert_eq!(s["queue"], json!(0), "{s}");
     drop(hold);
     let r = wait_job(&w.a, Who::Tok(&w.rw.tok), r).await;
     assert_eq!(n(&report(&r), "created"), 1);
@@ -2165,4 +2183,242 @@ async fn import_revision_invalid_certainty_conflict() {
         "{r}"
     );
     assert_eq!(n(&r, "revised"), 0);
+}
+
+// ---------- повторное ревью: свой элемент, пределы заданий, стражи ----------
+
+/// Возобновление: поздняя пачка ссылается на документ вложения (`d:`) и папку (`n:`), созданные
+/// оборванной первой попыткой, — детерминированный id в своём пространстве того же вида — свой
+/// элемент: висячих ссылок нет, переназначений нет.
+#[tokio::test]
+async fn import_resume_refs_to_doc_and_folder() {
+    let w = world("imp-resume-d").await;
+    let (a, o) = (&w.a, &w.o);
+    let nid = note(a, &o.tok, G, "a0", "# С вложением").await;
+    common::attach::upload(a, &o.tok, &nid, "a.txt", b"plain text attachment").await;
+    note(a, &o.tok, G, "docs/x", "# В папке").await;
+    let odb = db(a, &o.id).await;
+    let doc = rows(&odb, "SELECT id FROM attachment_docs", vec![]).await[0][0]
+        .clone()
+        .unwrap();
+    let folder = node_by_path(&odb, "docs").await.unwrap();
+    entry(
+        a,
+        &o.tok,
+        G,
+        json!({"kind": "insight", "title": "Ссылки на раннее",
+               "body": format!("см. d:{doc} и n:{folder}"), "data": {"kind": "pattern"}}),
+    )
+    .await;
+    let zip = export_tok(a, &o.tok, G, "").await;
+    zam_server::backup::test_hooks::set_fail_point(&a.st.cfg.data_dir, Some("import_one_batch"));
+    let r = import_tok(a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    zam_server::backup::test_hooks::set_fail_point(&a.st.cfg.data_dir, None);
+    ok(
+        &r,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "остановка после первой пачки",
+    );
+    let bdb = db(a, &w.rw.id).await;
+    assert_eq!(
+        q1(&bdb, "SELECT count(*) FROM attachment_docs", vec![]).await,
+        1
+    );
+    let r = report(&import_tok(a, &w.rw.tok, "knowledge", "", zip).await);
+    assert_eq!(n(&r, "id_remapped"), 0, "{r}");
+    let e = entry_by_title(&bdb, "Ссылки на раннее").await;
+    let body = get_entry(a, &w.rw.tok, &e).await["body"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let d2 = rows(&bdb, "SELECT id FROM attachment_docs", vec![]).await[0][0]
+        .clone()
+        .unwrap();
+    let f2 = node_by_path(&bdb, "docs").await.unwrap();
+    assert_eq!(body, format!("см. d:{d2} и n:{f2}"));
+    assert_eq!(
+        q1(&bdb, "SELECT count(*) FROM attachment_docs", vec![]).await,
+        1
+    );
+}
+
+/// Одно незавершённое задание у пользователя, не больше четырёх на сервере — иначе 503 с
+/// `Retry-After`.
+#[tokio::test]
+async fn import_pending_limits_per_user_and_server() {
+    let w = world("imp-pending").await;
+    note(&w.a, &w.o.tok, G, "x", "текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let hold = w.a.st.imports.hold_write();
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    ok(&r, StatusCode::ACCEPTED, "первое задание");
+    let r2 = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    ok(
+        &r2,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "второе задание пользователя",
+    );
+    assert_eq!(r2.header("retry-after"), "30");
+    // ещё трое пользователей — до предела сервера, пятый — 503
+    let mut toks = vec![w.o.tok.clone(), w.ro.tok.clone()];
+    let (_, t4) = w.a.new_user("Галина").await;
+    let (_, t5) = w.a.new_user("Дмитрий").await;
+    toks.push(t4);
+    for t in &toks {
+        let rr = post_tok(&w.a, t, "knowledge", "", zip.clone()).await;
+        ok(&rr, StatusCode::ACCEPTED, "до предела");
+    }
+    assert_eq!(
+        w.a.st.imports.running(),
+        zam_server::api::transfer::import::MAX_PENDING
+    );
+    let r5 = post_tok(&w.a, &t5, "knowledge", "", zip.clone()).await;
+    ok(
+        &r5,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "сверх предела сервера",
+    );
+    assert_eq!(r5.header("retry-after"), "30");
+    drop(hold);
+    report(&wait_job(&w.a, Who::Tok(&w.rw.tok), r).await);
+    // итог получен — пользователь снова может импортировать
+    let t0 = std::time::Instant::now();
+    while w.a.st.imports.running() > 0 {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(60));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+}
+
+/// Мало места на диске: после приёма осталось бы меньше `max(1 ГиБ, min_free_percent %)` —
+/// 507 до чтения тела.
+#[tokio::test]
+async fn import_refused_when_disk_low() {
+    let w = world_cfg("imp-disk", |c| c.import.min_free_percent = 50).await;
+    note(&w.a, &w.o.tok, G, "x", "текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let root = w.a.st.data_dir.root().to_path_buf();
+    let free = fs4::available_space(&root).unwrap();
+    let total = fs4::total_space(&root).unwrap();
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    if free < (total / 2).max(1 << 30) {
+        ok(&r, StatusCode::INSUFFICIENT_STORAGE, "запас 50 %");
+    } else {
+        // свободно больше половины диска — та же проверка точкой теста
+        ok(&r, StatusCode::ACCEPTED, "места хватает");
+        wait_job(&w.a, Who::Tok(&w.rw.tok), r).await;
+        zam_server::backup::test_hooks::set_fail_point(
+            &w.a.st.cfg.data_dir,
+            Some("import_disk_full"),
+        );
+        let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
+        zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, None);
+        ok(&r, StatusCode::INSUFFICIENT_STORAGE, "точка места");
+    }
+    assert!(incoming_parts(&w.a).is_empty());
+}
+
+/// Паника внутри задания: задание кончается ошибкой 500, аудит `done` записан, слоты и учёт
+/// задач свободны.
+#[tokio::test]
+async fn import_job_panic_reports_error() {
+    let w = world("imp-panic").await;
+    note(&w.a, &w.o.tok, G, "x", "текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, Some("import_panic"));
+    let r = import_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, None);
+    ok(&r, StatusCode::INTERNAL_SERVER_ERROR, "паника задания");
+    let t0 = std::time::Instant::now();
+    loop {
+        let rows = w.a.st.system.list_audit(100, None).await.unwrap();
+        if let Some(d) = rows.iter().find(|r| r.action == "space.import.done") {
+            assert_eq!(d.details["complete"], json!(false), "{:?}", d.details);
+            break;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "нет аудита done"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        w.a.st.imports.write_available(),
+        zam_server::api::transfer::import::WRITE_SLOTS
+    );
+    assert_eq!(w.a.st.import_tasks.running(), 0);
+    report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+}
+
+/// Задание учитывается в задачах остановки (`import_tasks`), пока не кончилось.
+#[tokio::test]
+async fn import_job_counted_for_shutdown() {
+    let w = world("imp-tasks").await;
+    note(&w.a, &w.o.tok, G, "x", "текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let hold = w.a.st.imports.hold_write();
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
+    ok(&r, StatusCode::ACCEPTED, "принято");
+    assert_eq!(w.a.st.import_tasks.running(), 1);
+    assert!(
+        !w.a.st
+            .wait_exports(std::time::Duration::from_millis(200))
+            .await
+    );
+    drop(hold);
+    report(&wait_job(&w.a, Who::Tok(&w.rw.tok), r).await);
+    assert!(w.a.st.wait_exports(std::time::Duration::from_secs(5)).await);
+}
+
+/// Обработчик снят посреди приёма тела (клиент оборвал соединение — hyper бросает запрос):
+/// страж пишет аудит `done` с `reason: client`, резерв задания снят, `.part` удалён.
+#[tokio::test]
+async fn import_disconnect_mid_body_audited() {
+    let w = world("imp-midbody").await;
+    let app = w.a.app.clone();
+    let tok = w.rw.tok.clone();
+    let hang = tokio::spawn(async move {
+        let first: Result<axum::body::Bytes, std::io::Error> =
+            Ok(axum::body::Bytes::from(vec![1u8; 100_000]));
+        let body = Body::from_stream(futures_util::StreamExt::chain(
+            futures_util::stream::iter([first]),
+            futures_util::stream::pending(),
+        ));
+        let req = Request::post("/api/v1/spaces/knowledge/import")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(body)
+            .unwrap();
+        let _ = tower::ServiceExt::oneshot(app, req).await;
+    });
+    let t0 = std::time::Instant::now();
+    while incoming_parts(&w.a).is_empty() {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "приём не начался"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        w.a.st.imports.running(),
+        1,
+        "резерв задания на время приёма"
+    );
+    hang.abort();
+    let _ = hang.await;
+    let t0 = std::time::Instant::now();
+    loop {
+        let rows = w.a.st.system.list_audit(100, None).await.unwrap();
+        if let Some(d) = rows.iter().find(|r| r.action == "space.import.done") {
+            assert_eq!(d.details["reason"], json!("client"), "{:?}", d.details);
+            assert_eq!(d.details["complete"], json!(false));
+            break;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "нет аудита done"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(w.a.st.imports.running(), 0, "резерв задания не снят");
+    assert!(incoming_parts(&w.a).is_empty());
 }

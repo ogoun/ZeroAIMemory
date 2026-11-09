@@ -1317,6 +1317,9 @@ pub struct ImportSection {
     /// держит в памяти план импорта — их объём не больше, байт (1 МиБ..=64 ГиБ, 256 МиБ): больше —
     /// 422.
     pub max_text_bytes: u64,
+    /// После приёма тела на диске каталога данных должно остаться не меньше
+    /// `max(1 ГиБ, min_free_percent % диска)`, иначе 507 (0..=50, 5).
+    pub min_free_percent: u8,
 }
 
 impl Default for ImportSection {
@@ -1325,6 +1328,7 @@ impl Default for ImportSection {
             max_bytes: 2 << 30,
             max_files: 100_000,
             max_text_bytes: zam_store::import::MAX_TEXT_BYTES_DEFAULT,
+            min_free_percent: 5,
         }
     }
 }
@@ -1346,6 +1350,9 @@ impl ImportSection {
         }
         if !(1..=1_000_000).contains(&self.max_files) {
             return Err(bad("max_files", "от 1 до 1000000"));
+        }
+        if self.min_free_percent > 50 {
+            return Err(bad("min_free_percent", "от 0 до 50"));
         }
         if !(MIB..=MAX).contains(&self.max_text_bytes) {
             return Err(bad(
@@ -2841,10 +2848,14 @@ master_key = \"x\"
             ("ZAM_IMPORT__MAX_FILES", "0"),
             ("ZAM_IMPORT__MAX_FILES", "1000001"),
             ("ZAM_IMPORT__MAX_TEXT_BYTES", "1048575"),
+            ("ZAM_IMPORT__MIN_FREE_PERCENT", "51"),
         ] {
             let r = load(None, &[env(k, v)], &Default::default());
             assert!(
-                r.unwrap_err().to_string().contains("import.max_"),
+                r.unwrap_err().to_string().contains(&format!(
+                    "import.{}",
+                    k.trim_start_matches("ZAM_IMPORT__").to_lowercase()
+                )),
                 "{k}={v}"
             );
         }

@@ -448,18 +448,63 @@ fn exit_of(status: u64) -> u8 {
 /// [`import_idle`] — выход с кодом 2 (задание на сервере продолжается).
 fn poll_job(ctx: &Ctx, status: &str, job: &str) -> Result<serde_json::Value, CliError> {
     let idle = import_idle();
-    let mut last = (String::new(), u64::MAX);
+    let mut last = (String::new(), u64::MAX, u64::MAX);
     let mut moved = Instant::now();
+    let lost = || {
+        CliError::new(
+            EXIT_UNREACHABLE,
+            format!(
+                "задание импорта {job} на сервере не найдено: сервер перезапущен — повторите \
+                 импорт, записанное пропустится"
+            ),
+        )
+    };
     loop {
-        let s = crate::client::read_json(ctx.client.get(status, &[])?)?;
+        let idle_err = |moved: Instant| {
+            (moved.elapsed() > idle).then(|| {
+                CliError::new(
+                    EXIT_UNREACHABLE,
+                    format!(
+                        "сервер не сообщает о ходе импорта дольше {} с ({IMPORT_IDLE_ENV}); \
+                         задание {job} продолжается на сервере: GET /api/v1{status}",
+                        idle.as_secs()
+                    ),
+                )
+            })
+        };
+        // сетевой сбой — повтор в пределах сторожа; 404 — задание потеряно (перезапуск)
+        let s = match ctx
+            .client
+            .get(status, &[])
+            .and_then(crate::client::read_json)
+        {
+            Ok(s) => s,
+            Err(e) if e.http_status() == Some(404) => return Err(lost()),
+            Err(e) if e.http_status().is_none() => {
+                if let Some(err) = idle_err(moved) {
+                    return Err(err);
+                }
+                eprintln!("импорт {job}: сервер не ответил ({e}) — повтор");
+                std::thread::sleep(POLL);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let stage = s["stage"].as_str().unwrap_or("?").to_string();
         let done = s["progress"]["done"].as_u64().unwrap_or(0);
-        if (stage.clone(), done) != last {
-            if stage != last.0 {
-                let total = s["progress"]["total"].as_u64().unwrap_or(0);
+        let queue = s["queue"].as_u64().unwrap_or(u64::MAX);
+        if (stage.clone(), done, queue) != last {
+            let total = s["progress"]["total"].as_u64().unwrap_or(0);
+            if stage == "queued" {
+                eprintln!("импорт {job}: в очереди, впереди заданий: {}", s["queue"]);
+            } else if stage != last.0 {
                 eprintln!("импорт {job}: {stage} ({done}/{total})");
             }
-            last = (stage, done);
+            last = (stage.clone(), done, queue);
+            moved = Instant::now();
+        }
+        // ожидание в очереди — не простой
+        if stage == "queued" {
             moved = Instant::now();
         }
         match s["state"].as_str() {
@@ -479,18 +524,24 @@ fn poll_job(ctx: &Ctx, status: &str, job: &str) -> Result<serde_json::Value, Cli
             }
             _ => {}
         }
-        if moved.elapsed() > idle {
-            return Err(CliError::new(
-                EXIT_UNREACHABLE,
-                format!(
-                    "сервер не сообщает о ходе импорта дольше {} с ({IMPORT_IDLE_ENV}); задание \
-                     {job} продолжается на сервере: GET /api/v1{status}",
-                    idle.as_secs()
-                ),
-            ));
+        if let Some(err) = idle_err(moved) {
+            return Err(err);
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// Значение параметра запроса: всё, кроме ASCII-букв и цифр, — `%XX`.
+fn qenc(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
@@ -507,6 +558,14 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
     }
     if a.dry_run {
         q.push("dry_run=true".into());
+    }
+    // имя каталога «папки .md» — в источнике id назначения: разные папки не делят id
+    if a.src.is_dir()
+        && let Some(name) = std::fs::canonicalize(a.src)
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    {
+        q.push(format!("folder={}", qenc(&name)));
     }
     let path = if q.is_empty() {
         format!("/spaces/{space}/import")
@@ -550,17 +609,13 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
             a.src.display()
         )));
     };
-    // ошибка упаковки важнее ответа сервера на оборванный архив
-    if let Some(h) = packer {
-        match h.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(m)) => return Err(CliError::config(format!("упаковка каталога: {m}"))),
-            Err(_) => return Err(CliError::config("упаковка каталога прервана")),
-        }
-    }
-    let resp = match sent {
-        Ok(r) => r,
-        Err(e) if e.http_status() == Some(404) => {
+    // ответ сервера с ошибкой (413, 503 с Retry-After…) важнее: упаковщик при этом ловит
+    // BrokenPipe — сервер перестал читать тело
+    let packed = packer.map(|h| h.join());
+    if let Err(e) = &sent
+        && e.http_status().is_some()
+    {
+        if e.http_status() == Some(404) {
             ctx.client.set_timeouts(Timeouts::Transfer);
             if ctx
                 .client
@@ -569,10 +624,28 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
             {
                 return Err(CliError::new(EXIT_CONFIG, OLD_SERVER_IMPORT));
             }
-            return Err(e);
         }
-        Err(e) => return Err(e),
-    };
+        return sent.map(|_| ());
+    }
+    // сервер оборвал приём, не дав ответа (тело сильно больше предела): ошибка запроса — с
+    // подсказкой, а не «упаковка каталога»
+    if let Err(e) = &sent
+        && matches!(packed, Some(Ok(Err(_))))
+    {
+        return Err(CliError::new(
+            EXIT_UNREACHABLE,
+            format!(
+                "сервер прервал приём архива: {e}; частые причины — архив больше \
+                 import.max_bytes сервера или сервер занят"
+            ),
+        ));
+    }
+    match packed {
+        None | Some(Ok(Ok(()))) => {}
+        Some(Ok(Err(m))) => return Err(CliError::config(format!("упаковка каталога: {m}"))),
+        Some(Err(_)) => return Err(CliError::config("упаковка каталога прервана")),
+    }
+    let resp = sent?;
     let accepted = crate::client::read_json(resp)?;
     let job = accepted["job"].as_str().unwrap_or_default().to_string();
     let status = accepted["status"]

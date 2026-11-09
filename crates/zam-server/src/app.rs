@@ -72,6 +72,9 @@ pub struct AppState {
     /// Импорт пространства (M6 §12б.5): слоты приёма, очередь записи, задания в памяти
     /// ([`api::transfer::import::ImportRuntime`]).
     pub imports: Arc<api::transfer::import::ImportRuntime>,
+    /// Идущие задания импорта: остановка ждёт их аудит `space.import.done` (вместе с
+    /// экспортами, не дольше 1 с).
+    pub import_tasks: Arc<TaskCount>,
     /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
     /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
     #[cfg(feature = "test-hooks")]
@@ -122,7 +125,7 @@ impl AppState {
     /// `space.export.done`) не дольше `limit`; `true` — все закончились.
     pub async fn wait_exports(&self, limit: std::time::Duration) -> bool {
         let t0 = Instant::now();
-        while self.export_tasks.running() > 0 {
+        while self.export_tasks.running() + self.import_tasks.running() > 0 {
             if t0.elapsed() >= limit {
                 return false;
             }
@@ -388,6 +391,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         stopping: Arc::default(),
         export_tasks: Arc::default(),
         imports: Arc::default(),
+        import_tasks: Arc::default(),
         big_bodies: api::big_body::BigBodies::new(
             api::big_body::BIG_BODY_PERMITS,
             api::note_body_max(&cfg.limits),

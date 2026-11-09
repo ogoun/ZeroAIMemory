@@ -136,6 +136,8 @@ pub struct ImportOptions {
     pub batch: usize,
     /// Прервать запись после стольких пачек как при остановке (точка теста повтора после обрыва).
     pub stop_after: Option<usize>,
+    /// Имя каталога «папки `.md`» (источник id назначения).
+    pub folder: Option<String>,
 }
 
 /// Ход записи импорта.
@@ -154,6 +156,10 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportedFrom {
     pub archive_fingerprint: String,
+    /// Источник архива ([`Plan::source_key`]): повтор сопоставляется по источнику и ключу —
+    /// одинаковые пути двух разных «папок `.md`» не одна заметка.
+    #[serde(default)]
+    pub source: String,
     pub source_id: String,
     pub source_rev: u32,
     /// Хэш исходного содержимого: sha256 текста заметки, у записи — [`entry_hash`].
@@ -197,9 +203,26 @@ pub struct ImportReport {
     pub archive_fingerprint: String,
     /// Свой архив (аксиомы и id как есть).
     pub own: bool,
+    /// Полные длины списков (сами списки в итоге задания урезаются, [`ImportReport::truncate_lists`]).
+    pub conflicts_total: u64,
+    pub unresolved_total: u64,
+    pub warnings_total: u64,
+    pub remapped_total: u64,
 }
 
 impl ImportReport {
+    /// Списки не длиннее `max` элементов; полные длины — в `*_total`.
+    pub fn truncate_lists(&mut self, max: usize) {
+        self.conflicts_total = self.conflicts.len() as u64;
+        self.unresolved_total = self.unresolved.len() as u64;
+        self.warnings_total = self.warnings.len() as u64;
+        self.remapped_total = self.remapped.len() as u64;
+        self.conflicts.truncate(max);
+        self.unresolved.truncate(max);
+        self.warnings.truncate(max);
+        self.remapped.truncate(max);
+    }
+
     fn merge(&mut self, o: ImportReport) {
         self.created += o.created;
         self.revised += o.revised;
@@ -397,6 +420,8 @@ pub struct Plan {
     /// Есть опись (архив экспорта); нет — «папка `.md`».
     pub has_manifest: bool,
     pub source_user_id: Option<Id>,
+    /// Имя каталога «папки `.md`» (`zam import <каталог>`): входит в источник id назначения.
+    pub folder_label: Option<String>,
     /// Пространство архива (`space` описи): `data.task_space` вопросов-предложений «начать»,
     /// указывающий на него, переводится на пространство назначения.
     pub source_space: Option<Id>,
@@ -433,7 +458,7 @@ impl Plan {
         match (self.has_manifest, self.source_user_id, self.source_space) {
             (true, Some(u), Some(s)) => format!("{u}/{s}"),
             (true, u, s) => format!("{u:?}/{s:?}"),
-            (false, _, _) => "folder".into(),
+            (false, _, _) => format!("folder:{}", self.folder_label.as_deref().unwrap_or("")),
         }
     }
 
@@ -1334,23 +1359,30 @@ fn where_is(c: &Connection, id: Id) -> Result<Option<Place>, StoreError> {
     {
         return Ok(Some((Some(s), d, "entry")));
     }
-    if c.prepare_cached("SELECT 1 FROM attachment_docs WHERE id = ?1")?
-        .query_row([id], |_| Ok(()))
+    // документ — пространство его узла-владельца
+    if let Some((s, d)) = c
+        .prepare_cached(
+            "SELECT n.space_id, d.deleted_at IS NULL FROM attachment_docs d
+             JOIN nodes n ON n.id = d.node_id WHERE d.id = ?1",
+        )?
+        .query_row([id], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, bool>(1)?)))
         .optional()?
-        .is_some()
     {
-        return Ok(Some((None, true, "doc")));
+        return Ok(Some((Some(s), d, "doc")));
     }
     Ok(None)
 }
 
-/// Импортированное ранее в пространство: ключ источника (`imported_from.source_id`) → id.
+/// Импортированное ранее в пространство: `<источник>\0<ключ>` (`imported_from.source`,
+/// `source_id`) → id.
 fn imported_ids(c: &Connection, space: Id) -> Result<HashMap<String, Id>, StoreError> {
     let mut out = HashMap::new();
     for sql in [
-        "SELECT id, json_extract(imported_from, '$.source_id') FROM nodes
+        "SELECT id, coalesce(json_extract(imported_from, '$.source'), '') || char(0)
+                || json_extract(imported_from, '$.source_id') FROM nodes
          WHERE space_id = ?1 AND deleted_at IS NULL AND imported_from IS NOT NULL",
-        "SELECT id, json_extract(imported_from, '$.source_id') FROM entries
+        "SELECT id, coalesce(json_extract(imported_from, '$.source'), '') || char(0)
+                || json_extract(imported_from, '$.source_id') FROM entries
          WHERE space_id = ?1 AND deleted_at IS NULL AND imported_from IS NOT NULL",
     ] {
         let mut st = c.prepare(sql)?;
@@ -1390,19 +1422,23 @@ pub async fn plan_ids(
             if !seen.insert(format!("{kind}/{key}")) {
                 continue;
             }
-            let id = match prev.get(&key).filter(|_| kind != "doc") {
+            let id = match prev
+                .get(&format!("{source}\u{0}{key}"))
+                .filter(|_| kind != "doc")
+            {
                 Some(id) => *id,
                 None => {
                     let det = import_id(user, space, &source, &key);
-                    // свой элемент этого пространства (повтор своего архива) — тот же id
-                    let same = |id: Id| -> Result<bool, StoreError> {
-                        Ok(own
-                            && src == Some(id)
-                            && matches!(where_is(c, id)?,
-                                        Some((Some(s), true, k)) if s == space && k == kind))
+                    // id уже есть в этом пространстве и того же вида — это наш элемент: свой
+                    // исходный (повтор своего архива) или детерминированный (прежняя, в том
+                    // числе оборванная, попытка этого импорта; у документа — узел этого
+                    // пространства)
+                    let ours = |id: Id| -> Result<bool, StoreError> {
+                        Ok(matches!(where_is(c, id)?,
+                                    Some((Some(s), true, k)) if s == space && k == kind))
                     };
                     let free = |id: Id| -> Result<bool, StoreError> {
-                        Ok(!taken.contains(&id) && (where_is(c, id)?.is_none() || same(id)?))
+                        Ok(!taken.contains(&id) && (where_is(c, id)?.is_none() || ours(id)?))
                     };
                     match src.filter(|_| own) {
                         Some(s) if free(s)? => s,
@@ -1674,6 +1710,8 @@ struct Ctx<'a> {
     ideas: &'a HashSet<Id>,
     /// Пространство архива ([`Plan::source_space`]).
     source_space: Option<Id>,
+    /// Источник архива ([`Plan::source_key`]).
+    source: &'a str,
 }
 
 const DEMOTE_REASON: &str = "импорт: аксиома другого пользователя — понижена до theorem";
@@ -1700,6 +1738,7 @@ impl Ctx<'_> {
     fn imported_from(&self, key: &str, rev: u32, hash: &str) -> String {
         json!(ImportedFrom {
             archive_fingerprint: self.fp.to_string(),
+            source: self.source.to_string(),
             source_id: key.to_string(),
             source_rev: rev,
             content_hash: hash.to_string(),
@@ -1726,7 +1765,7 @@ fn note_existing(
     Ok(row.map(|(id, path, hash, imp)| {
         let h = imp
             .and_then(|s| serde_json::from_str::<ImportedFrom>(&s).ok())
-            .filter(|i| i.source_id == n.key())
+            .filter(|i| i.source == ctx.source && i.source_id == n.key())
             .map(|i| i.content_hash)
             .or(hash)
             .unwrap_or_default();
@@ -2146,11 +2185,12 @@ fn apply_folder(c: &Connection, ctx: &Ctx, f: &PlanFolder) -> Result<(), StoreEr
                 .optional()?
                 .is_some();
             let id = if busy { Id::new() } else { f.id };
+            let imp = f.src.map(|s| ctx.imported_from(&s.to_string(), 0, ""));
             c.execute(
                 "INSERT INTO nodes (id, space_id, parent_id, kind, name, path, current_rev,
-                                    index_state, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'folder', ?4, ?5, 0, 'excluded', ?6, ?6)",
-                params![id, ctx.space, parent, np.name(), np.as_str(), ctx.now],
+                                    index_state, created_at, updated_at, imported_from)
+                 VALUES (?1, ?2, ?3, 'folder', ?4, ?5, 0, 'excluded', ?6, ?6, ?7)",
+                params![id, ctx.space, parent, np.name(), np.as_str(), ctx.now, imp],
             )?;
             crate::graph::tree_changed(c, ctx.space, &[id], &[])?;
             id
@@ -2337,7 +2377,7 @@ fn apply_entry(
             .query_row([e.id], |r| r.get::<_, Option<String>>(0))?
             .and_then(|s| serde_json::from_str(&s).ok());
         let hash = imp
-            .filter(|i| i.source_id == e.src.to_string())
+            .filter(|i| i.source == ctx.source && i.source_id == e.src.to_string())
             .map(|i| i.content_hash)
             .unwrap_or_else(|| entry_hash_of(&cur));
         if hash == e.content_hash {
@@ -2689,6 +2729,7 @@ pub async fn apply_plan(
         _ => "папки .md".to_string(),
     };
     let reason = format!("импорт {} от {src_user}", plan.archive_fingerprint);
+    let source = plan.source_key();
     let Plan {
         archive_fingerprint,
         folders,
@@ -2732,6 +2773,7 @@ pub async fn apply_plan(
         intakes,
         infos,
         links,
+        source,
     });
     if opts.dry_run {
         // одна транзакция с откатом: отчёт тот же, записи нет (писатель базы занят на время
@@ -2815,6 +2857,7 @@ struct Shared {
     intakes: HashMap<(String, String), DocIntake>,
     infos: Vec<LinkInfo>,
     links: Vec<PlanLink>,
+    source: String,
 }
 
 impl Shared {
@@ -2832,6 +2875,7 @@ impl Shared {
             now: fmt_ts(now_ts),
             ideas: &self.ideas,
             source_space: self.source_space,
+            source: &self.source,
         })
     }
 
@@ -2962,6 +3006,31 @@ mod tests {
             validate_archive(&mut a, &LIM),
             Err(ImportError::Rejected(_))
         ));
+    }
+
+    #[test]
+    fn import_report_lists_truncated_with_totals() {
+        let mut r = ImportReport {
+            warnings: (0..1500).map(|i| i.to_string()).collect(),
+            unresolved: vec!["x".into(); 3],
+            ..ImportReport::default()
+        };
+        r.truncate_lists(1000);
+        assert_eq!((r.warnings.len(), r.warnings_total), (1000, 1500));
+        assert_eq!((r.unresolved.len(), r.unresolved_total), (3, 3));
+    }
+
+    #[test]
+    fn import_folder_source_includes_name() {
+        let a = Plan {
+            folder_label: Some("notes".into()),
+            ..Plan::default()
+        };
+        let b = Plan {
+            folder_label: Some("other".into()),
+            ..Plan::default()
+        };
+        assert_ne!(a.source_key(), b.source_key());
     }
 
     #[test]

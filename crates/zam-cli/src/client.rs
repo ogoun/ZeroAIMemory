@@ -430,6 +430,13 @@ impl Client {
 /// Ответ с ошибкой → [`CliError`]: текст из `detail` problem+json.
 fn problem(mut resp: Response<Body>) -> CliError {
     let status = resp.status().as_u16();
+    // занято, слишком велико, мало места: когда повторить — из `Retry-After`
+    let retry = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| format!("; повторите через {} с", v.trim()))
+        .unwrap_or_default();
     let text = resp
         .body_mut()
         .with_config()
@@ -452,7 +459,7 @@ fn problem(mut resp: Response<Body>) -> CliError {
     };
     let msg = match status {
         401 => "токен отклонён сервером".to_string(),
-        _ => format!("{detail} (HTTP {status})"),
+        _ => format!("{detail} (HTTP {status}{retry})"),
     };
     // статус — всегда в `problem` ([`CliError::http_status`]): у тела не problem+json тоже
     match v.as_mut() {
