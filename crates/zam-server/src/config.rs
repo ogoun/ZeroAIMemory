@@ -1308,11 +1308,15 @@ impl ExportSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportSection {
-    /// Предел тела запроса (zip) и распакованного объёма архива, байт (1024..=2⁴⁰, 2 ГиБ):
+    /// Предел тела запроса (zip) и распакованного объёма архива, байт (1 МиБ..=64 ГиБ, 2 ГиБ):
     /// больше — 413 (тело) или 422 (распакованный объём).
     pub max_bytes: u64,
-    /// Файлов в архиве не больше (1..=10 000 000, 100 000): больше — 422.
+    /// Файлов в архиве не больше (1..=1 000 000, 100 000): больше — 422.
     pub max_files: usize,
+    /// Тексты архива (всё, кроме вложений `_attachments/`: заметки, записи, история, связи)
+    /// держит в памяти план импорта — их объём не больше, байт (1 МиБ..=64 ГиБ, 256 МиБ): больше —
+    /// 422.
+    pub max_text_bytes: u64,
 }
 
 impl Default for ImportSection {
@@ -1320,6 +1324,7 @@ impl Default for ImportSection {
         Self {
             max_bytes: 2 << 30,
             max_files: 100_000,
+            max_text_bytes: zam_store::import::MAX_TEXT_BYTES_DEFAULT,
         }
     }
 }
@@ -1331,11 +1336,22 @@ impl ImportSection {
             source_name: "итог".into(),
             message: message.into(),
         };
-        if !(1024..=1 << 40).contains(&self.max_bytes) {
-            return Err(bad("max_bytes", "от 1024 до 1099511627776 (1 ТиБ)"));
+        const MIB: u64 = 1 << 20;
+        const MAX: u64 = 64 << 30;
+        if !(MIB..=MAX).contains(&self.max_bytes) {
+            return Err(bad(
+                "max_bytes",
+                "от 1048576 (1 МиБ) до 68719476736 (64 ГиБ)",
+            ));
         }
-        if !(1..=10_000_000).contains(&self.max_files) {
-            return Err(bad("max_files", "от 1 до 10000000"));
+        if !(1..=1_000_000).contains(&self.max_files) {
+            return Err(bad("max_files", "от 1 до 1000000"));
+        }
+        if !(MIB..=MAX).contains(&self.max_text_bytes) {
+            return Err(bad(
+                "max_text_bytes",
+                "от 1048576 (1 МиБ) до 68719476736 (64 ГиБ)",
+            ));
         }
         Ok(())
     }
@@ -2818,9 +2834,13 @@ master_key = \"x\"
         let i = load(None, &[], &Default::default()).unwrap().import;
         assert_eq!(i.max_bytes, 2 << 30);
         assert_eq!(i.max_files, 100_000);
+        assert_eq!(i.max_text_bytes, 256 << 20);
         for (k, v) in [
-            ("ZAM_IMPORT__MAX_BYTES", "1023"),
+            ("ZAM_IMPORT__MAX_BYTES", "1048575"),
+            ("ZAM_IMPORT__MAX_BYTES", "68719476737"),
             ("ZAM_IMPORT__MAX_FILES", "0"),
+            ("ZAM_IMPORT__MAX_FILES", "1000001"),
+            ("ZAM_IMPORT__MAX_TEXT_BYTES", "1048575"),
         ] {
             let r = load(None, &[env(k, v)], &Default::default());
             assert!(

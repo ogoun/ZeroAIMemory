@@ -1,9 +1,11 @@
 //! Перенос пространства (M6 §12б.5): `zam export [--space S] [--path P]… [--kind K]…
 //! [--no-history] -o <файл.zip>` — архив `GET /spaces/{space}/export` в файл; `zam import
 //! <файл.zip|каталог> [--space S] [--own] [--on-conflict skip|revision] [--axioms demote|keep]
-//! [--dry-run]` — `POST /spaces/{space}/import` потоком (каталог упаковывается в zip рядом с
-//! ним, `<каталог>.zip.<pid>.part`, и удаляется после отправки; каталог без `manifest.json` —
-//! «папка `.md`»: на сервер уходят только `*.md`, архив чужой).
+//! [--dry-run]` — `POST /spaces/{space}/import` потоком (каталог упаковывается в zip на лету,
+//! без временного файла; каталог без `manifest.json` — «папка `.md`»: на сервер уходят только
+//! `*.md`, архив чужой). Сервер отвечает 202 с заданием; `zam` опрашивает его раз в 2 с, печатает
+//! этап в stderr и выходит с кодом 2, если хода нет дольше `ZAM_IMPORT_IDLE_SECS` (600 с). Ctrl+C
+//! прекращает только ожидание: задание на сервере продолжается.
 //!
 //! - Пространство: `--space` (`rules` | `human` | `knowledge` | `solution` | GUID | id), иначе
 //!   решение из `solution.toml`, иначе `knowledge` — как у адресов заметок.
@@ -348,102 +350,151 @@ pub struct ImportArgs<'a> {
     pub dry_run: bool,
 }
 
+/// Переменная предела отсутствия хода задания импорта, с.
+pub const IMPORT_IDLE_ENV: &str = "ZAM_IMPORT_IDLE_SECS";
+/// Предел отсутствия хода задания по умолчанию.
+const IMPORT_IDLE_DEFAULT: Duration = Duration::from_secs(600);
+/// Шаг опроса задания.
+const POLL: Duration = Duration::from_secs(2);
+
+/// Файлы архива (путь в архиве, файл на диске) и пропущенные скрытые пути.
+type DirFiles = (Vec<(String, PathBuf)>, Vec<String>);
+
 /// Файлы каталога `root` для архива: относительные пути через `/`, по алфавиту; скрытые
-/// (`.git`, `.zeroaimemory`) пропускаются. Без описи — только `*.md`.
-fn dir_files(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+/// (`.git`, `.zeroaimemory`) пропускаются и перечисляются вторым списком. Без описи — только
+/// `*.md`.
+fn dir_files(root: &Path) -> std::io::Result<DirFiles> {
     let manifest = root.join("manifest.json").is_file();
     let mut out = Vec::new();
+    let mut hidden = Vec::new();
     let mut stack = vec![root.to_path_buf()];
+    let rel = |p: &Path| -> std::io::Result<String> {
+        Ok(p.strip_prefix(root)
+            .map_err(std::io::Error::other)?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"))
+    };
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d)? {
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
+            let p = e.path();
             if name.starts_with('.') {
+                hidden.push(rel(&p)?);
                 continue;
             }
-            let p = e.path();
             let t = e.file_type()?;
             if t.is_dir() {
                 stack.push(p);
             } else if t.is_file() && (manifest || name.ends_with(".md")) {
-                let rel = p
-                    .strip_prefix(root)
-                    .map_err(std::io::Error::other)?
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                out.push((rel, p));
+                out.push((rel(&p)?, p));
             }
         }
     }
     out.sort();
-    Ok(out)
+    hidden.sort();
+    Ok((out, hidden))
 }
 
-/// Каталог → zip в новом файле `<каталог>.zip.<pid>.part` рядом (удаляет вызывающий).
-fn pack_dir(dir: &Path) -> Result<PathBuf, CliError> {
-    let io = |e: std::io::Error| CliError::config(format!("{}: {e}", dir.display()));
-    let files = dir_files(dir).map_err(io)?;
-    if files.is_empty() {
-        return Err(CliError::input(format!(
-            "{}: нет файлов .md для импорта",
-            dir.display()
-        )));
-    }
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "import".into());
-    let (part, f) = create_part(&dir.with_file_name(format!("{name}.zip"))).map_err(io)?;
-    let res = (|| -> Result<(), CliError> {
-        let mut z = zip::ZipWriter::new(std::io::BufWriter::new(f));
+/// Архив каталога потоком (поток-упаковщик пишет zip в канал, тело запроса читает его):
+/// временного файла нет — прерванный `zam` ничего не оставляет. Ошибка упаковки — итог потока.
+fn pack_stream(
+    files: Vec<(String, PathBuf)>,
+) -> std::io::Result<(
+    std::io::PipeReader,
+    std::thread::JoinHandle<Result<(), String>>,
+)> {
+    let (r, w) = std::io::pipe()?;
+    let h = std::thread::spawn(move || -> Result<(), String> {
+        let mut z = zip::ZipWriter::new_stream(w);
         let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .large_file(true);
         for (rel, p) in &files {
             z.start_file(rel.as_str(), opts)
-                .map_err(|e| CliError::config(format!("zip: {e}")))?;
-            let mut src = File::open(p).map_err(io)?;
-            std::io::copy(&mut src, &mut z).map_err(io)?;
+                .map_err(|e| format!("zip: {e}"))?;
+            let mut src = File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            std::io::copy(&mut src, &mut z).map_err(|e| format!("{}: {e}", p.display()))?;
         }
-        let mut w = z
-            .finish()
-            .map_err(|e| CliError::config(format!("zip: {e}")))?;
-        w.flush().map_err(io)?;
+        z.finish().map_err(|e| format!("zip: {e}"))?;
         Ok(())
-    })();
-    if let Err(e) = res {
-        let _ = std::fs::remove_file(&part);
-        return Err(e);
-    }
-    Ok(part)
+    });
+    Ok((r, h))
 }
 
-/// Свой временный архив удаляется при любом исходе.
-struct Packed(Option<PathBuf>);
+/// Предел отсутствия хода: `ZAM_IMPORT_IDLE_SECS` (целое > 0), иначе [`IMPORT_IDLE_DEFAULT`].
+fn import_idle() -> Duration {
+    std::env::var(IMPORT_IDLE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map_or(IMPORT_IDLE_DEFAULT, Duration::from_secs)
+}
 
-impl Drop for Packed {
-    fn drop(&mut self) {
-        if let Some(p) = self.0.take() {
-            let _ = std::fs::remove_file(p);
+/// Код выхода по статусу ошибки задания.
+fn exit_of(status: u64) -> u8 {
+    match status {
+        404 => crate::client::EXIT_NOT_FOUND,
+        409 => crate::client::EXIT_CONFLICT,
+        401 | 403 => crate::client::EXIT_TOKEN,
+        400..=499 => crate::client::EXIT_INPUT,
+        _ => EXIT_UNREACHABLE,
+    }
+}
+
+/// Опрос задания раз в [`POLL`]; этап печатается в stderr при смене; хода нет дольше
+/// [`import_idle`] — выход с кодом 2 (задание на сервере продолжается).
+fn poll_job(ctx: &Ctx, status: &str, job: &str) -> Result<serde_json::Value, CliError> {
+    let idle = import_idle();
+    let mut last = (String::new(), u64::MAX);
+    let mut moved = Instant::now();
+    loop {
+        let s = crate::client::read_json(ctx.client.get(status, &[])?)?;
+        let stage = s["stage"].as_str().unwrap_or("?").to_string();
+        let done = s["progress"]["done"].as_u64().unwrap_or(0);
+        if (stage.clone(), done) != last {
+            if stage != last.0 {
+                let total = s["progress"]["total"].as_u64().unwrap_or(0);
+                eprintln!("импорт {job}: {stage} ({done}/{total})");
+            }
+            last = (stage, done);
+            moved = Instant::now();
         }
+        match s["state"].as_str() {
+            Some("done") => return Ok(s["report"].clone()),
+            Some("failed") => {
+                let e = &s["error"];
+                return Err(CliError::new(
+                    exit_of(e["status"].as_u64().unwrap_or(500)),
+                    format!(
+                        "импорт не выполнен: {}",
+                        e["detail"]
+                            .as_str()
+                            .or(e["title"].as_str())
+                            .unwrap_or("ошибка сервера")
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        if moved.elapsed() > idle {
+            return Err(CliError::new(
+                EXIT_UNREACHABLE,
+                format!(
+                    "сервер не сообщает о ходе импорта дольше {} с ({IMPORT_IDLE_ENV}); задание \
+                     {job} продолжается на сервере: GET /api/v1{status}",
+                    idle.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(POLL);
     }
 }
 
 pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
     let space = space_of(ctx, a.space)?;
-    let (file, _packed) = if a.src.is_dir() {
-        let p = pack_dir(a.src)?;
-        (p.clone(), Packed(Some(p)))
-    } else if a.src.is_file() {
-        (a.src.to_path_buf(), Packed(None))
-    } else {
-        return Err(CliError::input(format!(
-            "{}: нет такого файла или каталога",
-            a.src.display()
-        )));
-    };
     let mut q: Vec<String> = Vec::new();
     if a.own {
         q.push("own=true".into());
@@ -462,14 +513,52 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
     } else {
         format!("/spaces/{space}/import?{}", q.join("&"))
     };
-    let f = File::open(&file).map_err(|e| CliError::config(format!("{}: {e}", file.display())))?;
-    let len = f
-        .metadata()
-        .map_err(|e| CliError::config(format!("{}: {e}", file.display())))?
-        .len();
-    // ответ — после проверки и записи всего архива: заголовки ждём долго, как у экспорта
+    // приём тела может идти долго: тело без общего предела, заголовки — как у экспорта
     ctx.client.set_timeouts(Timeouts::Download);
-    let resp = match ctx.client.send_multipart(&path, "application/zip", len, f) {
+    let (sent, packer) = if a.src.is_dir() {
+        let io = |e: std::io::Error| CliError::config(format!("{}: {e}", a.src.display()));
+        let (files, hidden) = dir_files(a.src).map_err(io)?;
+        if !hidden.is_empty() {
+            eprintln!(
+                "предупреждение: скрытые пути не переносятся ({}): {}",
+                hidden.len(),
+                hidden.join(", ")
+            );
+        }
+        if files.is_empty() {
+            return Err(CliError::input(format!(
+                "{}: нет файлов .md для импорта",
+                a.src.display()
+            )));
+        }
+        let (r, h) = pack_stream(files).map_err(io)?;
+        (ctx.client.send_stream(&path, "application/zip", r), Some(h))
+    } else if a.src.is_file() {
+        let f =
+            File::open(a.src).map_err(|e| CliError::config(format!("{}: {e}", a.src.display())))?;
+        let len = f
+            .metadata()
+            .map_err(|e| CliError::config(format!("{}: {e}", a.src.display())))?
+            .len();
+        (
+            ctx.client.send_multipart(&path, "application/zip", len, f),
+            None,
+        )
+    } else {
+        return Err(CliError::input(format!(
+            "{}: нет такого файла или каталога",
+            a.src.display()
+        )));
+    };
+    // ошибка упаковки важнее ответа сервера на оборванный архив
+    if let Some(h) = packer {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(m)) => return Err(CliError::config(format!("упаковка каталога: {m}"))),
+            Err(_) => return Err(CliError::config("упаковка каталога прервана")),
+        }
+    }
+    let resp = match sent {
         Ok(r) => r,
         Err(e) if e.http_status() == Some(404) => {
             ctx.client.set_timeouts(Timeouts::Transfer);
@@ -484,7 +573,18 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
         }
         Err(e) => return Err(e),
     };
-    let rep = crate::client::read_json(resp)?;
+    let accepted = crate::client::read_json(resp)?;
+    let job = accepted["job"].as_str().unwrap_or_default().to_string();
+    let status = accepted["status"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| CliError::new(EXIT_UNREACHABLE, "сервер не вернул задание импорта"))?;
+    eprintln!(
+        "импорт {job} принят сервером; Ctrl+C прекращает только ожидание — задание на сервере \
+         не отменяется (ход: GET /api/v1{status})"
+    );
+    ctx.client.set_timeouts(Timeouts::Transfer);
+    let rep = poll_job(ctx, &status, &job)?;
     if ctx.json {
         return emit_json(&rep);
     }
@@ -545,10 +645,12 @@ mod tests {
         std::fs::write(d.join("sub").join("b.md"), "b").unwrap();
         std::fs::write(d.join("pic.png"), "p").unwrap();
         std::fs::write(d.join(".git").join("c.md"), "c").unwrap();
-        let names: Vec<String> = dir_files(&d).unwrap().into_iter().map(|x| x.0).collect();
+        let (files, hidden) = dir_files(&d).unwrap();
+        let names: Vec<String> = files.into_iter().map(|x| x.0).collect();
         assert_eq!(names, ["a.md", "sub/b.md"]);
+        assert_eq!(hidden, [".git"]);
         std::fs::write(d.join("manifest.json"), "{}").unwrap();
-        let names: Vec<String> = dir_files(&d).unwrap().into_iter().map(|x| x.0).collect();
+        let names: Vec<String> = dir_files(&d).unwrap().0.into_iter().map(|x| x.0).collect();
         assert_eq!(names, ["a.md", "manifest.json", "pic.png", "sub/b.md"]);
         let _ = std::fs::remove_dir_all(&d);
     }

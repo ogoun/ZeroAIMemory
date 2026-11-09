@@ -69,9 +69,9 @@ pub struct AppState {
     pub stopping: Arc<std::sync::atomic::AtomicBool>,
     /// Идущие задачи экспорта: остановка ждёт их аудит `space.export.done` (не дольше 1 с).
     pub export_tasks: Arc<TaskCount>,
-    /// Слот импорта пространства (M6 §12б.5): один импорт на сервер, занято — 503 с
-    /// `Retry-After` ([`api::transfer::import::IMPORT_SLOTS`]).
-    pub import_slots: Arc<tokio::sync::Semaphore>,
+    /// Импорт пространства (M6 §12б.5): слоты приёма, очередь записи, задания в памяти
+    /// ([`api::transfer::import::ImportRuntime`]).
+    pub imports: Arc<api::transfer::import::ImportRuntime>,
     /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
     /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
     #[cfg(feature = "test-hooks")]
@@ -300,6 +300,8 @@ pub(crate) struct Prepared {
 pub(crate) fn prepare(cfg: ServerConfig, env_password: Option<&str>) -> anyhow::Result<Prepared> {
     let AdminSecret::Hash(admin_hash) = cfg.admin_secret(env_password)?;
     let data_dir = Arc::new(DataDir::open(&cfg.data_dir)?);
+    // тела импорта прерванного процесса (M6 §12б.5)
+    api::transfer::import::clean_incoming(data_dir.root());
     Ok(Prepared {
         cfg,
         admin_hash,
@@ -385,9 +387,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         export_users: Arc::default(),
         stopping: Arc::default(),
         export_tasks: Arc::default(),
-        import_slots: Arc::new(tokio::sync::Semaphore::new(
-            api::transfer::import::IMPORT_SLOTS,
-        )),
+        imports: Arc::default(),
         big_bodies: api::big_body::BigBodies::new(
             api::big_body::BIG_BODY_PERMITS,
             api::note_body_max(&cfg.limits),

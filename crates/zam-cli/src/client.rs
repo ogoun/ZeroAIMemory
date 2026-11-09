@@ -358,6 +358,20 @@ impl Client {
         self.send_multipart_with(path, content_type, len, reader, &[])
     }
 
+    /// POST тела потоком неизвестной длины (chunked): архив каталога `zam import` собирается на
+    /// лету, без временного файла.
+    pub fn send_stream(
+        &self,
+        path: &str,
+        content_type: &str,
+        reader: impl Read + 'static,
+    ) -> Result<Response<Body>, CliError> {
+        let rb = self
+            .prepare(self.agent.post(&self.url(path)))
+            .header("Content-Type", content_type);
+        self.check(rb.send(ureq::SendBody::from_owned_reader(reader)))
+    }
+
     /// POST тела потоком с дополнительными заголовками (`Idempotency-Key`).
     pub fn send_multipart_with(
         &self,

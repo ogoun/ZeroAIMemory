@@ -122,13 +122,68 @@ fn import_req(space: &str, q: &str, body: Body) -> axum::http::request::Builder 
         .header(header::CONTENT_TYPE, "application/zip")
 }
 
-async fn import_tok(a: &Api, tok: &str, space: &str, q: &str, zip: Vec<u8>) -> Resp {
-    let body = Body::from(zip);
+/// Кто опрашивает задание.
+#[derive(Clone, Copy)]
+enum Who<'a> {
+    Tok(&'a str),
+    Web(&'a User),
+    Admin(&'a str),
+}
+
+async fn get_as(a: &Api, who: Who<'_>, uri: &str) -> Resp {
+    match who {
+        Who::Tok(t) => a.tok(t, Method::GET, uri, None).await,
+        Who::Web(u) => web(a, &u.web, Method::GET, uri, None).await,
+        Who::Admin(u) => a.adm(Method::GET, uri, None, Some(u)).await,
+    }
+}
+
+/// Опрос задания до конца: итог как ответ — 200 и отчёт или статус и problem+json ошибки.
+async fn wait_job(a: &Api, who: Who<'_>, accepted: Resp) -> Resp {
+    if accepted.status != StatusCode::ACCEPTED {
+        return accepted;
+    }
+    let status = format!("/api/v1{}", accepted.json()["status"].as_str().unwrap());
+    let t0 = std::time::Instant::now();
+    loop {
+        let r = get_as(a, who, &status).await;
+        ok(&r, StatusCode::OK, "опрос задания");
+        let j = r.json();
+        match j["state"].as_str().unwrap() {
+            "running" => {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(300), "{j}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            "done" => {
+                return Resp {
+                    status: StatusCode::OK,
+                    headers: Default::default(),
+                    body: j["report"].to_string().into(),
+                };
+            }
+            _ => {
+                let e = &j["error"];
+                return Resp {
+                    status: StatusCode::from_u16(e["status"].as_u64().unwrap() as u16).unwrap(),
+                    headers: Default::default(),
+                    body: e.to_string().into(),
+                };
+            }
+        }
+    }
+}
+
+async fn post_tok(a: &Api, tok: &str, space: &str, q: &str, zip: Vec<u8>) -> Resp {
     let r = import_req(space, q, Body::empty())
         .header(header::AUTHORIZATION, format!("Bearer {tok}"))
-        .body(body)
+        .body(Body::from(zip))
         .unwrap();
     a.send(r).await
+}
+
+async fn import_tok(a: &Api, tok: &str, space: &str, q: &str, zip: Vec<u8>) -> Resp {
+    let r = post_tok(a, tok, space, q, zip).await;
+    wait_job(a, Who::Tok(tok), r).await
 }
 
 async fn import_web(a: &Api, u: &User, space: &str, q: &str, zip: Vec<u8>) -> Resp {
@@ -137,7 +192,8 @@ async fn import_web(a: &Api, u: &User, space: &str, q: &str, zip: Vec<u8>) -> Re
         .header("x-csrf-token", &u.web.csrf)
         .body(Body::from(zip))
         .unwrap();
-    a.send(with_ip(r, &u.web.ip)).await
+    let r = a.send(with_ip(r, &u.web.ip)).await;
+    wait_job(a, Who::Web(u), r).await
 }
 
 fn report(r: &Resp) -> Value {
@@ -1421,13 +1477,13 @@ async fn import_rejects_zip_bomb() {
 /// Тело больше `import.max_bytes` — 413 (по `Content-Length` и потоком), `.part` удалён.
 #[tokio::test]
 async fn import_body_over_limit_413_and_part_removed() {
-    let w = world_cfg("imp-413", |c| c.import.max_bytes = 64 * 1024).await;
-    let big = vec![7u8; 200 * 1024];
+    let w = world_cfg("imp-413", |c| c.import.max_bytes = 1 << 20).await;
+    let big = vec![7u8; 3 << 20];
     let r = import_tok(&w.a, &w.rw.tok, "knowledge", "", big.clone()).await;
     ok(&r, StatusCode::PAYLOAD_TOO_LARGE, "Content-Length");
     // без длины: поток кусками
     let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = big
-        .chunks(16 * 1024)
+        .chunks(256 * 1024)
         .map(|c| Ok(axum::body::Bytes::copy_from_slice(c)))
         .collect();
     let body = Body::from_stream(futures_util::stream::iter(chunks));
@@ -1681,35 +1737,80 @@ async fn member_cannot_import() {
         .body(Body::from(zip))
         .unwrap();
     let r = w.a.send(req).await;
+    let r = wait_job(&w.a, Who::Admin(&w.o.id), r).await;
     assert_eq!(n(&report(&r), "skipped"), 1);
 }
 
 // ---------- слот, остановка, аудит ----------
 
-/// Слот импорта занят — 503 `/problems/busy` с `Retry-After`; освободился — импорт идёт.
+/// Слоты приёма заняты — 503 `/problems/busy` с `Retry-After`: на сервере (два) и у
+/// пользователя (один, пока идёт его приём); освободились — импорт идёт. Запись — очередь: при
+/// занятом слоте записи задание ждёт на этапе `queued`.
 #[tokio::test]
 async fn import_busy_when_slot_taken() {
     let w = world("imp-busy").await;
     note(&w.a, &w.o.tok, G, "x", "текст").await;
     let zip = export_tok(&w.a, &w.o.tok, G, "").await;
-    let permit = w.a.st.import_slots.clone().try_acquire_owned().unwrap();
-    let r = import_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
-    ok(&r, StatusCode::SERVICE_UNAVAILABLE, "занято");
+    let rt = &w.a.st.imports;
+    let (p1, p2) = (rt.hold_recv(), rt.hold_recv());
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    ok(&r, StatusCode::SERVICE_UNAVAILABLE, "занято на сервере");
     assert_eq!(r.header("retry-after"), "30");
     // права проверяются раньше слота
-    let r = import_tok(&w.a, &w.ro.tok, G, "", zip.clone()).await;
+    let r = post_tok(&w.a, &w.ro.tok, G, "", zip.clone()).await;
     ok(&r, StatusCode::FORBIDDEN, "участник при занятом слоте");
-    drop(permit);
+    drop((p1, p2));
+    // свой приём у пользователя идёт (тело не кончается) — второй его приём занят
+    let app = w.a.app.clone();
+    let tok = w.rw.tok.clone();
+    let hang = tokio::spawn(async move {
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let req = Request::post("/api/v1/spaces/knowledge/import")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(body)
+            .unwrap();
+        let _ = tower::ServiceExt::oneshot(app, req).await;
+    });
+    let t0 = std::time::Instant::now();
+    while rt.recv_available() == zam_server::api::transfer::import::RECV_SLOTS {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    ok(
+        &r,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "второй приём пользователя",
+    );
+    // другой пользователь в это время принимается
+    let r = import_tok(&w.a, &w.o.tok, "knowledge", "", zip.clone()).await;
+    report(&r);
+    hang.abort();
+    let _ = hang.await;
+    // очередь записи: задание ждёт на этапе queued
+    let hold = rt.hold_write();
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
+    ok(&r, StatusCode::ACCEPTED, "принято");
+    let status = format!("/api/v1{}", r.json()["status"].as_str().unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let s = w.a.tok(&w.rw.tok, Method::GET, &status, None).await.json();
     assert_eq!(
-        n(
-            &report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await),
-            "created"
-        ),
-        1
+        (s["state"].as_str(), s["stage"].as_str()),
+        (Some("running"), Some("queued")),
+        "{s}"
+    );
+    drop(hold);
+    let r = wait_job(&w.a, Who::Tok(&w.rw.tok), r).await;
+    assert_eq!(n(&report(&r), "created"), 1);
+    assert_eq!(
+        rt.recv_available(),
+        zam_server::api::transfer::import::RECV_SLOTS
     );
     assert_eq!(
-        w.a.st.import_slots.available_permits(),
-        zam_server::api::transfer::import::IMPORT_SLOTS
+        rt.write_available(),
+        zam_server::api::transfer::import::WRITE_SLOTS
     );
 }
 
@@ -1742,6 +1843,326 @@ async fn import_audit_failure_no_body() {
     assert_eq!(live_counts(&bdb).await, before);
     let rows = w.a.st.system.list_audit(100, None).await.unwrap();
     assert!(!rows.iter().any(|r| r.action.starts_with("space.import")));
-    assert_eq!(w.a.st.import_slots.available_permits(), 1);
+    assert_eq!(
+        w.a.st.imports.recv_available(),
+        zam_server::api::transfer::import::RECV_SLOTS
+    );
     report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+}
+
+// ---------- задания, повтор после обрыва, мелкие файлы, ответ на вопрос ----------
+
+/// Опрос: этап и итог видит тот же пользователь и администратор; другому — 404.
+#[tokio::test]
+async fn import_job_status_owner_only() {
+    let w = world("imp-poll").await;
+    note(&w.a, &w.o.tok, G, "x", "текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
+    ok(&r, StatusCode::ACCEPTED, "принято");
+    let j = r.json();
+    let status = format!("/api/v1{}", j["status"].as_str().unwrap());
+    assert!(r.header("location").ends_with(j["job"].as_str().unwrap()));
+    let done = wait_job(&w.a, Who::Tok(&w.rw.tok), r).await;
+    assert_eq!(n(&report(&done), "created"), 1);
+    let s = w.a.tok(&w.rw.tok, Method::GET, &status, None).await.json();
+    assert_eq!(s["state"], "done");
+    assert_eq!(s["stage"], "done");
+    assert_eq!(s["progress"]["done"], s["progress"]["total"]);
+    // сессия того же пользователя и администратор — видят
+    ok(
+        &get_as(&w.a, Who::Web(&w.rw), &status).await,
+        StatusCode::OK,
+        "сессия",
+    );
+    ok(
+        &get_as(&w.a, Who::Admin(&w.rw.id), &status).await,
+        StatusCode::OK,
+        "админ",
+    );
+    // другой пользователь — как несуществующее
+    for t in [&w.o.tok, &w.ro.tok] {
+        ok(
+            &w.a.tok(t, Method::GET, &status, None).await,
+            StatusCode::NOT_FOUND,
+            "чужой",
+        );
+    }
+    let other = status.replace("/knowledge/", &format!("/{G}/"));
+    ok(
+        &w.a.tok(&w.rw.tok, Method::GET, &other, None).await,
+        StatusCode::NOT_FOUND,
+        "другое пространство",
+    );
+    let nojob = format!("/api/v1/spaces/knowledge/imports/{}", Id::new());
+    ok(
+        &w.a.tok(&w.rw.tok, Method::GET, &nojob, None).await,
+        StatusCode::NOT_FOUND,
+        "нет задания",
+    );
+}
+
+/// Настоящий обрыв соединения: клиент ушёл, получив 202, пока задание ждёт записи, — задание
+/// доходит до конца, итог виден опросом.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_job_survives_client_disconnect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = world("imp-disc").await;
+    src(&w).await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = w.a.app.clone();
+    let srv = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let hold = w.a.st.imports.hold_write();
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /api/v1/spaces/knowledge/import HTTP/1.1\r\nHost: {addr}\r\n\
+         Authorization: Bearer {}\r\nContent-Type: application/zip\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        w.rw.tok,
+        zip.len()
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    sock.write_all(&zip).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    // ответ 202 приходит до записи (запись ждёт слот): клиент его не ждёт вечно
+    let got = tokio::time::timeout(std::time::Duration::from_secs(30), sock.read(&mut buf))
+        .await
+        .expect("202 не пришёл: задание держит запрос")
+        .unwrap();
+    let resp = String::from_utf8_lossy(&buf[..got]).to_string();
+    assert!(resp.starts_with("HTTP/1.1 202"), "{resp}");
+    let body = resp.split("\r\n\r\n").nth(1).unwrap();
+    let job: Value = serde_json::from_str(body.trim()).unwrap();
+    // клиент уходит, не дожидаясь записи
+    drop(sock);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(hold);
+    let fake = Resp {
+        status: StatusCode::ACCEPTED,
+        headers: Default::default(),
+        body: job.to_string().into(),
+    };
+    let r = wait_job(&w.a, Who::Tok(&w.rw.tok), fake).await;
+    assert!(n(&report(&r), "created") >= 12, "{}", r.text());
+    srv.abort();
+}
+
+/// Обрыв после первой пачки (остановка) → повтор: id назначения детерминированы — ни одной
+/// ссылки на несуществующий id и ни одного дубля.
+#[tokio::test]
+async fn import_resume_after_stop_no_dangling_refs() {
+    let w = world("imp-resume").await;
+    let s = src(&w).await;
+    // первая пачка (папка docs и эта заметка) ссылается на записи следующих пачек
+    note(
+        &w.a,
+        &w.o.tok,
+        G,
+        "aaa",
+        &format!("см. i:{} и k:{}", s.ins, s.task),
+    )
+    .await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let bdb = db(&w.a, &w.rw.id).await;
+    let kspace: Id = rows(
+        &bdb,
+        "SELECT id FROM spaces WHERE kind = 'knowledge'",
+        vec![],
+    )
+    .await[0][0]
+        .clone()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let uid: Id = w.rw.id.parse().unwrap();
+    let gen0 = w.a.st.render_gen.get(uid, kspace);
+    zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, Some("import_one_batch"));
+    let r = import_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, None);
+    ok(
+        &r,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "остановка после первой пачки",
+    );
+    // записанная пачка оповестила рендер и индексацию и на пути ошибки
+    assert!(w.a.st.render_gen.get(uid, kspace) > gen0);
+    assert!(
+        node_by_path(&bdb, "aaa").await.is_some(),
+        "первая пачка записана"
+    );
+    assert_eq!(q1(&bdb, "SELECT count(*) FROM entries", vec![]).await, 0);
+    report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+    // дублей нет
+    let dup = q1(
+        &bdb,
+        "SELECT count(*) FROM (SELECT kind, title FROM entries WHERE deleted_at IS NULL
+                               GROUP BY kind, title HAVING count(*) > 1)",
+        vec![],
+    )
+    .await;
+    assert_eq!(dup, 0);
+    let dupn = q1(
+        &bdb,
+        "SELECT count(*) FROM (SELECT path FROM nodes WHERE deleted_at IS NULL
+                               GROUP BY path HAVING count(*) > 1)",
+        vec![],
+    )
+    .await;
+    assert_eq!(dupn, 0);
+    // каждая ссылка текстов ведёт на существующий id
+    let texts = rows(
+        &bdb,
+        "SELECT body || ' ' || data FROM entries
+         UNION ALL SELECT content FROM revisions r JOIN nodes n ON n.id = r.node_id
+                   AND r.rev = n.current_rev",
+        vec![],
+    )
+    .await;
+    let mut checked = 0;
+    for t in texts.into_iter().flatten().flatten() {
+        for sp in zam_store::import::scan_refs(&t) {
+            let Some(id) = sp.id else { continue };
+            let found = q1(
+                &bdb,
+                "SELECT (SELECT count(*) FROM nodes WHERE id = ?1)
+                      + (SELECT count(*) FROM entries WHERE id = ?1)
+                      + (SELECT count(*) FROM attachment_docs WHERE id = ?1)",
+                vec![id.to_string()],
+            )
+            .await;
+            assert_eq!(found, 1, "висячая ссылка {}:{id} в «{t}»", sp.letter);
+            checked += 1;
+        }
+    }
+    assert!(checked >= 5, "проверено ссылок: {checked}");
+}
+
+/// Бомба из мелких файлов: каждый меньше 1 МиБ, но сжат в тысячи раз — 422.
+#[tokio::test]
+async fn import_rejects_small_files_bomb() {
+    let w = world("imp-smallbomb").await;
+    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let o = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let zeros = vec![0u8; 512 << 10];
+    for i in 0..100 {
+        z.start_file(format!("n{i}.md"), o).unwrap();
+        z.write_all(&zeros).unwrap();
+    }
+    let zip = z.finish().unwrap().into_inner();
+    assert!(zip.len() < 1 << 20, "{}", zip.len());
+    let r = import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
+    ok(&r, StatusCode::UNPROCESSABLE_ENTITY, "мелкие файлы");
+    assert!(r.text().contains("сжат"), "{}", r.text());
+}
+
+/// `data.answer.decision_id` отвеченного вопроса — на решение, импортированное заново.
+#[tokio::test]
+async fn import_remaps_answer_decision_id() {
+    let w = world("imp-answer").await;
+    let q = entry(
+        &w.a,
+        &w.o.tok,
+        G,
+        json!({"kind": "question", "title": "Брать ли SQLite?", "body": "контекст"}),
+    )
+    .await;
+    let r =
+        w.a.tok(
+            &w.o.tok,
+            Method::POST,
+            &format!("/api/v1/entries/{q}/answer"),
+            Some(json!({"text": "да, SQLite", "channel": "chat", "by": "human"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK, "ответ");
+    let old = get_entry(&w.a, &w.o.tok, &q).await["data"]["answer"]["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+    let bdb = db(&w.a, &w.rw.id).await;
+    let q2 = entry_by_title(&bdb, "Брать ли SQLite?").await;
+    let dec = get_entry(&w.a, &w.rw.tok, &q2).await["data"]["answer"]["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(dec, old);
+    let d = get_entry(&w.a, &w.rw.tok, &dec).await;
+    assert_eq!(d["kind"], "insight", "{d}");
+}
+
+/// Размер вложения — фактический из архива, MIME — по имени, как при загрузке: frontmatter
+/// архива им не указ.
+#[tokio::test]
+async fn import_attachment_size_and_mime_from_file() {
+    use std::io::Read;
+    let w = world("imp-mime").await;
+    let nid = note(&w.a, &w.o.tok, G, "pic", "# Картинка").await;
+    let pic = png(3, 500);
+    common::attach::upload(&w.a, &w.o.tok, &nid, "a.png", &pic).await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    // подделка frontmatter: размер и MIME
+    let mut src = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for i in 0..src.len() {
+        let mut f = src.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        let mut b = Vec::new();
+        f.read_to_end(&mut b).unwrap();
+        if name == "pic.md" {
+            let t = String::from_utf8(b).unwrap();
+            let t = t
+                .replace("\"mime\":\"image/png\"", "\"mime\":\"text/html\"")
+                .replace(&format!("\"size\":{}", pic.len()), "\"size\":1");
+            assert!(t.contains("text/html") && t.contains("\"size\":1"), "{t}");
+            b = t.into_bytes();
+        }
+        out.start_file(name.as_str(), SimpleFileOptions::default())
+            .unwrap();
+        out.write_all(&b).unwrap();
+    }
+    let zip = out.finish().unwrap().into_inner();
+    report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+    let bdb = db(&w.a, &w.rw.id).await;
+    let n2 = node_by_path(&bdb, "pic").await.unwrap();
+    let r = rows(
+        &bdb,
+        "SELECT mime, CAST(size AS TEXT) FROM attachments WHERE node_id = ?1",
+        vec![n2],
+    )
+    .await;
+    assert_eq!(
+        r,
+        vec![vec![
+            Some("image/png".to_string()),
+            Some(pic.len().to_string())
+        ]]
+    );
+}
+
+/// Ревизия при повторе с недопустимым `certainty` — конфликт `invalid`, а не сбой задания.
+#[tokio::test]
+async fn import_revision_invalid_certainty_conflict() {
+    let w = world("imp-badcert").await;
+    let v1 = zip_of(&[("a.md", b"# A\n\nversion 1\n")]);
+    report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", v1).await);
+    let v2 = zip_of(&[("a.md", b"---\ncertainty: probably\n---\n# A\n\nversion 2\n")]);
+    let r = report(&import_tok(&w.a, &w.rw.tok, "knowledge", "?on_conflict=revision", v2).await);
+    let c = r["conflicts"].as_array().unwrap();
+    assert_eq!(c.len(), 1, "{r}");
+    assert!(
+        c[0]["reason"].as_str().unwrap().starts_with("invalid"),
+        "{r}"
+    );
+    assert_eq!(n(&r, "revised"), 0);
 }

@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -45,6 +45,10 @@ use sha2::{Digest, Sha256};
 use zam_core::{Id, TargetKind, TargetRef};
 use zip::ZipArchive;
 
+pub use crate::archive::{
+    ATTACHMENTS_DIR, EXPORT_FORMAT, FOLDERS_FILE, Fingerprint, HISTORY_DIR, JOURNALS_DIR,
+    LINKS_FILE, MANIFEST_FILE,
+};
 use crate::attachments::DocIntake;
 use crate::blobs::BlobStore;
 use crate::entries::{
@@ -59,30 +63,18 @@ use crate::time::{fmt_ts, parse_ts};
 use crate::user_db::SpaceKind;
 use crate::{Db, StoreError};
 
-// ---------- раскладка архива (общая с экспортом 18b1) ----------
-
-/// Версия формата архива экспорта.
-pub const EXPORT_FORMAT: u32 = 1;
-/// Опись архива.
-pub const MANIFEST_FILE: &str = "manifest.json";
-/// Каталог вложений и файлов отчётов.
-pub const ATTACHMENTS_DIR: &str = "_attachments";
-/// Каталог записей журналов.
-pub const JOURNALS_DIR: &str = "_journals";
-/// Каталог истории.
-pub const HISTORY_DIR: &str = "_history";
-/// Явные связи.
-pub const LINKS_FILE: &str = "_links.jsonl";
-/// Папки.
-pub const FOLDERS_FILE: &str = "_folders.jsonl";
-
 /// Элементов (папок, заметок, записей) в одной транзакции записи.
 pub const BATCH: usize = 200;
 /// Коэффициент сжатия по умолчанию (распакованный объём к сжатому).
 pub const MAX_RATIO_DEFAULT: u32 = 100;
-/// Файл меньше — коэффициент сжатия не проверяется: повторяющийся мелкий текст жмётся сильнее
-/// 100 раз, а бомбой не бывает (общий объём ограничен отдельно).
-const RATIO_FROM: u64 = 1 << 20;
+/// Запас коэффициента сжатия на файл, байт: короткий повторяющийся текст жмётся сильнее 100 раз,
+/// а `size ≤ packed × ratio + запас` пропускает его (бомбу из мелких файлов ловит и общий
+/// коэффициент, и предел текстов).
+const RATIO_SLACK: u64 = 64 << 10;
+/// Запас общего коэффициента сжатия, байт.
+const RATIO_SLACK_TOTAL: u64 = 1 << 20;
+/// Предел текстов архива по умолчанию (`import.max_text_bytes`), байт.
+pub const MAX_TEXT_BYTES_DEFAULT: u64 = 256 << 20;
 
 /// Буквы ссылок, которые переписывает импорт: [`crate::ENTRY_REF_LETTERS`] (`i c r t k q p w e`)
 /// ∪ {`n`, `d`} — канон `TargetRef` (`zam-core/src/target.rs`).
@@ -99,61 +91,8 @@ pub const REF_COLUMNS: &[&str] = &[
     "data.idea",
     "data.blocked_by",
     "data.links",
+    "data.answer.decision_id",
 ];
-
-/// Отпечаток содержимого архива: blake3 по файлам без описи в порядке записи — на файл длина
-/// имени (u64 LE), имя, длина содержимого (u64 LE) и blake3 содержимого (32 байта).
-pub struct Fingerprint {
-    outer: blake3::Hasher,
-    cur: Option<(String, u64, blake3::Hasher)>,
-}
-
-impl Default for Fingerprint {
-    fn default() -> Self {
-        Fingerprint {
-            outer: blake3::Hasher::new(),
-            cur: None,
-        }
-    }
-}
-
-impl Fingerprint {
-    /// Начало файла `name`; затем [`Fingerprint::update`] содержимым и [`Fingerprint::end`].
-    pub fn begin(&mut self, name: &str) {
-        self.end();
-        self.cur = Some((name.to_string(), 0, blake3::Hasher::new()));
-    }
-
-    pub fn update(&mut self, data: &[u8]) {
-        if let Some((_, len, h)) = &mut self.cur {
-            *len += data.len() as u64;
-            h.update(data);
-        }
-    }
-
-    /// Конец текущего файла (нет файла — ничего).
-    pub fn end(&mut self) {
-        if let Some((name, len, h)) = self.cur.take() {
-            self.outer.update(&(name.len() as u64).to_le_bytes());
-            self.outer.update(name.as_bytes());
-            self.outer.update(&len.to_le_bytes());
-            self.outer.update(h.finalize().as_bytes());
-        }
-    }
-
-    /// Файл целиком.
-    pub fn file(&mut self, name: &str, data: &[u8]) {
-        self.begin(name);
-        self.update(data);
-        self.end();
-    }
-
-    /// Отпечаток (текущий файл завершается).
-    pub fn hex(&mut self) -> String {
-        self.end();
-        self.outer.finalize().to_hex().to_string()
-    }
-}
 
 // ---------- параметры и отчёт ----------
 
@@ -191,6 +130,24 @@ pub struct ImportOptions {
     pub with_reports: bool,
     /// Остановка сервера: между пачками импорт прерывается ([`ImportError::Stopped`]).
     pub stop: Option<Arc<AtomicBool>>,
+    /// Ход записи для задания импорта (счётчики элементов, записана ли хоть одна пачка).
+    pub progress: Option<Arc<Progress>>,
+    /// Элементов в пачке; 0 — [`BATCH`] (меньше — только тесты).
+    pub batch: usize,
+    /// Прервать запись после стольких пачек как при остановке (точка теста повтора после обрыва).
+    pub stop_after: Option<usize>,
+}
+
+/// Ход записи импорта.
+#[derive(Debug, Default)]
+pub struct Progress {
+    /// Элементов к записи (папки, заметки, записи).
+    pub total: AtomicU64,
+    /// Обработано элементов.
+    pub done: AtomicU64,
+    /// Хоть одна пачка зафиксирована (вызывающий должен оповестить индексацию и рендер, даже если
+    /// импорт потом прервался).
+    pub written: AtomicBool,
 }
 
 /// Происхождение импортированной записи или заметки (`imported_from`).
@@ -288,8 +245,10 @@ pub struct ImportLimits {
     /// Распакованный объём, байт.
     pub max_bytes: u64,
     pub max_files: usize,
-    /// Коэффициент сжатия файла (распакованный к сжатому) — не больше.
+    /// Коэффициент сжатия файла и архива (распакованный к сжатому) — не больше.
     pub max_ratio: u32,
+    /// Все файлы, кроме вложений (`_attachments/`), — тексты плана в памяти, байт.
+    pub max_text_bytes: u64,
 }
 
 // ---------- план ----------
@@ -375,6 +334,16 @@ pub struct PlanNote {
     pub content_hash: String,
 }
 
+impl PlanNote {
+    /// Ключ источника (`imported_from.source_id`): исходный id, у папки `.md` — `path:<путь>`.
+    pub fn key(&self) -> String {
+        match self.src {
+            Some(s) => s.to_string(),
+            None => format!("path:{}", self.path),
+        }
+    }
+}
+
 /// Ссылка записи на файл решения (`file_refs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanRef {
@@ -458,10 +427,70 @@ impl Plan {
         v
     }
 
+    /// Источник архива для детерминированных id: `<source_user_id>/<space>` описи, у папки
+    /// `.md` — `folder`.
+    pub fn source_key(&self) -> String {
+        match (self.has_manifest, self.source_user_id, self.source_space) {
+            (true, Some(u), Some(s)) => format!("{u}/{s}"),
+            (true, u, s) => format!("{u:?}/{s:?}"),
+            (false, _, _) => "folder".into(),
+        }
+    }
+
+    /// Элементы плана: (ключ источника, исходный id, вид `node`/`entry`/`doc`).
+    fn keyed(&self) -> Vec<(String, Option<Id>, &'static str)> {
+        let mut v: Vec<(String, Option<Id>, &'static str)> = Vec::new();
+        for f in &self.folders {
+            if let Some(s) = f.src {
+                v.push((s.to_string(), Some(s), "node"));
+            }
+        }
+        for n in &self.notes {
+            v.push((n.key(), n.src, "node"));
+            for a in &n.attachments {
+                if let Some(d) = a.doc {
+                    v.push((d.to_string(), Some(d), "doc"));
+                }
+            }
+        }
+        for e in &self.entries {
+            v.push((e.src.to_string(), Some(e.src), "entry"));
+        }
+        v
+    }
+
+    /// Кандидаты id назначения (для проверки коллизий вне базы — другие базы и точки Qdrant):
+    /// детерминированные [`import_id`] и, у своего архива, исходные.
+    pub fn candidate_ids(&self, user: Id, space: Id, own: bool) -> Vec<Id> {
+        let src = self.source_key();
+        let mut out = Vec::new();
+        for (key, id, _) in self.keyed() {
+            if own && let Some(i) = id {
+                out.push(i);
+            }
+            out.push(import_id(user, space, &src, &key));
+        }
+        out
+    }
+
     /// Свой архив: `source_user_id` = пользователь базы или прямое указание `own`.
     pub fn is_own(&self, user: Id, own_flag: bool) -> bool {
         own_flag || (self.has_manifest && self.source_user_id == Some(user))
     }
+}
+
+/// Пространство имён детерминированных id импорта (UUIDv5).
+const NS_IMPORT: uuid::Uuid = uuid::Uuid::from_u128(0x5c1e_7a4d_2b9f_5e03_a1c6_88d2_4f0e_b713);
+
+/// Детерминированный id назначения: UUIDv5 от (получатель, пространство, источник архива, ключ
+/// элемента). Повтор того же архива после обрыва даёт те же id — ссылки уже записанных пачек на
+/// ещё не записанные элементы не повисают; у другого получателя id другие (точки Qdrant общей
+/// коллекции не пересекаются).
+pub fn import_id(user: Id, space: Id, source: &str, key: &str) -> Id {
+    Id::from(uuid::Uuid::new_v5(
+        &NS_IMPORT,
+        format!("{user}/{space}/{source}/{key}").as_bytes(),
+    ))
 }
 
 // ---------- сканер ссылок ----------
@@ -761,7 +790,9 @@ pub fn validate_archive<R: Read + Seek>(
     }
     // имена и пределы — по центральному каталогу, до чтения содержимого
     let mut total: u64 = 0;
+    let mut total_packed: u64 = 0;
     let mut names = Vec::with_capacity(n);
+    let mut sizes = Vec::with_capacity(n);
     let mut has_manifest = false;
     for i in 0..n {
         let f = zip
@@ -781,7 +812,12 @@ pub fn validate_archive<R: Read + Seek>(
             return Err(rejected(format!("архив отклонён: «{name}» зашифрован")));
         }
         let (size, packed) = (f.size(), f.compressed_size());
-        if size >= RATIO_FROM && size > packed.saturating_mul(u64::from(limits.max_ratio)) {
+        total_packed = total_packed.saturating_add(packed);
+        if size
+            > packed
+                .saturating_mul(u64::from(limits.max_ratio))
+                .saturating_add(RATIO_SLACK)
+        {
             return Err(rejected(format!(
                 "архив отклонён: «{name}» сжат сильнее чем в {} раз (zip-бомба?)",
                 limits.max_ratio
@@ -795,7 +831,39 @@ pub fn validate_archive<R: Read + Seek>(
             )));
         }
         has_manifest |= name == MANIFEST_FILE;
+        sizes.push(size);
         names.push((name, f.is_dir()));
+    }
+    if total
+        > total_packed
+            .saturating_mul(u64::from(limits.max_ratio))
+            .saturating_add(RATIO_SLACK_TOTAL)
+    {
+        return Err(rejected(format!(
+            "архив отклонён: архив сжат сильнее чем в {} раз (zip-бомба?)",
+            limits.max_ratio
+        )));
+    }
+    // тексты (всё, кроме вложений) держит план: свой предел
+    let is_text = |name: &str| {
+        if has_manifest {
+            !name.starts_with(&format!("{ATTACHMENTS_DIR}/"))
+        } else {
+            name.ends_with(".md")
+        }
+    };
+    let text_total: u64 = names
+        .iter()
+        .zip(&sizes)
+        .filter(|((name, dir), _)| !dir && is_text(name))
+        .map(|(_, s)| *s)
+        .sum();
+    if text_total > limits.max_text_bytes {
+        return Err(rejected(format!(
+            "архив отклонён: тексты архива ({text_total} байт) больше предела \
+             import.max_text_bytes = {} байт",
+            limits.max_text_bytes
+        )));
     }
     let mut plan = Plan {
         has_manifest,
@@ -805,6 +873,7 @@ pub fn validate_archive<R: Read + Seek>(
     let mut texts: Vec<RawText> = Vec::new();
     let mut manifest: Option<Value> = None;
     let mut read_total: u64 = 0;
+    let mut read_text: u64 = 0;
     for (i, (name, is_dir)) in names.iter().enumerate() {
         if *is_dir {
             continue;
@@ -816,6 +885,8 @@ pub fn validate_archive<R: Read + Seek>(
         // не больше заявленного размера: заголовок не обманет предел
         let mut r = f.take(declared.saturating_add(1));
         let blob = has_manifest && name.starts_with(&format!("{ATTACHMENTS_DIR}/"));
+        // не текст плана: хэш потоком, в память не читается
+        let hashed = !is_text(name);
         if name != MANIFEST_FILE {
             fp.begin(name);
         }
@@ -832,7 +903,11 @@ pub fn validate_archive<R: Read + Seek>(
             }
             size += k as u64;
             read_total += k as u64;
-            if size > declared || read_total > limits.max_bytes {
+            if !hashed {
+                read_text += k as u64;
+            }
+            if size > declared || read_total > limits.max_bytes || read_text > limits.max_text_bytes
+            {
                 return Err(rejected(format!(
                     "архив отклонён: «{name}» больше заявленного размера"
                 )));
@@ -840,13 +915,18 @@ pub fn validate_archive<R: Read + Seek>(
             if name != MANIFEST_FILE {
                 fp.update(&buf[..k]);
             }
-            if blob {
+            if hashed {
                 hasher.update(&buf[..k]);
             } else {
                 data.extend_from_slice(&buf[..k]);
             }
         }
         fp.end();
+        if size != declared {
+            return Err(rejected(format!(
+                "архив повреждён: «{name}» — {size} байт вместо заявленных {declared}"
+            )));
+        }
         if blob {
             plan.blobs
                 .insert(name.clone(), (crate::nodes::hex(&hasher.finalize()), size));
@@ -859,7 +939,7 @@ pub fn validate_archive<R: Read + Seek>(
             );
             continue;
         }
-        if !has_manifest && !name.ends_with(".md") {
+        if hashed {
             plan.warnings.push(format!(
                 "файл «{name}» пропущен: из папки .md переносятся только заметки"
             ));
@@ -1203,14 +1283,14 @@ fn parse_entry(t: &RawText) -> Result<PlanEntry, ImportError> {
     })
 }
 
-/// Распаковывает файлы вложений плана в блобы пользователя (после [`validate_archive`], не при
+/// Распаковывает файлы вложений плана (`Plan::blobs`) в блобы пользователя (после [`validate_archive`], не при
 /// `dry_run`). Файл — потоком, через `<root>/.incoming/<id>.part`; sha256 сверяется с планом.
 pub fn extract_blobs<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
-    plan: &Plan,
+    blobs: &BTreeMap<String, (String, u64)>,
     store: &BlobStore,
 ) -> Result<(), ImportError> {
-    for (name, (sha, size)) in &plan.blobs {
+    for (name, (sha, size)) in blobs {
         let f = zip
             .by_name(name)
             .map_err(|e| rejected(format!("архив: {name}: {e}")))?;
@@ -1228,8 +1308,10 @@ pub fn extract_blobs<R: Read + Seek>(
 #[derive(Debug, Clone, Default)]
 pub struct IdMap {
     pub map: HashMap<Id, Id>,
-    /// Коллизии своего архива: (исходный, новый).
-    pub remapped: Vec<(Id, Id)>,
+    /// Заметки папки `.md` (без исходного id): ключ `path:<путь>` → id.
+    pub paths: HashMap<String, Id>,
+    /// Коллизии: (ключ источника, новый id) — id назначения занят не этим импортом.
+    pub remapped: Vec<(String, Id)>,
 }
 
 /// Где id в этой базе: пространство (у документа вложения — нет), жив ли, вид
@@ -1262,8 +1344,8 @@ fn where_is(c: &Connection, id: Id) -> Result<Option<Place>, StoreError> {
     Ok(None)
 }
 
-/// Импортированное ранее в пространство: `source_id` → id (узлы и записи).
-fn imported_ids(c: &Connection, space: Id) -> Result<HashMap<Id, Id>, StoreError> {
+/// Импортированное ранее в пространство: ключ источника (`imported_from.source_id`) → id.
+fn imported_ids(c: &Connection, space: Id) -> Result<HashMap<String, Id>, StoreError> {
     let mut out = HashMap::new();
     for sql in [
         "SELECT id, json_extract(imported_from, '$.source_id') FROM nodes
@@ -1277,7 +1359,7 @@ fn imported_ids(c: &Connection, space: Id) -> Result<HashMap<Id, Id>, StoreError
         })?;
         for row in rows {
             let (id, src) = row?;
-            if let Some(src) = src.and_then(|s| s.parse::<Id>().ok()) {
+            if let Some(src) = src.filter(|s| !s.is_empty()) {
                 out.insert(src, id);
             }
         }
@@ -1285,67 +1367,65 @@ fn imported_ids(c: &Connection, space: Id) -> Result<HashMap<Id, Id>, StoreError
     Ok(out)
 }
 
-/// Id назначения (см. модуль). `taken` — id, занятые вне этой базы (другие базы сервера, точки
-/// Qdrant других пользователей); у своего архива они переназначаются.
+/// Id назначения (см. модуль). Прежний импорт этого пространства (по ключу источника) — его id;
+/// свой архив — исходный id, если свободен; иначе — детерминированный [`import_id`]. Кандидат
+/// занят не этим импортом (`taken` — другие базы и точки Qdrant, или строка этой базы) —
+/// случайный id и запись в `remapped`.
 pub async fn plan_ids(
     db: &Db,
+    user: Id,
     space: Id,
     plan: &Plan,
     own: bool,
     taken: &HashSet<Id>,
 ) -> Result<IdMap, StoreError> {
-    let notes: Vec<Id> = plan.notes.iter().filter_map(|n| n.src).collect();
-    let folders: Vec<Id> = plan.folders.iter().filter_map(|f| f.src).collect();
-    let entries: Vec<Id> = plan.entries.iter().map(|e| e.src).collect();
-    let docs: Vec<Id> = plan
-        .notes
-        .iter()
-        .flat_map(|n| n.attachments.iter().filter_map(|a| a.doc))
-        .collect();
+    let keyed = plan.keyed();
+    let source = plan.source_key();
     let taken = taken.clone();
     db.read(move |c| {
         let prev = imported_ids(c, space)?;
         let mut m = IdMap::default();
-        let one = |src: Id, want: &str, m: &mut IdMap| -> Result<(), StoreError> {
-            if m.map.contains_key(&src) {
-                return Ok(());
+        let mut seen: HashSet<String> = HashSet::new();
+        for (key, src, kind) in keyed {
+            if !seen.insert(format!("{kind}/{key}")) {
+                continue;
             }
-            if let Some(id) = prev.get(&src) {
-                m.map.insert(src, *id);
-                return Ok(());
-            }
-            if !own {
-                m.map.insert(src, Id::new());
-                return Ok(());
-            }
-            let free = !taken.contains(&src)
-                && match where_is(c, src)? {
-                    None => true,
-                    // тот же элемент этого пространства (повтор своего архива) — тот же id
-                    Some((Some(s), true, kind)) => s == space && kind == want,
-                    Some(_) => false,
-                };
-            if free {
-                m.map.insert(src, src);
-            } else {
-                let new = Id::new();
-                m.map.insert(src, new);
-                m.remapped.push((src, new));
-            }
-            Ok(())
-        };
-        for id in notes.iter().chain(&folders) {
-            one(*id, "node", &mut m)?;
-        }
-        for id in &entries {
-            one(*id, "entry", &mut m)?;
-        }
-        for id in &docs {
-            // документы пересоздаются при записи вложений: свой — прежний id, если свободен
-            if own && !taken.contains(id) && where_is(c, *id)?.is_none() {
-                m.map.insert(*id, *id);
-            } else {
-                m.map.insert(*id, Id::new());
+            let id = match prev.get(&key).filter(|_| kind != "doc") {
+                Some(id) => *id,
+                None => {
+                    let det = import_id(user, space, &source, &key);
+                    // свой элемент этого пространства (повтор своего архива) — тот же id
+                    let same = |id: Id| -> Result<bool, StoreError> {
+                        Ok(own
+                            && src == Some(id)
+                            && matches!(where_is(c, id)?,
+                                        Some((Some(s), true, k)) if s == space && k == kind))
+                    };
+                    let free = |id: Id| -> Result<bool, StoreError> {
+                        Ok(!taken.contains(&id) && (where_is(c, id)?.is_none() || same(id)?))
+                    };
+                    match src.filter(|_| own) {
+                        Some(s) if free(s)? => s,
+                        Some(_) if free(det)? => {
+                            m.remapped.push((key.clone(), det));
+                            det
+                        }
+                        None if free(det)? => det,
+                        _ => {
+                            let new = Id::new();
+                            m.remapped.push((key.clone(), new));
+                            new
+                        }
+                    }
+                }
+            };
+            match src {
+                Some(s) => {
+                    m.map.insert(s, id);
+                }
+                None => {
+                    m.paths.insert(key, id);
+                }
             }
         }
         Ok(m)
@@ -1419,6 +1499,13 @@ impl Rewriter<'_> {
                     o.insert(k.into(), Value::String(n));
                 }
             }
+            // решение из ответа на вопрос (`data.answer.decision_id`)
+            if let Some(Value::Object(ans)) = o.get_mut("answer")
+                && let Some(Value::String(s)) = ans.get("decision_id")
+                && let Some(n) = self.bare(s)
+            {
+                ans.insert("decision_id".into(), Value::String(n));
+            }
             if let Some(Value::Array(a)) = o.get_mut("prev_task_ids") {
                 for x in a.iter_mut() {
                     if let Value::String(s) = x
@@ -1472,6 +1559,8 @@ pub fn remap_refs(plan: &mut Plan, map: &IdMap) -> RemapReport {
     for n in &mut plan.notes {
         if let Some(s) = n.src {
             n.id = map.map.get(&s).copied().unwrap_or(s);
+        } else if let Some(id) = map.paths.get(&n.key()) {
+            n.id = *id;
         }
         n.content = w.text(&n.content);
         n.l0 = n.l0.as_deref().map(|x| w.text(x));
@@ -1515,39 +1604,58 @@ pub fn remap_refs(plan: &mut Plan, map: &IdMap) -> RemapReport {
 
 // ---------- запись ----------
 
-/// Текст заметки с `certainty: axiom` её собственного frontmatter → `theorem` (`None` — аксиомы
-/// нет).
-fn demote_note_text(content: &str) -> Option<String> {
+/// Понижение аксиомы заметки (I5 ревью): статус читает тот же разбор, что и запись
+/// ([`note_meta`]). Не аксиома — `Ok(None)`. Аксиома — каждый ключ `certainty` верхнего уровня
+/// собственного frontmatter (со строками продолжения: блочный скаляр, многострочное значение;
+/// повтор ключа) заменяется на `certainty: theorem` с прежним комментарием, затем разбор
+/// проверяется ещё раз; если статус не стал `theorem` — `Err` (конфликт `invalid`).
+fn demote_note(content: &str) -> Result<Option<String>, String> {
+    if note_meta(content, None).certainty_lenient() != Some(Certainty::Axiom) {
+        return Ok(None);
+    }
+    let fail = || "certainty: axiom не удалось понизить до theorem — правьте заметку".to_string();
     let nl = if content.starts_with("---\r\n") {
         "\r\n"
     } else if content.starts_with("---\n") {
         "\n"
     } else {
-        return None;
+        return Err(fail());
     };
     let start = 3 + nl.len();
-    let end_mark = format!("{nl}---");
-    let end = content[start..].find(&end_mark).map(|i| start + i)?;
-    let block = &content[start..end];
-    let mut out = String::with_capacity(content.len());
-    out.push_str(&content[..start]);
-    let mut changed = false;
-    for (i, line) in block.split(nl).enumerate() {
-        if i > 0 {
-            out.push_str(nl);
+    let end = content[start..]
+        .find(&format!("{nl}---"))
+        .map(|i| start + i)
+        .ok_or_else(fail)?;
+    let lines: Vec<&str> = content[start..end].split(nl).collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        let top = !line.starts_with([' ', '\t', '#', '-']);
+        let is_key = top
+            && line
+                .split_once(':')
+                .is_some_and(|(k, _)| k.trim() == "certainty");
+        if !is_key {
+            out.push(line.to_string());
+            continue;
         }
-        let t = line.trim();
-        if let Some(v) = t.strip_prefix("certainty:")
-            && v.trim().trim_matches(['"', '\'']) == "axiom"
-        {
-            out.push_str("certainty: theorem");
-            changed = true;
-        } else {
-            out.push_str(line);
+        // строки продолжения значения (с отступом или пустые) уходят вместе с ключом
+        while i < lines.len() && (lines[i].starts_with([' ', '\t']) || lines[i].trim().is_empty()) {
+            i += 1;
         }
+        let comment = line
+            .split_once(" #")
+            .map(|(_, c)| format!(" #{c}"))
+            .unwrap_or_default();
+        out.push(format!("certainty: theorem{comment}"));
     }
-    out.push_str(&content[end..]);
-    changed.then_some(out)
+    let text = format!("{}{}{}", &content[..start], out.join(nl), &content[end..]);
+    match note_meta(&text, None).certainty() {
+        Ok(Some(Certainty::Theorem)) => Ok(Some(text)),
+        _ => Err(fail()),
+    }
 }
 
 /// Контекст пачки записи.
@@ -1589,10 +1697,10 @@ impl Ctx<'_> {
         }
     }
 
-    fn imported_from(&self, src: Option<Id>, rev: u32, hash: &str) -> String {
+    fn imported_from(&self, key: &str, rev: u32, hash: &str) -> String {
         json!(ImportedFrom {
             archive_fingerprint: self.fp.to_string(),
-            source_id: src.map(|s| s.to_string()).unwrap_or_default(),
+            source_id: key.to_string(),
             source_rev: rev,
             content_hash: hash.to_string(),
         })
@@ -1618,7 +1726,7 @@ fn note_existing(
     Ok(row.map(|(id, path, hash, imp)| {
         let h = imp
             .and_then(|s| serde_json::from_str::<ImportedFrom>(&s).ok())
-            .filter(|i| n.src.is_some_and(|s| i.source_id == s.to_string()))
+            .filter(|i| i.source_id == n.key())
             .map(|i| i.content_hash)
             .or(hash)
             .unwrap_or_default();
@@ -1734,11 +1842,22 @@ fn apply_note(
 ) -> Result<(), StoreError> {
     let mut content = n.content.clone();
     let mut demoted = false;
-    if ctx.demote()
-        && let Some(t) = demote_note_text(&content)
-    {
-        content = t;
-        demoted = true;
+    if ctx.demote() {
+        match demote_note(&content) {
+            Ok(Some(t)) => {
+                content = t;
+                demoted = true;
+            }
+            Ok(None) => {}
+            Err(m) => {
+                rep.conflicts.push(Conflict {
+                    id: n.src.map(|s| s.to_string()),
+                    path: Some(n.path.clone()),
+                    reason: format!("invalid: {m}"),
+                });
+                return Ok(());
+            }
+        }
     }
     let reason = if demoted {
         format!("{DEMOTE_REASON} ({})", ctx.reason)
@@ -1761,20 +1880,24 @@ fn apply_note(
         let mut a = note_attrib(ctx);
         a.message = Some(reason);
         let node = load_node(c, id)?;
-        revise_note(
-            c,
-            node,
-            &content,
-            n.l0_source
-                .as_deref()
-                .filter(|s| *s == "agent")
-                .and(n.l0.as_deref()),
-            &a,
-        )?;
+        let agent_l0 = n
+            .l0_source
+            .as_deref()
+            .filter(|s| *s == "agent")
+            .and(n.l0.as_deref());
+        if let Err(e) = note_meta(&content, agent_l0).certainty() {
+            rep.conflicts.push(Conflict {
+                id: Some(id.to_string()),
+                path: Some(path),
+                reason: format!("invalid: {e}"),
+            });
+            return Ok(());
+        }
+        revise_note(c, node, &content, agent_l0, &a)?;
         c.prepare_cached("UPDATE nodes SET imported_from = ?2 WHERE id = ?1")?
             .execute(params![
                 id,
-                ctx.imported_from(n.src, n.rev, &n.content_hash)
+                ctx.imported_from(&n.key(), n.rev, &n.content_hash)
             ])?;
         if path != n.path {
             let p = NodePath::parse(&n.path).map_err(|e| StoreError::BadInput(e.to_string()))?;
@@ -1924,7 +2047,7 @@ fn insert_note_row(
             updated,
             ctx.attrib.area,
             certainty,
-            ctx.imported_from(n.src, n.rev, &n.content_hash),
+            ctx.imported_from(&n.key(), n.rev, &n.content_hash),
         ],
     )?;
     Ok(())
@@ -2234,7 +2357,7 @@ fn apply_entry(
         c.prepare_cached("UPDATE entries SET imported_from = ?2 WHERE id = ?1")?
             .execute(params![
                 e.id,
-                ctx.imported_from(Some(e.src), e.rev, &e.content_hash)
+                ctx.imported_from(&e.src.to_string(), e.rev, &e.content_hash)
             ])?;
         if e.kind == EntryKind::Insight
             && let Ok(ts) = check_triggers(e.triggers.clone())
@@ -2317,7 +2440,7 @@ fn apply_entry(
         entry_index_state(ctx.space_kind, e.kind).as_str(),
         created,
         updated,
-        ctx.imported_from(Some(e.src), e.rev, &e.content_hash),
+        ctx.imported_from(&e.src.to_string(), e.rev, &e.content_hash),
     ])?;
     if report {
         // отчёт неизменяем: одна ревизия (исходная), файлы — с `created_at` отчёта
@@ -2406,7 +2529,8 @@ fn apply_entry(
 fn apply_links(
     c: &Connection,
     ctx: &Ctx,
-    plan: &Plan,
+    entries: &[LinkInfo],
+    links: &[PlanLink],
     rep: &mut ImportReport,
 ) -> Result<(), StoreError> {
     let a = note_attrib(ctx);
@@ -2418,7 +2542,7 @@ fn apply_links(
                 .is_some(),
         )
     };
-    for e in &plan.entries {
+    for e in entries {
         if e.kind == EntryKind::Report || !live_entry(e.id)? {
             continue;
         }
@@ -2470,29 +2594,18 @@ fn apply_links(
             }
             Ok(())
         };
-        let id_of =
-            |v: Option<&Value>| v.and_then(Value::as_str).and_then(|s| s.parse::<Id>().ok());
         if e.kind == EntryKind::Idea {
-            let mut tasks: Vec<Id> = id_of(e.data.get("task_id")).into_iter().collect();
-            tasks.extend(
-                e.data
-                    .get("prev_task_ids")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|x| id_of(Some(x))),
-            );
-            for t in tasks {
-                sys(t, EdgeType::DerivedFrom, e.id)?;
+            for t in &e.tasks {
+                sys(*t, EdgeType::DerivedFrom, e.id)?;
             }
         }
         if e.kind == EntryKind::Question
-            && let Some(i) = id_of(e.data.get("idea"))
+            && let Some(i) = e.idea
         {
             sys(e.id, EdgeType::RelatesTo, i)?;
         }
     }
-    for l in &plan.links {
+    for l in links {
         let e = NewEdge {
             src: l.src,
             dst: l.dst,
@@ -2519,11 +2632,49 @@ enum Item {
     Entry(Box<PlanEntry>),
 }
 
+/// Сводка записи для последней транзакции (связи, замещение): план к тому времени уже отдан
+/// пачкам — тексты не держатся дважды.
+struct LinkInfo {
+    id: Id,
+    kind: EntryKind,
+    supersedes: Option<Id>,
+    superseded_by: Option<Id>,
+    /// Задачи идеи (`data.task_id`, `data.prev_task_ids`).
+    tasks: Vec<Id>,
+    /// Идея вопроса-предложения (`data.idea`).
+    idea: Option<Id>,
+}
+
+impl LinkInfo {
+    fn of(e: &PlanEntry) -> LinkInfo {
+        let id_of =
+            |v: Option<&Value>| v.and_then(Value::as_str).and_then(|s| s.parse::<Id>().ok());
+        let mut tasks: Vec<Id> = id_of(e.data.get("task_id")).into_iter().collect();
+        tasks.extend(
+            e.data
+                .get("prev_task_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|x| id_of(Some(x))),
+        );
+        LinkInfo {
+            id: e.id,
+            kind: e.kind,
+            supersedes: e.supersedes,
+            superseded_by: e.superseded_by,
+            tasks,
+            idea: id_of(e.data.get("idea")),
+        }
+    }
+}
+
 /// Маркер отката пробного импорта.
 const DRY_RUN: &str = "\u{0}dry-run";
 
 /// Записывает план в пространство `space` (см. модуль). `attrib` — атрибуция запроса (автор
-/// ревизий импорта — `system`). `user` — пользователь базы (свой ли архив).
+/// ревизий импорта — `system`). `user` — пользователь базы (свой ли архив). План забирается по
+/// значению: элементы уходят пачкам без копий.
 pub async fn apply_plan(
     db: &Db,
     space: Id,
@@ -2538,42 +2689,53 @@ pub async fn apply_plan(
         _ => "папки .md".to_string(),
     };
     let reason = format!("импорт {} от {src_user}", plan.archive_fingerprint);
-    let base = ImportReport {
+    let Plan {
+        archive_fingerprint,
+        folders,
+        notes,
+        entries,
+        links,
+        warnings,
+        intakes,
+        source_space,
+        ..
+    } = plan;
+    let mut report = ImportReport {
         dry_run: opts.dry_run,
-        archive_fingerprint: plan.archive_fingerprint.clone(),
+        archive_fingerprint: archive_fingerprint.clone(),
         own,
-        warnings: plan.warnings.clone(),
+        warnings,
         ..ImportReport::default()
     };
-    let ideas: HashSet<Id> = plan
-        .entries
+    let ideas: HashSet<Id> = entries
         .iter()
         .filter(|e| e.kind == EntryKind::Idea)
         .map(|e| e.id)
         .collect();
-    let plan = Arc::new(plan);
-    let mut items: Vec<Item> = Vec::new();
-    items.extend(plan.folders.iter().cloned().map(Item::Folder));
-    items.extend(plan.notes.iter().cloned().map(|n| Item::Note(Box::new(n))));
-    items.extend(
-        plan.entries
-            .iter()
-            .cloned()
-            .map(|e| Item::Entry(Box::new(e))),
-    );
+    let infos: Vec<LinkInfo> = entries.iter().map(LinkInfo::of).collect();
+    let mut items: Vec<Item> = Vec::with_capacity(folders.len() + notes.len() + entries.len());
+    items.extend(folders.into_iter().map(Item::Folder));
+    items.extend(notes.into_iter().map(|n| Item::Note(Box::new(n))));
+    items.extend(entries.into_iter().map(|e| Item::Entry(Box::new(e))));
+    if let Some(p) = &opts.progress {
+        p.total.store(items.len() as u64, Ordering::SeqCst);
+    }
     let shared = Arc::new(Shared {
         space,
         opts: opts.clone(),
         own,
         attrib: attrib.clone(),
         reason,
-        fp: plan.archive_fingerprint.clone(),
+        fp: archive_fingerprint,
         ideas,
-        plan: plan.clone(),
+        source_space,
+        intakes,
+        infos,
+        links,
     });
-    let mut report = base;
     if opts.dry_run {
-        // одна транзакция с откатом: отчёт тот же, записи нет
+        // одна транзакция с откатом: отчёт тот же, записи нет (писатель базы занят на время
+        // проверки)
         let cell = Arc::new(std::sync::Mutex::new(ImportReport::default()));
         let (sh, cl) = (shared.clone(), cell.clone());
         let res = db
@@ -2592,15 +2754,24 @@ pub async fn apply_plan(
         }
         let r = std::mem::take(&mut *cell.lock().unwrap_or_else(|e| e.into_inner()));
         report.merge(r);
+        if let Some(p) = &opts.progress {
+            p.done
+                .store(p.total.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
         return Ok(report);
     }
+    let size = if opts.batch == 0 { BATCH } else { opts.batch };
     let mut rest = items;
+    let mut batches = 0usize;
     while !rest.is_empty() {
-        if opts.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
+        if opts.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst))
+            || opts.stop_after.is_some_and(|n| batches >= n)
+        {
             return Err(ImportError::Stopped);
         }
-        let tail = rest.split_off(rest.len().min(BATCH));
+        let tail = rest.split_off(rest.len().min(size));
         let batch = std::mem::replace(&mut rest, tail);
+        let n = batch.len() as u64;
         let sh = shared.clone();
         let r = db
             .write(move |c| {
@@ -2609,6 +2780,11 @@ pub async fn apply_plan(
                 Ok(r)
             })
             .await?;
+        batches += 1;
+        if let Some(p) = &opts.progress {
+            p.written.store(true, Ordering::SeqCst);
+            p.done.fetch_add(n, Ordering::SeqCst);
+        }
         report.merge(r);
     }
     let sh = shared.clone();
@@ -2619,6 +2795,9 @@ pub async fn apply_plan(
             Ok(r)
         })
         .await?;
+    if let Some(p) = &opts.progress {
+        p.written.store(true, Ordering::SeqCst);
+    }
     report.merge(r);
     Ok(report)
 }
@@ -2632,7 +2811,10 @@ struct Shared {
     reason: String,
     fp: String,
     ideas: HashSet<Id>,
-    plan: Arc<Plan>,
+    source_space: Option<Id>,
+    intakes: HashMap<(String, String), DocIntake>,
+    infos: Vec<LinkInfo>,
+    links: Vec<PlanLink>,
 }
 
 impl Shared {
@@ -2649,7 +2831,7 @@ impl Shared {
             today: now_ts.to_zoned(jiff::tz::TimeZone::UTC).date().to_string(),
             now: fmt_ts(now_ts),
             ideas: &self.ideas,
-            source_space: self.plan.source_space,
+            source_space: self.source_space,
         })
     }
 
@@ -2663,7 +2845,7 @@ impl Shared {
         for it in items {
             match it {
                 Item::Folder(f) => apply_folder(c, &ctx, f)?,
-                Item::Note(n) => apply_note(c, &ctx, &self.plan.intakes, n, r)?,
+                Item::Note(n) => apply_note(c, &ctx, &self.intakes, n, r)?,
                 Item::Entry(e) => apply_entry(c, &ctx, e, r)?,
             }
         }
@@ -2672,7 +2854,7 @@ impl Shared {
 
     fn links(&self, c: &Connection, r: &mut ImportReport) -> Result<(), StoreError> {
         let ctx = self.ctx(c)?;
-        apply_links(c, &ctx, &self.plan, r)
+        apply_links(c, &ctx, &self.infos, &self.links, r)
     }
 }
 
@@ -2695,7 +2877,100 @@ mod tests {
         max_bytes: 1 << 30,
         max_files: 1000,
         max_ratio: 100,
+        max_text_bytes: 64 << 20,
     };
+
+    fn deflated(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let o = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (n, d) in files {
+            z.start_file(*n, o).unwrap();
+            z.write_all(d).unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    /// Бомба из мелких файлов: каждый меньше 1 МиБ, но сжат в тысячи раз.
+    #[test]
+    fn import_rejects_small_files_bomb() {
+        let files: Vec<(String, Vec<u8>)> = (0..64)
+            .map(|i| (format!("n{i}.md"), vec![0u8; (1 << 20) - 1]))
+            .collect();
+        let refs: Vec<(&str, Vec<u8>)> =
+            files.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+        let z = deflated(&refs);
+        let mut z = ZipArchive::new(Cursor::new(z)).unwrap();
+        let e = validate_archive(&mut z, &LIM).unwrap_err().to_string();
+        assert!(e.contains("сжат"), "{e}");
+        // предел текстов: умеренно сжатые тексты больше max_text_bytes
+        let txt: Vec<u8> = (0..400_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut z = ZipArchive::new(Cursor::new(deflated(&[("a.md", txt)]))).unwrap();
+        let lim = ImportLimits {
+            max_text_bytes: 1 << 20,
+            ..LIM
+        };
+        let e = validate_archive(&mut z, &lim).unwrap_err().to_string();
+        assert!(e.contains("max_text_bytes"), "{e}");
+    }
+
+    /// Бомба рядом с несжимаемым файлом: общий коэффициент мал, файловый — нет.
+    #[test]
+    fn import_rejects_mixed_bomb() {
+        let noise: Vec<u8> = (0..(5u64 << 20))
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let st = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let df = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        z.start_file("_attachments/aa/n.bin", st).unwrap();
+        z.write_all(&noise).unwrap();
+        z.start_file("manifest.json", df).unwrap();
+        z.write_all(b"{}").unwrap();
+        z.start_file("b.md", df).unwrap();
+        z.write_all(&vec![0u8; 900 << 10]).unwrap();
+        let mut a = ZipArchive::new(Cursor::new(z.finish().unwrap().into_inner())).unwrap();
+        let e = validate_archive(&mut a, &LIM).unwrap_err().to_string();
+        assert!(e.contains("«b.md» сжат"), "{e}");
+    }
+
+    /// Много мелких файлов, каждый в пределе файлового коэффициента, — ловит общий.
+    #[test]
+    fn import_rejects_many_tiny_bombs() {
+        let files: Vec<(String, Vec<u8>)> = (0..1000)
+            .map(|i| (format!("n{i}.md"), vec![0u8; 60 << 10]))
+            .collect();
+        let refs: Vec<(&str, Vec<u8>)> =
+            files.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+        let mut a = ZipArchive::new(Cursor::new(deflated(&refs))).unwrap();
+        let e = validate_archive(&mut a, &LIM).unwrap_err().to_string();
+        assert!(e.contains("архив сжат"), "{e}");
+    }
+
+    /// Подделанный размер в заголовках (меньше настоящего) — отказ, а не чтение сверх заявленного.
+    #[test]
+    fn import_rejects_forged_size_header() {
+        let data: Vec<u8> = (0..50_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut z = deflated(&[("a.md", data)]);
+        let patch = |z: &mut Vec<u8>, sig: &[u8], off: usize| {
+            let p = z.windows(4).position(|w| w == sig).unwrap();
+            z[p + off..p + off + 4].copy_from_slice(&100u32.to_le_bytes());
+        };
+        patch(&mut z, b"PK\x03\x04", 22);
+        patch(&mut z, b"PK\x01\x02", 24);
+        let mut a = ZipArchive::new(Cursor::new(z)).unwrap();
+        assert!(matches!(
+            validate_archive(&mut a, &LIM),
+            Err(ImportError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn import_ids_deterministic_per_recipient() {
+        let (u, v, s) = (Id::new(), Id::new(), Id::new());
+        assert_eq!(import_id(u, s, "a/b", "k"), import_id(u, s, "a/b", "k"));
+        assert_ne!(import_id(u, s, "a/b", "k"), import_id(v, s, "a/b", "k"));
+        assert_ne!(import_id(u, s, "a/b", "k"), import_id(u, s, "a/b", "k2"));
+    }
 
     #[test]
     fn import_scan_refs_letters_and_bounds() {
@@ -2807,15 +3082,37 @@ mod tests {
     }
 
     #[test]
-    fn import_demote_note_frontmatter_only() {
-        let t = "---\ntags: [a]\ncertainty: axiom\n---\n# X\n\ncertainty: axiom\n";
+    fn import_demote_note_by_parser() {
+        let d = |t: &str| demote_note(t);
+        // обычный ключ и тело с той же строкой
         assert_eq!(
-            demote_note_text(t).unwrap(),
-            "---\ntags: [a]\ncertainty: theorem\n---\n# X\n\ncertainty: axiom\n"
+            d("---\ntags: [a]\ncertainty: axiom\n---\n# X\n\ncertainty: axiom\n").unwrap(),
+            Some("---\ntags: [a]\ncertainty: theorem\n---\n# X\n\ncertainty: axiom\n".into())
         );
-        assert!(demote_note_text("# без frontmatter\ncertainty: axiom\n").is_none());
-        assert!(demote_note_text("---\ncertainty: theorem\n---\nx").is_none());
-        assert!(demote_note_text("---\ncertainty: \"axiom\"\n---\nx").is_some());
+        // комментарий сохраняется
+        assert_eq!(
+            d("---\ncertainty: axiom # подтвердил\n---\nx").unwrap(),
+            Some("---\ncertainty: theorem # подтвердил\n---\nx".into())
+        );
+        // блочный скаляр: строки продолжения уходят вместе с ключом
+        let t = d("---\ncertainty: |\n  axiom\ntags: [a]\n---\nx")
+            .unwrap()
+            .unwrap();
+        assert_eq!(t, "---\ncertainty: theorem\ntags: [a]\n---\nx");
+        // повтор ключа: действует последний, переписаны оба
+        let t = d("---\ncertainty: hypothesis\ncertainty: axiom\n---\nx")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            note_meta(&t, None).certainty().unwrap(),
+            Some(Certainty::Theorem)
+        );
+        assert!(!t.contains("axiom") && !t.contains("hypothesis"), "{t}");
+        // в кавычках и с пробелом перед двоеточием
+        assert!(d("---\ncertainty : \"axiom\"\n---\nx").unwrap().is_some());
+        // не аксиома — без изменений
+        assert_eq!(d("---\ncertainty: theorem\n---\nx").unwrap(), None);
+        assert_eq!(d("# без frontmatter\ncertainty: axiom\n").unwrap(), None);
     }
 
     #[test]

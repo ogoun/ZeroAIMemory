@@ -50,8 +50,8 @@ use zam_store::EntryKind;
 
 pub use crate::backup::MANIFEST_FILE;
 
-// Раскладка и отпечаток — общие с импортом (`zam_store::import`): одно место правды.
-pub use zam_store::import::{
+// Раскладка и отпечаток — общие с импортом (`zam_store::archive`): одно место правды.
+pub use zam_store::archive::{
     ATTACHMENTS_DIR, EXPORT_FORMAT, FOLDERS_FILE, Fingerprint, HISTORY_DIR, JOURNALS_DIR,
     LINKS_FILE,
 };
@@ -356,7 +356,7 @@ mod tests {
     /// Опись экспорта и импорта — один файл.
     #[test]
     fn manifest_name_shared_with_import() {
-        assert_eq!(MANIFEST_FILE, zam_store::import::MANIFEST_FILE);
+        assert_eq!(MANIFEST_FILE, zam_store::archive::MANIFEST_FILE);
     }
 
     #[test]

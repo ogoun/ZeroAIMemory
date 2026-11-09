@@ -11,6 +11,7 @@
 //! снимки сессий (`session_snapshots`; M6).
 
 pub mod access;
+pub mod archive;
 pub mod attachments;
 pub mod backup;
 pub mod blobs;

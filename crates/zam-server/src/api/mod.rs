@@ -184,7 +184,8 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
             delete(blobs::remove),
         )
         // импорт пространства (M6 §12б.5): тело — zip потоком в файл со своим пределом
-        // `import.max_bytes` (обработчик читает `Body` сам, общий предел тела не действует)
+        // `import.max_bytes` (обработчик читает `Body` сам, общий предел тела не действует);
+        // ответ 202 — задание, ход — `GET /spaces/{space}/imports/{job}`
         .route(
             "/api/v1/spaces/{space}/import",
             post(transfer::import::import).layer(DefaultBodyLimit::disable()),
@@ -241,6 +242,11 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route(
             "/api/v1/spaces/{space}/export",
             get(transfer::export::export),
+        )
+        // ход задания импорта (M6 §12б.5): чтение, не запись памяти
+        .route(
+            "/api/v1/spaces/{space}/imports/{job}",
+            get(transfer::import::status),
         )
         .route(
             "/api/v1/solutions",

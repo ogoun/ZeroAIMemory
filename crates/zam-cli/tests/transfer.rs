@@ -270,8 +270,8 @@ fn cli_export_idle_watchdog() {
     assert!(parts(&r).is_empty(), "{:?}", parts(&r));
 }
 
-/// Каталог без описи — «папка `.md`»: архив чужой (новые id, `axiom` → `theorem`), временный zip
-/// рядом с каталогом удаляется; повтор — конфликты `path-taken` (у папки нет id для повтора).
+/// Каталог без описи — «папка `.md`»: архив чужой (новые id, `axiom` → `theorem`), упаковка —
+/// потоком без временного файла; задание опрашивается до итога; повтор — пропуск.
 #[test]
 fn cli_import_folder_md() {
     let (url, tok) = start("imp-dir");
@@ -312,8 +312,9 @@ fn cli_import_folder_md() {
     );
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     let rep: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    // повтор «папки .md» идемпотентен: та же заметка по пути и хэшу
     assert_eq!(rep["created"], 0, "{rep}");
-    let c = rep["conflicts"].as_array().unwrap();
-    assert_eq!(c.len(), 2, "{rep}");
-    assert!(c.iter().all(|x| x["reason"] == "path-taken"), "{rep}");
+    assert_eq!(rep["skipped"], 2, "{rep}");
+    assert!(rep["conflicts"].as_array().unwrap().is_empty(), "{rep}");
+    assert!(stderr(&o).contains("не отменяется"), "{}", stderr(&o));
 }
