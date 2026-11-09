@@ -6627,3 +6627,36 @@ m57_acceptance` — 13 PASS, `--test agent_dates` — PASS, `--test backup --fea
 исправления (`g5`) упал ML-тест `foreign_import_same_server_keeps_owner_search`: Qdrant не
 включил векторный канал за 240 с (`QdrantDown`). Это внешний сбой стенда под нагрузкой:
 в прогонах `g6`, `g7`, `g8` тест прошёл.
+
+### Правки пятого ревью 18b2 (2026-11-10)
+
+Пятое ревью: Approve, Critical и Important нет; три Minor закрыты в этом круге. Коммит
+`942f521` поверх `c4cf8ef`.
+
+- **m-A — `Connection: close` на POST импорта.**
+  - Ограничение ureq 3.4.2: ранний (не `100`) ответ на `Expect` дочитывается только до закрытия
+    соединения сервером. После Await100 `recv_response` ждёт новых данных (`run.rs:541-543`,
+    `transport/mod.rs:282-293`).
+  - Прокси с keep-alive, ответивший до тела, держал бы CLI до срока ответа — 10 мин.
+  - `Client::send_import` шлёт `Connection: close`: сервер обязан закрыть соединение после
+    ответа (RFC 9112 §9.6). Ограничение записано в §12б.5 и в описании `send_import`.
+  - Тест `cli_import_early_answer_keep_alive_proxy_stub`: заглушка с keep-alive отвечает 413
+    рано и закрывает соединение только по `Connection: close` клиента, иначе держит его 20 с.
+    Проверено, что заголовок отправлен, CLI показывает HTTP 413 и заканчивает быстрее 10 с.
+- **m-B — тест без подмены свободного места.** `import_real_free_space_small_body` строит мир
+  через `common::reports::world_cfg`, без обёртки с подменой. При `min_free_bytes = 0` и малом
+  теле с `Content-Length` импорт проходит настоящий `fs4::available_space` в `disk_reserve`;
+  нужно лишь 2 × тело, так что от диска раннера тест не зависит.
+- **m-C.** В справке `zam import` длинная строка про сбой упаковки перенесена, как остальные.
+
+**Откаты** (каждый отдельно; после отката — PASS, дерево чистое):
+- `conn_close` (без заголовка) → `cli_import_early_answer_keep_alive_proxy_stub` FAIL: нет
+  `Connection: close`, CLI ждал закрытия соединения до конца удержания (прогон 21,3 с против
+  обычных единиц секунд);
+- `real_free` (настоящее свободное место считается нулём) →
+  `import_real_free_space_small_body` FAIL (507).
+
+**Проверки** (`target/r3-t18b2`, `--no-fail-fast`, каждый набор дважды): `fmt --check` и
+`clippy -p zam-store -p zam-server -p zam-cli -p zam-index --all-targets -D warnings` — чисто;
+`ZAM_REQUIRE_ML=1 zam-server --test transfer_import` — 2 × 45 PASS; `zam-cli --test transfer` —
+2 × 19 PASS.
