@@ -231,7 +231,7 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
         maps.push(json!({"budget": b, "tokens": tokens, "ok": tokens <= b,
                          "ms_p50": pct(&times, 50), "ms_max": pct(&times, 100)}));
     }
-    let central = central_report(&ctx, &status)?;
+    let (central, in_json) = central_report(&ctx, &status)?;
     // входы ранжирования карты без эталонов — для абляции (база прогона, только чтение)
     let inputs_nf = rank_inputs(&data)?;
     let hooks = hooks_with_map(&ctx, &copy, &work)?;
@@ -251,9 +251,9 @@ fn code_bench_in(root: &Path, repo: &Path) -> Result<()> {
             fixtures_sync.report
         );
     }
-    let central_fx = central_report(&ctx, &status_fx)?;
+    let (central_fx, _) = central_report(&ctx, &status_fx)?;
     let inputs_fx = rank_inputs(&data)?;
-    let ablation = ablation_report(&inputs_nf, &inputs_fx, &central);
+    let ablation = ablation_report(&inputs_nf, &inputs_fx, &central, &in_json);
     // замеры старта клиента — без работающего рядом сервера замеров (Qdrant, фоновые задачи
     // на том же HDD): у агента сервер обычно на другой машине
     srv.stop()?;
@@ -595,7 +595,11 @@ fn http(
 /// Центральные символы против ключевых типов: первые 10 `GET /code/status` (не больше трёх из
 /// файла — ответ сервера) и первые 15 по рангу символа среди всех символов карты в JSON
 /// (`budget_tokens = 20000`, без ограничения на файл).
-fn central_report(ctx: &Ctx, status: &Value) -> Result<Value> {
+/// Второе значение — `(qual, путь)` всех символов JSON-карты (сверка абляции с сервером).
+fn central_report(
+    ctx: &Ctx,
+    status: &Value,
+) -> Result<(Value, std::collections::HashSet<(String, String)>)> {
     let key = |qual: &str, path: &str| KEY_TYPES.iter().any(|(q, p)| *q == qual && *p == path);
     let status_top: Vec<Value> = status["central"]
         .as_array()
@@ -648,7 +652,11 @@ fn central_report(ctx: &Ctx, status: &Value) -> Result<Value> {
         })
         .collect();
     let top_hits = hits(&top);
-    Ok(json!({
+    let in_json = all
+        .iter()
+        .map(|(_, q, p, _)| (q.clone(), p.clone()))
+        .collect();
+    let report = json!({
         "status_top10": status_top,
         "status_hits": hits(&status_top),
         "top15": top,
@@ -657,7 +665,8 @@ fn central_report(ctx: &Ctx, status: &Value) -> Result<Value> {
         "key_type_places": places,
         "threshold": KEY_TYPES_MIN,
         "ok": top_hits >= KEY_TYPES_MIN,
-    }))
+    });
+    Ok((report, in_json))
 }
 
 /// Холодный старт `zam --version`: p50/p95 из [`VERSION_RUNS`].
@@ -944,7 +953,7 @@ fn print_table(r: &Value) {
     );
     for v in r["ablation"]["variants"].as_array().into_iter().flatten() {
         println!(
-            "| абляция (справочно): {} — ключевые типы в первых 15 | {}/10 | — |",
+            "| абляция (справочно): {} — ключевые типы в первых 15 (все символы карты) | {}/10 | — |",
             v["variant"].as_str().unwrap_or(""),
             v["top15_hits"]
         );
@@ -1081,9 +1090,17 @@ fn rank_inputs(data: &Path) -> Result<Inputs> {
     Ok(Inputs { files, quals })
 }
 
+/// Первые 15: `(qual, путь)`.
+type Top = Vec<(String, String)>;
+
 /// Первые [`CENTRAL_TOP`] по рангу символа (ранг файла × доля, без ограничения на файл, как
-/// [`central_report`]) при правилах `w`: `(qual, путь)`; и места ключевых типов.
-fn offline_top(inp: &Inputs, w: RankWeights) -> (Vec<(String, String)>, Vec<Option<usize>>) {
+/// [`central_report`]) при правилах `w` среди **всех** символов карты: `(qual, путь)`; места
+/// ключевых типов; и первые 15 среди символов `only` (JSON-карты сервера — для сверки).
+fn offline_top(
+    inp: &Inputs,
+    w: RankWeights,
+    only: &std::collections::HashSet<(String, String)>,
+) -> (Top, Vec<Option<usize>>, Top) {
     let r = zam_code::rank_with(&inp.files, None, w);
     let mut all: Vec<(f64, usize, usize)> = Vec::new();
     for (i, f) in inp.files.iter().enumerate() {
@@ -1095,6 +1112,12 @@ fn offline_top(inp: &Inputs, w: RankWeights) -> (Vec<(String, String)>, Vec<Opti
     let id =
         |&(_, i, j): &(f64, usize, usize)| (inp.quals[i][j].clone(), inp.files[i].path.clone());
     let top = all.iter().take(CENTRAL_TOP).map(id).collect();
+    let top_only = all
+        .iter()
+        .map(id)
+        .filter(|x| only.contains(x))
+        .take(CENTRAL_TOP)
+        .collect();
     let places = KEY_TYPES
         .iter()
         .map(|(q, p)| {
@@ -1106,12 +1129,19 @@ fn offline_top(inp: &Inputs, w: RankWeights) -> (Vec<(String, String)>, Vec<Opti
                 .map(|i| i + 1)
         })
         .collect();
-    (top, places)
+    (top, places, top_only)
 }
 
 /// Абляция M6 §12а (справочно): каждое из трёх изменений отдельно и вместе на входах прогона —
-/// карта без эталонов (`nf`) и с ними (`fx`); «все три» сверяется с первыми 15 сервера.
-fn ablation_report(nf: &Inputs, fx: &Inputs, server: &Value) -> Value {
+/// карта без эталонов (`nf`) и с ними (`fx`); места и первые 15 — среди всех символов карты (у
+/// сервера — только символы JSON-карты в бюджете 20000, её состав зависит от рангов). Сверка:
+/// «все три» среди символов JSON-карты сервера `in_json` = первые 15 сервера.
+fn ablation_report(
+    nf: &Inputs,
+    fx: &Inputs,
+    server: &Value,
+    in_json: &std::collections::HashSet<(String, String)>,
+) -> Value {
     let only = |kind_table: bool, recv: bool| RankWeights { kind_table, recv };
     let variants: [(&str, &Inputs, RankWeights); 5] = [
         (
@@ -1128,10 +1158,10 @@ fn ablation_report(nf: &Inputs, fx: &Inputs, server: &Value) -> Value {
     let mut out = Vec::new();
     let mut all_three = Vec::new();
     for (name, inp, w) in variants {
-        let (top, places) = offline_top(inp, w);
+        let (top, places, top_json) = offline_top(inp, w, in_json);
         let hits = top.iter().filter(|(q, p)| key(q, p)).count();
         if w == RankWeights::M6 {
-            all_three = top.clone();
+            all_three = top_json;
         }
         out.push(json!({
             "variant": name,
@@ -1155,7 +1185,8 @@ fn ablation_report(nf: &Inputs, fx: &Inputs, server: &Value) -> Value {
         })
         .collect();
     json!({"variants": out, "matches_server": all_three == server_top,
-           "note": "справочно (M6 §12а): выбор из абляции не делается"})
+           "note": "справочно (M6 §12а): выбор из абляции не делается; первые 15 и места — \
+                    среди всех символов карты, у сервера — среди символов JSON-карты"})
 }
 
 #[cfg(test)]
