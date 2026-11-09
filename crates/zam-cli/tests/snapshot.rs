@@ -87,7 +87,6 @@ impl Case {
             max_bytes: MAX,
             summary: None,
             min_len: None,
-            min_idle: None,
         }
     }
 

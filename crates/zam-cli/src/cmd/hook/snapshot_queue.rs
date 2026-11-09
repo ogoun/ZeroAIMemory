@@ -8,16 +8,18 @@
 //!     снимок из одного конспекта стёр бы запросы и файлы `PreCompact`;
 //!   - `PreCompact`, `SessionEnd` — всегда;
 //!   - `SessionStart source=compact` — если `PostCompact` не пришёл (в `snapst-*` последний
-//!     снимок не `post_compact` или старше [`POST_COMPACT_FRESH`]); снимок и `PUT` — **до**
+//!     **удавшийся** снимок не `post_compact` или старше [`POST_COMPACT_FRESH`]: опоздавшая
+//!     попытка `PostCompact` не считается); снимок и `PUT` — **до**
 //!     `/recall` (его делает поток `/recall` хука);
 //!   - `Stop` — не чаще раза в [`STOP_INTERVAL`], затем: сменился `transcript_path`, в журнале
 //!     сессии есть `Ev::Prompt` новее учтённого снимком (`prompt_at`) или журнал вырос на ≥
 //!     [`STOP_GROWTH`] байт ([`stop_due`]); без ключа `session_journal` — без запросов;
 //!   - `SessionStart source=startup` — догоняющий снимок ([`abandoned`]): у самой новой по
-//!     времени файла `snapst-*` другой сессии проекта нет признака конца (`ended`), её журнал
-//!     вырос после снимка и не менялся [`ABANDON_IDLE`].
+//!     времени файла `snapst-*` другой сессии проекта нет признака конца (`ended`), а её журнал
+//!     вырос после снимка. Давность журнала не проверяется (как в §8а): живую параллельную
+//!     сессию снять безвредно — живость для показа решает сервер по `last_seen_at`.
 //! - **Ввод-вывод журнала агента** — только в потоке снимка со сроком
-//!   ([`super::snapshot::take_ext`]: `metadata`, рост, давность, чтение); до него — только файлы
+//!   ([`super::snapshot::take_ext`]: `metadata`, рост, чтение); до него — только файлы
 //!   кэша проекта (`snapst-*`, журнал сессии).
 //! - **Сборка** ([`run`]) — со сроком `hooks.snapshot_ms`: опоздание — снимка нет (поток брошен),
 //!   в `snapst-*` — момент попытки; нового снимка нет — уходит прежняя очередь сессии. Готовый снимок — событие `Ev::Snapshot` журнала сессии (только
@@ -66,9 +68,6 @@ pub const FLUSH_OTHERS_MAX: usize = 3;
 /// Срок `PUT` снимка внутри бюджета хука, мс (как `IMPACT_MS` у `checkpoint`): медленный
 /// сервер не съедает бюджет `/recall` у `session-start`; не успел — снимок в очереди.
 pub const SNAPSHOT_PUT_MS: u64 = 60;
-/// Журнал кандидата на догоняющий снимок не менялся хотя бы столько: живая параллельная сессия
-/// (её журнал пишется) оборванной не считается.
-pub const ABANDON_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// Состояние снимка сессии `snapst-<сессия>.json`: журнал агента, его размер и момент снимка.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,11 +77,15 @@ pub struct State {
     pub transcript_path: PathBuf,
     /// Размер журнала агента при снимке, байт.
     pub size: u64,
-    /// Момент снимка, мс Unix.
+    /// Момент последней попытки снимка (удавшейся или опоздавшей), мс Unix: правило 60 с у
+    /// `Stop`.
     pub at: u64,
+    /// Момент последнего **удавшегося** снимка, мс Unix; 0 — снимков не было (только попытки).
+    #[serde(default)]
+    pub ok_at: u64,
     /// Формат журнала (`claude` | `codex`).
     pub agent: String,
-    /// Повод последнего снимка.
+    /// Повод последнего удавшегося снимка (опоздавшая попытка его не меняет).
     pub trigger: String,
     /// Пришёл `SessionEnd`: сессия закончилась, догоняющий снимок ей не нужен.
     #[serde(default)]
@@ -127,10 +130,9 @@ pub struct Job {
     pub agent: AgentKind,
     pub trigger: SnapTrigger,
     pub summary: Option<String>,
-    /// Журнал короче — не снимать (`Stop` без нового запроса: рост ≥ [`STOP_GROWTH`]).
+    /// Журнал короче — не снимать (`Stop` без нового запроса: рост ≥ [`STOP_GROWTH`];
+    /// догоняющий снимок: журнал не вырос).
     pub min_len: Option<u64>,
-    /// Журнал менялся позже — не снимать (догоняющий снимок: [`ABANDON_IDLE`]).
-    pub min_idle: Option<Duration>,
 }
 
 pub fn state_path(env: &Env, session: &str) -> PathBuf {
@@ -212,7 +214,6 @@ pub fn job_for_checkpoint(env: &Env, inp: &Input, s: &Settings) -> Option<Job> {
         trigger,
         summary,
         min_len,
-        min_idle: None,
     })
 }
 
@@ -238,7 +239,8 @@ pub fn stop_due(env: &Env, session: &str, transcript: &Path, journal_on: bool) -
     if now_ms().saturating_sub(st.at) < STOP_INTERVAL.as_millis() as u64 {
         return StopDue::No;
     }
-    if st.transcript_path != transcript {
+    // удавшегося снимка ещё не было (только опоздавшие попытки, `size` в них — 0) — сразу
+    if st.ok_at == 0 || st.transcript_path != transcript {
         return StopDue::Now;
     }
     let prompted = journal_on
@@ -269,7 +271,8 @@ pub fn job_for_session_start(env: &Env, inp: &Input, s: &Settings) -> Option<Job
             let session = inp.session_id.clone()?;
             let fresh = read_state(&state_path(env, &session)).is_some_and(|st| {
                 st.trigger == SnapTrigger::PostCompact.as_str()
-                    && now_ms().saturating_sub(st.at) < POST_COMPACT_FRESH.as_millis() as u64
+                    && st.ok_at > 0
+                    && now_ms().saturating_sub(st.ok_at) < POST_COMPACT_FRESH.as_millis() as u64
             });
             if fresh {
                 return None;
@@ -281,7 +284,6 @@ pub fn job_for_session_start(env: &Env, inp: &Input, s: &Settings) -> Option<Job
                 trigger: SnapTrigger::SessionStartCompact,
                 summary: None,
                 min_len: None,
-                min_idle: None,
             })
         }
         "startup" => {
@@ -293,7 +295,6 @@ pub fn job_for_session_start(env: &Env, inp: &Input, s: &Settings) -> Option<Job
                 transcript: st.transcript_path,
                 trigger: SnapTrigger::CatchUp,
                 summary: None,
-                min_idle: Some(ABANDON_IDLE),
             })
         }
         _ => None,
@@ -311,8 +312,13 @@ fn reopen(env: &Env, session: &str) {
 
 /// Кандидат на догоняющий снимок: самый новый по времени файла `snapst-*` другой сессии
 /// (разбирается он один, файлы — по `read_dir`, без чтения прочих). У него нет `ended` и есть
-/// журнал. Вырос ли журнал и давно ли он менялся ([`ABANDON_IDLE`]: живая параллельная сессия не
-/// снимается), проверяет поток снимка в сроке.
+/// журнал. Вырос ли журнал, проверяет поток снимка в сроке.
+///
+/// Давность журнала не требуется (§8а; отмена Minor 7 ревью 17b, повторное ревью N1): при
+/// быстром перезапуске (новая сессия раньше срока давности) оборванная сессия была бы пропущена,
+/// а после первого снимка новой сессии её `snapst-*` перестал бы быть самым новым — оборванная
+/// не рассматривалась бы никогда. Снять живую параллельную сессию безвредно: живость для показа
+/// решает сервер по `last_seen_at`.
 pub fn abandoned(env: &Env, current: Option<&str>) -> Option<State> {
     let rd = std::fs::read_dir(env.cache_dir()).ok()?;
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
@@ -352,7 +358,6 @@ pub fn run(env: &Env, s: &Settings, job: Job, send: bool) {
         max_bytes: MAX_BYTES,
         summary: job.summary.clone(),
         min_len: job.min_len,
-        min_idle: job.min_idle,
     };
     let taken = snapshot::take_ext(&job.transcript, &opts);
     let ended = job.trigger == SnapTrigger::SessionEnd;
@@ -367,12 +372,15 @@ pub fn run(env: &Env, s: &Settings, job: Job, send: bool) {
     let (snap, len) = match taken {
         Taken::Snap(snap, len) => (snap, len),
         Taken::Late => {
-            // попытка — в `snapst-*`: правило 60 с у `Stop` действует и для опоздавших
+            // попытка — в `snapst-*` (`at`): правило 60 с у `Stop` действует и для опоздавших.
+            // Повод, `ok_at`, размер и `prompt_at` — прежнего удавшегося снимка: опоздавший
+            // `PostCompact` не выдаёт себя за пришедший (`fresh` у `session-start`). Снимка ещё
+            // не было — размер 0 и `ok_at` 0: размер журнала узнать можно только `stat` вне срока,
+            // а `stop_due` при `ok_at == 0` снимает сразу (после 60 с), рост не нужен.
             let st = State {
                 session: job.session.clone(),
                 transcript_path: job.transcript.clone(),
                 at: now_ms(),
-                trigger: trigger.to_string(),
                 ended: ended || prev.as_ref().is_some_and(|p| p.ended),
                 agent: job.agent.as_str().to_string(),
                 ..prev.clone().unwrap_or_default()
@@ -406,6 +414,7 @@ pub fn run(env: &Env, s: &Settings, job: Job, send: bool) {
         transcript_path: job.transcript.clone(),
         size: len,
         at: now_ms(),
+        ok_at: now_ms(),
         agent: job.agent.as_str().to_string(),
         trigger: trigger.to_string(),
         ended: ended || prev.is_some_and(|p| p.ended),
@@ -460,6 +469,9 @@ pub fn run(env: &Env, s: &Settings, job: Job, send: bool) {
 fn log_sent(env: &Env, what: &str, r: Option<Sent>, always: bool) {
     match r {
         Some(Sent::Ok) => env.log(&format!("{what}, отправлен")),
+        Some(Sent::OkKept) => env.log(&format!(
+            "{what}, отправлен, очередь оставлена (замок занят)"
+        )),
         Some(Sent::Queued(why)) => env.log(&format!("{what}, в очереди: {why}")),
         Some(Sent::Dropped(why)) => env.log(&format!("{what}, отброшен: {why}")),
         None if always => env.log(&format!("{what}, в очереди")),
@@ -528,6 +540,8 @@ fn enqueue(env: &Env, session: &str, body: Value) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Sent {
     Ok,
+    /// Отправлен, но очередь не удалена: замок очереди занят (снимок уйдёт ещё раз).
+    OkKept,
     /// Остался в очереди (причина без текста снимка).
     Queued(String),
     /// Отброшен: повтор не поможет (400, 413, 422).
@@ -564,15 +578,22 @@ pub fn flush(env: &Env, session: &str) -> Option<Sent> {
     client.set_session(Some(item.session.clone()));
     let path = format!("/sessions/{}/snapshot", encode_segment(&item.session));
     let body = serde_json::to_vec(&item.body).ok()?;
+    let t0 = std::time::Instant::now();
     let res = client.put_json_body(&path, body);
+    let spent = t0.elapsed();
     let lock = cache::file_lock(&q, QUEUE_LOCK_WAIT);
     let same = || lock.is_some() && read_queue(&q).is_some_and(|(now, _)| now == raw);
     Some(match res {
         Ok(_) => {
             if same() {
                 let _ = std::fs::remove_file(&q);
+                Sent::Ok
+            } else if lock.is_none() {
+                Sent::OkKept
+            } else {
+                // очередь сменилась за время запроса: в ней уже новый снимок
+                Sent::Ok
             }
-            Sent::Ok
         }
         Err(e) if matches!(e.http_status(), Some(400 | 413 | 422)) => {
             if same() {
@@ -601,9 +622,19 @@ pub fn flush(env: &Env, session: &str) -> Option<Sent> {
                 short(&e)
             ))
         }
+        // сеть: ответа нет за свой срок — отдельная причина (вечная очередь видна в журнале)
+        Err(e)
+            if e.http_status().is_none()
+                && spent + PUT_LATE_SLACK >= Duration::from_millis(put_ms()) =>
+        {
+            Sent::Queued(format!("срок PUT {} мс", put_ms()))
+        }
         Err(e) => Sent::Queued(short(&e)),
     })
 }
+
+/// Запас при распознавании «срок PUT вышел» (запрос шёл почти весь срок).
+const PUT_LATE_SLACK: Duration = Duration::from_millis(5);
 
 /// Причина ошибки для `hooks.log`: ответ сервера — только `HTTP <код>` и `type` problem+json
 /// (`detail` мог бы нести кусок снимка); сеть — текст клиента (без тела запроса).

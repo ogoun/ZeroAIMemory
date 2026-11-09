@@ -167,9 +167,6 @@ pub struct TakeOpts {
     /// Журнал короче — снимок не нужен ([`Taken::Skipped`]): `Stop` без роста, догоняющий снимок
     /// без новых записей. Проверка — в потоке, в сроке (§8а: весь ввод-вывод в срок).
     pub min_len: Option<u64>,
-    /// Журнал менялся позже, чем столько назад, — снимок не нужен ([`Taken::Skipped`]): живая
-    /// параллельная сессия для догоняющего снимка.
-    pub min_idle: Option<Duration>,
 }
 
 /// Итог [`take_ext`].
@@ -179,7 +176,7 @@ pub enum Taken {
     Snap(Snapshot, u64),
     /// Журнала нет, это не файл или ошибка чтения (и конспекта входа нет).
     Missing,
-    /// Журнал не подошёл под `min_len`/`min_idle`.
+    /// Журнал короче `min_len`.
     Skipped,
     /// Поток не успел в срок (брошен и ничего не пишет).
     Late,
@@ -200,7 +197,7 @@ pub fn take(path: &Path, opts: &TakeOpts) -> Option<Snapshot> {
 }
 
 /// [`take`] с причиной, если снимка нет, и размером журнала (для `snapst-*`): весь ввод-вывод
-/// журнала (`metadata`, проверки `min_len`/`min_idle`, чтение) — в потоке со сроком.
+/// журнала (`metadata`, проверка `min_len`, чтение) — в потоке со сроком.
 pub fn take_ext(path: &Path, opts: &TakeOpts) -> Taken {
     let start = Instant::now();
     let (tx, rx) = mpsc::sync_channel(1);
@@ -238,17 +235,10 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Taken {
     let soft = start + o.deadline * 4 / 5;
     let summary = o.summary.as_deref().filter(|t| !t.trim().is_empty());
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file());
-    if let Some(m) = &meta {
-        let short = o.min_len.is_some_and(|n| m.len() < n);
-        let busy = o.min_idle.is_some_and(|idle| {
-            m.modified()
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_none_or(|age| age < idle)
-        });
-        if short || busy {
-            return Taken::Skipped;
-        }
+    if let Some(m) = &meta
+        && o.min_len.is_some_and(|n| m.len() < n)
+    {
+        return Taken::Skipped;
     }
     let len = meta.as_ref().map_or(0, |m| m.len());
     let tail = meta

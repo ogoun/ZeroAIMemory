@@ -98,7 +98,6 @@ pub fn run(
         max_bytes: MAX_BYTES,
         summary: None,
         min_len: None,
-        min_idle: None,
     };
     let snap = snapshot::take(transcript, &opts).ok_or_else(|| {
         CliError::new(
