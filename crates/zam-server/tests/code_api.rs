@@ -1546,6 +1546,11 @@ async fn code_files_page_lang_q_offset_limit() {
 /// Ревью задачи 4, O1: чтение входов для фокуса — отдельной задачей, одной на решение и снимок;
 /// срок запроса его не отменяет: первые запросы откатываются без фокуса, следующий — с фокусом
 /// из кэша; чтение — одно на два параллельных запроса.
+///
+/// Синхронизация — барьером `CodeHooks::inputs_hold`, не временем (флейк M5.6, задача 15b M6):
+/// раньше чтение спало 3 с, и второй запрос под нагрузкой доходил до фокуса уже после него — с
+/// фокусом из кэша. Теперь чтение стоит, пока у обоих запросов не вышел срок фокуса
+/// (`CodeHooks::focus_timeouts`); дальше запросы ждут того же чтения ради рёбер `format=json`.
 #[tokio::test]
 async fn focus_inputs_load_survives_timeout_single_read() {
     use std::sync::atomic::Ordering;
@@ -1566,27 +1571,40 @@ async fn focus_inputs_load_survives_timeout_single_read() {
     wait_ranked(&a).await;
     let hooks = &a.st.code.hooks;
     a.st.code.forget_inputs();
-    hooks.inputs_delay_ms.store(3000, Ordering::SeqCst);
+    hooks.inputs_hold.store(true, Ordering::SeqCst);
     let focus = enc(&json!({"paths": ["src/b.rs"]}).to_string());
     let extra = format!("&focus={focus}");
-    let (m1, m2) = tokio::join!(map_json(&a, &extra), map_json(&a, &extra));
+    hooks.focus_timeouts.store(0, Ordering::SeqCst);
+    let release = async {
+        // событие, а не время: срок — только страховка от зависания
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while hooks.focus_timeouts.load(Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < deadline, "срок фокуса не вышел");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // чтение стоит на барьере: оба запроса застали одну и ту же задачу чтения
+        let active = (
+            hooks.inputs_active.load(Ordering::SeqCst),
+            hooks.inputs_active_max.load(Ordering::SeqCst),
+        );
+        hooks.release_inputs();
+        active
+    };
+    let (m1, m2, active) = tokio::join!(map_json(&a, &extra), map_json(&a, &extra), release);
     for m in [&m1, &m2] {
         assert_eq!(m["warnings"], json!(["focus rank timeout"]), "{m}");
     }
     assert_eq!(
-        hooks.inputs_reads.load(Ordering::SeqCst),
-        1,
-        "одно чтение на два запроса"
+        active,
+        (1, 1),
+        "одно чтение на два запроса, идёт до барьера"
     );
-    // чтение дочиталось в фоне и заполнило кэш
-    for _ in 0..200 {
-        if a.st.code.hooks.inputs_reads.load(Ordering::SeqCst) == 1
-            && map_json(&a, &extra).await["warnings"] == json!([])
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // чтение дочиталось и заполнило кэш до ответов (рёбра ждали его)
+    assert_eq!(
+        hooks.inputs_active.load(Ordering::SeqCst),
+        0,
+        "чтение закончилось"
+    );
     let m = map_json(&a, &extra).await;
     assert_eq!(m["warnings"], json!([]), "{m}");
     assert!(m["header"].as_str().unwrap().contains("с фокусом"), "{m}");

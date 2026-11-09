@@ -273,7 +273,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CacheCmd,
     },
-    /// Сессии агентов: выданное по событию (токены, «уже выдавалось»)
+    /// Сессии агентов: выданное по событию (токены, «уже выдавалось»), снимок сессии
+    #[command(alias = "session")]
     Sessions {
         #[command(subcommand)]
         cmd: SessionsCmd,
@@ -1026,6 +1027,21 @@ enum SessionsCmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Снимок сессии из журнала агента (запросы, файлы, команды, хвост конспекта — после
+    /// маскировки секретов): для агентов без хуков и ручного снимка
+    Snapshot {
+        /// Журнал агента (Claude Code — ~/.claude/projects/…/<uuid>.jsonl, Codex — rollout-*.jsonl)
+        #[arg(long)]
+        transcript: PathBuf,
+        /// Формат журнала: claude | codex (иначе — по первой строке)
+        #[arg(long)]
+        format: Option<String>,
+        /// Id сессии (иначе ZAM_SESSION_ID, иначе id из журнала)
+        #[arg(long)]
+        session: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
 }
 
 fn sessions(c: SessionsCmd) -> Result<(), CliError> {
@@ -1043,6 +1059,14 @@ fn sessions(c: SessionsCmd) -> Result<(), CliError> {
                 (None, None) => Pick::Current,
             };
             tokens(&cmd::connect(&common)?, &pick, by_holdout)
+        }
+        SessionsCmd::Snapshot {
+            transcript,
+            format,
+            session,
+            common,
+        } => {
+            cmd::session_snapshot::run(&common, &transcript, format.as_deref(), session.as_deref())
         }
     }
 }

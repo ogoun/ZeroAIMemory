@@ -29,8 +29,11 @@
 //!   до [`SPAWN_MAX`] записей, каждая живёт [`SPAWN_TTL`]; правка — под замком `.spawn-….lock`;
 //!   просроченные записи снимает и `session-start` ([`prune_spawns`]), файл без изменений
 //!   дольше [`SPAWN_FILE_TTL`] удаляет [`gc_cache`];
+//! - `snapst-<сессия>.json` и `snapq-<сессия>.json` — состояние и очередь снимка сессии (M6 §8а,
+//!   [`super::snapshot_queue`]);
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
-//!   `shown-*`/`edits-*`/`holdout-*`/`events-*`/`changed-*`/`tokens-*`/`agent-*` старше
+//!   `shown-*`/`edits-*`/`holdout-*`/`events-*`/`changed-*`/`tokens-*`/`snapst-*`/`snapq-*`/
+//!   `agent-*` старше
 //!   [`SHOWN_TTL`] и `.*.tmp` старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
@@ -54,7 +57,7 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 /// Срок, после которого брошенный временный файл записи удаляется.
 pub const TMP_TTL: Duration = Duration::from_secs(3600);
 /// Предел файла кэша, байт.
-const CACHE_MAX: u64 = 16 * 1024 * 1024;
+pub(super) const CACHE_MAX: u64 = 16 * 1024 * 1024;
 
 /// Триггер из `GET /triggers`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1038,7 +1041,7 @@ pub fn spawn_path(env: &Env, session: &str) -> PathBuf {
 /// Замок-файл `.<имя>.lock` очереди запусков и очереди изменённых файлов (создаётся только
 /// новым, внутри — токен владельца); брошенный старше [`SPAWN_LOCK_TTL`] снимается; не взят за
 /// `wait` — `None` (без замка).
-fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
+pub(super) fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
     use std::io::Write;
     let name = path.file_name()?.to_str()?;
     let lock = path.with_file_name(format!(".{name}.lock"));
@@ -1076,7 +1079,7 @@ fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
 /// Взятый замок-файл: снимается при `Drop`, только если в файле всё ещё свой токен
 /// (`pid.nanos`) — замок, снятый как брошенный и взятый другим процессом, не удаляется
 /// (ревью задачи 9A, M1).
-struct FileLock {
+pub(super) struct FileLock {
     path: PathBuf,
     token: String,
 }
@@ -1164,7 +1167,7 @@ pub fn prune_spawns(env: &Env, session: &str) {
 }
 
 /// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`,
-/// `tokens-*.jsonl`) и привязки `agent-*.json` (M6 §7.1) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
+/// `tokens-*.jsonl`, снимок сессии `snapst-*.json` и `snapq-*.json`) и привязки `agent-*.json` (M6 §7.1) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
 /// временные `.*.tmp` и замки старше [`TMP_TTL`].
 pub fn gc_cache(env: &Env) {
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
@@ -1179,6 +1182,9 @@ pub fn gc_cache(env: &Env) {
             || (n.starts_with("events-") && n.ends_with(".jsonl"))
             || (n.starts_with("changed-") && n.ends_with(".jsonl"))
             || (n.starts_with("tokens-") && n.ends_with(".jsonl"))
+            // снимок сессии (M6 §8а): состояние и очередь
+            || (n.starts_with("snapst-") && n.ends_with(".json"))
+            || (n.starts_with("snapq-") && n.ends_with(".json"))
             // привязка `zam mcp` к сессии (M6 §7.1): pid агента, перезаписывается каждым стартом
             || (n.starts_with(super::binding::BINDING_PREFIX) && n.ends_with(".json"));
         let ttl = if session_file {

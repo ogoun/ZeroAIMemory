@@ -426,6 +426,57 @@ pub(crate) fn enqueue_doc(c: &Connection, id: Id, op: JobOp, now: &str) -> Resul
     )
 }
 
+/// Повторное извлечение документа `id` (разностная перепроверка секретов, [`crate::secrets_delta`]).
+/// Сначала сохранённые чанки документа маскируются **на месте** текущими правилами (`text`,
+/// `heading_path`, `context_prefix`, `text_hash`, `embed_key`; FTS — триггером `chunks_au`):
+/// значение уходит из `chunks` и FTS сразу, даже если повторное извлечение не удастся. Затем —
+/// `extract_state = 'pending'` и задание извлечения у живого, как в [`rechunk_docs_if_stale`]:
+/// извлечение из кэша `blob_extract` лишь уточнит границы чанков. `false` — документ не в `done`
+/// (уже ждёт извлечения или не извлекается; чанки всё равно замаскированы).
+pub(crate) fn reextract_doc(c: &Connection, id: Id, now: &str) -> Result<bool, StoreError> {
+    mask_doc_chunks(c, id)?;
+    let live: Option<bool> = c
+        .prepare_cached(
+            "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
+             WHERE id = ?1 AND extract_state = 'done'
+             RETURNING deleted_at IS NULL
+               AND (SELECT deleted_at IS NULL FROM nodes WHERE id = node_id)",
+        )?
+        .query_row([id], |r| r.get(0))
+        .optional()?;
+    if live == Some(true) {
+        enqueue_doc(c, id, JobOp::Upsert, now)?;
+    }
+    Ok(live.is_some())
+}
+
+/// Маскирует на месте сохранённые чанки документа `att` текущими правилами сканера; число
+/// переписанных строк.
+pub(crate) fn mask_doc_chunks(c: &Connection, att: Id) -> Result<u64, StoreError> {
+    let rows: Vec<(i64, String, String, String)> = c
+        .prepare_cached(
+            "SELECT seq, text, heading_path, context_prefix FROM chunks WHERE attachment_id = ?1",
+        )?
+        .query_map([att], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut upd = c.prepare_cached(
+        "UPDATE chunks SET text = ?2, heading_path = ?3, context_prefix = ?4, text_hash = ?5,
+                           embed_key = ?6
+         WHERE seq = ?1",
+    )?;
+    let mut n = 0;
+    for (seq, text, heading, prefix) in rows {
+        let (t, h, p) = (mask_text(&text), mask_text(&heading), mask_text(&prefix));
+        if t == text && h == heading && p == prefix {
+            continue;
+        }
+        let hash = blake3::hash(t.as_bytes()).to_hex().to_string();
+        upd.execute(params![seq, t, h, p, hash, embed_key_of(&p, &t)])?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Что известно о файле при привязке ([`crate::blobs::attach`]): вид по `zam_docs::sniff` и
 /// размер против `docs.max_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

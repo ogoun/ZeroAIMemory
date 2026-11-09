@@ -47,7 +47,8 @@ pub use chunks::{
     reindex_entries_page,
 };
 pub(crate) use chunks::{
-    entry_index_state, index_entry_now, rechunk_entries, rescan_entry_secrets, set_entry_state,
+    entry_index_state, index_entry_now, rechunk_entries, remask_entry, rescan_entry_secrets,
+    set_entry_state,
 };
 pub use read::{
     CHANGELOG_BETWEEN_MAX, DEDUP_CANDIDATES_MAX, DedupCandidate, changelog_between,

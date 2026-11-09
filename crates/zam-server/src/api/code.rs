@@ -260,6 +260,12 @@ pub struct CodeHooks {
     /// Задержка перед чтением входов для кэша фокуса, мс, и число таких чтений.
     pub inputs_delay_ms: std::sync::atomic::AtomicU64,
     pub inputs_reads: std::sync::atomic::AtomicUsize,
+    /// Чтение входов ждёт на барьере, пока поднят `inputs_hold` (после учёта в `inputs_reads`):
+    /// тест синхронизируется барьером, а не временем; [`CodeHooks::release_inputs`] — открыть.
+    pub inputs_hold: std::sync::atomic::AtomicBool,
+    pub inputs_release: tokio::sync::Notify,
+    /// Запросов с фокусом, у которых вышел срок ранжирования (`focus rank timeout`).
+    pub focus_timeouts: std::sync::atomic::AtomicUsize,
     /// Паника в следующем чтении входов (сбрасывается этим чтением).
     pub inputs_panic: std::sync::atomic::AtomicBool,
     /// Наибольшее число одновременных чтений входов одного решения.
@@ -268,6 +274,30 @@ pub struct CodeHooks {
     /// Занятых слотов тяжёлых операций ([`HEAVY_SLOTS`]) сейчас и наибольшее их число.
     pub heavy_active: std::sync::atomic::AtomicUsize,
     pub heavy_active_max: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "test-hooks")]
+impl CodeHooks {
+    /// Открывает барьер `inputs_hold`: ждущие чтения входов продолжаются.
+    pub fn release_inputs(&self) {
+        self.inputs_hold
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.inputs_release.notify_waiters();
+    }
+
+    /// Ждёт открытия барьера `inputs_hold` (без гонки с [`Self::release_inputs`]: ожидание
+    /// регистрируется до проверки флага).
+    async fn inputs_gate(&self) {
+        loop {
+            let notified = self.inputs_release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.inputs_hold.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Слот тяжёлой операции карты ([`HEAVY_SLOTS`]); освобождается при сбросе.
@@ -1608,6 +1638,7 @@ fn inputs_load(
             if ms > 0 {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
             }
+            h.inputs_gate().await;
             if h.inputs_panic.swap(false, Ordering::SeqCst) {
                 panic!("тестовая паника чтения входов");
             }
@@ -1672,7 +1703,14 @@ async fn focus_file_ranks(
     };
     match tokio::time::timeout(wait, work).await {
         Ok(r) => r.map(Ok),
-        Err(_) => Ok(Err(())),
+        Err(_) => {
+            #[cfg(feature = "test-hooks")]
+            st.code
+                .hooks
+                .focus_timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Err(()))
+        }
     }
 }
 

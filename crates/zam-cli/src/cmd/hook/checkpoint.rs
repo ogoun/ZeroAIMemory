@@ -1,4 +1,5 @@
-//! `zam hook checkpoint` (`Stop`, `PreCompact`; бюджет 100 мс; §10.3, R1): одно напоминание
+//! `zam hook checkpoint` (`Stop`, `PreCompact`, `PostCompact`, `SessionEnd`; бюджет 100 мс; §10.3,
+//! R1; M6 §8а): одно напоминание
 //! за сессию «запиши итоги в changelog/insights» — только на `Stop`, если в сессии были правки
 //! (маркер `edits-<сессия>`, пишет `pre-tool`) и `GET /sessions/{id}` даёт `memory_writes == 0`.
 //! Сервер недоступен (сеть, тайм-аут) — не напоминать (R1). Сессии на сервере нет (404), а
@@ -33,6 +34,11 @@
 //! `GET /sessions/{id}`) их не получает.
 //! M5.6 §5: были правки в сессии — после запросов хука запуск фоновой
 //! `zam code sync --background`, если пора ([`crate::cmd::code::auto::maybe_spawn_sync`]).
+//! M6 §8а: снимок сессии из журнала агента ([`snapshot_queue`]) — в своём потоке параллельно
+//! остальным запросам хука, со сроком `hooks.snapshot_ms` на сборку и `PUT` в остатке бюджета:
+//! `decision: block` у `Stop` его не ждёт дольше этого. `PostCompact` и `SessionEnd` — без вывода;
+//! `SessionEnd` ставит сессии `ended_at` (`PATCH /sessions/{id} {ended: true}`) и при выключенном
+//! снимке.
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -41,6 +47,7 @@ use super::cache;
 use super::input::Input;
 use super::journal::{self, Ev};
 use super::output::Output;
+use super::snapshot_queue;
 use super::{Env, Flag, Kind, Settings, encode_segment};
 use crate::client::{Client, EXIT_NOT_FOUND, read_json};
 
@@ -128,6 +135,54 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
     };
     // новая эпоха `session_seen` на сжатии контекста (M6 §7.2)
     let epoch = session.filter(|_| inp.event == "PreCompact");
+    // снимок сессии и конец сессии (M6 §8а)
+    let job = snapshot_queue::job_for_checkpoint(env, inp, s);
+    let end = session.filter(|_| inp.event == "SessionEnd");
+    // нового снимка нет, а прежний ждёт в очереди — уходит этим хуком (один `stat`)
+    let pending = session
+        .filter(|id| job.is_none() && s.session_snapshot() && snapshot_queue::queued(env, id));
+    if job.is_none() && end.is_none() && pending.is_none() {
+        return checkpoint_net(env, inp, s, remind, impact_in, queued, tokens, epoch);
+    }
+    std::thread::scope(|sc| {
+        // снимок — в своём потоке: сборка со своим сроком, `PUT` — со своим сроком в бюджете;
+        // очередь снимка пишется и без сервера
+        let snap = job.map(|j| sc.spawn(move || snapshot_queue::run(env, s, j, true)));
+        let old = pending.map(|id| sc.spawn(move || snapshot_queue::flush_logged(env, id)));
+        let ended = end.map(|id| sc.spawn(move || snapshot_queue::end_session(env, id)));
+        let out = checkpoint_net(env, inp, s, remind, impact_in, queued, tokens, epoch);
+        if let Some(h) = snap
+            && h.join().is_err()
+        {
+            env.log("snapshot: паника");
+        }
+        if let Some(h) = ended
+            && h.join().is_err()
+        {
+            env.log("sessions(ended): паника");
+        }
+        if let Some(h) = old
+            && h.join().is_err()
+        {
+            env.log("snapshot(очередь): паника");
+        }
+        out
+    })
+}
+
+/// Сетевая часть `checkpoint`: очереди, эпоха, напоминание (см. модуль).
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_net(
+    env: &Env,
+    inp: &Input,
+    s: &Settings,
+    remind: Option<(&str, cache::Shown)>,
+    impact_in: Option<(String, &str)>,
+    queued: bool,
+    tokens: bool,
+    epoch: Option<&str>,
+) -> Output {
+    let session = inp.session_id.as_deref();
     if remind.is_none() && !queued && !tokens && epoch.is_none() {
         return Output::Empty;
     }

@@ -32,6 +32,11 @@
 //!   [`cache::estimate_tokens`]); сетевые хуки (`session-start`, `prompt`, `post-tool` ошибки,
 //!   `checkpoint`, `subagent-start` — для сессии родителя) отправляют её параллельно со своим
 //!   запросом ([`cache::flush_tokens`]). Вывод сетевых хуков сервер считает сам (`/recall`).
+//! - **Снимок сессии** (M6 §8а, [`snapshot_queue`]): `checkpoint` (`Stop`, `PreCompact`,
+//!   `PostCompact`, `SessionEnd`) и `session-start` (`compact`, догоняющий на `startup`) читают
+//!   хвост журнала агента ([`snapshot`]) в отдельном потоке со сроком `hooks.snapshot_ms`, кладут
+//!   снимок в очередь `cache/snapq-<сессия>.json` и отправляют `PUT /sessions/{id}/snapshot`.
+//!   Ключи клиента — `hooks.session_snapshot`, `snapshot_tail_kb`, `snapshot_ms` ([`ClientKeys`]).
 pub mod binding;
 pub mod cache;
 pub mod checkpoint;
@@ -43,6 +48,10 @@ pub mod pre_tool;
 pub mod procs;
 pub mod prompt;
 pub mod session_start;
+// снимок сессии §8а: адаптеры журналов и `take` (задача 17a)
+pub mod snapshot;
+// снимок в хуках: состояние `snapst-*`, очередь `snapq-*`, `PUT /sessions/{id}/snapshot` (17b)
+pub mod snapshot_queue;
 pub mod subagent_start;
 
 use std::io::Write;
@@ -122,7 +131,9 @@ impl Kind {
             Kind::Prompt => event == "UserPromptSubmit",
             Kind::PreTool => event == "PreToolUse",
             Kind::PostTool => matches!(event, "PostToolUseFailure" | "PostToolUse"),
-            Kind::Checkpoint => matches!(event, "Stop" | "PreCompact"),
+            Kind::Checkpoint => {
+                matches!(event, "Stop" | "PreCompact" | "PostCompact" | "SessionEnd")
+            }
             Kind::SubagentStart => event == "SubagentStart",
         }
     }
@@ -231,16 +242,35 @@ pub struct ClientKeys {
     /// Доля сессий контрольной группы агентного A/B, 0..=[`HOLDOUT_MAX`], по умолчанию 0.
     #[serde(default)]
     pub holdout: Option<f64>,
+    /// Снимок сессии из журнала агента (M6 §8а), по умолчанию `true`; `false` — журнал агента
+    /// не открывается вовсе.
+    #[serde(default)]
+    pub session_snapshot: Option<bool>,
+    /// Хвост журнала агента для снимка, КиБ, [`SNAPSHOT_TAIL_KB`] (диапазон 64..=16384).
+    #[serde(default)]
+    pub snapshot_tail_kb: Option<u32>,
+    /// Жёсткий срок снимка (весь ввод-вывод), мс, [`SNAPSHOT_MS`] (диапазон 5..=50).
+    #[serde(default)]
+    pub snapshot_ms: Option<u64>,
 }
 
 /// Предел `hooks.holdout`: контрольная группа — не больше половины сессий (M6 §12).
 pub const HOLDOUT_MAX: f64 = 0.5;
+/// Умолчание и диапазон `hooks.snapshot_tail_kb` (M6 §8а, §14).
+pub const SNAPSHOT_TAIL_KB: u32 = 2048;
+pub const SNAPSHOT_TAIL_KB_RANGE: std::ops::RangeInclusive<u32> = 64..=16384;
+/// Умолчание и диапазон `hooks.snapshot_ms` (M6 §8а, §14).
+pub const SNAPSHOT_MS: u64 = 25;
+pub const SNAPSHOT_MS_RANGE: std::ops::RangeInclusive<u64> = 5..=50;
 
 impl ClientKeys {
     fn over(self, base: ClientKeys) -> ClientKeys {
         ClientKeys {
             checkpoint_impact: self.checkpoint_impact.or(base.checkpoint_impact),
             holdout: self.holdout.or(base.holdout),
+            session_snapshot: self.session_snapshot.or(base.session_snapshot),
+            snapshot_tail_kb: self.snapshot_tail_kb.or(base.snapshot_tail_kb),
+            snapshot_ms: self.snapshot_ms.or(base.snapshot_ms),
         }
     }
 }
@@ -296,6 +326,42 @@ impl Settings {
             .holdout
             .filter(|p| (0.0..=HOLDOUT_MAX).contains(p))
             .unwrap_or(0.0)
+    }
+
+    /// `hooks.session_snapshot` клиента (по умолчанию включён, M6 §8а).
+    pub fn session_snapshot(&self) -> bool {
+        self.keys.session_snapshot != Some(false)
+    }
+
+    /// `hooks.snapshot_tail_kb` в [`SNAPSHOT_TAIL_KB_RANGE`]; вне диапазона — умолчание (пишет
+    /// в журнал [`Env::settings`]).
+    pub fn snapshot_tail_kb(&self) -> u32 {
+        self.keys
+            .snapshot_tail_kb
+            .filter(|v| SNAPSHOT_TAIL_KB_RANGE.contains(v))
+            .unwrap_or(SNAPSHOT_TAIL_KB)
+    }
+
+    /// `hooks.snapshot_ms` в [`SNAPSHOT_MS_RANGE`], вне диапазона — умолчание.
+    pub fn snapshot_ms(&self) -> u64 {
+        self.keys
+            .snapshot_ms
+            .filter(|v| SNAPSHOT_MS_RANGE.contains(v))
+            .unwrap_or(SNAPSHOT_MS)
+    }
+
+    /// Жёсткий срок снимка в хуке — [`Settings::snapshot_ms`]; отладочная сборка или фича
+    /// `test-hooks` — `ZAM_TEST_SNAPSHOT_MS` (тесты содержимого под нагрузкой, как
+    /// `ZAM_TEST_HOOK_BUDGET_MS`).
+    pub fn snapshot_deadline(&self) -> Duration {
+        #[cfg(any(feature = "test-hooks", debug_assertions))]
+        if let Some(ms) = std::env::var("ZAM_TEST_SNAPSHOT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Duration::from_millis(ms);
+        }
+        Duration::from_millis(self.snapshot_ms())
     }
 }
 
@@ -378,6 +444,20 @@ impl Env {
         {
             self.log(&format!(
                 "hooks.holdout = {p} вне 0..={HOLDOUT_MAX}: контрольной группы нет"
+            ));
+        }
+        if let Some(v) = keys.snapshot_tail_kb
+            && !SNAPSHOT_TAIL_KB_RANGE.contains(&v)
+        {
+            self.log(&format!(
+                "hooks.snapshot_tail_kb = {v} вне 64..=16384: {SNAPSHOT_TAIL_KB}"
+            ));
+        }
+        if let Some(v) = keys.snapshot_ms
+            && !SNAPSHOT_MS_RANGE.contains(&v)
+        {
+            self.log(&format!(
+                "hooks.snapshot_ms = {v} вне 5..=50: {SNAPSHOT_MS}"
             ));
         }
         Settings {
@@ -686,6 +766,23 @@ mod tests {
         assert_eq!(Settings::default().holdout(), 0.0);
         // неизвестный ключ (конфигурация новее клиента) — пропускается
         assert_eq!(parse("[hooks]\nfuture = 1\n").keys, ClientKeys::default());
+        // снимок сессии (M6 §8а): умолчания, слой проекта, вне диапазона — умолчание
+        let d = Settings::default();
+        assert!(d.session_snapshot());
+        assert_eq!((d.snapshot_tail_kb(), d.snapshot_ms()), (2048, 25));
+        let home = parse("[hooks]\nsession_snapshot = false\nsnapshot_tail_kb = 64\n");
+        let project = parse("[hooks]\nsnapshot_ms = 50\n");
+        let s = Settings {
+            keys: project.keys.over(home.keys),
+            ..Settings::default()
+        };
+        assert!(!s.session_snapshot());
+        assert_eq!((s.snapshot_tail_kb(), s.snapshot_ms()), (64, 50));
+        let bad = Settings {
+            keys: parse("[hooks]\nsnapshot_tail_kb = 1\nsnapshot_ms = 51\n").keys,
+            ..Settings::default()
+        };
+        assert_eq!((bad.snapshot_tail_kb(), bad.snapshot_ms()), (2048, 25));
     }
 
     #[test]
@@ -797,6 +894,10 @@ mod tests {
         assert!(Kind::PostTool.accepts("PostToolUse"));
         assert!(!Kind::PreTool.accepts("PostToolUse"));
         assert!(Kind::Checkpoint.accepts("PreCompact"));
+        // снимок сессии (M6 §8а): новые события `checkpoint`, без вывода
+        assert!(Kind::Checkpoint.accepts("PostCompact"));
+        assert!(Kind::Checkpoint.accepts("SessionEnd"));
+        assert_eq!(Kind::Checkpoint.budget_ms(), 100);
         assert!(!Kind::Checkpoint.accepts("SubagentStop"));
         assert!(Kind::SubagentStart.accepts("SubagentStart"));
         assert!(!Kind::SubagentStart.accepts("SubagentStop"));

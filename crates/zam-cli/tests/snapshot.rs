@@ -1,0 +1,1286 @@
+//! Снимок сессии (спецификация M6 §8а, задача 17a): адаптеры журналов агента, чтение хвоста
+//! (`take`), маскировка и пределы (`mask_and_limit`). Модуль клиента подключается исходником —
+//! у `zam` нет библиотечной цели, а модуль снимка зависит только от внешних крейтов.
+//!
+//! Фикстуры — `tests/fixtures/transcripts/<агент>-<версия>-<случай>.jsonl`:
+//! - `claude-2.1.314-*` — структура записей живого журнала Claude Code 2.1.314 (обезличена:
+//!   все строки — заглушки, id фиктивные; задача 17a, шаг 0, ответ владельца А);
+//! - `claude-doc-*`, `codex-doc-*` — по документации (журнала Codex на машине владельца нет).
+//!
+//! Заглушки `@ROOT@`, `@OUTSIDE@`, `@TRANSCRIPT@` подставляет [`fixture`]. Приманки-секреты
+//! собираются конкатенацией — целого ключа в одной строке исходника нет (push protection).
+mod common;
+
+#[allow(dead_code)]
+#[path = "../src/cmd/hook/snapshot/mod.rs"]
+mod snapshot;
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use snapshot::{AgentKind, Snapshot, TakeOpts};
+use zam_core::snapshot::{SnapCommand, SnapStatus, SnapTrigger, SnapshotData};
+
+const SESSION: &str = "00000000-0000-4000-8000-000000000001";
+const MAX: usize = 16 * 1024;
+
+fn tmp(name: &str) -> PathBuf {
+    common::sandbox("cli-snapshot", name)
+}
+
+fn json_str(s: &str) -> String {
+    let q = serde_json::to_string(s).unwrap();
+    q[1..q.len() - 1].to_string()
+}
+
+/// Текст фикстуры с подставленными корнем решения и каталогом вне корня.
+fn fixture(name: &str, root: &Path, outside: &Path) -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/transcripts")
+        .join(name);
+    std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        .replace("@ROOT@", &json_str(&root.to_string_lossy()))
+        .replace("@OUTSIDE@", &json_str(&outside.to_string_lossy()))
+        .replace("@TRANSCRIPT@", "transcript.jsonl")
+}
+
+struct Case {
+    root: PathBuf,
+    outside: PathBuf,
+    dir: PathBuf,
+}
+
+impl Case {
+    fn new(name: &str) -> Self {
+        let dir = tmp(name);
+        let root = dir.join("proj");
+        let outside = dir.join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        Case { root, outside, dir }
+    }
+
+    /// Журнал из фикстур (по порядку) и добавочных строк; путь файла.
+    fn journal(&self, fixtures: &[&str], extra: &[String]) -> PathBuf {
+        let mut text = String::new();
+        for f in fixtures {
+            text.push_str(&fixture(f, &self.root, &self.outside));
+        }
+        for l in extra {
+            text.push_str(l);
+            text.push('\n');
+        }
+        let p = self.dir.join("journal.jsonl");
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    fn opts(&self, agent: AgentKind, session: &str) -> TakeOpts {
+        TakeOpts {
+            root: self.root.clone(),
+            agent,
+            session: session.to_string(),
+            trigger: SnapTrigger::Manual,
+            tail_kb: 2048,
+            deadline: Duration::from_secs(10),
+            max_bytes: MAX,
+            summary: None,
+            min_len: None,
+        }
+    }
+
+    fn take(&self, agent: AgentKind, session: &str, p: &Path) -> Snapshot {
+        snapshot::take(p, &self.opts(agent, session)).expect("снимок")
+    }
+}
+
+/// Запись человека Claude (структура живой записи) с заданным текстом.
+fn claude_human(c: &Case, text: &str) -> String {
+    let line = fixture("claude-2.1.314-prompts.jsonl", &c.root, &c.outside)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let mut v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    v["message"]["content"] = serde_json::Value::String(text.to_string());
+    v.to_string()
+}
+
+/// Вызов Bash (структура живой записи) с заданной командой.
+fn claude_bash(c: &Case, cmd: &str, id: &str) -> String {
+    let line = fixture("claude-2.1.314-tools.jsonl", &c.root, &c.outside)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let mut v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    v["message"]["content"][0]["input"]["command"] = serde_json::Value::String(cmd.to_string());
+    v["message"]["content"][0]["id"] = serde_json::Value::String(id.to_string());
+    v.to_string()
+}
+
+// ---------------------------------------------------------------- Claude
+
+/// Запись `type: "summary"` — заголовок сессии для `/resume`, а не конспект.
+#[test]
+fn claude_summary_record_is_not_compact() {
+    let c = Case::new("summary");
+    let p = c.journal(&["claude-doc-summary.jsonl"], &[]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.compact_summary, None);
+    assert_eq!(s.data.prompts, ["Запрос без сжатия."]);
+    // запись `summary` сразу после границы сжатия и с признаком `isCompactSummary` (проходит
+    // предфильтр) — всё равно не конспект: конспект только у `type: "user"`
+    let boundary = fixture("claude-2.1.314-compact.jsonl", &c.root, &c.outside)
+        .lines()
+        .find(|l| l.contains("\"compact_boundary\""))
+        .unwrap()
+        .to_string();
+    let summary = format!(
+        r#"{{"type":"summary","summary":"Заголовок сессии","isCompactSummary":true,"sessionId":"{SESSION}","message":{{"role":"user","content":"Заголовок сессии"}}}}"#
+    );
+    let p = c.journal(&[], &[boundary, summary]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.compact_summary, None);
+    assert!(s.data.prompts.is_empty());
+}
+
+/// Конспект — `isCompactSummary` после `compact_boundary`; без границы не берётся.
+/// Обёртка Claude (первая строка и хвостовые указания) снимается, разделы остаются.
+#[test]
+fn claude_compact_after_boundary() {
+    let c = Case::new("compact");
+    let p = c.journal(&["claude-2.1.314-compact.jsonl"], &[]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    let sum = s.data.compact_summary.expect("конспект");
+    assert!(sum.contains("8. Current Work:"), "{sum}");
+    assert!(sum.ends_with("Запустить тесты модуля A."), "{sum}");
+    assert!(!sum.contains("This session is being continued"), "{sum}");
+    assert!(!sum.contains("If you need specific details"), "{sum}");
+    assert!(!sum.contains("transcript.jsonl"), "{sum}");
+    assert!(!sum.contains("Continue the conversation"), "{sum}");
+    assert_eq!(
+        s.data.prompts,
+        ["Первый запрос до сжатия.", "Запрос после сжатия."]
+    );
+    assert_eq!(s.session_hint.as_deref(), Some(SESSION));
+
+    // та же запись без границы перед ней — не конспект
+    let text = fixture("claude-2.1.314-compact.jsonl", &c.root, &c.outside);
+    let no_boundary: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.contains("\"compact_boundary\""))
+        .collect();
+    let p = c.journal(
+        &[],
+        &no_boundary
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+    );
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.compact_summary, None);
+    // и конспект не стал запросом человека
+    assert_eq!(s.data.prompts.len(), 2, "{:?}", s.data.prompts);
+}
+
+/// Белый список запросов: вставки, мета-записи, уведомления задач, субагенты, картинки,
+/// чужая сессия — не запросы человека.
+#[test]
+fn claude_whitelist_drops_inserts() {
+    let c = Case::new("whitelist");
+    // уведомление фоновой задачи без тега — отсекает `origin.kind`, а не вырезка вставок
+    let note = fixture("claude-2.1.314-prompts.jsonl", &c.root, &c.outside)
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    let mut v: serde_json::Value = serde_json::from_str(&note).unwrap();
+    assert_eq!(v["origin"]["kind"], "task-notification");
+    v["message"]["content"] = "Фоновая задача завершена.".into();
+    let p = c.journal(
+        &["claude-2.1.314-prompts.jsonl", "claude-doc-inserts.jsonl"],
+        &[v.to_string()],
+    );
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(
+        s.data.prompts,
+        [
+            "Обычный запрос человека.",
+            "Второй запрос  человека.",
+            "Запрос с картинкой.",
+            "Последний запрос.",
+        ]
+    );
+    let all = s.data.prompts.join("\n");
+    for bad in [
+        "bash-",
+        "local-command",
+        "command-name",
+        "system-reminder",
+        "task-notification",
+        "Request interrupted",
+        "субагент",
+        "старой сессии",
+        "ZeroAIMemory",
+        "Напоминание",
+        "Ответ агента",
+        "Фоновая задача",
+    ] {
+        assert!(!all.contains(bad), "{bad}: {all}");
+    }
+    assert!(s.data.commands.is_empty() && s.data.files.is_empty());
+}
+
+/// Без известной сессии берётся последняя сессия файла: после `/resume` старые записи идут раньше.
+#[test]
+fn claude_unknown_session_takes_last() {
+    let c = Case::new("lastsession");
+    let p = c.journal(&["claude-doc-inserts.jsonl"], &[]);
+    let s = c.take(AgentKind::Claude, "", &p);
+    assert_eq!(s.session_hint.as_deref(), Some(SESSION));
+    // запись чужой (старой) сессии идёт четвёртой — всё до неё отброшено сменой сессии
+    assert_eq!(s.data.prompts, ["Последний запрос."]);
+}
+
+/// Команды Bash (первая строка, исход по `is_error`) и файлы `Edit`/`Write` внутри корня.
+#[test]
+fn claude_commands_and_files() {
+    let c = Case::new("tools");
+    let p = c.journal(&["claude-2.1.314-tools.jsonl"], &[]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(
+        s.data.commands,
+        [
+            SnapCommand {
+                cmd: "cargo test -p demo".into(),
+                failed: Some(true)
+            },
+            SnapCommand {
+                cmd: "cargo build".into(),
+                failed: Some(false)
+            },
+        ]
+    );
+    assert_eq!(s.data.files, ["src/a.rs"]);
+    assert!(s.data.prompts.is_empty() && s.data.compact_summary.is_none());
+    // вывод инструментов и содержимое правок не попадают никуда (§17 п. 19)
+    let all = serde_json::to_string(&s).unwrap();
+    for marker in [
+        "ВЫВОД-ИНСТРУМЕНТА",
+        "СОДЕРЖИМОЕ-ФАЙЛА",
+        "СТАРЫЙ-ТЕКСТ",
+        "НОВЫЙ-ТЕКСТ",
+        "echo второй",
+    ] {
+        assert!(!all.contains(marker), "{marker}: {all}");
+    }
+}
+
+// ---------------------------------------------------------------- Codex
+
+#[test]
+fn codex_compacted_and_user_message() {
+    let c = Case::new("codex");
+    let p = c.journal(&["codex-doc-session.jsonl"], &[]);
+    let s = c.take(AgentKind::Codex, "", &p);
+    assert_eq!(
+        s.data.compact_summary.as_deref(),
+        Some("Конспект сжатия Codex: работа над модулем A, следующий шаг — тесты.")
+    );
+    assert_eq!(
+        s.data.prompts,
+        ["Первый запрос человека.", "Второй запрос человека."]
+    );
+    assert_eq!(
+        s.session_hint.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000c1")
+    );
+    assert_eq!(
+        s.data.commands,
+        [
+            SnapCommand {
+                cmd: "cargo test -p demo".into(),
+                failed: Some(true)
+            },
+            SnapCommand {
+                cmd: "cargo build".into(),
+                failed: Some(false)
+            },
+        ]
+    );
+    assert_eq!(s.data.files, ["src/a.rs", "src/b.rs"]);
+}
+
+/// `session_meta` (первая строка) вне окна хвоста читается отдельно: id сессии есть, пути патча —
+/// от `cwd` сессии; более поздний `turn_context` в окне меняет `cwd`.
+#[test]
+fn codex_session_meta_outside_window() {
+    let c = Case::new("codex-head");
+    let sub = c.root.join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    let meta = format!(
+        r#"{{"type":"session_meta","payload":{{"id":"00000000-0000-4000-8000-0000000000c2","cwd":"{}","instructions":"Правила."}}}}"#,
+        json_str(&sub.to_string_lossy())
+    );
+    let pad = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+        "п".repeat(40 * 1024)
+    );
+    let patch = r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch"}}"#;
+    let p = c.journal(&[], &[meta.clone(), pad.clone(), patch.to_string()]);
+    let mut o = c.opts(AgentKind::Codex, "");
+    o.tail_kb = 64; // окно не захватывает первую строку
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(
+        s.session_hint.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000c2")
+    );
+    assert_eq!(s.data.files, ["crates/x/src/a.rs"]);
+    assert_eq!(s.skipped, 0);
+    // `turn_context` в окне — последний `cwd` побеждает
+    let other = c.root.join("crates").join("y");
+    let turn = format!(
+        r#"{{"type":"turn_context","payload":{{"cwd":"{}"}}}}"#,
+        json_str(&other.to_string_lossy())
+    );
+    let p = c.journal(&[], &[meta, pad, turn, patch.to_string()]);
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(s.data.files, ["crates/y/src/a.rs"]);
+}
+
+/// Длинная `session_meta` (instructions — AGENTS.md — больше 64 КиБ, перевода строки в первых
+/// 64 КиБ нет): `id` и `cwd` достаются из начала строки.
+#[test]
+fn codex_long_session_meta_prefix() {
+    let c = Case::new("codex-longmeta");
+    let sub = c.root.join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    let meta = format!(
+        r#"{{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{{"id":"00000000-0000-4000-8000-0000000000c3","timestamp":"2026-01-01T00:00:00.000Z","cwd":"{}","originator":"codex_cli_rs","cli_version":"0.0.0","instructions":"{}"}}}}"#,
+        json_str(&sub.to_string_lossy()),
+        "п".repeat(40_000)
+    );
+    assert!(meta.len() > 64 * 1024 + 1024);
+    let pad = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+        "о".repeat(40 * 1024)
+    );
+    let patch = r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch"}}"#;
+    let p = c.journal(&[], &[meta, pad, patch.to_string()]);
+    let mut o = c.opts(AgentKind::Codex, "");
+    o.tail_kb = 64;
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(
+        s.session_hint.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000c3")
+    );
+    assert_eq!(s.data.files, ["crates/x/src/a.rs"]);
+    assert_eq!((s.skipped, s.status), (0, SnapStatus::Complete));
+}
+
+/// Длинная `session_meta`: `id`/`cwd` — только первого уровня `payload`; вложенные
+/// (`source.id`) не берутся, даже если идут раньше.
+#[test]
+fn codex_long_meta_nested_id_ignored() {
+    let c = Case::new("codex-nested");
+    let sub = c.root.join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    let wrong = c.root.join("crates").join("wrong");
+    let meta = format!(
+        r#"{{"type":"session_meta","payload":{{"source":{{"id":"N","cwd":"{}","list":[{{"id":"L"}}],"s":"\"id\":\"Q\" }}"}},"id":"A","cwd":"{}","instructions":"{}"}}}}"#,
+        json_str(&wrong.to_string_lossy()),
+        json_str(&sub.to_string_lossy()),
+        "п".repeat(40_000)
+    );
+    let pad = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+        "о".repeat(40 * 1024)
+    );
+    let patch = r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch"}}"#;
+    let p = c.journal(&[], &[meta, pad, patch.to_string()]);
+    let mut o = c.opts(AgentKind::Codex, "");
+    o.tail_kb = 64;
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(s.session_hint.as_deref(), Some("A"));
+    assert_eq!(s.data.files, ["crates/x/src/a.rs"]);
+}
+
+/// Первая строка вне окна берётся, только если это `session_meta`: старая запись другого типа
+/// (запрос человека) в снимок не попадает.
+#[test]
+fn codex_head_other_type_ignored() {
+    let c = Case::new("codex-headtype");
+    let old = r#"{"type":"event_msg","payload":{"type":"user_message","message":"Старый запрос вне окна."}}"#;
+    let pad = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+        "о".repeat(40 * 1024)
+    );
+    let new = r#"{"type":"event_msg","payload":{"type":"user_message","message":"Новый запрос."}}"#;
+    let p = c.journal(&[], &[old.to_string(), pad, new.to_string()]);
+    let mut o = c.opts(AgentKind::Codex, "");
+    o.tail_kb = 64;
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(s.data.prompts, ["Новый запрос."]);
+    assert_eq!(s.session_hint, None);
+}
+
+/// `response_item` с `role: user` (правила проекта, окружение) и `compaction` с
+/// `encrypted_content` не берутся.
+#[test]
+fn codex_ignores_user_instructions_and_encrypted() {
+    let c = Case::new("codex-ignore");
+    let p = c.journal(&["codex-doc-session.jsonl"], &[]);
+    let s = c.take(AgentKind::Codex, "", &p);
+    let all = serde_json::to_string(&s.data).unwrap();
+    for bad in [
+        "AGENTS.md",
+        "user_instructions",
+        "environment_context",
+        "gAAAAB",
+        "Ответ агента",
+    ] {
+        assert!(!all.contains(bad), "{bad}: {all}");
+    }
+    // без `compacted` конспекта нет: шифрованная `compaction` его не даёт
+    let text = fixture("codex-doc-session.jsonl", &c.root, &c.outside);
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.contains("\"type\":\"compacted\""))
+        .map(str::to_string)
+        .collect();
+    let p = c.journal(&[], &lines);
+    let s = c.take(AgentKind::Codex, "", &p);
+    assert_eq!(s.data.compact_summary, None);
+    // запрос в `<user_instructions>` внутри `user_message` тоже снимается
+    let p = c.journal(
+        &[],
+        &[r#"{"type":"event_msg","payload":{"type":"user_message","message":"<user_instructions>правила</user_instructions>"}}"#.to_string()],
+    );
+    assert!(c.take(AgentKind::Codex, "", &p).data.prompts.is_empty());
+}
+
+// ---------------------------------------------------------------- разбор
+
+#[test]
+fn broken_and_unknown_lines_skipped() {
+    let c = Case::new("broken");
+    let p = c.journal(
+        &[],
+        &[
+            r#"{"type":"user","message":{"content":"#.to_string(),
+            "не json \"type\":\"user\"".to_string(),
+            r#"{"type":"user","sessionId":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":42}}"#.to_string(),
+            r#"{"type":"новый-тип","x":1}"#.to_string(),
+            "\u{feff}".to_string(),
+            String::new(),
+            claude_human(&c, "Живой запрос."),
+        ],
+    );
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.prompts, ["Живой запрос."]);
+    // три строки прошли предфильтр и не разобрались; неизвестный тип и пустые — не пропуск
+    assert_eq!(s.skipped, 3);
+    assert_eq!(s.status, SnapStatus::Partial);
+    // без битых строк — complete
+    let p = c.journal(&[], &[claude_human(&c, "Живой запрос.")]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!((s.skipped, s.status), (0, SnapStatus::Complete));
+}
+
+/// Строка длиннее 1 МиБ не разбирается и считается в `skipped`; соседние строки целы.
+#[test]
+fn huge_line_skipped() {
+    let c = Case::new("huge");
+    let big = "я".repeat(600 * 1024); // 1,2 МиБ UTF-8
+    let p = c.journal(
+        &[],
+        &[
+            claude_human(&c, "До."),
+            claude_human(&c, &big),
+            claude_human(&c, "После."),
+        ],
+    );
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.prompts, ["До.", "После."]);
+    assert_eq!(s.skipped, 1);
+    // огромная и не UTF-8 строки чужого вида (очередь, прогресс) — не пропуск и не `partial`
+    let mut bytes = Vec::new();
+    for l in [
+        claude_human(&c, "До."),
+        format!(r#"{{"type":"queue-operation","content":"{big}"}}"#),
+    ] {
+        bytes.extend_from_slice(l.as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(b"{\"type\":\"progress\",\"x\":\"\xff\xfe\"}\n");
+    bytes.extend_from_slice(claude_human(&c, "После.").as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(&p, &bytes).unwrap();
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.prompts, ["До.", "После."]);
+    assert_eq!((s.skipped, s.status), (0, SnapStatus::Complete));
+    // не UTF-8 строка своего вида — пропуск
+    let mut bad = claude_human(&c, "x").into_bytes();
+    let at = bad.len() - 10;
+    bad[at] = 0xff;
+    bad.push(b'\n');
+    std::fs::write(&p, &bad).unwrap();
+    assert_eq!(c.take(AgentKind::Claude, SESSION, &p).skipped, 1);
+}
+
+/// Последняя строка без перевода строки (агент её дописывает): разобралась — берётся; нет —
+/// пропуск и `partial`, даже если обрыв унёс признак предфильтра.
+#[test]
+fn last_unterminated_line() {
+    let c = Case::new("unterminated");
+    let p = c.dir.join("journal.jsonl");
+    let full = claude_human(&c, "Запрос.");
+    std::fs::write(&p, &full).unwrap();
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!((s.data.prompts.len(), s.skipped), (1, 0));
+    // обрыв до `"type":"user"`
+    let cut = &full[..full.find("\"type\"").unwrap() + 3];
+    std::fs::write(&p, format!("{full}\n{cut}")).unwrap();
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.prompts, ["Запрос."]);
+    assert_eq!((s.skipped, s.status), (1, SnapStatus::Partial));
+}
+
+/// Пути вне корня решения (абсолютные и через `..`) не берутся.
+#[test]
+fn path_outside_root_dropped() {
+    let c = Case::new("outside");
+    let p = c.journal(&["claude-2.1.314-tools.jsonl"], &[]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.files, ["src/a.rs"]);
+    let all = serde_json::to_string(&s.data).unwrap();
+    assert!(!all.contains("notes.md"), "{all}");
+    // Codex: `../outside.rs` из патча
+    let p = c.journal(&["codex-doc-session.jsonl"], &[]);
+    let s = c.take(AgentKind::Codex, "", &p);
+    assert!(
+        !s.data.files.iter().any(|f| f.contains("outside")),
+        "{:?}",
+        s.data.files
+    );
+}
+
+/// Строки без признаков предфильтра не разбираются: битая строка без них — не пропуск.
+#[test]
+fn prefilter_skips_unrelated_lines() {
+    let c = Case::new("prefilter");
+    let p = c.journal(
+        &[],
+        &[
+            r#"{"type":"queue-operation","operation":"enqueue","content":"сломано"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"нет"#.to_string(),
+            claude_human(&c, "Запрос."),
+        ],
+    );
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.prompts, ["Запрос."]);
+    assert_eq!(s.skipped, 0);
+    // у Codex свои признаки: строка Claude-формата у него не разбирается
+    let s = c.take(AgentKind::Codex, "", &p);
+    assert_eq!((s.skipped, s.data.prompts.len()), (0, 0));
+    for agent in [AgentKind::Claude, AgentKind::Codex] {
+        assert!(agent.prefilter().iter().all(|t| t.starts_with('"')));
+    }
+}
+
+/// Хвост: читается не больше `tail_kb`, первая обрезанная строка отбрасывается.
+#[test]
+fn tail_window_drops_cut_line() {
+    let c = Case::new("tail");
+    let mut lines = vec![claude_human(&c, "Старый запрос.")];
+    let pad = "п".repeat(40 * 1024);
+    lines.push(claude_human(&c, &pad)); // ~80 КиБ, окно 64 КиБ режет её
+    lines.push(claude_human(&c, "Новый запрос."));
+    let p = c.journal(&[], &lines);
+    let mut o = c.opts(AgentKind::Claude, SESSION);
+    o.tail_kb = 64;
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(s.data.prompts, ["Новый запрос."]);
+    assert_eq!(s.skipped, 0);
+}
+
+/// Нет файла или это каталог — снимка нет; срок вышел — тоже нет, поток брошен.
+#[test]
+fn take_missing_or_dir_is_none() {
+    let c = Case::new("missing");
+    let o = c.opts(AgentKind::Claude, SESSION);
+    assert!(snapshot::take(&c.dir.join("нет.jsonl"), &o).is_none());
+    assert!(snapshot::take(&c.dir, &o).is_none());
+}
+
+// ---------------------------------------------------------------- маскировка и пределы
+
+/// Приманки — конкатенацией: целого «ключа» в одной строке исходника нет.
+fn bait() -> (String, String, String) {
+    let pw = ["Sx9", "kQ2", "vLm", "7Rt"].concat();
+    let token = [
+        "eyJhbGciOiJIUzI1NiJ9",
+        ".",
+        "eyJzdWIiOiJ4In0",
+        ".",
+        "c2lnbmF0dXJlLXRlc3Q",
+    ]
+    .concat();
+    let gh = [concat!("gh", "p_"), "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"].concat();
+    (pw, token, gh)
+}
+
+#[test]
+fn secrets_masked_in_prompts_and_flags() {
+    let (pw, token, gh) = bait();
+    // короткий токен без признаков сканера — ловит только контекст `Authorization:`
+    let plain = ["Abc", "123", "Def", "456"].concat();
+    let snap = Snapshot {
+        trigger: SnapTrigger::Stop,
+        agent: AgentKind::Claude,
+        status: SnapStatus::Complete,
+        skipped: 0,
+        session_hint: None,
+        scan_depth_capped: false,
+        data: SnapshotData {
+            compact_summary: Some(format!("Работа. Токен {gh} в конфиге.")),
+            prompts: vec![
+                format!("вот пароль password={pw} для базы"),
+                format!("ключ {gh}"),
+            ],
+            files: vec!["src/a.rs".into()],
+            commands: vec![
+                SnapCommand {
+                    cmd: format!("mysql -u root -p{pw} db"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("psql --password {pw} -h h"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("curl -u admin:{pw} https://h/x"),
+                    failed: Some(false),
+                },
+                SnapCommand {
+                    cmd: format!("curl -H \"Authorization: Bearer {token}\" https://h"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("gpg --batch --passphrase {pw} -d f.gpg"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("tool --secret-key {pw} --client-secret {pw}"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("az login --client-secret={pw}"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("mysql -u root -p'{pw} {pw}' db"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("curl -H 'Authorization: Bearer {plain}' https://h"),
+                    failed: None,
+                },
+            ],
+        },
+    };
+    let out = snapshot::mask_and_limit(snap, MAX);
+    let all = serde_json::to_string(&out.data).unwrap();
+    for secret in [&pw, &token, &gh, &plain] {
+        assert!(!all.contains(secret.as_str()), "{secret}: {all}");
+    }
+    assert_eq!(
+        out.data.commands[7].cmd,
+        format!("mysql -u root -p'{}' db", zam_secrets::SECRET_MARK)
+    );
+    assert!(all.contains(zam_secrets::SECRET_MARK));
+    // то же, что `mask_text` по каждому полю
+    assert_eq!(
+        out.data.prompts[0],
+        zam_secrets::mask_text(&format!("вот пароль password={pw} для базы"))
+    );
+    assert!(
+        out.data.commands[0].cmd.starts_with("mysql -u root -p"),
+        "{all}"
+    );
+    assert_eq!(out.data.commands[2].failed, Some(false));
+    assert!(!out.scan_depth_capped);
+}
+
+/// Правила флагов — только у команд и только в своём контексте: проза с «basic»/«bearer»,
+/// `docker run -u 1000:1000`, числовой `-u` у curl, `-u` у не-HTTP команды и `-p` без mysql не
+/// маскируются.
+#[test]
+fn flags_do_not_touch_prose_and_uid() {
+    let prose = "This is a basic implementation of the parser; bearer of bad news";
+    let snap = Snapshot {
+        trigger: SnapTrigger::Stop,
+        agent: AgentKind::Claude,
+        status: SnapStatus::Complete,
+        skipped: 0,
+        session_hint: None,
+        scan_depth_capped: false,
+        data: SnapshotData {
+            compact_summary: Some(format!("{prose}. Basic setup done.")),
+            prompts: vec![
+                prose.to_string(),
+                "use Bearer tokens in headers".into(),
+                // флаги в прозе запроса — не команда: правила флагов сюда не применяются
+                "Use the --token option, mysql -pdemo and curl -u user:name".into(),
+            ],
+            files: Vec::new(),
+            commands: vec![
+                SnapCommand {
+                    cmd: "docker run -u 1000:1000 image".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "curl -u 1000:1000 http://h".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "cargo test -pzam-cli".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "echo \"basic implementation\" --verbose".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "ssh -u admin:secretword host".into(),
+                    failed: None,
+                },
+                // ссылка на переменную — не секрет; слово-схему тоже не трогаем
+                SnapCommand {
+                    cmd: "curl -H \"Authorization: Bearer $TOKEN\" https://h".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "curl -H 'Authorization: Bearer ${API_TOKEN}' https://h".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "curl -H \"Authorization: Basic %CREDS%\" https://h".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "curl -H \"Authorization: Bearer $TK\" https://h".into(),
+                    failed: None,
+                },
+            ],
+        },
+    };
+    let before = snap.data.clone();
+    let out = snapshot::mask_and_limit(snap, MAX);
+    assert_eq!(out.data, before);
+}
+
+/// Значение `Authorization:` пропускается, только если оно целиком — ссылка на переменную:
+/// `%2F…` (URL-кодирование) и `$2b$10$…` (хэш bcrypt) маскируются.
+#[test]
+fn authorization_value_not_a_reference_masked() {
+    let enc = ["%2F", "abcdef123"].concat();
+    let hash = ["$2b$10$", "abcdefghijklmnop"].concat();
+    let mk = |cmd: String| SnapCommand { cmd, failed: None };
+    let snap = Snapshot {
+        trigger: SnapTrigger::Stop,
+        agent: AgentKind::Claude,
+        status: SnapStatus::Complete,
+        skipped: 0,
+        session_hint: None,
+        scan_depth_capped: false,
+        data: SnapshotData {
+            commands: vec![
+                mk(format!("curl -H \"Authorization: Bearer {enc}\" https://h")),
+                mk(format!("curl -H \"Authorization: {hash}\" https://h")),
+                mk(format!("psql --password {hash}")),
+            ],
+            ..SnapshotData::default()
+        },
+    };
+    let out = snapshot::mask_and_limit(snap, MAX);
+    for (c, secret) in out.data.commands.iter().zip([&enc, &hash, &hash]) {
+        assert!(!c.cmd.contains(secret.as_str()), "{}", c.cmd);
+        assert!(c.cmd.contains(zam_secrets::SECRET_MARK), "{}", c.cmd);
+    }
+}
+
+/// Команда: сначала первая непустая строка, затем маска по ней (окно — строка плюс запас), затем
+/// обрезка до 200 символов. Остальные строки (тело here-doc с ключом) в снимок не идут вовсе;
+/// секрет на границе обрезки маскируется целиком, а не по обрывку.
+#[test]
+fn command_first_line_after_mask() {
+    let (pw, _, gh) = bait();
+    let pem = ["-----BEGIN ", "PRIVATE KEY-----"].concat();
+    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+    let end = ["-----END ", "PRIVATE KEY-----"].concat();
+    let snap = Snapshot {
+        trigger: SnapTrigger::Stop,
+        agent: AgentKind::Claude,
+        status: SnapStatus::Complete,
+        skipped: 0,
+        session_hint: None,
+        scan_depth_capped: false,
+        data: SnapshotData {
+            commands: vec![
+                SnapCommand {
+                    cmd: format!("cat > k <<EOF\n{pem}\n{body}\n{end}\nEOF"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("\n\nexport DB_PASSWORD={pw}\nnext"),
+                    failed: None,
+                },
+                // ключ на границе 200 символов: обрезка до маски оставила бы его начало
+                SnapCommand {
+                    cmd: format!("{} {gh}", "x".repeat(185)),
+                    failed: None,
+                },
+            ],
+            ..SnapshotData::default()
+        },
+    };
+    let out = snapshot::mask_and_limit(snap, MAX);
+    assert_eq!(out.data.commands[0].cmd, "cat > k <<EOF");
+    assert_eq!(
+        out.data.commands[1].cmd,
+        format!("export DB_PASSWORD={}", zam_secrets::SECRET_MARK)
+    );
+    let cut = &out.data.commands[2].cmd;
+    assert!(!cut.contains(&gh[4..10]), "{cut}");
+    assert!(cut.chars().count() <= 200);
+}
+
+fn sized(n: usize, tag: &str) -> String {
+    format!("{tag}:{}", "ж".repeat(n))
+}
+
+/// Пределы полей, затем порядок сокращения: команды (старые), запросы (старые), конспект с
+/// начала (хвост остаётся). Итог ≤ `max_bytes` всего JSON.
+#[test]
+fn limit_order_commands_prompts_summary() {
+    let mk = |summary: usize| Snapshot {
+        trigger: SnapTrigger::Stop,
+        agent: AgentKind::Codex,
+        status: SnapStatus::Complete,
+        skipped: 0,
+        session_hint: None,
+        scan_depth_capped: false,
+        data: SnapshotData {
+            compact_summary: (summary > 0).then(|| format!("НАЧАЛО {} КОНЕЦ", "к".repeat(summary))),
+            prompts: (0..8).map(|i| sized(600, &format!("p{i}"))).collect(),
+            files: (0..30).map(|i| format!("src/f{i}.rs")).collect(),
+            commands: (0..14)
+                .map(|i| SnapCommand {
+                    cmd: sized(300, &format!("c{i}")),
+                    failed: None,
+                })
+                .collect(),
+        },
+    };
+    // шаг 1: поля ограничены сами
+    let out = snapshot::mask_and_limit(mk(100), 64 * 1024);
+    let d = &out.data;
+    assert_eq!(d.prompts.len(), 5);
+    assert!(d.prompts[0].starts_with("p3:") && d.prompts[4].starts_with("p7:"));
+    assert!(d.prompts.iter().all(|p| p.chars().count() <= 500));
+    assert_eq!(d.files.len(), 20);
+    assert_eq!(d.files[0], "src/f10.rs");
+    assert_eq!(d.commands.len(), 10);
+    assert!(d.commands[0].cmd.starts_with("c4:"));
+    assert!(d.commands.iter().all(|c| c.cmd.chars().count() <= 200));
+    assert_eq!(out.status, SnapStatus::Complete);
+
+    let size = |s: &Snapshot| serde_json::to_vec(s).unwrap().len();
+    // шаг 2: сначала уходят команды — с самых старых
+    let full = size(&out);
+    let out2 = snapshot::mask_and_limit(mk(100), full - 300);
+    assert!(size(&out2) <= full - 300);
+    assert!(out2.data.commands.len() < 10 && !out2.data.commands.is_empty());
+    assert!(out2.data.commands.last().unwrap().cmd.starts_with("c13:"));
+    assert_eq!(out2.data.prompts.len(), 5);
+    assert_eq!(out2.status, SnapStatus::Partial);
+    // затем запросы — с самых старых, команд уже нет
+    let out3 = snapshot::mask_and_limit(mk(100), full - 4500);
+    assert!(out3.data.commands.is_empty());
+    assert!(out3.data.prompts.len() < 5 && !out3.data.prompts.is_empty());
+    assert!(out3.data.prompts.last().unwrap().starts_with("p7:"));
+    assert!(out3.data.compact_summary.is_some());
+    // затем конспект — с начала, хвост остаётся
+    let out4 = snapshot::mask_and_limit(mk(6000), 4096);
+    assert!(size(&out4) <= 4096, "{}", size(&out4));
+    assert!(out4.data.commands.is_empty() && out4.data.prompts.is_empty());
+    let sum = out4.data.compact_summary.as_deref().unwrap();
+    assert!(sum.ends_with("КОНЕЦ") && !sum.contains("НАЧАЛО"), "{sum}");
+    assert_eq!(out4.data.files.len(), 20);
+}
+
+/// Конспект > 8 КиБ: ключевые разделы («Pending Tasks», «Current Work», «Optional Next Step»,
+/// русские варианты) берутся целиком, даже если за ними длинный прочий раздел; остальное — с
+/// конца до предела.
+#[test]
+fn summary_keeps_tail_sections() {
+    let long = |n: usize| "слово ".repeat(n);
+    let text = [
+        "1. Primary Request and Intent:".to_string(),
+        long(1500),
+        "7. **Pending Tasks:**".to_string(),
+        "   - задача B".to_string(),
+        "8. Current Work:".to_string(),
+        "   Работа над модулем A.".to_string(),
+        "9. **Optional Next Step**".to_string(),
+        "   Запустить тесты.".to_string(),
+        "10. Notes:".to_string(),
+        long(1500),
+        "ХВОСТ".to_string(),
+    ]
+    .join("\n");
+    assert!(text.len() > 16 * 1024);
+    let snap = Snapshot {
+        trigger: SnapTrigger::PostCompact,
+        agent: AgentKind::Claude,
+        status: SnapStatus::Complete,
+        skipped: 0,
+        session_hint: None,
+        scan_depth_capped: false,
+        data: SnapshotData {
+            compact_summary: Some(text),
+            ..SnapshotData::default()
+        },
+    };
+    let out = snapshot::mask_and_limit(snap.clone(), MAX);
+    let sum = out.data.compact_summary.unwrap();
+    assert!(sum.len() <= 8 * 1024, "{}", sum.len());
+    for h in [
+        "7. **Pending Tasks:**\n   - задача B",
+        "8. Current Work:\n   Работа над модулем A.",
+        "9. **Optional Next Step**\n   Запустить тесты.",
+    ] {
+        assert!(sum.contains(h), "{h}");
+    }
+    assert!(sum.ends_with("ХВОСТ"), "хвост прочего раздела");
+    assert!(!sum.contains("1. Primary Request"));
+    // русские заголовки
+    let ru = format!(
+        "1. **Основной запрос и намерение**\n{}\n7. **Ожидающие задачи**\n- Б\n8. **Текущая работа**\nА\n9. **Следующий шаг**\nтесты\n10. Прочее:\n{}",
+        long(1500),
+        long(1500)
+    );
+    let mut s2 = snap;
+    s2.data.compact_summary = Some(ru);
+    let sum = snapshot::mask_and_limit(s2, MAX)
+        .data
+        .compact_summary
+        .unwrap();
+    assert!(sum.len() <= 8 * 1024);
+    for h in [
+        "**Ожидающие задачи**\n- Б",
+        "**Текущая работа**\nА",
+        "**Следующий шаг**\nтесты",
+    ] {
+        assert!(sum.contains(h), "{h}");
+    }
+}
+
+/// Жёсткий срок: поток задержан точкой подмены (`<журнал>.stall-ms`) — `take` возвращает `None`
+/// по сроку, не дожидаясь потока.
+#[test]
+fn take_hard_deadline_abandons_thread() {
+    let c = Case::new("stall");
+    let p = c.journal(&[], &[claude_human(&c, "Запрос.")]);
+    std::fs::write(format!("{}.stall-ms", p.display()), "3000").unwrap();
+    let mut o = c.opts(AgentKind::Claude, SESSION);
+    o.deadline = Duration::from_millis(50);
+    let t = std::time::Instant::now();
+    let s = snapshot::take(&p, &o);
+    let took = t.elapsed();
+    assert!(s.is_none());
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+}
+
+/// Срок: поток не успел — `None`, вызывающий не ждёт сверх срока.
+#[test]
+fn take_deadline_returns_in_time() {
+    let c = Case::new("deadline");
+    let line = claude_human(&c, &"з".repeat(1000));
+    let lines: Vec<String> = std::iter::repeat_n(line, 4000).collect();
+    let p = c.journal(&[], &lines);
+    let mut o = c.opts(AgentKind::Claude, SESSION);
+    o.tail_kb = 16 * 1024;
+    o.deadline = Duration::from_millis(5);
+    let t = std::time::Instant::now();
+    let s = snapshot::take(&p, &o);
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        t.elapsed()
+    );
+    // успел — тогда неполный по сроку или полный; не успел — None
+    if let Some(s) = s {
+        assert!(s.data.prompts.len() <= 5);
+    }
+}
+
+/// Срез конспекта с начала не режет метку `‹secret›`: обрывков метки нет.
+#[test]
+fn summary_cut_keeps_mark_whole() {
+    let mark = zam_secrets::SECRET_MARK;
+    let clean = |s: &str| {
+        let rest = s.replace(mark, "");
+        !rest.contains('‹') && !rest.contains('›')
+    };
+    for shift in 0..mark.len() + 2 {
+        let text = format!("{}{}{}", "а".repeat(3000 + shift), mark, "б".repeat(2000));
+        for max in 4000..4030 {
+            assert!(clean(&snapshot::summary_tail(&text, max)), "{shift}/{max}");
+        }
+    }
+    // и сокращение второго шага (`mask_and_limit`) — тоже
+    let text = format!("{}{}{}", "а".repeat(3000), mark, "б".repeat(2000));
+    for max in 4300..4460 {
+        let snap = Snapshot {
+            trigger: SnapTrigger::Stop,
+            agent: AgentKind::Claude,
+            status: SnapStatus::Complete,
+            skipped: 0,
+            session_hint: None,
+            scan_depth_capped: false,
+            data: SnapshotData {
+                compact_summary: Some(text.clone()),
+                ..SnapshotData::default()
+            },
+        };
+        let out = snapshot::mask_and_limit(snap, max);
+        assert!(
+            clean(&out.data.compact_summary.unwrap_or_default()),
+            "max {max}"
+        );
+    }
+}
+
+/// Пункт списка без отступа («1. сделать X») не обрывает ключевой раздел.
+#[test]
+fn summary_list_items_stay_in_section() {
+    let long = |n: usize| "слово ".repeat(n);
+    let text = [
+        "1. Primary Request and Intent:".to_string(),
+        long(1500),
+        "8. Current Work:".to_string(),
+        "1. первый пункт работы".to_string(),
+        "детали текущей работы".to_string(),
+        "2. **второй пункт**".to_string(),
+        "ещё детали".to_string(),
+        "9. Optional Next Step:".to_string(),
+        "шаг".to_string(),
+        "10. Notes:".to_string(),
+        long(1500),
+    ]
+    .join("\n");
+    let sum = snapshot::summary_tail(&text, 8 * 1024);
+    let part = "8. Current Work:\n1. первый пункт работы\nдетали текущей работы\n2. **второй пункт**\nещё детали";
+    assert!(sum.contains(part), "{sum}");
+}
+
+/// Команды Claude из длинной сессии: последние 10, исход сохраняется.
+#[test]
+fn claude_many_commands_keep_last() {
+    let c = Case::new("manycmd");
+    let lines: Vec<String> = (0..15)
+        .map(|i| claude_bash(&c, &format!("echo {i}"), &format!("toolu_{i}")))
+        .collect();
+    let p = c.journal(&[], &lines);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.commands.len(), 10);
+    assert_eq!(s.data.commands[0].cmd, "echo 5");
+    assert_eq!(s.data.commands[9].failed, None);
+}
+
+// ------------------------------------------------- `zam session snapshot` (задача 17b)
+
+/// Заглушка сервера для `zam session snapshot`: `GET /sessions/{id}` — `get` (статус), прочее —
+/// 2xx; принятые запросы — в `Seen`.
+fn cli_stub(get: u16) -> (String, common::Seen) {
+    common::stub_body(std::sync::Arc::new(
+        move |m: &str, p: &str, _: usize, _: &serde_json::Value| {
+            if m == "GET" && p.starts_with("/api/v1/sessions/") {
+                let body = if get == 200 {
+                    r#"{"id":"x","memory_writes":0}"#.to_string()
+                } else {
+                    format!(r#"{{"status":{get},"detail":"нет сессии"}}"#)
+                };
+                (get, body, Duration::ZERO)
+            } else if m == "PUT" {
+                (204, String::new(), Duration::ZERO)
+            } else {
+                (201, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ))
+}
+
+/// `zam session snapshot` в каталоге `c.root` против `url`.
+fn cli(c: &Case, url: &str, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let home = c.dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut cmd = common::zam_cmd();
+    cmd.env("ZAM_URL", url)
+        .env("ZAM_TOKEN", "zam_x")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&c.root)
+        .args(["session", "snapshot"])
+        .args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+fn seen_of(seen: &common::Seen) -> Vec<(String, String, serde_json::Value)> {
+    seen.lock().unwrap().clone()
+}
+
+/// §8а: сессия снимка по порядку — `--session`, `ZAM_SESSION_ID`, id из журнала (Claude —
+/// `sessionId` записей); записи журнала берутся последней сессии файла при любом источнике.
+#[test]
+fn cli_snapshot_session_source_order() {
+    let c = Case::new("cli-order");
+    let p = c.journal(&[], &[claude_human(&c, "запрос из журнала")]);
+    let t = p.to_string_lossy().into_owned();
+    for (args, env, want) in [
+        (
+            vec!["--transcript", &t, "--session", "S-flag"],
+            vec![("ZAM_SESSION_ID", "S-env")],
+            "S-flag",
+        ),
+        (
+            vec!["--transcript", &t],
+            vec![("ZAM_SESSION_ID", "S-env")],
+            "S-env",
+        ),
+        (
+            vec!["--transcript", &t, "--format", "claude"],
+            vec![],
+            SESSION,
+        ),
+    ] {
+        let (url, seen) = cli_stub(200);
+        let o = cli(&c, &url, &args, &env);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{want}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(out.contains(&format!("снимок сессии {want}: ")), "{out}");
+        let puts: Vec<_> = seen_of(&seen)
+            .into_iter()
+            .filter(|(m, _, _)| m == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1, "{want}");
+        assert_eq!(puts[0].1, format!("/api/v1/sessions/{want}/snapshot"));
+        let b = &puts[0].2;
+        assert_eq!(b["trigger"], "manual");
+        assert_eq!(b["agent"], "claude");
+        assert_eq!(
+            b["data"]["prompts"],
+            serde_json::json!(["запрос из журнала"]),
+            "{b}"
+        );
+        assert!(
+            b["taken_at"].as_str().is_some_and(|s| s.ends_with('Z')),
+            "{b}"
+        );
+    }
+}
+
+/// §8а: сессии нет на сервере (`GET` → 404) — `POST /sessions {id, agent}` до `PUT`; есть —
+/// не регистрируется заново (`POST` освежил бы `last_seen_at`). Codex — формат по первой
+/// строке, id из `session_meta`.
+#[test]
+fn cli_snapshot_registers_session() {
+    let c = Case::new("cli-register");
+    let p = c.journal(&["codex-doc-session.jsonl"], &[]);
+    let t = p.to_string_lossy().into_owned();
+    let codex_id = "00000000-0000-4000-8000-0000000000c1";
+    let (url, seen) = cli_stub(404);
+    let o = cli(&c, &url, &["--transcript", &t, "--json"], &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["session"], codex_id);
+    assert_eq!(v["trigger"], "manual");
+    let reqs = seen_of(&seen);
+    let order: Vec<String> = reqs.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+    assert_eq!(
+        order,
+        [
+            format!("GET /api/v1/sessions/{codex_id}"),
+            "POST /api/v1/sessions".to_string(),
+            format!("PUT /api/v1/sessions/{codex_id}/snapshot"),
+        ]
+    );
+    assert_eq!(reqs[1].2["id"], codex_id);
+    assert_eq!(reqs[1].2["agent"], "codex");
+    assert_eq!(reqs[2].2["agent"], "codex");
+    // сессия есть — без POST
+    let (url, seen) = cli_stub(200);
+    let o = cli(&c, &url, &["--transcript", &t], &[]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(!seen_of(&seen).iter().any(|(m, _, _)| m == "POST"));
+}
+
+/// §8а: ни `--session`, ни `ZAM_SESSION_ID`, ни id в журнале — код 1, «укажите --session»,
+/// запросов к серверу нет.
+#[test]
+fn cli_snapshot_no_session_exit_1() {
+    let c = Case::new("cli-no-session");
+    let line = r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"запрос без session_meta","images":[]}}"#;
+    let p = c.journal(&[], &[line.to_string()]);
+    let t = p.to_string_lossy().into_owned();
+    let (url, seen) = cli_stub(200);
+    let o = cli(&c, &url, &["--transcript", &t, "--format", "codex"], &[]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("укажите --session"), "{err}");
+    assert!(seen_of(&seen).is_empty());
+    // плохой формат и нет файла — ошибки ввода, не паника
+    let o = cli(&c, &url, &["--transcript", &t, "--format", "gemini"], &[]);
+    assert!(o.status.code().is_some_and(|x| x != 0));
+    // пустой снимок (в журнале нет ни одной записи формата) — ошибка ввода без запросов
+    let empty_t = c.dir.join("empty.jsonl");
+    std::fs::write(
+        &empty_t,
+        "{\"type\":\"progress\",\"data\":\"x\"}
+",
+    )
+    .unwrap();
+    let et = empty_t.to_string_lossy().into_owned();
+    let o = cli(&c, &url, &["--transcript", &et, "--session", "S"], &[]);
+    assert_eq!(o.status.code(), Some(6));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("снимок пуст"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let o = cli(
+        &c,
+        &url,
+        &["--transcript", "нет.jsonl", "--session", "S"],
+        &[],
+    );
+    assert!(o.status.code().is_some_and(|x| x != 0));
+    assert!(seen_of(&seen).is_empty());
+}

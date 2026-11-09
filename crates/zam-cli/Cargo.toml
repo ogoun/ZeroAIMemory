@@ -30,6 +30,8 @@ blake3.workspace = true
 zam-code = { path = "../zam-code", features = ["parse"] }
 # `zam import <каталог>`: упаковка папки в zip (M6 §12б.5; MIT, крейт workspace, уже у сервера)
 zip.workspace = true
+# маскировка снимка сессии (M6 §8а): сканер секретов без comrak и tokio
+zam-secrets = { path = "../zam-secrets" }
 
 # цепочка предков процесса (привязка `zam mcp` к сессии, M6 §7.1): ToolHelp32 (MIT OR
 # Apache-2.0, крейт workspace, уже у xtask)

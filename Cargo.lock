@@ -6965,6 +6965,7 @@ dependencies = [
  "zam-code",
  "zam-core",
  "zam-markdown",
+ "zam-secrets",
  "zam-server",
  "zam-store",
  "zip",
@@ -7070,7 +7071,6 @@ dependencies = [
  "mime_guess",
  "proptest",
  "pulldown-cmark",
- "regex",
  "rust-stemmers",
  "serde",
  "serde_json",
@@ -7078,6 +7078,7 @@ dependencies = [
  "thiserror 2.0.21",
  "unicode-segmentation",
  "zam-core",
+ "zam-secrets",
 ]
 
 [[package]]
@@ -7106,6 +7107,15 @@ dependencies = [
  "jiff",
  "regex",
  "serde",
+ "zam-core",
+]
+
+[[package]]
+name = "zam-secrets"
+version = "0.0.10-m5.7"
+dependencies = [
+ "proptest",
+ "regex",
  "zam-core",
 ]
 

@@ -315,6 +315,8 @@ async fn agent_setup_hooks_exec_form() {
         "SubagentStart": cmd("subagent-start", 2),
         "Stop": cmd("checkpoint", 2),
         "PreCompact": cmd("checkpoint", 2),
+        "PostCompact": cmd("checkpoint", 2),
+        "SessionEnd": cmd("checkpoint", 2),
     }});
     assert_eq!(j["claude_settings"], want);
     assert!(j.get("codex_hooks").is_none(), "{j}");
@@ -824,7 +826,7 @@ async fn agent_setup_claude_settings_new_events() {
         assert_eq!(g["hooks"][0]["args"], json!(["hook", kind]), "{ev}");
         assert_eq!(g["hooks"][0]["timeout"], 2, "{ev}");
     }
-    assert_eq!(h.as_object().unwrap().len(), 8, "{h}");
+    assert_eq!(h.as_object().unwrap().len(), 10, "{h}");
 }
 
 /// Codex (M4.5 §11): `PostToolUse` на `Bash|apply_patch` (ошибка и успех — одна команда),
@@ -847,7 +849,32 @@ async fn agent_setup_codex_hooks_new_events() {
     assert!(h["SubagentStart"][0].get("matcher").is_none(), "{h}");
     assert_eq!(h["PreToolUse"][0]["matcher"], "Bash|apply_patch");
     assert!(h.get("PostToolUseFailure").is_none(), "{h}");
-    assert_eq!(h.as_object().unwrap().len(), 7, "{h}");
+    assert_eq!(h.as_object().unwrap().len(), 8, "{h}");
+}
+
+/// Снимок сессии (M6 §8а, задача 17b): Claude Code — `PostCompact` (конспект сжатия) и
+/// `SessionEnd` на `zam hook checkpoint` без matcher, `timeout` 2; Codex — `SessionEnd`
+/// (`PostCompact` у Codex без конспекта — не подключается).
+#[tokio::test]
+async fn agent_setup_fragments_have_session_end() {
+    let a = api("agent-setup-session-end", |_| {}).await;
+    let j = setup(&a, &a.token, "agent=claude").await;
+    let h = &j["claude_settings"]["hooks"];
+    for ev in ["PostCompact", "SessionEnd"] {
+        assert_eq!(
+            h[ev],
+            json!([{"hooks": [{"type": "command", "command": "zam", "args": ["hook", "checkpoint"], "timeout": 2}]}]),
+            "{ev}: {h}"
+        );
+    }
+    let j = setup(&a, &a.token, "agent=codex").await;
+    let h = &j["codex_hooks"]["hooks"];
+    assert_eq!(
+        h["SessionEnd"],
+        json!([{"hooks": [{"type": "command", "command": "zam hook checkpoint --agent codex", "timeout": 2}]}]),
+        "{h}"
+    );
+    assert!(h.get("PostCompact").is_none(), "{h}");
 }
 
 /// Блок v5 из M5.6 устарел (M5.7 — строка об идеях, фразы перенесены в протокол):

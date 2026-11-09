@@ -17,7 +17,6 @@ mod patch;
 mod pos;
 mod render;
 mod sanitize;
-mod secrets;
 mod sentences;
 
 pub use chunk::{
@@ -42,6 +41,11 @@ pub use render::{
     LinkResolution, NoResolve, RENDER_VERSION, Rendered, Resolver, attachment_ref, render_html,
 };
 pub use sanitize::sanitize_html;
-pub use secrets::{SECRET_MARK, SecretHit, SecretKind, mask_secrets, mask_text, scan_secrets};
 pub use sentences::split_sentences;
 pub use zam_core::text::is_stop_word;
+/// Сканер секретов §7.6 — крейт `zam-secrets` (задача 15b M6); прежние имена — реэкспортом.
+pub use zam_secrets as secrets;
+pub use zam_secrets::{
+    SECRET_MARK, ScanOutcome, SecretHit, SecretKind, mask_secrets, mask_text, scan_secrets,
+    scan_secrets_ext,
+};

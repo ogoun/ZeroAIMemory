@@ -48,6 +48,12 @@
 //! хук ждёт его после запросов до [`CRITICAL_WAIT_MAX`] (неверная сессия у `zam mcp` хуже
 //! опоздания хука); затем уборка ([`best_effort`]: срок кэша, субагенты, уплотнение очередей) —
 //! только в остатке бюджета.
+//! M6 §8а: снимок сессии ([`snapshot_queue`]) — **до** `/recall`, в потоке `/recall`, со сроком
+//! `hooks.snapshot_ms`: на `source=compact` — снимок этой сессии, если `PostCompact` не пришёл
+//! (иначе — только отправка её очереди), на `startup` — догоняющий снимок оборванной сессии
+//! проекта (не уложился — пропуск, старт как обычно). Очереди снимков других сессий уходят
+//! параллельно с `/recall` ([`snapshot_queue::flush_others`]). Сервер недоступен — снимок
+//! остаётся в очереди.
 use std::path::Path;
 use std::time::Duration;
 
@@ -60,6 +66,7 @@ use super::cache;
 use super::input::Input;
 use super::journal;
 use super::output::{self, Output};
+use super::snapshot_queue;
 use super::{Env, Flag, HookFlags, Kind, Settings};
 use crate::client::read_json;
 
@@ -173,9 +180,23 @@ fn digest_net(
         }
         Output::context(&inp.event, &summary(st))
     };
+    // снимок сессии (M6 §8а): до `/recall`; без сервера — только в очередь
+    let job = snapshot_queue::job_for_session_start(env, inp, s);
+    let compact = source == Some("compact") && s.session_snapshot();
     let Some(client) = env.client() else {
+        // клиента нет (причина уже в журнале) — снимок только в очередь
+        if let Some(j) = job {
+            snapshot_queue::run(env, s, j, false);
+        }
         return local(s);
     };
+    // очереди снимков, которые уходят до `/recall` (сессия снимка; после `compact` — своя)
+    let first_ids: Vec<String> = job
+        .as_ref()
+        .map(|j| j.session.clone())
+        .into_iter()
+        .chain(session.filter(|_| compact).map(str::to_string))
+        .collect();
     // сводка журнала — заранее: её место вычитается из предела канала (ревью 8a M6, C1)
     let tail_pre = summary(s);
     let solution = env.solution.as_ref().map(|x| x.id.clone());
@@ -221,6 +242,15 @@ fn digest_net(
             }
             let c = &client;
             sc.spawn(move || {
+                // снимок сессии — до `/recall` (`recovery` и дайджест видят свежий снимок)
+                match job {
+                    Some(j) => snapshot_queue::run(env, s, j, true),
+                    None => {
+                        if let Some(id) = session.filter(|_| compact) {
+                            snapshot_queue::flush_logged(env, id);
+                        }
+                    }
+                }
                 let Some(id) = hold else {
                     return (c.post_json("/recall", &body).and_then(read_json), false);
                 };
@@ -236,6 +266,11 @@ fn digest_net(
             })
         };
         let trig = sc.spawn(|| cache::refresh_triggers(env, &client, false));
+        // очереди снимков других сессий (M6 §8а): параллельно `/recall`
+        let snapq = s.session_snapshot().then(|| {
+            let except: Vec<&str> = first_ids.iter().map(String::as_str).collect();
+            sc.spawn(move || snapshot_queue::flush_others(env, &except))
+        });
         // очередь учёта локального вывода прошлой сессии хуков (M4.5 §9.5)
         let tokens = session
             .filter(|_| cache::tokens_queued(env, session))
@@ -262,6 +297,11 @@ fn digest_net(
             && h.join().is_err()
         {
             env.log("sessions(new_epoch): паника");
+        }
+        if let Some(h) = snapq
+            && h.join().is_err()
+        {
+            env.log("snapshot(очереди): паника");
         }
         (reg.map(|h| h.join()), recall.join(), trig.join())
     });

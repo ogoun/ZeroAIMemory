@@ -128,6 +128,8 @@ struct Members {
     ops: HashMap<usize, lang::Operand>,
     /// Имена, которые вводят импорты файла (псевдонимы, пакеты, левые сегменты путей).
     quals: HashSet<String>,
+    /// Узлы имён ссылок-импортов, не вводящих имени (Python `import a.b` — сегмент `b`).
+    unbound: HashSet<usize>,
 }
 
 /// Ссылка из запроса: узел имени и вид.
@@ -307,7 +309,7 @@ fn walk_defs<'t>(
             if let Some((name, op)) = lang::member_access(lang, node, src) {
                 m.ops.insert(name.id(), op);
             }
-            lang::import_qualifiers(lang, node, src, &mut m.quals);
+            lang::import_qualifiers(lang, node, src, &mut m.quals, &mut m.unbound);
         }
         for (name, k) in lang::defs_of(lang, node, place, src) {
             defs.push(RawDef {
@@ -528,7 +530,7 @@ fn aggregate_refs(
 ) -> Vec<RefAgg> {
     let mut imports: HashSet<String> = refs
         .iter()
-        .filter(|r| r.kind == RefKind::Import)
+        .filter(|r| r.kind == RefKind::Import && !members.unbound.contains(&r.name.id()))
         .map(|r| ref_name(&lang::text(r.name, src), r.name.kind()))
         .collect();
     imports.extend(members.quals.iter().cloned());
