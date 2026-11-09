@@ -162,6 +162,26 @@ fn enqueue_entry(
     Ok(op)
 }
 
+/// Перемаскировка одной живой записи текущими правилами сканера (разностная перепроверка,
+/// [`crate::secrets_delta`]): чанки пересобираются, ставится задание с `priority`. `false` —
+/// записи нет или она удалена.
+pub(crate) fn remask_entry(
+    c: &Connection,
+    id: Id,
+    priority: i64,
+    now: &str,
+) -> Result<bool, StoreError> {
+    let prev: Option<IndexState> = c
+        .prepare_cached("SELECT index_state FROM entries WHERE id = ?1 AND deleted_at IS NULL")?
+        .query_row([id], |r| r.get(0))
+        .optional()?;
+    let Some(prev) = prev else {
+        return Ok(false);
+    };
+    index_entry(c, id, Some(prev), priority, now)?;
+    Ok(true)
+}
+
 /// [`index_entry`] с приоритетом записи.
 pub(crate) fn index_entry_now(
     c: &Connection,

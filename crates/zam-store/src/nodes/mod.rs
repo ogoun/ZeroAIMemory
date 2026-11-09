@@ -40,9 +40,9 @@ pub use chunks::{
 pub(crate) use chunks::{
     ChunkInsert, PARAM_ALGORITHM, PARAM_TOKENIZER, backfill_certainty, backfill_embed_keys,
     changed_params, chunk_id, chunker_base, chunker_fingerprint, chunker_params, context_prefix,
-    entry_chunker_fingerprint, frontmatter_tags, mask_tags, note_chunks, param_order,
-    params_from_fingerprint, rechunk_notes, replace_chunks, rescan_secrets, same_chunker,
-    stored_prefix_hit, token_counter,
+    enqueue_for_note, entry_chunker_fingerprint, frontmatter_tags, mask_tags, note_chunks,
+    param_order, params_from_fingerprint, rechunk_notes, remask_note, replace_chunks,
+    rescan_secrets, same_chunker, stored_prefix_hit, token_counter,
 };
 pub use history::{RevisionInfo, entry_snapshot_text, list_revisions, unified_diff};
 pub use l0::{set_auto_l0, set_folder_l0};

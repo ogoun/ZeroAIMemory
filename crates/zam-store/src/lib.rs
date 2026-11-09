@@ -33,6 +33,7 @@ pub mod nodes;
 pub mod paths;
 pub mod questions;
 pub mod search;
+mod secrets_delta;
 pub mod sessions;
 pub mod snapshots;
 pub mod solution_registry;

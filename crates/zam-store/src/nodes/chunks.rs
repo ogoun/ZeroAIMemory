@@ -1134,6 +1134,40 @@ pub(crate) async fn rescan_secrets(db: &Db, priority: i64) -> Result<u64, StoreE
     Ok(total)
 }
 
+/// Перемаскировка одной живой заметки текущими правилами сканера (разностная перепроверка при
+/// росте `zam_secrets::RULES_VERSION`, [`crate::secrets_delta`]): L0 маскируется, чанки
+/// пересобираются из исходника, ставится задание с `priority`. `false` — заметки нет или она в
+/// корзине.
+pub(crate) fn remask_note(
+    c: &Connection,
+    id: Id,
+    priority: i64,
+    now: &str,
+) -> Result<bool, StoreError> {
+    let row: Option<(i64, String, Option<String>)> = c
+        .prepare_cached(
+            "SELECT current_rev, index_state, l0 FROM nodes
+             WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+    let Some((rev, state, l0)) = row else {
+        return Ok(false);
+    };
+    if let Some(l0) = &l0 {
+        let m = mask_text(l0);
+        if &m != l0 {
+            c.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
+                .execute(params![id, m])?;
+        }
+    }
+    let content = revision_text(c, id, rev)?;
+    let meta = note_meta(&content, None);
+    rebuild_chunks(c, id, rev, &content, &meta)?;
+    enqueue_for_note(c, id, rev, Some(&state), priority, now)?;
+    Ok(true)
+}
+
 /// Заметок в одной транзакции перечанковки: писатель не занят надолго.
 const RECHUNK_BATCH: i64 = 200;
 

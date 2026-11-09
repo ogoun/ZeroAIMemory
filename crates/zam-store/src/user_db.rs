@@ -338,7 +338,8 @@ impl UserDbs {
         // нарезка вложений (M5): состояние и задания извлечения, работа — у конвейера документов
         crate::attachments::rechunk_docs_if_stale(&db).await?;
         let edges = crate::graph::backfill_pending(&db).await?;
-        let secrets = secrets_scan_pending(&db).await?;
+        let plan = secrets_scan_pending(&db).await?;
+        let secrets = plan.legacy || plan.delta;
         // теги payload и вход эмбеддинга папок (v3): до возврата базы — воркер проверяет
         // отметку reindex при первом её открытии
         rescan_payload_secrets(&db).await?;
@@ -365,9 +366,17 @@ impl UserDbs {
                 if edges && let Err(e) = crate::graph::backfill_edges(&bg).await {
                     tracing::warn!(error = %e, "дозаполнение рёбер графа прервано");
                 }
-                if secrets && let Err(e) = rescan_secrets(&bg).await {
+                if plan.legacy
+                    && let Err(e) = rescan_secrets(&bg).await
+                {
                     // повторится при следующем открытии базы
                     tracing::warn!(error = %e, "перенарезка заметок и записей с секретами прервана");
+                }
+                if plan.delta
+                    && let Err(e) = rescan_delta(&bg).await
+                {
+                    // повторится при следующем открытии базы
+                    tracing::warn!(error = %e, "перепроверка секретов по новым правилам прервана");
                 }
                 let _ = done.send(true);
             });
@@ -456,20 +465,36 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
 
 /// Ключ `meta`: перенарезка заметок и записей со значениями секретов (сканер §7.6, задача 11 M3)
 /// выполнена; значение — версия правил сканера ([`zam_markdown::secrets::RULES_VERSION`]), с
-/// которой она прошла. Отсутствует у баз, открытых до сканера; у баз до задачи 15b M6 — `'1'`.
-/// Версия меньше текущей — перенарезка повторяется один раз (новое правило находит то, что
-/// старое пропустило, а чанки, FTS и Qdrant хранят значение открытым). У новой пустой базы
+/// которой проверено сохранённое. Отсутствует у баз, открытых до сканера (полная перенарезка по
+/// исходнику, [`rescan_secrets`]); у баз до задачи 15b M6 — `'1'`. Версия меньше текущей —
+/// разностная перепроверка сохранённого ([`crate::secrets_delta`], в фоне). У новой пустой базы
 /// ставится сразу (все её записи нарезаются уже замаскированными).
 const SECRETS_SCANNED: &str = "secrets_scanned_v2";
 
-/// Ключ `meta` `key` записан с текущей версией правил сканера (или новее: база открыта
-/// более новым сервером, откат не перемаскирует).
-fn secrets_rules_current(c: &Connection, key: &str) -> rusqlite::Result<bool> {
+/// Состояние ключа `meta` версии правил сканера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RulesState {
+    /// Ключа нет: база до соответствующей проверки — полный путь по исходнику.
+    Absent,
+    /// Версия меньше текущей: разностная перепроверка сохранённого.
+    Old,
+    /// Текущая или новее (база открыта более новым сервером: при откате сервера не
+    /// перепроверяется и флаг не уменьшается).
+    Current,
+}
+
+fn secrets_rules_state(c: &Connection, key: &str) -> rusqlite::Result<RulesState> {
     let v: Option<String> = c
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
         .optional()?;
-    Ok(v.and_then(|v| v.parse::<u32>().ok())
-        .is_some_and(|v| v >= zam_markdown::secrets::RULES_VERSION))
+    Ok(match v {
+        None => RulesState::Absent,
+        // нечисловое значение — как прежнее «есть» (`'1'`)
+        Some(v) if v.parse::<u32>().unwrap_or(1) >= zam_markdown::secrets::RULES_VERSION => {
+            RulesState::Current
+        }
+        Some(_) => RulesState::Old,
+    })
 }
 
 /// Записывает ключ `meta` `key` с текущей версией правил сканера.
@@ -481,12 +506,26 @@ fn set_secrets_rules(c: &Connection, key: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Нужна ли перенарезка секретов: ключа нет и в базе есть живые заметки или записи.
-/// В пустой базе ключ ставится сразу.
-async fn secrets_scan_pending(db: &Db) -> Result<bool, StoreError> {
+/// Разовые проверки секретов при открытии базы.
+#[derive(Debug, Clone, Copy, Default)]
+struct SecretsPlan {
+    /// Полная перенарезка по исходнику (база до сканера, [`rescan_secrets`]).
+    legacy: bool,
+    /// Разностная перепроверка сохранённого (выросла версия правил, [`rescan_delta`]).
+    delta: bool,
+}
+
+/// Какие проверки секретов нужны. Ключа нет и база пуста — ключ ставится сразу.
+async fn secrets_scan_pending(db: &Db) -> Result<SecretsPlan, StoreError> {
     db.write(|tx| {
-        if secrets_rules_current(tx, SECRETS_SCANNED)? {
-            return Ok(false);
+        let scanned = secrets_rules_state(tx, SECRETS_SCANNED)?;
+        let payload = secrets_rules_state(tx, SECRETS_PAYLOAD)?;
+        let delta = scanned == RulesState::Old || payload == RulesState::Old;
+        if scanned != RulesState::Absent {
+            return Ok(SecretsPlan {
+                legacy: false,
+                delta,
+            });
         }
         let any: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)
@@ -497,9 +536,40 @@ async fn secrets_scan_pending(db: &Db) -> Result<bool, StoreError> {
         if !any {
             set_secrets_rules(tx, SECRETS_SCANNED)?;
         }
-        Ok(any)
+        Ok(SecretsPlan { legacy: any, delta })
     })
     .await
+}
+
+/// Разностная перепроверка сохранённого текущими правилами ([`crate::secrets_delta`]): найденное
+/// переписывается, остальное не трогается; затем оба ключа (`SECRETS_SCANNED`,
+/// `SECRETS_PAYLOAD`) — текущая версия. Прерванная работа повторится при следующем открытии.
+async fn rescan_delta(db: &Db) -> Result<(), StoreError> {
+    let st = crate::secrets_delta::run(db).await?;
+    if st.notes + st.entries + st.docs > 0 {
+        loop {
+            if crate::embeddings::gc_embeddings(db, 1000).await? < 1000 {
+                break;
+            }
+        }
+    }
+    db.write(|tx| {
+        set_secrets_rules(tx, SECRETS_SCANNED)?;
+        set_secrets_rules(tx, SECRETS_PAYLOAD)?;
+        Ok(())
+    })
+    .await?;
+    tracing::info!(
+        notes = st.notes,
+        entries = st.entries,
+        docs = st.docs,
+        folders = st.folders,
+        sigs = st.sigs,
+        scan_ms = st.scan_ms,
+        rules = zam_markdown::secrets::RULES_VERSION,
+        "перепроверка секретов по новым правилам завершена"
+    );
+    Ok(())
 }
 
 /// Перенарезка живых заметок и записей, в которых сканер находит секреты: значения из версий
@@ -533,7 +603,7 @@ async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
 /// Ключ `meta`: разовая проверка payload и точек папок на значения секретов (ревью задачи 11,
 /// задача 15 M3) выполнена. Теги точек Qdrant и вход эмбеддинга L0 папки маскируются с
 /// задачи 15; у новой пустой базы ключ ставится сразу. Значение — версия правил сканера, как у
-/// [`SECRETS_SCANNED`]: с меньшей версией проверка повторяется.
+/// [`SECRETS_SCANNED`]: с меньшей версией — разностная перепроверка в фоне ([`rescan_delta`]).
 const SECRETS_PAYLOAD: &str = "secrets_scanned_v3";
 
 /// Разовая проверка базы, открытой до маскировки тегов payload и входа эмбеддинга папок: если
@@ -548,7 +618,9 @@ const SECRETS_PAYLOAD: &str = "secrets_scanned_v3";
 async fn rescan_payload_secrets(db: &Db) -> Result<(), StoreError> {
     let found = db
         .write(|tx| {
-            if secrets_rules_current(tx, SECRETS_PAYLOAD)? {
+            // только база до задачи 15 M3 (ключа нет); версия правил выросла — разностная
+            // перепроверка в фоне (`rescan_delta`): открытие её не ждёт
+            if secrets_rules_state(tx, SECRETS_PAYLOAD)? != RulesState::Absent {
                 return Ok(None);
             }
             let secret = |s: &str| !zam_markdown::scan_secrets(s).is_empty();

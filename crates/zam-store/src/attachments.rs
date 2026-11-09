@@ -426,6 +426,26 @@ pub(crate) fn enqueue_doc(c: &Connection, id: Id, op: JobOp, now: &str) -> Resul
     )
 }
 
+/// Повторное извлечение документа `id` (разностная перепроверка секретов, [`crate::secrets_delta`]):
+/// `extract_state = 'pending'` и задание извлечения у живого — как в [`rechunk_docs_if_stale`];
+/// извлечение берёт текст из кэша `blob_extract`, нарезка маскирует его текущими правилами.
+/// `false` — документ не в `done` (уже ждёт извлечения или не извлекается).
+pub(crate) fn reextract_doc(c: &Connection, id: Id, now: &str) -> Result<bool, StoreError> {
+    let live: Option<bool> = c
+        .prepare_cached(
+            "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
+             WHERE id = ?1 AND extract_state = 'done'
+             RETURNING deleted_at IS NULL
+               AND (SELECT deleted_at IS NULL FROM nodes WHERE id = node_id)",
+        )?
+        .query_row([id], |r| r.get(0))
+        .optional()?;
+    if live == Some(true) {
+        enqueue_doc(c, id, JobOp::Upsert, now)?;
+    }
+    Ok(live.is_some())
+}
+
 /// Что известно о файле при привязке ([`crate::blobs::attach`]): вид по `zam_docs::sniff` и
 /// размер против `docs.max_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
