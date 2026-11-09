@@ -294,6 +294,10 @@ pub async fn run_with(
         stopping.begin_stop();
     })
     .await?;
+    // аудит `space.export.done` оборванных экспортов — до выхода процесса (не дольше 1 с)
+    if !state.wait_exports(std::time::Duration::from_secs(1)).await {
+        tracing::warn!("экспорт не завершился за 1 с: space.export.done может не записаться");
+    }
     state.shutdown().await;
     tracing::info!("zam-server остановлен");
     Ok(())

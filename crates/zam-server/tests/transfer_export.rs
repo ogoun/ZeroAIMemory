@@ -682,9 +682,12 @@ async fn export_deadline_aborts() {
     assert_eq!(db.long_readers(), 1, "экспорт — долгий читатель базы");
     tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
     let body = finish(r).await;
+    // тело кончается ошибкой (обрыв соединения), а не штатным концом chunked: браузер не
+    // сохранит неполный zip как успешную загрузку
     assert!(
-        body.as_ref().map_or(true, |b| !valid_zip(b)),
-        "архив полный"
+        body.is_err(),
+        "тело кончилось штатно: {:?}",
+        body.map(|b| b.len())
     );
     let d = done_audits(a, 1).await.remove(0);
     assert_eq!(d["details"]["complete"], json!(false));
@@ -707,13 +710,62 @@ async fn export_stops_on_shutdown() {
     let body = tokio::time::timeout(std::time::Duration::from_secs(20), finish(r))
         .await
         .expect("поток не оборвался");
+    // тело кончается ошибкой (обрыв соединения), а не штатным концом chunked: браузер не
+    // сохранит неполный zip как успешную загрузку
     assert!(
-        body.as_ref().map_or(true, |b| !valid_zip(b)),
-        "архив полный"
+        body.is_err(),
+        "тело кончилось штатно: {:?}",
+        body.map(|b| b.len())
     );
     let d = done_audits(a, 1).await.remove(0);
     assert_eq!(d["details"]["complete"], json!(false));
     assert_eq!(d["details"]["reason"], json!("stop"));
+    assert!(a.st.wait_exports(std::time::Duration::from_secs(1)).await);
+}
+
+/// При остановке новый экспорт — сразу 503 с `Retry-After`: без аудита и без слота.
+#[tokio::test]
+async fn export_refused_while_stopping() {
+    let w = world("export-stopping").await;
+    let (a, o) = (&w.a, &w.o);
+    a.st.begin_stop();
+    for q in ["", "?probe=true"] {
+        let r = export_tok(a, &o.tok, G, q).await;
+        assert_eq!(
+            r.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{q}: {}",
+            r.text()
+        );
+        assert_eq!(r.header("retry-after"), "30");
+        assert_eq!(r.json()["type"], json!("/problems/busy"));
+    }
+    assert_eq!(
+        a.st.export_slots.available_permits(),
+        zam_server::api::transfer::export::EXPORT_SLOTS
+    );
+    let all = a
+        .adm(Method::GET, "/api/v1/admin/audit", None, None)
+        .await
+        .json();
+    assert!(!all.to_string().contains("space.export"), "{all}");
+}
+
+/// Остановка ждёт аудит оборванного экспорта: после `wait_exports` запись `space.export.done`
+/// уже есть (так `serve` делает до выхода процесса).
+#[tokio::test]
+async fn shutdown_waits_export_audit() {
+    let w = big_world("export-waitaudit", |_| {}).await;
+    let a = &w.a;
+    let r = start_export(a, &w.o.tok, G).await;
+    a.st.begin_stop();
+    assert!(a.st.wait_exports(std::time::Duration::from_secs(5)).await);
+    let all = a
+        .adm(Method::GET, "/api/v1/admin/audit", None, None)
+        .await
+        .json();
+    assert!(all.to_string().contains("space.export.done"), "{all}");
+    drop(r);
 }
 
 /// Аудит до тела не записался — 500 без архива и без `space.export.done`.

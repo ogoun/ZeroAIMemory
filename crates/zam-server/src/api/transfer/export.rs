@@ -83,9 +83,6 @@ const CHUNK: usize = 256 * 1024;
 const CHANNEL: usize = 8;
 /// Клиент не забирает тело дольше — поток обрывается.
 const STALL: Duration = Duration::from_secs(10 * 60);
-/// Сколько ждать, пока клиент заберёт ошибку обрыва: не забрал — тело просто кончается
-/// (архив без центрального каталога — `zam export` его отвергает).
-const ERR_STALL: Duration = Duration::from_secs(1);
 /// Файл больше — запись zip64 (без `Seek` размер в заголовке не исправить).
 const ZIP64_FROM: u64 = 0xFFFF_0000;
 
@@ -143,57 +140,113 @@ pub(crate) struct Guard {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Причины обрыва в сообщении ошибки (для `reason` аудита).
-const R_STOP: &str = "сервер останавливается";
-const R_DEADLINE: &str = "экспорт дольше export.max_secs";
-const R_STALL: &str = "клиент не забирает архив";
-const R_CLIENT: &str = "клиент закрыл соединение";
+/// Причина обрыва (`reason` аудита `space.export.done`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbortKind {
+    Stop,
+    Deadline,
+    Stall,
+    Client,
+}
+
+impl AbortKind {
+    fn code(self) -> &'static str {
+        match self {
+            AbortKind::Stop => "stop",
+            AbortKind::Deadline => "deadline",
+            AbortKind::Stall => "stall",
+            AbortKind::Client => "client",
+        }
+    }
+}
+
+/// Ошибка обрыва внутри `io::Error` (`io::Error::other(Abort(..))`): причина достаётся
+/// `downcast`, а не по тексту.
+#[derive(Debug)]
+pub(crate) struct Abort(pub(crate) AbortKind);
+
+impl std::fmt::Display for Abort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            AbortKind::Stop => "сервер останавливается",
+            AbortKind::Deadline => "экспорт дольше export.max_secs",
+            AbortKind::Stall => "клиент не забирает архив",
+            AbortKind::Client => "клиент закрыл соединение",
+        })
+    }
+}
+
+impl std::error::Error for Abort {}
+
+/// Ошибка ввода-вывода обрыва вида `k`. Вид — `Other`: `Interrupted` `write_all` повторяет
+/// бесконечно (так зависал первый вариант остановки).
+fn abort(k: AbortKind) -> io::Error {
+    io::Error::other(Abort(k))
+}
+
+/// Причина обрыва ошибки `e` (`None` — не обрыв, а сбой).
+fn abort_kind(e: &io::Error) -> Option<AbortKind> {
+    e.get_ref()
+        .and_then(|x| x.downcast_ref::<Abort>())
+        .map(|a| a.0)
+}
 
 impl Guard {
     fn check(&self) -> io::Result<()> {
         if self.stop.load(std::sync::atomic::Ordering::SeqCst) {
-            // не `Interrupted`: `write_all` повторяет запись на нём бесконечно
-            return Err(io::Error::other(R_STOP));
+            return Err(abort(AbortKind::Stop));
         }
         if Instant::now() >= self.deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, R_DEADLINE));
+            return Err(abort(AbortKind::Deadline));
         }
         Ok(())
     }
 }
 
-/// Код причины обрыва по тексту ошибки.
-fn reason(e: &str) -> &'static str {
-    [
-        (R_STOP, "stop"),
-        (R_DEADLINE, "deadline"),
-        (R_STALL, "stall"),
-        (R_CLIENT, "client"),
-    ]
-    .iter()
-    .find(|(m, _)| e.contains(m))
-    .map_or("error", |(_, r)| *r)
-}
-
 /// `Write` в канал тела ответа кусками по [`CHUNK`]; каждая запись проверяет [`Guard`],
-/// отправка — [`send_stalled`].
+/// отправка — [`send_stalled`]. После первой ошибки поток мёртв: `write` и `flush` сразу
+/// возвращают ошибку и ничего не шлют (завершение zip в `Drop` не ждёт `stall` и не пишет в
+/// оборванное тело).
 struct ChanWriter {
     tx: mpsc::Sender<io::Result<Bytes>>,
     buf: Vec<u8>,
     guard: Guard,
+    stall: Duration,
+    dead: Option<AbortKind>,
 }
 
 impl ChanWriter {
+    fn new(tx: mpsc::Sender<io::Result<Bytes>>, guard: Guard, stall: Duration) -> ChanWriter {
+        ChanWriter {
+            tx,
+            buf: Vec::with_capacity(CHUNK),
+            guard,
+            stall,
+            dead: None,
+        }
+    }
+
     fn send(&mut self) -> io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
         let b = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
-        send_stalled(&self.tx, Ok(b), STALL, Some(&self.guard))
+        send_stalled(&self.tx, Ok(b), self.stall, Some(&self.guard))
+    }
+
+    /// Мёртвый поток — ошибка сразу; иначе `f`, и её ошибка делает поток мёртвым.
+    fn alive(&mut self, f: impl FnOnce(&mut Self) -> io::Result<()>) -> io::Result<()> {
+        if let Some(k) = self.dead {
+            return Err(abort(k));
+        }
+        f(self).inspect_err(|e| {
+            self.dead = Some(abort_kind(e).unwrap_or(AbortKind::Client));
+            self.buf.clear();
+        })
     }
 }
 
-/// Кусок в канал тела: получатель ушёл — `BrokenPipe`; не забирает дольше `stall` — тоже;
+/// Кусок в канал тела: получатель ушёл — `Client`; не забирает дольше `stall` — `Stall`;
 /// пока ждём — проверяется `guard` (срок, остановка).
 fn send_stalled(
     tx: &mpsc::Sender<io::Result<Bytes>>,
@@ -206,9 +259,7 @@ fn send_stalled(
     loop {
         match tx.try_send(item) {
             Ok(()) => return Ok(()),
-            Err(TrySendError::Closed(_)) => {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, R_CLIENT));
-            }
+            Err(TrySendError::Closed(_)) => return Err(abort(AbortKind::Client)),
             Err(TrySendError::Full(back)) if t0.elapsed() < stall => {
                 if let Some(g) = guard {
                     g.check()?;
@@ -216,26 +267,64 @@ fn send_stalled(
                 item = back;
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(TrySendError::Full(_)) => {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, R_STALL));
-            }
+            Err(TrySendError::Full(_)) => return Err(abort(AbortKind::Stall)),
         }
     }
 }
 
 impl Write for ChanWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.guard.check()?;
-        self.buf.extend_from_slice(data);
-        if self.buf.len() >= CHUNK {
-            self.send()?;
-        }
+        self.alive(|w| {
+            w.guard.check()?;
+            w.buf.extend_from_slice(data);
+            if w.buf.len() >= CHUNK {
+                w.send()?;
+            }
+            Ok(())
+        })?;
         Ok(data.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.send()
+        self.alive(Self::send)
     }
+}
+
+/// Ошибка обрыва для тела ответа: её выдаёт поток тела ([`body_stream`]) вне очереди
+/// кусков — тело не кончается штатным концом chunked даже при полном канале.
+#[derive(Default)]
+pub(crate) struct AbortCell(std::sync::Mutex<Option<String>>);
+
+impl AbortCell {
+    fn set(&self, msg: String) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Поток тела ответа: куски из канала; ошибка обрыва ([`AbortCell`]) — сразу, раньше
+/// оставшихся кусков, и после неё поток кончается ошибкой (hyper рвёт соединение).
+fn body_stream(
+    rx: mpsc::Receiver<io::Result<Bytes>>,
+    cell: std::sync::Arc<AbortCell>,
+) -> impl futures_util::Stream<Item = io::Result<Bytes>> {
+    futures_util::stream::unfold(Some(rx), move |rx| {
+        let cell = cell.clone();
+        async move {
+            let mut rx = rx?;
+            if let Some(e) = cell.take() {
+                return Some((Err(io::Error::other(e)), None));
+            }
+            match rx.recv().await {
+                Some(x) => Some((x, Some(rx))),
+                // отправители ушли: обрыв (ячейка ставится раньше, чем уходят отправители)
+                None => cell.take().map(|e| (Err(io::Error::other(e)), None)),
+            }
+        }
+    })
 }
 
 fn opts(method: CompressionMethod, len: u64) -> SimpleFileOptions {
@@ -249,7 +338,11 @@ fn io_store(e: io::Error) -> StoreError {
 }
 
 fn zip_store(e: zip::result::ZipError) -> StoreError {
-    StoreError::Io(io::Error::other(e.to_string()))
+    match e {
+        // ошибка записи (в том числе обрыв `Abort`) — как есть: причина достаётся `downcast`
+        zip::result::ZipError::Io(e) => StoreError::Io(e),
+        e => StoreError::Io(io::Error::other(e.to_string())),
+    }
 }
 
 fn json_store(e: serde_json::Error) -> StoreError {
@@ -269,6 +362,16 @@ struct Stats {
     files: usize,
     bytes: u64,
     error: Option<String>,
+    /// Код причины обрыва (`reason`); `error` без причины — `error`.
+    reason: Option<&'static str>,
+}
+
+/// Код причины ошибки экспорта.
+fn reason_of(e: &StoreError) -> &'static str {
+    match e {
+        StoreError::Io(io) => abort_kind(io).map_or("error", AbortKind::code),
+        _ => "error",
+    }
 }
 
 /// Запись архива в поток zip (внутри транзакции [`export_space`]).
@@ -629,6 +732,12 @@ pub async fn export(
     Path(space): Path<String>,
     q: Result<Query<ExportQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
+    // сервер останавливается: ни аудита, ни слота — повторить на работающем сервере
+    if st.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError::ShuttingDown {
+            retry_after_s: RETRY_AFTER_S,
+        });
+    }
     let q = query(q)?;
     admin_user(&p, &mut headers, q.user.as_deref())?;
     let filter = filter_of(&q)?;
@@ -692,17 +801,17 @@ pub async fn export(
     };
 
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHANNEL);
+    let cell = std::sync::Arc::new(AbortCell::default());
+    let cell2 = cell.clone();
     let db = sc.db.clone();
     let st2 = st.clone();
+    let running = st.export_tasks.clone().enter();
     tokio::spawn(async move {
+        let _running = running;
         let space_id = manifest.space;
         let res = export_space(&db, sel, move |r| {
             let mut stats = Stats::default();
-            let w = ChanWriter {
-                tx: tx.clone(),
-                buf: Vec::with_capacity(CHUNK),
-                guard,
-            };
+            let w = ChanWriter::new(tx.clone(), guard, STALL);
             let res =
                 write_archive(r, w, store, history, manifest, &mut stats).and_then(|mut w| {
                     w.flush().map_err(io_store)?;
@@ -712,8 +821,9 @@ pub async fn export(
                 Ok(w) => Some(w),
                 Err(e) => {
                     stats.error = Some(e.to_string());
-                    let _ =
-                        send_stalled(&tx, Err(io::Error::other(e.to_string())), ERR_STALL, None);
+                    stats.reason = Some(reason_of(&e));
+                    // до ухода отправителей: тело кончится ошибкой, а не штатным концом
+                    cell2.set(e.to_string());
                     None
                 }
             };
@@ -727,6 +837,7 @@ pub async fn export(
         .await;
         let stats = res.unwrap_or_else(|e| Stats {
             error: Some(e.to_string()),
+            reason: Some("error"),
             ..Stats::default()
         });
         if let Some(e) = &stats.error {
@@ -736,8 +847,7 @@ pub async fn export(
             tracing::warn!(space = %space_id, error = %e, "аудит экспорта не записан");
         }
     });
-    let stream =
-        futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|x| (x, rx)) });
+    let stream = body_stream(rx, cell);
     let name = download_name(
         sc.space.kind.as_str(),
         sc.space.solution_guid.as_deref(),
@@ -807,8 +917,8 @@ impl AuditCtx {
             "space": self.space, "user": self.user, "owner": self.owner,
             "files": s.files, "bytes": s.bytes, "complete": s.error.is_none(),
         });
-        if let (Some(e), Value::Object(o)) = (&s.error, &mut d) {
-            o.insert("reason".into(), json!(reason(e)));
+        if let (Some(_), Value::Object(o)) = (&s.error, &mut d) {
+            o.insert("reason".into(), json!(s.reason.unwrap_or("error")));
         }
         self.record(st, AUDIT_DONE, d).await
     }
@@ -841,7 +951,7 @@ mod tests {
     /// Получатель не забирает куски: обрыв через `stall`, а не вечное ожидание.
     #[test]
     fn send_stalled_gives_up() {
-        let (tx, _rx) = mpsc::channel::<io::Result<Bytes>>(1);
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(1);
         send_stalled(&tx, Ok(Bytes::from_static(b"a")), STALL, None).unwrap();
         let t0 = Instant::now();
         let e = send_stalled(
@@ -851,8 +961,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(reason(&e.to_string()), "stall");
+        assert_eq!(abort_kind(&e), Some(AbortKind::Stall));
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
         // остановка сервера прерывает ожидание раньше срока
         let g = Guard {
@@ -860,12 +969,68 @@ mod tests {
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let e = send_stalled(&tx, Ok(Bytes::from_static(b"c")), STALL, Some(&g)).unwrap_err();
-        assert_eq!(reason(&e.to_string()), "stop");
+        assert_eq!(abort_kind(&e), Some(AbortKind::Stop));
         // `Interrupted` `write_all` повторял бы бесконечно (так зависал первый вариант)
         assert_ne!(e.kind(), io::ErrorKind::Interrupted);
-        drop(_rx);
+        drop(rx);
         let e = send_stalled(&tx, Ok(Bytes::from_static(b"d")), STALL, None).unwrap_err();
-        assert_eq!(reason(&e.to_string()), "client");
+        assert_eq!(abort_kind(&e), Some(AbortKind::Client));
+        // причина проходит через ошибку zip и хранилища
+        let z = zip_store(zip::result::ZipError::Io(abort(AbortKind::Deadline)));
+        assert_eq!(reason_of(&z), "deadline");
+        assert_eq!(reason_of(&io_store(io::Error::other("x"))), "error");
+    }
+
+    /// После первой ошибки поток мёртв: завершение zip в `Drop` не ждёт `stall` и ничего не
+    /// пишет в канал.
+    #[test]
+    fn dead_writer_drop_does_not_wait_or_write() {
+        let (tx, mut rx) = mpsc::channel::<io::Result<Bytes>>(1);
+        tx.try_send(Ok(Bytes::from_static(b"first"))).unwrap();
+        let g = Guard {
+            deadline: Instant::now() + Duration::from_secs(3600),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let w = ChanWriter::new(tx, g, Duration::from_secs(2));
+        let mut z = zip::ZipWriter::new_stream(w);
+        z.start_file("a.bin", opts(CompressionMethod::Stored, 0))
+            .unwrap();
+        let e = z.write_all(&vec![7u8; CHUNK + 1]).unwrap_err();
+        assert_eq!(abort_kind(&e), Some(AbortKind::Stall));
+        let t0 = Instant::now();
+        drop(z);
+        assert!(
+            t0.elapsed() < Duration::from_millis(1000),
+            "Drop ждал {:?}",
+            t0.elapsed()
+        );
+        assert!(rx.try_recv().is_ok(), "первый кусок на месте");
+        assert!(
+            rx.try_recv().is_err(),
+            "после ошибки в канал ничего не ушло"
+        );
+    }
+
+    /// Ошибка обрыва — раньше оставшихся кусков и после ухода отправителей: тело кончается
+    /// ошибкой, а не штатно.
+    #[tokio::test]
+    async fn body_stream_ends_with_error() {
+        use futures_util::StreamExt;
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        let cell = std::sync::Arc::new(AbortCell::default());
+        tx.try_send(Ok(Bytes::from_static(b"a"))).unwrap();
+        let mut st = Box::pin(body_stream(rx, cell.clone()));
+        assert!(st.next().await.unwrap().is_ok());
+        tx.try_send(Ok(Bytes::from_static(b"b"))).unwrap();
+        cell.set("обрыв".into());
+        drop(tx);
+        assert!(st.next().await.unwrap().is_err(), "ошибка раньше куска «b»");
+        assert!(st.next().await.is_none());
+        // без обрыва — штатный конец
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(1);
+        drop(tx);
+        let mut st = Box::pin(body_stream(rx, std::sync::Arc::default()));
+        assert!(st.next().await.is_none());
     }
 
     #[test]
