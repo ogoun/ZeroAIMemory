@@ -5948,3 +5948,35 @@ I1/I2, M1–M8 приняты; исправлены N1–N4 и Minor. Субаг
   FAIL (`reason` = `error`);
 - после отката — PASS: `zam-server --lib transfer` — 12, `--test transfer_export` — 16 PASS;
   `fmt --check`, `clippy -p zam-server --all-targets -D warnings` — чисто.
+
+#### Повторное ревью задачи 14 (APPROVE) — Minor N1–N3 (2026-11-09)
+
+Коммит — `fix(code): мелкие правки повторного ревью задачи 14 — импорты Python, имя Go-пакета`
+(sha — в отчёте контроллеру).
+- **N1.** Python `import a.b`, `import a.b as c`: последний сегмент (`b`) больше не идёт в набор
+  квалификаторов (`Members::unbound` — узлы имён ссылок-импортов, которые имени не вводят; ссылка
+  `import` в карте остаётся). Квалификатор — левый сегмент (`a`) или псевдоним (`c`); имена
+  `from m import x` — как были. Тест `import_names_not_bound_by_path_segments`: `import os.path` +
+  `def g(path, b): path.n1()` — по получателю, `b.n2()` при `import a.b as c` — по получателю,
+  `c.n3()`, `x.n4()`, `os.n5()` — прямые.
+- **N3.** `go_package_name`: снимаются суффиксы `-go`/`.go`; остаток с дефисом (`aws-sdk-go` →
+  `aws-sdk`) — не имя пакета, квалификатор не добавляется. Юнит-тест `go_package_name_from_path`
+  (`lang.rs`) и сценарий в `import_names_not_bound_by_path_segments` (`yaml.go`, `redis-go`).
+- **N2. Известные ограничения правила квалификатора (п. 2(б)), → 13c (ТЗ §7.12):** анализа
+  областей видимости нет, поэтому (1) локальная переменная, затеняющая импорт, считается
+  квалификатором (Go `url := url.Parse(s); url.Query()`, Python `def g(json): json.dumps()`);
+  (2) имя объекта, совпавшее с левым сегментом импортированного пути, — тоже (Java `com.x()` при
+  `import com.acme.Y`); (3) объект-значение из импорта (`import { config } …; config.db.open()`)
+  — прямой вызов по п. 2(б). Все три ошибки — в сторону веса M5.7 (вызов прямой, вес 1,0), то есть
+  не хуже прежнего. → M7: анализ областей видимости (связывание имени с объявлением, например по
+  образцу stack-graphs / scope graphs).
+
+Откаты (`.tmp/m6/task14/rollbacks3.py`, лог `rollbacks3.log`): R22 (сегмент `b` снова
+квалификатор) → `import_names_not_bound_by_path_segments` FAIL; R23 (остаток с дефисом — имя
+пакета) → `go_package_name_from_path` FAIL (в сценарии извлечения он не виден: имя с дефисом не
+может быть идентификатором вызова — поэтому юнит-тест); R24 (суффикс `-go`/`.go` не снимается) →
+`import_names_not_bound_by_path_segments` FAIL. Дерево после откатов чистое.
+
+Тесты: `zam-code --features parse` — lib 1, `extract` 31, `pack` 10, `proto` 12, `rank` 18 + 2
+ignored; `cargo fmt --check`, `clippy -p zam-code --features parse --all-targets -D warnings` —
+чисто.

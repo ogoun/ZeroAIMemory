@@ -1081,3 +1081,34 @@ fn extractor_metrics_1_000() {
         assert_eq!(got, expected, "{dir}: точность и полнота должны быть 1,000");
     }
 }
+
+/// Повторное ревью задачи 14, N1 и N3: Python `import os.path` вводит имя `os`, а не `path` —
+/// параметр `path` остаётся получателем (а `from m import x` имя `x` вводит); имя Go-пакета без
+/// суффикса `-go`/`.go`, остаток с дефисом (`aws-sdk-go` → `aws-sdk`) именем пакета не считается.
+#[test]
+fn import_names_not_bound_by_path_segments() {
+    let py = run(
+        Lang::Python,
+        "import os.path\nimport a.b as c\nfrom m import x\n\ndef g(path, b):\n    path.n1()\n    b.n2()\n    c.n3()\n    x.n4()\n    os.n5()\n",
+    );
+    assert_calls(
+        &py,
+        Lang::Python,
+        &[
+            ("n1", true),
+            ("n2", true),
+            ("n3", false),
+            ("n4", false),
+            ("n5", false),
+        ],
+    );
+    let go = run(
+        Lang::Go,
+        "package p\n\nimport (\n\t\"github.com/aws/aws-sdk-go\"\n\t\"github.com/x/yaml.go\"\n\t\"github.com/x/redis-go\"\n)\n\nfunc g(x X) {\n\taws.k1()\n\tsdk.k2()\n\tyaml.k3()\n\tredis.k4()\n}\n",
+    );
+    assert_calls(
+        &go,
+        Lang::Go,
+        &[("k1", true), ("k2", true), ("k3", false), ("k4", false)],
+    );
+}

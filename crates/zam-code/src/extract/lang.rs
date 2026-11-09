@@ -482,8 +482,9 @@ fn chain_left(lang: Lang, mut node: Node, src: &[u8]) -> Option<String> {
 }
 
 /// Имя Go-пакета по пути импорта: последний сегмент без `.vN` и без префикса `go-`; сегмент
-/// мажорной версии `/vN` — предыдущий (`gopkg.in/yaml.v3` → `yaml`, `github.com/x/go-redis/v9` →
-/// `redis`).
+/// мажорной версии `/vN` — предыдущий; без суффикса `-go`/`.go` (`gopkg.in/yaml.v3` → `yaml`,
+/// `github.com/x/go-redis/v9` → `redis`). Остаток с дефисом (`aws-sdk-go` → `aws-sdk`) — не имя
+/// пакета Go: `None` (имя объявляет `package` внутри, по пути его не узнать).
 pub(super) fn go_package_name(path: &str) -> Option<String> {
     let is_ver = |s: &str| {
         s.strip_prefix('v')
@@ -500,7 +501,11 @@ pub(super) fn go_package_name(path: &str) -> Option<String> {
         last = base;
     }
     let last = last.strip_prefix("go-").unwrap_or(last);
-    (!last.is_empty()).then(|| last.to_string())
+    let last = last
+        .strip_suffix("-go")
+        .or_else(|| last.strip_suffix(".go"))
+        .unwrap_or(last);
+    (!last.is_empty() && !last.contains('-')).then(|| last.to_string())
 }
 
 /// Имена-квалификаторы, которые вводит узел импорта (M6 §12а, правило п. 2(б)): псевдонимы
@@ -508,7 +513,16 @@ pub(super) fn go_package_name(path: &str) -> Option<String> {
 /// `using F = A.B`), имя Go-пакета по пути, `const fs = require('fs')`, левый сегмент
 /// импортируемого пути (`import os.path` → `os`, `using System.Text` → `System`, Java
 /// `import java.util.Objects` → `java`).
-pub(super) fn import_qualifiers(lang: Lang, node: Node, src: &[u8], out: &mut HashSet<String>) {
+///
+/// `unbound` — узлы имён ссылок-импортов, которые имени в файле не вводят: последний сегмент
+/// Python `import a.b` (связано `a`) и `import a.b as c` (связано `c`) — ревью задачи 14, N1.
+pub(super) fn import_qualifiers(
+    lang: Lang,
+    node: Node,
+    src: &[u8],
+    out: &mut HashSet<String>,
+    unbound: &mut HashSet<usize>,
+) {
     fn leftmost<'t>(mut n: Node<'t>, scope: &str) -> Node<'t> {
         while let Some(s) = n.child_by_field_name(scope) {
             n = s;
@@ -524,9 +538,25 @@ pub(super) fn import_qualifiers(lang: Lang, node: Node, src: &[u8], out: &mut Ha
         (Lang::Python, "aliased_import") => add(node.child_by_field_name("alias")),
         (Lang::Python, "import_statement") => {
             let mut c = node.walk();
-            for n in node.children_by_field_name("name", &mut c) {
-                if n.kind() == "dotted_name" {
-                    add(n.named_child(0));
+            let names: Vec<Node> = node.children_by_field_name("name", &mut c).collect();
+            for n in names {
+                let (dotted, aliased) = match n.kind() {
+                    "dotted_name" => (Some(n), false),
+                    "aliased_import" => (n.child_by_field_name("name"), true),
+                    _ => (None, false),
+                };
+                let Some(d) = dotted else { continue };
+                if !aliased {
+                    add(d.named_child(0));
+                }
+                let parts = d.named_child_count();
+                if (aliased || parts > 1)
+                    && let Some(last) = parts
+                        .checked_sub(1)
+                        .and_then(|i| u32::try_from(i).ok())
+                        .and_then(|i| d.named_child(i))
+                {
+                    unbound.insert(last.id());
                 }
             }
         }
@@ -733,4 +763,26 @@ pub(super) fn name_parts(node: Node, src: &[u8]) -> Vec<String> {
         .map(|p| p.split_whitespace().collect::<String>())
         .filter(|p| !p.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::go_package_name;
+
+    /// Ревью задачи 14 (I3, N3): имя Go-пакета по пути импорта.
+    #[test]
+    fn go_package_name_from_path() {
+        for (path, want) in [
+            ("fmt", Some("fmt")),
+            ("net/http", Some("http")),
+            ("gopkg.in/yaml.v3", Some("yaml")),
+            ("github.com/redis/go-redis/v9", Some("redis")),
+            ("github.com/x/yaml.go", Some("yaml")),
+            ("github.com/x/redis-go", Some("redis")),
+            ("github.com/aws/aws-sdk-go", None),
+            ("github.com/x/foo-bar", None),
+        ] {
+            assert_eq!(go_package_name(path).as_deref(), want, "{path}");
+        }
+    }
 }
