@@ -12,6 +12,11 @@
 //!
 //! Диапазоны результата отсортированы, не пересекаются и лежат на границах символов UTF-8.
 //! Бюджет — не больше 2 мс на 100 КБ (release).
+//!
+//! Отдельный крейт с одной зависимостью (`regex`) — с задачи 15b M6: сканер нужен не только
+//! серверу (через `zam-markdown`, реэкспорт `zam_markdown::secrets` и прежние имена), но и
+//! клиенту `zam` без comrak (маскировка снимка сессии, задача 17a). [`scan_secrets_ext`]
+//! дополнительно сообщает число повторов скана и упор в их предел ([`ScanOutcome`]).
 
 use std::ops::Range;
 use std::sync::LazyLock;
@@ -355,7 +360,23 @@ fn url_token_masked(text: &str, r: &Range<usize>, masked_end: usize) -> String {
 
 /// Предел повторных сканов вида с масками в [`scan_secrets`]: каждый скан линеен, их число —
 /// константа. На практике хватает одного-двух (маска одного правила открывает находку другого).
-const FIXPOINT_MAX: usize = 4;
+pub const FIXPOINT_MAX: u32 = 4;
+
+/// Итог скана [`scan_secrets_ext`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanOutcome {
+    /// Находки — те же, что у [`scan_secrets`].
+    pub hits: Vec<SecretHit>,
+    /// Повторных сканов по виду с масками ([`MaskedView`]), от 0 до [`FIXPOINT_MAX`]: 0 —
+    /// находок нет или вид из одних масок; 1 — первый повтор уже ничего не нашёл (обычный
+    /// текст с секретами).
+    pub passes: u32,
+    /// Скан упёрся в [`FIXPOINT_MAX`]: все повторы давали находки, и ещё один повтор по виду
+    /// находит новые. Неподвижная точка не достигнута — [`mask_text`] на таком тексте не
+    /// идемпотентна (повторная маскировка заменит ещё что-то). Проверочный повтор в находки не
+    /// идёт: они те же, что у [`scan_secrets`].
+    pub depth_capped: bool,
+}
 
 /// Находит секреты. Результат отсортирован по началу, диапазоны не пересекаются
 /// (пересёкшиеся объединяются, вид берётся у первого), `line` считается с 1.
@@ -368,13 +389,19 @@ const FIXPOINT_MAX: usize = 4;
 /// второй проход, маскируется сразу. Находки первого прохода остаются: вид их не отменяет
 /// (энтропия по тексту видит длинного кандидата целиком, по виду — обрывки между масками).
 /// Скан останавливается, когда вид не даёт находок, — тогда `mask_text` идемпотентна; не дольше
-/// [`FIXPOINT_MAX`] повторов.
+/// [`FIXPOINT_MAX`] повторов (упор — [`scan_secrets_ext`]).
 pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
+    scan_secrets_ext(text).hits
+}
+
+/// [`scan_secrets`] с числом повторов скана и признаком упора в [`FIXPOINT_MAX`]
+/// ([`ScanOutcome`]). Упор стоит одного лишнего скана — только на таком тексте.
+pub fn scan_secrets_ext(text: &str) -> ScanOutcome {
     let mut raw = scan_rules(text);
-    for _ in 0..FIXPOINT_MAX {
-        if raw.is_empty() {
-            break;
-        }
+    let mut passes = 0u32;
+    let mut depth_capped = false;
+    // повторы `1..=FIXPOINT_MAX` дают находки; повтор `FIXPOINT_MAX + 1` — только проверка упора
+    while !raw.is_empty() {
         let view = MaskedView::new(text, &raw);
         // вид из одних масок находок не даст (ни одно правило не совпадает внутри `‹secret›`):
         // цепочка из десятков тысяч ключей не сканируется второй раз
@@ -382,6 +409,11 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
             break;
         }
         let found = scan_rules(&view.text);
+        if passes == FIXPOINT_MAX {
+            depth_capped = !found.is_empty();
+            break;
+        }
+        passes += 1;
         if found.is_empty() {
             break;
         }
@@ -394,7 +426,7 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
     let merged = merge_ranges(raw);
     // номера строк одним проходом
     let (mut line, mut pos) = (1usize, 0usize);
-    merged
+    let hits = merged
         .into_iter()
         .map(|(range, kind)| {
             line += text.as_bytes()[pos..range.start]
@@ -404,7 +436,12 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
             pos = range.start;
             SecretHit { kind, range, line }
         })
-        .collect()
+        .collect();
+    ScanOutcome {
+        hits,
+        passes,
+        depth_capped,
+    }
 }
 
 /// Все правила по `text` (один проход, без объединения).

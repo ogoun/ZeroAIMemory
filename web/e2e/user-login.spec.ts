@@ -2,6 +2,8 @@
 // при первом входе — обязательная смена; у пользователя нет разделов администратора; он
 // создаёт insight с пустым certainty (замена записи) и меняет статус без причины (человек);
 // свои токены — в «Аккаунте». Вход пользователя — один (лимит 5 в минуту на IP).
+// Лимит общий у входа и смены пароля, соседние спеки в ту же минуту его выбирают: при 429 спека
+// ждёт `Retry-After` и повторяет отправку один раз (флейк M5.6, задача 15b M6; лимит не меняется).
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
@@ -17,6 +19,28 @@ const screens = fileURLToPath(new URL('../../.tmp/e2e/screens/', import.meta.url
 const FIRST = 'e2e-first-pass-1';
 const MINE = 'e2e-my-own-pass-2';
 
+/** Пути под общим лимитом входа: 429 на них — повод для одного повтора ({@link submitRetry429}). */
+const LIMITED = ['/api/v1/auth/login', '/api/v1/auth/password'];
+
+/**
+ * Отправка формы `submit` с ответом POST на `path`: при 429 — ждать `Retry-After` (секунды) и
+ * отправить ещё раз, один; повтор 429 — ошибка. Лимит входа сервера не трогается.
+ */
+async function submitRetry429(page: Page, path: string, submit: () => Promise<void>): Promise<void> {
+  const answer = () =>
+    page.waitForResponse((r) => r.request().method() === 'POST' && new URL(r.url()).pathname.endsWith(path));
+  const first = answer();
+  await submit();
+  const r = await first;
+  if (r.status() !== 429) return;
+  const wait = Number(r.headers()['retry-after'] ?? '60');
+  expect(wait, 'Retry-After').toBeGreaterThan(0);
+  await page.waitForTimeout(wait * 1000 + 500);
+  const again = answer();
+  await submit();
+  expect((await again).status(), `${path}: 429 и после Retry-After`).not.toBe(429);
+}
+
 function watch(page: Page): string[] {
   const problems: string[] = [];
   page.on('console', (m) => {
@@ -27,6 +51,8 @@ function watch(page: Page): string[] {
     const path = new URL(r.url()).pathname;
     const expected =
       (r.status() === 401 && path.endsWith('/api/v1/auth/me')) ||
+      // 429 входа повторяет submitRetry429 (повтор с 429 — ошибка там)
+      (r.status() === 429 && LIMITED.some((p) => path.endsWith(p))) ||
       (r.status() === 404 && path.endsWith('/favicon.ico'));
     if (r.status() >= 400 && !expected) problems.push(`HTTP ${r.status()} ${r.request().method()} ${path}`);
   });
@@ -46,6 +72,8 @@ async function adminApi(rc: APIRequestContext) {
 }
 
 test('пользователь: вход, обязательная смена пароля, свои разделы, insight и токены', async ({ page, playwright }) => {
+  // до двух ожиданий `Retry-After` (не больше минуты каждое) сверх обычного срока
+  test.setTimeout(180_000);
   const problems = watch(page);
   const rc = await playwright.request.newContext({ storageState: ADMIN_STATE });
   const admin = await adminApi(rc);
@@ -77,7 +105,7 @@ test('пользователь: вход, обязательная смена п
   await page.goto(base());
   await page.getByLabel('Логин').fill(name.toUpperCase());
   await page.getByLabel('Пароль').fill(FIRST);
-  await page.getByRole('button', { name: 'Войти' }).click();
+  await submitRetry429(page, '/api/v1/auth/login', () => page.getByRole('button', { name: 'Войти' }).click());
 
   // обязательная смена пароля: другие разделы недоступны
   await expect(page.getByRole('heading', { name: 'Смена пароля' })).toBeVisible();
@@ -89,7 +117,7 @@ test('пользователь: вход, обязательная смена п
   await pw.getByLabel('Новый пароль', { exact: true }).fill(MINE);
   await pw.getByLabel('Повтор нового пароля').fill(MINE);
   await page.screenshot({ path: `${screens}user-forced-password.png`, fullPage: true });
-  await pw.getByRole('button', { name: 'Сменить пароль' }).click();
+  await submitRetry429(page, '/api/v1/auth/password', () => pw.getByRole('button', { name: 'Сменить пароль' }).click());
 
   // оболочка пользователя: своя память, без разделов администратора
   const tree = page.getByRole('navigation', { name: 'Дерево заметок' });

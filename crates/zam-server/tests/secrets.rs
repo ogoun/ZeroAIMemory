@@ -2,6 +2,9 @@
 //! эмбеддинги, Qdrant), исходник заметки читается без изменений, ответ записи предупреждает
 //! `secrets_detected` без значений. Без моделей (FTS).
 mod common;
+/// Шаблоны тестовых входов сканера (`zam-secrets`): вход упора в предел повторов.
+#[path = "../../zam-secrets/tests/common/mod.rs"]
+mod scan_common;
 
 use axum::http::{Method, StatusCode};
 use common::api::{Api, api};
@@ -245,4 +248,100 @@ async fn secret_in_title_and_tag_masked_in_prefix() {
         assert!(!c.context_prefix.contains(&s), "{}", c.context_prefix);
     }
     assert_eq!(count(&search(&a, &s).await), 0);
+}
+
+/// Закреплённый вход упора сканера в предел повторов (фикстура `zam-secrets`, задача 15b M6).
+fn depth_capped_text() -> String {
+    scan_common::expand(
+        include_str!("../../zam-secrets/tests/fixtures/scan_depth_capped.txt").trim_end(),
+    )
+}
+
+/// Долг M5.6 (задача 15b M6): упор сканера в `FIXPOINT_MAX` не молчит — у записи заметки и
+/// записи журнала `warnings` получает `secrets_scan_depth` (рядом с `secrets_detected`); обычный
+/// секрет этого предупреждения не даёт.
+#[tokio::test]
+async fn scan_depth_capped_warns() {
+    let a = api("secrets-depth", |_| {}).await;
+    let t = depth_capped_text();
+    let n = a
+        .note("knowledge", "ops/depth", &format!("# Глубина\n\n{t}\n"))
+        .await;
+    let w = n["warnings"].as_array().expect("warnings");
+    assert!(w.contains(&json!("secrets_detected")), "{n}");
+    assert!(w.contains(&json!("secrets_scan_depth")), "{n}");
+    let e = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(
+                json!({"kind": "insight", "title": "Глубина", "body": t, "force": true,
+                        "certainty": "hypothesis", "data": {"kind": "discovery"}}),
+            ),
+        )
+        .await;
+    assert_eq!(e.status, StatusCode::CREATED, "{}", e.text());
+    let e = e.json();
+    assert!(
+        e["warnings"]
+            .as_array()
+            .is_some_and(|w| w.contains(&json!("secrets_scan_depth"))),
+        "{e}"
+    );
+    // обычный секрет — только `secrets_detected`
+    let n = a
+        .note(
+            "knowledge",
+            "ops/plain",
+            &format!("# K\n\ntoken: {}\n", secret()),
+        )
+        .await;
+    assert_eq!(n["warnings"], json!(["secrets_detected"]), "{n}");
+}
+
+/// Упор сканера — WARN в журнал сервера без текста находок и самого текста (только счётчики).
+#[test]
+fn scan_depth_capped_logs_without_text() {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    let buf = Buf::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    let t = depth_capped_text();
+    let mut v = json!({});
+    tracing::subscriber::with_default(sub, || zam_server::api::secrets::attach(&mut v, &t));
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("WARN") && log.contains("secrets_scan_depth"),
+        "{log}"
+    );
+    assert!(log.contains("passes=4"), "{log}");
+    // ни значений находок, ни фрагментов текста
+    for frag in ["passwd", "BEGIN", "t://", &t[5..25]] {
+        assert!(!log.contains(frag), "{frag}: {log}");
+    }
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("secrets_scan_depth"))
+    );
 }

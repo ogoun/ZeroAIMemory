@@ -4,24 +4,11 @@
 //! Тестовые «секреты» собираются из частей во время выполнения: в исходниках нет строк,
 //! похожих на настоящие ключи (сканеры утечек репозитория).
 
-use proptest::prelude::*;
-use zam_markdown::{SECRET_MARK, SecretKind, mask_secrets, mask_text, scan_secrets};
+mod common;
 
-/// Псевдослучайная строка base62 заданной длины (детерминированная, с высокой энтропией).
-fn rnd(len: usize, seed: u64) -> String {
-    const A: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut x = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (0..len)
-        .map(|_| {
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            A[((x >> 33) % 62) as usize] as char
-        })
-        .collect()
-}
+use common::rnd;
+use proptest::prelude::*;
+use zam_secrets::{SECRET_MARK, SecretKind, mask_secrets, mask_text, scan_secrets};
 
 fn kinds(text: &str) -> Vec<SecretKind> {
     scan_secrets(text).into_iter().map(|h| h.kind).collect()
@@ -404,7 +391,7 @@ proptest! {
     }
 }
 
-/// Бюджет: не больше 2 мс на 100 КБ (только release). `cargo test -p zam-markdown --release
+/// Бюджет: не больше 2 мс на 100 КБ (только release). `cargo test -p zam-secrets --release
 /// --test secrets -- --ignored bench_scan_100kb --nocapture`.
 #[test]
 #[ignore]

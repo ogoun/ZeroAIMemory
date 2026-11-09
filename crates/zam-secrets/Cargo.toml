@@ -1,0 +1,17 @@
+[package]
+name = "zam-secrets"
+description = "Сканер и маскировщик секретов ZeroAIMemory (ТЗ §7.6): ключи, токены, пароли, закрытые ключи"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Лёгкий крейт без tokio и comrak: его берут `zam-markdown` (реэкспорт `zam_markdown::secrets`)
+# и клиент `zam` (маскировка снимка сессии, задача 17a M6)
+[dependencies]
+regex.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# `Id` в тесте ложных срабатываний на base32-идентификаторах
+zam-core = { path = "../zam-core" }

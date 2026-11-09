@@ -4267,6 +4267,10 @@ UTC, без прогонов на GPU): 182 цели, **2600 PASS, 3 FAIL, 34 ig
 
 ### Задача 15b. Долги M5.6, `zam-secrets`
 
+Журнал исполнителя — раздел «Задача 15b (исполнитель)» в конце журнала: крейт `zam-secrets`,
+`secrets_scan_depth`, флейк `focus_inputs_load…` (20/20), повтор e2e `user-login` после
+`Retry-After`.
+
 ### Задача 15c. Упаковка
 
 ### Задача 16. Долги M5.7
@@ -4338,6 +4342,10 @@ UTC, без прогонов на GPU): 182 цели, **2600 PASS, 3 FAIL, 34 ig
 
 ## Передать в M7
 
+- Сканер секретов (задача 15b): цепочка «пароль в URL ↔ ключ-значение» не ограничена числом
+  повторов — `mask_text` на таком тексте не идемпотентна (фикстура
+  `crates/zam-secrets/tests/fixtures/scan_depth_capped.txt`); сейчас — предупреждение
+  `secrets_scan_depth`. Варианты — в разделе «Задача 15b (исполнитель)».
 - Перенос памяти (спецификация §12б): страница бэкапа и импорт в WebUI (ТЗ §15), `zam-server doctor`,
   `zam-server rollback --to v<N>`, сборщик мусора блобов (и вместе с ним — согласованность копии
   блобов при удалении).
@@ -5980,3 +5988,127 @@ I1/I2, M1–M8 приняты; исправлены N1–N4 и Minor. Субаг
 Тесты: `zam-code --features parse` — lib 1, `extract` 31, `pack` 10, `proto` 12, `rank` 18 + 2
 ignored; `cargo fmt --check`, `clippy -p zam-code --features parse --all-targets -D warnings` —
 чисто.
+
+### Задача 15b (исполнитель). Долги M5.6: `zam-secrets`, счётчик повторов, флейк, e2e входа (2026-11-09)
+
+Коммит — `refactor(secrets): крейт zam-secrets; fix: упор сканера, флейк, e2e входа` (sha — в
+отчёте контроллеру). Логи, скрипт откатов — `.tmp/m6/task15b/`.
+
+**Крейт `zam-secrets`.**
+- `crates/zam-markdown/src/secrets.rs` → `crates/zam-secrets/src/lib.rs` (`git mv`, история
+  сохранена), правила сканера не менялись. Зависимость одна — `regex`; dev — `proptest` и
+  `zam-core` (`Id` в тесте ложных срабатываний). Член workspace — по маске `crates/*`, правка
+  корневого `Cargo.toml` не понадобилась.
+- `zam-markdown`: `pub use zam_secrets as secrets` и прежние имена (`SECRET_MARK`, `SecretHit`,
+  `SecretKind`, `mask_secrets`, `mask_text`, `scan_secrets`) плюс новые `ScanOutcome`,
+  `scan_secrets_ext`. Своих регулярных выражений у `zam-markdown` больше нет — зависимость `regex`
+  снята. Вызовы `zam_markdown::mask_text`/`scan_secrets` в `zam-store`, `zam-index`,
+  `zam-server` (и в worktree 18b2) не менялись.
+- Тесты сканера переехали с ним: `crates/zam-secrets/tests/secrets.rs` (+ `proptest-regressions`).
+  Общие данные — `crates/zam-secrets/tests/common/mod.rs` (без зависимостей): `rnd`, ключи всех
+  семейств (собраны из частей), корпус входов тестов сканера, атомы генератора, шаблоны `expand`
+  (`{rnd:L:S}`, `{key:I}`, `{mark}`, `{nl}`). Этот модуль подключают тест реэкспорта
+  `zam-markdown` и тест сервера (`#[path]`).
+- Вне брифа (обоснование): `README.md` — строка крейта в структуре репозитория;
+  `.github/workflows/edge.yml` — путь `crates/zam-secrets/**` (сборка `zam-index --features edge`
+  зависит от сканера через `zam-store` → `zam-markdown`, без пути правка сканера не запускала бы
+  недельную проверку на push).
+
+**Счётчик повторов и упор.**
+- `scan_secrets_ext(text) -> ScanOutcome { hits, passes, depth_capped }`; `scan_secrets` — обёртка
+  (`.hits`), `mask_text` — как была. `FIXPOINT_MAX` стал `pub const u32` (4).
+- `passes` — число повторных сканов по виду с масками (0 — находок нет или вид из одних масок;
+  1 — обычный текст с секретом: первый повтор ничего не нашёл).
+- `depth_capped` — **[решение исполнителя]** строже, чем «цикл исчерпан»: после `FIXPOINT_MAX`
+  повторов с находками выполняется ещё один проверочный скан вида, и упор ставится, только если он
+  тоже что-то нашёл (тогда `mask_text` на этом тексте действительно не идемпотентна). Находки
+  проверочного скана в результат не идут — поведение сканера прежнее; плата — один лишний скан и
+  только на таком тексте. Без проверки четыре повтора, последний из которых закрыл цепочку, давали бы
+  ложное предупреждение.
+- Сервер (`api/secrets.rs::attach`, им пользуются ответы записи заметок, записей журналов, идей,
+  вопросов, insight): при упоре — `warnings += "secrets_scan_depth"` (константа
+  `SECRETS_SCAN_DEPTH`) рядом с `secrets_detected` и `tracing::warn!` с полями `hits`, `passes`,
+  `text_bytes` — без находок и текста.
+- **Вход упора подобран генератором.** Случайный перебор склеек атомов (4,6 млн склеек до
+  24 атомов) до упора не дошёл: 12 входов с тремя повторами, ни одного с четырьмя. Генератор
+  `generate_depth_capped` (ignored) — эволюционный отбор (приспособленность — число повторов, упор —
+  цель; перезапуски с новым зерном) и минимизация удалением токенов. Найденный вход (29 токенов)
+  закреплён фикстурой `crates/zam-secrets/tests/fixtures/scan_depth_capped.txt` шаблоном (секретов
+  в файле нет — push protection). Механизм: ключ-значение маскирует `://` → энтропия (URL-токен
+  без `://`) → пароль в URL (в пароле больше нет `/`) → ключ-значение `pwd=` (значение `:‹secret›@…`
+  длиннее 6; в тексте `:` упиралось в `` ` ``) → пароль в URL следующего звена → … Звено
+  ``"pwd=:`@`` удлиняет цепочку на два повтора, то есть **цепочка не ограничена** — это настоящий
+  дефект идемпотентности (→ M7, ниже).
+- Тесты: `scan_depth_capped` (упор, `passes = 4`, находки = `scan_secrets`, `mask_text` не
+  идемпотентна; без последнего звена — ровно 4 повтора без упора), `ordinary_inputs_le_3_passes`
+  (корпус тестов сканера: ≤ 3 повторов, упора нет, максимум ≥ 1), `passes_counted`;
+  `zam-markdown/tests/secrets_reexport.rs::secrets_reexport_identical` (корпус, 2000 склеек атомов,
+  вход упора: `zam_markdown::secrets::mask_text` ≡ `zam_secrets::mask_text`, то же для прежних
+  имён, `scan_secrets`, `mask_secrets`, `scan_secrets_ext`); `zam-server/tests/secrets.rs`:
+  `scan_depth_capped_warns` (заметка и insight — `secrets_scan_depth`; обычный секрет — только
+  `secrets_detected`), `scan_depth_capped_logs_without_text` (WARN с `passes=4`, без `passwd`,
+  `t://`, фрагментов текста).
+
+**Флейк `focus_inputs_load_survives_timeout_single_read`.**
+- Причина (журнал M5.6): чтение входов спало 3 с (`inputs_delay_ms`), второй из двух
+  параллельных запросов под нагрузкой доходил до фокуса после этих 3 с — кэш уже заполнен, фокус
+  есть, `warnings` пусты.
+- Точки `test-hooks` в `CodeHooks`: барьер `inputs_hold` + `inputs_release` (`Notify`; ожидание
+  регистрируется до проверки флага — без гонки с `release_inputs`), счётчик `focus_timeouts`
+  (вышел срок фокуса). Чтение входов ждёт барьера после учёта в `inputs_reads`.
+- Тест: барьер поднят → два запроса параллельно → третья ветка `join!` ждёт события «у обоих вышел
+  срок фокуса» (`focus_timeouts = 2`), снимает `inputs_active`/`inputs_active_max` (оба 1 — одно
+  чтение на два запроса, идёт) и открывает барьер. Барьер открывается только после этого: рёбра
+  `format=json` берут входы тем же путём без срока (O1), и первая редакция с открытием барьера после
+  `join!` зависала — разобрано, не ждал. После ответов чтение закончено (`inputs_active = 0`),
+  следующий запрос — с фокусом из кэша, `inputs_reads = 1`. Время в тесте — только страховочные
+  сроки ожидания событий.
+- 20 прогонов подряд (`cargo test -p zam-server --test code_api … focus_inputs_load`,
+  `.tmp/m6/task15b/flake-20.log`, `flake-run-*.log`): **20 из 20 PASS, 0 падений** (тест — 1,4 с; прежняя редакция ждала 3 с задержки).
+
+**e2e `user-login`.** `submitRetry429(page, path, submit)`: ответ POST на `auth/login` или
+`auth/password`; при 429 — ждать `Retry-After` (+0,5 с) и отправить форму ещё раз, один; повтор с
+429 — ошибка спеки. 429 на этих двух путях не считаются «проблемой» в `watch` (повтор проверяется
+в помощнике). Срок теста — 180 с (до двух ожиданий по ≤ 60 с). Лимит входа не тронут.
+
+**Проверка на откате** (`.tmp/m6/task15b/rollbacks.py`, логи `rb-*.log`; после каждого отката
+файл восстановлен):
+- R1: проверочный повтор не ставит упор (`depth_capped = false`) → `scan_depth_capped` FAIL
+  («упор не обнаружен: passes = 4»);
+- R2: `passes` не отдаётся (0) → `scan_depth_capped`, `passes_counted`,
+  `ordinary_inputs_le_3_passes` FAIL;
+- R3: в `zam_markdown::secrets` своя копия `mask_text` (двойная маскировка — расходится только на
+  неидемпотентном входе) → `secrets_reexport_identical` FAIL на входе упора из корпуса;
+- R4: запись без `secrets_scan_depth` → `scan_depth_capped_warns`,
+  `scan_depth_capped_logs_without_text` FAIL;
+- R5: WARN не пишется → `scan_depth_capped_logs_without_text` FAIL;
+- R6: в WARN добавлен текст (`text = %text`) → `scan_depth_capped_logs_without_text` FAIL;
+- R7: чтение входов не ждёт барьера → `focus_inputs_load_survives_timeout_single_read` FAIL
+  (входы готовы сразу, срок фокуса не выходит — «срок фокуса не вышел» по страховочному сроку
+  60 с);
+- R8: дочитанное не ложится в кэш (O1) → тот же тест FAIL («из кэша»: второе чтение);
+- e2e (`.tmp/m6/task15b/e2e_force429.py`, логи `e2e-force.log`, `e2e-rollback.log`): перед входом
+  спека выбирает лимит (6 неверных входов через API с того же IP). С помощником — PASS за 1,1 мин
+  (ожидание `Retry-After`, повтор входа); помощник заменён прямой отправкой — FAIL (нет экрана
+  «Смена пароля» после 429). Спека после прогонов восстановлена.
+- Первые тесты шага 1 до реализации не писались строго первыми: `scan_secrets_ext` появилась
+  вместе с ними; падение тестов без правки показано откатами R1–R6.
+
+**Проверка (шаг 4).** `cargo test -p zam-secrets -p zam-markdown` — PASS (`zam-secrets`: `secrets` 20 + 1 ignored,
+`scan_depth` 3 + 1 ignored; `zam-markdown` — все наборы, `secrets_reexport` 1);
+`cargo test -p zam-server --test secrets --test code_api` — PASS (7 и 35); `cargo fmt --all --
+--check`, `cargo clippy -p zam-secrets -p zam-markdown -p zam-server --all-targets -D warnings` —
+чисто; release `zam-server`, `zam` в `target/r1-t15b`, `npm run build`, `npm run e2e --
+user-login` — 1 PASS (`e2e-plain.log`). `hook_budgets` не запускался (по заданию).
+
+**Передать.**
+- → 17a: маскировка снимка — `zam_secrets::mask_text` напрямую (крейт без comrak); упор виден
+  через `scan_secrets_ext(..).depth_capped` — снимку стоит считать его так же, как запись
+  (`secrets_scan_depth` в ответе/журнале без текста).
+- → 13a/13c: ТЗ §7.6 — `secrets_scan_depth` в `warnings` записи и WARN без текста; дерево крейтов
+  (§ структура репозитория) — `zam-secrets`; CHANGELOG — крейт и предупреждение.
+- → M7: цепочка «пароль в URL ↔ ключ-значение» (фикстура) не ограничена: скан до неподвижной точки
+  с постоянным пределом её не закрывает, `mask_text` на таком тексте не идемпотентна. Варианты:
+  повтор до неподвижной точки с пределом по длине текста (каждый повтор добавляет находку, их
+  число ≤ числа `@`/`=`), или правило ключ-значение, не зависящее от маски (значение `:…` до `@`).
+  Пока — предупреждение `secrets_scan_depth`. Связано с маскировкой L2 (M7, `secrets-mask-l2`).
