@@ -6269,3 +6269,157 @@ CI на 6168f90 и 4f88544 падал на шаге `size-limit` (джоб `web`
 `id` для `qual` вида якоря строки `L10` и подсказка) увеличил чанк `CodeView` до 8,08 КБ gzip
 при пределе 8 КБ (+77 Б). Рост оправдан функцией, предел поднят до 9 КБ (`web/.size-limit.json`).
 Урок: результат наблюдателя CI проверять сразу после каждого push, не откладывать.
+
+## Задача 17a (исполнитель)
+
+Снимок сессии §8а: адаптеры журналов Claude Code и Codex, `take` (чтение хвоста в потоке со
+сроком), маскировка и пределы. Коммит `feat(snapshot): адаптеры журналов агента и маскировка`
+(sha — в отчёте контроллеру).
+
+### Шаг 0 — живые фикстуры (ответ владельца на вопрос 2: А)
+
+- Прочитан **один** журнал Claude Code — самый свежий в `~/.claude/projects/H--Documents-GitHub-ZeroAIMemory/`
+  (185 МБ, 53 415 строк — журнал текущей сессии контроллера, версия записей 2.1.302…2.1.314, CLI 2.1.319). Читался только скриптами
+  структуры (`.tmp/m6/task17a/{structure,enums,paths}.py`): типы, ключи, перечислимые значения,
+  счётчики, шаблонные заголовки конспекта — без текста. Сам журнал не копировался.
+- **Журнала Codex нет**: каталога `~/.codex` на машине нет. Фикстура Codex — `codex-doc-session.jsonl`
+  (по документации и исходникам Codex). Критерий §17 п. 19 для Codex остаётся открытым до живого журнала.
+- Фикстуры (`crates/zam-cli/tests/fixtures/transcripts/`) построены скриптом
+  `.tmp/m6/task17a/make_fixtures.py`: из живых записей сохранены набор и порядок ключей и
+  перечислимые значения (`type`, `subtype`, `role`, `name`, `origin.kind`, `promptSource`,
+  `turnOrigin`, `userType`, `entrypoint`, `version`), все прочие строки — `"x"`, id — фиктивные
+  `00000000-…`, числа — 0, `cwd` — `@ROOT@`; ключи-идентификаторы (`wireToolInputs`) заменены.
+  Тексты запросов, команд и конспекта — нейтральные заглушки. Все строки фикстур просмотрены
+  перечнем значений — личного и рабочего текста, путей и секретов нет.
+  - `claude-2.1.314-compact.jsonl`, `-prompts.jsonl`, `-tools.jsonl` — живая структура;
+  - `claude-doc-inserts.jsonl` (субагент, картинка, чужая сессия, вывод хука), `claude-doc-summary.jsonl`
+    (запись `summary`) — живая запись человека с изменениями по документации: этих случаев в журнале нет;
+  - `codex-doc-session.jsonl`.
+
+### Сверка форматов §8а (Claude Code 2.1.314)
+
+| §8а | Живой журнал | Итог |
+|---|---|---|
+| конспект — `type:"user"`, `isCompactSummary:true` после `system/compact_boundary` | подтверждено: 26 из 26 сразу после границы; `content` — строка; есть ещё `isVisibleInTranscriptOnly:true` | так и берётся |
+| `type:"summary"` — заголовок `/resume` | записей `summary` **нет**; заголовок — `ai-title` (`aiTitle`), последний запрос — `last-prompt` | не берутся; фикстура `-doc-` |
+| названия разделов конспекта | «7. Pending Tasks:», «8. Current Work:», «9. Optional Next Step:» (23 из 26); варианты `**…**`, `**…:**`, «7. Pending Tasks (…):»; русские «Ожидающие задачи», «Текущая работа», «Следующий шаг» | все варианты в `heading` |
+| обёртка конспекта | первая строка «This session is being continued from a previous conversation…», строка «Summary:», в хвосте три строки: «If you need specific details… read the full transcript at: <путь>», «Continue the conversation…», «The messages after this summary are…» | **новое**: снимается (`unwrap_summary`), путь к журналу с именем пользователя в снимок не идёт |
+| запрос — без `isMeta`, `isSidechain`, `isCompactSummary`, `toolUseResult` | этого **мало**: 564 записи `<task-notification>` (уведомления фоновых задач) без `isMeta`; сообщения субагентов (`peer`) — с `isMeta` | **новое**: при наличии `origin.kind` берётся только `human` (`task-notification`, `peer` — нет); тег `<task-notification>` тоже вырезается |
+| вставки `<bash-…>`, `<command-…>`, `<local-command-stdout>`, `<system-reminder>` | есть, плюс `<local-command-caveat>`, `<local-command-stderr>`, «[Request interrupted by user]» (блок `text`) | все вырезаются |
+| вывод хуков (дайджест ZeroAIMemory) | приходит записями `type:"attachment"` (`hook_additional_context`, `hook_success`), не `user` | не берётся по типу; тег `<user-prompt-submit-hook>` (старые версии) вырезается |
+| `isSidechain` | в основном файле все `false`: субагенты пишут свои файлы | фильтр оставлен |
+| `sessionId` у каждой записи | да, совпадает с именем файла; есть ещё поле **`session_id`** (5 разных UUID, не равно `sessionId`) | сравнивается только `sessionId` |
+| команды — `Bash` | также `PowerShell` (139 вызовов, `input.command`) | **новое**: берётся и `PowerShell` |
+| исход — `is_error` | `tool_result.is_error` есть у Bash (true 46 / false 2300), у прочих бывает нет | `failed = is_error ?? false` для отслеживаемых команд |
+| файлы — `input.file_path` у `Edit`/`Write`/… | абсолютные пути Windows с `\`; часть — вне корня (`~/.claude/…`) | `glob_path` (регистр на Windows), вне корня — пропуск; `NotebookEdit` — ещё `notebook_path` (по документации) |
+| предфильтр `"type":"user"` | JSON без пробелов (`"type":"user"` в сырой строке) — подтверждено | так |
+| размер строк | максимум 272 КБ; через предфильтр проходит ~32 % байт (записи с `parentUuid` и `api-request-blob`) | предел 1 МиБ достаточен |
+
+Codex — сверить нечем (журнала нет); всё по §8а и исходникам, помечено «проверить на живом журнале» → 17d/13b.
+
+### Реализация
+
+- `crates/zam-cli/src/cmd/hook/snapshot/{mod.rs,claude.rs,codex.rs}`; тесты
+  `crates/zam-cli/tests/snapshot.rs` подключают модуль исходником (`#[path]`): у `zam` нет
+  библиотечной цели, модуль снимка зависит только от внешних крейтов.
+- `zam_core::toolpath` (новый модуль): `glob_path` и `patch_files` перенесены из
+  `hook/pre_tool.rs` без изменений (с тестами) — общие для хуков и адаптеров; `pre_tool`
+  реэкспортирует их (вызовы `post_tool`, `refs` не менялись).
+- `zam-cli` → зависимость `zam-secrets`.
+- `take` — поток `zam-snapshot`, `sync_channel(1)`, `recv_timeout(deadline)`; поток сам
+  останавливается на 4/5 срока (между блоками и каждые 256 строк) и отдаёт собранное `partial`.
+- `mask_and_limit` — `scan_secrets_ext` + `mask_secrets` (= `mask_text`, плюс `depth_capped` →
+  `Snapshot::scan_depth_capped`), затем `mask_flags`; пределы и порядок — §8а.
+
+### Отступления (с причиной)
+
+1. **`take(path, &TakeOpts)`** вместо позиционных параметров: в срок §8а входит маскировка,
+   поэтому `take` вызывает `mask_and_limit` в потоке и знает `max_bytes`; повод (`trigger`) тоже
+   задаётся здесь. Поля: `root, agent, session, trigger, tail_kb, deadline, max_bytes`.
+2. **Предфильтр — свой у формата** (`AgentKind::prefilter()`, `claude::PREFILTER` [4],
+   `codex::PREFILTER` [6]) вместо общего `[&str; 7]`: у Codex вызовы инструментов —
+   `function_call`/`custom_tool_call`/`local_shell_call`, общий список их отбрасывал бы (команд и
+   файлов Codex не было бы).
+3. **Трейт** `TranscriptAdapter` получил `skipped()` и `session_hint()` (битые строки и id
+   сессии — сведения адаптера).
+4. **`Snapshot`**: `Serialize` (размер для предела меряется сериализацией всего снимка;
+   `session_hint`, `scan_depth_capped` не сериализуются), поле `scan_depth_capped`.
+5. **Флаги командной строки** (`mask_flags`): сканер `zam_secrets` не знает `-pXXX`,
+   `--password X`, `curl -u u:p`, `Bearer X` (бриф требует их маскировать). Правила — в клиенте,
+   по всем текстовым полям снимка; `-pXXX` — только если в тексте есть mysql/mariadb/sshpass
+   (иначе `cargo -pdemo`). В `zam-secrets` не внесены: это подняло бы `RULES_VERSION` и
+   перепроверку всех баз (15b) и дало бы ложные срабатывания на прозе. → M7/13c.
+6. **Пятый шаг сокращения** — файлы (с самых старых): если после команд, запросов и конспекта
+   запись всё ещё больше предела (20 длинных путей), иначе предел недостижим.
+7. **Запас `ENVELOPE_RESERVE` = 256 байт** под поля тела `PUT` сверх снимка (время, id).
+8. **`partial`** — опоздание потока, `skipped > 0` или сокращение второго шага. Окно
+   `tail_kb` само по себе — не `partial` (оно по замыслу).
+9. **Без известной сессии** (Claude) берётся последняя сессия файла: смена `sessionId`
+   сбрасывает собранное.
+10. **Запрос** обрезается с конца (500 символов — начало запроса); конспект — хвост.
+11. **Пути и команды**: маска по всему полю, **затем** первая строка и обрезка — секрет в
+    многострочной команде не попадает частично; обрезка не режет метку `‹secret›`.
+
+### Откаты
+
+Скрипт `.tmp/m6/task17a/rollbacks.py` (журнал `rollbacks.log`): правка убирается, набор
+`snapshot` прогоняется, файл восстанавливается. Все 17 — FAIL ожидаемым тестом:
+R1 `origin.kind` → `claude_whitelist_drops_inserts` (для этого в тест добавлено уведомление
+фоновой задачи **без тега**: на живых записях тег `<task-notification>` вырезался бы и без
+`origin.kind` — тест усилен); R2 граница сжатия, R3 обёртка конспекта → `claude_compact_after_boundary`;
+R4 вставки, R5 `isSidechain`, R6 чужая сессия → `claude_whitelist_drops_inserts` (R4 — ещё
+`claude_unknown_session_takes_last`); R7 исход `is_error` → `claude_commands_and_files`; R8 теги
+Codex → `codex_ignores_user_instructions_and_encrypted`; R9 исход Codex →
+`codex_compacted_and_user_message`; R10 предел 1 МиБ → `huge_line_skipped`; R11 предфильтр →
+`prefilter_skips_unrelated_lines` (+3 соседних); R12 первая обрезанная строка →
+`tail_window_drops_cut_line`; R13 `mask_flags` → `secrets_masked_in_prompts_and_flags`; R14 обрезка
+до маски → `command_first_line_after_mask` (тест усилен: ключ на границе 200 символов — на прежнем
+тесте откат не падал бы); R15 ключевые разделы → `summary_keeps_tail_sections`; R16 порядок
+(запросы раньше команд) → `limit_order_commands_prompts_summary`; R17 пути вне корня →
+`path_outside_root_dropped`, `claude_commands_and_files`.
+
+Не проверено откатом: жёсткий срок `recv_timeout` (поток и так успевает за 5 мс на 10 МБ — тест
+`take_deadline_returns_in_time` проверяет только, что вызов возвращается вовремя). Задержка
+потока — точка подмены 17b (`snapshot_deadline_never_delays_stop`).
+
+TDD: тесты написаны до модуля, но первый прогон был уже с реализацией; падение каждой защиты без
+правки показано откатами.
+
+### Проверка
+
+- `cargo test -p zam-cli --test snapshot` — 19 PASS; `cargo fmt --all -- --check`, `cargo clippy
+  -p zam-core -p zam-cli --all-targets -D warnings` — чисто.
+- `cargo test -p zam-core -p zam-cli --no-fail-fast -- --skip hook_budgets` (`full.log`): zam-core
+  22 PASS (в том числе перенесённые `patch_headers`, `glob_paths_relative_to_root`), unit `zam` 162
+  PASS, все наборы PASS, кроме: `read_locator`, `search_attachments` (нет собранного `zam-server`, как
+  в задаче 6b; после `cargo build -p zam-server --bin zam-server` — PASS); временны́е
+  `hooks::{post_tool_failure_error_regex_hint, subagent_start_uses_matching_spawn, pre_tool_under_50ms,
+  session_start_spawns_background_sync_once_per_interval}`, `m57_acceptance::acceptance_recall_p95_with_50_ideas`.
+  Повтор поодиночке (`rerun.log`): PASS все, кроме `pre_tool_under_50ms` (p95 275 мс при min 12 мс)
+  и `session_start_spawns_background_sync…` (выбросы 35–280 мс при медиане 6 мс). Машина **не в тихом
+  окне**: с 04:13 идут восемь чужих процессов `python` с большой загрузкой ЦП (не мои, не трогал).
+  Код хуков задачей не меняется: модуль снимка ещё не вызывается, `glob_path`/`patch_files`
+  перенесены без изменений; release-бинарник больше на 512 байт.
+- **p95 `zam --version`, пара** (`version_pair.py`, `version_pair.json`; бинарники release HEAD
+  `4f88544` и задачи, поочерёдно, 6 раундов × 50): медиана p95 — 8,52 мс до и 8,93 мс после,
+  отношение **1,048** (≤ 1,10 — критерий выполнен).
+- `cargo xtask code-bench` (`code-bench.log`, отчёт `.tmp/m56/bench/report.json`): `zam --version`
+  p95 10,34 мс (≤ 20). Итог — ошибка по целям хуков под нагрузкой: `post-tool` с картой p95 59,4 мс
+  (> 50, p50 9,8), `subagent-start` «### Код» 19/20, запуск фоновой синхронизации p95 152 мс (p50
+  5,8). Это те же выбросы нагрузки; полный `code-bench` парой не повторялся (тихого окна нет) —
+  → контроллеру/13b: повторить в тихое окно. `hook_budgets` не запускался (по заданию).
+
+### Передать
+
+- → 17b: `take(path, &TakeOpts)` уже маскирует и ограничивает; тело `PUT` — из `Snapshot`
+  (`trigger, agent, status, skipped, data`) + не больше 256 байт добавочных полей. `scan_depth_capped`
+  — предупреждение `secrets_scan_depth` в `hooks.log` без текста. `#[allow(dead_code)]` у
+  `pub mod snapshot` в `hook/mod.rs` снять, когда появятся вызовы. `session_hint` — источник id
+  для `zam session snapshot` без `--session`. `AgentKind::parse` — для `--format`.
+- → 17b/17d: Codex — проверить на живом журнале (`transcript_path` в хуках, имена инструментов
+  `shell`/`exec_command`, вид `function_call_output`), добавить фикстуру `codex-<версия>-…`.
+- → 17c: сервер повторяет `scan_secrets`, правил флагов (`mask_flags`) у него нет — повторная
+  проверка их не найдёт, это ожидаемо (клиент уже маскировал).
+- → 13a/13c: ТЗ §8а — свести «Сверку форматов» (нет `summary`, обёртка конспекта, `origin.kind`,
+  `PowerShell`, `session_id` ≠ `sessionId`, Codex-предфильтр); `guide` — правила флагов.
+- → M7: правила флагов перенести в `zam-secrets` вместе с маскировкой L2 (`secrets-mask-l2`).

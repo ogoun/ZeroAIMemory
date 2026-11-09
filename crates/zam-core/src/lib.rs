@@ -8,6 +8,7 @@ pub mod target;
 pub mod text;
 pub mod time;
 pub mod token;
+pub mod toolpath;
 
 pub use id::{Id, ParseIdError};
 pub use solution::SolutionGuid;

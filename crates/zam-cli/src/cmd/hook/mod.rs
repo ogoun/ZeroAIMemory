@@ -43,6 +43,9 @@ pub mod pre_tool;
 pub mod procs;
 pub mod prompt;
 pub mod session_start;
+// снимок сессии §8а (задача 17a); хуки, очередь и `zam session snapshot` — задача 17b
+#[allow(dead_code)]
+pub mod snapshot;
 pub mod subagent_start;
 
 use std::io::Write;

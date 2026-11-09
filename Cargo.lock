@@ -6965,6 +6965,7 @@ dependencies = [
  "zam-code",
  "zam-core",
  "zam-markdown",
+ "zam-secrets",
  "zam-server",
  "zam-store",
 ]
