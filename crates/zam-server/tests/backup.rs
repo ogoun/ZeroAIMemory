@@ -249,6 +249,12 @@ async fn backup_while_writing_invariants() {
 /// Параллельная запись во время копии не получает `SQLITE_BUSY` (каждая запись проходит, и
 /// быстрее `busy_timeout` писателя); рост `-wal` ≤ записанного × 1,5 + 4 МиБ; после снятия
 /// признака WAL снова начинается сначала (кадров не больше `wal_restart_bytes`).
+///
+/// WAL начинает сначала не сам `RESTART`, а следующая транзакция, которая **пишет кадры**
+/// (`walRestartLog` в `sqlite3WalFrames`). Поэтому каждая запись хвоста меняет данные: запись
+/// того же значения не меняет ни одной страницы (SQLite не пишет неизменённую ячейку,
+/// коммит без грязных страниц не пишет кадров), и WAL выше порога не перезапустился бы
+/// никогда — так тест падал на Linux CI.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_writer_no_busy_and_wal_bound() {
     let _g = CHUNKER.read().await;
@@ -320,10 +326,56 @@ async fn backup_writer_no_busy_and_wal_bound() {
     );
     // признак снят: фоновый поток снова делает RESTART, WAL начинается сначала
     assert!(!zam_store::backup_flag_path(&a.st.cfg.data_dir).exists());
+    // WAL заведомо выше порога `wal_restart_bytes` (2048 кадров): без этого проверка ниже
+    // проходила вхолостую, если за время копии накопилось мало кадров (так на Windows). Снимок
+    // чтения `hold` не даёт перенести кадры пачки, и WAL не начнётся сначала посреди неё
+    let wal_frames = |p: &Path| -> (i64, i64, i64) {
+        rusqlite::Connection::open(p)
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+    };
+    let hold = rusqlite::Connection::open(db.path()).unwrap();
+    hold.execute_batch("BEGIN").unwrap();
+    let _: i64 = hold
+        .query_row("SELECT count(*) FROM meta", [], |r| r.get(0))
+        .unwrap();
+    for i in 0..250 {
+        let v = fill.clone();
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("t18a-burst-{i}"), v],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    // (1, -1, -1) — блокировку на миг держит фоновый RESTART с переносом остатка: повтор
+    let mut burst = wal_frames(db.path());
+    for _ in 0..100 {
+        if burst.0 == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        burst = wal_frames(db.path());
+    }
+    assert!(
+        burst.1 * 4096 > 8 * 1024 * 1024,
+        "пачка не подняла WAL выше порога: {burst:?}"
+    );
+    hold.execute_batch("COMMIT").unwrap();
+    drop(hold);
     let restarts0 = db.restart_count();
     let t = Instant::now();
+    let mut n = 0u64;
     loop {
-        let v = "z".repeat(4096);
+        // каждое значение новое: запись пишет кадры (см. doc-комментарий теста)
+        let v = format!("{n:08}{}", "z".repeat(4088));
+        n += 1;
         db.write(move |tx| {
             tx.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('t18a-tail', ?1)",
