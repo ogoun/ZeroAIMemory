@@ -50,6 +50,17 @@ pub const COMMANDS_MAX: usize = 10;
 pub const COMMAND_CHARS: usize = 200;
 /// Предел конспекта, байт UTF-8.
 pub const SUMMARY_BYTES: usize = 8 * 1024;
+/// Запас окна маскировки сверх сохраняемой части поля, символов: секрет, начатый в сохраняемой
+/// части, сканер видит целым (закрытый ключ PEM — до ~3,3 тыс. символов). Скан ограничен окном,
+/// а не всем полем (запрос в мегабайт на слабом стенде не съедает срок).
+pub const MASK_MARGIN: usize = 4096;
+/// Окно конспекта до маскировки, байт: хвост — ключевые разделы Claude в конце.
+pub const SUMMARY_WINDOW: usize = 4 * SUMMARY_BYTES;
+/// Первая строка журнала (Codex `session_meta`), если она вне окна хвоста: одно чтение с нуля.
+pub const HEAD_LINE_MAX: usize = 64 * 1024;
+/// Начало и конец длинной строки для предфильтра, байт: в пропуски идут только строки
+/// своего формата (огромный вывод инструмента — не повод для `partial`).
+pub const PREFIX_PROBE: usize = 4096;
 /// Запас под поля тела `PUT` сверх сериализованного [`Snapshot`] (время, id сессии): тело
 /// запроса не больше `max_bytes`, если в нём не больше этого запаса добавочных байт.
 pub const ENVELOPE_RESERVE: usize = 256;
@@ -84,6 +95,12 @@ impl AgentKind {
             AgentKind::Claude => &claude::PREFILTER,
             AgentKind::Codex => &codex::PREFILTER,
         }
+    }
+
+    /// Нужна ли первая строка файла вне окна: у Codex там `session_meta` (id и `cwd` сессии);
+    /// у Claude первая строка — обычная старая запись, вне окна она не берётся.
+    fn reads_head(self) -> bool {
+        matches!(self, AgentKind::Codex)
     }
 
     fn adapter(self, root: &Path, session: &str) -> Box<dyn TranscriptAdapter> {
@@ -140,6 +157,10 @@ pub struct TakeOpts {
 /// Снимок журнала `path` в отдельном потоке со сроком `opts.deadline`: чтение хвоста,
 /// предфильтр, разбор, маскировка и пределы. `None` — файла нет, это не файл, ошибка чтения
 /// или поток не успел (он брошен и ничего не пишет).
+///
+/// **Только для короткоживущих процессов** (хук `zam hook …`, `zam session snapshot`): брошенный
+/// по сроку поток доживает до конца своей работы и всё это время держит файл журнала открытым.
+/// Из долгоживущих процессов (`zam mcp`) не вызывать.
 pub fn take(path: &Path, opts: &TakeOpts) -> Option<Snapshot> {
     let start = Instant::now();
     let (tx, rx) = mpsc::sync_channel(1);
@@ -148,35 +169,70 @@ pub fn take(path: &Path, opts: &TakeOpts) -> Option<Snapshot> {
     std::thread::Builder::new()
         .name("zam-snapshot".into())
         .spawn(move || {
+            test_stall(&path);
             let _ = tx.send(build(&path, &o, start));
         })
         .ok()?;
     rx.recv_timeout(opts.deadline).ok().flatten()
 }
 
+/// Точка подмены для тестов срока: файл `<журнал>.stall-ms` с числом миллисекунд — поток
+/// засыпает до сборки. Только отладочная сборка и фича `test-hooks` (как
+/// `ZAM_TEST_BINDING_STALL_MS`); у каждого теста свой журнал — соседние тесты не задеты.
+fn test_stall(path: &Path) {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::fs::read_to_string(format!("{}.stall-ms", path.display()))
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+    #[cfg(not(any(feature = "test-hooks", debug_assertions)))]
+    let _ = path;
+}
+
 /// Тело потока [`take`]: мягкий срок — 4/5 жёсткого, после него собранное отдаётся `partial`.
 fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
     let soft = start + o.deadline * 4 / 5;
-    let (buf, mut late) = read_tail(path, o.tail_kb as usize * 1024, soft)?;
+    let tail = read_tail(path, o.tail_kb as usize * 1024, soft, o.agent.reads_head())?;
+    let mut late = tail.late;
     let mut adapter = o.agent.adapter(&o.root, &o.session);
     let filters = o.agent.prefilter();
+    let passes = |s: &str| filters.iter().any(|f| s.contains(f));
     let mut skipped = 0u32;
-    for (i, raw) in buf.split(|&b| b == b'\n').enumerate() {
-        if i % 256 == 255 && Instant::now() >= soft {
+    // первая строка файла (`session_meta` Codex) вне окна — до хвоста, если она своего формата
+    if let Some(head) = tail.head.as_deref()
+        && passes(head)
+    {
+        adapter.accept_line(head);
+    }
+    let mut lines = tail.buf.split(|&b| b == b'\n').peekable();
+    let mut i = 0usize;
+    while let Some(raw) = lines.next() {
+        i += 1;
+        if i.is_multiple_of(256) && Instant::now() >= soft {
             late = true;
             break;
         }
+        // последняя строка без `\n` — агент её ещё пишет
+        let unterminated = lines.peek().is_none() && !raw.is_empty();
         if raw.len() > LINE_MAX {
-            skipped += 1;
+            // признак может стоять в начале записи (Claude: `type` до `message`) или в конце
+            let head = String::from_utf8_lossy(&raw[..PREFIX_PROBE]);
+            let end = String::from_utf8_lossy(&raw[raw.len() - PREFIX_PROBE..]);
+            skipped += u32::from(passes(&head) || passes(&end));
             continue;
         }
         let Ok(line) = std::str::from_utf8(raw) else {
-            skipped += 1;
+            skipped += u32::from(passes(&String::from_utf8_lossy(raw)));
             continue;
         };
         let line = line.trim_end_matches('\r');
-        if filters.iter().any(|f| line.contains(f)) {
+        if passes(line) {
             adapter.accept_line(line);
+        } else if unterminated && serde_json::from_str::<serde::de::IgnoredAny>(line).is_err() {
+            // недописанная строка могла потерять признак предфильтра — пропуск, снимок неполный
+            skipped += 1;
         }
     }
     let skipped = skipped + adapter.skipped();
@@ -197,9 +253,20 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
     Some(mask_and_limit(snap, o.max_bytes))
 }
 
+/// Прочитанное [`read_tail`].
+struct Tail {
+    /// Хвост с начала целой строки.
+    buf: Vec<u8>,
+    /// Первая строка файла (не больше [`HEAD_LINE_MAX`]), если окно её не захватило.
+    head: Option<String>,
+    /// Срок вышел во время чтения.
+    late: bool,
+}
+
 /// Хвост файла не больше `max` байт, начиная с целой строки; чтение с конца блоками по
 /// [`BLOCK`]. Срок `soft` вышел — отдаётся уже прочитанное (новейшее) и признак опоздания.
-fn read_tail(path: &Path, max: usize, soft: Instant) -> Option<(Vec<u8>, bool)> {
+/// Окно не с начала файла — первая строка читается отдельно, одним коротким чтением с нуля.
+fn read_tail(path: &Path, max: usize, soft: Instant, want_head: bool) -> Option<Tail> {
     let mut f = File::open(path).ok()?;
     let meta = f.metadata().ok()?;
     if !meta.is_file() {
@@ -222,11 +289,12 @@ fn read_tail(path: &Path, max: usize, soft: Instant) -> Option<(Vec<u8>, bool)> 
         f.read_exact(&mut b).ok()?;
         blocks.push(b);
     }
-    let mut buf = Vec::with_capacity(blocks.iter().map(Vec::len).sum());
+    let mut buf: Vec<u8> = Vec::with_capacity(blocks.iter().map(Vec::len).sum());
     for b in blocks.iter().rev() {
         buf.extend_from_slice(b);
     }
     // начало окна не на границе строки — первая (обрезанная) строка отбрасывается
+    let mut head = None;
     if pos > 0 {
         match buf.iter().position(|&b| b == b'\n') {
             Some(i) => {
@@ -234,8 +302,25 @@ fn read_tail(path: &Path, max: usize, soft: Instant) -> Option<(Vec<u8>, bool)> 
             }
             None => buf.clear(),
         }
+        if want_head && !late {
+            head = read_head(&mut f, pos);
+        }
     }
-    Some((buf, late))
+    Some(Tail { buf, head, late })
+}
+
+/// Первая строка файла, если она целиком в первых [`HEAD_LINE_MAX`] байтах и кончается до
+/// `limit` (начала окна хвоста — иначе она уже в окне или обрезана им).
+fn read_head(f: &mut File, limit: u64) -> Option<String> {
+    let n = (HEAD_LINE_MAX as u64).min(limit) as usize;
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let mut b = vec![0u8; n];
+    f.read_exact(&mut b).ok()?;
+    let end = b.iter().position(|&c| c == b'\n')?;
+    b.truncate(end);
+    String::from_utf8(b)
+        .ok()
+        .map(|s| s.trim_end_matches('\r').to_string())
 }
 
 /// Маскировка и пределы §8а. Каждое текстовое поле: `zam_secrets` (как `mask_text`) и
@@ -249,19 +334,23 @@ pub fn mask_and_limit(mut s: Snapshot, max_bytes: usize) -> Snapshot {
     let mut mask = |t: &str| -> String {
         let o = zam_secrets::scan_secrets_ext(t);
         capped |= o.depth_capped;
-        let masked = if o.hits.is_empty() {
+        if o.hits.is_empty() {
             t.to_string()
         } else {
             zam_secrets::mask_secrets(t, &o.hits)
-        };
-        mask_flags(&masked)
+        }
     };
     let d = &mut s.data;
     keep_last(&mut d.prompts, PROMPTS_MAX);
     d.prompts = d
         .prompts
         .iter()
-        .map(|p| trunc_chars(&mask(p), PROMPT_CHARS))
+        .map(|p| {
+            trunc_chars(
+                &mask(head_chars(p, PROMPT_CHARS + MASK_MARGIN)),
+                PROMPT_CHARS,
+            )
+        })
         .collect();
     let mut files: Vec<String> = Vec::new();
     for f in d.files.drain(..) {
@@ -269,20 +358,30 @@ pub fn mask_and_limit(mut s: Snapshot, max_bytes: usize) -> Snapshot {
         files.push(f);
     }
     keep_last(&mut files, FILES_MAX);
-    d.files = files.iter().map(|f| mask(f)).collect();
+    d.files = files
+        .iter()
+        .map(|f| mask(head_chars(f, PROMPT_CHARS + MASK_MARGIN)))
+        .collect();
     keep_last(&mut d.commands, COMMANDS_MAX);
     d.commands = d
         .commands
         .iter()
         .map(|c| SnapCommand {
-            cmd: trunc_chars(first_line(&mask(&c.cmd)), COMMAND_CHARS),
+            // флаги командной строки — только у команд: в прозе «basic»/«-u» не пароль
+            cmd: trunc_chars(
+                &mask_flags(first_line(&mask(head_chars(
+                    first_line(&c.cmd),
+                    COMMAND_CHARS + MASK_MARGIN,
+                )))),
+                COMMAND_CHARS,
+            ),
             failed: c.failed,
         })
         .collect();
     d.compact_summary = d
         .compact_summary
         .as_deref()
-        .map(|t| summary_tail(&mask(t), SUMMARY_BYTES))
+        .map(|t| summary_tail(&mask(tail_bytes(t, SUMMARY_WINDOW)), SUMMARY_BYTES))
         .filter(|t| !t.is_empty());
     s.scan_depth_capped = capped;
 
@@ -333,6 +432,11 @@ fn first_line(s: &str) -> &str {
         .unwrap_or("")
 }
 
+/// Первые не больше `n` символов (срез по границе символа, без копии).
+fn head_chars(s: &str, n: usize) -> &str {
+    s.char_indices().nth(n).map_or(s, |(i, _)| &s[..i])
+}
+
 /// Не больше `n` символов: длиннее — `n - 1` символ и `…`. Срез не режет метку секрета.
 fn trunc_chars(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -361,6 +465,13 @@ fn tail_bytes(s: &str, n: usize) -> &str {
     while !s.is_char_boundary(i) {
         i += 1;
     }
+    // срез внутри метки `‹secret›` — начало после метки (как `trunc_chars`, но с хвоста)
+    if let Some((j, m)) = s
+        .match_indices(zam_secrets::SECRET_MARK)
+        .find(|(j, m)| *j < i && i < j + m.len())
+    {
+        i = j + m.len();
+    }
     let rest = &s[i..];
     match rest.find('\n') {
         Some(j) if j < 256 => &rest[j + 1..],
@@ -378,7 +489,27 @@ const KEY_SECTIONS: [&[&str]; 3] = [
     &["pending tasks", "ожидающие задачи"],
 ];
 
+/// Прочие разделы шаблона конспекта Claude (живой журнал 2.1.314, английские и русские).
+const OTHER_SECTIONS: [&str; 13] = [
+    "summary",
+    "primary request and intent",
+    "key technical concepts",
+    "files and code sections",
+    "errors and fixes",
+    "problem solving",
+    "all user messages",
+    "основной запрос и намерение",
+    "ключевые технические решения",
+    "файлы и разделы",
+    "ошибки и их исправление",
+    "решённые задачи",
+    "все сообщения пользователя",
+];
+
 /// Заголовок раздела: строка с начала (`#…`, `N.` или `**…**`) и имя до `:`/`(`/`**`.
+/// Заголовок — Markdown `#…`, известное имя ([`KEY_SECTIONS`], [`OTHER_SECTIONS`]) или
+/// нумерованная строка с двоеточием в конце (`N. Имя:`, `N. **Имя:**`). Пункт списка без отступа
+/// («1. сделать X») раздел не обрывает.
 /// `Some(Some(k))` — ключевой раздел `k` из [`KEY_SECTIONS`], `Some(None)` — прочий.
 fn heading(line: &str) -> Option<Option<usize>> {
     let l = line.trim_end();
@@ -402,11 +533,12 @@ fn heading(line: &str) -> Option<Option<usize>> {
     if name.is_empty() || name.chars().count() > 60 {
         return None;
     }
-    Some(
-        KEY_SECTIONS
-            .iter()
-            .position(|names| names.contains(&name.as_str())),
-    )
+    let key = KEY_SECTIONS
+        .iter()
+        .position(|names| names.contains(&name.as_str()));
+    let known = key.is_some() || OTHER_SECTIONS.contains(&name.as_str());
+    let colon = l.trim_end_matches('*').ends_with(':');
+    (known || hashed || (numbered && colon)).then_some(key)
 }
 
 /// Конспект не больше `max` байт: хвост, а не начало (§8а). Ключевые разделы берутся целиком
@@ -479,9 +611,14 @@ pub fn summary_tail(text: &str, max: usize) -> String {
     tail_bytes(out, max).to_string()
 }
 
-/// Флаги командной строки с паролем или токеном, которых не знает сканер `zam_secrets`:
-/// `-pXXX` у mysql-подобных команд и `sshpass`, `--password X`/`--password=X` (и `--token`,
-/// `--api-key`, `--secret`, …), `curl -u user:pass`/`--user user:pass`, `Bearer X`/`Basic X`.
+/// Флаги командной строки с паролем или токеном, которых не знает сканер `zam_secrets`
+/// (только поле команд — в прозе «basic»/«bearer» и `-u` не пароль):
+/// - `-pXXX`/`-p'a b'` у mysql-подобных команд и `sshpass`;
+/// - `--password X`/`--password=X` (и `--passphrase`, `--secret-key`, `--client-secret`, `--token`,
+///   `--api-key`, `--secret`, …);
+/// - `-u user:pass`/`--user user:pass` у curl, wget и подобных (числовые `uid:gid` — нет);
+/// - значение заголовка `Authorization:` (`Bearer X`, `Basic X`, `Token X`) и `X-Api-Key:`.
+///
 /// Значение заменяется меткой `‹secret›`; ссылки на переменные (`$X`, `%X%`) и заглушки (`<…>`)
 /// остаются.
 pub fn mask_flags(text: &str) -> String {
@@ -490,28 +627,49 @@ pub fn mask_flags(text: &str) -> String {
         [
             // --password X, --password=X, --token "a b"
             Regex::new(
-                r#"(?i)(?:^|[\s'"])--(?:password|passwd|pass|pwd|token|api-key|apikey|api-token|secret|client-secret|access-token|auth-token|http-password|proxy-password)(?:=|\s+)("[^"]*"|'[^']*'|[^\s"']+)"#,
+                r#"(?i)(?:^|[\s'"])--(?:password|passwd|pass|pwd|passphrase|token|api-key|apikey|api-token|secret|secret-key|client-secret|access-token|auth-token|http-password|proxy-password)(?:=|\s+)("[^"]*"|'[^']*'|[^\s"']+)"#,
             )
             .expect("regex"),
             // curl -u user:pass, --user user:pass, -uuser:pass
-            Regex::new(r#"(?:^|\s)(?:-u\s*|--user(?:=|\s+))["']?[^\s:"']+:([^\s"'@]+)"#)
+            Regex::new(r#"(?:^|\s)(?:-u\s*|--user(?:=|\s+))["']?([^\s:"']+):([^\s"'@]+)"#)
                 .expect("regex"),
-            // Bearer X, Basic X
-            Regex::new(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})").expect("regex"),
-            // -pXXX (значение слитно с флагом)
+            // Authorization: Bearer X | Basic X | Token X | X; X-Api-Key: X
+            Regex::new(
+                r#"(?i)(?:authorization\s*:\s*(?:(?:bearer|basic|token|digest)\s+)?|x-api-key\s*:\s*)([A-Za-z0-9._~+/=-]{6,})"#,
+            )
+            .expect("regex"),
+            // -pXXX, -p'a b' (значение слитно с флагом)
             Regex::new(r#"(?:^|\s)-p("[^"]*"|'[^']*'|[^\s"']+)"#).expect("regex"),
         ]
     });
-    static MYSQL: OnceLock<Regex> = OnceLock::new();
-    let mysql = MYSQL
-        .get_or_init(|| Regex::new(r"(?i)\b(?:mysql\w*|mariadb\w*|sshpass)\b").expect("regex"));
+    static GATES: OnceLock<[Regex; 2]> = OnceLock::new();
+    let [mysql, curl] = GATES.get_or_init(|| {
+        [
+            Regex::new(r"(?i)\b(?:mysql\w*|mariadb\w*|sshpass)\b").expect("regex"),
+            Regex::new(r"(?i)\b(?:curl|wget|wget2|http|https|httpie|xh|lftp|aria2c)\b")
+                .expect("regex"),
+        ]
+    });
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (i, r) in re.iter().enumerate() {
-        if i == 3 && !mysql.is_match(text) {
+        if (i == 3 && !mysql.is_match(text)) || (i == 1 && !curl.is_match(text)) {
             continue;
         }
         for c in r.captures_iter(text) {
-            let Some(m) = c.get(1) else { continue };
+            // `-u user:pass` — значение во второй группе; числовые `uid:gid` — не пароль
+            let m = if i == 1 {
+                let (Some(u), Some(p)) = (c.get(1), c.get(2)) else {
+                    continue;
+                };
+                let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+                if digits(u.as_str()) && digits(p.as_str()) {
+                    continue;
+                }
+                p
+            } else {
+                let Some(m) = c.get(1) else { continue };
+                m
+            };
             let v = m.as_str();
             let (mut b, mut e) = (m.start(), m.end());
             if (v.starts_with('"') || v.starts_with('\'')) && v.len() >= 2 {
@@ -546,7 +704,9 @@ pub fn mask_flags(text: &str) -> String {
     out
 }
 
-/// Текст без вставок `<тег>…</тег>` (незакрытая — до конца текста); пробелы по краям сняты.
+/// Текст без вставок `<тег>…</тег>`; пробелы по краям сняты. Незакрытая вставка (`<тег>` без
+/// `</тег>`) вырезается до конца текста: это вывод, обрезанный клиентом или самим журналом, и
+/// слова человека после него не идут (лучше потерять хвост запроса, чем взять вывод команды).
 pub(crate) fn strip_tags(text: &str, tags: &[&str]) -> String {
     let mut s = text.to_string();
     loop {

@@ -13,6 +13,9 @@
 //! - файлы — пути патча `apply_patch` (`custom_tool_call.input`, `function_call.arguments.input`
 //!   или команда `apply_patch …`), относительно `cwd` сессии;
 //! - сессия — `session_meta.payload.id`; файл Codex — одна сессия, фильтра по сессии нет.
+//!   `session_meta` — первая строка файла: вне окна хвоста её читает `read_head` (мод. снимка);
+//! - каталог путей патча — `cwd` последнего `turn_context` в окне, иначе `session_meta.payload.cwd`,
+//!   иначе корень решения.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -25,10 +28,11 @@ use super::{TranscriptAdapter, strip_tags};
 
 /// Признаки строк, которые стоит разбирать: §8а и вызовы инструментов Codex (`"function_call`
 /// без закрывающей кавычки покрывает и `function_call_output`).
-pub const PREFILTER: [&str; 6] = [
+pub const PREFILTER: [&str; 7] = [
     "\"compacted\"",
     "\"user_message\"",
     "\"session_meta\"",
+    "\"turn_context\"",
     "\"function_call",
     "\"custom_tool_call",
     "\"local_shell_call",
@@ -160,7 +164,15 @@ impl TranscriptAdapter for CodexAdapter {
         match l.kind.as_deref() {
             Some("session_meta") => {
                 self.hint = p.id.as_ref().and_then(Value::as_str).map(str::to_string);
-                self.cwd = p.cwd.as_ref().and_then(Value::as_str).map(PathBuf::from);
+                if self.cwd.is_none() {
+                    self.cwd = p.cwd.as_ref().and_then(Value::as_str).map(PathBuf::from);
+                }
+            }
+            // `cwd` хода: последний в окне — для путей патчей (сессия могла сменить каталог)
+            Some("turn_context") => {
+                if let Some(c) = p.cwd.as_ref().and_then(Value::as_str) {
+                    self.cwd = Some(PathBuf::from(c));
+                }
             }
             Some("compacted") => {
                 if let Some(m) = p.message.as_ref().and_then(Value::as_str) {

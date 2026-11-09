@@ -128,6 +128,20 @@ fn claude_summary_record_is_not_compact() {
     let s = c.take(AgentKind::Claude, SESSION, &p);
     assert_eq!(s.data.compact_summary, None);
     assert_eq!(s.data.prompts, ["Запрос без сжатия."]);
+    // запись `summary` сразу после границы сжатия и с признаком `isCompactSummary` (проходит
+    // предфильтр) — всё равно не конспект: конспект только у `type: "user"`
+    let boundary = fixture("claude-2.1.314-compact.jsonl", &c.root, &c.outside)
+        .lines()
+        .find(|l| l.contains("\"compact_boundary\""))
+        .unwrap()
+        .to_string();
+    let summary = format!(
+        r#"{{"type":"summary","summary":"Заголовок сессии","isCompactSummary":true,"sessionId":"{SESSION}","message":{{"role":"user","content":"Заголовок сессии"}}}}"#
+    );
+    let p = c.journal(&[], &[boundary, summary]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.compact_summary, None);
+    assert!(s.data.prompts.is_empty());
 }
 
 /// Конспект — `isCompactSummary` после `compact_boundary`; без границы не берётся.
@@ -248,6 +262,18 @@ fn claude_commands_and_files() {
         ]
     );
     assert_eq!(s.data.files, ["src/a.rs"]);
+    assert!(s.data.prompts.is_empty() && s.data.compact_summary.is_none());
+    // вывод инструментов и содержимое правок не попадают никуда (§17 п. 19)
+    let all = serde_json::to_string(&s).unwrap();
+    for marker in [
+        "ВЫВОД-ИНСТРУМЕНТА",
+        "СОДЕРЖИМОЕ-ФАЙЛА",
+        "СТАРЫЙ-ТЕКСТ",
+        "НОВЫЙ-ТЕКСТ",
+        "echo второй",
+    ] {
+        assert!(!all.contains(marker), "{marker}: {all}");
+    }
 }
 
 // ---------------------------------------------------------------- Codex
@@ -283,6 +309,43 @@ fn codex_compacted_and_user_message() {
         ]
     );
     assert_eq!(s.data.files, ["src/a.rs", "src/b.rs"]);
+}
+
+/// `session_meta` (первая строка) вне окна хвоста читается отдельно: id сессии есть, пути патча —
+/// от `cwd` сессии; более поздний `turn_context` в окне меняет `cwd`.
+#[test]
+fn codex_session_meta_outside_window() {
+    let c = Case::new("codex-head");
+    let sub = c.root.join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    let meta = format!(
+        r#"{{"type":"session_meta","payload":{{"id":"00000000-0000-4000-8000-0000000000c2","cwd":"{}","instructions":"Правила."}}}}"#,
+        json_str(&sub.to_string_lossy())
+    );
+    let pad = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+        "п".repeat(40 * 1024)
+    );
+    let patch = r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch"}}"#;
+    let p = c.journal(&[], &[meta.clone(), pad.clone(), patch.to_string()]);
+    let mut o = c.opts(AgentKind::Codex, "");
+    o.tail_kb = 64; // окно не захватывает первую строку
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(
+        s.session_hint.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000c2")
+    );
+    assert_eq!(s.data.files, ["crates/x/src/a.rs"]);
+    assert_eq!(s.skipped, 0);
+    // `turn_context` в окне — последний `cwd` побеждает
+    let other = c.root.join("crates").join("y");
+    let turn = format!(
+        r#"{{"type":"turn_context","payload":{{"cwd":"{}"}}}}"#,
+        json_str(&other.to_string_lossy())
+    );
+    let p = c.journal(&[], &[meta, pad, turn, patch.to_string()]);
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(s.data.files, ["crates/y/src/a.rs"]);
 }
 
 /// `response_item` с `role: user` (правила проекта, окружение) и `compaction` с
@@ -364,6 +427,47 @@ fn huge_line_skipped() {
     let s = c.take(AgentKind::Claude, SESSION, &p);
     assert_eq!(s.data.prompts, ["До.", "После."]);
     assert_eq!(s.skipped, 1);
+    // огромная и не UTF-8 строки чужого вида (очередь, прогресс) — не пропуск и не `partial`
+    let mut bytes = Vec::new();
+    for l in [
+        claude_human(&c, "До."),
+        format!(r#"{{"type":"queue-operation","content":"{big}"}}"#),
+    ] {
+        bytes.extend_from_slice(l.as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(b"{\"type\":\"progress\",\"x\":\"\xff\xfe\"}\n");
+    bytes.extend_from_slice(claude_human(&c, "После.").as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(&p, &bytes).unwrap();
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.prompts, ["До.", "После."]);
+    assert_eq!((s.skipped, s.status), (0, SnapStatus::Complete));
+    // не UTF-8 строка своего вида — пропуск
+    let mut bad = claude_human(&c, "x").into_bytes();
+    let at = bad.len() - 10;
+    bad[at] = 0xff;
+    bad.push(b'\n');
+    std::fs::write(&p, &bad).unwrap();
+    assert_eq!(c.take(AgentKind::Claude, SESSION, &p).skipped, 1);
+}
+
+/// Последняя строка без перевода строки (агент её дописывает): разобралась — берётся; нет —
+/// пропуск и `partial`, даже если обрыв унёс признак предфильтра.
+#[test]
+fn last_unterminated_line() {
+    let c = Case::new("unterminated");
+    let p = c.dir.join("journal.jsonl");
+    let full = claude_human(&c, "Запрос.");
+    std::fs::write(&p, &full).unwrap();
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!((s.data.prompts.len(), s.skipped), (1, 0));
+    // обрыв до `"type":"user"`
+    let cut = &full[..full.find("\"type\"").unwrap() + 3];
+    std::fs::write(&p, format!("{full}\n{cut}")).unwrap();
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.prompts, ["Запрос."]);
+    assert_eq!((s.skipped, s.status), (1, SnapStatus::Partial));
 }
 
 /// Пути вне корня решения (абсолютные и через `..`) не берутся.
@@ -453,6 +557,8 @@ fn bait() -> (String, String, String) {
 #[test]
 fn secrets_masked_in_prompts_and_flags() {
     let (pw, token, gh) = bait();
+    // короткий токен без признаков сканера — ловит только контекст `Authorization:`
+    let plain = ["Abc", "123", "Def", "456"].concat();
     let snap = Snapshot {
         trigger: SnapTrigger::Stop,
         agent: AgentKind::Claude,
@@ -484,14 +590,38 @@ fn secrets_masked_in_prompts_and_flags() {
                     cmd: format!("curl -H \"Authorization: Bearer {token}\" https://h"),
                     failed: None,
                 },
+                SnapCommand {
+                    cmd: format!("gpg --batch --passphrase {pw} -d f.gpg"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("tool --secret-key {pw} --client-secret {pw}"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("az login --client-secret={pw}"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("mysql -u root -p'{pw} {pw}' db"),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: format!("curl -H 'Authorization: Bearer {plain}' https://h"),
+                    failed: None,
+                },
             ],
         },
     };
     let out = snapshot::mask_and_limit(snap, MAX);
     let all = serde_json::to_string(&out.data).unwrap();
-    for secret in [&pw, &token, &gh] {
+    for secret in [&pw, &token, &gh, &plain] {
         assert!(!all.contains(secret.as_str()), "{secret}: {all}");
     }
+    assert_eq!(
+        out.data.commands[7].cmd,
+        format!("mysql -u root -p'{}' db", zam_secrets::SECRET_MARK)
+    );
     assert!(all.contains(zam_secrets::SECRET_MARK));
     // то же, что `mask_text` по каждому полю
     assert_eq!(
@@ -504,6 +634,57 @@ fn secrets_masked_in_prompts_and_flags() {
     );
     assert_eq!(out.data.commands[2].failed, Some(false));
     assert!(!out.scan_depth_capped);
+}
+
+/// Правила флагов — только у команд и только в своём контексте: проза с «basic»/«bearer»,
+/// `docker run -u 1000:1000`, числовой `-u` у curl, `-u` у не-HTTP команды и `-p` без mysql не
+/// маскируются.
+#[test]
+fn flags_do_not_touch_prose_and_uid() {
+    let prose = "This is a basic implementation of the parser; bearer of bad news";
+    let snap = Snapshot {
+        trigger: SnapTrigger::Stop,
+        agent: AgentKind::Claude,
+        status: SnapStatus::Complete,
+        skipped: 0,
+        session_hint: None,
+        scan_depth_capped: false,
+        data: SnapshotData {
+            compact_summary: Some(format!("{prose}. Basic setup done.")),
+            prompts: vec![
+                prose.to_string(),
+                "use Bearer tokens in headers".into(),
+                // флаги в прозе запроса — не команда: правила флагов сюда не применяются
+                "Use the --token option, mysql -pdemo and curl -u user:name".into(),
+            ],
+            files: Vec::new(),
+            commands: vec![
+                SnapCommand {
+                    cmd: "docker run -u 1000:1000 image".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "curl -u 1000:1000 http://h".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "cargo test -pzam-cli".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "echo \"basic implementation\" --verbose".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "ssh -u admin:secretword host".into(),
+                    failed: None,
+                },
+            ],
+        },
+    };
+    let before = snap.data.clone();
+    let out = snapshot::mask_and_limit(snap, MAX);
+    assert_eq!(out.data, before);
 }
 
 /// Секрет на второй строке многострочной команды не попадает, даже если первая строка
@@ -682,6 +863,22 @@ fn summary_keeps_tail_sections() {
     }
 }
 
+/// Жёсткий срок: поток задержан точкой подмены (`<журнал>.stall-ms`) — `take` возвращает `None`
+/// по сроку, не дожидаясь потока.
+#[test]
+fn take_hard_deadline_abandons_thread() {
+    let c = Case::new("stall");
+    let p = c.journal(&[], &[claude_human(&c, "Запрос.")]);
+    std::fs::write(format!("{}.stall-ms", p.display()), "3000").unwrap();
+    let mut o = c.opts(AgentKind::Claude, SESSION);
+    o.deadline = Duration::from_millis(50);
+    let t = std::time::Instant::now();
+    let s = snapshot::take(&p, &o);
+    let took = t.elapsed();
+    assert!(s.is_none());
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+}
+
 /// Срок: поток не успел — `None`, вызывающий не ждёт сверх срока.
 #[test]
 fn take_deadline_returns_in_time() {
@@ -703,6 +900,66 @@ fn take_deadline_returns_in_time() {
     if let Some(s) = s {
         assert!(s.data.prompts.len() <= 5);
     }
+}
+
+/// Срез конспекта с начала не режет метку `‹secret›`: обрывков метки нет.
+#[test]
+fn summary_cut_keeps_mark_whole() {
+    let mark = zam_secrets::SECRET_MARK;
+    let clean = |s: &str| {
+        let rest = s.replace(mark, "");
+        !rest.contains('‹') && !rest.contains('›')
+    };
+    for shift in 0..mark.len() + 2 {
+        let text = format!("{}{}{}", "а".repeat(3000 + shift), mark, "б".repeat(2000));
+        for max in 4000..4030 {
+            assert!(clean(&snapshot::summary_tail(&text, max)), "{shift}/{max}");
+        }
+    }
+    // и сокращение второго шага (`mask_and_limit`) — тоже
+    let text = format!("{}{}{}", "а".repeat(3000), mark, "б".repeat(2000));
+    for max in 4300..4460 {
+        let snap = Snapshot {
+            trigger: SnapTrigger::Stop,
+            agent: AgentKind::Claude,
+            status: SnapStatus::Complete,
+            skipped: 0,
+            session_hint: None,
+            scan_depth_capped: false,
+            data: SnapshotData {
+                compact_summary: Some(text.clone()),
+                ..SnapshotData::default()
+            },
+        };
+        let out = snapshot::mask_and_limit(snap, max);
+        assert!(
+            clean(&out.data.compact_summary.unwrap_or_default()),
+            "max {max}"
+        );
+    }
+}
+
+/// Пункт списка без отступа («1. сделать X») не обрывает ключевой раздел.
+#[test]
+fn summary_list_items_stay_in_section() {
+    let long = |n: usize| "слово ".repeat(n);
+    let text = [
+        "1. Primary Request and Intent:".to_string(),
+        long(1500),
+        "8. Current Work:".to_string(),
+        "1. первый пункт работы".to_string(),
+        "детали текущей работы".to_string(),
+        "2. **второй пункт**".to_string(),
+        "ещё детали".to_string(),
+        "9. Optional Next Step:".to_string(),
+        "шаг".to_string(),
+        "10. Notes:".to_string(),
+        long(1500),
+    ]
+    .join("\n");
+    let sum = snapshot::summary_tail(&text, 8 * 1024);
+    let part = "8. Current Work:\n1. первый пункт работы\nдетали текущей работы\n2. **второй пункт**\nещё детали";
+    assert!(sum.contains(part), "{sum}");
 }
 
 /// Команды Claude из длинной сессии: последние 10, исход сохраняется.
