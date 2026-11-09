@@ -1219,6 +1219,19 @@ async fn migrate_0025_from_m57_db() {
             ],
             ("table", "session_tokens") => &["reread_calls INTEGER NOT NULL DEFAULT 0"],
             ("table", "code_refs") => &["recv_count INTEGER NOT NULL DEFAULT 0"],
+            // происхождение импорта (§12б.5, задача 18b2)
+            ("table", "nodes") => &["imported_from TEXT"],
+            ("table", "entries") => {
+                // у `entries` есть ограничения таблицы: SQLite вставляет столбец после последнего
+                // столбца, перед ними
+                let sql = o.3.replacen(
+                    "deleted_at TEXT,",
+                    "deleted_at TEXT, imported_from TEXT,",
+                    1,
+                );
+                want.insert((o.0.clone(), o.1.clone(), o.2.clone(), sql));
+                continue;
+            }
             ("table", "session_seen") => {
                 let sql = migration_create("session_seen_new").replace(
                     "CREATE TABLE session_seen_new",

@@ -6152,3 +6152,183 @@ I1/I2, M1–M8 приняты; исправлены N1–N4 и Minor. Субаг
 в 0025, миграция 0026 не нужна; базы разработки пересоздаются, стенд 18c поднимается с нуля.
 2) `scripts/dev-env.ps1` основного каталога (только чтение) и временные файлы в `.tmp` основного
 каталога — допустимы.
+
+### Правки ревью 18b2 (CHANGES REQUESTED, 2026-11-09)
+
+Исполнитель исправил все замечания ревью в этом круге; субагентов не запускал. Сборка —
+`target/r2-t18b2`, скрипты и логи — `.tmp/m6/task18b2/` (`fix*.py`, `revert2.py`, `f*-*.log`,
+`rv2-*.log`).
+
+- **C1. Бомба из мелких файлов.**
+  - (а) Коэффициент сжатия проверяется у каждого файла без порога 1 МиБ:
+    `size ≤ packed × ratio + 64 КиБ` (`RATIO_SLACK`), и у архива в целом:
+    `Σsize ≤ ratio × Σpacked + 1 МиБ`.
+  - (б) Новый ключ `import.max_text_bytes` (256 МиБ, 1 МиБ..=64 ГиБ). В него входят все файлы,
+    кроме вложений (у «папки `.md`» — все `*.md`). Предел проверяется дважды: по центральному
+    каталогу и по фактически прочитанному. Не-тексты (вложения, лишние файлы «папки») в память
+    не читаются, для них только считается хэш. Ключ внесён в конфиг, `deploy/config.example.toml`,
+    §12б.5 и таблицу §14.
+  - Фактический размер, расходящийся с заявленным, — отказ (422).
+  - (в) `extract_blobs` принимает только `Plan::blobs`.
+  - (г) `apply_plan` разбирает план по значению. Элементы уходят пачкам без копий; последней
+    транзакции остаются сводки записей (`LinkInfo`) и связи.
+  - (д) Тесты:
+    - юниты `import_rejects_small_files_bomb` (бомба и предел текстов),
+      `import_rejects_mixed_bomb` (файловый коэффициент рядом с несжимаемым файлом),
+      `import_rejects_many_tiny_bombs` (общий коэффициент), `import_rejects_forged_size_header`;
+    - сервер — `import_rejects_small_files_bomb` (100 × 512 КиБ нулей).
+- **I1. Детерминированные id назначения.**
+  - `import::import_id` — UUIDv5 от (пользователь-получатель, пространство, источник
+    `<source_user_id>/<space>` описи или `folder`, ключ элемента). Ключ — исходный id, у
+    «папки `.md`» — `path:<путь>`.
+  - `plan_ids(db, user, space, plan, own, taken)`:
+    1. прежний импорт по ключу (`imported_from.source_id`) — его id;
+    2. свой архив — исходный id, если свободен, иначе детерминированный;
+    3. чужой архив — детерминированный.
+  - Кандидат занят не этим импортом (строка базы, другая база сервера, точка Qdrant другого
+    тенанта) — случайный id и запись в `remapped`. Отчёт `id_remapped` теперь и у чужого архива.
+  - `Plan::candidate_ids` даёт серверу список для проверки других баз и Qdrant: теперь и для
+    чужого архива.
+  - Тест `import_resume_after_stop_no_dangling_refs`: точка `import_one_batch` даёт пачки по 2
+    записи и остановку после первой. Первая пачка (папка и заметка со ссылками на записи) записана,
+    задание кончается 503. Повтор — ни одной висячей ссылки (`scan_refs` по телам, `data` и
+    текущим ревизиям), ни одного дубля.
+- **I2 + I3. Асинхронное задание.**
+  - `POST …/import` после приёма тела отвечает 202 `{job, status}` и `Location`.
+  - Проверка, распаковка и запись идут в `tokio::spawn`. Задание владеет `.part`, аудитом и
+    итогом; обрыв клиента его не прерывает.
+  - Очередь записи — `WRITE_SLOTS = 1` (этап `queued`).
+  - `GET /spaces/{space}/imports/{job}` отдаёт `{state, stage, dry_run, progress {total, done},
+    report, error}`. Видит тот же пользователь (`bound_user` или `X-Zam-User` задания) или
+    администратор; другому пользователю и другому пространству — 404.
+  - Задания живут в памяти (`AppState::imports`, `ImportRuntime`), итог — не меньше часа
+    (`JOB_KEEP`, чистка при новом задании). После перезапуска опрос — 404; это описано в модуле,
+    `config.example.toml` и §12б.5.
+  - Остановка сервера: ожидание очереди и пачки кончаются `Stopped` (503 в итоге).
+  - Записана хоть одна пачка (`Progress::written`) — `bump_space`, `index.notify`, `docs.notify`
+    и на пути ошибки. Аудит `space.import.done {job, …}` пишется в задаче. `dry_run` — тоже
+    задание.
+  - CLI `zam import`:
+    - опрос раз в 2 с, этап — в stderr при смене;
+    - сторож отсутствия хода `ZAM_IMPORT_IDLE_SECS` (600 с) → код 2, задание продолжается;
+    - сообщение «Ctrl+C прекращает только ожидание — задание на сервере не отменяется»;
+    - коды выхода по статусу ошибки задания.
+  - Тесты: `import_job_status_owner_only` (опрос, сессия, администратор, чужой, другое
+    пространство, нет задания); `import_job_survives_client_disconnect` (настоящий TCP: клиент
+    уходит после 202, пока задание ждёт очередь, — задание доходит до конца);
+    `import_busy_when_slot_taken` (сервер, пользователь, очередь `queued`).
+  - Все тесты импорта ходят через опрос (`wait_job`).
+- **I4.** `data.answer.decision_id` — голый id в переписывании и в `REF_COLUMNS` (и в §12б.5).
+  Остальные `Option<Id>` типизированных `data` проверены:
+  - `question.idea`, `idea.task_id`, `prev_task_ids`, `question_id` — переписываются;
+  - `question.task_space` — пространство (переводится);
+  - `idea.adopted_by` — пользователь (не переписывается).
+  Тест — `import_remaps_answer_decision_id`.
+- **I5.** Понижение аксиомы заметки (`demote_note`):
+  - статус читает тот же разбор (`note_meta(...).certainty_lenient()`);
+  - каждый ключ `certainty` верхнего уровня (со строками продолжения — блочный скаляр,
+    многострочное значение; повтор ключа) заменяется на `certainty: theorem` с прежним
+    комментарием;
+  - разбор проверяется ещё раз; не `theorem` или нет блока — конфликт `invalid`.
+  Юнит `import_demote_note_by_parser`: комментарий, блочный скаляр, повтор ключа, кавычки и
+  пробел перед `:`, не аксиома.
+- **Minor.**
+  - M1. Повтор «папки `.md`» идемпотентен: ключ `path:<путь>` + `content_hash` (CLI-тест — второй
+    импорт: `skipped` 2, конфликтов нет).
+  - M2. Размер вложения — фактический из архива (`Plan::blobs`), MIME — `blobs::pick_mime` по
+    имени (тест `import_attachment_size_and_mime_from_file`: подделанный frontmatter).
+  - M3. При запуске сервера `<data_dir>/.incoming/*.part` убираются (`clean_incoming` в `build`;
+    юнит `part_removed_on_drop_and_on_start`).
+  - M4. Приём: общий срок `max(30 мин, max_bytes / 1 МиБ/с)`, средняя скорость не ниже 16 КиБ/с
+    после первой минуты (408), слоты приёма — один на пользователя и два на сервер
+    (`RECV_SLOTS`), запись — одна на сервер (очередь). Юнит `receive_gives_up_on_stall_and_stop`
+    (простой, срок, скорость, остановка).
+  - M5. → M7 (GC): блобы, распакованные до записи, при сбое записи остаются без ссылок —
+    осиротевшие, их уберёт сборщик мусора блобов.
+  - M6. Пределы конфига — по таблице ТЗ: `max_bytes` 1 МиБ..=64 ГиБ, `max_files` 1..=1 000 000
+    (`import_section_defaults_and_ranges`).
+  - M7. Недопустимый `certainty` при ревизии — конфликт `invalid`, как при создании (тест
+    `import_revision_invalid_certainty_conflict`).
+  - M8. `dry_run` держит запись в пространство на время проверки (одна транзакция с откатом) —
+    описано в модуле, `config.example.toml` и §12б.5. Проход без писателя не сделан: записи
+    заметок и записей зависят от состояния транзакции (пути, предки, словарь, `path-taken`),
+    отдельный «сухой» путь повторил бы всю запись → M7, если понадобится.
+  - M9. Отмечено в журнале.
+  - M10. Оставлено по ТЗ (вопрос владельцу задаёт контролёр).
+  - M11. Временного zip у CLI больше нет: каталог упаковывается на лету в канал
+    (`std::io::pipe`, `ZipWriter::new_stream`), тело — chunked (`Client::send_stream`). Прерванный
+    `zam` ничего не оставляет, отдельный guard не нужен. Пропущенные скрытые пути перечисляются
+    в предупреждении (юнит `dir_files_md_only_without_manifest`).
+  - M12. Тесты C1, I1, I2 и бомба из мелких файлов — выше.
+  - Формат frontmatter (`attachments[].doc`, `refs[].symbol`/`symbol_hash`, прочие поля
+    заметки и записи) дописан в §12б.5.
+  - Константы формата и `Fingerprint` вынесены в нейтральный `zam_store::archive`;
+    `zam_store::import` и `api/transfer/archive.rs` их реэкспортируют.
+- **Риск 18c (большой архив на HDD) снят:** ответ 202 приходит сразу после приёма тела, запись
+  идёт заданием, CLI опрашивает его без предела на длительность (только сторож отсутствия хода).
+
+**Проверка на откате** (коммит `83c2faf`, `.tmp/m6/task18b2/revert2.py`, прогон — `rollbacks2.ps1`,
+после — `git checkout -- <файлы>`; логи `rev-rv2-*.log`):
+- S1 (`zam-store --lib`): файловый коэффициент → `import_rejects_mixed_bomb` FAIL; общий
+  коэффициент → `import_rejects_many_tiny_bombs` FAIL; предел текстов →
+  `import_rejects_small_files_bomb` FAIL; ворота разбора у понижения аксиомы →
+  `import_demote_note_by_parser` FAIL;
+- S2: строки продолжения ключа `certainty` → `import_demote_note_by_parser` FAIL (блочный
+  скаляр);
+- S1/S3: проверки фактического размера (`size > declared`, `size ≠ declared`) откатом не
+  наблюдаемы — `import_rejects_forged_size_header` проходит и без них: крейт `zip` сам читает
+  не больше заявленного размера (`Take`) и отвергает данные по CRC. Наши проверки остаются
+  запасными;
+- L1 (`zam-server --lib`): общий срок приёма → `receive_gives_up_on_stall_and_stop` FAIL (предел
+  теста 10 с); чистка `.part` при запуске → `part_removed_on_drop_and_on_start` FAIL;
+- L2: минимальная скорость → тот же юнит FAIL; L3: сторож простоя (переписан) → FAIL;
+- C1 (`zam-cli --test transfer`): ключ `path:<путь>` «папки `.md`» → `cli_import_folder_md` FAIL
+  (повтор не пропущен);
+- R1 (`transfer_import`):
+  - детерминированные id → `import_resume_after_stop_no_dangling_refs` FAIL (висячая
+    `i:` в заметке первой пачки);
+  - `data.answer.decision_id` → `import_remaps_answer_decision_id` FAIL;
+  - `invalid` при ревизии → `import_revision_invalid_certainty_conflict` FAIL (400 задания);
+  - один приём на пользователя → `import_busy_when_slot_taken` FAIL (202 вместо 503);
+  - опрос только своему → `import_job_status_owner_only` FAIL (200 чужому);
+  - размер и MIME из файла → `import_attachment_size_and_mime_from_file` FAIL (`text/html`, 1);
+- R2: слоты приёма сервера → `import_busy_when_slot_taken` FAIL (202); оповещения на пути ошибки
+  → `import_resume_after_stop_no_dangling_refs` FAIL (поколение рендера не выросло);
+- R3: очередь записи → `import_busy_when_slot_taken` FAIL (этап `done` вместо `queued`);
+- R4: задание вне запроса (обработчик ждёт задание) → `import_job_survives_client_disconnect`
+  FAIL (202 не пришёл за 30 с);
+- R5 — защиты первого круга, код которых переписан:
+  - предел тела → `import_body_over_limit_413…` FAIL (422 вместо 413);
+  - коллизии → `own_flag_collision…` FAIL;
+  - прежний импорт → `reimport_same_archive_only_skipped` FAIL (8 `path-taken`);
+  - связи идей → `roundtrip_own_archive_keeps_ids` FAIL;
+  - остановка → `import_refused_while_stopping` FAIL;
+  - `complete` аудита → `import_aborted_upload_part_removed` FAIL;
+  - блобы при `dry_run` → `import_dry_run_writes_nothing` FAIL;
+- остальные откаты первого круга (`revert.py`) на неизменённом коде: шаблоны совпадают, код тот
+  же;
+- после отката — PASS (прогон `f1-*`).
+
+**Проверки** (`target/r2-t18b2`): `fmt --check`, `clippy -p zam-store -p zam-server -p zam-cli
+-p zam-index --all-targets -D warnings` — чисто; `zam-store --lib import` — 12 PASS;
+`zam-server --lib transfer` — 17; `ZAM_REQUIRE_ML=1 zam-server --test transfer_import` — 35 PASS;
+`zam-cli --test transfer` — 7; `zam --bin transfer` — 5; `transfer_export` — 16;
+`config::` — 45; `zam-store` целиком (`--no-fail-fast`) — 33 набора PASS; `zam-server --test
+m57_acceptance` — 13 PASS, `--test agent_dates` — PASS, `--test backup --features test-hooks` —
+40 PASS.
+
+**Исправление записи первого круга.** В разделе исполнителя 18b2 сказано «`zam-store` целиком
+(12 наборов, в том числе миграции) — PASS». Это неверно. Сводка лога (`sum.py`) печатала только
+первые 12 строк, а `cargo test` остановился на первом упавшем наборе. Колонки `imported_from` в
+0025 ломали сверку схемы в `migrate_rebuild.rs::migrate_0025_from_m57_db`, а при проверке
+обнаружилось и падение `m57_acceptance.rs::acceptance_migration_from_m56_db`. Оба теста
+дополнены колонками `nodes.imported_from` и `entries.imported_from`. Сводка теперь печатает всё,
+прогоны идут с `--no-fail-fast`.
+
+**Передать.**
+- → 13c: §12б.5 уже описывает задание, опрос, 404 после рестарта, детерминированные id,
+  `max_text_bytes`, `decision_id` — перенести в ТЗ v1.24 и CHANGELOG (новый маршрут
+  `GET /spaces/{space}/imports/{job}`, ответ 202 вместо 200).
+- → M7: осиротевшие блобы прерванного импорта — сборщик мусора (M5); проверочный проход
+  `dry_run` без писателя; потоковый план без текстов в памяти (предел `max_text_bytes` —
+  временная мера).

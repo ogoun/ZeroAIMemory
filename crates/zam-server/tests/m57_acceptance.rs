@@ -1647,6 +1647,8 @@ async fn acceptance_migration_from_m56_db() {
             "tokens_unattributed",
             "session_snapshots",
             "sqlite_autoindex_session_snapshots_1",
+            // `nodes.imported_from` (0025, задача 18b2)
+            "nodes",
         ]
         .contains(&o.1.as_str())
     };
