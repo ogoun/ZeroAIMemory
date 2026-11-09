@@ -253,7 +253,7 @@ pub(crate) fn same_triggers(
 }
 
 /// JSON-массив инструментов из колонки `tools`.
-fn tools_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<Vec<String>>> {
+pub(crate) fn tools_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<Vec<String>>> {
     let s: Option<String> = r.get(i)?;
     s.map(|s| serde_json::from_str(&s).map_err(|e| crate::time::conv_err(i, e)))
         .transpose()

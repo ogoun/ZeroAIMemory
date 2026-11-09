@@ -32,6 +32,7 @@ pub mod sessions;
 pub mod solutions;
 pub mod spaces;
 pub mod tasks;
+pub mod transfer;
 pub mod triggers;
 pub mod user_settings;
 pub mod vault;
@@ -230,6 +231,11 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         )
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
+        // экспорт пространства (M6 §12б.5): чтение, не запись памяти
+        .route(
+            "/api/v1/spaces/{space}/export",
+            get(transfer::export::export),
+        )
         .route(
             "/api/v1/solutions",
             get(solutions::list).post(solutions::register),

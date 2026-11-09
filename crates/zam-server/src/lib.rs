@@ -282,6 +282,7 @@ pub async fn run_with(
         f();
     }
     let stop = signal.clone();
+    let stopping = state.clone();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -289,8 +290,14 @@ pub async fn run_with(
     .with_graceful_shutdown(async move {
         let source = stop.wait().await;
         tracing::info!(%source, "остановка zam-server");
+        // потоки экспорта обрываются: штатная остановка ждёт открытые соединения
+        stopping.begin_stop();
     })
     .await?;
+    // аудит `space.export.done` оборванных экспортов — до выхода процесса (не дольше 1 с)
+    if !state.wait_exports(std::time::Duration::from_secs(1)).await {
+        tracing::warn!("экспорт не завершился за 1 с: space.export.done может не записаться");
+    }
     state.shutdown().await;
     tracing::info!("zam-server остановлен");
     Ok(())

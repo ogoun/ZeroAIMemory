@@ -5644,3 +5644,307 @@ M6 и M5.7 подряд: время синхронизаций равно (3,88 
 - → 13b: `session-start` с картой p50 ≈ 45–50 мс против ≈ 20 мс у M5.7 — уже на `7ea07d3`
   (до задачи 14), найти задачу M6 и причину (бюджет 300 мс не нарушен).
 - → M7: проверка гипотезы M7 (`is_empty`), свойства C# с заглавной буквы.
+
+### Задача 18b1. Экспорт пространства — исполнение (2026-11-08)
+
+Ветка `m6-portability` (worktree `.tmp/m6/wt-b`), сборка — `target/r1-t18b1`, логи —
+`.tmp/m6/task18b1/`.
+
+**Сделано.**
+- `zam-store/src/export.rs` — `export_space(db, ExportSelect)`: снимок пространства **одной
+  транзакцией чтения** (живые папки и заметки с текстом текущей ревизии, вложениями и
+  `file_refs`; живые записи с триггерами, `file_refs` и файлами отчёта; явные живые связи;
+  ревизии). Vault, `code_*`, эмбеддинги, чанки, кэш, сессии, снимки, задания не читаются вовсе.
+  Связь выдаётся, только если источник в снимке, цель жива, в пространстве из `link_spaces`
+  (что принципал читает) и не отчёт при `with_reports = false`. Для этого `EDGE_COLS`/`edge_row`,
+  `ATT_COLS`/`att_row`, `tools_col` стали `pub(crate)`.
+- `zam-server/src/api/transfer/`:
+  - `archive.rs` — `EXPORT_FORMAT`, `ExportFilter`, `ExportManifest`, `file_name_for`,
+    `encode_segment`, `attachment_file`, `front_matter`, `Fingerprint` (общие с 18b2);
+  - `export.rs` — `GET /spaces/{space}/export?paths=&kinds=&history=` (`?user=` администратора,
+    как у вложений): права → снимок → план (тексты в памяти, блобы путями) → аудит → поток zip
+    (`ZipWriter::new_stream`, zip64 для файлов ≥ 4 ГиБ − 64 КиБ, тексты deflate, блобы store) из
+    потока ОС через канал на 8 кусков по 256 КиБ. Соединение с базой — только на снимок.
+- CLI `zam export [--space S] [--path P]… [--kind K]… [--no-history] -o F.zip [--json]`
+  (`cmd/transfer.rs`): поток в новый `F.zip.<pid>.part` (`create_new`), проверка конца каталога
+  zip, `fsync`, `rename_retry`; ошибка — свой `.part` удаляется. Профиль `Timeouts::Download`
+  (заголовки до 10 мин, тело без предела). 404 → проба `GET /spaces/{space}/tree`: есть —
+  «сервер не поддерживает экспорт пространства: нужен zam-server 0.0.11-m6 или новее» (код 1).
+- WebUI: `exportUrl` (`api.ts`), пункт «Экспорт (.zip)» в меню пространства (`Tree.svelte`).
+- `rename_retry` 18a перенесён в `zam_core::fsx::rename_retry` (журнал — колбэком), у сервера —
+  обёртка с WARN, у CLI — тот же цикл; `blobs::admin_user` принимает `Option<&str>`.
+- README: строка `zam export`.
+
+**Решения исполнителя.**
+1. Фильтр: нет `paths` и `kinds` — всё; задан один — только его часть (`paths` — заметки и
+   папки под префиксами по целым сегментам с учётом регистра, без журналов; `kinds` — записи,
+   без заметок); оба — обе части. Неизвестный вид, неверный путь, `history` не bool — 400.
+   Токену `kinds=report` — пусто, без ошибки (отчёта для агента нет).
+2. Запятая — разделитель `paths`: префикс с `,` не выражается (CLI отказывает с пояснением).
+3. Frontmatter — `key: <JSON>` по строке (JSON — подмножество YAML 1.2): без YAML-зависимости,
+   `---` внутри блока невозможна. Тело заметки — байт в байт, **вместе с её собственным
+   frontmatter**: наш блок всегда первый, импорт отрезает ровно его.
+4. Сверх списка спецификации: у заметки — `l0_source` и `attachments [{sha256, name, mime,
+   size, created_at, file}]` (импорту нужен список вложений: ссылки тела перечисляют не все),
+   у записи — `kind`, `supersedes_id`, `superseded_by_id`, `retract_reason`, `rev`, `author`,
+   `files`; файл `_folders.jsonl` (пустые папки и L0 папок); в описи — `space_kind`,
+   `space_name`, `solution_guid`, `missing_blobs`.
+5. `_links.jsonl` — только явные связи (`origin = explicit`): wikilink, frontmatter, связи идей и
+   задач импорт строит заново (§12б.5). Поля `{src, type, dst, dst_space, anchor}`.
+6. Имя вложения в архиве — **без** percent-кодирования ссылки Markdown (`схема 1.png`, в теле
+   `схема%201.png`): распакованный архив открывает ссылку тела. Пара (sha256, имя) — один файл;
+   имена — по сегментам `encode_segment`, совпадение без учёта регистра — `~N` перед
+   расширением. Каталог `_attachments/` — в корне архива, как в спецификации: из вложенной
+   заметки относительная ссылка `_attachments/…` в обычном просмотрщике Markdown не откроется
+   (WebUI и импорт разрешают её от корня).
+7. Имена Windows: кроме `: ? * | < > "` кодируются `%` (однозначность), `\`, `/` внутри
+   сегмента (имена файлов отчёта) и управляющие; зарезервированы также `COM¹–³`, `LPT¹–³`;
+   первый `_` первого сегмента пути заметки — `%5F` (служебные имена архива). `~N` — и при
+   совпадении файла с каталогом; имена раздаются от глубоких путей к мелким. Длина сегмента после
+   кодирования не ограничивается (сегмент 255 байт из `:` станет 765) — предел ФС не проверяется.
+8. Отпечаток — blake3 по (длина имени, имя, длина, содержимое) файлов без описи в порядке
+   записи; опись — последним файлом.
+9. Аудит `space.export {space, user, owner, files, bytes}` пишется **до** отдачи тела (`bytes` —
+   несжатый объём файлов без описи): запись остаётся и при оборванной загрузке.
+10. Нет файла блоба — экспорт не прерывается: пара в `missing_blobs`, WARN, `file: null` во
+    frontmatter. Ошибка чтения посреди потока — тело обрывается, CLI это видит.
+11. Связи на отчёт API не создаёт (422 «отчёт концом связи не бывает»), фильтр отчётов в
+    выборке связей — страховка; тестом не покрыт.
+
+**Тесты.** `zam-server/tests/transfer_export.rs` — 8: `export_layout_and_manifest`,
+`export_windows_names`, `export_excludes_vault_codemap_trash_sessions` (Vault — значение,
+название, описание; карта кода; корзина — заметка и запись; id сессии; другое пространство и
+другой пользователь — токеном и сессией), `token_export_no_human_no_reports`, `member_can_export`
+(`rw` и `ro`; связь на knowledge владельца не выдаётся), `export_audit_written`,
+`export_filter_paths_kinds_history`, `export_missing_blob_listed`; отпечаток пересчитывается в
+тестах. `zam-cli/tests/transfer.rs` — 4: `cli_export_writes_zip`, `cli_export_old_server_404_message`,
+`cli_export_missing_space_not_found`, `cli_export_truncated_stream_keeps_target` (чужой
+`a.zip.part` и прежний `a.zip` целы). Юнит: `archive` 5, `export::tests` 2 (сервер),
+`export::tests::prefix_by_whole_segments` (store), `transfer::tests` 2 (CLI). e2e
+`web/e2e/export.spec.ts`.
+
+**Проверка на откате** (коммит `2e2124c`, правки скриптом `.tmp/m6/task18b1/revert.py`, после —
+`git checkout -- <файлы>`; логи `rev-*.log`):
+- пакет s1 (разные тесты): корзина (`deleted_at` у узлов) → `excludes…` FAIL (TRASHED-TEXT-MARK);
+  отчёты токену (`with_reports: true`) → `token_export…` FAIL; фильтр пространств целей связей →
+  `member_can_export` FAIL; аудит убран → `export_audit_written` FAIL; один файл на пару убран →
+  `export_layout…` FAIL (zip: Duplicate filename); `~N` убран → `export_windows_names` FAIL;
+  фильтр путей → `export_filter…` FAIL; `export_missing_blob_listed` — PASS (откат его не касался);
+- пакет s2: префикс `_` → `export_windows_names` FAIL; фильтр `space_id` узлов → `excludes…`,
+  `token…` (Human), `member…` FAIL;
+- c1: проба старого сервера → `cli_export_old_server_404_message` FAIL (код 5); проверка конца
+  zip → `cli_export_truncated…` FAIL (код 0);
+- c2: `.part` по фиксированному имени с усечением → `cli_export_truncated…` FAIL (чужой
+  `a.zip.part` удалён);
+- после отката всех правок — PASS.
+
+**Проверки** (`target/r1-t18b1`; ML-тестов задача не касается, модели и Qdrant не нужны):
+`cargo fmt --all -- --check` — чисто; `cargo clippy --workspace --all-targets -- -D warnings` —
+чисто; `zam-server --test transfer_export` — 8 PASS; `zam-cli --test transfer` — 4 PASS;
+`zam-server --lib transfer` — 7 PASS; `zam-store --lib export` — 1 PASS; `zam --bin transfer` —
+2 PASS; `zam-server --test backup --features test-hooks` (после переноса `rename_retry`) — 40
+PASS; `zam-core` — 18 PASS; `npm run check` — 0 ошибок; `npm run build`, `npm run size` — в
+пределах; `npm run e2e -- export` на release (`E2E_SERVER`/`E2E_ZAM` из `target/r1-t18b1`) —
+1 PASS. `node_modules` в worktree — `npm ci --prefer-offline` из `.tmp/npm-cache`.
+
+**Найдено вне задачи.**
+- → 18b2: импорт берёт список вложений из `attachments` frontmatter (не из ссылок тела), тело
+  заметки — всё после первого блока `---`; отпечаток — `archive::Fingerprint` по порядку файлов
+  центрального каталога; `_folders.jsonl` — папки и их L0; `missing_blobs` описи — в `warnings`.
+- → 18b2/M7: путь-префикс с `,` в `paths` не выражается; при необходимости — повторяемый
+  параметр.
+- → 13c: README дополнен строкой `zam export`; ТЗ §12/§13 — экспорт в v1.24.
+
+### Ревью задачи 18b1 — правки (2026-11-08)
+
+Утечек через права ревью не нашло (ревьюер сам проверил откатом фильтры `space_id`, корзины,
+`with_reports`, `graph_spaces`); замечания I1, I2, M1–M9 исправлены в этом же круге.
+
+- **I1. Память и параллельность.**
+  - `zam_store::export_space(db, sel, f)` теперь отдаёт вызывающему `SpaceReader` внутри одной
+    транзакции чтения: метаданные узлов — списком (пути нужны заранее для имён файлов), тексты
+    заметок, записи журналов (`for_each_entry`) и ревизии (`for_each_node_revision`,
+    `for_each_entry_revision`) — по одной. Архив пишется в потоке `spawn_blocking` прямо в этой
+    транзакции; `Item::Text` и план в памяти убраны, каждый текст строится один раз и сразу уходит
+    в zip. `_history/<id>.jsonl` пишется строками по ревизии; флаг zip64 — по верхней оценке
+    `history_bound` (текст ×6 на экранирование JSON + 4 КиБ на ревизию).
+  - Отпечаток изменён, чтобы считать его потоком: на файл — длина имени, имя, длина и blake3
+    содержимого (формат 1 ещё не выпущен).
+  - Слоты экспорта: `AppState::export_slots`, `EXPORT_SLOTS = 2` (из 4 соединений пула
+    читателей); занято — 503 `/problems/busy` с `Retry-After: 30` (`ApiError::ExportBusy`). Слот
+    освобождается до конца тела (раньше последнего отправителя канала): клиент, сразу начавший
+    следующий экспорт, слот получает (первая редакция держала слот до записи аудита — подряд
+    идущие экспорты тестов получали 503, лог `r2-t1.log`).
+  - Клиент, переставший читать, держит соединение не дольше `STALL` = 10 мин: отправка куска в
+    канал — `try_send` с ожиданием, затем поток обрывается (тестом не покрыт: 10 мин).
+  - Аудит пишется по окончании потока (объём заранее неизвестен), в том числе при обрыве:
+    `{space, user, owner, files, bytes, complete}`. Остановка сервера посреди экспорта запись
+    теряет.
+  - **Оценка пиковой памяти на экспорт:** метаданные узлов пространства (~1 КиБ на узел: путь,
+    L0, frontmatter) + множество имён + id записей + список блобов; один текст за раз (самая
+    большая заметка или ревизия ×2); буфер блоба 256 КиБ; канал 8 × 256 КиБ = 2 МиБ; deflate
+    ~0,5 МиБ. Итого — несколько МиБ + ~1 КиБ на узел, от объёма текстов и истории не зависит.
+    Пространство на 100 000 узлов — порядка 100 МиБ на экспорт, два экспорта — вдвое (→ 13c, в
+    документацию).
+  - Тест `export_busy_when_slots_taken` (слоты заняты — 503 и `Retry-After` у экспорта и
+    `probe`; освободились — 200, после потока все слоты свободны; права проверяются раньше слота).
+- **I2.** Сторож простоя CLI: обёртка ридера отмечает время последнего байта, поток-сторож при
+  простое дольше `ZAM_EXPORT_IDLE_SECS` (300 с) удаляет свой `.part`, печатает «сервер молчит» и
+  завершает процесс с кодом 2. Тест `cli_export_idle_watchdog` (заглушка шлёт заголовки и
+  4 байта, молчит; предел 1 с).
+- **M1.** `zip_complete`: запись конца каталога заканчивается ровно в конце файла (с
+  комментарием), центральный каталог — ровно перед ней и начинается с `PK\x01\x02`; zip64 —
+  через локатор и запись zip64. Без новой зависимости (у CLI нет `zip` до 18b2). Тесты:
+  юнит `zip_end_exact`, `zip64_end_exact`, интеграционный `cli_export_inner_zip_tail_rejected`
+  (конец вложенного zip в конце обрезанного потока).
+- **M2.** Ссылки тела и изменённые имена (`%XX`, `_`, `~N`, `~h…`), ссылки от корня архива —
+  описаны в документации модуля `archive.rs`; → 13c: в пользовательскую документацию.
+- **M3.** Имена устройств `COM0`, `LPT0`, `CONIN$`, `CONOUT$`; ключ занятых имён — NFC и
+  нижний регистр (`unicode-normalization`, крейт workspace); сегмент длиннее 200 байт после
+  кодирования — `<начало>~h<8 hex blake3 исходного><.расширение ≤ 16>`, разрез по границе
+  символа и не посреди `%XX`. Весь путь не укорачивается: путь заметки до 1024 байт, предел
+  Windows 260 зависит от каталога распаковки — нужны длинные пути (`LongPathsEnabled`) или
+  короткий каталог **[решение исполнителя]**. Тесты `segment_rules`, `long_segment_shortened_with_hash`,
+  `nfc_and_nfd_collide`.
+- **M4.** Имя файла отчёта с `/` запись не пропускает (`check_filename`); `attachment_file`
+  всё равно отбрасывает пустые сегменты (`a//b`, `/x`, `/` → `%5F`). Тест `attachment_names`.
+- **M5.** → M7: сборщик мусора блобов не должен удалять блобы во время экспорта (экспорт
+  читает файлы блобов по списку из снимка до конца потока).
+- **M6.** Тест `export_link_to_report_hidden_from_token`: ребро на отчёт вставлено прямо в базу
+  (`Db::write`); токену не выдаётся, сессии WebUI — выдаётся.
+- **M7.** WebUI: перед скачиванием — `GET …/export?probe=true` (права, фильтр, слот; 204 без
+  архива и аудита), ошибка — текстом под строкой пространства (`errs`, `role="alert"`); архив —
+  по ссылке, браузер пишет его на диск, не в память. Гонка «слот занят между проверкой и
+  скачиванием» остаётся (браузер покажет сбой загрузки).
+- **M8.** Справка `zam export -o` и README: `.part` после убитого процесса, сторож простоя.
+- **M9.** → M7: экспорт по токену должен маскировать секреты так же, как будущая выдача агенту
+  (`secrets-mask-l2-m7`).
+- Вопросы ревью: запятая в `paths=` — остаётся; `_attachments/` в корне — остаётся, ограничение
+  описано (→ 13c).
+
+**Проверка на откате** (коммит `5b8d9f2`, `.tmp/m6/task18b1/revert2.py`, после —
+`git checkout -- <файлы>`; логи `rev2-*.log`):
+- слоты (у каждого запроса свой семафор) → `export_busy_when_slots_taken` FAIL (200 вместо 503);
+- фильтр отчётов в связях → `export_link_to_report_hidden_from_token` FAIL;
+- `COM0` убран → `segment_rules` FAIL; NFC убран → `nfc_and_nfd_collide` FAIL; укорачивание
+  выключено → `long_segment_shortened_with_hash` FAIL (304 байта); пустые сегменты не
+  отбрасываются → `attachment_names` FAIL;
+- сторож с пределом ×3600 → `cli_export_idle_watchdog` FAIL (убит тайм-аутом теста, 30 с);
+- конец zip без проверки каталога → `cli_export_inner_zip_tail_rejected` FAIL (код 0) и
+  `zip_end_exact` FAIL;
+- после отката — PASS.
+
+**Проверки:** `fmt --check`, `clippy --workspace --all-targets -D warnings` — чисто;
+`zam-server --test transfer_export` — 10 PASS; `zam-cli --test transfer` — 6 PASS;
+`zam-server --lib transfer` — 9, `zam --bin transfer` — 4, `zam-store --lib export` — 1 PASS;
+`npm run check`, `build`, `size` — PASS; `npm run e2e -- export` на release (через `probe`) — 1 PASS.
+
+### Повторное ревью задачи 18b1 — правки (2026-11-09)
+
+I1/I2, M1–M8 приняты; исправлены N1–N4 и Minor. Субагентов в задаче 18b1 исполнитель не
+запускал.
+
+- **N1. Аудит до тела.** Две записи: `space.export {space, user, owner, filter}` — до тела, в
+  обработчике; не записалась — 500, архив не отдаётся, слот освобождается; `space.export.done
+  {space, user, owner, files, bytes, complete, reason}` — по окончании потока, в том числе при
+  обрыве (`reason`: `client` | `stall` | `deadline` | `stop` | `error`). Точка `test-hooks`
+  `export_audit` — общий `backup::fail_point`. §12б.5 спецификации обновлён (две записи, слоты,
+  `export.max_secs`, формат `archive_fingerprint`, «повторите, если загрузка не началась»),
+  таблица ключей — `export.max_secs`. Тест `export_audit_failure_no_body`; `export_audit_written`
+  проверяет обе записи и порядок.
+- **N2. Долгая транзакция.**
+  - `zam_store::Db::long_reader()` — RAII-счётчик долгих читателей (`CheckpointFlags::long_readers`);
+    пока он > 0, и фоновый поток, и страховка писателя делают только `PASSIVE`
+    (`passive_only()`, как при копии). `export_space` берёт его на всю транзакцию. Тест
+    `zam-store/tests/db.rs::db_checkpoint_passive_while_long_reader`.
+  - Предел длительности: `[export] max_secs` (1..=604800, 14400 — 4 ч; `deploy/config.example.toml`,
+    `config::tests::export_section_defaults_and_ranges`). `Guard` проверяется в каждой записи в
+    канал тела и в ожидании свободного места (`send_stalled`), поэтому медленный клиент
+    больше не сбрасывает срок. Ошибку обрыва клиенту отдаём не дольше 1 с (`ERR_STALL`), иначе
+    тело просто кончается (архив без каталога — `zam export` отвергает). Тест
+    `export_deadline_aborts` (`max_secs = 1`, вложение 6 МиБ, тело не читается: обрыв, аудит
+    `deadline`, долгий читатель снят, слот свободен).
+- **N3. Остановка.** `AppState::stopping` и `begin_stop()`; `serve` зовёт его по сигналу
+  остановки до штатного завершения HTTP; `Guard` обрывает поток с `reason: stop`. Найдено и
+  исправлено при тестах: первая редакция возвращала `io::ErrorKind::Interrupted` — `write_all`
+  повторяет запись на нём бесконечно, поток экспорта зависал навсегда (тестовый процесс висел
+  ~10 ч); теперь `Other`, юнит-тест проверяет вид ошибки. Тест `export_stops_on_shutdown`.
+- **N4.** Тест `export_slot_held_while_streaming`: два экспорта с непрочитанным телом (вложение
+  6 МиБ > канала 2 МиБ) — `available_permits` = `EXPORT_SLOTS − 1`, затем `− 2`; третий
+  (другой пользователь) — 503 с `Retry-After`; после чтения тел — архивы целы, слоты свободны.
+- **Minor.**
+  - Один экспорт на пользователя (`AppState::export_users`, `Slot` снимает отметку при
+    уничтожении) + 2 на сервер; проверяется тем же тестом.
+  - `send_stalled(tx, item, stall, guard)` — срок параметром; юнит `send_stalled_gives_up`
+    (канал ёмкостью 1 без читателя, 50 мс → `stall`; остановка → `stop`, не `Interrupted`;
+    закрытый канал → `client`). Срок в конфиг не вынесен.
+  - Новый формат `archive_fingerprint` — в §12б.5.
+  - Вопрос 1: брони слота нет; в спецификации и документации модуля — «если загрузка не
+    началась, повторите позже».
+- Замечание: при обрыве `zip::ZipWriter` в `Drop` пишет в stderr «failed to finalize archive»
+  (запись завершения тоже обрывается `Guard`); на работу не влияет.
+
+**Проверка на откате** (коммит `5f3b15a`, `.tmp/m6/task18b1/revert3.py`, после —
+`git checkout -- <файлы>`; логи `rev3-*.log`):
+- пакет a: аудит до тела убран → `export_audit_failure_no_body` (200 и архив) и
+  `export_audit_written` FAIL; предел убран → `export_deadline_aborts` FAIL («архив полный»);
+  остановка убрана → `export_stops_on_shutdown` FAIL; слот отпускается сразу после захвата →
+  `export_slot_held_while_streaming` FAIL (`available_permits` 2 вместо 1);
+- пакет b: проверка «один на пользователя» убрана → `export_slot_held_while_streaming` FAIL
+  (200); `long_reader` в `export_space` убран → `export_deadline_aborts` FAIL (долгих читателей 0);
+- пакет c: `passive_only` без долгих читателей → `db_checkpoint_passive_while_long_reader` FAIL
+  (148 `RESTART`);
+- после отката — PASS.
+
+**Проверки:** `fmt --check`, `clippy --workspace --all-targets -D warnings` — чисто;
+`zam-server --test transfer_export` — 14 PASS; `zam-store --test db long_reader` — 1 PASS;
+`zam-server --lib transfer` — 10, `export_section_defaults_and_ranges`,
+`example_config_parses_to_defaults` — PASS.
+
+### Мелкие замечания одобренного повторного ревью 18b1 (2026-11-09)
+
+- **m1.** У `ChanWriter` флаг «поток мёртв»: после первой ошибки (`Guard`, `stall`, клиент ушёл)
+  `write` и `flush` сразу возвращают ту же причину и ничего не шлют — завершение zip в
+  `ZipWriter::drop` не ждёт `stall` на каждом куске. Строка «ZipWriter::drop: failed to
+  finalize archive» в stderr на каждый оборванный экспорт остаётся (её печатает сам крейт `zip` в
+  `Drop`; заглушить можно только `forget`, который оставил бы отправителя канала живым). Юнит
+  `dead_writer_drop_does_not_wait_or_write` (`stall` 2 с: `Drop` < 1 с, в канал после ошибки
+  ничего не ушло).
+- **m2.** При `stopping` обработчик сразу отвечает 503 `/problems/busy` с `Retry-After: 30`
+  (`ApiError::ShuttingDown`) — до аудита и слота, в том числе на `probe`. Тест
+  `export_refused_while_stopping`.
+- **m3.** `space.export.done` пишется в задаче после потока; при выходе процесса запись могла
+  не успеть. Теперь `serve` после штатной остановки HTTP ждёт задачи экспорта
+  (`AppState::export_tasks`, `wait_exports`) не дольше 1 с, затем WARN. Убийство процесса
+  (без штатной остановки) запись по-прежнему теряет: `space.export` до тела при этом есть. Тест
+  `shutdown_waits_export_audit`.
+- **m4.** → M7: `Guard` (срок `export.max_secs`, остановка) проверяется при каждой записи в
+  канал и в ожидании места в нём, но не внутри одного долгого блокирующего чтения (выборка
+  SQLite большой страницы, чтение файла блоба с медленного диска): обрыв наступит после его
+  окончания.
+- **m5.** Ошибка обрыва идёт в тело вне очереди кусков: задача ставит её в `AbortCell` до ухода
+  отправителей канала, поток тела (`body_stream`) отдаёт её раньше оставшихся кусков или после
+  закрытия канала — hyper рвёт соединение, тело не кончается штатным концом chunked, браузер не
+  сохранит неполный zip как успешную загрузку. Старая отправка ошибки с ожиданием 1 с убрана.
+  Юнит `body_stream_ends_with_error`; `export_deadline_aborts` и `export_stops_on_shutdown` теперь
+  требуют ошибку тела.
+- **Причина кодом.** `io::Error::other(Abort(AbortKind))` и `downcast` (`abort_kind`), `zip_store`
+  сохраняет `ZipError::Io` как есть; поиск подстроки убран.
+
+**Проверка на откате** (коммиты `8e8f1f9` и следующий, `.tmp/m6/task18b1/revert4.py`, логи
+`rev4-*.log`, `rev5-*.log`, `rev6-*.log`):
+- флаг «поток мёртв» выключен → первая редакция юнита его не ловила (после ошибки записи `zip`
+  в `Drop` ничего не дописывал — откат PASS, `rev4-u.log`); юнит дополнен прямой проверкой
+  писателя (после ошибки `write_all` и `flush` — сразу, без `stall`) → FAIL («flush» не вернул
+  ошибку, `rev5-u.log`);
+- отказ при остановке убран → `export_refused_while_stopping` FAIL (200);
+- ошибка обрыва не ставится в `AbortCell` → `export_deadline_aborts` (тело `Ok`, 2 МиБ) и
+  `export_stops_on_shutdown` (`Ok(0)`) FAIL;
+- учёт задачи экспорта снят в начале задачи → первая редакция `shutdown_waits_export_audit` его
+  не ловила (аудит успевал за 10 мс ожидания, `rev5-m3.log`); тест дополнен проверкой счётчика
+  через 300 мс после старта → FAIL (0 вместо 1, `rev6-m3.log`);
+- `abort_kind` без `downcast` и `zip_store` через текст → `send_stalled_gives_up`,
+  `dead_writer_drop_does_not_wait_or_write`, `export_deadline_aborts`, `export_stops_on_shutdown`
+  FAIL (`reason` = `error`);
+- после отката — PASS: `zam-server --lib transfer` — 12, `--test transfer_export` — 16 PASS;
+  `fmt --check`, `clippy -p zam-server --all-targets -D warnings` — чисто.

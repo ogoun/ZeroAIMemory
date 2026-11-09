@@ -21,6 +21,7 @@ pub mod datadir;
 pub mod db;
 pub mod embeddings;
 pub mod entries;
+pub mod export;
 pub mod file_refs;
 pub mod glossary;
 pub mod graph;
@@ -81,7 +82,7 @@ pub use datadir::{
     DataDir, DirLock, LockMark, MAX_DATA_DIR_CHARS_WINDOWS, RESTORE_INCOMPLETE_FILE,
     RESTORE_MARK_FILE, check_data_dir_len, lock_mark, restore_incomplete, try_lock_dir,
 };
-pub use db::{Db, DbOptions};
+pub use db::{Db, DbOptions, LongReader};
 pub use embeddings::{
     Embedding, adopt_owned_embeddings, adopt_owned_embeddings_batch, embed_input_of, embed_key_of,
     gc_embeddings, get_embeddings, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
@@ -98,6 +99,10 @@ pub use entries::{
     has_certainty, initial_status, is_entry_ref_letter, list_entries, normalize_area,
     normalize_title, reindex_entries_page, restore_entry, retract_entry, set_triggers,
     supersede_entry, title_duplicates, update_entry, validate_trigger,
+};
+pub use export::{
+    EntryDump, ExportSelect, NodeRevision, NoteAttachment, RefRow, SpaceReader, export_space,
+    under_prefix,
 };
 pub use file_refs::{
     ChangedFile, FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit,

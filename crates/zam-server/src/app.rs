@@ -59,6 +59,16 @@ pub struct AppState {
     /// Карта кода (M5.6 §7): пересчёты рангов (single-flight на решение), слоты и кэш входов
     /// ранжирования с фокусом.
     pub code: Arc<api::code::CodeRuntime>,
+    /// Слоты экспорта пространства (M6 §12б.5): не больше
+    /// [`api::transfer::export::EXPORT_SLOTS`] одновременно, занято — 503 с `Retry-After`.
+    pub export_slots: Arc<tokio::sync::Semaphore>,
+    /// Пользователи с идущим экспортом: не больше одного экспорта на пользователя.
+    pub export_users: Arc<std::sync::Mutex<std::collections::HashSet<Id>>>,
+    /// Сервер останавливается ([`AppState::begin_stop`]): долгие потоки ответа (экспорт)
+    /// обрываются, чтобы штатная остановка HTTP не ждала их.
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// Идущие задачи экспорта: остановка ждёт их аудит `space.export.done` (не дольше 1 с).
+    pub export_tasks: Arc<TaskCount>,
     /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
     /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
     #[cfg(feature = "test-hooks")]
@@ -98,6 +108,26 @@ impl AppState {
     ///
     /// Поэтому «после `shutdown` соединений нет» верно для обслуживания и воркера индексации,
     /// но не для незаконченной задачи открытия базы.
+    /// Начало остановки: долгие потоки ответа (экспорт пространства) обрываются между файлами
+    /// и кусками тела. Зовётся по сигналу остановки до штатного завершения HTTP.
+    pub fn begin_stop(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Ждёт конца задач экспорта (обрыв по [`AppState::begin_stop`] и аудит
+    /// `space.export.done`) не дольше `limit`; `true` — все закончились.
+    pub async fn wait_exports(&self, limit: std::time::Duration) -> bool {
+        let t0 = Instant::now();
+        while self.export_tasks.running() > 0 {
+            if t0.elapsed() >= limit {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
     pub async fn shutdown(&self) {
         self.maintenance.stop().await;
         self.docs.shutdown().await;
@@ -201,6 +231,30 @@ pub async fn os_stop_signals() {
 }
 
 // Вручную: хэш пароля и пути не должны попадать в отладочный вывод.
+/// Счётчик идущих задач ([`TaskCount::enter`] — на время задачи).
+#[derive(Debug, Default)]
+pub struct TaskCount(std::sync::atomic::AtomicUsize);
+
+/// Задача идёт, пока жив.
+pub struct TaskRunning(Arc<TaskCount>);
+
+impl TaskCount {
+    pub fn enter(self: Arc<Self>) -> TaskRunning {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        TaskRunning(self)
+    }
+
+    pub fn running(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for TaskRunning {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
@@ -322,6 +376,12 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         maintenance,
         glossary: Arc::default(),
         code: Arc::default(),
+        export_slots: Arc::new(tokio::sync::Semaphore::new(
+            api::transfer::export::EXPORT_SLOTS,
+        )),
+        export_users: Arc::default(),
+        stopping: Arc::default(),
+        export_tasks: Arc::default(),
         big_bodies: api::big_body::BigBodies::new(
             api::big_body::BIG_BODY_PERMITS,
             api::note_body_max(&cfg.limits),

@@ -53,6 +53,7 @@ pub struct ServerConfig {
     pub code: CodeSection,
     pub ideas: IdeasSection,
     pub backup: BackupSection,
+    pub export: ExportSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1274,6 +1275,34 @@ impl BackupSection {
     }
 }
 
+/// Секция `[export]` (M6 §12б.5): экспорт пространства `GET /spaces/{space}/export`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportSection {
+    /// Предел длительности одного экспорта, с (1..=604800, 14400 — 4 ч): дольше — поток
+    /// обрывается (`complete: false` в аудите), транзакция чтения закрывается.
+    pub max_secs: u64,
+}
+
+impl Default for ExportSection {
+    fn default() -> Self {
+        Self { max_secs: 4 * 3600 }
+    }
+}
+
+impl ExportSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=604_800).contains(&self.max_secs) {
+            return Err(ConfigError::Invalid {
+                key: "export.max_secs".into(),
+                source_name: "итог".into(),
+                message: "от 1 до 604800 (7 суток)".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// `HH:MM` → (часы 0..=23, минуты 0..=59).
 fn parse_hm(s: &str) -> Option<(i8, i8)> {
     let (h, m) = s.trim().split_once(':')?;
@@ -1415,6 +1444,7 @@ impl Default for ServerConfig {
             code: CodeSection::default(),
             ideas: IdeasSection::default(),
             backup: BackupSection::default(),
+            export: ExportSection::default(),
         }
     }
 }
@@ -1591,6 +1621,7 @@ pub fn load(
     cfg.code.validate()?;
     cfg.ideas.validate()?;
     cfg.backup.validate()?;
+    cfg.export.validate()?;
     Ok(cfg)
 }
 
@@ -2726,6 +2757,19 @@ master_key = \"x\"
         ] {
             let e = load(None, &[env(k, v)], &Default::default());
             assert!(e.unwrap_err().to_string().contains("backup."), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn export_section_defaults_and_ranges() {
+        let e = load(None, &[], &Default::default()).unwrap().export;
+        assert_eq!(e.max_secs, 14_400);
+        for v in ["0", "604801"] {
+            let r = load(None, &[env("ZAM_EXPORT__MAX_SECS", v)], &Default::default());
+            assert!(
+                r.unwrap_err().to_string().contains("export.max_secs"),
+                "{v}"
+            );
         }
     }
 

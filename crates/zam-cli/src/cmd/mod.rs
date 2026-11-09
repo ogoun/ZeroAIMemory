@@ -22,6 +22,7 @@ pub mod sessions;
 pub mod solution;
 pub mod status;
 pub mod task;
+pub mod transfer;
 pub mod tree;
 pub mod vault;
 pub mod write;

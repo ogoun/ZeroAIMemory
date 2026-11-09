@@ -96,6 +96,9 @@ pub enum Timeouts {
     /// `zam mcp`: как `Transfer`, но ответ ждётся до [`MCP_RECV_RESPONSE`] — сервер (`json_response`)
     /// отдаёт заголовки только после конца инструмента.
     Mcp,
+    /// `zam export`: заголовки — после снимка пространства (до [`MCP_RECV_RESPONSE`]), тело —
+    /// архив любого размера потоком, без общего предела на его приём.
+    Download,
 }
 
 /// Ожидание ответа `POST /mcp` (ревью задачи 3, m1). Сервер синхронно ждёт инструмент, а
@@ -125,6 +128,10 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
             .timeout_send_body(Some(Duration::from_secs(30 * 60)))
             .timeout_recv_response(Some(MCP_RECV_RESPONSE))
             .timeout_recv_body(Some(Duration::from_secs(5 * 60))),
+        Timeouts::Download => b
+            .timeout_send_request(Some(Duration::from_secs(30)))
+            .timeout_recv_response(Some(MCP_RECV_RESPONSE))
+            .timeout_recv_body(None),
         Timeouts::Deadline(d) => b
             .timeout_resolve(Some(d))
             .timeout_connect(Some(d))

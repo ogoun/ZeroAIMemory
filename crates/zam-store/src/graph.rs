@@ -292,10 +292,10 @@ fn kind_of(s: &str, i: usize) -> rusqlite::Result<TargetKind> {
 }
 
 /// Колонки ребра для [`edge_row`]; таблица `edges` под псевдонимом `e`.
-const EDGE_COLS: &str = "e.id, e.src_kind, e.src_id, e.space_id, e.dst_kind, e.dst_id,
+pub(crate) const EDGE_COLS: &str = "e.id, e.src_kind, e.src_id, e.space_id, e.dst_kind, e.dst_id,
     e.dst_space_id, e.dst_raw, e.dst_anchor, e.type, e.origin, e.created_at";
 
-fn edge_row(r: &Row) -> rusqlite::Result<EdgeView> {
+pub(crate) fn edge_row(r: &Row) -> rusqlite::Result<EdgeView> {
     let src_kind: String = r.get(1)?;
     let dst_kind: Option<String> = r.get(4)?;
     let dst_id: Option<Id> = r.get(5)?;
