@@ -6438,3 +6438,96 @@ m57_acceptance` — 13 PASS, `--test agent_dates` — PASS, `--test backup --fea
 - `transfer_export`, `m57_acceptance`, `agent_dates` — 33 PASS;
 - `backup --features test-hooks` — 40 PASS;
 - `zam-cli --test transfer` — 12 PASS; `zam --bin transfer` — 5 PASS.
+
+### Правки третьего ревью 18b2 (2026-11-09)
+
+Третье ревью: одно Important (I-1) и пять Minor (M-1…M-5), всё закрыто в этом круге.
+Коммиты поверх `fdb00bf`: `12a163b` (сервер, конфигурация, ТЗ), `6f442ff` (CLI).
+
+- **I-1 — запас места на диске (решение контролёра).** `import.min_free_percent` убран:
+  процент от размера диска отвергал бы импорт на больших дисках. Новый ключ
+  `import.min_free_bytes` (0..=1 ТиБ, по умолчанию 2 ГиБ). Нужно свободного места
+  `min_free_bytes + 2 × ожидаемый объём`: тело плюс распакованные вложения. Ожидаемый объём —
+  `Content-Length`, без него — `import.max_bytes`. Из свободного места вычитается уже
+  зарезервированное: сумма ожидаемых объёмов идущих приёмов и заданий, у которых ещё лежит
+  `.part`. Проверка и запись резерва идут под одной блокировкой (`DiskReserve` в
+  `ImportRuntime`). Резерв держит `Part` и снимает при удалении `.part`: успех, отказ, обрыв,
+  паника, снятие обработчика. `min_free_percent = 0` убран из `tests/common/mod.rs` и из
+  CLI-тестов. Обновлены §12б.5, таблица ключей и `deploy/config.example.toml`. Тесты:
+  - `import_refused_when_disk_low_with_reserve`: первый приём заявил 10 ГиБ и висит; второй
+    приём (другой пользователь) при запасе «свободно − 30 ГиБ» получает 507 до чтения тела;
+    после снятия первого резерв = 0;
+  - `import_default_disk_reserve_allows`: значение по умолчанию на обычном диске не отказывает,
+    резерв снят после задания, точка `import_disk_full` → 507;
+  - диапазон ключа — `config` (`ZAM_IMPORT__MIN_FREE_BYTES=1099511627777` → ошибка).
+- **M-1 — сбой упаковщика CLI.** Раньше `ZipWriter` при уничтожении дописывал оглавление, и
+  усечённый архив уходил как нормальный конец тела. Теперь:
+  - `PackReader` поверх `PipeReader`: упаковщик записывает причину до закрытия канала, а
+    `read` возвращает `Err`. ureq обрывает запрос, сервер пишет `space.import.done` с
+    `reason: client`, CLI показывает «упаковка каталога: <файл>: …»;
+  - выход упаковщика после сбоя «мёртвый» (`PipeOut`): оглавление в канал не пишется, нет шума
+    `ZipWriter::drop … BrokenPipe` в stderr;
+  - тест `cli_import_pack_failure_aborts_body`: файл каталога нельзя открыть (Windows —
+    `share_mode(0)`, Unix — права 000; под root тест пропускается).
+- **M-2, M-3 — справка `zam import` и §12б.5.**
+  - При отказе сервер дочитывает тело не больше 16 МиБ и 5 с. Тело больше — приём рвётся без
+    ответа, и CLI показывает подсказку «сервер прервал приём архива» с вероятными причинами.
+  - Переименованный каталог — новый источник: его заметки не сопоставляются с прежним
+    импортом. Пути, занятые прежним импортом, при `skip` — конфликты `path-taken`; при
+    `revision` заметки ложатся рядом как `<путь> (импорт <дата>)`. Прежние заметки не
+    меняются.
+- **M-4 — остановка сервера (запись по ревью).** Остановка ждёт задания импорта вместе с
+  экспортами не дольше 1 с. Задание, не успевшее закончиться, обрывается. Аудит
+  `space.import.done` при этом может потеряться: процесс завершается раньше записи. Данные
+  целы: записанные пачки зафиксированы своими транзакциями, `.part` убирается при следующем
+  запуске (`clean_incoming`), повтор импорта безопасен (детерминированные id).
+- **M-5 — «ответ сервера важнее `BrokenPipe`».** Заглушка по ревью (прочесть несколько КиБ,
+  ответить 503, не дочитать тело) показала: ureq 3.4.2 читает ответ только после всего тела
+  (`run.rs::send_body`, ошибка записи — транспортная). Значит, для такого сервера ответ
+  до CLI не доходит, и правило недостижимо. Чтобы правило работало, `zam import` (каталог)
+  теперь шлёт `Expect: 100-continue`:
+  - ureq ждёт ответ до тела (до 1 с). На ответ не `100` тело не отправляется, читатель тела
+    уничтожается — упаковщик ловит `BrokenPipe`, а CLI показывает ответ сервера;
+  - сервер при `Expect` отвечает отказом до приёма без дочитывания тела (hyper не шлёт `100`),
+    без `Expect` — дочитывает, как раньше.
+
+  Тесты:
+  - `cli_import_server_answer_beats_broken_pipe_stub`: заглушка отвечает 503 с `Retry-After`
+    до тела; CLI показывает HTTP 503, не «прервал» и не «упаковка»;
+  - `cli_import_server_cut_mid_body_hint_stub`: заглушка по ревью (8 КиБ тела, 503, тело не
+    дочитано) → подсказка «сервер прервал приём архива», код 2;
+  - `cli_import_refusal_before_body_shown`: настоящий сервер, 507 до приёма, тело 32 МиБ →
+    HTTP 507;
+  - `import_refusal_skips_drain_on_expect` (сервер): при `Expect` тело не опрашивается, без
+    `Expect` — дочитывается.
+
+  Для точки `import_disk_full` CLI-тесты включают `zam-server` с `test-hooks` (только
+  dev-зависимость).
+
+**Откаты защит** (каждая отдельно, `target/r3-t18b2`; после отката — PASS):
+- `disk_reserved` (вычитание резерва идущих приёмов), `disk_need` (множитель 2 × объём),
+  `disk_insert` (запись резерва) → `import_refused_when_disk_low_with_reserve` FAIL;
+  `disk_release` (снятие резерва) → оба теста места FAIL;
+- `range` (верх `min_free_bytes`) → `config::tests::import_section_defaults_and_ranges` FAIL;
+- `expect_srv` (отказ без дочитывания при `Expect`) → `import_refusal_skips_drain_on_expect`
+  и `cli_import_refusal_before_body_shown` FAIL;
+- `pack_reader` (сбой упаковки — ошибка чтения) → `cli_import_pack_failure_aborts_body` FAIL.
+  Без обёртки тело уходит целым (`ZipWriter` дописал оглавление), сервер отвергает архив при
+  разборе (`reason: rejected`), а не видит обрыв;
+- `cli_order` («ответ сервера важнее `BrokenPipe`») → `cli_import_server_answer_beats_broken_pipe_stub`
+  и `cli_import_refusal_before_body_shown` FAIL («сервер прервал приём архива … HTTP 503/507»).
+  Прошлый круг отмечал правило как ненаблюдаемое — с `Expect` оно наблюдаемо;
+- `expect_cli` (заголовок `Expect`) → оба теста FAIL (обрыв записи вместо ответа);
+- `pipe_dead` («мёртвый» выход упаковщика) → `cli_import_server_answer_beats_broken_pipe_stub`
+  FAIL (шум `ZipWriter::drop` в stderr);
+- после каждого отката рабочее дерево восстановлено (`git status` чисто), прогон `g4-*` — PASS.
+
+**Проверки** (`target/r3-t18b2`, `--no-fail-fast`):
+`fmt --check` и `clippy -p zam-store -p zam-server -p zam-cli -p zam-index --all-targets
+-D warnings` — чисто. Тесты:
+- `zam-store` — 33 набора, 474 PASS;
+- `zam-server --lib` — 272 PASS;
+- `ZAM_REQUIRE_ML=1 zam-server --test transfer_import` — 43 PASS;
+- `transfer_export`, `m57_acceptance`, `agent_dates` — 33 PASS;
+- `backup --features test-hooks` — 40 PASS;
+- `zam-cli --test transfer` — 16 PASS; `zam --bin transfer` — 5 PASS.
