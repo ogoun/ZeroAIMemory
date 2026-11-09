@@ -704,8 +704,9 @@ pub fn mask_flags(text: &str) -> String {
                 e -= 1;
             }
             let inner = &text[b..e];
-            // значение — ссылка на переменную (`$NAME`, `${NAME}`, `%NAME%`) или заглушка; у
-            // заголовка без значения длиной ≥ 6 регулярка берёт слово-схему — его не трогаем
+            // значение целиком — ссылка на переменную (`$NAME`, `${NAME}`, `%NAME%`) или заглушка
+            // `<…>` ([`is_reference`]); у заголовка без значения длиной ≥ 6 регулярка берёт
+            // слово-схему — его не трогаем
             let scheme = i == 2
                 && ["bearer", "basic", "token", "digest"]
                     .iter()
@@ -713,7 +714,7 @@ pub fn mask_flags(text: &str) -> String {
             if inner.is_empty()
                 || scheme
                 || inner.contains(zam_secrets::SECRET_MARK)
-                || inner.starts_with(['$', '%', '<'])
+                || is_reference(inner)
             {
                 continue;
             }
@@ -736,6 +737,28 @@ pub fn mask_flags(text: &str) -> String {
     }
     out.push_str(&text[pos..]);
     out
+}
+
+/// Значение — целиком ссылка на переменную или заглушка, а не секрет: `$NAME`, `${NAME}`,
+/// `%NAME%` (имя — `[A-Za-z_][A-Za-z0-9_]*`) или `<…>`. `%2Fabc…`, `$2b$10$…` (хэш bcrypt) —
+/// не ссылки.
+fn is_reference(v: &str) -> bool {
+    let ident = |s: &str| {
+        let mut c = s.chars();
+        c.next()
+            .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+            && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+    };
+    if let Some(r) = v.strip_prefix("${") {
+        return r.strip_suffix('}').is_some_and(ident);
+    }
+    if let Some(r) = v.strip_prefix('$') {
+        return ident(r);
+    }
+    if let Some(r) = v.strip_prefix('%') {
+        return r.strip_suffix('%').is_some_and(ident);
+    }
+    v.len() >= 2 && v.starts_with('<') && v.ends_with('>')
 }
 
 /// Текст без вставок `<тег>…</тег>`; пробелы по краям сняты. Незакрытая вставка (`<тег>` без

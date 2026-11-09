@@ -378,6 +378,33 @@ fn codex_long_session_meta_prefix() {
     assert_eq!((s.skipped, s.status), (0, SnapStatus::Complete));
 }
 
+/// Длинная `session_meta`: `id`/`cwd` — только первого уровня `payload`; вложенные
+/// (`source.id`) не берутся, даже если идут раньше.
+#[test]
+fn codex_long_meta_nested_id_ignored() {
+    let c = Case::new("codex-nested");
+    let sub = c.root.join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    let wrong = c.root.join("crates").join("wrong");
+    let meta = format!(
+        r#"{{"type":"session_meta","payload":{{"source":{{"id":"N","cwd":"{}","list":[{{"id":"L"}}],"s":"\"id\":\"Q\" }}"}},"id":"A","cwd":"{}","instructions":"{}"}}}}"#,
+        json_str(&wrong.to_string_lossy()),
+        json_str(&sub.to_string_lossy()),
+        "п".repeat(40_000)
+    );
+    let pad = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+        "о".repeat(40 * 1024)
+    );
+    let patch = r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch"}}"#;
+    let p = c.journal(&[], &[meta, pad, patch.to_string()]);
+    let mut o = c.opts(AgentKind::Codex, "");
+    o.tail_kb = 64;
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(s.session_hint.as_deref(), Some("A"));
+    assert_eq!(s.data.files, ["crates/x/src/a.rs"]);
+}
+
 /// Первая строка вне окна берётся, только если это `session_meta`: старая запись другого типа
 /// (запрос человека) в снимок не попадает.
 #[test]
@@ -751,6 +778,36 @@ fn flags_do_not_touch_prose_and_uid() {
     let before = snap.data.clone();
     let out = snapshot::mask_and_limit(snap, MAX);
     assert_eq!(out.data, before);
+}
+
+/// Значение `Authorization:` пропускается, только если оно целиком — ссылка на переменную:
+/// `%2F…` (URL-кодирование) и `$2b$10$…` (хэш bcrypt) маскируются.
+#[test]
+fn authorization_value_not_a_reference_masked() {
+    let enc = ["%2F", "abcdef123"].concat();
+    let hash = ["$2b$10$", "abcdefghijklmnop"].concat();
+    let mk = |cmd: String| SnapCommand { cmd, failed: None };
+    let snap = Snapshot {
+        trigger: SnapTrigger::Stop,
+        agent: AgentKind::Claude,
+        status: SnapStatus::Complete,
+        skipped: 0,
+        session_hint: None,
+        scan_depth_capped: false,
+        data: SnapshotData {
+            commands: vec![
+                mk(format!("curl -H \"Authorization: Bearer {enc}\" https://h")),
+                mk(format!("curl -H \"Authorization: {hash}\" https://h")),
+                mk(format!("psql --password {hash}")),
+            ],
+            ..SnapshotData::default()
+        },
+    };
+    let out = snapshot::mask_and_limit(snap, MAX);
+    for (c, secret) in out.data.commands.iter().zip([&enc, &hash, &hash]) {
+        assert!(!c.cmd.contains(secret.as_str()), "{}", c.cmd);
+        assert!(c.cmd.contains(zam_secrets::SECRET_MARK), "{}", c.cmd);
+    }
 }
 
 /// Команда: сначала первая непустая строка, затем маска по ней (окно — строка плюс запас), затем

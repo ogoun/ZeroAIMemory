@@ -227,49 +227,84 @@ pub fn head_line(head: &str, cut: bool) -> Option<String> {
 
 /// `payload.id` и `payload.cwd` из начала строки `session_meta`, обрезанной до разбора
 /// (`instructions`/`base_instructions` — AGENTS.md — длиннее предела чтения). Разбор
-/// ограниченный, без полного JSON: тип — `"type":"session_meta"` до `"payload"`, поля ищутся
-/// после `"payload":{` и до первого `"instructions"`/`"base_instructions"` (в `SessionMeta` Codex
-/// они идут раньше); значение — JSON-строка до закрывающей неэкранированной кавычки.
+/// ограниченный, без полного JSON:
+/// - тип — `"type":"session_meta"` до `"payload"`; после `"payload":` — объект `{`;
+/// - обход по байтам с глубиной скобок `{}`/`[]` вне строк; строки — до неэкранированной
+///   кавычки (`\\` пропускает следующий байт);
+/// - ключи `id` и `cwd` берутся только на первом уровне `payload` (вложенный
+///   `source.id` — нет), первое вхождение;
+/// - обход кончается на ключе `instructions`/`base_instructions` первого уровня (в
+///   `SessionMeta` Codex `id` и `cwd` идут раньше), на закрытии `payload` или на обрыве строки.
 pub fn meta_from_prefix(prefix: &str) -> Option<(String, Option<String>)> {
-    let p = prefix.find("\"payload\"")?;
+    const KEY: &str = "\"payload\"";
+    let p = prefix.find(KEY)?;
     if !prefix[..p].contains("\"type\":\"session_meta\"") {
         return None;
     }
-    let body = &prefix[p..];
-    let stop = ["\"instructions\"", "\"base_instructions\""]
-        .iter()
-        .filter_map(|k| body.find(k))
-        .min()
-        .unwrap_or(body.len());
-    let body = &body[..stop];
-    let field = |name: &str| -> Option<String> {
-        let key = format!("\"{name}\":");
-        let mut from = 0;
-        while let Some(i) = body[from..].find(&key) {
-            let at = from + i;
-            from = at + key.len();
-            // ключ — не внутри строки: перед ним `{` или `,` (без пробелов, как у serde_json)
-            if !matches!(body[..at].chars().next_back(), Some('{' | ',')) {
-                continue;
-            }
-            let rest = body[from..].trim_start();
-            if !rest.starts_with('"') {
-                return None;
-            }
-            let bytes = rest.as_bytes();
-            let mut j = 1;
-            while j < bytes.len() {
-                match bytes[j] {
-                    b'\\' => j += 2,
-                    b'"' => return serde_json::from_str::<String>(&rest[..=j]).ok(),
-                    _ => j += 1,
+    let rest = prefix[p + KEY.len()..].trim_start().strip_prefix(':')?;
+    let body = rest.trim_start();
+    if !body.starts_with('{') {
+        return None;
+    }
+    let b = body.as_bytes();
+    let (mut id, mut cwd): (Option<String>, Option<String>) = (None, None);
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
                 }
             }
-            return None;
+            b'"' => {
+                let Some(end) = string_end(b, i) else { break };
+                let after = body[end + 1..].trim_start();
+                let Some(value) = after.strip_prefix(':').filter(|_| depth == 1) else {
+                    i = end + 1;
+                    continue;
+                };
+                // ключ первого уровня `payload`
+                let key: String = serde_json::from_str(&body[i..=end]).ok()?;
+                if key == "instructions" || key == "base_instructions" {
+                    break;
+                }
+                let value = value.trim_start();
+                let at = body.len() - value.len();
+                if (key == "id" || key == "cwd") && value.starts_with('"') {
+                    let Some(ve) = string_end(b, at) else { break };
+                    let v = serde_json::from_str::<String>(&body[at..=ve]).ok();
+                    let slot = if key == "id" { &mut id } else { &mut cwd };
+                    if slot.is_none() {
+                        *slot = v;
+                    }
+                    i = ve + 1;
+                    continue;
+                }
+                i = at;
+                continue;
+            }
+            _ => {}
         }
-        None
-    };
-    Some((field("id")?, field("cwd")))
+        i += 1;
+    }
+    Some((id?, cwd))
+}
+
+/// Индекс закрывающей кавычки JSON-строки, начатой кавычкой в `start`; `None` — строка
+/// оборвана (конец начала строки журнала).
+fn string_end(b: &[u8], start: usize) -> Option<usize> {
+    let mut j = start + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return Some(j),
+            _ => j += 1,
+        }
+    }
+    None
 }
 
 /// Текст команды: строка или массив аргументов; `bash -lc "<скрипт>"` → скрипт.

@@ -6602,3 +6602,15 @@ WAL за 20 с не возвращается к норме (3046–3253 кадр
 - → M7: `Authorization: Digest …` — значение `response="…"` и пары ключ-значение после схемы не
   разбираются, маскируется только первый токен. Сделать вместе с правилами флагов в
   `zam-secrets`.
+
+- Третьи мелкие 17a (коммит `fix(snapshot): мелкие третьего ревью 17a — первый уровень payload,
+  ссылка на переменную целиком`):
+  - `meta_from_prefix` берёт `id`/`cwd` только первого уровня `payload`: глубина `{}`/`[]` вне
+    строк, экранирование, первое вхождение. Тест `codex_long_meta_nested_id_ignored`: `source.id`,
+    `id` в массиве и `"id":"Q"` внутри строки — мимо, id = A.
+  - Значение `Authorization:` и прочих флагов пропускается, только если оно целиком — ссылка на
+    переменную или заглушка (`is_reference`: `$NAME`, `${NAME}`, `%NAME%`, `<…>`). Тест
+    `authorization_value_not_a_reference_masked`: `Bearer %2Fabcdef123`,
+    `Authorization: $2b$10$…`, `--password $2b$10$…` маскируются.
+  - Откаты Q1 (глубина) и Q2 (ссылка по префиксу) — FAIL (`rollbacks-r4.log`). Проверка:
+    `snapshot` 29 PASS, `rustfmt --check` по своим файлам и `clippy -D warnings` — чисто.
