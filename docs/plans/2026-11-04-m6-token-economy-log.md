@@ -4688,3 +4688,51 @@ I1/I2, M1–M8 приняты; исправлены N1–N4 и Minor. Субаг
 `zam-server --test transfer_export` — 14 PASS; `zam-store --test db long_reader` — 1 PASS;
 `zam-server --lib transfer` — 10, `export_section_defaults_and_ranges`,
 `example_config_parses_to_defaults` — PASS.
+
+### Мелкие замечания одобренного повторного ревью 18b1 (2026-11-09)
+
+- **m1.** У `ChanWriter` флаг «поток мёртв»: после первой ошибки (`Guard`, `stall`, клиент ушёл)
+  `write` и `flush` сразу возвращают ту же причину и ничего не шлют — завершение zip в
+  `ZipWriter::drop` не ждёт `stall` на каждом куске. Строка «ZipWriter::drop: failed to
+  finalize archive» в stderr на каждый оборванный экспорт остаётся (её печатает сам крейт `zip` в
+  `Drop`; заглушить можно только `forget`, который оставил бы отправителя канала живым). Юнит
+  `dead_writer_drop_does_not_wait_or_write` (`stall` 2 с: `Drop` < 1 с, в канал после ошибки
+  ничего не ушло).
+- **m2.** При `stopping` обработчик сразу отвечает 503 `/problems/busy` с `Retry-After: 30`
+  (`ApiError::ShuttingDown`) — до аудита и слота, в том числе на `probe`. Тест
+  `export_refused_while_stopping`.
+- **m3.** `space.export.done` пишется в задаче после потока; при выходе процесса запись могла
+  не успеть. Теперь `serve` после штатной остановки HTTP ждёт задачи экспорта
+  (`AppState::export_tasks`, `wait_exports`) не дольше 1 с, затем WARN. Убийство процесса
+  (без штатной остановки) запись по-прежнему теряет: `space.export` до тела при этом есть. Тест
+  `shutdown_waits_export_audit`.
+- **m4.** → M7: `Guard` (срок `export.max_secs`, остановка) проверяется при каждой записи в
+  канал и в ожидании места в нём, но не внутри одного долгого блокирующего чтения (выборка
+  SQLite большой страницы, чтение файла блоба с медленного диска): обрыв наступит после его
+  окончания.
+- **m5.** Ошибка обрыва идёт в тело вне очереди кусков: задача ставит её в `AbortCell` до ухода
+  отправителей канала, поток тела (`body_stream`) отдаёт её раньше оставшихся кусков или после
+  закрытия канала — hyper рвёт соединение, тело не кончается штатным концом chunked, браузер не
+  сохранит неполный zip как успешную загрузку. Старая отправка ошибки с ожиданием 1 с убрана.
+  Юнит `body_stream_ends_with_error`; `export_deadline_aborts` и `export_stops_on_shutdown` теперь
+  требуют ошибку тела.
+- **Причина кодом.** `io::Error::other(Abort(AbortKind))` и `downcast` (`abort_kind`), `zip_store`
+  сохраняет `ZipError::Io` как есть; поиск подстроки убран.
+
+**Проверка на откате** (коммиты `8e8f1f9` и следующий, `.tmp/m6/task18b1/revert4.py`, логи
+`rev4-*.log`, `rev5-*.log`, `rev6-*.log`):
+- флаг «поток мёртв» выключен → первая редакция юнита его не ловила (после ошибки записи `zip`
+  в `Drop` ничего не дописывал — откат PASS, `rev4-u.log`); юнит дополнен прямой проверкой
+  писателя (после ошибки `write_all` и `flush` — сразу, без `stall`) → FAIL («flush» не вернул
+  ошибку, `rev5-u.log`);
+- отказ при остановке убран → `export_refused_while_stopping` FAIL (200);
+- ошибка обрыва не ставится в `AbortCell` → `export_deadline_aborts` (тело `Ok`, 2 МиБ) и
+  `export_stops_on_shutdown` (`Ok(0)`) FAIL;
+- учёт задачи экспорта снят в начале задачи → первая редакция `shutdown_waits_export_audit` его
+  не ловила (аудит успевал за 10 мс ожидания, `rev5-m3.log`); тест дополнен проверкой счётчика
+  через 300 мс после старта → FAIL (0 вместо 1, `rev6-m3.log`);
+- `abort_kind` без `downcast` и `zip_store` через текст → `send_stalled_gives_up`,
+  `dead_writer_drop_does_not_wait_or_write`, `export_deadline_aborts`, `export_stops_on_shutdown`
+  FAIL (`reason` = `error`);
+- после отката — PASS: `zam-server --lib transfer` — 12, `--test transfer_export` — 16 PASS;
+  `fmt --check`, `clippy -p zam-server --all-targets -D warnings` — чисто.

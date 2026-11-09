@@ -758,8 +758,12 @@ async fn shutdown_waits_export_audit() {
     let w = big_world("export-waitaudit", |_| {}).await;
     let a = &w.a;
     let r = start_export(a, &w.o.tok, G).await;
+    // задача экспорта учтена, пока идёт (поток встал на полном канале), а не только до старта
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(a.st.export_tasks.running(), 1);
     a.st.begin_stop();
     assert!(a.st.wait_exports(std::time::Duration::from_secs(5)).await);
+    assert_eq!(a.st.export_tasks.running(), 0);
     let all = a
         .adm(Method::GET, "/api/v1/admin/audit", None, None)
         .await

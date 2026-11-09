@@ -991,6 +991,21 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(3600),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
+        // сам писатель: после ошибки `write` и `flush` (дописывание каталога в `Drop`) — сразу
+        let mut w = ChanWriter::new(tx.clone(), g.clone(), Duration::from_secs(2));
+        let e = w.write_all(&vec![1u8; CHUNK]).unwrap_err();
+        assert_eq!(abort_kind(&e), Some(AbortKind::Stall));
+        let t0 = Instant::now();
+        let e = w.write_all(&vec![2u8; CHUNK]).unwrap_err();
+        assert_eq!(abort_kind(&e), Some(AbortKind::Stall));
+        assert!(w.flush().is_err());
+        assert!(
+            t0.elapsed() < Duration::from_millis(1000),
+            "мёртвый поток ждал {:?}",
+            t0.elapsed()
+        );
+        drop(w);
+        // то же под zip: `Drop` не ждёт
         let w = ChanWriter::new(tx, g, Duration::from_secs(2));
         let mut z = zip::ZipWriter::new_stream(w);
         z.start_file("a.bin", opts(CompressionMethod::Stored, 0))
