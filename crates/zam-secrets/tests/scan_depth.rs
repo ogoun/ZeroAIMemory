@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{atoms, corpus, expand};
+use common::{MARK, atoms, corpus, expand};
 use zam_secrets::{FIXPOINT_MAX, mask_text, scan_secrets, scan_secrets_ext};
 
 /// Закреплённый вход упора (шаблон фикстуры, раскрытый).
@@ -37,9 +37,11 @@ fn scan_depth_capped() {
         scan_secrets(&t),
         "проверочный повтор не меняет находок"
     );
-    // признак честный: маскировка на таком входе не идемпотентна
+    // признак честный: маскировка на таком входе не идемпотентна; «золотые» результаты —
+    // первая маскировка оставляет последнее звено `:`…`@` открытым, вторая закрывает его
     let once = mask_text(&t);
-    assert_ne!(mask_text(&once), once, "упор без потери идемпотентности");
+    assert_eq!(once, format!("x://pwd={MARK}\"pwd=:{MARK}@"), "{t}");
+    assert_eq!(mask_text(&once), format!("x://pwd={MARK}\"pwd={MARK}"));
     // на звено короче — ровно предел, без упора: проверочный повтор ничего не нашёл
     let short = t
         .strip_suffix("\"pwd=:`@")

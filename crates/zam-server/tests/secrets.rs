@@ -334,8 +334,21 @@ fn scan_depth_capped_logs_without_text() {
         "{log}"
     );
     assert!(log.contains("passes=4"), "{log}");
-    // ни значений находок, ни фрагментов текста
-    for frag in ["passwd", "BEGIN", "t://", &t[5..25]] {
+    // ни значений находок, ни фрагментов текста (в том числе случайных строк фикстуры)
+    let hits = zam_markdown::scan_secrets(&t);
+    assert!(!hits.is_empty());
+    for h in &hits {
+        let v = &t[h.range.clone()];
+        assert!(!log.contains(v), "{v}: {log}");
+    }
+    let rnd40 = scan_common::rnd(40, 101);
+    assert!(t.contains(&rnd40), "фикстура с {{rnd:40:101}}");
+    for frag in [
+        &rnd40[..12],
+        &scan_common::rnd(20, 301)[..12],
+        "x://",
+        "pwd=",
+    ] {
         assert!(!log.contains(frag), "{frag}: {log}");
     }
     assert!(

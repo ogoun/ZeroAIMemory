@@ -29,7 +29,8 @@ fn secrets_reexport_identical() {
         assert_eq!(zam_markdown::mask_secrets(t, &hits), m, "{t:?}");
         assert_eq!(
             zam_markdown::scan_secrets_ext(t),
-            zam_secrets::scan_secrets_ext(t)
+            zam_secrets::scan_secrets_ext(t),
+            "{t:?}"
         );
         masked += usize::from(m != *t);
     }
