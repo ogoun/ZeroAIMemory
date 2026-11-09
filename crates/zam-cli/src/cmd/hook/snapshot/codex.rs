@@ -208,6 +208,70 @@ impl TranscriptAdapter for CodexAdapter {
     }
 }
 
+/// Первая строка файла для адаптера (она вне окна хвоста): только `session_meta`. Целая строка
+/// проверяется разбором; начало длинной строки (`cut`) — по признаку типа в начале, а `id` и
+/// `cwd` достаёт [`meta_from_prefix`] и собирает из них короткую запись `session_meta`.
+pub fn head_line(head: &str, cut: bool) -> Option<String> {
+    if !cut {
+        let l: Line = serde_json::from_str(head).ok()?;
+        return (l.kind.as_deref() == Some("session_meta")).then(|| head.to_string());
+    }
+    let (id, cwd) = meta_from_prefix(head)?;
+    let mut payload = serde_json::Map::new();
+    payload.insert("id".into(), Value::String(id));
+    if let Some(c) = cwd {
+        payload.insert("cwd".into(), Value::String(c));
+    }
+    Some(serde_json::json!({"type": "session_meta", "payload": payload}).to_string())
+}
+
+/// `payload.id` и `payload.cwd` из начала строки `session_meta`, обрезанной до разбора
+/// (`instructions`/`base_instructions` — AGENTS.md — длиннее предела чтения). Разбор
+/// ограниченный, без полного JSON: тип — `"type":"session_meta"` до `"payload"`, поля ищутся
+/// после `"payload":{` и до первого `"instructions"`/`"base_instructions"` (в `SessionMeta` Codex
+/// они идут раньше); значение — JSON-строка до закрывающей неэкранированной кавычки.
+pub fn meta_from_prefix(prefix: &str) -> Option<(String, Option<String>)> {
+    let p = prefix.find("\"payload\"")?;
+    if !prefix[..p].contains("\"type\":\"session_meta\"") {
+        return None;
+    }
+    let body = &prefix[p..];
+    let stop = ["\"instructions\"", "\"base_instructions\""]
+        .iter()
+        .filter_map(|k| body.find(k))
+        .min()
+        .unwrap_or(body.len());
+    let body = &body[..stop];
+    let field = |name: &str| -> Option<String> {
+        let key = format!("\"{name}\":");
+        let mut from = 0;
+        while let Some(i) = body[from..].find(&key) {
+            let at = from + i;
+            from = at + key.len();
+            // ключ — не внутри строки: перед ним `{` или `,` (без пробелов, как у serde_json)
+            if !matches!(body[..at].chars().next_back(), Some('{' | ',')) {
+                continue;
+            }
+            let rest = body[from..].trim_start();
+            if !rest.starts_with('"') {
+                return None;
+            }
+            let bytes = rest.as_bytes();
+            let mut j = 1;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'\\' => j += 2,
+                    b'"' => return serde_json::from_str::<String>(&rest[..=j]).ok(),
+                    _ => j += 1,
+                }
+            }
+            return None;
+        }
+        None
+    };
+    Some((field("id")?, field("cwd")))
+}
+
 /// Текст команды: строка или массив аргументов; `bash -lc "<скрипт>"` → скрипт.
 fn command_text(v: &Value) -> Option<String> {
     if let Some(s) = v.as_str() {

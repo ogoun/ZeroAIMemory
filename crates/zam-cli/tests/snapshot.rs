@@ -348,6 +348,55 @@ fn codex_session_meta_outside_window() {
     assert_eq!(s.data.files, ["crates/y/src/a.rs"]);
 }
 
+/// Длинная `session_meta` (instructions — AGENTS.md — больше 64 КиБ, перевода строки в первых
+/// 64 КиБ нет): `id` и `cwd` достаются из начала строки.
+#[test]
+fn codex_long_session_meta_prefix() {
+    let c = Case::new("codex-longmeta");
+    let sub = c.root.join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    let meta = format!(
+        r#"{{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{{"id":"00000000-0000-4000-8000-0000000000c3","timestamp":"2026-01-01T00:00:00.000Z","cwd":"{}","originator":"codex_cli_rs","cli_version":"0.0.0","instructions":"{}"}}}}"#,
+        json_str(&sub.to_string_lossy()),
+        "п".repeat(40_000)
+    );
+    assert!(meta.len() > 64 * 1024 + 1024);
+    let pad = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+        "о".repeat(40 * 1024)
+    );
+    let patch = r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch"}}"#;
+    let p = c.journal(&[], &[meta, pad, patch.to_string()]);
+    let mut o = c.opts(AgentKind::Codex, "");
+    o.tail_kb = 64;
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(
+        s.session_hint.as_deref(),
+        Some("00000000-0000-4000-8000-0000000000c3")
+    );
+    assert_eq!(s.data.files, ["crates/x/src/a.rs"]);
+    assert_eq!((s.skipped, s.status), (0, SnapStatus::Complete));
+}
+
+/// Первая строка вне окна берётся, только если это `session_meta`: старая запись другого типа
+/// (запрос человека) в снимок не попадает.
+#[test]
+fn codex_head_other_type_ignored() {
+    let c = Case::new("codex-headtype");
+    let old = r#"{"type":"event_msg","payload":{"type":"user_message","message":"Старый запрос вне окна."}}"#;
+    let pad = format!(
+        r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+        "о".repeat(40 * 1024)
+    );
+    let new = r#"{"type":"event_msg","payload":{"type":"user_message","message":"Новый запрос."}}"#;
+    let p = c.journal(&[], &[old.to_string(), pad, new.to_string()]);
+    let mut o = c.opts(AgentKind::Codex, "");
+    o.tail_kb = 64;
+    let s = snapshot::take(&p, &o).unwrap();
+    assert_eq!(s.data.prompts, ["Новый запрос."]);
+    assert_eq!(s.session_hint, None);
+}
+
 /// `response_item` с `role: user` (правила проекта, окружение) и `compaction` с
 /// `encrypted_content` не берутся.
 #[test]
@@ -679,6 +728,23 @@ fn flags_do_not_touch_prose_and_uid() {
                     cmd: "ssh -u admin:secretword host".into(),
                     failed: None,
                 },
+                // ссылка на переменную — не секрет; слово-схему тоже не трогаем
+                SnapCommand {
+                    cmd: "curl -H \"Authorization: Bearer $TOKEN\" https://h".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "curl -H 'Authorization: Bearer ${API_TOKEN}' https://h".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "curl -H \"Authorization: Basic %CREDS%\" https://h".into(),
+                    failed: None,
+                },
+                SnapCommand {
+                    cmd: "curl -H \"Authorization: Bearer $TK\" https://h".into(),
+                    failed: None,
+                },
             ],
         },
     };
@@ -687,8 +753,9 @@ fn flags_do_not_touch_prose_and_uid() {
     assert_eq!(out.data, before);
 }
 
-/// Секрет на второй строке многострочной команды не попадает, даже если первая строка
-/// маскируется отдельно: маска — по всему полю, затем первая строка.
+/// Команда: сначала первая непустая строка, затем маска по ней (окно — строка плюс запас), затем
+/// обрезка до 200 символов. Остальные строки (тело here-doc с ключом) в снимок не идут вовсе;
+/// секрет на границе обрезки маскируется целиком, а не по обрывку.
 #[test]
 fn command_first_line_after_mask() {
     let (pw, _, gh) = bait();

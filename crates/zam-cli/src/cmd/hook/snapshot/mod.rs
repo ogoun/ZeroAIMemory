@@ -103,6 +103,15 @@ impl AgentKind {
         matches!(self, AgentKind::Codex)
     }
 
+    /// Строка для адаптера из первой строки файла (`cut` — прочитано только начало): у Codex —
+    /// только `session_meta` (иначе вне окна оказалась бы старая запись хода).
+    fn head_line(self, head: &str, cut: bool) -> Option<String> {
+        match self {
+            AgentKind::Claude => None,
+            AgentKind::Codex => codex::head_line(head, cut),
+        }
+    }
+
     fn adapter(self, root: &Path, session: &str) -> Box<dyn TranscriptAdapter> {
         match self {
             AgentKind::Claude => Box::new(ClaudeAdapter::new(root, session)),
@@ -200,11 +209,13 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
     let filters = o.agent.prefilter();
     let passes = |s: &str| filters.iter().any(|f| s.contains(f));
     let mut skipped = 0u32;
-    // первая строка файла (`session_meta` Codex) вне окна — до хвоста, если она своего формата
-    if let Some(head) = tail.head.as_deref()
-        && passes(head)
+    // первая строка файла (`session_meta` Codex) вне окна — до хвоста; адаптер решает, его ли она
+    if let Some(line) = tail
+        .head
+        .as_ref()
+        .and_then(|(h, cut)| o.agent.head_line(h, *cut))
     {
-        adapter.accept_line(head);
+        adapter.accept_line(&line);
     }
     let mut lines = tail.buf.split(|&b| b == b'\n').peekable();
     let mut i = 0usize;
@@ -257,8 +268,9 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
 struct Tail {
     /// Хвост с начала целой строки.
     buf: Vec<u8>,
-    /// Первая строка файла (не больше [`HEAD_LINE_MAX`]), если окно её не захватило.
-    head: Option<String>,
+    /// Первая строка файла, если окно её не захватило: целиком (`false`) или только начало в
+    /// [`HEAD_LINE_MAX`] байт без перевода строки (`true`, строка длиннее).
+    head: Option<(String, bool)>,
     /// Срок вышел во время чтения.
     late: bool,
 }
@@ -309,18 +321,32 @@ fn read_tail(path: &Path, max: usize, soft: Instant, want_head: bool) -> Option<
     Some(Tail { buf, head, late })
 }
 
-/// Первая строка файла, если она целиком в первых [`HEAD_LINE_MAX`] байтах и кончается до
-/// `limit` (начала окна хвоста — иначе она уже в окне или обрезана им).
-fn read_head(f: &mut File, limit: u64) -> Option<String> {
+/// Первая строка файла из первых `min(HEAD_LINE_MAX, limit)` байт (`limit` — начало окна хвоста):
+/// целиком, если перевод строки там есть, иначе начало строки (по границе символа) и `true`.
+/// У Codex `session_meta` с `instructions` (AGENTS.md) бывает длиннее 64 КиБ; `id` и `cwd` в ней
+/// идут раньше `instructions` — их достаёт [`codex::meta_from_prefix`].
+fn read_head(f: &mut File, limit: u64) -> Option<(String, bool)> {
     let n = (HEAD_LINE_MAX as u64).min(limit) as usize;
     f.seek(SeekFrom::Start(0)).ok()?;
     let mut b = vec![0u8; n];
     f.read_exact(&mut b).ok()?;
-    let end = b.iter().position(|&c| c == b'\n')?;
+    let (end, cut) = match b.iter().position(|&c| c == b'\n') {
+        Some(e) => (e, false),
+        None => (n, true),
+    };
     b.truncate(end);
-    String::from_utf8(b)
-        .ok()
-        .map(|s| s.trim_end_matches('\r').to_string())
+    let s = match String::from_utf8(b) {
+        Ok(s) => s,
+        // начало длинной строки могло оборвать символ — до последней целой границы
+        Err(e) if cut => {
+            let ok = e.utf8_error().valid_up_to();
+            let mut b = e.into_bytes();
+            b.truncate(ok);
+            String::from_utf8(b).ok()?
+        }
+        Err(_) => return None,
+    };
+    Some((s.trim_end_matches('\r').to_string(), cut))
 }
 
 /// Маскировка и пределы §8а. Каждое текстовое поле: `zam_secrets` (как `mask_text`) и
@@ -617,7 +643,8 @@ pub fn summary_tail(text: &str, max: usize) -> String {
 /// - `--password X`/`--password=X` (и `--passphrase`, `--secret-key`, `--client-secret`, `--token`,
 ///   `--api-key`, `--secret`, …);
 /// - `-u user:pass`/`--user user:pass` у curl, wget и подобных (числовые `uid:gid` — нет);
-/// - значение заголовка `Authorization:` (`Bearer X`, `Basic X`, `Token X`) и `X-Api-Key:`.
+/// - значение заголовка `Authorization:` (`Bearer X`, `Basic X`, `Token X`) и `X-Api-Key:`;
+///   ссылка на переменную (`Bearer $TOKEN`) и сама схема не маскируются.
 ///
 /// Значение заменяется меткой `‹secret›`; ссылки на переменные (`$X`, `%X%`) и заглушки (`<…>`)
 /// остаются.
@@ -635,7 +662,7 @@ pub fn mask_flags(text: &str) -> String {
                 .expect("regex"),
             // Authorization: Bearer X | Basic X | Token X | X; X-Api-Key: X
             Regex::new(
-                r#"(?i)(?:authorization\s*:\s*(?:(?:bearer|basic|token|digest)\s+)?|x-api-key\s*:\s*)([A-Za-z0-9._~+/=-]{6,})"#,
+                r#"(?i)(?:authorization\s*:\s*(?:(?:bearer|basic|token|digest)\s+)?|x-api-key\s*:\s*)([^\s"']{6,})"#,
             )
             .expect("regex"),
             // -pXXX, -p'a b' (значение слитно с флагом)
@@ -677,7 +704,14 @@ pub fn mask_flags(text: &str) -> String {
                 e -= 1;
             }
             let inner = &text[b..e];
+            // значение — ссылка на переменную (`$NAME`, `${NAME}`, `%NAME%`) или заглушка; у
+            // заголовка без значения длиной ≥ 6 регулярка берёт слово-схему — его не трогаем
+            let scheme = i == 2
+                && ["bearer", "basic", "token", "digest"]
+                    .iter()
+                    .any(|w| inner.eq_ignore_ascii_case(w));
             if inner.is_empty()
+                || scheme
                 || inner.contains(zam_secrets::SECRET_MARK)
                 || inner.starts_with(['$', '%', '<'])
             {
