@@ -101,6 +101,14 @@ const SPEED_GRACE: Duration = Duration::from_secs(60);
 const DRAIN_MAX: u64 = 16 << 20;
 /// Срок дочитывания при отказе.
 const DRAIN_TIME: Duration = Duration::from_secs(5);
+/// Оценка объёма тела без `Content-Length` (`zam import` каталога): резерв места и предел
+/// тела вместо `import.max_bytes`.
+pub const EXPECTED_HEADER: &str = "x-zam-expected-bytes";
+
+/// Предел тела по оценке клиента `est`: оценка плюс небольшой запас (1/32 и 64 КиБ).
+fn estimate_cap(est: u64) -> u64 {
+    est.saturating_add(est / 32).saturating_add(64 << 10)
+}
 
 /// Дочитывает и выбрасывает тело (не больше [`DRAIN_MAX`] и [`DRAIN_TIME`]).
 async fn drain(s: &mut axum::body::BodyDataStream) {
@@ -663,8 +671,10 @@ impl Drop for DiskReserve {
 
 /// Резерв места под тело `expected` байт: нужно `import.min_free_bytes + 2 × expected` (тело и
 /// распакованные из него вложения) сверх уже зарезервированного идущими приёмами и заданиями с
-/// лежащими `.part`; иначе 507. Проверка и запись резерва — под одной блокировкой. Тестовая
-/// точка `import_disk_full` — «места нет».
+/// лежащими `.part`; иначе 507. Резервируется `2 × expected` до удаления `.part` (после
+/// распаковки вложений). Проверка и запись резерва — под одной блокировкой. Свободное место —
+/// [`crate::backup::free_space`] (тестовая подмена по каталогу данных); тестовая точка
+/// `import_disk_full` — «места нет».
 fn disk_reserve(st: &AppState, job: Id, expected: u64) -> Result<DiskReserve, ApiError> {
     let full = || {
         ApiError::InsufficientStorage(
@@ -674,14 +684,11 @@ fn disk_reserve(st: &AppState, job: Id, expected: u64) -> Result<DiskReserve, Ap
     if crate::backup::fail_point(&st.cfg.data_dir, "import_disk_full").is_err() {
         return Err(full());
     }
-    let need = st
-        .cfg
-        .import
-        .min_free_bytes
-        .saturating_add(expected.saturating_mul(2));
+    let hold = expected.saturating_mul(2);
+    let need = st.cfg.import.min_free_bytes.saturating_add(hold);
     let map = st.imports.disk.clone();
     let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
-    match fs4::available_space(st.data_dir.root()) {
+    match crate::backup::free_space(&st.cfg.data_dir, st.data_dir.root()) {
         Ok(free) => {
             let reserved: u64 = m.values().sum();
             if free.saturating_sub(reserved) < need {
@@ -692,7 +699,7 @@ fn disk_reserve(st: &AppState, job: Id, expected: u64) -> Result<DiskReserve, Ap
             tracing::warn!(error = %e, "импорт: свободное место не определено — проверка пропущена")
         }
     }
-    m.insert(job, expected);
+    m.insert(job, hold);
     drop(m);
     Ok(DiskReserve { map, job })
 }
@@ -764,16 +771,32 @@ pub async fn import(
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    if declared.is_some_and(|n| n > limit) {
+    let estimate = match headers.get(EXPECTED_HEADER) {
+        None => None,
+        Some(v) => match v.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+            Some(n) => Some(n),
+            None => {
+                let e = ApiError::BadRequest(format!("{EXPECTED_HEADER} — целое число байт"));
+                return Err(refuse(body, e, expect).await);
+            }
+        },
+    };
+    if declared.or(estimate).is_some_and(|n| n > limit) {
         return Err(refuse(body, Recv::TooLarge.into_api(limit), expect).await);
     }
+    // предел тела и ожидаемый объём: Content-Length; без него — оценка клиента с запасом
+    // (тело больше — 413, занижением резерв не обойти); без оценки — import.max_bytes
+    let cap = match (declared, estimate) {
+        (Some(n), _) => n,
+        (None, Some(e)) => estimate_cap(e).min(limit),
+        (None, None) => limit,
+    };
     let slot = match recv_slot(&st.imports, sc.user.id) {
         Ok(s) => s,
         Err(e) => return Err(refuse(body, e, expect).await),
     };
     let job = Id::new();
-    // место: ожидаемый объём — Content-Length, без него — import.max_bytes
-    let disk = match disk_reserve(&st, job, declared.unwrap_or(limit)) {
+    let disk = match disk_reserve(&st, job, cap) {
         Ok(d) => d,
         Err(e) => return Err(refuse(body, e, expect).await),
     };
@@ -820,9 +843,9 @@ pub async fn import(
         Some(disk),
     );
     let lim = RecvLimits {
-        max_bytes: limit,
+        max_bytes: cap,
         stall: STALL,
-        deadline: recv_deadline(limit),
+        deadline: recv_deadline(cap),
         min_speed: MIN_SPEED,
         grace: SPEED_GRACE,
     };
@@ -838,7 +861,14 @@ pub async fn import(
         Err(e) => {
             st.imports.drop_job(job);
             out.reason = Some(e.reason());
-            let err = e.into_api(limit);
+            let err = match e {
+                Recv::TooLarge if declared.is_none() && estimate.is_some() && cap < limit => {
+                    ApiError::PayloadTooLarge(format!(
+                        "архив больше заявленной оценки {EXPECTED_HEADER} (с запасом {cap} байт)"
+                    ))
+                }
+                e => e.into_api(limit),
+            };
             if let Err(e) = audit.done(&st, &out, false, None).await {
                 tracing::warn!(space = %sc.space.id, error = %e, "аудит импорта не записан");
             }

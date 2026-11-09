@@ -259,7 +259,7 @@ pub mod test_hooks {
             .cloned()
     }
 
-    /// Свободное место для копий каталога данных `data_dir` (`None` — настоящее).
+    /// Свободное место для копий и импорта каталога данных `data_dir` (`None` — настоящее).
     pub fn set_free_space(data_dir: &Path, free: Option<u64>) {
         set(&FREE, data_dir, free);
     }
@@ -298,7 +298,7 @@ pub mod test_hooks {
     }
 }
 
-/// Свободное место тома `dir` (тестовая точка — по каталогу данных).
+/// Свободное место тома `dir` (копии, импорт; тестовая точка — по каталогу данных).
 pub(crate) fn free_space(data_dir: &Path, dir: &Path) -> std::io::Result<u64> {
     #[cfg(feature = "test-hooks")]
     if let Some(f) = test_hooks::free_space(data_dir) {

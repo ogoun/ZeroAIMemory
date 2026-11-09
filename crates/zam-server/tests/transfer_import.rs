@@ -12,8 +12,8 @@ use std::io::{Cursor, Write};
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use common::api::{Api, Resp, api};
-use common::reports::{G, User, W, ok, png, ready_user, web, with_ip, world, world_cfg};
+use common::api::{Api, Resp};
+use common::reports::{G, User, W, ok, png, ready_user, web, with_ip};
 use serde_json::{Value, json};
 use zam_core::Id;
 use zip::write::SimpleFileOptions;
@@ -114,6 +114,30 @@ async fn export_web(a: &Api, u: &User, space: &str, q: &str) -> Vec<u8> {
     .await;
     ok(&r, StatusCode::OK, "экспорт");
     r.body.to_vec()
+}
+
+/// Свободное место тестов импорта — подменённое, а не диска раннера (резерв места не мешает
+/// тестам; тесты места ставят своё).
+const TEST_FREE: u64 = 1 << 40;
+
+fn free(a: &Api, n: Option<u64>) {
+    zam_server::backup::test_hooks::set_free_space(&a.st.cfg.data_dir, n);
+}
+
+async fn api(name: &str, tweak: impl FnOnce(&mut zam_server::config::ServerConfig)) -> Api {
+    let a = common::api::api(name, tweak).await;
+    free(&a, Some(TEST_FREE));
+    a
+}
+
+async fn world(name: &str) -> W {
+    world_cfg(name, |_| {}).await
+}
+
+async fn world_cfg(name: &str, tweak: impl FnOnce(&mut zam_server::config::ServerConfig)) -> W {
+    let w = common::reports::world_cfg(name, tweak).await;
+    free(&w.a, Some(TEST_FREE));
+    w
 }
 
 fn import_req(space: &str, q: &str, body: Body) -> axum::http::request::Builder {
@@ -2294,7 +2318,6 @@ async fn import_pending_limits_per_user_and_server() {
 fn hanging_import(a: &Api, tok: &str, declared: u64) -> tokio::task::JoinHandle<Resp> {
     let app = a.app.clone();
     let tok = tok.to_string();
-    let st = a.st.clone();
     tokio::spawn(async move {
         let body = Body::from_stream(futures_util::stream::pending::<
             Result<axum::body::Bytes, std::io::Error>,
@@ -2305,79 +2328,152 @@ fn hanging_import(a: &Api, tok: &str, declared: u64) -> tokio::task::JoinHandle<
             .body(body)
             .unwrap();
         let r = tower::ServiceExt::oneshot(app, req).await.unwrap();
-        let _ = st;
-        let status = r.status();
         Resp {
-            status,
+            status: r.status(),
             headers: r.headers().clone(),
             body: Default::default(),
         }
     })
 }
 
-/// Место на диске с учётом резерва параллельного приёма: первый приём (10 ГиБ заявлено)
-/// резервирует 2 × 10 ГиБ; второй с тем же объёмом при запасе `min_free_bytes` = свободно − 30
-/// ГиБ не помещается — 507 до чтения тела. Резерв снимается, когда приём снят.
-#[tokio::test]
-async fn import_refused_when_disk_low_with_reserve() {
-    const E: u64 = 10 << 30;
-    let probe = common::tmp("api-imp-disk-probe");
-    std::fs::create_dir_all(&probe).unwrap();
-    let free = fs4::available_space(&probe).unwrap();
-    assert!(
-        free > 40 << 30,
-        "для теста нужно больше 40 ГиБ свободных: {free}"
-    );
-    let w = world_cfg("imp-disk", move |c| {
-        c.import.max_bytes = 64 << 30;
-        c.import.min_free_bytes = free - 3 * E;
-    })
-    .await;
-    let first = hanging_import(&w.a, &w.rw.tok, E);
+/// Ждёт, пока резерв места станет `want`.
+async fn reserved_is(a: &Api, want: u64, what: &str) {
     let t0 = std::time::Instant::now();
-    while w.a.st.imports.disk_reserved() == 0 {
+    while a.st.imports.disk_reserved() != want {
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(10),
-            "первый приём не начался"
+            "{what}: резерв {} ≠ {want}",
+            a.st.imports.disk_reserved()
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(w.a.st.imports.disk_reserved(), E);
-    // второй (другой пользователь): свободно − резерв < запас + 2 × E
+}
+
+/// Место с учётом резерва параллельного приёма (свободное место подменено): запас M, объём E,
+/// свободно M + 3E. Первый приём резервирует 2E. Второй (другой пользователь) без резерва
+/// поместился бы (M + 2E ≤ M + 3E), с резервом — нет с запасом в целый E (M + E < M + 2E):
+/// 507 до чтения тела. Снят первый — второй принят и резервирует 2E.
+#[tokio::test]
+async fn import_refused_when_disk_low_with_reserve() {
+    const M: u64 = 1 << 30;
+    const E: u64 = 100 << 20;
+    let w = world_cfg("imp-disk", |c| c.import.min_free_bytes = M).await;
+    free(&w.a, Some(M + 3 * E));
+    let first = hanging_import(&w.a, &w.rw.tok, E);
+    reserved_is(&w.a, 2 * E, "первый приём").await;
     let second = hanging_import(&w.a, &w.o.tok, E);
     let r = tokio::time::timeout(std::time::Duration::from_secs(15), second)
         .await
         .expect("второй приём не отвергнут: резерв первого не учтён")
         .unwrap();
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(
+        w.a.st.imports.disk_reserved(),
+        2 * E,
+        "резерв второго не остался"
+    );
     first.abort();
     let _ = first.await;
-    let t0 = std::time::Instant::now();
-    while w.a.st.imports.disk_reserved() != 0 {
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(10),
-            "резерв не снят"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    reserved_is(&w.a, 0, "снятие первого").await;
+    let again = hanging_import(&w.a, &w.o.tok, E);
+    reserved_is(&w.a, 2 * E, "второй после снятия первого").await;
+    again.abort();
+    let _ = again.await;
+    reserved_is(&w.a, 0, "снятие второго").await;
     assert!(incoming_parts(&w.a).is_empty());
 }
 
-/// Запас по умолчанию (2 ГиБ) на обычном диске не отказывает; резерв снимается после задания;
-/// точка `import_disk_full` — 507.
+/// Запас по умолчанию (2 ГиБ): свободно ровно `2 ГиБ + 2 × тело` — принят, резерв снят после
+/// задания; на байт меньше — 507; точка `import_disk_full` — 507.
 #[tokio::test]
 async fn import_default_disk_reserve_allows() {
     let w = world("imp-disk-default").await;
     assert_eq!(w.a.st.cfg.import.min_free_bytes, 2 << 30);
     note(&w.a, &w.o.tok, G, "x", "текст").await;
     let zip = export_tok(&w.a, &w.o.tok, G, "").await;
-    report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await);
+    let len = zip.len() as u64;
+    let sized = |zip: Vec<u8>| {
+        import_req("knowledge", "", Body::empty())
+            .header(header::AUTHORIZATION, format!("Bearer {}", w.rw.tok))
+            .header(header::CONTENT_LENGTH, len.to_string())
+            .body(Body::from(zip))
+            .unwrap()
+    };
+    free(&w.a, Some((2 << 30) + 2 * len - 1));
+    let r = w.a.send(sized(zip.clone())).await;
+    ok(&r, StatusCode::INSUFFICIENT_STORAGE, "на байт меньше");
+    free(&w.a, Some((2 << 30) + 2 * len));
+    let r = w.a.send(sized(zip.clone())).await;
+    report(&wait_job(&w.a, Who::Tok(&w.rw.tok), r).await);
     assert_eq!(w.a.st.imports.disk_reserved(), 0);
     zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, Some("import_disk_full"));
+    free(&w.a, Some(TEST_FREE));
     let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
     zam_server::backup::test_hooks::set_fail_point(&w.a.st.cfg.data_dir, None);
     ok(&r, StatusCode::INSUFFICIENT_STORAGE, "точка места");
     assert_eq!(w.a.st.imports.disk_reserved(), 0);
+    assert_eq!(w.a.st.imports.running(), 0);
+}
+
+/// Тело потоком без `Content-Length` (chunked), с оценкой `X-Zam-Expected-Bytes`.
+fn estimated(tok: &str, est: &str, zip: Vec<u8>) -> Request<Body> {
+    let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = zip
+        .chunks(64 << 10)
+        .map(|c| Ok(axum::body::Bytes::copy_from_slice(c)))
+        .collect();
+    import_req("knowledge", "", Body::empty())
+        .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+        .header("x-zam-expected-bytes", est)
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap()
+}
+
+/// Оценка объёма каталога (`X-Zam-Expected-Bytes`): маленький поток при малом свободном месте
+/// принят (резерв по оценке, а не по `max_bytes`); без оценки — 507; тело больше оценки с
+/// запасом — 413; оценка больше `max_bytes` — 413 до тела; не число — 400.
+#[tokio::test]
+async fn import_estimate_header_reserves_and_limits() {
+    let w = world_cfg("imp-estimate", |c| c.import.min_free_bytes = 0).await;
+    note(&w.a, &w.o.tok, G, "x", "текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    // места хватает на оценку, но не на 2 × max_bytes (2 ГиБ)
+    free(&w.a, Some(64 << 20));
+    let est = zip.len().to_string();
+    let r = w.a.send(estimated(&w.rw.tok, &est, zip.clone())).await;
+    report(&wait_job(&w.a, Who::Tok(&w.rw.tok), r).await);
+    assert_eq!(w.a.st.imports.disk_reserved(), 0);
+    let r = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip.clone()).await;
+    ok(
+        &r,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "без оценки — max_bytes",
+    );
+    // тело больше оценки с запасом (1/32 + 64 КиБ): 413, резерв снят
+    free(&w.a, Some(TEST_FREE));
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let big: Vec<u8> = (0..(1 << 20))
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let r = w.a.send(estimated(&w.rw.tok, "1000", big)).await;
+    ok(&r, StatusCode::PAYLOAD_TOO_LARGE, "тело больше оценки");
+    assert_eq!(w.a.st.imports.disk_reserved(), 0);
+    assert!(incoming_parts(&w.a).is_empty());
+    let rows = w.a.st.system.list_audit(100, None).await.unwrap();
+    let d = rows
+        .iter()
+        .find(|r| r.action == "space.import.done" && r.details["reason"] == json!("too_large"))
+        .expect("аудит too_large");
+    assert_eq!(d.details["complete"], json!(false));
+    let over = ((2u64 << 30) + 1).to_string();
+    let r = w.a.send(estimated(&w.rw.tok, &over, zip.clone())).await;
+    ok(&r, StatusCode::PAYLOAD_TOO_LARGE, "оценка больше max_bytes");
+    let r = w.a.send(estimated(&w.rw.tok, "много", zip)).await;
+    ok(&r, StatusCode::BAD_REQUEST, "оценка не число");
     assert_eq!(w.a.st.imports.running(), 0);
 }
 
