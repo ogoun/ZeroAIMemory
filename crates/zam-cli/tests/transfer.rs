@@ -362,7 +362,11 @@ fn stub(answers: Vec<Option<String>>) -> String {
             }
             let mut body = vec![0u8; len];
             let _ = r.read_exact(&mut body);
-            let Some(next) = answers.next() else { return };
+            // ответы кончились — соединение закрывается без ответа, но слушатель жив: порт не
+            // достаётся заглушке другого теста, куда попал бы повтор этого CLI
+            let Some(next) = answers.next() else {
+                continue;
+            };
             let mut c = c;
             match next {
                 None => drop(c),
@@ -496,46 +500,101 @@ fn cli_import_http_error_beats_broken_pipe() {
     assert!(!stderr(&o).contains("упаковка"), "{}", stderr(&o));
 }
 
-/// Заглушка: читает заголовки (`expect` — запоминает, был ли `Expect: 100-continue`), затем
-/// `head` байт тела, через `delay` отвечает `answer` и, не дочитав тело, держит соединение
-/// `hold`.
-fn stub_early(
-    answer: String,
-    head: usize,
-    delay: Duration,
-    hold: Duration,
-) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+/// Что видела заглушка [`stub_early`].
+#[derive(Default)]
+struct Seen {
+    /// Запрос импорта пришёл с `Expect: 100-continue`.
+    expect: std::sync::atomic::AtomicBool,
+    /// Журнал соединений (диагностика в сообщениях проверок).
+    log: std::sync::Mutex<Vec<String>>,
+}
+
+impl Seen {
+    fn expect(&self) -> bool {
+        self.expect.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn log(&self) -> String {
+        self.log.lock().unwrap().join("; ")
+    }
+}
+
+/// Заглушка: на POST импорта читает заголовки; `head > 0` — отвечает `100 Continue` (как
+/// сервер, начавший читать тело) и читает `head` байт тела; через `delay` отвечает `answer` и
+/// закрывает свою сторону записи (как сервер после отказа: ureq 3.4.2 дочитывает ранний ответ
+/// только до закрытия соединения), не дочитав тело, ждёт `hold` и рвёт соединение
+/// (`shutdown` действует на сокет, даже если его описатель унаследовал параллельно запущенный
+/// дочерний процесс). Прочие соединения закрываются. Слушатель живёт до конца процесса тестов
+/// (порт не достаётся другой заглушке).
+fn stub_early(answer: String, head: usize, delay: Duration, hold: Duration) -> (String, Arc<Seen>) {
     use std::io::{BufRead, BufReader, Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
-    let expect = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let seen = expect.clone();
+    let seen = Arc::new(Seen::default());
+    let s2 = seen.clone();
     std::thread::spawn(move || {
-        let Some(c) = l.incoming().flatten().next() else {
-            return;
-        };
-        let mut r = BufReader::new(c.try_clone().unwrap());
-        loop {
-            let mut line = String::new();
-            if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                break;
+        let mut served = false;
+        for c in l.incoming().flatten() {
+            let t0 = std::time::Instant::now();
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = r.read_line(&mut first);
+            let mut expect = false;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if line
+                    .to_ascii_lowercase()
+                    .starts_with("expect: 100-continue")
+                {
+                    expect = true;
+                }
             }
-            if line
-                .to_ascii_lowercase()
-                .starts_with("expect: 100-continue")
-            {
-                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            let import = first.starts_with("POST ") && first.contains("/import");
+            s2.log
+                .lock()
+                .unwrap()
+                .push(format!("{} expect={expect}", first.trim()));
+            if !import || served {
+                continue;
             }
+            served = true;
+            s2.expect.store(expect, std::sync::atomic::Ordering::SeqCst);
+            let mut c = c;
+            if head > 0 {
+                let _ = c.write_all(
+                    b"HTTP/1.1 100 Continue
+
+",
+                );
+                let mut body = vec![0u8; head];
+                let _ = r.read_exact(&mut body);
+            }
+            std::thread::sleep(delay);
+            // тело пошло до ответа: в буфере или в сокете уже есть байты
+            let early = !r.buffer().is_empty() || {
+                let _ = c.set_nonblocking(true);
+                let mut one = [0u8; 1];
+                let got = c.peek(&mut one).is_ok_and(|n| n > 0);
+                let _ = c.set_nonblocking(false);
+                got
+            };
+            s2.log.lock().unwrap().push(format!(
+                "ответ через {} мс, тело до ответа: {early}",
+                t0.elapsed().as_millis()
+            ));
+            let w = c.write_all(answer.as_bytes()).and_then(|()| c.flush());
+            let _ = c.shutdown(std::net::Shutdown::Write);
+            s2.log.lock().unwrap().push(format!("запись {w:?}"));
+            std::thread::spawn(move || {
+                std::thread::sleep(hold);
+                let _ = c.shutdown(std::net::Shutdown::Both);
+            });
         }
-        let mut body = vec![0u8; head];
-        let _ = r.read_exact(&mut body);
-        std::thread::sleep(delay);
-        let mut c = c;
-        let _ = c.write_all(answer.as_bytes());
-        let _ = c.flush();
-        std::thread::sleep(hold);
     });
-    (url, expect)
+    (url, seen)
 }
 
 /// Плохо сжимаемый текст `n` байт (после deflate почти не меньше).
@@ -569,20 +628,18 @@ fn big_repo(name: &str) -> PathBuf {
 /// обрыв приёма или упаковка.
 #[test]
 fn cli_import_server_answer_beats_broken_pipe_stub() {
-    let (url, expect) = stub_early(
+    let (url, seen) = stub_early(
         ANSWER_503.to_string(),
         0,
         Duration::from_secs(2),
         Duration::from_secs(3),
     );
     let r = big_repo("imp-503-stub-repo");
+    let t0 = std::time::Instant::now();
     let o = zam_idle(&url, &r, "30", &["import", "big", "--space", "knowledge"]);
-    let e = stderr(&o);
-    assert!(
-        expect.load(std::sync::atomic::Ordering::SeqCst),
-        "нет Expect: {e}"
-    );
-    assert!(e.contains("HTTP 503"), "{e}");
+    let e = format!("{} [{} мс]", stderr(&o), t0.elapsed().as_millis());
+    assert!(seen.expect(), "нет Expect: {e}; {}", seen.log());
+    assert!(e.contains("HTTP 503"), "{e}; {}", seen.log());
     assert!(e.contains("7"), "Retry-After: {e}");
     assert!(!e.contains("упаковка"), "{e}");
     assert!(!e.contains("прервал"), "{e}");
@@ -684,7 +741,7 @@ fn cli_import_pack_failure_aborts_body() {
 /// ответ (HTTP 503 через 2 с) приходит до тела.
 #[test]
 fn cli_import_zip_answer_before_body_stub() {
-    let (url, expect) = stub_early(
+    let (url, seen) = stub_early(
         ANSWER_503.to_string(),
         0,
         Duration::from_secs(2),
@@ -700,11 +757,8 @@ fn cli_import_zip_answer_before_body_stub() {
         &["import", "big.zip", "--space", "knowledge"],
     );
     let e = stderr(&o);
-    assert!(
-        expect.load(std::sync::atomic::Ordering::SeqCst),
-        "нет Expect: {e}"
-    );
-    assert!(e.contains("HTTP 503"), "{e}");
+    assert!(seen.expect(), "нет Expect: {e}; {}", seen.log());
+    assert!(e.contains("HTTP 503"), "{e}; {}", seen.log());
 }
 
 /// Каталог идёт с оценкой объёма: при малом свободном месте сервера (подмена: хватает на
