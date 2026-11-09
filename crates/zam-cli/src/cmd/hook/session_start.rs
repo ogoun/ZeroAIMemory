@@ -184,8 +184,9 @@ fn digest_net(
     let job = snapshot_queue::job_for_session_start(env, inp, s);
     let compact = source == Some("compact") && s.session_snapshot();
     let Some(client) = env.client() else {
+        // клиента нет (причина уже в журнале) — снимок только в очередь
         if let Some(j) = job {
-            snapshot_queue::run(env, s, j);
+            snapshot_queue::run(env, s, j, false);
         }
         return local(s);
     };
@@ -243,10 +244,10 @@ fn digest_net(
             sc.spawn(move || {
                 // снимок сессии — до `/recall` (`recovery` и дайджест видят свежий снимок)
                 match job {
-                    Some(j) => snapshot_queue::run(env, s, j),
+                    Some(j) => snapshot_queue::run(env, s, j, true),
                     None => {
                         if let Some(id) = session.filter(|_| compact) {
-                            let _ = snapshot_queue::flush(env, id);
+                            snapshot_queue::flush_logged(env, id);
                         }
                     }
                 }

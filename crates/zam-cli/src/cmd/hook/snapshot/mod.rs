@@ -164,6 +164,25 @@ pub struct TakeOpts {
     /// Конспект из входа хука (`PostCompact.compact_summary` Claude, §8а — основной источник):
     /// заменяет конспект журнала; журнала нет или он не читается — снимок из одного конспекта.
     pub summary: Option<String>,
+    /// Журнал короче — снимок не нужен ([`Taken::Skipped`]): `Stop` без роста, догоняющий снимок
+    /// без новых записей. Проверка — в потоке, в сроке (§8а: весь ввод-вывод в срок).
+    pub min_len: Option<u64>,
+    /// Журнал менялся позже, чем столько назад, — снимок не нужен ([`Taken::Skipped`]): живая
+    /// параллельная сессия для догоняющего снимка.
+    pub min_idle: Option<Duration>,
+}
+
+/// Итог [`take_ext`].
+#[derive(Debug)]
+pub enum Taken {
+    /// Снимок и размер журнала при чтении, байт.
+    Snap(Snapshot, u64),
+    /// Журнала нет, это не файл или ошибка чтения (и конспекта входа нет).
+    Missing,
+    /// Журнал не подошёл под `min_len`/`min_idle`.
+    Skipped,
+    /// Поток не успел в срок (брошен и ничего не пишет).
+    Late,
 }
 
 /// Снимок журнала `path` в отдельном потоке со сроком `opts.deadline`: чтение хвоста,
@@ -174,18 +193,29 @@ pub struct TakeOpts {
 /// по сроку поток доживает до конца своей работы и всё это время держит файл журнала открытым.
 /// Из долгоживущих процессов (`zam mcp`) не вызывать.
 pub fn take(path: &Path, opts: &TakeOpts) -> Option<Snapshot> {
+    match take_ext(path, opts) {
+        Taken::Snap(s, _) => Some(s),
+        _ => None,
+    }
+}
+
+/// [`take`] с причиной, если снимка нет, и размером журнала (для `snapst-*`): весь ввод-вывод
+/// журнала (`metadata`, проверки `min_len`/`min_idle`, чтение) — в потоке со сроком.
+pub fn take_ext(path: &Path, opts: &TakeOpts) -> Taken {
     let start = Instant::now();
     let (tx, rx) = mpsc::sync_channel(1);
     let path = path.to_path_buf();
     let o = opts.clone();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("zam-snapshot".into())
         .spawn(move || {
             test_stall(&path);
             let _ = tx.send(build(&path, &o, start));
-        })
-        .ok()?;
-    rx.recv_timeout(opts.deadline).ok().flatten()
+        });
+    if spawned.is_err() {
+        return Taken::Late;
+    }
+    rx.recv_timeout(opts.deadline).unwrap_or(Taken::Late)
 }
 
 /// Точка подмены для тестов срока: файл `<журнал>.stall-ms` с числом миллисекунд — поток
@@ -204,11 +234,31 @@ fn test_stall(path: &Path) {
 }
 
 /// Тело потока [`take`]: мягкий срок — 4/5 жёсткого, после него собранное отдаётся `partial`.
-fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
+fn build(path: &Path, o: &TakeOpts, start: Instant) -> Taken {
     let soft = start + o.deadline * 4 / 5;
     let summary = o.summary.as_deref().filter(|t| !t.trim().is_empty());
-    let Some(tail) = read_tail(path, o.tail_kb as usize * 1024, soft, o.agent.reads_head()) else {
+    let meta = std::fs::metadata(path).ok().filter(|m| m.is_file());
+    if let Some(m) = &meta {
+        let short = o.min_len.is_some_and(|n| m.len() < n);
+        let busy = o.min_idle.is_some_and(|idle| {
+            m.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age < idle)
+        });
+        if short || busy {
+            return Taken::Skipped;
+        }
+    }
+    let len = meta.as_ref().map_or(0, |m| m.len());
+    let tail = meta
+        .as_ref()
+        .and_then(|_| read_tail(path, o.tail_kb as usize * 1024, soft, o.agent.reads_head()));
+    let Some(tail) = tail else {
         // журнала нет — снимок из конспекта входа хука, если он есть
+        let Some(summary) = summary else {
+            return Taken::Missing;
+        };
         let snap = Snapshot {
             trigger: o.trigger,
             agent: o.agent,
@@ -217,11 +267,11 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
             session_hint: None,
             scan_depth_capped: false,
             data: SnapshotData {
-                compact_summary: Some(summary?.to_string()),
+                compact_summary: Some(summary.to_string()),
                 ..SnapshotData::default()
             },
         };
-        return Some(mask_and_limit(snap, o.max_bytes));
+        return Taken::Snap(mask_and_limit(snap, o.max_bytes), 0);
     };
     let mut late = tail.late;
     let mut adapter = o.agent.adapter(&o.root, &o.session);
@@ -284,7 +334,7 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
         scan_depth_capped: false,
         data,
     };
-    Some(mask_and_limit(snap, o.max_bytes))
+    Taken::Snap(mask_and_limit(snap, o.max_bytes), len)
 }
 
 /// Прочитанное [`read_tail`].

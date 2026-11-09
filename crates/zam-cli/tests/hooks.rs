@@ -4605,10 +4605,22 @@ fn hook_snap(p: &Proj, kind: &str, ev: &Value) -> Output {
     p.cmd(&p.url)
         .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
         .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+        .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
         .args(["hook", kind, "--agent", "claude"])
         .write_stdin(ev.to_string().into_bytes())
         .output()
         .unwrap()
+}
+
+/// Время изменения файла — `secs` секунд назад (журнал «давно не менялся»).
+fn age_file(path: &std::path::Path, secs: u64) {
+    let t = std::time::SystemTime::now() - Duration::from_secs(secs);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
 }
 
 /// Заглушка сервера снимка: `PUT …/snapshot` — `put` (статус и тело); `GET /sessions/{id}` —
@@ -4706,6 +4718,10 @@ fn snapshot_deadline_never_delays_stop() {
     assert!(d <= max_for("checkpoint"), "снимок задержал Stop: {d:?}");
     assert!(puts(&seen).is_empty(), "{:?}", puts(&seen));
     assert!(snap_file(&p, "snapq", "sd-1").is_none());
+    // попытка записана (`at`): следующий `Stop` — не раньше чем через 60 с
+    let st = snap_file(&p, "snapst", "sd-1").expect("попытка в snapst");
+    assert_eq!(st["trigger"], "stop", "{st}");
+    assert!(st["at"].as_u64().unwrap() > 0);
 }
 
 /// §8а: читается только хвост `hooks.snapshot_tail_kb` растущего журнала — старый запрос за
@@ -4840,6 +4856,15 @@ fn stop_throttle_16kib_60s() {
     append_lines(&t, &(0..5).map(|_| cl_filler(4096)).collect::<Vec<_>>());
     empty(&hook_snap(&p, "checkpoint", &stop));
     assert_eq!(puts(&seen).len(), 3);
+    // сменился журнал (новый файл сессии) — снимок без роста и без запроса
+    age_snapst(&p, s, 61_000);
+    let t2 = transcript_path(&p, "th-1-b");
+    write_lines(&t2, &[cl_user(s, "запрос C")]);
+    let stop2 = snap_ev(&p, "Stop", s, &t2, json!({"stop_hook_active": false}));
+    empty(&hook_snap(&p, "checkpoint", &stop2));
+    let got = puts(&seen);
+    assert_eq!(got.len(), 4, "смена журнала: {}", p.log());
+    assert_eq!(prompts_of(&got[3].1), ["запрос C"]);
 }
 
 /// §8а: `PostCompact` и `SessionEnd` — события `checkpoint` без вывода в бюджете хука;
@@ -5073,6 +5098,13 @@ fn catch_up_before_recall_on_startup() {
         write_lines(&tb, &[]);
         snap_ev(&p, "SessionStart", s, &tb, json!({"source": "startup"}))
     };
+    // журнал менялся только что — сессия, может быть, ещё жива: не снимается
+    context(
+        &hook_snap(&p, "session-start", &start_of("cu-live")),
+        "SessionStart",
+    );
+    assert_eq!(puts(&seen).len(), 1, "живая сессия: {}", p.log());
+    age_file(&t, 11 * 60);
     let n0 = seen.lock().unwrap().len();
     context(
         &hook_snap(&p, "session-start", &start_of("cu-b")),
@@ -5104,11 +5136,25 @@ fn catch_up_before_recall_on_startup() {
     empty(&hook_snap(&p, "checkpoint", &end));
     let n = puts(&seen).len();
     append_lines(&t, &[cl_user(a, "запись после конца")]);
+    age_file(&t, 11 * 60);
     context(
         &hook_snap(&p, "session-start", &start_of("cu-d")),
         "SessionStart",
     );
     assert_eq!(puts(&seen).len(), n, "{}", p.log());
+    // `resume` закрытой сессии снимает `ended`: её следующий обрыв снова догоняется
+    let resume = snap_ev(&p, "SessionStart", a, &t, json!({"source": "resume"}));
+    context(&hook_snap(&p, "session-start", &resume), "SessionStart");
+    assert_eq!(snap_file(&p, "snapst", a).unwrap()["ended"], false);
+    append_lines(&t, &[cl_user(a, "запрос после resume")]);
+    age_file(&t, 11 * 60);
+    context(
+        &hook_snap(&p, "session-start", &start_of("cu-e")),
+        "SessionStart",
+    );
+    let got = puts(&seen);
+    assert_eq!(got.len(), n + 1, "{}", p.log());
+    assert_eq!(got[n].1["trigger"], "catch_up");
 }
 
 /// §8а: старый сервер (404 на `PUT`) — не больше 3 попыток за сессию, затем снимок остаётся
@@ -5161,6 +5207,7 @@ fn switch_off_never_opens_transcript() {
     );
     // её журнал вырос — при включённом снимке старт сделал бы догоняющий снимок
     append_lines(&t, &[cl_user("off-on", "ещё запрос")]);
+    age_file(&t, 11 * 60);
     project_hooks(&p, "session_snapshot = false");
     let n = puts(&seen).len();
     let quick = |o: Output, t0: Instant, what: &str| {
@@ -5238,7 +5285,12 @@ fn snap_baits() -> (String, String, String) {
 fn hooks_log_has_no_snapshot_text() {
     let _g = serial();
     let (gh, pw, marker) = snap_baits();
-    for (put, body) in [(404u16, r#"{"status":404}"#), (204, "")] {
+    // ответ сервера с куском снимка в `detail` — в `hooks.log` только код и `type`
+    let detail: &'static str = Box::leak(
+        format!(r#"{{"type":"/problems/invalid","status":422,"detail":"плохое поле: {marker}"}}"#)
+            .into_boxed_str(),
+    );
+    for (put, body) in [(404u16, r#"{"status":404}"#), (204, ""), (422, detail)] {
         let (url, seen) = snap_stub(put, body);
         let p = Proj::new(&format!("snap-log-{put}"), &url, "zam_x");
         let s = "lg-1";
@@ -5353,4 +5405,282 @@ fn ev_snapshot_metadata_only() {
     )
     .unwrap();
     assert!(re.is_match(&c), "{c}");
+}
+
+/// Ревью 17b, I1: `PUT` снимка до `/recall` — со своим сроком: медленный сервер (ответ на `PUT`
+/// через 1 с) не съедает бюджет `/recall`, дайджест приходит, снимок остаётся в очереди.
+#[test]
+fn slow_snapshot_put_keeps_digest() {
+    let _g = serial();
+    // моменты приёма запросов заглушкой: путь и время
+    let times: std::sync::Arc<std::sync::Mutex<Vec<(String, Instant)>>> = Default::default();
+    let t2 = times.clone();
+    let (url, _seen) = common::stub_body(std::sync::Arc::new(
+        move |m: &str, path: &str, _: usize, _: &Value| {
+            t2.lock()
+                .unwrap()
+                .push((format!("{m} {path}"), Instant::now()));
+            if m == "PUT" && path.ends_with("/snapshot") {
+                (503, r#"{"status":503}"#.to_string(), Duration::from_secs(1))
+            } else if path == "/api/v1/recall" {
+                (200, r#"{"text":"D"}"#.to_string(), Duration::ZERO)
+            } else {
+                (200, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ));
+    let p = Proj::new("snap-slow-put", &url, "zam_x");
+    let s = "sp-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    // `PostCompact` снял (сервер ответил 503 — снимок в очереди)
+    let pc = snap_ev(
+        &p,
+        "PostCompact",
+        s,
+        &t,
+        json!({"trigger": "auto", "compact_summary": "Конспект"}),
+    );
+    empty(&hook_snap(&p, "checkpoint", &pc));
+    assert!(snap_file(&p, "snapq", s).is_some(), "{}", p.log());
+    // старт после сжатия — очередь уходит до `/recall`, но не дольше своего срока
+    let ss = snap_ev(&p, "SessionStart", s, &t, json!({"source": "compact"}));
+    let warm = snap_ev(
+        &p,
+        "SessionStart",
+        "sp-warm",
+        &t,
+        json!({"source": "resume"}),
+    );
+    let _ = p.hook_at(&url, "session-start", "claude", warm.to_string().as_bytes());
+    let n0 = times.lock().unwrap().len();
+    let (o, d) = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+    let c = context(&o, "SessionStart");
+    assert!(c.starts_with('D'), "{c}: {}", p.log());
+    assert!(d <= max_for("session-start"), "{d:?}");
+    // `/recall` ушёл вскоре после `PUT` (срок `PUT` — 60 мс, а не весь остаток бюджета)
+    let tm = times.lock().unwrap()[n0..].to_vec();
+    let at = |key: &str| tm.iter().find(|(k, _)| k == key).map(|(_, t)| *t);
+    let put = at(&format!("PUT /api/v1/sessions/{s}/snapshot")).expect("PUT");
+    let recall = at("POST /api/v1/recall").expect("recall");
+    let gap = recall.saturating_duration_since(put);
+    assert!(
+        gap < Duration::from_millis(200),
+        "PUT держал /recall {gap:?}"
+    );
+    assert!(
+        snap_file(&p, "snapq", s).is_some(),
+        "снимок остался в очереди"
+    );
+}
+
+/// Ревью 17b, Minor 2: ответ 400/413/422 — снимок отброшен (очередь удалена, строка в
+/// `hooks.log`), следующий снимок уходит.
+#[test]
+fn rejected_snapshot_dropped_next_sent() {
+    let _g = serial();
+    let (url, seen) = common::stub_body(std::sync::Arc::new(
+        |m: &str, path: &str, n: usize, _: &Value| {
+            if m == "PUT" && path.ends_with("/snapshot") {
+                if n == 0 {
+                    (413, r#"{"status":413}"#.to_string(), Duration::ZERO)
+                } else {
+                    (204, String::new(), Duration::ZERO)
+                }
+            } else {
+                (200, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ));
+    let p = Proj::new("snap-rejected", &url, "zam_x");
+    let s = "rj-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос 1")]);
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    empty(&hook_snap(&p, "checkpoint", &pc));
+    assert!(snap_file(&p, "snapq", s).is_none(), "{}", p.log());
+    assert!(p.log().contains("отброшен: HTTP 413"), "{}", p.log());
+    append_lines(&t, &[cl_user(s, "запрос 2")]);
+    empty(&hook_snap(&p, "checkpoint", &pc));
+    let got = puts(&seen);
+    assert_eq!(got.len(), 2, "{}", p.log());
+    assert_eq!(prompts_of(&got[1].1), ["запрос 1", "запрос 2"]);
+    assert!(snap_file(&p, "snapq", s).is_none());
+}
+
+/// Ревью 17b, Minor 3: очередь уходит следующим хуком и без нового снимка (`Stop` раньше 60 с).
+#[test]
+fn queued_snapshot_sent_without_new_one() {
+    let _g = serial();
+    let (down, _) = snap_stub(503, r#"{"status":503}"#);
+    let p = Proj::new("snap-pending", &down, "zam_x");
+    let s = "pd-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
+    empty(&hook_snap(&p, "checkpoint", &stop));
+    assert!(snap_file(&p, "snapq", s).is_some(), "{}", p.log());
+    let (up, seen) = snap_stub(204, "");
+    let at = |url: &str, ev: &Value| {
+        let o = p
+            .cmd(url)
+            .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+            .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+            .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
+            .args(["hook", "checkpoint", "--agent", "claude"])
+            .write_stdin(ev.to_string().into_bytes())
+            .output()
+            .unwrap();
+        empty(&o);
+    };
+    // `Stop` раньше 60 с — задания снимка нет, очередь уходит сама
+    at(&up, &stop);
+    let got = puts(&seen);
+    assert_eq!(got.len(), 1, "{}", p.log());
+    assert_eq!(got[0].1["trigger"], "stop");
+    assert!(snap_file(&p, "snapq", s).is_none());
+    // снова в очереди; `Stop` через 60 с без роста — снимок не нужен, очередь уходит
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    at(&down, &pc);
+    assert!(snap_file(&p, "snapq", s).is_some(), "{}", p.log());
+    age_snapst(&p, s, 61_000);
+    at(&up, &stop);
+    let got = puts(&seen);
+    assert_eq!(got.len(), 2, "{}", p.log());
+    assert_eq!(
+        got[1].1["trigger"], "pre_compact",
+        "новый снимок не снимался"
+    );
+    assert!(snap_file(&p, "snapq", s).is_none());
+}
+
+/// Ревью 17b, Minor 9: `PostCompact` без `transcript_path`, но с конспектом — снимок из одного
+/// конспекта.
+#[test]
+fn post_compact_without_transcript_uses_summary() {
+    let _g = serial();
+    let (url, seen) = snap_stub(204, "");
+    let p = Proj::new("snap-pc-no-t", &url, "zam_x");
+    let mut pc = p.ev(
+        "PostCompact",
+        "pn-1",
+        json!({"trigger": "auto", "compact_summary": "Следующий шаг: тесты"}),
+    );
+    pc.as_object_mut().unwrap().remove("transcript_path");
+    empty(&hook_snap(&p, "checkpoint", &pc));
+    let got = puts(&seen);
+    assert_eq!(got.len(), 1, "{}", p.log());
+    assert_eq!(got[0].1["data"]["compact_summary"], "Следующий шаг: тесты");
+    assert_eq!(got[0].1["data"]["prompts"], json!([]));
+}
+
+/// Ревью 17b, Minor 10: правка очереди по ответу — только под замком (чужой замок — очередь не
+/// трогается, снимок уйдёт ещё раз); очередь больше предела кэша не читается.
+#[test]
+fn queue_lock_and_size_limit() {
+    let _g = serial();
+    let (url, seen) = snap_stub(204, "");
+    let p = Proj::new("snap-lock", &url, "zam_x");
+    let s = "lk-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    let (down, _) = snap_stub(503, r#"{"status":503}"#);
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    let o = p
+        .cmd(&down)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+        .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+        .args(["hook", "checkpoint", "--agent", "claude"])
+        .write_stdin(pc.to_string().into_bytes())
+        .output()
+        .unwrap();
+    empty(&o);
+    let q = p.session_file("snapq", s, ".json").expect("очередь");
+    let name = q.file_name().unwrap().to_str().unwrap().to_string();
+    let lock = q.with_file_name(format!(".{name}.lock"));
+    std::fs::write(&lock, "чужой").unwrap();
+    let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
+    empty(&hook_snap(&p, "checkpoint", &stop));
+    assert_eq!(puts(&seen).len(), 1, "{}", p.log());
+    assert!(q.is_file(), "очередь удалена без замка");
+    std::fs::remove_file(&lock).unwrap();
+    // очередь больше 16 МиБ — не читается, хук молчит
+    let big = format!(
+        r#"{{"session":"{s}","old_server":0,"body":{{"pad":"{}"}}}}"#,
+        "x".repeat(17 * 1024 * 1024)
+    );
+    std::fs::write(&q, big).unwrap();
+    empty(&hook_snap(&p, "checkpoint", &stop));
+    assert_eq!(puts(&seen).len(), 1, "{}", p.log());
+}
+
+/// Ревью 17b, Minor 11: без адреса сервера `session-start` пишет одну строку «не заданы адрес
+/// сервера или токен» (снимок — только в очередь).
+#[test]
+fn no_server_single_log_line() {
+    let _g = serial();
+    let p = Proj::new("snap-no-server", DEAD, "zam_x");
+    let s = "ns-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    let ss = snap_ev(&p, "SessionStart", s, &t, json!({"source": "compact"}));
+    let o = p
+        .cmd(DEAD)
+        .env_remove("ZAM_URL")
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+        .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+        .args(["hook", "session-start", "--agent", "claude"])
+        .write_stdin(ss.to_string().into_bytes())
+        .output()
+        .unwrap();
+    ok(&o);
+    let log = p.log();
+    assert_eq!(
+        log.matches("не заданы адрес сервера или токен").count(),
+        1,
+        "{log}"
+    );
+    assert!(snap_file(&p, "snapq", s).is_some(), "{log}");
+}
+
+/// Ревью 17b, Minor 12: опоздавший догоняющий снимок (подмена `stall-ms` на журнале другой
+/// сессии) не задерживает старт.
+#[test]
+fn late_catch_up_does_not_delay_start() {
+    let _g = serial();
+    let (url, seen) = snap_stub(204, "");
+    let p = Proj::new("snap-late-catch", &url, "zam_x");
+    let a = "lc-a";
+    let t = transcript_path(&p, a);
+    write_lines(&t, &[cl_user(a, "запрос 1")]);
+    let stop = snap_ev(&p, "Stop", a, &t, json!({"stop_hook_active": false}));
+    empty(&hook_snap(&p, "checkpoint", &stop));
+    assert_eq!(puts(&seen).len(), 1, "{}", p.log());
+    append_lines(&t, &[cl_user(a, "запрос 2")]);
+    age_file(&t, 11 * 60);
+    std::fs::write(format!("{}.stall-ms", t.display()), "3000").unwrap();
+    let tb = transcript_path(&p, "lc-b");
+    write_lines(&tb, &[]);
+    let warm = snap_ev(
+        &p,
+        "SessionStart",
+        "lc-warm",
+        &tb,
+        json!({"source": "resume"}),
+    );
+    let _ = p.hook_at(&url, "session-start", "claude", warm.to_string().as_bytes());
+    let ss = snap_ev(
+        &p,
+        "SessionStart",
+        "lc-b",
+        &tb,
+        json!({"source": "startup"}),
+    );
+    let (o, d) = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+    ok(&o);
+    assert!(
+        d <= max_for("session-start"),
+        "догоняющий задержал старт: {d:?}"
+    );
+    assert_eq!(puts(&seen).len(), 1, "опоздавший снимок не уходит");
 }

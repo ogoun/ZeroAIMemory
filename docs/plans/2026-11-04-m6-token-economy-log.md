@@ -6841,3 +6841,83 @@ R6 в первом прогоне **не упал** (см. п. 3 отступл�
   псевдонимом `session` (п. 7), строка «`PostCompact`/`SessionEnd` только ставят `ended_at`» —
   `ended_at` только у `SessionEnd` (п. 11); README обновлён, `CHANGELOG` — при финализации.
 - `target/t17b` удалён после работы.
+
+### Задача 17b, правки ревью (принять после правок, 2026-11-09)
+
+Коммит `fix(hooks): правки ревью 17b — срок PUT, ввод-вывод журнала в сроке, очередь без нового
+снимка` поверх `57ce1a3` (sha — в отчёте контроллеру).
+
+**Important.**
+1. **I1 — свой срок `PUT`.** `flush` идёт клиентом `client_within(SNAPSHOT_PUT_MS = 60 мс)` (как
+   `IMPACT_MS` у `checkpoint`), и в `checkpoint`, и до `/recall` в `session-start`; не успел —
+   снимок остаётся в очереди. Тестовая подмена `ZAM_TEST_SNAPSHOT_PUT_MS` (debug/`test-hooks`).
+   Тест `slow_snapshot_put_keeps_digest`: `PUT` отвечает через 1 с, дайджест приходит в пределах
+   `max_for("session-start")`, очередь на месте.
+2. **I2 — весь ввод-вывод журнала агента в сроке.** `snapshot::take_ext` (итог `Taken::{Snap(_,
+   len), Missing, Skipped, Late}`): `metadata`, проверки `TakeOpts::min_len` (рост) и `min_idle`
+   (давность) и чтение — в потоке со сроком; размер для `snapst-*` — из потока. `stop_due`
+   больше не трогает журнал агента: «рано / снимать / снимать, если вырос» (`StopDue::IfGrown`).
+   `abandoned` выбирает кандидата по времени файла из `read_dir` и разбирает только самый новый
+   `snapst-*` другой сессии; рост и давность журнала — в потоке. До потока — только файлы кэша
+   проекта (`snapst-*`, журнал сессии).
+3. **I3** — требования к 17c дописаны в «Передать» (ниже).
+
+**Minor.**
+1. В `hooks.log` из ответа сервера — только `HTTP <код>` и `type` problem+json, без `detail`
+   (`short`). В `hooks_log_has_no_snapshot_text` — случай 422 с приманкой в `detail`.
+2. Тест `rejected_snapshot_dropped_next_sent`: 413 — очередь удалена, «отброшен: HTTP 413» в
+   журнале, следующий снимок уходит.
+3. Очередь уходит без нового снимка: `run` при опоздании, пропуске, отсутствии журнала и пустом
+   снимке отправляет прежнюю очередь; `checkpoint` без задания снимка — `flush`, если есть
+   `snapq-*` (один `stat`); `session-start source=compact` — своя очередь (было). Тест
+   `queued_snapshot_sent_without_new_one`.
+4. Опоздавший снимок пишет попытку в `snapst-*` (`at`, повод; размер и `prompt_at` прежние) —
+   правило 60 с у `Stop` действует. Проверка — в `snapshot_deadline_never_delays_stop`.
+5. `stop_due`: смена `transcript_path` — снимок без роста и запроса (в `stop_throttle_16kib_60s`).
+6. `session-start` `startup`/`resume`/`clear` снимает `ended` у своей сессии (`reopen`): после
+   `resume` закрытой сессии её обрыв снова догоняется (в `catch_up_before_recall_on_startup`).
+7. Догоняющий снимок — только если журнал кандидата не менялся `ABANDON_IDLE` = 10 мин
+   (`min_idle`, в потоке): живая параллельная сессия не снимается (в
+   `catch_up_before_recall_on_startup`, время файла журнала — `File::set_modified`).
+8. CLI: пустой снимок — код 6 «снимок пуст: …», без запросов (в `cli_snapshot_no_session_exit_1`).
+9. `PostCompact` без `transcript_path` с `compact_summary` — снимок из конспекта (журнал пустой
+   путь, `Taken::Snap(_, 0)`). Тест `post_compact_without_transcript_uses_summary`.
+10. Замок очереди `.snapq-….json.lock` (`cache::file_lock`, 20 мс): `enqueue` (чтение счётчика и
+    запись) и правка очереди по ответу `flush` (сравнение и удаление/перезапись). Замок не взят —
+    `flush` очередь не трогает (снимок уйдёт ещё раз), `enqueue` пишет без него (fail-open).
+    Чтение очереди — с пределом `CACHE_MAX` (16 МиБ, `read_queue`). Тест `queue_lock_and_size_limit`.
+11. Без клиента `session-start` вызывает `run(…, send: false)` — одна строка «не заданы адрес
+    сервера или токен». Тест `no_server_single_log_line`.
+12. Тест `late_catch_up_does_not_delay_start`: `stall-ms` на журнале оборванной сессии, старт в
+    пределах `max_for("session-start")`, `PUT` нет.
+
+**Откаты** (`.tmp/m6/task17b/rollbacks2.py` + `rollbacks2_list.py`, журнал `rollbacks-r2.log`) —
+15, все FAIL ожидаемым тестом: S1 `PUT` клиентом на весь остаток →
+`slow_snapshot_put_keeps_digest`; S2 без `min_len`, S8 без смены журнала → `stop_throttle_16kib_60s`;
+S3 без `min_idle`, S9 без `reopen` → `catch_up_before_recall_on_startup`; S4 `detail` в журнал →
+`hooks_log_has_no_snapshot_text`; S5 без отправки очереди в `checkpoint`, S6 без отправки в `run` →
+`queued_snapshot_sent_without_new_one`; S7 опоздавший без записи попытки →
+`snapshot_deadline_never_delays_stop`; S10 CLI без проверки пустого → `cli_snapshot_no_session_exit_1`;
+S11 `PostCompact` без журнала → `post_compact_without_transcript_uses_summary`; S12 без замка,
+S13 без предела чтения → `queue_lock_and_size_limit`; S14 `send: true` без клиента →
+`no_server_single_log_line`; S15 срок 10 с → `late_catch_up_does_not_delay_start`.
+S1 в первом прогоне **не упал**: тест проверял только, что дайджест пришёл в `max_for` (1,2 с), а
+`/recall` получал свой клиент со сроком от начала хука. Тест усилен: заглушка записывает время
+приёма, `/recall` должен прийти меньше чем через 200 мс после `PUT`; повтор S1 — FAIL. Выбор
+кандидата `abandoned` по времени файла (разбор одного `snapst-*`) — свойство объёма ввода-вывода,
+откатом не проверяется.
+
+**Передать → 17c (дополнение, I3).**
+- `PUT /sessions/{id}/snapshot` **не освежает `last_seen_at`** и **не считается `memory_writes`**:
+  маршрут не входит в `memory_routes` и в `touch_from_request` (иначе снимок `SessionEnd` или
+  догоняющий снимок сделали бы оборванную сессию «живой» для дайджеста §8а). Тест в 17c: `PUT`
+  снимка — `last_seen_at` и `memory_writes` сессии не меняются.
+- Клиент шлёт `PUT` со сроком 60 мс; сервер должен отвечать быстро (без синхронной тяжёлой
+  работы до ответа).
+
+**Проверка.**
+- `cargo test -p zam-core -p zam-cli --no-fail-fast -- --skip hook_budgets` (`r2-full.log`, перед
+  этим собран `zam-server`) — все 32 набора PASS, в том числе `hooks` 93 и `snapshot` 32.
+- `cargo clippy -p zam-cli --all-targets -- -D warnings` — чисто; `rustfmt --edition 2024
+  --check` по файлам задачи — чисто. Сервер в этом круге не менялся.
+- `target/t17b` удалён.

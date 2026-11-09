@@ -86,6 +86,8 @@ impl Case {
             deadline: Duration::from_secs(10),
             max_bytes: MAX,
             summary: None,
+            min_len: None,
+            min_idle: None,
         }
     }
 
@@ -1258,6 +1260,22 @@ fn cli_snapshot_no_session_exit_1() {
     // плохой формат и нет файла — ошибки ввода, не паника
     let o = cli(&c, &url, &["--transcript", &t, "--format", "gemini"], &[]);
     assert!(o.status.code().is_some_and(|x| x != 0));
+    // пустой снимок (в журнале нет ни одной записи формата) — ошибка ввода без запросов
+    let empty_t = c.dir.join("empty.jsonl");
+    std::fs::write(
+        &empty_t,
+        "{\"type\":\"progress\",\"data\":\"x\"}
+",
+    )
+    .unwrap();
+    let et = empty_t.to_string_lossy().into_owned();
+    let o = cli(&c, &url, &["--transcript", &et, "--session", "S"], &[]);
+    assert_eq!(o.status.code(), Some(6));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("снимок пуст"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     let o = cli(
         &c,
         &url,

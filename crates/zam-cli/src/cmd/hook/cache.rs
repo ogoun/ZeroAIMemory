@@ -57,7 +57,7 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 /// Срок, после которого брошенный временный файл записи удаляется.
 pub const TMP_TTL: Duration = Duration::from_secs(3600);
 /// Предел файла кэша, байт.
-const CACHE_MAX: u64 = 16 * 1024 * 1024;
+pub(super) const CACHE_MAX: u64 = 16 * 1024 * 1024;
 
 /// Триггер из `GET /triggers`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1041,7 +1041,7 @@ pub fn spawn_path(env: &Env, session: &str) -> PathBuf {
 /// Замок-файл `.<имя>.lock` очереди запусков и очереди изменённых файлов (создаётся только
 /// новым, внутри — токен владельца); брошенный старше [`SPAWN_LOCK_TTL`] снимается; не взят за
 /// `wait` — `None` (без замка).
-fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
+pub(super) fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
     use std::io::Write;
     let name = path.file_name()?.to_str()?;
     let lock = path.with_file_name(format!(".{name}.lock"));
@@ -1079,7 +1079,7 @@ fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
 /// Взятый замок-файл: снимается при `Drop`, только если в файле всё ещё свой токен
 /// (`pid.nanos`) — замок, снятый как брошенный и взятый другим процессом, не удаляется
 /// (ревью задачи 9A, M1).
-struct FileLock {
+pub(super) struct FileLock {
     path: PathBuf,
     token: String,
 }

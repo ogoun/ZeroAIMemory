@@ -138,13 +138,17 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
     // снимок сессии и конец сессии (M6 §8а)
     let job = snapshot_queue::job_for_checkpoint(env, inp, s);
     let end = session.filter(|_| inp.event == "SessionEnd");
-    if job.is_none() && end.is_none() {
+    // нового снимка нет, а прежний ждёт в очереди — уходит этим хуком (один `stat`)
+    let pending = session
+        .filter(|id| job.is_none() && s.session_snapshot() && snapshot_queue::queued(env, id));
+    if job.is_none() && end.is_none() && pending.is_none() {
         return checkpoint_net(env, inp, s, remind, impact_in, queued, tokens, epoch);
     }
     std::thread::scope(|sc| {
-        // снимок — в своём потоке: сборка со своим сроком, `PUT` — в остатке бюджета; очередь
-        // снимка пишется и без сервера
-        let snap = job.map(|j| sc.spawn(move || snapshot_queue::run(env, s, j)));
+        // снимок — в своём потоке: сборка со своим сроком, `PUT` — со своим сроком в бюджете;
+        // очередь снимка пишется и без сервера
+        let snap = job.map(|j| sc.spawn(move || snapshot_queue::run(env, s, j, true)));
+        let old = pending.map(|id| sc.spawn(move || snapshot_queue::flush_logged(env, id)));
         let ended = end.map(|id| sc.spawn(move || snapshot_queue::end_session(env, id)));
         let out = checkpoint_net(env, inp, s, remind, impact_in, queued, tokens, epoch);
         if let Some(h) = snap
@@ -156,6 +160,11 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
             && h.join().is_err()
         {
             env.log("sessions(ended): паника");
+        }
+        if let Some(h) = old
+            && h.join().is_err()
+        {
+            env.log("snapshot(очередь): паника");
         }
         out
     })

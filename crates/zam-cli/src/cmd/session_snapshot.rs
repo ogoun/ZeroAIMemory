@@ -13,7 +13,8 @@
 //! - Снимок — та же сборка, что у хуков ([`hook::snapshot::take`]: хвост `hooks.snapshot_tail_kb`,
 //!   маскировка, пределы), со сроком [`CLI_DEADLINE`]; `PUT /sessions/{id}/snapshot` с
 //!   `X-Zam-Session: <id>` (явная сессия). Ошибка сервера — ошибка команды, в очередь хуков снимок
-//!   не кладётся. Вывод — «снимок сессии <id>: N байт, <полнота>», `--json` — `{session, bytes,
+//!   не кладётся. Пустой снимок (нет ни запросов, ни файлов, ни команд, ни конспекта) — ошибка
+//!   ввода без `PUT`. Вывод — «снимок сессии <id>: N байт, <полнота>», `--json` — `{session, bytes,
 //!   status, trigger}`.
 use std::io::Read;
 use std::path::Path;
@@ -96,6 +97,8 @@ pub fn run(
         deadline: CLI_DEADLINE,
         max_bytes: MAX_BYTES,
         summary: None,
+        min_len: None,
+        min_idle: None,
     };
     let snap = snapshot::take(transcript, &opts).ok_or_else(|| {
         CliError::new(
@@ -108,6 +111,18 @@ pub fn run(
             "в журнале нет id сессии: укажите --session",
         ));
     };
+    let d = &snap.data;
+    if d.compact_summary.is_none()
+        && d.prompts.is_empty()
+        && d.files.is_empty()
+        && d.commands.is_empty()
+    {
+        return Err(CliError::input(format!(
+            "снимок пуст: в хвосте журнала нет ни запросов, ни файлов, ни команд, ни конспекта \
+             (формат {}?)",
+            agent.as_str()
+        )));
+    }
     if snap.scan_depth_capped {
         eprintln!("предупреждение: secrets_scan_depth");
     }
