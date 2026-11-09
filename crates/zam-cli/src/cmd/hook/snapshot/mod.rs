@@ -161,6 +161,9 @@ pub struct TakeOpts {
     pub deadline: Duration,
     /// Предел записи, байт (`snapshot.max_bytes`).
     pub max_bytes: usize,
+    /// Конспект из входа хука (`PostCompact.compact_summary` Claude, §8а — основной источник):
+    /// заменяет конспект журнала; журнала нет или он не читается — снимок из одного конспекта.
+    pub summary: Option<String>,
 }
 
 /// Снимок журнала `path` в отдельном потоке со сроком `opts.deadline`: чтение хвоста,
@@ -203,7 +206,23 @@ fn test_stall(path: &Path) {
 /// Тело потока [`take`]: мягкий срок — 4/5 жёсткого, после него собранное отдаётся `partial`.
 fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
     let soft = start + o.deadline * 4 / 5;
-    let tail = read_tail(path, o.tail_kb as usize * 1024, soft, o.agent.reads_head())?;
+    let summary = o.summary.as_deref().filter(|t| !t.trim().is_empty());
+    let Some(tail) = read_tail(path, o.tail_kb as usize * 1024, soft, o.agent.reads_head()) else {
+        // журнала нет — снимок из конспекта входа хука, если он есть
+        let snap = Snapshot {
+            trigger: o.trigger,
+            agent: o.agent,
+            status: SnapStatus::Complete,
+            skipped: 0,
+            session_hint: None,
+            scan_depth_capped: false,
+            data: SnapshotData {
+                compact_summary: Some(summary?.to_string()),
+                ..SnapshotData::default()
+            },
+        };
+        return Some(mask_and_limit(snap, o.max_bytes));
+    };
     let mut late = tail.late;
     let mut adapter = o.agent.adapter(&o.root, &o.session);
     let filters = o.agent.prefilter();
@@ -248,6 +267,10 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
     }
     let skipped = skipped + adapter.skipped();
     let session_hint = adapter.session_hint();
+    let mut data = adapter.finish();
+    if let Some(t) = summary {
+        data.compact_summary = Some(t.to_string());
+    }
     let snap = Snapshot {
         trigger: o.trigger,
         agent: o.agent,
@@ -259,7 +282,7 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Option<Snapshot> {
         skipped,
         session_hint,
         scan_depth_capped: false,
-        data: adapter.finish(),
+        data,
     };
     Some(mask_and_limit(snap, o.max_bytes))
 }

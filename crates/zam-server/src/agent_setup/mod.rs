@@ -230,7 +230,9 @@ pub const CODEX_TOOLS: &str = "Bash|apply_patch";
 
 /// Фрагмент `.claude/settings.json` (§15.5, M4.5 §11): exec form, `timeout` в секундах — 1 у
 /// `pre-tool` и `post-tool` успеха (бюджет 50 мс, без сети), 2 у остальных. Ошибка инструмента
-/// — `PostToolUseFailure`, успех — `PostToolUse`; обе — одна команда `post-tool`.
+/// — `PostToolUseFailure`, успех — `PostToolUse`; обе — одна команда `post-tool`. Снимок сессии
+/// (M6 §8а): `PostCompact` (конспект сжатия) и `SessionEnd` (снимок и `ended_at`) — тоже
+/// `checkpoint`, без вывода.
 pub fn claude_settings() -> Value {
     let h = claude_hook;
     json!({"hooks": {
@@ -242,13 +244,16 @@ pub fn claude_settings() -> Value {
         "SubagentStart": group(None, h("subagent-start", 2)),
         "Stop": group(None, h("checkpoint", 2)),
         "PreCompact": group(None, h("checkpoint", 2)),
+        "PostCompact": group(None, h("checkpoint", 2)),
+        "SessionEnd": group(None, h("checkpoint", 2)),
     }})
 }
 
 /// Фрагмент `.codex/hooks.json`: тот же состав с `--agent codex`; `post-tool` — на
 /// `PostToolUse` (у Codex нет `PostToolUseFailure`: ошибка и успех различаются по
 /// `tool_response`), правки файлов Codex — инструмент `apply_patch` (matcher — regex)
-/// **[решение контроллера T11-b]**; `SubagentStart` — пакет под задачу (M4.5 §9.4).
+/// **[решение контроллера T11-b]**; `SubagentStart` — пакет под задачу (M4.5 §9.4); `SessionEnd`
+/// — снимок сессии и `ended_at` (M6 §8а; `PostCompact` у Codex конспекта не несёт).
 pub fn codex_hooks() -> Value {
     let h = codex_hook;
     json!({"hooks": {
@@ -259,6 +264,7 @@ pub fn codex_hooks() -> Value {
         "SubagentStart": group(None, h("subagent-start", 2)),
         "Stop": group(None, h("checkpoint", 2)),
         "PreCompact": group(None, h("checkpoint", 2)),
+        "SessionEnd": group(None, h("checkpoint", 2)),
     }})
 }
 

@@ -85,6 +85,7 @@ impl Case {
             tail_kb: 2048,
             deadline: Duration::from_secs(10),
             max_bytes: MAX,
+            summary: None,
         }
     }
 
@@ -1098,4 +1099,171 @@ fn claude_many_commands_keep_last() {
     assert_eq!(s.data.commands.len(), 10);
     assert_eq!(s.data.commands[0].cmd, "echo 5");
     assert_eq!(s.data.commands[9].failed, None);
+}
+
+// ------------------------------------------------- `zam session snapshot` (задача 17b)
+
+/// Заглушка сервера для `zam session snapshot`: `GET /sessions/{id}` — `get` (статус), прочее —
+/// 2xx; принятые запросы — в `Seen`.
+fn cli_stub(get: u16) -> (String, common::Seen) {
+    common::stub_body(std::sync::Arc::new(
+        move |m: &str, p: &str, _: usize, _: &serde_json::Value| {
+            if m == "GET" && p.starts_with("/api/v1/sessions/") {
+                let body = if get == 200 {
+                    r#"{"id":"x","memory_writes":0}"#.to_string()
+                } else {
+                    format!(r#"{{"status":{get},"detail":"нет сессии"}}"#)
+                };
+                (get, body, Duration::ZERO)
+            } else if m == "PUT" {
+                (204, String::new(), Duration::ZERO)
+            } else {
+                (201, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ))
+}
+
+/// `zam session snapshot` в каталоге `c.root` против `url`.
+fn cli(c: &Case, url: &str, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let home = c.dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut cmd = common::zam_cmd();
+    cmd.env("ZAM_URL", url)
+        .env("ZAM_TOKEN", "zam_x")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&c.root)
+        .args(["session", "snapshot"])
+        .args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+fn seen_of(seen: &common::Seen) -> Vec<(String, String, serde_json::Value)> {
+    seen.lock().unwrap().clone()
+}
+
+/// §8а: сессия снимка по порядку — `--session`, `ZAM_SESSION_ID`, id из журнала (Claude —
+/// `sessionId` записей); записи журнала берутся последней сессии файла при любом источнике.
+#[test]
+fn cli_snapshot_session_source_order() {
+    let c = Case::new("cli-order");
+    let p = c.journal(&[], &[claude_human(&c, "запрос из журнала")]);
+    let t = p.to_string_lossy().into_owned();
+    for (args, env, want) in [
+        (
+            vec!["--transcript", &t, "--session", "S-flag"],
+            vec![("ZAM_SESSION_ID", "S-env")],
+            "S-flag",
+        ),
+        (
+            vec!["--transcript", &t],
+            vec![("ZAM_SESSION_ID", "S-env")],
+            "S-env",
+        ),
+        (
+            vec!["--transcript", &t, "--format", "claude"],
+            vec![],
+            SESSION,
+        ),
+    ] {
+        let (url, seen) = cli_stub(200);
+        let o = cli(&c, &url, &args, &env);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{want}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(out.contains(&format!("снимок сессии {want}: ")), "{out}");
+        let puts: Vec<_> = seen_of(&seen)
+            .into_iter()
+            .filter(|(m, _, _)| m == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1, "{want}");
+        assert_eq!(puts[0].1, format!("/api/v1/sessions/{want}/snapshot"));
+        let b = &puts[0].2;
+        assert_eq!(b["trigger"], "manual");
+        assert_eq!(b["agent"], "claude");
+        assert_eq!(
+            b["data"]["prompts"],
+            serde_json::json!(["запрос из журнала"]),
+            "{b}"
+        );
+        assert!(
+            b["taken_at"].as_str().is_some_and(|s| s.ends_with('Z')),
+            "{b}"
+        );
+    }
+}
+
+/// §8а: сессии нет на сервере (`GET` → 404) — `POST /sessions {id, agent}` до `PUT`; есть —
+/// не регистрируется заново (`POST` освежил бы `last_seen_at`). Codex — формат по первой
+/// строке, id из `session_meta`.
+#[test]
+fn cli_snapshot_registers_session() {
+    let c = Case::new("cli-register");
+    let p = c.journal(&["codex-doc-session.jsonl"], &[]);
+    let t = p.to_string_lossy().into_owned();
+    let codex_id = "00000000-0000-4000-8000-0000000000c1";
+    let (url, seen) = cli_stub(404);
+    let o = cli(&c, &url, &["--transcript", &t, "--json"], &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["session"], codex_id);
+    assert_eq!(v["trigger"], "manual");
+    let reqs = seen_of(&seen);
+    let order: Vec<String> = reqs.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+    assert_eq!(
+        order,
+        [
+            format!("GET /api/v1/sessions/{codex_id}"),
+            "POST /api/v1/sessions".to_string(),
+            format!("PUT /api/v1/sessions/{codex_id}/snapshot"),
+        ]
+    );
+    assert_eq!(reqs[1].2["id"], codex_id);
+    assert_eq!(reqs[1].2["agent"], "codex");
+    assert_eq!(reqs[2].2["agent"], "codex");
+    // сессия есть — без POST
+    let (url, seen) = cli_stub(200);
+    let o = cli(&c, &url, &["--transcript", &t], &[]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(!seen_of(&seen).iter().any(|(m, _, _)| m == "POST"));
+}
+
+/// §8а: ни `--session`, ни `ZAM_SESSION_ID`, ни id в журнале — код 1, «укажите --session»,
+/// запросов к серверу нет.
+#[test]
+fn cli_snapshot_no_session_exit_1() {
+    let c = Case::new("cli-no-session");
+    let line = r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"запрос без session_meta","images":[]}}"#;
+    let p = c.journal(&[], &[line.to_string()]);
+    let t = p.to_string_lossy().into_owned();
+    let (url, seen) = cli_stub(200);
+    let o = cli(&c, &url, &["--transcript", &t, "--format", "codex"], &[]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("укажите --session"), "{err}");
+    assert!(seen_of(&seen).is_empty());
+    // плохой формат и нет файла — ошибки ввода, не паника
+    let o = cli(&c, &url, &["--transcript", &t, "--format", "gemini"], &[]);
+    assert!(o.status.code().is_some_and(|x| x != 0));
+    let o = cli(
+        &c,
+        &url,
+        &["--transcript", "нет.jsonl", "--session", "S"],
+        &[],
+    );
+    assert!(o.status.code().is_some_and(|x| x != 0));
+    assert!(seen_of(&seen).is_empty());
 }

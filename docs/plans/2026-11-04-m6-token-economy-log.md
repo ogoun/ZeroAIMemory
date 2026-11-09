@@ -6655,3 +6655,183 @@ WAL за 20 с не возвращается к норме (3046–3253 кадр
     `Authorization: $2b$10$…`, `--password $2b$10$…` маскируются.
   - Откаты Q1 (глубина) и Q2 (ссылка по префиксу) — FAIL (`rollbacks-r4.log`). Проверка:
     `snapshot` 29 PASS, `rustfmt --check` по своим файлам и `clippy -D warnings` — чисто.
+
+## Задача 17b (исполнитель)
+
+Снимок сессии §8а в хуках: события `checkpoint` (`Stop`, `PreCompact`, `PostCompact`,
+`SessionEnd`) и `session-start` (`compact`, догоняющий на `startup`), состояние `snapst-*`,
+очередь `snapq-*`, `PUT /sessions/{id}/snapshot`, `PATCH … {ended: true}`, команда
+`zam session snapshot`, фрагменты подключения агента. Коммит `feat(hooks): снимок сессии в
+хуках, очередь, zam session snapshot` (sha — в отчёте контроллеру).
+
+### Реализация
+
+- `crates/zam-cli/src/cmd/hook/snapshot_queue.rs` (новый) — когда снимать
+  (`job_for_checkpoint`, `job_for_session_start`, `stop_due`, `abandoned`), сборка и учёт
+  (`run`), очередь и отправка (`flush`, `flush_others`), `end_session`. Тело `PUT` — один тип
+  `PutBody {taken_at, #[flatten] Snapshot}`, размер меряется `body_bytes` (запас 256 байт 17a
+  покрывает `taken_at`, ~34 байта).
+- `hook/mod.rs`: `#[allow(dead_code)]` у `pub mod snapshot` снят; `Kind::Checkpoint` принимает
+  `PostCompact`, `SessionEnd` (бюджет 100 мс); ключи `[hooks]` клиента `session_snapshot` (true),
+  `snapshot_tail_kb` (2048, 64..=16384), `snapshot_ms` (25, 5..=50) в `ClientKeys`; вне
+  диапазона — умолчание и строка в `hooks.log` (как `holdout`).
+- `checkpoint.rs`: снимок и `PATCH ended` — в потоках общего `scope`, параллельно сетевой части
+  (`checkpoint_net`); снимок пишется в очередь и без сервера.
+- `session_start.rs`: снимок (`compact` без свежего `PostCompact`, догоняющий `startup`) — в
+  потоке `/recall` **до** запроса; после `compact` со свежим `PostCompact` — отправка своей
+  очереди до `/recall`; очереди других сессий — параллельно `/recall`.
+- `journal.rs`: `Ev::Snapshot {trigger, status, bytes, prompts, files, cmds}`;
+  `Summary::snapshot_at`; `render_summary` — «снимок сессии <yyyy-MM-dd HH:mm:ss>, извлечено
+  автоматически» (UTC, `agent_ms`).
+- `cache.rs`: `snapst-*.json`, `snapq-*.json` в `gc_cache` (7 дней).
+- `snapshot/mod.rs` (17a): `TakeOpts::summary` — конспект входа хука заменяет конспект журнала;
+  журнала нет — снимок из одного конспекта (маскировка и пределы те же, в том же сроке).
+- `cmd/session_snapshot.rs` (новый), `main.rs`: `zam sessions snapshot` с псевдонимом группы
+  `session` (`zam session snapshot …`).
+- `zam-server/src/agent_setup/mod.rs`: `claude_settings()` — `PostCompact`, `SessionEnd` →
+  `zam hook checkpoint` (timeout 2); `codex_hooks()` — `SessionEnd`.
+- README: строка команды и снимок в описании хуков.
+- Передача из задачи 4 (eval/README.md, «допускаемая неточность»: вызовы MCP субагента — в
+  сессии родителя, событие `mcp`) — **уже сделано** (абзац «Допускаемая неточность (ревью
+  задачи 3)»), не менялось.
+
+### Отступления и решения исполнителя
+
+1. **[решение исполнителя] `PostCompact` читает журнал.** §8а: «конспект берётся из входа хука,
+   журнал не читается». `PUT` заменяет снимок сессии целиком (одна строка `session_snapshots` на
+   сессию), и снимок из одного конспекта стёр бы запросы, файлы и команды `PreCompact`. Поэтому
+   у `PostCompact` конспект — из `compact_summary` входа (он сильнее конспекта журнала), остальное
+   — из хвоста журнала в том же сроке. Журнала нет — снимок из одного конспекта.
+2. **[решение исполнителя] «`PostCompact` не пришёл»** на `SessionStart source=compact` — в
+   `snapst-*` последний снимок не `post_compact` или старше 5 мин (`POST_COMPACT_FRESH`). Пришёл
+   — журнал не читается, но неотправленная очередь сессии уходит до `/recall`.
+3. **[решение исполнителя] «Новый запрос человека» у `Stop`** — событие `Ev::Prompt` журнала
+   сессии (его пишет хук `prompt`) новее `prompt_at` в `snapst-*` (последний запрос, учтённый
+   прошлым снимком): без чтения журнала агента. Сначала сравнивалось с `at` — откат R6 этого не
+   поймал (после сдвига `at` назад старый запрос казался новым); `prompt_at` надёжнее и для
+   живой работы. Ключ
+   `session_journal` выключен — только рост ≥ 16 КиБ. Порядок: сначала 60 с (не чаще), затем
+   рост или запрос.
+4. **[решение исполнителя] Признак конца для догоняющего снимка — локальный** (`ended` в
+   `snapst-*`, ставит `SessionEnd`), а не `ended_at` сервера: старт не тратит запрос на `GET`
+   чужой сессии в бюджете до `/recall`. «Последняя сессия проекта» — наибольший `at` среди
+   `snapst-*` кроме текущей. Догоняющий снимок обновляет `size`/`at` — повторного нет, пока журнал
+   не вырос снова.
+5. **[решение исполнителя] Пустой снимок не отправляется.** В хвосте нет ни конспекта, ни
+   запросов, ни файлов, ни команд — обновляется только `snapst-*`, без `PUT`, очереди и
+   `Ev::Snapshot`: иначе пустой снимок затёр бы прежний на сервере.
+6. **[решение исполнителя] Очередь — один снимок на сессию** (`snapq-<сессия>.json`
+   `{session, old_server, body}`): новый заменяет старый (снимок — «последнее известное
+   состояние»), счётчик ответов старого сервера переносится. Отправка: 2xx — удалить; 404/405 —
+   счётчик +1, после 3 — без попыток в этой сессии (снимок остаётся); 400/413/422 — отбросить;
+   прочее (сеть, 5xx, 401/403) — оставить. Файл сменился за время запроса — новый не трогается.
+   `session-start` отправляет до 3 очередей других сессий (новые первыми) — снимок
+   `SessionEnd` при недоступном сервере уходит со следующим стартом.
+7. **CLI: `zam sessions snapshot` с псевдонимом `session`** вместо отдельной группы `zam session`
+   и файла `cmd/session.rs`: у `zam` уже есть группа `sessions` (`tokens`), две группы `session`
+   и `sessions` путали бы; файл — `cmd/session_snapshot.rs` (рядом с `sessions.rs`). Вызов
+   `zam session snapshot …` из ТЗ работает.
+8. **CLI: записи журнала — последней сессии файла** при любом источнике id: `--session` и
+   `ZAM_SESSION_ID` задают только сессию на сервере (у Claude фильтр по чужому `sessionId` дал бы
+   пустой снимок). Формат без `--format` — по первой строке (`"type":"session_meta"` — Codex).
+   Сессия есть на сервере (`GET` 200) — `POST /sessions` не шлётся: он освежил бы `last_seen_at`,
+   и оборванная сессия выглядела бы живой (§8а, дайджест). Срок сборки CLI — 5 с (не хук). Ошибка
+   сервера — ошибка команды, в очередь хуков снимок не кладётся. Предел записи — 16384
+   (`snapshot.max_bytes` по умолчанию: клиент настроек сервера не знает).
+9. **`ZAM_TEST_SNAPSHOT_MS`** (только отладочная сборка или фича `test-hooks`, как
+   `ZAM_TEST_HOOK_BUDGET_MS`) — срок снимка для тестов содержимого под нагрузкой. Жёсткий срок
+   проверяет `snapshot_deadline_never_delays_stop` со сроком по умолчанию и подменой
+   `<журнал>.stall-ms` (17a).
+10. **`hooks.log`**: строка на снимок — «снимок <повод>: N байт, <полнота>, отправлен | в очереди:
+    <причина> | отброшен: <причина>»; упор сканера — `snapshot: secrets_scan_depth`. Причина —
+    статус и начало `detail` ответа сервера (не текст снимка).
+11. **`SessionEnd` → `PATCH ended`** — и при выключенном снимке; 404 (сессии нет) — молча.
+    `PostCompact` при выключенном снимке ничего не делает (в §8а «`PostCompact`/`SessionEnd`
+    только ставят `ended_at`» — `ended_at` ставит только `SessionEnd`, у `PostCompact` конца
+    сессии нет).
+12. `X-Zam-Session` у `PUT` — id сессии снимка (`Client::set_session`); заглушка тестов
+    заголовков не записывает — проверяется в 17c (`put_requires_explicit_session`).
+
+### Тесты
+
+`crates/zam-cli/tests/hooks.rs` (12): `snapshot_deadline_never_delays_stop`,
+`snapshot_tail_of_growing_file`, `snapshot_bad_path_is_silent` (нет файла, каталог, пустая
+строка, мусор — пустой снимок без `PUT`), `stop_throttle_16kib_60s`,
+`post_compact_and_session_end_accepted_within_100ms`, `session_end_patches_ended` (настоящий
+сервер), `compact_put_before_recall` (+ очередь другой сессии на старте),
+`catch_up_before_recall_on_startup`, `old_server_three_attempts_then_queue`,
+`switch_off_never_opens_transcript` (контроль подменой `stall-ms`: при включённом снимке хук
+ждёт 2 с, при выключенном каждый хук < 1,9 с), `queue_file_mode_0600` (unix), `hooks_log_has_no_snapshot_text`,
+`ev_snapshot_metadata_only`. `crates/zam-cli/tests/snapshot.rs` (3): `cli_snapshot_session_source_order`,
+`cli_snapshot_registers_session`, `cli_snapshot_no_session_exit_1`. `crates/zam-server/tests/agent_setup.rs`:
+`agent_setup_fragments_have_session_end` и правка трёх прежних (число событий 8 → 10 у Claude,
+7 → 8 у Codex). Юнит: `client_keys_parsed_and_layered`, `events_per_command`,
+`summary_has_snapshot_line`, `journal_roundtrip_all_events` (с `Ev::Snapshot`).
+
+TDD: `agent_setup` — красный до правки сервера (4 FAILED, `agent_setup_red.log`), затем зелёный.
+Тесты хуков и CLI написаны вместе с реализацией и прошли с первого прогона; падение каждой
+защиты без правки показано откатами.
+
+### Откаты
+
+Скрипт `.tmp/m6/task17b/rollbacks.py`, журнал `rollbacks.log`: правка убирается, нужный тест
+прогоняется (`--exact`), файл восстанавливается. 25 откатов — все FAIL ожидаемым тестом:
+R1 срок (10 с вместо `snapshot_ms`) → `snapshot_deadline_never_delays_stop`; R2 хвост
+`snapshot_tail_kb` → `snapshot_tail_of_growing_file`; R3 строка в журнале при отсутствии
+журнала агента, R4 отправка пустого снимка → `snapshot_bad_path_is_silent`; R5 60 с, R6 рост
+16 КиБ, R7 новый запрос → `stop_throttle_16kib_60s`; R8 `PATCH ended` → `session_end_patches_ended`;
+R9 конспект входа `PostCompact` → `post_compact_and_session_end_accepted_within_100ms`; R10 снимок
+после `/recall`, R11 журнал читается при свежем `PostCompact`, R12 очереди других сессий →
+`compact_put_before_recall`; R13 нет догоняющего, R14 без проверки `ended`, R15 без проверки
+роста → `catch_up_before_recall_on_startup`; R16 без предела 3 попыток →
+`old_server_three_attempts_then_queue`; R17/R18 выключатель (`checkpoint`/`session-start`) →
+`switch_off_never_opens_transcript`; R19 текст снимка в `hooks.log` →
+`hooks_log_has_no_snapshot_text`; R20 нет `Ev::Snapshot`, R21 нет строки сводки →
+`ev_snapshot_metadata_only`; R22 порядок `--session`/`ZAM_SESSION_ID`, R23 фильтр записей по явному
+id → `cli_snapshot_session_source_order`; R24 регистрация без проверки → `cli_snapshot_registers_session`;
+R25 код 6 вместо 1 → `cli_snapshot_no_session_exit_1`.
+
+R6 в первом прогоне **не упал** (см. п. 3 отступлений): исправлено полем `prompt_at`, R6 и R7
+повторены — оба FAIL. `queue_file_mode_0600` — только unix, на Windows не запускался (права
+даёт `cache::write_atomic`, тот же путь, что у прочих файлов кэша).
+
+### Проверка
+
+- `cargo test -p zam-server --test agent_setup` — 14 PASS (`agent_setup.log`).
+- `cargo test -p zam-core -p zam-cli --no-fail-fast -- --skip hook_budgets` (`full.log`, перед
+  этим собран `zam-server`): 30 наборов PASS, два FAIL — оба повторены поодиночке и прошли
+  (`rerun-*.log`):
+  - `hooks::session_start_spawns_background_sync_once_per_interval` — выбросы запуска 528 и
+    111 мс при медиане 5,7 мс (известный временной тест под нагрузкой, как в 17a); повтор — PASS;
+  - `snapshot::cli_snapshot_session_source_order` — `WSAENOBUFS` (10055) в `try_clone` сокета
+    заглушки `common::stub_body`: исчерпание буферов сокетов машины под нагрузкой; повтор
+    набора `snapshot` — 32 PASS.
+  Машина не в тихом окне (чужие процессы `python`, не трогал). `hook_budgets` не запускался.
+- `cargo clippy -p zam-cli -p zam-server --all-targets -- -D warnings` — чисто; `rustfmt
+  --edition 2024 --check` по файлам задачи — чисто.
+
+### Передать
+
+- → 17c:
+  - тело `PUT /sessions/{id}/snapshot` — `{taken_at, trigger, agent, status, skipped, data}`
+    (`agent` — формат журнала `claude`|`codex`, не имя агента сессии `claude-code`); `PUT`
+    заменяет снимок сессии целиком, поэтому `PostCompact` клиента несёт и запросы/файлы/команды;
+  - клиент считает 404/405 «старым сервером» (3 попытки за сессию). Если новый сервер на
+    несуществующую сессию отвечает 404, клиент потратит на неё попытку — лучше 404 с явным
+    `type` (`session-not-found`) или регистрация сессии сервером; 400/413/422 — снимок
+    отбрасывается;
+  - `X-Zam-Session` = `{id}` ставит клиент (заглушки тестов заголовок не проверяют —
+    `put_requires_explicit_session` на стороне сервера);
+  - клиент не знает `snapshot.max_bytes` сервера, шлёт ≤ 16384; меньший предел сервера → 413 →
+    снимок отброшен (`hooks.log`);
+  - `guide` и «Подключение агента → Подсказки хуков»: ключи клиента `hooks.session_snapshot`,
+    `snapshot_tail_kb`, `snapshot_ms`, события `PostCompact`/`SessionEnd`.
+- → 17d: `hook_budgets` (release) на журнале 50 МиБ — `checkpoint` со снимком и `session-start`
+  с догоняющим снимком; `ZAM_TEST_SNAPSHOT_MS` в release нет. Codex — проверить на живом агенте
+  `transcript_path` во входе хуков и `SessionEnd`.
+- → 13a/13c (ТЗ §8а, §14): `PostCompact` читает журнал (п. 1), признак «`PostCompact` пришёл»
+  (п. 2), `prompt_at` (п. 3), локальный `ended` для догоняющего снимка (п. 4), пустой снимок не
+  отправляется (п. 5), одна очередь на сессию и классы ответов (п. 6), `zam sessions snapshot` с
+  псевдонимом `session` (п. 7), строка «`PostCompact`/`SessionEnd` только ставят `ended_at`» —
+  `ended_at` только у `SessionEnd` (п. 11); README обновлён, `CHANGELOG` — при финализации.
+- `target/t17b` удалён после работы.
