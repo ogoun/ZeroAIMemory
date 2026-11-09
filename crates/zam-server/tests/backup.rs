@@ -320,6 +320,7 @@ async fn backup_writer_no_busy_and_wal_bound() {
     );
     // признак снят: фоновый поток снова делает RESTART, WAL начинается сначала
     assert!(!zam_store::backup_flag_path(&a.st.cfg.data_dir).exists());
+    let restarts0 = db.restart_count();
     let t = Instant::now();
     loop {
         let v = "z".repeat(4096);
@@ -332,17 +333,24 @@ async fn backup_writer_no_busy_and_wal_bound() {
         })
         .await
         .unwrap();
-        // кадров в WAL — отдельным соединением (читатели пула только для чтения)
-        let frames: i64 = rusqlite::Connection::open(db.path())
+        // кадров в WAL — отдельным соединением (читатели пула только для чтения);
+        // (busy, кадров, перенесено) — для диагностики редкого падения на Linux CI
+        let (busy, frames, moved): (i64, i64, i64) = rusqlite::Connection::open(db.path())
             .unwrap()
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap();
         if frames * 4096 <= 8 * 1024 * 1024 && !db.backup_active() {
             break;
         }
         assert!(
             t.elapsed() < Duration::from_secs(20),
-            "WAL не вернулся к норме: {frames} кадров"
+            "WAL не вернулся к норме: {frames} кадров (перенесено {moved}, busy {busy}, \
+             backup_active {}, long_readers {}, restarts {restarts0}→{})",
+            db.backup_active(),
+            db.long_readers(),
+            db.restart_count()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
