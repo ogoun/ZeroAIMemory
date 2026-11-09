@@ -832,7 +832,7 @@ recall_recovery.rs,recall_brief.rs}`.
   - CLI: `cli_sessions_tokens_table`, `cli_sessions_tokens_last`;
   - e2e: `sessions page shows tokens and reread share`, `rules heavy banner`.
 - [ ] **Step 2: Реализация.** Проверка:
-  - `cargo test -p zam-server --test session_tokens --test index_api $T`;
+  - `cargo test -p zam-server --test session_tokens --test index_api --test index_rules $T`;
   - `cargo test -p zam-cli --test sessions $T`;
   - `npm run check`, `npm run build`, `npm run size`;
   - `npm run e2e -- sessions` на release.
