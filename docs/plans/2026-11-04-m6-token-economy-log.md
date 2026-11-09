@@ -5948,3 +5948,202 @@ I1/I2, M1–M8 приняты; исправлены N1–N4 и Minor. Субаг
   FAIL (`reason` = `error`);
 - после отката — PASS: `zam-server --lib transfer` — 12, `--test transfer_export` — 16 PASS;
   `fmt --check`, `clippy -p zam-server --all-targets -D warnings` — чисто.
+
+### Задача 18b2 (исполнитель). Импорт пространства (2026-11-09)
+
+Ветка `m6-portability` (worktree `.tmp/m6/wt-b`), сборка — `target/r1-t18b2`, логи и скрипты —
+`.tmp/m6/task18b2/`. Субагентов исполнитель не запускал.
+
+**Сделано.**
+- `zam-store/src/import.rs` — импорт по шагам §12б.5:
+  - `validate_archive(zip, ImportLimits)` → `Plan`: весь архив проверяется до первой записи.
+    По центральному каталогу — имена (`..`, `.`, пустой сегмент, абсолютный путь, `\`, диск
+    `C:`, `\0` — 422), символьные ссылки и шифрование (422), файлов ≤ `import.max_files`,
+    распакованный объём ≤ `import.max_bytes`, коэффициент сжатия файла ≥ 1 МиБ ≤ 100
+    (`MAX_RATIO_DEFAULT`). Чтение — не больше заявленного размера (`take(size + 1)`), sha256
+    файлов `_attachments/` считается потоком и сверяется с frontmatter. Разбор описи (формат 1,
+    `source_user_id`, `space`, `missing_blobs` → `warnings`), frontmatter заметок и записей,
+    `_folders.jsonl`, `_links.jsonl`, `_history/<id>.jsonl`; отпечаток пересчитывается
+    (`Fingerprint`), расхождение с описью — предупреждение. Архив без `manifest.json` — «папка
+    `.md`»: все `*.md` — заметки (путь — имя файла), прочие файлы — предупреждение.
+  - `plan_ids(db, space, plan, own, taken)` — id назначения: уже импортированное в это
+    пространство (`imported_from.source_id`) — прежний id; чужой архив — новые; свой —
+    исходные, кроме коллизий (`taken`: id в базах других пользователей и точки Qdrant других
+    тенантов; в этой базе — вне пространства, в корзине или другого вида).
+  - `remap_refs(plan, map)` — один сканер `scan_refs` (буквы `REF_LETTERS` = `i c r t k q p w e`
+    ∪ `n d`, 26 символов base32; `a:` + 32 hex) по телам, `l0`, `title`, истории и всем строкам
+    `data`; столбцы-ссылки `REF_COLUMNS` (голые id `task_id`, `question_id`, `idea`,
+    `prev_task_ids`, `supersedes_id`, `superseded_by_id`). Вне таблицы и `a:` — как есть, в
+    `unresolved`.
+  - `apply_plan(db, space, user, plan, opts, attrib)` — служебная операция `system` пачками по
+    200 (`BATCH`) в транзакции: строки `nodes`/`entries` с исходными id назначения, статусами,
+    `data`, `created_at`/`updated_at` и атрибуцией из архива; ревизии `_history` с исходной
+    атрибуцией + ревизия импорта (`author_kind: system`, причина «импорт <отпечаток> от
+    <source_user_id>»); производные — обычной записью (`index_note`, `sync_note`,
+    `tree_changed`, `replace_triggers`, `index_entry_now`, `terms_written`, `ensure_doc_as`).
+    Последняя транзакция — `supersedes_id`/`superseded_by_id` и системное ребро `supersedes`,
+    системные связи идей (`derived_from` задача → идея по `data.task_id`/`prev_task_ids`,
+    `relates_to` вопрос → идея), явные связи `_links.jsonl` (`add_explicit`; цель вне архива и
+    базы — `links_skipped`, повтор — пропуск). `dry_run` — всё в одной транзакции с откатом.
+  - Повтор — по `imported_from.source_id` + `content_hash` (заметка — sha256 исходного текста,
+    запись — `entry_hash`: вид, заголовок, тело, `data` без захвата, теги, область, статус,
+    `certainty`); родное (свой архив, тот же id) — по `nodes.content_hash`/`entry_hash`.
+    Совпали — `skipped`; отличаются — `conflicts` (`changed`) или новая ревизия при
+    `on_conflict=revision` (у заметки — `move_tx` на путь архива, если он свободен; у отчёта —
+    `report-immutable`). Заметка без своего id: путь занят — `path-taken`, при `revision` —
+    рядом `<путь> (импорт <yyyy-MM-dd>)`.
+  - Аксиомы: чужой архив (без `axioms=keep`) — `axiom` → `theorem` у записи и у заметки (строка
+    `certainty:` её собственного frontmatter), причина ревизии импорта «импорт: аксиома другого
+    пользователя — понижена до theorem (импорт …)», `demoted_axioms`.
+  - Содержимое: захват задачи `claimed_by` снимается; открытый вопрос-предложение без своей
+    идеи (нет в архиве и в базе) — `obsolete`; `data.task_space` вопроса «начать», равный
+    пространству архива, — пространство назначения; отчёт — только при `with_reports` (сессия
+    WebUI; токену — предупреждение), только в пространство решения, одна ревизия (исходная) и
+    файлы с `created_at` отчёта (триггеры 0022 не нарушаются); термин — `ensure_names_free`
+    (`term-conflict`), релиз — `ensure_release_version_free` (`release-version`); сканер
+    секретов — `warnings: "secrets_detected: «<путь|заголовок>» — <вид> (строка N)…"` без
+    значений.
+  - `extract_blobs` — файлы вложений в блобы владельца через `.incoming/<id>.part`
+    (`BlobStore::put_blocking`), sha256 сверяется ещё раз.
+- `zam-server/src/api/transfer/import.rs` — `POST /spaces/{space}/import?own=&on_conflict=&axioms=&dry_run=`
+  (`?user=` администратора): остановка → 503; права — `space_scope(Write)`, участник решения
+  (`Role::Member`) — 403; `Content-Length` > `import.max_bytes` — 413 без чтения; слот
+  (`IMPORT_SLOTS` = 1, `AppState::import_slots`; занято — 503 `Retry-After: 30`); аудит
+  `space.import` до тела (не записан — 500); тело потоком в `<data_dir>/.incoming/<id>.part`
+  (`Part` удаляет файл в `Drop` при любом исходе) с пределом (413), сторожем простоя (`STALL`
+  10 мин → 408) и остановкой (`stopping` → 503); проверка в `spawn_blocking` (422); для своего
+  архива — коллизии по базам других пользователей и `VectorIndex::foreign_targets`; распаковка
+  блобов, вид документа вложения (`sniff_blob` + `DocIntake::classify`); запись; `render_gen`,
+  `index.notify`, `docs.notify`; аудит `space.import.done {complete, reason, created, revised,
+  skipped, conflicts, bytes}`. Причина сбоя приёма — кодом (`Recv::{TooLarge, Client, Stall,
+  Stop, Io}`), без разбора текста.
+- `zam-index`: `VectorIndex::foreign_targets(user, targets)` (по умолчанию пусто), реализации в
+  `qdrant.rs` (gRPC `count` с `must_not user_id`) и `edge.rs`; один подсчёт на пачку из 500,
+  по одной цели — только при находке.
+- Конфиг `[import] max_bytes` (1024..=2⁴⁰, 2 ГиБ), `max_files` (1..=10⁷, 100 000);
+  `deploy/config.example.toml`; тест `import_section_defaults_and_ranges`.
+- CLI `zam import <F.zip|DIR> [--space S] [--own] [--on-conflict skip|revision] [--axioms
+  demote|keep] [--dry-run] [--json]`: каталог упаковывается в zip рядом (`<DIR>.zip.<pid>.part`,
+  `create_new`, удаляется после отправки); без `manifest.json` — только `*.md`, скрытые
+  каталоги пропускаются; тело — потоком с `Content-Length`, профиль `Timeouts::Download`;
+  404 у существующего пространства — «сервер не поддерживает импорт пространства: нужен
+  zam-server 0.0.11-m6 или новее». `zip` — новая зависимость `zam-cli` (крейт workspace).
+- README — строка `zam import`; спецификация §12б.5 (`imported_from` — колонка) и §13 (0025).
+
+**Отступления от брифа и решения исполнителя** (обоснования):
+1. **`imported_from` — колонка, а не поле `data`.** `nodes.imported_from` и
+   `entries.imported_from` (TEXT, JSON) добавлены в миграцию этапа `0025` (одна миграция на
+   этап, §13; 0.0.11-m6 не выпущена). Причина: `data` задач, вопросов, идей и терминов
+   нормализуется типизированным разбором (`TaskData::to_value`, `IdeaData::to_value`, …) при
+   каждой записи сервера — поле пропало бы после первой правки, и повтор импорта создал бы
+   дубль. Колонка не попадает в выдачу агенту. Базы, уже созданные с 0025 до этой правки (стенды
+   разработки), колонок не получат — пересоздать (→ 13c, в CHANGELOG разработчиков).
+2. **Сигнатуры.** `plan_ids(db, space, plan, own, taken)` — асинхронная, с пространством и
+   множеством занятых вне базы id (проверку других баз и Qdrant делает сервер);
+   `apply_plan(db, space, user, plan, opts, attrib)` — с пользователем базы (свой ли архив);
+   `ImportOptions` + `with_reports` (сессия WebUI), `stop` (остановка между пачками);
+   `ImportReport` + `remapped [{from, to}]`, `dry_run`, `archive_fingerprint`, `own`.
+   `id_remapped` — только коллизии своего архива (у чужого новые все id — 0).
+3. **Правки 18b1 (экспорт), без них круг не замыкается.** У вложения заметки во frontmatter —
+   `doc` (id документа вложения: ссылки `d:` архива переписываются на документы, созданные
+   заново с заранее выбранными id, `attachments::ensure_doc_as`); у ссылки записи на файл —
+   `symbol` и `symbol_hash` (символьные ссылки `путь#qual` M5.6 терялись).
+4. **Раскладка архива — одно место.** Константы (`EXPORT_FORMAT`, каталоги, файлы) и
+   `Fingerprint` перенесены в `zam_store::import`; `api/transfer/archive.rs` их реэкспортирует.
+5. Внутреннее `zam-store` открыто модулю импорта (`pub(crate)`): `entries::{Fields, save,
+   content_data, tags_json, ensure_release_version_free, entry_index_state, index_entry_now}`,
+   `nodes::{NoteMeta, note_meta, index_note, index_state, space_kind, ensure_ancestors,
+   store_revision, move_tx}`; `move_node` разделён на обёртку и `move_tx` (тело без изменений).
+6. **Распакованный объём** ограничивает тот же `import.max_bytes`, что и тело (спецификация:
+   оба 2 ГиБ).
+7. **Один импорт на сервер** (`IMPORT_SLOTS = 1`): запись идёт одним писателем базы, а план
+   держит тексты архива в памяти. **Память:** все тексты архива (заметки, записи, история) —
+   в `Plan` одновременно; файлы вложений в память не читаются. Пик — порядка распакованного
+   объёма текстов ×2 (строки плана и пачка в замыкании писателя) → M7: потоковый импорт.
+8. **Пачки и повтор.** Обрыв посреди записи (остановка) оставляет записанные пачки; повтор
+   того же архива их пропускает (`imported_from`). Связи и `supersedes` — последней
+   транзакцией, поэтому после обрыва до неё повтор их достраивает.
+9. Заметка «папки `.md`» без своего id при повторе — `path-taken` (сопоставить её не с чем):
+   так и проверяет `cli_import_folder_md`.
+
+**Тесты.**
+- `zam-server/tests/transfer_import.rs` — 28: все 25 из брифа и `import_busy_when_slot_taken`,
+  `import_refused_while_stopping`, `import_audit_failure_no_body`. В
+  `foreign_import_same_server_keeps_owner_search` (ML, внешний Qdrant) — ещё
+  `foreign_targets`: точка узла A видна как чужая для B и не видна для A.
+- `zam-store --lib import` — 7 юнитов (сканер, переписывание, имена и ссылки, пределы, папка
+  `.md`, понижение аксиомы во frontmatter, блок frontmatter).
+- `zam-server --lib`: `transfer::import::tests` — 4 (`options_parsing`, `recv_reasons_are_codes`,
+  `receive_gives_up_on_stall_and_stop`, `part_removed_on_drop`); `config::tests::import_section_defaults_and_ranges`.
+- `zam-cli/tests/transfer.rs::cli_import_folder_md`; юнит `dir_files_md_only_without_manifest`.
+
+Порядок TDD: файл `transfer_import.rs` написан до реализации, но первый прогон — уже после неё
+(сборка сервера ~10 мин; падение каждого защитного теста без своей защиты показано откатами
+ниже).
+
+**Проверка на откате** (коммит `966cb85`, правки скриптом `.tmp/m6/task18b2/revert.py`, прогон —
+`rollback.ps1`, после — `git checkout -- <файлы>`; логи `rev-*.log`). Пакеты подобраны так,
+что откат одного пакета не задевает целевые тесты других откатов того же пакета:
+- пакет A: имена архива → `import_rejects_traversal_abs_symlink` FAIL (`../x.md` — 200);
+  коэффициент сжатия → `import_rejects_zip_bomb` FAIL (200); снятие захвата →
+  `import_drops_claims` FAIL (`claimed_by` на месте); `obsolete` предложения →
+  `import_orphan_proposal_obsolete` FAIL (`open`); понижение аксиом →
+  `import_foreign_axioms_to_theorem_with_revision` FAIL (`demoted_axioms` 0); сканер секретов →
+  `import_secrets_detected_warning` FAIL; учёт связей вне архива →
+  `import_links_outside_skipped_reported` FAIL (0); `path-taken` → `note_path_taken_conflict` FAIL
+  (500: уникальный путь); отчёты токену → `import_report_with_images_keeps_immutability` FAIL
+  (создан 1); откат пробного импорта → `import_dry_run_writes_nothing` FAIL (счётчики выросли);
+  участник → `member_cannot_import` FAIL (200); слот → `import_busy_when_slot_taken` FAIL (200);
+  остановка → `import_refused_while_stopping` FAIL (аудит записан); аудит до тела →
+  `import_audit_failure_no_body` FAIL (200);
+- пакет B: символьная ссылка → `import_rejects_traversal_abs_symlink` FAIL; предел файлов →
+  `import_rejects_zip_bomb` FAIL (5 файлов — 200); предел тела → `import_body_over_limit_413…`
+  FAIL (422 вместо 413); флаг `own` → `own_flag_keeps_ids_and_axioms_on_new_server` FAIL;
+  `revision` → `import_on_conflict_skip_and_revision` FAIL; сканер ссылок →
+  `foreign_archive_new_ids_and_rewritten_refs` FAIL (старые id в теле);
+  (`own_flag_collision_remaps_with_report` упал и здесь — от отката `own`, поэтому коллизии
+  проверены отдельно в пакете C);
+- пакет C: удаление `.part` → `import_aborted_upload_part_removed` FAIL (`.part` остался); id
+  сильнее пути → `note_id_wins_over_path` FAIL (500); голые столбцы-ссылки →
+  `foreign_archive_new_ids_and_rewritten_refs` FAIL (`data.task_id` старый); id документов
+  `d:` → `remap_all_letters_and_columns` FAIL; триггеры → `roundtrip_derived_tables_match` FAIL;
+  коллизии своего архива → `own_flag_collision_remaps_with_report` FAIL (`id_remapped` 0);
+- пакет D: поиск прежнего импорта → `reimport_same_archive_only_skipped` FAIL (8 `path-taken`);
+  столбцы замещения → `remap_all_letters_and_columns` FAIL (`supersedes_id` null); связи идей →
+  `roundtrip_own_archive_keeps_ids` FAIL (нет `derived_from`); ссылки записей на файлы →
+  `roundtrip_derived_tables_match` FAIL; `complete` аудита → `import_aborted_upload_part_removed`
+  FAIL (`complete: true`);
+- пакет E: `doc` во frontmatter экспорта → `remap_all_letters_and_columns` FAIL; `symbol` ссылок
+  экспорта → `roundtrip_derived_tables_match` FAIL (`Cache::get` потерян); `created_at` файлов
+  отчёта → `import_report_with_images_keeps_immutability` FAIL (500 — триггер 0022); блобы при
+  `dry_run` → `import_dry_run_writes_nothing` FAIL (файл блоба записан); `foreign_targets`
+  Qdrant → `foreign_import_same_server_keeps_owner_search` FAIL (пусто);
+- L1, L2 (юнит `receive_gives_up_on_stall_and_stop`): сторож простоя и остановка при приёме тела
+  — FAIL по пределу теста 10 с (без защиты приём ждал бы вечно);
+- после отката — PASS (прогон `r7-*`).
+
+**Проверки** (`target/r1-t18b2`): `cargo fmt --all -- --check` — чисто; `cargo clippy -p zam-store
+-p zam-server -p zam-cli -p zam-index --all-targets -- -D warnings` — чисто;
+`zam-store --lib import` — 7 PASS; `zam-server --lib transfer` — 17 PASS;
+`ZAM_REQUIRE_ML=1 zam-server --test transfer_import` — 28 PASS (ML-тест с внешним Qdrant);
+`zam-cli --test transfer` — 7 PASS (`import` — 1); `zam --bin transfer` — 5 PASS; регрессия:
+`zam-server --test transfer_export` — 16 PASS, `zam-server --lib config::` — 45 PASS, `zam-store`
+целиком (12 наборов, в том числе миграции) — PASS, `zam-index --lib` — 40 PASS. `hook_budgets`
+не запускался. Зависимости ML-теста (ORT, Qdrant, pdfium) скопированы в `wt-b/target/deps` и
+удалены вместе с `target`.
+
+**Передать.**
+- → 13c (документы, ТЗ v1.24): маршрут `POST /spaces/{space}/import` и `zam import` (§12, §13.2–§13.3);
+  изменение §6.3 (аксиома чужого архива → `theorem`); колонки `imported_from` в 0025 (базы,
+  созданные с 0025 до этой правки, пересоздать — только стенды разработки); `[import]` в ТЗ §17/§23;
+  формат архива: `attachments[].doc`, `refs[].symbol`/`symbol_hash`; CHANGELOG; оценка памяти
+  импорта (тексты архива целиком) — в документацию.
+- → 18c: переезд через `zam export` / `zam import --own` на стенде; `zam import` ждёт заголовки
+  ответа до 10 мин (`Timeouts::Download`), а сервер отвечает после записи всего архива — на HDD
+  большой архив может не уложиться (замерить на стенде).
+- → M7: потоковый импорт без текстов архива в памяти; импорт в WebUI; вложения не-`.md` у
+  «папки `.md`» (картинки рядом) — сейчас пропускаются с предупреждением; `a:<чанк>` остаются
+  в `unresolved`; `foreign_targets` адаптера Qdrant Edge тестом не покрыт (тесты идут через
+  внешний Qdrant); сборщик мусора блобов не должен удалять блобы импорта, распакованные до
+  записи; маскировка секретов при импорте токеном — вместе с `secrets-mask-l2-m7`.
+- → 13a: нет.
