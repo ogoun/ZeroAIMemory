@@ -1848,7 +1848,15 @@ async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) ->
     let addr = match zam_code::split_ref(query) {
         // число — `id` карточки (так адресуется символ с `qual` вида якоря строки `L10`, M6 §12а;
         // имя символа с цифры не начинается)
-        _ if !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()) => query.to_string(),
+        _ if !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()) => {
+            if let Some(p) = path {
+                extra.push(format!(
+                    "path «{}» не учтён: query — уже id карточки",
+                    zam_store::shown_ref(p)
+                ));
+            }
+            query.to_string()
+        }
         (_, Some(_)) => {
             if let Some(p) = path {
                 extra.push(format!(

@@ -3818,6 +3818,16 @@ async fn line_anchor_symbol_link_by_id() {
         body_of(&card).lines().next(),
         "{by_id}"
     );
+    // id и path вместе — path не учтён, предупреждение (ревью задачи 14, M2)
+    let with_path = call(json!({"action": "symbol", "query": id, "path": "e.rs"})).await;
+    assert!(
+        with_path.contains("> warning: path «e.rs» не учтён: query — уже id карточки"),
+        "{with_path}"
+    );
+    assert_eq!(
+        body_of(&with_path).lines().next(),
+        body_of(&card).lines().next()
+    );
     // два символа `L10` — список кандидатов с id и подсказкой
     code_put(
         a,

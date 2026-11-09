@@ -10,7 +10,9 @@ use crate::error::ApiError;
 /// `caps`): у выпусков до M6 поля нет, и замер узнаёт их по версии и коммиту тега. `"m6"` —
 /// сборка ветки M6; задача M6, которая вводит ключ конфигурации или возможность, добавляет сюда
 /// её строку (`budget`, `snippet`, `focus`, `digest`, `hint_thresholds`, `kind_boost`,
-/// `attach_weight`, `snapshot` — таблица `KEYS` в `xtask/src/eval/caps.rs`).
+/// `attach_weight`, `snapshot` — таблица `KEYS` в `xtask/src/eval/caps.rs`). `code_recv` — карта
+/// кода принимает `refs[].recv_count` (§12а, задача 14; ключа конфигурации нет — клиент берёт
+/// тот же признак из ответа `POST /code/sync`).
 pub const FEATURES: &[&str] = &[
     "m6",
     "budget",
@@ -20,6 +22,7 @@ pub const FEATURES: &[&str] = &[
     "hint_thresholds",
     "kind_boost",
     "attach_weight",
+    "code_recv",
 ];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {

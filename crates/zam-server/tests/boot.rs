@@ -75,6 +75,8 @@ async fn health_ok_under_base_path() {
         .collect();
     assert_eq!(f, zam_server::api::health::FEATURES);
     assert!(f.contains(&"m6"), "{f:?}");
+    // карта кода принимает `refs[].recv_count` (M6 §12а)
+    assert!(f.contains(&"code_recv"), "{f:?}");
     // вне base_path маршрута нет
     let r = app.oneshot(get("/api/v1/health")).await.unwrap();
     assert_eq!(r.status(), 404);

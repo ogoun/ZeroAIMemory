@@ -140,6 +140,59 @@ test('code_search_ctrl_k_opens_card', async ({ page }) => {
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+// M6 §12а (ревью задачи 14, M6): символ с `qual` вида якоря строки (`L10`) — адрес `путь#L10`
+// сервер читает как строку файла (400), поэтому ссылка поиска ведёт на карточку по `id`, с
+// подсказкой. Ответы поиска и карточки для такого символа подставляются (`page.route`): в общей
+// карте E2E его нет — добавление изменило бы счётчики остальных сценариев.
+test('code_line_anchor_symbol_opens_card_by_id', async ({ page }) => {
+  const problems = watch(page);
+  const ID = 900_010;
+  const hit = {
+    id: ID, file_id: 1, name: 'L10', qual: 'L10', kind: 'const', path: 'src/a.rs',
+    line: 44, end_line: 44, sig: 'pub const L10: u32 = 10;', rank: 0.01,
+  };
+  const anchorCalls: string[] = [];
+  await page.route(
+    (u) => u.pathname.endsWith('/api/v1/code/symbols'),
+    async (route) => {
+      const resp = await route.fetch();
+      const body = (await resp.json()) as { symbols: unknown[] };
+      return route.fulfill({ json: { ...body, symbols: [hit, ...body.symbols] } });
+    },
+  );
+  await page.route(
+    (u) => u.pathname.includes('/api/v1/code/symbols/'),
+    async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path.endsWith(`/code/symbols/${ID}`)) {
+        return route.fulfill({
+          json: {
+            symbol: { ...hit, body_hash: '0000000000000000', exported: true, ref: 'src/a.rs#L10' },
+            callers: [], uses: [], knowledge: [], knowledge_left: 0, tokens: 40,
+          },
+        });
+      }
+      anchorCalls.push(path);
+      return route.continue();
+    },
+  );
+  await openCode(page);
+  await expect(statusBox(page)).toContainText('40 символов');
+  const input = page.getByRole('searchbox', { name: 'Поиск символа' });
+  await input.fill('L10');
+  await input.press('Enter');
+  const link = page.getByRole('list', { name: 'Найденные символы' }).getByRole('link', { name: 'L10', exact: true });
+  await expect(link).toHaveAttribute('title', /якорем строки/);
+  await expect(link).toHaveAttribute('href', new RegExp(`/j/code/${ID}$`));
+  await link.click();
+  await expect(page).toHaveURL(new RegExp(`/j/code/${ID}$`));
+  const card = page.getByRole('article', { name: 'Карточка символа' });
+  await expect(card.getByRole('heading', { level: 2 })).toHaveText('L10');
+  await expect(card).toContainText('символ не привязать: это якорь строки файла');
+  expect(anchorCalls, 'карточка не запрашивается по путь#L10').toEqual([]);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('code_card_sig_refs_knowledge_links', async ({ page }) => {
   const problems = watch(page);
   await openCode(page, CODE_REF);

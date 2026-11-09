@@ -69,6 +69,13 @@ impl CodeConfig {
             .collect()
     }
 
+    /// Набор масок [`DEFAULT_EXCLUDE`], если они действуют (`exclude_defaults`), иначе `None`.
+    pub fn default_exclude_set(&self) -> Option<GlobSet> {
+        let defaults: Vec<String> = DEFAULT_EXCLUDE.iter().map(|m| (*m).to_string()).collect();
+        self.exclude_defaults
+            .then(|| globs(&defaults).unwrap_or_else(|_| GlobSet::empty()))
+    }
+
     /// Набор действующих масок (проверены при загрузке).
     pub fn exclude_set(&self) -> GlobSet {
         globs(&self.exclude_all()).unwrap_or_else(|_| GlobSet::empty())

@@ -857,32 +857,81 @@ fn call_counts(out: &Extracted, name: &str) -> (u32, Option<u32>) {
     (r.count, r.recv_count)
 }
 
+/// Каждый вызов `name` (по одному в файле): `true` — по получателю (`(1, Some(1))`), `false` —
+/// прямой (`(1, None)`).
+fn assert_calls(out: &Extracted, lang: Lang, want: &[(&str, bool)]) {
+    for (name, recv) in want {
+        let got = call_counts(out, name);
+        let exp = (1, recv.then_some(1));
+        assert_eq!(got, exp, "{lang} {name}: {:?}", out.refs);
+    }
+}
+
 /// M6 §12а: экстрактор различает вызов по получателю (`x.f()`, `self.f()`, `this.f()`, `a.b.f()`)
 /// и прямое упоминание (`f()`, `T::f()`, `T.f()` с типом по заглавной букве, вызов через имя
-/// импорта `fs.f()`, `use …::f`); отдельного вида нет — `call` с `recv_count`.
+/// импорта `fs.f()`, `use …::f`); отдельного вида нет — `call` с `recv_count`. Каждый вызов —
+/// своё имя: проверяется каждый, а не сумма.
 #[test]
 fn recv_call_detected_rust_ts_py() {
     let rs = run(
         Lang::Rust,
-        "use m::f;\nfn g(x: X) {\n    x.f();\n    self.f();\n    a.b.f();\n    f();\n    T::f();\n}\n",
+        "use m::f4;\nfn g(x: X) {\n    x.f1();\n    self.f2();\n    a.b.f3();\n    f4();\n    T::f5();\n}\n",
     );
-    assert_eq!(call_counts(&rs, "f"), (5, Some(3)), "{:?}", rs.refs);
-    assert!(has_ref(&rs, "f", RefKind::Import));
-    let ts_src = "import { f } from './m';\nimport fs from 'fs';\nfunction g(x) {\n  x.f();\n  this.f();\n  a.b.f();\n  f();\n  T.f();\n  fs.f();\n}\n";
+    assert_calls(
+        &rs,
+        Lang::Rust,
+        &[
+            ("f1", true),
+            ("f2", true),
+            ("f3", true),
+            ("f4", false),
+            ("f5", false),
+        ],
+    );
+    assert!(has_ref(&rs, "f4", RefKind::Import));
+    let ts_src = "import { f4 } from './m';\nimport fs from 'fs';\nfunction g(x) {\n  x.f1();\n  this.f2();\n  a.b.f3();\n  f4();\n  T.f5();\n  fs.f6();\n}\n";
     for lang in [Lang::TypeScript, Lang::Tsx, Lang::JavaScript] {
         let ts = run(lang, ts_src);
-        assert_eq!(call_counts(&ts, "f"), (6, Some(3)), "{lang}: {:?}", ts.refs);
+        assert_calls(
+            &ts,
+            lang,
+            &[
+                ("f1", true),
+                ("f2", true),
+                ("f3", true),
+                ("f4", false),
+                ("f5", false),
+                ("f6", false),
+            ],
+        );
     }
     let py = run(
         Lang::Python,
-        "import os\nfrom m import f\n\ndef g(self, x):\n    x.f()\n    self.f()\n    a.b.f()\n    f()\n    T.f()\n    os.f()\n",
+        "import os\nfrom m import f4\n\ndef g(self, x):\n    x.f1()\n    self.f2()\n    a.b.f3()\n    f4()\n    T.f5()\n    os.f6()\n",
     );
-    assert_eq!(call_counts(&py, "f"), (6, Some(3)), "{:?}", py.refs);
+    assert_calls(
+        &py,
+        Lang::Python,
+        &[
+            ("f1", true),
+            ("f2", true),
+            ("f3", true),
+            ("f4", false),
+            ("f5", false),
+            ("f6", false),
+        ],
+    );
     // только прямые вызовы — поля нет (и в JSON его нет)
     let direct = run(Lang::Rust, "fn g() {\n    f();\n    T::f();\n}\n");
     assert_eq!(call_counts(&direct, "f"), (2, None));
     let json = serde_json::to_value(&direct.refs).unwrap();
-    assert!(json.to_string().find("recv_count").is_none(), "{json}");
+    assert!(!json.to_string().contains("recv_count"), "{json}");
+    // агрегирование по имени: 2 по получателю из 3
+    let agg = run(
+        Lang::Rust,
+        "fn g(x: X) {\n    x.f();\n    x.f();\n    f();\n}\n",
+    );
+    assert_eq!(call_counts(&agg, "f"), (3, Some(2)));
     // у ссылок не-вызовов счётчика нет
     for out in [&rs, &py, &direct] {
         assert!(
@@ -900,19 +949,112 @@ fn recv_call_detected_rust_ts_py() {
 fn recv_call_detected_go_java_csharp() {
     let go = run(
         Lang::Go,
-        "package p\n\nimport \"fmt\"\n\nfunc g(x X) {\n\tx.f()\n\ta.b.f()\n\tf()\n\tfmt.f()\n\tT.f()\n}\n",
+        "package p\n\nimport \"fmt\"\n\nfunc g(x X) {\n\tx.f1()\n\ta.b.f2()\n\tf3()\n\tfmt.f4()\n\tT.f5()\n}\n",
     );
-    assert_eq!(call_counts(&go, "f"), (5, Some(2)), "{:?}", go.refs);
+    assert_calls(
+        &go,
+        Lang::Go,
+        &[
+            ("f1", true),
+            ("f2", true),
+            ("f3", false),
+            ("f4", false),
+            ("f5", false),
+        ],
+    );
     let java = run(
         Lang::Java,
-        "import a.b.F;\nclass C {\n  void g(X x) {\n    x.f();\n    this.f();\n    a.b.f();\n    f();\n    T.f();\n  }\n}\n",
+        "import p.q.F;\nclass C {\n  void g(X x) {\n    x.f1();\n    this.f2();\n    a.b.f3();\n    f4();\n    T.f5();\n  }\n}\n",
     );
-    assert_eq!(call_counts(&java, "f"), (5, Some(3)), "{:?}", java.refs);
+    assert_calls(
+        &java,
+        Lang::Java,
+        &[
+            ("f1", true),
+            ("f2", true),
+            ("f3", true),
+            ("f4", false),
+            ("f5", false),
+        ],
+    );
     let cs = run(
         Lang::CSharp,
-        "using System;\nclass C {\n  void G(X x) {\n    x.F();\n    this.F();\n    a.b.F();\n    F();\n    T.F();\n    x.F<int>();\n  }\n}\n",
+        "using System;\nclass C {\n  void G(X x) {\n    x.F1();\n    this.F2();\n    a.b.F3();\n    F4();\n    T.F5();\n    x.F6<int>();\n  }\n}\n",
     );
-    assert_eq!(call_counts(&cs, "F"), (6, Some(4)), "{:?}", cs.refs);
+    assert_calls(
+        &cs,
+        Lang::CSharp,
+        &[
+            ("F1", true),
+            ("F2", true),
+            ("F3", true),
+            ("F4", false),
+            ("F5", false),
+            ("F6", true),
+        ],
+    );
+}
+
+/// M6 §12а, п. 2(б) предрегистрации (ревью задачи 14, I3): вызов через модуль — квалификатор и
+/// при псевдониме импорта (`import numpy as np`, `import * as ns`, `import { a as b }`, Go
+/// `f "fmt"`, `require`), по имени Go-пакета из пути (без `.vN`, `/vN` и `go-`) и по цепочке, чей
+/// левый идентификатор — импорт (`os.path.join`, `System.Console.WriteLine`,
+/// `java.util.Objects.equals`); неимпортированная цепочка — по получателю.
+#[test]
+fn module_calls_via_import_aliases_and_chains_are_direct() {
+    let py = run(
+        Lang::Python,
+        "import numpy as np\nimport os.path\nfrom m import thing as th\n\ndef g(x):\n    np.p1()\n    os.path.p2()\n    th.p3()\n    x.y.p4()\n",
+    );
+    assert_calls(
+        &py,
+        Lang::Python,
+        &[("p1", false), ("p2", false), ("p3", false), ("p4", true)],
+    );
+    let ts_src = "import * as ns from './ns';\nimport { a as b } from './a';\nconst fs = require('fs');\nfunction g(x) {\n  ns.t1();\n  b.t2();\n  fs.t3();\n  x.y.t4();\n  ns.inner.t5();\n}\n";
+    for lang in [Lang::TypeScript, Lang::Tsx, Lang::JavaScript] {
+        let ts = run(lang, ts_src);
+        assert_calls(
+            &ts,
+            lang,
+            &[
+                ("t1", false),
+                ("t2", false),
+                ("t3", false),
+                ("t4", true),
+                ("t5", false),
+            ],
+        );
+    }
+    let go = run(
+        Lang::Go,
+        "package p\n\nimport (\n\tf \"fmt\"\n\t\"gopkg.in/yaml.v3\"\n\t\"github.com/redis/go-redis/v9\"\n\t\"github.com/x/go-kit\"\n)\n\nfunc g(x X) {\n\tf.g1()\n\tyaml.g2()\n\tredis.g3()\n\tkit.g4()\n\tx.y.g5()\n}\n",
+    );
+    assert_calls(
+        &go,
+        Lang::Go,
+        &[
+            ("g1", false),
+            ("g2", false),
+            ("g3", false),
+            ("g4", false),
+            ("g5", true),
+        ],
+    );
+    let java = run(
+        Lang::Java,
+        "import java.util.List;\nclass C {\n  void g(X x) {\n    java.util.Objects.j1(x);\n    x.y.j2();\n  }\n}\n",
+    );
+    assert_calls(&java, Lang::Java, &[("j1", false), ("j2", true)]);
+    let cs = run(
+        Lang::CSharp,
+        "using System.Text;\nusing IO = System.IO;\nclass C {\n  void G(X x) {\n    System.Console.C1();\n    IO.File.C2();\n    x.y.C3();\n  }\n}\n",
+    );
+    assert_calls(
+        &cs,
+        Lang::CSharp,
+        &[("C1", false), ("C2", false), ("C3", true)],
+    );
 }
 
 /// M6 §12а, контроль прочих целей: точность и полнота экстрактора на эталонах — 1,000 у всех

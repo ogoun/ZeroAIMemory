@@ -121,6 +121,15 @@ struct RawDef<'t> {
     ctx: Ctx,
 }
 
+/// Доступы к членам и квалификаторы импортов файла (вызовы по получателю, M6 §12а).
+#[derive(Default)]
+struct Members {
+    /// id узла имени члена → операнд доступа.
+    ops: HashMap<usize, lang::Operand>,
+    /// Имена, которые вводят импорты файла (псевдонимы, пакеты, левые сегменты путей).
+    quals: HashSet<String>,
+}
+
 /// Ссылка из запроса: узел имени и вид.
 struct RawRef<'t> {
     name: Node<'t>,
@@ -214,7 +223,7 @@ fn run(lang: Lang, src: &[u8], lim: &Limits, with_refs: bool, deadline: Instant)
 
     let mut chain = Chain::default();
     // имена членов в вызовах `x.f()` — только при разборе ссылок (хэшам хуков не нужны)
-    let mut members = with_refs.then(HashMap::new);
+    let mut members = with_refs.then(Members::default);
     let Some(defs) = walk_defs(lang, &tree, src, &mut chain, members.as_mut(), deadline) else {
         return Extracted::skipped(SkipReason::Timeout);
     };
@@ -256,13 +265,13 @@ fn run(lang: Lang, src: &[u8], lim: &Limits, with_refs: bool, deadline: Instant)
 /// Один обход дерева в глубину курсором (без рекурсии и без `Node::parent()`, который в
 /// tree-sitter 0.27 спускается от корня): определения с контекстом. Стек контекстов идёт
 /// параллельно пути курсора. Дедлайн — раз в [`DEADLINE_EVERY`] узлов; вышел — `None`.
-/// `members` — id узла имени члена → операнд доступа (вызовы по получателю, M6 §12а).
+/// `members` — доступы к членам и имена-квалификаторы импортов (вызовы по получателю, M6 §12а).
 fn walk_defs<'t>(
     lang: Lang,
     tree: &'t tree_sitter::Tree,
     src: &[u8],
     chain: &mut Chain,
-    mut members: Option<&mut HashMap<usize, lang::Operand>>,
+    mut members: Option<&mut Members>,
     deadline: Instant,
 ) -> Option<Vec<RawDef<'t>>> {
     let root_ctx = Ctx {
@@ -294,10 +303,11 @@ fn walk_defs<'t>(
             export: ctx.export || place.parent == Some("export_statement"),
             ..ctx
         };
-        if let Some(m) = members.as_deref_mut()
-            && let Some((name, op)) = lang::member_access(lang, node, src)
-        {
-            m.insert(name.id(), op);
+        if let Some(m) = members.as_deref_mut() {
+            if let Some((name, op)) = lang::member_access(lang, node, src) {
+                m.ops.insert(name.id(), op);
+            }
+            lang::import_qualifiers(lang, node, src, &mut m.quals);
         }
         for (name, k) in lang::defs_of(lang, node, place, src) {
             defs.push(RawDef {
@@ -514,13 +524,14 @@ fn aggregate_refs(
     src: &[u8],
     refs: Vec<RawRef>,
     def_names: &HashSet<usize>,
-    members: &HashMap<usize, lang::Operand>,
+    members: &Members,
 ) -> Vec<RefAgg> {
-    let imports: HashSet<String> = refs
+    let mut imports: HashSet<String> = refs
         .iter()
         .filter(|r| r.kind == RefKind::Import)
         .map(|r| ref_name(&lang::text(r.name, src), r.name.kind()))
         .collect();
+    imports.extend(members.quals.iter().cloned());
     let mut by_node: HashMap<usize, (usize, RawRef)> = HashMap::new();
     for r in refs {
         if def_names.contains(&r.name.id()) {
@@ -546,6 +557,7 @@ fn aggregate_refs(
         let line = r.name.start_position().row as u32 + 1;
         let recv = r.kind == RefKind::Call
             && members
+                .ops
                 .get(&r.name.id())
                 .is_some_and(|op| lang::is_recv(op, &imports));
         let i = match index.get(&(name.clone(), r.kind)) {

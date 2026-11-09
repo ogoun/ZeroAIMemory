@@ -626,8 +626,15 @@ pub fn sync(
         hashes.insert(fp.path.clone(), h);
         live.push(fp);
     }
+    // пути под исключениями по умолчанию (M6 §12а) не считаются: их уход из карты — смена
+    // умолчания (`code.exclude_defaults`), а не потерянный корень (ревью задачи 14, M1)
+    let defaults = cfg.default_exclude_set();
     let known = if state.solution == guid && !state.files.is_empty() {
-        state.files.len()
+        state
+            .files
+            .keys()
+            .filter(|p| !defaults.as_ref().is_some_and(|g| g.is_match(p.as_str())))
+            .count()
     } else if opts.prune {
         0
     } else {
@@ -636,8 +643,8 @@ pub fn sync(
     if !opts.prune && known >= PRUNE_GUARD_MIN && live.len() * 2 < known {
         return Err(CliError::config(format!(
             "файлов кода {} — меньше половины файлов карты ({known}): сервер удалил бы \
-             из карты остальные. Проверьте корень, code.exclude и code.languages; удаление \
-             намеренное — zam code sync --prune",
+             из карты остальные. Проверьте корень, code.exclude, code.exclude_defaults и \
+             code.languages; удаление намеренное — zam code sync --prune",
             live.len()
         )));
     }

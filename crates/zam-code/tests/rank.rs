@@ -1,4 +1,4 @@
-//! Ð Ð°Ð½Ð¶Ð¸Ñ€Ð¾Ð²Ð°Ð½Ð¸Ðµ ÐºÐ°Ñ€Ñ‚Ñ‹ ÐºÐ¾Ð´Ð° (ÑÐ¿ÐµÑ†Ð¸Ñ„Ð¸ÐºÐ°Ñ†Ð¸Ñ M5.6 Â§7): Ð³Ñ€Ð°Ñ„ Ñ„Ð°Ð¹Ð»Ð¾Ð², PageRank, Ð´Ð¾Ð»Ð¸ ÑÐ¸Ð¼Ð²Ð¾Ð»Ð¾Ð².
+//! Ранжирование карты кода (спецификация M5.6 §7): граф файлов, PageRank, доли символов.
 
 use std::collections::HashMap;
 
@@ -23,8 +23,8 @@ fn file(id: i64, path: &str, defs: &[(&str, SymbolKind)], refs: &[(&str, u32)]) 
     }
 }
 
-/// Ð’ÐºÐ»Ð°Ð´ ÑÑÑ‹Ð»ÐºÐ¸ Ð¿Ð¾ Ñ‚Ð°Ð±Ð»Ð¸Ñ†Ðµ M6 Â§12Ð°, Ð·Ð°Ð¿Ð¸ÑÐ°Ð½Ð½Ð¾Ð¹ Ð·Ð´ÐµÑÑŒ Ð½ÐµÐ·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ Ð¾Ñ‚ `rank.rs`: Ñ‚Ð¸Ð¿ Ð¸ Ñ€ÐµÐ°Ð»Ð¸Ð·Ð°Ñ†Ð¸Ñ
-/// 2,0, Ð¿Ñ€Ð¾Ñ‡Ð¸Ðµ 1,0; Ñƒ Ð²Ñ‹Ð·Ð¾Ð²Ð° `recv` (Ð½Ðµ Ð±Ð¾Ð»ÑŒÑˆÐµ `count`) â€” 0,25.
+/// Вклад ссылки по таблице M6 §12а, записанной здесь независимо от `rank.rs`: тип и реализация
+/// 2,0, прочие 1,0; у вызова `recv` (не больше `count`) — 0,25.
 fn table_contribution(kind: RefKind, count: u32, recv: u32) -> f64 {
     let k = match kind {
         RefKind::Type | RefKind::Impl => 2.0,
@@ -46,7 +46,7 @@ fn edge(edges: &[(usize, usize, f64)], s: usize, d: usize) -> Option<f64> {
     edges.iter().find(|e| e.0 == s && e.1 == d).map(|e| e.2)
 }
 
-/// Ð­Ñ‚Ð°Ð»Ð¾Ð½Ð½Ñ‹Ð¹ ÑÑ‚ÐµÐ¿ÐµÐ½Ð½Ð¾Ð¹ Ð¼ÐµÑ‚Ð¾Ð´ Ð±ÐµÐ· Ð¿Ñ€ÐµÐ´ÐµÐ»Ð° Ð¸Ñ‚ÐµÑ€Ð°Ñ†Ð¸Ð¹ (Ð´Ð»Ñ Ð¿Ñ€Ð¾Ð²ÐµÑ€ÐºÐ¸ ÑÑ…Ð¾Ð´Ð¸Ð¼Ð¾ÑÑ‚Ð¸ Ð·Ð° 50).
+/// Эталонный степенной метод без предела итераций (для проверки сходимости за 50).
 fn reference_pagerank(n: usize, edges: &[(usize, usize, f64)]) -> Vec<f64> {
     let mut out = vec![0.0; n];
     for &(s, _, w) in edges {
@@ -100,7 +100,7 @@ fn edges_skip_self_definitions() {
     assert_eq!(
         edge(&e, 0, 0),
         None,
-        "ÑÑÑ‹Ð»ÐºÐ° Ð½Ð° ÑÐ²Ð¾Ñ‘ Ð¾Ð¿Ñ€ÐµÐ´ÐµÐ»ÐµÐ½Ð¸Ðµ â€” Ð½Ðµ Ñ€ÐµÐ±Ñ€Ð¾"
+        "ссылка на своё определение — не ребро"
     );
     assert!(close(edge(&e, 1, 0).unwrap(), 10.0));
     assert_eq!(e.len(), 1);
@@ -108,7 +108,7 @@ fn edges_skip_self_definitions() {
 
 #[test]
 fn edges_split_by_definers_count() {
-    // `open_store` Ð¾Ð¿Ñ€ÐµÐ´ÐµÐ»Ñ‘Ð½ Ð² b Ð¸ c: Ð²ÐµÑ A â†’ B Ð¸ A â†’ C â€” âˆš4 Ã— 10 / 2 = 10; ÑÑÑ‹Ð»ÐºÐ¸ ÑÑƒÐ¼Ð¼Ð¸Ñ€ÑƒÑŽÑ‚ÑÑ
+    // `open_store` определён в b и c: вес A → B и A → C — √4 × 10 / 2 = 10; ссылки суммируются
     let files = [
         file(1, "a.rs", &[], &[("open_store", 4), ("Db", 1)]),
         file(
@@ -126,16 +126,12 @@ fn edges_split_by_definers_count() {
     let e = edges_among(&files, &[0, 1, 2, 3]);
     assert!(close(edge(&e, 0, 1).unwrap(), 10.0 + 1.0));
     assert!(close(edge(&e, 0, 2).unwrap(), 10.0));
-    assert_eq!(
-        e.len(),
-        2,
-        "Ð½ÐµÐ¾Ð¿Ñ€ÐµÐ´ÐµÐ»Ñ‘Ð½Ð½Ð¾Ðµ Ð¸Ð¼Ñ Ñ€Ñ‘Ð±ÐµÑ€ Ð½Ðµ Ð´Ð°Ñ‘Ñ‚: {e:?}"
-    );
+    assert_eq!(e.len(), 2, "неопределённое имя рёбер не даёт: {e:?}");
 }
 
 #[test]
 fn pagerank_sums_to_one_converges_50_iters() {
-    // ÐºÐ¾Ð»ÑŒÑ†Ð¾ Ñ Ñ…Ð¾Ñ€Ð´Ð°Ð¼Ð¸ Ð¸ Ð²Ð¸ÑÑÑ‡Ð¸Ð¼ ÑƒÐ·Ð»Ð¾Ð¼
+    // кольцо с хордами и висячим узлом
     let n = 12;
     let mut edges = Vec::new();
     for i in 0..n - 1 {
@@ -147,7 +143,7 @@ fn pagerank_sums_to_one_converges_50_iters() {
     assert!((r.iter().sum::<f64>() - 1.0).abs() < 1e-9);
     let reference = reference_pagerank(n, &edges);
     let l1: f64 = r.iter().zip(&reference).map(|(a, b)| (a - b).abs()).sum();
-    assert!(l1 < 1e-4, "L1 Ð´Ð¾ ÑÑ‚Ð°Ð»Ð¾Ð½Ð° {l1}");
+    assert!(l1 < 1e-4, "L1 до эталона {l1}");
     assert!(pagerank(0, &[], None).is_empty());
 }
 
@@ -157,13 +153,13 @@ fn pagerank_star_center_highest() {
     let edges: Vec<_> = (1..n).map(|i| (i, 0, 1.0)).collect();
     let r = pagerank(n, &edges, None);
     for (i, v) in r.iter().enumerate().skip(1) {
-        assert!(r[0] > *v * 2.0, "Ñ†ÐµÐ½Ñ‚Ñ€ {} Ð»Ð¸ÑÑ‚ {i} {v}", r[0]);
+        assert!(r[0] > *v * 2.0, "центр {} лист {i} {v}", r[0]);
     }
 }
 
 #[test]
 fn pagerank_dangling_nodes_no_nan() {
-    // Ñ‚Ð¾Ð»ÑŒÐºÐ¾ Ð²Ð¸ÑÑÑ‡Ð¸Ðµ ÑƒÐ·Ð»Ñ‹, Ð¼ÑƒÑÐ¾Ñ€Ð½Ñ‹Ðµ Ñ€Ñ‘Ð±Ñ€Ð° Ð¸ Ð½ÑƒÐ»ÐµÐ²Ð¾Ð¹ Ð²ÐµÐºÑ‚Ð¾Ñ€ Ð¿ÐµÑ€ÐµÐ·Ð°Ð¿ÑƒÑÐºÐ°
+    // только висячие узлы, мусорные рёбра и нулевой вектор перезапуска
     let edges = [
         (0, 1, 1.0),
         (2, 9, 1.0),
@@ -181,10 +177,10 @@ fn pagerank_dangling_nodes_no_nan() {
         assert!((r.iter().sum::<f64>() - 1.0).abs() < 1e-9);
     }
     let r = pagerank(5, &edges, Some(&[0.0, 0.0, 1.0, 0.0, 0.0]));
-    assert!(r[2] > r[3], "Ð¿ÐµÑ€ÐµÐ·Ð°Ð¿ÑƒÑÐº Ð² ÑƒÐ·ÐµÐ» 2: {r:?}");
+    assert!(r[2] > r[3], "перезапуск в узел 2: {r:?}");
 }
 
-/// Ð“Ñ€Ð°Ñ„ Ð¸Ð· 30 Ñ„Ð°Ð¹Ð»Ð¾Ð²: Ñ…Ð°Ð±, ÑÑ€ÐµÐ´Ð½Ð¸Ðµ ÑƒÐ·Ð»Ñ‹, Ñ„Ð¾ÐºÑƒÑÐ½Ñ‹Ð¹ Ñ„Ð°Ð¹Ð» Ð¸ Ñ‚Ñ€Ð¸ ÐµÐ³Ð¾ Ñ†ÐµÐ»Ð¸.
+/// Граф из 30 файлов: хаб, средние узлы, фокусный файл и три его цели.
 fn graph30() -> Vec<RankFile> {
     let mut files = vec![file(
         0,
@@ -214,7 +210,7 @@ fn graph30() -> Vec<RankFile> {
             refs.clear();
         }
         if i == 20 {
-            // Ñ„Ð¾ÐºÑƒÑÐ½Ñ‹Ð¹ Ñ„Ð°Ð¹Ð» ÑÑÑ‹Ð»Ð°ÐµÑ‚ÑÑ Ð½Ð° Ñ…Ð°Ð± Ð¸ Ñ‚Ñ€Ð¸ Ñ†ÐµÐ»Ð¸: Ð²Ð¼ÐµÑÑ‚Ðµ Ñ Ð½Ð¸Ð¼ â€” Ñ€Ð¾Ð²Ð½Ð¾ Ð¿ÑÑ‚Ñ‘Ñ€ÐºÐ°
+            // фокусный файл ссылается на хаб и три цели: вместе с ним — ровно пятёрка
             refs.truncate(1);
             for t in 25..=27 {
                 refs.push((format!("focus_target_{t}"), RefKind::Call, 1, 0));
@@ -242,10 +238,7 @@ fn focus_paths_and_their_targets_in_top5() {
     let files = graph30();
     let global = rank(&files, None);
     let g5 = top(&global.file_rank, 5);
-    assert!(
-        !g5.contains(&20) && !g5.contains(&25),
-        "Ð±ÐµÐ· Ñ„Ð¾ÐºÑƒÑÐ°: {g5:?}"
-    );
+    assert!(!g5.contains(&20) && !g5.contains(&25), "без фокуса: {g5:?}");
     let focus = Focus {
         paths: vec!["src/f20.rs".into()],
         idents: vec![],
@@ -254,10 +247,10 @@ fn focus_paths_and_their_targets_in_top5() {
     let r = rank(&files, Some(&focus));
     let t5 = top(&r.file_rank, 5);
     for want in [20, 25, 26, 27] {
-        assert!(t5.contains(&want), "{want} Ð½Ðµ Ð² Ð¿ÑÑ‚Ñ‘Ñ€ÐºÐµ {t5:?}");
+        assert!(t5.contains(&want), "{want} не в пятёрке {t5:?}");
     }
     assert!((r.file_rank.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-    // Ñ‚Ð¾Ñ‚ Ð¶Ðµ Ñ€ÐµÐ·ÑƒÐ»ÑŒÑ‚Ð°Ñ‚ Ð¿Ð¾ Ð³Ñ€Ð°Ñ„Ñƒ (Ð¿ÐµÑ€ÑÐ¾Ð½Ð°Ð»Ð¸Ð·Ð°Ñ†Ð¸Ñ Ð½Ð° ÑÐµÑ€Ð²ÐµÑ€Ðµ)
+    // тот же результат по графу (персонализация на сервере)
     let restart = focus_restart(&files, &focus).unwrap();
     assert_eq!(
         rank_on_graph(&Graph::new(&files), Some(&restart)),
@@ -278,7 +271,7 @@ fn focus_idents_and_text_give_restart_mass() {
     let by_text = Focus {
         paths: vec![],
         idents: vec![],
-        text: Some("Ð¿Ð¾Ñ‡ÐµÐ¼Ñƒ Ð¿Ð°Ð´Ð°ÐµÑ‚ focus_target_25 Ð¿Ñ€Ð¸ ÑÑ‚Ð°Ñ€Ñ‚Ðµ?".into()),
+        text: Some("почему падает focus_target_25 при старте?".into()),
     };
     let m = focus_restart(&files, &by_text).unwrap();
     assert!(m[25] > 0.0 && m[26] == 0.0);
@@ -332,16 +325,10 @@ fn symbol_share_by_incoming_name() {
     assert!(r.symbol_share[0].is_empty() && r.symbol_share[2].is_empty());
     let s = &r.symbol_share[1];
     assert!((s.iter().sum::<f64>() - 1.0).abs() < 1e-9, "{s:?}");
-    assert!(
-        s[0] > s[1] + s[2] + s[3],
-        "Ð²Ñ…Ð¾Ð´ÑÑ‰Ð¸Ð¹ Ð²ÐµÑ Ð¿Ð¾ Ð¸Ð¼ÐµÐ½Ð¸: {s:?}"
-    );
-    assert!(close(s[2], 2.0 * s[1]), "Ñ‚Ð¸Ð¿ Ã—2: {s:?}");
-    assert!(
-        close(s[3], 2.0 * s[1]),
-        "ÑÐºÑÐ¿Ð¾Ñ€Ñ‚Ð¸Ñ€ÑƒÐµÐ¼Ñ‹Ð¹ Ã—2: {s:?}"
-    );
-    // Ñ„Ð°Ð¹Ð» Ð±ÐµÐ· Ð²Ñ…Ð¾Ð´ÑÑ‰Ð¸Ñ… ÑÑÑ‹Ð»Ð¾Ðº â€” Ð´Ð¾Ð»Ð¸ Ñ‚Ð¾Ð»ÑŒÐºÐ¾ Ð¿Ð¾ Ð²Ð¸Ð´Ñƒ
+    assert!(s[0] > s[1] + s[2] + s[3], "входящий вес по имени: {s:?}");
+    assert!(close(s[2], 2.0 * s[1]), "тип ×2: {s:?}");
+    assert!(close(s[3], 2.0 * s[1]), "экспортируемый ×2: {s:?}");
+    // файл без входящих ссылок — доли только по виду
     let solo = [file(
         1,
         "a.rs",
@@ -375,10 +362,7 @@ fn central_max_three_per_file() {
     assert_eq!(c.len(), 4, "{c:?}");
     let score = |(f, s): (usize, usize)| r.file_rank[f] * r.symbol_share[f][s];
     for w in c.windows(2) {
-        assert!(
-            score(w[0]) >= score(w[1]),
-            "Ð¿Ð¾ ÑƒÐ±Ñ‹Ð²Ð°Ð½Ð¸ÑŽ Ñ€Ð°Ð½Ð³Ð°: {c:?}"
-        );
+        assert!(score(w[0]) >= score(w[1]), "по убыванию ранга: {c:?}");
     }
     assert_eq!(central(&files, &r, 2).len(), 2);
     assert!(central(&files, &r, 0).is_empty());
@@ -386,7 +370,7 @@ fn central_max_three_per_file() {
 
 #[test]
 fn edges_sum_ref_kinds_of_one_name() {
-    // `Store` ÐºÐ°Ðº Ñ‚Ð¸Ð¿ Ã—3 (Ð²ÐµÑ Ð²Ð¸Ð´Ð° 2,0, M6 Â§12Ð°) Ð¸ Ð²Ñ‹Ð·Ð¾Ð² Ã—1: âˆš(3 Ã— 2 + 1), Ð° Ð½Ðµ âˆš6 + âˆš1
+    // `Store` как тип ×3 (вес вида 2,0, M6 §12а) и вызов ×1: √(3 × 2 + 1), а не √6 + √1
     let mut a = file(1, "a.rs", &[], &[]);
     a.refs = vec![
         ("Store".into(), RefKind::Type, 3, 0),
@@ -407,7 +391,7 @@ fn edges_among_only_shown_sorted_by_weight() {
     ];
     let e = edges_among(&files, &[0, 1, 2]);
     assert_eq!(e, [(0, 2, 3.0), (0, 1, 1.0)]);
-    // d(name) â€” Ð¿Ð¾ Ð²ÑÐµÐ¼ Ñ„Ð°Ð¹Ð»Ð°Ð¼, Ð½Ðµ Ñ‚Ð¾Ð»ÑŒÐºÐ¾ Ð¿Ð¾ÐºÐ°Ð·Ð°Ð½Ð½Ñ‹Ð¼
+    // d(name) — по всем файлам, не только показанным
     let two = [
         file(1, "a.rs", &[], &[("Name", 4)]),
         file(2, "b.rs", &[("Name", SymbolKind::Struct)], &[]),
@@ -419,7 +403,7 @@ fn edges_among_only_shown_sorted_by_weight() {
 
 #[test]
 fn focus_text_common_word_does_not_dilute() {
-    // Â«newÂ» Ð¾Ð¿Ñ€ÐµÐ´ÐµÐ»Ñ‘Ð½ Ð² 20 Ñ„Ð°Ð¹Ð»Ð°Ñ…: ÑÐ»Ð¾Ð²Ð¾ Ð¸Ð· Ñ‚ÐµÐºÑÑ‚Ð° Ð½Ðµ Ð¾Ñ‚Ð½Ð¸Ð¼Ð°ÐµÑ‚ Ð¼Ð°ÑÑÑƒ Ñƒ Ñ€ÐµÐ´ÐºÐ¾Ð³Ð¾ Ð¸Ð¼ÐµÐ½Ð¸
+    // «new» определён в 20 файлах: слово из текста не отнимает массу у редкого имени
     let mut files = graph30();
     for f in files.iter_mut().skip(6).take(20) {
         f.defs
@@ -432,19 +416,15 @@ fn focus_text_common_word_does_not_dilute() {
     };
     let m = focus_restart(&files, &focus).unwrap();
     let total: f64 = m.iter().sum();
-    assert!(
-        m[25] / total > 0.9,
-        "Ð´Ð¾Ð»Ñ Ñ†ÐµÐ»Ð¸ {} Ð¸Ð· {total}",
-        m[25]
-    );
+    assert!(m[25] / total > 0.9, "доля цели {} из {total}", m[25]);
     assert!(
         close(m[6], 1.0 / 400.0),
-        "1/dÂ² Ð¾Ð¿Ñ€ÐµÐ´ÐµÐ»Ð¸Ñ‚ÐµÐ»ÑŽ Ð¾Ð±Ñ‰ÐµÐ³Ð¾ ÑÐ»Ð¾Ð²Ð°: {}",
+        "1/d² определителю общего слова: {}",
         m[6]
     );
     let r = rank(&files, Some(&focus));
     assert_eq!(top(&r.file_rank, 1), [25]);
-    // ÑÐ²Ð½Ñ‹Ð¹ ident â€” Ð¼Ð°ÑÑÐ° 1 Ð´Ð°Ð¶Ðµ Ñƒ Ð¾Ð±Ñ‰ÐµÐ³Ð¾ Ð¸Ð¼ÐµÐ½Ð¸
+    // явный ident — масса 1 даже у общего имени
     let explicit = Focus {
         idents: vec!["new".into()],
         ..Focus::default()
@@ -452,7 +432,7 @@ fn focus_text_common_word_does_not_dilute() {
     assert!(close(focus_restart(&files, &explicit).unwrap()[6], 1.0));
 }
 
-/// ÐŸÐ»Ð¾Ñ‚Ð½Ñ‹Ð¹ ÑÑ‚Ð°Ð»Ð¾Ð½ Ð³Ñ€Ð°Ñ„Ð°: Ñ€ÐµÐ±Ñ€Ð¾ A â†’ B Ð´Ð»Ñ ÐºÐ°Ð¶Ð´Ð¾Ð¹ ÑÑÑ‹Ð»ÐºÐ¸ A Ð¸ ÐºÐ°Ð¶Ð´Ð¾Ð³Ð¾ B â‰  A, Ð³Ð´Ðµ Ð¸Ð¼Ñ Ð¾Ð¿Ñ€ÐµÐ´ÐµÐ»ÐµÐ½Ð¾.
+/// Плотный эталон графа: ребро A → B для каждой ссылки A и каждого B ≠ A, где имя определено.
 fn dense_named(files: &[RankFile]) -> Vec<(usize, usize, String, f64)> {
     let mut definers: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, f) in files.iter().enumerate() {
@@ -496,7 +476,7 @@ fn dense_edges(files: &[RankFile]) -> Vec<(usize, usize, f64)> {
     e
 }
 
-/// Ð’ÐµÑ Ð²Ð¸Ð´Ð° ÑÐ¸Ð¼Ð²Ð¾Ð»Ð° Ð±ÐµÐ· Ð²Ñ…Ð¾Ð´ÑÑ‰Ð¸Ñ… ÑÑÑ‹Ð»Ð¾Ðº (ÑÑ‚Ð°Ð»Ð¾Ð½): Ñ‚Ð¸Ð¿Ñ‹ Ã—2, ÑÐºÑÐ¿Ð¾Ñ€Ñ‚Ð¸Ñ€ÑƒÐµÐ¼Ñ‹Ðµ Ã—2.
+/// Вес вида символа без входящих ссылок (эталон): типы ×2, экспортируемые ×2.
 fn kind_w(k: SymbolKind, e: Option<bool>) -> f64 {
     let t = matches!(
         k,
@@ -510,7 +490,7 @@ fn kind_w(k: SymbolKind, e: Option<bool>) -> f64 {
     (if t { 2.0 } else { 1.0 }) * (if e == Some(true) { 2.0 } else { 1.0 })
 }
 
-/// ÐŸÐ»Ð¾Ñ‚Ð½Ñ‹Ð¹ ÑÑ‚Ð°Ð»Ð¾Ð½ Ð´Ð¾Ð»ÐµÐ¹: Ð²Ñ…Ð¾Ð´ÑÑ‰Ð¸Ð¹ Ð¿Ð¾Ñ‚Ð¾Ðº `r[A] Ã— w / out[A]` Ð¿Ð¾ Ð¸Ð¼ÐµÐ½Ð¸, Ð¾ÑÑ‚Ð°Ñ‚Ð¾Ðº 10 % Ð¿Ð¾ Ð²Ð¸Ð´Ñƒ.
+/// Плотный эталон долей: входящий поток `r[A] × w / out[A]` по имени, остаток 10 % по виду.
 fn dense_shares(files: &[RankFile], r: &[f64]) -> Vec<Vec<f64>> {
     let named = dense_named(files);
     let mut out = vec![0.0; files.len()];
@@ -626,14 +606,14 @@ proptest! {
         for (i, (s, d)) in r.symbol_share.iter().zip(&shares).enumerate() {
             prop_assert_eq!(s.len(), d.len());
             for (a, b) in s.iter().zip(d) {
-                prop_assert!((a - b).abs() < 1e-9, "Ñ„Ð°Ð¹Ð» {}: {:?} != {:?}", i, s, d);
+                prop_assert!((a - b).abs() < 1e-9, "файл {}: {:?} != {:?}", i, s, d);
             }
         }
     }
 }
 
-/// Ð¡Ð¸Ð½Ñ‚ÐµÑ‚Ð¸ÐºÐ° Ð¿Ñ€Ð¾Ð¿Ð¾Ñ€Ñ†Ð¸Ð¹ Ñ€ÐµÐ¿Ð¾Ð·Ð¸Ñ‚Ð¾Ñ€Ð¸Ñ (Ð³ÐµÐ½ÐµÑ€Ð°Ñ‚Ð¾Ñ€ Ñ€ÐµÐ²ÑŒÑŽ Ð·Ð°Ð´Ð°Ñ‡Ð¸ 2): Ð¾Ð±Ñ‰Ð¸Ðµ Ð¸Ð¼ÐµÐ½Ð° Ð¼ÐµÑ‚Ð¾Ð´Ð¾Ð² Ð² Ñ‡Ð°ÑÑ‚Ð¸
-/// Ñ„Ð°Ð¹Ð»Ð¾Ð², 12 ÑÐ²Ð¾Ð¸Ñ… ÑÐ¸Ð¼Ð²Ð¾Ð»Ð¾Ð², 40 ÑÑÑ‹Ð»Ð¾Ðº ÑÐ¾ ÑÑ‚ÐµÐ¿ÐµÐ½Ð½Ñ‹Ð¼ Ñ€Ð°ÑÐ¿Ñ€ÐµÐ´ÐµÐ»ÐµÐ½Ð¸ÐµÐ¼ Ñ†ÐµÐ»Ð¸.
+/// Синтетика пропорций репозитория (генератор ревью задачи 2): общие имена методов в части
+/// файлов, 12 своих символов, 40 ссылок со степенным распределением цели.
 fn synth(n: usize, common_def: f64, common_ref: f64) -> Vec<RankFile> {
     let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut rnd = move || {
@@ -707,9 +687,9 @@ fn synth(n: usize, common_def: f64, common_ref: f64) -> Vec<RankFile> {
     files
 }
 
-/// Ð—Ð°Ð¼ÐµÑ€: `cargo test -p zam-code --release --test rank -- --ignored --nocapture`.
+/// Замер: `cargo test -p zam-code --release --test rank -- --ignored --nocapture`.
 #[test]
-#[ignore = "Ð·Ð°Ð¼ÐµÑ€ Ð² release: 50 000 Ñ„Ð°Ð¹Ð»Ð¾Ð² ÑÐ¸Ð½Ñ‚ÐµÑ‚Ð¸ÐºÐ¸, rank() < 1 Ñ"]
+#[ignore = "замер в release: 50 000 файлов синтетики, rank() < 1 с"]
 fn rank_50k_files_under_1s_release() {
     for (def, rf) in [(0.01, 0.1), (0.1, 0.3)] {
         let files = synth(50_000, def, rf);
@@ -717,7 +697,7 @@ fn rank_50k_files_under_1s_release() {
         let r = rank(&files, None);
         let el = t.elapsed();
         let refs: usize = files.iter().map(|f| f.refs.len()).sum();
-        println!("50 000 Ñ„Ð°Ð¹Ð»Ð¾Ð² (def {def}, ref {rf}), ÑÑÑ‹Ð»Ð¾Ðº {refs}: rank() {el:?}");
+        println!("50 000 файлов (def {def}, ref {rf}), ссылок {refs}: rank() {el:?}");
         assert!((r.file_rank.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         if !cfg!(debug_assertions) {
             assert!(el.as_secs_f64() < 1.0, "{el:?}");
@@ -725,9 +705,9 @@ fn rank_50k_files_under_1s_release() {
     }
 }
 
-/// M6 Â§12Ð°: Ñ‚Ð°Ð±Ð»Ð¸Ñ†Ð° Ð²ÐµÑÐ¾Ð² Ð²Ð¸Ð´Ð° Ð¾Ð±ÑŠÑÐ²Ð»ÐµÐ½Ð° Ð´Ð¾ Ð·Ð°Ð¼ÐµÑ€Ð° â€” Ñ‚Ð¸Ð¿ Ð¸ Ñ€ÐµÐ°Ð»Ð¸Ð·Ð°Ñ†Ð¸Ñ 2,0, Ð¿Ñ€ÑÐ¼Ð¾Ð¹ Ð²Ñ‹Ð·Ð¾Ð², Ð¸Ð¼Ð¿Ð¾Ñ€Ñ‚ Ð¸
-/// Ð¿Ñ€Ð¾Ñ‡ÐµÐµ 1,0, Ð²Ñ‹Ð·Ð¾Ð² Ð¿Ð¾ Ð¿Ð¾Ð»ÑƒÑ‡Ð°Ñ‚ÐµÐ»ÑŽ 0,25: Ð²ÐºÐ»Ð°Ð´ Ð²Ñ‹Ð·Ð¾Ð²Ð° `(count âˆ’ recv) Ã— 1,0 + recv Ã— 0,25`
-/// (`recv` Ð±Ð¾Ð»ÑŒÑˆÐµ `count` â€” Ð½Ðµ Ð±Ð¾Ð»ÑŒÑˆÐµ `count`). Ð’ÐµÑ Ñ€ÐµÐ±Ñ€Ð° â€” `âˆšc` (Ð¸Ð¼Ñ `Store`: Ð¼Ð½Ð¾Ð¶Ð¸Ñ‚ÐµÐ»ÑŒ 1, d = 1).
+/// M6 §12а: таблица весов вида объявлена до замера — тип и реализация 2,0, прямой вызов, импорт и
+/// прочее 1,0, вызов по получателю 0,25: вклад вызова `(count − recv) × 1,0 + recv × 0,25`
+/// (`recv` больше `count` — не больше `count`). Вес ребра — `√c` (имя `Store`: множитель 1, d = 1).
 #[test]
 fn weights_table_fixed() {
     let weight = |kind: RefKind, count: u32, recv: u32| {
@@ -748,9 +728,9 @@ fn weights_table_fixed() {
     assert!(close(weight(RefKind::Call, 4, 4), 1.0));
     assert!(close(weight(RefKind::Call, 4, 2), 2.5f64.sqrt()));
     assert!(close(weight(RefKind::Call, 4, 9), 1.0), "recv â‰¤ count");
-    // ÑÑ‡Ñ‘Ñ‚Ñ‡Ð¸Ðº Ð¿Ð¾Ð»ÑƒÑ‡Ð°Ñ‚ÐµÐ»Ñ Ñƒ Ð½Ðµ-Ð²Ñ‹Ð·Ð¾Ð²Ð° Ð½Ðµ Ð´ÐµÐ¹ÑÑ‚Ð²ÑƒÐµÑ‚
+    // счётчик получателя у не-вызова не действует
     assert!(close(weight(RefKind::Type, 4, 4), 8f64.sqrt()));
-    // Ð¿Ñ€Ð°Ð²Ð¸Ð»Ð° M5.7 Ð´Ð»Ñ Ð°Ð±Ð»ÑÑ†Ð¸Ð¸: Ð²Ð¸Ð´Ñ‹ Ñ€Ð°Ð²Ð½Ñ‹, Ð¿Ð¾Ð»ÑƒÑ‡Ð°Ñ‚ÐµÐ»ÑŒ Ð½Ðµ Ñ€Ð°Ð·Ð»Ð¸Ñ‡Ð°ÐµÑ‚ÑÑ
+    // правила M5.7 для абляции: виды равны, получатель не различается
     let mut a = file(1, "a.rs", &[], &[]);
     a.refs = vec![
         ("Store".into(), RefKind::Type, 3, 0),
@@ -778,11 +758,7 @@ fn weights_table_fixed() {
             ..f.clone()
         })
         .collect();
-    assert_eq!(
-        r57,
-        rank(&uniform, None),
-        "M5.7: Ð²ÑÐµ Ð²Ð¸Ð´Ñ‹ ÐºÐ°Ðº Ð¿Ñ€ÑÐ¼Ð¾Ð¹ Ð²Ñ‹Ð·Ð¾Ð²"
-    );
+    assert_eq!(r57, rank(&uniform, None), "M5.7: все виды как прямой вызов");
 }
 
 /// Входы ранжирования из JSON эталона шага 0 задачи 14 M6 (`files[].defs [[name, kind,
