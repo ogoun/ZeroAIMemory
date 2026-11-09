@@ -7696,3 +7696,67 @@ T5 без `OkKept` → `queue_lock_and_size_limit`. Проверка `fresh` п�
 - `clippy -p zam-cli --all-targets -D warnings` — чисто (после `collapsible_if` в `build`);
   `rustfmt --edition 2024 --check` по файлам задачи — чисто.
 - `target/t17b` удалён.
+
+### Задача 17b, сверка временного теста на базе (2026-11-10)
+
+`hooks::session_start_spawns_background_sync_once_per_interval` (порог p95 запуска фоновой
+`zam code sync` — 40 мс в debug) на базе `82284cc` и на `3f34fbc`: два worktree в `.tmp/m6/`,
+общий `target/t17b-ab`, по одному прогону поочерёдно, 10 кругов в одной нагрузке (36 чужих
+процессов `python`). p95 запуска, мс:
+
+| круг | 82284cc (база) | 3f34fbc (17b) |
+|---|---|---|
+| 1 | 10,43 | 17,97 |
+| 2 | 14,78 | **70,76** |
+| 3 | 13,30 | 8,30 |
+| 4 | 9,82 | 18,52 |
+| 5 | **67,74** | 11,60 |
+| 6 | 9,20 | **74,45** |
+| 7 | **78,82** | 8,85 |
+| 8 | **43,38** | 9,98 |
+| 9 | **72,99** | **75,15** |
+| 10 | **71,69** | **75,24** |
+
+FAIL (жирное): база — 5 из 10, 17b — 4 из 10; разброс одинаковый (≈ 9–15 мс в тихие минуты,
+68–79 мс в шумные). Вывод: падение — нагрузка машины, не регресс 17b (замер — `spawn()`
+процесса внутри `code::auto::maybe_spawn_sync`, задачей не менялся; в тесте нет сервера и
+кандидатов на снимок). Worktree сняты (`git worktree remove`, без junction), `target/t17b-ab`
+удалён.
+
+### Задача 17b, мелкие третьего ревью (2026-11-10)
+
+Коммит `fix(hooks): мелкие третьего ревью 17b — фактический срок PUT в причине` поверх `3f34fbc`
+(sha — в отчёте контроллеру).
+1. **Фактический срок `PUT`.** Срок клиента — меньшее из `SNAPSHOT_PUT_MS` и остатка бюджета хука
+   (в `checkpoint` остаток бывает ~40 мс). `flush` запоминает его (`limit`), опоздание
+   распознаётся по нему, в `hooks.log` — фактическое значение: «срок PUT N мс». Тест
+   `put_timeout_reason_uses_actual_limit`: свой срок 10 с, бюджет хука 1,5 с, `PUT` отвечает через
+   3 с — в журнале «срок PUT N мс» с N < 1500.
+2. **`trigger` в `snapst-*`.** Комментарий у поля: пустая строка — удавшихся снимков не было
+   (только опоздавшие попытки, `ok_at == 0`).
+
+3. **Порог `slow_snapshot_put_keeps_digest` под нагрузкой.** Первый прогон после правки — FAIL
+   («PUT держал /recall» 277 и 177 мс при пороге 165): при бюджете по умолчанию разрыв между
+   сроком `PUT` (60 мс) и отказом (~270 мс) съедается нагрузкой. Тест разделён: бюджет по
+   умолчанию — дайджест пришёл в `max_for`; бюджет хука 3 с — `/recall` после `PUT` меньше
+   530 мс (середина между 60 мс и ответом сервера 1 с, к которому без своего срока ждал бы `PUT`).
+   Три прогона подряд — PASS.
+
+**Откаты** (`rollbacks4.py` + `rollbacks4_list.py`, журнал `rollbacks-r4.log`): U1 сравнение с
+константой вместо фактического срока → `put_timeout_reason_uses_actual_limit` FAIL; U2 `PUT` без
+своего срока → `slow_snapshot_put_keeps_digest` (новая форма) FAIL.
+
+**Проверка.**
+- `cargo test -p zam-cli --test hooks --test snapshot --no-fail-fast` (`r4-suites.log`): `snapshot`
+  32 PASS; `hooks` 92 из 96 — FAIL `post_tool_success_under_50ms` (p95 297 мс при min 13 мс),
+  `prompt_flushes_changed_queue`, `session_start_spawns_background_sync_once_per_interval`,
+  `session_start_compact_appends_summary`; прогон шёл 237 с вместо обычных ~107 (нагрузка).
+  Повторы поодиночке: `session_start_compact_appends_summary` и
+  `session_start_spawns_background_sync…` — PASS; `prompt_flushes_changed_queue` — PASS 2 из 3
+  (падение — то на `prompt`, который 17b не менял, то на `checkpoint`: очередь изменённых не ушла
+  молча, без строки в `hooks.log` — пропуск по остатку бюджета меньше 15 мс); `post_tool_success_
+  under_50ms` — PASS 1 из 3 (p95 210–335 мс при min 13 мс; `post-tool` задачей не менялся).
+  Всё это — бюджетные тесты под нагрузкой (36 процессов `python`); отдельная сверка на базе для
+  них не делалась.
+- `clippy -p zam-cli --all-targets -D warnings` — чисто; `rustfmt --check` по файлам задачи —
+  чисто. `target/t17b` удалён.

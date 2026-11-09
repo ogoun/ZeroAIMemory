@@ -5458,20 +5458,29 @@ fn slow_snapshot_put_keeps_digest() {
         json!({"source": "resume"}),
     );
     let _ = p.hook_at(&url, "session-start", "claude", warm.to_string().as_bytes());
-    let n0 = times.lock().unwrap().len();
+    // бюджет по умолчанию: дайджест приходит в пределах хука
     let (o, d) = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
     let c = context(&o, "SessionStart");
     assert!(c.starts_with('D'), "{c}: {}", p.log());
     assert!(d <= max_for("session-start"), "{d:?}");
-    // `/recall` ушёл вскоре после `PUT` (срок `PUT` — 60 мс, а не весь остаток бюджета)
+    // щедрый бюджет хука (3 с): `PUT` держит `/recall` только свой срок (60 мс,
+    // `SNAPSHOT_PUT_MS`), а не до ответа сервера (1 с) — порог посередине, разрыв под нагрузкой
+    // широкий
+    const PUT_CAP_MS: u64 = 60;
+    const FAIL_GAP_MS: u64 = 1000;
+    let n0 = times.lock().unwrap().len();
+    let o = p
+        .cmd(&url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+        .args(["hook", "session-start", "--agent", "claude"])
+        .write_stdin(ss.to_string().into_bytes())
+        .output()
+        .unwrap();
+    context(&o, "SessionStart");
     let tm = times.lock().unwrap()[n0..].to_vec();
     let at = |key: &str| tm.iter().find(|(k, _)| k == key).map(|(_, t)| *t);
     let put = at(&format!("PUT /api/v1/sessions/{s}/snapshot")).expect("PUT");
     let recall = at("POST /api/v1/recall").expect("recall");
-    // порог — срок `PUT` (60 мс, `SNAPSHOT_PUT_MS`) с запасом посередине до значения при отказе:
-    // без своего срока `PUT` держит `/recall` весь остаток бюджета `session-start` (~270 мс)
-    const PUT_CAP_MS: u64 = 60;
-    const FAIL_GAP_MS: u64 = 270;
     let gap = recall.saturating_duration_since(put);
     assert!(
         gap < Duration::from_millis((PUT_CAP_MS + FAIL_GAP_MS) / 2),
@@ -5786,4 +5795,45 @@ fn late_post_compact_not_counted() {
     let got = puts(&seen);
     assert_eq!(got.len(), 2, "{}", p.log());
     assert_eq!(got[1].1["trigger"], "session_start_compact");
+}
+
+/// Третье ревью 17b, Minor 1: срок `PUT` — фактический срок клиента (меньшее из своего срока и
+/// остатка бюджета хука); причина «срок PUT N мс» — с ним, а не с константой.
+#[test]
+fn put_timeout_reason_uses_actual_limit() {
+    let _g = serial();
+    let (url, _seen) = common::stub_body(std::sync::Arc::new(
+        |m: &str, path: &str, _: usize, _: &Value| {
+            if m == "PUT" && path.ends_with("/snapshot") {
+                (204, String::new(), Duration::from_secs(3))
+            } else {
+                (200, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ));
+    let p = Proj::new("snap-put-limit", &url, "zam_x");
+    let s = "pl-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    // свой срок `PUT` больше остатка бюджета: фактический срок — остаток (< 1500 мс)
+    let o = p
+        .cmd(&url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "1500")
+        .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+        .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
+        .args(["hook", "checkpoint", "--agent", "claude"])
+        .write_stdin(pc.to_string().into_bytes())
+        .output()
+        .unwrap();
+    empty(&o);
+    let log = p.log();
+    let n: u64 = log
+        .split("срок PUT ")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|x| x.parse().ok())
+        .unwrap_or_else(|| panic!("нет причины «срок PUT»: {log}"));
+    assert!(n < 1500, "срок {n} мс — не фактический: {log}");
+    assert!(snap_file(&p, "snapq", s).is_some());
 }
