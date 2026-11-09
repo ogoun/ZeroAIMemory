@@ -505,6 +505,8 @@ fn cli_import_http_error_beats_broken_pipe() {
 struct Seen {
     /// Запрос импорта пришёл с `Expect: 100-continue`.
     expect: std::sync::atomic::AtomicBool,
+    /// Запрос импорта пришёл с `Connection: close`.
+    close: std::sync::atomic::AtomicBool,
     /// Журнал соединений (диагностика в сообщениях проверок).
     log: std::sync::Mutex<Vec<String>>,
 }
@@ -512,6 +514,10 @@ struct Seen {
 impl Seen {
     fn expect(&self) -> bool {
         self.expect.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn close(&self) -> bool {
+        self.close.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn log(&self) -> String {
@@ -527,6 +533,19 @@ impl Seen {
 /// дочерний процесс). Прочие соединения закрываются. Слушатель живёт до конца процесса тестов
 /// (порт не достаётся другой заглушке).
 fn stub_early(answer: String, head: usize, delay: Duration, hold: Duration) -> (String, Arc<Seen>) {
+    stub_early_with(answer, head, delay, hold, false)
+}
+
+/// Как [`stub_early`]; `keep_alive` — сервер с keep-alive: после ответа соединение не
+/// закрывается (держится `hold`), если клиент не прислал `Connection: close` (тогда закрывается
+/// сразу, как обязан сервер по RFC 9112).
+fn stub_early_with(
+    answer: String,
+    head: usize,
+    delay: Duration,
+    hold: Duration,
+    keep_alive: bool,
+) -> (String, Arc<Seen>) {
     use std::io::{BufRead, BufReader, Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -540,28 +559,31 @@ fn stub_early(answer: String, head: usize, delay: Duration, hold: Duration) -> (
             let mut first = String::new();
             let _ = r.read_line(&mut first);
             let mut expect = false;
+            let mut close = false;
             loop {
                 let mut line = String::new();
                 if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                     break;
                 }
-                if line
-                    .to_ascii_lowercase()
-                    .starts_with("expect: 100-continue")
-                {
+                let low = line.to_ascii_lowercase();
+                if low.starts_with("expect: 100-continue") {
                     expect = true;
+                }
+                if low.starts_with("connection: close") {
+                    close = true;
                 }
             }
             let import = first.starts_with("POST ") && first.contains("/import");
             s2.log
                 .lock()
                 .unwrap()
-                .push(format!("{} expect={expect}", first.trim()));
+                .push(format!("{} expect={expect} close={close}", first.trim()));
             if !import || served {
                 continue;
             }
             served = true;
             s2.expect.store(expect, std::sync::atomic::Ordering::SeqCst);
+            s2.close.store(close, std::sync::atomic::Ordering::SeqCst);
             let mut c = c;
             if head > 0 {
                 let _ = c.write_all(
@@ -586,7 +608,9 @@ fn stub_early(answer: String, head: usize, delay: Duration, hold: Duration) -> (
                 t0.elapsed().as_millis()
             ));
             let w = c.write_all(answer.as_bytes()).and_then(|()| c.flush());
-            let _ = c.shutdown(std::net::Shutdown::Write);
+            if !keep_alive || close {
+                let _ = c.shutdown(std::net::Shutdown::Write);
+            }
             s2.log.lock().unwrap().push(format!("запись {w:?}"));
             std::thread::spawn(move || {
                 std::thread::sleep(hold);
@@ -759,6 +783,32 @@ fn cli_import_zip_answer_before_body_stub() {
     let e = stderr(&o);
     assert!(seen.expect(), "нет Expect: {e}; {}", seen.log());
     assert!(e.contains("HTTP 503"), "{e}; {}", seen.log());
+}
+
+/// Прокси с keep-alive ответил рано (413) и сам соединение не закрывает: CLI шлёт
+/// `Connection: close`, сервер закрывает соединение после ответа, CLI заканчивает сразу, а не
+/// по сроку (ureq 3.4.2 дочитывает ранний ответ только до закрытия соединения).
+#[test]
+fn cli_import_early_answer_keep_alive_proxy_stub() {
+    let (url, seen) = stub_early_with(
+        "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/problem+json\r\n\
+         Content-Length: 2\r\n\r\n{}"
+            .to_string(),
+        0,
+        Duration::ZERO,
+        Duration::from_secs(20),
+        true,
+    );
+    let r = tmp("imp-keepalive-repo");
+    std::fs::create_dir_all(&r).unwrap();
+    std::fs::write(r.join("a.zip"), noise(1 << 20)).unwrap();
+    let t0 = std::time::Instant::now();
+    let o = zam_idle(&url, &r, "30", &["import", "a.zip", "--space", "knowledge"]);
+    let ms = t0.elapsed().as_millis();
+    let e = stderr(&o);
+    assert!(seen.close(), "нет Connection: close: {e}; {}", seen.log());
+    assert!(e.contains("HTTP 413"), "{e}; {}", seen.log());
+    assert!(ms < 10_000, "CLI ждал закрытия соединения {ms} мс: {e}");
 }
 
 /// Каталог идёт с оценкой объёма: при малом свободном месте сервера (подмена: хватает на

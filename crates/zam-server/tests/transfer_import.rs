@@ -2415,6 +2415,25 @@ async fn import_default_disk_reserve_allows() {
     assert_eq!(w.a.st.imports.running(), 0);
 }
 
+/// Настоящее свободное место (без подмены: `common::reports::world_cfg`, а не обёртка этого
+/// файла): `min_free_bytes = 0` и малое тело с `Content-Length` — нужно лишь 2 × тело, импорт
+/// проходит настоящий `fs4::available_space` и от диска раннера не зависит.
+#[tokio::test]
+async fn import_real_free_space_small_body() {
+    let w = common::reports::world_cfg("imp-real-free", |c| c.import.min_free_bytes = 0).await;
+    note(&w.a, &w.o.tok, G, "x", "текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let len = zip.len();
+    let req = import_req("knowledge", "", Body::empty())
+        .header(header::AUTHORIZATION, format!("Bearer {}", w.rw.tok))
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .body(Body::from(zip))
+        .unwrap();
+    let r = w.a.send(req).await;
+    report(&wait_job(&w.a, Who::Tok(&w.rw.tok), r).await);
+    assert_eq!(w.a.st.imports.disk_reserved(), 0);
+}
+
 /// Тело потоком без `Content-Length` (chunked), с оценкой `X-Zam-Expected-Bytes`.
 fn estimated(tok: &str, est: &str, zip: Vec<u8>) -> Request<Body> {
     let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = zip

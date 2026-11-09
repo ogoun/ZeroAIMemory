@@ -366,7 +366,11 @@ impl Client {
     /// предел тела на сервере). `Expect: 100-continue`: ureq читает ответ сервера только после
     /// всего тела, а так отказ до приёма (413, 503, 507, 404 старого сервера) приходит до тела —
     /// тело не уходит, и ответ не теряется в обрыве записи. Ответ ждётся до [`AWAIT_100`];
-    /// сервер (прокси) молчит дольше — тело уходит как обычно.
+    /// сервер (прокси) молчит дольше — тело уходит как обычно. `Connection: close`: ureq 3.4.2
+    /// дочитывает ранний ответ на `Expect` только до закрытия соединения сервером (после
+    /// Await100 ждёт новых данных), а прокси с keep-alive, ответивший до тела, держал бы CLI до
+    /// срока ответа (10 мин); с `Connection: close` сервер обязан закрыть соединение после
+    /// ответа (RFC 9112 §9.6).
     pub fn send_import(
         &self,
         path: &str,
@@ -378,7 +382,8 @@ impl Client {
         let mut rb = self
             .prepare(self.agent.post(&self.url(path)))
             .header("Content-Type", content_type)
-            .header("Expect", "100-continue");
+            .header("Expect", "100-continue")
+            .header("Connection", "close");
         if let Some(n) = len {
             rb = rb.header("Content-Length", n.to_string());
         }
