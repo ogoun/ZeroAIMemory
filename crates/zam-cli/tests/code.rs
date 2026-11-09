@@ -1538,49 +1538,34 @@ fn fixtures_excluded_by_default_and_pruned() {
     let Some(q) = Proj::git("fixtures-prune", &url, &tok) else {
         return;
     };
-    q.file(
-        "src/a.rs",
-        b"pub fn real() {}
-",
-    );
+    q.file("src/a.rs", b"pub fn real() {}\n");
     for i in 0..24 {
         q.file(
             &format!("pkg/tests/fixtures/f{i:02}.rs"),
-            format!(
-                "pub fn fx{i}() {{}}
-"
-            )
-            .as_bytes(),
-        );
-        q.file(
-            &format!("gen/g{i:02}.rs"),
-            format!(
-                "pub fn gx{i}() {{}}
-"
-            )
-            .as_bytes(),
+            format!("pub fn fx{i}() {{}}\n").as_bytes(),
         );
     }
     q.commit("init");
-    q.config(
-        "[code]
-exclude_defaults = false
-",
-    );
-    assert_eq!(q.sync()["files"], 49);
+    q.config("[code]\nexclude_defaults = false\n");
+    assert_eq!(q.sync()["files"], 25);
     std::fs::remove_file(q.repo.join(".zeroaimemory/config.toml")).unwrap();
+    // остаётся 1 из 25: без учёта умолчания это сработало бы как массовое удаление
     let r = q.sync();
     assert_eq!(
         (r["files"].clone(), r["removed"].clone()),
-        (json!(25), json!(24)),
+        (json!(1), json!(24)),
         "{r}"
     );
     // прочие пропавшие пути предохранитель по-прежнему считает: `gen/**` — больше половины
-    q.config(
-        "[code]
-exclude = [\"gen/**\"]
-",
-    );
+    for i in 0..24 {
+        q.file(
+            &format!("gen/g{i:02}.rs"),
+            format!("pub fn gx{i}() {{}}\n").as_bytes(),
+        );
+    }
+    q.commit("gen");
+    assert_eq!(q.sync()["files"], 25);
+    q.config("[code]\nexclude = [\"gen/**\"]\n");
     let o = q.zam(&["code", "sync"]);
     assert_eq!(o.status.code(), Some(1), "{}{}", out(&o), err(&o));
     assert!(
