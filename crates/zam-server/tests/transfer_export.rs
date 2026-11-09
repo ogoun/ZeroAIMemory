@@ -11,7 +11,7 @@ use std::io::Read;
 
 use axum::http::{Method, StatusCode};
 use common::api::{Api, Resp};
-use common::reports::{G, User, W, ok, png, web, world};
+use common::reports::{G, User, W, ok, png, web, world, world_cfg};
 use serde_json::{Value, json};
 use zam_server::api::transfer::{ExportManifest, Fingerprint};
 
@@ -526,10 +526,16 @@ async fn export_audit_written() {
     let r = export_tok(a, &o.tok, G, "").await;
     let z = Zip::of(&r);
     let space = z.manifest().space.to_string();
-    let e = export_audits(a, 1).await.remove(0);
-    assert_eq!(e["user_id"], json!(o.id));
+    // до тела — `space.export` с фильтром, по окончании — `space.export.done` с объёмом
+    let s = audits(a, "space.export", 1).await.remove(0);
+    assert_eq!(s["user_id"], json!(o.id));
+    assert_eq!(s["target"], json!(space));
+    assert_eq!(s["details"]["space"], json!(space));
+    assert_eq!(s["details"]["filter"]["history"], json!(true));
+    assert!(s["details"].get("files").is_none());
+    let e = done_audits(a, 1).await.remove(0);
+    assert!(e["id"].as_i64() > s["id"].as_i64());
     assert_eq!(e["target"], json!(space));
-    assert_eq!(e["details"]["space"], json!(space));
     assert_eq!(e["details"]["user"], json!(o.id));
     assert_eq!(e["details"]["files"], json!(z.names.len() - 1));
     let bytes: usize = z
@@ -540,18 +546,25 @@ async fn export_audit_written() {
         .sum();
     assert_eq!(e["details"]["bytes"], json!(bytes));
     assert_eq!(e["details"]["complete"], json!(true));
+    assert!(e["details"].get("reason").is_none());
     assert!(!e.to_string().contains("AUDIT-TEXT-MARK"));
+    assert!(!s.to_string().contains("AUDIT-TEXT-MARK"));
     // проверка `probe=true` аудита не пишет
     let r = export_tok(a, &o.tok, G, "?probe=true").await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     assert!(r.body.is_empty());
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert_eq!(export_audits(a, 1).await.len(), 1);
+    assert_eq!(audits(a, "space.export", 1).await.len(), 1);
+    assert_eq!(done_audits(a, 1).await.len(), 1);
 }
 
-/// Записи аудита `space.export` (новые первыми); ждёт, пока их станет не меньше `n` (аудит
-/// пишется по окончании потока).
-async fn export_audits(a: &Api, n: usize) -> Vec<Value> {
+async fn done_audits(a: &Api, n: usize) -> Vec<Value> {
+    audits(a, "space.export.done", n).await
+}
+
+/// Записи аудита `action` (новые первыми); ждёт, пока их станет не меньше `n`
+/// (`space.export.done` пишется по окончании потока).
+async fn audits(a: &Api, action: &str, n: usize) -> Vec<Value> {
     for _ in 0..100 {
         let r = a.adm(Method::GET, "/api/v1/admin/audit", None, None).await;
         ok(&r, StatusCode::OK, "аудит");
@@ -559,7 +572,7 @@ async fn export_audits(a: &Api, n: usize) -> Vec<Value> {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["action"] == "space.export")
+            .filter(|e| e["action"] == action)
             .cloned()
             .collect();
         if all.len() >= n {
@@ -567,7 +580,165 @@ async fn export_audits(a: &Api, n: usize) -> Vec<Value> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("нет {n} записей space.export");
+    panic!("нет {n} записей {action}");
+}
+
+/// Экспорт, тело которого не читается (поток встаёт, когда заполнится канал): ответ с
+/// заголовками.
+async fn start_export(a: &Api, tok: &str, space: &str) -> axum::response::Response {
+    use tower::ServiceExt;
+    let r = axum::http::Request::get(format!("/api/v1/spaces/{space}/export"))
+        .header("authorization", format!("Bearer {tok}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let r = a.app.clone().oneshot(r).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    r
+}
+
+/// Тело ответа целиком: байты или ошибка потока.
+async fn finish(r: axum::response::Response) -> Result<Vec<u8>, String> {
+    use http_body_util::BodyExt;
+    r.into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .map_err(|e| e.to_string())
+}
+
+/// Решение с заметкой и вложением 6 МиБ: архив больше канала тела (2 МиБ), непрочитанный
+/// поток встаёт.
+async fn big_world(name: &str, tweak: impl FnOnce(&mut zam_server::config::ServerConfig)) -> W {
+    let w = world_cfg(name, tweak).await;
+    let n = note_as(&w.a, &w.o.tok, G, "большая", "т").await;
+    let data: Vec<u8> = (0..6 * 1024 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    common::attach::upload(&w.a, &w.o.tok, &n, "big.bin", &data).await;
+    w
+}
+
+/// Архив разбирается целиком.
+fn valid_zip(b: &[u8]) -> bool {
+    zip::ZipArchive::new(std::io::Cursor::new(b.to_vec()))
+        .and_then(|mut z| z.by_name("manifest.json").map(|_| ()))
+        .is_ok()
+}
+
+/// Слот держится, пока идёт поток: два медленных экспорта (владелец и участник) занимают оба
+/// слота — третий (другой пользователь) получает 503; второй экспорт того же пользователя —
+/// 503 и при свободном слоте; после чтения тел слоты свободны, архивы целы.
+#[tokio::test]
+async fn export_slot_held_while_streaming() {
+    let w = big_world("export-hold", |_| {}).await;
+    let a = &w.a;
+    let n = zam_server::api::transfer::export::EXPORT_SLOTS;
+    let r1 = start_export(a, &w.o.tok, G).await;
+    assert_eq!(a.st.export_slots.available_permits(), n - 1);
+    let again = export_tok(a, &w.o.tok, G, "").await;
+    assert_eq!(
+        again.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "один на пользователя"
+    );
+    let r2 = start_export(a, &w.rw.tok, G).await;
+    assert_eq!(a.st.export_slots.available_permits(), n - 2);
+    let third = export_tok(a, &w.ro.tok, G, "").await;
+    assert_eq!(
+        third.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        third.text()
+    );
+    assert_eq!(third.header("retry-after"), "30");
+    let b1 = finish(r1).await.unwrap();
+    let b2 = finish(r2).await.unwrap();
+    assert!(valid_zip(&b1) && valid_zip(&b2));
+    for _ in 0..200 {
+        if a.st.export_slots.available_permits() == n {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(a.st.export_slots.available_permits(), n);
+    assert!(a.st.export_users.lock().unwrap().is_empty());
+    Zip::of(&export_tok(a, &w.ro.tok, G, "").await);
+}
+
+/// Экспорт дольше `export.max_secs` обрывается: тело — незавершённый архив, аудит
+/// `complete: false, reason: deadline`, долгий читатель базы снят, слот свободен.
+#[tokio::test]
+async fn export_deadline_aborts() {
+    let w = big_world("export-deadline", |c| c.export.max_secs = 1).await;
+    let a = &w.a;
+    let db = w.db().await;
+    let r = start_export(a, &w.o.tok, G).await;
+    for _ in 0..200 {
+        if db.long_readers() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(db.long_readers(), 1, "экспорт — долгий читатель базы");
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+    let body = finish(r).await;
+    assert!(
+        body.as_ref().map_or(true, |b| !valid_zip(b)),
+        "архив полный"
+    );
+    let d = done_audits(a, 1).await.remove(0);
+    assert_eq!(d["details"]["complete"], json!(false));
+    assert_eq!(d["details"]["reason"], json!("deadline"));
+    assert_eq!(db.long_readers(), 0);
+    assert_eq!(
+        a.st.export_slots.available_permits(),
+        zam_server::api::transfer::export::EXPORT_SLOTS
+    );
+}
+
+/// Остановка сервера обрывает идущий экспорт (штатная остановка HTTP ждёт соединения): тело
+/// незавершено, аудит `reason: stop`.
+#[tokio::test]
+async fn export_stops_on_shutdown() {
+    let w = big_world("export-stop", |_| {}).await;
+    let a = &w.a;
+    let r = start_export(a, &w.o.tok, G).await;
+    a.st.begin_stop();
+    let body = tokio::time::timeout(std::time::Duration::from_secs(20), finish(r))
+        .await
+        .expect("поток не оборвался");
+    assert!(
+        body.as_ref().map_or(true, |b| !valid_zip(b)),
+        "архив полный"
+    );
+    let d = done_audits(a, 1).await.remove(0);
+    assert_eq!(d["details"]["complete"], json!(false));
+    assert_eq!(d["details"]["reason"], json!("stop"));
+}
+
+/// Аудит до тела не записался — 500 без архива и без `space.export.done`.
+#[tokio::test]
+async fn export_audit_failure_no_body() {
+    let w = world("export-auditfail").await;
+    let (a, o) = (&w.a, &w.o);
+    note_as(a, &o.tok, G, "x", "SECRET-NOTE-TEXT").await;
+    zam_server::backup::test_hooks::set_fail_point(&a.st.cfg.data_dir, Some("export_audit"));
+    let r = export_tok(a, &o.tok, G, "").await;
+    zam_server::backup::test_hooks::set_fail_point(&a.st.cfg.data_dir, None);
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR, "{}", r.text());
+    assert!(!r.text().contains("SECRET-NOTE-TEXT"));
+    assert!(!r.body.starts_with(b"PK"));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let all = a
+        .adm(Method::GET, "/api/v1/admin/audit", None, None)
+        .await
+        .json();
+    assert!(!all.to_string().contains("space.export"), "{all}");
+    assert_eq!(
+        a.st.export_slots.available_permits(),
+        zam_server::api::transfer::export::EXPORT_SLOTS
+    );
+    Zip::of(&export_tok(a, &o.tok, G, "").await);
 }
 
 /// Слоты экспорта заняты — 503 `/problems/busy` с `Retry-After` (и у `probe`); слот

@@ -112,7 +112,10 @@ pub async fn export_space<R: Send + 'static>(
     sel: ExportSelect,
     f: impl FnOnce(&SpaceReader) -> Result<R, StoreError> + Send + 'static,
 ) -> Result<R, StoreError> {
+    // долгая транзакция: контрольные точки базы — только PASSIVE, пока она идёт
+    let guard = db.long_reader();
     db.read(move |c| {
+        let _guard = guard;
         // одна транзакция: все выборки — из одного состояния базы
         let tx = c.unchecked_transaction()?;
         let r = f(&SpaceReader { c: &tx, sel: &sel })?;

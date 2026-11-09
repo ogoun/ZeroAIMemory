@@ -1,8 +1,10 @@
 //! `GET /spaces/{space}/export?paths=&kinds=&history=[&probe=true]` (M6 §12б.5) — архив zip
 //! пространства потоком (zip64, без `Seek`: [`zip::ZipWriter::new_stream`]).
 //!
-//! **Порядок.** Права (`space_scope`, чтение) → слот экспорта ([`EXPORT_SLOTS`] на сервер,
-//! занято — 503 `/problems/busy` с `Retry-After`) → ответ с потоком. Архив пишет поток
+//! **Порядок.** Права (`space_scope`, чтение) → слот экспорта ([`EXPORT_SLOTS`] на сервер и
+//! один на пользователя, занято — 503 `/problems/busy` с `Retry-After`; если загрузка не
+//! началась — повторите позже) → аудит `space.export` (не записан — 500 без тела) → ответ с
+//! потоком. Архив пишет поток
 //! `spawn_blocking` внутри одной транзакции чтения ([`zam_store::export_space`]): заметки,
 //! записи и ревизии читаются и пишутся по одной, байты уходят через ограниченный канал в тело
 //! ответа. `probe=true` — та же проверка прав, фильтра и слота без архива и аудита (204): WebUI
@@ -16,8 +18,10 @@
 //! МиБ плюс ~1 КиБ на узел и самая большая заметка ×2.
 //!
 //! **Соединение.** Транзакция чтения держит одно соединение пула читателей на всё время потока —
-//! поэтому слотов меньше, чем читателей. Клиент, переставший читать, ждёт не дольше [`STALL`]: затем
-//! поток обрывается и соединение возвращается в пул.
+//! поэтому слотов меньше, чем читателей; пока она идёт, контрольные точки базы — только
+//! `PASSIVE` ([`zam_store::Db::long_reader`]). Поток обрывается ([`Guard`]): клиент не забирает
+//! кусок дольше [`STALL`], экспорт дольше `export.max_secs` (4 ч), сервер останавливается
+//! ([`AppState::begin_stop`]) — транзакция закрывается, соединение возвращается в пул.
 //!
 //! **Права** (§12б.5): что принципал читает, то и выгружается. Токен — без Human (`space_scope`
 //! → 404) и без отчётов; сессия WebUI — с ними; участник решения — пространство решения, связи
@@ -25,8 +29,10 @@
 //! WebUI, как у вложений). Vault, карта кода, эмбеддинги, кэш выжимок, сессии, корзина в
 //! снимок не входят ([`zam_store::export`]).
 //!
-//! **Аудит** `space.export {space, user, owner, files, bytes, complete}` пишется по окончании
-//! потока — и при обрыве (`complete: false`); `bytes` — несжатый объём файлов архива без описи.
+//! **Аудит** — две записи: `space.export {space, user, owner, filter}` до тела (не записалась —
+//! 500, архив не отдаётся) и `space.export.done {space, user, files, bytes, complete, reason}` по
+//! окончании потока, в том числе при обрыве (`complete: false`, `reason`: `client` | `stall` |
+//! `deadline` | `stop` | `error`); `bytes` — несжатый объём файлов архива без описи.
 //! Ошибка посреди потока обрывает тело (клиент видит незавершённый архив); `zam export` пишет во
 //! временный файл и публикует его только после полного архива.
 use std::collections::{HashMap, HashSet};
@@ -62,9 +68,12 @@ use crate::app::AppState;
 use crate::auth::{Client, Principal};
 use crate::error::ApiError;
 
-/// Действие аудита.
+/// Действие аудита до тела.
 pub const AUDIT_ACTION: &str = "space.export";
-/// Экспортов одновременно на сервер (каждый держит одно из соединений пула читателей).
+/// Действие аудита по окончании потока.
+pub const AUDIT_DONE: &str = "space.export.done";
+/// Экспортов одновременно на сервер (каждый держит одно из соединений пула читателей); у
+/// пользователя — один.
 pub const EXPORT_SLOTS: usize = 2;
 /// `Retry-After` при занятых слотах, с.
 const RETRY_AFTER_S: u64 = 30;
@@ -74,6 +83,9 @@ const CHUNK: usize = 256 * 1024;
 const CHANNEL: usize = 8;
 /// Клиент не забирает тело дольше — поток обрывается.
 const STALL: Duration = Duration::from_secs(10 * 60);
+/// Сколько ждать, пока клиент заберёт ошибку обрыва: не забрал — тело просто кончается
+/// (архив без центрального каталога — `zam export` его отвергает).
+const ERR_STALL: Duration = Duration::from_secs(1);
 /// Файл больше — запись zip64 (без `Seek` размер в заголовке не исправить).
 const ZIP64_FROM: u64 = 0xFFFF_0000;
 
@@ -124,11 +136,51 @@ fn filter_of(q: &ExportQuery) -> Result<ExportFilter, ApiError> {
     })
 }
 
-/// `Write` в канал тела ответа кусками по [`CHUNK`]; получатель ушёл или не забирает куски
-/// дольше [`STALL`] — `BrokenPipe`.
+/// Обрыв потока экспорта: срок `export.max_secs` или остановка сервера.
+#[derive(Clone)]
+pub(crate) struct Guard {
+    deadline: Instant,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Причины обрыва в сообщении ошибки (для `reason` аудита).
+const R_STOP: &str = "сервер останавливается";
+const R_DEADLINE: &str = "экспорт дольше export.max_secs";
+const R_STALL: &str = "клиент не забирает архив";
+const R_CLIENT: &str = "клиент закрыл соединение";
+
+impl Guard {
+    fn check(&self) -> io::Result<()> {
+        if self.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            // не `Interrupted`: `write_all` повторяет запись на нём бесконечно
+            return Err(io::Error::other(R_STOP));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, R_DEADLINE));
+        }
+        Ok(())
+    }
+}
+
+/// Код причины обрыва по тексту ошибки.
+fn reason(e: &str) -> &'static str {
+    [
+        (R_STOP, "stop"),
+        (R_DEADLINE, "deadline"),
+        (R_STALL, "stall"),
+        (R_CLIENT, "client"),
+    ]
+    .iter()
+    .find(|(m, _)| e.contains(m))
+    .map_or("error", |(_, r)| *r)
+}
+
+/// `Write` в канал тела ответа кусками по [`CHUNK`]; каждая запись проверяет [`Guard`],
+/// отправка — [`send_stalled`].
 struct ChanWriter {
     tx: mpsc::Sender<io::Result<Bytes>>,
     buf: Vec<u8>,
+    guard: Guard,
 }
 
 impl ChanWriter {
@@ -137,32 +189,35 @@ impl ChanWriter {
             return Ok(());
         }
         let b = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
-        send_stalled(&self.tx, Ok(b))
+        send_stalled(&self.tx, Ok(b), STALL, Some(&self.guard))
     }
 }
 
-/// Кусок в канал тела: получатель ушёл или не забирает дольше [`STALL`] — `BrokenPipe`.
-fn send_stalled(tx: &mpsc::Sender<io::Result<Bytes>>, item: io::Result<Bytes>) -> io::Result<()> {
+/// Кусок в канал тела: получатель ушёл — `BrokenPipe`; не забирает дольше `stall` — тоже;
+/// пока ждём — проверяется `guard` (срок, остановка).
+fn send_stalled(
+    tx: &mpsc::Sender<io::Result<Bytes>>,
+    item: io::Result<Bytes>,
+    stall: Duration,
+    guard: Option<&Guard>,
+) -> io::Result<()> {
     let mut item = item;
     let t0 = Instant::now();
     loop {
         match tx.try_send(item) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Closed(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "клиент закрыл соединение",
-                ));
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, R_CLIENT));
             }
-            Err(TrySendError::Full(back)) if t0.elapsed() < STALL => {
+            Err(TrySendError::Full(back)) if t0.elapsed() < stall => {
+                if let Some(g) = guard {
+                    g.check()?;
+                }
                 item = back;
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(10));
             }
             Err(TrySendError::Full(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "клиент не забирает архив",
-                ));
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, R_STALL));
             }
         }
     }
@@ -170,6 +225,7 @@ fn send_stalled(tx: &mpsc::Sender<io::Result<Bytes>>, item: io::Result<Bytes>) -
 
 impl Write for ChanWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.guard.check()?;
         self.buf.extend_from_slice(data);
         if self.buf.len() >= CHUNK {
             self.send()?;
@@ -525,14 +581,44 @@ fn download_name(sc_kind: &str, guid: Option<&str>, created_at: &str) -> String 
     }
 }
 
-/// Слот экспорта; занято — 503 с `Retry-After`.
-fn slot(st: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
-    st.export_slots
+/// Слот экспорта: разрешение семафора сервера и отметка пользователя; освобождается при
+/// уничтожении.
+pub(crate) struct Slot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    users: std::sync::Arc<std::sync::Mutex<HashSet<Id>>>,
+    user: Id,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.users
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.user);
+    }
+}
+
+/// Слот экспорта пользователя `user`; занят (у сервера или у пользователя) — 503 с
+/// `Retry-After`.
+fn slot(st: &AppState, user: Id) -> Result<Slot, ApiError> {
+    let busy = || ApiError::ExportBusy {
+        retry_after_s: RETRY_AFTER_S,
+    };
+    let mut users = st.export_users.lock().unwrap_or_else(|e| e.into_inner());
+    if users.contains(&user) {
+        return Err(busy());
+    }
+    let permit = st
+        .export_slots
         .clone()
         .try_acquire_owned()
-        .map_err(|_| ApiError::ExportBusy {
-            retry_after_s: RETRY_AFTER_S,
-        })
+        .map_err(|_| busy())?;
+    users.insert(user);
+    Ok(Slot {
+        _permit: permit,
+        users: st.export_users.clone(),
+        user,
+    })
 }
 
 pub async fn export(
@@ -547,7 +633,7 @@ pub async fn export(
     admin_user(&p, &mut headers, q.user.as_deref())?;
     let filter = filter_of(&q)?;
     let sc = space_scope(&st, &p, &headers, &space, Mode::Read).await?;
-    let permit = slot(&st)?;
+    let permit = slot(&st, sc.user.id)?;
     if q.probe == Some(true) {
         drop(permit);
         return Ok(StatusCode::NO_CONTENT.into_response());
@@ -598,6 +684,12 @@ pub async fn export(
         space: sc.space.id,
         ip: client.ip.to_string(),
     };
+    // до тела: не записался аудит — архива нет (500)
+    audit.start(&st, &manifest.filter).await?;
+    let guard = Guard {
+        deadline: Instant::now() + Duration::from_secs(st.cfg.export.max_secs),
+        stop: st.stopping.clone(),
+    };
 
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHANNEL);
     let db = sc.db.clone();
@@ -609,6 +701,7 @@ pub async fn export(
             let w = ChanWriter {
                 tx: tx.clone(),
                 buf: Vec::with_capacity(CHUNK),
+                guard,
             };
             let res =
                 write_archive(r, w, store, history, manifest, &mut stats).and_then(|mut w| {
@@ -619,7 +712,8 @@ pub async fn export(
                 Ok(w) => Some(w),
                 Err(e) => {
                     stats.error = Some(e.to_string());
-                    let _ = send_stalled(&tx, Err(io::Error::other(e.to_string())));
+                    let _ =
+                        send_stalled(&tx, Err(io::Error::other(e.to_string())), ERR_STALL, None);
                     None
                 }
             };
@@ -638,7 +732,7 @@ pub async fn export(
         if let Some(e) = &stats.error {
             tracing::warn!(space = %space_id, error = %e, "экспорт оборван");
         }
-        if let Err(e) = audit.write(&st2, &stats).await {
+        if let Err(e) = audit.done(&st2, &stats).await {
             tracing::warn!(space = %space_id, error = %e, "аудит экспорта не записан");
         }
     });
@@ -669,7 +763,7 @@ pub async fn export(
     Ok(r)
 }
 
-/// Аудит `space.export` без текста: кто, чьё пространство, файлы, байты, полнота.
+/// Аудит экспорта без текста: кто, чьё пространство (см. модуль).
 struct AuditCtx {
     actor: String,
     user: Id,
@@ -679,20 +773,44 @@ struct AuditCtx {
 }
 
 impl AuditCtx {
-    async fn write(&self, st: &AppState, s: &Stats) -> Result<(), StoreError> {
+    async fn record(&self, st: &AppState, action: &str, details: Value) -> Result<(), StoreError> {
         st.system
             .audit(
                 &self.actor,
                 Some(self.user),
-                AUDIT_ACTION,
+                action,
                 Some(&self.space.to_string()),
                 Some(&self.ip),
-                json!({
-                    "space": self.space, "user": self.user, "owner": self.owner,
-                    "files": s.files, "bytes": s.bytes, "complete": s.error.is_none(),
-                }),
+                details,
             )
             .await
+    }
+
+    /// `space.export` до тела; тестовая точка `export_audit` (фича `test-hooks`) — сбой.
+    async fn start(&self, st: &AppState, filter: &ExportFilter) -> Result<(), ApiError> {
+        crate::backup::fail_point(&st.cfg.data_dir, "export_audit")
+            .map_err(|e| ApiError::Internal(format!("аудит экспорта: {e}")))?;
+        self.record(
+            st,
+            AUDIT_ACTION,
+            json!({
+                "space": self.space, "user": self.user, "owner": self.owner, "filter": filter,
+            }),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("аудит экспорта: {e}")))
+    }
+
+    /// `space.export.done` по окончании потока.
+    async fn done(&self, st: &AppState, s: &Stats) -> Result<(), StoreError> {
+        let mut d = json!({
+            "space": self.space, "user": self.user, "owner": self.owner,
+            "files": s.files, "bytes": s.bytes, "complete": s.error.is_none(),
+        });
+        if let (Some(e), Value::Object(o)) = (&s.error, &mut d) {
+            o.insert("reason".into(), json!(reason(e)));
+        }
+        self.record(st, AUDIT_DONE, d).await
     }
 }
 
@@ -718,6 +836,36 @@ mod tests {
         assert!(f.history);
         assert!(filter_of(&q(Some("a//b"), None)).is_err());
         assert!(filter_of(&q(None, Some("note"))).is_err());
+    }
+
+    /// Получатель не забирает куски: обрыв через `stall`, а не вечное ожидание.
+    #[test]
+    fn send_stalled_gives_up() {
+        let (tx, _rx) = mpsc::channel::<io::Result<Bytes>>(1);
+        send_stalled(&tx, Ok(Bytes::from_static(b"a")), STALL, None).unwrap();
+        let t0 = Instant::now();
+        let e = send_stalled(
+            &tx,
+            Ok(Bytes::from_static(b"b")),
+            Duration::from_millis(50),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(reason(&e.to_string()), "stall");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        // остановка сервера прерывает ожидание раньше срока
+        let g = Guard {
+            deadline: Instant::now() + Duration::from_secs(3600),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let e = send_stalled(&tx, Ok(Bytes::from_static(b"c")), STALL, Some(&g)).unwrap_err();
+        assert_eq!(reason(&e.to_string()), "stop");
+        // `Interrupted` `write_all` повторял бы бесконечно (так зависал первый вариант)
+        assert_ne!(e.kind(), io::ErrorKind::Interrupted);
+        drop(_rx);
+        let e = send_stalled(&tx, Ok(Bytes::from_static(b"d")), STALL, None).unwrap_err();
+        assert_eq!(reason(&e.to_string()), "client");
     }
 
     #[test]

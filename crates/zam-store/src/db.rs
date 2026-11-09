@@ -18,6 +18,11 @@
 //! растёт на объём записей за время копии (страховка `wal_limit_bytes` ослаблена). После
 //! снятия признака первый же `RESTART` возвращает WAL к норме.
 //!
+//! **Долгие читатели (экспорт пространства, M6 §12б.5).** Экспорт держит транзакцию чтения на
+//! весь поток архива; на это время он берёт [`Db::long_reader`] — пока такие читатели есть, оба
+//! места тоже делают только `PASSIVE` (как при копии), иначе `RESTART` ждал бы их до
+//! [`WRITER_BUSY_TIMEOUT`] на каждой записи сверх `wal_limit_bytes`.
+//!
 //! **Ожидание блокировки писателем** — [`WRITER_BUSY_TIMEOUT`] (30 с), у читателей и
 //! фонового потока — 5 с и 50 мс. Фоновый `RESTART` с переносом остатка держит блокировку
 //! записи на время копирования кадров и fsync: на HDD под нагрузкой индексации это секунды
@@ -122,6 +127,25 @@ struct Inner {
 struct CheckpointFlags {
     backup_active: AtomicBool,
     restarts: AtomicU64,
+    /// Долгих читателей сейчас ([`Db::long_reader`]).
+    long_readers: AtomicUsize,
+}
+
+impl CheckpointFlags {
+    /// `RESTART` нельзя: идёт копия или держится долгая транзакция чтения.
+    fn passive_only(&self) -> bool {
+        self.backup_active.load(Ordering::SeqCst) || self.long_readers.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// Долгий читатель базы: пока жив, контрольные точки — только `PASSIVE` (см. модуль).
+#[derive(Debug)]
+pub struct LongReader(Arc<CheckpointFlags>);
+
+impl Drop for LongReader {
+    fn drop(&mut self) {
+        self.0.long_readers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Если последний `Db` уничтожается внутри самого потока — join невозможен.
@@ -250,6 +274,7 @@ fn spawn_checkpointer(
                         }
                     });
                 flags.backup_active.store(backup, Ordering::SeqCst);
+                let passive = flags.passive_only();
                 // (busy, кадров в WAL, перенесено)
                 let Ok((busy, log, done)) =
                     conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
@@ -264,7 +289,7 @@ fn spawn_checkpointer(
                 };
                 // всё перенесено — RESTART почти бесплатен; WAL вчетверо больше порога —
                 // RESTART и с переносом остатка (писатель ждёт его fsync)
-                if !backup
+                if !passive
                     && busy == 0
                     && log > restart_frames
                     && (log == done || log > 4 * restart_frames)
@@ -305,6 +330,17 @@ impl Db {
     /// Фоновый поток видит признак идущей копии (`.zam-backup`): `RESTART` не делается.
     pub fn backup_active(&self) -> bool {
         self.inner.flags.backup_active.load(Ordering::SeqCst)
+    }
+
+    /// Долгий читатель (экспорт): пока жив [`LongReader`], `RESTART` не делается.
+    pub fn long_reader(&self) -> LongReader {
+        self.inner.flags.long_readers.fetch_add(1, Ordering::SeqCst);
+        LongReader(self.inner.flags.clone())
+    }
+
+    /// Долгих читателей сейчас.
+    pub fn long_readers(&self) -> usize {
+        self.inner.flags.long_readers.load(Ordering::SeqCst)
     }
 
     /// Сколько раз с открытия сделан `wal_checkpoint(RESTART)` (фоновым потоком и страховкой
@@ -382,7 +418,7 @@ impl Db {
                     // фоновый поток мог ещё не заметить только что поставленный признак (или
                     // его нет); страховка срабатывает редко, проверка файла дешева
                     if wal_len(&wal) > limit {
-                        let backup = wflags.backup_active.load(Ordering::SeqCst)
+                        let backup = wflags.passive_only()
                             || wflag_path.as_deref().is_some_and(|f| {
                                 crate::backup::flag_state(f, crate::backup::backup_flag_max_age())
                                     == crate::backup::FlagState::Active

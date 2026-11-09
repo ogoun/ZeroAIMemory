@@ -526,3 +526,29 @@ async fn vacuum_into_query_only_and_immutable() {
         .unwrap();
     assert_eq!(n, 250);
 }
+
+/// Долгий читатель (экспорт пространства, M6 §12б.5): пока жив `Db::long_reader`, ни фоновый
+/// поток, ни страховка писателя не делают `RESTART`; после — делают.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn db_checkpoint_passive_while_long_reader() {
+    let p = tmp("long-reader");
+    let opts = DbOptions {
+        checkpoint_interval: std::time::Duration::from_millis(20),
+        wal_limit_bytes: 128 * 1024,
+        wal_restart_bytes: 64 * 1024,
+        ..DbOptions::default()
+    };
+    let db = Db::open_with(&p, BLOB_MIGS, opts).unwrap();
+    let guard = db.long_reader();
+    assert_eq!(db.long_readers(), 1);
+    // 6 МБ записей при пределе 128 КиБ: без долгого читателя — RESTART почти после каждой
+    for _ in 0..200 {
+        write_blobs(&db, 1, 32 * 1024).await;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(db.restart_count(), 0, "RESTART при долгом читателе");
+    drop(guard);
+    assert_eq!(db.long_readers(), 0);
+    write_blobs(&db, 20, 32 * 1024).await;
+    assert!(db.restart_count() > 0, "после долгого читателя RESTART нет");
+}
