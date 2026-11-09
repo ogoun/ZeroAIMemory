@@ -26,6 +26,14 @@ use regex::Regex;
 /// Замена секрета в тексте чанка.
 pub const SECRET_MARK: &str = "‹secret›";
 
+/// Версия правил сканера. Увеличивается при каждой правке правил, после которой сканер находит
+/// больше: хранилище (`zam-store`, ключи `meta` `secrets_scanned_v2` и `secrets_scanned_v3`)
+/// записывает версию, с которой база перемаскирована, и при открытии базы с меньшей версией один
+/// раз перенарезает заметки и записи, где теперь есть находки, и проверяет теги payload и папки.
+/// 1 — правила M3–M5.7 (значение `'1'` старых баз); 2 — значение в обратных кавычках (задача 15b
+/// M6, I1).
+pub const RULES_VERSION: u32 = 2;
+
 /// Тип сработавшего правила.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SecretKind {
@@ -187,14 +195,16 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Ключ-значение; необязательная кавычка перед разделителем покрывает JSON (`"password": "…"`)
-/// [решение исполнителя]. Значение — группа 2.
+/// [решение исполнителя].
 ///
 /// Значение в кавычках берётся до закрывающей кавычки (пароль-фраза с пробелами); без кавычек —
 /// до пробела. Словарь ключей расширен `secret_key`, `signing_key`, `private_key`
-/// [решение исполнителя]. Значение — группа 1 (в `"`), 2 (в `'`) или 3 (без кавычек).
+/// [решение исполнителя]. Значение — группа 1 (в `"`), 2 (в `'`), 3 (в обратных кавычках,
+/// `` password=`…` ``, ревью задачи 15b M6, I1) или 4 (без кавычек). Обычный inline code без ключа
+/// (`` `cargo build` ``) правило не задевает.
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     rx(
-        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key)["']?\s*[:=]\s*(?:"([^"\r\n]{6,})"|'([^'\r\n]{6,})'|([^\s"'`]{6,}))"#,
+        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key)["']?\s*[:=]\s*(?:"([^"\r\n]{6,})"|'([^'\r\n]{6,})'|`([^`\r\n]{6,})`|([^\s"'`]{6,}))"#,
     )
 });
 
@@ -459,7 +469,7 @@ fn scan_rules(text: &str) -> Vec<(Range<usize>, SecretKind)> {
         raw.push((m.range(), SecretKind::PrivateKey));
     }
     for c in KEY_VALUE.captures_iter(text) {
-        if let Some(v) = c.get(1).or_else(|| c.get(2)).or_else(|| c.get(3))
+        if let Some(v) = (1..=4).find_map(|i| c.get(i))
             && !is_placeholder(v.as_str())
         {
             raw.push((v.range(), SecretKind::KeyValue));

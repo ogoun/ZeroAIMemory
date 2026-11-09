@@ -426,3 +426,122 @@ async fn payload_rescan_widens_partial_reindex_mark() {
     assert!(v["space"].is_null(), "вся база: {spec}");
     assert_eq!(v["full"], true, "режим прежней отметки: {spec}");
 }
+
+async fn meta_value(db: &Db, key: &'static str) -> String {
+    db.read(move |c| Ok(c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))?))
+        .await
+        .unwrap()
+}
+
+/// Ревью задачи 15b M6, I1: правило сканера расширено (значение в обратных кавычках) — база,
+/// перемаскированная прежними правилами (`secrets_scanned_v2 = '1'`, значение в чанках
+/// открыто), при открытии один раз перенарезается: значение уходит из `chunks`, флаги получают
+/// текущую версию правил, повторное открытие ничего не делает.
+#[tokio::test]
+async fn rules_version_bump_rescans_old_db_once() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("secrets-rules-bump");
+    let _ = std::fs::remove_dir_all(&dir);
+    let dd = DataDir::open(&dir).unwrap();
+    let user = Id::new();
+    let pw = format!("Sup3r{}", "S3cretValue");
+    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    let k = list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    let attrib = Attribution::new(AuthorKind::Agent);
+    create_note(
+        &db,
+        NewNote {
+            space_id: k,
+            path: NodePath::parse("ops/db").unwrap(),
+            content: format!("# База\n\nDB_PASSWORD=`{pw}`\n"),
+            l0: None,
+            attrib: attrib.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    create_entry(
+        &db,
+        NewEntry {
+            refs: None,
+            space_id: k,
+            kind: EntryKind::Insight,
+            title: "Пароль в логе".into(),
+            body: format!("в логе было password: `{pw}`"),
+            data: json!({"kind": "gotcha"}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: Some(Certainty::Hypothesis),
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &attrib,
+    )
+    .await
+    .unwrap();
+    let like = format!("%{pw}%");
+    let open_chunks = |db: Db| {
+        let like = like.clone();
+        async move { count(&db, "SELECT count(*) FROM chunks WHERE text LIKE ?1", like).await }
+    };
+    assert_eq!(
+        open_chunks(db.clone()).await,
+        0,
+        "новые записи — замаскированы"
+    );
+    let version = zam_markdown::secrets::RULES_VERSION.to_string();
+    for flag in [FLAG, FLAG_V3] {
+        assert_eq!(meta_value(&db, flag).await, version, "{flag}");
+    }
+
+    // имитация базы с прежними правилами: флаги '1', значение в чанках открыто
+    let old = pw.clone();
+    db.write(move |tx| {
+        tx.execute(
+            "UPDATE meta SET value = '1' WHERE key IN (?1, ?2)",
+            [FLAG, FLAG_V3],
+        )?;
+        tx.execute(
+            "UPDATE chunks SET text = replace(text, '‹secret›', ?1) WHERE text LIKE '%‹secret›%'",
+            [old],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(open_chunks(db.clone()).await > 0);
+    drain(&db).await;
+    drop(db);
+
+    let dbs = UserDbs::new(dd.users_dir());
+    let db = dbs.get(user).await.unwrap();
+    dbs.wait_rechunk(user).await;
+    assert_eq!(
+        open_chunks(db.clone()).await,
+        0,
+        "значение убрано из chunks"
+    );
+    assert_eq!(
+        job_stats(&db).await.unwrap().queued,
+        2,
+        "upsert заметки и записи"
+    );
+    for flag in [FLAG, FLAG_V3] {
+        assert_eq!(meta_value(&db, flag).await, version, "{flag}");
+    }
+    drain(&db).await;
+    drop((db, dbs));
+
+    // повторное открытие ничего не делает
+    let dbs = UserDbs::new(dd.users_dir());
+    let db = dbs.get(user).await.unwrap();
+    dbs.wait_rechunk(user).await;
+    assert_eq!(job_stats(&db).await.unwrap().queued, 0);
+}

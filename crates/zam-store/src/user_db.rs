@@ -454,16 +454,38 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
     .await
 }
 
-/// Ключ `meta`: разовая перенарезка заметок и записей со значениями секретов (сканер §7.6,
-/// задача 11 M3) выполнена. Отсутствует у баз, открытых до сканера; у новой пустой базы
+/// Ключ `meta`: перенарезка заметок и записей со значениями секретов (сканер §7.6, задача 11 M3)
+/// выполнена; значение — версия правил сканера ([`zam_markdown::secrets::RULES_VERSION`]), с
+/// которой она прошла. Отсутствует у баз, открытых до сканера; у баз до задачи 15b M6 — `'1'`.
+/// Версия меньше текущей — перенарезка повторяется один раз (новое правило находит то, что
+/// старое пропустило, а чанки, FTS и Qdrant хранят значение открытым). У новой пустой базы
 /// ставится сразу (все её записи нарезаются уже замаскированными).
 const SECRETS_SCANNED: &str = "secrets_scanned_v2";
+
+/// Ключ `meta` `key` записан с текущей версией правил сканера (или новее: база открыта
+/// более новым сервером, откат не перемаскирует).
+fn secrets_rules_current(c: &Connection, key: &str) -> rusqlite::Result<bool> {
+    let v: Option<String> = c
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+        .optional()?;
+    Ok(v.and_then(|v| v.parse::<u32>().ok())
+        .is_some_and(|v| v >= zam_markdown::secrets::RULES_VERSION))
+}
+
+/// Записывает ключ `meta` `key` с текущей версией правил сканера.
+fn set_secrets_rules(c: &Connection, key: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![key, zam_markdown::secrets::RULES_VERSION.to_string()],
+    )?;
+    Ok(())
+}
 
 /// Нужна ли перенарезка секретов: ключа нет и в базе есть живые заметки или записи.
 /// В пустой базе ключ ставится сразу.
 async fn secrets_scan_pending(db: &Db) -> Result<bool, StoreError> {
     db.write(|tx| {
-        if has_meta(tx, SECRETS_SCANNED)? {
+        if secrets_rules_current(tx, SECRETS_SCANNED)? {
             return Ok(false);
         }
         let any: bool = tx.query_row(
@@ -473,10 +495,7 @@ async fn secrets_scan_pending(db: &Db) -> Result<bool, StoreError> {
             |r| r.get(0),
         )?;
         if !any {
-            tx.execute(
-                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
-                [SECRETS_SCANNED],
-            )?;
+            set_secrets_rules(tx, SECRETS_SCANNED)?;
         }
         Ok(any)
     })
@@ -500,14 +519,8 @@ async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
             }
         }
     }
-    db.write(|tx| {
-        tx.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
-            [SECRETS_SCANNED],
-        )?;
-        Ok(())
-    })
-    .await?;
+    db.write(|tx| Ok(set_secrets_rules(tx, SECRETS_SCANNED)?))
+        .await?;
     tracing::info!(
         notes,
         entries,
@@ -519,7 +532,8 @@ async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
 
 /// Ключ `meta`: разовая проверка payload и точек папок на значения секретов (ревью задачи 11,
 /// задача 15 M3) выполнена. Теги точек Qdrant и вход эмбеддинга L0 папки маскируются с
-/// задачи 15; у новой пустой базы ключ ставится сразу.
+/// задачи 15; у новой пустой базы ключ ставится сразу. Значение — версия правил сканера, как у
+/// [`SECRETS_SCANNED`]: с меньшей версией проверка повторяется.
 const SECRETS_PAYLOAD: &str = "secrets_scanned_v3";
 
 /// Разовая проверка базы, открытой до маскировки тегов payload и входа эмбеддинга папок: если
@@ -534,7 +548,7 @@ const SECRETS_PAYLOAD: &str = "secrets_scanned_v3";
 async fn rescan_payload_secrets(db: &Db) -> Result<(), StoreError> {
     let found = db
         .write(|tx| {
-            if has_meta(tx, SECRETS_PAYLOAD)? {
+            if secrets_rules_current(tx, SECRETS_PAYLOAD)? {
                 return Ok(None);
             }
             let secret = |s: &str| !zam_markdown::scan_secrets(s).is_empty();
@@ -618,10 +632,7 @@ async fn rescan_payload_secrets(db: &Db) -> Result<(), StoreError> {
                     ],
                 )?;
             }
-            tx.execute(
-                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
-                [SECRETS_PAYLOAD],
-            )?;
+            set_secrets_rules(tx, SECRETS_PAYLOAD)?;
             Ok(Some((notes, entries, stale_folders)))
         })
         .await?;

@@ -381,6 +381,9 @@ proptest! {
                 Just(format!("{}{}", "AK", "IA") + &rnd(16, 45).to_ascii_uppercase()),
                 Just(format!("ey{}{}.{}.{}", "J", rnd(20, 46), rnd(30, 47), rnd(20, 48))),
                 Just(format!("xo{}-{}", "xb", rnd(20, 49))),
+                // ревью задачи 15b, I1: значение в обратных кавычках
+                Just("password=`hunter2hunter2`".to_string()),
+                Just("`".to_string()),
             ],
             0..14,
         )
@@ -615,4 +618,48 @@ fn glued_chain_1mb_linear() {
     eprintln!("1 МБ AKIA-цепочки: {} находок за {ms} мс", hits.len());
     assert_eq!(hits.len(), t.len() / key.len());
     assert!(ms < 5000, "{ms} мс");
+}
+
+/// Ревью задачи 15b M6, I1: значение в обратных кавычках после ключа маскируется (кавычки
+/// остаются); обычный inline code без ключа — нет.
+#[test]
+fn backtick_value_masked() {
+    let pw = format!("hunter2{}", "hunter2");
+    let cases = [
+        (
+            format!("password=`{pw}`"),
+            format!("password=`{SECRET_MARK}`"),
+        ),
+        (
+            format!("password: `{pw}`"),
+            format!("password: `{SECRET_MARK}`"),
+        ),
+        (
+            format!("DB_PASSWORD=`Sup3r{}`", "S3cret!"),
+            format!("DB_PASSWORD=`{SECRET_MARK}`"),
+        ),
+        (
+            format!("token = `abcdef{}`", "123456"),
+            format!("token = `{SECRET_MARK}`"),
+        ),
+        // пароль-фраза с пробелами — до закрывающей кавычки
+        (
+            "secret: `two words here` и дальше".to_string(),
+            format!("secret: `{SECRET_MARK}` и дальше"),
+        ),
+    ];
+    for (t, want) in &cases {
+        assert_eq!(one(t), SecretKind::KeyValue, "{t}");
+        assert_eq!(&mask_text(t), want, "{t}");
+        assert_eq!(mask_text(want), *want, "идемпотентно: {t}");
+    }
+    for t in [
+        "запустите `cargo build` и `cargo test --release`",
+        "`password` — имя поля, а не значение",
+        "password=`${DB_PASSWORD}`",
+        "token: `<your-token>`",
+        "password=`short`",
+    ] {
+        assert!(scan_secrets(t).is_empty(), "{t}: {:?}", scan_secrets(t));
+    }
 }
