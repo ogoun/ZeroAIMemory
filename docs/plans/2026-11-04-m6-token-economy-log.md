@@ -6332,3 +6332,109 @@ m57_acceptance` — 13 PASS, `--test agent_dates` — PASS, `--test backup --fea
 - → M7: осиротевшие блобы прерванного импорта — сборщик мусора (M5); проверочный проход
   `dry_run` без писателя; потоковый план без текстов в памяти (предел `max_text_bytes` —
   временная мера).
+
+### Правки повторного ревью 18b2 (CHANGES REQUESTED, 2026-11-09)
+
+Сборка — `target/r3-t18b2`, тесты — с `--no-fail-fast`. Скрипты и логи — `.tmp/m6/task18b2/`
+(`fix9`–`fix13*.py`, `revert3.py`, `g*-*.log`, `rev-rv3-*.log`). Зависимости ML-теста
+(onnxruntime, pdfium, qdrant) скопированы в `wt-b/target/deps` и удалены вместе с `target`.
+Субагентов не было.
+
+- **R1** (решение контролёра — первый вариант). Если детерминированный id уже есть в этой базе,
+  в этом пространстве и того же вида, это свой элемент: `plan_ids` берёт его. У документа
+  вложения `where_is` берёт пространство узла-владельца.
+  - Папкам пишется `imported_from`; повтор находит их по ключу источника.
+  - У документов колонки нет (`attachment_docs`), их находит правило R1. Миграция 0025 не
+    менялась.
+  - Тест `import_resume_refs_to_doc_and_folder`: поздняя пачка ссылается на `d:` и
+    `n:<папка>`, созданные оборванной попыткой. Висячих ссылок нет, `id_remapped` = 0.
+  - Добавлены проверки `id_remapped = 0` при повторе: в `reimport_same_archive_only_skipped`,
+    в `cli_import_folder_md` и в `cli_import_two_folders_distinct_ids`.
+- **R2.**
+  - До приёма тела ставится резерв задания (этап `receiving`): у пользователя одно
+    незавершённое задание, на сервере не больше `MAX_PENDING` = 4; иначе 503 с `Retry-After`.
+    Если приём не удался, резерв снимается.
+  - Перед приёмом проверяется место: после приёма должно остаться не меньше
+    `max(1 ГиБ, import.min_free_percent % диска)`, иначе 507 `/problems/insufficient-storage`
+    (новый `ApiError::InsufficientStorage`).
+  - **Решение исполнителя:** процент вынесен в ключ `import.min_free_percent` (0..=50, 5).
+    Причина: на диске разработчика (H:, 3,7 ТБ, свободно ~140 ГБ) запас 5 % отверг бы любой
+    импорт в тестах. В тестовом конфиге (`tests/common::cfg_in`, CLI `start`) стоит 0, запас
+    1 ГиБ остаётся. Ключ внесён в `config.example.toml`, §12б.5 и §14.
+  - Списки итога урезаются до 1000 (`ImportReport::truncate_lists`), полные длины — в
+    `*_total`.
+  - Тесты:
+    - `import_pending_limits_per_user_and_server`;
+    - `import_refused_when_disk_low` (на этом диске проверяется настоящий путь с запасом 50 %;
+      на просторном диске — точка `import_disk_full`);
+    - юнит `import_report_lists_truncated_with_totals`.
+- **N1.** Задание идёт под `AssertUnwindSafe(..).catch_unwind()`. При панике задание кончается
+  ошибкой 500, пишется аудит `done (complete: false)`, слоты и учёт освобождаются. Тест
+  `import_job_panic_reports_error` (точка `import_panic`).
+- **N2.** CLI: ответ сервера с ошибкой (413, 503…) важнее `BrokenPipe` упаковщика. `problem()`
+  клиента добавляет к сообщению «повторите через N с» из `Retry-After`. Тест
+  `cli_import_http_error_beats_broken_pipe`: сервер с `max_bytes` 1 МиБ и каталог 4 МиБ —
+  выход с кодом 6 и «HTTP 413», без «упаковки».
+- **N3.** `poll_job`:
+  - сетевой сбой — повтор в пределах сторожа;
+  - 404 — «сервер перезапущен — повторите импорт, записанное пропустится»;
+  - `queued` — не простой; место в очереди печатается. Его отдаёт сервер: поле `queue` опроса,
+    число незавершённых принятых заданий раньше этого.
+  - Тесты на заглушке HTTP: `cli_import_job_lost_404`, `cli_import_poll_retries_network`,
+    `cli_import_queued_is_not_idle` (сторож 1 с, три опроса в очереди). Сервер:
+    `import_busy_when_slot_taken` проверяет `queue = 0`.
+- **N4.** `AppState::import_tasks` (`TaskCount`). Остановка ждёт задачи экспорта и импорта
+  вместе, не дольше 1 с (`wait_exports`). Тест `import_job_counted_for_shutdown`.
+- **N5.** `RecvGuard` в обработчике на время приёма. Если обработчик снят (обрыв соединения,
+  hyper бросил запрос), снимается резерв и пишется аудит `done` с `reason: client`. Тест
+  `import_disconnect_mid_body_audited`: обработчик снят посреди тела.
+- **N6.** Источник «папки `.md`» — `folder:<имя каталога>`. `zam import <каталог>` передаёт имя
+  параметром `folder`; на сервере это `ImportQuery::folder` → `Plan::folder_label`. Записано в
+  §12б.5. Тесты: юнит `import_folder_source_includes_name` и CLI
+  `cli_import_two_folders_distinct_ids` (вторая папка — `path-taken`, а не «та же заметка»).
+- **Найдено при проверке.**
+  1. Повтор искал прежний импорт только по ключу: две «папки `.md`» с одинаковым путём
+     сопоставлялись между собой. Это поймал тест `cli_import_two_folders_distinct_ids`. Теперь
+     `imported_from.source` хранит источник, сопоставление идёт по паре (источник, ключ).
+  2. ureq не читает ответ, если сервер перестал читать тело: при 413 посреди потока упаковщик
+     получал `BrokenPipe`, а CLI — ошибку записи вместо ответа (`cli_import_http_error_beats_broken_pipe`).
+     Сервер при отказе (413, 503, 507 до приёма; 413 посреди приёма) теперь дочитывает тело не
+     больше 16 МиБ и 5 с (`drain`). При большем превышении `zam import` пишет «сервер прервал
+     приём архива» с вероятными причинами.
+  3. ML-тест сравнивал точки A до затихания воркера (свёртки L0 папок): теперь ждёт тишины
+     (`settle`).
+  4. `import_section_defaults_and_ranges` искал в сообщении «import.max_»; теперь — имя самого
+     ключа.
+
+**Проверка на откате** (коммит `c89fca6`, `revert3.py`, `rollbacks3.ps1`, логи `rev-rv3-*.log`):
+- S1 (`zam-store --lib`): имя каталога в источнике → `import_folder_source_includes_name` FAIL;
+  урезание списков → `import_report_lists_truncated_with_totals` FAIL;
+- C1 (`zam-cli --test transfer`): 404 опроса → `cli_import_job_lost_404` FAIL; повтор
+  сетевого сбоя → `cli_import_poll_retries_network` FAIL; `queued` не простой →
+  `cli_import_queued_is_not_idle` FAIL. Порядок «ответ сервера важнее `BrokenPipe`»
+  (`cli_order`) откатом не наблюдаем: благодаря дочитыванию на сервере упаковщик успевает
+  дописать тело. Ветка осталась запасной — для случая, когда HTTP-ответ пришёл при упавшем
+  упаковщике;
+- C2: имя каталога → `cli_import_two_folders_distinct_ids` FAIL; C4: источник в сопоставлении
+  повтора → тот же тест FAIL;
+- C3: дочитывание тела при 413 → `cli_import_http_error_beats_broken_pipe` FAIL (CLI видит
+  обрыв записи вместо 413);
+- R1 (`transfer_import`):
+  - R1 «свой элемент» → `import_resume_refs_to_doc_and_folder` FAIL (`id_remapped` 1);
+  - одно задание на пользователя → `import_pending_limits_per_user_and_server` FAIL (202);
+  - место на диске → `import_refused_when_disk_low` FAIL (202);
+  - учёт задач остановки → `import_job_counted_for_shutdown` FAIL (0);
+  - страж приёма → `import_disconnect_mid_body_audited` FAIL (нет аудита `done`);
+  - место в очереди → `import_busy_when_slot_taken` FAIL (`queue` null);
+- R2: предел сервера → `import_pending_limits_per_user_and_server` FAIL; страж паники →
+  `import_job_panic_reports_error` FAIL (задание не кончилось, предел опроса 300 с);
+- после отката — PASS (прогон `g2-*`).
+
+**Проверки** (`target/r3-t18b2`, `--no-fail-fast`): `fmt --check` и `clippy -p zam-store
+-p zam-server -p zam-cli -p zam-index --all-targets -D warnings` — чисто. Тесты:
+- `zam-store` — 33 набора, 474 PASS;
+- `zam-server --lib` — 272 PASS;
+- `ZAM_REQUIRE_ML=1 zam-server --test transfer_import` — 41 PASS;
+- `transfer_export`, `m57_acceptance`, `agent_dates` — 33 PASS;
+- `backup --features test-hooks` — 40 PASS;
+- `zam-cli --test transfer` — 12 PASS; `zam --bin transfer` — 5 PASS.
