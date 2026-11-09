@@ -4626,3 +4626,65 @@ PASS; `zam-core` — 18 PASS; `npm run check` — 0 ошибок; `npm run build
 `zam-server --test transfer_export` — 10 PASS; `zam-cli --test transfer` — 6 PASS;
 `zam-server --lib transfer` — 9, `zam --bin transfer` — 4, `zam-store --lib export` — 1 PASS;
 `npm run check`, `build`, `size` — PASS; `npm run e2e -- export` на release (через `probe`) — 1 PASS.
+
+### Повторное ревью задачи 18b1 — правки (2026-11-09)
+
+I1/I2, M1–M8 приняты; исправлены N1–N4 и Minor. Субагентов в задаче 18b1 исполнитель не
+запускал.
+
+- **N1. Аудит до тела.** Две записи: `space.export {space, user, owner, filter}` — до тела, в
+  обработчике; не записалась — 500, архив не отдаётся, слот освобождается; `space.export.done
+  {space, user, owner, files, bytes, complete, reason}` — по окончании потока, в том числе при
+  обрыве (`reason`: `client` | `stall` | `deadline` | `stop` | `error`). Точка `test-hooks`
+  `export_audit` — общий `backup::fail_point`. §12б.5 спецификации обновлён (две записи, слоты,
+  `export.max_secs`, формат `archive_fingerprint`, «повторите, если загрузка не началась»),
+  таблица ключей — `export.max_secs`. Тест `export_audit_failure_no_body`; `export_audit_written`
+  проверяет обе записи и порядок.
+- **N2. Долгая транзакция.**
+  - `zam_store::Db::long_reader()` — RAII-счётчик долгих читателей (`CheckpointFlags::long_readers`);
+    пока он > 0, и фоновый поток, и страховка писателя делают только `PASSIVE`
+    (`passive_only()`, как при копии). `export_space` берёт его на всю транзакцию. Тест
+    `zam-store/tests/db.rs::db_checkpoint_passive_while_long_reader`.
+  - Предел длительности: `[export] max_secs` (1..=604800, 14400 — 4 ч; `deploy/config.example.toml`,
+    `config::tests::export_section_defaults_and_ranges`). `Guard` проверяется в каждой записи в
+    канал тела и в ожидании свободного места (`send_stalled`), поэтому медленный клиент
+    больше не сбрасывает срок. Ошибку обрыва клиенту отдаём не дольше 1 с (`ERR_STALL`), иначе
+    тело просто кончается (архив без каталога — `zam export` отвергает). Тест
+    `export_deadline_aborts` (`max_secs = 1`, вложение 6 МиБ, тело не читается: обрыв, аудит
+    `deadline`, долгий читатель снят, слот свободен).
+- **N3. Остановка.** `AppState::stopping` и `begin_stop()`; `serve` зовёт его по сигналу
+  остановки до штатного завершения HTTP; `Guard` обрывает поток с `reason: stop`. Найдено и
+  исправлено при тестах: первая редакция возвращала `io::ErrorKind::Interrupted` — `write_all`
+  повторяет запись на нём бесконечно, поток экспорта зависал навсегда (тестовый процесс висел
+  ~10 ч); теперь `Other`, юнит-тест проверяет вид ошибки. Тест `export_stops_on_shutdown`.
+- **N4.** Тест `export_slot_held_while_streaming`: два экспорта с непрочитанным телом (вложение
+  6 МиБ > канала 2 МиБ) — `available_permits` = `EXPORT_SLOTS − 1`, затем `− 2`; третий
+  (другой пользователь) — 503 с `Retry-After`; после чтения тел — архивы целы, слоты свободны.
+- **Minor.**
+  - Один экспорт на пользователя (`AppState::export_users`, `Slot` снимает отметку при
+    уничтожении) + 2 на сервер; проверяется тем же тестом.
+  - `send_stalled(tx, item, stall, guard)` — срок параметром; юнит `send_stalled_gives_up`
+    (канал ёмкостью 1 без читателя, 50 мс → `stall`; остановка → `stop`, не `Interrupted`;
+    закрытый канал → `client`). Срок в конфиг не вынесен.
+  - Новый формат `archive_fingerprint` — в §12б.5.
+  - Вопрос 1: брони слота нет; в спецификации и документации модуля — «если загрузка не
+    началась, повторите позже».
+- Замечание: при обрыве `zip::ZipWriter` в `Drop` пишет в stderr «failed to finalize archive»
+  (запись завершения тоже обрывается `Guard`); на работу не влияет.
+
+**Проверка на откате** (коммит `5f3b15a`, `.tmp/m6/task18b1/revert3.py`, после —
+`git checkout -- <файлы>`; логи `rev3-*.log`):
+- пакет a: аудит до тела убран → `export_audit_failure_no_body` (200 и архив) и
+  `export_audit_written` FAIL; предел убран → `export_deadline_aborts` FAIL («архив полный»);
+  остановка убрана → `export_stops_on_shutdown` FAIL; слот отпускается сразу после захвата →
+  `export_slot_held_while_streaming` FAIL (`available_permits` 2 вместо 1);
+- пакет b: проверка «один на пользователя» убрана → `export_slot_held_while_streaming` FAIL
+  (200); `long_reader` в `export_space` убран → `export_deadline_aborts` FAIL (долгих читателей 0);
+- пакет c: `passive_only` без долгих читателей → `db_checkpoint_passive_while_long_reader` FAIL
+  (148 `RESTART`);
+- после отката — PASS.
+
+**Проверки:** `fmt --check`, `clippy --workspace --all-targets -D warnings` — чисто;
+`zam-server --test transfer_export` — 14 PASS; `zam-store --test db long_reader` — 1 PASS;
+`zam-server --lib transfer` — 10, `export_section_defaults_and_ranges`,
+`example_config_parses_to_defaults` — PASS.
