@@ -247,9 +247,14 @@ use zam_store::{
     SeenItem, SeenKey, SeenTarget, Space, SpaceKind, StoreError, TargetFilter, TokenCount,
     WHOLE_TARGET, chunk_ref, count_tokens, get_embeddings, get_node, leaf_term_hits,
     leaves_of_targets, live_chunks, live_folders, mark_seen_with_tokens, neighbor_leaves,
-    node_content, pending_count, query_needles, search_fts_channels, seen_revs, text_snippet,
-    touch_session,
+    node_content, pending_count, query_needles, search_fts_channels, search_fts_channels_light,
+    seen_revs, text_snippet, touch_session,
 };
+
+/// Параметры лёгкого поиска ([`search_with`]; M6 §16): глубина каналов FTS и сниппеты. Для
+/// подсказок-идей — `channel_depth = max(4 × top_k, 20)`, `snippets = false`
+/// (`api/recall.rs`, `idea_light_search`).
+pub use zam_store::LightSearch;
 
 use self::merge::merge_channels;
 use self::targets::{
@@ -2323,11 +2328,46 @@ async fn alias_expansion(st: &AppState, tg: &SearchTarget, qterms: &[&str]) -> V
 
 /// `POST /search`.
 pub async fn search(
+    state: State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    search_with(state, p, headers, origin, body, None).await
+}
+
+/// Проба лёгкого поиска (фича `test-hooks`): запрос, длины слитых каналов и число элементов
+/// выдачи со сниппетом — тесты проверяют, что подсказки-идеи идут лёгким поиском.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightProbe {
+    pub query: String,
+    pub light: LightSearch,
+    pub bm25: usize,
+    pub trigram: usize,
+    pub with_snippet: usize,
+}
+
+/// Пробы лёгких поисков процесса ([`LightProbe`]).
+#[cfg(feature = "test-hooks")]
+pub static TEST_LIGHT_SEARCHES: std::sync::Mutex<Vec<LightProbe>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// [`search`] с облегчением `light` (M6 §16, задача 16) — только для внутреннего поиска
+/// подсказок-идей к `prompt` (`api/recall.rs`): каналы FTS не длиннее
+/// [`LightSearch::channel_depth`], сниппеты строятся только при [`LightSearch::snippets`]
+/// (у элементов выдачи `snippet` пуст), непроиндексированные заметки не считаются
+/// (`pending_count` — 0), устаревшие ссылки на файлы в карточках не помечаются. Состав, порядок
+/// и баллы элементов — те же, что у обычного поиска с той же глубиной каналов. `None` — обычный
+/// поиск, побайтово прежний: в API параметра нет.
+pub(crate) async fn search_with(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
     origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
+    light: Option<LightSearch>,
 ) -> Result<Response, ApiError> {
     let total_t = Instant::now();
     let req: SearchReq = json_body(body)?;
@@ -2412,18 +2452,18 @@ pub async fn search(
             } else {
                 Vec::new()
             };
-            let r = search_fts_channels(
-                &tg.db,
-                FtsQuery {
-                    text: req.query.clone(),
-                    space_ids: tg.space_ids(),
-                    path_prefix: prefix.clone(),
-                    top_k: TOP_K_MAX,
-                    targets: kinds.clone(),
-                    alias_groups: alias_groups(&exp),
-                },
-            )
-            .await;
+            let q = FtsQuery {
+                text: req.query.clone(),
+                space_ids: tg.space_ids(),
+                path_prefix: prefix.clone(),
+                top_k: TOP_K_MAX,
+                targets: kinds.clone(),
+                alias_groups: alias_groups(&exp),
+            };
+            let r = match light {
+                Some(l) => search_fts_channels_light(&tg.db, q, l).await,
+                None => search_fts_channels(&tg.db, q).await,
+            };
             (r, exp)
         }))
         .await;
@@ -2453,16 +2493,19 @@ pub async fn search(
     // вектор их видит (флейк шага 17 smoke: счёт после запроса давал 0 при FTS-only выдаче).
     // Сумма — по целям, живым к концу обработчика
     let pending_t = Instant::now();
-    let pending_runs = join_all(
-        targets
-            .iter()
-            .map(|t| pending_count(&t.db, t.space_ids(), prefix.clone())),
-    )
-    .await;
     let mut pending_by = vec![0; targets.len()];
-    for (i, r) in pending_runs.into_iter().enumerate() {
-        if health.alive[i] {
-            pending_by[i] = health.soft(i, r)?.unwrap_or(0);
+    // лёгкому поиску счётчик не нужен (подсказки-идеи его не читают): `pending_count` — 0
+    if light.is_none() {
+        let pending_runs = join_all(
+            targets
+                .iter()
+                .map(|t| pending_count(&t.db, t.space_ids(), prefix.clone())),
+        )
+        .await;
+        for (i, r) in pending_runs.into_iter().enumerate() {
+            if health.alive[i] {
+                pending_by[i] = health.soft(i, r)?.unwrap_or(0);
+            }
         }
     }
     let pending_ms = ms(pending_t);
@@ -2508,7 +2551,11 @@ pub async fn search(
             }
         }
     }
-    let fts = merge_channels(per_db, FTS_BM25_TOP, FTS_TRIGRAM_TOP);
+    // лёгкий поиск: слитые каналы нескольких баз — тоже не длиннее его глубины
+    let depth = |top: usize| light.map_or(top, |l| top.min(l.channel_depth.max(1)));
+    let fts = merge_channels(per_db, depth(FTS_BM25_TOP), depth(FTS_TRIGRAM_TOP));
+    #[cfg(feature = "test-hooks")]
+    let light_channels = (fts.bm25.len(), fts.trigram.len());
 
     // 2. векторные хиты — в базу своего владельца, только живые чанки пространств цели
     let fuse_t = Instant::now();
@@ -2713,7 +2760,7 @@ pub async fn search(
         .filter_map(|r| {
             let (target, hit) = hits.get(&r.chunk_id)?;
             let mut hit = hit.clone();
-            if hit.snippet.is_empty() {
+            if hit.snippet.is_empty() && light.is_none_or(|l| l.snippets) {
                 hit.snippet = text_snippet(&hit.text, &needles);
             }
             Some(Item {
@@ -2747,6 +2794,18 @@ pub async fn search(
         Vec::new()
     };
     let fuse_ms = ms(fuse_t);
+    #[cfg(feature = "test-hooks")]
+    if let Some(l) = light
+        && let Ok(mut probes) = TEST_LIGHT_SEARCHES.lock()
+    {
+        probes.push(LightProbe {
+            query: req.query.clone(),
+            light: l,
+            bm25: light_channels.0,
+            trigram: light_channels.1,
+            with_snippet: items.iter().filter(|i| !i.hit.snippet.is_empty()).count(),
+        });
+    }
 
     // 4. серверный реранк; пересборка индекса — предупреждение о неполной векторной выдаче
     if st.index.reindexing() {
@@ -2848,8 +2907,11 @@ pub async fn search(
     }
     // источник выжимки этого ответа — без фрагмента (M6 §7.1, решение контролёра 2026-11-06)
     mark_cache_sources(&targets, &cache_items, &mut items).await;
-    // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется
-    attach_stale_refs(&targets, &mut items).await;
+    // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется;
+    // лёгкому поиску пометки карточек не нужны
+    if light.is_none() {
+        attach_stale_refs(&targets, &mut items).await;
+    }
     // лист с секретом в имени — номером, как в `/read` (задача 7 M5, раунд правок 2)
     number_secret_sheets(&targets, &mut items).await;
     // слабые карточки `brief`/`notes` — вон (M6 §4.2, `search.brief_min_rel`)

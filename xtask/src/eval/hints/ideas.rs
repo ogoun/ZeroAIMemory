@@ -70,6 +70,12 @@ pub enum QueryClass {
     Positive,
     /// Автор ждёт тишину.
     Negative,
+    /// Запрос из общих глаголов и слов работы с кодом (M6 §16, задача 16): с идеей `about` его
+    /// связывают только они. M5.7 даёт по нему ложную подсказку — эталон это фиксирует; M6 со
+    /// стоп-основами идей молчит. В проверке эквивалентности с M5.7 такой запрос не участвует:
+    /// расхождение на нём ожидаемое и считается отдельно (тест `idea_hints_top5_match_m57`).
+    #[serde(rename = "stop_verb")]
+    StopVerb,
 }
 
 /// Запрос набора `eval/idea-hints.toml`.
@@ -110,6 +116,8 @@ pub struct QueriesSummary {
     pub queries: usize,
     pub positive: usize,
     pub negative: usize,
+    /// Запросов общих глаголов ([`QueryClass::StopVerb`]).
+    pub stop_verb: usize,
     pub long: usize,
     /// Состояния идей корпуса, затронутые `expect` и `about`.
     pub states: BTreeSet<String>,
@@ -169,6 +177,18 @@ pub fn validate_queries(qs: &[IdeaQuery], corpus: &SessionsCorpus) -> Result<Que
                 s.negative += 1;
                 if !q.expect.is_empty() {
                     errs.push(format!("{}: у negative непустой expect", q.id));
+                }
+            }
+            QueryClass::StopVerb => {
+                s.stop_verb += 1;
+                if !q.expect.is_empty() {
+                    errs.push(format!("{}: у stop_verb непустой expect", q.id));
+                }
+                if q.about.is_empty() {
+                    errs.push(format!(
+                        "{}: у stop_verb пустой about (идеи ложной подсказки M5.7)",
+                        q.id
+                    ));
                 }
             }
         }
@@ -511,11 +531,12 @@ pub fn run(a: &EvalArgs, p: &Paths, queries_path: &Path) -> Result<()> {
     let qs = validate_queries(&queries, &corpus)?;
     let ideas_path = p.sessions_corpus.join("ideas").join("ideas.toml");
     println!(
-        "набор подсказок-идей: запросов {} (положительных {}, отрицательных {}, длинных {}), \
-         идей {}; поиск — FTS (без моделей)",
+        "набор подсказок-идей: запросов {} (положительных {}, отрицательных {}, общих глаголов \
+         {}, длинных {}), идей {}; поиск — FTS (без моделей)",
         qs.queries,
         qs.positive,
         qs.negative,
+        qs.stop_verb,
         qs.long,
         corpus.ideas.len()
     );
@@ -632,6 +653,7 @@ fn print_summary(queries: &[IdeaQuery], fx: &IdeaHintsFixture) {
     let mut with = 0;
     let mut pos_hit = 0;
     let mut neg_silent = 0;
+    let mut verb_hint = 0;
     let mut deep = 0;
     for (q, r) in queries.iter().zip(&fx.rows) {
         if !r.ideas.is_empty() {
@@ -643,26 +665,28 @@ fn print_summary(queries: &[IdeaQuery], fx: &IdeaHintsFixture) {
         let as_expected = match q.class {
             QueryClass::Positive => r.ideas.first().is_some_and(|f| q.expect.contains(f)),
             QueryClass::Negative => r.ideas.is_empty(),
+            // ожидание — о M5.7: ложная подсказка одной из идей `about` (с M6 — тишина)
+            QueryClass::StopVerb => r.ideas.iter().any(|i| q.about.contains(i)),
         };
         match (q.class, as_expected) {
             (QueryClass::Positive, true) => pos_hit += 1,
             (QueryClass::Negative, true) => neg_silent += 1,
+            (QueryClass::StopVerb, true) => verb_hint += 1,
             _ => {}
         }
         let mark = if as_expected { "=" } else { "≠" };
         println!("  {} {mark} {:?} — {}", r.id, r.ideas, q.note);
     }
-    let pos = queries
-        .iter()
-        .filter(|q| q.class == QueryClass::Positive)
-        .count();
+    let of = |c: QueryClass| queries.iter().filter(|q| q.class == c).count();
     println!(
         "сервер {}: запросов {}, с подсказками {with} (больше одной — {deep}); первая подсказка \
-         из expect у {pos_hit} из {pos} положительных, тишина у {neg_silent} из {} \
-         отрицательных",
+         из expect у {pos_hit} из {} положительных, тишина у {neg_silent} из {} отрицательных, \
+         подсказка идеи из about у {verb_hint} из {} запросов общих глаголов",
         fx.server_version,
         fx.rows.len(),
-        queries.len() - pos
+        of(QueryClass::Positive),
+        of(QueryClass::Negative),
+        of(QueryClass::StopVerb)
     );
 }
 
@@ -806,6 +830,39 @@ mod tests {
         let s = validate_queries(&qs, &corpus).unwrap();
         assert!(s.queries >= MIN_QUERIES && s.long >= MIN_LONG, "{s:?}");
         assert_eq!(s.states.len(), 7, "{s:?}");
+        // M6 §16 (задача 16): запросы общих глаголов — отдельным классом, не меньше шести
+        assert!(s.stop_verb >= 6, "{s:?}");
+        assert_eq!(s.queries, s.positive + s.negative + s.stop_verb, "{s:?}");
+    }
+
+    /// Класс `stop_verb` читается из TOML этим именем; `expect` пуст, `about` обязателен.
+    #[test]
+    fn stop_verb_class_markup() {
+        let f: QueriesFile = toml::from_str(
+            "[[query]]\nid = \"v1\"\nprompt = \"почини тест\"\nclass = \"stop_verb\"\n\
+             about = [\"idea:i01\"]\n",
+        )
+        .unwrap();
+        assert_eq!(f.query[0].class, QueryClass::StopVerb);
+        let corpus = SessionsCorpus {
+            ideas: vec![idea("i01", "human", IdeaState::New, None)],
+            ..Default::default()
+        };
+        let mut q = f.query[0].clone();
+        let err = |q: &IdeaQuery| {
+            validate_queries(std::slice::from_ref(q), &corpus)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(!err(&q).contains("stop_verb"), "{}", err(&q));
+        q.about.clear();
+        assert!(err(&q).contains("у stop_verb пустой about"), "{}", err(&q));
+        q.expect = vec!["idea:i01".into()];
+        assert!(
+            err(&q).contains("у stop_verb непустой expect"),
+            "{}",
+            err(&q)
+        );
     }
 
     #[test]

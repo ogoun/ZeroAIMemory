@@ -87,7 +87,9 @@
 //!   `ZeroAIMemory: идея «…» [<priority>] — w:<id>`, `reason: idea`; только пространство
 //!   решения и только первый `session_start` сессии; нет в `recovery` и `brief`); к `prompt` —
 //!   до `ideas.prompt_max` строк отдельного лёгкого поиска идей после основного
-//!   ([`prompt_ideas`]; общие идеи Knowledge — [`knowledge_ideas_related`]). Кандидаты —
+//!   ([`prompt_ideas`]; общие идеи Knowledge — [`knowledge_ideas_related`]; лёгкий поиск —
+//!   [`idea_light_search`], M6 §16: каналы FTS до `max(4 × top_k, 20)`, без сниппетов; слова
+//!   запроса на стоп-основу [`IDEA_STOP_STEMS`] идею не подтверждают). Кандидаты —
 //!   [`zam_store::idea_candidate`]: «от агента», `proposed`, `declined`, `done`, `deferred` до
 //!   `horizon` и `accepted` с живой задачей не предлагаются никогда; `accepted` со снятой или
 //!   удалённой задачей (§16) — после `new`/`deferred`, строка с пометкой «задача снята|удалена,
@@ -185,7 +187,8 @@ use tokio::time::Instant;
 use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
     CoverageQuery, CoverageRule, HINT_PREFIX, Section, StemWord, WordMatch, error_regex_matches,
-    error_terms, hint_line, normalize_error, one_line, pack_sections, reserved_text, stem_words,
+    error_terms, hint_line, normalize_error, one_line, pack_sections, prepared_terms,
+    reserved_text, stem_words,
 };
 use zam_search::{truncate_marked, truncate_to_tokens};
 use zam_store::{
@@ -198,7 +201,7 @@ use zam_store::{
 
 use super::json_body;
 use super::search::targets::{ScopeReq, SearchTarget, dedup_keep_order, resolve_targets};
-use super::search::{Health, SOLUTION_HEADER};
+use super::search::{Health, LightSearch, SOLUTION_HEADER};
 use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
 use super::user_settings::{UserFlags, user_flags};
 use crate::app::AppState;
@@ -915,6 +918,20 @@ pub const TEST_SLOW_IDEA_MARK: &str = "zam-test-slow-idea";
 pub static TEST_SECOND_PASS_QUERIES: std::sync::Mutex<Vec<String>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Длительности отдельного поиска идей к `prompt` (внутренний поиск [`search_prompt_ideas`]) и
+/// поле `timings` его ответа (этапы поиска, мс; `null` — поиск не ответил) — только с фичей
+/// `test-hooks`: микрозамер `ideas_recall::inner_search_ideas_median` (M6 §16).
+#[cfg(feature = "test-hooks")]
+pub static TEST_IDEA_SEARCH_TIMES: std::sync::Mutex<Vec<(Duration, Value)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Выключатель лёгкого поиска идей (фича `test-hooks`): микрозамер
+/// `ideas_recall::inner_search_ideas_median` чередует лёгкий и обычный поиск в одном процессе —
+/// сравнение под одним фоном нагрузки. Вне замера — `false`.
+#[cfg(feature = "test-hooks")]
+pub static TEST_IDEA_LIGHT_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Обрезка текста до `max` символов с многоточием.
 fn clip(s: &str, max: usize) -> String {
     let s = one_line(s);
@@ -1396,7 +1413,7 @@ async fn any_prompt_candidates(
 /// Лексическое подтверждение идеи решения в подсказке (финальное ревью M5.7, I-1): балл
 /// отдельного поиска только по идеям нормирован по непустым каналам, и без порога вектора
 /// ближайшая идея получала бы 1,0 на любой запрос. Нужны канал `fts`, `alias` или `trigram` в
-/// `sources` и совпадение слов запроса со словами идеи по основам ([`idea_words_match`]).
+/// `sources` и совпадение слов запроса со словами идеи по основам ([`IdeaQuery::matches`]).
 fn idea_lexically_matched(item: &Value, e: &Entry, q: &IdeaQuery) -> bool {
     let lexical = item["sources"]
         .as_array()
@@ -1406,7 +1423,7 @@ fn idea_lexically_matched(item: &Value, e: &Entry, q: &IdeaQuery) -> bool {
     lexical && q.matches(&e.title, &e.body)
 }
 
-/// Значимых слов идеи в пороге [`idea_words_match`], не больше: длинное тело не делает порог
+/// Значимых слов идеи в пороге [`IdeaQuery::matches`], не больше: длинное тело не делает порог
 /// недостижимым (половина от 6 — 3 слова, не больше порога покрытия запроса 4).
 const IDEA_WORDS_CAP: usize = 6;
 /// Порог покрытия слов запроса у подсказок-идей — свой и фиксированный (M5.7: ⌈n/3⌉ от 2 до 4,
@@ -1417,32 +1434,89 @@ const IDEA_QUERY_RULE: CoverageRule = CoverageRule {
     word_match: WordMatch::Stems,
 };
 
-/// Слова запроса `terms` ([`error_terms`]) подтверждаются заголовком `title` и телом `body`
-/// идеи (финальное ревью M5.7, I-1′ и I-1″). Служебные слова не считаются ни в запросе, ни в
-/// идее ([`stem_words`]). Нужно хотя бы одно совпадение по основе со словом **заголовка**:
-/// совпадения только с телом («пользователь», «server») связи с замыслом не доказывают. Далее:
-/// покрыты все слова запроса — да; иначе нужно не меньше
-/// `min(порог покрытия запроса, max(1, ⌈k / 2⌉))` совпавших, где `k` — значимые слова идеи (до
-/// [`IDEA_WORDS_CAP`]). Порог ограничен словами самой идеи: к длинному запросу Claude Code
-/// короткая идея иначе не подходила бы никогда. Общий код слов — `zam_search::recall`
-/// ([`StemWord`], задача 9 M6).
-#[cfg(test)]
-fn idea_words_match(terms: &[String], title: &str, body: &str) -> bool {
-    IdeaQuery::new(terms).matches(title, body)
+/// Стоп-основы общих глаголов и слов работы с кодом — **только для слов запроса подсказок-идей**
+/// (M6 §16, задача 16; финальное ревью M5.7): «добавь тест на модуль авторизации» не должен
+/// подходить к идее только потому, что в её заголовке «Добавить», а в теле — «тесты» и
+/// «модуль». Записаны основами `zam_search::recall::stem` (первые `max(4, длина − 3)`
+/// символов), ru и en. Общий список служебных слов (`zam_core::text`) не меняется: он влияет на
+/// границы разделов.
+pub const IDEA_STOP_STEMS: [&str; 17] = [
+    "сдел",
+    "добав",
+    "исправ",
+    "обнов",
+    "поправ",
+    "почин",
+    "модул",
+    "тест",
+    "функци",
+    "файл",
+    "make",
+    "add",
+    "fix",
+    "updat",
+    "chang",
+    "modul",
+    "test",
+];
+
+/// Слово запроса `norm` (после `zam_search::recall::norm_word`) — служебное для подсказок-идей:
+/// начинается со стоп-основы [`IDEA_STOP_STEMS`] и длиннее её не больше чем на 3 символа.
+/// «добавьте», «tests», «fixed» — да; «changelog», «модульный», «address», «makefile» — нет.
+fn is_idea_stop(norm: &str) -> bool {
+    let n = norm.chars().count();
+    IDEA_STOP_STEMS
+        .iter()
+        .any(|s| norm.starts_with(s) && n <= s.chars().count() + 3)
 }
 
 /// Слова запроса подсказки-идеи, подготовленные один раз на запрос (перф: раньше стоп-список,
 /// нормализация и основы запроса пересчитывались на каждого кандидата).
-struct IdeaQuery(Vec<StemWord>);
+struct IdeaQuery {
+    /// Значимые слова запроса: [`prepared_terms`] при [`WordMatch::Stems`] (без служебных слов
+    /// ru/en, `ё` → `е`, без повторов) и без слов на стоп-основу ([`is_idea_stop`]).
+    words: Vec<StemWord>,
+    /// Слов запроса вместе со словами на стоп-основу — знаменатель порога покрытия, как у M5.7.
+    total: usize,
+}
 
 impl IdeaQuery {
     fn new(terms: &[String]) -> IdeaQuery {
-        IdeaQuery(stem_words(terms))
+        let all = prepared_terms(terms, WordMatch::Stems);
+        IdeaQuery {
+            total: all.len(),
+            words: all
+                .into_iter()
+                .filter(|w| !is_idea_stop(w))
+                .map(StemWord::new)
+                .collect(),
+        }
     }
 
-    /// Правило [`idea_words_match`] для заголовка `title` и тела `body` идеи.
+    /// В запросе нет значимых слов: ни одна идея решения им не подтверждается.
+    fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// Слова запроса ([`error_terms`]) подтверждаются заголовком `title` и телом `body` идеи
+    /// (финальное ревью M5.7, I-1′ и I-1″). Служебные слова не считаются ни в запросе, ни в
+    /// идее ([`stem_words`]). Нужно хотя бы одно совпадение по основе со словом **заголовка**:
+    /// совпадения только с телом («пользователь», «server») связи с замыслом не доказывают.
+    /// Далее: покрыты все значимые слова запроса — да; иначе нужно не меньше
+    /// `min(порог покрытия запроса, max(1, ⌈k / 2⌉))` совпавших, где `k` — значимые слова идеи
+    /// (до [`IDEA_WORDS_CAP`]). Порог ограничен словами самой идеи: к длинному запросу Claude
+    /// Code короткая идея иначе не подходила бы никогда. Общий код слов — `zam_search::recall`
+    /// ([`StemWord`], задача 9 M6).
+    ///
+    /// Слова запроса на стоп-основу ([`is_idea_stop`], M6 §16) совпадением не считаются — ни с
+    /// заголовком, ни с телом, — но остаются в знаменателе порога покрытия **[решение
+    /// исполнителя задачи 16]**: если их убрать и из знаменателя, порог `⌈n / 3⌉` падает, и
+    /// возвращается ложная подсказка таблицы I-1″ («fix the server crash when this config is
+    /// missing from the web request» к «Dark theme for the web interface»: 7 слов → порог 3, без
+    /// «fix» 6 слов → порог 2 при двух случайных совпадениях). Слова идеи не фильтруются: слово
+    /// запроса «тестирование» находит идею со словом «тесты».
     fn matches(&self, title: &str, body: &str) -> bool {
-        let q = &self.0;
+        let q = &self.words;
         if q.is_empty() {
             return false;
         }
@@ -1458,7 +1532,7 @@ impl IdeaQuery {
         if covered == q.len() {
             return true;
         }
-        let query_need = IDEA_QUERY_RULE.need(q.len());
+        let query_need = IDEA_QUERY_RULE.need(self.total);
         let k = words.len().min(IDEA_WORDS_CAP);
         covered >= query_need.min(k.div_ceil(2).max(1))
     }
@@ -1521,7 +1595,8 @@ const RELEASED_PROMPT_IDS: usize = 50;
 /// - релевантность — FTS (`search_fts_channels`, `kinds [idea]`, `status [accepted]`) только
 ///   среди этих id: строгий запрос (все слова) проходит, ослабленный (любое слово) — при
 ///   подтверждении по основам слов, как у первого прохода ([`IdeaQuery::matches`]). Принятые
-///   идеи с живой задачей сюда не попадают и мест не занимают;
+///   идеи с живой задачей сюда не попадают и мест не занимают. Запрос без значимых слов
+///   ([`IdeaQuery::is_empty`]: только служебные и стоп-основы идей) — прохода нет;
 /// - общая идея Knowledge — по [`knowledge_ideas_related`].
 ///
 /// Не больше `want` кандидатов, после основных. Ошибки — WARN, `health.alive` не трогается.
@@ -1537,6 +1612,11 @@ async fn released_prompt_ideas(
     want: usize,
 ) -> Vec<Cand> {
     let iq = IdeaQuery::new(&error_terms(query));
+    // в запросе нет значимых слов (служебные и стоп-основы идей, M6 §16): строгий FTS по одним
+    // «почини тест» связи с идеей не доказывает — второго прохода нет, как и подтверждения первого
+    if iq.is_empty() {
+        return Vec::new();
+    }
     let today = zam_store::time::utc_today();
     #[cfg(feature = "test-hooks")]
     if let Ok(mut runs) = TEST_SECOND_PASS_QUERIES.lock() {
@@ -1690,8 +1770,24 @@ async fn released_prompt_ideas(
         .collect()
 }
 
+/// Наименьшая глубина каналов лёгкого поиска идей ([`idea_light_search`]).
+const IDEA_LIGHT_DEPTH_MIN: usize = 20;
+
+/// Облегчение отдельного поиска идей к `prompt` (M6 §16, задача 16): при `top_k` 5 обычный
+/// поиск строил хиты каналов FTS до 50 и сниппеты к ним — 8 мс медианы в отладочной сборке на 50
+/// идеях против 3 мс основного поиска. Каналы — не длиннее `max(4 × top_k, 20)`, сниппеты не
+/// строятся: подсказке нужны только id, балл и каналы находки, а заголовок и тело для
+/// лексического подтверждения читаются из базы по id. Основной поиск `prompt` не меняется.
+fn idea_light_search(top_k: usize) -> LightSearch {
+    LightSearch {
+        channel_depth: (4 * top_k).max(IDEA_LIGHT_DEPTH_MIN),
+        snippets: false,
+    }
+}
+
 /// Один проход отдельного поиска идей [`collect_prompt_ideas`] по статусам `statuses`:
-/// кандидаты [`zam_store::idea_candidate`] в порядке выдачи. `None` — срок истёк.
+/// кандидаты [`zam_store::idea_candidate`] в порядке выдачи. `None` — срок истёк. Поиск —
+/// лёгкий ([`idea_light_search`]).
 #[allow(clippy::too_many_arguments)]
 async fn search_prompt_ideas(
     st: &AppState,
@@ -1718,7 +1814,18 @@ async fn search_prompt_ideas(
         "format": "json",
     });
     let area = req.area.as_deref();
-    let Some(v) = inner_search(st, p, headers, area, body, health, d).await? else {
+    let light = Some(idea_light_search(st.cfg.ideas.prompt_top_k as usize));
+    #[cfg(feature = "test-hooks")]
+    let light = light.filter(|_| !TEST_IDEA_LIGHT_OFF.load(std::sync::atomic::Ordering::Relaxed));
+    #[cfg(feature = "test-hooks")]
+    let search_t = std::time::Instant::now();
+    let found = inner_search(st, p, headers, area, body, light, health, d).await?;
+    #[cfg(feature = "test-hooks")]
+    if let Ok(mut times) = TEST_IDEA_SEARCH_TIMES.lock() {
+        let stages = found.as_ref().map_or(Value::Null, |v| v["timings"].clone());
+        times.push((search_t.elapsed(), stages));
+    }
+    let Some(v) = found else {
         return Ok(Some(Vec::new()));
     };
     let min = prompt_min_score(st, &v);
@@ -2457,7 +2564,7 @@ async fn brief_search(
         "format": "json",
     });
     let area = req.area.as_deref();
-    let Some(v) = inner_search(st, p, headers, area, body, health, deadline).await? else {
+    let Some(v) = inner_search(st, p, headers, area, body, None, health, deadline).await? else {
         return Ok((decisions, traps));
     };
     let min = st.cfg.recall.prompt_min_score;
@@ -3317,7 +3424,7 @@ async fn prompt_hints(
         "format": "json",
     });
     let area = req.area.as_deref();
-    let Some(v) = inner_search(st, p, headers, area, body, health, deadline).await? else {
+    let Some(v) = inner_search(st, p, headers, area, body, None, health, deadline).await? else {
         return Ok(Vec::new());
     };
     let min = prompt_min_score(st, &v);
@@ -3430,12 +3537,16 @@ fn prompt_min_score(st: &AppState, search: &Value) -> f64 {
 /// Внутренний `POST /search` подсказок (тело `body`): без сессии (показанное учитывает сам
 /// `/recall`), `area` — в `X-Zam-Area`, если его нет. Срок вышел — `None`; сбой поиска —
 /// `None` и `warnings: ["recall search failed"]`; предупреждения поиска переходят в ответ.
+/// `light` — облегчение поиска ([`LightSearch`]; только подсказки-идеи, [`idea_light_search`]),
+/// `None` — обычный поиск.
+#[allow(clippy::too_many_arguments)]
 async fn inner_search(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
     area: Option<&str>,
     body: Value,
+    light: Option<LightSearch>,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Option<Value>, ApiError> {
@@ -3450,12 +3561,13 @@ async fn inner_search(
                 .map_err(|_| ApiError::BadRequest("area: печатные символы".into()))?,
         );
     }
-    let search = super::search::search(
+    let search = super::search::search_with(
         State(st.clone()),
         p.clone(),
         h,
         None,
         Ok(Bytes::from(body.to_string())),
+        light,
     );
     let Some(r) = deadline.step(search).await else {
         return Ok(None);
@@ -4402,6 +4514,178 @@ mod tests {
 
     // основы слов (бывш. `idea_stem_match_forms_and_short_words`) — тест `zam_search::recall`
     // `stem_word_match_forms_and_short_words` (задача 9 M6)
+
+    /// Правило идей для слов запроса `terms`, заголовка и тела ([`IdeaQuery::matches`]).
+    fn idea_words_match(terms: &[String], title: &str, body: &str) -> bool {
+        IdeaQuery::new(terms).matches(title, body)
+    }
+
+    /// M6 §16 (задача 16): слово служебное для идей, если начинается со стоп-основы и длиннее
+    /// её не больше чем на 3 символа. Список — основы `zam_search::recall::stem` своих слов.
+    #[test]
+    fn idea_stop_stems_examples() {
+        use zam_search::recall::{norm_word, stem};
+        for w in [
+            "добавьте",
+            "добавь",
+            "добавить",
+            "сделай",
+            "сделать",
+            "исправь",
+            "исправить",
+            "обнови",
+            "обновить",
+            "поправь",
+            "поправить",
+            "почини",
+            "починить",
+            "модуль",
+            "модуля",
+            "тест",
+            "тесты",
+            "тестов",
+            "функция",
+            "функцию",
+            "файл",
+            "файле",
+            "файлами",
+            "make",
+            "makes",
+            "add",
+            "added",
+            "fix",
+            "fixed",
+            "update",
+            "updated",
+            "change",
+            "changes",
+            "module",
+            "modules",
+            "test",
+            "tests",
+        ] {
+            assert!(is_idea_stop(&norm_word(w)), "служебное: {w}");
+        }
+        // длиннее основы на 4 и больше — другое слово; чужое начало — тоже
+        for w in [
+            "changelog",
+            "модульный",
+            "address",
+            "makefile",
+            "файловый",
+            "функциональный",
+            "тестировщиков",
+            "тестирование",
+            "additional",
+            "fixtures",
+            "экспорт",
+            "отчёт",
+            "pdf",
+            "ad",
+            "обновление",
+        ] {
+            assert!(!is_idea_stop(&norm_word(w)), "не служебное: {w}");
+        }
+        // регистр и «ё» — после нормализации; без неё заглавное слово не совпало бы с основой
+        assert!(is_idea_stop(&norm_word("ДОБАВЬТЕ")) && is_idea_stop(&norm_word("Тёст")));
+        // запись списка: каждая основа — основа хотя бы одного своего слова ([`stem`])
+        let forms = [
+            "сделать",
+            "добавить",
+            "исправить",
+            "обновить",
+            "поправить",
+            "починить",
+            "модулями",
+            "тест",
+            "функциями",
+            "файл",
+            "make",
+            "add",
+            "fix",
+            "updating",
+            "changing",
+            "modulate",
+            "test",
+        ];
+        assert_eq!(forms.len(), IDEA_STOP_STEMS.len());
+        for (s, w) in IDEA_STOP_STEMS.iter().zip(forms) {
+            assert_eq!(stem(w), *s, "{w}");
+        }
+        // значимые слова запроса и знаменатель порога (со словами на стоп-основу)
+        let words = |t: &str| {
+            let q = IdeaQuery::new(&error_terms(t));
+            (q.words.len(), q.total)
+        };
+        assert_eq!(words("Добавьте тесты на модуль авторизации"), (1, 4));
+        assert_eq!(words("update the changelog and the makefile"), (2, 3));
+        assert_eq!(words("fix tests"), (0, 2));
+        assert!(IdeaQuery::new(&error_terms("fix tests")).is_empty());
+    }
+
+    /// M6 §16 (задача 16): глубина каналов лёгкого поиска идей — `max(4 × top_k, 20)`, без
+    /// сниппетов.
+    #[test]
+    fn idea_light_search_depth() {
+        for (top_k, depth) in [(1, 20), (5, 20), (6, 24), (8, 32), (20, 80)] {
+            assert_eq!(
+                idea_light_search(top_k),
+                LightSearch {
+                    channel_depth: depth,
+                    snippets: false
+                },
+                "top_k {top_k}"
+            );
+        }
+    }
+
+    /// M6 §16 (задача 16): общий глагол и слова работы с кодом связи с идеей не доказывают;
+    /// значимые слова — доказывают по-прежнему.
+    #[test]
+    fn idea_stop_stems_in_words_match() {
+        let title = "Добавить экспорт отчётов в PDF";
+        let body = "Сделать модуль выгрузки, функцию печати в файл и тесты.";
+        let m = |q: &str| idea_words_match(&error_terms(q), title, body);
+        for q in [
+            "добавь тест на модуль авторизации",
+            "сделай функцию и добавь её в файл",
+            "исправь тесты модуля",
+            "почини и обнови файл с функцией",
+            "поправь модуль",
+            "add a test for the module and fix the file",
+        ] {
+            assert!(!m(q), "только стоп-основы: {q}");
+        }
+        for q in [
+            "добавь экспорт отчётов в PDF",
+            "сделай модуль экспорта",
+            "экспортировать отчёты в pdf",
+            "тесты на экспорт отчётов",
+        ] {
+            assert!(m(q), "значимые слова: {q}");
+        }
+        // запрос из одних стоп-основ не подтверждает и идею из тех же слов
+        assert!(!idea_words_match(
+            &error_terms("обнови тесты модуля"),
+            "Обновить тесты модуля",
+            "Починить файл."
+        ));
+        // слова идеи не фильтруются: значимое слово запроса находит слово идеи на стоп-основу
+        assert!(idea_words_match(
+            &error_terms("тестирование оплаты"),
+            "Добавить тесты на модуль оплаты",
+            "Замысел."
+        ));
+        // слово на стоп-основу остаётся в знаменателе порога: без «fix» порог ⌈6/3⌉ = 2 вернул бы
+        // ложную подсказку таблицы I-1″ (совпадают только «server» и «web»)
+        let q = "fix the server crash when this config is missing from the web request";
+        let iq = IdeaQuery::new(&error_terms(q));
+        assert_eq!((iq.words.len(), iq.total), (6, 7));
+        assert!(!iq.matches(
+            "Dark theme for the web interface",
+            "This would make the server UI nicer."
+        ));
+    }
 
     /// Порог подтверждения ограничен словами идеи: длинный запрос к короткой идее подходит.
     #[test]

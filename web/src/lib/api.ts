@@ -987,9 +987,11 @@ export const decideIdea = (
 export const adoptIdea = (user: string, id: string) =>
   call<Entry>('POST', `entries/${q(id)}/adopt`, undefined, user);
 
-/** Поиск идей пространства по заголовку и тексту: `POST /search` `kinds: [idea]`. */
-export const searchIdeas = (user: string, space: string, query: string, status: EntryStatus[]) =>
-  call<SearchResult>(
+/** Поиск идей пространства по заголовку и тексту: `POST /search` `kinds: [idea]`. Идеи — по
+ * одному разу в порядке выдачи (`brief` — элемент на чанк: идея с совпадениями в нескольких
+ * местах пришла бы несколько раз). */
+export const searchIdeas = async (user: string, space: string, query: string, status: EntryStatus[]): Promise<SearchItem[]> => {
+  const r = await call<SearchResult>(
     'POST',
     'search',
     {
@@ -1003,6 +1005,9 @@ export const searchIdeas = (user: string, space: string, query: string, status: 
     },
     user,
   );
+  const seen = new Set<string>();
+  return r.items.filter((x) => x.kind === 'idea' && !!x.entry_id && !seen.has(x.entry_id) && !!seen.add(x.entry_id));
+};
 
 // ---- ссылки знаний на файлы (M4.5 §6) ----
 

@@ -493,10 +493,11 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
             let is = hints::ideas::validate_queries(&iq, &sc)?;
             println!(
                 "набор подсказок-идей M6 (эталон M5.7): запросов {} (положительных {}, \
-                 отрицательных {}, длинных {}), состояний идей {}",
+                 отрицательных {}, общих глаголов {}, длинных {}), состояний идей {}",
                 is.queries,
                 is.positive,
                 is.negative,
+                is.stop_verb,
                 is.long,
                 is.states.len()
             );

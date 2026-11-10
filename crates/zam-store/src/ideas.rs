@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use jiff::civil::Date;
 use jiff::{Span, Timestamp};
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
@@ -737,6 +737,29 @@ fn task_state(c: &Connection, d: &IdeaData) -> Result<Option<TaskState>, StoreEr
     }))
 }
 
+/// Время, когда задача `data.task_id` стала `done`: первая ревизия её последней непрерывной
+/// серии ревизий `done` (поздняя правка сделанной задачи время не сдвигает; после переоткрытия и
+/// повторного `done` — время второго перехода). Задачи в данных нет или история не кончается
+/// ревизией `done` — `None`.
+fn task_done_ts(c: &Connection, d: &IdeaData) -> Result<Option<Timestamp>, StoreError> {
+    let Some(task) = d.task_id else {
+        return Ok(None);
+    };
+    let ts: Option<String> = c
+        .query_row(
+            "SELECT r.ts FROM entry_revisions r
+             WHERE r.entry_id = ?1 AND r.status = 'done'
+               AND r.rev > coalesce((SELECT max(x.rev) FROM entry_revisions x
+                                     WHERE x.entry_id = ?1
+                                       AND (x.status IS NULL OR x.status <> 'done')), 0)
+             ORDER BY r.rev LIMIT 1",
+            [task],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ts.as_deref().map(parse_ts).transpose()
+}
+
 /// Есть ли в пространствах `spaces` кандидат первого прохода подсказки к `prompt`: живая идея
 /// человека `new` или `deferred` с наступившим `horizon` (один SQL `LIMIT 1`). Нет — поиск идей
 /// не нужен (финальное ревью M5.7, Minor 5).
@@ -1444,9 +1467,10 @@ const STALE_PROPOSAL_REASON: &str = "предложение устарело";
 ///   удалении), теряет `question_id` — снова кандидат (§16, п. 4);
 /// - восстановленная живая (не `dropped`) задача идеи — как переоткрытая: открытый вопрос
 ///   «вернуть» устаревает ([`revive_task_tx`]).
-/// - восстановленная идея `accepted` при задаче `done` становится `done` (с `done_at`), идея
-///   `done` при живой или снятой задаче — снова `accepted` (финальное ревью M5.7): в корзине идея
-///   не видела смену статуса задачи.
+/// - восстановленная идея `accepted` при задаче `done` становится `done`, идея `done` при живой
+///   или снятой задаче — снова `accepted` (финальное ревью M5.7): в корзине идея не видела смену
+///   статуса задачи. `done_at` — время, когда задача стала `done` ([`task_done_ts`]; M6 §16), а
+///   не время восстановления.
 pub(crate) fn on_entry_restored_tx(
     tx: &Connection,
     e: &Entry,
@@ -1512,7 +1536,11 @@ pub(crate) fn on_entry_restored_tx(
             match (status, task_state(tx, &d)?) {
                 (Some(EntryStatus::Accepted), Some(TaskState::Done)) => {
                     status = Some(EntryStatus::Done);
-                    d.done_at = Some(parse_ts(now)?);
+                    // ревизии `done` нет (статус поставлен мимо ревизий) — время восстановления
+                    d.done_at = Some(match task_done_ts(tx, &d)? {
+                        Some(ts) => ts,
+                        None => parse_ts(now)?,
+                    });
                     changed = true;
                 }
                 (Some(EntryStatus::Done), Some(TaskState::Live | TaskState::Dropped)) => {

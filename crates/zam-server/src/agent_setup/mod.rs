@@ -6,7 +6,7 @@
 //!   (`PATCH /admin/settings`, WebUI — задача 13).
 //! - **Версия блока** — одна на сервер **[решение контроллера T11-a]**:
 //!   `max(AGENT_BLOCK_VERSION, agent_setup.version)`; каждое сохранение шаблона, которое меняет
-//!   его текст, увеличивает её на 1 ([`bump_version`]). Её отдаёт `GET /agent-setup`
+//!   его текст, увеличивает её на 1 ([`save_templates`]). Её отдаёт `GET /agent-setup`
 //!   (`version`), с ней сравнивают `/recall(session_start)` и `zam status`.
 //! - Токен не попадает ни в блок, ни в `.mcp.json` (stdio `zam mcp` берёт его сам).
 pub mod templates;

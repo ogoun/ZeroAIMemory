@@ -18,7 +18,8 @@
     type Entry,
     type Space,
   } from '../lib/api';
-  import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime, utcDate } from '../lib/journals';
+  import { IDEA_FORMS, deferDefault, deferError, deferMin, sharedWarning } from '../lib/ideaButtons';
+  import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime } from '../lib/journals';
   import { href } from '../lib/router';
 
   interface Props {
@@ -120,7 +121,7 @@
     if (ideaOf(q) && key === 'defer') {
       confirmFor = '';
       deferFor = q.id;
-      deferDate = utcDate(30);
+      deferDate = deferDefault();
       errors[q.id] = '';
       return;
     }
@@ -129,8 +130,9 @@
 
   function submitDefer(e: SubmitEvent, q: Entry) {
     e.preventDefault();
-    if (!deferDate || deferDate < utcDate(1)) {
-      errors[q.id] = `Дата — не раньше ${utcDate(1)} (UTC).`;
+    const err = deferError(deferDate);
+    if (err) {
+      errors[q.id] = err;
       return;
     }
     answer(q, { option: 'defer', horizon: deferDate });
@@ -236,19 +238,19 @@
           {#if confirmFor === q.id}
             {@const sp = sharedTarget(q)}
             <div class="row" role="group" aria-label="Подтверждение «начать»">
-              <p class="warn" data-testid="shared-warning">Задача появится в решении «{sp?.name ?? ''}», её увидят участники.</p>
-              <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>Начать</button>
+              <p class="warn" data-testid="shared-warning">{sharedWarning(sp?.name ?? '')}</p>
+              <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>{IDEA_FORMS.start.submit}</button>
               <button type="button" onclick={() => (confirmFor = '')}>Отмена</button>
             </div>
           {/if}
           {#if deferFor === q.id}
-            <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label="Отложить идею">
+            <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label={IDEA_FORMS.defer.aria}>
               <label class="row">
                 Не раньше
-                <input type="date" bind:value={deferDate} min={utcDate(1)} required aria-label="Отложить до" />
+                <input type="date" bind:value={deferDate} min={deferMin()} required aria-label="Отложить до" />
                 <span class="muted small" title="Даты хранятся в UTC">UTC</span>
               </label>
-              <button type="submit" disabled={busy !== ''}>Отложить</button>
+              <button type="submit" disabled={busy !== ''}>{IDEA_FORMS.defer.submit}</button>
               <button type="button" onclick={() => (deferFor = '')}>Отмена</button>
             </form>
           {/if}

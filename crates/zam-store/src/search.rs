@@ -207,6 +207,18 @@ pub struct FtsQuery {
     pub alias_groups: Vec<AliasGroup>,
 }
 
+/// Облегчение [`search_fts_channels_light`] для выдачи с малым `top_k` (M6 §16, задача 16:
+/// подсказки-идеи к `prompt`). Обычный поиск им не пользуется.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightSearch {
+    /// Кандидатов канала, не больше (и не больше обычных пределов канала: 50 у `bm25` и `alias`,
+    /// 20 у `trigram`; не меньше 1).
+    pub channel_depth: usize,
+    /// Строить ли сниппеты; `false` — [`FtsHit::snippet`] пуст (ни `snippet()` FTS5, ни фрагмента
+    /// по подстрокам).
+    pub snippets: bool,
+}
+
 /// Группа расширения запроса: слова запроса `start..start + len` ([`query_terms`]) заменяются
 /// на «слово OR `with`» (M4.5, спецификация §2.2 п. 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,7 +673,8 @@ fn json_ids(ids: &[i64]) -> String {
 /// Кандидат канала: `(seq, цель, это L1 заметки или записи, bm25 канала)`.
 type Cand = (i64, TargetRef, bool, f64);
 
-/// Выполняет канал: кандидаты по убыванию релевантности канала.
+/// Выполняет канал: кандидаты по убыванию релевантности канала. `depth` — предел канала
+/// лёгкого поиска (`None` — обычный).
 ///
 /// Ранжирование с соединением `chunks`/`nodes` для каждого совпадения дорого
 /// (на 30 тыс. чанков частое слово — ~30 мс), поэтому сначала берётся
@@ -676,8 +689,13 @@ fn run_channel(
     prefix: Option<&str>,
     spaces: &[Id],
     targets: &TargetArgs,
+    depth: Option<usize>,
 ) -> Result<Vec<Cand>, StoreError> {
     let (table, order, limit) = channel_spec(ch);
+    // лёгкий поиск ([`LightSearch::channel_depth`]): канал короче, но не длиннее обычного
+    let limit = depth.map_or(limit, |d| {
+        limit.min(i64::try_from(d).unwrap_or(limit)).max(1)
+    });
     let over = limit * OVERSAMPLE;
     let mut st = c.prepare_cached(&format!(
         "SELECT rowid, {order} FROM {table} WHERE {table} MATCH ?1 ORDER BY {order}, rowid LIMIT {over}"
@@ -771,9 +789,10 @@ pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError>
             &spaces,
             &q.targets.args(),
             &[],
+            None,
         )?;
         let ranked = merge(ch.a, ch.b, q.top_k);
-        fetch_hits(&tx, &ranked, ch.a_fts.as_deref(), None, &ch.needles)
+        fetch_hits(&tx, &ranked, ch.a_fts.as_deref(), None, &ch.needles, true)
     })
     .await
 }
@@ -801,6 +820,25 @@ pub struct FtsChannels {
 /// есть в обоих списках. `top_k` запроса не используется, но проверяется, как и
 /// остальные поля.
 pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, StoreError> {
+    fts_channels(db, q, None).await
+}
+
+/// [`search_fts_channels`] для выдачи с малым `top_k` (M6 §16): каналы не длиннее
+/// `light.channel_depth`, сниппеты — только при `light.snippets`. Порядок канала тот же, что у
+/// начала обычного: первые `channel_depth` кандидатов совпадают.
+pub async fn search_fts_channels_light(
+    db: &Db,
+    q: FtsQuery,
+    light: LightSearch,
+) -> Result<FtsChannels, StoreError> {
+    fts_channels(db, q, Some(light)).await
+}
+
+async fn fts_channels(
+    db: &Db,
+    q: FtsQuery,
+    light: Option<LightSearch>,
+) -> Result<FtsChannels, StoreError> {
     let (spaces, prefix) = check_query(&q)?;
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
@@ -811,6 +849,7 @@ pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, St
             &spaces,
             &q.targets.args(),
             &q.alias_groups,
+            light.map(|l| l.channel_depth),
         )?;
         let in_a: HashSet<i64> = ch.a.iter().map(|c| c.0).collect();
         let in_alias: HashSet<i64> = ch.alias.iter().map(|c| c.0).collect();
@@ -833,6 +872,7 @@ pub async fn search_fts_channels(db: &Db, q: FtsQuery) -> Result<FtsChannels, St
             ch.a_fts.as_deref(),
             ch.alias_fts.as_deref(),
             &ch.needles,
+            light.is_none_or(|l| l.snippets),
         )?
         .into_iter()
         .map(|h| (h.chunk_id.clone(), h))
@@ -897,18 +937,19 @@ fn run_channels<'q>(
     spaces: &[Id],
     t: &TargetArgs,
     groups: &[AliasGroup],
+    depth: Option<usize>,
 ) -> Result<Channels<'q>, StoreError> {
     let mut a_fts = sanitize_fts(text);
     let mut relaxed = false;
     let mut a = match &a_fts {
-        Some(fts) => run_channel(tx, Channel::Bm25, fts, prefix, spaces, t)?,
+        Some(fts) => run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?,
         None => Vec::new(),
     };
     if a.is_empty() && terms(text).len() > 1 {
         a_fts = sanitize_fts_any(text);
         relaxed = true;
         if let Some(fts) = &a_fts {
-            a = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t)?;
+            a = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
         }
     }
     let mut alias: Vec<Cand> = Vec::new();
@@ -917,19 +958,19 @@ fn run_channels<'q>(
     if !groups.is_empty() {
         alias_fts_q = alias_fts(text, groups, " AND ");
         if let Some(fts) = &alias_fts_q {
-            alias = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t)?;
+            alias = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
         }
         if alias.is_empty() && terms(text).len() > 1 {
             alias_fts_q = alias_fts(text, groups, " OR ");
             alias_relaxed = true;
             if let Some(fts) = &alias_fts_q {
-                alias = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t)?;
+                alias = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
             }
         }
     }
     let (b, needles) = match trigram_query(text, a.is_empty()) {
         Some((fts, needles)) => (
-            run_channel(tx, Channel::Trigram, &fts, prefix, spaces, t)?,
+            run_channel(tx, Channel::Trigram, &fts, prefix, spaces, t, depth)?,
             needles,
         ),
         None => (Vec::new(), Vec::new()),
@@ -1481,13 +1522,15 @@ fn rrf(a: Vec<(i64, TargetRef)>, b: Vec<(i64, TargetRef)>, top_k: usize) -> Vec<
 
 /// Шаг 2: текст, метаданные и сниппеты итоговых чанков в порядке `ranked`.
 /// `bm25_fts` — запрос канала A, по которому строится `snippet()`;
-/// `needles` — подстроки для сниппета trigram-хитов.
+/// `needles` — подстроки для сниппета trigram-хитов. `snippets: false` (лёгкий поиск,
+/// [`LightSearch`]) — сниппеты не строятся, [`FtsHit::snippet`] пуст.
 fn fetch_hits(
     c: &Connection,
     ranked: &[Ranked],
     bm25_fts: Option<&str>,
     alias_fts: Option<&str>,
     needles: &[&str],
+    snippets: bool,
 ) -> Result<Vec<FtsHit>, StoreError> {
     if ranked.is_empty() {
         return Ok(Vec::new());
@@ -1504,7 +1547,7 @@ fn fetch_hits(
     })?;
     let mut by_seq: HashMap<i64, FtsHit> = rows.collect::<Result<_, _>>()?;
 
-    let mut snippets: HashMap<i64, String> = HashMap::new();
+    let mut found: HashMap<i64, String> = HashMap::new();
     // snippet() требует курсора MATCH, поэтому запрос повторяется одним
     // проходом по совпадениям; `+rowid` не отдаётся FTS5 как ограничение:
     // иначе для каждого rowid из списка MATCH (с раскрытием префиксов)
@@ -1520,7 +1563,7 @@ fn fetch_hits(
     let (ms, me) = (MARK_START.to_string(), MARK_END.to_string());
     for (fts, seqs) in [(bm25_fts, a_seqs), (alias_fts, al_seqs)] {
         let Some(fts) = fts else { continue };
-        if seqs.is_empty() {
+        if !snippets || seqs.is_empty() {
             continue;
         }
         let mut st = c.prepare_cached(&format!(
@@ -1533,7 +1576,7 @@ fn fetch_hits(
         })?;
         for row in rows {
             let (seq, snip) = row?;
-            snippets.insert(seq, snip);
+            found.insert(seq, snip);
         }
     }
 
@@ -1542,9 +1585,11 @@ fn fetch_hits(
         .filter_map(|r| {
             let mut h = by_seq.remove(&r.seq)?;
             h.score = r.score;
-            h.snippet = snippets
-                .remove(&r.seq)
-                .unwrap_or_else(|| text_snippet(&h.text, needles));
+            if snippets {
+                h.snippet = found
+                    .remove(&r.seq)
+                    .unwrap_or_else(|| text_snippet(&h.text, needles));
+            }
             Some(h)
         })
         .collect())

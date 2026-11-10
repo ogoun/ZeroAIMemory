@@ -1390,6 +1390,12 @@ async fn prompt_idea_not_repeated_after_new_epoch() {
 /// `horizon_days = 0` — SQL `data.horizon` = сегодня UTC по часам сервера; на запрос — своя
 /// сессия, `prompt` повторяется до 5 новых подсказок-идей (эпоха не меняется); `w:<id>` →
 /// `idea:<key>`. Правило идей держит свой делитель 3, `recall.post_tool_coverage` не влияет.
+///
+/// Задача 16 M6 (спецификация §16): то же — после лёгкого поиска идей (каналы FTS до
+/// `max(4 × top_k, 20)`, без сниппетов) и стоп-основ идей. Запросы класса `stop_verb` набора
+/// (общие глаголы; эталон переснят бинарником тега) в эквивалентности не участвуют: M5.7 даёт по
+/// ним ложную подсказку, M6 молчит — это расхождение ожидаемое, считается и печатается отдельно
+/// (`ZAM_INFO m6`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idea_hints_top5_match_m57() {
     let root = repo();
@@ -1507,7 +1513,19 @@ async fn idea_hints_top5_match_m57() {
         keys.insert(format!("w:{id}"), format!("idea:{key}"));
     }
     assert_eq!(keys.len(), 50);
+    // классы запросов набора: `stop_verb` — вне проверки эквивалентности
+    let set: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("eval/idea-hints.toml")).unwrap())
+            .unwrap();
+    let stop_verb: std::collections::BTreeSet<&str> = set["query"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|q| q["class"].as_str() == Some("stop_verb"))
+        .map(|q| q["id"].as_str().unwrap())
+        .collect();
     let mut diffs = Vec::new();
+    let (mut compared, mut verb_fixed, mut verb_wrong) = (0, Vec::new(), Vec::new());
     for row in fx["rows"].as_array().unwrap() {
         let qid = row["id"].as_str().unwrap();
         let session = format!("idea-hints-{qid}");
@@ -1540,13 +1558,337 @@ async fn idea_hints_top5_match_m57() {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
+        if stop_verb.contains(qid) {
+            // запрос общих глаголов: у M5.7 — ложная подсказка (иначе ему место в `negative`)
+            assert!(
+                !want.is_empty(),
+                "{qid}: в эталоне M5.7 тишина — не stop_verb"
+            );
+            if got.is_empty() {
+                verb_fixed.push(format!("{qid} «{}»: M5.7 {want:?}", row["query"]));
+            } else {
+                verb_wrong.push(format!("{qid}: M6 {got:?}, M5.7 {want:?}"));
+            }
+            continue;
+        }
+        compared += 1;
         if got != want {
             diffs.push(format!("{qid}: M6 {got:?}, M5.7 {want:?}"));
         }
     }
+    eprintln!(
+        "ZAM_INFO m6 эквивалентность подсказок-идей с M5.7: сравнено {compared}, расхождений {}; \
+         запросов общих глаголов {} — ожидаемых расхождений (M6 молчит) {}:\n{}",
+        diffs.len(),
+        stop_verb.len(),
+        verb_fixed.len(),
+        verb_fixed.join("\n")
+    );
     assert!(
         diffs.is_empty(),
         "расхождения с эталоном M5.7:\n{}",
         diffs.join("\n")
     );
+    assert!(compared >= 40, "сравнено {compared}");
+    assert!(
+        verb_wrong.is_empty(),
+        "подсказка по общим глаголам:\n{}",
+        verb_wrong.join("\n")
+    );
+    assert!(
+        verb_fixed.len() >= 6,
+        "запросов общих глаголов {}",
+        verb_fixed.len()
+    );
+}
+
+// ---- M6, задача 16: долги M5.7 ----
+
+/// Идея человека в решении с телом `body`; id.
+async fn idea_body(a: &Api, title: &str, body: &str) -> String {
+    let r = a
+        .t(
+            Method::POST,
+            &sol(),
+            Some(json!({"kind": "idea", "title": title, "body": body,
+                        "data": {"origin": "human"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    r.json()["id"].as_str().unwrap().to_string()
+}
+
+/// M6 §16 (задача 16): стоп-основы общих глаголов — только для идей. Запрос, у которого с идеей
+/// общие лишь «добавь», «тест», «модуль», «файл» и подобные, подсказки не даёт (до правки каждая
+/// из восьми строк давала идею-приманку); пять запросов таблицы финального ревью M5.7 отвечают
+/// по-прежнему; положительные пары приманок не теряются.
+#[tokio::test]
+async fn idea_stop_verbs_negatives() {
+    let a = server("stop-verbs", |_| {}).await;
+    let pdf = idea(&a, &sol(), "Экспорт отчётов в PDF", json!({})).await;
+    let ru = idea_body(
+        &a,
+        "Добавить тесты на модуль оплаты",
+        "Сделать файл с функцией проверки платежа, исправить и обновить сценарии.",
+    )
+    .await;
+    let en = idea_body(
+        &a,
+        "Add tests for the payment module",
+        "Make a file with a fix function, update and change the scenarios.",
+    )
+    .await;
+    let mut wrong = Vec::new();
+    for (i, q) in [
+        "добавь тест на модуль авторизации",
+        "сделай тесты для файла конфигурации",
+        "обнови модуль и почини тесты сессий",
+        "добавь функцию в модуль логирования",
+        "поправь тесты модуля",
+        "сделай тест",
+        "add a test for the auth module",
+        "fix and update the changed test file",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let j = prompt(&a, &format!("neg{i}"), q).await;
+        let got = idea_items(&j);
+        if !got.is_empty() {
+            wrong.push(format!("«{q}»: {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "подсказка по общим глаголам (ru w:{ru}, en w:{en}):\n{}",
+        wrong.join("\n")
+    );
+    // таблица финального ревью M5.7 (журнал M5.7, I-1′): ответы прежние
+    for (i, (q, want)) in [
+        ("как сделать экспорт отчётов в PDF", true),
+        ("экспортировать отчёты в pdf", true),
+        (
+            "Пользователи просят, чтобы отчёты можно было скачать в PDF; посмотри модуль reports и \
+             предложи план, с чего начать",
+            true,
+        ),
+        ("настрой логирование сервера", false),
+        (
+            "Почини падающий тест миграции базы данных и обнови документацию по развёртыванию на \
+             стенде",
+            false,
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let j = prompt(&a, &format!("m57-{i}"), q).await;
+        let expect: Vec<String> = want.then(|| format!("w:{pdf}")).into_iter().collect();
+        assert_eq!(idea_items(&j), expect, "«{q}»: {j}");
+    }
+    // значимые слова приманок по-прежнему находят их
+    for (i, (q, id)) in [
+        ("тесты на модуль оплаты", &ru),
+        ("добавь проверку платежа в тесты оплаты", &ru),
+        ("tests for the payment module", &en),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let j = prompt(&a, &format!("pos{i}"), q).await;
+        assert_eq!(idea_items(&j), [format!("w:{id}")], "«{q}»: {j}");
+    }
+}
+
+/// M6 §16 (задача 16): второй проход (принятая идея со снятой задачей) пропускал строгий FTS без
+/// проверки слов — запрос из одних стоп-основ («почини тесты») находил идею «Починить тесты
+/// корзины». Запрос без значимых слов подсказки не даёт; со значимым словом — даёт.
+#[tokio::test]
+async fn idea_stop_verbs_second_pass() {
+    let a = server("stop-verbs-2", |_| {}).await;
+    let (id, task) = accepted(&a, "Починить тесты корзины", json!({})).await;
+    drop_task(&a, &task).await;
+    for (i, q) in ["почини тесты", "почини тест", "тесты"].iter().enumerate()
+    {
+        let j = prompt(&a, &format!("neg{i}"), q).await;
+        assert!(idea_items(&j).is_empty(), "«{q}»: {j}");
+    }
+    let j = prompt(&a, "pos", "почини тесты корзины").await;
+    assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
+}
+
+/// M6 §16 (задача 16): отдельный поиск идей к `prompt` — лёгкий: каналы FTS не длиннее
+/// `max(4 × ideas.prompt_top_k, 20)`, сниппеты не строятся (проба `test-hooks`); основной
+/// `POST /search` тем же запросом — прежний, со сниппетами.
+#[tokio::test]
+async fn prompt_ideas_use_light_search() {
+    use zam_server::api::search::{LightSearch, TEST_LIGHT_SEARCHES};
+    let a = server("light-search", |c| c.ideas.prompt_top_k = 8).await;
+    let mut ids = Vec::new();
+    for n in 0..40 {
+        ids.push(
+            idea(
+                &a,
+                &sol(),
+                &format!("Экспорт отчётов, вариант {n}"),
+                json!({}),
+            )
+            .await,
+        );
+    }
+    // запрос уникален для процесса тестов: пробы других тестов не мешают
+    let q = "экспорт отчётов лёгкийпоискпроба";
+    let j = prompt(&a, "s1", q).await;
+    let got = idea_items(&j);
+    assert_eq!(got.len(), 1, "{j}");
+    assert!(ids.iter().any(|id| got[0] == format!("w:{id}")), "{j}");
+    let probes: Vec<_> = TEST_LIGHT_SEARCHES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.query == q)
+        .cloned()
+        .collect();
+    assert_eq!(probes.len(), 1, "один лёгкий поиск на prompt: {probes:?}");
+    let p = &probes[0];
+    assert_eq!(
+        p.light,
+        LightSearch {
+            channel_depth: 32,
+            snippets: false
+        }
+    );
+    assert_eq!(p.bm25, 32, "канал bm25 урезан до глубины: {p:?}");
+    assert_eq!(p.with_snippet, 0, "{p:?}");
+    // обычный поиск идей тем же запросом — со сниппетами, пробы не оставляет
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({
+                "query": q,
+                "scope": {"solution": G},
+                "filters": {"kinds": ["idea"]},
+                "top_k": 50,
+                "format": "json",
+            })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let items = r.json()["items"].as_array().unwrap().clone();
+    assert!(!items.is_empty());
+    assert!(
+        items
+            .iter()
+            .all(|i| i["snippet"].as_str().is_some_and(|s| !s.is_empty())),
+        "{items:?}"
+    );
+    let n = TEST_LIGHT_SEARCHES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.query == q)
+        .count();
+    assert_eq!(n, 1);
+}
+
+/// Квантиль `q` отсортированной выборки (ближайший ранг).
+fn quantile(sorted: &[f64], q: f64) -> f64 {
+    let i = ((sorted.len() as f64) * q).ceil() as usize;
+    sorted[i.clamp(1, sorted.len()) - 1]
+}
+
+/// M6 §16 (задача 16), микрозамер для журнала: внутренний поиск идей к `prompt` на 50 идеях,
+/// подходящих ослабленному FTS (худший случай журнала M5.7: «Идея N: улучшить кэш»), тёплый
+/// кэш, по 200 вызовов лёгкого и обычного поиска **вперемешку** (выключатель `test-hooks`
+/// `TEST_IDEA_LIGHT_OFF`): оба — под одним фоном нагрузки машины. Цель — медиана лёгкого ≤ 4 мс в
+/// отладочной сборке (было 8). Печатает `ZAM_TIMING m6`; порога не проверяет — шум машины.
+/// Запускать одним тестом (фильтр по имени): выключатель общий для процесса тестов.
+#[tokio::test]
+#[ignore = "замер для журнала: ZAM_TIMING m6"]
+async fn inner_search_ideas_median() {
+    use std::sync::atomic::Ordering;
+    use zam_server::api::recall::{TEST_IDEA_LIGHT_OFF, TEST_IDEA_SEARCH_TIMES};
+    const CALLS: usize = 200;
+    const WARM: usize = 20;
+    let a = server("inner-median", |_| {}).await;
+    for n in 0..50 {
+        idea_body(
+            &a,
+            &format!("Идея {n}: улучшить кэш"),
+            "Замысел на будущее.",
+        )
+        .await;
+    }
+    let body = json!({"event": "prompt", "solution": G,
+                      "prompt": "как улучшить кэш и деплой, шаг 3"});
+    // один вызов `prompt` без сессии; ответ — та же идея в обоих режимах
+    let call = async |light: bool| -> (f64, String) {
+        TEST_IDEA_LIGHT_OFF.store(!light, Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        let j = ok(&a, None, body.clone()).await;
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let ids = idea_items(&j);
+        assert_eq!(ids.len(), 1, "{j}");
+        (ms, ids[0].clone())
+    };
+    for i in 0..WARM {
+        call(i % 2 == 0).await;
+    }
+    TEST_IDEA_SEARCH_TIMES.lock().unwrap().clear();
+    // [обычный, лёгкий]: время `/recall` целиком
+    let mut total: [Vec<f64>; 2] = Default::default();
+    for _ in 0..CALLS {
+        let (full_ms, full_id) = call(false).await;
+        let (light_ms, light_id) = call(true).await;
+        assert_eq!(light_id, full_id, "лёгкий поиск отвечает той же идеей");
+        total[0].push(full_ms);
+        total[1].push(light_ms);
+    }
+    TEST_IDEA_LIGHT_OFF.store(false, Ordering::Relaxed);
+    let samples = TEST_IDEA_SEARCH_TIMES.lock().unwrap().clone();
+    assert_eq!(samples.len(), 2 * CALLS, "один поиск идей на вызов");
+    // этапы поиска из его `timings`: каналы FTS, слияние и хиты, счётчик непроиндексированного;
+    // остаток внутреннего поиска — цели, разбор тела, упаковка, JSON ответа
+    let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
+    for (k, mode) in ["обычный", "лёгкий"].iter().enumerate() {
+        let of: Vec<&(Duration, Value)> = samples.iter().skip(k).step_by(2).collect();
+        rows.push((
+            format!("inner_search идей, {mode}"),
+            of.iter().map(|(d, _)| d.as_secs_f64() * 1e3).collect(),
+        ));
+        for key in ["fts_ms", "fuse_ms", "pending_ms", "total_ms"] {
+            rows.push((
+                format!("поиск идей, {mode}, {key}"),
+                of.iter()
+                    .map(|(_, t)| t[key].as_f64().unwrap_or_else(|| panic!("нет {key}: {t}")))
+                    .collect(),
+            ));
+        }
+        rows.push((format!("recall prompt, {mode}"), total[k].clone()));
+    }
+    // парная разность «обычный − лёгкий» соседних вызовов
+    let pair = |f: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..CALLS).map(f).collect() };
+    let inner_ms = |i: usize| samples[i].0.as_secs_f64() * 1e3;
+    rows.push((
+        "inner_search идей, обычный − лёгкий".into(),
+        pair(&|i| inner_ms(2 * i) - inner_ms(2 * i + 1)),
+    ));
+    rows.push((
+        "recall prompt, обычный − лёгкий".into(),
+        pair(&|i| total[0][i] - total[1][i]),
+    ));
+    for (name, v) in &mut rows {
+        v.sort_by(f64::total_cmp);
+        eprintln!(
+            "ZAM_TIMING m6 {name}: n={} min={:.2} p50={:.2} p95={:.2} max={:.2} мс \
+             (50 идей, debug={})",
+            v.len(),
+            v[0],
+            quantile(v, 0.5),
+            quantile(v, 0.95),
+            v[v.len() - 1],
+            cfg!(debug_assertions)
+        );
+    }
 }

@@ -1,9 +1,9 @@
 {
   "server_version": "0.0.10-m5.7",
   "server_git": "91363056d3ba",
-  "date": "2026-11-05",
+  "date": "2026-11-10",
   "ideas_blake3": "196ba783b6c8f633eb1601e4beb419c9b2b50cd0441bd7e92633f2b5f7b19477",
-  "queries_blake3": "0355c1397b992809350670622364db12bd1d76685cba8fad9b230331998b6b98",
+  "queries_blake3": "14bdf66ee3635985b6f350548d9bbc8d71ffe02d733ce1d9c95de6aaa9d2fbd6",
   "protocol": "FTS без моделей; решение 5e7a1e00-2026-4e3a-9a11-000000000e01; идеи — через API (by: human), horizon_days = 0 — SQL data.horizon = сегодня UTC; на запрос — своя сессия X-Zam-Session idea-hints-<id>, POST /recall {event: prompt} повторяется, пока приходят новые подсказки-идеи (items[].reason = idea), не больше 5; w:<id> → idea:<key>",
   "config": {
     "ideas.proactive": true,
@@ -440,6 +440,78 @@
       "ideas": [
         "idea:i33"
       ]
+    },
+    {
+      "id": "ih-68",
+      "query": "почини тест логина",
+      "ideas": [
+        "idea:i33"
+      ]
+    },
+    {
+      "id": "ih-69",
+      "query": "почини тест",
+      "ideas": [
+        "idea:i33"
+      ]
+    },
+    {
+      "id": "ih-70",
+      "query": "что нужно добавить",
+      "ideas": [
+        "idea:i05"
+      ]
+    },
+    {
+      "id": "ih-71",
+      "query": "обнови",
+      "ideas": [
+        "idea:i21"
+      ]
+    },
+    {
+      "id": "ih-72",
+      "query": "fix it",
+      "ideas": [
+        "idea:i48"
+      ]
+    },
+    {
+      "id": "ih-73",
+      "query": "update",
+      "ideas": [
+        "idea:i25",
+        "idea:i50"
+      ]
+    },
+    {
+      "id": "ih-74",
+      "query": "update testing docs",
+      "ideas": [
+        "idea:i50"
+      ]
+    },
+    {
+      "id": "ih-75",
+      "query": "add tests and update docs",
+      "ideas": [
+        "idea:i50"
+      ]
+    },
+    {
+      "id": "ih-76",
+      "query": "сделай это",
+      "ideas": []
+    },
+    {
+      "id": "ih-77",
+      "query": "добавь тесты",
+      "ideas": []
+    },
+    {
+      "id": "ih-78",
+      "query": "fix the test module",
+      "ideas": []
     }
   ]
 }

@@ -164,6 +164,28 @@ export const IDEA_STATUS_TEXT: Record<'new' | 'proposed' | 'accepted' | 'deferre
   done: 'выполнена',
 };
 
+/** Подпись статуса идеи; не статус идеи — как есть, `null` — пусто. */
+export const ideaStatusText = (s: EntryStatus | null): string =>
+  s && s in IDEA_STATUS_TEXT ? IDEA_STATUS_TEXT[s as keyof typeof IDEA_STATUS_TEXT] : (s ?? '');
+
+/** Вкладки журнала «Идеи» по происхождению (§10). */
+export type IdeaTab = 'human' | 'agent' | 'all';
+export const IDEA_TABS: { id: IdeaTab; title: string }[] = [
+  { id: 'human', title: 'Мои' },
+  { id: 'agent', title: 'От агента' },
+  { id: 'all', title: 'Все' },
+];
+
+/** Фильтр статуса журнала «Идеи»: подпись и статусы запроса (пусто — все). */
+export type IdeaStatusSel = 'active' | 'accepted' | 'done' | 'declined' | 'all';
+export const IDEA_STATUS_SEL: { id: IdeaStatusSel; title: string; statuses: EntryStatus[] }[] = [
+  { id: 'active', title: 'Активные', statuses: IDEA_ACTIVE },
+  { id: 'accepted', title: IDEA_STATUS_TEXT.accepted, statuses: ['accepted'] },
+  { id: 'done', title: IDEA_STATUS_TEXT.done, statuses: ['done'] },
+  { id: 'declined', title: IDEA_STATUS_TEXT.declined, statuses: ['declined'] },
+  { id: 'all', title: 'все', statuses: [] },
+];
+
 /** Дата `YYYY-MM-DD` по UTC через `days` дней от сегодняшней (сервер сравнивает `horizon` с
  * сегодняшней датой UTC: «отложить до» — не раньше завтрашней по UTC). */
 export const utcDate = (days: number, now = Date.now()): string =>
