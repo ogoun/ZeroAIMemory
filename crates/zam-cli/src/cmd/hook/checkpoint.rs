@@ -209,10 +209,8 @@ fn checkpoint_net(
                     return cache::flush_changed(env, c, session);
                 }
                 let _ = read_rx.recv_timeout(IMPACT_READ_WAIT);
-                // после ожидания — новым клиентом по остатку бюджета (повторное ревью, m4)
-                if let Some(fresh) = env.client() {
-                    cache::flush_changed(env, &fresh, session);
-                }
+                // после ожидания — тем же клиентом: его срок абсолютный, остаток бюджета хука
+                cache::flush_changed(env, c, session);
             })
         });
         // очередь учёта локального вывода (M4.5 §9.5)
@@ -260,13 +258,16 @@ fn checkpoint_net(
 /// выключенном в клиенте `recovery`): отдельный запрос, чтобы старый сервер
 /// (`deny_unknown_fields` тела) не потерял ничего другого. Молча — только 400 старого сервера
 /// про неизвестное поле `new_epoch` ([`old_server_epoch`]); прочее — в `hooks.log` с причиной:
-/// `sessions(new_epoch): HTTP <код>: …` (сервер ответил — эпохи нет) или `sessions(new_epoch):
-/// сеть: …` (сеть, срок запроса — сервер мог успеть её начать).
+/// `sessions(new_epoch): HTTP <код>: …` (сервер ответил — эпохи нет), `sessions(new_epoch):
+/// сеть: …` (сеть, срок запроса — сервер мог успеть её начать: снятый клиентом запрос он
+/// дообрабатывает и после выхода хука) или `sessions(new_epoch): бюджет исчерпан до запроса к
+/// серверу` (срок хука вышел до отправки — запроса не было, эпохи нет).
 pub fn new_epoch(env: &Env, client: &Client, session: &str) {
     let body = serde_json::json!({"id": session, "new_epoch": true});
     match client.post_json("/sessions", &body) {
         Ok(_) => {}
         Err(e) if old_server_epoch(&e) => {}
+        Err(e) if e.is_unsent() => env.log(&format!("sessions(new_epoch): {e}")),
         Err(e) => match e.http_status() {
             Some(code) => env.log(&format!("sessions(new_epoch): HTTP {code}: {e}")),
             None => env.log(&format!("sessions(new_epoch): сеть: {e}")),

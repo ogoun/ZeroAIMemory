@@ -756,20 +756,27 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
     env.http_left().filter(|d| *d >= cache::FLUSH_MIN_LEFT)?;
     let put = Duration::from_millis(put_ms());
     let mut client = env.client_within(put)?;
-    // фактический срок клиента — меньшее из своего срока `PUT` и остатка бюджета хука (у
-    // `checkpoint` остаток бывает меньше 60 мс): с ним и сравнивается опоздание. Остаток
-    // меряется **после** создания клиента (тот читает настройки подключения с диска и свой срок
-    // считает уже после них): `limit` не больше срока клиента, сетевой отказ по сроку всегда
-    // распознаётся как «срок PUT», сколько бы ни читались настройки. Бюджет вышел за время
-    // чтения настроек — запроса нет (срок 0 мс был бы ложной причиной «срок PUT 0 мс»)
-    let Some(left) = env.http_left() else {
-        return Some(Sent::Queued(format!(
+    // фактический срок запроса — остаток до абсолютного срока клиента (меньшее из своего срока
+    // `PUT` от создания клиента и срока HTTP хука; у `checkpoint` остаток бывает меньше 60 мс): с
+    // ним и сравнивается опоздание. Бюджет вышел за время чтения настроек подключения — запроса
+    // нет (срок 0 мс был бы ложной причиной «срок PUT 0 мс»)
+    let spent = || {
+        Sent::Queued(format!(
             "{} (прошло {} мс)",
             zam_core::HOOK_BUDGET_SPENT,
             env.started.elapsed().as_millis()
-        )));
+        ))
     };
-    let limit = left.min(put);
+    let Some(left) = client
+        .deadline_left()
+        .filter(|d| *d >= crate::client::DEADLINE_MIN)
+    else {
+        return Some(spent());
+    };
+    // для строки журнала — целые мс вверх: свой срок 60 мс, от которого до этой строки прошли
+    // микросекунды, — это «срок PUT 60 мс», а не 59
+    let limit =
+        Duration::from_millis(u64::try_from(left.as_micros().div_ceil(1000)).unwrap_or(u64::MAX));
     client.set_session(Some(item.session.clone()));
     let path = format!("/sessions/{}/snapshot", encode_segment(&item.session));
     let body = serde_json::to_vec(&item.body).ok()?;
@@ -791,6 +798,7 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
         let outcome = match &res {
             Ok(r) => format!("ответ получен (HTTP {})", r.status().as_u16()),
             Err(e) if timed_out(e) => late_why.clone(),
+            Err(e) if e.is_unsent() => e.to_string(),
             Err(e) if e.http_status().is_some() => format!("ответ получен ({})", short(e)),
             Err(e) => format!("сеть: {}", short(e)),
         };
@@ -842,6 +850,8 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
             ))
         }
         Err(e) if timed_out(&e) => Sent::Queued(late_why),
+        // срок вышел между замером остатка и отправкой — запрос не начат
+        Err(e) if e.is_unsent() => spent(),
         Err(e) => Sent::Queued(short(&e)),
     })
 }

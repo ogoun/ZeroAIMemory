@@ -226,6 +226,7 @@ pub fn maybe_spawn_sync(env: &Env, s: &Settings) -> bool {
         ));
         return false;
     }
+    let spawned = t0.elapsed();
     let a = Attempt { at: now, head };
     if let Err(e) = serde_json::to_vec(&a)
         .map_err(std::io::Error::other)
@@ -233,10 +234,19 @@ pub fn maybe_spawn_sync(env: &Env, s: &Settings) -> bool {
     {
         env.log(&format!("карта кода: code-auto.json: {e}"));
     }
+    // время — по частям: проверки, создание процесса и отметка запуска `code-auto.json`.
+    // Редкие десятки мс здесь — отметка: создание временного файла на занятом диске (замер
+    // 17b-http M6: создание процесса — p95 3 мс, «горб» 45–120 мс — у записи файла и без запуска
+    // процесса), а не `CreateProcess`
+    let total = t0.elapsed();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     env.log(&format!(
-        "карта кода: фоновая синхронизация карты запущена за {:.2} мс (проверки {:.2} мс)",
-        t0.elapsed().as_secs_f64() * 1000.0,
-        checks.as_secs_f64() * 1000.0
+        "карта кода: фоновая синхронизация карты запущена за {:.2} мс (проверки {:.2} мс, процесс \
+         {:.2} мс, отметка {:.2} мс)",
+        ms(total),
+        ms(checks),
+        ms(spawned.saturating_sub(checks)),
+        ms(total.saturating_sub(spawned))
     ));
     true
 }
