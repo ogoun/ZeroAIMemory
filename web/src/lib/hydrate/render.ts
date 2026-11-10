@@ -25,9 +25,13 @@ export interface HydrateOpts {
  * Результат: `false` — не загрузился модуль формул или диаграмм.
  */
 export async function hydrateRendered(el: HTMLElement, o: HydrateOpts): Promise<boolean> {
-  hydrateDom(el);
-  rewriteLinks(el, o.wiki, o.self);
-  o.links?.(el);
+  // проход по ссылкам отчёта — первым: его не отменит сбой остального оживления (и наоборот)
+  try {
+    o.links?.(el);
+  } finally {
+    hydrateDom(el);
+    rewriteLinks(el, o.wiki, o.self);
+  }
   const jobs: Promise<void>[] = [];
   if (el.querySelector('.math')) {
     jobs.push(import('./katex').then((m) => (o.alive() ? m.renderMath(el) : undefined)));

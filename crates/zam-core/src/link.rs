@@ -1,10 +1,20 @@
-//! Схемы URL ссылок отчёта (M6 §16 п. 15, долг M5.5): одно правило у клиента `zam report`
-//! (проверка до отправки), сервера (ссылки тела и рендер страницы) и WebUI
-//! (`web/src/lib/reportLinks.ts` — та же функция на TypeScript). Согласие трёх мест держит общий
-//! набор примеров `tests/fixtures/link_schemes.json`: его читают тест этого модуля и тест WebUI.
+//! Ссылки отчёта (M6 §16 п. 15, долг M5.5): какие схемы допустимы в теле и по каким адресам
+//! разрешён переход. Тело отчёта пишет агент — содержимое недоверенное.
 //!
-//! Тело отчёта пишет агент — содержимое недоверенное. Разрешён только список
-//! [`REPORT_LINK_SCHEMES`]; всё прочее (`javascript:`, `data:`, `ftp:` …) — отказ.
+//! Два правила, оба — здесь:
+//! - **схема допустима** ([`REPORT_LINK_SCHEMES`], [`report_scheme_allowed`]) — её проверяют
+//!   `zam report` до отправки и сервер при записи; прочее (`javascript:`, `data:`, `ftp:` …) —
+//!   отказ;
+//! - **по ссылке можно перейти** ([`report_link_clickable`]) — `href` в HTML страницы отчёта
+//!   сервер пишет только таким ссылкам: `http`, `https`, `mailto` и `vscode://file/<путь>`.
+//!   `file:` и прочие адреса `vscode:` (команды расширений редактора, сетевой путь) допустимы в
+//!   теле, но в HTML остаются без `href` — адрес уходит в `data-url` (текст, кнопка «копировать
+//!   путь» в WebUI). WebUI (`web/src/lib/reportLinks.ts`) повторяет обе проверки второй линией.
+//!
+//! Согласие Rust и TypeScript держит общий набор `tests/fixtures/link_schemes.json` (схема,
+//! допустимость, кликабельность): его читают тест этого модуля и тест WebUI; разбор схемы
+//! дополнительно сверяется с разборщиком URL на случайных строках (`zam-markdown`,
+//! `tests/link_scheme_fuzz.rs`; в WebUI — с `new URL()`).
 
 /// Схемы внешних ссылок отчёта (ответ владельца по M5.5, п. 1). `vscode:` и `file:` — только
 /// у ссылок (не у картинок): WebUI даёт им кнопку «копировать путь», `file:` — без перехода.
@@ -40,6 +50,45 @@ pub fn report_scheme_allowed(scheme: &str) -> bool {
     REPORT_LINK_SCHEMES.contains(&scheme)
 }
 
+/// Адрес без того, что отбрасывает браузер: края до U+0020 включительно, TAB/LF/CR — везде.
+fn clean(target: &str) -> String {
+    target
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect()
+}
+
+/// По ссылке отчёта разрешён переход (ей пишется `href`):
+/// - схемы нет (относительная ссылка, якорь, `//host`) — да;
+/// - `http`, `https`, `mailto` — да;
+/// - `vscode:` — только `vscode://file/<путь>`: имя схемы без учёта регистра, `//file/` —
+///   буквально, путь непуст и не начинается с `/`, `\`, `%2F`, `%5C` (сетевой путь
+///   `vscode://file//сервер/ресурс` редактор открыл бы по сети). Прочие адреса `vscode:` —
+///   команды расширений (`vscode://vscode.git/clone?url=…`), из недоверенного отчёта не
+///   запускаются;
+/// - `file:` — нет: браузер с http(s)-страницы его не откроет, а `file://сервер/…` — сетевой путь;
+/// - прочие схемы — нет (они и в тело не принимаются).
+pub fn report_link_clickable(target: &str) -> bool {
+    let t = clean(target);
+    match url_scheme(&t).as_deref() {
+        None | Some("http" | "https" | "mailto") => true,
+        Some("vscode") => {
+            // схема — 6 символов ASCII, за ней `:`
+            let Some(path) = t[7..].strip_prefix("//file/") else {
+                return false;
+            };
+            let p = path.to_ascii_lowercase();
+            !(p.is_empty()
+                || p.starts_with('/')
+                || p.starts_with('\\')
+                || p.starts_with("%2f")
+                || p.starts_with("%5c"))
+        }
+        Some(_) => false,
+    }
+}
+
 /// Перечень разрешённых схем для сообщений об ошибке: `http, https, mailto, vscode, file`.
 pub fn report_schemes_text() -> String {
     REPORT_LINK_SCHEMES.join(", ")
@@ -71,7 +120,7 @@ mod tests {
     fn url_scheme_shared_vectors() {
         let v: serde_json::Value = serde_json::from_str(VECTORS).unwrap();
         let cases = v.as_array().unwrap();
-        assert!(cases.len() >= 50, "{}", cases.len());
+        assert!(cases.len() >= 80, "{}", cases.len());
         let mut allowed = 0;
         for c in cases {
             let t = c["t"].as_str().unwrap();
@@ -82,6 +131,32 @@ mod tests {
             allowed += usize::from(ok);
         }
         assert!(allowed >= 10, "{allowed}");
+    }
+
+    /// Кликабельность — по общему набору; всё кликабельное со схемой — допустимая схема.
+    #[test]
+    fn report_link_clickable_shared_vectors() {
+        let v: serde_json::Value = serde_json::from_str(VECTORS).unwrap();
+        let (mut yes, mut no) = (0, 0);
+        for c in v.as_array().unwrap() {
+            let t = c["t"].as_str().unwrap();
+            let click = report_link_clickable(t);
+            assert_eq!(click, c["click"].as_bool().unwrap(), "{t:?}");
+            if let Some(s) = url_scheme(t) {
+                assert!(!click || report_scheme_allowed(&s), "{t:?}");
+                assert!(!click || s != "file", "{t:?}");
+            }
+            if click { yes += 1 } else { no += 1 }
+        }
+        assert!(yes >= 30 && no >= 30, "{yes}/{no}");
+        // адрес в сотню килобайт — линейно и без паники
+        let long = format!("http://example.org/{}", "a".repeat(100_000));
+        assert!(report_link_clickable(&long));
+        let long = format!("{}:x", "a".repeat(100_000));
+        assert_eq!(url_scheme(&long).map(|s| s.len()), Some(100_000));
+        assert!(!report_link_clickable(&long));
+        let long = format!("vscode://file/{}", "a/".repeat(50_000));
+        assert!(report_link_clickable(&long));
     }
 
     /// Обходы регистром, пробелами и управляющими символами дают схему `javascript`, а не

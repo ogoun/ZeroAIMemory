@@ -7,6 +7,7 @@ import { expect, test, type Browser, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import {
+  LINK_FILE,
   LINK_FILE_AUTO,
   LINK_FILE_PATH,
   LINK_HTTPS,
@@ -359,9 +360,19 @@ test('report_links_rel_copy_path_file_no_navigation', async ({ page, context }) 
   await expect(codeBtn).toHaveText('копировать путь');
   await expect(codeBtn).toHaveAttribute('data-copy-path', LINK_VSCODE_PATH);
 
+  // первая линия — сервер: в HTML страницы у `file:` нет `href` вовсе, адрес — в `data-url`
+  // (ревью 15a, I-1); `href` со схемой `vscode:` — только `vscode://file/…`
+  const served = await page.request.get(`${base()}api/v1/entries/${env('E2E_REPORT_PRINT')}?format=html`);
+  const { html } = (await served.json()) as { html: string };
+  expect(html).not.toMatch(/href="file:/i);
+  expect(html).toContain(`data-url="${LINK_FILE}"`);
+  expect(html).toContain(`data-url="${LINK_FILE_AUTO}"`);
+  expect(html).toContain(`href="${LINK_VSCODE}" rel="noopener noreferrer"`);
+
   // file: — без href: клик никуда не ведёт, новых вкладок нет
   const data = link('данные');
   await expect(data).not.toHaveAttribute('href');
+  await expect(data).toHaveAttribute('data-url', LINK_FILE);
   await expect(data).toHaveClass(/local-link/);
   await expect(data).toHaveAttribute('title', LINK_FILE_PATH);
   const url = page.url();
@@ -447,6 +458,8 @@ test('report_links_hostile_schemes_no_href_in_webui', async ({ page }) => {
   await expect(links.nth(hostile.length)).toHaveAttribute('href', safe[0]);
   await expect(links.nth(hostile.length + 1)).toHaveAttribute('rel', 'noopener noreferrer');
   await expect(links.nth(hostile.length + 2)).toHaveAttribute('href', safe[2]);
+  // кнопка «копировать путь» — только у `vscode://file/…`; у команд `vscode:` её нет
+  await expect(page.locator('article.report .doc p.hostile button.copy-path')).toHaveCount(1);
   await page.waitForTimeout(200);
   expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).__zamLinkPwned)).toBeUndefined();
   await expect(page.locator(`article.report[data-report="${id}"] .doc`)).toBeVisible();

@@ -113,8 +113,8 @@
 }
 /* на бумаге и в PDF у `file:` и `vscode:` виден сам адрес */
 @media print {
-  .doc a[data-url]::after {
-    content: ' (' attr(data-url) ')';
+  .doc a[data-print]::after {
+    content: ' (' attr(data-print) ')';
     overflow-wrap: anywhere;
   }
 }

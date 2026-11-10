@@ -1552,18 +1552,35 @@ async fn report_preview_token_404() {
             .await;
     assert_status(&r, StatusCode::OK, "администратор ?user=");
 
-    // токен: тот же ответ, что у несуществующего sha
+    // токен: тот же ответ, что у несуществующего sha, — статус, тело и заголовки (кроме даты и
+    // номера запроса: они свои у каждого ответа)
     let shape = |r: &Resp| {
         let j = r.json();
+        let mut headers: Vec<(String, String)> = r
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    v.to_str().unwrap_or("?").to_string(),
+                )
+            })
+            .filter(|(k, _)| k != "date" && !k.contains("request-id"))
+            .collect();
+        headers.sort();
         (
             r.status,
             j["type"].clone(),
             j["title"].clone(),
             j["detail"].clone(),
+            r.body.len(),
+            headers,
         )
     };
     let none = w.a.tok(&w.o.tok, Method::GET, &missing, None).await;
     assert_status(&none, StatusCode::NOT_FOUND, "несуществующий sha");
+    // сравнение заголовков содержательно: они в ответе есть
+    assert!(shape(&none).5.iter().any(|(k, _)| k == "content-type"));
     let ro_tok = w.a.issue(&w.o.id, "ro").await;
     for (who, tok) in [
         ("токен владельца", &w.o.tok),

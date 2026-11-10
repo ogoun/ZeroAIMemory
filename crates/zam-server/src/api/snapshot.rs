@@ -731,6 +731,25 @@ fn summary_block(text: &str, cap: usize) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Список снимка — свой (он оставляет ZWJ/ZWNJ и селекторы эмодзи: текст снимка читает
+    /// человек), но не шире общего `zam_core::text::INVISIBLE_RANGES`: всё невидимое, что
+    /// вырезает снимок, считают невидимым санитайзер и «копировать путь» (ревью 15a, Minor 1).
+    #[test]
+    fn hidden_is_subset_of_shared_invisible_ranges() {
+        let mut hidden = 0;
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            if is_hidden(c) && !c.is_control() {
+                hidden += 1;
+                assert!(zam_core::text::is_invisible(c), "U+{:04X}", c as u32);
+            }
+        }
+        assert!(hidden > 400, "{hidden}");
+        // чем списки различаются намеренно
+        for c in ['\u{200C}', '\u{200D}', '\u{FE0F}', '\u{3164}'] {
+            assert!(!is_hidden(c) && zam_core::text::is_invisible(c), "{c:?}");
+        }
+    }
+
     fn snap(data: SnapshotData) -> SnapshotRow {
         SnapshotRow {
             session_id: "s".into(),

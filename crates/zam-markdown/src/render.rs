@@ -76,11 +76,14 @@ pub fn render_html(src: &str, resolver: &dyn Resolver) -> Rendered {
     render(src, resolver, false)
 }
 
-/// Рендерит тело отчёта (M6 §16 п. 15): как [`render_html`], но ссылкам разрешены схемы
-/// [`zam_core::REPORT_LINK_SCHEMES`] — к `http`, `https`, `mailto` добавлены `vscode:` и `file:`
-/// (только у ссылок, не у картинок), и каждая ссылка со схемой или `//host` получает
-/// `rel="noopener noreferrer"`. Ссылка с иной схемой остаётся без `href`. HTML заметок этот
-/// рендер не меняет: [`RENDER_VERSION`] прежняя.
+/// Рендерит тело отчёта (M6 §16 п. 15): как [`render_html`], но ссылкам (не картинкам)
+/// разрешены схемы [`zam_core::REPORT_LINK_SCHEMES`] — к `http`, `https`, `mailto` добавлены
+/// `vscode:` и `file:`. `href` получает только ссылка, по которой разрешён переход
+/// ([`zam_core::link::report_link_clickable`]: `http`, `https`, `mailto`, `vscode://file/…`), и
+/// каждая такая ссылка со схемой или `//host` — `rel="noopener noreferrer"`. Ссылке `file:` и
+/// прочим `vscode:` вместо `href` пишется `data-url` с адресом: перехода из HTML нет, что бы ни
+/// делал потребитель страницы. Ссылка с иной схемой остаётся без обоих атрибутов. HTML заметок
+/// этот рендер не меняет: [`RENDER_VERSION`] прежняя.
 pub fn render_report_html(src: &str, resolver: &dyn Resolver) -> Rendered {
     render(src, resolver, true)
 }
@@ -749,18 +752,25 @@ fn link<'a>(
     }
     ctx.write_str("<a")?;
     render_sourcepos(ctx, node)?;
-    // отчёт: схема — по общему списку (comrak считает `file:` опасной и `href` не пишет)
+    // отчёт: схема — по общему списку; `href` — только ссылке с разрешённым переходом,
+    // `file:` и прочим `vscode:` — адрес в `data-url`, иной схеме — ничего
     let scheme = if ctx.user.report {
         zam_core::link::url_scheme(&l.url)
     } else {
         None
     };
+    let mut clickable = false;
     match &scheme {
-        Some(s) => {
+        Some(s) if !zam_core::link::report_scheme_allowed(s) => {}
+        Some(_) if zam_core::link::report_link_clickable(&l.url) => {
+            clickable = true;
             ctx.write_str(" href=\"")?;
-            if zam_core::link::report_scheme_allowed(s) {
-                ctx.escape_href(&l.url)?;
-            }
+            ctx.escape_href(&l.url)?;
+            ctx.write_str("\"")?;
+        }
+        Some(_) => {
+            ctx.write_str(" data-url=\"")?;
+            ctx.escape(&l.url)?;
             ctx.write_str("\"")?;
         }
         None => write_href(ctx, &l.url)?,
@@ -770,7 +780,7 @@ fn link<'a>(
         ctx.escape(&l.title)?;
         ctx.write_str("\"")?;
     }
-    if scheme.is_some() || is_external(&l.url) {
+    if clickable || (scheme.is_none() && is_external(&l.url)) {
         write!(ctx, " rel=\"{EXTERNAL_REL}\"")?;
     }
     ctx.write_str(">")

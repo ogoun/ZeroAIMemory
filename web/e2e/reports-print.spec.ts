@@ -338,7 +338,7 @@ test('print_button_pdf_print_with_hint', async ({ page }) => {
   // Ctrl+P без кнопки печатает страницу отчёта: у `file:` виден адрес (`::after`), кнопок
   // «копировать путь» на бумаге нет
   const fileLink = page.locator('article.report .doc a', { hasText: /^данные$/ });
-  await expect(fileLink).toHaveAttribute('data-url', LINK_FILE);
+  await expect(fileLink).toHaveAttribute('data-print', LINK_FILE);
   expect(await fileLink.evaluate((a) => getComputedStyle(a, '::after').content)).not.toBe('none');
   await expect(page.locator('article.report .doc button.copy-path').first()).toBeHidden();
   await page.emulateMedia({ media: null });
@@ -352,12 +352,12 @@ test('print_shows_link_address_for_vscode_and_file', async ({ page }) => {
   await printed(page);
   await page.emulateMedia({ media: 'print' });
   const root = page.locator('.print-root');
-  // адрес дописывает `::after` из `data-url` (значение `content` движок может отдать и как
-  // строку, и как `attr(data-url)` — сам текст проверяется ниже по PDF)
+  // адрес дописывает `::after` из `data-print` (значение `content` движок может отдать и как
+  // строку, и как `attr(data-print)` — сам текст проверяется ниже по PDF)
   const after = (scope: typeof root, text: string | RegExp) =>
     scope
       .locator('a', { hasText: typeof text === 'string' ? new RegExp(`^${text}$`) : text })
-      .evaluate((a) => ({ url: a.getAttribute('data-url'), content: getComputedStyle(a, '::after').content }));
+      .evaluate((a) => ({ url: a.getAttribute('data-print'), content: getComputedStyle(a, '::after').content }));
   const code = await after(root, 'код');
   expect(code.url).toBe(LINK_VSCODE);
   expect(code.content).not.toBe('none');
@@ -371,10 +371,10 @@ test('print_shows_link_address_for_vscode_and_file', async ({ page }) => {
   await expect(root.locator('a[href^="file:" i]')).toHaveCount(0);
   await expect(root.locator('button')).toHaveCount(0);
   await expect(root.locator('a', { hasText: /^сайт$/ })).toHaveAttribute('href', LINK_HTTPS);
-  // страница отчёта несёт тот же `data-url` (Ctrl+P без кнопки — print_button_pdf_print_with_hint)
+  // страница отчёта несёт тот же `data-print` (Ctrl+P без кнопки — print_button_pdf_print_with_hint)
   const screen = await page
     .locator('article.report .doc a', { hasText: /^данные$/ })
-    .evaluate((a) => ({ url: a.getAttribute('data-url'), content: getComputedStyle(a, '::after').content }));
+    .evaluate((a) => ({ url: a.getAttribute('data-print'), content: getComputedStyle(a, '::after').content }));
   expect(screen.url).toBe(LINK_FILE);
   // на экране адрес не дописывается
   await page.emulateMedia({ media: 'screen' });

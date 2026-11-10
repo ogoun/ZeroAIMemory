@@ -529,8 +529,9 @@ async fn report_feed_thumb_url_raster_only_and_admin_user() {
     ok(&r, StatusCode::OK, "миниатюра администратору по ?user=");
 }
 
-/// M6, задача 15a (§16 п. 15): страница отчёта — ссылки пяти схем с `href`, всем внешним —
-/// `rel="noopener noreferrer"`; сырой HTML тела проверкой ссылок не виден, но и рендер его
+/// M6, задача 15a (§16 п. 15; ревью, I-1): страница отчёта — `href` и `rel="noopener
+/// noreferrer"` у `http`, `https`, `mailto` и `vscode://file/…`; у `file:` и прочих `vscode:`
+/// `href` нет — адрес в `data-url` (перехода из HTML нет, что бы ни делал потребитель); сырой HTML тела проверкой ссылок не виден, но и рендер его
 /// не пропускает (ни ссылок, ни картинок из него на странице нет; санитайзер отчёта отдельно
 /// проверен в `zam-markdown`); у заметки `vscode:`/`file:` по-прежнему без `href`.
 #[tokio::test]
@@ -538,7 +539,9 @@ async fn report_html_link_schemes_rel_and_raw_html() {
     let w = world("html-links").await;
     let body = "# Ссылки\n\n[h](https://example.org/a) [p](http://example.org) \
         [m](mailto:a@example.org) [v](vscode://file/C:/proj/src/main.rs:10:5) \
-        [f](file:///C:/data/report.csv) <file:///etc/hosts> [я](#ссылки)\n\n\
+        [f](file:///C:/data/report.csv) <file:///etc/hosts> [я](#ссылки) \
+        [c](vscode://vscode.git/clone?url=x) [u](file://attacker.example/share/x.txt) \
+        [e](vscode:extension/a.b) [n](vscode://file//server/share/a.rs)\n\n\
         <a href=\"javascript:alert(1)\">j</a> <a href=\"JaVaScRiPt:alert(2)\">J</a> \
         <a href=\"java&#9;script:alert(3)\">t</a> <a href=\" javascript:alert(4)\">s</a> \
         <a href=\"ftp://example.org/x\">ftp</a> <a href=\"data:text/html,x\">d</a> \
@@ -562,12 +565,28 @@ async fn report_html_link_schemes_rel_and_raw_html() {
         "http://example.org",
         "mailto:a@example.org",
         "vscode://file/C:/proj/src/main.rs:10:5",
-        "file:///C:/data/report.csv",
-        "file:///etc/hosts",
     ] {
         let a = format!("href=\"{url}\" {REL}");
         assert!(html.contains(&a), "{a} в {html}");
     }
+    // без перехода: адрес — в data-url, href и rel нет
+    for url in [
+        "file:///C:/data/report.csv",
+        "file:///etc/hosts",
+        "vscode://vscode.git/clone?url=x",
+        "file://attacker.example/share/x.txt",
+        "vscode:extension/a.b",
+        "vscode://file//server/share/a.rs",
+    ] {
+        assert!(
+            html.contains(&format!("data-url=\"{url}\">")),
+            "{url} в {html}"
+        );
+        assert!(!html.contains(&format!("href=\"{url}\"")), "{url} в {html}");
+    }
+    assert!(!html.contains("href=\"file:"), "{html}");
+    assert_eq!(html.matches("href=\"vscode:").count(), 1, "{html}");
+    assert_eq!(html.matches(REL).count(), 4, "{html}");
     // якорь — не внешняя ссылка
     assert!(!html.contains(&format!("\" {REL}>я<")), "{html}");
     // сырой HTML тела рендер не пропускает вовсе: ни ссылок, ни картинок, ни схем из него нет
