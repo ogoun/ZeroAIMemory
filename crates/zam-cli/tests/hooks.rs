@@ -5797,11 +5797,11 @@ fn late_post_compact_not_counted() {
     assert_eq!(got[1].1["trigger"], "session_start_compact");
 }
 
-/// Третье ревью 17b, Minor 1: срок `PUT` — фактический срок клиента (меньшее из своего срока и
-/// остатка бюджета хука); причина «срок PUT N мс» — с ним, а не с константой.
-#[test]
-fn put_timeout_reason_uses_actual_limit() {
-    let _g = serial();
+/// `PreCompact` с бюджетом хука 1,5 с и своим сроком `PUT` 10 с против заглушки, отвечающей на
+/// `PUT` через 3 с: фактический срок `PUT` — остаток бюджета. `log_stall_ms` — подмена
+/// `<журнал>.log-stall-ms`: поток снимка засыпает между концом `PUT` и строкой итога. Возвращает
+/// `hooks.log`, время хука и наличие очереди снимка.
+fn put_limit_case(name: &str, log_stall_ms: Option<u64>) -> (String, Duration, bool) {
     let (url, _seen) = common::stub_body(std::sync::Arc::new(
         |m: &str, path: &str, _: usize, _: &Value| {
             if m == "PUT" && path.ends_with("/snapshot") {
@@ -5811,31 +5811,70 @@ fn put_timeout_reason_uses_actual_limit() {
             }
         },
     ));
-    let p = Proj::new("snap-put-limit", &url, "zam_x");
+    let p = Proj::new(name, &url, "zam_x");
     let s = "pl-1";
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
+    if let Some(ms) = log_stall_ms {
+        std::fs::write(format!("{}.log-stall-ms", t.display()), ms.to_string()).unwrap();
+    }
     let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
     // свой срок `PUT` больше остатка бюджета: фактический срок — остаток (< 1500 мс)
-    let o = p
-        .cmd(&url)
-        .env("ZAM_TEST_HOOK_BUDGET_MS", "1500")
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_HOOK_BUDGET_MS", "1500")
         .env("ZAM_TEST_SNAPSHOT_MS", "5000")
         .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
         .args(["hook", "checkpoint", "--agent", "claude"])
-        .write_stdin(pc.to_string().into_bytes())
-        .output()
-        .unwrap();
+        .write_stdin(pc.to_string().into_bytes());
+    let t0 = Instant::now();
+    let o = c.output().unwrap();
+    let d = t0.elapsed();
     empty(&o);
-    let log = p.log();
-    let n: u64 = log
-        .split("срок PUT ")
+    (p.log(), d, snap_file(&p, "snapq", s).is_some())
+}
+
+/// Срок из единственной строки «срок PUT N мс» журнала хуков.
+fn put_limit_logged(log: &str) -> u64 {
+    assert_eq!(
+        log.matches("срок PUT ").count(),
+        1,
+        "строка «срок PUT» — ровно одна: {log:?}"
+    );
+    log.split("срок PUT ")
         .nth(1)
         .and_then(|r| r.split_whitespace().next())
         .and_then(|x| x.parse().ok())
-        .unwrap_or_else(|| panic!("нет причины «срок PUT»: {log}"));
+        .unwrap_or_else(|| panic!("срок PUT не число: {log}"))
+}
+
+/// Третье ревью 17b, Minor 1: срок `PUT` — фактический срок клиента (меньшее из своего срока и
+/// остатка бюджета хука); причина «срок PUT N мс» — с ним, а не с константой.
+#[test]
+fn put_timeout_reason_uses_actual_limit() {
+    let _g = serial();
+    let (log, _, queued) = put_limit_case("snap-put-limit", None);
+    let n = put_limit_logged(&log);
     assert!(n < 1500, "срок {n} мс — не фактический: {log}");
-    assert!(snap_file(&p, "snapq", s).is_some());
+    assert!(queued, "{log}");
+}
+
+/// CI ubuntu (77063ec): срок `PUT` истекает за `HTTP_RESERVE_MS` (30 мс) до конца бюджета, и
+/// поток снимка может не успеть записать итог до выхода хука — строка терялась. Подмена
+/// `log-stall-ms` держит поток 2 с между концом `PUT` и записью итога: причина «срок PUT N мс»
+/// всё равно в `hooks.log` (её пишет сам хук), ровно одна, снимок в очереди, хук в бюджете.
+#[test]
+fn put_outcome_logged_when_snapshot_thread_is_late() {
+    let _g = serial();
+    // прогрев: первый запуск процесса после сборки не меряется
+    let _ = put_limit_case("snap-put-late-warm", Some(2000));
+    let (log, d, queued) = put_limit_case("snap-put-late-log", Some(2000));
+    let n = put_limit_logged(&log);
+    assert!(n < 1500, "срок {n} мс — не фактический: {log}");
+    assert!(queued, "{log}");
+    assert!(
+        d <= Duration::from_millis(1500 + 300),
+        "запись итога увела хук за бюджет: {d:?}"
+    );
 }
 
 /// Повторное ревью 17b (`prompt_flushes_changed_queue`): решение о снимке и снимок — вне пути
