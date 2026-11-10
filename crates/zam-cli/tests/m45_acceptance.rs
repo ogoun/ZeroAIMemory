@@ -450,9 +450,13 @@ impl Proj {
             .unwrap()
     }
 
-    /// `zam hook <kind> --agent <agent>` с событием на stdin.
+    /// `zam hook <kind> --agent <agent>` с событием на stdin, со
+    /// щедрым бюджетом (`ZAM_TEST_HOOK_BUDGET_MS`): критерий приёмки — содержимое, а с бюджетом
+    /// продукта отладочная сборка на занятой машине молчит (fail-open); время и бюджеты проверяют
+    /// `hooks` и release `hook_budgets` (ревью 17b-http M6).
     fn hook_as(&self, agent: &str, kind: &str, v: &Value) -> Output {
         self.cmd()
+            .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
             .args(["hook", kind, "--agent", agent])
             .write_stdin(v.to_string().into_bytes())
             .output()

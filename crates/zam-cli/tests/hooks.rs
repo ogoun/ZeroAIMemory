@@ -881,6 +881,12 @@ fn binding_session(p: &Proj) -> Option<String> {
 /// Ревью задачи 5, I-1: уборка большого кэша (`gc_cache` тысяч просроченных файлов) идёт после
 /// записи привязки и не задерживает её: после выхода хука привязка — новой сессии, хук не
 /// ждёт уборку дольше бюджета.
+///
+/// Две части (ревью 17b-http). Настоящая уборка 3000 файлов: привязка — новой сессии, бюджет
+/// запросов цел; время одиночного замера не сверяется — на занятом HDD уборка и записи хука
+/// делят один каталог, и хук выходил на 1,6–3,4 с без всякого ожидания уборки. Суть — подменой
+/// `ZAM_TEST_GC_STALL_MS`: уборка «идёт» 30 с, а привязка записана (значит, до уборки), и хук
+/// вышел на порядок раньше её конца (значит, не ждал).
 #[test]
 fn session_start_big_cache_gc_does_not_delay_binding() {
     let _g = serial();
@@ -903,12 +909,31 @@ fn session_start_big_cache_gc_does_not_delay_binding() {
     // прогрев: первый запуск нового бинарника на Windows проверяет антивирус
     p.zam(&["--version"], b"");
     let ev = p.ev("SessionStart", "ss-big", json!({"source": "startup"}));
-    let (o, took) = p.hook_at(&url, "session-start", "claude", ev.to_string().as_bytes());
+    let (o, _) = p.hook_at(&url, "session-start", "claude", ev.to_string().as_bytes());
     assert!(o.status.success());
     assert_eq!(binding_session(&p).as_deref(), Some("ss-big"));
-    assert!(took < max_for("session-start"), "{took:?}");
     let log = p.log();
     assert!(!log.contains(zam_core::HOOK_BUDGET_SPENT), "{log}");
+    // уборка занята 30 с: привязка новой сессии того же агента (`clear`) уже записана, хук
+    // уборку не ждал (ждал бы — шёл бы 30 с; запись привязки после уборки — хук ждал бы её до
+    // потолка 1,5 с и вышел со старой привязкой и строкой в журнале)
+    let ev = p.ev("SessionStart", "ss-big-2", json!({"source": "clear"}));
+    let (o, t) = p.hook_env(
+        &url,
+        "session-start",
+        "claude",
+        ev.to_string().as_bytes(),
+        &[("ZAM_TEST_GC_STALL_MS", STALL_MS)],
+    );
+    assert!(o.status.success());
+    let log = p.log();
+    assert_eq!(binding_session(&p).as_deref(), Some("ss-big-2"), "{log}");
+    assert!(!log.contains("привязка MCP к сессии"), "{log}");
+    assert!(
+        t.inner <= LATE_THREAD_MAX,
+        "хук ждал уборку кэша: {:?} при паузе уборки 30 с: {log}",
+        t.inner
+    );
 }
 
 /// `PostToolUseFailure`: `error_regex` — с сервером и (сервер выключен) по кэшу.
@@ -2337,26 +2362,42 @@ fn session_start_flushes_all_queues_in_one_request() {
     let ss = p.ev("SessionStart", "s-new", json!({"source": "startup"}));
     // лучший из повторов — полтора бюджета (повтор — только если время не уложилось: после срока
     // запроса хук ещё возвращает очередь, а создание файла на занятом диске изредка стоит секунды)
+    let posts = || {
+        slow_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, path, _)| path == "/api/v1/files/changed")
+            .count()
+    };
     let (mut attempts, mut d) = (0, Duration::MAX);
     while attempts < 3 && d > max_inner("session-start") {
+        let before = posts();
         let (_, t) = p.hook_at(&slow, "session-start", "claude", ss.to_string().as_bytes());
         attempts += 1;
         d = d.min(t);
+        // прирост — этого хука: счёт берётся, когда заглушка дочитала принятое (два равных
+        // чтения через 50 мс), иначе опоздавшая запись ушла бы в счёт следующей попытки
+        let mut now = posts();
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            let next = posts();
+            if next == now {
+                break;
+            }
+            now = next;
+        }
+        let sent = now - before;
+        assert!(
+            sent <= 1,
+            "не больше одного запроса на хук: {sent} (попытка {attempts}): {}",
+            p.log()
+        );
     }
     assert!(
         d <= max_inner("session-start"),
         "session-start {d:?}: {}",
         p.log()
-    );
-    let posts = slow_seen
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(_, path, _)| path == "/api/v1/files/changed")
-        .count();
-    assert!(
-        posts <= attempts,
-        "не больше одного запроса на хук: {posts} из {attempts}"
     );
     let left: usize = (0..5).map(|i| queue(&p, &format!("s{i}")).len()).sum();
     assert_eq!(left, 5, "тайм-аут — очереди целы");
@@ -2408,18 +2449,21 @@ fn session_start_slow_server_one_deadline_for_all_requests() {
     let log = p.log();
     let posts = count("POST", "/api/v1/files/changed");
     assert!(posts >= 1, "отправка очереди ушла: {sent:?}; {log}");
-    // отправка очереди ушла у каждого хука и кончилась сроком — второго запроса потока нет; хук,
-    // не успевший до отправки (старт процесса дольше бюджета), в счёт не идёт
+    // Отправка очереди ушла и кончилась сроком — второго запроса потока у этого хука нет. Хук, не
+    // успевший до отправки (до срока оставалось меньше 15 мс — `FLUSH_MIN_LEFT`), очередь не шлёт,
+    // а `GET /file-refs` с остатком в 1–15 мс начать вправе: запрос уходит и снимается сроком
+    // (строка «… не обновлён: сервер … timeout» — правда о нём). Поэтому: запросов `GET` — не
+    // больше, чем хуков без отправки; строка «сервер» запрещена, только когда отправка была у всех
+    let gets = count("GET", "/api/v1/file-refs");
+    assert!(
+        gets <= 3 - posts,
+        "запрос после срока хука: GET {gets} при отправках {posts}: {sent:?}; {log}"
+    );
     if posts == 3 {
-        assert_eq!(
-            count("GET", "/api/v1/file-refs"),
-            0,
-            "запрос после срока хука: {sent:?}; {log}"
-        );
         let unsent = format!("кэш file-refs не обновлён: {}", zam_core::HOOK_BUDGET_SPENT);
         assert_eq!(log.matches(&unsent).count(), 3, "одна строка на хук: {log}");
+        assert!(!log.contains("file-refs не обновлён: сервер"), "{log}");
     }
-    assert!(!log.contains("file-refs не обновлён: сервер"), "{log}");
     let inner: Vec<Duration> = times.iter().map(|t| t.inner).collect();
     let best = *inner.iter().min().unwrap();
     assert!(
@@ -5208,9 +5252,10 @@ fn prompts_of(body: &Value) -> Vec<String> {
 /// `hooks.snapshot_ms` (поток сборки «засыпает» на 30 с через точку подмены `<журнал>.stall-ms`);
 /// опоздавший снимок не кладётся ни в очередь, ни на сервер. Бюджет хука — щедрый (напоминание —
 /// содержимое: с бюджетом продукта занятая машина превращала его в тишину), ожидание потока
-/// ограничено своим пределом (срок снимка + срок `PUT` + запас, 135 мс), поэтому порог «хук не
-/// ждал поток» — [`LATE_THREAD_MAX`] при сне 30 с, как у соседних тестов; бюджет `checkpoint` —
-/// у `hooks_with_server_within_margin`.
+/// ограничено своим пределом (срок снимка + срок `PUT` + запас, 135 мс). Порог «хук не ждал
+/// поток» — 3 с: бюджет хука здесь 10 с ([`Proj::hook_content`]), и хук, ждущий поток до конца
+/// бюджета, вышел бы как раз на 10 с — общий порог [`LATE_THREAD_MAX`] этого бы не отличил.
+/// Бюджет `checkpoint` — у `hooks_with_server_within_margin`.
 #[test]
 fn snapshot_deadline_never_delays_stop() {
     let _g = serial();
@@ -5233,7 +5278,11 @@ fn snapshot_deadline_never_delays_stop() {
     let (o, d) = p.hook_content(&url, "checkpoint", "claude", ev.to_string().as_bytes());
     let v = hook_json(&o);
     assert_eq!(v["decision"], "block", "{v}: {}", p.log());
-    assert!(d <= LATE_THREAD_MAX, "снимок задержал Stop: {d:?}");
+    assert!(
+        d <= Duration::from_secs(3),
+        "снимок задержал Stop: {d:?}: {}",
+        p.log()
+    );
     assert!(puts(&seen).is_empty(), "{:?}", puts(&seen));
     assert!(snap_file(&p, "snapq", "sd-1").is_none());
     // попытка записана (`at`): следующий `Stop` — не раньше чем через 60 с
@@ -6444,10 +6493,12 @@ fn put_limit_logged(log: &str) -> u64 {
     n
 }
 
-/// Предел времени хука в тестах опоздавшего потока снимка (бюджет хука — 1–1,5 с, свой предел
-/// ожидания — доли секунды): запуск и выход отладочного процесса под нагрузкой входят в замер
-/// (наблюдалось до +3 с), а хук, ждущий усыплённый поток, шёл бы не меньше 15 с (срок снимка и
-/// `PUT` в этих тестах) — порог между ними с запасом в обе стороны.
+/// Предел времени хука в тестах «хук не ждёт усыплённый поток» (сон — [`STALL_MS`], 30 с): свой
+/// предел ожидания у хука — доли секунды, остановки диска и запуск отладочного процесса под
+/// нагрузкой добавляют до 3–4 с, а хук, ждущий поток, шёл бы не меньше 15 с (сроки снимка и
+/// `PUT` в этих тестах) или до конца сна. Годится только там, где бюджет хука заметно меньше
+/// порога (1–4 с) или заметно больше (30 с): при бюджете 10 с хук, досидевший бюджет, уложился
+/// бы в порог — у такого теста порог свой (`snapshot_deadline_never_delays_stop`).
 const LATE_THREAD_MAX: Duration = Duration::from_secs(10);
 
 /// Третье ревью 17b, Minor 1: срок `PUT` — фактический срок клиента (меньшее из своего срока и
