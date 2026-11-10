@@ -286,6 +286,7 @@ fn explain_decided(e: CliError) -> CliError {
             "идея уже начата → задача k:{}",
             p["task_id"].as_str().unwrap_or("?")
         ),
+        timeout: false,
         problem: e.problem,
     }
 }
@@ -458,6 +459,7 @@ mod tests {
         let e = CliError {
             code: 4,
             msg: "x".into(),
+            timeout: false,
             problem: Some(json!({"type": "/problems/already-decided", "task_id": "01T"})),
         };
         let r = explain_decided(e);

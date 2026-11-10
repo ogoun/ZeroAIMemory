@@ -649,6 +649,15 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
         return;
     };
     if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+        // пропуск виден в журнале (раньше — молча: «очередь не ушла» было не отличить от
+        // задержки соседней работы хука); без очереди пропускать нечего — строки нет
+        if !queue_files(env, session).is_empty() {
+            env.log(&format!(
+                "files/changed: очередь не отправлена — остаток бюджета меньше {} мс (прошло {} мс)",
+                FLUSH_MIN_LEFT.as_millis(),
+                env.started.elapsed().as_millis()
+            ));
+        }
         return;
     }
     let nanos = SystemTime::now()
@@ -1342,6 +1351,50 @@ mod tests {
         let log = std::fs::read_to_string(env.log_path()).unwrap_or_default();
         assert!(!log.contains("files/changed"), "{log}");
         drop(held);
+    }
+
+    /// Повторное ревью 76458e3 (17b), M1: очередь, не отправленная из-за остатка бюджета, видна
+    /// в журнале хука (с временем от старта процесса) и остаётся на месте; без очереди — тихо.
+    #[test]
+    fn flush_skipped_by_budget_is_logged() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/zam-cli-flush-budget");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
+        std::fs::write(
+            dir.join(".zeroaimemory/solution.toml"),
+            "agent_solution_id = \"0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e77\"\nname = \"x\"\n",
+        )
+        .unwrap();
+        // бюджет исчерпан: процесс «стартовал» 5 с назад
+        let env = Env::new(
+            super::super::Kind::Checkpoint,
+            super::super::Agent::Claude,
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .unwrap(),
+            dir.clone(),
+            dir.join("home"),
+        );
+        let client = Client::new("http://127.0.0.1:9", "t", None);
+        let log = || std::fs::read_to_string(env.log_path()).unwrap_or_default();
+        flush_changed(&env, &client, Some("s1"));
+        assert_eq!(log(), "", "очереди нет — строки нет");
+        let q = changed_path(&env, "s1");
+        std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+        let body = changed_bytes([&line("src/a.rs", 0)]);
+        std::fs::write(&q, &body).unwrap();
+        flush_changed(&env, &client, Some("s1"));
+        assert_eq!(std::fs::read(&q).unwrap(), body, "очередь на месте");
+        let got = log();
+        assert_eq!(got.lines().count(), 1, "{got}");
+        assert!(
+            got.contains(
+                "checkpoint files/changed: очередь не отправлена — остаток бюджета меньше 15 мс \
+                 (прошло 5"
+            ),
+            "{got}"
+        );
     }
 
     fn line(path: &str, symbols: usize) -> Changed {

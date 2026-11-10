@@ -107,6 +107,7 @@ fn explain_claimed(e: CliError) -> CliError {
             c["session"].as_str().unwrap_or("?"),
             agent_time(c["until"].as_str().unwrap_or("?"))
         ),
+        timeout: false,
         problem: e.problem,
     }
 }
@@ -220,6 +221,7 @@ pub fn status(
                 CliError {
                     code: EXIT_CONFLICT,
                     msg: format!("запись изменилась (rev {rev}): перечитайте и повторите"),
+                    timeout: false,
                     problem: e.problem,
                 }
             } else {

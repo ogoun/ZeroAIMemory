@@ -182,6 +182,7 @@ fn explain_duplicate(e: CliError) -> CliError {
     CliError {
         code: EXIT_CONFLICT,
         msg,
+        timeout: false,
         problem: e.problem,
     }
 }
@@ -260,6 +261,7 @@ fn explain_answered(e: CliError) -> CliError {
     CliError {
         code: EXIT_CONFLICT,
         msg: format!("вопрос уже отвечен (решение i:{d})"),
+        timeout: false,
         problem: e.problem,
     }
 }
@@ -399,6 +401,7 @@ mod tests {
         let dup = CliError {
             code: 4,
             msg: "x".into(),
+            timeout: false,
             problem: Some(json!({
                 "type": "/problems/possible-duplicate",
                 "candidates": [{"id": "01A", "status": "answered", "title": "Брать?",
@@ -416,6 +419,7 @@ mod tests {
         let ans = CliError {
             code: 4,
             msg: "x".into(),
+            timeout: false,
             problem: Some(json!({"type": "/problems/already-answered", "decision_id": "01D"})),
         };
         assert_eq!(

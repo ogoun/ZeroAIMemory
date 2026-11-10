@@ -82,6 +82,7 @@ pub fn run(ctx: &Ctx, term: Option<&str>, solution: Option<&str>) -> Result<(), 
                     CliError {
                         code: EXIT_NOT_FOUND,
                         msg: format!("термин «{name}» не найден среди имён и псевдонимов"),
+                        timeout: false,
                         problem: e.problem,
                     }
                 } else {

@@ -33,7 +33,9 @@
 //!   `X-Zam-Session` — id сессии снимка (явная сессия §8а), правка очереди — под замком
 //!   `.snapq-….json.lock`. 2xx —
 //!   очередь удаляется; 404/405 (старый сервер, маршрута нет) — счётчик попыток очереди, после
-//!   [`OLD_SERVER_ATTEMPTS`] снимок остаётся в очереди без новых попыток в этой сессии; 400, 413,
+//!   [`OLD_SERVER_ATTEMPTS`] снимок остаётся в очереди без новых попыток в этой сессии; 404 с
+//!   `type` `…/session-not-found` (сервер с маршрутом, сессии у него нет) старым сервером не
+//!   считается — счётчик не растёт, снимок уйдёт, когда сессия появится; 400, 413,
 //!   422 — снимок отброшен; прочее (сеть, 5xx, 401/403) — остаётся до следующего хука.
 //! - **`hooks.log`** — повод, размер, полнота и итог отправки (ответ сервера — только `HTTP <код>`
 //!   и `type`, без `detail`); текста снимка там нет. Упор
@@ -580,7 +582,9 @@ impl SendNote {
     /// - `PUT` идёт: его срок вышел (предел ожидания по бюджету хука — срок раньше него на
     ///   [`super::HTTP_RESERVE_MS`] − [`EXIT_LOG_RESERVE`]) — «срок PUT N мс»; срок ещё не вышел
     ///   (предел ожидания — свой, запуск потока + сроки + [`WAIT_SLACK`], а поток долго шёл к
-    ///   `PUT`) — «PUT не завершён (M из N мс)»: сервер в этом случае ни при чём;
+    ///   `PUT`) — «PUT не завершён (M из N мс)»: сервер в этом случае ни при чём. Срок считается
+    ///   вышедшим с запасом [`PUT_LATE_SLACK`]: запрос, которому до срока осталось меньше шага
+    ///   таймера ОС, ответа уже не дождётся;
     /// - `PUT` вернулся, очередь не обработана — чем кончился запрос (ответ сервера, срок,
     ///   сеть): медленная локальная доработка не выдаётся за медленный сервер.
     ///
@@ -612,8 +616,9 @@ impl SendNote {
                 env.started.elapsed().as_millis()
             )),
             Stage::Put { what, limit, t0 } => {
+                let late = t0.elapsed() + PUT_LATE_SLACK >= limit;
                 let (spent, limit) = (t0.elapsed().as_millis(), limit.as_millis());
-                Some(if spent >= limit {
+                Some(if late {
                     format!("{what}: срок PUT {limit} мс, итог отправки не записан до выхода хука")
                 } else {
                     format!("{what}: PUT не завершён ({spent} из {limit} мс) до выхода хука")
@@ -689,6 +694,16 @@ fn enqueue(env: &Env, session: &str, body: Value) -> bool {
     }
 }
 
+/// Ответ сервера с маршрутом снимка «сессии нет» (404 с `type` `…/session-not-found`, задача
+/// 17c) — в отличие от 404 старого сервера без маршрута (`about:blank` или без тела).
+fn session_not_found(e: &CliError) -> bool {
+    e.http_status() == Some(404)
+        && e.problem
+            .as_ref()
+            .and_then(|p| p["type"].as_str())
+            .is_some_and(|t| t.ends_with("/session-not-found"))
+}
+
 /// Итог отправки очереди.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Sent {
@@ -750,9 +765,12 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
         n.sending(what, limit, t0);
     }
     let res = client.put_json_body(&path, body);
-    let spent = t0.elapsed();
-    // сеть: ответа нет за свой срок — отдельная причина (вечная очередь видна в журнале)
-    let timed_out = |e: &CliError| put_timed_out(e, spent, limit);
+    // сеть: ответа нет за свой срок — отдельная причина (вечная очередь видна в журнале). Срок —
+    // по типу ошибки клиента ([`CliError::is_timeout`]); правила «запрос шёл почти весь срок»
+    // больше нет: оно ошибалось в обе стороны — ожидание сокета возвращается раньше срока на
+    // шаг таймера ОС (срок не распознавался), а обрыв соединения у самого срока сроком не
+    // является (распознавался бы)
+    let timed_out = |e: &CliError| e.is_timeout();
     let late_why = format!("срок PUT {} мс", limit.as_millis());
     // чем кончился запрос — до работы с очередью: хук, не дождавшийся потока, пишет это, а не
     // «срок PUT» ([`SendNote::late`])
@@ -786,6 +804,9 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
             }
             Sent::Dropped(short(&e))
         }
+        // сессии нет на сервере с маршрутом: не старый сервер — счётчик попыток не растёт, снимок
+        // ждёт в очереди и уходит следующим хуком, когда сессия появится
+        Err(e) if session_not_found(&e) => Sent::Queued(short(&e)),
         Err(e) if matches!(e.http_status(), Some(404 | 405)) => {
             item.old_server += 1;
             let n = item.old_server;
@@ -812,17 +833,10 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
     })
 }
 
-/// Запас при распознавании «срок PUT вышел» по времени (запрос шёл почти весь срок).
-const PUT_LATE_SLACK: Duration = Duration::from_millis(5);
-
-/// Ответа на `PUT` нет за его срок `limit`: сетевая ошибка (без ответа сервера), и клиент сам
-/// назвал её сроком (`timeout: …` в тексте ureq) либо запрос шёл почти весь срок. Одного времени
-/// мало: ожидание сокета кончается с точностью таймера ОС и может вернуться раньше срока больше
-/// чем на [`PUT_LATE_SLACK`] — под нагрузкой причина выходила общим текстом клиента (`сервер …
-/// недоступен: timeout: global`) вместо «срок PUT N мс».
-fn put_timed_out(e: &CliError, spent: Duration, limit: Duration) -> bool {
-    e.http_status().is_none() && (e.msg.contains(": timeout: ") || spent + PUT_LATE_SLACK >= limit)
-}
+/// Запас, с которым хук считает срок идущего `PUT` вышедшим ([`SendNote::late`]): не меньше шага
+/// таймера ОС (на Windows ~15,6 мс) — ожидание сокета возвращается с такой точностью. Итог
+/// законченного запроса по времени не определяется: там — тип ошибки клиента ([`flush`]).
+const PUT_LATE_SLACK: Duration = Duration::from_millis(20);
 
 /// Причина ошибки для `hooks.log`: ответ сервера — только `HTTP <код>` и `type` problem+json
 /// (`detail` мог бы нести кусок снимка); сеть — текст клиента (без тела запроса).
@@ -1016,22 +1030,29 @@ pub fn end_session(env: &Env, session: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::channel;
     use std::time::Instant;
 
-    /// Окружение `checkpoint` в пустом каталоге проекта (`target/tmp`), журнал хуков пуст.
-    fn env_at(name: &str) -> Env {
+    /// Окружение хука в пустом каталоге проекта (`target/tmp`), журнал хуков пуст; `age` —
+    /// сколько «прошло» от старта процесса (бюджет `session-start` — 300 мс).
+    fn env_at(name: &str, age: Duration) -> Env {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/tmp")
             .join(format!("zam-cli-send-note-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
         Env::new(
-            super::super::Kind::Checkpoint,
+            super::super::Kind::SessionStart,
             Agent::Claude,
-            Instant::now(),
+            Instant::now().checked_sub(age).unwrap(),
             dir.clone(),
             dir.join("home"),
         )
+    }
+
+    /// Окружение с целым бюджетом.
+    fn fresh(name: &str) -> Env {
+        env_at(name, Duration::ZERO)
     }
 
     /// Строки журнала хуков без времени и источника.
@@ -1045,28 +1066,48 @@ mod tests {
 
     /// Сигнал конца потока, который уже не придёт (поток «оборван»): `late` не ждёт.
     fn gone() -> std::sync::mpsc::Receiver<()> {
-        std::sync::mpsc::channel().1
+        channel().1
+    }
+
+    /// Момент `ms` миллисекунд назад.
+    fn ago(ms: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_millis(ms))
+            .unwrap()
     }
 
     /// `PUT` начат и срок вышел — хук пишет «срок PUT»; опоздавшая строка потока не пишется.
     #[test]
     fn late_after_put_deadline_logs_limit_once() {
-        let env = env_at("put");
+        let env = fresh("put");
         let n = SendNote::default();
-        n.sending("снимок stop", Duration::from_millis(7), Instant::now());
-        std::thread::sleep(Duration::from_millis(10));
+        n.sending("снимок stop", Duration::from_millis(100), ago(500));
         n.late(&env, &gone(), "Stop");
-        n.write(&env, "снимок stop, в очереди: срок PUT 7 мс");
+        n.write(&env, "снимок stop, в очереди: срок PUT 100 мс");
         assert_eq!(
             lines(&env),
-            ["снимок stop: срок PUT 7 мс, итог отправки не записан до выхода хука"]
+            ["снимок stop: срок PUT 100 мс, итог отправки не записан до выхода хука"]
+        );
+    }
+
+    /// Ревью 76458e3, M4: до срока идущего `PUT` осталось меньше запаса — он считается вышедшим.
+    #[test]
+    fn late_within_slack_of_put_deadline_is_a_timeout() {
+        let env = fresh("put-slack");
+        let n = SendNote::default();
+        let limit = Duration::from_millis(1000);
+        n.sending("снимок stop", limit, ago(1000 - 10));
+        n.late(&env, &gone(), "Stop");
+        assert_eq!(
+            lines(&env),
+            ["снимок stop: срок PUT 1000 мс, итог отправки не записан до выхода хука"]
         );
     }
 
     /// `PUT` начат, срок не вышел (хук вышел по своему пределу) — не «срок PUT».
     #[test]
     fn late_before_put_deadline_is_not_a_timeout() {
-        let env = env_at("put-early");
+        let env = fresh("put-early");
         let n = SendNote::default();
         n.sending("снимок stop", Duration::from_secs(600), Instant::now());
         n.late(&env, &gone(), "Stop");
@@ -1083,7 +1124,7 @@ mod tests {
     /// `PUT` вернулся, очередь не обработана — в строке ответ сервера, а не срок.
     #[test]
     fn late_after_response_logs_outcome() {
-        let env = env_at("done");
+        let env = fresh("done");
         let n = SendNote::default();
         n.sending("снимок stop", Duration::ZERO, Instant::now());
         n.put_done("снимок stop", "ответ получен (HTTP 204)".to_string());
@@ -1098,7 +1139,7 @@ mod tests {
     /// Поток записал итог сам — хук строку не добавляет.
     #[test]
     fn write_then_late_logs_once() {
-        let env = env_at("written");
+        let env = fresh("written");
         let n = SendNote::default();
         n.sending("снимок stop", Duration::ZERO, Instant::now());
         n.write(&env, "снимок stop, отправлен");
@@ -1106,18 +1147,18 @@ mod tests {
         assert_eq!(lines(&env), ["снимок stop, отправлен"]);
     }
 
-    /// До `PUT` поток не дошёл — «не готов» с событием и временем; опоздавшие отметки потока
-    /// этап не сбрасывают, вторая строка не пишется.
+    /// До `PUT` поток не дошёл — «не готов» с событием и временем; опоздавшие отметки и строка
+    /// потока, повторный `late` второй строки не дают.
     #[test]
-    fn late_before_put_logs_not_ready_and_stays_logged() {
-        let env = env_at("before");
+    fn late_before_put_logs_not_ready_once() {
+        let env = fresh("before");
         let n = SendNote::default();
         n.late(&env, &gone(), "PreCompact");
         n.sending("снимок pre_compact", Duration::ZERO, Instant::now());
-        n.put_done("снимок pre_compact", "ответ получен (HTTP 204)".to_string());
-        assert!(matches!(*n.lock(), Stage::Logged));
-        n.write(&env, "снимок pre_compact, отправлен");
         n.late(&env, &gone(), "PreCompact");
+        n.put_done("снимок pre_compact", "ответ получен (HTTP 204)".to_string());
+        n.late(&env, &gone(), "PreCompact");
+        n.write(&env, "снимок pre_compact, отправлен");
         let got = lines(&env);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(
@@ -1130,7 +1171,7 @@ mod tests {
     /// Отравленный замок (паника потока под ним) не мешает ни хуку, ни потоку.
     #[test]
     fn poisoned_lock_still_logs() {
-        let env = env_at("poison");
+        let env = fresh("poison");
         let n = std::sync::Arc::new(SendNote::default());
         n.sending("снимок stop", Duration::ZERO, Instant::now());
         let n2 = n.clone();
@@ -1149,41 +1190,81 @@ mod tests {
         );
     }
 
-    /// Ревью 2c36319, M5 (прогон под нагрузкой): срок, названный клиентом, распознаётся и тогда,
-    /// когда ожидание сокета вернулось раньше срока; отказ соединения и ответ сервера — не срок.
-    #[test]
-    fn put_timeout_recognized_by_client_error_or_time() {
-        let net = |m: &str| CliError::new(1, format!("сервер http://x недоступен: {m}"));
-        let (ms, limit) = (Duration::from_millis, Duration::from_millis(1400));
-        assert!(put_timed_out(&net("timeout: global"), ms(1380), limit));
-        assert!(put_timed_out(&net("io: Connection reset"), ms(1396), limit));
-        assert!(!put_timed_out(&net("io: Connection refused"), ms(2), limit));
-        let mut http = net("timeout: global");
-        http.problem = Some(serde_json::json!({"status": 503}));
-        assert!(!put_timed_out(&http, ms(1400), limit));
-    }
-
-    /// Замок занят (поток пишет строку прямо сейчас): хук ждёт конца потока и своей строки не
-    /// добавляет.
-    #[test]
-    fn late_waits_for_writer_holding_lock() {
-        let env = env_at("busy");
-        let n = std::sync::Arc::new(SendNote::default());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (n2, env2) = (n.clone(), env.clone());
+    /// Поток, который держит замок `hold`, затем выполняет `then` (под замком) и отпускает;
+    /// возвращается, когда замок уже взят.
+    fn hold_lock(
+        n: &std::sync::Arc<SendNote>,
+        hold: Duration,
+        then: impl FnOnce(&mut Stage) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let (held_tx, held_rx) = channel();
+        let n2 = n.clone();
         let h = std::thread::spawn(move || {
             let mut g = n2.lock();
             held_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(20));
-            env2.log("снимок stop, отправлен");
-            *g = Stage::Logged;
-            drop(g);
-            tx.send(()).unwrap();
+            std::thread::sleep(hold);
+            then(&mut g);
         });
         held_rx.recv().unwrap();
+        h
+    }
+
+    /// Замок занят потоком, пишущим строку: `late` возвращается только после её записи (ждёт
+    /// сигнал конца потока) и своей строки не добавляет.
+    #[test]
+    fn late_returns_after_writer_holding_lock_finished() {
+        // старт «в будущем»: остаток бюджета не тает, пока тест под нагрузкой доходит до `late`
+        let mut env = fresh("busy");
+        env.started = Instant::now() + Duration::from_secs(60);
+        let n = std::sync::Arc::new(SendNote::default());
+        let (tx, rx) = channel();
+        let env2 = env.clone();
+        let h = hold_lock(&n, Duration::from_millis(30), move |g| {
+            env2.log("снимок stop, отправлен");
+            *g = Stage::Logged;
+            tx.send(()).unwrap();
+        });
         n.late(&env, &rx, "Stop");
-        h.join().unwrap();
+        // строка потока уже в журнале в момент возврата `late` (до `join`)
         assert_eq!(lines(&env), ["снимок stop, отправлен"]);
+        h.join().unwrap();
+    }
+
+    /// Ревью 2c36319, M2: замок был занят, сигнала конца потока за остаток бюджета нет — `late`
+    /// пробует замок ещё раз и пишет строку по этапу.
+    #[test]
+    fn late_retries_lock_after_failed_wait() {
+        let env = fresh("retry");
+        let n = std::sync::Arc::new(SendNote::default());
+        n.sending("снимок stop", Duration::from_millis(100), ago(500));
+        // сигнала не будет, но канал жив: ожидание идёт весь остаток бюджета
+        let (tx, rx) = channel::<()>();
+        let h = hold_lock(&n, Duration::from_millis(30), |_| {});
+        n.late(&env, &rx, "Stop");
+        assert!(env.budget_left().is_zero(), "ожидание — до конца бюджета");
+        assert_eq!(
+            lines(&env),
+            ["снимок stop: срок PUT 100 мс, итог отправки не записан до выхода хука"]
+        );
+        h.join().unwrap();
+        drop(tx);
+    }
+
+    /// Ревью 2c36319, M2: замок занят и после ожидания (запись в `hooks.log` дольше остатка
+    /// бюджета) — `late` выходит без строки и не ждёт замок.
+    #[test]
+    fn late_gives_up_when_lock_stays_busy() {
+        let env = env_at("stuck", Duration::from_secs(5));
+        let n = std::sync::Arc::new(SendNote::default());
+        n.sending("снимок stop", Duration::from_millis(100), ago(500));
+        let (tx, rx) = channel::<()>();
+        let h = hold_lock(&n, Duration::from_millis(300), |_| {});
+        let t0 = Instant::now();
+        n.late(&env, &rx, "Stop");
+        let spent = t0.elapsed();
+        assert!(spent < Duration::from_millis(250), "{spent:?}");
+        assert!(lines(&env).is_empty(), "{:?}", lines(&env));
+        h.join().unwrap();
+        drop(tx);
     }
 }

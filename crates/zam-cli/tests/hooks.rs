@@ -2064,7 +2064,9 @@ fn session_start_flushes_all_queues_in_one_request() {
         .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
         .map(|(_, _, b)| b)
         .collect();
-    assert_eq!(posts.len(), 1, "{s:?}");
+    // пропуск отправки по остатку бюджета виден в журнале хука («files/changed: очередь не
+    // отправлена — … (прошло N мс)»)
+    assert_eq!(posts.len(), 1, "журнал хука: {:?}; запросы: {s:?}", p.log());
     let files = posts[0]["files"].as_array().unwrap();
     assert_eq!(files.len(), 6, "{files:?}");
     assert_eq!(
@@ -5913,12 +5915,20 @@ fn put_outcome_logged_when_snapshot_thread_is_late() {
     let _ = put_limit_case("snap-put-late-warm", slow, Some(2000));
     let (log, d, queued) = put_limit_case("snap-put-late-log", slow, Some(2000));
     put_limit_logged(&log);
+    // строку пишет сам хук, на каком бы этапе он ни застал поток: отказ клиента по сроку уже
+    // вернулся («…срок PUT N мс, очередь не обработана до выхода хука») или ещё нет («…срок PUT
+    // N мс, итог отправки не записан до выхода хука» — CI windows-latest, 76458e3: отказ
+    // вернулся позже предела ожидания). Оба исхода верны; своей строки («…, в очереди: срок PUT»)
+    // усыплённый поток записать не может
     assert!(
-        log.contains("очередь не обработана до выхода хука"),
-        "{log}"
+        log.contains("до выхода хука") && !log.contains(", в очереди"),
+        "строку итога написал не хук (хук шёл {d:?}): {log}"
     );
-    assert!(queued, "{log}");
-    assert!(d <= LATE_THREAD_MAX, "хук ждал поток снимка: {d:?}");
+    assert!(queued, "снимка нет в очереди (хук шёл {d:?}): {log}");
+    assert!(
+        d <= LATE_THREAD_MAX,
+        "хук ждал поток снимка: {d:?} при пределе {LATE_THREAD_MAX:?}: {log}"
+    );
 }
 
 /// Ревью 2c36319, I1: сервер ответил 204 сразу, а поток снимка застрял после `PUT` (подмена
@@ -5985,7 +5995,13 @@ fn snapshot_decision_never_delays_changed_flush() {
         .iter()
         .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
         .count();
-    assert!(sent >= 1, "очередь изменённых не ушла: {}", p.log());
+    // что именно не успело — в журнале хука: «files/changed: очередь не отправлена — остаток
+    // бюджета меньше 15 мс (прошло N мс)» (пропуск до запроса) или «files/changed: <ошибка сети>»
+    assert!(
+        sent >= 1,
+        "очередь изменённых не ушла (хук шёл {d:?}): {}",
+        p.log()
+    );
     assert!(queue(&p, s).is_empty(), "{}", p.log());
 }
 
