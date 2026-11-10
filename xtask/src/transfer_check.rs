@@ -3,15 +3,20 @@
 //! - `seed` — корпус на старом сервере: заметки, вложения PDF и DOCX, секрет Vault, идеи,
 //!   отчёт с картинкой, карта кода (`zam code sync` на фикстуре `eval/sessions-corpus/code`);
 //!   ожидания — в `expect.json` (id, sha256 содержимого и вложений, топ-5 на 10 запросах, имя
-//!   и sha256 секрета, `model_id`, отпечатки нарезки);
+//!   и sha256 секрета, `model_id`, отпечатки нарезки). **Только на чистом сервере:** решение
+//!   корпуса уже зарегистрировано — отказ (топ-5 по чужим данным ничего не подтверждает);
 //! - `verify` — те же данные на новом сервере после `restore` (или без ключа — `--no-key`:
 //!   Vault заблокирован с понятной ошибкой, остальное работает);
-//! - `bindings` — ни одна текстовая ячейка баз каталога данных, кроме атрибуции `machine`,
-//!   не содержит прежнего `data_dir` и имени прежней машины (§12б.1; та же проверка — тест
-//!   `restore_has_no_machine_bindings`).
+//! - `bindings` — ни одна ячейка баз каталога данных, кроме атрибуции `machine`, не содержит
+//!   путей прежней машины и её имени (§12б.1). Проверка — модуль [`bindings`], общий с тестом
+//!   `restore_has_no_machine_bindings` (`crates/zam-server/tests/backup.rs`).
 //!
 //! Запросы поиска идут без заголовков сессии и машины: выданное сессии понижается в выдаче, а
 //! неявная сессия выбирается по машине (R13) — топ-5 сравнивается без этих поправок.
+//!
+//! Токен — флаг `--token` или переменная `ZAM_TOKEN` (так он не попадает в список процессов).
+
+pub mod bindings;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -120,15 +125,16 @@ pub struct TransferCheckArgs {
 
 #[derive(Subcommand)]
 enum TcCmd {
-    /// Корпус на старом сервере и ожидания в expect.json
+    /// Корпус на старом сервере и ожидания в expect.json. Только на чистом сервере: если
+    /// решение корпуса уже зарегистрировано, команда отказывает
     Seed {
         /// Адрес сервера, например http://127.0.0.1:7700
         #[arg(long)]
         server: String,
-        /// Токен пользователя (rw)
-        #[arg(long)]
+        /// Токен пользователя (rw); лучше переменной `ZAM_TOKEN` — флаг виден в списке процессов
+        #[arg(long, env = "ZAM_TOKEN", hide_env_values = true)]
         token: String,
-        /// Файл ожиданий
+        /// Файл ожиданий; рядом на время работы создаётся каталог `seed-work` (с маркером)
         #[arg(long)]
         out: PathBuf,
         /// Клиент `zam` для `zam code sync` (из комплекта)
@@ -145,7 +151,8 @@ enum TcCmd {
     Verify {
         #[arg(long)]
         server: String,
-        #[arg(long)]
+        /// Токен пользователя; лучше переменной `ZAM_TOKEN`
+        #[arg(long, env = "ZAM_TOKEN", hide_env_values = true)]
         token: String,
         /// Файл ожиданий seed
         #[arg(long)]
@@ -163,17 +170,19 @@ enum TcCmd {
         #[arg(long)]
         report: Option<PathBuf>,
     },
-    /// Текстовые ячейки баз без прежнего data_dir и имени прежней машины (кроме `machine`)
+    /// Ячейки баз без путей прежней машины и её имени (кроме атрибуции `machine`)
     Bindings {
         /// Каталог данных (system.db, users/*.db)
         #[arg(long)]
         data_dir: PathBuf,
-        /// Абсолютный путь data_dir старой машины
-        #[arg(long)]
-        old_path: String,
-        /// Имя старой машины
-        #[arg(long)]
-        old_machine: String,
+        /// Абсолютный путь старой машины; флаг повторяется: data_dir, каталог комплекта (exe,
+        /// pdfium), каталог моделей. Пустой и слишком общий (корень диска, `/var`) — отказ
+        #[arg(long, required = true)]
+        old_path: Vec<String>,
+        /// Имя старой машины (не короче 3 символов; сравнение по границам слова, без учёта
+        /// регистра); флаг повторяется
+        #[arg(long, required = true)]
+        old_machine: Vec<String>,
     },
 }
 
@@ -227,19 +236,34 @@ pub fn main(a: TransferCheckArgs, root: &Path) -> Result<()> {
             old_path,
             old_machine,
         } => {
-            let needles = needles(&old_path, &old_machine);
-            let hits = bindings(&data_dir, &needles)?;
-            if hits.is_empty() {
-                println!(
-                    "bindings: ok — в текстовых ячейках баз {} нет {needles:?} (кроме machine)",
+            let needles = bindings::Needles::new(&old_path, &old_machine)?;
+            let scan = bindings::scan(&data_dir, &needles)?;
+            println!(
+                "bindings: {} баз, {} текстовых ячеек, {} BLOB с текстом (zstd, UTF-8)",
+                scan.dbs, scan.text_cells, scan.blob_cells
+            );
+            if scan.text_cells == 0 {
+                bail!(
+                    "bindings: в базах {} нет текстовых ячеек",
                     data_dir.display()
+                );
+            }
+            if scan.hits.is_empty() {
+                println!(
+                    "bindings: ok — в ячейках баз {} нет путей {:?} и машин {:?} (кроме machine)",
+                    data_dir.display(),
+                    needles.paths(),
+                    needles.machines()
                 );
                 return Ok(());
             }
-            for h in &hits {
+            for h in &scan.hits {
                 println!("{h}");
             }
-            bail!("bindings: {} ячеек с привязкой к старой машине", hits.len())
+            bail!(
+                "bindings: {} ячеек с привязкой к старой машине",
+                scan.hits.len()
+            )
         }
     }
 }
@@ -364,15 +388,7 @@ impl Conn {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|i| {
-                // элемент: фрагмент вложения — `id` (`a:…`), запись — `entry_id`, заметка — путь
-                let id = ["id", "entry_id", "path"]
-                    .iter()
-                    .find_map(|k| i[*k].as_str().filter(|s| !s.is_empty()))
-                    .unwrap_or_default()
-                    .to_string();
-                (id, i["score"].as_f64().unwrap_or_default())
-            })
+            .map(|i| (item_id(i), i["score"].as_f64().unwrap_or_default()))
             .collect();
         Ok((items, v))
     }
@@ -402,6 +418,17 @@ impl Conn {
     }
 }
 
+/// Идентификатор элемента выдачи: фрагмент вложения — `id` (`a:<чанк>`), запись журнала —
+/// `entry_id`, заметка — `node_id` (не путь: путь совпал бы и у другой заметки на том же месте).
+/// Пусто — у элемента нет ни одного из них.
+fn item_id(i: &Value) -> String {
+    ["id", "entry_id", "node_id"]
+        .iter()
+        .find_map(|k| i[*k].as_str().filter(|s| !s.is_empty()))
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn sha_hex(b: &[u8]) -> String {
     Sha256::digest(b)
         .iter()
@@ -427,7 +454,10 @@ fn multipart(boundary: &str, parts: &[(&str, Option<&str>, &str, &[u8])]) -> Vec
     b
 }
 
-/// Ждёт `ok()` не дольше `limit`, опрос раз в `step`; `what` — для ошибки.
+/// Ждёт `ok()` не дольше `limit`, опрос раз в `step`; `what` — для ошибки. Транспортная
+/// ошибка запроса (сервер ещё поднимается, перезапускается, обрыв) — не отказ: опрос
+/// повторяется до предела, последняя такая ошибка попадает в сообщение. Прочие ошибки `ok()`
+/// (состояние, которое уже не изменится) прерывают ожидание сразу.
 fn until(
     what: &str,
     limit: Duration,
@@ -435,12 +465,21 @@ fn until(
     mut ok: impl FnMut() -> Result<bool>,
 ) -> Result<Duration> {
     let t0 = Instant::now();
+    let mut last = None;
     loop {
-        if ok()? {
-            return Ok(t0.elapsed());
+        match ok() {
+            Ok(true) => return Ok(t0.elapsed()),
+            Ok(false) => {}
+            Err(e) if e.downcast_ref::<ureq::Error>().is_some() => last = Some(format!("{e:#}")),
+            Err(e) => return Err(e),
         }
         if t0.elapsed() > limit {
-            bail!("{what}: не дождались за {} с", limit.as_secs());
+            let tail = last.map(|e| format!("; последняя ошибка связи: {e}"));
+            bail!(
+                "{what}: не дождались за {} с{}",
+                limit.as_secs(),
+                tail.unwrap_or_default()
+            );
         }
         thread::sleep(step);
     }
@@ -540,7 +579,14 @@ fn seed(c: &Conn, root: &Path, zam: &Path, out: &Path, data_dir: Option<&Path>) 
         true,
         None,
     )?;
-    if !matches!(r.status, 200 | 201) {
+    if r.status == 200 {
+        bail!(
+            "решение корпуса {SOLUTION} на сервере уже зарегистрировано: seed работает только \
+             на чистом сервере (свежий каталог данных) — поверх прежнего корпуса id и топ-5 \
+             ожиданий были бы другими"
+        );
+    }
+    if r.status != 201 {
         bail!("POST /solutions: HTTP {}: {}", r.status, r.text());
     }
     // заметки
@@ -710,14 +756,19 @@ fn seed(c: &Conn, root: &Path, zam: &Path, out: &Path, data_dir: Option<&Path>) 
         .context("нет id отчёта")?
         .to_string();
     // карта кода: `zam code sync` на фикстуре
-    let work = out.parent().unwrap_or(Path::new(".")).join("seed-work");
-    let _ = fs::remove_dir_all(&work);
+    let work = SeedWork::create(
+        &out.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .join("seed-work"),
+    )?;
     code_sync(
         c,
         zam,
         &root.join("eval").join("sessions-corpus").join("code"),
-        &work,
+        &work.0,
     )?;
+    drop(work);
     let st = c.get(&format!("/code/status?solution={SOLUTION}"))?.json();
     let code_files = st["files"].as_u64().unwrap_or(0);
     if code_files == 0 {
@@ -729,18 +780,27 @@ fn seed(c: &Conn, root: &Path, zam: &Path, out: &Path, data_dir: Option<&Path>) 
     let mut queries = Vec::new();
     for q in QUERIES {
         let (top, _) = c.top6(q)?;
+        full_top5(q, &top)?;
         queries.push(QueryExp {
             query: (*q).to_string(),
             top,
         });
     }
     let ist = c.get("/index/status")?.json();
+    let model_id = ist["model"]["id"]
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .context(
+            "у сервера нет модели эмбеддингов (index/status: model.id): без векторного канала \
+             топ-5 не подтверждает перенос индекса — установите модель (models fetch)",
+        )?
+        .to_string();
     Ok(Expect {
         created_at: jiff::Timestamp::now().to_string(),
         server_version: health["version"].as_str().unwrap_or_default().to_string(),
         machine: c.machine.clone().unwrap_or_default(),
         solution: SOLUTION.to_string(),
-        model_id: ist["model"]["id"].as_str().map(String::from),
+        model_id: Some(model_id),
         chunkers: match data_dir {
             Some(d) => chunkers(d)?,
             None => BTreeMap::new(),
@@ -805,6 +865,38 @@ fn code_sync(c: &Conn, zam: &Path, fixture: &Path, work: &Path) -> Result<()> {
         String::from_utf8_lossy(&out.stdout).trim()
     );
     Ok(())
+}
+
+/// Маркер рабочего каталога `seed`: чужой каталог с тем же именем команда не трогает.
+const SEED_MARK: &str = ".zam-transfer-seed";
+
+/// Рабочий каталог `seed` (проект фикстуры карты кода и домашний каталог клиента): создаётся с
+/// маркером [`SEED_MARK`] и удаляется при выходе из области. Существующий каталог удаляется,
+/// только если маркер в нём есть (остаток прерванного `seed`), иначе — отказ.
+struct SeedWork(PathBuf);
+
+impl SeedWork {
+    fn create(dir: &Path) -> Result<Self> {
+        if dir.exists() {
+            if !dir.join(SEED_MARK).is_file() {
+                bail!(
+                    "каталог {} уже есть и создан не командой seed (нет маркера {SEED_MARK}): \
+                     уберите его или задайте --out в другом каталоге",
+                    dir.display()
+                );
+            }
+            fs::remove_dir_all(dir).with_context(|| dir.display().to_string())?;
+        }
+        fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
+        fs::write(dir.join(SEED_MARK), "cargo xtask transfer-check seed\n")?;
+        Ok(Self(dir.to_path_buf()))
+    }
+}
+
+impl Drop for SeedWork {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
@@ -918,16 +1010,7 @@ impl Report {
 
 fn verify(c: &Conn, e: &Expect, no_key: bool, data_dir: Option<&Path>, wait: Duration) -> Report {
     let mut rep = Report::default();
-    rep.check(
-        "health",
-        (|| {
-            let h = c.get("/health")?;
-            if h.status != 200 {
-                bail!("HTTP {}", h.status);
-            }
-            Ok(format!("версия {}", h.json()["version"]))
-        })(),
-    );
+    rep.check("health", check_health(c));
     // индекс: пересборка из кэша завершилась, модель та же
     let waited = wait_index(c, wait);
     rep.check(
@@ -941,261 +1024,317 @@ fn verify(c: &Conn, e: &Expect, no_key: bool, data_dir: Option<&Path>, wait: Dur
         rep.numbers
             .insert("index_wait_secs".into(), json!(d.as_secs_f64()));
     }
-    rep.check(
-        "модель",
-        (|| {
-            let st = c.get("/index/status")?.json();
-            let got = st["model"]["id"].as_str().map(String::from);
-            if got != e.model_id {
-                bail!("model_id {got:?}, ожидался {:?}", e.model_id);
-            }
-            Ok(format!(
-                "{got:?}; reindex.last = {}; worker = {}",
-                st["reindex"]["last"], st["worker"]
-            ))
-        })(),
-    );
+    rep.check("модель", check_model(c, e));
     if let Ok(st) = c.get("/index/status").map(|r| r.json()) {
         rep.numbers.insert("index_status".into(), st);
     }
-    rep.check(
-        "заметки",
-        (|| {
-            for n in &e.notes {
-                let r = c.get(&format!("/nodes/{}", n.id))?;
-                if r.status != 200 {
-                    bail!("{} {}: HTTP {}", n.id, n.path, r.status);
-                }
-                let v = r.json();
-                let content = v["content"].as_str().unwrap_or_default();
-                if sha_hex(content.as_bytes()) != n.sha256
-                    || v["node"]["path"].as_str() != Some(n.path.as_str())
-                {
-                    bail!("{} {}: содержимое или путь другие", n.id, n.path);
-                }
-            }
-            Ok(format!("{} заметок, содержимое совпадает", e.notes.len()))
-        })(),
-    );
-    rep.check(
-        "поиск: топ-5 на 10 запросах",
-        (|| {
-            for q in &e.queries {
-                let (got, _) = c.top6(&q.query)?;
-                same_top5(&q.query, &q.top, &got)?;
-            }
-            Ok(format!(
-                "{} запросов: топ-5 те же, на тех же местах",
-                e.queries.len()
-            ))
-        })(),
-    );
-    rep.check(
-        "вложения",
-        (|| {
-            let v = c
-                .get(&format!("/nodes/{}/attachments", e.attach_node))?
-                .json();
-            let docs = v.as_array().cloned().unwrap_or_default();
-            for a in &e.attachments {
-                let d = docs
-                    .iter()
-                    .find(|d| d["filename"] == a.file.as_str())
-                    .with_context(|| format!("нет вложения {}", a.file))?;
-                if d["sha256"] != a.sha256.as_str() || d["extract_state"] != "done" {
-                    bail!(
-                        "{}: sha256 = {}, extract_state = {}",
-                        a.file,
-                        d["sha256"],
-                        d["extract_state"]
-                    );
-                }
-                let r = c.get(&format!("/blobs/{}/{}", a.sha256, a.file))?;
-                if r.status != 200 || sha_hex(&r.body) != a.sha256 {
-                    bail!(
-                        "GET /blobs/{}/{}: HTTP {}, {} байт",
-                        a.sha256,
-                        a.file,
-                        r.status,
-                        r.body.len()
-                    );
-                }
-            }
-            let pdf = &e
-                .attachments
-                .iter()
-                .find(|a| a.file.ends_with(".pdf"))
-                .context("нет PDF")?
-                .sha256;
-            let r = c.get(&format!("/previews/{pdf}?kind=thumb&page=1&px=128"))?;
-            if r.status != 200 || !r.body.starts_with(b"\x89PNG\r\n\x1a\n") {
-                bail!("превью PDF: HTTP {}, {} байт", r.status, r.body.len());
-            }
-            Ok(format!(
-                "{} файлов открываются, превью PDF — PNG {} байт",
-                e.attachments.len(),
-                r.body.len()
-            ))
-        })(),
-    );
+    rep.check("заметки", check_notes(c, e));
+    rep.check("поиск: топ-5 на 10 запросах", check_top5(c, e));
+    rep.check("вложения", check_attachments(c, e));
     rep.check(
         "Vault",
-        (|| {
-            let r = c.get(&format!("/vault/{}?reveal=1", e.vault_id))?;
-            if no_key {
-                let p = r.json();
-                if r.status != 503
-                    || !p["type"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .ends_with("vault-locked")
-                {
-                    bail!(
-                        "без ключа ожидался 503 vault-locked: HTTP {}: {}",
-                        r.status,
-                        r.text()
-                    );
-                }
-                let l = c.get(&format!("/spaces/{}/vault", e.solution))?;
-                let lv = l.json();
-                if l.status != 200 || lv["locked"] != true {
-                    bail!("список Vault без ключа: HTTP {}: {}", l.status, l.text());
-                }
-                return Ok(format!(
-                    "заблокирован, как ожидалось: {} «{}»; список отвечает (locked: true)",
-                    p["type"],
-                    p["detail"]
-                        .as_str()
-                        .or(p["title"].as_str())
-                        .unwrap_or_default()
-                ));
-            }
-            if r.status != 200 {
-                bail!("HTTP {}: {}", r.status, r.text());
-            }
-            let v = r.json();
-            let secret = v["secret"]
-                .as_str()
-                .or(v["value"].as_str())
-                .unwrap_or_default();
-            if sha_hex(secret.as_bytes()) != e.vault_sha256 || v["title"] != e.vault_title.as_str()
-            {
-                bail!("секрет {} другой", e.vault_title);
-            }
-            Ok(format!(
-                "секрет «{}» раскрыт, значение совпадает",
-                e.vault_title
-            ))
-        })(),
+        if no_key {
+            check_vault_locked(c, e)
+        } else {
+            check_vault(c, e)
+        },
     );
-    rep.check(
-        "идеи и записи",
-        (|| {
-            for x in &e.entries {
-                let r = c.get(&format!("/entries/{}", x.id))?;
-                let v = r.json();
-                if r.status != 200
-                    || v["title"] != x.title.as_str()
-                    || v["status"].as_str().map(String::from) != x.status
-                {
-                    bail!(
-                        "{} {}: HTTP {}, status {}",
-                        x.kind,
-                        x.id,
-                        r.status,
-                        v["status"]
-                    );
-                }
-            }
-            Ok(format!(
-                "{} записей (идеи, insight) со статусами",
-                e.entries.len()
-            ))
-        })(),
-    );
-    rep.check("отчёт", (|| {
-        let Ok(pw) = std::env::var("ZAM_ADMIN_PASSWORD") else {
-            bail!("нужен ZAM_ADMIN_PASSWORD (пароль администратора нового сервера): отчёт видит только человек");
-        };
-        let cookie = c.login(&pw)?;
-        let feed = format!("/spaces/{}/entries?kind=report", e.solution);
-        let r = c.call("GET", &feed, None, false, Some(&cookie))?;
-        if r.status != 200 {
-            bail!("лента отчётов: HTTP {}", r.status);
-        }
-        let v = r.json();
-        let item = v["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|i| i["id"] == e.report_id.as_str())
-            .with_context(|| format!("отчёта {} нет в ленте", e.report_id))?;
-        let url = item["first_image"]["url"].as_str().context("нет first_image")?;
-        let a = agent_with(Duration::from_secs(30));
-        let mut r = a.get(&format!("{}/{}", c.base, url.trim_start_matches('/'))).header("Cookie", &cookie).call()?;
-        let st = r.status().as_u16();
-        let b = r.body_mut().read_to_vec()?;
-        if st != 200 || sha_hex(&b) != e.report_image_sha256 {
-            bail!("картинка отчёта: HTTP {st}, {} байт", b.len());
-        }
-        Ok(format!("отчёт {} в ленте, картинка совпадает", e.report_id))
-    })());
-    rep.check(
-        "карта кода",
-        (|| {
-            let st = c
-                .get(&format!("/code/status?solution={}", e.solution))?
-                .json();
-            if st["files"].as_u64() != Some(e.code_files) {
-                bail!("files = {}, ожидалось {}", st["files"], e.code_files);
-            }
-            let m = c.get(&format!("/code/map?solution={}", e.solution))?;
-            if m.status != 200 || !m.text().contains(&e.code_path) {
-                bail!("карта: HTTP {}, нет {}", m.status, e.code_path);
-            }
-            Ok(format!("{} файлов, карта отдаётся", e.code_files))
-        })(),
-    );
+    rep.check("идеи и записи", check_entries(c, e));
+    rep.check("отчёт", check_report(c, e));
+    rep.check("карта кода", check_code(c, e));
     if let Some(d) = data_dir {
-        rep.check(
-            "integrity_check",
-            (|| {
-                let mut dbs = vec![d.join("system.db")];
-                dbs.extend(user_dbs(d)?);
-                for db in &dbs {
-                    let c = rusqlite::Connection::open_with_flags(
-                        db,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                    )?;
-                    let ok: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-                    if ok != "ok" {
-                        bail!("{}: {ok}", db.display());
-                    }
-                }
-                Ok(format!("{} баз — ok", dbs.len()))
-            })(),
-        );
-        if !e.chunkers.is_empty() {
-            rep.check(
-                "отпечатки нарезки",
-                (|| {
-                    let got = chunkers(d)?;
-                    for (db, m) in &e.chunkers {
-                        if got.get(db) != Some(m) {
-                            bail!("{db}: {:?}, ожидалось {m:?}", got.get(db));
-                        }
-                    }
-                    Ok("meta.chunker* совпадают".to_string())
-                })(),
-            );
-        }
+        rep.check("integrity_check", check_integrity(d));
+        rep.check("отпечатки нарезки", check_chunkers(d, e));
     }
     rep
 }
 
-/// Топ-5 совпадают: те же пять элементов на тех же местах (§12б.6). Баллы не сравниваются:
+fn check_health(c: &Conn) -> Result<String> {
+    let h = c.get("/health")?;
+    if h.status != 200 {
+        bail!("HTTP {}", h.status);
+    }
+    Ok(format!("версия {}", h.json()["version"]))
+}
+
+/// Модель нового сервера — та же, что в ожиданиях. Ожидания без `model_id` — отказ: «нет
+/// модели там и тут» совпадением не считается.
+fn check_model(c: &Conn, e: &Expect) -> Result<String> {
+    let want = e
+        .model_id
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .context("в expect.json нет model_id: seed снят без модели, сверять нечего")?;
+    let st = c.get("/index/status")?.json();
+    let got = st["model"]["id"].as_str();
+    if got != Some(want) {
+        bail!("model_id {got:?}, ожидался {want:?}");
+    }
+    Ok(format!(
+        "{want}; reindex.last = {}; worker = {}",
+        st["reindex"]["last"], st["worker"]
+    ))
+}
+
+fn check_notes(c: &Conn, e: &Expect) -> Result<String> {
+    if e.notes.is_empty() {
+        bail!("в expect.json нет заметок");
+    }
+    for n in &e.notes {
+        let r = c.get(&format!("/nodes/{}", n.id))?;
+        if r.status != 200 {
+            bail!("{} {}: HTTP {}", n.id, n.path, r.status);
+        }
+        let v = r.json();
+        let content = v["content"].as_str().unwrap_or_default();
+        if sha_hex(content.as_bytes()) != n.sha256
+            || v["node"]["path"].as_str() != Some(n.path.as_str())
+        {
+            bail!("{} {}: содержимое или путь другие", n.id, n.path);
+        }
+    }
+    Ok(format!("{} заметок, содержимое совпадает", e.notes.len()))
+}
+
+fn check_top5(c: &Conn, e: &Expect) -> Result<String> {
+    if e.queries.len() != QUERIES.len() {
+        bail!(
+            "в expect.json {} запросов, нужно {}",
+            e.queries.len(),
+            QUERIES.len()
+        );
+    }
+    for q in &e.queries {
+        let (got, _) = c.top6(&q.query)?;
+        same_top5(&q.query, &q.top, &got)?;
+    }
+    Ok(format!(
+        "{} запросов: в топ-5 те же id (заметки — node_id, вложения — a:<чанк>) на тех же местах",
+        e.queries.len()
+    ))
+}
+
+fn check_attachments(c: &Conn, e: &Expect) -> Result<String> {
+    if e.attachments.is_empty() {
+        bail!("в expect.json нет вложений");
+    }
+    let v = c
+        .get(&format!("/nodes/{}/attachments", e.attach_node))?
+        .json();
+    let docs = v.as_array().cloned().unwrap_or_default();
+    for a in &e.attachments {
+        let d = docs
+            .iter()
+            .find(|d| d["filename"] == a.file.as_str())
+            .with_context(|| format!("нет вложения {}", a.file))?;
+        if d["sha256"] != a.sha256.as_str() || d["extract_state"] != "done" {
+            bail!(
+                "{}: sha256 = {}, extract_state = {}",
+                a.file,
+                d["sha256"],
+                d["extract_state"]
+            );
+        }
+        let r = c.get(&format!("/blobs/{}/{}", a.sha256, a.file))?;
+        if r.status != 200 || sha_hex(&r.body) != a.sha256 {
+            bail!(
+                "GET /blobs/{}/{}: HTTP {}, {} байт",
+                a.sha256,
+                a.file,
+                r.status,
+                r.body.len()
+            );
+        }
+    }
+    let pdf = &e
+        .attachments
+        .iter()
+        .find(|a| a.file.ends_with(".pdf"))
+        .context("нет PDF")?
+        .sha256;
+    let r = c.get(&format!("/previews/{pdf}?kind=thumb&page=1&px=128"))?;
+    if r.status != 200 || !r.body.starts_with(b"\x89PNG\r\n\x1a\n") {
+        bail!("превью PDF: HTTP {}, {} байт", r.status, r.body.len());
+    }
+    Ok(format!(
+        "{} файлов открываются, превью PDF — PNG {} байт",
+        e.attachments.len(),
+        r.body.len()
+    ))
+}
+
+/// С ключом: секрет раскрывается, значение то же.
+fn check_vault(c: &Conn, e: &Expect) -> Result<String> {
+    let r = c.get(&format!("/vault/{}?reveal=1", e.vault_id))?;
+    if r.status != 200 {
+        bail!("HTTP {}: {}", r.status, r.text());
+    }
+    let v = r.json();
+    let secret = v["secret"]
+        .as_str()
+        .or(v["value"].as_str())
+        .unwrap_or_default();
+    if sha_hex(secret.as_bytes()) != e.vault_sha256 || v["title"] != e.vault_title.as_str() {
+        bail!("секрет {} другой", e.vault_title);
+    }
+    Ok(format!(
+        "секрет «{}» раскрыт, значение совпадает",
+        e.vault_title
+    ))
+}
+
+/// Без ключа (`--no-key`): раскрытие — 503 `vault-locked`, список отвечает с `locked: true`.
+fn check_vault_locked(c: &Conn, e: &Expect) -> Result<String> {
+    let r = c.get(&format!("/vault/{}?reveal=1", e.vault_id))?;
+    let p = r.json();
+    let kind = p["type"].as_str().unwrap_or_default();
+    if r.status != 503 || !kind.ends_with("vault-locked") {
+        bail!(
+            "без ключа ожидался 503 vault-locked: HTTP {}: {}",
+            r.status,
+            r.text()
+        );
+    }
+    let l = c.get(&format!("/spaces/{}/vault", e.solution))?;
+    if l.status != 200 || l.json()["locked"] != true {
+        bail!("список Vault без ключа: HTTP {}: {}", l.status, l.text());
+    }
+    Ok(format!(
+        "заблокирован, как ожидалось: {} «{}»; список отвечает (locked: true)",
+        p["type"],
+        p["detail"]
+            .as_str()
+            .or(p["title"].as_str())
+            .unwrap_or_default()
+    ))
+}
+
+fn check_entries(c: &Conn, e: &Expect) -> Result<String> {
+    if e.entries.is_empty() {
+        bail!("в expect.json нет записей");
+    }
+    for x in &e.entries {
+        let r = c.get(&format!("/entries/{}", x.id))?;
+        let v = r.json();
+        if r.status != 200
+            || v["title"] != x.title.as_str()
+            || v["status"].as_str().map(String::from) != x.status
+        {
+            bail!(
+                "{} {}: HTTP {}, status {}",
+                x.kind,
+                x.id,
+                r.status,
+                v["status"]
+            );
+        }
+    }
+    Ok(format!(
+        "{} записей (идеи, insight) со статусами",
+        e.entries.len()
+    ))
+}
+
+/// Отчёт в ленте и его картинка — глазами человека: вход администратора паролем из
+/// `ZAM_ADMIN_PASSWORD` (агентскому токену отчёты не выдаются).
+fn check_report(c: &Conn, e: &Expect) -> Result<String> {
+    let Ok(pw) = std::env::var("ZAM_ADMIN_PASSWORD") else {
+        bail!(
+            "нужен ZAM_ADMIN_PASSWORD (пароль администратора нового сервера): \
+             отчёт видит только человек"
+        );
+    };
+    let cookie = c.login(&pw)?;
+    let feed = format!("/spaces/{}/entries?kind=report", e.solution);
+    let r = c.call("GET", &feed, None, false, Some(&cookie))?;
+    if r.status != 200 {
+        bail!("лента отчётов: HTTP {}", r.status);
+    }
+    let v = r.json();
+    let item = v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|i| i["id"] == e.report_id.as_str())
+        .with_context(|| format!("отчёта {} нет в ленте", e.report_id))?;
+    let url = item["first_image"]["url"]
+        .as_str()
+        .context("нет first_image")?;
+    let url = format!("{}/{}", c.base, url.trim_start_matches('/'));
+    let mut r = agent_with(Duration::from_secs(30))
+        .get(&url)
+        .header("Cookie", &cookie)
+        .call()?;
+    let st = r.status().as_u16();
+    let b = r.body_mut().read_to_vec()?;
+    if st != 200 || sha_hex(&b) != e.report_image_sha256 {
+        bail!("картинка отчёта: HTTP {st}, {} байт", b.len());
+    }
+    Ok(format!("отчёт {} в ленте, картинка совпадает", e.report_id))
+}
+
+fn check_code(c: &Conn, e: &Expect) -> Result<String> {
+    if e.code_files == 0 {
+        bail!("в expect.json карта кода пуста");
+    }
+    let st = c
+        .get(&format!("/code/status?solution={}", e.solution))?
+        .json();
+    if st["files"].as_u64() != Some(e.code_files) {
+        bail!("files = {}, ожидалось {}", st["files"], e.code_files);
+    }
+    let m = c.get(&format!("/code/map?solution={}", e.solution))?;
+    if m.status != 200 || !m.text().contains(&e.code_path) {
+        bail!("карта: HTTP {}, нет {}", m.status, e.code_path);
+    }
+    Ok(format!("{} файлов, карта отдаётся", e.code_files))
+}
+
+fn check_integrity(data_dir: &Path) -> Result<String> {
+    let dbs = bindings::databases(data_dir)?;
+    for db in &dbs {
+        let c =
+            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let ok: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if ok != "ok" {
+            bail!("{}: {ok}", db.display());
+        }
+    }
+    Ok(format!("{} баз — ok", dbs.len()))
+}
+
+/// Отпечатки нарезки баз — как в ожиданиях. Ожидания без отпечатков (seed без `--data-dir`) —
+/// отказ, а не пропуск.
+fn check_chunkers(data_dir: &Path, e: &Expect) -> Result<String> {
+    if e.chunkers.is_empty() || e.chunkers.values().any(BTreeMap::is_empty) {
+        bail!("в expect.json нет отпечатков нарезки: seed запущен без --data-dir");
+    }
+    let got = chunkers(data_dir)?;
+    for (db, m) in &e.chunkers {
+        if got.get(db) != Some(m) {
+            bail!("{db}: {:?}, ожидалось {m:?}", got.get(db));
+        }
+    }
+    Ok("meta.chunker* совпадают".to_string())
+}
+
+/// В выдаче не меньше пяти элементов, и у каждого из первых пяти есть id. Иначе сравнение
+/// топ-5 было бы пустым: «ничего не нашли там и тут» — не совпадение.
+fn full_top5(q: &str, top: &[(String, f64)]) -> Result<()> {
+    if top.len() < 5 {
+        bail!("«{q}»: в выдаче {} элементов, для топ-5 нужно 5", top.len());
+    }
+    if let Some(i) = top.iter().take(5).position(|x| x.0.is_empty()) {
+        bail!("«{q}»: у элемента на месте {} нет id", i + 1);
+    }
+    Ok(())
+}
+
+/// Топ-5 совпадают: те же пять id на тех же местах (§12б.6); id заметки — `node_id`,
+/// фрагмента вложения — `a:<чанк>`, записи — `entry_id` ([`item_id`]). Баллы не сравниваются:
 /// это нормированные места слияния каналов (1,0; 0,984; 0,968 …), а не косинусы.
 fn same_top5(q: &str, before: &[(String, f64)], after: &[(String, f64)]) -> Result<()> {
+    full_top5(q, before).context("ожидания (expect.json)")?;
     let ids = |v: &[(String, f64)]| v.iter().take(5).map(|x| x.0.clone()).collect::<Vec<_>>();
     if ids(before) != ids(after) {
         bail!("«{q}»: топ-5 {:?} вместо {:?}", ids(after), ids(before));
@@ -1203,122 +1342,313 @@ fn same_top5(q: &str, before: &[(String, f64)], after: &[(String, f64)]) -> Resu
     Ok(())
 }
 
-// ---------------------------------------------------------------- bindings
-
-/// Иглы привязки: путь (как есть, через `/`, с удвоенным `\` — экранирование JSON) и имя машины.
-fn needles(old_path: &str, old_machine: &str) -> Vec<String> {
-    let p = old_path.strip_prefix(r"\\?\").unwrap_or(old_path);
-    let p = p.trim_end_matches(['\\', '/']);
-    let mut v = vec![
-        p.to_string(),
-        p.replace('\\', "/"),
-        p.replace('\\', r"\\"),
-        old_machine.trim().to_string(),
-    ];
-    v.retain(|s| !s.is_empty());
-    v.sort();
-    v.dedup();
-    v
-}
-
-/// Убирает из JSON все поля `machine` (атрибуция, как столбцы `machine`).
-fn strip_machine(v: &mut Value) {
-    match v {
-        Value::Object(m) => {
-            m.remove("machine");
-            m.values_mut().for_each(strip_machine);
-        }
-        Value::Array(a) => a.iter_mut().for_each(strip_machine),
-        _ => {}
-    }
-}
-
-/// Текстовые ячейки `system.db` и `users/*.db` каталога `data_dir` с одной из `needles`,
-/// кроме столбцов `machine` и полей `machine` JSON-ячеек; виртуальные таблицы пропускаются
-/// (их данные — в теневых таблицах).
-fn bindings(data_dir: &Path, needles: &[String]) -> Result<Vec<String>> {
-    let mut dbs = vec![data_dir.join("system.db")];
-    dbs.extend(user_dbs(data_dir)?);
-    let found = |s: &str| needles.iter().any(|n| s.contains(n.as_str()));
-    let mut hits = Vec::new();
-    let mut cells = 0u64;
-    for db in &dbs {
-        let c =
-            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| db.display().to_string())?;
-        let tables: Vec<String> = c
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type = 'table' \
-                 AND coalesce(sql, '') NOT LIKE 'CREATE VIRTUAL%'",
-            )?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for t in tables {
-            let cols: Vec<String> = c
-                .prepare(&format!("SELECT name FROM pragma_table_info('{t}')"))?
-                .query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            for col in cols.iter().filter(|c| c.as_str() != "machine") {
-                let mut st = c.prepare(&format!(
-                    "SELECT \"{col}\" FROM \"{t}\" WHERE typeof(\"{col}\") = 'text'"
-                ))?;
-                let vals: Vec<String> = st
-                    .query_map([], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
-                cells += vals.len() as u64;
-                for s in vals.into_iter().filter(|s| found(s)) {
-                    if let Ok(mut v) = serde_json::from_str::<Value>(&s) {
-                        strip_machine(&mut v);
-                        if !found(&v.to_string()) {
-                            continue;
-                        }
-                    }
-                    let head: String = s.chars().take(160).collect();
-                    hits.push(format!(
-                        "{} {t}.{col}: {head}",
-                        db.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                }
-            }
-        }
-    }
-    println!("bindings: {} баз, {cells} текстовых ячеек", dbs.len());
-    Ok(hits)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::bindings::{Needles, machine_needle, norm, path_needle, percent_decode, scan};
     use super::*;
 
-    #[test]
-    fn needles_forms() {
-        let n = needles(r"\\?\H:\zam\data\", "WIN-BOX");
-        assert!(n.contains(&r"H:\zam\data".to_string()));
-        assert!(n.contains(&"H:/zam/data".to_string()));
-        assert!(n.contains(&r"H:\\zam\\data".to_string()));
-        assert!(n.contains(&"WIN-BOX".to_string()));
+    /// Свежий каталог теста в `target/test-tmp` (как у остальных тестов xtask).
+    fn tmp(name: &str) -> PathBuf {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/test-tmp/xtask")
+            .join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn win() -> Needles {
+        Needles::new(&[r"H:\Zam Data\Данные"], &["WIN-BOX"]).unwrap()
+    }
+
+    fn top(ids: &[&str]) -> Vec<(String, f64)> {
+        ids.iter().map(|i| (i.to_string(), 0.0)).collect()
     }
 
     #[test]
     fn top5_same_ids_same_places() {
-        let r = |ids: &[&str]| ids.iter().map(|i| (i.to_string(), 0.0)).collect::<Vec<_>>();
-        let a = r(&["a", "b", "c", "d", "e", "f"]);
+        let a = top(&["a", "b", "c", "d", "e", "f"]);
         assert!(same_top5("q", &a, &a).is_ok());
         // шестое место в сравнение не входит
-        assert!(same_top5("q", &a, &r(&["a", "b", "c", "d", "e", "z"])).is_ok());
-        assert!(same_top5("q", &a, &r(&["a", "c", "b", "d", "e"])).is_err());
-        assert!(same_top5("q", &a, &r(&["a", "b", "c", "d", "f"])).is_err());
-        assert!(same_top5("q", &a, &r(&["a", "b", "c", "d"])).is_err());
+        assert!(same_top5("q", &a, &top(&["a", "b", "c", "d", "e", "z"])).is_ok());
+        assert!(same_top5("q", &a, &top(&["a", "c", "b", "d", "e"])).is_err());
+        assert!(same_top5("q", &a, &top(&["a", "b", "c", "d", "f"])).is_err());
+        assert!(same_top5("q", &a, &top(&["a", "b", "c", "d"])).is_err());
+    }
+
+    /// Пустой зелёный: короткая выдача и пустые id — отказ, даже когда «до» и «после» равны.
+    #[test]
+    fn top5_refuses_short_and_empty() {
+        let short = top(&["a", "b", "c"]);
+        assert!(same_top5("q", &short, &short).is_err());
+        assert!(same_top5("q", &[], &[]).is_err());
+        let blank = top(&["a", "", "c", "d", "e"]);
+        assert!(same_top5("q", &blank, &blank).is_err());
+        assert!(full_top5("q", &short).is_err());
+        assert!(full_top5("q", &blank).is_err());
+        assert!(full_top5("q", &top(&["a", "b", "c", "d", "e"])).is_ok());
+    }
+
+    /// Заметка сравнивается по `node_id`, не по пути; вложение — по `a:<чанк>`, запись — по
+    /// `entry_id`.
+    #[test]
+    fn item_id_prefers_ids_over_path() {
+        let note = json!({"node_id": "01N", "path": "transfer/build"});
+        assert_eq!(item_id(&note), "01N");
+        let att = json!({"id": "a:c1", "node_id": "01OWNER", "path": "transfer/docs"});
+        assert_eq!(item_id(&att), "a:c1");
+        assert_eq!(item_id(&json!({"entry_id": "01E", "kind": "idea"})), "01E");
+        assert_eq!(item_id(&json!({"path": "transfer/build"})), "");
+    }
+
+    /// Проверка без `model_id` и без отпечатков в ожиданиях — отказ, а не «None == None».
+    #[test]
+    fn verify_refuses_empty_expectations() {
+        let c = Conn::new("http://127.0.0.1:9", "t", None);
+        let e: Expect = serde_json::from_value(json!({
+            "created_at": "", "server_version": "", "machine": "", "solution": SOLUTION,
+            "model_id": null, "chunkers": {}, "notes": [], "attach_node": "", "attachments": [],
+            "vault_id": "", "vault_title": "", "vault_sha256": "", "entries": [],
+            "report_id": "", "report_image_sha256": "", "code_files": 0, "code_path": "",
+            "queries": []
+        }))
+        .unwrap();
+        // отказы — до первого запроса к серверу (порт 9 не слушает)
+        let msg = |r: Result<String>| format!("{:#}", r.unwrap_err());
+        assert!(msg(check_model(&c, &e)).contains("нет model_id"));
+        assert!(msg(check_top5(&c, &e)).contains("запросов"));
+        assert!(msg(check_notes(&c, &e)).contains("нет заметок"));
+        assert!(msg(check_attachments(&c, &e)).contains("нет вложений"));
+        assert!(msg(check_entries(&c, &e)).contains("нет записей"));
+        assert!(msg(check_code(&c, &e)).contains("пуста"));
+        assert!(msg(check_chunkers(Path::new("нет"), &e)).contains("нет отпечатков"));
+    }
+
+    /// Транспортная ошибка опроса повторяется до предела; прочая — прерывает сразу.
+    #[test]
+    fn until_retries_transport_errors() {
+        let step = Duration::from_millis(1);
+        let mut n = 0;
+        let r = until("опрос", Duration::from_secs(5), step, || {
+            n += 1;
+            if n < 3 {
+                return Err(ureq::Error::ConnectionFailed.into());
+            }
+            Ok(true)
+        });
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(n, 3);
+        // предел: в сообщении — последняя ошибка связи
+        let r = until("опрос", Duration::ZERO, step, || {
+            Err(ureq::Error::ConnectionFailed.into())
+        });
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(
+            msg.contains("не дождались") && msg.contains("ошибка связи"),
+            "{msg}"
+        );
+        // ошибка состояния — сразу, без повторов
+        let mut n = 0;
+        let r = until("опрос", Duration::from_secs(5), step, || {
+            n += 1;
+            bail!("extract_state = failed")
+        });
+        assert!(format!("{:#}", r.unwrap_err()).contains("failed"));
+        assert_eq!(n, 1);
+    }
+
+    /// Рабочий каталог seed: чужой каталог не удаляется, свой (с маркером) — пересоздаётся и
+    /// убирается при выходе.
+    #[test]
+    fn seed_work_only_own_dir() {
+        let root = tmp("tc-seed-work");
+        let foreign = root.join("foreign").join("seed-work");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("notes.txt"), "чужое").unwrap();
+        let e = SeedWork::create(&foreign)
+            .err()
+            .expect("чужой каталог принят");
+        assert!(format!("{e:#}").contains(SEED_MARK), "{e:#}");
+        assert!(foreign.join("notes.txt").is_file(), "чужой каталог тронут");
+
+        let own = root.join("own").join("seed-work");
+        let w = SeedWork::create(&own).unwrap();
+        assert!(own.join(SEED_MARK).is_file());
+        fs::write(own.join("left.txt"), "остаток").unwrap();
+        std::mem::forget(w); // прерванный seed: каталог остался
+        let w = SeedWork::create(&own).unwrap();
+        assert!(
+            !own.join("left.txt").exists(),
+            "остаток прерванного seed не убран"
+        );
+        drop(w);
+        assert!(!own.exists(), "seed не убрал за собой");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ------------------------------------------------------------ привязки: формы пути
+
+    #[test]
+    fn norm_and_percent_decode() {
+        assert_eq!(norm(r"H:\\Zam//Data\x"), "h:/zam/data/x");
+        assert_eq!(percent_decode("a%20b%D0%B4%zz%2"), "a bд%zz%2");
+        assert_eq!(path_needle(r"\\?\H:\zam\data\").unwrap(), "h:/zam/data");
+        assert_eq!(path_needle("/var/lib/zam//").unwrap(), "/var/lib/zam");
     }
 
     #[test]
+    fn path_as_is_and_case_insensitive() {
+        let n = win();
+        assert!(n.find(r"см. H:\Zam Data\Данные\blobs").is_some());
+        // регистр ячейки и иглы не важен, в том числе кириллица
+        assert!(n.find(r"см. h:\zam data\данные").is_some());
+        assert!(n.find(r"см. H:\ZAM DATA\ДАННЫЕ").is_some());
+        let upper = Needles::new(&[r"H:\ZAM DATA\ДАННЫЕ"], &["win-box"]).unwrap();
+        assert!(upper.find(r"h:\zam data\данные").is_some());
+        assert!(upper.find("host WIN-BOX here").is_some());
+    }
+
+    #[test]
+    fn path_forward_slashes() {
+        assert!(win().find("см. H:/Zam Data/Данные/blobs").is_some());
+    }
+
+    #[test]
+    fn path_json_escaped_backslashes() {
+        // текст вне JSON с экранированием JSON: `\\`
+        assert!(win().find(r"path=H:\\Zam Data\\Данные").is_some());
+        // ячейка JSON: разбор сам снимает экранирование
+        assert!(win().find(r#"{"p":"H:\\Zam Data\\Данные\\x"}"#).is_some());
+    }
+
+    #[test]
+    fn path_double_escaped_backslashes() {
+        // JSON в JSON: `\\\\`
+        assert!(win().find(r"log: H:\\\\Zam Data\\\\Данные").is_some());
+        let inner = json!({"p": r"H:\Zam Data\Данные"}).to_string();
+        let outer = json!({"payload": inner}).to_string();
+        assert!(outer.contains(r"H:\\\\Zam"), "{outer}");
+        assert!(win().find(&outer).is_some());
+    }
+
+    #[test]
+    fn path_mixed_slashes() {
+        assert!(win().find(r"см. H:\Zam Data/Данные").is_some());
+        assert!(win().find(r"см. H:/Zam Data\\Данные/x").is_some());
+    }
+
+    #[test]
+    fn path_percent_encoded_file_url() {
+        // пробел и кириллица в file://
+        let url = "file:///H:/Zam%20Data/%D0%94%D0%B0%D0%BD%D0%BD%D1%8B%D0%B5/a.md";
+        assert!(win().find(url).is_some());
+        // шестнадцатеричные цифры в нижнем регистре, двоеточие и слэши кодированы
+        let url = "file:///H%3a%5cZam%20Data%5c%d0%94%d0%b0%d0%bd%d0%bd%d1%8b%d0%b5";
+        assert!(win().find(url).is_some());
+        // и внутри JSON
+        let cell = json!({"href": "file:///H:/Zam%20Data/%D0%94%D0%B0%D0%BD%D0%BD%D1%8B%D0%B5"});
+        assert!(win().find(&cell.to_string()).is_some());
+    }
+
+    #[test]
+    fn path_boundary_and_trailing_slash() {
+        let n = Needles::new(&[r"H:\zam\data\"], &["WIN-BOX"]).unwrap();
+        assert_eq!(n.paths(), ["h:/zam/data"]);
+        assert!(n.find(r"H:\zam\data").is_some());
+        assert!(n.find(r"H:\zam\data\blobs").is_some());
+        // другой каталог с тем же началом имени — не привязка
+        assert!(n.find(r"H:\zam\data2\blobs").is_none());
+        assert!(n.find(r"H:\zam\database").is_none());
+        assert!(n.find("ничего похожего").is_none());
+    }
+
+    #[test]
+    fn path_empty_and_too_general_refused() {
+        for p in ["", "  ", r"C:\", "/", "/var", r"\\?\D:\", "a/b"] {
+            assert!(path_needle(p).is_err(), "{p:?}");
+            assert!(Needles::new(&[p], &["WIN-BOX"]).is_err(), "{p:?}");
+        }
+        assert!(Needles::new::<&str, &str>(&[], &["WIN-BOX"]).is_err());
+        let mut n = win();
+        assert!(!n.add_path_if_specific(r"C:\"));
+        assert!(n.add_path_if_specific(r"C:\ZeroAIMemory"));
+        assert_eq!(n.paths().len(), 2);
+    }
+
+    // ------------------------------------------------------------ привязки: имя машины
+
+    #[test]
+    fn machine_word_boundaries() {
+        let n = win();
+        assert!(n.find("host=WIN-BOX;").is_some());
+        assert!(n.find("win-box").is_some());
+        assert!(n.find("с машины win-box.local").is_some());
+        // часть другого слова — не привязка
+        assert!(n.find("darwin-boxes").is_none());
+        assert!(n.find("win-box-2").is_none());
+        assert!(n.find("my_win-box").is_none());
+    }
+
+    #[test]
+    fn machine_short_name_refused() {
+        for m in ["", " ", "pc", "ПК"] {
+            let e = machine_needle(m).expect_err(m);
+            assert!(format!("{e:#}").contains("короче"), "{e:#}");
+            assert!(Needles::new(&[r"H:\zam\data"], &[m]).is_err(), "{m:?}");
+        }
+        assert_eq!(machine_needle(" Box ").unwrap(), "box");
+        let mut n = win();
+        assert!(!n.add_machine_if_long("pc"));
+        assert!(n.add_machine_if_long("OGOUN-PC"));
+        assert_eq!(n.machines(), ["ogoun-pc", "win-box"]);
+    }
+
+    /// Поля `machine` JSON — атрибуция на любой глубине, в том числе в JSON внутри строки;
+    /// то же имя в другом поле или ключе — находка.
+    #[test]
+    fn json_machine_fields_are_attribution() {
+        let n = win();
+        assert!(n.find(r#"{"machine":"WIN-BOX","x":1}"#).is_none());
+        assert!(n.find(r#"[{"a":{"machine":"win-box"}}]"#).is_none());
+        let inner = json!({"machine": "WIN-BOX"}).to_string();
+        assert!(n.find(&json!({"payload": inner}).to_string()).is_none());
+        assert!(
+            n.find(r#"{"machine":"WIN-BOX","host":"WIN-BOX"}"#)
+                .is_some()
+        );
+        assert!(n.find(r#"{"WIN-BOX":1}"#).is_some());
+        // экранированный перевод строки перед именем: в сыром тексте `\nwin-box` — не граница
+        assert!(n.find(r#"{"note":"first\nWIN-BOX"}"#).is_some());
+        // не JSON — сырой текст, атрибуции в нём нет
+        assert!(n.find(r#"machine":"WIN-BOX" (обрывок)"#).is_some());
+    }
+
+    /// Находка показывает окрестность совпадения, а не начало ячейки.
+    #[test]
+    fn hit_shows_neighbourhood() {
+        let text = format!(
+            "{} перед H:\\Zam Data\\Данные\\blobs после {}",
+            "начало ".repeat(100),
+            "хвост ".repeat(100)
+        );
+        let (needle, ctx) = win().find(&text).unwrap();
+        assert_eq!(needle, "h:/zam data/данные");
+        assert!(
+            ctx.contains("перед h:/zam data/данные/blobs после"),
+            "{ctx}"
+        );
+        assert!(ctx.starts_with('…') && ctx.ends_with('…'), "{ctx}");
+        assert!(ctx.chars().count() < 200, "{ctx}");
+        // короткая ячейка — целиком, без многоточий
+        let (_, ctx) = win().find("host WIN-BOX").unwrap();
+        assert_eq!(ctx, "host win-box");
+    }
+
+    // ------------------------------------------------------------ привязки: обход баз
+
+    #[test]
     fn bindings_skip_machine_and_find_paths() {
-        // каталог теста — внутри target репозитория (CARGO_TARGET_TMPDIR у юнит-тестов нет)
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("target")
-            .join("xtask-tc-bindings");
-        let _ = fs::remove_dir_all(&root);
+        let root = tmp("tc-bindings");
         fs::create_dir_all(root.join("users")).unwrap();
         let sys = rusqlite::Connection::open(root.join("system.db")).unwrap();
         sys.execute_batch(
@@ -1329,13 +1659,45 @@ mod tests {
         let u = rusqlite::Connection::open(root.join("users").join("u.db")).unwrap();
         u.execute_batch(
             "CREATE TABLE nodes(path TEXT, note TEXT);
-             INSERT INTO nodes VALUES ('a', 'see H:\\zam\\data\\blobs');",
+             INSERT INTO nodes VALUES ('a', 'see h:\\ZAM\\data\\blobs');
+             INSERT INTO nodes VALUES ('b', 'чисто');
+             CREATE TABLE blob_extract(sha TEXT, units BLOB);",
         )
         .unwrap();
+        // BLOB: zstd(JSON) с путём — находка; zstd без пути, двоичный и UTF-8 с именем машины
+        let packed = |t: &str| zstd::bulk::compress(t.as_bytes(), 3).unwrap();
+        let ins = "INSERT INTO blob_extract VALUES (?1, ?2)";
+        let unit = json!([{"text": r"opened H:\zam\data\blobs\ab\cd"}]).to_string();
+        u.execute(ins, rusqlite::params!["z-hit", packed(&unit)])
+            .unwrap();
+        u.execute(ins, rusqlite::params!["z-clean", packed("[]")])
+            .unwrap();
+        u.execute(
+            ins,
+            rusqlite::params!["bin", vec![0xFFu8, 0xFE, 0x00, 0x80]],
+        )
+        .unwrap();
+        u.execute(ins, rusqlite::params!["utf8", b"from win-box".to_vec()])
+            .unwrap();
         drop((sys, u));
-        let hits = bindings(&root, &needles(r"H:\zam\data", "WIN-BOX")).unwrap();
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert!(hits[0].contains("nodes.note"), "{hits:?}");
+        let n = Needles::new(&[r"H:\zam\data"], &["WIN-BOX"]).unwrap();
+        let s = scan(&root, &n).unwrap();
+        assert_eq!(s.dbs, 2);
+        assert_eq!(s.blob_cells, 3, "zstd ×2 и UTF-8; двоичный пропущен");
+        assert_eq!(s.hits.len(), 3, "{:?}", s.hits);
+        assert!(s.hits.iter().any(|h| h.contains("u.db nodes.note")));
+        let z = s.hits.iter().find(|h| h.contains("blob_extract.units"));
+        assert!(z.is_some_and(|h| h.contains("h:/zam/data")), "{:?}", s.hits);
+        assert_eq!(
+            s.hits
+                .iter()
+                .filter(|h| h.contains("blob_extract.units"))
+                .count(),
+            2,
+            "{:?}",
+            s.hits
+        );
+        assert!(!s.hits.iter().any(|h| h.contains("audit")), "{:?}", s.hits);
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -2168,88 +2168,11 @@ async fn backup_zip_refuses_when_stage_busy() {
 /// Имя «старой машины» в заголовках атрибуции корпуса привязок.
 const OLD_MACHINE: &str = "win-old-box-18c";
 
-/// Убирает из JSON все поля `machine` (атрибуция, как столбцы `machine`, §12б.1).
-fn strip_machine(v: &mut Value) {
-    match v {
-        Value::Object(m) => {
-            m.remove("machine");
-            m.values_mut().for_each(strip_machine);
-        }
-        Value::Array(a) => a.iter_mut().for_each(strip_machine),
-        _ => {}
-    }
-}
-
-/// Текстовые ячейки баз каталога данных `root` (`system.db`, `users/*.db`), содержащие одну из
-/// `needles`: «файл таблица.столбец: начало значения». Столбцы `machine` и поля `machine`
-/// JSON-ячеек — атрибуция, не привязка (§12б.1); виртуальные таблицы пропускаются (их данные —
-/// в теневых таблицах). Та же проверка — `cargo xtask transfer-check bindings`.
-fn machine_bindings(root: &Path, needles: &[String]) -> Vec<String> {
-    let mut dbs = vec![root.join("system.db")];
-    dbs.extend(
-        tree(&root.join("users"))
-            .into_iter()
-            .filter(|p| p.ends_with(".db"))
-            .map(|p| root.join("users").join(p)),
-    );
-    let found = |s: &str| needles.iter().any(|n| s.contains(n.as_str()));
-    let mut hits = Vec::new();
-    for db in dbs {
-        let c = sqlite(&db);
-        let tables: Vec<String> = c
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type = 'table' \
-                 AND coalesce(sql, '') NOT LIKE 'CREATE VIRTUAL%'",
-            )
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        for t in tables {
-            let cols: Vec<String> = c
-                .prepare(&format!("SELECT name FROM pragma_table_info('{t}')"))
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
-            for col in cols.iter().filter(|c| c.as_str() != "machine") {
-                let sql = format!("SELECT \"{col}\" FROM \"{t}\" WHERE typeof(\"{col}\") = 'text'");
-                let mut st = c.prepare(&sql).unwrap();
-                let vals: Vec<String> = st
-                    .query_map([], |r| r.get::<_, String>(0))
-                    .unwrap()
-                    .map(Result::unwrap)
-                    .collect();
-                for s in vals.into_iter().filter(|s| found(s)) {
-                    if let Ok(mut v) = serde_json::from_str::<Value>(&s) {
-                        strip_machine(&mut v);
-                        if !found(&v.to_string()) {
-                            continue;
-                        }
-                    }
-                    let head: String = s.chars().take(160).collect();
-                    hits.push(format!(
-                        "{} {t}.{col}: {head}",
-                        db.file_name().unwrap().to_string_lossy()
-                    ));
-                }
-            }
-        }
-    }
-    hits
-}
-
-/// Формы записи пути `p` в тексте: как есть, через `/`, с удвоенным `\` (экранирование JSON).
-fn path_forms(p: &Path) -> Vec<String> {
-    let s = p.to_string_lossy().into_owned();
-    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
-    let mut v = vec![s.replace('\\', "/"), s.replace('\\', r"\\"), s];
-    v.sort();
-    v.dedup();
-    v
-}
+/// Проверка привязок — общий исходник с `cargo xtask transfer-check bindings` (формы пути,
+/// границы имени машины, поля `machine`, BLOB zstd — см. описание модуля): тест и команда не
+/// расходятся. Зависимости модуля есть у обоих крейтов.
+#[path = "../../../xtask/src/transfer_check/bindings.rs"]
+mod bindings;
 
 /// §12б.1, §17 п. 24 (задача 18c): копия сервера с корпусом всех видов (заметки, вложения PDF и
 /// DOCX, Vault с раскрытием, идеи, задачи, вопросы, словарь, insight, отчёт с картинкой, карта
@@ -2402,23 +2325,39 @@ async fn restore_has_no_machine_bindings() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut needles = path_forms(&cfg.data_dir);
-    if let Ok(c) = cfg.data_dir.canonicalize() {
-        needles.extend(path_forms(&c));
+    // Иглы. Пути старой машины: каталог данных и его родитель, каталог моделей, библиотека
+    // pdfium, каталог исполняемых файлов (тест и `zam-server` рабочего процесса) — как есть и
+    // канонические; слишком общие (корень диска) пропускаются. Имена: заголовок атрибуции и
+    // имя машины-источника из описи (короче `bindings::MIN_MACHINE` — пропускается).
+    let lossy = |p: &Path| p.to_string_lossy().into_owned();
+    let mut needles = bindings::Needles::new(&[lossy(&cfg.data_dir)], &[OLD_MACHINE]).unwrap();
+    let mut paths = vec![cfg.data_dir.clone(), cfg.ml.models_dir(&cfg.data_dir)];
+    paths.extend(cfg.data_dir.parent().map(Path::to_path_buf));
+    paths.extend(cfg.docs.pdfium_dylib.clone());
+    let exe_dir = |p: PathBuf| p.parent().map(Path::to_path_buf);
+    paths.extend(std::env::current_exe().ok().and_then(exe_dir));
+    paths.extend(cfg.docs.worker_program.clone().and_then(exe_dir));
+    for p in paths.clone() {
+        paths.extend(p.canonicalize().ok());
     }
-    needles.push(OLD_MACHINE.to_string());
-    // имя этой машины (источник копии), если не короче 4 символов (иначе совпадения слов)
-    if let Some(src) = m.source_machine.filter(|s| s.chars().count() >= 4) {
-        needles.push(src);
+    for p in &paths {
+        needles.add_path_if_specific(&lossy(p));
     }
-    needles.sort();
-    needles.dedup();
-    let hits = machine_bindings(&dst.data_dir, &needles);
+    assert!(needles.paths().len() >= 3, "{needles:?}");
+    if let Some(src) = &m.source_machine {
+        needles.add_machine_if_long(src);
+    }
+    let scan = bindings::scan(&dst.data_dir, &needles).unwrap();
     assert!(
-        hits.is_empty(),
+        scan.hits.is_empty(),
         "привязки к старой машине ({needles:?}):\n{}",
-        hits.join("\n")
+        scan.hits.join("\n")
     );
+    // проверка не пустая: system.db и базы пользователей мира (владелец и участники), текст и
+    // распакованные BLOB zstd (`blob_extract.units`)
+    assert!(scan.dbs >= 2, "{scan:?}");
+    assert!(scan.text_cells > 100, "{scan:?}");
+    assert!(scan.blob_cells > 0, "{scan:?}");
     // атрибуция `machine` при этом сохранена — проверка не пустая
     let udb = dst.data_dir.join("users").join(format!("{user}.db"));
     assert!(
@@ -2442,20 +2381,80 @@ async fn restore_has_no_machine_bindings() {
             .unwrap();
         assert_eq!(ok, "ok", "{p}");
     }
-    // контроль проверки: путь старой машины в тексте записи и имя машины в JSON вне поля
-    // `machine` находятся
+    // Контроль проверки: каждая форма записи пути старой машины и её имя вне поля `machine`
+    // подкладываются в восстановленную базу по одной — и каждая находится (ровно одна
+    // находка), а после удаления база снова чиста.
+    let back = lossy(&cfg.data_dir).replace('/', "\\");
+    let zst = |t: &str| zstd::bulk::compress(t.as_bytes(), 3).unwrap();
+    let text = |t: String| rusqlite::types::Value::Text(t);
+    let controls = [
+        ("путь через `\\`", text(format!("см. {back}\\blobs"))),
+        (
+            "путь через `\\\\` (JSON)",
+            text(format!("см. {}", back.replace('\\', "\\\\"))),
+        ),
+        (
+            "путь через `\\\\\\\\` (JSON в JSON)",
+            text(json!({"log": json!({"p": back}).to_string()}).to_string()),
+        ),
+        ("путь через `/`", text(back.replace('\\', "/"))),
+        (
+            "путь в другом регистре",
+            text(format!("{} и {}", back.to_uppercase(), back.to_lowercase())),
+        ),
+        (
+            "путь в file:// с %20",
+            text(format!(
+                "file:///{}/a%20b.md",
+                back.replace('\\', "/").replace(' ', "%20")
+            )),
+        ),
+        ("имя машины в тексте", text(format!("писал {OLD_MACHINE}."))),
+        (
+            "имя машины в другом регистре",
+            text(OLD_MACHINE.to_uppercase()),
+        ),
+        (
+            "имя машины в JSON вне поля machine",
+            text(json!({"machine": OLD_MACHINE, "host": OLD_MACHINE}).to_string()),
+        ),
+        (
+            "путь в BLOB zstd",
+            rusqlite::types::Value::Blob(zst(&json!([{"text": back}]).to_string())),
+        ),
+    ];
     let c = rusqlite::Connection::open(&udb).unwrap();
+    c.execute_batch("CREATE TABLE tc_18c_control(v)").unwrap();
+    for (what, v) in controls {
+        c.execute("INSERT INTO tc_18c_control(v) VALUES (?1)", [v])
+            .unwrap();
+        let hits = bindings::scan(&dst.data_dir, &needles).unwrap().hits;
+        assert_eq!(hits.len(), 1, "{what}: {hits:?}");
+        assert!(hits[0].contains("tc_18c_control.v"), "{what}: {hits:?}");
+        c.execute("DELETE FROM tc_18c_control", []).unwrap();
+    }
+    // атрибуция в поле `machine` JSON и в столбце `machine` — не находка
+    c.execute_batch("ALTER TABLE tc_18c_control ADD COLUMN machine")
+        .unwrap();
     c.execute(
-        "UPDATE entries SET body = body || ?1 WHERE rowid = (SELECT min(rowid) FROM entries)",
-        [format!(" см. {}", needles[0])],
+        "INSERT INTO tc_18c_control(v, machine) VALUES (?1, ?2)",
+        [
+            json!({"machine": OLD_MACHINE}).to_string(),
+            OLD_MACHINE.into(),
+        ],
     )
     .unwrap();
+    // и путь в теле настоящей записи — находка с окрестностью, а не началом ячейки
     c.execute(
-        "INSERT INTO meta(key, value) VALUES ('tc-18c-control', ?1)",
-        [json!({"machine": OLD_MACHINE, "host": OLD_MACHINE}).to_string()],
+        "UPDATE entries SET body = body || ?1 WHERE rowid = (SELECT min(rowid) FROM entries)",
+        [format!(" см. {back}")],
     )
     .unwrap();
     drop(c);
-    let hits = machine_bindings(&dst.data_dir, &needles);
-    assert_eq!(hits.len(), 2, "{hits:?}");
+    let hits = bindings::scan(&dst.data_dir, &needles).unwrap().hits;
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(
+        hits[0].contains("entries.body") && hits[0].contains(" см. "),
+        "{hits:?}"
+    );
 }

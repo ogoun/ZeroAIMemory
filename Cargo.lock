@@ -7174,6 +7174,7 @@ dependencies = [
  "zam-store",
  "zeroize",
  "zip",
+ "zstd",
 ]
 
 [[package]]

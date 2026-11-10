@@ -108,3 +108,6 @@ tower = { workspace = true, features = ["util"] }
 image.workspace = true
 # приёмка M5.7: база 0023 и объекты схемы прямым SQL (tests/m57_acceptance.rs)
 rusqlite.workspace = true
+# проверка привязок к машине (tests/backup.rs, общий модуль с xtask): BLOB zstd
+# `blob_extract.units`; крейт уже в дереве (zam-store)
+zstd.workspace = true

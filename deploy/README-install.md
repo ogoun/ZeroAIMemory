@@ -1115,15 +1115,23 @@ jina — модель с динамическим int8: пары «запрос 
 числе на машину другой ОС (Windows ↔ Linux). Копия переносит базы (`system.db`,
 `users/*.db`: заметки, журналы, идеи, отчёты, Vault в зашифрованном виде, карту кода, токены,
 кэш эмбеддингов) и блобы вложений. В копию **не входят**: мастер-ключ Vault (переносится
-отдельно, шаг 2), конфигурация сервера (на новой машине — своя, шаг 5), модели (шаг 6),
+отдельно, шаги 2 и 8), конфигурация сервера (на новой машине — своя, шаг 5), модели (шаг 6),
 хранилище Qdrant и превью (пересобираются из баз сами), журналы. Абсолютных путей старой машины
 в базах нет: пути заметок, вложений и карты кода относительны; имя машины остаётся только в
 атрибуции ревизий (кто и откуда писал). Cookie входа в WebUI после `restore` не действуют —
 войдите заново; токены агентов прежние.
 
-Команды ниже — для комплекта в `C:\ZeroAIMemory` (Windows) и `/opt/zeroaimemory` с конфигом
-`/etc/zeroaimemory/config.toml` и каталогом данных `/var/lib/zeroaimemory` (Linux), как в
-разделах «Windows» и «Linux». Подставьте свои пути.
+Команды ниже — для комплекта в `C:\ZeroAIMemory` с каталогом данных `C:\ZeroAIMemory\data`
+(Windows) и `/opt/zeroaimemory` с конфигом `/etc/zeroaimemory/config.toml` и каталогом данных
+`/var/lib/zeroaimemory` (Linux), как в разделах «Windows» и «Linux». Подставьте свои пути.
+
+**Не запускайте сервер на новой машине до шага 9 (`restore`).** Первый запуск на пустом каталоге
+данных создаёт новые базы, первого администратора и — если ключа ещё нет — новый `master.key`.
+`restore` после этого откажет («каталог данных не пуст…»), а с `--replace` уберёт созданные базы
+в `<data_dir>/backups/pre-restore-<время>/`, но созданный сервером `master.key` останется на
+месте и к восстановленным секретам не подойдёт. Если сервер всё же запускали: остановите его,
+замените `master.key` прежним (шаг 8), выполните шаг 9 с `--replace` и удалите
+`<data_dir>/first-admin-token.txt` (токен из него остался в убранных базах).
 
 **На старой машине**
 
@@ -1132,11 +1140,12 @@ jina — модель с динамическим int8: пары «запрос 
 
    ```powershell
    # Windows (PowerShell)
+   New-Item -ItemType Directory -Force D:\zam-transfer
    C:\ZeroAIMemory\zam-server.exe backup --config C:\ZeroAIMemory\config.toml --zip D:\zam-transfer\zam-backup.zip
    ```
 
    ```bash
-   # Linux
+   # Linux: каталог копии принадлежит пользователю службы и закрыт для остальных
    sudo install -d -o zam -g zam -m 700 /var/backups/zam-transfer
    sudo -u zam /opt/zeroaimemory/zam-server backup --config /etc/zeroaimemory/config.toml --zip /var/backups/zam-transfer/zam-backup.zip
    ```
@@ -1149,43 +1158,55 @@ jina — модель с динамическим int8: пары «запрос 
    копию…». Без прежнего ключа секреты Vault на новой машине не раскрыть, остальное работает.
    Ключ — файл `[vault] master_key_file` (по умолчанию `<data_dir>/master.key`) или значение
    `ZAM_MASTER_KEY`. Переносите его другим путём, чем копию (менеджер паролей, отдельный
-   носитель): копия вместе с ключом раскрывает весь Vault.
+   носитель): копия вместе с ключом раскрывает весь Vault. Пример — на съёмный носитель
+   (`E:` и `/media/usb` — ваш носитель; каталог создаётся первой командой):
 
    ```powershell
-   # Windows: data_dir — из config.toml
-   Copy-Item <data_dir>\master.key E:\zam-key\master.key
+   # Windows
+   New-Item -ItemType Directory -Force E:\zam-key
+   Copy-Item C:\ZeroAIMemory\data\master.key E:\zam-key\master.key
    ```
 
    ```bash
    # Linux
+   sudo install -d -m 700 /media/usb/zam-key
    sudo install -m 600 /var/lib/zeroaimemory/master.key /media/usb/zam-key/master.key
    ```
 
    Посмотрите и запишите модель эмбеддингов старой машины — на новой нужна та же (шаг 6):
 
+   ```powershell
+   C:\ZeroAIMemory\zam-server.exe models status --config C:\ZeroAIMemory\config.toml
    ```
-   zam-server models status --config <config.toml>
+
+   ```bash
+   sudo -u zam /opt/zeroaimemory/zam-server models status --config /etc/zeroaimemory/config.toml
    ```
 
 3. **Перенос копии** на новую машину — любым способом: носитель, общая папка, `scp` (в
    Windows 10/11 он встроен):
 
    ```powershell
-   # с Windows на Linux
-   scp D:\zam-transfer\zam-backup.zip admin@new-host:~/
+   # с Windows
+   scp D:\zam-transfer\zam-backup.zip admin@new-host:
    ```
 
    ```bash
-   # с Linux на Linux или Windows (OpenSSH на Windows)
-   scp /var/backups/zam-transfer/zam-backup.zip admin@new-host:~/
+   # с Linux: копия закрыта для всех, кроме пользователя службы, — сначала возьмите её себе
+   sudo install -m 600 -o "$USER" /var/backups/zam-transfer/zam-backup.zip ~/zam-backup.zip
+   scp ~/zam-backup.zip admin@new-host:
+   rm ~/zam-backup.zip
    ```
+
+   Файл окажется в домашнем каталоге пользователя `admin` новой машины (`~/zam-backup.zip` на
+   Linux, `C:\Users\admin\zam-backup.zip` на Windows с OpenSSH).
 
 **На новой машине**
 
 4. **Комплект своей ОС** — архив `zam-server-<версия>-<os>-x64-cpu` (или `-gpu`) той же или
    более новой версии, что на старой машине (базы старше программы мигрируют при первом
    открытии; новее — `restore` откажет). Распакуйте как в разделе «Windows» (шаг 1) или «Linux»
-   (шаг 1); на Linux создайте пользователя и каталоги (шаг 2 «Linux»).
+   (шаг 1); на Linux создайте пользователя и каталоги (шаг 2 «Linux»). Сервер не запускайте.
 5. **Свой конфиг.** `config.toml` старой машины содержит её пути — не копируйте его вслепую.
    Возьмите `config.example.toml` комплекта, задайте `data_dir` (пустой каталог), `[admin]
    password_hash` (пароль администратора хранится в конфиге, а не в копии: задайте прежний или
@@ -1223,18 +1244,40 @@ jina — модель с динамическим int8: пары «запрос 
    докачает, если его нет. Внешний Qdrant — `[qdrant] mode = "external"` и `url` в конфиге.
 
    ```powershell
-   C:\ZeroAIMemory\zam-server.exe qdrant fetch
+   C:\ZeroAIMemory\zam-server.exe qdrant fetch --config C:\ZeroAIMemory\config.toml
    ```
 
    ```bash
-   sudo /opt/zeroaimemory/zam-server qdrant fetch    # пишет в каталог комплекта
+   sudo /opt/zeroaimemory/zam-server qdrant fetch --config /etc/zeroaimemory/config.toml    # пишет в каталог комплекта
    ```
 
-8. **Восстановление** — сервер не запущен, каталог данных пуст (каталог моделей в нём не
-   мешает). `restore` проверяет суммы и версии схем всех файлов до первой записи, копирует базы и
-   блобы, очищает сессии WebUI и ставит каждой базе отметку «пересобрать векторный индекс из
-   кэша». Он заранее пишет, что ждёт векторы: «из кэша» или «пересчёт: другая модель / другая
-   нарезка, N чанков».
+8. **Мастер-ключ — до `restore`**: на место `[vault] master_key_file` (по умолчанию
+   `<data_dir>/master.key`) с правами только владельца. Файл ключа в пустом каталоге данных
+   `restore` не мешает, зато `restore` сам сверит ключ с восстановленными секретами (шаг 9).
+
+   ```powershell
+   New-Item -ItemType Directory -Force C:\ZeroAIMemory\data
+   Copy-Item E:\zam-key\master.key C:\ZeroAIMemory\data\master.key
+   icacls "C:\ZeroAIMemory\data\master.key" /inheritance:r /grant:r "*S-1-3-4:F" "*S-1-5-18:F" "*S-1-5-32-544:F"
+   ```
+
+   ```bash
+   sudo install -o zam -g zam -m 600 /media/usb/zam-key/master.key /var/lib/zeroaimemory/master.key
+   ```
+
+   Windows, сервер службой (LocalSystem): файл, скопированный вашим пользователем, остаётся
+   его собственностью, и сервер на каждом старте пишет WARN «файл мастер-ключа Vault доступен
+   не только владельцу…» с SID вашего пользователя. Передайте файл службе:
+   `icacls "C:\ZeroAIMemory\data\master.key" /setowner SYSTEM` (см. «Vault: секреты и
+   мастер-ключ»).
+
+   Ключ задан переменной `ZAM_MASTER_KEY`, а не файлом, — задайте её и в окружении сервера, и
+   в консоли, где запускаете `restore` (иначе `restore` ключа не увидит).
+9. **Восстановление** — сервер не запущен, в каталоге данных нет баз и блобов (каталог моделей
+   и `master.key` в нём не мешают). `restore` проверяет суммы и версии схем всех файлов до первой
+   записи, копирует базы и блобы, очищает сессии WebUI и ставит каждой базе отметку
+   «пересобрать векторный индекс из кэша». Он заранее пишет, что ждёт векторы: «из кэша» или
+   «пересчёт: другая модель / другая нарезка, N чанков».
 
    ```powershell
    C:\ZeroAIMemory\zam-server.exe restore $HOME\zam-backup.zip --config C:\ZeroAIMemory\config.toml
@@ -1246,34 +1289,41 @@ jina — модель с динамическим int8: пары «запрос 
    sudo rm /var/lib/zeroaimemory/zam-backup.zip
    ```
 
-   Итог — число баз и блобов, версии схем и ожидание векторов, например:
+   Итог — число баз и блобов, версии схем и ожидание векторов:
 
    ```
    восстановлено: баз 2, блобов 3; схемы: system.db=7, users/<id>.db=25
    векторы: векторы из кэша
+   ```
+
+   **Ключ подошёл — третьей строки нет.** Если после этих строк напечатано
+
+   ```
    Vault: ключ не подходит — секреты недоступны, положите прежний master.key
    ```
 
-   Последняя строка на этом шаге ожидаема: ключ ещё не положен (шаг 9). Каталог данных не пуст —
-   отказ; `--replace` переносит прежние данные в `<data_dir>/backups/pre-restore-<время>/`
-   (ничего не удаляется).
-9. **Мастер-ключ** — на место `[vault] master_key_file` (по умолчанию `<data_dir>/master.key`)
-   с правами только владельца, или переменная `ZAM_MASTER_KEY` в окружении сервера. Без ключа
-   сервер работает, но Vault заблокирован: `zam vault get` и раскрытие отвечают
-   `503 /problems/vault-locked` («Vault заблокирован: файл мастер-ключа ([vault] master_key_file)
-   не найден, а ключи Vault уже есть: новый ключ не создаётся…»), список секретов — с
-   `locked: true`; заметки, поиск, вложения, журналы и карта кода работают. Положите ключ и
-   перезапустите сервер.
+   значит, ключ на шаге 8 — не тот, что был на старой машине, или `restore` его не нашёл.
+   Данные при этом восстановлены полностью, повторять `restore` не нужно. Проверьте:
+   - файл лежит там, куда указывает `[vault] master_key_file` (по умолчанию
+     `<data_dir>/master.key`), и читается пользователем, от имени которого шёл `restore`;
+   - это файл старой машины, скопированный без изменений (не открывался в редакторе, не
+     обрезан; сервер, запущенный до шага 9, мог создать свой ключ — см. предупреждение в
+     начале раздела);
+   - в консоли нет другой `ZAM_MASTER_KEY`: переменная важнее файла.
 
-   ```powershell
-   Copy-Item E:\zam-key\master.key C:\ZeroAIMemory\data\master.key
-   icacls "C:\ZeroAIMemory\data\master.key" /inheritance:r /grant:r "*S-1-3-4:F" "*S-1-5-18:F" "*S-1-5-32-544:F"
-   ```
+   Положите верный ключ и продолжайте с шага 10: при старте сервер сверит ключ ещё раз — в
+   журнале не должно быть WARN «Vault заблокирован: …», а `zam vault get` на шаге 12 выдаст
+   секрет.
 
-   ```bash
-   sudo install -o zam -g zam -m 600 /media/usb/zam-key/master.key /var/lib/zeroaimemory/master.key
-   ```
+   Каталог данных не пуст — отказ; `--replace` переносит прежние базы и блобы в
+   `<data_dir>/backups/pre-restore-<время>/` (ничего не удаляется).
 
+   **Переезд без ключа.** Если прежнего ключа нет (или он приедет позже), пропустите шаг 8:
+   строка «Vault: ключ не подходит…» тогда ожидаема. Сервер работает, но Vault заблокирован:
+   `zam vault get` и раскрытие отвечают `503 /problems/vault-locked` («Vault заблокирован: файл
+   мастер-ключа ([vault] master_key_file) не найден, а ключи Vault уже есть: новый ключ не
+   создаётся…»), список секретов — с `locked: true`; заметки, поиск, вложения, журналы и карта
+   кода работают. Когда ключ появится — положите его командами шага 8 и перезапустите сервер.
 10. **Запуск.** Сервер при первом открытии каждой базы пересобирает Qdrant из кэша эмбеддингов
     (без модели, тысячи чанков в секунду); пока идёт пересборка, поиск отвечает с
     `warnings: ["index rebuilding"]` и `pending_count`. Ход — `GET /api/v1/index/status` или
@@ -1294,18 +1344,27 @@ jina — модель с динамическим int8: пары «запрос 
     GUID решений (`.zeroaimemory/solution.toml`) едут с репозиториями; локальный кэш
     `.zeroaimemory/cache/` строится заново.
 12. **Проверка** — после окончания пересборки: раздел «Индекс» WebUI или
-    `GET /api/v1/index/status` — очередь пуста, `reindex.running = false`, в `reindex.last` нет
-    ошибок. В первые секунды после запуска поиск отвечает полнотекстом с `degraded: qdrant_down` и
-    предупреждением «индекс пересобирается» — это не сбой.
+    `GET /api/v1/index/status` — векторный поиск включён, очередь пуста,
+    `reindex.running = false`, в `reindex.last` нет ошибок. В первые секунды после запуска поиск
+    отвечает полнотекстом с `degraded: qdrant_down` и предупреждением «индекс пересобирается» —
+    это не сбой. Адрес и токен — переменными окружения (так токен не попадает в список
+    процессов); `zam` — из комплекта или с машины агента:
 
-    ```
-    zam status --url http://new-host:7700 --token <токен>   # код 0
+    ```powershell
+    $env:ZAM_URL = 'http://new-host:7700'; $env:ZAM_TOKEN = '<токен>'
+    zam status                                              # код 0
     zam search "<слово из вашей заметки>"                   # те же заметки
-    zam vault get <имя секрета> --raw --solution <GUID>     # значение секрета (ключ на месте); --global — личный Vault
+    zam vault get <имя секрета> --raw --solution <GUID>     # значение секрета; --global — личный Vault
     ```
 
-    и раздел «Индекс» WebUI: векторный поиск включён, очередь пуста, `reindex.last` — без
-    ошибок; в WebUI — вложения, идеи и отчёты.
+    ```bash
+    export ZAM_URL=http://new-host:7700 ZAM_TOKEN='<токен>'
+    zam status                                              # код 0
+    zam search "<слово из вашей заметки>"                   # те же заметки
+    zam vault get <имя секрета> --raw --solution <GUID>     # значение секрета; --global — личный Vault
+    ```
+
+    В WebUI — вложения, идеи и отчёты.
 
 **Одно пространство: `export` / `import`.** Когда переезжает не весь сервер, а одно
 пространство (например, Knowledge на чужой сервер, где у вас уже есть пользователь), —
@@ -1313,7 +1372,7 @@ jina — модель с динамическим int8: пары «запрос 
 
 ```
 zam export --space knowledge -o knowledge.zip                     # на старом сервере
-zam import knowledge.zip --space knowledge --own --url http://new-host:7700 --token <токен>
+zam import knowledge.zip --space knowledge --own                  # на новом: ZAM_URL и ZAM_TOKEN нового сервера
 ```
 
 В архив входят заметки (`.md` с frontmatter), вложения, записи журналов, связи и история; Vault,

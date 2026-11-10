@@ -1604,8 +1604,9 @@ cargo xtask transfer-check bindings --data-dir <D> --old-path "<старый dat
 - [ ] **Step 1: Тест** (FAIL) `restore_has_no_machine_bindings`: `cargo test -p zam-server --test
   backup $T bindings`.
 - [ ] **Step 2: `transfer-check` и раздел инструкции.**
-  - Шаги §12б.6 — дословными командами для Windows (PowerShell) и Linux (bash), в порядке: модель и
-    Qdrant **до** `restore`, затем `serve` пересобирает индекс из кэша.
+  - Шаги §12б.6 — дословными командами для Windows (PowerShell) и Linux (bash), в порядке: модель,
+    Qdrant и мастер-ключ **до** `restore` (ключ — решение координатора по ревью, ТЗ ред. 4.7),
+    затем `serve` пересобирает индекс из кэша.
   - Предупреждения:
     - мастер-ключ хранится отдельно;
     - при другой модели или нарезке векторы считаются заново, а на 2 ядрах это долго.

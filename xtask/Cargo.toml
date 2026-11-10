@@ -14,7 +14,8 @@ zam-core = { path = "../crates/zam-core" }
 # сервера (`zam_code::rank_with`, без фичи `parse`); свой крейт workspace
 zam-code = { path = "../crates/zam-code" }
 anyhow.workspace = true
-clap.workspace = true
+# `env`: токен `transfer-check` из `ZAM_TOKEN`, а не из списка процессов (фича того же крейта)
+clap = { workspace = true, features = ["env"] }
 zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
