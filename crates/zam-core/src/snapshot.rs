@@ -87,9 +87,6 @@ pub mod limits {
     pub const SUMMARY_BYTES: usize = 8 * 1024;
 }
 
-/// Форматы журналов агентов (поле `agent` снимка): адаптеры клиента `zam`.
-pub const AGENT_FORMATS: [&str; 2] = ["claude", "codex"];
-
 /// Команда из журнала агента; `failed` — исход, если журнал его знает.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapCommand {

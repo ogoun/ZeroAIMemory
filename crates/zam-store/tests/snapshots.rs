@@ -6,8 +6,8 @@ use jiff::{SignedDuration, Timestamp};
 use zam_core::Id;
 use zam_core::snapshot::{SnapCommand, SnapStatus, SnapTrigger, SnapshotData};
 use zam_store::{
-    DataDir, Db, SessionTouch, SnapshotRow, StoreError, UserDbs, gc_sessions, gc_snapshots,
-    get_session, get_snapshot, put_snapshot, touch_session,
+    DataDir, Db, SessionTouch, SnapshotRow, StoreError, UserDbs, digest_snapshot, end_session,
+    gc_sessions, gc_snapshots, get_session, get_snapshot, put_snapshot, touch_session,
 };
 
 async fn db(name: &str) -> (DataDir, Db) {
@@ -163,4 +163,58 @@ async fn gc_sessions_drops_snapshots() {
     assert_eq!(get_snapshot(&db, "old").await.unwrap(), None);
     assert!(get_session(&db, "old").await.unwrap().is_none());
     assert!(get_snapshot(&db, "fresh").await.unwrap().is_some());
+}
+
+/// Повторное ревью 17c, N2: «оборванная A, затем завершённая B». С показом завершённых берётся
+/// последний снимок (B); без него завершённые не выбираются в самом запросе — остаётся снимок A,
+/// а не пусто. Своя сессия (`except`) и другое решение не выбираются.
+#[tokio::test]
+async fn digest_snapshot_can_skip_ended_sessions() {
+    let (_dd, db) = db("digest-ended").await;
+    let guid = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e17";
+    for id in ["A", "B", "C"] {
+        let s = SessionTouch {
+            id: id.into(),
+            solution_guid: Some(guid.parse().unwrap()),
+            ..SessionTouch::default()
+        };
+        touch_session(&db, &s).await.unwrap();
+    }
+    session(&db, "other").await;
+    put_snapshot(&db, &row("A", "2026-11-05T09:00:00Z", SnapTrigger::Stop))
+        .await
+        .unwrap();
+    put_snapshot(
+        &db,
+        &row("B", "2026-11-05T10:00:00Z", SnapTrigger::SessionEnd),
+    )
+    .await
+    .unwrap();
+    put_snapshot(
+        &db,
+        &row("other", "2026-11-05T11:00:00Z", SnapTrigger::Stop),
+    )
+    .await
+    .unwrap();
+    assert!(end_session(&db, "B", true).await.unwrap());
+    let since = ts("2026-11-04T00:00:00Z");
+    let pick = |except: Option<&'static str>, show_ended: bool| {
+        let db = db.clone();
+        async move {
+            digest_snapshot(&db, guid, except, since, show_ended)
+                .await
+                .unwrap()
+                .map(|r| r.session_id)
+        }
+    };
+    assert_eq!(pick(Some("C"), true).await.as_deref(), Some("B"));
+    assert_eq!(pick(Some("C"), false).await.as_deref(), Some("A"));
+    assert_eq!(pick(Some("A"), false).await, None);
+    assert_eq!(pick(Some("B"), true).await.as_deref(), Some("A"));
+    // окно: снимки раньше `since` не выбираются
+    let late = ts("2026-11-05T09:30:00Z");
+    assert_eq!(
+        digest_snapshot(&db, guid, None, late, false).await.unwrap(),
+        None
+    );
 }
