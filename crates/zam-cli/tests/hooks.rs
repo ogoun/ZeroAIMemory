@@ -5884,3 +5884,90 @@ fn snapshot_decision_never_delays_changed_flush() {
     assert!(sent >= 1, "очередь изменённых не ушла: {}", p.log());
     assert!(queue(&p, s).is_empty(), "{}", p.log());
 }
+
+/// Ревью правки `checkpoint`, Minor 1: ожидание потока снимка ограничено концом бюджета хука —
+/// медленная сеть (2 с) и медленное решение (`decide-stall-ms` 3 с) не уводят выход `Stop` за
+/// бюджет (1 с) больше чем на малый запас.
+#[test]
+fn snapshot_wait_bounded_by_hook_budget() {
+    let _g = serial();
+    let (url, _seen) = common::stub(
+        200,
+        r#"{"memory_writes":0,"claimed_tasks":[]}"#,
+        Duration::from_secs(2),
+    );
+    let p = Proj::new("snap-wait-budget", &url, "zam_x");
+    let s = "wb-1";
+    empty(&p.hook("pre-tool", &write_ev(&p, s, "a.sh")));
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    std::fs::write(format!("{}.decide-stall-ms", t.display()), "3000").unwrap();
+    let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
+    let run = || {
+        let mut c = p.cmd(&url);
+        c.env("ZAM_TEST_HOOK_BUDGET_MS", "1000")
+            .env("ZAM_TEST_SNAPSHOT_PUT_MS", "1000")
+            .args(["hook", "checkpoint", "--agent", "claude"])
+            .write_stdin(stop.to_string().into_bytes());
+        let t0 = Instant::now();
+        let o = c.output().unwrap();
+        (o, t0.elapsed())
+    };
+    let _ = run();
+    let (o, d) = run();
+    ok(&o);
+    assert!(
+        d <= Duration::from_millis(1000 + 300),
+        "поток снимка увёл хук за бюджет: {d:?}"
+    );
+}
+
+/// Ревью правки `checkpoint`, Minor 3: сначала очередь, потом `snapst-*` — обрыв между записями
+/// (подмена `write-stall-ms`, хук выходит по своему пределу) оставляет снимок в очереди без
+/// отметки «снят», а не отметку без снимка.
+#[test]
+fn snapshot_queue_written_before_state() {
+    let _g = serial();
+    let (url, _seen) = snap_stub(204, "");
+    let p = Proj::new("snap-write-order", &url, "zam_x");
+    let s = "wo-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    std::fs::write(format!("{}.write-stall-ms", t.display()), "3000").unwrap();
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    let o = p
+        .cmd(&url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+        .env("ZAM_TEST_SNAPSHOT_MS", "500")
+        .args(["hook", "checkpoint", "--agent", "claude"])
+        .write_stdin(pc.to_string().into_bytes())
+        .output()
+        .unwrap();
+    empty(&o);
+    assert!(
+        snap_file(&p, "snapq", s).is_some(),
+        "снимка нет в очереди: {}",
+        p.log()
+    );
+    let st = snap_file(&p, "snapst", s);
+    assert!(
+        st.as_ref().is_none_or(|v| v["ok_at"] == 0),
+        "отметка «снят» без очереди: {st:?}"
+    );
+}
+
+/// Ревью правки `checkpoint`, Minor 4: паника потока снимка (тестовая точка `<журнал>.panic`) —
+/// строка «snapshot: паника» в `hooks.log`, хук отвечает как обычно.
+#[test]
+fn snapshot_thread_panic_logged() {
+    let _g = serial();
+    let (url, _seen) = snap_stub(204, "");
+    let p = Proj::new("snap-panic", &url, "zam_x");
+    let s = "pn-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    std::fs::write(format!("{}.panic", t.display()), "").unwrap();
+    let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
+    empty(&hook_snap(&p, "checkpoint", &stop));
+    assert!(p.log().contains("snapshot: паника"), "{}", p.log());
+}

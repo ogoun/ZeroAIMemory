@@ -7804,3 +7804,36 @@ FAIL (жирное): база — 5 из 10, 17b — 4 из 10; разброс �
 **Проверка.** `hooks` 97 PASS, `snapshot` 32 PASS; `clippy -p zam-cli --all-targets -D warnings`
 и `rustfmt --check` по своим файлам — чисто. Worktree снят (`git worktree remove`, без junction),
 `target/t17b` удалён.
+
+### Задача 17b, мелкие ревью правки checkpoint (2026-11-10)
+
+Коммит `fix(hooks): мелкие ревью правки checkpoint — предел ожидания снимка, порядок записей,
+паника` поверх `65e6320` (sha — в отчёте контроллеру).
+1. **Абсолютный предел ожидания потока снимка.** `wait_snapshot` ждёт до меньшего из конца
+   бюджета хука от старта процесса (`Env::budget_left`, новый; `Env::budget_ms` — бюджет с
+   подменой `ZAM_TEST_HOOK_BUDGET_MS`) и запуска потока + срок снимка + срок `PUT` + 50 мс.
+   Медленное решение или сеть больше не уводят выход хука (и `decision: block` у `Stop`) за
+   бюджет. Тест `snapshot_wait_bounded_by_hook_budget`: сеть отвечает через 2 с, решение
+   засыпает на 3 с, бюджет 1 с — хук ≤ 1,3 с.
+2. **Точка подмены — внутри решения.** `decide-stall-ms` перенесена в начало
+   `job_for_checkpoint` (общая `test_point`): `snapshot_decision_never_delays_changed_flush` ловит
+   вызов решения на главном пути в любой форме.
+3. **Порядок записей в `run`.** Сначала очередь `snapq-*`, затем `snapst-*` (отметка «снимок
+   записан»): обрыв между ними оставляет снимок в очереди без отметки (следующий `Stop` снимет
+   заново, очередь уйдёт), а не отметку без снимка. Пустой снимок — по-прежнему только `snapst-*`.
+   Тест `snapshot_queue_written_before_state`: подмена `write-stall-ms` между записями, хук выходит
+   по своему пределу — очередь есть, удавшейся отметки (`ok_at`) нет.
+4. **Паника потока снимка.** Тело потока — в `catch_unwind`, паника — строка «snapshot: паника» в
+   `hooks.log`, хук отвечает как обычно. Тестовая точка `<журнал>.panic` (debug/`test-hooks`),
+   тест `snapshot_thread_panic_logged`.
+
+**Откаты** (`rollbacks6.py` + `rollbacks6_list.py`, журнал `rollbacks-r6.log`): 4, все FAIL ожидаемым тестом: W1 ожидание
+от конца сетевой части → `snapshot_wait_bounded_by_hook_budget`; W2 `job_for_checkpoint` на
+главном пути → `snapshot_decision_never_delays_changed_flush`; W3 `snapst-*` раньше очереди →
+`snapshot_queue_written_before_state`; W4 паника без строки в журнале → `snapshot_thread_panic_logged`.
+
+**Проверка.** `hooks` — 99 из 100 (`r6-suites.log`): FAIL
+`session_start_holdout_quiet_group` (метка `holdout` со сроком 100 мс не поставлена у одной
+сессии; `session-start` в этом круге не менялся, снимков в тесте нет), повтор поодиночке — 3 из 3
+PASS. `snapshot` — 32 PASS. `clippy -p zam-cli --all-targets -D warnings` и `rustfmt --check` по
+своим файлам — чисто. `target/t17b` удалён.

@@ -174,6 +174,10 @@ fn transcript_of(inp: &Input) -> Option<PathBuf> {
 /// `None` (выключено, нет сессии или журнала, `Stop` ещё рано). `PostCompact` без журнала, но с
 /// `compact_summary` — снимок из одного конспекта. Журнал агента здесь не трогается.
 pub fn job_for_checkpoint(env: &Env, inp: &Input, s: &Settings) -> Option<Job> {
+    // точка подмены — в самом решении: вызов на главном пути хука в любой форме тест поймает
+    if let Some(t) = transcript_of(inp) {
+        test_point(&t, "decide-stall-ms");
+    }
     if !s.session_snapshot() {
         return None;
     }
@@ -421,14 +425,14 @@ pub fn run(env: &Env, s: &Settings, job: Job, send: bool) {
         ended: ended || prev.is_some_and(|p| p.ended),
         prompt_at,
     };
-    write_state(env, &st_path, &st);
     // пустой снимок (в хвосте нет ни конспекта, ни запросов, ни файлов, ни команд) — не нужен
-    // серверу: прежний снимок сессии остаётся
+    // серверу: прежний снимок сессии остаётся, отметка о снимке — в `snapst-*`
     if d.compact_summary.is_none()
         && d.prompts.is_empty()
         && d.files.is_empty()
         && d.commands.is_empty()
     {
+        write_state(env, &st_path, &st);
         flush_old();
         return;
     }
@@ -459,9 +463,13 @@ pub fn run(env: &Env, s: &Settings, job: Job, send: bool) {
     let Ok(body) = serde_json::from_slice::<Value>(&body) else {
         return;
     };
+    // сначала очередь, потом `snapst-*` (отметка «снимок записан»): обрыв между ними оставляет
+    // снимок в очереди без отметки (следующий хук снимет заново), а не отметку без снимка
     if !enqueue(env, &job.session, body) {
         return;
     }
+    test_point(&job.transcript, "write-stall-ms");
+    write_state(env, &st_path, &st);
     let r = if send { flush(env, &job.session) } else { None };
     log_sent(env, &what, r, true);
 }
@@ -685,55 +693,84 @@ pub fn flush_others(env: &Env, except: &[&str]) {
 /// решение ([`job_for_checkpoint`]: `snapst-*`, журнал сессии), снимок ([`run`]) или отправка
 /// прежней очереди ([`flush_logged`]) — всё вне пути сетевой части хука. Поток не scoped: хук ждёт
 /// его не дольше [`wait_snapshot`], опоздавший обрывается с процессом (записи файлов — атомарные).
-pub fn spawn_checkpoint(env: &Env, inp: &Input, s: &Settings) -> std::sync::mpsc::Receiver<()> {
+pub fn spawn_checkpoint(env: &Env, inp: &Input, s: &Settings) -> SnapWait {
     let (tx, rx) = std::sync::mpsc::channel();
+    let started = std::time::Instant::now();
     let log_env = env.clone();
     let (env, inp, s) = (env.clone(), inp.clone(), *s);
     let spawned = std::thread::Builder::new()
         .name("zam-snapshot-job".into())
         .spawn(move || {
-            test_decide_stall(&inp);
-            match job_for_checkpoint(&env, &inp, &s) {
-                Some(job) => run(&env, &s, job, true),
-                None => {
-                    if let Some(id) = inp.session_id.as_deref().filter(|id| queued(&env, id)) {
-                        flush_logged(&env, id);
+            // паника потока — строкой в `hooks.log`, хук не ждёт до своего предела
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(t) = transcript_of(&inp) {
+                    test_panic(&t);
+                }
+                match job_for_checkpoint(&env, &inp, &s) {
+                    Some(job) => run(&env, &s, job, true),
+                    None => {
+                        if let Some(id) = inp.session_id.as_deref().filter(|id| queued(&env, id)) {
+                            flush_logged(&env, id);
+                        }
                     }
                 }
+            }));
+            if r.is_err() {
+                env.log("snapshot: паника");
             }
             let _ = tx.send(());
         });
     if let Err(e) = spawned {
         log_env.log(&format!("snapshot: поток не запущен: {e}"));
     }
-    rx
+    SnapWait { rx, started }
 }
 
-/// Ожидание потока снимка `checkpoint` после сетевой части: не дольше срока снимка и срока `PUT`
-/// с запасом на локальные записи ([`WAIT_SLACK`]) — обычный снимок успевает целиком (очередь и
-/// `snapst-*` записаны), а задержка выхода хука ограничена.
-pub fn wait_snapshot(s: &Settings, done: &std::sync::mpsc::Receiver<()>) {
-    let cap = s.snapshot_deadline() + Duration::from_millis(put_ms()) + WAIT_SLACK;
+/// Поток снимка `checkpoint`: сигнал окончания и момент запуска.
+pub struct SnapWait {
+    rx: std::sync::mpsc::Receiver<()>,
+    started: std::time::Instant,
+}
+
+/// Ожидание потока снимка `checkpoint` после сетевой части. Предел абсолютный: меньшее из конца
+/// бюджета хука (от старта процесса) и запуска потока + срок снимка + срок `PUT` + [`WAIT_SLACK`]
+/// — медленное решение или сеть не уводят выход хука (и `decision: block` у `Stop`) за бюджет;
+/// обычный снимок успевает целиком (очередь и `snapst-*` записаны).
+pub fn wait_snapshot(env: &Env, s: &Settings, w: &SnapWait) {
+    let own = s.snapshot_deadline() + Duration::from_millis(put_ms()) + WAIT_SLACK;
+    let own_left = own.saturating_sub(w.started.elapsed());
     // не успел (подмена сроков в тестах, занятый диск) — хук выходит без него
-    let _ = done.recv_timeout(cap);
+    let _ = w.rx.recv_timeout(own_left.min(env.budget_left()));
 }
 
 /// Запас ожидания потока снимка сверх его сроков: решение, журнал сессии, `snapst-*`, очередь.
 const WAIT_SLACK: Duration = Duration::from_millis(50);
 
-/// Точка подмены для тестов: файл `<журнал>.decide-stall-ms` — поток снимка `checkpoint` засыпает
-/// до решения (проверка, что сетевая часть хука решения не ждёт). Только отладочная сборка и фича
-/// `test-hooks`.
-fn test_decide_stall(inp: &Input) {
+/// Точки подмены для тестов (только отладочная сборка и фича `test-hooks`): файл
+/// `<журнал>.<suffix>` с числом миллисекунд — поток засыпает. `decide-stall-ms` — в начале
+/// решения ([`job_for_checkpoint`]: сетевая часть хука решения не ждёт), `write-stall-ms` — между
+/// очередью и `snapst-*` в [`run`] (порядок записей при обрыве).
+fn test_point(transcript: &Path, suffix: &str) {
     #[cfg(any(feature = "test-hooks", debug_assertions))]
-    if let Some(ms) = transcript_of(inp)
-        .and_then(|t| std::fs::read_to_string(format!("{}.decide-stall-ms", t.display())).ok())
+    if let Some(ms) = std::fs::read_to_string(format!("{}.{suffix}", transcript.display()))
+        .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
         std::thread::sleep(Duration::from_millis(ms));
     }
     #[cfg(not(any(feature = "test-hooks", debug_assertions)))]
-    let _ = inp;
+    let _ = (transcript, suffix);
+}
+
+/// Точка паники для тестов: файл `<журнал>.panic` — поток снимка `checkpoint` паникует (только
+/// отладочная сборка и фича `test-hooks`).
+fn test_panic(transcript: &Path) {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if std::path::PathBuf::from(format!("{}.panic", transcript.display())).is_file() {
+        panic!("тестовая паника потока снимка");
+    }
+    #[cfg(not(any(feature = "test-hooks", debug_assertions)))]
+    let _ = transcript;
 }
 
 /// Отправка очереди сессии без нового снимка, итог — в `hooks.log`.

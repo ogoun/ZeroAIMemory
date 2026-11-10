@@ -467,8 +467,9 @@ impl Env {
         }
     }
 
-    /// Остаток бюджета на HTTP: бюджет минус [`HTTP_RESERVE_MS`] от старта процесса.
-    pub fn http_left(&self) -> Option<Duration> {
+    /// Бюджет хука, мс (§10.3); отладочная сборка или фича `test-hooks` —
+    /// `ZAM_TEST_HOOK_BUDGET_MS`.
+    pub fn budget_ms(&self) -> u64 {
         #[allow(unused_mut)]
         let mut budget = self.kind.budget_ms();
         // щедрый бюджет для тестов содержимого (отладочная сборка под нагрузкой; повторное
@@ -480,7 +481,17 @@ impl Env {
         {
             budget = ms;
         }
-        let total = Duration::from_millis(budget.saturating_sub(HTTP_RESERVE_MS));
+        budget
+    }
+
+    /// Остаток всего бюджета хука от старта процесса (без резерва HTTP).
+    pub fn budget_left(&self) -> Duration {
+        Duration::from_millis(self.budget_ms()).saturating_sub(self.started.elapsed())
+    }
+
+    /// Остаток бюджета на HTTP: бюджет минус [`HTTP_RESERVE_MS`] от старта процесса.
+    pub fn http_left(&self) -> Option<Duration> {
+        let total = Duration::from_millis(self.budget_ms().saturating_sub(HTTP_RESERVE_MS));
         total
             .checked_sub(self.started.elapsed())
             .filter(|d| !d.is_zero())

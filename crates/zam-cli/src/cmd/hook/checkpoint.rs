@@ -156,7 +156,7 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
         out
     });
     if let Some(done) = snap {
-        snapshot_queue::wait_snapshot(s, &done);
+        snapshot_queue::wait_snapshot(env, s, &done);
     }
     out
 }
