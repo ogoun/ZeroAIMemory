@@ -880,18 +880,14 @@ struct Scanner<'a> {
     /// Начала пустых строк (граница абзаца для поиска скобок и `` ` ``).
     breaks: Vec<usize>,
     out: Vec<String>,
-    /// Счёт скобок блока для голых автоссылок `схема://…` и `www.…`: до какой позиции текст
-    /// просмотрен и сколько `[` там не закрыто. Позиции запросов только растут — каждый байт
-    /// просматривается один раз.
-    brackets: (usize, u32),
-    /// То же для почты, по строке: просмотрено до позиции, начало счёта (строки или конец
+    /// Счёт скобок для почты, по строке: просмотрено до позиции, начало счёта (строки или конец
     /// предыдущей автоссылки), разность числа `[` и `]`.
     line_brackets: (usize, usize, i32),
     /// Для [`inline_html`]: концы абзацев, в которых закрывающей последовательности дальше нет.
     html_miss: [usize; 6],
-    /// Концы абзацев, до которых нет закрывающих `]]` вики-ссылки и `$` формулы: второй раз до
-    /// конца абзаца их не ищут (непарный знак в каждой строке длинной таблицы).
-    scan_miss: [usize; 2],
+    /// Конец абзаца, до которого нет закрывающего `$` формулы: второй раз до конца абзаца его
+    /// не ищут (непарный знак в каждой строке длинной таблицы).
+    math_miss: usize,
     /// Пары вложенных скобок, найденные попутно ([`Scanner::match_bracket`]); `None` — пары нет.
     bracket_pairs: HashMap<usize, Option<usize>>,
 }
@@ -924,10 +920,9 @@ impl<'a> Scanner<'a> {
             defs,
             breaks,
             out: Vec::new(),
-            brackets: (0, 0),
             line_brackets: (0, 0, 0),
             html_miss: [0; 6],
-            scan_miss: [0; 2],
+            math_miss: 0,
             bracket_pairs: HashMap::new(),
         }
     }
@@ -936,46 +931,6 @@ impl<'a> Scanner<'a> {
     fn para_end(&self, i: usize) -> usize {
         let k = self.breaks.partition_point(|&s| s <= i);
         self.breaks.get(k).copied().unwrap_or(self.b.len())
-    }
-
-    /// Перед позицией `i` в её блоке есть незакрытая `[`: внутри скобок разбор сервера голых
-    /// автоссылок `схема://…` и `www.…` не ищет (скобка может оказаться текстом ссылки).
-    /// Приближение: скобки считаются по тексту блока как есть (без кода и формул), блок — от
-    /// пустой строки или строки с маркером заголовка, списка, цитаты. Счёт продолжается с
-    /// места прошлого запроса ([`Scanner::brackets`]): запросы идут по возрастанию `i`.
-    fn in_brackets(&mut self, i: usize) -> bool {
-        let (b, s) = (self.b, self.s);
-        let (mut j, mut depth) = self.brackets;
-        let k = self.breaks.partition_point(|&p| p <= i);
-        let block = if k == 0 { 0 } else { self.breaks[k - 1] };
-        if block > j {
-            (j, depth) = (block, 0);
-        }
-        while j < i {
-            steps(1);
-            match b[j] {
-                b'\\' => j += 1,
-                b'[' => depth += 1,
-                b']' => depth = depth.saturating_sub(1),
-                b'\n' if block_marker(&b[j + 1..]) => depth = 0,
-                // скобка внутри более ранней голой автоссылки — часть её адреса
-                b':' | b'w' if depth == 0 => {
-                    let end = if b[j] == b':' {
-                        bare_url_autolink(s, j).map(|l| l.end)
-                    } else {
-                        bare_www_autolink(s, j)
-                    };
-                    if let Some(end) = end {
-                        j = end;
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-            j += 1;
-        }
-        self.brackets = (j, depth);
-        depth > 0
     }
 
     /// Для почты в позиции `i`: начало её текста (строки или `floor` — конца предыдущей голой
@@ -1003,15 +958,29 @@ impl<'a> Scanner<'a> {
 
     fn run(mut self) -> Vec<String> {
         let (b, s) = (self.b, self.s);
-        // (откуда, куда): дойдя до `]` текста найденной ссылки, перепрыгнуть её назначение
-        let mut jumps: Vec<(usize, usize)> = Vec::new();
+        // откуда → куда: дойдя до `]` текста найденной ссылки, перепрыгнуть её назначение
+        // (по ключу: вложенные ссылки копят переходы, перебор на каждом байте был бы квадратичен)
+        let mut jumps: HashMap<usize, usize> = HashMap::new();
         // конец последней голой автоссылки (`схема://…`, `www.…`, почта)
         let mut bare_end = 0;
+        // Сколько `[` блока не закрыто — как стек скобок разбора сервера: `[` кладёт, `]`
+        // снимает (стала скобка ссылкой или нет). Внутри скобок сервер голых автоссылок
+        // `схема://…`, `www.…` и вики-ссылок не ищет. Считается в этом же проходе: код, формулы,
+        // строчный HTML и назначения ссылок уже пропущены. Блок — от пустой строки или строки с
+        // маркером заголовка, списка, цитаты (приближение: ячейки таблицы — один блок).
+        let mut depth = 0u32;
+        let mut next_break = 0;
         let mut i = 0;
         while i < b.len() {
-            steps(1 + jumps.len());
-            if let Some(k) = jumps.iter().position(|j| j.0 == i) {
-                i = jumps.swap_remove(k).1;
+            steps(1);
+            while self.breaks.get(next_break).is_some_and(|&p| p <= i) {
+                depth = 0;
+                next_break += 1;
+            }
+            if let Some(to) = jumps.remove(&i) {
+                // `]` текста найденной ссылки
+                depth = depth.saturating_sub(1);
+                i = to;
                 continue;
             }
             match b[i] {
@@ -1025,33 +994,40 @@ impl<'a> Scanner<'a> {
                 b'`' => i = self.skip_code(i),
                 b'$' => i = self.skip_math(i),
                 b'<' => i = self.skip_angle(i),
-                b'!' if b.get(i + 1) == Some(&b'[') => {
+                b'\n' => {
+                    if block_marker(&b[i + 1..]) {
+                        depth = 0;
+                    }
+                    i += 1;
+                }
+                // `[` и `]` внутри голой автоссылки (`https://e.org/b[t](x.png)`) — часть её
+                // адреса: разбор сервера ссылки там не видит
+                b'!' if b.get(i + 1) == Some(&b'[') && i >= bare_end => {
                     self.link(i + 1, &mut jumps);
+                    depth += 1;
                     i += 2;
                 }
-                b'[' => {
-                    if b.get(i + 1) == Some(&b'[') {
-                        // вики-ссылка `[[…]]` — не файл отчёта
-                        let end = self.para_end(i);
-                        if self.scan_miss[0] != end {
-                            let found = find(&b[i..end], b"]]");
-                            steps(found.unwrap_or(end - i));
-                            if let Some(k) = found {
-                                i += k + 2;
-                                continue;
-                            }
-                            self.scan_miss[0] = end;
-                        }
+                b'[' if i >= bare_end => {
+                    // вики-ссылка `[[…]]` — не файл отчёта
+                    if depth == 0
+                        && let Some(n) = wikilink(&b[i..self.para_end(i)])
+                    {
+                        steps(n);
+                        i += n;
+                        continue;
                     }
                     self.link(i, &mut jumps);
+                    depth += 1;
+                    i += 1;
+                }
+                b']' if i >= bare_end => {
+                    depth = depth.saturating_sub(1);
                     i += 1;
                 }
                 // голые автоссылки GFM — только ради отказа по схеме (файлом отчёта они не
                 // бывают); внутри уже найденной (`https://a/ftp://b`) новых нет
-                b':' if i >= bare_end => {
-                    if let Some(l) = bare_url_autolink(s, i)
-                        && !self.in_brackets(i)
-                    {
+                b':' if i >= bare_end && depth == 0 => {
+                    if let Some(l) = bare_url_autolink(s, i) {
                         bare_end = l.end;
                         if l.ftp {
                             self.out
@@ -1060,10 +1036,8 @@ impl<'a> Scanner<'a> {
                     }
                     i += 1;
                 }
-                b'w' if i >= bare_end => {
-                    if let Some(end) = bare_www_autolink(s, i)
-                        && !self.in_brackets(i)
-                    {
+                b'w' if i >= bare_end && depth == 0 => {
+                    if let Some(end) = bare_www_autolink(s, i) {
                         bare_end = end;
                     }
                     i += 1;
@@ -1125,7 +1099,7 @@ impl<'a> Scanner<'a> {
             return i + 1;
         }
         let end = self.para_end(i);
-        if self.scan_miss[1] == end {
+        if self.math_miss == end {
             return i + 1;
         }
         let mut k = i + 1;
@@ -1144,7 +1118,7 @@ impl<'a> Scanner<'a> {
         }
         // закрывающего `$` до конца абзаца нет — и для следующих `$` тоже
         steps(end - i);
-        self.scan_miss[1] = end;
+        self.math_miss = end;
         i + 1
     }
 
@@ -1180,7 +1154,7 @@ impl<'a> Scanner<'a> {
 
     /// Ссылка с текстом с позиции `[` (`open`): назначение — в вывод, переход через него — в
     /// `jumps`.
-    fn link(&mut self, open: usize, jumps: &mut Vec<(usize, usize)>) {
+    fn link(&mut self, open: usize, jumps: &mut HashMap<usize, usize>) {
         let b = self.b;
         let Some(close) = self.match_bracket(open) else {
             return;
@@ -1195,7 +1169,7 @@ impl<'a> Scanner<'a> {
             && let Some((dest, end)) = self.inline_dest(after)
         {
             self.out.push(dest);
-            jumps.push((close, end));
+            jumps.insert(close, end);
             return;
         }
         if b.get(after) == Some(&b'[')
@@ -1205,7 +1179,7 @@ impl<'a> Scanner<'a> {
             let label = if label.is_empty() { text } else { label };
             if let Some(d) = self.def(label) {
                 self.out.push(d);
-                jumps.push((close, lc + 1));
+                jumps.insert(close, lc + 1);
             }
             return;
         }
@@ -1380,7 +1354,7 @@ fn is_autolink(s: &[u8]) -> bool {
 
 /// Длина строчного HTML в начале `s` (`s[0] == b'<'`; CommonMark §6.6): открывающий тег с
 /// атрибутами, закрывающий тег, комментарий `<!-- … -->`, инструкция `<? … ?>`, объявление
-/// `<!X … >`, `<![CDATA[ … ]]>`. `None` — не HTML: `<` — обычный текст. `s` — до конца абзаца
+/// `<!NAME … >`, `<![CDATA[ … ]]>`. `None` — не HTML: `<` — обычный текст. `s` — до конца абзаца
 /// `para`; `miss` помнит, каких закрывающих последовательностей в этом абзаце дальше нет
 /// (второй раз до конца абзаца их не ищут).
 fn inline_html(s: &[u8], para: usize, miss: &mut [usize; 6]) -> Option<usize> {
@@ -1404,10 +1378,24 @@ fn inline_html(s: &[u8], para: usize, miss: &mut [usize; 6]) -> Option<usize> {
             if s[4..].starts_with(b"->") {
                 return Some(6);
             }
-            until(0, 4, b"-->")
+            // закрывающая `-->` в абзаце вообще есть (иначе второй раз не ищем) — и разбор
+            // сервера доходит именно до неё
+            until(0, 4, b"-->")?;
+            html_comment_end(s)
         }
         b'!' if s[2..].starts_with(b"[CDATA[") => until(1, 9, b"]]>"),
-        b'!' if s.get(2).is_some_and(u8::is_ascii_alphabetic) => until(2, 2, b">"),
+        // объявление — как в разборе сервера (comrak 0.56, `declaration`): заглавные буквы,
+        // затем пробельный символ; `<!D<ftp://q.org>` — не объявление, а текст и автоссылка
+        b'!' if s.get(2).is_some_and(u8::is_ascii_uppercase) => {
+            let name = s[2..].iter().take_while(|c| c.is_ascii_uppercase()).count();
+            if !s
+                .get(2 + name)
+                .is_some_and(|&c| space(c) || matches!(c, 0x0b | 0x0c))
+            {
+                return None;
+            }
+            until(2, 2 + name, b">")
+        }
         b'?' => until(3, 2, b"?>"),
         b'/' => {
             if !s.get(2)?.is_ascii_alphabetic() {
@@ -1464,6 +1452,61 @@ fn inline_html(s: &[u8], para: usize, miss: &mut [usize; 6]) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// Конец комментария HTML в начале `s` (`<!--…`) — как `htmlcomment` разбора сервера (comrak
+/// 0.56): текст комментария — куски «не дефис», «дефис и не дефис», «два дефиса и не `>`»; конец
+/// — `-->` на границе куска. Поэтому `<!--a<!---->` комментарием не кончается: `---` — один
+/// кусок, за ним `->`.
+fn html_comment_end(s: &[u8]) -> Option<usize> {
+    let mut k = 4;
+    while k < s.len() {
+        if s[k] != b'-' {
+            k += 1;
+        } else if s.get(k + 1) != Some(&b'-') {
+            k += 2;
+        } else if s.get(k + 2) == Some(&b'>') {
+            steps(k);
+            return Some(k + 3);
+        } else {
+            k += 3;
+        }
+    }
+    steps(s.len());
+    None
+}
+
+/// Длина вики-ссылки `[[адрес]]` или `[[адрес|текст]]` в начале `s` — как `handle_wikilink`
+/// разбора сервера (comrak 0.56): в частях нет `[`, `]`, `|` (экранирование `\` — как в тексте),
+/// часть не длиннее 1000 символов. `[[a][b]]` — не вики-ссылка, а две обычные.
+fn wikilink(s: &[u8]) -> Option<usize> {
+    if !s.starts_with(b"[[") {
+        return None;
+    }
+    // конец части, начатой в `from` (`[` или `|`)
+    let part = |from: usize| -> Option<usize> {
+        let (mut k, mut len) = (from + 1, 0);
+        while let Some(&c) = s.get(k) {
+            if matches!(c, b'[' | b']' | b'|') {
+                break;
+            }
+            if c == b'\\' && s.get(k + 1).is_some_and(u8::is_ascii_punctuation) {
+                k += 1;
+                len += 1;
+            }
+            k += 1;
+            len += 1;
+            if len > 1000 {
+                return None;
+            }
+        }
+        Some(k)
+    };
+    let mut k = part(1)?;
+    if s.get(k) == Some(&b'|') {
+        k = part(k)?;
+    }
+    s[k..].starts_with(b"]]").then_some(k + 2)
 }
 
 /// Знак годится для имени узла голой автоссылки GFM — как `is_valid_hostchar` разбора сервера
@@ -1813,7 +1856,17 @@ mod tests {
             v.dedup();
             v
         };
-        let corpus: [(&str, &[&str]); 23] = [
+        let corpus: [(&str, &[&str]); 27] = [
+            // объявление HTML — заглавные буквы и пробельный символ после имени (ревью, круг 4,
+            // Minor 1); иначе `<!…` — текст, автоссылка за ним видна
+            ("т <!D<ftp://q.org>\n", &["ftp"]),
+            // в начале строки `<!` с буквой открывает блок HTML: ссылок в нём нет
+            ("<!D<ftp://q.org>\n", &[]),
+            (
+                "т <!DOCTYPE ftp://q.org/a> и <!d ftp://q.org/b>\n",
+                &["ftp"],
+            ),
+            ("т <!DOCTYPE<ftp://q.org/a> x>\n", &["ftp"]),
             // адрес почты кончается там, где начинается голая ссылка `схема://…`: от почты
             // остаётся `xmpp:@www.` (не адрес), ссылка — `FTP://…`
             ("т xmpp:@www.FTP://example.org/a\n", &["ftp"]),
@@ -1940,6 +1993,62 @@ mod tests {
         );
     }
 
+    /// Ревью 15a, круг 4, Minor 2: ссылки на файлы рядом с голыми автоссылками — те же, что видит
+    /// разбор сервера. Скобка внутри голой автоссылки (`https://e.org/b[t](x.png)`) — часть её
+    /// адреса, а не начало ссылки. Случайный текст с фиксированным зерном.
+    #[test]
+    fn file_links_near_bare_autolinks_agree_with_server_parse() {
+        for (md, want) in [
+            (
+                "<a href=\"h.png\"><!--https://e.org/b[t](<e f.png>)\n",
+                vec![],
+            ),
+            ("https://e.org/b[t](x.png) и [u](y.png)\n", vec!["y.png"]),
+            ("www.e.org/[t](x.png) ![i](z.png)\n", vec!["z.png"]),
+            ("ftp://q.org/![i](x.png)\n", vec![]),
+            ("[t https://e.org/a](x.png)\n", vec!["x.png"]),
+            ("(https://e.org/a) [t](x.png)\n", vec!["x.png"]),
+        ] {
+            assert_eq!(server(md), want, "разбор сервера:\n{md}");
+            assert_eq!(local(local_links(md)), want, "сканер CLI:\n{md}");
+        }
+        #[rustfmt::skip]
+        const PARTS: &[&str] = &[
+            "https://e.org/b", "http://e.org", "www.e.org/", "ftp://q.org/", "[t](x.png)",
+            "![i](<e f.png>)", "[u](y.png)", "[v][r]", " ", " ", "\n", "<!--", "-->",
+            "<a href=\"h.png\">", "(", ")", ",", ".", "т", "a", "[", "]", "u@h.org", ":", "/",
+        ];
+        let mut x: u32 = 0x15A_2026;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let (mut with_link, mut diff) = (0, Vec::new());
+        for _ in 0..40_000 {
+            let n = 1 + next() % 8;
+            let mut md = String::from("т ");
+            for _ in 0..n {
+                md.push_str(PARTS[(next() % PARTS.len() as u32) as usize]);
+            }
+            md.push_str("\n\n[r]: r.png\n");
+            let want = server(&md);
+            with_link += usize::from(!want.is_empty());
+            let got = local(local_links(&md));
+            if want != got {
+                diff.push(format!("{md:?}: сервер {want:?}, CLI {got:?}"));
+            }
+        }
+        assert!(with_link > 3000, "{with_link}");
+        assert!(
+            diff.is_empty(),
+            "{} расхождений:\n{}",
+            diff.len(),
+            diff[..diff.len().min(40)].join("\n")
+        );
+    }
+
     /// Тела для проверки линейности: `rows` строк одного вида без пустых строк между ними (один
     /// блок — худший случай для счёта скобок).
     fn long_bodies(rows: usize) -> Vec<(&'static str, String)> {
@@ -1992,6 +2101,15 @@ mod tests {
             (
                 "вложенные скобки",
                 make(&|k| format!("[a{k} [b] [c [d] e] f ![g](h{k}.png)\n")),
+            ),
+            // ссылки, вложенные друг в друга на всю глубину: переходы через назначения копятся
+            (
+                "вложенные ссылки",
+                format!(
+                    "{}{}\n",
+                    make(&|k| format!("[a{k} ")),
+                    make(&|k| format!("](x{k}.png)"))
+                ),
             ),
         ]
     }

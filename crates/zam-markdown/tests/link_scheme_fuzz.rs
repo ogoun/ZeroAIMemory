@@ -81,3 +81,71 @@ fn url_scheme_agrees_with_url_parser_on_random_strings() {
         }
     }
 }
+
+/// Ревью 15a, круг 4, I-4: кликабельный адрес `vscode://file/<путь>` разборщик URL не меняет.
+/// Разборщик делит путь только по `/` и снимает сегменты `.`/`..` (`x%2f/..//сервер/y` →
+/// `//сервер/y`), поэтому правило перехода не моделирует нормализацию, а не пускает её повод.
+/// Случайные адреса из кусков с фиксированным зерном (тот же набор и генератор — в тесте WebUI):
+/// ни один кликабельный после разбора не получает путь, начинающийся с `//`, пустой путь или
+/// путь, отличный от написанного.
+#[test]
+fn clickable_vscode_path_survives_url_parser() {
+    for (url, parsed) in [
+        (
+            "vscode://file/x%2f/..//server/share/a.code-workspace",
+            "//server/share/a.code-workspace",
+        ),
+        (
+            "vscode://file/x\\/..//server/share/a.rs",
+            "//server/share/a.rs",
+        ),
+        ("vscode://file/x%5C/..//server/share", "//server/share"),
+        ("vscode://file/x\\/..", "/"),
+    ] {
+        assert_eq!(Url::parse(url).unwrap().path(), parsed, "{url}");
+        assert!(!report_link_clickable(url), "{url}");
+    }
+    const PARTS: &[&str] = &[
+        ".", "..", "%2e", "%2E", "%2F", "%2f", "%5C", "%5c", "%25", "%252E", "\\", "/", "/", "?",
+        "#", "a", "x", "C:", "b.rs",
+    ];
+    let mut rng = Rng(0x15A_2026);
+    let (mut clickable, mut refused, mut changed) = (0u32, 0u32, 0u32);
+    for _ in 0..60_000 {
+        let n = rng.next() % 9;
+        let mut tail = String::new();
+        for _ in 0..n {
+            tail.push_str(PARTS[(rng.next() % PARTS.len() as u32) as usize]);
+        }
+        let t = format!("vscode://file/{tail}");
+        let written = format!("/{}", tail.split(['?', '#']).next().unwrap());
+        let url = Url::parse(&t).unwrap();
+        let parsed = url.path();
+        changed += u32::from(parsed != written);
+        if !report_link_clickable(&t) {
+            refused += 1;
+            continue;
+        }
+        clickable += 1;
+        assert_eq!(parsed, written, "{t}");
+        assert!(!parsed.starts_with("//") && parsed != "/", "{t} → {parsed}");
+        // и прочтение редактора (раскрыть `%2F`, `%5C`, `%2E`; `\` → `/`) — без сетевого пути и `..`
+        let opened = parsed
+            .replace("%2F", "/")
+            .replace("%2f", "/")
+            .replace("%5C", "/")
+            .replace("%5c", "/")
+            .replace("%2E", ".")
+            .replace("%2e", ".")
+            .replace('\\', "/");
+        assert!(!opened.starts_with("//"), "{t} → {opened}");
+        assert!(
+            !opened.split('/').any(|s| s == "." || s == ".."),
+            "{t} → {opened}"
+        );
+    }
+    assert!(
+        clickable > 3000 && refused > 3000 && changed > 3000,
+        "{clickable}/{refused}/{changed}"
+    );
+}

@@ -97,8 +97,8 @@ export function reportLinkAllowed(target: string): boolean {
 /**
  * По ссылке разрешён переход — как `zam_core::link::report_link_clickable`: схемы нет, `http`,
  * `https`, `mailto` или `vscode://file/<путь>` (схема без учёта регистра, `//file/` — буквально,
- * путь непуст и не сетевой: не начинается с `/`, `\`, `%2F`, `%5C`). `file:` и прочие адреса
- * `vscode:` (команды расширений редактора) — нет.
+ * путь непуст, не сетевой — не начинается с `/`, `\`, `%2F`, `%5C` — и без сегментов `.` и `..`).
+ * `file:` и прочие адреса `vscode:` (команды расширений редактора) — нет.
  */
 export function reportLinkClickable(target: string): boolean {
   const t = clean(target);
@@ -107,27 +107,23 @@ export function reportLinkClickable(target: string): boolean {
   if (scheme !== 'vscode') return false;
   const rest = t.slice(7);
   if (!rest.startsWith('//file/')) return false;
-  return !vscodePathEmptyOrNetwork(rest.slice(7));
+  return vscodePathPlain(rest.slice(7));
 }
 
 /**
- * Путь адреса `vscode://file/<путь>` пуст или сетевой — после снятия сегментов `.` и `..`, как
- * это сделал бы разборщик URL (`.//сервер/x`, `x/..//сервер/y` — тот же `//сервер/…`). То же, что
- * `vscode_path_empty_or_network` в `zam_core::link`: разделитель — `/`, `\`, `%2F`, `%5C`, точка —
- * и `%2E`; запрос и якорь — не путь.
+ * Путь адреса `vscode://file/<путь>` прост: непуст, первый сегмент непуст и ни один сегмент не
+ * равен `.` или `..` — то же, что `vscode_path_plain` в `zam_core::link` (там обоснование).
+ * Нормализация пути не моделируется: разборщик URL делит путь только по `/` и снимает `.`/`..`
+ * (`x%2F/..//сервер/y` → `//сервер/y`), редактор потом раскрывает `%XX` и читает `\` как `/`.
+ * Сегменты считаются по самому мелкому делению (`/`, `\`, `%2F`, `%5C`; точка — и `%2E`): без
+ * сегментов `.` и `..` путь не меняет никто, и достаточно непустого первого сегмента.
  */
-function vscodePathEmptyOrNetwork(path: string): boolean {
+function vscodePathPlain(path: string): boolean {
   const plain = path
     .replace(/[?#].*$/s, '')
     .replace(/%2f|%5c|\\/gi, '/')
     .replace(/%2e/gi, '.');
-  const segments: string[] = [];
-  for (const s of plain.split('/')) {
-    if (s === '.') continue;
-    if (s === '..') segments.pop();
-    else segments.push(s);
-  }
-  return segments.length === 0 || segments[0] === '';
+  return plain !== '' && !plain.startsWith('/') && !plain.split('/').some((s) => s === '.' || s === '..');
 }
 
 /** Внешняя ссылка: со схемой или `//host` (браузер читает `\` как `/`). */

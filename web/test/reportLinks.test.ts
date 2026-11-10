@@ -531,6 +531,59 @@ test('reportLinkClickable: сегменты . и .. не обходят запр
     'vscode://file//home/u/a.rs',
   ])
     assert.equal(reportLinkClickable(url), false, url);
-  for (const url of ['vscode://file/./C:/a.rs', 'vscode://file/home/u/../v/a.rs', 'vscode://file/home/u/a//b.rs', 'vscode://file/home/u/a.rs#.//x'])
+  // сегменты `.` и `..` не кликаются вовсе (ревью, круг 4, I-4): нормализацию не моделируем
+  for (const url of ['vscode://file/./C:/a.rs', 'vscode://file/home/u/../v/a.rs'])
+    assert.equal(reportLinkClickable(url), false, url);
+  for (const url of ['vscode://file/home/u/a//b.rs', 'vscode://file/home/u/a.rs#.//x', 'vscode://file/home/u/.config/a..b.rs'])
     assert.equal(reportLinkClickable(url), true, url);
+});
+
+test('reportLinkClickable: кликабельный vscode://file/… разборщик URL не меняет (ревью, круг 4, I-4)', () => {
+  // примеры ревью: разборщик URL делит путь только по `/`, `x%2f` — один сегмент, `..` снимает его
+  for (const url of [
+    'vscode://file/x%2f/..//server/share/a.code-workspace',
+    'vscode://file/x\\/..//server/share/a.rs',
+    'vscode://file/x%5C/..//server/share',
+    'vscode://file/x\\/..',
+  ]) {
+    assert.equal(reportLinkClickable(url), false, url);
+    assert.ok(/^\/(\/|$)/.test(new URL(url).pathname), `${url} → ${new URL(url).pathname}`);
+  }
+  // случайные адреса из кусков (фиксированное зерно): ни один кликабельный после разбора URL не
+  // получает путь, начинающийся с `//`, пустой путь или путь, отличный от написанного
+  const parts = ['.', '..', '%2e', '%2E', '%2F', '%2f', '%5C', '%5c', '%25', '%252E', '\\', '/', '/', '?', '#', 'a', 'x', 'C:', 'b.rs'];
+  let x = 0x15a_2026;
+  const next = () => {
+    x ^= x << 13;
+    x >>>= 0;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    x >>>= 0;
+    return x;
+  };
+  let clickable = 0;
+  let refused = 0;
+  let changed = 0;
+  for (let i = 0; i < 60_000; i++) {
+    const n = next() % 9;
+    let tail = '';
+    for (let k = 0; k < n; k++) tail += parts[next() % parts.length];
+    const t = `vscode://file/${tail}`;
+    const written = `/${tail.replace(/[?#].*$/s, '')}`;
+    const parsed = new URL(t).pathname;
+    if (parsed !== written) changed++;
+    if (!reportLinkClickable(t)) {
+      refused++;
+      continue;
+    }
+    clickable++;
+    assert.equal(parsed, written, t);
+    assert.ok(!parsed.startsWith('//') && parsed !== '/' && parsed !== '', `${t} → ${parsed}`);
+    // и прочтение редактора (раскрыть %XX, `\` → `/`) не даёт сетевого пути и сегментов `..`
+    const opened = decodeURIComponent(parsed.replace(/%(?![0-9a-f]{2})/gi, '%25')).replace(/\\/g, '/');
+    assert.ok(!opened.startsWith('//'), `${t} → ${opened}`);
+    assert.ok(!opened.split('/').some((s) => s === '.' || s === '..'), `${t} → ${opened}`);
+  }
+  // выборка содержательна: есть и кликабельные, и отказы, и адреса, которые разборщик меняет
+  assert.ok(clickable > 3000 && refused > 3000 && changed > 3000, `${clickable}/${refused}/${changed}`);
 });
