@@ -4960,7 +4960,9 @@ fn post_compact_and_session_end_accepted_within_100ms() {
 }
 
 /// §8а: `SessionEnd` ставит сессии `ended_at` настоящего сервера — и при выключенном снимке
-/// (`hooks.session_snapshot = false`); сервер без `PUT …/snapshot` (404) — снимок в очереди.
+/// (`hooks.session_snapshot = false`); включённый снимок сервер (17c) принимает: очередь пуста,
+/// `GET …/snapshot` отдаёт его. Сессии на сервере нет — 404 `session-not-found`: снимок остаётся
+/// в очереди со счётчиком попыток (как у старого сервера), причина — в `hooks.log`.
 #[test]
 fn session_end_patches_ended() {
     let _g = serial();
@@ -4989,13 +4991,40 @@ fn session_end_patches_ended() {
             p.session(s),
             p.log()
         );
-        assert_eq!(snap_file(&p, "snapq", s).is_some(), on, "{s}: {}", p.log());
+        assert!(snap_file(&p, "snapq", s).is_none(), "{s}: {}", p.log());
+        let mut r = http()
+            .get(&format!("{url}/api/v1/sessions/{s}/snapshot"))
+            .header("Authorization", format!("Bearer {tok}"))
+            .call()
+            .unwrap();
+        assert_eq!(r.status() == 200, on, "{s}: {} / {}", r.status(), p.log());
+        if on {
+            let v: Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap();
+            assert_eq!(v["trigger"], "session_end", "{v}");
+            assert_eq!(v["agent"], "claude", "{v}");
+            assert_eq!(prompts_of(&v), ["последний запрос"], "{v}");
+        }
     }
-    // сессии нет на сервере — молча
+    // сессии нет на сервере — `PATCH ended` молча; без журнала снимка нет
     let t = transcript_path(&p, "se-none");
     let end = snap_ev(&p, "SessionEnd", "se-none", &t, json!({"reason": "exit"}));
     empty(&hook_snap(&p, "checkpoint", &end));
     assert!(!p.log().contains("sessions(ended)"), "{}", p.log());
+    assert!(snap_file(&p, "snapq", "se-none").is_none(), "{}", p.log());
+    // сессии нет, журнал есть — сервер отвечает 404 `session-not-found`: снимок в очереди
+    project_hooks(&p, "session_snapshot = true");
+    let s = "se-unknown";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос незарегистрированной сессии")]);
+    let end = snap_ev(&p, "SessionEnd", s, &t, json!({"reason": "exit"}));
+    empty(&hook_snap(&p, "checkpoint", &end));
+    let q = snap_file(&p, "snapq", s).unwrap_or_else(|| panic!("нет очереди: {}", p.log()));
+    assert_eq!(q["old_server"], 1, "{q}");
+    assert!(
+        p.log().contains("HTTP 404 /problems/session-not-found"),
+        "{}",
+        p.log()
+    );
 }
 
 /// §8а: `SessionStart source=compact` без `PostCompact` — снимок из журнала, `PUT` **до**

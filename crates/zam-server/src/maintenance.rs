@@ -5,7 +5,8 @@
 //! дольше [`SESSION_TTL`] (30 дней от `last_seen_at`) вместе с выданным им (`session_seen`);
 //! `usage` хранится бессрочно; срок жизни кэша выжимок (§9.4): выжимки без обращений дольше
 //! `cache.ttl_days` и сверх `cache.max_entries` на базу (LRU) удаляются, превращённые в записи
-//! — нет. Работает и без модели (в отличие от воркера индексации).
+//! — нет; снимки сессий (M6 §8а) старше `snapshot.keep_days` от `taken_at` удаляются
+//! ([`gc_snapshots`]). Работает и без модели (в отличие от воркера индексации).
 //!
 //! Автокопии (M6 §12б.4): раз в [`BACKUP_TICK`] — решение [`crate::backup::schedule::tick`]
 //! по `[backup]`; копию снимает тот же код, что `zam-server backup` (в блокирующем потоке),
@@ -51,6 +52,7 @@ impl Maintenance {
         cfg: ServerConfig,
     ) -> Maintenance {
         let mut handles = Vec::new();
+        let keep_days = cfg.snapshot.keep_days;
         if cfg.backup.schedule != BackupSchedule::Off {
             handles.push(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(BACKUP_TICK);
@@ -70,6 +72,7 @@ impl Maintenance {
                 tick.tick().await;
                 gc_sessions_in(&system, &users, zam_store::time::now()).await;
                 gc_cache_in(&system, &users, &cache, zam_store::time::now()).await;
+                gc_snapshots_in(&system, &users, keep_days, zam_store::time::now()).await;
             }
         });
         handles.push(handle);
@@ -127,6 +130,46 @@ async fn gc_sessions_in(system: &SystemStore, users: &UserDbs, now: Timestamp) -
                 total += n;
             }
             Err(e) => tracing::warn!(user = %u.id, error = %e, "обслуживание: сессии не очищены"),
+        }
+    }
+    total
+}
+
+/// Один проход срока хранения снимков сессий (`snapshot.keep_days`) на момент `now` по всем
+/// базам; число удалённых снимков.
+pub async fn gc_snapshots(st: &AppState, now: Timestamp) -> u64 {
+    gc_snapshots_in(&st.system, &st.users, st.cfg.snapshot.keep_days, now).await
+}
+
+async fn gc_snapshots_in(
+    system: &SystemStore,
+    users: &UserDbs,
+    keep_days: u32,
+    now: Timestamp,
+) -> u64 {
+    let list = match system.list_users().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "обслуживание: список пользователей недоступен");
+            return 0;
+        }
+    };
+    let cutoff = now - SignedDuration::from_hours(24 * i64::from(keep_days));
+    let mut total = 0;
+    for u in list {
+        let r = match users.get(u.id).await {
+            Ok(db) => zam_store::gc_snapshots(&db, cutoff).await,
+            Err(e) => Err(e),
+        };
+        match r {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(user = %u.id, deleted = n, "обслуживание: удалены старые снимки сессий");
+                total += n;
+            }
+            Err(e) => {
+                tracing::warn!(user = %u.id, error = %e, "обслуживание: снимки сессий не очищены")
+            }
         }
     }
     total
