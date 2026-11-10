@@ -26,8 +26,17 @@
 //! **BLOB.** Ячейка-BLOB с магией zstd распаковывается (`blob_extract.units` — zstd(JSON)),
 //! BLOB из корректного UTF-8 читается как текст; остальные (векторы, индексы FTS) — двоичные,
 //! пропускаются. Виртуальные таблицы пропускаются: их данные — в теневых таблицах.
-
-#![allow(dead_code)]
+//!
+//! **Сырой текст** (ячейка — не JSON-объект и не массив: обрывок JSON, JSONL, журнал)
+//! проверяется в нескольких видах: как есть; с раскрытыми `\uXXXX` (`\u005c` — это `\`);
+//! каждый — ещё и с раскрытым процентным кодированием, до трёх проходов (`%2520` → `%20` →
+//! пробел). Литеральные `\n`, `\t`, `\r` перед именем машины считаются границей слова
+//! (`line1\nwin-box started`). Цена — редкий ложный красный на каталоге вида `…\nwin-box`;
+//! пропуск привязки хуже.
+//!
+//! **Имя-слово.** Имя машины, совпадающее с обычным словом (`dev`, `test`, `server`), найдётся
+//! в тексте заметок («the dev server») — это ложный красный, а не привязка: проверяйте
+//! окрестность находки.
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +46,8 @@ use serde_json::Value;
 
 /// Наименьшая длина имени машины, символов.
 pub const MIN_MACHINE: usize = 3;
+/// Наименьшая длина имени машины, которое добавляется само (`add_machine_if_distinct`).
+const MIN_DISTINCT_MACHINE: usize = 4;
 /// Наименьшая длина пути в нормальной форме, символов (`c:/zam`).
 const MIN_PATH: usize = 6;
 /// Символов текста до и после совпадения в сообщении о находке.
@@ -46,6 +57,8 @@ const JSON_DEPTH: usize = 8;
 /// Предел распакованного BLOB zstd, байт.
 const ZSTD_MAX: usize = 256 << 20;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+/// Проходов раскрытия процентного кодирования сырого текста (`%2520` → `%20` → пробел).
+const PERCENT_PASSES: usize = 3;
 
 /// Нормальная форма для поиска пути: нижний регистр, серия `\` и `/` — один `/`.
 pub fn norm(s: &str) -> String {
@@ -145,6 +158,7 @@ impl Needles {
     }
 
     /// Добавляет путь, если он не слишком общий; `false` — пропущен.
+    #[allow(dead_code)] // только тест `restore_has_no_machine_bindings` и юнит-тесты xtask
     pub fn add_path_if_specific(&mut self, p: &str) -> bool {
         let Ok(n) = path_needle(p) else {
             return false;
@@ -154,11 +168,18 @@ impl Needles {
         true
     }
 
-    /// Добавляет имя машины, если оно не короче [`MIN_MACHINE`]; `false` — пропущено.
-    pub fn add_machine_if_long(&mut self, m: &str) -> bool {
+    /// Добавляет имя машины, если оно приметное: не короче [`MIN_DISTINCT_MACHINE`] символов и
+    /// не из одних букв (`fv-az1774-221`, `ogoun-pc`); `false` — пропущено. Имя-слово (`dev`,
+    /// `runner`) совпало бы с текстом корпуса и дало бы ложный красный — так тест добавляет имя
+    /// машины, на которой идёт (её не выбирают).
+    #[allow(dead_code)] // только тест `restore_has_no_machine_bindings` и юнит-тесты xtask
+    pub fn add_machine_if_distinct(&mut self, m: &str) -> bool {
         let Ok(n) = machine_needle(m) else {
             return false;
         };
+        if n.chars().count() < MIN_DISTINCT_MACHINE || n.chars().all(char::is_alphabetic) {
+            return false;
+        }
         self.machines.push(n);
         self.dedup();
         true
@@ -175,29 +196,49 @@ impl Needles {
         &self.paths
     }
 
+    #[allow(dead_code)] // только xtask (вывод команды) и его юнит-тесты
     pub fn machines(&self) -> &[String] {
         &self.machines
     }
 
     /// Первое совпадение в сыром тексте `text` (без разбора JSON): игла и окрестность.
     pub fn find_raw(&self, text: &str) -> Option<(String, String)> {
+        // виды текста: как есть, с раскрытыми `\uXXXX`; каждый — с раскрытым процентным
+        // кодированием, до PERCENT_PASSES проходов (двойное кодирование `%2520`)
         let lower = text.to_lowercase();
-        for m in &self.machines {
-            if let Some(i) = find_word(&lower, m) {
-                return Some((m.clone(), around(&lower, i, m.len())));
+        let mut views = vec![lower];
+        if views[0].contains("\\u") {
+            let u = unescape_unicode(&views[0]).to_lowercase();
+            if u != views[0] {
+                views.push(u);
             }
         }
-        if self.paths.is_empty() {
-            return None;
+        for k in 0..views.len() {
+            let mut cur = views[k].clone();
+            for _ in 0..PERCENT_PASSES {
+                if !cur.contains('%') {
+                    break;
+                }
+                let next = percent_decode(&cur).to_lowercase();
+                if next == cur {
+                    break;
+                }
+                views.push(next.clone());
+                cur = next;
+            }
         }
-        let mut forms = vec![norm(&lower)];
-        if lower.contains('%') {
-            forms.push(norm(&percent_decode(&lower)));
+        for v in &views {
+            for m in &self.machines {
+                if let Some(i) = find_word(v, m) {
+                    return Some((m.clone(), around(v, i, m.len())));
+                }
+            }
         }
-        for f in &forms {
+        for v in &views {
+            let f = norm(v);
             for p in &self.paths {
-                if let Some(i) = find_path(f, p) {
-                    return Some((p.clone(), around(f, i, p.len())));
+                if let Some(i) = find_path(&f, p) {
+                    return Some((p.clone(), around(&f, i, p.len())));
                 }
             }
         }
@@ -239,13 +280,52 @@ fn word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-'
 }
 
-/// Позиция `needle` в `hay` по границам слова.
+/// Текст кончается литеральным экранированием `\n`, `\t` или `\r` (обратная косая и буква):
+/// в неразобранном JSON и журналах это перевод строки или табуляция, то есть граница слова.
+fn after_literal_escape(before: &str) -> bool {
+    let mut it = before.chars().rev();
+    matches!(it.next(), Some('n' | 't' | 'r')) && it.next() == Some('\\')
+}
+
+/// Раскрывает `\uXXXX` (в том числе суррогатные пары — с заменой); прочее остаётся как есть.
+pub fn unescape_unicode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut units: Vec<u16> = Vec::new();
+    let mut out = String::with_capacity(s.len());
+    let flush = |units: &mut Vec<u16>, out: &mut String| {
+        out.push_str(&String::from_utf16_lossy(units));
+        units.clear();
+    };
+    let mut i = 0;
+    while i < b.len() {
+        let code = (b[i] == b'\\' && b.get(i + 1) == Some(&b'u'))
+            .then(|| s.get(i + 2..i + 6))
+            .flatten()
+            .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
+            .and_then(|h| u16::from_str_radix(h, 16).ok());
+        if let Some(c) = code {
+            units.push(c);
+            i += 6;
+            continue;
+        }
+        flush(&mut units, &mut out);
+        let ch = s[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8().max(1);
+    }
+    flush(&mut units, &mut out);
+    out
+}
+
+/// Позиция `needle` в `hay` по границам слова; литеральные `\n`, `\t`, `\r` перед именем —
+/// граница.
 fn find_word(hay: &str, needle: &str) -> Option<usize> {
     let mut from = 0;
     while let Some(i) = hay[from..].find(needle) {
         let at = from + i;
         let end = at + needle.len();
-        let before = hay[..at].chars().next_back().is_some_and(word_char);
+        let before = hay[..at].chars().next_back().is_some_and(word_char)
+            && !after_literal_escape(&hay[..at]);
         let after = hay[end..].chars().next().is_some_and(word_char);
         if !before && !after {
             return Some(at);

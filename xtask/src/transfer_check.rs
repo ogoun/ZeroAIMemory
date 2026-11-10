@@ -180,7 +180,8 @@ enum TcCmd {
         #[arg(long, required = true)]
         old_path: Vec<String>,
         /// Имя старой машины (не короче 3 символов; сравнение по границам слова, без учёта
-        /// регистра); флаг повторяется
+        /// регистра); флаг повторяется. Имя-слово (`dev`, `server`) найдётся и в обычном
+        /// тексте заметок («the dev server») — такая находка не привязка, смотрите окрестность
         #[arg(long, required = true)]
         old_machine: Vec<String>,
     },
@@ -372,14 +373,7 @@ impl Conn {
 
     /// Поиск без атрибуции (без сессии и машины): `(id, балл)` первых шести.
     fn top6(&self, q: &str) -> Result<(Vec<(String, f64)>, Value)> {
-        let body = json!({"query": q, "top_k": 6, "scope": {"solution": SOLUTION}});
-        let r = self.call(
-            "POST",
-            "/search",
-            Some(("application/json", body.to_string().into_bytes())),
-            false,
-            None,
-        )?;
+        let r = self.search(q)?;
         if r.status != 200 {
             bail!("POST /search «{q}»: HTTP {}: {}", r.status, r.text());
         }
@@ -391,6 +385,18 @@ impl Conn {
             .map(|i| (item_id(i), i["score"].as_f64().unwrap_or_default()))
             .collect();
         Ok((items, v))
+    }
+
+    /// `POST /search` без атрибуции: шесть первых в области решения корпуса; ответ как есть.
+    fn search(&self, q: &str) -> Result<Resp> {
+        let body = json!({"query": q, "top_k": 6, "scope": {"solution": SOLUTION}});
+        self.call(
+            "POST",
+            "/search",
+            Some(("application/json", body.to_string().into_bytes())),
+            false,
+            None,
+        )
     }
 
     /// Вход администратора WebUI паролем `pw`: cookie.
@@ -958,10 +964,23 @@ fn wait_index(c: &Conn, limit: Duration) -> Result<Duration> {
             {
                 return Ok(false);
             }
-            let (_, v) = c.top6(QUERIES[0])?;
-            Ok(v["pending_count"] == 0 && v["degraded"] == false)
+            search_ready(&c.search(QUERIES[0])?)
         },
     )
+}
+
+/// Ответ `/search` при ожидании индекса: 200 без `pending_count` и `degraded` — готово; 200 с
+/// ними и любой 5xx (Qdrant ещё поднимается, сервер занят) — «ещё не готово», ожидание
+/// продолжается; прочее (4xx: токен, запрос) не изменится — ошибка.
+fn search_ready(r: &Resp) -> Result<bool> {
+    match r.status {
+        200 => {
+            let v = r.json();
+            Ok(v["pending_count"] == 0 && v["degraded"] == false)
+        }
+        500..=599 => Ok(false),
+        s => bail!("POST /search: HTTP {s}: {}", r.text()),
+    }
 }
 
 // ---------------------------------------------------------------- verify
@@ -1598,9 +1617,76 @@ mod tests {
         }
         assert_eq!(machine_needle(" Box ").unwrap(), "box");
         let mut n = win();
-        assert!(!n.add_machine_if_long("pc"));
-        assert!(n.add_machine_if_long("OGOUN-PC"));
-        assert_eq!(n.machines(), ["ogoun-pc", "win-box"]);
+        // само добавляется только приметное имя: от 4 символов и не из одних букв
+        for m in ["pc", "dev", "runner", "Сервер", "a-1"] {
+            assert!(!n.add_machine_if_distinct(m), "{m}");
+        }
+        assert!(n.add_machine_if_distinct("OGOUN-PC"));
+        assert!(n.add_machine_if_distinct("fv-az1774-221"));
+        assert!(n.add_machine_if_distinct("node7"));
+        assert_eq!(
+            n.machines(),
+            ["fv-az1774-221", "node7", "ogoun-pc", "win-box"]
+        );
+    }
+
+    /// Литеральные `\n`, `\t`, `\r` перед именем машины в сыром тексте — граница слова.
+    #[test]
+    fn machine_after_literal_escape() {
+        let n = win();
+        assert!(n.find(r"log: line1\nwin-box started").is_some());
+        assert!(n.find(r"a\twin-box").is_some());
+        assert!(n.find(r"a\rWIN-BOX b").is_some());
+        // обрывок JSON (не разбирается): экранирование осталось литеральным
+        assert!(n.find(r#""msg":"up\nwin-box ok", ..."#).is_some());
+        // без обратной косой буква — часть слова
+        assert!(n.find("nwin-box").is_none());
+        assert!(n.find(r"a\xwin-box").is_none());
+    }
+
+    /// `\uXXXX` в неразобранном JSON и двойное процентное кодирование.
+    #[test]
+    fn raw_unicode_escapes_and_double_percent() {
+        use super::bindings::unescape_unicode;
+        assert_eq!(
+            unescape_unicode(r"a\u005cb\u0414\uZZZZ\u00"),
+            "a\\bД\\uZZZZ\\u00"
+        );
+        assert_eq!(unescape_unicode(r"\ud83d\ude00!"), "\u{1F600}!");
+        let n = win();
+        // обрывок JSON и JSONL: `\` как \u005c, кириллица как \uXXXX
+        let frag =
+            r#""p":"H:\u005cZam Data\u005c\u0414\u0430\u043d\u043d\u044b\u0435\u005cx", ..."#;
+        assert!(n.find(frag).is_some());
+        let jsonl = "{\"a\":1}\n{\"p\":\"H:\\u005CZam Data\\u005CДанные\"}";
+        assert!(n.find(jsonl).is_some());
+        assert!(n.find(r"host \u0057IN-BOX up").is_some());
+        // двойное и тройное процентное кодирование
+        assert!(n.find("file:///H:/Zam%2520Data/%25D0%2594анные").is_some());
+        assert!(n.find("H%253A%255CZam%252520Data%255CДанные").is_some());
+        assert!(n.find("win%252Dbox").is_some());
+        // `\u` и процент вместе
+        assert!(n.find(r"H:\u005cZam%2520Data\u005cДанные").is_some());
+        assert!(n.find(r"H:\u005cZam%2520Other\u005cДанные").is_none());
+    }
+
+    /// Ожидание индекса: 5xx от `/search` — «ещё не готово», 4xx — ошибка.
+    #[test]
+    fn search_ready_treats_5xx_as_not_ready() {
+        let r = |status, body: &str| Resp {
+            status,
+            body: body.as_bytes().to_vec(),
+        };
+        let ok = r#"{"items":[],"pending_count":0,"degraded":false}"#;
+        assert!(search_ready(&r(200, ok)).unwrap());
+        assert!(!search_ready(&r(200, r#"{"pending_count":3,"degraded":false}"#)).unwrap());
+        assert!(!search_ready(&r(200, r#"{"pending_count":0,"degraded":"qdrant_down"}"#)).unwrap());
+        for s in [500, 502, 503, 504] {
+            assert!(!search_ready(&r(s, "busy")).unwrap(), "{s}");
+        }
+        for s in [400, 401, 403, 404] {
+            assert!(search_ready(&r(s, "no")).is_err(), "{s}");
+        }
     }
 
     /// Поля `machine` JSON — атрибуция на любой глубине, в том числе в JSON внутри строки;

@@ -2328,7 +2328,8 @@ async fn restore_has_no_machine_bindings() {
     // Иглы. Пути старой машины: каталог данных и его родитель, каталог моделей, библиотека
     // pdfium, каталог исполняемых файлов (тест и `zam-server` рабочего процесса) — как есть и
     // канонические; слишком общие (корень диска) пропускаются. Имена: заголовок атрибуции и
-    // имя машины-источника из описи (короче `bindings::MIN_MACHINE` — пропускается).
+    // имя машины-источника из описи — если оно приметное (от 4 символов и не из одних букв):
+    // имя-слово раннера (`dev`, `runner`) совпало бы с текстом корпуса — ложный красный.
     let lossy = |p: &Path| p.to_string_lossy().into_owned();
     let mut needles = bindings::Needles::new(&[lossy(&cfg.data_dir)], &[OLD_MACHINE]).unwrap();
     let mut paths = vec![cfg.data_dir.clone(), cfg.ml.models_dir(&cfg.data_dir)];
@@ -2345,7 +2346,7 @@ async fn restore_has_no_machine_bindings() {
     }
     assert!(needles.paths().len() >= 3, "{needles:?}");
     if let Some(src) = &m.source_machine {
-        needles.add_machine_if_long(src);
+        needles.add_machine_if_distinct(src);
     }
     let scan = bindings::scan(&dst.data_dir, &needles).unwrap();
     assert!(
