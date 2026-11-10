@@ -3096,6 +3096,11 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                     .to_string(),
             );
         }
+        // дата точки — сутки старта; переход через полночь UTC виден в примечаниях результата
+        if let Some(n) = midnight_note(&date, &run::today_utc()) {
+            println!("  примечание: {n}");
+            notes.push(n);
+        }
         let ex = Exclusions::of(&f);
         let r = SessionsResult {
             info: SessionsInfo {
@@ -3249,10 +3254,36 @@ pub enum Toggle {
     Off,
 }
 
+/// Примечание точки, сессии которой перешли полночь UTC (повторное ревью задачи 8c): дата точки
+/// (`info.date`, имя файла результата) — сутки её старта `start`, а сессии, начатые после
+/// полуночи, несут в id и в окнах дайджеста сервера уже сутки `end`. `None` — точка уложилась в
+/// одни сутки.
+fn midnight_note(start: &str, end: &str) -> Option<String> {
+    (start != end).then(|| {
+        format!(
+            "точка перешла полночь UTC: старт {start}, конец {end} — дата точки взята на старте, \
+             сессии после полуночи (id `ts2-{end}-…`) считают окна дайджеста от новых суток"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::eval::caps::caps_from;
+
+    /// Точка в пределах суток — без примечания; перешедшая полночь UTC — с обеими датами.
+    #[test]
+    fn midnight_note_only_when_date_changed() {
+        assert_eq!(midnight_note("2026-11-08", "2026-11-08"), None);
+        let n = midnight_note("2026-11-08", "2026-11-09").unwrap();
+        assert!(n.contains("полночь UTC"), "{n}");
+        assert!(
+            n.contains("старт 2026-11-08") && n.contains("конец 2026-11-09"),
+            "{n}"
+        );
+        assert!(n.contains("ts2-2026-11-09-"), "{n}");
+    }
 
     /// Заготовка ответа мока по команде (инструменту) и входу.
     type Reply = Box<dyn FnMut(&str, &Value) -> String>;

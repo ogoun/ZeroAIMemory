@@ -130,8 +130,10 @@ fn assert_marked(j: &Value) {
 }
 
 /// Строка правила раздела Rules (задача 8c, ревью п. 11): `<путь>( [..])? <id>` (L1),
-/// `<путь> — <фраза>( [..])? <id>` (L0) или `<путь> …( [..])? <id>` (до пути); путь — без
-/// пробелов и не начинается с метки подсказки.
+/// `<путь> — <фраза>( [..])? <id>` (L0) или `<путь> …( [..])? <id>` (до пути). Путь может
+/// содержать пробелы (имя заметки «Стиль кода»): он кончается перед ` — ` (L0), перед ` …` (до
+/// пути) или в конце строки (L1); он непуст, без пробелов по краям и не начинается с метки
+/// подсказки, фраза L0 непуста.
 fn rule_line_shape(line: &str, id: &str) -> bool {
     let Some(rest) = line.strip_suffix(&format!(" {id}")) else {
         return false;
@@ -140,10 +142,50 @@ fn rule_line_shape(line: &str, id: &str) -> bool {
         Some((head, tag)) if tag.ends_with(']') && !tag[..tag.len() - 1].contains(' ') => head,
         _ => rest,
     };
-    let (path, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    let (path, phrase) = match rest.split_once(" — ") {
+        Some((path, phrase)) => (path, Some(phrase)),
+        None => (rest.strip_suffix(" …").unwrap_or(rest), None),
+    };
     !path.is_empty()
+        && path.trim() == path
         && !path.starts_with("ZeroAIMemory:")
-        && (tail.is_empty() || tail.starts_with("— ") || tail == "…")
+        && phrase.is_none_or(|p| !p.trim().is_empty())
+}
+
+/// Форма строки правила: путь без пробелов и с пробелами во всех трёх видах; метка подсказки,
+/// пустой путь и пустая фраза — не строка правила (передача 8c → 15a).
+#[test]
+fn rule_line_shape_paths_with_spaces() {
+    let id = "n:0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e12";
+    for ok in [
+        "rules/style",
+        "rules/style [th]",
+        "rules/style — писать кратко",
+        "rules/style — писать кратко [ax]",
+        "rules/style …",
+        "Правила/Стиль кода",
+        "Правила/Стиль кода [th]",
+        "Правила/Стиль кода — писать кратко, без воды",
+        "Правила/Стиль кода — тире — внутри фразы [hyp]",
+        "Правила/Стиль кода …",
+        "Правила/Стиль кода … [th]",
+    ] {
+        assert!(rule_line_shape(&format!("{ok} {id}"), id), "{ok}");
+    }
+    for bad in [
+        "ZeroAIMemory: подсказка",
+        "ZeroAIMemory: путь с пробелом — фраза",
+        "",
+        " rules/style",
+        "rules/style ",
+        "rules/style — ",
+        " — фраза",
+        " …",
+    ] {
+        assert!(!rule_line_shape(&format!("{bad} {id}"), id), "{bad:?}");
+    }
+    // без своей ссылки в конце — не строка этого правила
+    assert!(!rule_line_shape("rules/style n:other", id));
 }
 
 async fn shown(a: &Api, owner: &str, kind: TargetKind, id: &str) -> zam_store::UsageCounts {
