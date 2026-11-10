@@ -5837,3 +5837,50 @@ fn put_timeout_reason_uses_actual_limit() {
     assert!(n < 1500, "срок {n} мс — не фактический: {log}");
     assert!(snap_file(&p, "snapq", s).is_some());
 }
+
+/// Повторное ревью 17b (`prompt_flushes_changed_queue`): решение о снимке и снимок — вне пути
+/// сетевой части `checkpoint`. Подмена `<журнал>.decide-stall-ms` усыпляет поток снимка до
+/// решения на 3 с: очередь изменённых файлов всё равно уходит в бюджете хука, хук не ждёт поток.
+#[test]
+fn snapshot_decision_never_delays_changed_flush() {
+    let _g = serial();
+    let (url, seen) = snap_stub(204, "");
+    let p = Proj::new("snap-decide-stall", &url, "zam_x");
+    let s = "ds-1";
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), b"v1\n").unwrap();
+    let edit = post_ok(
+        &p,
+        s,
+        "Edit",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    let _ = p.hook_at(&url, "post-tool", "claude", edit.to_string().as_bytes());
+    assert_eq!(queue(&p, s).len(), 1);
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    std::fs::write(format!("{}.decide-stall-ms", t.display()), "3000").unwrap();
+    let warm = snap_ev(
+        &p,
+        "Stop",
+        "ds-warm",
+        &t,
+        json!({"stop_hook_active": false}),
+    );
+    let _ = p.hook_at(&url, "checkpoint", "claude", warm.to_string().as_bytes());
+    let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
+    let (o, d) = p.hook_at(&url, "checkpoint", "claude", stop.to_string().as_bytes());
+    ok(&o);
+    assert!(
+        d <= max_for("checkpoint"),
+        "поток снимка задержал хук: {d:?}"
+    );
+    let sent = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+        .count();
+    assert!(sent >= 1, "очередь изменённых не ушла: {}", p.log());
+    assert!(queue(&p, s).is_empty(), "{}", p.log());
+}

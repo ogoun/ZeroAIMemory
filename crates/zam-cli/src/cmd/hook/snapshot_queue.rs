@@ -681,6 +681,61 @@ pub fn flush_others(env: &Env, except: &[&str]) {
     }
 }
 
+/// Снимок `checkpoint` в отдельном потоке (повторное ревью 17b, `prompt_flushes_changed_queue`):
+/// решение ([`job_for_checkpoint`]: `snapst-*`, журнал сессии), снимок ([`run`]) или отправка
+/// прежней очереди ([`flush_logged`]) — всё вне пути сетевой части хука. Поток не scoped: хук ждёт
+/// его не дольше [`wait_snapshot`], опоздавший обрывается с процессом (записи файлов — атомарные).
+pub fn spawn_checkpoint(env: &Env, inp: &Input, s: &Settings) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let log_env = env.clone();
+    let (env, inp, s) = (env.clone(), inp.clone(), *s);
+    let spawned = std::thread::Builder::new()
+        .name("zam-snapshot-job".into())
+        .spawn(move || {
+            test_decide_stall(&inp);
+            match job_for_checkpoint(&env, &inp, &s) {
+                Some(job) => run(&env, &s, job, true),
+                None => {
+                    if let Some(id) = inp.session_id.as_deref().filter(|id| queued(&env, id)) {
+                        flush_logged(&env, id);
+                    }
+                }
+            }
+            let _ = tx.send(());
+        });
+    if let Err(e) = spawned {
+        log_env.log(&format!("snapshot: поток не запущен: {e}"));
+    }
+    rx
+}
+
+/// Ожидание потока снимка `checkpoint` после сетевой части: не дольше срока снимка и срока `PUT`
+/// с запасом на локальные записи ([`WAIT_SLACK`]) — обычный снимок успевает целиком (очередь и
+/// `snapst-*` записаны), а задержка выхода хука ограничена.
+pub fn wait_snapshot(s: &Settings, done: &std::sync::mpsc::Receiver<()>) {
+    let cap = s.snapshot_deadline() + Duration::from_millis(put_ms()) + WAIT_SLACK;
+    // не успел (подмена сроков в тестах, занятый диск) — хук выходит без него
+    let _ = done.recv_timeout(cap);
+}
+
+/// Запас ожидания потока снимка сверх его сроков: решение, журнал сессии, `snapst-*`, очередь.
+const WAIT_SLACK: Duration = Duration::from_millis(50);
+
+/// Точка подмены для тестов: файл `<журнал>.decide-stall-ms` — поток снимка `checkpoint` засыпает
+/// до решения (проверка, что сетевая часть хука решения не ждёт). Только отладочная сборка и фича
+/// `test-hooks`.
+fn test_decide_stall(inp: &Input) {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = transcript_of(inp)
+        .and_then(|t| std::fs::read_to_string(format!("{}.decide-stall-ms", t.display())).ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+    #[cfg(not(any(feature = "test-hooks", debug_assertions)))]
+    let _ = inp;
+}
+
 /// Отправка очереди сессии без нового снимка, итог — в `hooks.log`.
 pub fn flush_logged(env: &Env, session: &str) {
     log_sent(env, "снимок из очереди", flush(env, session), false);
