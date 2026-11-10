@@ -11,6 +11,7 @@ import {
   INVISIBLE_RANGES,
   REPORT_LINK_SCHEMES,
   SHOWN_MAX,
+  hasHidden,
   hydrateReportLinks,
   isInvisible,
   linkPath,
@@ -19,6 +20,7 @@ import {
   shorten,
   unsafePathText,
   urlScheme,
+  visible,
 } from '../src/lib/reportLinks.ts';
 
 interface Vector {
@@ -469,4 +471,66 @@ test('hydrateReportLinks: длинный адрес в подсказке и п�
   const btn = a.next[0];
   assert.ok(btn.getAttribute('data-copy-path')!.length > 2000);
   assert.equal([...btn.getAttribute('title')!].length, SHOWN_MAX + 1);
+});
+
+test('адрес с невидимыми и bidi-символами человеку не показывается (повторное ревью, Minor 1)', () => {
+  const rlo = '\u202e';
+  // data-url с невидимым символом сервер не присылает; пришёл — снимается, ссылка остаётся текстом
+  const hidden = [`file:///tmp/${rlo}gpj.exe`, 'file:///tmp/a\u200bb', 'vscode://vscode.git/\u2066x', 'file:///tmp/a\u0007b'].map(
+    (u) => new El('a', { 'data-url': u }, 'a'),
+  );
+  // href с правом перехода и невидимым символом: адрес в подсказке и печати — в записи %XX
+  const code = new El('a', { href: `vscode://file/C:/${rlo}gpj.exe` }, 'код');
+  // href без права перехода (сервер такого не пришлёт): снимается, адрес — в записи %XX
+  const file = new El('a', { href: `file:///tmp/${rlo}gpj.exe` }, 'файл');
+  hydrate([...hidden, code, file]);
+  for (const a of hidden) {
+    assert.equal(a.getAttribute('data-url'), null);
+    assert.equal(a.getAttribute('title'), null);
+    assert.equal(a.getAttribute('data-print'), null);
+    assert.equal(a.next.length, 0);
+  }
+  assert.equal(file.getAttribute('href'), null);
+  for (const a of [code, file]) {
+    for (const name of ['title', 'data-print', 'data-url']) {
+      const v = a.getAttribute(name)!;
+      assert.equal(hasHidden(v), false, `${name}: ${JSON.stringify(v)}`);
+      assert.ok(v.includes('%E2%80%AEgpj.exe'), `${name}: ${v}`);
+    }
+    assert.equal(a.next.length, 0);
+  }
+  assert.equal(visible(`a${rlo}b\u0000c\u00add`), 'a%E2%80%AEb%00c%C2%ADd');
+  assert.equal(visible('C:\\Мои документы\\a b.txt'), 'C:\\Мои документы\\a b.txt');
+  assert.equal(hasHidden('обычный текст — «без» скрытого…'), false);
+});
+
+test('linkPath: пробел перед «-» — пути нет: подстановка флага (повторное ревью, Minor 3)', () => {
+  for (const url of [
+    'file:///tmp/a --install-extension x',
+    'file:///tmp/a%20--install-extension%20x',
+    'file:///tmp/a -rf',
+    'vscode://file/C:/a%20-x/b.rs',
+    'file://server/share/a -x',
+  ])
+    assert.equal(linkPath(url), null, url);
+  assert.equal(unsafePathText('/tmp/a -x'), true);
+  // дефис без пробела перед ним и пробел без дефиса — обычные имена
+  assert.equal(linkPath('file:///home/u/my-proj/a - b.md'), null);
+  assert.equal(linkPath('file:///home/u/my-proj/a-b c.md'), '/home/u/my-proj/a-b c.md');
+  assert.equal(linkPath('file:///home/u/-x/a.md'), '/home/u/-x/a.md');
+});
+
+test('reportLinkClickable: сегменты . и .. не обходят запрет сетевого пути (повторное ревью, Minor 5)', () => {
+  for (const url of [
+    'vscode://file/.//server/x',
+    'vscode://file/x/..//server/y',
+    'vscode://file/%2e/%2e%2e//server/x',
+    'vscode://file/a/./b/../..//server/x',
+    'vscode://file/..\\\\server\\x',
+    'vscode://file/x/..',
+    'vscode://file//home/u/a.rs',
+  ])
+    assert.equal(reportLinkClickable(url), false, url);
+  for (const url of ['vscode://file/./C:/a.rs', 'vscode://file/home/u/../v/a.rs', 'vscode://file/home/u/a//b.rs', 'vscode://file/home/u/a.rs#.//x'])
+    assert.equal(reportLinkClickable(url), true, url);
 });

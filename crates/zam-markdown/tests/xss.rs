@@ -661,3 +661,44 @@ fn dangerous_scheme_hidden_by_invisible_chars() {
         }
     }
 }
+
+/// Повторное ревью 15a, Minor 1: адрес ссылки без перехода показывают человеку (подсказка,
+/// печать), поэтому `data-url` с невидимыми, bidi и управляющими символами в HTML отчёта нет —
+/// ссылка остаётся текстом. Тот же адрес в записи `%XX` проходит.
+#[test]
+fn report_data_url_without_invisible_and_bidi() {
+    for hidden in [
+        "\u{202e}",
+        "\u{200b}",
+        "\u{2066}",
+        "\u{feff}",
+        "\u{ad}",
+        "\u{61c}",
+        "\u{e0001}",
+        "\u{1bca0}",
+        "\u{7f}",
+        "\u{85}",
+    ] {
+        for url in [
+            format!("file:///tmp/{hidden}gpj.exe"),
+            format!("vscode://vscode.git/{hidden}clone"),
+            format!("vscode://file//server/{hidden}x"),
+        ] {
+            let md = format!("[a](<{url}>)");
+            let out = render_report_html(&md, &NoResolve).html;
+            assert!(
+                !out.contains("data-url") && !out.contains("href"),
+                "U+{:04X}: {out}",
+                hidden.chars().next().unwrap() as u32
+            );
+            assert!(out.contains(">a</a>"), "{out}");
+            let raw = format!("<a data-url=\"{url}\">a</a>");
+            assert_eq!(sanitize_report_html(&raw), "<a>a</a>", "{raw:?}");
+        }
+    }
+    let out = render_report_html("[a](<file:///tmp/%E2%80%AEgpj.exe>)", &NoResolve).html;
+    assert!(
+        out.contains("data-url=\"file:///tmp/%E2%80%AEgpj.exe\""),
+        "{out}"
+    );
+}

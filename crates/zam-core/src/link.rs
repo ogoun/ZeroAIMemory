@@ -63,8 +63,9 @@ fn clean(target: &str) -> String {
 /// - схемы нет (относительная ссылка, якорь, `//host`) — да;
 /// - `http`, `https`, `mailto` — да;
 /// - `vscode:` — только `vscode://file/<путь>`: имя схемы без учёта регистра, `//file/` —
-///   буквально, путь непуст и не начинается с `/`, `\`, `%2F`, `%5C` (сетевой путь
-///   `vscode://file//сервер/ресурс` редактор открыл бы по сети). Прочие адреса `vscode:` —
+///   буквально, путь непуст и не начинается с `/`, `\`, `%2F`, `%5C` — и после снятия сегментов
+///   `.` и `..` тоже (сетевой путь `vscode://file//сервер/ресурс` редактор открыл бы по сети;
+///   `vscode://file/.//сервер/ресурс` — он же). Прочие адреса `vscode:` —
 ///   команды расширений (`vscode://vscode.git/clone?url=…`), из недоверенного отчёта не
 ///   запускаются;
 /// - `file:` — нет: браузер с http(s)-страницы его не откроет, а `file://сервер/…` — сетевой путь;
@@ -78,15 +79,46 @@ pub fn report_link_clickable(target: &str) -> bool {
             let Some(path) = t[7..].strip_prefix("//file/") else {
                 return false;
             };
-            let p = path.to_ascii_lowercase();
-            !(p.is_empty()
-                || p.starts_with('/')
-                || p.starts_with('\\')
-                || p.starts_with("%2f")
-                || p.starts_with("%5c"))
+            !vscode_path_empty_or_network(path)
         }
         Some(_) => false,
     }
+}
+
+/// Путь адреса `vscode://file/<путь>` пуст или сетевой — после того, как из него убраны сегменты
+/// `.` и `..`, как это сделал бы разборщик URL: `.//сервер/x` и `x/..//сервер/y` — тот же
+/// `//сервер/…`. Разделителем считаются `/`, `\` и их записи `%2F`, `%5C`, точкой — и `%2E`
+/// (с запасом: редактор на Windows читает `\` как `/`); запрос и якорь (`?…`, `#…`) — не путь.
+fn vscode_path_empty_or_network(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let mut plain = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(c) = rest.chars().next() {
+        let coded = rest.get(..3).map(str::to_ascii_lowercase);
+        match (c, coded.as_deref()) {
+            (_, Some("%2f" | "%5c")) => plain.push('/'),
+            (_, Some("%2e")) => plain.push('.'),
+            ('\\', _) => plain.push('/'),
+            _ => {
+                plain.push(c);
+                rest = &rest[c.len_utf8()..];
+                continue;
+            }
+        }
+        rest = &rest[if c == '\\' { 1 } else { 3 }..];
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for s in plain.split('/') {
+        match s {
+            "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    // пусто (`x/..`) или первый сегмент пуст (`//сервер`, `/`)
+    segments.first().is_none_or(|s| s.is_empty())
 }
 
 /// Перечень разрешённых схем для сообщений об ошибке: `http, https, mailto, vscode, file`.

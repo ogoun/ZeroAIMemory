@@ -81,5 +81,20 @@
   {"t": "java\u017fcript:alert(1)", "scheme": null, "report": false, "click": true},
   {"t": "javascript\uff1aalert(1)", "scheme": null, "report": false, "click": true},
   {"t": "K:x", "scheme": "k", "report": false, "click": false},
-  {"t": "\u212a:x", "scheme": null, "report": false, "click": true}
+  {"t": "\u212a:x", "scheme": null, "report": false, "click": true},
+  {"t": "vscode://file//home/u/a.rs", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/.//server/x", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/x/..//server/y", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/%2e//server/x", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/%2E%2E/%2Fserver/x", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/a/b/../..//server/x", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/.\\\\server\\x", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/./%5Cserver/x", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/x/..", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/.", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/?x=1", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/./C:/proj/a.rs", "scheme": "vscode", "report": true, "click": true},
+  {"t": "vscode://file/home/u/../v/a.rs:3", "scheme": "vscode", "report": true, "click": true},
+  {"t": "vscode://file/home/u/a//b.rs", "scheme": "vscode", "report": true, "click": true},
+  {"t": "vscode://file/home/u/a.rs?x=.//server", "scheme": "vscode", "report": true, "click": true}
 ]

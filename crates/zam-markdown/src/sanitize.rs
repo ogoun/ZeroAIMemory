@@ -196,8 +196,13 @@ fn report_filter<'u>(element: &str, attribute: &str, value: &'u str) -> Option<C
     use zam_core::link::{report_link_clickable, url_scheme};
     let ok = match (element, attribute) {
         ("a", "href") => report_link_clickable(value),
+        // адрес показывают человеку (подсказка, печать): невидимые, bidi и управляющие символы
+        // подменили бы его вид — такая ссылка остаётся текстом
         ("a", "data-url") => {
             matches!(url_scheme(value).as_deref(), Some("file" | "vscode"))
+                && !value
+                    .chars()
+                    .any(|c| c.is_control() || zam_core::text::is_invisible(c))
         }
         (_, "src") => url_scheme(value).is_none_or(|s| URL_SCHEMES.contains(&s.as_str())),
         _ => true,

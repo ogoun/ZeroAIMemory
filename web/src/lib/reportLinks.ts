@@ -107,8 +107,27 @@ export function reportLinkClickable(target: string): boolean {
   if (scheme !== 'vscode') return false;
   const rest = t.slice(7);
   if (!rest.startsWith('//file/')) return false;
-  const p = rest.slice(7).toLowerCase();
-  return !(p === '' || p.startsWith('/') || p.startsWith('\\') || p.startsWith('%2f') || p.startsWith('%5c'));
+  return !vscodePathEmptyOrNetwork(rest.slice(7));
+}
+
+/**
+ * Путь адреса `vscode://file/<путь>` пуст или сетевой — после снятия сегментов `.` и `..`, как
+ * это сделал бы разборщик URL (`.//сервер/x`, `x/..//сервер/y` — тот же `//сервер/…`). То же, что
+ * `vscode_path_empty_or_network` в `zam_core::link`: разделитель — `/`, `\`, `%2F`, `%5C`, точка —
+ * и `%2E`; запрос и якорь — не путь.
+ */
+function vscodePathEmptyOrNetwork(path: string): boolean {
+  const plain = path
+    .replace(/[?#].*$/s, '')
+    .replace(/%2f|%5c|\\/gi, '/')
+    .replace(/%2e/gi, '.');
+  const segments: string[] = [];
+  for (const s of plain.split('/')) {
+    if (s === '.') continue;
+    if (s === '..') segments.pop();
+    else segments.push(s);
+  }
+  return segments.length === 0 || segments[0] === '';
 }
 
 /** Внешняя ссылка: со схемой или `//host` (браузер читает `\` как `/`). */
@@ -123,7 +142,8 @@ function isExternal(target: string, scheme: string | null): boolean {
  * - `;`, `|`, `&` — следующая команда, конвейер (все три оболочки);
  * - `<`, `>` — перенаправление в файл;
  * - `"`, `'` — закрывают кавычки, в которые человек заключил путь;
- * - `(`, `)` — подвыражение PowerShell в начале слова (`a (calc)` после пробела в пути), подоболочка bash;
+ * - `(`, `)` — PowerShell исполняет аргумент, начинающийся с `(` (`a (calc)` после пробела в
+ *   пути); подоболочка bash; в zsh — и внутри слова: `*(e:cmd:)`, `=(cmd)`;
  * - `%` — переменная cmd (`%COMSPEC%`); `^` — экранирование cmd; `!` — история bash и
  *   отложенные переменные cmd.
  * Пробел, `#`, `~`, `*`, `?`, `[`, `{` не исполняют ничего (худшее — путь разобьётся или
@@ -134,9 +154,11 @@ const SHELL_META = '`$;|&<>"\'()%^!';
 /**
  * Текст небезопасно класть в буфер обмена как путь: управляющие символы (перевод строки при
  * вставке в терминал выполняет строку), невидимые и bidi ({@link INVISIBLE_RANGES}), знаки
- * оболочки ({@link SHELL_META}).
+ * оболочки ({@link SHELL_META}), а также пробел, за которым идёт `-`: вставленный в команду
+ * человека путь `/tmp/a --install-extension x` дал бы ей свой флаг.
  */
 export function unsafePathText(s: string): boolean {
+  if (s.includes(' -')) return true;
   for (const ch of s) {
     const cp = ch.codePointAt(0)!;
     if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || isInvisible(cp) || SHELL_META.includes(ch)) return true;
@@ -209,6 +231,25 @@ export function shorten(s: string): string {
   return chars.length <= SHOWN_MAX ? s : `${chars.slice(0, SHOWN_MAX).join('')}…`;
 }
 
+/** В тексте есть управляющий или невидимый символ ({@link INVISIBLE_RANGES}). */
+export function hasHidden(s: string): boolean {
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!;
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || isInvisible(cp)) return true;
+  }
+  return false;
+}
+
+/**
+ * Текст, который увидит человек (подсказка, печать): управляющие и невидимые символы — в записи
+ * `%XX`, иначе bidi-символ зеркалил бы адрес (с U+202E перед `gpj.exe` имя читается как `exe.jpg`).
+ */
+export function visible(s: string): string {
+  let out = '';
+  for (const ch of s) out += hasHidden(ch) ? encodeURIComponent(ch) : ch;
+  return out;
+}
+
 /** Ссылки, уже оформленные {@link hydrateReportLinks} (метку в HTML отчёта подделать нельзя). */
 const done = new WeakSet<object>();
 
@@ -221,7 +262,9 @@ const done = new WeakSet<object>();
  * - ссылке `file:`/`vscode:` (адрес — `data-url` с сервера или её `href`): без `href` — класс
  *   `local-link`; адрес — в `title` и, если он не текст самой ссылки, в `data-print` (печать:
  *   `a[data-print]::after`), оба не длиннее {@link SHOWN_MAX}; при безопасном пути — кнопка
- *   «копировать путь» (`data-copy-path`).
+ *   «копировать путь» (`data-copy-path`);
+ * - `data-url` с управляющими и невидимыми символами (сервер такой не присылает) снимается; адрес
+ *   из `href` с ними показывается в записи `%XX` ({@link visible}).
  */
 export function hydrateReportLinks(root: ParentNode): void {
   for (const a of root.querySelectorAll<HTMLElement>('a[href], a[data-url]')) {
@@ -244,11 +287,13 @@ export function hydrateReportLinks(root: ParentNode): void {
     }
     if (url === null || again) continue;
     const scheme = urlScheme(url);
-    if ((scheme !== 'file' && scheme !== 'vscode') || !reportLinkAllowed(url)) {
+    // адрес без перехода с невидимыми символами — не показывается вовсе: ссылка остаётся текстом
+    const fromHref = raw !== null && url === raw;
+    if ((scheme !== 'file' && scheme !== 'vscode') || !reportLinkAllowed(url) || (!fromHref && hasHidden(clean(url)))) {
       a.removeAttribute('data-url');
       continue;
     }
-    url = clean(url);
+    url = visible(clean(url));
     a.setAttribute('data-url', url);
     if (!a.hasAttribute('href')) a.classList.add('local-link');
     if ((a.textContent ?? '').trim() !== url) a.setAttribute('data-print', shorten(url));

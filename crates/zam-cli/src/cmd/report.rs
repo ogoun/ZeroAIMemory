@@ -469,8 +469,8 @@ enum Line {
     Para,
 }
 
-/// Блоки документа: текст для разбора строк (код, frontmatter и определения ссылок заменены
-/// пробелами — смещения те же), определения `[метка]: путь` (первое по тексту) и первый
+/// Блоки документа: текст для разбора строк (код, frontmatter, блоки HTML и определения ссылок
+/// заменены пробелами — смещения те же), определения `[метка]: путь` (первое по тексту) и первый
 /// заголовок `#`.
 struct Blocks {
     text: Vec<u8>,
@@ -555,6 +555,30 @@ fn blocks(md: &str) -> Blocks {
                 prev = Line::Break;
                 continue;
             }
+            // блок HTML: разбор сервера ссылок в нём не видит (`<div>ftp://e.org/a</div>`)
+            if let Some(end) = html_block(rest, prev == Line::Break) {
+                blank(&mut text, r);
+                match end {
+                    // до пустой строки
+                    None => {
+                        while k < lines.len() && !line_str(&lines[k]).trim().is_empty() {
+                            blank(&mut text, lines[k].clone());
+                            k += 1;
+                        }
+                    }
+                    // до строки с закрывающей последовательностью (включая её; может быть этой же)
+                    Some(close) => {
+                        let mut l = rest.to_ascii_lowercase();
+                        while !l.contains(close) && k < lines.len() {
+                            blank(&mut text, lines[k].clone());
+                            l = line_str(&lines[k]).to_ascii_lowercase();
+                            k += 1;
+                        }
+                    }
+                }
+                prev = Line::Break;
+                continue;
+            }
             // определение сноски `[^1]: …` — блок текста: его ссылки ищутся как обычно
             if prev == Line::Break
                 && let Some((label, dest)) = definition(rest)
@@ -574,6 +598,133 @@ fn blocks(md: &str) -> Blocks {
         prev = Line::Para;
     }
     Blocks { text, defs, h1 }
+}
+
+/// Теги, с которых начинается блок HTML вида 6 (CommonMark 0.31, §4.6).
+const HTML_BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+];
+
+/// Строка (без отступа, он меньше 4) начинает блок HTML (CommonMark §4.6): `Some(None)` — блок
+/// до пустой строки, `Some(Some(конец))` — до строки с закрывающей последовательностью (в нижнем
+/// регистре). `after_break` — перед строкой нет абзаца: вид 7 (любой одиночный тег) абзац не
+/// прерывает. Приближение: у вида 7 атрибуты тега не разбираются — тег должен занимать строку
+/// целиком и не содержать `<` и `>` внутри.
+fn html_block(rest: &str, after_break: bool) -> Option<Option<&'static str>> {
+    let low = rest
+        .chars()
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let after = low.strip_prefix('<')?;
+    for (open, close) in [
+        ("script", "</script>"),
+        ("pre", "</pre>"),
+        ("style", "</style>"),
+        ("textarea", "</textarea>"),
+    ] {
+        if let Some(t) = after.strip_prefix(open)
+            && matches!(t.bytes().next(), None | Some(b' ' | b'\t' | b'>'))
+        {
+            return Some(Some(close));
+        }
+    }
+    if after.starts_with("!--") {
+        return Some(Some("-->"));
+    }
+    if after.starts_with('?') {
+        return Some(Some("?>"));
+    }
+    if after.starts_with("![cdata[") {
+        return Some(Some("]]>"));
+    }
+    if after.starts_with('!') && after[1..].starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return Some(Some(">"));
+    }
+    let full = rest[1..].strip_prefix('/').unwrap_or(&rest[1..]);
+    let name_len = full
+        .bytes()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        .count();
+    let (name, tail) = full.split_at(name_len);
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    if HTML_BLOCK_TAGS.contains(&name.as_str())
+        && (tail.is_empty() || tail.starts_with([' ', '\t', '>']) || tail.starts_with("/>"))
+    {
+        return Some(None);
+    }
+    // вид 7: один открывающий или закрывающий тег на всю строку
+    let whole = rest.trim_end();
+    (after_break
+        && !matches!(name.as_str(), "script" | "pre" | "style" | "textarea")
+        && whole.ends_with('>')
+        && !whole[1..whole.len() - 1].contains(['<', '>'])
+        && (tail.starts_with([' ', '\t', '>']) || tail.starts_with("/>")))
+    .then_some(None)
 }
 
 /// Отступ строки в колонках (табуляция — до кратного 4).
@@ -701,19 +852,53 @@ fn first_h1(md: &str) -> Option<String> {
 /// ссылки на файлы.
 pub(crate) fn local_links(md: &str) -> Vec<String> {
     let Blocks { text, defs, .. } = blocks(md);
+    // замена на пробелы шла целыми строками: текст остался корректным UTF-8
+    let text = String::from_utf8_lossy(&text);
     Scanner::new(&text, &defs).run()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Счётчик шагов сканера ссылок — для теста линейности (без порогов времени).
+    static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `n` шагов просмотра текста сканером (считаются только в тестах).
+#[inline]
+fn steps(n: usize) {
+    #[cfg(test)]
+    STEPS.with(|s| s.set(s.get() + n as u64));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 struct Scanner<'a> {
+    /// Текст тела (код, frontmatter, блоки HTML и определения ссылок заменены пробелами).
+    s: &'a str,
     b: &'a [u8],
     defs: &'a HashMap<String, String>,
     /// Начала пустых строк (граница абзаца для поиска скобок и `` ` ``).
     breaks: Vec<usize>,
     out: Vec<String>,
+    /// Счёт скобок блока для голых автоссылок `схема://…` и `www.…`: до какой позиции текст
+    /// просмотрен и сколько `[` там не закрыто. Позиции запросов только растут — каждый байт
+    /// просматривается один раз.
+    brackets: (usize, u32),
+    /// То же для почты, по строке: просмотрено до позиции, начало счёта (строки или конец
+    /// предыдущей автоссылки), разность числа `[` и `]`.
+    line_brackets: (usize, usize, i32),
+    /// Для [`inline_html`]: концы абзацев, в которых закрывающей последовательности дальше нет.
+    html_miss: [usize; 6],
+    /// Концы абзацев, до которых нет закрывающих `]]` вики-ссылки и `$` формулы: второй раз до
+    /// конца абзаца их не ищут (непарный знак в каждой строке длинной таблицы).
+    scan_miss: [usize; 2],
+    /// Пары вложенных скобок, найденные попутно ([`Scanner::match_bracket`]); `None` — пары нет.
+    bracket_pairs: HashMap<usize, Option<usize>>,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(b: &'a [u8], defs: &'a HashMap<String, String>) -> Scanner<'a> {
+    fn new(s: &'a str, defs: &'a HashMap<String, String>) -> Scanner<'a> {
+        let b = s.as_bytes();
         let mut breaks = Vec::new();
         let mut line_start = 0;
         let mut only_ws = true;
@@ -734,10 +919,16 @@ impl<'a> Scanner<'a> {
             breaks.push(line_start);
         }
         Scanner {
+            s,
             b,
             defs,
             breaks,
             out: Vec::new(),
+            brackets: (0, 0),
+            line_brackets: (0, 0, 0),
+            html_miss: [0; 6],
+            scan_miss: [0; 2],
+            bracket_pairs: HashMap::new(),
         }
     }
 
@@ -750,24 +941,29 @@ impl<'a> Scanner<'a> {
     /// Перед позицией `i` в её блоке есть незакрытая `[`: внутри скобок разбор сервера голых
     /// автоссылок `схема://…` и `www.…` не ищет (скобка может оказаться текстом ссылки).
     /// Приближение: скобки считаются по тексту блока как есть (без кода и формул), блок — от
-    /// пустой строки или строки с маркером заголовка, списка, цитаты.
-    fn in_brackets(&self, i: usize) -> bool {
-        let b = self.b;
-        let k = self.breaks.partition_point(|&s| s <= i);
-        let mut j = if k == 0 { 0 } else { self.breaks[k - 1] };
-        let mut depth = 0u32;
+    /// пустой строки или строки с маркером заголовка, списка, цитаты. Счёт продолжается с
+    /// места прошлого запроса ([`Scanner::brackets`]): запросы идут по возрастанию `i`.
+    fn in_brackets(&mut self, i: usize) -> bool {
+        let (b, s) = (self.b, self.s);
+        let (mut j, mut depth) = self.brackets;
+        let k = self.breaks.partition_point(|&p| p <= i);
+        let block = if k == 0 { 0 } else { self.breaks[k - 1] };
+        if block > j {
+            (j, depth) = (block, 0);
+        }
         while j < i {
+            steps(1);
             match b[j] {
                 b'\\' => j += 1,
                 b'[' => depth += 1,
                 b']' => depth = depth.saturating_sub(1),
-                b'\n' if block_marker(&b[j + 1..i]) => depth = 0,
+                b'\n' if block_marker(&b[j + 1..]) => depth = 0,
                 // скобка внутри более ранней голой автоссылки — часть её адреса
                 b':' | b'w' if depth == 0 => {
                     let end = if b[j] == b':' {
-                        bare_url_autolink(b, j).map(|l| l.end)
+                        bare_url_autolink(s, j).map(|l| l.end)
                     } else {
-                        bare_www_autolink(b, j)
+                        bare_www_autolink(s, j)
                     };
                     if let Some(end) = end {
                         j = end;
@@ -778,17 +974,42 @@ impl<'a> Scanner<'a> {
             }
             j += 1;
         }
+        self.brackets = (j, depth);
         depth > 0
     }
 
-    fn run(mut self) -> Vec<String> {
+    /// Для почты в позиции `i`: начало её текста (строки или `floor` — конца предыдущей голой
+    /// автоссылки) и разность числа `[` и `]` от него до `i`. Счёт продолжается с места прошлого
+    /// запроса ([`Scanner::line_brackets`]).
+    fn line_brackets(&mut self, i: usize, floor: usize) -> (usize, i32) {
         let b = self.b;
+        let (mut j, mut line, mut depth) = self.line_brackets;
+        if floor > j {
+            (j, line, depth) = (floor, floor, 0);
+        }
+        steps(i.saturating_sub(j));
+        while j < i {
+            match b[j] {
+                b'\n' => (line, depth) = (j + 1, 0),
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        self.line_brackets = (j, line, depth);
+        (line, depth)
+    }
+
+    fn run(mut self) -> Vec<String> {
+        let (b, s) = (self.b, self.s);
         // (откуда, куда): дойдя до `]` текста найденной ссылки, перепрыгнуть её назначение
         let mut jumps: Vec<(usize, usize)> = Vec::new();
         // конец последней голой автоссылки (`схема://…`, `www.…`, почта)
         let mut bare_end = 0;
         let mut i = 0;
         while i < b.len() {
+            steps(1 + jumps.len());
             if let Some(k) = jumps.iter().position(|j| j.0 == i) {
                 i = jumps.swap_remove(k).1;
                 continue;
@@ -812,9 +1033,14 @@ impl<'a> Scanner<'a> {
                     if b.get(i + 1) == Some(&b'[') {
                         // вики-ссылка `[[…]]` — не файл отчёта
                         let end = self.para_end(i);
-                        if let Some(k) = find(&b[i..end], b"]]") {
-                            i += k + 2;
-                            continue;
+                        if self.scan_miss[0] != end {
+                            let found = find(&b[i..end], b"]]");
+                            steps(found.unwrap_or(end - i));
+                            if let Some(k) = found {
+                                i += k + 2;
+                                continue;
+                            }
+                            self.scan_miss[0] = end;
                         }
                     }
                     self.link(i, &mut jumps);
@@ -823,7 +1049,7 @@ impl<'a> Scanner<'a> {
                 // голые автоссылки GFM — только ради отказа по схеме (файлом отчёта они не
                 // бывают); внутри уже найденной (`https://a/ftp://b`) новых нет
                 b':' if i >= bare_end => {
-                    if let Some(l) = bare_url_autolink(b, i)
+                    if let Some(l) = bare_url_autolink(s, i)
                         && !self.in_brackets(i)
                     {
                         bare_end = l.end;
@@ -835,7 +1061,7 @@ impl<'a> Scanner<'a> {
                     i += 1;
                 }
                 b'w' if i >= bare_end => {
-                    if let Some(end) = bare_www_autolink(b, i)
+                    if let Some(end) = bare_www_autolink(s, i)
                         && !self.in_brackets(i)
                     {
                         bare_end = end;
@@ -843,7 +1069,10 @@ impl<'a> Scanner<'a> {
                     i += 1;
                 }
                 b'@' if i >= bare_end => {
-                    if let Some((url, end)) = bare_email_autolink(b, i, bare_end) {
+                    let (line, depth) = self.line_brackets(i, bare_end);
+                    if depth <= 0
+                        && let Some((url, end)) = bare_email_autolink(s, i, line)
+                    {
                         bare_end = end;
                         if zam_core::link::url_scheme(&url)
                             .is_some_and(|s| !zam_core::link::report_scheme_allowed(&s))
@@ -861,6 +1090,8 @@ impl<'a> Scanner<'a> {
 
     /// После кода `` `…` ``: позиция за закрывающей последовательностью той же длины (нет —
     /// за открывающей).
+    /// Без пары остаётся не больше одной последовательности каждой длины на абзац — повторных
+    /// просмотров до конца абзаца здесь не бывает (как и у `$$`).
     fn skip_code(&self, i: usize) -> usize {
         let b = self.b;
         let n = b[i..].iter().take_while(|&&c| c == b'`').count();
@@ -870,6 +1101,7 @@ impl<'a> Scanner<'a> {
             if b[k] == b'`' {
                 let m = b[k..end].iter().take_while(|&&c| c == b'`').count();
                 if m == n {
+                    steps(k - i);
                     return k + m;
                 }
                 k += m;
@@ -877,19 +1109,25 @@ impl<'a> Scanner<'a> {
                 k += 1;
             }
         }
+        steps(end - i);
         i + n
     }
 
     /// После формулы `$…$` или `$$…$$` (математика разбора сервера: ссылки внутри не видны).
-    fn skip_math(&self, i: usize) -> usize {
+    fn skip_math(&mut self, i: usize) -> usize {
         let b = self.b;
         if b.get(i + 1) == Some(&b'$') {
-            return find(&b[i + 2..], b"$$").map_or(i + 2, |k| i + 2 + k + 2);
+            let found = find(&b[i + 2..], b"$$");
+            steps(found.unwrap_or(b.len() - i));
+            return found.map_or(i + 2, |k| i + 2 + k + 2);
         }
         if b.get(i + 1).is_none_or(|c| c.is_ascii_whitespace()) {
             return i + 1;
         }
         let end = self.para_end(i);
+        if self.scan_miss[1] == end {
+            return i + 1;
+        }
         let mut k = i + 1;
         while k < end {
             match b[k] {
@@ -897,36 +1135,47 @@ impl<'a> Scanner<'a> {
                 b'$' if !b[k - 1].is_ascii_whitespace()
                     && !b.get(k + 1).is_some_and(u8::is_ascii_digit) =>
                 {
+                    steps(k - i);
                     return k + 1;
                 }
                 _ => {}
             }
             k += 1;
         }
+        // закрывающего `$` до конца абзаца нет — и для следующих `$` тоже
+        steps(end - i);
+        self.scan_miss[1] = end;
         i + 1
     }
 
-    /// `<…>` — автоссылка или тег HTML: до `>` (ссылки внутри тега не ищутся). Назначение
-    /// автоссылки `<схема:адрес>` — в вывод: её схема проверяется как у прочих ссылок.
+    /// `<…>` — автоссылка `<схема:адрес>` (её назначение — в вывод: схема проверяется как у
+    /// прочих ссылок) или строчный HTML (ссылки внутри не ищутся): позиция за ним. Не то и не
+    /// другое — `<` остаётся текстом (`<!--ftp://x>` — не комментарий: ссылка в нём видна).
     fn skip_angle(&mut self, i: usize) -> usize {
         let b = self.b;
-        let tag = b
-            .get(i + 1)
-            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?'));
-        if !tag {
-            return i + 1;
-        }
         let end = self.para_end(i);
-        let Some(k) = b[i..end].iter().position(|&c| c == b'>') else {
-            return i + 1;
-        };
-        // `<a:<ftp://x>`: первая `<` — текст, автоссылка — от последней
-        let from = b[i..i + k].iter().rposition(|&c| c == b'<').unwrap_or(0);
-        let inner = &b[i + from + 1..i + k];
-        if is_autolink(inner) {
-            self.out.push(String::from_utf8_lossy(inner).into_owned());
+        let rest = &b[i..end];
+        // автоссылка — без пробелов и `<`: дальше них `>` искать незачем
+        if let Some(k) = rest
+            .iter()
+            .skip(1)
+            .position(|&c| c == b'>' || c == b'<' || c <= b' ')
+            .map(|k| k + 1)
+            && rest[k] == b'>'
+            && is_autolink(&rest[1..k])
+        {
+            steps(k);
+            self.out
+                .push(String::from_utf8_lossy(&rest[1..k]).into_owned());
+            return i + k + 1;
         }
-        i + k + 1
+        match inline_html(rest, end, &mut self.html_miss) {
+            Some(n) => {
+                steps(n);
+                i + n
+            }
+            None => i + 1,
+        }
     }
 
     /// Ссылка с текстом с позиции `[` (`open`): назначение — в вывод, переход через него — в
@@ -988,28 +1237,43 @@ impl<'a> Scanner<'a> {
     }
 
     /// Парная `]` текста ссылки (вложенные скобки, экранирование, код).
-    fn match_bracket(&self, open: usize) -> Option<usize> {
+    ///
+    /// Один просмотр находит пары и всем вложенным скобкам — они запоминаются
+    /// ([`Scanner::bracket_pairs`]): незакрытая `[` в длинном абзаце (`[0, 5)` в каждой строке
+    /// таблицы) не заставляет просматривать абзац заново от каждой следующей.
+    fn match_bracket(&mut self, open: usize) -> Option<usize> {
+        if let Some(&close) = self.bracket_pairs.get(&open) {
+            return close;
+        }
         let b = self.b;
         let end = self.para_end(open);
-        let mut depth = 0usize;
+        let mut opened: Vec<usize> = Vec::new();
         let mut k = open;
         while k < end {
+            steps(1);
             match b[k] {
                 b'\\' => k += 1,
                 b'`' => {
                     k = self.skip_code(k);
                     continue;
                 }
-                b'[' => depth += 1,
+                b'[' => opened.push(k),
                 b']' => {
-                    depth -= 1;
-                    if depth == 0 {
+                    // стек не пуст: просмотр начат с `[` и кончается на её паре
+                    let inner = opened.pop();
+                    if opened.is_empty() {
                         return Some(k);
+                    }
+                    if let Some(inner) = inner {
+                        self.bracket_pairs.insert(inner, Some(k));
                     }
                 }
                 _ => {}
             }
             k += 1;
+        }
+        for o in opened {
+            self.bracket_pairs.insert(o, None);
         }
         None
     }
@@ -1103,7 +1367,7 @@ fn skip_ws(b: &[u8], mut i: usize, end: usize) -> usize {
 /// Содержимое `<…>` — автоссылка CommonMark с адресом: схема из 2–32 символов (буква, затем
 /// буквы, цифры, `+.-`), `:`, дальше без пробелов, управляющих символов и `<`.
 fn is_autolink(s: &[u8]) -> bool {
-    let Some(colon) = s.iter().position(|&c| c == b':') else {
+    let Some(colon) = s.iter().take(33).position(|&c| c == b':') else {
         return false;
     };
     (2..=32).contains(&colon)
@@ -1112,6 +1376,94 @@ fn is_autolink(s: &[u8]) -> bool {
             .iter()
             .all(|c| c.is_ascii_alphanumeric() || b"+.-".contains(c))
         && !s.iter().any(|&c| c <= b' ' || c == b'<')
+}
+
+/// Длина строчного HTML в начале `s` (`s[0] == b'<'`; CommonMark §6.6): открывающий тег с
+/// атрибутами, закрывающий тег, комментарий `<!-- … -->`, инструкция `<? … ?>`, объявление
+/// `<!X … >`, `<![CDATA[ … ]]>`. `None` — не HTML: `<` — обычный текст. `s` — до конца абзаца
+/// `para`; `miss` помнит, каких закрывающих последовательностей в этом абзаце дальше нет
+/// (второй раз до конца абзаца их не ищут).
+fn inline_html(s: &[u8], para: usize, miss: &mut [usize; 6]) -> Option<usize> {
+    let mut until = |kind: usize, from: usize, close: &[u8]| -> Option<usize> {
+        if miss[kind] == para {
+            return None;
+        }
+        let found = find(&s[from..], close).map(|k| from + k + close.len());
+        if found.is_none() {
+            steps(s.len());
+            miss[kind] = para;
+        }
+        found
+    };
+    let space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
+    match s.get(1)? {
+        b'!' if s[2..].starts_with(b"--") => {
+            if s[4..].starts_with(b">") {
+                return Some(5);
+            }
+            if s[4..].starts_with(b"->") {
+                return Some(6);
+            }
+            until(0, 4, b"-->")
+        }
+        b'!' if s[2..].starts_with(b"[CDATA[") => until(1, 9, b"]]>"),
+        b'!' if s.get(2).is_some_and(u8::is_ascii_alphabetic) => until(2, 2, b">"),
+        b'?' => until(3, 2, b"?>"),
+        b'/' => {
+            if !s.get(2)?.is_ascii_alphabetic() {
+                return None;
+            }
+            let mut k = 2 + s[2..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == b'-')
+                .count();
+            k += s[k..].iter().take_while(|&&c| space(c)).count();
+            (s.get(k) == Some(&b'>')).then_some(k + 1)
+        }
+        c if c.is_ascii_alphabetic() => {
+            let mut k = 1 + s[1..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == b'-')
+                .count();
+            loop {
+                let ws = s[k..].iter().take_while(|&&c| space(c)).count();
+                k += ws;
+                match s.get(k)? {
+                    b'>' => return Some(k + 1),
+                    b'/' => return (s.get(k + 1) == Some(&b'>')).then_some(k + 2),
+                    c if ws > 0 && (c.is_ascii_alphabetic() || matches!(c, b'_' | b':')) => {}
+                    _ => return None,
+                }
+                // имя атрибута и необязательное значение
+                k += s[k..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(c))
+                    .count();
+                let eq = k + s[k..].iter().take_while(|&&c| space(c)).count();
+                if s.get(eq) != Some(&b'=') {
+                    continue;
+                }
+                k = eq + 1 + s[eq + 1..].iter().take_while(|&&c| space(c)).count();
+                match s.get(k)? {
+                    q @ (b'"' | b'\'') => {
+                        let kind = if *q == b'"' { 4 } else { 5 };
+                        k = until(kind, k + 1, &[*q])?;
+                    }
+                    _ => {
+                        let n = s[k..]
+                            .iter()
+                            .take_while(|&&c| !space(c) && !b"\"'=<>`".contains(&c))
+                            .count();
+                        if n == 0 {
+                            return None;
+                        }
+                        k += n;
+                    }
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Знак годится для имени узла голой автоссылки GFM — как `is_valid_hostchar` разбора сервера
@@ -1142,10 +1494,12 @@ fn host_char(c: char) -> bool {
 
 /// Имя узла голой автоссылки GFM принимается — `check_domain` разбора сервера: узел — знаки
 /// [`host_char`], `-`, `_`, `.`; в двух последних метках нет `_` (если точек не больше десяти);
-/// `short` — точка в узле не обязательна (`схема://узел`; у `www.` — обязательна).
+/// `short` — точка в узле не обязательна (`схема://узел`; у `www.` — обязательна). `tail` — текст
+/// от начала узла: просматривается только сам узел.
 fn bare_domain_ok(tail: &str, short: bool) -> bool {
-    let (mut dots, mut underscores, mut prev_underscores) = (0, 0, 0);
+    let (mut dots, mut underscores, mut prev_underscores, mut seen) = (0, 0, 0, 0);
     for (k, c) in tail.char_indices() {
+        seen += 1;
         match c {
             '\\' if k + 1 < tail.len() => {}
             '_' => underscores += 1,
@@ -1158,6 +1512,7 @@ fn bare_domain_ok(tail: &str, short: bool) -> bool {
             _ => break,
         }
     }
+    steps(seen);
     dots > 10 || (underscores == 0 && prev_underscores == 0 && (short || dots > 0))
 }
 
@@ -1182,10 +1537,12 @@ fn bare_space(c: u8) -> bool {
 
 /// Конец голой автоссылки, начатой до `from`: первый пробельный символ или `<`.
 fn bare_link_end(b: &[u8], from: usize) -> usize {
-    b[from..]
+    let end = b[from..]
         .iter()
         .position(|&c| bare_space(c) || c == b'<')
-        .map_or(b.len(), |k| from + k)
+        .map_or(b.len(), |k| from + k);
+    steps(end - from);
+    end
 }
 
 /// Голая автоссылка `схема://…`: байты `start..end` текста.
@@ -1203,86 +1560,71 @@ struct BareUrl {
 /// - за двоеточием `//`, перед ним — буквы ASCII, целиком равные `http`, `https` или `ftp` без
 ///   учёта регистра (`словоftp://…` и `1ftp://…` — ссылки, `aftp://…`, `sftp://…` — нет);
 /// - первый знак узла — [`host_char`], узел — [`bare_domain_ok`].
-fn bare_url_autolink(b: &[u8], i: usize) -> Option<BareUrl> {
+///
+/// Конец ссылки ищется только у принятой: отказ стоит не больше длины узла.
+fn bare_url_autolink(s: &str, i: usize) -> Option<BareUrl> {
+    let b = s.as_bytes();
     if b.get(i + 1) != Some(&b'/') || b.get(i + 2) != Some(&b'/') {
         return None;
     }
-    let start = i - b[..i]
+    // схема — не длиннее `https`: дальше шести букв назад смотреть незачем
+    let back = b[..i]
         .iter()
         .rev()
+        .take(6)
         .take_while(|c| c.is_ascii_alphabetic())
         .count();
+    let start = i - back;
     let scheme = &b[start..i];
     let ftp = scheme.eq_ignore_ascii_case(b"ftp");
     if !(ftp || scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https")) {
         return None;
     }
+    // `i + 3` — граница символа: перед ней ASCII `/`
+    let tail = &s[i + 3..];
+    if !(tail.chars().next().is_some_and(host_char) && bare_domain_ok(tail, true)) {
+        return None;
+    }
     let end = bare_link_end(b, i + 3);
-    let tail = String::from_utf8_lossy(&b[i + 3..end]);
-    (tail.chars().next().is_some_and(host_char) && bare_domain_ok(&tail, true)).then_some(BareUrl {
-        start,
-        end,
-        ftp,
-    })
+    Some(BareUrl { start, end, ftp })
 }
 
 /// Голая автоссылка GFM `www.узел.зона…` (`www_match` comrak 0.56) с позиции `i`: её конец. Схема
 /// (`http`) разрешена — нужна только граница, как у [`bare_url_autolink`]. Перед `www.` — начало
 /// текста, пробельный символ или один из `*_~([`.
-fn bare_www_autolink(b: &[u8], i: usize) -> Option<usize> {
+fn bare_www_autolink(s: &str, i: usize) -> Option<usize> {
+    let b = s.as_bytes();
     let before = i == 0 || bare_space(b[i - 1]) || b"*_~([".contains(&b[i - 1]);
     if !before || !b[i..].starts_with(b"www.") {
         return None;
     }
-    let end = bare_link_end(b, i + 4);
-    bare_domain_ok(&String::from_utf8_lossy(&b[i + 4..end]), false).then_some(end)
+    bare_domain_ok(&s[i + 4..], false).then(|| bare_link_end(b, i + 4))
 }
 
 /// Голая автоссылка почты GFM (`имя@узел.зона`, `xmpp:имя@узел.зона`; `email_match` comrak 0.56)
 /// по знаку `@` в позиции `i`: её адрес и конец в тексте. С протоколом адрес — текст от начала
 /// имени, вместе со всем, что стоит перед протоколом слитно (`a.xmpp:имя@узел.зона` — схема
 /// `a.xmpp`), поэтому решает [`zam_core::link::url_scheme`] у вызывающего; без протокола сервер
-/// подставляет `mailto:`. `floor` — конец предыдущей голой автоссылки: её текст в новую не входит.
+/// подставляет `mailto:`. `line` — начало текста, в который может входить адрес: начало строки
+/// или конец предыдущей голой автоссылки ([`Scanner::line_brackets`]).
 /// Правило снято с разбора сервера:
 /// - имя — назад по буквам, цифрам и `.+-_`; двоеточие входит, если перед ним буквы ASCII,
 ///   целиком равные `mailto` или `xmpp` (регистр важен);
 /// - узел — вперёд по буквам, цифрам, `-`, `_`, точке перед буквой или цифрой (нужна хотя бы
 ///   одна), у `xmpp` ещё `/`; второй `@` — не адрес; последний знак — буква или точка;
-/// - `@` внутри незакрытой `[` — не адрес (глубина скобок считается по строке — приближение:
-///   разбор сервера считает её по текстовому узлу); текст адреса кончается там, где дальше в
-///   строке начинается голая автоссылка `схема://…` (она разбирается раньше почты).
-fn bare_email_autolink(b: &[u8], i: usize, floor: usize) -> Option<(String, usize)> {
-    let line = b[..i]
-        .iter()
-        .rposition(|&c| c == b'\n')
-        .map_or(0, |k| k + 1)
-        .max(floor);
-    let mut end = b[i..]
-        .iter()
-        .position(|&c| c == b'\n')
-        .map_or(b.len(), |k| i + k);
-    if let Some(next) = (i + 1..end)
-        .filter(|&k| b[k] == b':')
-        .find_map(|k| bare_url_autolink(b, k))
-    {
-        end = end.min(next.start.max(i + 1));
-    }
-    let depth: i32 = b[line..i]
-        .iter()
-        .map(|&c| match c {
-            b'[' => 1,
-            b']' => -1,
-            _ => 0,
-        })
-        .sum();
-    if depth > 0 {
-        return None;
-    }
+/// - `@` внутри незакрытой `[` — не адрес (проверяет вызывающий; глубина скобок считается по
+///   строке — приближение: разбор сервера считает её по текстовому узлу);
+/// - текст адреса кончается там, где начинается голая автоссылка `схема://…` (она разбирается
+///   раньше почты): узел не содержит `:`, поэтому такая ссылка может начаться только у
+///   двоеточия, на котором узел остановился.
+fn bare_email_autolink(s: &str, i: usize, line: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
     let protocol = |name: &[u8], colon: usize| {
         let from = colon
             - b[line..colon]
                 .iter()
                 .rev()
+                .take(name.len() + 1)
                 .take_while(|c| c.is_ascii_alphabetic())
                 .count();
         &b[from..colon] == name
@@ -1302,30 +1644,42 @@ fn bare_email_autolink(b: &[u8], i: usize, floor: usize) -> Option<(String, usiz
             break;
         }
     }
+    steps(i - start);
     if start == i {
         return None;
     }
-    let size = end - i;
-    let (mut len, mut dots) = (1, 0);
-    while len < size {
-        let c = b[i + len];
-        if c.is_ascii_alphanumeric() {
-        } else if c == b'@' {
-            return None;
-        } else if c == b'.' && len < size - 1 && b[i + len + 1].is_ascii_alphanumeric() {
-            dots += 1;
-        } else if !(c == b'-' || c == b'_' || (c == b'/' && xmpp)) {
-            break;
+    // узел: до `limit` (конец текста или начало следующей автоссылки), не дальше конца строки;
+    // `None` — в узле второй `@`
+    let host = |limit: usize| -> Option<(usize, usize)> {
+        let (mut len, mut dots) = (1, 0);
+        while i + len < limit {
+            let c = b[i + len];
+            if c.is_ascii_alphanumeric() {
+            } else if c == b'@' {
+                return None;
+            } else if c == b'.' && i + len + 1 < limit && b[i + len + 1].is_ascii_alphanumeric() {
+                dots += 1;
+            } else if !(c == b'-' || c == b'_' || (c == b'/' && xmpp)) {
+                break;
+            }
+            len += 1;
         }
-        len += 1;
+        steps(len);
+        Some((len, dots))
+    };
+    let (mut len, mut dots) = host(b.len())?;
+    if b.get(i + len) == Some(&b':')
+        && let Some(next) = bare_url_autolink(s, i + len)
+    {
+        (len, dots) = host(next.start.max(i + 1))?;
     }
     let last = b[i + len - 1];
     if len < 2 || dots == 0 || !(last.is_ascii_alphabetic() || last == b'.') {
         return None;
     }
-    let text = String::from_utf8_lossy(&b[start..i + len]);
+    let text = &s[start..i + len];
     let url = if with_protocol {
-        text.into_owned()
+        text.to_string()
     } else {
         format!("mailto:{text}")
     };
@@ -1459,7 +1813,26 @@ mod tests {
             v.dedup();
             v
         };
-        let corpus: [(&str, &[&str]); 14] = [
+        let corpus: [(&str, &[&str]); 23] = [
+            // адрес почты кончается там, где начинается голая ссылка `схема://…`: от почты
+            // остаётся `xmpp:@www.` (не адрес), ссылка — `FTP://…`
+            ("т xmpp:@www.FTP://example.org/a\n", &["ftp"]),
+            ("т xmpp:u@h.org-http://example.org/a\n", &[]),
+            // блок HTML: ссылок в нём разбор сервера не видит (повторное ревью, Minor 2)
+            ("<div>ftp://example.org/a</div>\n", &[]),
+            (
+                "<div>\nftp://example.org/a\n</div>\n\nftp://example.org/b\n",
+                &["ftp"],
+            ),
+            ("<!-- ftp://example.org/a -->\n", &[]),
+            (
+                "<pre>\nftp://example.org/a\n\nftp://example.org/b\n</pre>\nтекст\n",
+                &[],
+            ),
+            ("<details open>\nxmpp:user@example.org\n", &[]),
+            // одиночный тег абзац не прерывает: это строчный HTML, ссылка дальше видна
+            ("текст\n<span>\nftp://example.org/a\n", &["ftp"]),
+            ("<span>\nftp://example.org/a\n\nтекст\n", &[]),
             ("см. ftp://example.org/a тут\n", &["ftp"]),
             ("ftp://example.org/a в начале\n", &["ftp"]),
             ("(ftp://example.org/a) и *ftp://example.org/b*\n", &["ftp"]),
@@ -1516,7 +1889,8 @@ mod tests {
             "user@example.org", "host", "a", "z", "я", "1", " ", " ", "\n", "\n\n", "(", ")", "*",
             "~", ".", ",", "-", "/", ":", "@", "\"", "'", "!", "?", "www.", "https://", "> ", "- ",
             "# ", "    ", "|", "mailto:", "h.org", "u@h.org/r", "+", "a.", "_b", "a_b", "[", "]",
-            "`", "<", ">", "«", "…",
+            "`", "<", ">", "«", "…", "<div>", "</div>", "\n<div>", "\n<span>\n", "<!--", "-->",
+            "\n<pre>", "</pre>",
         ];
         let rejected = |targets: Vec<String>| -> Vec<String> {
             let mut v: Vec<String> = targets
@@ -1564,6 +1938,116 @@ mod tests {
             diff.len(),
             diff[..diff.len().min(40)].join("\n")
         );
+    }
+
+    /// Тела для проверки линейности: `rows` строк одного вида без пустых строк между ними (один
+    /// блок — худший случай для счёта скобок).
+    fn long_bodies(rows: usize) -> Vec<(&'static str, String)> {
+        let make = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
+        vec![
+            (
+                "таблица со ссылками",
+                format!(
+                    "| источник | адрес |\n|---|---|\n{}",
+                    make(&|k| format!(
+                        "| работа {k} | https://example.org/papers/{k}?a=b и [pdf](files/p{k}.pdf) |\n"
+                    ))
+                ),
+            ),
+            (
+                "https + почта + www",
+                make(&|k| {
+                    format!(
+                        "см. https://e{k}.example.org/a, u{k}@example.org и www.example.org/{k}\n"
+                    )
+                }),
+            ),
+            (
+                "перечень источников",
+                make(&|k| {
+                    format!("{k}. Автор. Название: подзаголовок. ftp-зеркало http://h{k}.org/x\n")
+                }),
+            ),
+            (
+                "одна строка",
+                make(&|k| format!("a{k}@ b: w c@d https://e{k}.org/x_y [t{k}] ")),
+            ),
+            (
+                "почта без узла в одной строке",
+                make(&|k| format!("n{k}@ x.y:z {k}@. ")),
+            ),
+            (
+                "слитные адреса без пробелов",
+                make(&|k| format!("http://a_b{k},www.a_b,")),
+            ),
+            // непарные знаки в каждой строке таблицы: до конца абзаца ищут один раз
+            (
+                "интервалы и цены",
+                make(&|k| format!("| [{k}, 5) | $10{k} и $x{k} | a <b{k} c | `` x |\n")),
+            ),
+            (
+                "незакрытый HTML и вики",
+                make(&|k| format!("{k} <!-- a <? b <!D c <![CDATA[ d <a b=\"c e='f [[g\n")),
+            ),
+            (
+                "вложенные скобки",
+                make(&|k| format!("[a{k} [b] [c [d] e] f ![g](h{k}.png)\n")),
+            ),
+        ]
+    }
+
+    /// Повторное ревью 15a, I-3: сканер ссылок линеен по длине тела. Счётчик шагов вместо
+    /// времени: при удвоении числа строк шагов вдвое больше (квадратичный сканер давал вчетверо).
+    #[test]
+    fn local_links_scanner_is_linear() {
+        let count = |md: &str| {
+            STEPS.with(|s| s.set(0));
+            let n = local_links(md).len();
+            (STEPS.with(std::cell::Cell::get), n)
+        };
+        let small = long_bodies(5_000);
+        let big = long_bodies(10_000);
+        for ((name, a), (_, b)) in small.iter().zip(&big) {
+            let (sa, _) = count(a);
+            let (sb, _) = count(b);
+            assert!(
+                sa as usize >= a.len(),
+                "{name}: счётчик считает шаги ({sa})"
+            );
+            let ratio = sb as f64 / sa as f64;
+            assert!(
+                (1.8..2.3).contains(&ratio),
+                "{name}: шагов {sa} → {sb}, отношение {ratio:.2}"
+            );
+            // и не больше нескольких проходов по тексту
+            assert!(
+                (sb as usize) < 12 * b.len(),
+                "{name}: {sb} шагов на {} байт",
+                b.len()
+            );
+        }
+        // запрещённая схема в длинном теле по-прежнему находится
+        let (_, md) = &long_bodies(2_000)[0];
+        let md = format!("{md}| x | ftp://example.org/a |\n");
+        assert!(local_links(&md).iter().any(|t| t.starts_with("ftp://")));
+    }
+
+    /// Замер времени сканера (не проверка): `cargo test --release -p zam-cli --bins -- --ignored
+    /// --nocapture local_links_scanner_timing`.
+    #[test]
+    #[ignore = "замер времени, запускается вручную"]
+    fn local_links_scanner_timing() {
+        for rows in [4_000, 8_000, 16_000] {
+            for (name, md) in long_bodies(rows) {
+                let t = std::time::Instant::now();
+                let n = local_links(&md).len();
+                println!(
+                    "{rows} строк, {name}: {} кБ, ссылок {n}, {:.1} мс",
+                    md.len() / 1000,
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
     }
 
     #[test]
