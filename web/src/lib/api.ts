@@ -1424,7 +1424,31 @@ export interface SessionItem {
   /** Контрольная группа агентного A/B (M6 §12). */
   holdout?: boolean;
   tokens?: Record<string, TokenStat>;
+  /** Момент снимка сессии (M6 §8а), если он есть: сам снимок — [`sessionSnapshot`]. */
+  snapshot_at?: string;
 }
+
+/** Снимок сессии (M6 §8а, `GET /sessions/{id}/snapshot`): извлечён из журнала агента клиентом
+ * `zam` после маскировки секретов. Текст полей — как прислал агент: выводится только как текст. */
+export interface SessionSnapshot {
+  session_id: string;
+  taken_at: string;
+  trigger: string;
+  agent: string | null;
+  status: 'complete' | 'partial';
+  skipped: number;
+  bytes: number;
+  data: {
+    compact_summary?: string;
+    prompts: string[];
+    files: string[];
+    commands: { cmd: string; failed?: boolean }[];
+  };
+}
+
+/** Снимок сессии `id`; администратор — пользователя `user`. */
+export const sessionSnapshot = (id: string, user?: string) =>
+  call<SessionSnapshot>('GET', `sessions/${encodeURIComponent(id)}/snapshot`, undefined, user);
 
 /** Свои сессии, свежие первыми, с выданным по событию; администратор — пользователя `user`. */
 export function listSessions(f: { solution?: string; limit?: number }, user?: string) {

@@ -135,39 +135,30 @@ fn checkpoint(env: &Env, inp: &Input, s: &Settings) -> Output {
     };
     // новая эпоха `session_seen` на сжатии контекста (M6 §7.2)
     let epoch = session.filter(|_| inp.event == "PreCompact");
-    // снимок сессии и конец сессии (M6 §8а)
-    let job = snapshot_queue::job_for_checkpoint(env, inp, s);
+    // снимок сессии и конец сессии (M6 §8а). Решение о снимке (`snapst-*`, журнал сессии), сам
+    // снимок и отправка его очереди — целиком в отдельном потоке, **не** на пути сетевой части:
+    // очередь изменённых файлов, напоминание и эпоха не ждут ни одного файла снимка
     let end = session.filter(|_| inp.event == "SessionEnd");
-    // нового снимка нет, а прежний ждёт в очереди — уходит этим хуком (один `stat`)
-    let pending = session
-        .filter(|id| job.is_none() && s.session_snapshot() && snapshot_queue::queued(env, id));
-    if job.is_none() && end.is_none() && pending.is_none() {
+    let snap = session
+        .filter(|_| s.session_snapshot())
+        .map(|_| snapshot_queue::spawn_checkpoint(env, inp, s));
+    if snap.is_none() && end.is_none() {
         return checkpoint_net(env, inp, s, remind, impact_in, queued, tokens, epoch);
     }
-    std::thread::scope(|sc| {
-        // снимок — в своём потоке: сборка со своим сроком, `PUT` — со своим сроком в бюджете;
-        // очередь снимка пишется и без сервера
-        let snap = job.map(|j| sc.spawn(move || snapshot_queue::run(env, s, j, true)));
-        let old = pending.map(|id| sc.spawn(move || snapshot_queue::flush_logged(env, id)));
+    let out = std::thread::scope(|sc| {
         let ended = end.map(|id| sc.spawn(move || snapshot_queue::end_session(env, id)));
         let out = checkpoint_net(env, inp, s, remind, impact_in, queued, tokens, epoch);
-        if let Some(h) = snap
-            && h.join().is_err()
-        {
-            env.log("snapshot: паника");
-        }
         if let Some(h) = ended
             && h.join().is_err()
         {
             env.log("sessions(ended): паника");
         }
-        if let Some(h) = old
-            && h.join().is_err()
-        {
-            env.log("snapshot(очередь): паника");
-        }
         out
-    })
+    });
+    if let Some(done) = snap {
+        snapshot_queue::wait_snapshot(env, s, &done);
+    }
+    out
 }
 
 /// Сетевая часть `checkpoint`: очереди, эпоха, напоминание (см. модуль).

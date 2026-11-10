@@ -2031,6 +2031,20 @@ async fn digest(
         let decisions = decision_cands(health, deadline, sol).await?;
         sections.push((Some(SECTION_DECISIONS), decisions));
     }
+    // снимок сессии (M6 §8а): раздел выводится после ответов и идей (в пакете восстановления —
+    // после решений и уведомлений), [`arrange`]
+    let snapshot = snapshot_part(
+        st,
+        req,
+        headers,
+        targets,
+        &insight_spaces,
+        session.as_deref(),
+        recovery,
+        user,
+        deadline,
+    )
+    .await;
 
     // Rules — текст каждой заметки (до `RULE_L1_TOKENS`); больше `RULES_MAX` — первые по
     // приоритету ([`rule_order`]), остальные — строкой «не показано — правил: N»; вывод — по пути
@@ -2223,8 +2237,66 @@ async fn digest(
         rules_short,
         rules_hidden,
         rules_cut,
+        snapshot,
     };
     Ok((lines, sections))
+}
+
+/// Раздел «Последнее известное состояние» (M6 §8а, [`super::snapshot::last_state`]): дайджест —
+/// только в решении запроса; сбой чтения — WARN и без раздела (дайджест не валится), срок сбора
+/// вышел — без раздела.
+#[allow(clippy::too_many_arguments)]
+async fn snapshot_part(
+    st: &AppState,
+    req: &RecallReq,
+    headers: &HeaderMap,
+    targets: &[SearchTarget],
+    spaces: &[(usize, Id)],
+    session: Option<&str>,
+    recovery: bool,
+    user: Id,
+    deadline: &mut Deadline,
+) -> Option<super::snapshot::Shown> {
+    if st.cfg.recall.snapshot_tokens == 0 {
+        return None;
+    }
+    let guid = scoped_solution(targets, req, headers);
+    if guid.is_none() && !recovery {
+        return None;
+    }
+    let own = match st.users.get(user).await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: база сессий для снимка недоступна");
+            return None;
+        }
+    };
+    let mut by_target: Vec<(usize, Vec<Id>)> = Vec::new();
+    for &(i, sp) in spaces {
+        match by_target.iter_mut().find(|(t, _)| *t == i) {
+            Some((_, v)) => v.push(sp),
+            None => by_target.push((i, vec![sp])),
+        }
+    }
+    let q = super::snapshot::ShowReq {
+        own: &own,
+        solution: guid.as_ref().map_or("", |g| g.as_str()),
+        session,
+        task_dbs: by_target
+            .into_iter()
+            .map(|(i, v)| (targets[i].db.clone(), v))
+            .collect(),
+        recovery,
+        now: zam_store::time::now(),
+        cfg: &st.cfg.recall,
+    };
+    match deadline.step(super::snapshot::last_state(q)).await? {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: снимок сессии не прочитан");
+            None
+        }
+    }
 }
 
 /// Действующие `gotcha`/`failure` пространств `spaces`, новые первыми.
@@ -2674,6 +2746,8 @@ struct Lines {
     rules_hidden: usize,
     /// Текст хоть одного правила обрезан до [`RULE_L1_TOKENS`] (строка [`RULES_SHORT_NOTE`]).
     rules_cut: bool,
+    /// «Последнее известное состояние» — снимок сессии (M6 §8а, [`super::snapshot`]).
+    snapshot: Option<super::snapshot::Shown>,
 }
 
 /// Правило раздела для урезания под предел вывода: место в приоритете ([`rule_order`]),
@@ -3711,8 +3785,10 @@ fn arrange<'c>(
         code_map,
         rules_hidden,
         rules_cut,
+        snapshot,
         ..
     } = lines;
+    let mut snapshot = snapshot;
     let mut out = Arranged::default();
     let mut ideas = ideas;
     let mut notices = Some(notices);
@@ -3773,6 +3849,19 @@ fn arrange<'c>(
             out.packed.push(sec);
             out.picked.push(std::mem::take(&mut ideas));
         }
+        // снимок сессии — после ответов и идей; в пакете восстановления — после решений и
+        // уведомлений: задачи, ответы, доступы и идеи он не вытесняет (M6 §8а)
+        if (title == Some(SECTION_ANSWERS) && !recovery)
+            || (title == Some(SECTION_DECISIONS) && recovery)
+        {
+            if recovery {
+                out.notices(&mut notices, &mut open_line);
+            }
+            if let Some(sn) = snapshot.take() {
+                out.line(Some(&sn.title), sn.blocks, 0);
+                out.omit_last(OMIT_SNAPSHOT);
+            }
+        }
         if title == Some(SECTION_RULES) {
             // строки словаря и проверенных команд — по разделу на строку: свой адрес снятого
             for (l, omit) in &after_rules {
@@ -3814,6 +3903,9 @@ fn keep_of(title: Option<&str>) -> u8 {
         _ => 0,
     }
 }
+
+/// Адрес снятой строки снимка сессии: сам снимок — на странице сессии WebUI.
+const OMIT_SNAPSHOT: Omit = ("строк снимка сессии", "WebUI «Сессии»");
 
 /// Адрес снятой строки открытых вопросов.
 const OMIT_OPEN_QUESTIONS: Omit = ("строк открытых вопросов", "memory_search kinds=[question]");

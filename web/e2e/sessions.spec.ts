@@ -89,6 +89,66 @@ test('sessions page shows tokens and reread share', async ({ page, playwright })
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+const SNAP_SESSION = 'e2e-snapshot-17c';
+
+// M6 §8а (задача 17c): блок «Снимок сессии» выводит текст снимка как текст — `<script>` и
+// `<img onerror>` из журнала агента не исполняются и не становятся элементами страницы.
+test('snapshot text is not html', async ({ page, playwright }) => {
+  const problems = watch(page);
+  page.on('dialog', (d) => {
+    problems.push(`dialog: ${d.message()}`);
+    void d.dismiss();
+  });
+  const rc = await playwright.request.newContext({ baseURL: base() });
+  const a = agent(rc);
+  let r = await a.post('sessions', { id: SNAP_SESSION, agent: 'claude-code' });
+  expect(r.status(), await r.text()).toBe(201);
+  const script = '<script>window.__zamXss = 1</script>';
+  const img = '<img src=x onerror="window.__zamXss = 2">';
+  const headers = { Authorization: `Bearer ${env('E2E_ADMIN_TOKEN')}`, 'X-Zam-Session': SNAP_SESSION };
+  r = await rc.put(`api/v1/sessions/${SNAP_SESSION}/snapshot`, {
+    headers,
+    failOnStatusCode: false,
+    data: {
+      taken_at: new Date().toISOString(),
+      trigger: 'session_end',
+      agent: 'claude',
+      status: 'complete',
+      skipped: 0,
+      data: {
+        compact_summary: `Current Work: ${script}`,
+        prompts: [`почини ${img}`],
+        files: ['web/<b>x</b>.ts'],
+        commands: [{ cmd: `echo ${img}`, failed: true }],
+      },
+    },
+  });
+  expect(r.status(), await r.text()).toBe(204);
+
+  await page.goto(base());
+  await page.getByRole('link', { name: 'Сессии' }).click();
+  const row = page.locator(`tr[data-session="${SNAP_SESSION}"]`);
+  await expect(row).toContainText('снимок');
+  await row.getByRole('button', { name: SNAP_SESSION }).click();
+  const block = page.getByRole('region', { name: 'Снимок сессии' });
+  await expect(block.locator('[data-part="summary"]')).toHaveText(`Current Work: ${script}`);
+  await expect(block.locator('[data-part="prompts"]')).toContainText(img);
+  await expect(block.locator('[data-part="files"]')).toContainText('web/<b>x</b>.ts');
+  await expect(block.locator('[data-part="commands"]')).toContainText(`echo ${img}`);
+  await expect(block.locator('[data-part="commands"]')).toContainText('ошибка');
+  await expect(block.locator('img, script, b')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { __zamXss?: number }).__zamXss)).toBeUndefined();
+  await page.screenshot({ path: `${screens}sessions-snapshot.png` });
+  // ключи снимка — на странице «Подключение агента → Подсказки хуков»
+  await page.getByRole('link', { name: 'Подключение агента' }).click();
+  const keys = page.getByRole('region', { name: 'Снимок сессии' });
+  for (const k of ['hooks.session_snapshot', 'snapshot_tail_kb', 'snapshot_ms', 'PostCompact', 'SessionEnd']) {
+    await expect(keys).toContainText(k);
+  }
+  await rc.dispose();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('rules heavy banner', async ({ page, playwright }) => {
   const problems = watch(page);
   const rc = await playwright.request.newContext({ baseURL: base() });

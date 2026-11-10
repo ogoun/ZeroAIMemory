@@ -29,6 +29,7 @@ pub mod scope;
 pub mod search;
 pub mod secrets;
 pub mod sessions;
+pub mod snapshot;
 pub mod solutions;
 pub mod spaces;
 pub mod tasks;
@@ -335,6 +336,14 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route(
             "/api/v1/sessions/{id}",
             get(sessions::get).patch(sessions::patch),
+        )
+        // снимок сессии (M6 §8а): не запись в память и не обращение сессии — вне
+        // `memory_routes`, без `touch_from_request` (`last_seen_at`, `memory_writes` не меняются)
+        .route(
+            "/api/v1/sessions/{id}/snapshot",
+            get(snapshot::get)
+                .put(snapshot::put)
+                .layer(DefaultBodyLimit::max(cfg.snapshot.max_bytes)),
         )
         .route("/api/v1/agent-setup", get(agent_setup::setup))
         .route("/api/v1/agent-guide", get(agent_setup::guide))

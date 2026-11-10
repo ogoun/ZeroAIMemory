@@ -38,7 +38,8 @@
 //!   выводом — `pre_tool`, `post_tool_local`, `subagent_local`;
 //! - `GET /sessions?solution=&limit=&tokens=` → `{items}` — свои, свежие первыми (50, до 500);
 //!   `tokens=true` — у каждой ещё `tokens`, как в `GET /sessions/{id}` (`zam sessions tokens
-//!   --last N`, страница сессий WebUI);
+//!   --last N`, страница сессий WebUI); у сессии со снимком (M6 §8а) — `snapshot_at` (момент
+//!   снимка; сам снимок — `GET /sessions/{id}/snapshot`, [`super::snapshot`]);
 //! - `GET /sessions/unattributed?days=N` → `{items: [{day, event, calls, tokens}]}` — выданное
 //!   без явной сессии по суткам UTC (M6 §7.1, [`unattributed`]).
 //!
@@ -71,7 +72,7 @@ use zam_core::{Id, SolutionGuid};
 use zam_store::{
     Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, bump_epoch,
     claimed_tasks, end_session, get_session, list_sessions, list_spaces, session_epoch,
-    session_holdout, session_tokens, sessions_tokens, set_holdout, touch_session,
+    session_holdout, session_tokens, sessions_tokens, set_holdout, snapshot_times, touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -90,8 +91,13 @@ pub const LOCAL_TOKEN_EVENTS: [&str; 3] = ["pre_tool", "post_tool_local", "subag
 /// Предел `tokens` и `calls` одной прибавки.
 pub const TOKENS_MAX: u64 = 1_000_000_000;
 
-/// База пользователя запроса (без проверки существования: принципал уже проверен).
-async fn requester_db(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<Db, ApiError> {
+/// База пользователя запроса (без проверки существования: принципал уже проверен); у
+/// администратора — пользователя `X-Zam-User`.
+pub(super) async fn requester_db(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+) -> Result<Db, ApiError> {
     let user = crate::auth::target_user(st, p, headers).await?;
     Ok(st.users.get(user.id).await?)
 }
@@ -445,16 +451,23 @@ pub async fn list(
         .transpose()?;
     let db = requester_db(&st, &p, &headers).await?;
     let items = list_sessions(&db, solution.as_ref(), limit).await?;
-    if q.tokens != Some(true) {
-        return Ok(Json(json!({ "items": items })));
-    }
     let ids: Vec<String> = items.iter().map(|s| s.id.clone()).collect();
-    let mut tokens = sessions_tokens(&db, &ids).await?;
+    let snaps = snapshot_times(&db, &ids).await?;
+    let mut tokens = if q.tokens == Some(true) {
+        Some(sessions_tokens(&db, &ids).await?)
+    } else {
+        None
+    };
     let items: Vec<Value> = items
         .iter()
         .map(|s| {
             let mut v = json!(s);
-            v["tokens"] = json!(tokens.remove(&s.id).unwrap_or_default());
+            if let Some(t) = tokens.as_mut() {
+                v["tokens"] = json!(t.remove(&s.id).unwrap_or_default());
+            }
+            if let Some(at) = snaps.get(&s.id) {
+                v["snapshot_at"] = json!(zam_store::time::fmt_ts(*at));
+            }
             v
         })
         .collect();

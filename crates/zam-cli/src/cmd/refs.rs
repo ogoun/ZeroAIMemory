@@ -958,6 +958,7 @@ mod tests {
         let e = |status: u16, detail: &str| CliError {
             code: 2,
             msg: format!("{detail} (HTTP {status})"),
+            timeout: false,
             problem: Some(json!({"status": status, "detail": detail})),
         };
         assert!(unknown_symbols_field(&e(

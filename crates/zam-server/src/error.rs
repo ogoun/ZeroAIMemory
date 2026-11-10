@@ -33,6 +33,14 @@ pub enum ApiError {
     },
     #[error("ресурс не найден")]
     NotFound,
+    /// 400 `/problems/session-required` (M6 §8а): запись снимка сессии без явной сессии —
+    /// `X-Zam-Session` не совпадает с `{id}` пути.
+    #[error("{0}")]
+    SessionRequired(String),
+    /// 404 `/problems/session-not-found` (M6 §8а): сессии нет в базе пользователя запроса — в
+    /// отличие от 404 старого сервера без маршрута (`about:blank`).
+    #[error("сессия не найдена: зарегистрируйте её (POST /sessions)")]
+    SessionNotFound,
     /// 404 [`CODE_SYMBOL_NOT_FOUND`] (M5.6 §9): символа нет в карте решения — в отличие от
     /// выключенной карты и неизвестного решения (`about:blank`).
     #[error("{0}")]
@@ -184,6 +192,16 @@ impl ApiError {
                 "Forbidden",
             ),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "about:blank", "Not Found"),
+            ApiError::SessionRequired(_) => (
+                StatusCode::BAD_REQUEST,
+                "/problems/session-required",
+                "Bad Request",
+            ),
+            ApiError::SessionNotFound => (
+                StatusCode::NOT_FOUND,
+                "/problems/session-not-found",
+                "Not Found",
+            ),
             ApiError::Conflict { .. } => (StatusCode::CONFLICT, "/problems/conflict", "Conflict"),
             ApiError::PossibleDuplicate { .. } => (
                 StatusCode::CONFLICT,

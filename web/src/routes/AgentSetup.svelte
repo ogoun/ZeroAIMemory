@@ -422,11 +422,30 @@
   {:else if !flagsError}
     <p class="muted">Загрузка…</p>
   {/if}
+  <section class="snapshot-keys" aria-label="Снимок сессии">
+    <h3>Снимок сессии</h3>
+    <p class="muted small">
+      Хуки снимают из журнала агента (без LLM) хвост конспекта сжатия, последние запросы, изменённые
+      файлы и команды — на событиях <code>PreCompact</code>, <code>PostCompact</code>,
+      <code>SessionStart</code> (compact), <code>Stop</code> и <code>SessionEnd</code>; секреты
+      маскируются. Снимок оборванной сессии приходит следующей сессии разделом «Последнее известное
+      состояние». Ключи клиента — в <code>[hooks]</code> файла <code>config.toml</code>:
+      <code>hooks.session_snapshot</code> (вкл.; выкл. — журнал агента не открывается),
+      <code>snapshot_tail_kb</code> (2048 — КиБ хвоста журнала), <code>snapshot_ms</code> (25 — срок
+      сборки, 5–50 мс). Сервер: <code>recall.snapshot_tokens</code> (400; 0 — не показывать),
+      <code>[snapshot] keep_days</code> (14). Снимок виден на странице «Сессии».
+    </p>
+  </section>
 </section>
 
 <TokenShown bind:shown />
 
 <style>
+  .snapshot-keys h3 {
+    margin: 12px 0 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
   .setup h3 {
     margin: 0;
     font-size: 14px;

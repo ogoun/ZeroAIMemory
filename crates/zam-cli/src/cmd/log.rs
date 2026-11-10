@@ -196,6 +196,7 @@ fn explain_term_conflict(e: CliError) -> CliError {
     CliError {
         code: crate::client::EXIT_CONFLICT,
         msg,
+        timeout: false,
         problem: e.problem,
     }
 }
@@ -240,6 +241,7 @@ mod tests {
         let e = CliError {
             code: 4,
             msg: "x".into(),
+            timeout: false,
             problem: Some(json!({
                 "type": "/problems/term-conflict",
                 "conflicts": [{"id": "i1", "title": "Выжимка", "matched": "summary"}],
@@ -256,6 +258,7 @@ mod tests {
         let other = CliError {
             code: 4,
             msg: "иное".into(),
+            timeout: false,
             problem: None,
         };
         assert_eq!(explain_term_conflict(other).msg, "иное");

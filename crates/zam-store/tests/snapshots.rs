@@ -80,7 +80,11 @@ async fn snapshot_put_overwrites() {
         },
         ..row("s1", "2026-11-05T11:00:00.000001Z", SnapTrigger::Stop)
     };
-    put_snapshot(&db, &second).await.unwrap();
+    assert!(put_snapshot(&db, &second).await.unwrap());
+    assert_eq!(get_snapshot(&db, "s1").await.unwrap(), Some(second.clone()));
+    // снимок старше хранимого (опоздавшая очередь клиента) новый не затирает
+    let older = row("s1", "2026-11-05T10:59:59.999999Z", SnapTrigger::Stop);
+    assert!(!put_snapshot(&db, &older).await.unwrap());
     assert_eq!(get_snapshot(&db, "s1").await.unwrap(), Some(second));
     let n: i64 = db
         .read(|c| Ok(c.query_row("SELECT count(*) FROM session_snapshots", [], |r| r.get(0))?))

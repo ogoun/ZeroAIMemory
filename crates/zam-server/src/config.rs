@@ -55,6 +55,7 @@ pub struct ServerConfig {
     pub backup: BackupSection,
     pub export: ExportSection,
     pub import: ImportSection,
+    pub snapshot: SnapshotSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -819,6 +820,15 @@ pub struct RecallSection {
     /// Мини-карта кода дайджеста `### Карта кода` (центральные символы), токенов, 0..=1000,
     /// 0 — только строка-указатель карты (M6 §8, решение 16; включение — по A/B).
     pub digest_code_map_tokens: usize,
+    /// Раздел «Последнее известное состояние» (снимок сессии, M6 §8а) в дайджесте и пакете
+    /// восстановления, токенов (0..=2000, 400), внутри `digest_tokens`/`recovery_tokens`;
+    /// 0 — не показывать (снимок хранится).
+    pub snapshot_tokens: usize,
+    /// Задача снимка «давно не обновлялась», если её последняя ревизия старше снимка на столько
+    /// минут (0..=1440, 30; M6 §8а).
+    pub snapshot_stale_min: u32,
+    /// Окно дайджеста для снимков других сессий, суток UTC от начала текущих (1..=30, 2).
+    pub snapshot_digest_days: u32,
 }
 
 impl RecallSection {
@@ -863,6 +873,15 @@ impl RecallSection {
         }
         if self.digest_code_map_tokens > 1000 {
             return Err(bad("digest_code_map_tokens", "от 0 до 1000"));
+        }
+        if self.snapshot_tokens > 2000 {
+            return Err(bad("snapshot_tokens", "от 0 до 2000"));
+        }
+        if self.snapshot_stale_min > 1440 {
+            return Err(bad("snapshot_stale_min", "от 0 до 1440"));
+        }
+        if !(1..=30).contains(&self.snapshot_digest_days) {
+            return Err(bad("snapshot_digest_days", "от 1 до 30"));
         }
         Ok(())
     }
@@ -1276,6 +1295,44 @@ impl BackupSection {
     }
 }
 
+/// Секция `[snapshot]` (M6 §8а): снимок сессии `PUT /sessions/{id}/snapshot`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotSection {
+    /// Предел записи снимка — всего тела JSON после маскировки, байт (1024..=65536, 16384):
+    /// больше — 413.
+    pub max_bytes: usize,
+    /// Срок хранения снимка от `taken_at`, суток (1..=90, 14): старше удаляет воркер
+    /// обслуживания раз в сутки; вместе с сессией снимок уходит и раньше (`gc_sessions`).
+    pub keep_days: u32,
+}
+
+impl Default for SnapshotSection {
+    fn default() -> Self {
+        Self {
+            max_bytes: 16_384,
+            keep_days: 14,
+        }
+    }
+}
+
+impl SnapshotSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("snapshot.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1024..=65_536).contains(&self.max_bytes) {
+            return Err(bad("max_bytes", "от 1024 до 65536"));
+        }
+        if !(1..=90).contains(&self.keep_days) {
+            return Err(bad("keep_days", "от 1 до 90"));
+        }
+        Ok(())
+    }
+}
+
 /// Секция `[export]` (M6 §12б.5): экспорт пространства `GET /spaces/{space}/export`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1495,6 +1552,9 @@ impl Default for ServerConfig {
                 snippet_tokens: 60,
                 digest_entries: 5,
                 digest_code_map_tokens: 0,
+                snapshot_tokens: 400,
+                snapshot_stale_min: 30,
+                snapshot_digest_days: 2,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -1508,6 +1568,7 @@ impl Default for ServerConfig {
             backup: BackupSection::default(),
             export: ExportSection::default(),
             import: ImportSection::default(),
+            snapshot: SnapshotSection::default(),
         }
     }
 }
@@ -1686,6 +1747,7 @@ pub fn load(
     cfg.backup.validate()?;
     cfg.export.validate()?;
     cfg.import.validate()?;
+    cfg.snapshot.validate()?;
     Ok(cfg)
 }
 
@@ -2861,6 +2923,53 @@ master_key = \"x\"
                 "{k}={v}"
             );
         }
+    }
+
+    /// M6 §8а: ключи снимка — умолчания и пределы.
+    #[test]
+    fn snapshot_keys_defaults_and_ranges() {
+        let c = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(
+            (
+                c.recall.snapshot_tokens,
+                c.recall.snapshot_stale_min,
+                c.recall.snapshot_digest_days
+            ),
+            (400, 30, 2)
+        );
+        assert_eq!((c.snapshot.max_bytes, c.snapshot.keep_days), (16_384, 14));
+        for (k, v) in [
+            ("ZAM_RECALL__SNAPSHOT_TOKENS", "2001"),
+            ("ZAM_RECALL__SNAPSHOT_STALE_MIN", "1441"),
+            ("ZAM_RECALL__SNAPSHOT_DIGEST_DAYS", "0"),
+            ("ZAM_RECALL__SNAPSHOT_DIGEST_DAYS", "31"),
+            ("ZAM_SNAPSHOT__MAX_BYTES", "1023"),
+            ("ZAM_SNAPSHOT__MAX_BYTES", "65537"),
+            ("ZAM_SNAPSHOT__KEEP_DAYS", "0"),
+            ("ZAM_SNAPSHOT__KEEP_DAYS", "91"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            let key = k
+                .trim_start_matches("ZAM_")
+                .replace("__", ".")
+                .to_lowercase();
+            assert!(e.contains(&key), "{k}={v}: {e}");
+        }
+        let c = load(
+            None,
+            &[
+                env("ZAM_RECALL__SNAPSHOT_TOKENS", "0"),
+                env("ZAM_SNAPSHOT__MAX_BYTES", "65536"),
+            ],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (c.recall.snapshot_tokens, c.snapshot.max_bytes),
+            (0, 65_536)
+        );
     }
 
     #[test]

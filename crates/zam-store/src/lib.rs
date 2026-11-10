@@ -167,7 +167,10 @@ pub use sessions::{
     seen_revs_any_epoch, session_epoch, session_holdout, session_tokens, sessions_tokens,
     set_holdout, touch_session,
 };
-pub use snapshots::{SnapshotRow, gc_snapshots, get_snapshot, put_snapshot};
+pub use snapshots::{
+    SnapTask, SnapshotRow, digest_snapshot, gc_snapshots, get_snapshot, put_snapshot,
+    snapshot_tasks, snapshot_times, writes_after,
+};
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
     Access, AuditRow, AuthToken, SYSTEM_MIGRATIONS, SkippedIndex, SystemStore, TokenInfo, User,

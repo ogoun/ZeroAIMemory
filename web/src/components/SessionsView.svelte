@@ -4,7 +4,22 @@
   // доля пометок «уже выдавалось» (`reread_calls`: у `read` — чтения REST и CLI, у `mcp_read` —
   // чтения из MCP; токены MCP — в `mcp`). Сводка — по показанным сессиям; строка сессии открывает её таблицу. Время — локальное
   // время браузера (`localTime`, M6 §4.4). Администратор выбирает пользователя (`X-Zam-User`).
-  import { ApiError, errorText, isAdminSession, listSessions, type Me, type SessionItem, type TokenStat, type User } from '../lib/api';
+  // У сессии со снимком (M6 §8а, `snapshot_at`) карточка показывает блок «Снимок сессии» — только
+  // чтение; текст снимка пришёл из журнала агента и выводится только как текст (без `{@html}` и
+  // без Markdown).
+  import {
+    ApiError,
+    errorText,
+    isAdminSession,
+    listSessions,
+    sessionSnapshot,
+    type Me,
+    type SessionItem,
+    type SessionSnapshot,
+    type TokenStat,
+    type User,
+  } from '../lib/api';
+  import { untrack } from 'svelte';
   import { localTime } from '../lib/time';
 
   let { me, users, onexpired }: { me: Me; users: User[]; onexpired: () => void } = $props();
@@ -86,9 +101,49 @@
     void load();
   });
 
+  /** Подписи поводов снимка; неизвестный — как есть. */
+  const TRIGGER_TITLE: Record<string, string> = {
+    post_compact: 'после сжатия',
+    pre_compact: 'перед сжатием',
+    session_start_compact: 'старт после сжатия',
+    stop: 'конец ответа',
+    session_end: 'конец сессии',
+    catch_up: 'догоняющий (сессия оборвалась)',
+    manual: 'вручную (zam session snapshot)',
+  };
+
+  let snap = $state<SessionSnapshot | null>(null);
+  let snapError = $state('');
+  let snapSeq = 0;
+  async function loadSnapshot(id: string | null) {
+    const n = ++snapSeq;
+    snapError = '';
+    // снимок той же сессии обновился — прежний текст остаётся до ответа: блок не мигает
+    if (snap?.session_id !== id) snap = null;
+    if (!id) return;
+    try {
+      const r = await sessionSnapshot(id, admin ? who : undefined);
+      if (n === snapSeq) snap = r;
+    } catch (e) {
+      if (n !== snapSeq) return;
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      snapError = errorText(e);
+    }
+  }
+
+  // Зависимости — только id открытой сессии и момент её снимка: перезагрузка списка даёт новый
+  // объект `opened`, но снимок перечитывается, лишь когда он сменился.
+  $effect(() => {
+    const id = snapId;
+    void snapAt;
+    untrack(() => void loadSnapshot(id));
+  });
+
   let summary = $derived(rows(items));
   let opened = $derived(items.find((s) => s.id === open) ?? null);
   let openRows = $derived(opened ? rows([opened]) : []);
+  let snapId = $derived(opened?.snapshot_at ? opened.id : null);
+  let snapAt = $derived(opened?.snapshot_at ?? null);
 </script>
 
 {#snippet table(rs: Row[], label: string)}
@@ -145,6 +200,7 @@
               {#if s.parent_id}<span class="tag" title="родитель {s.parent_id}">субагент{s.agent_type ? ` ${s.agent_type}` : ''}</span>{/if}
               {#if s.holdout}<span class="tag" title="контрольная группа A/B">holdout</span>{/if}
               {#if s.ended_at}<span class="tag">завершена</span>{/if}
+              {#if s.snapshot_at}<span class="tag" title="снимок {localTime(s.snapshot_at)}">снимок</span>{/if}
             </td>
             <td>{s.agent ?? '—'}</td>
             <td class="muted">{localTime(s.started_at)}</td>
@@ -163,6 +219,35 @@
           {opened.memory_writes} · эпоха {opened.seen_epoch}
         </p>
         {@render table(openRows, 'Выданное сессии')}
+        {#if snapError}<p class="error" role="alert">{snapError}</p>{/if}
+        {#if snap}
+          <section class="snapshot" aria-label="Снимок сессии">
+            <h3>Снимок сессии</h3>
+            <p class="muted small">
+              {localTime(snap.taken_at)} · {TRIGGER_TITLE[snap.trigger] ?? snap.trigger}{snap.agent ? ` · ${snap.agent}` : ''} ·
+              {num(snap.bytes)} байт{snap.status === 'partial' ? ' · неполный' : ''}{snap.skipped ? ` · пропущено строк ${snap.skipped}` : ''}
+              — извлечено автоматически из журнала агента, секреты замаскированы.
+            </p>
+            {#if snap.data.compact_summary}
+              <h4>Конспект (хвост)</h4>
+              <pre class="text" data-part="summary">{snap.data.compact_summary}</pre>
+            {/if}
+            {#if snap.data.prompts.length}
+              <h4>Запросы</h4>
+              <ul data-part="prompts">{#each snap.data.prompts as p, i (i)}<li><pre class="text">{p}</pre></li>{/each}</ul>
+            {/if}
+            {#if snap.data.files.length}
+              <h4>Файлы</h4>
+              <ul data-part="files">{#each snap.data.files as f, i (i)}<li><code>{f}</code></li>{/each}</ul>
+            {/if}
+            {#if snap.data.commands.length}
+              <h4>Команды</h4>
+              <ul data-part="commands">
+                {#each snap.data.commands as c, i (i)}<li><code>{c.cmd}</code>{#if c.failed}<span class="tag">ошибка</span>{/if}</li>{/each}
+              </ul>
+            {/if}
+          </section>
+        {/if}
       </section>
     {/if}
 
@@ -213,5 +298,23 @@
   }
   .small {
     font-size: 12px;
+  }
+  .snapshot {
+    margin-top: 12px;
+  }
+  .snapshot h4 {
+    margin: 8px 0 2px;
+    font-size: 13px;
+  }
+  .snapshot ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .snapshot pre.text {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    font-size: 13px;
   }
 </style>

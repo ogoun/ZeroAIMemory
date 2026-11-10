@@ -25,6 +25,9 @@ pub struct CliError {
     pub code: u8,
     pub msg: String,
     pub problem: Option<Value>,
+    /// Сетевая ошибка — истёк срок запроса, ответа сервера нет ([`CliError::is_timeout`]);
+    /// ставит только [`net_error`].
+    pub timeout: bool,
 }
 
 impl CliError {
@@ -33,6 +36,7 @@ impl CliError {
             code,
             msg: msg.into(),
             problem: None,
+            timeout: false,
         }
     }
 
@@ -51,6 +55,12 @@ impl CliError {
             .get("status")?
             .as_u64()
             .and_then(|s| u16::try_from(s).ok())
+    }
+
+    /// Запрос оборван сроком клиента (разрешение имени, соединение, ожидание ответа): сервер не
+    /// ответил вовремя. Отказ соединения, обрыв и ответ сервера с ошибкой — не срок.
+    pub fn is_timeout(&self) -> bool {
+        self.timeout
     }
 
     /// Уточнение: «<ctx>: <текст>».
@@ -426,22 +436,14 @@ impl Client {
         for (k, v) in headers {
             rb = rb.header(*k, *v);
         }
-        rb.content_type("application/json").send(body).map_err(|e| {
-            CliError::new(
-                EXIT_UNREACHABLE,
-                format!("сервер {} недоступен: {e}", self.base),
-            )
-        })
+        rb.content_type("application/json")
+            .send(body)
+            .map_err(|e| net_error(&self.base, e))
     }
 
     /// 2xx и 304 (ответ на `If-None-Match`) → ответ; иначе ошибка с кодом выхода по статусу.
     fn check(&self, r: Result<Response<Body>, ureq::Error>) -> Result<Response<Body>, CliError> {
-        let resp = r.map_err(|e| {
-            CliError::new(
-                EXIT_UNREACHABLE,
-                format!("сервер {} недоступен: {e}", self.base),
-            )
-        })?;
+        let resp = r.map_err(|e| net_error(&self.base, e))?;
         if resp.status().is_success() || resp.status().as_u16() == 304 {
             return Ok(resp);
         }
@@ -494,6 +496,24 @@ fn problem(mut resp: Response<Body>) -> CliError {
         code,
         msg,
         problem: v,
+        timeout: false,
+    }
+}
+
+/// Сетевая ошибка запроса к серверу `base` (ответа нет): «сервер … недоступен» с кодом
+/// [`EXIT_UNREACHABLE`]. Срок клиента — по типу ошибки, а не по её тексту: `Timeout` ureq или
+/// ввод-вывод с `TimedOut` (срок сокета) — [`CliError::is_timeout`].
+fn net_error(base: &str, e: ureq::Error) -> CliError {
+    let timeout = match &e {
+        ureq::Error::Timeout(_) => true,
+        ureq::Error::Io(io) => io.kind() == std::io::ErrorKind::TimedOut,
+        _ => false,
+    };
+    CliError {
+        code: EXIT_UNREACHABLE,
+        msg: format!("сервер {base} недоступен: {e}"),
+        problem: None,
+        timeout,
     }
 }
 
@@ -542,6 +562,33 @@ mod tests {
             c.agent.config().timeouts().recv_response,
             Some(MCP_RECV_RESPONSE)
         );
+    }
+
+    /// Повторное ревью 76458e3 (17b), I1: срок клиента — типизированный признак ошибки.
+    /// Сервер принял соединение и молчит — `is_timeout()`; отказ соединения — нет.
+    #[test]
+    fn timeout_is_typed_not_parsed_from_text() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(Duration::from_millis(50)),
+        );
+        let e = c.put_json_body("/x", b"{}".to_vec()).unwrap_err();
+        assert!(e.is_timeout(), "{e}");
+        assert_eq!(e.code, EXIT_UNREACHABLE);
+        assert_eq!(e.http_status(), None);
+        drop(silent);
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let c = Client::with_timeouts(&url, "t", None, Timeouts::Deadline(Duration::from_secs(30)));
+        let e = c.put_json_body("/x", b"{}".to_vec()).unwrap_err();
+        assert!(!e.is_timeout(), "{e}");
+        assert_eq!(e.code, EXIT_UNREACHABLE);
     }
 
     #[test]

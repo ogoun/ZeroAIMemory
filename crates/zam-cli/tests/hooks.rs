@@ -2064,7 +2064,9 @@ fn session_start_flushes_all_queues_in_one_request() {
         .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
         .map(|(_, _, b)| b)
         .collect();
-    assert_eq!(posts.len(), 1, "{s:?}");
+    // пропуск отправки по остатку бюджета виден в журнале хука («files/changed: очередь не
+    // отправлена — … (прошло N мс)»)
+    assert_eq!(posts.len(), 1, "журнал хука: {:?}; запросы: {s:?}", p.log());
     let files = posts[0]["files"].as_array().unwrap();
     assert_eq!(files.len(), 6, "{files:?}");
     assert_eq!(
@@ -4960,7 +4962,10 @@ fn post_compact_and_session_end_accepted_within_100ms() {
 }
 
 /// §8а: `SessionEnd` ставит сессии `ended_at` настоящего сервера — и при выключенном снимке
-/// (`hooks.session_snapshot = false`); сервер без `PUT …/snapshot` (404) — снимок в очереди.
+/// (`hooks.session_snapshot = false`); включённый снимок сервер (17c) принимает: очередь пуста,
+/// `GET …/snapshot` отдаёт его. Сессии на сервере нет — 404 `session-not-found`: снимок остаётся
+/// в очереди, счётчик попыток старого сервера не растёт, причина — в `hooks.log`; сессия
+/// появилась — снимок уходит следующим хуком.
 #[test]
 fn session_end_patches_ended() {
     let _g = serial();
@@ -4989,13 +4994,55 @@ fn session_end_patches_ended() {
             p.session(s),
             p.log()
         );
-        assert_eq!(snap_file(&p, "snapq", s).is_some(), on, "{s}: {}", p.log());
+        assert!(snap_file(&p, "snapq", s).is_none(), "{s}: {}", p.log());
+        let mut r = http()
+            .get(&format!("{url}/api/v1/sessions/{s}/snapshot"))
+            .header("Authorization", format!("Bearer {tok}"))
+            .call()
+            .unwrap();
+        assert_eq!(r.status() == 200, on, "{s}: {} / {}", r.status(), p.log());
+        if on {
+            let v: Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap();
+            assert_eq!(v["trigger"], "session_end", "{v}");
+            assert_eq!(v["agent"], "claude", "{v}");
+            assert_eq!(prompts_of(&v), ["последний запрос"], "{v}");
+        }
     }
-    // сессии нет на сервере — молча
+    // сессии нет на сервере — `PATCH ended` молча; без журнала снимка нет
     let t = transcript_path(&p, "se-none");
     let end = snap_ev(&p, "SessionEnd", "se-none", &t, json!({"reason": "exit"}));
     empty(&hook_snap(&p, "checkpoint", &end));
     assert!(!p.log().contains("sessions(ended)"), "{}", p.log());
+    assert!(snap_file(&p, "snapq", "se-none").is_none(), "{}", p.log());
+    // сессии нет, журнал есть — сервер отвечает 404 `session-not-found`: снимок в очереди
+    project_hooks(&p, "session_snapshot = true");
+    let s = "se-unknown";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос незарегистрированной сессии")]);
+    let end = snap_ev(&p, "SessionEnd", s, &t, json!({"reason": "exit"}));
+    empty(&hook_snap(&p, "checkpoint", &end));
+    // больше попыток, чем даётся старому серверу: счётчик не растёт, снимок не бросается
+    for _ in 0..4 {
+        empty(&hook_snap(&p, "checkpoint", &end));
+    }
+    let q = snap_file(&p, "snapq", s).unwrap_or_else(|| panic!("нет очереди: {}", p.log()));
+    assert_eq!(q["old_server"], 0, "{q}");
+    let log = p.log();
+    assert!(
+        log.matches("HTTP 404 /problems/session-not-found").count() >= 4,
+        "{log}"
+    );
+    assert!(!log.contains("старый сервер"), "{log}");
+    // сессия появилась — очередь уходит следующим хуком
+    reg(s);
+    empty(&hook_snap(&p, "checkpoint", &end));
+    assert!(snap_file(&p, "snapq", s).is_none(), "{}", p.log());
+    let r = http()
+        .get(&format!("{url}/api/v1/sessions/{s}/snapshot"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .call()
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", p.log());
 }
 
 /// §8а: `SessionStart source=compact` без `PostCompact` — снимок из журнала, `PUT` **до**
@@ -5797,43 +5844,272 @@ fn late_post_compact_not_counted() {
     assert_eq!(got[1].1["trigger"], "session_start_compact");
 }
 
-/// Третье ревью 17b, Minor 1: срок `PUT` — фактический срок клиента (меньшее из своего срока и
-/// остатка бюджета хука); причина «срок PUT N мс» — с ним, а не с константой.
-#[test]
-fn put_timeout_reason_uses_actual_limit() {
-    let _g = serial();
+/// `PreCompact` с бюджетом хука 1,5 с и своим сроком `PUT` 10 с против заглушки, отвечающей на
+/// `PUT` кодом 204 через `put_delay`: при задержке больше бюджета фактический срок `PUT` —
+/// остаток бюджета. `put_stall_ms` — подмена `<кэш>/snapshot.put-stall-ms`: поток снимка засыпает
+/// между концом `PUT` и работой с очередью. Возвращает `hooks.log`, время хука и наличие очереди
+/// снимка.
+fn put_limit_case(
+    name: &str,
+    put_delay: Duration,
+    put_stall_ms: Option<u64>,
+) -> (String, Duration, bool) {
     let (url, _seen) = common::stub_body(std::sync::Arc::new(
-        |m: &str, path: &str, _: usize, _: &Value| {
+        move |m: &str, path: &str, _: usize, _: &Value| {
             if m == "PUT" && path.ends_with("/snapshot") {
-                (204, String::new(), Duration::from_secs(3))
+                (204, String::new(), put_delay)
             } else {
                 (200, "{}".to_string(), Duration::ZERO)
             }
         },
     ));
-    let p = Proj::new("snap-put-limit", &url, "zam_x");
+    let p = Proj::new(name, &url, "zam_x");
     let s = "pl-1";
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
+    if let Some(ms) = put_stall_ms {
+        let cache = p.repo.join(".zeroaimemory/cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("snapshot.put-stall-ms"), ms.to_string()).unwrap();
+    }
     let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
     // свой срок `PUT` больше остатка бюджета: фактический срок — остаток (< 1500 мс)
-    let o = p
-        .cmd(&url)
-        .env("ZAM_TEST_HOOK_BUDGET_MS", "1500")
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_HOOK_BUDGET_MS", "1500")
         .env("ZAM_TEST_SNAPSHOT_MS", "5000")
         .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
         .args(["hook", "checkpoint", "--agent", "claude"])
-        .write_stdin(pc.to_string().into_bytes())
-        .output()
-        .unwrap();
+        .write_stdin(pc.to_string().into_bytes());
+    let t0 = Instant::now();
+    let o = c.output().unwrap();
+    let d = t0.elapsed();
     empty(&o);
-    let log = p.log();
+    (p.log(), d, snap_file(&p, "snapq", s).is_some())
+}
+
+/// Срок из единственной строки «срок PUT N мс» журнала хуков: фактический — больше нуля и
+/// меньше бюджета хука (1500 мс).
+fn put_limit_logged(log: &str) -> u64 {
+    assert_eq!(
+        log.matches("срок PUT ").count(),
+        1,
+        "строка «срок PUT» — ровно одна: {log:?}"
+    );
     let n: u64 = log
         .split("срок PUT ")
         .nth(1)
         .and_then(|r| r.split_whitespace().next())
         .and_then(|x| x.parse().ok())
-        .unwrap_or_else(|| panic!("нет причины «срок PUT»: {log}"));
-    assert!(n < 1500, "срок {n} мс — не фактический: {log}");
-    assert!(snap_file(&p, "snapq", s).is_some());
+        .unwrap_or_else(|| panic!("срок PUT не число: {log}"));
+    assert!(n > 0 && n < 1500, "срок {n} мс — не фактический: {log}");
+    n
+}
+
+/// Предел времени хука с бюджетом 1,5 с в тестах опоздавшего потока снимка: запуск отладочного
+/// процесса под нагрузкой входит в замер, а хук, ждущий усыплённый поток, шёл бы ≈ 3,5 с.
+const LATE_THREAD_MAX: Duration = Duration::from_millis(2500);
+
+/// Третье ревью 17b, Minor 1: срок `PUT` — фактический срок клиента (меньшее из своего срока и
+/// остатка бюджета хука); причина «срок PUT N мс» — с ним, а не с константой.
+#[test]
+fn put_timeout_reason_uses_actual_limit() {
+    let _g = serial();
+    let (log, _, queued) = put_limit_case("snap-put-limit", Duration::from_secs(3), None);
+    put_limit_logged(&log);
+    assert!(queued, "{log}");
+}
+
+/// CI ubuntu (77063ec): срок `PUT` истекает за `HTTP_RESERVE_MS` (30 мс) до конца бюджета, и
+/// поток снимка может не успеть записать итог до выхода хука — строка терялась. Подмена
+/// `put-stall-ms` держит поток 2 с после конца `PUT`: причина «срок PUT N мс» всё равно в
+/// `hooks.log` (её пишет сам хук), ровно одна, снимок в очереди, хук не ждёт поток.
+#[test]
+fn put_outcome_logged_when_snapshot_thread_is_late() {
+    let _g = serial();
+    let slow = Duration::from_secs(3);
+    // прогрев: первый запуск процесса после сборки не меряется
+    let _ = put_limit_case("snap-put-late-warm", slow, Some(2000));
+    let (log, d, queued) = put_limit_case("snap-put-late-log", slow, Some(2000));
+    put_limit_logged(&log);
+    // строку пишет сам хук, на каком бы этапе он ни застал поток: отказ клиента по сроку уже
+    // вернулся («…срок PUT N мс, очередь не обработана до выхода хука») или ещё нет («…срок PUT
+    // N мс, итог отправки не записан до выхода хука» — CI windows-latest, 76458e3: отказ
+    // вернулся позже предела ожидания). Оба исхода верны; своей строки («…, в очереди: срок PUT»)
+    // усыплённый поток записать не может
+    assert!(
+        log.contains("до выхода хука") && !log.contains(", в очереди"),
+        "строку итога написал не хук (хук шёл {d:?}): {log}"
+    );
+    assert!(queued, "снимка нет в очереди (хук шёл {d:?}): {log}");
+    assert!(
+        d <= LATE_THREAD_MAX,
+        "хук ждал поток снимка: {d:?} при пределе {LATE_THREAD_MAX:?}: {log}"
+    );
+}
+
+/// Ревью 2c36319, I1: сервер ответил 204 сразу, а поток снимка застрял после `PUT` (подмена
+/// `put-stall-ms` 3 с) — хук пишет «ответ получен (HTTP 204), очередь не обработана», а не
+/// «срок PUT»: медленная локальная доработка не выдаётся за медленный сервер.
+#[test]
+fn late_snapshot_thread_after_response_is_not_put_timeout() {
+    let _g = serial();
+    // прогрев: первый запуск процесса после сборки не меряется
+    let _ = put_limit_case("snap-put-done-warm", Duration::ZERO, Some(3000));
+    let (log, d, queued) = put_limit_case("snap-put-done-late", Duration::ZERO, Some(3000));
+    assert!(!log.contains("срок PUT"), "ложная причина: {log}");
+    assert_eq!(
+        log.matches("ответ получен (HTTP 204), очередь не обработана до выхода хука")
+            .count(),
+        1,
+        "{log:?}"
+    );
+    // поток оборван до работы с очередью: снимок уйдёт ещё раз со следующим хуком
+    assert!(queued, "{log}");
+    assert!(d <= LATE_THREAD_MAX, "хук ждал поток снимка: {d:?}");
+}
+
+/// Повторное ревью 17b (`prompt_flushes_changed_queue`): решение о снимке и снимок — вне пути
+/// сетевой части `checkpoint`. Подмена `<журнал>.decide-stall-ms` усыпляет поток снимка до
+/// решения на 3 с: очередь изменённых файлов всё равно уходит в бюджете хука, хук не ждёт поток.
+#[test]
+fn snapshot_decision_never_delays_changed_flush() {
+    let _g = serial();
+    let (url, seen) = snap_stub(204, "");
+    let p = Proj::new("snap-decide-stall", &url, "zam_x");
+    let s = "ds-1";
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), b"v1\n").unwrap();
+    let edit = post_ok(
+        &p,
+        s,
+        "Edit",
+        json!({"file_path": p.repo.join("src/pool.rs")}),
+    );
+    let _ = p.hook_at(&url, "post-tool", "claude", edit.to_string().as_bytes());
+    assert_eq!(queue(&p, s).len(), 1);
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    std::fs::write(format!("{}.decide-stall-ms", t.display()), "3000").unwrap();
+    let warm = snap_ev(
+        &p,
+        "Stop",
+        "ds-warm",
+        &t,
+        json!({"stop_hook_active": false}),
+    );
+    let _ = p.hook_at(&url, "checkpoint", "claude", warm.to_string().as_bytes());
+    let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
+    let (o, d) = p.hook_at(&url, "checkpoint", "claude", stop.to_string().as_bytes());
+    ok(&o);
+    assert!(
+        d <= max_for("checkpoint"),
+        "поток снимка задержал хук: {d:?}"
+    );
+    let sent = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+        .count();
+    // что именно не успело — в журнале хука: «files/changed: очередь не отправлена — остаток
+    // бюджета меньше 15 мс (прошло N мс)» (пропуск до запроса) или «files/changed: <ошибка сети>»
+    assert!(
+        sent >= 1,
+        "очередь изменённых не ушла (хук шёл {d:?}): {}",
+        p.log()
+    );
+    assert!(queue(&p, s).is_empty(), "{}", p.log());
+}
+
+/// Ревью правки `checkpoint`, Minor 1: ожидание потока снимка ограничено концом бюджета хука —
+/// медленная сеть (2 с) и медленное решение (`decide-stall-ms` 3 с) не уводят выход `Stop` за
+/// бюджет (1 с) больше чем на малый запас.
+#[test]
+fn snapshot_wait_bounded_by_hook_budget() {
+    let _g = serial();
+    let (url, _seen) = common::stub(
+        200,
+        r#"{"memory_writes":0,"claimed_tasks":[]}"#,
+        Duration::from_secs(2),
+    );
+    let p = Proj::new("snap-wait-budget", &url, "zam_x");
+    let s = "wb-1";
+    empty(&p.hook("pre-tool", &write_ev(&p, s, "a.sh")));
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    std::fs::write(format!("{}.decide-stall-ms", t.display()), "3000").unwrap();
+    let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
+    let run = || {
+        let mut c = p.cmd(&url);
+        c.env("ZAM_TEST_HOOK_BUDGET_MS", "1000")
+            .env("ZAM_TEST_SNAPSHOT_PUT_MS", "1000")
+            .args(["hook", "checkpoint", "--agent", "claude"])
+            .write_stdin(stop.to_string().into_bytes());
+        let t0 = Instant::now();
+        let o = c.output().unwrap();
+        (o, t0.elapsed())
+    };
+    let _ = run();
+    let (o, d) = run();
+    ok(&o);
+    assert!(
+        d <= Duration::from_millis(1000 + 300),
+        "поток снимка увёл хук за бюджет: {d:?}"
+    );
+    // ревью 2c36319, M4: поток до `PUT` не дошёл — строка с событием и временем от старта
+    let log = p.log();
+    assert!(
+        log.contains("snapshot: не готов до выхода хука (Stop, прошло "),
+        "{log}"
+    );
+}
+
+/// Ревью правки `checkpoint`, Minor 3: сначала очередь, потом `snapst-*` — обрыв между записями
+/// (подмена `write-stall-ms`, хук выходит по своему пределу) оставляет снимок в очереди без
+/// отметки «снят», а не отметку без снимка.
+#[test]
+fn snapshot_queue_written_before_state() {
+    let _g = serial();
+    let (url, _seen) = snap_stub(204, "");
+    let p = Proj::new("snap-write-order", &url, "zam_x");
+    let s = "wo-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    std::fs::write(format!("{}.write-stall-ms", t.display()), "3000").unwrap();
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    let o = p
+        .cmd(&url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+        .env("ZAM_TEST_SNAPSHOT_MS", "500")
+        .args(["hook", "checkpoint", "--agent", "claude"])
+        .write_stdin(pc.to_string().into_bytes())
+        .output()
+        .unwrap();
+    empty(&o);
+    assert!(
+        snap_file(&p, "snapq", s).is_some(),
+        "снимка нет в очереди: {}",
+        p.log()
+    );
+    let st = snap_file(&p, "snapst", s);
+    assert!(
+        st.as_ref().is_none_or(|v| v["ok_at"] == 0),
+        "отметка «снят» без очереди: {st:?}"
+    );
+}
+
+/// Ревью правки `checkpoint`, Minor 4: паника потока снимка (тестовая точка `<журнал>.panic`) —
+/// строка «snapshot: паника» в `hooks.log`, хук отвечает как обычно.
+#[test]
+fn snapshot_thread_panic_logged() {
+    let _g = serial();
+    let (url, _seen) = snap_stub(204, "");
+    let p = Proj::new("snap-panic", &url, "zam_x");
+    let s = "pn-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    std::fs::write(format!("{}.panic", t.display()), "").unwrap();
+    let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
+    empty(&hook_snap(&p, "checkpoint", &stop));
+    assert!(p.log().contains("snapshot: паника"), "{}", p.log());
 }

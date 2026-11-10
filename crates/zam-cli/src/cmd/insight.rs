@@ -193,6 +193,7 @@ fn explain_duplicate(e: CliError) -> CliError {
     CliError {
         code: EXIT_CONFLICT,
         msg,
+        timeout: false,
         problem: e.problem,
     }
 }
@@ -331,6 +332,7 @@ fn explain_stale(e: CliError, sent: i64) -> CliError {
     CliError {
         code: EXIT_CONFLICT,
         msg: format!("запись изменилась (rev {sent} → {cur}): перечитайте"),
+        timeout: false,
         problem: e.problem,
     }
 }
@@ -620,6 +622,7 @@ mod tests {
         let e = CliError {
             code: EXIT_CONFLICT,
             msg: "x".into(),
+            timeout: false,
             problem: Some(json!({"type": "/problems/conflict", "status": 409, "rev": 5})),
         };
         let s = explain_stale(e, 3);
@@ -629,6 +632,7 @@ mod tests {
         let other = CliError {
             code: EXIT_CONFLICT,
             msg: "y".into(),
+            timeout: false,
             problem: Some(json!({"type": "/problems/conflict", "status": 409})),
         };
         let o = explain_stale(other, 3);
@@ -640,6 +644,7 @@ mod tests {
         let e = CliError {
             code: crate::client::EXIT_CONFLICT,
             msg: "x".into(),
+            timeout: false,
             problem: Some(json!({
                 "type": "/problems/possible-duplicate",
                 "dedup": "full",
