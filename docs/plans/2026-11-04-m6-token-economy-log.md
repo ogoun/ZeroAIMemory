@@ -10768,3 +10768,129 @@ Worktree `.tmp/m6/wt-b`, ветка `m6-portability` (база `05f41fc`). Ко�
    `cli_entries`.
 2. Оставлять ли `tree-sitter-*.LICENSE` в `LICENSES/` комплекта сервера (попали туда как часть
    `deploy/licenses/`) или исключить как повтор сводки?
+
+## Задача 15c, правки ревью (2026-11-10)
+
+Worktree `.tmp/m6/wt-b`, ветка `m6-portability` (база `1f8d9b4`). Коммит: `build(package): правки
+ревью 15c — раздельная сборка zam, версии уточнённых крейтов, проверка сводки`. Ревью: принять с
+правками I1, I2, M1–M3 и решениями по двум вопросам раздела «Задача 15c…» выше.
+
+### По пунктам
+
+**I1. Выпускаемый `zam` собирается отдельной командой.** `package.yml`, шаг `build (windows)`:
+`cargo build --release -p zam-server -p zam-cli` разделён на две команды (как у Linux). Причина
+подтверждена: `cargo tree -p zam-server -p zam-cli -e normal -i rusqlite` показывает `rusqlite ←
+zam-core ← zam-cli` (cargo объединяет фичи `zam-core` по пакетам одной команды), а `cargo tree -p
+zam-cli … -i rusqlite` — «nothing to print».
+- Другие места: `release.yml` и `ci.yml` бинарники не собирают (`release.yml` вызывает
+  `package.yml`; `cargo test --workspace` — не выпуск); `cuda.yml`, `edge.yml` — без `zam`. Задача
+  `cli` в `package.yml` (клиент другой платформы для `downloads/`) и шаг Linux уже собирали `-p
+  zam-cli` отдельно. `README.md`, «Сборка и тесты»: команда разделена на две, добавлена строка
+  «почему». `deploy/README-install.md` сборку не описывает. xtask сам собирает `zam` только для eval
+  (`eval/run.rs::build_release` — `-p <один пакет>`), в упаковку этот бинарник не идёт.
+- Защита от возврата — тест `release_cli_is_built_separately`: читает `README.md`,
+  `deploy/README-install.md` и все `.github/workflows/*.yml`, разбирает команды `cargo build` с
+  `--release`/`-r` (перенос `\` склеивается, `-p`/`--package`/`--package=`) и падает, если `zam-cli`
+  стоит в одной команде с другим пакетом, либо команда собирает весь workspace (`--workspace`,
+  `--all` или без `-p`). Чтобы проверка не была пустой, требует в `package.yml` не меньше трёх
+  отдельных сборок `-p zam-cli`, среди них musl и без `--target`.
+- **Размер `zam.exe`** (release, Windows, этот коммит, `-j 2`, без `ZAM_GIT_SHA`): отдельно —
+  20 672 512 байт; вместе с `zam-server` — 20 870 656 байт (+198 144 байта, +0,96 %). Повторная
+  отдельная сборка в том же каталоге после совместной — снова 20 672 512 байт: порядок команд на
+  результат не влияет, вторая команда пересобирает `zam` с узким набором фич.
+- **Лишние крейты** при совместной сборке (`cargo tree -p zam-server -p zam-cli -e normal
+  --no-dedupe --target x86_64-pc-windows-msvc`, поддерево `zam-cli`, против отдельного `-p
+  zam-cli`): 130 против 118, разница 12 — 11 из ревью (`rusqlite`, `libsqlite3-sys`, `hashlink`,
+  `fallible-iterator`, `fallible-streaming-iterator`, `miniz_oxide`, `adler2`, `bitflags`,
+  `smallvec`, `foldhash`, `rand_core` 0.10.1) и `zerocopy-derive` (процедурный макрос, в бинарник
+  не линкуется).
+
+**I2. Версии уточнённых крейтов закреплены.** `package::CLARIFIED_CRATES` = `tree-sitter-java
+0.23.5`, `tree-sitter-typescript 0.23.2`. `check_clarified_versions` (вызывается и при упаковке, и
+тестом `clarified_crate_versions_are_pinned` на настоящих `about.toml` и `Cargo.lock`): у каждого
+крейта с `clarify` версия закреплена; в `Cargo.lock` у закреплённого крейта ровно одна, эта версия
+(другая, две версии или нет крейта — ошибка «обновили крейт — сверьте LICENSE и SHA-256 в
+about.toml и deploy/licenses…»). Версии названы и в комментарии `about.toml` (тест сверяет).
+
+**M1. Проверка самой сводки.** `check_clarified_notices` после каждого `cargo about generate`
+(сервер и клиент): для каждого файла `clarify.files` из `deploy/licenses/`, крейт которого есть в
+сводке (строка `<li>имя версия</li>` шаблона `about.hbs`), каждая строка файла, начинающаяся с
+«Copyright», должна быть в HTML (с экранированием handlebars: `& < > " ' ` =`). Нет строки —
+ошибка упаковки; в файле нет строки «Copyright» — тоже ошибка (проверять нечем). От формулировок
+cargo-about не зависит. Тест сверяет и вид строки крейта в настоящем `about.hbs`: смена шаблона,
+при которой проверка стала бы пустой, роняет тест. Проверка по stderr (`clarify_failures`)
+оставлена вторым слоем.
+
+**M3. Версия cargo-about.** `CARGO_ABOUT_VERSION = "0.9.2"`; перед генерацией xtask выполняет
+`cargo about --version`, несовпадение — **ошибка** с командой `cargo install cargo-about@0.9.2
+--locked --features cli` (та же подсказка — при неудачном запуске). Ошибка, а не предупреждение:
+от версии зависят разбор `about.toml`, смысл пути `clarify.files` и поведение при несработавшем
+`clarify`; архивы выпуска должны получаться одинаковыми у разработчика и в CI, а предупреждение в
+выводе упаковки легко пропустить. Тест `cargo_about_version_is_pinned` сверяет константу с
+`tool: cargo-about@…` в `package.yml`.
+
+**M2 и отсутствующий файл.** `resolve_about_config` переписывает только пути с началом
+`deploy/licenses/`; прочие оставляет как есть — путь от крейта, даже если такой файл есть от корня
+репозитория (`LICENSE`). Файла из `deploy/licenses/` нет — ошибка «нет файла …», а не пропуск.
+(В замечании префикс назван `deploy/`; взят `deploy/licenses/` — он же префикс переписывания из
+M2, чтобы правило было одно.)
+
+**Решение (а).** `LICENSES/TREE-SITTER-QUERIES-MIT.txt` — в архиве клиента (`cli_entries`, из
+`deploy/licenses/`; константа `QUERIES_LICENSE`). Состав архива клиента: `zam[.exe]`, `LICENSE.txt`,
+`LICENSES/THIRD-PARTY-RUST.html`, `LICENSES/TREE-SITTER-QUERIES-MIT.txt`. Тесты состава zip и
+tar.gz обновлены; в tar.gz проверено, что прочее из `deploy/licenses/` (`A.txt`, `B.txt` фикстуры)
+в архив клиента не попадает.
+
+**Решение (б).** Два `tree-sitter-*.LICENSE` в `LICENSES/` комплекта сервера оставлены.
+
+### Откаты
+
+Один прогон `cargo test -p xtask package::` с шестью откатами сразу (`rollback3.log`) — 9 FAIL
+из 23:
+
+| откат | тест | итог |
+|---|---|---|
+| I1: в `package.yml` возвращена общая команда | `release_cli_is_built_separately` | FAIL: «package.yml: zam-cli собирается вместе с другим пакетом…» |
+| I2: `check_clarified_versions` ничего не проверяет | `clarified_crate_versions_are_pinned` | FAIL |
+| M1: `check_clarified_notices` ничего не проверяет | `clarified_notices_checked_in_summary` | FAIL |
+| M3: любая версия cargo-about принимается | `cargo_about_version_is_pinned` | FAIL |
+| M2: прежнее правило «файл есть от корня — переписать» | `about_config_rejects_git_and_wrong_checksum` | FAIL: путь `LICENSE-MIT` стал абсолютным |
+| (а): из `cli_entries` убран файл запросов | `client_zip_has_licenses`, три теста раскладки | FAIL: в архиве нет `LICENSES/TREE-SITTER-QUERIES-MIT.txt` |
+
+Отдельно откат `README.md` не прогонялся: файл читает тот же тест, что и `package.yml`.
+
+### Проверка
+
+Свои `target/t15c` и `target/t15c-rel` (после работы удалены), `-j 2`, cargo-about 0.9.2.
+- `cargo fmt --all --check` — чисто; `cargo clippy -p xtask --all-targets -- -D warnings` — чисто.
+- `cargo test -p xtask` — 222 + 3 + 5, все PASS (`package::` — 23).
+- Упаковка без сети (то же окружение, что в разделе выше: `CARGO_NET_OFFLINE=true`, прокси на
+  закрытый порт `127.0.0.1:9`, `npm_config_offline=true`): `cargo xtask package --platform
+  windows-x64 --flavor cpu --version 0.0.11-m6-dev` — код 0. Бинарники — собранные в этом круге из
+  этого коммита: `zam-server.exe` и отдельно собранный `zam.exe`.
+- Состав `zam-0.0.11-m6-dev-windows-x64.zip` (5,0 МБ) — четыре файла: `zam.exe` (20 672 512),
+  `LICENSE.txt`, `LICENSES/THIRD-PARTY-RUST.html` (249 003 байта, 119 крейтов, обе строки авторских
+  прав на месте), `LICENSES/TREE-SITTER-QUERIES-MIT.txt` (8403 байта, SHA-256 как у файла в
+  `deploy/licenses/`). В комплекте сервера `LICENSES/` — 13 файлов, как после первого коммита.
+- Не запускалось: упаковка linux-x64, `--flavor gpu`, `cargo xtask smoke`, CI (правка
+  `package.yml` на раннере не проверена).
+
+### Передать
+
+- **→ 13a/13c** (дополнение к списку раздела «Задача 15c…»):
+  - состав `LICENSES/` архива клиента — два файла: `THIRD-PARTY-RUST.html` (сводка cargo-about по
+    зависимостям `zam`) и `TREE-SITTER-QUERIES-MIT.txt`; в README (раздел лицензий) и
+    `deploy/README-install.md` («Известные ограничения») это ещё не отражено;
+  - I1: выпускаемый `zam` собирается отдельной командой `cargo build --release -p zam-cli`
+    (`package.yml`, `README.md` «Сборка и тесты» — уже поправлены); в CHANGELOG `[Unreleased]`,
+    Changed/Fixed: до правки `zam.exe` архива Windows собирался одной командой с сервером и
+    включал зависимости сервера (SQLite и др.); в ТЗ §16 — правило раздельной сборки и тест-страж;
+  - упаковка требует cargo-about ровно 0.9.2 (иначе ошибка) — в инструкцию по сборке.
+- **→ M7.**
+  - M4 ревью: в сводки не входят лицензии того, что линкуется помимо крейтов, — статически
+    влинкованный musl libc в `zam` для Linux (MIT, файл `COPYRIGHT` musl) и стандартная библиотека
+    Rust (MIT OR Apache-2.0 и лицензии её зависимостей); cargo-about их не видит. Решить, класть ли
+    их тексты в `LICENSES/` (для musl — только в архив Linux).
+  - Тест-страж I1 разбирает команды текстом: сборку `zam` через скрипт, `cargo install`, `cross`
+    или переменную с именами пакетов он не увидит. Надёжнее — сверять зависимости готового
+    бинарника со сводкой (например, `cargo auditable` и проверка в `xtask package`).

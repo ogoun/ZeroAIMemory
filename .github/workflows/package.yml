@@ -177,7 +177,11 @@ jobs:
         if: matrix.platform == 'windows-x64'
         env:
           ZAM_GIT_SHA: ${{ github.sha }}
-        run: cargo build --release -p zam-server -p zam-cli
+        # zam — отдельной командой: в общей cargo объединяет фичи с zam-server, и в zam попадают
+        # зависимости вне сводки лицензий архива клиента (xtask: release_cli_is_built_separately)
+        run: |
+          cargo build --release -p zam-server
+          cargo build --release -p zam-cli
       - name: build (linux)
         if: matrix.platform == 'linux-x64'
         env:

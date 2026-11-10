@@ -167,6 +167,11 @@ pub const PDFIUM_LICENSES: [&str; 2] = ["PDFIUM-LICENSE.txt", "PDFIUM-THIRD-PART
 /// Сводка лицензий Rust-зависимостей (cargo-about) в `LICENSES/` комплекта и архива клиента.
 pub const RUST_LICENSES: &str = "THIRD-PARTY-RUST.html";
 
+/// Уведомления MIT исходных `tags.scm` грамматик tree-sitter (`deploy/licenses/`): собственные
+/// запросы тегов на их основе встроены в `zam`, поэтому файл идёт с каждым архивом, где есть
+/// `zam`, — и в комплекте сервера, и в архиве клиента.
+pub const QUERIES_LICENSE: &str = "TREE-SITTER-QUERIES-MIT.txt";
+
 /// Разбирает заголовок библиотеки: `Some(платформа)` для PE AMD64 (`windows-x64`) и ELF64
 /// x86-64 (`linux-x64`), иначе `None`.
 pub fn native_lib_platform(head: &[u8]) -> Option<&'static str> {
@@ -362,9 +367,10 @@ fn server_entries(i: &Inputs) -> Result<Vec<Entry>> {
     Ok(v)
 }
 
-/// Архив клиента: `zam`, лицензия проекта и `LICENSES/` со сводкой лицензий зависимостей
-/// `zam` (в него встроены рантайм tree-sitter и грамматики под MIT; ответ владельца M5.6
-/// п. 13). Каталог `deploy/licenses/` сюда не копируется: он про компоненты комплекта сервера.
+/// Архив клиента: `zam`, лицензия проекта и `LICENSES/` — сводка лицензий зависимостей `zam`
+/// (в него встроены рантайм tree-sitter и грамматики под MIT; ответ владельца M5.6 п. 13) и
+/// уведомления запросов тегов [`QUERIES_LICENSE`]. Остальное из `deploy/licenses/` сюда не
+/// копируется: оно про компоненты комплекта сервера.
 fn cli_entries(i: &Inputs) -> Vec<Entry> {
     vec![
         Entry {
@@ -374,6 +380,10 @@ fn cli_entries(i: &Inputs) -> Vec<Entry> {
         },
         Entry::file("LICENSE.txt", i.project_license),
         Entry::file(format!("LICENSES/{RUST_LICENSES}"), i.cli_rust_licenses),
+        Entry::file(
+            format!("LICENSES/{QUERIES_LICENSE}"),
+            i.deploy_dir.join("licenses").join(QUERIES_LICENSE),
+        ),
     ]
 }
 
@@ -749,22 +759,83 @@ pub struct GeneratedLicenses {
     pub cli_rust: PathBuf,
 }
 
-/// Манифест клиента `zam`: по нему cargo-about собирает сводку архива клиента.
+/// Манифест клиента `zam`: по нему cargo-about собирает сводку архива клиента. Сводка верна
+/// для `zam`, собранного отдельной командой `cargo build -p zam-cli`: в общей команде с
+/// `zam-server` cargo объединяет фичи общих крейтов, и в `zam` попадают лишние зависимости
+/// (тест `release_cli_is_built_separately`).
 const CLI_MANIFEST: &str = "crates/zam-cli/Cargo.toml";
 
-/// Настройки cargo-about для упаковки: `about.toml`, где пути `clarify.files`, существующие от
-/// корня репозитория (`deploy/licenses/…`), заменены абсолютными. cargo-about ищет такие файлы
-/// в каталоге самого крейта (в реестре cargo), а абсолютный путь берёт как есть; остальные пути
-/// остаются относительными к крейту. Упаковка идёт без сети (ответ владельца M5.6 п. 14):
-/// `clarify.git` (файл с GitHub) — ошибка. Хэш файла сверяется здесь же: cargo-about 0.9.2 на
-/// несошедшийся `clarify` только предупреждает и подставляет шаблон лицензии без авторских
-/// прав (см. [`clarify_failures`]).
-pub fn resolve_about_config(text: &str, root: &Path) -> Result<String> {
+/// Версия cargo-about, с которой собираются сводки (та же в `.github/workflows/package.yml`).
+/// От версии зависят разбор `about.toml`, смысл пути `clarify.files` и поведение при
+/// несработавшем `clarify`, поэтому другая версия — ошибка упаковки, а не предупреждение:
+/// архивы выпуска должны получаться одинаковыми на машине разработчика и в CI.
+pub const CARGO_ABOUT_VERSION: &str = "0.9.2";
+
+/// Подсказка установки cargo-about закреплённой версии.
+fn cargo_about_install() -> String {
+    format!("cargo install cargo-about@{CARGO_ABOUT_VERSION} --locked --features cli")
+}
+
+/// Вывод `cargo about --version` — закреплённая версия [`CARGO_ABOUT_VERSION`].
+fn check_cargo_about_version(output: &str) -> Result<()> {
+    let got = output.trim();
+    if got.strip_prefix("cargo-about ") != Some(CARGO_ABOUT_VERSION) {
+        bail!(
+            "cargo-about: «{got}», для упаковки нужна версия {CARGO_ABOUT_VERSION} ({})",
+            cargo_about_install()
+        );
+    }
+    Ok(())
+}
+
+/// Каталог текстов лицензий в репозитории: только пути `clarify.files` с этим началом
+/// считаются от корня репозитория ([`resolve_about_config`]).
+const DEPLOY_LICENSES_PREFIX: &str = "deploy/licenses/";
+
+/// Крейты с уточнением лицензии в `about.toml` и их версии в `Cargo.lock`. У `clarify`
+/// cargo-about нет поля версии: текст из `deploy/licenses/` молча приложился бы и к новой
+/// версии крейта, где лицензия или авторы могли измениться. Поэтому версия закреплена здесь
+/// ([`check_clarified_versions`]): обновили крейт — сверьте `LICENSE` репозитория на коммите
+/// пакета (`.cargo_vcs_info.json`), SHA-256 в `about.toml`, файл в `deploy/licenses/` и
+/// поправьте версию.
+pub const CLARIFIED_CRATES: [(&str, &str); 2] = [
+    ("tree-sitter-java", "0.23.5"),
+    ("tree-sitter-typescript", "0.23.2"),
+];
+
+/// Файл лицензии из `deploy/licenses/`, которым `about.toml` уточняет крейт.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClarifiedFile {
+    pub krate: String,
+    pub path: PathBuf,
+}
+
+/// Настройки cargo-about для упаковки ([`resolve_about_config`]).
+#[derive(Debug)]
+pub struct AboutConfig {
+    /// Текст настроек с абсолютными путями файлов из `deploy/licenses/`.
+    pub text: String,
+    /// Все крейты с `clarify`.
+    pub crates: Vec<String>,
+    /// Файлы `clarify.files` из `deploy/licenses/`.
+    pub clarified: Vec<ClarifiedFile>,
+}
+
+/// Настройки cargo-about для упаковки: `about.toml`, где пути `clarify.files` с началом
+/// `deploy/licenses/` заменены абсолютными. cargo-about ищет файлы `clarify.files` в каталоге
+/// самого крейта (в реестре cargo), а абсолютный путь берёт как есть; прочие пути не меняются
+/// — это пути от крейта. Упаковка идёт без сети (ответ владельца M5.6 п. 14): `clarify.git`
+/// (файл с GitHub) — ошибка. Файла из `deploy/licenses/` нет или его SHA-256 не сошёлся —
+/// ошибка: cargo-about 0.9.2 на несошедшийся `clarify` только предупреждает и подставляет
+/// шаблон лицензии без авторских прав.
+pub fn resolve_about_config(text: &str, root: &Path) -> Result<AboutConfig> {
     let mut cfg: toml::Table = text.parse().context("разбор about.toml")?;
+    let (mut crates, mut clarified) = (Vec::new(), Vec::new());
     for (krate, v) in cfg.iter_mut() {
         let Some(clarify) = v.get_mut("clarify") else {
             continue;
         };
+        crates.push(krate.clone());
         if clarify.get("git").is_some() {
             bail!(
                 "about.toml: {krate}: clarify.git скачивает файл из сети при каждой упаковке; \
@@ -785,9 +856,12 @@ pub fn resolve_about_config(text: &str, root: &Path) -> Result<String> {
                     .with_context(|| format!("about.toml: {krate}: clarify.files без `{key}`"))
             };
             let (rel, want) = (str_of(f, "path")?, str_of(f, "checksum")?);
-            let abs = root.join(&rel);
-            if Path::new(&rel).is_absolute() || !abs.is_file() {
+            if !rel.starts_with(DEPLOY_LICENSES_PREFIX) {
                 continue;
+            }
+            let abs = root.join(&rel);
+            if !abs.is_file() {
+                bail!("about.toml: {krate}: нет файла {rel} (clarify.files)");
             }
             // с `start`/`end` хэш считается по части файла — её сверяет только cargo-about
             if !f.contains_key("start") && !f.contains_key("end") {
@@ -799,20 +873,121 @@ pub fn resolve_about_config(text: &str, root: &Path) -> Result<String> {
                     );
                 }
             }
-            let abs = abs
+            let s = abs
                 .to_str()
                 .with_context(|| format!("путь {} не в UTF-8", abs.display()))?
                 .to_string();
-            f.insert("path".into(), abs.into());
+            f.insert("path".into(), s.into());
+            clarified.push(ClarifiedFile {
+                krate: krate.clone(),
+                path: abs,
+            });
         }
     }
-    toml::to_string(&cfg).context("запись настроек cargo-about")
+    Ok(AboutConfig {
+        text: toml::to_string(&cfg).context("запись настроек cargo-about")?,
+        crates,
+        clarified,
+    })
+}
+
+/// Каждый крейт с `clarify` (`clarified`) закреплён в `pinned`, и в `Cargo.lock` (`lock`) у
+/// закреплённого крейта ровно эта версия (см. [`CLARIFIED_CRATES`]).
+fn check_clarified_versions(
+    clarified: &[String],
+    pinned: &[(&str, &str)],
+    lock: &str,
+) -> Result<()> {
+    const HINT: &str = "обновили крейт — сверьте LICENSE и SHA-256 в about.toml и deploy/licenses, \
+                        затем поправьте версию в package::CLARIFIED_CRATES";
+    for c in clarified {
+        if !pinned.iter().any(|(n, _)| n == c) {
+            bail!(
+                "about.toml: у {c} есть clarify, но версия не закреплена в \
+                 package::CLARIFIED_CRATES"
+            );
+        }
+    }
+    let lock: toml::Table = lock.parse().context("разбор Cargo.lock")?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .context("Cargo.lock: нет списка package")?;
+    for (name, version) in pinned {
+        let got: Vec<&str> = packages
+            .iter()
+            .filter(|p| p.get("name").and_then(toml::Value::as_str) == Some(name))
+            .filter_map(|p| p.get("version").and_then(toml::Value::as_str))
+            .collect();
+        if got != [*version] {
+            bail!(
+                "Cargo.lock: {name} — версии [{}], лицензия уточнена для {version}: {HINT}",
+                got.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Экранирование текста в HTML, как у шаблонизатора cargo-about (handlebars, `{{text}}`).
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            '`' => out.push_str("&#x60;"),
+            '=' => out.push_str("&#x3D;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Сводка `html` содержит строки авторских прав (строки файла, начинающиеся с «Copyright»)
+/// каждого файла `clarified`, крейт которого есть в сводке (строка `<li>имя версия</li>`
+/// шаблона `about.hbs`). Проверка итога, а не сообщений cargo-about: если уточнение не
+/// сработало по любой причине, в сводке стоит шаблон лицензии без авторских прав — ошибка.
+fn check_clarified_notices(html: &str, clarified: &[ClarifiedFile], what: &str) -> Result<()> {
+    for c in clarified {
+        if !html.contains(&format!("<li>{} ", c.krate)) {
+            continue;
+        }
+        let text =
+            fs::read_to_string(&c.path).with_context(|| format!("чтение {}", c.path.display()))?;
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("Copyright"))
+            .collect();
+        if lines.is_empty() {
+            bail!(
+                "{}: нет строки «Copyright» — нечем проверить сводку лицензий",
+                c.path.display()
+            );
+        }
+        for l in lines {
+            if !html.contains(&html_escape(l)) {
+                bail!(
+                    "{what}: у крейта {} нет строки «{l}» из {} — уточнение лицензии \
+                     (about.toml, clarify) не применено, в сводке шаблон без авторских прав",
+                    c.krate,
+                    c.path.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Строки предупреждений cargo-about о несработавшем `clarify`: файл не прочитан или хэш не
 /// сошёлся. cargo-about 0.9.2 при этом завершается успешно и подставляет шаблон лицензии без
 /// строки авторских прав (проверено: `clarify.git` без сети — код 0), поэтому такие строки —
-/// ошибка упаковки.
+/// ошибка упаковки. Формулировка — версии [`CARGO_ABOUT_VERSION`]; от неё не зависит вторая
+/// проверка, [`check_clarified_notices`].
 fn clarify_failures(stderr: &str) -> Vec<&str> {
     stderr
         .lines()
@@ -821,8 +996,14 @@ fn clarify_failures(stderr: &str) -> Vec<&str> {
 }
 
 /// `cargo about generate`: сводка лицензий Rust-зависимостей в `out` — пакета `manifest` или,
-/// без него, всего workspace.
-fn cargo_about(root: &Path, config: &Path, manifest: Option<&Path>, out: &Path) -> Result<()> {
+/// без него, всего workspace; с проверкой, что уточнения `about` применены.
+fn cargo_about(
+    root: &Path,
+    about: &AboutConfig,
+    config: &Path,
+    manifest: Option<&Path>,
+    out: &Path,
+) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(root)
@@ -834,7 +1015,7 @@ fn cargo_about(root: &Path, config: &Path, manifest: Option<&Path>, out: &Path) 
     cmd.arg("about.hbs").arg("-o").arg(out);
     let o = run(
         &mut cmd,
-        "cargo about (установка: cargo install cargo-about --locked --features cli)",
+        &format!("cargo about (установка: {})", cargo_about_install()),
     )?;
     let stderr = String::from_utf8_lossy(&o.stderr);
     let bad = clarify_failures(&stderr);
@@ -846,7 +1027,8 @@ fn cargo_about(root: &Path, config: &Path, manifest: Option<&Path>, out: &Path) 
             bad.join("\n")
         );
     }
-    Ok(())
+    let html = fs::read_to_string(out).with_context(|| format!("чтение {}", out.display()))?;
+    check_clarified_notices(&html, &about.clarified, &out.display().to_string())
 }
 
 /// Генерирует в `work` лицензии поставки. Комплект сервера (`work/server/`):
@@ -861,13 +1043,34 @@ pub fn generate_licenses(root: &Path, work: &Path) -> Result<GeneratedLicenses> 
     let (out, cli) = (work.join("server"), work.join("cli"));
     fs::create_dir_all(&out)?;
     fs::create_dir_all(&cli)?;
-    let about = root.join("about.toml");
-    let text = fs::read_to_string(&about).with_context(|| format!("чтение {}", about.display()))?;
+    let read = |name: &str| {
+        let p = root.join(name);
+        fs::read_to_string(&p).with_context(|| format!("чтение {}", p.display()))
+    };
+    let about = resolve_about_config(&read("about.toml")?, root)?;
+    check_clarified_versions(&about.crates, &CLARIFIED_CRATES, &read("Cargo.lock")?)?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let v = run(
+        Command::new(cargo)
+            .current_dir(root)
+            .args(["about", "--version"]),
+        &format!(
+            "cargo about --version (установка: {})",
+            cargo_about_install()
+        ),
+    )?;
+    check_cargo_about_version(&String::from_utf8_lossy(&v.stdout))?;
     let config = work.join("about.toml");
-    fs::write(&config, resolve_about_config(&text, root)?)?;
-    cargo_about(root, &config, None, &out.join(RUST_LICENSES))?;
+    fs::write(&config, &about.text)?;
+    cargo_about(root, &about, &config, None, &out.join(RUST_LICENSES))?;
     let cli_rust = cli.join(RUST_LICENSES);
-    cargo_about(root, &config, Some(&root.join(CLI_MANIFEST)), &cli_rust)?;
+    cargo_about(
+        root,
+        &about,
+        &config,
+        Some(&root.join(CLI_MANIFEST)),
+        &cli_rust,
+    )?;
     // В бандл WebUI входят пакеты из devDependencies (сборка vite), поэтому проверяем всё дерево.
     let npx = if cfg!(windows) { "npx.cmd" } else { "npx" };
     let web_pkg = web_package_id(&root.join("web").join("package.json"))?;
@@ -965,6 +1168,7 @@ pub(crate) mod tests {
             "systemd/zam-server.service",
             "licenses/A.txt",
             "licenses/B.txt",
+            "licenses/TREE-SITTER-QUERIES-MIT.txt",
             // подкаталог (лицензии NVIDIA для zam-cuda) в комплект сервера не входит
             "licenses/nvidia/NVIDIA-CUDA-EULA.txt",
         ] {
@@ -1087,13 +1291,19 @@ pub(crate) mod tests {
         "tokenizers/bge-m3-int8/tokenizer.json",
         "LICENSES/A.txt",
         "LICENSES/B.txt",
+        "LICENSES/TREE-SITTER-QUERIES-MIT.txt",
         "LICENSES/THIRD-PARTY-RUST.html",
         "LICENSES/THIRD-PARTY-WEB.json",
         "LICENSES/ZeroAIMemory-LICENSE.txt",
     ];
 
     /// Состав архива клиента Windows.
-    const CLI_WIN: &[&str] = &["LICENSE.txt", "LICENSES/THIRD-PARTY-RUST.html", "zam.exe"];
+    const CLI_WIN: &[&str] = &[
+        "LICENSE.txt",
+        "LICENSES/THIRD-PARTY-RUST.html",
+        "LICENSES/TREE-SITTER-QUERIES-MIT.txt",
+        "zam.exe",
+    ];
 
     fn zip_bytes(p: &Path, name: &str) -> Vec<u8> {
         let mut z = zip::ZipArchive::new(File::open(p).unwrap()).unwrap();
@@ -1144,6 +1354,18 @@ pub(crate) mod tests {
         let got = run_package(&w, "linux-x64", Flavor::Cpu, false).unwrap();
         let (server, cli) = (&got[0], &got[1]);
         assert_eq!(cli.file_name().unwrap(), "zam-1.2.3-linux-x64.tar.gz");
+        // решение по ревью 15c: уведомления запросов тегов (встроены в `zam`) — тоже в архиве
+        // клиента, из `deploy/licenses/`; больше оттуда ничего (`A.txt`, `B.txt` — нет)
+        let names: Vec<String> = tar_entries(cli).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            [
+                "zam-1.2.3-linux-x64/LICENSE.txt",
+                "zam-1.2.3-linux-x64/LICENSES/THIRD-PARTY-RUST.html",
+                "zam-1.2.3-linux-x64/LICENSES/TREE-SITTER-QUERIES-MIT.txt",
+                "zam-1.2.3-linux-x64/zam",
+            ]
+        );
         assert_eq!(
             tar_bytes(cli, "zam-1.2.3-linux-x64/LICENSES/THIRD-PARTY-RUST.html"),
             CLI_LICENSES_BODY
@@ -1260,6 +1482,7 @@ pub(crate) mod tests {
             ("tokenizers/bge-m3-int8/tokenizer.json", 0o644),
             ("LICENSES/A.txt", 0o644),
             ("LICENSES/B.txt", 0o644),
+            ("LICENSES/TREE-SITTER-QUERIES-MIT.txt", 0o644),
             ("LICENSES/THIRD-PARTY-RUST.html", 0o644),
             ("LICENSES/THIRD-PARTY-WEB.json", 0o644),
             ("LICENSES/ZeroAIMemory-LICENSE.txt", 0o644),
@@ -1293,6 +1516,10 @@ pub(crate) mod tests {
                 ("zam-1.2.3-linux-x64/LICENSE.txt".to_string(), 0o644),
                 (
                     "zam-1.2.3-linux-x64/LICENSES/THIRD-PARTY-RUST.html".to_string(),
+                    0o644
+                ),
+                (
+                    "zam-1.2.3-linux-x64/LICENSES/TREE-SITTER-QUERIES-MIT.txt".to_string(),
                     0o644
                 ),
                 ("zam-1.2.3-linux-x64/zam".to_string(), 0o755)
@@ -1464,15 +1691,20 @@ pub(crate) mod tests {
         }
     }
 
+    fn repo() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    }
+
     /// M6 (задача 15c, ответ владельца M5.6 п. 14): упаковка без сети. В `about.toml`
     /// репозитория нет `clarify.git`; каждый `clarify.files` указывает на файл в
     /// `deploy/licenses/` с тем же SHA-256, и путь к нему в настройках для cargo-about —
     /// абсолютный (иначе cargo-about искал бы файл в каталоге крейта).
     #[test]
     fn about_config_clarifies_from_deploy_licenses_offline() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = repo();
         let text = fs::read_to_string(root.join("about.toml")).unwrap();
-        let cfg: toml::Table = resolve_about_config(&text, &root).unwrap().parse().unwrap();
+        let about = resolve_about_config(&text, &root).unwrap();
+        let cfg: toml::Table = about.text.parse().unwrap();
         let mut seen = Vec::new();
         for (krate, v) in &cfg {
             let Some(c) = v.get("clarify") else { continue };
@@ -1489,17 +1721,32 @@ pub(crate) mod tests {
                     f["checksum"].as_str().unwrap(),
                     "{krate}"
                 );
-                seen.push((krate.as_str(), p.file_name().unwrap().to_str().unwrap()));
+                seen.push(ClarifiedFile {
+                    krate: krate.clone(),
+                    path: p.to_path_buf(),
+                });
             }
         }
-        seen.sort();
-        assert_eq!(
-            seen,
-            [
-                ("tree-sitter-java", "tree-sitter-java.LICENSE"),
-                ("tree-sitter-typescript", "tree-sitter-typescript.LICENSE"),
-            ]
-        );
+        let names = |v: &[ClarifiedFile]| -> Vec<(String, String)> {
+            let mut n: Vec<(String, String)> = v
+                .iter()
+                .map(|c| {
+                    let file = c.path.file_name().unwrap().to_str().unwrap();
+                    (c.krate.clone(), file.to_string())
+                })
+                .collect();
+            n.sort();
+            n
+        };
+        let want: Vec<(String, String)> = CLARIFIED_CRATES
+            .iter()
+            .map(|(n, _)| (n.to_string(), format!("{n}.LICENSE")))
+            .collect();
+        assert_eq!(names(&seen), want);
+        // то же, что уйдёт в проверку сводки
+        assert_eq!(names(&about.clarified), want);
+        let pinned: Vec<&str> = CLARIFIED_CRATES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(about.crates, pinned);
         // остальные настройки переносятся без изменений
         let orig: toml::Table = text.parse().unwrap();
         for key in [
@@ -1527,22 +1774,45 @@ pub(crate) mod tests {
                 "[[x.clarify.files]]\npath = \"{path}\"\nchecksum = \"{sum}\"\n{extra}"
             ))
         };
-        let path_of = |text: &str| {
-            let t: toml::Table = text.parse().unwrap();
+        let path_of = |a: &AboutConfig| {
+            let t: toml::Table = a.text.parse().unwrap();
             t["x"]["clarify"]["files"][0]["path"]
                 .as_str()
                 .unwrap()
                 .to_string()
         };
-        // файл от корня репозитория — абсолютный путь
+        // файл из deploy/licenses/ — абсолютный путь, файл уходит в проверку сводки
         let ok = resolve_about_config(&files("deploy/licenses/x.LICENSE", &sum, ""), &w).unwrap();
         assert_eq!(
             Path::new(&path_of(&ok)),
             w.join("deploy/licenses/x.LICENSE")
         );
-        // файла от корня нет — путь относительно крейта, как его понимает cargo-about
-        let krate = resolve_about_config(&files("LICENSE-MIT", &sum, ""), &w).unwrap();
-        assert_eq!(path_of(&krate), "LICENSE-MIT");
+        assert_eq!(
+            ok.clarified,
+            [ClarifiedFile {
+                krate: "x".into(),
+                path: w.join("deploy/licenses/x.LICENSE")
+            }]
+        );
+        assert_eq!(ok.crates, ["x"]);
+        // M2: путь не из deploy/licenses/ — путь от крейта, как его понимает cargo-about; не
+        // меняется, даже если такой файл есть от корня репозитория (LICENSE есть и там, и там)
+        for rel in ["LICENSE-MIT", "LICENSE", "deploy/other/x.LICENSE"] {
+            let at_root = w.join(rel);
+            fs::create_dir_all(at_root.parent().unwrap()).unwrap();
+            fs::write(&at_root, b"MIT text\n").unwrap();
+            let krate = resolve_about_config(&files(rel, &sum, ""), &w).unwrap();
+            assert_eq!(path_of(&krate), rel);
+            assert!(krate.clarified.is_empty(), "{rel}");
+        }
+        // файла из deploy/licenses/ нет — ошибка с именем, а не путь от крейта
+        let e =
+            resolve_about_config(&files("deploy/licenses/nope.LICENSE", &sum, ""), &w).unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("нет файла deploy/licenses/nope.LICENSE") && e.contains("x:"),
+            "{e}"
+        );
         // текст изменён — ошибка с именем файла и обоими хэшами
         let bad = "0".repeat(64);
         let e =
@@ -1563,6 +1833,180 @@ pub(crate) mod tests {
         assert!(e.contains("clarify.git") && e.contains("x:"), "{e}");
     }
 
+    /// I2 (ревью 15c): у `clarify` нет поля версии, поэтому версии уточнённых крейтов
+    /// закреплены в [`CLARIFIED_CRATES`] и сверяются с `Cargo.lock`.
+    #[test]
+    fn clarified_crate_versions_are_pinned() {
+        let root = repo();
+        let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+        let about = fs::read_to_string(root.join("about.toml")).unwrap();
+        let about = resolve_about_config(&about, &root).unwrap();
+        check_clarified_versions(&about.crates, &CLARIFIED_CRATES, &lock).unwrap();
+        // версии названы и в комментарии about.toml — рядом с контрольными суммами
+        let text = fs::read_to_string(root.join("about.toml")).unwrap();
+        for (name, version) in CLARIFIED_CRATES {
+            assert!(
+                text.contains(&format!("{name} {version}")),
+                "{name} {version}"
+            );
+        }
+
+        let pkg = |n: &str, v: &str| format!("[[package]]\nname = \"{n}\"\nversion = \"{v}\"\n\n");
+        let pinned = [("a", "1.0.0"), ("b", "2.0.0")];
+        let crates = ["a".to_string(), "b".to_string()];
+        let ok = pkg("a", "1.0.0") + &pkg("b", "2.0.0") + &pkg("c", "9.9.9");
+        check_clarified_versions(&crates, &pinned, &ok).unwrap();
+        let err = |crates: &[String], lock: &str| {
+            format!(
+                "{:#}",
+                check_clarified_versions(crates, &pinned, lock).unwrap_err()
+            )
+        };
+        // крейт обновлён
+        let e = err(&crates, &(pkg("a", "1.0.1") + &pkg("b", "2.0.0")));
+        assert!(
+            e.contains("a — версии [1.0.1]")
+                && e.contains("1.0.0")
+                && e.contains("обновили крейт — сверьте LICENSE и SHA-256"),
+            "{e}"
+        );
+        // две версии в графе: текст уточнения приложился бы к обеим
+        let e = err(
+            &crates,
+            &(pkg("a", "1.0.0") + &pkg("a", "1.1.0") + &pkg("b", "2.0.0")),
+        );
+        assert!(e.contains("[1.0.0, 1.1.0]"), "{e}");
+        // крейта нет в графе
+        let e = err(&crates, &pkg("a", "1.0.0"));
+        assert!(e.contains("b — версии []"), "{e}");
+        // новое уточнение без закреплённой версии
+        let e = err(&["a".to_string(), "z".to_string()], &ok);
+        assert!(
+            e.contains("у z есть clarify") && e.contains("CLARIFIED_CRATES"),
+            "{e}"
+        );
+    }
+
+    /// M1 (ревью 15c): итог проверяется по самой сводке — в ней есть строки «Copyright» из
+    /// файлов уточнений крейтов этой сводки; от формулировок cargo-about проверка не зависит.
+    #[test]
+    fn clarified_notices_checked_in_summary() {
+        let w = work("clarified-notices");
+        let lic = |name: &str, text: &str| {
+            let p = w.join(name);
+            fs::write(&p, text).unwrap();
+            p
+        };
+        let a = ClarifiedFile {
+            krate: "ts-a".into(),
+            path: lic(
+                "a.LICENSE",
+                "MIT License\n\nCopyright (c) 2017 A & B <a@b>\n\ntext\n",
+            ),
+        };
+        let b = ClarifiedFile {
+            krate: "ts-b".into(),
+            path: lic(
+                "b.LICENSE",
+                "Copyright (c) 2017 First\n  Copyright (c) 2019 Second\n",
+            ),
+        };
+        let both = [a.clone(), b.clone()];
+        let page = |crates: &[&str], body: &str| {
+            let used: String = crates
+                .iter()
+                .map(|c| format!("<li>{c} 1.0.0</li>\n"))
+                .collect();
+            format!("<ul>{used}</ul>\n<pre>{body}</pre>")
+        };
+        // текст в сводке экранирован, как у шаблонизатора
+        let a_html = "Copyright (c) 2017 A &amp; B &lt;a@b&gt;";
+        let b_html = "Copyright (c) 2017 First\nCopyright (c) 2019 Second";
+        let full = page(&["ts-a", "ts-b", "other"], &format!("{a_html}\n{b_html}"));
+        check_clarified_notices(&full, &both, "сводка").unwrap();
+        // крейта нет в сводке — его строк не ждём (имя-префикс другого крейта не считается)
+        check_clarified_notices(&page(&["ts-a", "ts-b-extra"], a_html), &both, "сводка").unwrap();
+        // уточнение не сработало: в сводке шаблон без авторских прав
+        let template = "Copyright (c) &lt;year&gt; &lt;copyright holders&gt;";
+        let e = check_clarified_notices(&page(&["ts-a"], template), &both, "сводка").unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("сводка")
+                && e.contains("ts-a")
+                && e.contains("Copyright (c) 2017 A & B <a@b>"),
+            "{e}"
+        );
+        // не хватает одной из строк файла
+        let e = check_clarified_notices(
+            &page(&["ts-b"], "Copyright (c) 2017 First"),
+            &both,
+            "сводка",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("2019 Second"), "{e:#}");
+        // в файле нет строки «Copyright» — проверять нечем
+        let none = ClarifiedFile {
+            krate: "ts-a".into(),
+            path: lic("none.LICENSE", "Permission is hereby granted\n"),
+        };
+        let e = check_clarified_notices(&full, &[none], "сводка").unwrap_err();
+        assert!(format!("{e:#}").contains("нет строки «Copyright»"), "{e:#}");
+        assert_eq!(
+            html_escape("a&b<c>\"d'e`f=g"),
+            "a&amp;b&lt;c&gt;&quot;d&#x27;e&#x60;f&#x3D;g"
+        );
+
+        // настоящие файлы и шаблон: в каждом тексте есть строка «Copyright», а шаблон пишет
+        // крейт строкой `<li>имя версия</li>`, по которой проверка находит крейт в сводке
+        let root = repo();
+        let about = fs::read_to_string(root.join("about.toml")).unwrap();
+        let about = resolve_about_config(&about, &root).unwrap();
+        assert_eq!(about.clarified.len(), CLARIFIED_CRATES.len());
+        let real = page(
+            &CLARIFIED_CRATES.map(|(n, _)| n),
+            "Copyright (c) 2017 Max Brunsfeld\nCopyright (c) 2017 Ayman Nadeem",
+        );
+        check_clarified_notices(&real, &about.clarified, "сводка").unwrap();
+        assert!(
+            check_clarified_notices(
+                &page(&["tree-sitter-java"], template),
+                &about.clarified,
+                "сводка"
+            )
+            .is_err()
+        );
+        let hbs = fs::read_to_string(root.join("about.hbs")).unwrap();
+        assert!(
+            hbs.contains("<li>{{crate.name}} {{crate.version}}</li>")
+                && hbs.contains("<pre>{{text}}</pre>"),
+            "about.hbs: изменился вид строки крейта или текста — поправьте check_clarified_notices"
+        );
+    }
+
+    /// M3 (ревью 15c): cargo-about закреплённой версии; подсказка установки её называет; та же
+    /// версия ставится в CI.
+    #[test]
+    fn cargo_about_version_is_pinned() {
+        check_cargo_about_version("cargo-about 0.9.2\n").unwrap();
+        for bad in [
+            "cargo-about 0.9.3",
+            "cargo-about 0.10.0\n",
+            "cargo-about 0.9.20",
+            "",
+        ] {
+            let e = format!("{:#}", check_cargo_about_version(bad).unwrap_err());
+            assert!(
+                e.contains("cargo install cargo-about@0.9.2 --locked --features cli"),
+                "{bad:?}: {e}"
+            );
+        }
+        let ci = fs::read_to_string(repo().join(".github/workflows/package.yml")).unwrap();
+        assert!(
+            ci.contains(&format!("tool: cargo-about@{CARGO_ABOUT_VERSION}")),
+            "package.yml ставит другую версию cargo-about"
+        );
+    }
+
     /// Предупреждение cargo-about 0.9.2 о несработавшем `clarify` (он завершается с кодом 0) —
     /// ошибка упаковки; прочие предупреждения — нет.
     #[test]
@@ -1577,6 +2021,120 @@ pub(crate) mod tests {
         let out = format!("{other}\n{warn}\n");
         assert_eq!(clarify_failures(&out), [warn]);
         assert!(clarify_failures(other).is_empty());
+    }
+
+    /// Пакет выпускаемого клиента `zam`.
+    const CLI_PACKAGE: &str = "zam-cli";
+
+    /// Команды `cargo build --release` текста (workflow CI, инструкция): пакеты `-p` каждой,
+    /// признак «весь workspace» (`--workspace` или команда без `-p`) и сама команда. Перенос
+    /// строки `\` склеивается.
+    fn release_builds(text: &str) -> Vec<(Vec<String>, bool, String)> {
+        let joined = text.replace("\\\r\n", " ").replace("\\\n", " ");
+        let mut out = Vec::new();
+        for line in joined.lines() {
+            for cmd in line.split("cargo build").skip(1) {
+                let cmd = cmd.split(['&', ';', '|', '#', '`']).next().unwrap();
+                let toks: Vec<&str> = cmd.split_whitespace().collect();
+                if !toks.iter().any(|t| matches!(*t, "--release" | "-r")) {
+                    continue;
+                }
+                let mut packages = Vec::new();
+                for (n, t) in toks.iter().enumerate() {
+                    if matches!(*t, "-p" | "--package") {
+                        packages.extend(toks.get(n + 1).map(|p| p.to_string()));
+                    } else if let Some(p) = t.strip_prefix("--package=").or(t.strip_prefix("-p=")) {
+                        packages.push(p.to_string());
+                    }
+                }
+                let workspace = packages.is_empty()
+                    || toks.iter().any(|t| matches!(*t, "--workspace" | "--all"));
+                out.push((
+                    packages,
+                    workspace,
+                    format!("cargo build {}", toks.join(" ")),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Команды `cargo build --release`, собирающие `zam-cli` в одной команде с другим пакетом
+    /// (или весь workspace).
+    fn joint_cli_builds(text: &str) -> Vec<String> {
+        release_builds(text)
+            .into_iter()
+            .filter(|(p, ws, _)| *ws || (p.iter().any(|p| p == CLI_PACKAGE) && p.len() > 1))
+            .map(|(_, _, cmd)| cmd)
+            .collect()
+    }
+
+    /// I1 (ревью 15c): выпускаемый `zam` собирается отдельной командой `cargo build -p zam-cli`.
+    /// В одной команде с `zam-server` cargo объединяет фичи общих крейтов, и в `zam` попадают
+    /// зависимости, которых нет в сводке лицензий архива клиента (она строится по манифесту
+    /// `zam-cli`, [`CLI_MANIFEST`]). Проверяются все workflow CI и инструкции по сборке.
+    #[test]
+    fn release_cli_is_built_separately() {
+        let cmds = |text: &str| joint_cli_builds(text);
+        assert_eq!(
+            cmds("  run: cargo build --release -p zam-server -p zam-cli\n"),
+            ["cargo build --release -p zam-server -p zam-cli"]
+        );
+        assert_eq!(
+            cmds("cargo build -p zam-cli \\\n  --release --package=zam-server # вместе\n").len(),
+            1
+        );
+        assert_eq!(cmds("cargo build --release\n").len(), 1);
+        assert_eq!(cmds("cargo build --workspace --release\n").len(), 1);
+        assert_eq!(
+            cmds("cargo build -r -p zam-cli -p zam-core && echo ok\n").len(),
+            1
+        );
+        let ok = "cargo build --release -p zam-server\n\
+                  cargo build --release -p zam-cli --target x86_64-unknown-linux-musl\n\
+                  cargo build -p zam-server -p zam-cli\n\
+                  cargo build --release -p zam-index --example index_bench\n";
+        assert!(cmds(ok).is_empty(), "{:?}", cmds(ok));
+
+        let root = repo();
+        let mut files = vec![
+            root.join("README.md"),
+            root.join("deploy/README-install.md"),
+        ];
+        let wf = root.join(".github/workflows");
+        for e in fs::read_dir(&wf).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_some_and(|x| x == "yml" || x == "yaml") {
+                files.push(p);
+            }
+        }
+        assert!(files.len() >= 5, "{files:?}");
+        for f in &files {
+            let bad = joint_cli_builds(&fs::read_to_string(f).unwrap());
+            assert!(
+                bad.is_empty(),
+                "{}: zam-cli собирается вместе с другим пакетом — в zam попадут зависимости вне \
+                 сводки лицензий архива клиента; соберите отдельной командой \
+                 `cargo build --release -p zam-cli`: {bad:?}",
+                f.display()
+            );
+        }
+        // проверка не пустая: package.yml собирает клиент отдельно — для архива Windows, для
+        // архива Linux (musl) и для раздачи сервером другой платформы
+        let pkg = fs::read_to_string(wf.join("package.yml")).unwrap();
+        let alone: Vec<String> = release_builds(&pkg)
+            .into_iter()
+            .filter(|(p, ws, _)| !ws && p == &[CLI_PACKAGE.to_string()])
+            .map(|(_, _, c)| c)
+            .collect();
+        assert!(alone.len() >= 3, "{alone:?}");
+        assert!(
+            alone
+                .iter()
+                .any(|c| c.contains("x86_64-unknown-linux-musl")),
+            "{alone:?}"
+        );
+        assert!(alone.iter().any(|c| !c.contains("--target")), "{alone:?}");
     }
 
     #[test]

@@ -574,9 +574,13 @@ runtime ищется через vswhere или задаётся в `ZAM_VC_CRT_D
 cargo xtask fetch-deps --platform windows-x64      # Qdrant, ONNX Runtime CPU и GPU, pdfium → target/deps/
 cargo xtask fetch-models --test                    # тестовая модель MiniLM → target/models/
 cargo test --workspace
-cargo build --release -p zam-server -p zam-cli
+cargo build --release -p zam-server
+cargo build --release -p zam-cli                   # отдельной командой, см. ниже
 ```
 
+- `zam` для выпуска собирается отдельной командой: в одной команде с `zam-server` cargo
+  объединяет фичи общих крейтов, и в `zam` попадают зависимости сервера, которых нет в сводке
+  лицензий архива клиента (тест `release_cli_is_built_separately` в `xtask`).
 - Тесты ML и индекса пропускаются, если нет ONNX Runtime или модели. С `ZAM_REQUIRE_ML=1`
   (так в CI) они вместо этого падают.
 - Интеграционные тесты запускают настоящий Qdrant из `target/deps`, Docker не нужен.

@@ -30,7 +30,13 @@ targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-unknown
 # cargo-about ищет `clarify.files` в каталоге самого крейта (в реестре cargo), поэтому
 # `cargo xtask package` передаёт ему копию этого файла, где путь, существующий от корня
 # репозитория, заменён абсолютным (`package::resolve_about_config`). Прямой запуск
-# `cargo about generate` с этим файлом такие пути не найдёт.
+# `cargo about generate` с этим файлом такие пути не найдёт. Переписываются только пути с началом
+# `deploy/licenses/`; прочие — пути от крейта, как их понимает cargo-about.
+#
+# У `clarify` нет поля версии: тексты сверены для tree-sitter-typescript 0.23.2 и
+# tree-sitter-java 0.23.5. Версии закреплены в `package::CLARIFIED_CRATES` (xtask сверяет их с
+# Cargo.lock): обновили крейт — сверьте LICENSE репозитория на коммите пакета, SHA-256 здесь и
+# файл в `deploy/licenses/`.
 [tree-sitter-typescript.clarify]
 license = "MIT"
 
