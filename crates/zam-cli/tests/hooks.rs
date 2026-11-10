@@ -1884,6 +1884,10 @@ fn ref_state(idx: &Value, path: &str) -> Vec<String> {
 
 /// Правка файла уходит очередью `POST /files/changed` из `prompt`: ссылка `stale`, очередь
 /// пуста; `session-start` кэширует индекс `file-refs.json` (ETag), `Read` показывает знание.
+/// Тест содержимого: хуки с живым сервером идут со щедрым бюджетом ([`hook_slow`]) — на занятой
+/// машине отладочная сборка не доходит до запроса за 70–220 мс (запуск потока — до кванта
+/// планировщика, каждая операция с файлом очереди — десятки мс), и это свойство машины, а не
+/// порядка отправки; бюджеты меряют `m4_acceptance::hook_budgets` (release) и тесты времени.
 #[test]
 fn prompt_flushes_changed_queue() {
     let _g = serial();
@@ -1908,7 +1912,7 @@ fn prompt_flushes_changed_queue() {
     assert_eq!(ref_state(&file_refs_index(&p), "src/pool.rs"), ["ok"]);
     // session-start: индекс в кэш
     let ss = p.ev("SessionStart", "fl", json!({"source": "startup"}));
-    let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+    ok(&hook_slow(&p, &url, "session-start", &ss));
     let cache: Value =
         serde_json::from_str(&std::fs::read_to_string(p.cache().join("file-refs.json")).unwrap())
             .unwrap();
@@ -1921,7 +1925,7 @@ fn prompt_flushes_changed_queue() {
         "Read",
         json!({"file_path": p.repo.join("src/pool.rs")}),
     );
-    let (o, _) = p.hook_at(&url, "post-tool", "claude", read.to_string().as_bytes());
+    let o = hook_slow(&p, &url, "post-tool", &read);
     assert!(
         context(&o, "PostToolUse").contains(&format!("Пул соединений течёт [insight] — i:{id}"))
     );
@@ -1933,20 +1937,29 @@ fn prompt_flushes_changed_queue() {
         "Edit",
         json!({"file_path": p.repo.join("src/pool.rs")}),
     );
-    let _ = p.hook_at(&url, "post-tool", "claude", edit.to_string().as_bytes());
+    ok(&hook_slow(&p, &url, "post-tool", &edit));
     assert_eq!(queue(&p, "fl").len(), 1);
     let pr = p.ev("UserPromptSubmit", "fl", json!({"prompt": "что с пулом"}));
-    let _ = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
-    assert!(queue(&p, "fl").is_empty(), "очередь отправлена");
+    ok(&hook_slow(&p, &url, "prompt", &pr));
+    assert!(
+        queue(&p, "fl").is_empty(),
+        "очередь отправлена: {}",
+        p.log()
+    );
     assert_eq!(ref_state(&file_refs_index(&p), "src/pool.rs"), ["stale"]);
     // сервер недоступен — очередь остаётся до следующего раза
     std::fs::write(p.repo.join("src/pool.rs"), b"v1\n").unwrap();
-    let _ = p.hook_at(&url, "post-tool", "claude", edit.to_string().as_bytes());
+    ok(&hook_slow(&p, &url, "post-tool", &edit));
+    // недоступный сервер — с бюджетом продукта: отказ соединения ждать дольше незачем
     let _ = p.hook_at(DEAD, "prompt", "claude", pr.to_string().as_bytes());
     assert_eq!(queue(&p, "fl").len(), 1, "ошибка — очередь цела");
     let stop = p.ev("Stop", "fl", json!({"stop_hook_active": false}));
-    let _ = p.hook_at(&url, "checkpoint", "claude", stop.to_string().as_bytes());
-    assert!(queue(&p, "fl").is_empty(), "checkpoint отправил");
+    ok(&hook_slow(&p, &url, "checkpoint", &stop));
+    assert!(
+        queue(&p, "fl").is_empty(),
+        "checkpoint отправил: {}",
+        p.log()
+    );
     assert_eq!(
         ref_state(&file_refs_index(&p), "src/pool.rs"),
         ["ok"],
@@ -2057,7 +2070,8 @@ fn session_start_flushes_all_queues_in_one_request() {
         );
     }
     let ss = p.ev("SessionStart", "q-new", json!({"source": "startup"}));
-    let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+    // содержимое («один запрос на все очереди») — со щедрым бюджетом; бюджет — во второй части
+    ok(&hook_slow(&p, &url, "session-start", &ss));
     let s = seen.lock().unwrap().clone();
     let posts: Vec<&Value> = s
         .iter()
@@ -3450,6 +3464,61 @@ fn changed_flush_partial_failure_returns_rest() {
         both.sort();
         assert_eq!(both, all, "{name}: первая пачка снята, остаток возвращён");
     }
+}
+
+/// Бюджет хука вышел **после** разбора очереди (замки, rename, чтение — на занятом диске десятки
+/// мс; подмена `ZAM_TEST_FLUSH_STALL_MS`): запроса нет, очередь возвращена на место, причина —
+/// строкой в `hooks.log` (раньше эта ветка молчала: «очередь не ушла» без единой строки);
+/// следующий хук очередь отправляет.
+#[test]
+fn changed_flush_budget_spent_after_take_is_logged() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"stale":0,"text":""}"#, Duration::ZERO);
+    let p = Proj::new("flush-stall", &url, "zam_x");
+    let s = "fs-1";
+    put_queue(&p, s, &[("src/a.rs".into(), 'a'), ("src/b.rs".into(), 'b')]);
+    let pr = p.ev("UserPromptSubmit", s, json!({"prompt": ""}));
+    let posts = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+            .count()
+    };
+    // щедрый бюджет (3 с) — до очереди хук доходит при любой занятости машины; пауза дольше его
+    let o = p
+        .cmd(&url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+        .env("ZAM_TEST_FLUSH_STALL_MS", "3100")
+        .args(["hook", "prompt", "--agent", "claude"])
+        .write_stdin(pr.to_string().into_bytes())
+        .output()
+        .unwrap();
+    empty(&o);
+    let log = p.log();
+    assert_eq!(posts(), 0, "{log}");
+    assert_eq!(queue(&p, s).len(), 2, "очередь возвращена: {log}");
+    assert_eq!(
+        log.matches("files/changed: очередь не отправлена — остаток бюджета меньше 15 мс")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        log.contains("очередь разобрана, возвращено путей: 2)"),
+        "{log}"
+    );
+    // без паузы — тот же хук очередь отправляет
+    let o = p
+        .cmd(&url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+        .args(["hook", "prompt", "--agent", "claude"])
+        .write_stdin(pr.to_string().into_bytes())
+        .output()
+        .unwrap();
+    empty(&o);
+    assert_eq!(posts(), 1, "{}", p.log());
+    assert!(queue(&p, s).is_empty(), "{}", p.log());
 }
 
 // ---- эпохи `session_seen` (M6 §7.2, задача 7a) ----
@@ -5990,6 +6059,12 @@ fn late_snapshot_thread_after_response_is_not_put_timeout() {
 /// Повторное ревью 17b (`prompt_flushes_changed_queue`): решение о снимке и снимок — вне пути
 /// сетевой части `checkpoint`. Подмена `<журнал>.decide-stall-ms` усыпляет поток снимка до
 /// решения на 30 с: очередь изменённых файлов всё равно уходит в бюджете хука, хук не ждёт поток.
+///
+/// Бюджет хука — 4 с (`ZAM_TEST_HOOK_BUDGET_MS`), пауза решения — 30 с: решение на главном пути
+/// съело бы бюджет целиком (очередь не ушла бы, хук шёл бы 30 с), а занятая машина в него
+/// укладывается. С бюджетом продукта (70 мс на HTTP) тест путал одно с другим: на занятом диске
+/// одна операция с файлом очереди стоит до 1,5 с (замер под нагрузкой, журнал M6), и очередь не
+/// уходила без всякого участия потока снимка. Бюджеты меряют тесты времени и `hook_budgets`.
 #[test]
 fn snapshot_decision_never_delays_changed_flush() {
     let _g = serial();
@@ -6009,19 +6084,19 @@ fn snapshot_decision_never_delays_changed_flush() {
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
     std::fs::write(format!("{}.decide-stall-ms", t.display()), STALL_MS).unwrap();
-    let warm = snap_ev(
-        &p,
-        "Stop",
-        "ds-warm",
-        &t,
-        json!({"stop_hook_active": false}),
-    );
-    let _ = p.hook_at(&url, "checkpoint", "claude", warm.to_string().as_bytes());
     let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
-    let (o, d) = p.hook_at(&url, "checkpoint", "claude", stop.to_string().as_bytes());
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_HOOK_BUDGET_MS", "4000")
+        .args(["hook", "checkpoint", "--agent", "claude"])
+        .write_stdin(stop.to_string().into_bytes());
+    let t0 = Instant::now();
+    let o = c.output().unwrap();
+    let d = t0.elapsed();
     ok(&o);
+    // хук не ждёт поток снимка: опоздавшему он отдаёт остаток бюджета (4 с) и выходит — задолго
+    // до конца паузы решения (30 с); запас 4 с — запуск и выход процесса на занятой машине
     assert!(
-        d <= max_for("checkpoint"),
+        d <= Duration::from_millis(8000),
         "поток снимка задержал хук: {d:?}"
     );
     let sent = seen
