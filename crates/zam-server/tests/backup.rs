@@ -2162,3 +2162,300 @@ async fn backup_zip_refuses_when_stage_busy() {
     assert!(zip.is_file());
     stop(a).await;
 }
+
+// ---------------------------------------------------------------- привязки к машине (18c)
+
+/// Имя «старой машины» в заголовках атрибуции корпуса привязок.
+const OLD_MACHINE: &str = "win-old-box-18c";
+
+/// Убирает из JSON все поля `machine` (атрибуция, как столбцы `machine`, §12б.1).
+fn strip_machine(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            m.remove("machine");
+            m.values_mut().for_each(strip_machine);
+        }
+        Value::Array(a) => a.iter_mut().for_each(strip_machine),
+        _ => {}
+    }
+}
+
+/// Текстовые ячейки баз каталога данных `root` (`system.db`, `users/*.db`), содержащие одну из
+/// `needles`: «файл таблица.столбец: начало значения». Столбцы `machine` и поля `machine`
+/// JSON-ячеек — атрибуция, не привязка (§12б.1); виртуальные таблицы пропускаются (их данные —
+/// в теневых таблицах). Та же проверка — `cargo xtask transfer-check bindings`.
+fn machine_bindings(root: &Path, needles: &[String]) -> Vec<String> {
+    let mut dbs = vec![root.join("system.db")];
+    dbs.extend(
+        tree(&root.join("users"))
+            .into_iter()
+            .filter(|p| p.ends_with(".db"))
+            .map(|p| root.join("users").join(p)),
+    );
+    let found = |s: &str| needles.iter().any(|n| s.contains(n.as_str()));
+    let mut hits = Vec::new();
+    for db in dbs {
+        let c = sqlite(&db);
+        let tables: Vec<String> = c
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND coalesce(sql, '') NOT LIKE 'CREATE VIRTUAL%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for t in tables {
+            let cols: Vec<String> = c
+                .prepare(&format!("SELECT name FROM pragma_table_info('{t}')"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for col in cols.iter().filter(|c| c.as_str() != "machine") {
+                let sql = format!("SELECT \"{col}\" FROM \"{t}\" WHERE typeof(\"{col}\") = 'text'");
+                let mut st = c.prepare(&sql).unwrap();
+                let vals: Vec<String> = st
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                for s in vals.into_iter().filter(|s| found(s)) {
+                    if let Ok(mut v) = serde_json::from_str::<Value>(&s) {
+                        strip_machine(&mut v);
+                        if !found(&v.to_string()) {
+                            continue;
+                        }
+                    }
+                    let head: String = s.chars().take(160).collect();
+                    hits.push(format!(
+                        "{} {t}.{col}: {head}",
+                        db.file_name().unwrap().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// Формы записи пути `p` в тексте: как есть, через `/`, с удвоенным `\` (экранирование JSON).
+fn path_forms(p: &Path) -> Vec<String> {
+    let s = p.to_string_lossy().into_owned();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+    let mut v = vec![s.replace('\\', "/"), s.replace('\\', r"\\"), s];
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// §12б.1, §17 п. 24 (задача 18c): копия сервера с корпусом всех видов (заметки, вложения PDF и
+/// DOCX, Vault с раскрытием, идеи, задачи, вопросы, словарь, insight, отчёт с картинкой, карта
+/// кода, сессия, запросы доступа других пользователей), снятая при работающем сервере, после
+/// `restore` в другой каталог не содержит ни в одной текстовой ячейке баз, кроме атрибуции
+/// `machine`, абсолютного пути `data_dir` старой машины и её имени; базы — `integrity_check` ok.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_has_no_machine_bindings() {
+    let _g = CHUNKER.read().await;
+    let pdfium = common::attach::pdfium();
+    let with_pdf = pdfium.is_some();
+    let a = api("bind-src", |c| c.docs.pdfium_dylib = pdfium).await;
+    common::heavy::load(&a, &common::heavy::spec("sh-01")).await;
+    let sol = common::heavy::SOL;
+    let h = [
+        ("x-zam-session", "bind-sess-1"),
+        ("x-zam-machine", OLD_MACHINE),
+    ];
+    // заметка с вложениями PDF и DOCX
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": "knowledge", "path": "docs/handbook", "kind": "note",
+                        "content": "# Справочник\n\nСборка — cargo build.\n"}),
+            ),
+            &h,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let node = r.json()["id"].as_str().unwrap().to_string();
+    let pdf = zam_docs::test_pdf::build(&[zam_docs::test_pdf::Page::default().line(
+        72.0,
+        700.0,
+        "The obsidian heron delivered copper kettles.",
+    )]);
+    common::attach::upload(&a, &a.token, &node, "handbook.pdf", &pdf).await;
+    let docx = common::attach::docx(&["The vermilion otter archived glass marbles."]);
+    common::attach::upload(&a, &a.token, &node, "handbook.docx", &docx).await;
+    // секрет Vault решения и его раскрытие (аудит `vault.reveal` с машиной)
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/spaces/{sol}/vault"),
+            Some(json!({"title": "deploy-key", "data": {"type": "token"},
+                        "secret": "zv-bind-c2VjcmV0-k9"})),
+            &h,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let vid = r.json()["id"].as_str().unwrap().to_string();
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::GET,
+            &format!("/api/v1/vault/{vid}?reveal=1"),
+            None,
+            &h,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // идея и insight с машиной в атрибуции
+    for body in [
+        json!({"kind": "idea", "title": "Перенос памяти", "body": "Проверить переезд.",
+               "data": {"origin": "agent"}}),
+        json!({"kind": "insight", "title": "Переезд", "body": "Ключ — отдельно.",
+               "data": {"kind": "gotcha"}, "force": true}),
+    ] {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                &format!("/api/v1/spaces/{sol}/entries"),
+                Some(body),
+                &h,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    // отчёт с картинкой (multipart, как `zam report`)
+    let meta = json!({"title": "Отчёт переезда", "body": "# Итог\n\n![loss](figs/loss.png)\n"});
+    let png = common::reports::png(3, 300);
+    let mut rb = axum::http::Request::post(format!("/api/v1/spaces/{sol}/entries"))
+        .header("authorization", format!("Bearer {}", a.token))
+        .header(
+            "content-type",
+            format!(
+                "multipart/form-data; boundary={}",
+                common::reports::BOUNDARY
+            ),
+        );
+    for (k, v) in h {
+        rb = rb.header(k, v);
+    }
+    let body = common::reports::multipart(&meta, &[("figs/loss.png", &png)]);
+    let r = a.send(rb.body(axum::body::Body::from(body)).unwrap()).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // поиск в сессии (сессия с машиной)
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "сборка"})),
+            &h,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // разбор вложений — до копии (ошибки разбора — тоже текст базы)
+    let user = uid(&a);
+    let mut files = vec!["handbook.docx"];
+    if with_pdf {
+        files.push("handbook.pdf");
+    }
+    let nid: Id = node.parse().unwrap();
+    let t0 = Instant::now();
+    loop {
+        let docs = zam_store::list_attachments(&common::attach::db(&a, user).await, nid)
+            .await
+            .unwrap();
+        let state = |f: &str| {
+            docs.iter()
+                .find(|d| d.filename == f)
+                .map(|d| (d.extract_state, d.extract_error.clone()))
+        };
+        if files
+            .iter()
+            .all(|f| state(f).is_some_and(|s| s.0 == zam_store::ExtractState::Done))
+        {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(180),
+            "вложения не разобраны: {:?}",
+            files.iter().map(|f| (f, state(f))).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let cfg = cfg_of(&a);
+    let rep = run_backup(&cfg, BackupOpts::default()).await.unwrap();
+    stop(a).await;
+    let m = read_manifest(&rep.path);
+    let dst = dst_cfg("bind-dst");
+    restore(&dst, &rep.path, &RestoreOpts::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut needles = path_forms(&cfg.data_dir);
+    if let Ok(c) = cfg.data_dir.canonicalize() {
+        needles.extend(path_forms(&c));
+    }
+    needles.push(OLD_MACHINE.to_string());
+    // имя этой машины (источник копии), если не короче 4 символов (иначе совпадения слов)
+    if let Some(src) = m.source_machine.filter(|s| s.chars().count() >= 4) {
+        needles.push(src);
+    }
+    needles.sort();
+    needles.dedup();
+    let hits = machine_bindings(&dst.data_dir, &needles);
+    assert!(
+        hits.is_empty(),
+        "привязки к старой машине ({needles:?}):\n{}",
+        hits.join("\n")
+    );
+    // атрибуция `machine` при этом сохранена — проверка не пустая
+    let udb = dst.data_dir.join("users").join(format!("{user}.db"));
+    assert!(
+        count(
+            &udb,
+            &format!("SELECT count(*) FROM revisions WHERE machine = '{OLD_MACHINE}'")
+        ) > 0
+    );
+    assert!(
+        count(
+            &udb,
+            &format!("SELECT count(*) FROM entry_revisions WHERE machine = '{OLD_MACHINE}'")
+        ) > 0
+    );
+    for p in tree(&dst.data_dir.join("users"))
+        .iter()
+        .filter(|p| p.ends_with(".db"))
+    {
+        let ok: String = sqlite(&dst.data_dir.join("users").join(p))
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ok, "ok", "{p}");
+    }
+    // контроль проверки: путь старой машины в тексте записи и имя машины в JSON вне поля
+    // `machine` находятся
+    let c = rusqlite::Connection::open(&udb).unwrap();
+    c.execute(
+        "UPDATE entries SET body = body || ?1 WHERE rowid = (SELECT min(rowid) FROM entries)",
+        [format!(" см. {}", needles[0])],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO meta(key, value) VALUES ('tc-18c-control', ?1)",
+        [json!({"machine": OLD_MACHINE, "host": OLD_MACHINE}).to_string()],
+    )
+    .unwrap();
+    drop(c);
+    let hits = machine_bindings(&dst.data_dir, &needles);
+    assert_eq!(hits.len(), 2, "{hits:?}");
+}

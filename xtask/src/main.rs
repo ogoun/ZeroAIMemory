@@ -12,6 +12,7 @@ mod manifest;
 mod package;
 mod procjob;
 mod smoke;
+mod transfer_check;
 
 use std::path::{Path, PathBuf};
 
@@ -129,6 +130,10 @@ enum Cmd {
     /// .tmp/m56/bench/repo, синхронизации, карта 200/500/1000/2000, ключевые типы в центральных,
     /// `zam --version` и запуск фоновой синхронизации (p95); отчёт .tmp/m56/bench/report.json
     CodeBench(code_bench::CodeBenchArgs),
+    /// Проверка переезда на другую машину (M6 §12б.6, задача 18c): seed — корпус и ожидания
+    /// на старом сервере, verify — те же данные на новом после restore (--no-key — без
+    /// мастер-ключа), bindings — базы без прежнего data_dir и имени машины
+    TransferCheck(transfer_check::TransferCheckArgs),
     /// Набор документов eval/docs/ (спецификация M5 §6): DOCX, XLSX, PPTX, PDF и враждебные
     /// файлы детерминированно из сида; бинарники не в git
     DocsCorpus(docs_corpus::DocsCorpusArgs),
@@ -530,6 +535,7 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::DocsExtract(a) => eval::docs::extract::child_main(a, &repo_root()),
         Cmd::Bench(a) => bench::main(a, &repo_root()),
         Cmd::CodeBench(a) => code_bench::main(a, &repo_root()),
+        Cmd::TransferCheck(a) => transfer_check::main(a, &repo_root()),
     }
 }
 
