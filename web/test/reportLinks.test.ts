@@ -551,7 +551,7 @@ test('reportLinkClickable: кликабельный vscode://file/… разбо
   }
   // случайные адреса из кусков (фиксированное зерно): ни один кликабельный после разбора URL не
   // получает путь, начинающийся с `//`, пустой путь или путь, отличный от написанного
-  const parts = ['.', '..', '%2e', '%2E', '%2F', '%2f', '%5C', '%5c', '%25', '%252E', '\\', '/', '/', '?', '#', 'a', 'x', 'C:', 'b.rs'];
+  const parts = ['.', '..', '%2e', '%2E', '%2F', '%2f', '%5C', '%5c', '%25', '%252E', '\\', '/', '/', '?', '#', 'a', 'x', 'C:', 'b.rs', '%252F', '%255c', '2F', '2e', '5C', '20'];
   let x = 0x15a_2026;
   const next = () => {
     x ^= x << 13;
@@ -580,9 +580,20 @@ test('reportLinkClickable: кликабельный vscode://file/… разбо
     assert.equal(parsed, written, t);
     assert.ok(!parsed.startsWith('//') && parsed !== '/' && parsed !== '', `${t} → ${parsed}`);
     // и прочтение редактора (раскрыть %XX, `\` → `/`) не даёт сетевого пути и сегментов `..`
-    const opened = decodeURIComponent(parsed.replace(/%(?![0-9a-f]{2})/gi, '%25')).replace(/\\/g, '/');
+    const decode = (v: string) => {
+      try {
+        return decodeURIComponent(v.replace(/%(?![0-9a-f]{2})/gi, '%25'));
+      } catch {
+        return v;
+      }
+    };
+    const opened = decode(parsed).replace(/\\/g, '/');
     assert.ok(!opened.startsWith('//'), `${t} → ${opened}`);
     assert.ok(!opened.split('/').some((s) => s === '.' || s === '..'), `${t} → ${opened}`);
+    // и двойное раскрытие `%XX` (страховка: `%252F` → `%2F` → `/`)
+    const twice = decode(decode(parsed)).replace(/\\/g, '/');
+    assert.ok(!twice.startsWith('//'), `${t} → ${twice}`);
+    assert.ok(!twice.split('/').some((s) => s === '.' || s === '..'), `${t} → ${twice}`);
   }
   // выборка содержательна: есть и кликабельные, и отказы, и адреса, которые разборщик меняет
   assert.ok(clickable > 3000 && refused > 3000 && changed > 3000, `${clickable}/${refused}/${changed}`);

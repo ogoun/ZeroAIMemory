@@ -119,10 +119,10 @@ export function reportLinkClickable(target: string): boolean {
  * сегментов `.` и `..` путь не меняет никто, и достаточно непустого первого сегмента.
  */
 function vscodePathPlain(path: string): boolean {
-  const plain = path
-    .replace(/[?#].*$/s, '')
-    .replace(/%2f|%5c|\\/gi, '/')
-    .replace(/%2e/gi, '.');
+  const own = path.replace(/[?#].*$/s, '');
+  // страховка от двойного раскрытия `%XX`: `%252F`, `%255C`, `%252E` — как в `zam_core::link`
+  if (/%25(2f|5c|2e)/i.test(own)) return false;
+  const plain = own.replace(/%2f|%5c|\\/gi, '/').replace(/%2e/gi, '.');
   return plain !== '' && !plain.startsWith('/') && !plain.split('/').some((s) => s === '.' || s === '..');
 }
 

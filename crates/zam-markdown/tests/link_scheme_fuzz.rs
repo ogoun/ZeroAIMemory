@@ -107,7 +107,7 @@ fn clickable_vscode_path_survives_url_parser() {
     }
     const PARTS: &[&str] = &[
         ".", "..", "%2e", "%2E", "%2F", "%2f", "%5C", "%5c", "%25", "%252E", "\\", "/", "/", "?",
-        "#", "a", "x", "C:", "b.rs",
+        "#", "a", "x", "C:", "b.rs", "%252F", "%255c", "2F", "2e", "5C", "20",
     ];
     let mut rng = Rng(0x15A_2026);
     let (mut clickable, mut refused, mut changed) = (0u32, 0u32, 0u32);
@@ -142,6 +142,21 @@ fn clickable_vscode_path_survives_url_parser() {
         assert!(
             !opened.split('/').any(|s| s == "." || s == ".."),
             "{t} → {opened}"
+        );
+        // и двойное раскрытие `%XX` (страховка: `%252F` → `%2F` → `/`)
+        let twice = parsed
+            .replace("%25", "%")
+            .replace("%2F", "/")
+            .replace("%2f", "/")
+            .replace("%5C", "/")
+            .replace("%5c", "/")
+            .replace("%2E", ".")
+            .replace("%2e", ".")
+            .replace('\\', "/");
+        assert!(!twice.starts_with("//"), "{t} → {twice}");
+        assert!(
+            !twice.split('/').any(|s| s == "." || s == ".."),
+            "{t} → {twice}"
         );
     }
     assert!(

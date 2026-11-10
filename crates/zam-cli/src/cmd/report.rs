@@ -885,6 +885,9 @@ struct Scanner<'a> {
     line_brackets: (usize, usize, i32),
     /// Для [`inline_html`]: концы абзацев, в которых закрывающей последовательности дальше нет.
     html_miss: [usize; 6],
+    /// Для комментария HTML: конец абзаца, откуда искали, и первый годный конец `-->` оттуда
+    /// (начало серии дефисов и позиция за `>`); `None` — годного конца в абзаце дальше нет.
+    comment_end: (usize, usize, Option<(usize, usize)>),
     /// Конец абзаца, до которого нет закрывающего `$` формулы: второй раз до конца абзаца его
     /// не ищут (непарный знак в каждой строке длинной таблицы).
     math_miss: usize,
@@ -922,6 +925,7 @@ impl<'a> Scanner<'a> {
             out: Vec::new(),
             line_brackets: (0, 0, 0),
             html_miss: [0; 6],
+            comment_end: (0, 0, None),
             math_miss: 0,
             bracket_pairs: HashMap::new(),
         }
@@ -1143,7 +1147,7 @@ impl<'a> Scanner<'a> {
                 .push(String::from_utf8_lossy(&rest[1..k]).into_owned());
             return i + k + 1;
         }
-        match inline_html(rest, end, &mut self.html_miss) {
+        match inline_html(rest, end, &mut self.html_miss, &mut self.comment_end) {
             Some(n) => {
                 steps(n);
                 i + n
@@ -1356,8 +1360,13 @@ fn is_autolink(s: &[u8]) -> bool {
 /// атрибутами, закрывающий тег, комментарий `<!-- … -->`, инструкция `<? … ?>`, объявление
 /// `<!NAME … >`, `<![CDATA[ … ]]>`. `None` — не HTML: `<` — обычный текст. `s` — до конца абзаца
 /// `para`; `miss` помнит, каких закрывающих последовательностей в этом абзаце дальше нет
-/// (второй раз до конца абзаца их не ищут).
-fn inline_html(s: &[u8], para: usize, miss: &mut [usize; 6]) -> Option<usize> {
+/// (второй раз до конца абзаца их не ищут), `comment` — первый годный конец комментария.
+fn inline_html(
+    s: &[u8],
+    para: usize,
+    miss: &mut [usize; 6],
+    comment: &mut (usize, usize, Option<(usize, usize)>),
+) -> Option<usize> {
     let mut until = |kind: usize, from: usize, close: &[u8]| -> Option<usize> {
         if miss[kind] == para {
             return None;
@@ -1371,19 +1380,19 @@ fn inline_html(s: &[u8], para: usize, miss: &mut [usize; 6]) -> Option<usize> {
     };
     let space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
     match s.get(1)? {
-        b'!' if s[2..].starts_with(b"--") => {
-            if s[4..].starts_with(b">") {
-                return Some(5);
+        b'!' if s[2..].starts_with(b"--") => html_comment_len(s, para, comment),
+        // CDATA — как в разборе сервера (`cdata`): конец `]]>` — после серии `]` годной длины;
+        // годность от начала не зависит, поэтому промах запоминается на абзац
+        b'!' if s[2..].starts_with(b"[CDATA[") => {
+            if miss[1] == para {
+                return None;
             }
-            if s[4..].starts_with(b"->") {
-                return Some(6);
+            let end = closing_run(s, 9, b']').map(|(_, end)| end);
+            if end.is_none() {
+                miss[1] = para;
             }
-            // закрывающая `-->` в абзаце вообще есть (иначе второй раз не ищем) — и разбор
-            // сервера доходит именно до неё
-            until(0, 4, b"-->")?;
-            html_comment_end(s)
+            end
         }
-        b'!' if s[2..].starts_with(b"[CDATA[") => until(1, 9, b"]]>"),
         // объявление — как в разборе сервера (comrak 0.56, `declaration`): заглавные буквы,
         // затем пробельный символ; `<!D<ftp://q.org>` — не объявление, а текст и автоссылка
         b'!' if s.get(2).is_some_and(u8::is_ascii_uppercase) => {
@@ -1454,26 +1463,65 @@ fn inline_html(s: &[u8], para: usize, miss: &mut [usize; 6]) -> Option<usize> {
     }
 }
 
-/// Конец комментария HTML в начале `s` (`<!--…`) — как `htmlcomment` разбора сервера (comrak
-/// 0.56): текст комментария — куски «не дефис», «дефис и не дефис», «два дефиса и не `>`»; конец
-/// — `-->` на границе куска. Поэтому `<!--a<!---->` комментарием не кончается: `---` — один
-/// кусок, за ним `->`.
-fn html_comment_end(s: &[u8]) -> Option<usize> {
-    let mut k = 4;
+/// Первая с позиции `from` серия знаков `ch`, которой кончается комментарий (`-`) или CDATA
+/// (`]`): начало серии и позиция за `>`. Разбор сервера (comrak 0.56, `htmlcomment`, `cdata`)
+/// читает текст кусками «не знак», «знак и не знак», «два знака и не `>`», конец — два знака и
+/// `>` на границе куска. Серия из `L` знаков перед `>` разбирается тройками, поэтому конец годен,
+/// только когда `L` при делении на 3 даёт 2: `-->` и `----->` кончают комментарий, `--->` и
+/// `---->` — нет. Годность зависит только от самой серии (перед ней — не знак), не от начала
+/// комментария.
+fn closing_run(s: &[u8], from: usize, ch: u8) -> Option<(usize, usize)> {
+    let mut k = from;
     while k < s.len() {
-        if s[k] != b'-' {
+        if s[k] != ch {
             k += 1;
-        } else if s.get(k + 1) != Some(&b'-') {
-            k += 2;
-        } else if s.get(k + 2) == Some(&b'>') {
-            steps(k);
-            return Some(k + 3);
-        } else {
-            k += 3;
+            continue;
         }
+        let run = s[k..].iter().take_while(|&&c| c == ch).count();
+        if run % 3 == 2 && s.get(k + run) == Some(&b'>') {
+            steps(k + run - from);
+            return Some((k, k + run + 1));
+        }
+        k += run;
     }
-    steps(s.len());
+    steps(s.len().saturating_sub(from));
     None
+}
+
+/// Длина комментария HTML в начале `s` (`<!--…`; `s` — до конца абзаца `para`) — как
+/// `htmlcomment` разбора сервера; `<!-->` и `<!--->` — тоже комментарии. Серия дефисов сразу
+/// за `<!--` разбирается здесь (она зависит от начала), дальше конец — первая годная серия
+/// ([`closing_run`]). Он ищется один раз: `cache` помнит конец абзаца, позицию, с которой искали,
+/// и найденное — следующий `<!--` того же абзаца (позиции только растут) берёт готовый ответ,
+/// пока не зайдёт за него. Так `<!--` в каждой строке при негодном `--->` в конце абзаца не
+/// заставляет проходить абзац заново.
+fn html_comment_len(
+    s: &[u8],
+    para: usize,
+    cache: &mut (usize, usize, Option<(usize, usize)>),
+) -> Option<usize> {
+    let run = s[4..].iter().take_while(|&&c| c == b'-').count();
+    let after = 4 + run;
+    if s.get(after) == Some(&b'>') && (run < 2 || run % 3 == 2) {
+        return Some(after + 1);
+    }
+    // серия за `<!--` разобрана тройками; остаток из одного или двух дефисов забирает и
+    // следующий знак (`-x`, `--x`)
+    let from = if run % 3 == 0 { after } else { after + 1 };
+    let base = para - s.len();
+    let q = base + from;
+    let (p, asked, found) = *cache;
+    let found = if p == para && asked <= q && found.is_none_or(|(start, _)| q <= start) {
+        found
+    } else {
+        let found = (from < s.len())
+            .then(|| closing_run(s, from, b'-'))
+            .flatten()
+            .map(|(start, end)| (base + start, base + end));
+        *cache = (para, q, found);
+        found
+    };
+    found.map(|(_, end)| end - base)
 }
 
 /// Длина вики-ссылки `[[адрес]]` или `[[адрес|текст]]` в начале `s` — как `handle_wikilink`
@@ -2008,10 +2056,35 @@ mod tests {
             ("ftp://q.org/![i](x.png)\n", vec![]),
             ("[t https://e.org/a](x.png)\n", vec!["x.png"]),
             ("(https://e.org/a) [t](x.png)\n", vec!["x.png"]),
+            // конец комментария и CDATA — по серии знаков перед `>` (ревью, круг 5): `--->` и
+            // `]]]>` их не кончают
+            ("т <!-- a ---> [t](x.png) --> [u](y.png)\n", vec!["y.png"]),
+            (
+                "т <!-- a -----> [t](x.png) --> [u](y.png)\n",
+                vec!["x.png", "y.png"],
+            ),
+            ("т <!-- a ---> [t](x.png)\n", vec!["x.png"]),
+            (
+                "т <!-----> [t](x.png) <!----> [u](y.png)\n",
+                vec!["x.png", "y.png"],
+            ),
+            (
+                "т <![CDATA[ a ]]]> [t](x.png) ]]> [u](y.png)\n",
+                vec!["y.png"],
+            ),
+            ("т <![CDATA[ a ]]]> [t](x.png)\n", vec!["x.png"]),
+            // `<!D[` без пробела — не объявление: в строке ссылка за ним видна обоим
+            ("т <!D[t](<e f.png>)<![CDATA[\n", vec!["e f.png"]),
         ] {
             assert_eq!(server(md), want, "разбор сервера:\n{md}");
             assert_eq!(local(local_links(md)), want, "сканер CLI:\n{md}");
         }
+        // Известное приближение (→ M7): в начале пункта списка `<!D…` открывает блок HTML, и
+        // сервер ссылки в нём не видит; блок HTML внутри пункта списка и цитаты сканер не
+        // распознаёт и ссылку видит.
+        let in_list = "[t](c d.png)\n- <!D[t](<e f.png>)<![CDATA[\n";
+        assert_eq!(server(in_list), Vec::<String>::new());
+        assert_eq!(local(local_links(in_list)), ["e f.png"]);
         #[rustfmt::skip]
         const PARTS: &[&str] = &[
             "https://e.org/b", "http://e.org", "www.e.org/", "ftp://q.org/", "[t](x.png)",
@@ -2111,6 +2184,15 @@ mod tests {
                     make(&|k| format!("](x{k}.png)"))
                 ),
             ),
+            // `<!--` в каждой строке, а в конце абзаца — `--->`, которым комментарий не кончается
+            (
+                "комментарии без годного конца",
+                format!("{}--->\n", make(&|k| format!("a{k} <!-- b\n"))),
+            ),
+            (
+                "CDATA без годного конца",
+                format!("{}]]]>\n", make(&|k| format!("a{k} <![CDATA[ b\n"))),
+            ),
         ]
     }
 
@@ -2125,6 +2207,8 @@ mod tests {
         };
         let small = long_bodies(5_000);
         let big = long_bodies(10_000);
+        // все нелинейные тела — в одном сообщении (а не только первое)
+        let mut bad = Vec::new();
         for ((name, a), (_, b)) in small.iter().zip(&big) {
             let (sa, _) = count(a);
             let (sb, _) = count(b);
@@ -2133,17 +2217,15 @@ mod tests {
                 "{name}: счётчик считает шаги ({sa})"
             );
             let ratio = sb as f64 / sa as f64;
-            assert!(
-                (1.8..2.3).contains(&ratio),
-                "{name}: шагов {sa} → {sb}, отношение {ratio:.2}"
-            );
-            // и не больше нескольких проходов по тексту
-            assert!(
-                (sb as usize) < 12 * b.len(),
-                "{name}: {sb} шагов на {} байт",
-                b.len()
-            );
+            // при удвоении тела шагов вдвое больше — и не больше нескольких проходов по тексту
+            if !(1.8..2.3).contains(&ratio) || sb as usize >= 12 * b.len() {
+                bad.push(format!(
+                    "{name}: шагов {sa} → {sb} на {} байт, отношение {ratio:.2}",
+                    b.len()
+                ));
+            }
         }
+        assert!(bad.is_empty(), "нелинейно:\n{}", bad.join("\n"));
         // запрещённая схема в длинном теле по-прежнему находится
         let (_, md) = &long_bodies(2_000)[0];
         let md = format!("{md}| x | ftp://example.org/a |\n");

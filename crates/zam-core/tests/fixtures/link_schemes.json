@@ -113,7 +113,15 @@
   {"t": "vscode://file/home/u/a..b/c.rs", "scheme": "vscode", "report": true, "click": true},
   {"t": "vscode://file/home/u/.config/a.rs", "scheme": "vscode", "report": true, "click": true},
   {"t": "vscode://file/home/u/a.../b.rs", "scheme": "vscode", "report": true, "click": true},
-  {"t": "vscode://file/home/u/%252E%252E/a.rs", "scheme": "vscode", "report": true, "click": true},
+  {"t": "vscode://file/home/u/%252E%252E/a.rs", "scheme": "vscode", "report": true, "click": false},
   {"t": "vscode://file/C:/proj/a%20b/c.rs", "scheme": "vscode", "report": true, "click": true},
-  {"t": "vscode://file/home/u/a.rs#../x", "scheme": "vscode", "report": true, "click": true}
+  {"t": "vscode://file/home/u/a.rs#../x", "scheme": "vscode", "report": true, "click": true},
+  {"t": "vscode://file/%252F%252Fserver/x", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/a/%252e%252e//server", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/a/%252E%252E/b.rs", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/a%255Cb.rs", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/a%255c..%255cb.rs", "scheme": "vscode", "report": true, "click": false},
+  {"t": "vscode://file/home/u/a%2520b.rs", "scheme": "vscode", "report": true, "click": true},
+  {"t": "vscode://file/home/u/100%25/a.rs", "scheme": "vscode", "report": true, "click": true},
+  {"t": "vscode://file/home/u/a.rs?x=%252F", "scheme": "vscode", "report": true, "click": true}
 ]
