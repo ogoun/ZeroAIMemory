@@ -5798,14 +5798,19 @@ fn late_post_compact_not_counted() {
 }
 
 /// `PreCompact` с бюджетом хука 1,5 с и своим сроком `PUT` 10 с против заглушки, отвечающей на
-/// `PUT` через 3 с: фактический срок `PUT` — остаток бюджета. `log_stall_ms` — подмена
-/// `<журнал>.log-stall-ms`: поток снимка засыпает между концом `PUT` и строкой итога. Возвращает
-/// `hooks.log`, время хука и наличие очереди снимка.
-fn put_limit_case(name: &str, log_stall_ms: Option<u64>) -> (String, Duration, bool) {
+/// `PUT` кодом 204 через `put_delay`: при задержке больше бюджета фактический срок `PUT` —
+/// остаток бюджета. `put_stall_ms` — подмена `<кэш>/snapshot.put-stall-ms`: поток снимка засыпает
+/// между концом `PUT` и работой с очередью. Возвращает `hooks.log`, время хука и наличие очереди
+/// снимка.
+fn put_limit_case(
+    name: &str,
+    put_delay: Duration,
+    put_stall_ms: Option<u64>,
+) -> (String, Duration, bool) {
     let (url, _seen) = common::stub_body(std::sync::Arc::new(
-        |m: &str, path: &str, _: usize, _: &Value| {
+        move |m: &str, path: &str, _: usize, _: &Value| {
             if m == "PUT" && path.ends_with("/snapshot") {
-                (204, String::new(), Duration::from_secs(3))
+                (204, String::new(), put_delay)
             } else {
                 (200, "{}".to_string(), Duration::ZERO)
             }
@@ -5815,8 +5820,10 @@ fn put_limit_case(name: &str, log_stall_ms: Option<u64>) -> (String, Duration, b
     let s = "pl-1";
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
-    if let Some(ms) = log_stall_ms {
-        std::fs::write(format!("{}.log-stall-ms", t.display()), ms.to_string()).unwrap();
+    if let Some(ms) = put_stall_ms {
+        let cache = p.repo.join(".zeroaimemory/cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("snapshot.put-stall-ms"), ms.to_string()).unwrap();
     }
     let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
     // свой срок `PUT` больше остатка бюджета: фактический срок — остаток (< 1500 мс)
@@ -5833,48 +5840,77 @@ fn put_limit_case(name: &str, log_stall_ms: Option<u64>) -> (String, Duration, b
     (p.log(), d, snap_file(&p, "snapq", s).is_some())
 }
 
-/// Срок из единственной строки «срок PUT N мс» журнала хуков.
+/// Срок из единственной строки «срок PUT N мс» журнала хуков: фактический — больше нуля и
+/// меньше бюджета хука (1500 мс).
 fn put_limit_logged(log: &str) -> u64 {
     assert_eq!(
         log.matches("срок PUT ").count(),
         1,
         "строка «срок PUT» — ровно одна: {log:?}"
     );
-    log.split("срок PUT ")
+    let n: u64 = log
+        .split("срок PUT ")
         .nth(1)
         .and_then(|r| r.split_whitespace().next())
         .and_then(|x| x.parse().ok())
-        .unwrap_or_else(|| panic!("срок PUT не число: {log}"))
+        .unwrap_or_else(|| panic!("срок PUT не число: {log}"));
+    assert!(n > 0 && n < 1500, "срок {n} мс — не фактический: {log}");
+    n
 }
+
+/// Предел времени хука с бюджетом 1,5 с в тестах опоздавшего потока снимка: запуск отладочного
+/// процесса под нагрузкой входит в замер, а хук, ждущий усыплённый поток, шёл бы ≈ 3,5 с.
+const LATE_THREAD_MAX: Duration = Duration::from_millis(2500);
 
 /// Третье ревью 17b, Minor 1: срок `PUT` — фактический срок клиента (меньшее из своего срока и
 /// остатка бюджета хука); причина «срок PUT N мс» — с ним, а не с константой.
 #[test]
 fn put_timeout_reason_uses_actual_limit() {
     let _g = serial();
-    let (log, _, queued) = put_limit_case("snap-put-limit", None);
-    let n = put_limit_logged(&log);
-    assert!(n < 1500, "срок {n} мс — не фактический: {log}");
+    let (log, _, queued) = put_limit_case("snap-put-limit", Duration::from_secs(3), None);
+    put_limit_logged(&log);
     assert!(queued, "{log}");
 }
 
 /// CI ubuntu (77063ec): срок `PUT` истекает за `HTTP_RESERVE_MS` (30 мс) до конца бюджета, и
 /// поток снимка может не успеть записать итог до выхода хука — строка терялась. Подмена
-/// `log-stall-ms` держит поток 2 с между концом `PUT` и записью итога: причина «срок PUT N мс»
-/// всё равно в `hooks.log` (её пишет сам хук), ровно одна, снимок в очереди, хук в бюджете.
+/// `put-stall-ms` держит поток 2 с после конца `PUT`: причина «срок PUT N мс» всё равно в
+/// `hooks.log` (её пишет сам хук), ровно одна, снимок в очереди, хук не ждёт поток.
 #[test]
 fn put_outcome_logged_when_snapshot_thread_is_late() {
     let _g = serial();
+    let slow = Duration::from_secs(3);
     // прогрев: первый запуск процесса после сборки не меряется
-    let _ = put_limit_case("snap-put-late-warm", Some(2000));
-    let (log, d, queued) = put_limit_case("snap-put-late-log", Some(2000));
-    let n = put_limit_logged(&log);
-    assert!(n < 1500, "срок {n} мс — не фактический: {log}");
-    assert!(queued, "{log}");
+    let _ = put_limit_case("snap-put-late-warm", slow, Some(2000));
+    let (log, d, queued) = put_limit_case("snap-put-late-log", slow, Some(2000));
+    put_limit_logged(&log);
     assert!(
-        d <= Duration::from_millis(1500 + 300),
-        "запись итога увела хук за бюджет: {d:?}"
+        log.contains("очередь не обработана до выхода хука"),
+        "{log}"
     );
+    assert!(queued, "{log}");
+    assert!(d <= LATE_THREAD_MAX, "хук ждал поток снимка: {d:?}");
+}
+
+/// Ревью 2c36319, I1: сервер ответил 204 сразу, а поток снимка застрял после `PUT` (подмена
+/// `put-stall-ms` 3 с) — хук пишет «ответ получен (HTTP 204), очередь не обработана», а не
+/// «срок PUT»: медленная локальная доработка не выдаётся за медленный сервер.
+#[test]
+fn late_snapshot_thread_after_response_is_not_put_timeout() {
+    let _g = serial();
+    // прогрев: первый запуск процесса после сборки не меряется
+    let _ = put_limit_case("snap-put-done-warm", Duration::ZERO, Some(3000));
+    let (log, d, queued) = put_limit_case("snap-put-done-late", Duration::ZERO, Some(3000));
+    assert!(!log.contains("срок PUT"), "ложная причина: {log}");
+    assert_eq!(
+        log.matches("ответ получен (HTTP 204), очередь не обработана до выхода хука")
+            .count(),
+        1,
+        "{log:?}"
+    );
+    // поток оборван до работы с очередью: снимок уйдёт ещё раз со следующим хуком
+    assert!(queued, "{log}");
+    assert!(d <= LATE_THREAD_MAX, "хук ждал поток снимка: {d:?}");
 }
 
 /// Повторное ревью 17b (`prompt_flushes_changed_queue`): решение о снимке и снимок — вне пути
@@ -5958,6 +5994,12 @@ fn snapshot_wait_bounded_by_hook_budget() {
     assert!(
         d <= Duration::from_millis(1000 + 300),
         "поток снимка увёл хук за бюджет: {d:?}"
+    );
+    // ревью 2c36319, M4: поток до `PUT` не дошёл — строка с событием и временем от старта
+    let log = p.log();
+    assert!(
+        log.contains("snapshot: не готов до выхода хука (Stop, прошло "),
+        "{log}"
     );
 }
 
