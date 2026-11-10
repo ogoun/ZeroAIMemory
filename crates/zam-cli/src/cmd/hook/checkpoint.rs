@@ -482,6 +482,42 @@ pub fn impact_lines(v: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Задача 17b-http, ревью: запрос новой эпохи, не начатый по сроку хука (срок клиента уже
+    /// вышел), — строка `sessions(new_epoch): бюджет исчерпан до запроса к серверу` без слова
+    /// «сеть»: запроса не было, сервер эпоху не начинал (учёт промахов в тестах и разбор журнала
+    /// различают это и срок запроса).
+    #[test]
+    fn new_epoch_unsent_is_logged_without_net() {
+        use crate::client::Timeouts;
+        use std::time::Instant;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp/zam-cli-new-epoch-unsent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
+        let env = Env::new(
+            Kind::Checkpoint,
+            super::super::Agent::Claude,
+            Instant::now(),
+            dir.clone(),
+            dir.join("home"),
+        );
+        let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let client =
+            Client::with_timeouts("http://127.0.0.1:9", "t", None, Timeouts::Deadline(past));
+        new_epoch(&env, &client, "s-1");
+        let log = std::fs::read_to_string(env.log_path()).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(
+            lines[0].ends_with(&format!(
+                " checkpoint sessions(new_epoch): {}",
+                zam_core::HOOK_BUDGET_SPENT
+            )),
+            "{log}"
+        );
+        assert!(!log.contains("сеть"), "{log}");
+    }
+
     fn edit(p: &str) -> (journal::Timestamp, Ev) {
         (journal::Timestamp(0), Ev::Edit { path: p.into() })
     }

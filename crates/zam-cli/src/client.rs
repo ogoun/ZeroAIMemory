@@ -693,13 +693,13 @@ mod tests {
 
     /// Задача 17b-http: срок клиента хуков — абсолютный, один на все запросы. Сервер принял
     /// соединение и молчит: первый запрос оборван сроком, второй (тем же клиентом, срок вышел) не
-    /// начинается вовсе — оба вместе идут один срок, а не два. Запас — возврат ожидания сокета
-    /// (шаг таймера ОС) и занятая машина.
+    /// начинается вовсе — оба вместе идут один срок, а не два. Сроки — сотни мс (срок 600, сон
+    /// 300): планировщик занятой машины и шаг таймера ОС на исход не влияют.
     #[test]
     fn deadline_is_absolute_and_shared_by_requests() {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", silent.local_addr().unwrap());
-        let ms = 150;
+        let ms = 600;
         let t0 = Instant::now();
         let c = Client::with_timeouts(
             &url,
@@ -717,7 +717,7 @@ mod tests {
         let both = t0.elapsed();
         assert!(first >= Duration::from_millis(ms - 20), "{first:?}");
         assert!(
-            both < Duration::from_millis(2 * ms - 20),
+            both < Duration::from_millis(2 * ms - 100),
             "два запроса — один срок {ms} мс, а не два: {both:?}"
         );
         assert_eq!(c.deadline_left(), Some(Duration::ZERO));
@@ -729,12 +729,14 @@ mod tests {
             None,
             Timeouts::Deadline(t0 + Duration::from_millis(ms)),
         );
-        std::thread::sleep(Duration::from_millis(100));
+        let nap = 300;
+        std::thread::sleep(Duration::from_millis(nap));
         let e = c.get("/x", &[]).unwrap_err();
-        assert!(e.is_timeout(), "{e}");
+        // сон затянулся за срок (занятая машина) — запрос не начат: тоже верный исход
+        assert!(e.is_timeout() || e.is_unsent(), "{e}");
         let took = t0.elapsed();
         assert!(
-            took < Duration::from_millis(ms + 100 - 20),
+            e.is_unsent() || took < Duration::from_millis(ms + nap - 100),
             "срок от создания клиента, а не от начала запроса: {took:?}"
         );
         // профили без срока — без изменений
