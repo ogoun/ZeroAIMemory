@@ -1,8 +1,19 @@
 //! Хуки `zam hook …` (§10.3; задача 10 M4) против настоящего zam-server в том же процессе тестов:
 //! вывод по контракту Claude Code и Codex, локальный кэш триггеров (ETag), один показ за сессию,
-//! напоминание `checkpoint` (R1), переключатели (R5), fail-open и время (R3: `pre-tool` ≤ 200 мс
-//! p95, остальные ≤ 1 с). Сервер без моделей (поиск — FTS). Каталоги проекта и «домашний» — во
-//! временном каталоге целей сборки (`CARGO_TARGET_TMPDIR`), не в профиле пользователя.
+//! напоминание `checkpoint` (R1), переключатели (R5), fail-open и время. Сервер без моделей
+//! (поиск — FTS). Каталоги проекта и «домашний» — во временном каталоге целей сборки
+//! (`CARGO_TARGET_TMPDIR`), не в профиле пользователя.
+//!
+//! **Время (задача 17b-http M6).** Бюджет хука §10.3 отсчитывается от старта процесса `zam`
+//! (`started` в `main`), поэтому тесты сверяют с ним время **внутри процесса** ([`Times::inner`]:
+//! хук сам пишет его в файл по `ZAM_TEST_HOOK_TIMING`), а не время запуска и выхода отладочного
+//! exe глазами теста — под нагрузкой растёт именно оно. Пределы серии ([`assert_series`]):
+//! медиана — сам бюджет, p95 — прежний запас R3, ×4 бюджета ([`max_for`]: хвост отладочной сборки
+//! на занятом HDD — остановки диска, не хук); лучший из повторов (медленный или выключенный
+//! сервер, [`Proj::hook_best`]) — полтора бюджета ([`max_inner`]); одиночный замер, который
+//! повторить нельзя, — [`max_for`]; запуск и выход процесса —
+//! отдельно, нормировкой по пустому вызову `zam hook` в том же цикле ([`assert_launch`]). Тесты содержимого идут со щедрым бюджетом ([`Proj::hook`], [`hook_slow`]):
+//! успеет ли отладочная сборка на занятой машине в 70–270 мс — не свойство содержимого.
 mod common;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,16 +29,92 @@ use zam_store::Access;
 const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e61";
 /// Адрес, где заведомо никто не слушает (порт discard).
 const DEAD: &str = "http://127.0.0.1:9";
-/// Запас времени R3: `pre-tool` — ×4 от 50 мс.
-const PRE_TOOL_P95_MAX: Duration = Duration::from_millis(200);
-/// Предел времени R3 по команде (fix round 1, m-1): ×4 от бюджета §10.3 — `checkpoint`
-/// 400 мс, `session-start` 1200 мс, `prompt` и `post-tool` 1000 мс.
+/// Предел одиночного замера и p95 серии времени хука внутри процесса по команде (R3, fix round
+/// 1, m-1): ×4 от бюджета §10.3 — `pre-tool` 200 мс, `checkpoint` 400 мс, `session-start` 1200 мс,
+/// `prompt` и `post-tool` 1000 мс. Запас — на остановки диска отладочной сборки (запись строки
+/// `hooks.log`, возврат очереди: на занятом HDD одна операция с файлом — до сотен мс); сам бюджет
+/// сверяют медиана серии ([`assert_series`]) и лучший из повторов ([`max_inner`]).
 fn max_for(kind: &str) -> Duration {
-    Duration::from_millis(match kind {
-        "checkpoint" => 400,
-        "session-start" => 1200,
-        _ => 1000,
-    })
+    Duration::from_millis(4 * budget_ms(kind))
+}
+/// Бюджет команды хука §10.3, мс (`Kind::budget_ms`; у `post-tool` — режима ошибки).
+fn budget_ms(kind: &str) -> u64 {
+    match kind {
+        "checkpoint" => 100,
+        "session-start" | "subagent-start" => 300,
+        "pre-tool" => 50,
+        _ => 250,
+    }
+}
+/// Предел времени хука внутри процесса ([`Times::inner`]) у лучшего из повторов с медленным
+/// сервером: полтора бюджета §10.3 (`session-start` 450 мс, `checkpoint` 150 мс). Срок HTTP —
+/// бюджет минус 30 мс, но ожидание сокета возвращается с шагом таймера ОС (Windows — до 15,6 мс),
+/// а отладочная сборка на HDD после него ещё пишет строки `hooks.log` и возвращает очередь
+/// (замер 17b-http при бюджете 300 мс: 283–307 мс на тихой машине, 281–540 мс под чужой сборкой
+/// на том же диске). Второй срок запроса сверх первого (дефект 17b-http) давал не меньше 557 мс —
+/// 1,86 бюджета — и на тихой машине.
+fn max_inner(kind: &str) -> Duration {
+    Duration::from_millis(budget_ms(kind) * 3 / 2)
+}
+/// Бюджет хука тестов содержимого, мс (`ZAM_TEST_HOOK_BUDGET_MS`).
+const ROOMY_BUDGET_MS: &str = "10000";
+/// Запас нормировки запуска процесса ([`assert_launch`]).
+const LAUNCH_SLACK: Duration = Duration::from_millis(30);
+
+/// Медиана.
+fn median(mut v: Vec<Duration>) -> Duration {
+    v.sort();
+    v[v.len() / 2]
+}
+
+/// Разброс времени пустого вызова `zam hook` ([`Proj::idle`]) в серии: p95 − минимум. На тихой
+/// машине — единицы мс; на занятой (все ядра в работе, очередь к диску) — десятки и сотни: столько
+/// машина в этот момент прибавляет процессу, который ничего не делает.
+fn jitter(idle: &[Duration]) -> Duration {
+    match idle.iter().min() {
+        Some(min) => p95(idle.to_vec()).saturating_sub(*min),
+        None => Duration::ZERO,
+    }
+}
+
+/// Серия замеров времени хука `kind` внутри процесса: медиана — не больше бюджета `budget`
+/// (§10.3; устойчива к остановкам диска), p95 — не больше `p95_max` (запас R3) и разброса пустого
+/// вызова в той же серии ([`jitter`]; `idle` пуст — без него): хвост серии нормируется тем, что
+/// занятая машина делает с пустым процессом.
+fn assert_series(
+    what: &str,
+    inner: Vec<Duration>,
+    budget: Duration,
+    p95_max: Duration,
+    idle: &[Duration],
+) -> Duration {
+    let (q, mid) = (p95(inner.clone()), median(inner));
+    assert!(
+        mid <= budget,
+        "{what}: медиана {mid:?} при бюджете {budget:?}"
+    );
+    let noise = jitter(idle);
+    assert!(
+        q <= p95_max + noise,
+        "{what}: p95 {q:?} при пределе {p95_max:?} и разбросе пустого вызова {noise:?}"
+    );
+    q
+}
+
+/// Запуск и выход процесса хука (вне бюджета: [`Times::launch`]) — нормировкой по пустому вызову
+/// `zam hook` в том же цикле (`idle` — [`Proj::idle`]): медиана не больше двух медиан пустого
+/// вызова и [`LAUNCH_SLACK`]. Занятая машина замедляет оба одинаково; хук, который дорого
+/// стартует или не выходит (ждёт поток, держит процесс), — только первое.
+fn assert_launch(what: &str, hooks: &[Times], idle: &[Duration]) {
+    let launch = median(hooks.iter().map(|t| t.launch()).collect());
+    let base = median(idle.to_vec());
+    eprintln!(
+        "ZAM_TIMING {what}: запуск и выход процесса {launch:?} (медиана), пустой вызов {base:?}"
+    );
+    assert!(
+        launch <= base * 2 + LAUNCH_SLACK,
+        "{what}: запуск и выход процесса {launch:?} при пустом вызове {base:?}"
+    );
 }
 /// Предел для прочих замеров процесса (без сети, огромный ввод).
 const OTHER_MAX: Duration = Duration::from_secs(1);
@@ -119,6 +206,23 @@ fn start_opt(name: &str, rules_write: bool) -> (String, String) {
     (url, tok)
 }
 
+/// Времена одного вызова хука. `inner` — внутри процесса, от старта `main` до конца вывода (от
+/// того же момента отсчитывается бюджет хука, §10.3); `outer` — весь процесс глазами теста:
+/// запуск отладочного exe, `inner` и выход. Разность — запуск и выход процесса: под нагрузкой
+/// растёт она, а не хук (журнал M6, «Расследование: нестабильные тесты хуков под нагрузкой»).
+#[derive(Debug, Clone, Copy)]
+struct Times {
+    inner: Duration,
+    outer: Duration,
+}
+
+impl Times {
+    /// Запуск и выход процесса (вне бюджета хука).
+    fn launch(self) -> Duration {
+        self.outer.saturating_sub(self.inner)
+    }
+}
+
 /// Проект с решением и «домашний» каталог.
 struct Proj {
     url: String,
@@ -176,19 +280,108 @@ impl Proj {
             .unwrap()
     }
 
-    /// `zam hook <kind> [--agent codex]` с JSON на stdin: вывод и время процесса.
+    /// `zam hook <kind> [--agent codex]` с JSON на stdin, с бюджетом продукта: вывод и время
+    /// хука **внутри процесса** ([`Times::inner`]) — с ним сверяются бюджеты.
     fn hook_at(&self, url: &str, kind: &str, agent: &str, stdin: &[u8]) -> (Output, Duration) {
+        let (o, t) = self.hook_times(url, kind, agent, stdin);
+        (o, t.inner)
+    }
+
+    /// [`Proj::hook_at`] для одиночной проверки бюджета, устойчивой к остановке диска: вызов
+    /// повторяется (до трёх раз), пока время внутри процесса не уложится в [`max_inner`]; вывод —
+    /// первого вызова, время — лучшее. Обычно вызов один. Остановка диска (на занятом HDD одна
+    /// операция с файлом — до секунд) случайна и повтором снимается; хук, который в бюджет не
+    /// укладывается, не уложится все три раза. Только там, где повтор события безвреден.
+    fn hook_best(&self, url: &str, kind: &str, agent: &str, stdin: &[u8]) -> (Output, Duration) {
+        let (first, mut best) = self.hook_at(url, kind, agent, stdin);
+        for _ in 0..2 {
+            if best <= max_inner(kind) {
+                break;
+            }
+            best = best.min(self.hook_at(url, kind, agent, stdin).1);
+        }
+        (first, best)
+    }
+
+    /// [`Proj::hook_at`] с обоими временами вызова ([`Times`]).
+    fn hook_times(&self, url: &str, kind: &str, agent: &str, stdin: &[u8]) -> (Output, Times) {
+        self.hook_env(url, kind, agent, stdin, &[])
+    }
+
+    /// Пустой вызов `zam hook <kind>` (stdin пуст — хук сразу выходит): время процесса целиком —
+    /// мера запуска и выхода отладочного exe на этой машине в этот момент ([`assert_launch`]).
+    fn idle(&self, kind: &str) -> Duration {
+        self.hook_times(DEAD, kind, "claude", b"").1.outer
+    }
+
+    /// Хук с переменными окружения `envs` (подмены тестов) и обоими временами вызова. Время внутри
+    /// процесса хук пишет сам (тестовый канал `ZAM_TEST_HOOK_TIMING`, свой файл на вызов); строки
+    /// нет — в отладочной сборке это падение теста, в release без канала — время снаружи (оно не
+    /// меньше).
+    fn hook_env(
+        &self,
+        url: &str,
+        kind: &str,
+        agent: &str,
+        stdin: &[u8],
+        envs: &[(&str, &str)],
+    ) -> (Output, Times) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = self
+            .repo
+            .parent()
+            .unwrap()
+            .join(format!("hook-timing-{n}.txt"));
         let mut c = self.cmd(url);
-        c.args(["hook", kind, "--agent", agent])
+        c.env("ZAM_TEST_HOOK_TIMING", &file)
+            .envs(envs.iter().copied())
+            .args(["hook", kind, "--agent", agent])
             .write_stdin(stdin.to_vec());
         let t = Instant::now();
         let o = c.output().unwrap();
-        (o, t.elapsed())
+        let outer = t.elapsed();
+        let inner = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|s| {
+                let (k, us) = s.lines().last()?.split_once(' ')?;
+                (k == kind).then(|| us.trim().parse().ok()).flatten()
+            })
+            .map(Duration::from_micros);
+        let _ = std::fs::remove_file(&file);
+        // отладочная сборка: канал обязан сработать — иначе все проверки времени молча вернулись
+        // бы к времени снаружи; release без фичи `test-hooks` канала не имеет
+        assert!(
+            inner.is_some() || !cfg!(debug_assertions) || !o.status.success(),
+            "хук {kind} не записал время в {}",
+            file.display()
+        );
+        let inner = inner.unwrap_or(outer);
+        (o, Times { inner, outer })
     }
 
+    /// Хук ради содержимого (вывод, кэш, запросы): со щедрым бюджетом ([`ROOMY_BUDGET_MS`]) —
+    /// занятая машина не превращает ответ в тишину. Время и бюджеты — [`Proj::hook_at`].
     fn hook(&self, kind: &str, v: &Value) -> Output {
-        self.hook_at(&self.url, kind, "claude", v.to_string().as_bytes())
-            .0
+        self.hook_roomy(&self.url, kind, "claude", v).0
+    }
+
+    /// [`Proj::hook_at`] ради содержимого: тот же вызов со щедрым бюджетом (время — справочно).
+    fn hook_content(&self, url: &str, kind: &str, agent: &str, stdin: &[u8]) -> (Output, Duration) {
+        let (o, t) = self.hook_env(
+            url,
+            kind,
+            agent,
+            stdin,
+            &[("ZAM_TEST_HOOK_BUDGET_MS", ROOMY_BUDGET_MS)],
+        );
+        (o, t.inner)
+    }
+
+    /// [`Proj::hook`] с адресом, агентом и временем внутри процесса (справочно: щедрый бюджет
+    /// хук не обрезает).
+    fn hook_roomy(&self, url: &str, kind: &str, agent: &str, v: &Value) -> (Output, Duration) {
+        self.hook_content(url, kind, agent, v.to_string().as_bytes())
     }
 
     /// Событие с общими полями (`session_id`, `cwd`).
@@ -386,17 +579,25 @@ fn pre_tool_under_50ms() {
     let _g = serial();
     let p = Proj::new("pre-timing", DEAD, "zam_x");
     write_cache(&p, DEAD);
-    let mut times = Vec::new();
+    let (mut times, mut idle) = (Vec::new(), Vec::new());
     for i in 0..100 {
         let v = write_ev(&p, &format!("t{i}"), "scripts/deploy.sh").to_string();
-        let (o, d) = p.hook_at(DEAD, "pre-tool", "claude", v.as_bytes());
+        let (o, t) = p.hook_times(DEAD, "pre-tool", "claude", v.as_bytes());
         assert!(context(&o, "PreToolUse").contains("i:E1"));
-        times.push(d);
+        times.push(t);
+        idle.push(p.idle("pre-tool"));
     }
-    let q = p95(times.clone());
-    let min = times.iter().min().unwrap();
-    eprintln!("ZAM_TIMING pre-tool p95={q:?} min={min:?} (100 запусков)");
-    assert!(q <= PRE_TOOL_P95_MAX, "pre-tool p95 {q:?}");
+    let inner: Vec<Duration> = times.iter().map(|t| t.inner).collect();
+    let q = p95(inner.clone());
+    let min = inner.iter().min().unwrap();
+    eprintln!(
+        "ZAM_TIMING pre-tool внутри процесса p95={q:?} min={min:?} (100 запусков); процесс целиком p95={:?}",
+        p95(times.iter().map(|t| t.outer).collect())
+    );
+    // бюджет `pre-tool` §10.3 — 50 мс от старта процесса: медиана — в бюджете, p95 — ×4
+    let budget = Duration::from_millis(budget_ms("pre-tool"));
+    assert_series("pre-tool", inner, budget, max_for("pre-tool"), &idle);
+    assert_launch("pre-tool", &times, &idle);
 }
 
 /// Запись показывается не больше раза за сессию; другая сессия — снова; Write отмечает правку.
@@ -744,13 +945,13 @@ fn post_tool_failure_error_regex_hint() {
     assert_eq!(c.matches(&format!("i:{id}")).count(), 1, "без дублей: {c}");
     // сервер выключен: кэш того же адреса — локальная подсказка
     write_cache(&p, DEAD);
-    let (o, d) = p.hook_at(DEAD, "post-tool", "claude", ev.to_string().as_bytes());
+    let (o, d) = p.hook_best(DEAD, "post-tool", "claude", ev.to_string().as_bytes());
     let c = context(&o, "PostToolUseFailure");
     assert!(
         c.contains("эта ошибка уже разбиралась: CRLF в shebang [gotcha·th] i:E3"),
         "{c}"
     );
-    assert!(d <= OTHER_MAX, "{d:?}");
+    assert!(d <= max_inner("post-tool"), "{d:?}");
     // другая ошибка — тишина
     let other = p.ev(
         "PostToolUseFailure",
@@ -783,7 +984,7 @@ fn post_tool_codex_stderr_hint() {
                    "tool_response": {"stdout": "", "stderr": stderr}}),
         )
     };
-    let (o, _) = p.hook_at(
+    let (o, _) = p.hook_content(
         &url,
         "post-tool",
         "codex",
@@ -791,7 +992,7 @@ fn post_tool_codex_stderr_hint() {
     );
     let c = context(&o, "PostToolUse");
     assert!(c.contains(&format!("i:{id}")), "{c}");
-    let (o, _) = p.hook_at(&url, "post-tool", "codex", ev("").to_string().as_bytes());
+    let (o, _) = p.hook_content(&url, "post-tool", "codex", ev("").to_string().as_bytes());
     empty(&o);
 }
 
@@ -1042,9 +1243,9 @@ fn fail_open_server_down_empty_exit_0() {
         ),
     ];
     for (k, v) in &cases {
-        let (o, d) = p.hook_at(DEAD, k, "claude", v.to_string().as_bytes());
+        let (o, d) = p.hook_best(DEAD, k, "claude", v.to_string().as_bytes());
         empty(&o);
-        assert!(d <= max_for(k), "{k}: {d:?}");
+        assert!(d <= max_inner(k), "{k}: {d:?}");
     }
     let log = p.log();
     assert!(
@@ -1176,14 +1377,17 @@ fn output_is_valid_hook_json_with_event_name() {
     }
     let ss = p.ev("SessionStart", "o1", json!({"source": "startup"}));
     for agent in ["claude", "codex"] {
-        let (o, d) = p.hook_at(&url, "session-start", agent, ss.to_string().as_bytes());
+        // формат — со щедрым бюджетом (содержимое); время — отдельным вызовом с бюджетом продукта
+        let (o, _) = p.hook_roomy(&url, "session-start", agent, &ss);
         let s = ok(&o);
         assert_eq!(s.lines().count(), 1, "{s}");
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v.as_object().unwrap().len(), 1, "{v}");
         assert_eq!(v["hookSpecificOutput"].as_object().unwrap().len(), 2, "{v}");
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
-        assert!(d <= max_for("session-start"), "{agent}: {d:?}");
+        let (o, d) = p.hook_best(&url, "session-start", agent, ss.to_string().as_bytes());
+        ok(&o);
+        assert!(d <= max_inner("session-start"), "{agent}: {d:?}");
     }
     // prompt: подсказка (повтор в той же сессии сервер гасит — каждый раз новая сессия)
     let mut found = None;
@@ -1193,7 +1397,7 @@ fn output_is_valid_hook_json_with_event_name() {
             &format!("op{i}"),
             json!({"prompt": "почему квазар светит"}),
         );
-        let (o, d) = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
+        let (o, d) = p.hook_roomy(&url, "prompt", "claude", &pr);
         assert_eq!(o.status.code(), Some(0));
         if !out(&o).trim().is_empty() {
             found = Some((context(&o, "UserPromptSubmit"), d));
@@ -1266,12 +1470,15 @@ pre_tool = true
     assert_eq!(spawns_logged(&p).len(), 1, "{}", p.log());
 }
 
-/// R3: время `session-start` (≤ 1200 мс), `prompt` и `post-tool` (≤ 1000 мс), `checkpoint`
-/// (≤ 400 мс) с сервером — p95 из 20 запусков каждого; пустых ответов (хук замолчал по
+/// R3: время `session-start`, `prompt`, `post-tool` и `checkpoint` с сервером — 20 запусков
+/// каждого, **внутри процесса** ([`assert_series`]): медиана — не больше бюджета §10.3 (300, 250,
+/// 250 и 100 мс), p95 — не больше ×4 от него (1200, 1000, 1000 и 400 мс; прежде — только p95 и
+/// на весь процесс); запуск и выход процесса — отдельно, нормировкой по пустому вызову
+/// ([`assert_launch`]); пустых ответов (хук замолчал по
 /// внутреннему сроку, fail-open) — не больше 5 % всех 80 вызовов, как у
 /// `m4_acceptance::hook_budgets`: на общем раннере CI отладочная сборка изредка не укладывается
-/// в бюджет вместе с запуском процесса (ubuntu: 872cfc4, e32fe1f, d020f16; на стенде A/B p95
-/// ~15 мс без пустых — журнал M5, «Финальное ревью ветки»).
+/// в бюджет (ubuntu: 872cfc4, e32fe1f, d020f16; на стенде A/B p95 ~15 мс без пустых — журнал
+/// M5, «Финальное ревью ветки»).
 #[test]
 fn hooks_with_server_within_margin() {
     let _g = serial();
@@ -1336,21 +1543,31 @@ fn hooks_with_server_within_margin() {
             }),
         ),
     ] {
-        let mut times = Vec::new();
+        let (mut times, mut idle) = (Vec::new(), Vec::new());
         for i in 0..20 {
             if k == "checkpoint" {
                 p.hook("pre-tool", &write_ev(&p, &format!("tm{i}"), "a.txt"));
             }
-            let (o, d) = p.hook_at(&url, k, "claude", mk(i).to_string().as_bytes());
+            let (o, t) = p.hook_times(&url, k, "claude", mk(i).to_string().as_bytes());
             calls += 1;
             if ok(&o).trim().is_empty() {
-                silent.push(format!("{k} #{i} {d:?}"));
+                silent.push(format!("{k} #{i} {:?}", t.inner));
             }
-            times.push(d);
+            times.push(t);
+            idle.push(p.idle(k));
         }
-        let q = p95(times);
-        report.push(format!("{k} p95={q:?}"));
-        assert!(q <= max_for(k), "{k}: p95 {q:?}");
+        let q = assert_series(
+            k,
+            times.iter().map(|t| t.inner).collect(),
+            Duration::from_millis(budget_ms(k)),
+            max_for(k),
+            &idle,
+        );
+        report.push(format!(
+            "{k} внутри процесса p95={q:?}, процесс целиком p95={:?}",
+            p95(times.iter().map(|t| t.outer).collect())
+        ));
+        assert_launch(k, &times, &idle);
     }
     eprintln!("ZAM_TIMING {}; пустые: {silent:?}", report.join(", "));
     assert!(
@@ -1715,7 +1932,7 @@ impl Pool {
     std::fs::write(p.repo.join("src/pool.rs"), &src).unwrap();
     let line = "ZeroAIMemory: о файле src/pool.rs в памяти: `Pool::get`: Пул соединений течёт \
                 [gotcha] — i:E7; Архитектура пула [note] — n:N1";
-    let mut times = Vec::new();
+    let (mut times, mut idle) = (Vec::new(), Vec::new());
     for i in 0..100 {
         let (tool, input) = if i % 2 == 0 {
             ("Read", json!({"file_path": p.repo.join("src/pool.rs")}))
@@ -1726,13 +1943,14 @@ impl Pool {
             )
         };
         let v = post_ok(&p, &format!("pt{i}"), tool, input);
-        let (o, d) = p.hook_at(DEAD, "post-tool", "claude", v.to_string().as_bytes());
+        let (o, t) = p.hook_times(DEAD, "post-tool", "claude", v.to_string().as_bytes());
         if tool == "Read" {
             assert_eq!(context(&o, "PostToolUse"), line);
         } else {
             empty(&o);
         }
-        times.push(d);
+        times.push(t);
+        idle.push(p.idle("post-tool"));
     }
     // правки с символьной ссылкой: в очереди — хэши символов (или строка без них по отсечке)
     let q = queue(&p, "pt1");
@@ -1741,10 +1959,24 @@ impl Pool {
         "ZAM_TIMING post-tool: символов в очереди {}",
         q[0]["symbols"].as_array().map_or(0, Vec::len)
     );
-    let q = p95(times.clone());
-    let min = times.iter().min().unwrap();
-    eprintln!("ZAM_TIMING post-tool (успех) p95={q:?} min={min:?} (100 запусков)");
-    assert!(q <= PRE_TOOL_P95_MAX, "post-tool p95 {q:?}");
+    let inner: Vec<Duration> = times.iter().map(|t| t.inner).collect();
+    let q = p95(inner.clone());
+    let min = inner.iter().min().unwrap();
+    eprintln!(
+        "ZAM_TIMING post-tool (успех) внутри процесса p95={q:?} min={min:?} (100 запусков); процесс целиком p95={:?}",
+        p95(times.iter().map(|t| t.outer).collect())
+    );
+    // успешный `post-tool` — без сети, 50 мс от старта процесса (M4.5 §9.1), как `pre-tool`:
+    // медиана — в бюджете, p95 — ×4
+    let budget = Duration::from_millis(budget_ms("pre-tool"));
+    assert_series(
+        "post-tool (успех)",
+        inner,
+        budget,
+        max_for("pre-tool"),
+        &idle,
+    );
+    assert_launch("post-tool (успех)", &times, &idle);
     assert_eq!(p.log(), "", "hooks.log");
 }
 
@@ -2103,17 +2335,100 @@ fn session_start_flushes_all_queues_in_one_request() {
         put_queue(&p, &format!("s{i}"), &[(format!("src/f{i}.rs"), 'b')]);
     }
     let ss = p.ev("SessionStart", "s-new", json!({"source": "startup"}));
-    let (_, d) = p.hook_at(&slow, "session-start", "claude", ss.to_string().as_bytes());
-    assert!(d <= max_for("session-start"), "session-start {d:?}");
+    // лучший из повторов — полтора бюджета (повтор — только если время не уложилось: после срока
+    // запроса хук ещё возвращает очередь, а создание файла на занятом диске изредка стоит секунды)
+    let (mut attempts, mut d) = (0, Duration::MAX);
+    while attempts < 3 && d > max_inner("session-start") {
+        let (_, t) = p.hook_at(&slow, "session-start", "claude", ss.to_string().as_bytes());
+        attempts += 1;
+        d = d.min(t);
+    }
+    assert!(
+        d <= max_inner("session-start"),
+        "session-start {d:?}: {}",
+        p.log()
+    );
     let posts = slow_seen
         .lock()
         .unwrap()
         .iter()
         .filter(|(_, path, _)| path == "/api/v1/files/changed")
         .count();
-    assert!(posts <= 1, "не больше одного запроса: {posts}");
+    assert!(
+        posts <= attempts,
+        "не больше одного запроса на хук: {posts} из {attempts}"
+    );
     let left: usize = (0..5).map(|i| queue(&p, &format!("s{i}")).len()).sum();
     assert_eq!(left, 5, "тайм-аут — очереди целы");
+}
+
+/// Задача 17b-http: срок HTTP хука — абсолютный (старт процесса + бюджет − резерв), один на все
+/// запросы хука. Заглушка молчит 3 с на каждый запрос: `session-start` шлёт `POST /files/changed`
+/// и следом, тем же клиентом, `GET /file-refs`. Со сроком «от начала запроса» второй запрос
+/// получал ещё один полный срок — 600–1100 мс при бюджете 300 мс; с абсолютным — не начинается
+/// вовсе (одна строка в `hooks.log`), и хук выходит в свой бюджет.
+///
+/// Две проверки. Без времени: `GET /file-refs` до заглушки не доходит ни разу — отправка очереди
+/// кончилась сроком, значит, остатка у второго запроса нет. По времени **внутри процесса**
+/// ([`Times::inner`]) с бюджетом продукта: лучший из трёх — полтора бюджета ([`max_inner`]; двойной
+/// срок давал 557–2464 мс). Худший не сверяется: после срока запроса хук ещё возвращает очередь
+/// (создание файла), а на занятом диске это изредка стоит секунду и больше.
+#[test]
+fn session_start_slow_server_one_deadline_for_all_requests() {
+    let _g = serial();
+    let (slow, seen) = common::stub(200, r#"{"stale":0}"#, Duration::from_secs(3));
+    let p = Proj::new("deadline-seq", &slow, "zam_x");
+    // прогрев процесса (первый запуск отладочного exe — с диска)
+    let _ = p.hook_at(
+        DEAD,
+        "pre-tool",
+        "claude",
+        write_ev(&p, "d-warm", "a.txt").to_string().as_bytes(),
+    );
+    let mut times = Vec::new();
+    for i in 0..3 {
+        put_queue(&p, &format!("dq{i}"), &[(format!("src/f{i}.rs"), 'b')]);
+        let ss = p.ev(
+            "SessionStart",
+            &format!("d-new{i}"),
+            json!({"source": "startup"}),
+        );
+        let (o, t) = p.hook_times(&slow, "session-start", "claude", ss.to_string().as_bytes());
+        empty(&o);
+        times.push(t);
+    }
+    eprintln!("ZAM_TIMING session-start, медленный сервер: {times:?}");
+    let sent = seen.lock().unwrap().clone();
+    // путь у заглушки — со строкой запроса (`/file-refs?solution=…`)
+    let count = |method: &str, path: &str| {
+        sent.iter()
+            .filter(|(m, q, _)| m == method && q.split('?').next() == Some(path))
+            .count()
+    };
+    let log = p.log();
+    let posts = count("POST", "/api/v1/files/changed");
+    assert!(posts >= 1, "отправка очереди ушла: {sent:?}; {log}");
+    // отправка очереди ушла у каждого хука и кончилась сроком — второго запроса потока нет; хук,
+    // не успевший до отправки (старт процесса дольше бюджета), в счёт не идёт
+    if posts == 3 {
+        assert_eq!(
+            count("GET", "/api/v1/file-refs"),
+            0,
+            "запрос после срока хука: {sent:?}; {log}"
+        );
+        let unsent = format!("кэш file-refs не обновлён: {}", zam_core::HOOK_BUDGET_SPENT);
+        assert_eq!(log.matches(&unsent).count(), 3, "одна строка на хук: {log}");
+    }
+    assert!(!log.contains("file-refs не обновлён: сервер"), "{log}");
+    let inner: Vec<Duration> = times.iter().map(|t| t.inner).collect();
+    let best = *inner.iter().min().unwrap();
+    assert!(
+        best <= max_inner("session-start"),
+        "session-start внутри процесса {best:?} при бюджете 300 мс: {times:?}\n{log}"
+    );
+    // срок — очереди целы
+    let left: usize = (0..3).map(|i| queue(&p, &format!("dq{i}")).len()).sum();
+    assert_eq!(left, 3, "{log}");
 }
 
 /// M-6: постоянная ошибка 4xx — очередь отбрасывается со строкой в `hooks.log`; 429 — остаётся.
@@ -2329,7 +2644,7 @@ fn session_start_flushes_before_file_refs() {
     let _ = p.hook_at(DEAD, "post-tool", "claude", edit.to_string().as_bytes());
     assert_eq!(queue(&p, "fo").len(), 1);
     let ss = p.ev("SessionStart", "fo", json!({"source": "startup"}));
-    let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+    let _ = p.hook_content(&url, "session-start", "claude", ss.to_string().as_bytes());
     assert!(queue(&p, "fo").is_empty(), "{}", p.log());
     let cache: Value =
         serde_json::from_str(&std::fs::read_to_string(p.cache().join("file-refs.json")).unwrap())
@@ -2641,7 +2956,7 @@ fn subagent_start_uses_matching_spawn() {
         "pre-tool",
         &spawn_ev(&p, "sm", "Agent", Some("Plan"), "пульсар мигает"),
     );
-    let (o, _) = p.hook_at(
+    let (o, _) = p.hook_content(
         &url,
         "subagent-start",
         "codex",
@@ -2694,21 +3009,22 @@ fn subagent_start_server_down_silent() {
     let p = Proj::new("subagent-down", DEAD, "zam_x");
     pre_dead(&p, &spawn_ev(&p, "sd", "Agent", Some("Plan"), "пульсар"));
     assert_eq!(spawns(&p, "sd").len(), 1);
-    let (o, d) = p.hook_at(
+    let (o, d) = p.hook_best(
         DEAD,
         "subagent-start",
         "claude",
         sub_ev(&p, "sd", "a1", "Plan").to_string().as_bytes(),
     );
     empty(&o);
-    assert!(d <= OTHER_MAX, "{d:?}");
+    assert!(d <= max_inner("subagent-start"), "{d:?}");
     assert!(spawns(&p, "sd").is_empty());
     let ev = events(&p, "sd");
     assert!(ev.iter().any(|e| e["ev"] == "subagent"), "{ev:?}");
 }
 
-/// Бюджет 300 мс: с живым сервером p95 ≤ 1200 мс (×4, как `session-start`); сервер, который
-/// принимает соединение и молчит, — тишина не дольше 1 с.
+/// Бюджет 300 мс: с живым сервером внутри процесса медиана — в бюджете, p95 ≤ 1200 мс (×4, как
+/// `session-start`; [`assert_series`]); сервер, который принимает соединение и молчит, — тишина
+/// не дольше полутора бюджетов (лучший из повторов).
 #[test]
 fn subagent_start_budget_300ms() {
     let _g = serial();
@@ -2743,9 +3059,14 @@ fn subagent_start_budget_300ms() {
         answered >= need,
         "с пакетом только {answered} из 20 (нужно {need})"
     );
-    let q = p95(times);
-    eprintln!("ZAM_TIMING subagent-start p95={q:?}");
-    assert!(q <= max_for("session-start"), "p95 {q:?}");
+    let q = assert_series(
+        "subagent-start",
+        times,
+        Duration::from_millis(budget_ms("subagent-start")),
+        max_for("subagent-start"),
+        &[],
+    );
+    eprintln!("ZAM_TIMING subagent-start внутри процесса p95={q:?}");
     // «чёрная дыра»: соединение принято, ответа нет
     let hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = format!("http://{}", hole.local_addr().unwrap());
@@ -2755,14 +3076,14 @@ fn subagent_start_budget_300ms() {
             keep.push(s);
         }
     });
-    let (o, d) = p.hook_at(
+    let (o, d) = p.hook_best(
         &addr,
         "subagent-start",
         "claude",
         sub_ev(&p, "sb-hole", "a1", "Plan").to_string().as_bytes(),
     );
     empty(&o);
-    assert!(d <= OTHER_MAX, "{d:?}");
+    assert!(d <= max_inner("subagent-start"), "{d:?}");
 }
 
 /// Ревью задачи 10 (M-2): `session-start` снимает просроченные записи очереди своей сессии, а
@@ -2833,7 +3154,7 @@ fn local_tokens_flushed_by_hook() {
     let p = Proj::new("tokens", &url, &tok);
     write_cache(&p, &url);
     let mut want = 0;
-    let (o, _) = p.hook_at(
+    let (o, _) = p.hook_content(
         &url,
         "pre-tool",
         "claude",
@@ -2847,7 +3168,7 @@ fn local_tokens_flushed_by_hook() {
         "tk",
         json!({"tool_name": "Bash", "tool_input": {"command": "git push --force"}}),
     );
-    let (o, _) = p.hook_at(&url, "pre-tool", "claude", push.to_string().as_bytes());
+    let (o, _) = p.hook_content(&url, "pre-tool", "claude", push.to_string().as_bytes());
     want += approx_tokens(&context(&o, "PreToolUse"));
     // тишина — не выдача
     let quiet = p.ev(
@@ -2855,7 +3176,7 @@ fn local_tokens_flushed_by_hook() {
         "tk",
         json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
     );
-    let (o, _) = p.hook_at(&url, "pre-tool", "claude", quiet.to_string().as_bytes());
+    let (o, _) = p.hook_content(&url, "pre-tool", "claude", quiet.to_string().as_bytes());
     empty(&o);
     let q = token_queue(&p, "tk");
     assert_eq!(q.len(), 2, "{q:?}");
@@ -2868,7 +3189,7 @@ fn local_tokens_flushed_by_hook() {
     let pr = p.ev("UserPromptSubmit", "tk", json!({"prompt": "zzqx"}));
     let _ = p.hook_at(DEAD, "prompt", "claude", pr.to_string().as_bytes());
     assert_eq!(token_queue(&p, "tk").len(), 2, "ошибка — очередь цела");
-    let _ = p.hook_at(&url, "prompt", "claude", pr.to_string().as_bytes());
+    let _ = p.hook_content(&url, "prompt", "claude", pr.to_string().as_bytes());
     assert!(token_queue(&p, "tk").is_empty(), "очередь отправлена");
     let s = p.session("tk");
     assert_eq!(
@@ -3175,13 +3496,47 @@ fn git_head(p: &Proj, sha: &str) {
 
 /// Запуски фоновой синхронизации в `hooks.log`: время запуска, мс.
 fn spawns_logged(p: &Proj) -> Vec<f64> {
+    spawn_parts(p).into_iter().map(|x| x.total).collect()
+}
+
+/// Время запуска фоновой синхронизации по частям, мс (строка `hooks.log` «запущена за T мс
+/// (проверки C мс, процесс P мс, отметка W мс)»): проверки, создание процесса, запись отметки
+/// запуска `code-auto.json`.
+#[derive(Debug, Clone, Copy)]
+struct SpawnParts {
+    total: f64,
+    checks: f64,
+    process: f64,
+    mark: f64,
+}
+
+fn spawn_parts(p: &Proj) -> Vec<SpawnParts> {
     p.log()
         .lines()
         .filter_map(|l| {
             let rest = l.split("фоновая синхронизация карты запущена за ").nth(1)?;
-            rest.split_whitespace().next()?.parse().ok()
+            let num = |after: &str| -> Option<f64> {
+                let r = if after.is_empty() {
+                    rest
+                } else {
+                    rest.split(after).nth(1)?
+                };
+                r.split_whitespace().next()?.parse().ok()
+            };
+            Some(SpawnParts {
+                total: num("")?,
+                checks: num("(проверки ")?,
+                process: num(", процесс ")?,
+                mark: num(", отметка ")?,
+            })
         })
         .collect()
+}
+
+/// p95 чисел.
+fn p95_f(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[(v.len() * 95).div_ceil(100) - 1]
 }
 
 fn sha(n: u32) -> String {
@@ -3239,28 +3594,51 @@ fn session_start_spawns_background_sync_once_per_interval() {
     let _ = start("a6");
     assert_eq!(spawns_logged(&p).len(), 4, "{}", p.log());
     // 20 запусков, каждый со сменой HEAD (отсоединённый): время запуска p95 ≤ 10 мс
-    let mut hook_times = Vec::new();
+    let (mut hook_times, mut idle) = (Vec::new(), Vec::new());
     for i in 0..20 {
         std::fs::write(p.repo.join(".git/HEAD"), format!("{}\n", sha(200 + i))).unwrap();
         let (o, d) = start(&format!("t{i}"));
         empty(&o);
         hook_times.push(d);
+        idle.push(p.idle("session-start"));
     }
-    let t: Vec<f64> = spawns_logged(&p).into_iter().skip(4).collect();
+    let t: Vec<SpawnParts> = spawn_parts(&p).into_iter().skip(4).collect();
     assert_eq!(t.len(), 20, "{}", p.log());
-    let mut sorted = t.clone();
-    sorted.sort_by(f64::total_cmp);
-    let q = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+    // запуск — проверки и создание процесса: то, чего хук «не ждёт»; отметка `code-auto.json` —
+    // запись файла кэша, как любая другая у хука
+    let launch = p95_f(t.iter().map(|x| x.checks + x.process).collect());
+    let mut marks: Vec<f64> = t.iter().map(|x| x.mark).collect();
+    marks.sort_by(f64::total_cmp);
+    let mark_p50 = marks[marks.len() / 2];
     eprintln!(
-        "ZAM_TIMING запуск фоновой синхронизации p95={q:.2} мс; хук p95={:?}",
+        "ZAM_TIMING запуск фоновой синхронизации p95={:.2} мс (проверки и процесс p95={launch:.2} мс, \
+         отметка p50={mark_p50:.2} мс, max={:.2} мс); хук внутри процесса p95={:?}",
+        p95_f(t.iter().map(|x| x.total).collect()),
+        marks[marks.len() - 1],
         p95(hook_times.clone())
     );
-    // ≤ 10 мс (§10) — у release; отладочная сборка под нагрузкой соседних тестов — ×4, как
-    // `PRE_TOOL_P95_MAX` (замер release — в журнале этапа)
+    // ≤ 10 мс (§10) — у release; отладочная сборка — ×4 (замер release — в журнале этапа). По
+    // p95 — проверки и создание процесса. Отметка — по медиане: время запуска двухмодальное
+    // (≈ 6 мс и 45–120 мс у 10–15 % запусков), и второй горб — создание временного файла отметки
+    // на занятом диске, а не процесс (замер 17b-http M6: та же запись без запуска процесса даёт
+    // тот же хвост; создание процесса — p95 3 мс); p95 из 20 попадал в него
+    // Хвост создания процесса нормируется разбросом пустого вызова `zam hook` в той же серии
+    // ([`jitter`]): когда все ядра заняты, `CreateProcess` стоит сотни мс и тесту, и хуку
     let max = if cfg!(debug_assertions) { 40.0 } else { 10.0 };
-    assert!(q <= max, "запуск p95 {q} мс: {t:?}");
-    // хук не ждёт фоновый процесс
-    assert!(p95(hook_times) <= max_for("session-start"));
+    let noise = jitter(&idle).as_secs_f64() * 1000.0;
+    assert!(
+        launch <= max + noise,
+        "запуск p95 {launch} мс при разбросе пустого вызова {noise:.2} мс: {t:?}"
+    );
+    assert!(mark_p50 <= max, "отметка запуска p50 {mark_p50} мс: {t:?}");
+    // хук не ждёт фоновый процесс: бюджет `session-start` внутри процесса
+    assert_series(
+        "session-start с запуском синхронизации",
+        hook_times,
+        Duration::from_millis(budget_ms("session-start")),
+        max_for("session-start"),
+        &idle,
+    );
 }
 
 #[test]
@@ -3409,9 +3787,11 @@ fn changed_queue_with_many_symbols_flushed_without_loss() {
 #[test]
 fn changed_flush_partial_failure_returns_rest() {
     let _g = serial();
-    for (name, code, delay) in [
-        ("flush-part-500", 500u16, Duration::ZERO),
-        ("flush-part-slow", 200, Duration::from_secs(3)),
+    // бюджет хука — щедрый (содержимое): у постоянной ошибки — 10 с, у медленной второй пачки
+    // (ответ через 30 с) — 2 с: первая пачка успевает и на занятой машине, вторая — нет
+    for (name, code, delay, budget) in [
+        ("flush-part-500", 500u16, Duration::ZERO, ROOMY_BUDGET_MS),
+        ("flush-part-slow", 200, Duration::from_secs(30), "2000"),
     ] {
         let (url, seen) =
             common::stub_with(std::sync::Arc::new(move |_: &str, path: &str, n: usize| {
@@ -3437,7 +3817,13 @@ fn changed_flush_partial_failure_returns_rest() {
         let part = format!("pq-{}", &blake(b"pq")[..8]);
         std::fs::write(p.cache().join(format!("changed-{part}.jsonl")), text).unwrap();
         let ss = p.ev("SessionStart", "pq-new", json!({"source": "startup"}));
-        let _ = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+        let _ = p.hook_env(
+            &url,
+            "session-start",
+            "claude",
+            ss.to_string().as_bytes(),
+            &[("ZAM_TEST_HOOK_BUDGET_MS", budget)],
+        );
         let posts: Vec<Value> = seen
             .lock()
             .unwrap()
@@ -3445,7 +3831,12 @@ fn changed_flush_partial_failure_returns_rest() {
             .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
             .map(|(_, _, b)| b.clone())
             .collect();
-        assert!(posts.len() >= 2, "{name}: пачек {}", posts.len());
+        assert!(
+            posts.len() >= 2,
+            "{name}: пачек {}: {}",
+            posts.len(),
+            p.log()
+        );
         let sent: Vec<String> = posts[0]["files"]
             .as_array()
             .unwrap()
@@ -3558,7 +3949,14 @@ impl EpochMisses {
 /// `PreCompact` (`checkpoint`, M6 §7.2: «в бюджете хука 100 мс»): `POST /sessions {id,
 /// new_epoch: true}` идёт с тайм-аутом по остатку бюджета (100 мс − резерв 30 мс = 70 мс на
 /// HTTP) — медленный сервер хук не задерживает; и без `SessionStart` (сессии ещё нет), и после
-/// него; вывод — тишина. Время процесса отладочной сборки — по правилу файла (×4, 400 мс).
+/// него; вывод — тишина. Время — внутри процесса, по правилу файла.
+///
+/// «`Stop` эпоху не меняет» проверяется на сессии, чьи запросы эпохи шли со щедрым бюджетом
+/// ([`Proj::hook`]) и потому все завершены. С бюджетом продукта проверка гонялась с сервером:
+/// запрос, снятый клиентом по сроку, сервер дообрабатывает и после выхода хука (HTTP отмены не
+/// несёт; строка `sessions(new_epoch): сеть` так и говорит — «сервер мог успеть её начать»), и
+/// эпоха росла уже после замера (17b-http M6). Для сессий с бюджетом продукта остаётся проверка
+/// без гонки — диапазон «дошло ..= дошло + снято по сроку».
 #[test]
 fn checkpoint_precompact_new_epoch_in_hook_budget() {
     let _g = serial();
@@ -3575,11 +3973,19 @@ fn checkpoint_precompact_new_epoch_in_hook_budget() {
     let q = Proj::new("precompact-slow", &slow, "zam_x");
     let warm = q.ev("Stop", "ps-warm", json!({"stop_hook_active": false}));
     let _ = q.hook_at(&slow, "checkpoint", "claude", warm.to_string().as_bytes());
-    let (o, d) = q.hook_at(&slow, "checkpoint", "claude", pc(&q, "ps-1").as_bytes());
-    empty(&o);
+    // лучший из трёх — полтора бюджета (срок запроса — абсолютный); худший не сверяется: одна
+    // запись в файл на занятом диске изредка стоит секунду и больше
+    let mut slow_times = Vec::new();
+    for i in 0..3 {
+        let ev = pc(&q, &format!("ps-{}", i + 1));
+        let (o, d) = q.hook_at(&slow, "checkpoint", "claude", ev.as_bytes());
+        empty(&o);
+        slow_times.push(d);
+    }
+    let best = *slow_times.iter().min().unwrap();
     assert!(
-        d <= max_for("checkpoint"),
-        "медленный сервер задержал хук: {d:?}"
+        best <= max_inner("checkpoint"),
+        "медленный сервер задержал хук: {slow_times:?}"
     );
     let m = EpochMisses::of(&q.log());
     let posts = seen
@@ -3588,9 +3994,10 @@ fn checkpoint_precompact_new_epoch_in_hook_budget() {
         .iter()
         .filter(|(m, path, _)| m == "POST" && path == "/api/v1/sessions")
         .count();
-    // запрос ушёл и снят по сроку — или до него не дошло (промах бюджета старта процесса)
+    // каждый из трёх запросов ушёл и снят по сроку — или до него не дошло (промах бюджета старта
+    // процесса); заглушка успевает увидеть не каждый снятый запрос (под нагрузкой — 2 из 3)
     assert!(
-        (posts == 1 && m.net == 1) || (posts == 0 && m.budget >= 1),
+        m.net + m.budget >= 3 && posts <= m.net && posts <= 3,
         "запросов {posts}, {m:?}: {}",
         q.log()
     );
@@ -3650,10 +4057,22 @@ fn checkpoint_precompact_new_epoch_in_hook_budget() {
     let (ok, m) = run("pe-1", 3);
     let e = in_range("pe-1", ok, m);
     assert!(e >= ok && ok >= 1, "эпоха {e}, дошло {ok}");
-    // `Stop` эпоху не меняет
-    let st = p.ev("Stop", "pe-1", json!({"stop_hook_active": false}));
+    // содержимое — со щедрым бюджетом: каждый `PreCompact` — ровно +1, `Stop` эпоху не меняет
+    let before = EpochMisses::of(&p.log());
+    for n in 1..=2 {
+        let ev: Value = serde_json::from_str(&pc(&p, "pe-2")).unwrap();
+        empty(&p.hook("checkpoint", &ev));
+        assert_eq!(p.session("pe-2")["seen_epoch"], n, "{}", p.log());
+    }
+    let st = p.ev("Stop", "pe-2", json!({"stop_hook_active": false}));
     empty(&p.hook("checkpoint", &st));
-    assert_eq!(p.session("pe-1")["seen_epoch"], e);
+    assert_eq!(p.session("pe-2")["seen_epoch"], 2, "{}", p.log());
+    assert_eq!(
+        EpochMisses::of(&p.log()).since(before),
+        EpochMisses::default(),
+        "{}",
+        p.log()
+    );
 }
 
 /// Старый сервер (v0.0.10-m5.7) отвечает на `new_epoch` 400 (`deny_unknown_fields`, «unknown
@@ -3673,7 +4092,9 @@ fn old_server_new_epoch_400_silent() {
         "oe-1",
         json!({"trigger": "manual", "custom_instructions": ""}),
     );
-    let (o, d) = p.hook_at(&url, "checkpoint", "claude", pc.to_string().as_bytes());
+    // содержимое (ответ 400 разобран молча) — со щедрым бюджетом: с бюджетом продукта занятая
+    // машина давала вместо ответа срок запроса; заглушка отвечает сразу — время то же
+    let (o, d) = p.hook_content(&url, "checkpoint", "claude", pc.to_string().as_bytes());
     empty(&o);
     assert!(d <= max_for("checkpoint"), "checkpoint {d:?}");
     let sent = seen.lock().unwrap().clone();
@@ -3707,7 +4128,7 @@ fn old_server_new_epoch_400_silent() {
         "oe-2",
         json!({"trigger": "manual", "custom_instructions": ""}),
     );
-    let (o, _) = p.hook_at(&url, "checkpoint", "claude", pc.to_string().as_bytes());
+    let (o, _) = p.hook_content(&url, "checkpoint", "claude", pc.to_string().as_bytes());
     empty(&o);
     let log = p.log();
     assert!(
@@ -3975,12 +4396,14 @@ fn session_start_fits_channel_codex_and_claude() {
 /// Строка влияния правки в напоминании `Stop` (§12).
 const IMPACT_MARK: &str = "правка затрагивает";
 
-/// Хук `kind` с щедрым бюджетом процесса и сроком `POST /code/impact` (отладочная сборка под
-/// нагрузкой; проверка содержимого, а не времени).
+/// Хук `kind` с щедрым бюджетом процесса и сроками `POST /code/impact` и метки контрольной
+/// группы `POST /sessions {holdout}` (отладочная сборка под нагрузкой; проверка содержимого, а не
+/// времени).
 fn hook_slow(p: &Proj, url: &str, kind: &str, ev: &Value) -> Output {
     p.cmd(url)
-        .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+        .env("ZAM_TEST_HOOK_BUDGET_MS", ROOMY_BUDGET_MS)
         .env("ZAM_TEST_HOOK_IMPACT_MS", "10000")
+        .env("ZAM_TEST_HOOK_HOLDOUT_MS", "10000")
         .args(["hook", kind, "--agent", "claude"])
         .write_stdin(ev.to_string().into_bytes())
         .output()
@@ -4518,7 +4941,7 @@ fn session_start_holdout_only_on_first_start() {
                 (
                     201,
                     r#"{"id":"x","holdout":true}"#.to_string(),
-                    Duration::from_millis(1500),
+                    Duration::from_secs(30),
                 )
             } else if path == "/api/v1/recall" {
                 (
@@ -4536,8 +4959,20 @@ fn session_start_holdout_only_on_first_start() {
     let s = common::holdout_session("hf", 0.5, true);
     let start = |src: &str| {
         let ev = p.ev("SessionStart", &s, json!({"source": src}));
-        // щедрый бюджет процесса; у метки — свой срок 100 мс, она его не дождётся
-        hook_slow(&p, &url, "session-start", &ev)
+        // щедрый бюджет процесса; у метки — свой срок, она его не дождётся (ответ — через
+        // 30 с). Срок метки здесь — 2 с вместо 100 мс продукта: на занятой машине запрос метки за
+        // 100 мс не успевал дойти до заглушки, и проверять было нечего
+        p.hook_env(
+            &url,
+            "session-start",
+            "claude",
+            ev.to_string().as_bytes(),
+            &[
+                ("ZAM_TEST_HOOK_BUDGET_MS", ROOMY_BUDGET_MS),
+                ("ZAM_TEST_HOOK_HOLDOUT_MS", "2000"),
+            ],
+        )
+        .0
     };
     let holds = || {
         seen.lock()
@@ -4771,7 +5206,11 @@ fn prompts_of(body: &Value) -> Vec<String> {
 
 /// §8а: жёсткий срок снимка — `decision: block` у `Stop` не ждёт сборки дольше
 /// `hooks.snapshot_ms` (поток сборки «засыпает» на 30 с через точку подмены `<журнал>.stall-ms`);
-/// опоздавший снимок не кладётся ни в очередь, ни на сервер.
+/// опоздавший снимок не кладётся ни в очередь, ни на сервер. Бюджет хука — щедрый (напоминание —
+/// содержимое: с бюджетом продукта занятая машина превращала его в тишину), ожидание потока
+/// ограничено своим пределом (срок снимка + срок `PUT` + запас, 135 мс), поэтому порог «хук не
+/// ждал поток» — [`LATE_THREAD_MAX`] при сне 30 с, как у соседних тестов; бюджет `checkpoint` —
+/// у `hooks_with_server_within_margin`.
 #[test]
 fn snapshot_deadline_never_delays_stop() {
     let _g = serial();
@@ -4791,10 +5230,10 @@ fn snapshot_deadline_never_delays_stop() {
     );
     let _ = p.hook_at(&url, "checkpoint", "claude", warm.to_string().as_bytes());
     let ev = snap_ev(&p, "Stop", "sd-1", &t, json!({"stop_hook_active": false}));
-    let (o, d) = p.hook_at(&url, "checkpoint", "claude", ev.to_string().as_bytes());
+    let (o, d) = p.hook_content(&url, "checkpoint", "claude", ev.to_string().as_bytes());
     let v = hook_json(&o);
-    assert_eq!(v["decision"], "block", "{v}");
-    assert!(d <= max_for("checkpoint"), "снимок задержал Stop: {d:?}");
+    assert_eq!(v["decision"], "block", "{v}: {}", p.log());
+    assert!(d <= LATE_THREAD_MAX, "снимок задержал Stop: {d:?}");
     assert!(puts(&seen).is_empty(), "{:?}", puts(&seen));
     assert!(snap_file(&p, "snapq", "sd-1").is_none());
     // попытка записана (`at`): следующий `Stop` — не раньше чем через 60 с
@@ -4990,13 +5429,14 @@ fn post_compact_and_session_end_accepted_within_100ms() {
         &t,
         json!({"trigger": "auto", "compact_summary": "8. Current Work:\nмодуль A\n9. Optional Next Step:\nтесты модуля A"}),
     );
-    let (o, d) = p.hook_at(&url, "checkpoint", "claude", pc.to_string().as_bytes());
+    // бюджет — лучшим из повторов (повтор события снимок лишь заменяет): полтора бюджета
+    let (o, d) = p.hook_best(&url, "checkpoint", "claude", pc.to_string().as_bytes());
     empty(&o);
-    assert!(d <= max_for("checkpoint"), "PostCompact: {d:?}");
+    assert!(d <= max_inner("checkpoint"), "PostCompact: {d:?}");
     let end = snap_ev(&p, "SessionEnd", s, &t, json!({"reason": "exit"}));
-    let (o, d) = p.hook_at(&url, "checkpoint", "claude", end.to_string().as_bytes());
+    let (o, d) = p.hook_best(&url, "checkpoint", "claude", end.to_string().as_bytes());
     empty(&o);
-    assert!(d <= max_for("checkpoint"), "SessionEnd: {d:?}");
+    assert!(d <= max_inner("checkpoint"), "SessionEnd: {d:?}");
     let got: Vec<(String, Value)> = puts(&seen).into_iter().skip(before).collect();
     // срок по умолчанию (25 мс) на отладочной сборке под нагрузкой бывает мал — тогда снимок
     // пропускается (это и есть жёсткий срок); проверяется то, что дошло
@@ -5170,10 +5610,12 @@ fn compact_put_before_recall() {
     // сервер ожил: тот же адрес нельзя — новая заглушка, адрес — через ZAM_URL
     let (url3, seen3) = snap_stub(204, "");
     let ss = snap_ev(&q, "SessionStart", s, &t2, json!({"source": "compact"}));
+    // содержимое: срок `PUT` (60 мс) — тоже щедрый, иначе занятая машина оставляет очереди
     let o = q
         .cmd(&url3)
         .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
         .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+        .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
         .args(["hook", "session-start", "--agent", "claude"])
         .write_stdin(ss.to_string().into_bytes())
         .output()
@@ -5585,11 +6027,32 @@ fn slow_snapshot_put_keeps_digest() {
         json!({"source": "resume"}),
     );
     let _ = p.hook_at(&url, "session-start", "claude", warm.to_string().as_bytes());
-    // бюджет по умолчанию: дайджест приходит в пределах хука
-    let (o, d) = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
-    let c = context(&o, "SessionStart");
-    assert!(c.starts_with('D'), "{c}: {}", p.log());
-    assert!(d <= max_for("session-start"), "{d:?}");
+    // бюджет по умолчанию: дайджест приходит в пределах хука — хотя бы в одном из трёх вызовов
+    // (повтор очередь снимка не меняет: сервер отвечает 503; на занятой машине отладочная сборка
+    // не всякий раз доходит до `/recall` за 270 мс)
+    let mut tries = Vec::new();
+    for _ in 0..3 {
+        let (o, d) = p.hook_at(&url, "session-start", "claude", ss.to_string().as_bytes());
+        let c = serde_json::from_str::<Value>(out(&o).trim())
+            .ok()
+            .and_then(|v| {
+                v["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let good = c.starts_with('D') && d <= max_for("session-start");
+        tries.push((c, d));
+        if good {
+            break;
+        }
+    }
+    let (c, d) = tries.last().unwrap();
+    assert!(
+        c.starts_with('D') && *d <= max_for("session-start"),
+        "{tries:?}: {}",
+        p.log()
+    );
     // щедрый бюджет хука (3 с): `PUT` держит `/recall` только свой срок (60 мс,
     // `SNAPSHOT_PUT_MS`), а не до ответа сервера (1 с) — порог посередине, разрыв под нагрузкой
     // широкий
