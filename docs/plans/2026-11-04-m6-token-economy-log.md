@@ -4307,6 +4307,15 @@ UTC, без прогонов на GPU): 182 цели, **2600 PASS, 3 FAIL, 34 ig
 
 ## Ответы владельца
 
+- 2026-11-10, «последнее известное состояние» (М11): раздел снимка в дайджесте — только для
+  оборванной сессии и (в `recovery`) после сжатия контекста; после нормально завершённой сессии
+  (`SessionEnd` → `ended_at`) и после `/clear` — не показывать (до 400 токенов на старт; цель M6 —
+  рост ≤ 15 % к 0.0.9). Снимок завершённой сессии хранится и виден в WebUI. Проведено в разделе
+  «Задача 17c: решение владельца М11».
+- 2026-11-10, ссылки в отчётах (М12): кликабельны только `vscode://file/…`; прочие `vscode:` —
+  текстом (подтверждено; реализация — задача 15a).
+- 2026-11-10, тестовый стенд Linux: выделен под проект целиком — системные изменения (пакеты,
+  пользователи, службы) допустимы без согласования.
 - 2026-11-10, флаги импорта агентом (M10): `own=true` и `axioms=keep` — оставить как в ТЗ: агент может указать их по диктовке пользователя (как с аксиомами, M3); ограничения «только из WebUI» нет.
 - 2026-11-05, вопросы редакции 4: хранение снимка — А (сервер); образцы журналов — А
   (разрешено прочитать по одному журналу Claude Code этого проекта и Codex, фрагменты
@@ -9110,3 +9119,102 @@ P11 заголовок `catch_up` по `taken_at` → `catch_up_staleness_from_l
 
 **Не установлено.** Природа избытка падений HEAD (и реален ли он); насколько генератор похож на настоящую
 нагрузку; release-замеры и Linux не проверялись.
+
+## Задача 17c: решение владельца М11 — снимок только оборванной сессии (2026-11-10)
+
+Решение владельца (2026-11-10, «Ответы владельца», М11): раздел «Последнее известное состояние» в
+дайджесте — только для оборванной сессии; после нормально завершённой сессии (`SessionEnd` →
+`ended_at`) и после `/clear` — нет. `recovery` (свой снимок после сжатия контекста, `resume`) не
+затронут. Снимок завершённой сессии хранится и виден в WebUI. Коммит `fix(snapshot): «последнее
+известное состояние» — только оборванная сессия (решение владельца)` поверх `40465fc` (sha — в
+отчёте контроллеру).
+
+**Что изменено.**
+1. **Переключатель убран** [решение исполнителя]. Константа `SHOW_ENDED`, поле
+   `ShowReq::show_ended` и параметр `show_ended` у `zam_store::digest_snapshot` удалены: решение
+   окончательное, ветка `true` стала бы недостижимым кодом с собственным тестом, а ключа
+   конфигурации у неё не было. Поведение — одно условие отбора в запросе `digest_snapshot`
+   (`crates/zam-store/src/snapshots.rs`): `s.ended_at IS NULL AND p.trigger_kind <> 'session_end'`.
+   Отбор именно в запросе (как в N2 повторного ревью): берётся последний снимок **незавершённой**
+   сессии, поэтому «оборванная A, затем завершённая B» показывает A, а не пусто.
+2. **Живость** в `last_state` (`crates/zam-server/src/api/snapshot.rs`) — одна проверка
+   `last_seen_at` моложе `LIVE_MIN`; условие `ended_at.is_none()` из неё ушло — завершённая сессия
+   до проверки не доходит. Повторной проверки `ended_at` после выбора нет: она недостижима (окно
+   гонки между двумя чтениями — микросекунды, цена — один лишний показ).
+3. **Снимок повода `session_end` у сессии без `ended_at`** [решение исполнителя] — сессия
+   считается **завершённой**, раздела нет. Обоснование: такой снимок снимается только хуком
+   `SessionEnd`, то есть агент сообщил о нормальном конце; `PATCH {ended: true}` и `PUT` снимка
+   идут разными запросами, и при недоступном сервере `PATCH` теряется (повтора нет), а снимок
+   уходит позже из очереди `snapq-*`. Без этого условия каждая обычная сессия, закончившаяся при
+   недоступном сервере, выглядела бы оборванной и стоила бы до 400 токенов на старт — против цели
+   решения. Если такую сессию продолжили (`resume`) и она оборвалась, следующий снимок (`stop`,
+   `pre_compact`, `catch_up`) заменяет `session_end` — и сессия снова выбирается.
+4. `recovery` — без изменений: свой снимок читается `get_snapshot` без отбора завершённых (в том
+   числе у сессии с `ended_at`).
+
+**Случаи.**
+
+| Случай | Раздел в дайджесте | Тест |
+|---|---|---|
+| оборванная: нет `ended_at`, молчит дольше 10 мин | да | `digest_shows_last_state_when_task_stale`, `digest_hides_live_session_by_last_seen` (10:06) |
+| живая: нет `ended_at`, обращалась меньше 10 мин назад | нет | `digest_hides_live_session_by_last_seen` (10:00) |
+| нормально завершённая (`ended_at`), сразу и позже | нет | `digest_hides_live_session_by_last_seen` (10:21, 11:00), `ended_session_snapshot_hidden` (10:00) |
+| `/clear`: старая сессия получила `SessionEnd`, новая стартует сразу | нет | `ended_session_snapshot_hidden` (09:10) |
+| оборванная A, затем завершённая B | да, снимок A | `abandoned_then_ended_shows_abandoned`, `digest_snapshot_skips_ended_sessions` (`zam-store`) |
+| `PATCH ended` не дошёл, снимка `SessionEnd` тоже нет (или отметка снята) | да — выглядит оборванной (приемлемо) | `ended_session_snapshot_hidden` (10:45), `digest_snapshot_skips_ended_sessions` (E) |
+| снимок повода `session_end`, `ended_at` нет (`PATCH` потерян) | нет | `session_end_snapshot_without_ended_hidden`, `abandoned_then_ended_shows_abandoned` (второй мир), `digest_snapshot_skips_ended_sessions` (D, B) |
+| то же, затем снимок другого повода (работу продолжили) | да | `session_end_snapshot_without_ended_hidden` (10:30), `digest_snapshot_skips_ended_sessions` (D) |
+| догоняющий снимок `catch_up` оборванной сессии | да | `catch_up_staleness_from_last_seen` |
+| `recovery` после сжатия (своя сессия, жива) | да, без конспекта | `recovery_without_summary` |
+| `recovery` своей сессии с `ended_at` | да | `ended_session_snapshot_hidden` (10:05) |
+| снимок завершённой сессии хранится (`GET` — 200, WebUI) | — | `ended_session_snapshot_hidden` |
+
+**Тесты.** `crates/zam-server/tests/snapshot.rs`: изменён `digest_hides_live_session_by_last_seen`
+(«ended — показывается сразу» → не показывается ни в 10:21, ни в 11:00);
+`abandoned_then_ended_shows_latest` заменён на `abandoned_then_ended_shows_abandoned` (два мира:
+у B отметка `ended_at` при снимке обычного повода; у B только снимок `session_end`); новые
+`ended_session_snapshot_hidden`, `session_end_snapshot_without_ended_hidden`.
+`crates/zam-store/tests/snapshots.rs`: `digest_snapshot_can_skip_ended_sessions` заменён на
+`digest_snapshot_skips_ended_sessions` (оба признака конца порознь, снятие отметки, смена повода).
+
+**Документы.** `guide.{ru,en}.md` (раздел «Снимок сессии», «Что увидишь»: оборванная сессия; после
+обычного конца и `/clear` раздела нет; восстановление — после сжатия); спецификация
+`docs/specs/2026-11-04-m6-token-economy.md` — **редакция 4.8** (§8а «Показ», §15 — ответ М11, §16
+задача 17, §17 п. 19 — случай «Обычный конец и `/clear`»); `deploy/config.example.toml` и
+`config.rs` (комментарий `snapshot_tokens`). Страница WebUI «Подключение агента» не менялась: там
+уже «Снимок оборванной сессии приходит следующей сессии…», условие описано верно.
+
+**Откаты** (`.tmp/m6/task17c/r4/rollbacks4.py`, журнал `r4/rollbacks.log`): 7, все FAIL ожидаемыми
+тестами. Q1 запрос без отбора `ended_at` → `digest_snapshot_skips_ended_sessions`; Q1s то же через
+дайджест → `digest_hides_live_session_by_last_seen`, `abandoned_then_ended_shows_abandoned`,
+`ended_session_snapshot_hidden`; Q2 запрос без отбора `session_end` →
+`digest_snapshot_skips_ended_sessions`; Q2s то же через дайджест →
+`session_end_snapshot_without_ended_hidden`, `abandoned_then_ended_shows_abandoned`; Q3 живость не
+проверяется → `digest_hides_live_session_by_last_seen`; Q4 восстановление отбрасывает завершённую
+сессию → `ended_session_snapshot_hidden`; Q5 отбор после выбора («последний снимок, и если
+завершён — пусто») → `abandoned_then_ended_shows_abandoned`. Первый прогон Q1s показал пробел
+теста: в мире с `ended_at` снимок B тоже имел повод `session_end`, и откат отбора `ended_at` его
+не ронял — признаки конца в тесте разведены, повтор Q1s — FAIL всеми тремя тестами.
+
+**Проверка** (`target/t17c`, `ZAM_REQUIRE_ML=1`, журналы — `.tmp/m6/task17c/r4/`; только
+`-p zam-server -p zam-store` — в дереве чужие незакоммиченные правки `zam-cli`):
+- `zam-store`: `snapshots` 4, `sessions` 15 — PASS (`t3-store.log`).
+- `zam-server`: lib 280 (1 пропущен) (`t2-server.log`); `snapshot` 25, `recall` 40 (1 пропущен),
+  `recall_recovery` 6, `recall_frozen` 4, `recall_brief` 9, `sessions` 17, `agent_setup` 14,
+  `m57_acceptance` 13 — PASS (`t3-server.log`; `snapshot` после правки теста — `t4-snapshot.log`).
+- `cargo clippy -p zam-server -p zam-store --all-targets --features zam-server/test-hooks -- -D
+  warnings` — чисто; `rustfmt --edition 2024 --check` по своим файлам — чисто.
+- `zam-cli` и `hook_budgets` не запускались (клиент не менялся); WebUI не менялся.
+
+**Передать.**
+- → 17d: замер сценариев «вторая сессия после обычной первой» и «после `/clear`» теперь должен
+  показать **отсутствие** раздела снимка (0 токенов); раздел остаётся только в сценариях «обрыв»
+  (нет `SessionEnd`, молчание дольше 10 мин) и `recovery`. Передача I3 («почти после любой обычной
+  сессии с правками») больше не действует.
+- → 13a/13c: ТЗ v1.24 §8а — условие показа по редакции 4.8 спецификации (оборванная сессия; два
+  признака конца — `ended_at` и повод `session_end`); CHANGELOG `0.0.11-m6` — «снимок в дайджесте
+  только после оборванной сессии». `SHOW_ENDED` из передач прежних кругов 17c — вычеркнуть.
+- → M7 (к пункту о клиенте снимка): `PATCH {ended: true}` при недоступном сервере не повторяется —
+  в WebUI такая сессия остаётся без пометки «завершена»; на показ это не влияет (повод
+  `session_end`), но отметку можно ставить сервером при приёме снимка `session_end`.
+- `target/t17c` удалён после работы.
