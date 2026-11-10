@@ -275,8 +275,12 @@ impl Proj {
         out
     }
 
-    /// `zam hook <kind> --agent claude` с событием `ev` на адрес `url`.
+    /// `zam hook <kind> --agent claude` с событием `ev` на адрес `url`, с бюджетом продукта.
     fn hook_at(&self, url: &str, kind: &str, ev: &Value) -> Output {
+        self.hook_cmd(url, kind, ev).output().unwrap()
+    }
+
+    fn hook_cmd(&self, url: &str, kind: &str, ev: &Value) -> assert_cmd::Command {
         let mut c = common::zam_cmd();
         c.env("ZAM_URL", url)
             .env("ZAM_TOKEN", &self.token)
@@ -285,11 +289,19 @@ impl Proj {
             .current_dir(&self.repo)
             .args(["hook", kind, "--agent", "claude"])
             .write_stdin(ev.to_string().into_bytes());
-        c.output().unwrap()
+        c
     }
 
+    /// Хук ради содержимого — со
+    /// щедрым бюджетом (`ZAM_TEST_HOOK_BUDGET_MS`): критерий приёмки — содержимое, а с бюджетом
+    /// продукта отладочная сборка на занятой машине молчит (fail-open); время и бюджеты проверяют
+    /// `hooks` и release `hook_budgets` (ревью 17b-http M6). Замер
+    /// времени (`acceptance_hook_budgets_with_map`) — [`Proj::hook_at`].
     fn hook(&self, kind: &str, ev: &Value) -> Output {
-        self.hook_at(&self.url, kind, ev)
+        self.hook_cmd(&self.url, kind, ev)
+            .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+            .output()
+            .unwrap()
     }
 
     fn ev(&self, event: &str, session: &str, extra: Value) -> Value {
@@ -895,8 +907,9 @@ fn acceptance_hook_budgets_with_map() {
                     )
                 }
             };
+            // критерий — время: бюджет продукта
             let t = std::time::Instant::now();
-            let o = p.hook(kind, &ev);
+            let o = p.hook_at(&p.url, kind, &ev);
             let d = t.elapsed();
             let c = context(&o);
             // первые два — прогрев (первые запросы отладочного сервера, фоновая синхронизация)

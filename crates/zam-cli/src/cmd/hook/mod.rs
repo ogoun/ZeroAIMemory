@@ -8,7 +8,10 @@
 //! - **Корень** — [`project_root`]: каталог с `.zeroaimemory/` вверх от `cwd` из stdin, иначе
 //!   корень git, иначе `cwd`; там `.zeroaimemory/cache/` ([`cache`]) и `.zeroaimemory/logs/`.
 //!   Решение — ближайший `solution.toml` вверх от `cwd`.
-//! - **Бюджеты** (§10.3): тайм-аут HTTP — бюджет минус [`HTTP_RESERVE_MS`] от старта процесса.
+//! - **Бюджеты** (§10.3): срок HTTP — абсолютный момент [`Env::http_deadline`]: старт процесса +
+//!   бюджет − [`HTTP_RESERVE_MS`]. Он один на все запросы хука: срок каждого запроса — остаток
+//!   до этого момента при отправке, последовательные запросы и параллельные потоки его делят;
+//!   без остатка запрос не начинается (одна строка `… бюджет исчерпан до запроса к серверу`).
 //! - **Переключатели** (решение контроллера R5, [`Settings`]): `[hooks]` в
 //!   `~/.zeroaimemory/config.toml` и `<корень>/.zeroaimemory/config.toml` (проект сильнее
 //!   домашнего), затем настройка сервера из ответа `/recall(session_start)` (кэш
@@ -489,22 +492,29 @@ impl Env {
         Duration::from_millis(self.budget_ms()).saturating_sub(self.started.elapsed())
     }
 
-    /// Остаток бюджета на HTTP: бюджет минус [`HTTP_RESERVE_MS`] от старта процесса.
+    /// Абсолютный срок HTTP хука: старт процесса + бюджет − [`HTTP_RESERVE_MS`]. К этому моменту
+    /// кончаются все запросы хука, когда бы они ни начались.
+    pub fn http_deadline(&self) -> Instant {
+        self.started + Duration::from_millis(self.budget_ms().saturating_sub(HTTP_RESERVE_MS))
+    }
+
+    /// Остаток бюджета на HTTP — до [`Env::http_deadline`]; вышел — `None`.
     pub fn http_left(&self) -> Option<Duration> {
-        let total = Duration::from_millis(self.budget_ms().saturating_sub(HTTP_RESERVE_MS));
-        total
-            .checked_sub(self.started.elapsed())
+        self.http_deadline()
+            .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
     }
 
-    /// Клиент API с тайм-аутом по остатку бюджета; нет адреса, токена или времени — `None`
-    /// (причина — в журнал).
+    /// Клиент API со сроком [`Env::http_deadline`] на все его запросы (клиент можно
+    /// переиспользовать и делить между потоками: второго срока не будет); нет адреса, токена или
+    /// времени — `None` (причина — в журнал).
     pub fn client(&self) -> Option<Client> {
         self.client_within(Duration::MAX)
     }
 
-    /// [`Env::client`] со сроком запроса не больше `cap` (свой срок запроса внутри бюджета
-    /// хука: `POST /code/impact` у `checkpoint`, M6 §12).
+    /// [`Env::client`] со своим сроком внутри бюджета хука: все запросы клиента кончаются не
+    /// позже чем через `cap` от его создания и не позже [`Env::http_deadline`] (`POST
+    /// /code/impact` у `checkpoint`, метка контрольной группы, `PUT` снимка).
     pub fn client_within(&self, cap: Duration) -> Option<Client> {
         let r = match locate::resolve(&Flags::default(), &super::zam_env(), &self.cwd, &self.home) {
             Ok(r) => r,
@@ -521,7 +531,7 @@ impl Env {
             self.log(&e);
             return None;
         }
-        let Some(left) = self.http_left() else {
+        if self.http_left().is_none() {
             // сколько прошло от старта процесса — для разбора промаха (журнал задачи 5 M6)
             self.log(&format!(
                 "{} (прошло {} мс)",
@@ -529,12 +539,16 @@ impl Env {
                 self.started.elapsed().as_millis()
             ));
             return None;
-        };
+        }
+        let hook = self.http_deadline();
+        let at = Instant::now()
+            .checked_add(cap)
+            .map_or(hook, |own| own.min(hook));
         Some(Client::with_timeouts(
             &url.value,
             &token.value,
             self.solution.as_ref().map(|s| s.id.clone()),
-            Timeouts::Deadline(left.min(cap)),
+            Timeouts::Deadline(at),
         ))
     }
 
@@ -615,7 +629,27 @@ pub fn run(kind: Kind, agent: Agent, started: Instant) -> u8 {
         let mut so = std::io::stdout().lock();
         let _ = so.write_all(text.as_bytes()).and_then(|_| so.flush());
     }
+    test_timing(kind, started);
     0
+}
+
+/// Тестовый канал времени (только отладочная сборка и фича `test-hooks`, как
+/// `ZAM_TEST_HOOK_BUDGET_MS`): `ZAM_TEST_HOOK_TIMING` — файл, в который хук после вывода дописывает
+/// строку `<команда> <микросекунды от старта процесса>`. Тесты времени сверяют с бюджетом хука
+/// это время — внутри процесса, от того же `started`, что и бюджет, — а не время запуска и выхода
+/// отладочного exe.
+fn test_timing(kind: Kind, started: Instant) {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(path) = std::env::var_os("ZAM_TEST_HOOK_TIMING") {
+        let line = format!("{} {}\n", kind.as_str(), started.elapsed().as_micros());
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+    }
+    #[cfg(not(any(feature = "test-hooks", debug_assertions)))]
+    let _ = (kind, started);
 }
 
 fn handle(kind: Kind, agent: Agent, started: Instant, raw: &input::Raw) -> Output {

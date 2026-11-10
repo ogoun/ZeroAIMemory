@@ -2244,7 +2244,7 @@ async fn digest(
 }
 
 /// Раздел «Последнее известное состояние» (M6 §8а, [`super::snapshot::last_state`]): дайджест —
-/// только в решении запроса; сбой чтения — WARN и без раздела (дайджест не валится), срок сбора
+/// только в решении запроса и только снимок оборванной сессии; сбой чтения — WARN и без раздела (дайджест не валится), срок сбора
 /// вышел — без раздела.
 #[allow(clippy::too_many_arguments)]
 async fn snapshot_part(
@@ -2288,7 +2288,6 @@ async fn snapshot_part(
             .map(|(i, v)| (targets[i].db.clone(), v))
             .collect(),
         recovery,
-        show_ended: super::snapshot::SHOW_ENDED,
         now: zam_store::time::now(),
         cfg: &st.cfg.recall,
     };

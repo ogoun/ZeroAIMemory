@@ -1218,6 +1218,7 @@ pub fn prune_spawns(env: &Env, session: &str) {
 /// `tokens-*.jsonl`, снимок сессии `snapst-*.json` и `snapq-*.json`) и привязки `agent-*.json` (M6 §7.1) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
 /// временные `.*.tmp` и замки старше [`TMP_TTL`].
 pub fn gc_cache(env: &Env) {
+    gc_stall();
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
         return;
     };
@@ -1255,6 +1256,19 @@ pub fn gc_cache(env: &Env) {
         if old {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+/// Точка подмены для тестов (только отладочная сборка и фича `test-hooks`, как
+/// `ZAM_TEST_FLUSH_STALL_MS`): `ZAM_TEST_GC_STALL_MS` — пауза перед уборкой кэша (долгая уборка
+/// на занятом диске: хук её не ждёт дольше бюджета, привязка сессии записана до неё).
+fn gc_stall() {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::env::var("ZAM_TEST_GC_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 

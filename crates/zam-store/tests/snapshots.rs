@@ -165,14 +165,16 @@ async fn gc_sessions_drops_snapshots() {
     assert!(get_snapshot(&db, "fresh").await.unwrap().is_some());
 }
 
-/// Повторное ревью 17c, N2: «оборванная A, затем завершённая B». С показом завершённых берётся
-/// последний снимок (B); без него завершённые не выбираются в самом запросе — остаётся снимок A,
-/// а не пусто. Своя сессия (`except`) и другое решение не выбираются.
+/// §8а (решение владельца 2026-11-10): в дайджест идёт только снимок незавершённой сессии.
+/// «Оборванная A, затем завершённая B» — завершённые не выбираются в самом запросе, остаётся
+/// снимок A, а не пусто. Завершена — `ended_at` (E: отметка снята — снимок выбирается) или снимок
+/// повода `session_end` без `ended_at` (D: следующий снимок другого повода — выбирается). Своя
+/// сессия (`except`), другое решение и снимки раньше `since` не выбираются.
 #[tokio::test]
-async fn digest_snapshot_can_skip_ended_sessions() {
+async fn digest_snapshot_skips_ended_sessions() {
     let (_dd, db) = db("digest-ended").await;
     let guid = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e17";
-    for id in ["A", "B", "C"] {
+    for id in ["A", "B", "C", "D", "E"] {
         let s = SessionTouch {
             id: id.into(),
             solution_guid: Some(guid.parse().unwrap()),
@@ -181,40 +183,44 @@ async fn digest_snapshot_can_skip_ended_sessions() {
         touch_session(&db, &s).await.unwrap();
     }
     session(&db, "other").await;
-    put_snapshot(&db, &row("A", "2026-11-05T09:00:00Z", SnapTrigger::Stop))
-        .await
-        .unwrap();
-    put_snapshot(
-        &db,
-        &row("B", "2026-11-05T10:00:00Z", SnapTrigger::SessionEnd),
-    )
-    .await
-    .unwrap();
-    put_snapshot(
-        &db,
-        &row("other", "2026-11-05T11:00:00Z", SnapTrigger::Stop),
-    )
-    .await
-    .unwrap();
-    assert!(end_session(&db, "B", true).await.unwrap());
+    for (id, at, trigger) in [
+        ("A", "2026-11-05T09:00:00Z", SnapTrigger::Stop),
+        ("B", "2026-11-05T10:00:00Z", SnapTrigger::SessionEnd),
+        ("D", "2026-11-05T10:30:00Z", SnapTrigger::SessionEnd),
+        ("E", "2026-11-05T10:45:00Z", SnapTrigger::Stop),
+        ("other", "2026-11-05T11:00:00Z", SnapTrigger::Stop),
+    ] {
+        put_snapshot(&db, &row(id, at, trigger)).await.unwrap();
+    }
+    for id in ["B", "E"] {
+        assert!(end_session(&db, id, true).await.unwrap());
+    }
     let since = ts("2026-11-04T00:00:00Z");
-    let pick = |except: Option<&'static str>, show_ended: bool| {
+    let pick = |except: Option<&'static str>| {
         let db = db.clone();
         async move {
-            digest_snapshot(&db, guid, except, since, show_ended)
+            digest_snapshot(&db, guid, except, since)
                 .await
                 .unwrap()
                 .map(|r| r.session_id)
         }
     };
-    assert_eq!(pick(Some("C"), true).await.as_deref(), Some("B"));
-    assert_eq!(pick(Some("C"), false).await.as_deref(), Some("A"));
-    assert_eq!(pick(Some("A"), false).await, None);
-    assert_eq!(pick(Some("B"), true).await.as_deref(), Some("A"));
+    // B и E завершены (`ended_at`), D — снимок `session_end`: остаётся оборванная A
+    assert_eq!(pick(Some("C")).await.as_deref(), Some("A"));
+    assert_eq!(pick(None).await.as_deref(), Some("A"));
+    assert_eq!(pick(Some("A")).await, None);
     // окно: снимки раньше `since` не выбираются
     let late = ts("2026-11-05T09:30:00Z");
-    assert_eq!(
-        digest_snapshot(&db, guid, None, late, false).await.unwrap(),
-        None
-    );
+    assert_eq!(digest_snapshot(&db, guid, None, late).await.unwrap(), None);
+    // отметка конца снята (сессию продолжили): E — обычная незавершённая, её снимок последний
+    assert!(end_session(&db, "E", false).await.unwrap());
+    assert_eq!(pick(Some("C")).await.as_deref(), Some("E"));
+    // у B отметка снята, но последний снимок — `session_end`: по-прежнему завершённая
+    assert!(end_session(&db, "B", false).await.unwrap());
+    assert_eq!(pick(Some("E")).await.as_deref(), Some("A"));
+    // D сняла снимок другого повода (работа продолжилась и оборвалась) — выбирается
+    put_snapshot(&db, &row("D", "2026-11-05T11:30:00Z", SnapTrigger::Stop))
+        .await
+        .unwrap();
+    assert_eq!(pick(Some("C")).await.as_deref(), Some("D"));
 }

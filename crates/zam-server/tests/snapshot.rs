@@ -1,8 +1,8 @@
 //! Снимок сессии на сервере (M6 §8а, задача 17c): `PUT|GET /sessions/{id}/snapshot` (явная
 //! сессия, чужое — 404, предел размера, повторная маскировка), срок хранения и удаление с
 //! сессией, показ «последнего известного состояния» в дайджесте и пакете восстановления
-//! (условие «давно не обновлялась», живость по `last_seen_at`, признаки «работа продолжилась»,
-//! квоты частей, выключатель, детерминизм).
+//! (только оборванная сессия — не завершённая и не живая по `last_seen_at`, условие «давно не
+//! обновлялась», признаки «работа продолжилась», квоты частей, выключатель, детерминизм).
 //!
 //! Все тесты файла замораживают часы (`freeze_now` держит блокировку тестовых точек): часы общие
 //! для процесса, и сроки (живость 10 мин, давность 30 мин, срок захвата) задаются ими. Повторный
@@ -601,7 +601,9 @@ async fn digest_shows_last_state_when_task_stale() {
 }
 
 /// §8а: живая сессия (нет `ended_at`, `last_seen_at` моложе 10 мин) — снимок не показывается;
-/// решает `last_seen_at` сервера: закончилась (`ended`) или молчит 10 мин — показывается.
+/// решает `last_seen_at` сервера: молчит 10 мин — оборвана, показывается. Закончилась (`ended`) —
+/// не показывается ни сразу, ни когда перестала быть «живой» по времени (решение владельца
+/// 2026-11-10).
 #[tokio::test]
 async fn digest_hides_live_session_by_last_seen() {
     let a = world("live", |_| {}).await;
@@ -631,7 +633,7 @@ async fn digest_hides_live_session_by_last_seen() {
             "молчит больше 10 мин"
         );
     }
-    // снова обращение и конец сессии: ended — показывается сразу
+    // снова обращение и конец сессии: ended — не показывается
     {
         let _c = at("10:20");
         let r = a
@@ -653,11 +655,11 @@ async fn digest_hides_live_session_by_last_seen() {
             .await;
         assert_eq!(r.status, StatusCode::OK);
     }
-    {
-        let _c = at("10:21");
+    for hm in ["10:21", "11:00"] {
+        let _c = at(hm);
         assert!(
-            section(&digest(&a, "B").await).is_some(),
-            "ended_at — не живая"
+            section(&digest(&a, "B").await).is_none(),
+            "{hm}: ended_at — завершена, не оборвана"
         );
     }
 }
@@ -1314,38 +1316,242 @@ async fn guide_has_snapshot_section() {
     }
 }
 
-/// Повторное ревью 17c, N2: «оборванная A, затем завершённая B» — при показе завершённых
-/// (`SHOW_ENDED`, как сейчас) дайджест берёт последний снимок, то есть снимок B. Ветка `false`
-/// (снимок B не выбирается, остаётся A) — отбор в запросе, тест `zam-store`
-/// `digest_snapshot_can_skip_ended_sessions`.
+/// `PATCH /sessions/{id} {ended}` (хук `SessionEnd`; `false` — снять отметку).
+async fn set_ended(a: &Api, id: &str, ended: bool) {
+    let r = a
+        .t(
+            Method::PATCH,
+            &format!("/api/v1/sessions/{id}"),
+            Some(json!({"ended": ended})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+}
+
+/// §8а (решение владельца 2026-11-10): «оборванная A, затем завершённая B» — снимок завершённой
+/// B (`ended_at`, снимок обычного повода) не выбирается и не заслоняет снимок A: дайджест
+/// показывает A. То же, если отметка `ended_at` у B не дошла, но её снимок снят на `SessionEnd`.
 #[tokio::test]
-async fn abandoned_then_ended_shows_latest() {
-    let a = world("ended-after", |_| {}).await;
+async fn abandoned_then_ended_shows_abandoned() {
+    for (name, patch) in [("ended-after", true), ("ended-after-lost", false)] {
+        let a = world(name, |_| {}).await;
+        abandoned(&a).await;
+        {
+            let _c = at("09:30");
+            register(&a, "B", true, None).await;
+        }
+        {
+            let _c = at("09:40");
+            let mut b = body(&t("09:40").to_string(), json!({"files": ["src/b.rs"]}));
+            // признаки конца — порознь: либо отметка `ended_at`, либо повод снимка
+            if !patch {
+                b["trigger"] = json!("session_end");
+            }
+            let r = put_as(&a, &a.token, "B", Some("B"), b).await;
+            assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+            if patch {
+                set_ended(&a, "B", true).await;
+            }
+        }
+        let _c = at("10:00");
+        let text = digest(&a, "C").await;
+        let sec = section(&text).unwrap_or_else(|| panic!("{name}: нет раздела: {text}"));
+        assert!(
+            sec.starts_with("### Последнее известное состояние (снимок 2026-11-10 09:00:00,"),
+            "{name}: {sec}"
+        );
+        assert!(
+            sec.contains("Файлы: src/parser.rs") && !sec.contains("src/b.rs"),
+            "{name}: {sec}"
+        );
+    }
+}
+
+/// §8а (решение владельца 2026-11-10): после нормально завершённой сессии (`SessionEnd` →
+/// `ended_at`; так же заканчивается старая сессия при `/clear`) раздела в дайджесте нет — ни
+/// сразу, ни позже; снимок хранится (`GET` — 200), свой пакет восстановления его показывает.
+/// Отметка снята (или не дошла — сессия выглядит оборванной) — раздел есть.
+#[tokio::test]
+async fn ended_session_snapshot_hidden() {
+    let a = world("ended", |_| {}).await;
     abandoned(&a).await;
     {
-        let _c = at("09:30");
-        register(&a, "B", true, None).await;
+        let _c = at("09:10");
+        set_ended(&a, "A", true).await;
+        // `/clear`: новая сессия стартует сразу после конца старой
+        assert!(section(&digest(&a, "B").await).is_none());
     }
     {
+        // вторая сессия после обычной первой
+        let _c = at("10:00");
+        let text = digest(&a, "B2").await;
+        assert!(section(&text).is_none(), "{text}");
+        assert_eq!(
+            a.t(Method::GET, &snap_uri("A"), None).await.status,
+            StatusCode::OK
+        );
+        assert!(!session_json(&a, "A").await["ended_at"].is_null());
+    }
+    {
+        // восстановление своей сессии отбора завершённых не знает
+        let _c = at("10:05");
+        let text = recall(&a, "A", json!({"event": "recovery", "solution": G})).await;
+        let sec = section(&text).unwrap_or_else(|| panic!("нет раздела: {text}"));
+        assert!(sec.contains("Файлы: src/parser.rs"), "{sec}");
+        assert!(!session_json(&a, "A").await["ended_at"].is_null());
+    }
+    {
+        let _c = at("10:30");
+        set_ended(&a, "A", false).await;
+    }
+    let _c = at("10:45");
+    let text = digest(&a, "B3").await;
+    assert!(section(&text).is_some(), "без ended_at — оборвана: {text}");
+}
+
+/// §8а [решение исполнителя]: снимок повода `session_end` у сессии без `ended_at` (отметка конца
+/// не дошла до сервера) — сессия завершена, а не оборвана: раздела нет. Следующий снимок другого
+/// повода (сессию продолжили, и она оборвалась) — раздел есть.
+#[tokio::test]
+async fn session_end_snapshot_without_ended_hidden() {
+    let a = world("end-trigger", |_| {}).await;
+    {
+        let _c = at("08:00");
+        register(&a, "A", true, None).await;
+        task_of(&a, "A", "Задача завершённой сессии").await;
+    }
+    {
+        let _c = at("09:00");
+        let mut b = body(&t("09:00").to_string(), data_files());
+        b["trigger"] = json!("session_end");
+        let r = put_as(&a, &a.token, "A", Some("A"), b).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    }
+    {
+        let _c = at("10:00");
+        assert!(session_json(&a, "A").await["ended_at"].is_null());
+        let text = digest(&a, "B").await;
+        assert!(section(&text).is_none(), "{text}");
+    }
+    {
+        let _c = at("10:10");
+        put_ok(&a, "A", "10:10", data_files()).await;
+    }
+    let _c = at("10:30");
+    let text = digest(&a, "B2").await;
+    let sec = section(&text).unwrap_or_else(|| panic!("нет раздела: {text}"));
+    assert!(sec.contains("Файлы: src/lib.rs"), "{sec}");
+}
+
+/// `ended_at` сессии `id` в списке сессий (ответ страницы «Сессии» WebUI).
+async fn listed_ended(a: &Api, id: &str) -> Value {
+    let r = a.t(Method::GET, "/api/v1/sessions?limit=100", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let items = r.json()["items"].as_array().unwrap().clone();
+    let s = items
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("нет сессии {id}"));
+    s["ended_at"].clone()
+}
+
+/// §8а (ревью решения М11, R1): завершённую сессию продолжили (`resume`) — регистрация
+/// `POST /sessions` тем же id снимает `ended_at`; оборвалась — её снимок снова показывается.
+/// Хвост запросов после `SessionEnd` (запрос с `X-Zam-Session`, `PUT` снимка, учёт токенов,
+/// новая эпоха, метка A/B) сессию не «оживляет». В списке сессий возобновлённая — не завершена.
+#[tokio::test]
+async fn resume_reopens_ended_session() {
+    let a = world("resume", |_| {}).await;
+    abandoned(&a).await;
+    {
+        let _c = at("09:10");
+        set_ended(&a, "A", true).await;
+    }
+    // (б) хвост после конца сессии: отметка на месте, раздела нет
+    {
         let _c = at("09:40");
-        put_ok(&a, "B", "09:40", json!({"files": ["src/b.rs"]})).await;
         let r = a
-            .t(
-                Method::PATCH,
-                "/api/v1/sessions/B",
-                Some(json!({"ended": true})),
+            .tok_h(
+                &a.token,
+                Method::POST,
+                "/api/v1/search",
+                Some(json!({"query": "парсер", "mode": "brief"})),
+                &[("x-zam-session", "A")],
             )
             .await;
-        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        put_ok(&a, "A", "09:40", data_files()).await;
+        for b in [
+            json!({"id": "A", "tokens": {"pre_tool": 5}}),
+            json!({"id": "A", "new_epoch": true}),
+            json!({"id": "A", "holdout": false}),
+        ] {
+            let r = a.t(Method::POST, "/api/v1/sessions", Some(b)).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        }
+        assert!(!session_json(&a, "A").await["ended_at"].is_null());
+        assert!(!listed_ended(&a, "A").await.is_null());
     }
-    let _c = at("10:00");
-    let text = digest(&a, "C").await;
+    {
+        let _c = at("10:00");
+        let text = digest(&a, "B").await;
+        assert!(section(&text).is_none(), "{text}");
+    }
+    // (а), (в) регистрация тем же id — сессию продолжили
+    {
+        let _c = at("10:10");
+        register(&a, "A", true, None).await;
+        assert!(session_json(&a, "A").await["ended_at"].is_null());
+        assert!(listed_ended(&a, "A").await.is_null());
+    }
+    {
+        let _c = at("10:15");
+        put_ok(&a, "A", "10:15", data_files()).await;
+        // ещё жива (обращалась в 10:10)
+        assert!(section(&digest(&a, "B2").await).is_none());
+    }
+    let _c = at("10:30");
+    let text = digest(&a, "B3").await;
     let sec = section(&text).unwrap_or_else(|| panic!("нет раздела: {text}"));
     assert!(
-        sec.starts_with("### Последнее известное состояние (снимок 2026-11-10 09:40:00,"),
+        sec.starts_with("### Последнее известное состояние (снимок 2026-11-10 10:15:00,"),
         "{sec}"
     );
-    assert!(sec.contains("Файлы: src/b.rs"), "{sec}");
+}
+
+/// §8а (ревью решения М11, R1) [решение исполнителя]: гонка `SessionEnd` прежнего процесса и
+/// регистрации нового (resume сразу после выхода) — времени события в запросах нет, действует
+/// пришедший последним. Конец, затем регистрация — сессия открыта; регистрация, затем конец —
+/// отметка стоит до следующей регистрации (любой `session-start` этой сессии).
+#[tokio::test]
+async fn end_and_resume_race_last_wins() {
+    let a = world("resume-race", |_| {}).await;
+    abandoned(&a).await;
+    {
+        let _c = at("09:10");
+        set_ended(&a, "A", true).await;
+        register(&a, "A", true, None).await;
+        assert!(session_json(&a, "A").await["ended_at"].is_null());
+    }
+    {
+        let _c = at("09:20");
+        register(&a, "A", true, None).await;
+        set_ended(&a, "A", true).await;
+        assert!(!session_json(&a, "A").await["ended_at"].is_null());
+    }
+    {
+        let _c = at("10:00");
+        assert!(section(&digest(&a, "B").await).is_none());
+    }
+    {
+        // следующий старт сессии (например, после сжатия) отметку снимает
+        let _c = at("10:10");
+        register(&a, "A", true, None).await;
+        assert!(session_json(&a, "A").await["ended_at"].is_null());
+    }
+    let _c = at("10:30");
+    let text = digest(&a, "B2").await;
+    assert!(section(&text).is_some(), "{text}");
 }
 
 /// Повторное ревью 17c, Minor 8: давность — по задачам решения снимка. Задача личного Knowledge

@@ -177,9 +177,31 @@ impl Proj {
         v
     }
 
-    /// `zam hook <kind> --agent <agent>` с событием `ev`: вывод и время процесса.
+    /// `zam hook <kind> --agent <agent>` с событием `ev` ради содержимого — со
+    /// щедрым бюджетом (`ZAM_TEST_HOOK_BUDGET_MS`): критерий приёмки — содержимое, а с бюджетом
+    /// продукта отладочная сборка на занятой машине молчит (fail-open); время и бюджеты проверяют
+    /// `hooks` и release `hook_budgets` (ревью 17b-http M6). Замер
+    /// времени (`acceptance_recall_p95_with_50_ideas`) — [`Proj::hook_timed`].
     fn hook(&self, kind: &str, agent: &str, ev: &Value) -> (Output, Duration) {
+        self.hook_budget(kind, agent, ev, Some("10000"))
+    }
+
+    /// [`Proj::hook`] с бюджетом продукта: вывод и время процесса.
+    fn hook_timed(&self, kind: &str, agent: &str, ev: &Value) -> (Output, Duration) {
+        self.hook_budget(kind, agent, ev, None)
+    }
+
+    fn hook_budget(
+        &self,
+        kind: &str,
+        agent: &str,
+        ev: &Value,
+        budget_ms: Option<&str>,
+    ) -> (Output, Duration) {
         let mut c = common::zam_cmd();
+        if let Some(ms) = budget_ms {
+            c.env("ZAM_TEST_HOOK_BUDGET_MS", ms);
+        }
         c.env("ZAM_URL", &self.url)
             .env("ZAM_TOKEN", &self.token)
             .env("HOME", &self.home)
@@ -412,7 +434,7 @@ fn measure(pa: &Proj, pb: &Proj, round: usize) -> [(Duration, Duration); 2] {
         for (k, p) in [pa, pb].iter().enumerate() {
             let s = format!("p95-{round}-{k}-{i}");
             let ev = p.ev("SessionStart", &s, json!({"source": "startup"}));
-            let (o, d) = p.hook("session-start", "claude", &ev);
+            let (o, d) = p.hook_timed("session-start", "claude", &ev);
             ok(&o);
             t[0][k].push(d);
             let ev = p.ev(
@@ -420,7 +442,7 @@ fn measure(pa: &Proj, pb: &Proj, round: usize) -> [(Duration, Duration); 2] {
                 &format!("{s}-p"),
                 json!({"prompt": format!("как улучшить кэш и деплой, шаг {}", i % 5)}),
             );
-            let (o, d) = p.hook("prompt", "claude", &ev);
+            let (o, d) = p.hook_timed("prompt", "claude", &ev);
             ok(&o);
             t[1][k].push(d);
         }

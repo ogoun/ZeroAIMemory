@@ -2,7 +2,7 @@
 //! (RFC 9457) в [`CliError`] с кодом выхода. Токен нигде не печатается.
 use std::fmt;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use ureq::http::Response;
@@ -29,6 +29,8 @@ pub struct CliError {
     /// Поле закрыто: признак ставит только [`net_error`], прочие ошибки строятся через
     /// [`CliError::new`] и [`CliError::with_problem`] — без него.
     timeout: bool,
+    /// Запрос не начат: абсолютный срок клиента вышел до отправки ([`CliError::is_unsent`]).
+    unsent: bool,
 }
 
 impl CliError {
@@ -43,6 +45,16 @@ impl CliError {
             msg: msg.into(),
             problem,
             timeout: false,
+            unsent: false,
+        }
+    }
+
+    /// Запрос не начат: абсолютный срок клиента ([`Timeouts::Deadline`]) вышел до отправки. Текст —
+    /// [`zam_core::HOOK_BUDGET_SPENT`]: в `hooks.log` это та же причина, что и «клиента нет».
+    fn unsent() -> CliError {
+        CliError {
+            unsent: true,
+            ..CliError::new(EXIT_UNREACHABLE, zam_core::HOOK_BUDGET_SPENT)
         }
     }
 
@@ -67,6 +79,12 @@ impl CliError {
     /// ответил вовремя. Отказ соединения, обрыв и ответ сервера с ошибкой — не срок.
     pub fn is_timeout(&self) -> bool {
         self.timeout
+    }
+
+    /// Запрос не начат — абсолютный срок клиента вышел до отправки ([`Timeouts::Deadline`]):
+    /// сервер запроса не видел. Это не [`CliError::is_timeout`] (там сервер не ответил вовремя).
+    pub fn is_unsent(&self) -> bool {
+        self.unsent
     }
 
     /// Уточнение: «<ctx>: <текст>».
@@ -106,9 +124,12 @@ pub enum Timeouts {
     Probe,
     /// Команды заметок: тело (вложение до 200 МБ) может идти долго, общего предела нет.
     Transfer,
-    /// Хуки агента (§10.3): весь запрос, включая чтение ответа, — не дольше срока
-    /// (бюджет хука минус 30 мс).
-    Deadline(Duration),
+    /// Хуки агента (§10.3): абсолютный срок — момент, к которому кончаются все запросы клиента
+    /// (старт хука + бюджет − резерв). Срок каждого запроса — остаток до этого момента в момент
+    /// отправки (весь запрос, включая чтение ответа): последовательные запросы и параллельные
+    /// потоки одного клиента делят один срок; без остатка запрос не начинается
+    /// ([`CliError::is_unsent`]).
+    Deadline(Instant),
     /// `zam mcp`: как `Transfer`, но ответ ждётся до [`MCP_RECV_RESPONSE`] — сервер (`json_response`)
     /// отдаёт заголовки только после конца инструмента.
     Mcp,
@@ -126,6 +147,18 @@ pub const MCP_RECV_RESPONSE: Duration = Duration::from_secs(10 * 60);
 /// Ожидание ответа на `Expect: 100-continue` при импорте (по умолчанию ureq — 1 с: под нагрузкой
 /// тело уходило до ответа сервера).
 pub const AWAIT_100: Duration = Duration::from_secs(30);
+
+/// Остаток до абсолютного срока, с которым запрос ещё начинается ([`Timeouts::Deadline`]):
+/// меньше — ответа он не дождётся, только выйдет за срок на шаг таймера ОС.
+pub const DEADLINE_MIN: Duration = Duration::from_millis(1);
+
+/// Абсолютный срок профиля ([`Timeouts::Deadline`]); у прочих профилей его нет.
+fn deadline_of(t: Timeouts) -> Option<Instant> {
+    match t {
+        Timeouts::Deadline(at) => Some(at),
+        _ => None,
+    }
+}
 
 pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
     let mut b = ureq::Agent::config_builder()
@@ -151,10 +184,14 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
             .timeout_send_request(Some(Duration::from_secs(30)))
             .timeout_recv_response(Some(MCP_RECV_RESPONSE))
             .timeout_recv_body(None),
-        Timeouts::Deadline(d) => b
-            .timeout_resolve(Some(d))
-            .timeout_connect(Some(d))
-            .timeout_global(Some(d)),
+        // срок — у каждого запроса свой, по остатку до момента ([`Client::timed`]); у агента —
+        // тот же остаток на случай запроса мимо клиента
+        Timeouts::Deadline(at) => {
+            let d = at.saturating_duration_since(Instant::now());
+            b.timeout_resolve(Some(d))
+                .timeout_connect(Some(d))
+                .timeout_global(Some(d))
+        }
     };
     if bypass_proxy(url) {
         b = b.proxy(None);
@@ -192,6 +229,8 @@ pub struct Client {
     machine: Option<String>,
     solution: Option<String>,
     session: Option<String>,
+    /// Абсолютный срок запросов ([`Timeouts::Deadline`]); прочие профили — `None`.
+    deadline: Option<Instant>,
 }
 
 /// В Debug токен — только маска.
@@ -222,12 +261,39 @@ impl Client {
             machine: machine_from(|k| std::env::var(k).ok()),
             solution,
             session: None,
+            deadline: deadline_of(t),
         }
     }
 
     /// Сменить профиль таймаутов (`zam mcp` — [`Timeouts::Mcp`]).
     pub fn set_timeouts(&mut self, t: Timeouts) {
         self.agent = agent(&self.base, t);
+        self.deadline = deadline_of(t);
+    }
+
+    /// Остаток до абсолютного срока клиента ([`Timeouts::Deadline`]): `None` — срока нет (прочие
+    /// профили); ноль — срок вышел, запрос не начнётся.
+    pub fn deadline_left(&self) -> Option<Duration> {
+        self.deadline
+            .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+
+    /// Срок запроса по абсолютному сроку клиента: остаток в момент отправки — на разрешение
+    /// имени, соединение и весь запрос с чтением ответа. Остатка нет (меньше [`DEADLINE_MIN`]) —
+    /// запрос не начинается: ошибка [`CliError::is_unsent`]. Профили без срока — без изменений.
+    fn timed<B>(&self, rb: RequestBuilder<B>) -> Result<RequestBuilder<B>, CliError> {
+        let Some(left) = self.deadline_left() else {
+            return Ok(rb);
+        };
+        if left < DEADLINE_MIN {
+            return Err(CliError::unsent());
+        }
+        Ok(rb
+            .config()
+            .timeout_resolve(Some(left))
+            .timeout_connect(Some(left))
+            .timeout_global(Some(left))
+            .build())
     }
 
     /// Сессия агента для `X-Zam-Session` (запись в память учитывается в её `memory_writes`).
@@ -249,7 +315,9 @@ impl Client {
         format!("{}/api/v1{path}", self.base)
     }
 
-    fn prepare<B>(&self, mut rb: RequestBuilder<B>) -> RequestBuilder<B> {
+    /// Заголовки атрибуции и срок запроса ([`Client::timed`]).
+    fn prepare<B>(&self, rb: RequestBuilder<B>) -> Result<RequestBuilder<B>, CliError> {
+        let mut rb = self.timed(rb)?;
         rb = rb.header("Authorization", format!("Bearer {}", self.token));
         if let Some(m) = &self.machine {
             rb = rb.header("X-Zam-Machine", m.as_str());
@@ -260,12 +328,12 @@ impl Client {
         if let Some(s) = &self.session {
             rb = rb.header("X-Zam-Session", s.as_str());
         }
-        rb
+        Ok(rb)
     }
 
     /// GET `/api/v1{path}` с параметрами запроса (кодируются ureq).
     pub fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Response<Body>, CliError> {
-        let mut rb = self.prepare(self.agent.get(&self.url(path)));
+        let mut rb = self.prepare(self.agent.get(&self.url(path)))?;
         for (k, v) in query {
             rb = rb.query(*k, *v);
         }
@@ -279,7 +347,7 @@ impl Client {
         query: &[(&str, &str)],
         headers: &[(&str, &str)],
     ) -> Result<Response<Body>, CliError> {
-        let mut rb = self.prepare(self.agent.get(&self.url(path)));
+        let mut rb = self.prepare(self.agent.get(&self.url(path)))?;
         for (k, v) in query {
             rb = rb.query(*k, *v);
         }
@@ -290,7 +358,7 @@ impl Client {
     }
 
     pub fn post_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
-        let rb = self.prepare(self.agent.post(&self.url(path)));
+        let rb = self.prepare(self.agent.post(&self.url(path)))?;
         self.check(
             rb.content_type("application/json")
                 .send(body.to_string().as_bytes()),
@@ -304,7 +372,7 @@ impl Client {
         body: &Value,
         headers: &[(&str, &str)],
     ) -> Result<Response<Body>, CliError> {
-        let mut rb = self.prepare(self.agent.post(&self.url(path)));
+        let mut rb = self.prepare(self.agent.post(&self.url(path)))?;
         for (k, v) in headers {
             rb = rb.header(*k, *v);
         }
@@ -316,12 +384,12 @@ impl Client {
 
     /// DELETE `/api/v1{path}`.
     pub fn delete(&self, path: &str) -> Result<Response<Body>, CliError> {
-        self.check(self.prepare(self.agent.delete(&self.url(path))).call())
+        self.check(self.prepare(self.agent.delete(&self.url(path)))?.call())
     }
 
     /// PATCH JSON без `If-Match`.
     pub fn patch_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
-        let rb = self.prepare(self.agent.patch(&self.url(path)));
+        let rb = self.prepare(self.agent.patch(&self.url(path)))?;
         self.check(
             rb.content_type("application/json")
                 .send(body.to_string().as_bytes()),
@@ -336,7 +404,7 @@ impl Client {
         if_match: i64,
     ) -> Result<Response<Body>, CliError> {
         let rb = self
-            .prepare(self.agent.patch(&self.url(path)))
+            .prepare(self.agent.patch(&self.url(path)))?
             .header("If-Match", format!("\"{if_match}\""));
         self.check(
             rb.content_type("application/json")
@@ -352,7 +420,7 @@ impl Client {
         if_match: i64,
     ) -> Result<Response<Body>, CliError> {
         let rb = self
-            .prepare(self.agent.put(&self.url(path)))
+            .prepare(self.agent.put(&self.url(path)))?
             .header("If-Match", format!("\"{if_match}\""));
         self.check(
             rb.content_type("application/json")
@@ -362,7 +430,7 @@ impl Client {
 
     /// PUT JSON без `If-Match` (готовое тело: размер пачки считает вызывающий).
     pub fn put_json_body(&self, path: &str, body: Vec<u8>) -> Result<Response<Body>, CliError> {
-        let rb = self.prepare(self.agent.put(&self.url(path)));
+        let rb = self.prepare(self.agent.put(&self.url(path)))?;
         self.check(rb.content_type("application/json").send(&body[..]))
     }
 
@@ -396,7 +464,7 @@ impl Client {
         reader: impl Read + 'static,
     ) -> Result<Response<Body>, CliError> {
         let mut rb = self
-            .prepare(self.agent.post(&self.url(path)))
+            .prepare(self.agent.post(&self.url(path)))?
             .header("Content-Type", content_type)
             .header("Expect", "100-continue")
             .header("Connection", "close");
@@ -420,7 +488,7 @@ impl Client {
         headers: &[(&str, &str)],
     ) -> Result<Response<Body>, CliError> {
         let mut rb = self
-            .prepare(self.agent.post(&self.url(path)))
+            .prepare(self.agent.post(&self.url(path)))?
             .header("Content-Type", content_type)
             .header("Content-Length", len.to_string());
         for (k, v) in headers {
@@ -437,7 +505,7 @@ impl Client {
         headers: &[(&str, &str)],
     ) -> Result<Response<Body>, CliError> {
         let mut rb = self
-            .prepare(self.agent.post(&format!("{}/mcp", self.base)))
+            .prepare(self.agent.post(&format!("{}/mcp", self.base)))?
             .header("Accept", "application/json, text/event-stream");
         for (k, v) in headers {
             rb = rb.header(*k, *v);
@@ -510,6 +578,7 @@ fn net_error(base: &str, e: ureq::Error) -> CliError {
         msg: format!("сервер {base} недоступен: {e}"),
         problem: None,
         timeout: timed_out(&e),
+        unsent: false,
     }
 }
 
@@ -584,7 +653,7 @@ mod tests {
             &url,
             "t",
             None,
-            Timeouts::Deadline(Duration::from_millis(50)),
+            Timeouts::Deadline(Instant::now() + Duration::from_millis(50)),
         );
         let e = c.put_json_body("/x", b"{}".to_vec()).unwrap_err();
         assert!(e.is_timeout(), "{e}");
@@ -595,7 +664,12 @@ mod tests {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", closed.local_addr().unwrap());
         drop(closed);
-        let c = Client::with_timeouts(&url, "t", None, Timeouts::Deadline(Duration::from_secs(30)));
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(Instant::now() + Duration::from_secs(30)),
+        );
         let e = c.put_json_body("/x", b"{}".to_vec()).unwrap_err();
         assert!(!e.is_timeout(), "{e}");
         assert_eq!(e.code, EXIT_UNREACHABLE);
@@ -615,6 +689,58 @@ mod tests {
         assert!(!net_error("http://x", io(ErrorKind::ConnectionReset)).is_timeout());
         assert!(!CliError::new(EXIT_UNREACHABLE, "timeout: global").is_timeout());
         assert!(!CliError::with_problem(EXIT_CONFLICT, "x", None).is_timeout());
+    }
+
+    /// Задача 17b-http: срок клиента хуков — абсолютный, один на все запросы. Сервер принял
+    /// соединение и молчит: первый запрос оборван сроком, второй (тем же клиентом, срок вышел) не
+    /// начинается вовсе — оба вместе идут один срок, а не два. Сроки — сотни мс (срок 600, сон
+    /// 300): планировщик занятой машины и шаг таймера ОС на исход не влияют.
+    #[test]
+    fn deadline_is_absolute_and_shared_by_requests() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let ms = 600;
+        let t0 = Instant::now();
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(t0 + Duration::from_millis(ms)),
+        );
+        let e = c.post_json("/x", &serde_json::json!({})).unwrap_err();
+        assert!(e.is_timeout() && !e.is_unsent(), "{e}");
+        let first = t0.elapsed();
+        let e = c.get("/x", &[]).unwrap_err();
+        assert!(e.is_unsent() && !e.is_timeout(), "{e}");
+        assert_eq!(e.code, EXIT_UNREACHABLE);
+        assert_eq!(e.to_string(), zam_core::HOOK_BUDGET_SPENT);
+        let both = t0.elapsed();
+        assert!(first >= Duration::from_millis(ms - 20), "{first:?}");
+        assert!(
+            both < Duration::from_millis(2 * ms - 100),
+            "два запроса — один срок {ms} мс, а не два: {both:?}"
+        );
+        assert_eq!(c.deadline_left(), Some(Duration::ZERO));
+        // запрос, начатый позже, получает остаток, а не полный срок
+        let t0 = Instant::now();
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(t0 + Duration::from_millis(ms)),
+        );
+        let nap = 300;
+        std::thread::sleep(Duration::from_millis(nap));
+        let e = c.get("/x", &[]).unwrap_err();
+        // сон затянулся за срок (занятая машина) — запрос не начат: тоже верный исход
+        assert!(e.is_timeout() || e.is_unsent(), "{e}");
+        let took = t0.elapsed();
+        assert!(
+            e.is_unsent() || took < Duration::from_millis(ms + nap - 100),
+            "срок от создания клиента, а не от начала запроса: {took:?}"
+        );
+        // профили без срока — без изменений
+        assert_eq!(Client::new(&url, "t", None).deadline_left(), None);
     }
 
     #[test]

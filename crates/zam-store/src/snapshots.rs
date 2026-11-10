@@ -6,8 +6,8 @@
 //!   и полноту `status` присылает клиент, предел размера проверяет сервер.
 //! - Удаление: вместе с сессией ([`crate::gc_sessions`], каскада нет) и по сроку
 //!   `snapshot.keep_days` ([`gc_snapshots`], воркер обслуживания).
-//! - Показ «последнего известного состояния» (§8а, задача 17c): последний снимок других сессий
-//!   решения ([`digest_snapshot`]), запись в память другой сессией после снимка
+//! - Показ «последнего известного состояния» (§8а, задача 17c): последний снимок других
+//!   **оборванных** сессий решения ([`digest_snapshot`]), запись в память другой сессией после снимка
 //!   ([`writes_after`]), задачи сессии снимка ([`snapshot_tasks`]); моменты снимков списка
 //!   сессий — [`snapshot_times`].
 use std::collections::HashMap;
@@ -132,14 +132,19 @@ pub async fn gc_snapshots(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError>
     .await
 }
 
-/// Последний снимок сессий решения `solution` кроме `except`, снятый не раньше `since`
-/// (по `taken_at`, затем по id сессии — порядок однозначен); нет — `None`.
+/// Последний снимок **незавершённых** сессий решения `solution` кроме `except`, снятый не раньше
+/// `since` (по `taken_at`, затем по id сессии — порядок однозначен); нет — `None`.
+///
+/// Завершённая сессия (§8а, решение владельца 2026-11-10: в дайджесте — только оборванные) не
+/// выбирается вовсе, поэтому её снимок не заслоняет более ранний снимок оборванной. Завершена —
+/// значит есть `ended_at` **или** последний снимок снят на `SessionEnd` (`session_end`): агент
+/// сообщил о конце сессии, даже если отметка `ended_at` до сервера не дошла (сервер был
+/// недоступен, снимок пришёл позже из очереди клиента).
 pub async fn digest_snapshot(
     db: &Db,
     solution: &str,
     except: Option<&str>,
     since: Timestamp,
-    show_ended: bool,
 ) -> Result<Option<SnapshotRow>, StoreError> {
     let (solution, except, since) = (
         solution.to_string(),
@@ -152,9 +157,9 @@ pub async fn digest_snapshot(
                     p.bytes, p.data
              FROM session_snapshots p JOIN sessions s ON s.id = p.session_id
              WHERE s.solution_guid = ?1 AND p.session_id <> ?2 AND p.taken_at >= ?3
-               AND (?4 OR s.ended_at IS NULL)
+               AND s.ended_at IS NULL AND p.trigger_kind <> ?4
              ORDER BY p.taken_at DESC, p.session_id DESC LIMIT 1",
-            params![solution, except, since, show_ended],
+            params![solution, except, since, SnapTrigger::SessionEnd.as_str()],
             snapshot_row,
         )
         .optional()?)

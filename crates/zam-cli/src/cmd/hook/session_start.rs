@@ -57,8 +57,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::client::{CliError, EXIT_UNREACHABLE};
-
 use serde_json::{Value, json};
 
 use super::binding;
@@ -254,15 +252,12 @@ fn digest_net(
                 let Some(id) = hold else {
                     return (c.post_json("/recall", &body).and_then(read_json), false);
                 };
-                // метка — со своим сроком, `/recall` — новым клиентом по остатку бюджета
+                // метка — со своим сроком; `/recall` — общим клиентом: его срок абсолютный
+                // (остаток бюджета хука), вышел — запрос не начнётся
                 let held = env
-                    .client_within(Duration::from_millis(HOLDOUT_MS))
+                    .client_within(Duration::from_millis(holdout_ms()))
                     .is_some_and(|h| set_holdout(env, &h, id));
-                let r = match env.client() {
-                    Some(fresh) => fresh.post_json("/recall", &body).and_then(read_json),
-                    None => Err(CliError::new(EXIT_UNREACHABLE, zam_core::HOOK_BUDGET_SPENT)),
-                };
-                (r, held)
+                (c.post_json("/recall", &body).and_then(read_json), held)
             })
         };
         let trig = sc.spawn(|| cache::refresh_triggers(env, &client, false));
@@ -382,6 +377,19 @@ fn digest_net(
 
 /// Срок `POST /sessions {id, holdout: true}` внутри бюджета `session-start`, мс.
 pub const HOLDOUT_MS: u64 = 100;
+
+/// Срок метки контрольной группы, мс: [`HOLDOUT_MS`]; отладочная сборка или фича `test-hooks` —
+/// `ZAM_TEST_HOOK_HOLDOUT_MS` (тесты содержимого под нагрузкой, как `ZAM_TEST_HOOK_IMPACT_MS`).
+fn holdout_ms() -> u64 {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::env::var("ZAM_TEST_HOOK_HOLDOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return ms;
+    }
+    HOLDOUT_MS
+}
 
 /// Соль хэша контрольной группы A/B (смена — новое разбиение сессий).
 const HOLDOUT_SALT: &[u8] = b"zam-holdout-v1\0";

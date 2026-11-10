@@ -4309,6 +4309,15 @@ UTC, без прогонов на GPU): 182 цели, **2600 PASS, 3 FAIL, 34 ig
 
 ## Ответы владельца
 
+- 2026-11-10, «последнее известное состояние» (М11): раздел снимка в дайджесте — только для
+  оборванной сессии и (в `recovery`) после сжатия контекста; после нормально завершённой сессии
+  (`SessionEnd` → `ended_at`) и после `/clear` — не показывать (до 400 токенов на старт; цель M6 —
+  рост ≤ 15 % к 0.0.9). Снимок завершённой сессии хранится и виден в WebUI. Проведено в разделе
+  «Задача 17c: решение владельца М11».
+- 2026-11-10, ссылки в отчётах (М12): кликабельны только `vscode://file/…`; прочие `vscode:` —
+  текстом (подтверждено; реализация — задача 15a).
+- 2026-11-10, тестовый стенд Linux: выделен под проект целиком — системные изменения (пакеты,
+  пользователи, службы) допустимы без согласования.
 - 2026-11-10, флаги импорта агентом (M10): `own=true` и `axioms=keep` — оставить как в ТЗ: агент может указать их по диктовке пользователя (как с аксиомами, M3); ограничения «только из WebUI» нет.
 - 2026-11-05, вопросы редакции 4: хранение снимка — А (сервер); образцы журналов — А
   (разрешено прочитать по одному журналу Claude Code этого проекта и Codex, фрагменты
@@ -9931,3 +9940,677 @@ Minor 1–4. Все сделаны в этом круге.
   в тесте как известное расхождение) и остальной перечень приближений — выше; непокрытое
   тестом линейности — как в прошлом круге, кроме комментария HTML (закрыт).
 - `target/t15a`, `target/deps` и `.tmp/e2e` в worktree удалены после работы.
+
+## Задача 17c: решение владельца М11 — снимок только оборванной сессии (2026-11-10)
+
+Решение владельца (2026-11-10, «Ответы владельца», М11): раздел «Последнее известное состояние» в
+дайджесте — только для оборванной сессии; после нормально завершённой сессии (`SessionEnd` →
+`ended_at`) и после `/clear` — нет. `recovery` (свой снимок после сжатия контекста, `resume`) не
+затронут. Снимок завершённой сессии хранится и виден в WebUI. Коммит `fix(snapshot): «последнее
+известное состояние» — только оборванная сессия (решение владельца)` поверх `40465fc` (sha — в
+отчёте контроллеру).
+
+**Что изменено.**
+1. **Переключатель убран** [решение исполнителя]. Константа `SHOW_ENDED`, поле
+   `ShowReq::show_ended` и параметр `show_ended` у `zam_store::digest_snapshot` удалены: решение
+   окончательное, ветка `true` стала бы недостижимым кодом с собственным тестом, а ключа
+   конфигурации у неё не было. Поведение — одно условие отбора в запросе `digest_snapshot`
+   (`crates/zam-store/src/snapshots.rs`): `s.ended_at IS NULL AND p.trigger_kind <> 'session_end'`.
+   Отбор именно в запросе (как в N2 повторного ревью): берётся последний снимок **незавершённой**
+   сессии, поэтому «оборванная A, затем завершённая B» показывает A, а не пусто.
+2. **Живость** в `last_state` (`crates/zam-server/src/api/snapshot.rs`) — одна проверка
+   `last_seen_at` моложе `LIVE_MIN`; условие `ended_at.is_none()` из неё ушло — завершённая сессия
+   до проверки не доходит. Повторной проверки `ended_at` после выбора нет: она недостижима (окно
+   гонки между двумя чтениями — микросекунды, цена — один лишний показ).
+3. **Снимок повода `session_end` у сессии без `ended_at`** [решение исполнителя] — сессия
+   считается **завершённой**, раздела нет. Обоснование: такой снимок снимается только хуком
+   `SessionEnd`, то есть агент сообщил о нормальном конце; `PATCH {ended: true}` и `PUT` снимка
+   идут разными запросами, и при недоступном сервере `PATCH` теряется (повтора нет), а снимок
+   уходит позже из очереди `snapq-*`. Без этого условия каждая обычная сессия, закончившаяся при
+   недоступном сервере, выглядела бы оборванной и стоила бы до 400 токенов на старт — против цели
+   решения. Если такую сессию продолжили (`resume`) и она оборвалась, следующий снимок (`stop`,
+   `pre_compact`, `catch_up`) заменяет `session_end` — и сессия снова выбирается.
+4. `recovery` — без изменений: свой снимок читается `get_snapshot` без отбора завершённых (в том
+   числе у сессии с `ended_at`).
+
+**Случаи.**
+
+| Случай | Раздел в дайджесте | Тест |
+|---|---|---|
+| оборванная: нет `ended_at`, молчит дольше 10 мин | да | `digest_shows_last_state_when_task_stale`, `digest_hides_live_session_by_last_seen` (10:06) |
+| живая: нет `ended_at`, обращалась меньше 10 мин назад | нет | `digest_hides_live_session_by_last_seen` (10:00) |
+| нормально завершённая (`ended_at`), сразу и позже | нет | `digest_hides_live_session_by_last_seen` (10:21, 11:00), `ended_session_snapshot_hidden` (10:00) |
+| `/clear`: старая сессия получила `SessionEnd`, новая стартует сразу | нет | `ended_session_snapshot_hidden` (09:10) |
+| оборванная A, затем завершённая B | да, снимок A | `abandoned_then_ended_shows_abandoned`, `digest_snapshot_skips_ended_sessions` (`zam-store`) |
+| `PATCH ended` не дошёл, снимка `SessionEnd` тоже нет (или отметка снята) | да — выглядит оборванной (приемлемо) | `ended_session_snapshot_hidden` (10:45), `digest_snapshot_skips_ended_sessions` (E) |
+| снимок повода `session_end`, `ended_at` нет (`PATCH` потерян) | нет | `session_end_snapshot_without_ended_hidden`, `abandoned_then_ended_shows_abandoned` (второй мир), `digest_snapshot_skips_ended_sessions` (D, B) |
+| то же, затем снимок другого повода (работу продолжили) | да | `session_end_snapshot_without_ended_hidden` (10:30), `digest_snapshot_skips_ended_sessions` (D) |
+| догоняющий снимок `catch_up` оборванной сессии | да | `catch_up_staleness_from_last_seen` |
+| `recovery` после сжатия (своя сессия, жива) | да, без конспекта | `recovery_without_summary` |
+| `recovery` своей сессии с `ended_at` | да | `ended_session_snapshot_hidden` (10:05) |
+| снимок завершённой сессии хранится (`GET` — 200, WebUI) | — | `ended_session_snapshot_hidden` |
+
+**Тесты.** `crates/zam-server/tests/snapshot.rs`: изменён `digest_hides_live_session_by_last_seen`
+(«ended — показывается сразу» → не показывается ни в 10:21, ни в 11:00);
+`abandoned_then_ended_shows_latest` заменён на `abandoned_then_ended_shows_abandoned` (два мира:
+у B отметка `ended_at` при снимке обычного повода; у B только снимок `session_end`); новые
+`ended_session_snapshot_hidden`, `session_end_snapshot_without_ended_hidden`.
+`crates/zam-store/tests/snapshots.rs`: `digest_snapshot_can_skip_ended_sessions` заменён на
+`digest_snapshot_skips_ended_sessions` (оба признака конца порознь, снятие отметки, смена повода).
+
+**Документы.** `guide.{ru,en}.md` (раздел «Снимок сессии», «Что увидишь»: оборванная сессия; после
+обычного конца и `/clear` раздела нет; восстановление — после сжатия); спецификация
+`docs/specs/2026-11-04-m6-token-economy.md` — **редакция 4.8** (§8а «Показ», §15 — ответ М11, §16
+задача 17, §17 п. 19 — случай «Обычный конец и `/clear`»); `deploy/config.example.toml` и
+`config.rs` (комментарий `snapshot_tokens`). Страница WebUI «Подключение агента» не менялась: там
+уже «Снимок оборванной сессии приходит следующей сессии…», условие описано верно.
+
+**Откаты** (`.tmp/m6/task17c/r4/rollbacks4.py`, журнал `r4/rollbacks.log`): 7, все FAIL ожидаемыми
+тестами. Q1 запрос без отбора `ended_at` → `digest_snapshot_skips_ended_sessions`; Q1s то же через
+дайджест → `digest_hides_live_session_by_last_seen`, `abandoned_then_ended_shows_abandoned`,
+`ended_session_snapshot_hidden`; Q2 запрос без отбора `session_end` →
+`digest_snapshot_skips_ended_sessions`; Q2s то же через дайджест →
+`session_end_snapshot_without_ended_hidden`, `abandoned_then_ended_shows_abandoned`; Q3 живость не
+проверяется → `digest_hides_live_session_by_last_seen`; Q4 восстановление отбрасывает завершённую
+сессию → `ended_session_snapshot_hidden`; Q5 отбор после выбора («последний снимок, и если
+завершён — пусто») → `abandoned_then_ended_shows_abandoned`. Первый прогон Q1s показал пробел
+теста: в мире с `ended_at` снимок B тоже имел повод `session_end`, и откат отбора `ended_at` его
+не ронял — признаки конца в тесте разведены, повтор Q1s — FAIL всеми тремя тестами.
+
+**Проверка** (`target/t17c`, `ZAM_REQUIRE_ML=1`, журналы — `.tmp/m6/task17c/r4/`; только
+`-p zam-server -p zam-store` — в дереве чужие незакоммиченные правки `zam-cli`):
+- `zam-store`: `snapshots` 4, `sessions` 15 — PASS (`t3-store.log`).
+- `zam-server`: lib 280 (1 пропущен) (`t2-server.log`); `snapshot` 25, `recall` 40 (1 пропущен),
+  `recall_recovery` 6, `recall_frozen` 4, `recall_brief` 9, `sessions` 17, `agent_setup` 14,
+  `m57_acceptance` 13 — PASS (`t3-server.log`; `snapshot` после правки теста — `t4-snapshot.log`).
+- `cargo clippy -p zam-server -p zam-store --all-targets --features zam-server/test-hooks -- -D
+  warnings` — чисто; `rustfmt --edition 2024 --check` по своим файлам — чисто.
+- `zam-cli` и `hook_budgets` не запускались (клиент не менялся); WebUI не менялся.
+
+**Передать.**
+- → 17d: замер сценариев «вторая сессия после обычной первой» и «после `/clear`» теперь должен
+  показать **отсутствие** раздела снимка (0 токенов); раздел остаётся только в сценариях «обрыв»
+  (нет `SessionEnd`, молчание дольше 10 мин) и `recovery`. Передача I3 («почти после любой обычной
+  сессии с правками») больше не действует.
+- → 13a/13c: ТЗ v1.24 §8а — условие показа по редакции 4.8 спецификации (оборванная сессия; два
+  признака конца — `ended_at` и повод `session_end`); CHANGELOG `0.0.11-m6` — «снимок в дайджесте
+  только после оборванной сессии». `SHOW_ENDED` из передач прежних кругов 17c — вычеркнуть.
+- → M7 (к пункту о клиенте снимка): `PATCH {ended: true}` при недоступном сервере не повторяется —
+  в WebUI такая сессия остаётся без пометки «завершена»; на показ это не влияет (повод
+  `session_end`), но отметку можно ставить сервером при приёме снимка `session_end`.
+- `target/t17c` удалён после работы.
+
+## Задача 17c: правка ревью М11 — resume снимает завершение (2026-11-10)
+
+Ревью `b0e5e19` (координатор): решение проведено верно, одна правка Important и три Minor. Коммит
+`fix(sessions): регистрация сессии снимает отметку конца — resume завершённой сессии` поверх
+`b0e5e19` (sha — в отчёте контроллеру). Клиент (`crates/zam-cli`) не менялся.
+
+**R1 (Important) — `ended_at` не сбрасывался при resume.** Сессия нормально завершилась
+(`SessionEnd` → `ended_at`), её продолжили (`claude --resume`/`--continue`, тот же id), она
+оборвалась: отбор `s.ended_at IS NULL` не выбирал её никогда, в WebUI она оставалась «завершена»
+и выпадала из `latest_session`.
+
+- **Что шлёт клиент** (проверено по коду, без правок): хук `session-start` на **каждом** старте,
+  при любом `source` (`startup`, `resume`, `clear`, `compact`), шлёт регистрацию `POST /sessions
+  {id, agent, solution}` (`session_start.rs`, `digest_net`, поток `reg`) — для возобновлённой
+  сессии она уходит. Прочие `POST /sessions` клиента несут служебное поле: учёт токенов
+  (`cache.rs`: `{id, tokens}`), новая эпоха (`checkpoint.rs`: `{id, new_epoch}`), метка A/B
+  (`{id, holdout}`); `zam session snapshot` регистрирует сессию, только если её нет на сервере.
+- **Правка.** `zam_store::register_session` (`crates/zam-store/src/sessions.rs`): обращение, как
+  `touch_session`, и в той же транзакции `UPDATE sessions SET ended_at = NULL` — `true`, если
+  отметка была. `POST /sessions` (`crates/zam-server/src/api/sessions.rs`, `create`) зовёт её
+  только для **регистрации** — тела без `tokens`, `new_epoch` и `holdout`. Общий `upsert` и
+  `touch_from_request` не тронуты: запрос с `X-Zam-Session`, `PUT` снимка, учёт токенов, новая
+  эпоха и метка A/B завершённую сессию не «оживляют» (хук `checkpoint` на `SessionEnd` шлёт
+  учёт токенов параллельно с `PATCH ended` — он отметку не снимает).
+- **Гонка** `SessionEnd` прежнего процесса и регистрации нового (resume сразу после выхода)
+  [решение исполнителя]: **действует пришедший последним**. Времени события нет ни в `PATCH
+  /sessions/{id}`, ни в `POST /sessions`, а клиент в этом круге не меняется — сравнивать нечего.
+  Обычный порядок (конец, затем регистрация) даёт открытую сессию. Обратный оставляет отметку,
+  хотя сессия идёт; это приемлемо: окно — доли секунды между двумя запросами разных процессов;
+  отметку снимает следующая регистрация (любой `session-start` этой сессии, например после
+  сжатия); цена — раздел снимка, не показанный один раз, и пометка «завершена» в WebUI до
+  следующего старта. Зеркальный случай (запоздавшая регистрация после настоящего конца) раздела
+  не даёт: последний снимок такой сессии — повода `session_end`.
+- **Аудит.** Истории изменений у сессий нет (таблица `sessions` — служебный учёт без ревизий) —
+  снятие отметки пишется в журнал сервера строкой DEBUG без id сессии.
+
+**Minor.**
+- 4 — в спецификации §8а одной строкой: агент без хуков со снимком повода `manual` (`zam session
+  snapshot`) `SessionEnd` не шлёт и через 10 минут молчания выглядит оборванным — так и задумано.
+- 1, 5 — в «Передать → M7» ниже.
+- Спецификация §8а (редакция 4.8) и `guide.{ru,en}.md` дополнены про resume; описание модуля
+  `api/snapshot.rs` и `api/sessions.rs` — тоже.
+
+**Тесты.**
+- (а), (б), (в) `resume_reopens_ended_session` (`crates/zam-server/tests/snapshot.rs`): конец
+  сессии; запрос с `X-Zam-Session`, `PUT` снимка, `POST /sessions` с `tokens`, `new_epoch`,
+  `holdout` — `ended_at` на месте (в `GET /sessions/{id}` и в списке `GET /sessions`), раздела
+  нет; регистрация тем же id — `ended_at` пуст и в списке; снимок `stop`; пока жива — раздела
+  нет; молчание дольше 10 минут — раздел со снимком 10:15.
+- (г) `end_and_resume_race_last_wins` (там же): конец → регистрация — открыта; регистрация →
+  конец — завершена, раздела нет; следующая регистрация — открыта, раздел есть.
+- `register_session_reopens_ended` (`crates/zam-store/tests/sessions.rs`): обращение и запись в
+  память отметку не снимают; регистрация снимает (поля дописаны, счётчик цел, сессия снова в
+  `latest_session`), чужую отметку не трогает.
+
+**Откаты** (`.tmp/m6/task17c/r5/rollbacks5.py`, журнал `r5/rollbacks.log`): 6, все FAIL ожидаемыми
+тестами. S1 регистрация не снимает отметку → `register_session_reopens_ended`; S1s то же через
+API → `resume_reopens_ended_session`, `end_and_resume_race_last_wins`; S2 отметку снимает любое
+обращение (общий `upsert`) → `register_session_reopens_ended`; S2s то же через API →
+`resume_reopens_ended_session`, `digest_hides_live_session_by_last_seen`; S3 служебный `POST
+/sessions` (эпоха, метка A/B) снимает отметку → `resume_reopens_ended_session`; S4 регистрация
+обычным касанием → `resume_reopens_ended_session`, `end_and_resume_race_last_wins`. Ветка
+`tokens` откатом не проверяется: она идёт через `add_token_counts`, который отметку не трогает.
+
+**Проверка** (`target/t17c`, `ZAM_REQUIRE_ML=1`, журналы — `.tmp/m6/task17c/r5/`; только
+`-p zam-server -p zam-store`):
+- `zam-store`: `snapshots` 4, `sessions` 16 — PASS (`t3-store.log`).
+- `zam-server` (`t3-server.log`): lib 280 (1 пропущен), `snapshot` 27, `recall` 40 (1 пропущен),
+  `recall_recovery` 6, `recall_frozen` 4, `recall_brief` 9, `sessions` 17, `agent_setup` 14,
+  `m57_acceptance` 13 — PASS. В первом прогоне круга (`t2-server.log`) `m57_acceptance::
+  acceptance_prompt_hint_rules` упал — «векторный канал не включился» за 240 с (`QdrantDown`,
+  внешний Qdrant; сессий и снимка не касается) и оборвал очередь наборов; повтор всех наборов с
+  `--no-fail-fast` — без падений.
+- `cargo clippy -p zam-server -p zam-store --all-targets --features zam-server/test-hooks -- -D
+  warnings` — чисто; `rustfmt --edition 2024 --check` по своим файлам — чисто.
+- `zam-cli`, `hook_budgets` и WebUI не запускались (не менялись).
+
+**Передать.**
+- → 13a/13c: ТЗ v1.24 §8а — регистрация `POST /sessions` снимает `ended_at` (resume), правило
+  гонки «пришедший последним»; `manual` без `SessionEnd`.
+- → M7:
+  - обрыв возобновлённой сессии **до первого снимка** после resume: хранимый снимок — прежний,
+    повода `session_end`, и раздела нет, пока его не заменит догоняющий снимок (`catch_up` на
+    следующем `startup`; не уложился в срок — раздела не будет);
+  - отметку «завершена» ставить сервером при приёме снимка повода `session_end` (если `PATCH
+    ended` потерян) — **без** освежения `last_seen_at`;
+  - время события в `PATCH /sessions/{id}` и в регистрации (например, `at`) — чтобы гонку конца и
+    resume решать по времени, а не по порядку прихода.
+- `target/t17c` удалён после работы.
+
+## Задача 17b-http: абсолютный срок HTTP у хуков, честные тесты времени (2026-11-10)
+
+Исполнитель продолжил прерванную работу (HEAD `40465fc`, незакоммиченные правки прежнего исполнителя
+в `client.rs`, `cmd/hook/mod.rs`, `tests/hooks.rs`). Материалы — `.tmp/m6/task17b-http/`
+(`tdd-red.log`, `tdd-green.log`, `stages-after.txt`, `probe-base.txt`, `probe-timer.txt`,
+`probe-spawn.txt`, `spawn-stages.txt`, `slow-before.txt`, `slow-after.txt`, `rollbacks.log`,
+`results.csv`, `logs/`).
+
+Коммиты (поверх `7fc31e7`): `44790a5` `fix(hooks): абсолютный срок HTTP — один на все запросы
+хука` (продукт: `client.rs`, `cmd/hook/{mod,checkpoint,session_start,snapshot_queue}.rs`,
+`cmd/code/auto.rs`), `feb0530` `test(hooks): время хука — внутри процесса, запуск — нормировкой,
+содержимое — со щедрым бюджетом` (`tests/hooks.rs`). Поправка к тексту коммита `44790a5`: p50
+сценария после правки под чужой сборкой — 330 мс, а не 371 (в тексте один запуск посчитан
+дважды); остальные числа верны.
+
+### Что принято из унаследованного и что переделано
+
+- **Принято.** Тестовый канал времени `ZAM_TEST_HOOK_TIMING` (`hook::test_timing`: хук после вывода
+  дописывает в файл `<команда> <микросекунды от старта процесса>`; только отладочная сборка и
+  `test-hooks`) и пара времён `Times {inner, outer}` в тестах; тест
+  `session_start_slow_server_one_deadline_for_all_requests` как красный для дефекта 1 (на базе —
+  FAIL: 817 / 1091 / 588 мс внутри процесса при бюджете 300, `tdd-red.log`).
+- **Принято как материал, в коммит не вошло.** Проба `zz_probe_deadline_lateness` в `client.rs`
+  (помечена прежним исполнителем «не в коммит»): её числа — `probe-base.txt`; вместо неё — отдельные
+  пробы вне крейта (`probe/sockprobe.rs`, `probe/spawnprobe.rs`).
+- **Переделано.** (1) В красном тесте худший из трёх сверялся с бюджетом + 50 мс — под чужой
+  сборкой на том же диске он падал и после правки (309 / 416 / 495 мс); теперь проверка без
+  времени (второй запрос до заглушки не доходит, одна строка в журнале на хук) и лучший из трёх
+  не больше полутора бюджетов; худший не сверяется (после срока запроса хук ещё возвращает
+  очередь, а создание файла на занятом диске изредка стоит секунду и больше — 1,5 с в одном из
+  прогонов). (2) `hook_at` у прежнего
+  исполнителя просто стал возвращать время внутри процесса при прежних пределах ×4 — это ослабляло
+  все проверки времени на время запуска exe и ничего не давало взамен; добавлены медиана серии по
+  самому бюджету и отдельная проверка запуска процесса (ниже). (3) Канал времени стал
+  обязательным: в отладочной сборке отсутствие строки — падение теста, а не тихий возврат к
+  времени снаружи.
+
+### Дефект 1. Срок HTTP считался от начала запроса
+
+**Причина.** `Env::client_within` вычислял остаток бюджета в момент создания клиента и передавал
+его как длительность `Timeouts::Deadline(left)`; `client::agent` ставил её `timeout_global` агента
+ureq — то есть на **каждый** запрос заново, от его начала. Запрос, начатый через t мс после
+создания клиента, кончался на t мс позже срока; два запроса подряд — два срока. У `session-start`
+поток `flush_changed` → `refresh_file_refs` делал это всегда: `POST /files/changed` шёл до срока,
+затем `GET /file-refs` — ещё один полный срок.
+
+**Доказательство.** Проба прежнего исполнителя (`probe-base.txt`): один запрос ureq со сроком
+270 мс возвращается через 270 + 14 мс (p50), два подряд тем же агентом — через 270 + 285 мс.
+Красный тест на базе: `hooks.log` — `files/changed: … timeout: global`, затем `кэш file-refs не
+обновлён: … timeout: global` у каждого хука; время хука 588–1091 мс.
+
+**Правка** (`client.rs`, `cmd/hook/mod.rs`).
+- `Timeouts::Deadline(Instant)` — абсолютный момент. `Client` хранит его и перед **каждым**
+  запросом (`Client::timed`, из `prepare`) ставит запросу `timeout_resolve`, `timeout_connect` и
+  `timeout_global` равными остатку до момента (конфигурация уровня запроса ureq). Остатка нет
+  (меньше `DEADLINE_MIN` = 1 мс) — запрос не начинается: `CliError::is_unsent()`, текст —
+  `zam_core::HOOK_BUDGET_SPENT` («бюджет исчерпан до запроса к серверу»). `is_timeout()` у такой
+  ошибки — `false` (сервер запроса не видел). Профили `Probe`, `Transfer`, `Mcp`, `Download` не
+  менялись (у них срока нет, `timed` ничего не делает).
+- `Env::http_deadline()` = `started + бюджет − HTTP_RESERVE_MS`; `Env::client()` даёт клиента с
+  этим сроком, `Env::client_within(cap)` — с меньшим из него и «создание клиента + cap».
+  `Env::http_left()` считается от того же момента.
+- Обход всех хуков и мест переиспользования клиента:
+
+  | место | было | стало |
+  |---|---|---|
+  | `session-start`: `flush_changed` → `refresh_file_refs` одним клиентом | второй запрос — ещё один полный срок | общий срок; `GET /file-refs` без остатка не начинается |
+  | `session-start`: регистрация, `/recall`, триггеры, учёт, эпоха (`recovery` выключен) — параллельные потоки одного клиента | срок каждого — от его начала (поток стартует позже — кончает позже) | общий абсолютный срок |
+  | `session-start`, контрольная группа: метка со сроком 100 мс, затем `/recall` **новым** клиентом | новый клиент — повторное чтение настроек подключения с диска | `/recall` — общим клиентом (срок абсолютный), метка — `client_within(100 мс)` |
+  | `checkpoint`: `flush_changed` после ожидания потока влияния — **новым** клиентом | то же | тем же клиентом |
+  | `checkpoint`: `GET /sessions/{id}`, эпоха, учёт, очередь — потоки одного клиента | срок от начала запроса | общий срок |
+  | `checkpoint`: `POST /code/impact` (`client_within(60 мс)`), `PATCH … {ended}` (свой клиент) | от начала запроса | от создания клиента и не позже срока хука |
+  | снимок: `PUT` (`client_within(60 мс)`) в `flush`, `flush_others`, `flush_logged`, поток снимка `checkpoint` | остаток мерился отдельно от клиента (`limit`) | `limit` — `Client::deadline_left()`; запрос без остатка — «бюджет исчерпан до запроса к серверу (прошло N мс)», а не «срок PUT 0 мс» |
+  | `prompt`, `post-tool` (ошибка), `subagent-start`: `/recall` и параллельные очереди одним клиентом | от начала запроса | общий срок |
+  | `pre-tool`, `post-tool` (успех), привязка сессии, запуск `zam code sync` | без сети | без изменений |
+
+- Новые строки `hooks.log` — только у запроса, который не начат: прежняя причина с текстом
+  `бюджет исчерпан до запроса к серверу`, по одной на запрос (`кэш file-refs не обновлён: бюджет
+  исчерпан до запроса к серверу`, `recall(session_start): …`, `sessions(new_epoch): бюджет исчерпан
+  до запроса к серверу` — без слова «сеть»: запроса не было, эпоха не начата). Строк «timeout:
+  global» после срока хука больше нет.
+
+**Почему возврат по сроку опаздывает и можно ли сократить.** Опоздание складывается из двух частей.
+1. Ожидание сокета. ureq ставит срок чтения через `SO_RCVTIMEO`; Windows будит ожидание на
+   ближайшем тике системного таймера (15,6 мс) после срока. Проба `probe/sockprobe.rs`
+   (`probe-timer.txt`): опоздание `read_timeout` при сроках 40–270 мс распределено равномерно 0–15,6 мс
+   (p50 6–9, p90 13–14, max 15,6), у ureq — то же самое (`probe-base.txt`), у `connect_timeout` —
+   6–10 мс. `timeBeginPeriod(1)` на это **не влияет** (p50 6–8, max 15,6 — те же числа): тайм-ауты
+   сокетов идут по грубому тику независимо от запрошенного разрешения. Раздельные сроки
+   соединения и приёма не помогают — каждый из них тот же `SO_RCVTIMEO`/`select` с тем же шагом.
+2. Работа после возврата: строка в `hooks.log` на каждый несостоявшийся запрос и возврат забранной
+   очереди изменённых файлов (замок, чтение, атомарная запись). Трассировка этапов `session-start`
+   с медленным сервером после правки (`stages-after.txt`, срок HTTP 270 мс): отправка очереди
+   возвращается на 282–306 мс от старта, всё остальное до выхода — меньше 1,5 мс.
+
+Итого на тихой машине хук с несостоявшимися запросами выходит на 283–307 мс при бюджете 300
+(срок 270 + тик до 15,6 + файлы 5–20 мс): резерв `HTTP_RESERVE_MS` = 30 мс покрывает это в среднем,
+но не всегда. **[решение исполнителя]** Резерв и сроки не менялись (бюджеты §10.3 — не моя
+задача): запас на возврат вычитался бы из времени ожидания ответа (у `checkpoint` 70 мс → 54 мс),
+это решение о бюджете — передано в 17d. Сократить само опоздание можно только уйдя от
+`SO_RCVTIMEO` (свой транспорт ureq с ожиданием по таймеру высокого разрешения) — в M7.
+
+**Замер «session-start с медленным сервером»** (заглушка молчит 3 с на каждый запрос, очередь
+изменённых файлов есть; время внутри процесса, мс; `measure-slow.ps1`):
+
+| | n | min | p50 | p90 | max |
+|---|---|---|---|---|---|
+| до правки (`40465fc`, `slow-before.txt`) | 21 | 557 | 603 | 1024 | 2464 |
+| после, под чужой сборкой на том же диске (`slow-after.txt`; один из семи запусков теста шёл 22 с) | 21 | 281 | 330 | 517 | 540 |
+| после, тихая машина (`stages-after.txt`, `logs/dev1-1.log.err`) | 15 | 283 | 294 | 306 | 307 |
+
+До правки тест красный во всех семи запусках, после — зелёный в шести из семи (в седьмом лучший из
+трёх — 371 мс при тогдашнем пределе 350; предел лучшего из повторов после этого — полтора бюджета,
+см. решения).
+
+### Дефект 2. Гонка «`Stop` эпоху не меняет»
+
+**Причина — тест.** `checkpoint_precompact_new_epoch_in_hook_budget` читал `seen_epoch` сессии
+`pe-1` сразу после серии `PreCompact` с бюджетом продукта, а затем проверял, что `Stop` его не
+изменил. Запрос эпохи, снятый клиентом по сроку (строка `sessions(new_epoch): сеть`), сервер
+дообрабатывает и после выхода хука — HTTP отмены не несёт; эпоха вырастала между двумя чтениями
+без всякого участия `Stop`. Продукт здесь прав и об этом уже пишет («сервер мог успеть её
+начать»); лишняя эпоха безвредна (сброс «уже выдавалось» на сжатии — то, что и требовалось).
+
+**Правка.** Проверка «`Stop` эпоху не меняет» перенесена на сессию `pe-2`, чьи `PreCompact` идут
+со щедрым бюджетом и потому все завершены: каждый — ровно +1, после `Stop` — то же число, новых
+строк о промахах в `hooks.log` нет. Для сессий с бюджетом продукта осталась проверка без гонки —
+диапазон «дошло ..= дошло + снято по сроку» (нижняя граница подтверждена ответами, верхняя верна в
+любой момент). Откат R8 (`Stop` тоже начинает эпоху) тест ловит.
+Попутно в продукте: запрос эпохи, не начатый по сроку хука, пишется как `sessions(new_epoch):
+бюджет исчерпан до запроса к серверу` (без «сеть») — иначе учёт промахов считал бы его дважды.
+
+### Дефект 3. Тесты времени
+
+**Что они мерили.** Время процесса глазами теста: запуск отладочного exe, хук, выход. На тихой
+машине запуск и выход — 8–10 мс (пустой вызов `zam hook` — 9–10 мс), под нагрузкой — десятки и
+сотни мс (журнал расследования), то есть пределы ×4 от бюджета сверяли в основном планировщик и
+диск.
+
+**Как стало** (шапка `tests/hooks.rs`).
+- `Proj::hook_at` / `hook_times` — бюджет продукта, время — **внутри процесса** от `started`
+  (канал `ZAM_TEST_HOOK_TIMING`; в отладочной сборке отсутствие строки — падение теста, откат R3).
+- Серии (`assert_series`): **медиана — не больше самого бюджета §10.3** (новое; устойчива к
+  остановкам диска, откат R5), p95 — прежний запас R3 ×4 (`max_for`) внутри процесса плюс разброс
+  пустого вызова `zam hook` в той же серии (`jitter`: p95 − минимум; на тихой машине — единицы мс,
+  под генератором — 285–370 мс).
+- Запуск и выход процесса — отдельно (`assert_launch`): медиана `outer − inner` не больше двух
+  медиан пустого вызова `zam hook` в том же цикле + 30 мс. Занятая машина замедляет оба одинаково
+  (тихо: 8,4 против 9,4–10,4 мс; под генератором: 46–56 против 43–50 мс); хук, который после работы
+  не выходит (ждёт поток), — только первое (откат R4). Ограничение: задержку, общую для **любого**
+  вызова `zam hook`, включая пустой, нормировка не видит по построению (первый вариант отката R4
+  — сон на выходе у всех вызовов — она пропустила) — это ловит только время процесса целиком на
+  release (`hook_budgets`, 17d).
+- Медленный или выключенный сервер: лучший из трёх — полтора бюджета (`max_inner`: 450 мс у
+  `session-start`, 150 мс у `checkpoint`; второй срок сверх первого давал не меньше 557 мс и на
+  тихой машине). Где повтор события безвреден — `Proj::hook_best`: вызов повторяется (до трёх
+  раз), только если время не уложилось; остановка диска повтором снимается, систематическое
+  превышение — нет.
+- Одиночный замер, который повторить нельзя, — прежний запас ×4 (`max_for`), внутри процесса.
+- Тесты содержимого — со щедрым бюджетом: `Proj::hook` (54 вызова по файлу) теперь идёт с
+  `ZAM_TEST_HOOK_BUDGET_MS=10000`, как `hook_slow`; `Proj::hook_content` — то же для вызовов с
+  адресом и агентом; `hook_slow` дополнительно снимает срок метки контрольной группы
+  (`ZAM_TEST_HOOK_HOLDOUT_MS`, новая подмена рядом с `ZAM_TEST_HOOK_IMPACT_MS`).
+
+По тестам из задания:
+
+| тест | что изменено |
+|---|---|
+| `pre_tool_under_50ms`, `post_tool_success_under_50ms` | 100 запусков: медиана внутри процесса ≤ 50 мс, p95 ≤ 200 мс + разброс пустого вызова; запуск — нормировкой (пустой вызов на каждом шаге) |
+| `hooks_with_server_within_margin` | по 20 запусков: медиана ≤ бюджета (300 / 250 / 250 / 100 мс), p95 ≤ ×4 + разброс; запуск — нормировкой; пустых ответов ≤ 5 % — как было (с бюджетом продукта) |
+| `checkpoint_precompact_new_epoch_in_hook_budget` | дефект 2; медленный сервер — три вызова, лучший ≤ 150 мс (было: один вызов ≤ 400 мс); время — внутри процесса |
+| `session_start_spawns_background_sync_once_per_interval` | время запуска — по частям (ниже); хук — `assert_series` |
+| `holdout_marker_silences_all_hooks`, `session_start_holdout_quiet_group` | содержимое; `hook_slow` снимает и срок метки 100 мс (под нагрузкой метка не успевала — сессия оказывалась вне группы) |
+| `session_start_compact_appends_summary` | содержимое: `Proj::hook` со щедрым бюджетом |
+| `output_is_valid_hook_json_with_event_name` | формат — со щедрым бюджетом; время — отдельным вызовом с бюджетом продукта, `hook_best` ≤ 450 мс |
+| `post_compact_and_session_end_accepted_within_100ms` | время — внутри процесса, `hook_best`: ≤ 150 мс вместо 400 мс одиночного |
+
+Сверх задания (падали в прогонах этой задачи по тем же причинам):
+
+| тест | что изменено |
+|---|---|
+| `fail_open_server_down_empty_exit_0`, `subagent_start_server_down_silent`, `post_tool_failure_error_regex_hint` (сервер выключен), `subagent_start_budget_300ms` («чёрная дыра») | `hook_best`: полтора бюджета вместо ×4 и 1 с одиночного |
+| `subagent_start_budget_300ms` (серия) | `assert_series` |
+| `session_start_flushes_all_queues_in_one_request` (медленный сервер) | лучший из повторов ≤ 450 мс; запросов — не больше одного на хук |
+| `slow_snapshot_put_keeps_digest` | «дайджест в бюджете продукта» — хотя бы в одном из трёх вызовов |
+| `compact_put_before_recall`, `changed_flush_partial_failure_returns_rest`, `old_server_new_epoch_400_silent`, `snapshot_deadline_never_delays_stop`, `post_tool_codex_stderr_hint`, `session_start_flushes_before_file_refs`, `subagent_start_uses_matching_spawn`, `local_tokens_flushed_by_hook` | содержимое — со щедрым бюджетом (`hook_content`; у `changed_flush…` с медленной второй пачкой — бюджет 2 с при ответе через 30 с; у `snapshot_deadline…` порог «хук не ждал поток» — `LATE_THREAD_MAX` при сне 30 с, как у соседних тестов снимка) |
+| `session_start_holdout_only_on_first_start` | срок метки — предмет теста: 2 с при ответе заглушки через 30 с (было 100 мс при 1,5 с: под нагрузкой запрос метки не успевал дойти до заглушки) |
+
+**Двухмодальность запуска фоновой `zam code sync`.** Горб — **не** создание процесса. Разбивка
+времени `maybe_spawn_sync` по этапам (`spawn-stages.txt`): проверки 0,3–0,5 мс, `CreateProcess`
+3,8–6,2 мс (один выброс 12,7), запись отметки `code-auto.json` — 0,4–0,7 мс и редкие 88 и 117 мс.
+Проба `probe/spawnprobe.rs` (`probe-spawn.txt`, 200 циклов, диск занят чужой сборкой): атомарная
+запись маленького файла (временный файл + rename) даёт тот же хвост **без** запуска процесса
+(43 из 200 дольше 20 мс, max 3 с), сразу после запуска (38 из 200) и до него (43 из 200); из
+этапов записи виновато создание временного файла (36 из 38), не rename; сам запуск процесса — p50
+2,1, p95 3,0 мс. То есть «45–52 мс у 10–15 % запусков» — создание файла на HDD (NTFS, занятый
+диск), которое стояло в измеряемом интервале сразу после запуска.
+**Правка.** Строка `hooks.log` несёт части: `запущена за T мс (проверки C мс, процесс P мс, отметка
+W мс)` — общее время первым числом, разбор `xtask code-bench` не затронут. Тест сверяет p95
+«проверки + процесс» с прежним пределом (40 мс отладочная сборка / 10 мс release), отметку — по
+медиане с тем же пределом, общее p95 печатает.
+
+### Откаты новых проверок
+
+`rollbacks.py`, журнал `rollbacks.log`:
+
+| откат (правка продукта) | тест | итог |
+|---|---|---|
+| R1 срок запроса — от создания клиента, как до правки | `client::tests::deadline_is_absolute_and_shared_by_requests`; `session_start_slow_server_one_deadline_for_all_requests` | FAIL оба; второй — «запрос после срока хука» (`GET /file-refs` дошёл до заглушки) |
+| R2 запрос начинается и без остатка срока | `client::tests::deadline_is_absolute_and_shared_by_requests` | FAIL |
+| R3 канал времени хука не пишет | `pre_tool_matches_glob_from_cache_without_network` (любой тест с хуком) | FAIL «хук pre-tool не записал время» |
+| R4 хук с выводом не выходит 150 мс после него | `pre_tool_under_50ms` | FAIL «запуск и выход процесса 158,7 мс при пустом вызове 10,1 мс» |
+| R5 хук тратит 80 мс до работы | `pre_tool_under_50ms` | FAIL «медиана 86 мс при бюджете 50 мс» |
+| R6 срок `PUT` в строке журнала — без округления вверх | `slow_snapshot_put_keeps_digest` | FAIL (нет «срок PUT 60 мс») |
+| R7 строка запуска фоновой синхронизации без частей | `session_start_spawns_background_sync_once_per_interval` | FAIL |
+| R8 `Stop` тоже начинает эпоху | `checkpoint_precompact_new_epoch_in_hook_budget` | FAIL (уже у медленной заглушки: прогревочный `Stop` послал лишний запрос — «запросов 4») |
+
+Откаты нашли два изъяна самих проверок, оба исправлены и перепроверены: (1) в красном тесте
+сравнение пути `GET /file-refs` было точным, а заглушка хранит путь со строкой запроса
+(`?solution=…`) — проверка «второй запрос не дошёл» была пустой, R1 ловила только соседняя («одна
+строка на хук»); (2) первый вариант R4 (сон на выходе у всех вызовов, включая пустой) нормировка
+запуска пропустила по построению — см. ограничение выше.
+
+Не покрыто откатом: строка `sessions(new_epoch): бюджет исчерпан…` без слова «сеть» (срабатывает
+только при промахе бюджета, детерминированного теста нет) и подмена `ZAM_TEST_HOOK_HOLDOUT_MS`
+(влияет только под нагрузкой).
+
+### Прогоны
+
+Полный набор `hooks` (104 теста), один за другим (`--test-threads=1`), каждый прогон — готовым
+бинарником без пересборки (`run.ps1`, `chain2.ps1`; итоги — `results.csv`, журналы — `logs/`).
+«Нагрузка» — генератор `.tmp/m6/flaky/loadgen` на среднем уровне расследования: 24 потока CPU
+(все логические ядра) + 2 потока записи на диск с fsync; после каждой серии генератор остановлен
+флагом, процессов `zamflakyload` — 0 (строка `loadgen stopped; zamflakyload processes left: 0` в
+`chain.txt` и `chain2.txt`). «База» — продукт `40465fc` и тесты прежнего исполнителя (время уже
+внутри процесса, пределы ×4; бинарники `base-bin/`), под той же нагрузкой в тот же день.
+
+Оговорка о «тихой» машине: весь день на том же HDD шли чужие сборки (параллельные исполнители: от
+1 до 26 процессов `rustc`/`cargo` в момент прогона — число записано у каждого прогона в
+`chain*.txt`); тихий прогон набора занимает 114–140 с, под чужой сборкой — до 514 с, под
+генератором — 400–820 с.
+
+| тест | тихо 1 | тихо 2 | тихо 3 | нагр. 1 | нагр. 2 | нагр. 3 | база, нагр. 1 | база, нагр. 2 | база, нагр. 3 |
+|---|---|---|---|---|---|---|---|---|---|
+| `changed_flush_partial_failure_returns_rest` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** | **FAIL** |
+| `changed_queue_with_many_symbols_flushed_without_loss` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** | **FAIL** |
+| `checkpoint_precompact_new_epoch_in_hook_budget` | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS | PASS | PASS |
+| `checkpoint_reminds_fix_once` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `checkpoint_reminds_once_and_respects_stop_hook_active` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS |
+| `compact_put_before_recall` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** | **FAIL** |
+| `holdout_marker_silences_all_hooks` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `hooks_with_server_within_margin` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS | **FAIL** |
+| `late_snapshot_thread_after_response_is_not_put_timeout` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS |
+| `old_server_new_epoch_400_silent` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `output_is_valid_hook_json_with_event_name` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `post_tool_codex_stderr_hint` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS | PASS |
+| `post_tool_failure_error_regex_hint` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS | **FAIL** |
+| `post_tool_success_under_50ms` | PASS | PASS | PASS | **FAIL** | PASS | PASS | PASS | PASS | **FAIL** |
+| `pre_tool_under_50ms` | PASS | PASS | PASS | **FAIL** | PASS | PASS | PASS | PASS | PASS |
+| `session_start_big_cache_gc_does_not_delay_binding` | PASS | PASS | PASS | PASS | **FAIL** | PASS | PASS | PASS | **FAIL** |
+| `session_start_compact_appends_summary` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS | **FAIL** |
+| `session_start_compact_budget_kept_with_slow_binding` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `session_start_flushes_before_file_refs` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `session_start_holdout_old_server_400_ignored` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** | **FAIL** |
+| `session_start_holdout_only_on_first_start` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `session_start_holdout_quiet_group` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** | **FAIL** |
+| `session_start_outputs_digest_and_refreshes_cache_with_etag` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** |
+| `session_start_slow_server_one_deadline_for_all_requests` | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** | **FAIL** |
+| `session_start_spawns_background_sync_once_per_interval` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS |
+| `slow_snapshot_put_keeps_digest` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** |
+| `snapshot_deadline_never_delays_stop` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | **FAIL** |
+| `subagent_start_budget_300ms` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `subagent_start_server_down_silent` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| `subagent_start_uses_matching_spawn` | PASS | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** | PASS |
+| **итого PASS** | 104/104 | 104/104 | 104/104 | 102/104 | 103/104 | 103/104 | 94/104 | 91/104 | 81/104 |
+
+| | прогонов | PASS | FAIL |
+|---|---|---|---|
+| итоговая сборка, без генератора | 3 | 312 из 312 | 0 |
+| итоговая сборка, под генератором | 3 | 308 из 312 | 4 |
+| база, под генератором | 3 | 266 из 312 | 46 (из них 3 — красный тест дефекта 1 по замыслу) |
+
+Оставшиеся падения итоговой сборки под генератором (все — время, не содержимое):
+- `pre_tool_under_50ms`, `post_tool_success_under_50ms` (прогон 1, 730 с): p95 времени **внутри
+  процесса** 1,7 с и 4,1 с при пределе 200 мс и разбросе пустого вызова 0,25 с и 1,0 с; медиана — в
+  бюджете 50 мс, запуск процесса — в норме. Хук без сети в эти моменты стоит на файлах (журнал
+  сессии, очередь изменённых, замок) — задержка диска под записью с fsync; пустой вызов файлов не
+  трогает, поэтому нормировка по нему этот хвост не снимает. Честнее предел не ослаблять: это
+  свойство машины, а бюджет меряет release (17d).
+- `session_start_big_cache_gc_does_not_delay_binding` (прогон 2): 1,64 с при пределе 1,2 с. Хук
+  со старым кэшем в 3000 файлов: уборка идёт в своём потоке и хук её не ждёт, но удаляет файлы в
+  том же каталоге, куда хук пишет свои (привязка, `session.json`, кэши), — на занятом диске записи
+  хука стоят за ней. Под чужой сборкой без генератора давал 1,6–3,4 с (прогоны прежних сборок
+  теста); повторить замер нельзя (кэш уже убран). Передано в M7.
+- `checkpoint_precompact_new_epoch_in_hook_budget` (прогон 3): моя новая проверка у медленной
+  заглушки требовала, чтобы заглушка увидела каждый снятый по сроку запрос, а увидела 2 из 3
+  (запрос снят раньше, чем поток заглушки его прочёл). Проверка исправлена после прогонов: «исходов
+  не меньше трёх, увиденных запросов не больше снятых»; тест перепрогнан отдельно (ниже).
+
+Промежуточные прогоны (сборки тестов до последних правок; `results-oldexe.csv`, `results-mid.csv`,
+`logs/oldexe-*`, `logs/mid-*`, `logs/quiet-*`, `logs/load-*`) показали, чего ещё не хватало, и по
+ним сделаны правки «сверх задания»: без генератора под чужой сборкой — 102, 103, 103, затем 103,
+104, 102, затем 104, 103, 104 из 104; под генератором — 99, затем 100, 100, 95 из 104.
+
+
+### Проверка
+
+Сборка — отдельный `target/t17bh`, `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`, `-j 2`
+(каталог после работы удалён).
+- `cargo clippy -p zam-cli --all-targets -- -D warnings` — чисто; `rustfmt --edition 2024 --check`
+  по семи своим файлам — чисто.
+- `cargo test -p zam-cli --no-fail-fast -- --skip hook_budgets` (`full-zam-cli-final.log`,
+  итоговый продукт, под чужой сборкой — набор `hooks` шёл 226 с): модульные 179 PASS, `hooks` 104 из
+  104, остальные 33 набора PASS, кроме `m45_acceptance` — 5 из 7 (`compact_recovers_task_and_journal`,
+  `file_change_marks_stale`: содержимое с бюджетом продукта — хук замолчал). Повторы
+  `m45_acceptance`: 7 из 7 трижды, затем 6 из 7 дважды (`subagent_brief`, `glossary_ru_en` — тесты
+  каждый раз другие). Сверка с базой (`ab-m45.ps1`, тот же тестовый бинарник, `zam.exe` до правки
+  против после, поочерёдно, 6 кругов): база — 5 PASS из 6 (упал `glossary_ru_en`), после правки —
+  6 из 6. То есть это та же нестабильность содержимого на бюджете продукта, что была у `hooks`, и
+  от правки она не зависит; приёмочные наборы (`m45_acceptance` и соседние) в задачу не входили —
+  см. «Передать».
+- После последних двух правок проверок (`checkpoint_precompact…`: «исходов не меньше трёх»,
+  худший из трёх у медленной заглушки не сверяется — 1,27 с на одном вызове при 70–90 мс у двух
+  других) — ещё один полный `hooks`: 104 из 104 (`logs/final-1.log`, 213 с, под чужой сборкой).
+- `hook_budgets` (release) не запускался — это 17d.
+
+### [решение исполнителя]
+
+- Текст ошибки неотправленного запроса — существующая константа `zam_core::HOOK_BUDGET_SPENT`, а не
+  новая строка: для читателя `hooks.log` «клиента не создали» и «запрос не начали» — одна причина.
+- `HTTP_RESERVE_MS` (30 мс) и сроки своих запросов (60 / 100 мс) не менялись.
+- Одиночные замеры времени, которые нельзя повторить, оставлены с запасом ×4 (R3); строгую
+  сверку с бюджетом несут медиана серии и лучший из повторов: одиночный замер на HDD под чужой
+  сборкой давал 0,8–3,4 с при обычных 20–300 мс (остановка диска), и строгий предел на нём только
+  добавил бы шум. Предел лучшего из повторов — полтора бюджета, а не бюджет + 50 мс: под чужой
+  сборкой лучший из трёх доходил до 371 мс при бюджете 300 (срок 270 мс соблюдён, остальное —
+  диск), а дефект давал от 557 мс.
+- Время запуска фоновой синхронизации в журнале разбито на части вместо смены смысла первого числа
+  (его читают `xtask code-bench` и ТЗ §18.2).
+- ТЗ и спецификация M6 не правились — передано в 13a/13c.
+
+### Передать
+
+- **→ 17d (`hook_budgets`, release).** (1) Проверить на release, укладывается ли хук с
+  несостоявшимися запросами в бюджет: срок HTTP = бюджет − 30 мс, но возврат ожидания сокета на
+  Windows опаздывает до 15,6 мс (тик) и после него идут записи в `hooks.log` и возврат очереди
+  (отладочная сборка, HDD: выход на 283–307 мс при бюджете 300). Если p95 release выходит за
+  бюджет — решать о резерве (например, +16 мс на Windows) там, с перемером. (2) В release канала
+  времени `ZAM_TEST_HOOK_TIMING` нет (только отладочная сборка и фича `test-hooks`): `hook_budgets`
+  либо собирает `zam` с `test-hooks`, либо мерит снаружи с нормировкой по пустому вызову, как
+  `assert_launch`. (3) Пределы отладочных тестов времени теперь такие: медиана ≤ бюджета, p95 ≤ ×4.
+- **→ 13a/13c (ТЗ §10.3, строка «тайм-аут HTTP — бюджет минус 30 мс»).** Уточнить: срок —
+  абсолютный момент «старт процесса + бюджет − 30 мс», общий для всех запросов хука
+  (последовательных и параллельных); запрос без остатка не начинается. Строки `hooks.log`: у
+  неотправленного запроса — `<что>: бюджет исчерпан до запроса к серверу` (в том числе
+  `sessions(new_epoch): бюджет исчерпан до запроса к серверу`, `кэш file-refs не обновлён: бюджет
+  исчерпан до запроса к серверу`); строка запуска фоновой синхронизации — `запущена за T мс
+  (проверки C мс, процесс P мс, отметка W мс)` (ТЗ §13 «Автосинхронизация», §18.2). Подмены
+  тестов: `ZAM_TEST_HOOK_TIMING`, `ZAM_TEST_HOOK_HOLDOUT_MS`.
+- **→ координатору.** Приёмочные наборы `m45_acceptance` (и, вероятно, `m4`/`m56`/`m57`) проверяют
+  содержимое хуков с бюджетом продукта и под нагрузкой молчат так же, как молчали тесты `hooks`
+  (замер выше: и до правки, и после). Перевод их помощника `hook_as` на щедрый бюджет
+  (`ZAM_TEST_HOOK_BUDGET_MS`) — одна строка на набор, но это приёмка, поэтому без решения не
+  трогал.
+- **→ M7.** (4) Уборка кэша `session-start` (`gc_cache`) не ограничена ни числом файлов, ни
+  временем и удаляет файлы в том же каталоге, куда хук пишет привязку и кэши: на занятом диске
+  хук с кэшем в 3000 старых файлов выходит на 1,6–3,4 с
+  (`session_start_big_cache_gc_does_not_delay_binding`). Вариант — порция за старт или остановка
+  по сроку хука. (1) Опоздание возврата по сроку на Windows (тик 15,6 мс) убирается только своим
+  транспортом ureq с ожиданием по таймеру высокого разрешения. (2) Отметку `code-auto.json` и
+  другие мелкие файлы кэша хуков можно писать без временного файла (перезапись на месте: битый
+  файл читается как «отметки нет») — хвост создания файла на HDD уходит из пути хука. (3)
+  `flush_changed` после срока запроса ещё возвращает очередь (замок, чтение, атомарная запись) —
+  5–20 мс на HDD уже за сроком HTTP; вариант — не забирать очередь rename, а отправлять копию и
+  удалять по успеху.
+
+## Задача 17b-http, правки ревью (принято; шесть мелких и два дополнения, 2026-11-10)
+
+Коммиты поверх `e6f8541`: `1cce1e9` (точка подмены `ZAM_TEST_GC_STALL_MS`, модульные тесты в `client.rs` и `checkpoint.rs`; поведение продукта не менялось), `2002cc0` (`tests/hooks.rs`, `tests/m4|m45|m56|m57_acceptance.rs`). Материалы — `.tmp/m6/task17b-http/` (`chain3.txt`,
+`rollbacks2.log`, `logs/r2h-*`, `logs/r2-*`).
+
+### Мелкие
+
+1. **`session_start_big_cache_gc_does_not_delay_binding`** (упал у ревьюера без генератора: 1,65 с
+   при пределе 1,2 с). Одиночный замер времени убран: на занятом HDD уборка 3000 файлов и записи
+   хука делят один каталог, и хук выходит на 1,6–3,4 с, не ожидая уборки вовсе. Вместо него —
+   суть, подменой: новая точка `ZAM_TEST_GC_STALL_MS` (`cache::gc_cache`, только отладочная сборка
+   и `test-hooks`) держит уборку 30 с; тест проверяет, что привязка новой сессии уже записана
+   (значит, до уборки), строки «привязка MCP к сессии: запись не завершилась» нет и хук вышел не
+   позже 10 с (ждал бы уборку — шёл бы 30 с). Первая часть (настоящая уборка 3000 файлов: привязка
+   новой сессии, бюджет запросов цел) осталась. Проверка не пустая — откаты S2 и S3 ниже.
+2. **`client::tests::deadline_is_absolute_and_shared_by_requests`** — масштаб ×4 (срок 600 мс, сон
+   300 мс, запасы 100 мс); в третьей части допустимы оба исхода — `is_timeout()` и `is_unsent()`
+   (сон на занятой машине затянулся за срок — запрос не начат; предел по времени сверяется только
+   у начатого запроса).
+3. **`assert!(!log.contains("file-refs не обновлён: сервер"))`** — окно ложного падения было, и
+   оно не в `timed`. Откуда «сервер»: `Client::timed` не начинает запрос только без остатка
+   (< 1 мс); `flush_changed` не шлёт очередь уже при остатке меньше 15 мс (`FLUSH_MIN_LEFT`), и
+   тогда `refresh_file_refs` начинает `GET /file-refs` с остатком 1–15 мс — запрос уходит, снимается
+   сроком, строка «кэш file-refs не обновлён: сервер … timeout» говорит о нём правду.
+   **[решение исполнителя]** Продукт не менял: общий порог «запрос не начинается» — решение о
+   бюджете (с остатком в единицы мс локальный сервер ещё успевает ответить 304; порог 15 мс у
+   очереди — потому что там тело и запись на сервере), оно связано с резервом и передано в 17d
+   вместе с ним. Проверка поставлена под условие «отправка очереди была у всех трёх хуков».
+4. Там же: при любом числе отправок — `GET /file-refs` не больше, чем хуков без отправки очереди
+   (`gets <= 3 − posts`).
+5. **`session_start_flushes_all_queues_in_one_request`** — прирост запросов считается на каждую
+   попытку отдельно (не больше одного на хук); счёт берётся, когда заглушка дочитала принятое
+   (два равных чтения через 50 мс), чтобы опоздавшая запись не ушла в счёт следующей попытки.
+6. **`snapshot_deadline_never_delays_stop`** — порог 3 с вместо `LATE_THREAD_MAX` (10 с): бюджет
+   хука в этом тесте 10 с, и хук, досидевший бюджет, уложился бы в прежний порог. Комментарий у
+   `LATE_THREAD_MAX` переписан: порог годится только там, где бюджет хука заметно меньше него
+   (1–4 с) или заметно больше (30 с).
+
+### Дополнения
+
+7. **Строка неотправленного запроса эпохи.** Модульный тест
+   `cmd::hook::checkpoint::tests::new_epoch_unsent_is_logged_without_net`: клиент со сроком в
+   прошлом → в `hooks.log` ровно одна строка `checkpoint sessions(new_epoch): бюджет исчерпан до
+   запроса к серверу`, слова «сеть» нет. Откат S4.
+8. **Приёмочные наборы — содержимое на щедром бюджете** (решение координатора). Критерии про
+   время не тронуты:
+
+   | набор | переведено на `ZAM_TEST_HOOK_BUDGET_MS=10000` | оставлено с бюджетом продукта (критерий — время) |
+   |---|---|---|
+   | `m45_acceptance` | `hook_as` — все хуки набора (замеров времени в наборе нет) | — |
+   | `m4_acceptance` | `Proj::hook` (сценарии, `session_start_until`, подготовка) | `Proj::hook_at`: `crlf_scenario` (хуки без сети — `fail_open_max`), `fail_open_when_server_down`, `hook_budgets` (release, 17d) |
+   | `m56_acceptance` | `Proj::hook` | `acceptance_hook_budgets_with_map` (p95 по командам и «карта в 10 из 10» — в одном вызове; переведён на `hook_at`, то есть бюджет прежний), `hook_at` на выключенный сервер |
+   | `m57_acceptance` | `Proj::hook` (разделы «Идеи», подготовка) | `acceptance_recall_p95_with_50_ideas` — замер `measure` через новый `hook_timed` (бюджет прежний) |
+
+   `m55_acceptance` хуки не запускает.
+
+### Откаты
+
+`rollbacks2.py`, журнал `rollbacks2.log`:
+
+| откат (правка продукта) | тест | итог |
+|---|---|---|
+| S1 срок запроса — от создания клиента, как до правки | `client::tests::deadline_is_absolute_and_shared_by_requests`; `session_start_slow_server_one_deadline_for_all_requests` | FAIL оба (второй — «запрос после срока хука: GET 3 при отправках 3») — переписанные проверки п. 2–4 дефект по-прежнему ловят |
+| S2 уборка кэша — до записи привязки | `session_start_big_cache_gc_does_not_delay_binding` | FAIL: привязка осталась прежней сессии |
+| S3 хук ждёт уборку кэша без предела | `session_start_big_cache_gc_does_not_delay_binding` | FAIL: «хук ждал уборку кэша: 30,0 с при паузе уборки 30 с» |
+| S4 неотправленный запрос эпохи — общей веткой «сеть» | `new_epoch_unsent_is_logged_without_net` | FAIL: строка «sessions(new_epoch): сеть: бюджет исчерпан…» |
+
+### Проверка
+
+Свой `target/t17bh` (собран заново, после работы удалён), `-j 2`.
+- `cargo fmt --all --check` — чисто; `cargo clippy -p zam-cli --all-targets -- -D warnings` — чисто.
+- Модульные: `client::` — 7 PASS; `new_epoch_unsent_is_logged_without_net` — PASS.
+- `cargo test -p zam-cli --test hooks` (готовым бинарником, `--test-threads=1`), три прогона:
+  104 из 104 все три (`logs/r2h-1..3.log`: 121, 117 и 119 с; чужих `rustc`/`cargo` — 1–2).
+- Приёмочные, по три прогона (`-- --skip hook_budgets`):
+  `m45_acceptance` 7 из 7 ×3; `m4_acceptance` 4 из 4 ×3; `m56_acceptance` 6 из 6 ×3;
+  `m57_acceptance` 3 из 3 ×3 (`chain3.txt`, `logs/r2-*`). До перевода `m45_acceptance` давал 5–6
+  из 7 в трёх прогонах из тринадцати (на базе до 17b-http — в одном из шести).
+- `m56_acceptance::acceptance_hook_budgets_with_map` фильтром `--skip hook_budgets` пропускается
+  (имя содержит `hook_budgets`), поэтому запущен отдельно, шесть раз: 4 PASS, 2 FAIL — «карта в N
+  из 10» в первом запуске после пересборки и «session-start: p95 1,28 с > 1200 мс» (p95 из десяти —
+  это максимум; время процесса целиком). Это тест с критерием про время на бюджете продукта —
+  оставлен как есть (правка в нём — только имя помощника, бюджет прежний), нестабильность того
+  же рода, что была у `hooks` до этой задачи; перевод его на время внутри процесса и медиану —
+  отдельным решением (→ 17d).
+- Не запускалось: `hook_budgets` (release, 17d); полный `cargo test -p zam-cli` и прогоны под
+  генератором нагрузки в этом круге не повторялись (продукт изменён только точкой подмены
+  `ZAM_TEST_GC_STALL_MS`).
+
+### Передать
+
+- **→ 17d (дополнение).** (1) Хук против HTTPS-сервера: ureq 3.4.2 при конфигурации уровня
+  запроса (а срок каждого запроса хука теперь ставится именно так, `Client::timed`) не
+  заполняет кэш конфигурации rustls агента и строит её на каждое новое соединение
+  (`ureq-3.4.2/src/tls/rustls.rs:98–113`, ветка `details.request_level`): корневые сертификаты
+  разбираются заново, возобновление сеансов TLS между соединениями не работает. У `session-start`
+  параллельных соединений до шести. Замерить на release против HTTPS; если заметно — срок запроса
+  передавать иначе (своя обёртка транспорта) либо прогревать кэш запросом уровня агента. (2) Порог
+  «запрос не начинается»: сейчас 1 мс (`client::DEADLINE_MIN`), у очереди изменённых файлов — 15 мс
+  (`FLUSH_MIN_LEFT`); запрос, начатый с остатком в единицы мс, почти наверняка кончится сроком и
+  добавит хуку до тика таймера (15,6 мс на Windows) — решать вместе с резервом.
+  (3) `m56_acceptance::acceptance_hook_budgets_with_map` — время процесса целиком и p95 из десяти
+  на бюджете продукта: 2 падения из 6 запусков; перевести на время внутри процесса и медиану, как
+  `hooks`, или мерить на release.
+- **→ 13a/13c.** Передача про ТЗ §10.3 (абсолютный срок, строки `hooks.log`, подмены тестов) —
+  в разделе «Задача 17b-http…» выше, пункт «→ 13a/13c»; к списку подмен добавить
+  `ZAM_TEST_GC_STALL_MS`.
+- **→ M7.** Без изменений (уборка кэша `session-start` без предела — там же, п. 4).

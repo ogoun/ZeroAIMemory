@@ -439,8 +439,18 @@ impl Proj {
         (o, t.elapsed())
     }
 
+    /// Хук ради содержимого — со
+    /// щедрым бюджетом (`ZAM_TEST_HOOK_BUDGET_MS`): критерий приёмки — содержимое, а с бюджетом
+    /// продукта отладочная сборка на занятой машине молчит (fail-open); время и бюджеты проверяют
+    /// `hooks` и release `hook_budgets` (ревью 17b-http M6). Замеры
+    /// времени и fail-open — [`Proj::hook_at`], с бюджетом продукта.
     fn hook(&self, kind: &str, v: &Value) -> Output {
-        self.hook_at(&self.url, kind, v).0
+        self.cmd(&self.url)
+            .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+            .args(["hook", kind])
+            .write_stdin(v.to_string().into_bytes())
+            .output()
+            .unwrap()
     }
 
     /// Событие с общими полями (`session_id`, `cwd`).
