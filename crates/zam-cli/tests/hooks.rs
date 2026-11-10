@@ -4964,7 +4964,8 @@ fn post_compact_and_session_end_accepted_within_100ms() {
 /// §8а: `SessionEnd` ставит сессии `ended_at` настоящего сервера — и при выключенном снимке
 /// (`hooks.session_snapshot = false`); включённый снимок сервер (17c) принимает: очередь пуста,
 /// `GET …/snapshot` отдаёт его. Сессии на сервере нет — 404 `session-not-found`: снимок остаётся
-/// в очереди со счётчиком попыток (как у старого сервера), причина — в `hooks.log`.
+/// в очереди, счётчик попыток старого сервера не растёт, причина — в `hooks.log`; сессия
+/// появилась — снимок уходит следующим хуком.
 #[test]
 fn session_end_patches_ended() {
     let _g = serial();
@@ -5020,13 +5021,28 @@ fn session_end_patches_ended() {
     write_lines(&t, &[cl_user(s, "запрос незарегистрированной сессии")]);
     let end = snap_ev(&p, "SessionEnd", s, &t, json!({"reason": "exit"}));
     empty(&hook_snap(&p, "checkpoint", &end));
+    // больше попыток, чем даётся старому серверу: счётчик не растёт, снимок не бросается
+    for _ in 0..4 {
+        empty(&hook_snap(&p, "checkpoint", &end));
+    }
     let q = snap_file(&p, "snapq", s).unwrap_or_else(|| panic!("нет очереди: {}", p.log()));
-    assert_eq!(q["old_server"], 1, "{q}");
+    assert_eq!(q["old_server"], 0, "{q}");
+    let log = p.log();
     assert!(
-        p.log().contains("HTTP 404 /problems/session-not-found"),
-        "{}",
-        p.log()
+        log.matches("HTTP 404 /problems/session-not-found").count() >= 4,
+        "{log}"
     );
+    assert!(!log.contains("старый сервер"), "{log}");
+    // сессия появилась — очередь уходит следующим хуком
+    reg(s);
+    empty(&hook_snap(&p, "checkpoint", &end));
+    assert!(snap_file(&p, "snapq", s).is_none(), "{}", p.log());
+    let r = http()
+        .get(&format!("{url}/api/v1/sessions/{s}/snapshot"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .call()
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", p.log());
 }
 
 /// §8а: `SessionStart source=compact` без `PostCompact` — снимок из журнала, `PUT` **до**

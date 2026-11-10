@@ -68,6 +68,28 @@ impl SnapTrigger {
     }
 }
 
+/// Пределы полей снимка (§8а, «Пределы»): клиент собирает снимок в них, сервер усекает
+/// присланное сверх них (остаются последние элементы и хвост конспекта).
+pub mod limits {
+    /// Запросов человека.
+    pub const PROMPTS_MAX: usize = 5;
+    /// Символов запроса.
+    pub const PROMPT_CHARS: usize = 500;
+    /// Изменённых файлов.
+    pub const FILES_MAX: usize = 20;
+    /// Символов пути файла.
+    pub const FILE_CHARS: usize = 512;
+    /// Команд.
+    pub const COMMANDS_MAX: usize = 10;
+    /// Символов команды.
+    pub const COMMAND_CHARS: usize = 200;
+    /// Байт конспекта (хвост).
+    pub const SUMMARY_BYTES: usize = 8 * 1024;
+}
+
+/// Форматы журналов агентов (поле `agent` снимка): адаптеры клиента `zam`.
+pub const AGENT_FORMATS: [&str; 2] = ["claude", "codex"];
+
 /// Команда из журнала агента; `failed` — исход, если журнал его знает.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapCommand {

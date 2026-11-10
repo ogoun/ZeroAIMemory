@@ -60,8 +60,10 @@ fn snapshot_row(r: &rusqlite::Row) -> rusqlite::Result<SnapshotRow> {
     })
 }
 
-/// Записывает снимок сессии, заменяя прежний. Сессии нет — [`StoreError::NotFound`].
-pub async fn put_snapshot(db: &Db, row: &SnapshotRow) -> Result<(), StoreError> {
+/// Записывает снимок сессии, заменяя прежний, если тот не новее (`taken_at`): опоздавший старый
+/// снимок (очередь клиента) новый не затирает — тогда `false`. Сессии нет —
+/// [`StoreError::NotFound`].
+pub async fn put_snapshot(db: &Db, row: &SnapshotRow) -> Result<bool, StoreError> {
     let data = serde_json::to_string(&row.data)
         .map_err(|e| StoreError::BadInput(format!("данные снимка: {e}")))?;
     let row = row.clone();
@@ -77,14 +79,15 @@ pub async fn put_snapshot(db: &Db, row: &SnapshotRow) -> Result<(), StoreError> 
         if !exists {
             return Err(StoreError::NotFound);
         }
-        t.execute(
+        let n = t.execute(
             "INSERT INTO session_snapshots (session_id, taken_at, trigger_kind, agent, status,
                                             skipped, bytes, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (session_id) DO UPDATE SET
                taken_at = excluded.taken_at, trigger_kind = excluded.trigger_kind,
                agent = excluded.agent, status = excluded.status, skipped = excluded.skipped,
-               bytes = excluded.bytes, data = excluded.data",
+               bytes = excluded.bytes, data = excluded.data
+             WHERE excluded.taken_at >= session_snapshots.taken_at",
             params![
                 row.session_id,
                 fmt_ts(row.taken_at),
@@ -96,7 +99,7 @@ pub async fn put_snapshot(db: &Db, row: &SnapshotRow) -> Result<(), StoreError> 
                 data
             ],
         )?;
-        Ok(())
+        Ok(n > 0)
     })
     .await
 }
@@ -181,12 +184,13 @@ pub async fn writes_after(
     .await
 }
 
-/// Задача сессии снимка (§8а): `in_progress` или `blocked`, захваченная сессией (любой срок
-/// захвата) или с её ревизией.
+/// Задача сессии снимка (§8а): захваченная сессией (любой срок захвата) или с её ревизией, в
+/// любом статусе — закрытая после снимка задача тоже признак того, что работа продолжилась.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapTask {
     pub id: Id,
-    pub title: String,
+    /// Статус задачи (`open`, `in_progress`, `blocked`, `done`, …).
+    pub status: String,
     /// Последняя ревизия задачи — любой сессии и без сессии (WebUI): ревизия другой сессии
     /// после снимка (§8а, признак (б)) — частный случай «задача обновлялась после снимка».
     pub last_rev_at: Option<Timestamp>,
@@ -212,13 +216,12 @@ pub async fn snapshot_tasks(
     args.push(fmt_ts(now));
     args.push(limit.to_string());
     let sql = format!(
-        "SELECT e.id, e.title,
+        "SELECT e.id, e.status,
                 (SELECT max(ts) FROM entry_revisions r WHERE r.entry_id = e.id),
                 coalesce(json_extract(e.data, '$.claimed_by.session'), '') <> ?{s}
                   AND json_extract(e.data, '$.claimed_by.until') > ?{now}
          FROM entries e INDEXED BY entries_feed
          WHERE e.space_id IN ({list}) AND e.kind = 'task' AND e.deleted_at IS NULL
-           AND e.status IN ('in_progress', 'blocked')
            AND (json_extract(e.data, '$.claimed_by.session') = ?{s}
                 OR EXISTS (SELECT 1 FROM entry_revisions r
                            WHERE r.entry_id = e.id AND r.session_id = ?{s}))
@@ -234,7 +237,7 @@ pub async fn snapshot_tasks(
         let rows = st.query_map(params_from_iter(args), |r| {
             Ok(SnapTask {
                 id: r.get(0)?,
-                title: r.get(1)?,
+                status: r.get(1)?,
                 last_rev_at: ts_opt(r, 2)?,
                 claimed_by_other: r.get::<_, Option<bool>>(3)?.unwrap_or(false),
             })

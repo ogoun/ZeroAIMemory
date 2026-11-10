@@ -91,8 +91,13 @@ pub const LOCAL_TOKEN_EVENTS: [&str; 3] = ["pre_tool", "post_tool_local", "subag
 /// Предел `tokens` и `calls` одной прибавки.
 pub const TOKENS_MAX: u64 = 1_000_000_000;
 
-/// База пользователя запроса (без проверки существования: принципал уже проверен).
-async fn requester_db(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<Db, ApiError> {
+/// База пользователя запроса (без проверки существования: принципал уже проверен); у
+/// администратора — пользователя `X-Zam-User`.
+pub(super) async fn requester_db(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+) -> Result<Db, ApiError> {
     let user = crate::auth::target_user(st, p, headers).await?;
     Ok(st.users.get(user.id).await?)
 }

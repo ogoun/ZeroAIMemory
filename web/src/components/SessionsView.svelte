@@ -19,6 +19,7 @@
     type TokenStat,
     type User,
   } from '../lib/api';
+  import { untrack } from 'svelte';
   import { localTime } from '../lib/time';
 
   let { me, users, onexpired }: { me: Me; users: User[]; onexpired: () => void } = $props();
@@ -114,13 +115,14 @@
   let snap = $state<SessionSnapshot | null>(null);
   let snapError = $state('');
   let snapSeq = 0;
-  async function loadSnapshot(s: SessionItem | null) {
+  async function loadSnapshot(id: string | null) {
     const n = ++snapSeq;
-    snap = null;
     snapError = '';
-    if (!s?.snapshot_at) return;
+    // снимок той же сессии обновился — прежний текст остаётся до ответа: блок не мигает
+    if (snap?.session_id !== id) snap = null;
+    if (!id) return;
     try {
-      const r = await sessionSnapshot(s.id, admin ? who : undefined);
+      const r = await sessionSnapshot(id, admin ? who : undefined);
       if (n === snapSeq) snap = r;
     } catch (e) {
       if (n !== snapSeq) return;
@@ -129,13 +131,19 @@
     }
   }
 
+  // Зависимости — только id открытой сессии и момент её снимка: перезагрузка списка даёт новый
+  // объект `opened`, но снимок перечитывается, лишь когда он сменился.
   $effect(() => {
-    void loadSnapshot(opened);
+    const id = snapId;
+    void snapAt;
+    untrack(() => void loadSnapshot(id));
   });
 
   let summary = $derived(rows(items));
   let opened = $derived(items.find((s) => s.id === open) ?? null);
   let openRows = $derived(opened ? rows([opened]) : []);
+  let snapId = $derived(opened?.snapshot_at ? opened.id : null);
+  let snapAt = $derived(opened?.snapshot_at ?? null);
 </script>
 
 {#snippet table(rs: Row[], label: string)}
