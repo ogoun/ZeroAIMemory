@@ -3452,6 +3452,61 @@ fn changed_flush_partial_failure_returns_rest() {
     }
 }
 
+/// Бюджет хука вышел **после** разбора очереди (замки, rename, чтение — на занятом диске десятки
+/// мс; подмена `ZAM_TEST_FLUSH_STALL_MS`): запроса нет, очередь возвращена на место, причина —
+/// строкой в `hooks.log` (раньше эта ветка молчала: «очередь не ушла» без единой строки);
+/// следующий хук очередь отправляет.
+#[test]
+fn changed_flush_budget_spent_after_take_is_logged() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"stale":0,"text":""}"#, Duration::ZERO);
+    let p = Proj::new("flush-stall", &url, "zam_x");
+    let s = "fs-1";
+    put_queue(&p, s, &[("src/a.rs".into(), 'a'), ("src/b.rs".into(), 'b')]);
+    let pr = p.ev("UserPromptSubmit", s, json!({"prompt": ""}));
+    let posts = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+            .count()
+    };
+    // щедрый бюджет (3 с) — до очереди хук доходит при любой занятости машины; пауза дольше его
+    let o = p
+        .cmd(&url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+        .env("ZAM_TEST_FLUSH_STALL_MS", "3100")
+        .args(["hook", "prompt", "--agent", "claude"])
+        .write_stdin(pr.to_string().into_bytes())
+        .output()
+        .unwrap();
+    empty(&o);
+    let log = p.log();
+    assert_eq!(posts(), 0, "{log}");
+    assert_eq!(queue(&p, s).len(), 2, "очередь возвращена: {log}");
+    assert_eq!(
+        log.matches("files/changed: очередь не отправлена — остаток бюджета меньше 15 мс")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        log.contains("очередь разобрана, возвращено путей: 2)"),
+        "{log}"
+    );
+    // без паузы — тот же хук очередь отправляет
+    let o = p
+        .cmd(&url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+        .args(["hook", "prompt", "--agent", "claude"])
+        .write_stdin(pr.to_string().into_bytes())
+        .output()
+        .unwrap();
+    empty(&o);
+    assert_eq!(posts(), 1, "{}", p.log());
+    assert!(queue(&p, s).is_empty(), "{}", p.log());
+}
+
 // ---- эпохи `session_seen` (M6 §7.2, задача 7a) ----
 
 /// Пометка `/read` о повторной выдаче (§7.3).
