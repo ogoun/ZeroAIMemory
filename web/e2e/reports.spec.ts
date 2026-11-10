@@ -7,6 +7,12 @@ import { expect, test, type Browser, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import {
+  LINK_FILE_AUTO,
+  LINK_FILE_PATH,
+  LINK_HTTPS,
+  LINK_MAILTO,
+  LINK_VSCODE,
+  LINK_VSCODE_PATH,
   REPORT_BULK,
   REPORT_COMMIT,
   REPORT_DUP_WORD,
@@ -99,6 +105,14 @@ test('reports_journal_pinned_in_solution_tree', async ({ page }) => {
 
 test('reports_feed_date_author_tags_thumb_cursor', async ({ page }) => {
   const problems = watch(page);
+  // запросы картинок ленты: серверные миниатюры, а не исходные файлы (M6, задача 15a)
+  const images: { path: string; type: string }[] = [];
+  page.on('response', (r) => {
+    const u = new URL(r.url());
+    if (/\/api\/v1\/(previews|entries\/[^/]+\/attachments)\//.test(u.pathname)) {
+      images.push({ path: u.pathname + u.search, type: r.headers()['content-type'] ?? '' });
+    }
+  });
   const feed = await openFeed(page);
   const cards = feed.locator('article');
   // страница — 20, новые первыми: полный отчёт создан последним
@@ -109,10 +123,11 @@ test('reports_feed_date_author_tags_thumb_cursor', async ({ page }) => {
   await expect(first).toContainText(`агент, сессия ${REPORT_SESSION}, ${REPORT_MACHINE}`);
   await expect(first).toContainText('#ml');
   await expect(first).toContainText('train');
-  // миниатюра — исходный файл первой картинки, лениво, с object-fit
+  // миниатюра — серверное превью первой картинки (`kind=thumb`), лениво, с object-fit;
+  // исходник 160×90 меньше предела 256 — размер тот же
   const thumb = first.locator('img.thumb');
   await expect(thumb).toHaveAttribute('loading', 'lazy');
-  await expect(thumb).toHaveAttribute('src', /\/attachments\/[0-9a-f]{64}\/loss\.png$/);
+  await expect(thumb).toHaveAttribute('src', /api\/v1\/previews\/[0-9a-f]{64}\?kind=thumb&px=256$/);
   await expect.poll(() => thumb.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(160);
   expect(await thumb.evaluate((i) => getComputedStyle(i).objectFit)).toBe('cover');
   // у отчёта без картинок — заглушка
@@ -127,6 +142,22 @@ test('reports_feed_date_author_tags_thumb_cursor', async ({ page }) => {
   // + полный, «perf», корзина, «два раздела», печатный (reports-print.spec), из `zam report`
   await expect(cards).toHaveCount(REPORT_BULK + 6);
   await expect(page.getByRole('button', { name: 'Показать ещё' })).toHaveCount(0);
+  // печатный отчёт (первая картинка 320×160): превью ужато до 256 — грузится PNG превью
+  const big = feed.locator(`article[data-report="${env('E2E_REPORT_PRINT')}"] img.thumb`);
+  await big.scrollIntoViewIfNeeded();
+  await expect(big).toHaveAttribute('src', /api\/v1\/previews\/[0-9a-f]{64}\?kind=thumb&px=256$/);
+  await expect.poll(() => big.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(256);
+  expect(await big.evaluate((i: HTMLImageElement) => i.naturalHeight)).toBe(128);
+  // отчёт из `zam report` (первая картинка 300×150) — тоже превью
+  const cli = feed.locator(`article[data-report="${env('E2E_REPORT_CLI')}"] img.thumb`);
+  await cli.scrollIntoViewIfNeeded();
+  await expect.poll(() => cli.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(256);
+  // лента не запросила ни одного исходного файла: только превью, все — PNG
+  expect(images.length).toBeGreaterThanOrEqual(3);
+  for (const i of images) {
+    expect(i.path, i.path).toMatch(/^\/api\/v1\/previews\/[0-9a-f]{64}\?kind=thumb&px=256$/);
+    expect(i.type, i.path).toBe('image/png');
+  }
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
@@ -305,6 +336,123 @@ test('report_no_create_or_edit_ui', async ({ page }) => {
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+test('report_links_rel_copy_path_file_no_navigation', async ({ page, context }) => {
+  // M6, задача 15a: ссылки тела — пять схем; внешним — rel; `vscode:` кликается и с кнопкой;
+  // `file:` — без перехода (нет href), с кнопкой «копировать путь» (путь ОС)
+  const problems = watch(page);
+  await openReport(page, env('E2E_REPORT_PRINT'));
+  const doc = page.locator('article.report .doc');
+  const link = (text: string) => doc.locator('a', { hasText: new RegExp(`^${text}$`) });
+  const REL = 'noopener noreferrer';
+  await expect(link('сайт')).toHaveAttribute('href', LINK_HTTPS);
+  await expect(link('сайт')).toHaveAttribute('rel', REL);
+  await expect(link('почта')).toHaveAttribute('href', LINK_MAILTO);
+  await expect(link('почта')).toHaveAttribute('rel', REL);
+  // у http(s) и mailto кнопки нет: кнопки — у `vscode:`, `file:` и автоссылки `file:`
+  await expect(doc.getByRole('button', { name: 'копировать путь' })).toHaveCount(3);
+
+  // vscode: ссылка остаётся ссылкой, рядом кнопка — путь после vscode://file/
+  const code = link('код');
+  await expect(code).toHaveAttribute('href', LINK_VSCODE);
+  await expect(code).toHaveAttribute('rel', REL);
+  const codeBtn = code.locator('xpath=following-sibling::*[1]');
+  await expect(codeBtn).toHaveText('копировать путь');
+  await expect(codeBtn).toHaveAttribute('data-copy-path', LINK_VSCODE_PATH);
+
+  // file: — без href: клик никуда не ведёт, новых вкладок нет
+  const data = link('данные');
+  await expect(data).not.toHaveAttribute('href');
+  await expect(data).toHaveClass(/local-link/);
+  await expect(data).toHaveAttribute('title', LINK_FILE_PATH);
+  const url = page.url();
+  let popups = 0;
+  context.on('page', () => popups++);
+  let navigations = 0;
+  page.on('framenavigated', () => navigations++);
+  await data.click();
+  await page.waitForTimeout(300);
+  expect(page.url()).toBe(url);
+  expect(navigations).toBe(0);
+  expect(popups).toBe(0);
+  await expect(doc).toBeVisible();
+  // автоссылка file: — так же
+  const auto = doc.locator('a', { hasText: LINK_FILE_AUTO });
+  await expect(auto).not.toHaveAttribute('href');
+  await expect(auto.locator('xpath=following-sibling::*[1]')).toHaveAttribute('data-copy-path', '/home/u/notes.md');
+  // ни одной ссылки с href на file: в теле нет
+  expect(await doc.locator('a[href^="file:" i]').count()).toBe(0);
+
+  // «копировать путь» по HTTP (без Clipboard API) кладёт путь ОС в буфер
+  expect(await page.evaluate(() => typeof navigator.clipboard)).toBe('undefined');
+  const dataBtn = data.locator('xpath=following-sibling::*[1]');
+  await expect(dataBtn).toHaveAttribute('data-copy-path', LINK_FILE_PATH);
+  await dataBtn.click();
+  await expect(dataBtn).toHaveText('Скопировано');
+  const port = new URL(base()).port;
+  await context.grantPermissions(['clipboard-read'], { origin: `http://localhost:${port}` });
+  const probe = await context.newPage();
+  await probe.goto(`http://localhost:${port}/`);
+  expect(await probe.evaluate(() => navigator.clipboard.readText())).toBe(LINK_FILE_PATH);
+  await page.bringToFront();
+  await codeBtn.click();
+  await expect(codeBtn).toHaveText('Скопировано');
+  await probe.bringToFront();
+  expect(await probe.evaluate(() => navigator.clipboard.readText())).toBe(LINK_VSCODE_PATH);
+  await probe.close();
+  // подпись кнопки возвращается
+  await expect(dataBtn).toHaveText('копировать путь');
+  await page.screenshot({ path: `${screens}report-links.png`, fullPage: true });
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('report_links_hostile_schemes_no_href_in_webui', async ({ page }) => {
+  // вторая линия защиты: если бы сервер пропустил чужую схему, рендер WebUI снимает href сам —
+  // та же проверка схемы, что в `zam report` и на сервере (регистр, пробел, управляющие символы)
+  const problems = watch(page);
+  const hostile = [
+    'javascript:window.__zamLinkPwned=1',
+    'JaVaScRiPt:window.__zamLinkPwned=1',
+    ' javascript:window.__zamLinkPwned=1',
+    'java\tscript:window.__zamLinkPwned=1',
+    'java\nscript:window.__zamLinkPwned=1',
+    '\u0001javascript:window.__zamLinkPwned=1',
+    'data:text/html,<script>parent.__zamLinkPwned=1</script>',
+    'vbscript:x',
+    'ftp://example.org/a',
+    'blob:http://example.org/1',
+    'vscode-insiders://file/x',
+    // `vscode:` разрешена, но переход — только у `vscode://file/…`: команды расширений не кликаются
+    'vscode://vscode.git/clone?url=https://example.org/x.git',
+    'vscode:extension/publisher.name',
+  ];
+  const safe = ['%6Aavascript:window.__zamLinkPwned=1', 'https://example.org/ok', 'vscode://file/C:/ok.rs', '#h-x'];
+  const id = env('E2E_REPORT_PERF');
+  await page.route(new RegExp(`/api/v1/entries/${id}\\?format=html`), async (route) => {
+    const resp = await route.fetch();
+    const j = (await resp.json()) as { html: string };
+    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    j.html +=
+      '<p class="hostile">' +
+      [...hostile, ...safe].map((h, i) => `<a data-i="${i}" href="${esc(h)}">ссылка ${i}</a>`).join(' ') +
+      '</p>';
+    await route.fulfill({ response: resp, json: j });
+  });
+  await openReport(page, id);
+  const links = page.locator('article.report .doc p.hostile a');
+  await expect(links).toHaveCount(hostile.length + safe.length);
+  for (let i = 0; i < hostile.length; i++) {
+    await expect(links.nth(i), hostile[i]).not.toHaveAttribute('href');
+    await links.nth(i).click();
+  }
+  await expect(links.nth(hostile.length)).toHaveAttribute('href', safe[0]);
+  await expect(links.nth(hostile.length + 1)).toHaveAttribute('rel', 'noopener noreferrer');
+  await expect(links.nth(hostile.length + 2)).toHaveAttribute('href', safe[2]);
+  await page.waitForTimeout(200);
+  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).__zamLinkPwned)).toBeUndefined();
+  await expect(page.locator(`article.report[data-report="${id}"] .doc`)).toBeVisible();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 /** Участник решения администратора с одобренным доступом `access` (без входа в WebUI). */
 async function member(browser: Browser, page: Page, access: 'rw' | 'ro') {
   const rc = page.request;
@@ -374,7 +522,8 @@ test('report_admin_for_user_no_trash_ui_files_with_user', async ({ page, browser
   await page.goto(url);
   const feed = page.getByRole('feed', { name: 'Лента отчётов' });
   const thumb = feed.locator(`article[data-report="${id}"] img.thumb`);
-  await expect(thumb).toHaveAttribute('src', new RegExp(`/plot\\.png\\?user=${m.id}$`));
+  // миниатюра — превью от имени владельца (`&user=`), не исходный файл
+  await expect(thumb).toHaveAttribute('src', new RegExp(`api/v1/previews/[0-9a-f]{64}\\?kind=thumb&px=256&user=${m.id}$`));
   await expect.poll(() => thumb.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(80);
   await expect(page.getByRole('button', { name: 'Корзина', exact: true })).toHaveCount(0);
   await page.goto(`${url}/${id}`);

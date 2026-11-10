@@ -1380,3 +1380,277 @@ async fn report_multipart_filename_star_utf8() {
     assert_status(&r, StatusCode::BAD_REQUEST, "filename* не UTF-8");
     assert_eq!(w.reports().await, before);
 }
+
+// ---- M6, задача 15a (долги M5.5): схемы ссылок и превью ----
+
+/// M6 §16 п. 15 (ответ владельца по M5.5, п. 1): ссылки тела со схемами
+/// [`zam_core::REPORT_LINK_SCHEMES`] принимаются (201) и остаются как есть; `ftp:`,
+/// `javascript:` и обходы (регистр, пробел, управляющие символы, сущности, percent-кодирование,
+/// определение сноски, автоссылка) — 422; `vscode:`/`file:` у картинки — 422.
+#[tokio::test]
+async fn report_link_schemes() {
+    let w = world("link-schemes").await;
+    let ok = [
+        "http://example.org/a",
+        "https://example.org/a?b=c#d",
+        "mailto:a@example.org",
+        "vscode://file/C:/proj/src/main.rs:10:5",
+        "file:///C:/data/report.csv",
+    ];
+    assert_eq!(ok.len(), zam_core::REPORT_LINK_SCHEMES.len());
+    for (url, scheme) in ok.iter().zip(zam_core::REPORT_LINK_SCHEMES) {
+        assert!(url.starts_with(&format!("{scheme}:")), "{url}");
+        let r = w
+            .js(
+                &w.a_tok,
+                G,
+                json!({"title": format!("Схема {scheme}"), "body": format!("[ссылка]({url})\n")}),
+                None,
+            )
+            .await;
+        assert_status(&r, StatusCode::CREATED, scheme);
+        let stored = w.body_of(&id_of(&r)).await;
+        assert!(stored.contains(url), "{scheme}: {stored}");
+    }
+    // все формы в одном теле (multipart, как `zam report`): регистр схемы, автоссылка, сноска,
+    // `<…>` с пробелом; ссылки внешние — частей `file` не требуют
+    let body = "[a](HTTPS://example.org) <file:///etc/hosts> [v](VSCode://file/x.rs) [r][def] \
+                [п](<file:///C:/Мои документы/a b.txt>) <mailto:a@example.org>\n\n\
+                [def]: vscode://file/home/u/proj/a.rs\n";
+    let r = w
+        .mp(
+            &w.a_tok,
+            G,
+            json!({"title": "Все схемы", "body": body}),
+            &[],
+            None,
+        )
+        .await;
+    assert_status(&r, StatusCode::CREATED, "все схемы");
+    assert_eq!(w.body_of(&id_of(&r)).await, body);
+    assert!(w.files_of(&id_of(&r)).await.is_empty());
+    let created = w.reports().await;
+    assert_eq!(created, 6);
+
+    let bad: Vec<(&str, String)> = vec![
+        ("ftp", "[x](ftp://example.org/a)".into()),
+        ("ftp автоссылкой", "<ftp://example.org/a>".into()),
+        ("javascript", "[x](javascript:alert(1))".into()),
+        ("регистр", "[x](JaVaScRiPt:alert(1))".into()),
+        ("пробел", "[x]( javascript:alert(1))".into()),
+        ("пробел в <>", "[x](< javascript:alert(1)>)".into()),
+        ("табуляция внутри", "[x](<java\tscript:alert(1)>)".into()),
+        ("табуляция в начале", "[x](<\tjavascript:alert(1)>)".into()),
+        ("сущность Tab", "[x](java&Tab;script:alert(1))".into()),
+        (
+            "сущность NewLine",
+            "[x](java&NewLine;script:alert(1))".into(),
+        ),
+        ("сущность буквы", "[x](&#106;avascript:alert(1))".into()),
+        (
+            "сущность двоеточия",
+            "[x](javascript&colon;alert(1))".into(),
+        ),
+        ("percent буквы", "[x](%6Aavascript:alert(1))".into()),
+        ("percent двоеточия", "[x](javascript%3Aalert(1))".into()),
+        (
+            "управляющий символ",
+            "[x](<\u{1}javascript:alert(1)>)".into(),
+        ),
+        ("сноска", "[x][r]\n\n[r]: javascript:alert(1)\n".into()),
+        (
+            "сноска с регистром",
+            "[r]\n\n[r]: <JAVASCRIPT:alert(1)>\n".into(),
+        ),
+        ("data", "[x](data:text/html;base64,PGI+)".into()),
+        ("DATA", "[x](DATA:text/html;base64,PGI+)".into()),
+        ("vbscript", "[x](vbscript:msgbox(1))".into()),
+        ("blob", "[x](blob:https://example.org/1)".into()),
+        ("vscode-insiders", "[x](vscode-insiders://file/x)".into()),
+        ("files", "[x](files:///x)".into()),
+        ("tel", "[x](tel:+10000000000)".into()),
+        ("картинка file", "![a](file:///C:/a.png)".into()),
+        ("картинка vscode", "![a](vscode://file/C:/a.png)".into()),
+    ];
+    for (what, body) in bad {
+        for multipart in [false, true] {
+            let meta = json!({"title": "Т", "body": body});
+            let r = if multipart {
+                w.mp(&w.a_tok, G, meta, &[], None).await
+            } else {
+                w.js(&w.a_tok, G, meta, None).await
+            };
+            assert_status(&r, StatusCode::UNPROCESSABLE_ENTITY, what);
+            assert_eq!(r.json()["type"], "/problems/unprocessable", "{what}");
+        }
+    }
+    // отказ называет разрешённые схемы — из общей константы
+    let r = w
+        .js(
+            &w.a_tok,
+            G,
+            json!({"title": "Т", "body": "[x](ftp://example.org/a)"}),
+            None,
+        )
+        .await;
+    let detail = r.json()["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("ftp") && detail.contains(&zam_core::link::report_schemes_text()),
+        "{detail}"
+    );
+    assert_eq!(w.reports().await, created, "отказы отчётов не создали");
+}
+
+/// Настоящий PNG `w × h` (миниатюру строит рабочий процесс превью).
+fn real_png(w: u32, h: u32) -> Vec<u8> {
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    let img = DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+        Rgb([(x % 256) as u8, (y % 256) as u8, 7])
+    }));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// M6 §16 п. 15 (ответ владельца по M5.5, п. 5): превью картинки отчёта
+/// `GET /previews/{sha256}?kind=thumb` — тем же маршрутом, что у вложений. Права — как у файла
+/// отчёта: сессии владельца и участников решения — PNG; токену (любому) — 404, неотличимый от
+/// несуществующего sha (отчёт агенту не виден); постороннему — 404; удалённый отчёт — 404.
+#[tokio::test]
+async fn report_preview_token_404() {
+    use common::reports as cr;
+    let w = cr::world("reports-preview-token").await;
+    let img = real_png(400, 200);
+    let id = w
+        .report_with(
+            "С картинкой",
+            "![график](plot.png)\n",
+            &[("plot.png", &img)],
+        )
+        .await;
+    let f = w.file(&id, "plot.png").await;
+    let uri = format!("/api/v1/previews/{}?kind=thumb&px=64", f.sha256);
+    let missing = format!("/api/v1/previews/{}?kind=thumb&px=64", "0".repeat(64));
+    let dims = |b: &[u8]| {
+        let i = image::load_from_memory_with_format(b, image::ImageFormat::Png).unwrap();
+        (i.width(), i.height())
+    };
+    for (who, u) in [("владелец", &w.o), ("rw", &w.rw), ("ro", &w.ro)] {
+        let r = cr::web(&w.a, &u.web, Method::GET, &uri, None).await;
+        assert_status(&r, StatusCode::OK, who);
+        assert!(r.header("content-type").starts_with("image/png"), "{who}");
+        assert_eq!(r.header("x-content-type-options"), "nosniff", "{who}");
+        assert!(
+            r.header("content-security-policy").contains("sandbox"),
+            "{who}"
+        );
+        assert_eq!(dims(&r.body), (64, 32), "{who}");
+    }
+    // администратор от имени владельца — по `?user=`, как файл отчёта
+    let r =
+        w.a.adm(Method::GET, &format!("{uri}&user={}", w.o.id), None, None)
+            .await;
+    assert_status(&r, StatusCode::OK, "администратор ?user=");
+
+    // токен: тот же ответ, что у несуществующего sha
+    let shape = |r: &Resp| {
+        let j = r.json();
+        (
+            r.status,
+            j["type"].clone(),
+            j["title"].clone(),
+            j["detail"].clone(),
+        )
+    };
+    let none = w.a.tok(&w.o.tok, Method::GET, &missing, None).await;
+    assert_status(&none, StatusCode::NOT_FOUND, "несуществующий sha");
+    let ro_tok = w.a.issue(&w.o.id, "ro").await;
+    for (who, tok) in [
+        ("токен владельца", &w.o.tok),
+        ("токен владельца ro", &ro_tok),
+        ("токен участника rw", &w.rw.tok),
+        ("токен участника ro", &w.ro.tok),
+        ("токен администратора", &w.a.token),
+    ] {
+        let r = w.a.tok(tok, Method::GET, &uri, None).await;
+        assert_status(&r, StatusCode::NOT_FOUND, who);
+        assert_eq!(
+            shape(&r),
+            shape(&none),
+            "{who}: неотличим от несуществующего"
+        );
+        // прочие виды превью — тоже 404, а не 422 «не тот вид файла»
+        for kind in ["text", "sheet"] {
+            let r =
+                w.a.tok(
+                    tok,
+                    Method::GET,
+                    &format!("/api/v1/previews/{}?kind={kind}", f.sha256),
+                    None,
+                )
+                .await;
+            assert_status(&r, StatusCode::NOT_FOUND, &format!("{who}: {kind}"));
+        }
+    }
+    // посторонний (нет доступа к решению): и сессия, и токен — 404
+    let x = cr::ready_user(&w.a, "Глеб", "10.0.0.4").await;
+    let r = cr::web(&w.a, &x.web, Method::GET, &uri, None).await;
+    assert_status(&r, StatusCode::NOT_FOUND, "посторонний: сессия");
+    let web_none = cr::web(&w.a, &x.web, Method::GET, &missing, None).await;
+    assert_eq!(shape(&r), shape(&web_none), "посторонний: неотличим");
+    let r = w.a.tok(&x.tok, Method::GET, &uri, None).await;
+    assert_status(&r, StatusCode::NOT_FOUND, "посторонний: токен");
+    // администратор (сессия) видит решения всех владельцев и без `?user=` — как превью вложений
+    // заметок (`scope::foreign_solutions`); его токен — агент, отчёта не видит (проверено выше)
+    let r = w.a.adm(Method::GET, &uri, None, None).await;
+    assert_status(&r, StatusCode::OK, "администратор без ?user=");
+
+    // участник видит только пространство своего решения: отчёт владельца в другом решении
+    // (без доступа участника) — 404, владельцу — PNG
+    const G2: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e13";
+    let r =
+        w.a.tok(
+            &w.o.tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G2, "name": "Закрытое"})),
+        )
+        .await;
+    assert_status(&r, StatusCode::CREATED, "второе решение");
+    let other = real_png(200, 300);
+    let r = w
+        .report_as(
+            &w.o.tok,
+            G2,
+            "Закрытый",
+            "![x](x.png)\n",
+            &[("x.png", &other)],
+        )
+        .await;
+    assert_status(&r, StatusCode::CREATED, "отчёт второго решения");
+    let f2 = w.file(&id_of(&r), "x.png").await;
+    let uri2 = format!("/api/v1/previews/{}?kind=thumb&px=60", f2.sha256);
+    let r = cr::web(&w.a, &w.o.web, Method::GET, &uri2, None).await;
+    assert_status(&r, StatusCode::OK, "владелец: второе решение");
+    assert_eq!(dims(&r.body), (40, 60));
+    for (who, u) in [("rw", &w.rw), ("ro", &w.ro)] {
+        let r = cr::web(&w.a, &u.web, Method::GET, &uri2, None).await;
+        assert_status(&r, StatusCode::NOT_FOUND, &format!("чужое решение: {who}"));
+    }
+
+    // удалённый отчёт: файлы не отдаются — и превью тоже
+    let r = cr::web_h(
+        &w.a,
+        &w.o.web,
+        Method::DELETE,
+        &format!("/api/v1/entries/{id}"),
+        None,
+        &[("if-match", "1")],
+    )
+    .await;
+    assert_status(&r, StatusCode::NO_CONTENT, "удаление");
+    for (who, u) in [("владелец", &w.o), ("ro", &w.ro)] {
+        let r = cr::web(&w.a, &u.web, Method::GET, &uri, None).await;
+        assert_status(&r, StatusCode::NOT_FOUND, &format!("удалённый: {who}"));
+    }
+}

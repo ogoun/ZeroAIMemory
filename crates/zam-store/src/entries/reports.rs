@@ -225,6 +225,36 @@ pub async fn entry_attachment(
     .await
 }
 
+/// Файл живого отчёта по sha256 содержимого — `(mime, размер, имя)` — для превью
+/// (`GET /previews/{sha256}`, миниатюры ленты): запись вида `report`, не удалена; `space` —
+/// только в этом пространстве (участник общего решения в базе владельца). Несколько записей с
+/// тем же содержимым — последняя привязка. Права проверяет вызывающий: отчёты видны только
+/// сессии человека.
+pub async fn report_blob_meta_by_sha(
+    db: &Db,
+    sha256: &str,
+    space: Option<Id>,
+) -> Result<Option<(String, u64, String)>, StoreError> {
+    let sha = sha256.to_string();
+    db.read(move |c| {
+        let row: Option<(String, i64, String)> = c
+            .query_row(
+                "SELECT a.mime, a.size, a.filename
+                 FROM entry_attachments a
+                 JOIN entries e ON e.id = a.entry_id
+                 WHERE a.blob_sha256 = ?1 AND e.kind = 'report' AND e.deleted_at IS NULL
+                   AND (?2 IS NULL OR e.space_id = ?2)
+                 ORDER BY a.created_at DESC, a.rowid DESC
+                 LIMIT 1",
+                params![sha, space],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(m, s, f)| (m, u64::try_from(s).unwrap_or(0), f)))
+    })
+    .await
+}
+
 /// Первая картинка каждой записи `entries` в порядке тела: первая ссылка-картинка
 /// `![…](_attachments/<sha16>/<имя>)`, у которой есть файл записи с MIME `image/*`. Записи без
 /// такой картинки (и несуществующие) в ответ не попадают. Миниатюра ленты отчётов.

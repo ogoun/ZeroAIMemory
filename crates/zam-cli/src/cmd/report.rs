@@ -7,9 +7,12 @@
 //!   ссылки-сноски `[…][метка]` с определением `[метка]: путь`; вне кода, формул и frontmatter.
 //!   Путь — относительно каталога файла, percent-декодируется, ведущие `./` снимаются: это и имя
 //!   части `file` (сервер сверяет его с телом тем же правилом). Повтор пути — одна часть.
-//!   Схемы (`https:`, `mailto:`), якоря и `//…` — не файлы ([`resolve_local`] → `None`, их
-//!   проверяет сервер). `..`, абсолютный путь, `\`, символы `" : * ? < > |`, выход за каталог
-//!   (символическая ссылка), нет файла — ошибка ввода **до** любого запроса к серверу.
+//!   Схемы из [`zam_core::REPORT_LINK_SCHEMES`] (`http:`, `https:`, `mailto:`, `vscode:`,
+//!   `file:` — M6 §16 п. 15), якоря и `//…` — не файлы ([`resolve_local`] → `None`; картинку
+//!   со схемой отклонит сервер). Прочая схема (`ftp:`, `javascript:`, `data:` …, в том числе
+//!   с регистром, пробелом и табуляцией — [`zam_core::link::url_scheme`]), `..`, абсолютный
+//!   путь, `\`, символы `" : * ? < > |`, выход за каталог (символическая ссылка), нет файла —
+//!   ошибка ввода **до** любого запроса к серверу.
 //! - **Пределы до отправки** — не больше [`MAX_FILES`] файлов и [`MAX_TOTAL_BYTES`] в сумме по
 //!   `stat` (умолчания сервера `reports.*`; окончательно проверяет сервер).
 //! - **Разбор ссылок** — свой лёгкий сканер ([`local_links`]): `zam` не тянет `comrak` в путь
@@ -326,8 +329,9 @@ impl Read for LazyFile {
 
 // ---- пути ----
 
-/// Имя файла отчёта по назначению ссылки: `None` — не файл (схема, якорь, `//`); путь
-/// percent-декодирован, без якоря и ведущих `./`; нарушение правил пути — ошибка ввода.
+/// Имя файла отчёта по назначению ссылки: `None` — не файл (разрешённая схема, якорь, `//`);
+/// путь percent-декодирован, без якоря и ведущих `./`; схема не из
+/// [`zam_core::REPORT_LINK_SCHEMES`] и нарушение правил пути — ошибка ввода.
 fn local_name(link: &str) -> Result<Option<String>, CliError> {
     let t = link.trim();
     if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
@@ -340,8 +344,15 @@ fn local_name(link: &str) -> Result<Option<String>, CliError> {
             "абсолютный путь — только путь относительно файла отчёта",
         ));
     }
-    if scheme_of(t) {
-        return Ok(None);
+    if let Some(scheme) = zam_core::link::url_scheme(t) {
+        return if zam_core::link::report_scheme_allowed(&scheme) {
+            Ok(None)
+        } else {
+            Err(bad(&format!(
+                "схема {scheme}: не поддерживается ({} или файл отчёта)",
+                zam_core::link::report_schemes_text()
+            )))
+        };
     }
     let path = t.split('#').next().unwrap_or_default();
     if path.is_empty() {
@@ -424,17 +435,6 @@ pub(crate) fn resolve_local(base: &Path, link: &str) -> Result<Option<PathBuf>, 
         return Err(CliError::input(format!("«{name}» — не обычный файл")));
     }
     Ok(Some(real))
-}
-
-/// Есть ли у ссылки схема URL (`https:`, `mailto:`, `data:`).
-fn scheme_of(t: &str) -> bool {
-    let Some(colon) = t.find(':') else {
-        return false;
-    };
-    let s = &t[..colon];
-    let mut b = s.bytes();
-    b.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && b.all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c))
 }
 
 /// `%XX` → байты; `None` — неверная последовательность или не UTF-8.
@@ -695,8 +695,9 @@ fn first_h1(md: &str) -> Option<String> {
 
 /// Назначения ссылок и картинок тела вне кода, формул и frontmatter, как их видит разбор
 /// CommonMark сервера: inline `(путь)` и `(<путь>)`, сноски `[текст][метка]`, `[метка][]`,
-/// `[метка]` по определениям `[метка]: путь`. Экранирование `\` снимается; якорь и схема —
-/// как в тексте (их отбрасывает [`resolve_local`]). Вики-ссылки `[[…]]` и сноски `[^1]` — не
+/// `[метка]` по определениям `[метка]: путь`, автоссылки `<схема:адрес>` (файлом не бывают —
+/// ради проверки схемы). Экранирование `\` снимается; якорь и схема — как в тексте (их
+/// отбрасывает или отклоняет [`resolve_local`]). Вики-ссылки `[[…]]` и сноски `[^1]` — не
 /// ссылки на файлы.
 pub(crate) fn local_links(md: &str) -> Vec<String> {
     let Blocks { text, defs, .. } = blocks(md);
@@ -836,8 +837,9 @@ impl<'a> Scanner<'a> {
         i + 1
     }
 
-    /// `<…>` — автоссылка или тег HTML: до `>` (ссылки внутри тега не ищутся).
-    fn skip_angle(&self, i: usize) -> usize {
+    /// `<…>` — автоссылка или тег HTML: до `>` (ссылки внутри тега не ищутся). Назначение
+    /// автоссылки `<схема:адрес>` — в вывод: её схема проверяется как у прочих ссылок.
+    fn skip_angle(&mut self, i: usize) -> usize {
         let b = self.b;
         let tag = b
             .get(i + 1)
@@ -846,10 +848,14 @@ impl<'a> Scanner<'a> {
             return i + 1;
         }
         let end = self.para_end(i);
-        b[i..end]
-            .iter()
-            .position(|&c| c == b'>')
-            .map_or(i + 1, |k| i + k + 1)
+        let Some(k) = b[i..end].iter().position(|&c| c == b'>') else {
+            return i + 1;
+        };
+        let inner = &b[i + 1..i + k];
+        if is_autolink(inner) {
+            self.out.push(String::from_utf8_lossy(inner).into_owned());
+        }
+        i + k + 1
     }
 
     /// Ссылка с текстом с позиции `[` (`open`): назначение — в вывод, переход через него — в
@@ -1023,6 +1029,20 @@ fn skip_ws(b: &[u8], mut i: usize, end: usize) -> usize {
     i
 }
 
+/// Содержимое `<…>` — автоссылка CommonMark с адресом: схема из 2–32 символов (буква, затем
+/// буквы, цифры, `+.-`), `:`, дальше без пробелов, управляющих символов и `<`.
+fn is_autolink(s: &[u8]) -> bool {
+    let Some(colon) = s.iter().position(|&c| c == b':') else {
+        return false;
+    };
+    (2..=32).contains(&colon)
+        && s[0].is_ascii_alphabetic()
+        && s[1..colon]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || b"+.-".contains(c))
+        && !s.iter().any(|&c| c <= b' ' || c == b'<')
+}
+
 fn find(h: &[u8], n: &[u8]) -> Option<usize> {
     h.windows(n.len()).position(|w| w == n)
 }
@@ -1036,7 +1056,7 @@ mod tests {
         let mut v: Vec<String> = v
             .into_iter()
             .filter(|t| !t.is_empty() && !t.starts_with('#') && !t.starts_with("//"))
-            .filter(|t| !scheme_of(t))
+            .filter(|t| zam_core::link::url_scheme(t).is_none())
             .map(|t| t.split('#').next().unwrap_or_default().to_string())
             .filter(|t| !t.is_empty())
             .collect();
@@ -1109,6 +1129,32 @@ mod tests {
         );
     }
 
+    /// Автоссылка `<схема:адрес>` попадает в назначения (её схему проверяет `local_name`);
+    /// тег HTML, почта и `<…>` с пробелом — нет.
+    #[test]
+    fn autolinks_are_scanned_for_scheme_check() {
+        let md = "<ftp://e.org/a> и <https://e.org/b> и <FILE:///etc/hosts>\n\n\
+                  <a href=\"x:y\">тег</a> <b> <a@b.c> <не ссылка: текст> <c:\\x> `<javascript:x>`\n";
+        assert_eq!(
+            local_links(md),
+            ["ftp://e.org/a", "https://e.org/b", "FILE:///etc/hosts"]
+        );
+        assert!(local_name("ftp://e.org/a").is_err());
+        assert!(local_name("https://e.org/b").unwrap().is_none());
+        assert!(local_name("FILE:///etc/hosts").unwrap().is_none());
+        for (s, auto) in [
+            ("ab:c", true),
+            ("a:c", false),
+            ("ab", false),
+            ("1b:c", false),
+            ("ab:c d", false),
+            ("ab:c<d", false),
+            ("a-b+c.d:x", true),
+        ] {
+            assert_eq!(is_autolink(s.as_bytes()), auto, "{s}");
+        }
+    }
+
     #[test]
     fn names_and_rules() {
         assert_eq!(
@@ -1118,12 +1164,34 @@ mod tests {
         assert_eq!(local_name("././a.png#x").unwrap().unwrap(), "a.png");
         for none in [
             "https://e.com/a.png",
+            "http://e.com",
             "mailto:a@b.c",
+            "vscode://file/C:/proj/a.rs:10",
+            "file:///C:/data/a.csv",
+            "FILE:///etc/hosts",
             "#sec",
             "//host/a.png",
             "",
         ] {
             assert!(local_name(none).unwrap().is_none(), "{none}");
+        }
+        // схема не из общего списка — ошибка ввода с перечнем разрешённых (M6 §16 п. 15)
+        for (bad, scheme) in [
+            ("ftp://e.com/a", "ftp"),
+            ("javascript:alert(1)", "javascript"),
+            ("JaVaScRiPt:alert(1)", "javascript"),
+            (" javascript:alert(1)", "javascript"),
+            ("java\tscript:alert(1)", "javascript"),
+            ("data:image/png;base64,AAAA", "data"),
+            ("vscode-insiders://file/x", "vscode-insiders"),
+        ] {
+            let e = local_name(bad).unwrap_err();
+            assert!(
+                e.msg.contains(&format!("схема {scheme}:"))
+                    && e.msg.contains("http, https, mailto, vscode, file"),
+                "{bad}: {}",
+                e.msg
+            );
         }
         for bad in [
             "../a.png",

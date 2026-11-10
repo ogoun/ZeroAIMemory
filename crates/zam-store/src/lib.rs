@@ -100,8 +100,8 @@ pub use entries::{
     entry_attachments, entry_by_idempotency_key, entry_chunks_for_index, entry_revisions,
     entry_triggers, find_release_by_version, finish_entries_reindexed, first_images, get_entry,
     has_certainty, initial_status, is_entry_ref_letter, list_entries, normalize_area,
-    normalize_title, reindex_entries_page, restore_entry, retract_entry, set_triggers,
-    supersede_entry, title_duplicates, update_entry, validate_trigger,
+    normalize_title, reindex_entries_page, report_blob_meta_by_sha, restore_entry, retract_entry,
+    set_triggers, supersede_entry, title_duplicates, update_entry, validate_trigger,
 };
 pub use export::{
     EntryDump, ExportSelect, NodeRevision, NoteAttachment, RefRow, SpaceReader, export_space,

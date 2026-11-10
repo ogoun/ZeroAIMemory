@@ -8,6 +8,13 @@
 //! пространства в ключе). Ссылки `_attachments/<sha16>/<имя>` разрешаются **только** по
 //! `entry_attachments` этой записи ([`ReportResolver`]) → [`file_url`]; вложения заметок и чужих
 //! записей отчёт не показывает. Вики-ссылки — как у заметок (только отрисовка, рёбер нет).
+//! Рендер — [`zam_markdown::render_report_html`]: ссылкам разрешены схемы
+//! [`zam_core::REPORT_LINK_SCHEMES`] (у заметок `vscode:` и `file:` нет), всем внешним —
+//! `rel="noopener noreferrer"`.
+//!
+//! **Лента** — у первой растровой картинки отчёта `thumb_url`: серверная миниатюра
+//! `GET /previews/{sha256}?kind=thumb` ([`crate::api::previews`], M6 §16 п. 15) вместо исходного
+//! файла; у SVG его нет (для превью SVG — не изображение).
 //!
 //! **Файлы** — только сессиям WebUI (токену — 404: отчёт агенту не виден, §7) и только живой
 //! записи вида `report`, пара (sha256, имя) — именно этой записи, иначе 404. Заголовки — общий
@@ -120,7 +127,7 @@ pub async fn get_html(
     let r = render::cached(st, key, async {
         let wiki = render::resolve_wiki(&sc.db, sc.space.id, &e.body).await?;
         let resolver = ReportResolver::new(&files, wiki, viewer);
-        render::render_with(e.body.clone(), resolver).await
+        render::render_report_with(e.body.clone(), resolver).await
     })
     .await?;
     Ok(Json(json!({
@@ -169,10 +176,30 @@ pub async fn attachment(
     .await
 }
 
+/// Сторона миниатюры ленты отчётов, пикселей (карточка 120 × 80 CSS-пикселей, экран 2×).
+pub const FEED_THUMB_PX: u32 = 256;
+
+/// Адрес серверной миниатюры файла отчёта для ленты (`GET /previews/{sha256}?kind=thumb`) или
+/// `None` — не растровая картинка (SVG превью не строит: лента показывает сам файл).
+/// Администратору от имени другого — с `&user=<владелец>`, как у [`file_url`].
+pub fn thumb_url(f: &EntryAttachment, viewer: Viewer) -> Option<String> {
+    if !matches!(
+        f.mime.as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    ) {
+        return None;
+    }
+    let mut url = format!("api/v1/previews/{}?kind=thumb&px={FEED_THUMB_PX}", f.sha256);
+    if let Viewer::AdminFor(u) = viewer {
+        url.push_str(&format!("&user={u}"));
+    }
+    Some(url)
+}
+
 /// Элементы ленты отчётов: без `body` (до 50 тел по `note_max_bytes` ленте не нужны — тело
-/// читает страница `format=html`), поле `first_image` (`{sha256, filename, mime, size, url}`
-/// первой картинки тела с файлом записи или `null`; у удалённых — `null`, их файлы не
-/// отдаются). `out[i]` — JSON `items[i]`.
+/// читает страница `format=html`), поле `first_image` (`{sha256, filename, mime, size, url,
+/// thumb_url}` первой картинки тела с файлом записи или `null`; `thumb_url` — [`thumb_url`];
+/// у удалённых — `null`, их файлы не отдаются). `out[i]` — JSON `items[i]`.
 pub async fn report_feed(
     db: &zam_store::Db,
     items: &[Entry],
@@ -192,9 +219,11 @@ pub async fn report_feed(
         if let Some(o) = v.as_object_mut() {
             o.remove("body");
         }
-        v["first_image"] = firsts
-            .get(&e.id)
-            .map_or(Value::Null, |f| file_json(f, viewer));
+        v["first_image"] = firsts.get(&e.id).map_or(Value::Null, |f| {
+            let mut j = file_json(f, viewer);
+            j["thumb_url"] = json!(thumb_url(f, viewer));
+            j
+        });
     }
     Ok(())
 }
@@ -236,5 +265,32 @@ mod tests {
                 .unwrap()
                 .ends_with(&format!("?user={owner}"))
         );
+    }
+
+    /// Миниатюра ленты: только растровым картинкам; `&user=` — администратору от имени.
+    #[test]
+    fn thumb_url_raster_only() {
+        let (id, owner) = (Id::new(), Id::new());
+        let sha = "ab".repeat(32);
+        let mut f = att(id, "a.png");
+        assert_eq!(
+            thumb_url(&f, Viewer::Admin).as_deref(),
+            Some(format!("api/v1/previews/{sha}?kind=thumb&px=256").as_str())
+        );
+        assert_eq!(
+            thumb_url(&f, Viewer::AdminFor(owner)).as_deref(),
+            Some(format!("api/v1/previews/{sha}?kind=thumb&px=256&user={owner}").as_str())
+        );
+        for (mime, raster) in [
+            ("image/jpeg", true),
+            ("image/webp", true),
+            ("image/gif", true),
+            ("image/svg+xml", false),
+            ("image/avif", false),
+            ("text/csv", false),
+        ] {
+            f.mime = mime.into();
+            assert_eq!(thumb_url(&f, Viewer::Admin).is_some(), raster, "{mime}");
+        }
     }
 }

@@ -13,6 +13,11 @@ export interface HydrateOpts {
   alive: () => boolean;
   /** Тема диаграмм; без неё — тема страницы (печать задаёт `default`). */
   mermaidTheme?: 'default' | 'dark';
+  /**
+   * Дополнительный проход по ссылкам (отчёт: `hydrateReportLinks` — схемы, `rel`, «копировать
+   * путь»). Передаётся вызывающим: модуль отчётов не попадает в общий чанк.
+   */
+  links?: (root: HTMLElement) => void;
 }
 
 /**
@@ -22,6 +27,7 @@ export interface HydrateOpts {
 export async function hydrateRendered(el: HTMLElement, o: HydrateOpts): Promise<boolean> {
   hydrateDom(el);
   rewriteLinks(el, o.wiki, o.self);
+  o.links?.(el);
   const jobs: Promise<void>[] = [];
   if (el.querySelector('.math')) {
     jobs.push(import('./katex').then((m) => (o.alive() ? m.renderMath(el) : undefined)));

@@ -93,6 +93,9 @@ const SET_ATTRIBUTES: &[(&str, &str, &str)] = &[("input", "disabled", "")];
 /// Схемы абсолютных URL; относительные проходят как есть.
 const URL_SCHEMES: &[&str] = &["http", "https", "mailto"];
 
+/// Схемы абсолютных URL отчёта (M6 §16 п. 15): общий список клиента, сервера и WebUI.
+const REPORT_URL_SCHEMES: &[&str] = &zam_core::REPORT_LINK_SCHEMES;
+
 /// Префиксы допустимых классов.
 const CLASS_PREFIXES: &[&str] = &[
     "hl-",
@@ -113,7 +116,20 @@ pub(crate) const EXTERNAL_REL: &str = "noopener noreferrer";
 /// атрибуте, после удаления пробельных и управляющих символов).
 const DANGEROUS_VALUES: &[&str] = &["javascript:", "vbscript:", "data:text/html"];
 
-static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
+static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| builder(URL_SCHEMES, filter));
+
+/// Санитайзер страницы отчёта: тот же allowlist, схемы — [`REPORT_URL_SCHEMES`], причём
+/// `vscode:` и `file:` — только у ссылок ([`report_filter`]).
+static REPORT_SANITIZER: LazyLock<Builder<'static>> =
+    LazyLock::new(|| builder(REPORT_URL_SCHEMES, report_filter));
+
+/// Проверка значений атрибутов ([`filter`], [`report_filter`]).
+type AttributeFilter = for<'u> fn(&str, &str, &'u str) -> Option<Cow<'u, str>>;
+
+fn builder(
+    schemes: &'static [&'static str],
+    attribute_filter: AttributeFilter,
+) -> Builder<'static> {
     let mut b = Builder::empty();
     b.tags(TAGS.iter().copied().collect())
         .clean_content_tags(CLEAN_CONTENT_TAGS.iter().copied().collect())
@@ -134,20 +150,40 @@ static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
             },
         ))
         .allowed_classes(HashMap::new())
-        .url_schemes(URL_SCHEMES.iter().copied().collect())
+        .url_schemes(schemes.iter().copied().collect())
         .url_relative(UrlRelative::PassThrough)
         .link_rel(None)
         .id_prefix(None)
         .strip_comments(true)
-        .attribute_filter(filter);
+        .attribute_filter(attribute_filter);
     b
-});
+}
 
 /// Санитизирует HTML-фрагмент по allowlist рендера. Вызывается из
 /// [`render_html`](crate::render_html); публична для тестов и для HTML,
 /// собранного вне рендера.
 pub fn sanitize_html(html: &str) -> String {
     SANITIZER.clean(html).to_string()
+}
+
+/// Санитизирует HTML страницы отчёта: как [`sanitize_html`], но у ссылок `<a href>` разрешены
+/// ещё `vscode:` и `file:` ([`zam_core::REPORT_LINK_SCHEMES`]). Вызывается из
+/// [`render_report_html`](crate::render_report_html).
+pub fn sanitize_report_html(html: &str) -> String {
+    REPORT_SANITIZER.clean(html).to_string()
+}
+
+/// [`filter`] отчёта: схемы сверх обычных (`vscode:`, `file:`) — только ссылке `<a href>`;
+/// у `src` картинки, видео и аудио (единственный другой URL-атрибут из [`TAG_ATTRIBUTES`]) такой
+/// адрес удаляется: файл с диска пользователя странице отчёта не нужен, а CSP `img-src 'self'`
+/// его всё равно не покажет. Текстовые атрибуты (`alt`, `title`) с двоеточием не трогаются.
+fn report_filter<'u>(element: &str, attribute: &str, value: &'u str) -> Option<Cow<'u, str>> {
+    if attribute == "src"
+        && zam_core::link::url_scheme(value).is_some_and(|s| !URL_SCHEMES.contains(&s.as_str()))
+    {
+        return None;
+    }
+    filter(element, attribute, value)
 }
 
 /// Проверка значений разрешённых атрибутов; `None` — атрибут удаляется.

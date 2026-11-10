@@ -442,6 +442,59 @@ fn cli_report_skips_urls_anchors_code() {
     assert_eq!(names(&s.files(&id)), ["real.png"]);
 }
 
+/// M6 §16 п. 15 (долг M5.5): схемы ссылок — общий список `zam_core::REPORT_LINK_SCHEMES`.
+/// Пять разрешённых уходят на сервер как есть (файлами не считаются); прочие схемы и обходы
+/// (регистр, пробел, табуляция, сноска) — ошибка ввода до любого запроса.
+#[test]
+fn cli_report_link_schemes() {
+    let s = Srv::start("schemes");
+    let d = project("schemes");
+    let body = "# Схемы\n\n[h](http://example.org) [s](https://example.org/a) \
+        [m](mailto:a@example.org) [v](vscode://file/C:/proj/src/main.rs:10:5) \
+        [f](file:///C:/data/report.csv) <file:///etc/hosts> [V](VSCode://file/x.rs) [r][def]\n\n\
+        [def]: <file:///C:/Мои документы/a b.txt>\n";
+    put(&d, "r.md", body.as_bytes());
+    let id = id_of(&ok(&zam(&s.url, &s.tok, &d, &["report", "r.md"])));
+    assert!(s.files(&id).is_empty(), "внешние ссылки — не файлы");
+    assert_eq!(s.entry(&id).body, body);
+
+    let (url, seen) = no_server();
+    let d = project("schemes-bad");
+    for (bad, scheme) in [
+        ("[x](ftp://example.org/a)", "ftp"),
+        ("<ftp://example.org/a>", "ftp"),
+        ("[x](javascript:alert(1))", "javascript"),
+        ("[x](JaVaScRiPt:alert(1))", "javascript"),
+        ("[x]( javascript:alert(1))", "javascript"),
+        ("[x](<java\tscript:alert(1)>)", "javascript"),
+        ("[x](<\tjavascript:alert(1)>)", "javascript"),
+        ("[x][r]\n\n[r]: javascript:alert(1)", "javascript"),
+        ("[x](data:text/html;base64,PGI+)", "data"),
+        ("[x](vbscript:msgbox(1))", "vbscript"),
+        ("[x](vscode-insiders://file/x)", "vscode-insiders"),
+        ("[x](tel:+10000000000)", "tel"),
+    ] {
+        put(&d, "r.md", format!("# Т\n\n{bad}\n").as_bytes());
+        let e = input_err(&zam(&url, "zam_x", &d, &["report", "r.md"]));
+        assert!(
+            e.contains(&format!("схема {scheme}:"))
+                && e.contains("http, https, mailto, vscode, file"),
+            "{bad}: {e}"
+        );
+    }
+    // обходы без схемы для браузера (percent, сущность) — тоже отказ: путь с «:» или нет файла
+    for bad in [
+        "[x](%6Aavascript:alert(1))",
+        "[x](javascript%3Aalert(1))",
+        "[x](&#106;avascript:alert(1))",
+    ] {
+        put(&d, "r.md", format!("# Т\n\n{bad}\n").as_bytes());
+        let e = input_err(&zam(&url, "zam_x", &d, &["report", "r.md"]));
+        assert!(!e.is_empty(), "{bad}");
+    }
+    assert!(seen.lock().unwrap().is_empty(), "запрос к серверу");
+}
+
 #[test]
 fn cli_report_missing_file_error() {
     let (url, seen) = no_server();

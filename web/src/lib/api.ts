@@ -843,9 +843,13 @@ export interface EntryAttachment {
   url: string;
 }
 
-/** Элемент ленты отчётов: без `body` (тело — страница отчёта), миниатюра — первая картинка. */
+/**
+ * Элемент ленты отчётов: без `body` (тело — страница отчёта), миниатюра — первая картинка.
+ * `thumb_url` — серверное превью PNG (`/previews/{sha256}?kind=thumb`, M6) растровой картинки;
+ * `null` — SVG: лента показывает сам файл (`url`).
+ */
 export interface ReportItem extends Omit<Entry, 'body'> {
-  first_image: EntryAttachment | null;
+  first_image: (EntryAttachment & { thumb_url?: string | null }) | null;
 }
 
 /** Страница отчёта `GET /entries/{id}?format=html`. */

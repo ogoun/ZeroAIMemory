@@ -39,8 +39,9 @@ pub use patch::{Applied, PatchError, PatchOp, apply_patch, section_bytes};
 pub use pos::LineIndex;
 pub use render::{
     LinkResolution, NoResolve, RENDER_VERSION, Rendered, Resolver, attachment_ref, render_html,
+    render_report_html,
 };
-pub use sanitize::sanitize_html;
+pub use sanitize::{sanitize_html, sanitize_report_html};
 pub use sentences::split_sentences;
 pub use zam_core::text::is_stop_word;
 /// Сканер секретов §7.6 — крейт `zam-secrets` (задача 15b M6); прежние имена — реэкспортом.

@@ -170,6 +170,13 @@
 
   const open = (id: string) => href({ name: 'journal', user, space, journal: 'reports', entry: id });
 
+  /** Превью не построилось (422: файл больше предела `[docs]`, повреждён) — один раз сам файл. */
+  function thumbFailed(img: HTMLImageElement, full: string) {
+    if (img.dataset.full) return;
+    img.dataset.full = '1';
+    img.src = full;
+  }
+
   let filtered = $derived(!!(applied.tag || applied.area || applied.query));
 </script>
 
@@ -227,7 +234,14 @@
         {#each items as it (it.id)}
           <article class="report-card" data-report={it.id}>
             {#if it.first_image}
-              <img class="thumb" src={it.first_image.url} alt="" loading="lazy" decoding="async" />
+              <img
+                class="thumb"
+                src={it.first_image.thumb_url ?? it.first_image.url}
+                alt=""
+                loading="lazy"
+                decoding="async"
+                onerror={(e) => thumbFailed(e.currentTarget as HTMLImageElement, it.first_image!.url)}
+              />
             {:else}
               <div class="thumb empty" aria-hidden="true"></div>
             {/if}

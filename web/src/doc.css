@@ -99,6 +99,25 @@
 .doc a.attachment::before {
   content: '⤓ ';
 }
+/* ссылки отчёта `file:` (без перехода) и кнопка «копировать путь» (lib/reportLinks.ts) */
+.doc a.local-link {
+  color: var(--text);
+  text-decoration-style: dashed;
+  cursor: default;
+}
+.doc .copy-path {
+  margin-left: 0.4em;
+  padding: 0 6px;
+  font-size: 12px;
+  vertical-align: baseline;
+}
+/* на бумаге и в PDF у `file:` и `vscode:` виден сам адрес */
+@media print {
+  .doc a[data-url]::after {
+    content: ' (' attr(data-url) ')';
+    overflow-wrap: anywhere;
+  }
+}
 .doc hr {
   border: 0;
   border-top: 1px solid var(--border);

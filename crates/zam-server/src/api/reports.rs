@@ -8,7 +8,10 @@
 //! notes, tasks}`), размер тела (413) → ссылки тела ([`report_refs`]) → файлы.
 //!
 //! **Ссылки тела** (по [`zam_markdown::parse`]: ссылки в коде не видны и не считаются):
-//! `http(s):`, `mailto:`, якоря и `[[вики]]` — как есть; картинка с внешним адресом или `data:` —
+//! схемы [`zam_core::REPORT_LINK_SCHEMES`] (`http(s):`, `mailto:`, с M6 — `vscode:` и `file:`),
+//! якоря и `[[вики]]` — как есть: это внешние ссылки, в multipart они не загружаются. Схему
+//! определяет [`zam_core::link::url_scheme`] — то же правило у `zam report` и в WebUI (регистр,
+//! пробелы и табуляция в схеме её не прячут). Картинка с внешним адресом или `data:` —
 //! 422 (CSP `img-src 'self'` и PDF её потеряют); `_attachments/…` — 422 (чужое вложение); прочая
 //! схема, абсолютный путь, `\`, `..`, кавычка и символы `:*?<>|` — 422; остальная относительная
 //! ссылка — файл отчёта, имя — путь из тела после percent-декодирования без ведущих `./`. Нет
@@ -502,7 +505,7 @@ fn classify(l: &zam_markdown::Link) -> Result<Option<String>, ApiError> {
             Ok(None)
         };
     }
-    if let Some(scheme) = scheme_of(t) {
+    if let Some(scheme) = zam_core::link::url_scheme(t) {
         if image {
             return Err(unprocessable(format!(
                 "картинка «{}»: только файл отчёта — внешний адрес и data: не показываются \
@@ -510,12 +513,13 @@ fn classify(l: &zam_markdown::Link) -> Result<Option<String>, ApiError> {
                 short(t)
             )));
         }
-        return if ["http", "https", "mailto"].contains(&scheme.as_str()) {
+        return if zam_core::link::report_scheme_allowed(&scheme) {
             Ok(None)
         } else {
             Err(unprocessable(format!(
-                "ссылка «{}»: схема {scheme}: не поддерживается (http, https, mailto или файл отчёта)",
-                short(t)
+                "ссылка «{}»: схема {scheme}: не поддерживается ({} или файл отчёта)",
+                short(t),
+                zam_core::link::report_schemes_text()
             )))
         };
     }
@@ -578,16 +582,6 @@ fn short(s: &str) -> String {
         out.push('…');
     }
     out
-}
-
-/// Схема URL в нижнем регистре (`http`, `data`, `c` у `C:/…`); нет схемы — `None`.
-fn scheme_of(t: &str) -> Option<String> {
-    let colon = t.find(':')?;
-    let s = &t[..colon];
-    let mut b = s.bytes();
-    let first = b.next()?;
-    (first.is_ascii_alphabetic() && b.all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)))
-        .then(|| s.to_ascii_lowercase())
 }
 
 /// Декодирует `%XX`; `None` — неверная последовательность или не UTF-8.

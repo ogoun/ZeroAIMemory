@@ -383,6 +383,12 @@ async fn report_list_cookie_first_image_author_cursor() {
         fi["url"],
         format!("api/v1/entries/{second}/attachments/{}/a.png", a.sha256)
     );
+    // серверная миниатюра (M6, задача 15a): лента берёт её вместо исходного файла
+    assert_eq!(
+        fi["thumb_url"],
+        format!("api/v1/previews/{}?kind=thumb&px=256", a.sha256),
+        "{j}"
+    );
     for e in items {
         assert_eq!(e["kind"], "report");
         assert_eq!(e["author"]["kind"], "agent", "{e}");
@@ -438,6 +444,176 @@ async fn report_list_cookie_first_image_author_cursor() {
         detail(&r).replace("report", "xyz"),
         detail(&unknown),
         "текст как у неизвестного вида"
+    );
+}
+
+/// M6, задача 15a: `thumb_url` — только у растровой первой картинки (SVG для превью не
+/// изображение — лента показывает сам файл); администратору от имени владельца — с `?user=`;
+/// адрес из ленты отдаёт PNG сессии и 404 токену.
+#[tokio::test]
+async fn report_feed_thumb_url_raster_only_and_admin_user() {
+    let w = world("feed-thumb").await;
+    let svg_only = w
+        .report_with("Только SVG", "![схема](diag.svg)\n", &[("diag.svg", SVG)])
+        .await;
+    let img = {
+        use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+        let i = DynamicImage::ImageRgb8(RgbImage::from_fn(320, 160, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, 9])
+        }));
+        let mut out = std::io::Cursor::new(Vec::new());
+        i.write_to(&mut out, ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    let raster = w
+        .report_with("Растр", "![график](plot.png)\n", &[("plot.png", &img)])
+        .await;
+    let uri = format!("/api/v1/spaces/{G}/entries?kind=report");
+    let r = web(&w.a, &w.o.web, Method::GET, &uri, None).await;
+    ok(&r, StatusCode::OK, "лента");
+    let j = r.json();
+    let item = |id: &str| -> Value {
+        j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let s = item(&svg_only);
+    assert_eq!(s["first_image"]["mime"], "image/svg+xml", "{s}");
+    assert!(s["first_image"]["thumb_url"].is_null(), "{s}");
+    assert!(
+        s["first_image"]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/diag.svg")
+    );
+    let p = item(&raster);
+    let f = w.file(&raster, "plot.png").await;
+    let thumb = p["first_image"]["thumb_url"].as_str().unwrap().to_string();
+    assert_eq!(
+        thumb,
+        format!("api/v1/previews/{}?kind=thumb&px=256", f.sha256)
+    );
+    // адрес из ленты работает: сессии — PNG не больше 256, токену — 404
+    let r = web(&w.a, &w.ro.web, Method::GET, &format!("/{thumb}"), None).await;
+    ok(&r, StatusCode::OK, "миниатюра участнику");
+    let png = image::load_from_memory_with_format(&r.body, image::ImageFormat::Png).unwrap();
+    assert_eq!((png.width(), png.height()), (256, 128));
+    assert!(r.body.len() < img.len(), "миниатюра меньше исходника");
+    let r =
+        w.a.tok(&w.o.tok, Method::GET, &format!("/{thumb}"), None)
+            .await;
+    ok(&r, StatusCode::NOT_FOUND, "миниатюра токену");
+    // администратор от имени владельца: адрес с `&user=`, и он отдаёт PNG
+    let r = w.a.adm(Method::GET, &uri, None, Some(&w.o.id)).await;
+    ok(&r, StatusCode::OK, "лента администратору");
+    let j = r.json();
+    let p = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == raster.as_str())
+        .unwrap();
+    let thumb = p["first_image"]["thumb_url"].as_str().unwrap();
+    assert_eq!(
+        thumb,
+        format!(
+            "api/v1/previews/{}?kind=thumb&px=256&user={}",
+            f.sha256, w.o.id
+        )
+    );
+    let r = w.a.adm(Method::GET, &format!("/{thumb}"), None, None).await;
+    ok(&r, StatusCode::OK, "миниатюра администратору по ?user=");
+}
+
+/// M6, задача 15a (§16 п. 15): страница отчёта — ссылки пяти схем с `href`, всем внешним —
+/// `rel="noopener noreferrer"`; сырой HTML тела проверкой ссылок не виден, но и рендер его
+/// не пропускает (ни ссылок, ни картинок из него на странице нет; санитайзер отчёта отдельно
+/// проверен в `zam-markdown`); у заметки `vscode:`/`file:` по-прежнему без `href`.
+#[tokio::test]
+async fn report_html_link_schemes_rel_and_raw_html() {
+    let w = world("html-links").await;
+    let body = "# Ссылки\n\n[h](https://example.org/a) [p](http://example.org) \
+        [m](mailto:a@example.org) [v](vscode://file/C:/proj/src/main.rs:10:5) \
+        [f](file:///C:/data/report.csv) <file:///etc/hosts> [я](#ссылки)\n\n\
+        <a href=\"javascript:alert(1)\">j</a> <a href=\"JaVaScRiPt:alert(2)\">J</a> \
+        <a href=\"java&#9;script:alert(3)\">t</a> <a href=\" javascript:alert(4)\">s</a> \
+        <a href=\"ftp://example.org/x\">ftp</a> <a href=\"data:text/html,x\">d</a> \
+        <a href=\"vscode://file/raw.rs\">raw</a>\n\n\
+        <img src=\"file:///C:/secret.png\" alt=\"i\"> <img src=\"vscode://file/x.png\" alt=\"k\"> \
+        <video src=\"file:///C:/v.mp4\"></video>\n";
+    let id = w.report_with("Ссылки", body, &[]).await;
+    let r = web(
+        &w.a,
+        &w.o.web,
+        Method::GET,
+        &format!("/api/v1/entries/{id}?format=html"),
+        None,
+    )
+    .await;
+    ok(&r, StatusCode::OK, "страница");
+    let html = r.json()["html"].as_str().unwrap().to_string();
+    const REL: &str = "rel=\"noopener noreferrer\"";
+    for url in [
+        "https://example.org/a",
+        "http://example.org",
+        "mailto:a@example.org",
+        "vscode://file/C:/proj/src/main.rs:10:5",
+        "file:///C:/data/report.csv",
+        "file:///etc/hosts",
+    ] {
+        let a = format!("href=\"{url}\" {REL}");
+        assert!(html.contains(&a), "{a} в {html}");
+    }
+    // якорь — не внешняя ссылка
+    assert!(!html.contains(&format!("\" {REL}>я<")), "{html}");
+    // сырой HTML тела рендер не пропускает вовсе: ни ссылок, ни картинок, ни схем из него нет
+    let lower = html.to_lowercase();
+    for bad in [
+        "javascript",
+        "ftp:",
+        "data:",
+        "alert(",
+        "src=\"file:",
+        "src=\"vscode:",
+        "secret.png",
+        "v.mp4",
+        "raw.rs",
+        "<img",
+        "<video",
+    ] {
+        assert!(!lower.contains(bad), "{bad} в {html}");
+    }
+
+    // заметка: рендер заметок не менялся — `vscode:` и `file:` без href
+    let n =
+        w.a.tok(
+            &w.o.tok,
+            Method::POST,
+            "/api/v1/nodes",
+            Some(json!({"space": G, "path": "ссылки", "kind": "note",
+                "content": "[v](vscode://file/x.rs) [f](file:///C:/a.txt) [h](https://example.org)\n"})),
+        )
+        .await;
+    ok(&n, StatusCode::CREATED, "заметка");
+    let nid = n.json()["id"].as_str().unwrap().to_string();
+    let r = web(
+        &w.a,
+        &w.o.web,
+        Method::GET,
+        &format!("/api/v1/nodes/{nid}?format=html"),
+        None,
+    )
+    .await;
+    ok(&r, StatusCode::OK, "заметка html");
+    let html = r.json()["html"].as_str().unwrap().to_string();
+    assert!(html.contains("href=\"https://example.org\""), "{html}");
+    assert!(
+        !html.contains("vscode:") && !html.contains("file:"),
+        "{html}"
     );
 }
 

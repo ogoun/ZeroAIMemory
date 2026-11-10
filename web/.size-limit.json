@@ -1,6 +1,6 @@
 [
   { "name": "entry", "path": "dist/assets/entry-*.js", "gzip": true, "limit": "103 KB" },
-  { "name": "ReportsView (журнал «Отчёты»)", "path": "dist/assets/ReportsView-*.js", "gzip": true, "limit": "8 KB" },
+  { "name": "ReportsView (журнал «Отчёты»)", "path": "dist/assets/ReportsView-*.js", "gzip": true, "limit": "9 KB" },
   { "name": "CodeView (страница «Код»)", "path": "dist/assets/CodeView-*.js", "gzip": true, "limit": "9 KB" },
   { "name": "IdeasView (журнал «Идеи»)", "path": "dist/assets/IdeasView-*.js", "gzip": true, "limit": "8 KB" },
   { "name": "CodeOverview (обзор карты кода)", "path": "dist/assets/CodeOverview-*.js", "gzip": true, "limit": "2 KB" },

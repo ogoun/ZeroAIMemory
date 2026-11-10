@@ -1,7 +1,10 @@
 //! XSS-набор: каждый вектор из `xss_vectors.txt` проходит `render_html`
 //! с разными резолверами; проверяется итоговый санитизированный HTML.
 
-use zam_markdown::{LinkResolution, NoResolve, Resolver, render_html, sanitize_html};
+use zam_markdown::{
+    LinkResolution, NoResolve, Resolver, render_html, render_report_html, sanitize_html,
+    sanitize_report_html,
+};
 
 const VECTORS: &str = include_str!("xss_vectors.txt");
 
@@ -302,4 +305,195 @@ fn sanitizer_data_callout_unicode_only_letters_digits() {
         let out = sanitize_html(bad);
         assert!(!out.contains("data-callout"), "{bad}: {out}");
     }
+}
+
+// ---------- Рендер отчёта: схемы ссылок (M6 §16 п. 15) ----------
+
+/// Каждый URL-атрибут вывода отчёта: схемы нет или она из общего списка; `vscode:` и `file:` —
+/// только у `<a href>`.
+fn assert_report_schemes(vector: &str, html: &str) {
+    for (tag, name, value) in attributes(html) {
+        if !matches!(name.as_str(), "href" | "src" | "poster" | "action" | "data") {
+            continue;
+        }
+        let value = value.replace("&amp;", "&").replace("&quot;", "\"");
+        let Some(scheme) = zam_core::link::url_scheme(&value) else {
+            continue;
+        };
+        assert!(
+            zam_core::link::report_scheme_allowed(&scheme),
+            "вектор {vector:?}: схема {scheme} в {tag}[{name}]\n{html}"
+        );
+        assert!(
+            (tag == "a" && name == "href") || !matches!(scheme.as_str(), "vscode" | "file"),
+            "вектор {vector:?}: {scheme}: вне ссылки — {tag}[{name}]\n{html}"
+        );
+    }
+}
+
+/// XSS-набор через рендер отчёта: расширение схем не открыло ни одного вектора.
+#[test]
+fn report_xss_vectors_are_neutralized() {
+    let resolvers: [(&str, &dyn Resolver); 3] =
+        [("NoResolve", &NoResolve), ("Echo", &Echo), ("Evil", &Evil)];
+    let schemes = [
+        "javascript",
+        "vbscript",
+        "data",
+        "ftp",
+        "blob",
+        "file",
+        "vscode",
+    ];
+    let mut extra = Vec::new();
+    for s in schemes {
+        extra.push(format!("![x]({s}:alert(1))"));
+        extra.push(format!(
+            "<img src=\"{s}://x/a.png\"> <video src=\"{s}://x\"></video>"
+        ));
+        extra.push(format!(
+            "<a href=\"{s}:alert(1)\">x</a> [y]({s}:alert(1)) <{s}:alert(1)>"
+        ));
+        extra.push(format!("[r]\n\n[r]: {s}:alert(1)\n"));
+    }
+    for v in file_vectors()
+        .into_iter()
+        .chain(generated_vectors())
+        .chain(extra)
+    {
+        for (name, r) in resolvers {
+            let out = render_report_html(&v, r);
+            assert_safe(&format!("отчёт, {name}: {v}"), &out.html);
+            assert_report_schemes(&format!("отчёт, {name}: {v}"), &out.html);
+        }
+    }
+}
+
+/// Ссылки отчёта: пять схем — с `href` и `rel`; прочая схема — без `href`; относительная и якорь
+/// — без `rel`. Регистр, пробел и табуляция в схеме решения не меняют.
+#[test]
+fn report_link_schemes_href_and_rel() {
+    const REL: &str = "rel=\"noopener noreferrer\"";
+    let src = "[h](https://e.org/a) [p](http://e.org) [m](mailto:a@b.c) \
+               [v](vscode://file/C:/proj/a.rs:10:5) [f](file:///C:/data/a.csv) \
+               <file:///etc/hosts> [V](VSCode://file/x.rs) [r](rel/a.md) [я](#h-x) [n](//e.org/x)\n";
+    let out = render_report_html(src, &NoResolve).html;
+    for url in [
+        "https://e.org/a",
+        "http://e.org",
+        "mailto:a@b.c",
+        "vscode://file/C:/proj/a.rs:10:5",
+        "file:///C:/data/a.csv",
+        "file:///etc/hosts",
+        "VSCode://file/x.rs",
+        "//e.org/x",
+    ] {
+        let a = format!("href=\"{url}\" {REL}");
+        assert!(out.contains(&a), "{a}\n{out}");
+    }
+    assert!(out.contains("href=\"rel/a.md\">r</a>"), "{out}");
+    assert!(out.contains("href=\"#h-x\">я</a>"), "{out}");
+    assert_eq!(out.matches(REL).count(), 8, "{out}");
+
+    for bad in [
+        "[x](ftp://e.org/a)",
+        "<ftp://e.org/a>",
+        "[x](javascript:alert(1))",
+        "[x](JaVaScRiPt:alert(1))",
+        "[x]( javascript:alert(1))",
+        "[x](<java\tscript:alert(1)>)",
+        "[x](<\tjavascript:alert(1)>)",
+        "[x](java&Tab;script:alert(1))",
+        "[x](&#106;avascript:alert(1))",
+        "[x](data:text/html;base64,PGI+)",
+        "[x](vbscript:msgbox(1))",
+        "[x](vscode-insiders://file/x)",
+        "[x](blob:https://e.org/1)",
+        "[x][r]\n\n[r]: javascript:alert(1)\n",
+    ] {
+        let out = render_report_html(bad, &NoResolve).html;
+        assert_report_schemes(bad, &out);
+        assert_safe(bad, &out);
+        for (_, name, value) in attributes(&out) {
+            assert!(
+                name != "href" || value.is_empty(),
+                "{bad}: href={value:?}\n{out}"
+            );
+        }
+    }
+}
+
+/// `vscode:` и `file:` — только ссылке отчёта: у картинки, видео и аудио (в том числе сырым
+/// HTML) адреса нет; рендер заметки этих схем не знает вовсе.
+#[test]
+fn report_schemes_only_on_links_and_only_in_reports() {
+    let src = "![a](file:///C:/a.png) ![b](vscode://file/b.png)\n\n\
+               <img src=\"file:///C:/c.png\" alt=\"c\"> <img src=\"VSCODE://file/d.png\">\n\n\
+               <video src=\"file:///C:/v.mp4\"></video> <audio src=\" file:///C:/s.mp3\"></audio>\n\n\
+               <a href=\"file:///C:/ok.txt\">ok</a> <a href=\"vscode://file/ok.rs\">ok2</a>\n";
+    let out = render_report_html(src, &NoResolve).html;
+    for (tag, name, value) in attributes(&out) {
+        assert!(
+            name != "src" || value.is_empty(),
+            "{tag}[src]={value}\n{out}"
+        );
+    }
+    // сырой HTML тела рендер не пропускает вовсе (comrak без `unsafe`): ссылок из него нет
+    assert!(!out.contains("ok.txt") && !out.contains("ok.rs"), "{out}");
+    // санитайзер отчёта сам по себе (HTML, собранный вне comrak): схемы сверх обычных — только
+    // у `<a href>`, в том числе с регистром и ведущим пробелом
+    let raw = "<img src=\"file:///C:/c.png\" alt=\"c\"><img src=\"VSCODE://file/d.png\">\
+               <video src=\"file:///C:/v.mp4\"></video><audio src=\" file:///C:/s.mp3\"></audio>\
+               <a href=\"file:///C:/ok.txt\">ok</a><a href=\"vscode://file/ok.rs\">ok2</a>\
+               <a href=\"JaVaScRiPt:alert(1)\">j</a><a href=\" javascript:alert(1)\">s</a>\
+               <a href=\"java&#9;script:alert(1)\">t</a><a href=\"data:text/html,x\">d</a>";
+    let out = sanitize_report_html(raw);
+    assert_safe(raw, &out);
+    assert_report_schemes(raw, &out);
+    for (tag, name, value) in attributes(&out) {
+        assert!(name != "src", "{tag}[src]={value}\n{out}");
+    }
+    assert!(out.contains("href=\"file:///C:/ok.txt\""), "{out}");
+    assert!(out.contains("href=\"vscode://file/ok.rs\""), "{out}");
+    assert_eq!(out.matches("href=").count(), 2, "{out}");
+    // текстовые атрибуты с двоеточием — не адреса: подпись и заголовок остаются
+    let out = sanitize_report_html(
+        "<img src=\"a.png\" alt=\"Figure: loss\" title=\"note: x\">\
+         <a href=\"https://e.org\" title=\"file: имя\">t</a>",
+    );
+    for keep in [
+        "src=\"a.png\"",
+        "alt=\"Figure: loss\"",
+        "title=\"note: x\"",
+        "title=\"file: имя\"",
+    ] {
+        assert!(out.contains(keep), "{keep}\n{out}");
+    }
+    let out = render_report_html("[t](https://e.org \"note: see\")\n", &NoResolve).html;
+    assert!(out.contains("title=\"note: see\""), "{out}");
+
+    // заметка: как до M6 — `vscode:` и `file:` без href, `mailto:` без rel
+    let note = "[v](vscode://file/x.rs) [f](file:///C:/a.txt) [m](mailto:a@b.c) \
+                [h](https://e.org)\n\n\
+                <a href=\"vscode://file/y.rs\">y</a> <a href=\"file:///C:/z.txt\">z</a>\n";
+    let out = render_html(note, &NoResolve).html;
+    for (tag, name, value) in attributes(&out) {
+        assert!(
+            !value.contains("vscode:") && !value.contains("file:"),
+            "{tag}[{name}]={value}\n{out}"
+        );
+    }
+    assert!(out.contains("href=\"mailto:a@b.c\">m</a>"), "{out}");
+    assert!(
+        out.contains("href=\"https://e.org\" rel=\"noopener noreferrer\""),
+        "{out}"
+    );
+    assert_eq!(
+        sanitize_html("<a href=\"vscode://file/y.rs\">y</a>"),
+        "<a>y</a>"
+    );
+    assert_eq!(
+        sanitize_report_html("<a href=\"vscode://file/y.rs\">y</a><a href=\"ftp://x\">f</a>"),
+        "<a href=\"vscode://file/y.rs\">y</a><a>f</a>"
+    );
 }

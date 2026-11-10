@@ -57,7 +57,7 @@ pub use read::{
 pub(crate) use reports::{ATT_COLS, att_row};
 pub use reports::{
     EntryAttachment, NewReportFile, create_report, entry_attachment, entry_attachments,
-    first_images,
+    first_images, report_blob_meta_by_sha,
 };
 pub use triggers::{
     KEYWORD_MAX_CHARS, NewTrigger, PATTERN_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger,

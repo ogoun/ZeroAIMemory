@@ -1,4 +1,4 @@
-// Печать и PDF отчёта (M5.5, задача 7, спецификация §9): «Скачать PDF» собирает печатную
+// Печать и PDF отчёта (M5.5, задача 7, спецификация §9): «PDF / печать» собирает печатную
 // вёрстку и вызывает `window.print()` (здесь — шпион) только после догрузки ленивых модулей
 // KaTeX и Mermaid, картинок и шрифтов; ошибка модуля — сообщение без печати; печать светлая
 // при тёмной теме ОС; A4 без навигации и кнопок; разрывы не режут картинки, формулы и строки
@@ -9,6 +9,10 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import {
+  LINK_FILE,
+  LINK_FILE_AUTO,
+  LINK_HTTPS,
+  LINK_VSCODE,
   CLI_NODE_A,
   CLI_NODE_B,
   CLI_REPORT_TITLE,
@@ -82,9 +86,9 @@ async function openPrintReport(page: Page) {
   await expect(page.locator(`article.report[data-report="${id}"] .doc`)).toBeVisible();
 }
 
-const pdfButton = (page: Page) => page.getByRole('button', { name: 'Скачать PDF' });
+const pdfButton = (page: Page) => page.getByRole('button', { name: 'PDF / печать', exact: true });
 
-/** Открыть отчёт, нажать «Скачать PDF» и дождаться вызова печати. */
+/** Открыть отчёт, нажать «PDF / печать» и дождаться вызова печати. */
 async function printed(page: Page): Promise<PrintCall> {
   await spyPrint(page);
   await openPrintReport(page);
@@ -313,6 +317,79 @@ test('print_refs_and_files_as_text', async ({ page }) => {
   expect(ids.dup).toEqual([]);
   expect(ids.links.length).toBeGreaterThan(0);
   for (const l of ids.links) expect(ids.inside, l).toContain(l);
+});
+
+test('print_button_pdf_print_with_hint', async ({ page }) => {
+  // M6, задача 15a (ответ владельца по M5.5, п. 6): кнопка «PDF / печать» и подсказка рядом
+  await spyPrint(page);
+  await openPrintReport(page);
+  const btn = pdfButton(page);
+  await expect(btn).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Скачать PDF' })).toHaveCount(0);
+  const hint = page.locator('article.report .actions .hint');
+  await expect(hint).toBeVisible();
+  await expect(hint).toHaveText('В диалоге печати выберите „Сохранить как PDF“');
+  // подсказка связана с кнопкой (описание для вспомогательных технологий)
+  await expect(btn).toHaveAccessibleDescription('В диалоге печати выберите „Сохранить как PDF“');
+  // в печати — ни кнопки, ни подсказки
+  await page.emulateMedia({ media: 'print' });
+  await expect(hint).toBeHidden();
+  await expect(btn).toBeHidden();
+  // Ctrl+P без кнопки печатает страницу отчёта: у `file:` виден адрес (`::after`), кнопок
+  // «копировать путь» на бумаге нет
+  const fileLink = page.locator('article.report .doc a', { hasText: /^данные$/ });
+  await expect(fileLink).toHaveAttribute('data-url', LINK_FILE);
+  expect(await fileLink.evaluate((a) => getComputedStyle(a, '::after').content)).not.toBe('none');
+  await expect(page.locator('article.report .doc button.copy-path').first()).toBeHidden();
+  await page.emulateMedia({ media: null });
+  expect(await fileLink.evaluate((a) => getComputedStyle(a, '::after').content)).toBe('none');
+  await btn.click();
+  await expect.poll(() => page.evaluate(() => window.__printCalls.length), { timeout: 30_000 }).toBe(1);
+});
+
+test('print_shows_link_address_for_vscode_and_file', async ({ page }) => {
+  // M6, задача 15a: в печати и PDF у ссылок `vscode:` и `file:` виден текст адреса
+  await printed(page);
+  await page.emulateMedia({ media: 'print' });
+  const root = page.locator('.print-root');
+  // адрес дописывает `::after` из `data-url` (значение `content` движок может отдать и как
+  // строку, и как `attr(data-url)` — сам текст проверяется ниже по PDF)
+  const after = (scope: typeof root, text: string | RegExp) =>
+    scope
+      .locator('a', { hasText: typeof text === 'string' ? new RegExp(`^${text}$`) : text })
+      .evaluate((a) => ({ url: a.getAttribute('data-url'), content: getComputedStyle(a, '::after').content }));
+  const code = await after(root, 'код');
+  expect(code.url).toBe(LINK_VSCODE);
+  expect(code.content).not.toBe('none');
+  const data = await after(root, 'данные');
+  expect(data.url).toBe(LINK_FILE);
+  expect(data.content).not.toBe('none');
+  // http(s) — без дописанного адреса (обычная ссылка PDF); автоссылка — адрес уже в тексте
+  expect(await after(root, 'сайт')).toEqual({ url: null, content: 'none' });
+  expect(await after(root, new RegExp(LINK_FILE_AUTO.replace(/[/.]/g, '\\$&')))).toEqual({ url: null, content: 'none' });
+  // `file:` и в копии без перехода; кнопок в копии нет
+  await expect(root.locator('a[href^="file:" i]')).toHaveCount(0);
+  await expect(root.locator('button')).toHaveCount(0);
+  await expect(root.locator('a', { hasText: /^сайт$/ })).toHaveAttribute('href', LINK_HTTPS);
+  // страница отчёта несёт тот же `data-url` (Ctrl+P без кнопки — print_button_pdf_print_with_hint)
+  const screen = await page
+    .locator('article.report .doc a', { hasText: /^данные$/ })
+    .evaluate((a) => ({ url: a.getAttribute('data-url'), content: getComputedStyle(a, '::after').content }));
+  expect(screen.url).toBe(LINK_FILE);
+  // на экране адрес не дописывается
+  await page.emulateMedia({ media: 'screen' });
+  expect(
+    await page
+      .locator('article.report .doc a', { hasText: /^данные$/ })
+      .evaluate((a) => getComputedStyle(a, '::after').content),
+  ).toBe('none');
+  await page.emulateMedia({ media: 'print' });
+  const pdf = await page.pdf({ preferCSSPageSize: true });
+  writeFileSync(`${out}report-links.pdf`, pdf);
+  const text = (await pdfFacts(pdf)).text.replace(/\s+/g, '');
+  expect(text).toContain(LINK_VSCODE);
+  expect(text).toContain(LINK_FILE);
+  expect(text).toContain(LINK_FILE_AUTO);
 });
 
 test('report_pdf_contains_images_formula_diagram', async ({ page }) => {

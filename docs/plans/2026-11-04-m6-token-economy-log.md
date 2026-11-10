@@ -4262,6 +4262,8 @@ UTC, без прогонов на GPU): 182 цели, **2600 PASS, 3 FAIL, 34 ig
 
 ### Задача 15a. Долги M5.5
 
+Журнал исполнителя — раздел «Задача 15a (исполнитель)» в конце журнала.
+
 - **Из 8c:** стабилизировать флак `zam-cli hooks::session_start_spawns_background_sync_once_per_interval`
   (падал 3+ раза; разбор и варианты — журнал задачи 8c, «Передать»).
 
@@ -8810,3 +8812,231 @@ C2; Windows-контроль (`win2`), обратный переезд Linux →
   (точечных `allow` хватает обоим потребителям); `rustfmt --edition 2024 --check` по
   `transfer_check.rs` (с `bindings.rs`) и `backup.rs` — чисто.
 - `target` в `wt-b` (сборка и копии зависимостей) удалён.
+
+## Задача 15a (исполнитель). Долги M5.5: схемы ссылок, миниатюры, «PDF / печать» (2026-11-10)
+
+Worktree `.tmp/m6/wt-b`, ветка `m6-portability` (база `ea826ea`). Коммиты: `fix(reports): схемы
+vscode:/file:, серверные миниатюры, «PDF / печать»` и `chore: мелочи, переданные в 15a`.
+Спецификация §16 п. 15 (ответы владельца по M5.5, п. 1, 5, 6), приёмка §17 п. 18.
+
+### Что сделано
+
+**Схемы ссылок отчёта.**
+- `zam_core::link` (новый модуль): `REPORT_LINK_SCHEMES = ["http", "https", "mailto", "vscode",
+  "file"]` (реэкспорт `zam_core::REPORT_LINK_SCHEMES`), `url_scheme`, `report_scheme_allowed`,
+  `report_schemes_text`. `url_scheme` читает схему так же, как браузер (WHATWG URL): края до
+  U+0020 включительно отбрасываются, TAB/LF/CR выбрасываются из любого места, схема — буква, затем
+  буквы, цифры и `+-.` до первого `:`, результат в нижнем регистре. Поэтому `JaVaScRiPt:`,
+  ` javascript:` и `java\tscript:` — схема `javascript` (отказ), а `%6Aavascript:` — не схема
+  (относительный путь; его отклоняют правила пути — «:» в имени).
+- Общий набор примеров `crates/zam-core/tests/fixtures/link_schemes.json` (55 адресов) читают
+  тест `zam-core` и тест WebUI `web/test/reportLinks.test.ts`; тест WebUI дополнительно сверяет
+  каждый пример с разбором `new URL()` движка — правило совпало с WHATWG на всём наборе.
+- Сервер (`api/reports.rs`, `classify`): схема — `zam_core::link::url_scheme`, разрешение —
+  `report_scheme_allowed`; своя `scheme_of` удалена. Картинке со схемой — по-прежнему 422 (значит,
+  `vscode:`/`file:` — только у ссылок). Текст отказа называет список из константы.
+- CLI (`cmd/report.rs`): схема не из списка — ошибка ввода до запроса (раньше любая схема уходила
+  на сервер); сканер ссылок теперь видит автоссылки `<схема:адрес>` (только ради проверки схемы).
+- Рендер страницы (`zam_markdown::render_report_html`, `sanitize_report_html`): отдельный профиль
+  отчёта — ссылке со схемой из списка пишется `href` (comrak сам считает `file:` опасной и `href`
+  не пишет), ссылке с иной схемой — пустой; каждой ссылке со схемой и `//host` —
+  `rel="noopener noreferrer"`; санитайзер отчёта пропускает пять схем, причём `vscode:` и `file:` —
+  только в `<a href>` (у `src` картинки, видео, аудио — удаляются). Рендер заметок не менялся
+  (`render_html`, `RENDER_VERSION` = 4): `vscode:` и `file:` там по-прежнему без `href`.
+- WebUI (`web/src/lib/reportLinks.ts`, вызывается из `hydrateRendered` через новый параметр
+  `links` — и на экране, и в печатной копии): та же проверка схемы + сверка с `new URL()` (при
+  расхождении или чужой схеме `href` снимается — вторая линия защиты после сервера); внешним —
+  `rel`; `file:` — без `href` (класс `local-link`); у `file:` и `vscode://file/…` — кнопка
+  «копировать путь» (`file:` → путь ОС: `C:\…`, `/home/…`, `\\сервер\ресурс\…`; `vscode:` → путь
+  после `vscode://file/`). Кнопка и атрибуты строятся через DOM (`createElement`, `textContent`,
+  `dataset`), без вставки HTML. В печати и PDF адрес дописывает `a[data-url]::after` (`doc.css`,
+  `@media print` — и для копии «PDF / печать», и для Ctrl+P); автоссылке адрес не дублируется.
+
+**Серверные миниатюры ленты.**
+- `GET /api/v1/previews/{sha256}?kind=thumb` находит и файл отчёта: `zam_store::
+  report_blob_meta_by_sha` (живая запись вида `report`, при заданном пространстве — только в нём).
+  Права — как у файла отчёта: только сессия человека (своя база; решения с одобренным доступом —
+  только пространство решения; администратору — и по `?user=`); токену — тот же 404, что у
+  несуществующего sha (и для `kind=text|sheet`); удалённый отчёт — 404.
+- Лента: `first_image.thumb_url` = `api/v1/previews/<sha256>?kind=thumb&px=256[&user=<владелец>]`
+  у растровой картинки (PNG, JPEG, WebP, GIF), `null` у SVG. `ReportsView.svelte` берёт
+  `thumb_url ?? url`; если превью не построилось (422: файл больше предела `[docs]`, повреждён) —
+  один раз подставляется сам файл (`onerror`).
+
+**«PDF / печать».** Кнопка переименована, рядом подсказка «В диалоге печати выберите „Сохранить
+как PDF“» (`aria-describedby` кнопки); комментарии `print.ts`, `printRoot.ts` обновлены.
+
+**Мелочи, переданные в 15a** (отдельный коммит):
+- `zam-core/src/lib.rs` — doc-комментарий `HOOK_BUDGET_SPENT` возвращён к константе;
+- `xtask/src/eval/sessions.rs` — `midnight_note`: в конце точки сетки `today_utc()` сверяется с
+  датой старта, при расхождении в `info.notes` (и в вывод) пишется примечание с обеими датами;
+- `crates/zam-server/tests/recall.rs` — `rule_line_shape` поддерживает путь с пробелами (путь
+  кончается перед ` — `, перед ` …` или в конце строки), тест `rule_line_shape_paths_with_spaces`.
+- Не делалось (по заданию): стабилизация `session_start_spawns_background_sync_once_per_interval`
+  (нестабильные тесты хуков расследует другой исполнитель).
+
+### Решения исполнителя и отклонения
+
+1. **[решение исполнителя] Отдельный профиль рендера отчёта.** `vscode:` и `file:` разрешены
+   только в `render_report_html`; рендер заметок прежний, `RENDER_VERSION` не поднята (HTML
+   заметок не изменился, кэш рендера — в памяти процесса и обнуляется перезапуском).
+2. **[решение исполнителя] `vscode:` кликается только вида `vscode://file/…`.** Прочие адреса
+   `vscode:` (команды расширений редактора: `vscode://vscode.git/clone?url=…`,
+   `vscode:extension/…`) сервер принимает (схему разрешил владелец), но WebUI показывает их без
+   `href` и без кнопки; адрес — в подсказке и в печати. Причина: тело отчёта пишет агент, а такие
+   адреса — команды, а не «открыть файл». Спецификация говорит «ссылка `vscode:` кликается» —
+   это сужение; снять его — одна проверка `VSCODE_FILE` в `hydrateReportLinks`.
+3. **[решение исполнителя] Путь с управляющими и bidi-символами не копируется.** После
+   percent-декодирования `file:///tmp/x%0Arm%20-rf%20~` дал бы перевод строки в буфере обмена
+   (вставка в терминал выполнила бы вторую строку) — у такой ссылки кнопки нет.
+4. **[решение исполнителя] Сверка схемы с `new URL()` в WebUI.** Свой разбор и разбор движка
+   должны совпасть, иначе `href` снимается (страховка от расхождения разборов).
+5. **[решение исполнителя] `rel="noopener noreferrer"` — всем ссылкам со схемой** в отчёте
+   (и `mailto:`), сервером и повторно WebUI.
+6. **[решение исполнителя] Сырой HTML тела.** comrak его не пропускает (опции без `unsafe`),
+   поэтому ссылок и картинок из сырого HTML на странице нет; санитайзер отчёта проверен отдельно
+   (`zam-markdown`, `report_schemes_only_on_links_and_only_in_reports`).
+7. **[решение исполнителя] Превью файла отчёта — весь маршрут `/previews`**, не только
+   `kind=thumb`: сессии доступны и `kind=text|sheet` файла отчёта (права те же, что у скачивания).
+   Администратор (сессия) получает превью и без `?user=` — как у вложений заметок
+   (`scope::foreign_solutions`: администратору видны решения всех владельцев).
+8. **[решение исполнителя] `px=256`** (`FEED_THUMB_PX`): карточка 120 × 80 CSS-пикселей, экран 2×;
+   меньший исходник не увеличивается. При отказе превью лента один раз берёт исходный файл.
+9. **[решение исполнителя] Предел `ReportsView` поднят с 8 до 9 кБ** (`web/.size-limit.json`):
+   чанк вырос с 6,84 до 7,98 кБ gzip (+1,14 кБ: `reportLinks.ts` — проверка схем, путь, разметка
+   кнопки; около 0,1 кБ — миниатюры и подсказка). В прежние 8 кБ он ещё укладывается, но с запасом
+   20 Б — первый же байт в журнале «Отчёты» уронил бы CI (так уже было с `CodeView`).
+10. **[решение исполнителя] CLI видит автоссылки** `<схема:адрес>` — иначе `<ftp://…>` уходил бы
+    на сервер и «проверка до отправки» была бы неполной.
+11. **Отклонение: en-подпись «PDF / Print» не сделана** — локализации в WebUI нет (все подписи
+    русские).
+12. **Расположение тестов.** `report_link_schemes` и `report_preview_token_404` — в
+    `crates/zam-server/tests/reports.rs` (бриф); страница и лента — в `tests/reports_access.rs`
+    (там сессии WebUI). `m55_acceptance` (сервер и CLI) не менялись — прогнаны.
+13. **Файлы с CRLF в рабочем дереве** (`api/reports/view.rs`, `zam-store/src/entries/reports.rs`;
+    в индексе — LF, `eol=lf`) записаны с LF.
+14. **Не делалось (не входило в задание):** запись журнала «→ 13b/15a» о сроке 200 мс в
+    `eval --hints` и вторая половина записи «→ 15a (вне задачи)» о модели `post_tool_pick`
+    (справочная модель M4) — остаются за 13b.
+
+### Тесты
+
+- `zam-core` `link::tests` — 3: `report_link_schemes_const`, `url_scheme_shared_vectors` (55
+  адресов общего набора), `url_scheme_bypass_forms`.
+- `zam-markdown` `tests/xss.rs` — 3 новых: `report_xss_vectors_are_neutralized` (весь XSS-набор
+  через рендер отчёта, три резолвера, плюс семь схем в четырёх формах),
+  `report_link_schemes_href_and_rel`, `report_schemes_only_on_links_and_only_in_reports`.
+- `zam-store` `tests/reports.rs` — `report_blob_meta_live_report_in_space`.
+- `zam-server`: `tests/reports.rs` — `report_link_schemes` (201 для пяти схем JSON и multipart;
+  422 для 26 форм: `ftp:`, `javascript:` с регистром, пробелом, табуляцией, управляющим
+  символом, сущностями, percent-кодированием, сноской, автоссылкой, `data:`, `vbscript:`, `blob:`,
+  `vscode-insiders:`, `tel:`, картинка с `file:`/`vscode:`), `report_preview_token_404`
+  (сессии владельца и участников — PNG; пять токенов — 404, неотличимый от несуществующего sha,
+  и для `kind=text|sheet`; посторонний — 404; чужое решение того же владельца — 404 участнику;
+  удалённый отчёт — 404); `tests/reports_access.rs` —
+  `report_feed_thumb_url_raster_only_and_admin_user`, `report_html_link_schemes_rel_and_raw_html`,
+  проверка `thumb_url` в `report_list_cookie_first_image_author_cursor`; модульный
+  `api::reports::view::tests::thumb_url_raster_only`.
+- `zam-cli`: `tests/report.rs` — `cli_report_link_schemes`; модульные
+  `autolinks_are_scanned_for_scheme_check`, расширение `names_and_rules`.
+- WebUI: `web/test/reportLinks.test.ts` — 7 (в `npm run test:build`); e2e `reports.spec.ts` —
+  `report_links_rel_copy_path_file_no_navigation`,
+  `report_links_hostile_schemes_no_href_in_webui` (HTML ответа подменяется: 13 адресов с чужой
+  схемой — без `href`, клик ничего не исполняет), лента — превью `kind=thumb` вместо исходников
+  (в том числе администратору от имени); `reports-print.spec.ts` —
+  `print_button_pdf_print_with_hint`, `print_shows_link_address_for_vscode_and_file`, все сценарии
+  печати и `acceptance_pdf_from_cli_report` — по новой подписи.
+- Мелочи: `recall::rule_line_shape_paths_with_spaces`,
+  `xtask eval::sessions::tests::midnight_note_only_when_date_changed`.
+
+TDD: до реализации `report_link_schemes` (422 на `vscode:`) и `report_preview_token_404` (404
+владельцу) — FAIL (`.tmp/m6/task15a/red-server.log`); остальные новые тесты проверены откатами.
+
+### Откаты
+
+`.tmp/m6/task15a/rollbacks.py` (25 откатов), журнал `rollbacks.log`; после каждого шага дерево
+возвращалось (хэш `git diff HEAD` до и после совпал). Все — FAIL ожидаемым тестом:
+- `zam-core`: R2 (без выбрасывания TAB/LF/CR), R2b (без отбрасывания краёв), R2c (без нижнего
+  регистра) → `url_scheme_shared_vectors`, `url_scheme_bypass_forms`;
+- `zam-markdown`: R10 (фильтр `src`) → `report_schemes_only_on_links…`, `report_xss_vectors…`;
+  R11 (`rel` только http) → `report_link_schemes_href_and_rel`; R13 (схемы санитайзера отчёта) →
+  оба теста ссылок; R12 (без проверки списка в `link()`) → `report_link_schemes_href_and_rel`;
+- `zam-store`: R5 (без `deleted_at IS NULL`), R6 (без пространства) →
+  `report_blob_meta_live_report_in_space`;
+- `zam-cli`: R14 (любая схема уходит на сервер) → `names_and_rules`, `cli_report_link_schemes`;
+- `zam-server`, группа X: R1 (старый список схем) → `report_link_schemes`; R3 (превью и токену) →
+  `report_preview_token_404` («токен владельца» получил PNG); R7 (без `thumb_url`) →
+  `report_list_cookie_first_image…`; R8b (без `&user=`) → `thumb_url_raster_only`; группа Y:
+  R4 (без поиска файла отчёта) → `report_preview_token_404` (владельцу 404); R8 (`thumb_url` у
+  SVG) → `report_feed_thumb_url…`, `thumb_url_raster_only`; R9 (рендер заметки вместо отчёта) →
+  `report_html_link_schemes_rel_and_raw_html`. В группе X `report_html_link…` и
+  `report_feed_thumb_url…` упали заодно (отчёт с `vscode:` не создался) — это следствие R1;
+- мелочи: R15 (прежняя `rule_line_shape`) → `rule_line_shape_paths_with_spaces`; R16 →
+  `midnight_note_only_when_date_changed`;
+- WebUI, модульные: W5 (без выбрасывания TAB/LF/CR) → «urlScheme — общий набор»; W6 (без запрета
+  управляющих символов) → «linkPath: управляющие символы…»;
+- WebUI, e2e (сборка WebUI и release-сервера с откатами W1 — без `hydrateReportLinks`, W2 —
+  исходник вместо превью, W3 — прежняя подпись): 17 FAIL из 27 — оба сценария ссылок (W1), лента и
+  лента администратора (W2), все 13 сценариев печати (W3).
+В журнале `rollbacks.log` три строки «код 1» — ошибка аргументов cargo при первом запуске шагов
+`cli-R14`, `srv-X`, `srv-Y` (фильтры без `--`); повтор — ниже в том же журнале.
+- WebUI, e2e, отдельно W4 (без правила `a[data-url]::after`): 2 FAIL из 27 —
+  `print_shows_link_address_for_vscode_and_file` и `print_button_pdf_print_with_hint` (в нём
+  проверка Ctrl+P); после восстановления и пересборки — 27 PASS.
+
+### Проверка
+
+Каталог сборки `target/t15a` (в worktree), `-j 2`, `ZAM_REQUIRE_ML=1`; машина нагружена чужими
+сборками и генератором нагрузки расследования хуков; журналы — `.tmp/m6/task15a/`.
+- `cargo test -p zam-core -p zam-markdown` (`t1-core-md.log`) — `zam-core` 24 PASS,
+  `zam-markdown` 155 PASS (в том числе `xss` 13).
+- `cargo test -p zam-store --test reports` — 21 PASS.
+- `cargo test -p zam-cli --bins --test report --test m55_acceptance` (`t1-cli.log`) — модульные
+  177, `report` 13, `m55_acceptance` 2 — PASS.
+- `cargo test -p zam-server --lib --test reports --test reports_access --test reports_invisible
+  --test m55_acceptance --test previews --test render --test web --test blobs` (`t1-server.log`) —
+  lib 278 (1 пропущен), `reports` 26, `reports_access` 16, `reports_invisible` 17,
+  `m55_acceptance` 4, `previews` 10, `render` 8, `web` 9, `blobs` 11 — 0 FAIL. `recall` — 41 PASS
+  (1 пропущен; `green-server.log`, до последних правок `zam-markdown`, которых он не касается).
+- `cargo test -p xtask midnight_note` — 1 PASS (полный набор xtask не запускался).
+- `cargo clippy -p zam-core -p zam-markdown -p zam-store -p zam-server -p zam-cli -p xtask
+  --all-targets --features zam-server/test-hooks -- -D warnings` — чисто; `rustfmt --edition 2024
+  --check` по файлам задачи — чисто.
+- WebUI: `npm run check` — 0 ошибок; `npm run test:build` — 19 PASS; `npm run build`;
+  `npm run size` — в пределах. Размеры gzip до → после: entry 78,48 → 78,50 кБ (предел 103);
+  `ReportsView` 6,84 → 7,98 кБ (предел 8 → 9, см. решение 9); `print` 1,61 → 1,61 кБ (предел 3);
+  прочие чанки без изменений. Нового общего чанка нет (`print.ts` модуль ссылок не импортирует —
+  получает его параметром `links`).
+- e2e на release этого дерева (`E2E_SERVER`/`E2E_ZAM` = `target/t15a/release`):
+  `npm run e2e -- reports` — 27 PASS, 0 FAIL (три прогона: до откатов и после каждого
+  восстановления; 13 сценариев `reports-print`, 14 — `reports`).
+- Полный `cargo test --workspace`, полный e2e и `zam-cli --test hooks` не запускались (хуки не
+  менялись; их расследует другой исполнитель).
+
+### Передать
+
+- → 13a/13c (ТЗ §16 п. 15, §17 п. 18; CHANGELOG, README, guide):
+  - схемы ссылок отчёта — `zam_core::REPORT_LINK_SCHEMES`; правило схемы — как у браузера
+    (`zam_core::link::url_scheme`); `zam report` отклоняет чужую схему до отправки (и в
+    автоссылке); картинке `vscode:`/`file:` — 422;
+  - WebUI: `file:` без перехода, «копировать путь» у `file:` и `vscode://file/…`; **переход по
+    `vscode:` — только `vscode://file/…`** (решение исполнителя 2 — подтвердить у владельца или
+    снять); путь с управляющими символами не копируется (решение 3);
+  - `GET /previews/{sha256}` отдаёт и файлы отчётов — только сессии человека; в ленте
+    `first_image.thumb_url`;
+  - «Скачать PDF» → «PDF / печать» в текстах: `README.md` (1 место), `deploy/README-install.md`
+    (2), ТЗ `docs/specs/2026-10-17-zeroaimemory-tz.md` (3); английской подписи нет (нет
+    локализации WebUI);
+  - `web/.size-limit.json`: `ReportsView` 9 кБ;
+  - блок инструкции v7 (13a): можно подсказать агенту вид ссылки на код в отчёте —
+    `vscode://file/<абсолютный путь>:<строка>`.
+- → 13b: срок 200 мс в `eval --hints` и справочная модель `post_tool_pick` (записи журнала
+  «→ 13b/15a», «→ 15a (вне задачи)») — в этой задаче не делались.
+- → M7:
+  - `vscode:`/`file:` в заметках (сейчас только в отчётах) — тем же профилем рендера, если
+    понадобится; тогда поднять `RENDER_VERSION`;
+  - миниатюры для картинок на самой странице отчёта (сейчас страница грузит исходники, превью —
+    только лента);
+  - `file://сервер/ресурс` (UNC) в отчёте: перехода нет, путь копируется как `\\сервер\ресурс\…` —
+    решить, показывать ли предупреждение о сетевом пути.
+- `target/t15a`, `target/deps` и `.tmp/e2e` в worktree удалены после работы.
