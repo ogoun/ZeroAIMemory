@@ -274,6 +274,26 @@ pub async fn add_memory_write(db: &Db, s: &SessionTouch) -> Result<(), StoreErro
     db.write(move |t| upsert(t, &s, 1)).await
 }
 
+/// Регистрация сессии (`POST /sessions`: хук `session-start` шлёт её на каждом старте — и на
+/// `resume`): обращение, как [`touch_session`], и в той же транзакции снятие отметки конца —
+/// сессию, завершённую `SessionEnd`, продолжили (M6 §8а). `true` — отметка была и снята.
+///
+/// Только здесь, а не в общем [`upsert`]: поздние обращения после `SessionEnd` (хвостовой запрос,
+/// учёт токенов, `PUT` снимка) завершённую сессию не «оживляют».
+pub async fn register_session(db: &Db, s: &SessionTouch) -> Result<bool, StoreError> {
+    check_touch(s)?;
+    let s = s.clone();
+    db.write(move |t| {
+        upsert(t, &s, 0)?;
+        let n = t.execute(
+            "UPDATE sessions SET ended_at = NULL WHERE id = ?1 AND ended_at IS NOT NULL",
+            [&s.id],
+        )?;
+        Ok(n > 0)
+    })
+    .await
+}
+
 /// Конец сессии (`ended: true` — сейчас, `false` — снять отметку). `false` — сессии нет.
 pub async fn end_session(db: &Db, id: &str, ended: bool) -> Result<bool, StoreError> {
     let id = id.to_string();

@@ -9218,3 +9218,93 @@ P11 заголовок `catch_up` по `taken_at` → `catch_up_staleness_from_l
   в WebUI такая сессия остаётся без пометки «завершена»; на показ это не влияет (повод
   `session_end`), но отметку можно ставить сервером при приёме снимка `session_end`.
 - `target/t17c` удалён после работы.
+
+## Задача 17c: правка ревью М11 — resume снимает завершение (2026-11-10)
+
+Ревью `b0e5e19` (координатор): решение проведено верно, одна правка Important и три Minor. Коммит
+`fix(sessions): регистрация сессии снимает отметку конца — resume завершённой сессии` поверх
+`b0e5e19` (sha — в отчёте контроллеру). Клиент (`crates/zam-cli`) не менялся.
+
+**R1 (Important) — `ended_at` не сбрасывался при resume.** Сессия нормально завершилась
+(`SessionEnd` → `ended_at`), её продолжили (`claude --resume`/`--continue`, тот же id), она
+оборвалась: отбор `s.ended_at IS NULL` не выбирал её никогда, в WebUI она оставалась «завершена»
+и выпадала из `latest_session`.
+
+- **Что шлёт клиент** (проверено по коду, без правок): хук `session-start` на **каждом** старте,
+  при любом `source` (`startup`, `resume`, `clear`, `compact`), шлёт регистрацию `POST /sessions
+  {id, agent, solution}` (`session_start.rs`, `digest_net`, поток `reg`) — для возобновлённой
+  сессии она уходит. Прочие `POST /sessions` клиента несут служебное поле: учёт токенов
+  (`cache.rs`: `{id, tokens}`), новая эпоха (`checkpoint.rs`: `{id, new_epoch}`), метка A/B
+  (`{id, holdout}`); `zam session snapshot` регистрирует сессию, только если её нет на сервере.
+- **Правка.** `zam_store::register_session` (`crates/zam-store/src/sessions.rs`): обращение, как
+  `touch_session`, и в той же транзакции `UPDATE sessions SET ended_at = NULL` — `true`, если
+  отметка была. `POST /sessions` (`crates/zam-server/src/api/sessions.rs`, `create`) зовёт её
+  только для **регистрации** — тела без `tokens`, `new_epoch` и `holdout`. Общий `upsert` и
+  `touch_from_request` не тронуты: запрос с `X-Zam-Session`, `PUT` снимка, учёт токенов, новая
+  эпоха и метка A/B завершённую сессию не «оживляют» (хук `checkpoint` на `SessionEnd` шлёт
+  учёт токенов параллельно с `PATCH ended` — он отметку не снимает).
+- **Гонка** `SessionEnd` прежнего процесса и регистрации нового (resume сразу после выхода)
+  [решение исполнителя]: **действует пришедший последним**. Времени события нет ни в `PATCH
+  /sessions/{id}`, ни в `POST /sessions`, а клиент в этом круге не меняется — сравнивать нечего.
+  Обычный порядок (конец, затем регистрация) даёт открытую сессию. Обратный оставляет отметку,
+  хотя сессия идёт; это приемлемо: окно — доли секунды между двумя запросами разных процессов;
+  отметку снимает следующая регистрация (любой `session-start` этой сессии, например после
+  сжатия); цена — раздел снимка, не показанный один раз, и пометка «завершена» в WebUI до
+  следующего старта. Зеркальный случай (запоздавшая регистрация после настоящего конца) раздела
+  не даёт: последний снимок такой сессии — повода `session_end`.
+- **Аудит.** Истории изменений у сессий нет (таблица `sessions` — служебный учёт без ревизий) —
+  снятие отметки пишется в журнал сервера строкой DEBUG без id сессии.
+
+**Minor.**
+- 4 — в спецификации §8а одной строкой: агент без хуков со снимком повода `manual` (`zam session
+  snapshot`) `SessionEnd` не шлёт и через 10 минут молчания выглядит оборванным — так и задумано.
+- 1, 5 — в «Передать → M7» ниже.
+- Спецификация §8а (редакция 4.8) и `guide.{ru,en}.md` дополнены про resume; описание модуля
+  `api/snapshot.rs` и `api/sessions.rs` — тоже.
+
+**Тесты.**
+- (а), (б), (в) `resume_reopens_ended_session` (`crates/zam-server/tests/snapshot.rs`): конец
+  сессии; запрос с `X-Zam-Session`, `PUT` снимка, `POST /sessions` с `tokens`, `new_epoch`,
+  `holdout` — `ended_at` на месте (в `GET /sessions/{id}` и в списке `GET /sessions`), раздела
+  нет; регистрация тем же id — `ended_at` пуст и в списке; снимок `stop`; пока жива — раздела
+  нет; молчание дольше 10 минут — раздел со снимком 10:15.
+- (г) `end_and_resume_race_last_wins` (там же): конец → регистрация — открыта; регистрация →
+  конец — завершена, раздела нет; следующая регистрация — открыта, раздел есть.
+- `register_session_reopens_ended` (`crates/zam-store/tests/sessions.rs`): обращение и запись в
+  память отметку не снимают; регистрация снимает (поля дописаны, счётчик цел, сессия снова в
+  `latest_session`), чужую отметку не трогает.
+
+**Откаты** (`.tmp/m6/task17c/r5/rollbacks5.py`, журнал `r5/rollbacks.log`): 6, все FAIL ожидаемыми
+тестами. S1 регистрация не снимает отметку → `register_session_reopens_ended`; S1s то же через
+API → `resume_reopens_ended_session`, `end_and_resume_race_last_wins`; S2 отметку снимает любое
+обращение (общий `upsert`) → `register_session_reopens_ended`; S2s то же через API →
+`resume_reopens_ended_session`, `digest_hides_live_session_by_last_seen`; S3 служебный `POST
+/sessions` (эпоха, метка A/B) снимает отметку → `resume_reopens_ended_session`; S4 регистрация
+обычным касанием → `resume_reopens_ended_session`, `end_and_resume_race_last_wins`. Ветка
+`tokens` откатом не проверяется: она идёт через `add_token_counts`, который отметку не трогает.
+
+**Проверка** (`target/t17c`, `ZAM_REQUIRE_ML=1`, журналы — `.tmp/m6/task17c/r5/`; только
+`-p zam-server -p zam-store`):
+- `zam-store`: `snapshots` 4, `sessions` 16 — PASS (`t3-store.log`).
+- `zam-server` (`t3-server.log`): lib 280 (1 пропущен), `snapshot` 27, `recall` 40 (1 пропущен),
+  `recall_recovery` 6, `recall_frozen` 4, `recall_brief` 9, `sessions` 17, `agent_setup` 14,
+  `m57_acceptance` 13 — PASS. В первом прогоне круга (`t2-server.log`) `m57_acceptance::
+  acceptance_prompt_hint_rules` упал — «векторный канал не включился» за 240 с (`QdrantDown`,
+  внешний Qdrant; сессий и снимка не касается) и оборвал очередь наборов; повтор всех наборов с
+  `--no-fail-fast` — без падений.
+- `cargo clippy -p zam-server -p zam-store --all-targets --features zam-server/test-hooks -- -D
+  warnings` — чисто; `rustfmt --edition 2024 --check` по своим файлам — чисто.
+- `zam-cli`, `hook_budgets` и WebUI не запускались (не менялись).
+
+**Передать.**
+- → 13a/13c: ТЗ v1.24 §8а — регистрация `POST /sessions` снимает `ended_at` (resume), правило
+  гонки «пришедший последним»; `manual` без `SessionEnd`.
+- → M7:
+  - обрыв возобновлённой сессии **до первого снимка** после resume: хранимый снимок — прежний,
+    повода `session_end`, и раздела нет, пока его не заменит догоняющий снимок (`catch_up` на
+    следующем `startup`; не уложился в срок — раздела не будет);
+  - отметку «завершена» ставить сервером при приёме снимка повода `session_end` (если `PATCH
+    ended` потерян) — **без** освежения `last_seen_at`;
+  - время события в `PATCH /sessions/{id}` и в регистрации (например, `at`) — чтобы гонку конца и
+    resume решать по времени, а не по порядку прихода.
+- `target/t17c` удалён после работы.

@@ -1443,6 +1443,117 @@ async fn session_end_snapshot_without_ended_hidden() {
     assert!(sec.contains("Файлы: src/lib.rs"), "{sec}");
 }
 
+/// `ended_at` сессии `id` в списке сессий (ответ страницы «Сессии» WebUI).
+async fn listed_ended(a: &Api, id: &str) -> Value {
+    let r = a.t(Method::GET, "/api/v1/sessions?limit=100", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let items = r.json()["items"].as_array().unwrap().clone();
+    let s = items
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("нет сессии {id}"));
+    s["ended_at"].clone()
+}
+
+/// §8а (ревью решения М11, R1): завершённую сессию продолжили (`resume`) — регистрация
+/// `POST /sessions` тем же id снимает `ended_at`; оборвалась — её снимок снова показывается.
+/// Хвост запросов после `SessionEnd` (запрос с `X-Zam-Session`, `PUT` снимка, учёт токенов,
+/// новая эпоха, метка A/B) сессию не «оживляет». В списке сессий возобновлённая — не завершена.
+#[tokio::test]
+async fn resume_reopens_ended_session() {
+    let a = world("resume", |_| {}).await;
+    abandoned(&a).await;
+    {
+        let _c = at("09:10");
+        set_ended(&a, "A", true).await;
+    }
+    // (б) хвост после конца сессии: отметка на месте, раздела нет
+    {
+        let _c = at("09:40");
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                "/api/v1/search",
+                Some(json!({"query": "парсер", "mode": "brief"})),
+                &[("x-zam-session", "A")],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        put_ok(&a, "A", "09:40", data_files()).await;
+        for b in [
+            json!({"id": "A", "tokens": {"pre_tool": 5}}),
+            json!({"id": "A", "new_epoch": true}),
+            json!({"id": "A", "holdout": false}),
+        ] {
+            let r = a.t(Method::POST, "/api/v1/sessions", Some(b)).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        }
+        assert!(!session_json(&a, "A").await["ended_at"].is_null());
+        assert!(!listed_ended(&a, "A").await.is_null());
+    }
+    {
+        let _c = at("10:00");
+        let text = digest(&a, "B").await;
+        assert!(section(&text).is_none(), "{text}");
+    }
+    // (а), (в) регистрация тем же id — сессию продолжили
+    {
+        let _c = at("10:10");
+        register(&a, "A", true, None).await;
+        assert!(session_json(&a, "A").await["ended_at"].is_null());
+        assert!(listed_ended(&a, "A").await.is_null());
+    }
+    {
+        let _c = at("10:15");
+        put_ok(&a, "A", "10:15", data_files()).await;
+        // ещё жива (обращалась в 10:10)
+        assert!(section(&digest(&a, "B2").await).is_none());
+    }
+    let _c = at("10:30");
+    let text = digest(&a, "B3").await;
+    let sec = section(&text).unwrap_or_else(|| panic!("нет раздела: {text}"));
+    assert!(
+        sec.starts_with("### Последнее известное состояние (снимок 2026-11-10 10:15:00,"),
+        "{sec}"
+    );
+}
+
+/// §8а (ревью решения М11, R1) [решение исполнителя]: гонка `SessionEnd` прежнего процесса и
+/// регистрации нового (resume сразу после выхода) — времени события в запросах нет, действует
+/// пришедший последним. Конец, затем регистрация — сессия открыта; регистрация, затем конец —
+/// отметка стоит до следующей регистрации (любой `session-start` этой сессии).
+#[tokio::test]
+async fn end_and_resume_race_last_wins() {
+    let a = world("resume-race", |_| {}).await;
+    abandoned(&a).await;
+    {
+        let _c = at("09:10");
+        set_ended(&a, "A", true).await;
+        register(&a, "A", true, None).await;
+        assert!(session_json(&a, "A").await["ended_at"].is_null());
+    }
+    {
+        let _c = at("09:20");
+        register(&a, "A", true, None).await;
+        set_ended(&a, "A", true).await;
+        assert!(!session_json(&a, "A").await["ended_at"].is_null());
+    }
+    {
+        let _c = at("10:00");
+        assert!(section(&digest(&a, "B").await).is_none());
+    }
+    {
+        // следующий старт сессии (например, после сжатия) отметку снимает
+        let _c = at("10:10");
+        register(&a, "A", true, None).await;
+        assert!(session_json(&a, "A").await["ended_at"].is_null());
+    }
+    let _c = at("10:30");
+    let text = digest(&a, "B2").await;
+    assert!(section(&text).is_some(), "{text}");
+}
+
 /// Повторное ревью 17c, Minor 8: давность — по задачам решения снимка. Задача личного Knowledge
 /// (общего для всех решений), обновлённая после снимка сессией без этого решения, раздел не
 /// скрывает и задачей снимка не считается.

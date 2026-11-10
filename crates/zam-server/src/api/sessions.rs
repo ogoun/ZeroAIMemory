@@ -2,7 +2,17 @@
 //!
 //! - `POST /sessions {id?, agent?, solution?, area?, parent_id?, agent_type?, tokens?}` → 201
 //!   `{id}`: без `id` — UUIDv7; существующая сессия обновляется (известные поля дописываются,
-//!   `last_seen_at` — сейчас). Машина и токен — из `X-Zam-Machine` и принципала. `parent_id` и
+//!   `last_seen_at` — сейчас). **Регистрация** — тело без `tokens`, `new_epoch` и `holdout` (её
+//!   шлёт хук `session-start` на каждом старте, в том числе `resume`) — ещё и снимает отметку
+//!   конца `ended_at`: завершённую сессию продолжили (M6 §8а; иначе её снимок после обрыва не
+//!   показался бы никогда, а в списке она осталась бы «завершена»). Прочие обращения — учёт
+//!   токенов, новая эпоха, метка A/B, запросы с `X-Zam-Session`, `PUT` снимка — отметку не
+//!   трогают: хвост запросов после `SessionEnd` сессию не «оживляет». Времени события в запросах
+//!   нет, поэтому при встречной гонке (`SessionEnd` прежнего процесса и регистрация нового
+//!   почти одновременно) действует **пришедший последним**: обычный порядок — конец, затем
+//!   регистрация — даёт открытую сессию; обратный оставляет отметку до следующей регистрации
+//!   (любой `session-start` этой сессии), цена — раздел снимка, не показанный один раз.
+//!   Машина и токен — из `X-Zam-Machine` и принципала. `parent_id` и
 //!   `agent_type` (до 128 печатных символов) — сессия субагента (M4.5 §9.4): её создаёт хук
 //!   `subagent-start` с id `<session>:<agent_id>`. `tokens: {pre_tool, post_tool_local,
 //!   subagent_local}` (M4.5 §9.5) — прибавка выданного хуками с локальным выводом: число
@@ -23,7 +33,8 @@
 //!   субагента (`parent_id`) при регистрации наследует метку родителя — только в сторону `true`:
 //!   `holdout: false` у субагента контрольной группы метку не снимает (ответ — `holdout: true`);
 //!   после compact метка остаётся (та же сессия);
-//! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
+//! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца; её же
+//!   снимает регистрация `POST /sessions` — см. выше);
 //! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, parent_id, agent_type,
 //!   started_at, last_seen_at, ended_at, memory_writes, seen_epoch, claimed_tasks: [{id, title,
 //!   status}], holdout, tokens: {<событие>: {calls, tokens, reread_calls?}}}` (решение контроллера R6,
@@ -71,8 +82,9 @@ use serde_json::{Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
     Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, bump_epoch,
-    claimed_tasks, end_session, get_session, list_sessions, list_spaces, session_epoch,
-    session_holdout, session_tokens, sessions_tokens, set_holdout, snapshot_times, touch_session,
+    claimed_tasks, end_session, get_session, list_sessions, list_spaces, register_session,
+    session_epoch, session_holdout, session_tokens, sessions_tokens, set_holdout, snapshot_times,
+    touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -294,8 +306,16 @@ pub async fn create(
         epoch: 0,
     };
     let db = requester_db(&st, &p, &headers).await?;
+    // регистрация (хук `session-start`) — без служебных полей: она же снимает отметку конца
+    let register = req.tokens.is_none() && req.new_epoch.is_none() && req.holdout.is_none();
     match tokens.filter(|t| !t.is_empty()) {
         Some(t) => add_token_counts(&db, &touch, &t).await?,
+        None if register => {
+            if register_session(&db, &touch).await? {
+                // без id сессии
+                tracing::debug!("сессия возобновлена: отметка конца снята");
+            }
+        }
         None => touch_session(&db, &touch).await?,
     }
     let mut out = json!({ "id": touch.id });

@@ -7,7 +7,8 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
     DataDir, SeenItem, SeenKey, SeenTarget, SessionTouch, UsageEvent, UsageKind, UsageSource,
     UserDbs, WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, record_usage, seen_revs, touch_session, usage_counts,
+    list_sessions, mark_seen, record_usage, register_session, seen_revs, touch_session,
+    usage_counts,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -841,4 +842,52 @@ async fn reread_calls_accumulate() {
         get_session(&db, "s-r").await.unwrap().unwrap().seen_epoch,
         1
     );
+}
+
+/// M6 §8а (ревью решения М11): отметку конца снимает только регистрация сессии
+/// ([`register_session`], `resume`) — обращение и запись в память завершённую сессию не
+/// «оживляют». Регистрация создаёт сессию, если её нет, и дописывает поля, как обращение.
+#[tokio::test]
+async fn register_session_reopens_ended() {
+    let (_dd, db) = db("register").await;
+    let ended_at = |id: &'static str| {
+        let db = db.clone();
+        async move { get_session(&db, id).await.unwrap().unwrap().ended_at }
+    };
+    // новой сессии снимать нечего
+    assert!(!register_session(&db, &touch("s1")).await.unwrap());
+    assert_eq!(ended_at("s1").await, None);
+    assert!(end_session(&db, "s1", true).await.unwrap());
+    let ended = ended_at("s1").await;
+    assert!(ended.is_some());
+    // хвост запросов после `SessionEnd`: отметка на месте
+    touch_session(&db, &touch("s1")).await.unwrap();
+    add_memory_write(&db, &touch("s1")).await.unwrap();
+    assert_eq!(ended_at("s1").await, ended);
+    // регистрация (сессию продолжили): отметка снята, поля дописаны, счётчик цел
+    let again = SessionTouch {
+        agent: Some("claude-code".into()),
+        ..touch("s1")
+    };
+    assert!(register_session(&db, &again).await.unwrap());
+    let s = get_session(&db, "s1").await.unwrap().unwrap();
+    assert_eq!(s.ended_at, None);
+    assert_eq!(s.agent.as_deref(), Some("claude-code"));
+    assert_eq!(s.memory_writes, 1);
+    assert_eq!(
+        latest_session(&db, None, None, s.last_seen_at)
+            .await
+            .unwrap()
+            .map(|x| x.id)
+            .as_deref(),
+        Some("s1"),
+        "возобновлённая сессия — снова в выборке незавершённых"
+    );
+    assert!(!register_session(&db, &touch("s1")).await.unwrap());
+    // чужую отметку регистрация не трогает
+    touch_session(&db, &touch("s2")).await.unwrap();
+    assert!(end_session(&db, "s2", true).await.unwrap());
+    assert!(!register_session(&db, &touch("s1")).await.unwrap());
+    assert!(ended_at("s2").await.is_some());
+    assert!(register_session(&db, &touch("")).await.is_err());
 }
