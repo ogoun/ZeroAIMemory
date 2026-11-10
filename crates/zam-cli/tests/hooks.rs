@@ -4614,6 +4614,14 @@ fn hook_snap(p: &Proj, kind: &str, ev: &Value) -> Output {
         .unwrap()
 }
 
+/// Подмена сна потока снимка (`stall-ms`, `decide-stall-ms`, `write-stall-ms`, `put-stall-ms`),
+/// мс, в тестах «хук не ждёт поток»: на порядок больше порогов времени хука. Усыплённый поток
+/// обрывается выходом процесса, поэтому длина сна ничего не стоит; короткий сон (2–3 с) под
+/// нагрузкой кончался раньше, чем выходил задержавшийся процесс хука, — поток просыпался и
+/// законно доделывал работу (удалял очередь после удавшегося `PUT`, дописывал `snapst-*`), а
+/// тест падал на артефакте.
+const STALL_MS: &str = "30000";
+
 /// Время изменения файла — `secs` секунд назад (журнал «давно не менялся»).
 fn age_file(path: &std::path::Path, secs: u64) {
     let t = std::time::SystemTime::now() - Duration::from_secs(secs);
@@ -4693,7 +4701,7 @@ fn prompts_of(body: &Value) -> Vec<String> {
 }
 
 /// §8а: жёсткий срок снимка — `decision: block` у `Stop` не ждёт сборки дольше
-/// `hooks.snapshot_ms` (поток сборки «засыпает» на 3 с через точку подмены `<журнал>.stall-ms`);
+/// `hooks.snapshot_ms` (поток сборки «засыпает» на 30 с через точку подмены `<журнал>.stall-ms`);
 /// опоздавший снимок не кладётся ни в очередь, ни на сервер.
 #[test]
 fn snapshot_deadline_never_delays_stop() {
@@ -4702,7 +4710,7 @@ fn snapshot_deadline_never_delays_stop() {
     let p = Proj::new("snap-deadline", &url, "zam_x");
     let t = transcript_path(&p, "sd-1");
     write_lines(&t, &[cl_user("sd-1", "Запрос перед остановкой")]);
-    std::fs::write(format!("{}.stall-ms", t.display()), "3000").unwrap();
+    std::fs::write(format!("{}.stall-ms", t.display()), STALL_MS).unwrap();
     // правки в сессии — напоминание `Stop` (GET /sessions → записей 0)
     empty(&p.hook("pre-tool", &write_ev(&p, "sd-1", "a.sh")));
     let warm = snap_ev(
@@ -5239,7 +5247,7 @@ fn old_server_three_attempts_then_queue() {
 
 /// §8а: `hooks.session_snapshot = false` — журнал агента не открывается: нет `snapst-*`,
 /// `snapq-*`, `PUT` и `Ev::Snapshot`, догоняющего снимка тоже нет (точка подмены
-/// `<журнал>.stall-ms` задержала бы хук на 2 с при сроке 5 с); `SessionEnd` ставит `ended`.
+/// `<журнал>.stall-ms` задержала бы хук на 4 с при сроке 5 с); `SessionEnd` ставит `ended`.
 #[test]
 fn switch_off_never_opens_transcript() {
     let _g = serial();
@@ -5248,14 +5256,17 @@ fn switch_off_never_opens_transcript() {
     let s = "off-1";
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
-    // контроль: при включённом снимке подмена задерживает хук
-    std::fs::write(format!("{}.stall-ms", t.display()), "2000").unwrap();
+    // контроль: при включённом снимке подмена задерживает хук. Здесь поток ждут (срок снимка у
+    // `hook_snap` — 5 с), поэтому сон не 30 с, а наибольший под этим сроком: порог «журнал не
+    // открывался» ниже — 3,9 с, запуск процесса под нагрузкой в него укладывается
+    std::fs::write(format!("{}.stall-ms", t.display()), "4000").unwrap();
     let pc = snap_ev(&p, "PreCompact", "off-on", &t, json!({"trigger": "auto"}));
     let t0 = Instant::now();
     empty(&hook_snap(&p, "checkpoint", &pc));
     assert!(
-        t0.elapsed() >= Duration::from_millis(1900),
-        "подмена не сработала"
+        t0.elapsed() >= Duration::from_millis(3900),
+        "подмена не сработала: {:?}",
+        t0.elapsed()
     );
     // её журнал вырос — при включённом снимке старт сделал бы догоняющий снимок
     append_lines(&t, &[cl_user("off-on", "ещё запрос")]);
@@ -5264,7 +5275,7 @@ fn switch_off_never_opens_transcript() {
     let n = puts(&seen).len();
     let quick = |o: Output, t0: Instant, what: &str| {
         assert!(
-            t0.elapsed() < Duration::from_millis(1900),
+            t0.elapsed() < Duration::from_millis(3900),
             "{what}: журнал открывался ({:?})",
             t0.elapsed()
         );
@@ -5730,7 +5741,7 @@ fn late_catch_up_does_not_delay_start() {
     assert_eq!(puts(&seen).len(), 1, "{}", p.log());
     append_lines(&t, &[cl_user(a, "запрос 2")]);
     age_file(&t, 11 * 60);
-    std::fs::write(format!("{}.stall-ms", t.display()), "3000").unwrap();
+    std::fs::write(format!("{}.stall-ms", t.display()), STALL_MS).unwrap();
     let tb = transcript_path(&p, "lc-b");
     write_lines(&tb, &[]);
     let warm = snap_ev(
@@ -5823,7 +5834,7 @@ fn late_post_compact_not_counted() {
     empty(&hook_snap(&p, "checkpoint", &pre));
     assert_eq!(puts(&seen).len(), 1, "{}", p.log());
     let stall = format!("{}.stall-ms", t.display());
-    std::fs::write(&stall, "3000").unwrap();
+    std::fs::write(&stall, STALL_MS).unwrap();
     let pc = snap_ev(
         &p,
         "PostCompact",
@@ -5846,14 +5857,10 @@ fn late_post_compact_not_counted() {
 
 /// `PreCompact` с бюджетом хука 1,5 с и своим сроком `PUT` 10 с против заглушки, отвечающей на
 /// `PUT` кодом 204 через `put_delay`: при задержке больше бюджета фактический срок `PUT` —
-/// остаток бюджета. `put_stall_ms` — подмена `<кэш>/snapshot.put-stall-ms`: поток снимка засыпает
-/// между концом `PUT` и работой с очередью. Возвращает `hooks.log`, время хука и наличие очереди
-/// снимка.
-fn put_limit_case(
-    name: &str,
-    put_delay: Duration,
-    put_stall_ms: Option<u64>,
-) -> (String, Duration, bool) {
+/// остаток бюджета. `put_stall` — подмена `<кэш>/snapshot.put-stall-ms` ([`STALL_MS`]): поток
+/// снимка засыпает между концом `PUT` и работой с очередью. Возвращает `hooks.log`, время хука и
+/// наличие очереди снимка.
+fn put_limit_case(name: &str, put_delay: Duration, put_stall: bool) -> (String, Duration, bool) {
     let (url, _seen) = common::stub_body(std::sync::Arc::new(
         move |m: &str, path: &str, _: usize, _: &Value| {
             if m == "PUT" && path.ends_with("/snapshot") {
@@ -5867,10 +5874,10 @@ fn put_limit_case(
     let s = "pl-1";
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
-    if let Some(ms) = put_stall_ms {
+    if put_stall {
         let cache = p.repo.join(".zeroaimemory/cache");
         std::fs::create_dir_all(&cache).unwrap();
-        std::fs::write(cache.join("snapshot.put-stall-ms"), ms.to_string()).unwrap();
+        std::fs::write(cache.join("snapshot.put-stall-ms"), STALL_MS).unwrap();
     }
     let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
     // свой срок `PUT` больше остатка бюджета: фактический срок — остаток (< 1500 мс)
@@ -5905,31 +5912,39 @@ fn put_limit_logged(log: &str) -> u64 {
     n
 }
 
-/// Предел времени хука с бюджетом 1,5 с в тестах опоздавшего потока снимка: запуск отладочного
-/// процесса под нагрузкой входит в замер, а хук, ждущий усыплённый поток, шёл бы ≈ 3,5 с.
-const LATE_THREAD_MAX: Duration = Duration::from_millis(2500);
+/// Предел времени хука в тестах опоздавшего потока снимка (бюджет хука — 1–1,5 с, свой предел
+/// ожидания — доли секунды): запуск и выход отладочного процесса под нагрузкой входят в замер
+/// (наблюдалось до +3 с), а хук, ждущий усыплённый поток, шёл бы не меньше 15 с (срок снимка и
+/// `PUT` в этих тестах) — порог между ними с запасом в обе стороны.
+const LATE_THREAD_MAX: Duration = Duration::from_secs(10);
 
 /// Третье ревью 17b, Minor 1: срок `PUT` — фактический срок клиента (меньшее из своего срока и
 /// остатка бюджета хука); причина «срок PUT N мс» — с ним, а не с константой.
 #[test]
 fn put_timeout_reason_uses_actual_limit() {
     let _g = serial();
-    let (log, _, queued) = put_limit_case("snap-put-limit", Duration::from_secs(3), None);
+    let (log, _, queued) = put_limit_case("snap-put-limit", Duration::from_secs(3), false);
     put_limit_logged(&log);
     assert!(queued, "{log}");
 }
 
 /// CI ubuntu (77063ec): срок `PUT` истекает за `HTTP_RESERVE_MS` (30 мс) до конца бюджета, и
 /// поток снимка может не успеть записать итог до выхода хука — строка терялась. Подмена
-/// `put-stall-ms` держит поток 2 с после конца `PUT`: причина «срок PUT N мс» всё равно в
+/// `put-stall-ms` держит поток 30 с после конца `PUT`: причина «срок PUT N мс» всё равно в
 /// `hooks.log` (её пишет сам хук), ровно одна, снимок в очереди, хук не ждёт поток.
 #[test]
 fn put_outcome_logged_when_snapshot_thread_is_late() {
     let _g = serial();
     let slow = Duration::from_secs(3);
     // прогрев: первый запуск процесса после сборки не меряется
-    let _ = put_limit_case("snap-put-late-warm", slow, Some(2000));
-    let (log, d, queued) = put_limit_case("snap-put-late-log", slow, Some(2000));
+    let _ = put_limit_case("snap-put-late-warm", slow, true);
+    let (log, d, queued) = put_limit_case("snap-put-late-log", slow, true);
+    // время — первым: у задержавшегося хука прочие проверки ловили бы артефакты проснувшегося
+    // потока, а не причину
+    assert!(
+        d <= LATE_THREAD_MAX,
+        "хук ждал поток снимка: {d:?} при пределе {LATE_THREAD_MAX:?}: {log}"
+    );
     put_limit_logged(&log);
     // строку пишет сам хук, на каком бы этапе он ни застал поток: отказ клиента по сроку уже
     // вернулся («…срок PUT N мс, очередь не обработана до выхода хука») или ещё нет («…срок PUT
@@ -5941,36 +5956,40 @@ fn put_outcome_logged_when_snapshot_thread_is_late() {
         "строку итога написал не хук (хук шёл {d:?}): {log}"
     );
     assert!(queued, "снимка нет в очереди (хук шёл {d:?}): {log}");
-    assert!(
-        d <= LATE_THREAD_MAX,
-        "хук ждал поток снимка: {d:?} при пределе {LATE_THREAD_MAX:?}: {log}"
-    );
 }
 
 /// Ревью 2c36319, I1: сервер ответил 204 сразу, а поток снимка застрял после `PUT` (подмена
-/// `put-stall-ms` 3 с) — хук пишет «ответ получен (HTTP 204), очередь не обработана», а не
+/// `put-stall-ms` 30 с) — хук пишет «ответ получен (HTTP 204), очередь не обработана», а не
 /// «срок PUT»: медленная локальная доработка не выдаётся за медленный сервер.
 #[test]
 fn late_snapshot_thread_after_response_is_not_put_timeout() {
     let _g = serial();
     // прогрев: первый запуск процесса после сборки не меряется
-    let _ = put_limit_case("snap-put-done-warm", Duration::ZERO, Some(3000));
-    let (log, d, queued) = put_limit_case("snap-put-done-late", Duration::ZERO, Some(3000));
-    assert!(!log.contains("срок PUT"), "ложная причина: {log}");
+    let _ = put_limit_case("snap-put-done-warm", Duration::ZERO, true);
+    let (log, d, queued) = put_limit_case("snap-put-done-late", Duration::ZERO, true);
+    // время — первым: проснувшийся через 30 с поток законно удалил бы очередь после удавшегося
+    // `PUT`, и проверка очереди упала бы на этом артефакте, а не на причине
+    assert!(
+        d <= LATE_THREAD_MAX,
+        "хук ждал поток снимка: {d:?} при пределе {LATE_THREAD_MAX:?}: {log}"
+    );
+    assert!(
+        !log.contains("срок PUT"),
+        "ложная причина (хук шёл {d:?}): {log}"
+    );
     assert_eq!(
         log.matches("ответ получен (HTTP 204), очередь не обработана до выхода хука")
             .count(),
         1,
-        "{log:?}"
+        "хук шёл {d:?}: {log:?}"
     );
     // поток оборван до работы с очередью: снимок уйдёт ещё раз со следующим хуком
-    assert!(queued, "{log}");
-    assert!(d <= LATE_THREAD_MAX, "хук ждал поток снимка: {d:?}");
+    assert!(queued, "снимка нет в очереди (хук шёл {d:?}): {log}");
 }
 
 /// Повторное ревью 17b (`prompt_flushes_changed_queue`): решение о снимке и снимок — вне пути
 /// сетевой части `checkpoint`. Подмена `<журнал>.decide-stall-ms` усыпляет поток снимка до
-/// решения на 3 с: очередь изменённых файлов всё равно уходит в бюджете хука, хук не ждёт поток.
+/// решения на 30 с: очередь изменённых файлов всё равно уходит в бюджете хука, хук не ждёт поток.
 #[test]
 fn snapshot_decision_never_delays_changed_flush() {
     let _g = serial();
@@ -5989,7 +6008,7 @@ fn snapshot_decision_never_delays_changed_flush() {
     assert_eq!(queue(&p, s).len(), 1);
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
-    std::fs::write(format!("{}.decide-stall-ms", t.display()), "3000").unwrap();
+    std::fs::write(format!("{}.decide-stall-ms", t.display()), STALL_MS).unwrap();
     let warm = snap_ev(
         &p,
         "Stop",
@@ -6022,8 +6041,9 @@ fn snapshot_decision_never_delays_changed_flush() {
 }
 
 /// Ревью правки `checkpoint`, Minor 1: ожидание потока снимка ограничено концом бюджета хука —
-/// медленная сеть (2 с) и медленное решение (`decide-stall-ms` 3 с) не уводят выход `Stop` за
-/// бюджет (1 с) больше чем на малый запас.
+/// медленная сеть (2 с) и медленное решение (`decide-stall-ms` 30 с) не уводят выход `Stop` за
+/// бюджет (1 с). Свой предел ожидания здесь — 20 с от запуска потока (срок `PUT`): хук, ждущий
+/// поток по своему пределу или от конца сетевой части, шёл бы 20 с и дольше при пороге 10 с.
 #[test]
 fn snapshot_wait_bounded_by_hook_budget() {
     let _g = serial();
@@ -6037,12 +6057,12 @@ fn snapshot_wait_bounded_by_hook_budget() {
     empty(&p.hook("pre-tool", &write_ev(&p, s, "a.sh")));
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
-    std::fs::write(format!("{}.decide-stall-ms", t.display()), "3000").unwrap();
+    std::fs::write(format!("{}.decide-stall-ms", t.display()), STALL_MS).unwrap();
     let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
     let run = || {
         let mut c = p.cmd(&url);
         c.env("ZAM_TEST_HOOK_BUDGET_MS", "1000")
-            .env("ZAM_TEST_SNAPSHOT_PUT_MS", "1000")
+            .env("ZAM_TEST_SNAPSHOT_PUT_MS", "20000")
             .args(["hook", "checkpoint", "--agent", "claude"])
             .write_stdin(stop.to_string().into_bytes());
         let t0 = Instant::now();
@@ -6052,12 +6072,12 @@ fn snapshot_wait_bounded_by_hook_budget() {
     let _ = run();
     let (o, d) = run();
     ok(&o);
+    let log = p.log();
     assert!(
-        d <= Duration::from_millis(1000 + 300),
-        "поток снимка увёл хук за бюджет: {d:?}"
+        d <= LATE_THREAD_MAX,
+        "поток снимка увёл хук за бюджет: {d:?} при пределе {LATE_THREAD_MAX:?}: {log}"
     );
     // ревью 2c36319, M4: поток до `PUT` не дошёл — строка с событием и временем от старта
-    let log = p.log();
     assert!(
         log.contains("snapshot: не готов до выхода хука (Stop, прошло "),
         "{log}"
@@ -6075,13 +6095,13 @@ fn snapshot_queue_written_before_state() {
     let s = "wo-1";
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
-    std::fs::write(format!("{}.write-stall-ms", t.display()), "3000").unwrap();
+    std::fs::write(format!("{}.write-stall-ms", t.display()), STALL_MS).unwrap();
     let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
     // прогрев: первый запуск процесса после сборки не меряется
     let warm = snap_ev(&p, "Stop", "wo-warm", &t, json!({"stop_hook_active": true}));
     let _ = p.hook_at(&url, "checkpoint", "claude", warm.to_string().as_bytes());
     let mut c = p.cmd(&url);
-    c.env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+    c.env("ZAM_TEST_HOOK_BUDGET_MS", "30000")
         .env("ZAM_TEST_SNAPSHOT_MS", "500")
         .args(["hook", "checkpoint", "--agent", "claude"])
         .write_stdin(pc.to_string().into_bytes());
@@ -6090,21 +6110,22 @@ fn snapshot_queue_written_before_state() {
     let d = t0.elapsed();
     empty(&o);
     // третье ревью 599c933: хук выходит по своему пределу (срок снимка 500 мс + срок `PUT` 60 мс
-    // + запас 50 мс от запуска потока), а не досиживает бюджет 3 с вслед за потоком
+    // + запас 50 мс от запуска потока), а не досиживает бюджет 30 с вслед за потоком. Время —
+    // первым: проснувшийся поток дописал бы `snapst-*`, и проверка ниже упала бы на артефакте
     assert!(
-        d <= Duration::from_millis(2000),
-        "хук ждал поток до конца бюджета: {d:?}: {}",
+        d <= LATE_THREAD_MAX,
+        "хук ждал поток до конца бюджета: {d:?} при пределе {LATE_THREAD_MAX:?}: {}",
         p.log()
     );
     assert!(
         snap_file(&p, "snapq", s).is_some(),
-        "снимка нет в очереди: {}",
+        "снимка нет в очереди (хук шёл {d:?}): {}",
         p.log()
     );
     let st = snap_file(&p, "snapst", s);
     assert!(
         st.as_ref().is_none_or(|v| v["ok_at"] == 0),
-        "отметка «снят» без очереди: {st:?}"
+        "отметка «снят» без очереди (хук шёл {d:?}): {st:?}"
     );
 }
 

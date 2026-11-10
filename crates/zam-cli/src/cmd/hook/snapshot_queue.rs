@@ -600,8 +600,8 @@ impl SendNote {
     fn late(&self, env: &Env, done: &std::sync::mpsc::Receiver<()>, event: &str) {
         let until = std::time::Instant::now() + EXIT_LOG_RESERVE;
         self.late_with(env, event, &mut || {
-            let tail = until.saturating_duration_since(std::time::Instant::now());
-            done.recv_timeout(tail.min(env.budget_left())).is_ok()
+            let tail = tail_left(until, std::time::Instant::now(), env.budget_left());
+            done.recv_timeout(tail).is_ok()
         });
     }
 
@@ -970,6 +970,16 @@ pub fn wait_snapshot(env: &Env, s: &Settings, w: &SnapWait) {
     }
 }
 
+/// Остаток хвоста ожидания внутри [`SendNote::late`] в момент `now`: до `until` (начало `late` +
+/// [`EXIT_LOG_RESERVE`]) и не дольше остатка бюджета хука `budget_left`.
+fn tail_left(
+    until: std::time::Instant,
+    now: std::time::Instant,
+    budget_left: Duration,
+) -> Duration {
+    until.saturating_duration_since(now).min(budget_left)
+}
+
 /// Запас ожидания потока снимка сверх его сроков: решение, журнал сессии, `snapst-*`, очередь.
 const WAIT_SLACK: Duration = Duration::from_millis(50);
 
@@ -1249,22 +1259,25 @@ mod tests {
     }
 
     /// Третье ревью 599c933: ожидание внутри `late` — хвост [`EXIT_LOG_RESERVE`], а не весь
-    /// остаток бюджета (здесь — 300 мс, старт «в будущем»: остаток не тает): хук, вышедший по
-    /// своему пределу, не досиживает до конца бюджета.
+    /// остаток бюджета: хук, вышедший по своему пределу, не досиживает до конца бюджета.
+    /// Четвёртое ревью 3aec37d, M2: расчёт хвоста проверяется без часов.
     #[test]
-    fn late_tail_wait_is_not_whole_budget() {
-        let mut env = fresh("tail");
-        env.started = Instant::now() + Duration::from_secs(60);
-        let n = SendNote::default();
-        n.sending("снимок stop", Duration::from_millis(100), ago(500));
-        // сигнала не будет, но канал жив: ожидание идёт до своего предела
-        let (tx, rx) = channel::<()>();
-        let t0 = Instant::now();
-        n.late(&env, &rx, "Stop");
-        let spent = t0.elapsed();
-        assert!(spent < Duration::from_millis(150), "{spent:?}");
-        assert_eq!(lines(&env).len(), 1);
-        drop(tx);
+    fn late_tail_is_reserve_capped_by_budget() {
+        let ms = Duration::from_millis;
+        let now = Instant::now();
+        let until = now + EXIT_LOG_RESERVE;
+        // бюджета много — хвост, а не бюджет
+        assert_eq!(tail_left(until, now, ms(300)), EXIT_LOG_RESERVE);
+        assert_eq!(
+            tail_left(until, now + ms(4), ms(300)),
+            EXIT_LOG_RESERVE - ms(4)
+        );
+        // хвост вышел — ждать нечего
+        assert_eq!(tail_left(until, until, ms(300)), Duration::ZERO);
+        assert_eq!(tail_left(until, until + ms(50), ms(300)), Duration::ZERO);
+        // бюджета меньше хвоста — бюджет
+        assert_eq!(tail_left(until, now, ms(3)), ms(3));
+        assert_eq!(tail_left(until, now, Duration::ZERO), Duration::ZERO);
     }
 
     /// Ревью 2c36319, M2: замок был занят, поток за время ожидания не закончил, но замок

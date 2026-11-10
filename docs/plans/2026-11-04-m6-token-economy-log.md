@@ -8895,3 +8895,61 @@ C2; Windows-контроль (`win2`), обратный переезд Linux →
   `r10-hooks2.log` (260 с, 5 FAIL, из них `snapshot_queue_written_before_state` — регресс п. 4).
 - `clippy -p zam-cli --all-targets -- -D warnings` и `rustfmt --edition 2024 --check` по своим
   файлам — чисто. Worktree снят, `target/t17b` удалён.
+
+### Задача 17b, мелкие четвёртого ревью (2026-11-10)
+
+Коммит `test(hooks): мелкие четвёртого ревью 3aec37d — подмены сна и пороги разведены на порядок`
+поверх `3aec37d` (sha — в отчёте контроллеру). Файлы: `tests/hooks.rs`, `cmd/hook/snapshot_queue.rs`.
+Поведение продукта не менялось (в `snapshot_queue.rs` — только вынос расчёта хвоста в функцию).
+
+1. **M1. Подмены сна и пороги времени были одного порядка** (сон 2–3 с, пороги 2–2,5 с, нагрузка
+   добавляет хуку 1–1,5 с и больше): задержавшийся процесс хука доживал до пробуждения потока, и
+   тот законно доделывал работу — удалял очередь после удавшегося `PUT` («снимка нет в очереди» в
+   `late_snapshot_thread_after_response_is_not_put_timeout`), дописывал `snapst-*`. Теперь:
+   - общая подмена `STALL_MS` = 30 000 мс (усыплённый поток обрывается выходом процесса — длина
+     сна ничего не стоит) и общий порог `LATE_THREAD_MAX` = 10 с;
+   - `put_outcome_logged_when_snapshot_thread_is_late`,
+     `late_snapshot_thread_after_response_is_not_put_timeout` — `put-stall-ms` 30 с; проверка
+     времени — первой, время хука — в сообщении каждой проверки;
+   - `snapshot_queue_written_before_state` — `write-stall-ms` 30 с, бюджет хука 30 с (свой предел
+     — те же 610 мс), порог 10 с, время — первым;
+   - `snapshot_wait_bounded_by_hook_budget` — `decide-stall-ms` 30 с, свой срок `PUT` 20 с (хук,
+     ждущий поток по своему пределу, шёл бы 20 с и дольше), порог 10 с вместо 1,3 с;
+   - просмотрены остальные тесты снимка с подменами: `snapshot_deadline_never_delays_stop`,
+     `late_catch_up_does_not_delay_start`, `late_post_compact_not_counted`,
+     `snapshot_decision_never_delays_changed_flush` — сон 30 с (пороги у них — `max_for`, 0,4–1,2
+     с, не менялись); `switch_off_never_opens_transcript` — там поток **ждут** (срок снимка 5 с),
+     поэтому сон не 30 с, а 4 с, пороги «подмена сработала» / «журнал не открывался» — 3,9 с
+     вместо 1,9 с (тест стал дольше на 2 с).
+2. **M2.** Расчёт хвоста ожидания вынесен в чистую функцию `tail_left(until, now, budget_left)`;
+   модульный тест `late_tail_is_reserve_capped_by_budget` проверяет её без часов (вместо
+   `late_tail_wait_is_not_whole_budget` с порогом 150 мс).
+
+**Откаты** после разведения порогов (`rollbacks11.py`, журнал `rollbacks-r11.log`): 5, все FAIL
+ожидаемым тестом — тесты по-прежнему ловят свои правки.
+
+| откат | тест |
+|---|---|
+| W5 хвост ожидания — весь остаток бюджета | `late_tail_is_reserve_capped_by_budget` |
+| W6 то же, в хуке | `snapshot_queue_written_before_state` (время хука) |
+| Y1 поток не отмечает конец `PUT` | `late_snapshot_thread_after_response_is_not_put_timeout` («ложная причина… срок PUT 1443 мс») |
+| Y5 хук не пишет строку за поток | `put_outcome_logged_when_snapshot_thread_is_late` (журнал пуст) |
+| V1 ожидание потока не ограничено бюджетом хука | `snapshot_wait_bounded_by_hook_budget` |
+
+**Проверка** (worktree `3aec37d` + правка, отдельный `target/t17b`, `CARGO_PROFILE_DEV_DEBUG=0`;
+загрузка процессора 96–97 % до и после прогона, полный `hooks` — 358 с).
+- Модульные `zam-cli` — 178 PASS; `snapshot` — 32 PASS.
+- `hooks` (`r11-suites.log`): 95 из 102. Все тесты снимка с подменами сна — PASS (в прошлом круге
+  под той же загрузкой три из них падали по порогам). FAIL — тесты с бюджетами в десятки и сотни
+  миллисекунд: `pre_tool_under_50ms` (p95 421 мс), `post_tool_success_under_50ms` (p95 444 мс),
+  `hooks_with_server_within_margin`, `checkpoint_precompact_new_epoch_in_hook_budget` (1,75 с),
+  `holdout_marker_silences_all_hooks`, `session_start_flushes_all_queues_in_one_request`,
+  `snapshot_decision_never_delays_changed_flush` («очередь изменённых не ушла», хук шёл 220 мс,
+  «прошло 209 мс» при бюджете 100 мс). Первые пять правками 17b не затронуты. У
+  `session_start_flushes_all_queues_in_one_request` в журнале хука (теперь он в сообщении теста)
+  нет ни строки пропуска по бюджету, ни ошибки сети — отправки не было по иной причине (замок
+  очереди или пустой список очередей); это материал для расследования нестабильных тестов, не
+  разбиралось. Причина падения `snapshot_decision…` не установлена; тихого окна для сверки не
+  было.
+- `clippy -p zam-cli --all-targets -- -D warnings` и `rustfmt --edition 2024 --check` по своим
+  файлам — чисто. Worktree снят, `target/t17b` удалён.
