@@ -42,8 +42,7 @@ pub(crate) use chunks::{
     backfill_embed_keys, changed_params, chunk_id, chunker_base, chunker_fingerprint,
     chunker_params, context_prefix, enqueue_for_note, entry_chunker_fingerprint, frontmatter_tags,
     mask_tags, note_chunks, param_order, params_from_fingerprint, rechunk_notes, remask_note,
-    replace_chunks,
-    rescan_secrets, same_chunker, stored_prefix_hit, token_counter,
+    replace_chunks, rescan_secrets, same_chunker, stored_prefix_hit, token_counter,
 };
 // импорт пространства (M6 §12б.5): запись узла с исходным id и историей
 pub(crate) use chunks::{index_note, index_state, note_meta, space_kind};
