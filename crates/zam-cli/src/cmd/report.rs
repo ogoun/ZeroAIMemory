@@ -1219,8 +1219,11 @@ fn bare_url_autolink(b: &[u8], i: usize) -> Option<BareUrl> {
     }
     let end = bare_link_end(b, i + 3);
     let tail = String::from_utf8_lossy(&b[i + 3..end]);
-    (tail.chars().next().is_some_and(host_char) && bare_domain_ok(&tail, true))
-        .then_some(BareUrl { start, end, ftp })
+    (tail.chars().next().is_some_and(host_char) && bare_domain_ok(&tail, true)).then_some(BareUrl {
+        start,
+        end,
+        ftp,
+    })
 }
 
 /// Голая автоссылка GFM `www.узел.зона…` (`www_match` comrak 0.56) с позиции `i`: её конец. Схема
