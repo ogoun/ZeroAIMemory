@@ -25,17 +25,23 @@ pub struct CliError {
     pub code: u8,
     pub msg: String,
     pub problem: Option<Value>,
-    /// Сетевая ошибка — истёк срок запроса, ответа сервера нет ([`CliError::is_timeout`]);
-    /// ставит только [`net_error`].
-    pub timeout: bool,
+    /// Сетевая ошибка — истёк срок запроса, ответа сервера нет ([`CliError::is_timeout`]).
+    /// Поле закрыто: признак ставит только [`net_error`], прочие ошибки строятся через
+    /// [`CliError::new`] и [`CliError::with_problem`] — без него.
+    timeout: bool,
 }
 
 impl CliError {
     pub fn new(code: u8, msg: impl Into<String>) -> CliError {
+        CliError::with_problem(code, msg, None)
+    }
+
+    /// Ошибка по ответу сервера: код выхода, текст и тело problem+json (`problem`).
+    pub fn with_problem(code: u8, msg: impl Into<String>, problem: Option<Value>) -> CliError {
         CliError {
             code,
             msg: msg.into(),
-            problem: None,
+            problem,
             timeout: false,
         }
     }
@@ -492,28 +498,32 @@ fn problem(mut resp: Response<Body>) -> CliError {
         }
         _ => v = Some(serde_json::json!({ "status": status })),
     }
-    CliError {
-        code,
-        msg,
-        problem: v,
-        timeout: false,
-    }
+    CliError::with_problem(code, msg, v)
 }
 
 /// Сетевая ошибка запроса к серверу `base` (ответа нет): «сервер … недоступен» с кодом
-/// [`EXIT_UNREACHABLE`]. Срок клиента — по типу ошибки, а не по её тексту: `Timeout` ureq или
-/// ввод-вывод с `TimedOut` (срок сокета) — [`CliError::is_timeout`].
+/// [`EXIT_UNREACHABLE`]. Срок клиента — по типу ошибки, а не по её тексту ([`timed_out`]) —
+/// [`CliError::is_timeout`].
 fn net_error(base: &str, e: ureq::Error) -> CliError {
-    let timeout = match &e {
-        ureq::Error::Timeout(_) => true,
-        ureq::Error::Io(io) => io.kind() == std::io::ErrorKind::TimedOut,
-        _ => false,
-    };
     CliError {
         code: EXIT_UNREACHABLE,
         msg: format!("сервер {base} недоступен: {e}"),
         problem: None,
-        timeout,
+        timeout: timed_out(&e),
+    }
+}
+
+/// Ошибка клиента — истёкший срок: `Timeout` ureq или ввод-вывод сокета с `TimedOut` либо
+/// `WouldBlock`. Срок чтения и записи сокета (`SO_RCVTIMEO`/`SO_SNDTIMEO`) Windows отдаёт как
+/// `TimedOut`, unix — как `WouldBlock` (`EAGAIN`); сокеты клиента блокирующие, поэтому
+/// `WouldBlock` у них бывает только по сроку. ureq сам сводит его к `Timeout`, но не на каждом
+/// пути (ошибка ввода-вывода из чтения тела приходит как `Io`).
+fn timed_out(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
+    match e {
+        ureq::Error::Timeout(_) => true,
+        ureq::Error::Io(io) => matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock),
+        _ => false,
     }
 }
 
@@ -589,6 +599,22 @@ mod tests {
         let e = c.put_json_body("/x", b"{}".to_vec()).unwrap_err();
         assert!(!e.is_timeout(), "{e}");
         assert_eq!(e.code, EXIT_UNREACHABLE);
+    }
+
+    /// Третье ревью 599c933 (17b), M2: срок сокета на unix приходит как `WouldBlock`; отказ и
+    /// обрыв соединения — не срок.
+    #[test]
+    fn socket_timeout_kinds_are_timeouts() {
+        use std::io::{Error, ErrorKind};
+        let io = |k: ErrorKind| ureq::Error::Io(Error::from(k));
+        assert!(timed_out(&io(ErrorKind::TimedOut)));
+        assert!(timed_out(&io(ErrorKind::WouldBlock)));
+        assert!(!timed_out(&io(ErrorKind::ConnectionRefused)));
+        assert!(!timed_out(&io(ErrorKind::ConnectionReset)));
+        assert!(net_error("http://x", io(ErrorKind::WouldBlock)).is_timeout());
+        assert!(!net_error("http://x", io(ErrorKind::ConnectionReset)).is_timeout());
+        assert!(!CliError::new(EXIT_UNREACHABLE, "timeout: global").is_timeout());
+        assert!(!CliError::with_problem(EXIT_CONFLICT, "x", None).is_timeout());
     }
 
     #[test]

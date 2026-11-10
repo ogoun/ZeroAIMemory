@@ -590,17 +590,30 @@ impl SendNote {
     ///
     /// Снимок при этом в очереди, пока поток её не удалил: уйдёт или повторится со следующим
     /// хуком, `PUT` заменяет снимок целиком. Замок занят — поток пишет строку прямо сейчас: хук
-    /// ждёт конца потока не дольше остатка бюджета и пробует замок ещё раз; снова занят (запись
-    /// в `hooks.log` дольше остатка бюджета) — хук выходит без строки: за бюджет он не уходит,
-    /// а строку допишет поток, если успеет до конца процесса. После своей строки хук отдаёт
-    /// потоку остаток бюджета (уже без замка): опоздавший успевает доработать очередь.
+    /// ждёт конца потока и пробует замок ещё раз; снова занят (запись в `hooks.log` дольше
+    /// хвоста) — хук выходит без строки, а строку допишет поток, если успеет до конца процесса.
+    /// После своей строки хук отдаёт потоку остаток хвоста (уже без замка): опоздавший успевает
+    /// доработать очередь. Хвост — всё ожидание внутри `late` — не дольше [`EXIT_LOG_RESERVE`] и
+    /// не дольше остатка бюджета: предел ожидания потока уже вышел ([`wait_snapshot`]), и когда
+    /// он свой, а не по бюджету, хук не досиживает до конца бюджета (так было в `76458e3`:
+    /// `snapshot_queue_written_before_state` — хук шёл весь бюджет вместо своего предела).
     fn late(&self, env: &Env, done: &std::sync::mpsc::Receiver<()>, event: &str) {
+        let until = std::time::Instant::now() + EXIT_LOG_RESERVE;
+        self.late_with(env, event, &mut || {
+            let tail = tail_left(until, std::time::Instant::now(), env.budget_left());
+            done.recv_timeout(tail).is_ok()
+        });
+    }
+
+    /// [`SendNote::late`] с ожиданием конца потока `wait_done` (`true` — поток закончил):
+    /// в работе — сигнал потока не дольше хвоста, в тестах — подмена без времени.
+    fn late_with(&self, env: &Env, event: &str, wait_done: &mut dyn FnMut() -> bool) {
         use std::sync::TryLockError;
         let mut g = match self.stage.try_lock() {
             Ok(g) => g,
             Err(TryLockError::Poisoned(e)) => e.into_inner(),
             Err(TryLockError::WouldBlock) => {
-                if done.recv_timeout(env.budget_left()).is_ok() {
+                if wait_done() {
                     return;
                 }
                 match self.stage.try_lock() {
@@ -633,7 +646,7 @@ impl SendNote {
             env.log(&line);
         }
         drop(g);
-        let _ = done.recv_timeout(env.budget_left());
+        wait_done();
     }
 }
 
@@ -957,12 +970,22 @@ pub fn wait_snapshot(env: &Env, s: &Settings, w: &SnapWait) {
     }
 }
 
+/// Остаток хвоста ожидания внутри [`SendNote::late`] в момент `now`: до `until` (начало `late` +
+/// [`EXIT_LOG_RESERVE`]) и не дольше остатка бюджета хука `budget_left`.
+fn tail_left(
+    until: std::time::Instant,
+    now: std::time::Instant,
+    budget_left: Duration,
+) -> Duration {
+    until.saturating_duration_since(now).min(budget_left)
+}
+
 /// Запас ожидания потока снимка сверх его сроков: решение, журнал сессии, `snapst-*`, очередь.
 const WAIT_SLACK: Duration = Duration::from_millis(50);
 
 /// Хвост бюджета хука, который ожидание потока снимка оставляет хуку на строку итога отправки
 /// ([`SendNote::late`]): запись строки не выводит хук за бюджет, остаток хвоста после неё снова
-/// отдаётся потоку. Когда предел ожидания — бюджет хука, срок `PUT` истекает раньше него на
+/// отдаётся потоку; он же — предел всего ожидания внутри `late`. Когда предел ожидания — бюджет хука, срок `PUT` истекает раньше него на
 /// [`super::HTTP_RESERVE_MS`] − этот запас (20 мс): обычно поток успевает записать итог сам.
 /// Когда предел — свой (запуск потока + сроки + [`WAIT_SLACK`]), срок `PUT` к нему мог и не
 /// выйти — [`SendNote::late`] различает это по времени запроса.
@@ -1190,81 +1213,117 @@ mod tests {
         );
     }
 
-    /// Поток, который держит замок `hold`, затем выполняет `then` (под замком) и отпускает;
-    /// возвращается, когда замок уже взят.
+    /// Поток, который держит замок до сигнала `release`, затем выполняет `then` (под замком)
+    /// и отпускает; возвращается, когда замок уже взят.
     fn hold_lock(
         n: &std::sync::Arc<SendNote>,
-        hold: Duration,
         then: impl FnOnce(&mut Stage) + Send + 'static,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
         let (held_tx, held_rx) = channel();
+        let (release_tx, release_rx) = channel::<()>();
         let n2 = n.clone();
         let h = std::thread::spawn(move || {
             let mut g = n2.lock();
             held_tx.send(()).unwrap();
-            std::thread::sleep(hold);
+            let _ = release_rx.recv();
             then(&mut g);
         });
         held_rx.recv().unwrap();
-        h
+        (release_tx, h)
     }
 
-    /// Замок занят потоком, пишущим строку: `late` возвращается только после её записи (ждёт
-    /// сигнал конца потока) и своей строки не добавляет.
+    /// Замок занят потоком, пишущим строку: `late` ждёт конца потока и, дождавшись, своей строки
+    /// не добавляет и замок больше не трогает. Ожидание подменено: поток дописывает строку
+    /// ровно в нём.
     #[test]
     fn late_returns_after_writer_holding_lock_finished() {
-        // старт «в будущем»: остаток бюджета не тает, пока тест под нагрузкой доходит до `late`
-        let mut env = fresh("busy");
-        env.started = Instant::now() + Duration::from_secs(60);
+        let env = fresh("busy");
         let n = std::sync::Arc::new(SendNote::default());
-        let (tx, rx) = channel();
+        n.sending("снимок stop", Duration::from_millis(100), ago(500));
         let env2 = env.clone();
-        let h = hold_lock(&n, Duration::from_millis(30), move |g| {
+        let (release, h) = hold_lock(&n, move |g| {
             env2.log("снимок stop, отправлен");
             *g = Stage::Logged;
-            tx.send(()).unwrap();
         });
-        n.late(&env, &rx, "Stop");
-        // строка потока уже в журнале в момент возврата `late` (до `join`)
+        let mut holder = Some((release, h));
+        let mut waits = 0;
+        n.late_with(&env, "Stop", &mut || {
+            waits += 1;
+            let (release, h) = holder.take().expect("ожидание — одно");
+            release.send(()).unwrap();
+            h.join().unwrap();
+            true
+        });
+        assert_eq!(waits, 1);
         assert_eq!(lines(&env), ["снимок stop, отправлен"]);
-        h.join().unwrap();
     }
 
-    /// Ревью 2c36319, M2: замок был занят, сигнала конца потока за остаток бюджета нет — `late`
-    /// пробует замок ещё раз и пишет строку по этапу.
+    /// Третье ревью 599c933: ожидание внутри `late` — хвост [`EXIT_LOG_RESERVE`], а не весь
+    /// остаток бюджета: хук, вышедший по своему пределу, не досиживает до конца бюджета.
+    /// Четвёртое ревью 3aec37d, M2: расчёт хвоста проверяется без часов.
+    #[test]
+    fn late_tail_is_reserve_capped_by_budget() {
+        let ms = Duration::from_millis;
+        let now = Instant::now();
+        let until = now + EXIT_LOG_RESERVE;
+        // бюджета много — хвост, а не бюджет
+        assert_eq!(tail_left(until, now, ms(300)), EXIT_LOG_RESERVE);
+        assert_eq!(
+            tail_left(until, now + ms(4), ms(300)),
+            EXIT_LOG_RESERVE - ms(4)
+        );
+        // хвост вышел — ждать нечего
+        assert_eq!(tail_left(until, until, ms(300)), Duration::ZERO);
+        assert_eq!(tail_left(until, until + ms(50), ms(300)), Duration::ZERO);
+        // бюджета меньше хвоста — бюджет
+        assert_eq!(tail_left(until, now, ms(3)), ms(3));
+        assert_eq!(tail_left(until, now, Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Ревью 2c36319, M2: замок был занят, поток за время ожидания не закончил, но замок
+    /// отпустил — `late` пробует замок ещё раз и пишет строку по этапу. Ожидание подменено:
+    /// замок отпускается ровно между двумя попытками, без расчёта на время.
     #[test]
     fn late_retries_lock_after_failed_wait() {
         let env = fresh("retry");
         let n = std::sync::Arc::new(SendNote::default());
         n.sending("снимок stop", Duration::from_millis(100), ago(500));
-        // сигнала не будет, но канал жив: ожидание идёт весь остаток бюджета
-        let (tx, rx) = channel::<()>();
-        let h = hold_lock(&n, Duration::from_millis(30), |_| {});
-        n.late(&env, &rx, "Stop");
-        assert!(env.budget_left().is_zero(), "ожидание — до конца бюджета");
+        let (release, h) = hold_lock(&n, |_| {});
+        let mut holder = Some((release, h));
+        let mut waits = 0;
+        n.late_with(&env, "Stop", &mut || {
+            waits += 1;
+            if let Some((release, h)) = holder.take() {
+                release.send(()).unwrap();
+                h.join().unwrap();
+            }
+            false
+        });
+        // ожидание до повтора замка и ещё одно — после строки хука (остаток бюджета потоку)
+        assert_eq!(waits, 2);
         assert_eq!(
             lines(&env),
             ["снимок stop: срок PUT 100 мс, итог отправки не записан до выхода хука"]
         );
-        h.join().unwrap();
-        drop(tx);
     }
 
     /// Ревью 2c36319, M2: замок занят и после ожидания (запись в `hooks.log` дольше остатка
-    /// бюджета) — `late` выходит без строки и не ждёт замок.
+    /// бюджета) — `late` выходит без строки, замок не ждёт и второй раз потока не ждёт.
     #[test]
     fn late_gives_up_when_lock_stays_busy() {
-        let env = env_at("stuck", Duration::from_secs(5));
+        let env = fresh("stuck");
         let n = std::sync::Arc::new(SendNote::default());
         n.sending("снимок stop", Duration::from_millis(100), ago(500));
-        let (tx, rx) = channel::<()>();
-        let h = hold_lock(&n, Duration::from_millis(300), |_| {});
-        let t0 = Instant::now();
-        n.late(&env, &rx, "Stop");
-        let spent = t0.elapsed();
-        assert!(spent < Duration::from_millis(250), "{spent:?}");
+        let (release, h) = hold_lock(&n, |_| {});
+        let mut waits = 0;
+        n.late_with(&env, "Stop", &mut || {
+            waits += 1;
+            false
+        });
+        assert_eq!(waits, 1);
         assert!(lines(&env).is_empty(), "{:?}", lines(&env));
+        // замок отпущен только после возврата `late`
+        release.send(()).unwrap();
         h.join().unwrap();
-        drop(tx);
     }
 }

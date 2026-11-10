@@ -190,12 +190,7 @@ fn explain_duplicate(e: CliError) -> CliError {
          заменить его новой записью: повторите с --supersedes <id>\n  \
          записать всё равно: повторите с --force",
     );
-    CliError {
-        code: EXIT_CONFLICT,
-        msg,
-        timeout: false,
-        problem: e.problem,
-    }
+    CliError::with_problem(EXIT_CONFLICT, msg, e.problem)
 }
 
 /// Печать созданной записи: `<id>@<rev>` или JSON `{entry, created}`.
@@ -329,12 +324,11 @@ fn explain_stale(e: CliError, sent: i64) -> CliError {
     else {
         return e;
     };
-    CliError {
-        code: EXIT_CONFLICT,
-        msg: format!("запись изменилась (rev {sent} → {cur}): перечитайте"),
-        timeout: false,
-        problem: e.problem,
-    }
+    CliError::with_problem(
+        EXIT_CONFLICT,
+        format!("запись изменилась (rev {sent} → {cur}): перечитайте"),
+        e.problem,
+    )
 }
 
 /// `PATCH /entries/{id}` с `If-Match: <rev>` (§11.3).
@@ -619,38 +613,35 @@ mod tests {
 
     #[test]
     fn stale_revision_explained() {
-        let e = CliError {
-            code: EXIT_CONFLICT,
-            msg: "x".into(),
-            timeout: false,
-            problem: Some(json!({"type": "/problems/conflict", "status": 409, "rev": 5})),
-        };
+        let e = CliError::with_problem(
+            EXIT_CONFLICT,
+            "x",
+            Some(json!({"type": "/problems/conflict", "status": 409, "rev": 5})),
+        );
         let s = explain_stale(e, 3);
         assert_eq!(s.code, EXIT_CONFLICT);
         assert_eq!(s.msg, "запись изменилась (rev 3 → 5): перечитайте");
         // 409 без rev (например, содержимое superseded) — как есть
-        let other = CliError {
-            code: EXIT_CONFLICT,
-            msg: "y".into(),
-            timeout: false,
-            problem: Some(json!({"type": "/problems/conflict", "status": 409})),
-        };
+        let other = CliError::with_problem(
+            EXIT_CONFLICT,
+            "y",
+            Some(json!({"type": "/problems/conflict", "status": 409})),
+        );
         let o = explain_stale(other, 3);
         assert_eq!((o.code, o.msg.as_str()), (EXIT_CONFLICT, "y"));
     }
 
     #[test]
     fn duplicate_problem_explained() {
-        let e = CliError {
-            code: crate::client::EXIT_CONFLICT,
-            msg: "x".into(),
-            timeout: false,
-            problem: Some(json!({
+        let e = CliError::with_problem(
+            crate::client::EXIT_CONFLICT,
+            "x",
+            Some(json!({
                 "type": "/problems/possible-duplicate",
                 "dedup": "full",
                 "candidates": [{"id": "01A", "status": "active", "title": "LF", "reason": "vector", "score": 0.93}]
             })),
-        };
+        );
         let m = explain_duplicate(e).msg;
         assert!(m.contains("01A [active] «LF» — vector 0.93"), "{m}");
         assert!(m.contains("--supersedes") && m.contains("--force") && m.contains("append"));

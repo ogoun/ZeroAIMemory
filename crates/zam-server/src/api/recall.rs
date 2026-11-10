@@ -2038,7 +2038,8 @@ async fn digest(
         req,
         headers,
         targets,
-        &insight_spaces,
+        // задачи снимка — только решения запроса: личное Knowledge общее для всех решений
+        &sol.into_iter().collect::<Vec<_>>(),
         session.as_deref(),
         recovery,
         user,
@@ -2287,6 +2288,7 @@ async fn snapshot_part(
             .map(|(i, v)| (targets[i].db.clone(), v))
             .collect(),
         recovery,
+        show_ended: super::snapshot::SHOW_ENDED,
         now: zam_store::time::now(),
         cfg: &st.cfg.recall,
     };

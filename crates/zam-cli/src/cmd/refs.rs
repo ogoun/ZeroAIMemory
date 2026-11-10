@@ -955,11 +955,12 @@ mod tests {
     /// оно), повтор — без `symbols`.
     #[test]
     fn old_server_symbols_rejection_detected_and_stripped() {
-        let e = |status: u16, detail: &str| CliError {
-            code: 2,
-            msg: format!("{detail} (HTTP {status})"),
-            timeout: false,
-            problem: Some(json!({"status": status, "detail": detail})),
+        let e = |status: u16, detail: &str| {
+            CliError::with_problem(
+                2,
+                format!("{detail} (HTTP {status})"),
+                Some(json!({"status": status, "detail": detail})),
+            )
         };
         assert!(unknown_symbols_field(&e(
             422,

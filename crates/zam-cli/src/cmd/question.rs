@@ -179,12 +179,7 @@ fn explain_duplicate(e: CliError) -> CliError {
         msg.push('\n');
     }
     msg.push_str("что дальше: используйте ответ или повторите с --force");
-    CliError {
-        code: EXIT_CONFLICT,
-        msg,
-        timeout: false,
-        problem: e.problem,
-    }
+    CliError::with_problem(EXIT_CONFLICT, msg, e.problem)
 }
 
 /// `zam question ask`.
@@ -258,12 +253,11 @@ fn explain_answered(e: CliError) -> CliError {
         return e;
     };
     let d = p["decision_id"].as_str().unwrap_or("?");
-    CliError {
-        code: EXIT_CONFLICT,
-        msg: format!("вопрос уже отвечен (решение i:{d})"),
-        timeout: false,
-        problem: e.problem,
-    }
+    CliError::with_problem(
+        EXIT_CONFLICT,
+        format!("вопрос уже отвечен (решение i:{d})"),
+        e.problem,
+    )
 }
 
 /// `by` до подключения к серверу: без `--by` у агента команда не отправляется.
@@ -398,16 +392,15 @@ mod tests {
 
     #[test]
     fn errors_explained() {
-        let dup = CliError {
-            code: 4,
-            msg: "x".into(),
-            timeout: false,
-            problem: Some(json!({
+        let dup = CliError::with_problem(
+            4,
+            "x",
+            Some(json!({
                 "type": "/problems/possible-duplicate",
                 "candidates": [{"id": "01A", "status": "answered", "title": "Брать?",
                                 "answer": {"text": "Да", "decision_id": "01D"}}],
             })),
-        };
+        );
         let r = explain_duplicate(dup);
         assert_eq!(r.code, EXIT_CONFLICT);
         assert!(
@@ -416,12 +409,11 @@ mod tests {
             "{}",
             r.msg
         );
-        let ans = CliError {
-            code: 4,
-            msg: "x".into(),
-            timeout: false,
-            problem: Some(json!({"type": "/problems/already-answered", "decision_id": "01D"})),
-        };
+        let ans = CliError::with_problem(
+            4,
+            "x",
+            Some(json!({"type": "/problems/already-answered", "decision_id": "01D"})),
+        );
         assert_eq!(
             explain_answered(ans).msg,
             "вопрос уже отвечен (решение i:01D)"

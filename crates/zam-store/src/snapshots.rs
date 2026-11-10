@@ -139,6 +139,7 @@ pub async fn digest_snapshot(
     solution: &str,
     except: Option<&str>,
     since: Timestamp,
+    show_ended: bool,
 ) -> Result<Option<SnapshotRow>, StoreError> {
     let (solution, except, since) = (
         solution.to_string(),
@@ -151,8 +152,9 @@ pub async fn digest_snapshot(
                     p.bytes, p.data
              FROM session_snapshots p JOIN sessions s ON s.id = p.session_id
              WHERE s.solution_guid = ?1 AND p.session_id <> ?2 AND p.taken_at >= ?3
+               AND (?4 OR s.ended_at IS NULL)
              ORDER BY p.taken_at DESC, p.session_id DESC LIMIT 1",
-            params![solution, except, since],
+            params![solution, except, since, show_ended],
             snapshot_row,
         )
         .optional()?)
