@@ -100,16 +100,15 @@ fn explain_claimed(e: CliError) -> CliError {
     else {
         return e;
     };
-    CliError {
-        code: EXIT_CONFLICT,
-        msg: format!(
+    CliError::with_problem(
+        EXIT_CONFLICT,
+        format!(
             "задача уже захвачена сессией {} до {}",
             c["session"].as_str().unwrap_or("?"),
             agent_time(c["until"].as_str().unwrap_or("?"))
         ),
-        timeout: false,
-        problem: e.problem,
-    }
+        e.problem,
+    )
 }
 
 /// `zam task list`.
@@ -218,12 +217,11 @@ pub fn status(
         )
         .map_err(|e| {
             if e.problem.as_ref().is_some_and(|p| p["status"] == 409) {
-                CliError {
-                    code: EXIT_CONFLICT,
-                    msg: format!("запись изменилась (rev {rev}): перечитайте и повторите"),
-                    timeout: false,
-                    problem: e.problem,
-                }
+                CliError::with_problem(
+                    EXIT_CONFLICT,
+                    format!("запись изменилась (rev {rev}): перечитайте и повторите"),
+                    e.problem,
+                )
             } else {
                 e
             }

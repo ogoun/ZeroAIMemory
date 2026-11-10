@@ -6077,15 +6077,25 @@ fn snapshot_queue_written_before_state() {
     write_lines(&t, &[cl_user(s, "запрос")]);
     std::fs::write(format!("{}.write-stall-ms", t.display()), "3000").unwrap();
     let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
-    let o = p
-        .cmd(&url)
-        .env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
+    // прогрев: первый запуск процесса после сборки не меряется
+    let warm = snap_ev(&p, "Stop", "wo-warm", &t, json!({"stop_hook_active": true}));
+    let _ = p.hook_at(&url, "checkpoint", "claude", warm.to_string().as_bytes());
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_HOOK_BUDGET_MS", "3000")
         .env("ZAM_TEST_SNAPSHOT_MS", "500")
         .args(["hook", "checkpoint", "--agent", "claude"])
-        .write_stdin(pc.to_string().into_bytes())
-        .output()
-        .unwrap();
+        .write_stdin(pc.to_string().into_bytes());
+    let t0 = Instant::now();
+    let o = c.output().unwrap();
+    let d = t0.elapsed();
     empty(&o);
+    // третье ревью 599c933: хук выходит по своему пределу (срок снимка 500 мс + срок `PUT` 60 мс
+    // + запас 50 мс от запуска потока), а не досиживает бюджет 3 с вслед за потоком
+    assert!(
+        d <= Duration::from_millis(2000),
+        "хук ждал поток до конца бюджета: {d:?}: {}",
+        p.log()
+    );
     assert!(
         snap_file(&p, "snapq", s).is_some(),
         "снимка нет в очереди: {}",

@@ -280,15 +280,14 @@ fn explain_decided(e: CliError) -> CliError {
     else {
         return e;
     };
-    CliError {
-        code: EXIT_CONFLICT,
-        msg: format!(
+    CliError::with_problem(
+        EXIT_CONFLICT,
+        format!(
             "идея уже начата → задача k:{}",
             p["task_id"].as_str().unwrap_or("?")
         ),
-        timeout: false,
-        problem: e.problem,
-    }
+        e.problem,
+    )
 }
 
 /// Тело решения по параметрам команды (формат `--until` проверяется до запроса).
@@ -456,12 +455,11 @@ mod tests {
         );
 
         // already-decided → код 4 с задачей
-        let e = CliError {
-            code: 4,
-            msg: "x".into(),
-            timeout: false,
-            problem: Some(json!({"type": "/problems/already-decided", "task_id": "01T"})),
-        };
+        let e = CliError::with_problem(
+            4,
+            "x",
+            Some(json!({"type": "/problems/already-decided", "task_id": "01T"})),
+        );
         let r = explain_decided(e);
         assert_eq!(
             (r.code, r.msg.as_str()),

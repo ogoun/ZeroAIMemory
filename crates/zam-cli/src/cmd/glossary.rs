@@ -79,12 +79,11 @@ pub fn run(ctx: &Ctx, term: Option<&str>, solution: Option<&str>) -> Result<(), 
         Some(name) => {
             let r = ctx.client.get(&path, &[("term", name)]).map_err(|e| {
                 if e.code == EXIT_NOT_FOUND {
-                    CliError {
-                        code: EXIT_NOT_FOUND,
-                        msg: format!("термин «{name}» не найден среди имён и псевдонимов"),
-                        timeout: false,
-                        problem: e.problem,
-                    }
+                    CliError::with_problem(
+                        EXIT_NOT_FOUND,
+                        format!("термин «{name}» не найден среди имён и псевдонимов"),
+                        e.problem,
+                    )
                 } else {
                     e
                 }
