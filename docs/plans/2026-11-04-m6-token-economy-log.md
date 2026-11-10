@@ -10614,3 +10614,157 @@ W мс)` — общее время первым числом, разбор `xtas
   в разделе «Задача 17b-http…» выше, пункт «→ 13a/13c»; к списку подмен добавить
   `ZAM_TEST_GC_STALL_MS`.
 - **→ M7.** Без изменений (уборка кэша `session-start` без предела — там же, п. 4).
+
+## Задача 15c (исполнитель). Упаковка: `LICENSES/` в архиве клиента, упаковка без сети (2026-11-10)
+
+Worktree `.tmp/m6/wt-b`, ветка `m6-portability` (база `05f41fc`). Коммит: `build(package): лицензии
+в архиве клиента, офлайн-упаковка`. Спецификация §16 п. 13, ответы владельца по M5.6, п. 13–14
+(журнал M5.6, «Ответы владельца (2026-11-04)»), приёмка §17 п. 18 («`zam-*.zip` содержит
+`LICENSES/`», «упаковка без сети проходит»).
+
+### Что сделано
+
+**Архив клиента (п. 13).** В `zam-<версия>-<платформа>.(zip|tar.gz)` добавлен
+`LICENSES/THIRD-PARTY-RUST.html` — сводка cargo-about по зависимостям одного `zam`
+(`cargo about generate --manifest-path crates/zam-cli/Cargo.toml`). Состав архива теперь: `zam[.exe]`,
+`LICENSE.txt` (лицензия проекта, как раньше), `LICENSES/THIRD-PARTY-RUST.html`. Запись добавляет
+`package::cli_entries` — общий код обеих платформ, поэтому linux-x64 получает тот же каталог.
+Сводка клиента и сводка комплекта сервера — разные файлы: `generate_licenses` теперь пишет в
+`target/licenses/server/` (как раньше: весь workspace, WebUI) и в `target/licenses/cli/` (только
+`zam`), возвращает оба пути (`GeneratedLicenses`). Каталог `deploy/licenses/` в архив клиента не
+копируется: он про компоненты комплекта сервера (Qdrant, ONNX Runtime, pdfium, MSVC).
+
+**Упаковка без сети (п. 14).** Тексты — `deploy/licenses/tree-sitter-typescript.LICENSE` и
+`deploy/licenses/tree-sitter-java.LICENSE`; в `about.toml` `[[…clarify.git]]` заменён на
+`[[…clarify.files]]` с теми же SHA-256.
+
+- Откуда тексты: `https://raw.githubusercontent.com/tree-sitter/tree-sitter-typescript/f975a621f4e7f532fe322e13c4f79495e0a7b2e7/LICENSE`
+  и `…/tree-sitter-java/94703d5a6bed02b98e438d7cad1136c01a60ba2c/LICENSE` — коммиты из
+  `.cargo_vcs_info.json` пакетов 0.23.2 и 0.23.5 (те же, что брал `clarify.git`). SHA-256 скачанных
+  файлов: `49bf33cf…6559` (TS, 1080 байт, «2017 Max Brunsfeld») и `52ed137b…69a7` (Java, 1069 байт,
+  «2017 Ayman Nadeem») — совпали с контрольными суммами `about.toml` до правки. Перевод строк —
+  LF (`.gitattributes`: `* text=auto eol=lf`), иначе хэш не сошёлся бы.
+
+### Решения исполнителя
+
+1. **Путь `clarify.files` cargo-about считает от каталога крейта, а не от репозитория**
+   (`cargo-about` 0.9.2, `src/licenses.rs`, `apply_clarification`: `krate.manifest_path.parent()
+   .join(path)`; абсолютный путь при этом берётся как есть). Записать в `about.toml`
+   `deploy/licenses/…` и запустить cargo-about напрямую нельзя — он искал бы файл в реестре cargo.
+   Поэтому `cargo xtask package` передаёт cargo-about (`--config`) копию настроек
+   `target/licenses/about.toml`, в которой путь, существующий от корня репозитория, заменён
+   абсолютным (`package::resolve_about_config`); путь, которого от корня нет, остаётся
+   относительным к крейту — обычный смысл cargo-about сохранён. В самом `about.toml` — путь от
+   корня репозитория и комментарий об этом. Прямой `cargo about generate` в корне такие пути не
+   найдёт (см. п. 2 — и не упадёт).
+2. **cargo-about 0.9.2 на несработавший `clarify` не падает.** Проверено: прежний `about.toml`
+   (`clarify.git`) при недоступной сети — код 0, в stderr `WARN failed to validate all files
+   specified in clarification…: Connection refused`, в сводке вместо «2017 Max Brunsfeld» и «2017
+   Ayman Nadeem» — шаблон MIT без авторских прав. То есть запись журнала M5.6 «офлайн-упаковка
+   упадёт на шаге лицензий» для этой версии не подтверждается: упаковка прошла бы с неверным
+   текстом. Защита в xtask, два слоя: (а) `resolve_about_config` сам сверяет SHA-256 файла с
+   `checksum` и отвергает `clarify.git` (сеть при упаковке) — ошибка с именем крейта, файла и
+   обоими хэшами; (б) `cargo_about` считает строку `failed to validate all files specified in
+   clarification` в stderr ошибкой упаковки (`clarify_failures`) — ловит и то, что слой (а) не
+   видит (путь относительно крейта, `start`/`end`).
+3. **В `LICENSES/` архива клиента — один файл.** Ответ владельца: «сводка cargo-about для zam».
+   `TREE-SITTER-QUERIES-MIT.txt` (уведомления исходных `tags.scm`) в архив клиента не положен: те же
+   тексты MIT с теми же строками авторских прав уже есть в сводке (крейты грамматик). См. вопрос 1.
+4. **Цели сводки — как у комплекта сервера** (`about.toml` `targets`: msvc, linux-gnu, linux-musl):
+   сводка клиента одинакова в архивах обеих платформ и покрывает объединение зависимостей `zam` по
+   трём целям. Отдельная сводка на платформу не делалась.
+5. Поле `Inputs::cli_rust_licenses` — путь одного файла, а не каталог: в архив клиента не попадёт
+   ничего, кроме названного; отсутствие файла — ошибка упаковки (`check_sources`) с именем
+   `LICENSES/THIRD-PARTY-RUST.html`.
+
+### Побочное изменение
+
+`deploy/licenses/` целиком копируется в `LICENSES/` комплекта сервера, поэтому в
+`zam-server-*` появились `LICENSES/tree-sitter-typescript.LICENSE` и
+`LICENSES/tree-sitter-java.LICENSE` (2 файла, 2149 байт; те же тексты есть в
+`THIRD-PARTY-RUST.html`). Место файлов задано ответом владельца; исключать их из комплекта не
+стал. Smoke комплекта проверяет наличие отдельных файлов `LICENSES/`, а не полный список —
+правок не требует. Состав архива клиента в CI отдельным шагом не проверяется (`package.yml`,
+`release.yml` — только число архивов); его держат тесты `xtask` (CI `ci.yml`, `cargo test`).
+
+### TDD, откаты
+
+- **Красный** (тесты и поле `Inputs` без реализации, `logs: .tmp/t15c/red-step1.log`):
+  `client_zip_has_licenses` — FAIL (`left: [LICENSE.txt, zam.exe]`, справа — с
+  `LICENSES/THIRD-PARTY-RUST.html`); с ним три теста раскладки, где уточнён состав архива клиента.
+- **Зелёный**: `cargo test -p xtask package::` — 19 из 19.
+- **Откат 1** (из `cli_entries` убрана запись `LICENSES/…`; `about.toml` возвращён к `clarify.git`):
+  5 FAIL — `client_zip_has_licenses`, три теста раскладки и
+  `about_config_clarifies_from_deploy_licenses_offline` («clarify.git скачивает файл из сети…»).
+- **Откат 2** (в `deploy/licenses/tree-sitter-java.LICENSE` изменена строка авторских прав):
+  `about_config_clarifies_from_deploy_licenses_offline` — FAIL («SHA-256 файла … — c7da3989…, в
+  clarify.files — 52ed137b…»); `cargo xtask package` на том же дереве — код 1 с той же ошибкой,
+  архивы не собраны.
+
+Новые тесты (`xtask/src/package.rs`): `client_zip_has_licenses` (zip и tar.gz: состав, содержимое
+сводки клиента ≠ сводке сервера, нет сводки — ошибка), `about_config_clarifies_from_deploy_licenses_offline`
+(настоящий `about.toml`: нет `clarify.git`, оба файла в `deploy/licenses/`, SHA-256, абсолютный
+путь, прочие настройки без изменений), `about_config_rejects_git_and_wrong_checksum`,
+`clarify_failures_are_detected_in_cargo_about_output`.
+
+### Проверка
+
+Свой `target/t15c` (после работы удалён), `-j 2`, cargo-about 0.9.2.
+
+- `cargo fmt --all --check` — чисто; `cargo clippy -p xtask --all-targets -- -D warnings` — чисто.
+- `cargo test -p xtask` — 218 + 3 + 5, все PASS.
+- **Упаковка без сети:** `cargo xtask package --platform windows-x64 --flavor cpu --version
+  0.0.11-m6-dev --server-bin … --cli-bin …` — код 0, дважды. Способ: в окружении процесса
+  `CARGO_NET_OFFLINE=true`, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY=http://127.0.0.1:9` (порт
+  закрыт), `npm_config_offline=true`. Контроль, что окружение действительно отрезает сеть
+  cargo-about: с прежним `about.toml` (`clarify.git`) в том же окружении cargo-about пишет
+  `failed to send request: io: Connection refused` по обоим крейтам. Условия упаковки без сети —
+  прежние и к задаче не относятся: реестр cargo уже скачан, `cargo-about` установлен,
+  `license-checker-rseidelsohn@5.0.1` есть в кэше npm, `web/dist` и `web/node_modules` собраны,
+  `target/deps` и `tokenizer.json` получены.
+- **Состав архива клиента** (`zam-0.0.11-m6-dev-windows-x64.zip`, 4,6 МБ): `zam.exe`,
+  `LICENSE.txt`, `LICENSES/THIRD-PARTY-RUST.html` (249 003 байта) — три файла. В сводке клиента
+  119 крейтов, в сводке комплекта сервера — 426 (662 379 байт). Список 119 совпал один в один с
+  объединением `cargo tree -p zam-cli -e normal --prefix none --target <цель>` по трём целям
+  `about.toml` (119, расхождений нет): рантайм `tree-sitter` 0.27.1, семь грамматик,
+  `tree-sitter-language`, свои `zam-cli`, `zam-code`, `zam-core`, `zam-secrets`; `zam-server`,
+  `xtask` и их зависимостей нет. В обеих сводках — «2017 Max Brunsfeld» и «2017 Ayman Nadeem»;
+  локальных путей сборки в сводках нет. Шаблон «Copyright (c) <year> <copyright holders>» в сводке
+  клиента — одна запись, у собственных крейтов workspace (как отмечено в журнале M5.6).
+- Бинарники для упаковки — копии готовых `target/release/zam-server.exe` и `zam.exe` основного
+  каталога (сборка release не запускалась: проверялись лицензии и состав, а не бинарники);
+  нативные библиотеки и `tokenizer.json` — копии из основного каталога, после работы удалены.
+- **Не запускалось:** упаковка linux-x64 (нет зависимостей Linux на этой машине; состав tar.gz
+  клиента проверен модульным тестом), `--flavor gpu`, `cargo xtask smoke` собранного комплекта,
+  CI. Прямого наблюдения за сетью (перехват пакетов) не было — довод строится на недостижимом
+  прокси, `CARGO_NET_OFFLINE`, `npm_config_offline` и контрольном прогоне.
+
+### Передать
+
+- **→ 13a/13c (CHANGELOG, инструкции, ТЗ).** Устаревают:
+  - `README.md`, раздел лицензий (строки ~747–751): «у TypeScript и Java — из репозитория на коммите
+    пакета», «Архив только CLI … уведомлений сторонних лицензий пока не содержит — вопрос
+    владельцу» → в архиве клиента `LICENSES/THIRD-PARTY-RUST.html`; тексты TS/Java —
+    `deploy/licenses/*.LICENSE`.
+  - `deploy/README-install.md`, «Известные ограничения» (строки ~1016–1018): «Архив только CLI … не
+    содержит уведомлений…», «Упаковка … требует сети на шаге лицензий» — оба снять.
+  - ТЗ §16.3 (строка ~1706): «`clarify` с `git`-файлом … требует сети … вопрос владельцу» →
+    `clarify.files`, тексты в `deploy/licenses/`, `resolve_about_config`, упаковка без сети; состав
+    архива клиента — с `LICENSES/`; в `LICENSES/` комплекта сервера два новых файла.
+  - CHANGELOG `[Unreleased]`: Added — `LICENSES/` в архиве клиента; Changed — упаковка без сети,
+    `target/licenses/{server,cli}/`, ошибка упаковки при несошедшемся `clarify`.
+- **→ M7.** (1) Сводка клиента по целям платформы архива (`cargo about --target`), если владелец
+  захочет точный список на платформу — сейчас объединение трёх целей. (2) Сводка комплекта сервера
+  строится по всему workspace и включает зависимости `xtask` (426 крейтов) — было и раньше; сузить
+  до `zam-server` + `zam` можно тем же приёмом (`--manifest-path`). (3) Шаблон MIT без авторских
+  прав у собственных крейтов workspace, `brotli-decompressor` и `tonic-prost` (журнал M5.6) — без
+  изменений.
+
+### Вопросы
+
+1. Положить ли в `LICENSES/` архива клиента ещё и `TREE-SITTER-QUERIES-MIT.txt` (файл написан
+   именно про запросы тегов «в составе клиента zam»)? Сейчас его там нет — ответ владельца назвал
+   только сводку cargo-about, а тексты и авторы в сводке те же. Правка — одна запись в
+   `cli_entries`.
+2. Оставлять ли `tree-sitter-*.LICENSE` в `LICENSES/` комплекта сервера (попали туда как часть
+   `deploy/licenses/`) или исключить как повтор сводки?

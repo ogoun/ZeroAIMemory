@@ -23,17 +23,24 @@ targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-unknown
 
 # M5.6: в опубликованных пакетах tree-sitter-typescript 0.23.2 и tree-sitter-java 0.23.5 нет
 # файла LICENSE — без уточнения cargo-about подставил бы шаблон MIT без строки авторских прав.
-# Текст берётся из репозитория на коммите пакета (.cargo_vcs_info.json), сверка — по SHA-256.
+# M6 (задача 15c, решение владельца 2026-11-04): тексты лежат в `deploy/licenses/` — это файл
+# LICENSE репозитория на коммите пакета (`.cargo_vcs_info.json`), сверка по SHA-256 — и
+# упаковка идёт без сети (раньше `clarify.git` скачивал их с GitHub при каждой упаковке).
+#
+# cargo-about ищет `clarify.files` в каталоге самого крейта (в реестре cargo), поэтому
+# `cargo xtask package` передаёт ему копию этого файла, где путь, существующий от корня
+# репозитория, заменён абсолютным (`package::resolve_about_config`). Прямой запуск
+# `cargo about generate` с этим файлом такие пути не найдёт.
 [tree-sitter-typescript.clarify]
 license = "MIT"
 
-[[tree-sitter-typescript.clarify.git]]
-path = "LICENSE"
+[[tree-sitter-typescript.clarify.files]]
+path = "deploy/licenses/tree-sitter-typescript.LICENSE"
 checksum = "49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559"
 
 [tree-sitter-java.clarify]
 license = "MIT"
 
-[[tree-sitter-java.clarify.git]]
-path = "LICENSE"
+[[tree-sitter-java.clarify.files]]
+path = "deploy/licenses/tree-sitter-java.LICENSE"
 checksum = "52ed137b039cd9c46409bc22e89938af911c95b157feae2d040b51e6084369a7"

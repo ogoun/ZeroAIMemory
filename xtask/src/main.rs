@@ -411,8 +411,7 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
                 package::other_platform(&platform)
             );
         }
-        let licenses = target.join("licenses");
-        package::generate_licenses(&root, &licenses)?;
+        let licenses = package::generate_licenses(&root, &target.join("licenses"))?;
         let crt = if platform.starts_with("windows") {
             Some(package::find_crt_dir(a.flavor)?)
         } else {
@@ -430,7 +429,8 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
             other_cli_bin: a.cli_other.as_deref(),
             deps_dir: &deps,
             deploy_dir: &deploy,
-            generated_licenses_dir: &licenses,
+            generated_licenses_dir: &licenses.server_dir,
+            cli_rust_licenses: &licenses.cli_rust,
             project_license: &license,
             crt_dir: crt.as_deref(),
             qdrant_version: &qv,

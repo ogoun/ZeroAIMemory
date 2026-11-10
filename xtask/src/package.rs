@@ -71,6 +71,9 @@ pub struct Inputs<'a> {
     pub deploy_dir: &'a Path,
     /// Сгенерированные сторонние лицензии (THIRD-PARTY-*).
     pub generated_licenses_dir: &'a Path,
+    /// Сводка cargo-about зависимостей одного `zam` ([`RUST_LICENSES`]) — в `LICENSES/` архива
+    /// клиента (сводка комплекта сервера покрывает весь workspace).
+    pub cli_rust_licenses: &'a Path,
     /// Лицензия проекта.
     pub project_license: &'a Path,
     /// Каталог `Microsoft.VC*.CRT` с файлами [`crt_files`] (только Windows).
@@ -160,6 +163,9 @@ pub fn pdfium_file(platform: &str) -> &'static str {
 
 /// Лицензии pdfium в `LICENSES/` комплекта (из `deploy/licenses/`).
 pub const PDFIUM_LICENSES: [&str; 2] = ["PDFIUM-LICENSE.txt", "PDFIUM-THIRD-PARTY.txt"];
+
+/// Сводка лицензий Rust-зависимостей (cargo-about) в `LICENSES/` комплекта и архива клиента.
+pub const RUST_LICENSES: &str = "THIRD-PARTY-RUST.html";
 
 /// Разбирает заголовок библиотеки: `Some(платформа)` для PE AMD64 (`windows-x64`) и ELF64
 /// x86-64 (`linux-x64`), иначе `None`.
@@ -356,6 +362,9 @@ fn server_entries(i: &Inputs) -> Result<Vec<Entry>> {
     Ok(v)
 }
 
+/// Архив клиента: `zam`, лицензия проекта и `LICENSES/` со сводкой лицензий зависимостей
+/// `zam` (в него встроены рантайм tree-sitter и грамматики под MIT; ответ владельца M5.6
+/// п. 13). Каталог `deploy/licenses/` сюда не копируется: он про компоненты комплекта сервера.
 fn cli_entries(i: &Inputs) -> Vec<Entry> {
     vec![
         Entry {
@@ -363,11 +372,8 @@ fn cli_entries(i: &Inputs) -> Vec<Entry> {
             src: i.cli_bin.to_path_buf(),
             exec: true,
         },
-        Entry {
-            path: "LICENSE.txt".into(),
-            src: i.project_license.to_path_buf(),
-            exec: false,
-        },
+        Entry::file("LICENSE.txt", i.project_license),
+        Entry::file(format!("LICENSES/{RUST_LICENSES}"), i.cli_rust_licenses),
     ]
 }
 
@@ -734,24 +740,134 @@ fn copy_web_notices(web_dist: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Генерирует THIRD-PARTY-RUST.html (cargo-about), THIRD-PARTY-WEB.json (license-checker)
-/// и копирует THIRD-PARTY-WEB-NOTICES.txt (тексты лицензий бандла WebUI).
-pub fn generate_licenses(root: &Path, out: &Path) -> Result<()> {
-    if out.exists() {
-        fs::remove_dir_all(out)?;
+/// Сгенерированные лицензии ([`generate_licenses`]).
+pub struct GeneratedLicenses {
+    /// Каталог `THIRD-PARTY-*` комплекта сервера (Rust-зависимости workspace и WebUI) — целиком
+    /// в `LICENSES/` комплекта.
+    pub server_dir: PathBuf,
+    /// Сводка cargo-about зависимостей одного `zam` — в `LICENSES/` архива клиента.
+    pub cli_rust: PathBuf,
+}
+
+/// Манифест клиента `zam`: по нему cargo-about собирает сводку архива клиента.
+const CLI_MANIFEST: &str = "crates/zam-cli/Cargo.toml";
+
+/// Настройки cargo-about для упаковки: `about.toml`, где пути `clarify.files`, существующие от
+/// корня репозитория (`deploy/licenses/…`), заменены абсолютными. cargo-about ищет такие файлы
+/// в каталоге самого крейта (в реестре cargo), а абсолютный путь берёт как есть; остальные пути
+/// остаются относительными к крейту. Упаковка идёт без сети (ответ владельца M5.6 п. 14):
+/// `clarify.git` (файл с GitHub) — ошибка. Хэш файла сверяется здесь же: cargo-about 0.9.2 на
+/// несошедшийся `clarify` только предупреждает и подставляет шаблон лицензии без авторских
+/// прав (см. [`clarify_failures`]).
+pub fn resolve_about_config(text: &str, root: &Path) -> Result<String> {
+    let mut cfg: toml::Table = text.parse().context("разбор about.toml")?;
+    for (krate, v) in cfg.iter_mut() {
+        let Some(clarify) = v.get_mut("clarify") else {
+            continue;
+        };
+        if clarify.get("git").is_some() {
+            bail!(
+                "about.toml: {krate}: clarify.git скачивает файл из сети при каждой упаковке; \
+                 положите текст лицензии в deploy/licenses/ и опишите его в clarify.files"
+            );
+        }
+        let Some(files) = clarify.get_mut("files").and_then(toml::Value::as_array_mut) else {
+            continue;
+        };
+        for f in files {
+            let f = f
+                .as_table_mut()
+                .with_context(|| format!("about.toml: {krate}: clarify.files — не таблица"))?;
+            let str_of = |f: &toml::Table, key: &str| {
+                f.get(key)
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_string)
+                    .with_context(|| format!("about.toml: {krate}: clarify.files без `{key}`"))
+            };
+            let (rel, want) = (str_of(f, "path")?, str_of(f, "checksum")?);
+            let abs = root.join(&rel);
+            if Path::new(&rel).is_absolute() || !abs.is_file() {
+                continue;
+            }
+            // с `start`/`end` хэш считается по части файла — её сверяет только cargo-about
+            if !f.contains_key("start") && !f.contains_key("end") {
+                let got = sha256_file(&abs)?;
+                if !got.eq_ignore_ascii_case(&want) {
+                    bail!(
+                        "about.toml: {krate}: SHA-256 файла {rel} — {got}, в clarify.files — \
+                         {want}; текст лицензии должен совпадать с файлом репозитория крейта"
+                    );
+                }
+            }
+            let abs = abs
+                .to_str()
+                .with_context(|| format!("путь {} не в UTF-8", abs.display()))?
+                .to_string();
+            f.insert("path".into(), abs.into());
+        }
     }
-    fs::create_dir_all(out)?;
+    toml::to_string(&cfg).context("запись настроек cargo-about")
+}
+
+/// Строки предупреждений cargo-about о несработавшем `clarify`: файл не прочитан или хэш не
+/// сошёлся. cargo-about 0.9.2 при этом завершается успешно и подставляет шаблон лицензии без
+/// строки авторских прав (проверено: `clarify.git` без сети — код 0), поэтому такие строки —
+/// ошибка упаковки.
+fn clarify_failures(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|l| l.contains("failed to validate all files specified in clarification"))
+        .collect()
+}
+
+/// `cargo about generate`: сводка лицензий Rust-зависимостей в `out` — пакета `manifest` или,
+/// без него, всего workspace.
+fn cargo_about(root: &Path, config: &Path, manifest: Option<&Path>, out: &Path) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    run(
-        Command::new(cargo)
-            .current_dir(root)
-            .arg("about")
-            .arg("generate")
-            .arg("about.hbs")
-            .arg("-o")
-            .arg(out.join("THIRD-PARTY-RUST.html")),
+    let mut cmd = Command::new(cargo);
+    cmd.current_dir(root)
+        .args(["about", "generate", "--config"])
+        .arg(config);
+    if let Some(m) = manifest {
+        cmd.arg("--manifest-path").arg(m);
+    }
+    cmd.arg("about.hbs").arg("-o").arg(out);
+    let o = run(
+        &mut cmd,
         "cargo about (установка: cargo install cargo-about --locked --features cli)",
     )?;
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    let bad = clarify_failures(&stderr);
+    if !bad.is_empty() {
+        bail!(
+            "cargo about не применил уточнение лицензии (about.toml, clarify) — в {} был бы \
+             шаблон без авторских прав:\n{}",
+            out.display(),
+            bad.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// Генерирует в `work` лицензии поставки. Комплект сервера (`work/server/`):
+/// THIRD-PARTY-RUST.html (cargo-about по всему workspace), THIRD-PARTY-WEB.json
+/// (license-checker) и THIRD-PARTY-WEB-NOTICES.txt (тексты лицензий бандла WebUI). Архив клиента
+/// (`work/cli/`): THIRD-PARTY-RUST.html только по зависимостям `zam` ([`CLI_MANIFEST`]). Сети
+/// cargo-about не требует: тексты `clarify` — в репозитории ([`resolve_about_config`]).
+pub fn generate_licenses(root: &Path, work: &Path) -> Result<GeneratedLicenses> {
+    if work.exists() {
+        fs::remove_dir_all(work)?;
+    }
+    let (out, cli) = (work.join("server"), work.join("cli"));
+    fs::create_dir_all(&out)?;
+    fs::create_dir_all(&cli)?;
+    let about = root.join("about.toml");
+    let text = fs::read_to_string(&about).with_context(|| format!("чтение {}", about.display()))?;
+    let config = work.join("about.toml");
+    fs::write(&config, resolve_about_config(&text, root)?)?;
+    cargo_about(root, &config, None, &out.join(RUST_LICENSES))?;
+    let cli_rust = cli.join(RUST_LICENSES);
+    cargo_about(root, &config, Some(&root.join(CLI_MANIFEST)), &cli_rust)?;
     // В бандл WebUI входят пакеты из devDependencies (сборка vite), поэтому проверяем всё дерево.
     let npx = if cfg!(windows) { "npx.cmd" } else { "npx" };
     let web_pkg = web_package_id(&root.join("web").join("package.json"))?;
@@ -769,7 +885,11 @@ pub fn generate_licenses(root: &Path, out: &Path) -> Result<()> {
         out.join("THIRD-PARTY-WEB.json"),
         strip_local_paths(&String::from_utf8_lossy(&o.stdout))?,
     )?;
-    copy_web_notices(&root.join("web").join("dist"), out)
+    copy_web_notices(&root.join("web").join("dist"), &out)?;
+    Ok(GeneratedLicenses {
+        server_dir: out,
+        cli_rust,
+    })
 }
 
 /// Версия Qdrant из `deploy/qdrant.toml`.
@@ -812,6 +932,13 @@ pub(crate) mod tests {
         b
     }
 
+    /// Содержимое фиктивной сводки лицензий клиента (у сводки комплекта — `x`, см. `touch`).
+    const CLI_LICENSES_BODY: &[u8] = b"zam only";
+
+    fn cli_rust_licenses(w: &Path) -> PathBuf {
+        w.join("gen-cli").join(RUST_LICENSES)
+    }
+
     /// Фиктивное дерево исходников: (deps, deploy, generated, crt, dist).
     fn fixture(w: &Path, platform: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         let deps = w.join("deps");
@@ -844,8 +971,11 @@ pub(crate) mod tests {
             touch(&deploy.join(f));
         }
         let gen_dir = w.join("gen");
-        touch(&gen_dir.join("THIRD-PARTY-RUST.html"));
+        touch(&gen_dir.join(RUST_LICENSES));
         touch(&gen_dir.join("THIRD-PARTY-WEB.json"));
+        // сводка одного zam — отдельный файл с другим содержимым, вне каталога комплекта
+        fs::create_dir_all(w.join("gen-cli")).unwrap();
+        fs::write(cli_rust_licenses(w), CLI_LICENSES_BODY).unwrap();
         for f in ["zam-server.bin", "zam.bin", "LICENSE", "tokenizer.json"] {
             touch(&w.join(f));
         }
@@ -872,7 +1002,19 @@ pub(crate) mod tests {
         with_crt: bool,
         other_cli_bin: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
-        let (deps, deploy, gen_dir, crt, dist) = fixture(w, platform);
+        let fx = fixture(w, platform);
+        package_fixture(w, platform, flavor, with_crt, other_cli_bin, &fx)
+    }
+
+    /// Упаковка уже созданного дерева [`fixture`] (тест может испортить его до вызова).
+    fn package_fixture(
+        w: &Path,
+        platform: &str,
+        flavor: Flavor,
+        with_crt: bool,
+        other_cli_bin: Option<&Path>,
+        (deps, deploy, gen_dir, crt, dist): &(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf),
+    ) -> Result<Vec<PathBuf>> {
         let server_bin = w.join("zam-server.bin");
         let cli_bin = w.join("zam.bin");
         let lic = w.join("LICENSE");
@@ -883,14 +1025,15 @@ pub(crate) mod tests {
             server_bin: &server_bin,
             cli_bin: &cli_bin,
             other_cli_bin,
-            deps_dir: &deps,
-            deploy_dir: &deploy,
-            generated_licenses_dir: &gen_dir,
+            deps_dir: deps,
+            deploy_dir: deploy,
+            generated_licenses_dir: gen_dir,
+            cli_rust_licenses: &cli_rust_licenses(w),
             project_license: &lic,
             crt_dir: with_crt.then_some(crt.as_path()),
             qdrant_version: "1.19.2",
             tokenizer: &w.join("tokenizer.json"),
-            out_dir: &dist,
+            out_dir: dist,
         })
     }
 
@@ -949,6 +1092,81 @@ pub(crate) mod tests {
         "LICENSES/ZeroAIMemory-LICENSE.txt",
     ];
 
+    /// Состав архива клиента Windows.
+    const CLI_WIN: &[&str] = &["LICENSE.txt", "LICENSES/THIRD-PARTY-RUST.html", "zam.exe"];
+
+    fn zip_bytes(p: &Path, name: &str) -> Vec<u8> {
+        let mut z = zip::ZipArchive::new(File::open(p).unwrap()).unwrap();
+        let mut b = Vec::new();
+        io::Read::read_to_end(&mut z.by_name(name).unwrap(), &mut b).unwrap();
+        b
+    }
+
+    fn tar_bytes(p: &Path, name: &str) -> Vec<u8> {
+        let gz = flate2::read::GzDecoder::new(File::open(p).unwrap());
+        let mut t = tar::Archive::new(gz);
+        for e in t.entries().unwrap() {
+            let mut e = e.unwrap();
+            if e.path().unwrap().to_string_lossy() == name {
+                let mut b = Vec::new();
+                io::Read::read_to_end(&mut e, &mut b).unwrap();
+                return b;
+            }
+        }
+        panic!("нет {name} в {}", p.display());
+    }
+
+    /// M6 (задача 15c, ответ владельца M5.6 п. 13): в архиве клиента обеих платформ —
+    /// `LICENSES/` со сводкой cargo-about зависимостей одного `zam` (в `zam` встроены рантайм
+    /// tree-sitter и грамматики под MIT — уведомления обязаны идти с бинарником). Это сводка
+    /// клиента, а не комплекта сервера; кроме неё в `LICENSES/` ничего нет; сводка комплекта
+    /// сервера остаётся своей.
+    #[test]
+    fn client_zip_has_licenses() {
+        let w = work("cli-licenses-win");
+        let got = run_package(&w, "windows-x64", Flavor::Cpu, true).unwrap();
+        let (server, cli) = (&got[0], &got[1]);
+        assert_eq!(cli.file_name().unwrap(), "zam-1.2.3-windows-x64.zip");
+        assert_eq!(zip_names(cli), sorted("zam-1.2.3-windows-x64", CLI_WIN));
+        assert_eq!(
+            zip_bytes(cli, "zam-1.2.3-windows-x64/LICENSES/THIRD-PARTY-RUST.html"),
+            CLI_LICENSES_BODY
+        );
+        assert_eq!(
+            zip_bytes(
+                server,
+                "zam-server-1.2.3-windows-x64-cpu/LICENSES/THIRD-PARTY-RUST.html"
+            ),
+            b"x"
+        );
+
+        let w = work("cli-licenses-linux");
+        let got = run_package(&w, "linux-x64", Flavor::Cpu, false).unwrap();
+        let (server, cli) = (&got[0], &got[1]);
+        assert_eq!(cli.file_name().unwrap(), "zam-1.2.3-linux-x64.tar.gz");
+        assert_eq!(
+            tar_bytes(cli, "zam-1.2.3-linux-x64/LICENSES/THIRD-PARTY-RUST.html"),
+            CLI_LICENSES_BODY
+        );
+        assert_eq!(
+            tar_bytes(
+                server,
+                "zam-server-1.2.3-linux-x64-cpu/LICENSES/THIRD-PARTY-RUST.html"
+            ),
+            b"x"
+        );
+
+        // нет сводки — ошибка упаковки с именем файла, а не архив клиента без уведомлений
+        let w = work("cli-licenses-missing");
+        let fx = fixture(&w, "linux-x64");
+        fs::remove_file(cli_rust_licenses(&w)).unwrap();
+        let e = package_fixture(&w, "linux-x64", Flavor::Cpu, false, None, &fx).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("LICENSES/THIRD-PARTY-RUST.html"),
+            "{e:#}"
+        );
+    }
+
     #[test]
     fn package_includes_other_platform_cli_for_downloads() {
         let w = work("layout-cli-other");
@@ -961,10 +1179,7 @@ pub(crate) mod tests {
             "{names:?}"
         );
         // архив клиента — только своей платформы
-        assert_eq!(
-            zip_names(&got[1]),
-            sorted("zam-1.2.3-windows-x64", &["LICENSE.txt", "zam.exe"])
-        );
+        assert_eq!(zip_names(&got[1]), sorted("zam-1.2.3-windows-x64", CLI_WIN));
         let w = work("layout-cli-other-linux");
         let other = w.join("zam-win.bin");
         touch(&other);
@@ -999,10 +1214,7 @@ pub(crate) mod tests {
             zip_names(server),
             sorted("zam-server-1.2.3-windows-x64-cpu", &items)
         );
-        assert_eq!(
-            zip_names(cli),
-            sorted("zam-1.2.3-windows-x64", &["LICENSE.txt", "zam.exe"])
-        );
+        assert_eq!(zip_names(cli), sorted("zam-1.2.3-windows-x64", CLI_WIN));
 
         // gpu: ORT с CUDA EP, msvcp140_atomic_wait.dll и cuda.toml; без библиотек NVIDIA;
         // архив клиента — только из cpu
@@ -1079,6 +1291,10 @@ pub(crate) mod tests {
             tar_entries(cli),
             vec![
                 ("zam-1.2.3-linux-x64/LICENSE.txt".to_string(), 0o644),
+                (
+                    "zam-1.2.3-linux-x64/LICENSES/THIRD-PARTY-RUST.html".to_string(),
+                    0o644
+                ),
                 ("zam-1.2.3-linux-x64/zam".to_string(), 0o755)
             ]
         );
@@ -1210,6 +1426,7 @@ pub(crate) mod tests {
                 deps_dir: &deps,
                 deploy_dir: &deploy,
                 generated_licenses_dir: &gen_dir,
+                cli_rust_licenses: &cli_rust_licenses(&w),
                 project_license: &lic,
                 crt_dir: Some(&crt),
                 qdrant_version: "1.19.2",
@@ -1245,6 +1462,121 @@ pub(crate) mod tests {
             let len = fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0);
             assert!(len > 0, "нет или пуст deploy/licenses/{n}");
         }
+    }
+
+    /// M6 (задача 15c, ответ владельца M5.6 п. 14): упаковка без сети. В `about.toml`
+    /// репозитория нет `clarify.git`; каждый `clarify.files` указывает на файл в
+    /// `deploy/licenses/` с тем же SHA-256, и путь к нему в настройках для cargo-about —
+    /// абсолютный (иначе cargo-about искал бы файл в каталоге крейта).
+    #[test]
+    fn about_config_clarifies_from_deploy_licenses_offline() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let text = fs::read_to_string(root.join("about.toml")).unwrap();
+        let cfg: toml::Table = resolve_about_config(&text, &root).unwrap().parse().unwrap();
+        let mut seen = Vec::new();
+        for (krate, v) in &cfg {
+            let Some(c) = v.get("clarify") else { continue };
+            assert!(c.get("git").is_none(), "{krate}: clarify.git");
+            for f in c["files"].as_array().unwrap() {
+                let p = Path::new(f["path"].as_str().unwrap());
+                assert!(p.is_absolute(), "{krate}: {p:?}");
+                assert!(
+                    p.parent().unwrap().ends_with("deploy/licenses"),
+                    "{krate}: {p:?}"
+                );
+                assert_eq!(
+                    sha256_file(p).unwrap(),
+                    f["checksum"].as_str().unwrap(),
+                    "{krate}"
+                );
+                seen.push((krate.as_str(), p.file_name().unwrap().to_str().unwrap()));
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                ("tree-sitter-java", "tree-sitter-java.LICENSE"),
+                ("tree-sitter-typescript", "tree-sitter-typescript.LICENSE"),
+            ]
+        );
+        // остальные настройки переносятся без изменений
+        let orig: toml::Table = text.parse().unwrap();
+        for key in [
+            "accepted",
+            "targets",
+            "workarounds",
+            "ignore-dev-dependencies",
+            "ignore-build-dependencies",
+        ] {
+            assert_eq!(cfg[key], orig[key], "{key}");
+        }
+    }
+
+    #[test]
+    fn about_config_rejects_git_and_wrong_checksum() {
+        let w = work("about-config");
+        let lic = w.join("deploy/licenses/x.LICENSE");
+        fs::create_dir_all(lic.parent().unwrap()).unwrap();
+        fs::write(&lic, b"MIT text\n").unwrap();
+        let sum = sha256_file(&lic).unwrap();
+        let cfg =
+            |body: &str| format!("accepted = [\"MIT\"]\n[x.clarify]\nlicense = \"MIT\"\n{body}");
+        let files = |path: &str, sum: &str, extra: &str| {
+            cfg(&format!(
+                "[[x.clarify.files]]\npath = \"{path}\"\nchecksum = \"{sum}\"\n{extra}"
+            ))
+        };
+        let path_of = |text: &str| {
+            let t: toml::Table = text.parse().unwrap();
+            t["x"]["clarify"]["files"][0]["path"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // файл от корня репозитория — абсолютный путь
+        let ok = resolve_about_config(&files("deploy/licenses/x.LICENSE", &sum, ""), &w).unwrap();
+        assert_eq!(
+            Path::new(&path_of(&ok)),
+            w.join("deploy/licenses/x.LICENSE")
+        );
+        // файла от корня нет — путь относительно крейта, как его понимает cargo-about
+        let krate = resolve_about_config(&files("LICENSE-MIT", &sum, ""), &w).unwrap();
+        assert_eq!(path_of(&krate), "LICENSE-MIT");
+        // текст изменён — ошибка с именем файла и обоими хэшами
+        let bad = "0".repeat(64);
+        let e =
+            resolve_about_config(&files("deploy/licenses/x.LICENSE", &bad, ""), &w).unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("deploy/licenses/x.LICENSE") && e.contains(&sum) && e.contains(&bad),
+            "{e}"
+        );
+        // хэш части файла (`start`/`end`) сверяет cargo-about
+        let part = files("deploy/licenses/x.LICENSE", &bad, "start = \"MIT\"\n");
+        assert!(Path::new(&path_of(&resolve_about_config(&part, &w).unwrap())).is_absolute());
+        // clarify.git — сеть при упаковке
+        let git = cfg(&format!(
+            "[[x.clarify.git]]\npath = \"LICENSE\"\nchecksum = \"{sum}\"\n"
+        ));
+        let e = format!("{:#}", resolve_about_config(&git, &w).unwrap_err());
+        assert!(e.contains("clarify.git") && e.contains("x:"), "{e}");
+    }
+
+    /// Предупреждение cargo-about 0.9.2 о несработавшем `clarify` (он завершается с кодом 0) —
+    /// ошибка упаковки; прочие предупреждения — нет.
+    #[test]
+    fn clarify_failures_are_detected_in_cargo_about_output() {
+        let warn = "2026-11-10T19:15:58.031918Z [WARN] failed to validate all files specified in \
+                    clarification for crate tree-sitter-java 0.23.5: unable to retrieve 'LICENSE' \
+                    for crate 'tree-sitter-java 0.23.5' from remote git host: failed to fetch \
+                    contents of 'LICENSE' from repo \
+                    'https://github.com/tree-sitter/tree-sitter-java': failed to send request: io: \
+                    Connection refused";
+        let other = "warning: config found for a crate not present in the graph";
+        let out = format!("{other}\n{warn}\n");
+        assert_eq!(clarify_failures(&out), [warn]);
+        assert!(clarify_failures(other).is_empty());
     }
 
     #[test]
