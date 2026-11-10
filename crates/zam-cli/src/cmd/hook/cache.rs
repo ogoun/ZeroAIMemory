@@ -644,6 +644,12 @@ pub const FLUSH_MIN_LEFT: Duration = Duration::from_millis(15);
 /// строкой в `hooks.log` (fix round 1, M-6; задача 9); прочее (сеть, 5xx, 401, 403, 404, 408,
 /// 410, 429: решение ещё не открыто для доступа, старый сервер) — всё возвращается.
 /// Строки, дописанные во время отправки, не теряются: они в новой очереди. Без решения — ничего.
+///
+/// Очередь, оставшаяся неотправленной без ошибки запроса, видна в `hooks.log` — каждая причина
+/// своей строкой `files/changed: очередь не отправлена — …`: остаток бюджета до работы с очередью,
+/// он же после её разбора (замки, rename, чтение — на занятом диске десятки мс), занятый замок
+/// очереди, сбой rename. Очередь при этом на месте (не забрана или возвращена) и уйдёт со
+/// следующим хуком.
 pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     let Some(sol) = env.solution.as_ref().map(|s| s.id.clone()) else {
         return;
@@ -673,15 +679,27 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
         // замок занят (уплотнение, другой хук) — очередь уйдёт в другой раз (ревью задачи 5 M6)
         let lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
         if !lock.held() {
+            env.log(&format!(
+                "files/changed: очередь не отправлена — замок очереди занят дольше {} мс (прошло {} мс)",
+                CHANGED_LOCK_WAIT.as_millis(),
+                env.started.elapsed().as_millis()
+            ));
             continue;
         }
-        if std::fs::rename(&q, &t).is_ok() {
-            taken.push((q, t));
+        match std::fs::rename(&q, &t) {
+            Ok(()) => taken.push((q, t)),
+            // очередь уже забрал параллельный хук — не сбой
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => env.log(&format!(
+                "files/changed: очередь не отправлена — не забрана: {e} (прошло {} мс)",
+                env.started.elapsed().as_millis()
+            )),
         }
     }
     if taken.is_empty() {
         return;
     }
+    flush_stall();
     // (строка, номер очереди) — повтор пути: последняя строка (хэш и символы)
     let mut files: Vec<(Changed, usize)> = Vec::new();
     for (qi, (_, t)) in taken.iter().enumerate() {
@@ -699,6 +717,14 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     let mut done = 0usize;
     for b in changed_batches(&lines, CHANGED_BATCH_BYTES) {
         if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+            // бюджет вышел уже после разбора очереди (замки, rename, чтение): раньше — молча
+            env.log(&format!(
+                "files/changed: очередь не отправлена — остаток бюджета меньше {} мс (прошло {} мс, \
+                 очередь разобрана, возвращено путей: {})",
+                FLUSH_MIN_LEFT.as_millis(),
+                env.started.elapsed().as_millis(),
+                lines.len() - done
+            ));
             break;
         }
         let n = b.len();
@@ -727,6 +753,19 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     }
     for (_, t) in &taken {
         let _ = std::fs::remove_file(t);
+    }
+}
+
+/// Точка подмены для тестов (только отладочная сборка и фича `test-hooks`, как
+/// `ZAM_TEST_BINDING_STALL_MS`): `ZAM_TEST_FLUSH_STALL_MS` — пауза между разбором очередей
+/// изменённых файлов и запросом (занятый диск: бюджет выходит после того, как очередь забрана).
+fn flush_stall() {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::env::var("ZAM_TEST_FLUSH_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -1318,7 +1357,8 @@ mod tests {
     }
 
     /// Ревью задачи 5 M6: очередь под чужим замком `flush_changed` не забирает (как
-    /// `compact_changed_queues`) — она остаётся на месте, запроса нет.
+    /// `compact_changed_queues`) — она остаётся на месте, запроса нет. Причина — строкой в журнале
+    /// хука (раньше — молча, как и сбой rename).
     #[test]
     fn flush_skips_locked_queue() {
         let dir =
@@ -1333,7 +1373,8 @@ mod tests {
         let env = Env::new(
             super::super::Kind::SessionStart,
             super::super::Agent::Claude,
-            std::time::Instant::now(),
+            // «старт» в будущем: бюджет не кончается, как бы ни была занята машина
+            std::time::Instant::now() + Duration::from_secs(600),
             dir.clone(),
             dir.join("home"),
         );
@@ -1344,12 +1385,19 @@ mod tests {
         std::fs::write(&q, &body).unwrap();
         let held = QueueLock::take(&q, Duration::ZERO);
         assert!(held.held());
-        // сервер недоступен: попытка отправки оставила бы строку `files/changed` в журнале
+        // сервер недоступен: попытка отправки оставила бы в журнале вторую строку — ошибку сети
         let client = Client::new("http://127.0.0.1:9", "t", None);
         flush_changed(&env, &client, Some("s1"));
         assert_eq!(std::fs::read(&q).unwrap(), body, "очередь на месте");
         let log = std::fs::read_to_string(env.log_path()).unwrap_or_default();
-        assert!(!log.contains("files/changed"), "{log}");
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(
+            log.contains(
+                "session-start files/changed: очередь не отправлена — замок очереди занят дольше \
+                 50 мс (прошло "
+            ),
+            "{log}"
+        );
         drop(held);
     }
 
