@@ -11706,3 +11706,24 @@ zam-store -p zam-server -p zam-cli -p xtask --all-targets -D warnings` — чи�
   досборкой.
 - **→ M7:** контрольная сумма миграций — хэш SQL каждой применённой миграции в `meta`, ошибка при
   расхождении (страховка от правки применённой миграции вместо `schema_repair`).
+
+### Задача 19, круг 2 ревью: N-1…N-3 (2026-11-11)
+
+Принято ревьюером; три Minor по `schema_repair` одним коммитом. **N-1:** `Db::open_with` читает
+`user_version` до `migrate::apply` и досборку делает до следующих миграций (у базы версии 25 —
+и при 25 → 25, и при будущей 0026); база пользователя узнаётся по списку, где 25-я миграция —
+итоговый текст 0025 (`schema_repair::is_user_list`; так работают и тестовые списки). **N-2:**
+история 0025 (`git log -p`): `61c5c14` — `session_snapshots.trigger`, без `imported_from` и
+`node_idempotency`; `d00f46c` — `trigger_kind`, без `imported_from` и `node_idempotency`;
+`966cb85` — без `node_idempotency`; `52ea190` и `af3fec4` — итог (в `af3fec4` только
+комментарии вне `CREATE`). Других отличий (индексы, CHECK, таблицы) нет — досборка покрывает
+все три: `RENAME COLUMN "trigger" TO trigger_kind` (если есть `trigger` и нет `trigger_kind`),
+`ADD COLUMN imported_from`, `node_idempotency`. **N-3:** транзакция досборки —
+`TransactionBehavior::Immediate`. Тесты `migrate_rebuild`: `reopen_historic_0025_versions_repaired`
+(тексты трёх промежуточных версий собираются из итогового, база с данными снимка; два
+открытия — схема равна эталону `master_objects`, `trigger_kind` со значением) и
+`repair_runs_before_next_migration` (фиктивная 0026 только в тесте: итог — версия 26, схема как у
+чистой базы, `bak-v25` есть). Откаты: R19 (досборка после миграций) → второй тест FAIL; R20 (без
+переименования) → первый FAIL; дерево после откатов совпало со снимком. Прогоны: `cargo fmt --all
+--check`, `clippy -p zam-store -p zam-server --all-targets -D warnings` — чисто; `zam-store`
+`--lib` 105 (+1), `migrate_rebuild` 10, `sessions` 17, `snapshots` 4; `zam-server` `snapshot` 27, `boot` 14 — PASS.

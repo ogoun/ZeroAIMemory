@@ -377,14 +377,12 @@ impl Db {
             )));
         }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let version = migrate::apply(&mut conn, path, migrations)?;
-        // база пользователя версии 25 промежуточной сборки M6 — досборка схемы 0025
-        // (`schema_repair`, ревью задачи 19 I-1); у прочих баз — ничего
-        if std::ptr::eq(
-            migrations.as_ptr(),
-            crate::user_db::USER_MIGRATIONS.as_ptr(),
-        ) {
-            let fixed = crate::schema_repair::repair_user_schema(&mut conn, version)?;
+        // база пользователя версии 25 промежуточной сборки M6 — досборка схемы 0025 до
+        // следующих миграций (`schema_repair`, ревью задачи 19 I-1, N-1): версия читается до
+        // `apply`, иначе после 0026 досборка уже не сработала бы; у прочих баз — ничего
+        if crate::schema_repair::is_user_list(migrations) {
+            let before: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let fixed = crate::schema_repair::repair_user_schema(&mut conn, before)?;
             if !fixed.is_empty() {
                 tracing::warn!(
                     fixed = %fixed.join(", "),
@@ -393,6 +391,7 @@ impl Db {
                 );
             }
         }
+        migrate::apply(&mut conn, path, migrations)?;
         // checkpoint — не в потоке писателя (см. документацию модуля)
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         let size_limit = i64::try_from(opts.wal_limit_bytes).unwrap_or(i64::MAX);

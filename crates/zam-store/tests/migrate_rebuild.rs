@@ -11,9 +11,9 @@ use serde_json::json;
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
     Attribution, AuthorKind, Certainty, DataDir, Db, EdgeType, EntryKind, EntryPatch, EntryStatus,
-    FtsQuery, Migration, NewEntry, NewReportFile, NewTrigger, SpaceKind, StoreError, TargetFilter,
-    TriggerKind, USER_MIGRATIONS, UserDbs, attachment_link, create_entry, create_report,
-    delete_entry, search_fts, supersede_entry, update_entry,
+    FtsQuery, Migration, NewEntry, NewReportFile, NewTrigger, SessionTouch, SpaceKind, StoreError,
+    TargetFilter, TriggerKind, USER_MIGRATIONS, UserDbs, attachment_link, create_entry,
+    create_report, delete_entry, search_fts, supersede_entry, touch_session, update_entry,
 };
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -1372,4 +1372,126 @@ async fn reopen_v25_repairs_late_0025_schema() {
     }
     // копии перед миграцией нет: мигратор ничего не применял
     assert!(!dir.join("u.db.bak-v25").exists());
+}
+
+// ---- ревью задачи 19, N-1…N-2: промежуточные версии 0025 ----
+
+/// Текст 0025 промежуточной версии (`git log -- …/0025_session_epochs.sql`): `61c5c14` —
+/// `trigger` вместо `trigger_kind`, без `imported_from` и `node_idempotency`; `d00f46c` — без
+/// `imported_from` и `node_idempotency`; `966cb85` — без `node_idempotency`.
+fn historic_0025(rev: &str) -> &'static str {
+    let mut sql = USER_MIGRATIONS[24].sql.to_string();
+    let mut cut = |from: &str, to: &str| {
+        assert_eq!(sql.matches(from).count(), 1, "{rev}: «{from}»");
+        sql = sql.replace(from, to);
+    };
+    let start = USER_MIGRATIONS[24]
+        .sql
+        .find("CREATE TABLE node_idempotency (")
+        .unwrap();
+    let rest = &USER_MIGRATIONS[24].sql[start..];
+    let table = &rest[..rest.find(';').unwrap() + 1];
+    cut(table, "");
+    if rev != "966cb85" {
+        cut(
+            "ALTER TABLE nodes ADD COLUMN imported_from TEXT;\nALTER TABLE entries ADD COLUMN \
+             imported_from TEXT;",
+            "",
+        );
+    }
+    if rev == "61c5c14" {
+        cut(
+            "  trigger_kind TEXT NOT NULL,         --",
+            "  trigger TEXT NOT NULL,              --",
+        );
+    }
+    Box::leak(sql.into_boxed_str())
+}
+
+/// Список миграций с 0025 версии `rev` вместо итоговой.
+fn historic_list(rev: &str) -> &'static [Migration] {
+    let mut v = USER_MIGRATIONS.to_vec();
+    v[24].sql = historic_0025(rev);
+    Box::leak(v.into_boxed_slice())
+}
+
+/// Список итоговых миграций и фиктивной 0026 (только в тесте: досборка до следующих миграций).
+fn with_fake_0026() -> &'static [Migration] {
+    let mut v = USER_MIGRATIONS.to_vec();
+    v.push(Migration {
+        version: 26,
+        sql: "CREATE TABLE probe_0026 (x INTEGER);",
+        rebuild: false,
+    });
+    Box::leak(v.into_boxed_slice())
+}
+
+/// Схема чистой базы на списке `list`.
+fn fresh_schema(dir: &Path, list: &'static [Migration]) -> BTreeSet<MasterObject> {
+    let path = dir.join("fresh.db");
+    drop(Db::open(&path, list).unwrap());
+    master_objects(&conn(&path))
+}
+
+/// База каждой промежуточной версии 0025 при открытии итоговой сборкой дособирается до эталона
+/// (`master_objects`), в том числе `session_snapshots.trigger` → `trigger_kind` с данными.
+#[tokio::test]
+async fn reopen_historic_0025_versions_repaired() {
+    let dir = tmp_dir("v25-historic");
+    let want = fresh_schema(&dir, USER_MIGRATIONS);
+    for rev in ["61c5c14", "d00f46c", "966cb85"] {
+        let path = dir.join(format!("{rev}.db"));
+        {
+            let db = Db::open(&path, historic_list(rev)).unwrap();
+            let s = SessionTouch {
+                id: "s".into(),
+                ..SessionTouch::default()
+            };
+            touch_session(&db, &s).await.unwrap();
+        }
+        {
+            let c = conn(&path);
+            assert_ne!(master_objects(&c), want, "{rev}: исходная схема другая");
+            let col = if rev == "61c5c14" {
+                "\"trigger\""
+            } else {
+                "trigger_kind"
+            };
+            c.execute_batch(&format!(
+                "INSERT INTO session_snapshots (session_id, taken_at, {col}, status, skipped,
+                     bytes, data) VALUES ('s', 't', 'stop', 'complete', 0, 2, '{{}}');"
+            ))
+            .unwrap();
+        }
+        for round in 0..2 {
+            drop(Db::open(&path, USER_MIGRATIONS).unwrap());
+            let c = conn(&path);
+            assert_eq!(master_objects(&c), want, "{rev}, открытие {round}");
+            assert_eq!(user_version(&c), 25);
+            let kind: String = c
+                .query_row(
+                    "SELECT trigger_kind FROM session_snapshots WHERE session_id = 's'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(kind, "stop", "{rev}");
+        }
+    }
+}
+
+/// N-1: база версии 25 промежуточной сборки, а у сервера уже есть следующая миграция —
+/// досборка идёт до неё (версия читается до миграций), итог совпадает с чистой базой.
+#[tokio::test]
+async fn repair_runs_before_next_migration() {
+    let dir = tmp_dir("v25-then-26");
+    let list = with_fake_0026();
+    let want = fresh_schema(&dir, list);
+    let path = dir.join("u.db");
+    drop(Db::open(&path, historic_list("61c5c14")).unwrap());
+    drop(Db::open(&path, list).unwrap());
+    let c = conn(&path);
+    assert_eq!(user_version(&c), 26);
+    assert_eq!(master_objects(&c), want);
+    assert!(dir.join("u.db.bak-v25").exists());
 }
