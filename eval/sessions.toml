@@ -14,7 +14,14 @@
 #   new и deferred с наступившим горизонтом от человека — high, normal, low, внутри — новые
 #   первыми; затем accepted со снятой задачей; сверено прогоном B5.7 на dev) — обязательные
 #   строки дайджеста;
-# - transcript — фикстура журнала агента для снимка сессии (§8а; заполняет задача 17d).
+# - transcript — фикстура журнала агента для снимка сессии (§8а): имя файла без расширения в
+#   eval/sessions-corpus/transcripts/ (заглушки @ROOT@ — каталог проекта сессии, @SESSION@ — id
+#   сессии агента); хуки сессии получают `transcript_path`, снимок снимается на `Stop` и
+#   `PreCompact`;
+# - abort = true — сессия «обрывается» (§3.1; нужен transcript): после её событий раннер делает
+#   её неживой (последнее обращение — 11 минут назад, конца сессии нет) и запускает
+#   `session_start` (startup) другой сессией — событие `session_start_after_abort`, обязательная
+#   строка — раздел «Последнее известное состояние». Тяжёлых «оборванных» — не меньше двух.
 #
 # [[session.event]] по порядку; первый `session_start` (startup) и его повтор другой сессией
 # (совпадение дайджеста) ставит раннер. type:
@@ -42,6 +49,7 @@ tasks = ["t-keyset-orders"]
 insights = ["s-migration-lock", "s-sqlx-offline"]
 ideas = ["i01", "i05"]
 digest_ideas = ["i01", "i05"]
+transcript = "shop-keyset-index"
 
 [[session.event]]
 type = "prompt"
@@ -440,6 +448,8 @@ insights = ["*"]
 ideas = ["*"]
 code_map = true
 digest_ideas = ["i20", "i10", "i06"]
+transcript = "shop-export-stream"
+abort = true
 
 [[session.event]]
 type = "prompt"
@@ -498,6 +508,8 @@ insights = ["*"]
 ideas = ["*"]
 code_map = true
 digest_ideas = ["i20", "i10", "i06"]
+transcript = "shop-token-refresh"
+abort = true
 
 [[session.event]]
 type = "prompt"
@@ -607,6 +619,7 @@ insights = ["*"]
 ideas = ["*"]
 code_map = true
 digest_ideas = ["i20", "i10", "i06"]
+transcript = "shop-flag-removal"
 
 [[session.event]]
 type = "prompt"
@@ -659,6 +672,8 @@ insights = ["*"]
 ideas = ["*"]
 code_map = true
 digest_ideas = ["i20", "i10", "i06"]
+transcript = "shop-keyset-outbox"
+abort = true
 
 [[session.event]]
 type = "prompt"

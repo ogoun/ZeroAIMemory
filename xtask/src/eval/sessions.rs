@@ -15,7 +15,11 @@
 //! **Метрики** ([`summarize`], [`compare`]): токены по событиям (`R` к базе с парным бутстрепом по
 //! сессиям), полнота обязательных строк дайджеста и восстановления, `hint_recall` общий (без
 //! подсказок-идей) и подсказок-идей, совпадение подсказок-идей с базой (B5.7), доля повторной
-//! выдачи, совпадение дайджеста при двух стартах, строки «идеи» и «снимок сессии». Чего нет у
+//! выдачи, совпадение дайджеста при двух стартах, строки «идеи» и «снимок сессии». Сессии с
+//! журналом агента (`transcript`, §8а) отдают хукам `transcript_path` — снимок сессии на `Stop` и
+//! `PreCompact`; «оборванная» сессия (`abort`) после своих событий перестаёт быть живой
+//! ([`Driver::abandon`]), и следующий старт другой сессией ([`label::AFTER_ABORT`]) обязан
+//! получить раздел «Последнее известное состояние» ([`req::SNAPSHOT`]). Чего нет у
 //! старой базы (события, разделы дайджеста, виды обязательных строк, подсказки терминов), то
 //! исключается из **обоих** плеч сравнения (§3.1, C2).
 
@@ -58,6 +62,15 @@ pub const ALL: &str = "*";
 const MCP_TIMEOUT: Duration = Duration::from_secs(180);
 /// Суффикс id второго старта (совпадение дайджеста, §3.6).
 const SECOND_START: &str = "-b";
+/// Суффикс id сессии, стартующей после оборванной (§3.1, §8а).
+const AFTER_ABORT: &str = "-next";
+/// Минимум «оборванных» сессий тяжёлого профиля (§3.1).
+pub const MIN_HEAVY_ABORT: usize = 2;
+/// Каталог фикстур журналов агента в корпусе ТС-2 (`<имя>.jsonl`).
+pub const TRANSCRIPTS_DIR: &str = "transcripts";
+/// На сколько минут назад сдвигается последнее обращение оборванной сессии: больше срока
+/// живости сервера (`LIVE_MIN` = 10 мин, §8а).
+const ABANDON_MIN: i64 = 11;
 
 // ---------------------------------------------------------------------------------------------
 // Набор
@@ -178,9 +191,14 @@ pub struct SessionSpec {
     /// Идеи раздела `### Идеи` первого `session_start` (как отбирает M5.7, до 3).
     #[serde(default)]
     pub digest_ideas: Vec<String>,
-    /// Фикстура журнала агента для снимка (§8а, задача 17d).
+    /// Фикстура журнала агента для снимка (§8а, задача 17d): имя файла без расширения в
+    /// `eval/sessions-corpus/transcripts/`; хуки сессии получают `transcript_path`.
     #[serde(default)]
     pub transcript: Option<String>,
+    /// Сессия «обрывается» (§3.1): после её событий — старт другой сессией, которая должна
+    /// получить «последнее известное состояние». Нужен `transcript`.
+    #[serde(default)]
+    pub abort: bool,
     #[serde(default, rename = "event")]
     pub events: Vec<Event>,
 }
@@ -306,6 +324,9 @@ pub struct SetSummary {
     pub nuggets: usize,
     /// Разные миры тяжёлого профиля.
     pub heavy_worlds: usize,
+    /// Сессии с журналом агента и «оборванные» тяжёлого профиля (§3.1, §8а).
+    pub transcripts: usize,
+    pub heavy_aborts: usize,
 }
 
 /// Проверка набора по §3.1 (все нарушения — одной ошибкой).
@@ -393,10 +414,27 @@ pub fn validate_set(set: &[SessionSpec], c: &SessionsCorpus) -> Result<SetSummar
                 errs.push(e(format!("digest_ideas {d}: идеи нет в мире сессии")));
             }
         }
-        if let Some(t) = &s.transcript
-            && t.trim().is_empty()
-        {
-            errs.push(e("transcript — пустая строка".into()));
+        if let Some(t) = &s.transcript {
+            // имя файла фикстуры, не путь
+            let name_ok = !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !name_ok {
+                errs.push(e(format!(
+                    "transcript «{t}»: имя фикстуры — строчные латинские буквы, цифры и «-»"
+                )));
+            }
+            sum.transcripts += 1;
+        }
+        if s.abort {
+            if s.transcript.is_none() {
+                errs.push(e(
+                    "abort: нужен transcript (снимок берётся из журнала агента)".into(),
+                ));
+            }
+            if s.profile == Profile::Heavy {
+                sum.heavy_aborts += 1;
+            }
         }
         let mut count: BTreeMap<&str, usize> = BTreeMap::new();
         let mut questions: BTreeSet<&str> = BTreeSet::new();
@@ -508,6 +546,12 @@ pub fn validate_set(set: &[SessionSpec], c: &SessionsCorpus) -> Result<SetSummar
             heavy_worlds.len()
         ));
     }
+    if sum.heavy >= MIN_HEAVY && sum.heavy_aborts < MIN_HEAVY_ABORT {
+        errs.push(format!(
+            "«оборванных» сессий тяжёлого профиля {} (abort = true): нужно ≥ {MIN_HEAVY_ABORT}",
+            sum.heavy_aborts
+        ));
+    }
     for p in [Profile::Standard, Profile::Heavy] {
         if !idea_prompt_by_profile.contains(&p) && !set.is_empty() {
             errs.push(format!(
@@ -582,6 +626,9 @@ pub mod label {
     pub const PRE_COMPACT: &str = "pre_compact";
     pub const RECOVERY: &str = "recovery";
     pub const CHECKPOINT: &str = "checkpoint";
+    /// `session_start` (startup) другой сессией после оборванной (§3.1, §8а): дайджест с
+    /// «последним известным состоянием». У базы без снимка события нет.
+    pub const AFTER_ABORT: &str = "session_start_after_abort";
 }
 
 /// Классы строк выдачи, которые сравнение может вычесть ([`classify`]).
@@ -626,6 +673,8 @@ pub mod req {
     pub const ANSWER: &str = "answer";
     pub const ACCESS: &str = "access";
     pub const IDEA: &str = "idea";
+    /// Раздел «Последнее известное состояние» в дайджесте после оборванной сессии (§8а).
+    pub const SNAPSHOT: &str = "snapshot";
 }
 
 impl Feats {
@@ -640,6 +689,9 @@ impl Feats {
         }
         if !self.file_context {
             out.push(label::FILE_CONTEXT);
+        }
+        if !self.snapshot {
+            out.push(label::AFTER_ABORT);
         }
         out.into_iter().map(str::to_string).collect()
     }
@@ -952,6 +1004,9 @@ pub trait Driver {
     fn mcp(&mut self, tool: &str, args: Value) -> Result<String>;
     /// Абсолютный путь файла проекта (как у Claude Code).
     fn abs(&self, rel: &str) -> String;
+    /// Сессия `session` оборвана: конца (`SessionEnd`) не было, а молчит она дольше срока
+    /// живости сервера (§8а) — настоящий исполнитель сдвигает её последнее обращение в базе.
+    fn abandon(&mut self, session: &str) -> Result<()>;
 }
 
 /// Шаг сессии — один ответ агенту.
@@ -1001,7 +1056,7 @@ pub struct HintCheck {
 /// Источник зачёта «было раньше» по метке шага.
 fn source_of(l: &str) -> &'static str {
     match l {
-        label::SESSION_START | label::RECOVERY => "digest",
+        label::SESSION_START | label::RECOVERY | label::AFTER_ABORT => "digest",
         label::QUESTION | label::REPEAT | label::SUBAGENT_MCP => "mcp",
         _ => "hooks",
     }
@@ -1487,6 +1542,29 @@ pub fn play(
             }
         }
     }
+    // «обрыв» (§3.1, §8а): сессия замолчала без конца — следующий старт другой сессией получает
+    // «последнее известное состояние» (снимок `Stop`/`PreCompact` из журнала агента)
+    if spec.abort {
+        if f.snapshot {
+            p.d.abandon(sid)?;
+            let next = format!("{sid}{AFTER_ABORT}");
+            let st = p.hook(
+                label::AFTER_ABORT,
+                None,
+                "session-start",
+                hook_input("SessionStart", &next, json!({ "source": "startup" })),
+            )?;
+            let found = p.text(st).lines().any(|l| l.starts_with(SNAPSHOT_SECTION));
+            p.run.required.push(RequiredCheck {
+                step: label::AFTER_ABORT.to_string(),
+                kind: req::SNAPSHOT.to_string(),
+                key: "last_state".to_string(),
+                found,
+            });
+        } else {
+            skipped.insert(label::AFTER_ABORT.into());
+        }
+    }
     p.run.skipped = skipped.into_iter().collect();
     Ok(p.run)
 }
@@ -1609,7 +1687,11 @@ fn repeats(r: &SessionRun, labels_ex: &BTreeSet<String>, cross: bool) -> Tally {
     let mut event: Option<Option<usize>> = None;
     let mut t = Tally::default();
     for s in &r.steps {
-        if labels_ex.contains(&s.label) || s.label == label::RECOVERY {
+        // старт после обрыва — другая сессия с чистым контекстом: её дайджест не повтор
+        if labels_ex.contains(&s.label)
+            || s.label == label::RECOVERY
+            || s.label == label::AFTER_ABORT
+        {
             continue;
         }
         if event != Some(s.event) {
@@ -2325,11 +2407,18 @@ pub fn hook_text(out: &str) -> (String, bool) {
 struct RealDriver {
     hooks: Hooks,
     mcp: StdioMcp,
+    /// Журнал агента сессии (фикстура `transcript`): `transcript_path` входа хуков.
+    transcript: Option<PathBuf>,
+    /// Каталог данных сервера сессии (база пользователя — для [`Driver::abandon`]).
+    data: PathBuf,
 }
 
 impl Driver for RealDriver {
     fn hook(&mut self, cmd: &str, mut input: Value) -> Result<HookOut> {
         input["cwd"] = json!(self.hooks.project.to_string_lossy());
+        if let Some(t) = &self.transcript {
+            input["transcript_path"] = json!(t.to_string_lossy());
+        }
         let before = self.hooks.log_lines();
         let (out, _) = self.hooks.run(cmd, &input)?;
         let (text, bad_output) = hook_text(&out);
@@ -2347,6 +2436,82 @@ impl Driver for RealDriver {
     fn abs(&self, rel: &str) -> String {
         self.hooks.project.join(rel).to_string_lossy().into_owned()
     }
+
+    fn abandon(&mut self, session: &str) -> Result<()> {
+        abandon_session(&self.data, session)
+    }
+}
+
+/// Момент `t` в текстовом формате времени базы (`YYYY-MM-DDTHH:MM:SS.ffffffZ`, UTC).
+fn db_time(t: jiff::Timestamp) -> String {
+    let d = t.to_zoned(jiff::tz::TimeZone::UTC).datetime();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        d.year(),
+        d.month(),
+        d.day(),
+        d.hour(),
+        d.minute(),
+        d.second(),
+        d.subsec_nanosecond() / 1000
+    )
+}
+
+/// «Обрыв» сессии `session` в базе пользователя сервера `data` (§8а): последнее обращение
+/// сдвигается на [`ABANDON_MIN`] минут назад — сервер перестаёт считать её живой. Часы сервера
+/// подменить нельзя (release-сборка), ждать 10 минут на сессию — тоже; конца сессии
+/// (`ended_at`) при этом нет, как и у настоящего обрыва. Сервер работает: правка — одной
+/// командой в его базе (WAL, ожидание замка до 5 с).
+fn abandon_session(data: &Path, session: &str) -> Result<()> {
+    let at = db_time(jiff::Timestamp::now() - jiff::SignedDuration::from_mins(ABANDON_MIN));
+    // базы всех пользователей сервера (агент, администратор, участники доступа): сессия — в одной
+    let dir = data.join("users");
+    let mut n = 0;
+    for e in fs::read_dir(&dir).with_context(|| format!("чтение {}", dir.display()))? {
+        let db = e?.path();
+        if db.extension().and_then(|x| x.to_str()) != Some("db") {
+            continue;
+        }
+        let c = rusqlite::Connection::open(&db).with_context(|| db.display().to_string())?;
+        c.busy_timeout(Duration::from_secs(5))?;
+        // база без таблицы сессий (старая схема) — пропуск
+        n += c
+            .execute(
+                "UPDATE sessions SET last_seen_at = ?2 WHERE id = ?1 AND ended_at IS NULL",
+                rusqlite::params![session, at],
+            )
+            .unwrap_or(0);
+    }
+    if n != 1 {
+        bail!("обрыв сессии {session}: обновлено строк {n} (сессии нет или она завершена)");
+    }
+    Ok(())
+}
+
+/// Журнал агента сессии из фикстуры `name` корпуса: заглушки `@ROOT@` (каталог проекта сессии,
+/// как в JSON) и `@SESSION@` (id сессии агента) подставлены; файл — вне проекта, как
+/// `~/.claude/projects/…` у Claude Code.
+fn prepare_transcript(
+    corpus_dir: &Path,
+    name: &str,
+    dir: &Path,
+    project: &Path,
+    sid: &str,
+) -> Result<PathBuf> {
+    let src = corpus_dir
+        .join(TRANSCRIPTS_DIR)
+        .join(format!("{name}.jsonl"));
+    let text = fs::read_to_string(&src).with_context(|| format!("чтение {}", src.display()))?;
+    let root = serde_json::to_string(&project.to_string_lossy())?;
+    let text = text
+        .replace("\r\n", "\n")
+        .replace("@ROOT@", &root[1..root.len() - 1])
+        .replace("@SESSION@", sid);
+    let out_dir = dir.join("agent-transcripts");
+    fs::create_dir_all(&out_dir)?;
+    let out = out_dir.join(format!("{sid}.jsonl"));
+    fs::write(&out, text).with_context(|| format!("запись {}", out.display()))?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2740,7 +2905,23 @@ fn run_session(
         implicit_mcp_dir(&dir)?
     };
     let mcp = StdioMcp::spawn(&hooks, &mcp_dir, f.mcp_explicit.then_some(sid.as_str()))?;
-    let mut d = RealDriver { hooks, mcp };
+    // журнал агента (§8а): у плеча без снимка хуки его не читают — поле входа то же
+    let transcript = match &sp.transcript {
+        Some(name) => Some(prepare_transcript(
+            &p.sessions_corpus,
+            name,
+            &dir,
+            &hooks.project,
+            &sid,
+        )?),
+        None => None,
+    };
+    let mut d = RealDriver {
+        hooks,
+        mcp,
+        transcript,
+        data: data.clone(),
+    };
     let mut r =
         play(&mut d, sp, &w, f, &refs, count, &sid).with_context(|| format!("сессия {}", sp.id))?;
     if let Some(n) = wait_code_sync(&d.hooks) {
@@ -2894,9 +3075,27 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     let set = load_set(&set_path)?;
     let corpus = sessions_corpus::load(&p.sessions_corpus)?;
     let sum = validate_set(&set, &corpus)?;
+    for s in &set {
+        if let Some(t) = &s.transcript {
+            let f = p
+                .sessions_corpus
+                .join(TRANSCRIPTS_DIR)
+                .join(format!("{t}.jsonl"));
+            if !f.is_file() {
+                bail!("{}: нет фикстуры журнала агента {}", s.id, f.display());
+            }
+        }
+    }
     println!(
-        "набор ТС-2: сессий {} (стандартных {}, тяжёлых {}), событий {:?}, нагетов {}",
-        sum.sessions, sum.standard, sum.heavy, sum.events, sum.nuggets
+        "набор ТС-2: сессий {} (стандартных {}, тяжёлых {}), событий {:?}, нагетов {}; с журналом \
+         агента {}, «оборванных» тяжёлых {}",
+        sum.sessions,
+        sum.standard,
+        sum.heavy,
+        sum.events,
+        sum.nuggets,
+        sum.transcripts,
+        sum.heavy_aborts
     );
     let items: Vec<(String, String)> = set
         .iter()
@@ -3311,6 +3510,10 @@ mod tests {
         fn abs(&self, rel: &str) -> String {
             format!("/p/{rel}")
         }
+        fn abandon(&mut self, session: &str) -> Result<()> {
+            self.calls.push(format!("abandon {session}"));
+            Ok(())
+        }
     }
 
     fn words(t: &str) -> usize {
@@ -3654,6 +3857,140 @@ type = "checkpoint"
         let set = load_set(&repo.join("eval").join("sessions.toml")).unwrap();
         let s = validate_set(&set, &corpus()).unwrap();
         assert!(s.sessions >= MIN_SESSIONS && s.standard >= MIN_STANDARD && s.heavy >= MIN_HEAVY);
+        // задача 17d (§3.1): журналы агента и «оборванные» тяжёлые сессии; фикстуры на месте
+        assert!(s.heavy_aborts >= MIN_HEAVY_ABORT && s.transcripts >= s.heavy_aborts);
+        let dir = repo
+            .join("eval")
+            .join("sessions-corpus")
+            .join(TRANSCRIPTS_DIR);
+        for sp in set.iter().filter(|s| s.transcript.is_some()) {
+            let f = dir.join(format!("{}.jsonl", sp.transcript.as_deref().unwrap()));
+            let text = fs::read_to_string(&f).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            // предфильтр снимка ищет `"type":"user"` без пробелов; заглушки подставляет раннер
+            assert!(text.contains("\"type\":\"user\""), "{}", f.display());
+            assert!(
+                text.contains("@SESSION@") && text.contains("@ROOT@/"),
+                "{}",
+                f.display()
+            );
+            for line in text.lines() {
+                serde_json::from_str::<Value>(line)
+                    .unwrap_or_else(|e| panic!("{}: {e}: {line}", f.display()));
+            }
+        }
+    }
+
+    /// Задача 17d (§3.1, §8а): «оборванная» сессия — после своих событий перестаёт быть живой
+    /// ([`Driver::abandon`]), затем стартует другая сессия; раздел снимка в её дайджесте —
+    /// обязательная строка. У плеча без снимка события нет, метка исключена из сравнения.
+    #[test]
+    fn abort_session_starts_next_with_snapshot_section() {
+        let c = corpus();
+        let mut sp = spec();
+        sp.transcript = Some("shop-export-stream".into());
+        sp.abort = true;
+        let w = world(&sp, &c).unwrap();
+        let caps = caps_from(
+            &json!({ "version": "0.0.11-m6", "git": "abc", "features": ["m6", "snapshot"] }),
+        )
+        .unwrap();
+        let f = feats(&caps, true, false);
+        assert!(f.snapshot);
+        let with_section = |shown: bool| Mock {
+            calls: Vec::new(),
+            hook: Box::new(move |cmd, inp| {
+                let next = inp["session_id"].as_str() == Some("sid-next");
+                match (cmd, inp["source"].as_str()) {
+                    ("session-start", Some("startup")) if next && shown => format!(
+                        "{}### Последнее известное состояние (снимок 10:00, извлечено \
+                         автоматически)\nфайлы: services/orders/src/export.rs\n",
+                        digest()
+                    ),
+                    ("session-start", Some("startup")) => digest(),
+                    ("prompt", _) => prompt_text(),
+                    _ => String::new(),
+                }
+            }),
+            mcp: Box::new(|_, _| "карточка".into()),
+        };
+        let mut m = with_section(true);
+        let r = play(&mut m, &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        // порядок: последний `Stop`, обрыв, старт другой сессией
+        let tail: Vec<&str> = m
+            .calls
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "hook checkpoint \"Stop\"",
+                "abandon sid",
+                "hook session-start \"SessionStart\"",
+            ]
+        );
+        let last = r.steps.last().unwrap();
+        assert_eq!(last.label, label::AFTER_ABORT);
+        assert!(last.classes[class::SNAPSHOT] > 0);
+        let chk: Vec<(&str, &str, bool)> = r
+            .required
+            .iter()
+            .filter(|c| c.step == label::AFTER_ABORT)
+            .map(|c| (c.kind.as_str(), c.key.as_str(), c.found))
+            .collect();
+        assert_eq!(chk, vec![("snapshot", "last_state", true)]);
+        let sum = summarize(std::slice::from_ref(&r), &Exclusions::of(&f));
+        assert!(sum.snapshot_tokens[label::AFTER_ABORT] > 0);
+        assert!(sum.tokens_by_label[label::AFTER_ABORT] > 0);
+        // раздела нет — обязательная строка не найдена и названа в сводке
+        let mut m = with_section(false);
+        let r = play(&mut m, &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        let sum = summarize(&[r], &Exclusions::of(&f));
+        assert!(
+            sum.required_missing.iter().any(|m| m.contains("snapshot")),
+            "{:?}",
+            sum.required_missing
+        );
+        // плечо без снимка: ни обрыва, ни старта; метка исключена и в сводку не входит
+        let old = feats(&m6_caps(), true, false);
+        assert!(!old.snapshot);
+        let mut m = with_section(true);
+        let r = play(&mut m, &sp, &w, &old, &refs(), &words, "sid").unwrap();
+        assert!(!m.calls.iter().any(|c| c.starts_with("abandon")));
+        assert!(r.skipped.contains(&label::AFTER_ABORT.to_string()));
+        assert!(r.steps.iter().all(|s| s.label != label::AFTER_ABORT));
+        assert!(Exclusions::of(&old).labels.contains(label::AFTER_ABORT));
+        // сессия без `abort` — без лишнего старта
+        sp.abort = false;
+        let mut m = with_section(true);
+        let r = play(&mut m, &sp, &w, &f, &refs(), &words, "sid").unwrap();
+        assert!(r.steps.iter().all(|s| s.label != label::AFTER_ABORT));
+        assert!(!m.calls.iter().any(|c| c.starts_with("abandon")));
+    }
+
+    /// `abort` без журнала агента и имя фикстуры-путь — ошибки набора.
+    #[test]
+    fn set_checks_abort_and_transcript() {
+        let mut sp = spec();
+        sp.abort = true;
+        let err = format!("{:#}", validate_set(&[sp], &corpus()).unwrap_err());
+        assert!(err.contains("abort: нужен transcript"), "{err}");
+        let mut sp = spec();
+        sp.transcript = Some("../x".into());
+        let err = format!("{:#}", validate_set(&[sp], &corpus()).unwrap_err());
+        assert!(err.contains("имя фикстуры"), "{err}");
+    }
+
+    /// Формат времени базы у сдвига последнего обращения оборванной сессии.
+    #[test]
+    fn db_time_format_is_fixed_width_utc() {
+        let t: jiff::Timestamp = "2026-11-10T19:05:07.000123Z".parse().unwrap();
+        assert_eq!(db_time(t), "2026-11-10T19:05:07.000123Z");
+        let t: jiff::Timestamp = "2026-01-02T03:04:05Z".parse().unwrap();
+        assert_eq!(db_time(t), "2026-01-02T03:04:05.000000Z");
     }
 
     #[test]
