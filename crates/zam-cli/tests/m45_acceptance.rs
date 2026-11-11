@@ -991,7 +991,7 @@ fn file_change_marks_stale() {
     assert_eq!(
         c,
         format!(
-            "ZeroAIMemory: о файле src/a.rs в памяти: {TITLE} [insight, возможно устарело] — i:{iid}"
+            "ZeroAIMemory: о файле src/a.rs в памяти: {TITLE} [insight·возможно устарело] i:{iid}"
         )
     );
     let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-a\n+b\n*** End Patch\n";

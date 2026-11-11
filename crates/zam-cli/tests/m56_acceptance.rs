@@ -1139,8 +1139,8 @@ fn acceptance_old_cache_reads() {
     ));
     assert_eq!(
         ctx,
-        "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] — i:E7; \
-         Архитектура пула [note, возможно устарело] — n:N1"
+        "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] i:E7; \
+         Архитектура пула [note·возможно устарело] n:N1"
     );
     // очередь клиента M4.5 — на настоящий сервер
     let (url, tok, db) = start_db("old-queue");

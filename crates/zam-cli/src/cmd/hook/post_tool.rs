@@ -445,7 +445,9 @@ fn edited(env: &Env, rel: &str, parse_until: Option<Instant>) -> Option<cache::C
 }
 
 /// Строки знания о файле (§6.3) по `file-refs.json` для путей `rels` (относительно корня):
-/// `ZeroAIMemory: о файле <path> в памяти: <title> [<kind>] — <ref>; …` (до 3 записей).
+/// `ZeroAIMemory: о файле <path> в памяти: <title> [<kind>] <ref>; …` (до 3 записей; вид v2, как у
+/// подсказок сервера и `Trigger::hint`: теги через «·», ссылка без « — »; M6 §4.3, решение
+/// координатора задачи 13a).
 /// `shown` задан — каждый файл раз за сессию (ключ `file:<путь>` добавляется в `shown`).
 pub fn file_context_lines(
     env: &Env,
@@ -476,11 +478,11 @@ pub fn file_context_lines(
     lines
 }
 
-/// Строка знания о файле: до [`FILE_ITEMS_MAX`] записей, `stale` — «возможно устарело».
+/// Строка знания о файле: до [`FILE_ITEMS_MAX`] записей, `stale` — тег «возможно устарело».
 /// Ссылки на символ (M5.6 §8; решение составителя плана 13) — первыми; все записи о одном
-/// символе — «ZeroAIMemory: о `Sym` в <путь> в памяти: <title> [<kind>] — <ref>; …»; смесь
+/// символе — «ZeroAIMemory: о `Sym` в <путь> в памяти: <title> [<kind>] <ref>; …»; смесь
 /// символьных и файловых (или разных символов) — «ZeroAIMemory: о файле <путь> в памяти:
-/// `Sym`: <title> [<kind>] — <ref>; <title> [<kind>] — <ref>».
+/// `Sym`: <title> [<kind>] <ref>; <title> [<kind>·возможно устарело] <ref>».
 pub fn file_hint(pr: &PathRefs) -> String {
     let mut items: Vec<&cache::RefItem> = pr.items.iter().collect();
     // устойчиво: символьные первыми, порядок сервера внутри групп
@@ -503,11 +505,11 @@ pub fn file_hint(pr: &PathRefs) -> String {
                 .collect();
             let mut tag = i.kind.clone();
             if i.state == "stale" {
-                tag.push_str(", возможно устарело");
+                tag.push_str("·возможно устарело");
             }
             match (&i.symbol, one) {
-                (Some(sym), None) => format!("`{sym}`: {title} [{tag}] — {}", i.id),
-                _ => format!("{title} [{tag}] — {}", i.id),
+                (Some(sym), None) => format!("`{sym}`: {title} [{tag}] {}", i.id),
+                _ => format!("{title} [{tag}] {}", i.id),
             }
         })
         .collect();
@@ -583,8 +585,8 @@ mod tests {
         };
         assert_eq!(
             file_hint(&pr),
-            "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] — i:01A; \
-             Архитектура [note, возможно устарело] — n:01B; Пул v2 [changelog] — c:01C"
+            "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] i:01A; \
+             Архитектура [note·возможно устарело] n:01B; Пул v2 [changelog] c:01C"
         );
     }
 

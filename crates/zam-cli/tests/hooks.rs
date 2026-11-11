@@ -762,7 +762,13 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
         "{c}"
     );
     // R2: блок v1 устарел — сервер напоминает
-    assert!(c.contains("устарел (v1 → v6)"), "{c}");
+    assert!(
+        c.contains(&format!(
+            "устарел (v1 → v{})",
+            zam_core::AGENT_BLOCK_VERSION
+        )),
+        "{c}"
+    );
     let s = p.session("ss-1");
     assert_eq!(s["agent"], "claude-code", "{s}");
     assert_eq!(s["solution"], G, "{s}");
@@ -1623,7 +1629,7 @@ fn write_file_refs(p: &Proj, server: &str) {
 
 /// Строка знания о `src/pool.rs` из [`write_file_refs`].
 const POOL_LINE: &str = "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] \
-— i:E7; Архитектура пула [note, возможно устарело] — n:N1";
+i:E7; Архитектура пула [note·возможно устарело] n:N1";
 
 /// Claude `PostToolUse` (успех) инструмента `tool` с `tool_input`.
 fn post_ok(p: &Proj, session: &str, tool: &str, input: Value) -> Value {
@@ -1762,7 +1768,7 @@ fn post_tool_read_once_per_file() {
     );
     let lines: Vec<&str> = c.lines().collect();
     assert_eq!(lines.len(), 2, "{c}");
-    assert!(lines[0].starts_with("ZeroAIMemory: о файле scripts/deploy.sh в памяти: Деплой через systemd [changelog] — c:C1"), "{c}");
+    assert!(lines[0].starts_with("ZeroAIMemory: о файле scripts/deploy.sh в памяти: Деплой через systemd [changelog] c:C1"), "{c}");
     assert!(lines[1].contains("для **/*.sh"), "{c}");
     // показанное — ключом file:<путь> в shown-файле сессии
     let shown = std::fs::read_to_string(p.session_file("shown", "o1", ".json").unwrap()).unwrap();
@@ -1956,7 +1962,7 @@ impl Pool {
     }
     std::fs::write(p.repo.join("src/pool.rs"), &src).unwrap();
     let line = "ZeroAIMemory: о файле src/pool.rs в памяти: `Pool::get`: Пул соединений течёт \
-                [gotcha] — i:E7; Архитектура пула [note] — n:N1";
+                [gotcha] i:E7; Архитектура пула [note] n:N1";
     let (mut times, mut idle) = (Vec::new(), Vec::new());
     for i in 0..100 {
         let (tool, input) = if i % 2 == 0 {
@@ -2183,9 +2189,7 @@ fn prompt_flushes_changed_queue() {
         json!({"file_path": p.repo.join("src/pool.rs")}),
     );
     let o = hook_slow(&p, &url, "post-tool", &read);
-    assert!(
-        context(&o, "PostToolUse").contains(&format!("Пул соединений течёт [insight] — i:{id}"))
-    );
+    assert!(context(&o, "PostToolUse").contains(&format!("Пул соединений течёт [insight] i:{id}")));
     // правка → очередь → prompt отправляет
     std::fs::write(p.repo.join("src/pool.rs"), b"v2\n").unwrap();
     let edit = post_ok(
@@ -3433,13 +3437,13 @@ fn file_hint_names_symbol() {
     };
     assert_eq!(
         read("h1", "src/store.rs"),
-        "ZeroAIMemory: о `Store::open` в src/store.rs в памяти: Открытие базы [gotcha] — i:I1; \
-         Схема [note] — n:N1"
+        "ZeroAIMemory: о `Store::open` в src/store.rs в памяти: Открытие базы [gotcha] i:I1; \
+         Схема [note] n:N1"
     );
     assert_eq!(
         read("h1", "src/api.rs"),
-        "ZeroAIMemory: о файле src/api.rs в памяти: `ApiError`: Ошибки [gotcha] — i:I2; \
-         Маршруты [changelog] — c:C1"
+        "ZeroAIMemory: о файле src/api.rs в памяти: `ApiError`: Ошибки [gotcha] i:I2; \
+         Маршруты [changelog] c:C1"
     );
     // pre-tool перед правкой — та же строка
     let pre = p.ev(
