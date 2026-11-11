@@ -83,16 +83,16 @@ impl ToolName {
     fn description(self) -> &'static str {
         match self {
             ToolName::Search => {
-                "Поиск в памяти (Knowledge, Rules, решение): выжимки кэша, затем карточки — id, \
-                 путь › секция, [балл] rN · ax|th|hyp · дата UTC · Nt, (выдавалось); вложение — \
-                 a:<id>, файл, locator. filters: kinds (+term, task, question, attachment), \
-                 insight_kinds, file, decided_by. Дальше — memory_read."
+                "Поиск (Knowledge, Rules, решение): [cache] и карточки id, путь › секция, [балл] \
+                 rN · ax|th|hyp · дата UTC · Nt; (выдавалось) — было в сессии, (…, в выжимке) — \
+                 текст в [cache]; вложение a:<id>. filters: kinds (+term, task, question, \
+                 attachment), file, decided_by. Далее memory_read, длинное — focus."
             }
             ToolName::Read => {
-                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:|w:<id>, путь <пространство>:/<путь>; \
-                 вложение — a:<id> или b:<sha256>, locator page:N|slide:N|para:N|sheet:Лист!A1:F40, \
-                 без него — оглавление. tier, section, max_tokens; if_rev — unchanged; since_rev — \
-                 дифф. Ошибка — в элементе."
+                "Чтение до 20 целей: n:|i:|c:|r:|t:|k:|q:|w:<id>, <пространство>:/<путь>; вложение \
+                 a:<id>|b:<sha256> с locator page:N|sheet:Лист!A1:F40. tier, section, max_tokens, \
+                 if_rev, since_rev (дифф). Длинное — focus, один на пачку; [пропущено: адрес] — \
+                 дочитать range. «уже выдавалось» — текст у тебя есть."
             }
             ToolName::CachePut => {
                 "Сохранить выжимку ответа на запрос (до 600 токенов) с источниками [{id, rev?, \
@@ -266,7 +266,9 @@ impl ToolName {
                     "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "idea", "question", "report"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}; idea: origin обязателен — human (записана по словам человека) | agent (своя мысль: не предлагается, человек принимает её в WebUI), priority low|normal|high, horizon YYYY-MM-DD («не раньше»), links"},
+                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}; idea: origin обязателен — human (записана по словам человека) | agent (своя мысль: не предлагается, человек принимает её в WebUI), priority low|normal|high, horizon YYYY-MM-DD («не раньше»), links",
+                        "properties": {"kind": {"type": "string", "description":
+                            "insight: gotcha|failure|experiment|discovery|decision. Отверг подход после проверки — decision: decision.options — отвергнутое, chosen — выбранное, rationale — «отвергнуто, потому что…» (или failure с результатом)"}}},
                     "images": {"type": "array", "description": "report: файлы по ссылкам тела ![…](figs/a.png); name — путь из ссылки, data — base64",
                         "items": {"type": "object", "properties": {
                             "name": {"type": "string"}, "data": {"type": "string"}},

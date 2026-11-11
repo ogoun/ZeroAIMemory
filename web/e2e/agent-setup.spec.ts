@@ -89,7 +89,10 @@ test('Подключение агента: опции меняют фрагме�
   await expect(toml).toContainText('Проект E2E');
   const guid = ((await toml.textContent()) ?? '').match(GUID)?.[0];
   expect(guid).toBeTruthy();
-  await expect(frag(page, 'Фрагмент .mcp.json')).toContainText(guid!);
+  // GUID — в блоке CLAUDE.md/AGENTS.md и solution.toml; `.mcp.json` с M6 — stdio `zam mcp` без
+  // GUID (решение берётся из solution.toml; журнал M6, задача 8b → 13a)
+  await expect(block).toContainText(guid!);
+  await expect(frag(page, 'Фрагмент .mcp.json')).not.toContainText(guid!);
   await page.getByLabel('Язык инструкции').selectOption('en');
   await expect(block).toContainText('ZeroAIMemory memory');
   await expect(toml).toContainText(guid!);

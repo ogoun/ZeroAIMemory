@@ -11727,3 +11727,191 @@ zam-store -p zam-server -p zam-cli -p xtask --all-targets -D warnings` — чи�
 переименования) → первый FAIL; дерево после откатов совпало со снимком. Прогоны: `cargo fmt --all
 --check`, `clippy -p zam-store -p zam-server --all-targets -D warnings` — чисто; `zam-store`
 `--lib` 105 (+1), `migrate_rebuild` 10, `sessions` 17, `snapshots` 4; `zam-server` `snapshot` 27, `boot` 14 — PASS.
+## Задача 13a. Блок v7 и протокол (исполнитель, 2026-11-11)
+
+Worktree `.tmp/m6/wt-b`, ветка `m6-portability` (база `5214b93`). Коммит — `feat(agent): блок
+инструкции v7 и протокол` (sha — в отчёте координатору). Спецификация §6, §7.1, §7.3, §13 (основной
+вариант v7), бриф задачи 13a. Логи — `.tmp/m6/wt-b/.tmp/t13a/` (`red*.log`, `g*.log`, `rb-*.log`).
+
+### Сделано
+
+- **Блок v7** (`AGENT_BLOCK_VERSION = 7`, `agent_setup/templates.rs`, ru и en):
+  - строка поиска: «`memory_read` пачкой (длинное и дорогая модель — один `focus`)» / «in one
+    call (long text and an expensive model — one `focus`)»;
+  - из строки `axiom` убрано «; `certainty` меняй с `reason`», из строки кода — «функция —
+    `путь#Тип::метод`» (обе мысли уже в протоколе: «Меняется с `reason`», «Ссылка на символ —
+    `путь#Тип::метод`»); `MOVED_TO_GUIDE` теста — 18 фраз (+4);
+  - строка отчётов не менялась; правило отвергнутых подходов, вид ссылки на код, сессия MCP — в
+    блок **не** вошли (принцип §13).
+- **Бюджет — фактические числа** (bge-m3 fp16, `common::ml::bge_counter`, тот же счётчик, что тест
+  `agent_setup_block_v7_under_500_tokens_ru_en`; худший случай — длинный адрес с префиксом,
+  кириллическое имя 128 → 40, GUID `d6c5a5d9-…`, Rules открыты): **483 ru / 479 en** (оценка
+  спецификации 482/478; «один» — +1). Прочие случаи: адрес по IP — 470/466; Rules закрыты — −8.
+  Без «один» было ровно 482/478 (замер прогона `g1`).
+- **Протокол** `guide.{ru,en}.md`:
+  - новый раздел «Фокусное чтение» / «Focused reading»: когда (`~T` > ≈ 600 и дорогая модель, один
+    факт), один `focus` на пачку, что приходит, дочитывание `range: "r<rev>:S-E"` (CLI `--range`,
+    устаревшая ревизия), `locator` у документа, `focus skipped: short|not indexed`, `focus lexical`,
+    400 при `section|locator|since_rev|range`;
+  - «Запись»: правило отвергнутых подходов (дословно по §13) и `idempotency_key` у
+    `memory_write` (422 при другом теле);
+  - «Поиск»: `(выдавалось, в выжимке)`, пометка `· уже выдавалось в этой сессии` (не перечитывать,
+    пока контекст не сжат), отсылка к `focus`;
+  - «Подключение»: Claude Code — stdio `zam mcp` (сам привязывает сессию); прочие клиенты —
+    `X-Zam-Session` или `session_id` у `memory_search|read|recall`, оба и различаются — 400;
+  - «Отчёты»: схемы ссылок, картинке `vscode:`/`file:` — 422, переход только по `vscode://file/…`,
+    «копировать путь»; вид ссылки на код `vscode://file/<абсолютный нормализованный путь>:<строка>`
+    без `//`, `.`/`..`, `%2F`/`%5C`/`%2E`/`%252F`, примеры POSIX и Windows;
+  - «После сжатия…»: `timeout_ms` (`recall.max_timeout_ms`, `recall timeout`), `session_id` и
+    `agent_block_version` у своего клиента;
+  - «Снимок сессии»: правила флагов клиента (`--password`, `--token`, `-pXXX`, `-u user:pass`,
+    `Authorization:`, `X-Api-Key:`; ссылки на переменные остаются) — раздел и «не диктуйте секреты»
+    уже были (17b/17c);
+  - «Проактивное вспоминание»: строки раздела `### Правила` (`<путь> [надёжность] n:<id>`, L0 —
+    `<путь> — <фраза> [надёжность] n:<id>`, `memory_read n:<id>`, «не показано — правил: N»),
+    индексы `<ссылка> «заголовок» · Nt`, строки «правка затрагивает» (`hooks.checkpoint_impact`).
+- **MCP** (`mcp/tools.rs`, `mcp/mod.rs`):
+  - `memory_read` (295 символов): `focus`, «один на пачку», `[пропущено: адрес]` → `range`, «уже
+    выдавалось»; убраны «без него — оглавление» и «Ошибка — в элементе» ради предела 300;
+  - `memory_search` (298): легенда хвоста, `(выдавалось)`, `(…, в выжимке)`, «длинное — focus»;
+    `insight_kinds` убран из описания (остался в описании поля `filters`);
+  - `memory_log`: у поля `data` — `properties.kind.description` с правилом отвергнутых подходов
+    (213 символов);
+  - `INSTRUCTIONS` `initialize`: фокус, «уже выдавалось», отвергнутый подход, строки правил и
+    индексов дайджеста.
+  - Аргументы `session_id`, `idempotency_key`, `timeout_ms`, `source`, `agent_block_version` в
+    схемах — уже сделаны задачей 19; здесь — тексты протокола.
+- **Тесты.** `agent_setup.rs`: `agent_setup_block_v7_under_500_tokens_ru_en` (бывший v6),
+  `block_version_reminder_v6_to_v7` (бывший v5→v6: v6 и v5 — по одному напоминанию «vN → v7», v7 —
+  ни одного), `guide_has_focus_rejected_snapshot` (10 разделов ru/en, правила нет в блоке),
+  версии в `template_edit_bumps_version` (7 → 8 → 9 → 10) и `template_preview_renders_unsaved`;
+  `mcp.rs`: `mcp_v7_descriptions_focus_seen_rejected`; `m57_acceptance.rs` — версия через
+  `AGENT_BLOCK_VERSION` (проверка M5.7 сохранена). WebUI: `web/e2e/agent-setup.spec.ts:92` — GUID
+  ждётся в блоке, а `.mcp.json` без GUID (передача 8b).
+
+### Перечень передач «→ 13a» и «→ 13a/13c» (задачи 2–19)
+
+«13a» — блок, `guide`, описания и схемы MCP, `INSTRUCTIONS`, e2e подключения; «13c» — ТЗ,
+CHANGELOG, README, `deploy/README-install.md`.
+
+| Источник (стр. журнала) | Что передано | Куда | Статус |
+|---|---|---|---|
+| 3 (986, 1068) | «(выдавалось)» в описании `memory_search` и протоколе | 13a | сделано в задаче 3, проверено |
+| 3 (1070) | заголовок `${CLAUDE_CODE_SESSION_ID}` в `.mcp.json` | — | снято ревью 3 (I4) |
+| 3 (1139) | блок/протокол: MCP Claude Code через `zam mcp` | 13a | сделано (guide «Подключение») |
+| 3 (1139) | CHANGELOG «пересоздайте `.mcp.json`», ТЗ §13.1, матрица §13 (M8) | 13c | в 13c |
+| 5 (1595, 1745) | легенда хвоста в описании `memory_search` | 13a | сделано в 5, сохранено (298/300) |
+| 5 (1745, 1844, 1954, 2020, 2095) | CHANGELOG: `POST /cache` `echo`, ответы записи, карточки v2, `brief_min_rel`, умолчания, `tokens` выжимок без модели, `tokenizer.json` в комплекте, `/health.token_counter|tokenizer_id` | 13c | в 13c |
+| 5 (1755) | строки знания о файле клиента — к виду v2 «если владелец захочет» | владелец | не делалось: это клиент `zam` (вне 13a), решения владельца нет |
+| 6 (2248) | CHANGELOG: время UTC в текстовом выводе `zam` | 13c | в 13c |
+| 7a (2464) | `(выдавалось, в выжимке)` в описании `memory_search`/протоколе | 13a | сделано |
+| 7a (2464, 2472) | CHANGELOG: `in_cache`, `seen`, `seen_epoch`, `reread_calls`, `new_epoch` | 13c | в 13c |
+| 7a (2472) | «уже выдавалось в этой сессии» — описание `memory_read` и протокол | 13a | сделано |
+| 7b (2721) | описание `memory_read` — `focus`, легенда `[пропущено: …]`; блок — когда звать фокус | 13a | сделано |
+| 7b (2721, 2829, 2902) | CHANGELOG: `focus`/`tier: focus`, `warnings`, `· фокус`, ключи `[read] focus_*`, `zam read --focus|--range|--tier focus`, `focus_parts`, `range:r<rev>:S-E`, `features: focus` | 13c | в 13c |
+| 7b (2728, 2829) | блок — «один `focus` на пачку» | 13a | сделано (блок +1 токен, протокол, описание) |
+| 7b (2829, 2902) | описание `memory_read` — `range`, адрес `r<rev>:S-E` | 13a | сделано (описание; подробности — протокол) |
+| 8a (3118) | `guide`/`INSTRUCTIONS` — формат строк индексов | 13a | сделано |
+| 8a (3118, 3175) | CHANGELOG/ТЗ §7.12, §10.3: `rules_tokens`, индексы, L0 корней, «снимок <дата>», `digest` `/code/status` | 13c | в 13c |
+| 8a (3239) | `guide`/`INSTRUCTIONS` — строка правила L0 и «не показаны» → `memory_read n:<id>` | 13a | сделано (итоговый вид 8c: без «правило») |
+| 8b (3599, 3653) | CHANGELOG/ТЗ: события `search|read|rules`, `holdout`, `?tokens=true`, `?only=rules`, страница «Сессии», смешение учёта до/после 8b | 13c | в 13c |
+| 8b (3624) | `web/e2e/agent-setup.spec.ts:92` — GUID не в `.mcp.json` | 13a | сделано |
+| 8c (3980, 4071) | `guide`/`INSTRUCTIONS` — формат раздела Rules | 13a | сделано |
+| 8c (3980, 4071) | CHANGELOG — строка правила в дайджесте, восстановлении и пакете субагенту | 13c | в 13c |
+| 9 (4163) | CHANGELOG/ТЗ: `prompt_min_score_fts`, `post_tool_coverage`, `features: hint_thresholds`, `eval --hints --grid` | 13c | в 13c |
+| 10 (4532) | CHANGELOG/ТЗ: `search.kind_boost_mode`, `features: kind_boost`, наборы | 13c | в 13c |
+| 11 (5013, 5048) | CHANGELOG/ТЗ: `search.w_attach`, `boost_area` 1,10 → 1,0 | 13c | в 13c |
+| 12 (5188) | блок/`guide`: строки «правка затрагивает» в напоминании `Stop` | 13a | сделано (guide; блок — нет: редкий сценарий, ключ выключен по умолчанию) |
+| 12 (5188, 5300) | CHANGELOG/ТЗ: `cargo xtask ab`, `hooks.checkpoint_impact|holdout`, `POST /sessions {holdout}`, маркер `cache/holdout-…`, `--allow-missing` | 13c | в 13c |
+| 14 (5547) | «→ 13a/13b»: `recv_count`, `EXTRACT_VERSION` 3, p50 `session-start` | 13b/13c | не агентский текст — в 13b/13c |
+| 15b (6838) | ТЗ §7.6 `secrets_scan_depth`, крейт `zam-secrets`, CHANGELOG | 13c | в 13c |
+| 17a (7153) | `guide` — правила флагов | 13a | сделано («Снимок сессии») |
+| 17a (7153, 7325) | ТЗ §8а — сверка форматов, предфильтр Codex, пропуски, `partial` | 13c | в 13c |
+| 17b (7566) | ТЗ §8а, §14: `PostCompact`, `prompt_at`, очередь, `zam sessions snapshot`, `ended_at` | 13c | в 13c |
+| 17c (8170, 8402, 9066, 10039, 10125) | ТЗ §8, §8а, §14 и CHANGELOG: порядок раздела, `PUT` 204/200, `snapshot_at`, усечение, `stale_ignored`, оборванная сессия (ред. 4.8), resume; `SHOW_ENDED` — вычеркнуть | 13c | в 13c |
+| 15a (9331, 9547, 9712) | ТЗ §16 п. 15, §17 п. 18, CHANGELOG, README: схемы, `data-url`, «копировать путь», превью, «PDF / печать», `.size-limit.json` | 13c | в 13c |
+| 15a (9331, 9707, 9841, 9941) | вид ссылки на код `vscode://file/<путь>:<строка>`: без `//`, без `.`/`..`, без `%2F`/`%5C`/`%2E`/`%252F`/`%255C`/`%252E` | 13a | сделано (guide «Отчёты»; в блок не вошло — бюджет, принцип §13) |
+| 15a (9331) | протокол: `zam report` отклоняет чужую схему, картинке `vscode:`/`file:` — 422, «копировать путь» | 13a | сделано (guide «Отчёты») |
+| 17b-http (10488, 10617) | ТЗ §10.3: абсолютный срок хука, строки `hooks.log`, подмены тестов (+`ZAM_TEST_GC_STALL_MS`) | 13c | в 13c |
+| 15c (10748, 10884) | README, `deploy/README-install.md`, ТЗ §16.3, CHANGELOG: `LICENSES/`, офлайн-упаковка, раздельная сборка `zam` | 13c | в 13c |
+| 16 (11185) | ТЗ §10, §7.13: лёгкий поиск идей, стоп-основы, `done_at` | 13c | в 13c |
+| 16 (11360, 11460, 11487) | помечено «→ 13a», но это спецификация §16 и ТЗ §9.2, §10: стоп-основы, оговорка FTS, `contradicts graph truncated|unavailable` | 13c | в 13c (документы) |
+| 19 (11618) | MCP: `session_id` у `memory_search|read` и «заголовок против аргумента — 400», `idempotency_key` у `memory_write`, `source|agent_block_version|timeout_ms` у `memory_recall` | 13a | схемы — задача 19; протокол — сделано |
+| 19 (11618, 11626, 11701) | ТЗ §API, §14: `/health.features`, `docs/api-compat.md`, `timeout_ms`, `recall.max_timeout_ms`, `Idempotency-Key` узлов, `node_idempotency`, `subagent-start` без `agent_id`, `area.toml`; CHANGELOG/README — то же и смена «заголовок ≠ аргумент → 400» | 13c | в 13c |
+| 18b2 (6175), 18c (8564, 8773) | «→ 13a: нет» | — | — |
+
+**17d ещё идёт** в основном каталоге и может добавить передачи «→ 13a/13c» — их сверить перед 13c.
+
+### Передано в 13c (единый список)
+
+Всё, что ниже, — документы (ТЗ v1.24, CHANGELOG `[0.0.11-m6]`, README, `deploy/README-install.md`);
+источник — задача и строка журнала.
+
+- **ТЗ §14.2 / журнал** — фактические числа блока v7: 483 ru / 479 en (13a, этот раздел).
+- **CHANGELOG «Изменения подключения»** — блок v7 (`focus`, две фразы в протокол), пересоздать
+  `.mcp.json` (stdio `zam mcp`, прежний HTTP — без сессии) (3, 1139; 13a).
+- **ТЗ §13.1, матрица §13** — `zam mcp` и `X-Zam-Session` по §7.1, `GET /sessions/unattributed`,
+  M8 (`zam` M6 + сервер v0.0.10) (3, 1068, 1139).
+- **CHANGELOG «Изменения ответа»**: 5 (1745, 1844, 1954, 2020, 2095), 6 (2248), 7a (2464, 2472),
+  7b (2721, 2829, 2902), 8a (3118), 8b (3599, 3653), 8c (3980, 4071), 9 (4163), 10 (4532),
+  11 (5013, 5048), 12 (5188, 5300), 15b (6838), 15a (9331, 9547, 9712, 9841), 17c (10039), 19
+  (11626, 11701) — состав см. таблицу выше.
+- **ТЗ**: §7.6 (15b 6838, 6902, 6938, 6943), §7.12 (8a 3118, 14 5550, 6703), §7.13 (16 11185), §8 и
+  §8а (17a 7153, 7325; 17b 7566; 17c 8170, 8402, 9066, 10039, 10125), §9.2 (11 5048, 5068; 16 11460,
+  11487), §10 (10 4576; 16 11185, 11360), §10.3 (8a 3118; 8b 3472; 17b-http 10488, 10617), §10.8 и
+  §15 (8b 3599), §12/§13 (18b1 5782, 18b2 6162, 6355), §12а (14 5522, 5550, 5625, 5667), §12б.3/§12б.6
+  (18c 8763), §14 и §17/§23 (19 11618; 18b2 6162), §16 (15c 10748, 10884; 15a 9331, 9547), §18 (18c
+  8554, 8763), §API (19 11618), `area.toml` (19 11618).
+- **Совместимость (13b/13c)**: 7a (2476), 7b (2730), 8a (3234), 12 (5192), 14 (5547).
+- **README / install**: 15a (9331 — «PDF / печать»), 15c (10748, 10884), 18b1 (5782, 5813, 5827,
+  5849), 18c (8554, 8763), 19 (11626 — `docs/api-compat.md`).
+- **CHANGELOG разработчиков**: 18b2 (6066 — базы с ранней 0025 пересоздать), 19 (11704).
+- **Вопрос владельцу**: 14 (5550, 5606, 5667) — карта кода 3/10 (решено 2026-11-09: в M7);
+  5 (1755) — вид строк знания о файле клиента.
+
+### Решения исполнителя
+
+1. **«один `focus`» — в блоке** (+1 токен): §6 спецификации и передачи 7b требуют совета в блоке,
+   §13 давал строку без него; запас 18/22 токена это позволяет. Подробности («один и тот же текст
+   на пачку, иначе растёт срок») — в протоколе.
+2. **Ссылка на код в отчёте, правила `vscode://file/…`, сессия MCP, `timeout_ms`, правила флагов
+   снимка, строки дайджеста** — только протокол (и `INSTRUCTIONS` для строк дайджеста): нужны не
+   каждой сессии (принцип §13). В блок не вошли.
+3. **Правило отвергнутых подходов в схеме** — `data.properties.kind.description` у `memory_log`
+   (поле `data` получило `properties` только с `kind`; прочие ключи `data` не ограничены — схема
+   без `additionalProperties`).
+4. **Описания MCP**: предел — 300 символов на описание инструмента (юнит
+   `descriptions_short_and_names_unique` и тесты `mcp.rs`/`m56`/`m57`), у полей схемы предел
+   проверяется только у `memory_update_entry`; `data.kind` держит ≤ 300 новый тест.
+5. **`m57_acceptance`** — номер версии берётся из `AGENT_BLOCK_VERSION` (≥ 6): приёмка M5.7
+   проверяет строку идей и перенесённые фразы, а не номер.
+
+### Тесты сначала красные, откаты
+
+- **Красный прогон** (тесты шага 1 до реализации, `red-agent_setup.log`, `red2.log`): FAIL —
+  `agent_setup_block_v7_under_500_tokens_ru_en`, `block_version_reminder_v6_to_v7`,
+  `guide_has_focus_rejected_snapshot`, `agent_setup_contains_axiom_rule_and_rev_rule`,
+  `template_edit_bumps_version`, `template_preview_renders_unsaved`,
+  `mcp_v7_descriptions_focus_seen_rejected`; `acceptance_block_v6_and_mcp` (не зависит от номера)
+  — PASS.
+- **Откаты** (`.tmp/t13a/rollback.ps1`, `rb-A.log`, `rb-B.log`; файлы возвращены из копии, sha256
+  сверен — `restored=True`): R1 правило отвергнутых подходов убрано из `guide.ru.md` →
+  `guide_has_focus_rejected_snapshot` FAIL; R2 «`certainty` меняй с `reason`» снова в блоке →
+  `agent_setup_block_v7_under_500_tokens_ru_en` FAIL; R4 `focus` убран из описания `memory_read` →
+  `mcp_v7_descriptions_focus_seen_rejected` FAIL; R3 `AGENT_BLOCK_VERSION = 6` →
+  `block_version_reminder_v6_to_v7` и `agent_setup_block_v7_…` FAIL; R5 нет `data.kind` в схеме
+  `memory_log` → `mcp_v7_descriptions_focus_seen_rejected` FAIL.
+
+### Прогоны
+
+`CARGO_TARGET_DIR=.tmp/m6/wt-b/target/t13a`, `-j 2`, `ZAM_REQUIRE_ML=1`, модели
+`.tmp/ci-models`: `zam-server --lib` 287 (+1 ignored), `agent_setup` 15, `mcp` 65,
+`m56_acceptance` 8, `m57_acceptance` 13 — PASS; `zam-core` 26 PASS; `cargo clippy -p zam-core -p
+zam-server --all-targets -- -D warnings` — чисто; `cargo fmt --all --check` — чисто (rustfmt
+только файлов задачи).
+### Не сделано / вне задачи
+
+- `crates/zam-cli/tests/init.rs` ждёт маркер `begin v6` (стр. 203, 334, 406, 616, 902, 1117) —
+  с v7 эти тесты падают; файл `zam-cli/**` по условию задачи не правился, готовая правка —
+  `.tmp/m6/wt-b/.tmp/t13a/zam-cli-init-v7.patch` (замена `v6` → `v7` в шести местах).
+- Строки знания о файле клиента (5, 1755) — вопрос владельцу, клиент не правился.

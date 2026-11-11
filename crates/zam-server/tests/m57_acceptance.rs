@@ -1344,10 +1344,13 @@ async fn acceptance_block_v6_and_mcp() {
             .await;
         ok(&r, StatusCode::OK, "agent-setup");
         let j = r.json();
-        assert_eq!(j["version"], 6);
+        // с M6 — блок v7 (строка идей и перенесённые фразы M5.7 в нём сохранены)
+        let v = zam_core::AGENT_BLOCK_VERSION;
+        assert!(v >= 6, "{v}");
+        assert_eq!(j["version"], v);
         let block = j["block"].as_str().unwrap();
         assert!(
-            block.starts_with("<!-- zeroaimemory:begin v6 -->\n"),
+            block.starts_with(&format!("<!-- zeroaimemory:begin v{v} -->\n")),
             "{block}"
         );
         assert!(block.contains(idea), "{lang}: {block}");
@@ -1382,7 +1385,8 @@ async fn acceptance_block_v6_and_mcp() {
         .await;
     ok(&r, StatusCode::OK, "напоминание");
     let t = r.json()["text"].as_str().unwrap_or_default().to_string();
-    assert_eq!(t.matches("устарел (v5 → v6)").count(), 1, "{t}");
+    let want = format!("устарел (v5 → v{})", zam_core::AGENT_BLOCK_VERSION);
+    assert_eq!(t.matches(want.as_str()).count(), 1, "{t}");
     assert_eq!(t.matches("устарел").count(), 1, "{t}");
     let list = rpc(&a, &a.token, "b1", "tools/list", json!({})).await;
     let tools = list["tools"].as_array().unwrap();

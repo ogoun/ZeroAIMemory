@@ -101,13 +101,17 @@ const FORWARDED: [&str; 9] = [
 
 /// Инструкция клиенту в ответе `initialize`.
 const INSTRUCTIONS: &str = "ZeroAIMemory — долговременная память агента. Порядок: memory_search \
-(карточки, шаг 0 — кэш выжимок) → memory_read нужного → memory_cache_put выжимки. Запись — \
-memory_write, memory_log, memory_update_entry; ревизии обязательны при правке (409/428 — \
-перечитать). Задачи, вопросы человеку, словарь — memory_log kind=task|question|term; итог \
-для пользователя — kind=report (большой — zam report); после \
+(карточки, шаг 0 — кэш выжимок) → memory_read нужного (длинное при дорогой модели — focus, один \
+на пачку; [пропущено: …] — дочитать range; «уже выдавалось» — текст у тебя есть) → \
+memory_cache_put выжимки. Запись — memory_write, memory_log, memory_update_entry; ревизии \
+обязательны при правке (409/428 — перечитать). Задачи, вопросы человеку, словарь — memory_log \
+kind=task|question|term; отверг подход после проверки — kind=insight, data.kind=decision \
+(options, chosen, rationale); итог для пользователя — kind=report (большой — zam report); после \
 сжатия контекста — memory_recall event=recovery, задание субагенту — event=brief; карта кода — \
-memory_code (map, symbol, refs, impact). Протокол — zam guide (GET /api/v1/agent-guide). Ответы \
-— Markdown, последняя строка ~N tok.";
+memory_code (map, symbol, refs, impact). Дайджест: правило — <путь> [надёжность] n:<id>, \
+сокращённое — полностью memory_read n:<id>; индексы журнала <ссылка> «…» · Nt — читать по \
+ссылке при нужде. Протокол — zam guide (GET /api/v1/agent-guide). Ответы — Markdown, последняя \
+строка ~N tok.";
 
 /// Маршрут `/mcp` с проверкой bearer-токена. Внутренний роутер инструментов собирается
 /// здесь же из [`crate::api::router`] — без `/mcp`.

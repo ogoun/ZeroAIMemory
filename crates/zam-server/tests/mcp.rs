@@ -4074,3 +4074,92 @@ async fn mcp_ref_prefixes_include_w() {
     .await;
     assert!(o.text.contains("Идея о префиксе w"), "{}", o.text);
 }
+
+/// Описания v7 (M6 §13, задача 13a): `memory_read` — `focus` (один на пачку), легенда
+/// `[пропущено: …]` с дочитыванием `range`, «уже выдавалось»; `memory_search` — легенда хвоста и
+/// пометки `(выдавалось)`, `(выдавалось, в выжимке)`; правило отвергнутых подходов — в описании
+/// поля `data.kind` схемы `memory_log`; `initialize.instructions` — фокус, отвергнутый подход,
+/// строки правил и индексов дайджеста. Все описания — до 300 символов.
+#[tokio::test]
+async fn mcp_v7_descriptions_focus_seen_rejected() {
+    let a = api("mcp-desc-v7", |_| {}).await;
+    let read = tool_def(&a, "memory_read").await;
+    let d = read["description"].as_str().unwrap();
+    assert!(
+        d.chars().count() <= 300,
+        "memory_read: {}",
+        d.chars().count()
+    );
+    for w in [
+        "focus",
+        "один на пачку",
+        "[пропущено",
+        "range",
+        "уже выдавалось",
+        "a:",
+        "b:",
+        "locator",
+        "w:<id>",
+    ] {
+        assert!(d.contains(w), "memory_read: нет «{w}»: {d}");
+    }
+    let search = tool_def(&a, "memory_search").await;
+    let d = search["description"].as_str().unwrap();
+    assert!(
+        d.chars().count() <= 300,
+        "memory_search: {}",
+        d.chars().count()
+    );
+    for w in [
+        "[балл] rN · ax|th|hyp · дата UTC · Nt",
+        "(выдавалось)",
+        "в выжимке",
+        "focus",
+    ] {
+        assert!(d.contains(w), "memory_search: нет «{w}»: {d}");
+    }
+    let log = tool_def(&a, "memory_log").await;
+    let kind = log["inputSchema"]["properties"]["data"]["properties"]["kind"]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("нет data.kind: {log}"));
+    for w in [
+        "decision",
+        "options",
+        "chosen",
+        "rationale",
+        "отвергнуто, потому что",
+        "failure",
+    ] {
+        assert!(kind.contains(w), "data.kind: нет «{w}»: {kind}");
+    }
+    assert!(
+        kind.chars().count() <= 300,
+        "data.kind: {}",
+        kind.chars().count()
+    );
+    let init = rpc(
+        &a,
+        &a.token,
+        &[],
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "test", "version": "1"}}),
+    )
+    .await;
+    let s = init["instructions"].as_str().unwrap_or_default();
+    for w in [
+        "focus",
+        "[пропущено",
+        "уже выдавалось",
+        "kind=decision",
+        "n:<id>",
+        "· Nt",
+        "kind=task|question|term",
+        "event=recovery",
+        "event=brief",
+        "kind=report",
+        "карта кода — memory_code",
+    ] {
+        assert!(s.contains(w), "instructions: нет «{w}»: {s}");
+    }
+}
