@@ -10,7 +10,7 @@
 //!   [`crate::api::big_body`] (не больше двух одновременно, иначе 503 `busy`).
 //! - **Аутентификация** — `Authorization: Bearer` обязателен ([`require_bearer`]): токен
 //!   проверяется тем же извлекателем [`Principal`], что у REST (лимит неудачных попыток по
-//!   IP, отзыв, срок); без заголовка или с неверным токеном — 401 problem+json до `rmcp`.
+//!   IP, отзыв); без заголовка или с неверным токеном — 401 problem+json до `rmcp`.
 //!   Cookie WebUI здесь не действует.
 //! - **Инструменты** ([`tools`]) вызывают маршруты `/api/v1/…` через внутренний `Router`
 //!   ([`Rest`], `tower::ServiceExt::oneshot`; решение контроллера R12) с заголовками
@@ -38,8 +38,12 @@
 //!   выданное. Учёт выданного — один на вызов инструмента, событием `mcp` ([`account`]): с явной
 //!   сессией — в `session_tokens`, иначе — в `tokens_unattributed` пользователя (`GET
 //!   /sessions/unattributed`). Явную сессию задаёт `zam mcp` (`ZAM_SESSION_ID` или
-//!   файл привязки хука `session-start`; `.mcp.json` Claude Code с M6 — stdio `zam mcp`). В
-//!   DEBUG — `implicit` и `no_session`; учёт пишется в фоне после ответа.
+//!   файл привязки хука `session-start`; `.mcp.json` Claude Code с M6 — stdio `zam mcp`) или
+//!   нативный клиент аргументом `session_id` у `memory_recall`, `memory_search`, `memory_read`
+//!   (M6 §16 п. 19, CR-8; [`tools::SESSION_ARG_TOOLS`]): аргумент без заголовка становится
+//!   `X-Zam-Session` внутренних запросов и учёта; оба заданы и совпадают — та же сессия;
+//!   различаются — ответ-ошибка 400 без вызова REST (учёт ответа — в сессии заголовка). В
+//!   DEBUG — `implicit`, `session_arg` и `no_session`; учёт пишется в фоне после ответа.
 pub mod tools;
 
 use std::net::SocketAddr;
@@ -54,7 +58,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header}
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
@@ -252,9 +256,46 @@ impl ServerHandler for McpServer {
         };
         let mut rest = Rest::new(self.rest.clone(), parts);
         rest.cancel = Some(context.ct.clone());
-        // явная сессия — заголовок запроса (`zam mcp` с привязкой, M6 §7.1); иначе — неявная
-        // сессия R13 только для счётчика записей
-        let explicit = rest.header(SESSION_HEADER).is_some();
+        // учёт — по заголовкам запроса и сессии вызова (заголовок или аргумент `session_id`)
+        let mut acct = parts.headers.clone();
+        // явная сессия (M6 §7.1, §16 п. 19 CR-8) — заголовок запроса (`zam mcp` с привязкой) или
+        // аргумент `session_id` (`memory_recall|search|read`): оба — одна сессия, разные — 400
+        // без вызова REST (учёт ответа — в сессии заголовка: он важнее); иначе — неявная сессия
+        // R13 только для счётчика записей
+        let header = rest.header(SESSION_HEADER).map(str::to_string);
+        let arg = match tools::session_arg(tool, request.arguments.as_ref()) {
+            Ok(a) => a,
+            Err(m) => {
+                return Ok(self
+                    .refuse(parts, acct, header.is_some(), StatusCode::BAD_REQUEST, m)
+                    .into());
+            }
+        };
+        match (&arg, &header) {
+            (Some(a), Some(h)) if a != h => {
+                let m = format!(
+                    "session_id «{a}» не совпадает с X-Zam-Session «{h}»: передайте одну сессию"
+                );
+                return Ok(self
+                    .refuse(parts, acct, true, StatusCode::BAD_REQUEST, m)
+                    .into());
+            }
+            (Some(a), None) => match HeaderValue::from_str(a) {
+                Ok(v) => {
+                    rest.headers
+                        .insert(HeaderName::from_static(SESSION_HEADER), v.clone());
+                    acct.insert(HeaderName::from_static(SESSION_HEADER), v);
+                }
+                Err(_) => {
+                    let m = "session_id: недопустимые символы".to_string();
+                    return Ok(self
+                        .refuse(parts, acct, false, StatusCode::BAD_REQUEST, m)
+                        .into());
+                }
+            },
+            _ => {}
+        }
+        let explicit = header.is_some() || arg.is_some();
         if !explicit
             && let Some(id) = implicit_session(&self.state, parts).await
             && let Ok(v) = HeaderValue::from_str(&id)
@@ -269,16 +310,38 @@ impl ServerHandler for McpServer {
             tool = tool.as_str(),
             is_error = out.is_error,
             implicit = rest.origin.implicit,
+            session_arg = arg.is_some(),
             no_session = !explicit && !rest.origin.implicit,
             ms = t.elapsed().as_millis() as u64,
             "инструмент MCP"
         );
-        // учёт — в фоне: ответ агенту его не ждёт (ревью задачи 3, M2)
+        self.spawn_account(parts, acct, explicit, out.tokens());
+        Ok(out.into_result().into())
+    }
+}
+
+impl McpServer {
+    /// Учёт выданного — в фоне: ответ агенту его не ждёт (ревью задачи 3, M2).
+    fn spawn_account(&self, parts: &Parts, headers: HeaderMap, explicit: bool, tokens: u64) {
         if let Some(p) = parts.extensions.get::<Principal>().cloned() {
-            let (st, headers, tokens) = (self.state.clone(), parts.headers.clone(), out.tokens());
+            let st = self.state.clone();
             tokio::spawn(async move { account(&st, &p, &headers, explicit, tokens).await });
         }
-        Ok(out.into_result().into())
+    }
+
+    /// Отказ инструмента до вызова REST (`session_id` против заголовка, CR-8): ответ-ошибка с
+    /// кодом `status` и учётом, как у любого ответа (`explicit` — сессия заголовка).
+    fn refuse(
+        &self,
+        parts: &Parts,
+        headers: HeaderMap,
+        explicit: bool,
+        status: StatusCode,
+        detail: String,
+    ) -> CallToolResult {
+        let out = tools::problem(status, detail);
+        self.spawn_account(parts, headers, explicit, out.tokens());
+        out.into_result()
     }
 }
 

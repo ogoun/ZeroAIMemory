@@ -11,6 +11,7 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::{PatchError, PatchOp, apply_patch, section_bytes};
 
 use super::chunks::{index_state, note_meta, space_kind};
+use super::idempotency::{NodeKey, NodeOp, opt_part};
 use super::write::store_revision;
 use super::{Attribution, AuthorKind, Node, NodeKind, load_node, revision_text, sha256_hex};
 use crate::cache::StaleKind;
@@ -81,12 +82,49 @@ pub async fn update_note(
     l0: Option<String>,
     a: Attribution,
 ) -> Result<Node, WriteError> {
+    update_note_keyed(db, id, base_rev, content, l0, a, None)
+        .await
+        .map(|(n, _)| n)
+}
+
+/// [`update_note`] с `Idempotency-Key` (`key`, [`super::idempotency`]): повтор того же запроса —
+/// узел в текущем виде и `false` (без новой ревизии и без проверки `base_rev`); другой запрос с
+/// тем же ключом — `IdempotencyMismatch`. Иначе — правка и `true`.
+pub async fn update_note_keyed(
+    db: &Db,
+    id: Id,
+    base_rev: i64,
+    content: String,
+    l0: Option<String>,
+    a: Attribution,
+    key: Option<String>,
+) -> Result<(Node, bool), WriteError> {
     write_note(db, move |tx| {
+        let k = NodeKey::new(
+            key,
+            &a,
+            NodeOp::Replace,
+            &[
+                id.to_string().as_bytes(),
+                &base_rev.to_le_bytes(),
+                content.as_bytes(),
+                &opt_part(l0.as_deref()),
+            ],
+        )?;
+        if let Some(k) = &k
+            && let Some(n) = k.replay(tx)?
+        {
+            return Ok((n, false));
+        }
         let node = live_note(tx, id)?;
         if base_rev != node.current_rev {
             return Err(rev_mismatch(tx, &node)?);
         }
-        Ok(commit_text(tx, node, &content, l0.as_deref(), &a)?)
+        let n = commit_text(tx, node, &content, l0.as_deref(), &a)?;
+        if let Some(k) = &k {
+            k.remember(tx, n.id)?;
+        }
+        Ok((n, true))
     })
     .await
 }
@@ -118,42 +156,94 @@ pub async fn patch_note_within(
     a: Attribution,
     max_bytes: usize,
 ) -> Result<Node, WriteError> {
+    patch_note_keyed(db, id, base_rev, ops, a, max_bytes, None)
+        .await
+        .map(|(n, _)| n)
+}
+
+/// [`patch_note_within`] с `Idempotency-Key` (`key`): повтор того же запроса — узел в текущем
+/// виде и `false` (операции второй раз не применяются: два `append` — одна вставка); другой
+/// запрос с тем же ключом — `IdempotencyMismatch`. Иначе — правка и `true`.
+pub async fn patch_note_keyed(
+    db: &Db,
+    id: Id,
+    base_rev: i64,
+    ops: Vec<PatchOp>,
+    a: Attribution,
+    max_bytes: usize,
+    key: Option<String>,
+) -> Result<(Node, bool), WriteError> {
+    let ops_bytes = match key {
+        Some(_) => serde_json::to_vec(&ops).map_err(|e| StoreError::Corrupt(e.to_string()))?,
+        None => Vec::new(),
+    };
     write_note(db, move |tx| {
-        let node = live_note(tx, id)?;
-        if ops.is_empty() {
-            return Err(StoreError::BadInput("пустой список операций PATCH".into()).into());
+        let k = NodeKey::new(
+            key,
+            &a,
+            NodeOp::Patch,
+            &[
+                id.to_string().as_bytes(),
+                &base_rev.to_le_bytes(),
+                &ops_bytes,
+            ],
+        )?;
+        if let Some(k) = &k
+            && let Some(n) = k.replay(tx)?
+        {
+            return Ok((n, false));
         }
-        let cur_rev = node.current_rev;
-        if base_rev > cur_rev {
-            return Err(rev_mismatch(tx, &node)?);
+        let n = patch_tx(tx, id, base_rev, &ops, &a, max_bytes)?;
+        if let Some(k) = &k {
+            k.remember(tx, n.id)?;
         }
-        let current = revision_text(tx, id, cur_rev)?;
-        let base = if base_rev == cur_rev {
-            None
-        } else {
-            Some(revision_text(tx, id, base_rev)?)
-        };
-        let mut text = current.clone();
-        for op in &ops {
-            if let (Some(base), Some(section)) = (&base, op_section(op))
-                && section_bytes(base, section) != section_bytes(&current, section)
-            {
-                return Err(WriteError::SectionChanged {
-                    section: section.to_string(),
-                    current_rev: cur_rev,
-                });
-            }
-            text = apply_patch(&text, op)?.text;
-        }
-        if text.len() > max_bytes {
-            return Err(WriteError::TooLarge {
-                size: text.len(),
-                max: max_bytes,
-            });
-        }
-        Ok(commit_text(tx, node, &text, None, &a)?)
+        Ok((n, true))
     })
     .await
+}
+
+/// Тело [`patch_note_keyed`] в транзакции писателя.
+fn patch_tx(
+    tx: &Connection,
+    id: Id,
+    base_rev: i64,
+    ops: &[PatchOp],
+    a: &Attribution,
+    max_bytes: usize,
+) -> Result<Node, WriteError> {
+    let node = live_note(tx, id)?;
+    if ops.is_empty() {
+        return Err(StoreError::BadInput("пустой список операций PATCH".into()).into());
+    }
+    let cur_rev = node.current_rev;
+    if base_rev > cur_rev {
+        return Err(rev_mismatch(tx, &node)?);
+    }
+    let current = revision_text(tx, id, cur_rev)?;
+    let base = if base_rev == cur_rev {
+        None
+    } else {
+        Some(revision_text(tx, id, base_rev)?)
+    };
+    let mut text = current.clone();
+    for op in ops {
+        if let (Some(base), Some(section)) = (&base, op_section(op))
+            && section_bytes(base, section) != section_bytes(&current, section)
+        {
+            return Err(WriteError::SectionChanged {
+                section: section.to_string(),
+                current_rev: cur_rev,
+            });
+        }
+        text = apply_patch(&text, op)?.text;
+    }
+    if text.len() > max_bytes {
+        return Err(WriteError::TooLarge {
+            size: text.len(),
+            max: max_bytes,
+        });
+    }
+    Ok(commit_text(tx, node, &text, None, a)?)
 }
 
 /// Откат: новая ревизия с текстом ревизии `to_rev`, L0 пересчитывается по тексту.
@@ -171,10 +261,10 @@ pub async fn revert_note(db: &Db, id: Id, to_rev: i64, a: Attribution) -> Result
 /// Транзакция писателя для операции с [`WriteError`]: ошибки хранилища идут через
 /// `Db::write`, конфликты возвращаются как значение. Конфликт выявляется до любой
 /// записи, поэтому фиксация такой транзакции ничего не меняет.
-async fn write_note(
+async fn write_note<T: Send + 'static>(
     db: &Db,
-    f: impl FnOnce(&Connection) -> Result<Node, WriteError> + Send + 'static,
-) -> Result<Node, WriteError> {
+    f: impl FnOnce(&Connection) -> Result<T, WriteError> + Send + 'static,
+) -> Result<T, WriteError> {
     db.write(move |tx| match f(tx) {
         Ok(n) => Ok(Ok(n)),
         Err(WriteError::Store(e)) => Err(e),

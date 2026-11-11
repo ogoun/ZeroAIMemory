@@ -3017,7 +3017,7 @@ fn subagent_start_uses_matching_spawn() {
 }
 
 /// Нет подходящей записи в очереди — общий мини-дайджест (ловушки, без разделов пакета под
-/// задачу); очередь другого типа не трогается; без `agent_id` — пакет в сессии родителя.
+/// задачу); очередь другого типа не трогается; без `agent_id` — пакет в своей сессии субагента.
 #[test]
 fn subagent_start_without_spawn_generic() {
     let _g = serial();
@@ -3043,7 +3043,8 @@ fn subagent_start_without_spawn_generic() {
     let ev = p.ev("SubagentStart", "sg2", json!({"agent_type": "Plan"}));
     let c = context(&p.hook("subagent-start", &ev), "SubagentStart");
     assert!(c.contains("### Ловушки"), "{c}");
-    assert_eq!(p.session("sg2")["id"], "sg2");
+    // задача 19 M6: пакет — в своей сессии субагента с parent_id родителя
+    assert_eq!(t19_children(&p, "sg2").len(), 1);
 }
 
 /// Сервер недоступен — тишина и код 0; событие `subagent` в журнале есть, запись очереди взята.
@@ -6732,4 +6733,75 @@ fn snapshot_thread_panic_logged() {
     let stop = snap_ev(&p, "Stop", s, &t, json!({"stop_hook_active": false}));
     empty(&hook_snap(&p, "checkpoint", &stop));
     assert!(p.log().contains("snapshot: паника"), "{}", p.log());
+}
+
+// ---- M6 §16 п. 19: пакет субагента без `agent_id` не гасит подсказки родителя ----
+
+/// `GET /sessions` токеном проекта: сессии с `parent_id == parent`.
+fn t19_children(p: &Proj, parent: &str) -> Vec<Value> {
+    let r = http()
+        .get(&format!("{}/api/v1/sessions?limit=500", p.url))
+        .header("Authorization", format!("Bearer {}", p.token))
+        .call()
+        .unwrap();
+    let v: Value = serde_json::from_str(&r.into_body().read_to_string().unwrap()).unwrap();
+    v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["parent_id"] == parent)
+        .cloned()
+        .collect()
+}
+
+/// Подсказки `prompt` сессии `session` к тексту `prompt` (REST, без бюджета хука): ссылки.
+fn t19_prompt_refs(p: &Proj, session: &str, prompt: &str) -> Vec<String> {
+    let v = api_post(
+        p,
+        "/recall",
+        json!({"event": "prompt", "session_id": session, "prompt": prompt, "solution": G}),
+    );
+    v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Приложение zero-agent: `SubagentStart` без `agent_id` — пакет `brief` идёт в своей сессии
+/// субагента (с `parent_id` родителя), а не в сессии родителя: показ пакета не отмечается у
+/// родителя, и его подсказка `prompt` к той же ловушке не гасится. Контроль — та же подсказка
+/// в сессии без пакета.
+#[test]
+fn subagent_brief_does_not_mute_parent_hints() {
+    let _g = serial();
+    let (url, tok) = start("t19-brief-mute");
+    let p = Proj::new("t19-brief-mute", &url, &tok);
+    let pulsar = p.insight("Пульсар мигает по таймеру", "gotcha", "global", &[]);
+    let want = format!("i:{pulsar}");
+    let prompt = "почему пульсар мигает по таймеру";
+    // контроль: подсказка к запросу в сессии без пакета
+    assert!(
+        t19_prompt_refs(&p, "t19-ctl", prompt).contains(&want),
+        "контроль без подсказки"
+    );
+    // пакет субагенту без agent_id: ловушка в пакете
+    let ev = p.ev("SubagentStart", "t19-par", json!({"agent_type": "Plan"}));
+    let c = context(&p.hook("subagent-start", &ev), "SubagentStart");
+    assert!(c.contains(&want), "{c}");
+    // у родителя подсказка не погашена показом пакета
+    assert!(
+        t19_prompt_refs(&p, "t19-par", prompt).contains(&want),
+        "пакет субагента погасил подсказку родителя"
+    );
+    // сессия субагента зарегистрирована с parent_id родителя
+    let kids = t19_children(&p, "t19-par");
+    assert_eq!(kids.len(), 1, "{kids:?}");
+    assert_eq!(kids[0]["agent_type"], "Plan", "{kids:?}");
+    assert_ne!(kids[0]["id"], "t19-par");
+    // второй субагент без agent_id — своя сессия
+    let c = context(&p.hook("subagent-start", &ev), "SubagentStart");
+    assert!(c.contains(&want), "{c}");
+    assert_eq!(t19_children(&p, "t19-par").len(), 2);
 }

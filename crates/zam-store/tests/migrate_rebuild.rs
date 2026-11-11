@@ -1206,6 +1206,8 @@ async fn migrate_0025_from_m57_db() {
     }
     assert_eq!(counts_after.get("tokens_unattributed"), Some(&0));
     assert_eq!(counts_after.get("session_snapshots"), Some(&0));
+    // ключи идемпотентности заметок (§16 п. 19, задача 19)
+    assert_eq!(counts_after.get("node_idempotency"), Some(&0));
     assert!(!counts_after.keys().any(|t| t.ends_with("_new")));
 
     // объекты схемы целиком: вне таблиц 0025 и их индексы — как были; `ADD COLUMN` — прежний
@@ -1249,7 +1251,11 @@ async fn migrate_0025_from_m57_db() {
         };
         want.insert((o.0.clone(), o.1.clone(), o.2.clone(), sql));
     }
-    for t in ["tokens_unattributed", "session_snapshots"] {
+    for t in [
+        "tokens_unattributed",
+        "session_snapshots",
+        "node_idempotency",
+    ] {
         let s = |v: &str| v.to_string();
         want.insert((s("table"), s(t), s(t), migration_create(t)));
     }

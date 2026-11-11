@@ -13,6 +13,13 @@
 //! (4–64 hex); `invalid_ref: <путь> (<причина>)` — путь `refs:` не стал ссылкой на файл;
 //! `refs_truncated` — ссылок больше 64 (M4.5 §6.1, §7).
 //!
+//! `Idempotency-Key` (M6 §16 п. 19, CR-20; заголовок — `api::entries::idempotency_key`, как у записей
+//! журнала): у создания заметки, `PUT` и `PATCH`. Повтор того же запроса — 200 и узел в текущем
+//! виде без новой правки (`POST` — не 409 «путь занят», `PUT` — не 409 по старому `If-Match`,
+//! `PATCH append` — одна вставка); тот же ключ с другим запросом — 422
+//! `/problems/idempotency-mismatch`; узел по ключу удалён — 409. Сверка и правка — одна
+//! транзакция писателя (`zam_store::create_note_keyed` и соседние). У папки ключа нет — 400.
+//!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
 //! слоем `DefaultBodyLimit` (см. `api::router`).
@@ -25,11 +32,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_markdown::PatchOp;
 use zam_store::{
-    NewNote, Node, NodePath, create_folder, create_note, delete_node, list_trash, move_node,
-    node_content, patch_note_within, restore_node, update_note,
+    NewNote, Node, NodePath, create_folder, create_note_keyed, delete_node, list_trash, move_node,
+    node_content, patch_note_keyed, restore_node, update_note_keyed,
 };
 
 use super::{audit_node, write_error};
+use crate::api::entries::idempotency_key;
 use crate::api::scope::{Mode, live, node_scope, space_scope, user_db};
 use crate::api::spaces::readable_space_ids;
 use crate::api::{json_body, query};
@@ -134,7 +142,7 @@ fn check_size(st: &AppState, content: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// `POST /nodes` → 201 `Node`.
+/// `POST /nodes` → 201 `Node`; повтор с тем же `Idempotency-Key` — 200.
 pub async fn create(
     State(st): State<AppState>,
     p: Principal,
@@ -143,15 +151,22 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let req: Create = json_body(body)?;
     let path = NodePath::parse(&req.path)?;
+    let key = idempotency_key(&headers)?;
     let sc = space_scope(&st, &p, &headers, &req.space, Mode::Write).await?;
-    let (node, content) = match req.kind {
+    let (node, content, created) = match req.kind {
         Kind::Folder => {
             if req.content.is_some() || req.l0.is_some() {
                 return Err(ApiError::BadRequest("у папки нет content и l0".into()));
             }
+            if key.is_some() {
+                return Err(ApiError::BadRequest(
+                    "Idempotency-Key — только у заметок (kind: note)".into(),
+                ));
+            }
             (
                 create_folder(&sc.db, sc.space.id, path).await?,
                 String::new(),
+                true,
             )
         }
         Kind::Note => {
@@ -165,9 +180,18 @@ pub async fn create(
                 l0: req.l0,
                 attrib,
             };
-            (create_note(&sc.db, n).await?, content)
+            let (node, created) = create_note_keyed(&sc.db, n, key).await?;
+            (node, content, created)
         }
     };
+    // повтор по `Idempotency-Key` (M6 §16 п. 19) — 200 и узел в текущем виде, без уведомлений
+    if !created {
+        let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(node_reply(&st, &sc.db, sc.space.id, &node, &text).await?),
+        ));
+    }
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
     st.docs.notify();
@@ -197,7 +221,8 @@ pub struct Replace {
 }
 
 /// `PUT /nodes/{id}` с `If-Match: <rev>` → 200 `Node`; без заголовка — 428;
-/// устаревшая ревизия — 409 с `current_rev` и `diff`.
+/// устаревшая ревизия — 409 с `current_rev` и `diff`; повтор с тем же `Idempotency-Key` — 200
+/// без новой ревизии.
 pub async fn replace(
     State(st): State<AppState>,
     p: Principal,
@@ -210,15 +235,21 @@ pub async fn replace(
     let base = if_match(&headers)?;
     let req: Replace = json_body(body)?;
     check_size(&st, &req.content)?;
+    let key = idempotency_key(&headers)?;
     let attrib = attribution(&p, &headers, req.message)?;
     let content = req.content.clone();
-    match update_note(&sc.db, sc.node.id, base, req.content, req.l0, attrib).await {
-        Ok(n) => {
-            st.index.notify();
-            st.docs.notify();
-            Ok(Json(
-                node_reply(&st, &sc.db, sc.space.id, &n, &content).await?,
-            ))
+    let r = update_note_keyed(&sc.db, sc.node.id, base, req.content, req.l0, attrib, key).await;
+    match r {
+        Ok((n, fresh)) => {
+            // повтор по ключу — текущий текст узла (его могли править после первого запроса)
+            let text = if fresh {
+                st.index.notify();
+                st.docs.notify();
+                content
+            } else {
+                node_content(&sc.db, n.id, Some(n.current_rev)).await?.1
+            };
+            Ok(Json(node_reply(&st, &sc.db, sc.space.id, &n, &text).await?))
         }
         Err(e) => Err(write_error(&sc.db, sc.node.id, base, e).await),
     }
@@ -231,7 +262,8 @@ pub struct Patch {
     message: Option<String>,
 }
 
-/// `PATCH /nodes/{id} {base_rev, ops, message?}` → 200 `Node` / 409 / 413 / 422.
+/// `PATCH /nodes/{id} {base_rev, ops, message?}` → 200 `Node` / 409 / 413 / 422; повтор с тем же
+/// `Idempotency-Key` — 200 без второй правки.
 pub async fn patch(
     State(st): State<AppState>,
     p: Principal,
@@ -242,12 +274,16 @@ pub async fn patch(
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let req: Patch = json_body(body)?;
+    let key = idempotency_key(&headers)?;
     let attrib = attribution(&p, &headers, req.message)?;
     let max = st.cfg.limits.note_max_bytes;
-    match patch_note_within(&sc.db, sc.node.id, req.base_rev, req.ops, attrib, max).await {
-        Ok(n) => {
-            st.index.notify();
-            st.docs.notify();
+    let r = patch_note_keyed(&sc.db, sc.node.id, req.base_rev, req.ops, attrib, max, key).await;
+    match r {
+        Ok((n, fresh)) => {
+            if fresh {
+                st.index.notify();
+                st.docs.notify();
+            }
             let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
             Ok(Json(node_reply(&st, &sc.db, sc.space.id, &n, &text).await?))
         }

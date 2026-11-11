@@ -124,7 +124,7 @@ fn check_reason(r: Option<String>) -> Result<Option<String>, StoreError> {
 }
 
 /// `Idempotency-Key`: если задан — непустой, до [`KEY_MAX_CHARS`] печатных символов.
-pub(super) fn check_key(k: Option<String>) -> Result<Option<String>, StoreError> {
+pub(crate) fn check_key(k: Option<String>) -> Result<Option<String>, StoreError> {
     let Some(k) = k else {
         return Ok(None);
     };
@@ -158,7 +158,7 @@ pub(super) fn space_kind_of(c: &Connection, space: Id) -> Result<SpaceKind, Stor
 /// Ключ идемпотентности в границах автора: `<автор>:<ключ>`, автор — пользователь, иначе
 /// токен, иначе `-` (администратор без пользователя). Идемпотентность по `(автор, ключ)`:
 /// в общем решении ключ участника не совпадает с ключом владельца. [решение исполнителя]
-pub(super) fn scoped_key(a: &Attribution, key: &str) -> String {
+pub(crate) fn scoped_key(a: &Attribution, key: &str) -> String {
     let who = a
         .user_id
         .map(|u| u.to_string())

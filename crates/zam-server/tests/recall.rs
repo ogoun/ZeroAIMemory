@@ -2728,3 +2728,110 @@ async fn mcp_recall_with_source_has_no_limit() {
     );
     assert!(text.len() > CODEX_MAX_BYTES, "{}", text.len());
 }
+
+// ---- M6 §16 п. 19 (CR-7): срок сбора из тела запроса ----
+
+/// Задержка шага сбора `/recall` (точка `test-hooks`): `ms` до конца области.
+struct RecallDelay<'a>(&'a Api);
+
+impl<'a> RecallDelay<'a> {
+    fn set(a: &'a Api, ms: u64) -> Self {
+        a.st.recall_delay_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+        RecallDelay(a)
+    }
+}
+
+impl Drop for RecallDelay<'_> {
+    fn drop(&mut self) {
+        self.0
+            .st
+            .recall_delay_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn has_timeout_warning(j: &Value) -> bool {
+    j["warnings"]
+        .as_array()
+        .is_some_and(|w| w.contains(&json!("recall timeout")))
+}
+
+/// CR-7 (§17 п. 25): шаг сбора задержан на 600 мс — со сроком сервера по умолчанию (200 мс)
+/// дайджест неполный и с `recall timeout`; тот же запрос с `timeout_ms: 1000` — полный дайджест
+/// без предупреждения. Старый клиент без поля — прежний срок `recall.timeout_ms`.
+#[tokio::test]
+async fn recall_timeout_ms_param_full_digest() {
+    let a = api("recall-timeout-param", |c| {
+        assert_eq!(c.recall.timeout_ms, 200, "умолчание сервера");
+    })
+    .await;
+    allow_rules(&a).await;
+    a.note("rules", "срок", "# Срок\n\nПравило про звёздный срок.\n")
+        .await;
+    let _d = RecallDelay::set(&a, 600);
+    let j = ok(&a, &a.token, Some("tp1"), json!({"event": "session_start"})).await;
+    assert!(has_timeout_warning(&j), "без timeout_ms — срок 200 мс: {j}");
+    assert!(!j["text"].as_str().unwrap().contains("звёздный"), "{j}");
+    let t = Instant::now();
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tp2"),
+        json!({"event": "session_start", "timeout_ms": 1000}),
+    )
+    .await;
+    assert!(t.elapsed().as_millis() >= 600, "{:?}", t.elapsed());
+    assert!(!has_timeout_warning(&j), "{j}");
+    assert!(j["text"].as_str().unwrap().contains("звёздный"), "{j}");
+}
+
+/// CR-7: `timeout_ms` — 1..=`recall.max_timeout_ms` (по умолчанию 2000), иначе 400; верхний
+/// предел берётся из конфигурации.
+#[tokio::test]
+async fn recall_timeout_ms_over_max_400() {
+    let a = api("recall-timeout-max", |c| {
+        assert_eq!(c.recall.max_timeout_ms, 2000, "умолчание");
+    })
+    .await;
+    for bad in [json!(0), json!(2001), json!(-1), json!("x")] {
+        let r = recall(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "session_start", "timeout_ms": bad}),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+    for good in [1, 2000] {
+        let r = recall(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "session_start", "timeout_ms": good}),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{good}: {}", r.text());
+    }
+    let a = api("recall-timeout-max-5000", |c| {
+        c.recall.max_timeout_ms = 5000
+    })
+    .await;
+    let r = recall(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "session_start", "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = recall(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "session_start", "timeout_ms": 5001}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}

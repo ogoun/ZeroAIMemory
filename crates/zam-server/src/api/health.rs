@@ -13,6 +13,11 @@ use crate::error::ApiError;
 /// `attach_weight`, `snapshot` — таблица `KEYS` в `xtask/src/eval/caps.rs`). `code_recv` — карта
 /// кода принимает `refs[].recv_count` (§12а, задача 14; ключа конфигурации нет — клиент берёт
 /// тот же признак из ответа `POST /code/sync`).
+///
+/// С задачи 19 (M6 §16 п. 19, CR-9) список — **официальный способ** для любого клиента узнать
+/// возможности сервера: каждый флаг описан в `docs/api-compat.md` (раздел «Флаги `features`»;
+/// тест `boot::health_features_documented` сверяет таблицу с этим списком в обе стороны). Флаг
+/// не удаляется, пока жив `/api/v1`.
 pub const FEATURES: &[&str] = &[
     "m6",
     "budget",
@@ -24,6 +29,15 @@ pub const FEATURES: &[&str] = &[
     "attach_weight",
     "code_recv",
     "snapshot",
+    "epochs",
+    "unattributed",
+    "holdout",
+    "backup",
+    "export",
+    "import",
+    "recall_timeout",
+    "idempotent_nodes",
+    "mcp_session_arg",
 ];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {

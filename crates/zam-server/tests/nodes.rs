@@ -938,3 +938,252 @@ async fn patch_section_tail_hints_full_path() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }
+
+// ---- M6 §16 п. 19 (CR-20): `Idempotency-Key` заметок ----
+
+/// Запрос первым токеном с `Idempotency-Key: key` (и `If-Match`, если задан).
+async fn keyed(
+    a: &Api,
+    m: Method,
+    uri: &str,
+    body: Value,
+    key: &str,
+    if_match: Option<&str>,
+) -> common::api::Resp {
+    let mut h = vec![("idempotency-key", key)];
+    if let Some(r) = if_match {
+        h.push(("if-match", r));
+    }
+    a.tok_h(&a.token, m, uri, Some(body), &h).await
+}
+
+/// Ревизии узла (новые первыми) и текст текущей.
+async fn revs_and_text(a: &Api, nid: &str) -> (usize, String) {
+    let revs = get(a, &format!("/api/v1/nodes/{nid}/revisions"))
+        .await
+        .json();
+    let md = get(a, &format!("/api/v1/nodes/{nid}?format=md"))
+        .await
+        .text();
+    (revs.as_array().unwrap().len(), md)
+}
+
+/// CR-20 (§17 п. 25): два одинаковых `PATCH append` с одним ключом — одна вставка, оба 200
+/// (повтор — узел в текущем виде, как у записей журнала); другой ключ — новая правка. Так же
+/// `PUT`: повтор с тем же `If-Match` не даёт 409.
+#[tokio::test]
+async fn patch_append_idempotent() {
+    let a = api("idem-patch", |_| {}).await;
+    let n = a.note("knowledge", "Идем/Патч", "# A\nначало\n").await;
+    let nid = id(&n);
+    let uri = format!("/api/v1/nodes/{nid}");
+    let body = json!({"base_rev": 1, "ops": [{"op": "append", "content": "хвост\n"}]});
+    let r1 = keyed(&a, Method::PATCH, &uri, body.clone(), "p-1", None).await;
+    assert_eq!(r1.status, StatusCode::OK, "{}", r1.text());
+    let r2 = keyed(&a, Method::PATCH, &uri, body.clone(), "p-1", None).await;
+    assert_eq!(r2.status, StatusCode::OK, "{}", r2.text());
+    assert_eq!(r2.json()["current_rev"], 2, "{}", r2.text());
+    assert_eq!(r2.json()["id"], nid.as_str());
+    let (revs, md) = revs_and_text(&a, &nid).await;
+    assert_eq!((revs, md.matches("хвост").count()), (2, 1), "{md}");
+    // другой ключ — та же правка ещё раз (append применяется к текущему тексту)
+    let r3 = keyed(&a, Method::PATCH, &uri, body, "p-2", None).await;
+    assert_eq!(r3.status, StatusCode::OK, "{}", r3.text());
+    let (revs, md) = revs_and_text(&a, &nid).await;
+    assert_eq!((revs, md.matches("хвост").count()), (3, 2), "{md}");
+    // PUT: повтор с прежним If-Match — 200 без новой ревизии, а не 409
+    let put = json!({"content": "# A\nзамена\n"});
+    let r = keyed(&a, Method::PUT, &uri, put.clone(), "u-1", Some("3")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = keyed(&a, Method::PUT, &uri, put.clone(), "u-1", Some("3")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["current_rev"], 4, "{}", r.text());
+    assert_eq!(revs_and_text(&a, &nid).await.0, 4);
+    // без ключа — прежнее поведение: устаревший If-Match — 409
+    let r = a
+        .tok_h(&a.token, Method::PUT, &uri, Some(put), &[("if-match", "3")])
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+}
+
+/// CR-20: повтор `POST /nodes` с тем же ключом — 200 и тот же узел (не 409 «путь занят»);
+/// другой ключ — новый узел; ключ действует, пока жив узел (как у записей журнала).
+#[tokio::test]
+async fn post_node_idempotent() {
+    let a = api("idem-post", |_| {}).await;
+    let body = |path: &str| json!({"space": "knowledge", "path": path, "kind": "note", "content": "# Идем\nтекст\n"});
+    let r1 = keyed(
+        &a,
+        Method::POST,
+        "/api/v1/nodes",
+        body("Идем/Один"),
+        "c-1",
+        None,
+    )
+    .await;
+    assert_eq!(r1.status, StatusCode::CREATED, "{}", r1.text());
+    let r2 = keyed(
+        &a,
+        Method::POST,
+        "/api/v1/nodes",
+        body("Идем/Один"),
+        "c-1",
+        None,
+    )
+    .await;
+    assert_eq!(r2.status, StatusCode::OK, "{}", r2.text());
+    assert_eq!(r2.json()["id"], r1.json()["id"]);
+    assert_eq!(r2.json()["current_rev"], 1);
+    let nid = id(&r1.json());
+    assert_eq!(revs_and_text(&a, &nid).await.0, 1);
+    // другой ключ, другой путь — новый узел; другой ключ, тот же путь — 409, как без ключа
+    let r3 = keyed(
+        &a,
+        Method::POST,
+        "/api/v1/nodes",
+        body("Идем/Два"),
+        "c-2",
+        None,
+    )
+    .await;
+    assert_eq!(r3.status, StatusCode::CREATED, "{}", r3.text());
+    assert_ne!(r3.json()["id"], r1.json()["id"]);
+    let r4 = keyed(
+        &a,
+        Method::POST,
+        "/api/v1/nodes",
+        body("Идем/Один"),
+        "c-3",
+        None,
+    )
+    .await;
+    assert_eq!(r4.status, StatusCode::CONFLICT, "{}", r4.text());
+    // узел удалён в корзину — повтор по ключу 409 (как у удалённой записи журнала)
+    let d = a
+        .t(Method::DELETE, &format!("/api/v1/nodes/{nid}"), None)
+        .await;
+    assert_eq!(d.status, StatusCode::NO_CONTENT, "{}", d.text());
+    let r5 = keyed(
+        &a,
+        Method::POST,
+        "/api/v1/nodes",
+        body("Идем/Один"),
+        "c-1",
+        None,
+    )
+    .await;
+    assert_eq!(r5.status, StatusCode::CONFLICT, "{}", r5.text());
+    // пустой ключ равен отсутствию, слишком длинный — 400
+    let r = keyed(
+        &a,
+        Method::POST,
+        "/api/v1/nodes",
+        body("Идем/Три"),
+        " ",
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let long = "k".repeat(201);
+    let r = keyed(
+        &a,
+        Method::POST,
+        "/api/v1/nodes",
+        body("Идем/Четыре"),
+        &long,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+/// CR-20: ключ, повторённый с другим телом или для другой цели, — 422
+/// `/problems/idempotency-mismatch`, ничего не записано.
+#[tokio::test]
+async fn idempotency_key_body_mismatch_422() {
+    let a = api("idem-mismatch", |_| {}).await;
+    let n = a.note("knowledge", "Идем/Сверка", "# A\nначало\n").await;
+    let nid = id(&n);
+    let other = id(&a.note("knowledge", "Идем/Другая", "# B\nб\n").await);
+    let uri = format!("/api/v1/nodes/{nid}");
+    let append = |c: &str| json!({"base_rev": 1, "ops": [{"op": "append", "content": c}]});
+    let r = keyed(&a, Method::PATCH, &uri, append("один\n"), "m-1", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let mismatch = |r: &common::api::Resp| {
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+        assert_eq!(
+            r.json()["type"],
+            "/problems/idempotency-mismatch",
+            "{}",
+            r.text()
+        );
+    };
+    // другое тело
+    mismatch(&keyed(&a, Method::PATCH, &uri, append("два\n"), "m-1", None).await);
+    // другая заметка
+    let ouri = format!("/api/v1/nodes/{other}");
+    mismatch(&keyed(&a, Method::PATCH, &ouri, append("один\n"), "m-1", None).await);
+    // другой метод: PUT с ключом PATCH
+    let put = json!({"content": "# A\nзамена\n"});
+    mismatch(&keyed(&a, Method::PUT, &uri, put, "m-1", Some("2")).await);
+    // POST с ключом PATCH
+    let create = json!({"space": "knowledge", "path": "Идем/Новая", "kind": "note",
+                        "content": "# Н\n"});
+    mismatch(&keyed(&a, Method::POST, "/api/v1/nodes", create, "m-1", None).await);
+    let (revs, md) = revs_and_text(&a, &nid).await;
+    assert_eq!(revs, 2);
+    assert!(!md.contains("два") && !md.contains("замена"), "{md}");
+    assert_eq!(revs_and_text(&a, &other).await.0, 1);
+    let uri = format!(
+        "/api/v1/nodes/by-path?space=knowledge&path={}",
+        enc("Идем/Новая")
+    );
+    let r = get(&a, &uri).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}
+
+/// CR-20: параллельные запросы с одним ключом — одна вставка, все ответы 200 (писатель базы
+/// один, сверка ключа и правка — в одной транзакции).
+#[tokio::test]
+async fn idempotency_key_parallel_single_write() {
+    let a = api("idem-parallel", |_| {}).await;
+    let n = a.note("knowledge", "Идем/Гонка", "# A\nначало\n").await;
+    let nid = id(&n);
+    let uri = format!("/api/v1/nodes/{nid}");
+    let body = json!({"base_rev": 1, "ops": [{"op": "append", "content": "гонка\n"}]});
+    let calls = (0..8).map(|_| keyed(&a, Method::PATCH, &uri, body.clone(), "race-1", None));
+    let rs = futures_util::future::join_all(calls).await;
+    for r in &rs {
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json()["current_rev"], 2, "{}", r.text());
+    }
+    let (revs, md) = revs_and_text(&a, &nid).await;
+    assert_eq!((revs, md.matches("гонка").count()), (2, 1), "{md}");
+    // то же для создания: один узел
+    let create = json!({"space": "knowledge", "path": "Идем/Гонка2", "kind": "note",
+                        "content": "# Г\n"});
+    let calls = (0..8).map(|_| {
+        keyed(
+            &a,
+            Method::POST,
+            "/api/v1/nodes",
+            create.clone(),
+            "race-2",
+            None,
+        )
+    });
+    let rs = futures_util::future::join_all(calls).await;
+    let created = rs
+        .iter()
+        .filter(|r| r.status == StatusCode::CREATED)
+        .count();
+    let replayed = rs.iter().filter(|r| r.status == StatusCode::OK).count();
+    assert_eq!(
+        (created, replayed),
+        (1, 7),
+        "{:?}",
+        rs.iter().map(|r| r.status).collect::<Vec<_>>()
+    );
+    let ids: std::collections::HashSet<String> = rs.iter().map(|r| id(&r.json())).collect();
+    assert_eq!(ids.len(), 1);
+}

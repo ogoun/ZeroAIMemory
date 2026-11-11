@@ -6,7 +6,7 @@
 //!             session_id?, format?: "json"|"md", budget_tokens?}
 //! ```
 //!
-//! - `id`: `n:<id>` (узел), `i:|c:|r:|t:|k:|q:<id>` (запись журнала; `e:` тоже), голый id (узел,
+//! - `id`: `n:<id>` (узел), `i:|c:|r:|t:|k:|q:|w:<id>` (запись журнала; `e:` тоже), голый id (узел,
 //!   иначе запись) или путь `<пространство>:/<путь>` (`knowledge:/Инструменты/Bash`). Не больше
 //!   `read.max_items` (20) элементов, пусто или больше — 422. Некорректный `tier`, нулевые
 //!   `max_tokens` и `budget_tokens` — 400. Всё это проверяется до чтения;
@@ -248,7 +248,7 @@ impl Content {
 struct Fetched {
     /// `id` как в запросе.
     raw: String,
-    /// Каноническая ссылка `n:<id>` | `i:|c:|r:|t:|k:|q:<id>`.
+    /// Каноническая ссылка `n:<id>` | `i:|c:|r:|t:|k:|q:|w:<id>`.
     reference: String,
     /// `node` или вид записи (`insight`, `changelog`, `release`, `term`, `task`, `question`).
     kind: &'static str,
@@ -371,7 +371,7 @@ fn is_doc_letter(k: &str) -> bool {
     k == CHUNK_REF_LETTER || k == BLOB_REF_LETTER || k == DOC_REF_LETTER
 }
 
-/// Префикс ссылки элемента: `n` (узел), буква записи (`i|c|r|t|k|q|e`) или вложения (`a|b|d`) и
+/// Префикс ссылки элемента: `n` (узел), буква записи (`i|c|r|t|k|q|p|w|e`) или вложения (`a|b|d`) и
 /// остаток; без известного префикса — `(None, raw)`.
 fn split_ref(raw: &str) -> (Option<&str>, &str) {
     match raw.split_once(':') {

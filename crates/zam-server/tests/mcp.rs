@@ -3845,3 +3845,232 @@ async fn line_anchor_symbol_link_by_id() {
     let other = call(json!({"action": "symbol", "query": "other"})).await;
     assert!(other.contains("`d.rs#other`"), "{other}");
 }
+
+// ---- M6 §16 п. 19: нативный клиент (CR-8, CR-7, CR-20, мелочи приложения) ----
+
+/// Схема аргументов инструмента `name` из `tools/list`.
+async fn tool_def(a: &Api, name: &str) -> Value {
+    let list = rpc(a, &a.token, &[], "tools/list", json!({})).await;
+    list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == name)
+        .unwrap_or_else(|| panic!("нет {name}"))
+        .clone()
+}
+
+/// CR-8 (§17 п. 25): `session_id` в аргументах без `X-Zam-Session` — явная сессия:
+/// `memory_recall`, `memory_read`, `memory_search` учитываются в ней (событие `mcp`), выданное
+/// отмечается (`(выдавалось)`), `tokens_unattributed` не растёт.
+#[tokio::test]
+async fn mcp_session_id_arg_accounts_session() {
+    let a = api("mcp-session-arg", |_| {}).await;
+    let id = quasar(&a).await;
+    let s = "arg-session-1";
+    let c = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_recall",
+        json!({"event": "session_start", "session_id": s}),
+    )
+    .await;
+    let r = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}], "session_id": s}),
+    )
+    .await;
+    assert!(r.text.contains("светит ярко"), "{}", r.text);
+    let q = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_search",
+        json!({"query": "квазар", "session_id": s}),
+    )
+    .await;
+    assert!(
+        q.text.contains("(выдавалось)"),
+        "отметка в сессии: {}",
+        q.text
+    );
+    let t = session_tokens_when(&a, s, 3).await;
+    assert_eq!(t["mcp"]["calls"], 3, "{t}");
+    assert_eq!(
+        t["mcp"]["tokens"],
+        tok_of(&c) + tok_of(&r) + tok_of(&q),
+        "{t}"
+    );
+    assert!(unattributed(&a).await.is_empty());
+}
+
+/// CR-8: заголовок `X-Zam-Session` и аргумент `session_id` вместе — одна и та же сессия;
+/// разные — 400 у `memory_recall`, `memory_search` и `memory_read` (REST не вызывается, сессия
+/// аргумента не создаётся; ответ с ошибкой учитывается в сессии заголовка — он важнее).
+#[tokio::test]
+async fn mcp_session_header_and_arg_conflict_400() {
+    let a = api("mcp-session-conflict", |_| {}).await;
+    let id = quasar(&a).await;
+    let h = sess();
+    let calls = [
+        ("memory_recall", json!({"event": "session_start"})),
+        ("memory_search", json!({"query": "квазар"})),
+        ("memory_read", json!({"items": [{"id": format!("n:{id}")}]})),
+    ];
+    for (name, args) in &calls {
+        let mut bad = args.clone();
+        bad["session_id"] = json!("other-session");
+        let o = tool(&a, &a.token, &h, name, bad).await;
+        assert!(o.is_error, "{name}: {}", o.text);
+        assert!(o.text.contains("Ошибка 400"), "{name}: {}", o.text);
+        assert!(o.text.contains("session_id"), "{name}: {}", o.text);
+    }
+    // совпадает с заголовком — как без аргумента
+    for (name, args) in &calls {
+        let mut same = args.clone();
+        same["session_id"] = json!(SESSION);
+        ok(&a, &a.token, &h, name, same).await;
+    }
+    let t = session_tokens_when(&a, SESSION, 6).await;
+    assert_eq!(t["mcp"]["calls"], 6, "{t}");
+    let other = a
+        .t(Method::GET, "/api/v1/sessions/other-session", None)
+        .await;
+    assert_eq!(other.status, StatusCode::NOT_FOUND, "{}", other.text());
+    assert!(unattributed(&a).await.is_empty());
+}
+
+/// CR-7, CR-8: в схемах объявлены `source`, `agent_block_version`, `timeout_ms` у
+/// `memory_recall` и `session_id` у `memory_search` и `memory_read`.
+#[tokio::test]
+async fn mcp_recall_schema_has_source_block_timeout() {
+    let a = api("mcp-recall-schema", |_| {}).await;
+    let recall = tool_def(&a, "memory_recall").await;
+    let p = &recall["inputSchema"]["properties"];
+    for k in ["source", "agent_block_version", "timeout_ms", "session_id"] {
+        assert!(p[k].is_object(), "memory_recall.{k}: {recall}");
+    }
+    assert_eq!(p["timeout_ms"]["type"], "integer", "{recall}");
+    assert_eq!(p["timeout_ms"]["minimum"], 1, "{recall}");
+    for name in ["memory_search", "memory_read"] {
+        let d = tool_def(&a, name).await;
+        assert_eq!(
+            d["inputSchema"]["properties"]["session_id"]["type"], "string",
+            "{d}"
+        );
+    }
+    // timeout_ms доходит до REST: больше предела — 400
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_recall",
+        json!({"event": "session_start", "timeout_ms": 2001}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("Ошибка 400"), "{}", o.text);
+    ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_recall",
+        json!({"event": "session_start", "timeout_ms": 1500, "source": "startup",
+               "agent_block_version": 1}),
+    )
+    .await;
+}
+
+/// Число вхождений `needle` в тексте заметки `space:/path` (REST, md).
+async fn note_count(a: &Api, id: &str, needle: &str) -> (usize, i64) {
+    let r = a.t(Method::GET, &format!("/api/v1/nodes/{id}"), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    (
+        j["content"].as_str().unwrap().matches(needle).count(),
+        j["rev"].as_i64().unwrap(),
+    )
+}
+
+/// CR-20: `memory_write` с `idempotency_key` — повтор создания и `append` с тем же ключом
+/// не пишет второй раз (тот же ответ без ошибки), другое тело с тем же ключом — 422.
+#[tokio::test]
+async fn memory_write_idempotency_key() {
+    let a = api("mcp-write-idem", |_| {}).await;
+    let d = tool_def(&a, "memory_write").await;
+    assert_eq!(
+        d["inputSchema"]["properties"]["idempotency_key"]["type"], "string",
+        "{d}"
+    );
+    let h = sess();
+    let create = json!({"path": "Идем/A", "content": "# A\n\nначало\n",
+                        "idempotency_key": "w-create-1"});
+    let first = ok(&a, &a.token, &h, "memory_write", create.clone()).await;
+    let again = ok(&a, &a.token, &h, "memory_write", create).await;
+    let nid = |o: &Out| {
+        o.text
+            .trim_start_matches("Записано n:")
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(nid(&first), nid(&again), "{} / {}", first.text, again.text);
+    let id = nid(&first);
+    let append = json!({"path": "Идем/A", "base_rev": 1, "idempotency_key": "w-append-1",
+                        "ops": [{"op": "append", "content": "хвост-1"}]});
+    ok(&a, &a.token, &h, "memory_write", append.clone()).await;
+    let o = ok(&a, &a.token, &h, "memory_write", append).await;
+    assert!(o.text.contains("rev2"), "{}", o.text);
+    assert_eq!(note_count(&a, &id, "хвост-1").await, (1, 2));
+    // тот же ключ, другое тело — 422, ничего не записано
+    let o = tool(
+        &a,
+        &a.token,
+        &h,
+        "memory_write",
+        json!({"path": "Идем/A", "base_rev": 2, "idempotency_key": "w-append-1",
+               "ops": [{"op": "append", "content": "хвост-2"}]}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("Ошибка 422"), "{}", o.text);
+    assert_eq!(note_count(&a, &id, "хвост-2").await, (0, 2));
+    // без ключа — прежнее поведение: повтор append пишет второй раз
+    let plain = json!({"path": "Идем/A", "base_rev": 2,
+                       "ops": [{"op": "append", "content": "хвост-3"}]});
+    ok(&a, &a.token, &h, "memory_write", plain.clone()).await;
+    ok(&a, &a.token, &h, "memory_write", plain).await;
+    assert_eq!(note_count(&a, &id, "хвост-3").await, (2, 4));
+}
+
+/// Мелочи приложения zero-agent: префикс `w:` есть в списках ссылок MCP и работает в
+/// `memory_read`; описание `memory_update_entry` называет все действия без `rev`.
+#[tokio::test]
+async fn mcp_ref_prefixes_include_w() {
+    let a = api("mcp-ref-w", |_| {}).await;
+    let read = tool_def(&a, "memory_read").await;
+    let d = read["description"].as_str().unwrap();
+    assert!(d.contains("|w:") || d.contains("w:<id>"), "{d}");
+    let upd = tool_def(&a, "memory_update_entry").await;
+    let d = upd["description"].as_str().unwrap();
+    for act in [
+        "feedback", "claim", "release", "answer", "propose", "decide",
+    ] {
+        let tail = d.split("кроме").nth(1).unwrap_or("");
+        let list = tail.split(')').next().unwrap_or("");
+        assert!(list.contains(act), "rev не нужна у {act}: {d}");
+    }
+    let id = mcp_idea(&a, "Идея о префиксе w").await;
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_read",
+        json!({"items": [{"id": format!("w:{id}")}]}),
+    )
+    .await;
+    assert!(o.text.contains("Идея о префиксе w"), "{}", o.text);
+}

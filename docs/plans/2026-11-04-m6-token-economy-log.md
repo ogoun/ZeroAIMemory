@@ -11492,3 +11492,146 @@ unless_contradicted_warns_on_truncated_graph` дополнен: предупре
 21, 12 (+1 ignored), 6 (+1), все PASS; WebUI: `npm run check` — 0 ошибок, `test:build` — 44 PASS,
 `npm run size` — `entry` 78,73 КБ, `IdeasView` 7,02 КБ, `IdeaForm` 2,17 КБ. e2e и откаты в этом
 круге не прогонялись.
+
+## Задача 19: нативный клиент — CR-8, CR-7, CR-20, `features` (2026-11-11)
+
+Решение владельца 2026-11-06 (ответ «А»): малые запросы zero-agent — в M6. Ветка `m6-portability`
+(worktree `wt-b`), база `87df46a`. Передач «→ 19» в журнале нет (поиск по `19`, `CR-`); пункт
+ответа zero-agent «brief гасит подсказки — проверка вместе с эпохами 7a, исправление — 19» закрыт
+здесь.
+
+**Тесты шага 1 — сначала красные** (`.tmp/t19/red-server.log`, `red-hooks*.log`) упали на
+исходном коде по существу — все 13 (не по сборке; заготовки — поле `recall.max_timeout_ms` и тестовая
+точка `AppState::recall_delay_ms` без использования):
+
+- `boot::health_features_documented` — нет `docs/api-compat.md`;
+- `recall::recall_timeout_ms_param_full_digest` — с `timeout_ms: 1000` всё равно `recall timeout`;
+  `recall_timeout_ms_over_max_400` — `timeout_ms: 0` → 200;
+- `nodes::post_node_idempotent` (повтор → 409 «путь занят»), `patch_append_idempotent` (два
+  `append` → две вставки, rev 3), `idempotency_key_body_mismatch_422`,
+  `idempotency_key_parallel_single_write` (у 8 параллельных `append` ответы с разными ревизиями);
+- `mcp::mcp_session_id_arg_accounts_session` (поиск с `session_id` не видит отметок чтения),
+  `mcp_session_header_and_arg_conflict_400`, `mcp_recall_schema_has_source_block_timeout` (нет
+  `source`), `memory_write_idempotency_key` (нет `idempotency_key` в схеме),
+  `mcp_ref_prefixes_include_w` (в описании `memory_read` нет `w:`);
+- `hooks::subagent_brief_does_not_mute_parent_hints` — «пакет субагента погасил подсказку
+  родителя» (контроль без пакета подсказку получил).
+
+### Сделано
+
+1. **CR-8, явная сессия MCP** (`mcp/mod.rs`, `mcp/tools.rs`). Аргумент `session_id` у
+   `memory_recall`, `memory_search`, `memory_read` (`tools::SESSION_ARG_TOOLS`, схема
+   `session_id()`): без заголовка становится `X-Zam-Session` внутренних запросов REST и учёта
+   (`account()` получает заголовки с этой сессией), неявная сессия R13 не подставляется. Заголовок
+   и аргумент совпадают — та же сессия; различаются — ответ-ошибка `Ошибка 400 …` без вызова REST
+   (`McpServer::refuse`, учёт ответа — в сессии заголовка: «заголовок важнее»); аргумент не строка
+   или с недопустимыми символами — тоже 400. REST не менялся (тело `/search|/read|/recall` по-
+   прежнему сильнее заголовка). DEBUG — поле `session_arg`.
+2. **CR-7, срок `/recall`** (`api/recall.rs`, `config.rs`). `[recall] max_timeout_ms` (1..=60000,
+   2000; `deploy/config.example.toml`, юнит `recall_max_timeout_default_and_range`);
+   `RecallReq.timeout_ms` — 1..=max, иначе 400; без поля — `recall.timeout_ms`. Тестовая точка
+   `AppState::recall_delay_ms` (фича `test-hooks`) — шаг сбора под сроком (`Deadline::step`). В
+   схеме `memory_recall` — `source`, `agent_block_version`, `timeout_ms` (MCP пересылает
+   `timeout_ms`). Перекрёстного условия `timeout_ms ≤ max_timeout_ms` нет **[решение
+   исполнителя]**: сетки замера ставят `recall.timeout_ms = 60000`. xtask `caps::KEYS` +=
+   `recall.max_timeout_ms` (`F("recall_timeout")`).
+3. **CR-20, идемпотентность заметок.** Хранилище — таблица `node_idempotency` (`key` с автором,
+   `op` create|replace|patch, `node_id`, `fingerprint` blake3, `created_at`; `WITHOUT ROWID`),
+   дописана в пользовательскую миграцию **0025** (правило плана «одна миграция M6, один `bak-v24`»;
+   прецедент — `imported_from` задачи 18b2). Модуль `zam_store::nodes::idempotency`
+   (`NodeKey::{new, replay, remember}`), общие с записями журнала `check_key`/`scoped_key`
+   (стали `pub(crate)`), серверный заголовок — тот же `api::entries::idempotency_key`. API
+   хранилища: `create_note_keyed`, `update_note_keyed`, `patch_note_keyed` → `(Node, свежая)`;
+   прежние функции — обёртки с `None`. Сверка ключа — первым шагом транзакции писателя, до
+   проверки пути, `If-Match` и `base_rev`; ключ пишется в той же транзакции после правки (неуспех
+   ключ не занимает). Повтор — 200 и узел в **текущем** виде (как у записей журнала с M3), без
+   уведомлений индексатора; другой отпечаток (тело, цель, операция) — 422
+   `/problems/idempotency-mismatch`; узел в корзине — 409. Отпечаток: create — пространство,
+   путь, текст, L0; replace — узел, `If-Match`, текст, L0; patch — узел, `base_rev`, `ops` (JSON);
+   `message` не входит (как у записей). Срок хранения — пока жив узел (узлы физически не
+   удаляются), как ключ записи журнала. Папка с ключом — 400. MCP `memory_write` —
+   `idempotency_key` во всех трёх путях (общий помощник `idempotency_header` с `memory_log`).
+   Тесты схемы: `migrate_rebuild::migrate_0025_from_m57_db` и `m57_acceptance` знают новую
+   таблицу.
+4. **`/health.features` — официально** (`api/health.rs`, новый `docs/api-compat.md`): правило
+   совместимости `/api/v1` (добавление — без смены версии; удаление и смена смысла — `/api/v2`),
+   таблица флагов, явная сессия, срок `/recall`, таблица идемпотентности. Новые флаги:
+   `epochs`, `unattributed`, `holdout`, `backup`, `export`, `import` (функции задач 2–18,
+   флагов у них не было), `recall_timeout`, `idempotent_nodes`, `mcp_session_arg`. Тест
+   сверяет таблицу документа с `FEATURES` в обе стороны.
+5. **Хук `subagent-start`** (`subagent_start.rs`): без `agent_id` — разовый `anon-<нс><pid>`
+   (hex): своя сессия субагента с `parent_id` родителя, пакет `brief` учитывается и отмечается в
+   ней. Существующий `subagent_start_without_spawn_generic` ждал сессию родителя («без `agent_id`
+   — пакет в сессии родителя») — две строки (комментарий и проверка) переписаны на новую
+   семантику; остальные тесты `hooks.rs` не тронуты, новый тест и помощники `t19_*` — блоком в
+   конце файла.
+6. **Мелочи приложения:** `w:` в списках ссылок (`memory_read`, документация `tools.rs`,
+   `api/read.rs`, `api/cache.rs`); описание `memory_update_entry` — `rev` не нужна у `propose`,
+   `decide` (строка «задача: status, claim, release» убрана ради предела 300 символов — действия
+   перечислены в начале описания); комментарий `mcp/mod.rs` про «срок» токена.
+7. **Ответ zero-agent** — раздел «Что в описании неверно» дописан таблицами по CR-7, CR-8, CR-20 и
+   строкам приложения (вердикт и тест на каждое утверждение).
+
+### Откаты
+
+14 откатов (`.tmp/t19/rollback.ps1`, итоги `rollbacks.log`, логи `rb-R*.log`): каждый — правка
+одного места, сборка, тест; файл возвращён из копии (sha256 сверен), дерево после всех откатов
+совпало со снимком (`git status` и хэш `git diff` — `D0B2C77E…`). Все 14 — FAIL:
+
+| № | Откат | Упал |
+|---|---|---|
+| R1 | аргумент `session_id` не становится заголовком | `mcp_session_id_arg_accounts_session` |
+| R2 | нет проверки «заголовок ≠ аргумент» | `mcp_session_header_and_arg_conflict_400` |
+| R3 | `timeout_ms` убран из схемы `memory_recall` | `mcp_recall_schema_has_source_block_timeout` |
+| R4 | срок `/recall` не из тела | `recall_timeout_ms_param_full_digest` |
+| R5 | нет проверки диапазона `timeout_ms` | `recall_timeout_ms_over_max_400` |
+| R6 | `PATCH` без повтора по ключу | `patch_append_idempotent` (500: второй `INSERT` ключа упирается в первичный ключ — задвоения нет и тогда) |
+| R7 | отпечаток не сверяется | `idempotency_key_body_mismatch_422` |
+| R8 | `POST /nodes` без повтора | `post_node_idempotent` |
+| R9 | `memory_write` не шлёт ключ при создании | `memory_write_idempotency_key` |
+| R10 | флаг убран из `FEATURES` | `health_features_documented` |
+| R11 | `w:` убран из описания `memory_read` | `mcp_ref_prefixes_include_w` |
+| R12 | хук без `agent_id` — снова сессия родителя | `subagent_brief_does_not_mute_parent_hints` |
+| R13 | нет проверки `recall.max_timeout_ms` | юнит `recall_max_timeout_default_and_range` |
+| R14 | `PUT` не запоминает ключ | `patch_append_idempotent` (409 по старому `If-Match`) |
+
+### Прогоны
+
+- `cargo fmt --all -- --check` — чисто (форматировались только файлы задачи);
+- `cargo clippy -p zam-store -p zam-server -p zam-cli -p xtask --all-targets -- -D warnings` —
+  чисто;
+- `RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links' cargo doc -p zam-server --no-deps` — чисто;
+- `zam-store`: `--lib` 104 (+1 ignored), `migrate_rebuild` 22, `entries` 28, `nodes` 7 — PASS;
+- `zam-server --lib` — 287 (+1 ignored) PASS;
+- `zam-server` (`ZAM_REQUIRE_ML=1`, модели `.tmp/ci-models`): `mcp` 64, `recall` 43 (+1),
+  `recall_brief` 9, `recall_frozen` 4, `recall_heavy` 2, `recall_heavy_ml` 1, `recall_prompt_ml`
+  1, `recall_recovery` 6, `nodes` 19, `boot` 14, `journals` 13, `insights` 19, `ideas` 21,
+  `questions` 15, `reports` 26, `entries_revision` 4, `sessions` 17, `session_tokens` 5,
+  `m57_acceptance` 13 — все PASS;
+- `zam-cli --test hooks` — 105 PASS (104 прежних + новый);
+- `xtask` — тесты `caps` 3 PASS.
+- Не запускались: полный прогон (`--workspace`, задачи 8c/17d/13b), e2e, WebUI (не менялся),
+  стенд Linux, замеры токенов (§17 п. 25 подтверждается тестами, не замером).
+
+### Передать
+
+- **→ 13a/13c (ТЗ):** §API — `/health.features` официальный список и ссылка на
+  `docs/api-compat.md`; `POST /recall` поле `timeout_ms`, ключ `recall.max_timeout_ms` (§14:
+  1..=60000, 2000); `Idempotency-Key` у `POST /nodes`, `PUT|PATCH /nodes/{id}` (семантика,
+  422/409, папка — 400), таблица `node_idempotency` в описании схемы 0025; MCP — `session_id` у
+  `memory_search|read` и правило «заголовок против аргумента — 400», `idempotency_key` у
+  `memory_write`, `source|agent_block_version|timeout_ms` у `memory_recall`; хук
+  `subagent-start` без `agent_id` — своя сессия. ТЗ: `.zeroaimemory/area.toml` описан, но не
+  читается (наблюдение zero-agent) — убрать или пометить.
+- **→ 13c (CHANGELOG `[0.0.11-m6]`, руководство, README):** те же пункты для пользователя;
+  README — ссылка на `docs/api-compat.md`; устаревшие комментарии из приложения zero-agent
+  (`cli/main.rs` «пять видов hook», `api/recall.rs` «девять ключей hooks») — строки уехали,
+  сверить по тексту.
+- **→ 13b (полный прогон):** миграция 0025 дополнена — базы разработки, уже открытые сборкой M6
+  до задачи 19 (`user_version = 25`), таблицы `node_idempotency` не получат: запрос с
+  `Idempotency-Key` к узлу на такой базе даст 500 (без ключа всё работает). Тестовые и eval-базы
+  создаются заново; на машине владельца — пересоздать или открыть копию `bak-v24`.
+- **→ M7:** `Idempotency-Key` у `PATCH /entries/{id}` (`append` записи журнала) и у
+  `answer|claim|propose|decide` — тот же класс повтора; вместе с CR-12. OpenAPI (CR-9).
+  `memory_recall event=brief` из MCP с сессией родителя отмечает показ у родителя (текст пакета
+  родитель видит сам — оставлено как есть).

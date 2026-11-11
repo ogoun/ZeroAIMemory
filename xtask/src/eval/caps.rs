@@ -12,7 +12,7 @@
 //!   ключ в [`KEYS`] помечен этой строкой ([`Since::Feature`]): `budget` (§4.2, задача 5),
 //!   `snippet` (§4.3, задача 5), `focus` (§6, задача 7b), `digest` (§8, задача 8a),
 //!   `hint_thresholds` (§9, задача 9), `kind_boost` (§10), `attach_weight` (§11), `snapshot`
-//!   (§8а, задача 17c); `code_recv` (§12а, задача 14) — возможность без ключа конфигурации (в
+//!   (§8а, задача 17c), `recall_timeout` (§16 п. 19, задача 19); `code_recv` (§12а, задача 14) — возможность без ключа конфигурации (в
 //!   [`KEYS`] её нет). Пока строки нет, ключ этой сборке не шлётся (а прогон с ним — не
 //!   сравнивается);
 //! - `features` нет — выпуск по таблице [`RELEASES`]: версия и коммит (`git`, 12 знаков) должны
@@ -222,6 +222,7 @@ pub const KEYS: &[(&str, Since)] = &[
     ("recall.snapshot_digest_days", F("snapshot")),
     ("snapshot.max_bytes", F("snapshot")),
     ("snapshot.keep_days", F("snapshot")),
+    ("recall.max_timeout_ms", F("recall_timeout")),
 ];
 
 /// Возможности по ответу `/health`.

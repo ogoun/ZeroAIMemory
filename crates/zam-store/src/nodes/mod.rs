@@ -13,6 +13,7 @@
 
 mod chunks;
 mod history;
+mod idempotency;
 mod l0;
 mod read;
 mod revise;
@@ -49,10 +50,13 @@ pub(crate) use chunks::{index_note, index_state, note_meta, space_kind};
 pub use history::{RevisionInfo, entry_snapshot_text, list_revisions, unified_diff};
 pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
-pub use revise::{WriteError, patch_note, patch_note_within, revert_note, update_note};
+pub use revise::{
+    WriteError, patch_note, patch_note_keyed, patch_note_within, revert_note, update_note,
+    update_note_keyed,
+};
 pub(crate) use tree_ops::move_tx;
 pub use tree_ops::{delete_node, list_trash, move_node, restore_node};
-pub use write::{create_folder, create_note};
+pub use write::{create_folder, create_note, create_note_keyed};
 pub(crate) use write::{ensure_ancestors, insert_note, store_revision};
 
 /// Вид узла.

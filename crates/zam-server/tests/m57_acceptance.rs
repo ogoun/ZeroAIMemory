@@ -1649,6 +1649,8 @@ async fn acceptance_migration_from_m56_db() {
             "sqlite_autoindex_session_snapshots_1",
             // `nodes.imported_from` (0025, задача 18b2)
             "nodes",
+            // ключи идемпотентности заметок (0025, задача 19)
+            "node_idempotency",
         ]
         .contains(&o.1.as_str())
     };

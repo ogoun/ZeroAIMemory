@@ -810,6 +810,9 @@ pub struct RecallSection {
     /// Бюджет сервера на сбор подсказок, мс (1..=60000, 200): по превышении отдаётся собранное
     /// и `warnings: ["recall timeout"]`.
     pub timeout_ms: u64,
+    /// Верхний предел поля `timeout_ms` тела `/recall`, мс (1..=60000, 2000; M6 §16 п. 19,
+    /// CR-7): нативный клиент может ждать полный дайджест дольше хуков; больше предела — 400.
+    pub max_timeout_ms: u64,
     /// Фрагмент под подсказкой поиска (правило, insight), токенов (0..=200, 60; M6 §4.3);
     /// 0 — без фрагмента.
     pub snippet_tokens: usize,
@@ -864,6 +867,9 @@ impl RecallSection {
         }
         if !(1..=60_000).contains(&self.timeout_ms) {
             return Err(bad("timeout_ms", "от 1 до 60000"));
+        }
+        if !(1..=60_000).contains(&self.max_timeout_ms) {
+            return Err(bad("max_timeout_ms", "от 1 до 60000"));
         }
         if self.snippet_tokens > 200 {
             return Err(bad("snippet_tokens", "от 0 до 200"));
@@ -1549,6 +1555,7 @@ impl Default for ServerConfig {
                 prompt_min_score_fts: None,
                 post_tool_coverage: CoverageRule::M6,
                 timeout_ms: 200,
+                max_timeout_ms: 2000,
                 snippet_tokens: 60,
                 digest_entries: 5,
                 digest_code_map_tokens: 0,
@@ -2970,6 +2977,30 @@ master_key = \"x\"
             (c.recall.snapshot_tokens, c.snapshot.max_bytes),
             (0, 65_536)
         );
+    }
+
+    /// M6 §16 п. 19 (CR-7): `recall.max_timeout_ms` — 1..=60000, по умолчанию 2000.
+    #[test]
+    fn recall_max_timeout_default_and_range() {
+        let c = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(c.recall.max_timeout_ms, 2000);
+        for v in ["0", "60001"] {
+            let e = load(
+                None,
+                &[env("ZAM_RECALL__MAX_TIMEOUT_MS", v)],
+                &Default::default(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("recall.max_timeout_ms"), "{v}: {e}");
+        }
+        let c = load(
+            None,
+            &[env("ZAM_RECALL__MAX_TIMEOUT_MS", "60000")],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(c.recall.max_timeout_ms, 60_000);
     }
 
     #[test]

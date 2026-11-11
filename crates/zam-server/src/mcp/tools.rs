@@ -12,7 +12,7 @@
 //! - **Пространство по умолчанию** (`memory_tree`, `memory_write`, `memory_log`,
 //!   `memory_vault`) **[решение исполнителя]** — решение из `X-Zam-Solution`, без него —
 //!   `knowledge`.
-//! - **Ссылки** `i:|c:|r:|t:|k:|q:|e:<id>` (как в карточках поиска) принимаются везде, где REST
+//! - **Ссылки** `i:|c:|r:|t:|k:|q:|w:|e:<id>` (как в карточках поиска) принимаются везде, где REST
 //!   ждёт id записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`.
 use std::sync::{Arc, LazyLock};
 
@@ -89,7 +89,7 @@ impl ToolName {
                  insight_kinds, file, decided_by. Дальше — memory_read."
             }
             ToolName::Read => {
-                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id>, путь <пространство>:/<путь>; \
+                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:|w:<id>, путь <пространство>:/<путь>; \
                  вложение — a:<id> или b:<sha256>, locator page:N|slide:N|para:N|sheet:Лист!A1:F40, \
                  без него — оглавление. tier, section, max_tokens; if_rev — unchanged; since_rev — \
                  дифф. Ошибка — в элементе."
@@ -119,8 +119,8 @@ impl ToolName {
             ToolName::UpdateEntry => {
                 "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
                  claim|release|answer|propose|decide; rev — ревизия (кроме feedback, claim, \
-                 release, answer). certify — certainty, reason; feedback — value; задача: status, \
-                 claim, release; вопрос: answer (by обязателен), status obsolete."
+                 release, answer, propose, decide). certify — certainty, reason; feedback — value; \
+                 вопрос: answer (by обязателен), status obsolete."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
@@ -173,6 +173,7 @@ impl ToolName {
                     "rerank": {"type": "string", "enum": ["off", "on"]},
                     "skip_seen": {"type": "boolean", "description":
                         "true — выданное в сессии без фрагмента (seen); по умолчанию фрагмент и (выдавалось)"},
+                    "session_id": session_id(),
                     "format": fmt,
                 }),
                 &["query"],
@@ -199,6 +200,7 @@ impl ToolName {
                         "required": ["id"],
                     }},
                     "budget_tokens": {"type": "integer", "minimum": 1},
+                    "session_id": session_id(),
                     "format": fmt,
                 }),
                 &["items"],
@@ -253,6 +255,8 @@ impl ToolName {
                     "base_rev": {"type": "integer"},
                     "message": {"type": "string"},
                     "l0": {"type": "string"},
+                    "idempotency_key": {"type": "string", "description":
+                        "повтор с тем же ключом не пишет второй раз (сбой связи); другое тело — 422"},
                     "format": fmt,
                 }),
                 &["path"],
@@ -339,9 +343,14 @@ impl ToolName {
                         "description": "brief: задача субагента, до 2000 символов"},
                     "error": {"type": "string"},
                     "tool": {"type": "string"},
-                    "session_id": {"type": "string",
-                        "description": "по умолчанию — X-Zam-Session"},
+                    "session_id": session_id(),
                     "budget_tokens": {"type": "integer", "minimum": 1},
+                    "source": {"type": "string", "description":
+                        "session_start: startup|resume|clear|compact|fork; compact и resume — пакет восстановления"},
+                    "agent_block_version": {"type": "integer", "minimum": 0, "description":
+                        "версия блока инструкции агента; старее сервера — напоминание в дайджесте"},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "description":
+                        "срок сбора, мс (до recall.max_timeout_ms; по умолчанию recall.timeout_ms)"},
                     "format": fmt,
                 }),
                 &["event"],
@@ -396,6 +405,12 @@ impl ToolName {
         };
         json!({"type": "object", "properties": props, "required": required})
     }
+}
+
+/// Схема аргумента `session_id` ([`SESSION_ARG_TOOLS`]).
+fn session_id() -> Value {
+    json!({"type": "string", "description":
+        "явная сессия учёта и отметок; по умолчанию — X-Zam-Session, с ним не расходится (иначе 400)"})
 }
 
 /// Определения инструментов (собираются один раз).
@@ -508,6 +523,30 @@ pub async fn call(tool: ToolName, rest: &Rest, mut args: JsonObject) -> Output {
             text: with_tokens(fail_text(&f)),
             is_error: true,
         },
+    }
+}
+
+/// Инструменты с аргументом `session_id` — явной сессией вызова (M6 §16 п. 19, CR-8).
+pub const SESSION_ARG_TOOLS: [ToolName; 3] = [ToolName::Recall, ToolName::Search, ToolName::Read];
+
+/// Аргумент `session_id` инструмента из [`SESSION_ARG_TOOLS`] без пробелов по краям (пусто или
+/// нет — `None`; у прочих инструментов не читается). Не строка — текст ошибки.
+pub fn session_arg(tool: ToolName, args: Option<&JsonObject>) -> Result<Option<String>, String> {
+    if !SESSION_ARG_TOOLS.contains(&tool) {
+        return Ok(None);
+    }
+    match args.and_then(|a| a.get("session_id")) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.trim().to_string()).filter(|s| !s.is_empty())),
+        Some(_) => Err("session_id: строка".into()),
+    }
+}
+
+/// Ответ-ошибка инструмента с семантикой HTTP (`Ошибка <код> …`) и `~N tok` — до вызова REST.
+pub fn problem(status: StatusCode, detail: String) -> Output {
+    Output {
+        text: with_tokens(fail_text(&Fail::Problem { status, detail })),
+        is_error: true,
     }
 }
 
@@ -699,7 +738,7 @@ fn default_space(rest: &Rest) -> String {
         .to_string()
 }
 
-/// Id записи журнала без префикса ссылки `i:|c:|r:|t:|k:|q:|p:|e:` (или `entry:`).
+/// Id записи журнала без префикса ссылки `i:|c:|r:|t:|k:|q:|p:|w:|e:` (или `entry:`).
 fn entry_id(raw: &str) -> &str {
     let t = raw.trim();
     match t.split_once(':') {
@@ -708,7 +747,7 @@ fn entry_id(raw: &str) -> &str {
     }
 }
 
-/// Ссылка графа: `i:|c:|r:|t:|k:|q:|p:<id>` → `e:<id>`, остальное — как есть (отчёт `p:` токену
+/// Ссылка графа: `i:|c:|r:|t:|k:|q:|p:|w:<id>` → `e:<id>`, остальное — как есть (отчёт `p:` токену
 /// — 404 в REST, как несуществующая запись).
 fn graph_ref(raw: &str) -> String {
     let t = raw.trim();
@@ -740,6 +779,14 @@ async fn call_rest(
             hint: None,
         })
     }
+}
+
+/// Заголовок `Idempotency-Key` из аргумента `idempotency_key` (`memory_write`, `memory_log`).
+fn idempotency_header(args: &JsonObject) -> Result<Vec<(HeaderName, String)>, Fail> {
+    Ok(opt_str(args, "idempotency_key")?
+        .map(|k| (HeaderName::from_static("idempotency-key"), k.to_string()))
+        .into_iter()
+        .collect())
 }
 
 fn if_match(rev: i64) -> (HeaderName, String) {
@@ -973,6 +1020,8 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
     let content = opt_str(args, "content")?;
     let ops = args.get("ops").filter(|v| !v.is_null());
     let base_rev = opt_int(args, "base_rev")?;
+    // `Idempotency-Key` для всех трёх путей (M6 §16 п. 19, CR-20)
+    let key = idempotency_header(args)?;
     let reread = "Перечитайте заметку (memory_read) и повторите с base_rev текущей ревизии.";
     let r = match (content, ops, base_rev) {
         (Some(_), Some(_), _) => {
@@ -996,7 +1045,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
                 Method::PATCH,
                 &format!("/api/v1/nodes/{}", enc(&id)),
                 Some(&Value::Object(body)),
-                &[],
+                &key,
             )
             .await
             .map_err(|e| e.hint(reread))?
@@ -1004,12 +1053,14 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
         (Some(_), None, Some(rev)) => {
             let id = node_id(rest, &space, &path).await?;
             let body = pick(args, &["content", "l0", "message"]);
+            let mut extra = vec![if_match(rev)];
+            extra.extend(key.iter().cloned());
             call_rest(
                 rest,
                 Method::PUT,
                 &format!("/api/v1/nodes/{}", enc(&id)),
                 Some(&Value::Object(body)),
-                &[if_match(rev)],
+                &extra,
             )
             .await
             .map_err(|e| e.hint(reread))?
@@ -1024,7 +1075,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
                 Method::POST,
                 "/api/v1/nodes",
                 Some(&Value::Object(body)),
-                &[],
+                &key,
             )
             .await
             .map_err(|e| {
@@ -1144,10 +1195,7 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
             body.insert("images".into(), images);
         }
     }
-    let extra: Vec<(HeaderName, String)> = opt_str(args, "idempotency_key")?
-        .map(|k| (HeaderName::from_static("idempotency-key"), k.to_string()))
-        .into_iter()
-        .collect();
+    let extra = idempotency_header(args)?;
     let r = call_rest(
         rest,
         Method::POST,
@@ -1445,6 +1493,7 @@ async fn recall(rest: &Rest, args: &JsonObject) -> Res {
             "budget_tokens",
             "agent_block_version",
             "source",
+            "timeout_ms",
         ],
     );
     let r = call_rest(

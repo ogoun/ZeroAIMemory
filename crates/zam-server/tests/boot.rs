@@ -82,6 +82,43 @@ async fn health_ok_under_base_path() {
     assert_eq!(r.status(), 404);
 }
 
+/// CR-9 (часть, §16 п. 19): `/health.features` — официальный список; каждый флаг `FEATURES`
+/// описан строкой таблицы раздела «Флаги `features`» в `docs/api-compat.md`, и таблица не
+/// называет флагов, которых нет в сборке. Флаги задачи 19 — в списке.
+#[test]
+fn health_features_documented() {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api-compat.md");
+    let doc = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let section = doc
+        .split("\n## ")
+        .find(|s| s.starts_with("Флаги `features`"))
+        .expect("раздел «Флаги `features`»");
+    let documented: std::collections::BTreeSet<&str> = section
+        .lines()
+        .filter_map(|l| l.strip_prefix("| `"))
+        .filter_map(|l| l.split_once('`').map(|(f, _)| f))
+        .collect();
+    let built: std::collections::BTreeSet<&str> =
+        zam_server::api::health::FEATURES.iter().copied().collect();
+    assert_eq!(documented, built, "таблица флагов против FEATURES");
+    for f in [
+        "idempotent_nodes",
+        "recall_timeout",
+        "mcp_session_arg",
+        "epochs",
+    ] {
+        assert!(built.contains(f), "{f}");
+    }
+    // у каждого флага — описание (третья ячейка не пустая)
+    for l in section.lines().filter(|l| l.starts_with("| `")) {
+        let cells: Vec<&str> = l.split('|').map(str::trim).collect();
+        assert!(
+            cells.len() >= 4 && cells[2..cells.len() - 1].iter().all(|c| !c.is_empty()),
+            "{l}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn ready_ok() {
     let (app, ..) = build(cfg_in(tmp("b4")), Some("pw".into())).await.unwrap();

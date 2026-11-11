@@ -6,7 +6,9 @@
 //!   (мини-дайджест сервера);
 //! - параллельно в общем бюджете: `POST /sessions {id: "<session>:<agent_id>", parent_id,
 //!   agent_type, agent, solution}` и `POST /recall {event: "brief", session_id, parent_id,
-//!   solution, task}`. Id длиннее 128 символов — `sub-<32 hex blake3>`;
+//!   solution, task}`. Id длиннее 128 символов — `sub-<32 hex blake3>`; без `agent_id` — разовый
+//!   `anon-<hex>` (M6 §16 п. 19, наблюдение zero-agent): показ пакета не отмечается в сессии
+//!   родителя и не гасит его подсказки к тем же записям;
 //! - журнал сессии родителя — `subagent {agent_type, agent_id}` (ключ `session_journal`);
 //! - вывод — `additionalContext` с `hookEventName: SubagentStart`. У Claude текст попадает в
 //!   контекст субагента (документировано); у Codex адресат не подтверждён — ⚠️ проверить на
@@ -34,6 +36,15 @@ pub fn subagent_session_id(session: &str, agent_id: &str) -> String {
     }
     let h = blake3::hash(id.as_bytes()).to_hex();
     format!("sub-{}", &h[..32])
+}
+
+/// Разовый `agent_id` субагента, когда агент его не прислал: `anon-<время нс><pid>` в hex —
+/// своя сессия на каждый запуск.
+fn anon_agent_id() -> String {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("anon-{ns:x}{:x}", std::process::id())
 }
 
 /// Строковое поле stdin без пробелов по краям, до 128 символов без управляющих; пусто — `None`.
@@ -71,19 +82,22 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
         return Output::Empty;
     };
     let solution = env.solution.as_ref().map(|x| x.id.clone());
-    let sub = agent_id.as_deref().map(|a| subagent_session_id(session, a));
+    // без `agent_id` — своя разовая сессия субагента (M6 §16 п. 19): показ пакета в сессии
+    // родителя погасил бы его подсказки к тем же записям, хотя пакет ушёл в контекст субагента
+    let agent_id = agent_id.unwrap_or_else(anon_agent_id);
+    let sub = subagent_session_id(session, &agent_id);
     let agent_type = (!agent_type.is_empty()).then_some(agent_type);
     let (reg, recall) = std::thread::scope(|sc| {
-        let reg = sub.as_ref().map(|id| {
-            let body = json!({"id": id, "parent_id": session, "agent_type": agent_type,
+        let reg = {
+            let body = json!({"id": sub, "parent_id": session, "agent_type": agent_type,
                               "agent": env.agent.name(), "solution": solution});
             let c = &client;
             sc.spawn(move || c.post_json("/sessions", &body).map(|_| ()))
-        });
+        };
         let body = json!({
             "event": "brief",
-            // без `agent_id` сессии субагента нет — показ учитывается в сессии родителя
-            "session_id": sub.as_deref().unwrap_or(session),
+            // показ пакета — в сессии субагента, не родителя
+            "session_id": sub,
             "parent_id": session,
             "solution": solution,
             "task": spawn.as_ref().map(|x| x.task.as_str()).filter(|t| !t.trim().is_empty()),
@@ -101,11 +115,11 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
                 env.log("sessions(tokens): паника");
             }
         }
-        (reg.map(|h| h.join()), recall.join())
+        (reg.join(), recall.join())
     });
     match reg {
-        Some(Ok(Err(e))) => env.log(&format!("регистрация сессии субагента: {e}")),
-        Some(Err(_)) => env.log("регистрация сессии субагента: паника"),
+        Ok(Err(e)) => env.log(&format!("регистрация сессии субагента: {e}")),
+        Err(_) => env.log("регистрация сессии субагента: паника"),
         _ => {}
     }
     let v: Value = match recall {

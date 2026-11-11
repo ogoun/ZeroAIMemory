@@ -65,8 +65,8 @@ pub use triggers::{
 };
 pub(crate) use triggers::{check_triggers, replace_triggers, same_triggers, tools_col};
 pub(crate) use write::{
-    Fields, Maker, content_data, ensure_not_report, ensure_release_version_free, insert_entry,
-    insert_entry_as, revise, revise_with, save, tags_json,
+    Fields, Maker, check_key, content_data, ensure_not_report, ensure_release_version_free,
+    insert_entry, insert_entry_as, revise, revise_with, save, scoped_key, tags_json,
 };
 pub use write::{
     create_entry, delete_entry, entry_by_idempotency_key, restore_entry, retract_entry,

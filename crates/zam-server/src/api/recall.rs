@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! POST /recall {event, session_id?, solution?, area?, prompt?, error?, tool?, budget_tokens?,
-//!               agent_block_version?, task?, parent_id?}
+//!               agent_block_version?, task?, parent_id?, timeout_ms?}
 //!   → 200 {text, items: [{id, kind, title, certainty, reason, age_days?}], tokens,
 //!          rules_tokens, timings, warnings, hooks?, holdout?}
 //! ```
@@ -120,7 +120,9 @@
 //!   [`ACCOUNTING_RESERVE_MS`] (40 мс, не больше половины срока), по превышении отдаётся
 //!   собранное и `warnings: ["recall timeout"]`; учёт показов — после сбора и только до полного
 //!   срока: вышел — собранное отдаётся без `session_seen` и `usage` (`timings.record_ms: null`)
-//!   и с тем же предупреждением. Сбой внутреннего поиска `prompt` — тишина и
+//!   и с тем же предупреждением. Поле тела `timeout_ms` (M6 §16 п. 19, CR-7) задаёт срок этого
+//!   запроса вместо `recall.timeout_ms`: 1..=`recall.max_timeout_ms` (2000), иначе 400 — нативный
+//!   клиент может ждать полный дайджест дольше хуков. Сбой внутреннего поиска `prompt` — тишина и
 //!   `warnings: ["recall search failed"]`;
 //! - `record: false` (по умолчанию `true`) — ответ без учёта: ни `session_seen`, ни `usage`,
 //!   `timings.record_ms: null` (хук `session-start` с выключенным в клиенте дайджестом берёт
@@ -377,6 +379,9 @@ pub struct RecallReq {
     /// Предел канала вывода хука (ревью 8a, C1): весь `text` укладывается в него сервером,
     /// клиент режет только страховочно. Нет у хука (старый клиент) — [`HOOK_OUTPUT_LIMIT`].
     output_limit: Option<OutputLimit>,
+    /// Срок сбора этого запроса, мс (M6 §16 п. 19, CR-7): 1..=`recall.max_timeout_ms`, иначе 400;
+    /// нет — `recall.timeout_ms`.
+    timeout_ms: Option<u64>,
 }
 
 /// Единица предела вывода: символы (Claude Code) или байты UTF-8 (Codex).
@@ -4123,6 +4128,15 @@ pub async fn recall(
             "output_limit.max: от 1 до {OUTPUT_LIMIT_MAX}"
         )));
     }
+    let max_timeout = st.cfg.recall.max_timeout_ms;
+    if req
+        .timeout_ms
+        .is_some_and(|t| !(1..=max_timeout).contains(&t))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "timeout_ms: от 1 до {max_timeout} (recall.max_timeout_ms)"
+        )));
+    }
     let area = zam_store::normalize_area(req.area.as_deref());
     if area.as_ref().is_some_and(|a| {
         a.chars().count() > zam_store::AREA_MAX_CHARS || a.chars().any(char::is_control)
@@ -4271,12 +4285,23 @@ pub async fn recall(
         tracing::debug!(event = ?req.event, source = %src, recovery, "recall");
     }
     // сбор — до срока минус резерв на учёт показа; учёт — только до полного срока
-    let timeout = st.cfg.recall.timeout_ms;
+    // срок — из тела (нативный клиент, CR-7) или `recall.timeout_ms` (бюджет хуков)
+    let timeout = req.timeout_ms.unwrap_or(st.cfg.recall.timeout_ms);
     let total_deadline = t0 + Duration::from_millis(timeout);
     let mut deadline = Deadline {
         at: t0 + Duration::from_millis(timeout - ACCOUNTING_RESERVE_MS.min(timeout / 2)),
         expired: false,
     };
+    // тестовая задержка шага сбора под сроком (CR-7): только с фичей test-hooks
+    #[cfg(feature = "test-hooks")]
+    {
+        let ms = st.recall_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            let _ = deadline
+                .step(tokio::time::sleep(Duration::from_millis(ms)))
+                .await;
+        }
+    }
 
     // сбор кандидатов
     let mut code_section: Vec<String> = Vec::new();

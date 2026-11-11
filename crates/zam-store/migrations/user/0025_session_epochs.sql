@@ -76,3 +76,16 @@ ALTER TABLE code_refs ADD COLUMN recv_count INTEGER NOT NULL DEFAULT 0;
 -- нормализуется типизированным разбором при каждой записи сервера и потеряла бы поле.
 ALTER TABLE nodes ADD COLUMN imported_from TEXT;
 ALTER TABLE entries ADD COLUMN imported_from TEXT;
+
+-- ---------- ключи идемпотентности заметок (§16 п. 19, CR-20, задача 19) ----------
+-- `Idempotency-Key` у `POST /nodes`, `PUT` и `PATCH /nodes/{id}`: ключ в границах автора
+-- (`<пользователь|t<токен>|->:<ключ>`, как `entries.idempotency_key`), операция, узел и отпечаток
+-- запроса (blake3 hex, `zam_store::nodes::idempotency`). Строка пишется в транзакции самой
+-- правки; живёт, пока жив узел (узлы физически не удаляются) — отдельного срока нет, как у
+-- ключа записи журнала.
+CREATE TABLE node_idempotency (
+  key TEXT PRIMARY KEY,
+  op TEXT NOT NULL CHECK (op IN ('create','replace','patch')),
+  node_id TEXT NOT NULL REFERENCES nodes(id),
+  fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL) WITHOUT ROWID;

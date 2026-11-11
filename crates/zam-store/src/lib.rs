@@ -139,11 +139,12 @@ pub use migrate::Migration;
 pub use nodes::{
     Attribution, AuthorKind, BudgetCounterKind, NewNote, Node, NodeKind, PREFIX_L0_MAX_TOKENS,
     RevisionInfo, WriteError, budget_cap, budget_counter_kind, budget_tokenizer_id, chunk_params,
-    count_tokens, count_tokens_chunker, create_folder, create_note, delete_node,
+    count_tokens, count_tokens_chunker, create_folder, create_note, create_note_keyed, delete_node,
     entry_snapshot_text, find_by_name, fits_budget, get_node, get_node_by_path, list_children,
-    list_revisions, list_trash, move_node, node_content, patch_note, patch_note_within, prefix_l0,
-    restore_node, revert_note, set_auto_l0, set_bundled_counter, set_chunk_params, set_folder_l0,
-    set_prefix_l0, set_token_counter, token_counter_exact, unified_diff, update_note,
+    list_revisions, list_trash, move_node, node_content, patch_note, patch_note_keyed,
+    patch_note_within, prefix_l0, restore_node, revert_note, set_auto_l0, set_bundled_counter,
+    set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter, token_counter_exact,
+    unified_diff, update_note, update_note_keyed,
 };
 pub use paths::{NodePath, path_ancestors};
 pub use questions::{

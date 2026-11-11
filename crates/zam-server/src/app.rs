@@ -94,6 +94,11 @@ pub struct AppState {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub focus_embeds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Задержка шага сбора `/recall` под сроком сбора, мс (фича `test-hooks`): тест срока из
+    /// тела `timeout_ms` (M6 §16 п. 19, CR-7). 0 — без задержки.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub recall_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -420,6 +425,8 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         focus_batch: Arc::default(),
         #[cfg(feature = "test-hooks")]
         focus_embeds: Arc::default(),
+        #[cfg(feature = "test-hooks")]
+        recall_delay_ms: Arc::default(),
     };
     let router = router(state.clone());
     Ok((router, state, BootReport { initial_token }))
