@@ -12361,6 +12361,19 @@ CHANGELOG, README, `deploy/README-install.md`.
   `fail_open_when_server_down`, `acceptance_recall_p95_with_50_ideas`; CHANGELOG Fixed — потеря
   очереди старше часа, замедление `session-start` без сервера, пустой `hooks.log`. Текстов блока,
   `guide` и MCP среди них нет.
+- **Задача 1a2 (стр. ~138)**: ТЗ §API — `/health.features` (вместе с передачей 19).
+- **Задача 2 (стр. ~716, M1)**: откат на 0.0.10-m5.7 — только вручную: остановить сервер, вернуть
+  `<user>.db.bak-v24` (или `bak-v23` при миграции с 0023) на место базы, удалить `-wal`/`-shm`;
+  записанное после миграции теряется — описать в `deploy/README-install.md` и CHANGELOG.
+- **Задача 7a (стр. ~2366, п. 5)**: `eval/README.md`, «неточности MCP» — `memory_recall
+  event=recovery` субагента через общее подключение начинает новую эпоху сессии родителя (лишний
+  повтор фрагментов у родителя, не потеря).
+- **Задача 17a (стр. ~7079, п. 5)**: правила флагов (`mask_flags`) не внесены в `zam-secrets`
+  (`RULES_VERSION`, перепроверка баз, ложные срабатывания) — в ТЗ §8а/§7.6 оговорка; перенос — M7.
+- **Ревью 13a, I1**: спецификация §13 (правило отвергнутых подходов) — вид
+  `data: {kind: "decision", decision: {options, chosen, rationale}}`; ТЗ §7.x/§5.1 и CHANGELOG
+  «Изменения ответа» — новый 422 `data.<ключ>: поля решения — в data.decision` у `insight`
+  `decision` без `data.decision` и с ADR-ключами на верхнем уровне.
 - **Доработка 13a (знание о файле клиента, вид v2)**: спецификация M6 §4.3 (строка «Строки знания о
   файле клиента … не меняются» — теперь меняются: `<title> [<kind>·возможно устарело] <ref>`), ТЗ
   §10.7 (стр. ~1162 «`[<kind>, возможно устарело]` — <ref>») и §7.12 (стр. ~667, вид строки о
@@ -12435,3 +12448,45 @@ zam-server --all-targets -- -D warnings` — чисто; `cargo fmt --all --chec
 `init` 15, `m45_acceptance::file_change_marks_stale`, `m56_acceptance::acceptance_old_cache_reads`
 — PASS; `zam-server` `agent_setup` 15, `mcp` 65 — PASS; `cargo clippy -p zam-cli -p zam-server
 --all-targets -- -D warnings` — чисто.
+### Задача 13a, правки ревью (2026-11-11)
+
+Ревью — «одобрено с правками», I1–I3 и M1–M9 закрыты в одном круге.
+
+- **I1.** Правило отвергнутых подходов — в виде, который читает сервер: `data: {kind: "decision",
+  decision: {options: [<отвергнутое>], chosen, rationale: "отвергнуто, потому что…"}}` — в
+  `guide.{ru,en}.md` («Запись»), `INSTRUCTIONS`, описании `data.kind` у `memory_log` (273 символа).
+  Защита сервера: `check_insight_data` (`api/insights.rs`) — у `insight` с `kind: decision` без
+  `data.decision` и с `options|chosen|rationale|consequences|revisit_if` на верхнем уровне `data`
+  — 422 `data.<ключ>: поля решения — в data.decision (…)`; так же в `supersede`. Писателей с
+  ADR-ключами сверху нет (grep: WebUI `InsightsView`/`journals.ts`, e2e `working-memory`, xtask,
+  eval, тесты — все через `data.decision`), поэтому 422, а не предупреждение. Тест
+  `decisions::decision_adr_fields_at_top_level_rejected` (5 ключей, `supersede`, верный вид — 201,
+  у `gotcha` такие ключи — данные).
+- **I2.** Поле `locator` у `memory_read` (у полей схемы предела 300 нет; 117 символов): «часть
+  вложения: page:N | slide:N | para:N | sheet:Лист!A1:F40 (sheet:#N!A1:F40 — по номеру); без
+  locator — оглавление» — формы сверены с `zam_docs::Locator::parse`.
+- **I3.** В «Передано в 13c» добавлены 1a2 (стр. ~138), 2 (стр. ~716, ручной откат на
+  0.0.10-m5.7), 7a (стр. ~2366, `recovery` субагента — эпоха родителя), 17a (стр. ~7079, флаги не
+  в `zam-secrets`), ревью 13a I1 (спецификация §13, 422 в ТЗ/CHANGELOG). Повторный grep `13c`,
+  `README-install`, `CHANGELOG` с задачи 1: прочие упоминания уже в списке или сделаны задачами.
+- **M1** дочитывание пропуска документа — элементами `{id, locator: "page:N"}`, `оглавление` —
+  чтение без `locator`; **M2** «размер в хвосте карточки (`· 340t`) больше ≈ 600», «без фокуса»;
+  **M3** «уже выдавалось» — «в этой ревизии … повтор может быть обрезан бюджетом» (`read.rs`
+  58–63) и «после сжатия без хуков пометки обнуляет `recovery` (новая эпоха)» (§7.2); **M4**
+  `session_id` — один постоянный id на сессию, до 128 символов (`SESSION_ID_MAX_CHARS`);
+  `agent_block_version` — N из маркера `zeroaimemory:begin vN`; **M5** `timeout_ms` — не больше
+  `max(recall.max_timeout_ms, recall.timeout_ms)` (2000 по умолчанию), больше — 400; **M6** «копировать
+  путь» — только у `file:` и `vscode://file/…` (`reportLinks.ts` 195–220), прочие `vscode:` — текстом
+  без кнопки; **M7** поле `focus` — «один и тот же текст на пачку» (92 символа); **M8** сокращённый
+  вид правил `<путь> … [надёжность] n:<id>` (`rule_bare_block`); **M9** `file_hint` — пустой вид без
+  пустого тега (как `hint_line`), тест в `file_hint_format`. Попутно: правила флагов снимка —
+  «во всех текстовых полях снимка», а не «в командах» (журнал 17a, п. 5).
+- **Блок** не менялся: 483 ru / 479 en (прогон `c3`). Описания инструментов: `memory_read` 295,
+  `memory_search` 298 — без изменений.
+- **Откаты** (`rollback2.ps1`, `rb-C.log`, `restored=True`): защита I1 выключена →
+  `decision_adr_fields_at_top_level_rejected` FAIL; пустые теги не отбрасываются →
+  `file_hint_format` FAIL.
+- **Прогоны** (`c3.log`): `cargo fmt --all --check` — чисто; `zam-server` `--lib` 287 (+1),
+  `agent_setup` 15, `decisions` 9, `insights` 19, `journals` 13, `mcp` 65; `zam-cli` юниты 186
+  (+1), `hooks` 109 — PASS; `cargo clippy -p zam-cli -p zam-server --all-targets -D warnings` —
+  чисто.

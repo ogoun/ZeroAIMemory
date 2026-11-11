@@ -4151,7 +4151,7 @@ async fn mcp_v7_descriptions_focus_seen_rejected() {
         "focus",
         "[пропущено",
         "уже выдавалось",
-        "kind=decision",
+        "data {kind: decision, decision: {options: [отвергнутое], chosen, rationale}}",
         "n:<id>",
         "· Nt",
         "kind=task|question|term",

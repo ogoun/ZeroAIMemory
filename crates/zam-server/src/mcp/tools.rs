@@ -186,7 +186,7 @@ impl ToolName {
                             "id": {"type": "string"},
                             "tier": {"type": "string", "enum": ["L0", "L1", "L2", "focus"]},
                             "focus": {"type": "string", "description":
-                                "запрос: оглавление, ближайшие листы, [пропущено: адрес · ~N t]"},
+                                "запрос, один и тот же текст на пачку: оглавление, ближайшие листы, [пропущено: адрес · ~N t]"},
                             "range": {"type": "string",
                                       "description": "r<rev>:S-E — байты ревизии (адрес [пропущено])"},
                             "section": {"type": "string", "description": "путь заголовков «A > B»"},
@@ -195,7 +195,7 @@ impl ToolName {
                             "since_rev": {"type": "integer", "minimum": 1,
                                           "description": "дифф с этой ревизии"},
                             "locator": {"type": "string",
-                                        "description": "часть вложения: page:12, sheet:Итоги!A1:F40"},
+                                        "description": "часть вложения: page:N | slide:N | para:N | sheet:Лист!A1:F40 (sheet:#N!A1:F40 — по номеру); без locator — оглавление"},
                         },
                         "required": ["id"],
                     }},
@@ -268,7 +268,7 @@ impl ToolName {
                     "body": {"type": "string"},
                     "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}; idea: origin обязателен — human (записана по словам человека) | agent (своя мысль: не предлагается, человек принимает её в WebUI), priority low|normal|high, horizon YYYY-MM-DD («не раньше»), links",
                         "properties": {"kind": {"type": "string", "description":
-                            "insight: gotcha|failure|experiment|discovery|decision. Отверг подход после проверки — decision: decision.options — отвергнутое, chosen — выбранное, rationale — «отвергнуто, потому что…» (или failure с результатом)"}}},
+                            "insight: gotcha|failure|experiment|discovery|decision. Отверг подход после проверки — kind: decision, поля решения — в data.decision: {options: [отвергнутое], chosen: выбранное, rationale: «отвергнуто, потому что…»} (на верхнем уровне data — 422); или failure с результатом"}}},
                     "images": {"type": "array", "description": "report: файлы по ссылкам тела ![…](figs/a.png); name — путь из ссылки, data — base64",
                         "items": {"type": "object", "properties": {
                             "name": {"type": "string"}, "data": {"type": "string"}},

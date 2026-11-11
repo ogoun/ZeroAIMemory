@@ -730,3 +730,60 @@ async fn contradicts_order_off_keeps_order() {
     let (ids, _) = rerank_order(&a).await;
     assert_eq!(ids, [hyp, ax], "порядок реранкера без поправки");
 }
+
+/// Поля ADR на верхнем уровне `data` решения (`{kind: "decision", options, chosen, …}`) сервер
+/// не читает — запись вышла бы без решения: 422 «поля решения — в data.decision» (ревью задачи
+/// 13a M6, I1). С `data.decision` — как раньше; у других видов insight такие ключи — данные.
+#[tokio::test]
+async fn decision_adr_fields_at_top_level_rejected() {
+    let a = api("decisions-adr-top", |_| {}).await;
+    for k in [
+        "options",
+        "chosen",
+        "rationale",
+        "consequences",
+        "revisit_if",
+    ] {
+        let v = if k == "options" {
+            json!(["A", "B"])
+        } else {
+            json!("x")
+        };
+        let mut body = decision(&format!("ADR: {k} сверху"), "b", None, json!({}));
+        body["data"][k] = v;
+        let r = post(&a, body).await;
+        unprocessable(&r, &format!("data.{k}: поля решения — в data.decision"));
+    }
+    // и в замещении
+    let e = created(post(&a, decision("ADR: база", "b", Some(json!({})), json!({}))).await).await;
+    let mut sup = decision("ADR: новая", "b", None, json!({}));
+    sup["data"]["chosen"] = json!("A");
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/entries/{}/supersede", id(&e)),
+            Some(sup),
+        )
+        .await;
+    unprocessable(&r, "data.chosen: поля решения — в data.decision");
+    // верный вид — 201 с решением
+    let ok = created(
+        post(
+            &a,
+            decision(
+                "ADR: отвергнутый подход",
+                "b",
+                Some(json!({"options": ["Redis"], "chosen": "SQLite",
+                            "rationale": "отвергнуто, потому что лишний сервис"})),
+                json!({}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(ok["data"]["decision"]["chosen"], "SQLite");
+    // у gotcha такие ключи — произвольные данные
+    let g = json!({"kind": "insight", "title": "Не решение", "body": "b",
+                   "data": {"kind": "gotcha", "chosen": "x", "options": ["a"]}});
+    created(post(&a, g).await).await;
+}

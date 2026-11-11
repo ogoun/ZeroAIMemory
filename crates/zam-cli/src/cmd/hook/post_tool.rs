@@ -503,13 +503,24 @@ pub fn file_hint(pr: &PathRefs) -> String {
                 .chars()
                 .take(TITLE_MAX)
                 .collect();
-            let mut tag = i.kind.clone();
-            if i.state == "stale" {
-                tag.push_str("·возможно устарело");
-            }
+            // теги как у `hint_line`: пустые опускаются, без тегов — без скобок
+            let stale = if i.state == "stale" {
+                "возможно устарело"
+            } else {
+                ""
+            };
+            let tags: Vec<&str> = [i.kind.trim(), stale]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect();
+            let tag = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", tags.join("·"))
+            };
             match (&i.symbol, one) {
-                (Some(sym), None) => format!("`{sym}`: {title} [{tag}] {}", i.id),
-                _ => format!("{title} [{tag}] {}", i.id),
+                (Some(sym), None) => format!("`{sym}`: {title}{tag} {}", i.id),
+                _ => format!("{title}{tag} {}", i.id),
             }
         })
         .collect();
@@ -587,6 +598,20 @@ mod tests {
             file_hint(&pr),
             "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] i:01A; \
              Архитектура [note·возможно устарело] n:01B; Пул v2 [changelog] c:01C"
+        );
+        // пустой вид — без пустого тега, как у `hint_line` (ревью задачи 13a, M9)
+        let pr = PathRefs {
+            path: "a.rs".into(),
+            hash: None,
+            items: vec![
+                item("i:01E", "", "Без вида", "ok"),
+                item("i:01F", " ", "Без вида, устарело", "stale"),
+            ],
+        };
+        assert_eq!(
+            file_hint(&pr),
+            "ZeroAIMemory: о файле a.rs в памяти: Без вида i:01E; \
+             Без вида, устарело [возможно устарело] i:01F"
         );
     }
 

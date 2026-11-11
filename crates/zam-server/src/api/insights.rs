@@ -154,13 +154,35 @@ pub fn check_insight_data(data: &Value) -> Result<(), ApiError> {
         )));
     }
     // ADR-поля — только у решений
-    if kind == Some("decision")
-        && let Some(d) = o.get("decision").filter(|d| !d.is_null())
-    {
-        DecisionData::parse(d)?;
+    if kind == Some("decision") {
+        match o.get("decision").filter(|d| !d.is_null()) {
+            Some(d) => {
+                DecisionData::parse(d)?;
+            }
+            // поля ADR на верхнем уровне `data` сервер не читает — запись вышла бы без решения
+            // (ревью задачи 13a M6, I1)
+            None => {
+                if let Some(k) = DECISION_TOP_LEVEL.iter().find(|k| o.contains_key(**k)) {
+                    return Err(unprocessable(format!(
+                        "data.{k}: поля решения — в data.decision \
+                         ({{kind: \"decision\", decision: {{options, chosen, rationale, …}}}})"
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
+
+/// Ключи ADR, которые по ошибке кладут на верхний уровень `data` решения вместо
+/// `data.decision` ([`check_insight_data`] — 422).
+const DECISION_TOP_LEVEL: [&str; 5] = [
+    "options",
+    "chosen",
+    "rationale",
+    "consequences",
+    "revisit_if",
+];
 
 /// Предел длины строк `data.decision` (символов).
 const DECISION_TEXT_MAX: usize = 2000;
