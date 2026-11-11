@@ -174,8 +174,11 @@ pub struct TakeOpts {
 pub enum Taken {
     /// Снимок и размер журнала при чтении, байт.
     Snap(Snapshot, u64),
-    /// Журнала нет, это не файл или ошибка чтения (и конспекта входа нет).
+    /// Журнала нет или это не файл (и конспекта входа нет).
     Missing,
+    /// Журнал есть, но не прочитан: ошибка открытия или чтения (на Windows — файл открыт другим
+    /// процессом без совместного чтения), и конспекта входа нет.
+    Unreadable,
     /// Журнал короче `min_len`.
     Skipped,
     /// Поток не успел в срок (брошен и ничего не пишет).
@@ -247,7 +250,11 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Taken {
     let Some(tail) = tail else {
         // журнала нет — снимок из конспекта входа хука, если он есть
         let Some(summary) = summary else {
-            return Taken::Missing;
+            return if meta.is_some() {
+                Taken::Unreadable
+            } else {
+                Taken::Missing
+            };
         };
         let snap = Snapshot {
             trigger: o.trigger,

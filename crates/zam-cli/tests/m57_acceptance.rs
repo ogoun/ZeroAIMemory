@@ -15,7 +15,7 @@ mod common;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Output;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use zam_server::build;
@@ -186,7 +186,7 @@ impl Proj {
         self.hook_budget(kind, agent, ev, Some("10000"))
     }
 
-    /// [`Proj::hook`] с бюджетом продукта: вывод и время процесса.
+    /// [`Proj::hook`] с бюджетом продукта: вывод и время хука внутри процесса.
     fn hook_timed(&self, kind: &str, agent: &str, ev: &Value) -> (Output, Duration) {
         self.hook_budget(kind, agent, ev, None)
     }
@@ -209,9 +209,10 @@ impl Proj {
             .current_dir(&self.repo)
             .args(["hook", kind, "--agent", agent])
             .write_stdin(ev.to_string().into_bytes());
-        let t = Instant::now();
-        let o = c.output().unwrap();
-        (o, t.elapsed())
+        // время хука — внутри процесса (канал `ZAM_TEST_HOOK_TIMING`; release без фичи
+        // `test-hooks` — процесс целиком): запуск отладочного exe в замер не входит
+        let (o, t) = common::hook_timed(c, kind);
+        (o, t.hook())
     }
 
     fn ev(&self, event: &str, session: &str, extra: Value) -> Value {
@@ -426,8 +427,12 @@ fn acceptance_hook_session_start_shows_idea() {
 
 // ---------- п. 15 ----------
 
-/// Один замер: p95 `session-start` и `prompt` решения с идеями и без (вперемешку).
-fn measure(pa: &Proj, pb: &Proj, round: usize) -> [(Duration, Duration); 2] {
+/// Квантили серии: (медиана, p95).
+type Q = (Duration, Duration);
+
+/// Один замер: медиана и p95 `session-start` и `prompt` решения с идеями и без (вперемешку):
+/// `[хук][с идеями | без]`.
+fn measure(pa: &Proj, pb: &Proj, round: usize) -> [[Q; 2]; 2] {
     const N: usize = 40;
     let mut t: [[Vec<Duration>; 2]; 2] = Default::default();
     for i in 0..N {
@@ -447,15 +452,16 @@ fn measure(pa: &Proj, pb: &Proj, round: usize) -> [(Duration, Duration); 2] {
             t[1][k].push(d);
         }
     }
-    let [ss, pr] = t;
-    let [ss_a, ss_b] = ss;
-    let [pr_a, pr_b] = pr;
-    [(p95(ss_a), p95(ss_b)), (p95(pr_a), p95(pr_b))]
+    let q = |v: &Vec<Duration>| (common::quantile(v, 50), p95(v.clone()));
+    [[q(&t[0][0]), q(&t[0][1])], [q(&t[1][0]), q(&t[1][1])]]
 }
 
 /// §13 п. 15: p95 `zam hook session-start` и `prompt` решения с 50 идеями человека против
 /// решения без идей того же сервера (вызовы вперемешку — общий фон нагрузки) — прирост ≤ 5 и ≤
-/// 15 мс. Отладочная сборка на занятой машине шумит: до трёх замеров, засчитывается первый
+/// 15 мс. Время — внутри процесса (задача 17d, пункт i): запуск отладочного exe, главный источник
+/// шума p95 из 40, в замер не входит. Кроме p95, тем же порогам подчинён прирост **медианы** —
+/// она устойчива к остановкам диска и ловит систематическую цену идей, даже когда p95 замера
+/// съел выброс. Отладочная сборка на занятой машине шумит: до трёх замеров, засчитывается первый
 /// уложившийся; все замеры печатаются (`ZAM_TIMING`) для журнала этапа.
 #[test]
 fn acceptance_recall_p95_with_50_ideas() {
@@ -502,21 +508,25 @@ fn acceptance_recall_p95_with_50_ideas() {
     let mut report = Vec::new();
     let mut passed = false;
     for round in 0..3 {
-        let [(ssa, ssb), (pra, prb)] = measure(&pa, &pb, round);
+        let [[ssa, ssb], [pra, prb]] = measure(&pa, &pb, round);
         let line = format!(
-            "замер {round}: session-start p95 {ssa:?} с идеями / {ssb:?} без; prompt p95 {pra:?} / \
-             {prb:?}"
+            "замер {round}: session-start p50 {:?} с идеями / {:?} без, p95 {:?} / {:?}; prompt \
+             p50 {:?} / {:?}, p95 {:?} / {:?}",
+            ssa.0, ssb.0, ssa.1, ssb.1, pra.0, prb.0, pra.1, prb.1
         );
         eprintln!("ZAM_TIMING m57 {line}");
         report.push(line);
-        if ssa.saturating_sub(ssb) <= ss_max && pra.saturating_sub(prb) <= pr_max {
+        let within = |a: Q, b: Q, max: Duration| {
+            a.0.saturating_sub(b.0) <= max && a.1.saturating_sub(b.1) <= max
+        };
+        if within(ssa, ssb, ss_max) && within(pra, prb, pr_max) {
             passed = true;
             break;
         }
     }
     assert!(
         passed,
-        "прирост p95 выше порогов (+5 мс session-start, +15 мс prompt):\n{}",
+        "прирост медианы или p95 выше порогов (+5 мс session-start, +15 мс prompt):\n{}",
         report.join("\n")
     );
 }
