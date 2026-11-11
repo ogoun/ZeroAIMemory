@@ -436,6 +436,8 @@ async fn unless_contradicted_warns_on_truncated_graph() {
     let tok = a.token.clone();
     a.st.shutdown().await;
     drop(a);
+    // фоновые задачи открытия баз отпускают `Db` чуть позже (как `stop` в `tests/backup.rs`)
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let b = common::api::api_with(cfg).await;
     let r = b.tok(&tok, Method::POST, "/api/v1/search", Some(q)).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());

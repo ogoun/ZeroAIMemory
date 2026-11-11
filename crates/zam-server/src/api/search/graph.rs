@@ -230,11 +230,23 @@ pub(super) struct KindCandidate {
 /// противоречиям ([`order_by_contradicts`]) могли примениться не полностью.
 pub const WARN_KIND_GRAPH_TRUNCATED: &str = "contradicts graph truncated";
 
+/// Предупреждение ответа поиска: граф `contradicts` чужого решения не прочитан — исключения буста
+/// вида и порядок по противоречиям для его элементов не применены; само решение в выдаче
+/// остаётся (в отличие от `solution unavailable`).
+pub const WARN_KIND_GRAPH_UNAVAILABLE: &str = "contradicts graph unavailable";
+
+/// Предупреждение ответа `w` — одно на ответ.
+fn warn_once(health: &mut Health<'_>, w: &str) {
+    if !health.warnings.iter().any(|x| x == w) {
+        health.warnings.push(w.into());
+    }
+}
+
 /// Граф `contradicts` глубины 1 от `refs` в базе цели `ti` — одно чтение на шаг поиска
 /// ([`kind_boost_exempt`], [`order_by_contradicts`]) с общими правилами (ревью задач 10 и 16):
-/// - сбой чтения графа **чужого** решения — `None` и WARN в журнал: решение из выдачи не
-///   исключается (в отличие от [`Health::soft`]), шаг для него просто не применяется; сбой
-///   личной базы — ошибка запроса;
+/// - сбой чтения графа **чужого** решения — `None`, WARN в журнал и предупреждение ответа
+///   [`WARN_KIND_GRAPH_UNAVAILABLE`] (одно на ответ): решение из выдачи не исключается (в отличие
+///   от [`Health::soft`]), шаг для него не применяется; сбой личной базы — ошибка запроса;
 /// - подграф обрезан пределами `zam_store::GRAPH_MAX_NODES` / `GRAPH_MAX_EDGES` — WARN в журнал
 ///   и предупреждение ответа [`WARN_KIND_GRAPH_TRUNCATED`] (одно на ответ); найденные связи
 ///   действуют.
@@ -243,7 +255,8 @@ async fn contradicts_graph(
     ti: usize,
     refs: &[TargetRef],
 ) -> Result<Option<zam_store::Graph>, ApiError> {
-    let t = &health.targets[ti];
+    let targets = health.targets;
+    let t = &targets[ti];
     let r =
         t.db.neighbors(refs, 1, &[EdgeType::Contradicts], &t.space_ids())
             .await;
@@ -255,6 +268,7 @@ async fn contradicts_graph(
                     error = %e,
                     "поиск: граф contradicts чужого решения не прочитан — шаг пропущен"
                 );
+                warn_once(health, WARN_KIND_GRAPH_UNAVAILABLE);
                 return Ok(None);
             }
             None => return Err(e.into()),
@@ -266,13 +280,7 @@ async fn contradicts_graph(
             edges = g.edges.len(),
             "поиск: граф contradicts обрезан пределом — связи учтены не все"
         );
-        if !health
-            .warnings
-            .iter()
-            .any(|w| w == WARN_KIND_GRAPH_TRUNCATED)
-        {
-            health.warnings.push(WARN_KIND_GRAPH_TRUNCATED.into());
-        }
+        warn_once(health, WARN_KIND_GRAPH_TRUNCATED);
     }
     Ok(Some(g))
 }

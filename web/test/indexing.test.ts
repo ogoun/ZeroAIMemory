@@ -15,6 +15,7 @@ test('warningText: предупреждения поиска переведен�
     'solution access revoked',
     'solution unavailable',
     'contradicts graph truncated',
+    'contradicts graph unavailable',
   ];
   for (const w of known) {
     const t = warningText(w);
@@ -24,6 +25,10 @@ test('warningText: предупреждения поиска переведен�
   assert.equal(
     warningText('contradicts graph truncated'),
     'граф противоречий обрезан — исключения и порядок по противоречиям могли примениться не полностью',
+  );
+  assert.equal(
+    warningText('contradicts graph unavailable'),
+    'граф противоречий недоступен — порядок и исключения по противоречиям не применены',
   );
   assert.equal(warningText('что-то новое'), 'что-то новое');
 });

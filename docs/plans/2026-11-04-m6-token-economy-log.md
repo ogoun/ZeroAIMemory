@@ -11466,3 +11466,29 @@ unless_contradicted_warns_on_truncated_graph` дополнен: предупре
   браузер может отдать тот же отказ из кэша модулей до перезагрузки страницы — сообщение об этом
   и говорит; автоматической перезагрузки при смене версии сервера нет (как у остальных ленивых
   чанков).
+
+## Задача 16, два последних Minor (2026-11-11)
+
+Ревью круга 3 — принято; двумя мелочами закрыто одним коммитом (`fix(search): предупреждение
+«contradicts graph unavailable», пауза перед повторным стартом в тесте`).
+
+- **Предупреждение о недоступном графе.** При сбое чтения графа `contradicts` чужого решения
+  клиент раньше видел `solution unavailable`, после круга 2 — пустые `warnings`, хотя порядок и
+  исключения по противоречиям для этого решения не применялись. Теперь `contradicts_graph`
+  добавляет в ответ `contradicts graph unavailable` (`WARN_KIND_GRAPH_UNAVAILABLE`, одно на ответ
+  — общий `warn_once` с предупреждением об обрезке). Перевод в `web/src/lib/indexing.ts`: «граф
+  противоречий недоступен — порядок и исключения по противоречиям не применены», строка в
+  `web/test/indexing.test.ts`. Три теста `search_multi` о сбое графа ждут `warnings ==
+  ["contradicts graph unavailable"]` (в том числе когда граф читают оба шага).
+- **Пауза перед повторным стартом.** `search_rerank_boosts::
+  unless_contradicted_warns_on_truncated_graph`: после `shutdown` и `drop` — 300 мс, как в `stop`
+  из `tests/backup.rs` (фоновые задачи открытия баз отпускают `Db` чуть позже); общего помощника
+  в `tests/common` нет.
+- **→ 13a (ТЗ §9.2):** оба значения — `contradicts graph truncated` и `contradicts graph
+  unavailable`.
+
+Проверка: `cargo fmt --all --check` и `cargo clippy -p zam-server --all-targets -- -D warnings` —
+чисто; `cargo test -p zam-server --test search --test search_multi --test search_rerank_boosts` —
+21, 12 (+1 ignored), 6 (+1), все PASS; WebUI: `npm run check` — 0 ошибок, `test:build` — 44 PASS,
+`npm run size` — `entry` 78,73 КБ, `IdeasView` 7,02 КБ, `IdeaForm` 2,17 КБ. e2e и откаты в этом
+круге не прогонялись.

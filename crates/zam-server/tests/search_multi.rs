@@ -886,8 +886,8 @@ async fn bench_vector_scopes() {
 
 /// Мир сбоя графа: общее решение A с двумя insight (`gotcha` и `discovery`), которые находит
 /// участник B; затем таблица `edges` базы A переименована — граф `contradicts` не читается, FTS
-/// работает. Проверяет: участнику — те же элементы и баллы без предупреждений (решение не
-/// исключено), владельцу сбой его личной базы — ошибка запроса.
+/// работает. Проверяет: участнику — те же элементы и баллы (решение не исключено) и одно
+/// предупреждение `contradicts graph unavailable`, владельцу сбой его личной базы — ошибка.
 async fn graph_failure_keeps_solution(name: &str, tweak: impl FnOnce(&mut ServerConfig)) {
     let w = world_with(name, tweak).await;
     w.shared().await;
@@ -931,10 +931,15 @@ async fn graph_failure_keeps_solution(name: &str, tweak: impl FnOnce(&mut Server
     })
     .await
     .unwrap();
-    // участнику: решение на месте, состав и баллы прежние, предупреждений нет
+    // участнику: решение на месте, состав и баллы прежние; предупреждение — одно, даже когда
+    // граф читают оба шага: порядок и исключения по противоречиям не применены
     let after = w.search(&w.b_tok, body.clone()).await;
     assert_eq!(entries(&after), entries(&before), "{after}");
-    assert_eq!(after["warnings"], json!([]), "{after}");
+    assert_eq!(
+        after["warnings"],
+        json!(["contradicts graph unavailable"]),
+        "{after}"
+    );
     // владельцу сбой его личной базы — ошибка запроса
     let r =
         w.a.tok(&w.a_tok, Method::POST, "/api/v1/search", Some(body))
