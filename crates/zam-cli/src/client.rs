@@ -149,8 +149,12 @@ pub const MCP_RECV_RESPONSE: Duration = Duration::from_secs(10 * 60);
 pub const AWAIT_100: Duration = Duration::from_secs(30);
 
 /// Остаток до абсолютного срока, с которым запрос ещё начинается ([`Timeouts::Deadline`]):
-/// меньше — ответа он не дождётся, только выйдет за срок на шаг таймера ОС.
-pub const DEADLINE_MIN: Duration = Duration::from_millis(1);
+/// меньше — ответа он не дождётся, только выйдет за срок на шаг таймера ОС. Порог — чуть больше
+/// шага таймера Windows (15,6 мс): ожидание сокета возвращается с такой точностью и **раньше**
+/// срока тоже, так что после запроса, снятого по сроку, остаток бывает от нуля до шага. С порогом
+/// 1 мс следующий запрос хука в этот остаток начинался (задача 17d: `GET /file-refs` после
+/// `POST /files/changed`, снятого сроком, — лишний запрос к серверу и ещё шаг таймера к выходу).
+pub const DEADLINE_MIN: Duration = Duration::from_millis(16);
 
 /// Абсолютный срок профиля ([`Timeouts::Deadline`]); у прочих профилей его нет.
 fn deadline_of(t: Timeouts) -> Option<Instant> {
@@ -720,7 +724,8 @@ mod tests {
             both < Duration::from_millis(2 * ms - 100),
             "два запроса — один срок {ms} мс, а не два: {both:?}"
         );
-        assert_eq!(c.deadline_left(), Some(Duration::ZERO));
+        // ожидание сокета возвращается с точностью шага таймера ОС, бывает и чуть раньше срока
+        assert!(c.deadline_left().is_some_and(|d| d < DEADLINE_MIN));
         // запрос, начатый позже, получает остаток, а не полный срок
         let t0 = Instant::now();
         let c = Client::with_timeouts(
@@ -741,6 +746,31 @@ mod tests {
         );
         // профили без срока — без изменений
         assert_eq!(Client::new(&url, "t", None).deadline_left(), None);
+    }
+
+    /// Задача 17d: остаток до срока меньше шага таймера ОС ([`DEADLINE_MIN`]) — запрос не
+    /// начинается: сервер соединения не видит, ошибка — «бюджет исчерпан до запроса», не тайм-аут.
+    /// С прежним порогом 1 мс такой запрос уходил и возвращался по сроку с опозданием на шаг
+    /// таймера (после запроса, снятого сроком, остаток — от нуля до шага).
+    #[test]
+    fn request_with_remainder_below_timer_step_is_not_started() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        silent.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(Instant::now() + Duration::from_millis(10)),
+        );
+        let e = c.get("/x", &[]).unwrap_err();
+        assert!(e.is_unsent() && !e.is_timeout(), "{e}");
+        assert_eq!(e.to_string(), zam_core::HOOK_BUDGET_SPENT);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            silent.accept().is_err(),
+            "запрос с остатком меньше шага таймера дошёл до сервера"
+        );
     }
 
     #[test]
