@@ -11601,7 +11601,7 @@ unless_contradicted_warns_on_truncated_graph` дополнен: предупре
 - `cargo clippy -p zam-store -p zam-server -p zam-cli -p xtask --all-targets -- -D warnings` —
   чисто;
 - `RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links' cargo doc -p zam-server --no-deps` — чисто;
-- `zam-store`: `--lib` 104 (+1 ignored), `migrate_rebuild` 22, `entries` 28, `nodes` 7 — PASS;
+- `zam-store`: `--lib` 104 (+1 ignored), `entries` 22, `migrate_rebuild` 7, `nodes` 28 — PASS (числа исправлены ревью, M-7);
 - `zam-server --lib` — 287 (+1 ignored) PASS;
 - `zam-server` (`ZAM_REQUIRE_ML=1`, модели `.tmp/ci-models`): `mcp` 64, `recall` 43 (+1),
   `recall_brief` 9, `recall_frozen` 4, `recall_heavy` 2, `recall_heavy_ml` 1, `recall_prompt_ml`
@@ -11635,3 +11635,74 @@ unless_contradicted_warns_on_truncated_graph` дополнен: предупре
   `answer|claim|propose|decide` — тот же класс повтора; вместе с CR-12. OpenAPI (CR-9).
   `memory_recall event=brief` из MCP с сессией родителя отмечает показ у родителя (текст пакета
   родитель видит сам — оставлено как есть).
+
+### Задача 19, правки ревью (2026-11-11)
+
+Ревью `52ea190` — «принять с правками»: Important I-1, Minor M-1…M-8, всё в одном круге.
+
+- **I-1, страховка схемы 0025.** Мигратор смотрит только на `user_version`; в 0025 после её
+  первого применения дописаны `imported_from` (`nodes`, `entries`; 18b2) и `node_idempotency`
+  (19) — база версии 25 промежуточной сборки M6 их не получала (500 на запросах с ключом и на
+  импорте). Решение координатора: 0025 остаётся единственной миграцией M6, плюс досборка.
+  Новый модуль `zam_store::schema_repair`: `Db::open_with` после `migrate::apply` для базы
+  пользователя (сравнение `migrations` с `USER_MIGRATIONS` по указателю; системная база не
+  трогается) зовёт `repair_user_schema` — при `user_version == 25` одной транзакцией
+  `ALTER TABLE nodes|entries ADD COLUMN imported_from TEXT`, если столбца нет
+  (`pragma_table_info`), и `NODE_IDEMPOTENCY_DDL`, если нет таблицы; что дособрано — WARN
+  «база пользователя: дособрана схема 0025». Один источник текста: юнит
+  `node_idempotency_ddl_matches_0025` проверяет, что DDL и оба `ALTER` дословно есть в файле
+  миграции. Тест `migrate_rebuild::reopen_v25_repairs_late_0025_schema`: база на текущих
+  миграциях → `DROP TABLE node_idempotency`, `DROP COLUMN imported_from` у `nodes` и
+  `entries` → два переоткрытия: `master_objects` (тот же способ, что в
+  `migrate_0025_from_m57_db`) равен эталону, счётчики строк те же, `foreign_key_check` пуст,
+  копии `bak-v25` нет. В 0025 — комментарий «заморожена после M6; новые изменения схемы —
+  новой миграцией».
+- **M-1.** `PUT`/`PATCH` по ключу узла в корзине — 404 (`live` области узла раньше ключа), 409 —
+  `POST /nodes` и гонка с удалением. Исправлены `docs/api-compat.md` и doc `api/nodes/write.rs`;
+  в `nodes::post_node_idempotent` — повтор `PATCH` после удаления → 404.
+- **M-2.** Из сверяемого у `POST /nodes` убран «вид» (в отпечаток не входит).
+- **M-3.** Предел `timeout_ms` — `max(recall.max_timeout_ms, recall.timeout_ms)`: при сроке
+  сервера 60000 (сетки замера) и пределе 2000 запрос с `timeout_ms: 60000` — 200, 60001 — 400
+  (`recall_timeout_ms_over_max_400`); `config.example.toml`, `config.rs`, `api-compat.md`.
+- **M-4.** Смена поведения «заголовок и аргумент различаются → 400» (до M6 у `memory_recall`
+  побеждал аргумент) — явно в `api-compat.md`; передача → 13c ниже.
+- **M-5.** `latest_session` (неявная сессия R13) — `AND parent_id IS NULL`: запись главного
+  агента не уходит в сессию субагента (`<сессия>:<agent_id>`, `anon-…`), даже если тот
+  обращался последним. Других пользователей функции нет (только `mcp::implicit_session`).
+  Тест `zam-store sessions::latest_session_skips_subagent_sessions`.
+- **M-6.** Комментарий в 0025: у `node_idempotency` нет срока и чистки; внешний ключ на
+  `nodes(id)` — будущая пересборка `nodes` должна учесть дочернюю таблицу.
+- **M-7.** Числа прогона `zam-store` в разделе задачи 19 исправлены: `entries` 22,
+  `migrate_rebuild` 7, `nodes` 28.
+- **M-8.** `api-compat.md`: строгий разбор тел — «у части маршрутов (около половины структур)»,
+  а не «большинства».
+
+**Откаты** (`rollbacks.log`, `rb-R15…R18.log`; файлы восстановлены, sha256 сверен; разница
+снимков `git diff` до и после — только строка журнала M-7, правленная во время прогона):
+R15 досборка выключена → `reopen_v25_repairs_late_0025_schema` FAIL (схема без таблицы);
+R16 DDL разошёлся с миграцией на пробел → `node_idempotency_ddl_matches_0025` FAIL; R17
+`latest_session` без `parent_id IS NULL` → `latest_session_skips_subagent_sessions` FAIL; R18
+предел без срока сервера → `recall_timeout_ms_over_max_400` FAIL.
+
+**Прогоны:** `cargo fmt --all --check` — чисто (форматировались только файлы правок); `clippy -p
+zam-store -p zam-server -p zam-cli -p xtask --all-targets -D warnings` — чисто; rustdoc
+`-D rustdoc::broken_intra_doc_links` по `zam-server` — чисто (у `zam-store` та же проверка падает
+на давнем `time.rs:10` — ссылка на `freeze_now` под фичей `test-hooks`, файл не трогался →
+13c); `zam-store`: `--lib` 105 (+1 ignored; +1 — `node_idempotency_ddl_matches_0025`), `entries`
+22, `migrate_rebuild` 8, `nodes` 28, `sessions` 17 — PASS; `zam-server` (`ZAM_REQUIRE_ML=1`):
+`boot` 14, `m57_acceptance` 13, `mcp` 64, `nodes` 19, `recall` 43 (+1), `session_tokens` 5,
+`sessions` 17, `transfer_export` 16, `transfer_import` 44 + 1 FAIL
+(`foreign_import_same_server_keeps_owner_search`: за 240 с не включился векторный канал,
+`QdrantDown` у внешнего Qdrant при чужих сборках на машине; повтор отдельно — PASS за 72 с);
+`zam-cli --test hooks` — 105 PASS.
+
+**Передать (дополнение):**
+
+- **→ 13c (CHANGELOG `[0.0.11-m6]`, «Изменено»):** MCP — `session_id` в аргументах и
+  `X-Zam-Session` различаются → ошибка 400 (раньше у `memory_recall` побеждал аргумент); неявная
+  сессия MCP без заголовка — только сессия верхнего уровня (не субагента).
+- **→ 13b:** базы разработки всё равно пересоздать (досборка закрывает известные части 0025, но
+  не гарантирует равенство с чистой базой во всём); передача задачи 19 «даст 500» снята
+  досборкой.
+- **→ M7:** контрольная сумма миграций — хэш SQL каждой применённой миграции в `meta`, ошибка при
+  расхождении (страховка от правки применённой миграции вместо `schema_repair`).

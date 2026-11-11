@@ -370,7 +370,9 @@ pub async fn list_sessions(
 /// Последняя незавершённая сессия базы с обращением не раньше `since`; `machine` задана —
 /// только сессии этой машины, `solution` задано — только сессии этого решения. Нужна MCP без
 /// `X-Zam-Session` (решение контроллера R13, задача 10 M4): `.mcp.json` не знает `session_id`
-/// агента, и запись через MCP учитывается в сессии хуков.
+/// агента, и запись через MCP учитывается в сессии хуков. Сессии субагентов (`parent_id`
+/// задан: `<сессия>:<agent_id>`, `anon-…`) не выбираются — запись главного агента не уходит в
+/// дочернюю сессию, даже если субагент обращался последним (ревью задачи 19, M-5).
 pub async fn latest_session(
     db: &Db,
     machine: Option<&str>,
@@ -384,7 +386,7 @@ pub async fn latest_session(
         Ok(c.query_row(
             &format!(
                 "SELECT {SESSION_COLS} FROM sessions
-                 WHERE ended_at IS NULL AND last_seen_at >= ?1
+                 WHERE ended_at IS NULL AND last_seen_at >= ?1 AND parent_id IS NULL
                    AND (?2 IS NULL OR machine = ?2)
                    AND (?3 IS NULL OR solution_guid = ?3)
                  ORDER BY last_seen_at DESC, id DESC LIMIT 1"

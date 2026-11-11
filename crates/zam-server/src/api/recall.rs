@@ -121,7 +121,8 @@
 //!   собранное и `warnings: ["recall timeout"]`; учёт показов — после сбора и только до полного
 //!   срока: вышел — собранное отдаётся без `session_seen` и `usage` (`timings.record_ms: null`)
 //!   и с тем же предупреждением. Поле тела `timeout_ms` (M6 §16 п. 19, CR-7) задаёт срок этого
-//!   запроса вместо `recall.timeout_ms`: 1..=`recall.max_timeout_ms` (2000), иначе 400 — нативный
+//!   запроса вместо `recall.timeout_ms`: 1..=`max(recall.max_timeout_ms, recall.timeout_ms)`
+//!   (по умолчанию 2000), иначе 400 — нативный
 //!   клиент может ждать полный дайджест дольше хуков. Сбой внутреннего поиска `prompt` — тишина и
 //!   `warnings: ["recall search failed"]`;
 //! - `record: false` (по умолчанию `true`) — ответ без учёта: ни `session_seen`, ни `usage`,
@@ -4128,13 +4129,15 @@ pub async fn recall(
             "output_limit.max: от 1 до {OUTPUT_LIMIT_MAX}"
         )));
     }
-    let max_timeout = st.cfg.recall.max_timeout_ms;
+    // предел поля — не меньше срока сервера: при `recall.timeout_ms` больше `max_timeout_ms`
+    // (сетки замера ставят 60000) клиент может попросить и сам срок сервера (ревью задачи 19, M-3)
+    let max_timeout = st.cfg.recall.max_timeout_ms.max(st.cfg.recall.timeout_ms);
     if req
         .timeout_ms
         .is_some_and(|t| !(1..=max_timeout).contains(&t))
     {
         return Err(ApiError::BadRequest(format!(
-            "timeout_ms: от 1 до {max_timeout} (recall.max_timeout_ms)"
+            "timeout_ms: от 1 до {max_timeout} (max(recall.max_timeout_ms, recall.timeout_ms))"
         )));
     }
     let area = zam_store::normalize_area(req.area.as_deref());

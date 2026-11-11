@@ -34,6 +34,7 @@ pub mod migrate;
 pub mod nodes;
 pub mod paths;
 pub mod questions;
+mod schema_repair;
 pub mod search;
 mod secrets_delta;
 pub mod sessions;

@@ -1327,3 +1327,49 @@ async fn migrate_0025_from_m57_db() {
     );
     assert_eq!(zam_store::session_epoch(&db, "s-ideas").await.unwrap(), 0);
 }
+
+/// Ревью задачи 19, I-1: база версии 25 промежуточной сборки M6 — без `node_idempotency` и
+/// `imported_from` у `nodes`/`entries` (0025 дописывалась до выпуска). Открытие дособирает
+/// схему до эталона текущих миграций (`master_objects`, как в `migrate_0025_from_m57_db`),
+/// строки на месте; второе открытие ничего не меняет.
+#[tokio::test]
+async fn reopen_v25_repairs_late_0025_schema() {
+    let dir = tmp_dir("v25-repair");
+    let path = dir.join("u.db");
+    drop(Db::open(&path, USER_MIGRATIONS).unwrap());
+    let (want, counts) = {
+        let c = conn(&path);
+        assert_eq!(user_version(&c), 25);
+        (master_objects(&c), table_counts(&c))
+    };
+    assert!(want.iter().any(|o| o.1 == "node_idempotency"), "{want:?}");
+    {
+        let c = conn(&path);
+        c.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE node_idempotency;
+             ALTER TABLE nodes DROP COLUMN imported_from;
+             ALTER TABLE entries DROP COLUMN imported_from;",
+        )
+        .unwrap();
+        let old = master_objects(&c);
+        assert!(!old.iter().any(|o| o.1 == "node_idempotency"));
+        assert!(
+            old.iter()
+                .filter(|o| o.0 == "table" && (o.1 == "nodes" || o.1 == "entries"))
+                .all(|o| !o.3.contains("imported_from")),
+            "{old:?}"
+        );
+        assert_eq!(user_version(&c), 25);
+    }
+    for round in 0..2 {
+        drop(Db::open(&path, USER_MIGRATIONS).unwrap());
+        let c = conn(&path);
+        assert_eq!(master_objects(&c), want, "открытие {round}");
+        assert_eq!(table_counts(&c), counts, "открытие {round}");
+        assert_eq!(user_version(&c), 25);
+        assert_eq!(fk_violations(&c), 0);
+    }
+    // копии перед миграцией нет: мигратор ничего не применял
+    assert!(!dir.join("u.db.bak-v25").exists());
+}

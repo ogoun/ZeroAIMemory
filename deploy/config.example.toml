@@ -284,6 +284,7 @@ post_tool_coverage = { divisor = 2, cap = 6, word_match = "plain" }
 timeout_ms = 200
 # Верхний предел поля timeout_ms тела POST /recall (и memory_recall), мс (1..60000): нативный
 # клиент может ждать полный дайджест дольше хуков; больше предела — 400 (docs/api-compat.md).
+# Действует max(max_timeout_ms, timeout_ms): срок сервера больше предела можно попросить явно.
 max_timeout_ms = 2000
 # Фрагмент под подсказкой поиска к запросу (правило, insight), токенов (0..=200; M6 §4.3);
 # 0 — без фрагмента.

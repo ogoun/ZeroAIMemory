@@ -1,5 +1,7 @@
 -- user DB, задача 2 M6 (спецификация M6 §7.2, §8а, §12а, §13): вся схема этапа одной миграцией
--- (один `bak-v24`, один шаг отката). Миграция с признаком `rebuild` (zam_store::migrate):
+-- (один `bak-v24`, один шаг отката). Заморожена после M6: новые изменения схемы — новой
+-- миграцией. Части, дописанные после первого применения (`imported_from`, `node_idempotency`),
+-- база версии 25 получает досборкой при открытии (`zam_store::schema_repair`). Миграция с признаком `rebuild` (zam_store::migrate):
 -- загрузчик выключает `foreign_keys` вне транзакции, после SQL проверяет `foreign_key_check`.
 --
 -- Схема снята с базы на 0024 (`sqlite_master`): у `session_seen` (0013) нет своих индексов,
@@ -82,7 +84,12 @@ ALTER TABLE entries ADD COLUMN imported_from TEXT;
 -- (`<пользователь|t<токен>|->:<ключ>`, как `entries.idempotency_key`), операция, узел и отпечаток
 -- запроса (blake3 hex, `zam_store::nodes::idempotency`). Строка пишется в транзакции самой
 -- правки; живёт, пока жив узел (узлы физически не удаляются) — отдельного срока нет, как у
--- ключа записи журнала.
+-- ключа записи журнала, и чистки нет (ревью задачи 19, M-6). Внешний ключ `node_id → nodes(id)`:
+-- будущая пересборка `nodes` (новая таблица, `DROP`, `RENAME`) должна учесть эту дочернюю
+-- таблицу. Текст `CREATE TABLE` ниже дословно повторяет `zam_store::schema_repair::
+-- NODE_IDEMPOTENCY_DDL` (досборка баз версии 25, тест `node_idempotency_ddl_matches_0025`).
+--
+-- 0025 заморожена после M6: новые изменения схемы — новой миграцией.
 CREATE TABLE node_idempotency (
   key TEXT PRIMARY KEY,
   op TEXT NOT NULL CHECK (op IN ('create','replace','patch')),

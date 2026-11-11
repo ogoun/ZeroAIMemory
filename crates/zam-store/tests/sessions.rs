@@ -891,3 +891,47 @@ async fn register_session_reopens_ended() {
     assert!(ended_at("s2").await.is_some());
     assert!(register_session(&db, &touch("")).await.is_err());
 }
+
+/// Ревью задачи 19, M-5: неявная сессия R13 — только сессия верхнего уровня; субагент, который
+/// обращался последним (`parent_id` задан), не выбирается.
+#[tokio::test]
+async fn latest_session_skips_subagent_sessions() {
+    let (_dd, d1) = db("latest-sub").await;
+    let since = Timestamp::now() - SignedDuration::from_hours(12);
+    touch_session(
+        &d1,
+        &SessionTouch {
+            id: "parent".into(),
+            machine: Some("box".into()),
+            ..SessionTouch::default()
+        },
+    )
+    .await
+    .unwrap();
+    touch_session(
+        &d1,
+        &SessionTouch {
+            id: "parent:anon-1".into(),
+            machine: Some("box".into()),
+            parent_id: Some("parent".into()),
+            ..SessionTouch::default()
+        },
+    )
+    .await
+    .unwrap();
+    let got = latest_session(&d1, Some("box"), None, since).await.unwrap();
+    assert_eq!(got.map(|s| s.id).as_deref(), Some("parent"));
+    // только субагенты — неявной сессии нет
+    let (_dd2, db2) = db("latest-sub-only").await;
+    touch_session(
+        &db2,
+        &SessionTouch {
+            id: "p:a".into(),
+            parent_id: Some("p".into()),
+            ..SessionTouch::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(latest_session(&db2, None, None, since).await.unwrap(), None);
+}

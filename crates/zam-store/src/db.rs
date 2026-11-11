@@ -377,7 +377,22 @@ impl Db {
             )));
         }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        migrate::apply(&mut conn, path, migrations)?;
+        let version = migrate::apply(&mut conn, path, migrations)?;
+        // база пользователя версии 25 промежуточной сборки M6 — досборка схемы 0025
+        // (`schema_repair`, ревью задачи 19 I-1); у прочих баз — ничего
+        if std::ptr::eq(
+            migrations.as_ptr(),
+            crate::user_db::USER_MIGRATIONS.as_ptr(),
+        ) {
+            let fixed = crate::schema_repair::repair_user_schema(&mut conn, version)?;
+            if !fixed.is_empty() {
+                tracing::warn!(
+                    fixed = %fixed.join(", "),
+                    "база пользователя: дособрана схема 0025 (база открывалась промежуточной \
+                     сборкой M6)"
+                );
+            }
+        }
         // checkpoint — не в потоке писателя (см. документацию модуля)
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         let size_limit = i64::try_from(opts.wal_limit_bytes).unwrap_or(i64::MAX);

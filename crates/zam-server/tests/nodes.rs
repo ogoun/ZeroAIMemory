@@ -1058,7 +1058,13 @@ async fn post_node_idempotent() {
     )
     .await;
     assert_eq!(r4.status, StatusCode::CONFLICT, "{}", r4.text());
-    // узел удалён в корзину — повтор по ключу 409 (как у удалённой записи журнала)
+    // правка с ключом до удаления — для повтора после
+    let uri = format!("/api/v1/nodes/{nid}");
+    let append = json!({"base_rev": 1, "ops": [{"op": "append", "content": "x\n"}]});
+    let r = keyed(&a, Method::PATCH, &uri, append.clone(), "c-p", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // узел удалён в корзину — повтор POST по ключу 409 (как у удалённой записи журнала),
+    // повтор PATCH — 404 (узел в корзине для правки не виден, ревью задачи 19 M-1)
     let d = a
         .t(Method::DELETE, &format!("/api/v1/nodes/{nid}"), None)
         .await;
@@ -1073,6 +1079,8 @@ async fn post_node_idempotent() {
     )
     .await;
     assert_eq!(r5.status, StatusCode::CONFLICT, "{}", r5.text());
+    let r = keyed(&a, Method::PATCH, &uri, append, "c-p", None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
     // пустой ключ равен отсутствию, слишком длинный — 400
     let r = keyed(
         &a,

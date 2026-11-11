@@ -2834,4 +2834,22 @@ async fn recall_timeout_ms_over_max_400() {
     )
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // срок сервера больше предела поля (сетки замера: 60000 при 2000) — предел поля равен
+    // сроку сервера: его можно попросить явно (ревью задачи 19, M-3)
+    let a = api("recall-timeout-max-60000", |c| c.recall.timeout_ms = 60_000).await;
+    assert_eq!(a.st.cfg.recall.max_timeout_ms, 2000);
+    for (t, want) in [
+        (60_000, StatusCode::OK),
+        (2001, StatusCode::OK),
+        (60_001, StatusCode::BAD_REQUEST),
+    ] {
+        let r = recall(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "session_start", "timeout_ms": t}),
+        )
+        .await;
+        assert_eq!(r.status, want, "{t}: {}", r.text());
+    }
 }
