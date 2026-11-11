@@ -11376,3 +11376,93 @@ xtask | git hash-object --stdin` — `afd29c1846c2…` до и после.
   - Отдельный путь поиска идей — только если замер стенда в release ухудшится.
   - Суммарный размер ленивого кода журнала «Идеи» вырос за счёт второго чанка — при следующей
     правке журнала проверить, не дешевле ли вернуть формы в один чанк, подняв предел до 8 КБ.
+
+## Задача 16, правки повторного ревью (2026-11-11)
+
+Повторное ревью: ленивый чанк форм принят; один маленький круг — Important 1 и Minor 2–4. Коммит:
+`fix(ideas): правки повторного ревью задачи 16 — сбой загрузки чанка формы, терпимый порядок по
+contradicts, перевод предупреждения`.
+
+### Что сделано
+
+**1 (Important). Чанк формы не загрузился.** `IdeasView` ждал `import('./IdeaForm.svelte')` без
+ветки ошибки: после обновления сервера (у чанков новые имена) или без сети кнопки «Новая идея»,
+«Изменить», «Отложить» молча ничего не делали. Теперь по образцу `CodeView`/`Shell`: пока грузится
+— «Загрузка…», при сбое — `<p class="error" role="alert">Форма не загрузилась: … — обновите
+страницу</p>` и кнопка «Отмена» (форма закрывается, карточка на месте). e2e
+`ideas_form_chunk_load_failure_shows_alert`: `route.abort` на `**/IdeaForm-*.js` — сообщение у
+формы решения и у формы создания, «Отмена» убирает его.
+
+**2 (Minor). Порядок по `contradicts` так же терпим, как буст вида.** При `contradicts_order =
+true` (умолчание) `order_by_contradicts` читал тот же граф через `health.soft` и исключал чужое
+решение шагом позже — тест первого круга правок обходил это, выключая порядок. Чтение графа
+вынесено в общий `search::graph::contradicts_graph`: сбой чтения графа чужого решения — WARN,
+шаг для этого решения пропускается (без исключений буста, без перестановки), решение остаётся в
+выдаче; личная база — ошибка, как раньше; `truncated` — WARN и предупреждение ответа
+`contradicts graph truncated`, одно на ответ. Тесты `search_multi`:
+`contradicts_order_graph_failure_keeps_foreign_solution` (настройки по умолчанию),
+`contradicts_graph_failure_keeps_foreign_solution_both_steps`, прежний
+`kind_boost_graph_failure_keeps_foreign_solution`; `search_rerank_boosts::
+unless_contradicted_warns_on_truncated_graph` дополнен: предупреждение ровно одно при двух шагах
+и есть при `always` (граф читает только порядок).
+
+**3 (Minor). Перевод предупреждения.** `web/src/lib/indexing.ts`, словарь `WARNING`:
+`contradicts graph truncated` → «граф противоречий обрезан — исключения и порядок по
+противоречиям могли примениться не полностью». Новый тест `web/test/indexing.test.ts`: все восемь
+строк словаря переведены, неизвестная строка — как есть.
+
+**4 (Minor). Повторное нажатие кнопки сбрасывает форму.** Ключ формы — счётчик открытий
+(`opened`), а не вид формы: повторное «Отложить» при открытой форме создаёт её заново, как делал
+прежний `startDecision`. e2e `ideas_defer_with_date_and_decline` дополнен: дата изменена, кнопка
+карточки нажата ещё раз — в поле снова +30 дней.
+
+### Откаты
+
+| Откат | Упавшие тесты |
+|---|---|
+| `order_by_contradicts` снова читает граф через `health.soft` | `search_multi::contradicts_order_graph_failure_keeps_foreign_solution`, `contradicts_graph_failure_keeps_foreign_solution_both_steps`; `kind_boost_graph_failure_keeps_foreign_solution` (порядок выключен) — зелёный |
+| обрезка графа проходит молча | `search_rerank_boosts::unless_contradicted_warns_on_truncated_graph` |
+| `IdeasView` без ветки ошибки загрузки и с ключом формы по виду (release пересобран с таким `web/dist`) | e2e `ideas_form_chunk_load_failure_shows_alert` (сообщения нет), `ideas_defer_with_date_and_decline` (дата после повторного нажатия не сброшена) |
+
+Два отката Rust — одной сборкой; `git diff -- crates | git hash-object --stdin` — `1c9a491cf46b…`
+до и после. После отката WebUI файл возвращён из снимка, `web/dist` пересобран.
+
+### Размеры чанков
+
+| Состояние | `entry` | `IdeasView` | `IdeaForm` |
+|---|---:|---:|---:|
+| круг правок ревью (`7f18ed0`) | 78,61 | 6,88 | 2,17 |
+| итог | 78,7 | 7,02 (предел 7,2) | 2,17 (предел 2,5) |
+
+`IdeasView` +0,14 КБ — ветки ожидания и ошибки загрузки; `entry` +0,09 КБ — строка перевода в
+`indexing.ts`.
+
+### Проверка
+
+Свой `target/t16` и копия `target/deps/windows-x64` (удалены после работы), `-j 2`.
+- `cargo fmt --all --check` — чисто; `cargo clippy -p zam-server --all-targets -- -D warnings` —
+  чисто.
+- `cargo test -p zam-server`: `search` 21, `search_multi` 12 (+1 ignored), `search_rerank_boosts`
+  6 (+1), `decisions` 8 (порядок по `contradicts`) — все PASS. В первом прогоне круга
+  `unless_contradicted_warns_on_truncated_graph` упал по вине теста (повторный старт сервера на
+  занятом каталоге данных: нужен `drop` прежнего экземпляра и токен первого старта) — тест
+  исправлен, набор перезапущен.
+- WebUI: `npm run check` — 0 ошибок; `npm run test:build` — 44 PASS; `npm run build`; `npm run
+  size` — в пределах (таблица выше).
+- e2e на release этого круга (14 мин 20 с + 2 мин 42 с): `npm run e2e -- ideas journals
+  working-memory` — **34 PASS** (`ideas` 18).
+- **Не запускалось:** остальные наборы `zam-server` (правка — только `search/graph.rs`),
+  `zam-store`, xtask, rustdoc-проверка (новые doc-ссылки — на элементы того же модуля), стенд,
+  микрозамер.
+
+### Передать (дополнение)
+
+- **→ 13a (ТЗ §9.2, список предупреждений `/search`):** `contradicts graph truncated` — граф
+  `contradicts` элементов выдачи обрезан пределом подграфа; его дают и буст вида
+  `unless_contradicted`, и порядок по противоречиям. Там же: при сбое чтения графа чужого решения
+  оба шага пропускаются, решение из выдачи не исключается (`solution unavailable` на этом шаге
+  больше нет).
+- **→ M7:** после сбоя загрузки чанка формы повторное нажатие кнопки снова пробует `import()`;
+  браузер может отдать тот же отказ из кэша модулей до перезагрузки страницы — сообщение об этом
+  и говорит; автоматической перезагрузки при смене версии сервера нет (как у остальных ленивых
+  чанков).

@@ -372,7 +372,9 @@ async fn reliable_only_boosts_theorem_axiom() {
 /// Ревью задачи 10 (передача в задачу 16 M6): подграф `contradicts` кандидатов с бустом вида
 /// обрезан пределом `GRAPH_MAX_NODES` — связь сверх предела не видна. Молча это не проходит:
 /// в ответе предупреждение `contradicts graph truncated`; исключения, найденные в пределах
-/// (гипотеза `hyp` против теоремы `thm`), действуют — выдача та же, что до обрезки.
+/// (гипотеза `hyp` против теоремы `thm`), действуют — выдача та же, что до обрезки. Граф читают
+/// два шага — буст вида и порядок по `contradicts` (включён по умолчанию): предупреждение одно.
+/// При `always` граф читает только порядок по `contradicts` — предупреждение тоже есть.
 #[tokio::test]
 async fn unless_contradicted_warns_on_truncated_graph() {
     use zam_server::api::search::graph::WARN_KIND_GRAPH_TRUNCATED;
@@ -415,7 +417,28 @@ async fn unless_contradicted_warns_on_truncated_graph() {
             .await;
         assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     }
-    let after = search(&a, q).await;
+    let after = search(&a, q.clone()).await;
     assert!(warned(&after), "{after}");
     assert_eq!(named(&after, &ids), named(&before, &ids));
+    let count = |j: &Value| {
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| **w == json!(WARN_KIND_GRAPH_TRUNCATED))
+            .count()
+    };
+    assert_eq!(count(&after), 1, "без дублей: {after}");
+    // тот же каталог данных, `kind_boost_mode = always`: граф читает только порядок по contradicts
+    let mut cfg = a.st.cfg.as_ref().clone();
+    cfg.search.kind_boost_mode = KindBoostMode::Always;
+    // токен первого старта: при повторном старте каталога новый не выдаётся
+    let tok = a.token.clone();
+    a.st.shutdown().await;
+    drop(a);
+    let b = common::api::api_with(cfg).await;
+    let r = b.tok(&tok, Method::POST, "/api/v1/search", Some(q)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(count(&j), 1, "порядок по contradicts: {j}");
 }

@@ -279,6 +279,10 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   await expectUtcDay(date, 1, 'min');
   await expectUtcDay(date, 30);
   await expect(form.getByText('UTC', { exact: true })).toBeVisible();
+  // повторное нажатие той же кнопки карточки открывает форму заново: введённое сброшено
+  await date.fill(utc(7));
+  await card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Отложить' }).click();
+  await expectUtcDay(date, 30);
   await date.fill(utc(5));
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
   await form.getByRole('button', { name: 'Отложить' }).click();
@@ -298,6 +302,28 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   expect(e.status).toBe('declined');
   expect(e.data.horizon).toBeUndefined();
   expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// Формы карточки — ленивый чанк `IdeaForm-*.js`. Чанк не пришёл (сервер обновился — у чанков новые
+// имена, или нет сети): вместо молчания — сообщение `role="alert"`, «Отмена» возвращает карточку.
+test('ideas_form_chunk_load_failure_shows_alert', async ({ page }) => {
+  const idea = await newIdea('Идея E2E: форма не загрузилась');
+  await page.route('**/IdeaForm-*.js', (route) => route.abort());
+  await openIdeas(page, idea.id);
+  const actions = card(page).getByRole('group', { name: 'Решение по идее' });
+  await actions.getByRole('button', { name: 'Отложить' }).click();
+  const alert = card(page).getByRole('alert');
+  await expect(alert).toContainText('Форма не загрузилась');
+  await expect(alert).toContainText('обновите страницу');
+  await expect(page.getByRole('form', { name: 'Отложить идею' })).toHaveCount(0);
+  await card(page).getByRole('button', { name: 'Отмена' }).click();
+  await expect(card(page).getByRole('alert')).toHaveCount(0);
+  await expect(actions.getByRole('button', { name: 'Отложить' })).toBeVisible();
+  // и у формы создания — вне карточки
+  await page.getByRole('button', { name: 'Новая идея' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Форма не загрузилась' })).toBeVisible();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+  await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
 test('ideas_reopen_declined_with_reason', async ({ page }) => {

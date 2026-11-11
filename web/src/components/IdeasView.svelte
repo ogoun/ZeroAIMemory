@@ -310,10 +310,19 @@
     return sp && sp.kind === 'solution' ? spaceRef(sp) : 'knowledge';
   }
 
+  /** Номер открытия формы: повторное нажатие той же кнопки создаёт форму заново (поля сброшены). */
+  let opened = $state(0);
+
   /** Открыть форму `m` (создание, правка, решение с полями). */
   function show(m: IdeaForm) {
     actionError = '';
+    opened++;
     mode = m;
+  }
+
+  function closeForm() {
+    mode = 'none';
+    actionError = '';
   }
 
   /** Кнопка карточки (`ideaButtons`): решение сразу или форма с полями. */
@@ -487,8 +496,10 @@
 </section>
 
 {#snippet form(m: IdeaForm)}
-  {#await import('./IdeaForm.svelte') then { default: Form }}
-    {#key m}
+  {#await import('./IdeaForm.svelte')}
+    <p class="muted">Загрузка…</p>
+  {:then { default: Form }}
+    {#key opened}
       <Form
         {m}
         idea={cur}
@@ -498,9 +509,13 @@
         error={actionError}
         onsubmit={submitted}
         onerror={(e) => (actionError = e)}
-        oncancel={() => ((mode = 'none'), (actionError = ''))}
+        oncancel={closeForm}
       />
     {/key}
+  {:catch e}
+    <!-- чанк формы не пришёл: сервер обновился (у чанков новые имена) или нет сети -->
+    <p class="error" role="alert">Форма не загрузилась: {errorText(e)} — обновите страницу</p>
+    <button type="button" onclick={closeForm}>Отмена</button>
   {/await}
 {/snippet}
 

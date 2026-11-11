@@ -31,6 +31,8 @@ const WARNING: Record<string, string> = {
   'solution access rejected': 'решение исключено из поиска: запрос доступа отклонён владельцем',
   'solution access revoked': 'решение исключено из поиска: доступ отозван владельцем',
   'solution unavailable': 'решение исключено из поиска: база владельца недоступна',
+  'contradicts graph truncated':
+    'граф противоречий обрезан — исключения и порядок по противоречиям могли примениться не полностью',
 };
 
 export const warningText = (w: string): string => WARNING[w] ?? w;

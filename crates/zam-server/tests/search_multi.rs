@@ -884,19 +884,12 @@ async fn bench_vector_scopes() {
     }
 }
 
-/// Ревью задачи 10 (передача в задачу 16 M6): сбой чтения графа `contradicts` чужого решения
-/// при `kind_boost_mode = unless_contradicted` решение из выдачи не исключает — исключений буста
-/// вида у его кандидатов нет (буст как при `always`), предупреждения `solution unavailable` нет.
-/// Владельцу сбой его личной базы — ошибка запроса. Порядок по `contradicts` выключен: он читает
-/// тот же граф и исключил бы решение сам.
-#[tokio::test]
-async fn kind_boost_graph_failure_keeps_foreign_solution() {
-    let w = world_with("kind-graph", |c| {
-        c.search.kind_boost_mode = zam_search::KindBoostMode::UnlessContradicted;
-        c.search.contradicts_order = false;
-        c.search.brief_min_rel = 0.0;
-    })
-    .await;
+/// Мир сбоя графа: общее решение A с двумя insight (`gotcha` и `discovery`), которые находит
+/// участник B; затем таблица `edges` базы A переименована — граф `contradicts` не читается, FTS
+/// работает. Проверяет: участнику — те же элементы и баллы без предупреждений (решение не
+/// исключено), владельцу сбой его личной базы — ошибка запроса.
+async fn graph_failure_keeps_solution(name: &str, tweak: impl FnOnce(&mut ServerConfig)) {
+    let w = world_with(name, tweak).await;
     w.shared().await;
     for (kind, title) in [("gotcha", "Грабли"), ("discovery", "Наблюдение")] {
         let r = w
@@ -947,4 +940,35 @@ async fn kind_boost_graph_failure_keeps_foreign_solution() {
         w.a.tok(&w.a_tok, Method::POST, "/api/v1/search", Some(body))
             .await;
     assert!(r.status.is_server_error(), "{} {}", r.status, r.text());
+}
+
+/// Ревью задачи 10 (передача в задачу 16 M6): сбой чтения графа `contradicts` чужого решения
+/// при `kind_boost_mode = unless_contradicted` решение из выдачи не исключает — исключений буста
+/// вида у его кандидатов нет (буст как при `always`), предупреждения `solution unavailable` нет.
+/// Порядок по `contradicts` выключен — проверяется один шаг буста вида.
+#[tokio::test]
+async fn kind_boost_graph_failure_keeps_foreign_solution() {
+    graph_failure_keeps_solution("kind-graph", |c| {
+        c.search.kind_boost_mode = zam_search::KindBoostMode::UnlessContradicted;
+        c.search.contradicts_order = false;
+        c.search.brief_min_rel = 0.0;
+    })
+    .await;
+}
+
+/// Повторное ревью задачи 16 (Minor 2): то же при настройках по умолчанию — граф читает порядок
+/// по `contradicts` (`contradicts_order = true`). Сбой чтения графа чужого решения оставляет его
+/// элементы в выдаче без перестановки; раньше `health.soft` исключал решение на этом шаге.
+#[tokio::test]
+async fn contradicts_order_graph_failure_keeps_foreign_solution() {
+    graph_failure_keeps_solution("order-graph", |_| {}).await;
+}
+
+/// И оба шага вместе: `unless_contradicted` и порядок по `contradicts`.
+#[tokio::test]
+async fn contradicts_graph_failure_keeps_foreign_solution_both_steps() {
+    graph_failure_keeps_solution("both-graph", |c| {
+        c.search.kind_boost_mode = zam_search::KindBoostMode::UnlessContradicted;
+    })
+    .await;
 }
