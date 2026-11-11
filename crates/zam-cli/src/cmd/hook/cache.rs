@@ -636,6 +636,14 @@ fn queue_files(env: &Env, session: Option<&str>) -> Vec<PathBuf> {
 /// следующий хук).
 pub const FLUSH_MIN_LEFT: Duration = Duration::from_millis(15);
 
+/// Очередей изменённых файлов, которые один хук забирает на отправку (`session-start` шлёт
+/// очереди всех сессий проекта). Каждая очередь — это замок, rename и чтение до запроса: без
+/// предела при долго недоступном сервере (очереди копятся у каждой сессии) разбор съедал бы
+/// бюджет до запроса, а возврат шёл уже после срока — время хука росло с числом очередей (замер
+/// 17d: +8 мс на очередь, 540 мс при 32 очередях и бюджете 300). Старые очереди — первыми;
+/// остальные уходят следующими хуками.
+pub const FLUSH_QUEUES_MAX: usize = 8;
+
 /// Отправка очередей изменённых файлов (fix round 1, I-2): все очереди (`session` задан —
 /// только его) забираются rename во временные файлы и уходят **одним** `POST /files/changed` до
 /// 500 путей (повтор пути — последний хэш); перед запросом проверяется остаток бюджета хука
@@ -644,6 +652,11 @@ pub const FLUSH_MIN_LEFT: Duration = Duration::from_millis(15);
 /// строкой в `hooks.log` (fix round 1, M-6; задача 9); прочее (сеть, 5xx, 401, 403, 404, 408,
 /// 410, 429: решение ещё не открыто для доступа, старый сервер) — всё возвращается.
 /// Строки, дописанные во время отправки, не теряются: они в новой очереди. Без решения — ничего.
+///
+/// Очередей за раз — не больше [`FLUSH_QUEUES_MAX`] (старые первыми) и пока есть бюджет на
+/// запрос. Если не отправлено ничего (сервер недоступен, срок), забранные файлы возвращаются
+/// на место как были ([`restore_taken`]: жёсткая ссылка, без замка, чтения и записи): эта работа
+/// идёт уже после срока HTTP и должна стоить как можно меньше.
 ///
 /// Очередь, оставшаяся неотправленной без ошибки запроса, видна в `hooks.log` — каждая причина
 /// своей строкой `files/changed: очередь не отправлена — …`: остаток бюджета до работы с очередью,
@@ -670,9 +683,19 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    // (очередь, забранный файл)
-    let mut taken: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for (i, q) in queue_files(env, session).into_iter().enumerate() {
+    let mut queues = queue_files(env, session);
+    if queues.len() > FLUSH_QUEUES_MAX {
+        // старые первыми: очередь давно закрытой сессии не ждёт вечно за свежими
+        queues.sort_by_key(|q| std::fs::metadata(q).and_then(|m| m.modified()).ok());
+        queues.truncate(FLUSH_QUEUES_MAX);
+    }
+    // (очередь, забранный файл, его содержимое)
+    let mut taken: Vec<(PathBuf, PathBuf, Vec<u8>)> = Vec::new();
+    for (i, q) in queues.into_iter().enumerate() {
+        // бюджет на запрос кончается — остальные очереди не трогаются (уйдут следующим хуком)
+        if i > 0 && env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+            break;
+        }
         let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("changed");
         let t = q.with_file_name(format!(".{name}.{}.{nanos}.{i}.tmp", std::process::id()));
         // под замком: `post-tool`, открывший очередь до rename, допишет уже в забранный файл;
@@ -686,8 +709,25 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
             ));
             continue;
         }
+        // содержимое — под замком и **до** rename, время изменения — «сейчас»: забранный файл
+        // наследует время очереди, и для очереди старше [`TMP_TTL`] он сразу «брошенный временный
+        // файл» — уборка кэша ([`gc_cache`], у `session-start` идёт параллельно) удаляла его до
+        // чтения, и строки терялись молча (задача 17d). Прочитанное не зависит от судьбы файла,
+        // а свежее время не даёт уборке удалить его, пока идёт запрос
+        let bytes = match read_and_touch(&q) {
+            Ok(b) => b,
+            // очередь уже забрал параллельный хук — не сбой
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                env.log(&format!(
+                    "files/changed: очередь не отправлена — не прочитана: {e} (прошло {} мс)",
+                    env.started.elapsed().as_millis()
+                ));
+                continue;
+            }
+        };
         match std::fs::rename(&q, &t) {
-            Ok(()) => taken.push((q, t)),
+            Ok(()) => taken.push((q, t, bytes)),
             // очередь уже забрал параллельный хук — не сбой
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => env.log(&format!(
@@ -702,8 +742,7 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     flush_stall();
     // (строка, номер очереди) — повтор пути: последняя строка (хэш и символы)
     let mut files: Vec<(Changed, usize)> = Vec::new();
-    for (qi, (_, t)) in taken.iter().enumerate() {
-        let bytes = std::fs::read(t).unwrap_or_default();
+    for (qi, (_, _, bytes)) in taken.iter().enumerate() {
         for l in bytes.split(|b| *b == b'\n') {
             let Ok(c) = serde_json::from_slice::<Changed>(l) else {
                 continue;
@@ -741,7 +780,12 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
         }
     }
     let back: Vec<(Changed, usize)> = files[done..].to_vec();
-    for (qi, (q, _)) in taken.iter().enumerate() {
+    // не отправлено ничего — забранные файлы возвращаются как были, без переписывания
+    let untouched = done == 0;
+    for (qi, (q, t, _)) in taken.iter().enumerate() {
+        if untouched && restore_taken(q, t) {
+            continue;
+        }
         let mine: Vec<Changed> = back
             .iter()
             .filter(|(_, i)| *i == qi)
@@ -751,9 +795,32 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
             return_changed(env, q, mine);
         }
     }
-    for (_, t) in &taken {
+    for (_, t, _) in &taken {
         let _ = std::fs::remove_file(t);
     }
+}
+
+/// Возврат забранной очереди `taken` на место `q` жёсткой ссылкой (сам `taken` удаляет
+/// вызывающий): ссылка не создаётся, если `q` уже есть, — строки, дописанные `post-tool` за
+/// время запроса в новую очередь, не затираются (rename затёр бы), и замок не нужен. `false` —
+/// новая очередь уже есть, забранного файла нет (его удалила уборка кэша) или файловая система
+/// без жёстких ссылок: обычный возврат слиянием из прочитанного ([`return_changed`]). Время
+/// изменения у возвращённой очереди — момент, когда её забрали ([`read_and_touch`]): очередь,
+/// которую пытаются отправить, уборка кэша брошенной не считает (как и прежде, когда возврат её
+/// переписывал).
+fn restore_taken(q: &Path, taken: &Path) -> bool {
+    std::fs::hard_link(taken, q).is_ok()
+}
+
+/// Содержимое очереди и отметка времени изменения «сейчас» одним открытием файла (сбой отметки
+/// не мешает: прочитанное уже есть).
+fn read_and_touch(q: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::options().read(true).append(true).open(q)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    let _ = f.set_modified(SystemTime::now());
+    Ok(bytes)
 }
 
 /// Точка подмены для тестов (только отладочная сборка и фича `test-hooks`, как

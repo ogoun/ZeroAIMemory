@@ -615,6 +615,43 @@ fn take_missing_or_dir_is_none() {
     assert!(snapshot::take(&c.dir, &o).is_none());
 }
 
+/// Задача 17d (пункт h): журнал есть, но не открывается (на Windows — открыт другим процессом
+/// без совместного доступа) — отдельный исход `Unreadable`, а не «журнала нет»: хук пишет о нём
+/// строку в `hooks.log`.
+#[cfg(windows)]
+#[test]
+fn take_locked_file_is_unreadable() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let c = Case::new("locked");
+    let p = c.dir.join("t.jsonl");
+    std::fs::write(
+        &p,
+        claude_human(&c, "запрос")
+            + "
+",
+    )
+    .unwrap();
+    let o = c.opts(AgentKind::Claude, SESSION);
+    assert!(matches!(
+        snapshot::take_ext(&p, &o),
+        snapshot::Taken::Snap(..)
+    ));
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&p)
+        .unwrap();
+    assert!(matches!(
+        snapshot::take_ext(&p, &o),
+        snapshot::Taken::Unreadable
+    ));
+    drop(held);
+    assert!(matches!(
+        snapshot::take_ext(&c.dir.join("нет.jsonl"), &o),
+        snapshot::Taken::Missing
+    ));
+}
+
 // ---------------------------------------------------------------- маскировка и пределы
 
 /// Приманки — конкатенацией: целого «ключа» в одной строке исходника нет.

@@ -59,21 +59,27 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// Бюджет хука по ТЗ §10.3, мс.
 fn budget_ms(kind: &str) -> u64 {
     match kind {
-        "session-start" | "subagent-start" | "session-start-holdout" => 300,
+        "session-start" | "subagent-start" | "session-start-holdout" | "session-start-catchup" => {
+            300
+        }
         "prompt" | "post-tool" => 250,
         // M4.5: `post-tool` успеха — весь процесс без сети (план M4.5, Global Constraints)
         "pre-tool" | "post-tool-ok" => 50,
-        "checkpoint" => 100,
+        "checkpoint" | "checkpoint-snap" => 100,
         other => panic!("неизвестный хук {other}"),
     }
 }
 
 /// Запас к бюджету в CI (общие раннеры, отладочная сборка): ×2.
 const CI_MARGIN: u64 = 2;
-/// Предел времени хука без сервера или с зависшим сервером: бюджет ×4 (как `hooks.rs`), не
-/// меньше 400 мс — запуск процесса отладочной сборки под нагрузкой.
+/// Предел времени хука **внутри процесса** без сервера или с зависшим сервером — у лучшего из
+/// повторов ([`Proj::hook_best`]): полтора бюджета §10.3, как `max_inner` в `hooks.rs` (срок HTTP
+/// — бюджет минус резерв, возврат ожидания сокета — с шагом таймера ОС, затем строки
+/// `hooks.log`). Ловит хук, который ждёт мёртвый сервер дольше своего срока: второй срок запроса
+/// сверх первого давал 1,86 бюджета (дефект 17b-http), прежний предел «×4 процесса целиком» его
+/// пропускал.
 fn fail_open_max(kind: &str) -> Duration {
-    Duration::from_millis((budget_ms(kind) * 4).max(400))
+    Duration::from_millis(budget_ms(kind) * 3 / 2)
 }
 
 fn tmp(name: &str) -> PathBuf {
@@ -429,14 +435,45 @@ impl Proj {
         c
     }
 
-    /// `zam hook <kind>` (Claude Code) по адресу `url`: вывод и время процесса.
-    fn hook_at(&self, url: &str, kind: &str, v: &Value) -> (Output, Duration) {
+    /// `zam hook <kind>` (Claude Code) по адресу `url` с бюджетом продукта: вывод и времена
+    /// вызова ([`common::HookTimes`]: процесс целиком и, где есть канал, внутри процесса).
+    fn hook_times(&self, url: &str, kind: &str, v: &Value) -> (Output, common::HookTimes) {
         let mut c = self.cmd(url);
         c.args(["hook", kind])
             .write_stdin(v.to_string().into_bytes());
+        common::hook_timed(c, kind)
+    }
+
+    /// [`Proj::hook_times`]: вывод и время процесса целиком.
+    fn hook_at(&self, url: &str, kind: &str, v: &Value) -> (Output, Duration) {
+        let (o, t) = self.hook_times(url, kind, v);
+        (o, t.outer)
+    }
+
+    /// Одиночная проверка срока, устойчивая к остановке диска: вызов повторяется (до трёх раз),
+    /// пока время хука внутри процесса не уложится в `max`; вывод — первого вызова, время —
+    /// лучшее. Остановка диска случайна и повтором снимается; хук, который в срок не укладывается,
+    /// не уложится все три раза. Только там, где повтор события безвреден.
+    fn hook_best(&self, url: &str, kind: &str, v: &Value, max: Duration) -> (Output, Duration) {
+        let (first, t) = self.hook_times(url, kind, v);
+        let mut best = t.hook();
+        for _ in 0..2 {
+            if best <= max {
+                break;
+            }
+            best = best.min(self.hook_times(url, kind, v).1.hook());
+        }
+        (first, best)
+    }
+
+    /// Пустой вызов `zam hook <kind>` (stdin пуст — хук сразу выходит): время процесса целиком —
+    /// мера запуска и выхода exe на этой машине в этот момент.
+    fn idle(&self, kind: &str) -> Duration {
+        let mut c = self.cmd(&self.url);
+        c.args(["hook", kind]).write_stdin(Vec::new());
         let t = Instant::now();
-        let o = c.output().unwrap();
-        (o, t.elapsed())
+        let _ = c.output().unwrap();
+        t.elapsed()
     }
 
     /// Хук ради содержимого — со
@@ -447,6 +484,9 @@ impl Proj {
     fn hook(&self, kind: &str, v: &Value) -> Output {
         self.cmd(&self.url)
             .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+            // снимок сессии (M6 §8а): его сроки — тоже бюджет продукта, содержимому не нужны
+            .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+            .env("ZAM_TEST_SNAPSHOT_PUT_MS", "8000")
             .args(["hook", kind])
             .write_stdin(v.to_string().into_bytes())
             .output()
@@ -574,12 +614,126 @@ fn empty(o: &Output) {
 /// Строка `hooks.log` о хуке, замолчавшем по сроку: внутренний тайм-аут HTTP или
 /// `recall timeout` сервера.
 fn is_timeout(line: &str) -> bool {
-    line.contains("timeout") || line.contains("бюджет исчерпан")
+    line.contains("timeout")
+        || line.contains("бюджет исчерпан")
+        // очередь изменённых файлов не ушла: бюджет вышел до запроса (диск, занятая машина)
+        || line.contains("остаток бюджета меньше")
+        // снимок сессии (M6 §8а): срок `PUT` и поток снимка, не успевший к выходу хука
+        || line.contains("срок PUT")
+        || line.contains("до выхода хука")
 }
 
-fn p95(mut v: Vec<Duration>) -> Duration {
-    v.sort();
-    v[(v.len() * 95).div_ceil(100) - 1]
+/// Строка `hooks.log` о снимке сессии, не ушедшем в срок (M6 §8а): срок `PUT` или поток снимка,
+/// не успевший к выходу хука, — снимок остаётся в очереди.
+fn is_snapshot_late(line: &str) -> bool {
+    line.contains("срок PUT")
+        || line.contains("до выхода хука")
+        || (line.contains("снимок") && line.contains("бюджет исчерпан"))
+}
+
+/// Строка `hooks.log` об удавшейся отправке снимка сессии (M6 §8а) — итог работы, не отказ.
+fn is_snapshot_sent(line: &str) -> bool {
+    line.contains("снимок") && line.contains(", отправлен")
+}
+
+/// Разброс времени пустого вызова `zam hook` в серии: p95 − минимум. На тихой машине — единицы
+/// мс; на занятой — десятки и сотни: столько машина в этот момент прибавляет процессу, который
+/// ничего не делает.
+fn jitter(idle: &[Duration]) -> Duration {
+    match idle.iter().min() {
+        Some(min) => common::quantile(idle, 95).saturating_sub(*min),
+        None => Duration::ZERO,
+    }
+}
+
+/// Записи журнала Claude Code (как в `hooks.rs`): запрос человека, команда, правка файла. Без
+/// `sessionId`: такая запись — своя для любой сессии (адаптер снимка пропускает только записи с
+/// чужим id), один журнал служит всем сессиям серии.
+fn cl_user(text: &str) -> String {
+    json!({"type": "user", "isSidechain": false,
+           "message": {"role": "user", "content": text}})
+    .to_string()
+}
+
+fn cl_bash(id: &str, command: &str) -> String {
+    json!({"type": "assistant", "isSidechain": false,
+           "message": {"role": "assistant", "content": [
+               {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}})
+    .to_string()
+}
+
+fn cl_edit(id: &str, path: &Path) -> String {
+    json!({"type": "assistant", "isSidechain": false,
+           "message": {"role": "assistant", "content": [
+               {"type": "tool_use", "id": id, "name": "Edit",
+                "input": {"file_path": path, "old_string": "a", "new_string": "b"}}]}})
+    .to_string()
+}
+
+fn append_lines(path: &Path, lines: &[String]) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+}
+
+/// Журнал агента не меньше `bytes` байт: запросы, команды и правки файлов проекта `repo`
+/// вперемешку с выводом агента (строки без признаков предфильтра снимка — как у живого журнала
+/// большая часть объёма).
+fn big_transcript(path: &Path, repo: &Path, bytes: u64) {
+    use std::io::Write as _;
+    let filler = json!({"type": "progress", "data": "ж".repeat(2048)}).to_string();
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let (mut n, mut i) = (0u64, 0usize);
+    while n < bytes {
+        let lines = [
+            cl_user(&format!("Запрос {i}: почини пул соединений")),
+            cl_bash(&format!("b{i}"), "cargo test -p pool"),
+            cl_edit(&format!("e{i}"), &repo.join(format!("src/f{}.rs", i % 7))),
+            filler.clone(),
+        ];
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+            n += l.len() as u64 + 1;
+        }
+        i += 1;
+    }
+    f.flush().unwrap();
+}
+
+/// Размер журнала агента в замерах снимка (M6, задача 17d): 50 МиБ.
+const BIG_TRANSCRIPT: u64 = 50 * 1024 * 1024;
+
+/// Удаляет очереди изменённых файлов всех сессий проекта (и забранные, но не возвращённые).
+fn clear_changed(p: &Proj) {
+    let cache = p.repo.join(".zeroaimemory/cache");
+    for e in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("changed-") || name.starts_with(".changed-") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Очередь изменённых файлов сессии `changed-<сессия>.jsonl` вручную (имя — как у хуков:
+/// очищенный id и 8 hex blake3).
+fn put_changed(p: &Proj, session: &str, path: &str) {
+    let cache = p.repo.join(".zeroaimemory/cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let part = format!(
+        "{session}-{}",
+        &blake3::hash(session.as_bytes()).to_hex()[..8]
+    );
+    std::fs::write(
+        cache.join(format!("changed-{part}.jsonl")),
+        format!("{}\n", json!({"path": path, "hash": "b".repeat(64)})),
+    )
+    .unwrap();
 }
 
 // ---- e2e CRLF ----
@@ -654,7 +808,14 @@ fn crlf_scenario() {
 
     // сеть пропала: сервер остановлен после sync
     srv.stop();
-    let (o, d) = b.hook_at(&b.url, "pre-tool", &b.write_ev("crlf-b-1", "deploy.sh"));
+    // время — внутри процесса, лучший из повторов (вывод — первого вызова: подсказка — раз за
+    // сессию)
+    let (o, d) = b.hook_best(
+        &b.url,
+        "pre-tool",
+        &b.write_ev("crlf-b-1", "deploy.sh"),
+        fail_open_max("pre-tool"),
+    );
     let c = context(&o, "PreToolUse");
     assert!(
         c.starts_with("ZeroAIMemory: для **/*.sh: Скрипты *.sh — только LF [gotcha·hyp]"),
@@ -662,13 +823,14 @@ fn crlf_scenario() {
     );
     assert!(c.contains(&format!("i:{id}")), "{c}");
     assert!(d <= fail_open_max("pre-tool"), "pre-tool без сети: {d:?}");
-    let (o, d) = b.hook_at(
+    let (o, d) = b.hook_best(
         &b.url,
         "post-tool",
         &b.fail_ev(
             "crlf-b-1",
             "Exit code 126\n/bin/bash^M: bad interpreter: No such file or directory",
         ),
+        fail_open_max("post-tool"),
     );
     let c = context(&o, "PostToolUseFailure");
     assert!(
@@ -1031,21 +1193,62 @@ fn hook_budgets() {
             .map(|s| (p.start_ev(&s), Some(false)))
             .collect(),
     ));
+    // M6 §8а (задача 17d): снимок сессии из журнала агента 50 МиБ. Серии идут последними: их
+    // `snapst-*` иначе стали бы кандидатами догоняющего снимка у прежних серий `session-start`.
+    // Первые `SNAP_WARM` событий серии — прогрев на зарегистрированных сессиях (не в замер).
+    let big = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli-m4-budgets-transcripts");
+    let _ = std::fs::remove_dir_all(&big);
+    std::fs::create_dir_all(&big).unwrap();
+    let (t_stop, t_catch) = (big.join("stop.jsonl"), big.join("catchup.jsonl"));
+    big_transcript(&t_stop, &p.repo, BIG_TRANSCRIPT);
+    std::fs::copy(&t_stop, &t_catch).unwrap();
+    const SNAP_WARM: usize = 3;
+    // `checkpoint` (`Stop`) с напоминанием, влиянием диффа и первым снимком сессии: чтение хвоста
+    // журнала, разбор, маскировка, очередь, `PUT` — в бюджете 100 мс
+    runs.push((
+        "checkpoint-snap",
+        (0..40 + SNAP_WARM)
+            .map(|i| {
+                let mut ev = p.ev(
+                    "Stop",
+                    &format!("bud-cs-{i}"),
+                    json!({"stop_hook_active": false}),
+                );
+                ev["transcript_path"] = json!(t_stop);
+                (ev, Some(true))
+            })
+            .collect(),
+    ));
+    // `session-start` (`startup`) с догоняющим снимком оборванной сессии: снимок и `PUT` — до
+    // `/recall`, всё вместе — в бюджете 300 мс
+    runs.push((
+        "session-start-catchup",
+        (0..40 + SNAP_WARM)
+            .map(|i| (p.start_ev(&format!("bud-cu-{i}")), Some(true)))
+            .collect(),
+    ));
     let mut report = Vec::new();
     let mut fails = Vec::new();
     for (kind, evs) in &runs {
-        if *kind == "session-start-holdout" {
-            std::fs::write(
-                p.repo.join(".zeroaimemory/config.toml"),
-                "[hooks]\ncheckpoint_impact = true\nholdout = 0.5\n",
-            )
-            .unwrap();
-        }
-        if *kind == "checkpoint" {
+        let snap_run = matches!(*kind, "checkpoint-snap" | "session-start-catchup");
+        std::fs::write(
+            p.repo.join(".zeroaimemory/config.toml"),
+            if *kind == "session-start-holdout" {
+                "[hooks]\ncheckpoint_impact = true\nholdout = 0.5\n"
+            } else {
+                "[hooks]\ncheckpoint_impact = true\n"
+            },
+        )
+        .unwrap();
+        if matches!(*kind, "checkpoint" | "checkpoint-snap") {
             // правка в сессии — иначе checkpoint молчит без запроса к серверу; правка файла со
             // знанием (`src/pool.rs`) — вход влияния диффа (M6 §12)
-            for i in 0..evs.len() {
-                let s = format!("bud-cp-{i}");
+            for (ev, _) in evs.iter() {
+                let s = ev["session_id"].as_str().unwrap().to_string();
+                if snap_run {
+                    // сессия на сервере: `PUT` снимка незарегистрированной сессии — 404
+                    p.hook("session-start", &p.start_ev(&s));
+                }
                 p.hook("pre-tool", &p.write_ev(&s, "a.txt"));
                 let edit = p.ev(
                     "PostToolUse",
@@ -1056,6 +1259,22 @@ fn hook_budgets() {
                            "tool_response": {"success": true}}),
                 );
                 p.hook("post-tool", &edit);
+            }
+        }
+        if matches!(*kind, "pre-tool" | "post-tool-ok") {
+            // файлы сессии (журнал событий, маркеры) — до замера: у живой сессии их создаёт первый
+            // же вызов инструмента, а каждый следующий только дописывает. Без этого каждый замер
+            // шёл бы на новой сессии и мерил создание файлов — на HDD оно стоит до сотен мс
+            // (замер 17d, release: 2 вызова из 18 — 108 и 174 мс при 3 мс у остальных)
+            for (ev, _) in evs.iter() {
+                let s = ev["session_id"].as_str().unwrap();
+                let read = p.ev(
+                    "PreToolUse",
+                    s,
+                    json!({"tool_name": "Read", "tool_use_id": "u0",
+                           "tool_input": {"file_path": p.repo.join("LICENSE")}}),
+                );
+                p.hook("pre-tool", &read);
             }
         }
         if *kind == "subagent-start" {
@@ -1075,30 +1294,65 @@ fn hook_budgets() {
         // команда хука: `post-tool-ok` — тот же `post-tool` с событием успеха
         let cmd = match *kind {
             "post-tool-ok" => "post-tool",
-            "session-start-holdout" => "session-start",
+            "session-start-holdout" | "session-start-catchup" => "session-start",
+            "checkpoint-snap" => "checkpoint",
             k => k,
         };
         // прогрев вида (не в замер): после загрузки корпуса первые запросы отладочного сервера
         // читают холодные страницы SQLite с HDD — бюджет относится к рабочему серверу
-        for (ev, _) in evs.iter().take(3) {
-            let mut w = ev.clone();
-            w["session_id"] = json!(format!("warm-{}", ev["session_id"].as_str().unwrap()));
-            p.hook_at(&p.url, cmd, &w);
+        if !snap_run {
+            for (ev, _) in evs.iter().take(3) {
+                let mut w = ev.clone();
+                w["session_id"] = json!(format!("warm-{}", ev["session_id"].as_str().unwrap()));
+                p.hook_at(&p.url, cmd, &w);
+            }
         }
-        let mut times = Vec::new();
-        let (mut timeouts, mut spoke, mut impact) = (0, 0, 0);
-        for (ev, want) in evs {
+        let mut times: Vec<common::HookTimes> = Vec::new();
+        let mut idle = Vec::new();
+        let (mut timeouts, mut spoke, mut impact, mut sent, mut put_late) = (0, 0, 0, 0, 0);
+        for (i, (ev, want)) in evs.iter().enumerate() {
+            if *kind == "session-start-catchup" {
+                // оборванная сессия: её снимок на `Stop`, затем журнал вырос (работа шла дальше,
+                // а `SessionEnd` не пришёл) — следующий старт снимает её догоняющим снимком
+                let a = format!("bud-ca-{i}");
+                p.hook("session-start", &p.start_ev(&a));
+                let mut stop = p.ev("Stop", &a, json!({"stop_hook_active": false}));
+                stop["transcript_path"] = json!(t_catch);
+                p.hook("checkpoint", &stop);
+                append_lines(
+                    &t_catch,
+                    &[
+                        cl_user(&format!("Продолжение {i}: добавь тест на пул")),
+                        cl_edit(&format!("c{i}"), &p.repo.join("src/pool.rs")),
+                    ],
+                );
+            }
+            let measured = !snap_run || i >= SNAP_WARM;
+            // пустой вызов рядом с каждым замером: что машина сейчас делает с процессом
+            let empty_call = p.idle(cmd);
             let before = p.log().lines().count();
-            let (o, d) = p.hook_at(&p.url, cmd, ev);
+            let (o, t) = p.hook_times(&p.url, cmd, ev);
+            if !measured {
+                continue;
+            }
+            idle.push(empty_call);
             let said = !ok(&o).trim().is_empty();
             spoke += usize::from(said);
             impact += usize::from(out(&o).contains("правка затрагивает"));
-            times.push(d);
+            times.push(t);
             let lines: Vec<String> = p.log().lines().skip(before).map(String::from).collect();
-            let late = lines.iter().any(|l| is_timeout(l));
+            // снимок, не ушедший в срок, — не отказ хука: он в очереди (§8а), вывод хука не
+            // задержан; считается отдельно. Срок остальных запросов — тайм-аут, как прежде
+            let snap_late = lines.iter().any(|l| is_snapshot_late(l));
+            put_late += usize::from(snap_late);
+            let late = lines.iter().any(|l| is_timeout(l) && !is_snapshot_late(l));
             timeouts += usize::from(late);
+            sent += usize::from(lines.iter().any(|l| is_snapshot_sent(l)));
             // любая другая строка журнала — отказ, а не замер (I-1)
-            for l in lines.iter().filter(|l| !is_timeout(l)) {
+            for l in lines
+                .iter()
+                .filter(|l| !is_timeout(l) && !is_snapshot_sent(l))
+            {
                 fails.push(format!("{kind} {}: ошибка хука: {l}", ev["session_id"]));
             }
             // ответ, где он ожидается; вызов, замолчавший по сроку, учтён в тайм-аутах
@@ -1114,33 +1368,77 @@ fn hook_budgets() {
                 ));
             }
         }
-        let n = times.len();
-        let max = *times.iter().max().unwrap();
-        let mut sorted = times.clone();
-        sorted.sort();
-        let q = p95(times);
-        let limit = Duration::from_millis(budget_ms(kind) * CI_MARGIN);
+        let outer: Vec<Duration> = times.iter().map(|t| t.outer).collect();
+        let inner: Vec<Duration> = times.iter().filter_map(|t| t.inner).collect();
+        let n = outer.len();
+        let budget = Duration::from_millis(budget_ms(kind));
+        let noise = jitter(&idle);
+        let (mid, q) = (common::quantile(&outer, 50), common::quantile(&outer, 95));
         report.push(format!(
-            "{kind} n={n} p50={:?} p95={q:?} max={max:?} ответов={spoke} тайм-аутов={timeouts} \
-             (бюджет {} мс){}",
-            sorted[n / 2],
+            "{kind} (бюджет {} мс): процесс {}; внутри {}; пустой вызов {}; ответов={spoke} \
+             тайм-аутов={timeouts}{}{}",
             budget_ms(kind),
-            if *kind == "checkpoint" {
+            common::stats(&outer),
+            common::stats(&inner),
+            common::stats(&idle),
+            if matches!(*kind, "checkpoint" | "checkpoint-snap") {
                 format!(" со строками влияния={impact}")
+            } else {
+                String::new()
+            },
+            if snap_run {
+                format!(" снимков отправлено={sent} в очереди по сроку={put_late}")
             } else {
                 String::new()
             }
         ));
         // влияние диффа (M6 §12) уложилось в свой срок 60 мс хотя бы раз: иначе замер
         // `checkpoint` шёл бы без `POST /code/impact` (молчание по сроку — не отказ)
-        if *kind == "checkpoint" && impact == 0 {
-            fails.push("checkpoint: ни одной строки влияния диффа".into());
+        if matches!(*kind, "checkpoint" | "checkpoint-snap") && impact == 0 {
+            fails.push(format!("{kind}: ни одной строки влияния диффа"));
         }
-        if q > limit {
-            fails.push(format!("{kind}: p95 {q:?} > {limit:?}"));
+        if cfg!(debug_assertions) {
+            // отладочная сборка (CI, общие раннеры): запас ×2 к времени процесса
+            let limit = budget * CI_MARGIN as u32;
+            if q > limit {
+                fails.push(format!("{kind}: p95 {q:?} > {limit:?}"));
+            }
+        } else {
+            // release (приёмка, задача 17d): бюджет §10.3 как он есть, по времени процесса
+            // целиком — его и ждёт агент, и только оно видит задержку, общую для любого вызова
+            // `zam hook` (запуск, выход). Медиана — устойчива к остановкам диска; p95 — с
+            // поправкой на то, что машина в этой же серии прибавила пустому вызову
+            if mid > budget {
+                fails.push(format!(
+                    "{kind}: медиана времени процесса {mid:?} > бюджета {budget:?}"
+                ));
+            }
+            if q > budget + noise {
+                fails.push(format!(
+                    "{kind}: p95 времени процесса {q:?} > бюджета {budget:?} + разброс пустого \
+                     вызова {noise:?}"
+                ));
+            }
         }
-        if timeouts * 20 > n {
+        // сроки снимка (`hooks.snapshot_ms`, срок `PUT`) — бюджеты release: отладочная сборка на
+        // общем раннере в них не обязана укладываться, там серии снимка проверяют только отказы
+        let strict = !snap_run || !cfg!(debug_assertions);
+        if strict && timeouts * 20 > n {
             fails.push(format!("{kind}: тайм-аутов {timeouts} из {n} (> 5 %)"));
+        }
+        // снимок состоялся: каждый вызов либо отправил снимок, либо оставил его в очереди со
+        // строкой причины — иначе замер шёл бы без чтения журнала и `PUT` (молчаливый пропуск
+        // снимка — отказ); в срок уходит подавляющая часть (не меньше 80 %: срок `PUT` и срок
+        // снимка рассчитаны на эту машину, а не «иногда успевает»)
+        if snap_run && strict && sent + put_late < n {
+            fails.push(format!(
+                "{kind}: снимок отправлен в {sent} и оставлен в очереди в {put_late} из {n}"
+            ));
+        }
+        if snap_run && strict && sent * 5 < n * 4 {
+            fails.push(format!(
+                "{kind}: снимок отправлен в срок в {sent} из {n} (< 80 %)"
+            ));
         }
         // контрольная группа молчит по построению; её метка — на сервере у каждой сессии
         if *kind == "session-start-holdout" {
@@ -1155,13 +1453,601 @@ fn hook_budgets() {
             fails.push(format!("{kind}: ни одного ответа из {n}"));
         }
     }
-    eprintln!("ZAM_TIMING m4 hook_budgets: {}", report.join("; "));
+    let _ = std::fs::remove_dir_all(&big);
+    eprintln!("ZAM_TIMING m4 hook_budgets:\n  {}", report.join("\n  "));
     assert!(
         fails.is_empty(),
         "{}\n{}\nhooks.log:\n{}",
         fails.join("\n"),
         report.join("\n"),
         p.log()
+    );
+}
+
+/// Задача 17d (пункт d): хук, запросы которого не состоялись — сервер принял соединение и
+/// молчит. Срок HTTP — бюджет минус резерв (`HTTP_RESERVE_MS`), но ожидание сокета возвращается
+/// с шагом таймера ОС (Windows — до 15,6 мс), а после него хук ещё пишет строки `hooks.log` и
+/// возвращает очередь изменённых файлов. Серия по каждому сетевому хуку (очередь изменённых
+/// есть у каждого вызова): время выхода — в бюджете.
+///
+/// Что ловит: рост «хвоста после срока» (лишние файловые операции после возврата запроса,
+/// второй срок сверх первого, ожидание потока) и уменьшение резерва. Release (приёмка): медиана
+/// времени процесса целиком не больше бюджета, p95 — бюджета и разброса пустого вызова. Отладочная
+/// сборка: время внутри процесса, медиана не больше бюджета + запаса отладочной сборки, p95 —
+/// полутора бюджетов (как `max_inner` в `hooks.rs`) и разброса пустого вызова.
+#[test]
+fn hook_budgets_unanswered() {
+    let _g = serial();
+    let hang = hanging_server();
+    let p = Proj::new("budgets-hang", &hang, "zam_x", GA, "bench-box");
+    let mut report = Vec::new();
+    let mut fails = Vec::new();
+    const WARM: usize = 3;
+    for kind in ["session-start", "prompt", "post-tool", "checkpoint"] {
+        let (mut times, mut idle) = (Vec::new(), Vec::new());
+        for i in 0..30 + WARM {
+            let s = format!("un-{kind}-{i}");
+            // очередь изменённых файлов сессии: её отправка и возврат — в пути хука. Одна на
+            // вызов: `session-start` отправляет очереди всех сессий проекта, и без уборки они
+            // копились бы от вызова к вызову (масштаб по числу очередей — ниже, отдельно)
+            clear_changed(&p);
+            put_changed(&p, &s, &format!("src/f{i}.rs"));
+            let ev = match kind {
+                "session-start" => p.start_ev(&s),
+                "prompt" => p.ev(
+                    "UserPromptSubmit",
+                    &s,
+                    json!({"prompt": "почему течёт пул соединений"}),
+                ),
+                "post-tool" => p.fail_ev(&s, "error[E0308]: mismatched types"),
+                _ => {
+                    // правка в сессии: `checkpoint` идёт на сервер за `GET /sessions/{id}`
+                    empty(&p.hook_at(&hang, "pre-tool", &p.write_ev(&s, "a.txt")).0);
+                    p.ev("Stop", &s, json!({"stop_hook_active": false}))
+                }
+            };
+            let empty_call = p.idle(kind);
+            let before = p.log().lines().count();
+            let (o, t) = p.hook_times(&hang, kind, &ev);
+            empty(&o);
+            if i < WARM {
+                continue;
+            }
+            // запросы действительно не состоялись: строка причины в журнале есть
+            if !p.log().lines().skip(before).any(is_timeout) {
+                fails.push(format!(
+                    "{kind} {s}: нет строки о сроке; hooks.log: {:?}",
+                    p.log().lines().skip(before).collect::<Vec<_>>()
+                ));
+            }
+            times.push(t);
+            idle.push(empty_call);
+        }
+        let outer: Vec<Duration> = times.iter().map(|t| t.outer).collect();
+        let inner: Vec<Duration> = times.iter().filter_map(|t| t.inner).collect();
+        let tail: Vec<Duration> = times.iter().filter_map(|t| t.launch()).collect();
+        let budget = Duration::from_millis(budget_ms(kind));
+        let noise = jitter(&idle);
+        report.push(format!(
+            "{kind} (бюджет {} мс): процесс {}; внутри {}; запуск и выход {}; пустой вызов {}",
+            budget_ms(kind),
+            common::stats(&outer),
+            common::stats(&inner),
+            common::stats(&tail),
+            common::stats(&idle),
+        ));
+        if cfg!(debug_assertions) {
+            let (mid, q) = (common::quantile(&inner, 50), common::quantile(&inner, 95));
+            if mid > budget + DEBUG_EXIT_SLACK {
+                fails.push(format!(
+                    "{kind}: медиана внутри процесса {mid:?} > бюджета {budget:?} + \
+                     {DEBUG_EXIT_SLACK:?}"
+                ));
+            }
+            if q > fail_open_max(kind) + noise {
+                fails.push(format!(
+                    "{kind}: p95 внутри процесса {q:?} > {:?} + разброс пустого вызова {noise:?}",
+                    fail_open_max(kind)
+                ));
+            }
+        } else {
+            let (mid, q) = (common::quantile(&outer, 50), common::quantile(&outer, 95));
+            if mid > budget {
+                fails.push(format!(
+                    "{kind}: медиана времени процесса {mid:?} > бюджета {budget:?}"
+                ));
+            }
+            if q > budget + noise {
+                fails.push(format!(
+                    "{kind}: p95 времени процесса {q:?} > бюджета {budget:?} + разброс пустого \
+                     вызова {noise:?}"
+                ));
+            }
+        }
+    }
+    // масштаб: сервер недоступен давно, очереди изменённых файлов есть у K сессий —
+    // `session-start` забирает и возвращает каждую. Предел — тот же бюджет: число очередей не
+    // должно выводить хук за него (`FLUSH_QUEUES_MAX`, возврат забранной очереди одним rename)
+    for k in [8usize, 32] {
+        let mut times = Vec::new();
+        for i in 0..12 + WARM {
+            clear_changed(&p);
+            for q in 0..k {
+                put_changed(&p, &format!("un-many-{k}-{q}"), &format!("src/q{q}.rs"));
+            }
+            let ev = p.start_ev(&format!("un-many-{k}-s{i}"));
+            let (o, t) = p.hook_times(&hang, "session-start", &ev);
+            empty(&o);
+            if i >= WARM {
+                times.push(t);
+            }
+            // ни одна очередь не потеряна
+            let left = std::fs::read_dir(p.repo.join(".zeroaimemory/cache"))
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.starts_with("changed-") && n.ends_with(".jsonl")
+                })
+                .count();
+            if left != k {
+                fails.push(format!(
+                    "session-start, очередей {k}: после хука осталось {left}; hooks.log:\n{}",
+                    p.log().lines().rev().take(6).collect::<Vec<_>>().join("\n")
+                ));
+            }
+        }
+        let outer: Vec<Duration> = times.iter().map(|t| t.outer).collect();
+        let inner: Vec<Duration> = times.iter().filter_map(|t| t.inner).collect();
+        report.push(format!(
+            "session-start, очередей {k} (бюджет 300 мс): процесс {}; внутри {}",
+            common::stats(&outer),
+            common::stats(&inner),
+        ));
+        let series = if cfg!(debug_assertions) {
+            &inner
+        } else {
+            &outer
+        };
+        let mid = common::quantile(series, 50);
+        let max = if cfg!(debug_assertions) {
+            fail_open_max("session-start")
+        } else {
+            Duration::from_millis(budget_ms("session-start"))
+        };
+        if mid > max {
+            fails.push(format!(
+                "session-start, очередей {k}: медиана {mid:?} > {max:?} — время выхода растёт с \
+                 числом очередей"
+            ));
+        }
+    }
+    clear_changed(&p);
+    eprintln!(
+        "ZAM_TIMING m4 hook_budgets_unanswered:\n  {}",
+        report.join("\n  ")
+    );
+    assert!(
+        fails.is_empty(),
+        "{}\n{}",
+        fails.join("\n"),
+        report.join("\n")
+    );
+}
+
+/// Решение замера против внешнего сервера ([`hook_budgets_remote`]).
+const GR: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9ec1";
+
+/// Задача 17d (пункт c): те же хуки со снимком сессии против **внешнего** сервера — по LAN, на
+/// медленном диске, за TLS-прокси. Запуск вручную:
+///
+/// ```text
+/// ZAM_HOOK_BUDGETS_URL=http://192.168.0.210:7711 ZAM_HOOK_BUDGETS_TOKEN=zam_… \
+///   cargo test -p zam-cli --release --test m4_acceptance hook_budgets_remote -- --nocapture
+/// ```
+///
+/// Без переменных — пропуск. Серии (`ZAM_HOOK_BUDGETS_N` вызовов, по умолчанию 40, журнал
+/// агента 50 МиБ): `session-start`; `checkpoint` (`Stop` с напоминанием) без снимка и со
+/// снимком; `SessionEnd` со снимком (`PATCH {ended}` и `PUT`, без вывода); `session-start` с
+/// догоняющим снимком; и сам `PUT /sessions/{id}/snapshot` снимка с журнала (новое соединение
+/// на запрос, как у хука). Печатает сводки (`ZAM_TIMING`) и исходы `PUT` по `hooks.log`
+/// («отправлен», «срок PUT», прочее); падает только на отказах, не на времени — бюджет
+/// на чужой среде не критерий, а предмет замера (решение о сроке `PUT`, журнал M6).
+#[test]
+fn hook_budgets_remote() {
+    let (Ok(url), Ok(token)) = (
+        std::env::var("ZAM_HOOK_BUDGETS_URL"),
+        std::env::var("ZAM_HOOK_BUDGETS_TOKEN"),
+    ) else {
+        eprintln!("SKIP hook_budgets_remote: нет ZAM_HOOK_BUDGETS_URL и ZAM_HOOK_BUDGETS_TOKEN");
+        return;
+    };
+    let _g = serial();
+    let n: usize = std::env::var("ZAM_HOOK_BUDGETS_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    const WARM: usize = 3;
+    let auth = format!("Bearer {token}");
+    let h = [("Authorization", auth.as_str())];
+    let (code, v) = rest(
+        &url,
+        &h,
+        "POST",
+        "/api/v1/solutions",
+        Some(&json!({"agent_solution_id": GR, "name": "Замер хуков"})),
+    );
+    assert!(
+        matches!(code, 200 | 201 | 409),
+        "регистрация решения: {code} {v}"
+    );
+    let p = Proj::new("budgets-remote", &url, &token, GR, "bench-box");
+    // свой прогон — свои сессии: сервер живёт между запусками
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::write(p.repo.join("src/pool.rs"), "pub fn pool() {}\n").unwrap();
+    let big = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli-m4-remote-transcripts");
+    let _ = std::fs::remove_dir_all(&big);
+    std::fs::create_dir_all(&big).unwrap();
+    let (t_stop, t_catch) = (big.join("stop.jsonl"), big.join("catchup.jsonl"));
+    big_transcript(&t_stop, &p.repo, BIG_TRANSCRIPT);
+    std::fs::copy(&t_stop, &t_catch).unwrap();
+    let with = |mut ev: Value, t: &Path| {
+        ev["transcript_path"] = json!(t);
+        ev
+    };
+    let mut report = Vec::new();
+    let mut fails = Vec::new();
+    for kind in [
+        "session-start",
+        "checkpoint",
+        "checkpoint-snap",
+        "checkpoint-end",
+        "session-start-catchup",
+    ] {
+        let cmd = if kind.starts_with("checkpoint") {
+            "checkpoint"
+        } else {
+            "session-start"
+        };
+        let (mut times, mut idle) = (Vec::new(), Vec::new());
+        let (mut sent, mut put_late, mut late, mut spoke) = (0, 0, 0, 0);
+        let mut other: Vec<String> = Vec::new();
+        for i in 0..n + WARM {
+            let s = format!("rem-{run}-{kind}-{i}");
+            let ev = match kind {
+                "session-start" => p.start_ev(&s),
+                "session-start-catchup" => {
+                    let a = format!("rem-{run}-ca-{i}");
+                    p.hook("session-start", &p.start_ev(&a));
+                    p.hook(
+                        "checkpoint",
+                        &with(
+                            p.ev("Stop", &a, json!({"stop_hook_active": false})),
+                            &t_catch,
+                        ),
+                    );
+                    append_lines(
+                        &t_catch,
+                        &[
+                            cl_user(&format!("Продолжение {i}: добавь тест на пул")),
+                            cl_edit(&format!("c{i}"), &p.repo.join("src/pool.rs")),
+                        ],
+                    );
+                    p.start_ev(&s)
+                }
+                _ => {
+                    // сессия на сервере и правка в ней: `Stop` идёт за `GET /sessions/{id}`
+                    p.hook("session-start", &p.start_ev(&s));
+                    p.hook("pre-tool", &p.write_ev(&s, "a.txt"));
+                    match kind {
+                        "checkpoint" => p.ev("Stop", &s, json!({"stop_hook_active": false})),
+                        "checkpoint-snap" => with(
+                            p.ev("Stop", &s, json!({"stop_hook_active": false})),
+                            &t_stop,
+                        ),
+                        _ => with(p.ev("SessionEnd", &s, json!({"reason": "other"})), &t_stop),
+                    }
+                }
+            };
+            let empty_call = p.idle(cmd);
+            let before = p.log().lines().count();
+            let (o, t) = p.hook_times(&url, cmd, &ev);
+            if i < WARM {
+                continue;
+            }
+            spoke += usize::from(!ok(&o).trim().is_empty());
+            times.push(t);
+            idle.push(empty_call);
+            let lines: Vec<String> = p.log().lines().skip(before).map(String::from).collect();
+            sent += usize::from(lines.iter().any(|l| is_snapshot_sent(l)));
+            put_late += usize::from(lines.iter().any(|l| l.contains("срок PUT")));
+            late += usize::from(lines.iter().any(|l| is_timeout(l)));
+            other.extend(
+                lines
+                    .into_iter()
+                    .filter(|l| !is_timeout(l) && !is_snapshot_sent(l)),
+            );
+        }
+        let outer: Vec<Duration> = times.iter().map(|t| t.outer).collect();
+        let inner: Vec<Duration> = times.iter().filter_map(|t| t.inner).collect();
+        report.push(format!(
+            "{kind} (бюджет {} мс): процесс {}; внутри {}; пустой вызов {}; ответов={spoke} \
+             вызовов со строкой срока={late} снимков отправлено={sent} «срок PUT»={put_late}",
+            if cmd == "checkpoint" { 100 } else { 300 },
+            common::stats(&outer),
+            common::stats(&inner),
+            common::stats(&idle),
+        ));
+        for l in other.iter().take(5) {
+            fails.push(format!("{kind}: ошибка хука: {l}"));
+        }
+    }
+    // сам `PUT` снимка: тело — снимок, принятый сервером от хука; каждый запрос — новое
+    // соединение (как у процесса хука); `taken_at` растёт, иначе сервер не пишет («stale_ignored»)
+    let probe = format!("rem-{run}-put");
+    p.hook("session-start", &p.start_ev(&probe));
+    p.hook(
+        "checkpoint",
+        &with(
+            p.ev("Stop", &probe, json!({"stop_hook_active": true})),
+            &t_stop,
+        ),
+    );
+    let path = format!("/api/v1/sessions/{probe}/snapshot");
+    let (code, snap) = rest(&url, &h, "GET", &path, None);
+    if code == 200 {
+        let hs = [
+            ("Authorization", auth.as_str()),
+            ("X-Zam-Session", probe.as_str()),
+        ];
+        let mut puts = Vec::new();
+        for i in 0..n + WARM {
+            let body = json!({
+                "taken_at": (zam_store::time::now() + Duration::from_millis(i as u64)).to_string(),
+                "trigger": snap["trigger"], "agent": snap["agent"], "status": snap["status"],
+                "skipped": snap["skipped"], "data": snap["data"],
+            });
+            let t0 = Instant::now();
+            let (code, _, _) = rest_raw(&url, &hs, "PUT", &path, Some(&body));
+            let d = t0.elapsed();
+            if !matches!(code, 200 | 204) {
+                fails.push(format!("PUT снимка: HTTP {code}"));
+                break;
+            }
+            if i >= WARM {
+                puts.push(d);
+            }
+        }
+        report.push(format!(
+            "PUT снимка ({} байт, срок клиента 60 мс): {}",
+            snap["bytes"],
+            common::stats(&puts)
+        ));
+    } else {
+        fails.push(format!("снимок пробной сессии не дошёл: GET {code} {snap}"));
+    }
+    let _ = std::fs::remove_dir_all(&big);
+    eprintln!(
+        "ZAM_TIMING m4 hook_budgets_remote {url}:\n  {}",
+        report.join("\n  ")
+    );
+    assert!(
+        fails.is_empty(),
+        "{}\n{}",
+        fails.join("\n"),
+        report.join("\n")
+    );
+}
+
+/// Запас отладочной сборки к бюджету у медианы времени выхода хука с несостоявшимися запросами
+/// ([`hook_budgets_unanswered`]): отладочный exe после срока запроса пишет строки `hooks.log` и
+/// возвращает очередь медленнее release (замер 17b-http: 283–307 мс при бюджете 300).
+const DEBUG_EXIT_SLACK: Duration = Duration::from_millis(30);
+
+/// Раздел снимка сессии в тексте дайджеста (до следующего раздела `###`).
+fn snapshot_section(digest: &str) -> Option<&str> {
+    let at = digest.find("### Последнее известное состояние")?;
+    let rest = &digest[at..];
+    let end = rest[3..].find("\n### ").map_or(rest.len(), |i| i + 3);
+    Some(rest[..end].trim_end())
+}
+
+/// Решения сценариев снимка (у каждого сценария своё: снимок оборванной сессии показывается всем
+/// следующим стартам решения).
+const GS: [&str; 3] = [
+    "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9eb1",
+    "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9eb2",
+    "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9eb3",
+];
+
+/// Задача 17d (пункт b; решение владельца 2026-11-10, М11): раздел «Последнее известное
+/// состояние» в дайджесте следующей сессии — типовые сценарии через настоящие хуки и сервер:
+///
+/// - **вторая сессия после обычной** (`SessionEnd`) — раздела нет (0 токенов);
+/// - **после `/clear`** (`SessionEnd reason=clear`, затем `SessionStart source=clear`) — нет;
+/// - **после обрыва** (нет `SessionEnd`, журнал вырос после последнего снимка, сессия молчит
+///   дольше 10 мин) — раздел есть: первый старт снимает оборванную сессию догоняющим снимком,
+///   раздел — не больше `recall.snapshot_tokens` (400).
+///
+/// «Молчит дольше 10 мин» — часами сервера (`freeze_now`, фича `test-hooks` хранилища): сервер
+/// идёт в процессе теста. Время стартов второй сессии с бюджетом продукта печатается
+/// (`ZAM_TIMING`); критерий времени — у `hook_budgets`.
+#[test]
+fn hook_budgets_snapshot_scenarios() {
+    let _g = serial();
+    let srv = Srv::start("snap-scen", &["Анна"], |_| {});
+    let mut report = Vec::new();
+    for (k, name) in ["обычный конец", "/clear", "обрыв"].into_iter().enumerate() {
+        assert_eq!(srv.register(0, GS[k], name), 201);
+        let p = Proj::new(
+            &format!("snap-scen-{k}"),
+            &srv.url,
+            &srv.users[0].token,
+            GS[k],
+            "box",
+        );
+        // запись в решении: дайджест непуст и без раздела снимка
+        srv.insight(
+            0,
+            GS[k],
+            "Пул соединений течёт при панике",
+            "gotcha",
+            json!([]),
+        );
+        std::fs::create_dir_all(p.repo.join("src")).unwrap();
+        std::fs::write(p.repo.join("src/pool.rs"), "pub fn pool() {}\n").unwrap();
+        let t = p.repo.parent().unwrap().join("agent.jsonl");
+        append_lines(
+            &t,
+            &[
+                cl_user("Почини утечку соединений в пуле при панике обработчика"),
+                cl_edit("e1", &p.repo.join("src/pool.rs")),
+                cl_bash("b1", "cargo test -p pool"),
+            ],
+        );
+        let with_t = |mut ev: Value| {
+            ev["transcript_path"] = json!(t);
+            ev
+        };
+        // первая сессия: старт, запрос, правка, `Stop` со снимком
+        let a = format!("scen-a-{k}");
+        let d0 = context(
+            &p.hook(
+                "session-start",
+                &with_t(p.ev("SessionStart", &a, json!({"source": "startup"}))),
+            ),
+            "SessionStart",
+        );
+        assert!(snapshot_section(&d0).is_none(), "{d0}");
+        p.hook(
+            "prompt",
+            &with_t(p.ev(
+                "UserPromptSubmit",
+                &a,
+                json!({"prompt": "Почини утечку соединений в пуле"}),
+            )),
+        );
+        p.hook("pre-tool", &with_t(p.write_ev(&a, "src/pool.rs")));
+        p.hook(
+            "checkpoint",
+            &with_t(p.ev("Stop", &a, json!({"stop_hook_active": true}))),
+        );
+        let (code, v) = srv.call(
+            0,
+            "GET",
+            &format!("/api/v1/sessions/{a}/snapshot"),
+            None,
+            &[],
+        );
+        assert_eq!(
+            code,
+            200,
+            "{name}: снимок `Stop` не дошёл: {v}\n{}",
+            p.log()
+        );
+        let source = match k {
+            0 => {
+                p.hook(
+                    "checkpoint",
+                    &with_t(p.ev("SessionEnd", &a, json!({"reason": "prompt_input_exit"}))),
+                );
+                "startup"
+            }
+            1 => {
+                p.hook(
+                    "checkpoint",
+                    &with_t(p.ev("SessionEnd", &a, json!({"reason": "clear"}))),
+                );
+                "clear"
+            }
+            _ => {
+                // обрыв: работа шла и после последнего снимка, конца сессии нет
+                append_lines(
+                    &t,
+                    &[
+                        cl_user("Теперь добавь тест на возврат соединения"),
+                        cl_edit("e2", &p.repo.join("src/pool.rs")),
+                    ],
+                );
+                "startup"
+            }
+        };
+        if k < 2 {
+            let (code, v) = srv.call(0, "GET", &format!("/api/v1/sessions/{a}"), None, &[]);
+            assert_eq!(code, 200, "{v}");
+            assert!(
+                v["ended_at"].is_string(),
+                "{name}: нет ended_at: {v}\n{}",
+                p.log()
+            );
+        }
+        // первая сессия молчит 11 минут (часы сервера)
+        let _clock =
+            zam_store::time::freeze_now(zam_store::time::now() + Duration::from_secs(11 * 60));
+        // содержимое — со щедрым бюджетом
+        let b = format!("scen-b-{k}");
+        let d1 = context(
+            &p.hook(
+                "session-start",
+                &p.ev("SessionStart", &b, json!({"source": source})),
+            ),
+            "SessionStart",
+        );
+        let section = snapshot_section(&d1);
+        let tokens = section.map_or(0, zam_store::count_tokens);
+        if k < 2 {
+            assert!(
+                section.is_none(),
+                "{name}: раздел снимка после завершённой сессии:\n{d1}"
+            );
+        } else {
+            let sec = section.unwrap_or_else(|| {
+                panic!("{name}: нет раздела снимка:\n{d1}\nhooks.log:\n{}", p.log())
+            });
+            assert!(sec.contains("src/pool.rs"), "{sec}");
+            // догоняющий снимок снял работу после последнего `Stop`
+            assert!(sec.contains("добавь тест на возврат соединения"), "{sec}");
+            assert!(
+                p.log().contains("снимок catch_up:"),
+                "нет догоняющего снимка:\n{}",
+                p.log()
+            );
+            assert!(
+                tokens > 0 && tokens <= 400,
+                "раздел {tokens} токенов:\n{sec}"
+            );
+        }
+        // время старта следующих сессий с бюджетом продукта (справочно)
+        let (mut times, mut shown) = (Vec::new(), 0);
+        for i in 0..12 {
+            let ev = p.ev(
+                "SessionStart",
+                &format!("scen-c-{k}-{i}"),
+                json!({"source": source}),
+            );
+            let (o, tm) = p.hook_times(&p.url, "session-start", &ev);
+            if i < 2 {
+                continue;
+            }
+            times.push(tm.outer);
+            shown += usize::from(out(&o).contains("### Последнее известное состояние"));
+        }
+        report.push(format!(
+            "{name}: раздел снимка {tokens} токенов (оценка сервера), {} символов; дайджест {} \
+             токенов; старт следующей сессии, процесс: {}; раздел в {shown} из {}",
+            section.map_or(0, |s| s.chars().count()),
+            zam_store::count_tokens(&d1),
+            common::stats(&times),
+            times.len(),
+        ));
+    }
+    eprintln!(
+        "ZAM_TIMING m4 snapshot_scenarios:\n  {}",
+        report.join("\n  ")
     );
 }
 
@@ -1253,6 +2139,11 @@ fn hanging_server() -> String {
 /// Критерий M4 «fail-open хуков»: все пять хуков при выключенном (соединение отвергнуто) и
 /// зависшем (соединение есть, ответа нет) сервере — пустой вывод, код 0, время в пределе;
 /// агент никогда не блокируется. Кэш триггеров при этом не портится.
+///
+/// Время (задача 17d, пункт i) — внутри процесса, лучший из трёх вызовов не больше полутора
+/// бюджетов ([`fail_open_max`]): остановка диска повтором снимается, хук, ждущий мёртвый сервер
+/// дольше срока, — нет. Запуск и выход процесса (вне бюджета) меряют `hooks.rs`
+/// (`assert_launch`) и release `hook_budgets`.
 #[test]
 fn fail_open_when_server_down() {
     let _g = serial();
@@ -1262,7 +2153,12 @@ fn fail_open_when_server_down() {
         let p = Proj::new(&format!("fail-{label}"), url, "zam_x", GA, "box");
         let s = format!("fo-{label}");
         // правка в сессии: checkpoint идёт на сервер (GET /sessions), а не молчит сразу
-        let (o, d) = p.hook_at(url, "pre-tool", &p.write_ev(&s, "a.txt"));
+        let (o, d) = p.hook_best(
+            url,
+            "pre-tool",
+            &p.write_ev(&s, "a.txt"),
+            fail_open_max("pre-tool"),
+        );
         empty(&o);
         assert!(d <= fail_open_max("pre-tool"), "{label} pre-tool: {d:?}");
         let cases = [
@@ -1283,9 +2179,14 @@ fn fail_open_when_server_down() {
             ),
         ];
         for (kind, ev) in &cases {
-            let (o, d) = p.hook_at(url, kind, ev);
+            let (o, d) = p.hook_best(url, kind, ev, fail_open_max(kind));
             empty(&o);
-            assert!(d <= fail_open_max(kind), "{label} {kind}: {d:?}");
+            assert!(
+                d <= fail_open_max(kind),
+                "{label} {kind}: {d:?} внутри процесса (лучший из трёх); hooks.log:
+{}",
+                p.log()
+            );
         }
         assert!(
             !p.triggers_path().exists(),

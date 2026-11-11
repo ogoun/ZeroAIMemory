@@ -383,6 +383,7 @@ fn run_noted(env: &Env, s: &Settings, job: Job, send: bool, note: Option<&SendNo
             flush_noted(env, &job.session, note);
         }
     };
+    let unreadable = matches!(taken, Taken::Unreadable);
     let (snap, len) = match taken {
         Taken::Snap(snap, len) => (snap, len),
         Taken::Late => {
@@ -403,7 +404,12 @@ fn run_noted(env: &Env, s: &Settings, job: Job, send: bool, note: Option<&SendNo
             flush_old();
             return;
         }
-        Taken::Missing | Taken::Skipped => {
+        Taken::Missing | Taken::Skipped | Taken::Unreadable => {
+            // журнал есть, а прочитать не удалось — снимка нет, но причина видна (задача 17d,
+            // пункт h: молчаливых исходов у несостоявшегося снимка быть не должно)
+            if unreadable {
+                env.log(&format!("снимок {trigger}: журнал агента не прочитан"));
+            }
             if ended && let Some(mut st) = prev.filter(|p| !p.ended) {
                 st.ended = true;
                 write_state(env, &st_path, &st);
@@ -571,6 +577,8 @@ impl SendNote {
     fn write(&self, env: &Env, line: &str) {
         let mut g = self.lock();
         if !matches!(*g, Stage::Logged) {
+            // точка подмены: запись строки «идёт» под замком (медленный диск)
+            test_point(&env.cache_dir().join("snapshot"), "log-stall-ms");
             env.log(line);
             *g = Stage::Logged;
         }
@@ -591,12 +599,18 @@ impl SendNote {
     /// Снимок при этом в очереди, пока поток её не удалил: уйдёт или повторится со следующим
     /// хуком, `PUT` заменяет снимок целиком. Замок занят — поток пишет строку прямо сейчас: хук
     /// ждёт конца потока и пробует замок ещё раз; снова занят (запись в `hooks.log` дольше
-    /// хвоста) — хук выходит без строки, а строку допишет поток, если успеет до конца процесса.
+    /// хвоста — создание файла на занятом HDD стоит десятки мс) — хук **дожидается замка**, то
+    /// есть конца этой записи: выйди он сейчас, процесс оборвал бы поток посреди записи, и
+    /// неотправленный снимок не оставил бы в журнале ни одной строки (задача 17d, пункт h:
+    /// `put_timeout_reason_uses_actual_limit` с пустым `hooks.log`). Ожидание стоит столько же,
+    /// сколько своя запись строки хуком: замок поток держит только на время одной записи
+    /// ([`SendNote::write`]) и смены этапа.
     /// После своей строки хук отдаёт потоку остаток хвоста (уже без замка): опоздавший успевает
-    /// доработать очередь. Хвост — всё ожидание внутри `late` — не дольше [`EXIT_LOG_RESERVE`] и
-    /// не дольше остатка бюджета: предел ожидания потока уже вышел ([`wait_snapshot`]), и когда
-    /// он свой, а не по бюджету, хук не досиживает до конца бюджета (так было в `76458e3`:
-    /// `snapshot_queue_written_before_state` — хук шёл весь бюджет вместо своего предела).
+    /// доработать очередь. Хвост — ожидание конца потока внутри `late` — не дольше
+    /// [`EXIT_LOG_RESERVE`] и не дольше остатка бюджета: предел ожидания потока уже вышел
+    /// ([`wait_snapshot`]), и когда он свой, а не по бюджету, хук не досиживает до конца бюджета
+    /// (так было в `76458e3`: `snapshot_queue_written_before_state` — хук шёл весь бюджет вместо
+    /// своего предела).
     fn late(&self, env: &Env, done: &std::sync::mpsc::Receiver<()>, event: &str) {
         let until = std::time::Instant::now() + EXIT_LOG_RESERVE;
         self.late_with(env, event, &mut || {
@@ -619,7 +633,8 @@ impl SendNote {
                 match self.stage.try_lock() {
                     Ok(g) => g,
                     Err(TryLockError::Poisoned(e)) => e.into_inner(),
-                    Err(TryLockError::WouldBlock) => return,
+                    // запись строки потоком идёт дольше хвоста: дождаться её конца (см. выше)
+                    Err(TryLockError::WouldBlock) => self.lock(),
                 }
             }
         };
@@ -744,7 +759,8 @@ fn put_ms() -> u64 {
 
 /// Отправка очереди сессии `session` со своим сроком [`SNAPSHOT_PUT_MS`] внутри бюджета хука (не
 /// успел — снимок остаётся в очереди); `None` — нечего отправлять, старый сервер уже ответил
-/// [`OLD_SERVER_ATTEMPTS`] раз, нет клиента или бюджета. Правка очереди по ответу — под замком и
+/// [`OLD_SERVER_ATTEMPTS`] раз или нет клиента (причина уже в журнале); нет остатка бюджета —
+/// `Queued` с причиной. Правка очереди по ответу — под замком и
 /// только если очередь не сменилась за время запроса (новый снимок не трогается). `note` (поток
 /// снимка `checkpoint`) получает начало и конец запроса; `what` — что отправляется.
 fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Option<Sent> {
@@ -753,7 +769,15 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
     if item.old_server >= OLD_SERVER_ATTEMPTS {
         return None;
     }
-    env.http_left().filter(|d| *d >= cache::FLUSH_MIN_LEFT)?;
+    // остатка бюджета на запрос нет — снимок ждёт в очереди, причина — в строке итога (раньше
+    // здесь было «в очереди» без причины; задача 17d, пункт h)
+    if env.http_left().is_none_or(|d| d < cache::FLUSH_MIN_LEFT) {
+        return Some(Sent::Queued(format!(
+            "{} (прошло {} мс)",
+            zam_core::HOOK_BUDGET_SPENT,
+            env.started.elapsed().as_millis()
+        )));
+    }
     let put = Duration::from_millis(put_ms());
     let mut client = env.client_within(put)?;
     // фактический срок запроса — остаток до абсолютного срока клиента (меньшее из своего срока
@@ -903,6 +927,11 @@ pub fn flush_others(env: &Env, except: &[&str]) {
         .collect();
     items.sort_by_key(|x| std::cmp::Reverse(x.0));
     for (_, id) in items.into_iter().take(FLUSH_OTHERS_MAX) {
+        // чужие очереди — попутная работа: без остатка бюджета они молча ждут следующего хука
+        // (строка причины — у снимка самого хука, [`flush`])
+        if env.http_left().is_none_or(|d| d < cache::FLUSH_MIN_LEFT) {
+            break;
+        }
         flush_logged(env, &id);
     }
 }
@@ -1006,7 +1035,9 @@ const EXIT_LOG_RESERVE: Duration = Duration::from_millis(10);
 /// решения ([`job_for_checkpoint`]: сетевая часть хука решения не ждёт), `write-stall-ms` — между
 /// очередью и `snapst-*` в [`run`] (порядок записей при обрыве). Не от журнала, а от кэша
 /// проекта — `<кэш>/snapshot.put-stall-ms`: между концом `PUT` и работой с очередью в [`flush`]
-/// (поток не успел обработать очередь и записать итог до выхода хука).
+/// (поток не успел обработать очередь и записать итог до выхода хука); `<кэш>/snapshot.log-stall-ms`
+/// — в [`SendNote::write`] под замком перед записью строки итога (запись в `hooks.log` дольше
+/// хвоста ожидания хука).
 fn test_point(transcript: &Path, suffix: &str) {
     #[cfg(any(feature = "test-hooks", debug_assertions))]
     if let Some(ms) = std::fs::read_to_string(format!("{}.{suffix}", transcript.display()))
@@ -1317,23 +1348,36 @@ mod tests {
         );
     }
 
-    /// Ревью 2c36319, M2: замок занят и после ожидания (запись в `hooks.log` дольше остатка
-    /// бюджета) — `late` выходит без строки, замок не ждёт и второй раз потока не ждёт.
+    /// Задача 17d (пункт h; отменяет решение ревью 2c36319, M2 «выйти без строки»): замок занят
+    /// и после ожидания (поток пишет строку в `hooks.log` дольше хвоста) — `late` дожидается
+    /// конца записи и своей строки не добавляет. Раньше хук выходил, процесс обрывал поток
+    /// посреди записи, и неотправленный снимок не оставлял в журнале ни одной строки.
     #[test]
-    fn late_gives_up_when_lock_stays_busy() {
+    fn late_waits_for_writer_when_lock_stays_busy() {
         let env = fresh("stuck");
         let n = std::sync::Arc::new(SendNote::default());
         n.sending("снимок stop", Duration::from_millis(100), ago(500));
-        let (release, h) = hold_lock(&n, |_| {});
+        let env2 = env.clone();
+        let (release, h) = hold_lock(&n, move |g| {
+            env2.log("снимок stop, в очереди: срок PUT 100 мс");
+            *g = Stage::Logged;
+        });
+        // «запись» кончается через 200 мс после первого (неудачного) ожидания
+        let mut release = Some(release);
         let mut waits = 0;
         n.late_with(&env, "Stop", &mut || {
             waits += 1;
+            if let Some(r) = release.take() {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = r.send(());
+                });
+            }
             false
         });
-        assert_eq!(waits, 1);
-        assert!(lines(&env).is_empty(), "{:?}", lines(&env));
-        // замок отпущен только после возврата `late`
-        release.send(()).unwrap();
+        // строка потока уже в журнале к возврату `late`; второй строки нет
+        assert_eq!(lines(&env), ["снимок stop, в очереди: срок PUT 100 мс"]);
+        assert_eq!(waits, 2);
         h.join().unwrap();
     }
 }

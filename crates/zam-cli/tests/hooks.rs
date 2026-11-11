@@ -3956,6 +3956,175 @@ fn changed_flush_budget_spent_after_take_is_logged() {
     assert!(queue(&p, s).is_empty(), "{}", p.log());
 }
 
+/// Файлы очередей изменённых файлов проекта (`changed-*.jsonl`) и забранные, но не возвращённые
+/// (`.changed-*.tmp`).
+fn changed_files(p: &Proj) -> (Vec<PathBuf>, usize) {
+    let mut queues = Vec::new();
+    let mut tmp = 0;
+    for e in std::fs::read_dir(p.cache()).unwrap().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with("changed-") && n.ends_with(".jsonl") {
+            queues.push(e.path());
+        } else if n.starts_with(".changed-") && n.ends_with(".tmp") {
+            tmp += 1;
+        }
+    }
+    queues.sort();
+    (queues, tmp)
+}
+
+/// Задача 17d (пункт d): сервер долго недоступен — очереди изменённых файлов копятся у каждой
+/// сессии, а `session-start` отправляет очереди всех сессий проекта. Один хук забирает не больше
+/// `FLUSH_QUEUES_MAX` (8) очередей, старые первыми: иначе разбор (замок, rename, чтение на
+/// очередь) съедал бы бюджет до запроса — очереди не уходили бы и при ожившем сервере, а возврат
+/// шёл бы после срока (замер: +8 мс на очередь, 540 мс при 32 очередях и бюджете 300).
+/// Остальные уходят следующими хуками, ничего не теряется — в том числе у очередей старше часа
+/// (содержимое читается до того, как очередь становится временным файлом).
+#[test]
+fn session_start_takes_bounded_number_of_changed_queues() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"stale":0,"text":""}"#, Duration::ZERO);
+    let p = Proj::new("flush-cap", &url, "zam_x");
+    for i in 0..20 {
+        put_queue(
+            &p,
+            &format!("cap-{i:02}"),
+            &[(format!("src/f{i:02}.rs"), 'a')],
+        );
+        // время файла — порядок «старые первыми» (шаг больше точности времени файловой системы).
+        // Все очереди старше часа (`TMP_TTL`): забранный файл наследует время очереди, и уборка
+        // кэша, идущая у `session-start` параллельно, удаляла его как брошенный временный до
+        // чтения — строки терялись молча (найдено этим тестом: 7 путей из 8)
+        let f = p
+            .session_file("changed", &format!("cap-{i:02}"), ".jsonl")
+            .unwrap();
+        let t = std::time::SystemTime::now() - Duration::from_secs(3 * 3600 - i as u64 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+    let posted = || -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+            .flat_map(|(_, _, b)| {
+                b["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|f| f["path"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let start = |n: usize| {
+        let ev = p.ev(
+            "SessionStart",
+            &format!("cap-new-{n}"),
+            json!({"source": "startup"}),
+        );
+        p.hook("session-start", &ev);
+    };
+    start(0);
+    // первый хук: восемь самых старых очередей одним запросом
+    let mut got = posted();
+    got.sort();
+    let want: Vec<String> = (0..8).map(|i| format!("src/f{i:02}.rs")).collect();
+    assert_eq!(
+        got,
+        want,
+        "{}
+{:?}",
+        p.log(),
+        seen.lock().unwrap()
+    );
+    let (left, tmp) = changed_files(&p);
+    assert_eq!((left.len(), tmp), (12, 0), "{}", p.log());
+    // следующие хуки добирают остальное: всё отправлено ровно по разу
+    start(1);
+    start(2);
+    let mut got = posted();
+    got.sort();
+    let want: Vec<String> = (0..20).map(|i| format!("src/f{i:02}.rs")).collect();
+    assert_eq!(got, want, "{}", p.log());
+    assert_eq!(changed_files(&p), (Vec::new(), 0), "{}", p.log());
+}
+
+/// Задача 17d (пункт d): запрос не состоялся (сервер молчит) — забранные очереди возвращаются на
+/// место **как были**, без замка, чтения и переписывания (жёсткая ссылка): возврат идёт уже
+/// после срока HTTP, и переписывание каждой очереди через временный файл выводило хук за бюджет.
+/// Признак «не переписана» — байты очереди с нестандартной разметкой JSON те же (переписывание
+/// сериализует строки заново). Строка, дописанная во время запроса в новую очередь, не теряется
+/// (ссылка поверх неё не ставится — обычный возврат слиянием).
+#[test]
+fn unsent_changed_queue_returns_untouched() {
+    let _g = serial();
+    let (slow, _seen) = common::stub(200, r#"{"stale":0}"#, Duration::from_secs(3));
+    let p = Proj::new("flush-link", &slow, "zam_x");
+    std::fs::create_dir_all(p.cache()).unwrap();
+    let raw = |i: usize| {
+        format!(
+            "{{ \"path\":   \"src/l{i}.rs\",\"hash\": \"{}\" }}\n",
+            "c".repeat(64)
+        )
+    };
+    let names: Vec<String> = (0..3).map(|i| format!("lk-{i}")).collect();
+    for (i, s) in names.iter().enumerate() {
+        put_queue(&p, s, &[("x".into(), 'a')]);
+        let f = p.session_file("changed", s, ".jsonl").unwrap();
+        std::fs::write(&f, raw(i)).unwrap();
+        // очередь двухдневной давности
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(48 * 3600))
+            .unwrap();
+    }
+    let ev = p.ev("SessionStart", "lk-new", json!({"source": "startup"}));
+    // бюджет 1,5 с при ответе через 3 с: запрос заведомо начат и снят сроком
+    let (o, _) = p.hook_env(
+        &slow,
+        "session-start",
+        "claude",
+        ev.to_string().as_bytes(),
+        &[("ZAM_TEST_HOOK_BUDGET_MS", "1500")],
+    );
+    empty(&o);
+    let log = p.log();
+    assert!(
+        log.contains("files/changed:") && !log.contains("очередь не отправлена"),
+        "запрос очереди не начат: {log}"
+    );
+    let (left, tmp) = changed_files(&p);
+    assert_eq!((left.len(), tmp), (3, 0), "{log}");
+    for (i, s) in names.iter().enumerate() {
+        let f = p.session_file("changed", s, ".jsonl").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            raw(i),
+            "очередь {s} переписана: {log}"
+        );
+        // время изменения обновлено: очередь, которую пытаются отправить, уборка кэша не
+        // считает брошенной (прежде её освежало переписывание)
+        let age = std::fs::metadata(&f)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap_or_default();
+        assert!(
+            age < Duration::from_secs(600),
+            "очередь {s}: время изменения не обновлено ({age:?})"
+        );
+    }
+    assert!(!log.contains("возврат очереди"), "{log}");
+}
+
 // ---- эпохи `session_seen` (M6 §7.2, задача 7a) ----
 
 /// Пометка `/read` о повторной выдаче (§7.3).
@@ -6509,6 +6678,81 @@ fn put_timeout_reason_uses_actual_limit() {
     let (log, _, queued) = put_limit_case("snap-put-limit", Duration::from_secs(3), false);
     put_limit_logged(&log);
     assert!(queued, "{log}");
+}
+
+/// Задача 17d, пункт h (слияние 05f41fc: `put_timeout_reason_uses_actual_limit` упал с пустым
+/// `hooks.log`): поток снимка пишет строку итога под замком, а запись идёт дольше хвоста ожидания
+/// хука (на занятом HDD создание `hooks.log` стоит десятки мс при хвосте 10 мс). Подмена
+/// `log-stall-ms` держит поток под замком 3 с перед записью при бюджете хука 1,5 с; сервер
+/// отвечает на `PUT` 500 сразу, так что поток заведомо в записи, когда предел ожидания хука
+/// выходит. Хук обязан дождаться конца записи: раньше он выходил, процесс обрывал поток, и
+/// неотправленный снимок не оставлял ни одной строки причины. Строка — ровно одна, снимок в
+/// очереди.
+#[test]
+fn snapshot_outcome_survives_slow_log_write() {
+    let _g = serial();
+    let (url, _seen) = snap_stub(500, "");
+    let p = Proj::new("snap-slow-log", &url, "zam_x");
+    let s = "sl-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    let cache = p.repo.join(".zeroaimemory/cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("snapshot.log-stall-ms"), "3000").unwrap();
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    let mut c = p.cmd(&url);
+    c.env("ZAM_TEST_HOOK_BUDGET_MS", "1500")
+        .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+        .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
+        .args(["hook", "checkpoint", "--agent", "claude"])
+        .write_stdin(pc.to_string().into_bytes());
+    let t0 = Instant::now();
+    let o = c.output().unwrap();
+    let d = t0.elapsed();
+    empty(&o);
+    let log = p.log();
+    assert_eq!(
+        log.matches(", в очереди: HTTP 500").count(),
+        1,
+        "строка причины — ровно одна (хук шёл {d:?}): {log:?}"
+    );
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        snap_file(&p, "snapq", s).is_some(),
+        "снимка нет в очереди: {log}"
+    );
+    assert!(d <= LATE_THREAD_MAX, "хук шёл {d:?}: {log}");
+}
+
+/// Задача 17d, пункт h: журнал агента есть, но не читается (открыт другим процессом без
+/// совместного доступа) — снимка нет, но в `hooks.log` строка причины, а не тишина.
+#[cfg(windows)]
+#[test]
+fn snapshot_unreadable_transcript_is_logged() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let _g = serial();
+    let (url, seen) = snap_stub(204, "");
+    let p = Proj::new("snap-unreadable", &url, "zam_x");
+    let s = "ur-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&t)
+        .unwrap();
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    empty(&hook_snap(&p, "checkpoint", &pc));
+    drop(held);
+    let log = p.log();
+    assert_eq!(
+        log.matches("снимок pre_compact: журнал агента не прочитан")
+            .count(),
+        1,
+        "{log:?}"
+    );
+    assert!(puts(&seen).is_empty(), "{log}");
+    assert!(snap_file(&p, "snapq", s).is_none());
 }
 
 /// CI ubuntu (77063ec): срок `PUT` истекает за `HTTP_RESERVE_MS` (30 мс) до конца бюджета, и
