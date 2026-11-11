@@ -11908,10 +11908,11 @@ CHANGELOG, README, `deploy/README-install.md`.
 `.tmp/ci-models`: `zam-server --lib` 287 (+1 ignored), `agent_setup` 15, `mcp` 65,
 `m56_acceptance` 8, `m57_acceptance` 13 — PASS; `zam-core` 26 PASS; `cargo clippy -p zam-core -p
 zam-server --all-targets -- -D warnings` — чисто; `cargo fmt --all --check` — чисто (rustfmt
-только файлов задачи).
+только файлов задачи). WebUI e2e `agent-setup` на release (`npm run build`, `cargo build --release -p zam-server`, отдельно `-p zam-cli`; `E2E_SERVER`/`E2E_ZAM` — сборки задачи) — 3 PASS.
 ### Не сделано / вне задачи
 
 - `crates/zam-cli/tests/init.rs` ждёт маркер `begin v6` (стр. 203, 334, 406, 616, 902, 1117) —
   с v7 эти тесты падают; файл `zam-cli/**` по условию задачи не правился, готовая правка —
   `.tmp/m6/wt-b/.tmp/t13a/zam-cli-init-v7.patch` (замена `v6` → `v7` в шести местах).
 - Строки знания о файле клиента (5, 1755) — вопрос владельцу, клиент не правился.
+- Не запускались: `zam-cli` (в том числе `--test init`, ждёт `v6`), полный `--workspace`, полный e2e, замеры токенов. Описания MCP и блок изменились — расход `tools/list` и блока в eval (13b) переснять на этом коде.
