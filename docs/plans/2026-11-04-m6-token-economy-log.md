@@ -12490,3 +12490,34 @@ zam-server --all-targets -- -D warnings` — чисто; `cargo fmt --all --chec
   `agent_setup` 15, `decisions` 9, `insights` 19, `journals` 13, `mcp` 65; `zam-cli` юниты 186
   (+1), `hooks` 109 — PASS; `cargo clippy -p zam-cli -p zam-server --all-targets -D warnings` —
   чисто.
+### Задача 13a, Minor повторного ревью (2026-11-11)
+
+- **m1 (регресс WebUI).** `PATCH /entries/{id}` проверяет `data` insight через
+  `check_insight_data_patch(d, stored)`: ADR-ключ верхнего уровня, который уже лежит в
+  сохранённой записи (решения до M6, данные `gotcha`/`experiment`), правке не мешает — 422 только
+  за новые ключи. Certify с evidence и «очистить ADR» в WebUI у таких записей проходят. WebUI при
+  `supersede` в `decision` ключи ADR верхнего уровня прежней записи **не копирует**
+  (`web/src/lib/adrData.ts`, `supersedeData`; `InsightsView.svelte`). Выбрано «не копировать», а
+  не «перенести в `data.decision`»: сервер эти ключи как ADR никогда не читал (форма показывает
+  только `data.decision`), перенос дал бы решение, которого человек в форме не видел и не
+  подтверждал, и мог бы не пройти проверку типов `DecisionData` (произвольные данные `gotcha`).
+- **m2.** Создание и `supersede` у `decision`: ADR-ключ на верхнем уровне — 422 и рядом с
+  `data.decision` (раньше — только без него). Тексты выровнены: `guide.{ru,en}` «422, даже рядом
+  с `data.decision`», описание `data.kind` — «и рядом с data.decision» (298 символов).
+- **m3.** «Без locator — оглавление» уже покрыто: REST — `read_attachments::read_attachment_toc_without_locator`,
+  MCP — `mcp::mcp_read_locator` (вызов без `locator`). Добавлено: `mcp_v7_descriptions_focus_seen_rejected`
+  проверяет описание поля `locator` (`page:N`, `slide:N`, `para:N`, `sheet:`, «без locator —
+  оглавление») и поля `focus` («один и тот же текст на пачку»).
+- **Тесты.** `decisions::decision_top_level_keys_mixed_and_patch` (смесь — 422 при создании и
+  `supersede`; старая запись с ключами сверху — `PATCH` 200 с evidence и с `decision: null`; новый
+  верхний ключ — 422); WebUI `test/adrData.test.ts` (3 случая, в `test:build`).
+- **Откаты** (`rollback3.ps1`, `rb-D.log`, `restored=True`): строгая проверка в `PATCH` → тест
+  `decision_top_level_keys_mixed_and_patch` FAIL; верхние ключи не проверяются при наличии
+  `data.decision` → он же FAIL; `supersedeData` копирует ключи ADR → 2 из 3 тестов `adrData` FAIL.
+- **Прогоны** (`c4.log`): `cargo fmt --all --check` — чисто; `zam-server` `--lib` 287 (+1),
+  `agent_setup` 15, `decisions` 10, `insights` 19, `journals` 13, `mcp` 65, `transfer_import` 45 —
+  PASS; `cargo clippy -p zam-cli -p zam-server --all-targets -D warnings` — чисто; WebUI
+  `npm run check` — без ошибок, `test:build` — 47 PASS. e2e `working-memory` на release (`npm run build`, `--release -p zam-server`, отдельно `-p zam-cli`) — 7 PASS.
+- **→ 13c:** ТЗ §5.1/§7.x и CHANGELOG — 422 за ADR-ключи на верхнем уровне `data` у решения
+  (создание, `supersede`; `PATCH` — только новые ключи); в WebUI замещение решения не переносит
+  такие ключи.

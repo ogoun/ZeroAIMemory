@@ -787,3 +787,67 @@ async fn decision_adr_fields_at_top_level_rejected() {
                    "data": {"kind": "gotcha", "chosen": "x", "options": ["a"]}});
     created(post(&a, g).await).await;
 }
+
+/// m2: ADR-ключ на верхнем уровне — 422 и рядом с `data.decision` (создание и `supersede`).
+/// m1: `PATCH` записи, где такие ключи уже лежат (запись до M6), проходит; новый верхний ключ —
+/// 422 (ревью задачи 13a M6).
+#[tokio::test]
+async fn decision_top_level_keys_mixed_and_patch() {
+    let a = api("decisions-adr-patch", |_| {}).await;
+    // часть в data.decision, часть сверху — 422
+    let mut mixed = decision("ADR: смесь", "b", Some(json!({"chosen": "A"})), json!({}));
+    mixed["data"]["options"] = json!(["A", "B"]);
+    unprocessable(
+        &post(&a, mixed.clone()).await,
+        "data.options: поля решения — в data.decision",
+    );
+    let base =
+        created(post(&a, decision("ADR: база2", "b", Some(json!({})), json!({}))).await).await;
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/entries/{}/supersede", id(&base)),
+            Some(mixed),
+        )
+        .await;
+    unprocessable(&r, "data.options: поля решения — в data.decision");
+
+    // «старая» запись: ключи сверху уже лежат (gotcha с данными, затем вид decision правкой)
+    let g = created(
+        post(
+            &a,
+            json!({"kind": "insight", "title": "Старая запись", "body": "b",
+                   "data": {"kind": "gotcha", "rationale": "старое", "options": ["x"]}}),
+        )
+        .await,
+    )
+    .await;
+    let uri = format!("/api/v1/entries/{}", id(&g));
+    let patch = |data: Value| {
+        let a = &a;
+        let uri = uri.clone();
+        async move {
+            a.tok_rev(&a.token, Method::PATCH, &uri, Some(json!({"data": data})))
+                .await
+        }
+    };
+    let legacy = json!({"kind": "decision", "rationale": "старое", "options": ["x"]});
+    let r = patch(legacy.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // правка без новых верхних ключей (evidence, «очистить ADR») — 200
+    let mut ev = legacy.clone();
+    ev["evidence"] = json!({"checked": "c", "method": "m", "result": "r"});
+    let r = patch(ev.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let mut cleared = ev.clone();
+    cleared["decision"] = Value::Null;
+    let r = patch(cleared.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // новый ключ сверху — 422
+    let mut add = cleared;
+    add["chosen"] = json!("y");
+    unprocessable(
+        &patch(add).await,
+        "data.chosen: поля решения — в data.decision",
+    );
+}

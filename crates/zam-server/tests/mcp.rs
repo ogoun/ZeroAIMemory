@@ -4103,6 +4103,20 @@ async fn mcp_v7_descriptions_focus_seen_rejected() {
     ] {
         assert!(d.contains(w), "memory_read: нет «{w}»: {d}");
     }
+    // поля элемента: формы locator (zam_docs::Locator::parse), оглавление без locator, один focus
+    let item = &read["inputSchema"]["properties"]["items"]["items"]["properties"];
+    let loc = item["locator"]["description"].as_str().unwrap();
+    for w in [
+        "page:N",
+        "slide:N",
+        "para:N",
+        "sheet:",
+        "без locator — оглавление",
+    ] {
+        assert!(loc.contains(w), "locator: нет «{w}»: {loc}");
+    }
+    let focus = item["focus"]["description"].as_str().unwrap();
+    assert!(focus.contains("один и тот же текст на пачку"), "{focus}");
     let search = tool_def(&a, "memory_search").await;
     let d = search["description"].as_str().unwrap();
     assert!(

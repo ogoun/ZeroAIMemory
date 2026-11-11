@@ -47,6 +47,7 @@
     type Adr,
   } from '../lib/journals';
   import { go } from '../lib/router';
+  import { supersedeData } from '../lib/adrData';
 
   interface Props {
     user: string;
@@ -342,10 +343,8 @@
     const c = cur;
     if (!c) return;
     act(async () => {
-      const data: Record<string, unknown> = { ...c.data, kind: sKind };
-      const decision = sKind === 'decision' ? adrPayload() : null;
-      if (decision) data.decision = decision;
-      else delete data.decision;
+      // у решения ключи ADR верхнего уровня прежней записи не копируются (422 сервера)
+      const data = supersedeData(c.data, sKind, sKind === 'decision' ? adrPayload() : null);
       const r = await supersedeEntry(user, c.id, {
         title: sTitle.trim(),
         body: sBody,

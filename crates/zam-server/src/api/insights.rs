@@ -126,7 +126,22 @@ pub struct InsightReq {
 /// `data` insight: `kind` из [`INSIGHT_KINDS`]; `experiment` и `evidence`, если заданы, —
 /// объекты; `experiment.result` — `confirmed | refuted | inconclusive`; у `decision` —
 /// `decision` по правилам [`DecisionData`].
+///
+/// Поля ADR на верхнем уровне `data` решения ([`DECISION_TOP_LEVEL`]) сервер не читает —
+/// 422, даже если `data.decision` есть (создание и `supersede`; ревью задачи 13a M6, I1, m2).
+/// Правку `PATCH` проверяет [`check_insight_data_patch`].
 pub fn check_insight_data(data: &Value) -> Result<(), ApiError> {
+    check_insight_data_with(data, |_| false)
+}
+
+/// `data` insight в `PATCH /entries/{id}`: как [`check_insight_data`], но ADR-ключи верхнего
+/// уровня, которые уже лежат в сохранённой записи (`stored`, записи до M6), правке не мешают —
+/// 422 только за новые (ревью задачи 13a M6, m1).
+pub fn check_insight_data_patch(data: &Value, stored: &Value) -> Result<(), ApiError> {
+    check_insight_data_with(data, |k| stored.get(k).is_some())
+}
+
+fn check_insight_data_with(data: &Value, kept: impl Fn(&str) -> bool) -> Result<(), ApiError> {
     let o = data
         .as_object()
         .ok_or_else(|| unprocessable("data должно быть JSON-объектом"))?;
@@ -155,20 +170,19 @@ pub fn check_insight_data(data: &Value) -> Result<(), ApiError> {
     }
     // ADR-поля — только у решений
     if kind == Some("decision") {
-        match o.get("decision").filter(|d| !d.is_null()) {
-            Some(d) => {
-                DecisionData::parse(d)?;
-            }
-            // поля ADR на верхнем уровне `data` сервер не читает — запись вышла бы без решения
-            // (ревью задачи 13a M6, I1)
-            None => {
-                if let Some(k) = DECISION_TOP_LEVEL.iter().find(|k| o.contains_key(**k)) {
-                    return Err(unprocessable(format!(
-                        "data.{k}: поля решения — в data.decision \
-                         ({{kind: \"decision\", decision: {{options, chosen, rationale, …}}}})"
-                    )));
-                }
-            }
+        // поля ADR на верхнем уровне `data` сервер не читает — запись вышла бы без решения или
+        // с его частью (ревью задачи 13a M6, I1, m2); старые ключи записи — не помеха правке
+        if let Some(k) = DECISION_TOP_LEVEL
+            .iter()
+            .find(|k| o.contains_key(**k) && !kept(k))
+        {
+            return Err(unprocessable(format!(
+                "data.{k}: поля решения — в data.decision \
+                 ({{kind: \"decision\", decision: {{options, chosen, rationale, …}}}})"
+            )));
+        }
+        if let Some(d) = o.get("decision").filter(|d| !d.is_null()) {
+            DecisionData::parse(d)?;
         }
     }
     Ok(())
