@@ -368,3 +368,54 @@ async fn reliable_only_boosts_theorem_axiom() {
         assert!((score_of(&v, name) - want).abs() < 1e-3, "{name}: {j}");
     }
 }
+
+/// Ревью задачи 10 (передача в задачу 16 M6): подграф `contradicts` кандидатов с бустом вида
+/// обрезан пределом `GRAPH_MAX_NODES` — связь сверх предела не видна. Молча это не проходит:
+/// в ответе предупреждение `contradicts graph truncated`; исключения, найденные в пределах
+/// (гипотеза `hyp` против теоремы `thm`), действуют — выдача та же, что до обрезки.
+#[tokio::test]
+async fn unless_contradicted_warns_on_truncated_graph() {
+    use zam_server::api::search::graph::WARN_KIND_GRAPH_TRUNCATED;
+    let (a, ids) = kind_world("kb-uc-trunc", |c| {
+        c.search.kind_boost_mode = KindBoostMode::UnlessContradicted;
+    })
+    .await;
+    let q = json!({"query": "сборка кэша", "rerank": "off", "top_k": 10});
+    let warned = |j: &Value| {
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(WARN_KIND_GRAPH_TRUNCATED))
+    };
+    let before = search(&a, q.clone()).await;
+    assert!(!warned(&before), "{before}");
+    // соседей `hyp` по `contradicts` — больше предела подграфа; запросом они не находятся
+    let hyp = ids.iter().find(|(_, n)| *n == "hyp").unwrap().0.clone();
+    for n in 0..=zam_store::GRAPH_MAX_NODES {
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/spaces/knowledge/entries",
+                Some(
+                    json!({"kind": "insight", "title": format!("Посторонняя запись {n}"),
+                            "body": format!("Наполнитель графа номер {n}."),
+                            "data": {"kind": "discovery"}, "force": true}),
+                ),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        let id = r.json()["id"].as_str().unwrap().to_string();
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/edges",
+                Some(json!({"src": format!("e:{hyp}"), "type": "contradicts",
+                            "dst": format!("e:{id}")})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    let after = search(&a, q).await;
+    assert!(warned(&after), "{after}");
+    assert_eq!(named(&after, &ids), named(&before, &ids));
+}

@@ -5,19 +5,18 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Entry, EntryStatus } from '../src/lib/api.ts';
 import {
+  IDEA_ACTIVE,
   IDEA_FORMS,
+  IDEA_TABS,
   decisionNotice,
   decisionOf,
-  deferDefault,
-  deferError,
-  deferMin,
   ideaButtons,
   originOf,
   priorityOf,
   releasedOf,
-  sharedWarning,
   tagsOf,
 } from '../src/lib/ideaButtons.ts';
+import { DEFER_FORM, START_SUBMIT, deferDefault, deferError, deferMin, sharedWarning, utcDate } from '../src/lib/ideaForms.ts';
 
 const acts = (status: EntryStatus | null, agent = false, released = false) =>
   ideaButtons(status, agent, released).map((b) => b.act);
@@ -42,6 +41,20 @@ test('ideaButtons: состав и порядок кнопок по состоя
   assert.deepEqual(acts('proposed', true), ['defer', 'decline']);
 });
 
+test('ideaButtons: «начать» и «отложить» — ровно у активных статусов (IDEA_ACTIVE)', () => {
+  assert.deepEqual(IDEA_ACTIVE, ['new', 'proposed', 'deferred']);
+  const all: (EntryStatus | null)[] = ['new', 'proposed', 'deferred', 'accepted', 'declined', 'done', 'open', null];
+  for (const s of all) {
+    const active = s !== null && IDEA_ACTIVE.includes(s);
+    assert.equal(acts(s).includes('start'), active, `start у ${s}`);
+    assert.equal(acts(s).includes('defer'), active, `defer у ${s}`);
+  }
+  assert.deepEqual(
+    IDEA_TABS.map((t) => t.id),
+    ['human', 'agent', 'all'],
+  );
+});
+
 test('ideaButtons: подписи и вид кнопок', () => {
   const by = Object.fromEntries(ideaButtons('deferred', false, false).map((b) => [b.act, b]));
   assert.deepEqual(by.start, { act: 'start', title: 'Начать', cls: 'primary' });
@@ -59,13 +72,20 @@ test('формы решения: подписи для вёрстки и e2e', (
   assert.deepEqual(IDEA_FORMS.reopen, { aria: 'Вернуть идею', title: 'Вернуть в новые', submit: 'Вернуть' });
   assert.deepEqual(IDEA_FORMS.edit, { aria: 'Правка идеи', title: 'Изменить идею', submit: 'Сохранить' });
   assert.deepEqual(IDEA_FORMS.create, { aria: 'Новая идея', title: 'Новая идея', submit: 'Записать' });
+  // общие с «Вопросами» подписи — одни и те же объекты, не копии
+  assert.equal(IDEA_FORMS.defer, DEFER_FORM);
+  assert.equal(IDEA_FORMS.start.submit, START_SUBMIT);
 });
 
 test('отложить: дата UTC по умолчанию, наименьшая и проверка', () => {
   const now = Date.UTC(2026, 10, 10, 23, 30);
   assert.equal(deferDefault(now), '2026-12-10');
   assert.equal(deferMin(now), '2026-11-11');
-  // без `now` — от текущего момента, как `utcDate` журналов
+  // одна функция даты на «отложить» и на формы: `deferMin` — это `utcDate(1)`
+  assert.equal(utcDate(0, now), '2026-11-10');
+  assert.equal(deferMin(now), utcDate(1, now));
+  assert.equal(deferDefault(now), utcDate(30, now));
+  // без `now` — от текущего момента
   const day = (n: number) => new Date(Date.now() + n * 86_400_000).toISOString().slice(0, 10);
   assert.ok([day(30), day(31)].includes(deferDefault()));
   assert.ok([day(1), day(2)].includes(deferMin()));
@@ -76,18 +96,15 @@ test('отложить: дата UTC по умолчанию, наименьша
 });
 
 test('decisionOf: решение и поля запроса по форме', () => {
-  const now = Date.UTC(2026, 10, 10, 12);
   const f = { horizon: '2026-12-01', reason: '  уже не нужно ', space: 'knowledge' };
-  assert.deepEqual(decisionOf('start', f, now), { decision: 'accept', opts: { space: 'knowledge' } });
-  assert.deepEqual(decisionOf('defer', f, now), { decision: 'defer', opts: { horizon: '2026-12-01' } });
-  assert.deepEqual(decisionOf('defer', { ...f, horizon: '2026-11-10' }, now), {
-    error: 'Дата — не раньше 2026-11-11 (UTC).',
-  });
+  assert.deepEqual(decisionOf('start', f), { decision: 'accept', opts: { space: 'knowledge' } });
+  // дату «отложить» проверяет вызывающий (`deferError`), здесь — только поля запроса
+  assert.deepEqual(decisionOf('defer', f), { decision: 'defer', opts: { horizon: '2026-12-01' } });
   // причина отказа необязательна, возврата — обязательна; пробелы по краям срезаются
-  assert.deepEqual(decisionOf('decline', f, now), { decision: 'decline', opts: { reason: 'уже не нужно' } });
-  assert.deepEqual(decisionOf('decline', { ...f, reason: '  ' }, now), { decision: 'decline', opts: {} });
-  assert.deepEqual(decisionOf('reopen', f, now), { decision: 'reopen', opts: { reason: 'уже не нужно' } });
-  assert.deepEqual(decisionOf('reopen', { ...f, reason: ' ' }, now), { error: 'Укажите причину.' });
+  assert.deepEqual(decisionOf('decline', f), { decision: 'decline', opts: { reason: 'уже не нужно' } });
+  assert.deepEqual(decisionOf('decline', { ...f, reason: '  ' }), { decision: 'decline', opts: {} });
+  assert.deepEqual(decisionOf('reopen', f), { decision: 'reopen', opts: { reason: 'уже не нужно' } });
+  assert.deepEqual(decisionOf('reopen', { ...f, reason: ' ' }), { error: 'Укажите причину.' });
 });
 
 test('decisionNotice: текст итога решения', () => {

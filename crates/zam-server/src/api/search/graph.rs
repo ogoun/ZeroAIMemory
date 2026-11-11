@@ -225,12 +225,22 @@ pub(super) struct KindCandidate {
     pub boosted: bool,
 }
 
+/// Предупреждение ответа поиска: граф `contradicts` кандидатов с бустом вида обрезан пределом
+/// подграфа — исключения `unless_contradicted` могли примениться не все ([`kind_boost_exempt`]).
+pub const WARN_KIND_GRAPH_TRUNCATED: &str = "contradicts graph truncated";
+
 /// Цели без буста вида при `search.kind_boost_mode = unless_contradicted` (M6 §10): кандидат с
 /// бустом вида, связанный `contradicts` (в любую сторону **[решение исполнителя]**: связь —
 /// противоречие, направление в данных — от гипотезы к теореме) с действующей записью, которая
 /// надёжнее его по [`contradicts_applies`] и тоже среди кандидатов `cands` — всех после слияния,
-/// до отсечения `top_k` (не только видимых). Граф читается от кандидатов с бустом; сбой чтения
-/// графа чужого решения исключает решение ([`Health::soft`]).
+/// до отсечения `top_k` (не только видимых). Граф читается от кандидатов с бустом.
+///
+/// - Сбой чтения графа **чужого** решения решение не исключает (ревью задачи 10): исключений у
+///   его кандидатов нет — буст как при `always`, в журнал — WARN. Сбой личной базы — ошибка
+///   запроса, как у остальных чтений.
+/// - Подграф обрезан пределами `zam_store::GRAPH_MAX_NODES` / `GRAPH_MAX_EDGES` (`truncated`):
+///   связь сверх предела не видна, и исключение по ней не применяется — найденные исключения
+///   действуют, в журнал — WARN, в ответ — предупреждение [`WARN_KIND_GRAPH_TRUNCATED`].
 pub(super) async fn kind_boost_exempt(
     health: &mut Health<'_>,
     cands: &[KindCandidate],
@@ -256,9 +266,28 @@ pub(super) async fn kind_boost_exempt(
         let r =
             t.db.neighbors(&boosted, 1, &[EdgeType::Contradicts], &t.space_ids())
                 .await;
-        let Some(g) = health.soft(ti, r)? else {
-            continue;
+        let g = match r {
+            Ok(g) => g,
+            Err(e) => match &t.solution {
+                // чужое решение остаётся в выдаче: без исключений буст вида — как при `always`
+                Some(_) => {
+                    tracing::warn!(
+                        error = %e,
+                        "поиск: граф contradicts чужого решения не прочитан — буст вида без исключений"
+                    );
+                    continue;
+                }
+                None => return Err(e.into()),
+            },
         };
+        if g.truncated {
+            tracing::warn!(
+                nodes = g.nodes.len(),
+                edges = g.edges.len(),
+                "поиск: граф contradicts обрезан пределом — исключения буста вида неполны"
+            );
+            health.warnings.push(WARN_KIND_GRAPH_TRUNCATED.into());
+        }
         let rel = reliabilities(&g);
         for e in &g.edges {
             let Some(d) = e.dst.filter(|_| e.kind == EdgeType::Contradicts) else {

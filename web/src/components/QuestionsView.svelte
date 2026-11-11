@@ -18,7 +18,7 @@
     type Entry,
     type Space,
   } from '../lib/api';
-  import { IDEA_FORMS, deferDefault, deferError, deferMin, sharedWarning } from '../lib/ideaButtons';
+  import { DEFER_FORM, START_SUBMIT, deferDefault, deferError, deferMin, sharedWarning } from '../lib/ideaForms';
   import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime } from '../lib/journals';
   import { href } from '../lib/router';
 
@@ -239,18 +239,18 @@
             {@const sp = sharedTarget(q)}
             <div class="row" role="group" aria-label="Подтверждение «начать»">
               <p class="warn" data-testid="shared-warning">{sharedWarning(sp?.name ?? '')}</p>
-              <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>{IDEA_FORMS.start.submit}</button>
+              <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>{START_SUBMIT}</button>
               <button type="button" onclick={() => (confirmFor = '')}>Отмена</button>
             </div>
           {/if}
           {#if deferFor === q.id}
-            <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label={IDEA_FORMS.defer.aria}>
+            <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label={DEFER_FORM.aria}>
               <label class="row">
                 Не раньше
                 <input type="date" bind:value={deferDate} min={deferMin()} required aria-label="Отложить до" />
                 <span class="muted small" title="Даты хранятся в UTC">UTC</span>
               </label>
-              <button type="submit" disabled={busy !== ''}>{IDEA_FORMS.defer.submit}</button>
+              <button type="submit" disabled={busy !== ''}>{DEFER_FORM.submit}</button>
               <button type="button" onclick={() => (deferFor = '')}>Отмена</button>
             </form>
           {/if}

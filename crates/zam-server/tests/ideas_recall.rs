@@ -1589,7 +1589,13 @@ async fn idea_hints_top5_match_m57() {
         "расхождения с эталоном M5.7:\n{}",
         diffs.join("\n")
     );
-    assert!(compared >= 40, "сравнено {compared}");
+    let rows = fx["rows"].as_array().unwrap().len();
+    assert_eq!(
+        compared + stop_verb.len(),
+        rows,
+        "каждая строка эталона учтена"
+    );
+    assert!(compared >= 70, "сравнено {compared}");
     assert!(
         verb_wrong.is_empty(),
         "подсказка по общим глаголам:\n{}",

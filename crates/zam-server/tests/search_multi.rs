@@ -883,3 +883,68 @@ async fn bench_vector_scopes() {
         );
     }
 }
+
+/// Ревью задачи 10 (передача в задачу 16 M6): сбой чтения графа `contradicts` чужого решения
+/// при `kind_boost_mode = unless_contradicted` решение из выдачи не исключает — исключений буста
+/// вида у его кандидатов нет (буст как при `always`), предупреждения `solution unavailable` нет.
+/// Владельцу сбой его личной базы — ошибка запроса. Порядок по `contradicts` выключен: он читает
+/// тот же граф и исключил бы решение сам.
+#[tokio::test]
+async fn kind_boost_graph_failure_keeps_foreign_solution() {
+    let w = world_with("kind-graph", |c| {
+        c.search.kind_boost_mode = zam_search::KindBoostMode::UnlessContradicted;
+        c.search.contradicts_order = false;
+        c.search.brief_min_rel = 0.0;
+    })
+    .await;
+    w.shared().await;
+    for (kind, title) in [("gotcha", "Грабли"), ("discovery", "Наблюдение")] {
+        let r = w
+            .req(
+                &w.a_tok,
+                Method::POST,
+                &format!("/api/v1/spaces/{G}/entries"),
+                Some(
+                    json!({"kind": "insight", "title": format!("{title} про {WORD}"),
+                            "body": format!("{title}: {WORD} прячется в кустах."),
+                            "data": {"kind": kind}, "force": true}),
+                ),
+            )
+            .await;
+        sid(&r);
+    }
+    let body = json!({"query": WORD, "scope": {"solution": G}, "filters": {"kinds": ["insight"]}});
+    let entries = |j: &Value| -> Vec<(String, String)> {
+        j["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{j}"))
+            .iter()
+            .map(|i| {
+                (
+                    i["entry_id"].as_str().unwrap().to_string(),
+                    i["score"].to_string(),
+                )
+            })
+            .collect()
+    };
+    let before = w.search(&w.b_tok, body.clone()).await;
+    assert_eq!(entries(&before).len(), 2, "{before}");
+    assert_eq!(before["warnings"], json!([]), "{before}");
+    let a: Id = w.a_id.parse().unwrap();
+    let db = w.a.st.users.get(a).await.unwrap();
+    db.write(|tx| {
+        tx.execute_batch("ALTER TABLE edges RENAME TO edges_broken")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    // участнику: решение на месте, состав и баллы прежние, предупреждений нет
+    let after = w.search(&w.b_tok, body.clone()).await;
+    assert_eq!(entries(&after), entries(&before), "{after}");
+    assert_eq!(after["warnings"], json!([]), "{after}");
+    // владельцу сбой его личной базы — ошибка запроса
+    let r =
+        w.a.tok(&w.a_tok, Method::POST, "/api/v1/search", Some(body))
+            .await;
+    assert!(r.status.is_server_error(), "{} {}", r.status, r.text());
+}

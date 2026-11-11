@@ -1476,20 +1476,20 @@ struct IdeaQuery {
     /// Значимые слова запроса: [`prepared_terms`] при [`WordMatch::Stems`] (без служебных слов
     /// ru/en, `ё` → `е`, без повторов) и без слов на стоп-основу ([`is_idea_stop`]).
     words: Vec<StemWord>,
-    /// Слов запроса вместе со словами на стоп-основу — знаменатель порога покрытия, как у M5.7.
-    total: usize,
+    /// Слова запроса на стоп-основу: совпадением не считаются; не совпавшие с идеей остаются в
+    /// знаменателе порога покрытия ([`IdeaQuery::matches`]).
+    stops: Vec<StemWord>,
 }
 
 impl IdeaQuery {
     fn new(terms: &[String]) -> IdeaQuery {
-        let all = prepared_terms(terms, WordMatch::Stems);
+        let (stops, words): (Vec<String>, Vec<String>) = prepared_terms(terms, WordMatch::Stems)
+            .into_iter()
+            .partition(|w| is_idea_stop(w));
+        let stems = |v: Vec<String>| v.into_iter().map(StemWord::new).collect();
         IdeaQuery {
-            total: all.len(),
-            words: all
-                .into_iter()
-                .filter(|w| !is_idea_stop(w))
-                .map(StemWord::new)
-                .collect(),
+            words: stems(words),
+            stops: stems(stops),
         }
     }
 
@@ -1509,12 +1509,16 @@ impl IdeaQuery {
     /// ([`StemWord`], задача 9 M6).
     ///
     /// Слова запроса на стоп-основу ([`is_idea_stop`], M6 §16) совпадением не считаются — ни с
-    /// заголовком, ни с телом, — но остаются в знаменателе порога покрытия **[решение
-    /// исполнителя задачи 16]**: если их убрать и из знаменателя, порог `⌈n / 3⌉` падает, и
-    /// возвращается ложная подсказка таблицы I-1″ («fix the server crash when this config is
-    /// missing from the web request» к «Dark theme for the web interface»: 7 слов → порог 3, без
-    /// «fix» 6 слов → порог 2 при двух случайных совпадениях). Слова идеи не фильтруются: слово
-    /// запроса «тестирование» находит идею со словом «тесты».
+    /// заголовком, ни с телом. В знаменателе порога покрытия остаются только те из них, что с
+    /// идеей **не совпали** **[решение исполнителя задачи 16, правка ревью]**:
+    /// - убрать все — порог `⌈n / 3⌉` падает, и возвращается ложная подсказка таблицы I-1″
+    ///   («fix the server crash when this config is missing from the web request» к «Dark theme
+    ///   for the web interface»: 7 слов → порог 3, без «fix» 6 слов → порог 2 при двух случайных
+    ///   совпадениях; «fix» с идеей не совпадает — остаётся);
+    /// - оставить все — двойной штраф: «update», совпавшее с «updates» идеи, и в числитель не
+    ///   идёт, и порог поднимает; такое слово нейтрально — вне числителя и знаменателя.
+    ///
+    /// Слова идеи не фильтруются: слово запроса «тестирование» находит идею со словом «тесты».
     fn matches(&self, title: &str, body: &str) -> bool {
         let q = &self.words;
         if q.is_empty() {
@@ -1532,7 +1536,12 @@ impl IdeaQuery {
         if covered == q.len() {
             return true;
         }
-        let query_need = IDEA_QUERY_RULE.need(self.total);
+        let stray_stops = self
+            .stops
+            .iter()
+            .filter(|t| !words.iter().any(|w| t.matches(w)))
+            .count();
+        let query_need = IDEA_QUERY_RULE.need(q.len() + stray_stops);
         let k = words.len().min(IDEA_WORDS_CAP);
         covered >= query_need.min(k.div_ceil(2).max(1))
     }
@@ -4612,13 +4621,13 @@ mod tests {
         for (s, w) in IDEA_STOP_STEMS.iter().zip(forms) {
             assert_eq!(stem(w), *s, "{w}");
         }
-        // значимые слова запроса и знаменатель порога (со словами на стоп-основу)
+        // значимые слова запроса и слова на стоп-основу
         let words = |t: &str| {
             let q = IdeaQuery::new(&error_terms(t));
-            (q.words.len(), q.total)
+            (q.words.len(), q.stops.len())
         };
-        assert_eq!(words("Добавьте тесты на модуль авторизации"), (1, 4));
-        assert_eq!(words("update the changelog and the makefile"), (2, 3));
+        assert_eq!(words("Добавьте тесты на модуль авторизации"), (1, 3));
+        assert_eq!(words("update the changelog and the makefile"), (2, 1));
         assert_eq!(words("fix tests"), (0, 2));
         assert!(IdeaQuery::new(&error_terms("fix tests")).is_empty());
     }
@@ -4676,15 +4685,42 @@ mod tests {
             "Добавить тесты на модуль оплаты",
             "Замысел."
         ));
-        // слово на стоп-основу остаётся в знаменателе порога: без «fix» порог ⌈6/3⌉ = 2 вернул бы
-        // ложную подсказку таблицы I-1″ (совпадают только «server» и «web»)
+        // слово на стоп-основу, не совпавшее с идеей, остаётся в знаменателе порога: без «fix»
+        // порог ⌈6/3⌉ = 2 вернул бы ложную подсказку таблицы I-1″ (совпадают только «server» и
+        // «web»)
         let q = "fix the server crash when this config is missing from the web request";
         let iq = IdeaQuery::new(&error_terms(q));
-        assert_eq!((iq.words.len(), iq.total), (6, 7));
+        assert_eq!((iq.words.len(), iq.stops.len()), (6, 1));
         assert!(!iq.matches(
             "Dark theme for the web interface",
             "This would make the server UI nicer."
         ));
+    }
+
+    /// Ревью задачи 16 (Minor 2): слово запроса на стоп-основу, **совпавшее** со словом идеи,
+    /// нейтрально — ни в числителе, ни в знаменателе порога. Иначе двойной штраф: «update» и
+    /// «testing» совпадением не считаются и при этом поднимают порог с 2 до 3, и запрос с двумя
+    /// значимыми совпадениями («checklist», «payment») идею теряет, хотя M5.7 её находил.
+    #[test]
+    fn idea_stop_matched_word_is_neutral() {
+        let title = "Testing checklist for payment provider updates";
+        let body = "A short manual checklist to run on the stand before switching the payment \
+                    gateway API version.";
+        let q = "update testing checklist for payment, linter docs and deploy";
+        let iq = IdeaQuery::new(&error_terms(q));
+        // значимых слов 5 (checklist, payment, linter, docs, deploy), на стоп-основу — 2
+        assert_eq!((iq.words.len(), iq.stops.len()), (5, 2));
+        assert!(iq.matches(title, body), "порог 2 от пяти значимых слов");
+        // те же слова на стоп-основу к идее без них — в знаменателе: 5 + 2 = 7 слов → порог 3
+        let other = "Checklist for the payment provider";
+        let other_body = "A short manual list to run on the stand before switching the gateway.";
+        assert!(
+            !iq.matches(other, other_body),
+            "порог 3 при двух совпадениях"
+        );
+        // и одно несовпавшее слово на стоп-основу («add») порог не меняет: 5 + 1 = 6 → 2
+        let q2 = "add testing checklist for payment, linter docs and deploy";
+        assert!(IdeaQuery::new(&error_terms(q2)).matches(title, body));
     }
 
     /// Порог подтверждения ограничен словами идеи: длинный запрос к короткой идее подходит.

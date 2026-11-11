@@ -5,7 +5,8 @@
   // Карточка: «Начать» (decide accept — задача и ссылка на неё; у идеи Knowledge — выбор
   // решения с предупреждением об общем), «Отложить» (дата UTC), «Отказаться», «Вернуть»,
   // «Принять как свою» (у «от агента» «Начать» нет до неё), «Изменить» (PATCH с If-Match,
-  // 409 — перечитать). Предлагает идею агент (propose): у WebUI этого действия нет; у идеи со
+  // 409 — перечитать); формы — отдельный ленивый чанк `IdeaForm.svelte`, грузится при первом
+  // открытии. Предлагает идею агент (propose): у WebUI этого действия нет; у идеи со
   // снятой задачей открытый вопрос агента «вернуть» — пометка «Предложено вернуть» (§16, п. 6),
   // кнопки «Вернуть»/«Отказаться» остаются. Ленивый чанк.
   import { untrack } from 'svelte';
@@ -27,35 +28,29 @@
     type Space,
   } from '../lib/api';
   import {
-    IDEA_FORMS,
+    IDEA_ACTIVE,
+    IDEA_TABS as TABS,
     decisionNotice,
-    decisionOf,
-    deferDefault,
-    deferMin,
     ideaButtons,
     originOf,
     priorityOf,
     releasedOf,
-    sharedWarning,
-    tagsOf,
     type DecisionOpts,
     type IdeaAction,
-    type IdeaForm,
+    type IdeaSubmit,
+    type IdeaTab as Tab,
   } from '../lib/ideaButtons';
+  import type { IdeaForm } from '../lib/ideaForms';
   import {
     AUTHOR_TEXT,
     IDEA_STATUSES,
-    IDEA_STATUS_SEL as STATUS_SEL,
-    IDEA_TABS as TABS,
+    IDEA_STATUS_TEXT,
     PRIORITIES,
     PRIORITY_TEXT,
     dataStr as str,
     entryRef,
     fmtTime,
-    ideaStatusText as statusText,
     type IdeaPriority,
-    type IdeaStatusSel as StatusSel,
-    type IdeaTab as Tab,
   } from '../lib/journals';
   import { snippetParts } from '../lib/snippet';
   import { go, href } from '../lib/router';
@@ -75,7 +70,17 @@
 
   const uid = $props.id();
 
+  /** Фильтр статуса: подпись и статусы запроса (пусто — все). */
+  type StatusSel = 'active' | 'accepted' | 'done' | 'declined' | 'all';
+  const STATUS_SEL: { id: StatusSel; title: string; statuses: EntryStatus[] }[] = [
+    { id: 'active', title: 'Активные', statuses: IDEA_ACTIVE },
+    { id: 'accepted', title: IDEA_STATUS_TEXT.accepted, statuses: ['accepted'] },
+    { id: 'done', title: IDEA_STATUS_TEXT.done, statuses: ['done'] },
+    { id: 'declined', title: IDEA_STATUS_TEXT.declined, statuses: ['declined'] },
+    { id: 'all', title: 'все', statuses: [] },
+  ];
   const statusesOf = (s: StatusSel) => STATUS_SEL.find((x) => x.id === s)?.statuses ?? [];
+  const statusText = (s: EntryStatus | null) => (IDEA_STATUS_TEXT as Record<string, string>)[s ?? ''] ?? s ?? '';
 
   let tab = $state<Tab>('human');
   let tabEls = $state<HTMLButtonElement[]>([]);
@@ -107,19 +112,6 @@
   let actionError = $state('');
   let notice = $state('');
 
-  // форма создания и правки
-  let fTitle = $state('');
-  let fBody = $state('');
-  let fPriority = $state<IdeaPriority>('normal');
-  let fHorizon = $state('');
-  let fTags = $state('');
-  /** `horizon` идеи до правки: неизменённая (в том числе наступившая) дата не ограничивается min. */
-  let fHorizonWas = $state('');
-  // формы решений
-  let dHorizon = $state('');
-  let dReason = $state('');
-  let dSpace = $state('');
-
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
     set(errorText(e));
@@ -139,10 +131,7 @@
       tab = 'human';
       statusSel = 'active';
       priority = '';
-      tag = '';
-      query = '';
-      applied = { tag: '', query: '' };
-      load(user, space, true);
+      reset();
     });
   });
 
@@ -271,10 +260,8 @@
   }
 
   function reset() {
-    tag = '';
-    query = '';
-    applied = { tag: '', query: '' };
-    load(user, space, true);
+    tag = query = '';
+    apply();
   }
 
   async function act(fn: () => Promise<string | void>, done: string | (() => string)) {
@@ -304,73 +291,6 @@
     }
   }
 
-  function startCreate() {
-    fTitle = '';
-    fBody = '';
-    fPriority = 'normal';
-    fHorizon = '';
-    fHorizonWas = '';
-    fTags = '';
-    actionError = '';
-    mode = 'create';
-  }
-
-  function submitCreate(e: SubmitEvent) {
-    e.preventDefault();
-    const title = fTitle.trim();
-    if (!title) {
-      actionError = 'Укажите заголовок.';
-      return;
-    }
-    act(
-      async () =>
-        (
-          await createEntry(user, space, {
-            kind: 'idea',
-            title,
-            body: fBody,
-            tags: tagsOf(fTags),
-            data: { priority: fPriority, ...(fHorizon ? { horizon: fHorizon } : {}) },
-          })
-        ).id,
-      'Идея записана.',
-    );
-  }
-
-  function startEdit(c: Entry) {
-    fTitle = c.title;
-    fBody = c.body;
-    fPriority = priorityOf(c);
-    fHorizon = str(c.data, 'horizon');
-    fHorizonWas = fHorizon;
-    fTags = c.tags.join(', ');
-    actionError = '';
-    mode = 'edit';
-  }
-
-  function submitEdit(e: SubmitEvent) {
-    e.preventDefault();
-    const c = cur;
-    if (!c) return;
-    const title = fTitle.trim();
-    if (!title) {
-      actionError = 'Укажите заголовок.';
-      return;
-    }
-    // в data — только изменённое: прежний horizon мог наступить, и сервер отверг бы его
-    const data: Record<string, unknown> = {};
-    if (fPriority !== priorityOf(c)) data.priority = fPriority;
-    if (fHorizon !== str(c.data, 'horizon')) data.horizon = fHorizon || null;
-    act(async () => {
-      await patchEntry(user, c.id, c.rev, {
-        title,
-        body: fBody,
-        tags: tagsOf(fTags),
-        ...(Object.keys(data).length ? { data } : {}),
-      });
-    }, 'Идея сохранена.');
-  }
-
   /** Решение по идее; `accept` — ещё и ссылка на созданную задачу. */
   function decide(c: Entry, decision: IdeaDecision, opts: DecisionOpts = {}) {
     let task = '';
@@ -390,33 +310,33 @@
     return sp && sp.kind === 'solution' ? spaceRef(sp) : 'knowledge';
   }
 
-  let chosen = $derived(targets.find((s) => spaceRef(s) === dSpace) ?? null);
+  /** Открыть форму `m` (создание, правка, решение с полями). */
+  function show(m: IdeaForm) {
+    actionError = '';
+    mode = m;
+  }
 
   /** Кнопка карточки (`ideaButtons`): решение сразу или форма с полями. */
   function press(a: IdeaAction, c: Entry) {
-    if (a === 'edit') return startEdit(c);
     if (a === 'adopt')
-      return act(async () => {
+      act(async () => {
         await adoptIdea(user, c.id);
       }, 'Идея принята как своя.');
     // «Начать» идеи решения — без формы; у идеи Knowledge — выбор пространства задачи
-    if (a === 'start' && !knowledge) return decide(c, 'accept');
-    dSpace = defaultTarget();
-    dHorizon = deferDefault();
-    dReason = '';
-    actionError = '';
-    mode = a;
+    else if (a === 'start' && !knowledge) decide(c, 'accept');
+    else show(a);
   }
 
-  /** Отправка формы карточки: создание, правка или решение (`decisionOf`). */
-  function submit(e: SubmitEvent) {
-    if (mode === 'create') return submitCreate(e);
-    if (mode === 'edit') return submitEdit(e);
-    e.preventDefault();
-    if (!cur || mode === 'none') return;
-    const d = decisionOf(mode, { horizon: dHorizon, reason: dReason, space: dSpace });
-    if ('error' in d) actionError = d.error;
-    else decide(cur, d.decision, d.opts);
+  /** Заполненная форма (`IdeaForm.svelte`): создание, правка или решение. */
+  function submitted(f: IdeaSubmit) {
+    const c = cur;
+    if ('create' in f) act(async () => (await createEntry(user, space, { kind: 'idea', ...f.create })).id, 'Идея записана.');
+    else if (!c) return;
+    else if ('patch' in f)
+      act(async () => {
+        await patchEntry(user, c.id, c.rev, f.patch);
+      }, 'Идея сохранена.');
+    else decide(c, f.decision, f.opts);
   }
 
   const taskHref = (id: string, sp = taskSpace ?? space) => href({ name: 'journal', user, space: sp, journal: 'tasks', entry: id });
@@ -426,7 +346,7 @@
 
 <section class="journal ideas">
   <div class="row bar">
-    <button type="button" class="primary" onclick={startCreate}>Новая идея</button>
+    <button type="button" class="primary" onclick={() => show('create')}>Новая идея</button>
   </div>
 
   {#if mode === 'create'}{@render form('create')}{/if}
@@ -477,41 +397,38 @@
 
     {#if error}<p class="error" role="alert">{error}</p>{/if}
 
-    {#if hits}
-      <div class="feed" role="feed" aria-label="Найденные идеи" aria-busy={loading}>
-        {#each hits as h (h.entry_id)}
-          <article class="idea" class:selected={h.entry_id === entry} data-idea={h.entry_id}>
-            <button type="button" class="link title" onclick={() => select(h.entry_id ?? '')}>{h.title ?? ''}</button>
-            {#if h.status}<span class="chip">{statusText(h.status)}</span>{/if}
-            <p class="snippet small">
-              {#each snippetParts(h.snippet ?? '') as p, j (j)}{#if p.m}<mark>{p.t}</mark>{:else}{p.t}{/if}{/each}
-            </p>
-          </article>
-        {/each}
-      </div>
-      {#if !loading && hits.length === 0 && !error}<p class="muted">Ничего не найдено.</p>{/if}
-    {:else}
-      <div class="feed" role="feed" aria-label="Лента идей" aria-busy={loading}>
-        {#each items as it (it.id)}
-          {@const task = str(it.data, 'task_id')}
-          {@const q = str(it.data, 'question_id')}
-          <article class="idea" class:selected={it.id === entry} data-idea={it.id}>
-            <button type="button" class="link title" onclick={() => select(it.id)}>{it.title}</button>
-            <span class="chip prio" data-priority={priorityOf(it)}>{PRIORITY_TEXT[priorityOf(it)]}</span>
-            <span class="chip">{statusText(it.status)}</span>
-            {#if it.status === 'deferred' && str(it.data, 'horizon')}<span class="muted small">не раньше {str(it.data, 'horizon')} UTC</span>{/if}
-            {#if originOf(it) === 'agent'}<span class="badge small">от агента</span>{/if}
-            {#if task && !knowledge}<a class="small" href={taskHref(task, space)}>задача {entryRef('task', task)}</a>
-            {:else if task}<button type="button" class="link small" onclick={() => select(it.id)} title="Задача может быть в решении: ссылка — в карточке">задача {entryRef('task', task)}</button>
-            {:else if q && it.status === 'proposed'}<a class="small" href={questionHref(q)}>вопрос {entryRef('question', q)}</a>{/if}
-            {#each it.tags as t (t)}<span class="chip">#{t}</span>{/each}
-          </article>
-        {/each}
-      </div>
-      {#if !loading && items.length === 0 && !error}<p class="muted">{filtered ? 'Идей по выбранным фильтрам нет.' : 'Идей нет.'}</p>{/if}
-      {#if next && !loading}
-        <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
-      {/if}
+    <div class="feed" role="feed" aria-label={hits ? 'Найденные идеи' : 'Лента идей'} aria-busy={loading}>
+      {#each hits ?? [] as h (h.entry_id)}
+        <article class="idea" class:selected={h.entry_id === entry} data-idea={h.entry_id}>
+          <button type="button" class="link title" onclick={() => select(h.entry_id ?? '')}>{h.title ?? ''}</button>
+          {#if h.status}<span class="chip">{statusText(h.status)}</span>{/if}
+          <p class="snippet small">
+            {#each snippetParts(h.snippet ?? '') as p, j (j)}{#if p.m}<mark>{p.t}</mark>{:else}{p.t}{/if}{/each}
+          </p>
+        </article>
+      {/each}
+      {#each items as it (it.id)}
+        {@const task = str(it.data, 'task_id')}
+        {@const q = str(it.data, 'question_id')}
+        {@const hz = it.status === 'deferred' && str(it.data, 'horizon')}
+        <article class="idea" class:selected={it.id === entry} data-idea={it.id}>
+          <button type="button" class="link title" onclick={() => select(it.id)}>{it.title}</button>
+          <span class="chip prio" data-priority={priorityOf(it)}>{PRIORITY_TEXT[priorityOf(it)]}</span>
+          <span class="chip">{statusText(it.status)}</span>
+          {#if hz}<span class="muted small">не раньше {hz} UTC</span>{/if}
+          {@render marks(originOf(it) === 'agent', [])}
+          {#if task && !knowledge}<a class="small" href={taskHref(task, space)}>задача {entryRef('task', task)}</a>
+          {:else if task}<button type="button" class="link small" onclick={() => select(it.id)} title="Задача может быть в решении: ссылка — в карточке">задача {entryRef('task', task)}</button>
+          {:else if q && it.status === 'proposed'}<a class="small" href={questionHref(q)}>вопрос {entryRef('question', q)}</a>{/if}
+          {@render marks(false, it.tags)}
+        </article>
+      {/each}
+    </div>
+    {#if !loading && !error && !(hits ?? items).length}
+      <p class="muted">{hits ? 'Ничего не найдено.' : filtered ? 'Идей по выбранным фильтрам нет.' : 'Идей нет.'}</p>
+    {/if}
+    {#if next && !loading}
+      <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
     {/if}
     {#if loading}<p class="muted">Загрузка…</p>{/if}
   </div>
@@ -527,12 +444,12 @@
         <div class="row meta">
           <span class="chip status" data-status={c.status}>{statusText(c.status)}</span>
           <span class="chip prio">приоритет: {PRIORITY_TEXT[priorityOf(c)]}</span>
-          {#if agent}<span class="badge small">от агента</span>{/if}
+          {@render marks(agent, [])}
           <span class="muted small">{entryRef('idea', c.id)} · {AUTHOR_TEXT[c.author.kind] ?? c.author.kind} · ревизия {c.rev} · {fmtTime(c.updated_at)}</span>
         </div>
       </header>
       {#if c.body}<p class="body">{c.body}</p>{/if}
-      {#if c.tags.length}<div class="row">{#each c.tags as t (t)}<span class="chip">#{t}</span>{/each}</div>{/if}
+      {#if c.tags.length}<div class="row">{@render marks(false, c.tags)}</div>{/if}
       {#if c.status === 'deferred' && str(c.data, 'horizon')}<p class="muted">Отложена до {str(c.data, 'horizon')} (UTC).</p>{/if}
       {#if curQuestion && (c.status === 'proposed' || rel)}
         <div class="proposal" data-testid={rel ? 'reopen-proposed' : undefined}>
@@ -570,66 +487,26 @@
 </section>
 
 {#snippet form(m: IdeaForm)}
-  {@const f = IDEA_FORMS[m]}
-  <form class="form" class:panel={m === 'create'} onsubmit={submit} aria-label={f.aria}>
-    <h3>{f.title}</h3>
-    {#if m === 'create' || m === 'edit'}
-      {@render fields()}
-    {:else if m === 'start'}
-      <label>
-        Пространство задачи
-        <select bind:value={dSpace}>
-          <option value="knowledge">Knowledge</option>
-          {#each targets as s (s.id)}<option value={spaceRef(s)}>{s.name}{s.shared ? ' (общее)' : ''}</option>{/each}
-        </select>
-      </label>
-      {#if chosen?.shared}<p class="warn" data-testid="shared-warning">{sharedWarning(chosen.name)}</p>{/if}
-    {:else if m === 'defer'}
-      <label>
-        Не раньше
-        {@render date('Отложить до', true)}
-      </label>
-    {:else}
-      <label
-        >Причина{m === 'decline' ? ' (необязательно)' : ''}
-        <textarea bind:value={dReason} rows="2" maxlength="2000" required={m === 'reopen'}></textarea></label
-      >
-    {/if}
-    {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
-    <div class="row end">
-      <button type="submit" class="primary" disabled={busy}>{f.submit}</button>
-      <button type="button" onclick={() => ((mode = 'none'), (actionError = ''))}>Отмена</button>
-    </div>
-  </form>
+  {#await import('./IdeaForm.svelte') then { default: Form }}
+    {#key m}
+      <Form
+        {m}
+        idea={cur}
+        {targets}
+        space0={defaultTarget()}
+        {busy}
+        error={actionError}
+        onsubmit={submitted}
+        onerror={(e) => (actionError = e)}
+        oncancel={() => ((mode = 'none'), (actionError = ''))}
+      />
+    {/key}
+  {/await}
 {/snippet}
 
-{#snippet date(label: string, decision: boolean)}
-  <span class="row">
-    {#if decision}
-      <input type="date" bind:value={dHorizon} min={deferMin()} required aria-label={label} />
-    {:else}
-      <input type="date" bind:value={fHorizon} min={fHorizon && fHorizon === fHorizonWas ? undefined : deferMin()} aria-label={label} />
-    {/if}
-    <span class="muted small" title="Даты хранятся в UTC">UTC</span>
-  </span>
-{/snippet}
-
-{#snippet fields()}
-  <label>Заголовок <input bind:value={fTitle} required maxlength="500" /></label>
-  <label>Замысел <textarea bind:value={fBody} rows="4"></textarea></label>
-  <div class="row">
-    <label>
-      Приоритет
-      <select bind:value={fPriority}>
-        {#each PRIORITIES as p (p)}<option value={p}>{PRIORITY_TEXT[p]}</option>{/each}
-      </select>
-    </label>
-    <label>
-      Не раньше
-      {@render date('Не раньше', false)}
-    </label>
-  </div>
-  <label>Теги (через запятую) <input bind:value={fTags} aria-label="Теги идеи" /></label>
+{#snippet marks(agent: boolean, tags: string[])}
+  {#if agent}<span class="badge small">от агента</span>{/if}
+  {#each tags as t (t)}<span class="chip">#{t}</span>{/each}
 {/snippet}
 
 <style>
@@ -724,33 +601,6 @@
   }
   .actions {
     margin-top: 12px;
-  }
-  .form {
-    display: grid;
-    gap: 8px;
-    margin-top: 12px;
-    padding: 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }
-  .form h3 {
-    margin: 0;
-    font-size: 15px;
-  }
-  .form label {
-    display: grid;
-    gap: 4px;
-  }
-  .form textarea {
-    font: inherit;
-    padding: 6px 10px;
-    color: var(--text);
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-  }
-  .end {
-    justify-content: flex-end;
   }
   .small {
     font-size: 12px;
