@@ -2235,9 +2235,10 @@ fn m6_focus(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
     }
 }
 
-/// M6 §8 (учёт): хук `session-start` сессии [`M6_SESSION`], затем `zam search` и `zam read`
-/// этой сессией (`ZAM_SESSION`) → `zam sessions tokens <id>` — таблица «событие · вызовов ·
-/// токенов» со строками `session_start` и `read` (учёт может прийти после ответа — до 10 с).
+/// M6 §8 (учёт): хук `session-start` сессии [`M6_SESSION`], затем `zam search` и `zam read
+/// --batch` (`POST /read`) этой сессией (`ZAM_SESSION`) → `zam sessions tokens <id>` — таблица
+/// «событие · вызовов · токенов» со строками `session_start` и `read` (учёт может прийти после
+/// ответа — до 10 с).
 fn m6_sessions_tokens(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
     let conn = (base, token);
     let (home, project) = wm_project(dir)?;
@@ -2248,11 +2249,12 @@ fn m6_sessions_tokens(zam: &Path, dir: &Path, base: &str, token: &str) -> Result
     run_hook(zam, &home, &project, conn, "session-start", &ev)?;
     let agent = [("ZAM_SESSION", M6_SESSION)];
     wm_zam(zam, dir, conn, &["search", "квазиметрии"], None, &agent)?;
+    // побайтное чтение (без флагов) идёт мимо `POST /read` и в учёт не попадает: пачкой
     wm_zam(
         zam,
         dir,
         conn,
-        &["read", "knowledge:smoke/m6/focus"],
+        &["read", "knowledge:smoke/m6/focus", "--batch"],
         None,
         &agent,
     )?;
