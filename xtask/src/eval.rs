@@ -193,9 +193,10 @@ pub struct EvalArgs {
     #[arg(long, value_name = "FILE")]
     pub scenarios: Option<PathBuf>,
     /// --via mcp и --sessions без прогона: сохранённое плечо (JSON) сравнивается с каждым
-    /// --compare
+    /// --compare; у --via mcp можно повторять — повторы одного плеча (K индексаций), тогда
+    /// --compare — повторы базы и сравнение идёт по среднему на сценарий (методика M6, правило 3)
     #[arg(long, value_name = "FILE")]
-    pub arm: Option<PathBuf>,
+    pub arm: Vec<PathBuf>,
     /// Гейт без справочного прогона fp16 на CUDA (GPU занят): вердикт — по int8 и fp32 на CPU
     #[arg(long, requires = "quality_gate")]
     pub skip_cuda: bool,
@@ -416,7 +417,7 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     if a.sessions {
         return sessions::main(&a, &p);
     }
-    if a.split.is_some() || a.arm.is_some() {
+    if a.split.is_some() || !a.arm.is_empty() {
         bail!("--split и --arm — только у --tokens --via mcp и --sessions");
     }
     if a.tokens && a.grid.is_some() {

@@ -488,12 +488,36 @@ pub fn quantile(values: &[f64], q: f64) -> f64 {
     percentile(&v, q)
 }
 
+/// Разброс повторов (порог шума A/A, методика M6): 95-й перцентиль `|x − среднее| / среднее`
+/// по всем повторам всех элементов, у которых больше одного повтора и среднее больше нуля.
+/// `None` — таких элементов нет.
+pub fn rep_spread_p95(groups: &[Vec<f64>]) -> Option<f64> {
+    let mut d = Vec::new();
+    for g in groups.iter().filter(|g| g.len() > 1) {
+        let m = mean(g);
+        if m > 0.0 {
+            d.extend(g.iter().map(|x| (x - m).abs() / m));
+        }
+    }
+    (!d.is_empty()).then(|| quantile(&d, 0.95))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Разброс повторов: одиночные элементы и нулевые средние не входят; одинаковые — 0.
+    #[test]
+    fn rep_spread_p95_of_groups() {
+        assert_eq!(rep_spread_p95(&[vec![5.0], vec![0.0, 0.0]]), None);
+        assert_eq!(rep_spread_p95(&[vec![7.0, 7.0, 7.0]]), Some(0.0));
+        // среднее 100: отклонения 0,1; 0; 0,1 → p95 (интерполяция между 0,1 и 0,1) — 0,1
+        let p = rep_spread_p95(&[vec![90.0, 100.0, 110.0], vec![3.0]]).unwrap();
+        assert!((p - 0.1).abs() < 1e-12, "{p}");
     }
 
     #[test]

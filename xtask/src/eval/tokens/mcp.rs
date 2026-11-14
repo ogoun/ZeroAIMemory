@@ -63,7 +63,7 @@ use crate::eval::hints::refs_in_text;
 use crate::eval::mcp_client::McpClient;
 use crate::eval::metrics::{
     BOOTSTRAP_M6, Estimate, SEED, micro_recall, net_losses, paired_diff_weighted,
-    ratio_estimate_with,
+    ratio_estimate_with, rep_spread_p95,
 };
 use crate::eval::nuggets::{self, DOC_REF, normalize_md};
 use crate::eval::run::{self, RunSpec, Session};
@@ -569,6 +569,239 @@ fn compare_and_write(
     let c = compare(base, arm, names)?;
     print!("{}", crate::eval::report::comparison_md(&c));
     let (j, m) = write_comparison(arm_prefix, &c)?;
+    println!("  {}\n  {}", j.display(), m.display());
+    Ok(())
+}
+
+/// Итог одной пары повторов (`arm[i]` против `base[i]`) — чувствительность сравнения средних.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepPair {
+    pub base: String,
+    pub arm: String,
+    pub r: Option<Estimate>,
+    pub d_micro: Option<Estimate>,
+    pub net_losses: i64,
+    pub noninferior: bool,
+}
+
+/// Сравнение повторов плеча с повторами базы по **среднему на сценарий** (методика M6, правило
+/// 3, запасной вариант: K ≥ 3 индексаций на плечо; ничьи баллов между индексациями
+/// упорядочиваются по случайным `chunk_id`). Токены сценария — среднее по повторам; доля
+/// найденных нагетов — среднее по повторам; сценарий «полон» — в большинстве повторов
+/// (строго больше половины), справочно — во всех.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepsComparison {
+    pub base: String,
+    pub arm: String,
+    pub base_files: Vec<String>,
+    pub arm_files: Vec<String>,
+    pub split: String,
+    pub scenarios: usize,
+    /// Исключённые хотя бы в одном файле (`info.excluded_scenarios`) — вне сравнения.
+    pub excluded: Vec<String>,
+    pub base_tokens_mean: f64,
+    pub arm_tokens_mean: f64,
+    /// `R = Σ средних плеча / Σ средних базы`, парный бутстреп сценариев (95 %).
+    pub r: Option<Estimate>,
+    pub base_micro: f64,
+    pub arm_micro: f64,
+    /// Δ микро-полноты (доли — средние повторов), односторонние 95 % границы.
+    pub d_micro: Option<Estimate>,
+    /// `L` по полноте «в большинстве повторов».
+    pub net_losses: i64,
+    /// Справочно: `L` по полноте «во всех повторах».
+    pub net_losses_all_reps: i64,
+    pub noninferior: bool,
+    /// Порог шума A/A: p95 `|токены повтора − среднее| / среднее` по сценариям.
+    pub noise_base_p95: Option<f64>,
+    pub noise_arm_p95: Option<f64>,
+    /// Пары повторов `arm[i]` против `base[i]`.
+    pub pairs: Vec<RepPair>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub l0_excluded: Vec<L0Excluded>,
+    pub bootstrap: Bootstrap,
+}
+
+/// Сторона сравнения повторов: по сценарию — токены повторов, средняя доля найденного,
+/// полнота «в большинстве» и «во всех» повторах, число нагетов (вес).
+struct RepSide {
+    tokens: Vec<Vec<f64>>,
+    frac: Vec<f64>,
+    major: Vec<bool>,
+    every: Vec<bool>,
+    weights: Vec<f64>,
+}
+
+fn rep_side(reps: &[(String, McpResult)], ids: &[String], l0: &L0Set) -> Result<RepSide> {
+    let mut out = RepSide {
+        tokens: Vec::new(),
+        frac: Vec::new(),
+        major: Vec::new(),
+        every: Vec::new(),
+        weights: Vec::new(),
+    };
+    for id in ids {
+        let (mut toks, mut fr) = (Vec::new(), Vec::new());
+        let (mut full, mut total) = (0usize, 0usize);
+        for (name, r) in reps {
+            let sc = r
+                .scenarios
+                .iter()
+                .find(|s| &s.id == id)
+                .with_context(|| format!("{name}: нет сценария {id}"))?;
+            let (f, n, c) = adjusted(&sc.protocol, sc.nuggets_total, l0.get(id))?;
+            toks.push(sc.protocol.tokens as f64);
+            fr.push(if n == 0 { 0.0 } else { f as f64 / n as f64 });
+            full += usize::from(c);
+            total = n;
+        }
+        let k = reps.len();
+        out.tokens.push(toks);
+        out.frac.push(fr.iter().sum::<f64>() / k as f64);
+        out.major.push(2 * full > k);
+        out.every.push(full == k);
+        out.weights.push(total as f64);
+    }
+    Ok(out)
+}
+
+/// Сравнение повторов: условия замера всех файлов — как у [`compare`] (каждое плечо против
+/// первой базы и каждая база против первого плеча); сценарии — общие для всех файлов, на
+/// holdout сценарий не во всех файлах допустим лишь как исключённый.
+pub fn compare_reps(
+    bases: &[(String, McpResult)],
+    arms: &[(String, McpResult)],
+) -> Result<RepsComparison> {
+    let (Some(b0), Some(a0)) = (bases.first(), arms.first()) else {
+        bail!("сравнение повторов: нужны плечо и база");
+    };
+    for (n, a) in arms {
+        compare(&b0.1, a, (&b0.0, n)).with_context(|| format!("повтор плеча {n}"))?;
+    }
+    for (n, b) in bases {
+        compare(b, &a0.1, (n, &a0.0)).with_context(|| format!("повтор базы {n}"))?;
+    }
+    let all: Vec<&McpResult> = bases.iter().chain(arms).map(|(_, r)| r).collect();
+    let excluded: BTreeSet<&str> = all.iter().flat_map(|r| r.excluded_ids()).collect();
+    let ids_of =
+        |r: &McpResult| -> BTreeSet<String> { r.scenarios.iter().map(|s| s.id.clone()).collect() };
+    let mut common = ids_of(all[0]);
+    let mut any = BTreeSet::new();
+    for r in &all {
+        let ids = ids_of(r);
+        common = common.intersection(&ids).cloned().collect();
+        any.extend(ids);
+    }
+    let stray: Vec<&String> = any
+        .iter()
+        .filter(|id| !common.contains(*id) && !excluded.contains(id.as_str()))
+        .collect();
+    if a0.1.info.split == Part::Holdout.as_str() && !stray.is_empty() {
+        bail!("holdout: сценарии не во всех повторах и не исключённые: {stray:?}");
+    }
+    let ids: Vec<String> = common
+        .into_iter()
+        .filter(|id| !excluded.contains(id.as_str()))
+        .collect();
+    let l0 = l0_union(all.iter().map(|r| &r.info));
+    let l0_excluded: Vec<L0Excluded> = all
+        .iter()
+        .flat_map(|r| r.info.l0_excluded.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let b = rep_side(bases, &ids, &l0)?;
+    let a = rep_side(arms, &ids, &l0)?;
+    let w = &b.weights;
+    let mean = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
+    let bt: Vec<f64> = b.tokens.iter().map(mean).collect();
+    let at: Vec<f64> = a.tokens.iter().map(mean).collect();
+    let ratio_pairs: Vec<(f64, f64)> = at.iter().copied().zip(bt.iter().copied()).collect();
+    let d_micro = (w.iter().sum::<f64>() > 0.0)
+        .then(|| paired_diff_weighted(&b.frac, &a.frac, w, BOOTSTRAP_M6, SEED));
+    let l = net_losses(&b.major, &a.major);
+    let micro = |fr: &[f64]| {
+        let tot: f64 = w.iter().sum();
+        if tot == 0.0 {
+            0.0
+        } else {
+            fr.iter().zip(w).map(|(f, n)| f * n).sum::<f64>() / tot
+        }
+    };
+    let pairs = arms
+        .iter()
+        .zip(bases)
+        .map(|((an, ar), (bn, br))| {
+            compare(br, ar, (bn, an)).map(|c| RepPair {
+                base: bn.clone(),
+                arm: an.clone(),
+                r: c.r,
+                d_micro: c.d_micro,
+                net_losses: c.net_losses,
+                noninferior: c.noninferior,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RepsComparison {
+        base: format!("{}×{}", b0.0, bases.len()),
+        arm: format!("{}×{}", a0.0, arms.len()),
+        base_files: bases.iter().map(|(n, _)| n.clone()).collect(),
+        arm_files: arms.iter().map(|(n, _)| n.clone()).collect(),
+        split: a0.1.info.split.clone(),
+        scenarios: ids.len(),
+        excluded: excluded.iter().map(|s| s.to_string()).collect(),
+        base_tokens_mean: bt.iter().sum(),
+        arm_tokens_mean: at.iter().sum(),
+        r: ratio_estimate_with(&ratio_pairs, BOOTSTRAP_M6, SEED),
+        base_micro: micro(&b.frac),
+        arm_micro: micro(&a.frac),
+        noninferior: d_micro.is_some_and(|d| d.lo >= MIN_D_MICRO) && l <= MAX_NET_LOSSES,
+        d_micro,
+        net_losses: l,
+        net_losses_all_reps: net_losses(&b.every, &a.every),
+        noise_base_p95: rep_spread_p95(&b.tokens),
+        noise_arm_p95: rep_spread_p95(&a.tokens),
+        pairs,
+        l0_excluded,
+        bootstrap: Bootstrap {
+            samples: BOOTSTRAP_M6,
+            seed: SEED,
+            r_interval: "двусторонний 95 % (перцентили 2,5 и 97,5), парный бутстреп сценариев \
+                         по средним повторов",
+            d_micro_interval: "односторонние 95 % (перцентили 5 и 95), веса — число нагетов, \
+                               доли — средние повторов",
+        },
+    })
+}
+
+/// `--arm` × K и `--compare` × M: повторы плеча против повторов базы (по среднему на сценарий);
+/// запись — `<префикс первого плеча>-mean<K>-vs-<первая база>-mean<M>.{json,md}`.
+fn compare_reps_files(arms: &[PathBuf], bases: &[PathBuf]) -> Result<()> {
+    if bases.is_empty() {
+        bail!("--arm: укажите базы --compare <json>");
+    }
+    let load = |v: &[PathBuf]| {
+        v.iter()
+            .map(|p| Ok((file_name(p), read_result(p)?)))
+            .collect::<Result<Vec<_>>>()
+    };
+    let (a, b) = (load(arms)?, load(bases)?);
+    let c = compare_reps(&b, &a)?;
+    let md = crate::eval::report::reps_comparison_md(&c);
+    print!("{md}");
+    let stem = format!(
+        "{}-mean{}-vs-{}-mean{}",
+        prefix_of(&arms[0]).display(),
+        arms.len(),
+        file_name(&bases[0]),
+        bases.len()
+    );
+    let (j, m) = (
+        PathBuf::from(format!("{stem}.json")),
+        PathBuf::from(format!("{stem}.md")),
+    );
+    fs::write(&j, serde_json::to_string_pretty(&c)? + "\n")?;
+    fs::write(&m, md)?;
     println!("  {}\n  {}", j.display(), m.display());
     Ok(())
 }
@@ -1453,8 +1686,10 @@ pub(crate) fn changes_index(env_key: &str) -> bool {
 pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     // до любой работы: сетка на holdout запрещена
     grid::refuse_holdout(a.grid.as_deref(), a.split)?;
-    if let Some(arm) = &a.arm {
-        return compare_files(arm, &a.compare);
+    match a.arm.as_slice() {
+        [] => {}
+        [arm] => return compare_files(arm, &a.compare),
+        arms => return compare_reps_files(arms, &a.compare),
     }
     let Some(part) = a.split else {
         bail!("--via mcp: укажите --split dev|holdout");
@@ -2011,6 +2246,66 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("corpus_fingerprint d (плечо) ≠ c (база)"), "{e}");
+    }
+
+    /// Повторы (13b, правило 3): одинаковые повторы дают то же, что одно сравнение; шум — 0.
+    #[test]
+    fn reps_of_identical_runs_equal_single_compare() {
+        let base = arm(
+            "c",
+            vec![
+                scen("a", 2, path(1000, 2, true)),
+                scen("b", 2, path(800, 1, false)),
+            ],
+        );
+        let m6 = arm(
+            "c",
+            vec![
+                scen("a", 2, path(700, 2, true)),
+                scen("b", 2, path(600, 2, true)),
+            ],
+        );
+        let one = compare(&base, &m6, ("b", "m")).unwrap();
+        let k3 = |r: &McpResult, n: &str| -> Vec<(String, McpResult)> {
+            (0..3).map(|i| (format!("{n}{i}"), r.clone())).collect()
+        };
+        let c = compare_reps(&k3(&base, "b"), &k3(&m6, "m")).unwrap();
+        assert_eq!(c.scenarios, 2);
+        let (r1, r3) = (one.r.unwrap(), c.r.unwrap());
+        assert!((r1.mean - r3.mean).abs() < 1e-12 && (r1.lo - r3.lo).abs() < 1e-12);
+        assert_eq!(
+            (c.net_losses, c.net_losses_all_reps),
+            (one.net_losses, one.net_losses)
+        );
+        assert!((c.d_micro.unwrap().lo - one.d_micro.unwrap().lo).abs() < 1e-12);
+        assert_eq!((c.noise_base_p95, c.noise_arm_p95), (Some(0.0), Some(0.0)));
+        assert_eq!(c.pairs.len(), 3);
+        assert_eq!(c.base, "b0×3");
+    }
+
+    /// Повторы: токены — среднее, полнота — большинство повторов (справочно — все), доля
+    /// найденного — среднее; разные условия замера — ошибка.
+    #[test]
+    fn reps_mean_tokens_and_majority_completeness() {
+        let b = arm("c", vec![scen("a", 2, path(100, 2, true))]);
+        let arm_rep = |t: usize, f: usize| arm("c", vec![scen("a", 2, path(t, f, f == 2))]);
+        let arms = vec![
+            ("m0".to_string(), arm_rep(60, 2)),
+            ("m1".to_string(), arm_rep(90, 2)),
+            ("m2".to_string(), arm_rep(90, 1)),
+        ];
+        let bases = vec![("b0".to_string(), b.clone())];
+        let c = compare_reps(&bases, &arms).unwrap();
+        assert!((c.arm_tokens_mean - 80.0).abs() < 1e-12);
+        assert!((c.r.unwrap().mean - 0.8).abs() < 1e-12);
+        // полон в 2 из 3 — «в большинстве»: потерь нет; «во всех» — потеря 1
+        assert_eq!((c.net_losses, c.net_losses_all_reps), (0, 1));
+        assert!((c.arm_micro - 5.0 / 6.0).abs() < 1e-12);
+        assert!(c.noise_arm_p95.unwrap() > 0.0);
+        let mut other = arm_rep(60, 2);
+        other.info.device = Some("cuda".into());
+        let e = compare_reps(&bases, &[("x".into(), other)]).unwrap_err();
+        assert!(format!("{e:#}").contains("устройство"), "{e:#}");
     }
 
     /// Условия замера должны совпадать: отпечаток нагетов, часть, бюджет чтения, счётчик,

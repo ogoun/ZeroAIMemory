@@ -586,6 +586,88 @@ pub fn comparison_md(c: &super::tokens::mcp::Comparison) -> String {
     s
 }
 
+/// Сравнение повторов ТС-1 по среднему на сценарий (методика M6, правило 3).
+pub fn reps_comparison_md(c: &super::tokens::mcp::RepsComparison) -> String {
+    let mut s = String::new();
+    let opt = |e: &Option<Estimate>| e.as_ref().map_or("—".into(), est);
+    let p95 = |x: Option<f64>| x.map_or("—".into(), |v| format!("{v:.4}"));
+    let _ = writeln!(
+        s,
+        "\n## {} против {} ({}, сценариев {}, по среднему на сценарий)\n",
+        c.arm, c.base, c.split, c.scenarios
+    );
+    let _ = writeln!(
+        s,
+        "- R = Σ средних плеча / Σ средних базы = {:.1} / {:.1}: {} (95 %, парный бутстреп \
+         сценариев);",
+        c.arm_tokens_mean,
+        c.base_tokens_mean,
+        opt(&c.r)
+    );
+    let _ = writeln!(
+        s,
+        "- микро-полнота (доли — средние повторов): база {:.3}, плечо {:.3}; Δ {} (односторонние \
+         95 % границы; порог нижней ≥ {});",
+        c.base_micro,
+        c.arm_micro,
+        c.d_micro.as_ref().map_or("— (нагетов нет)".into(), est),
+        super::tokens::mcp::MIN_D_MICRO
+    );
+    let _ = writeln!(
+        s,
+        "- чистые потери L = {} по полноте «в большинстве повторов» (порог ≤ {}), справочно «во \
+         всех повторах» — {}; неинфериорность: {}.",
+        c.net_losses,
+        super::tokens::mcp::MAX_NET_LOSSES,
+        c.net_losses_all_reps,
+        if c.noninferior { "да" } else { "нет" }
+    );
+    let _ = writeln!(
+        s,
+        "- порог шума A/A (p95 |повтор − среднее| / среднее по сценариям): база {}, плечо {};",
+        p95(c.noise_base_p95),
+        p95(c.noise_arm_p95)
+    );
+    if !c.excluded.is_empty() {
+        let _ = writeln!(s, "- исключены из сравнения: {:?};", c.excluded);
+    }
+    let _ = writeln!(
+        s,
+        "- бутстреп: {} выборок, зерно {:#x}.\n",
+        c.bootstrap.samples, c.bootstrap.seed
+    );
+    let _ = writeln!(
+        s,
+        "| пара повторов | R [95 %] | Δ микро [одностор.] | L | неинф. |"
+    );
+    let _ = writeln!(s, "|---|---|---|---:|---|");
+    for p in &c.pairs {
+        let _ = writeln!(
+            s,
+            "| {} / {} | {} | {} | {} | {} |",
+            p.arm,
+            p.base,
+            opt(&p.r),
+            opt(&p.d_micro),
+            p.net_losses,
+            if p.noninferior { "да" } else { "нет" }
+        );
+    }
+    if !c.l0_excluded.is_empty() {
+        let l: Vec<String> = c
+            .l0_excluded
+            .iter()
+            .map(|e| format!("{}#{} {}", e.scenario, e.nugget, e.source))
+            .collect();
+        let _ = writeln!(
+            s,
+            "\n- нагеты в L0 сервера хотя бы одного файла — вне полноты всех: {}.",
+            l.join("; ")
+        );
+    }
+    s
+}
+
 /// `found/total (0.750)`.
 fn tally(t: &super::sessions::Tally) -> String {
     match t.share() {

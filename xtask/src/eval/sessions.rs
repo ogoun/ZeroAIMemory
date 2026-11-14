@@ -2948,7 +2948,7 @@ fn run_session(
 /// `--arm` (сравнение сохранённых плеч без прогона) с `--grid` — ошибка: сетка молча не
 /// прогналась бы (ревью 8c).
 fn refuse_grid_with_arm(a: &EvalArgs) -> Result<()> {
-    if let (Some(_), Some(g)) = (&a.arm, &a.grid) {
+    if let (false, Some(g)) = (a.arm.is_empty(), &a.grid) {
         bail!(
             "--arm вместе с --grid ({}): сравнение сохранённых плеч идёт без прогона",
             g.display()
@@ -3064,8 +3064,10 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     // до любой работы: сетка на holdout запрещена (§3.5)
     super::grid::refuse_holdout(a.grid.as_deref(), a.split)?;
     refuse_grid_with_arm(a)?;
-    if let Some(arm) = &a.arm {
-        return compare_files(&p.repo, arm, &a.compare);
+    match a.arm.as_slice() {
+        [] => {}
+        [arm] => return compare_files(&p.repo, arm, &a.compare),
+        _ => bail!("--sessions: --arm — одно плечо (повторы ТС-2 — --repeat внутри прогона)"),
     }
     let Some(part) = a.split else {
         bail!("--sessions: укажите --split dev|holdout");
