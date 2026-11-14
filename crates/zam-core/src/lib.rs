@@ -95,10 +95,25 @@ pub const HOOK_BUDGET_SPENT: &str = "бюджет исчерпан до запр
 /// Явная сессия `zam mcp` (M6 §7.1): сильнее `CLAUDE_CODE_SESSION_ID` и файла привязки.
 pub const MCP_SESSION_ENV: &str = "ZAM_SESSION_ID";
 
+/// Предел простоя тела `zam export`, с (M6 §12б.5).
+pub const EXPORT_IDLE_ENV: &str = "ZAM_EXPORT_IDLE_SECS";
+
+/// Предел отсутствия хода задания `zam import`, с (M6 §12б.5).
+pub const IMPORT_IDLE_ENV: &str = "ZAM_IMPORT_IDLE_SECS";
+
 /// Клиентские переменные `zam` (не агента): явная сессия хуков, признак агента, имя машины,
-/// сессия `zam mcp`. Сервер не читает их как ключи конфигурации, тесты убирают из окружения
-/// дочернего `zam`.
-pub const CLIENT_ENV_VARS: [&str; 4] = ["ZAM_SESSION", "ZAM_AGENT", MACHINE_ENV, MCP_SESSION_ENV];
+/// сессия `zam mcp`, пределы ожидания `zam export`/`zam import`. Сервер не читает их как ключи
+/// конфигурации (иначе такая переменная в окружении пользователя — неизвестный ключ, и сервер
+/// не стартует), тесты убирают их из окружения дочернего `zam`. Новая переменная, которую читает
+/// `zam`, добавляется сюда.
+pub const CLIENT_ENV_VARS: [&str; 6] = [
+    "ZAM_SESSION",
+    "ZAM_AGENT",
+    MACHINE_ENV,
+    MCP_SESSION_ENV,
+    EXPORT_IDLE_ENV,
+    IMPORT_IDLE_ENV,
+];
 
 #[cfg(test)]
 mod machine_tests {

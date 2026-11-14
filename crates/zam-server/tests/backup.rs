@@ -965,6 +965,69 @@ async fn restore_bad_sum_before_any_write() {
     assert!(tree(&root.join("blobs")).is_empty());
 }
 
+/// Файл копии длиннее описи (подмена, испорченный архив): копирование в каталог сборки
+/// останавливается на размере из описи + 1 байт, ответ — `Oversize`, сборка убрана, каталог
+/// данных не тронут (без предела подложенный файл заполнял бы диск до сверки суммы).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_oversize_file_bounded_by_manifest() {
+    let _g = CHUNKER.read().await;
+    let (copy, _, user, shas) = copy_of("rs-oversize").await;
+    let rel = format!("blobs/{user}/{}/{}", &shas[1][..2], shas[1]);
+    let declared = read_manifest(&copy)
+        .files
+        .iter()
+        .find(|f| f.path == rel)
+        .unwrap()
+        .size;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(copy.join(&rel))
+            .unwrap();
+        f.write_all(&vec![7u8; 4 << 20]).unwrap();
+    }
+    let dst = dst_cfg("rs-oversize-dst");
+    match restore(&dst, &copy, &RestoreOpts::default()).await {
+        Err(BackupError::Oversize { path, max }) => assert_eq!((path, max), (rel, declared)),
+        other => panic!("ожидался Oversize: {other:?}"),
+    }
+    let root = &dst.data_dir;
+    assert!(
+        !root.join(".restore-staging").exists(),
+        "каталог сборки не убран"
+    );
+    assert!(!root.join("system.db").exists());
+    assert!(tree(&root.join("users")).is_empty());
+    assert!(tree(&root.join("blobs")).is_empty());
+
+    // сам предел: из «бесконечного» источника записано ровно размер описи + 1 байт
+    let probe = common::tmp("rs-oversize-probe").join("f");
+    let mut src = std::io::Read::take(std::io::repeat(7), 4 << 20);
+    let r = zam_server::backup::restore::copy_bounded(&mut src, &probe, "x", 10);
+    assert!(
+        matches!(r, Err(BackupError::Oversize { max: 10, .. })),
+        "{r:?}"
+    );
+    assert_eq!(std::fs::metadata(&probe).unwrap().len(), 11);
+}
+
+/// Срок признака копии у `restore` — из конфигурации (`backup.flag_max_hours`), как у `backup`:
+/// удерживаемый признак старше срока считается брошенным, и восстановление идёт.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_flag_age_from_config() {
+    let _g = CHUNKER.read().await;
+    let (copy, _, _, _) = copy_of("rs-flag-age").await;
+    let mut dst = dst_cfg("rs-flag-age-dst");
+    dst.backup.flag_max_hours = 1;
+    std::fs::create_dir_all(&dst.data_dir).unwrap();
+    let hold = zam_store::hold_backup_flag(&dst.data_dir).unwrap();
+    // признак удерживается, но старше срока конфигурации (и моложе умолчания 6 ч)
+    age_file(&zam_store::backup_flag_path(&dst.data_dir), 2);
+    restore(&dst, &copy, &RestoreOpts::default()).await.unwrap();
+    drop(hold);
+}
+
 // ---------------------------------------------------------------- восстановление
 
 /// Копия базы 0024 (M5.7) восстанавливается и при открытии мигрирует до 0025 с `bak-v24`.

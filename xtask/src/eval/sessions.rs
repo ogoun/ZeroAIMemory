@@ -644,7 +644,7 @@ pub mod class {
     pub const SNAPSHOT: &str = "snapshot";
     /// Раздел `### Правила` дайджеста и пакета восстановления — резерв Rules (M6 §8, решение 10;
     /// строка учёта `rules`, §17 п. 3). Вычитается только у `session_start` и `recovery`
-    /// ([`step_tokens`]): у пакета субагенту L0 Rules — в бюджете. Строки словаря, проверенных
+    /// ([`step_tokens`](super::step_tokens)): у пакета субагенту L0 Rules — в бюджете. Строки словаря, проверенных
     /// команд и карты кода под ним — класс [`JOURNAL`].
     pub const RULES: &str = "rules";
 }

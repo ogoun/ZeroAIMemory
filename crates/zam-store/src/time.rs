@@ -7,7 +7,8 @@ use rusqlite::Row;
 use crate::StoreError;
 
 /// «Сейчас» сервера и хранилища (M6 §4.4): все записи времени, окна и сроки — через неё. С фичей
-/// `test-hooks` часы можно заморозить ([`freeze_now`]).
+/// `test-hooks` часы можно заморозить (`freeze_now`; без фичи функции нет, поэтому без
+/// rustdoc-ссылки).
 pub fn now() -> Timestamp {
     #[cfg(feature = "test-hooks")]
     if let Some(t) = crate::test_hooks::frozen() {

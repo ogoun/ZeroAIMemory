@@ -119,6 +119,9 @@ impl Device {
     }
 }
 
+// Doc-комментарии полей — справка clap (`--help`): `[search]` — секция конфигурации, а не ссылка
+// rustdoc.
+#[allow(rustdoc::broken_intra_doc_links)]
 /// Аргументы `cargo xtask eval`.
 #[derive(Debug, clap::Args)]
 pub struct EvalArgs {

@@ -76,7 +76,14 @@ pub struct ServerProc {
 impl ServerProc {
     /// Запускает `zam-server serve --config <conf>`; `addr` — `server.bind` конфига.
     pub fn start(conf: &Path, addr: SocketAddr) -> ServerProc {
-        let mut child = command()
+        Self::start_env(conf, addr, &[])
+    }
+
+    /// То же, что [`ServerProc::start`], с дополнительными переменными окружения процесса.
+    pub fn start_env(conf: &Path, addr: SocketAddr, env: &[(&str, &str)]) -> ServerProc {
+        let mut cmd = command();
+        cmd.envs(env.iter().copied());
+        let mut child = cmd
             .arg("serve")
             .arg("--config")
             .arg(conf)

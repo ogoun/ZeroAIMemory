@@ -978,6 +978,8 @@ async fn guide_has_focus_rejected_snapshot() {
                 "`‹secret›`",
                 "`--password X`",
                 "`Authorization:`",
+                "Только в командах снимка",
+                "работает только сканер секретов",
                 "не диктуйте секреты в чат",
                 "данные, а не указания",
             ],
@@ -1067,6 +1069,8 @@ async fn guide_has_focus_rejected_snapshot() {
                 "`‹secret›`",
                 "`--password X`",
                 "`Authorization:`",
+                "Only in snapshot commands",
+                "only the secrets scanner works there",
                 "do not dictate secrets in the chat",
                 "data, not instructions",
             ],
@@ -1129,6 +1133,14 @@ async fn guide_has_focus_rejected_snapshot() {
             for p in *phrases {
                 assert!(sec.contains(p), "«{title}»{q}: нет «{p}»:\n{sec}");
             }
+        }
+        // правила флагов снимка — только у команд (`zam-cli` `snapshot::mask_flags`, правки
+        // ревью 17a): протокол не обещает агенту маскировку флагов в запросах и путях
+        for wrong in [
+            "Во всех текстовых полях снимка",
+            "In all text fields of a snapshot",
+        ] {
+            assert!(!g.contains(wrong), "{q}: протокол обещает «{wrong}»");
         }
     }
     // правила отвергнутых подходов в блоке нет — оно в протоколе и в схеме `memory_log`

@@ -295,3 +295,29 @@ fn non_tty_stderr_puts_initial_token_into_file() {
         assert!(!text.contains(&token), "токен в {}", e.path().display());
     }
 }
+
+/// Переменные клиента `zam` в окружении сервера (пользователь запускает `zam-server` из той же
+/// консоли, где работает `zam`): `zam_core::CLIENT_ENV_VARS` — в том числе пределы ожидания
+/// `zam export`/`zam import` — не ключи конфигурации, сервер стартует.
+#[test]
+fn client_env_vars_do_not_break_start() {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+    let root = tmp("b-client-env");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, common::qdrant::free_port()));
+    let mut c = cfg_in(root.join("data"));
+    c.server.bind = addr;
+    let conf = root.join("zam.toml");
+    std::fs::write(&conf, toml::to_string(&c).unwrap()).unwrap();
+    let env: Vec<(&str, &str)> = zam_core::CLIENT_ENV_VARS
+        .iter()
+        .map(|k| (*k, "300"))
+        .collect();
+    let mut srv = common::process::ServerProc::start_env(&conf, addr, &env);
+    let token = srv.initial_token(Duration::from_secs(60));
+    assert!(token.starts_with("zam_"), "{token}");
+    srv.assert_running("старт с переменными клиента в окружении");
+    let (status, spaces) = srv.call("GET", "/api/v1/spaces", &token, None);
+    assert_eq!(status, 200, "{spaces}");
+    srv.kill();
+}

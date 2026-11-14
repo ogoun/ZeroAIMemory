@@ -380,8 +380,8 @@ pub struct RecallReq {
     /// Предел канала вывода хука (ревью 8a, C1): весь `text` укладывается в него сервером,
     /// клиент режет только страховочно. Нет у хука (старый клиент) — [`HOOK_OUTPUT_LIMIT`].
     output_limit: Option<OutputLimit>,
-    /// Срок сбора этого запроса, мс (M6 §16 п. 19, CR-7): 1..=`recall.max_timeout_ms`, иначе 400;
-    /// нет — `recall.timeout_ms`.
+    /// Срок сбора этого запроса, мс (M6 §16 п. 19, CR-7): 1..=`max(recall.max_timeout_ms,
+    /// recall.timeout_ms)`, иначе 400; нет — `recall.timeout_ms`.
     timeout_ms: Option<u64>,
 }
 

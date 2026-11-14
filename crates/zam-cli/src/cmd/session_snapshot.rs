@@ -4,7 +4,8 @@
 //! - **Формат**: `--format`, иначе по первой строке журнала (`"type":"session_meta"` — Codex,
 //!   иначе Claude Code).
 //! - **Сессия** по порядку: `--session`, `ZAM_SESSION_ID`, id из самого журнала (Claude —
-//!   `sessionId` последней записи, Codex — `session_meta.payload.id`; [`Snapshot::session_hint`]).
+//!   `sessionId` последней записи, Codex — `session_meta.payload.id`;
+//!   [`TranscriptAdapter::session_hint`](crate::cmd::hook::snapshot::TranscriptAdapter::session_hint)).
 //!   Ни одного источника — код 1 и «укажите --session». Записи журнала берутся последней сессии
 //!   файла (как у хука без `session_id`): явный id задаёт только сессию на сервере.
 //! - Сессии нет на сервере (`GET /sessions/{id}` → 404) — `POST /sessions {id, agent, solution}`,

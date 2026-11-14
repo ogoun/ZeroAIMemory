@@ -203,8 +203,28 @@ fn side(p: &Path, suffix: &str) -> PathBuf {
 /// сумм при записи), а в каталог данных попадают только переименованием целиком проверенными.
 const STAGING: &str = ".restore-staging";
 
-/// Копирует файлы описи в `staging`, считая SHA-256 при записи (одно чтение источника), и
-/// проверяет суммы, размеры и версии схем баз. Каталог данных не трогается.
+/// Копирует `r` в `dst` не больше `size + 1` байт (размер файла по описи и один байт, чтобы
+/// заметить превышение), считая SHA-256 при записи: подменённый или испорченный файл копии не
+/// заполнит диск до сверки суммы. Превышение — [`BackupError::Oversize`].
+pub fn copy_bounded(
+    r: &mut dyn Read,
+    dst: &Path,
+    rel: &str,
+    size: u64,
+) -> Result<(String, u64), BackupError> {
+    let (sha, n) = super::copy_hashed(&mut r.take(size.saturating_add(1)), dst)?;
+    if n > size {
+        return Err(BackupError::Oversize {
+            path: rel.to_string(),
+            max: size,
+        });
+    }
+    Ok((sha, n))
+}
+
+/// Копирует файлы описи в `staging`, считая SHA-256 при записи (одно чтение источника; не больше
+/// размера по описи — [`copy_bounded`]), и проверяет суммы, размеры и версии схем баз. Каталог
+/// данных не трогается.
 fn stage_files(src: &mut Source, m: &Manifest, staging: &Path) -> Result<Vec<Kind>, BackupError> {
     let kinds: Vec<Kind> = m
         .files
@@ -218,7 +238,8 @@ fn stage_files(src: &mut Source, m: &Manifest, staging: &Path) -> Result<Vec<Kin
     let user_max = USER_MIGRATIONS.len() as u32;
     for (f, k) in m.files.iter().zip(&kinds) {
         let dst = manifest::local(staging, &f.path);
-        let (sha, size) = src.with_reader(&f.path, |r, _| Ok(super::copy_hashed(r, &dst)?))?;
+        let (sha, size) =
+            src.with_reader(&f.path, |r, _| copy_bounded(r, &dst, &f.path, f.size))?;
         if sha != f.sha256 || size != f.size {
             return Err(BackupError::BadSum {
                 path: f.path.clone(),
@@ -461,7 +482,10 @@ pub async fn restore(
         }
         Err(e) => return Err(e.into()),
     };
-    if zam_store::backup_flag_active(&root, zam_store::backup::backup_flag_max_age()) {
+    // срок признака копии — из конфигурации (`backup.flag_max_hours`), как у `backup`: процесс
+    // `restore` не задаёт срок процесса (`set_backup_flag_max_age` — только у `serve`)
+    let flag_age = std::time::Duration::from_secs(u64::from(cfg.backup.flag_max_hours) * 3600);
+    if zam_store::backup_flag_active(&root, flag_age) {
         return Err(BackupError::BackupInProgress);
     }
     let (src_path, replace) = (src.to_path_buf(), opts.replace);

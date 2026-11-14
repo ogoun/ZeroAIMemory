@@ -39,8 +39,8 @@ use crate::client::{CliError, EXIT_CONFIG, EXIT_UNREACHABLE, Timeouts, into_read
 pub const OLD_SERVER: &str =
     "сервер не поддерживает экспорт пространства: нужен zam-server 0.0.11-m6 или новее";
 
-/// Переменная предела простоя тела, с.
-pub const IDLE_ENV: &str = "ZAM_EXPORT_IDLE_SECS";
+/// Переменная предела простоя тела, с (в `zam_core::CLIENT_ENV_VARS`: сервер её не читает).
+pub const IDLE_ENV: &str = zam_core::EXPORT_IDLE_ENV;
 /// Предел простоя тела по умолчанию.
 const IDLE_DEFAULT: Duration = Duration::from_secs(300);
 
@@ -350,8 +350,8 @@ pub struct ImportArgs<'a> {
     pub dry_run: bool,
 }
 
-/// Переменная предела отсутствия хода задания импорта, с.
-pub const IMPORT_IDLE_ENV: &str = "ZAM_IMPORT_IDLE_SECS";
+/// Переменная предела отсутствия хода задания импорта, с (в `zam_core::CLIENT_ENV_VARS`).
+pub const IMPORT_IDLE_ENV: &str = zam_core::IMPORT_IDLE_ENV;
 /// Предел отсутствия хода задания по умолчанию.
 const IMPORT_IDLE_DEFAULT: Duration = Duration::from_secs(600);
 /// Шаг опроса задания.

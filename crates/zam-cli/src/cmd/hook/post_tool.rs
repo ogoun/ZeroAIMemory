@@ -480,9 +480,9 @@ pub fn file_context_lines(
 
 /// Строка знания о файле: до [`FILE_ITEMS_MAX`] записей, `stale` — тег «возможно устарело».
 /// Ссылки на символ (M5.6 §8; решение составителя плана 13) — первыми; все записи о одном
-/// символе — «ZeroAIMemory: о `Sym` в <путь> в памяти: <title> [<kind>] <ref>; …»; смесь
-/// символьных и файловых (или разных символов) — «ZeroAIMemory: о файле <путь> в памяти:
-/// `Sym`: <title> [<kind>] <ref>; <title> [<kind>·возможно устарело] <ref>».
+/// символе — «`ZeroAIMemory: о Sym в <путь> в памяти: <title> [<kind>] <ref>; …`»; смесь
+/// символьных и файловых (или разных символов) — «`ZeroAIMemory: о файле <путь> в памяти:
+/// Sym: <title> [<kind>] <ref>; <title> [<kind>·возможно устарело] <ref>`».
 pub fn file_hint(pr: &PathRefs) -> String {
     let mut items: Vec<&cache::RefItem> = pr.items.iter().collect();
     // устойчиво: символьные первыми, порядок сервера внутри групп

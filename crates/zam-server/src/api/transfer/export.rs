@@ -30,7 +30,8 @@
 //! снимок не входят ([`zam_store::export`]).
 //!
 //! **Аудит** — две записи: `space.export {space, user, owner, filter}` до тела (не записалась —
-//! 500, архив не отдаётся) и `space.export.done {space, user, files, bytes, complete, reason}` по
+//! 500, архив не отдаётся) и `space.export.done {space, user, owner, files, bytes, complete,
+//! reason}` по
 //! окончании потока, в том числе при обрыве (`complete: false`, `reason`: `client` | `stall` |
 //! `deadline` | `stop` | `error`); `bytes` — несжатый объём файлов архива без описи.
 //! Ошибка посреди потока обрывает тело (клиент видит незавершённый архив); `zam export` пишет во

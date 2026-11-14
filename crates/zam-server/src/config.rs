@@ -11,11 +11,12 @@ use toml::{Table, Value};
 use zam_search::KindBoostMode;
 use zam_search::recall::CoverageRule;
 
-/// Переменные `ZAM_*`, которые не являются слоем конфигурации:
-/// секреты и адрес клиента, переменные клиента `zam` (сессия, признак агента, имя машины, сессия `zam mcp` —
-/// `zam_core::CLIENT_ENV_VARS`: без этого `ZAM_MACHINE` в окружении пользователя ломала бы
-/// ручной запуск сервера), а также сборочные (build.rs, xtask), попадающие в окружение CI.
-const RESERVED_ENV: [&str; 13] = [
+/// Переменные `ZAM_*`, которые не являются слоем конфигурации: секреты и адрес клиента,
+/// сборочные (build.rs, xtask), попадающие в окружение CI. Переменные клиента `zam` —
+/// [`zam_core::CLIENT_ENV_VARS`] (сессия, признак агента, имя машины, сессия `zam mcp`, пределы
+/// ожидания `zam export`/`zam import`): без этого `ZAM_MACHINE` или `ZAM_EXPORT_IDLE_SECS` в
+/// окружении пользователя ломали бы ручной запуск сервера.
+const RESERVED_ENV: [&str; 9] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
@@ -25,11 +26,13 @@ const RESERVED_ENV: [&str; 13] = [
     "ZAM_WEB_INDEX",
     "ZAM_VCRUNTIME_DLL",
     "ZAM_VC_CRT_DIR",
-    zam_core::CLIENT_ENV_VARS[0],
-    zam_core::CLIENT_ENV_VARS[1],
-    zam_core::CLIENT_ENV_VARS[2],
-    zam_core::CLIENT_ENV_VARS[3],
 ];
+
+/// `ZAM_*` (в верхнем регистре) — не ключ конфигурации, а секрет, сборочная переменная или
+/// переменная клиента `zam`.
+fn reserved_env(upper: &str) -> bool {
+    RESERVED_ENV.contains(&upper) || zam_core::CLIENT_ENV_VARS.contains(&upper)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1668,7 +1671,7 @@ pub fn load(
         let Some(rest) = upper.strip_prefix("ZAM_") else {
             continue;
         };
-        if RESERVED_ENV.contains(&upper.as_str()) || rest.is_empty() {
+        if reserved_env(&upper) || rest.is_empty() {
             continue;
         }
         let path: Vec<String> = rest
@@ -2062,6 +2065,24 @@ note_max_bytes = 1000
             env("ZAM_MACHINE", "box"),
         ];
         assert!(load(None, &env, &Default::default()).is_ok());
+    }
+
+    /// Переменные клиента `zam` (все `zam_core::CLIENT_ENV_VARS`, в том числе пределы ожидания
+    /// `zam export`/`zam import`) в окружении сервера — не ключи конфигурации: сервер с ними
+    /// стартует с умолчаниями.
+    #[test]
+    fn client_env_are_skipped() {
+        let mut env: Vec<(String, String)> = zam_core::CLIENT_ENV_VARS
+            .iter()
+            .map(|k| (k.to_string(), "1".to_string()))
+            .collect();
+        for k in ["ZAM_EXPORT_IDLE_SECS", "ZAM_IMPORT_IDLE_SECS"] {
+            env.push((k.to_string(), "300".to_string()));
+        }
+        assert_eq!(
+            load(None, &env, &Default::default()).unwrap(),
+            ServerConfig::default()
+        );
     }
 
     #[test]

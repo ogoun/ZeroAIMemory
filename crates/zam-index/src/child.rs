@@ -2,7 +2,7 @@
 //! процесса разбора документов `zam-server doc-worker` (M5 §2).
 //!
 //! - окружение: секреты сервера ([`SECRET_ENV`]) дочерним процессам не передаются;
-//! - Linux: [`pre_exec_hook`] — `PR_SET_PDEATHSIG` (`SIGKILL`) со сверкой `getppid()` и, по
+//! - Linux: `pre_exec_hook` (только Linux) — `PR_SET_PDEATHSIG` (`SIGKILL`) со сверкой `getppid()` и, по
 //!   желанию, `RLIMIT_AS`. Сигнал приходит при смерти **потока**, сделавшего `fork`, поэтому
 //!   запускать дочерний процесс нужно из долгоживущего потока;
 //! - Windows: [`KillJob`] — свой Job Object с `KILL_ON_JOB_CLOSE` и, по желанию, лимитом памяти

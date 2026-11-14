@@ -25,6 +25,9 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Doc-комментарии — справка clap (`zam … --help`): `[space:]path`, `ID[#СЕКЦИЯ]` — синтаксис
+// командной строки, а не ссылки rustdoc; текст справки не меняется ради rustdoc.
+#[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Проверить подключение: сервер, токен, пользователь, solution.toml
@@ -352,7 +355,7 @@ enum Cmd {
     },
     /// Хук агента (§10.3): JSON события на stdin, подсказки — JSON в stdout; всегда код 0
     Hook {
-        /// session-start, prompt, pre-tool, post-tool, checkpoint
+        /// session-start, subagent-start, prompt, pre-tool, post-tool, checkpoint
         #[arg(value_enum)]
         kind: cmd::hook::Kind,
         /// Формат вывода и предел текста
@@ -703,6 +706,9 @@ enum QuestionCmd {
     },
 }
 
+// Doc-комментарии — справка clap (`zam … --help`): `[space:]path`, `ID[#СЕКЦИЯ]` — синтаксис
+// командной строки, а не ссылки rustdoc; текст справки не меняется ради rustdoc.
+#[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum IdeaCmd {
     /// Лента идей (по умолчанию new, proposed, deferred, accepted)
@@ -959,6 +965,9 @@ impl VaultOpts {
     }
 }
 
+// Doc-комментарии — справка clap (`zam … --help`): `[space:]path`, `ID[#СЕКЦИЯ]` — синтаксис
+// командной строки, а не ссылки rustdoc; текст справки не меняется ради rustdoc.
+#[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum CacheCmd {
     /// Сохранить выжимку (текст — из --file или stdin); печатает c_<id>
