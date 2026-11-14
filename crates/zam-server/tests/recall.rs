@@ -368,12 +368,12 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
         text.contains("ZeroAIMemory: LF в bash-скриптах [gotcha·hyp] i:"),
         "{text}"
     );
-    assert!(
-        text.contains(
-            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v6): обнови через `zam init` или WebUI"
-        ),
-        "{text}"
+    // номер текущего блока — из `AGENT_BLOCK_VERSION`: тест не правится при каждом новом блоке
+    let outdated = format!(
+        "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v{}): обнови через `zam init` или WebUI",
+        zam_core::AGENT_BLOCK_VERSION
     );
+    assert!(text.contains(&outdated), "{text}");
     assert!(
         text.lines()
             .any(|l| l.starts_with("ZeroAIMemory: запросы доступа") && l.contains(": 1 ")),

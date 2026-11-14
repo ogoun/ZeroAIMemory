@@ -12649,3 +12649,29 @@ Critical и Important нет. Minor — тесты и комментарий, п
 агента; если поток стоит внутри системной записи на диск, завершение процесса на Windows может
 ждать её конца — кодом не лечится, отметить в ТЗ §10.3 (→ 13c). `ZAM_TEST_TOUCH_FAIL` в release
 нет (фича `test-hooks` в упаковке не включается).
+
+### Minor повторного ревью 17d и итоговая проверка слитого кода (координатор, 2026-11-14)
+
+Minor 1–4 повторного ревью 17d (выше) сделаны:
+1. Комментарий `SendNote::late`: след при исчерпании `LOG_WAIT_MAX` — только при исходе «в
+   очереди»; после `SessionEnd` — со стартом следующей сессии (`flush_logged`, до трёх новых
+   очередей); при «отправлен» и «отброшен» строка теряется.
+2. Новая точка подмены `<кэш>/snapshot.log-stall-until-ms` (`test_point_until`, отладочная сборка и
+   `test-hooks`): поток держит замок до момента «старт процесса + N мс», `PUT` заглушки отвечает
+   сразу. `snapshot_outcome_survives_slow_log_write` — N = 1600 (хук застаёт замок после предела
+   ожидания ≈ 1,49 с и ждёт конца записи), строка — ровно одна и именно потока («…, в очереди:
+   HTTP 500»); `snapshot_log_wait_is_bounded` — N = 5000, журнал вызова пуст, следующий хук
+   пишет строку очереди. Запас до пути потока — ≈ 1,49 с вместо ≈ 170 мс.
+3. `late_waits_for_writer_when_lock_stays_busy`: замок отпускается через 50 мс (было 200).
+4. `old_changed_queue_survives_cache_gc_during_flush`: `ZAM_TEST_FLUSH_STALL_MS` = 1500.
+
+Итоговая проверка слитого кода (`.tmp/m6/task17d/verify-final.sh`, `target/t17d`, `-j 2`):
+- модульные `zam-cli` — 187 PASS; четыре изменённых теста `hooks` — 3 прогона подряд PASS;
+- откаты: H1 (оба теста FAIL), H3 (оба FAIL), D3 (FAIL) — `vf-rollbacks.out`, файлы восстановлены;
+- `cargo clippy --workspace --all-targets -- -D warnings` — чисто; `cargo fmt --all --check` —
+  чисто после форматирования одной строки;
+- `cargo test --workspace --no-fail-fast` (`ZAM_REQUIRE_ML=1`) — 196 наборов PASS, 1 FAIL:
+  `zam-server --test recall::digest_includes_rules_gotchas_revisit_changelog` ждал «(v1 → v6)» —
+  след задачи 13a (блок v7), набор `recall` она не запускала. Исправлено: номер из
+  `zam_core::AGENT_BLOCK_VERSION`; повтор `recall` — 43 PASS. Других зашитых «v6» в тестах нет;
+- WebUI: `npm run check` — 0 ошибок (968 файлов); `test:build` — 47 из 47.

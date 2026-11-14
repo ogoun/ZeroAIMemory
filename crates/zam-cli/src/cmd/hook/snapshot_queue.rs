@@ -577,8 +577,14 @@ impl SendNote {
     fn write(&self, env: &Env, line: &str) {
         let mut g = self.lock();
         if !matches!(*g, Stage::Logged) {
-            // точка подмены: запись строки «идёт» под замком (медленный диск)
+            // точки подмены: запись строки «идёт» под замком (медленный диск) — N мс или до
+            // момента «старт процесса + N мс»
             test_point(&env.cache_dir().join("snapshot"), "log-stall-ms");
+            test_point_until(
+                &env.cache_dir().join("snapshot"),
+                "log-stall-until-ms",
+                env.started,
+            );
             env.log(line);
             *g = Stage::Logged;
         }
@@ -607,8 +613,11 @@ impl SendNote {
     /// (диск стоит дольше) — хук выходит без строки: свою он написать не может (этап под замком,
     /// а вторая строка рядом со строкой потока была бы двойной), и ждать дольше нельзя — вывод
     /// хука (`decision: block` у `Stop`) ещё впереди, а агент убивает хук по своему тайм-ауту.
-    /// След в этом случае оставляет следующий хук сессии: снимок в очереди, и её отправка всегда
-    /// пишет строку итога ([`flush_noted`]).
+    /// След в этом случае остаётся, только если снимок остался в очереди (исход «в очереди»):
+    /// следующий хук сессии отправит её и запишет строку итога ([`flush_noted`]); после
+    /// `SessionEnd` это сделает старт следующей сессии в проекте ([`flush_logged`], до трёх самых
+    /// новых очередей и при достаточном бюджете). При исходах «отправлен» и «отброшен» (400, 413,
+    /// 422 — очередь удалена) строка этого вызова теряется.
     /// После своей строки хук отдаёт потоку остаток хвоста (уже без замка): опоздавший успевает
     /// доработать очередь. Хвост — ожидание конца потока внутри `late` — не дольше
     /// [`EXIT_LOG_RESERVE`] и не дольше остатка бюджета: предел ожидания потока уже вышел
@@ -1065,7 +1074,8 @@ const EXIT_LOG_RESERVE: Duration = Duration::from_millis(10);
 /// проекта — `<кэш>/snapshot.put-stall-ms`: между концом `PUT` и работой с очередью в [`flush`]
 /// (поток не успел обработать очередь и записать итог до выхода хука); `<кэш>/snapshot.log-stall-ms`
 /// — в [`SendNote::write`] под замком перед записью строки итога (запись в `hooks.log` дольше
-/// хвоста ожидания хука).
+/// хвоста ожидания хука); `<кэш>/snapshot.log-stall-until-ms` — там же, но до момента «старт
+/// процесса + N мс» ([`test_point_until`]).
 fn test_point(transcript: &Path, suffix: &str) {
     #[cfg(any(feature = "test-hooks", debug_assertions))]
     if let Some(ms) = std::fs::read_to_string(format!("{}.{suffix}", transcript.display()))
@@ -1076,6 +1086,23 @@ fn test_point(transcript: &Path, suffix: &str) {
     }
     #[cfg(not(any(feature = "test-hooks", debug_assertions)))]
     let _ = (transcript, suffix);
+}
+
+/// Точка подмены [`test_point`] с абсолютным временем: файл `<журнал>.<suffix>` с числом N —
+/// поток спит до момента `started + N мс` (если он ещё не прошёл). Тестам нужен момент
+/// относительно старта процесса, а не длительность от точки: путь потока до неё на занятом HDD
+/// длится по-разному (ревью 17d, повторное, Minor 2).
+fn test_point_until(transcript: &Path, suffix: &str, started: std::time::Instant) {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::fs::read_to_string(format!("{}.{suffix}", transcript.display()))
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        let until = started + Duration::from_millis(ms);
+        std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
+    }
+    #[cfg(not(any(feature = "test-hooks", debug_assertions)))]
+    let _ = (transcript, suffix, started);
 }
 
 /// Точка паники для тестов: файл `<журнал>.panic` — поток снимка `checkpoint` паникует (только
@@ -1391,14 +1418,15 @@ mod tests {
             env2.log("снимок stop, в очереди: срок PUT 100 мс");
             *g = Stage::Logged;
         });
-        // «запись» кончается через 200 мс после первого (неудачного) ожидания
+        // «запись» кончается через 50 мс после первого (неудачного) ожидания: вместе с созданием
+        // `hooks.log` на занятом HDD (до ~120 мс) — с запасом внутри `LOG_WAIT_MAX`
         let mut release = Some(release);
         let mut waits = 0;
         n.late_with(&env, "Stop", &mut || {
             waits += 1;
             if let Some(r) = release.take() {
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(200));
+                    std::thread::sleep(Duration::from_millis(50));
                     let _ = r.send(());
                 });
             }
