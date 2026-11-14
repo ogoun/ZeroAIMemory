@@ -626,15 +626,23 @@ impl SendNote {
     /// своего предела).
     fn late(&self, env: &Env, done: &std::sync::mpsc::Receiver<()>, event: &str) {
         let until = std::time::Instant::now() + EXIT_LOG_RESERVE;
-        self.late_with(env, event, &mut || {
+        let mut wait_done = || {
             let tail = tail_left(until, std::time::Instant::now(), env.budget_left());
             done.recv_timeout(tail).is_ok()
-        });
+        };
+        self.late_with(env, event, &mut wait_done, LOG_WAIT_MAX);
     }
 
-    /// [`SendNote::late`] с ожиданием конца потока `wait_done` (`true` — поток закончил):
-    /// в работе — сигнал потока не дольше хвоста, в тестах — подмена без времени.
-    fn late_with(&self, env: &Env, event: &str, wait_done: &mut dyn FnMut() -> bool) {
+    /// [`SendNote::late`] с ожиданием конца потока `wait_done` (`true` — поток закончил) и
+    /// пределом ожидания записи строки потоком `log_wait`: в работе — сигнал потока не дольше
+    /// хвоста и [`LOG_WAIT_MAX`], в тестах — подмена без времени и свой предел.
+    fn late_with(
+        &self,
+        env: &Env,
+        event: &str,
+        wait_done: &mut dyn FnMut() -> bool,
+        log_wait: Duration,
+    ) {
         use std::sync::TryLockError;
         let mut g = match self.stage.try_lock() {
             Ok(g) => g,
@@ -648,7 +656,7 @@ impl SendNote {
                     Err(TryLockError::Poisoned(e)) => e.into_inner(),
                     // запись строки потоком идёт дольше хвоста: ждать её конца, но с пределом
                     Err(TryLockError::WouldBlock) => {
-                        let until = std::time::Instant::now() + LOG_WAIT_MAX;
+                        let until = std::time::Instant::now() + log_wait;
                         loop {
                             match self.stage.try_lock() {
                                 Ok(g) => break g,
@@ -1349,7 +1357,7 @@ mod tests {
             release.send(()).unwrap();
             h.join().unwrap();
             true
-        });
+        }, LOG_WAIT_MAX);
         assert_eq!(waits, 1);
         assert_eq!(lines(&env), ["снимок stop, отправлен"]);
     }
@@ -1394,7 +1402,7 @@ mod tests {
                 h.join().unwrap();
             }
             false
-        });
+        }, LOG_WAIT_MAX);
         // ожидание до повтора замка и ещё одно — после строки хука (остаток бюджета потоку)
         assert_eq!(waits, 2);
         assert_eq!(
@@ -1418,8 +1426,12 @@ mod tests {
             env2.log("снимок stop, в очереди: срок PUT 100 мс");
             *g = Stage::Logged;
         });
-        // «запись» кончается через 50 мс после первого (неудачного) ожидания: вместе с созданием
-        // `hooks.log` на занятом HDD (до ~120 мс) — с запасом внутри `LOG_WAIT_MAX`
+        // «запись» кончается через 50 мс после первого (неудачного) ожидания плюс создание
+        // `hooks.log`. Предел здесь не проверяется (это `late_gives_up_…`): с `LOG_WAIT_MAX`
+        // тест падал под полным прогоном workspace на занятом HDD (запись шла дольше 200 мс,
+        // 2026-11-14), поэтому предел — щедрый. Выход без ожидания (откат пункта h) по-прежнему
+        // даёт пустой журнал.
+        const WRITER_WAIT: Duration = Duration::from_secs(10);
         let mut release = Some(release);
         let mut waits = 0;
         n.late_with(&env, "Stop", &mut || {
@@ -1431,7 +1443,7 @@ mod tests {
                 });
             }
             false
-        });
+        }, WRITER_WAIT);
         // строка потока уже в журнале к возврату `late`; второй строки нет
         assert_eq!(lines(&env), ["снимок stop, в очереди: срок PUT 100 мс"]);
         assert_eq!(waits, 2);
@@ -1457,7 +1469,7 @@ mod tests {
             n2.late_with(&env2, "Stop", &mut || {
                 waits += 1;
                 false
-            });
+            }, LOG_WAIT_MAX);
             let _ = done_tx.send((t.elapsed(), waits));
         });
         let got = done_rx.recv_timeout(LOG_WAIT_MAX + Duration::from_millis(1500));
