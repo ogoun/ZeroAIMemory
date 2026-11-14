@@ -630,13 +630,18 @@ impl SendNote {
             let tail = tail_left(until, std::time::Instant::now(), env.budget_left());
             done.recv_timeout(tail).is_ok()
         };
-        self.late_with(env, event, &mut wait_done, LOG_WAIT_MAX);
+        self.late_with(env, event, &mut wait_done);
     }
 
-    /// [`SendNote::late`] с ожиданием конца потока `wait_done` (`true` — поток закончил) и
-    /// пределом ожидания записи строки потоком `log_wait`: в работе — сигнал потока не дольше
-    /// хвоста и [`LOG_WAIT_MAX`], в тестах — подмена без времени и свой предел.
-    fn late_with(
+    /// [`SendNote::late`] с ожиданием конца потока `wait_done` (`true` — поток закончил):
+    /// в работе — сигнал потока не дольше хвоста, в тестах — подмена без времени.
+    fn late_with(&self, env: &Env, event: &str, wait_done: &mut dyn FnMut() -> bool) {
+        self.late_bounded(env, event, wait_done, LOG_WAIT_MAX);
+    }
+
+    /// [`SendNote::late_with`] с пределом ожидания записи строки потоком `log_wait`
+    /// (в работе — [`LOG_WAIT_MAX`]; тест ожидания задаёт свой, чтобы не зависеть от диска).
+    fn late_bounded(
         &self,
         env: &Env,
         event: &str,
@@ -1357,7 +1362,7 @@ mod tests {
             release.send(()).unwrap();
             h.join().unwrap();
             true
-        }, LOG_WAIT_MAX);
+        });
         assert_eq!(waits, 1);
         assert_eq!(lines(&env), ["снимок stop, отправлен"]);
     }
@@ -1402,7 +1407,7 @@ mod tests {
                 h.join().unwrap();
             }
             false
-        }, LOG_WAIT_MAX);
+        });
         // ожидание до повтора замка и ещё одно — после строки хука (остаток бюджета потоку)
         assert_eq!(waits, 2);
         assert_eq!(
@@ -1434,16 +1439,21 @@ mod tests {
         const WRITER_WAIT: Duration = Duration::from_secs(10);
         let mut release = Some(release);
         let mut waits = 0;
-        n.late_with(&env, "Stop", &mut || {
-            waits += 1;
-            if let Some(r) = release.take() {
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(50));
-                    let _ = r.send(());
-                });
-            }
-            false
-        }, WRITER_WAIT);
+        n.late_bounded(
+            &env,
+            "Stop",
+            &mut || {
+                waits += 1;
+                if let Some(r) = release.take() {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(50));
+                        let _ = r.send(());
+                    });
+                }
+                false
+            },
+            WRITER_WAIT,
+        );
         // строка потока уже в журнале к возврату `late`; второй строки нет
         assert_eq!(lines(&env), ["снимок stop, в очереди: срок PUT 100 мс"]);
         assert_eq!(waits, 2);
@@ -1469,7 +1479,7 @@ mod tests {
             n2.late_with(&env2, "Stop", &mut || {
                 waits += 1;
                 false
-            }, LOG_WAIT_MAX);
+            });
             let _ = done_tx.send((t.elapsed(), waits));
         });
         let got = done_rx.recv_timeout(LOG_WAIT_MAX + Duration::from_millis(1500));
