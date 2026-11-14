@@ -4371,6 +4371,12 @@ UTC, без прогонов на GPU): 182 цели, **2600 PASS, 3 FAIL, 34 ig
   повторов — `mask_text` на таком тексте не идемпотентна (фикстура
   `crates/zam-secrets/tests/fixtures/scan_depth_capped.txt`); сейчас — предупреждение
   `secrets_scan_depth`. Варианты — в разделе «Задача 15b (исполнитель)».
+- Задача 13c, ревью координатора правок до выпуска (2026-11-14): срок признака копии — одной
+  функцией `BackupConfig::flag_max_age()` (сейчас `serve`, `backup` и `restore` считают его
+  каждый сам); размер из описи — параметром `with_reader` (ранний `Oversize`, до чтения потока);
+  тест-сторож литералов `"ZAM_` в `zam-cli/src` против `CLIENT_ENV_VARS` и `RESERVED_ENV`;
+  `include_history` в схеме `memory_search`, версии Qdrant и ORT в `/health`, показ
+  `unattributed`, `no_recent_backup` в WebUI, решение по `area.toml`.
 - Перенос памяти (спецификация §12б): страница бэкапа и импорт в WebUI (ТЗ §15), `zam-server doctor`,
   `zam-server rollback --to v<N>`, сборщик мусора блобов (и вместе с ним — согласованность копии
   блобов при удалении).
@@ -12946,6 +12952,44 @@ Worktree `.tmp/m6/wt-b`, ветка `m6-portability` (база `d4892e2`, вес
 
 Метки 13b по сокращённой приёмке (стенд Linux, `code-bench`, p95 фокуса на GPU, справочные
 наборы) заменены фактом «не переснималось в 0.0.11-m6» с числами задач 7b, 8c, 9, 14, 18c.
+
+#### Ревью координатора правок до выпуска (`58e0906`, `06a4862`): принять, мелкие (2026-11-14)
+
+1. ТЗ §7.6, «Правила флагов командной строки»: вместо «протокол … говорят „во всех текстовых
+   полях“» записано «с 13c — „только в командах снимка“ (тест `guide_has_focus_rejected_snapshot`)».
+2. `backup/restore.rs` `need_space` — сумма с насыщением (`saturating_add`, как `with_margin`).
+   Раньше сфабрикованная опись с двумя записями по 2^63 байт в release давала сумму 0: проверка
+   места проходила, а `copy_bounded` фактически не ограничивал копию. Тест
+   `backup::restore_huge_manifest_sizes_no_space`: `NoSpace { need: u64::MAX }`, сборки
+   `.restore-staging` нет, каталог данных пуст.
+3. Опись `manifest.json` читается не больше `manifest::MANIFEST_MAX` (64 МиБ) — `read_limited`,
+   и из каталога, и из zip. Больше — `BadArchive` «опись manifest.json больше 64 МиБ». Юнит
+   `backup::manifest::tests::manifest_read_is_bounded` (сверх предела — отказ, ровно предел —
+   читается).
+4. Doc `copy_bounded`: при `Oversize` записанный `dst` (размер описи + 1 байт) остаётся, его
+   убирает вызывающий — каталог сборки целиком.
+5. `zam-cli` `main.rs`: у каждого перечисления — свои примеры скобок в комментарии к `#[allow]`:
+   `Cmd` — `[space:]path`, `[[Имя]]`; `IdeaCmd` — `[ideas]`; `CacheCmd` — `ID[#СЕКЦИЯ][@REV]`.
+6. `zam-core`: константы `SESSION_ENV` (`ZAM_SESSION`) и `AGENT_FLAG_ENV` (`ZAM_AGENT`) — в
+   `CLIENT_ENV_VARS` и в `zam-cli` `hook/mod.rs` (`launched_by_agent`, `agent_session_from`);
+   `session_snapshot.rs` берёт `zam_core::MCP_SESSION_ENV`. Doc `CLIENT_ENV_VARS`: `ZAM_URL` и
+   `ZAM_TOKEN` `zam` тоже читает, но это адрес и секрет — их пропускает `RESERVED_ENV` сервера.
+   `zam-cli/tests/common/mod.rs` — «все `CLIENT_ENV_VARS`» вместо перечня из четырёх.
+7. `guide.en.md`: «Only in snapshot commands (their first line) does the client also mask …».
+
+**→ M7** (ТЗ §19, «Передать в M7»): `BackupConfig::flag_max_age()`; размер из описи — параметром
+`with_reader` (ранний `Oversize`); тест-сторож литералов `"ZAM_` в `zam-cli/src`.
+
+**Откаты** (`.tmp/t13c/coord/rollback2.py`, восстановлено, sha256 совпали): R5 сумма без
+насыщения → `restore_huge_manifest_sizes_no_space` FAIL («attempt to add with overflow»); R6
+опись без отказа сверх предела → `manifest_read_is_bounded` FAIL.
+
+**Прогоны** (итоговый код):
+- `zam-server`: `--lib backup::manifest` 2, `backup` 44, `agent_setup` 15 — PASS;
+- `zam-cli` юниты 187 (+1 ignored) — PASS;
+- `cargo clippy -p zam-core -p zam-cli -p zam-server --all-targets -- -D warnings` — чисто;
+- `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --workspace --no-deps` — чисто;
+- `cargo fmt --all --check` — чисто.
 
 ### Открытые вопросы и ответы координатора (2026-11-14)
 

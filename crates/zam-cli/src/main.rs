@@ -25,7 +25,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-// Doc-комментарии — справка clap (`zam … --help`): `[space:]path`, `ID[#СЕКЦИЯ]` — синтаксис
+// Doc-комментарии — справка clap (`zam … --help`): `[space:]path`, `[[Имя]]` — синтаксис
 // командной строки, а не ссылки rustdoc; текст справки не меняется ради rustdoc.
 #[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
@@ -706,8 +706,8 @@ enum QuestionCmd {
     },
 }
 
-// Doc-комментарии — справка clap (`zam … --help`): `[space:]path`, `ID[#СЕКЦИЯ]` — синтаксис
-// командной строки, а не ссылки rustdoc; текст справки не меняется ради rustdoc.
+// Doc-комментарии — справка clap (`zam idea … --help`): `[ideas]` — секция конфигурации
+// сервера, а не ссылка rustdoc; текст справки не меняется ради rustdoc.
 #[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum IdeaCmd {
@@ -965,8 +965,8 @@ impl VaultOpts {
     }
 }
 
-// Doc-комментарии — справка clap (`zam … --help`): `[space:]path`, `ID[#СЕКЦИЯ]` — синтаксис
-// командной строки, а не ссылки rustdoc; текст справки не меняется ради rustdoc.
+// Doc-комментарии — справка clap (`zam cache … --help`): `ID[#СЕКЦИЯ][@REV]` — синтаксис
+// командной строки, а не ссылка rustdoc; текст справки не меняется ради rustdoc.
 #[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum CacheCmd {

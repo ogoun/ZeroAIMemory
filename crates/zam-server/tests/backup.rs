@@ -1012,6 +1012,31 @@ async fn restore_oversize_file_bounded_by_manifest() {
     assert_eq!(std::fs::metadata(&probe).unwrap().len(), 11);
 }
 
+/// Опись с огромными размерами (две записи по 2^63 байт): сумма места не переполняется (в release
+/// — ноль, и проверка места проходила бы), отказ «мало места» — до записи в каталог данных.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_huge_manifest_sizes_no_space() {
+    let _g = CHUNKER.read().await;
+    let (copy, _, _, _) = copy_of("rs-huge-sizes").await;
+    let mut m = read_manifest(&copy);
+    for f in m.files.iter_mut().take(2) {
+        f.size = 1 << 63;
+    }
+    std::fs::write(
+        copy.join(MANIFEST_FILE),
+        serde_json::to_string_pretty(&m).unwrap(),
+    )
+    .unwrap();
+    let dst = dst_cfg("rs-huge-sizes-dst");
+    match restore(&dst, &copy, &RestoreOpts::default()).await {
+        Err(BackupError::NoSpace { need, .. }) => assert_eq!(need, u64::MAX),
+        other => panic!("ожидался NoSpace: {other:?}"),
+    }
+    let root = &dst.data_dir;
+    assert!(!root.join(".restore-staging").exists());
+    assert!(!root.join("system.db").exists());
+}
+
 /// Срок признака копии у `restore` — из конфигурации (`backup.flag_max_hours`), как у `backup`:
 /// удерживаемый признак старше срока считается брошенным, и восстановление идёт.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

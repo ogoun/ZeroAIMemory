@@ -148,10 +148,8 @@ impl Source {
         match self {
             Source::Dir(d) => Manifest::read(d),
             Source::Zip(z) => {
-                let mut e = z.by_name(MANIFEST_FILE).map_err(zip_err)?;
-                let mut text = String::new();
-                e.read_to_string(&mut text)?;
-                Manifest::parse(&text)
+                let e = z.by_name(MANIFEST_FILE).map_err(zip_err)?;
+                Manifest::parse(&manifest::read_limited(e)?)
             }
         }
     }
@@ -205,7 +203,8 @@ const STAGING: &str = ".restore-staging";
 
 /// Копирует `r` в `dst` не больше `size + 1` байт (размер файла по описи и один байт, чтобы
 /// заметить превышение), считая SHA-256 при записи: подменённый или испорченный файл копии не
-/// заполнит диск до сверки суммы. Превышение — [`BackupError::Oversize`].
+/// заполнит диск до сверки суммы. Превышение — [`BackupError::Oversize`]; записанный `dst`
+/// (размер описи + 1 байт) остаётся — его убирает вызывающий (каталог сборки целиком).
 pub fn copy_bounded(
     r: &mut dyn Read,
     dst: &Path,
@@ -275,20 +274,21 @@ fn stage_files(src: &mut Source, m: &Manifest, staging: &Path) -> Result<Vec<Kin
 }
 
 /// Место восстановления: файлы копии и копии `bak-v<N>` баз, которые при открытии мигрируют
-/// (схема старше программы), плюс 10 %.
+/// (схема старше программы), плюс 10 %. Сумма — с насыщением: опись с огромными размерами даёт
+/// `u64::MAX` и отказ «мало места» до записи, а не переполнение (в release — ноль).
 fn need_space(m: &Manifest, kinds: &[Kind]) -> u64 {
     let sys_max = zam_store::SYSTEM_MIGRATIONS.len() as u32;
     let user_max = USER_MIGRATIONS.len() as u32;
     let mut n = 0u64;
     for (f, k) in m.files.iter().zip(kinds) {
-        n += f.size;
+        n = n.saturating_add(f.size);
         let max = match k {
             Kind::SystemDb => sys_max,
             Kind::UserDb(_) => user_max,
             Kind::Blob { .. } => continue,
         };
         if m.schemas.get(&f.path).is_some_and(|v| *v < max) {
-            n += f.size;
+            n = n.saturating_add(f.size);
         }
     }
     with_margin(n)

@@ -700,7 +700,7 @@ fn codex_runtime_var(name: &str) -> bool {
 /// ([`codex_runtime_var`]) или явный `ZAM_AGENT=1`.
 pub fn launched_by_agent(get: &impl Fn(&str) -> Option<String>, names: &[String]) -> bool {
     let one = |k: &str| get(k).is_some_and(|v| v.trim() == "1");
-    one("CLAUDECODE") || one("ZAM_AGENT") || names.iter().any(|n| codex_runtime_var(n))
+    one("CLAUDECODE") || one(zam_core::AGENT_FLAG_ENV) || names.iter().any(|n| codex_runtime_var(n))
 }
 
 /// Id сессии из переменной: непустой, до 128 печатных символов.
@@ -718,7 +718,7 @@ pub fn agent_session_from(
     names: &[String],
     current: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    if let Some(v) = get("ZAM_SESSION") {
+    if let Some(v) = get(zam_core::SESSION_ENV) {
         if v.trim() == "-" {
             return None;
         }

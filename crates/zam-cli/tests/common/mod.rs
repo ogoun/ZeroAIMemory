@@ -3,8 +3,7 @@
 //!
 //! - [`zam_cmd`] — `zam` без системного прокси, без переменных агента
 //!   ([`zam_core::AGENT_ENV_VARS`]: `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, переменные Codex),
-//!   без клиентских ([`zam_core::CLIENT_ENV_VARS`]: `ZAM_SESSION`, `ZAM_AGENT`, `ZAM_MACHINE`,
-//!   `ZAM_SESSION_ID`) и
+//!   без клиентских (все [`zam_core::CLIENT_ENV_VARS`]) и
 //!   без любых других `ZAM_*` процесса тестов; нужные значения тест задаёт сам после вызова.
 //!   Иначе `zam`, запущенный из сессии агента, писал бы в журнал этой сессии.
 //! - [`sandbox`] — каталог теста `<CARGO_TARGET_TMPDIR>/<префикс>-<имя>/w`, а уровнем выше —

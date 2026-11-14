@@ -101,14 +101,21 @@ pub const EXPORT_IDLE_ENV: &str = "ZAM_EXPORT_IDLE_SECS";
 /// Предел отсутствия хода задания `zam import`, с (M6 §12б.5).
 pub const IMPORT_IDLE_ENV: &str = "ZAM_IMPORT_IDLE_SECS";
 
+/// Явная сессия команд `zam` (`X-Zam-Session`; `-` — без сессии).
+pub const SESSION_ENV: &str = "ZAM_SESSION";
+
+/// Явный признак «команду запустил агент» (`ZAM_AGENT=1`).
+pub const AGENT_FLAG_ENV: &str = "ZAM_AGENT";
+
 /// Клиентские переменные `zam` (не агента): явная сессия хуков, признак агента, имя машины,
 /// сессия `zam mcp`, пределы ожидания `zam export`/`zam import`. Сервер не читает их как ключи
 /// конфигурации (иначе такая переменная в окружении пользователя — неизвестный ключ, и сервер
 /// не стартует), тесты убирают их из окружения дочернего `zam`. Новая переменная, которую читает
-/// `zam`, добавляется сюда.
+/// `zam`, добавляется сюда. `ZAM_URL` и `ZAM_TOKEN` `zam` тоже читает, но они не здесь: это адрес и
+/// секрет, сервер пропускает их своим списком (`RESERVED_ENV` в `zam-server`).
 pub const CLIENT_ENV_VARS: [&str; 6] = [
-    "ZAM_SESSION",
-    "ZAM_AGENT",
+    SESSION_ENV,
+    AGENT_FLAG_ENV,
     MACHINE_ENV,
     MCP_SESSION_ENV,
     EXPORT_IDLE_ENV,

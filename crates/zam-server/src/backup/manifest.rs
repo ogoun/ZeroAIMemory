@@ -130,12 +130,30 @@ pub fn local(root: &Path, path: &str) -> PathBuf {
     path.split('/').fold(root.to_path_buf(), |p, s| p.join(s))
 }
 
+/// Предел описи `manifest.json` при чтении копии: опись с путями и суммами 100 000 блобов —
+/// около 20 МиБ; больше — испорченная или подложенная копия, а не память процесса `restore`.
+pub const MANIFEST_MAX: u64 = 64 << 20;
+
+/// Читает опись не больше [`MANIFEST_MAX`] байт; больше — [`BackupError::BadArchive`].
+pub fn read_limited(r: impl Read) -> Result<String, BackupError> {
+    let mut buf = Vec::new();
+    r.take(MANIFEST_MAX + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MANIFEST_MAX {
+        return Err(BackupError::BadArchive(format!(
+            "опись {MANIFEST_FILE} больше {} МиБ",
+            MANIFEST_MAX >> 20
+        )));
+    }
+    String::from_utf8(buf)
+        .map_err(|e| BackupError::BadArchive(format!("опись не разбирается: {e}")))
+}
+
 impl Manifest {
-    /// Читает опись из `root/manifest.json`.
+    /// Читает опись из `root/manifest.json` (не больше [`MANIFEST_MAX`]).
     pub fn read(root: &Path) -> Result<Manifest, BackupError> {
-        let text = std::fs::read_to_string(root.join(MANIFEST_FILE))
+        let f = std::fs::File::open(root.join(MANIFEST_FILE))
             .map_err(|e| BackupError::BadArchive(format!("нет описи {MANIFEST_FILE}: {e}")))?;
-        Self::parse(&text)
+        Self::parse(&read_limited(f)?)
     }
 
     /// Разбор и проверка формата описи.
@@ -161,6 +179,19 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Опись больше [`MANIFEST_MAX`] — `BadArchive` без чтения дальше предела; ровно предел —
+    /// читается.
+    #[test]
+    fn manifest_read_is_bounded() {
+        let big = std::io::repeat(b' ').take(MANIFEST_MAX + 10);
+        match read_limited(big) {
+            Err(BackupError::BadArchive(m)) => assert!(m.contains("больше 64 МиБ"), "{m}"),
+            other => panic!("ожидался BadArchive: {other:?}"),
+        }
+        let at = std::io::repeat(b' ').take(MANIFEST_MAX);
+        assert_eq!(read_limited(at).unwrap().len() as u64, MANIFEST_MAX);
+    }
 
     #[test]
     fn classify_rejects_escapes() {

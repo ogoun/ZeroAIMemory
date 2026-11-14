@@ -74,7 +74,7 @@ pub fn run(
         )));
     }
     let explicit = hook::session_var(session.map(str::to_string))
-        .or_else(|| hook::session_var(std::env::var("ZAM_SESSION_ID").ok()));
+        .or_else(|| hook::session_var(std::env::var(zam_core::MCP_SESSION_ENV).ok()));
     let cwd = std::env::current_dir().unwrap_or_default();
     let hook_agent = match agent {
         AgentKind::Claude => hook::Agent::Claude,
