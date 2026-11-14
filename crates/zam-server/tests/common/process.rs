@@ -52,7 +52,12 @@ const TAIL: usize = 60;
 /// Команда `zam-server` без унаследованных переменных `ZAM_*` окружения теста
 /// (в CI задана `ZAM_REQUIRE_ML`, а сервер читает `ZAM_*` как ключи конфигурации).
 pub fn command() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zam-server"));
+    command_for(Path::new(env!("CARGO_BIN_EXE_zam-server")))
+}
+
+/// То же для другого исполняемого файла сервера (бинарник тега — приёмка M6, задача 13b).
+pub fn command_for(exe: &Path) -> Command {
+    let mut cmd = Command::new(exe);
     for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("ZAM_")) {
         cmd.env_remove(k);
     }
@@ -76,7 +81,12 @@ pub struct ServerProc {
 impl ServerProc {
     /// Запускает `zam-server serve --config <conf>`; `addr` — `server.bind` конфига.
     pub fn start(conf: &Path, addr: SocketAddr) -> ServerProc {
-        let mut child = command()
+        Self::start_exe(Path::new(env!("CARGO_BIN_EXE_zam-server")), conf, addr)
+    }
+
+    /// То же, что [`ServerProc::start`], для исполняемого файла `exe` (бинарник тега).
+    pub fn start_exe(exe: &Path, conf: &Path, addr: SocketAddr) -> ServerProc {
+        let mut child = command_for(exe)
             .arg("serve")
             .arg("--config")
             .arg(conf)
