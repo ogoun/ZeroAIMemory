@@ -220,6 +220,9 @@ pub struct McpInfo {
     pub nuggets_fingerprint: String,
     /// Отпечатки сверены с `nuggets.lock` (`false` — замка нет, прогон до заморозки).
     pub frozen: bool,
+    /// `--targets-of`: цели корпуса — как у этого выпуска-базы (§3.3), иначе — у сервера плеча.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub targets_of: Option<String>,
     /// Цели корпуса, которых старый сервер не умеет (не созданы в этом плече): `<цель>: <причина>`,
     /// например `contradicts p01-h→p01-t: …` — только перечень для отчёта.
     pub excluded: Vec<String>,
@@ -1762,8 +1765,23 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
             );
         }
     }
+    // цели корпуса: что умеет сервер плеча и — с `--targets-of` — выпуск-база (§3.3)
+    let targets = match a.targets_of.as_deref() {
+        Some(v) => caps::Targets::of(&caps).and(caps::Targets::of_release(v)?),
+        None => caps::Targets::of(&caps),
+    };
+    let who = match a.targets_of.as_deref() {
+        Some(v) => format!("{} (цели корпуса — как у {v})", caps.tag()),
+        None => caps.tag(),
+    };
+    if let Some(v) = &a.targets_of {
+        println!(
+            "цели корпуса — как у {v}: contradicts {}, вложения {}",
+            targets.contradicts, targets.attachments
+        );
+    }
     let mut index_sets: Vec<(String, String)> = Vec::new();
-    if caps.attachments {
+    if targets.attachments {
         // PDF набора разбирает pdfium сервера (`docs.pdfium_dylib` — с M5, как у eval --docs)
         index_sets.push((
             "docs.pdfium_dylib".into(),
@@ -1781,24 +1799,23 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     };
     let mut s0 = Session::start(p, &index_spec, &server, true)?;
     s0.check_model()?;
-    if !caps.contradicts {
+    if !targets.contradicts {
         s0.without_contradicts();
     }
     s0.load_corpus(&set.corpus)?;
-    let docs = if caps.attachments {
+    let docs = if targets.attachments {
         load_docs(&mut s0, &p.docs)?
     } else {
         DocMap::new()
     };
     let (excluded, excluded_scenarios) = {
         let (mut excluded, mut excluded_scenarios) =
-            excluded_by_edges(&chosen, s0.skipped_edges(), &caps.tag());
-        if !caps.attachments {
+            excluded_by_edges(&chosen, s0.skipped_edges(), &who);
+        if !targets.attachments {
             excluded.push(format!(
-                "вложения eval/docs: у сервера {} нет (с 0.0.7-m5) — не загружены",
-                caps.tag()
+                "вложения eval/docs: у сервера {who} нет (с 0.0.7-m5) — не загружены"
             ));
-            excluded_scenarios.extend(excluded_by_attachments(&chosen, &caps.tag()));
+            excluded_scenarios.extend(excluded_by_attachments(&chosen, &who));
         }
         (excluded, excluded_scenarios)
     };
@@ -1941,6 +1958,7 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 corpus_fingerprint: set.corpus_fingerprint.clone(),
                 nuggets_fingerprint: set.nuggets_fingerprint.clone(),
                 frozen: set.frozen,
+                targets_of: a.targets_of.clone(),
                 excluded: excluded.clone(),
                 excluded_scenarios: excluded_scenarios.clone(),
                 docs_loaded: docs.values().cloned().collect(),
