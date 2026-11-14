@@ -16,7 +16,7 @@
     {"date": "2026-11-14", "model": "bge-m3-fp16",
      "ts2": {"<агент>": {"m6": arm.json, "b56": arm.json, "b57": arm.json, "aa": arm.json?,
                          "vs_b56": cmp.json, "vs_b57": cmp.json, "aa_vs_m6": cmp.json?,
-                         "attempt": 1}},
+                         "attempt": 1, "idea_hint_exceptions": {"count": 0, "events": []}?}},
      "ts1": {"cuda": cmp-mean.json, "cpu": cmp.json, "dev_aa": cmp.json?,
              "control": {"verdict": "ok" | "<расхождения>", "files": [a.json, b.json]}},
      "quality": [{"name": "...", "cmp": run.json, "base": base.json}, ...],
@@ -80,6 +80,14 @@ def required_by_profile(arm):
     return {k: {'found': f, 'total': t} for k, (f, t) in out.items()}
 
 
+def idea_match_ok(match, exceptions):
+    """Совпадение подсказок-идей с B5.7: все события, кроме расхождений по стоп-основам."""
+    if not match or not match.get('total'):
+        return True
+    n = (exceptions or {}).get('count', 0)
+    return match['found'] + n == match['total']
+
+
 def ts2_block(agent, c, files):
     m6, b56, b57 = load(c['m6']), load(c['b56']), load(c['b57'])
     v56, v57 = load(c['vs_b56']), load(c['vs_b57'])
@@ -120,6 +128,9 @@ def ts2_block(agent, c, files):
         'idea_hints_match_b57': v57.get('idea_hints_match'),
         'misses': misses,
         'noise_aa_p95': noise,
+        # расхождения подсказок-идей с B5.7 по правилу стоп-основ задачи 16 (предрегистрация 13b):
+        # {"count": N, "events": [...]} — разбор по текстам ответов, вносится в конфиг
+        'idea_hint_exceptions': c.get('idea_hint_exceptions'),
     }
     rf = out['r_full_vs_b56']['standard']
     rn = out['r_norules_vs_b57']['standard']
@@ -131,6 +142,8 @@ def ts2_block(agent, c, files):
         'd_hint_recall_lo_ge_-0_02': dh is not None and dh['lo'] >= TS2_D_HINT_MIN,
         'd_hint_recall_strict_lo_ge_-0_02': dhs is not None and dhs['lo'] >= TS2_D_HINT_MIN,
         'idea_hint_recall_1_0': share(out['idea_hint_recall_m6']) in (None, 1.0),
+        'idea_hints_match_b57': idea_match_ok(out['idea_hints_match_b57'],
+                                              out['idea_hint_exceptions']),
         'no_reps_with_misses': all(not v['reps_with_misses'] for v in misses.values()),
         'same_utc_day': len(set(out['date_utc'].values())) == 1,
     }
