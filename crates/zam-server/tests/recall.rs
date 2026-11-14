@@ -2757,19 +2757,23 @@ fn has_timeout_warning(j: &Value) -> bool {
         .is_some_and(|w| w.contains(&json!("recall timeout")))
 }
 
-/// CR-7 (§17 п. 25): шаг сбора задержан на 600 мс — со сроком сервера по умолчанию (200 мс)
-/// дайджест неполный и с `recall timeout`; тот же запрос с `timeout_ms: 1000` — полный дайджест
-/// без предупреждения. Старый клиент без поля — прежний срок `recall.timeout_ms`.
+/// CR-7 (§17 п. 25): шаг сбора задержан на 400 мс — со сроком сервера по умолчанию (200 мс)
+/// дайджест неполный и с `recall timeout`; тот же запрос с `timeout_ms: 2000` (предел поля по
+/// умолчанию) — полный дайджест без предупреждения. Старый клиент без поля — прежний срок
+/// `recall.timeout_ms`. Запас после задержки — 1,6 с: с 600 + 1000 мс тест падал под полным
+/// прогоном workspace на HDD (сбор 965 мс, 2026-11-14).
 #[tokio::test]
 async fn recall_timeout_ms_param_full_digest() {
     let a = api("recall-timeout-param", |c| {
         assert_eq!(c.recall.timeout_ms, 200, "умолчание сервера");
+        assert_eq!(c.recall.max_timeout_ms, 2000, "предел поля");
     })
     .await;
     allow_rules(&a).await;
     a.note("rules", "срок", "# Срок\n\nПравило про звёздный срок.\n")
         .await;
-    let _d = RecallDelay::set(&a, 600);
+    const DELAY_MS: u64 = 400;
+    let _d = RecallDelay::set(&a, DELAY_MS);
     let j = ok(&a, &a.token, Some("tp1"), json!({"event": "session_start"})).await;
     assert!(has_timeout_warning(&j), "без timeout_ms — срок 200 мс: {j}");
     assert!(!j["text"].as_str().unwrap().contains("звёздный"), "{j}");
@@ -2778,10 +2782,11 @@ async fn recall_timeout_ms_param_full_digest() {
         &a,
         &a.token,
         Some("tp2"),
-        json!({"event": "session_start", "timeout_ms": 1000}),
+        json!({"event": "session_start", "timeout_ms": 2000}),
     )
     .await;
-    assert!(t.elapsed().as_millis() >= 600, "{:?}", t.elapsed());
+    let waited = t.elapsed();
+    assert!(waited.as_millis() >= u128::from(DELAY_MS), "{waited:?}");
     assert!(!has_timeout_warning(&j), "{j}");
     assert!(j["text"].as_str().unwrap().contains("звёздный"), "{j}");
 }
