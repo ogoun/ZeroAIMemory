@@ -23,8 +23,10 @@
   поле `type` problem+json).
 - **Тела запросов** части маршрутов (около половины структур тел) разбираются строго
   (`deny_unknown_fields`): неизвестное поле — 400. Поэтому новое поле запроса клиент шлёт, только убедившись по
-  `features`, что сервер его знает. Исключение — `POST /recall`: неизвестные поля его тела
-  игнорируются (клиент хуков бывает новее сервера).
+  `features`, что сервер его знает. Исключения — `POST /recall` и `PUT /sessions/{id}/snapshot`:
+  неизвестные поля их тел игнорируются (клиент хуков бывает новее сервера). Тело
+  `POST /sessions` разбирается строго: сервер до M6 на `new_epoch` и `holdout` отвечает 400 —
+  шлите их отдельным запросом, как хуки `zam`.
 - **Ошибки** — `application/problem+json` с `type`, `title`, `status`, `detail`.
 - **Ответы MCP** — Markdown для агента; стабильный контракт — у REST и у `format: "json"` MCP
   (JSON ответа REST в тексте).
@@ -62,7 +64,7 @@
 | `backup` | M6 §12б.2–§12б.3 | Команды сервера `zam-server backup` и `restore` (полная копия каталога данных). |
 | `export` | M6 §12б.5 | `GET /spaces/{space}/export` — архив пространства. |
 | `import` | M6 §12б.5 | `POST /spaces/{space}/import` и `GET /spaces/{space}/imports/{job}`. |
-| `recall_timeout` | M6 §16 п. 19 (CR-7) | Поле `timeout_ms` тела `POST /recall` (1..=`max(recall.max_timeout_ms, recall.timeout_ms)`, по умолчанию 2000) и в `memory_recall`. |
+| `recall_timeout` | M6 §16 п. 19 (CR-7) | Поле `timeout_ms` тела `POST /recall` и аргумент `memory_recall`: 1..=`max(recall.max_timeout_ms, recall.timeout_ms)` (предел `recall.max_timeout_ms` по умолчанию 2000); без поля — `recall.timeout_ms` (200). |
 | `idempotent_nodes` | M6 §16 п. 19 (CR-20) | `Idempotency-Key` у `POST /nodes`, `PUT` и `PATCH /nodes/{id}`; `idempotency_key` у `memory_write`. |
 | `mcp_session_arg` | M6 §16 п. 19 (CR-8) | Аргумент `session_id` у `memory_recall`, `memory_search`, `memory_read` — явная сессия для учёта и отметок, как `X-Zam-Session`. |
 
@@ -83,13 +85,17 @@
   побеждал аргумент (учёт же шёл в сессию заголовка); теперь такой вызов — ошибка. Учёт выданного (`session_tokens`, событие `mcp`), отметки «уже выдавалось» и
   счётчик записей идут в эту сессию.
 - Без явной сессии MCP подставляет последнюю сессию хуков только для счётчика записей, а
-  выданное учитывает в `GET /sessions/unattributed`.
+  выданное учитывает в `GET /sessions/unattributed`. Подставляется незавершённая сессия **верхнего
+  уровня** (не субагента) пользователя токена, к которой обращались не позже 12 ч назад; с
+  `X-Zam-Machine` — только той же машины, с `X-Zam-Solution` — того же решения. Отметок «уже
+  выдавалось» неявная сессия не ставит.
+- `session_id` — один постоянный id на сессию, до 128 символов.
 
 ## Срок `/recall` (`recall_timeout`)
 
 `POST /recall {…, timeout_ms}` — срок сбора подсказок этого запроса, мс. Без поля действует
 `recall.timeout_ms` сервера (200: бюджет хуков). Допустимо 1..=`max(recall.max_timeout_ms,
-recall.timeout_ms)` (по умолчанию 2000), иначе 400: если срок сервера больше предела поля
+recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), иначе 400: если срок сервера больше предела поля
 (сетки замера ставят 60000), явно попросить можно и его. Нативный агент, который может подождать, шлёт, например, `timeout_ms: 1000`
 и получает полный дайджест там, где хук получил бы собранное и `warnings: ["recall timeout"]`.
 
