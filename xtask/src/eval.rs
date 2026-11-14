@@ -196,9 +196,10 @@ pub struct EvalArgs {
     #[arg(long, value_name = "FILE")]
     pub scenarios: Option<PathBuf>,
     /// --via mcp и --sessions без прогона: сохранённое плечо (JSON) сравнивается с каждым
-    /// --compare
+    /// --compare; у --via mcp можно повторять — повторы одного плеча (K индексаций), тогда
+    /// --compare — повторы базы и сравнение идёт по среднему на сценарий (методика M6, правило 3)
     #[arg(long, value_name = "FILE")]
-    pub arm: Option<PathBuf>,
+    pub arm: Vec<PathBuf>,
     /// Гейт без справочного прогона fp16 на CUDA (GPU занят): вердикт — по int8 и fp32 на CPU
     #[arg(long, requires = "quality_gate")]
     pub skip_cuda: bool,
@@ -249,6 +250,11 @@ pub struct EvalArgs {
     /// моделью на том же каталоге — состав пачек эмбеддера не зависит от темпа загрузки (M6)
     #[arg(long, conflicts_with = "reuse")]
     pub preload: bool,
+    /// --tokens --via mcp: цели корпуса — как у выпуска-базы (`0.0.5-m4`): чего он не умеет
+    /// создать (связь `contradicts`, вложения `eval/docs`), не создаётся и у этого плеча, а
+    /// затронутые сценарии исключаются (спецификация M6 §3.3: из **всех** плеч сравнения)
+    #[arg(long, value_name = "VERSION", requires = "via")]
+    pub targets_of: Option<String>,
     /// --tokens --via mcp: нагет в L0 сервера — ошибка прогона (приёмка); без флага такой нагет
     /// исключается из полноты плеча и, в сравнении, обоих плеч (`info.l0_excluded`)
     #[arg(long)]
@@ -419,7 +425,7 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     if a.sessions {
         return sessions::main(&a, &p);
     }
-    if a.split.is_some() || a.arm.is_some() {
+    if a.split.is_some() || !a.arm.is_empty() {
         bail!("--split и --arm — только у --tokens --via mcp и --sessions");
     }
     if a.tokens && a.grid.is_some() {

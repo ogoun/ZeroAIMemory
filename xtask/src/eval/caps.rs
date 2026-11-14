@@ -225,6 +225,53 @@ pub const KEYS: &[(&str, Since)] = &[
     ("recall.max_timeout_ms", F("recall_timeout")),
 ];
 
+/// Цели корпуса ТС-1, которые сервер умеет создать (загрузчик `--via mcp`): связь
+/// `contradicts` (с 0.0.6-m4.5) и вложения `eval/docs` (с 0.0.7-m5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Targets {
+    pub contradicts: bool,
+    pub attachments: bool,
+}
+
+impl Targets {
+    fn of_triple(v: (u32, u32, u32), m6: bool) -> Targets {
+        Targets {
+            contradicts: m6 || v >= (0, 0, 6),
+            attachments: m6 || v >= (0, 0, 7),
+        }
+    }
+
+    /// Цели плеча-сервера `caps`.
+    pub fn of(caps: &ServerCaps) -> Targets {
+        Targets {
+            contradicts: caps.contradicts,
+            attachments: caps.attachments,
+        }
+    }
+
+    /// Цели выпуска `version` (`--targets-of`, спецификация M6 §3.3: цель, которую старый сервер
+    /// не умеет создать, исключается из **всех** плеч сравнения с ним); версия — из таблицы
+    /// [`RELEASES`].
+    pub fn of_release(version: &str) -> Result<Targets> {
+        if !RELEASES.iter().any(|(v, _)| *v == version) {
+            bail!(
+                "--targets-of {version}: не выпуск-база ({})",
+                RELEASES.iter().map(|r| r.0).collect::<Vec<_>>().join(", ")
+            );
+        }
+        let v = parse_version(version).with_context(|| format!("версия «{version}»"))?;
+        Ok(Targets::of_triple(v.triple(), false))
+    }
+
+    /// Общее у двух: плечо создаёт только то, что умеют оба.
+    pub fn and(self, o: Targets) -> Targets {
+        Targets {
+            contradicts: self.contradicts && o.contradicts,
+            attachments: self.attachments && o.attachments,
+        }
+    }
+}
+
 /// Возможности по ответу `/health`.
 pub fn caps_from(health: &Value) -> Result<ServerCaps> {
     let raw = health["version"]
@@ -273,10 +320,11 @@ pub fn caps_from(health: &Value) -> Result<ServerCaps> {
         })
         .map(|(k, _)| *k)
         .collect();
+    let t = Targets::of_triple(ver.triple(), m6);
     Ok(ServerCaps {
         ideas: m6 || ver.triple() >= (0, 0, 10),
-        contradicts: m6 || ver.triple() >= (0, 0, 6),
-        attachments: m6 || ver.triple() >= (0, 0, 7),
+        contradicts: t.contradicts,
+        attachments: t.attachments,
         focus: has("focus"),
         snapshot: has("snapshot"),
         version: ver,
@@ -408,6 +456,30 @@ mod tests {
 
     /// Старые теги — по версии и коммиту выпуска; сборка ветки M6 объявляет себя `features`;
     /// `git = unknown` и чужой коммит у старой версии — ошибка.
+    #[test]
+    fn targets_of_release_and_intersection() {
+        let b4 = Targets::of_release("0.0.5-m4").unwrap();
+        assert_eq!(
+            b4,
+            Targets {
+                contradicts: false,
+                attachments: false
+            }
+        );
+        let m45 = Targets::of_release("0.0.6-m4.5").unwrap();
+        assert!(m45.contradicts && !m45.attachments);
+        let m57 = Targets::of_release("0.0.10-m5.7").unwrap();
+        assert!(m57.contradicts && m57.attachments);
+        let m6 = caps_from(
+            &serde_json::json!({"version": "0.0.10-m5.7", "git": "x", "features": ["m6"]}),
+        )
+        .unwrap();
+        assert_eq!(Targets::of(&m6).and(b4), b4);
+        assert_eq!(Targets::of(&m6).and(m57), m57);
+        let e = Targets::of_release("0.0.11-m6").unwrap_err().to_string();
+        assert!(e.contains("не выпуск-база"), "{e}");
+    }
+
     #[test]
     fn caps_from_health_by_release_or_features() {
         let m57 = caps_from(&health("0.0.10-m5.7", "91363056d3ba", None)).unwrap();
