@@ -691,6 +691,7 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     }
     // (очередь, забранный файл, его содержимое)
     let mut taken: Vec<(PathBuf, PathBuf, Vec<u8>)> = Vec::new();
+    let mut touch_failed = false;
     for (i, q) in queues.into_iter().enumerate() {
         // бюджет на запрос кончается — остальные очереди не трогаются (уйдут следующим хуком)
         if i > 0 && env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
@@ -715,7 +716,16 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
         // чтения, и строки терялись молча (задача 17d). Прочитанное не зависит от судьбы файла,
         // а свежее время не даёт уборке удалить его, пока идёт запрос
         let bytes = match read_and_touch(&q) {
-            Ok(b) => b,
+            Ok((b, touched)) => {
+                // время не освежено: забранный файл старше часа уборка кэша может удалить за
+                // время запроса — строки целы (уже прочитаны), но возврат пойдёт переписыванием.
+                // Одна строка на хук
+                if let (Err(e), false) = (touched, touch_failed) {
+                    touch_failed = true;
+                    env.log(&format!("files/changed: время очереди не обновлено: {e}"));
+                }
+                b
+            }
             // очередь уже забрал параллельный хук — не сбой
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
@@ -812,15 +822,26 @@ fn restore_taken(q: &Path, taken: &Path) -> bool {
     std::fs::hard_link(taken, q).is_ok()
 }
 
-/// Содержимое очереди и отметка времени изменения «сейчас» одним открытием файла (сбой отметки
-/// не мешает: прочитанное уже есть).
-fn read_and_touch(q: &Path) -> std::io::Result<Vec<u8>> {
+/// Содержимое очереди и отметка времени изменения «сейчас» одним открытием файла; сбой отметки
+/// чтению не мешает (прочитанное уже есть) и возвращается вторым значением — вызывающий пишет о
+/// нём строку.
+fn read_and_touch(q: &Path) -> std::io::Result<(Vec<u8>, std::io::Result<()>)> {
     use std::io::Read;
     let mut f = std::fs::File::options().read(true).append(true).open(q)?;
     let mut bytes = Vec::new();
     f.read_to_end(&mut bytes)?;
-    let _ = f.set_modified(SystemTime::now());
-    Ok(bytes)
+    let touched = touch(&f);
+    Ok((bytes, touched))
+}
+
+/// Время изменения открытого файла — «сейчас»; отладочная сборка или фича `test-hooks` —
+/// `ZAM_TEST_TOUCH_FAIL` (любое значение): отметка «не удалась» (строка о сбое в `hooks.log`).
+fn touch(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if std::env::var_os("ZAM_TEST_TOUCH_FAIL").is_some() {
+        return Err(std::io::Error::other("тестовый сбой отметки времени"));
+    }
+    f.set_modified(SystemTime::now())
 }
 
 /// Точка подмены для тестов (только отладочная сборка и фича `test-hooks`, как

@@ -1102,10 +1102,14 @@ fn hook_budgets() {
             })
             .collect(),
     ));
+    // входов `pre_tool` в наборе меньше сорока (18): набор идёт по кругу, у каждого вызова своя
+    // сессия — иначе p95 серии был бы её максимумом (ревью 17d, Minor 5)
+    let pre = inputs("pre_tool");
     runs.push((
         "pre-tool",
-        inputs("pre_tool")
-            .iter()
+        pre.iter()
+            .cycle()
+            .take(pre.len().max(1) * 40usize.div_ceil(pre.len().max(1)))
             .enumerate()
             .map(|(i, c)| {
                 let input = c["input"].as_str().unwrap();

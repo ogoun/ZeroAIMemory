@@ -4126,6 +4126,111 @@ fn unsent_changed_queue_returns_untouched() {
     assert!(!log.contains("возврат очереди"), "{log}");
 }
 
+/// Время изменения очереди `changed-<сессия>.jsonl` — `secs` секунд назад.
+fn age_queue(p: &Proj, session: &str, secs: u64) {
+    let f = p.session_file("changed", session, ".jsonl").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// Пути всех принятых заглушкой `POST /files/changed`, по порядку.
+fn changed_posted(seen: &common::Seen) -> Vec<String> {
+    let mut out: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, path, _)| m == "POST" && path == "/api/v1/files/changed")
+        .flat_map(|(_, _, b)| {
+            b["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["path"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Ревью 17d, Minor 1 (откат D3 — детерминированно): очередь старше часа забирается на отправку
+/// rename, и забранный файл наследует её время — для уборки кэша это «брошенный временный
+/// файл». Уборка идёт через 100 мс после старта (`ZAM_TEST_GC_STALL_MS`), запрос — через 400 мс
+/// после разбора очередей (`ZAM_TEST_FLUSH_STALL_MS`): уборка заведомо проходит по каталогу,
+/// пока очереди забраны. Все пути отправлены: содержимое прочитано до rename, а время файла
+/// освежено. До правки очередь читалась после паузы — уже удалённой, и строки терялись молча.
+#[test]
+fn old_changed_queue_survives_cache_gc_during_flush() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"stale":0,"text":""}"#, Duration::ZERO);
+    let p = Proj::new("flush-gc", &url, "zam_x");
+    for i in 0..3 {
+        let s = format!("gc-{i}");
+        put_queue(&p, &s, &[(format!("src/g{i}.rs"), 'a')]);
+        age_queue(&p, &s, 3 * 3600);
+    }
+    let ev = p.ev("SessionStart", "gc-new", json!({"source": "startup"}));
+    let (o, _) = p.hook_env(
+        &url,
+        "session-start",
+        "claude",
+        ev.to_string().as_bytes(),
+        &[
+            ("ZAM_TEST_HOOK_BUDGET_MS", "3000"),
+            ("ZAM_TEST_GC_STALL_MS", "100"),
+            ("ZAM_TEST_FLUSH_STALL_MS", "400"),
+        ],
+    );
+    ok(&o);
+    assert_eq!(
+        changed_posted(&seen),
+        ["src/g0.rs", "src/g1.rs", "src/g2.rs"],
+        "{}",
+        p.log()
+    );
+    assert_eq!(changed_files(&p), (Vec::new(), 0), "{}", p.log());
+}
+
+/// Ревью 17d, Minor 3: время забранной очереди не удалось освежить (`ZAM_TEST_TOUCH_FAIL`) —
+/// одна строка в `hooks.log` на хук, а не тишина; очереди при этом отправлены.
+#[test]
+fn changed_queue_touch_failure_is_logged_once() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"stale":0,"text":""}"#, Duration::ZERO);
+    let p = Proj::new("flush-touch", &url, "zam_x");
+    for i in 0..3 {
+        put_queue(&p, &format!("tf-{i}"), &[(format!("src/t{i}.rs"), 'a')]);
+    }
+    let ev = p.ev("SessionStart", "tf-new", json!({"source": "startup"}));
+    let (o, _) = p.hook_env(
+        &url,
+        "session-start",
+        "claude",
+        ev.to_string().as_bytes(),
+        &[
+            ("ZAM_TEST_HOOK_BUDGET_MS", ROOMY_BUDGET_MS),
+            ("ZAM_TEST_TOUCH_FAIL", "1"),
+        ],
+    );
+    ok(&o);
+    let log = p.log();
+    assert_eq!(
+        log.matches("files/changed: время очереди не обновлено")
+            .count(),
+        1,
+        "{log:?}"
+    );
+    assert_eq!(
+        changed_posted(&seen),
+        ["src/t0.rs", "src/t1.rs", "src/t2.rs"],
+        "{log}"
+    );
+}
+
 // ---- эпохи `session_seen` (M6 §7.2, задача 7a) ----
 
 /// Пометка `/read` о повторной выдаче (§7.3).
@@ -6681,48 +6786,95 @@ fn put_timeout_reason_uses_actual_limit() {
     assert!(queued, "{log}");
 }
 
-/// Задача 17d, пункт h (слияние 05f41fc: `put_timeout_reason_uses_actual_limit` упал с пустым
-/// `hooks.log`): поток снимка пишет строку итога под замком, а запись идёт дольше хвоста ожидания
-/// хука (на занятом HDD создание `hooks.log` стоит десятки мс при хвосте 10 мс). Подмена
-/// `log-stall-ms` держит поток под замком 3 с перед записью при бюджете хука 1,5 с; сервер
-/// отвечает на `PUT` 500 сразу, так что поток заведомо в записи, когда предел ожидания хука
-/// выходит. Хук обязан дождаться конца записи: раньше он выходил, процесс обрывал поток, и
-/// неотправленный снимок не оставлял ни одной строки причины. Строка — ровно одна, снимок в
-/// очереди.
-#[test]
-fn snapshot_outcome_survives_slow_log_write() {
-    let _g = serial();
-    let (url, _seen) = snap_stub(500, "");
-    let p = Proj::new("snap-slow-log", &url, "zam_x");
+/// Хук `checkpoint` (`PreCompact`, бюджет 1,5 с), у которого поток снимка пишет строку итога
+/// под замком `stall_ms` мс (подмена `log-stall-ms`), начав запись незадолго до предела ожидания
+/// хука: заглушка отвечает на `PUT` 500 через 1,3 с. Возвращает `hooks.log`, время хука внутри
+/// процесса и наличие очереди снимка (и сам проект — для следующих хуков).
+fn slow_log_case(name: &str, stall_ms: &str) -> (Proj, String, Duration, bool) {
+    let (url, _seen) = common::stub_body(std::sync::Arc::new(
+        move |m: &str, path: &str, _: usize, _: &Value| {
+            if m == "PUT" && path.ends_with("/snapshot") {
+                (500, String::new(), Duration::from_millis(1300))
+            } else {
+                (200, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ));
+    let p = Proj::new(name, &url, "zam_x");
     let s = "sl-1";
     let t = transcript_path(&p, s);
     write_lines(&t, &[cl_user(s, "запрос")]);
     let cache = p.repo.join(".zeroaimemory/cache");
     std::fs::create_dir_all(&cache).unwrap();
-    std::fs::write(cache.join("snapshot.log-stall-ms"), "3000").unwrap();
+    std::fs::write(cache.join("snapshot.log-stall-ms"), stall_ms).unwrap();
     let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
-    let mut c = p.cmd(&url);
-    c.env("ZAM_TEST_HOOK_BUDGET_MS", "1500")
-        .env("ZAM_TEST_SNAPSHOT_MS", "5000")
-        .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
-        .args(["hook", "checkpoint", "--agent", "claude"])
-        .write_stdin(pc.to_string().into_bytes());
-    let t0 = Instant::now();
-    let o = c.output().unwrap();
-    let d = t0.elapsed();
+    let (o, times) = p.hook_env(
+        &url,
+        "checkpoint",
+        "claude",
+        pc.to_string().as_bytes(),
+        &[
+            ("ZAM_TEST_HOOK_BUDGET_MS", "1500"),
+            ("ZAM_TEST_SNAPSHOT_MS", "5000"),
+            ("ZAM_TEST_SNAPSHOT_PUT_MS", "10000"),
+        ],
+    );
     empty(&o);
-    let log = p.log();
+    let (log, queued) = (p.log(), snap_file(&p, "snapq", s).is_some());
+    (p, log, times.inner, queued)
+}
+
+/// Предел времени хука в [`slow_log_case`]: бюджет 1,5 с + предел ожидания записи строки потоком
+/// снимка (`LOG_WAIT_MAX`, 250 мс) + запас отладочной сборки на файлы.
+const SLOW_LOG_MAX: Duration = Duration::from_millis(1500 + 250 + 250);
+
+/// Задача 17d, пункт h (слияние 05f41fc: `put_timeout_reason_uses_actual_limit` упал с пустым
+/// `hooks.log`): поток снимка пишет строку итога под замком, а запись идёт дольше хвоста ожидания
+/// хука (на занятом HDD создание `hooks.log` стоит десятки мс при хвосте 10 мс). Запись длится
+/// 200 мс и застаёт предел ожидания хука: хук ждёт её конца — раньше он выходил, процесс обрывал
+/// поток, и неотправленный снимок не оставлял ни одной строки причины. Строка — ровно одна
+/// (потока; либо хука, если поток до записи ещё не дошёл), снимок в очереди, а хук вышел не
+/// позже бюджета и предела ожидания записи.
+#[test]
+fn snapshot_outcome_survives_slow_log_write() {
+    let _g = serial();
+    let (_p, log, d, queued) = slow_log_case("snap-slow-log", "200");
     assert_eq!(
-        log.matches(", в очереди: HTTP 500").count(),
+        log.matches("HTTP 500").count(),
         1,
         "строка причины — ровно одна (хук шёл {d:?}): {log:?}"
     );
     assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(queued, "снимка нет в очереди: {log}");
+    assert!(d <= SLOW_LOG_MAX, "хук шёл {d:?}: {log}");
+}
+
+/// Ревью 17d, I1: запись строки потоком снимка стоит (диск остановился на 5 с) — хук ждёт её не
+/// дольше `LOG_WAIT_MAX` и выходит: вывод хука (`decision: block` у `Stop`) не зависит от диска,
+/// агент не убивает хук по своему тайм-ауту (2 с). Строки итога в этом вызове нет, снимок в
+/// очереди, и след оставляет следующий хук сессии: отправка очереди всегда пишет строку.
+#[test]
+fn snapshot_log_wait_is_bounded() {
+    let _g = serial();
+    let (p, log, d, queued) = slow_log_case("snap-stuck-log", "5000");
     assert!(
-        snap_file(&p, "snapq", s).is_some(),
-        "снимка нет в очереди: {log}"
+        d <= SLOW_LOG_MAX,
+        "хук ждал запись строки без предела: {d:?}: {log}"
     );
-    assert!(d <= LATE_THREAD_MAX, "хук шёл {d:?}: {log}");
+    assert!(queued, "снимка нет в очереди: {log}");
+    // строку мог успеть написать только сам хук (поток стоит): не больше одной
+    assert!(log.lines().count() <= 1, "{log}");
+    // следующий хук сессии (запись строки больше не стоит): очередь отправляется заново, и её
+    // итог — строкой в журнале
+    std::fs::remove_file(p.repo.join(".zeroaimemory/cache/snapshot.log-stall-ms")).unwrap();
+    let t = transcript_path(&p, "sl-1");
+    let stop = snap_ev(&p, "Stop", "sl-1", &t, json!({"stop_hook_active": true}));
+    empty(&hook_snap(&p, "checkpoint", &stop));
+    let log = p.log();
+    assert!(
+        log.contains("снимок из очереди, в очереди: HTTP 500"),
+        "следующий хук не оставил строки об очереди: {log:?}"
+    );
 }
 
 /// Задача 17d, пункт h: журнал агента есть, но не читается (открыт другим процессом без
