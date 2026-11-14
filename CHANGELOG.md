@@ -407,7 +407,7 @@ compat_new_zam_old_server]`.
   хукам]`. `fail_open_when_server_down` берёт лучший из трёх вызовов — дефект, который
   проявляется в 1–2 вызовах из 3, он пропустит (компромисс против остановок HDD).
 - Пределы WebUI (`web/.size-limit.json`): `ReportsView` — 9 кБ, `IdeasView` — 7,2 кБ, `IdeaForm` —
-  2,5 кБ.
+  2,5 кБ, `SessionsView` — 4,8 кБ.
 
 ## [0.0.10-m5.7] - 2026-11-04
 
