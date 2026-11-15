@@ -64,6 +64,17 @@ def est(e):
     return None if e is None else {k: e.get(k) for k in ('mean', 'lo', 'hi')}
 
 
+def rel_path(p):
+    """Путь из файла `xtask eval` — от корня репозитория (абсолютный путь машины в отчёт не идёт)."""
+    if not p or not os.path.isabs(p):
+        return p
+    try:
+        r = os.path.relpath(p, os.getcwd())
+    except ValueError:
+        return p
+    return p if r.startswith('..') else r.replace(os.sep, '/')
+
+
 def share(t):
     return None if not t or not t.get('total') else t['found'] / t['total']
 
@@ -203,8 +214,9 @@ def quality_part(items, files):
         entry = {'name': q['name'], 'mode': r.get('info', {}).get('mode'),
                  'ndcg10': est(m.get('ndcg10')), 'recall5': est(m.get('recall5')),
                  'reliable_first': est(m.get('reliable_first')),
-                 'compare': {k: cmp.get(k) for k in ('against', 'n', 'd_ndcg10', 'd_recall5',
-                                                     'regression')} if cmp else None}
+                 'compare': {k: rel_path(cmp.get(k)) if k == 'against' else cmp.get(k)
+                             for k in ('against', 'n', 'd_ndcg10', 'd_recall5', 'regression')}
+                 if cmp else None}
         d1 = (cmp or {}).get('d_ndcg10')
         d2 = (cmp or {}).get('d_recall5')
         entry['checks'] = {

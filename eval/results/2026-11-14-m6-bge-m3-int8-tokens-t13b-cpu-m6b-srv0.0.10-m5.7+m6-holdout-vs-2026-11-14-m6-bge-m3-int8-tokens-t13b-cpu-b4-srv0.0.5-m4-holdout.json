@@ -1,0 +1,30 @@
+{
+  "base": "2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-b4-srv0.0.5-m4-holdout",
+  "arm": "2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-m6b-srv0.0.10-m5.7+m6-holdout",
+  "split": "holdout",
+  "scenarios": 15,
+  "only_base": [],
+  "only_arm": [],
+  "base_tokens": 55394,
+  "arm_tokens": 49271,
+  "r": {
+    "mean": 0.8894645629490558,
+    "lo": 0.8337614698989837,
+    "hi": 0.9220884780124095
+  },
+  "base_micro": 0.8481012658227848,
+  "arm_micro": 0.8227848101265823,
+  "d_micro": {
+    "mean": -0.02531645569620253,
+    "lo": -0.07228915662650602,
+    "hi": 0.0
+  },
+  "net_losses": 0,
+  "noninferior": false,
+  "bootstrap": {
+    "samples": 10000,
+    "seed": 104372539625497,
+    "r_interval": "двусторонний 95 % (перцентили 2,5 и 97,5), парный бутстреп сценариев",
+    "d_micro_interval": "односторонние 95 % (перцентили 5 и 95), веса — число нагетов"
+  }
+}

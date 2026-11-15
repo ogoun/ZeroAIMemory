@@ -52,15 +52,19 @@ fn report() -> Option<Value> {
     Some(load(&p))
 }
 
-/// Файл роли `role` из индекса отчёта.
-fn file_of(idx: &Value, role: &str) -> PathBuf {
+/// Файл роли `role` из индекса отчёта, если роль есть.
+fn file_of_opt(idx: &Value, role: &str) -> Option<PathBuf> {
     let f = idx["files"]
         .as_array()
         .expect("files")
         .iter()
-        .find(|f| f["role"] == role)
-        .unwrap_or_else(|| panic!("в индексе нет роли {role}"));
-    repo().join(f["path"].as_str().unwrap())
+        .find(|f| f["role"] == role)?;
+    Some(repo().join(f["path"].as_str().unwrap()))
+}
+
+/// Файл роли `role` из индекса отчёта.
+fn file_of(idx: &Value, role: &str) -> PathBuf {
+    file_of_opt(idx, role).unwrap_or_else(|| panic!("в индексе нет роли {role}"))
 }
 
 fn num(v: &Value, what: &str) -> f64 {
@@ -105,11 +109,18 @@ fn acceptance_ts1_vs_b4() {
     let d = num(&c["d_micro"]["lo"], "Δ микро-полноты");
     let l = c["net_losses"].as_i64().unwrap();
     let r_hi = num(&c["r"]["hi"], "R.hi");
-    assert!(d >= -0.02, "нижняя граница Δ микро-полноты {d} < −0,02");
-    assert!(l <= 1, "чистые потери L = {l} > 1");
-    assert!(r_hi < 1.0, "верхняя граница R {r_hi} ≥ 1,00");
+    let mut fails: Vec<String> = Vec::new();
+    if d < -0.02 {
+        fails.push(format!("CUDA: нижняя граница Δ микро-полноты {d} < −0,02"));
+    }
+    if l > 1 {
+        fails.push(format!("CUDA: чистые потери L = {l} > 1"));
+    }
+    if r_hi >= 1.0 {
+        fails.push(format!("CUDA: верхняя граница R {r_hi} ≥ 1,00"));
+    }
     eprintln!(
-        "ZAM_INFO ТС-1 к B4 (CUDA, K=3): R {:.3} [{:.3}–{r_hi:.3}], Δ микро {d:.3}, L {l}; цель \
+        "ZAM_INFO ТС-1 к B4 (CUDA, K=3): R {:.3} [{:.3}–{r_hi:.3}], нижняя Δ микро {d:.3}, L {l}; цель \
          R ≤ 0,70 — {}",
         num(&c["r"]["mean"], "R"),
         num(&c["r"]["lo"], "R.lo"),
@@ -121,17 +132,26 @@ fn acceptance_ts1_vs_b4() {
     );
     let cpu = load(&file_of(&idx, "ts1.cpu"));
     assert_eq!(cpu["split"], "holdout");
-    let d = num(&cpu["d_micro"]["lo"], "CPU Δ микро-полноты");
-    let l = cpu["net_losses"].as_i64().unwrap();
+    let d_cpu = num(&cpu["d_micro"]["lo"], "CPU Δ микро-полноты");
+    let l_cpu = cpu["net_losses"].as_i64().unwrap();
+    if (d_cpu >= -0.02 && l_cpu <= 1) != (d >= -0.02 && l <= 1) {
+        fails.push(format!(
+            "контроль int8 CPU: выводы о полноте другие, чем у CUDA (Δ {d_cpu}, L {l_cpu})"
+        ));
+    }
     assert!(
-        d >= -0.02 && l <= 1,
-        "контроль int8 CPU: выводы о полноте другие (Δ {d}, L {l})"
+        fails.is_empty(),
+        "ТС-1 к B4 не выполнен ({}):\n{}\nконтроль int8 CPU: нижняя Δ {d_cpu}, L {l_cpu}",
+        fails.len(),
+        fails.join("\n")
     );
 }
 
 /// §17 п. 2: ТС-2 на holdout у обоих агентов хуков — полный `R` к B5.6 (standard) ≤ 1,15, `R` без
 /// Rules к B5.7 (standard) ≤ 1,00, обязательные строки 1,0, Δ `hint_recall` ≥ −0,02 (оба
-/// варианта), подсказки-идеи 1,0, повторов с промахами нет, плечи одних суток UTC.
+/// варианта), подсказки-идеи 1,0, повторов с промахами нет во всех плечах блока (B5.6, B5.7, M6 и
+/// A/A, если снят — предрегистрация, условие 6), плечи одних суток UTC. Невыполненные условия
+/// собираются по обоим агентам и печатаются вместе.
 #[test]
 #[ignore = "итоговый замер: ZAM_M6_REPORT — индекс eval/results/<дата>-m6-bge-m3-fp16-tokens.json"]
 fn acceptance_ts2_vs_b56() {
@@ -139,12 +159,16 @@ fn acceptance_ts2_vs_b56() {
         eprintln!("ZAM_M6_REPORT не задан — пропуск");
         return;
     };
+    let mut fails: Vec<String> = Vec::new();
     for agent in ["claude", "codex"] {
         let role = |r: &str| file_of(&idx, &format!("ts2.{agent}.{r}"));
         let v56 = load(&role("vs_b56"));
         let v57 = load(&role("vs_b57"));
         let mut arms = vec![("m6", load(&role("m6"))), ("b56", load(&role("b56")))];
         arms.push(("b57", load(&role("b57"))));
+        if let Some(p) = file_of_opt(&idx, &format!("ts2.{agent}.aa")) {
+            arms.push(("aa", load(&p)));
+        }
         let mut dates = std::collections::BTreeSet::new();
         for (n, a) in &arms {
             let i = &a["info"];
@@ -154,12 +178,15 @@ fn acceptance_ts2_vs_b56() {
             assert_eq!(i["hook_agent"], agent, "{agent} {n}");
             dates.insert(i["date"].as_str().unwrap().to_string());
             let misses = &a["summary"]["reps_with_misses"];
-            assert!(
-                misses.as_array().is_some_and(Vec::is_empty),
-                "{agent} {n}: повторы с промахом бюджета хука или неразобранным выводом {misses}"
-            );
+            if !misses.as_array().is_some_and(Vec::is_empty) {
+                fails.push(format!(
+                    "{agent} {n}: повторы с промахом бюджета хука или неразобранным выводом {misses}"
+                ));
+            }
         }
-        assert_eq!(dates.len(), 1, "{agent}: плечи разных суток UTC {dates:?}");
+        if dates.len() != 1 {
+            fails.push(format!("{agent}: плечи разных суток UTC {dates:?}"));
+        }
         let rf = num(
             &part(&v56, "parts", "standard")["total"]["r"]["mean"],
             "R полный",
@@ -168,48 +195,59 @@ fn acceptance_ts2_vs_b56() {
             &part(&v57, "parts_no_rules", "standard")["total"]["r"]["mean"],
             "R без Rules",
         );
-        assert!(rf <= 1.15, "{agent}: R полный к B5.6, standard {rf} > 1,15");
-        assert!(
-            rn <= 1.00,
-            "{agent}: R без Rules к B5.7, standard {rn} > 1,00"
-        );
+        if rf > 1.15 {
+            fails.push(format!("{agent}: R полный к B5.6, standard {rf} > 1,15"));
+        }
+        if rn > 1.00 {
+            fails.push(format!("{agent}: R без Rules к B5.7, standard {rn} > 1,00"));
+        }
         let all = part(&v56, "parts", "всего");
         for d in ["d_hint_recall", "d_hint_recall_strict"] {
             let lo = num(&all[d]["lo"], d);
-            assert!(lo >= -0.02, "{agent}: {d} нижняя граница {lo} < −0,02");
+            if lo < -0.02 {
+                fails.push(format!("{agent}: {d} нижняя граница {lo} < −0,02"));
+            }
         }
         let m6 = &arms[0].1;
         for s in m6["sessions"].as_array().unwrap() {
             for r in s["required"].as_array().into_iter().flatten() {
-                assert_eq!(
-                    r["found"], true,
-                    "{agent}: обязательная строка не выдана: {} r{} {r}",
-                    s["id"], s["rep"]
-                );
+                if r["found"] != true {
+                    fails.push(format!(
+                        "{agent}: обязательная строка не выдана: {} r{} {r}",
+                        s["id"], s["rep"]
+                    ));
+                }
             }
         }
         for (rep, t) in m6["summary"]["required_by_rep"].as_object().unwrap() {
-            assert_eq!(
-                t["found"], t["total"],
-                "{agent}: обязательные строки, повтор {rep}"
-            );
+            if t["found"] != t["total"] {
+                fails.push(format!("{agent}: обязательные строки, повтор {rep}: {t}"));
+            }
         }
         let ih = &m6["summary"]["idea_hint_recall"];
-        assert_eq!(ih["found"], ih["total"], "{agent}: подсказки-идеи M6 {ih}");
+        if ih["found"] != ih["total"] {
+            fails.push(format!("{agent}: подсказки-идеи M6 {ih}"));
+        }
         if let Some(m) = v57["idea_hints_match"].as_object() {
             let block = &idx["ts2"][agent];
             let ex = block["idea_hint_exceptions"]["count"].as_u64().unwrap_or(0);
-            assert_eq!(
-                m["found"].as_u64().unwrap() + ex,
-                m["total"].as_u64().unwrap(),
-                "{agent}: подсказки-идеи не совпали с B5.7 сверх расхождений по стоп-основам"
-            );
+            if m["found"].as_u64().unwrap() + ex != m["total"].as_u64().unwrap() {
+                fails.push(format!(
+                    "{agent}: подсказки-идеи не совпали с B5.7 сверх расхождений по стоп-основам"
+                ));
+            }
         }
         eprintln!(
             "ZAM_INFO ТС-2 {agent}: R полный к B5.6 standard {rf:.3}, без Rules к B5.7 standard \
              {rn:.3}"
         );
     }
+    assert!(
+        fails.is_empty(),
+        "ТС-2 не выполнен ({}):\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
 }
 
 /// Бинарник `zam-server` v0.0.10-m5.7: `ZAM_M57_SERVER_BIN` или `target/tags/v0.0.10-m5.7/release`.
