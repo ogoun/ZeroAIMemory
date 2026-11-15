@@ -13,14 +13,15 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
-    AnswerBy, Answered, Attribution, AuthorKind, Channel, DataDir, Db, EdgeType, Entry,
-    EntryFilter, EntryKind, EntryPatch, EntryStatus, GraphStore, IDEA_LINKS_MAX, IDEA_OPTIONS,
-    IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewAnswer,
-    NewDecision, NewEdge, NewEntry, ProposalKind, QuestionData, QuestionError, Review,
-    ReviewOutcome, SpaceKind, StoreError, TaskData, TaskState, UserDbs, adopt_idea,
-    answer_question, check_idea, check_idea_transition, create_entry, create_solution, decide_idea,
-    delete_entry, entry_revisions, get_entry, idea_candidate, idea_task_state, list_entries,
-    list_spaces, proactive_ideas, propose_idea, restore_entry, update_entry,
+    AnswerBy, Answered, Attribution, AuthorKind, Channel, DataDir, Db, DecidedAs, DecidedVia,
+    EdgeType, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, GraphStore, IDEA_LINKS_MAX,
+    IDEA_OPTIONS, IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority,
+    NewAnswer, NewDecision, NewEdge, NewEntry, NewReview, ProposalKind, QuestionData,
+    QuestionError, REVIEW_MIN_CHARS_DEFAULT, Review, ReviewOutcome, ReviewTask, SpaceKind,
+    StoreError, TaskData, TaskState, UserDbs, adopt_idea, answer_question, check_idea,
+    check_idea_transition, create_entry, create_solution, decide_idea, delete_entry,
+    entry_revisions, get_entry, idea_candidate, idea_task_state, list_entries, list_spaces,
+    proactive_ideas, propose_idea, restore_entry, review_idea, update_entry,
 };
 
 // ---------- окружение ----------
@@ -611,7 +612,7 @@ async fn accept_creates_task_edge_and_answers_question() {
     let decided = d.decided.unwrap();
     assert_eq!(
         (decided.decision, decided.by, decided.channel),
-        (IdeaDecision::Accept, AnswerBy::Human, Channel::Webui)
+        (DecidedAs::Accept, AnswerBy::Human, DecidedVia::Webui)
     );
     assert_eq!(task.kind, EntryKind::Task);
     assert_eq!(task.status, Some(EntryStatus::Open));
@@ -2096,7 +2097,7 @@ async fn answer_reopen_moves_task_to_prev() {
     assert_eq!(i.status, Some(EntryStatus::New));
     let d = data_of(&i);
     assert_eq!((d.task_id, d.prev_task_ids.clone()), (None, vec![t.id]));
-    assert_eq!(d.decided.unwrap().decision, IdeaDecision::Reopen);
+    assert_eq!(d.decided.unwrap().decision, DecidedAs::Reopen);
     assert!(r.task.is_none());
     assert_eq!(count(&db, DECISIONS).await, before + 1);
     let reason = last_reason(&db, idea.id).await.unwrap();
@@ -2897,27 +2898,29 @@ async fn task_priority_roundtrip() {
     );
 }
 
-/// Идея человека в `returned` с разбором `return` в `review`/`reviews` и `returned_at` — прямым
-/// SQL (разбор агентом — задача 2).
+/// Идея человека в `returned` — настоящим разбором `return` агентом ([`review_idea`]): строка
+/// записи и её последняя ревизия согласованы (`review`, `reviews`, `returned_at`).
 async fn returned_idea(db: &Db, sol: Id, title: &str) -> Entry {
     let i = new_idea(db, sol, title, "human", "normal").await;
-    let r = review(ReviewOutcome::Return, true, "2026-11-15T10:00:00Z");
-    let mut d = data_of(&i);
-    d.review = Some(r.clone());
-    d.reviews = vec![r];
-    d.returned_at = Some("2026-11-15T10:00:00Z".parse().unwrap());
-    let (id, data) = (i.id, d.to_value().to_string());
-    db.write(move |tx| {
-        tx.execute(
-            "UPDATE entries SET status = 'returned', data = ?2 WHERE id = ?1",
-            rusqlite::params![id, data],
-        )?;
-        Ok(())
-    })
-    .await
-    .unwrap();
-    let e = get_entry(db, i.id).await.unwrap();
+    let r = NewReview {
+        outcome: ReviewOutcome::Return,
+        summary: "Идея просит кэш ответов: в плане его нет, в ТЗ §9.4 — только кэш выжимок. "
+            .repeat(4),
+        missing: Some("Каких ответов и на какой срок?".into()),
+        basis: Vec::new(),
+        similar: Vec::new(),
+        task: ReviewTask::None,
+        by_user: Id::new(),
+        session: None,
+        key: None,
+        min_chars: REVIEW_MIN_CHARS_DEFAULT,
+    };
+    let e = review_idea(db, i.id, r, &agent()).await.unwrap().idea;
     assert_eq!(e.status, Some(EntryStatus::Returned));
+    assert!(data_of(&e).returned_at.is_some());
+    let revs = entry_revisions(db, i.id).await.unwrap();
+    let last = revs.iter().max_by_key(|r| r.rev).unwrap();
+    assert_eq!((last.status, &last.data), (e.status, &e.data));
     e
 }
 

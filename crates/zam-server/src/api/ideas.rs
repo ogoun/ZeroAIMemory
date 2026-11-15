@@ -64,6 +64,9 @@ impl From<IdeaError> for ApiError {
                 ApiError::conflict(e.to_string())
             }
             e @ IdeaError::ReopenTextRequired => unprocessable(e.to_string()),
+            // поля разбора и привязка к не открытой задаче (M6.5 §5) — 422
+            IdeaError::ReviewInput(m) => unprocessable(m),
+            e @ IdeaError::ReviewTaskNotOpen => unprocessable(e.to_string()),
             IdeaError::TaskRevived { question } => {
                 let mut extra = Map::new();
                 extra.insert("code".into(), json!("task-revived"));

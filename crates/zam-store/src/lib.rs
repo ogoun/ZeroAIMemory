@@ -122,12 +122,14 @@ pub use graph::{
     GraphNode, GraphStore, IDEA_DERIVED_FROM_DENIED, NewEdge, get_edge, graph_node, graph_nodes,
 };
 pub use ideas::{
-    Decided, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS, IDEA_LINKS_MAX, IDEA_OPTIONS,
-    IDEA_ORIGIN_REQUIRED, IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin,
-    IdeaPriority, NewDecision, PROPOSE_TEXT_MAX_CHARS, ProposalKind, Review, ReviewOutcome,
-    TaskState, adopt_idea, any_idea, any_new_idea, check_idea, check_idea_shape,
+    Decided, DecidedAs, DecidedVia, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS,
+    IDEA_LINKS_MAX, IDEA_OPTIONS, IDEA_ORIGIN_REQUIRED, IDEA_REOPEN_OPTIONS, IdeaData,
+    IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewDecision, NewReview,
+    PROPOSE_TEXT_MAX_CHARS, ProposalKind, REVIEW_MIN_CHARS_DEFAULT, REVIEW_MISSING_MAX_CHARS,
+    REVIEW_REFS_MAX, REVIEW_SUMMARY_MAX_CHARS, REVIEWS_MAX, Review, ReviewOutcome, ReviewTask,
+    Reviewed, TaskState, adopt_idea, any_idea, any_new_idea, check_idea, check_idea_shape,
     check_idea_transition, decide_idea, idea_candidate, idea_task_state, proactive_ideas,
-    propose_idea, released_ideas, task_released,
+    propose_idea, released_ideas, review_idea, task_released,
 };
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
