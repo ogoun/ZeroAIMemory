@@ -1,0 +1,2356 @@
+{
+  "base_name": "2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-claude-a1-srv0.0.10-m5.7-holdout",
+  "arm_name": "2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a1-srv0.0.10-m5.7+m6-holdout",
+  "base_server": "0.0.10-m5.7",
+  "arm_server": "0.0.10-m5.7+m6",
+  "only_base": [],
+  "only_arm": [],
+  "exclusions": {
+    "labels": [
+      "session_start_after_abort"
+    ],
+    "classes": [],
+    "required": [],
+    "expect": []
+  },
+  "parts": [
+    {
+      "part": "всего",
+      "sessions": [
+        "sh-02",
+        "sh-03",
+        "ss-02",
+        "ss-08",
+        "ss-10",
+        "ss-11",
+        "ss-14",
+        "ss-15"
+      ],
+      "by_label": [
+        {
+          "label": "checkpoint",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "file_context",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "post_tool",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "pre_tool",
+          "base": 547.0,
+          "arm": 538.0,
+          "r": {
+            "mean": 0.9835466179159049,
+            "lo": 0.9826989619377162,
+            "hi": 0.9840255591054313
+          }
+        },
+        {
+          "label": "prompt",
+          "base": 1599.0,
+          "arm": 1206.0,
+          "r": {
+            "mean": 0.7542213883677298,
+            "lo": 0.47911898337884007,
+            "hi": 1.0039053926350443
+          }
+        },
+        {
+          "label": "question",
+          "base": 5997.666666666667,
+          "arm": 5547.333333333333,
+          "r": {
+            "mean": 0.9249152448174289,
+            "lo": 0.8775248102743723,
+            "hi": 0.9746003307705259
+          }
+        },
+        {
+          "label": "repeat",
+          "base": 1438.3333333333335,
+          "arm": 1280.3333333333333,
+          "r": {
+            "mean": 0.8901506373117032,
+            "lo": 0.8625874125874124,
+            "hi": 0.9443298969072165
+          }
+        },
+        {
+          "label": "session_start",
+          "base": 4854.333333333333,
+          "arm": 6646.0,
+          "r": {
+            "mean": 1.3690860399642932,
+            "lo": 1.1132839939282348,
+            "hi": 1.6660449113812235
+          }
+        },
+        {
+          "label": "subagent_mcp",
+          "base": 1242.6666666666667,
+          "arm": 999.0,
+          "r": {
+            "mean": 0.8039163090128755,
+            "lo": 0.74435318275154,
+            "hi": 1.0198511166253101
+          }
+        },
+        {
+          "label": "subagent_start",
+          "base": 825.0,
+          "arm": 680.6666666666666,
+          "r": {
+            "mean": 0.825050505050505,
+            "lo": 0.8171225937183384,
+            "hi": 0.8562874251497006
+          }
+        }
+      ],
+      "total": {
+        "label": "всего",
+        "base": 16504.0,
+        "arm": 16897.333333333336,
+        "r": {
+          "mean": 1.0238326062368721,
+          "lo": 0.8997988080740065,
+          "hi": 1.171801773639451
+        }
+      },
+      "base_summary": {
+        "sessions": 8,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 1641,
+          "prompt": 4797,
+          "question": 17993,
+          "repeat": 4315,
+          "session_start": 14563,
+          "subagent_mcp": 3728,
+          "subagent_start": 2475
+        },
+        "tokens_total": 49512,
+        "required": {
+          "found": 211,
+          "total": 249
+        },
+        "required_missing": [
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:frontend-a11y",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall",
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:frontend-a11y",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall",
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall"
+        ],
+        "hint_recall": {
+          "found": 87,
+          "total": 87
+        },
+        "hint_recall_strict": {
+          "found": 36,
+          "total": 87
+        },
+        "idea_hint_recall": {
+          "found": 21,
+          "total": 21
+        },
+        "idea_hint_recall_strict": {
+          "found": 9,
+          "total": 21
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 21,
+            "total": 21
+          },
+          "insight": {
+            "found": 30,
+            "total": 30
+          },
+          "rule": {
+            "found": 48,
+            "total": 48
+          },
+          "term": {
+            "found": 9,
+            "total": 9
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 9,
+            "total": 21
+          },
+          "insight": {
+            "found": 30,
+            "total": 30
+          },
+          "rule": {
+            "found": 0,
+            "total": 48
+          },
+          "term": {
+            "found": 6,
+            "total": 9
+          }
+        },
+        "hint_credit": {
+          "digest": 60,
+          "event": 45,
+          "hooks": 3
+        },
+        "nuggets": {
+          "found": 33,
+          "total": 33
+        },
+        "digest_match": {
+          "found": 24,
+          "total": 24
+        },
+        "repeated": {
+          "found": 101,
+          "total": 558
+        },
+        "repeated_cross": {
+          "found": 233,
+          "total": 531
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 0,
+        "reps_with_misses": [],
+        "required_by_rep": {
+          "0": {
+            "found": 70,
+            "total": 83
+          },
+          "1": {
+            "found": 70,
+            "total": 83
+          },
+          "2": {
+            "found": 71,
+            "total": 83
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.02728127939793038,
+        "idea_tokens": {
+          "prompt": 552,
+          "session_start": 2217
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 6287
+        }
+      },
+      "arm_summary": {
+        "sessions": 8,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 1614,
+          "prompt": 3618,
+          "question": 16642,
+          "repeat": 3841,
+          "session_start": 19938,
+          "subagent_mcp": 2997,
+          "subagent_start": 2042
+        },
+        "tokens_total": 50692,
+        "required": {
+          "found": 249,
+          "total": 249
+        },
+        "required_missing": [],
+        "hint_recall": {
+          "found": 85,
+          "total": 87
+        },
+        "hint_recall_strict": {
+          "found": 34,
+          "total": 87
+        },
+        "idea_hint_recall": {
+          "found": 19,
+          "total": 21
+        },
+        "idea_hint_recall_strict": {
+          "found": 7,
+          "total": 21
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 19,
+            "total": 21
+          },
+          "insight": {
+            "found": 28,
+            "total": 30
+          },
+          "rule": {
+            "found": 48,
+            "total": 48
+          },
+          "term": {
+            "found": 9,
+            "total": 9
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 7,
+            "total": 21
+          },
+          "insight": {
+            "found": 28,
+            "total": 30
+          },
+          "rule": {
+            "found": 0,
+            "total": 48
+          },
+          "term": {
+            "found": 6,
+            "total": 9
+          }
+        },
+        "hint_credit": {
+          "digest": 60,
+          "event": 41,
+          "hooks": 3
+        },
+        "nuggets": {
+          "found": 33,
+          "total": 33
+        },
+        "digest_match": {
+          "found": 24,
+          "total": 24
+        },
+        "repeated": {
+          "found": 87,
+          "total": 541
+        },
+        "repeated_cross": {
+          "found": 217,
+          "total": 531
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 1,
+        "reps_with_misses": [
+          "ss-10 r0"
+        ],
+        "required_by_rep": {
+          "0": {
+            "found": 83,
+            "total": 83
+          },
+          "1": {
+            "found": 83,
+            "total": 83
+          },
+          "2": {
+            "found": 83,
+            "total": 83
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.0562394984929135,
+        "idea_tokens": {
+          "prompt": 438,
+          "session_start": 2217
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 10965
+        }
+      },
+      "d_hint_recall": {
+        "mean": -0.022988505747126433,
+        "lo": -0.060606060606060594,
+        "hi": 0.0
+      },
+      "d_hint_recall_strict": {
+        "mean": -0.02298850574712644,
+        "lo": -0.06060606060606061,
+        "hi": 0.0
+      },
+      "d_required": {
+        "mean": 0.15261044176706828,
+        "lo": 0.0,
+        "hi": 0.26573426573426573
+      }
+    },
+    {
+      "part": "standard",
+      "sessions": [
+        "ss-02",
+        "ss-08",
+        "ss-10",
+        "ss-11",
+        "ss-14",
+        "ss-15"
+      ],
+      "by_label": [
+        {
+          "label": "checkpoint",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "file_context",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "post_tool",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "pre_tool",
+          "base": 368.0,
+          "arm": 362.0,
+          "r": {
+            "mean": 0.9836956521739131,
+            "lo": 0.9826989619377162,
+            "hi": 0.9843260188087775
+          }
+        },
+        {
+          "label": "prompt",
+          "base": 338.0,
+          "arm": 304.3333333333333,
+          "r": {
+            "mean": 0.9003944773175542,
+            "lo": 0.6587926509186351,
+            "hi": 1.2522935779816513
+          }
+        },
+        {
+          "label": "question",
+          "base": 3014.0,
+          "arm": 2925.0,
+          "r": {
+            "mean": 0.9704711347047114,
+            "lo": 0.9601924759405075,
+            "hi": 0.9787449392712552
+          }
+        },
+        {
+          "label": "repeat",
+          "base": 485.0,
+          "arm": 458.0,
+          "r": {
+            "mean": 0.9443298969072165,
+            "lo": 0.9443298969072165,
+            "hi": 0.9443298969072165
+          }
+        },
+        {
+          "label": "session_start",
+          "base": 1957.0,
+          "arm": 2249.0,
+          "r": {
+            "mean": 1.1492079713847727,
+            "lo": 1.091018444266239,
+            "hi": 1.2335483870967743
+          }
+        },
+        {
+          "label": "subagent_mcp",
+          "base": 268.6666666666667,
+          "arm": 274.0,
+          "r": {
+            "mean": 1.0198511166253101,
+            "lo": 1.0198511166253101,
+            "hi": 1.0198511166253101
+          }
+        },
+        {
+          "label": "subagent_start",
+          "base": 167.0,
+          "arm": 143.0,
+          "r": {
+            "mean": 0.8562874251497006,
+            "lo": 0.8562874251497006,
+            "hi": 0.8562874251497006
+          }
+        }
+      ],
+      "total": {
+        "label": "всего",
+        "base": 6597.666666666666,
+        "arm": 6715.333333333334,
+        "r": {
+          "mean": 1.0178345879856516,
+          "lo": 1.0006659836065575,
+          "hi": 1.0412383900928794
+        }
+      },
+      "base_summary": {
+        "sessions": 6,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 1104,
+          "prompt": 1014,
+          "question": 9042,
+          "repeat": 1455,
+          "session_start": 5871,
+          "subagent_mcp": 806,
+          "subagent_start": 501
+        },
+        "tokens_total": 19793,
+        "required": {
+          "found": 87,
+          "total": 87
+        },
+        "required_missing": [],
+        "hint_recall": {
+          "found": 60,
+          "total": 60
+        },
+        "hint_recall_strict": {
+          "found": 18,
+          "total": 60
+        },
+        "idea_hint_recall": {
+          "found": 12,
+          "total": 12
+        },
+        "idea_hint_recall_strict": {
+          "found": 0,
+          "total": 12
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 12,
+            "total": 12
+          },
+          "insight": {
+            "found": 18,
+            "total": 18
+          },
+          "rule": {
+            "found": 42,
+            "total": 42
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 0,
+            "total": 12
+          },
+          "insight": {
+            "found": 18,
+            "total": 18
+          },
+          "rule": {
+            "found": 0,
+            "total": 42
+          }
+        },
+        "hint_credit": {
+          "digest": 54,
+          "event": 18
+        },
+        "nuggets": {
+          "found": 21,
+          "total": 21
+        },
+        "digest_match": {
+          "found": 18,
+          "total": 18
+        },
+        "repeated": {
+          "found": 35,
+          "total": 218
+        },
+        "repeated_cross": {
+          "found": 104,
+          "total": 209
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 0,
+        "reps_with_misses": [],
+        "required_by_rep": {
+          "0": {
+            "found": 29,
+            "total": 29
+          },
+          "1": {
+            "found": 29,
+            "total": 29
+          },
+          "2": {
+            "found": 29,
+            "total": 29
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.0313734713076199,
+        "idea_tokens": {
+          "session_start": 1209
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 3027
+        }
+      },
+      "arm_summary": {
+        "sessions": 6,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 1086,
+          "prompt": 913,
+          "question": 8775,
+          "repeat": 1374,
+          "session_start": 6747,
+          "subagent_mcp": 822,
+          "subagent_start": 429
+        },
+        "tokens_total": 20146,
+        "required": {
+          "found": 87,
+          "total": 87
+        },
+        "required_missing": [],
+        "hint_recall": {
+          "found": 60,
+          "total": 60
+        },
+        "hint_recall_strict": {
+          "found": 18,
+          "total": 60
+        },
+        "idea_hint_recall": {
+          "found": 12,
+          "total": 12
+        },
+        "idea_hint_recall_strict": {
+          "found": 0,
+          "total": 12
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 12,
+            "total": 12
+          },
+          "insight": {
+            "found": 18,
+            "total": 18
+          },
+          "rule": {
+            "found": 42,
+            "total": 42
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 0,
+            "total": 12
+          },
+          "insight": {
+            "found": 18,
+            "total": 18
+          },
+          "rule": {
+            "found": 0,
+            "total": 42
+          }
+        },
+        "hint_credit": {
+          "digest": 54,
+          "event": 18
+        },
+        "nuggets": {
+          "found": 21,
+          "total": 21
+        },
+        "digest_match": {
+          "found": 18,
+          "total": 18
+        },
+        "repeated": {
+          "found": 31,
+          "total": 211
+        },
+        "repeated_cross": {
+          "found": 100,
+          "total": 205
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 1,
+        "reps_with_misses": [
+          "ss-10 r0"
+        ],
+        "required_by_rep": {
+          "0": {
+            "found": 29,
+            "total": 29
+          },
+          "1": {
+            "found": 29,
+            "total": 29
+          },
+          "2": {
+            "found": 29,
+            "total": 29
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.05126481151044393,
+        "idea_tokens": {
+          "session_start": 1209
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 3909
+        }
+      },
+      "d_hint_recall": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "d_hint_recall_strict": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "d_required": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      }
+    },
+    {
+      "part": "heavy",
+      "sessions": [
+        "sh-02",
+        "sh-03"
+      ],
+      "by_label": [
+        {
+          "label": "checkpoint",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "file_context",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "post_tool",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "pre_tool",
+          "base": 179.0,
+          "arm": 176.0,
+          "r": {
+            "mean": 0.9832402234636871,
+            "lo": 0.9818181818181818,
+            "hi": 0.9838709677419355
+          }
+        },
+        {
+          "label": "prompt",
+          "base": 1261.0,
+          "arm": 901.6666666666667,
+          "r": {
+            "mean": 0.7150409727729315,
+            "lo": 0.40717736369910285,
+            "hi": 0.9061696658097687
+          }
+        },
+        {
+          "label": "question",
+          "base": 2983.666666666667,
+          "arm": 2622.333333333333,
+          "r": {
+            "mean": 0.8788962127136631,
+            "lo": 0.8402128345694937,
+            "hi": 0.9661695161877046
+          }
+        },
+        {
+          "label": "repeat",
+          "base": 953.3333333333334,
+          "arm": 822.3333333333333,
+          "r": {
+            "mean": 0.8625874125874124,
+            "lo": 0.8625874125874124,
+            "hi": 0.8625874125874124
+          }
+        },
+        {
+          "label": "session_start",
+          "base": 2897.333333333333,
+          "arm": 4397.0,
+          "r": {
+            "mean": 1.5176023930050624,
+            "lo": 1.1391426563598033,
+            "hi": 1.8828849197377346
+          }
+        },
+        {
+          "label": "subagent_mcp",
+          "base": 974.0,
+          "arm": 725.0,
+          "r": {
+            "mean": 0.74435318275154,
+            "lo": 0.74435318275154,
+            "hi": 0.74435318275154
+          }
+        },
+        {
+          "label": "subagent_start",
+          "base": 658.0,
+          "arm": 537.6666666666666,
+          "r": {
+            "mean": 0.8171225937183384,
+            "lo": 0.8171225937183384,
+            "hi": 0.8171225937183384
+          }
+        }
+      ],
+      "total": {
+        "label": "всего",
+        "base": 9906.333333333334,
+        "arm": 10182.0,
+        "r": {
+          "mean": 1.0278273158585416,
+          "lo": 0.8606089158471233,
+          "hi": 1.2507457999685978
+        }
+      },
+      "base_summary": {
+        "sessions": 2,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 537,
+          "prompt": 3783,
+          "question": 8951,
+          "repeat": 2860,
+          "session_start": 8692,
+          "subagent_mcp": 2922,
+          "subagent_start": 1974
+        },
+        "tokens_total": 29719,
+        "required": {
+          "found": 124,
+          "total": 162
+        },
+        "required_missing": [
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:frontend-a11y",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall",
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:frontend-a11y",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall",
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall"
+        ],
+        "hint_recall": {
+          "found": 27,
+          "total": 27
+        },
+        "hint_recall_strict": {
+          "found": 18,
+          "total": 27
+        },
+        "idea_hint_recall": {
+          "found": 9,
+          "total": 9
+        },
+        "idea_hint_recall_strict": {
+          "found": 9,
+          "total": 9
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 9,
+            "total": 9
+          },
+          "insight": {
+            "found": 12,
+            "total": 12
+          },
+          "rule": {
+            "found": 6,
+            "total": 6
+          },
+          "term": {
+            "found": 9,
+            "total": 9
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 9,
+            "total": 9
+          },
+          "insight": {
+            "found": 12,
+            "total": 12
+          },
+          "rule": {
+            "found": 0,
+            "total": 6
+          },
+          "term": {
+            "found": 6,
+            "total": 9
+          }
+        },
+        "hint_credit": {
+          "digest": 6,
+          "event": 27,
+          "hooks": 3
+        },
+        "nuggets": {
+          "found": 12,
+          "total": 12
+        },
+        "digest_match": {
+          "found": 6,
+          "total": 6
+        },
+        "repeated": {
+          "found": 66,
+          "total": 340
+        },
+        "repeated_cross": {
+          "found": 129,
+          "total": 322
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 0,
+        "reps_with_misses": [],
+        "required_by_rep": {
+          "0": {
+            "found": 41,
+            "total": 54
+          },
+          "1": {
+            "found": 41,
+            "total": 54
+          },
+          "2": {
+            "found": 42,
+            "total": 54
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.006005652378709373,
+        "idea_tokens": {
+          "prompt": 552,
+          "session_start": 1008
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 3260
+        }
+      },
+      "arm_summary": {
+        "sessions": 2,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 528,
+          "prompt": 2705,
+          "question": 7867,
+          "repeat": 2467,
+          "session_start": 13191,
+          "subagent_mcp": 2175,
+          "subagent_start": 1613
+        },
+        "tokens_total": 30546,
+        "required": {
+          "found": 162,
+          "total": 162
+        },
+        "required_missing": [],
+        "hint_recall": {
+          "found": 25,
+          "total": 27
+        },
+        "hint_recall_strict": {
+          "found": 16,
+          "total": 27
+        },
+        "idea_hint_recall": {
+          "found": 7,
+          "total": 9
+        },
+        "idea_hint_recall_strict": {
+          "found": 7,
+          "total": 9
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 7,
+            "total": 9
+          },
+          "insight": {
+            "found": 10,
+            "total": 12
+          },
+          "rule": {
+            "found": 6,
+            "total": 6
+          },
+          "term": {
+            "found": 9,
+            "total": 9
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 7,
+            "total": 9
+          },
+          "insight": {
+            "found": 10,
+            "total": 12
+          },
+          "rule": {
+            "found": 0,
+            "total": 6
+          },
+          "term": {
+            "found": 6,
+            "total": 9
+          }
+        },
+        "hint_credit": {
+          "digest": 6,
+          "event": 23,
+          "hooks": 3
+        },
+        "nuggets": {
+          "found": 12,
+          "total": 12
+        },
+        "digest_match": {
+          "found": 6,
+          "total": 6
+        },
+        "repeated": {
+          "found": 56,
+          "total": 330
+        },
+        "repeated_cross": {
+          "found": 117,
+          "total": 326
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 0,
+        "reps_with_misses": [],
+        "required_by_rep": {
+          "0": {
+            "found": 54,
+            "total": 54
+          },
+          "1": {
+            "found": 54,
+            "total": 54
+          },
+          "2": {
+            "found": 54,
+            "total": 54
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.06611810592582458,
+        "idea_tokens": {
+          "prompt": 438,
+          "session_start": 1008
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 7056
+        }
+      },
+      "d_hint_recall": {
+        "mean": -0.07407407407407406,
+        "lo": -0.1333333333333333,
+        "hi": 0.0
+      },
+      "d_hint_recall_strict": {
+        "mean": -0.07407407407407408,
+        "lo": -0.13333333333333336,
+        "hi": 0.0
+      },
+      "d_required": {
+        "mean": 0.23456790123456792,
+        "lo": 0.0,
+        "hi": 0.36190476190476195
+      }
+    }
+  ],
+  "parts_no_rules": [
+    {
+      "part": "всего",
+      "sessions": [
+        "sh-02",
+        "sh-03",
+        "ss-02",
+        "ss-08",
+        "ss-10",
+        "ss-11",
+        "ss-14",
+        "ss-15"
+      ],
+      "by_label": [
+        {
+          "label": "checkpoint",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "file_context",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "post_tool",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "pre_tool",
+          "base": 547.0,
+          "arm": 538.0,
+          "r": {
+            "mean": 0.9835466179159049,
+            "lo": 0.9826989619377162,
+            "hi": 0.9840255591054313
+          }
+        },
+        {
+          "label": "prompt",
+          "base": 1599.0,
+          "arm": 1206.0,
+          "r": {
+            "mean": 0.7542213883677298,
+            "lo": 0.47911898337884007,
+            "hi": 1.0039053926350443
+          }
+        },
+        {
+          "label": "question",
+          "base": 5997.666666666667,
+          "arm": 5547.333333333333,
+          "r": {
+            "mean": 0.9249152448174289,
+            "lo": 0.8775248102743723,
+            "hi": 0.9746003307705259
+          }
+        },
+        {
+          "label": "repeat",
+          "base": 1438.3333333333335,
+          "arm": 1280.3333333333333,
+          "r": {
+            "mean": 0.8901506373117032,
+            "lo": 0.8625874125874124,
+            "hi": 0.9443298969072165
+          }
+        },
+        {
+          "label": "session_start",
+          "base": 2758.666666666667,
+          "arm": 2991.0,
+          "r": {
+            "mean": 1.084219429676172,
+            "lo": 0.9973462482078175,
+            "hi": 1.180896135575812
+          }
+        },
+        {
+          "label": "subagent_mcp",
+          "base": 1242.6666666666667,
+          "arm": 999.0,
+          "r": {
+            "mean": 0.8039163090128755,
+            "lo": 0.74435318275154,
+            "hi": 1.0198511166253101
+          }
+        },
+        {
+          "label": "subagent_start",
+          "base": 825.0,
+          "arm": 680.6666666666666,
+          "r": {
+            "mean": 0.825050505050505,
+            "lo": 0.8171225937183384,
+            "hi": 0.8562874251497006
+          }
+        }
+      ],
+      "total": {
+        "label": "всего",
+        "base": 14408.333333333336,
+        "arm": 13242.333333333336,
+        "r": {
+          "mean": 0.9190746096009254,
+          "lo": 0.8450506467789577,
+          "hi": 0.9915749239589783
+        }
+      },
+      "base_summary": {
+        "sessions": 8,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 1641,
+          "prompt": 4797,
+          "question": 17993,
+          "repeat": 4315,
+          "session_start": 8276,
+          "subagent_mcp": 3728,
+          "subagent_start": 2475
+        },
+        "tokens_total": 43225,
+        "required": {
+          "found": 211,
+          "total": 249
+        },
+        "required_missing": [
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:frontend-a11y",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall",
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:frontend-a11y",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall",
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall"
+        ],
+        "hint_recall": {
+          "found": 87,
+          "total": 87
+        },
+        "hint_recall_strict": {
+          "found": 36,
+          "total": 87
+        },
+        "idea_hint_recall": {
+          "found": 21,
+          "total": 21
+        },
+        "idea_hint_recall_strict": {
+          "found": 9,
+          "total": 21
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 21,
+            "total": 21
+          },
+          "insight": {
+            "found": 30,
+            "total": 30
+          },
+          "rule": {
+            "found": 48,
+            "total": 48
+          },
+          "term": {
+            "found": 9,
+            "total": 9
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 9,
+            "total": 21
+          },
+          "insight": {
+            "found": 30,
+            "total": 30
+          },
+          "rule": {
+            "found": 0,
+            "total": 48
+          },
+          "term": {
+            "found": 6,
+            "total": 9
+          }
+        },
+        "hint_credit": {
+          "digest": 60,
+          "event": 45,
+          "hooks": 3
+        },
+        "nuggets": {
+          "found": 33,
+          "total": 33
+        },
+        "digest_match": {
+          "found": 24,
+          "total": 24
+        },
+        "repeated": {
+          "found": 101,
+          "total": 558
+        },
+        "repeated_cross": {
+          "found": 233,
+          "total": 531
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 0,
+        "reps_with_misses": [],
+        "required_by_rep": {
+          "0": {
+            "found": 70,
+            "total": 83
+          },
+          "1": {
+            "found": 70,
+            "total": 83
+          },
+          "2": {
+            "found": 71,
+            "total": 83
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.03059071729957806,
+        "idea_tokens": {
+          "prompt": 552,
+          "session_start": 2217
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 6287
+        }
+      },
+      "arm_summary": {
+        "sessions": 8,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 1614,
+          "prompt": 3618,
+          "question": 16642,
+          "repeat": 3841,
+          "session_start": 8973,
+          "subagent_mcp": 2997,
+          "subagent_start": 2042
+        },
+        "tokens_total": 39727,
+        "required": {
+          "found": 249,
+          "total": 249
+        },
+        "required_missing": [],
+        "hint_recall": {
+          "found": 85,
+          "total": 87
+        },
+        "hint_recall_strict": {
+          "found": 34,
+          "total": 87
+        },
+        "idea_hint_recall": {
+          "found": 19,
+          "total": 21
+        },
+        "idea_hint_recall_strict": {
+          "found": 7,
+          "total": 21
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 19,
+            "total": 21
+          },
+          "insight": {
+            "found": 28,
+            "total": 30
+          },
+          "rule": {
+            "found": 48,
+            "total": 48
+          },
+          "term": {
+            "found": 9,
+            "total": 9
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 7,
+            "total": 21
+          },
+          "insight": {
+            "found": 28,
+            "total": 30
+          },
+          "rule": {
+            "found": 0,
+            "total": 48
+          },
+          "term": {
+            "found": 6,
+            "total": 9
+          }
+        },
+        "hint_credit": {
+          "digest": 60,
+          "event": 41,
+          "hooks": 3
+        },
+        "nuggets": {
+          "found": 33,
+          "total": 33
+        },
+        "digest_match": {
+          "found": 24,
+          "total": 24
+        },
+        "repeated": {
+          "found": 87,
+          "total": 541
+        },
+        "repeated_cross": {
+          "found": 217,
+          "total": 531
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 1,
+        "reps_with_misses": [
+          "ss-10 r0"
+        ],
+        "required_by_rep": {
+          "0": {
+            "found": 83,
+            "total": 83
+          },
+          "1": {
+            "found": 83,
+            "total": 83
+          },
+          "2": {
+            "found": 83,
+            "total": 83
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.07436485430624483,
+        "idea_tokens": {
+          "prompt": 438,
+          "session_start": 2217
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 10965
+        }
+      },
+      "d_hint_recall": {
+        "mean": -0.022988505747126433,
+        "lo": -0.060606060606060594,
+        "hi": 0.0
+      },
+      "d_hint_recall_strict": {
+        "mean": -0.02298850574712644,
+        "lo": -0.06060606060606061,
+        "hi": 0.0
+      },
+      "d_required": {
+        "mean": 0.15261044176706828,
+        "lo": 0.0,
+        "hi": 0.26573426573426573
+      }
+    },
+    {
+      "part": "standard",
+      "sessions": [
+        "ss-02",
+        "ss-08",
+        "ss-10",
+        "ss-11",
+        "ss-14",
+        "ss-15"
+      ],
+      "by_label": [
+        {
+          "label": "checkpoint",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "file_context",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "post_tool",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "pre_tool",
+          "base": 368.0,
+          "arm": 362.0,
+          "r": {
+            "mean": 0.9836956521739131,
+            "lo": 0.9826989619377162,
+            "hi": 0.9843260188087775
+          }
+        },
+        {
+          "label": "prompt",
+          "base": 338.0,
+          "arm": 304.3333333333333,
+          "r": {
+            "mean": 0.9003944773175542,
+            "lo": 0.6587926509186351,
+            "hi": 1.2522935779816513
+          }
+        },
+        {
+          "label": "question",
+          "base": 3014.0,
+          "arm": 2925.0,
+          "r": {
+            "mean": 0.9704711347047114,
+            "lo": 0.9601924759405075,
+            "hi": 0.9787449392712552
+          }
+        },
+        {
+          "label": "repeat",
+          "base": 485.0,
+          "arm": 458.0,
+          "r": {
+            "mean": 0.9443298969072165,
+            "lo": 0.9443298969072165,
+            "hi": 0.9443298969072165
+          }
+        },
+        {
+          "label": "session_start",
+          "base": 948.0,
+          "arm": 946.0,
+          "r": {
+            "mean": 0.9978902953586498,
+            "lo": 0.9965156794425087,
+            "hi": 1.0
+          }
+        },
+        {
+          "label": "subagent_mcp",
+          "base": 268.6666666666667,
+          "arm": 274.0,
+          "r": {
+            "mean": 1.0198511166253101,
+            "lo": 1.0198511166253101,
+            "hi": 1.0198511166253101
+          }
+        },
+        {
+          "label": "subagent_start",
+          "base": 167.0,
+          "arm": 143.0,
+          "r": {
+            "mean": 0.8562874251497006,
+            "lo": 0.8562874251497006,
+            "hi": 0.8562874251497006
+          }
+        }
+      ],
+      "total": {
+        "label": "всего",
+        "base": 5588.666666666666,
+        "arm": 5412.333333333333,
+        "r": {
+          "mean": 0.9684480496242396,
+          "lo": 0.9526767228630585,
+          "hi": 0.988203322833673
+        }
+      },
+      "base_summary": {
+        "sessions": 6,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 1104,
+          "prompt": 1014,
+          "question": 9042,
+          "repeat": 1455,
+          "session_start": 2844,
+          "subagent_mcp": 806,
+          "subagent_start": 501
+        },
+        "tokens_total": 16766,
+        "required": {
+          "found": 87,
+          "total": 87
+        },
+        "required_missing": [],
+        "hint_recall": {
+          "found": 60,
+          "total": 60
+        },
+        "hint_recall_strict": {
+          "found": 18,
+          "total": 60
+        },
+        "idea_hint_recall": {
+          "found": 12,
+          "total": 12
+        },
+        "idea_hint_recall_strict": {
+          "found": 0,
+          "total": 12
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 12,
+            "total": 12
+          },
+          "insight": {
+            "found": 18,
+            "total": 18
+          },
+          "rule": {
+            "found": 42,
+            "total": 42
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 0,
+            "total": 12
+          },
+          "insight": {
+            "found": 18,
+            "total": 18
+          },
+          "rule": {
+            "found": 0,
+            "total": 42
+          }
+        },
+        "hint_credit": {
+          "digest": 54,
+          "event": 18
+        },
+        "nuggets": {
+          "found": 21,
+          "total": 21
+        },
+        "digest_match": {
+          "found": 18,
+          "total": 18
+        },
+        "repeated": {
+          "found": 35,
+          "total": 218
+        },
+        "repeated_cross": {
+          "found": 104,
+          "total": 209
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 0,
+        "reps_with_misses": [],
+        "required_by_rep": {
+          "0": {
+            "found": 29,
+            "total": 29
+          },
+          "1": {
+            "found": 29,
+            "total": 29
+          },
+          "2": {
+            "found": 29,
+            "total": 29
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.035179324894514724,
+        "idea_tokens": {
+          "session_start": 1209
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 3027
+        }
+      },
+      "arm_summary": {
+        "sessions": 6,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 1086,
+          "prompt": 913,
+          "question": 8775,
+          "repeat": 1374,
+          "session_start": 2838,
+          "subagent_mcp": 822,
+          "subagent_start": 429
+        },
+        "tokens_total": 16237,
+        "required": {
+          "found": 87,
+          "total": 87
+        },
+        "required_missing": [],
+        "hint_recall": {
+          "found": 60,
+          "total": 60
+        },
+        "hint_recall_strict": {
+          "found": 18,
+          "total": 60
+        },
+        "idea_hint_recall": {
+          "found": 12,
+          "total": 12
+        },
+        "idea_hint_recall_strict": {
+          "found": 0,
+          "total": 12
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 12,
+            "total": 12
+          },
+          "insight": {
+            "found": 18,
+            "total": 18
+          },
+          "rule": {
+            "found": 42,
+            "total": 42
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 0,
+            "total": 12
+          },
+          "insight": {
+            "found": 18,
+            "total": 18
+          },
+          "rule": {
+            "found": 0,
+            "total": 42
+          }
+        },
+        "hint_credit": {
+          "digest": 54,
+          "event": 18
+        },
+        "nuggets": {
+          "found": 21,
+          "total": 21
+        },
+        "digest_match": {
+          "found": 18,
+          "total": 18
+        },
+        "repeated": {
+          "found": 31,
+          "total": 211
+        },
+        "repeated_cross": {
+          "found": 100,
+          "total": 205
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 1,
+        "reps_with_misses": [
+          "ss-10 r0"
+        ],
+        "required_by_rep": {
+          "0": {
+            "found": 29,
+            "total": 29
+          },
+          "1": {
+            "found": 29,
+            "total": 29
+          },
+          "2": {
+            "found": 29,
+            "total": 29
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.06297425578557375,
+        "idea_tokens": {
+          "session_start": 1209
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 3909
+        }
+      },
+      "d_hint_recall": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "d_hint_recall_strict": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "d_required": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      }
+    },
+    {
+      "part": "heavy",
+      "sessions": [
+        "sh-02",
+        "sh-03"
+      ],
+      "by_label": [
+        {
+          "label": "checkpoint",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "file_context",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "post_tool",
+          "base": 0.0,
+          "arm": 0.0,
+          "r": null
+        },
+        {
+          "label": "pre_tool",
+          "base": 179.0,
+          "arm": 176.0,
+          "r": {
+            "mean": 0.9832402234636871,
+            "lo": 0.9818181818181818,
+            "hi": 0.9838709677419355
+          }
+        },
+        {
+          "label": "prompt",
+          "base": 1261.0,
+          "arm": 901.6666666666667,
+          "r": {
+            "mean": 0.7150409727729315,
+            "lo": 0.40717736369910285,
+            "hi": 0.9061696658097687
+          }
+        },
+        {
+          "label": "question",
+          "base": 2983.666666666667,
+          "arm": 2622.333333333333,
+          "r": {
+            "mean": 0.8788962127136631,
+            "lo": 0.8402128345694937,
+            "hi": 0.9661695161877046
+          }
+        },
+        {
+          "label": "repeat",
+          "base": 953.3333333333334,
+          "arm": 822.3333333333333,
+          "r": {
+            "mean": 0.8625874125874124,
+            "lo": 0.8625874125874124,
+            "hi": 0.8625874125874124
+          }
+        },
+        {
+          "label": "session_start",
+          "base": 1810.6666666666667,
+          "arm": 2045.0,
+          "r": {
+            "mean": 1.129418262150221,
+            "lo": 0.9987623762376238,
+            "hi": 1.2347074468085106
+          }
+        },
+        {
+          "label": "subagent_mcp",
+          "base": 974.0,
+          "arm": 725.0,
+          "r": {
+            "mean": 0.74435318275154,
+            "lo": 0.74435318275154,
+            "hi": 0.74435318275154
+          }
+        },
+        {
+          "label": "subagent_start",
+          "base": 658.0,
+          "arm": 537.6666666666666,
+          "r": {
+            "mean": 0.8171225937183384,
+            "lo": 0.8171225937183384,
+            "hi": 0.8171225937183384
+          }
+        }
+      ],
+      "total": {
+        "label": "всего",
+        "base": 8819.666666666668,
+        "arm": 7830.0,
+        "r": {
+          "mean": 0.8877886541441474,
+          "lo": 0.8041754756871036,
+          "hi": 0.9995584209131856
+        }
+      },
+      "base_summary": {
+        "sessions": 2,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 537,
+          "prompt": 3783,
+          "question": 8951,
+          "repeat": 2860,
+          "session_start": 5432,
+          "subagent_mcp": 2922,
+          "subagent_start": 1974
+        },
+        "tokens_total": 26459,
+        "required": {
+          "found": 124,
+          "total": 162
+        },
+        "required_missing": [
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:frontend-a11y",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall",
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:frontend-a11y",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall",
+          "sh-02 session_start rule:commits",
+          "sh-02 session_start rule:secrets",
+          "sh-02 session_start rule:tests",
+          "sh-02 session_start rule:deps",
+          "sh-02 session_start rule:release",
+          "sh-02 session_start rule:infra-changes",
+          "sh-02 session_start rule:tmp-files",
+          "sh-02 session_start rule:reviews",
+          "sh-02 session_start rule:feature-flags",
+          "sh-02 session_start rule:i18n",
+          "sh-02 session_start rule:cache-headers",
+          "sh-02 session_start rule:oncall"
+        ],
+        "hint_recall": {
+          "found": 27,
+          "total": 27
+        },
+        "hint_recall_strict": {
+          "found": 18,
+          "total": 27
+        },
+        "idea_hint_recall": {
+          "found": 9,
+          "total": 9
+        },
+        "idea_hint_recall_strict": {
+          "found": 9,
+          "total": 9
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 9,
+            "total": 9
+          },
+          "insight": {
+            "found": 12,
+            "total": 12
+          },
+          "rule": {
+            "found": 6,
+            "total": 6
+          },
+          "term": {
+            "found": 9,
+            "total": 9
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 9,
+            "total": 9
+          },
+          "insight": {
+            "found": 12,
+            "total": 12
+          },
+          "rule": {
+            "found": 0,
+            "total": 6
+          },
+          "term": {
+            "found": 6,
+            "total": 9
+          }
+        },
+        "hint_credit": {
+          "digest": 6,
+          "event": 27,
+          "hooks": 3
+        },
+        "nuggets": {
+          "found": 12,
+          "total": 12
+        },
+        "digest_match": {
+          "found": 6,
+          "total": 6
+        },
+        "repeated": {
+          "found": 66,
+          "total": 340
+        },
+        "repeated_cross": {
+          "found": 129,
+          "total": 322
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 0,
+        "reps_with_misses": [],
+        "required_by_rep": {
+          "0": {
+            "found": 41,
+            "total": 54
+          },
+          "1": {
+            "found": 41,
+            "total": 54
+          },
+          "2": {
+            "found": 42,
+            "total": 54
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.0019650269363243157,
+        "idea_tokens": {
+          "prompt": 552,
+          "session_start": 1008
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 3260
+        }
+      },
+      "arm_summary": {
+        "sessions": 2,
+        "tokens_by_label": {
+          "checkpoint": 0,
+          "file_context": 0,
+          "post_tool": 0,
+          "pre_tool": 528,
+          "prompt": 2705,
+          "question": 7867,
+          "repeat": 2467,
+          "session_start": 6135,
+          "subagent_mcp": 2175,
+          "subagent_start": 1613
+        },
+        "tokens_total": 23490,
+        "required": {
+          "found": 162,
+          "total": 162
+        },
+        "required_missing": [],
+        "hint_recall": {
+          "found": 25,
+          "total": 27
+        },
+        "hint_recall_strict": {
+          "found": 16,
+          "total": 27
+        },
+        "idea_hint_recall": {
+          "found": 7,
+          "total": 9
+        },
+        "idea_hint_recall_strict": {
+          "found": 7,
+          "total": 9
+        },
+        "hint_by_kind": {
+          "idea": {
+            "found": 7,
+            "total": 9
+          },
+          "insight": {
+            "found": 10,
+            "total": 12
+          },
+          "rule": {
+            "found": 6,
+            "total": 6
+          },
+          "term": {
+            "found": 9,
+            "total": 9
+          }
+        },
+        "hint_by_kind_strict": {
+          "idea": {
+            "found": 7,
+            "total": 9
+          },
+          "insight": {
+            "found": 10,
+            "total": 12
+          },
+          "rule": {
+            "found": 0,
+            "total": 6
+          },
+          "term": {
+            "found": 6,
+            "total": 9
+          }
+        },
+        "hint_credit": {
+          "digest": 6,
+          "event": 23,
+          "hooks": 3
+        },
+        "nuggets": {
+          "found": 12,
+          "total": 12
+        },
+        "digest_match": {
+          "found": 6,
+          "total": 6
+        },
+        "repeated": {
+          "found": 56,
+          "total": 330
+        },
+        "repeated_cross": {
+          "found": 117,
+          "total": 326
+        },
+        "bad_outputs": 0,
+        "hook_budget_misses": 0,
+        "reps_with_misses": [],
+        "required_by_rep": {
+          "0": {
+            "found": 54,
+            "total": 54
+          },
+          "1": {
+            "found": 54,
+            "total": 54
+          },
+          "2": {
+            "found": 54,
+            "total": 54
+          }
+        },
+        "reps": 3,
+        "rep_noise_p95": 0.07938301018731513,
+        "idea_tokens": {
+          "prompt": 438,
+          "session_start": 1008
+        },
+        "snapshot_tokens": {},
+        "rules_tokens": {
+          "session_start": 7056
+        }
+      },
+      "d_hint_recall": {
+        "mean": -0.07407407407407406,
+        "lo": -0.1333333333333333,
+        "hi": 0.0
+      },
+      "d_hint_recall_strict": {
+        "mean": -0.07407407407407408,
+        "lo": -0.13333333333333336,
+        "hi": 0.0
+      },
+      "d_required": {
+        "mean": 0.23456790123456792,
+        "lo": 0.0,
+        "hi": 0.36190476190476195
+      }
+    }
+  ],
+  "idea_hints_match": {
+    "found": 24,
+    "total": 24
+  },
+  "abs_rel_diff_p95": 0.21177164943309534,
+  "same_server": false,
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 104372539625497
+}

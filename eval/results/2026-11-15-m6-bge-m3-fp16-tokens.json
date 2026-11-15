@@ -1,0 +1,1023 @@
+{
+  "date": "2026-11-15",
+  "model": "bge-m3-fp16",
+  "thresholds": {
+    "ts2_r_full_standard_max": 1.15,
+    "ts2_r_norules_standard_vs_b57_max": 1.0,
+    "ts2_d_hint_lo_min": -0.02,
+    "ts1_d_micro_lo_min": -0.02,
+    "ts1_net_losses_max": 1,
+    "ts1_r_hi_max": 1.0,
+    "ts1_r_goal": 0.7,
+    "quality_d_lo_min": -0.01
+  },
+  "ts2": {
+    "claude": {
+      "date_utc": {
+        "m6": "2026-11-15",
+        "b56": "2026-11-15",
+        "b57": "2026-11-15",
+        "aa": "2026-11-15"
+      },
+      "hook_agent": {
+        "m6": "claude",
+        "b56": "claude",
+        "b57": "claude",
+        "aa": "claude"
+      },
+      "device": "cuda",
+      "repeat": {
+        "m6": 3,
+        "b56": 3,
+        "b57": 3,
+        "aa": 3
+      },
+      "attempt": 2,
+      "r_full_vs_b56": {
+        "standard": {
+          "mean": 1.0874591874966548,
+          "lo": 1.0426501782732318,
+          "hi": 1.1431238779174144
+        },
+        "all": {
+          "mean": 1.0877805591198806,
+          "lo": 0.9826173569385985,
+          "hi": 1.2154868325682533
+        }
+      },
+      "r_norules_vs_b57": {
+        "standard": {
+          "mean": 0.9733064420453199,
+          "lo": 0.9632603624618699,
+          "hi": 0.9833935475692462
+        }
+      },
+      "d_hint_recall": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "d_hint_recall_strict": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "required_m6": {
+        "by_profile": {
+          "standard": {
+            "found": 87,
+            "total": 87
+          },
+          "heavy": {
+            "found": 165,
+            "total": 165
+          }
+        },
+        "worst_rep_share": 1.0
+      },
+      "idea_hint_recall_m6": {
+        "found": 21,
+        "total": 21
+      },
+      "idea_hints_match_b57": {
+        "found": 24,
+        "total": 24
+      },
+      "misses": {
+        "m6": {
+          "reps_with_misses": [],
+          "hook_budget_misses": 0,
+          "bad_outputs": 0
+        },
+        "b56": {
+          "reps_with_misses": [],
+          "hook_budget_misses": 0,
+          "bad_outputs": 0
+        },
+        "b57": {
+          "reps_with_misses": [],
+          "hook_budget_misses": 0,
+          "bad_outputs": 0
+        },
+        "aa": {
+          "reps_with_misses": [
+            "sh-02 r1",
+            "sh-03 r2"
+          ],
+          "hook_budget_misses": 2,
+          "bad_outputs": 0
+        }
+      },
+      "noise_aa_p95": 0.0078047119434925165,
+      "idea_hint_exceptions": {
+        "count": 0,
+        "events": []
+      },
+      "checks": {
+        "r_full_standard_le_1_15": true,
+        "r_norules_standard_vs_b57_le_1_00": true,
+        "required_1_0": true,
+        "d_hint_recall_lo_ge_-0_02": true,
+        "d_hint_recall_strict_lo_ge_-0_02": true,
+        "idea_hint_recall_1_0": true,
+        "idea_hints_match_b57": true,
+        "no_reps_with_misses": false,
+        "same_utc_day": true
+      }
+    },
+    "codex": {
+      "date_utc": {
+        "m6": "2026-11-15",
+        "b56": "2026-11-15",
+        "b57": "2026-11-15"
+      },
+      "hook_agent": {
+        "m6": "codex",
+        "b56": "codex",
+        "b57": "codex"
+      },
+      "device": "cuda",
+      "repeat": {
+        "m6": 3,
+        "b56": 3,
+        "b57": 3
+      },
+      "attempt": 1,
+      "r_full_vs_b56": {
+        "standard": {
+          "mean": 1.0875756115839623,
+          "lo": 1.0427010923535254,
+          "hi": 1.1438833417139571
+        },
+        "all": {
+          "mean": 1.058925075261573,
+          "lo": 0.9874517189508323,
+          "hi": 1.1411781775972138
+        }
+      },
+      "r_norules_vs_b57": {
+        "standard": {
+          "mean": 0.9736529788749112,
+          "lo": 0.9636517328825023,
+          "hi": 0.9834558823529411
+        }
+      },
+      "d_hint_recall": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "d_hint_recall_strict": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "required_m6": {
+        "by_profile": {
+          "standard": {
+            "found": 87,
+            "total": 87
+          },
+          "heavy": {
+            "found": 162,
+            "total": 165
+          }
+        },
+        "worst_rep_share": 0.9880952380952381
+      },
+      "idea_hint_recall_m6": {
+        "found": 21,
+        "total": 21
+      },
+      "idea_hints_match_b57": {
+        "found": 24,
+        "total": 24
+      },
+      "misses": {
+        "m6": {
+          "reps_with_misses": [],
+          "hook_budget_misses": 0,
+          "bad_outputs": 0
+        },
+        "b56": {
+          "reps_with_misses": [],
+          "hook_budget_misses": 0,
+          "bad_outputs": 0
+        },
+        "b57": {
+          "reps_with_misses": [],
+          "hook_budget_misses": 0,
+          "bad_outputs": 0
+        }
+      },
+      "noise_aa_p95": null,
+      "idea_hint_exceptions": {
+        "count": 0,
+        "events": []
+      },
+      "checks": {
+        "r_full_standard_le_1_15": true,
+        "r_norules_standard_vs_b57_le_1_00": true,
+        "required_1_0": false,
+        "d_hint_recall_lo_ge_-0_02": true,
+        "d_hint_recall_strict_lo_ge_-0_02": true,
+        "idea_hint_recall_1_0": true,
+        "idea_hints_match_b57": true,
+        "no_reps_with_misses": true,
+        "same_utc_day": true
+      }
+    }
+  },
+  "ts1": {
+    "cuda": {
+      "arm": "2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6b-r1-srv0.0.10-m5.7+m6-holdout×3",
+      "base": "2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r1-srv0.0.5-m4-holdout×3",
+      "split": "holdout",
+      "scenarios": 15,
+      "excluded": [
+        "s-19",
+        "s-44",
+        "s-45"
+      ],
+      "base_tokens_mean": 55356.99999999999,
+      "arm_tokens_mean": 49139.666666666664,
+      "r": {
+        "mean": 0.8876865918793769,
+        "lo": 0.8330168223380012,
+        "hi": 0.9194393088647699
+      },
+      "base_micro": 0.8481012658227848,
+      "arm_micro": 0.810126582278481,
+      "d_micro": {
+        "mean": -0.037974683544303806,
+        "lo": -0.08235294117647061,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "net_losses_all_reps": 1,
+      "noninferior": false,
+      "noise_base_p95": 0.0060432196166637,
+      "noise_arm_p95": 0.0542337134992712,
+      "pairs": [
+        {
+          "base": "2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r1-srv0.0.5-m4-holdout",
+          "arm": "2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6b-r1-srv0.0.10-m5.7+m6-holdout",
+          "r": {
+            "mean": 0.8808195685531185,
+            "lo": 0.8234887747009337,
+            "hi": 0.9157142710491498
+          },
+          "d_micro": {
+            "mean": -0.06329113924050633,
+            "lo": -0.12941176470588237,
+            "hi": 0.0
+          },
+          "net_losses": 1,
+          "noninferior": false
+        },
+        {
+          "base": "2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r2-srv0.0.5-m4-holdout",
+          "arm": "2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6b-r2-srv0.0.10-m5.7+m6-holdout",
+          "r": {
+            "mean": 0.8930296506684516,
+            "lo": 0.8379892992935727,
+            "hi": 0.9247309470453455
+          },
+          "d_micro": {
+            "mean": -0.02531645569620253,
+            "lo": -0.07228915662650602,
+            "hi": 0.0
+          },
+          "net_losses": 0,
+          "noninferior": false
+        },
+        {
+          "base": "2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r3-srv0.0.5-m4-holdout",
+          "arm": "2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6b-r3-srv0.0.10-m5.7+m6-holdout",
+          "r": {
+            "mean": 0.8892218271087926,
+            "lo": 0.8358339042688027,
+            "hi": 0.9201306735321201
+          },
+          "d_micro": {
+            "mean": -0.02531645569620253,
+            "lo": -0.07228915662650602,
+            "hi": 0.0
+          },
+          "net_losses": 0,
+          "noninferior": false
+        }
+      ],
+      "l0_excluded": null,
+      "checks": {
+        "d_micro_lo_ge_-0_02": false,
+        "net_losses_le_1": true,
+        "r_hi_lt_1_00": true,
+        "goal_r_le_0_70": false
+      }
+    },
+    "cpu": {
+      "arm": "2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-m6b-srv0.0.10-m5.7+m6-holdout",
+      "base": "2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-b4-srv0.0.5-m4-holdout",
+      "split": "holdout",
+      "scenarios": 15,
+      "base_tokens": 55394,
+      "arm_tokens": 49271,
+      "r": {
+        "mean": 0.8894645629490558,
+        "lo": 0.8337614698989837,
+        "hi": 0.9220884780124095
+      },
+      "base_micro": 0.8481012658227848,
+      "arm_micro": 0.8227848101265823,
+      "d_micro": {
+        "mean": -0.02531645569620253,
+        "lo": -0.07228915662650602,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "noninferior": false,
+      "l0_excluded": null,
+      "checks": {
+        "d_micro_lo_ge_-0_02": false,
+        "net_losses_le_1": true
+      }
+    },
+    "dev_aa": {
+      "arm": "default-aa",
+      "base": "default",
+      "r": {
+        "mean": 1.000107901636868,
+        "lo": 0.9998774965601424,
+        "hi": 1.0003152858463331
+      },
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0
+    },
+    "control_v09_eq_v010": {
+      "verdict": "18 из 18 сценариев побайтово после канонизации id (в том числе a:<32 hex>), .tmp/m6/task13b/tools/control_a32.py",
+      "files": [
+        ".tmp/m6/task13b/ts1/fts/2026-11-14-m6-fts-tokens-t13b-fts-b56-srv0.0.9-m5.6-holdout.json",
+        ".tmp/m6/task13b/ts1/fts/2026-11-14-m6-fts-tokens-t13b-fts-b57-srv0.0.10-m5.7-holdout.json"
+      ]
+    }
+  },
+  "quality": [
+    {
+      "name": "cuda-m6-r1-hybrid+rerank",
+      "mode": "hybrid+rerank",
+      "ndcg10": {
+        "mean": 0.871552494348287,
+        "lo": 0.8395707594002837,
+        "hi": 0.8998921931972262
+      },
+      "recall5": {
+        "mean": 0.9050613496932514,
+        "lo": 0.8736157975460123,
+        "hi": 0.9335391104294479
+      },
+      "reliable_first": {
+        "mean": 0.9285714285714286,
+        "lo": 0.7857142857142857,
+        "hi": 1.0
+      },
+      "compare": {
+        "against": ".tmp/m6/task13b/quality/cuda/b56-r1/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+        "n": 326,
+        "d_ndcg10": {
+          "mean": -0.0029734796928634366,
+          "lo": -0.009202453987730062,
+          "hi": 0.0002820149091397498
+        },
+        "d_recall5": {
+          "mean": 0.0,
+          "lo": -0.009202453987730062,
+          "hi": 0.009202453987730062
+        },
+        "regression": false
+      },
+      "checks": {
+        "d_ndcg10_lo_ge_-0_01": true,
+        "d_recall5_lo_ge_-0_01": true
+      }
+    },
+    {
+      "name": "cuda-m6-r1-hybrid",
+      "mode": "hybrid",
+      "ndcg10": {
+        "mean": 0.8184013678003794,
+        "lo": 0.7818239282227748,
+        "hi": 0.8543007009335039
+      },
+      "recall5": {
+        "mean": 0.8449897750511248,
+        "lo": 0.8060250511247443,
+        "hi": 0.8833333333333335
+      },
+      "reliable_first": {
+        "mean": 1.0,
+        "lo": 1.0,
+        "hi": 1.0
+      },
+      "compare": {
+        "against": ".tmp/m6/task13b/quality/cuda/b56-r1/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+        "n": 326,
+        "d_ndcg10": {
+          "mean": 0.0018063332364356124,
+          "lo": -0.0008992171227806611,
+          "hi": 0.005955488525923522
+        },
+        "d_recall5": {
+          "mean": 0.0,
+          "lo": 0.0,
+          "hi": 0.0
+        },
+        "regression": false
+      },
+      "checks": {
+        "d_ndcg10_lo_ge_-0_01": true,
+        "d_recall5_lo_ge_-0_01": true
+      }
+    },
+    {
+      "name": "cuda-m6-r2-hybrid+rerank",
+      "mode": "hybrid+rerank",
+      "ndcg10": {
+        "mean": 0.871552494348287,
+        "lo": 0.8395707594002837,
+        "hi": 0.8998921931972262
+      },
+      "recall5": {
+        "mean": 0.9050613496932514,
+        "lo": 0.8736157975460123,
+        "hi": 0.9335391104294479
+      },
+      "reliable_first": {
+        "mean": 0.9285714285714286,
+        "lo": 0.7857142857142857,
+        "hi": 1.0
+      },
+      "compare": {
+        "against": ".tmp/m6/task13b/quality/cuda/b56-r2/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+        "n": 326,
+        "d_ndcg10": {
+          "mean": -0.0005775706323680089,
+          "lo": -0.00184282081746685,
+          "hi": 0.00011010892036282237
+        },
+        "d_recall5": {
+          "mean": 0.0,
+          "lo": 0.0,
+          "hi": 0.0
+        },
+        "regression": false
+      },
+      "checks": {
+        "d_ndcg10_lo_ge_-0_01": true,
+        "d_recall5_lo_ge_-0_01": true
+      }
+    },
+    {
+      "name": "cuda-m6-r2-hybrid",
+      "mode": "hybrid",
+      "ndcg10": {
+        "mean": 0.8184013678003794,
+        "lo": 0.7818239282227748,
+        "hi": 0.8543007009335039
+      },
+      "recall5": {
+        "mean": 0.8449897750511248,
+        "lo": 0.8060250511247443,
+        "hi": 0.8833333333333335
+      },
+      "reliable_first": {
+        "mean": 1.0,
+        "lo": 1.0,
+        "hi": 1.0
+      },
+      "compare": {
+        "against": ".tmp/m6/task13b/quality/cuda/b56-r2/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+        "n": 326,
+        "d_ndcg10": {
+          "mean": 0.001307795915116302,
+          "lo": -0.0026999413548051345,
+          "hi": 0.005735028016463244
+        },
+        "d_recall5": {
+          "mean": 0.0,
+          "lo": 0.0,
+          "hi": 0.0
+        },
+        "regression": false
+      },
+      "checks": {
+        "d_ndcg10_lo_ge_-0_01": true,
+        "d_recall5_lo_ge_-0_01": true
+      }
+    },
+    {
+      "name": "cuda-m6-r3-hybrid+rerank",
+      "mode": "hybrid+rerank",
+      "ndcg10": {
+        "mean": 0.871552494348287,
+        "lo": 0.8395707594002837,
+        "hi": 0.8998921931972262
+      },
+      "recall5": {
+        "mean": 0.9050613496932514,
+        "lo": 0.8736157975460123,
+        "hi": 0.9335391104294479
+      },
+      "reliable_first": {
+        "mean": 0.9285714285714286,
+        "lo": 0.7857142857142857,
+        "hi": 1.0
+      },
+      "compare": {
+        "against": ".tmp/m6/task13b/quality/cuda/b56-r3/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+        "n": 326,
+        "d_ndcg10": {
+          "mean": -0.0030674846625766868,
+          "lo": -0.009202453987730062,
+          "hi": 1.7027960500385836e-18
+        },
+        "d_recall5": {
+          "mean": -0.003067484662576687,
+          "lo": -0.009202453987730062,
+          "hi": 0.0
+        },
+        "regression": false
+      },
+      "checks": {
+        "d_ndcg10_lo_ge_-0_01": true,
+        "d_recall5_lo_ge_-0_01": true
+      }
+    },
+    {
+      "name": "cuda-m6-r3-hybrid",
+      "mode": "hybrid",
+      "ndcg10": {
+        "mean": 0.8184013678003794,
+        "lo": 0.7818239282227748,
+        "hi": 0.8543007009335039
+      },
+      "recall5": {
+        "mean": 0.8449897750511248,
+        "lo": 0.8060250511247443,
+        "hi": 0.8833333333333335
+      },
+      "reliable_first": {
+        "mean": 1.0,
+        "lo": 1.0,
+        "hi": 1.0
+      },
+      "compare": {
+        "against": ".tmp/m6/task13b/quality/cuda/b56-r3/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+        "n": 326,
+        "d_ndcg10": {
+          "mean": 9.872734123680199e-05,
+          "lo": -0.0036750625378469967,
+          "hi": 0.004046878931114247
+        },
+        "d_recall5": {
+          "mean": 0.0,
+          "lo": 0.0,
+          "hi": 0.0
+        },
+        "regression": false
+      },
+      "checks": {
+        "d_ndcg10_lo_ge_-0_01": true,
+        "d_recall5_lo_ge_-0_01": true
+      }
+    },
+    {
+      "name": "cpu-m6-r1-hybrid",
+      "mode": "hybrid",
+      "ndcg10": {
+        "mean": 0.8165060111288376,
+        "lo": 0.7798427188616378,
+        "hi": 0.8523825303447841
+      },
+      "recall5": {
+        "mean": 0.8455010224948875,
+        "lo": 0.8071472392638036,
+        "hi": 0.883957055214724
+      },
+      "reliable_first": {
+        "mean": 1.0,
+        "lo": 1.0,
+        "hi": 1.0
+      },
+      "compare": {
+        "against": ".tmp/m6/task13b/quality/cpu/b56-r1/2026-11-14-bge-m3-int8-hybrid-t13b-qcpu.json",
+        "n": 326,
+        "d_ndcg10": {
+          "mean": 0.001283264265862186,
+          "lo": -0.0017293144610687713,
+          "hi": 0.0050794836379096705
+        },
+        "d_recall5": {
+          "mean": 0.0,
+          "lo": 0.0,
+          "hi": 0.0
+        },
+        "regression": false
+      },
+      "checks": {
+        "d_ndcg10_lo_ge_-0_01": true,
+        "d_recall5_lo_ge_-0_01": true
+      }
+    }
+  ],
+  "files": [
+    {
+      "role": "quality.cpu-m6-r1-hybrid",
+      "path": ".tmp/m6/task13b/quality/cpu/m6-r1/2026-11-14-bge-m3-int8-hybrid-t13b-qcpu.json",
+      "bytes": 598350,
+      "sha256": "fcd2d4b262bfe008e7bf8b2a5b08c3da45c761260c1510ba04fcda68317bd768"
+    },
+    {
+      "role": "quality.cuda-m6-r1-hybrid",
+      "path": ".tmp/m6/task13b/quality/cuda/m6-r1/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+      "bytes": 599018,
+      "sha256": "8e1e76c5bcb5b831664bd24e6e8f0b16aedd8dee5544c609025f543f318f21e1"
+    },
+    {
+      "role": "quality.cuda-m6-r1-hybrid+rerank",
+      "path": ".tmp/m6/task13b/quality/cuda/m6-r1/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+      "bytes": 597122,
+      "sha256": "eedadfc63f7ee34ea4f72cd8ec43ed7e2b3eed2872d16180304f4c34b923606b"
+    },
+    {
+      "role": "quality.cuda-m6-r2-hybrid",
+      "path": ".tmp/m6/task13b/quality/cuda/m6-r2/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+      "bytes": 599150,
+      "sha256": "7aa43703e1044da8adfb03e17e3575678b0b220ee6b45b236c86376647f8cb7d"
+    },
+    {
+      "role": "quality.cuda-m6-r2-hybrid+rerank",
+      "path": ".tmp/m6/task13b/quality/cuda/m6-r2/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+      "bytes": 597060,
+      "sha256": "0e1b9046b200e3ff4908bebafc50b67ad3d9e0209a55fac710be4147cd09208b"
+    },
+    {
+      "role": "quality.cuda-m6-r3-hybrid",
+      "path": ".tmp/m6/task13b/quality/cuda/m6-r3/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+      "bytes": 599071,
+      "sha256": "4c6d6cfc7946bdc010fd7a6671842858b0e90f1f1712c1ae286cf72ce3d88b76"
+    },
+    {
+      "role": "quality.cuda-m6-r3-hybrid+rerank",
+      "path": ".tmp/m6/task13b/quality/cuda/m6-r3/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+      "bytes": 597020,
+      "sha256": "f1bfd96aa37019fa10a29c28eede97db2632f654856b067b02f3cc5d847d902c"
+    },
+    {
+      "role": "raw.quality.cpu.b56-r1.hybrid",
+      "path": ".tmp/m6/task13b/quality/cpu/b56-r1/2026-11-14-bge-m3-int8-hybrid-t13b-qcpu.json",
+      "bytes": 597458,
+      "sha256": "b79cf466648973ce3d2b73fb693f44bc5ef86cfcabd4e7329d35659de699546a"
+    },
+    {
+      "role": "raw.quality.cuda.b56-r1.hybrid",
+      "path": ".tmp/m6/task13b/quality/cuda/b56-r1/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+      "bytes": 598254,
+      "sha256": "818315205e5d7d959b7e420dc3b7022912dee81c34d33fa2840b1f697625622b"
+    },
+    {
+      "role": "raw.quality.cuda.b56-r1.hybrid+rerank",
+      "path": ".tmp/m6/task13b/quality/cuda/b56-r1/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+      "bytes": 596378,
+      "sha256": "2502c03cd1d225039ad8edbf902c26471696190a8d4106df8c8baeeb56571d53"
+    },
+    {
+      "role": "raw.quality.cuda.b56-r2.hybrid",
+      "path": ".tmp/m6/task13b/quality/cuda/b56-r2/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+      "bytes": 598455,
+      "sha256": "ff6e1de052099c747256e4b742c5702901ebcd3b524f719afe66ddb3f0709b14"
+    },
+    {
+      "role": "raw.quality.cuda.b56-r2.hybrid+rerank",
+      "path": ".tmp/m6/task13b/quality/cuda/b56-r2/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+      "bytes": 596391,
+      "sha256": "8ecb48c0770ff7c754a01c51bff00ff7be975a2d6e63f724e76292aac4b486a4"
+    },
+    {
+      "role": "raw.quality.cuda.b56-r3.hybrid",
+      "path": ".tmp/m6/task13b/quality/cuda/b56-r3/2026-11-15-bge-m3-fp16-hybrid-t13b-q.json",
+      "bytes": 598492,
+      "sha256": "1501d3ceb03ca55a7d64a98f327fe090c5d7c2fdf90f31d2e4e11dfa4b250a7d"
+    },
+    {
+      "role": "raw.quality.cuda.b56-r3.hybrid+rerank",
+      "path": ".tmp/m6/task13b/quality/cuda/b56-r3/2026-11-15-bge-m3-fp16-hybrid-rerank-t13b-q.json",
+      "bytes": 596264,
+      "sha256": "cad42cac99e1f03da27e8358131ae517c6c7a066294943a8ce4ae0c3c47cb745"
+    },
+    {
+      "role": "raw.ts1.-fts-b56-srv0.0.9-m5.6-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/fts/2026-11-14-m6-fts-tokens-t13b-fts-b56-srv0.0.9-m5.6-holdout.json",
+      "bytes": 1129076,
+      "sha256": "fe3e381b5d40db0beb85725d088431079c2becfd228081da112d0d2dac28addd"
+    },
+    {
+      "role": "raw.ts1.-fts-b57-srv0.0.10-m5.7-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/fts/2026-11-14-m6-fts-tokens-t13b-fts-b57-srv0.0.10-m5.7-holdout.json",
+      "bytes": 1129090,
+      "sha256": "fcae506c31657f45d50ccb0e4cc0b933c79bc414767c9cf865b7d251b3e82259"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-aa-dev-srv0.0.10-m5.7+m6-dev-default-",
+      "path": ".tmp/m6/task13b/ts1/dev-aa/2026-11-15-m6-bge-m3-fp16-tokens-t13b-aa-dev-srv0.0.10-m5.7+m6-dev-default-aa.json",
+      "bytes": 2195914,
+      "sha256": "9af5e5823ce791a3079671ccf28b5f07d6417d9d592dc77542468eeab017575f"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-aa-dev-srv0.0.10-m5.7+m6-dev-default.",
+      "path": ".tmp/m6/task13b/ts1/dev-aa/2026-11-15-m6-bge-m3-fp16-tokens-t13b-aa-dev-srv0.0.10-m5.7+m6-dev-default.json",
+      "bytes": 2195919,
+      "sha256": "c06ff3f31d1173017accd53a48c1822f2f5e76514767ae1041c0cff81cc73054"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-b4-r1-srv0.0.5-m4-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r1-srv0.0.5-m4-holdout.json",
+      "bytes": 1154219,
+      "sha256": "28187e7a0ea812ebfacb738bb44af9a9161942aa581db4ebdba9da046d77d64b"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-b4-r2-srv0.0.5-m4-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r2-srv0.0.5-m4-holdout.json",
+      "bytes": 1152015,
+      "sha256": "b1d29d7ac5191773e7b7ba99ba9ce3bc30ad79af1264039ce1fa3b3fe564728b"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-b4-r3-srv0.0.5-m4-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r3-srv0.0.5-m4-holdout.json",
+      "bytes": 1152221,
+      "sha256": "f57ee85162f26c25b14027a81e8a42cecec035e2567fd9a7136759a73c4c9885"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-cpu-b4-srv0.0.5-m4-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cpu/2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-b4-srv0.0.5-m4-holdout.json",
+      "bytes": 1149771,
+      "sha256": "61ac09ceed5efec1a4113a9134b2b661f35d346dadddc4557fee12c5e3539f45"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-cpu-m6-srv0.0.10-m5.7+m6-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cpu/2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-m6-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 1353422,
+      "sha256": "70217e45cc93cf74c4d2b2e9988d8191e985d1411b9a22e5b9deb283354aa55e"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-cpu-m6b-srv0.0.10-m5.7+m6-holdout.jso",
+      "path": ".tmp/m6/task13b/ts1/cpu/2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-m6b-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 1315495,
+      "sha256": "84434615511e5ec0560ed6b3f0d33a69d665d8238bf087e60fcb7de540762ca2"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-m6-r1-srv0.0.10-m5.7+m6-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6-r1-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 1350217,
+      "sha256": "8689f6f2c401708b411639c9d2cc03ff47894053eb512d66343af186a01e84b7"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-m6-r2-srv0.0.10-m5.7+m6-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6-r2-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 1335607,
+      "sha256": "524ac9be5513a6dd219fe4dc1dde5685efc25d80151dd7ee7c3333cb6baa79ed"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-m6-r3-srv0.0.10-m5.7+m6-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6-r3-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 1349132,
+      "sha256": "467f0070707663901edef4433674f742fa17cf50021334787953d02632fea36b"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-m6b-r1-srv0.0.10-m5.7+m6-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6b-r1-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 1312347,
+      "sha256": "6193ee745ca56a5d93583d6a483e9cb93ffb4650a3d954f3c4b7d705462b6393"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-m6b-r2-srv0.0.10-m5.7+m6-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6b-r2-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 1324052,
+      "sha256": "96be3181ded681a9b154a427a0de7e654b0312adf00dedae54aee17aab6c75f5"
+    },
+    {
+      "role": "raw.ts1.ens-t13b-m6b-r3-srv0.0.10-m5.7+m6-holdout.json",
+      "path": ".tmp/m6/task13b/ts1/cuda/2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6b-r3-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 1318482,
+      "sha256": "268b84f3eb6810d4fe25b2ebe123c1143182efa8fb4527fa3ddf2d1783c28157"
+    },
+    {
+      "role": "raw.ts2.claude.a1.b56-claude-a1-srv0.0.9-m5.6-ho",
+      "path": ".tmp/m6/task13b/ts2/claude-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-claude-a1-srv0.0.9-m5.6-holdout.json",
+      "bytes": 365028,
+      "sha256": "4cd7fb28bc90536c5009465b980d8450d83c044600497eff3060a50b92f9d17a"
+    },
+    {
+      "role": "raw.ts2.claude.a1.b57-claude-a1-srv0.0.10-m5.7-h",
+      "path": ".tmp/m6/task13b/ts2/claude-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-claude-a1-srv0.0.10-m5.7-holdout.json",
+      "bytes": 380581,
+      "sha256": "73198d8befb2627171ff563fab26d9ca9a97044694367eda4c2e1e392763b9d7"
+    },
+    {
+      "role": "raw.ts2.claude.a1.m6-claude-a1-srv0.0.10-m5.7+m6",
+      "path": ".tmp/m6/task13b/ts2/claude-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a1-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 427021,
+      "sha256": "2adb3ed000d8b61ee900ceb9e707fe8de1a3ca39c8cf8fcde60f0d22729bd24e"
+    },
+    {
+      "role": "raw.ts2.claude.a1.m6aa-claude-a1-srv0.0.10-m5.7+",
+      "path": ".tmp/m6/task13b/ts2/claude-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6aa-claude-a1-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 428955,
+      "sha256": "a75ce4a8746a974055188585376f6c4d61470762bf0f4cca821dcafaa2163609"
+    },
+    {
+      "role": "raw.ts2.claude.a2.b56-claude-a2-srv0.0.9-m5.6-ho",
+      "path": ".tmp/m6/task13b/ts2/claude-a2/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-claude-a2-srv0.0.9-m5.6-holdout.json",
+      "bytes": 365556,
+      "sha256": "a82318afe865a3ad6e1298fa359592f4e27a65dd934d3506b19af67b7263fdbe"
+    },
+    {
+      "role": "raw.ts2.claude.a2.b57-claude-a2-srv0.0.10-m5.7-h",
+      "path": ".tmp/m6/task13b/ts2/claude-a2/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-claude-a2-srv0.0.10-m5.7-holdout.json",
+      "bytes": 380455,
+      "sha256": "97000cc9b7d6b6eb58bad963343b4fe87000326c6d77871d571d34e8159b146b"
+    },
+    {
+      "role": "raw.ts2.claude.a2.m6-claude-a2-srv0.0.10-m5.7+m6",
+      "path": ".tmp/m6/task13b/ts2/claude-a2/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a2-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 428066,
+      "sha256": "f58cea165c7501b3c6354f8fdb1299edddccab1d8f334b635450fd680330ffe7"
+    },
+    {
+      "role": "raw.ts2.claude.a2.m6aa-claude-a2-srv0.0.10-m5.7+",
+      "path": ".tmp/m6/task13b/ts2/claude-a2/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6aa-claude-a2-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 428602,
+      "sha256": "35b2812f33a04756e407d0b463f2b3bd9dae278d8c9fb8a47ccd1b095e7e3f23"
+    },
+    {
+      "role": "raw.ts2.codex.a1.b56-codex-a1-srv0.0.9-m5.6-hol",
+      "path": ".tmp/m6/task13b/ts2/codex-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-codex-a1-srv0.0.9-m5.6-holdout.json",
+      "bytes": 365425,
+      "sha256": "8ad69f88c3d26291ab391e7a5155ffea13a60284bab3669ba224e54f74d178d6"
+    },
+    {
+      "role": "raw.ts2.codex.a1.b57-codex-a1-srv0.0.10-m5.7-ho",
+      "path": ".tmp/m6/task13b/ts2/codex-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-codex-a1-srv0.0.10-m5.7-holdout.json",
+      "bytes": 380385,
+      "sha256": "22655779c4f959d16f5c59a0f6d5700c07b4e2c4f0e7bc5997461ecfeac98ad5"
+    },
+    {
+      "role": "raw.ts2.codex.a1.m6-codex-a1-srv0.0.10-m5.7+m6-",
+      "path": ".tmp/m6/task13b/ts2/codex-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-codex-a1-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 404730,
+      "sha256": "de1fd31ba0f0a47a5c0938deeb7bc366c325a9f1aa70e9f09b648a79e8c14710"
+    },
+    {
+      "role": "ts1.control.0",
+      "path": ".tmp/m6/task13b/ts1/fts/2026-11-14-m6-fts-tokens-t13b-fts-b56-srv0.0.9-m5.6-holdout.json",
+      "bytes": 1129076,
+      "sha256": "fe3e381b5d40db0beb85725d088431079c2becfd228081da112d0d2dac28addd"
+    },
+    {
+      "role": "ts1.control.1",
+      "path": ".tmp/m6/task13b/ts1/fts/2026-11-14-m6-fts-tokens-t13b-fts-b57-srv0.0.10-m5.7-holdout.json",
+      "bytes": 1129090,
+      "sha256": "fcae506c31657f45d50ccb0e4cc0b933c79bc414767c9cf865b7d251b3e82259"
+    },
+    {
+      "role": "ts1.cpu",
+      "path": "eval/results/2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-m6b-srv0.0.10-m5.7+m6-holdout-vs-2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-b4-srv0.0.5-m4-holdout.json",
+      "bytes": 947,
+      "sha256": "e0d21a5393d4f0a264ded7e5e18fd2088015e248fe67b593cad4d81f819b3138"
+    },
+    {
+      "role": "ts1.cpu.variant_a",
+      "path": "eval/results/2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-m6-srv0.0.10-m5.7+m6-holdout-vs-2026-11-14-m6-bge-m3-int8-tokens-t13b-cpu-b4-srv0.0.5-m4-holdout.json",
+      "bytes": 945,
+      "sha256": "22c68190a532fd63afbd201d17c8ba5561ee958cbd31432ed088eb1910cfa5aa"
+    },
+    {
+      "role": "ts1.cuda",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6b-r1-srv0.0.10-m5.7+m6-holdout-mean3-vs-2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r1-srv0.0.5-m4-holdout-mean3.json",
+      "bytes": 3130,
+      "sha256": "8a2ae0792870e917f4957c1002867e57df54eef422edf90da8a5d1a32bada9c7"
+    },
+    {
+      "role": "ts1.cuda.variant_a",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-tokens-t13b-m6-r1-srv0.0.10-m5.7+m6-holdout-mean3-vs-2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4-r1-srv0.0.5-m4-holdout-mean3.json",
+      "bytes": 3121,
+      "sha256": "e4984940c9cc62b3035dad7ceedb3b82940bfc26a1fee7ea5d75dd215b3a3450"
+    },
+    {
+      "role": "ts1.dev_aa",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-tokens-t13b-aa-dev-srv0.0.10-m5.7+m6-dev-default-aa-vs-default.json",
+      "bytes": 789,
+      "sha256": "498d1e53ba81979054ac1bc21cfe093d357dc03fb5952440203b133460d8c633"
+    },
+    {
+      "role": "ts2.claude.a1.vs_b56",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a1-srv0.0.10-m5.7+m6-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-claude-a1-srv0.0.9-m5.6-holdout.json",
+      "bytes": 52574,
+      "sha256": "64902c308cfc1cd25a5fc2db0a5f33bd88d540c033822ac1d0eca20bc8acacb0"
+    },
+    {
+      "role": "ts2.claude.a1.vs_b57",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a1-srv0.0.10-m5.7+m6-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-claude-a1-srv0.0.10-m5.7-holdout.json",
+      "bytes": 56633,
+      "sha256": "e20d0ad80b6942ab28883c23294763967e4bbe563d0c4ca3ed466abe0e6aa62c"
+    },
+    {
+      "role": "ts2.claude.aa",
+      "path": ".tmp/m6/task13b/ts2/claude-a2/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6aa-claude-a2-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 428602,
+      "sha256": "35b2812f33a04756e407d0b463f2b3bd9dae278d8c9fb8a47ccd1b095e7e3f23"
+    },
+    {
+      "role": "ts2.claude.aa_vs_m6",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6aa-claude-a2-srv0.0.10-m5.7+m6-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a2-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 50224,
+      "sha256": "73794e4eebac842f4abeec7b8e408e2c07c3f5e8b6fbad644f3328d77764d1a4"
+    },
+    {
+      "role": "ts2.claude.b56",
+      "path": ".tmp/m6/task13b/ts2/claude-a2/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-claude-a2-srv0.0.9-m5.6-holdout.json",
+      "bytes": 365556,
+      "sha256": "a82318afe865a3ad6e1298fa359592f4e27a65dd934d3506b19af67b7263fdbe"
+    },
+    {
+      "role": "ts2.claude.b57",
+      "path": ".tmp/m6/task13b/ts2/claude-a2/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-claude-a2-srv0.0.10-m5.7-holdout.json",
+      "bytes": 380455,
+      "sha256": "97000cc9b7d6b6eb58bad963343b4fe87000326c6d77871d571d34e8159b146b"
+    },
+    {
+      "role": "ts2.claude.b57_vs_b56",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-claude-a2-srv0.0.10-m5.7-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-claude-a2-srv0.0.9-m5.6-holdout.json",
+      "bytes": 58189,
+      "sha256": "505ddf81af03bcc1207b0196ca97343d178f4baa2c0a5ec7bb3b658c5f82ab16"
+    },
+    {
+      "role": "ts2.claude.m6",
+      "path": ".tmp/m6/task13b/ts2/claude-a2/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a2-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 428066,
+      "sha256": "f58cea165c7501b3c6354f8fdb1299edddccab1d8f334b635450fd680330ffe7"
+    },
+    {
+      "role": "ts2.claude.vs_b56",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a2-srv0.0.10-m5.7+m6-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-claude-a2-srv0.0.9-m5.6-holdout.json",
+      "bytes": 51692,
+      "sha256": "0d1b0b4785e82d2e69d1ce68613a18b87dbf94fa3f4706f8d8eadb785e065835"
+    },
+    {
+      "role": "ts2.claude.vs_b57",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-claude-a2-srv0.0.10-m5.7+m6-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-claude-a2-srv0.0.10-m5.7-holdout.json",
+      "bytes": 56259,
+      "sha256": "8ad8a773b1fa65138d5c7e181382289f7579c4252873bb4362eb8bcf60e909b6"
+    },
+    {
+      "role": "ts2.codex.b56",
+      "path": ".tmp/m6/task13b/ts2/codex-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-codex-a1-srv0.0.9-m5.6-holdout.json",
+      "bytes": 365425,
+      "sha256": "8ad69f88c3d26291ab391e7a5155ffea13a60284bab3669ba224e54f74d178d6"
+    },
+    {
+      "role": "ts2.codex.b57",
+      "path": ".tmp/m6/task13b/ts2/codex-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-codex-a1-srv0.0.10-m5.7-holdout.json",
+      "bytes": 380385,
+      "sha256": "22655779c4f959d16f5c59a0f6d5700c07b4e2c4f0e7bc5997461ecfeac98ad5"
+    },
+    {
+      "role": "ts2.codex.b57_vs_b56",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-codex-a1-srv0.0.10-m5.7-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-codex-a1-srv0.0.9-m5.6-holdout.json",
+      "bytes": 58397,
+      "sha256": "8ea66caa5b6b1ffda6b868f81768dc662cd5123752c8e72468c141f6315d45c1"
+    },
+    {
+      "role": "ts2.codex.m6",
+      "path": ".tmp/m6/task13b/ts2/codex-a1/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-codex-a1-srv0.0.10-m5.7+m6-holdout.json",
+      "bytes": 404730,
+      "sha256": "de1fd31ba0f0a47a5c0938deeb7bc366c325a9f1aa70e9f09b648a79e8c14710"
+    },
+    {
+      "role": "ts2.codex.vs_b56",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-codex-a1-srv0.0.10-m5.7+m6-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-b56-codex-a1-srv0.0.9-m5.6-holdout.json",
+      "bytes": 51907,
+      "sha256": "ed637c54371da206de5b3db78606976b8a06f278481a19b6d4045717b16e0f25"
+    },
+    {
+      "role": "ts2.codex.vs_b57",
+      "path": "eval/results/2026-11-15-m6-bge-m3-fp16-sessions-t13b-m6-codex-a1-srv0.0.10-m5.7+m6-holdout-vs-2026-11-15-m6-bge-m3-fp16-sessions-t13b-b57-codex-a1-srv0.0.10-m5.7-holdout.json",
+      "bytes": 56269,
+      "sha256": "935ba3d6a626e0199d0e26a553914735b03c6c6d22a2cd90c70876faac0883c1"
+    }
+  ]
+}
