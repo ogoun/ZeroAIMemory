@@ -1,0 +1,307 @@
+{
+  "date": "2026-11-15",
+  "split": "dev",
+  "device": "cuda",
+  "model": "bge-m3-fp16",
+  "targets_of": "0.0.5-m4",
+  "rule": "наименьшее значение: нижняя Δ микро-полноты ≥ −0,02, L ≤ 1, верхняя 95 % R < 1,00 (compare_reps, K = 3)",
+  "points": [
+    {
+      "budget_tokens": 800,
+      "scenarios": 26,
+      "excluded": [
+        "s-20",
+        "s-46",
+        "s-47",
+        "s-48"
+      ],
+      "r": {
+        "mean": 0.9060528512583309,
+        "lo": 0.8783190753105866,
+        "hi": 0.9257480870927397
+      },
+      "arm_tokens_mean": 88277.33333333334,
+      "base_tokens_mean": 97430.66666666666,
+      "base_micro": 0.9166666666666666,
+      "arm_micro": 0.9166666666666666,
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "net_losses_all_reps": 0,
+      "noise_base_p95": 0.005411365626448632,
+      "noise_arm_p95": 0.007026729303289531,
+      "criterion_met": true,
+      "brief": {
+        "tokens_median": 746.5,
+        "tokens_p95": 779,
+        "tokens_max": 787,
+        "cards_median": 6.5,
+        "cards_min": 6,
+        "cards_max": 8,
+        "n": 78
+      },
+      "cmp": "eval/results/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b800-mean3-vs-2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4dev-r1-srv0.0.5-m4-dev-mean3.json"
+    },
+    {
+      "budget_tokens": 900,
+      "scenarios": 26,
+      "excluded": [
+        "s-20",
+        "s-46",
+        "s-47",
+        "s-48"
+      ],
+      "r": {
+        "mean": 0.9313221025549796,
+        "lo": 0.9105338719510973,
+        "hi": 0.9464545014877669
+      },
+      "arm_tokens_mean": 90739.33333333336,
+      "base_tokens_mean": 97430.66666666666,
+      "base_micro": 0.9166666666666666,
+      "arm_micro": 0.9166666666666666,
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "net_losses_all_reps": 0,
+      "noise_base_p95": 0.005411365626448632,
+      "noise_arm_p95": 0.010332753943759806,
+      "criterion_met": true,
+      "brief": {
+        "tokens_median": 840.0,
+        "tokens_p95": 888,
+        "tokens_max": 892,
+        "cards_median": 7.0,
+        "cards_min": 6,
+        "cards_max": 9,
+        "n": 78
+      },
+      "cmp": "eval/results/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b900-mean3-vs-2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4dev-r1-srv0.0.5-m4-dev-mean3.json"
+    },
+    {
+      "budget_tokens": 1000,
+      "scenarios": 26,
+      "excluded": [
+        "s-20",
+        "s-46",
+        "s-47",
+        "s-48"
+      ],
+      "r": {
+        "mean": 0.957053220751851,
+        "lo": 0.943273600953945,
+        "hi": 0.9674753383530573
+      },
+      "arm_tokens_mean": 93246.33333333333,
+      "base_tokens_mean": 97430.66666666666,
+      "base_micro": 0.9166666666666666,
+      "arm_micro": 0.9166666666666666,
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "net_losses_all_reps": 0,
+      "noise_base_p95": 0.005411365626448632,
+      "noise_arm_p95": 0.013406572701999867,
+      "criterion_met": true,
+      "brief": {
+        "tokens_median": 927.5,
+        "tokens_p95": 988,
+        "tokens_max": 989,
+        "cards_median": 8.0,
+        "cards_min": 7,
+        "cards_max": 10,
+        "n": 78
+      },
+      "cmp": "eval/results/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b1000-mean3-vs-2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4dev-r1-srv0.0.5-m4-dev-mean3.json"
+    },
+    {
+      "budget_tokens": 1100,
+      "scenarios": 26,
+      "excluded": [
+        "s-20",
+        "s-46",
+        "s-47",
+        "s-48"
+      ],
+      "r": {
+        "mean": 0.9840844087419433,
+        "lo": 0.9764942913913657,
+        "hi": 0.9904405317080398
+      },
+      "arm_tokens_mean": 95880.00000000001,
+      "base_tokens_mean": 97430.66666666666,
+      "base_micro": 0.9166666666666666,
+      "arm_micro": 0.9166666666666666,
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "net_losses_all_reps": 0,
+      "noise_base_p95": 0.005411365626448632,
+      "noise_arm_p95": 0.015562845395171715,
+      "criterion_met": true,
+      "brief": {
+        "tokens_median": 1029.5,
+        "tokens_p95": 1079,
+        "tokens_max": 1081,
+        "cards_median": 9.0,
+        "cards_min": 8,
+        "cards_max": 10,
+        "n": 78
+      },
+      "cmp": "eval/results/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b1100-mean3-vs-2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4dev-r1-srv0.0.5-m4-dev-mean3.json"
+    },
+    {
+      "budget_tokens": 1200,
+      "scenarios": 26,
+      "excluded": [
+        "s-20",
+        "s-46",
+        "s-47",
+        "s-48"
+      ],
+      "r": {
+        "mean": 1.0053781834603752,
+        "lo": 1.002056393536231,
+        "hi": 1.009648376512923
+      },
+      "arm_tokens_mean": 97954.66666666666,
+      "base_tokens_mean": 97430.66666666666,
+      "base_micro": 0.9166666666666666,
+      "arm_micro": 0.9166666666666666,
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "net_losses_all_reps": 0,
+      "noise_base_p95": 0.005411365626448632,
+      "noise_arm_p95": 0.007288809651330639,
+      "criterion_met": false,
+      "brief": {
+        "tokens_median": 1120.5,
+        "tokens_p95": 1184,
+        "tokens_max": 1188,
+        "cards_median": 10.0,
+        "cards_min": 9,
+        "cards_max": 10,
+        "n": 78
+      },
+      "cmp": "eval/results/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b1200-mean3-vs-2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4dev-r1-srv0.0.5-m4-dev-mean3.json"
+    }
+  ],
+  "files": [
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4dev-r1-srv0.0.5-m4-dev.json",
+      "bytes": 1846212,
+      "sha256": "2cfda5e19bd825488375f8ad4a8b367024b72ecbaf839ad10447d4874ba61105"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4dev-r2-srv0.0.5-m4-dev.json",
+      "bytes": 1846241,
+      "sha256": "2e986b296880a9dccd06ba37d2d09a69a6150b70c342fdea29379d8985689858"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-b4dev-r3-srv0.0.5-m4-dev.json",
+      "bytes": 1836296,
+      "sha256": "7b85ab2b9b2bea7c2dbde8fdb12f409b459155319ea3221403a19e168a36517e"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b1000.json",
+      "bytes": 2270028,
+      "sha256": "68b672fb633f675c763c717b7233b6ab4abc5850e07f6c758c3437c969f16f25"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b1100.json",
+      "bytes": 2312795,
+      "sha256": "e6ab96e694eb631d26779f0c1068ac0e154020d383691448f3204072dfcaab45"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b1200.json",
+      "bytes": 2349877,
+      "sha256": "b9a12720ce306c8d0188dde023f924801ea64463cde9f7293f1deab0775aba60"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b800.json",
+      "bytes": 2189176,
+      "sha256": "9d9fcca1caf8be58c872bbdd27d637d6affbb4e7f4d18081f63a7a285e36d2a0"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r1-srv0.0.10-m5.7+m6-dev-b900.json",
+      "bytes": 2230968,
+      "sha256": "f6ab7b573997849009c46d38a645e85ef3592cb8d0f2b0ec840bb1cb1c0d3698"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r2-srv0.0.10-m5.7+m6-dev-b1000.json",
+      "bytes": 2264434,
+      "sha256": "96b4c52e00794a243516d643c88ed42e24d5dfbb670ab22d8cdcd521da9a23bd"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r2-srv0.0.10-m5.7+m6-dev-b1100.json",
+      "bytes": 2311107,
+      "sha256": "d65d778fbc7ab086ea5e6aeb0d81ef30d7e55eac4beb1e63f329577b694a90ae"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r2-srv0.0.10-m5.7+m6-dev-b1200.json",
+      "bytes": 2347074,
+      "sha256": "f4a7e9f2ebef50bedd4b31dd5ea1580fad838a97be11f603e905b97cfa987b7b"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r2-srv0.0.10-m5.7+m6-dev-b800.json",
+      "bytes": 2186182,
+      "sha256": "dd0cddf5872d152953f1a910f163101913a20db81af4d319f051e4c8498fe2dd"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r2-srv0.0.10-m5.7+m6-dev-b900.json",
+      "bytes": 2228812,
+      "sha256": "0fbc8d2a59dc39a47fd4b963f21d7f0fd13be76c45244497c242ef21cf814bcf"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r3-srv0.0.10-m5.7+m6-dev-b1000.json",
+      "bytes": 2255601,
+      "sha256": "564c557bde545d414590cb83b58a6f7d29a3a8e22c97856fe7987e2c1ab74974"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r3-srv0.0.10-m5.7+m6-dev-b1100.json",
+      "bytes": 2298509,
+      "sha256": "35f06b6a09baa802c21bd180fa4050ab33913cb5604bcfe68b08a2d40db3e1f2"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r3-srv0.0.10-m5.7+m6-dev-b1200.json",
+      "bytes": 2338796,
+      "sha256": "18b65f48d676a83199c363d454bfe7817fa9d1f3a3fa15c765000f0825268e8f"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r3-srv0.0.10-m5.7+m6-dev-b800.json",
+      "bytes": 2177331,
+      "sha256": "49d9854782c3920cd3fad1f6d75bffbdacccc3e5b8fb4b8d09dfcfb1aaab72e1"
+    },
+    {
+      "path": ".tmp/m6/task13b/ts1/budget-dev/2026-11-15-m6-bge-m3-fp16-tokens-t13b-bud-r3-srv0.0.10-m5.7+m6-dev-b900.json",
+      "bytes": 2215487,
+      "sha256": "0c956a17a6b11c8c56ac3bd4e837337d5c0cc415160f222f791c2adb97c94ba3"
+    }
+  ],
+  "b4_brief": {
+    "tokens_median": 1075.5,
+    "tokens_p95": 1122,
+    "tokens_max": 1132,
+    "cards_median": 10.0,
+    "cards_min": 8,
+    "cards_max": 10,
+    "n": 78
+  },
+  "chosen": 800
+}
