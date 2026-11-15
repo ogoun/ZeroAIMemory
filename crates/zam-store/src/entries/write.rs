@@ -658,6 +658,9 @@ pub async fn create_entry(
 /// `triggers` заменяет набор триггеров insight в той же транзакции (неверный → `BadInput`);
 /// триггеры в ревизию не входят. Правка содержимого (заголовок, тело, `data`, теги, область,
 /// триггеры) insight `superseded`/`retracted` → `Conflict`. Отчёт → `ReportImmutable`.
+/// Содержимое идеи меняется только в `new`, `deferred` и `returned` (иначе `Conflict`); правка
+/// человеком (`p.human_edit`) заголовка или тела идеи `returned` возвращает её на разбор: статус
+/// `new` и без `data.returned_at` в той же ревизии (M6.5 §6).
 pub async fn update_entry(
     db: &Db,
     id: Id,
@@ -682,6 +685,7 @@ pub async fn update_entry(
             || p.area.is_some()
             || p.triggers.is_some();
         let term_edit = cur.kind == EntryKind::Term && (p.title.is_some() || p.data.is_some());
+        let (title_given, body_given) = (p.title.is_some(), p.body.is_some());
         if content {
             ensure_editable(&cur)?;
         }
@@ -702,10 +706,13 @@ pub async fn update_entry(
         }
         if content
             && cur.kind == EntryKind::Idea
-            && !matches!(cur.status, Some(EntryStatus::New | EntryStatus::Deferred))
+            && !matches!(
+                cur.status,
+                Some(EntryStatus::New | EntryStatus::Deferred | EntryStatus::Returned)
+            )
         {
             return Err(StoreError::Conflict(format!(
-                "идея {}: содержимое меняется только в new и deferred",
+                "идея {}: содержимое меняется только в new, deferred и returned",
                 cur.status.map_or("?", EntryStatus::as_str)
             )));
         }
@@ -824,6 +831,19 @@ pub async fn update_entry(
         if let (Some(mut idd), Some(d)) = (idea, &idea_patch) {
             idd.apply_patch(d).map_err(bad)?;
             f.data = idd.to_value();
+        }
+        // возвращённую идею человек дописал (заголовок или тело, не `append_body`) — снова на
+        // разбор: `returned → new` без `returned_at` в той же ревизии, история разборов
+        // остаётся (M6.5 §6); правка агента и правка без изменений статус не меняют
+        if p.human_edit
+            && cur.kind == EntryKind::Idea
+            && cur.status == Some(EntryStatus::Returned)
+            && ((title_given && f.title != cur.title) || (body_given && f.body != cur.body))
+        {
+            let mut idd = IdeaData::from_stored(&f.data);
+            idd.returned_at = None;
+            f.data = idd.to_value();
+            f.status = Some(EntryStatus::New);
         }
         if let Some(c) = p.certainty {
             if !has_certainty(cur.kind) {

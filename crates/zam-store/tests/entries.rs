@@ -1389,7 +1389,7 @@ fn allowed_statuses_per_kind() {
         (EntryKind::Report, &[], None),
         (
             EntryKind::Idea,
-            &[New, Proposed, Accepted, Deferred, Declined, Done],
+            &[New, Proposed, Accepted, Deferred, Declined, Done, Returned],
             Some(New),
         ),
     ];

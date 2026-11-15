@@ -956,6 +956,8 @@ pub async fn patch(
         reason: req.reason,
         triggers,
         refs,
+        // правка человеком (сессия WebUI, токен с `by: human`) — с маршрутом разбора идей M6.5
+        human_edit: false,
     };
     let before = sc.entry.rev;
     let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;

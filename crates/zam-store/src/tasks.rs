@@ -1,9 +1,9 @@
 //! Журнал задач (спецификация M4.5 §3): записи `task` — план в `body`, ход работы в `data`.
 //!
-//! - [`TaskData`] — `data` задачи: `next_step`, `blocked_by`, `owner`, `links`, `estimate_min`
-//!   ведёт клиент; `claimed_by`, `started_at`, `done_at` — только сервер (клиентская `data` с
-//!   этими полями отклоняется). Правка `data` задачи — слияние на верхнем уровне (`null`
-//!   снимает поле);
+//! - [`TaskData`] — `data` задачи: `next_step`, `blocked_by`, `owner`, `links`, `estimate_min`,
+//!   `priority` (M6.5 §5: по нему агент выбирает следующий пункт плана) ведёт клиент;
+//!   `claimed_by`, `started_at`, `done_at` — только сервер (клиентская `data` с этими полями
+//!   отклоняется). Правка `data` задачи — слияние на верхнем уровне (`null` снимает поле);
 //! - [`check_task_transition`] — переходы статусов: между `open`, `in_progress`, `blocked` —
 //!   любые; в `done`/`dropped` — из любого; из `done`/`dropped` — только в `open` и с причиной.
 //!   `started_at` ставится при первом переходе в `in_progress`, `done_at` — при `done` (снимается
@@ -21,6 +21,7 @@ use serde_json::{Map, Value, json};
 use zam_core::Id;
 
 use crate::entries::{EntryKind, EntryStatus, load_entry};
+use crate::ideas::IdeaPriority;
 use crate::time::{fmt_ts, ser_ts};
 use crate::{Db, StoreError};
 
@@ -71,10 +72,19 @@ pub struct TaskData {
     pub started_at: Option<Timestamp>,
     pub done_at: Option<Timestamp>,
     pub estimate_min: Option<u32>,
+    /// Приоритет пункта плана (те же значения, что у идеи); нет — без приоритета.
+    pub priority: Option<IdeaPriority>,
 }
 
 /// Поля, которые ведёт клиент.
-const CLIENT_KEYS: [&str; 5] = ["next_step", "blocked_by", "owner", "links", "estimate_min"];
+const CLIENT_KEYS: [&str; 6] = [
+    "next_step",
+    "blocked_by",
+    "owner",
+    "links",
+    "estimate_min",
+    "priority",
+];
 /// Поля, которые ведёт сервер.
 const SERVER_KEYS: [&str; 3] = ["claimed_by", "started_at", "done_at"];
 
@@ -92,6 +102,18 @@ fn text_field(v: &Value, field: &str) -> Result<Option<String>, String> {
             Ok((!s.is_empty()).then(|| s.to_string()))
         }
         _ => Err(format!("data.{field}: ожидается строка")),
+    }
+}
+
+/// `priority`: `null` — снять, иначе `low | normal | high`.
+fn priority_field(v: &Value) -> Result<Option<IdeaPriority>, String> {
+    const ERR: &str = "data.priority: low, normal или high";
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) => IdeaPriority::parse(s.trim())
+            .map(Some)
+            .ok_or_else(|| ERR.into()),
+        _ => Err(ERR.into()),
     }
 }
 
@@ -138,6 +160,7 @@ impl TaskData {
             started_at: get("started_at").and_then(|v| v.as_str()?.parse().ok()),
             done_at: get("done_at").and_then(|v| v.as_str()?.parse().ok()),
             estimate_min: get("estimate_min").and_then(|v| u32::try_from(v.as_u64()?).ok()),
+            priority: get("priority").and_then(|v| priority_field(v).ok().flatten()),
         }
     }
 
@@ -184,6 +207,7 @@ impl TaskData {
                         ),
                     }
                 }
+                "priority" => next.priority = priority_field(v)?,
                 _ => unreachable!("ключи проверены выше"),
             }
         }
@@ -217,6 +241,9 @@ impl TaskData {
         }
         if let Some(n) = self.estimate_min {
             o.insert("estimate_min".into(), json!(n));
+        }
+        if let Some(p) = self.priority {
+            o.insert("priority".into(), json!(p.as_str()));
         }
         Value::Object(o)
     }
@@ -591,6 +618,7 @@ mod tests {
             }),
             started_at: Some(now),
             estimate_min: Some(5),
+            priority: Some(IdeaPriority::High),
             ..TaskData::default()
         };
         assert_eq!(TaskData::from_stored(&t.to_value()), t);

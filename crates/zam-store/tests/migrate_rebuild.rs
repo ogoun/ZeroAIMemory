@@ -1097,14 +1097,22 @@ fn probe(c: &Connection, epoch: bool) -> Probe {
     )
 }
 
-/// SQL `CREATE TABLE <name>` из 0025 как его хранит `sqlite_master` (без лишних пробелов).
-fn migration_create(name: &str) -> String {
-    const SQL: &str = include_str!("../migrations/user/0025_session_epochs.sql");
+/// SQL `CREATE TABLE <name>` из текста миграции `sql` как его хранит `sqlite_master` (без лишних
+/// пробелов).
+fn create_in(sql: &str, name: &str) -> String {
     let head = format!("CREATE TABLE {name} (");
-    let start = SQL.find(&head).unwrap();
-    let rest = &SQL[start..];
+    let start = sql.find(&head).unwrap();
+    let rest = &sql[start..];
     let end = rest.find(';').unwrap();
     rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// SQL `CREATE TABLE <name>` из 0025 ([`create_in`]).
+fn migration_create(name: &str) -> String {
+    create_in(
+        include_str!("../migrations/user/0025_session_epochs.sql"),
+        name,
+    )
 }
 
 /// SQL таблицы после `ALTER TABLE ADD COLUMN`: SQLite вписывает `, <столбец>` сразу после
@@ -1127,8 +1135,9 @@ fn add_columns(sql: &str, cols: &[&str]) -> String {
 /// идеями, вопросом-предложением, задачей «начать», отметками `session_seen`, учётом и картой
 /// кода) открывается последней схемой: копия `bak-v24`; строки на месте (`session_seen` — в
 /// эпохе 0, `recv_count = 0`, новые столбцы — по умолчанию, новые таблицы пусты); объекты
-/// `sqlite_master` совпадают, кроме таблиц 0025; пять триггеров отчёта срабатывают;
-/// `foreign_key_check` пуст, `integrity_check` ok; идея «показана» в своей сессии.
+/// `sqlite_master` совпадают, кроме таблиц 0025 и `entries` (её следом пересобирает 0026, M6.5);
+/// пять триггеров отчёта срабатывают; `foreign_key_check` пуст, `integrity_check` ok; идея
+/// «показана» в своей сессии.
 #[tokio::test]
 async fn migrate_0025_from_m57_db() {
     let dir = tmp_dir("m57-db");
@@ -1179,7 +1188,8 @@ async fn migrate_0025_from_m57_db() {
         .await
         .unwrap();
     let (version, violations, fk, integrity) = checks;
-    assert_eq!(version, 25);
+    // 0025 и следом 0026 (M6.5) — последняя схема
+    assert_eq!(version, 26);
     assert_eq!(version, USER_MIGRATIONS.len() as u32);
     assert_eq!(violations, 0, "foreign_key_check не пуст");
     assert!(fk, "foreign_keys выключены после миграции");
@@ -1211,7 +1221,7 @@ async fn migrate_0025_from_m57_db() {
     assert!(!counts_after.keys().any(|t| t.ends_with("_new")));
 
     // объекты схемы целиком: вне таблиц 0025 и их индексы — как были; `ADD COLUMN` — прежний
-    // SQL с хвостом столбцов; пересобранная и новые таблицы — SQL миграции
+    // SQL с хвостом столбцов; пересобранные и новые таблицы — SQL миграции (`entries` — 0026)
     let mut want = BTreeSet::new();
     for o in &objects_before {
         let added: &[&str] = match (o.0.as_str(), o.1.as_str()) {
@@ -1224,13 +1234,10 @@ async fn migrate_0025_from_m57_db() {
             // происхождение импорта (§12б.5, задача 18b2)
             ("table", "nodes") => &["imported_from TEXT"],
             ("table", "entries") => {
-                // у `entries` есть ограничения таблицы: SQLite вставляет столбец после последнего
-                // столбца, перед ними
-                let sql = o.3.replacen(
-                    "deleted_at TEXT,",
-                    "deleted_at TEXT, imported_from TEXT,",
-                    1,
-                );
+                // `imported_from` 0025 и следом пересборка 0026 (M6.5): SQL 0026 после `RENAME`
+                let sql = create_in(USER_MIGRATIONS[25].sql, "entries_new")
+                    .replace("CREATE TABLE entries_new", "CREATE TABLE \"entries\"");
+                assert!(sql.contains("imported_from TEXT"), "{sql}");
                 want.insert((o.0.clone(), o.1.clone(), o.2.clone(), sql));
                 continue;
             }
@@ -1329,14 +1336,16 @@ async fn migrate_0025_from_m57_db() {
 }
 
 /// Ревью задачи 19, I-1: база версии 25 промежуточной сборки M6 — без `node_idempotency` и
-/// `imported_from` у `nodes`/`entries` (0025 дописывалась до выпуска). Открытие дособирает
-/// схему до эталона текущих миграций (`master_objects`, как в `migrate_0025_from_m57_db`),
-/// строки на месте; второе открытие ничего не меняет.
+/// `imported_from` у `nodes`/`entries` (0025 дописывалась до выпуска). Открытие списком до 0025
+/// дособирает схему до эталона 0025 (`master_objects`, как в `migrate_0025_from_m57_db`), строки
+/// на месте; второе открытие ничего не меняет. Открытие текущими миграциями затем применяет 0026
+/// (M6.5) — схема чистой базы, копия `bak-v25`.
 #[tokio::test]
 async fn reopen_v25_repairs_late_0025_schema() {
     let dir = tmp_dir("v25-repair");
     let path = dir.join("u.db");
-    drop(Db::open(&path, USER_MIGRATIONS).unwrap());
+    let v25 = &USER_MIGRATIONS[..25];
+    drop(Db::open(&path, v25).unwrap());
     let (want, counts) = {
         let c = conn(&path);
         assert_eq!(user_version(&c), 25);
@@ -1363,7 +1372,7 @@ async fn reopen_v25_repairs_late_0025_schema() {
         assert_eq!(user_version(&c), 25);
     }
     for round in 0..2 {
-        drop(Db::open(&path, USER_MIGRATIONS).unwrap());
+        drop(Db::open(&path, v25).unwrap());
         let c = conn(&path);
         assert_eq!(master_objects(&c), want, "открытие {round}");
         assert_eq!(table_counts(&c), counts, "открытие {round}");
@@ -1372,6 +1381,15 @@ async fn reopen_v25_repairs_late_0025_schema() {
     }
     // копии перед миграцией нет: мигратор ничего не применял
     assert!(!dir.join("u.db.bak-v25").exists());
+    // текущие миграции: 0026 поверх дособранной схемы
+    let fresh = fresh_schema(&dir, USER_MIGRATIONS);
+    drop(Db::open(&path, USER_MIGRATIONS).unwrap());
+    let c = conn(&path);
+    assert_eq!(user_version(&c), 26);
+    assert_eq!(master_objects(&c), fresh);
+    assert_eq!(table_counts(&c), counts);
+    assert_eq!(fk_violations(&c), 0);
+    assert!(dir.join("u.db.bak-v25").exists());
 }
 
 // ---- ревью задачи 19, N-1…N-2: промежуточные версии 0025 ----
@@ -1408,19 +1426,21 @@ fn historic_0025(rev: &str) -> &'static str {
     Box::leak(sql.into_boxed_str())
 }
 
-/// Список миграций с 0025 версии `rev` вместо итоговой.
+/// Список миграций промежуточной сборки M6: до 0025 версии `rev` вместо итоговой (следующих
+/// миграций у неё не было).
 fn historic_list(rev: &str) -> &'static [Migration] {
-    let mut v = USER_MIGRATIONS.to_vec();
+    let mut v = USER_MIGRATIONS[..25].to_vec();
     v[24].sql = historic_0025(rev);
     Box::leak(v.into_boxed_slice())
 }
 
-/// Список итоговых миграций и фиктивной 0026 (только в тесте: досборка до следующих миграций).
-fn with_fake_0026() -> &'static [Migration] {
+/// Список итоговых миграций и фиктивной 0027 (только в тесте: досборка до следующих миграций).
+fn with_fake_0027() -> &'static [Migration] {
     let mut v = USER_MIGRATIONS.to_vec();
+    assert_eq!(v.len(), 26);
     v.push(Migration {
-        version: 26,
-        sql: "CREATE TABLE probe_0026 (x INTEGER);",
+        version: 27,
+        sql: "CREATE TABLE probe_0027 (x INTEGER);",
         rebuild: false,
     });
     Box::leak(v.into_boxed_slice())
@@ -1434,7 +1454,8 @@ fn fresh_schema(dir: &Path, list: &'static [Migration]) -> BTreeSet<MasterObject
 }
 
 /// База каждой промежуточной версии 0025 при открытии итоговой сборкой дособирается до эталона
-/// (`master_objects`), в том числе `session_snapshots.trigger` → `trigger_kind` с данными.
+/// (`master_objects`), в том числе `session_snapshots.trigger` → `trigger_kind` с данными, и
+/// получает следующие миграции (0026, M6.5).
 #[tokio::test]
 async fn reopen_historic_0025_versions_repaired() {
     let dir = tmp_dir("v25-historic");
@@ -1467,7 +1488,7 @@ async fn reopen_historic_0025_versions_repaired() {
             drop(Db::open(&path, USER_MIGRATIONS).unwrap());
             let c = conn(&path);
             assert_eq!(master_objects(&c), want, "{rev}, открытие {round}");
-            assert_eq!(user_version(&c), 25);
+            assert_eq!(user_version(&c), 26);
             let kind: String = c
                 .query_row(
                     "SELECT trigger_kind FROM session_snapshots WHERE session_id = 's'",
@@ -1480,18 +1501,236 @@ async fn reopen_historic_0025_versions_repaired() {
     }
 }
 
-/// N-1: база версии 25 промежуточной сборки, а у сервера уже есть следующая миграция —
-/// досборка идёт до неё (версия читается до миграций), итог совпадает с чистой базой.
+/// N-1: база версии 25 промежуточной сборки, а у сервера уже есть следующие миграции —
+/// досборка идёт до них (версия читается до миграций): настоящая 0026 переносит
+/// `entries.imported_from`, который дособирает досборка, за ней фиктивная 0027; итог совпадает с
+/// чистой базой.
 #[tokio::test]
 async fn repair_runs_before_next_migration() {
-    let dir = tmp_dir("v25-then-26");
-    let list = with_fake_0026();
+    let dir = tmp_dir("v25-then-next");
+    let list = with_fake_0027();
     let want = fresh_schema(&dir, list);
     let path = dir.join("u.db");
     drop(Db::open(&path, historic_list("61c5c14")).unwrap());
     drop(Db::open(&path, list).unwrap());
     let c = conn(&path);
-    assert_eq!(user_version(&c), 26);
+    assert_eq!(user_version(&c), 27);
     assert_eq!(master_objects(&c), want);
     assert!(dir.join("u.db.bak-v25").exists());
+}
+
+// ---------- 0026 (M6.5): статус идеи `returned` ----------
+
+/// Дополняет базу M6 (0025) идеями остальных статусов M5.7 (`deferred`, `declined`, `done`) и
+/// происхождением импорта (`imported_from`, столбец 0025) у заметки и у записи.
+async fn fill_m6(db: &Db) {
+    let space = zam_store::list_spaces(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Solution)
+        .unwrap()
+        .id;
+    let idea = |title: &str| {
+        let mut e = new_entry(
+            space,
+            EntryKind::Idea,
+            title.into(),
+            json!({"origin": "human", "priority": "high"}),
+        );
+        e.certainty = None;
+        e
+    };
+    for (title, d) in [
+        ("Отложенная идея", zam_store::IdeaDecision::Defer),
+        ("Отклонённая идея", zam_store::IdeaDecision::Decline),
+    ] {
+        let (e, _) = create_entry(db, idea(title), &human()).await.unwrap();
+        zam_store::decide_idea(db, e.id, decision(d), &human())
+            .await
+            .unwrap();
+    }
+    let (done, _) = create_entry(db, idea("Сделанная идея"), &human())
+        .await
+        .unwrap();
+    let task = zam_store::decide_idea(
+        db,
+        done.id,
+        decision(zam_store::IdeaDecision::Accept),
+        &human(),
+    )
+    .await
+    .unwrap()
+    .task
+    .unwrap();
+    update_entry(
+        db,
+        task.id,
+        None,
+        EntryPatch {
+            status: Some(EntryStatus::Done),
+            ..EntryPatch::default()
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        zam_store::get_entry(db, done.id).await.unwrap().status,
+        Some(EntryStatus::Done)
+    );
+    let note = zam_store::create_note(
+        db,
+        zam_store::NewNote {
+            space_id: space,
+            path: zam_store::NodePath::parse("Заметка импорта").unwrap(),
+            content: "# Заметка\nПеренесена из архива.\n".into(),
+            l0: None,
+            attrib: agent(),
+        },
+    )
+    .await
+    .unwrap();
+    let (note, idea) = (note.id, done.id);
+    db.write(move |tx| {
+        tx.execute(
+            "UPDATE nodes SET imported_from = ?2 WHERE id = ?1",
+            rusqlite::params![note, r#"{"source":"arch","source_id":"n-1"}"#],
+        )?;
+        tx.execute(
+            "UPDATE entries SET imported_from = ?2 WHERE id = ?1",
+            rusqlite::params![idea, r#"{"source":"arch","source_id":"w-1"}"#],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+/// `imported_from` заметок и записей: `вид:id=значение`.
+const IMPORTED: &str = "SELECT 'node:' || id || '=' || imported_from FROM nodes
+                        WHERE imported_from IS NOT NULL
+                        UNION ALL
+                        SELECT 'entry:' || id || '=' || imported_from FROM entries
+                        WHERE imported_from IS NOT NULL
+                        ORDER BY 1";
+
+/// Спецификация M6.5 §10: база M6 (0025) с идеями всех статусов M5.7, отчётом и `imported_from`
+/// у заметки и у записи открывается схемой 0026 (CHECK статусов идеи += `returned`, пересборка
+/// `entries` по рецепту 0024): копия `bak-v25`; строки, счётчики таблиц и `imported_from` на
+/// месте; объекты `sqlite_master` — как у чистой базы, а от прежних отличается только SQL
+/// `entries`; пять триггеров отчёта срабатывают; идея пишется в `returned`, неизвестный статус
+/// отсекает CHECK.
+#[tokio::test]
+async fn migrate_0026_from_m6_db() {
+    let dir = tmp_dir("m6-db");
+    let dd = DataDir::open(&dir).unwrap();
+    let user = Id::new();
+    assert_eq!(USER_MIGRATIONS[25].version, 26);
+    assert!(USER_MIGRATIONS[25].rebuild);
+    let path = dd.user_db(&user);
+    let (report, sha) = {
+        let db = Db::open(&path, &USER_MIGRATIONS[..25]).unwrap();
+        let rep = fill_m56(&db).await;
+        fill_m57(&db, user).await;
+        fill_m6(&db).await;
+        rep
+    };
+    let (counts_before, objects_before, rows_before, imported_before) = {
+        let c = conn(&path);
+        assert_eq!(user_version(&c), 25);
+        (
+            table_counts(&c),
+            master_objects(&c),
+            entry_rows(&c),
+            all_rows(&c, IMPORTED),
+        )
+    };
+    let statuses: BTreeSet<&str> = rows_before
+        .iter()
+        .filter(|r| r.1 == "idea")
+        .filter_map(|r| r.2.as_deref())
+        .collect();
+    assert_eq!(
+        statuses,
+        BTreeSet::from([
+            "new", "proposed", "accepted", "deferred", "declined", "done"
+        ])
+    );
+    assert!(rows_before.iter().any(|r| r.1 == "report"));
+    assert_eq!(imported_before.len(), 2, "{imported_before:?}");
+
+    let db = Db::open(&path, USER_MIGRATIONS).unwrap();
+    let bak = path.with_file_name(format!("{user}.db.bak-v25"));
+    assert!(bak.exists());
+    let (counts_after, objects_after, rows_after, imported_after, checks) = db
+        .read(|c| {
+            let integrity: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            Ok((
+                table_counts(c),
+                master_objects(c),
+                entry_rows(c),
+                all_rows(c, IMPORTED),
+                (user_version(c), fk_violations(c), fk_on(c), integrity),
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(checks, (26, 0, true, "ok".to_string()));
+    assert_eq!(checks.0, USER_MIGRATIONS.len() as u32);
+    // строки (в том числе Idempotency-Key и `imported_from`) и счётчики всех таблиц
+    assert_eq!(rows_after, rows_before);
+    assert_eq!(imported_after, imported_before);
+    for (t, n) in counts_before.iter().filter(|(t, _)| t.as_str() != "meta") {
+        assert_eq!(counts_after.get(t), Some(n), "таблица {t}");
+    }
+    assert!(!counts_after.keys().any(|t| t.ends_with("_new")));
+    // схема — как у чистой базы; от прежней отличается только SQL таблицы `entries`
+    assert_eq!(objects_after, fresh_schema(&dir, USER_MIGRATIONS));
+    let is_entries = |o: &&MasterObject| o.0 == "table" && o.1 == "entries";
+    let before: Vec<&MasterObject> = objects_before.iter().filter(|o| !is_entries(o)).collect();
+    let after: Vec<&MasterObject> = objects_after.iter().filter(|o| !is_entries(o)).collect();
+    assert_eq!(after, before);
+    let sql_of = |s: &BTreeSet<MasterObject>| s.iter().find(is_entries).unwrap().3.clone();
+    let (sql_before, sql_after) = (sql_of(&objects_before), sql_of(&objects_after));
+    assert!(!sql_before.contains("'returned'"), "{sql_before}");
+    assert!(
+        sql_after.contains("'returned'") && sql_after.contains("imported_from TEXT"),
+        "{sql_after}"
+    );
+    // копия перед миграцией: схема 0025 и прежние строки
+    {
+        let c = conn(&bak);
+        assert_eq!(user_version(&c), 25);
+        assert_eq!(entry_rows(&c), rows_before);
+    }
+
+    assert_report_triggers(&db, report, &sha).await;
+    // идея в `returned` проходит CHECK, неизвестный статус — нет
+    let space = zam_store::list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Solution)
+        .unwrap()
+        .id;
+    let insert = |status: &str| {
+        let now = zam_store::time::fmt_ts(Timestamp::now());
+        exec_sql(
+            &db,
+            format!(
+                "INSERT INTO entries (id, space_id, kind, title, title_norm, status, author_kind,
+                                      created_at, updated_at)
+                 VALUES ('{}', '{space}', 'idea', 'Идея', 'идея', '{status}', 'human', '{now}',
+                         '{now}')",
+                Id::new()
+            ),
+        )
+    };
+    insert("returned").await.unwrap();
+    let r = insert("bogus").await;
+    assert!(
+        matches!(&r, Err(StoreError::Sqlite(e)) if e.to_string().contains("CHECK")),
+        "{r:?}"
+    );
 }

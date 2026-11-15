@@ -3,14 +3,16 @@
 //!
 //! - [`IdeaData`] — `data` идеи: `priority`, `horizon`, `links` ведёт клиент; `origin` задаётся
 //!   при создании (меняет его только [`adopt_idea`]); `task_id`, `prev_task_ids`,
-//!   `question_id`, `proposed_at`, `decided`, `adopted_at`, `adopted_by`, `done_at` — сервер;
+//!   `question_id`, `proposed_at`, `decided`, `adopted_at`, `adopted_by`, `done_at` и поля
+//!   разбора агентом M6.5 `review`, `reviews` ([`Review`]), `returned_at` — сервер;
 //! - [`check_idea_transition`] — таблица переходов §5 (единственное место правил, в том числе
 //!   выхода из `accepted` при снятой или удалённой задаче — ждёт ответа владельца);
 //! - операции — по одной транзакции писателя: [`propose_idea`] (вопрос с вариантами
 //!   [`IDEA_OPTIONS`]), [`decide_idea`] (переход и задача при `accept`), [`adopt_idea`];
 //!   общий шаг перехода [`apply_decision_tx`] вызывает и ответ на вопрос-предложение
 //!   ([`crate::answer_question`]). Логическая ошибка после записи откатывает всё ([`atomic`]);
-//! - хуки транзакций журналов: смена статуса задачи ([`on_task_status_tx`]), устаревание и
+//! - хуки транзакций журналов: смена статуса задачи ([`on_task_status_tx`]; у задачи может быть
+//!   несколько идей — [`ideas_of_task`], M6.5 §5), устаревание и
 //!   удаление вопроса-предложения ([`on_proposal_closed_tx`]), удаление идеи
 //!   ([`on_entry_deleted_tx`]);
 //! - отбор для проактивности: [`proactive_ideas`] и предикат [`idea_candidate`] (§6).
@@ -211,6 +213,72 @@ pub struct Decided {
     pub at: Timestamp,
 }
 
+/// Исход разбора идеи агентом (M6.5 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewOutcome {
+    /// В план: новая задача или привязка к открытой.
+    Plan,
+    /// На доработку: человек дописывает (`missing`).
+    Return,
+    /// Отклонить: разбор и есть причина.
+    Decline,
+    /// Уже сделано: в `basis` ссылка на сделанное.
+    Done,
+}
+
+impl ReviewOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewOutcome::Plan => "plan",
+            ReviewOutcome::Return => "return",
+            ReviewOutcome::Decline => "decline",
+            ReviewOutcome::Done => "done",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ReviewOutcome> {
+        match s {
+            "plan" => Some(ReviewOutcome::Plan),
+            "return" => Some(ReviewOutcome::Return),
+            "decline" => Some(ReviewOutcome::Decline),
+            "done" => Some(ReviewOutcome::Done),
+            _ => None,
+        }
+    }
+}
+
+/// Разбор идеи агентом (`data.review` — последний, `data.reviews` — история; M6.5 §5). Поля
+/// без значения в `data` не пишутся.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Review {
+    pub outcome: ReviewOutcome,
+    /// Разбор для человека (Markdown).
+    pub summary: String,
+    /// Что дописать (у `return`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing: Option<String>,
+    /// На что опирался разбор: ссылки с префиксом (`k:…`, `file:…`, `commit:…`).
+    #[serde(default)]
+    pub basis: Vec<String>,
+    /// Похожие идеи (`w:…`), в том числе отклонённые.
+    #[serde(default)]
+    pub similar: Vec<String>,
+    /// Задача плана (`k:<id>`) у исхода `plan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Пользователь, от имени которого разбирал агент (владелец токена).
+    pub by_user: Id,
+    /// Сессия агента.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Ключ повтора (`Idempotency-Key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(serialize_with = "ser_ts")]
+    pub at: Timestamp,
+}
+
 /// Разобранная `data` идеи.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdeaData {
@@ -230,6 +298,12 @@ pub struct IdeaData {
     pub adopted_at: Option<Timestamp>,
     pub adopted_by: Option<Id>,
     pub done_at: Option<Timestamp>,
+    /// Последний разбор агентом (M6.5 §5).
+    pub review: Option<Review>,
+    /// История разборов: не больше 10, новые в начале (предел держит запись разбора).
+    pub reviews: Vec<Review>,
+    /// Когда идея ушла «На доработку» (`returned`); снимается правкой человека.
+    pub returned_at: Option<Timestamp>,
 }
 
 /// Умолчания разбора: `normal` и `agent` — повреждённое происхождение никогда не делает идею
@@ -250,6 +324,9 @@ impl Default for IdeaData {
             adopted_at: None,
             adopted_by: None,
             done_at: None,
+            review: None,
+            reviews: Vec::new(),
+            returned_at: None,
         }
     }
 }
@@ -257,7 +334,7 @@ impl Default for IdeaData {
 /// Поля, которые ведёт клиент.
 const CLIENT_KEYS: [&str; 3] = ["priority", "horizon", "links"];
 /// Поля, которые ведёт сервер.
-const SERVER_KEYS: [&str; 8] = [
+const SERVER_KEYS: [&str; 11] = [
     "task_id",
     "prev_task_ids",
     "question_id",
@@ -266,6 +343,9 @@ const SERVER_KEYS: [&str; 8] = [
     "adopted_at",
     "adopted_by",
     "done_at",
+    "review",
+    "reviews",
+    "returned_at",
 ];
 /// Подсказка обязательного `data.origin` (по образцу обязательного `by` ответа, §4).
 pub const IDEA_ORIGIN_REQUIRED: &str = "data.origin: укажите human — идея человека (записана по его \
@@ -346,6 +426,17 @@ impl IdeaData {
             adopted_at: ts("adopted_at"),
             adopted_by: get("adopted_by").and_then(id_of),
             done_at: ts("done_at"),
+            review: get("review").and_then(|v| serde_json::from_value(v.clone()).ok()),
+            // битые элементы истории пропускаются по одному, остальные сохраняются
+            reviews: get("reviews")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            returned_at: ts("returned_at"),
         }
     }
 
@@ -445,6 +536,15 @@ impl IdeaData {
         if let Some(t) = self.done_at {
             o.insert("done_at".into(), json!(fmt_ts(t)));
         }
+        if let Some(r) = &self.review {
+            o.insert("review".into(), json!(r));
+        }
+        if !self.reviews.is_empty() {
+            o.insert("reviews".into(), json!(self.reviews));
+        }
+        if let Some(t) = self.returned_at {
+            o.insert("returned_at".into(), json!(fmt_ts(t)));
+        }
         Value::Object(o)
     }
 }
@@ -530,6 +630,8 @@ pub fn task_released(task: Option<TaskState>) -> bool {
 /// `transition-not-allowed`, `already-decided` (только `accept` из `accepted`|`done`),
 /// `idea-agent-origin` (`accept` идеи «от агента»), `reason-required` (`reopen` без причины).
 /// Повторный `defer` по `deferred` разрешён. `task` — состояние задачи `data.task_id`.
+/// Идею `returned` (M6.5 §6) человек решает сам, как открытую (`accept`, `defer`, `decline`);
+/// `reopen` из неё не переход — на разбор её возвращает правка человека.
 pub fn check_idea_transition(
     cur: EntryStatus,
     d: &IdeaData,
@@ -539,7 +641,7 @@ pub fn check_idea_transition(
 ) -> Result<EntryStatus, &'static str> {
     use EntryStatus::*;
     const TNA: &str = "transition-not-allowed";
-    let open = matches!(cur, New | Proposed | Deferred);
+    let open = matches!(cur, New | Proposed | Deferred | Returned);
     let to = match decision {
         IdeaDecision::Accept => match cur {
             Accepted | Done => return Err("already-decided"),
@@ -1290,25 +1392,28 @@ pub async fn adopt_idea(
     .await?
 }
 
-/// Идея, на которую указывает системное ребро `derived_from` задачи, если она живая.
-fn idea_of_task(c: &Connection, task: Id) -> Result<Option<Entry>, StoreError> {
+/// Все живые идеи, на которые указывают системные рёбра `derived_from` задачи: у задачи плана их
+/// может быть несколько (разбор `plan` с открытой задачей, M6.5 §5). Порядок — по id идеи.
+pub(crate) fn ideas_of_task(c: &Connection, task: Id) -> Result<Vec<Entry>, StoreError> {
     let ids: Vec<Id> = {
         let mut st = c.prepare_cached(
-            "SELECT dst_id FROM edges
+            "SELECT DISTINCT dst_id FROM edges
              WHERE src_kind = 'entry' AND src_id = ?1 AND dst_kind = 'entry'
-               AND type = 'derived_from' AND origin = 'system' AND deleted_at IS NULL",
+               AND type = 'derived_from' AND origin = 'system' AND deleted_at IS NULL
+             ORDER BY dst_id",
         )?;
         st.query_map([task], |r| r.get(0))?
             .collect::<Result<_, _>>()?
     };
+    let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(e) = live_opt(c, id)?
             && e.kind == EntryKind::Idea
         {
-            return Ok(Some(e));
+            out.push(e);
         }
     }
-    Ok(None)
+    Ok(out)
 }
 
 /// Причина устаревания вопроса «вернуть», когда задача идеи снова живая (§16, п. 4).
@@ -1347,16 +1452,20 @@ fn revive_task_tx(
     load_entry(tx, idea.id)
 }
 
-/// Идея задачи `task`: ребро `derived_from` ведёт к живой идее с этим `task_id`.
-fn idea_with_task(tx: &Connection, task: Id) -> Result<Option<Entry>, StoreError> {
-    Ok(idea_of_task(tx, task)?.filter(|i| IdeaData::from_stored(&i.data).task_id == Some(task)))
+/// Идеи задачи `task`: живые идеи по рёбрам `derived_from` ([`ideas_of_task`]), у которых
+/// `data.task_id` — эта задача (идея с ребром от прежней задачи, вернувшаяся и начатая заново, к
+/// ней уже не относится).
+fn ideas_with_task(tx: &Connection, task: Id) -> Result<Vec<Entry>, StoreError> {
+    let mut ideas = ideas_of_task(tx, task)?;
+    ideas.retain(|i| IdeaData::from_stored(&i.data).task_id == Some(task));
+    Ok(ideas)
 }
 
 /// Смена статуса задачи (из `update_entry`, та же транзакция; §5.5): задача идеи `accepted`
 /// → `done` — идея `done` с `done_at`; задача из `done` переоткрыта — идея снова `accepted`.
-/// Ревизия идеи — с атрибуцией правки задачи. `dropped` идею не меняет (§5); задача из
-/// `dropped` в любой другой статус — открытый вопрос «вернуть» устаревает
-/// ([`revive_task_tx`], §16, п. 4).
+/// Так — с каждой идеей задачи ([`ideas_with_task`], M6.5 §5). Ревизия идеи — с атрибуцией
+/// правки задачи. `dropped` идею не меняет (§5); задача из `dropped` в любой другой статус —
+/// открытый вопрос «вернуть» устаревает ([`revive_task_tx`], §16, п. 4).
 pub(crate) fn on_task_status_tx(
     tx: &Connection,
     task: &Entry,
@@ -1369,25 +1478,25 @@ pub(crate) fn on_task_status_tx(
     if from == to || !(revived || to == EntryStatus::Done || from == EntryStatus::Done) {
         return Ok(());
     }
-    let Some(mut idea) = idea_with_task(tx, task.id)? else {
-        return Ok(());
-    };
-    if revived {
-        idea = revive_task_tx(tx, idea, attrib, now)?;
+    for mut idea in ideas_with_task(tx, task.id)? {
+        if revived {
+            idea = revive_task_tx(tx, idea, attrib, now)?;
+        }
+        let mut d = IdeaData::from_stored(&idea.data);
+        let next = match (idea.status, to) {
+            (Some(EntryStatus::Accepted), EntryStatus::Done) => {
+                d.done_at = Some(parse_ts(now)?);
+                EntryStatus::Done
+            }
+            (Some(EntryStatus::Done), s) if s != EntryStatus::Done => {
+                d.done_at = None;
+                EntryStatus::Accepted
+            }
+            _ => continue,
+        };
+        revise_with(tx, &idea, Some(next), d.to_value(), None, attrib, now)?;
     }
-    let mut d = IdeaData::from_stored(&idea.data);
-    let next = match (idea.status, to) {
-        (Some(EntryStatus::Accepted), EntryStatus::Done) => {
-            d.done_at = Some(parse_ts(now)?);
-            EntryStatus::Done
-        }
-        (Some(EntryStatus::Done), s) if s != EntryStatus::Done => {
-            d.done_at = None;
-            EntryStatus::Accepted
-        }
-        _ => return Ok(()),
-    };
-    revise_with(tx, &idea, Some(next), d.to_value(), None, attrib, now)
+    Ok(())
 }
 
 /// Вопрос-предложение устарел или удалён (из `update_entry` и `delete_entry`; §5.3, §5.6):
@@ -1556,7 +1665,7 @@ pub(crate) fn on_entry_restored_tx(
             revise_with(tx, e, status, d.to_value(), None, attrib, now)
         }
         EntryKind::Task if e.status != Some(EntryStatus::Dropped) => {
-            if let Some(idea) = idea_with_task(tx, e.id)? {
+            for idea in ideas_with_task(tx, e.id)? {
                 revive_task_tx(tx, idea, attrib, now)?;
             }
             Ok(())

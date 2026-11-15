@@ -428,7 +428,7 @@ async fn acceptance_migration_0025() {
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 25, "миграция 0025");
+        assert_eq!(v, 26, "миграции 0025 и 0026 (M6.5)");
         let ok: String = c
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
