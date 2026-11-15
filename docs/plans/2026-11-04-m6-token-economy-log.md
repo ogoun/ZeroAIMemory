@@ -13055,6 +13055,78 @@ Worktree `.tmp/m6/wt-b`, ветка `m6-portability` (база `d4892e2`, вес
 - `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --workspace --no-deps` — чисто;
 - `cargo fmt --all --check` — чисто.
 
+### Шаг 2а — числа без решающих замеров на GPU (2026-11-15)
+
+Источники:
+- разделы журнала «Задача 13b … Ход замера» и «Слияние веток и проверка кода выпуска»;
+- полный прогон `ZAM_REQUIRE_ML=1` (`5516d03`). Имена и статусы тестов сверены по
+  `.tmp/m6/release/logs/v2-ws.log` (сводка — `.tmp/m6/wt-b/.tmp/t13c/coord/ws-tests.txt`);
+- release `hook_budgets` задачи 17d;
+- замеры задач 7b, 16, 17a.
+
+Сборок, тестов и новых замеров не было. Версия `0.0.11-m6` — `a6ce1c0` (координатор), не трогалась.
+
+**Подставлено.** Из 91 метки 50 закрыты полностью, у 9 оставлена только часть, зависящая от GPU, 32
+без изменений.
+- smoke Windows cpu — SMOKE OK, 44 шага, из них 5 шагов M6; обе ОС — `package-smoke` CI на `3f1b4ac`;
+- e2e — 114 passed;
+- полный прогон — 199 наборов, 3095 passed, 44 ignored, 1 failed (нестабильный тест, исправлен в
+  `3f1b4ac`);
+- CI на `3f1b4ac` — CI, Edge, CUDA success;
+- `compat_old_zam_new_server`, `compat_new_zam_old_server`, `acceptance_migration_0025` — PASS;
+- p95 `/recall(prompt)` M6 / M5.7 — медиана 1,040;
+- FTS-контроль на holdout ТС-1 — 18 из 18;
+- качество int8 CPU — Δ recall@5 0,000 [0,000–0,000], Δ nDCG@10 +0,001 [−0,002…+0,005],
+  `reliable_first` 1,000.
+
+**Сокращённая приёмка.** В `m6_acceptance.rs` есть только `acceptance_ts1_vs_b4`,
+`acceptance_ts2_vs_b56` (`#[ignore]`, читают отчёт), `acceptance_migration_0025`, `compat_*` и
+`acceptance_hook_budgets` (`#[ignore]`, тихое окно). Метки несуществующих тестов приёмки заменены
+тестами задач, которые покрывают критерий и прошли в полном прогоне:
+
+| был тест приёмки | теперь в документах |
+|---|---|
+| `acceptance_dates_utc` | `agent_dates.rs` сервера (4) и клиента (1) |
+| `acceptance_mcp_session_subagent` | `mcp_bind.rs` (4), `mcp::implicit_session_no_marks_goes_unattributed`, `subagent_on_shared_mcp_keeps_snippet` |
+| `acceptance_epochs_and_reread` | `zam-store` `sessions::bump_epoch_hides_old_marks`, `ideas_recall::ideas_seen_across_epochs`, `prompt_idea_not_repeated_after_new_epoch` |
+| `acceptance_digest_deterministic` | `recall_frozen::digest_deterministic_two_sessions` |
+| `acceptance_honest_budget` | `search::brief_markdown_within_budget`, `brief_budget_edges_first_card_only`, `budget_counter.rs` |
+| `acceptance_snapshot` | `snapshot.rs` сервера (27) и клиента (33), `zam-store` `snapshots.rs` (4); приманки — `secrets_masked_in_prompts_and_flags`, `authorization_value_not_a_reference_masked`, `command_first_line_after_mask`, `server_remasks_secrets` |
+| `acceptance_misc_outputs` | `session_tokens.rs` (5), `zam-cli` `sessions.rs` (3), `sessions.rs` сервера (17) |
+| `acceptance_backup_restore` | `backup.rs` (44) |
+| `acceptance_export_import` | `transfer_export.rs` (16), `transfer_import.rs` (45), `zam-cli` `transfer.rs` (19) |
+
+**Не переснималось** (сокращённая приёмка, ответ владельца 2026-11-14) — в документах факт с
+числом задачи:
+- release `hook_budgets` (в том числе серии снимка и `session-start` с привязкой) — задача 17d,
+  `5cb3be9`, тихие серии 4 из 4;
+- p95 фокуса — задача 7b: CPU int8 43,5 мс, GPU 27,9 мс;
+- прирост `prompt` с 50 идеями — задача 16: +5,5–5,6 мс;
+- `zam --version` — задача 17a: p95 8,93 мс;
+- размер `zam` выпуска;
+- `npm run size` — задача 13c;
+- `code-bench`;
+- справочные наборы;
+- стенд Linux — задача 18c;
+- живой журнал Codex.
+
+С настоящим сервером v0.0.10 не проверялись `zam sessions tokens --last` (только заглушка
+`cli_sessions_tokens_old_server`) и `zam session snapshot` — так и записано.
+
+**Оставлено на шаг 2б** (метки `[13b: …]`; полный список — отчёт координатору):
+- ТС-1: `R`, ДИ, Δ полноты, `L`, вывод int8, цель 30 %, подтверждение `budget_tokens = 800`;
+- ТС-2: `R` полный и без Rules, обязательные строки, раздел снимка, перемер L0 правил;
+- качество fp16 CUDA и `rerank=on`;
+- расход блока v7, `tools/list` и `initialize` из отчётов ТС;
+- имена файлов отчётов;
+- итог `acceptance_ts1_vs_b4` и `acceptance_ts2_vs_b56`;
+- дата выпуска и итог приёмки M6.
+
+Прочее:
+- `deploy/config.example.toml`, `ml.unload_after`: «Пока не реализована (в 0.0.11-m6 тоже)».
+  Проверено по `crates/zam-server/src/ml.rs:340`.
+- ТЗ §19: приёмка M6 условна только до итога приёмки (метка шага 2б), решения составителя плана приняты 2026-11-14.
+
 ### Открытые вопросы и ответы координатора (2026-11-14)
 
 1. **`guide` о флагах снимка** — исправить до выпуска (сделано, раздел «Правки до выпуска» ниже).
@@ -13354,8 +13426,9 @@ UnrealEditor): 7 тест-бинарников `zam-server` открыты им 
 
 ## Итог M6
 
-> Черновик задачи 13c (шаг 1, 2026-11-14) до чисел приёмки: метки `[13b: …]` заменяются итогами
-> задачи 13b; версия `0.0.11-m6` ставится на шаге 2.
+> Задача 13c: шаг 1 — 2026-11-14, шаг 2а — 2026-11-15 (числа без GPU подставлены). Метки
+> `[13b: …]` остались у ТС-1, ТС-2, качества CUDA, даты и итога приёмки — шаг 2б. Версия
+> `0.0.11-m6` — `a6ce1c0` (координатор).
 
 - **Выпуск** `0.0.11-m6` [13b: дата выпуска]. Ветки `m6-token-economy` (от `v0.0.10-m5.7`, `9136305`)
   и `m6-portability` (вторая ветка параллельных задач по ответу владельца 2026-11-08, п. 13; итог
@@ -13370,27 +13443,27 @@ UnrealEditor): 7 тест-бинарников `zam-server` открыты им 
   |---|---|---|
   | 1 | ТС-1 к B4 (holdout), цель −30 % | [13b: R, ДИ, Δ полноты, L; цель — факт] |
   | 2 | ТС-2 к B5.6 / без Rules к B5.7 (holdout) | [13b: R полный ≤ 1,15 и без Rules ≤ 1,00, ДИ]; dev (8c): 1,145 / 1,148, без Rules 0,999 / 1,000 |
-  | 3 | честный бюджет | реализовано (задача 5); [13b: `acceptance_honest_budget`] |
-  | 4 | качество поиска к v0.0.9 | [13b: Δ nDCG@10, Δ recall@5, `reliable_first`, `rerank=on`] |
-  | 5 | дата UTC в тексте | задача 6 (`agent_dates.rs` сервера и CLI); [13b: `acceptance_dates_utc`] |
-  | 6 | сессия MCP, субагент | задачи 3, 19 (`mcp_bind.rs`); [13b: `acceptance_mcp_session_subagent`] |
-  | 7 | эпохи и «уже выдавалось» | задача 7a; [13b: `acceptance_epochs_and_reread`] |
-  | 8 | фокус только явно, p95 | задача 7b (`read_focus*.rs`); [13b: p95 CPU int8 ≤ 120 мс, GPU ≤ 50 мс] |
-  | 9 | детерминированность дайджеста | задача 8a (`recall_frozen.rs`); [13b: `acceptance_digest_deterministic`] |
+  | 3 | честный бюджет | реализовано (задача 5); тесты задачи 5 (`search::brief_markdown_within_budget`, `brief_budget_edges_first_card_only`, `zam-store` `budget_counter.rs`) — PASS в полном прогоне |
+  | 4 | качество поиска к v0.0.9 | int8 CPU: Δ recall@5 0,000 [0,000–0,000], Δ nDCG@10 +0,001 [−0,002…+0,005], `reliable_first` 1,000; [13b: fp16 CUDA, `rerank=on`] |
+  | 5 | дата UTC в тексте | задача 6 (`agent_dates.rs` сервера и CLI); `agent_dates.rs` (сервер 4, клиент 1) — PASS |
+  | 6 | сессия MCP, субагент | задачи 3, 19 (`mcp_bind.rs`); `mcp_bind.rs` (4), `mcp::implicit_session_no_marks_goes_unattributed`, `subagent_on_shared_mcp_keeps_snippet` — PASS |
+  | 7 | эпохи и «уже выдавалось» | задача 7a; `zam-store` `sessions::bump_epoch_hides_old_marks`, `ideas_recall::ideas_seen_across_epochs`, `prompt_idea_not_repeated_after_new_epoch` — PASS |
+  | 8 | фокус только явно, p95 | задача 7b (`read_focus*.rs`); p95 в 13b не переснимался; задача 7b, release: CPU int8 43,5 мс, GPU fp16 27,9 мс |
+  | 9 | детерминированность дайджеста | задача 8a (`recall_frozen.rs`); `recall_frozen::digest_deterministic_two_sessions` — PASS |
   | 10 | буст вида | сетка прогнана (задача 10): `always × 1,05`; набор «не на потолке» 59,6 % при пороге 60 % — принято контролёром |
   | 11 | `boost_area`, `w_attach` | задача 11: `boost_area` 1,10 → 1,0 (решение контролёра), `w_attach` 1,0 |
   | 12 | подсказки | задача 9: `hints.toml` — 180 случаев; `post_tool_coverage {2, 6, plain}`, `prompt_min_score_fts` = `prompt_min_score` |
-  | 13 | совместимость, блок v7 | блок v7 — 483 ru / 479 en, одно напоминание v6 → v7 (задача 13a); [13b: `compat_*`, `acceptance_compat_matrix`] |
-  | 14 | миграция 0025 | задача 2 (+ досборка 0025, задача 19); [13b: `acceptance_migration_0025`] |
-  | 15 | бюджеты хуков release, p95 `/recall(prompt)` | [13b: `hook_budgets` release, p95 к v0.0.10-m5.7 + 10 %, прирост с 50 идеями ≤ +15 мс] |
+  | 13 | совместимость, блок v7 | блок v7 — 483 ru / 479 en, одно напоминание v6 → v7 (задача 13a); `compat_new_zam_old_server`, `compat_old_zam_new_server` — PASS |
+  | 14 | миграция 0025 | задача 2 (+ досборка 0025, задача 19); `acceptance_migration_0025` — PASS |
+  | 15 | бюджеты хуков release, p95 `/recall(prompt)` | p95 `/recall(prompt)` M6 / M5.7 — медиана 1,040 ≤ 1,10 (13b); release `hook_budgets` — задача 17d, 4 из 4 в тихих сериях; прирост `prompt` с 50 идеями — +5,5–5,6 мс (задача 16) |
   | 16 | стенд A/B | `cargo xtask ab` на фикстуре (задача 12); прогон на живом агенте — владелец, вне приёмки |
   | 17 | карта кода | **3/10** при пороге 6 с абляцией (задача 14); ответ владельца 2026-11-09 «Принять 3/10, остальное в M7» |
   | 18 | долги M5.5, M5.6 | задачи 15a–15c; упаковка без сети — проверена вручную на Windows cpu |
-  | 19 | снимок сессии | задачи 17a–17d (живые фикстуры Claude Code 2.1.314); для Codex живого журнала нет — пункт для Codex открыт; [13b: `acceptance_snapshot`] |
+  | 19 | снимок сессии | задачи 17a–17d (живые фикстуры Claude Code 2.1.314); для Codex живого журнала нет — пункт для Codex открыт; `snapshot.rs` сервера (27) и `zam-cli` (33), `zam-store` `snapshots.rs` (4) — PASS |
   | 20 | долги M5.7 | задача 16: топ-5 подсказок-идей — 0 расхождений с эталоном M5.7, стоп-глаголы — тишина; `inner_search` 5,7 мс при цели 4 мс (debug), порог +15 мс на стенде соблюдён |
-  | 21 | прочие изменения выдачи | задачи 5, 8b, 12, 3 (тесты задач); [13b: `acceptance_misc_outputs`] |
-  | 22 | бэкап и восстановление | задача 18a (`backup.rs`); [13b: `acceptance_backup_restore`] |
-  | 23 | экспорт и импорт | задачи 18b1, 18b2 (`transfer_*.rs`, `zam-cli/tests/transfer.rs`); [13b: `acceptance_export_import`] |
+  | 21 | прочие изменения выдачи | задачи 5, 8b, 12, 3 (тесты задач); `session_tokens.rs` (5), `zam-cli` `sessions.rs` (3), `sessions.rs` сервера (17) — PASS |
+  | 22 | бэкап и восстановление | задача 18a (`backup.rs`); `backup.rs` (44) — PASS; smoke `backup` → `restore` |
+  | 23 | экспорт и импорт | задачи 18b1, 18b2 (`transfer_*.rs`, `zam-cli/tests/transfer.rs`); `transfer_export.rs` (16), `transfer_import.rs` (45), `zam-cli` `transfer.rs` (19) — PASS |
   | 24 | переезд Windows → Linux | **подтверждён** на стенде Debian 13 командами инструкции дословно (задача 18c, журнал стенда) |
   | 25 | нативный клиент | задача 19; `Idempotency-Key` у `PATCH /entries/{id}` (`append`) — M7 (отступление 21 спецификации) |
 
@@ -13409,5 +13482,6 @@ UnrealEditor): 7 тест-бинарников `zam-server` открыты им 
   журналов и `answer|claim|propose|decide`, OpenAPI, нормализация дат в FTS, кандидаты в Rules,
   признак подсказок `prompt` без модели; после M7 — OCR (сначала спросить владельца о движке) и
   калибровка на реальной большой задаче.
-- **Приёмка M6 условна** до [13b: итог приёмки, smoke, e2e, полный прогон, CI на финальном HEAD].
+- **Прогоны выпуска** (13b и проверка координатора): smoke Windows cpu — SMOKE OK, 44 шага; e2e — 114 passed; полный прогон `ZAM_REQUIRE_ML=1` (`5516d03`): 199 наборов, 3095 passed, 44 ignored, 1 failed — нестабильный `recall_timeout_ms_param_full_digest`, исправлен в `3f1b4ac`, `recall` — 43 passed; CI на `3f1b4ac` — CI, Edge, CUDA success.
+- **Приёмка M6 условна** до [13b: итог приёмки — ТС-1, ТС-2, качество CUDA].
   Решения составителя плана приняты владельцем 2026-11-14. Merge и тег — контролёр.

@@ -19,15 +19,15 @@
 backup|restore` (копия без остановки сервера, автокопии), `zam export|import` (архив `.md`) и
 проверенная инструкция переезда Windows → Linux. Миграция 0025, блок инструкции v7, ТЗ — v1.24.
 Итог по расходу токенов — `[13b: R ТС-1 к B4 и ТС-2 к B5.6/B5.7, standard, holdout, точка и
-95 % ДИ]`. Приёмка — `[13b: файлы и итог приёмки]`. Тесты этапа — в том числе
+95 % ДИ]`. Приёмка — `crates/zam-server/tests/m6_acceptance.rs` и `crates/zam-cli/tests/m6_acceptance.rs` (сокращённая: совместимость с 0.0.10-m5.7, миграция 0025, бюджет `/recall` и расход токенов; прочее — тесты этапа) `[13b: итог приёмки]`. Тесты этапа — в том числе
 `crates/zam-server/tests/`: `snapshot.rs`, `backup.rs`, `transfer_export.rs`,
 `transfer_import.rs`, `read_focus.rs`, `read_focus_ml.rs`, `recall_heavy.rs`, `recall_frozen.rs`,
 `agent_dates.rs`; `crates/zam-cli/tests/`: `snapshot.rs`, `sessions.rs`, `transfer.rs`,
 `mcp_bind.rs`, `agent_dates.rs`; e2e `web/e2e/sessions.spec.ts`, `web/e2e/export.spec.ts`.
 
 **Совместимость с 0.0.10-m5.7.** Обновите сервер и `zam` вместе. Смешанные пары работают, но
-без части нового. Проверка пар — `[13b: тесты совместимости compat_old_zam_new_server,
-compat_new_zam_old_server]`.
+без части нового. Проверка пар — тесты `compat_old_zam_new_server` и
+`compat_new_zam_old_server` с настоящими бинарниками 0.0.10-m5.7 (пройдены).
 - **Сервер 0.0.11-m6 и `zam` 0.0.10-m5.7.** Хуки работают. MCP не привязан к сессии агента:
   без пометок «уже выдавалось» и `(seen)`, расход — в `GET /sessions/unattributed`. Снимка сессии
   нет. Новые события хуков `SessionEnd` и `PostCompact` (их ставит `zam init` с новым сервером)
@@ -403,8 +403,8 @@ compat_new_zam_old_server]`.
   `ZAM_TEST_HOOK_IMPACT_MS`, `ZAM_TEST_HOOK_HOLDOUT_MS`, `ZAM_TEST_GC_STALL_MS`,
   `ZAM_TEST_FLUSH_STALL_MS`, `ZAM_TEST_TOUCH_FAIL`, `<кэш>/snapshot.log-stall-ms`.
 - `hook_budgets` на release меряет время процесса целиком (`hook_budgets_unanswered`,
-  `hook_budgets_snapshot_scenarios`, `hook_budgets_remote`): `[13b: бюджеты хуков release, p95 по
-  хукам]`. `fail_open_when_server_down` берёт лучший из трёх вызовов — дефект, который
+  `hook_budgets_snapshot_scenarios`, `hook_budgets_remote`): на release перед выпуском обе тихие
+  серии — 4 из 4; в приёмке выпуска не переснимались. `fail_open_when_server_down` берёт лучший из трёх вызовов — дефект, который
   проявляется в 1–2 вызовах из 3, он пропустит (компромисс против остановок HDD).
 - Пределы WebUI (`web/.size-limit.json`): `ReportsView` — 9 кБ, `IdeasView` — 7,2 кБ, `IdeaForm` —
   2,5 кБ, `SessionsView` — 4,8 кБ.
