@@ -1,0 +1,32 @@
+# Сетка M6 (задача 13b, решение владельца 2026-11-15 «Сначала поднять лимит»): умолчание
+# `search.budget_tokens` на dev ТС-1 к B4, гибрид bge-m3 fp16 CUDA, вариант Б (цели корпуса — как у
+# v0.0.5-m4: без вложений `eval/docs` и связей `contradicts`):
+#   cargo xtask eval --tokens --via mcp --split dev --device cuda --strict-l0 \
+#     --targets-of 0.0.5-m4 --grid eval/grid-m6-budget-b4.toml --label t13b-bud-r<k>
+# Один индекс на все точки (план, «Методика замера при недетерминизме», правило 1), K = 3 —
+# три прогона сетки = три индексации (правило 3). Первая точка — нынешнее умолчание (800). Шаг
+# 100 токенов ≈ одна карточка brief (у M6 на holdout ТС-1 — 674–791 токен на 6–7 карточек); верх
+# 1200 — выше самого длинного ответа B4 на holdout (1038–1139 токенов, 9–10 карточек). Правило
+# выбора — журнал этапа, «Дополнение к предрегистрации 13b: `search.budget_tokens`»: наименьшее
+# значение, при котором на dev нижняя граница Δ микро-полноты ≥ −0,02, `L ≤ 1` и верхняя граница
+# 95 % `R` < 1,00 (`--arm` ×3 `--compare` B4 ×3, `compare_reps`).
+
+[[point]]
+name = "b800"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "800" }
+
+[[point]]
+name = "b900"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "900" }
+
+[[point]]
+name = "b1000"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "1000" }
+
+[[point]]
+name = "b1100"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "1100" }
+
+[[point]]
+name = "b1200"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "1200" }
