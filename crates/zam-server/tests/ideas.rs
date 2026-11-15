@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Method, StatusCode, header};
-use common::api::{Api, Resp, api, req};
+use common::api::{Api, Resp, api, id, ok, problem, req};
 use serde_json::{Value, json};
 
 const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e57";
@@ -25,32 +25,10 @@ fn ent(id: &str) -> String {
     format!("/api/v1/entries/{id}")
 }
 
-fn id(v: &Value) -> String {
-    v["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("нет id: {v}"))
-        .to_string()
-}
-
-fn ok(r: &Resp, s: StatusCode) {
-    assert_eq!(r.status, s, "{}", r.text());
-}
-
 /// Режим идей M5.7 (`[ideas] default_mode = propose`): эти тесты — о предложении идеи вопросом;
 /// разбор агентом (режим `review`, M6.5) — `tests/ideas_review.rs`.
 fn propose_mode(c: &mut zam_server::config::ServerConfig) {
     c.ideas.default_mode = zam_server::config::IdeasMode::Propose;
-}
-
-/// Ответ — problem с типом `/problems/<kind>` и статусом `s`.
-fn problem(r: &Resp, s: StatusCode, kind: &str) {
-    ok(r, s);
-    assert_eq!(
-        r.json()["type"],
-        format!("/problems/{kind}"),
-        "{}",
-        r.text()
-    );
 }
 
 /// Сервер с решением `G` администратора (`defer_days` = 7 — видно, что срок берётся из
@@ -1019,19 +997,6 @@ async fn ready_user(a: &Api, name: &str, ip: &str) -> (String, String, Web) {
     (uid, tok, w)
 }
 
-/// Режим участника `access` у владельца `owner_tok`.
-async fn set_access(a: &Api, owner_tok: &str, member: &str, access: &str) {
-    let r = a
-        .tok(
-            owner_tok,
-            Method::POST,
-            &format!("/api/v1/solutions/{G}/access/{member}/approve"),
-            Some(json!({ "access": access })),
-        )
-        .await;
-    ok(&r, StatusCode::OK);
-}
-
 /// Матрица прав §9: владелец (WebUI), участник `rw` (WebUI и токен), участник `ro` (WebUI и
 /// токен); задача «начать» — в базе владельца.
 #[tokio::test]
@@ -1057,7 +1022,7 @@ async fn shared_solution_rights_matrix() {
         )
         .await;
     ok(&r, StatusCode::ACCEPTED);
-    set_access(&a, &o_tok, &m_id, "rw").await;
+    a.set_access(&o_tok, G, &m_id, "rw").await;
     let create = |title: &str, origin: Option<&str>| {
         let mut b = json!({"kind": "idea", "title": title, "body": "Замысел"});
         if let Some(o) = origin {
@@ -1247,7 +1212,7 @@ async fn shared_solution_rights_matrix() {
     ok(&r, StatusCode::OK);
 
     // ro: читает, но не пишет — ни WebUI, ни токен
-    set_access(&a, &o_tok, &m_id, "ro").await;
+    a.set_access(&o_tok, G, &m_id, "ro").await;
     let m_ro = a.issue(&m_id, "ro").await;
     for t in [&m_tok, &m_ro] {
         ok(
@@ -1339,7 +1304,7 @@ async fn revoked_member_cannot_decide_or_propose() {
         )
         .await;
     ok(&r, StatusCode::ACCEPTED);
-    set_access(&a, &o_tok, &m_id, "rw").await;
+    a.set_access(&o_tok, G, &m_id, "rw").await;
     let mut ids = Vec::new();
     for t in ["Первая", "Вторая"] {
         let r = a

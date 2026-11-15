@@ -250,8 +250,11 @@ fn utc_date_plus(days: i64) -> String {
         .to_string()
 }
 
-/// Загружает мир сессии `s` на сервер `a` (токен администратора, `rules.agent_write` включается
-/// здесь). Идеи — по плану загрузчика ТС-2 (`load_plan`), горизонт «сегодня» — прямым SQL.
+/// Загружает мир сессии `s` на сервер `a` (токен администратора; `rules.agent_write` и режим
+/// идей `ideas.mode = propose` его пользователя включаются здесь). Идеи — по плану загрузчика ТС-2
+/// (`load_plan`), горизонт «сегодня» — прямым SQL. Мир ТС-2 собран под режим идей M5.7:
+/// предложенные идеи (`propose`) и раздел `### Идеи`; в режиме `review` M6.5 `propose` новой
+/// идеи — 409.
 pub async fn load(a: &Api, s: &Spec) -> World {
     let c = corpus();
     let r = a
@@ -259,6 +262,15 @@ pub async fn load(a: &Api, s: &Spec) -> World {
             Method::PATCH,
             "/api/v1/admin/settings",
             Some(json!({"rules": {"agent_write": true}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{}/settings", a.admin_id()),
+            Some(json!({"ideas": {"mode": "propose"}})),
             None,
         )
         .await;

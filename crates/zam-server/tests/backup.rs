@@ -2272,12 +2272,7 @@ async fn restore_has_no_machine_bindings() {
     let _g = CHUNKER.read().await;
     let pdfium = common::attach::pdfium();
     let with_pdf = pdfium.is_some();
-    // мир `sh-01` с предложенной идеей — режим идей M5.7 `propose` (в `review` M6.5 — 409)
-    let a = api("bind-src", |c| {
-        c.docs.pdfium_dylib = pdfium;
-        c.ideas.default_mode = zam_server::config::IdeasMode::Propose;
-    })
-    .await;
+    let a = api("bind-src", |c| c.docs.pdfium_dylib = pdfium).await;
     common::heavy::load(&a, &common::heavy::spec("sh-01")).await;
     let sol = common::heavy::SOL;
     let h = [

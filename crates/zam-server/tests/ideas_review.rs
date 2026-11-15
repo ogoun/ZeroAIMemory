@@ -6,7 +6,7 @@
 mod common;
 
 use axum::http::{Method, StatusCode};
-use common::api::{Api, Resp, api};
+use common::api::{Api, Resp, api, id, ok, problem};
 use serde_json::{Value, json};
 use zam_server::config::IdeasMode;
 
@@ -20,28 +20,6 @@ fn sol() -> String {
 
 fn ent(id: &str) -> String {
     format!("/api/v1/entries/{id}")
-}
-
-fn id(v: &Value) -> String {
-    v["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("нет id: {v}"))
-        .to_string()
-}
-
-fn ok(r: &Resp, s: StatusCode) {
-    assert_eq!(r.status, s, "{}", r.text());
-}
-
-/// Ответ — problem с типом `/problems/<kind>` и статусом `s`.
-fn problem(r: &Resp, s: StatusCode, kind: &str) {
-    ok(r, s);
-    assert_eq!(
-        r.json()["type"],
-        format!("/problems/{kind}"),
-        "{}",
-        r.text()
-    );
 }
 
 /// Разбор не короче `ideas.review_min_chars` (200).
@@ -307,57 +285,70 @@ async fn review_rest_refusals() {
     let t = task_tok(&a, "Просто задача").await;
     let r = review(&a, &t, plan.clone()).await;
     ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
-    // ошибки тела: неизвестное поле (в том числе by) — 400, неверные значения — 422
-    for (body, want) in [
+    // ошибки тела: неизвестное поле (в том числе by) — 400; неверные значения — 422 с именем
+    // поля в начале detail
+    let ghost = format!("k:{}", zam_core::Id::new());
+    let bad = StatusCode::BAD_REQUEST;
+    let unp = StatusCode::UNPROCESSABLE_ENTITY;
+    for (body, want, field) in [
         (
             json!({"outcome": "plan", "summary": summary(), "by": "agent"}),
-            StatusCode::BAD_REQUEST,
+            bad,
+            "",
         ),
         (
             json!({"outcome": "plan", "summary": summary(), "task": {"name": "x"}}),
-            StatusCode::BAD_REQUEST,
+            bad,
+            "",
         ),
         (
             json!({"outcome": "maybe", "summary": summary()}),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            unp,
+            "outcome:",
         ),
-        (
-            json!({"summary": summary()}),
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (json!({"outcome": "plan"}), StatusCode::UNPROCESSABLE_ENTITY),
+        (json!({"summary": summary()}), unp, "outcome:"),
+        (json!({"outcome": "plan"}), unp, "summary:"),
         (
             json!({"outcome": "plan", "summary": "коротко"}),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            unp,
+            "summary:",
         ),
         (
             json!({"outcome": "return", "summary": summary()}),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            unp,
+            "missing:",
         ),
         (
             json!({"outcome": "plan", "summary": summary(),
                    "task": {"id": format!("k:{t}"), "title": "и новая"}}),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            unp,
+            "task:",
         ),
         (
             json!({"outcome": "plan", "summary": summary(), "task": {"id": "k:не-id"}}),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            unp,
+            "task.id:",
         ),
         (
             json!({"outcome": "plan", "summary": summary(), "task": {"priority": "urgent"}}),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            unp,
+            "task.priority:",
         ),
         (
-            json!({"outcome": "plan", "summary": summary(), "basis": ["k:01M7GCJV84ENQ9FH2H8RJF25HB"]}),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"outcome": "plan", "summary": summary(), "basis": [ghost.clone()]}),
+            unp,
+            "basis:",
         ),
         (
             json!({"outcome": "plan", "summary": summary(), "space": "knowledge"}),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            unp,
+            "space:",
         ),
     ] {
         let r = review(&a, &i, body.clone()).await;
         assert_eq!(r.status, want, "{body}: {}", r.text());
+        let detail = r.json()["detail"].as_str().unwrap_or_default().to_string();
+        assert!(detail.starts_with(field), "{body}: {detail}");
     }
     assert_eq!(get(&a, &i).await["status"], "new", "отказы идею не меняют");
     // `space` идеи (GUID решения) допустим
@@ -424,8 +415,9 @@ fn yesterday() -> String {
 }
 
 /// §7: в режиме `review` `propose` идеи `new` решения — 409 `idea-mode` («идею разбирает
-/// агент»); `deferred` с наступившим `horizon` и общая идея Knowledge `new` предлагаются как в
-/// M5.7; в режиме `propose` — `propose` идеи `new` проходит.
+/// агент»); `deferred` с наступившим `horizon`, `accepted` со снятой задачей (вопрос «вернуть»,
+/// M5.7 §16) и общая идея Knowledge `new` предлагаются как в M5.7; в режиме `propose` — `propose`
+/// идеи `new` проходит.
 #[tokio::test]
 async fn propose_new_idea_in_review_mode_is_409() {
     let a = setup("propose-mode").await;
@@ -454,6 +446,35 @@ async fn propose_new_idea_in_review_mode_is_409() {
     let r = post_tok(&a, &d, "propose", json!({"text": "срок наступил"})).await;
     ok(&r, StatusCode::OK);
     assert_eq!(r.json()["entry"]["status"], "proposed");
+    // принятая человеком, задача снята — вопрос «вернуть» по M5.7 (§16), статус прежний
+    let acc = idea_tok(&a, &sol(), "Принятая идея", "human").await;
+    let r = post_tok(
+        &a,
+        &acc,
+        "decide",
+        json!({"decision": "accept", "by": "human"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let task = id(&r.json()["task"]);
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &ent(&task),
+            Some(json!({"status": "dropped", "reason": "не до того"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let r = post_tok(&a, &acc, "propose", json!({"text": "кэш снова нужен"})).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["entry"]["status"], "accepted", "{}", r.text());
+    assert_eq!(
+        r.json()["question"]["data"]["proposal"],
+        "reopen",
+        "{}",
+        r.text()
+    );
     // общая идея Knowledge — по M5.7
     let kn = idea_tok(&a, KN, "Общая идея", "human").await;
     let r = post_tok(&a, &kn, "propose", json!({})).await;
@@ -576,8 +597,8 @@ async fn human_patch_returned_by_token_with_by_human() {
 }
 
 /// §7: `ideas.mode` в `GET/PATCH /auth/settings` и у администратора: по умолчанию — `[ideas]
-/// default_mode` сервера; правка сессией с аудитом `{key, from, to}`; неизвестное значение —
-/// 422; повтор действующего значения — без аудита; [`ideas_mode`] — то же значение.
+/// default_mode` сервера; правка сессией с аудитом `{key, from, to}`; строка не из режимов — 422,
+/// не строка — 400; повтор действующего значения — без аудита; [`ideas_mode`] — то же значение.
 #[tokio::test]
 async fn ideas_mode_setting_roundtrip() {
     let a = setup("mode-setting").await;
@@ -619,19 +640,28 @@ async fn ideas_mode_setting_roundtrip() {
         .await
         .unwrap();
     assert_eq!(mode, IdeasMode::Propose);
-    // неизвестное значение — 422, настройка прежняя
-    for bad in [
-        json!({"ideas": {"mode": "auto"}}),
-        json!({"ideas": {"mode": ""}}),
-        json!({"ideas": {"mode": 1}}),
-        json!({"ideas": {"mode": null}}),
+    // строка не из режимов — 422, не строка (в том числе null) — 400, как тип `proactive`;
+    // настройка прежняя
+    for (bad, want) in [
+        (
+            json!({"ideas": {"mode": "auto"}}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"ideas": {"mode": ""}}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (json!({"ideas": {"mode": 1}}), StatusCode::BAD_REQUEST),
+        (json!({"ideas": {"mode": null}}), StatusCode::BAD_REQUEST),
     ] {
         let r = a
             .adm(Method::PATCH, SETTINGS, Some(bad.clone()), None)
             .await;
-        ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+        ok(&r, want);
         assert!(r.text().contains("ideas.mode"), "{bad}: {}", r.text());
     }
+    let r = a.adm(Method::GET, SETTINGS, None, None).await;
+    assert_eq!(r.json()["ideas"]["mode"], "propose");
     // токен свою настройку не меняет
     let r = a
         .t(
@@ -696,19 +726,6 @@ async fn ideas_mode_setting_roundtrip() {
     assert_eq!(mode, IdeasMode::Review);
 }
 
-/// Режим участника `access` у владельца `owner_tok`.
-async fn set_access(a: &Api, owner_tok: &str, member: &str, access: &str) {
-    let r = a
-        .tok(
-            owner_tok,
-            Method::POST,
-            &format!("/api/v1/solutions/{G}/access/{member}/approve"),
-            Some(json!({ "access": access })),
-        )
-        .await;
-    ok(&r, StatusCode::OK);
-}
-
 /// §7 «Общие решения»: участник `ro` — 403; участник `rw` разбирает, `data.review.by_user` —
 /// его id, задача — в базе владельца; действует режим владельца базы: `propose` участника не
 /// мешает, `propose` владельца — 409 `idea-mode` и участнику.
@@ -738,8 +755,8 @@ async fn review_shared_solution_rights_and_owner_mode() {
             .await;
         ok(&r, StatusCode::ACCEPTED);
     }
-    set_access(&a, &o_tok, &m_id, "rw").await;
-    set_access(&a, &o_tok, &r_id, "ro").await;
+    a.set_access(&o_tok, G, &m_id, "rw").await;
+    a.set_access(&o_tok, G, &r_id, "ro").await;
     let idea = |title: &str| json!({"kind": "idea", "title": title, "body": "Замысел", "data": {"origin": "human"}});
     let i = create_tok(&a, &o_tok, &sol(), idea("Идея владельца")).await;
     let j = create_tok(&a, &o_tok, &sol(), idea("Вторая идея")).await;

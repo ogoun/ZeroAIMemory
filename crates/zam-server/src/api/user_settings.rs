@@ -15,9 +15,11 @@
 //!   пользователя); по токену — 403: агент свои подсказки не выключает.
 //!   `GET/PATCH /admin/users/{id}/settings` — администратор, любой пользователь.
 //! - `PATCH {hooks?: {<тип>: bool, …}, ideas?: {proactive?: bool, mode?: "review"|"propose"}}`:
-//!   неизвестный тип или поле — 400, пустая правка — 400, неверное значение `ideas.mode` — 422.
-//!   Ответ — все настройки `{hooks: {…}, ideas: {proactive, mode}}`. Аудит
-//!   `user.settings.update {key, from, to}` на каждое изменение.
+//!   неизвестный тип или поле, значение не того типа (в том числе `null`) и пустая правка — 400;
+//!   строка `ideas.mode` не из `review | propose` — 422. Ответ — все настройки `{hooks: {…},
+//!   ideas: {proactive, mode}}`. Аудит `user.settings.update {key, from, to}` на каждое изменение.
+//! - Выбор, совпавший с действующим умолчанием, не сохраняется: такой пользователь пойдёт за
+//!   новым `[ideas] default_mode`, если администратор его сменит (как `hooks` — за `true`).
 //! - Сервер отдаёт их в `/recall(session_start)` полем `hooks`; выключенный тип `/recall`
 //!   (`session_start`, `prompt`, `post_tool`) отвечает пустым `text` и показ не учитывает (N4).
 //! - Режим идей решения — режим **владельца базы** ([`ideas_mode`]): идеи общего решения лежат в
@@ -98,7 +100,8 @@ pub struct UserFlags {
     pub hooks: HookFlags,
     /// Проактивность идей `ideas.proactive` (действует вместе с `[ideas] proactive`).
     pub ideas_proactive: bool,
-    /// Режим идей `ideas.mode` (нет строки — `[ideas] default_mode` сервера).
+    /// Режим идей `ideas.mode` этого пользователя (нет строки — `[ideas] default_mode` сервера).
+    /// Для идей чужой (общей) базы действует режим её владельца — [`ideas_mode`]`(st, owner)`.
     pub ideas_mode: IdeasMode,
 }
 
@@ -215,9 +218,15 @@ fn parse_patch(body: &Bytes) -> Result<Vec<(String, Value)>, ApiError> {
                 };
                 out.push((IDEAS_PROACTIVE.to_string(), Value::Bool(b)));
             }
-            // значение поля проверяется по смыслу: не режим — 422 (как у полей операций идей)
+            // не строка (в том числе null) — 400, как тип `proactive`; строка не из режимов — 422
+            // (значение по смыслу, как у полей операций идей)
             "mode" => {
-                let Some(m) = v.as_str().map(str::trim).and_then(IdeasMode::parse) else {
+                let Value::String(s) = v else {
+                    return Err(ApiError::BadRequest(
+                        "ideas.mode: строка review или propose".into(),
+                    ));
+                };
+                let Some(m) = IdeasMode::parse(s.trim()) else {
                     return Err(ApiError::Unprocessable(
                         "ideas.mode: review — агент сам разбирает новые идеи, propose — \
                          предлагает их человеку вопросом"
@@ -407,8 +416,8 @@ mod tests {
         }
     }
 
-    /// M6.5 §7: `ideas.mode` — строка `review | propose` (с пробелами по краям — та же);
-    /// иное значение — 422, а не 400 неизвестного поля.
+    /// M6.5 §7: `ideas.mode` — строка `review | propose` (с пробелами по краям — та же); другая
+    /// строка — 422, не строка (в том числе `null`) — 400, как тип `proactive`.
     #[test]
     fn patch_ideas_mode() {
         let mut ok = parse_patch(&Bytes::from_static(
@@ -426,11 +435,19 @@ mod tests {
         for bad in [
             r#"{"ideas":{"mode":"auto"}}"#,
             r#"{"ideas":{"mode":"Review"}}"#,
-            r#"{"ideas":{"mode":true}}"#,
-            r#"{"ideas":{"mode":null}}"#,
+            r#"{"ideas":{"mode":""}}"#,
         ] {
             let e = parse_patch(&Bytes::from(bad.to_string())).unwrap_err();
             assert!(matches!(e, ApiError::Unprocessable(_)), "{bad}: {e:?}");
+        }
+        for bad in [
+            r#"{"ideas":{"mode":true}}"#,
+            r#"{"ideas":{"mode":1}}"#,
+            r#"{"ideas":{"mode":null}}"#,
+            r#"{"ideas":{"mode":["review"]}}"#,
+        ] {
+            let e = parse_patch(&Bytes::from(bad.to_string())).unwrap_err();
+            assert!(matches!(e, ApiError::BadRequest(_)), "{bad}: {e:?}");
         }
         let f = UserFlags::defaults(IdeasMode::Propose);
         assert_eq!(f.value(IDEAS_MODE), json!("propose"));
