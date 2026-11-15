@@ -9,7 +9,7 @@ use std::process::Output;
 
 use serde_json::Value;
 use zam_server::build;
-use zam_server::config::ServerConfig;
+use zam_server::config::{IdeasMode, ServerConfig};
 use zam_store::Access;
 
 const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e52";
@@ -18,8 +18,9 @@ fn tmp(name: &str) -> PathBuf {
     common::sandbox("cli-idea", name)
 }
 
-/// Сервер в фоновом потоке: адрес и токен `rw` пользователя «Анна».
-fn start(name: &str) -> (String, String) {
+/// Сервер в фоновом потоке с режимом идей `mode` (`[ideas] default_mode`): адрес и токен `rw`
+/// пользователя «Анна».
+fn start(name: &str, mode: IdeasMode) -> (String, String) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -28,10 +29,11 @@ fn start(name: &str) -> (String, String) {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let cfg = ServerConfig {
+            let mut cfg = ServerConfig {
                 data_dir: data,
                 ..ServerConfig::default()
             };
+            cfg.ideas.default_mode = mode;
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
             let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
@@ -57,8 +59,18 @@ struct T {
 }
 
 impl T {
+    /// Режим идей по умолчанию (`review`, M6.5).
     fn new(name: &str) -> T {
-        let (url, tok) = start(name);
+        T::with_mode(name, IdeasMode::default())
+    }
+
+    /// Режим идей M5.7 `propose`: в режиме `review` `propose` новой идеи — 409 (M6.5 §7).
+    fn propose_mode(name: &str) -> T {
+        T::with_mode(name, IdeasMode::Propose)
+    }
+
+    fn with_mode(name: &str, mode: IdeasMode) -> T {
+        let (url, tok) = start(name, mode);
         T {
             url,
             tok,
@@ -236,7 +248,7 @@ fn idea_new_under_agent_requires_origin() {
 
 #[test]
 fn idea_propose_prints_question_ref() {
-    let t = T::new("propose");
+    let t = T::propose_mode("propose");
     let id = t.idea("Экспорт в PDF", &[]);
     let p = ok(&t.z(&[
         "idea",

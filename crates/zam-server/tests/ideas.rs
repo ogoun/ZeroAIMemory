@@ -1,6 +1,7 @@
 //! Журнал «Идеи» через REST (M5.7, задача 2): создание и `origin`, правка и корзина идей
 //! человека, `propose`, `decide`, `adopt`, ответ на вопрос-предложение, связи в `GET`, лента,
-//! `/read w:`, права участников общего решения. Сервер без моделей (поиск — FTS).
+//! `/read w:`, права участников общего решения. Сервер без моделей (поиск — FTS); режим идей —
+//! `propose` M5.7 (M6.5 §7: в режиме `review` `propose` идеи `new` — 409).
 mod common;
 
 use std::net::SocketAddr;
@@ -35,6 +36,12 @@ fn ok(r: &Resp, s: StatusCode) {
     assert_eq!(r.status, s, "{}", r.text());
 }
 
+/// Режим идей M5.7 (`[ideas] default_mode = propose`): эти тесты — о предложении идеи вопросом;
+/// разбор агентом (режим `review`, M6.5) — `tests/ideas_review.rs`.
+fn propose_mode(c: &mut zam_server::config::ServerConfig) {
+    c.ideas.default_mode = zam_server::config::IdeasMode::Propose;
+}
+
 /// Ответ — problem с типом `/problems/<kind>` и статусом `s`.
 fn problem(r: &Resp, s: StatusCode, kind: &str) {
     ok(r, s);
@@ -47,9 +54,13 @@ fn problem(r: &Resp, s: StatusCode, kind: &str) {
 }
 
 /// Сервер с решением `G` администратора (`defer_days` = 7 — видно, что срок берётся из
-/// `[ideas]`).
+/// `[ideas]`; режим идей M5.7 — `propose`, [`propose_mode`]).
 async fn setup(name: &str) -> Api {
-    let a = api(&format!("ideas-{name}"), |c| c.ideas.defer_days = 7).await;
+    let a = api(&format!("ideas-{name}"), |c| {
+        c.ideas.defer_days = 7;
+        propose_mode(c);
+    })
+    .await;
     let r = a
         .t(
             Method::POST,
@@ -1025,7 +1036,7 @@ async fn set_access(a: &Api, owner_tok: &str, member: &str, access: &str) {
 /// токен); задача «начать» — в базе владельца.
 #[tokio::test]
 async fn shared_solution_rights_matrix() {
-    let a = api("ideas-shared", |_| {}).await;
+    let a = api("ideas-shared", propose_mode).await;
     let (o_id, o_tok, o_web) = ready_user(&a, "Ольга", "10.7.0.1").await;
     let (m_id, m_tok, m_web) = ready_user(&a, "Марк", "10.7.0.2").await;
     let r = a
@@ -1307,7 +1318,7 @@ async fn shared_solution_rights_matrix() {
 /// Отзыв доступа участника (§9): его токен больше не предлагает и не решает идеи общего решения.
 #[tokio::test]
 async fn revoked_member_cannot_decide_or_propose() {
-    let a = api("ideas-revoked", |_| {}).await;
+    let a = api("ideas-revoked", propose_mode).await;
     let (_, o_tok) = a.new_user("Ольга").await;
     let (m_id, m_tok) = a.new_user("Марк").await;
     let r = a

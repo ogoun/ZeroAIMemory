@@ -12,11 +12,19 @@
 //!   400 `by-required`, `by: agent` — 403 `idea-human-decision`, кроме `decline` своей идеи
 //!   (`origin: agent`);
 //! - `POST /entries/{id}/adopt` → 200 `Entry`: только человек (сессия WebUI), токену 403;
+//! - `POST /entries/{id}/review {outcome, summary, missing?, basis?, similar?, task?, space?,
+//!   message?}` → 200 `{entry, task?, replay}` (M6.5 §5, [`zam_store::review_idea`]): разбор —
+//!   действие агента (сессии WebUI 422), только идеи решения (Knowledge 422), только в режиме
+//!   `ideas.mode = review` владельца базы (иначе 409 `idea-mode`); повтор — по заголовку
+//!   `Idempotency-Key`, как у записи;
+//! - режим идей в `propose`: идея `new` решения в режиме `review` — 409 `idea-mode` (её
+//!   разбирает агент), прочие случаи M5.7 (`deferred`, `accepted` со снятой задачей, Knowledge) —
+//!   как раньше (M6.5 §7);
 //! - права правки и корзины идей человека ([`deny_token_on_human_idea`]), `origin` при создании
 //!   ([`create_data`]) и связанные записи в `GET /entries/{id}` ([`attach_idea`]).
 //!
 //! Аудит в `system.db` без текста: `entry.idea.propose`, `entry.idea.decide {decision}`,
-//! `entry.idea.adopt`.
+//! `entry.idea.adopt`, `entry.idea.review {outcome, task?}`.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -28,17 +36,20 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use zam_core::Id;
 use zam_store::{
-    AnswerBy, Channel, Db, Entry, EntryKind, IdeaData, IdeaDecision, IdeaError, IdeaOrigin,
-    NewDecision, StoreError, adopt_idea, decide_idea, get_entry, propose_idea,
+    AnswerBy, Channel, Db, Entry, EntryKind, EntryStatus, IdeaData, IdeaDecision, IdeaError,
+    IdeaOrigin, IdeaPriority, NewDecision, NewReview, ReviewOutcome, ReviewTask, SpaceKind,
+    StoreError, adopt_idea, decide_idea, get_entry, propose_idea, review_idea,
 };
 
-use super::entries::{audit_details, unprocessable};
+use super::entries::{audit_details, idempotency_key, unprocessable};
 use super::json_body;
 use super::nodes::audit_node;
 use super::scope::{EntryScope, Mode, SpaceRef, deny_report_mutation, entry_scope, live_entry};
+use super::user_settings::ideas_mode;
 use crate::app::AppState;
 use crate::attrib::attribution;
 use crate::auth::{Client, Principal};
+use crate::config::IdeasMode;
 use crate::error::ApiError;
 
 impl From<IdeaError> for ApiError {
@@ -318,6 +329,18 @@ pub async fn propose(
             "предложение — действие агента: человек решает идею сам (decide)",
         ));
     }
+    // M6.5 §7: новую идею человека в решении разбирает агент — двух противоречивых указаний у
+    // него нет; `deferred`, `accepted` со снятой задачей и Knowledge — по M5.7, «от агента» —
+    // прежняя ошибка хранилища
+    if sc.space.kind == SpaceKind::Solution
+        && sc.entry.status.unwrap_or(EntryStatus::New) == EntryStatus::New
+        && origin_of(&sc.entry) == IdeaOrigin::Human
+        && ideas_mode(&st, sc.owner).await? == IdeasMode::Review
+    {
+        return Err(ApiError::IdeaMode(
+            "идею разбирает агент (ideas.mode = review): action=review, а не propose".into(),
+        ));
+    }
     let req: ProposeReq = if matches!(&body, Ok(b) if b.is_empty()) {
         ProposeReq::default()
     } else {
@@ -527,7 +550,160 @@ pub async fn adopt(
     Ok(Json(super::insights::entry_json(&sc.db, &e).await?))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewReq {
+    /// `plan | return | decline | done`; нет или иное — 422.
+    outcome: Option<String>,
+    /// Разбор; нет — 422 хранилища `summary: …` (поле названо, как у прочих полей разбора).
+    summary: Option<String>,
+    missing: Option<String>,
+    basis: Option<Vec<String>>,
+    similar: Option<Vec<String>>,
+    task: Option<ReviewTaskReq>,
+    /// Пространство идеи (GUID решения), если клиент его называет; другое — 422.
+    space: Option<String>,
+    message: Option<String>,
+}
+
+/// `task` разбора `plan`: новая задача `{title?, body?, priority?}` или уже открытая задача
+/// плана `{id: "k:<id>"}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewTaskReq {
+    id: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    priority: Option<String>,
+}
+
+impl ReviewTaskReq {
+    /// Задача плана хранилища; `id` вместе с полями новой задачи, неверный `id` или
+    /// `priority` — 422.
+    fn parse(self) -> Result<ReviewTask, ApiError> {
+        if let Some(raw) = self.id {
+            if self.title.is_some() || self.body.is_some() || self.priority.is_some() {
+                return Err(unprocessable(
+                    "task: либо {id} уже открытой задачи плана, либо {title, body, priority} \
+                     новой",
+                ));
+            }
+            let raw = raw.trim();
+            let id = raw
+                .strip_prefix("k:")
+                .unwrap_or(raw)
+                .trim()
+                .parse::<Id>()
+                .map_err(|_| unprocessable("task.id: ссылка на задачу k:<id>"))?;
+            return Ok(ReviewTask::Existing(id));
+        }
+        let priority = self
+            .priority
+            .as_deref()
+            .map(|s| {
+                IdeaPriority::parse(s.trim())
+                    .ok_or_else(|| unprocessable("task.priority: low, normal или high"))
+            })
+            .transpose()?;
+        Ok(ReviewTask::New {
+            title: self.title,
+            body: self.body,
+            priority,
+        })
+    }
+}
+
+/// `space` тела разбора: только пространство самой идеи (задача плана заводится в нём).
+async fn review_space(sc: &EntryScope, raw: Option<&str>) -> Result<(), ApiError> {
+    let bad = || unprocessable("space: разбор — в пространстве идеи, задача плана — там же");
+    match task_space(&sc.db, raw).await {
+        Ok(None) => Ok(()),
+        Ok(Some(s)) if s == sc.space.id => Ok(()),
+        Ok(Some(_)) | Err(ApiError::Unprocessable(_)) => Err(bad()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `POST /entries/{id}/review` (M6.5 §5): разбор новой идеи человека агентом.
+pub async fn review(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    client: Client,
+    Path(id): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let sc = idea_scope(&st, &p, &headers, &id).await?;
+    if is_session(&p) {
+        return Err(unprocessable(
+            "разбор — действие агента: человек решает идею сам (decide) или дописывает её",
+        ));
+    }
+    if sc.space.kind != SpaceKind::Solution {
+        return Err(unprocessable(
+            "разбор — у идей решения: у общих идей Knowledge нет плана и ТЗ одного проекта, они \
+             остаются по M5.7 (propose, decide)",
+        ));
+    }
+    // режим владельца базы: в общем решении — его, а не участника (§7 «Общие решения»)
+    if ideas_mode(&st, sc.owner).await? == IdeasMode::Propose {
+        return Err(ApiError::IdeaMode(
+            "разбор выключен (ideas.mode = propose): предложи идею человеку — action=propose"
+                .into(),
+        ));
+    }
+    let req: ReviewReq = json_body(body)?;
+    let outcome = req
+        .outcome
+        .as_deref()
+        .map(str::trim)
+        .and_then(ReviewOutcome::parse)
+        .ok_or_else(|| unprocessable("outcome: plan, return, decline или done"))?;
+    let task = req
+        .task
+        .map(ReviewTaskReq::parse)
+        .transpose()?
+        .unwrap_or(ReviewTask::None);
+    review_space(&sc, req.space.as_deref()).await?;
+    // ключ повтора — на один вызов разбора, из заголовка, как у записи (ruling 5)
+    let key = idempotency_key(&headers)?;
+    let attrib = attribution(&p, &headers, req.message)?;
+    let r = review_idea(
+        &sc.db,
+        sc.entry.id,
+        NewReview {
+            outcome,
+            summary: req.summary.unwrap_or_default(),
+            missing: req.missing,
+            basis: req.basis.unwrap_or_default(),
+            similar: req.similar.unwrap_or_default(),
+            task,
+            // агент разбирает от имени владельца токена (участника общего решения — тоже)
+            by_user: sc.user.id,
+            session: None,
+            key,
+            min_chars: st.cfg.ideas.review_min_chars as usize,
+        },
+        &attrib,
+    )
+    .await?;
+    // повтор по ключу — без записи и без аудита
+    if !r.replay {
+        st.index.notify();
+        let mut extra = json!({ "outcome": outcome.as_str() });
+        if let Some(t) = &r.task {
+            extra["task"] = json!(t.id);
+        }
+        audit(&st, &p, &client, &sc, "entry.idea.review", extra).await?;
+    }
+    let mut out = json!({ "entry": entry_value(&r.idea), "replay": r.replay });
+    if let Some(t) = &r.task {
+        out["task"] = entry_value(t);
+    }
+    Ok(Json(out))
+}
+
 /// Статус идеи меняют только операции этого модуля (§5): `PATCH status` — 422.
 pub(crate) fn status_patch_error() -> ApiError {
-    unprocessable("статус идеи меняется операциями propose, decide, adopt")
+    unprocessable("статус идеи меняется операциями propose, decide, adopt, review")
 }

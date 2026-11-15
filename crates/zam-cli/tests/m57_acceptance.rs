@@ -57,6 +57,8 @@ fn start(name: &str) -> (String, String) {
                 ..ServerConfig::default()
             };
             cfg.recall.timeout_ms = 30_000;
+            // приёмка M5.7 — режим идей `propose` (в `review` M6.5 `propose` новой идеи — 409)
+            cfg.ideas.default_mode = zam_server::config::IdeasMode::Propose;
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
             let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();

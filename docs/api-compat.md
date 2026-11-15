@@ -67,6 +67,7 @@
 | `recall_timeout` | M6 §16 п. 19 (CR-7) | Поле `timeout_ms` тела `POST /recall` и аргумент `memory_recall`: 1..=`max(recall.max_timeout_ms, recall.timeout_ms)` (предел `recall.max_timeout_ms` по умолчанию 2000); без поля — `recall.timeout_ms` (200). |
 | `idempotent_nodes` | M6 §16 п. 19 (CR-20) | `Idempotency-Key` у `POST /nodes`, `PUT` и `PATCH /nodes/{id}`; `idempotency_key` у `memory_write`. |
 | `mcp_session_arg` | M6 §16 п. 19 (CR-8) | Аргумент `session_id` у `memory_recall`, `memory_search`, `memory_read` — явная сессия для учёта и отметок, как `X-Zam-Session`. |
+| `idea_review` | M6.5 §5–§7 | Разбор идей агентом: `POST /entries/{id}/review` (исходы `plan`, `return`, `decline`, `done`; повтор по `Idempotency-Key`), статус идеи `returned`, режим `ideas.mode` (`review` по умолчанию — `[ideas] default_mode`, или `propose`) в `/auth/settings`; в режиме `review` `propose` идеи `new` — 409 `/problems/idea-mode`. Старый сервер без флага разбора не знает. |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;

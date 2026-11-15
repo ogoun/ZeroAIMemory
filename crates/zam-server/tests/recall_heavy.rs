@@ -24,12 +24,19 @@ async fn recall(a: &Api, session: &str, body: Value) -> Value {
     r.json()
 }
 
+/// Конфигурация тяжёлого мира: `recall.timeout_ms` поднят (отладочная сборка на HDD), режим идей
+/// M5.7 — `propose` (мир предлагает идею вопросом; в `review` M6.5 `propose` новой идеи — 409).
+fn heavy_cfg(c: &mut zam_server::config::ServerConfig) {
+    c.recall.timeout_ms = 30_000;
+    c.ideas.default_mode = zam_server::config::IdeasMode::Propose;
+}
+
 /// `sh-05`: 20 Rules, 6 задач, 6 вопросов, 2 запроса доступа, словарь, insight, идеи, карта кода.
 #[tokio::test]
 async fn heavy_sh05_digest_complete_fts() {
     let s = spec("sh-05");
     assert_eq!((s.profile.as_str(), s.rules.len()), ("heavy", 20));
-    let a = api("recall-heavy-sh05", |c| c.recall.timeout_ms = 30_000).await;
+    let a = api("recall-heavy-sh05", heavy_cfg).await;
     let w = load(&a, &s).await;
     assert_eq!(w.rules, 20);
     let j = recall(
@@ -70,7 +77,7 @@ async fn heavy_sh05_digest_complete_fts() {
 #[tokio::test]
 async fn heavy_sh05_fits_output_limit() {
     let s = spec("sh-05");
-    let a = api("recall-heavy-sh05-limit", |c| c.recall.timeout_ms = 30_000).await;
+    let a = api("recall-heavy-sh05-limit", heavy_cfg).await;
     let w = load(&a, &s).await;
     let cases = [
         (

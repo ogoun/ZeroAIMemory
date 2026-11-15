@@ -1193,7 +1193,11 @@ async fn user_ideas_settings_rest() {
     let (uid, tok, w) = ready_user(&a, "Ида", "10.1.9.3").await;
     let r = web(&a, &w, Method::GET, "/api/v1/auth/settings", None).await;
     ok(&r, StatusCode::OK);
-    assert_eq!(r.json()["ideas"], json!({"proactive": true}));
+    // M6.5 §7: рядом — режим идей `ideas.mode` (умолчание сервера `review`)
+    assert_eq!(
+        r.json()["ideas"],
+        json!({"proactive": true, "mode": "review"})
+    );
     let hooks_before = r.json()["hooks"].clone();
     let r = web(
         &a,

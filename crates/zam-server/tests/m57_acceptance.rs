@@ -72,10 +72,12 @@ fn problem(r: &Resp, s: StatusCode, kind: &str, ctx: &str) {
     );
 }
 
-/// Сервер с решением `G` администратора; `recall.timeout_ms` поднят (отладочная сборка на HDD).
+/// Сервер с решением `G` администратора; `recall.timeout_ms` поднят (отладочная сборка на HDD);
+/// режим идей M5.7 — `propose` (в `review` M6.5 `propose` новой идеи — 409).
 async fn world(name: &str, tweak: impl FnOnce(&mut ServerConfig)) -> Api {
     let a = api(&format!("m57-{name}"), |c| {
         c.recall.timeout_ms = 30_000;
+        c.ideas.default_mode = zam_server::config::IdeasMode::Propose;
         tweak(c);
     })
     .await;

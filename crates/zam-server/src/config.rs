@@ -1179,8 +1179,38 @@ impl CodeSection {
     }
 }
 
-/// Секция `[ideas]` (M5.7 §8): журнал «Идеи» — проактивность (раздел дайджеста `### Идеи`,
-/// подсказки `prompt`) и срок отсрочки по умолчанию.
+/// Режим идей человека (M6.5 §7): кто решает по новой идее решения.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdeasMode {
+    /// Агент разбирает новые идеи сам (`POST /entries/{id}/review`); `propose` идеи `new` —
+    /// 409 `idea-mode`.
+    #[default]
+    Review,
+    /// Поведение M5.7: агент предлагает идею человеку вопросом (`propose`), разбора нет.
+    Propose,
+}
+
+impl IdeasMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdeasMode::Review => "review",
+            IdeasMode::Propose => "propose",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<IdeasMode> {
+        match s {
+            "review" => Some(IdeasMode::Review),
+            "propose" => Some(IdeasMode::Propose),
+            _ => None,
+        }
+    }
+}
+
+/// Секция `[ideas]` (M5.7 §8, M6.5 §5, §7): журнал «Идеи» — проактивность (раздел дайджеста
+/// `### Идеи`, подсказки `prompt`), срок отсрочки по умолчанию, режим идей и нижний предел
+/// разбора агента.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdeasSection {
@@ -1195,6 +1225,10 @@ pub struct IdeasSection {
     pub prompt_top_k: u32,
     /// `horizon` по умолчанию у `defer`, дней (1..=3650, 30).
     pub defer_days: u32,
+    /// Режим идей пользователя без своей настройки `ideas.mode` (M6.5 §7; `review`).
+    pub default_mode: IdeasMode,
+    /// Нижний предел `summary` разбора агента, символов (50..=2000, 200; M6.5 §5).
+    pub review_min_chars: u32,
 }
 
 impl Default for IdeasSection {
@@ -1205,6 +1239,8 @@ impl Default for IdeasSection {
             prompt_max: 1,
             prompt_top_k: 5,
             defer_days: zam_store::IDEA_DEFER_DAYS_DEFAULT,
+            default_mode: IdeasMode::Review,
+            review_min_chars: zam_store::REVIEW_MIN_CHARS_DEFAULT as u32,
         }
     }
 }
@@ -1227,6 +1263,9 @@ impl IdeasSection {
         }
         if !(1..=3650).contains(&self.defer_days) {
             return Err(bad("defer_days", "от 1 до 3650"));
+        }
+        if !(50..=2000).contains(&self.review_min_chars) {
+            return Err(bad("review_min_chars", "от 50 до 2000"));
         }
         Ok(())
     }
@@ -2745,6 +2784,12 @@ master_key = \"x\"
             (3, 1, 5, 30)
         );
         assert_eq!(c.defer_days, zam_store::IDEA_DEFER_DAYS_DEFAULT);
+        // M6.5 §5, §7: режим по умолчанию — разбор агентом, предел разбора 200 символов
+        assert_eq!(c.default_mode, IdeasMode::Review);
+        assert_eq!(
+            c.review_min_chars as usize,
+            zam_store::REVIEW_MIN_CHARS_DEFAULT
+        );
         for (k, v) in [
             ("ZAM_IDEAS__DIGEST_MAX", "11"),
             ("ZAM_IDEAS__PROMPT_MAX", "4"),
@@ -2752,6 +2797,9 @@ master_key = \"x\"
             ("ZAM_IDEAS__PROMPT_TOP_K", "21"),
             ("ZAM_IDEAS__DEFER_DAYS", "0"),
             ("ZAM_IDEAS__DEFER_DAYS", "3651"),
+            ("ZAM_IDEAS__REVIEW_MIN_CHARS", "49"),
+            ("ZAM_IDEAS__REVIEW_MIN_CHARS", "2001"),
+            ("ZAM_IDEAS__DEFAULT_MODE", "auto"),
         ] {
             let e = load(None, &[env(k, v)], &Default::default())
                 .unwrap_err()
@@ -2765,6 +2813,8 @@ master_key = \"x\"
             env("ZAM_IDEAS__PROMPT_MAX", "3"),
             env("ZAM_IDEAS__PROMPT_TOP_K", "20"),
             env("ZAM_IDEAS__DEFER_DAYS", "3650"),
+            env("ZAM_IDEAS__DEFAULT_MODE", "propose"),
+            env("ZAM_IDEAS__REVIEW_MIN_CHARS", "2000"),
         ];
         let c = load(None, &ok, &Default::default()).unwrap().ideas;
         assert!(!c.proactive);
@@ -2772,6 +2822,18 @@ master_key = \"x\"
             (c.digest_max, c.prompt_max, c.prompt_top_k, c.defer_days),
             (0, 3, 20, 3650)
         );
+        assert_eq!(
+            (c.default_mode, c.review_min_chars),
+            (IdeasMode::Propose, 2000)
+        );
+        let c = load(
+            None,
+            &[env("ZAM_IDEAS__REVIEW_MIN_CHARS", "50")],
+            &Default::default(),
+        )
+        .unwrap()
+        .ideas;
+        assert_eq!(c.review_min_chars, 50);
         let e = load(None, &[env("ZAM_IDEAS__AUTO", "true")], &Default::default());
         assert!(e.is_err(), "неизвестный ключ секции — ошибка");
         // ответ владельца на вопрос 8 (А): порога косинуса нет — ключ не выпускался ни в одном

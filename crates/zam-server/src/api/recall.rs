@@ -4223,11 +4223,11 @@ pub async fn recall(
     let user = target_user_id(&st, &p, &headers)?;
     // R5: настройки пользователя (`hooks.<тип>`, `ideas.proactive`) одним чтением; сбой
     // чтения — всё включено (подсказки не валятся)
-    let flags = match user_flags(&st.system, user).await {
+    let flags = match user_flags(&st.system, user, st.cfg.ideas.default_mode).await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "recall: настройки пользователя не прочитаны");
-            UserFlags::default()
+            UserFlags::defaults(st.cfg.ideas.default_mode)
         }
     };
     let hooks = flags.hooks;

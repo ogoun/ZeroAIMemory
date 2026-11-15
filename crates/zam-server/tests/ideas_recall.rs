@@ -32,10 +32,12 @@ fn sol() -> String {
 
 const KN: &str = "/api/v1/spaces/knowledge/entries";
 
-/// Сервер с решением `G` администратора; `recall.timeout_ms` поднят (отладочная сборка на HDD).
+/// Сервер с решением `G` администратора; `recall.timeout_ms` поднят (отладочная сборка на HDD);
+/// режим идей M5.7 — `propose` (в `review` M6.5 `propose` новой идеи — 409).
 async fn server(name: &str, tweak: impl FnOnce(&mut ServerConfig)) -> Api {
     let a = api(&format!("ideas-recall-{name}"), |c| {
         c.recall.timeout_ms = 30_000;
+        c.ideas.default_mode = zam_server::config::IdeasMode::Propose;
         tweak(c);
     })
     .await;

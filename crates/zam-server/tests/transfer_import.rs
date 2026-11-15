@@ -134,8 +134,14 @@ async fn world(name: &str) -> W {
     world_cfg(name, |_| {}).await
 }
 
+/// Мир источника; режим идей — `propose` M5.7: [`src`] предлагает идею вопросом, а в режиме
+/// `review` (M6.5 §7) `propose` новой идеи — 409.
 async fn world_cfg(name: &str, tweak: impl FnOnce(&mut zam_server::config::ServerConfig)) -> W {
-    let w = common::reports::world_cfg(name, tweak).await;
+    let w = common::reports::world_cfg(name, |c| {
+        c.ideas.default_mode = zam_server::config::IdeasMode::Propose;
+        tweak(c);
+    })
+    .await;
     free(&w.a, Some(TEST_FREE));
     w
 }

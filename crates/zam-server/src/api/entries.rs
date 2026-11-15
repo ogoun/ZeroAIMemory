@@ -21,9 +21,11 @@
 //! `open`/`answered` вопроса — 409 `possible-duplicate` (`force` пишет всё равно); `PATCH` —
 //! `data` пока `open` и `status: obsolete` с `reason`; ответ — `POST /entries/{id}/answer`.
 //! `kind: idea` — идея (M5.7, [`super::ideas`]): в решении и Knowledge; `data.origin` у токена
-//! обязателен, у WebUI — всегда `human`; `PATCH status` — 422, содержимое — только в `new` и
-//! `deferred` (иначе 409); токен по идее человека — 403 `idea-human-owned`, кроме `append_body`
-//! (и на `DELETE`); лента — фильтры `origin`, `priority`; `GET` — ещё `task` и `question`.
+//! обязателен, у WebUI — всегда `human`; `PATCH status` — 422, содержимое — только в `new`,
+//! `deferred` и `returned` (иначе 409); токен по идее человека — 403 `idea-human-owned`, кроме
+//! `append_body` (и на `DELETE`); правка человеком (сессия WebUI или токен с `by: human`, M6.5
+//! §6) заголовка или тела возвращённой идеи переводит её в `new`; лента — фильтры `origin`,
+//! `priority`; `GET` — ещё `task` и `question`.
 //! `kind: report` — отчёт (M5.5, [`super::reports`]): `multipart/form-data` или JSON с
 //! `images`, только агентом и только в решении; ответ — `{id, url}`.
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
@@ -48,8 +50,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use zam_core::{Id, TargetKind};
 use zam_store::{
-    Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, NewEntry, SpaceKind,
-    create_entry, delete_entry, entry_by_idempotency_key, entry_revisions, list_entries,
+    AnswerBy, Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, NewEntry,
+    SpaceKind, create_entry, delete_entry, entry_by_idempotency_key, entry_revisions, list_entries,
     restore_entry, update_entry, usage_counts,
 };
 
@@ -746,6 +748,30 @@ pub struct Patch {
     message: Option<String>,
     /// Новый набор ссылок на файлы `{files: [...]}` целиком (M4.5 §6.1); ревизии не создаёт.
     refs: Option<Value>,
+    /// Только токен и только с правкой идеи (`title`, `body`, `append_body`; M6.5 §6): чья это
+    /// правка — `human` (агент записывает слова человека из чата: возвращённая идея снова идёт
+    /// на разбор) или `agent` (по умолчанию). Сессия WebUI — всегда человек.
+    by: Option<AnswerBy>,
+}
+
+/// `by` правки (M6.5 §6): только у токена и только вместе с правкой заголовка или тела идеи,
+/// иначе 422.
+fn check_patch_by(p: &Principal, e: &Entry, req: &Patch) -> Result<(), ApiError> {
+    if req.by.is_none() {
+        return Ok(());
+    }
+    if p.is_human() {
+        return Err(unprocessable(
+            "by: только у токена агента — правка из WebUI и так правка человека",
+        ));
+    }
+    let edit = req.title.is_some() || req.body.is_some() || req.append_body.is_some();
+    if e.kind != EntryKind::Idea || !edit {
+        return Err(unprocessable(
+            "by: только у правки идеи — вместе с title, body или append_body",
+        ));
+    }
+    Ok(())
 }
 
 /// Смена статуса task: переходы §3 M4.5; переоткрытие без `reason` — 422 `reason-required`.
@@ -873,6 +899,10 @@ pub async fn patch(
     deny_report_mutation(&p, &sc)?;
     let rev = Some(if_match(&headers)?);
     let req: Patch = json_body(body)?;
+    check_patch_by(&p, &sc.entry, &req)?;
+    // правку сделал человек: сессия WebUI или слова человека токеном (`by: human`, M6.5 §6) —
+    // возвращённая идея снова идёт на разбор
+    let human_edit = p.is_human() || req.by == Some(AnswerBy::Human);
     // токен по идее человека — только дополнение `append_body` (M5.7 §7.1), до записи
     let content = req.title.is_some()
         || req.body.is_some()
@@ -956,9 +986,7 @@ pub async fn patch(
         reason: req.reason,
         triggers,
         refs,
-        // M6.5: значение выставит задача 3 (маршрут разбора идей) — `true` у сессии WebUI и у
-        // токена с `by: human`; до неё правка из WebUI возвращённую идею в `new` не переводит
-        human_edit: false,
+        human_edit,
     };
     let before = sc.entry.rev;
     let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;

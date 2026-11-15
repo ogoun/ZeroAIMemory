@@ -60,6 +60,8 @@ async fn heavy_sh05_digest_complete_hybrid() {
         ml(c, MINILM);
         external(c, &q);
         c.recall.timeout_ms = 30_000;
+        // мир предлагает идею вопросом — режим идей M5.7 `propose` (в `review` M6.5 — 409)
+        c.ideas.default_mode = zam_server::config::IdeasMode::Propose;
     })
     .await;
     vector_ready(&a).await;
