@@ -956,7 +956,8 @@ pub async fn patch(
         reason: req.reason,
         triggers,
         refs,
-        // правка человеком (сессия WebUI, токен с `by: human`) — с маршрутом разбора идей M6.5
+        // M6.5: значение выставит задача 3 (маршрут разбора идей) — `true` у сессии WebUI и у
+        // токена с `by: human`; до неё правка из WebUI возвращённую идею в `new` не переводит
         human_edit: false,
     };
     let before = sc.entry.rev;

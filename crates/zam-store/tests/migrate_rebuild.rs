@@ -591,7 +591,15 @@ fn master_objects(c: &Connection) -> BTreeSet<MasterObject> {
 /// Строка `entries`: id, вид, статус, `data`, `idempotency_key`, ревизия.
 type EntryRow = (String, String, Option<String>, String, Option<String>, i64);
 
-/// Строки `entries`, которые миграция обязана перенести как есть.
+/// Строки `entries` всеми столбцами по порядку (`SELECT *`, как [`all_rows`]): пересборка
+/// таблицы переносит каждый столбец на своё место — перепутанные соседние столбцы в `INSERT …
+/// SELECT` здесь видны, а в [`entry_rows`] — нет.
+fn entry_rows_full(c: &Connection) -> Vec<String> {
+    all_rows(c, "SELECT * FROM entries ORDER BY id")
+}
+
+/// Строки `entries`, которые миграция обязана перенести как есть (поля для проверок по смыслу;
+/// перенос столбцов целиком — [`entry_rows_full`]).
 fn entry_rows(c: &Connection) -> Vec<EntryRow> {
     let mut st = c
         .prepare(
@@ -786,10 +794,15 @@ async fn migrate_0024_keeps_report_triggers_and_rows() {
         let db = Db::open(&path, &USER_MIGRATIONS[..23]).unwrap();
         fill_m56(&db).await
     };
-    let (counts_before, objects_before, rows_before) = {
+    let (counts_before, objects_before, rows_before, full_before) = {
         let c = conn(&path);
         assert_eq!(user_version(&c), 23);
-        (table_counts(&c), master_objects(&c), entry_rows(&c))
+        (
+            table_counts(&c),
+            master_objects(&c),
+            entry_rows(&c),
+            entry_rows_full(&c),
+        )
     };
     assert!(rows_before.len() >= 7);
     assert!(
@@ -829,8 +842,12 @@ async fn migrate_0024_keeps_report_triggers_and_rows() {
     assert_eq!(version, 24);
     assert_eq!(violations, 0, "foreign_key_check не пуст");
     assert!(fk, "foreign_keys выключены после миграции");
-    // строки (в том числе Idempotency-Key) и счётчики всех таблиц
+    // строки (в том числе Idempotency-Key; все столбцы на своих местах) и счётчики всех таблиц
     assert_eq!(rows_after, rows_before);
+    assert_eq!(
+        db.read(|c| Ok(entry_rows_full(c))).await.unwrap(),
+        full_before
+    );
     for (t, n) in counts_before.iter().filter(|(t, _)| t.as_str() != "meta") {
         assert_eq!(counts_after.get(t), Some(n), "таблица {t}");
     }
@@ -1636,13 +1653,14 @@ async fn migrate_0026_from_m6_db() {
         fill_m6(&db).await;
         rep
     };
-    let (counts_before, objects_before, rows_before, imported_before) = {
+    let (counts_before, objects_before, rows_before, full_before, imported_before) = {
         let c = conn(&path);
         assert_eq!(user_version(&c), 25);
         (
             table_counts(&c),
             master_objects(&c),
             entry_rows(&c),
+            entry_rows_full(&c),
             all_rows(&c, IMPORTED),
         )
     };
@@ -1678,8 +1696,13 @@ async fn migrate_0026_from_m6_db() {
         .unwrap();
     assert_eq!(checks, (26, 0, true, "ok".to_string()));
     assert_eq!(checks.0, USER_MIGRATIONS.len() as u32);
-    // строки (в том числе Idempotency-Key и `imported_from`) и счётчики всех таблиц
+    // строки (в том числе Idempotency-Key и `imported_from`; все столбцы на своих местах) и
+    // счётчики всех таблиц
     assert_eq!(rows_after, rows_before);
+    assert_eq!(
+        db.read(|c| Ok(entry_rows_full(c))).await.unwrap(),
+        full_before
+    );
     assert_eq!(imported_after, imported_before);
     for (t, n) in counts_before.iter().filter(|(t, _)| t.as_str() != "meta") {
         assert_eq!(counts_after.get(t), Some(n), "таблица {t}");
@@ -1702,7 +1725,7 @@ async fn migrate_0026_from_m6_db() {
     {
         let c = conn(&bak);
         assert_eq!(user_version(&c), 25);
-        assert_eq!(entry_rows(&c), rows_before);
+        assert_eq!(entry_rows_full(&c), full_before);
     }
 
     assert_report_triggers(&db, report, &sha).await;

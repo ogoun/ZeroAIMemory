@@ -475,7 +475,9 @@ fn insert_revision(
 }
 
 /// Новая ревизия `cur.rev + 1` с полями `f`: строка записи, ревизия, чанки и задание
-/// `upsert` (payload меняется и при смене одного статуса или `certainty`).
+/// `upsert` (payload меняется и при смене одного статуса или `certainty`). Выход идеи из
+/// `returned` `save` снимает сам — записанная `data` тогда без `returned_at`, чем и отличается
+/// от переданной (`ideas::returned_exit_data`, M6.5 §6).
 pub(crate) fn save(
     c: &Connection,
     cur: &Entry,

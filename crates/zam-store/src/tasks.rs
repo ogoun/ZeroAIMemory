@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use zam_core::Id;
 
 use crate::entries::{EntryKind, EntryStatus, load_entry};
-use crate::ideas::IdeaPriority;
+use crate::ideas::{IdeaPriority, priority_opt};
 use crate::time::{fmt_ts, ser_ts};
 use crate::{Db, StoreError};
 
@@ -105,18 +105,6 @@ fn text_field(v: &Value, field: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// `priority`: `null` — снять, иначе `low | normal | high`.
-fn priority_field(v: &Value) -> Result<Option<IdeaPriority>, String> {
-    const ERR: &str = "data.priority: low, normal или high";
-    match v {
-        Value::Null => Ok(None),
-        Value::String(s) => IdeaPriority::parse(s.trim())
-            .map(Some)
-            .ok_or_else(|| ERR.into()),
-        _ => Err(ERR.into()),
-    }
-}
-
 pub(crate) fn links_field(v: &Value) -> Result<Vec<String>, String> {
     if v.is_null() {
         return Ok(Vec::new());
@@ -160,7 +148,7 @@ impl TaskData {
             started_at: get("started_at").and_then(|v| v.as_str()?.parse().ok()),
             done_at: get("done_at").and_then(|v| v.as_str()?.parse().ok()),
             estimate_min: get("estimate_min").and_then(|v| u32::try_from(v.as_u64()?).ok()),
-            priority: get("priority").and_then(|v| priority_field(v).ok().flatten()),
+            priority: get("priority").and_then(|v| priority_opt(v).ok().flatten()),
         }
     }
 
@@ -207,7 +195,7 @@ impl TaskData {
                         ),
                     }
                 }
-                "priority" => next.priority = priority_field(v)?,
+                "priority" => next.priority = priority_opt(v)?,
                 _ => unreachable!("ключи проверены выше"),
             }
         }

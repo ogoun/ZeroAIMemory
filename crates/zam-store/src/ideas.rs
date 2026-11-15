@@ -352,13 +352,22 @@ const SERVER_KEYS: [&str; 11] = [
 pub const IDEA_ORIGIN_REQUIRED: &str = "data.origin: укажите human — идея человека (записана по его \
                                словам) или agent — своя";
 
-fn priority_field(v: &Value) -> Result<IdeaPriority, String> {
+/// `data.priority` идеи и задачи (M6.5 §5 — одно правило и один текст ошибки): `null` — нет
+/// значения, строка `low | normal | high`, иное — ошибка поля.
+pub(crate) fn priority_opt(v: &Value) -> Result<Option<IdeaPriority>, String> {
+    const ERR: &str = "data.priority: low, normal или high";
     match v {
-        Value::Null => Ok(IdeaPriority::Normal),
+        Value::Null => Ok(None),
         Value::String(s) => IdeaPriority::parse(s.trim())
-            .ok_or_else(|| "data.priority: low, normal или high".into()),
-        _ => Err("data.priority: low, normal или high".into()),
+            .map(Some)
+            .ok_or_else(|| ERR.into()),
+        _ => Err(ERR.into()),
     }
+}
+
+/// `data.priority` идеи: без значения — `normal`.
+fn priority_field(v: &Value) -> Result<IdeaPriority, String> {
+    Ok(priority_opt(v)?.unwrap_or(IdeaPriority::Normal))
 }
 
 fn horizon_field(v: &Value) -> Result<Option<Date>, String> {
