@@ -6,9 +6,9 @@
 //!   (`PATCH /admin/settings`, WebUI — задача 13).
 //! - **Версия блока** — одна на сервер **[решение контроллера T11-a]**:
 //!   `max(AGENT_BLOCK_VERSION, agent_setup.version)`; каждое сохранение шаблона, которое меняет
-//!   его текст, увеличивает её на 1 ([`bump_version`]). Её отдаёт `GET /agent-setup`
+//!   его текст, увеличивает её на 1 ([`save_templates`]). Её отдаёт `GET /agent-setup`
 //!   (`version`), с ней сравнивают `/recall(session_start)` и `zam status`.
-//! - Токен не попадает ни в блок, ни в `.mcp.json` (`Bearer ${ZAM_TOKEN}`).
+//! - Токен не попадает ни в блок, ни в `.mcp.json` (stdio `zam mcp` берёт его сам).
 pub mod templates;
 
 use serde_json::{Value, json};
@@ -230,7 +230,9 @@ pub const CODEX_TOOLS: &str = "Bash|apply_patch";
 
 /// Фрагмент `.claude/settings.json` (§15.5, M4.5 §11): exec form, `timeout` в секундах — 1 у
 /// `pre-tool` и `post-tool` успеха (бюджет 50 мс, без сети), 2 у остальных. Ошибка инструмента
-/// — `PostToolUseFailure`, успех — `PostToolUse`; обе — одна команда `post-tool`.
+/// — `PostToolUseFailure`, успех — `PostToolUse`; обе — одна команда `post-tool`. Снимок сессии
+/// (M6 §8а): `PostCompact` (конспект сжатия) и `SessionEnd` (снимок и `ended_at`) — тоже
+/// `checkpoint`, без вывода.
 pub fn claude_settings() -> Value {
     let h = claude_hook;
     json!({"hooks": {
@@ -242,13 +244,16 @@ pub fn claude_settings() -> Value {
         "SubagentStart": group(None, h("subagent-start", 2)),
         "Stop": group(None, h("checkpoint", 2)),
         "PreCompact": group(None, h("checkpoint", 2)),
+        "PostCompact": group(None, h("checkpoint", 2)),
+        "SessionEnd": group(None, h("checkpoint", 2)),
     }})
 }
 
 /// Фрагмент `.codex/hooks.json`: тот же состав с `--agent codex`; `post-tool` — на
 /// `PostToolUse` (у Codex нет `PostToolUseFailure`: ошибка и успех различаются по
 /// `tool_response`), правки файлов Codex — инструмент `apply_patch` (matcher — regex)
-/// **[решение контроллера T11-b]**; `SubagentStart` — пакет под задачу (M4.5 §9.4).
+/// **[решение контроллера T11-b]**; `SubagentStart` — пакет под задачу (M4.5 §9.4); `SessionEnd`
+/// — снимок сессии и `ended_at` (M6 §8а; `PostCompact` у Codex конспекта не несёт).
 pub fn codex_hooks() -> Value {
     let h = codex_hook;
     json!({"hooks": {
@@ -259,26 +264,21 @@ pub fn codex_hooks() -> Value {
         "SubagentStart": group(None, h("subagent-start", 2)),
         "Stop": group(None, h("checkpoint", 2)),
         "PreCompact": group(None, h("checkpoint", 2)),
+        "SessionEnd": group(None, h("checkpoint", 2)),
     }})
 }
 
-/// Фрагмент `.mcp.json`: токен — из переменной `ZAM_TOKEN`, машина — из `ZAM_MACHINE`
-/// (`zam_core::MACHINE_ENV`; её задаёт команда установки `zam`, CLI и хуки берут ту же
-/// переменную первой — финальное ревью M4, M-4; пусто — сервер берёт последнюю сессию
-/// пользователя без учёта машины, R13). Имя самой машины в файл не пишется: `.mcp.json`
-/// бывает общим для машин в репозитории.
-pub fn mcp_json(url: &str, solution: Option<&SolutionRef>) -> Value {
-    let mut headers = json!({
-        "Authorization": "Bearer ${ZAM_TOKEN}",
-        "X-Zam-Machine": "${ZAM_MACHINE:-}",
-    });
-    if let Some(s) = solution {
-        headers["X-Zam-Solution"] = json!(s.guid);
-    }
+/// Фрагмент `.mcp.json` (Claude Code): stdio-сервер `zam mcp` (M6 §7.1, ревью задачи 3, I4).
+/// Подпроцесс агента — общий предок с хуками, поэтому `zam mcp` находит привязку к сессии,
+/// которую пишет `session-start`; у HTTP-транспорта сессии нет (MCP-процессу и в заголовки
+/// Claude Code id сессии не передаёт). Адрес, токен (`~/.zeroaimemory/config.toml` или `ZAM_TOKEN`),
+/// решение (`solution.toml`) и машину `zam` берёт сам, как остальные команды: в файле нет ни
+/// токена, ни имени машины — `.mcp.json` бывает общим для машин в репозитории.
+pub fn mcp_json() -> Value {
     json!({"mcpServers": {"zeroaimemory": {
-        "type": "http",
-        "url": format!("{url}/mcp"),
-        "headers": headers,
+        "type": "stdio",
+        "command": "zam",
+        "args": ["mcp"],
     }}})
 }
 
@@ -339,8 +339,9 @@ pub const TOKEN_PLACEHOLDER: &str = "<токен>";
 /// Команды установки `zam` с сервера (`GET /downloads/zam/{os}-{arch}`) (fix round 1, M-1, M-2):
 /// каталог в `Path` пользователя Windows добавляется один раз; на Linux — подсказка, если
 /// `~/.local/bin` нет в `PATH`. Токен `zam` и хуки берут из `~/.zeroaimemory/config.toml`
-/// (его пишет `zam init --token`, права 0600); `ZAM_TOKEN` нужна только MCP по HTTP — на
-/// Windows она задаётся в окружении пользователя (`token` — открытый текст только при выпуске
+/// (его пишет `zam init --token`, права 0600), их же — `zam mcp` (`.mcp.json` M6); `ZAM_TOKEN`
+/// нужна только MCP по HTTP (Codex `config.toml`, старый `.mcp.json`) — на Windows она задаётся
+/// в окружении пользователя (`token` — открытый текст только при выпуске
 /// токена администратором, иначе заглушка).
 pub fn install(url: &str, token: Option<&str>) -> Value {
     let t = ps_quote(token.unwrap_or(TOKEN_PLACEHOLDER));
@@ -349,18 +350,18 @@ pub fn install(url: &str, token: Option<&str>) -> Value {
         "$d = \"$env:LOCALAPPDATA\\Programs\\zam\"; New-Item -ItemType Directory -Force $d | Out-Null\n\
          Invoke-WebRequest {win_url} -OutFile \"$d\\zam.exe\"\n\
          $p = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($p -split ';') -notcontains $d) {{ [Environment]::SetEnvironmentVariable('Path', $(if ($p) {{ \"$p;$d\" }} else {{ $d }}), 'User') }}\n\
-         # MCP по HTTP (.mcp.json) берёт токен из ZAM_TOKEN; zam и хуки — из ~/.zeroaimemory/config.toml (zam init --token)\n\
+         # zam, хуки и zam mcp (.mcp.json) берут токен из ~/.zeroaimemory/config.toml (zam init --token); ZAM_TOKEN — для MCP по HTTP\n\
          [Environment]::SetEnvironmentVariable('ZAM_TOKEN', {t}, 'User')\n\
-         # имя машины для X-Zam-Machine — одно для zam, хуков и .mcp.json\n\
+         # имя машины для X-Zam-Machine — одно для zam, хуков и MCP\n\
          [Environment]::SetEnvironmentVariable('ZAM_MACHINE', $env:COMPUTERNAME, 'User')\n"
     );
     let lin_url = sh_quote(&format!("{url}/downloads/zam/linux-x64"));
     let linux = format!(
         "mkdir -p ~/.local/bin && curl -fsSL {lin_url} -o ~/.local/bin/zam && chmod +x ~/.local/bin/zam\n\
          case \":$PATH:\" in *\":$HOME/.local/bin:\"*) ;; *) echo 'Добавьте ~/.local/bin в PATH' ;; esac\n\
-         # токен: zam init --token сохранит его в ~/.zeroaimemory/config.toml (права 0600); MCP по HTTP\n\
-         # (.mcp.json) берёт его из ZAM_TOKEN — задайте её в окружении агента в файле, доступном только вам\n\
-         # имя машины для X-Zam-Machine — одно для zam, хуков и .mcp.json\n\
+         # токен: zam init --token сохранит его в ~/.zeroaimemory/config.toml (права 0600) — для zam,\n\
+         # хуков и zam mcp; MCP по HTTP берёт его из ZAM_TOKEN — задайте её в файле, доступном только вам\n\
+         # имя машины для X-Zam-Machine — одно для zam, хуков и MCP\n\
          [ -n \"$ZAM_MACHINE\" ] || echo \"Добавьте в профиль оболочки: export ZAM_MACHINE=$(uname -n)\"\n"
     );
     json!({"windows": windows, "linux": linux})

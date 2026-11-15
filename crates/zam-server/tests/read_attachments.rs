@@ -289,11 +289,13 @@ async fn read_attachment_toc_without_locator() {
     assert!(!t.contains("ниобий"), "оглавление ограничено: {t}");
     assert!(t.contains("ещё"), "{t}");
     let tokens = it["tokens"].as_u64().unwrap();
+    // без модели — несмещённая оценка (M6, задача 5, повторное ревью I-2)
     assert!(tokens < 4000, "оглавление {tokens} токенов");
     a.st.shutdown().await;
 }
 
 /// `locator` у заметки, записи журнала и пути — 422 `/problems/locator-invalid`.
+
 #[tokio::test]
 async fn read_note_with_locator_422() {
     let a = api("read-note-locator", |_| {}).await;
@@ -587,7 +589,9 @@ async fn read_attachment_access_like_missing() {
     };
     let missing = [
         "a:0123456789abcdef0123456789abcdef".to_string(),
-        format!("b:{}", "0".repeat(64)),
+        // буквы и цифры, как у настоящего sha256: стоимость `~N tok` без модели — по классам
+        // символов (M6, задача 5), у одних цифр она другая
+        format!("b:{}", "0f".repeat(32)),
         format!("d:{}", Id::new()),
     ];
     // ответ на ссылку `r` — тело элемента без самой ссылки
@@ -618,10 +622,11 @@ async fn read_attachment_access_like_missing() {
     for (who, list) in cases.iter() {
         for r in list.iter().chain(missing.iter()) {
             for loc in [None, Some("slide:1")] {
-                // `~N tok` зависит от длины ссылки: сравнение — с несуществующей того же вида
-                let same = missing.iter().find(|m| m[..2] == r[..2]).unwrap();
+                // `~N tok` зависит от вида символов ссылки: сравнение — с несуществующей того же
+                // вида (`common::ghost_like`)
+                let same = common::ghost_like(r);
                 let got = shape(who, r, loc).await;
-                let want = shape(who, same, loc).await;
+                let want = shape(who, &same, loc).await;
                 assert_eq!(got, want, "{r} {loc:?}");
                 assert!(!got.0.contains(&k) && !got.0.contains(&h), "{got:?}");
                 assert!(!got.1.contains(&owner.to_string()), "{got:?}");

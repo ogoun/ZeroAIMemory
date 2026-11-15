@@ -1441,7 +1441,9 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         insights: eval.join("insights.toml"),
         hints: eval.join("hints.toml"),
         scenarios: eval.join("scenarios.toml"),
+        docs: eval.join("docs"),
         glossary: eval.join("glossary.toml"),
+        sessions_corpus: eval.join(crate::eval::corpus::SESSIONS_CORPUS_DIR),
         results: a.out.clone().unwrap_or_else(|| eval.join("results")),
         // абсолютный: сервер запускается из каталога бинарника
         work: match &a.work {

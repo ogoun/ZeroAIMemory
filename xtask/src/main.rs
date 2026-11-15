@@ -1,5 +1,6 @@
 //! Вспомогательные задачи сборки: `cargo xtask <команда>`.
 
+mod ab;
 mod bench;
 mod bundles;
 mod changelog;
@@ -11,6 +12,7 @@ mod manifest;
 mod package;
 mod procjob;
 mod smoke;
+mod transfer_check;
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +31,9 @@ struct Cli {
     cmd: Cmd,
 }
 
+// аргументы разбираются один раз на запуск: размер вариантов значения не имеет (боксинг
+// `EvalArgs` лишь сдвинул бы предупреждение на `Package`)
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Скачать зависимости поставки (Qdrant, ONNX Runtime CPU и GPU, pdfium) в target/deps/<платформа>/;
@@ -112,6 +117,9 @@ enum Cmd {
         #[arg(long, value_enum)]
         expect_device: Option<smoke::DeviceKind>,
     },
+    /// Агентный A/B (M6 §12): отчёт по плечам с интервалами из транскриптов агента (только
+    /// поля usage), меток eval/ab/runs.toml и GET /sessions/{id} сервера
+    Ab(ab::AbArgs),
     /// Eval качества поиска (ТЗ §18.2): корпус eval/, метрики recall@5, MRR@10, nDCG@10
     /// по режимам и видам запросов; --quality-gate — int8 против fp32; --grid — подбор весов
     Eval(eval::EvalArgs),
@@ -122,6 +130,10 @@ enum Cmd {
     /// .tmp/m56/bench/repo, синхронизации, карта 200/500/1000/2000, ключевые типы в центральных,
     /// `zam --version` и запуск фоновой синхронизации (p95); отчёт .tmp/m56/bench/report.json
     CodeBench(code_bench::CodeBenchArgs),
+    /// Проверка переезда на другую машину (M6 §12б.6, задача 18c): seed — корпус и ожидания
+    /// на старом сервере, verify — те же данные на новом после restore (--no-key — без
+    /// мастер-ключа), bindings — базы без прежнего data_dir и имени машины
+    TransferCheck(transfer_check::TransferCheckArgs),
     /// Набор документов eval/docs/ (спецификация M5 §6): DOCX, XLSX, PPTX, PDF и враждебные
     /// файлы детерминированно из сида; бинарники не в git
     DocsCorpus(docs_corpus::DocsCorpusArgs),
@@ -285,7 +297,8 @@ fn fetch_models(ids: Vec<String>, test: bool, accept_nc: bool) -> Result<()> {
 
 /// Модель, токенизатор которой нужен тестам бюджета блока инструкции (§14.2: ≤ 500 токенов по
 /// счётчику модели; `zam-server/tests/agent_setup.rs`).
-const TEST_TOKENIZER_MODEL: &str = "bge-m3-int8";
+/// Тот же файл входит в комплект сервера ([`package::BUNDLED_TOKENIZER_MODEL`]).
+const TEST_TOKENIZER_MODEL: &str = package::BUNDLED_TOKENIZER_MODEL;
 /// Каталог одиночных токенизаторов в `target/models`: `tokenizers/<id>/tokenizer.json` — без
 /// весов и `model.toml`, поэтому модель не считается установленной.
 const TEST_TOKENIZERS_DIR: &str = "tokenizers";
@@ -317,6 +330,39 @@ fn fetch_test_tokenizer(manifest: &ModelsManifest, models: &Path) -> Result<()> 
         }
     );
     Ok(())
+}
+
+/// `tokenizer.json` для комплекта сервера (M6, задача 5, решение владельца 2026-11-06): тот же
+/// файл, что качает `fetch-models --test` (`target/models/tokenizers/<id>/`), с проверкой
+/// размера и SHA-256 по `deploy/models.toml` — подменённый или старый файл в комплект не попадёт.
+fn bundled_tokenizer(root: &Path) -> Result<PathBuf> {
+    let manifest = ModelsManifest::load(&root.join("deploy").join(MODELS_MANIFEST))?;
+    let m = manifest.get(TEST_TOKENIZER_MODEL)?;
+    let f = m
+        .files
+        .iter()
+        .find(|f| f.path == "tokenizer.json")
+        .with_context(|| format!("{TEST_TOKENIZER_MODEL}: нет tokenizer.json в манифесте"))?;
+    let path = root
+        .join("target")
+        .join("models")
+        .join(TEST_TOKENIZERS_DIR)
+        .join(&m.id)
+        .join("tokenizer.json");
+    let hint = "cargo xtask fetch-models --test";
+    let len = std::fs::metadata(&path)
+        .with_context(|| format!("нет {} ({hint})", path.display()))?
+        .len();
+    let sum = fetch::sha256_file(&path)?;
+    if len != f.size || !sum.eq_ignore_ascii_case(&f.sha256) {
+        bail!(
+            "{}: размер {len} / sha256 {sum} не совпадают с deploy/models.toml ({} / {}); удалите файл и выполните {hint}",
+            path.display(),
+            f.size,
+            f.sha256
+        );
+    }
+    Ok(path)
 }
 
 /// Аргументы `cargo xtask package`.
@@ -365,8 +411,7 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
                 package::other_platform(&platform)
             );
         }
-        let licenses = target.join("licenses");
-        package::generate_licenses(&root, &licenses)?;
+        let licenses = package::generate_licenses(&root, &target.join("licenses"))?;
         let crt = if platform.starts_with("windows") {
             Some(package::find_crt_dir(a.flavor)?)
         } else {
@@ -374,6 +419,7 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
         };
         let qv = package::qdrant_version(&deploy)?;
         let license = root.join("LICENSE");
+        let tokenizer = bundled_tokenizer(&root)?;
         archives.extend(package::package(&package::Inputs {
             platform: &platform,
             version: &a.version,
@@ -383,10 +429,12 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
             other_cli_bin: a.cli_other.as_deref(),
             deps_dir: &deps,
             deploy_dir: &deploy,
-            generated_licenses_dir: &licenses,
+            generated_licenses_dir: &licenses.server_dir,
+            cli_rust_licenses: &licenses.cli_rust,
             project_license: &license,
             crt_dir: crt.as_deref(),
             qdrant_version: &qv,
+            tokenizer: &tokenizer,
             out_dir: &dist,
         })?);
     }
@@ -481,11 +529,13 @@ fn run(cmd: Cmd) -> Result<()> {
             &repo_root(),
         ),
         Cmd::SmokeCuda { archive } => smoke::run_cuda(&archive, &repo_root()),
+        Cmd::Ab(a) => ab::main(a),
         Cmd::Eval(a) => eval::main(a, &repo_root()),
         Cmd::DocsCorpus(a) => docs_corpus::main(a, &repo_root()),
         Cmd::DocsExtract(a) => eval::docs::extract::child_main(a, &repo_root()),
         Cmd::Bench(a) => bench::main(a, &repo_root()),
         Cmd::CodeBench(a) => code_bench::main(a, &repo_root()),
+        Cmd::TransferCheck(a) => transfer_check::main(a, &repo_root()),
     }
 }
 

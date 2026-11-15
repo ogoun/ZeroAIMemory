@@ -7,10 +7,13 @@
 //! (`answer_cache`, `cache_deps`; M4), ссылки на файлы решения (`file_refs`; M4.5), вложения как
 //! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5), отчёты (вид записи
 //! `report`, файлы `entry_attachments`; M5.5), карта кода решения (`code_*`, ссылки на символы;
-//! M5.6), журнал идей (вид записи `idea`; M5.7).
+//! M5.6), журнал идей (вид записи `idea`; M5.7), эпохи выданного сессии, учёт без сессии и
+//! снимки сессий (`session_snapshots`; M6).
 
 pub mod access;
+pub mod archive;
 pub mod attachments;
+pub mod backup;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
@@ -19,18 +22,23 @@ pub mod datadir;
 pub mod db;
 pub mod embeddings;
 pub mod entries;
+pub mod export;
 pub mod file_refs;
 pub mod glossary;
 pub mod graph;
 pub mod ideas;
+pub mod import;
 pub mod jobs;
 pub mod links;
 pub mod migrate;
 pub mod nodes;
 pub mod paths;
 pub mod questions;
+mod schema_repair;
 pub mod search;
+mod secrets_delta;
 pub mod sessions;
+pub mod snapshots;
 pub mod solution_registry;
 pub mod system;
 pub mod tasks;
@@ -54,6 +62,11 @@ pub use attachments::{
     reindex_attachments_page, reindex_docs, replace_attachment_chunks, requeue_failed_with,
     set_extract_state, sync_doc_limits,
 };
+pub use backup::{
+    BACKUP_FLAG_FILE, BackupFlag, BackupFlagHold, Chunkers, OpenMode, backup_flag_active,
+    backup_flag_path, hold_backup_flag, integrity_ok, meta_value, set_backup_flag_max_age,
+    vacuum_into,
+};
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_by_sha,
     blob_meta_by_sha_in_space, blob_meta_in_space, resolve_attachment,
@@ -69,8 +82,11 @@ pub use certainty::{
     CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,
     default_certainty,
 };
-pub use datadir::{DataDir, MAX_DATA_DIR_CHARS_WINDOWS, check_data_dir_len};
-pub use db::{Db, DbOptions};
+pub use datadir::{
+    DataDir, DirLock, LockMark, MAX_DATA_DIR_CHARS_WINDOWS, RESTORE_INCOMPLETE_FILE,
+    RESTORE_MARK_FILE, check_data_dir_len, lock_mark, restore_incomplete, try_lock_dir,
+};
+pub use db::{Db, DbOptions, LongReader};
 pub use embeddings::{
     Embedding, adopt_owned_embeddings, adopt_owned_embeddings_batch, embed_input_of, embed_key_of,
     gc_embeddings, get_embeddings, prune_owned_embeddings, put_embeddings, put_owned_embeddings,
@@ -85,8 +101,12 @@ pub use entries::{
     entry_attachments, entry_by_idempotency_key, entry_chunks_for_index, entry_revisions,
     entry_triggers, find_release_by_version, finish_entries_reindexed, first_images, get_entry,
     has_certainty, initial_status, is_entry_ref_letter, list_entries, normalize_area,
-    normalize_title, reindex_entries_page, restore_entry, retract_entry, set_triggers,
-    supersede_entry, title_duplicates, update_entry, validate_trigger,
+    normalize_title, reindex_entries_page, report_blob_meta_by_sha, restore_entry, retract_entry,
+    set_triggers, supersede_entry, title_duplicates, update_entry, validate_trigger,
+};
+pub use export::{
+    EntryDump, ExportSelect, NodeRevision, NoteAttachment, RefRow, SpaceReader, export_space,
+    under_prefix,
 };
 pub use file_refs::{
     ChangedFile, FileRef, PathError, PathRefs, RefItem, RefState, VerifiedNote, check_commit,
@@ -114,16 +134,18 @@ pub use jobs::{
     claim_jobs, complete_job, defer_job, enqueue_reindex, enqueue_upserts, fail_job, failed_jobs,
     finish_reindexed, folder_embed_input, folders_for_index, give_up_job, indexable_count,
     indexed_count, job_stats, mark_reindex, pending_reindex, reindex_page, release_job,
-    requeue_running, requeue_running_extract, set_index_state,
+    requeue_running, requeue_running_extract, set_index_state, set_reindex_pending,
 };
 pub use migrate::Migration;
 pub use nodes::{
-    Attribution, AuthorKind, NewNote, Node, NodeKind, PREFIX_L0_MAX_TOKENS, RevisionInfo,
-    WriteError, chunk_params, count_tokens, create_folder, create_note, delete_node,
-    entry_snapshot_text, find_by_name, get_node, get_node_by_path, list_children, list_revisions,
-    list_trash, move_node, node_content, patch_note, patch_note_within, prefix_l0, restore_node,
-    revert_note, set_auto_l0, set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter,
-    token_counter_exact, unified_diff, update_note,
+    Attribution, AuthorKind, BudgetCounterKind, NewNote, Node, NodeKind, PREFIX_L0_MAX_TOKENS,
+    RevisionInfo, WriteError, budget_cap, budget_counter_kind, budget_tokenizer_id, chunk_params,
+    count_tokens, count_tokens_chunker, create_folder, create_note, create_note_keyed, delete_node,
+    entry_snapshot_text, find_by_name, fits_budget, get_node, get_node_by_path, list_children,
+    list_revisions, list_trash, move_node, node_content, patch_note, patch_note_keyed,
+    patch_note_within, prefix_l0, restore_node, revert_note, set_auto_l0, set_bundled_counter,
+    set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter, token_counter_exact,
+    unified_diff, update_note, update_note_keyed,
 };
 pub use paths::{NodePath, path_ancestors};
 pub use questions::{
@@ -133,17 +155,23 @@ pub use questions::{
     days_ago, open_questions, question_duplicates, recent_answered,
 };
 pub use search::{
-    AliasGroup, AttachmentHit, ChunkScope, EntryHit, FolderRow, FtsChannels, FtsHit, FtsQuery,
-    LeafChunk, LeafHit, MARK_END, MARK_START, TargetFilter, first_leaves, leaf_term_hits,
-    leaves_of_targets, live_chunks, live_folders, neighbor_leaves, node_leaves, pending_count,
-    query_needles, query_terms, sanitize_fts, search_fts, search_fts_channels, text_snippet,
+    AliasGroup, AttachmentHit, ChunkScope, EntryHit, FocusLeaf, FolderRow, FtsChannels, FtsHit,
+    FtsQuery, LeafChunk, LeafHit, LightSearch, MARK_END, MARK_START, TargetFilter, first_leaves,
+    focus_leaves, leaf_term_hits, leaves_of_targets, live_chunks, live_folders, neighbor_leaves,
+    node_leaves, pending_count, query_needles, query_terms, sanitize_fts, search_fts,
+    search_fts_channels, search_fts_channels_light, text_snippet,
 };
 pub use sessions::{
     RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,
     TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
-    add_tokens, check_session_id, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, mark_seen_with_tokens, seen_entry_ids, seen_revs, session_tokens,
-    touch_session,
+    add_tokens, bump_epoch, check_session_id, end_session, gc_sessions, get_session,
+    latest_session, list_sessions, mark_seen, mark_seen_with_tokens, register_session,
+    seen_entry_ids, seen_revs, seen_revs_any_epoch, session_epoch, session_holdout, session_tokens,
+    sessions_tokens, set_holdout, touch_session,
+};
+pub use snapshots::{
+    SnapTask, SnapshotRow, digest_snapshot, gc_snapshots, get_snapshot, put_snapshot,
+    snapshot_tasks, snapshot_times, writes_after,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{
@@ -155,8 +183,8 @@ pub use tasks::{
     check_task, check_task_transition, claim_task, claimed_tasks, release_task,
 };
 pub use usage::{
-    UsageCounts, UsageEvent, UsageKind, UsageSource, record_usage, record_usages, usage_counts,
-    usage_counts_many,
+    UnattributedRow, UsageCounts, UsageEvent, UsageKind, UsageSource, add_unattributed,
+    record_usage, record_usages, unattributed_tokens, usage_counts, usage_counts_many,
 };
 pub use user_db::{
     RechunkNotice, RechunkProgress, RechunkReason, Space, SpaceKind, USER_MIGRATIONS, UserDbs,
@@ -207,6 +235,13 @@ pub enum StoreError {
     Certainty(#[from] CertaintyError),
     #[error("каталог данных уже используется другим экземпляром zam-server: {}", .0.display())]
     DataDirLocked(std::path::PathBuf),
+    /// В каталоге данных прервано `zam-server restore` (M6 §12б.3): данные неполны.
+    #[error(
+        "восстановление каталога данных {} не завершено: повторите zam-server restore \
+         <копия> --replace (прежние данные — в backups/pre-restore-…)",
+        .0.display()
+    )]
+    RestoreIncomplete(std::path::PathBuf),
     /// Windows: путь каталога данных так длинен, что файлы внутри него (базы SQLite, их
     /// копии перед миграцией, рабочий каталог Qdrant) выходят за MAX_PATH (260).
     #[error(

@@ -450,9 +450,13 @@ impl Proj {
             .unwrap()
     }
 
-    /// `zam hook <kind> --agent <agent>` с событием на stdin.
+    /// `zam hook <kind> --agent <agent>` с событием на stdin, со
+    /// щедрым бюджетом (`ZAM_TEST_HOOK_BUDGET_MS`): критерий приёмки — содержимое, а с бюджетом
+    /// продукта отладочная сборка на занятой машине молчит (fail-open); время и бюджеты проверяют
+    /// `hooks` и release `hook_budgets` (ревью 17b-http M6).
     fn hook_as(&self, agent: &str, kind: &str, v: &Value) -> Output {
         self.cmd()
+            .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
             .args(["hook", kind, "--agent", agent])
             .write_stdin(v.to_string().into_bytes())
             .output()
@@ -880,9 +884,8 @@ fn glossary_ru_en() {
     );
     assert!(t.contains("term_alias: «summary» → «Выжимка»"), "{t}");
     // подсказка термина к промпту и строка словаря в дайджесте
-    let term_line = format!(
-        "ZeroAIMemory: термин «Выжимка» — Краткое изложение найденного для агента — t:{tid}"
-    );
+    let term_line =
+        format!("ZeroAIMemory: термин «Выжимка» — Краткое изложение найденного для агента t:{tid}");
     for (agent, s) in [("claude", "wm-g1"), ("codex", "wm-g2")] {
         let d = p.session_start_until(agent, s, "startup", |c| !c.is_empty());
         assert!(
@@ -988,7 +991,7 @@ fn file_change_marks_stale() {
     assert_eq!(
         c,
         format!(
-            "ZeroAIMemory: о файле src/a.rs в памяти: {TITLE} [insight, возможно устарело] — i:{iid}"
+            "ZeroAIMemory: о файле src/a.rs в памяти: {TITLE} [insight·возможно устарело] i:{iid}"
         )
     );
     let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-a\n+b\n*** End Patch\n";

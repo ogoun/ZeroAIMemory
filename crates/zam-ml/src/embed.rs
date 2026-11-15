@@ -322,6 +322,36 @@ impl Embedder {
         Ok(e)
     }
 
+    /// Эмбеддинги нескольких запросов одним захватом сессии запросов — для явного фокуса
+    /// `/read` (M6 §6): без LRU-кэша запросов (пакетный вектор с паддингом может отличаться от
+    /// одиночного). Модели с `dynamic_quant` (CPU int8) — по одному тексту без паддинга, как в
+    /// [`Embedder::embed_passages`]. Порядок результата — порядок `texts`.
+    pub fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Embedding>, MlError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let capped: Vec<&str> = texts
+            .iter()
+            .map(|t| cap_text(t, self.spec.max_tokens_query))
+            .collect();
+        let encs = self.tok.encode(&capped, self.spec.max_tokens_query)?;
+        let _busy = QueryGuard::new(&self.queries);
+        let mut runner = lock(&self.query);
+        if self.spec.dynamic_quant || encs.len() == 1 {
+            let mut out = Vec::with_capacity(encs.len());
+            for e in &encs {
+                out.push(
+                    self.run(&mut runner, &[e])?
+                        .pop()
+                        .expect("один текст — один вектор"),
+                );
+            }
+            return Ok(out);
+        }
+        let refs: Vec<&Encoding> = encs.iter().collect();
+        self.run(&mut runner, &refs)
+    }
+
     /// Перед батчем индексации: пока выполняются запросы, подождать (не дольше
     /// [`QUERY_YIELD_MAX`]), чтобы батч не занял устройство посреди их инференса.
     fn yield_to_queries(&self) {

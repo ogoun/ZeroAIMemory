@@ -20,6 +20,7 @@ pub mod nodes;
 pub mod previews;
 pub mod questions;
 pub mod read;
+pub mod read_focus;
 pub mod recall;
 pub mod releases;
 pub mod render;
@@ -28,9 +29,11 @@ pub mod scope;
 pub mod search;
 pub mod secrets;
 pub mod sessions;
+pub mod snapshot;
 pub mod solutions;
 pub mod spaces;
 pub mod tasks;
+pub mod transfer;
 pub mod triggers;
 pub mod user_settings;
 pub mod vault;
@@ -181,6 +184,13 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
             "/api/v1/nodes/{id}/attachments/{sha256}/{filename}",
             delete(blobs::remove),
         )
+        // импорт пространства (M6 §12б.5): тело — zip потоком в файл со своим пределом
+        // `import.max_bytes` (обработчик читает `Body` сам, общий предел тела не действует);
+        // ответ 202 — задание, ход — `GET /spaces/{space}/imports/{job}`
+        .route(
+            "/api/v1/spaces/{space}/import",
+            post(transfer::import::import).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/v1/cache", post(cache::put))
         .route("/api/v1/cache/{id}", delete(cache::remove))
         .route("/api/v1/cache/{id}/promote", post(cache::promote))
@@ -229,6 +239,16 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         )
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
+        // экспорт пространства (M6 §12б.5): чтение, не запись памяти
+        .route(
+            "/api/v1/spaces/{space}/export",
+            get(transfer::export::export),
+        )
+        // ход задания импорта (M6 §12б.5): чтение, не запись памяти
+        .route(
+            "/api/v1/spaces/{space}/imports/{job}",
+            get(transfer::import::status),
+        )
         .route(
             "/api/v1/solutions",
             get(solutions::list).post(solutions::register),
@@ -312,9 +332,18 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
             "/api/v1/sessions",
             get(sessions::list).post(sessions::create),
         )
+        .route("/api/v1/sessions/unattributed", get(sessions::unattributed))
         .route(
             "/api/v1/sessions/{id}",
             get(sessions::get).patch(sessions::patch),
+        )
+        // снимок сессии (M6 §8а): не запись в память и не обращение сессии — вне
+        // `memory_routes`, без `touch_from_request` (`last_seen_at`, `memory_writes` не меняются)
+        .route(
+            "/api/v1/sessions/{id}/snapshot",
+            get(snapshot::get)
+                .put(snapshot::put)
+                .layer(DefaultBodyLimit::max(cfg.snapshot.max_bytes)),
         )
         .route("/api/v1/agent-setup", get(agent_setup::setup))
         .route("/api/v1/agent-guide", get(agent_setup::guide))

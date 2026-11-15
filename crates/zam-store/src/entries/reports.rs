@@ -49,9 +49,9 @@ fn bad(msg: impl Into<String>) -> StoreError {
     StoreError::BadInput(msg.into())
 }
 
-const ATT_COLS: &str = "entry_id, blob_sha256, filename, mime, size, created_at";
+pub(crate) const ATT_COLS: &str = "entry_id, blob_sha256, filename, mime, size, created_at";
 
-fn att_row(r: &Row) -> rusqlite::Result<EntryAttachment> {
+pub(crate) fn att_row(r: &Row) -> rusqlite::Result<EntryAttachment> {
     let size: i64 = r.get(4)?;
     Ok(EntryAttachment {
         entry_id: r.get(0)?,
@@ -154,7 +154,7 @@ pub async fn create_report(
             }
             return same_request(tx, ex, &new).map(|ex| (ex, false));
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let id = insert_entry(tx, new, key, &a, None, &now)?;
         for f in &files {
             let size = i64::try_from(f.size).map_err(|_| bad("размер файла"))?;
@@ -221,6 +221,36 @@ pub async fn entry_attachment(
         ))?
         .query_row(params![entry, sha16, name], att_row)
         .optional()?)
+    })
+    .await
+}
+
+/// Файл живого отчёта по sha256 содержимого — `(mime, размер, имя)` — для превью
+/// (`GET /previews/{sha256}`, миниатюры ленты): запись вида `report`, не удалена; `space` —
+/// только в этом пространстве (участник общего решения в базе владельца). Несколько записей с
+/// тем же содержимым — последняя привязка. Права проверяет вызывающий: отчёты видны только
+/// сессии человека.
+pub async fn report_blob_meta_by_sha(
+    db: &Db,
+    sha256: &str,
+    space: Option<Id>,
+) -> Result<Option<(String, u64, String)>, StoreError> {
+    let sha = sha256.to_string();
+    db.read(move |c| {
+        let row: Option<(String, i64, String)> = c
+            .query_row(
+                "SELECT a.mime, a.size, a.filename
+                 FROM entry_attachments a
+                 JOIN entries e ON e.id = a.entry_id
+                 WHERE a.blob_sha256 = ?1 AND e.kind = 'report' AND e.deleted_at IS NULL
+                   AND (?2 IS NULL OR e.space_id = ?2)
+                 ORDER BY a.created_at DESC, a.rowid DESC
+                 LIMIT 1",
+                params![sha, space],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(m, s, f)| (m, u64::try_from(s).unwrap_or(0), f)))
     })
     .await
 }

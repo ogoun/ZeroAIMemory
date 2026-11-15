@@ -2,7 +2,6 @@
 //! (`entry_revisions`), чанки, FTS и задание outbox фиксируются вместе или не фиксируются
 //! вовсе (§8.1 ТЗ). Ничего не удаляется: удаление мягкое, замещение и отзыв — смена статуса.
 
-use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::{Id, TargetKind, TargetRef};
 
@@ -30,18 +29,18 @@ use crate::{Db, StoreError};
 
 /// Поля записи, которые входят в ревизию.
 #[derive(Debug, Clone, PartialEq)]
-struct Fields {
-    title: String,
-    body: String,
-    data: serde_json::Value,
-    tags: Vec<String>,
-    area: Option<String>,
-    status: Option<EntryStatus>,
-    certainty: Option<Certainty>,
+pub(crate) struct Fields {
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) data: serde_json::Value,
+    pub(crate) tags: Vec<String>,
+    pub(crate) area: Option<String>,
+    pub(crate) status: Option<EntryStatus>,
+    pub(crate) certainty: Option<Certainty>,
 }
 
 impl Fields {
-    fn of(e: &Entry) -> Fields {
+    pub(crate) fn of(e: &Entry) -> Fields {
         Fields {
             title: e.title.clone(),
             body: e.body.clone(),
@@ -125,7 +124,7 @@ fn check_reason(r: Option<String>) -> Result<Option<String>, StoreError> {
 }
 
 /// `Idempotency-Key`: если задан — непустой, до [`KEY_MAX_CHARS`] печатных символов.
-pub(super) fn check_key(k: Option<String>) -> Result<Option<String>, StoreError> {
+pub(crate) fn check_key(k: Option<String>) -> Result<Option<String>, StoreError> {
     let Some(k) = k else {
         return Ok(None);
     };
@@ -159,7 +158,7 @@ pub(super) fn space_kind_of(c: &Connection, space: Id) -> Result<SpaceKind, Stor
 /// Ключ идемпотентности в границах автора: `<автор>:<ключ>`, автор — пользователь, иначе
 /// токен, иначе `-` (администратор без пользователя). Идемпотентность по `(автор, ключ)`:
 /// в общем решении ключ участника не совпадает с ключом владельца. [решение исполнителя]
-pub(super) fn scoped_key(a: &Attribution, key: &str) -> String {
+pub(crate) fn scoped_key(a: &Attribution, key: &str) -> String {
     let who = a
         .user_id
         .map(|u| u.to_string())
@@ -235,7 +234,7 @@ pub(super) fn same_request(c: &Connection, ex: Entry, e: &NewEntry) -> Result<En
 /// Версия релиза свободна среди живых релизов пространства (кроме `except`) — иначе
 /// `Conflict`. Вызывается внутри транзакции писателя (`BEGIN IMMEDIATE`), поэтому проверка и
 /// запись атомарны.
-fn ensure_release_version_free(
+pub(crate) fn ensure_release_version_free(
     c: &Connection,
     space: Id,
     data: &serde_json::Value,
@@ -420,13 +419,13 @@ pub(crate) fn insert_entry_as(
     Ok(id)
 }
 
-fn tags_json(tags: &[String]) -> String {
+pub(crate) fn tags_json(tags: &[String]) -> String {
     serde_json::to_string(tags).expect("сериализация списка строк")
 }
 
 /// `data` для ревизии и сравнения «правка без изменений»: у task без `claimed_by` — захват
 /// это оперативное состояние, а не содержимое записи (решение контроллера, M4.5 задача 5).
-fn content_data(kind: EntryKind, data: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn content_data(kind: EntryKind, data: &serde_json::Value) -> serde_json::Value {
     let mut d = data.clone();
     if kind == EntryKind::Task
         && let Some(o) = d.as_object_mut()
@@ -477,7 +476,7 @@ fn insert_revision(
 
 /// Новая ревизия `cur.rev + 1` с полями `f`: строка записи, ревизия, чанки и задание
 /// `upsert` (payload меняется и при смене одного статуса или `certainty`).
-fn save(
+pub(crate) fn save(
     c: &Connection,
     cur: &Entry,
     f: &Fields,
@@ -644,7 +643,7 @@ pub async fn create_entry(
         {
             return same_request(tx, ex, &e).map(|ex| (ex, false));
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let id = insert_entry(tx, e, key, &a, None, &now)?;
         Ok((load_entry(tx, id)?, true))
     })
@@ -668,7 +667,7 @@ pub async fn update_entry(
 ) -> Result<Entry, StoreError> {
     let a = a.clone();
     db.write(move |tx| {
-        let now_ts = Timestamp::now();
+        let now_ts = crate::time::now();
         let cur = live_entry(tx, id)?;
         ensure_not_report(&cur)?;
         // конфликт ревизии — раньше прав (§7.5, §11.3)
@@ -910,7 +909,7 @@ pub async fn delete_entry(
         let cur = live_entry(tx, id)?;
         check_rev(&cur, if_rev)?;
         ensure_may_modify(&cur, a.author_kind)?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         tx.execute(
             "UPDATE entries SET deleted_at = ?2 WHERE id = ?1",
             params![id, now],
@@ -952,7 +951,7 @@ pub async fn restore_entry(
             let (title, td) = check_term(&cur.title, &cur.data).map_err(bad)?;
             ensure_names_free(tx, cur.space_id, &title, &td, Some(cur.id))?;
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         tx.execute(
             "UPDATE entries SET deleted_at = NULL,
                                 index_state = CASE WHEN index_state = 'excluded' THEN 'excluded'
@@ -1017,7 +1016,7 @@ pub async fn supersede_entry(
                 s.as_str()
             )));
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         // без `refs` новая запись наследует ссылки на файлы замещаемой (M4.5 §6.1) — вместе с
         // решением и состоянием ссылок
         let inherit = new.refs.is_none();
@@ -1066,7 +1065,7 @@ pub async fn retract_entry(
         if cur.status == Some(EntryStatus::Retracted) {
             return Err(StoreError::Conflict("запись уже отозвана".into()));
         }
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         tx.execute(
             "UPDATE entries SET retract_reason = ?2 WHERE id = ?1",
             params![id, reason],

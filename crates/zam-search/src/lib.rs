@@ -8,7 +8,7 @@
 //!   замена сводки заметки или секции лучшим листом ([`note_to_leaf`], §9.2 п. 6), затем не
 //!   больше `max_per_node` элементов с узла и `max_per_attachment` с документа вложения
 //!   ([`cap_per_node`]).
-//! - [`pack`] — упаковка в `budget_tokens` по числу токенов элементов.
+//! - [`pack`](mod@pack) — упаковка в `budget_tokens` по числу токенов элементов.
 //! - [`recall`] — проактивное вспоминание `/recall` (§10.3): нормализация ошибки, `error_regex`,
 //!   строки подсказок, упаковка дайджеста в бюджет.
 //!
@@ -23,7 +23,7 @@ pub mod pack;
 pub mod recall;
 
 pub use adjust::{
-    Boosts, LeafRef, RECENCY_FLOOR, apply_boosts, apply_boosts_to, cap_per_node,
+    Boosts, KindBoostMode, LeafRef, RECENCY_FLOOR, apply_boosts, apply_boosts_to, cap_per_node,
     drop_unresolved_tail, in_section, note_to_leaf, order_contradicted, overflow_divisor,
     recency_factor, rescale_overflow, summaries_without_leaf, target_cap,
 };
@@ -31,4 +31,4 @@ pub use hybrid::{
     Channel, ChunkMeta, FolderHit, Level, Ranked, SearchInputs, Weights, folder_score, fuse,
     fuse_normed,
 };
-pub use pack::{Cost, Fit, pack, truncate_to_tokens};
+pub use pack::{Cost, ELLIPSIS, Fit, pack, truncate_marked, truncate_to_tokens};

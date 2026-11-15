@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use jiff::Timestamp;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
@@ -136,6 +135,12 @@ pub static USER_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 24,
         sql: include_str!("../migrations/user/0024_ideas.sql"),
+        rebuild: true,
+    },
+    // M6: эпохи `session_seen` (пересборка), holdout, учёт без сессии, снимки, `recv_count`
+    Migration {
+        version: 25,
+        sql: include_str!("../migrations/user/0025_session_epochs.sql"),
         rebuild: true,
     },
 ];
@@ -299,7 +304,12 @@ impl UserDbs {
         if let Some(e) = cell.as_ref() {
             return Ok(e.db.clone());
         }
-        let db = Db::open(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS)?;
+        // признак копии `backup` — в каталоге данных, родителе `users/` (M6 §12б.2)
+        let opts = crate::DbOptions {
+            backup_flag: self.dir.parent().map(crate::backup::backup_flag_path),
+            ..crate::DbOptions::default()
+        };
+        let db = Db::open_with(&self.dir.join(format!("{user}.db")), USER_MIGRATIONS, opts)?;
         ensure_fixed_spaces(&db).await?;
         crate::nodes::backfill_embed_keys(&db).await?;
         // статус заметок из frontmatter (v9) — до первой записи: права certainty читают столбец
@@ -328,7 +338,8 @@ impl UserDbs {
         // нарезка вложений (M5): состояние и задания извлечения, работа — у конвейера документов
         crate::attachments::rechunk_docs_if_stale(&db).await?;
         let edges = crate::graph::backfill_pending(&db).await?;
-        let secrets = secrets_scan_pending(&db).await?;
+        let plan = secrets_scan_pending(&db).await?;
+        let secrets = plan.legacy || plan.delta;
         // теги payload и вход эмбеддинга папок (v3): до возврата базы — воркер проверяет
         // отметку reindex при первом её открытии
         rescan_payload_secrets(&db).await?;
@@ -355,9 +366,17 @@ impl UserDbs {
                 if edges && let Err(e) = crate::graph::backfill_edges(&bg).await {
                     tracing::warn!(error = %e, "дозаполнение рёбер графа прервано");
                 }
-                if secrets && let Err(e) = rescan_secrets(&bg).await {
+                if plan.legacy
+                    && let Err(e) = rescan_secrets(&bg).await
+                {
                     // повторится при следующем открытии базы
                     tracing::warn!(error = %e, "перенарезка заметок и записей с секретами прервана");
+                }
+                if plan.delta
+                    && let Err(e) = rescan_delta(&bg).await
+                {
+                    // повторится при следующем открытии базы
+                    tracing::warn!(error = %e, "перепроверка секретов по новым правилам прервана");
                 }
                 let _ = done.send(true);
             });
@@ -430,7 +449,7 @@ fn changed_text(changed: &[String]) -> String {
 /// Идемпотентно добавляет недостающие фиксированные пространства.
 async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
     db.write(|tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         for (kind, name) in FIXED {
             tx.execute(
                 "INSERT INTO spaces (id, kind, name, created_at)
@@ -444,17 +463,69 @@ async fn ensure_fixed_spaces(db: &Db) -> Result<(), StoreError> {
     .await
 }
 
-/// Ключ `meta`: разовая перенарезка заметок и записей со значениями секретов (сканер §7.6,
-/// задача 11 M3) выполнена. Отсутствует у баз, открытых до сканера; у новой пустой базы
+/// Ключ `meta`: перенарезка заметок и записей со значениями секретов (сканер §7.6, задача 11 M3)
+/// выполнена; значение — версия правил сканера ([`zam_markdown::secrets::RULES_VERSION`]), с
+/// которой проверено сохранённое. Отсутствует у баз, открытых до сканера (полная перенарезка по
+/// исходнику, [`rescan_secrets`]); у баз до задачи 15b M6 — `'1'`. Версия меньше текущей —
+/// разностная перепроверка сохранённого ([`crate::secrets_delta`], в фоне). У новой пустой базы
 /// ставится сразу (все её записи нарезаются уже замаскированными).
 const SECRETS_SCANNED: &str = "secrets_scanned_v2";
 
-/// Нужна ли перенарезка секретов: ключа нет и в базе есть живые заметки или записи.
-/// В пустой базе ключ ставится сразу.
-async fn secrets_scan_pending(db: &Db) -> Result<bool, StoreError> {
+/// Состояние ключа `meta` версии правил сканера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RulesState {
+    /// Ключа нет: база до соответствующей проверки — полный путь по исходнику.
+    Absent,
+    /// Версия меньше текущей: разностная перепроверка сохранённого.
+    Old,
+    /// Текущая или новее (база открыта более новым сервером: при откате сервера не
+    /// перепроверяется и флаг не уменьшается).
+    Current,
+}
+
+fn secrets_rules_state(c: &Connection, key: &str) -> rusqlite::Result<RulesState> {
+    let v: Option<String> = c
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+        .optional()?;
+    Ok(match v {
+        None => RulesState::Absent,
+        // нечисловое значение — как прежнее «есть» (`'1'`)
+        Some(v) if v.parse::<u32>().unwrap_or(1) >= zam_markdown::secrets::RULES_VERSION => {
+            RulesState::Current
+        }
+        Some(_) => RulesState::Old,
+    })
+}
+
+/// Записывает ключ `meta` `key` с текущей версией правил сканера.
+fn set_secrets_rules(c: &Connection, key: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![key, zam_markdown::secrets::RULES_VERSION.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Разовые проверки секретов при открытии базы.
+#[derive(Debug, Clone, Copy, Default)]
+struct SecretsPlan {
+    /// Полная перенарезка по исходнику (база до сканера, [`rescan_secrets`]).
+    legacy: bool,
+    /// Разностная перепроверка сохранённого (выросла версия правил, [`rescan_delta`]).
+    delta: bool,
+}
+
+/// Какие проверки секретов нужны. Ключа нет и база пуста — ключ ставится сразу.
+async fn secrets_scan_pending(db: &Db) -> Result<SecretsPlan, StoreError> {
     db.write(|tx| {
-        if has_meta(tx, SECRETS_SCANNED)? {
-            return Ok(false);
+        let scanned = secrets_rules_state(tx, SECRETS_SCANNED)?;
+        let payload = secrets_rules_state(tx, SECRETS_PAYLOAD)?;
+        let delta = scanned == RulesState::Old || payload == RulesState::Old;
+        if scanned != RulesState::Absent {
+            return Ok(SecretsPlan {
+                legacy: false,
+                delta,
+            });
         }
         let any: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = 'note' AND deleted_at IS NULL)
@@ -463,14 +534,42 @@ async fn secrets_scan_pending(db: &Db) -> Result<bool, StoreError> {
             |r| r.get(0),
         )?;
         if !any {
-            tx.execute(
-                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
-                [SECRETS_SCANNED],
-            )?;
+            set_secrets_rules(tx, SECRETS_SCANNED)?;
         }
-        Ok(any)
+        Ok(SecretsPlan { legacy: any, delta })
     })
     .await
+}
+
+/// Разностная перепроверка сохранённого текущими правилами ([`crate::secrets_delta`]): найденное
+/// переписывается, остальное не трогается; затем оба ключа (`SECRETS_SCANNED`,
+/// `SECRETS_PAYLOAD`) — текущая версия. Прерванная работа повторится при следующем открытии.
+async fn rescan_delta(db: &Db) -> Result<(), StoreError> {
+    let st = crate::secrets_delta::run(db).await?;
+    if st.notes + st.entries + st.docs > 0 {
+        loop {
+            if crate::embeddings::gc_embeddings(db, 1000).await? < 1000 {
+                break;
+            }
+        }
+    }
+    db.write(|tx| {
+        set_secrets_rules(tx, SECRETS_SCANNED)?;
+        set_secrets_rules(tx, SECRETS_PAYLOAD)?;
+        Ok(())
+    })
+    .await?;
+    tracing::info!(
+        notes = st.notes,
+        entries = st.entries,
+        docs = st.docs,
+        folders = st.folders,
+        sigs = st.sigs,
+        scan_ms = st.scan_ms,
+        rules = zam_markdown::secrets::RULES_VERSION,
+        "перепроверка секретов по новым правилам завершена"
+    );
+    Ok(())
 }
 
 /// Перенарезка живых заметок и записей, в которых сканер находит секреты: значения из версий
@@ -490,14 +589,8 @@ async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
             }
         }
     }
-    db.write(|tx| {
-        tx.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
-            [SECRETS_SCANNED],
-        )?;
-        Ok(())
-    })
-    .await?;
+    db.write(|tx| Ok(set_secrets_rules(tx, SECRETS_SCANNED)?))
+        .await?;
     tracing::info!(
         notes,
         entries,
@@ -509,7 +602,8 @@ async fn rescan_secrets(db: &Db) -> Result<(), StoreError> {
 
 /// Ключ `meta`: разовая проверка payload и точек папок на значения секретов (ревью задачи 11,
 /// задача 15 M3) выполнена. Теги точек Qdrant и вход эмбеддинга L0 папки маскируются с
-/// задачи 15; у новой пустой базы ключ ставится сразу.
+/// задачи 15; у новой пустой базы ключ ставится сразу. Значение — версия правил сканера, как у
+/// [`SECRETS_SCANNED`]: с меньшей версией — разностная перепроверка в фоне ([`rescan_delta`]).
 const SECRETS_PAYLOAD: &str = "secrets_scanned_v3";
 
 /// Разовая проверка базы, открытой до маскировки тегов payload и входа эмбеддинга папок: если
@@ -524,7 +618,9 @@ const SECRETS_PAYLOAD: &str = "secrets_scanned_v3";
 async fn rescan_payload_secrets(db: &Db) -> Result<(), StoreError> {
     let found = db
         .write(|tx| {
-            if has_meta(tx, SECRETS_PAYLOAD)? {
+            // только база до задачи 15 M3 (ключа нет); версия правил выросла — разностная
+            // перепроверка в фоне (`rescan_delta`): открытие её не ждёт
+            if secrets_rules_state(tx, SECRETS_PAYLOAD)? != RulesState::Absent {
                 return Ok(None);
             }
             let secret = |s: &str| !zam_markdown::scan_secrets(s).is_empty();
@@ -608,10 +704,7 @@ async fn rescan_payload_secrets(db: &Db) -> Result<(), StoreError> {
                     ],
                 )?;
             }
-            tx.execute(
-                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '1')",
-                [SECRETS_PAYLOAD],
-            )?;
+            set_secrets_rules(tx, SECRETS_PAYLOAD)?;
             Ok(Some((notes, entries, stale_folders)))
         })
         .await?;
@@ -1049,7 +1142,7 @@ pub async fn create_solution(db: &Db, guid: &str, name: &str) -> Result<(Space, 
         tx.execute(
             "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
              VALUES (?1, 'solution', ?2, ?3, ?4)",
-            params![id, guid, name, fmt_ts(Timestamp::now())],
+            params![id, guid, name, fmt_ts(crate::time::now())],
         )?;
         let s = solution_by_guid(tx, &guid)?.ok_or(StoreError::NotFound)?;
         Ok((s, true))
@@ -1088,7 +1181,7 @@ pub async fn create_solution_with_id(
         tx.execute(
             "INSERT INTO spaces (id, kind, solution_guid, name, created_at)
              VALUES (?1, 'solution', ?2, ?3, ?4)",
-            params![space_id, guid, name, fmt_ts(Timestamp::now())],
+            params![space_id, guid, name, fmt_ts(crate::time::now())],
         )?;
         let s = solution_by_guid(tx, guid.as_str())?.ok_or(StoreError::NotFound)?;
         Ok((s, true))
@@ -1155,7 +1248,7 @@ pub async fn rename_solution_guid(
                 e.into()
             }
         })?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let notes: Vec<(Id, i64)> = {
             let mut st = tx.prepare(SPACE_NOTES_PENDING_SQL)?;
             st.query_map([space_id], |r| Ok((r.get(0)?, r.get(1)?)))?

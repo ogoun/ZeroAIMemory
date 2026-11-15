@@ -46,22 +46,27 @@ pub use chunks::{
     ReindexEntry, enqueue_entry_upserts, entry_chunks_for_index, finish_entries_reindexed,
     reindex_entries_page,
 };
-pub(crate) use chunks::{rechunk_entries, rescan_entry_secrets, set_entry_state};
+pub(crate) use chunks::{
+    entry_index_state, index_entry_now, rechunk_entries, remask_entry, rescan_entry_secrets,
+    set_entry_state,
+};
 pub use read::{
     CHANGELOG_BETWEEN_MAX, DEDUP_CANDIDATES_MAX, DedupCandidate, changelog_between,
     entry_revisions, find_release_by_version, get_entry, list_entries, title_duplicates,
 };
+pub(crate) use reports::{ATT_COLS, att_row};
 pub use reports::{
     EntryAttachment, NewReportFile, create_report, entry_attachment, entry_attachments,
-    first_images,
+    first_images, report_blob_meta_by_sha,
 };
 pub use triggers::{
     KEYWORD_MAX_CHARS, NewTrigger, PATTERN_MAX_CHARS, TOOLS_MAX, TRIGGERS_MAX, Trigger,
     TriggerKind, TriggerRow, active_triggers, entry_triggers, set_triggers, validate_trigger,
 };
-pub(crate) use triggers::{check_triggers, replace_triggers, same_triggers};
+pub(crate) use triggers::{check_triggers, replace_triggers, same_triggers, tools_col};
 pub(crate) use write::{
-    Maker, ensure_not_report, insert_entry, insert_entry_as, revise, revise_with,
+    Fields, Maker, check_key, content_data, ensure_not_report, ensure_release_version_free,
+    insert_entry, insert_entry_as, revise, revise_with, save, scoped_key, tags_json,
 };
 pub use write::{
     create_entry, delete_entry, entry_by_idempotency_key, restore_entry, retract_entry,

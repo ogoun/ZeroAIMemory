@@ -18,9 +18,12 @@ pub mod refs;
 pub mod release;
 pub mod report;
 pub mod search;
+pub mod session_snapshot;
+pub mod sessions;
 pub mod solution;
 pub mod status;
 pub mod task;
+pub mod transfer;
 pub mod tree;
 pub mod vault;
 pub mod write;
@@ -222,6 +225,12 @@ impl Ctx {
         }
         Ok(())
     }
+}
+
+/// Время из JSON ответа в тексте агенту (M6 §4.4): RFC 3339 → `yyyy-MM-dd HH:mm:ss` UTC, без
+/// `T`/`Z`; не время — как есть. `--json` печатает ответ API без изменений (RFC 3339).
+pub fn agent_time(s: &str) -> String {
+    zam_core::time::agent_ts(s).unwrap_or_else(|| s.to_string())
 }
 
 /// Запись в stdout; закрытый канал (`| head`) — не ошибка.

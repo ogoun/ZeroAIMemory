@@ -38,7 +38,6 @@ use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zam_code::{QUAL_MAX_CHARS, SymbolHash, split_ref};
@@ -384,7 +383,7 @@ pub async fn changed(
             symbols,
         })
         .collect();
-    let now = Timestamp::now();
+    let now = zam_store::time::now();
     let mut stale = 0;
     for (db, spaces) in report_dbs(&st, &p, &sc).await? {
         stale += files_changed(&db, guid.as_str(), &spaces, &files, now).await?;
@@ -402,7 +401,7 @@ pub async fn verified(
     let req: FilesReq = json_body(body)?;
     let (sc, guid) = write_scope(&st, &p, &headers, &req.solution).await?;
     let files = parse_files(&req.files, false, st.cfg.code.max_symbols_per_file)?;
-    let now = Timestamp::now();
+    let now = zam_store::time::now();
     let mut verified = 0;
     for (db, spaces) in report_dbs(&st, &p, &sc).await? {
         verified += files_verified(&db, guid.as_str(), &spaces, &files, now).await?;

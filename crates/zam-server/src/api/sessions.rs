@@ -2,20 +2,57 @@
 //!
 //! - `POST /sessions {id?, agent?, solution?, area?, parent_id?, agent_type?, tokens?}` → 201
 //!   `{id}`: без `id` — UUIDv7; существующая сессия обновляется (известные поля дописываются,
-//!   `last_seen_at` — сейчас). Машина и токен — из `X-Zam-Machine` и принципала. `parent_id` и
+//!   `last_seen_at` — сейчас). **Регистрация** — тело без `tokens`, `new_epoch` и `holdout` (её
+//!   шлёт хук `session-start` на каждом старте, в том числе `resume`) — ещё и снимает отметку
+//!   конца `ended_at`: завершённую сессию продолжили (M6 §8а; иначе её снимок после обрыва не
+//!   показался бы никогда, а в списке она осталась бы «завершена»). Прочие обращения — учёт
+//!   токенов, новая эпоха, метка A/B, запросы с `X-Zam-Session`, `PUT` снимка — отметку не
+//!   трогают: хвост запросов после `SessionEnd` сессию не «оживляет». Времени события в запросах
+//!   нет, поэтому при встречной гонке (`SessionEnd` прежнего процесса и регистрация нового
+//!   почти одновременно) действует **пришедший последним**: обычный порядок — конец, затем
+//!   регистрация — даёт открытую сессию; обратный оставляет отметку до следующей регистрации
+//!   (любой `session-start` этой сессии), цена — раздел снимка, не показанный один раз.
+//!   Машина и токен — из `X-Zam-Machine` и принципала. `parent_id` и
 //!   `agent_type` (до 128 печатных символов) — сессия субагента (M4.5 §9.4): её создаёт хук
 //!   `subagent-start` с id `<session>:<agent_id>`. `tokens: {pre_tool, post_tool_local,
 //!   subagent_local}` (M4.5 §9.5) — прибавка выданного хуками с локальным выводом: число
 //!   (токены, одна выдача) или `{calls, tokens}` (пачка, которую хук копил до сетевого
 //!   вызова); прочие ключи и значения вне `0..=`[`TOKENS_MAX`] — 400 (события `/recall`
 //!   сервер считает сам);
-//! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца);
+//! - `POST /sessions {id, new_epoch: true}` → 201 `{id, epoch}` (M6 §7.2): новая эпоха
+//!   `session_seen` — выданное раньше выданным больше не считается (`(seen)`, подсказки,
+//!   «уже выдавалось»; показ идей — без эпохи). Шлёт хук `checkpoint` на `PreCompact`
+//!   отдельным запросом: старый сервер отвечает на неизвестное поле 400, и хук молча
+//!   продолжает. Без `id` — 400; сессии нет — она создаётся с эпохой 1. Прочие источники
+//!   новой эпохи — `/recall` (`session_start` с `source` `compact | resume | clear`,
+//!   `event: recovery`);
+//! - `POST /sessions {id, holdout: true|false}` → 201 `{id, holdout}` (M6 §12): контрольная
+//!   группа агентного A/B — в такой сессии `/recall` хуков отдаёт пустой `text` (учёт ведётся,
+//!   [`super::recall`]); `false` снимает. Шлёт хук `session-start` (`hooks.holdout`) отдельным
+//!   запросом: старый сервер отвечает 400, хук молча продолжает. Без `id` — 400. Сессия
+//!   субагента (`parent_id`) при регистрации наследует метку родителя — только в сторону `true`:
+//!   `holdout: false` у субагента контрольной группы метку не снимает (ответ — `holdout: true`);
+//!   после compact метка остаётся (та же сессия);
+//! - `PATCH /sessions/{id} {ended: true|false}` → 204 (`false` снимает отметку конца; её же
+//!   снимает регистрация `POST /sessions` — см. выше);
 //! - `GET /sessions/{id}` → `{id, agent, solution, area, machine, parent_id, agent_type,
-//!   started_at, last_seen_at, ended_at, memory_writes, claimed_tasks: [{id, title, status}],
-//!   tokens: {<событие>: {calls, tokens}}}` (решение контроллера R6, читает хук `checkpoint`;
-//!   `claimed_tasks` — задачи журнала, захваченные сессией, M4.5; `tokens` — выданное сессии
-//!   по событию, §9.5);
-//! - `GET /sessions?solution=&limit=` → `{items}` — свои, свежие первыми (50, до 500).
+//!   started_at, last_seen_at, ended_at, memory_writes, seen_epoch, claimed_tasks: [{id, title,
+//!   status}], holdout, tokens: {<событие>: {calls, tokens, reread_calls?}}}` (решение контроллера R6,
+//!   читает хук `checkpoint`; `claimed_tasks` — задачи журнала, захваченные сессией, M4.5;
+//!   `tokens` — выданное сессии по событию, §9.5; `reread_calls` — повторные выдачи `/read`,
+//!   есть только ненулевое, M6 §7.3; `seen_epoch` — эпоха `session_seen`, M6 §7.2; `holdout` —
+//!   контрольная группа A/B, M6 §12). События учёта (M6 §8): `/recall` — `session_start`,
+//!   `recovery` (без Rules), `rules` (резерв Rules этих двух), `prompt`, `post_tool`, `brief`;
+//!   `/search` и `/read` с явной сессией, не из MCP — `search`, `read` (выдача в токенах);
+//!   инструменты MCP — `mcp`, чтения `/read` из MCP — ещё `mcp_read` (вызов и `reread_calls`,
+//!   токенов 0 — их считает `mcp`); хуки с локальным
+//!   выводом — `pre_tool`, `post_tool_local`, `subagent_local`;
+//! - `GET /sessions?solution=&limit=&tokens=` → `{items}` — свои, свежие первыми (50, до 500);
+//!   `tokens=true` — у каждой ещё `tokens`, как в `GET /sessions/{id}` (`zam sessions tokens
+//!   --last N`, страница сессий WebUI); у сессии со снимком (M6 §8а) — `snapshot_at` (момент
+//!   снимка; сам снимок — `GET /sessions/{id}/snapshot`, [`super::snapshot`]);
+//! - `GET /sessions/unattributed?days=N` → `{items: [{day, event, calls, tokens}]}` — выданное
+//!   без явной сессии по суткам UTC (M6 §7.1, [`unattributed`]).
 //!
 //! Сессия лежит в базе пользователя запроса (у администратора — `X-Zam-User` или он сам):
 //! чужая сессия — 404. Помимо явного `POST` сессия создаётся первым запросом с
@@ -44,8 +81,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, claimed_tasks,
-    end_session, get_session, list_sessions, list_spaces, session_tokens, touch_session,
+    Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, bump_epoch,
+    claimed_tasks, end_session, get_session, list_sessions, list_spaces, register_session,
+    session_epoch, session_holdout, session_tokens, sessions_tokens, set_holdout, snapshot_times,
+    touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -64,24 +103,50 @@ pub const LOCAL_TOKEN_EVENTS: [&str; 3] = ["pre_tool", "post_tool_local", "subag
 /// Предел `tokens` и `calls` одной прибавки.
 pub const TOKENS_MAX: u64 = 1_000_000_000;
 
-/// База пользователя запроса (без проверки существования: принципал уже проверен).
-async fn requester_db(st: &AppState, p: &Principal, headers: &HeaderMap) -> Result<Db, ApiError> {
+/// База пользователя запроса (без проверки существования: принципал уже проверен); у
+/// администратора — пользователя `X-Zam-User`.
+pub(super) async fn requester_db(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+) -> Result<Db, ApiError> {
     let user = crate::auth::target_user(st, p, headers).await?;
     Ok(st.users.get(user.id).await?)
 }
 
 /// Сессия запроса (касание по запросу) и база пользователя запроса, где она лежит.
+///
+/// M6 §7.1: учёт `session_tokens`, отметки `session_seen` и пометки выданного — только при
+/// **явной** сессии (`explicit`). Неявная — сессия, которую подставил MCP без
+/// `X-Zam-Session` (R13): она нужна счётчику записей, но не учёту выдачи.
 pub struct RequestSession {
     pub touch: SessionTouch,
     pub db: Db,
+    /// Сессия задана телом или заголовком запроса, а не подставлена MCP (см. [`McpOrigin`]).
+    pub explicit: bool,
+    /// Запрос пришёл из инструмента MCP (внутренний клиент `Rest`): учёт ведёт
+    /// `McpServer::call_tool` (`mcp::account`, событие `mcp`, в фоне после ответа), а `(seen)` не
+    /// прячет фрагмент (субагенты на общем подключении).
+    pub via_mcp: bool,
+}
+
+/// Признак внутреннего запроса MCP — расширение запроса (`http::Extensions`). Его ставит только
+/// внутренний клиент `mcp::Rest`: снаружи заголовками его не подделать. `implicit` — сессию
+/// подставил сервер ([`crate::mcp`], R13), агент её не задавал.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct McpOrigin {
+    pub implicit: bool,
 }
 
 /// Сессия запроса без записи: `session_id` из тела сильнее `X-Zam-Session`; `None` — запрос
-/// без сессии. Некорректный id — 400.
+/// без сессии. Некорректный id — 400. `origin` — признак MCP из расширений запроса.
+/// Эпоха `session_seen` здесь не читается (`touch.epoch` — 0): она нужна только выдаче —
+/// [`seen_session`].
 pub async fn request_session(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
+    origin: Option<&McpOrigin>,
     body_session: Option<&str>,
 ) -> Result<Option<RequestSession>, ApiError> {
     let Some(touch) = session_touch(p, headers, body_session)? else {
@@ -91,7 +156,44 @@ pub async fn request_session(
     // `users/<id>.db` (финальное ревью M4, M-3)
     let user = crate::auth::target_user(st, p, headers).await?;
     let db = st.users.get(user.id).await?;
-    Ok(Some(RequestSession { touch, db }))
+    let via_mcp = origin.is_some();
+    // id в теле агент задал сам; заголовок неявен, только если его подставил MCP
+    let body = body_session.is_some_and(|s| !s.trim().is_empty());
+    let explicit = body || !origin.is_some_and(|o| o.implicit);
+    Ok(Some(RequestSession {
+        touch,
+        db,
+        explicit,
+        via_mcp,
+    }))
+}
+
+/// Сессия запроса выдачи (`/read`, `/recall`, `/search`): только явная (M6 §7.1, неявная —
+/// `None`) и с текущей эпохой `session_seen` в `touch.epoch` (§7.2).
+///
+/// Эпоха читается в начале запроса: и чтение выданного, и отметки запроса идут в неё. Новая
+/// эпоха, пришедшая во время запроса, отметки не переносит — запрос отметит выданное в прежней
+/// эпохе, и оно один раз повторится (журнал задачи 2, M5: перенос отметки в новую эпоху спрятал
+/// бы текст, который агент потерял при сжатии контекста). Сбой чтения эпохи — ошибка хранилища
+/// (вызывающий выдаёт ответ без отметок и пометок, WARN).
+pub async fn seen_session(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    origin: Option<&McpOrigin>,
+    body_session: Option<&str>,
+) -> Result<Option<RequestSession>, ApiError> {
+    let Some(mut s) = explicit_only(request_session(st, p, headers, origin, body_session).await?)
+    else {
+        return Ok(None);
+    };
+    s.touch.epoch = session_epoch(&s.db, &s.touch.id).await?;
+    Ok(Some(s))
+}
+
+/// Сессия запроса с явной сессией (M6 §7.1); неявная — `None`, как запрос без сессии.
+pub fn explicit_only(s: Option<RequestSession>) -> Option<RequestSession> {
+    s.filter(|s| s.explicit)
 }
 
 /// Отмечает обращение сессии запроса (оценка, `/read`, `/recall`): сессия создаётся, если её
@@ -100,9 +202,10 @@ pub async fn touch_from_request(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
+    origin: Option<&McpOrigin>,
     body_session: Option<&str>,
 ) -> Result<Option<RequestSession>, ApiError> {
-    let Some(s) = request_session(st, p, headers, body_session).await? else {
+    let Some(s) = request_session(st, p, headers, origin, body_session).await? else {
         return Ok(None);
     };
     touch_session(&s.db, &s.touch).await?;
@@ -119,6 +222,10 @@ pub struct NewSession {
     parent_id: Option<String>,
     agent_type: Option<String>,
     tokens: Option<serde_json::Map<String, Value>>,
+    /// Новая эпоха `session_seen` (M6 §7.2); нужен `id`.
+    new_epoch: Option<bool>,
+    /// Контрольная группа агентного A/B (M6 §12): `true` ставит, `false` снимает; нужен `id`.
+    holdout: Option<bool>,
 }
 
 /// Прибавки `tokens` тела `POST /sessions` (см. модуль).
@@ -154,6 +261,7 @@ fn local_tokens(m: &serde_json::Map<String, Value>) -> Result<Vec<TokenCount>, A
             event: k.clone(),
             calls,
             tokens,
+            reread_calls: 0,
         });
     }
     Ok(out)
@@ -178,8 +286,16 @@ pub async fn create(
         .transpose()?;
     let tokens = req.tokens.as_ref().map(local_tokens).transpose()?;
     let blank = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let new_epoch = req.new_epoch == Some(true);
+    let id = blank(req.id);
+    if new_epoch && id.is_none() {
+        return Err(ApiError::BadRequest("new_epoch: нужен id сессии".into()));
+    }
+    if req.holdout.is_some() && id.is_none() {
+        return Err(ApiError::BadRequest("holdout: нужен id сессии".into()));
+    }
     let touch = SessionTouch {
-        id: blank(req.id).unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        id: id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
         token_id: p.token_id(),
         solution_guid,
         area: blank(req.area),
@@ -187,13 +303,49 @@ pub async fn create(
         agent: blank(req.agent),
         parent_id: blank(req.parent_id),
         agent_type: blank(req.agent_type),
+        // регистрация и учёт хуков отметок `session_seen` не пишут
+        epoch: 0,
     };
     let db = requester_db(&st, &p, &headers).await?;
+    // регистрация (хук `session-start`) — без служебных полей: она же снимает отметку конца
+    let register = req.tokens.is_none() && req.new_epoch.is_none() && req.holdout.is_none();
     match tokens.filter(|t| !t.is_empty()) {
         Some(t) => add_token_counts(&db, &touch, &t).await?,
+        None if register => {
+            if register_session(&db, &touch).await? {
+                // без id сессии
+                tracing::debug!("сессия возобновлена: отметка конца снята");
+            }
+        }
         None => touch_session(&db, &touch).await?,
     }
-    Ok((StatusCode::CREATED, Json(json!({ "id": touch.id }))))
+    let mut out = json!({ "id": touch.id });
+    // сессия субагента наследует метку родителя (M6 §12) — только в сторону `true`: `holdout:
+    // false` у субагента метку родителя не снимает (родитель — по `parent_id` тела или строки)
+    let parent = match touch.parent_id.clone() {
+        Some(p) => Some(p),
+        None if req.holdout.is_some() => {
+            get_session(&db, &touch.id).await?.and_then(|x| x.parent_id)
+        }
+        None => None,
+    };
+    let inherited = match parent.as_deref() {
+        Some(p) => session_holdout(&db, p, None).await?,
+        None => false,
+    };
+    match req.holdout {
+        Some(on) => {
+            let on = on || inherited;
+            set_holdout(&db, &touch.id, on).await?;
+            out["holdout"] = json!(on);
+        }
+        None if inherited => set_holdout(&db, &touch.id, true).await?,
+        None => {}
+    }
+    if new_epoch {
+        out["epoch"] = json!(bump_epoch(&db, &touch.id).await?);
+    }
+    Ok((StatusCode::CREATED, Json(out)))
 }
 
 #[derive(Deserialize)]
@@ -248,7 +400,7 @@ async fn claimed_tasks_of(
     own: &Db,
     s: &zam_store::Session,
 ) -> Vec<zam_store::ClaimedTask> {
-    let now = jiff::Timestamp::now();
+    let now = zam_store::time::now();
     let mut dbs: Vec<(Db, Vec<Id>)> = Vec::new();
     match list_spaces(own).await {
         Ok(spaces) => dbs.push((
@@ -293,6 +445,8 @@ async fn claimed_tasks_of(
 pub struct ListQuery {
     solution: Option<String>,
     limit: Option<usize>,
+    /// `true` — у каждой сессии `tokens` (выданное по событию).
+    tokens: Option<bool>,
 }
 
 /// `GET /sessions`.
@@ -318,6 +472,64 @@ pub async fn list(
         .transpose()?;
     let db = requester_db(&st, &p, &headers).await?;
     let items = list_sessions(&db, solution.as_ref(), limit).await?;
+    let ids: Vec<String> = items.iter().map(|s| s.id.clone()).collect();
+    let snaps = snapshot_times(&db, &ids).await?;
+    let mut tokens = if q.tokens == Some(true) {
+        Some(sessions_tokens(&db, &ids).await?)
+    } else {
+        None
+    };
+    let items: Vec<Value> = items
+        .iter()
+        .map(|s| {
+            let mut v = json!(s);
+            if let Some(t) = tokens.as_mut() {
+                v["tokens"] = json!(t.remove(&s.id).unwrap_or_default());
+            }
+            if let Some(at) = snaps.get(&s.id) {
+                v["snapshot_at"] = json!(zam_store::time::fmt_ts(*at));
+            }
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// Окно `GET /sessions/unattributed` по умолчанию, суток.
+const UNATTRIBUTED_DAYS_DEFAULT: i64 = 30;
+/// Предел окна `GET /sessions/unattributed`, суток.
+const UNATTRIBUTED_DAYS_MAX: i64 = 366;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnattributedQuery {
+    days: Option<i64>,
+}
+
+/// `GET /sessions/unattributed?days=N` (M6 §7.1) → `{items: [{day, event, calls, tokens}]}` —
+/// выданное без явной сессии (MCP без привязки) в базе пользователя запроса за N суток UTC
+/// (сегодня — первые; 30 по умолчанию, до 366), свежие первыми.
+pub async fn unattributed(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    q: Result<Query<UnattributedQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let q = query(q)?;
+    let days = q.days.unwrap_or(UNATTRIBUTED_DAYS_DEFAULT);
+    if !(1..=UNATTRIBUTED_DAYS_MAX).contains(&days) {
+        return Err(ApiError::BadRequest(format!(
+            "days: от 1 до {UNATTRIBUTED_DAYS_MAX}"
+        )));
+    }
+    let today = zam_store::time::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date();
+    let since = today
+        .checked_sub(jiff::Span::new().days(days - 1))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let db = requester_db(&st, &p, &headers).await?;
+    let items = zam_store::unattributed_tokens(&db, since).await?;
     Ok(Json(json!({ "items": items })))
 }
 

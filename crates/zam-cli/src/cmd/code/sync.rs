@@ -626,8 +626,15 @@ pub fn sync(
         hashes.insert(fp.path.clone(), h);
         live.push(fp);
     }
+    // пути под исключениями по умолчанию (M6 §12а) не считаются: их уход из карты — смена
+    // умолчания (`code.exclude_defaults`), а не потерянный корень (ревью задачи 14, M1)
+    let defaults = cfg.default_exclude_set();
     let known = if state.solution == guid && !state.files.is_empty() {
-        state.files.len()
+        state
+            .files
+            .keys()
+            .filter(|p| !defaults.as_ref().is_some_and(|g| g.is_match(p.as_str())))
+            .count()
     } else if opts.prune {
         0
     } else {
@@ -636,8 +643,8 @@ pub fn sync(
     if !opts.prune && known >= PRUNE_GUARD_MIN && live.len() * 2 < known {
         return Err(CliError::config(format!(
             "файлов кода {} — меньше половины файлов карты ({known}): сервер удалил бы \
-             из карты остальные. Проверьте корень, code.exclude и code.languages; удаление \
-             намеренное — zam code sync --prune",
+             из карты остальные. Проверьте корень, code.exclude, code.exclude_defaults и \
+             code.languages; удаление намеренное — zam code sync --prune",
             live.len()
         )));
     }
@@ -673,10 +680,19 @@ pub fn sync(
         warnings,
         ..SyncReport::default()
     };
+    // `refs[].recv_count` (M6 §12а) — только серверу, который его принимает: у сервера до M6
+    // тело файла — `deny_unknown_fields`, вызовы по получателю у него остаются в `call`
+    let recv_ok = resp["recv_count"] == true;
+    let known_state = state.solution == guid && !state.files.is_empty();
     // разбор сменился (`EXTRACT_VERSION`) — карта этого клиента перезагружается целиком
-    let reparse = state.solution == guid
-        && !state.files.is_empty()
-        && state.extractor != zam_code::EXTRACT_VERSION;
+    let reparse = known_state && state.extractor != zam_code::EXTRACT_VERSION;
+    // сервер стал принимать `recv_count` (обновился после загрузки) — тоже целиком
+    let resend = known_state && recv_ok && !state.recv_count && !reparse;
+    if resend {
+        report.warnings.push(
+            "сервер принимает вызовы по получателю: файлы карты загружаются заново".to_string(),
+        );
+    }
     if reparse {
         // журнал падений относится к прежнему разбору: новый пробует файлы заново (ревью 9A, M8)
         state.crashed.clear();
@@ -686,7 +702,7 @@ pub fn sync(
             zam_code::EXTRACT_VERSION
         ));
     }
-    let need: Vec<&Fingerprint> = if opts.full || reparse {
+    let need: Vec<&Fingerprint> = if opts.full || reparse || resend {
         live.clone()
     } else {
         let set: HashSet<&str> = resp["need"]
@@ -725,6 +741,9 @@ pub fn sync(
         let Some(mut file) = parse_file(root, fp, h, &state, cfg, &crash) else {
             continue;
         };
+        if !recv_ok {
+            file.refs.iter_mut().for_each(|r| r.recv_count = None);
+        }
         let ser = |f: &FileUpload| {
             serde_json::to_vec(f).map_err(|e| CliError::config(format!("сериализация файла: {e}")))
         };
@@ -778,6 +797,7 @@ pub fn sync(
         files,
         crashed,
         extractor: zam_code::EXTRACT_VERSION,
+        recv_count: recv_ok,
     };
     let io = |e: std::io::Error| CliError::config(format!("кэш карты кода: {e}"));
     new_state.save(root).map_err(io)?;

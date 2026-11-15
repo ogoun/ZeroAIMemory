@@ -338,6 +338,15 @@ export const PRINT_NODE_B = 'Декодер';
 /** Строка кода без пробелов длиннее ширины A4: на бумаге переносится. */
 export const PRINT_LONG_CODE = 'x'.repeat(30) + '_' + 'y'.repeat(300);
 export const PRINT_FILE = 'raw-data.csv';
+/** Ссылки печатного отчёта (M6, задача 15a): пять разрешённых схем; путь — для «копировать путь». */
+export const LINK_HTTPS = 'https://example.org/docs';
+export const LINK_MAILTO = 'mailto:team@example.org';
+export const LINK_VSCODE = 'vscode://file/C:/proj/src/train.py:42';
+export const LINK_VSCODE_PATH = 'C:/proj/src/train.py:42';
+export const LINK_FILE = 'file:///C:/data/raw%20set/train.csv';
+export const LINK_FILE_PATH = 'C:\\data\\raw set\\train.csv';
+/** Автоссылка: текст ссылки — сам адрес (в печати адрес не дублируется). */
+export const LINK_FILE_AUTO = 'file:///home/u/notes.md';
 /** SVG без собственных размеров (только `viewBox`): печать его не блокирует. */
 const SVG_NOSIZE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 40"><rect width="100" height="40" fill="#58a"/></svg>';
 
@@ -373,6 +382,9 @@ graph LR
 \`\`\`
 
 Исходные замеры — [${PRINT_FILE}](${PRINT_FILE}).
+
+Ссылки: [сайт](${LINK_HTTPS}), [почта](${LINK_MAILTO}), [код](${LINK_VSCODE}),
+[данные](${LINK_FILE}), <${LINK_FILE_AUTO}>.
 
 [^f1]: F1 — среднее гармоническое точности и полноты.
 `;

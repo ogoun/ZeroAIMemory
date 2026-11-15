@@ -11,12 +11,14 @@
 //! конфигураций на одних запросах — парный бутстреп разностей: выигрыш устойчив, если
 //! нижняя граница интервала разности больше нуля.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Число выборок бутстрепа.
 pub const BOOTSTRAP: usize = 2000;
+/// Число выборок бутстрепа замера M6 (спецификация M6 §3.5).
+pub const BOOTSTRAP_M6: usize = 10_000;
 /// Зерно генератора бутстрепа.
-const SEED: u64 = 0x5eed_2026_1019;
+pub const SEED: u64 = 0x5eed_2026_1019;
 
 /// Метрики одного запроса. Поля M3 — только у запросов своего вида (`None` у остальных):
 /// `cancelled5` — `superseded`, `reliable_first` — `certainty`, `chunk_*` — `chunk`.
@@ -103,7 +105,7 @@ pub fn score(ranked: &[String], expect: &[String]) -> QueryMetrics {
 }
 
 /// Среднее с 95 % интервалом.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Estimate {
     pub mean: f64,
     pub lo: f64,
@@ -204,29 +206,36 @@ pub fn ratio_estimate(num: &[f64], den: &[f64]) -> Option<Estimate> {
         den.len(),
         "числитель и знаменатель по одним случаям"
     );
-    let total: f64 = den.iter().sum();
+    let pairs: Vec<(f64, f64)> = num.iter().copied().zip(den.iter().copied()).collect();
+    ratio_estimate_with(&pairs, BOOTSTRAP, SEED)
+}
+
+/// [`ratio_estimate`] по парам `(числитель, знаменатель)` случаев: `n` выборок, зерно `seed`
+/// (M6: `R = Σ M6 / Σ базы`, [`BOOTSTRAP_M6`] выборок, парный бутстреп сценариев).
+pub fn ratio_estimate_with(pairs: &[(f64, f64)], n: usize, seed: u64) -> Option<Estimate> {
+    let total: f64 = pairs.iter().map(|p| p.1).sum();
     if total <= 0.0 {
         return None;
     }
-    let m = num.iter().sum::<f64>() / total;
-    if num.len() < 2 {
+    let m = pairs.iter().map(|p| p.0).sum::<f64>() / total;
+    if pairs.len() < 2 {
         return Some(Estimate {
             mean: m,
             lo: m,
             hi: m,
         });
     }
-    let mut rng = Rng(SEED);
-    let mut ratios: Vec<f64> = Vec::with_capacity(BOOTSTRAP);
-    for _ in 0..BOOTSTRAP {
-        let (mut n, mut d) = (0.0, 0.0);
-        for _ in 0..num.len() {
-            let i = rng.below(num.len());
-            n += num[i];
-            d += den[i];
+    let mut rng = Rng(seed);
+    let mut ratios: Vec<f64> = Vec::with_capacity(n);
+    for _ in 0..n.max(1) {
+        let (mut a, mut d) = (0.0, 0.0);
+        for _ in 0..pairs.len() {
+            let (x, y) = pairs[rng.below(pairs.len())];
+            a += x;
+            d += y;
         }
         if d > 0.0 {
-            ratios.push(n / d);
+            ratios.push(a / d);
         }
     }
     ratios.sort_by(f64::total_cmp);
@@ -237,6 +246,72 @@ pub fn ratio_estimate(num: &[f64], den: &[f64]) -> Option<Estimate> {
     })
 }
 
+/// Взвешенная парная разность `Σ w (b − a) / Σ w` по одним случаям (M6: Δ микро-полноты —
+/// доли найденных нагетов сценариев с весами числа нагетов) с **односторонними** 95 % границами
+/// бутстрепа случаев: `lo` — 5-й перцентиль (правило неинфериорности «нижняя граница
+/// одностороннего 95 % интервала ≥ −0,02», спецификация M6 §3.5), `hi` — 95-й. Пустой вес — 0.
+pub fn paired_diff_weighted(a: &[f64], b: &[f64], w: &[f64], n: usize, seed: u64) -> Estimate {
+    assert!(
+        a.len() == b.len() && a.len() == w.len(),
+        "парное сравнение на одних случаях"
+    );
+    let wmean = |idx: &mut dyn Iterator<Item = usize>| {
+        let (mut s, mut ws) = (0.0, 0.0);
+        for i in idx {
+            s += w[i] * (b[i] - a[i]);
+            ws += w[i];
+        }
+        (ws > 0.0).then(|| s / ws)
+    };
+    let m = wmean(&mut (0..a.len())).unwrap_or(0.0);
+    if a.len() < 2 {
+        return Estimate {
+            mean: m,
+            lo: m,
+            hi: m,
+        };
+    }
+    let mut rng = Rng(seed);
+    let mut d: Vec<f64> = Vec::with_capacity(n);
+    for _ in 0..n.max(1) {
+        let mut idx = (0..a.len()).map(|_| rng.below(a.len()));
+        if let Some(x) = wmean(&mut idx) {
+            d.push(x);
+        }
+    }
+    d.sort_by(f64::total_cmp);
+    Estimate {
+        mean: m,
+        lo: percentile(&d, 0.05),
+        hi: percentile(&d, 0.95),
+    }
+}
+
+/// Микро-усреднённая полнота `Σ найденных / Σ всех` по `(найдено, всего)` сценариев; нагетов
+/// нет — 0.
+pub fn micro_recall(found_total: &[(usize, usize)]) -> f64 {
+    let total: usize = found_total.iter().map(|p| p.1).sum();
+    if total == 0 {
+        return 0.0;
+    }
+    found_total.iter().map(|p| p.0).sum::<usize>() as f64 / total as f64
+}
+
+/// Чистые потери `L = #{полон в базе, неполон в плече} − #{неполон в базе, полон в плече}`
+/// (спецификация M6 §3.2) по одним сценариям в одном порядке.
+pub fn net_losses(base_full: &[bool], arm_full: &[bool]) -> i64 {
+    assert_eq!(base_full.len(), arm_full.len(), "одни сценарии");
+    base_full
+        .iter()
+        .zip(arm_full)
+        .map(|(b, a)| match (b, a) {
+            (true, false) => 1,
+            (false, true) => -1,
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Парная разность отношений сумм `b − a` по одним случаям (`Σ num / Σ den` у каждого) с 95 %
 /// интервалом бутстрепа случаев (выборка случаев общая для обоих; выборка с нулевым знаменателем
 /// у одного из них пропускается). `None` — знаменатель одного из отношений пуст.
@@ -245,6 +320,32 @@ pub fn paired_ratio_diff(
     a_den: &[f64],
     b_num: &[f64],
     b_den: &[f64],
+) -> Option<Estimate> {
+    paired_ratio_q(a_num, a_den, b_num, b_den, BOOTSTRAP, (0.025, 0.975))
+}
+
+/// [`paired_ratio_diff`] с **односторонними** 95 % границами (`lo` — 5-й перцентиль, `hi` —
+/// 95-й) и `samples` выборками (M6 §3.5: 10 000, правило «нижняя граница ≥ −0,02»; сетки порогов
+/// подсказок §9).
+pub fn paired_ratio_diff_one_sided(
+    a_num: &[f64],
+    a_den: &[f64],
+    b_num: &[f64],
+    b_den: &[f64],
+    samples: usize,
+) -> Option<Estimate> {
+    paired_ratio_q(a_num, a_den, b_num, b_den, samples, (0.05, 0.95))
+}
+
+/// Разность отношений сумм, бутстреп `samples` выборок (зерно [`SEED`]), перцентили `q` =
+/// (нижний, верхний); например, нижний `0,05 / k` — поправка Бонферрони на `k` сравнений.
+pub fn paired_ratio_q(
+    a_num: &[f64],
+    a_den: &[f64],
+    b_num: &[f64],
+    b_den: &[f64],
+    samples: usize,
+    q: (f64, f64),
 ) -> Option<Estimate> {
     let n = a_num.len();
     assert!(
@@ -264,8 +365,8 @@ pub fn paired_ratio_diff(
         });
     }
     let mut rng = Rng(SEED);
-    let mut d: Vec<f64> = Vec::with_capacity(BOOTSTRAP);
-    for _ in 0..BOOTSTRAP {
+    let mut d: Vec<f64> = Vec::with_capacity(samples);
+    for _ in 0..samples {
         let (mut an, mut ad, mut bn, mut bd) = (0.0, 0.0, 0.0, 0.0);
         for _ in 0..n {
             let i = rng.below(n);
@@ -281,8 +382,8 @@ pub fn paired_ratio_diff(
     d.sort_by(f64::total_cmp);
     Some(Estimate {
         mean: m,
-        lo: percentile(&d, 0.025),
-        hi: percentile(&d, 0.975),
+        lo: percentile(&d, q.0),
+        hi: percentile(&d, q.1),
     })
 }
 
@@ -387,12 +488,36 @@ pub fn quantile(values: &[f64], q: f64) -> f64 {
     percentile(&v, q)
 }
 
+/// Разброс повторов (порог шума A/A, методика M6): 95-й перцентиль `|x − среднее| / среднее`
+/// по всем повторам всех элементов, у которых больше одного повтора и среднее больше нуля.
+/// `None` — таких элементов нет.
+pub fn rep_spread_p95(groups: &[Vec<f64>]) -> Option<f64> {
+    let mut d = Vec::new();
+    for g in groups.iter().filter(|g| g.len() > 1) {
+        let m = mean(g);
+        if m > 0.0 {
+            d.extend(g.iter().map(|x| (x - m).abs() / m));
+        }
+    }
+    (!d.is_empty()).then(|| quantile(&d, 0.95))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Разброс повторов: одиночные элементы и нулевые средние не входят; одинаковые — 0.
+    #[test]
+    fn rep_spread_p95_of_groups() {
+        assert_eq!(rep_spread_p95(&[vec![5.0], vec![0.0, 0.0]]), None);
+        assert_eq!(rep_spread_p95(&[vec![7.0, 7.0, 7.0]]), Some(0.0));
+        // среднее 100: отклонения 0,1; 0; 0,1 → p95 (интерполяция между 0,1 и 0,1) — 0,1
+        let p = rep_spread_p95(&[vec![90.0, 100.0, 110.0], vec![3.0]]).unwrap();
+        assert!((p - 0.1).abs() < 1e-12, "{p}");
     }
 
     #[test]
@@ -477,6 +602,95 @@ mod tests {
         let b: Vec<f64> = a.iter().map(|x| x + 0.1).collect();
         let d = paired_diff(&a, &b);
         assert!((d.mean - 0.1).abs() < 1e-12 && d.lo > 0.09);
+    }
+
+    /// Одинаковые плечи: R = 1, интервал его содержит.
+    #[test]
+    fn ratio_identity_is_one() {
+        let pairs: Vec<(f64, f64)> = (1..=40)
+            .map(|i| (f64::from(i * 37 % 900), f64::from(i * 37 % 900)))
+            .collect();
+        let e = ratio_estimate_with(&pairs, BOOTSTRAP_M6, 7).unwrap();
+        assert!((e.mean - 1.0).abs() < 1e-12);
+        assert!(e.lo <= 1.0 && 1.0 <= e.hi, "{e:?}");
+        assert!(ratio_estimate_with(&[(1.0, 0.0)], BOOTSTRAP_M6, 7).is_none());
+    }
+
+    /// Одно зерно — один интервал; другое зерно — другие границы.
+    #[test]
+    fn ratio_seed_reproducible() {
+        let pairs: Vec<(f64, f64)> = (0..30)
+            .map(|i| (f64::from(500 + i * 13 % 170), f64::from(800 + i * 29 % 310)))
+            .collect();
+        let a = ratio_estimate_with(&pairs, 2000, 42).unwrap();
+        assert_eq!(ratio_estimate_with(&pairs, 2000, 42).unwrap(), a);
+        let b = ratio_estimate_with(&pairs, 2000, 43).unwrap();
+        assert_eq!(a.mean, b.mean);
+        assert!(a.lo != b.lo || a.hi != b.hi);
+        // старый интерфейс — тот же расчёт с BOOTSTRAP выборок и прежним зерном
+        let (num, den): (Vec<f64>, Vec<f64>) = pairs.iter().copied().unzip();
+        assert_eq!(
+            ratio_estimate(&num, &den).unwrap(),
+            ratio_estimate_with(&pairs, BOOTSTRAP, SEED).unwrap()
+        );
+    }
+
+    /// `[1,1,0]` против `[0,1,1]`: одна потеря и одна находка — L = 0.
+    #[test]
+    fn net_losses_counts_both_ways() {
+        assert_eq!(net_losses(&[true, true, false], &[false, true, true]), 0);
+        assert_eq!(net_losses(&[true, true, true], &[false, false, true]), 2);
+        assert_eq!(net_losses(&[false, false], &[true, true]), -2);
+    }
+
+    /// Микро-полнота — Σ найденных / Σ всех; взвешенная разность — разность микро-полнот.
+    #[test]
+    fn micro_recall_and_weighted_diff() {
+        assert!((micro_recall(&[(1, 2), (3, 3), (0, 1)]) - 4.0 / 6.0).abs() < 1e-12);
+        assert_eq!(micro_recall(&[]), 0.0);
+        let base = [0.5, 1.0, 0.0];
+        let arm = [1.0, 1.0, 0.0];
+        let w = [2.0, 3.0, 1.0];
+        let d = paired_diff_weighted(&base, &arm, &w, BOOTSTRAP_M6, 1);
+        assert!((d.mean - 1.0 / 6.0).abs() < 1e-12, "{d:?}");
+        assert!(d.lo <= d.mean && d.mean <= d.hi);
+        let same = paired_diff_weighted(&base, &base, &w, BOOTSTRAP_M6, 1);
+        assert_eq!((same.mean, same.lo, same.hi), (0.0, 0.0, 0.0));
+        // границы — 5-й и 95-й перцентили выборок (односторонние 95 %), не 2,5 / 97,5
+        let a: Vec<f64> = (0..20).map(|i| f64::from(i % 3) / 2.0).collect();
+        let b: Vec<f64> = (0..20).map(|i| f64::from((i + 1) % 3) / 2.0).collect();
+        let w: Vec<f64> = (0..20).map(|i| f64::from(1 + i % 4)).collect();
+        let d = paired_diff_weighted(&a, &b, &w, 500, 9);
+        let mut rng = Rng(9);
+        let mut s: Vec<f64> = (0..500)
+            .map(|_| {
+                let (mut x, mut ws) = (0.0, 0.0);
+                for _ in 0..20 {
+                    let i = rng.below(20);
+                    x += w[i] * (b[i] - a[i]);
+                    ws += w[i];
+                }
+                x / ws
+            })
+            .collect();
+        s.sort_by(f64::total_cmp);
+        assert_eq!((d.lo, d.hi), (percentile(&s, 0.05), percentile(&s, 0.95)));
+    }
+
+    /// Бутстреп парный: сценарий берётся в выборку обоими плечами сразу. У коррелированных
+    /// плеч (тяжёлый сценарий тяжёл в обоих) интервал R уже, чем у тех же чисел без пар.
+    #[test]
+    fn paired_bootstrap_uses_pairs() {
+        let base: Vec<f64> = (0..40).map(|i| f64::from(200 + (i * 97) % 3000)).collect();
+        let arm: Vec<f64> = base.iter().map(|x| x * 0.7).collect();
+        let paired: Vec<(f64, f64)> = arm.iter().copied().zip(base.iter().copied()).collect();
+        // те же значения, пары перемешаны (сдвиг на 17)
+        let shuffled: Vec<(f64, f64)> = (0..40).map(|i| (arm[(i + 17) % 40], base[i])).collect();
+        let p = ratio_estimate_with(&paired, BOOTSTRAP_M6, SEED).unwrap();
+        let u = ratio_estimate_with(&shuffled, BOOTSTRAP_M6, SEED).unwrap();
+        assert!((p.mean - 0.7).abs() < 1e-12 && (u.mean - 0.7).abs() < 1e-12);
+        assert!(p.hi - p.lo < 1e-9, "{p:?}");
+        assert!(u.hi - u.lo > 0.05, "{u:?}");
     }
 
     #[test]

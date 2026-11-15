@@ -1008,7 +1008,8 @@ async fn member_triggers_only_solution_and_own_knowledge() {
 
 #[tokio::test]
 async fn strict_area_filter() {
-    let w = world("area", false).await;
+    // буст области проверяется явным множителем: умолчание 1,0 (сетка задачи 11 M6) — без буста
+    let w = world_with("area", false, |c| c.search.boost_area = 1.10).await;
     let web = w
         .post_in(
             &w.a_tok,

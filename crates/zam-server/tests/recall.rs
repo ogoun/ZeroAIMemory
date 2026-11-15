@@ -108,16 +108,89 @@ fn ids(j: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Каждая строка подсказки начинается с `ZeroAIMemory:` и несёт свою ссылку.
+/// Каждая строка подсказки начинается с `ZeroAIMemory:` и несёт свою ссылку; строка-индекс
+/// (M6 §8: changelog, revisit) — начинается со ссылки; строка правила под `### Правила` —
+/// `<путь> … n:<id>` без метки (задача 8c).
 fn assert_marked(j: &Value) {
     let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила");
     for id in ids(j) {
+        let index = format!("{id} «");
         let line = text
             .lines()
-            .find(|l| l.ends_with(&format!("— {id}")))
+            .find(|l| l.ends_with(&format!(" {id}")) || l.starts_with(&index))
             .unwrap_or_else(|| panic!("нет строки {id}: {text}"));
-        assert!(line.starts_with("ZeroAIMemory: "), "{line}");
+        assert!(
+            line.starts_with("ZeroAIMemory: ")
+                || line.starts_with(&index)
+                || (rules.iter().any(|r| r == line) && rule_line_shape(line, &id)),
+            "{line}"
+        );
     }
+}
+
+/// Строка правила раздела Rules (задача 8c, ревью п. 11): `<путь>( [..])? <id>` (L1),
+/// `<путь> — <фраза>( [..])? <id>` (L0) или `<путь> …( [..])? <id>` (до пути). Путь может
+/// содержать пробелы (имя заметки «Стиль кода»): он кончается перед ` — ` (L0), перед ` …` (до
+/// пути) или в конце строки (L1); он непуст, без пробелов по краям и не начинается с метки
+/// подсказки, фраза L0 непуста.
+///
+/// Проверка формы намеренно слабая: с пробелами в пути почти любая строка без метки, кончающаяся
+/// ссылкой `<id>`, подходит под вид L1. Сильная часть проверки — у вызывающего: строка обязана
+/// быть строкой раздела `### Правила` и кончаться ссылкой именно этого правила; здесь отсекаются
+/// только метка подсказки, пустой путь, пробелы по краям и пустая фраза.
+fn rule_line_shape(line: &str, id: &str) -> bool {
+    let Some(rest) = line.strip_suffix(&format!(" {id}")) else {
+        return false;
+    };
+    let rest = match rest.rsplit_once(" [") {
+        Some((head, tag)) if tag.ends_with(']') && !tag[..tag.len() - 1].contains(' ') => head,
+        _ => rest,
+    };
+    let (path, phrase) = match rest.split_once(" — ") {
+        Some((path, phrase)) => (path, Some(phrase)),
+        None => (rest.strip_suffix(" …").unwrap_or(rest), None),
+    };
+    !path.is_empty()
+        && path.trim() == path
+        && !path.starts_with("ZeroAIMemory:")
+        && phrase.is_none_or(|p| !p.trim().is_empty())
+}
+
+/// Форма строки правила: путь без пробелов и с пробелами во всех трёх видах; метка подсказки,
+/// пустой путь и пустая фраза — не строка правила (передача 8c → 15a).
+#[test]
+fn rule_line_shape_paths_with_spaces() {
+    let id = "n:0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e12";
+    for ok in [
+        "rules/style",
+        "rules/style [th]",
+        "rules/style — писать кратко",
+        "rules/style — писать кратко [ax]",
+        "rules/style …",
+        "Правила/Стиль кода",
+        "Правила/Стиль кода [th]",
+        "Правила/Стиль кода — писать кратко, без воды",
+        "Правила/Стиль кода — тире — внутри фразы [hyp]",
+        "Правила/Стиль кода …",
+        "Правила/Стиль кода … [th]",
+    ] {
+        assert!(rule_line_shape(&format!("{ok} {id}"), id), "{ok}");
+    }
+    for bad in [
+        "ZeroAIMemory: подсказка",
+        "ZeroAIMemory: путь с пробелом — фраза",
+        "",
+        " rules/style",
+        "rules/style ",
+        "rules/style — ",
+        " — фраза",
+        " …",
+    ] {
+        assert!(!rule_line_shape(&format!("{bad} {id}"), id), "{bad:?}");
+    }
+    // без своей ссылки в конце — не строка этого правила
+    assert!(!rule_line_shape("rules/style n:other", id));
 }
 
 async fn shown(a: &Api, owner: &str, kind: TargetKind, id: &str) -> zam_store::UsageCounts {
@@ -160,9 +233,15 @@ async fn session_start_digest_within_budget() {
     }
     let j = ok(&a, &a.token, Some("s1"), json!({"event": "session_start"})).await;
     let tokens = j["tokens"].as_u64().unwrap();
-    assert!(tokens > 0 && tokens <= 1500, "{tokens}");
     let text = j["text"].as_str().unwrap();
     assert_eq!(zam_store::count_tokens(text) as u64, tokens);
+    // M6 §8: Rules — сверх бюджета, остальное — в `digest_tokens`
+    let rest = without_section(text, "### Правила");
+    assert!(
+        !rest.is_empty() && zam_store::fits_budget(&rest, 1500),
+        "{tokens}: {rest}"
+    );
+    assert!(j["rules_tokens"].as_u64().unwrap() > 0, "{j}");
     assert!(!j["items"].as_array().unwrap().is_empty());
     assert_marked(&j);
     assert_eq!(
@@ -182,8 +261,12 @@ async fn session_start_digest_within_budget() {
         json!({"event": "session_start", "budget_tokens": 120}),
     )
     .await;
-    let tokens = j["tokens"].as_u64().unwrap();
-    assert!(tokens > 0 && tokens <= 120, "{tokens}: {}", j["text"]);
+    let rest = without_section(j["text"].as_str().unwrap(), "### Правила");
+    assert!(
+        !rest.is_empty() && zam_store::fits_budget(&rest, 120),
+        "{}",
+        j["text"]
+    );
     // некорректный бюджет и событие — 400
     for bad in [
         json!({"event": "session_start", "budget_tokens": 0}),
@@ -282,15 +365,15 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
     }
     assert!(!got.contains(&format!("c:{}", changes[0])), "{text}");
     assert!(
-        text.contains("ZeroAIMemory: LF в bash-скриптах [gotcha, hypothesis] — i:"),
+        text.contains("ZeroAIMemory: LF в bash-скриптах [gotcha·hyp] i:"),
         "{text}"
     );
-    assert!(
-        text.contains(
-            "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v6): обнови через `zam init` или WebUI"
-        ),
-        "{text}"
+    // номер текущего блока — из `AGENT_BLOCK_VERSION`: тест не правится при каждом новом блоке
+    let outdated = format!(
+        "ZeroAIMemory: Блок ZeroAIMemory устарел (v1 → v{}): обнови через `zam init` или WebUI",
+        zam_core::AGENT_BLOCK_VERSION
     );
+    assert!(text.contains(&outdated), "{text}");
     assert!(
         text.lines()
             .any(|l| l.starts_with("ZeroAIMemory: запросы доступа") && l.contains(": 1 ")),
@@ -399,7 +482,7 @@ async fn prompt_returns_0_to_3_above_threshold() {
         j["text"]
             .as_str()
             .unwrap()
-            .starts_with("ZeroAIMemory: правило телескоп › Телескоп — n:"),
+            .starts_with("ZeroAIMemory: правило телескоп › Телескоп n:"),
         "{j}"
     );
     // ничего похожего — тишина
@@ -412,7 +495,8 @@ async fn prompt_returns_0_to_3_above_threshold() {
     .await;
     assert_eq!(j["text"], "", "{j}");
     assert!(j["items"].as_array().unwrap().is_empty());
-    // порог выше любого балла — тишина и для релевантного запроса
+    // порог выше любого балла — тишина и для релевантного запроса (порог FTS-only не задан —
+    // тот же `prompt_min_score`, M6 §9)
     let b = api("recall-prompt-strict", |c| {
         roomy(c);
         c.recall.prompt_min_score = 1.0;
@@ -450,7 +534,14 @@ async fn prompt_returns_0_to_3_above_threshold() {
 /// строка «эта ошибка уже разбиралась»; случайное общее слово подсказку не поднимает.
 #[tokio::test]
 async fn post_tool_matches_error_regex_and_fts() {
-    let a = server("post-tool").await;
+    // правило покрытия M4 (⌈n/3⌉): у ошибки докера совпадают 2 слова из 6; при умолчании M6
+    // (⌈n/2⌉ от 2 до 6, сетка задачи 9) нужно 3 — подсказки не было бы
+    let a = api("recall-post-tool", |c| {
+        roomy(c);
+        c.recall.post_tool_coverage = zam_search::recall::CoverageRule::M4;
+    })
+    .await;
+    allow_rules(&a).await;
     let crlf = entry(
         &a,
         &a.token,
@@ -495,7 +586,7 @@ async fn post_tool_matches_error_regex_and_fts() {
     assert_eq!(j["items"][0]["reason"], "error_regex");
     assert!(
         j["text"].as_str().unwrap().starts_with(&format!(
-            "ZeroAIMemory: эта ошибка уже разбиралась: CRLF в скриптах [gotcha, hypothesis] — i:{crlf}"
+            "ZeroAIMemory: эта ошибка уже разбиралась: CRLF в скриптах [gotcha·hyp] i:{crlf}"
         )),
         "{j}"
     );
@@ -534,6 +625,32 @@ async fn post_tool_matches_error_regex_and_fts() {
 }
 
 /// Подсказка `session_start`/`prompt` показывается сессии один раз (в другой сессии — снова),
+/// Цена умолчания M6 `{2, 6, plain}` (сетка задачи 9, повторное ревью M-c): ошибка docker
+/// совпадает с записью 2 словами из 6 (`permission`, `denied`), а нужно ⌈6/2⌉ = 3 — подсказки
+/// нет; при правиле M4 (⌈6/3⌉ = 2) — была (тест выше).
+#[tokio::test]
+async fn post_tool_default_needs_half_of_words() {
+    let a = server("post-tool-m6").await;
+    let docker = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Нет доступа к docker",
+        "permission denied при подключении к docker: добавь пользователя в группу docker",
+        "failure",
+    )
+    .await;
+    let err = "dial unix /var/run/docker.sock: connect: permission denied (code 13)";
+    let j = ok(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "post_tool", "tool": "Bash", "error": err}),
+    )
+    .await;
+    assert!(!ids(&j).contains(&format!("i:{docker}")), "{j}");
+}
+
 /// `post_tool` — при каждой ошибке; без сессии повторы не учитываются.
 #[tokio::test]
 async fn recall_no_repeat_in_session_except_post_tool() {
@@ -896,6 +1013,127 @@ async fn post_tool_long_trace_finds_short_insight() {
     assert!(!got.contains(&format!("i:{decoy}")), "{j}");
 }
 
+/// M6 §9: `recall.post_tool_coverage.word_match` — `plain` сравнивает начало слова (форма
+/// «консоль» не находит «консоли»), `stems` — основы, без служебных слов, `ё` → `е`.
+#[tokio::test]
+async fn post_tool_coverage_word_match_from_config() {
+    use zam_search::recall::WordMatch;
+    let mut got = Vec::new();
+    for (name, wm) in [("plain", WordMatch::Plain), ("stems", WordMatch::Stems)] {
+        let a = api(&format!("recall-post-tool-{name}"), |c| {
+            roomy(c);
+            c.recall.post_tool_coverage.word_match = wm;
+        })
+        .await;
+        let id = insight(
+            &a,
+            &a.token,
+            "knowledge",
+            "Вывод консоли Windows с кириллицей превращается в кракозябры",
+            "Кодовая страница консоли 866 не совпадает с UTF-8: chcp 65001 перед запуском.",
+            "gotcha",
+        )
+        .await;
+        let j = ok(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "post_tool", "error": "консоль: кракозябры"}),
+        )
+        .await;
+        got.push((ids(&j).contains(&format!("i:{id}")), j));
+    }
+    assert!(!got[0].0, "plain: «консоль» ≠ «консоли»: {}", got[0].1);
+    assert!(got[1].0, "stems: основа «конс»: {}", got[1].1);
+}
+
+/// Ревью задачи 9, I-2 (M-5): при `stems` код ошибки с цифрами совпадает только целиком —
+/// `LNK1181` не подтверждается записью о `LNK1104` по общему началу основы.
+#[tokio::test]
+async fn post_tool_stems_codes_match_whole() {
+    use zam_search::recall::WordMatch;
+    let a = api("recall-post-tool-codes", |c| {
+        roomy(c);
+        c.recall.post_tool_coverage.word_match = WordMatch::Stems;
+    })
+    .await;
+    let other = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "LNK1104 onnxruntime",
+        "Компоновщик не открыл файл onnxruntime.",
+        "failure",
+    )
+    .await;
+    let same = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "LNK1181 onnxruntime",
+        "Статическая линковка onnxruntime.",
+        "failure",
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "post_tool", "error": "lnk1181 onnxruntime.dll"}),
+    )
+    .await;
+    let got = ids(&j);
+    assert!(got.contains(&format!("i:{same}")), "{j}");
+    assert!(!got.contains(&format!("i:{other}")), "{j}");
+}
+
+/// M6 §9: поиск `prompt` без модели деградировал до FTS — порог балла подсказки
+/// `recall.prompt_min_score_fts`, а `recall.prompt_min_score` не действует.
+#[tokio::test]
+async fn prompt_fts_only_uses_fts_threshold() {
+    let mut counts = Vec::new();
+    for (name, min, fts) in [("fts-low", 1.0, 0.0), ("fts-high", 0.0, 1.0)] {
+        let a = api(&format!("recall-prompt-{name}"), |c| {
+            roomy(c);
+            c.recall.prompt_min_score = min;
+            c.recall.prompt_min_score_fts = Some(fts);
+        })
+        .await;
+        insight(
+            &a,
+            &a.token,
+            "knowledge",
+            "Квазар",
+            "Квазар светит ярче галактики.",
+            "discovery",
+        )
+        .await;
+        for i in 0..4 {
+            let filler = "длинное описание наблюдений и приборов обсерватории ".repeat(i + 2);
+            insight(
+                &a,
+                &a.token,
+                "knowledge",
+                &format!("Наблюдения, серия {i}"),
+                &format!("{filler} Квазар в поле зрения."),
+                "discovery",
+            )
+            .await;
+        }
+        let j = ok(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "prompt", "prompt": "квазар"}),
+        )
+        .await;
+        counts.push((ids(&j).len(), j));
+    }
+    // порог 0 при FTS — все 3 места; порог 1 — только лучшие (балл 1,0), меньше
+    assert_eq!(counts[0].0, 3, "{}", counts[0].1);
+    assert!(counts[1].0 < 3, "{}", counts[1].1);
+}
+
 // ---- замер бюджета (§10.3, §17) ----
 
 /// Корпус eval (`eval/corpus`, `eval/insights.toml`) в Knowledge и решении; запросы — из
@@ -1229,7 +1467,10 @@ async fn digest_code_line_under_80_tokens_after_verified() {
     .await;
     let line = code_line(&j).unwrap_or_else(|| panic!("нет строки карты: {j}"));
     assert!(
-        line.starts_with("ZeroAIMemory: карта кода: 2 файла, 3 символа, снимок 0 мин (main@abcdef1); центральные: "),
+        line.starts_with(&format!(
+            "ZeroAIMemory: карта кода: 2 файла, 3 символа, снимок {} (main@abcdef1); центральные: ",
+            zam_store::time::utc_today()
+        )),
         "{line}"
     );
     assert!(line.ends_with(" — `memory_code`/`zam code map`"), "{line}");
@@ -1366,5 +1607,1254 @@ async fn recovery_has_code_line() {
         let line = code_line(&j).unwrap_or_else(|| panic!("{body}: нет строки: {j}"));
         assert!(line.contains("1 файл, 1 символ"), "{line}");
         assert!(line.contains("центральные: alpha"), "{line}");
+    }
+}
+
+/// M6 §7.2: подсказка `prompt`, показанная в прежней эпохе, после новой эпохи (`new_epoch`) снова
+/// показывается — контекст агента потерян; в той же эпохе — один раз.
+#[tokio::test]
+async fn prompt_hint_returns_after_new_epoch() {
+    let a = server("prompt-epoch").await;
+    let g = entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "insight", "title": "Квазар коварен", "body": "Квазар светит ярко.",
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let me = format!("i:{g}");
+    let prompt = json!({"event": "prompt", "prompt": "квазар"});
+    let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
+    assert_eq!(ids(&j), [me.as_str()], "{j}");
+    let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
+    assert_eq!(j["text"], "", "{j}");
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "pe", "new_epoch": true})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
+    assert_eq!(ids(&j), [me.as_str()], "{j}");
+    let j = ok(&a, &a.token, Some("pe"), prompt.clone()).await;
+    assert_eq!(j["text"], "", "{j}");
+}
+
+// ---- задача 8a M6 (§8): Rules-резерв, компактные индексы, ключи `[recall]` ----
+
+/// Текст без раздела `title` (заголовок, его строки и пустая строка перед ним) — часть
+/// дайджеста, что упаковывается в бюджет (Rules — сверх него, M6 §8).
+fn without_section(text: &str, title: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let Some(start) = lines.iter().position(|l| *l == title) else {
+        return text.to_string();
+    };
+    let end = lines[start..]
+        .iter()
+        .position(|l| l.is_empty())
+        .map_or(lines.len(), |k| start + k);
+    let mut kept: Vec<&str> = Vec::new();
+    if start > 0 && lines[start - 1].is_empty() {
+        // пустая строка перед заголовком уходит вместе с разделом
+        kept.extend(&lines[..start - 1]);
+        kept.extend(&lines[end..]);
+    } else {
+        // раздел первый: уходит пустая строка после него
+        kept.extend(lines.get(end + 1..).unwrap_or_default());
+    }
+    kept.join("\n")
+}
+
+/// Строки раздела `title` (без заголовка); нет раздела — пусто.
+fn section(text: &str, title: &str) -> Vec<String> {
+    let Some(rest) = text.split(&format!("{title}\n")).nth(1) else {
+        return Vec::new();
+    };
+    rest.split("\n\n")
+        .next()
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// M6 §8, §17 п. 9: все Rules (до 20, L1 ≤ 200 токенов) выдаются сверх `digest_tokens` даже
+/// при бюджете 100, в дайджесте и в пакете восстановления; остальное — в бюджете;
+/// `rules_tokens` — размер раздела Rules.
+#[tokio::test]
+async fn rules_reserved_never_cut() {
+    let a = api("recall-rules-reserved", |c| {
+        roomy(c);
+        c.recall.digest_tokens = 100;
+        c.recall.recovery_tokens = 100;
+    })
+    .await;
+    allow_rules(&a).await;
+    let long = "Длинное пояснение правила с подробностями и примерами. ".repeat(40);
+    let mut rules = Vec::new();
+    for i in 0..21 {
+        let n = a
+            .note(
+                "rules",
+                &format!("правило-{i:02}"),
+                &format!("# Правило {i}\n\n{long}\n"),
+            )
+            .await;
+        rules.push(format!("n:{}", n["id"].as_str().unwrap()));
+    }
+    for i in 0..8 {
+        insight(
+            &a,
+            &a.token,
+            "knowledge",
+            &format!("Ловушка номер {i} с длинным заголовком про сборку и окружение"),
+            "текст",
+            "gotcha",
+        )
+        .await;
+    }
+    for event in ["session_start", "recovery"] {
+        let j = ok(&a, &a.token, Some("rr-1"), json!({"event": event})).await;
+        let text = j["text"].as_str().unwrap();
+        let got = ids(&j);
+        // до RULES_MAX = 20 по приоритету (надёжность, затем давность создания): первые 20
+        // созданных — на месте, самое новое — строкой о непоказанных (ревью 8a, I1)
+        for r in &rules[..20] {
+            assert!(got.contains(r), "{event}: {r}: {text}");
+        }
+        assert!(
+            !got.contains(&rules[20]),
+            "{event}: сверх RULES_MAX: {text}"
+        );
+        let rules_part = section(text, "### Правила");
+        assert_eq!(
+            rules_part.last().map(String::as_str),
+            Some("ZeroAIMemory: не показано — правил: 1 (memory_tree Rules)"),
+            "{event}: {text}"
+        );
+        let rest = without_section(text, "### Правила");
+        assert!(
+            zam_store::fits_budget(&rest, 100),
+            "{event}: без Rules {} > 100: {rest}",
+            zam_store::count_tokens(&rest)
+        );
+        let rules_tokens = j["rules_tokens"].as_u64().unwrap_or_else(|| panic!("{j}"));
+        assert!(rules_tokens > 100, "{event}: {j}");
+    }
+    // пакет под задачу — L0 Rules в своём бюджете, как раньше
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rr-2"),
+        json!({"event": "brief", "budget_tokens": 100}),
+    )
+    .await;
+    assert!(j["tokens"].as_u64().unwrap() <= 100, "{j}");
+}
+
+/// Задача 8c (ревью, п. 10): строка правила — `<путь> n:<id>` без метки; абзац — одной строкой;
+/// `# заголовок`, повторяющий путь, опущен, не повтор — остаётся; правило из одного заголовка-
+/// повтора — с заголовком. В пакете субагенту L0 правила — та же строка без метки (п. 13).
+#[tokio::test]
+async fn rule_heading_repeating_path_dropped() {
+    let a = api("recall-rule-heading", roomy).await;
+    allow_rules(&a).await;
+    let id = |n: &Value| format!("n:{}", n["id"].as_str().unwrap());
+    let sec = id(&a
+        .note(
+            "rules",
+            "security/secrets",
+            "# Secrets\n\nSecrets never go\ninto logs.\n",
+        )
+        .await);
+    let mig = id(&a
+        .note(
+            "rules",
+            "backend/migrations",
+            "# Миграции базы\n\nТолько\nдобавляют.\n",
+        )
+        .await);
+    let only = id(&a.note("rules", "process/tests", "# Tests\n").await);
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rh-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила").join("\n");
+    assert!(
+        rules.contains(&format!(
+            "security/secrets {sec}\n  Secrets never go into logs."
+        )),
+        "{text}"
+    );
+    assert!(
+        rules.contains(&format!(
+            "backend/migrations {mig}\n  # Миграции базы\n  Только добавляют."
+        )),
+        "{text}"
+    );
+    assert!(
+        rules.contains(&format!("process/tests {only}\n  # Tests")),
+        "{text}"
+    );
+    assert!(!text.contains("правило "), "{text}");
+    assert_marked(&j);
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rh-2"),
+        json!({"event": "brief", "task": "миграции и секреты"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила");
+    assert!(
+        rules
+            .iter()
+            .any(|l| l.starts_with("security/secrets") && l.ends_with(&format!(" {sec}"))),
+        "{text}"
+    );
+    assert!(!text.contains("ZeroAIMemory: правило"), "{text}");
+}
+
+/// Решение контролёра по ревью 8a: в разделе Rules — текст правила до `RULE_L1_TOKENS` (200), а
+/// не оглавление с первой фразой секции: вторая фраза правила видна без предела канала; текст
+/// длиннее — с «…» и строкой «правила сокращены … memory_read n:<id>».
+#[tokio::test]
+async fn rule_text_whole_and_long_cut_marked() {
+    let a = api("recall-rule-text", roomy).await;
+    allow_rules(&a).await;
+    let short = a
+        .note(
+            "rules",
+            "process/short",
+            "---\ntags: [rule]\n---\n# Короткое\n\nПервая фраза правила. Исключение: только \
+             по пятницам.\n",
+        )
+        .await;
+    let short_ref = format!("n:{}", short["id"].as_str().unwrap());
+    // REST без `source` и `output_limit` — без предела канала: только текст правила
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rt-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила").join("\n");
+    assert!(rules.contains(&short_ref), "{text}");
+    assert!(
+        rules.contains("Исключение: только по пятницам."),
+        "вторая фраза правила потеряна: {text}"
+    );
+    assert!(
+        !rules.contains("tags:"),
+        "frontmatter в тексте правила: {text}"
+    );
+    assert!(!rules.contains("правила сокращены"), "{text}");
+
+    let long = "Подробность правила с примером и оговоркой. ".repeat(60);
+    let n = a
+        .note("rules", "process/long", &format!("# Длинное\n\n{long}\n"))
+        .await;
+    let long_ref = format!("n:{}", n["id"].as_str().unwrap());
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rt-2"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let rules = section(text, "### Правила");
+    let at = rules
+        .iter()
+        .position(|l| l.contains(&long_ref))
+        .unwrap_or_else(|| panic!("{text}"));
+    let body: Vec<&String> = rules[at + 1..]
+        .iter()
+        .take_while(|l| l.starts_with("  "))
+        .collect();
+    let body = body.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+    assert!(body.ends_with('…'), "длинное правило без «…»: {body}");
+    assert!(
+        zam_store::fits_budget(&body, 200),
+        "текст правила {} > 200: {body}",
+        zam_store::count_tokens(&body)
+    );
+    assert!(
+        rules.iter().any(|l| l
+            == "ZeroAIMemory: правила сокращены («…» — обрезано) — полностью memory_read n:<id>"),
+        "{text}"
+    );
+    // короткое — по-прежнему целиком
+    assert!(text.contains("Исключение: только по пятницам."), "{text}");
+}
+
+/// M6 §8: порядок разделов не зависит от `usage` (`recall_shown`, `useful`) и показов других
+/// сессий — два старта разных сессий подряд дают одинаковый `text`.
+#[tokio::test]
+async fn digest_order_ignores_recall_shown() {
+    let a = server("order-usage").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let mut traps = Vec::new();
+    for i in 0..8 {
+        traps.push(insight(&a, &a.token, G, &format!("Ловушка {i}"), "x", "gotcha").await);
+    }
+    for i in 0..8 {
+        entry(
+            &a,
+            &a.token,
+            G,
+            json!({"kind": "changelog", "title": format!("Изменение {i}"), "body": "x",
+                   "data": {"kind": "fix"}}),
+        )
+        .await;
+    }
+    let body = json!({"event": "session_start", "solution": G});
+    let first = ok(&a, &a.token, Some("ou-1"), body.clone()).await;
+    // показы и полезность самой старой ловушки — много раз, в других сессиях
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let old = traps[0].clone();
+    db.write(move |tx| {
+        for k in 0..50 {
+            for ev in ["recall_shown", "useful"] {
+                tx.execute(
+                    "INSERT INTO usage (target_kind, target_id, event, source, session_id, \
+                     user_id, ts) SELECT 'entry', ?1, ?2, source, ?3, user_id, ts FROM usage \
+                     LIMIT 1",
+                    rusqlite::params![old, ev, format!("other-{k}")],
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let second = ok(&a, &a.token, Some("ou-2"), body.clone()).await;
+    assert_eq!(first["text"], second["text"], "{first}\n---\n{second}");
+}
+
+/// M6 §8: раздел `### Идеи` (как задачи и ответы человека) идёт в бюджет первым — компактные
+/// индексы его не вытесняют; Rules — сверх бюджета.
+#[tokio::test]
+async fn ideas_section_not_cut_by_budget() {
+    let a = api("recall-ideas-budget", |c| {
+        roomy(c);
+        c.recall.digest_tokens = 260;
+    })
+    .await;
+    allow_rules(&a).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    for i in 0..6 {
+        a.note(
+            "rules",
+            &format!("п{i}"),
+            &format!("# Правило {i}\n\nТекст правила {i}."),
+        )
+        .await;
+    }
+    let mut ideas = Vec::new();
+    for t in ["Кэш миниатюр", "Экспорт отчётов", "Тёмная тема"] {
+        let r = a
+            .t(
+                Method::POST,
+                &format!("/api/v1/spaces/{G}/entries"),
+                Some(json!({"kind": "idea", "title": t, "body": "Замысел.",
+                            "data": {"origin": "human", "priority": "high"}})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        ideas.push(format!("w:{}", r.json()["id"].as_str().unwrap()));
+    }
+    for i in 0..10 {
+        insight(
+            &a,
+            &a.token,
+            G,
+            &format!("Ловушка сборки номер {i}"),
+            "x",
+            "gotcha",
+        )
+        .await;
+        entry(
+            &a,
+            &a.token,
+            G,
+            json!({"kind": "changelog", "title": format!("Изменение {i}"), "body": "x",
+                   "data": {"kind": "fix"}}),
+        )
+        .await;
+    }
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ib-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let got = ids(&j);
+    for w in &ideas {
+        assert!(got.contains(w), "{w}: {text}");
+    }
+    // правило — строка правила и его текст (заголовок и фраза; решение контролёра по ревью 8a)
+    assert_eq!(section(text, "### Правила").len(), 18, "{text}");
+}
+
+/// Строка-индекс `<ссылка> «<заголовок>» · <N>t`.
+fn index_line(line: &str, reference: &str, title: &str) -> bool {
+    line.strip_prefix(&format!("{reference} «{title}» · "))
+        .and_then(|n| n.strip_suffix('t'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// M6 §8: changelog и revisit — компактные строки-индексы `<ссылка> «заголовок» · Nt`.
+#[tokio::test]
+async fn changelog_index_line_format() {
+    let a = server("index-lines").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let body = "Исправлен разбор дат в отчёте. ".repeat(10);
+    let c = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "changelog", "title": "Разбор дат", "body": body,
+               "data": {"kind": "fix"}}),
+    )
+    .await;
+    let r = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "insight", "title": "Проверить таймауты", "body": "Таймауты шлюза.",
+               "data": {"kind": "decision"}, "status": "revisit"}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("il-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let changes = section(text, "### Последние изменения");
+    assert_eq!(changes.len(), 1, "{text}");
+    let line = &changes[0];
+    assert!(index_line(line, &format!("c:{c}"), "Разбор дат"), "{line}");
+    let n: usize = line
+        .rsplit(" · ")
+        .next()
+        .unwrap()
+        .trim_end_matches('t')
+        .parse()
+        .unwrap();
+    assert!(n > 20, "размер записи: {line}");
+    let revisit = section(text, "### Пересмотреть (revisit)");
+    assert_eq!(revisit.len(), 1, "{text}");
+    assert!(
+        index_line(&revisit[0], &format!("i:{r}"), "Проверить таймауты"),
+        "{}",
+        revisit[0]
+    );
+    // индексы — тоже подсказки: в `items[]` и в учёте показов
+    let got = ids(&j);
+    assert!(
+        got.contains(&format!("c:{c}")) && got.contains(&format!("i:{r}")),
+        "{j}"
+    );
+}
+
+/// M6 §8: `recall.digest_entries` — предел записей в разделах дайджеста (ловушки, changelog).
+#[tokio::test]
+async fn digest_entries_limits_sections() {
+    let a = api("recall-digest-entries", |c| {
+        roomy(c);
+        c.recall.digest_entries = 2;
+    })
+    .await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    for i in 0..4 {
+        insight(&a, &a.token, G, &format!("Ловушка {i}"), "x", "gotcha").await;
+        entry(
+            &a,
+            &a.token,
+            G,
+            json!({"kind": "changelog", "title": format!("Изменение {i}"), "body": "x",
+                   "data": {"kind": "fix"}}),
+        )
+        .await;
+    }
+    let j = ok(
+        &a,
+        &a.token,
+        Some("de-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert_eq!(section(text, "### Ловушки и сбои").len(), 2, "{text}");
+    assert_eq!(section(text, "### Последние изменения").len(), 2, "{text}");
+}
+
+/// M6 §8: корень решения — одна строка, L0 — до 20 токенов.
+#[tokio::test]
+async fn solution_root_l0_cut_to_20_tokens() {
+    let a = server("root-l0").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let l0 = "Сервис расчёта доставки заказов по регионам с учётом тарифов перевозчиков, \
+              весовых коэффициентов, праздников и окон приёма на складах партнёров";
+    let root = note_as(
+        &a,
+        &a.token,
+        G,
+        "README",
+        &format!("---\nl0: {l0}\n---\n# README\n\nТекст.\n"),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rl-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let line = section(text, "### Решение")
+        .into_iter()
+        .find(|l| l.ends_with(&format!("n:{root}")))
+        .unwrap_or_else(|| panic!("нет корня: {text}"));
+    let shown = line
+        .split_once(" — ")
+        .map(|(_, s)| s)
+        .unwrap_or_else(|| panic!("нет L0: {line}"));
+    let shown = shown.rsplit_once(" n:").map_or(shown, |(s, _)| s);
+    assert!(shown.starts_with("Сервис расчёта доставки"), "{line}");
+    assert!(
+        shown.chars().count() < l0.chars().count(),
+        "L0 не сокращён: {line}"
+    );
+    assert!(zam_store::count_tokens(shown) <= 21, "{line}");
+}
+
+/// M6 §8, решение 16: `recall.digest_code_map_tokens = 0` (умолчание) — только строка-указатель
+/// карты; больше 0 — мини-карта `### Карта кода` (центральные символы) в пределах ключа.
+#[tokio::test]
+async fn code_map_pointer_only_at_zero() {
+    let files: &[(&str, &[(&str, u32)])] = &[
+        ("src/store.rs", &[("Store::open", 1), ("Store::close", 9)]),
+        ("src/api.rs", &[("route", 1), ("handler", 7)]),
+        ("src/db.rs", &[("Db::query", 3)]),
+    ];
+    let a = server("code-pointer").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    load_map(&a, &a.token, files).await;
+    let body = json!({"event": "session_start", "solution": G});
+    let j = ok(&a, &a.token, Some("cp-1"), body.clone()).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(code_line(&j).is_some(), "{text}");
+    assert!(!text.contains("### Карта кода"), "{text}");
+    let b = api("recall-code-mini", |c| {
+        roomy(c);
+        c.recall.digest_code_map_tokens = 60;
+    })
+    .await;
+    assert_eq!(register(&b, &b.token).await.status, StatusCode::CREATED);
+    load_map(&b, &b.token, files).await;
+    let j = ok(&b, &b.token, Some("cp-2"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(code_line(&j).is_some(), "{text}");
+    let mini = section(text, "### Карта кода");
+    assert!(!mini.is_empty(), "{text}");
+    assert!(
+        mini.iter()
+            .all(|l| l.starts_with("src/") && l.contains(':')),
+        "{mini:?}"
+    );
+    let block = format!("\n### Карта кода\n{}\n", mini.join("\n"));
+    assert!(
+        zam_store::fits_budget(&block, 60),
+        "{}: {mini:?}",
+        zam_store::count_tokens(&block)
+    );
+}
+
+/// Предложение zero-agent (приложение исследования 2026-11-06): задача в `open`, захваченная
+/// сессией (`claim`), видна в дайджесте — своя первой с пометкой, чужая — после задач в работе,
+/// с пометкой; незахваченная `open` — нет.
+#[tokio::test]
+async fn digest_shows_claimed_open_tasks() {
+    let a = server("claimed-open").await;
+    let mut ids_of = Vec::new();
+    for title in [
+        "Моя захваченная",
+        "Чужая захваченная",
+        "Свободная",
+        "В работе",
+    ] {
+        ids_of.push(
+            entry(
+                &a,
+                &a.token,
+                "knowledge",
+                json!({"kind": "task", "title": title, "data": {"next_step": "шаг"}}),
+            )
+            .await,
+        );
+    }
+    let (mine, other, free, busy) = (&ids_of[0], &ids_of[1], &ids_of[2], &ids_of[3]);
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{busy}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for (t, s) in [(mine, "cl-me"), (other, "cl-other")] {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                &format!("/api/v1/entries/{t}/claim"),
+                Some(json!({})),
+                &[("x-zam-session", s)],
+            )
+            .await;
+        assert!(r.status.is_success(), "{}", r.text());
+    }
+    let j = ok(
+        &a,
+        &a.token,
+        Some("cl-me"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let lines = section(text, "### Задачи");
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(
+        lines[0].contains("Моя захваченная") && lines[0].contains("захвачена этой сессией"),
+        "{text}"
+    );
+    assert!(lines[0].contains(&format!("k:{mine}")), "{text}");
+    assert!(lines[1].contains("[in_progress] В работе"), "{text}");
+    assert!(
+        lines[2].contains("Чужая захваченная") && lines[2].contains("захвачена другой сессией"),
+        "{text}"
+    );
+    assert!(!text.contains(free.as_str()), "{text}");
+    // у другой сессии — наоборот
+    let j = ok(
+        &a,
+        &a.token,
+        Some("cl-other"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let lines = section(j["text"].as_str().unwrap(), "### Задачи");
+    assert!(
+        lines[0].contains("Чужая захваченная") && lines[0].contains("захвачена этой сессией"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[2].contains("Моя захваченная") && lines[2].contains("захвачена другой сессией"),
+        "{lines:?}"
+    );
+}
+
+// ---- ревью задачи 8a (C1, I1, I3, M1, M3): предел вывода канала, приоритет правил ----
+
+/// Пределы каналов агентов (`zam-cli` `hook::output`): Claude Code — символы, Codex — байты.
+const CLAUDE_MAX_CHARS: usize = 9000;
+const CODEX_MAX_BYTES: usize = 7500;
+
+/// Текст правила: `n` разделов кириллицей (L1 — оглавление с первыми фразами, ≈ 200 токенов при
+/// `n = 12`) и `l0` во frontmatter.
+fn rule_text(title: &str, l0: &str, n: usize) -> String {
+    let body: String = (0..n)
+        .map(|k| {
+            format!(
+                "## Пункт {k}\n\nПредложение {k} правила «{title}» требует проверки изменений и \
+                 записи в журнал.\n\n"
+            )
+        })
+        .collect();
+    format!("---\nl0: {l0}\n---\n# {title}\n\n{body}")
+}
+
+/// Хвост первой фразы L0 правил мира: длиннее предела L0 правила (40 токенов) — строка L0
+/// обрезается с «…».
+const RULE_L0_TAIL: &str = "проверять каждое изменение на стенде, записывать решение и его причину в \
+    журнал задачи, согласовывать выпуск с дежурным и владельцем сервиса, не трогать чужие ветки, \
+    стенды и секреты, сообщать о сбоях в канал команды";
+/// Строка-пояснение раздела Rules о сокращённых правилах.
+const SHORT_NOTE: &str =
+    "ZeroAIMemory: правила сокращены («…» — обрезано) — полностью memory_read n:<id>";
+
+/// Мир «20 правил × 200 токенов кириллицей» с решением, ловушками, задачей и картой кода; id
+/// правил по порядку создания.
+async fn heavy_rules_world(name: &str, rules: usize) -> (Api, Vec<String>) {
+    let a = server(name).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let mut ids = Vec::new();
+    let dirs = ["security", "process", "backend", "frontend", "infra"];
+    for i in 0..rules {
+        let path = format!("{}/правило-{i:02}", dirs[i % dirs.len()]);
+        let r = note_as(
+            &a,
+            &a.token,
+            "rules",
+            &path,
+            &rule_text(
+                &format!("Правило {i}"),
+                &format!("Кратко о правиле {i}: {RULE_L0_TAIL}. Вторая фраза L0."),
+                12,
+            ),
+        )
+        .await;
+        ids.push(format!("n:{r}"));
+    }
+    for i in 0..3 {
+        insight(
+            &a,
+            &a.token,
+            G,
+            &format!("Ловушка сборки {i}"),
+            "x",
+            "gotcha",
+        )
+        .await;
+    }
+    let t = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": "Задача в работе", "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{t}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    load_map(&a, &a.token, &[("src/store.rs", &[("Store::open", 1)])]).await;
+    (a, ids)
+}
+
+/// Все правила в тексте — блоком (L1 или L0) или учтены строкой «ещё N правил не показаны».
+fn assert_rules_accounted(what: &str, text: &str, ids: &[String]) {
+    let missing = ids.iter().filter(|r| !text.contains(r.as_str())).count();
+    if missing > 0 {
+        assert!(
+            text.contains(&format!("ZeroAIMemory: не показано — правил: {missing} (")),
+            "{what}: {missing} правил пропали молча: {text}"
+        );
+    }
+}
+
+/// Ревью 8a, C1: с `output_limit` канала (Codex — байты, Claude — символы) весь текст в
+/// пределе — клиенту резать нечего; правила — первыми (хвост приоритета — L0), карта кода и
+/// «Ловушки» — на месте.
+#[tokio::test]
+async fn digest_fits_output_limit_codex_and_claude() {
+    let (a, ids) = heavy_rules_world("limit-agents", 20).await;
+    for (unit, max) in [("bytes", CODEX_MAX_BYTES), ("chars", CLAUDE_MAX_CHARS)] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(&format!("lim-{unit}")),
+            json!({"event": "session_start", "solution": G, "source": "startup",
+                   "code_map": true, "output_limit": {"unit": unit, "max": max}}),
+        )
+        .await;
+        let text = j["text"].as_str().unwrap();
+        let size = if unit == "bytes" {
+            text.len()
+        } else {
+            text.chars().count()
+        };
+        assert!(size <= max, "{unit}: {size} > {max}");
+        assert_rules_accounted(unit, text, &ids);
+        assert!(
+            ids.iter().all(|r| text.contains(r.as_str())),
+            "{unit}: L0 всех 20 правил помещается: {text}"
+        );
+        // хвост приоритета — L0 (без L1), голова — с L1
+        assert!(text.contains("— Кратко о правиле 19"), "{unit}: {text}");
+        assert!(
+            text.contains("Предложение 0 правила «Правило 0»"),
+            "{unit}: {text}"
+        );
+        assert!(code_line(&j).is_some(), "{unit}: нет карты кода: {text}");
+        assert!(text.contains("### Ловушки и сбои"), "{unit}: {text}");
+        // повторное ревью 8a: обрезанный L0 — с «…», строка-пояснение — ровно одна
+        let l0_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("— Кратко о правиле"))
+            .collect();
+        assert!(!l0_lines.is_empty(), "{unit}: {text}");
+        for l in &l0_lines {
+            assert!(
+                l.contains("…") && !l.contains("Вторая фраза"),
+                "{unit}: {l}"
+            );
+        }
+        assert_eq!(text.matches(SHORT_NOTE).count(), 1, "{unit}: {text}");
+    }
+    // без предела (REST, MCP) — текст у всех (без L0); правила мира длиннее `RULE_L1_TOKENS` —
+    // обрезаны с «…», строка-пояснение — одна (решение контролёра по ревью 8a)
+    let j = ok(
+        &a,
+        &a.token,
+        Some("lim-none"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() > CODEX_MAX_BYTES, "{}", text.len());
+    assert!(!text.contains("— Кратко о правиле"), "{text}");
+    assert_eq!(text.matches(SHORT_NOTE).count(), 1, "{text}");
+}
+
+/// Ревью 8a, C1: хук старого клиента (есть `source`/`code_map`, нет `output_limit`) —
+/// консервативные 7500 байт; восстановление с местом под сводку журнала — в своём пределе.
+#[tokio::test]
+async fn old_hook_client_gets_conservative_limit() {
+    let (a, ids) = heavy_rules_world("limit-old", 20).await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("old-1"),
+        json!({"event": "session_start", "solution": G, "source": "startup", "code_map": true}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() <= CODEX_MAX_BYTES, "{}", text.len());
+    assert_rules_accounted("old", text, &ids);
+    // пакет восстановления: клиент вычел 1500 байт под сводку журнала
+    let j = ok(
+        &a,
+        &a.token,
+        Some("old-1"),
+        json!({"event": "session_start", "solution": G, "source": "compact", "code_map": true,
+               "output_limit": {"unit": "bytes", "max": CODEX_MAX_BYTES - 1500}}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() <= CODEX_MAX_BYTES - 1500, "{}", text.len());
+    assert_rules_accounted("recovery", text, &ids);
+    assert!(text.contains("### Задачи"), "{text}");
+    // некорректный предел — 400
+    for bad in [
+        json!({"event": "session_start", "output_limit": {"unit": "bytes", "max": 0}}),
+        json!({"event": "session_start", "output_limit": {"unit": "words", "max": 10}}),
+    ] {
+        let r = recall(&a, &a.token, None, bad.clone()).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+}
+
+/// Ревью 8a, C1: правила не влезают в предел и строками L0 — с конца приоритета снимаются, а
+/// строка называет их число; правило с `axiom` остаётся.
+#[tokio::test]
+async fn rules_over_limit_dropped_with_honest_line() {
+    let (a, ids) = heavy_rules_world("limit-drop", 20).await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("drop-1"),
+        json!({"event": "session_start", "solution": G, "source": "startup",
+               "output_limit": {"unit": "bytes", "max": 1200}}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() <= 1200, "{}", text.len());
+    let shown = ids.iter().filter(|r| text.contains(r.as_str())).count();
+    assert!(shown > 0 && shown < 20, "{shown}: {text}");
+    assert_rules_accounted("drop", text, &ids);
+    // первые по приоритету (старые) — на месте, последние — сняты
+    assert!(text.contains(ids[0].as_str()), "{text}");
+    assert!(!text.contains(ids[19].as_str()), "{text}");
+}
+
+/// Ревью 8a, I1: приоритет правил — надёжность, затем давность создания, не алфавит: при
+/// 21 правиле не показывается самое новое, а не `security/*` в хвосте алфавита; `axiom` —
+/// всегда в числе показанных.
+#[tokio::test]
+async fn rules_priority_not_alphabetical() {
+    let a = server("rules-priority").await;
+    let mut ids = Vec::new();
+    // сначала — `security/secrets` (хвост алфавита), затем `a/…`
+    let sec = note_as(
+        &a,
+        &a.token,
+        "rules",
+        "security/secrets",
+        "# Secrets\n\nНе в репозиторий.",
+    )
+    .await;
+    for i in 0..19 {
+        ids.push(
+            note_as(
+                &a,
+                &a.token,
+                "rules",
+                &format!("a/п{i:02}"),
+                &format!("# П{i}\n\nТекст."),
+            )
+            .await,
+        );
+    }
+    // новейшее — `axiom`: надёжность важнее давности
+    let ax = note_as(
+        &a,
+        &a.token,
+        "rules",
+        "zz/axiom",
+        "---\ncertainty: axiom\n---\n# Аксиома\n\nВсегда.",
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("pr-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.contains(&format!("n:{sec}")), "{text}");
+    assert!(text.contains(&format!("n:{ax}")), "{text}");
+    assert!(
+        !text.contains(&format!("n:{}", ids[18])),
+        "новейшее — сверх RULES_MAX: {text}"
+    );
+    assert!(
+        text.contains("не показано — правил: 1 (memory_tree Rules)"),
+        "{text}"
+    );
+    // вывод — по пути
+    let a_pos = text.find("\na/п00 ").unwrap();
+    let s_pos = text.find("\nsecurity/secrets ").unwrap();
+    assert!(a_pos < s_pos, "{text}");
+}
+
+/// Ревью 8a, M1: в пакете субагенту задача, захваченная родителем, — «захвачена родительской
+/// сессией».
+#[tokio::test]
+async fn brief_marks_parent_claim() {
+    let a = server("brief-parent").await;
+    let t = entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "task", "title": "Задача родителя", "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{t}/claim"),
+            Some(json!({})),
+            &[("x-zam-session", "parent-1")],
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let j = ok(
+        &a,
+        &a.token,
+        Some("parent-1:sub"),
+        json!({"event": "brief", "parent_id": "parent-1"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(
+        text.contains("[open · захвачена родительской сессией] Задача родителя"),
+        "{text}"
+    );
+}
+
+/// Ревью 8a, M3: заголовок в строке-индексе changelog — до 20 токенов, как L0 корня.
+#[tokio::test]
+async fn index_title_cut_like_root_l0() {
+    let a = server("index-title").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let long = "Исправлен разбор дат в отчёте продавца по возвратам товаров с учётом часовых \
+                поясов, летнего времени и праздничных дней всех регионов доставки";
+    let c = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "changelog", "title": long, "body": "x", "data": {"kind": "fix"}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("it-1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let line = section(text, "### Последние изменения")
+        .into_iter()
+        .find(|l| l.starts_with(&format!("c:{c} «")))
+        .unwrap_or_else(|| panic!("{text}"));
+    let title = line
+        .trim_start_matches(&format!("c:{c} «"))
+        .rsplit_once("» · ")
+        .unwrap()
+        .0;
+    assert!(title.chars().count() < long.chars().count(), "{line}");
+    assert!(zam_store::count_tokens(title) <= 21, "{line}");
+}
+
+/// Повторное ревью 8a, п. 3: правило, у которого L1 не длиннее L0 больше чем в 1,4 раза, не
+/// переводится в L0 — шаг урезания идёт к следующему правилу.
+#[tokio::test]
+async fn short_l1_rule_stays_l1() {
+    let (a, ids) = heavy_rules_world("limit-short-l1", 19).await;
+    // самое новое (хвост приоритета) — с коротким L1, равным по длине L0
+    let short = note_as(
+        &a,
+        &a.token,
+        "rules",
+        "zz/коротко",
+        "---\nl0: Одна фраза правила.\n---\n# К\n\nОдна фраза правила.\n",
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("short-1"),
+        json!({"event": "session_start", "solution": G, "source": "startup",
+               "output_limit": {"unit": "bytes", "max": 12_000}}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    // предел, где хватает шага (1): сокращаются длинные правила, короткое — пропускается
+    assert!(text.len() <= 12_000, "{}", text.len());
+    // 19 правил мира и короткое — все 20 на месте
+    assert!(ids.iter().all(|r| text.contains(r.as_str())), "{text}");
+    // короткое правило — L1 (строка правила и текст правила под ней)
+    let l1 = format!("zz/коротко n:{short}\n  # К\n  Одна фраза правила.");
+    assert!(text.contains(&l1), "короткое правило не L1: {text}");
+    // урезаны другие правила
+    assert!(text.contains("— Кратко о правиле"), "{text}");
+}
+
+/// Правки ревью 8b (ТС-2 Codex sh-05): прежде чем снять обязательную строку (задачу в работе),
+/// строки L0 правил с конца приоритета сокращаются до пути `<путь> … n:<id>` (шаг (1″)); правило
+/// остаётся со ссылкой. Впустую не сокращаются: если задачу не спасти и со всеми правилами до
+/// пути, сокращения нет (повторное ревью 8b).
+#[tokio::test]
+async fn mandatory_lines_kept_before_rule_phrases() {
+    let (a, ids) = heavy_rules_world("limit-bare", 20).await;
+    let mut bare_seen = false;
+    for max in (2_000..=7_500).step_by(250) {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(&format!("bare-{max}")),
+            json!({"event": "session_start", "solution": G, "source": "startup",
+                   "output_limit": {"unit": "bytes", "max": max}}),
+        )
+        .await;
+        let text = j["text"].as_str().unwrap();
+        assert!(text.len() <= max, "{max}: {}", text.len());
+        let task = text.contains("Задача в работе");
+        let bare = text.lines().any(|l| l.contains(" … n:"));
+        bare_seen |= bare;
+        // правила сокращены до пути — только ради обязательной строки, и она на месте
+        assert!(!bare || task, "{max}: правила сокращены впустую: {text}");
+        // пока правила только сокращены до пути, они все на месте
+        if bare && task {
+            assert!(
+                ids.iter().all(|r| text.contains(r.as_str())),
+                "{max}: {text}"
+            );
+        }
+    }
+    assert!(bare_seen, "шаг (1″) не встретился ни при одном пределе");
+}
+
+/// Повторное ревью 8a, m2: MCP `memory_recall` с `source` (восстановление) — без предела
+/// канала: хуков в MCP нет, текст не урезается под 7500 байт.
+#[tokio::test]
+async fn mcp_recall_with_source_has_no_limit() {
+    let (a, _) = heavy_rules_world("limit-mcp", 20).await;
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "memory_recall",
+                                 "arguments": {"event": "recovery", "source": "compact"}}});
+    let r = a
+        .send(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(axum::http::header::HOST, "memory.lan:7700")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {}", a.token),
+                )
+                .header("x-zam-session", "mcp-limit-1")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let text = r.text();
+    assert!(
+        !text.contains("— Кратко о правиле"),
+        "MCP — L1 у всех: {text}"
+    );
+    assert!(text.len() > CODEX_MAX_BYTES, "{}", text.len());
+}
+
+// ---- M6 §16 п. 19 (CR-7): срок сбора из тела запроса ----
+
+/// Задержка шага сбора `/recall` (точка `test-hooks`): `ms` до конца области.
+struct RecallDelay<'a>(&'a Api);
+
+impl<'a> RecallDelay<'a> {
+    fn set(a: &'a Api, ms: u64) -> Self {
+        a.st.recall_delay_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+        RecallDelay(a)
+    }
+}
+
+impl Drop for RecallDelay<'_> {
+    fn drop(&mut self) {
+        self.0
+            .st
+            .recall_delay_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn has_timeout_warning(j: &Value) -> bool {
+    j["warnings"]
+        .as_array()
+        .is_some_and(|w| w.contains(&json!("recall timeout")))
+}
+
+/// CR-7 (§17 п. 25): шаг сбора задержан на 400 мс — со сроком сервера по умолчанию (200 мс)
+/// дайджест неполный и с `recall timeout`; тот же запрос с `timeout_ms: 2000` (предел поля по
+/// умолчанию) — полный дайджест без предупреждения. Старый клиент без поля — прежний срок
+/// `recall.timeout_ms`. Запас после задержки — 1,6 с: с 600 + 1000 мс тест падал под полным
+/// прогоном workspace на HDD (сбор 965 мс, 2026-11-14).
+#[tokio::test]
+async fn recall_timeout_ms_param_full_digest() {
+    let a = api("recall-timeout-param", |c| {
+        assert_eq!(c.recall.timeout_ms, 200, "умолчание сервера");
+        assert_eq!(c.recall.max_timeout_ms, 2000, "предел поля");
+    })
+    .await;
+    allow_rules(&a).await;
+    a.note("rules", "срок", "# Срок\n\nПравило про звёздный срок.\n")
+        .await;
+    const DELAY_MS: u64 = 400;
+    let _d = RecallDelay::set(&a, DELAY_MS);
+    let j = ok(&a, &a.token, Some("tp1"), json!({"event": "session_start"})).await;
+    assert!(has_timeout_warning(&j), "без timeout_ms — срок 200 мс: {j}");
+    assert!(!j["text"].as_str().unwrap().contains("звёздный"), "{j}");
+    let t = Instant::now();
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tp2"),
+        json!({"event": "session_start", "timeout_ms": 2000}),
+    )
+    .await;
+    let waited = t.elapsed();
+    assert!(waited.as_millis() >= u128::from(DELAY_MS), "{waited:?}");
+    assert!(!has_timeout_warning(&j), "{j}");
+    assert!(j["text"].as_str().unwrap().contains("звёздный"), "{j}");
+}
+
+/// CR-7: `timeout_ms` — 1..=`recall.max_timeout_ms` (по умолчанию 2000), иначе 400; верхний
+/// предел берётся из конфигурации.
+#[tokio::test]
+async fn recall_timeout_ms_over_max_400() {
+    let a = api("recall-timeout-max", |c| {
+        assert_eq!(c.recall.max_timeout_ms, 2000, "умолчание");
+    })
+    .await;
+    for bad in [json!(0), json!(2001), json!(-1), json!("x")] {
+        let r = recall(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "session_start", "timeout_ms": bad}),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+    for good in [1, 2000] {
+        let r = recall(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "session_start", "timeout_ms": good}),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{good}: {}", r.text());
+    }
+    let a = api("recall-timeout-max-5000", |c| {
+        c.recall.max_timeout_ms = 5000
+    })
+    .await;
+    let r = recall(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "session_start", "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = recall(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "session_start", "timeout_ms": 5001}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // срок сервера больше предела поля (сетки замера: 60000 при 2000) — предел поля равен
+    // сроку сервера: его можно попросить явно (ревью задачи 19, M-3)
+    let a = api("recall-timeout-max-60000", |c| c.recall.timeout_ms = 60_000).await;
+    assert_eq!(a.st.cfg.recall.max_timeout_ms, 2000);
+    for (t, want) in [
+        (60_000, StatusCode::OK),
+        (2001, StatusCode::OK),
+        (60_001, StatusCode::BAD_REQUEST),
+    ] {
+        let r = recall(
+            &a,
+            &a.token,
+            None,
+            json!({"event": "session_start", "timeout_ms": t}),
+        )
+        .await;
+        assert_eq!(r.status, want, "{t}: {}", r.text());
     }
 }

@@ -9,7 +9,9 @@
 //! `post_tool`; в журнал сессии (ключ `session_journal`) — `Ev::Error` и, если известна
 //! команда, `Ev::Cmd {ok: false, err_fp}`. Петля (§9.3, ключ `session_journal`, и при
 //! выключенном `post_tool`): тот же `err_fp` в журнале [`LOOP_AT`]-й раз — строка «эта ошибка
-//! повторяется N-й раз в сессии…», раз на отпечаток ([`repeat_hint`]).
+//! повторяется N-й раз в сессии…», раз на отпечаток ([`repeat_hint`]). Ответ сервера с
+//! `holdout: true` (контрольная группа A/B, M6 §12) — тишина: ни локальных `error_regex`, ни
+//! строки петли, маркер сессии ставится ([`cache::note_holdout`]).
 //!
 //! **Успех** (M4.5 §6.3, §9.1; `PostToolUse` без ошибки; без сети, бюджет 50 мс):
 //! - `Read` — `Ev::Read` и знание о файле по `file-refs.json` ([`file_context_lines`], ключ
@@ -167,6 +169,8 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
             "solution": env.solution.as_ref().map(|x| x.id.clone()),
             "error": error,
             "tool": tool,
+            // предел канала агента (ревью 8a M6, C1)
+            "output_limit": super::output::output_limit(env.agent, ""),
         });
         let session = inp.session_id.as_deref();
         std::thread::scope(|sc| {
@@ -192,6 +196,12 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
     let mut lines: Vec<String> = Vec::new();
     let mut known: Vec<String> = Vec::new();
     if let Some(v) = &remote {
+        // контрольная группа A/B (M6 §12): маркер — по ответу; в группе — ни локальных
+        // совпадений, ни строки петли
+        cache::note_holdout(env, inp.session_id.as_deref(), v);
+        if v["holdout"].as_bool() == Some(true) {
+            return Output::Empty;
+        }
         for w in cache::strings(&v["warnings"]) {
             env.log(&format!("recall(post_tool): предупреждение сервера: {w}"));
         }
@@ -435,7 +445,9 @@ fn edited(env: &Env, rel: &str, parse_until: Option<Instant>) -> Option<cache::C
 }
 
 /// Строки знания о файле (§6.3) по `file-refs.json` для путей `rels` (относительно корня):
-/// `ZeroAIMemory: о файле <path> в памяти: <title> [<kind>] — <ref>; …` (до 3 записей).
+/// `ZeroAIMemory: о файле <path> в памяти: <title> [<kind>] <ref>; …` (до 3 записей; вид v2, как у
+/// подсказок сервера и `Trigger::hint`: теги через «·», ссылка без « — »; M6 §4.3, решение
+/// координатора задачи 13a).
 /// `shown` задан — каждый файл раз за сессию (ключ `file:<путь>` добавляется в `shown`).
 pub fn file_context_lines(
     env: &Env,
@@ -466,11 +478,11 @@ pub fn file_context_lines(
     lines
 }
 
-/// Строка знания о файле: до [`FILE_ITEMS_MAX`] записей, `stale` — «возможно устарело».
+/// Строка знания о файле: до [`FILE_ITEMS_MAX`] записей, `stale` — тег «возможно устарело».
 /// Ссылки на символ (M5.6 §8; решение составителя плана 13) — первыми; все записи о одном
-/// символе — «ZeroAIMemory: о `Sym` в <путь> в памяти: <title> [<kind>] — <ref>; …»; смесь
-/// символьных и файловых (или разных символов) — «ZeroAIMemory: о файле <путь> в памяти:
-/// `Sym`: <title> [<kind>] — <ref>; <title> [<kind>] — <ref>».
+/// символе — «`ZeroAIMemory: о Sym в <путь> в памяти: <title> [<kind>] <ref>; …`»; смесь
+/// символьных и файловых (или разных символов) — «`ZeroAIMemory: о файле <путь> в памяти:
+/// Sym: <title> [<kind>] <ref>; <title> [<kind>·возможно устарело] <ref>`».
 pub fn file_hint(pr: &PathRefs) -> String {
     let mut items: Vec<&cache::RefItem> = pr.items.iter().collect();
     // устойчиво: символьные первыми, порядок сервера внутри групп
@@ -491,13 +503,24 @@ pub fn file_hint(pr: &PathRefs) -> String {
                 .chars()
                 .take(TITLE_MAX)
                 .collect();
-            let mut tag = i.kind.clone();
-            if i.state == "stale" {
-                tag.push_str(", возможно устарело");
-            }
+            // теги как у `hint_line`: пустые опускаются, без тегов — без скобок
+            let stale = if i.state == "stale" {
+                "возможно устарело"
+            } else {
+                ""
+            };
+            let tags: Vec<&str> = [i.kind.trim(), stale]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect();
+            let tag = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", tags.join("·"))
+            };
             match (&i.symbol, one) {
-                (Some(sym), None) => format!("`{sym}`: {title} [{tag}] — {}", i.id),
-                _ => format!("{title} [{tag}] — {}", i.id),
+                (Some(sym), None) => format!("`{sym}`: {title}{tag} {}", i.id),
+                _ => format!("{title}{tag} {}", i.id),
             }
         })
         .collect();
@@ -573,8 +596,22 @@ mod tests {
         };
         assert_eq!(
             file_hint(&pr),
-            "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] — i:01A; \
-             Архитектура [note, возможно устарело] — n:01B; Пул v2 [changelog] — c:01C"
+            "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] i:01A; \
+             Архитектура [note·возможно устарело] n:01B; Пул v2 [changelog] c:01C"
+        );
+        // пустой вид — без пустого тега, как у `hint_line` (ревью задачи 13a, M9)
+        let pr = PathRefs {
+            path: "a.rs".into(),
+            hash: None,
+            items: vec![
+                item("i:01E", "", "Без вида", "ok"),
+                item("i:01F", " ", "Без вида, устарело", "stale"),
+            ],
+        };
+        assert_eq!(
+            file_hint(&pr),
+            "ZeroAIMemory: о файле a.rs в памяти: Без вида i:01E; \
+             Без вида, устарело [возможно устарело] i:01F"
         );
     }
 

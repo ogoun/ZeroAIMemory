@@ -283,7 +283,7 @@ async fn modes_budget_and_md_format() {
     // карточка §9.3 и строка деградации в конце
     assert!(t.starts_with("1. n:"), "{t}");
     assert!(t.contains(" Knowledge/Инструменты/Bash скрипты › "), "{t}");
-    assert!(t.contains(" tok\n   "), "{t}");
+    assert!(t.contains("t\n   "), "{t}");
     assert!(t.contains("**"), "{t}");
     assert!(!t.contains('\u{E000}'), "{t}");
     assert!(t.trim_end().ends_with("(только FTS)"), "{t}");
@@ -797,4 +797,228 @@ async fn scope_key_ignores_idea_kind_and_statuses() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.text().contains(&cid), "WebUI: {}", r.text());
+}
+
+// ---- карточки v2 и честный бюджет (M6 §4.1–§4.2, задача 5) ----
+
+/// 30 заметок про сборку с многобайтовыми заголовками и длинным текстом.
+async fn budget_corpus(a: &Api) {
+    for i in 0..30 {
+        let body = format!(
+            "# Сборка проекта, этап {i} — «кириллица» и ёлочки\n\n## Причина\n\n{}\n",
+            "Скрипт сборки падает, если переменная окружения не задана; проверяй сборку заранее. "
+                .repeat(8)
+        );
+        a.note("knowledge", &format!("Сборка/Этап {i:02} — ёлки"), &body)
+            .await;
+    }
+}
+
+/// Markdown поиска вместе со строкой MCP `~N tok` — в токенах счётчика сервера.
+fn md_cost(md: &str) -> usize {
+    let n = zam_store::count_tokens(md);
+    zam_store::count_tokens(&format!("{md}~{n} tok"))
+}
+
+/// Номера карточек Markdown (`<n>. `) по порядку.
+fn card_numbers(md: &str) -> Vec<usize> {
+    md.lines()
+        .filter_map(|l| l.split_once(". ").and_then(|(n, _)| n.parse().ok()))
+        .collect()
+}
+
+/// Ответ `brief` в Markdown с `~N tok` MCP укладывается в бюджет (100, 400, 800, 2000).
+#[tokio::test]
+async fn brief_markdown_within_budget() {
+    let a = api("search-md-budget", |_| {}).await;
+    budget_corpus(&a).await;
+    let mut cards = Vec::new();
+    for budget in [100usize, 400, 800, 2000] {
+        for mode in ["brief", "notes"] {
+            let md = search(
+                &a,
+                json!({"query": "сборка скрипт", "format": "md", "mode": mode, "top_k": 30,
+                       "budget_tokens": budget}),
+            )
+            .await
+            .text();
+            let cost = md_cost(&md);
+            // первая карточка отдаётся всегда: дороже бюджета — только она одна, без фрагмента
+            let only_head =
+                card_numbers(&md) == [1] && md.lines().nth(1).is_some_and(|l| l.starts_with("> "));
+            assert!(
+                cost <= budget || only_head,
+                "{mode} {budget}: {cost} токенов\n{md}"
+            );
+            if budget >= 400 {
+                assert!(cost <= budget, "{mode} {budget}: {cost} токенов\n{md}");
+            }
+            if mode == "brief" {
+                cards.push(card_numbers(&md).len());
+            }
+        }
+    }
+    // бюджет действует: больше бюджет — больше карточек, а при 2000 их несколько
+    assert!(cards.windows(2).all(|w| w[0] <= w[1]), "{cards:?}");
+    assert!(cards[3] > cards[1] && cards[1] > 1, "{cards:?}");
+    // JSON — тот же отбор
+    let j = search(
+        &a,
+        json!({"query": "сборка скрипт", "mode": "brief", "top_k": 30, "budget_tokens": 400}),
+    )
+    .await
+    .json();
+    assert_eq!(j["items"].as_array().unwrap().len(), cards[1], "{j}");
+}
+
+/// Края бюджета: 1 и строка карточки длиннее бюджета — только первая карточка, фрагмент обрезан.
+#[tokio::test]
+async fn brief_budget_edges_first_card_only() {
+    let a = api("search-md-edges", |_| {}).await;
+    budget_corpus(&a).await;
+    for budget in [1usize, 20] {
+        let md = search(
+            &a,
+            json!({"query": "сборка скрипт", "format": "md", "budget_tokens": budget}),
+        )
+        .await
+        .text();
+        assert_eq!(card_numbers(&md), [1], "{budget}: {md}");
+        assert!(md.starts_with("1. n:"), "{md}");
+        let j = search(
+            &a,
+            json!({"query": "сборка скрипт", "budget_tokens": budget}),
+        )
+        .await
+        .json();
+        assert_eq!(j["items"].as_array().unwrap().len(), 1, "{j}");
+    }
+}
+
+/// Фрагмент первой карточки режется по границе символа: он — начало полного фрагмента.
+#[tokio::test]
+async fn snippet_cut_on_char_boundary() {
+    let a = api("search-md-cut", |_| {}).await;
+    budget_corpus(&a).await;
+    let snippet = |md: &str| -> String {
+        md.lines()
+            .nth(1)
+            .filter(|l| l.starts_with("   "))
+            .unwrap_or("")
+            .trim()
+            .replace("**", "")
+            .trim_end_matches('…')
+            .to_string()
+    };
+    let full = search(
+        &a,
+        json!({"query": "сборка скрипт", "format": "md", "budget_tokens": 2000}),
+    )
+    .await
+    .text();
+    let cut = search(
+        &a,
+        json!({"query": "сборка скрипт", "format": "md", "budget_tokens": 170}),
+    )
+    .await
+    .text();
+    let (f, c) = (snippet(&full), snippet(&cut));
+    assert!(!f.is_empty() && !c.is_empty(), "{full}\n{cut}");
+    assert_eq!(card_numbers(&cut), [1], "{cut}");
+    assert!(c.chars().count() < f.chars().count(), "не обрезан:\n{cut}");
+    assert!(f.starts_with(&c), "«{c}» не начало «{f}»");
+}
+
+/// Строка карточки §4.1: полный id, хвост `[.NN] rN · yyyy-MM-dd HH:mm:ss · Nt`, без «дн. назад».
+#[tokio::test]
+async fn card_v2_tail_format() {
+    let a = api("search-card-v2", |_| {}).await;
+    let n = a
+        .note(
+            "knowledge",
+            "Инструменты/Bash",
+            "# Bash\n\n## Причина\n\nСкрипт с CRLF падает в bash.\n",
+        )
+        .await;
+    let id = n["id"].as_str().unwrap();
+    let md = search(&a, json!({"query": "CRLF bash", "format": "md"}))
+        .await
+        .text();
+    let first = md.lines().next().unwrap();
+    let head = format!("1. n:{id} Knowledge/Инструменты/Bash › Bash > Причина  [");
+    assert!(first.starts_with(&head), "{first}");
+    let tail = first.strip_prefix(&head).unwrap();
+    // `.NN] r1 · 2026-11-05 12:34:56 · 12t` (балл 1.00 у единственного — `1.0`)
+    let (score, rest) = tail.split_once("] ").unwrap();
+    assert!(
+        score == "1.0" || (score.len() == 3 && score.starts_with('.')),
+        "{first}"
+    );
+    let parts: Vec<&str> = rest.split(" · ").collect();
+    assert_eq!(parts.len(), 3, "{first}");
+    assert_eq!(parts[0], "r1");
+    let date = parts[1];
+    assert_eq!(date.len(), 19, "{first}");
+    assert!(
+        jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", date).is_ok(),
+        "{first}"
+    );
+    assert!(parts[2].ends_with('t') && parts[2][..parts[2].len() - 1].parse::<u32>().is_ok());
+    assert!(!md.contains("дн. назад") && !md.contains("сегодня"), "{md}");
+    assert!(!md.contains(" tok"), "{md}");
+    // JSON — `age_days` остаётся
+    let j = search(&a, json!({"query": "CRLF bash"})).await.json();
+    assert_eq!(j["items"][0]["age_days"], 0, "{j}");
+}
+
+/// `search.brief_min_rel`: карточки с баллом ниже `r × лучший` не выдаются (и при явном top_k);
+/// `chunks` отсечка не касается. Без модели баллы — ранги RRF одного канала (лучший 1,0, дальше
+/// 0,98, 0,97…), поэтому порог 0,99 оставляет только лучших.
+#[tokio::test]
+async fn brief_min_rel_drops_weak() {
+    let body =
+        |mode: &str| json!({"query": "квазар", "mode": mode, "top_k": 30, "budget_tokens": 20000});
+    let fill = async |a: &Api| {
+        for i in 0..10 {
+            a.note(
+                "knowledge",
+                &format!("Квазар {i}"),
+                &format!(
+                    "# Квазар {i}\n\nквазар {}\n",
+                    "длинное пояснение без нужных слов ".repeat(1 + i * 10)
+                ),
+            )
+            .await;
+        }
+    };
+    let off = api("search-min-rel-off", |c| c.search.brief_min_rel = 0.0).await;
+    fill(&off).await;
+    let all = search(&off, body("brief")).await.json();
+    let all = all["items"].as_array().unwrap().clone();
+    assert!(all.len() >= 5, "{all:?}");
+    let on = api("search-min-rel-on", |c| c.search.brief_min_rel = 0.99).await;
+    fill(&on).await;
+    let kept = search(&on, body("brief")).await.json();
+    let kept = kept["items"].as_array().unwrap().clone();
+    let best = kept[0]["score"].as_f64().unwrap();
+    assert!(
+        kept.iter()
+            .all(|i| i["score"].as_f64().unwrap() >= 0.99 * best - 1e-4),
+        "{kept:?}"
+    );
+    let weak = all
+        .iter()
+        .filter(|i| i["score"].as_f64().unwrap() < 0.99 * all[0]["score"].as_f64().unwrap())
+        .count();
+    assert!(weak > 0, "набор без слабых карточек: {all:?}");
+    assert_eq!(kept.len() + weak, all.len());
+    // notes — так же, chunks — без отсечки
+    let notes = search(&on, body("notes")).await.json();
+    assert_eq!(
+        notes["items"].as_array().unwrap().len(),
+        kept.len(),
+        "{notes}"
+    );
+    let ch = search(&on, body("chunks")).await.json();
+    assert_eq!(ch["items"].as_array().unwrap().len(), all.len(), "{ch}");
 }

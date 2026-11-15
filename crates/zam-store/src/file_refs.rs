@@ -1233,7 +1233,7 @@ pub(crate) async fn backfill_refs(db: &Db) -> Result<u64, StoreError> {
         let a = system.clone();
         let (n, found, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 // заметка без текущей ревизии (повреждённая база) пропускается
                 let batch: Vec<(Id, String)> = tx
                     .prepare_cached(
@@ -1271,7 +1271,7 @@ pub(crate) async fn backfill_refs(db: &Db) -> Result<u64, StoreError> {
         let a = system.clone();
         let (n, found, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, Id, String)> = tx
                     .prepare_cached(
                         "SELECT id, space_id, data FROM entries

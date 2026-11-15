@@ -6,7 +6,7 @@
 //! - `--revert N` — новая ревизия с текстом `N`, печатается `<id>@<rev>`.
 use serde_json::{Value, json};
 
-use super::{Ctx, emit, emit_json, emit_written};
+use super::{Ctx, agent_time, emit, emit_json, emit_written};
 use crate::client::{CliError, read_json, read_text};
 
 /// Действие команды.
@@ -89,7 +89,7 @@ fn render(items: &[Value]) -> String {
             format!(
                 "{}\t{}\t{}\t{}\t{}\n",
                 r["rev"],
-                field(&r["ts"]),
+                agent_time(&field(&r["ts"])),
                 field(&r["author_kind"]),
                 field(&r["machine"]),
                 field(&r["message"]),
@@ -116,6 +116,6 @@ mod tests {
         let items = vec![
             json!({"rev": 2, "ts": "2026-10-18T00:00:00Z", "author_kind": "agent", "machine": null, "message": "a\tb\nc"}),
         ];
-        assert_eq!(render(&items), "2\t2026-10-18T00:00:00Z\tagent\t-\ta b c\n");
+        assert_eq!(render(&items), "2\t2026-10-18 00:00:00\tagent\t-\ta b c\n");
     }
 }

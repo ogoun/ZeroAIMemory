@@ -25,10 +25,72 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Doc-комментарии — справка clap (`zam … --help`): `[space:]path`, `[[Имя]]` — синтаксис
+// командной строки, а не ссылки rustdoc; текст справки не меняется ради rustdoc.
+#[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Проверить подключение: сервер, токен, пользователь, solution.toml
     Status {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Экспорт пространства в архив .zip (заметки .md, вложения, журналы, связи, история)
+    Export {
+        /// Пространство: rules | human | knowledge | solution | GUID | id (иначе решение или knowledge)
+        #[arg(long)]
+        space: Option<String>,
+        /// Только заметки под префиксом пути (можно повторять)
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Только записи журнала этого вида (можно повторять)
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Без истории ревизий
+        #[arg(long)]
+        no_history: bool,
+        /// Файл архива; загрузка идёт в `<файл>.<pid>.part` рядом и при сбое удаляется (после
+        /// убитого процесса `.part` остаётся — удалите вручную); сервер молчит дольше
+        /// ZAM_EXPORT_IDLE_SECS (300 с) — выход с кодом 2
+        #[arg(short = 'o', long = "out", required = true)]
+        out: PathBuf,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Импорт архива .zip (zam export) или каталога в пространство; каталог без manifest.json
+    /// — «папка .md»: все *.md — заметки, архив чужой (новые id, аксиомы → theorem)
+    ///
+    /// Источник «папки .md» — имя каталога: переименованный каталог — новый источник, его
+    /// заметки не сопоставляются с прежним импортом. Пути, занятые прежним импортом, при
+    /// --on-conflict skip уходят в отчёт конфликтами path-taken, при revision заметки ложатся
+    /// рядом как «<путь> (импорт <дата>)»; прежние заметки не меняются.
+    ///
+    /// zam спрашивает сервер до отправки тела (Expect: 100-continue, ответ ждётся до 30 с):
+    /// отказ (413, 503, 507) приходит до тела. Каталог идёт с оценкой объёма (сумма размеров
+    /// файлов с запасом) — по ней сервер резервирует место. Сервер не ответил до тела и отверг
+    /// приём потом: он дочитывает тело не больше 16 МиБ и 5 с, чтобы ответ дошёл; тело больше
+    /// — соединение рвётся без ответа, и zam показывает подсказку «сервер прервал приём архива»
+    /// с вероятными причинами (архив больше import.max_bytes, сервер занят). Сбой упаковки
+    /// каталога (файл не прочесть) обрывает запрос: сервер ничего не принимает, zam показывает
+    /// причину упаковки.
+    Import {
+        /// Архив .zip или каталог (упаковывается в zip потоком, без временного файла)
+        src: PathBuf,
+        /// Пространство: rules | human | knowledge | solution | GUID | id (иначе решение или knowledge)
+        #[arg(long)]
+        space: Option<String>,
+        /// Это мой архив (переезд на новый сервер с другим пользователем): id и аксиомы как есть
+        #[arg(long)]
+        own: bool,
+        /// Изменившиеся при повторе: skip — в отчёт conflicts (по умолчанию), revision — новая ревизия
+        #[arg(long, value_parser = ["skip", "revision"])]
+        on_conflict: Option<String>,
+        /// Аксиомы чужого архива: demote — в theorem (по умолчанию), keep — как есть
+        #[arg(long, value_parser = ["demote", "keep"])]
+        axioms: Option<String>,
+        /// Только отчёт, без записи
+        #[arg(long)]
+        dry_run: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -45,8 +107,8 @@ enum Cmd {
     Read {
         #[arg(required = true)]
         targets: Vec<String>,
-        /// Уровень: L0 (сводка), L1 (оглавление), L2 (полный текст)
-        #[arg(long, value_parser = ["L0", "L1", "L2", "l0", "l1", "l2"])]
+        /// Уровень: L0 (сводка), L1 (оглавление), L2 (полный текст), focus (с --focus)
+        #[arg(long, value_parser = ["L0", "L1", "L2", "l0", "l1", "l2", "focus"])]
         tier: Option<String>,
         /// Секция по пути заголовков: "A > B"
         #[arg(long)]
@@ -74,6 +136,12 @@ enum Cmd {
         /// оглавление
         #[arg(long)]
         locator: Option<String>,
+        /// Пачка: явный фокус — оглавление, ближайшие к запросу листы, «[пропущено: путь · ~N t]»
+        #[arg(long, value_name = "ЗАПРОС")]
+        focus: Option<String>,
+        /// Пачка: r<rev>:S-E — байты ревизии, адрес «[пропущено: range:r<rev>:S-E …]» фокуса
+        #[arg(long, value_name = "rREV:S-E")]
+        range: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -208,6 +276,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CacheCmd,
     },
+    /// Сессии агентов: выданное по событию (токены, «уже выдавалось»), снимок сессии
+    #[command(alias = "session")]
+    Sessions {
+        #[command(subcommand)]
+        cmd: SessionsCmd,
+    },
     /// Vault: секреты (значение — только из stdin или скрытого ввода)
     Vault {
         #[command(subcommand)]
@@ -281,7 +355,7 @@ enum Cmd {
     },
     /// Хук агента (§10.3): JSON события на stdin, подсказки — JSON в stdout; всегда код 0
     Hook {
-        /// session-start, prompt, pre-tool, post-tool, checkpoint
+        /// session-start, subagent-start, prompt, pre-tool, post-tool, checkpoint
         #[arg(value_enum)]
         kind: cmd::hook::Kind,
         /// Формат вывода и предел текста
@@ -632,6 +706,9 @@ enum QuestionCmd {
     },
 }
 
+// Doc-комментарии — справка clap (`zam idea … --help`): `[ideas]` — секция конфигурации
+// сервера, а не ссылка rustdoc; текст справки не меняется ради rustdoc.
+#[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum IdeaCmd {
     /// Лента идей (по умолчанию new, proposed, deferred, accepted)
@@ -888,6 +965,9 @@ impl VaultOpts {
     }
 }
 
+// Doc-комментарии — справка clap (`zam cache … --help`): `ID[#СЕКЦИЯ][@REV]` — синтаксис
+// командной строки, а не ссылка rustdoc; текст справки не меняется ради rustdoc.
+#[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum CacheCmd {
     /// Сохранить выжимку (текст — из --file или stdin); печатает c_<id>
@@ -938,6 +1018,66 @@ enum CacheCmd {
         #[command(flatten)]
         common: Common,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionsCmd {
+    /// Таблица «событие · вызовов · токенов · уже выдавалось»: сессия по id, сумма по --last N;
+    /// без них — сессия агента (ZAM_SESSION, сессия хуков) или последняя
+    Tokens {
+        /// Id сессии
+        id: Option<String>,
+        /// Сумма по N последним сессиям (свежие первыми)
+        #[arg(long, conflicts_with = "id", value_parser = clap::value_parser!(u32).range(1..=500))]
+        last: Option<u32>,
+        /// Отдельно контрольная группа A/B (holdout) и остальные
+        #[arg(long)]
+        by_holdout: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Снимок сессии из журнала агента (запросы, файлы, команды, хвост конспекта — после
+    /// маскировки секретов): для агентов без хуков и ручного снимка
+    Snapshot {
+        /// Журнал агента (Claude Code — ~/.claude/projects/…/<uuid>.jsonl, Codex — rollout-*.jsonl)
+        #[arg(long)]
+        transcript: PathBuf,
+        /// Формат журнала: claude | codex (иначе — по первой строке)
+        #[arg(long)]
+        format: Option<String>,
+        /// Id сессии (иначе ZAM_SESSION_ID, иначе id из журнала)
+        #[arg(long)]
+        session: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn sessions(c: SessionsCmd) -> Result<(), CliError> {
+    use cmd::sessions::{Pick, tokens};
+    match c {
+        SessionsCmd::Tokens {
+            id,
+            last,
+            by_holdout,
+            common,
+        } => {
+            let pick = match (id.as_deref(), last) {
+                (Some(id), _) => Pick::Id(id),
+                (None, Some(n)) => Pick::Last(n),
+                (None, None) => Pick::Current,
+            };
+            tokens(&cmd::connect(&common)?, &pick, by_holdout)
+        }
+        SessionsCmd::Snapshot {
+            transcript,
+            format,
+            session,
+            common,
+        } => {
+            cmd::session_snapshot::run(&common, &transcript, format.as_deref(), session.as_deref())
+        }
+    }
 }
 
 fn cache(c: CacheCmd) -> Result<(), CliError> {
@@ -1539,6 +1679,42 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         }),
         Cmd::Guide { lang, common } => cmd::guide::run(&cmd::connect(&common)?, &lang),
         Cmd::Mcp { common } => cmd::mcp::run(cmd::connect(&common)?),
+        Cmd::Export {
+            space,
+            paths,
+            kinds,
+            no_history,
+            out,
+            common,
+        } => cmd::transfer::export(
+            &mut cmd::connect(&common)?,
+            &cmd::transfer::ExportArgs {
+                space: space.as_deref(),
+                paths: &paths,
+                kinds: &kinds,
+                no_history,
+                out: &out,
+            },
+        ),
+        Cmd::Import {
+            src,
+            space,
+            own,
+            on_conflict,
+            axioms,
+            dry_run,
+            common,
+        } => cmd::transfer::import(
+            &mut cmd::connect(&common)?,
+            &cmd::transfer::ImportArgs {
+                src: &src,
+                space: space.as_deref(),
+                own,
+                on_conflict: on_conflict.as_deref(),
+                axioms: axioms.as_deref(),
+                dry_run,
+            },
+        ),
         Cmd::Tree {
             target,
             depth,
@@ -1555,10 +1731,14 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             if_rev,
             since_rev,
             locator,
+            focus,
+            range,
             common,
         } => {
             let o = cmd::read::Opts {
                 locator: locator.as_deref(),
+                focus: focus.as_deref(),
+                range: range.as_deref(),
                 tier: tier.as_deref(),
                 section: section.as_deref(),
                 rev,
@@ -1730,6 +1910,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Question { cmd } => question(cmd),
         Cmd::Idea { cmd } => idea(cmd),
         Cmd::Cache { cmd } => cache(cmd),
+        Cmd::Sessions { cmd } => sessions(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {
             cmd:

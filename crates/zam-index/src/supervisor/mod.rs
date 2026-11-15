@@ -28,6 +28,14 @@ mod stamp;
 #[cfg(feature = "edge")]
 pub(crate) use stamp::write_atomic;
 
+/// Ставит флаг стёртого хранилища `.zam-reindex` в `qdir` (`<data_dir>/qdrant`): при старте
+/// управляемого Qdrant — пересборка индекса всех баз из `embeddings` (`zam-server restore`,
+/// M6 §12б.3). Каталог создаётся, если его нет.
+pub fn mark_storage_reindex(qdir: &std::path::Path, reason: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(qdir)?;
+    stamp::mark_reindex(qdir, reason)
+}
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

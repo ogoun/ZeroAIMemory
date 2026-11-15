@@ -213,7 +213,8 @@ async fn mcp_search_returns_md_cards() {
     .await;
     assert!(o.text.contains(&format!("n:{id}")), "{}", o.text);
     assert!(o.text.contains("Инструменты/Ripgrep"), "{}", o.text);
-    assert!(o.text.contains("rev1"), "{}", o.text);
+    // карточка v2 (M6 §4.1): `r1` и дата UTC
+    assert!(o.text.contains("] r1 · "), "{}", o.text);
     // format=json — JSON ответа REST в тексте
     let o = ok(
         &a,
@@ -1492,6 +1493,74 @@ async fn mcp_read_locator() {
     .await;
     assert!(o.is_error, "{}", o.text);
     assert!(o.text.contains("locator"), "{}", o.text);
+}
+
+/// `memory_read` с `focus` (M6 §6, задача 7b; zero-agent: раньше — 400 `unknown field focus`):
+/// поле объявлено в схеме, ответ — оглавление, лист и пропуски; без текста — ошибка инструмента.
+#[tokio::test]
+async fn mcp_read_focus() {
+    let a = api("mcp-read-focus", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let t = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_read")
+        .unwrap();
+    let props = &t["inputSchema"]["properties"]["items"]["items"]["properties"];
+    assert_eq!(props["focus"]["type"], "string", "{t}");
+    assert_eq!(props["range"]["type"], "string", "{t}");
+    assert!(
+        props["tier"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("focus")),
+        "{t}"
+    );
+    let mut text = String::from("# Справочник\n\n");
+    for i in 1..=8 {
+        text.push_str(&format!("## Глава {i}\n\n"));
+        for k in 0..12 {
+            text.push_str(&format!(
+                "Абзац {k} главы {i} рассказывает о настройке и обслуживании сервера. "
+            ));
+        }
+        if i == 6 {
+            text.push_str("Здесь описан протокол квазиметрии. ");
+        }
+        text.push_str("\n\n");
+    }
+    let n = a.note("knowledge", "Справочник", &text).await;
+    let id = n["id"].as_str().unwrap();
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}"), "focus": "протокол квазиметрии"}],
+               "budget_tokens": 20000}),
+    )
+    .await;
+    assert!(o.text.contains("протокол квазиметрии"), "{}", o.text);
+    assert!(o.text.contains("Оглавление: "), "{}", o.text);
+    assert!(o.text.contains("*Глава 6"), "{}", o.text);
+    assert!(
+        o.text.contains("[пропущено: range:r1:0-")
+            && o.text.contains(" (Справочник — Справочник > Глава "),
+        "{}",
+        o.text
+    );
+    assert!(!o.text.contains("главы 2 "), "{}", o.text);
+    let o = tool(
+        &a,
+        &a.token,
+        &[],
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}"), "tier": "focus"}]}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("нужен текст focus"), "{}", o.text);
 }
 
 // ---- отчёты (M5.5, задача 5) ----
@@ -2819,4 +2888,1292 @@ async fn mcp_propose_reopen_dropped_task() {
     )
     .await;
     assert!(o.text.contains(&format!("Идея w:{id}: new")), "{}", o.text);
+}
+
+// ---- M6 §7.1: сессия MCP — явная или никакая ----
+
+/// `~N tok` последней строки ответа инструмента.
+fn tok_of(o: &Out) -> i64 {
+    let last = o.text.trim_end().rsplit('\n').next().unwrap();
+    last.trim_start_matches('~')
+        .trim_end_matches(" tok")
+        .parse()
+        .unwrap_or_else(|_| panic!("нет ~N tok: {}", o.text))
+}
+
+/// Учёт выданного сессии: `GET /sessions/{id}` → `tokens`.
+async fn session_tokens(a: &Api, id: &str) -> Value {
+    let r = a
+        .t(Method::GET, &format!("/api/v1/sessions/{id}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["tokens"].clone()
+}
+
+/// `GET /sessions/unattributed?days=1` → `items`.
+async fn unattributed(a: &Api) -> Vec<Value> {
+    let r = a
+        .t(Method::GET, "/api/v1/sessions/unattributed?days=1", None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"].as_array().unwrap().clone()
+}
+
+/// Учёт MCP пишется в фоне после ответа (ревью задачи 3, M2): опрос `tokens` сессии, пока у
+/// события `mcp` не станет `calls` вызовов (до 10 с).
+async fn session_tokens_when(a: &Api, id: &str, calls: i64) -> Value {
+    let t = std::time::Instant::now();
+    loop {
+        let r = a
+            .t(Method::GET, &format!("/api/v1/sessions/{id}"), None)
+            .await;
+        let v = r.json()["tokens"].clone();
+        if v["mcp"]["calls"] == calls || t.elapsed() > std::time::Duration::from_secs(10) {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Как [`session_tokens_when`], для `GET /sessions/unattributed` (сумма `calls` события `mcp`).
+async fn unattributed_when(a: &Api, calls: i64) -> Vec<Value> {
+    let t = std::time::Instant::now();
+    loop {
+        let items = unattributed(a).await;
+        let n: i64 = items
+            .iter()
+            .filter(|i| i["event"] == "mcp")
+            .map(|i| i["calls"].as_i64().unwrap())
+            .sum();
+        if n == calls || t.elapsed() > std::time::Duration::from_secs(10) {
+            return items;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// REST-поиск «квазар» с заголовками `extra`.
+async fn rest_search(a: &Api, extra: &[(&str, &str)], mode: &str, format: &str) -> Resp {
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "квазар", "mode": mode, "format": format})),
+            extra,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r
+}
+
+/// Заметка о квазаре; id узла.
+async fn quasar(a: &Api) -> String {
+    let n = a
+        .note(
+            "knowledge",
+            "Астро/Квазар",
+            "# Квазар\n\nКвазар светит ярко.\n",
+        )
+        .await;
+    n["id"].as_str().unwrap().to_string()
+}
+
+/// Явная сессия (`X-Zam-Session` запроса MCP): `/read` отмечает выданное, следующий
+/// `memory_search` — карточка с фрагментом и пометкой «(выдавалось)»; REST той же сессии —
+/// прежнее `(seen)` без фрагмента. Учёт — событие `mcp` сессии.
+#[tokio::test]
+async fn mcp_explicit_session_marks_seen() {
+    let a = api("mcp-explicit-seen", |_| {}).await;
+    let id = quasar(&a).await;
+    let h = sess();
+    let r = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}]}),
+    )
+    .await;
+    assert!(r.text.contains("светит ярко"), "{}", r.text);
+    let s = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар"}),
+    )
+    .await;
+    assert!(s.text.contains(&format!("n:{id}")), "{}", s.text);
+    assert!(s.text.contains("(выдавалось)"), "{}", s.text);
+    assert!(s.text.contains("светит"), "фрагмент остаётся: {}", s.text);
+    assert!(!s.text.contains("(seen)"), "{}", s.text);
+    // JSON: `seen: true` и фрагмент
+    let j = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар", "format": "json"}),
+    )
+    .await;
+    let it = j.json()["items"][0].clone();
+    assert_eq!(it["seen"], true, "{it}");
+    assert!(
+        it["snippet"].as_str().is_some_and(|s| s.contains("светит")),
+        "{it}"
+    );
+    // REST той же сессии — прежнее поведение
+    let md = rest_search(&a, &h, "brief", "md").await.text();
+    assert!(
+        md.contains("(seen)") && !md.contains("(выдавалось)"),
+        "{md}"
+    );
+    assert!(!md.contains("светит"), "{md}");
+    // учёт: три вызова MCP — событие `mcp`
+    let t = session_tokens_when(&a, SESSION, 3).await;
+    assert_eq!(t["mcp"]["calls"], 3, "{t}");
+    let want = tok_of(&r) + tok_of(&s) + tok_of(&j);
+    assert_eq!(t["mcp"]["tokens"], want, "{t}");
+    assert!(unattributed(&a).await.is_empty());
+}
+
+/// Без `X-Zam-Session` (неявная сессия R13 — последняя сессия хуков): запись по-прежнему
+/// засчитывается ей, но отметок `session_seen` и пометок нет, а токены — в счётчик
+/// `unattributed` пользователя по дням.
+#[tokio::test]
+async fn implicit_session_no_marks_goes_unattributed() {
+    let a = api("mcp-implicit-unattributed", |_| {}).await;
+    let id = quasar(&a).await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "hook-s", "agent": "claude-code"})),
+            &[("x-zam-machine", MACHINE)],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let m = [("x-zam-machine", MACHINE)];
+    let r = ok(
+        &a,
+        &a.token,
+        &m,
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}]}),
+    )
+    .await;
+    assert!(r.text.contains("светит ярко"), "{}", r.text);
+    let s = ok(
+        &a,
+        &a.token,
+        &m,
+        "memory_search",
+        json!({"query": "квазар", "mode": "chunks"}),
+    )
+    .await;
+    assert!(
+        !s.text.contains("(выдавалось)") && !s.text.contains("(seen)"),
+        "{}",
+        s.text
+    );
+    let w = ok(
+        &a,
+        &a.token,
+        &m,
+        "memory_write",
+        json!({"path": "Неявная/A", "content": "# A\n\nтекст\n"}),
+    )
+    .await;
+    // отметок нет: та же сессия явно по REST видит цель невыданной
+    let hs = [("x-zam-session", "hook-s"), ("x-zam-machine", MACHINE)];
+    let j = rest_search(&a, &hs, "brief", "json").await.json();
+    assert_eq!(j["items"][0]["seen"], false, "{j}");
+    // учёт (в фоне) — в unattributed; запись засчитана неявной сессии (R13), учёт выданного — нет
+    let items = unattributed_when(&a, 3).await;
+    let g = a
+        .t(Method::GET, "/api/v1/sessions/hook-s", None)
+        .await
+        .json();
+    assert_eq!(g["memory_writes"], 1, "{g}");
+    assert!(g["tokens"].get("mcp").is_none(), "{g}");
+    assert_eq!(items.len(), 1, "{items:?}");
+    let today = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .to_string();
+    assert_eq!(items[0]["day"], today.as_str(), "{items:?}");
+    assert_eq!(items[0]["event"], "mcp");
+    assert_eq!(items[0]["calls"], 3);
+    assert_eq!(items[0]["tokens"], tok_of(&r) + tok_of(&s) + tok_of(&w));
+    // параметр days: 1..=366
+    for bad in ["0", "367", "x"] {
+        let r = a
+            .t(
+                Method::GET,
+                &format!("/api/v1/sessions/unattributed?days={bad}"),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+}
+
+/// Признак MCP (`McpOrigin`) ставит только внутренний клиент: внешний запрос REST с любыми
+/// заголовками — обычный REST (`(seen)` прячет фрагмент, отметки пишутся, учёта `mcp` нет).
+#[tokio::test]
+async fn mcp_origin_not_forgeable_by_header() {
+    let a = api("mcp-origin-forge", |_| {}).await;
+    quasar(&a).await;
+    let forged = [
+        ("x-zam-session", "forge-s"),
+        ("x-zam-machine", MACHINE),
+        ("mcp-origin", "implicit"),
+        ("x-zam-mcp", "1"),
+        ("x-zam-mcp-origin", "{\"implicit\":true}"),
+        ("mcp-session-id", "abc"),
+        ("mcp-protocol-version", "2025-06-18"),
+    ];
+    // chunks отмечает выданное — «неявность» заголовками не подделать
+    rest_search(&a, &forged, "chunks", "json").await;
+    let md = rest_search(&a, &forged, "brief", "md").await.text();
+    assert!(
+        md.contains("(seen)") && !md.contains("(выдавалось)"),
+        "{md}"
+    );
+    assert!(!md.contains("светит"), "{md}");
+    let t = session_tokens(&a, "forge-s").await;
+    assert!(t.get("mcp").is_none(), "{t}");
+    assert!(unattributed(&a).await.is_empty());
+}
+
+/// Вызов MCP учитывается один раз — событием `mcp`: вложенные `/search`, `/read` и `/recall`
+/// событий `search`, `read` и `session_start` не пишут; чтение из MCP — ещё строкой `mcp_read`
+/// (вызов, токенов 0 — токены в `mcp`; правки ревью 8b M6).
+#[tokio::test]
+async fn mcp_search_counts_once() {
+    let a = api("mcp-counts-once", |_| {}).await;
+    let r = a
+        .adm(
+            Method::PATCH,
+            "/api/v1/admin/settings",
+            Some(json!({"rules": {"agent_write": true}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    a.note("rules", "правило.md", "# Правило\n\nВсегда пиши тесты.")
+        .await;
+    let id = quasar(&a).await;
+    let h = sess();
+    let s = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар"}),
+    )
+    .await;
+    let r = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}]}),
+    )
+    .await;
+    let c = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_recall",
+        json!({"event": "session_start"}),
+    )
+    .await;
+    assert!(c.text.contains("Всегда пиши тесты"), "{}", c.text);
+    let t = session_tokens_when(&a, SESSION, 3).await;
+    let keys: Vec<&String> = t.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["mcp", "mcp_read"], "{t}");
+    assert_eq!(t["mcp_read"], json!({"calls": 1, "tokens": 0}), "{t}");
+    assert_eq!(t["mcp"]["calls"], 3, "{t}");
+    assert_eq!(
+        t["mcp"]["tokens"],
+        tok_of(&s) + tok_of(&r) + tok_of(&c),
+        "{t}"
+    );
+}
+
+/// Субагент на общем подключении MCP приходит с сессией родителя: выданное родителем остаётся
+/// в карточке с фрагментом и пометкой «(выдавалось)»; прячет только явный `skip_seen: true`.
+#[tokio::test]
+async fn subagent_on_shared_mcp_keeps_snippet() {
+    let a = api("mcp-subagent-shared", |_| {}).await;
+    let id = quasar(&a).await;
+    let h = sess();
+    // родитель получил текст целиком
+    ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар", "mode": "chunks"}),
+    )
+    .await;
+    // «субагент» на том же подключении: фрагмент и пометка
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар"}),
+    )
+    .await;
+    assert!(o.text.contains(&format!("n:{id}")), "{}", o.text);
+    assert!(
+        o.text.contains("(выдавалось)") && o.text.contains("светит"),
+        "{}",
+        o.text
+    );
+    // chunks повторно — текст отдаётся
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар", "mode": "chunks"}),
+    )
+    .await;
+    assert!(o.text.contains("светит ярко"), "{}", o.text);
+    // явный skip_seen: true — как в REST: без фрагмента
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар", "skip_seen": true}),
+    )
+    .await;
+    assert!(
+        o.text.contains("(seen)") && !o.text.contains("светит"),
+        "{}",
+        o.text
+    );
+    // схема инструмента знает skip_seen
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let search = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_search")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        search["inputSchema"]["properties"]["skip_seen"]["type"], "boolean",
+        "{search}"
+    );
+}
+
+// ---- ответы записи (M6 §5, задача 5) ----
+
+/// Строки ответа без последней `~N tok`.
+fn body_lines(o: &Out) -> Vec<String> {
+    let t = o.text.trim_end();
+    let (body, _) = t.rsplit_once('\n').unwrap_or(("", t));
+    body.lines().map(str::to_string).collect()
+}
+
+/// `memory_cache_put` — одна строка (≤ 80 токенов вместе с `~N tok`), без эха запроса.
+#[tokio::test]
+async fn mcp_cache_put_one_line_le_80_tokens() {
+    let a = api("mcp-cache-one-line", |_| {}).await;
+    let n = a
+        .note(
+            "knowledge",
+            "Сборка/Кэш cargo",
+            "# Кэш cargo\n\nCARGO_TARGET_DIR общий для всех веток ускоряет сборку.\n",
+        )
+        .await;
+    let id = n["id"].as_str().unwrap();
+    let long_q = "как ускорить сборку cargo в рабочем пространстве с десятком крейтов, \
+                  общим каталогом target и несколькими ветками одновременно на HDD";
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_cache_put",
+        json!({"query": long_q,
+               "summary": "Общий CARGO_TARGET_DIR для веток ускоряет сборку.",
+               "sources": [{"id": format!("n:{id}"), "rev": 1}],
+               "promote": {"as": "note"}}),
+    )
+    .await;
+    let lines = body_lines(&o);
+    assert_eq!(lines.len(), 1, "{}", o.text);
+    assert!(lines[0].contains("c_"), "{}", o.text);
+    assert!(
+        !o.text.contains("десятком крейтов"),
+        "эхо запроса: {}",
+        o.text
+    );
+    let n = zam_store::count_tokens(&o.text);
+    assert!(n <= 80, "{n} токенов: {}", o.text);
+}
+
+/// `memory_update_entry` — одна строка (≤ 80 токенов) при длинном заголовке; замещение — тоже.
+#[tokio::test]
+async fn mcp_update_entry_one_line_le_80_tokens() {
+    let a = api("mcp-update-one-line", |_| {}).await;
+    let title = "Очень длинный заголовок ловушки про сборку на Windows с путями, пробелами \
+                 и кавычками в именах каталогов проекта";
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "insight", "title": title, "body": "Разобрано.",
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let id = o
+        .text
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("i:"))
+        .unwrap()
+        .to_string();
+    let mut rev = 1;
+    for mut args in [
+        json!({"id": format!("i:{id}"), "action": "revisit"}),
+        json!({"id": format!("i:{id}"), "action": "certify", "certainty": "theorem",
+               "reason": "проверено на двух машинах",
+               "data": {"kind": "gotcha", "evidence": {"checked": "сборка на двух машинах",
+                        "method": "повтор", "result": "воспроизводится"}}}),
+        json!({"id": format!("i:{id}"), "action": "supersede", "title": title,
+               "body": "Разобрано заново.", "data": {"kind": "gotcha"}}),
+    ] {
+        args["rev"] = json!(rev);
+        let o = ok(&a, &a.token, &sess(), "memory_update_entry", args.clone()).await;
+        // ревизия — из ответа (`i:<id> rev<N>`)
+        if let Some(n) = o
+            .text
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("rev").and_then(|n| n.parse::<i64>().ok()))
+        {
+            rev = n;
+        }
+        let lines = body_lines(&o);
+        assert_eq!(lines.len(), 1, "{args}: {}", o.text);
+        let n = zam_store::count_tokens(&o.text);
+        assert!(n <= 80, "{args}: {n} токенов: {}", o.text);
+        if args["action"] == "supersede" {
+            assert!(
+                o.text.contains(&format!("i:{id}")),
+                "замещённая: {}",
+                o.text
+            );
+        }
+    }
+}
+
+/// `memory_update_entry` с предупреждениями (секрет в дописанном теле): одна строка, они — в ней
+/// через «; », ≤ 80 токенов (M6 §5, ревью задачи 5, M3).
+#[tokio::test]
+async fn mcp_update_entry_warnings_one_line() {
+    let a = api("mcp-update-warn", |_| {}).await;
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "insight", "title": "Ключи в конфиге", "body": "Разобрано.",
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let id = o
+        .text
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("i:"))
+        .unwrap()
+        .to_string();
+    let key = ["AK", "IA", "IOSFODNN7", "EXAMPLE"].concat();
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_update_entry",
+        json!({"id": format!("i:{id}"), "action": "append", "rev": 1,
+               "body": format!("Ключ {key} в конфиге.")}),
+    )
+    .await;
+    let lines = body_lines(&o);
+    assert_eq!(lines.len(), 1, "{}", o.text);
+    assert!(lines[0].contains(" · warning: "), "{}", o.text);
+    assert!(!o.text.contains(&key), "{}", o.text);
+    let n = zam_store::count_tokens(&o.text);
+    assert!(n <= 80, "{n} токенов: {}", o.text);
+}
+
+/// `memory_log` с предупреждениями: строка записи и по строке на предупреждение.
+#[tokio::test]
+async fn memory_log_warnings_line_per_warning() {
+    let a = api("mcp-log-warnings", |_| {}).await;
+    ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "term", "title": "Выжимка", "body": "Подробности.",
+               "data": {"definition": "Короткая сводка", "aliases": ["summary", "digest"]}}),
+    )
+    .await;
+    let key = ["AK", "IA", "IOSFODNN7", "EXAMPLE"].concat();
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "insight", "title": "Про summary и digest",
+               "body": format!("summary и digest; ключ {key}"),
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let lines = body_lines(&o);
+    let warns: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("> warning: "))
+        .collect();
+    assert!(warns.len() >= 3, "{}", o.text);
+    assert_eq!(lines.len(), 1 + warns.len(), "{}", o.text);
+    assert!(lines[0].starts_with("Записано i:"), "{}", o.text);
+    assert!(!o.text.contains(&key), "{}", o.text);
+}
+
+// ---- источник выжимки в том же ответе (M6 §7.1, решение контролёра 2026-11-06) ----
+
+/// Пометка карточки MCP: выдавалось, текст источника — в выжимке этого же ответа.
+const IN_CACHE: &str = "(выдавалось, в выжимке)";
+
+/// Текст из двух секций о квазаре, каждая длиннее чанка: карточки секций — отдельные.
+fn section_note() -> String {
+    let mut t = String::from("# Квазар\n\n## Яркость\nКвазар светит ярко.\n");
+    for i in 0..60 {
+        t.push_str(&format!("Строка {i}: свет квазара виден издалека.\n"));
+    }
+    t.push_str("\n## Расстояние\nКвазар далеко и квазар стар.\n");
+    for i in 0..60 {
+        t.push_str(&format!("Строка {i}: до квазара миллиарды лет пути.\n"));
+    }
+    t
+}
+
+/// Заметка с двумя секциями о квазаре; id узла.
+async fn quasar_sections(a: &Api) -> String {
+    let n = a.note("knowledge", "Астро/Квазар2", &section_note()).await;
+    n["id"].as_str().unwrap().to_string()
+}
+
+/// Под карточкой цели `n:<id>` есть строка фрагмента (с отступом).
+fn fragment_under(text: &str, id: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .iter()
+        .position(|l| l.contains(&format!("n:{id}")))
+        .is_some_and(|k| lines.get(k + 1).is_some_and(|l| l.starts_with("   ")))
+}
+
+/// Сессия получила цель целиком (`memory_read`), затем выжимка по ней (`memory_cache_put`).
+async fn read_and_cache(a: &Api, h: &[(&str, &str)], query: &str, sources: Value) {
+    for s in sources.as_array().unwrap() {
+        ok(
+            a,
+            &a.token,
+            h,
+            "memory_read",
+            json!({"items": [{"id": s["id"]}], "budget_tokens": 8000}),
+        )
+        .await;
+    }
+    let o = ok(
+        a,
+        &a.token,
+        h,
+        "memory_cache_put",
+        json!({"query": query, "summary": "Сводка: объект яркий.", "sources": sources}),
+    )
+    .await;
+    assert!(o.text.contains("c_"), "{}", o.text);
+}
+
+/// Карточка `(выдавалось)`, чья цель — источник действующей выжимки этого же ответа: без
+/// фрагмента и с пометкой `(выдавалось, в выжимке)`; в JSON — `seen: true`, `in_cache: true`,
+/// без `snippet`. Выжимка в ответе есть (`[cache] … все актуальны`).
+#[tokio::test]
+async fn mcp_seen_cache_source_without_fragment() {
+    let a = api("mcp-cache-source", |_| {}).await;
+    let id = quasar(&a).await;
+    let h = sess();
+    let q = "чем светит квазар";
+    read_and_cache(&a, &h, q, json!([{"id": format!("n:{id}"), "rev": 1}])).await;
+    let o = ok(&a, &a.token, &h, "memory_search", json!({"query": q})).await;
+    assert!(
+        o.text.contains("[cache]") && o.text.contains("все актуальны"),
+        "{}",
+        o.text
+    );
+    assert!(
+        o.text.contains("Сводка: объект яркий."),
+        "выжимка в ответе: {}",
+        o.text
+    );
+    let card = o
+        .text
+        .lines()
+        .find(|l| l.contains(&format!("n:{id}")))
+        .unwrap_or_else(|| panic!("нет карточки: {}", o.text));
+    assert!(card.ends_with(IN_CACHE), "{card}");
+    // под карточкой нет строки фрагмента (в тексте выдачи «светит» — только в запросе выжимки)
+    let lines: Vec<&str> = o.text.lines().collect();
+    let k = lines.iter().position(|l| *l == card).unwrap();
+    assert!(
+        !lines.get(k + 1).is_some_and(|l| l.starts_with("   ")),
+        "фрагмента нет: {}",
+        o.text
+    );
+    assert!(!o.text.contains("**светит**"), "{}", o.text);
+    let j = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": q, "format": "json"}),
+    )
+    .await;
+    let v = j.json();
+    let it = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["node_id"] == id.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(it["seen"], true, "{it}");
+    assert_eq!(it["in_cache"], true, "{it}");
+    assert!(it.get("snippet").is_none(), "{it}");
+    assert_eq!(v["items"][0]["kind"], "cache", "{v}");
+}
+
+/// Отрицательные: выжимки в ответе нет (другой запрос — кэш не находит; у MCP нет `no_cache`),
+/// выжимка `stale`, явный `skip_seen: false` —
+/// карточка с фрагментом, как по §7.1.
+#[tokio::test]
+async fn mcp_seen_cache_source_keeps_fragment_otherwise() {
+    let a = api("mcp-cache-source-neg", |_| {}).await;
+    let id = quasar(&a).await;
+    let other = a
+        .note(
+            "knowledge",
+            "Астро/Пульсар",
+            "# Пульсар\n\nПульсар мигает.\n",
+        )
+        .await;
+    let other = other["id"].as_str().unwrap().to_string();
+    let h = sess();
+    let q = "чем светит квазар";
+    read_and_cache(
+        &a,
+        &h,
+        q,
+        json!([{"id": format!("n:{id}"), "rev": 1}, {"id": format!("n:{other}"), "rev": 1}]),
+    )
+    .await;
+    let card = |text: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(&format!("n:{id}")))
+            .unwrap_or_else(|| panic!("нет карточки: {text}"))
+            .to_string()
+    };
+    // выжимки в ответе нет — фрагмент остаётся
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар ярко"}),
+    )
+    .await;
+    assert!(!o.text.contains("[cache"), "{}", o.text);
+    assert!(card(&o.text).ends_with("(выдавалось)"), "{}", o.text);
+    assert!(fragment_under(&o.text, &id), "{}", o.text);
+    // явный `skip_seen: false` — фрагмент без пометки
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": q, "skip_seen": false}),
+    )
+    .await;
+    assert!(o.text.contains("[cache]"), "{}", o.text);
+    assert!(!card(&o.text).contains("(выдавалось"), "{}", o.text);
+    assert!(fragment_under(&o.text, &id), "{}", o.text);
+    // второй источник изменился — `[cache, stale: …]`: фрагмент у первого остаётся
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{other}"),
+            Some(json!({"content": "# Пульсар\n\nПульсар мигает часто.\n"})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let o = ok(&a, &a.token, &h, "memory_search", json!({"query": q})).await;
+    assert!(o.text.contains("[cache, stale:"), "{}", o.text);
+    assert!(card(&o.text).ends_with("(выдавалось)"), "{}", o.text);
+    assert!(fragment_under(&o.text, &id), "{}", o.text);
+}
+
+/// Источник — секция: без фрагмента только карточка этой секции, карточка другой секции той же
+/// заметки — `(выдавалось)` с фрагментом.
+#[tokio::test]
+async fn mcp_seen_cache_section_source_only_that_section() {
+    let a = api("mcp-cache-section", |_| {}).await;
+    let id = quasar_sections(&a).await;
+    let h = sess();
+    let q = "квазар";
+    read_and_cache(
+        &a,
+        &h,
+        q,
+        json!([{"id": format!("n:{id}"), "rev": 1, "section": "Квазар > Яркость"}]),
+    )
+    .await;
+    let o = ok(&a, &a.token, &h, "memory_search", json!({"query": q})).await;
+    assert!(o.text.contains("все актуальны"), "{}", o.text);
+    let lines: Vec<&str> = o.text.lines().collect();
+    // карточки секции и есть ли под ними фрагмент (строка с отступом)
+    let cards = |sec: &str| -> Vec<(&str, bool)> {
+        (0..lines.len())
+            .filter(|&k| lines[k].contains(&format!("n:{id}")) && lines[k].contains(sec))
+            .map(|k| {
+                (
+                    lines[k],
+                    lines.get(k + 1).is_some_and(|l| l.starts_with("   ")),
+                )
+            })
+            .collect()
+    };
+    let bright = cards("› Квазар > Яркость");
+    let far = cards("› Квазар > Расстояние");
+    assert!(!bright.is_empty(), "нет карточки «Яркость»: {}", o.text);
+    assert!(!far.is_empty(), "нет карточки «Расстояние»: {}", o.text);
+    for (l, frag) in bright {
+        assert!(l.ends_with(IN_CACHE) && !frag, "{l}: {}", o.text);
+    }
+    for (l, frag) in far {
+        assert!(l.ends_with("(выдавалось)") && frag, "{l}: {}", o.text);
+    }
+}
+
+/// Повторное ревью задачи 7a (I-A): источник-секция покрывает карточку, только если её чанк
+/// целиком лежит в секции. Карточки `n:<id>` с секцией `sec` в пути: `(пометка в конце, есть
+/// ли фрагмент)`.
+fn section_cards(text: &str, id: &str, sec: &str) -> Vec<(String, bool)> {
+    let lines: Vec<&str> = text.lines().collect();
+    (0..lines.len())
+        .filter(|&k| lines[k].contains(&format!("n:{id}")) && lines[k].contains(sec))
+        .map(|k| {
+            let frag = lines.get(k + 1).is_some_and(|l| l.starts_with("   "));
+            (lines[k].to_string(), frag)
+        })
+        .collect()
+}
+
+/// Заметка `path` с текстом `text`: прочитана целиком, выжимка по секции `sec`, поиск
+/// «квазар»; текст ответа MCP и id узла.
+async fn cache_section_search(name: &str, text: &str, sec: &str) -> (String, String) {
+    let a = api(name, |_| {}).await;
+    let n = a.note("knowledge", "Астро/Секции", text).await;
+    let id = n["id"].as_str().unwrap().to_string();
+    let h = sess();
+    read_and_cache(
+        &a,
+        &h,
+        "квазар",
+        json!([{"id": format!("n:{id}"), "rev": 1, "section": sec}]),
+    )
+    .await;
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_search",
+        json!({"query": "квазар"}),
+    )
+    .await;
+    assert!(o.text.contains("все актуальны"), "{}", o.text);
+    (o.text, id)
+}
+
+/// Короткая секция «A > B» склеена чанкером со следующей «A > C» (путь склейки — первой):
+/// источник «A > B» карточку склеенного чанка не покрывает — `(выдавалось)` с фрагментом.
+#[tokio::test]
+async fn mcp_cache_section_merged_chunk_keeps_fragment() {
+    let (text, id) = cache_section_search(
+        "mcp-cache-merged",
+        "# A\n\n## B\nКвазар светит.\n\n## C\nКвазар гаснет.\n",
+        "A > B",
+    )
+    .await;
+    let cards = section_cards(&text, &id, "› A > B");
+    assert!(!cards.is_empty(), "нет карточки «A > B»: {text}");
+    for (l, frag) in cards {
+        assert!(l.ends_with("(выдавалось)") && frag, "{l}: {text}");
+    }
+    assert!(
+        text.contains("гаснет"),
+        "текст соседней секции — во фрагменте: {text}"
+    );
+}
+
+/// Вложенность: источник «Квазар» (H1 со всеми подсекциями) покрывает карточки «Квазар >
+/// Яркость» и «Квазар > Расстояние».
+#[tokio::test]
+async fn mcp_cache_parent_section_covers_nested() {
+    let (text, id) = cache_section_search("mcp-cache-nested", &section_note(), "Квазар").await;
+    let cards = section_cards(&text, &id, "› Квазар > ");
+    assert!(cards.len() >= 2, "{text}");
+    for (l, frag) in cards {
+        assert!(l.ends_with(IN_CACHE) && !frag, "{l}: {text}");
+    }
+}
+
+/// Лист с путём H4 (`heading_path_h4`): короткая H3 «C» с подзаголовком H4 «D» склеена со
+/// следующей H3 «F», путь листа — «A > B > C > D». Источник-секция — только H1–H3 (H4 как
+/// источник — 422), поэтому источник — «A > B > C»: проверка по префиксу пути покрывала лист,
+/// хотя в нём текст «F»; карточка сохраняет фрагмент.
+#[tokio::test]
+async fn mcp_cache_h4_leaf_spanning_next_keeps_fragment() {
+    let (text, id) = cache_section_search(
+        "mcp-cache-h4",
+        "# A\n\n## B\n\n### C\n\n#### D\nКвазар светит.\n\n### F\nКвазар гаснет.\n",
+        "A > B > C",
+    )
+    .await;
+    let cards = section_cards(&text, &id, &format!("n:{id}"));
+    assert!(!cards.is_empty(), "{text}");
+    for (l, frag) in cards {
+        assert!(!l.ends_with(IN_CACHE) && frag, "{l}: {text}");
+    }
+    assert!(text.contains("гаснет"), "{text}");
+}
+
+/// M6 §12а (отложено финальным ревью M5.6): символ с `qual` вида якоря строки (`L10`, `L1-L2`) —
+/// `путь#L10` адресует строку файла (REST 400), поэтому `memory_code` даёт карточку по `id` с
+/// подсказкой «уточните path»; в списке кандидатов — `id`, а `query=<id>` открывает карточку.
+#[tokio::test]
+async fn line_anchor_symbol_link_by_id() {
+    let w = code_world("line-anchor").await;
+    let a = &w.a;
+    code_put(
+        a,
+        vec![code_file(
+            "d.rs",
+            4,
+            vec![
+                code_sym("L10", "const", 1),
+                code_sym("other", "function", 5),
+            ],
+            &[],
+        )],
+    )
+    .await;
+    let call = |args: Value| async move { ok(a, &a.token, &SOL, "memory_code", args).await.text };
+    // REST по адресу `путь#L10` — не символ (400), поэтому адрес карточки — id
+    let r = a
+        .t(
+            Method::GET,
+            &format!(
+                "/api/v1/code/symbols/{}?solution={G}",
+                common::api::enc("d.rs#L10")
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let card = call(json!({"action": "symbol", "query": "L10"})).await;
+    assert!(card.contains("### `d.rs · L10 · id "), "{card}");
+    assert!(card.contains("const"), "{card}");
+    assert!(card.contains("уточните path"), "подсказка: {card}");
+    let id: String = card
+        .split("· id ")
+        .nth(1)
+        .unwrap()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let by_id = call(json!({"action": "symbol", "query": id})).await;
+    assert_eq!(
+        body_of(&by_id).lines().next(),
+        body_of(&card).lines().next(),
+        "{by_id}"
+    );
+    // id и path вместе — path не учтён, предупреждение (ревью задачи 14, M2)
+    let with_path = call(json!({"action": "symbol", "query": id, "path": "e.rs"})).await;
+    assert!(
+        with_path.contains("> warning: path «e.rs» не учтён: query — уже id карточки"),
+        "{with_path}"
+    );
+    assert_eq!(
+        body_of(&with_path).lines().next(),
+        body_of(&card).lines().next()
+    );
+    // два символа `L10` — список кандидатов с id и подсказкой
+    code_put(
+        a,
+        vec![code_file("e.rs", 5, vec![code_sym("L10", "const", 2)], &[])],
+    )
+    .await;
+    let list = call(json!({"action": "symbol", "query": "L10"})).await;
+    assert!(
+        list.contains("`d.rs · L10 · id ") && list.contains("`e.rs · L10 · id "),
+        "{list}"
+    );
+    assert!(!list.contains("d.rs#L10"), "{list}");
+    assert!(list.contains("уточните path"), "{list}");
+    // обычный символ — по-прежнему адрес путь#qual
+    let other = call(json!({"action": "symbol", "query": "other"})).await;
+    assert!(other.contains("`d.rs#other`"), "{other}");
+}
+
+// ---- M6 §16 п. 19: нативный клиент (CR-8, CR-7, CR-20, мелочи приложения) ----
+
+/// Схема аргументов инструмента `name` из `tools/list`.
+async fn tool_def(a: &Api, name: &str) -> Value {
+    let list = rpc(a, &a.token, &[], "tools/list", json!({})).await;
+    list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == name)
+        .unwrap_or_else(|| panic!("нет {name}"))
+        .clone()
+}
+
+/// CR-8 (§17 п. 25): `session_id` в аргументах без `X-Zam-Session` — явная сессия:
+/// `memory_recall`, `memory_read`, `memory_search` учитываются в ней (событие `mcp`), выданное
+/// отмечается (`(выдавалось)`), `tokens_unattributed` не растёт.
+#[tokio::test]
+async fn mcp_session_id_arg_accounts_session() {
+    let a = api("mcp-session-arg", |_| {}).await;
+    let id = quasar(&a).await;
+    let s = "arg-session-1";
+    let c = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_recall",
+        json!({"event": "session_start", "session_id": s}),
+    )
+    .await;
+    let r = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_read",
+        json!({"items": [{"id": format!("n:{id}")}], "session_id": s}),
+    )
+    .await;
+    assert!(r.text.contains("светит ярко"), "{}", r.text);
+    let q = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_search",
+        json!({"query": "квазар", "session_id": s}),
+    )
+    .await;
+    assert!(
+        q.text.contains("(выдавалось)"),
+        "отметка в сессии: {}",
+        q.text
+    );
+    let t = session_tokens_when(&a, s, 3).await;
+    assert_eq!(t["mcp"]["calls"], 3, "{t}");
+    assert_eq!(
+        t["mcp"]["tokens"],
+        tok_of(&c) + tok_of(&r) + tok_of(&q),
+        "{t}"
+    );
+    assert!(unattributed(&a).await.is_empty());
+}
+
+/// CR-8: заголовок `X-Zam-Session` и аргумент `session_id` вместе — одна и та же сессия;
+/// разные — 400 у `memory_recall`, `memory_search` и `memory_read` (REST не вызывается, сессия
+/// аргумента не создаётся; ответ с ошибкой учитывается в сессии заголовка — он важнее).
+#[tokio::test]
+async fn mcp_session_header_and_arg_conflict_400() {
+    let a = api("mcp-session-conflict", |_| {}).await;
+    let id = quasar(&a).await;
+    let h = sess();
+    let calls = [
+        ("memory_recall", json!({"event": "session_start"})),
+        ("memory_search", json!({"query": "квазар"})),
+        ("memory_read", json!({"items": [{"id": format!("n:{id}")}]})),
+    ];
+    for (name, args) in &calls {
+        let mut bad = args.clone();
+        bad["session_id"] = json!("other-session");
+        let o = tool(&a, &a.token, &h, name, bad).await;
+        assert!(o.is_error, "{name}: {}", o.text);
+        assert!(o.text.contains("Ошибка 400"), "{name}: {}", o.text);
+        assert!(o.text.contains("session_id"), "{name}: {}", o.text);
+    }
+    // совпадает с заголовком — как без аргумента
+    for (name, args) in &calls {
+        let mut same = args.clone();
+        same["session_id"] = json!(SESSION);
+        ok(&a, &a.token, &h, name, same).await;
+    }
+    let t = session_tokens_when(&a, SESSION, 6).await;
+    assert_eq!(t["mcp"]["calls"], 6, "{t}");
+    let other = a
+        .t(Method::GET, "/api/v1/sessions/other-session", None)
+        .await;
+    assert_eq!(other.status, StatusCode::NOT_FOUND, "{}", other.text());
+    assert!(unattributed(&a).await.is_empty());
+}
+
+/// CR-7, CR-8: в схемах объявлены `source`, `agent_block_version`, `timeout_ms` у
+/// `memory_recall` и `session_id` у `memory_search` и `memory_read`.
+#[tokio::test]
+async fn mcp_recall_schema_has_source_block_timeout() {
+    let a = api("mcp-recall-schema", |_| {}).await;
+    let recall = tool_def(&a, "memory_recall").await;
+    let p = &recall["inputSchema"]["properties"];
+    for k in ["source", "agent_block_version", "timeout_ms", "session_id"] {
+        assert!(p[k].is_object(), "memory_recall.{k}: {recall}");
+    }
+    assert_eq!(p["timeout_ms"]["type"], "integer", "{recall}");
+    assert_eq!(p["timeout_ms"]["minimum"], 1, "{recall}");
+    for name in ["memory_search", "memory_read"] {
+        let d = tool_def(&a, name).await;
+        assert_eq!(
+            d["inputSchema"]["properties"]["session_id"]["type"], "string",
+            "{d}"
+        );
+    }
+    // timeout_ms доходит до REST: больше предела — 400
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_recall",
+        json!({"event": "session_start", "timeout_ms": 2001}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("Ошибка 400"), "{}", o.text);
+    ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_recall",
+        json!({"event": "session_start", "timeout_ms": 1500, "source": "startup",
+               "agent_block_version": 1}),
+    )
+    .await;
+}
+
+/// Число вхождений `needle` в тексте заметки `space:/path` (REST, md).
+async fn note_count(a: &Api, id: &str, needle: &str) -> (usize, i64) {
+    let r = a.t(Method::GET, &format!("/api/v1/nodes/{id}"), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    (
+        j["content"].as_str().unwrap().matches(needle).count(),
+        j["rev"].as_i64().unwrap(),
+    )
+}
+
+/// CR-20: `memory_write` с `idempotency_key` — повтор создания и `append` с тем же ключом
+/// не пишет второй раз (тот же ответ без ошибки), другое тело с тем же ключом — 422.
+#[tokio::test]
+async fn memory_write_idempotency_key() {
+    let a = api("mcp-write-idem", |_| {}).await;
+    let d = tool_def(&a, "memory_write").await;
+    assert_eq!(
+        d["inputSchema"]["properties"]["idempotency_key"]["type"], "string",
+        "{d}"
+    );
+    let h = sess();
+    let create = json!({"path": "Идем/A", "content": "# A\n\nначало\n",
+                        "idempotency_key": "w-create-1"});
+    let first = ok(&a, &a.token, &h, "memory_write", create.clone()).await;
+    let again = ok(&a, &a.token, &h, "memory_write", create).await;
+    let nid = |o: &Out| {
+        o.text
+            .trim_start_matches("Записано n:")
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(nid(&first), nid(&again), "{} / {}", first.text, again.text);
+    let id = nid(&first);
+    let append = json!({"path": "Идем/A", "base_rev": 1, "idempotency_key": "w-append-1",
+                        "ops": [{"op": "append", "content": "хвост-1"}]});
+    ok(&a, &a.token, &h, "memory_write", append.clone()).await;
+    let o = ok(&a, &a.token, &h, "memory_write", append).await;
+    assert!(o.text.contains("rev2"), "{}", o.text);
+    assert_eq!(note_count(&a, &id, "хвост-1").await, (1, 2));
+    // тот же ключ, другое тело — 422, ничего не записано
+    let o = tool(
+        &a,
+        &a.token,
+        &h,
+        "memory_write",
+        json!({"path": "Идем/A", "base_rev": 2, "idempotency_key": "w-append-1",
+               "ops": [{"op": "append", "content": "хвост-2"}]}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("Ошибка 422"), "{}", o.text);
+    assert_eq!(note_count(&a, &id, "хвост-2").await, (0, 2));
+    // без ключа — прежнее поведение: повтор append пишет второй раз
+    let plain = json!({"path": "Идем/A", "base_rev": 2,
+                       "ops": [{"op": "append", "content": "хвост-3"}]});
+    ok(&a, &a.token, &h, "memory_write", plain.clone()).await;
+    ok(&a, &a.token, &h, "memory_write", plain).await;
+    assert_eq!(note_count(&a, &id, "хвост-3").await, (2, 4));
+}
+
+/// Мелочи приложения zero-agent: префикс `w:` есть в списках ссылок MCP и работает в
+/// `memory_read`; описание `memory_update_entry` называет все действия без `rev`.
+#[tokio::test]
+async fn mcp_ref_prefixes_include_w() {
+    let a = api("mcp-ref-w", |_| {}).await;
+    let read = tool_def(&a, "memory_read").await;
+    let d = read["description"].as_str().unwrap();
+    assert!(d.contains("|w:") || d.contains("w:<id>"), "{d}");
+    let upd = tool_def(&a, "memory_update_entry").await;
+    let d = upd["description"].as_str().unwrap();
+    for act in [
+        "feedback", "claim", "release", "answer", "propose", "decide",
+    ] {
+        let tail = d.split("кроме").nth(1).unwrap_or("");
+        let list = tail.split(')').next().unwrap_or("");
+        assert!(list.contains(act), "rev не нужна у {act}: {d}");
+    }
+    let id = mcp_idea(&a, "Идея о префиксе w").await;
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_read",
+        json!({"items": [{"id": format!("w:{id}")}]}),
+    )
+    .await;
+    assert!(o.text.contains("Идея о префиксе w"), "{}", o.text);
+}
+
+/// Описания v7 (M6 §13, задача 13a): `memory_read` — `focus` (один на пачку), легенда
+/// `[пропущено: …]` с дочитыванием `range`, «уже выдавалось»; `memory_search` — легенда хвоста и
+/// пометки `(выдавалось)`, `(выдавалось, в выжимке)`; правило отвергнутых подходов — в описании
+/// поля `data.kind` схемы `memory_log`; `initialize.instructions` — фокус, отвергнутый подход,
+/// строки правил и индексов дайджеста. Все описания — до 300 символов.
+#[tokio::test]
+async fn mcp_v7_descriptions_focus_seen_rejected() {
+    let a = api("mcp-desc-v7", |_| {}).await;
+    let read = tool_def(&a, "memory_read").await;
+    let d = read["description"].as_str().unwrap();
+    assert!(
+        d.chars().count() <= 300,
+        "memory_read: {}",
+        d.chars().count()
+    );
+    for w in [
+        "focus",
+        "один на пачку",
+        "[пропущено",
+        "range",
+        "уже выдавалось",
+        "a:",
+        "b:",
+        "locator",
+        "w:<id>",
+    ] {
+        assert!(d.contains(w), "memory_read: нет «{w}»: {d}");
+    }
+    // поля элемента: формы locator (zam_docs::Locator::parse), оглавление без locator, один focus
+    let item = &read["inputSchema"]["properties"]["items"]["items"]["properties"];
+    let loc = item["locator"]["description"].as_str().unwrap();
+    for w in [
+        "page:N",
+        "slide:N",
+        "para:N",
+        "sheet:",
+        "без locator — оглавление",
+    ] {
+        assert!(loc.contains(w), "locator: нет «{w}»: {loc}");
+    }
+    let focus = item["focus"]["description"].as_str().unwrap();
+    assert!(focus.contains("один и тот же текст на пачку"), "{focus}");
+    let search = tool_def(&a, "memory_search").await;
+    let d = search["description"].as_str().unwrap();
+    assert!(
+        d.chars().count() <= 300,
+        "memory_search: {}",
+        d.chars().count()
+    );
+    for w in [
+        "[балл] rN · ax|th|hyp · дата UTC · Nt",
+        "(выдавалось)",
+        "в выжимке",
+        "focus",
+    ] {
+        assert!(d.contains(w), "memory_search: нет «{w}»: {d}");
+    }
+    let log = tool_def(&a, "memory_log").await;
+    let kind = log["inputSchema"]["properties"]["data"]["properties"]["kind"]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("нет data.kind: {log}"));
+    for w in [
+        "decision",
+        "options",
+        "chosen",
+        "rationale",
+        "отвергнуто, потому что",
+        "failure",
+    ] {
+        assert!(kind.contains(w), "data.kind: нет «{w}»: {kind}");
+    }
+    assert!(
+        kind.chars().count() <= 300,
+        "data.kind: {}",
+        kind.chars().count()
+    );
+    let init = rpc(
+        &a,
+        &a.token,
+        &[],
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "test", "version": "1"}}),
+    )
+    .await;
+    let s = init["instructions"].as_str().unwrap_or_default();
+    for w in [
+        "focus",
+        "[пропущено",
+        "уже выдавалось",
+        "data {kind: decision, decision: {options: [отвергнутое], chosen, rationale}}",
+        "n:<id>",
+        "· Nt",
+        "kind=task|question|term",
+        "event=recovery",
+        "event=brief",
+        "kind=report",
+        "карта кода — memory_code",
+    ] {
+        assert!(s.contains(w), "instructions: нет «{w}»: {s}");
+    }
 }

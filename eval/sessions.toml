@@ -1,0 +1,1063 @@
+# Набор ТС-2 «сессия» (спецификация M6 §3.1, §3.3; задача 4 плана): сессии агента в проекте
+# «магазин» на корпусе eval/sessions-corpus/. Прогон — `cargo xtask eval --sessions --split
+# dev|holdout [--profile standard|heavy] [--ideas on|off] [--base B4|B5.6|B5.7]`, формат и
+# метрики — eval/README.md, раздел «Набор ТС-2 (сессии)».
+#
+# [[session]]:
+# - id — `ss-NN` (стандартный профиль) или `sh-NN` (тяжёлый); profile — standard | heavy
+#   (слой разбиения dev/holdout);
+# - мир сессии — ключи корпуса eval/sessions-corpus (`"*"` — все записи файла): rules, tasks,
+#   questions (вопросы journal.toml; с answer — ответ человека), access (запросы доступа),
+#   terms (словарь), insights, ideas; code_map — карта кода по фикстуре
+#   eval/sessions-corpus/code (`zam code sync`);
+# - digest_ideas — идеи раздела `### Идеи` первого session_start (до 3, как отбирает M5.7:
+#   new и deferred с наступившим горизонтом от человека — high, normal, low, внутри — новые
+#   первыми; затем accepted со снятой задачей; сверено прогоном B5.7 на dev) — обязательные
+#   строки дайджеста;
+# - transcript — фикстура журнала агента для снимка сессии (§8а): имя файла без расширения в
+#   eval/sessions-corpus/transcripts/ (заглушки @ROOT@ — каталог проекта сессии, @SESSION@ — id
+#   сессии агента); хуки сессии получают `transcript_path`, снимок снимается на `Stop` и
+#   `PreCompact`;
+# - abort = true — сессия «обрывается» (§3.1; нужен transcript): после её событий раннер делает
+#   её неживой (последнее обращение — 11 минут назад, конца сессии нет) и запускает
+#   `session_start` (startup) другой сессией — событие `session_start_after_abort`, обязательная
+#   строка — раздел «Последнее известное состояние». Тяжёлых «оборванных» — не меньше двух.
+#
+# [[session.event]] по порядку; первый `session_start` (startup) и его повтор другой сессией
+# (совпадение дайджеста) ставит раннер. type:
+# - prompt {text, expect} — `zam hook prompt`; expect — ожидаемые подсказки (`insight:`,
+#   `rule:`, `term:`, `idea:`); подсказка показывается раз за сессию, поэтому ожидаемая считается
+#   выданной и тогда, когда она уже была раньше (правило и идея — в дайджесте);
+# - question {id, query, expect, nuggets} — вопрос по протоколу ТС-1 через `zam mcp`
+#   (memory_search brief → оракул → memory_read 4000 → дочитывание → memory_cache_put); expect —
+#   источники (`rule:`/`insight:`), nuggets — {source, text}, дословно из источника;
+# - repeat {of} — повтор вопроса `of` той же сессией (без memory_cache_put);
+# - tool_error {command, error, expect} — `pre-tool` Bash и `post-tool` с ошибкой;
+# - read_file {path, expect} — `pre-tool` Read и успешный `post-tool` Read (знание о файле);
+# - subagent {agent_type, task, queries} — `pre-tool` Agent, `subagent-start`, memory_search
+#   субагента через тот же `zam mcp` (учитывается в сессии родителя);
+# - compact — `checkpoint` PreCompact и `session-start` source=compact (пакет восстановления);
+# - checkpoint — `checkpoint` Stop.
+
+# ======================= стандартный профиль =======================
+
+[[session]]
+id = "ss-01"
+profile = "standard"
+rules = ["migrations", "commits", "tests"]
+tasks = ["t-keyset-orders"]
+insights = ["s-migration-lock", "s-sqlx-offline"]
+ideas = ["i01", "i05"]
+digest_ideas = ["i01", "i05"]
+transcript = "shop-keyset-index"
+
+[[session.event]]
+type = "prompt"
+text = "Надо перевести выгрузку партнёру на keyset-пагинацию, начни с миграции индекса по created_at"
+expect = ["rule:migrations", "insight:s-migration-lock"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "что поставить в начале миграции таблицы orders, чтобы она не блокировала чтение"
+expect = ["insight:s-migration-lock"]
+nuggets = [{ source = "insight:s-migration-lock", text = "В начале каждой миграции таблицы orders стоит SET lock_timeout = '2s'" }]
+
+[[session.event]]
+type = "tool_error"
+command = "cargo build -p orders"
+error = "error: `SQLX_OFFLINE=true` but there is no cached data for this query, run `cargo sqlx prepare` to update the query cache or unset `SQLX_OFFLINE`"
+expect = ["insight:s-sqlx-offline"]
+
+[[session.event]]
+type = "prompt"
+text = "Продавцы просят экспорт отчётов в PDF для бухгалтерии — это вообще есть в планах?"
+expect = ["idea:i01"]
+
+[[session.event]]
+type = "prompt"
+text = "Добавь тест на новую пагинацию и подготовь коммит"
+expect = ["rule:tests", "rule:commits"]
+
+[[session.event]]
+type = "repeat"
+of = "q1"
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-02"
+profile = "standard"
+rules = ["secrets", "frontend-a11y"]
+tasks = ["t-token-refresh"]
+insights = ["s-e2e-port", "s-env-dts"]
+ideas = ["i48"]
+digest_ideas = ["i48"]
+
+[[session.event]]
+type = "prompt"
+text = "Continue the single-tab token refresh in the storefront: share the token through BroadcastChannel"
+expect = []
+
+[[session.event]]
+type = "read_file"
+path = "web/storefront/.env.production"
+expect = ["insight:s-env-dts"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "где описывать новые переменные VITE_ сборки витрины и откуда берётся адрес API"
+expect = ["insight:s-env-dts"]
+nuggets = [{ source = "insight:s-env-dts", text = "адрес API берётся из /config.json стенда" }]
+
+[[session.event]]
+type = "tool_error"
+command = "npm run e2e"
+error = "Error: listen EADDRINUSE: address already in use :::5173"
+expect = ["insight:s-e2e-port"]
+
+[[session.event]]
+type = "prompt"
+text = "The size picker is not reachable from the keyboard, fix the accessibility of the size picker"
+expect = ["rule:frontend-a11y", "idea:i48"]
+
+[[session.event]]
+type = "prompt"
+text = "Можно ли положить токен API в переменную сборки витрины?"
+expect = ["rule:secrets"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-03"
+profile = "standard"
+rules = ["release", "reviews", "deps", "commits"]
+tasks = []
+insights = []
+ideas = []
+
+[[session.event]]
+type = "prompt"
+text = "Обнови крейт reqwest до последней версии в сервисе заказов"
+expect = ["rule:deps"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "какие лицензии допустимы для новой библиотеки в проекте"
+expect = ["rule:deps"]
+nuggets = [{ source = "rule:deps", text = "проверки лицензии (MIT, Apache-2.0, BSD)" }]
+
+[[session.event]]
+type = "question"
+id = "q2"
+query = "в какие дни и до какого часа можно выкатывать релиз"
+expect = ["rule:release"]
+nuggets = [{ source = "rule:release", text = "Релиз выкатывается по вторникам и четвергам до 15:00" }]
+
+[[session.event]]
+type = "prompt"
+text = "Who has to review a change to the payment flow before merge?"
+expect = ["rule:reviews"]
+
+[[session.event]]
+type = "prompt"
+text = "Сегодня пятница, можно выкатить обновление зависимостей?"
+expect = ["rule:release"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-04"
+profile = "standard"
+rules = ["infra-changes", "release"]
+tasks = ["t-upload-limits"]
+insights = ["s-nginx-template"]
+ideas = ["i27", "i34"]
+digest_ideas = ["i34", "i27"]
+
+[[session.event]]
+type = "prompt"
+text = "Import of price lists over 1 MB fails with 413 on the new stand, raise the nginx limit"
+expect = ["rule:infra-changes", "insight:s-nginx-template"]
+
+[[session.event]]
+type = "read_file"
+path = "infra/nginx/stand.conf.tmpl"
+expect = ["insight:s-nginx-template"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "can I fix nginx limits directly on the stand server"
+expect = ["rule:infra-changes"]
+nuggets = [{ source = "rule:infra-changes", text = "Manual changes on servers are forbidden: the next deploy overwrites them." }]
+
+[[session.event]]
+type = "prompt"
+text = "Is it fine to roll the new limit out on Friday together with the template change?"
+expect = ["rule:release"]
+
+[[session.event]]
+type = "subagent"
+agent_type = "Explore"
+task = "Find where client_max_body_size is set for every stand in infra/nginx"
+queries = ["client_max_body_size stand template nginx"]
+
+[[session.event]]
+type = "prompt"
+text = "Add makefile targets for the local stand setup while you are there"
+expect = ["idea:i27"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-05"
+profile = "standard"
+rules = ["logging", "api-compat", "tests"]
+tasks = ["t-export-stream", "t-keyset-orders"]
+insights = ["s-sqlx-offline", "s-migration-lock"]
+ideas = ["i02", "i37", "i03"]
+digest_ideas = ["i03", "i37"]
+
+[[session.event]]
+type = "prompt"
+text = "Выгрузка заказов в CSV обрывается с 504 на больших периодах, переделай на потоковую отдачу"
+expect = []
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "что нельзя писать в журналы сервисов"
+expect = ["rule:logging"]
+nuggets = [{ source = "rule:logging", text = "В журнал не пишутся тела запросов, токены, телефоны и адреса почты" }]
+
+[[session.event]]
+type = "tool_error"
+command = "cargo test -p orders"
+error = "error: SQLX_OFFLINE=true but there is no cached data for this query, run cargo sqlx prepare to update the query cache"
+expect = ["insight:s-sqlx-offline"]
+
+[[session.event]]
+type = "prompt"
+text = "Добавь в ответ выгрузки новое поле, клиенты API не должны сломаться"
+expect = ["rule:api-compat"]
+
+[[session.event]]
+type = "prompt"
+text = "Нужна сводка возвратов товаров за неделю в отчёте продавца"
+expect = ["idea:i03"]
+
+[[session.event]]
+type = "compact"
+
+[[session.event]]
+type = "prompt"
+text = "Продолжи с потоковой выгрузкой: проверь выгрузку за квартал на стенде"
+expect = []
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-06"
+profile = "standard"
+rules = ["tmp-files", "commits"]
+tasks = []
+insights = ["s-e2e-port"]
+ideas = ["i33"]
+digest_ideas = ["i33"]
+
+[[session.event]]
+type = "prompt"
+text = "Сохрани выгрузку заказов для отладки куда-нибудь и разберём её"
+expect = ["rule:tmp-files"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "почему e2e витрины падают с EADDRINUSE и как их запустить"
+expect = ["insight:s-e2e-port"]
+nuggets = [{ source = "insight:s-e2e-port", text = "запустить e2e с PORT=5174" }]
+
+[[session.event]]
+type = "tool_error"
+command = "npm run e2e"
+error = "Error: listen EADDRINUSE: address already in use 127.0.0.1:5173"
+expect = ["insight:s-e2e-port"]
+
+[[session.event]]
+type = "prompt"
+text = "Закоммить исправление конфигурации Playwright отдельным коммитом"
+expect = ["rule:commits"]
+
+[[session.event]]
+type = "prompt"
+text = "Нестабильные e2e тесты корзины опять падают в CI, посмотри"
+expect = ["idea:i33"]
+
+[[session.event]]
+type = "repeat"
+of = "q1"
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-07"
+profile = "standard"
+rules = ["secrets", "logging", "reviews"]
+tasks = ["t-flags-snapshot"]
+insights = []
+ideas = ["i06", "i08"]
+digest_ideas = ["i06", "i08"]
+
+[[session.event]]
+type = "prompt"
+text = "The flag service went down again, load the last rule set snapshot from disk"
+expect = []
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "where do services get their secrets from"
+expect = ["rule:secrets"]
+nuggets = [{ source = "rule:secrets", text = "Services read them from Vault at startup." }]
+
+[[session.event]]
+type = "prompt"
+text = "Уведомления покупателю о смене статуса заказа — кто-то уже предлагал?"
+expect = ["idea:i06"]
+
+[[session.event]]
+type = "prompt"
+text = "Залогируй тело ответа flag-сервиса для отладки"
+expect = ["rule:logging"]
+
+[[session.event]]
+type = "subagent"
+agent_type = "Plan"
+task = "Plan the snapshot persistence of the flag rule set and list the secrets it needs"
+queries = ["flag rule set snapshot secrets Vault"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-08"
+profile = "standard"
+rules = ["api-compat", "frontend-a11y", "deps"]
+tasks = ["t-token-refresh", "t-health-cache"]
+insights = ["s-env-dts"]
+ideas = ["i16", "i18"]
+digest_ideas = ["i18", "i16"]
+
+[[session.event]]
+type = "prompt"
+text = "Add an e2e test with three tabs and 30 s token lifetime for the refresh fix"
+expect = []
+
+[[session.event]]
+type = "prompt"
+text = "Customers want address autocomplete in the checkout form"
+expect = ["idea:i16"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "what colour contrast does the storefront require"
+expect = ["rule:frontend-a11y"]
+nuggets = [{ source = "rule:frontend-a11y", text = "Colour contrast is at least 4.5:1." }]
+
+[[session.event]]
+type = "read_file"
+path = "web/storefront/.env.local"
+expect = ["insight:s-env-dts"]
+
+[[session.event]]
+type = "prompt"
+text = "Подключи новый npm-пакет для автодополнения адресов"
+expect = ["rule:deps"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-09"
+profile = "standard"
+rules = ["migrations", "infra-changes"]
+tasks = []
+insights = ["s-nginx-template", "s-migration-lock"]
+ideas = ["i35"]
+digest_ideas = ["i35"]
+
+[[session.event]]
+type = "prompt"
+text = "Нужно удалить колонку legacy_status из таблицы orders"
+expect = ["rule:migrations", "insight:s-migration-lock"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "можно ли удалить колонку в той же миграции, где код перестаёт её читать"
+expect = ["rule:migrations"]
+nuggets = [{ source = "rule:migrations", text = "удаление колонки — отдельным релизом после того, как код перестал её читать" }]
+
+[[session.event]]
+type = "question"
+id = "q2"
+query = "where are client_max_body_size and proxy_read_timeout values of stands set"
+expect = ["insight:s-nginx-template"]
+nuggets = [{ source = "insight:s-nginx-template", text = "Stand-specific files may not override them" }]
+
+[[session.event]]
+type = "prompt"
+text = "Can I change proxy_read_timeout right in the stand config file?"
+expect = ["rule:infra-changes", "insight:s-nginx-template"]
+
+[[session.event]]
+type = "prompt"
+text = "Кэширование карточек товаров на CDN снимет нагрузку с каталога?"
+expect = ["idea:i35"]
+
+[[session.event]]
+type = "compact"
+
+[[session.event]]
+type = "checkpoint"
+
+# ======================= тяжёлый профиль =======================
+# Миры разные (ревью задачи 4): Rules 10–20 (до RULES_MAX), задач in_progress/blocked 3–5 (не
+# больше 5 — предел раздела «Задачи»), ответов человека 2–5, запросов доступа 1–2, идей 8 или
+# 50; словарь, insight и карта кода — у всех. sh-02 и sh-05 — граница бюджета дайджеста.
+
+[[session]]
+id = "sh-01"
+profile = "heavy"
+rules = ["commits", "migrations", "secrets", "api-compat", "tests", "deps", "frontend-a11y", "release", "logging", "infra-changes", "tmp-files", "reviews"]
+tasks = ["t-export-stream", "t-token-refresh", "t-upload-limits", "t-flags-snapshot", "t-keyset-orders", "t-health-cache"]
+questions = ["q-export-format", "q-release-day", "q-flag-default", "q-dark-theme"]
+access = ["a-maria"]
+terms = ["*"]
+insights = ["*"]
+ideas = ["*"]
+code_map = true
+digest_ideas = ["i20", "i10", "i06"]
+transcript = "shop-export-stream"
+abort = true
+
+[[session.event]]
+type = "prompt"
+text = "Продолжи потоковую выгрузку заказов в CSV, партнёры ждут формат из ответа"
+expect = []
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "что поставить в начале миграции таблицы orders, чтобы она не блокировала чтение"
+expect = ["insight:s-migration-lock"]
+nuggets = [{ source = "insight:s-migration-lock", text = "В начале каждой миграции таблицы orders стоит SET lock_timeout = '2s'" }]
+
+[[session.event]]
+type = "prompt"
+text = "Импорт прайс-листа на 30 МБ в кабинет продавца падает, проверь предел"
+expect = ["term:seller-dashboard", "term:price-list"]
+
+[[session.event]]
+type = "tool_error"
+command = "cargo build -p orders"
+error = "error: `SQLX_OFFLINE=true` but there is no cached data for this query, run `cargo sqlx prepare` to update the query cache"
+expect = ["insight:s-sqlx-offline"]
+
+[[session.event]]
+type = "prompt"
+text = "Bulk price editing for sellers — давно хотели, начнём?"
+expect = ["idea:i22"]
+
+[[session.event]]
+type = "subagent"
+agent_type = "Explore"
+task = "Find all places where the export of orders builds the whole CSV file in memory"
+queries = ["export orders CSV stream memory", "outbox"]
+
+[[session.event]]
+type = "compact"
+
+[[session.event]]
+type = "prompt"
+text = "Где мы остановились с выгрузкой? Проверь выгрузку за квартал на staging"
+expect = ["term:stand"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "sh-02"
+profile = "heavy"
+rules = ["commits", "migrations", "secrets", "api-compat", "tests", "deps", "frontend-a11y", "release", "logging", "infra-changes", "tmp-files", "reviews", "payments-idempotency", "feature-flags", "metrics", "db-indexes", "errors-api", "i18n", "cache-headers", "oncall"]
+tasks = ["t-export-stream", "t-token-refresh", "t-upload-limits", "t-flags-snapshot", "t-keyset-orders", "t-price-import"]
+questions = ["q-export-format", "q-release-day", "q-flag-default", "q-dark-theme", "q-cache-ttl", "q-import-limit"]
+access = ["a-maria", "a-ivan"]
+terms = ["*"]
+insights = ["*"]
+ideas = ["*"]
+code_map = true
+digest_ideas = ["i20", "i10", "i06"]
+transcript = "shop-token-refresh"
+abort = true
+
+[[session.event]]
+type = "prompt"
+text = "Can the token refresh fix go out today? It is ready"
+expect = []
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "how many reviewers does a change to authentication need"
+expect = ["rule:reviews"]
+nuggets = [{ source = "rule:reviews", text = "Changes to payments, authentication and migrations need a second reviewer." }]
+
+[[session.event]]
+type = "read_file"
+path = "web/storefront/.env.production"
+expect = ["insight:s-env-dts"]
+
+[[session.event]]
+type = "tool_error"
+command = "npm run e2e"
+error = "Error: listen EADDRINUSE: address already in use :::5173"
+expect = ["insight:s-e2e-port"]
+
+[[session.event]]
+type = "prompt"
+text = "Share a wishlist by link from the storefront — is it planned?"
+expect = ["idea:i43", "term:storefront"]
+
+[[session.event]]
+type = "prompt"
+text = "Сортировка по цене со скидкой работает неправильно — витрина показывает старую цену"
+expect = ["idea:i13", "term:storefront"]
+
+[[session.event]]
+type = "repeat"
+of = "q1"
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "sh-03"
+profile = "heavy"
+rules = ["commits", "migrations", "secrets", "api-compat", "tests", "deps", "release", "infra-changes", "tmp-files", "reviews"]
+tasks = ["t-export-stream", "t-upload-limits", "t-sitemap"]
+questions = ["q-export-format", "q-cache-ttl"]
+access = ["a-maria"]
+terms = ["*"]
+insights = ["*"]
+ideas = ["i04", "i05", "i08", "i12", "i13", "i20", "i35", "i43"]
+code_map = true
+digest_ideas = ["i20", "i43", "i35"]
+
+[[session.event]]
+type = "prompt"
+text = "Подними client_max_body_size до 50 МБ на всех стендах, доступ к репозиторию шлюза уже дали"
+expect = ["rule:infra-changes", "insight:s-nginx-template"]
+
+[[session.event]]
+type = "read_file"
+path = "infra/nginx/stand.conf.tmpl"
+expect = ["insight:s-nginx-template"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "can I fix nginx limits directly on the stand server"
+expect = ["rule:infra-changes"]
+nuggets = [{ source = "rule:infra-changes", text = "Manual changes on servers are forbidden: the next deploy overwrites them." }]
+
+[[session.event]]
+type = "question"
+id = "q2"
+query = "куда класть временные файлы и выгрузки для отладки"
+expect = ["rule:tmp-files"]
+nuggets = [{ source = "rule:tmp-files", text = "Выгрузки с данными покупателей удаляются в тот же день." }]
+
+[[session.event]]
+type = "prompt"
+text = "Отправим продавцам scheduled report emails, как договаривались"
+expect = ["idea:i04"]
+
+[[session.event]]
+type = "subagent"
+agent_type = "Explore"
+task = "List the stand templates under infra/nginx and their limits"
+queries = ["stand template limits nginx"]
+
+[[session.event]]
+type = "prompt"
+text = "Сделай коммит с правкой шаблона для staging"
+expect = ["rule:commits", "term:stand"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "sh-04"
+profile = "heavy"
+rules = ["commits", "migrations", "secrets", "api-compat", "tests", "deps", "frontend-a11y", "release", "logging", "infra-changes", "tmp-files", "reviews", "payments-idempotency", "feature-flags", "metrics", "db-indexes"]
+tasks = ["t-export-stream", "t-token-refresh", "t-upload-limits", "t-flags-snapshot", "t-keyset-orders"]
+questions = ["q-export-format", "q-release-day", "q-flag-default", "q-dark-theme", "q-oncall-window"]
+access = ["a-maria"]
+terms = ["*"]
+insights = ["*"]
+ideas = ["*"]
+code_map = true
+digest_ideas = ["i20", "i10", "i06"]
+transcript = "shop-flag-removal"
+
+[[session.event]]
+type = "prompt"
+text = "Удаляем флаг new_checkout, как решили — подготовь правку"
+expect = []
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "как оформлять сообщения коммитов в проекте"
+expect = ["rule:commits"]
+nuggets = [{ source = "rule:commits", text = "Conventional Commits на русском" }]
+
+[[session.event]]
+type = "prompt"
+text = "The flag rule set snapshot task is blocked, check whether flag SDK 4.2 is out"
+expect = ["term:flag-rule-set"]
+
+[[session.event]]
+type = "tool_error"
+command = "cargo clippy -p orders"
+error = "error: SQLX_OFFLINE=true but there is no cached data for this query; run cargo sqlx prepare"
+expect = ["insight:s-sqlx-offline"]
+
+[[session.event]]
+type = "prompt"
+text = "Кэширование карточек товаров на CDN — можно взять в работу?"
+expect = ["idea:i35"]
+
+[[session.event]]
+type = "compact"
+
+[[session.event]]
+type = "prompt"
+text = "После сжатия контекста: что с задачей про флаги и какие ответы человека есть?"
+expect = []
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "sh-05"
+profile = "heavy"
+rules = ["commits", "migrations", "secrets", "api-compat", "tests", "deps", "frontend-a11y", "release", "logging", "infra-changes", "tmp-files", "reviews", "payments-idempotency", "feature-flags", "metrics", "db-indexes", "errors-api", "i18n", "cache-headers", "oncall"]
+tasks = ["t-export-stream", "t-token-refresh", "t-sitemap", "t-keyset-orders", "t-price-import", "t-cdn-cache"]
+questions = ["q-export-format", "q-release-day", "q-flag-default", "q-dark-theme", "q-cache-ttl", "q-import-limit"]
+access = ["a-maria", "a-ivan"]
+terms = ["*"]
+insights = ["*"]
+ideas = ["*"]
+code_map = true
+digest_ideas = ["i20", "i10", "i06"]
+transcript = "shop-keyset-outbox"
+abort = true
+
+[[session.event]]
+type = "prompt"
+text = "Переведи выгрузку партнёру на keyset-пагинацию через outbox"
+expect = ["term:outbox"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "можно ли удалить колонку в той же миграции, где код перестаёт её читать"
+expect = ["rule:migrations"]
+nuggets = [{ source = "rule:migrations", text = "удаление колонки — отдельным релизом после того, как код перестал её читать" }]
+
+[[session.event]]
+type = "question"
+id = "q2"
+query = "which database do integration tests use"
+expect = ["rule:tests"]
+nuggets = [{ source = "rule:tests", text = "Integration tests use the shared Postgres container of the test stand" }]
+
+[[session.event]]
+type = "read_file"
+path = "infra/nginx/stand.conf.tmpl"
+expect = ["insight:s-nginx-template"]
+
+[[session.event]]
+type = "prompt"
+text = "Нужна подписка на снижение цены товара для покупателей"
+expect = ["idea:i46"]
+
+[[session.event]]
+type = "prompt"
+text = "Rate limits for partners by API key — let's design it"
+expect = ["idea:i38"]
+
+[[session.event]]
+type = "repeat"
+of = "q2"
+
+[[session.event]]
+type = "checkpoint"
+
+# ---- стандартный профиль, ревью задачи 4: ss-10…ss-16 ----
+
+[[session]]
+id = "ss-10"
+profile = "standard"
+rules = ["payments-idempotency", "reviews", "logging"]
+tasks = []
+insights = []
+ideas = ["i45"]
+digest_ideas = ["i45"]
+
+[[session.event]]
+type = "prompt"
+text = "Платёж иногда списывается дважды после тайм-аута провайдера, разберись"
+expect = ["rule:payments-idempotency"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "какой ключ идемпотентности слать платёжному провайдеру при повторе"
+expect = ["rule:payments-idempotency"]
+nuggets = [{ source = "rule:payments-idempotency", text = "Повтор после тайм-аута идёт с тем же ключом" }]
+
+[[session.event]]
+type = "prompt"
+text = "Gift cards for the storefront — our payment team asks about them"
+expect = ["idea:i45"]
+
+[[session.event]]
+type = "prompt"
+text = "Who must review the fix of the payment retry before merge?"
+expect = ["rule:reviews"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-11"
+profile = "standard"
+rules = ["feature-flags", "release", "commits"]
+tasks = ["t-flags-snapshot"]
+insights = []
+ideas = []
+
+[[session.event]]
+type = "prompt"
+text = "Remove the new_checkout flag, it has been fully rolled out for three releases"
+expect = ["rule:feature-flags"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "when is a feature flag removed after full rollout"
+expect = ["rule:feature-flags"]
+nuggets = [{ source = "rule:feature-flags", text = "A flag older than two releases after full rollout is removed together with its dead code branch" }]
+
+[[session.event]]
+type = "prompt"
+text = "Можно ли выкатить удаление флага сегодня вечером?"
+expect = ["rule:release"]
+
+[[session.event]]
+type = "prompt"
+text = "Сделай отдельный коммит с удалением мёртвой ветки кода флага"
+expect = ["rule:commits"]
+
+[[session.event]]
+type = "subagent"
+agent_type = "Explore"
+task = "Find all usages of the new_checkout flag"
+queries = ["new_checkout flag removal"]
+
+[[session.event]]
+type = "repeat"
+of = "q1"
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-12"
+profile = "standard"
+rules = ["metrics", "logging", "errors-api", "tests"]
+tasks = ["t-health-cache"]
+insights = ["s-sqlx-offline"]
+ideas = ["i38", "i34"]
+digest_ideas = ["i34", "i38"]
+
+[[session.event]]
+type = "prompt"
+text = "Добавь метрику времени ответа выгрузки с меткой id заказа"
+expect = ["rule:metrics"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "почему метка метрики не может содержать id заказа"
+expect = ["rule:metrics"]
+nuggets = [{ source = "rule:metrics", text = "высокая кардинальность роняет хранилище метрик" }]
+
+[[session.event]]
+type = "question"
+id = "q2"
+query = "в каком формате API отдаёт ошибки"
+expect = ["rule:errors-api"]
+nuggets = [{ source = "rule:errors-api", text = "Ошибки API отдаются в формате problem+json с полем code" }]
+
+[[session.event]]
+type = "tool_error"
+command = "cargo test -p orders"
+error = "error: SQLX_OFFLINE=true but there is no cached data for this query, run cargo sqlx prepare"
+expect = ["insight:s-sqlx-offline"]
+
+[[session.event]]
+type = "prompt"
+text = "Ошибка 500 выгрузки показывает SQL клиенту — так можно?"
+expect = ["rule:errors-api"]
+
+[[session.event]]
+type = "prompt"
+text = "Rate limits for partners by API key would need metrics too"
+expect = ["idea:i38"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-13"
+profile = "standard"
+rules = ["db-indexes", "migrations"]
+tasks = ["t-keyset-orders"]
+insights = ["s-migration-lock"]
+ideas = ["i12", "i10", "i01"]
+digest_ideas = ["i01", "i10", "i12"]
+
+[[session.event]]
+type = "prompt"
+text = "Add the (created_at, id) index on orders for the keyset pagination"
+expect = ["rule:db-indexes", "insight:s-migration-lock"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "how are new indexes created on large tables"
+expect = ["rule:db-indexes"]
+nuggets = [{ source = "rule:db-indexes", text = "New indexes on large tables are created with CREATE INDEX CONCURRENTLY in a migration of their own." }]
+
+[[session.event]]
+type = "read_file"
+path = "services/orders/migrations/0042_orders_created_at.sql"
+expect = []
+
+[[session.event]]
+type = "prompt"
+text = "Фильтры каталога по наличию на складе тоже потребуют индекса?"
+expect = ["idea:i12"]
+
+[[session.event]]
+type = "prompt"
+text = "Нужна ли отдельная миграция для индекса или можно в той же, что добавляет колонку?"
+expect = ["rule:db-indexes", "rule:migrations"]
+
+[[session.event]]
+type = "compact"
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-14"
+profile = "standard"
+rules = ["i18n", "frontend-a11y", "cache-headers"]
+tasks = ["t-cdn-cache", "t-token-refresh"]
+insights = ["s-env-dts", "s-e2e-port"]
+ideas = ["i42", "i44"]
+digest_ideas = ["i44", "i42"]
+
+[[session.event]]
+type = "prompt"
+text = "Add the Russian label for the new size picker button"
+expect = ["rule:i18n"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "с какими заголовками кэша отдавать HTML и config.json витрины"
+expect = ["rule:cache-headers"]
+nuggets = [{ source = "rule:cache-headers", text = "иначе после релиза покупатели получают старую сборку" }]
+
+[[session.event]]
+type = "tool_error"
+command = "npm run e2e"
+error = "Error: listen EADDRINUSE: address already in use :::5173"
+expect = ["insight:s-e2e-port"]
+
+[[session.event]]
+type = "read_file"
+path = "web/storefront/.env.production"
+expect = ["insight:s-env-dts"]
+
+[[session.event]]
+type = "prompt"
+text = "Make the new CDN static files cacheable for a year"
+expect = ["rule:cache-headers"]
+
+[[session.event]]
+type = "prompt"
+text = "Персональные рекомендации на главной — это уже кто-то предлагал?"
+expect = ["idea:i44"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-15"
+profile = "standard"
+rules = ["oncall", "infra-changes", "release"]
+tasks = ["t-upload-limits"]
+insights = ["s-nginx-template"]
+ideas = []
+
+[[session.event]]
+type = "prompt"
+text = "The storefront is down, roll back the nginx change on the stand right now"
+expect = ["rule:oncall", "rule:infra-changes"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "how fast must the on-call engineer acknowledge a page"
+expect = ["rule:oncall"]
+nuggets = [{ source = "rule:oncall", text = "The on-call engineer acknowledges a page within fifteen minutes." }]
+
+[[session.event]]
+type = "read_file"
+path = "infra/nginx/stand.conf.tmpl"
+expect = ["insight:s-nginx-template"]
+
+[[session.event]]
+type = "prompt"
+text = "Can we ship the nginx template fix on Thursday afternoon?"
+expect = ["rule:release"]
+
+[[session.event]]
+type = "prompt"
+text = "Где объявить изменение во время инцидента?"
+expect = ["rule:oncall"]
+
+[[session.event]]
+type = "checkpoint"
+
+[[session]]
+id = "ss-16"
+profile = "standard"
+rules = ["deps", "tests", "secrets"]
+tasks = []
+insights = ["s-sqlx-offline"]
+ideas = ["i50", "i30"]
+digest_ideas = ["i50"]
+
+[[session.event]]
+type = "prompt"
+text = "Update the payment provider SDK to the new major version"
+expect = ["rule:deps"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "what does every bug fix come with"
+expect = ["rule:tests"]
+nuggets = [{ source = "rule:tests", text = "Every bug fix comes with a test that fails without the fix." }]
+
+[[session.event]]
+type = "tool_error"
+command = "cargo build -p orders"
+error = "error: `SQLX_OFFLINE=true` but there is no cached data for this query, run `cargo sqlx prepare`"
+expect = ["insight:s-sqlx-offline"]
+
+[[session.event]]
+type = "prompt"
+text = "Можно ли положить ключ провайдера в переменную сборки для тестов?"
+expect = ["rule:secrets"]
+
+[[session.event]]
+type = "prompt"
+text = "We need a testing checklist for payment provider updates"
+expect = ["idea:i50"]
+
+[[session.event]]
+type = "checkpoint"
+
+# ---- тяжёлый профиль, ревью задачи 4: sh-06 (14 Rules, 3 задачи, 3 ответа, 8 идей) ----
+
+[[session]]
+id = "sh-06"
+profile = "heavy"
+rules = ["commits", "migrations", "secrets", "api-compat", "tests", "deps", "frontend-a11y", "release", "logging", "infra-changes", "tmp-files", "reviews", "errors-api", "oncall"]
+tasks = ["t-token-refresh", "t-flags-snapshot", "t-cdn-cache", "t-old-cart"]
+questions = ["q-release-day", "q-import-limit", "q-oncall-window"]
+access = ["a-ivan"]
+terms = ["*"]
+insights = ["*"]
+ideas = ["i06", "i10", "i15", "i18", "i33", "i43", "i46", "i48"]
+code_map = true
+digest_ideas = ["i10", "i06", "i48"]
+
+[[session.event]]
+type = "prompt"
+text = "Switch the storefront build to hashed file names for the CDN"
+expect = ["term:storefront"]
+
+[[session.event]]
+type = "question"
+id = "q1"
+query = "что API не должен раскрывать в тексте ошибки"
+expect = ["rule:errors-api"]
+nuggets = [{ source = "rule:errors-api", text = "Текст ошибки не раскрывает SQL, пути файлов и имена внутренних сервисов." }]
+
+[[session.event]]
+type = "tool_error"
+command = "npm run e2e"
+error = "Error: listen EADDRINUSE: address already in use 127.0.0.1:5173"
+expect = ["insight:s-e2e-port"]
+
+[[session.event]]
+type = "prompt"
+text = "Customers want several delivery addresses in the address book"
+expect = ["idea:i18"]
+
+[[session.event]]
+type = "subagent"
+agent_type = "Explore"
+task = "List the storefront files that still have hard-coded cache headers"
+queries = ["storefront cache headers CDN"]
+
+[[session.event]]
+type = "prompt"
+text = "Сохранять корзину между устройствами — давно хотели"
+expect = ["idea:i15"]
+
+[[session.event]]
+type = "compact"
+
+[[session.event]]
+type = "checkpoint"

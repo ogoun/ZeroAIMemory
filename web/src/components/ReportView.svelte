@@ -4,7 +4,11 @@
   // диаграммы. Шапка: заголовок (первый `#` тела, совпадающий с ним, не дублируется), дата,
   // автор, область, теги; ссылки `data.refs`; прочие файлы — на скачивание. Отчёт неизменен:
   // кнопок правки нет; «Удалить» — только владельцу решения (в корзину, с подтверждением).
-  // «Скачать PDF» — печать браузера (lib/print.ts): только после догрузки картинок и модулей.
+  // «PDF / печать» — печать браузера (lib/print.ts): только после догрузки картинок и модулей;
+  // PDF получается выбором «Сохранить как PDF» в диалоге печати (подсказка рядом с кнопкой).
+  // Ссылки тела (M6, задача 15a) — lib/reportLinks.ts: только схемы http, https, mailto, vscode,
+  // file; внешним — `rel="noopener noreferrer"`; `file:` — без перехода; у `file:` и `vscode:` —
+  // кнопка «копировать путь».
   import { onDestroy, tick, untrack } from 'svelte';
   import Lightbox from './Lightbox.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
@@ -25,6 +29,7 @@
   import { hydrateRendered } from '../lib/hydrate/render';
   import { fmtTime } from '../lib/journals';
   import { clearPrint, readyPrint } from '../lib/printRoot';
+  import { COPY_PATH_LABEL, hydrateReportLinks } from '../lib/reportLinks';
   import { reportAuthor, fmtSize, refsOf, refsText, REF_TITLE, bodyStartsWithTitle } from '../lib/reports';
   import { anchorId, go, href, parse } from '../lib/router';
 
@@ -135,6 +140,7 @@
       // якоря отчёта остаются `#<id>`: у страницы журнала своего якоря в адресе нет
       self: (a) => `#${a}`,
       alive: () => report === r,
+      links: hydrateReportLinks,
     });
     if (report === r && !ok) notice = 'Не удалось загрузить модуль формул или диаграмм: обновите страницу.';
   }
@@ -148,9 +154,15 @@
     el.classList.add('flash');
   }
 
-  // Делегирование кликов: копирование кода, лайтбокс, якоря отчёта, ссылки SPA.
+  // Делегирование кликов: «копировать путь», копирование кода, лайтбокс, якоря отчёта, ссылки SPA.
   async function onclick(e: MouseEvent) {
     const t = e.target as HTMLElement;
+    const pathBtn = t.closest<HTMLButtonElement>('button[data-copy-path]');
+    if (pathBtn) {
+      const ok = await copyText(pathBtn.dataset.copyPath ?? '');
+      flashButton(pathBtn, ok ? 'Скопировано' : 'Не удалось', COPY_PATH_LABEL);
+      return;
+    }
     const btn = t.closest<HTMLButtonElement>('button[data-copy]');
     if (btn) {
       const ok = await copyText(codeOf(btn));
@@ -207,7 +219,7 @@
 
   const fileLabel = (f: EntryAttachment) => `${f.filename} (${fmtSize(f.size)})`;
 
-  /** «Скачать PDF»: печатная вёрстка и `window.print()` после готовности всего. */
+  /** «PDF / печать»: печатная вёрстка и `window.print()` после готовности всего. */
   async function pdf() {
     const r = report;
     if (!r || printing) return;
@@ -240,6 +252,7 @@
           wiki: (n, a) => href({ name: 'node', user, space, node: n, anchor: a }),
           self: (a) => `#${a}`,
           alive: () => report === r,
+          links: hydrateReportLinks,
           onfail: (why) => {
             if (report === r) notice = `PDF не готов: ${why}.`;
           },
@@ -271,10 +284,11 @@
         {#each e.tags as t (t)}<span class="chip">#{t}</span>{/each}
       </div>
       <div class="actions">
-        <button type="button" onclick={pdf} disabled={printing} aria-busy={printing}>
-          {printing ? 'Готовлю PDF…' : 'Скачать PDF'}
+        <button type="button" onclick={pdf} disabled={printing} aria-busy={printing} aria-describedby="pdf-hint">
+          {printing ? 'Готовлю PDF…' : 'PDF / печать'}
         </button>
         {#if owner}<button type="button" class="danger" onclick={askDelete}>Удалить</button>{/if}
+        <span class="hint muted" id="pdf-hint">В диалоге печати выберите „Сохранить как PDF“</span>
       </div>
     </header>
     {#if notice}<p class="warn" role="status">{notice}</p>{/if}
@@ -341,7 +355,7 @@
 <Prompt bind:ask />
 
 <style>
-  /* Ctrl+P без «Скачать PDF» (или во время подготовки копии) — страница без навигации и кнопок */
+  /* Ctrl+P без «PDF / печать» (или во время подготовки копии) — страница без навигации и кнопок */
   @media print {
     :global(body:has(article.report) .topbar),
     :global(body:has(article.report) .sidebar),
@@ -379,8 +393,13 @@
   }
   .actions {
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 8px;
     margin-top: 8px;
+  }
+  .hint {
+    font-size: 12px;
   }
   .render-warnings,
   .toc {

@@ -93,7 +93,7 @@ mod tests {
             token_count: 1,
             score: 0.0,
             raw_score: raw,
-            updated_at: jiff::Timestamp::now(),
+            updated_at: zam_store::time::now(),
             snippet: String::new(),
             text: String::new(),
             index_state: "indexed".into(),

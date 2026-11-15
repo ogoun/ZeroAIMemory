@@ -4,11 +4,14 @@
 //!   формат вывода и предел текста ([`output`]).
 //! - **Fail-open:** любая ошибка, паника, тайм-аут, выключенный сервер, пустой или битый
 //!   stdin, чужое событие — пустой вывод и код 0. Ошибки — строкой в
-//!   `.zeroaimemory/logs/hooks.log` ([`log`]) без текста промптов, команд и содержимого файлов.
+//!   `.zeroaimemory/logs/hooks.log` ([`log_line`]) без текста промптов, команд и содержимого файлов.
 //! - **Корень** — [`project_root`]: каталог с `.zeroaimemory/` вверх от `cwd` из stdin, иначе
 //!   корень git, иначе `cwd`; там `.zeroaimemory/cache/` ([`cache`]) и `.zeroaimemory/logs/`.
 //!   Решение — ближайший `solution.toml` вверх от `cwd`.
-//! - **Бюджеты** (§10.3): тайм-аут HTTP — бюджет минус [`HTTP_RESERVE_MS`] от старта процесса.
+//! - **Бюджеты** (§10.3): срок HTTP — абсолютный момент [`Env::http_deadline`]: старт процесса +
+//!   бюджет − [`HTTP_RESERVE_MS`]. Он один на все запросы хука: срок каждого запроса — остаток
+//!   до этого момента при отправке, последовательные запросы и параллельные потоки его делят;
+//!   без остатка запрос не начинается (одна строка `… бюджет исчерпан до запроса к серверу`).
 //! - **Переключатели** (решение контроллера R5, [`Settings`]): `[hooks]` в
 //!   `~/.zeroaimemory/config.toml` и `<корень>/.zeroaimemory/config.toml` (проект сильнее
 //!   домашнего), затем настройка сервера из ответа `/recall(session_start)` (кэш
@@ -21,11 +24,23 @@
 //!   успех (M4.5: журнал, знание о файле, очередь изменённых — без сети, 50 мс).
 //! - **`subagent-start`** (M4.5 §9.4, событие `SubagentStart` Claude и Codex, 300 мс) —
 //!   сессия субагента и пакет под задачу ([`subagent_start`]).
+//! - **Контрольная группа A/B** (M6 §12, `hooks.holdout`): у сессии с маркером
+//!   `cache/holdout-<сессия>` ([`cache::mark_holdout`]; ставят `session-start` и ответы сервера с
+//!   `holdout: true`) вывод любого хука — пустой, включая локальный (знание о файле, триггеры,
+//!   напоминание, петля, сводка журнала), и учёта локального вывода нет; журнал, очереди,
+//!   привязка MCP и отправка учёта — как обычно. Субагенты Claude Code и Codex шлют события
+//!   хуков с id родителя — маркер покрывает и их.
 //! - **Учёт выданного** (M4.5 §9.5): непустой вывод без сети (`pre-tool`, успешный
 //!   `post-tool`) — строка в очереди `cache/tokens-<сессия>.jsonl` (оценка токенов
 //!   [`cache::estimate_tokens`]); сетевые хуки (`session-start`, `prompt`, `post-tool` ошибки,
 //!   `checkpoint`, `subagent-start` — для сессии родителя) отправляют её параллельно со своим
 //!   запросом ([`cache::flush_tokens`]). Вывод сетевых хуков сервер считает сам (`/recall`).
+//! - **Снимок сессии** (M6 §8а, [`snapshot_queue`]): `checkpoint` (`Stop`, `PreCompact`,
+//!   `PostCompact`, `SessionEnd`) и `session-start` (`compact`, догоняющий на `startup`) читают
+//!   хвост журнала агента ([`snapshot`]) в отдельном потоке со сроком `hooks.snapshot_ms`, кладут
+//!   снимок в очередь `cache/snapq-<сессия>.json` и отправляют `PUT /sessions/{id}/snapshot`.
+//!   Ключи клиента — `hooks.session_snapshot`, `snapshot_tail_kb`, `snapshot_ms` ([`ClientKeys`]).
+pub mod binding;
 pub mod cache;
 pub mod checkpoint;
 pub mod input;
@@ -33,8 +48,13 @@ pub mod journal;
 pub mod output;
 pub mod post_tool;
 pub mod pre_tool;
+pub mod procs;
 pub mod prompt;
 pub mod session_start;
+// снимок сессии §8а: адаптеры журналов и `take` (задача 17a)
+pub mod snapshot;
+// снимок в хуках: состояние `snapst-*`, очередь `snapq-*`, `PUT /sessions/{id}/snapshot` (17b)
+pub mod snapshot_queue;
 pub mod subagent_start;
 
 use std::io::Write;
@@ -114,7 +134,9 @@ impl Kind {
             Kind::Prompt => event == "UserPromptSubmit",
             Kind::PreTool => event == "PreToolUse",
             Kind::PostTool => matches!(event, "PostToolUseFailure" | "PostToolUse"),
-            Kind::Checkpoint => matches!(event, "Stop" | "PreCompact"),
+            Kind::Checkpoint => {
+                matches!(event, "Stop" | "PreCompact" | "PostCompact" | "SessionEnd")
+            }
             Kind::SubagentStart => event == "SubagentStart",
         }
     }
@@ -213,17 +235,70 @@ impl HookFlags {
     }
 }
 
+/// Ключи `[hooks]` только клиента (M6 §12; сервер их не знает и не присылает): нет ключа —
+/// `None` (умолчание).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+pub struct ClientKeys {
+    /// Влияние диффа в напоминании `checkpoint` (`POST /code/impact`), по умолчанию `false`.
+    #[serde(default)]
+    pub checkpoint_impact: Option<bool>,
+    /// Доля сессий контрольной группы агентного A/B, 0..=[`HOLDOUT_MAX`], по умолчанию 0.
+    #[serde(default)]
+    pub holdout: Option<f64>,
+    /// Снимок сессии из журнала агента (M6 §8а), по умолчанию `true`; `false` — журнал агента
+    /// не открывается вовсе.
+    #[serde(default)]
+    pub session_snapshot: Option<bool>,
+    /// Хвост журнала агента для снимка, КиБ, [`SNAPSHOT_TAIL_KB`] (диапазон 64..=16384).
+    #[serde(default)]
+    pub snapshot_tail_kb: Option<u32>,
+    /// Жёсткий срок снимка (весь ввод-вывод), мс, [`SNAPSHOT_MS`] (диапазон 5..=50).
+    #[serde(default)]
+    pub snapshot_ms: Option<u64>,
+}
+
+/// Предел `hooks.holdout`: контрольная группа — не больше половины сессий (M6 §12).
+pub const HOLDOUT_MAX: f64 = 0.5;
+/// Умолчание и диапазон `hooks.snapshot_tail_kb` (M6 §8а, §14).
+pub const SNAPSHOT_TAIL_KB: u32 = 2048;
+pub const SNAPSHOT_TAIL_KB_RANGE: std::ops::RangeInclusive<u32> = 64..=16384;
+/// Умолчание и диапазон `hooks.snapshot_ms` (M6 §8а, §14).
+pub const SNAPSHOT_MS: u64 = 25;
+pub const SNAPSHOT_MS_RANGE: std::ops::RangeInclusive<u64> = 5..=50;
+
+impl ClientKeys {
+    fn over(self, base: ClientKeys) -> ClientKeys {
+        ClientKeys {
+            checkpoint_impact: self.checkpoint_impact.or(base.checkpoint_impact),
+            holdout: self.holdout.or(base.holdout),
+            session_snapshot: self.session_snapshot.or(base.session_snapshot),
+            snapshot_tail_kb: self.snapshot_tail_kb.or(base.snapshot_tail_kb),
+            snapshot_ms: self.snapshot_ms.or(base.snapshot_ms),
+        }
+    }
+}
+
+/// `[hooks]` файла настроек: включённость типов подсказок и ключи клиента.
+#[derive(Deserialize, Default)]
+struct HooksSection {
+    #[serde(flatten)]
+    flags: HookFlags,
+    #[serde(flatten)]
+    keys: ClientKeys,
+}
+
 #[derive(Deserialize, Default)]
 struct ConfigFile {
     #[serde(default)]
-    hooks: HookFlags,
+    hooks: HooksSection,
 }
 
-/// Настройки типов подсказок: клиент (проект сильнее домашнего) и кэш сервера.
+/// Настройки типов подсказок: клиент (проект сильнее домашнего) и кэш сервера; ключи клиента.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Settings {
     pub client: HookFlags,
     pub server: HookFlags,
+    pub keys: ClientKeys,
 }
 
 impl Settings {
@@ -241,15 +316,65 @@ impl Settings {
     pub fn flag_on(&self, f: Flag) -> bool {
         self.client.get(f).unwrap_or(true) && self.server.get(f).unwrap_or(true)
     }
+
+    /// `hooks.checkpoint_impact` клиента (по умолчанию выключен).
+    pub fn checkpoint_impact(&self) -> bool {
+        self.keys.checkpoint_impact == Some(true)
+    }
+
+    /// `hooks.holdout` клиента в 0..=[`HOLDOUT_MAX`]; нет ключа или вне диапазона — 0 (вне
+    /// диапазона пишет в журнал [`Env::settings`]).
+    pub fn holdout(&self) -> f64 {
+        self.keys
+            .holdout
+            .filter(|p| (0.0..=HOLDOUT_MAX).contains(p))
+            .unwrap_or(0.0)
+    }
+
+    /// `hooks.session_snapshot` клиента (по умолчанию включён, M6 §8а).
+    pub fn session_snapshot(&self) -> bool {
+        self.keys.session_snapshot != Some(false)
+    }
+
+    /// `hooks.snapshot_tail_kb` в [`SNAPSHOT_TAIL_KB_RANGE`]; вне диапазона — умолчание (пишет
+    /// в журнал [`Env::settings`]).
+    pub fn snapshot_tail_kb(&self) -> u32 {
+        self.keys
+            .snapshot_tail_kb
+            .filter(|v| SNAPSHOT_TAIL_KB_RANGE.contains(v))
+            .unwrap_or(SNAPSHOT_TAIL_KB)
+    }
+
+    /// `hooks.snapshot_ms` в [`SNAPSHOT_MS_RANGE`], вне диапазона — умолчание.
+    pub fn snapshot_ms(&self) -> u64 {
+        self.keys
+            .snapshot_ms
+            .filter(|v| SNAPSHOT_MS_RANGE.contains(v))
+            .unwrap_or(SNAPSHOT_MS)
+    }
+
+    /// Жёсткий срок снимка в хуке — [`Settings::snapshot_ms`]; отладочная сборка или фича
+    /// `test-hooks` — `ZAM_TEST_SNAPSHOT_MS` (тесты содержимого под нагрузкой, как
+    /// `ZAM_TEST_HOOK_BUDGET_MS`).
+    pub fn snapshot_deadline(&self) -> Duration {
+        #[cfg(any(feature = "test-hooks", debug_assertions))]
+        if let Some(ms) = std::env::var("ZAM_TEST_SNAPSHOT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Duration::from_millis(ms);
+        }
+        Duration::from_millis(self.snapshot_ms())
+    }
 }
 
 /// `[hooks]` из `config.toml`; нет файла — пусто, битый — пусто и строка в журнал.
-fn read_flags(path: &Path, env: &Env) -> HookFlags {
+fn read_flags(path: &Path, env: &Env) -> HooksSection {
     let Ok(meta) = std::fs::metadata(path) else {
-        return HookFlags::default();
+        return HooksSection::default();
     };
     if !meta.is_file() || meta.len() > CONFIG_MAX {
-        return HookFlags::default();
+        return HooksSection::default();
     }
     let parsed = std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
@@ -262,12 +387,13 @@ fn read_flags(path: &Path, env: &Env) -> HookFlags {
         Ok(c) => c.hooks,
         Err(e) => {
             env.log(&format!("{} пропущен: {e}", path.display()));
-            HookFlags::default()
+            HooksSection::default()
         }
     }
 }
 
 /// Окружение запуска хука: команда, агент, корень, решение, начало отсчёта бюджета.
+#[derive(Clone)]
 pub struct Env {
     pub kind: Kind,
     pub agent: Agent,
@@ -315,23 +441,81 @@ impl Env {
     pub fn settings(&self) -> Settings {
         let home = read_flags(&self.home.join(".zeroaimemory").join("config.toml"), self);
         let project = read_flags(&self.root.join(".zeroaimemory").join("config.toml"), self);
+        let keys = project.keys.over(home.keys);
+        if let Some(p) = keys.holdout
+            && !(0.0..=HOLDOUT_MAX).contains(&p)
+        {
+            self.log(&format!(
+                "hooks.holdout = {p} вне 0..={HOLDOUT_MAX}: контрольной группы нет"
+            ));
+        }
+        if let Some(v) = keys.snapshot_tail_kb
+            && !SNAPSHOT_TAIL_KB_RANGE.contains(&v)
+        {
+            self.log(&format!(
+                "hooks.snapshot_tail_kb = {v} вне 64..=16384: {SNAPSHOT_TAIL_KB}"
+            ));
+        }
+        if let Some(v) = keys.snapshot_ms
+            && !SNAPSHOT_MS_RANGE.contains(&v)
+        {
+            self.log(&format!(
+                "hooks.snapshot_ms = {v} вне 5..=50: {SNAPSHOT_MS}"
+            ));
+        }
         Settings {
-            client: project.over(home),
+            client: project.flags.over(home.flags),
             server: cache::read_server_hooks(self).unwrap_or_default(),
+            keys,
         }
     }
 
-    /// Остаток бюджета на HTTP: бюджет минус [`HTTP_RESERVE_MS`] от старта процесса.
+    /// Бюджет хука, мс (§10.3); отладочная сборка или фича `test-hooks` —
+    /// `ZAM_TEST_HOOK_BUDGET_MS`.
+    pub fn budget_ms(&self) -> u64 {
+        #[allow(unused_mut)]
+        let mut budget = self.kind.budget_ms();
+        // щедрый бюджет для тестов содержимого (отладочная сборка под нагрузкой; повторное
+        // ревью 8a M6, п. 3) — отладочная сборка или фича `test-hooks`
+        #[cfg(any(feature = "test-hooks", debug_assertions))]
+        if let Some(ms) = std::env::var("ZAM_TEST_HOOK_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            budget = ms;
+        }
+        budget
+    }
+
+    /// Остаток всего бюджета хука от старта процесса (без резерва HTTP).
+    pub fn budget_left(&self) -> Duration {
+        Duration::from_millis(self.budget_ms()).saturating_sub(self.started.elapsed())
+    }
+
+    /// Абсолютный срок HTTP хука: старт процесса + бюджет − [`HTTP_RESERVE_MS`]. К этому моменту
+    /// кончаются все запросы хука, когда бы они ни начались.
+    pub fn http_deadline(&self) -> Instant {
+        self.started + Duration::from_millis(self.budget_ms().saturating_sub(HTTP_RESERVE_MS))
+    }
+
+    /// Остаток бюджета на HTTP — до [`Env::http_deadline`]; вышел — `None`.
     pub fn http_left(&self) -> Option<Duration> {
-        let total = Duration::from_millis(self.kind.budget_ms().saturating_sub(HTTP_RESERVE_MS));
-        total
-            .checked_sub(self.started.elapsed())
+        self.http_deadline()
+            .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
     }
 
-    /// Клиент API с тайм-аутом по остатку бюджета; нет адреса, токена или времени — `None`
-    /// (причина — в журнал).
+    /// Клиент API со сроком [`Env::http_deadline`] на все его запросы (клиент можно
+    /// переиспользовать и делить между потоками: второго срока не будет); нет адреса, токена или
+    /// времени — `None` (причина — в журнал).
     pub fn client(&self) -> Option<Client> {
+        self.client_within(Duration::MAX)
+    }
+
+    /// [`Env::client`] со своим сроком внутри бюджета хука: все запросы клиента кончаются не
+    /// позже чем через `cap` от его создания и не позже [`Env::http_deadline`] (`POST
+    /// /code/impact` у `checkpoint`, метка контрольной группы, `PUT` снимка).
+    pub fn client_within(&self, cap: Duration) -> Option<Client> {
         let r = match locate::resolve(&Flags::default(), &super::zam_env(), &self.cwd, &self.home) {
             Ok(r) => r,
             Err(e) => {
@@ -347,15 +531,24 @@ impl Env {
             self.log(&e);
             return None;
         }
-        let Some(left) = self.http_left() else {
-            self.log("бюджет исчерпан до запроса к серверу");
+        if self.http_left().is_none() {
+            // сколько прошло от старта процесса — для разбора промаха (журнал задачи 5 M6)
+            self.log(&format!(
+                "{} (прошло {} мс)",
+                zam_core::HOOK_BUDGET_SPENT,
+                self.started.elapsed().as_millis()
+            ));
             return None;
-        };
+        }
+        let hook = self.http_deadline();
+        let at = Instant::now()
+            .checked_add(cap)
+            .map_or(hook, |own| own.min(hook));
         Some(Client::with_timeouts(
             &url.value,
             &token.value,
             self.solution.as_ref().map(|s| s.id.clone()),
-            Timeouts::Deadline(left),
+            Timeouts::Deadline(at),
         ))
     }
 
@@ -436,7 +629,27 @@ pub fn run(kind: Kind, agent: Agent, started: Instant) -> u8 {
         let mut so = std::io::stdout().lock();
         let _ = so.write_all(text.as_bytes()).and_then(|_| so.flush());
     }
+    test_timing(kind, started);
     0
+}
+
+/// Тестовый канал времени (только отладочная сборка и фича `test-hooks`, как
+/// `ZAM_TEST_HOOK_BUDGET_MS`): `ZAM_TEST_HOOK_TIMING` — файл, в который хук после вывода дописывает
+/// строку `<команда> <микросекунды от старта процесса>`. Тесты времени сверяют с бюджетом хука
+/// это время — внутри процесса, от того же `started`, что и бюджет, — а не время запуска и выхода
+/// отладочного exe.
+fn test_timing(kind: Kind, started: Instant) {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(path) = std::env::var_os("ZAM_TEST_HOOK_TIMING") {
+        let line = format!("{} {}\n", kind.as_str(), started.elapsed().as_micros());
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+    }
+    #[cfg(not(any(feature = "test-hooks", debug_assertions)))]
+    let _ = (kind, started);
 }
 
 fn handle(kind: Kind, agent: Agent, started: Instant, raw: &input::Raw) -> Output {
@@ -454,14 +667,24 @@ fn handle(kind: Kind, agent: Agent, started: Instant, raw: &input::Raw) -> Outpu
         .unwrap_or_default();
     let env = Env::new(kind, agent, started, cwd, super::home_dir());
     let settings = env.settings();
-    match kind {
+    let out = match kind {
         Kind::SessionStart => session_start::run(&env, &inp, &settings),
         Kind::Prompt => prompt::run(&env, &inp, &settings),
         Kind::PreTool => pre_tool::run(&env, &inp, &settings),
         Kind::PostTool => post_tool::run(&env, &inp, &settings),
         Kind::Checkpoint => checkpoint::run(&env, &inp, &settings),
         Kind::SubagentStart => subagent_start::run(&env, &inp, &settings),
+    };
+    // контрольная группа A/B (M6 §12): сессия с маркером — тишина у всех хуков (служебная
+    // работа выше уже сделана)
+    if inp
+        .session_id
+        .as_deref()
+        .is_some_and(|id| cache::is_holdout(&env, id))
+    {
+        return Output::Empty;
     }
+    out
 }
 
 /// Переменная, по которой видно, что `zam` запустил Codex (не настройка пользователя вроде
@@ -477,11 +700,11 @@ fn codex_runtime_var(name: &str) -> bool {
 /// ([`codex_runtime_var`]) или явный `ZAM_AGENT=1`.
 pub fn launched_by_agent(get: &impl Fn(&str) -> Option<String>, names: &[String]) -> bool {
     let one = |k: &str| get(k).is_some_and(|v| v.trim() == "1");
-    one("CLAUDECODE") || one("ZAM_AGENT") || names.iter().any(|n| codex_runtime_var(n))
+    one("CLAUDECODE") || one(zam_core::AGENT_FLAG_ENV) || names.iter().any(|n| codex_runtime_var(n))
 }
 
 /// Id сессии из переменной: непустой, до 128 печатных символов.
-fn session_var(v: Option<String>) -> Option<String> {
+pub(crate) fn session_var(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s.chars().count() <= 128 && !s.chars().any(char::is_control))
 }
@@ -495,7 +718,7 @@ pub fn agent_session_from(
     names: &[String],
     current: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    if let Some(v) = get("ZAM_SESSION") {
+    if let Some(v) = get(zam_core::SESSION_ENV) {
         if v.trim() == "-" {
             return None;
         }
@@ -555,12 +778,56 @@ mod tests {
                 checkpoint: Some(false),
                 ..HookFlags::default()
             },
+            keys: ClientKeys::default(),
         };
         assert!(s.on(Kind::Prompt));
         assert!(!s.on(Kind::PreTool));
         assert!(!s.on(Kind::Checkpoint));
         assert!(s.client_on(Kind::Checkpoint));
         assert!(s.on(Kind::SessionStart));
+    }
+
+    /// `[hooks]` с ключами клиента (M6 §12): типы подсказок и ключи — из одной таблицы, проект
+    /// сильнее домашнего; `holdout` вне 0..=0,5 — 0.
+    #[test]
+    fn client_keys_parsed_and_layered() {
+        let parse = |t: &str| toml::from_str::<ConfigFile>(t).unwrap().hooks;
+        let home = parse("[hooks]\nprompt = false\ncheckpoint_impact = true\nholdout = 0.2\n");
+        let project = parse("[hooks]\nholdout = 0.5\n");
+        let s = Settings {
+            client: project.flags.over(home.flags),
+            server: HookFlags::default(),
+            keys: project.keys.over(home.keys),
+        };
+        assert!(!s.on(Kind::Prompt));
+        assert!(s.checkpoint_impact());
+        assert_eq!(s.holdout(), 0.5);
+        let bad = Settings {
+            keys: parse("[hooks]\nholdout = 0.9\n").keys,
+            ..Settings::default()
+        };
+        assert_eq!(bad.holdout(), 0.0);
+        assert!(!Settings::default().checkpoint_impact());
+        assert_eq!(Settings::default().holdout(), 0.0);
+        // неизвестный ключ (конфигурация новее клиента) — пропускается
+        assert_eq!(parse("[hooks]\nfuture = 1\n").keys, ClientKeys::default());
+        // снимок сессии (M6 §8а): умолчания, слой проекта, вне диапазона — умолчание
+        let d = Settings::default();
+        assert!(d.session_snapshot());
+        assert_eq!((d.snapshot_tail_kb(), d.snapshot_ms()), (2048, 25));
+        let home = parse("[hooks]\nsession_snapshot = false\nsnapshot_tail_kb = 64\n");
+        let project = parse("[hooks]\nsnapshot_ms = 50\n");
+        let s = Settings {
+            keys: project.keys.over(home.keys),
+            ..Settings::default()
+        };
+        assert!(!s.session_snapshot());
+        assert_eq!((s.snapshot_tail_kb(), s.snapshot_ms()), (64, 50));
+        let bad = Settings {
+            keys: parse("[hooks]\nsnapshot_tail_kb = 1\nsnapshot_ms = 51\n").keys,
+            ..Settings::default()
+        };
+        assert_eq!((bad.snapshot_tail_kb(), bad.snapshot_ms()), (2048, 25));
     }
 
     #[test]
@@ -672,6 +939,10 @@ mod tests {
         assert!(Kind::PostTool.accepts("PostToolUse"));
         assert!(!Kind::PreTool.accepts("PostToolUse"));
         assert!(Kind::Checkpoint.accepts("PreCompact"));
+        // снимок сессии (M6 §8а): новые события `checkpoint`, без вывода
+        assert!(Kind::Checkpoint.accepts("PostCompact"));
+        assert!(Kind::Checkpoint.accepts("SessionEnd"));
+        assert_eq!(Kind::Checkpoint.budget_ms(), 100);
         assert!(!Kind::Checkpoint.accepts("SubagentStop"));
         assert!(Kind::SubagentStart.accepts("SubagentStart"));
         assert!(!Kind::SubagentStart.accepts("SubagentStop"));

@@ -11,3 +11,5 @@ zam-core = { path = "../zam-core" }
 jiff.workspace = true
 # `error_regex` триггеров в `/recall` (§10.3): тот же диалект без обратных ссылок, что в zam-store
 regex.workspace = true
+# правило покрытия `recall.post_tool_coverage` в конфигурации сервера
+serde.workspace = true

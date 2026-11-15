@@ -1,4 +1,5 @@
 // Подписи журналов решения для WebUI (§7.2–7.6): виды записей, статусы, надёжность.
+import { localTime } from './time';
 import type { Certainty, EntryStatus, TriggerType } from './api';
 import type { Journal } from './router';
 
@@ -146,8 +147,6 @@ export const STATUS_TEXT: Record<EntryStatus, string> = {
 
 /** Статусы идеи (M5.7 §5) в порядке фильтра журнала «Идеи». */
 export const IDEA_STATUSES: EntryStatus[] = ['new', 'proposed', 'deferred', 'accepted', 'done', 'declined'];
-/** «Активные» идеи — фильтр журнала по умолчанию (§10). */
-export const IDEA_ACTIVE: EntryStatus[] = ['new', 'proposed', 'deferred'];
 
 export type IdeaPriority = 'low' | 'normal' | 'high';
 export const PRIORITIES: IdeaPriority[] = ['high', 'normal', 'low'];
@@ -162,11 +161,6 @@ export const IDEA_STATUS_TEXT: Record<'new' | 'proposed' | 'accepted' | 'deferre
   declined: 'отклонена',
   done: 'выполнена',
 };
-
-/** Дата `YYYY-MM-DD` по UTC через `days` дней от сегодняшней (сервер сравнивает `horizon` с
- * сегодняшней датой UTC: «отложить до» — не раньше завтрашней по UTC). */
-export const utcDate = (days: number, now = Date.now()): string =>
-  new Date(now + days * 86_400_000).toISOString().slice(0, 10);
 
 export const TRIGGER_TYPES: TriggerType[] = ['file_glob', 'command_regex', 'error_regex', 'keyword'];
 
@@ -189,10 +183,5 @@ export const dataStr = (data: Record<string, unknown>, key: string): string => {
   return typeof v === 'string' ? v : '';
 };
 
-export const fmtTime = (ts: string | null | undefined): string => {
-  if (!ts) return '';
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime())
-    ? ts
-    : d.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
-};
+/** Момент API (RFC 3339 UTC) в локальном времени браузера, коротко; пусто — пустая строка. */
+export const fmtTime = (ts: string | null | undefined): string => (ts ? localTime(ts) : '');

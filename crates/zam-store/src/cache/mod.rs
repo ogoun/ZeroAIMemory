@@ -458,7 +458,7 @@ fn put_tx(tx: &Connection, p: &CachePut) -> Result<CacheEntry, CacheError> {
             deps.push(dep);
         }
     }
-    let now = fmt_ts(Timestamp::now());
+    let now = fmt_ts(crate::time::now());
     let query_norm = normalize_query(&p.query);
     tx.execute(
         "UPDATE answer_cache SET deleted_at = ?4
@@ -650,7 +650,7 @@ pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, Stor
 /// Обращение к выжимкам: `last_used_at` — сейчас, `hits + 1`.
 async fn touch_used(db: &Db, ids: Vec<Id>) -> Result<(), StoreError> {
     db.write(move |t| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let mut st = t.prepare_cached(
             "UPDATE answer_cache SET last_used_at = ?2, hits = hits + 1 WHERE id = ?1",
         )?;
@@ -727,7 +727,7 @@ pub async fn cache_delete(db: &Db, id: Id) -> Result<bool, StoreError> {
     db.write(move |t| {
         let n = t.execute(
             "UPDATE answer_cache SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
-            params![id, fmt_ts(Timestamp::now())],
+            params![id, fmt_ts(crate::time::now())],
         )?;
         Ok(n > 0)
     })
@@ -763,7 +763,7 @@ fn promote_tx(
             "выжимка уже превращена в {p}"
         )));
     }
-    let now = fmt_ts(Timestamp::now());
+    let now = fmt_ts(crate::time::now());
     let mut targets: Vec<TargetRef> = Vec::new();
     for d in &e.sources {
         if !targets.contains(&d.target) && deps::is_live(tx, d.target)? {

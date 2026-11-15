@@ -19,7 +19,7 @@
 //!    `ack_storage_rebuilt()` — когда прошли (или исключены) все базы: флаг
 //!    `.zam-reindex` не держит полную перечанковку на каждом рестарте из-за одной базы.
 //! 3. **Reindex по запросу** ([`WorkerHandle::request_reindex`], `POST /admin/reindex`):
-//!    [`crate::reindex`] — из кэша без инференса или полный; выполняется здесь же,
+//!    [`crate::reindex()`] — из кэша без инференса или полный; выполняется здесь же,
 //!    последовательно с заданиями, в том числе при чужой модели коллекции (её он и
 //!    пересоздаёт). Прерванный reindex базы (отметка `reindex_pending`) повторяется при
 //!    первом открытии базы после запуска.
@@ -337,7 +337,7 @@ impl WorkerHandle {
         self.notify();
     }
 
-    /// Пересобрать индекс области ([`crate::reindex`]): из кэша `embeddings` без
+    /// Пересобрать индекс области ([`crate::reindex()`]): из кэша `embeddings` без
     /// инференса или полностью (`full`). Выполняется воркером асинхронно, по порядку
     /// запросов; итог — [`WorkerStatus::last_reindex`].
     pub fn request_reindex(&self, req: ReindexRequest) {
@@ -798,6 +798,14 @@ impl Worker {
                 for (u, f) in &rep.missed_folders {
                     self.rollups.schedule(*u, *f, self.cfg.rollup_debounce);
                 }
+                // reindex всей базы из кэша уже записал её точки: пересборке (стёртое
+                // хранилище, новая коллекция) перенарезать и ставить задания ей не нужно
+                if let (Some(u), None, false, Some(p)) =
+                    (req.user, req.space, req.full, self.pending.as_mut())
+                    && !rep.failed_users.iter().any(|(f, _)| *f == u)
+                {
+                    p.done.insert(u);
+                }
                 Ok(rep)
             }
         };
@@ -808,7 +816,7 @@ impl Worker {
         };
         let outcome = ReindexOutcome {
             request: req,
-            finished_at: Timestamp::now(),
+            finished_at: zam_store::time::now(),
             result,
         };
         if let Ok(rep) = &outcome.result {
@@ -1001,7 +1009,7 @@ impl Worker {
                 continue;
             }
             let res = match self.deps.users.get(u.id).await {
-                Ok(db) => enqueue_reindex(&db, None).await,
+                Ok(db) => rebuild_db(&db, u.id).await,
                 Err(e) => Err(e),
             };
             match res {
@@ -1233,7 +1241,7 @@ impl Worker {
                     Err(e) => tracing::warn!(user = %user, error = %e, "requeue_running"),
                 }
             }
-            let jobs = match claim_jobs(&db, self.cfg.batch_jobs, Timestamp::now()).await {
+            let jobs = match claim_jobs(&db, self.cfg.batch_jobs, zam_store::time::now()).await {
                 Ok(j) => j,
                 Err(e) => {
                     tracing::warn!(user = %user, error = %e, "выдача заданий");
@@ -1278,7 +1286,7 @@ impl Worker {
     }
 
     async fn fail(&self, db: &Db, j: &Job, err: &str) {
-        match fail_job(db, j.id, j.claim_gen, err, Timestamp::now()).await {
+        match fail_job(db, j.id, j.claim_gen, err, zam_store::time::now()).await {
             Ok(JobOutcome::Failed) if j.op == JobOp::Delete => tracing::warn!(
                 target = %j.target(),
                 error = err,
@@ -2111,6 +2119,20 @@ impl WorkerHandle {
     #[doc(hidden)]
     pub fn release_write(&self) {
         self.inner.hold.release();
+    }
+}
+
+/// Шаг пересборки одной базы `db` пользователя `user` ([`Worker`], `rebuild_pass`): число
+/// поставленных заданий. База с отметкой reindex **всей базы** (`space: null`, в том числе
+/// `full`: `zam-server restore`, прерванный reindex без пространства) пропускается — её
+/// пересоберёт отметка (точки из кэша без перенарезки и заданий). Отметка одного пространства
+/// (прерванный `reindex --space`) остальные пространства не вернёт — тогда перенарезка и
+/// задания всей базы, как без отметки (ревью 18a, N1).
+#[doc(hidden)]
+pub async fn rebuild_db(db: &Db, user: Id) -> Result<u64, StoreError> {
+    match pending_reindex(db).await? {
+        Some(spec) if ReindexRequest::from_spec(user, &spec).space.is_none() => Ok(0),
+        _ => enqueue_reindex(db, None).await,
     }
 }
 

@@ -15,7 +15,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::log::read_text;
-use super::{Ctx, emit, emit_json};
+use super::{Ctx, agent_time, emit, emit_json};
 use crate::client::{CliError, read_json};
 
 /// Источник `ID[#СЕКЦИЯ][@REV]` → `{id, section?, rev?}`.
@@ -92,6 +92,11 @@ pub fn put(ctx: &Ctx, o: &PutOpts) -> Result<(), CliError> {
     if let Some(g) = o.solution {
         body["solution"] = json!(super::solution_guid(ctx, Some(g))?);
     }
+    // `--json` — прежняя форма ответа для скриптов (с `summary`; сервер M6 без `echo` её не
+    // отдаёт, §5); старый сервер поле `echo` не знает — без `--json` оно не шлётся
+    if ctx.json {
+        body["echo"] = json!(true);
+    }
     let v = read_json(ctx.client.post_json("/cache", &body)?)?;
     if ctx.json {
         return emit_json(&v);
@@ -147,9 +152,8 @@ pub fn list(ctx: &Ctx, o: &ListOpts) -> Result<(), CliError> {
                 c["state"].as_str().unwrap_or("?"),
                 c["created_at"]
                     .as_str()
-                    .unwrap_or("?")
-                    .get(..10)
-                    .unwrap_or("?"),
+                    .and_then(zam_core::time::agent_date)
+                    .unwrap_or_else(|| "?".into()),
                 one_line(c["query"].as_str().unwrap_or("")),
             )
         })
@@ -177,7 +181,7 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
         v["ref"].as_str().unwrap_or("?"),
         one_line(v["query"].as_str().unwrap_or("")),
         v["state"].as_str().unwrap_or("?"),
-        v["created_at"].as_str().unwrap_or("?"),
+        agent_time(v["created_at"].as_str().unwrap_or("?")),
     );
     if let Some(a) = v["author"].as_str() {
         s.push_str(&format!(" · автор {a}"));

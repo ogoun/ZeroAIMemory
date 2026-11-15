@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn key_hash_follows_revision_read() {
-        let now = jiff::Timestamp::now();
+        let now = zam_store::time::now();
         let text = "текст rev 1
 ";
         let node = zam_store::Node {

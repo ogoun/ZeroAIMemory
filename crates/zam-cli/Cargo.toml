@@ -28,10 +28,28 @@ regex.workspace = true
 blake3.workspace = true
 # карта кода (M5.6): экстрактор tree-sitter — фича `parse` только у клиента (сервер без C-кода)
 zam-code = { path = "../zam-code", features = ["parse"] }
+# `zam import <каталог>`: упаковка папки в zip (M6 §12б.5; MIT, крейт workspace, уже у сервера)
+zip.workspace = true
+# маскировка снимка сессии (M6 §8а): сканер секретов без comrak и tokio
+zam-secrets = { path = "../zam-secrets" }
+
+# цепочка предков процесса (привязка `zam mcp` к сессии, M6 §7.1): ToolHelp32 (MIT OR
+# Apache-2.0, крейт workspace, уже у xtask)
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+
+[features]
+# точки подмены для тестов (цепочка предков процесса `hook::procs`; задержка записи привязки
+# `ZAM_TEST_BINDING_STALL_MS` — бюджет хука, M6 задача 5; она же есть в отладочной сборке —
+# бинарник интеграционных тестов)
+test-hooks = []
 
 [dev-dependencies]
-zam-server = { path = "../zam-server" }
-zam-store = { path = "../zam-store" }
+# точки отказа сервера (`import_disk_full`) — тесты `zam import`
+zam-server = { path = "../zam-server", features = ["test-hooks"] }
+# `test-hooks`: часы сервера в процессе теста (`time::freeze_now`) — сценарии снимка сессии
+# «сессия молчит дольше 10 мин» (M6 §8а, задача 17d)
+zam-store = { path = "../zam-store", features = ["test-hooks"] }
 # тесты: разбор frontmatter `refs:` тем же парсером, что у сервера (zam write --ref)
 zam-markdown = { path = "../zam-markdown" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

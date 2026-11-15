@@ -6,7 +6,7 @@
 //! Пользователь — по имени (как в списке запросов) или id.
 use serde_json::{Value, json};
 
-use super::{Ctx, emit, emit_json};
+use super::{Ctx, agent_time, emit, emit_json};
 use crate::client::{CliError, EXIT_NOT_FOUND, read_json};
 use crate::target::is_guid;
 
@@ -77,7 +77,7 @@ fn line(m: &Value) -> String {
         m["user_id"].as_str().unwrap_or("?"),
         m["state"].as_str().unwrap_or("?"),
         m["access"].as_str().unwrap_or("?"),
-        m["requested_at"].as_str().unwrap_or("?"),
+        agent_time(m["requested_at"].as_str().unwrap_or("?")),
     )
 }
 
@@ -157,6 +157,14 @@ pub fn run(ctx: &Ctx, flag: Option<&str>, action: &Action) -> Result<(), CliErro
 
 #[cfg(test)]
 mod tests {
+    /// Время запроса доступа — UTC без `T`/`Z` (M6 §4.4, ревью задачи 6).
+    #[test]
+    fn request_line_agent_time() {
+        let m = json!({"user_name": "борис", "user_id": "01B", "state": "pending",
+                       "access": "ro", "requested_at": "2026-10-10T14:03:22.123456Z"});
+        assert_eq!(line(&m), "борис  01B  pending  ro  2026-10-10 14:03:22\n");
+    }
+
     use super::*;
 
     #[test]

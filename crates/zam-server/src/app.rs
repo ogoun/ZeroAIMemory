@@ -59,11 +59,46 @@ pub struct AppState {
     /// Карта кода (M5.6 §7): пересчёты рангов (single-flight на решение), слоты и кэш входов
     /// ранжирования с фокусом.
     pub code: Arc<api::code::CodeRuntime>,
+    /// Слоты экспорта пространства (M6 §12б.5): не больше
+    /// [`api::transfer::export::EXPORT_SLOTS`] одновременно, занято — 503 с `Retry-After`.
+    pub export_slots: Arc<tokio::sync::Semaphore>,
+    /// Пользователи с идущим экспортом: не больше одного экспорта на пользователя.
+    pub export_users: Arc<std::sync::Mutex<std::collections::HashSet<Id>>>,
+    /// Сервер останавливается ([`AppState::begin_stop`]): долгие потоки ответа (экспорт)
+    /// обрываются, чтобы штатная остановка HTTP не ждала их.
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// Идущие задачи экспорта: остановка ждёт их аудит `space.export.done` (не дольше 1 с).
+    pub export_tasks: Arc<TaskCount>,
+    /// Импорт пространства (M6 §12б.5): слоты приёма, очередь записи, задания в памяти
+    /// ([`api::transfer::import::ImportRuntime`]).
+    pub imports: Arc<api::transfer::import::ImportRuntime>,
+    /// Идущие задания импорта: остановка ждёт их аудит `space.import.done` (вместе с
+    /// экспортами, не дольше 1 с).
+    pub import_tasks: Arc<TaskCount>,
     /// Точка остановки `POST /search` сразу после каналов FTS и векторного (фича `test-hooks`):
     /// тест задаёт порядок «поиск прочитал вектор → воркер проиндексировал → ответ».
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub search_hold: Arc<zam_index::test_hooks::Hold>,
+    /// Задержка эмбеддинга и векторов явного фокуса `/read`, мс (фича `test-hooks`): тест отката
+    /// по сроку `read.focus_timeout_ms` (M6 §6). 0 — без задержки.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub focus_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Пакетный эмбеддинг запросов фокуса (фича `test-hooks`, замер): 0 — по умолчанию
+    /// (`read_focus::FOCUS_BATCH_DEFAULT`), 1 — включён, 2 — выключен.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub focus_batch: Arc<std::sync::atomic::AtomicU8>,
+    /// Число эмбеддингов текстов `focus`, запущенных задачей фокуса (фича `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub focus_embeds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Задержка шага сбора `/recall` под сроком сбора, мс (фича `test-hooks`): тест срока из
+    /// тела `timeout_ms` (M6 §16 п. 19, CR-7). 0 — без задержки.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub recall_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -84,6 +119,26 @@ impl AppState {
     ///
     /// Поэтому «после `shutdown` соединений нет» верно для обслуживания и воркера индексации,
     /// но не для незаконченной задачи открытия базы.
+    /// Начало остановки: долгие потоки ответа (экспорт пространства) обрываются между файлами
+    /// и кусками тела. Зовётся по сигналу остановки до штатного завершения HTTP.
+    pub fn begin_stop(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Ждёт конца задач экспорта (обрыв по [`AppState::begin_stop`] и аудит
+    /// `space.export.done`) не дольше `limit`; `true` — все закончились.
+    pub async fn wait_exports(&self, limit: std::time::Duration) -> bool {
+        let t0 = Instant::now();
+        while self.export_tasks.running() + self.import_tasks.running() > 0 {
+            if t0.elapsed() >= limit {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
     pub async fn shutdown(&self) {
         self.maintenance.stop().await;
         self.docs.shutdown().await;
@@ -187,6 +242,30 @@ pub async fn os_stop_signals() {
 }
 
 // Вручную: хэш пароля и пути не должны попадать в отладочный вывод.
+/// Счётчик идущих задач ([`TaskCount::enter`] — на время задачи).
+#[derive(Debug, Default)]
+pub struct TaskCount(std::sync::atomic::AtomicUsize);
+
+/// Задача идёт, пока жив.
+pub struct TaskRunning(Arc<TaskCount>);
+
+impl TaskCount {
+    pub fn enter(self: Arc<Self>) -> TaskRunning {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        TaskRunning(self)
+    }
+
+    pub fn running(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for TaskRunning {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
@@ -229,6 +308,8 @@ pub(crate) struct Prepared {
 pub(crate) fn prepare(cfg: ServerConfig, env_password: Option<&str>) -> anyhow::Result<Prepared> {
     let AdminSecret::Hash(admin_hash) = cfg.admin_secret(env_password)?;
     let data_dir = Arc::new(DataDir::open(&cfg.data_dir)?);
+    // тела импорта прерванного процесса (M6 §12б.5)
+    api::transfer::import::clean_incoming(data_dir.root());
     Ok(Prepared {
         cfg,
         admin_hash,
@@ -264,6 +345,10 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     };
     // без эмбеддера — токенизатор установленной модели (если есть): чанки сразу точные
     ml::setup_chunker(&cfg, ml.embedder.as_deref());
+    // срок годности признака копии `.zam-backup` для потоков контрольных точек баз (§12б.2)
+    zam_store::set_backup_flag_max_age(std::time::Duration::from_secs(
+        u64::from(cfg.backup.flag_max_hours) * 3600,
+    ));
     let system = SystemStore::open(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
     bootstrap::warn_legacy_human_tokens(&system).await;
@@ -298,11 +383,20 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         system.clone(),
         users.clone(),
         cfg.cache.clone(),
+        cfg.clone(),
     ));
     let state = AppState {
         maintenance,
         glossary: Arc::default(),
         code: Arc::default(),
+        export_slots: Arc::new(tokio::sync::Semaphore::new(
+            api::transfer::export::EXPORT_SLOTS,
+        )),
+        export_users: Arc::default(),
+        stopping: Arc::default(),
+        export_tasks: Arc::default(),
+        imports: Arc::default(),
+        import_tasks: Arc::default(),
         big_bodies: api::big_body::BigBodies::new(
             api::big_body::BIG_BODY_PERMITS,
             api::note_body_max(&cfg.limits),
@@ -325,6 +419,14 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         cfg: Arc::new(cfg),
         #[cfg(feature = "test-hooks")]
         search_hold: Arc::default(),
+        #[cfg(feature = "test-hooks")]
+        focus_delay_ms: Arc::default(),
+        #[cfg(feature = "test-hooks")]
+        focus_batch: Arc::default(),
+        #[cfg(feature = "test-hooks")]
+        focus_embeds: Arc::default(),
+        #[cfg(feature = "test-hooks")]
+        recall_delay_ms: Arc::default(),
     };
     let router = router(state.clone());
     Ok((router, state, BootReport { initial_token }))

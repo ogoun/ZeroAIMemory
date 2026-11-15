@@ -3,7 +3,7 @@
   // справа — документ, стартовый экран пользователя или администрирование. У пользователя
   // (не администратора, §15.1) нет разделов «Пользователи», «Администрирование», «Настройки»
   // и полного «Индекса»: есть «Мои решения», «Аккаунт» и баннер перенарезки своей базы.
-  // «Подключение агента» и «Кэш выжимок» — у обоих (страницы грузятся лениво, §15.4).
+  // «Подключение агента», «Кэш выжимок» и «Сессии» (M6 §8) — у обоих (страницы грузятся лениво, §15.4).
   import { onMount, untrack } from 'svelte';
   import DocView from '../components/DocView.svelte';
   import Search from '../components/Search.svelte';
@@ -225,6 +225,7 @@
       <a href={href({ name: 'cache' })} aria-current={route.name === 'cache' ? 'page' : undefined}
         aria-label="Кэш выжимок"><span class="long">Кэш выжимок</span><span class="short" aria-hidden="true">Кэш</span></a
       >
+      <a href={href({ name: 'sessions' })} aria-current={route.name === 'sessions' ? 'page' : undefined}>Сессии</a>
     </nav>
     <button type="button" class="search-btn" onclick={() => (searchOpen = true)} title="Поиск (Ctrl+K)" aria-label="Поиск">
       <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8" /><path d="M13 13l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" /></svg>
@@ -379,6 +380,16 @@
           <p class="muted">Загрузка…</p>
         {:then { default: Cache }}
           <Cache {me} {users} {onexpired} />
+        {:catch e}
+          <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
+        {/await}
+      </div>
+    {:else if route.name === 'sessions'}
+      <div class="admin">
+        {#await import('../components/SessionsView.svelte')}
+          <p class="muted">Загрузка…</p>
+        {:then { default: SessionsView }}
+          <SessionsView {me} {users} {onexpired} />
         {:catch e}
           <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
         {/await}

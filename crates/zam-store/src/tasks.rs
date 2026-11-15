@@ -397,7 +397,7 @@ pub async fn release_task(
         let Some(c) = t.claimed_by.clone() else {
             return Ok(Ok(None));
         };
-        if c.live(Timestamp::now()) && c.session != session && !human {
+        if c.live(crate::time::now()) && c.session != session && !human {
             return Ok(Err(TaskError::NotClaimedBySession));
         }
         t.claimed_by = None;

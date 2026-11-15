@@ -253,7 +253,7 @@ pub(crate) fn same_triggers(
 }
 
 /// JSON-массив инструментов из колонки `tools`.
-fn tools_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<Vec<String>>> {
+pub(crate) fn tools_col(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<Vec<String>>> {
     let s: Option<String> = r.get(i)?;
     s.map(|s| serde_json::from_str(&s).map_err(|e| crate::time::conv_err(i, e)))
         .transpose()
@@ -289,7 +289,7 @@ pub async fn set_triggers(
             ));
         }
         super::write::ensure_editable(&e)?;
-        replace_triggers(tx, entry, &ts, &fmt_ts(Timestamp::now()))
+        replace_triggers(tx, entry, &ts, &fmt_ts(crate::time::now()))
     })
     .await
 }

@@ -33,6 +33,14 @@ pub enum ApiError {
     },
     #[error("ресурс не найден")]
     NotFound,
+    /// 400 `/problems/session-required` (M6 §8а): запись снимка сессии без явной сессии —
+    /// `X-Zam-Session` не совпадает с `{id}` пути.
+    #[error("{0}")]
+    SessionRequired(String),
+    /// 404 `/problems/session-not-found` (M6 §8а): сессии нет в базе пользователя запроса — в
+    /// отличие от 404 старого сервера без маршрута (`about:blank`).
+    #[error("сессия не найдена: зарегистрируйте её (POST /sessions)")]
+    SessionNotFound,
     /// 404 [`CODE_SYMBOL_NOT_FOUND`] (M5.6 §9): символа нет в карте решения — в отличие от
     /// выключенной карты и неизвестного решения (`about:blank`).
     #[error("{0}")]
@@ -121,8 +129,19 @@ pub enum ApiError {
     /// ([`crate::api::big_body`]).
     #[error("сервер занят обработкой больших запросов — повторите позже")]
     Busy { retry_after_s: u64 },
+    /// 503 `/problems/busy` с `Retry-After`: заняты слоты экспорта пространства
+    /// ([`crate::api::transfer::export`], M6 §12б.5).
+    #[error("уже идут другие экспорты пространств — повторите позже")]
+    ExportBusy { retry_after_s: u64 },
+    /// 503 `/problems/busy` с `Retry-After`: сервер останавливается (экспорт не начинается).
+    #[error("сервер останавливается — повторите позже")]
+    ShuttingDown { retry_after_s: u64 },
     #[error("{0}")]
     Unavailable(String),
+    /// 507 `/problems/insufficient-storage`: на диске сервера мало места для приёма (импорт
+    /// пространства, M6 §12б.5).
+    #[error("{0}")]
+    InsufficientStorage(String),
     /// 408 `/problems/timeout`: тело запроса не получено в срок ([`crate::api::big_body`]).
     #[error("{0}")]
     RequestTimeout(String),
@@ -173,6 +192,16 @@ impl ApiError {
                 "Forbidden",
             ),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "about:blank", "Not Found"),
+            ApiError::SessionRequired(_) => (
+                StatusCode::BAD_REQUEST,
+                "/problems/session-required",
+                "Bad Request",
+            ),
+            ApiError::SessionNotFound => (
+                StatusCode::NOT_FOUND,
+                "/problems/session-not-found",
+                "Not Found",
+            ),
             ApiError::Conflict { .. } => (StatusCode::CONFLICT, "/problems/conflict", "Conflict"),
             ApiError::PossibleDuplicate { .. } => (
                 StatusCode::CONFLICT,
@@ -278,11 +307,13 @@ impl ApiError {
                 "/problems/rate-limited",
                 "Too Many Requests",
             ),
-            ApiError::Busy { .. } => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "/problems/busy",
-                "Service Unavailable",
-            ),
+            ApiError::Busy { .. } | ApiError::ExportBusy { .. } | ApiError::ShuttingDown { .. } => {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "/problems/busy",
+                    "Service Unavailable",
+                )
+            }
             ApiError::RequestTimeout(_) => (
                 StatusCode::REQUEST_TIMEOUT,
                 "/problems/timeout",
@@ -292,6 +323,11 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "about:blank",
                 "Service Unavailable",
+            ),
+            ApiError::InsufficientStorage(_) => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "/problems/insufficient-storage",
+                "Insufficient Storage",
             ),
             ApiError::VaultLocked(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -404,7 +440,10 @@ impl IntoResponse for ApiError {
             HeaderValue::from_static("application/problem+json"),
         );
         match self {
-            ApiError::RateLimited { retry_after_s } | ApiError::Busy { retry_after_s } => {
+            ApiError::RateLimited { retry_after_s }
+            | ApiError::Busy { retry_after_s }
+            | ApiError::ExportBusy { retry_after_s }
+            | ApiError::ShuttingDown { retry_after_s } => {
                 h.insert(header::RETRY_AFTER, HeaderValue::from(retry_after_s));
             }
             // RFC 9110 §15.5.2: 401 обязан нести схему.

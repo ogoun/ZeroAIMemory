@@ -57,7 +57,9 @@ test('Подключение агента: опции меняют фрагме�
   await expect(block).toContainText('<!-- zeroaimemory:begin v');
   await expect(block).toContainText('ZeroAIMemoryUrl=');
   await expect(block).not.toContainText('zam_');
-  await expect(frag(page, 'Фрагмент .mcp.json')).toContainText('Bearer ${ZAM_TOKEN}');
+  // M6: stdio-прокси zam mcp (привязка к сессии агента)
+  await expect(frag(page, 'Фрагмент .mcp.json')).toContainText('"command": "zam"');
+  await expect(frag(page, 'Фрагмент .mcp.json')).not.toContainText('ZAM_TOKEN');
   await expect(frag(page, 'Хуки Claude Code')).toContainText('PostToolUseFailure');
   await expect(frag(page, 'solution.toml')).toHaveCount(0);
   await expect(frag(page, /zam init — Linux/)).toContainText('zam init');
@@ -87,7 +89,10 @@ test('Подключение агента: опции меняют фрагме�
   await expect(toml).toContainText('Проект E2E');
   const guid = ((await toml.textContent()) ?? '').match(GUID)?.[0];
   expect(guid).toBeTruthy();
-  await expect(frag(page, 'Фрагмент .mcp.json')).toContainText(guid!);
+  // GUID — в блоке CLAUDE.md/AGENTS.md и solution.toml; `.mcp.json` с M6 — stdio `zam mcp` без
+  // GUID (решение берётся из solution.toml; журнал M6, задача 8b → 13a)
+  await expect(block).toContainText(guid!);
+  await expect(frag(page, 'Фрагмент .mcp.json')).not.toContainText(guid!);
   await page.getByLabel('Язык инструкции').selectOption('en');
   await expect(block).toContainText('ZeroAIMemory memory');
   await expect(toml).toContainText(guid!);

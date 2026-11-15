@@ -173,6 +173,8 @@ pub(super) async fn expand_graph(
                 via: Some(c.via),
                 folder: None,
                 seen: false,
+                seen_kept: false,
+                in_cache: false,
                 stale_refs: Vec::new(),
             }
         })
@@ -199,18 +201,160 @@ pub(super) fn contradicts_applies(src_rel: u8, dst_rel: u8, dst_live: bool) -> b
     dst_live && dst_rel >= reliability(Some(Certainty::Theorem)) && dst_rel > src_rel
 }
 
+/// Надёжность ([`reliability`]) и «действует» узлов подграфа: у заметки статуса нет, запись
+/// действует при `active`/`revisit`; удалённое не действует.
+fn reliabilities(g: &zam_store::Graph) -> HashMap<Id, (u8, bool)> {
+    g.nodes
+        .iter()
+        .map(|n| {
+            let live = !n.deleted
+                && matches!(
+                    n.status,
+                    None | Some(EntryStatus::Active | EntryStatus::Revisit)
+                );
+            (n.r.id, (reliability(n.certainty), live))
+        })
+        .collect()
+}
+
+/// Кандидат поиска для [`kind_boost_exempt`]: индекс цели поиска, цель элемента и получил бы
+/// он буст вида.
+pub(super) struct KindCandidate {
+    pub target: usize,
+    pub r: TargetRef,
+    pub boosted: bool,
+}
+
+/// Предупреждение ответа поиска: граф `contradicts` элементов выдачи обрезан пределом подграфа —
+/// исключения буста вида `unless_contradicted` ([`kind_boost_exempt`]) и порядок по
+/// противоречиям ([`order_by_contradicts`]) могли примениться не полностью.
+pub const WARN_KIND_GRAPH_TRUNCATED: &str = "contradicts graph truncated";
+
+/// Предупреждение ответа поиска: граф `contradicts` чужого решения не прочитан — исключения буста
+/// вида и порядок по противоречиям для его элементов не применены; само решение в выдаче
+/// остаётся (в отличие от `solution unavailable`).
+pub const WARN_KIND_GRAPH_UNAVAILABLE: &str = "contradicts graph unavailable";
+
+/// Предупреждение ответа `w` — одно на ответ.
+fn warn_once(health: &mut Health<'_>, w: &str) {
+    if !health.warnings.iter().any(|x| x == w) {
+        health.warnings.push(w.into());
+    }
+}
+
+/// Граф `contradicts` глубины 1 от `refs` в базе цели `ti` — одно чтение на шаг поиска
+/// ([`kind_boost_exempt`], [`order_by_contradicts`]) с общими правилами (ревью задач 10 и 16):
+/// - сбой чтения графа **чужого** решения — `None`, WARN в журнал и предупреждение ответа
+///   [`WARN_KIND_GRAPH_UNAVAILABLE`] (одно на ответ): решение из выдачи не исключается (в отличие
+///   от [`Health::soft`]), шаг для него не применяется; сбой личной базы — ошибка запроса;
+/// - подграф обрезан пределами `zam_store::GRAPH_MAX_NODES` / `GRAPH_MAX_EDGES` — WARN в журнал
+///   и предупреждение ответа [`WARN_KIND_GRAPH_TRUNCATED`] (одно на ответ); найденные связи
+///   действуют.
+async fn contradicts_graph(
+    health: &mut Health<'_>,
+    ti: usize,
+    refs: &[TargetRef],
+) -> Result<Option<zam_store::Graph>, ApiError> {
+    let targets = health.targets;
+    let t = &targets[ti];
+    let r =
+        t.db.neighbors(refs, 1, &[EdgeType::Contradicts], &t.space_ids())
+            .await;
+    let g = match r {
+        Ok(g) => g,
+        Err(e) => match &t.solution {
+            Some(_) => {
+                tracing::warn!(
+                    error = %e,
+                    "поиск: граф contradicts чужого решения не прочитан — шаг пропущен"
+                );
+                warn_once(health, WARN_KIND_GRAPH_UNAVAILABLE);
+                return Ok(None);
+            }
+            None => return Err(e.into()),
+        },
+    };
+    if g.truncated {
+        tracing::warn!(
+            nodes = g.nodes.len(),
+            edges = g.edges.len(),
+            "поиск: граф contradicts обрезан пределом — связи учтены не все"
+        );
+        warn_once(health, WARN_KIND_GRAPH_TRUNCATED);
+    }
+    Ok(Some(g))
+}
+
+/// Цели без буста вида при `search.kind_boost_mode = unless_contradicted` (M6 §10): кандидат с
+/// бустом вида, связанный `contradicts` (в любую сторону **[решение исполнителя]**: связь —
+/// противоречие, направление в данных — от гипотезы к теореме) с действующей записью, которая
+/// надёжнее его по [`contradicts_applies`] и тоже среди кандидатов `cands` — всех после слияния,
+/// до отсечения `top_k` (не только видимых). Граф читается от кандидатов с бустом.
+///
+/// - Сбой чтения графа **чужого** решения решение не исключает (ревью задачи 10): исключений у
+///   его кандидатов нет — буст как при `always`, в журнал — WARN. Сбой личной базы — ошибка
+///   запроса, как у остальных чтений.
+/// - Подграф обрезан пределами `zam_store::GRAPH_MAX_NODES` / `GRAPH_MAX_EDGES` (`truncated`):
+///   связь сверх предела не видна, и исключение по ней не применяется — найденные исключения
+///   действуют, в журнал — WARN, в ответ — предупреждение [`WARN_KIND_GRAPH_TRUNCATED`].
+///
+/// Оба правила — в [`contradicts_graph`], общем с [`order_by_contradicts`].
+pub(super) async fn kind_boost_exempt(
+    health: &mut Health<'_>,
+    cands: &[KindCandidate],
+) -> Result<HashSet<TargetRef>, ApiError> {
+    let mut by_db: BTreeMap<usize, (Vec<TargetRef>, HashSet<TargetRef>)> = BTreeMap::new();
+    for c in cands {
+        if !health.alive[c.target] || !matches!(c.r.kind, TargetKind::Node | TargetKind::Entry) {
+            continue;
+        }
+        let (boosted, all) = by_db.entry(c.target).or_default();
+        all.insert(c.r);
+        if c.boosted && !boosted.contains(&c.r) {
+            boosted.push(c.r);
+        }
+    }
+    let mut out = HashSet::new();
+    for (ti, (boosted, all)) in by_db {
+        if boosted.is_empty() || all.len() < 2 {
+            continue;
+        }
+        // чужое решение с нечитаемым графом остаётся в выдаче: буст вида — как при `always`
+        let Some(g) = contradicts_graph(health, ti, &boosted).await? else {
+            continue;
+        };
+        let rel = reliabilities(&g);
+        for e in &g.edges {
+            let Some(d) = e.dst.filter(|_| e.kind == EdgeType::Contradicts) else {
+                continue;
+            };
+            for (x, y) in [(e.src, d), (d, e.src)] {
+                let xr = rel.get(&x.id).map_or(0, |r| r.0);
+                if boosted.contains(&x)
+                    && all.contains(&y)
+                    && let Some(&(yr, live)) = rel.get(&y.id)
+                    && contradicts_applies(xr, yr, live)
+                {
+                    out.insert(x);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Порядок по `contradicts` (M4.5, §5.2): элемент выдачи с исходящим `contradicts` к действующей
 /// записи той же выдачи, которая надёжнее его (`axiom` — любого элемента, кроме другой
 /// аксиомы; `theorem` — гипотезы или заметки), не стоит выше неё
 /// ([`zam_search::order_contradicted`]); задача 15: запрос `r-08` набора eval — гипотеза против
 /// `theorem`. Сдвинутой записи балл поднимается до балла следующего элемента, чтобы баллы не шли
 /// вразрез с порядком.
-/// Сбой чтения графа чужого решения исключает решение ([`Health::soft`]).
+/// Сбой чтения графа чужого решения решение не исключает: его элементы остаются без
+/// перестановки; обрезанный подграф — предупреждение ответа ([`contradicts_graph`]).
 pub(super) async fn order_by_contradicts(
     health: &mut Health<'_>,
     items: &mut Vec<Item>,
 ) -> Result<(), ApiError> {
-    let targets = health.targets;
     let mut by_db: BTreeMap<usize, Vec<TargetRef>> = BTreeMap::new();
     for it in items.iter() {
         // связи — между узлами и записями: документ вложения концом связи не бывает
@@ -226,27 +370,10 @@ pub(super) async fn order_by_contradicts(
         if refs.len() < 2 {
             continue;
         }
-        let t = &targets[ti];
-        let r =
-            t.db.neighbors(&refs, 1, &[EdgeType::Contradicts], &t.space_ids())
-                .await;
-        let Some(g) = health.soft(ti, r)? else {
+        let Some(g) = contradicts_graph(health, ti, &refs).await? else {
             continue;
         };
-        // надёжность записей подграфа; цель связи — только действующая
-        let rel: HashMap<Id, (u8, bool)> = g
-            .nodes
-            .iter()
-            .map(|n| {
-                let live = !n.deleted
-                    // у заметки статуса нет; у записи — только действующая
-                    && matches!(
-                        n.status,
-                        None | Some(EntryStatus::Active | EntryStatus::Revisit)
-                    );
-                (n.r.id, (reliability(n.certainty), live))
-            })
-            .collect();
+        let rel = reliabilities(&g);
         for e in &g.edges {
             if e.kind != EdgeType::Contradicts {
                 continue;

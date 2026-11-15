@@ -30,6 +30,12 @@
 //! решению) — тот же 404, что и несуществующий sha, без 403 `solution-access`: превью не
 //! подтверждает существование файла.
 //!
+//! **Файлы отчётов** (M6 §16 п. 15, миниатюры ленты «Отчёты») — права как у файла отчёта
+//! (`GET /entries/{id}/attachments/…`): только сессии человека — в своей базе и в решениях с
+//! одобренным доступом, только у живой записи вида `report`. Токену отчёты не видны (M5.5 §7),
+//! поэтому и превью их файла — 404, как несуществующий sha: вопрос «есть ли в отчёте файл с таким
+//! содержимым» токену не отвечается.
+//!
 //! **Ответ:** `ETag` — sha, ключ кэша (параметры, версии, отпечаток лимитов), у листа — и
 //! отпечаток номеров `ref_no`; `If-None-Match` → 304. `Cache-Control: private,
 //! max-age=3600`, `X-Content-Type-Options: nosniff`, CSP `sandbox; default-src 'none'`.
@@ -48,7 +54,9 @@ use zam_core::Id;
 use zam_docs::{DocError, DocKind, Limits, Locator};
 use zam_markdown::mask_text;
 use zam_store::blobs::is_sha256;
-use zam_store::{BlobStore, Db, blob_meta_by_sha, blob_meta_by_sha_in_space};
+use zam_store::{
+    BlobStore, Db, blob_meta_by_sha, blob_meta_by_sha_in_space, report_blob_meta_by_sha,
+};
 
 use super::blobs::NoCompress;
 use super::doc_locator::Sheets;
@@ -137,7 +145,9 @@ struct Located {
 
 /// Владелец и база с привязкой блоба `sha` к узлу, доступному принципалу: личная база (Human —
 /// только сессии человека), затем базы владельцев решений — только их пространство и только при
-/// одобренном доступе. Всё недоступное — [`ApiError::NotFound`], как несуществующее.
+/// одобренном доступе. Сессии человека — ещё и файл живого отчёта (`entry_attachments`) в тех же
+/// базах и пространствах; токену файлы отчётов не существуют. Всё недоступное —
+/// [`ApiError::NotFound`], как несуществующее.
 async fn locate(
     st: &AppState,
     p: &Principal,
@@ -145,7 +155,13 @@ async fn locate(
     sha: &str,
 ) -> Result<Located, ApiError> {
     let (user, db) = user_db(st, p, headers).await?;
-    if let Some((_, size, filename)) = blob_meta_by_sha(&db, sha, p.is_human()).await? {
+    // отчёт — только человеку (как `reports::view::attachment`)
+    let reports = p.is_human();
+    let mut found = blob_meta_by_sha(&db, sha, p.is_human()).await?;
+    if found.is_none() && reports {
+        found = report_blob_meta_by_sha(&db, sha, None).await?;
+    }
+    if let Some((_, size, filename)) = found {
         return Ok(Located {
             owner: user.id,
             db,
@@ -161,7 +177,11 @@ async fn locate(
         let Some(odb) = owner_db(st, &info).await else {
             continue;
         };
-        match blob_meta_by_sha_in_space(&odb, sha, info.space_id).await {
+        let mut found = blob_meta_by_sha_in_space(&odb, sha, info.space_id).await;
+        if reports && matches!(found, Ok(None)) {
+            found = report_blob_meta_by_sha(&odb, sha, Some(info.space_id)).await;
+        }
+        match found {
             Ok(Some((_, size, filename))) => {
                 return Ok(Located {
                     owner: info.owner_id,

@@ -94,3 +94,27 @@ Temporary changes still in place:
 ##### After your shift
 
 Take the day after a heavy shift easy if you can, and use some of your next week to do the follow-ups you found: fix the runbook that was wrong, tune the alert that woke you up for nothing, write the missing mitigation note. The rotation gets better only when people who experienced its problems spend time fixing them. The engineering manager tracks on-call follow-ups as part of the team's regular work, not as a side activity, and there is reserved capacity for them in every sprint.
+
+#### Appendix: timings and thresholds
+
+This appendix collects the numbers that the rest of the handbook refers to, in one place, because people looking for them during a shift do not want to read the whole document again. The numbers are reviewed once a quarter together with the rotation schedule; if you think one of them is wrong, raise it in the on-call review rather than ignoring it during a shift.
+
+##### Paging and escalation
+
+The escalation windows themselves are described in the section on handling a page. Acknowledging stops the escalation timer but does not resolve the page; a page that is acknowledged and then forgotten re-notifies the primary every thirty minutes until it is resolved or handed over. Pages from the same alert group within ten minutes are merged into one, so a flapping alert produces one page with a counter rather than a stream of notifications. If you are going to be out of reach for longer than the acknowledgement window, for example on a flight or in a place without coverage, swap the shift in advance instead of hoping nothing happens: the escalation policy cannot tell the difference between an absent primary and a busy one.
+
+##### Status update cadence
+
+During a declared incident the communications lead keeps the thirty-minute rhythm described above even if nothing has changed, and posts immediately when the impact, the mitigation or the estimated time to recovery changes. An update that says "no change, still investigating the database failover, next update in thirty minutes" is useful: it tells the people waiting that someone is working on it and when to look again. The support team writes customer-facing entries from the internal update, so the internal update has to be understandable to someone outside the team.
+
+##### Limits on shift load
+
+A primary who has been paged more than three times between midnight and six in the morning hands the rest of the night to the secondary and takes the following morning off. This is not a reward but a safety measure: decisions made after several interrupted hours of sleep are measurably worse, and the worst mistakes in our incident history were made by people who were too tired to notice that they were tired. The same limit applies to a single incident: after four hours as incident commander, hand the role over to someone rested, even if the incident is close to being resolved. Write down where things stand before you hand over, using the same headings as the shift handover.
+
+##### Follow-up deadlines
+
+Every incident gets a written review within five working days, and every action item from the review gets an owner and a due date before the review meeting ends. Action items without an owner are not recorded as action items; they are recorded as open questions, and the engineering manager brings them to the next planning meeting. Alerts that paged without a real problem are tuned or removed within two weeks; the alert hygiene section describes how.
+
+##### When a page becomes an incident
+
+Most pages are not incidents, and declaring one for every alert would wear out the incident process. The criteria in the section on deciding whether it is an incident apply, with one additional rule that removes the need for judgement late at night: any page that is still unresolved after thirty minutes is declared an incident, whatever its apparent impact. The rule exists because the cases where people hesitated longest were the ones where the impact was unclear, and unclear impact is exactly when a second pair of eyes and a status update help most. Declaring an incident that turns out to be minor costs a few minutes of paperwork; not declaring one that turns out to be large has cost us hours of uncoordinated work in the past.

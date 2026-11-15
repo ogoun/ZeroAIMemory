@@ -3,7 +3,7 @@
 //!
 //! - [`zam_cmd`] — `zam` без системного прокси, без переменных агента
 //!   ([`zam_core::AGENT_ENV_VARS`]: `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, переменные Codex),
-//!   без клиентских ([`zam_core::CLIENT_ENV_VARS`]: `ZAM_SESSION`, `ZAM_AGENT`, `ZAM_MACHINE`) и
+//!   без клиентских (все [`zam_core::CLIENT_ENV_VARS`]) и
 //!   без любых других `ZAM_*` процесса тестов; нужные значения тест задаёт сам после вызова.
 //!   Иначе `zam`, запущенный из сессии агента, писал бы в журнал этой сессии.
 //! - [`sandbox`] — каталог теста `<CARGO_TARGET_TMPDIR>/<префикс>-<имя>/w`, а уровнем выше —
@@ -105,6 +105,23 @@ pub fn stub(status: u16, body: &'static str, delay: std::time::Duration) -> (Str
 
 /// Заглушка с ответом по запросу ([`Reply`]): например, ошибка на второй пачке.
 pub fn stub_with(reply: std::sync::Arc<Reply>) -> (String, Seen) {
+    stub_body(std::sync::Arc::new(
+        move |m: &str, p: &str, n: usize, _: &serde_json::Value| {
+            let (status, body, delay) = reply(m, p, n);
+            (status, body.to_string(), delay)
+        },
+    ))
+}
+
+/// Ответ заглушки по запросу и его телу ([`stub_body`]): статус, тело, задержка.
+pub type BodyReply = dyn Fn(&str, &str, usize, &serde_json::Value) -> (u16, String, std::time::Duration)
+    + Send
+    + Sync
+    + 'static;
+
+/// Заглушка с ответом и по телу запроса ([`BodyReply`]): например, 400 старого сервера только
+/// на `POST /sessions {holdout}`, а регистрация той же сессии — 201 (M6 §12).
+pub fn stub_body(reply: std::sync::Arc<BodyReply>) -> (String, Seen) {
     use std::io::{BufRead, BufReader, Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -143,8 +160,9 @@ pub fn stub_with(reply: std::sync::Arc<Reply>) -> (String, Seen) {
                 let (status, body, delay) = {
                     let mut s = s3.lock().unwrap();
                     let n = s.iter().filter(|(_, q, _)| *q == p).count();
+                    let out = reply(&m, &p, n, &v);
                     s.push((m.clone(), p.clone(), v));
-                    reply(&m, &p, n)
+                    out
                 };
                 std::thread::sleep(delay);
                 let mut c = conn;
@@ -206,4 +224,110 @@ pub fn docs_server(data: PathBuf, worker: PathBuf) -> (String, String) {
         });
     });
     rx.recv().unwrap()
+}
+
+/// Копия `cmd::hook::session_start::holdout_pick` (M6 §12; `zam` — только бинарник): сессия `id`
+/// в контрольной группе A/B при доле `p`. Совпадение закреплено значениями `PINNED_HOLDOUT`
+/// юнит-теста `holdout_pick_share_and_determinism` и тестом `hooks::holdout_pick_copy_pinned`.
+pub fn holdout_pick(id: &str, p: f64) -> bool {
+    if p <= 0.0 {
+        return false;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"zam-holdout-v1\0");
+    h.update(id.as_bytes());
+    let b = h.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&b.as_bytes()[..8]);
+    (u64::from_le_bytes(first) as f64 / 18_446_744_073_709_551_616.0) < p
+}
+
+/// Первая сессия `<prefix>-<n>` в контрольной группе (`in_group`) или вне её при `p`.
+pub fn holdout_session(prefix: &str, p: f64, in_group: bool) -> String {
+    (0..10_000)
+        .map(|i| format!("{prefix}-{i}"))
+        .find(|s| holdout_pick(s, p) == in_group)
+        .expect("сессия группы")
+}
+
+/// Времена одного вызова `zam hook …` ([`hook_timed`]).
+///
+/// - `outer` — процесс целиком глазами теста: запуск exe, работа хука, выход. Это то, что ждёт
+///   агент; задержку, общую для любого вызова `zam hook`, видно только здесь.
+/// - `inner` — время внутри процесса от его старта до конца вывода (от того же момента
+///   отсчитывается бюджет хука, §10.3) — тестовый канал `ZAM_TEST_HOOK_TIMING`. Есть в отладочной
+///   сборке и в сборке с фичей `test-hooks`; в release без фичи — `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct HookTimes {
+    pub outer: std::time::Duration,
+    pub inner: Option<std::time::Duration>,
+}
+
+impl HookTimes {
+    /// Время хука для сверки с бюджетом: внутри процесса, а где канала нет — процесс целиком (оно
+    /// не меньше).
+    pub fn hook(&self) -> std::time::Duration {
+        self.inner.unwrap_or(self.outer)
+    }
+
+    /// Запуск и выход процесса (вне бюджета хука); без канала времени — `None`.
+    pub fn launch(&self) -> Option<std::time::Duration> {
+        self.inner.map(|i| self.outer.saturating_sub(i))
+    }
+}
+
+/// Запуск готовой команды `zam hook <kind> …` с замером ([`HookTimes`]). Файл канала времени —
+/// свой на вызов, в каталоге тестов сборки. В отладочной сборке канал обязан сработать (иначе
+/// проверки времени молча вернулись бы к времени процесса целиком).
+pub fn hook_timed(mut c: Command, kind: &str) -> (std::process::Output, HookTimes) {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hook-timing");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("{}-{n}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&file);
+    c.env("ZAM_TEST_HOOK_TIMING", &file);
+    let t = std::time::Instant::now();
+    let o = c.output().unwrap();
+    let outer = t.elapsed();
+    let inner = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|s| {
+            let (k, us) = s.lines().last()?.split_once(' ')?;
+            (k == kind).then(|| us.trim().parse().ok()).flatten()
+        })
+        .map(std::time::Duration::from_micros);
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        inner.is_some() || !cfg!(debug_assertions) || !o.status.success(),
+        "хук {kind} не записал время в {}",
+        file.display()
+    );
+    (o, HookTimes { outer, inner })
+}
+
+/// Сводка серии замеров для журнала: `n`, минимум, p50, p90, p95, максимум, мс.
+pub fn stats(v: &[std::time::Duration]) -> String {
+    if v.is_empty() {
+        return "n=0".into();
+    }
+    let mut s = v.to_vec();
+    s.sort();
+    let q = |p: usize| s[(s.len() * p).div_ceil(100).max(1) - 1].as_secs_f64() * 1000.0;
+    format!(
+        "n={} min={:.1} p50={:.1} p90={:.1} p95={:.1} max={:.1}",
+        s.len(),
+        s[0].as_secs_f64() * 1000.0,
+        q(50),
+        q(90),
+        q(95),
+        s[s.len() - 1].as_secs_f64() * 1000.0
+    )
+}
+
+/// Квантиль серии (ближайший ранг), `p` — проценты.
+pub fn quantile(v: &[std::time::Duration], p: usize) -> std::time::Duration {
+    let mut s = v.to_vec();
+    s.sort();
+    s[(s.len() * p).div_ceil(100).max(1) - 1]
 }

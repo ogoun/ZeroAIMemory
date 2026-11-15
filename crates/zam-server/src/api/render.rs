@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 use zam_core::Id;
 use zam_markdown::{
     HEADER_ID_PREFIX, LinkKind, LinkResolution, RENDER_VERSION, Rendered, Resolver, attachment_ref,
-    highlight_css, parse, render_html, slug,
+    highlight_css, parse, render_html, render_report_html, slug,
 };
 use zam_store::links::{percent_decode, resolve_link};
 use zam_store::{AttachScope, Db, resolve_attachment};
@@ -284,6 +284,17 @@ pub async fn render_with(
     resolver: impl Resolver + Send + 'static,
 ) -> Result<Rendered, ApiError> {
     tokio::task::spawn_blocking(move || render_html(&text, &resolver))
+        .await
+        .map_err(|e| ApiError::aborted("рендер", &e))
+}
+
+/// Рендер тела отчёта с готовым резолвером ([`render_report_html`]: схемы ссылок отчёта);
+/// CPU — в `spawn_blocking`.
+pub async fn render_report_with(
+    text: String,
+    resolver: impl Resolver + Send + 'static,
+) -> Result<Rendered, ApiError> {
+    tokio::task::spawn_blocking(move || render_report_html(&text, &resolver))
         .await
         .map_err(|e| ApiError::aborted("рендер", &e))
 }

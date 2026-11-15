@@ -20,9 +20,23 @@
 //! порогов и задержки `/recall` и хуков ([`hints`]); `--tokens` — расход токенов агента по
 //! сценариям `eval/scenarios.toml` ([`tokens`]).
 //!
+//! Eval M6 (задача 1a1): `--tokens --via mcp --split dev|holdout` — замер ТС-1 через `POST /mcp`
+//! симулированным агентом §3.4 ([`tokens::mcp`]): возможности сервера по версии ([`caps`]),
+//! нагеты и отпечатки с замком `eval/nuggets.lock` ([`nuggets`]), разбиение dev/holdout
+//! ([`split`]), статистика §3.5 ([`metrics`]); `--grid` — точки `[[point]]` (только dev), `--arm`
+//! с `--compare` — сравнение сохранённых плеч.
+//!
+//! Эталон подсказок-идей M5.7 (M6, задача 1a2): `--idea-hints eval/idea-hints.toml --out <json>`
+//! — топ-5 подсказок-идей к `prompt` на идеях корпуса ТС-2 ([`hints::ideas`]).
+//!
+//! Набор ТС-2 «сессия» (M6, задача 4): `--sessions --split dev|holdout [--profile] [--ideas on|off]
+//! [--base B4|B5.6|B5.7]` — сессии `eval/sessions.toml` через `zam hook` и `zam mcp`
+//! ([`sessions`]).
+//!
 //! Eval M4.5 (задача 15): `--glossary` — словарь RU↔EN `eval/glossary.toml`, канал `alias` и
 //! его вес, основной набор со словарём и связями `contradicts` ([`glossary`]).
 
+pub mod caps;
 pub mod compare;
 pub mod corpus;
 pub mod docs;
@@ -32,9 +46,14 @@ pub mod grid;
 pub mod hints;
 pub mod insights;
 pub mod leaves;
+pub mod mcp_client;
 pub mod metrics;
+pub mod nuggets;
 pub mod report;
 pub mod run;
+pub mod sessions;
+pub mod sessions_corpus;
+pub mod split;
 pub mod tokens;
 
 use std::path::{Path, PathBuf};
@@ -76,6 +95,13 @@ impl Mode {
     }
 }
 
+/// Транспорт агента замера токенов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    Mcp,
+}
+
 /// Устройство инференса прогона (`ml.device` сервера).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -93,6 +119,9 @@ impl Device {
     }
 }
 
+// Doc-комментарии полей — справка clap (`--help`): `[search]` — секция конфигурации, а не ссылка
+// rustdoc.
+#[allow(rustdoc::broken_intra_doc_links)]
 /// Аргументы `cargo xtask eval`.
 #[derive(Debug, clap::Args)]
 pub struct EvalArgs {
@@ -113,19 +142,73 @@ pub struct EvalArgs {
     /// поиск Qdrant, `qdrant.exact_search = true`)
     #[arg(long, conflicts_with_all = ["grid", "check", "hints", "tokens"])]
     pub quality_gate: bool,
-    /// Точность подсказок хуков (eval/hints.toml), калибровка порогов, задержки /recall и хуков
-    #[arg(long, conflicts_with_all = ["grid", "check", "tokens"])]
+    /// Точность подсказок хуков (eval/hints.toml), калибровка порогов, задержки /recall и хуков;
+    /// с --grid — сетка порогов подсказок M6 §9 (eval/grid-m6-hints*.toml)
+    #[arg(long, conflicts_with_all = ["check", "tokens"])]
     pub hints: bool,
-    /// Расход токенов агента по сценариям eval/scenarios.toml (протокол §9.3, кэш, chunks)
-    #[arg(long, conflicts_with_all = ["grid", "check"])]
+    /// Расход токенов агента по сценариям eval/scenarios.toml (протокол §9.3, кэш, chunks);
+    /// с --via mcp — замер M6 через MCP (спецификация M6 §3)
+    #[arg(long, conflicts_with = "check")]
     pub tokens: bool,
+    /// Эталон подсказок-идей M5.7 (M6, задача 1a2): набор запросов `prompt` (eval/idea-hints.toml)
+    /// к идеям eval/sessions-corpus/ideas; `--out` — файл JSON эталона; поиск — FTS
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["hints", "tokens", "check", "grid", "glossary", "docs", "quality_gate"]
+    )]
+    pub idea_hints: Option<PathBuf>,
+    /// Транспорт агента --tokens: mcp — ТС-1 M6 через POST /mcp (без флага — REST M4)
+    #[arg(long, value_enum, requires = "tokens")]
+    pub via: Option<Via>,
+    /// Набор ТС-2 «сессия» (M6, eval/sessions.toml): хуки `zam hook`, MCP — `zam mcp`
+    #[arg(
+        long,
+        conflicts_with_all = ["tokens", "hints", "check", "glossary", "docs", "quality_gate", "idea_hints"]
+    )]
+    pub sessions: bool,
+    /// --sessions: только сессии профиля
+    #[arg(long, value_enum, requires = "sessions")]
+    pub profile: Option<sessions::Profile>,
+    /// --sessions: идеи корпуса и `ideas.proactive` (по умолчанию on; у сервера без идей — нет)
+    #[arg(long, value_enum, requires = "sessions")]
+    pub ideas: Option<sessions::Toggle>,
+    /// --sessions: база — бинарники тега target/tags/<тег>/release (вместо --server-bin/--zam-bin)
+    #[arg(long, value_enum, requires = "sessions", conflicts_with_all = ["server_bin", "cli_bin"])]
+    pub base: Option<sessions::Base>,
+    /// --sessions: повторов каждой сессии на свежем сервере (гибрид недетерминирован: K ≥ 3;
+    /// сравнение — по среднему на сессию, шум внутри плеча — в сводке)
+    #[arg(long, default_value_t = 1, requires = "sessions")]
+    pub repeat: usize,
+    /// --sessions: `zam mcp` без ZAM_SESSION_ID и файла привязки (неявный путь R13) и у M6
+    #[arg(long, requires = "sessions")]
+    pub implicit_mcp: bool,
+    /// --sessions: агент хуков (`zam hook --agent`): формат вывода и предел текста канала —
+    /// Claude Code 9000 символов, Codex 7500 байт (ревью 8a M6, C1); по умолчанию claude
+    #[arg(long, value_enum, requires = "sessions")]
+    pub hook_agent: Option<sessions::HookAgent>,
+    /// Часть набора замера M6 (--via mcp, --sessions): dev (подбор, сетки) | holdout (приёмка;
+    /// без --grid)
+    #[arg(long, value_enum)]
+    pub split: Option<split::Part>,
+    /// Файл сценариев вместо eval/scenarios.toml (замок отпечатков — nuggets.lock рядом); с
+    /// --check — проверка только набора ТС-1
+    #[arg(long, value_name = "FILE")]
+    pub scenarios: Option<PathBuf>,
+    /// --via mcp и --sessions без прогона: сохранённое плечо (JSON) сравнивается с каждым
+    /// --compare; у --via mcp можно повторять — повторы одного плеча (K индексаций), тогда
+    /// --compare — повторы базы и сравнение идёт по среднему на сценарий (методика M6, правило 3)
+    #[arg(long, value_name = "FILE")]
+    pub arm: Vec<PathBuf>,
     /// Гейт без справочного прогона fp16 на CUDA (GPU занят): вердикт — по int8 и fp32 на CPU
     #[arg(long, requires = "quality_gate")]
     pub skip_cuda: bool,
-    /// zam для хуков в --hints (по умолчанию собирается `cargo build --release -p zam-cli`)
-    #[arg(long)]
+    /// zam для хуков в --hints и сессий ТС-2 (по умолчанию собирается
+    /// `cargo build --release -p zam-cli`); `--zam-bin` — то же
+    #[arg(long, alias = "zam-bin")]
     pub cli_bin: Option<PathBuf>,
-    /// Подбор весов [search] и порогов чанкинга по сетке из файла (eval/grid.toml)
+    /// Подбор весов [search] и порогов чанкинга по сетке из файла (eval/grid.toml); с --tokens
+    /// --via mcp — точки `[[point]] name, env = { ZAM_… }` (только --split dev)
     #[arg(long, value_name = "FILE", conflicts_with = "check")]
     pub grid: Option<PathBuf>,
     /// Только проверить корпус и запросы (без сервера)
@@ -145,7 +228,8 @@ pub struct EvalArgs {
     /// zam-server (по умолчанию собирается `cargo build --release -p zam-server`)
     #[arg(long)]
     pub server_bin: Option<PathBuf>,
-    /// Каталог результатов (по умолчанию eval/results)
+    /// Каталог результатов (по умолчанию eval/results); с --tokens --via mcp — каталог или
+    /// префикс пути файлов `<префикс>[-<точка>].{json,md}`
     #[arg(long)]
     pub out: Option<PathBuf>,
     /// Каталог корпуса вместо eval/corpus (контрольные прогоны; проверка — как у фрагмента)
@@ -162,6 +246,19 @@ pub struct EvalArgs {
     /// корпусе (target/eval/<прогон>), например с другими весами --set
     #[arg(long)]
     pub reuse: bool,
+    /// Корпус целиком до старта индексатора: загрузка сервером без моделей, затем перезапуск с
+    /// моделью на том же каталоге — состав пачек эмбеддера не зависит от темпа загрузки (M6)
+    #[arg(long, conflicts_with = "reuse")]
+    pub preload: bool,
+    /// --tokens --via mcp: цели корпуса — как у выпуска-базы (`0.0.5-m4`): чего он не умеет
+    /// создать (связь `contradicts`, вложения `eval/docs`), не создаётся и у этого плеча, а
+    /// затронутые сценарии исключаются (спецификация M6 §3.3: из **всех** плеч сравнения)
+    #[arg(long, value_name = "VERSION", requires = "via")]
+    pub targets_of: Option<String>,
+    /// --tokens --via mcp: нагет в L0 сервера — ошибка прогона (приёмка); без флага такой нагет
+    /// исключается из полноты плеча и, в сравнении, обоих плеч (`info.l0_excluded`)
+    #[arg(long)]
+    pub strict_l0: bool,
     /// Префикс имени результата после даты (`--hints` и прогоны `--mode`):
     /// `<дата>-<префикс>-<модель|fts>-…`, например `m45` — итоги этапа под общим префиксом без
     /// ручного переименования (у `--glossary` имена свои)
@@ -185,8 +282,9 @@ pub struct EvalArgs {
     /// --features pdf-oxide)
     #[arg(long, value_enum, default_value_t = docs::extract::PdfBackend::Pdfium, requires = "docs")]
     pub pdf_backend: docs::extract::PdfBackend,
-    /// Каталог набора документов вместо eval/docs
-    #[arg(long, value_name = "DIR", requires = "docs")]
+    /// Каталог набора документов вместо eval/docs (--docs; у --tokens --via mcp — для
+    /// отпечатка корпуса)
+    #[arg(long, value_name = "DIR")]
     pub docs_dir: Option<PathBuf>,
     /// --docs: без заметок eval/corpus (и без замера латентности основного набора)
     #[arg(long, requires = "docs")]
@@ -212,10 +310,14 @@ pub struct Paths {
     pub insights: PathBuf,
     /// `eval/hints.toml` — подсказки хуков (M4).
     pub hints: PathBuf,
-    /// `eval/scenarios.toml` — сценарии расхода токенов (M4).
+    /// `eval/scenarios.toml` — сценарии расхода токенов (M4; ТС-1 M6 с нагетами).
     pub scenarios: PathBuf,
+    /// `eval/docs` — набор документов (M5; входит в отпечаток корпуса ТС-1).
+    pub docs: PathBuf,
     /// `eval/glossary.toml` — словарь и запросы на псевдонимах (M4.5).
     pub glossary: PathBuf,
+    /// `eval/sessions-corpus` — корпус ТС-2 и идей (M6, задача 1c); ТС-1 его не грузит.
+    pub sessions_corpus: PathBuf,
     pub results: PathBuf,
     /// `target/eval` — каталоги данных прогонов.
     pub work: PathBuf,
@@ -236,8 +338,13 @@ impl Paths {
                 .clone()
                 .unwrap_or_else(|| eval.join("insights.toml")),
             hints: eval.join("hints.toml"),
-            scenarios: eval.join("scenarios.toml"),
+            scenarios: a
+                .scenarios
+                .clone()
+                .unwrap_or_else(|| eval.join("scenarios.toml")),
+            docs: a.docs_dir.clone().unwrap_or_else(|| eval.join("docs")),
             glossary: eval.join("glossary.toml"),
+            sessions_corpus: eval.join(corpus::SESSIONS_CORPUS_DIR),
             results: a.out.clone().unwrap_or_else(|| eval.join("results")),
             work: repo.join("target").join("eval"),
         }
@@ -286,6 +393,16 @@ fn print_summary(s: &corpus::Summary) {
             s.with_also
         );
     }
+    if !s.areas.is_empty() || s.gotcha_contradicts > 0 {
+        let areas: Vec<String> = s.areas.iter().map(|(a, n)| format!("{a} {n}")).collect();
+        println!(
+            "набор M6 (§10, §11): целей по областям: {}; пар hypothesis gotcha → theorem \
+             (contradicts) {}, из них с ответом gotcha/failure {}",
+            areas.join(", "),
+            s.gotcha_contradicts,
+            s.gotcha_answer_contradicts
+        );
+    }
 }
 
 /// Полный набор `eval/` (все требования проверки) — без своих корпуса, insight и запросов.
@@ -299,6 +416,29 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
     if a.docs {
         return docs::run(&a, &p);
     }
+    if let Some(f) = &a.idea_hints {
+        return hints::ideas::run(&a, &p, f);
+    }
+    if a.tokens && a.via == Some(Via::Mcp) {
+        return tokens::mcp::main(&a, &p);
+    }
+    if a.sessions {
+        return sessions::main(&a, &p);
+    }
+    if a.split.is_some() || !a.arm.is_empty() {
+        bail!("--split и --arm — только у --tokens --via mcp и --sessions");
+    }
+    if a.tokens && a.grid.is_some() {
+        bail!("--grid с --tokens — только у замера M6 (--via mcp)");
+    }
+    if a.check && a.scenarios.is_some() {
+        // только набор ТС-1 (свой файл сценариев): нагеты, отпечатки, замок
+        let set = tokens::mcp::load_set(&a, &p)?;
+        tokens::mcp::print_set(&set, &p);
+        tokens::mcp::print_foreign(&set, &p);
+        println!("EVAL-CHECK OK");
+        return Ok(());
+    }
     if a.check {
         // фрагмент (--queries) проверяется без требований к полному набору
         let (corpus, _, s) = load_set(&p, full_set(&a))?;
@@ -306,8 +446,8 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
         if full_set(&a) {
             let (set, _) = hints::load_hints(&p.hints)?;
             let h = hints::validate_hints(&set, &corpus)?;
-            let (sc, _) = tokens::load_scenarios(&p.scenarios)?;
-            tokens::validate_scenarios(&sc, &corpus)?;
+            let set = tokens::mcp::load_set(&a, &p)?;
+            let sc = &set.scenarios;
             println!(
                 "набор M4: подсказок {} (релевантных {}, нерелевантных {}), сценариев расхода токенов {}",
                 h.cases,
@@ -315,12 +455,72 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
                 h.irrelevant,
                 sc.len()
             );
+            let buckets: Vec<String> = h
+                .post_tool_buckets
+                .iter()
+                .map(|(b, (r, i))| format!("{b}: {r}/{i}"))
+                .collect();
+            println!(
+                "подсказки M6 §9: post_tool {:?} (рел./нерел.), по длине ошибки — {}",
+                h.by_event.get("post_tool"),
+                buckets.join(", ")
+            );
+            tokens::mcp::print_set(&set, &p);
+            tokens::mcp::print_foreign(&set, &p);
             let (g, _) = glossary::load_glossary(&p.glossary)?;
             glossary::validate_glossary(&g, &corpus, true)?;
             println!(
                 "набор M4.5: терминов словаря {}, запросов на псевдонимах {}",
                 g.term.len(),
                 g.query.len()
+            );
+            let sc = sessions_corpus::load(&p.sessions_corpus)?;
+            let ss = sessions_corpus::validate(&sc)?;
+            let states: Vec<String> = ss
+                .ideas_by_state
+                .iter()
+                .map(|(k, n)| format!("{k} {n}"))
+                .collect();
+            println!(
+                "корпус ТС-2 M6: Rules {}, задач {} (in_progress/blocked {}), вопросов {} \
+                 (отвечено {}), запросов доступа {}, терминов {}, insight {}; идей {} ({}; с \
+                 общим глаголом в заголовке {}, со словом «на стоп-основу» {})",
+                ss.rules,
+                ss.tasks,
+                ss.active_tasks,
+                ss.questions,
+                ss.answered,
+                ss.access,
+                ss.terms,
+                ss.insights,
+                ss.ideas,
+                states.join(", "),
+                ss.stop_verb_ideas,
+                ss.false_friend_ideas
+            );
+            let iq = hints::ideas::load_queries(&p.repo.join("eval").join("idea-hints.toml"))?;
+            let is = hints::ideas::validate_queries(&iq, &sc)?;
+            println!(
+                "набор подсказок-идей M6 (эталон M5.7): запросов {} (положительных {}, \
+                 отрицательных {}, общих глаголов {}, длинных {}), состояний идей {}",
+                is.queries,
+                is.positive,
+                is.negative,
+                is.stop_verb,
+                is.long,
+                is.states.len()
+            );
+            let set = sessions::load_set(&p.repo.join("eval").join("sessions.toml"))?;
+            let ts2 = sessions::validate_set(&set, &sc)?;
+            println!(
+                "набор ТС-2 M6: сессий {} (стандартных {}, тяжёлых {}), событий {:?}, prompt с \
+                 подсказкой-идеей {}, нагетов {}",
+                ts2.sessions,
+                ts2.standard,
+                ts2.heavy,
+                ts2.events,
+                ts2.prompts_with_idea,
+                ts2.nuggets
             );
         }
         println!("EVAL-CHECK OK");
@@ -332,6 +532,9 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
         return gate::run(&a, &p, &corpus, &queries);
     }
     if a.hints {
+        if let Some(g) = &a.grid {
+            return hints::grid::run(&a, &p, &corpus, g);
+        }
         return hints::run(&a, &p, &corpus, &queries);
     }
     if a.tokens {
@@ -347,4 +550,13 @@ pub fn main(a: EvalArgs, repo: &Path) -> Result<()> {
         bail!("укажите --mode");
     }
     run::run_modes(&a, &p, &corpus, &queries)
+}
+
+/// Корень репозитория для тестов модулей eval.
+#[cfg(test)]
+pub(crate) fn tests_repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("корень репозитория")
+        .to_path_buf()
 }

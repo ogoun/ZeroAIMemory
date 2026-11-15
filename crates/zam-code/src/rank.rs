@@ -15,6 +15,10 @@
 //!
 //! Функции чистые: сервер считает их в `spawn_blocking`, хранит ранги файлов и доли символов;
 //! персонализация — [`rank_on_graph`] по [`Graph`] из тех же входов.
+//!
+//! **Веса ссылок (M6 §12а)** — [`RankWeights::M6`]: вид ссылки по таблице `ref_kind_weight`
+//! (тип и реализация ×2), вызов по получателю ×0,25. Входы старого клиента (`recv_count = 0`)
+//! дают те же ранги, что M5.7 с той же таблицей видов; [`RankWeights::M57`] — ранги M5.7 целиком.
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,8 +51,9 @@ pub struct RankFile {
     pub path: String,
     /// `(name, kind, exported)` в порядке символов файла.
     pub defs: Vec<(String, SymbolKind, Option<bool>)>,
-    /// `(name, kind, count)` — как `RefAgg` протокола; виды одного имени складываются.
-    pub refs: Vec<(String, RefKind, u32)>,
+    /// `(name, kind, count, recv_count)` — как `RefAgg` протокола (`recv_count` нет — 0); виды
+    /// одного имени складываются с весом вида ([`ref_kind_weight`], M6 §12а).
+    pub refs: Vec<(String, RefKind, u32, u32)>,
 }
 
 /// Фокус карты (§7, §9): пути, имена и свободный текст задачи.
@@ -90,19 +95,66 @@ pub fn ident_mult(name: &str, defined_in: usize) -> f64 {
     m
 }
 
-/// Вес вида ссылки в счётчике `c` (§7: виды равны). Точка для весов по `RefKind`
-/// (журнал этапа, ревью задачи 2, кандидат (c)) без смены интерфейса.
-fn ref_kind_weight(_kind: RefKind) -> f64 {
-    1.0
+/// Вес вида ссылки в счётчике `c` — фиксированная таблица M6 §12а (объявлена до замера и под
+/// набор не подгоняется): тип (параметр, поле, возвращаемый тип, аннотация) и реализация — 2,0;
+/// прямой вызов, импорт, прочее — 1,0. Вызов по получателю — [`RECV_CALL_WEIGHT`].
+fn ref_kind_weight(kind: RefKind) -> f64 {
+    match kind {
+        RefKind::Type | RefKind::Impl => 2.0,
+        RefKind::Call | RefKind::Import | RefKind::Other => 1.0,
+    }
 }
 
-/// Ссылки файла по имени: `(name, c)`, где `c` — сумма `count` по видам с весом вида; по имени.
-fn agg_refs(file: &RankFile) -> Vec<(&str, f64)> {
+/// Вес вызова по получателю (`x.f()`, `self.f()`, `a.b.f()`; M6 §12а): такие вызовы стекаются к
+/// немногим файлам, где имя определено методом (`is_empty`, `len`).
+const RECV_CALL_WEIGHT: f64 = 0.25;
+
+/// Правила весов ссылок. Продукт — только [`RankWeights::M6`]; прочие — для справочной абляции
+/// замера (`cargo xtask code-bench`, M6 §12а): выбор из абляции не делается.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankWeights {
+    /// Таблица весов вида [`ref_kind_weight`]; `false` — все виды 1,0 (как M5.7).
+    pub kind_table: bool,
+    /// Вызов по получателю с весом [`RECV_CALL_WEIGHT`]; `false` — как прямой (как M5.7).
+    pub recv: bool,
+}
+
+impl RankWeights {
+    /// Правила M6 (§12а).
+    pub const M6: RankWeights = RankWeights {
+        kind_table: true,
+        recv: true,
+    };
+    /// Правила M5.7: виды равны, получатель не различается.
+    pub const M57: RankWeights = RankWeights {
+        kind_table: false,
+        recv: false,
+    };
+
+    /// Вклад ссылки в счётчик `c`: `count` с весом вида; у `call` —
+    /// `(count − recv) × 1,0 + recv × 0,25` (`recv` не больше `count`).
+    fn contribution(self, kind: RefKind, count: u32, recv: u32) -> f64 {
+        let k = if self.kind_table {
+            ref_kind_weight(kind)
+        } else {
+            1.0
+        };
+        if self.recv && kind == RefKind::Call {
+            let r = recv.min(count);
+            k * f64::from(count - r) + RECV_CALL_WEIGHT * f64::from(r)
+        } else {
+            k * f64::from(count)
+        }
+    }
+}
+
+/// Ссылки файла по имени: `(name, c)`, где `c` — сумма вкладов по видам
+/// ([`RankWeights::contribution`]); по имени.
+fn agg_refs(file: &RankFile, w: RankWeights) -> Vec<(&str, f64)> {
     let mut by_name: HashMap<&str, f64> = HashMap::new();
-    for (name, kind, count) in &file.refs {
+    for (name, kind, count, recv) in &file.refs {
         if *count > 0 {
-            *by_name.entry(name.as_str()).or_default() +=
-                ref_kind_weight(*kind) * f64::from(*count);
+            *by_name.entry(name.as_str()).or_default() += w.contribution(*kind, *count, *recv);
         }
     }
     let mut out: Vec<_> = by_name.into_iter().collect();
@@ -144,9 +196,14 @@ pub struct Graph<'a> {
 }
 
 impl<'a> Graph<'a> {
-    /// Граф из входов ранжирования; ссылки на неопределённые имена и на имена, определённые
-    /// только в самом файле, рёбер не дают.
+    /// Граф из входов ранжирования по правилам M6; ссылки на неопределённые имена и на имена,
+    /// определённые только в самом файле, рёбер не дают.
     pub fn new(files: &'a [RankFile]) -> Graph<'a> {
+        Graph::with_weights(files, RankWeights::M6)
+    }
+
+    /// Граф с правилами весов `w` (абляция замера; продукт — [`Graph::new`]).
+    pub fn with_weights(files: &'a [RankFile], w: RankWeights) -> Graph<'a> {
         let total_defs: usize = files.iter().map(|f| f.defs.len()).sum();
         let mut ids: HashMap<&'a str, usize> = HashMap::new();
         ids.reserve(total_defs);
@@ -198,11 +255,11 @@ impl<'a> Graph<'a> {
         let mut by_id: Vec<(usize, f64)> = Vec::new();
         for (a, f) in files.iter().enumerate() {
             by_id.clear();
-            for (name, kind, count) in &f.refs {
+            for (name, kind, count, recv) in &f.refs {
                 if *count > 0
                     && let Some(&id) = ids.get(name.as_str())
                 {
-                    by_id.push((id, ref_kind_weight(*kind) * f64::from(*count)));
+                    by_id.push((id, w.contribution(*kind, *count, *recv)));
                 }
             }
             by_id.sort_unstable_by_key(|x| x.0);
@@ -374,6 +431,7 @@ pub fn rank_on_graph(g: &Graph<'_>, restart: Option<&[f64]>) -> Vec<f64> {
 /// с индексами входного среза, по убыванию веса, при равенстве — по `(src, dst)`. `d(name)` —
 /// по всем файлам. Стоимость — O(ссылок показанных × определителей).
 pub fn edges_among(files: &[RankFile], shown: &[usize]) -> Vec<(usize, usize, f64)> {
+    let w = RankWeights::M6;
     let in_shown: HashSet<usize> = shown.iter().copied().filter(|&i| i < files.len()).collect();
     let mut d: HashMap<&str, usize> = HashMap::new();
     let mut shown_definers: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -392,7 +450,7 @@ pub fn edges_among(files: &[RankFile], shown: &[usize]) -> Vec<(usize, usize, f6
     let mut src: Vec<usize> = in_shown.iter().copied().collect();
     src.sort_unstable();
     for a in src {
-        for (name, c) in agg_refs(&files[a]) {
+        for (name, c) in agg_refs(&files[a], w) {
             let Some(defs) = shown_definers.get(name) else {
                 continue;
             };
@@ -523,7 +581,12 @@ fn shares(file: &RankFile, inflow: &[f64], same: &[f64]) -> Vec<f64> {
 /// ранжирования и при `focus` умножает их на [`rank_on_graph`] с [`focus_restart`] — так ранги
 /// символов с фокусом и без сопоставимы, а пересчитывать доли на каждый запрос не нужно.
 pub fn rank(files: &[RankFile], focus: Option<&Focus>) -> Ranked {
-    let g = Graph::new(files);
+    rank_with(files, focus, RankWeights::M6)
+}
+
+/// [`rank`] с правилами весов `w` — справочная абляция замера (M6 §12а); продукт — [`rank`].
+pub fn rank_with(files: &[RankFile], focus: Option<&Focus>, w: RankWeights) -> Ranked {
+    let g = Graph::with_weights(files, w);
     let restart = focus.and_then(|f| focus_restart(files, f));
     let file_rank = rank_on_graph(&g, restart.as_deref());
     let mut flow = vec![0.0; g.names()];

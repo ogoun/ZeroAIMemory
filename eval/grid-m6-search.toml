@@ -1,0 +1,49 @@
+# Сетка M6 §3.5 п. 1 (задача 5): `search.budget_tokens` {400, 600, 800} × `search.brief_min_rel`
+# {0; 0,4; 0,5} на dev ТС-1, гибрид bge-m3 fp16 CUDA:
+#   cargo xtask eval --tokens --via mcp --split dev --grid eval/grid-m6-search.toml
+# Один индекс на все точки: каждая точка — свежая копия проиндексированного каталога (план,
+# «Методика замера при недетерминизме», правило 1). Первая точка — база (умолчания v0.0.9:
+# 800 и 0), вторая — она же (A/A-гейт, правило 2: после устранения источника недетерминизма в
+# задаче 5 гибрид на одном индексе обязан совпасть побайтово). Правило выбора — §3.5: среди точек,
+# где на dev выполнены условия неинфериорности, — самая дешёвая; разница токенов ≤ 2 % — больший
+# бюджет.
+
+[[point]]
+name = "b800-r0"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "800", ZAM_SEARCH__BRIEF_MIN_REL = "0" }
+
+[[point]]
+name = "b800-r0-aa"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "800", ZAM_SEARCH__BRIEF_MIN_REL = "0" }
+
+[[point]]
+name = "b800-r0.4"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "800", ZAM_SEARCH__BRIEF_MIN_REL = "0.4" }
+
+[[point]]
+name = "b800-r0.5"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "800", ZAM_SEARCH__BRIEF_MIN_REL = "0.5" }
+
+[[point]]
+name = "b600-r0"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "600", ZAM_SEARCH__BRIEF_MIN_REL = "0" }
+
+[[point]]
+name = "b600-r0.4"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "600", ZAM_SEARCH__BRIEF_MIN_REL = "0.4" }
+
+[[point]]
+name = "b600-r0.5"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "600", ZAM_SEARCH__BRIEF_MIN_REL = "0.5" }
+
+[[point]]
+name = "b400-r0"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "400", ZAM_SEARCH__BRIEF_MIN_REL = "0" }
+
+[[point]]
+name = "b400-r0.4"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "400", ZAM_SEARCH__BRIEF_MIN_REL = "0.4" }
+
+[[point]]
+name = "b400-r0.5"
+env = { ZAM_SEARCH__BUDGET_TOKENS = "400", ZAM_SEARCH__BRIEF_MIN_REL = "0.5" }

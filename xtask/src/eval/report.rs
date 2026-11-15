@@ -360,3 +360,585 @@ pub fn write_pair<T: Serialize>(
     fs::write(&mdp, md)?;
     Ok((json, mdp))
 }
+
+/// Markdown плеча замера M6 (`eval --tokens --via mcp`, спецификация M6 §3.6).
+pub fn tokens_m6_md(r: &super::tokens::mcp::McpResult) -> String {
+    let i = &r.info;
+    let u = &r.summary;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "# Замер токенов M6 (ТС-1, MCP): {} {} — {}{} ({})\n",
+        i.model.as_deref().unwrap_or("fts"),
+        i.device.as_deref().unwrap_or("—"),
+        i.split,
+        i.point
+            .as_deref()
+            .map_or(String::new(), |p| format!(", точка {p}")),
+        i.date
+    );
+    let _ = writeln!(
+        s,
+        "Коммит `{}`, сервер {}{} (git `{}`); отпечатки: корпус `{}`, нагеты `{}`{}; чтение — \
+         бюджет {}; токены — {}.\n",
+        i.git,
+        i.server_version,
+        if i.server_m6 {
+            format!(" (сборка M6, features {:?})", i.server_features)
+        } else {
+            String::new()
+        },
+        i.server_git.as_deref().unwrap_or("—"),
+        i.corpus_fingerprint,
+        i.nuggets_fingerprint,
+        if i.frozen {
+            " (заморожены)"
+        } else {
+            " (замка нет)"
+        },
+        i.read_budget,
+        i.counter
+    );
+    if !i.overrides.is_empty() || !i.overrides_dropped.is_empty() {
+        let kept: Vec<String> = i
+            .overrides
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        let _ = writeln!(
+            s,
+            "Переопределения: {}; отброшены (нет в версии сервера; к сравнению плечо не \
+             допускается): {}.\n",
+            if kept.is_empty() {
+                "—".into()
+            } else {
+                kept.join(", ")
+            },
+            if i.overrides_dropped.is_empty() {
+                "—".into()
+            } else {
+                i.overrides_dropped.join(", ")
+            }
+        );
+    }
+    if !i.excluded.is_empty() {
+        let _ = writeln!(s, "Не созданы у сервера: {}.\n", i.excluded.join("; "));
+    }
+    if !i.excluded_scenarios.is_empty() {
+        let _ = writeln!(
+            s,
+            "Исключено из сравнения всех плеч: {}.\n",
+            i.excluded_scenarios.join("; ")
+        );
+    }
+    if !i.l0_excluded.is_empty() {
+        let l: Vec<String> = i
+            .l0_excluded
+            .iter()
+            .map(|e| format!("{}#{} {}", e.scenario, e.nugget, e.source))
+            .collect();
+        let _ = writeln!(
+            s,
+            "Нагеты в L0 сервера (вне полноты; в сравнении — обоих плеч): {}.\n",
+            l.join("; ")
+        );
+    }
+    let _ = writeln!(
+        s,
+        "| Путь | токенов всего | в среднем на сценарий | микро-полнота | полных |\n|---|---:|---|---:|---:|"
+    );
+    let mean = |e: &Option<Estimate>| {
+        e.as_ref().map_or("—".into(), |e| {
+            format!("{:.0} [{:.0}–{:.0}]", e.mean, e.lo, e.hi)
+        })
+    };
+    for (name, p) in [
+        (
+            "(а) протокол: brief → read → дочитывание → cache put",
+            &u.protocol,
+        ),
+        ("справочно: карточки 1–3 без оракула", &u.reference),
+        ("(в) наивный: chunks, бюджет 4000", &u.naive),
+    ] {
+        let _ = writeln!(
+            s,
+            "| {name} | {} | {} | {:.3} | {} из {} |",
+            p.tokens_total,
+            mean(&p.tokens_mean),
+            p.micro_recall,
+            p.full,
+            u.scenarios
+        );
+    }
+    let _ = writeln!(
+        s,
+        "| (б) повтор: кэш | {} | — | — | {} из {} |",
+        u.cached.tokens_total, u.cached.full, u.scenarios
+    );
+    if let Some(p) = &u.focus {
+        let _ = writeln!(
+            s,
+            "| справочно: явный фокус (`~T` > `read.focus_min_tokens`) | {} | {} | {:.3} | {} из {} |",
+            p.tokens_total,
+            mean(&p.tokens_mean),
+            p.micro_recall,
+            p.full,
+            u.scenarios
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\nСценариев {}, нагетов {}; (а) / (в): {}; выжимки агента (вывод, не ответ сервера): {} \
+         токенов; чужих попаданий в кэш (первая строка (а) или (в) — выжимка): {}.\n",
+        u.scenarios,
+        u.nuggets_total,
+        u.protocol_to_naive.as_ref().map_or("—".into(), est),
+        u.summary_tokens_total,
+        u.foreign_cache_hits
+    );
+    let _ = writeln!(
+        s,
+        "| id | вид | (а) токены | нагеты | дочитано | справочно | (в) | примечание |\n|---|---|---:|---|---|---:|---:|---|"
+    );
+    for x in &r.scenarios {
+        let note: Vec<&str> = [
+            &x.protocol.note,
+            &x.reference.note,
+            &x.naive.note,
+            &x.cached.note,
+        ]
+        .into_iter()
+        .filter(|n| !n.is_empty())
+        .map(String::as_str)
+        .collect();
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {}/{} | {} | {} | {} | {} |",
+            x.id,
+            x.kind,
+            x.protocol.tokens,
+            x.protocol.found,
+            x.nuggets_total,
+            x.protocol.reread.len(),
+            x.reference.tokens,
+            x.naive.tokens,
+            note.join("; ")
+        );
+    }
+    s
+}
+
+/// Markdown сравнения плеча с базой (спецификация M6 §3.5).
+pub fn comparison_md(c: &super::tokens::mcp::Comparison) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "\n## {} против {} ({}, сценариев {})\n",
+        c.arm, c.base, c.split, c.scenarios
+    );
+    let _ = writeln!(
+        s,
+        "- R = Σ плеча / Σ базы = {} / {}: {} (95 %, парный бутстреп сценариев);",
+        c.arm_tokens,
+        c.base_tokens,
+        c.r.as_ref().map_or("—".into(), est)
+    );
+    let _ = writeln!(
+        s,
+        "- микро-полнота: база {:.3}, плечо {:.3}; Δ {} (односторонние 95 % границы; порог \
+         нижней ≥ {});",
+        c.base_micro,
+        c.arm_micro,
+        c.d_micro.as_ref().map_or("— (нагетов нет)".into(), est),
+        super::tokens::mcp::MIN_D_MICRO
+    );
+    let _ = writeln!(
+        s,
+        "- чистые потери L = {} (порог ≤ {}); неинфериорность: {}.",
+        c.net_losses,
+        super::tokens::mcp::MAX_NET_LOSSES,
+        if c.noninferior { "да" } else { "нет" }
+    );
+    let _ = writeln!(
+        s,
+        "- бутстреп: {} выборок, зерно {:#x}.",
+        c.bootstrap.samples, c.bootstrap.seed
+    );
+    if !c.only_base.is_empty() || !c.only_arm.is_empty() {
+        let _ = writeln!(
+            s,
+            "- вне сравнения: только в базе {:?}, только в плече {:?}.",
+            c.only_base, c.only_arm
+        );
+    }
+    if !c.l0_excluded.is_empty() {
+        let l: Vec<String> = c
+            .l0_excluded
+            .iter()
+            .map(|e| format!("{}#{} {}", e.scenario, e.nugget, e.source))
+            .collect();
+        let _ = writeln!(
+            s,
+            "- нагеты в L0 сервера хотя бы одного плеча — вне полноты обоих: {}.",
+            l.join("; ")
+        );
+    }
+    s
+}
+
+/// Сравнение повторов ТС-1 по среднему на сценарий (методика M6, правило 3).
+pub fn reps_comparison_md(c: &super::tokens::mcp::RepsComparison) -> String {
+    let mut s = String::new();
+    let opt = |e: &Option<Estimate>| e.as_ref().map_or("—".into(), est);
+    let p95 = |x: Option<f64>| x.map_or("—".into(), |v| format!("{v:.4}"));
+    let _ = writeln!(
+        s,
+        "\n## {} против {} ({}, сценариев {}, по среднему на сценарий)\n",
+        c.arm, c.base, c.split, c.scenarios
+    );
+    let _ = writeln!(
+        s,
+        "- R = Σ средних плеча / Σ средних базы = {:.1} / {:.1}: {} (95 %, парный бутстреп \
+         сценариев);",
+        c.arm_tokens_mean,
+        c.base_tokens_mean,
+        opt(&c.r)
+    );
+    let _ = writeln!(
+        s,
+        "- микро-полнота (доли — средние повторов): база {:.3}, плечо {:.3}; Δ {} (односторонние \
+         95 % границы; порог нижней ≥ {});",
+        c.base_micro,
+        c.arm_micro,
+        c.d_micro.as_ref().map_or("— (нагетов нет)".into(), est),
+        super::tokens::mcp::MIN_D_MICRO
+    );
+    let _ = writeln!(
+        s,
+        "- чистые потери L = {} по полноте «в большинстве повторов» (порог ≤ {}), справочно «во \
+         всех повторах» — {}; неинфериорность: {}.",
+        c.net_losses,
+        super::tokens::mcp::MAX_NET_LOSSES,
+        c.net_losses_all_reps,
+        if c.noninferior { "да" } else { "нет" }
+    );
+    let _ = writeln!(
+        s,
+        "- порог шума A/A (p95 |повтор − среднее| / среднее по сценариям): база {}, плечо {};",
+        p95(c.noise_base_p95),
+        p95(c.noise_arm_p95)
+    );
+    if !c.excluded.is_empty() {
+        let _ = writeln!(s, "- исключены из сравнения: {:?};", c.excluded);
+    }
+    let _ = writeln!(
+        s,
+        "- бутстреп: {} выборок, зерно {:#x}.\n",
+        c.bootstrap.samples, c.bootstrap.seed
+    );
+    let _ = writeln!(
+        s,
+        "| пара повторов | R [95 %] | Δ микро [одностор.] | L | неинф. |"
+    );
+    let _ = writeln!(s, "|---|---|---|---:|---|");
+    for p in &c.pairs {
+        let _ = writeln!(
+            s,
+            "| {} / {} | {} | {} | {} | {} |",
+            p.arm,
+            p.base,
+            opt(&p.r),
+            opt(&p.d_micro),
+            p.net_losses,
+            if p.noninferior { "да" } else { "нет" }
+        );
+    }
+    if !c.l0_excluded.is_empty() {
+        let l: Vec<String> = c
+            .l0_excluded
+            .iter()
+            .map(|e| format!("{}#{} {}", e.scenario, e.nugget, e.source))
+            .collect();
+        let _ = writeln!(
+            s,
+            "\n- нагеты в L0 сервера хотя бы одного файла — вне полноты всех: {}.",
+            l.join("; ")
+        );
+    }
+    s
+}
+
+/// `found/total (0.750)`.
+fn tally(t: &super::sessions::Tally) -> String {
+    match t.share() {
+        Some(x) => format!("{}/{} ({x:.3})", t.found, t.total),
+        None => "—".into(),
+    }
+}
+
+/// Строки сводки ТС-2 (общие у плеча и сравнения).
+fn sessions_summary_md(s: &mut String, name: &str, x: &super::sessions::SessionsSummary) {
+    let kv = |m: &std::collections::BTreeMap<String, usize>| -> String {
+        if m.is_empty() {
+            return "0".into();
+        }
+        m.iter()
+            .map(|(l, n)| format!("{l} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = writeln!(
+        s,
+        "- **{name}**: сессий {}{}, токенов {} ({}); обязательные строки {}; нагеты вопросов {}; \
+         дайджест при двух стартах {}",
+        x.sessions,
+        if x.reps > 1 {
+            format!(" × {} повторов", x.reps)
+        } else {
+            String::new()
+        },
+        x.tokens_total,
+        kv(&x.tokens_by_label),
+        tally(&x.required),
+        tally(&x.nuggets),
+        tally(&x.digest_match)
+    );
+    let kinds: Vec<String> = x
+        .hint_by_kind
+        .iter()
+        .map(|(k, t)| {
+            let st = x.hint_by_kind_strict.get(k).copied().unwrap_or_default();
+            format!("{k} {} (строго {})", tally(t), tally(&st))
+        })
+        .collect();
+    let _ = writeln!(
+        s,
+        "  - hint_recall общий {} (строго в событии {}); подсказки-идеи {} (строго {}); по видам: \
+         {}; зачёт: {}",
+        tally(&x.hint_recall),
+        tally(&x.hint_recall_strict),
+        tally(&x.idea_hint_recall),
+        tally(&x.idea_hint_recall_strict),
+        kinds.join("; "),
+        kv(&x.hint_credit)
+    );
+    let _ = writeln!(
+        s,
+        "  - повторная выдача {} (между каналами {}); идеи: {}; снимок сессии: {}; раздел Rules: \
+         {}{}{}",
+        tally(&x.repeated),
+        tally(&x.repeated_cross),
+        kv(&x.idea_tokens),
+        kv(&x.snapshot_tokens),
+        kv(&x.rules_tokens),
+        x.rep_noise_p95.map_or(String::new(), |p| format!(
+            "; шум повторов (p95 |Δ|/среднее сессии): {p:.4}"
+        )),
+        if x.bad_outputs > 0 || x.hook_budget_misses > 0 {
+            format!(
+                "; неразобранных выводов хука: {}, хуков сверх бюджета: {}",
+                x.bad_outputs, x.hook_budget_misses
+            )
+        } else {
+            String::new()
+        }
+    );
+    if x.required_by_rep.len() > 1 {
+        let worst = x
+            .required_by_rep
+            .iter()
+            .min_by(|a, b| {
+                let (sa, sb) = (a.1.share().unwrap_or(1.0), b.1.share().unwrap_or(1.0));
+                sa.total_cmp(&sb)
+            })
+            .map(|(r, t)| format!("r{r} {}", tally(t)))
+            .unwrap_or_default();
+        let _ = writeln!(s, "  - обязательные строки, худший повтор: {worst}");
+    }
+    if !x.reps_with_misses.is_empty() {
+        let _ = writeln!(
+            s,
+            "  - повторы с промахом бюджета хука или неразобранным выводом (действительны; блокируют \
+             приёмку 13b): {}",
+            x.reps_with_misses.join(", ")
+        );
+    }
+    if !x.required_missing.is_empty() {
+        let _ = writeln!(s, "  - нет строк: {}", x.required_missing.join("; "));
+    }
+}
+
+/// Отчёт плеча ТС-2 (спецификация M6 §3.6).
+pub fn sessions_md(r: &super::sessions::SessionsResult) -> String {
+    let i = &r.info;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "# ТС-2 «сессия» — {} ({}, сервер {}, {}, идеи {}, MCP {})\n",
+        i.date,
+        i.split,
+        i.server_version,
+        i.model.as_deref().unwrap_or("fts"),
+        if i.ideas_flag { "on" } else { "off" },
+        i.mcp
+    );
+    let _ = writeln!(s, "- возможности: {:?}", i.feats);
+    let _ = writeln!(
+        s,
+        "- не воспроизводятся у сервера: {:?}; классы строк, которых нет: {:?}; виды \
+         обязательных строк, которых нет: {:?}",
+        i.exclusions.labels, i.exclusions.classes, i.exclusions.required
+    );
+    for n in &i.notes {
+        let _ = writeln!(s, "- {n}");
+    }
+    sessions_summary_md(&mut s, "итог", &r.summary);
+    let _ = writeln!(
+        s,
+        "\n| Сессия | профиль | токенов | обязательные | hint общий | идеи | нагеты | дайджест = |\n\
+         |---|---|---:|---|---|---|---|---|"
+    );
+    for x in &r.sessions {
+        let one = super::sessions::summarize(
+            std::slice::from_ref(x),
+            &super::sessions::own_exclusions(&r.info.feats),
+        );
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            x.id,
+            x.profile,
+            one.tokens_total,
+            tally(&one.required),
+            tally(&one.hint_recall),
+            tally(&one.idea_hint_recall),
+            tally(&one.nuggets),
+            match x.digest_match {
+                Some(true) => "да",
+                Some(false) => "нет",
+                None => "—",
+            }
+        );
+    }
+    let notes: Vec<String> = r
+        .sessions
+        .iter()
+        .flat_map(|x| x.notes.iter().map(move |n| format!("{}: {n}", x.id)))
+        .collect();
+    if !notes.is_empty() {
+        let _ = writeln!(s, "\nПримечания:");
+        for n in notes {
+            let _ = writeln!(s, "- {n}");
+        }
+    }
+    s
+}
+
+/// Сравнение плеч ТС-2 на пересечении событий (§3.3): весь набор и профили.
+pub fn sessions_comparison_md(c: &super::sessions::SessionsComparison) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "\n## ТС-2: {} ({}) против {} ({})\n",
+        c.arm_name, c.arm_server, c.base_name, c.base_server
+    );
+    let _ = writeln!(
+        s,
+        "- исключено из обоих плеч: события {:?}; классы строк {:?}; обязательные строки {:?}; \
+         ожидания {:?}",
+        c.exclusions.labels, c.exclusions.classes, c.exclusions.required, c.exclusions.expect
+    );
+    let d = |e: &Option<super::metrics::Estimate>| e.as_ref().map_or("—".into(), est);
+    for p in &c.parts {
+        let _ = writeln!(
+            s,
+            "\n### {} (сессий {})\n\n| Событие | база | плечо | R |\n|---|---:|---:|---|",
+            p.part,
+            p.sessions.len()
+        );
+        for l in p.by_label.iter().chain(std::iter::once(&p.total)) {
+            let _ = writeln!(
+                s,
+                "| {} | {:.0} | {:.0} | {} |",
+                l.label,
+                l.base,
+                l.arm,
+                l.r.as_ref().map_or("—".into(), est)
+            );
+        }
+        let _ = writeln!(
+            s,
+            "\n- Δ (плечо − база, общие элементы, доли сессий — среднее по повторам, односторонние \
+             95 %): hint_recall {}, строго {}, обязательные строки {}",
+            d(&p.d_hint_recall),
+            d(&p.d_hint_recall_strict),
+            d(&p.d_required)
+        );
+        sessions_summary_md(&mut s, "база", &p.base_summary);
+        sessions_summary_md(&mut s, "плечо", &p.arm_summary);
+    }
+    if !c.parts_no_rules.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n### Без раздела Rules (резерв `session_start`/`recovery` вычтен в обоих плечах; §17 \
+             п. 2, решение 10)\n\n| Часть | база | плечо | R | session_start R | recovery R |\n\
+             |---|---:|---:|---|---|---|"
+        );
+        for p in &c.parts_no_rules {
+            let by = |l: &str| {
+                p.by_label
+                    .iter()
+                    .find(|x| x.label == l)
+                    .and_then(|x| x.r.as_ref())
+                    .map_or("—".into(), est)
+            };
+            let _ = writeln!(
+                s,
+                "| {} ({}) | {:.0} | {:.0} | {} | {} | {} |",
+                p.part,
+                p.sessions.len(),
+                p.total.base,
+                p.total.arm,
+                p.total.r.as_ref().map_or("—".into(), est),
+                by("session_start"),
+                by("recovery")
+            );
+        }
+    }
+    let _ = writeln!(s);
+    if let Some(m) = &c.idea_hints_match {
+        let _ = writeln!(s, "- подсказки-идеи prompt совпали с базой: {}", tally(m));
+    }
+    if let Some(p) = c.abs_rel_diff_p95 {
+        let _ = writeln!(
+            s,
+            "- |Δ| / база токенов сессии, 95-й перцентиль: {p:.4}{}",
+            if c.same_server {
+                " — порог шума A/A (плечи одной версии)"
+            } else {
+                ""
+            }
+        );
+    }
+    let _ = writeln!(
+        s,
+        "- бутстреп: {} выборок, зерно {:#x} (парный по сессиям; токены сессии — среднее по \
+         повторам).",
+        c.bootstrap_samples, c.bootstrap_seed
+    );
+    // журнал задачи 7a, «→ 8b/13»: пометка «уже выдавалось» есть только у M6
+    let _ = writeln!(
+        s,
+        "- повторная выдача — справочно и смещена в пользу M6: повтор `/read` с пометкой «уже \
+         выдавалось» считается помеченным, у плеча без пометки (до M6) тот же повтор — \
+         неотмеченным."
+    );
+    if !c.only_base.is_empty() || !c.only_arm.is_empty() {
+        let _ = writeln!(
+            s,
+            "- вне сравнения: только в базе {:?}, только в плече {:?}.",
+            c.only_base, c.only_arm
+        );
+    }
+    s
+}

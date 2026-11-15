@@ -344,7 +344,7 @@ async fn recall_prompt_term_hint_once() {
     let text = j["text"].as_str().unwrap();
     assert!(
         text.contains(&format!(
-            "ZeroAIMemory: термин «Выжимка» — Определение: Выжимка — t:{t1}"
+            "ZeroAIMemory: термин «Выжимка» — Определение: Выжимка t:{t1}"
         )),
         "{text}"
     );

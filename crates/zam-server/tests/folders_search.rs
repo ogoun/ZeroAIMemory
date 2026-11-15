@@ -277,7 +277,7 @@ async fn folder_cards_only_with_kind_folder_and_capped() {
             .is_some_and(|l| l.contains("mirror")),
         "{j}"
     );
-    // md: `f:<id> <пространство>/<путь>/  [score] · <N> детей`
+    // md: `f:<id> <пространство>/<путь>/  [score] <N> детей` (карточка v2, M6 §4.1)
     let r = a
         .t(
             Method::POST,
@@ -291,7 +291,7 @@ async fn folder_cards_only_with_kind_folder_and_capped() {
         t.starts_with(&format!("1. f:{id} Knowledge/astronomy/  [")),
         "{t}"
     );
-    assert!(t.contains("] · 3 детей\n"), "{t}");
+    assert!(t.contains("] 3 детей\n"), "{t}");
     assert_eq!(t.matches(". f:").count(), 2, "{t}");
 }
 

@@ -8,7 +8,11 @@
 //! `zam read --locator` → превью листа и миниатюра PDF; для Windows — статический CRT наших exe
 //! и app-local MSVC runtime библиотек (в том числе pdfium); карта кода (M5.6): `zam code sync`
 //! проекта из трёх файлов, `/code/status`, `zam code map` и `zam code sym`; идеи (M5.7):
-//! `zam idea new` → раздел `### Идеи` хука `session-start` → `zam idea accept` → задача.
+//! `zam idea new` → раздел `### Идеи` хука `session-start` → `zam idea accept` → задача;
+//! M6: `zam read --focus` длинной заметки, учёт сессии (`zam sessions tokens`), снимок сессии
+//! из журнала-фикстуры (`zam session snapshot` → `GET /sessions/{id}/snapshot`),
+//! `zam-server backup` работающего сервера → `restore` в пустой каталог, `zam export` →
+//! `zam import --dry-run`.
 //! `smoke-cuda` — проверка архива `zam-cuda`.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -750,6 +754,38 @@ fn server_stopped(srv: &mut Server, addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+/// `/health` сообщает активный счётчик токенов выдачи `want` (`model`, `bundled`, `estimate`;
+/// M6, задача 5).
+fn token_counter_is(base: &str, want: &str) -> Result<()> {
+    let mut r = agent().get(&format!("{base}/api/v1/health")).call()?;
+    let v: Value = serde_json::from_str(&r.body_mut().read_to_string()?)?;
+    let got = v["token_counter"].as_str().unwrap_or("<нет поля>");
+    if got != want {
+        bail!("/health token_counter = {got}, ожидалось {want}: {v}");
+    }
+    Ok(())
+}
+
+/// Второй запуск на пустом каталоге данных без моделей: размеры и бюджеты выдачи считает
+/// `tokenizer.json` из комплекта (`tokenizers/<модель>/`), а не оценка (решение владельца
+/// 2026-11-06). Чанкер без модели по-прежнему режет оценкой — это проверяют тесты сервера.
+fn token_counter_without_model(root: &Path, dir: &Path, env: &SmokeEnv) -> Result<()> {
+    let tok = root.join(crate::package::bundled_tokenizer_path());
+    if !tok.is_file() {
+        bail!("в комплекте нет {}", tok.display());
+    }
+    let data = dir.join("data-nomodel");
+    let _ = std::fs::remove_dir_all(&data);
+    std::fs::create_dir_all(&data)?;
+    let log = dir.join("zam-server-nomodel.stderr.log");
+    let base = format!("http://{}", env.addr);
+    let mut srv = Server::start(root, &data, env, &log, false)?;
+    let r = wait_health(&mut srv, &base).and_then(|()| token_counter_is(&base, "bundled"));
+    let stopped = server_stopped(&mut srv, env.addr);
+    r.map_err(|e| anyhow!("{e:#}\nstderr сервера:\n{}", srv.log_tail()))?;
+    stopped
+}
+
 /// Выполняет smoke-тест комплекта; при успехе печатает `SMOKE OK`. `repo` — корень
 /// репозитория (тестовая модель — из `target/models/`, распаковка — в `target/smoke/`).
 pub fn run(
@@ -829,6 +865,10 @@ pub fn run(
     } else {
         s.run("ожидание /api/v1/health", wait_health(&mut srv, &base))?;
     }
+    s.run(
+        "M6: счётчик токенов выдачи с моделью — токенизатор модели (/health token_counter)",
+        token_counter_is(&base, "model"),
+    )?;
     let token = s.run(
         "первый токен (файл в каталоге данных)",
         srv.token_rx.recv_timeout(WAIT).map_err(|_| {
@@ -924,6 +964,26 @@ pub fn run(
         "M5.7: zam idea new --origin human → hook session-start с w: → zam idea accept --by human → zam task list",
         idea_flow(&zam, &dir, &base, &token),
     )?;
+    s.run(
+        "M6: длинная заметка → zam read --focus → « · фокус · ~», нужный абзац, [пропущено: range:]",
+        m6_focus(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M6: session-start, search и read сессией агента → zam sessions tokens по событиям",
+        m6_sessions_tokens(&zam, &dir, &base, &token),
+    )?;
+    s.run(
+        "M6: zam session snapshot по журналу-фикстуре → GET /sessions/{id}/snapshot",
+        m6_snapshot(&zam, &dir, &base, &token, repo),
+    )?;
+    s.run(
+        "M6: zam-server backup работающего сервера → restore в пустой каталог",
+        m6_backup_restore(&env, &root, &data, &dir),
+    )?;
+    s.run(
+        "M6: zam export --space knowledge → zam import --dry-run",
+        m6_export_import(&zam, &dir, &base, &token),
+    )?;
     let with_log = |e: anyhow::Error, srv: &Server| {
         anyhow!(
             "{e:#}\nstderr сервера (целиком — {}):\n{}",
@@ -965,6 +1025,10 @@ pub fn run(
     s.run(
         "процесс Qdrant завершён вместе с сервером",
         qdrant_gone(&env, &root, &data),
+    )?;
+    s.run(
+        "M6: без модели счётчик выдачи точный — tokenizer.json комплекта (/health token_counter)",
+        token_counter_without_model(&root, &dir, &env),
     )?;
     let reason = if vr.reason.is_empty() {
         String::new()
@@ -1132,16 +1196,39 @@ pub(crate) fn api_timeout(
     body: Option<&Value>,
     timeout: Duration,
 ) -> Result<(u16, Value)> {
+    api_with(base, token, path, body, &[], timeout)
+}
+
+/// То же со своими заголовками запроса (`X-Zam-Area` загрузчика eval, M6 §11).
+pub(crate) fn api_with(
+    base: &str,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<(u16, Value)> {
     let a = agent_with(timeout);
     let url = format!("{base}{path}");
     let auth = format!("Bearer {token}");
     let mut r = match body {
-        Some(b) => a
-            .post(&url)
-            .header("Authorization", &auth)
-            .content_type("application/json")
-            .send(b.to_string())?,
-        None => a.get(&url).header("Authorization", &auth).call()?,
+        Some(b) => {
+            let mut req = a
+                .post(&url)
+                .header("Authorization", &auth)
+                .content_type("application/json");
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.send(b.to_string())?
+        }
+        None => {
+            let mut req = a.get(&url).header("Authorization", &auth);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.call()?
+        }
     };
     let status = r.status().as_u16();
     let text = r.body_mut().read_to_string()?;
@@ -2078,6 +2165,226 @@ hooks.log:
             "zam task list: нет задачи k:{task} из идеи {w}:
 {list}"
         );
+    }
+    Ok(())
+}
+
+// ---- M6: фокус, учёт сессии, снимок, перенос ----
+
+/// Сессия агента шагов M6 (хук `session-start` её создаёт) — id сессии журнала-фикстуры
+/// (`sessionId` записей): чужие записи снимок не берёт.
+const M6_SESSION: &str = "00000000-0000-4000-8000-000000000001";
+
+/// Длинная заметка шага фокуса: 8 глав, искомый факт — в шестой.
+fn m6_focus_note() -> String {
+    let mut t = String::from("# Справочник smoke\n\n");
+    for i in 1..=8 {
+        t.push_str(&format!("## Глава {i}\n\n"));
+        for k in 0..12 {
+            t.push_str(&format!(
+                "Абзац {k} главы {i} рассказывает о настройке и обслуживании сервера. "
+            ));
+        }
+        if i == 6 {
+            t.push_str("Здесь описан протокол квазиметрии. ");
+        }
+        t.push_str("\n\n");
+    }
+    t
+}
+
+/// M6 §6: `zam read --focus` длинной заметки — заголовок « · фокус · ~», абзац с фактом и пометка
+/// пропуска `[пропущено: range:…]`. С моделью фокус ждёт индексации листов (до 60 с): до неё —
+/// `focus skipped: not indexed` и L2 целиком.
+fn m6_focus(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let note = m6_focus_note();
+    wm_zam(
+        zam,
+        dir,
+        conn,
+        &["write", "knowledge:smoke/m6/focus"],
+        Some(note.as_bytes()),
+        &[],
+    )?;
+    let t0 = Instant::now();
+    loop {
+        let out = wm_zam(
+            zam,
+            dir,
+            conn,
+            &[
+                "read",
+                "knowledge:smoke/m6/focus",
+                "--focus",
+                "протокол квазиметрии",
+            ],
+            None,
+            &[],
+        )?;
+        let ok = out.contains(" · фокус · ~")
+            && out.contains("протокол квазиметрии")
+            && out.contains("[пропущено: range:");
+        if ok {
+            return Ok(());
+        }
+        if t0.elapsed() > INDEX_WAIT {
+            bail!("zam read --focus за {INDEX_WAIT:?}: нет фокуса или пометки пропуска:\n{out}");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// M6 §8 (учёт): хук `session-start` сессии [`M6_SESSION`], затем `zam search` и `zam read
+/// --batch` (`POST /read`) этой сессией (`ZAM_SESSION`) → `zam sessions tokens <id>` — таблица
+/// «событие · вызовов · токенов» со строками `session_start` и `read` (учёт может прийти после
+/// ответа — до 10 с).
+fn m6_sessions_tokens(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let (home, project) = wm_project(dir)?;
+    let ev = serde_json::json!({
+        "session_id": M6_SESSION, "cwd": project,
+        "hook_event_name": "SessionStart", "source": "startup",
+    });
+    run_hook(zam, &home, &project, conn, "session-start", &ev)?;
+    let agent = [("ZAM_SESSION", M6_SESSION)];
+    wm_zam(zam, dir, conn, &["search", "квазиметрии"], None, &agent)?;
+    // побайтное чтение (без флагов) идёт мимо `POST /read` и в учёт не попадает: пачкой
+    wm_zam(
+        zam,
+        dir,
+        conn,
+        &["read", "knowledge:smoke/m6/focus", "--batch"],
+        None,
+        &agent,
+    )?;
+    let t0 = Instant::now();
+    loop {
+        let out = wm_zam(
+            zam,
+            dir,
+            conn,
+            &["sessions", "tokens", M6_SESSION],
+            None,
+            &[],
+        )?;
+        if out.contains("\nsession_start\t") && out.contains("\nread\t") {
+            return Ok(());
+        }
+        if t0.elapsed() > WAIT {
+            bail!("zam sessions tokens {M6_SESSION}: нет строк session_start и read:\n{out}");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// M6 §8а: `zam session snapshot --transcript <журнал-фикстура Claude Code>` → `GET
+/// /sessions/{id}/snapshot` отдаёт снимок с запросами журнала; приманка-секрет фикстуры в
+/// открытом виде не доходит.
+fn m6_snapshot(zam: &Path, dir: &Path, base: &str, token: &str, repo: &Path) -> Result<()> {
+    let conn = (base, token);
+    let (_, project) = wm_project(dir)?;
+    let fixture =
+        repo.join("crates/zam-cli/tests/fixtures/transcripts/claude-2.1.314-prompts.jsonl");
+    let raw = fs::read_to_string(&fixture)
+        .with_context(|| format!("фикстура журнала {}", fixture.display()))?;
+    let root = serde_json::to_string(&project.to_string_lossy())?;
+    let transcript = project.join("smoke-transcript.jsonl");
+    fs::write(&transcript, raw.replace("@ROOT@", &root[1..root.len() - 1]))?;
+    let path = transcript.to_string_lossy().into_owned();
+    wm_zam(
+        zam,
+        dir,
+        conn,
+        &[
+            "session",
+            "snapshot",
+            "--transcript",
+            &path,
+            "--session",
+            M6_SESSION,
+        ],
+        None,
+        &[],
+    )?;
+    let (status, v) = api(
+        base,
+        token,
+        &format!("/api/v1/sessions/{M6_SESSION}/snapshot"),
+        None,
+    )?;
+    if status != 200 {
+        bail!("GET /sessions/{M6_SESSION}/snapshot: HTTP {status}: {v}");
+    }
+    let prompts = v["data"]["prompts"].as_array().map_or(0, Vec::len);
+    if prompts == 0 {
+        bail!("снимок без запросов журнала: {v}");
+    }
+    Ok(())
+}
+
+/// M6 §12б.2–§12б.3: `zam-server backup --json` при работающем сервере → `restore` копии в пустой
+/// каталог данных (другой каталог, сервер копии не запускается) — код 0, базы на месте.
+fn m6_backup_restore(env: &SmokeEnv, root: &Path, data: &Path, dir: &Path) -> Result<()> {
+    let backups = dir.join("m6-backups");
+    let target = dir.join("m6-restore");
+    let _ = fs::remove_dir_all(&backups);
+    let _ = fs::remove_dir_all(&target);
+    let b = backups.to_string_lossy().into_owned();
+    let out = output_with_timeout(
+        &mut env.server_cmd(root, data, &["backup", "--json", "--dir", &b]),
+        Duration::from_secs(120),
+    )
+    .and_then(ensure_success)?;
+    let v: Value = serde_json::from_slice(&out.stdout).with_context(|| {
+        format!(
+            "zam-server backup --json: не JSON: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })?;
+    let copy = v["path"]
+        .as_str()
+        .with_context(|| format!("zam-server backup --json: нет path: {v}"))?
+        .to_string();
+    output_with_timeout(
+        &mut env.server_cmd(root, &target, &["restore", &copy]),
+        Duration::from_secs(120),
+    )
+    .and_then(ensure_success)?;
+    if !target.join("system.db").is_file() {
+        bail!("restore: нет system.db в {}", target.display());
+    }
+    Ok(())
+}
+
+/// M6 §12б.5: `zam export --space knowledge` → `zam import --dry-run` того же архива — код 0,
+/// отчёт без записи.
+fn m6_export_import(zam: &Path, dir: &Path, base: &str, token: &str) -> Result<()> {
+    let conn = (base, token);
+    let zip = dir.join("m6-export.zip");
+    let _ = fs::remove_file(&zip);
+    let z = zip.to_string_lossy().into_owned();
+    wm_zam(
+        zam,
+        dir,
+        conn,
+        &["export", "--space", "knowledge", "--out", &z],
+        None,
+        &[],
+    )?;
+    if fs::metadata(&zip).map(|m| m.len()).unwrap_or(0) == 0 {
+        bail!("zam export: пустой архив {}", zip.display());
+    }
+    let out = wm_zam(
+        zam,
+        dir,
+        conn,
+        &["import", &z, "--space", "knowledge", "--dry-run"],
+        None,
+        &[],
+    )?;
+    if out.trim().is_empty() {
+        bail!("zam import --dry-run: пустой отчёт");
     }
     Ok(())
 }

@@ -17,7 +17,8 @@ use zam_store::{
     attachment_link, claim_task, create_entry, create_report, create_solution, delete_entry,
     enqueue_entry_upserts, enqueue_reindex, entry_attachment, entry_attachments, entry_revisions,
     first_images, get_entry, list_entries, list_spaces, reindex_entries_page, release_task,
-    restore_entry, retract_entry, search_fts, set_triggers, supersede_entry, update_entry,
+    report_blob_meta_by_sha, restore_entry, retract_entry, search_fts, set_triggers,
+    supersede_entry, update_entry,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -556,6 +557,57 @@ async fn create_report_same_blob_twice_refcount() {
     .unwrap();
     assert_eq!(entry_attachments(&db, c.id).await.unwrap().len(), 1);
     assert_eq!(refcount(&db, 8).await, Some(1));
+}
+
+/// M6, задача 15a: файл отчёта по sha256 для превью — только живой отчёт, при заданном
+/// пространстве — только в нём; удалённый отчёт файла не отдаёт, восстановленный — снова отдаёт.
+#[tokio::test]
+async fn report_blob_meta_live_report_in_space() {
+    let (db, space) = setup("blob-meta").await;
+    let (other, _) = create_solution(&db, "g-blob-meta-2", "Другое решение")
+        .await
+        .unwrap();
+    let e = make_report(&db, space, "С файлами").await;
+    let meta = |sha: String, sp: Option<Id>| {
+        let db = db.clone();
+        async move { report_blob_meta_by_sha(&db, &sha, sp).await.unwrap() }
+    };
+    let want = Some(("image/png".to_string(), 101, "loss.png".to_string()));
+    assert_eq!(meta(sha(1), None).await, want);
+    assert_eq!(meta(sha(1), Some(space)).await, want);
+    assert_eq!(
+        meta(sha(3), Some(space)).await.map(|m| m.2).as_deref(),
+        Some("results.csv")
+    );
+    // другое пространство той же базы и неизвестный sha — нет
+    assert_eq!(meta(sha(1), Some(other.id)).await, None);
+    assert_eq!(meta(sha(99), None).await, None);
+    // то же содержимое во втором отчёте другого пространства: каждому пространству — своя запись
+    let again = vec![file(1, "копия.png", "image/png")];
+    create_report(
+        &db,
+        report(other.id, "Копия", body_of(&again)),
+        again,
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        meta(sha(1), Some(other.id)).await.map(|m| m.2).as_deref(),
+        Some("копия.png")
+    );
+    assert_eq!(meta(sha(1), Some(space)).await, want);
+    // удалённый отчёт файл не отдаёт; восстановленный — снова
+    delete_entry(&db, e.id, None, &human()).await.unwrap();
+    assert_eq!(meta(sha(1), Some(space)).await, None);
+    assert_eq!(meta(sha(3), None).await, None);
+    assert_eq!(
+        meta(sha(1), None).await.map(|m| m.2).as_deref(),
+        Some("копия.png"),
+        "живой отчёт с тем же содержимым остаётся"
+    );
+    restore_entry(&db, e.id, None, &human()).await.unwrap();
+    assert_eq!(meta(sha(1), Some(space)).await, want);
 }
 
 #[tokio::test]

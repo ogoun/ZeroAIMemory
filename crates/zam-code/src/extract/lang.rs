@@ -7,6 +7,7 @@
 //! **Ссылки** — шаблоны `@reference.*` встроенного `TAGS_QUERY` грамматики (TypeScript/TSX — ещё
 //! и JavaScript: грамматика TS наследует JS) плюс `queries/<язык>.scm`; у C# — только свой запрос.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use tree_sitter::{Language, Node, Query};
@@ -437,6 +438,234 @@ pub(super) fn exported(
     })
 }
 
+/// Операнд доступа к члену, чьё имя — имя вызова (M6 §12а): выражение, простой идентификатор
+/// или цепочка доступа из одних идентификаторов (`os.path`, `System.Console`) — её левый
+/// идентификатор (тексты — для правила «квалификатора»).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Operand {
+    Expr,
+    Ident(String),
+    Chain(String),
+}
+
+/// Поля `(имя члена, операнд)` узла доступа к члену языка (без Java `method_invocation`).
+fn access_fields(lang: Lang, kind: &str) -> Option<(&'static str, &'static str)> {
+    Some(match (lang, kind) {
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "member_expression") => {
+            ("property", "object")
+        }
+        (Lang::Python, "attribute") => ("attribute", "object"),
+        (Lang::Go, "selector_expression") => ("field", "operand"),
+        (Lang::Java, "field_access") => ("field", "object"),
+        (Lang::CSharp, "member_access_expression") => ("name", "expression"),
+        _ => return None,
+    })
+}
+
+/// Левый идентификатор цепочки доступа из одних идентификаторов (`os.path` → `os`,
+/// `java.util.Objects` → `java`); иное выражение (вызов, индекс, `this`) — `None`.
+fn chain_left(lang: Lang, mut node: Node, src: &[u8]) -> Option<String> {
+    loop {
+        if matches!(node.kind(), "identifier" | "type_identifier") {
+            return Some(text(node, src));
+        }
+        let (name_field, obj_field) = access_fields(lang, node.kind())?;
+        let name = node.child_by_field_name(name_field)?;
+        if !matches!(
+            name.kind(),
+            "identifier" | "property_identifier" | "field_identifier"
+        ) {
+            return None;
+        }
+        node = node.child_by_field_name(obj_field)?;
+    }
+}
+
+/// Имя Go-пакета по пути импорта: последний сегмент без `.vN` и без префикса `go-`; сегмент
+/// мажорной версии `/vN` — предыдущий; без суффикса `-go`/`.go` (`gopkg.in/yaml.v3` → `yaml`,
+/// `github.com/x/go-redis/v9` → `redis`). Остаток с дефисом (`aws-sdk-go` → `aws-sdk`) — не имя
+/// пакета Go: `None` (имя объявляет `package` внутри, по пути его не узнать).
+pub(super) fn go_package_name(path: &str) -> Option<String> {
+    let is_ver = |s: &str| {
+        s.strip_prefix('v')
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut last = *segs.last()?;
+    if is_ver(last) && segs.len() > 1 {
+        last = segs[segs.len() - 2];
+    }
+    if let Some((base, v)) = last.rsplit_once('.')
+        && is_ver(v)
+    {
+        last = base;
+    }
+    let last = last.strip_prefix("go-").unwrap_or(last);
+    let last = last
+        .strip_suffix("-go")
+        .or_else(|| last.strip_suffix(".go"))
+        .unwrap_or(last);
+    (!last.is_empty() && !last.contains('-')).then(|| last.to_string())
+}
+
+/// Имена-квалификаторы, которые вводит узел импорта (M6 §12а, правило п. 2(б)): псевдонимы
+/// (`import numpy as np`, `import * as ns`, `import { a as b }`, Go `f "fmt"`, C#
+/// `using F = A.B`), имя Go-пакета по пути, `const fs = require('fs')`, левый сегмент
+/// импортируемого пути (`import os.path` → `os`, `using System.Text` → `System`, Java
+/// `import java.util.Objects` → `java`).
+///
+/// `unbound` — узлы имён ссылок-импортов, которые имени в файле не вводят: последний сегмент
+/// Python `import a.b` (связано `a`) и `import a.b as c` (связано `c`) — ревью задачи 14, N1.
+pub(super) fn import_qualifiers(
+    lang: Lang,
+    node: Node,
+    src: &[u8],
+    out: &mut HashSet<String>,
+    unbound: &mut HashSet<usize>,
+) {
+    fn leftmost<'t>(mut n: Node<'t>, scope: &str) -> Node<'t> {
+        while let Some(s) = n.child_by_field_name(scope) {
+            n = s;
+        }
+        n
+    }
+    let mut add = |n: Option<Node>| {
+        if let Some(n) = n {
+            out.insert(text(n, src));
+        }
+    };
+    match (lang, node.kind()) {
+        (Lang::Python, "aliased_import") => add(node.child_by_field_name("alias")),
+        (Lang::Python, "import_statement") => {
+            let mut c = node.walk();
+            let names: Vec<Node> = node.children_by_field_name("name", &mut c).collect();
+            for n in names {
+                let (dotted, aliased) = match n.kind() {
+                    "dotted_name" => (Some(n), false),
+                    "aliased_import" => (n.child_by_field_name("name"), true),
+                    _ => (None, false),
+                };
+                let Some(d) = dotted else { continue };
+                if !aliased {
+                    add(d.named_child(0));
+                }
+                let parts = d.named_child_count();
+                if (aliased || parts > 1)
+                    && let Some(last) = parts
+                        .checked_sub(1)
+                        .and_then(|i| u32::try_from(i).ok())
+                        .and_then(|i| d.named_child(i))
+                {
+                    unbound.insert(last.id());
+                }
+            }
+        }
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "namespace_import") => {
+            let mut c = node.walk();
+            let last = node
+                .named_children(&mut c)
+                .filter(|n| n.kind() == "identifier")
+                .last();
+            add(last);
+        }
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "import_specifier") => {
+            add(node.child_by_field_name("alias"))
+        }
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "variable_declarator") => {
+            let is_require = node
+                .child_by_field_name("value")
+                .filter(|v| v.kind() == "call_expression")
+                .and_then(|v| v.child_by_field_name("function"))
+                .is_some_and(|f| f.kind() == "identifier" && text(f, src) == "require");
+            if is_require {
+                add(node
+                    .child_by_field_name("name")
+                    .filter(|n| n.kind() == "identifier"));
+            }
+        }
+        (Lang::Go, "import_spec") => match node.child_by_field_name("name") {
+            Some(n) if n.kind() == "package_identifier" => add(Some(n)),
+            Some(_) => {}
+            None => {
+                let path = node.child_by_field_name("path").map(|p| text(p, src));
+                if let Some(name) = path
+                    .as_deref()
+                    .map(|p| p.trim_matches(|c| c == '"' || c == '`'))
+                    .and_then(go_package_name)
+                {
+                    out.insert(name);
+                }
+            }
+        },
+        (Lang::Java, "import_declaration") => {
+            let mut c = node.walk();
+            let path = node
+                .named_children(&mut c)
+                .find(|n| matches!(n.kind(), "scoped_identifier" | "identifier"));
+            add(path.map(|p| leftmost(p, "scope")));
+        }
+        (Lang::CSharp, "using_directive") => {
+            add(node.child_by_field_name("name"));
+            let mut c = node.walk();
+            let path = node
+                .named_children(&mut c)
+                .find(|n| matches!(n.kind(), "qualified_name" | "identifier"));
+            add(path.map(|p| leftmost(p, "qualifier")));
+        }
+        _ => {}
+    }
+}
+
+/// Узел доступа к члену: `(узел имени члена, операнд)`. Rust `field_expression.field`, TS/TSX/JS
+/// `member_expression.property`, Python `attribute.attribute`, Go `selector_expression.field`, Java
+/// `method_invocation.name` при поле `object`, C# `member_access_expression.name` (у
+/// `generic_name` — его идентификатор). Иные узлы — `None`.
+pub(super) fn member_access<'t>(
+    lang: Lang,
+    node: Node<'t>,
+    src: &[u8],
+) -> Option<(Node<'t>, Operand)> {
+    let (name_field, obj_field) = match (lang, node.kind()) {
+        (Lang::Rust, "field_expression") => ("field", "value"),
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "member_expression") => {
+            ("property", "object")
+        }
+        (Lang::Python, "attribute") => ("attribute", "object"),
+        (Lang::Go, "selector_expression") => ("field", "operand"),
+        (Lang::Java, "method_invocation") => ("name", "object"),
+        (Lang::CSharp, "member_access_expression") => ("name", "expression"),
+        _ => return None,
+    };
+    let mut name = node.child_by_field_name(name_field)?;
+    if name.kind() == "generic_name" {
+        name = name.named_child(0).filter(|n| n.kind() == "identifier")?;
+    }
+    let obj = node.child_by_field_name(obj_field)?;
+    // Rust: путь `T::f` — `scoped_identifier`, а `field_expression` — всегда значение-получатель
+    let op = if lang == Lang::Rust {
+        Operand::Expr
+    } else if matches!(obj.kind(), "identifier" | "type_identifier") {
+        Operand::Ident(text(obj, src))
+    } else {
+        chain_left(lang, obj, src).map_or(Operand::Expr, Operand::Chain)
+    };
+    Some((name, op))
+}
+
+/// Вызов члена с операндом `op` — по получателю (M6 §12а): операнд не «квалификатор». Квалификатор —
+/// простой идентификатор с заглавной буквы (тип или класс: `Math.max`, `Console.WriteLine`) или имя
+/// импорта файла (пакет, модуль, псевдоним: `fmt.Println`, `np.array`), а также цепочка из одних
+/// идентификаторов, чей левый — имя импорта (`os.path.join`, `System.Console.WriteLine`).
+pub(super) fn is_recv(op: &Operand, imports: &HashSet<String>) -> bool {
+    match op {
+        Operand::Expr => true,
+        Operand::Ident(t) => {
+            !(t.chars().next().is_some_and(char::is_uppercase) || imports.contains(t.as_str()))
+        }
+        Operand::Chain(left) => !imports.contains(left.as_str()),
+    }
+}
+
 /// Вид ссылки по суффиксу захвата `@reference.*` и виду узла.
 pub(super) fn ref_kind(node: Node, cap: &str) -> RefKind {
     match cap {
@@ -534,4 +763,26 @@ pub(super) fn name_parts(node: Node, src: &[u8]) -> Vec<String> {
         .map(|p| p.split_whitespace().collect::<String>())
         .filter(|p| !p.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::go_package_name;
+
+    /// Ревью задачи 14 (I3, N3): имя Go-пакета по пути импорта.
+    #[test]
+    fn go_package_name_from_path() {
+        for (path, want) in [
+            ("fmt", Some("fmt")),
+            ("net/http", Some("http")),
+            ("gopkg.in/yaml.v3", Some("yaml")),
+            ("github.com/redis/go-redis/v9", Some("redis")),
+            ("github.com/x/yaml.go", Some("yaml")),
+            ("github.com/x/redis-go", Some("redis")),
+            ("github.com/aws/aws-sdk-go", None),
+            ("github.com/x/foo-bar", None),
+        ] {
+            assert_eq!(go_package_name(path).as_deref(), want, "{path}");
+        }
+    }
 }

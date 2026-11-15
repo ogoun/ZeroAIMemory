@@ -1,16 +1,22 @@
 //! Предупреждение `secrets_detected` в ответах записи заметок и записей журналов (§7.6).
 //!
-//! Сканер (`zam_markdown::scan_secrets`) находит в сохранённом тексте значения, похожие на
-//! ключи и пароли. Текст при этом сохраняется как есть, а в индекс (FTS, эмбеддинги, Qdrant)
-//! уходит замаскированным. Ответ получает `warnings: ["secrets_detected"]`,
-//! `secrets_detected: [{kind, line}]` (без значений) и подсказку про Vault.
+//! Сканер (`zam_markdown::scan_secrets`, крейт `zam-secrets`) находит в сохранённом тексте
+//! значения, похожие на ключи и пароли. Текст при этом сохраняется как есть, а в индекс (FTS,
+//! эмбеддинги, Qdrant) уходит замаскированным. Ответ получает `warnings: ["secrets_detected"]`,
+//! `secrets_detected: [{kind, line}]` (без значений) и подсказку про Vault. Скан упёрся в предел
+//! повторов (`ScanOutcome::depth_capped`, задача 15b M6) — ещё `warnings: ["secrets_scan_depth"]`
+//! и WARN в журнал сервера без текста находок (число находок и повторов, длина текста).
 
 use serde_json::{Value, json};
-use zam_markdown::scan_secrets;
+use zam_markdown::scan_secrets_ext;
 use zam_store::Entry;
 
 /// Предупреждение в массиве `warnings`.
 pub const SECRETS_DETECTED: &str = "secrets_detected";
+
+/// Предупреждение в `warnings`: скан упёрся в предел повторов (`zam_markdown::secrets::
+/// FIXPOINT_MAX`) — часть значений может уйти в индекс незамаскированной.
+pub const SECRETS_SCAN_DEPTH: &str = "secrets_scan_depth";
 
 /// Подсказка, куда класть секреты.
 pub const SECRETS_HINT: &str = "В тексте найдены значения, похожие на секреты. В индекс и поиск \
@@ -20,16 +26,32 @@ pub const SECRETS_HINT: &str = "В тексте найдены значения,
 /// Добавляет в ответ-объект `v` предупреждение и список находок по тексту `text`;
 /// без находок ответ не меняется.
 pub fn attach(v: &mut Value, text: &str) {
-    let hits = scan_secrets(text);
+    let scan = scan_secrets_ext(text);
+    let hits = scan.hits;
     if hits.is_empty() {
         return;
     }
+    if scan.depth_capped {
+        // без текста находок и самого текста: только счётчики
+        tracing::warn!(
+            hits = hits.len(),
+            passes = scan.passes,
+            text_bytes = text.len(),
+            "сканер секретов упёрся в предел повторов (secrets_scan_depth)"
+        );
+    }
     let Value::Object(o) = v else { return };
     let w = o.entry("warnings").or_insert_with(|| json!([]));
-    if let Value::Array(a) = w
-        && !a.iter().any(|x| x == SECRETS_DETECTED)
-    {
-        a.push(json!(SECRETS_DETECTED));
+    if let Value::Array(a) = w {
+        let mut add = |code: &str| {
+            if !a.iter().any(|x| x == code) {
+                a.push(json!(code));
+            }
+        };
+        add(SECRETS_DETECTED);
+        if scan.depth_capped {
+            add(SECRETS_SCAN_DEPTH);
+        }
     }
     let list: Vec<Value> = hits
         .iter()

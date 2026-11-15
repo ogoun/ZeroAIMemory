@@ -22,7 +22,18 @@
 //!   контроллера R11. Чанки `mode=chunks`, отданные целиком (не усечённые бюджетом),
 //!   записываются в `session_seen` базы пользователя запроса (`part = chunk_id`, владелец —
 //!   владелец базы цели) одной транзакцией с касанием сессии. Карточки папок не отмечаются;
-//!   сбой учёта сессии поиск не валит (WARN, ответ без пометок);
+//!   сбой учёта сессии поиск не валит (WARN, ответ без пометок).
+//!   M6 §7.1: учитывается только **явная** сессия — неявную, подставленную MCP без
+//!   `X-Zam-Session`, поиск не видит. Запрос из инструмента MCP без явного `skip_seen`
+//!   помечает выданное (`seen: true`, в md — `(выдавалось)`), но оставляет фрагмент и текст:
+//!   субагенты на общем подключении MCP приходят с сессией родителя. Выданным считается только
+//!   отмеченное в текущей эпохе сессии (M6 §7.2): после сжатия контекста — снова фрагмент.
+//!   Исключение (решение контролёра 2026-11-06, §7.1): карточка `(выдавалось)`, чья цель —
+//!   источник действующей выжимки шага 0 **этого же** ответа (та же цель и ревизия; у
+//!   источника-секции — только карточки, чей чанк целиком лежит в тексте секции), идёт без
+//!   фрагмента и текста с пометкой `(выдавалось, в выжимке)`, в JSON — `seen: true`,
+//!   `in_cache: true` ([`mark_cache_sources`]): текст источника уже в ответе; у `[cache, stale:
+//!   …]` фрагмент остаётся;
 //! - `filters.kinds` — виды целей: `note`, `insight`, `changelog`, `release`, `attachment`
 //!   (фрагменты вложений, M5; см. «Вложения») — по умолчанию все, `folder` — карточки папок
 //!   (см. «Папки»); `filters.status` — статусы insight (по умолчанию `active`,
@@ -85,7 +96,8 @@
 //!    `w_fts_relaxed`, если векторный канал работает и чанк ему виден, т. е. не Human и узел
 //!    проиндексирован) → бусты ([`zam_search::apply_boosts`], §9.2 п. 4: insight `gotcha` и
 //!    `failure` — `search.boost_gotcha`/`boost_failure`, узлы и записи области из
-//!    `X-Zam-Area` — `search.boost_area`; балл выше 1 после бустов и канала папок — деление
+//!    `X-Zam-Area` — `search.boost_area`, фрагменты вложений — `search.w_attach`, M6 §11;
+//!    балл выше 1 после бустов и канала папок — деление
 //!    всех баллов на лучший, `zam_search::rescale_overflow`) → `note_to_leaf` →
 //!    ≤ `max_per_node` с узла:
 //!    сводка (L1 заметки или секции) сливается с найденным листом своего узла (для
@@ -181,12 +193,15 @@
 //! `status`, `insight_kind` (`data.kind`), `certainty`, `title`; путь у записи пуст,
 //! `expand` и L0 к записям не применяются.
 //!
-//! **Формат `md`** — карточки §9.3, по одной на элемент:
-//! `<n>. n:<id> <пространство>/<путь> › <секция>  [score] rev<N>[ · <certainty>] · <дата> ·
-//! <возраст> · ~<N> tok` (возраст — `N дн. назад` или `сегодня`, его же получает MCP);
-//! у записи — `<n>. i:<id> insight/<вид> «<заголовок>»  [score] <status> · <certainty> ·
-//! <возраст> · ~<N> tok` (`c:` — changelog, `r:` — release; отсутствующие части опускаются; у
-//! соседа `expand=graph` — ` · via <тип> ← <родитель>`),
+//! **Формат `md`** — карточки v2 (§9.3, M6 §4.1), по одной на элемент:
+//! `<n>. n:<id> <пространство>/<путь> › <секция>  [.82] r<N>[ · ax|th|hyp] · <дата UTC
+//! yyyy-MM-dd HH:mm:ss> · <N>t` ([`card_tail`]; возраста нет, `age_days` — в JSON); у записи —
+//! `<n>. i:<id> insight/<вид> «<заголовок>»  [.77][ hyp ·][ <статус, если не active> ·] <дата> ·
+//! <N>t` (`c:` — changelog, `r:` — release; ревизии в хвосте записи нет), у папки —
+//! `f:<id> <пространство>/<путь>/  [.61] <N> детей`; у соседа `expand=graph` — ` · via <тип> ←
+//! <родитель>`. **Бюджет** Markdown — вся карточка счётчиком сервера вместе со строками
+//! деградации, предупреждений и строкой MCP `~N tok` ([`pack_items`]); `brief`/`notes` без
+//! карточек с баллом ниже `brief_min_rel × лучший` (поле запроса или `search.brief_min_rel`).
 //! под ней с отступом — сниппет (`brief`, маркеры → `**…**`), L0 (`notes`) или текст
 //! (`chunks`); балл — реранка, если элемент переставлен им. При деградации строка
 //! `> degraded: <код> — <текст причины> (только FTS)`, в том числе при пустой выдаче (тогда она
@@ -206,6 +221,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -220,19 +236,25 @@ use zam_core::{Id, SolutionGuid, TargetKind, TargetRef};
 use zam_index::{IndexError, VectorFilter, VectorHit, VectorIndex, VectorScope};
 use zam_ml::Embedding;
 use zam_search::{
-    Boosts, ChunkMeta, Cost, Fit, FolderHit, LeafRef, Level, Ranked, SearchInputs, Weights,
+    Boosts, ChunkMeta, FolderHit, KindBoostMode, LeafRef, Level, Ranked, SearchInputs, Weights,
     apply_boosts, apply_boosts_to, cap_per_node, drop_unresolved_tail, folder_score, fuse_normed,
-    in_section, note_to_leaf, overflow_divisor, pack, rescale_overflow, summaries_without_leaf,
+    in_section, note_to_leaf, overflow_divisor, rescale_overflow, summaries_without_leaf,
     target_cap, truncate_to_tokens,
 };
 use zam_store::time::fmt_ts;
 use zam_store::{
     AttachmentHit, ChunkScope, Db, EntryKind, FtsHit, FtsQuery, LeafHit, MARK_END, MARK_START,
-    SeenItem, SeenKey, SeenTarget, Space, SpaceKind, StoreError, TargetFilter, WHOLE_TARGET,
-    chunk_ref, count_tokens, get_embeddings, get_node, leaf_term_hits, leaves_of_targets,
-    live_chunks, live_folders, mark_seen, neighbor_leaves, node_content, pending_count,
-    query_needles, search_fts_channels, seen_revs, text_snippet, touch_session,
+    SeenItem, SeenKey, SeenTarget, Space, SpaceKind, StoreError, TargetFilter, TokenCount,
+    WHOLE_TARGET, chunk_ref, count_tokens, get_embeddings, get_node, leaf_term_hits,
+    leaves_of_targets, live_chunks, live_folders, mark_seen_with_tokens, neighbor_leaves,
+    node_content, pending_count, query_needles, search_fts_channels, search_fts_channels_light,
+    seen_revs, text_snippet, touch_session,
 };
+
+/// Параметры лёгкого поиска ([`search_with`]; M6 §16): глубина каналов FTS и сниппеты. Для
+/// подсказок-идей — `channel_depth = max(4 × top_k, 20)`, `snippets = false`
+/// (`api/recall.rs`, `idea_light_search`).
+pub use zam_store::LightSearch;
 
 use self::merge::merge_channels;
 use self::targets::{
@@ -241,7 +263,7 @@ use self::targets::{
 use super::doc_locator::{self, Sheets, secret_sheet};
 use super::json_body;
 use super::scope::skip_foreign;
-use super::sessions::{RequestSession, request_session};
+use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
@@ -254,7 +276,6 @@ use crate::rerank;
 /// Заголовок текущего решения агента.
 pub const SOLUTION_HEADER: &str = "x-zam-solution";
 const DEFAULT_TOP_K: usize = 10;
-const DEFAULT_BUDGET_TOKENS: usize = 800;
 /// Предел top_k в FTS (`zam_store::search`).
 const TOP_K_MAX: usize = 100;
 /// Кандидатов слитого канала `bm25` нескольких баз (как в одной базе, `zam_store`).
@@ -493,6 +514,9 @@ impl SearchSection {
             .into_iter()
             .collect(),
             area: area.map(|a| (a, self.boost_area)),
+            kind_mode: self.kind_boost_mode,
+            kind_exempt: HashSet::new(),
+            attach: Some(self.w_attach),
         }
     }
 }
@@ -702,6 +726,9 @@ struct SearchReq {
     mode: Option<SearchMode>,
     top_k: Option<usize>,
     budget_tokens: Option<usize>,
+    /// Отсечка слабых карточек запроса (0..=1); нет — `search.brief_min_rel` (M6 §4.2).
+    /// Внутренний поиск подсказок `/recall` передаёт 0: у подсказок свой порог.
+    brief_min_rel: Option<f64>,
     format: Option<OutFormat>,
     expand: Option<Expand>,
     rerank: Option<RerankMode>,
@@ -903,6 +930,7 @@ async fn best_leaves(
 }
 
 /// Элемент выдачи до упаковки.
+#[derive(Clone)]
 struct Item {
     /// Индекс цели (базы) элемента.
     target: usize,
@@ -922,8 +950,21 @@ struct Item {
     folder: Option<i64>,
     /// Уже выдан этой сессии в той же ревизии (`skip_seen`, §9.3): без фрагмента и текста.
     seen: bool,
+    /// Уже выдан, но фрагмент и текст оставлены (запрос MCP без явного `skip_seen: true`,
+    /// M6 §7.1: субагенты на общем подключении): пометка «(выдавалось)» вместо `(seen)`.
+    seen_kept: bool,
+    /// Уже выдан, и текст цели — в действующей выжимке этого же ответа (M6 §7.1, решение
+    /// контролёра 2026-11-06): без фрагмента, пометка «(выдавалось, в выжимке)».
+    in_cache: bool,
     /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
     stale_refs: Vec<String>,
+}
+
+impl Item {
+    /// Выданное прячется: без фрагмента и текста (`seen` без `seen_kept`).
+    fn hidden(&self) -> bool {
+        self.seen && !self.seen_kept
+    }
 }
 
 /// Текст пары реранкера: заголовок секции и текст чанка.
@@ -1393,7 +1434,7 @@ struct Packed {
 /// Строка карточки без текста: по ней считается стоимость в токенах. У вложения L0 нет — в
 /// `notes` тоже сниппет.
 fn card_summary(it: &Item, mode: SearchMode) -> &str {
-    if it.seen {
+    if it.hidden() {
         return "";
     }
     match mode {
@@ -1402,47 +1443,157 @@ fn card_summary(it: &Item, mode: SearchMode) -> &str {
     }
 }
 
-/// Упаковка в бюджет (см. модуль).
-fn pack_items(items: Vec<Item>, mode: SearchMode, budget_tokens: usize) -> Vec<Packed> {
-    let costs: Vec<Cost> = items
-        .iter()
-        .map(|it| Cost {
-            base: count_tokens(&format!(
-                "{} {} {} {}",
-                it.hit.path,
-                it.hit
-                    .attachment
-                    .as_ref()
-                    .map_or("", |a| a.filename.as_str()),
-                it.hit.heading_path,
-                card_summary(it, mode)
-            )),
-            text: it.text.as_ref().map_or(0, |t| t.1),
-        })
-        .collect();
-    let fits = pack(&costs, budget_tokens);
-    items
-        .into_iter()
-        .zip(fits)
-        .map(|(mut it, fit)| {
-            let text = it.text.take().map(|(t, n_full)| match fit {
-                Fit::Whole => (t, false, n_full),
-                Fit::Truncated(n) => {
-                    let t = truncate_to_tokens(&t, n, &count_tokens).to_string();
-                    let n = count_tokens(&t);
-                    (t, true, n)
-                }
-            });
-            let tokens = text
+/// Строки деградации и предупреждений в конце Markdown.
+fn md_tail(degraded: Option<DegradedReason>, warnings: &[String]) -> String {
+    let mut s = String::new();
+    if let Some(r) = degraded {
+        s.push_str(&format!(
+            "> degraded: {} — {} (только FTS)\n",
+            r.as_str(),
+            r.text()
+        ));
+    }
+    for w in warnings {
+        s.push_str(&format!("> warning: {w}\n"));
+    }
+    s
+}
+
+/// Markdown ответа: выжимки шага 0, карточки по порядку и строки [`md_tail`].
+fn md_body(
+    cache_md: &str,
+    packed: &[Packed],
+    mode: SearchMode,
+    spaces: &HashMap<Id, Space>,
+    tail: &str,
+) -> String {
+    let mut body = cache_md.to_string();
+    body.extend(
+        packed
+            .iter()
+            .enumerate()
+            .map(|(i, p)| item_md(i + 1, p, mode, spaces)),
+    );
+    body.push_str(tail);
+    body
+}
+
+/// Фрагмент или L0 карточки, урезанный до `room` токенов карточки целиком (по границе символа,
+/// незакрытый маркер совпадения закрывается, в конце — `…`). Стоимость считается по префиксу
+/// с закрытием, но `truncate_to_tokens` ещё отступает к границе слова; на стыке счёт токенизатора
+/// неаддитивен, так что первая карточка может выйти на 1 токен дороже `room` — только она:
+/// следующие берутся целиком или не берутся, а итог проверяет цикл по Markdown целиком.
+fn cut_summary(full: &str, cost: &dyn Fn(&str) -> usize, room: usize) -> String {
+    let close = |t: &str| -> String {
+        let opened = t.matches(MARK_START).count() > t.matches(MARK_END).count();
+        let mut t = t.to_string();
+        if opened {
+            t.push(MARK_END);
+        }
+        if !t.is_empty() {
+            t.push('…');
+        }
+        t
+    };
+    let cut = truncate_to_tokens(full, room, &|pre: &str| cost(&close(pre)));
+    close(cut)
+}
+
+/// Упаковка в бюджет (M6 §4.2): стоимость элемента — **вся** его карточка Markdown
+/// ([`item_md`]: номер, id, путь, секция, хвост, пометки, фрагмент или текст) счётчиком
+/// `count`; элементы берутся по порядку, пока помещаются. Первая карточка отдаётся всегда:
+/// не помещается — урезается её фрагмент (L0) или текст (`chunks`), вплоть до пустого. У
+/// следующей в `chunks` урезается текст до остатка, в `brief`/`notes` — стоп.
+fn pack_items(
+    items: Vec<Item>,
+    mode: SearchMode,
+    budget_tokens: usize,
+    count: &dyn Fn(&str) -> usize,
+    spaces: &HashMap<Id, Space>,
+) -> Vec<Packed> {
+    let mut out: Vec<Packed> = Vec::new();
+    let mut used = 0usize;
+    for mut it in items {
+        let n = out.len() + 1;
+        let text = it.text.take();
+        let mut p = Packed {
+            tokens: text
                 .as_ref()
-                .map_or(it.hit.token_count.max(0) as usize, |t| t.2);
-            Packed {
-                item: it,
-                text: text.map(|(t, tr, _)| (t, tr)),
-                tokens,
+                .map_or(it.hit.token_count.max(0) as usize, |t| t.1),
+            text: text.map(|(t, _)| (t, false)),
+            item: it,
+        };
+        let cost = count(&item_md(n, &p, mode, spaces));
+        if used + cost <= budget_tokens {
+            used += cost;
+            out.push(p);
+            continue;
+        }
+        let room = budget_tokens.saturating_sub(used);
+        let first = out.is_empty();
+        match p.text.take() {
+            // текст `chunks`: урезается до остатка (у не первой — если остаток есть)
+            Some((full, _)) if first || room > 0 => {
+                let render = |t: &str| -> usize {
+                    let q = Packed {
+                        item: p.item.clone(),
+                        text: Some((t.to_string(), true)),
+                        tokens: count(t),
+                    };
+                    count(&item_md(n, &q, mode, spaces))
+                };
+                let cut = truncate_to_tokens(&full, room, &render).to_string();
+                if !first && cut.is_empty() {
+                    break;
+                }
+                p.tokens = count(&cut);
+                p.text = Some((cut, true));
+                out.push(p);
             }
-        })
-        .collect()
+            Some(_) => {}
+            // `brief`/`notes`: первая карточка — с урезанным фрагментом
+            None if first => {
+                let notes_l0 = mode == SearchMode::Notes && p.item.hit.attachment.is_none();
+                let full = card_summary(&p.item, mode).to_string();
+                let render = |sum: &str| -> usize {
+                    let mut q = Packed {
+                        item: p.item.clone(),
+                        text: None,
+                        tokens: p.tokens,
+                    };
+                    if notes_l0 {
+                        q.item.l0 = Some(sum.to_string());
+                    } else {
+                        q.item.hit.snippet = sum.to_string();
+                    }
+                    count(&item_md(n, &q, mode, spaces))
+                };
+                let cut = cut_summary(&full, &render, room);
+                if notes_l0 {
+                    p.item.l0 = Some(cut);
+                } else {
+                    p.item.hit.snippet = cut;
+                }
+                out.push(p);
+            }
+            None => {}
+        }
+        break;
+    }
+    out
+}
+
+/// Отсечка слабых карточек `brief`/`notes` (M6 §4.2, `search.brief_min_rel`): балл ниже
+/// `min_rel × лучший` — вон; соседи `expand=graph` (явный запрос) не отсекаются.
+fn drop_weak(items: &mut Vec<Item>, mode: SearchMode, min_rel: f64) {
+    if min_rel <= 0.0 || !matches!(mode, SearchMode::Brief | SearchMode::Notes) {
+        return;
+    }
+    let best = items.iter().map(|it| it.score).fold(f64::MIN, f64::max);
+    if !best.is_finite() {
+        return;
+    }
+    items.retain(|it| it.via.is_some() || it.score >= min_rel * best);
 }
 
 /// Балл ответа: 0..1 с точностью 1e-4. Переполнение после бустов и канала папок уже снято
@@ -1574,13 +1725,16 @@ fn item_json(p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>, now: Tim
         }
     }
     o.insert("seen".into(), json!(p.item.seen));
+    if p.item.in_cache {
+        o.insert("in_cache".into(), json!(true));
+    }
     if !p.item.stale_refs.is_empty() {
         o.insert("stale_refs".into(), json!(p.item.stale_refs));
     }
     // у вложения L0 нет: и в `notes` — сниппет
     if mode == SearchMode::Notes && h.attachment.is_none() {
         o.insert("l0".into(), json!(p.item.l0));
-    } else if !p.item.seen {
+    } else if !p.item.hidden() {
         o.insert("snippet".into(), json!(h.snippet));
     }
     if let Some((t, truncated)) = &p.text {
@@ -1598,13 +1752,40 @@ fn hit_age(h: &FtsHit, now: Timestamp) -> u32 {
     zam_store::time::age_days(now, h.updated_at, h.verified_at.as_deref())
 }
 
-/// Возраст в Markdown (M4.5 §7): `сегодня` или `N дн. назад`.
-pub(crate) fn age_text(days: u32) -> String {
-    if days == 0 {
-        "сегодня".into()
-    } else {
-        format!("{days} дн. назад")
+/// Балл карточки v2 (M6 §4.1): два знака без ведущего нуля — `.82`; единица — `1.0`.
+pub(crate) fn score_text(score: f64) -> String {
+    let t = format!("{:.2}", score.clamp(0.0, 1.0));
+    match t.strip_prefix('0') {
+        Some(rest) => rest.to_string(),
+        None => "1.0".into(),
     }
+}
+
+/// Хвост карточки v2 (M6 §4.1): `[.82] r7 · th · 2026-10-10 14:03:22 · 340t` — балл, ревизия
+/// (`rev = 0` — без неё: записи журнала, вложения), надёжность, статус записи (только не
+/// `active`), дата обновления UTC `yyyy-MM-dd HH:mm:ss`, размер в токенах. Возраста «N дн.
+/// назад» нет: строка детерминирована, `age_days` остаётся в JSON.
+pub(crate) fn card_tail(
+    score: f64,
+    rev: i64,
+    updated: Timestamp,
+    tokens: usize,
+    certainty: Option<&str>,
+    status: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if rev > 0 {
+        parts.push(format!("r{rev}"));
+    }
+    if let Some(c) = certainty.filter(|c| !c.is_empty()) {
+        parts.push(zam_core::certainty_short(c).to_string());
+    }
+    if let Some(st) = status.filter(|st| !st.is_empty() && *st != "active") {
+        parts.push(st.to_string());
+    }
+    parts.push(zam_core::time::agent_ts(&fmt_ts(updated)).unwrap_or_default());
+    parts.push(format!("{tokens}t"));
+    format!("[{}] {}", score_text(score), parts.join(" · "))
 }
 
 /// Пометка Markdown об устаревших ссылках (M4.5 §6.2):
@@ -1633,9 +1814,15 @@ pub(crate) fn md_inline(s: &str) -> String {
         .replace([MARK_START, MARK_END], "**")
 }
 
-/// Заголовок карточки записи журнала (§9.3):
-/// `i:<id> insight/<вид> «<заголовок>»  [0.77] active · hypothesis · 3 дн. назад · ~120 tok`.
-fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, age: u32, tokens: usize) -> String {
+/// Заголовок карточки записи журнала (§9.3, M6 §4.1):
+/// `i:<id> insight/<вид> «<заголовок>»  [.77] hyp · 2026-09-28 08:00:01 · 120t`.
+fn entry_card(
+    e: &zam_store::EntryHit,
+    id: Id,
+    score: f64,
+    updated: Timestamp,
+    tokens: usize,
+) -> String {
     let letter = EntryKind::parse(&e.kind).map_or("e", EntryKind::ref_letter);
     let mut line = format!("{letter}:{id} {}", e.kind);
     if let Some(k) = &e.insight_kind {
@@ -1643,25 +1830,25 @@ fn entry_card(e: &zam_store::EntryHit, id: Id, score: f64, age: u32, tokens: usi
         line.push_str(&md_inline(k));
     }
     line.push_str(&format!(" «{}»", md_inline(&e.title)));
-    let mut parts: Vec<String> = [&e.status, &e.certainty]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect();
-    parts.push(age_text(age));
-    parts.push(format!("~{tokens} tok"));
-    line.push_str(&format!("  [{score:.2}] {}\n", parts.join(" · ")));
+    let tail = card_tail(
+        score,
+        0,
+        updated,
+        tokens,
+        e.certainty.as_deref(),
+        e.status.as_deref(),
+    );
+    line.push_str(&format!("  {tail}\n"));
     line
 }
 
 /// Заголовок карточки фрагмента вложения (без номера): `a:<chunk> <space>/<путь заметки> › <файл>
-/// › <путь заголовков> · стр. 12  [0.82] · <certainty> · 2026-10-10 · сегодня · ~120 tok`.
+/// › <путь заголовков> · стр. 12  [.82] th · 2026-10-10 14:03:22 · 120t`.
 fn attachment_card(
     h: &FtsHit,
     a: &AttachmentHit,
     space: &str,
     score: f64,
-    age: u32,
     tokens: usize,
 ) -> String {
     let mut line = format!(
@@ -1678,49 +1865,36 @@ fn attachment_card(
         line.push_str(" · ");
         line.push_str(&md_inline(&l));
     }
-    let certainty = h
-        .certainty
-        .as_ref()
-        .map(|c| format!(" · {c}"))
-        .unwrap_or_default();
-    line.push_str(&format!(
-        "  [{score:.2}]{certainty} · {} · {} · ~{tokens} tok\n",
-        h.updated_at.strftime("%Y-%m-%d"),
-        age_text(age),
-    ));
+    let tail = card_tail(score, 0, h.updated_at, tokens, h.certainty.as_deref(), None);
+    line.push_str(&format!("  {tail}\n"));
     line
 }
 
-/// Карточка §9.3: `1. n:<id> <space>/<path> › <секция>  [0.82] rev7 · 2026-10-10 · 3 дн. назад
-/// · ~340 tok` (у записи журнала — [`entry_card`], у вложения — [`attachment_card`]).
-fn item_md(
-    n: usize,
-    p: &Packed,
-    mode: SearchMode,
-    spaces: &HashMap<Id, Space>,
-    now: Timestamp,
-) -> String {
+/// Карточка §9.3, M6 §4.1: `1. n:<id> <space>/<path> › <секция>  [.82] r7 · 2026-10-10 14:03:22
+/// · 340t` (у записи журнала — [`entry_card`], у вложения — [`attachment_card`]).
+fn item_md(n: usize, p: &Packed, mode: SearchMode, spaces: &HashMap<Id, Space>) -> String {
     let h = &p.item.hit;
-    let age = hit_age(h, now);
     // у переставленных реранкером `score` — его балл с бустами (§9.2 п. 5)
     let score = p.item.score.min(1.0);
     let mut line = match (&h.entry, p.item.folder) {
-        // карточка папки: `f:<id> <пространство>/<путь>/  [0.61] · 4 детей`
+        // карточка папки: `f:<id> <пространство>/<путь>/  [.61] 4 детей`
         (_, Some(children)) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             format!(
-                "{n}. f:{} {space}/{}/  [{score:.2}] · {children} детей\n",
-                h.target.id, h.path
+                "{n}. f:{} {space}/{}/  [{}] {children} детей\n",
+                h.target.id,
+                h.path,
+                score_text(score)
             )
         }
-        (Some(e), None) => format!("{n}. {}", entry_card(e, h.target.id, score, age, p.tokens)),
+        (Some(e), None) => format!(
+            "{n}. {}",
+            entry_card(e, h.target.id, score, h.updated_at, p.tokens)
+        ),
         (None, None) if h.attachment.is_some() => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
             let a = h.attachment.as_ref().expect("проверено выше");
-            format!(
-                "{n}. {}",
-                attachment_card(h, a, space, score, age, p.tokens)
-            )
+            format!("{n}. {}", attachment_card(h, a, space, score, p.tokens))
         }
         (None, None) => {
             let space = spaces.get(&h.space_id).map_or("?", |s| s.name.as_str());
@@ -1729,18 +1903,15 @@ fn item_md(
                 line.push_str(" › ");
                 line.push_str(&h.heading_path);
             }
-            let certainty = h
-                .certainty
-                .as_ref()
-                .map(|c| format!(" · {c}"))
-                .unwrap_or_default();
-            line.push_str(&format!(
-                "  [{score:.2}] rev{}{certainty} · {} · {} · ~{} tok\n",
+            let tail = card_tail(
+                score,
                 h.rev,
-                h.updated_at.strftime("%Y-%m-%d"),
-                age_text(age),
-                p.tokens
-            ));
+                h.updated_at,
+                p.tokens,
+                h.certainty.as_deref(),
+                None,
+            );
+            line.push_str(&format!("  {tail}\n"));
             line
         }
     };
@@ -1750,12 +1921,19 @@ fn item_md(
         }
         line.push_str(&format!(" · via {} ← {from}\n", t.as_str()));
     }
-    // выдан этой сессии в той же ревизии: пометка вместо фрагмента (§9.3)
+    // выдан этой сессии в той же ревизии: пометка вместо фрагмента (§9.3); у MCP — пометка
+    // при фрагменте (M6 §7.1)
     if p.item.seen {
         if line.ends_with('\n') {
             line.pop();
         }
-        line.push_str("   (seen)\n");
+        line.push_str(if p.item.in_cache {
+            "   (выдавалось, в выжимке)\n"
+        } else if p.item.seen_kept {
+            "   (выдавалось)\n"
+        } else {
+            "   (seen)\n"
+        });
     }
     // устаревшие ссылки на файлы — строкой под заголовком карточки (M4.5 §6.2)
     if let Some(s) = stale_line(&p.item.stale_refs) {
@@ -1763,7 +1941,7 @@ fn item_md(
         line.push_str(&s);
         line.push('\n');
     }
-    if p.item.seen {
+    if p.item.hidden() {
         return line;
     }
     match &p.text {
@@ -1984,6 +2162,8 @@ fn folder_card(target: usize, f: &zam_store::FolderRow, score: f64) -> Item {
         via: None,
         folder: Some(f.child_count),
         seen: false,
+        seen_kept: false,
+        in_cache: false,
         stale_refs: Vec::new(),
     }
 }
@@ -2011,11 +2191,13 @@ fn seen_tracked(it: &Item) -> bool {
 
 /// Помечает элементы, уже выданные сессии в той же ревизии (`seen`), и снимает их текст:
 /// выдана цель целиком, все чанки элемента (`chunk_ids`) или — у вложения — его `locator`
-/// (`/read` отдал единицу документа целиком).
+/// (`/read` отдал единицу документа целиком). `keep` — пометить, но оставить фрагмент и текст
+/// (`seen_kept`, MCP без явного `skip_seen`, M6 §7.1).
 async fn mark_seen_items(
     s: &RequestSession,
     targets: &[SearchTarget],
     items: &mut [Item],
+    keep: bool,
 ) -> Result<(), StoreError> {
     let locator = |it: &Item| it.hit.attachment.as_ref().and_then(|a| a.locator.clone());
     let parts = |it: &Item| -> Vec<SeenKey> {
@@ -2030,7 +2212,7 @@ async fn mark_seen_items(
         .filter(|it| seen_tracked(it))
         .flat_map(parts)
         .collect();
-    let revs = seen_revs(&s.db, &s.touch.id, &keys).await?;
+    let revs = seen_revs(&s.db, &s.touch.id, s.touch.epoch, &keys).await?;
     let same = |k: &SeenKey, rev: i64| revs.get(k) == Some(&rev);
     for it in items.iter_mut().filter(|it| seen_tracked(it)) {
         let rev = it.hit.rev;
@@ -2043,11 +2225,73 @@ async fn mark_seen_items(
                 .all(|c| same(&seen_key(targets, it, c), rev));
         if whole || chunks {
             it.seen = true;
-            it.text = None;
+            it.seen_kept = keep;
+            if !keep {
+                it.text = None;
+            }
         }
     }
     Ok(())
 }
+
+/// Карточки `(выдавалось)` (MCP, `seen_kept`), чья цель — источник действующей выжимки шага 0
+/// этого ответа (`cache`), — без фрагмента и текста, `in_cache` (M6 §7.1, решение контролёра
+/// 2026-11-06). Цель и ревизия совпадают с источником точно. Источник-секция покрывает карточку,
+/// только если текст её чанка **целиком** лежит в тексте секции ([`zam_store::section_text`]
+/// ревизии карточки): чанкер склеивает короткие секции со следующей и даёт склейке путь первой
+/// (а лист H4 — путь первой H4), поэтому `heading_path` не доказывает, что в чанке нет текста
+/// соседней секции (повторное ревью задачи 7a, I-A). Сбой чтения текста или любой промах —
+/// фрагмент остаётся. Ожидаемо с фрагментом: заметка с секретами (чанки режутся по маскированному
+/// тексту) и чанк с повторённым заголовком блока — текста чанка нет в тексте секции дословно.
+async fn mark_cache_sources(
+    targets: &[SearchTarget],
+    cache: &[cache_step::CacheItem],
+    items: &mut [Item],
+) {
+    let deps: Vec<&zam_store::CacheDep> = cache.iter().flat_map(|c| c.valid_sources()).collect();
+    if deps.is_empty() {
+        return;
+    }
+    // текст ревизии узла — один раз на (база, узел, ревизия)
+    let mut texts: HashMap<(usize, Id, i64), Option<String>> = HashMap::new();
+    for it in items.iter_mut().filter(|it| it.seen && it.seen_kept) {
+        let mut covered = false;
+        for d in deps
+            .iter()
+            .filter(|d| d.target == it.hit.target && d.rev == it.hit.rev)
+        {
+            let Some(sec) = d.section.as_deref() else {
+                covered = true;
+                break;
+            };
+            if it.hit.target.kind != TargetKind::Node {
+                continue;
+            }
+            let key = (it.target, it.hit.target.id, it.hit.rev);
+            if let std::collections::hash_map::Entry::Vacant(v) = texts.entry(key) {
+                let db = &targets[it.target].db;
+                let r = node_content(db, it.hit.target.id, Some(it.hit.rev)).await;
+                v.insert(r.ok().map(|(_, t)| t));
+            }
+            let inside = texts[&key]
+                .as_deref()
+                .and_then(|t| zam_store::section_text(t, sec))
+                .is_some_and(|st| !it.hit.text.is_empty() && st.contains(it.hit.text.as_str()));
+            if inside {
+                covered = true;
+                break;
+            }
+        }
+        if covered {
+            it.seen_kept = false;
+            it.in_cache = true;
+            it.text = None;
+        }
+    }
+}
+
+/// Событие `session_tokens` поиска REST и CLI (M6 §8).
+pub const SEARCH_TOKEN_EVENT: &str = "search";
 
 /// Сбой учёта сессии не валит поиск: WARN (без id сессии и текста), ответ — без пометок.
 fn session_failed(what: &str, e: &StoreError) {
@@ -2084,10 +2328,49 @@ async fn alias_expansion(st: &AppState, tg: &SearchTarget, qterms: &[&str]) -> V
 
 /// `POST /search`.
 pub async fn search(
+    state: State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    search_with(state, p, headers, origin, body, None).await
+}
+
+/// Проба лёгкого поиска (фича `test-hooks`): запрос, длины слитых каналов и число элементов
+/// выдачи со сниппетом — тесты проверяют, что подсказки-идеи идут лёгким поиском.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightProbe {
+    pub query: String,
+    pub light: LightSearch,
+    pub bm25: usize,
+    pub trigram: usize,
+    pub with_snippet: usize,
+}
+
+/// Пробы лёгких поисков процесса ([`LightProbe`]).
+#[cfg(feature = "test-hooks")]
+pub static TEST_LIGHT_SEARCHES: std::sync::Mutex<Vec<LightProbe>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// [`search`] с облегчением `light` (M6 §16, задача 16) — только для внутреннего поиска
+/// подсказок-идей к `prompt` (`api/recall.rs`): каналы FTS не длиннее
+/// [`LightSearch::channel_depth`], сниппеты строятся только при [`LightSearch::snippets`]
+/// (у элементов выдачи `snippet` пуст), непроиндексированные заметки не считаются
+/// (`pending_count` — 0), устаревшие ссылки на файлы в карточках не помечаются. Состав, порядок
+/// и баллы элементов — те же, что у обычного поиска с той же глубиной каналов, **при живых
+/// целях**: вместе со счётчиком пропадает его побочный эффект — сбой `pending_count` в базе
+/// чужого решения больше не исключает это решение до каналов ([`Health::soft`]); такая база
+/// исключается первым же следующим чтением (каналы FTS). `None` — обычный поиск, побайтово
+/// прежний: в API параметра нет.
+pub(crate) async fn search_with(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
+    light: Option<LightSearch>,
 ) -> Result<Response, ApiError> {
     let total_t = Instant::now();
     let req: SearchReq = json_body(body)?;
@@ -2104,14 +2387,27 @@ pub async fn search(
             zam_store::search::QUERY_MAX_CHARS
         )));
     }
-    let budget = req.budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS);
+    let budget = req.budget_tokens.unwrap_or(st.cfg.search.budget_tokens);
+    let min_rel = req.brief_min_rel.unwrap_or(st.cfg.search.brief_min_rel);
+    if !(min_rel.is_finite() && (0.0..=1.0).contains(&min_rel)) {
+        return Err(ApiError::BadRequest("brief_min_rel: от 0 до 1".into()));
+    }
     let mut kinds = target_filter(&req.filters, req.include_history, p.is_human())?;
     kinds.area = area_filter(req.scope.area.as_deref())?;
-    let boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
+    let mut boosts = st.cfg.search.boosts(header_value(&headers, AREA_HEADER)?);
     let (targets, warnings) = resolve_targets(&st, &p, &headers, &req.scope).await?;
     // сессия: некорректный id — 400; сбой её базы поиск не валит (WARN, без пометок)
-    let session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
-        Ok(s) => s,
+    let session = match seen_session(
+        &st,
+        &p,
+        &headers,
+        origin.as_deref(),
+        req.session_id.as_deref(),
+    )
+    .await
+    {
+        // неявная сессия MCP (M6 §7.1) — как без сессии: без отметок и пометок
+        Ok(s) => explicit_only(s),
         // некорректный id — 400, несуществующий пользователь (`X-Zam-User`) — 404
         Err(e @ (ApiError::BadRequest(_) | ApiError::NotFound)) => return Err(e),
         Err(e) => {
@@ -2159,18 +2455,18 @@ pub async fn search(
             } else {
                 Vec::new()
             };
-            let r = search_fts_channels(
-                &tg.db,
-                FtsQuery {
-                    text: req.query.clone(),
-                    space_ids: tg.space_ids(),
-                    path_prefix: prefix.clone(),
-                    top_k: TOP_K_MAX,
-                    targets: kinds.clone(),
-                    alias_groups: alias_groups(&exp),
-                },
-            )
-            .await;
+            let q = FtsQuery {
+                text: req.query.clone(),
+                space_ids: tg.space_ids(),
+                path_prefix: prefix.clone(),
+                top_k: TOP_K_MAX,
+                targets: kinds.clone(),
+                alias_groups: alias_groups(&exp),
+            };
+            let r = match light {
+                Some(l) => search_fts_channels_light(&tg.db, q, l).await,
+                None => search_fts_channels(&tg.db, q).await,
+            };
             (r, exp)
         }))
         .await;
@@ -2200,16 +2496,21 @@ pub async fn search(
     // вектор их видит (флейк шага 17 smoke: счёт после запроса давал 0 при FTS-only выдаче).
     // Сумма — по целям, живым к концу обработчика
     let pending_t = Instant::now();
-    let pending_runs = join_all(
-        targets
-            .iter()
-            .map(|t| pending_count(&t.db, t.space_ids(), prefix.clone())),
-    )
-    .await;
     let mut pending_by = vec![0; targets.len()];
-    for (i, r) in pending_runs.into_iter().enumerate() {
-        if health.alive[i] {
-            pending_by[i] = health.soft(i, r)?.unwrap_or(0);
+    // лёгкому поиску счётчик не нужен (подсказки-идеи его не читают): `pending_count` — 0.
+    // Побочный эффект счётчика — `health.soft` исключал чужое решение с нечитаемой базой ещё до
+    // каналов — у лёгкого поиска берут на себя каналы FTS (тот же `health.soft` ниже)
+    if light.is_none() {
+        let pending_runs = join_all(
+            targets
+                .iter()
+                .map(|t| pending_count(&t.db, t.space_ids(), prefix.clone())),
+        )
+        .await;
+        for (i, r) in pending_runs.into_iter().enumerate() {
+            if health.alive[i] {
+                pending_by[i] = health.soft(i, r)?.unwrap_or(0);
+            }
         }
     }
     let pending_ms = ms(pending_t);
@@ -2255,7 +2556,11 @@ pub async fn search(
             }
         }
     }
-    let fts = merge_channels(per_db, FTS_BM25_TOP, FTS_TRIGRAM_TOP);
+    // лёгкий поиск: слитые каналы нескольких баз — тоже не длиннее его глубины
+    let depth = |top: usize| light.map_or(top, |l| top.min(l.channel_depth.max(1)));
+    let fts = merge_channels(per_db, depth(FTS_BM25_TOP), depth(FTS_TRIGRAM_TOP));
+    #[cfg(feature = "test-hooks")]
+    let light_channels = (fts.bm25.len(), fts.trigram.len());
 
     // 2. векторные хиты — в базу своего владельца, только живые чанки пространств цели
     let fuse_t = Instant::now();
@@ -2363,7 +2668,26 @@ pub async fn search(
             .collect(),
     };
     let weights = st.cfg.search.weights();
-    let (mut ranked, norm_max) = fuse_normed(&inputs, &weights, jiff::Timestamp::now());
+    let (mut ranked, norm_max) = fuse_normed(&inputs, &weights, zam_store::time::now());
+    // M6 §10: без буста вида — записи, которым противоречит более надёжная запись среди всех
+    // кандидатов слияния (до `top_k`); тот же набор действует и на баллы реранкера
+    if boosts.kind_mode == KindBoostMode::UnlessContradicted {
+        let cands: Vec<graph::KindCandidate> = ranked
+            .iter()
+            .filter_map(|r| {
+                let (i, h) = hits.get(&r.chunk_id)?;
+                let kind = inputs.chunks.get(&r.chunk_id)?.insight_kind.as_deref();
+                Some(graph::KindCandidate {
+                    target: *i,
+                    r: h.target,
+                    boosted: boosts.kind_boosted(kind),
+                })
+            })
+            .collect();
+        if cands.iter().any(|c| c.boosted) {
+            boosts.kind_exempt = graph::kind_boost_exempt(&mut health, &cands).await?;
+        }
+    }
     apply_boosts(&mut ranked, &inputs.chunks, &boosts);
     // балл выше 1 после бустов и канала папок: все баллы делятся на лучший (порядок прежний)
     let overflow = rescale_overflow(&mut ranked);
@@ -2441,7 +2765,7 @@ pub async fn search(
         .filter_map(|r| {
             let (target, hit) = hits.get(&r.chunk_id)?;
             let mut hit = hit.clone();
-            if hit.snippet.is_empty() {
+            if hit.snippet.is_empty() && light.is_none_or(|l| l.snippets) {
                 hit.snippet = text_snippet(&hit.text, &needles);
             }
             Some(Item {
@@ -2456,6 +2780,8 @@ pub async fn search(
                 via: None,
                 folder: None,
                 seen: false,
+                seen_kept: false,
+                in_cache: false,
                 stale_refs: Vec::new(),
             })
         })
@@ -2473,6 +2799,18 @@ pub async fn search(
         Vec::new()
     };
     let fuse_ms = ms(fuse_t);
+    #[cfg(feature = "test-hooks")]
+    if let Some(l) = light
+        && let Ok(mut probes) = TEST_LIGHT_SEARCHES.lock()
+    {
+        probes.push(LightProbe {
+            query: req.query.clone(),
+            light: l,
+            bm25: light_channels.0,
+            trigram: light_channels.1,
+            with_snippet: items.iter().filter(|i| !i.hit.snippet.is_empty()).count(),
+        });
+    }
 
     // 4. серверный реранк; пересборка индекса — предупреждение о неполной векторной выдаче
     if st.index.reindexing() {
@@ -2558,42 +2896,100 @@ pub async fn search(
     let mut warnings = health.warnings;
     dedup_keep_order(&mut warnings);
     // выданное этой сессии в той же ревизии — без фрагмента и текста (§9.3)
+    // MCP (M6 §7.1): субагенты идут с сессией родителя — без явного `skip_seen` фрагмент
+    // остаётся, с пометкой «(выдавалось)»
     if let Some(s) = &session
         && req.skip_seen.unwrap_or(true)
-        && let Err(e) = mark_seen_items(s, &targets, &mut items).await
+        && let Err(e) = mark_seen_items(
+            s,
+            &targets,
+            &mut items,
+            s.via_mcp && req.skip_seen.is_none(),
+        )
+        .await
     {
         session_failed("чтение выданного", &e);
     }
-    // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется
-    attach_stale_refs(&targets, &mut items).await;
+    // источник выжимки этого ответа — без фрагмента (M6 §7.1, решение контролёра 2026-11-06)
+    mark_cache_sources(&targets, &cache_items, &mut items).await;
+    // устаревшие ссылки на файлы — пометкой в карточке (M4.5 §6.2), ранжирование не меняется;
+    // лёгкому поиску пометки карточек не нужны
+    if light.is_none() {
+        attach_stale_refs(&targets, &mut items).await;
+    }
     // лист с секретом в имени — номером, как в `/read` (задача 7 M5, раунд правок 2)
     number_secret_sheets(&targets, &mut items).await;
-    // выжимки шага 0 — из того же бюджета
-    let cache_tokens: usize = cache_items.iter().map(cache_step::CacheItem::tokens).sum();
-    let packed = pack_items(items, mode, budget.saturating_sub(cache_tokens).max(1));
-    // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
-    if let (Some(s), SearchMode::Chunks) = (&session, mode) {
-        let given: Vec<SeenItem> = packed
-            .iter()
-            .filter(|p| matches!(p.text, Some((_, false))) && seen_tracked(&p.item))
-            .flat_map(|p| {
-                p.item.chunk_ids.iter().map(|c| SeenItem {
-                    key: seen_key(&targets, &p.item, c),
-                    rev: p.item.hit.rev,
-                })
-            })
-            .collect();
-        if let Err(e) = mark_seen(&s.db, &s.touch, &given).await {
-            session_failed("отметка выданного", &e);
-        }
-    }
+    // слабые карточки `brief`/`notes` — вон (M6 §4.2, `search.brief_min_rel`)
+    drop_weak(&mut items, mode, min_rel);
     let degraded = available.err().or(vrun.failed);
-    let now = Timestamp::now();
+    let now = zam_store::time::now();
     let by_id: HashMap<Id, Space> = targets
-        .into_iter()
-        .flat_map(|t| t.spaces)
+        .iter()
+        .flat_map(|t| t.spaces.iter().cloned())
         .map(|s| (s.id, s))
         .collect();
+    // честный бюджет (M6 §4.2): Markdown целиком — выжимки шага 0, карточки, строки
+    // деградации и предупреждений и строка MCP `~N tok` — счётчиком сервера; JSON — тот же отбор
+    let tail_md = md_tail(degraded, &warnings);
+    let cache_md: String = cache_items.iter().map(cache_step::item_md).collect();
+    let reserve = count_tokens(&cache_md)
+        + count_tokens(&tail_md)
+        + count_tokens(&format!("~{budget} tok"))
+        + 1;
+    // упаковка суммами частей — против `budget_cap` (без модели — с запасом оценки), итог — `fits`
+    let mut packed = pack_items(
+        items,
+        mode,
+        zam_store::budget_cap(budget).saturating_sub(reserve),
+        &count_tokens,
+        &by_id,
+    );
+    // суммы частей и счёт целого могут разойтись на стыках: с конца снимаются карточки
+    // Markdown ответа (он же — размер выдачи для учёта) считается один раз на итог отбора
+    let mut md_text = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
+    while packed.len() > 1 {
+        let n = count_tokens(&md_text);
+        if zam_store::fits_budget(&format!("{md_text}~{n} tok"), budget) {
+            break;
+        }
+        packed.pop();
+        md_text = md_body(&cache_md, &packed, mode, &by_id, &tail_md);
+    }
+    if let Some(s) = &session {
+        // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
+        let given: Vec<SeenItem> = if mode == SearchMode::Chunks {
+            packed
+                .iter()
+                .filter(|p| matches!(p.text, Some((_, false))) && seen_tracked(&p.item))
+                .flat_map(|p| {
+                    p.item.chunk_ids.iter().map(|c| SeenItem {
+                        key: seen_key(&targets, &p.item, c),
+                        rev: p.item.hit.rev,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // учёт выданного (M6 §8): REST и CLI с явной сессией — событие `search`, токены —
+        // Markdown того же отбора (у `format=json` — тоже он: размер выдачи, а не обёртки JSON);
+        // из MCP вызов считает инструмент событием `mcp`
+        let counts: Vec<TokenCount> = (!s.via_mcp)
+            .then(|| TokenCount {
+                event: SEARCH_TOKEN_EVENT.into(),
+                calls: 1,
+                tokens: count_tokens(&md_text) as u64,
+                reread_calls: 0,
+            })
+            .into_iter()
+            .collect();
+        // отметки и учёт — одной транзакцией базы сессии, как у `/recall` и `/read`
+        if (mode == SearchMode::Chunks || !counts.is_empty())
+            && let Err(e) = mark_seen_with_tokens(&s.db, &s.touch, &given, &counts).await
+        {
+            session_failed("отметка и учёт выданного", &e);
+        }
+    }
 
     Ok(match format {
         OutFormat::Json => {
@@ -2626,24 +3022,7 @@ pub async fn search(
             .into_response()
         }
         OutFormat::Md => {
-            let mut body: String = cache_items.iter().map(cache_step::item_md).collect();
-            body.extend(
-                packed
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| item_md(i + 1, p, mode, &by_id, now)),
-            );
-            if let Some(r) = degraded {
-                body.push_str(&format!(
-                    "> degraded: {} — {} (только FTS)\n",
-                    r.as_str(),
-                    r.text()
-                ));
-            }
-            for w in &warnings {
-                body.push_str(&format!("> warning: {w}\n"));
-            }
-            let mut r = body.into_response();
+            let mut r = md_text.into_response();
             r.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/markdown; charset=utf-8"),
@@ -2673,7 +3052,7 @@ mod tests {
             token_count: count_tokens(text) as i64,
             score: 1.0,
             raw_score: 0.0,
-            updated_at: jiff::Timestamp::now(),
+            updated_at: zam_store::time::now(),
             snippet: format!("{MARK_START}s{MARK_END}"),
             text: text.into(),
             index_state: "indexed".into(),
@@ -2683,6 +3062,11 @@ mod tests {
             verified_at: None,
             attachment: None,
         }
+    }
+
+    /// Упаковка счётчиком сервера без пространств (карточки — `?/<путь>`).
+    fn pk(items: Vec<Item>, mode: SearchMode, budget: usize) -> Vec<Packed> {
+        pack_items(items, mode, budget, &count_tokens, &HashMap::new())
     }
 
     fn items(hits: Vec<FtsHit>, with_text: bool) -> Vec<Item> {
@@ -2699,6 +3083,8 @@ mod tests {
                 via: None,
                 folder: None,
                 seen: false,
+                seen_kept: false,
+                in_cache: false,
                 stale_refs: Vec::new(),
             })
             .collect()
@@ -2759,7 +3145,7 @@ mod tests {
     /// `file`, `blob_sha256`, `locator`, `locator_text`.
     #[test]
     fn md_card_locator_text() {
-        let now = Timestamp::now();
+        let now = zam_store::time::now();
         let doc = Id::new();
         let mut h = att_hit(doc, "Текст страницы");
         h.chunk_id = "ab".repeat(16);
@@ -2767,18 +3153,17 @@ mod tests {
         h.heading_path = "Глава 1".into();
         let owner = h.attachment.as_ref().unwrap().node_id;
         let card = |h: FtsHit| {
-            let mut p = pack_items(items(vec![h], false), SearchMode::Brief, 1000).remove(0);
+            let mut p = pk(items(vec![h], false), SearchMode::Brief, 1000).remove(0);
             p.tokens = 7;
             p
         };
         let p = card(h.clone());
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         let chunk = "ab".repeat(16);
         assert!(
             s.starts_with(&format!(
-                "1. a:{chunk} ?/docs/отчёт › книга.pdf › Глава 1 · стр. 12  [0.50] · {} · \
-                 сегодня · ~7 tok\n",
-                now.strftime("%Y-%m-%d")
+                "1. a:{chunk} ?/docs/отчёт › книга.pdf › Глава 1 · стр. 12  [.50] {} · 7t\n",
+                p.item.hit.updated_at.strftime("%Y-%m-%d %H:%M:%S")
             )),
             "{s}"
         );
@@ -2798,7 +3183,7 @@ mod tests {
         s.attachment.as_mut().unwrap().locator = Some("sheet:AKIAIOSFODNN7EXAMPLE!A1:B2".into());
         let p = card(s);
         let j = item_json(&p, SearchMode::Brief, &HashMap::new(), now);
-        let md = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let md = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         for t in [j["locator"].to_string(), j["locator_text"].to_string(), md] {
             assert!(!t.contains("AKIAIOSFODNN7EXAMPLE"), "{t}");
         }
@@ -2813,7 +3198,7 @@ mod tests {
             h.attachment.as_mut().unwrap().locator = Some(loc.into());
             let p = card(h);
             assert!(
-                item_md(1, &p, SearchMode::Brief, &HashMap::new(), now)
+                item_md(1, &p, SearchMode::Brief, &HashMap::new())
                     .contains(&format!("› Глава 1 · {text}  [")),
                 "{loc}"
             );
@@ -2827,8 +3212,8 @@ mod tests {
         h.attachment.as_mut().unwrap().locator = None;
         let p = card(h);
         assert!(
-            item_md(1, &p, SearchMode::Brief, &HashMap::new(), now)
-                .starts_with(&format!("1. a:{chunk} ?/docs/отчёт › книга.pdf  [0.50]")),
+            item_md(1, &p, SearchMode::Brief, &HashMap::new())
+                .starts_with(&format!("1. a:{chunk} ?/docs/отчёт › книга.pdf  [.50]")),
         );
         assert!(item_json(&p, SearchMode::Brief, &HashMap::new(), now)["locator_text"].is_null());
         // в `notes` у вложения нет L0 — карточка несёт сниппет
@@ -2841,17 +3226,19 @@ mod tests {
     fn budget_trims_text_and_keeps_one() {
         let long = "слово ".repeat(100);
         let hs = vec![hit(Id::new(), &long), hit(Id::new(), "бб")];
-        let p = pack_items(items(hs, true), SearchMode::Chunks, 10);
+        // бюджет — вся карточка (M6 §4.2): заголовок и урезанный текст
+        let p = pk(items(hs, true), SearchMode::Chunks, 80);
         assert_eq!(p.len(), 1);
         let (t, tr) = p[0].text.clone().unwrap();
-        assert!(tr && count_tokens(&t) <= 10 && !t.is_empty(), "{t}");
-        let p = pack_items(
+        let md = item_md(1, &p[0], SearchMode::Chunks, &HashMap::new());
+        assert!(tr && count_tokens(&md) <= 80 && !t.is_empty(), "{md}");
+        let p = pk(
             items(vec![hit(Id::new(), "x")], true),
             SearchMode::Chunks,
             0,
         );
         assert_eq!(p.len(), 1);
-        let p = pack_items(
+        let p = pk(
             items(vec![hit(Id::new(), "x"), hit(Id::new(), "y")], false),
             SearchMode::Brief,
             0,
@@ -3302,7 +3689,7 @@ mod tests {
             owner_id: Id::new(),
             space_id: sp.id,
             name: "x".into(),
-            created_at: jiff::Timestamp::now(),
+            created_at: zam_store::time::now(),
         };
         let targets = vec![mk(None), mk(Some(info))];
         let mut h = Health::new(&targets, vec!["solution access pending".into()]);
@@ -3346,6 +3733,42 @@ mod tests {
         assert_eq!(sections[&(0, out[1].hit.target, SectionKey::At(2))], 1);
     }
 
+    /// Хвост карточки §4.1 дословно (примеры спецификации).
+    #[test]
+    fn card_tail_v2_strings() {
+        let t = |s: &str| -> Timestamp { s.parse().unwrap() };
+        assert_eq!(
+            card_tail(0.82, 7, t("2026-10-10T14:03:22Z"), 340, None, None),
+            "[.82] r7 · 2026-10-10 14:03:22 · 340t"
+        );
+        assert_eq!(
+            card_tail(
+                0.77,
+                0,
+                t("2026-09-28T08:00:01Z"),
+                120,
+                Some("hypothesis"),
+                Some("active")
+            ),
+            "[.77] hyp · 2026-09-28 08:00:01 · 120t"
+        );
+        assert_eq!(
+            card_tail(1.0, 3, t("2026-01-02T03:04:05Z"), 5, Some("axiom"), None),
+            "[1.0] r3 · ax · 2026-01-02 03:04:05 · 5t"
+        );
+        assert_eq!(
+            card_tail(
+                0.051,
+                0,
+                t("2026-01-02T03:04:05Z"),
+                0,
+                Some("theorem"),
+                Some("superseded")
+            ),
+            "[.05] th · superseded · 2026-01-02 03:04:05 · 0t"
+        );
+    }
+
     #[test]
     fn md_card_format() {
         let mut it = items(vec![hit(Id::new(), "текст")], false).remove(0);
@@ -3356,10 +3779,9 @@ mod tests {
             text: None,
             tokens: 7,
         };
-        let now = "2026-10-13T09:00:00Z".parse().unwrap();
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         let want = format!(
-            "1. n:{} ?/p › A > B  [0.50] rev1 · 2026-10-10 · 3 дн. назад · ~7 tok\n   **s**\n",
+            "1. n:{} ?/p › A > B  [.50] r1 · 2026-10-10 08:00:00 · 7t\n   **s**\n",
             p.item.hit.target.id
         );
         assert_eq!(s, want);
@@ -3387,12 +3809,14 @@ mod tests {
             tokens: 120,
         };
         let now = p.item.hit.updated_at;
-        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new(), now);
+        let at = now.strftime("%Y-%m-%d %H:%M:%S");
+        let s = item_md(2, &p, SearchMode::Brief, &HashMap::new());
+        // §4.1 дословно: статус `active` не выводится, надёжность — `hyp`
         assert_eq!(
             s,
             format!(
-                "2. i:{id} insight/gotcha «Bash-скрипты должны иметь LF»  [0.50] active · \
-                 hypothesis · сегодня · ~120 tok\n   **s**\n"
+                "2. i:{id} insight/gotcha «Bash-скрипты должны иметь LF»  [.50] hyp · {at} · \
+                 120t\n   **s**\n"
             )
         );
         // changelog без статуса и certainty
@@ -3405,10 +3829,10 @@ mod tests {
             created_at: jiff::Timestamp::UNIX_EPOCH,
         });
         p.tokens = 9;
-        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new(), now);
+        let s = item_md(1, &p, SearchMode::Brief, &HashMap::new());
         assert!(
             s.starts_with(&format!(
-                "1. c:{id} changelog/fix «Исправлен CRLF»  [0.50] сегодня · ~9 tok\n"
+                "1. c:{id} changelog/fix «Исправлен CRLF»  [.50] {at} · 9t\n"
             )),
             "{s}"
         );

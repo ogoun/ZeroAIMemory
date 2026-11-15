@@ -81,6 +81,16 @@ pub enum Ev {
     Compact { trigger: String },
     /// Запись в память командой `zam` (вид записи).
     MemoryWrite { kind: String },
+    /// Снимок сессии из журнала агента (M6 §8а): только счётчики — повод, полнота, размер тела
+    /// `PUT` в байтах, число запросов, файлов и команд; текста снимка здесь нет.
+    Snapshot {
+        trigger: String,
+        status: String,
+        bytes: u64,
+        prompts: u32,
+        files: u32,
+        cmds: u32,
+    },
 }
 
 impl Ev {
@@ -108,6 +118,12 @@ impl Ev {
             }
             Ev::Compact { trigger } => cut(trigger),
             Ev::MemoryWrite { kind } => cut(kind),
+            Ev::Snapshot {
+                trigger, status, ..
+            } => {
+                cut(trigger);
+                cut(status);
+            }
         }
     }
 }
@@ -314,6 +330,8 @@ pub struct Summary {
     pub subagents: Vec<String>,
     /// Записей в память (`Ev::MemoryWrite`).
     pub memory_writes: u32,
+    /// Последний снимок сессии (`Ev::Snapshot`, M6 §8а).
+    pub snapshot_at: Option<Timestamp>,
 }
 
 /// Сводка событий журнала (весь журнал сессии — до сжатия).
@@ -322,7 +340,7 @@ pub fn summarize(events: &[(Timestamp, Ev)]) -> Summary {
         fixes: fixes(events),
         ..Summary::default()
     };
-    for (_, e) in events {
+    for (ts, e) in events {
         match e {
             Ev::Edit { path } => {
                 if s.edited.len() < SUMMARY_FILES_MAX && !s.edited.contains(path) {
@@ -343,6 +361,7 @@ pub fn summarize(events: &[(Timestamp, Ev)]) -> Summary {
                 }
             }
             Ev::MemoryWrite { .. } => s.memory_writes += 1,
+            Ev::Snapshot { .. } => s.snapshot_at = Some(*ts),
             _ => {}
         }
     }
@@ -417,10 +436,16 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// Текст сводки (§9.2), не длиннее [`SUMMARY_MAX_CHARS`] символов: «До сжатия в этой сессии:
-/// правились …; ошибки: N (последняя: …); исправлены: …; субагенты: …; записей в память: N».
+/// правились …; ошибки: N (последняя: …); исправлены: …; субагенты: …; записей в память: N;
+/// снимок сессии <yyyy-MM-dd HH:mm:ss>, извлечено автоматически» (M6 §8а, время — UTC).
 /// Пустые части опускаются; в журнале нет ничего из перечисленного — пусто.
 pub fn render_summary(s: &Summary) -> String {
-    if s.edited.is_empty() && s.errors == 0 && s.subagents.is_empty() && s.memory_writes == 0 {
+    if s.edited.is_empty()
+        && s.errors == 0
+        && s.subagents.is_empty()
+        && s.memory_writes == 0
+        && s.snapshot_at.is_none()
+    {
         return String::new();
     }
     let mut parts: Vec<String> = Vec::new();
@@ -446,11 +471,23 @@ pub fn render_summary(s: &Summary) -> String {
         parts.push(format!("субагенты: {}", s.subagents.join(", ")));
     }
     parts.push(format!("записей в память: {}", s.memory_writes));
+    if let Some(at) = s.snapshot_at {
+        parts.push(format!(
+            "снимок сессии {}, извлечено автоматически",
+            agent_ms(at)
+        ));
+    }
     let text = format!(
         "ZeroAIMemory: До сжатия в этой сессии: {}",
         parts.join("; ")
     );
     clip(&text, SUMMARY_MAX_CHARS)
+}
+
+/// Миллисекунды Unix → `yyyy-MM-dd HH:mm:ss` UTC (время в тексте агенту, M6 §4.4).
+pub fn agent_ms(t: Timestamp) -> String {
+    let rfc = zam_core::time::rfc3339_from_secs(i64::try_from(t.0 / 1000).unwrap_or(i64::MAX));
+    zam_core::time::agent_ts(&rfc).unwrap_or(rfc)
 }
 
 /// Отпечаток нормализованной ошибки: первые 16 hex blake3.
@@ -735,7 +772,38 @@ mod tests {
             Ev::MemoryWrite {
                 kind: "insight".into(),
             },
+            Ev::Snapshot {
+                trigger: "stop".into(),
+                status: "partial".into(),
+                bytes: 1234,
+                prompts: 2,
+                files: 3,
+                cmds: 4,
+            },
         ]
+    }
+
+    /// M6 §8а: снимок в сводке — строка с временем UTC; одного снимка достаточно для сводки.
+    #[test]
+    fn summary_has_snapshot_line() {
+        // 2026-11-09 10:00:00 UTC
+        let at = Timestamp(1_794_218_400_000);
+        let ev = Ev::Snapshot {
+            trigger: "pre_compact".into(),
+            status: "complete".into(),
+            bytes: 10,
+            prompts: 1,
+            files: 0,
+            cmds: 0,
+        };
+        let s = summarize(&[(Timestamp(1), ev.clone()), (at, ev)]);
+        assert_eq!(s.snapshot_at, Some(at));
+        let t = render_summary(&s);
+        assert!(
+            t.ends_with("снимок сессии 2026-11-09 10:00:00, извлечено автоматически"),
+            "{t}"
+        );
+        assert_eq!(render_summary(&Summary::default()), "");
     }
 
     #[test]

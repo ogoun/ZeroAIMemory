@@ -1297,27 +1297,6 @@ async fn acceptance_task_lifecycle_and_dead_ends() {
 
 // ---------- п. 11 ----------
 
-/// Счётчик токенов bge-m3 из `target/models` (как `tests/agent_setup.rs`); нет — `None` (с
-/// `ZAM_REQUIRE_ML` — падение).
-fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/models");
-    let tokenizers = dir.join("tokenizers");
-    for (d, id) in [
-        (&dir, "bge-m3-int8"),
-        (&dir, "bge-m3-fp16"),
-        (&tokenizers, "bge-m3-int8"),
-    ] {
-        if let Ok(c) = zam_ml::BgeTokenCounter::load(d, id) {
-            return Some(c);
-        }
-    }
-    assert!(
-        std::env::var_os("ZAM_REQUIRE_ML").is_none(),
-        "нет токенизатора bge-m3: cargo xtask fetch-models --test"
-    );
-    None
-}
-
 /// §13 п. 11: блок v6 (ru, en) со строкой идей ≤ 500 токенов bge-m3 и без четырёх перенесённых
 /// фраз (они — в протоколе вместе с разделом «Идеи» и `--channel chat`); напоминание v5 → v6 —
 /// одно; MCP — 11 инструментов, описания ≤ 300 символов, `propose`/`decide`/`horizon` в схеме.
@@ -1326,7 +1305,7 @@ fn bge_counter() -> Option<zam_ml::BgeTokenCounter> {
 async fn acceptance_block_v6_and_mcp() {
     use zam_markdown::TokenCounter as _;
     let a = world("block", |_| {}).await;
-    let counter = bge_counter();
+    let counter = common::ml::bge_counter();
     let cases = [
         (
             "ru",
@@ -1365,10 +1344,13 @@ async fn acceptance_block_v6_and_mcp() {
             .await;
         ok(&r, StatusCode::OK, "agent-setup");
         let j = r.json();
-        assert_eq!(j["version"], 6);
+        // с M6 — блок v7 (строка идей и перенесённые фразы M5.7 в нём сохранены)
+        let v = zam_core::AGENT_BLOCK_VERSION;
+        assert!(v >= 6, "{v}");
+        assert_eq!(j["version"], v);
         let block = j["block"].as_str().unwrap();
         assert!(
-            block.starts_with("<!-- zeroaimemory:begin v6 -->\n"),
+            block.starts_with(&format!("<!-- zeroaimemory:begin v{v} -->\n")),
             "{block}"
         );
         assert!(block.contains(idea), "{lang}: {block}");
@@ -1403,7 +1385,8 @@ async fn acceptance_block_v6_and_mcp() {
         .await;
     ok(&r, StatusCode::OK, "напоминание");
     let t = r.json()["text"].as_str().unwrap_or_default().to_string();
-    assert_eq!(t.matches("устарел (v5 → v6)").count(), 1, "{t}");
+    let want = format!("устарел (v5 → v{})", zam_core::AGENT_BLOCK_VERSION);
+    assert_eq!(t.matches(want.as_str()).count(), 1, "{t}");
     assert_eq!(t.matches("устарел").count(), 1, "{t}");
     let list = rpc(&a, &a.token, "b1", "tools/list", json!({})).await;
     let tools = list["tools"].as_array().unwrap();
@@ -1657,18 +1640,36 @@ async fn acceptance_migration_from_m56_db() {
         "строки entry_revisions, entry_attachments, spaces на месте"
     );
     let is_entries = |o: &&Obj| o.0 == "table" && o.1 == "entries";
+    // база открывается последней схемой: объекты таблиц 0025 (M6) сверяет
+    // `zam-store/tests/migrate_rebuild.rs::migrate_0025_from_m57_db`
+    let m6 = |o: &&Obj| {
+        [
+            "sessions",
+            "session_seen",
+            "session_tokens",
+            "code_refs",
+            "tokens_unattributed",
+            "session_snapshots",
+            "sqlite_autoindex_session_snapshots_1",
+            // `nodes.imported_from` (0025, задача 18b2)
+            "nodes",
+            // ключи идемпотентности заметок (0025, задача 19)
+            "node_idempotency",
+        ]
+        .contains(&o.1.as_str())
+    };
     assert_eq!(
         after
             .0
             .iter()
-            .filter(|o| !is_entries(o))
+            .filter(|o| !is_entries(o) && !m6(o))
             .collect::<Vec<_>>(),
         before
             .0
             .iter()
-            .filter(|o| !is_entries(o))
+            .filter(|o| !is_entries(o) && !m6(o))
             .collect::<Vec<_>>(),
-        "объекты схемы, кроме entries"
+        "объекты схемы, кроме entries и таблиц 0025"
     );
     let entries_sql = &after.0.iter().find(is_entries).unwrap().2;
     assert!(entries_sql.contains("'idea'"), "{entries_sql}");

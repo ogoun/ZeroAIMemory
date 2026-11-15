@@ -426,6 +426,57 @@ pub(crate) fn enqueue_doc(c: &Connection, id: Id, op: JobOp, now: &str) -> Resul
     )
 }
 
+/// Повторное извлечение документа `id` (разностная перепроверка секретов, [`crate::secrets_delta`]).
+/// Сначала сохранённые чанки документа маскируются **на месте** текущими правилами (`text`,
+/// `heading_path`, `context_prefix`, `text_hash`, `embed_key`; FTS — триггером `chunks_au`):
+/// значение уходит из `chunks` и FTS сразу, даже если повторное извлечение не удастся. Затем —
+/// `extract_state = 'pending'` и задание извлечения у живого, как в [`rechunk_docs_if_stale`]:
+/// извлечение из кэша `blob_extract` лишь уточнит границы чанков. `false` — документ не в `done`
+/// (уже ждёт извлечения или не извлекается; чанки всё равно замаскированы).
+pub(crate) fn reextract_doc(c: &Connection, id: Id, now: &str) -> Result<bool, StoreError> {
+    mask_doc_chunks(c, id)?;
+    let live: Option<bool> = c
+        .prepare_cached(
+            "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
+             WHERE id = ?1 AND extract_state = 'done'
+             RETURNING deleted_at IS NULL
+               AND (SELECT deleted_at IS NULL FROM nodes WHERE id = node_id)",
+        )?
+        .query_row([id], |r| r.get(0))
+        .optional()?;
+    if live == Some(true) {
+        enqueue_doc(c, id, JobOp::Upsert, now)?;
+    }
+    Ok(live.is_some())
+}
+
+/// Маскирует на месте сохранённые чанки документа `att` текущими правилами сканера; число
+/// переписанных строк.
+pub(crate) fn mask_doc_chunks(c: &Connection, att: Id) -> Result<u64, StoreError> {
+    let rows: Vec<(i64, String, String, String)> = c
+        .prepare_cached(
+            "SELECT seq, text, heading_path, context_prefix FROM chunks WHERE attachment_id = ?1",
+        )?
+        .query_map([att], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut upd = c.prepare_cached(
+        "UPDATE chunks SET text = ?2, heading_path = ?3, context_prefix = ?4, text_hash = ?5,
+                           embed_key = ?6
+         WHERE seq = ?1",
+    )?;
+    let mut n = 0;
+    for (seq, text, heading, prefix) in rows {
+        let (t, h, p) = (mask_text(&text), mask_text(&heading), mask_text(&prefix));
+        if t == text && h == heading && p == prefix {
+            continue;
+        }
+        let hash = blake3::hash(t.as_bytes()).to_hex().to_string();
+        upd.execute(params![seq, t, h, p, hash, embed_key_of(&p, &t)])?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Что известно о файле при привязке ([`crate::blobs::attach`]): вид по `zam_docs::sniff` и
 /// размер против `docs.max_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,6 +525,22 @@ pub(crate) fn ensure_doc(
     intake: DocIntake,
     now: &str,
 ) -> Result<Id, StoreError> {
+    ensure_doc_as(c, None, node, sha, filename, mime, intake, now)
+}
+
+/// [`ensure_doc`] с id нового документа `want` (импорт пространства, M6 §12б.5: ссылки `d:`
+/// архива переписаны на заранее выбранные id); `None` — новый id.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ensure_doc_as(
+    c: &Connection,
+    want: Option<Id>,
+    node: Id,
+    sha: &str,
+    filename: &str,
+    mime: &str,
+    intake: DocIntake,
+    now: &str,
+) -> Result<Id, StoreError> {
     let (state, err) = intake.state();
     let row: Option<(Id, bool)> = c
         .prepare_cached(
@@ -495,7 +562,8 @@ pub(crate) fn ensure_doc(
             id
         }
         None => {
-            let id = Id::new();
+            // `Id::default()` — новый UUIDv7
+            let id = want.unwrap_or_default();
             c.prepare_cached(
                 "INSERT INTO attachment_docs (id, node_id, blob_sha256, filename, mime,
                                               extract_state, extract_error, created_at)
@@ -751,7 +819,7 @@ pub async fn detach(
             "UPDATE blobs SET refcount = max(refcount - 1, 0) WHERE sha256 = ?1",
             [&sha],
         )?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let doc: Option<Id> = t
             .query_row(
                 "UPDATE attachment_docs SET deleted_at = ?4
@@ -885,7 +953,7 @@ pub async fn put_extract(
             units,
             warnings,
             ocr,
-            fmt_ts(Timestamp::now()),
+            fmt_ts(crate::time::now()),
             fp
         ])?;
         Ok(true)
@@ -1093,7 +1161,7 @@ fn write_chunks(t: &Connection, att: Id, units: &[Piece]) -> Result<bool, StoreE
             return Ok(false);
         };
         let points = kind != SpaceKind::Human;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         // документ извлечён: `done`, причина прежней неудачи и её задания сняты
         t.prepare_cached(
             "UPDATE attachment_docs
@@ -1280,7 +1348,7 @@ pub async fn put_extract_failure(
             kind,
             units,
             warnings,
-            fmt_ts(Timestamp::now()),
+            fmt_ts(crate::time::now()),
             src,
             fp
         ])?;
@@ -1549,7 +1617,7 @@ pub async fn enqueue_attachment_upserts(db: &Db, ids: Vec<Id>) -> Result<u64, St
         return Ok(0);
     }
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         for id in &ids {
             enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
         }
@@ -1567,7 +1635,7 @@ pub async fn enqueue_attachment_upserts(db: &Db, ids: Vec<Id>) -> Result<u64, St
 /// — задание. Возвращает число поставленных заданий.
 pub async fn reindex_docs(db: &Db, space: Option<Id>) -> Result<u64, StoreError> {
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         // полный reindex — способ повтора разбора (спецификация §2): закэшированные неудачи
         // блобов области снимаются, `failed` (кроме `too_large`) и `unsupported` — снова `pending`
         tx.prepare_cached(&format!(
@@ -1698,7 +1766,7 @@ pub async fn sync_doc_limits(db: &Db, limits: DocLimitsKey) -> Result<u64, Store
             return Ok(0);
         }
         let ids = repend_stale_docs(tx, None, Some(&limits))?;
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         for id in &ids {
             enqueue_doc(tx, *id, JobOp::Upsert, &now)?;
         }
@@ -1719,7 +1787,7 @@ pub async fn sync_doc_limits(db: &Db, limits: DocLimitsKey) -> Result<u64, Store
 /// `delete`) и дозаполнения миграции 0019. Возвращает их число.
 pub async fn ensure_extract_jobs(db: &Db) -> Result<u64, StoreError> {
     db.write(|tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let ids: Vec<Id> = tx
             .prepare_cached(
                 "SELECT d.id FROM attachment_docs d JOIN nodes n ON n.id = d.node_id
@@ -1758,7 +1826,7 @@ pub async fn has_failed_with(db: &Db, code: &str) -> Result<bool, StoreError> {
 pub async fn requeue_failed_with(db: &Db, code: &str) -> Result<u64, StoreError> {
     let like = format!("{code}%");
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let ids: Vec<Id> = tx
             .prepare_cached(
                 "UPDATE attachment_docs SET extract_state = 'pending', extract_error = NULL
@@ -1819,7 +1887,7 @@ pub async fn rechunk_docs_if_stale(db: &Db) -> Result<u64, StoreError> {
                 )?
                 .query_map([TOO_LARGE], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?;
-            let now = fmt_ts(Timestamp::now());
+            let now = fmt_ts(crate::time::now());
             for (id, live) in &ids {
                 if *live {
                     enqueue_doc(tx, *id, JobOp::Upsert, &now)?;

@@ -10,6 +10,25 @@
 //! [`DbOptions::wal_limit_bytes`]. При закрытии — `wal_checkpoint(TRUNCATE)`,
 //! затем закрывается последнее соединение и SQLite удаляет `-wal`/`-shm`.
 //!
+//! **Копия без остановки (M6 §12б.2).** `zam-server backup` держит транзакцию чтения
+//! (`VACUUM INTO`), и `RESTART` с ожиданием читателей задержал бы писателя на весь
+//! [`WRITER_BUSY_TIMEOUT`]. Поэтому фоновый поток раз в свой интервал читает признак копии
+//! [`DbOptions::backup_flag`] (`<data_dir>/.zam-backup`, [`crate::backup::backup_flag_active`])
+//! и выставляет [`Db::backup_active`]; пока он стоит, оба места делают только `PASSIVE`, а WAL
+//! растёт на объём записей за время копии (страховка `wal_limit_bytes` ослаблена). После
+//! снятия признака первый же `RESTART` возвращает WAL к норме.
+//!
+//! **Как WAL начинается сначала.** `RESTART` переносит все кадры и дожидается, пока читатели
+//! отпустят слоты WAL, но счётчик кадров (`mxFrame`) не обнуляет: это делает следующая
+//! транзакция, которая пишет кадры (`walRestartLog`), если она началась при полностью
+//! перенесённом WAL. Транзакция, не изменившая ни одной страницы (например, запись того же
+//! значения), кадров не пишет — WAL не начинается сначала, но и не растёт.
+//!
+//! **Долгие читатели (экспорт пространства, M6 §12б.5).** Экспорт держит транзакцию чтения на
+//! весь поток архива; на это время он берёт [`Db::long_reader`] — пока такие читатели есть, оба
+//! места тоже делают только `PASSIVE` (как при копии), иначе `RESTART` ждал бы их до
+//! [`WRITER_BUSY_TIMEOUT`] на каждой записи сверх `wal_limit_bytes`.
+//!
 //! **Ожидание блокировки писателем** — [`WRITER_BUSY_TIMEOUT`] (30 с), у читателей и
 //! фонового потока — 5 с и 50 мс. Фоновый `RESTART` с переносом остатка держит блокировку
 //! записи на время копирования кадров и fsync: на HDD под нагрузкой индексации это секунды
@@ -18,7 +37,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -106,6 +125,33 @@ struct Inner {
     checkpointer_stop: Option<mpsc::Sender<()>>,
     checkpointer: Option<JoinHandle<()>>,
     readers: Arc<ReaderPool>,
+    flags: Arc<CheckpointFlags>,
+}
+
+/// Общее состояние фонового потока и писателя: признак идущей копии и счётчик `RESTART`.
+#[derive(Debug, Default)]
+struct CheckpointFlags {
+    backup_active: AtomicBool,
+    restarts: AtomicU64,
+    /// Долгих читателей сейчас ([`Db::long_reader`]).
+    long_readers: AtomicUsize,
+}
+
+impl CheckpointFlags {
+    /// `RESTART` нельзя: идёт копия или держится долгая транзакция чтения.
+    fn passive_only(&self) -> bool {
+        self.backup_active.load(Ordering::SeqCst) || self.long_readers.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// Долгий читатель базы: пока жив, контрольные точки — только `PASSIVE` (см. модуль).
+#[derive(Debug)]
+pub struct LongReader(Arc<CheckpointFlags>);
+
+impl Drop for LongReader {
+    fn drop(&mut self) {
+        self.0.long_readers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Если последний `Db` уничтожается внутри самого потока — join невозможен.
@@ -148,6 +194,9 @@ pub struct DbOptions {
     /// Кадров в WAL больше чем на столько байт — фоновый поток после
     /// PASSIVE делает `RESTART`, чтобы WAL начался сначала и при непрерывной записи.
     pub wal_restart_bytes: u64,
+    /// Признак копии `backup` (`<data_dir>/.zam-backup`): фоновый поток читает его раз в
+    /// `checkpoint_interval`; пока копия идёт, `RESTART` не делается. `None` — не читать.
+    pub backup_flag: Option<PathBuf>,
 }
 
 impl Default for DbOptions {
@@ -157,6 +206,7 @@ impl Default for DbOptions {
             checkpoint_interval: Duration::from_secs(1),
             wal_limit_bytes: 64 * 1024 * 1024,
             wal_restart_bytes: 8 * 1024 * 1024,
+            backup_flag: None,
         }
     }
 }
@@ -195,10 +245,14 @@ const RESTART_BUSY_MS: u64 = 50;
 /// Если же WAL вчетверо больше порога, а полного переноса не случилось, `RESTART`
 /// делается и с переносом остатка — писатель ждёт его fsync, но WAL не дорастает
 /// до страховочного предела писателя.
+///
+/// Пока стоит признак копии ([`DbOptions::backup_flag`]), `RESTART` не делается вовсе.
 fn spawn_checkpointer(
     path: &Path,
     interval: Duration,
     restart_bytes: u64,
+    backup_flag: Option<PathBuf>,
+    flags: Arc<CheckpointFlags>,
 ) -> Result<(mpsc::Sender<()>, JoinHandle<()>), StoreError> {
     let conn = Connection::open_with_flags(
         path,
@@ -214,6 +268,19 @@ fn spawn_checkpointer(
         .name("zam-db-checkpoint".into())
         .spawn(move || {
             while let Err(mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
+                let backup =
+                    backup_flag.as_deref().is_some_and(|f| {
+                        match crate::backup::flag_state(f, crate::backup::backup_flag_max_age()) {
+                            crate::backup::FlagState::Absent => false,
+                            crate::backup::FlagState::Active => true,
+                            crate::backup::FlagState::Stale(why) => {
+                                crate::backup::warn_stale(f, &why);
+                                false
+                            }
+                        }
+                    });
+                flags.backup_active.store(backup, Ordering::SeqCst);
+                let passive = flags.passive_only();
                 // (busy, кадров в WAL, перенесено)
                 let Ok((busy, log, done)) =
                     conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
@@ -228,7 +295,12 @@ fn spawn_checkpointer(
                 };
                 // всё перенесено — RESTART почти бесплатен; WAL вчетверо больше порога —
                 // RESTART и с переносом остатка (писатель ждёт его fsync)
-                if busy == 0 && log > restart_frames && (log == done || log > 4 * restart_frames) {
+                if !passive
+                    && busy == 0
+                    && log > restart_frames
+                    && (log == done || log > 4 * restart_frames)
+                {
+                    flags.restarts.fetch_add(1, Ordering::Relaxed);
                     let _ = checkpoint(&conn, "RESTART");
                 }
             }
@@ -261,6 +333,28 @@ impl Db {
         &self.inner.readers.path
     }
 
+    /// Фоновый поток видит признак идущей копии (`.zam-backup`): `RESTART` не делается.
+    pub fn backup_active(&self) -> bool {
+        self.inner.flags.backup_active.load(Ordering::SeqCst)
+    }
+
+    /// Долгий читатель (экспорт): пока жив [`LongReader`], `RESTART` не делается.
+    pub fn long_reader(&self) -> LongReader {
+        self.inner.flags.long_readers.fetch_add(1, Ordering::SeqCst);
+        LongReader(self.inner.flags.clone())
+    }
+
+    /// Долгих читателей сейчас.
+    pub fn long_readers(&self) -> usize {
+        self.inner.flags.long_readers.load(Ordering::SeqCst)
+    }
+
+    /// Сколько раз с открытия сделан `wal_checkpoint(RESTART)` (фоновым потоком и страховкой
+    /// писателя) — диагностика и тесты признака копии.
+    pub fn restart_count(&self) -> u64 {
+        self.inner.flags.restarts.load(Ordering::Relaxed)
+    }
+
     /// Открывает (создаёт) БД, применяет PRAGMA и миграции, запускает писателя,
     /// читателей и фоновый checkpoint с параметрами по умолчанию.
     pub fn open(path: &Path, migrations: &'static [Migration]) -> Result<Db, StoreError> {
@@ -283,6 +377,20 @@ impl Db {
             )));
         }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // база пользователя версии 25 промежуточной сборки M6 — досборка схемы 0025 до
+        // следующих миграций (`schema_repair`, ревью задачи 19 I-1, N-1): версия читается до
+        // `apply`, иначе после 0026 досборка уже не сработала бы; у прочих баз — ничего
+        if crate::schema_repair::is_user_list(migrations) {
+            let before: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let fixed = crate::schema_repair::repair_user_schema(&mut conn, before)?;
+            if !fixed.is_empty() {
+                tracing::warn!(
+                    fixed = %fixed.join(", "),
+                    "база пользователя: дособрана схема 0025 (база открывалась промежуточной \
+                     сборкой M6)"
+                );
+            }
+        }
         migrate::apply(&mut conn, path, migrations)?;
         // checkpoint — не в потоке писателя (см. документацию модуля)
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
@@ -295,9 +403,15 @@ impl Db {
             readers.push(open_reader(path)?);
         }
 
+        let flags = Arc::new(CheckpointFlags::default());
         let (checkpointer_stop, checkpointer) = if opts.background_checkpoint {
-            let (stop, handle) =
-                spawn_checkpointer(path, opts.checkpoint_interval, opts.wal_restart_bytes)?;
+            let (stop, handle) = spawn_checkpointer(
+                path,
+                opts.checkpoint_interval,
+                opts.wal_restart_bytes,
+                opts.backup_flag.clone(),
+                flags.clone(),
+            )?;
             (Some(stop), Some(handle))
         } else {
             (None, None)
@@ -305,6 +419,8 @@ impl Db {
 
         let wal = wal_path(path);
         let limit = opts.wal_limit_bytes;
+        let wflags = flags.clone();
+        let wflag_path = opts.backup_flag.clone();
         let (tx, rx) = mpsc::channel::<WriterJob>();
         let thread = std::thread::Builder::new()
             .name("zam-db-writer".into())
@@ -316,9 +432,23 @@ impl Db {
                     if !conn.is_autocommit() {
                         let _ = conn.execute_batch("ROLLBACK");
                     }
-                    // Страховка от неограниченного WAL, если фоновый checkpoint отстал или умер.
+                    // Страховка от неограниченного WAL, если фоновый checkpoint отстал или умер;
+                    // на время копии ослаблена: RESTART ждал бы читателя `VACUUM INTO`
+                    // до WRITER_BUSY_TIMEOUT — только PASSIVE. Признак проверяется и по файлу:
+                    // фоновый поток мог ещё не заметить только что поставленный признак (или
+                    // его нет); страховка срабатывает редко, проверка файла дешева
                     if wal_len(&wal) > limit {
-                        let _ = checkpoint(&conn, "RESTART");
+                        let backup = wflags.passive_only()
+                            || wflag_path.as_deref().is_some_and(|f| {
+                                crate::backup::flag_state(f, crate::backup::backup_flag_max_age())
+                                    == crate::backup::FlagState::Active
+                            });
+                        if backup {
+                            let _ = checkpoint(&conn, "PASSIVE");
+                        } else {
+                            wflags.restarts.fetch_add(1, Ordering::Relaxed);
+                            let _ = checkpoint(&conn, "RESTART");
+                        }
                     }
                 }
                 // Закрытие: читатели и фоновый поток уже закрыты (Inner::drop).
@@ -337,6 +467,7 @@ impl Db {
                     sem: Arc::new(Semaphore::new(READERS)),
                     live: AtomicUsize::new(READERS),
                 }),
+                flags,
             }),
         })
     }

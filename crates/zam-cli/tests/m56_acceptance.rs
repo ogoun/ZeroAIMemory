@@ -275,8 +275,12 @@ impl Proj {
         out
     }
 
-    /// `zam hook <kind> --agent claude` с событием `ev` на адрес `url`.
+    /// `zam hook <kind> --agent claude` с событием `ev` на адрес `url`, с бюджетом продукта.
     fn hook_at(&self, url: &str, kind: &str, ev: &Value) -> Output {
+        self.hook_cmd(url, kind, ev).output().unwrap()
+    }
+
+    fn hook_cmd(&self, url: &str, kind: &str, ev: &Value) -> assert_cmd::Command {
         let mut c = common::zam_cmd();
         c.env("ZAM_URL", url)
             .env("ZAM_TOKEN", &self.token)
@@ -285,11 +289,19 @@ impl Proj {
             .current_dir(&self.repo)
             .args(["hook", kind, "--agent", "claude"])
             .write_stdin(ev.to_string().into_bytes());
-        c.output().unwrap()
+        c
     }
 
+    /// Хук ради содержимого — со
+    /// щедрым бюджетом (`ZAM_TEST_HOOK_BUDGET_MS`): критерий приёмки — содержимое, а с бюджетом
+    /// продукта отладочная сборка на занятой машине молчит (fail-open); время и бюджеты проверяют
+    /// `hooks` и release `hook_budgets` (ревью 17b-http M6). Замер
+    /// времени (`acceptance_hook_budgets_with_map`) — [`Proj::hook_at`].
     fn hook(&self, kind: &str, ev: &Value) -> Output {
-        self.hook_at(&self.url, kind, ev)
+        self.hook_cmd(&self.url, kind, ev)
+            .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+            .output()
+            .unwrap()
     }
 
     fn ev(&self, event: &str, session: &str, extra: Value) -> Value {
@@ -825,18 +837,30 @@ fn acceptance_symbol_staleness_via_hook() {
 
 // ---------- п. 8 ----------
 
-/// p95 выборки (ближайший ранг).
-fn p95(mut v: Vec<Duration>) -> Duration {
-    v.sort();
-    v[(v.len() * 95).div_ceil(100) - 1]
+/// Бюджет хука §10.3, мс (`Kind::budget_ms`); `post-tool` здесь — успешное чтение: без сети,
+/// 50 мс на весь хук (M4.5 §9.1).
+fn budget_ms(kind: &str) -> u64 {
+    match kind {
+        "session-start" | "subagent-start" => 300,
+        "pre-tool" | "post-tool" => 50,
+        _ => 250,
+    }
 }
 
 /// §17 п. 8: бюджеты хуков с включённой и загруженной картой против живого сервера — конфигурация
 /// клиента по умолчанию (`code_map` и `code.auto` включены), карта проекта синхронизирована.
-/// `session-start` несёт строку карты, `subagent-start` с задачей про существующую функцию —
-/// раздел `### Код`; p95 каждого хука — в пределе отладочной сборки (×4 от бюджета §10.3, как
-/// `hooks.rs`: `session-start`/`subagent-start` 1200 мс, `prompt`/`post-tool` 1000 мс,
-/// `pre-tool` 200 мс). Замер release на карте этого репозитория — `cargo xtask code-bench`.
+///
+/// Две проверки — раздельными вызовами (задача 17d, пункт g; принцип `hooks.rs`):
+/// - **содержимое** — со щедрым бюджетом: `session-start` несёт строку карты, `subagent-start` с
+///   задачей про существующую функцию — раздел `### Код`, в 12 из 12, **включая первые вызовы
+///   после синхронизации** (с бюджетом продукта отладочная сборка на занятой машине молчит по
+///   сроку — «карта в 9 из 10» было промахом бюджета, а не содержимого; настоящий дефект первого
+///   запуска щедрый бюджет не скроет);
+/// - **время** — с бюджетом продукта, внутри процесса (канал `ZAM_TEST_HOOK_TIMING`): медиана
+///   серии не больше бюджета §10.3, p95 — запаса отладочной сборки ×4 (`session-start`/
+///   `subagent-start` 1200 мс, `prompt` 1000 мс, `pre-tool` и успешный `post-tool` 200 мс) и
+///   разброса пустого вызова в той же серии. Ловит: карта, вынесшая хук за бюджет (медиана), и редкий долгий путь
+///   с картой (p95). Запуск процесса и release — `hooks.rs` и `cargo xtask code-bench`.
 #[test]
 fn acceptance_hook_budgets_with_map() {
     let _g = serial();
@@ -852,73 +876,98 @@ fn acceptance_hook_budgets_with_map() {
     let r = p.sync();
     assert_eq!(r["uploaded"], 4, "{r}");
     let task = "Почини helper в src/c.rs: возвращает не то число";
-    let mut report = Vec::new();
-    for (kind, limit, want) in [
-        ("session-start", 1200u64, Some("ZeroAIMemory: карта кода:")),
-        ("prompt", 1000, None),
-        ("pre-tool", 200, None),
-        ("post-tool", 1000, None),
-        ("subagent-start", 1200, Some("### Код")),
-    ] {
-        let (mut times, mut hits) = (Vec::new(), 0usize);
-        for i in 0..12 {
-            let sess = format!("hb-{kind}-{i}");
-            let ev = match kind {
-                "session-start" => p.ev("SessionStart", &sess, json!({"source": "startup"})),
-                "prompt" => p.ev(
-                    "UserPromptSubmit",
-                    &sess,
-                    json!({"prompt": "почему helper возвращает единицу"}),
-                ),
-                "pre-tool" => p.ev(
+    let event = |kind: &str, sess: &str, i: usize| -> Value {
+        match kind {
+            "session-start" => p.ev("SessionStart", sess, json!({"source": "startup"})),
+            "prompt" => p.ev(
+                "UserPromptSubmit",
+                sess,
+                json!({"prompt": "почему helper возвращает единицу"}),
+            ),
+            "pre-tool" => p.ev(
+                "PreToolUse",
+                sess,
+                json!({"tool_name": "Read",
+                       "tool_input": {"file_path": p.repo.join("src/c.rs")}}),
+            ),
+            "post-tool" => p.post_ok(sess, "Read", json!({"file_path": p.repo.join("src/c.rs")})),
+            _ => {
+                let spawn = p.ev(
                     "PreToolUse",
-                    &sess,
-                    json!({"tool_name": "Read",
-                           "tool_input": {"file_path": p.repo.join("src/c.rs")}}),
-                ),
-                "post-tool" => {
-                    p.post_ok(&sess, "Read", json!({"file_path": p.repo.join("src/c.rs")}))
-                }
-                _ => {
-                    let spawn = p.ev(
-                        "PreToolUse",
-                        &sess,
-                        json!({"tool_name": "Agent", "tool_use_id": "u1",
-                               "tool_input": {"description": "d", "prompt": task,
-                                              "subagent_type": "Plan"}}),
-                    );
-                    ok(&p.hook("pre-tool", &spawn));
-                    p.ev(
-                        "SubagentStart",
-                        &sess,
-                        json!({"agent_id": format!("ag-{i}"), "agent_type": "Plan"}),
-                    )
-                }
-            };
-            let t = std::time::Instant::now();
-            let o = p.hook(kind, &ev);
-            let d = t.elapsed();
-            let c = context(&o);
-            // первые два — прогрев (первые запросы отладочного сервера, фоновая синхронизация)
-            if i >= 2 {
-                times.push(d);
-                if want.is_some_and(|w| c.contains(w)) {
-                    hits += 1;
-                }
+                    sess,
+                    json!({"tool_name": "Agent", "tool_use_id": "u1",
+                           "tool_input": {"description": "d", "prompt": task,
+                                          "subagent_type": "Plan"}}),
+                );
+                ok(&p.hook("pre-tool", &spawn));
+                p.ev(
+                    "SubagentStart",
+                    sess,
+                    json!({"agent_id": format!("ag-{i}"), "agent_type": "Plan"}),
+                )
             }
         }
-        let q = p95(times);
-        report.push(format!("{kind} p95={q:?}"));
+    };
+    let mut report = Vec::new();
+    for (kind, want) in [
+        ("session-start", Some("ZeroAIMemory: карта кода:")),
+        ("prompt", None),
+        ("pre-tool", None),
+        ("post-tool", None),
+        ("subagent-start", Some("### Код")),
+    ] {
+        // содержимое: щедрый бюджет, с первого вызова
+        if let Some(w) = want {
+            let hits: Vec<bool> = (0..12)
+                .map(|i| {
+                    let ev = event(kind, &format!("hb-{kind}-c{i}"), i);
+                    context(&p.hook(kind, &ev)).contains(w)
+                })
+                .collect();
+            assert!(
+                hits.iter().all(|h| *h),
+                "{kind}: «{w}» по вызовам {hits:?}; {}",
+                p.log()
+            );
+        }
+        // время: бюджет продукта, внутри процесса
+        let (mut times, mut idle) = (Vec::new(), Vec::new());
+        for i in 0..12 {
+            let ev = event(kind, &format!("hb-{kind}-t{i}"), i);
+            let mut e = p.hook_cmd(&p.url, kind, &json!({}));
+            e.write_stdin(Vec::new());
+            let t0 = std::time::Instant::now();
+            let _ = e.output().unwrap();
+            let empty_call = t0.elapsed();
+            let (o, t) = common::hook_timed(p.hook_cmd(&p.url, kind, &ev), kind);
+            ok(&o);
+            // первые два — прогрев (первые запросы отладочного сервера, фоновая синхронизация)
+            if i >= 2 {
+                times.push(t.hook());
+                idle.push(empty_call);
+            }
+        }
+        let budget = Duration::from_millis(budget_ms(kind));
+        let (mid, q) = (common::quantile(&times, 50), common::quantile(&times, 95));
+        let noise = common::quantile(&idle, 95).saturating_sub(*idle.iter().min().unwrap());
+        report.push(format!(
+            "{kind} {}; пустой вызов {}",
+            common::stats(&times),
+            common::stats(&idle)
+        ));
         assert!(
-            q <= Duration::from_millis(limit),
-            "{kind}: p95 {q:?} > {limit} мс; {}",
+            mid <= budget,
+            "{kind}: медиана {mid:?} при бюджете {budget:?}; {}",
             p.log()
         );
-        if let Some(w) = want {
-            assert_eq!(hits, 10, "{kind}: «{w}» в {hits} из 10; {}", p.log());
-        }
+        assert!(
+            q <= budget * 4 + noise,
+            "{kind}: p95 {q:?} при пределе {:?} и разбросе пустого вызова {noise:?}; {}",
+            budget * 4,
+            p.log()
+        );
     }
-    eprintln!("ZAM_TIMING хуки с картой: {}", report.join(", "));
+    eprintln!("ZAM_TIMING хуки с картой: {}", report.join("; "));
 }
 
 // ---------- п. 9 ----------
@@ -1090,8 +1139,8 @@ fn acceptance_old_cache_reads() {
     ));
     assert_eq!(
         ctx,
-        "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] — i:E7; \
-         Архитектура пула [note, возможно устарело] — n:N1"
+        "ZeroAIMemory: о файле src/pool.rs в памяти: Пул соединений течёт [gotcha] i:E7; \
+         Архитектура пула [note·возможно устарело] n:N1"
     );
     // очередь клиента M4.5 — на настоящий сервер
     let (url, tok, db) = start_db("old-queue");

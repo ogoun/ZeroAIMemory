@@ -194,7 +194,10 @@ async fn recovery_package_order_and_budget() {
     )
     .await;
     let t = text(&j);
-    assert!(j["tokens"].as_u64().unwrap() <= 80, "{t}");
+    // Rules — сверх бюджета (M6 §8): в бюджете — всё, кроме раздела правил
+    let rest = t.split("\n\n### Правила\n").next().unwrap();
+    assert!(zam_store::fits_budget(rest, 80), "{t}");
+    assert!(t.contains("Всегда пиши тесты"), "{t}");
     assert!(
         t.starts_with("### Задачи\nZeroAIMemory: [in_progress] Моя задача"),
         "{t}"
@@ -340,4 +343,62 @@ async fn mcp_recall_recovery() {
                       "params": {"name": "memory_recall", "arguments": {"event": "restore"}}});
     let r = a.send(b.body(Body::from(body.to_string())).unwrap()).await;
     assert_eq!(r.json()["result"]["isError"], true, "{}", r.text());
+}
+
+/// M6 §8 (задача 8a): пакеты M6 — восстановление, `brief` и фокусное чтение — идей не содержат,
+/// даже когда идеи есть и обычный дайджест их показывает.
+#[tokio::test]
+async fn no_ideas_in_recovery_brief_focus() {
+    let (a, _, _, _) = seeded("no-ideas").await;
+    let idea = created(
+        a.t(
+            Method::POST,
+            &format!("/api/v1/spaces/{G}/entries"),
+            Some(
+                json!({"kind": "idea", "title": "Кэш миниатюр", "body": "Замысел про кэш.",
+                        "data": {"origin": "human", "priority": "high"}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let note = a
+        .note(
+            G,
+            "Кэш.md",
+            &format!(
+                "# Кэш\n\n{}",
+                "Кэш миниатюр хранится на диске. ".repeat(200)
+            ),
+        )
+        .await;
+    let note = note["id"].as_str().unwrap().to_string();
+    for body in [
+        json!({"event": "recovery", "solution": G}),
+        json!({"event": "session_start", "solution": G, "source": "compact"}),
+        json!({"event": "brief", "solution": G, "task": "Кэш миниатюр"}),
+    ] {
+        let j = recall(&a, "ni-1", body.clone()).await;
+        assert!(!text(&j).contains(&idea), "{body}: {j}");
+        assert!(!text(&j).contains("### Идеи"), "{body}: {j}");
+    }
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/read",
+            Some(
+                json!({"items": [{"id": format!("n:{note}"), "focus": "кэш миниатюр"}],
+                        "format": "md"}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        !r.text().contains(&idea) && !r.text().contains("### Идеи"),
+        "{}",
+        r.text()
+    );
+    // обычный старт новой сессии — раздел с идеей на месте
+    let j = recall(&a, "ni-2", json!({"event": "session_start", "solution": G})).await;
+    assert!(text(&j).contains(&format!("w:{idea}")), "{j}");
 }

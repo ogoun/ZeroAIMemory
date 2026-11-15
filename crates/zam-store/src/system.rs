@@ -235,7 +235,7 @@ pub(crate) fn audit_tx(
         "INSERT INTO audit (ts, actor, user_id, action, target, ip, details)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            fmt_ts(Timestamp::now()),
+            fmt_ts(crate::time::now()),
             actor,
             user_id,
             action,
@@ -250,9 +250,21 @@ pub(crate) fn audit_tx(
 impl SystemStore {
     /// Открывает `system.db` в каталоге данных.
     pub fn open(dir: &DataDir) -> Result<SystemStore, StoreError> {
+        let opts = crate::DbOptions {
+            backup_flag: Some(crate::backup::backup_flag_path(dir.root())),
+            ..crate::DbOptions::default()
+        };
         Ok(SystemStore {
-            db: Db::open(&dir.system_db(), SYSTEM_MIGRATIONS)?,
+            db: Db::open_with(&dir.system_db(), SYSTEM_MIGRATIONS, opts)?,
         })
+    }
+
+    /// Удаляет все сессии входа в WebUI (`restore`, M6 §12б.3: cookie старой машины на новой
+    /// не действуют); число удалённых.
+    pub async fn clear_web_sessions(&self) -> Result<u64, StoreError> {
+        self.db
+            .write(|tx| Ok(tx.execute("DELETE FROM web_sessions", [])? as u64))
+            .await
     }
 
     /// Проверка доступности `system.db` (для `/ready`).
@@ -275,7 +287,7 @@ impl SystemStore {
                     id: Id::new(),
                     name,
                     is_admin,
-                    created_at: Timestamp::now(),
+                    created_at: crate::time::now(),
                     disabled_at: None,
                     has_password: false,
                     must_change_password: false,
@@ -322,7 +334,7 @@ impl SystemStore {
     pub async fn set_user_disabled(&self, id: Id, disabled: bool) -> Result<(), StoreError> {
         self.db
             .write(move |tx| {
-                let at = disabled.then(|| fmt_ts(Timestamp::now()));
+                let at = disabled.then(|| fmt_ts(crate::time::now()));
                 let n = tx.execute(
                     "UPDATE users SET disabled_at = ?2 WHERE id = ?1",
                     params![id, at],
@@ -476,7 +488,7 @@ impl SystemStore {
                     name,
                     prefix: nt.prefix,
                     access,
-                    created_at: Timestamp::now(),
+                    created_at: crate::time::now(),
                     last_used_at: None,
                     last_ip: None,
                     revoked_at: None,
@@ -544,7 +556,7 @@ impl SystemStore {
             .write(move |tx| {
                 let n = tx.execute(
                     "UPDATE tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
-                    params![token, fmt_ts(Timestamp::now())],
+                    params![token, fmt_ts(crate::time::now())],
                 )?;
                 if n == 0 {
                     return Err(StoreError::NotFound);
@@ -591,7 +603,7 @@ impl SystemStore {
         if rejected {
             return Ok(None);
         }
-        let now = Timestamp::now();
+        let now = crate::time::now();
         let stale =
             last_used.is_none_or(|t| now.as_second() - t.as_second() >= LAST_USED_THROTTLE_SECS);
         if stale {
@@ -647,7 +659,7 @@ impl SystemStore {
         let ip = ip.map(str::to_string);
         self.db
             .write(move |tx| {
-                let now = Timestamp::now();
+                let now = crate::time::now();
                 let exp = now
                     .checked_add(Span::new().hours(SESSION_TTL_HOURS))
                     .map_err(|e| StoreError::Corrupt(e.to_string()))?;
@@ -691,7 +703,7 @@ impl SystemStore {
             })
             .await?;
         match row {
-            Some(ws) if ws.expires_at > Timestamp::now() => Ok(Some(ws)),
+            Some(ws) if ws.expires_at > crate::time::now() => Ok(Some(ws)),
             Some(_) => {
                 self.db
                     .write(move |tx| {
@@ -789,7 +801,7 @@ impl SystemStore {
                      ON CONFLICT(user_id) DO UPDATE SET error = excluded.error,
                          attempts = max(attempts, excluded.attempts),
                          skipped_at = excluded.skipped_at",
-                    params![user, error, attempts, fmt_ts(Timestamp::now())],
+                    params![user, error, attempts, fmt_ts(crate::time::now())],
                 )?;
                 Ok(())
             })

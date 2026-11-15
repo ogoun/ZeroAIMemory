@@ -6,9 +6,43 @@ use rusqlite::Row;
 
 use crate::StoreError;
 
+/// «Сейчас» сервера и хранилища (M6 §4.4): все записи времени, окна и сроки — через неё. С фичей
+/// `test-hooks` часы можно заморозить (`freeze_now`; без фичи функции нет, поэтому без
+/// rustdoc-ссылки).
+pub fn now() -> Timestamp {
+    #[cfg(feature = "test-hooks")]
+    if let Some(t) = crate::test_hooks::frozen() {
+        return t;
+    }
+    Timestamp::now()
+}
+
+/// Замораживает [`now`] на `t`, пока жив результат (фича `test-hooks`).
+///
+/// Ждёт и держит блокировку тестовых точек (`test_hooks::GATE`, запись): тесты с замороженными
+/// часами не идут параллельно друг с другом и с прочими точками `test-hooks`. Часы общие для
+/// процесса — остальные тесты того же двоичного файла, идущие параллельно, видят то же время
+/// (сроки сессий WebUI, аренды задач): такие тесты держат в отдельном файле.
+///
+/// Пока guard жив, фоновая перенарезка при открытии базы (`rechunk_gate`) стоит до его drop.
+/// Повторный `freeze_now` или `hold_rechunk` из того же потока при живом guard — паника.
+#[cfg(feature = "test-hooks")]
+pub fn freeze_now(t: Timestamp) -> crate::test_hooks::FreezeGuard {
+    crate::test_hooks::freeze(t)
+}
+
 /// Сегодняшняя дата по UTC: «сегодня» идей (`horizon`) и релизов — одно определение.
 pub fn utc_today() -> jiff::civil::Date {
-    Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC).date()
+    now().to_zoned(jiff::tz::TimeZone::UTC).date()
+}
+
+/// Начало суток UTC момента `t` (M6 §8: окна дайджеста — от начала текущих суток, чтобы два
+/// старта в одни сутки видели одно и то же).
+pub fn day_start_utc(t: Timestamp) -> Timestamp {
+    let z = t.to_zoned(jiff::tz::TimeZone::UTC);
+    z.date()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .map_or(t, |d| d.timestamp())
 }
 
 /// Форматирует момент времени для хранения в TEXT-колонке.
@@ -96,6 +130,15 @@ mod tests {
         assert_eq!(age_days(upd, now, None), 0);
     }
 
+    /// M6 §8: окна дайджеста — от начала суток UTC момента.
+    #[test]
+    fn day_start_utc_of_moment() {
+        let t: Timestamp = "2026-10-18T23:59:59.5Z".parse().unwrap();
+        assert_eq!(fmt_ts(day_start_utc(t)), "2026-10-18T00:00:00.000000Z");
+        let t: Timestamp = "2026-10-18T00:00:00Z".parse().unwrap();
+        assert_eq!(day_start_utc(t), t);
+    }
+
     #[test]
     fn fixed_width_and_roundtrip() {
         let t: Timestamp = "2026-10-18T12:00:00Z".parse().unwrap();
@@ -107,6 +150,29 @@ mod tests {
             t2.as_microsecond()
         );
         assert!(matches!(parse_ts("мусор"), Err(StoreError::Corrupt(_))));
+    }
+
+    /// Текст агенту из строки хранения совпадает с `strftime` jiff (M6 §4.4): одна функция
+    /// `zam_core::time::agent_ts` для сервера и CLI.
+    #[test]
+    fn agent_ts_matches_jiff() {
+        let mut t: Timestamp = "1999-12-31T23:59:59.999999Z".parse().unwrap();
+        // шаг ~ 1 сут. 7 ч 13 мин 17,3 с: високосные годы, границы месяцев и суток
+        let step = jiff::SignedDuration::new(112_397, 300_000_000);
+        for _ in 0..20_000 {
+            let s = fmt_ts(t);
+            assert_eq!(
+                zam_core::time::agent_ts(&s).as_deref(),
+                Some(t.strftime("%Y-%m-%d %H:%M:%S").to_string().as_str()),
+                "{s}"
+            );
+            assert_eq!(
+                zam_core::time::agent_date(&s).as_deref(),
+                Some(t.strftime("%Y-%m-%d").to_string().as_str()),
+                "{s}"
+            );
+            t += step;
+        }
     }
 
     #[test]

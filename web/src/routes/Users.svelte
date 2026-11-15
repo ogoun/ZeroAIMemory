@@ -17,6 +17,7 @@
     type User,
   } from '../lib/api';
   import { openAgentSetup } from '../lib/agentSetup';
+  import { localTime } from '../lib/time';
 
   let { onExpired }: { onExpired: () => void } = $props();
 
@@ -166,7 +167,7 @@
                       <td>{t.name}</td>
                       <td><code>zam_{t.prefix}…</code></td>
                       <td>{t.access}</td>
-                      <td>{t.last_used_at ?? '—'}</td>
+                      <td>{t.last_used_at ? localTime(t.last_used_at) : '—'}</td>
                       <td>
                         {#if t.revoked_at}
                           <span class="muted">отозван</span>

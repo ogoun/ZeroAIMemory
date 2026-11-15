@@ -1,0 +1,231 @@
+# Независимый набор B запросов буста вида (M6 §10, задача 10). Формат — eval/queries.toml.
+# Составитель — независимый агент без доступа к коду поиска, сеткам и набору eval/kind-queries.toml.
+# kb-01…kb-17 — группы k (ответ k<NN>-t, трудные соседи k<NN>-n, заметка темы, пара другой области);
+# kb-18…kb-26 — пары противоречий certainty (theorem gotcha против hypothesis gotcha).
+
+# ---- группы k ----
+
+[[query]]
+id = "kb-01"
+text = "почему у части покупателей прошло двойное списание после того, как клиент заказов повторил POST /payments по тайм-ауту ответа"
+lang = "ru"
+expect = ["insight:k01-t"]
+kind = "identifier"
+# k01-t: повтор неидемпотентного POST без Idempotency-Key, шлюз провёл оба платежа; сосед k01-n (тот же POST /payments, повтор, шлюз) описывает лишь поведение шлюза при наличии ключа, заметка ru/api/http-client-retries — общие правила повторов, о двойном списании ни слова.
+
+[[query]]
+id = "kb-02"
+text = "обёртка fetch с повторами и джиттером: после первого тайм-аута каждая следующая попытка сразу падает с AbortError, а в журнале тайм-аут за 0 мс"
+lang = "ru"
+expect = ["insight:k02-t"]
+kind = "cross-lang"
+# k02-t (en): один и тот же уже отменённый AbortController передавался во все попытки; сосед k02-n — A/B-замер трёх попыток с джиттером без причины сбоя, заметка en/web/fetch-retry-abort — AbortController и таймер 10 с, но не повторное использование сигнала.
+
+[[query]]
+id = "kb-03"
+text = "the catalog returned 503 for several minutes during the sale although the Redis hit ratio of product cards was above 90 percent — why did the cache not protect Postgres"
+lang = "en"
+expect = ["insight:k03-t"]
+kind = "paraphrase"
+# k03-t: одновременное истечение горячих ключей с одинаковым TTL (stampede) и лавина промахов в primary; сосед k03-n — рост hit ratio от ключей по локали, заметка en/api/product-cache-invalidation — срок 15 минут и чтение при промахе, но не одновременное истечение.
+
+[[query]]
+id = "kb-04"
+text = "after a release the client error collector started rejecting reports from every page — how can one broken component do that if we group errors by source-mapped top frame"
+lang = "en"
+expect = ["insight:k06-t"]
+kind = "paraphrase"
+# k06-t: компонент бросал ошибку в каждом кадре requestAnimationFrame, ~60 отчётов в секунду на вкладку забили сборщик; сосед k06-n — группировка по верхнему кадру source maps, заметка en/web/client-error-reporting — дедупликация и предел 20 как готовые свойства, без разбора отказа сборщика.
+
+[[query]]
+id = "kb-05"
+text = "statement_timeout = '5s' выставляем через SET один раз после подключения, но медленный отчёт всё равно держит соединения пула минутами — почему лимит не действует"
+lang = "ru"
+expect = ["insight:k07-t"]
+kind = "cross-lang"
+# k07-t (en): при пулинге транзакций pgbouncer следующая транзакция идёт по другому серверному соединению, SET сессии теряется; сосед k07-n — эффект лимита 5 с на p99, заметка en/api/database-statement-timeout — лимит на роль и SQLSTATE 57014, о pgbouncer не говорит.
+
+[[query]]
+id = "kb-06"
+text = "the orders service was restarted during a flag service outage and checkout started returning 404 — wasn't the flag SDK supposed to keep serving the last known variants"
+lang = "en"
+expect = ["insight:k10-t"]
+kind = "paraphrase"
+# k10-t: SDK без набора правил вернул умолчания, а умолчание new_checkout = false вело на удалённый старый путь; сосед k10-n — локальный снимок правил на диске (тот ответ, на который надеется спрашивающий), заметка en/api/feature-flag-evaluation — когда возвращается умолчание, но не почему 404.
+
+[[query]]
+id = "kb-07"
+text = "сразу после входа пользователи изредка получают 401 от сервиса заказов, причём только на одном узле; допуск leeway для exp и nbf мы на стенде уже проверяли — в чём причина"
+lang = "ru"
+expect = ["insight:k12-t"]
+kind = "paraphrase"
+# k12-t: на узле отключилась синхронизация времени, часы отстали на 40 с, nbf «в будущем»; сосед k12-n — эксперимент с leeway 30 с, заметка ru/api/jwt-validation — что проверяется (exp, nbf, 401), но не расхождение часов узла.
+
+[[query]]
+id = "kb-08"
+text = "why does a LIMIT/OFFSET export of orders to a partner contain some orders twice and miss others while new orders keep coming in — I thought OFFSET was only a problem for speed on deep pages"
+lang = "en"
+expect = ["insight:k13-t"]
+kind = "cross-lang"
+# k13-t (ru): новые вставки сдвигают страницы OFFSET — дубли и пропуски; сосед k13-n — keyset и время ответа на дальних страницах (как раз «скорость»), заметка ru/api/keyset-pagination — параметры курсора и полный порядок, без сдвига при вставках.
+
+[[query]]
+id = "kb-09"
+text = "в бесконечной ленте товаров на высоких мониторах дублируются карточки, IntersectionObserver срабатывает второй раз подряд — поможет ли виртуализация списка"
+lang = "ru"
+expect = ["insight:k14-t"]
+kind = "cross-lang"
+# k14-t (en): сторож остаётся в окне после первой страницы, колбэк срабатывает до обновления курсора — одна страница запрошена дважды; сосед k14-n — виртуализация и память, заметка en/web/infinite-scroll — сторож и rootMargin, без двойного запроса.
+
+[[query]]
+id = "kb-10"
+text = "orders placed between 2 and 3 a.m. on the night the clocks changed got the wrong same-day shipping date — doesn't Postgres convert every timestamp to UTC anyway"
+lang = "en"
+expect = ["insight:k15-t"]
+kind = "paraphrase"
+# k15-t: старая таблица склада хранила местное время в timestamp без смещения, ночью перехода на летнее время — неоднозначность; сосед k15-n — timestamptz приводит ввод к UTC (верно, но не для этой колонки), заметка en/api/timestamps-utc — правила UTC и зоны склада без разбора сбоя.
+
+[[query]]
+id = "kb-11"
+text = "у покупателей в Америке дата доставки в интерфейсе на день раньше, чем в заказе; форматируем через закэшированный Intl.DateTimeFormat — что мы делаем не так"
+lang = "ru"
+expect = ["insight:k16-t"]
+kind = "paraphrase"
+# k16-t: new Date('ГГГГ-ММ-ДД') разбирается как полночь UTC и в западных поясах даёт предыдущий день; сосед k16-n — кэш форматтеров Intl и скорость таблицы, заметка ru/web/date-formatting-intl — форматирование и пояс, о разборе строки даты конструктором Date не говорит.
+
+[[query]]
+id = "kb-12"
+text = "продавцы загружают прайс-лист, полоса прогресса по паре минут висит на 100 %, они перезагружают страницу и импорт дублируется — может, уменьшить размер частей загрузки"
+lang = "ru"
+expect = ["insight:k17-t"]
+kind = "cross-lang"
+# k17-t (en): прогресс считался только по отправке байтов, а разбор файла на сервере шёл после — нет состояния обработки; сосед k17-n — размер частей 8 против 64 МиБ, заметка en/web/large-file-upload — прогресс по частям и докачка, без этапа обработки.
+
+[[query]]
+id = "kb-13"
+text = "why does limit_req zone=api with rate=20r/s answer 503 to a single user opening one storefront page that makes only a dozen API calls"
+lang = "en"
+expect = ["insight:k20-t"]
+kind = "identifier"
+# k20-t: без burst nginx считает скорость в окне миллисекунд, и запросы одной страницы приходят «слишком рано»; сосед k20-n — limit_req_dry_run (та же директива и зона), заметка en/infra/nginx-limit-req — зона, burst=40 nodelay и статус 429 как готовая настройка, без объяснения отказа одному пользователю.
+
+[[query]]
+id = "kb-14"
+text = "почему проверка /health сервиса заказов в пик трафика стала самым тяжёлым запросом к базе — кэшировать статус зависимостей на 10 секунд или искать причину глубже"
+lang = "ru"
+expect = ["insight:k24-t"]
+kind = "cross-lang"
+# k24-t (en): проверка здоровья выполняла SELECT count(*) FROM orders ~50 раз в секунду; сосед k24-n — кэш статуса на 10 с (исправление, не причина), заметки en/api/health-endpoint-design и en/infra/load-balancer-health-checks — формат ответа и частота опроса, без тяжёлого запроса.
+
+[[query]]
+id = "kb-15"
+text = "users with several storefront tabs open get logged out on all their devices a few times a day — should we just refresh the access token through a BroadcastChannel"
+lang = "en"
+expect = ["insight:k11-t"]
+kind = "paraphrase"
+# k11-t: две вкладки обновляли токен в одну секунду, вторая предъявила уже ротированный refresh-токен — отзыв всей семьи; сосед k11-n — BroadcastChannel и Web Locks (решение без причины), заметка en/web/token-refresh-tabs — ротация и обнаружение повтора вообще, без гонки вкладок.
+
+[[query]]
+id = "kb-16"
+text = "в пиковый час API отвечает 429 сразу всем клиентам, хотя ни один не выбрал своё ведро токенов по тарифу — в чём причина"
+lang = "ru"
+expect = ["insight:k19-t"]
+kind = "paraphrase"
+# k19-t: за балансировщиком адрес соединения — адрес балансировщика, все клиенты в одном ведре; сосед k19-n — лимит по ключу вместо IP и клиенты за NAT (похожий, но частичный эффект, не «все сразу»), заметка ru/api/rate-limiting-token-bucket — алгоритм и тарифы без адресов за прокси.
+
+[[query]]
+id = "kb-17"
+text = "can we keep the delivery service API key in a VITE_ variable if the storefront code only uses it to call that service"
+lang = "en"
+expect = ["insight:k21-t"]
+kind = "cross-lang"
+# k21-t (ru): значение VITE_DELIVERY_KEY Vite подставил в бандл, ключ стал публичным, секреты — только через сервис; сосед k21-n — import.meta.env подставляется при сборке (про стенды, не про секреты), заметка ru/web/vite-env-variables — механизм префикса VITE_ без вывода о секретах.
+
+# ---- пары противоречий certainty ----
+
+[[query]]
+id = "kb-18"
+text = "в Windows PowerShell 5.1 Out-File -Encoding utf8 всё равно пишет BOM — UTF-8 без BOM получится только в PowerShell 7?"
+lang = "ru"
+expect = ["insight:p01-t"]
+kind = "certainty"
+weaker = ["insight:p01-h"]
+also = ["ru/windows/powershell-encoding"]
+# p01-t: [IO.File]::WriteAllText с UTF8Encoding($false) пишет без BOM прямо из 5.1; формулировка ближе к гипотезе p01-h («нужен PowerShell 7»); заметка powershell-encoding приводит тот же способ WriteAllText — в also.
+
+[[query]]
+id = "kb-19"
+text = "git on Windows checks out symlinks as tiny text files with the target path — is that just how it always works there"
+lang = "en"
+expect = ["insight:p04-t"]
+kind = "certainty"
+weaker = ["insight:p04-h"]
+also = ["ru/windows/symlinks-developer-mode"]
+# p04-t: с Developer Mode и core.symlinks=true до клонирования ссылки настоящие; текст повторяет гипотезу p04-h («always … text files»); заметка symlinks-developer-mode даёт то же условие — в also.
+
+[[query]]
+id = "kb-20"
+text = "robocopy в задании планировщика вернул ненулевой код — значит, копирование не удалось и задание правильно помечено проваленным?"
+lang = "ru"
+expect = ["insight:p09-t"]
+kind = "certainty"
+weaker = ["insight:p09-h"]
+also = ["ru/windows/services-schtasks-robocopy"]
+# p09-t: коды 0–7 — успех (битовая маска), ошибка — от 8; вопрос в словах гипотезы p09-h; раздел «robocopy и его коды выхода» заметки services-schtasks-robocopy отвечает так же — в also.
+
+[[query]]
+id = "kb-21"
+text = "our export worker opens SQLite from eight threads — will that corrupt the database, or must every query go through a single thread"
+lang = "en"
+expect = ["insight:p16-t"]
+kind = "certainty"
+weaker = ["insight:p16-h"]
+# p16-t: режим serialized по умолчанию, соединение на поток безопасно; вопрос в словах гипотезы p16-h (corrupt, single thread); заметка ru/db/sqlite-busy-timeout — о SQLITE_BUSY и одном писателе, на вопрос о потокобезопасности не отвечает.
+
+[[query]]
+id = "kb-22"
+text = "сервис убил OOM killer, а systemd считает это штатной остановкой и не перезапускает даже с Restart=on-failure — нужен внешний сторож?"
+lang = "ru"
+expect = ["insight:p17-t"]
+kind = "certainty"
+weaker = ["insight:p17-h"]
+also = ["en/linux/systemd-unit-restart"]
+# p17-t: SIGKILL от OOM — неуспех, on-failure перезапускает (кроме Restart=no и StartLimitBurst); текст почти дословно гипотеза p17-h; заметка systemd-unit-restart: on-failure перезапускает при «нечистом» сигнале и описывает предел запусков — в also.
+
+[[query]]
+id = "kb-23"
+text = "the order summary in the checkout sidebar never sticks inside the flex row — do I have to switch to position: fixed with a scroll handler"
+lang = "en"
+expect = ["insight:p18-t"]
+kind = "certainty"
+weaker = ["insight:p18-h"]
+# p18-t: sticky работает во flex, мешают overflow предка или растянутый элемент (align-self: flex-start); формулировка гипотезы p18-h (position: fixed, scroll handler).
+
+[[query]]
+id = "kb-24"
+text = "интеграционные тесты одного файла tests/*.rs ведь идут по очереди — можно поднимать для них сервер на фиксированном порту 8080?"
+lang = "ru"
+expect = ["insight:p21-t"]
+kind = "certainty"
+weaker = ["insight:p21-h"]
+also = ["ru/rust/cargo-test-parallel-flaky-proptest"]
+# p21-t: тесты одного бинарника идут параллельно потоками, фиксированный порт — AddrInUse; вопрос в словах гипотезы p21-h; заметка cargo-test-parallel-flaky-proptest прямо говорит о параллельности внутри файла и порте 0 — в also.
+
+[[query]]
+id = "kb-25"
+text = "the cleanup returned from useEffect only runs when the component unmounts, right? so the price subscription can't leak while the product page stays open"
+lang = "en"
+expect = ["insight:p22-t"]
+kind = "certainty"
+weaker = ["insight:p22-h"]
+# p22-t: очистка выполняется перед каждым повторным запуском эффекта и при размонтировании — подписка течёт по слушателю на смену зависимости; вопрос в словах гипотезы p22-h.
+
+[[query]]
+id = "kb-26"
+text = "certbot renew прошёл успешно, а клиенты всё ещё получают старый сертификат — nginx разве не перечитывает файл при каждом TLS-рукопожатии?"
+lang = "ru"
+expect = ["insight:p23-t"]
+kind = "certainty"
+weaker = ["insight:p23-h"]
+also = ["ru/ops/tls-expired-certificate"]
+# p23-t: nginx держит сертификат в памяти до reload, нужен deploy-hook; вопрос в словах гипотезы p23-h («каждое рукопожатие»); инцидент tls-expired-certificate с тем же выводом (nginx читает сертификат при старте или reload) — в also.

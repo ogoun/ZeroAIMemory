@@ -24,6 +24,10 @@
 //! - с `VectorFilter::folders` (M3, канал папок §8.3) — ещё prefetch dense top-10 по точкам
 //!   папок со своим фильтром ([`VectorFilter::folder_filter`]); итоговый лимит растёт на
 //!   его размер, так что точки папок не вытесняют чанки из выдачи M2.
+//! - **слияние RRF детерминировано** (M6, задача 5): Qdrant упорядочивает равные баллы RRF
+//!   по-разному от вызова к вызову (замер — журнал M6, задача 5, шаг 0), поэтому запрос берёт
+//!   всех кандидатов (лимит — сумма лимитов prefetch), а порядок (балл ↓, `chunk_id` ↑) и отбор
+//!   первых — [`order_fused`].
 //!
 //! Задача 19 M3 — первый старт после жёсткой остановки ([`CollectionTuning`]): клиент
 //! супервизора создаёт коллекцию с заданными `flush_interval_sec` и `wal_capacity_mb`, у
@@ -559,6 +563,8 @@ impl QdrantIndex {
         let mut q = QueryPointsBuilder::new(COLLECTION);
         let mut prefetches = 0;
         let mut limit = QUERY_LIMIT;
+        // сумма лимитов prefetch: слияние отдаёт всех кандидатов, отбор — здесь (см. ниже)
+        let mut fetch = 0;
         // фрагменты вложений — своим prefetch dense и sparse (см. модуль)
         let window = attachment_window(f) as u64;
         if window > 0
@@ -574,6 +580,7 @@ impl QdrantIndex {
                         .limit(window),
                 );
                 prefetches += 1;
+                fetch += window;
             }
             if !q_sparse.is_empty() {
                 let mut sparse = PrefetchQueryBuilder::default()
@@ -586,6 +593,7 @@ impl QdrantIndex {
                 }
                 q = q.add_prefetch(sparse);
                 prefetches += 1;
+                fetch += window;
             }
             limit += window;
         }
@@ -599,6 +607,7 @@ impl QdrantIndex {
                     .limit(LEAF_PREFETCH),
             );
             prefetches += 1;
+            fetch += LEAF_PREFETCH;
         }
         if !leaf_levels.is_empty() && !q_sparse.is_empty() {
             let mut sparse = PrefetchQueryBuilder::default()
@@ -611,6 +620,7 @@ impl QdrantIndex {
             }
             q = q.add_prefetch(sparse);
             prefetches += 1;
+            fetch += LEAF_PREFETCH;
         }
         if !note_levels.is_empty() && !q_dense.is_empty() {
             q = q.add_prefetch(
@@ -622,6 +632,7 @@ impl QdrantIndex {
                     .limit(NOTE_PREFETCH),
             );
             prefetches += 1;
+            fetch += NOTE_PREFETCH;
         }
         // точки папок — своим prefetch; лимит слияния растёт на его размер: папки не
         // занимают места чанков (каждая точка — только в одном prefetch, RRF не меняет
@@ -639,21 +650,31 @@ impl QdrantIndex {
                     .limit(FOLDER_PREFETCH),
             );
             prefetches += 1;
+            fetch += FOLDER_PREFETCH;
             limit += FOLDER_PREFETCH;
         }
         if prefetches == 0 {
             return Ok(Vec::new());
         }
+        // RRF Qdrant упорядочивает равные баллы (а их много: ранг r в dense и ранг r в sparse
+        // дают один балл) по-разному от вызова к вызову и на границе лимита отдаёт разный
+        // состав (M6, задача 5, шаг 0). Поэтому слияние берёт всех кандидатов, а порядок и
+        // отбор — детерминированные ([`order_fused`]).
         let q = q
             .query(Query::new_rrf(RrfBuilder::with_k(RRF_K)))
-            .limit(limit)
+            .limit(fetch.max(limit))
             .with_payload(hit_payload());
         let resp = self
             .client
             .query(q)
             .await
             .map_err(|e| map_err("query", e))?;
-        resp.result.into_iter().map(to_hit).collect()
+        let hits = resp
+            .result
+            .into_iter()
+            .map(to_hit)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(order_fused(hits, limit as usize))
     }
 
     async fn nearest_dense_impl(
@@ -764,6 +785,58 @@ impl QdrantIndex {
         Ok(Some(out))
     }
 
+    /// Точек вне тенанта `user` по целям `t` (узлы — без точек вложений).
+    async fn foreign_count(&self, user: Id, t: &[TargetRef]) -> Result<u64, IndexError> {
+        let s = split_targets(t);
+        let mut any = Vec::new();
+        if !s.nodes.is_empty() {
+            any.push(kw_any("node_id", s.nodes));
+        }
+        if !s.entries.is_empty() {
+            any.push(kw_any("entry_id", s.entries));
+        }
+        if any.is_empty() {
+            return Ok(0);
+        }
+        let filter = Filter {
+            must_not: vec![kw("user_id", user.to_string())],
+            should: any,
+            ..Filter::default()
+        };
+        Ok(self
+            .client
+            .count(
+                CountPointsBuilder::new(COLLECTION)
+                    .filter(filter)
+                    .exact(true),
+            )
+            .await
+            .map_err(|e| map_err("count", e))?
+            .result
+            .map(|r| r.count)
+            .unwrap_or(0))
+    }
+
+    async fn foreign_targets_impl(
+        &self,
+        user: Id,
+        targets: &[TargetRef],
+    ) -> Result<Vec<TargetRef>, IndexError> {
+        let mut out = Vec::new();
+        for part in targets.chunks(500) {
+            // обычно чужих точек нет: один подсчёт на пачку, по одной цели — только при находке
+            if self.foreign_count(user, part).await? == 0 {
+                continue;
+            }
+            for t in part {
+                if self.foreign_count(user, std::slice::from_ref(t)).await? > 0 {
+                    out.push(*t);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn health_impl(&self) -> Result<(), IndexError> {
         // health_check в gRPC доступен без ключа; list_collections проверяет и ключ.
         self.client
@@ -823,6 +896,14 @@ impl VectorIndex for QdrantIndex {
 
     fn folder_hashes(&self, user: Id) -> IndexFuture<'_, Option<Vec<(Id, String)>>> {
         Box::pin(self.folder_hashes_impl(user))
+    }
+
+    fn foreign_targets<'a>(
+        &'a self,
+        user: Id,
+        targets: &'a [TargetRef],
+    ) -> IndexFuture<'a, Vec<TargetRef>> {
+        Box::pin(self.foreign_targets_impl(user, targets))
     }
 }
 
@@ -970,6 +1051,18 @@ fn hit_payload() -> SelectorOptions {
     SelectorOptions::Include(PayloadIncludeSelector {
         fields: HIT_FIELDS.iter().map(|f| (*f).to_string()).collect(),
     })
+}
+
+/// Порядок слияния: балл по убыванию, при равенстве — `chunk_id` по возрастанию; первые
+/// `limit`. Детерминирован при любом порядке входа (равные баллы RRF — обычное дело).
+pub(crate) fn order_fused(mut hits: Vec<VectorHit>, limit: usize) -> Vec<VectorHit> {
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
+    hits.truncate(limit);
+    hits
 }
 
 /// Точка выдачи → [`VectorHit`].

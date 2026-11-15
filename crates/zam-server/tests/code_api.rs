@@ -1272,11 +1272,12 @@ async fn map_two_phase_many_files_tail_counts_all() {
         let syms = m["symbols_shown"].as_u64().unwrap() + m["symbols_left"].as_u64().unwrap();
         assert_eq!(syms, 300);
     }
-    // дешёвые файлы (без символов, ≈ 3 токена): показано больше первой порции (бюджет / 8)
+    // дешёвые файлы (без символов; `q/NNN.rs` — ≈ 4 токена bge-m3, ≈ 7 оценки сверху без модели,
+    // M6 задача 5): показано больше первой порции (бюджет / 8)
     let b = world("two-phase-cheap", |_| {}).await;
     for part in [0..300u64, 300..600] {
         let cheap: Vec<Value> = part
-            .map(|i| file(&format!("q/a{i}.rs"), i + 1, vec![], &[]))
+            .map(|i| file(&format!("q/{i:03}.rs"), i + 1, vec![], &[]))
             .collect();
         put(&b, cheap).await;
     }
@@ -1296,7 +1297,7 @@ async fn map_two_phase_many_files_tail_counts_all() {
         "непрочитанные файлы не показаны: {text}"
     );
     assert_eq!(
-        text.lines().filter(|l| l.starts_with("q/a")).count() as u64,
+        text.lines().filter(|l| l.starts_with("q/")).count() as u64,
         shown
     );
     let md = get_ok(
@@ -1545,6 +1546,11 @@ async fn code_files_page_lang_q_offset_limit() {
 /// Ревью задачи 4, O1: чтение входов для фокуса — отдельной задачей, одной на решение и снимок;
 /// срок запроса его не отменяет: первые запросы откатываются без фокуса, следующий — с фокусом
 /// из кэша; чтение — одно на два параллельных запроса.
+///
+/// Синхронизация — барьером `CodeHooks::inputs_hold`, не временем (флейк M5.6, задача 15b M6):
+/// раньше чтение спало 3 с, и второй запрос под нагрузкой доходил до фокуса уже после него — с
+/// фокусом из кэша. Теперь чтение стоит, пока у обоих запросов не вышел срок фокуса
+/// (`CodeHooks::focus_timeouts`); дальше запросы ждут того же чтения ради рёбер `format=json`.
 #[tokio::test]
 async fn focus_inputs_load_survives_timeout_single_read() {
     use std::sync::atomic::Ordering;
@@ -1565,27 +1571,40 @@ async fn focus_inputs_load_survives_timeout_single_read() {
     wait_ranked(&a).await;
     let hooks = &a.st.code.hooks;
     a.st.code.forget_inputs();
-    hooks.inputs_delay_ms.store(3000, Ordering::SeqCst);
+    hooks.inputs_hold.store(true, Ordering::SeqCst);
     let focus = enc(&json!({"paths": ["src/b.rs"]}).to_string());
     let extra = format!("&focus={focus}");
-    let (m1, m2) = tokio::join!(map_json(&a, &extra), map_json(&a, &extra));
+    hooks.focus_timeouts.store(0, Ordering::SeqCst);
+    let release = async {
+        // событие, а не время: срок — только страховка от зависания
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while hooks.focus_timeouts.load(Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < deadline, "срок фокуса не вышел");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // чтение стоит на барьере: оба запроса застали одну и ту же задачу чтения
+        let active = (
+            hooks.inputs_active.load(Ordering::SeqCst),
+            hooks.inputs_active_max.load(Ordering::SeqCst),
+        );
+        hooks.release_inputs();
+        active
+    };
+    let (m1, m2, active) = tokio::join!(map_json(&a, &extra), map_json(&a, &extra), release);
     for m in [&m1, &m2] {
         assert_eq!(m["warnings"], json!(["focus rank timeout"]), "{m}");
     }
     assert_eq!(
-        hooks.inputs_reads.load(Ordering::SeqCst),
-        1,
-        "одно чтение на два запроса"
+        active,
+        (1, 1),
+        "одно чтение на два запроса, идёт до барьера"
     );
-    // чтение дочиталось в фоне и заполнило кэш
-    for _ in 0..200 {
-        if a.st.code.hooks.inputs_reads.load(Ordering::SeqCst) == 1
-            && map_json(&a, &extra).await["warnings"] == json!([])
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // чтение дочиталось и заполнило кэш до ответов (рёбра ждали его)
+    assert_eq!(
+        hooks.inputs_active.load(Ordering::SeqCst),
+        0,
+        "чтение закончилось"
+    );
     let m = map_json(&a, &extra).await;
     assert_eq!(m["warnings"], json!([]), "{m}");
     assert!(m["header"].as_str().unwrap().contains("с фокусом"), "{m}");
@@ -1852,4 +1871,65 @@ async fn map_files_param_limits_files_and_edges() {
             bad,
         );
     }
+}
+
+/// M6 §12а: ответ `POST /code/sync` несёт `recv_count: true` (клиент M6 по нему шлёт счётчик);
+/// `refs[].recv_count` принимается у `call` (≤ `count`), иначе 422; файл старого клиента (без
+/// поля) принимается, его вызовы — прямые. Ранги карты с получателем ниже, чем у прямых вызовов.
+#[tokio::test]
+async fn refs_recv_count_accepted_validated() {
+    let a = world("recv-count", |_| {}).await;
+    let r = sync(&a, &[("src/lib.rs", 1)]).await;
+    ok(&r, StatusCode::OK, "sync");
+    assert_eq!(r.json()["recv_count"], true, "{}", r.text());
+    let with = |kind: &str, count: u32, recv: u32| {
+        json!({"path": "src/x.rs", "lang": "rust", "hash": h(9), "size": 10, "parse_state": "ok",
+               "symbols": [], "refs": [{"name": "go", "kind": kind, "count": count,
+                                        "first_line": 1, "recv_count": recv}]})
+    };
+    unprocessable(
+        &put_raw(&a, vec![with("call", 2, 3)]).await,
+        "recv_count: не больше count",
+        "recv > count",
+    );
+    unprocessable(
+        &put_raw(&a, vec![with("type", 2, 1)]).await,
+        "recv_count: только у ссылок вида call",
+        "recv у type",
+    );
+    // один файл вызывает `go` только по получателю ×4, а `stop` — прямо ×4 (у старого клиента
+    // поля нет — тоже прямые): исходящий вес файла делится √(4 × 0,25) : √4 = 1 : 2
+    let mut user = file(
+        "src/user.rs",
+        3,
+        vec![func("o_user", 1)],
+        &[("go", "call", 4), ("stop", "call", 4)],
+    );
+    user["refs"][0]["recv_count"] = json!(4);
+    put(
+        &a,
+        vec![
+            file("src/go.rs", 1, vec![func("go", 1)], &[]),
+            file("src/stop.rs", 2, vec![func("stop", 1)], &[]),
+            user,
+        ],
+    )
+    .await;
+    wait_ranked(&a).await;
+    let m = map_json(&a, "").await;
+    let rank_of = |path: &str| {
+        m["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == path)
+            .unwrap_or_else(|| panic!("{path}: {m}"))["rank"]
+            .as_f64()
+            .unwrap()
+    };
+    let (go, stop) = (rank_of("src/go.rs"), rank_of("src/stop.rs"));
+    assert!(
+        go < stop,
+        "вызовы по получателю весят меньше прямых: {go} / {stop}: {m}"
+    );
 }

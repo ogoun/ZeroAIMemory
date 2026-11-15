@@ -1,7 +1,7 @@
 {
   "name": "zam-web",
   "private": true,
-  "version": "0.0.10-m5.7",
+  "version": "0.0.11-m6",
   "type": "module",
   "engines": {
     "node": ">=22.13"
@@ -11,7 +11,7 @@
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "size": "size-limit",
-    "test:build": "node --experimental-strip-types --test build/license-policy.test.ts",
+    "test:build": "node --experimental-strip-types --test build/license-policy.test.ts test/time.test.ts test/codeRef.test.ts test/reportLinks.test.ts test/ideaButtons.test.ts test/indexing.test.ts test/adrData.test.ts",
     "e2e": "node e2e/run.mjs"
   },
   "devDependencies": {

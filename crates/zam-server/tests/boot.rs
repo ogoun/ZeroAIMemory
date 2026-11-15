@@ -54,9 +54,69 @@ async fn health_ok_under_base_path() {
     assert_eq!(j["status"], "ok");
     assert_eq!(j["version"], env!("CARGO_PKG_VERSION"));
     assert!(j["git"].is_string() && j["uptime_s"].is_u64());
+    // M6, задача 5: активный счётчик выдачи (model | bundled | estimate)
+    assert!(
+        matches!(
+            j["token_counter"].as_str(),
+            Some("model" | "bundled" | "estimate")
+        ),
+        "{j}"
+    );
+    assert!(
+        j["tokenizer_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "{j}"
+    );
+    // возможности сборки для загрузчика замера M6 (xtask eval caps): сборка ветки M6 — "m6"
+    let f: Vec<&str> = j["features"]
+        .as_array()
+        .expect("features — массив")
+        .iter()
+        .map(|v| v.as_str().expect("строка"))
+        .collect();
+    assert_eq!(f, zam_server::api::health::FEATURES);
+    assert!(f.contains(&"m6"), "{f:?}");
+    // карта кода принимает `refs[].recv_count` (M6 §12а)
+    assert!(f.contains(&"code_recv"), "{f:?}");
     // вне base_path маршрута нет
     let r = app.oneshot(get("/api/v1/health")).await.unwrap();
     assert_eq!(r.status(), 404);
+}
+
+/// CR-9 (часть, §16 п. 19): `/health.features` — официальный список; каждый флаг `FEATURES`
+/// описан строкой таблицы раздела «Флаги `features`» в `docs/api-compat.md`, и таблица не
+/// называет флагов, которых нет в сборке. Флаги задачи 19 — в списке.
+#[test]
+fn health_features_documented() {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api-compat.md");
+    let doc = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let section = doc
+        .split("\n## ")
+        .find(|s| s.starts_with("Флаги `features`"))
+        .expect("раздел «Флаги `features`»");
+    let documented: std::collections::BTreeSet<&str> = section
+        .lines()
+        .filter_map(|l| l.strip_prefix("| `"))
+        .filter_map(|l| l.split_once('`').map(|(f, _)| f))
+        .collect();
+    let built: std::collections::BTreeSet<&str> =
+        zam_server::api::health::FEATURES.iter().copied().collect();
+    assert_eq!(documented, built, "таблица флагов против FEATURES");
+    for f in [
+        "idempotent_nodes",
+        "recall_timeout",
+        "mcp_session_arg",
+        "epochs",
+    ] {
+        assert!(built.contains(f), "{f}");
+    }
+    // у каждого флага — описание (третья ячейка не пустая)
+    for l in section.lines().filter(|l| l.starts_with("| `")) {
+        let cells: Vec<&str> = l.split('|').map(str::trim).collect();
+        assert!(
+            cells.len() >= 4 && cells[2..cells.len() - 1].iter().all(|c| !c.is_empty()),
+            "{l}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -234,4 +294,30 @@ fn non_tty_stderr_puts_initial_token_into_file() {
         let text = std::fs::read_to_string(e.path()).unwrap_or_default();
         assert!(!text.contains(&token), "токен в {}", e.path().display());
     }
+}
+
+/// Переменные клиента `zam` в окружении сервера (пользователь запускает `zam-server` из той же
+/// консоли, где работает `zam`): `zam_core::CLIENT_ENV_VARS` — в том числе пределы ожидания
+/// `zam export`/`zam import` — не ключи конфигурации, сервер стартует.
+#[test]
+fn client_env_vars_do_not_break_start() {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+    let root = tmp("b-client-env");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, common::qdrant::free_port()));
+    let mut c = cfg_in(root.join("data"));
+    c.server.bind = addr;
+    let conf = root.join("zam.toml");
+    std::fs::write(&conf, toml::to_string(&c).unwrap()).unwrap();
+    let env: Vec<(&str, &str)> = zam_core::CLIENT_ENV_VARS
+        .iter()
+        .map(|k| (*k, "300"))
+        .collect();
+    let mut srv = common::process::ServerProc::start_env(&conf, addr, &env);
+    let token = srv.initial_token(Duration::from_secs(60));
+    assert!(token.starts_with("zam_"), "{token}");
+    srv.assert_running("старт с переменными клиента в окружении");
+    let (status, spaces) = srv.call("GET", "/api/v1/spaces", &token, None);
+    assert_eq!(status, 200, "{spaces}");
+    srv.kill();
 }

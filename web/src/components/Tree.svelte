@@ -1,4 +1,5 @@
 <script lang="ts" module>
+  import { localTime } from '../lib/time';
   import type { NodeInfo } from '../lib/api';
 
   /** Изменение узла из дерева — для Shell (открытый документ мог исчезнуть или переехать). */
@@ -15,14 +16,19 @@
     ApiError,
     createNode,
     deleteNode,
+    exportProbe,
+    exportUrl,
     listChildren,
     listSpaces,
     listTrash,
     moveNode,
     restoreNode,
+    rulesHeavyText,
+    rulesStatus,
     spaceMatches,
     spaceRef,
     type NodeKind,
+    type RulesStatus,
     type Space,
     type User,
   } from '../lib/api';
@@ -60,6 +66,8 @@
   let trash = $state<Record<string, NodeInfo[]>>({});
   let busy = $state<Record<string, boolean>>({});
   let errs = $state<Record<string, string>>({});
+  /** Rules пользователя (`rules_heavy` — плашка у пространства Rules, M6 §8). */
+  let rules = $state<Record<string, RulesStatus | null>>({});
 
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   let ask = $state<Ask | null>(null);
@@ -103,10 +111,22 @@
       const r = await listSpaces(uid);
       spaces[uid] = r.spaces;
       pending[uid] = r.access_requests_pending ?? 0;
+      void loadRules(uid);
     } catch (e) {
       fail(k, e);
     } finally {
       busy[k] = false;
+    }
+  }
+
+  /** Rules пользователя для плашки `rules_heavy`; сбой (старый сервер без `only=rules`) — без
+   * плашки: дерево от неё не зависит. */
+  async function loadRules(uid: string) {
+    try {
+      rules[uid] = (await rulesStatus(uid)).rules;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) onexpired();
+      rules[uid] = null;
     }
   }
 
@@ -153,6 +173,8 @@
     for (const k of Object.keys(open)) {
       if (open[k] && k.startsWith(prefix)) loads.push(loadKids(uid, ref, k.slice(prefix.length)));
     }
+    // создание, перемещение, удаление и восстановление в Rules меняют плашку `rules_heavy`
+    if (spaces[uid]?.some((s) => s.kind === 'rules' && spaceRef(s) === ref)) loads.push(loadRules(uid));
     await Promise.all(loads);
   }
 
@@ -216,8 +238,36 @@
         { label: 'Переименовать/переместить', action: () => askMove(t, node) },
         { label: 'Удалить', danger: true, action: () => askDelete(t, node) },
       );
+    } else {
+      items.push({ label: 'Экспорт (.zip)', action: () => void exportSpace(t) });
     }
     return items;
+  }
+
+  const kExport = (u: string, ref: string) => `x|${u}|${ref}`;
+
+  /** Экспорт пространства: проверка (права, занятость сервера) с ошибкой текстом под строкой
+   * пространства, затем скачивание по ссылке — архив идёт браузером на диск, не в память. */
+  async function exportSpace(t: Target) {
+    const ref = spaceRef(t.space);
+    const k = kExport(t.uid, ref);
+    delete errs[k];
+    try {
+      await exportProbe(t.uid, ref);
+      download(exportUrl(t.uid, ref));
+    } catch (e) {
+      fail(k, e);
+    }
+  }
+
+  /** Скачивание по ссылке (архив экспорта): имя файла даёт `Content-Disposition` сервера. */
+  function download(url: string) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    document.body.append(a);
+    a.click();
+    a.remove();
   }
 
   function menuAt(e: MouseEvent, t: Target) {
@@ -314,11 +364,7 @@
   const spaceName = (uid: string, id: string) =>
     spaces[uid]?.find((s) => s.id === id)?.name ?? '';
 
-  const fmtTime = (ts: string | null) => {
-    if (!ts) return '';
-    const d = new Date(ts);
-    return Number.isNaN(d.getTime()) ? ts : d.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
-  };
+  const fmtTime = (ts: string | null) => (ts ? localTime(ts) : '');
 
   const isSelected = (uid: string, id: string) =>
     route.name === 'node' && route.user === uid && route.node === id;
@@ -474,11 +520,18 @@
       <button type="button" class="label" onclick={() => toggle(k, () => loadKids(uid, ref, ''), !!kids[k])}>
         {@render icon(s.kind)}<span class="name">{s.name}</span>
         {#each roleTags(s) as t (t.text)}<span class="tag role" title={t.title}>{t.text}</span>{/each}
+        {#if s.kind === 'rules' && rules[uid]?.warning === 'rules_heavy'}
+          <span class="tag heavy" title={rulesHeavyText(rules[uid]!)}>много правил</span>
+        {/if}
       </button>
       <button type="button" class="more" aria-label="Действия: {s.name}" onclick={(e) => menuBelow(e, target)}>⋯</button>
     </div>
+    {@render status(kExport(uid, ref))}
     {#if open[k]}
       {@const js = journalsOf(s.kind)}
+      {#if s.kind === 'rules' && rules[uid]?.warning === 'rules_heavy'}
+        <div class="tree-note heavy" role="note" style:--depth={depth + 1}>{rulesHeavyText(rules[uid]!)}</div>
+      {/if}
       {#if js.length}
         <ul class="journals" aria-label="Журналы: {s.name}">
           {#each js as j (j)}
@@ -705,6 +758,11 @@
   }
   .tag.role {
     color: var(--text);
+  }
+  .tag.heavy,
+  .tree-note.heavy {
+    background: var(--warn-bg);
+    color: var(--warn-text);
   }
   .tag.pending {
     background: var(--accent);

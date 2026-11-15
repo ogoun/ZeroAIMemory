@@ -4,7 +4,7 @@
   // (только владелец), поиск символа (Ctrl+K страницы), таблица файлов по рангу с фильтрами
   // (`GET /code/files` постранично), «Обзор» — Mermaid первых 40 файлов и рёбер между ними
   // (CodeOverview, свой ленивый чанк; ответ карты кэшируется по версии снимка), карточка символа по
-  // постоянному адресу `путь#qual`. Вкладки — шаблон ARIA tabs (стрелки, Home, End, как у листов
+  // постоянному адресу `путь#qual` (у `qual` вида якоря строки `L10` — по `id`, M6 §12а). Вкладки — шаблон ARIA tabs (стрелки, Home, End, как у листов
   // SheetViewer).
   // Данные сервера — только текстом (никакого `{@html}`). Ленивый чанк (Shell).
   import { untrack } from 'svelte';
@@ -30,6 +30,7 @@
     type CodeSymbolCard,
     type CodeSymbolHit,
   } from '../lib/code';
+  import { LINE_ANCHOR_HINT, isLineAnchor, symbolEntry } from '../lib/codeRef';
   import { JOURNAL_OF_KIND } from '../lib/journals';
   import { href } from '../lib/router';
 
@@ -334,7 +335,7 @@
     <ul class="hits" aria-label="Найденные символы">
       {#each hits as h (h.id)}
         <li>
-          <a href={cardHref(`${h.path}#${h.qual}`)}>{h.qual}</a>
+          <a href={cardHref(symbolEntry(h))} title={isLineAnchor(h.qual) ? LINE_ANCHOR_HINT : undefined}>{h.qual}</a>
           <span class="chip">{h.kind}</span>
           <span class="muted mono">{h.path}:{h.line}</span>
           {#if h.sig}<code class="sig-line">{h.sig}</code>{/if}
@@ -406,7 +407,11 @@
           </ul>
           {#if card.knowledge_left > 0}<p class="muted">…и ещё {card.knowledge_left}.</p>{/if}
         {:else}
-          <p class="muted">Знаний о символе нет: привяжите ссылкой {s.path}#{s.qual} в refs записи или заметки.</p>
+          {#if isLineAnchor(s.qual)}
+            <p class="muted">Знаний о символе нет. Ссылкой {s.path}#{s.qual} символ не привязать: это якорь строки файла (уточните path).</p>
+          {:else}
+            <p class="muted">Знаний о символе нет: привяжите ссылкой {s.path}#{s.qual} в refs записи или заметки.</p>
+          {/if}
         {/if}
       </article>
     {/if}

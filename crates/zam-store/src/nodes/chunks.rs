@@ -20,12 +20,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::{
-    ApproxCounter, ChunkLevel, ChunkParams, Doc, TokenCounter, chunk_note, first_paragraph,
-    mask_secrets, mask_text, parse, scan_secrets,
+    ApproxCounter, ChunkLevel, ChunkParams, Doc, EstimateCounter, TokenCounter, chunk_note,
+    first_paragraph, mask_secrets, mask_text, parse, scan_secrets,
 };
 
 use super::{hex, revision_text};
@@ -280,8 +279,95 @@ pub fn token_counter_exact() -> bool {
     token_counter().is_exact()
 }
 
-/// Число токенов `text` текущим счётчиком чанкера (бюджет выдачи поиска).
+static BUNDLED_COUNTER: OnceLock<RwLock<Option<Arc<dyn TokenCounter>>>> = OnceLock::new();
+
+fn bundled_cell() -> &'static RwLock<Option<Arc<dyn TokenCounter>>> {
+    BUNDLED_COUNTER.get_or_init(|| RwLock::new(None))
+}
+
+/// Ставит точный счётчик **выдачи** без модели — `tokenizer.json` из комплекта сервера (M6,
+/// задача 5, решение владельца 2026-11-06). Чанкер его не использует: без модели он режет
+/// [`ApproxCounter`], как требует сопоставимость индекса ([`set_token_counter`]).
+pub fn set_bundled_counter(tc: Arc<dyn TokenCounter>) {
+    *bundled_cell().write().unwrap_or_else(|e| e.into_inner()) = Some(tc);
+}
+
+/// Какой счётчик считает размеры и бюджеты выдачи ([`budget_counter_kind`], `/health`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetCounterKind {
+    /// Токенизатор установленной модели (тот же, что у чанкера).
+    Model,
+    /// `tokenizer.json` комплекта сервера ([`set_bundled_counter`]).
+    Bundled,
+    /// Несмещённая оценка [`EstimateCounter`] с запасом бюджета `fits`.
+    Estimate,
+}
+
+impl BudgetCounterKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetCounterKind::Model => "model",
+            BudgetCounterKind::Bundled => "bundled",
+            BudgetCounterKind::Estimate => "estimate",
+        }
+    }
+}
+
+/// Счётчик размеров и бюджетов выдачи и его вид, по порядку (M6, задача 5): токенизатор модели
+/// (точный счётчик чанкера); иначе `tokenizer.json` комплекта ([`set_bundled_counter`]); иначе
+/// несмещённая оценка [`EstimateCounter`] с запасом бюджета. Чанкер режет своим счётчиком
+/// ([`token_counter`]).
+fn budget_counter_with_kind() -> (Arc<dyn TokenCounter>, BudgetCounterKind) {
+    let c = token_counter();
+    if c.is_exact() {
+        return (c, BudgetCounterKind::Model);
+    }
+    if let Some(b) = bundled_cell()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return (b, BudgetCounterKind::Bundled);
+    }
+    (Arc::new(EstimateCounter), BudgetCounterKind::Estimate)
+}
+
+fn budget_counter() -> Arc<dyn TokenCounter> {
+    budget_counter_with_kind().0
+}
+
+/// Вид активного счётчика выдачи — для `/health` и диагностики (eval сверяет, точен ли счёт).
+pub fn budget_counter_kind() -> BudgetCounterKind {
+    budget_counter_with_kind().1
+}
+
+/// `tokenizer_id` активного счётчика выдачи (`/health`): у токенизатора — по его
+/// `tokenizer.json`, у оценки — версия (`estimate-v6`).
+pub fn budget_tokenizer_id() -> String {
+    budget_counter().tokenizer_id()
+}
+
+/// Число токенов `text` для размеров, которые видит агент (`Nt`, `tokens`, `~N tok`): точный
+/// счёт или несмещённая оценка ([`budget_counter`]).
 pub fn count_tokens(text: &str) -> usize {
+    budget_counter().count(text)
+}
+
+/// Наибольший [`count_tokens`], который помещается в бюджет `budget` (M6 §4.2): упаковка
+/// суммами частей сравнивает сумму с ним; без модели — с запасом оценки.
+pub fn budget_cap(budget: usize) -> usize {
+    budget_counter().budget_cap(budget)
+}
+
+/// Помещается ли ответ `text` целиком в бюджет `budget` (M6 §4.2) — единая проверка бюджета.
+pub fn fits_budget(text: &str, budget: usize) -> bool {
+    budget_counter().fits(text, budget)
+}
+
+/// Число токенов `text` счётчиком чанкера (токенизатор модели или `ApproxCounter`): размер
+/// для сведения, а не бюджет выдачи — например, блок инструкции агенту, проверяемый тестом по
+/// bge-m3 (оценка выдачи [`count_tokens`] без модели — другой счётчик со своим разбросом).
+pub fn count_tokens_chunker(text: &str) -> usize {
     token_counter().count(text)
 }
 
@@ -644,7 +730,7 @@ pub(crate) fn note_chunks(
 }
 
 /// Чанк заметки без текста тела (например, только `# Имя` из WebUI):
-/// путь и текст — первый заголовок, а без заголовков — имя узла.
+/// путь и текст — первый заголовок, а без заголовков — имя узла; секреты маскируются.
 pub(crate) fn title_chunk(doc: &Doc, name: &str, tc: &dyn TokenCounter) -> ChunkRow {
     let (heading_path, text) = match doc.sections.iter().find(|s| s.level > 0) {
         Some(s) => (
@@ -658,6 +744,9 @@ pub(crate) fn title_chunk(doc: &Doc, name: &str, tc: &dyn TokenCounter) -> Chunk
     } else {
         text
     };
+    // имя и заголовок задаёт автор: значение секрета маскируется, как в теле (ревью 15b, N4) —
+    // иначе разностная перепроверка находила бы такой чанк при каждом росте версии правил
+    let (text, heading_path) = (mask_text(&text), mask_text(&heading_path));
     ChunkRow {
         level: ChunkLevel::Chunk,
         heading_path,
@@ -836,7 +925,7 @@ pub(crate) async fn backfill_certainty(db: &Db) -> Result<u64, StoreError> {
         let cursor = after;
         let (n, found, demoted, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, i64, String)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT n.id, n.current_rev, r.author_kind
@@ -993,7 +1082,7 @@ pub(crate) async fn rescan_secrets(db: &Db, priority: i64) -> Result<u64, StoreE
         let cursor = after;
         let (n, found, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, i64, String, Option<String>)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT id, current_rev, index_state, l0 FROM nodes
@@ -1048,6 +1137,40 @@ pub(crate) async fn rescan_secrets(db: &Db, priority: i64) -> Result<u64, StoreE
     Ok(total)
 }
 
+/// Перемаскировка одной живой заметки текущими правилами сканера (разностная перепроверка при
+/// росте `zam_secrets::RULES_VERSION`, [`crate::secrets_delta`]): L0 маскируется, чанки
+/// пересобираются из исходника, ставится задание с `priority`. `false` — заметки нет или она в
+/// корзине.
+pub(crate) fn remask_note(
+    c: &Connection,
+    id: Id,
+    priority: i64,
+    now: &str,
+) -> Result<bool, StoreError> {
+    let row: Option<(i64, String, Option<String>)> = c
+        .prepare_cached(
+            "SELECT current_rev, index_state, l0 FROM nodes
+             WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+    let Some((rev, state, l0)) = row else {
+        return Ok(false);
+    };
+    if let Some(l0) = &l0 {
+        let m = mask_text(l0);
+        if &m != l0 {
+            c.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
+                .execute(params![id, m])?;
+        }
+    }
+    let content = revision_text(c, id, rev)?;
+    let meta = note_meta(&content, None);
+    rebuild_chunks(c, id, rev, &content, &meta)?;
+    enqueue_for_note(c, id, rev, Some(&state), priority, now)?;
+    Ok(true)
+}
+
 /// Заметок в одной транзакции перечанковки: писатель не занят надолго.
 const RECHUNK_BATCH: i64 = 200;
 
@@ -1074,7 +1197,7 @@ pub(crate) async fn rechunk_notes(
         let cursor = after;
         let (n, u, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, i64, String, SpaceKind)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT n.id, n.current_rev, n.index_state, s.kind

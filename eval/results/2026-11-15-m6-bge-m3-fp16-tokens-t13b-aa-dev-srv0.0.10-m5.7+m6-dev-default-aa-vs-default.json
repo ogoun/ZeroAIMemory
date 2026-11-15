@@ -1,0 +1,30 @@
+{
+  "base": "default",
+  "arm": "default-aa",
+  "split": "dev",
+  "scenarios": 30,
+  "only_base": [],
+  "only_arm": [],
+  "base_tokens": 92677,
+  "arm_tokens": 92687,
+  "r": {
+    "mean": 1.000107901636868,
+    "lo": 0.9998774965601424,
+    "hi": 1.0003152858463331
+  },
+  "base_micro": 0.9155844155844156,
+  "arm_micro": 0.9155844155844156,
+  "d_micro": {
+    "mean": 0.0,
+    "lo": 0.0,
+    "hi": 0.0
+  },
+  "net_losses": 0,
+  "noninferior": true,
+  "bootstrap": {
+    "samples": 10000,
+    "seed": 104372539625497,
+    "r_interval": "двусторонний 95 % (перцентили 2,5 и 97,5), парный бутстреп сценариев",
+    "d_micro_interval": "односторонние 95 % (перцентили 5 и 95), веса — число нагетов"
+  }
+}

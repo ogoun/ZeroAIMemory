@@ -1,0 +1,445 @@
+# Корпус ТС-2: 50 идей проекта «магазин» (спецификация M6 §3.1, §3.3, задача 16; задачи плана
+# 1c, 1a2). Фикстура эталона подсказок-идей M5.7 (`eval/idea-hints.toml`, задача 1a2) и идеи
+# сессий ТС-2 (задача 4); микрозамер лёгкого поиска идей (задача 16) — на этих же 50.
+#
+# [[idea]]: key (`idea:<key>` в разметке), lang, title, body?, priority? (low | normal | high,
+# нет — normal), origin (human | agent), state — состояние после загрузки:
+#   new | deferred (horizon_days — горизонт: дата прогона UTC + дни, 0 — наступил) | proposed |
+#   declined | accepted (задача «начать» жива) | released (accepted, задача снята — dropped) |
+#   done (задача выполнена).
+# Идея агента — только new: решения по идее принимает человек (M5.7).
+#
+# Разнообразие для эталона (проверяет `cargo xtask eval --check`):
+# - общие глаголы в заголовках («Добавить», «Сделать», «Fix», «Add»…) — материал стоп-основ
+#   идей задачи 16 (служебное слово — стоп-основа + не больше 3 символов);
+# - «ложные друзья» стоп-основ: changelog, makefile, address, модульный, файловый,
+#   функциональный, тестировщик — служебными не считаются;
+# - темы с общими основами у нескольких идей (экспорт, отчёт, уведомления, кэш, поиск) —
+#   порядок топ-5 и пороги совпадения;
+# - короткие слова (PDF, CSV, API, SMS), служебные слова в заголовках;
+# - живая и снятая задача у принятых идей, наступивший и будущий горизонт у отложенных.
+
+# ---- экспорт и отчёты ----
+
+[[idea]]
+key = "i01"
+lang = "ru"
+title = "Экспорт отчётов в PDF"
+body = "Продавцы просят выгружать отчёт по продажам за месяц в PDF для бухгалтерии."
+priority = "high"
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i02"
+lang = "ru"
+title = "Экспорт заказов в CSV для партнёров"
+body = "Партнёрам нужна ежедневная выгрузка заказов без доступа к кабинету."
+origin = "human"
+state = "accepted"
+
+[[idea]]
+key = "i03"
+lang = "ru"
+title = "Отчёт по возвратам товаров"
+body = "Сводка возвратов по причинам и продавцам за неделю."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i04"
+lang = "en"
+title = "Scheduled report emails for sellers"
+body = "Send the weekly sales report to the seller's email every Monday morning."
+origin = "human"
+state = "deferred"
+horizon_days = 0
+
+[[idea]]
+key = "i05"
+lang = "ru"
+title = "Добавить график выручки в отчёт продавца"
+body = "Линейный график выручки по дням рядом с таблицей отчёта."
+origin = "human"
+state = "new"
+
+# ---- уведомления ----
+
+[[idea]]
+key = "i06"
+lang = "ru"
+title = "Уведомления покупателю о смене статуса заказа"
+body = "Пуш и письмо, когда заказ собран, передан в доставку и доставлен."
+priority = "high"
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i07"
+lang = "en"
+title = "SMS notifications for delivery slots"
+body = "Remind the customer about the delivery slot by SMS two hours before."
+origin = "human"
+state = "declined"
+
+[[idea]]
+key = "i08"
+lang = "ru"
+title = "Сделать единый центр уведомлений в кабинете продавца"
+body = "Все уведомления продавца — новые заказы, отзывы, ошибки импорта — в одной ленте."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i09"
+lang = "en"
+title = "Fix duplicate push notifications after reinstall"
+body = "Customers get every push twice after reinstalling the app: the old device token stays registered."
+origin = "agent"
+state = "new"
+
+# ---- поиск и каталог ----
+
+[[idea]]
+key = "i10"
+lang = "ru"
+title = "Поиск по каталогу с исправлением опечаток"
+body = "Запрос «кросовки» должен находить кроссовки."
+priority = "high"
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i11"
+lang = "en"
+title = "Search suggestions while typing"
+body = "Show product and category suggestions after the second typed character."
+origin = "human"
+state = "done"
+
+[[idea]]
+key = "i12"
+lang = "ru"
+title = "Фильтры каталога по наличию на складе"
+body = "Показывать только товары, которые есть на ближайшем складе покупателя."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i13"
+lang = "ru"
+title = "Исправить сортировку каталога по цене со скидкой"
+body = "Сортировка по цене сейчас учитывает старую цену, а не цену со скидкой."
+origin = "human"
+state = "released"
+
+[[idea]]
+key = "i14"
+lang = "en"
+title = "Compare products side by side"
+body = "Pick up to four products and compare their attributes in one table."
+origin = "human"
+state = "deferred"
+horizon_days = 30
+
+# ---- корзина и оформление ----
+
+[[idea]]
+key = "i15"
+lang = "ru"
+title = "Сохранять корзину между устройствами"
+body = "Корзина вошедшего покупателя хранится на сервере и видна в приложении и в браузере."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i16"
+lang = "en"
+title = "Add address autocomplete to checkout"
+body = "Suggest street and house while the customer types the delivery address."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i17"
+lang = "ru"
+title = "Оплата частями при оформлении заказа"
+body = "Подключить рассрочку платёжного шлюза для заказов от 10 000 рублей."
+origin = "human"
+state = "proposed"
+
+[[idea]]
+key = "i18"
+lang = "en"
+title = "Address book with several delivery addresses"
+body = "Customers keep home, office and parents' addresses and pick one at checkout."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i19"
+lang = "ru"
+title = "Промокоды на первый заказ"
+body = "Скидка 10 % по промокоду для новых покупателей."
+origin = "human"
+state = "accepted"
+
+# ---- кабинет продавца и прайс-листы ----
+
+[[idea]]
+key = "i20"
+lang = "ru"
+title = "Импорт прайс-листов из XLSX"
+body = "Сейчас импорт принимает только CSV, продавцы присылают Excel."
+priority = "high"
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i21"
+lang = "ru"
+title = "Обновить шаблон прайс-листа для продавцов"
+body = "В шаблоне нет колонок для штрихкода и веса товара."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i22"
+lang = "en"
+title = "Bulk edit prices in the seller dashboard"
+body = "Change prices of selected products by a percentage in one action."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i23"
+lang = "ru"
+title = "Файловый менеджер для фото товаров"
+body = "Папки и поиск по загруженным фотографиям продавца, повторное использование фото в карточках."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i24"
+lang = "ru"
+title = "Тёмная тема кабинета продавца"
+body = "Дизайн готов, нужна поддержка в компонентах кабинета."
+priority = "low"
+origin = "human"
+state = "deferred"
+horizon_days = 90
+
+[[idea]]
+key = "i25"
+lang = "en"
+title = "Update seller onboarding checklist"
+body = "The onboarding checklist still mentions the old contract form and misses tax settings."
+origin = "human"
+state = "new"
+
+# ---- разработка и инфраструктура ----
+
+[[idea]]
+key = "i26"
+lang = "en"
+title = "Generate the changelog from commit messages"
+body = "Build release notes for the storefront from Conventional Commits automatically."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i27"
+lang = "en"
+title = "Makefile targets for local stand setup"
+body = "One make target to start Postgres, Redis and the services for local development."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i28"
+lang = "ru"
+title = "Модульный монолит вместо трёх мелких сервисов доставки"
+body = "Объединить сервисы тарифов, слотов и трекинга доставки в один процесс с модулями."
+origin = "human"
+state = "declined"
+
+[[idea]]
+key = "i29"
+lang = "ru"
+title = "Добавить тесты на модуль авторизации"
+body = "Покрыть проверку JWT и обновление токенов интеграционными тестами."
+origin = "agent"
+state = "new"
+
+[[idea]]
+key = "i30"
+lang = "en"
+title = "Make CI cache Docker layers in the registry"
+body = "Export the BuildKit cache to the internal registry so image builds stop starting from scratch."
+origin = "human"
+state = "done"
+
+[[idea]]
+key = "i31"
+lang = "ru"
+title = "Функциональный стенд для тестировщиков"
+body = "Отдельный стенд с обезличенной копией базы для ручного тестирования релиза."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i32"
+lang = "en"
+title = "Change the release window to three days a week"
+body = "Release on Monday, Wednesday and Thursday instead of Tuesday and Thursday."
+origin = "human"
+state = "declined"
+
+[[idea]]
+key = "i33"
+lang = "ru"
+title = "Починить нестабильные e2e корзины"
+body = "Тест оформления заказа падает примерно в каждом десятом прогоне CI."
+origin = "human"
+state = "released"
+
+[[idea]]
+key = "i34"
+lang = "en"
+title = "Canary releases for the orders service"
+body = "Route 5 % of traffic to the new version for an hour before the full rollout."
+origin = "human"
+state = "new"
+
+# ---- надёжность и производительность ----
+
+[[idea]]
+key = "i35"
+lang = "ru"
+title = "Кэширование карточек товаров на CDN"
+body = "Отдавать карточки товаров для неавторизованных посетителей с CDN."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i36"
+lang = "en"
+title = "Warm the product cache before sales"
+body = "Fill Redis with the hot products of the last month ten minutes before a sale starts."
+origin = "human"
+state = "accepted"
+
+[[idea]]
+key = "i37"
+lang = "ru"
+title = "Поправить тайм-ауты выгрузки отчётов"
+body = "Большие отчёты обрываются с 504 через минуту."
+origin = "human"
+state = "released"
+
+[[idea]]
+key = "i38"
+lang = "en"
+title = "Rate limits per API key for partners"
+body = "Limit partner integrations by their API key instead of the IP address."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i39"
+lang = "ru"
+title = "Резервные копии фото товаров в другом регионе"
+body = "Копировать объектное хранилище с фото в бакет другого региона раз в сутки."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i40"
+lang = "en"
+title = "Add a status page for customers"
+body = "Public page with the state of checkout, payments and delivery tracking."
+origin = "human"
+state = "proposed"
+
+# ---- покупатели и маркетинг ----
+
+[[idea]]
+key = "i41"
+lang = "ru"
+title = "Программа лояльности с баллами за отзывы"
+body = "Начислять баллы за отзыв с фото, списывать при оплате."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i42"
+lang = "ru"
+title = "Отзывы с фотографиями"
+body = "Покупатель прикладывает до пяти фото к отзыву, продавец отвечает на отзыв."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i43"
+lang = "en"
+title = "Wishlist sharing by link"
+body = "Share a wishlist with friends through a public link without an account."
+origin = "human"
+state = "deferred"
+horizon_days = 0
+
+[[idea]]
+key = "i44"
+lang = "ru"
+title = "Персональные рекомендации на главной"
+body = "Блок товаров по истории просмотров покупателя."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i45"
+lang = "en"
+title = "Gift cards for the storefront"
+body = "Sell digital gift cards and accept them as a payment method."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i46"
+lang = "ru"
+title = "Сделать подписку на снижение цены"
+body = "Покупатель подписывается на товар и получает письмо, когда цена снижается."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i47"
+lang = "ru"
+title = "Чат покупателя с продавцом"
+body = "Вопросы о товаре до покупки прямо из карточки, ответы продавца видны всем."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i48"
+lang = "en"
+title = "Fix the broken accessibility of the size picker"
+body = "The size picker cannot be operated from the keyboard and has no accessible names."
+origin = "human"
+state = "new"
+
+[[idea]]
+key = "i49"
+lang = "ru"
+title = "Обновить страницу доставки и оплаты"
+body = "На странице старые тарифы и нет рассрочки."
+origin = "agent"
+state = "new"
+
+[[idea]]
+key = "i50"
+lang = "en"
+title = "Testing checklist for payment provider updates"
+body = "A short manual checklist to run on the stand before switching the payment gateway API version."
+origin = "human"
+state = "new"

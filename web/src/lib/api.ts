@@ -399,6 +399,21 @@ export const detachAttachment = (user: string, node: string, sha: string, filena
 export const blobUrl = (user: string, sha: string, filename: string) =>
   `api/v1/blobs/${q(sha)}/${q(filename)}?user=${q(user)}`;
 
+/**
+ * Адрес архива экспорта пространства (M6 §12б.5): zip с заметками, вложениями, журналами,
+ * связями и историей; браузер скачивает его по ссылке (cookie сессии), у администратора
+ * пользователь — параметром `user`, как у вложений.
+ */
+export const exportUrl = (user: string, space: string) =>
+  `api/v1/spaces/${q(space)}/export?user=${q(user)}`;
+
+/**
+ * Проверка экспорта перед скачиванием (`probe=true` → 204): права и свободный слот. Ошибку
+ * скачивания по ссылке браузер не показывает — её показывает дерево по ответу проверки.
+ */
+export const exportProbe = (user: string, space: string) =>
+  call<void>('GET', `spaces/${q(space)}/export?probe=true`, undefined, user);
+
 /** Байты файла вложения (просмотрщики PDF и DOCX разбирают его в браузере). */
 export const blobBytes = async (user: string, sha: string, filename: string): Promise<ArrayBuffer> =>
   (await request('GET', `blobs/${q(sha)}/${q(filename)}`, { user })).arrayBuffer();
@@ -616,8 +631,12 @@ export interface IndexStatus {
   rebuild_skipped: { user_id: string; error: string; attempts: number }[];
   /** Базы пользователей, которые не открылись (повреждены или недоступны). */
   unavailable_dbs: { user_id: string; error: string }[];
-  /** Видимые базы: ход фоновой перенарезки после смены настроек нарезки (`null` — не идёт). */
-  dbs: { user_id: string; rechunk: Rechunk | null }[];
+  /** Видимые базы: ход фоновой перенарезки после смены настроек нарезки (`null` — не идёт) и
+   * Rules базы (M6 §8; старый сервер — без поля). */
+  dbs: { user_id: string; rechunk: Rechunk | null; rules?: RulesStatus | null }[];
+  /** Rules пользователя запроса (токен, пользователь, администратор с `X-Zam-User`); у
+   * администратора по всем базам — `null` (Rules каждой — в `dbs`). */
+  rules?: RulesStatus | null;
 }
 
 /** Перенарезка базы (§8.2): `reason` — `params` | `algorithm` | `tokenizer` | `unknown`;
@@ -824,9 +843,13 @@ export interface EntryAttachment {
   url: string;
 }
 
-/** Элемент ленты отчётов: без `body` (тело — страница отчёта), миниатюра — первая картинка. */
+/**
+ * Элемент ленты отчётов: без `body` (тело — страница отчёта), миниатюра — первая картинка.
+ * `thumb_url` — серверное превью PNG (`/previews/{sha256}?kind=thumb`, M6) растровой картинки;
+ * `null` — SVG: лента показывает сам файл (`url`).
+ */
 export interface ReportItem extends Omit<Entry, 'body'> {
-  first_image: EntryAttachment | null;
+  first_image: (EntryAttachment & { thumb_url?: string | null }) | null;
 }
 
 /** Страница отчёта `GET /entries/{id}?format=html`. */
@@ -964,9 +987,11 @@ export const decideIdea = (
 export const adoptIdea = (user: string, id: string) =>
   call<Entry>('POST', `entries/${q(id)}/adopt`, undefined, user);
 
-/** Поиск идей пространства по заголовку и тексту: `POST /search` `kinds: [idea]`. */
-export const searchIdeas = (user: string, space: string, query: string, status: EntryStatus[]) =>
-  call<SearchResult>(
+/** Поиск идей пространства по заголовку и тексту: `POST /search` `kinds: [idea]`. Идеи — по
+ * одному разу в порядке выдачи (`brief` — элемент на чанк: идея с совпадениями в нескольких
+ * местах пришла бы несколько раз). */
+export const searchIdeas = async (user: string, space: string, query: string, status: EntryStatus[]): Promise<SearchItem[]> => {
+  const r = await call<SearchResult>(
     'POST',
     'search',
     {
@@ -980,6 +1005,9 @@ export const searchIdeas = (user: string, space: string, query: string, status: 
     },
     user,
   );
+  const seen = new Set<string>();
+  return r.items.filter((x) => x.kind === 'idea' && !!x.entry_id && !seen.has(x.entry_id) && !!seen.add(x.entry_id));
+};
 
 // ---- ссылки знаний на файлы (M4.5 §6) ----
 
@@ -1250,7 +1278,8 @@ export function agentSetup(f: AgentSetupQuery, user?: string) {
 const TOKEN_SLOT = "'<токен>'";
 
 /** Ответ `/agent-setup` с открытым токеном вместо заглушки — только в командах установки и
- * `zam init` (в блоке и `.mcp.json` токена нет). Токен — `zam_` и base62: кавычки не нужны. */
+ * `zam init` (в блоке и `.mcp.json` — stdio `zam mcp` — токена нет). Токен — `zam_` и base62:
+ * кавычки не нужны. */
 export function withToken(s: AgentSetup, token: string): AgentSetup {
   if (!/^zam_[0-9A-Za-z]+$/.test(token)) return s;
   const put = (t: string) => t.split(TOKEN_SLOT).join(`'${token}'`);
@@ -1373,6 +1402,87 @@ export const promoteCache = (
   to: { as: 'note'; path?: string } | { as: 'insight'; kind?: string },
   user?: string,
 ) => call<CacheItem>('POST', `cache/${q(id)}/promote`, to, user);
+
+// ---- сессии агентов и выданное им (M4.5 §9.5, M6 §8) ----
+
+/** Выданное сессии по событию: `reread_calls` — вызовов с пометкой «уже выдавалось» (M6 §7.3;
+ * у `read` — REST и CLI, у `mcp_read` — чтения из MCP); нет поля — 0. */
+export interface TokenStat {
+  calls: number;
+  tokens: number;
+  reread_calls?: number;
+}
+
+/** Сессия агента (`GET /sessions`, `GET /sessions/{id}`). `tokens` — по событию
+ * (`session_start`, `recovery`, `rules` — резерв Rules этих событий, `prompt`, `post_tool`,
+ * `brief`, `pre_tool`, `post_tool_local`, `subagent_local`, `search`, `read`, `mcp`, `mcp_read` —
+ * чтения из MCP с токенами 0: их токены — в `mcp`). */
+export interface SessionItem {
+  id: string;
+  agent: string | null;
+  solution: string | null;
+  area: string | null;
+  machine: string | null;
+  parent_id: string | null;
+  agent_type: string | null;
+  started_at: string;
+  last_seen_at: string;
+  ended_at: string | null;
+  memory_writes: number;
+  seen_epoch: number;
+  /** Контрольная группа агентного A/B (M6 §12). */
+  holdout?: boolean;
+  tokens?: Record<string, TokenStat>;
+  /** Момент снимка сессии (M6 §8а), если он есть: сам снимок — [`sessionSnapshot`]. */
+  snapshot_at?: string;
+}
+
+/** Снимок сессии (M6 §8а, `GET /sessions/{id}/snapshot`): извлечён из журнала агента клиентом
+ * `zam` после маскировки секретов. Текст полей — как прислал агент: выводится только как текст. */
+export interface SessionSnapshot {
+  session_id: string;
+  taken_at: string;
+  trigger: string;
+  agent: string | null;
+  status: 'complete' | 'partial';
+  skipped: number;
+  bytes: number;
+  data: {
+    compact_summary?: string;
+    prompts: string[];
+    files: string[];
+    commands: { cmd: string; failed?: boolean }[];
+  };
+}
+
+/** Снимок сессии `id`; администратор — пользователя `user`. */
+export const sessionSnapshot = (id: string, user?: string) =>
+  call<SessionSnapshot>('GET', `sessions/${encodeURIComponent(id)}/snapshot`, undefined, user);
+
+/** Свои сессии, свежие первыми, с выданным по событию; администратор — пользователя `user`. */
+export function listSessions(f: { solution?: string; limit?: number }, user?: string) {
+  const p = new URLSearchParams({ tokens: 'true' });
+  if (f.solution) p.set('solution', f.solution);
+  if (f.limit) p.set('limit', String(f.limit));
+  return call<{ items: SessionItem[] }>('GET', `sessions?${p}`, undefined, user);
+}
+
+/** Rules пользователя (`GET /index/status?only=rules`, M6 §8): `warning` — `rules_heavy` при
+ * больше 10 правил или L1 в сумме больше 1500 токенов. */
+export interface RulesStatus {
+  solution: string | null;
+  count: number;
+  l1_tokens: number;
+  warning: 'rules_heavy' | null;
+}
+
+export const rulesStatus = (user?: string) =>
+  call<{ rules: RulesStatus | null }>('GET', 'index/status?only=rules', undefined, user);
+
+/** Текст плашки `rules_heavy`. */
+export const rulesHeavyText = (r: RulesStatus): string =>
+  `Правил много: ${r.count}, L1 в сумме ≈ ${r.l1_tokens} токенов — дайджест каждой сессии ` +
+  'выдаёт их сверх бюджета. Порог — 10 правил или 1500 токенов: объедините или сократите правила.';
 
 // ---- оценки и показы записей (§10.5) ----
 

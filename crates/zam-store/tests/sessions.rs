@@ -7,7 +7,8 @@ use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
     DataDir, SeenItem, SeenKey, SeenTarget, SessionTouch, UsageEvent, UsageKind, UsageSource,
     UserDbs, WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, record_usage, seen_revs, touch_session, usage_counts,
+    list_sessions, mark_seen, record_usage, register_session, seen_revs, touch_session,
+    usage_counts,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -184,15 +185,15 @@ async fn mark_seen_keeps_latest_rev() {
         foreign,
         entry,
     ];
-    let got = seen_revs(&db, "a", &all).await.unwrap();
+    let got = seen_revs(&db, "a", 0, &all).await.unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[&chunk], 5);
     // цель целиком — своя часть
     mark_seen(&db, &s, &[item(&whole, 6)]).await.unwrap();
-    let got = seen_revs(&db, "a", &all).await.unwrap();
+    let got = seen_revs(&db, "a", 0, &all).await.unwrap();
     assert_eq!((got[&chunk], got[&whole], got.len()), (5, 6, 2));
-    assert!(seen_revs(&db, "b", &[chunk]).await.unwrap().is_empty());
-    assert!(seen_revs(&db, "a", &[]).await.unwrap().is_empty());
+    assert!(seen_revs(&db, "b", 0, &[chunk]).await.unwrap().is_empty());
+    assert!(seen_revs(&db, "a", 0, &[]).await.unwrap().is_empty());
 }
 
 /// Показ вложения (M5, задача 7) — ключ `blob` с sha256 и частью (`locator` или `chunk_id`):
@@ -221,7 +222,7 @@ async fn mark_seen_blob_parts() {
     )
     .await
     .unwrap();
-    let got = seen_revs(&db, "blob", &[p1.clone(), p2, other])
+    let got = seen_revs(&db, "blob", 0, &[p1.clone(), p2, other])
         .await
         .unwrap();
     assert_eq!(got.len(), 1);
@@ -332,7 +333,7 @@ async fn gc_sessions_by_last_seen() {
     assert_eq!(gc_sessions(&db, later - ttl).await.unwrap(), 1);
     assert_eq!(get_session(&db, "old").await.unwrap(), None);
     assert!(get_session(&db, "fresh").await.unwrap().is_some());
-    assert!(seen_revs(&db, "old", &[key]).await.unwrap().is_empty());
+    assert!(seen_revs(&db, "old", 0, &[key]).await.unwrap().is_empty());
 }
 
 /// Переход схемы v12 → v13 на базе с данными: копия `bak-v12`, новые таблицы пусты и
@@ -522,6 +523,7 @@ async fn session_tokens_accumulate() {
         event: e.into(),
         calls,
         tokens,
+        reread_calls: 0,
     };
     zam_store::add_token_counts(&db, &s, &[c("pre_tool", 4, 50), c("brief", 0, 0)])
         .await
@@ -564,4 +566,372 @@ async fn session_tokens_accumulate() {
             .unwrap()
             .is_empty()
     );
+}
+
+// ---------- M6, миграция 0025: эпохи `session_seen`, holdout, учёт без сессии ----------
+
+/// Отметка цели целиком `n` владельца `owner` в эпохе `epoch` (ревизия `rev`).
+async fn seen_in_epoch(db: &zam_store::Db, session: &str, epoch: u32, key: &SeenKey, rev: i64) {
+    let s = SessionTouch {
+        id: session.into(),
+        epoch,
+        ..SessionTouch::default()
+    };
+    let item = SeenItem {
+        key: key.clone(),
+        rev,
+    };
+    mark_seen(db, &s, &[item]).await.unwrap();
+}
+
+async fn seen_rows(db: &zam_store::Db, session: &'static str) -> Vec<(u32, i64)> {
+    db.read(move |c| {
+        let mut st =
+            c.prepare("SELECT epoch, rev FROM session_seen WHERE session_id = ?1 ORDER BY epoch")?;
+        let rows = st.query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+    .unwrap()
+}
+
+/// Спецификация M6 §7.2: новая эпоха (`bump_epoch`) скрывает отметки прежних от `seen_revs`, но
+/// они хранятся (аналитика); отметка в новой эпохе — своя строка; эпоха растёт на 1 за вызов,
+/// сессия без касаний создаётся; `session_epoch` неизвестной сессии — 0.
+#[tokio::test]
+async fn bump_epoch_hides_old_marks() {
+    let (_dd, db) = db("epoch").await;
+    let key = SeenKey {
+        owner_id: Id::new(),
+        target: node(Id::new()).into(),
+        part: WHOLE_TARGET.into(),
+    };
+    assert_eq!(zam_store::session_epoch(&db, "e").await.unwrap(), 0);
+    seen_in_epoch(&db, "e", 0, &key, 3).await;
+    let k = std::slice::from_ref(&key);
+    assert_eq!(seen_revs(&db, "e", 0, k).await.unwrap()[&key], 3);
+    assert_eq!(zam_store::bump_epoch(&db, "e").await.unwrap(), 1);
+    assert_eq!(zam_store::session_epoch(&db, "e").await.unwrap(), 1);
+    assert!(seen_revs(&db, "e", 1, k).await.unwrap().is_empty());
+    // прежняя эпоха хранится
+    assert_eq!(seen_revs(&db, "e", 0, k).await.unwrap()[&key], 3);
+    seen_in_epoch(&db, "e", 1, &key, 2).await;
+    assert_eq!(seen_revs(&db, "e", 1, k).await.unwrap()[&key], 2);
+    // повтор в той же эпохе — та же строка, большая ревизия
+    seen_in_epoch(&db, "e", 1, &key, 1).await;
+    assert_eq!(seen_rows(&db, "e").await, [(0, 3), (1, 2)]);
+    // эпоха касанием не меняется и не откатывается
+    touch_session(&db, &touch("e")).await.unwrap();
+    assert_eq!(zam_store::session_epoch(&db, "e").await.unwrap(), 1);
+    assert_eq!(zam_store::bump_epoch(&db, "e").await.unwrap(), 2);
+    // сессии нет — создаётся с эпохой 1
+    assert_eq!(zam_store::bump_epoch(&db, "new").await.unwrap(), 1);
+    assert!(get_session(&db, "new").await.unwrap().is_some());
+    assert!(zam_store::bump_epoch(&db, " ").await.is_err());
+}
+
+/// §7.2, исключение — показ идей: `seen_entry_ids` (а за ним `any_idea`) видит отметку любой
+/// эпохи сессии, одна запись в двух эпохах — один id.
+#[tokio::test]
+async fn seen_ideas_ignore_epoch() {
+    let (_dd, db) = db("ideas-epoch").await;
+    let owner = Id::new();
+    let (idea, other) = (Id::new(), Id::new());
+    let key = |id| SeenKey {
+        owner_id: owner,
+        target: TargetRef {
+            kind: TargetKind::Entry,
+            id,
+        }
+        .into(),
+        part: zam_store::RECALL_PART.into(),
+    };
+    seen_in_epoch(&db, "i", 0, &key(idea), 1).await;
+    zam_store::bump_epoch(&db, "i").await.unwrap();
+    let ids = zam_store::seen_entry_ids(&db, "i", owner, zam_store::RECALL_PART)
+        .await
+        .unwrap();
+    assert_eq!(ids, [idea]);
+    seen_in_epoch(&db, "i", 1, &key(idea), 1).await;
+    seen_in_epoch(&db, "i", 1, &key(other), 1).await;
+    let mut ids = zam_store::seen_entry_ids(&db, "i", owner, zam_store::RECALL_PART)
+        .await
+        .unwrap();
+    ids.sort();
+    let mut want = vec![idea, other];
+    want.sort();
+    assert_eq!(ids, want);
+}
+
+/// `holdout` сессии (§12): ставится и снимается, сессии нет — создаётся.
+#[tokio::test]
+async fn set_holdout_flag() {
+    let (_dd, db) = db("holdout").await;
+    let holdout = |db: &zam_store::Db| {
+        let db = db.clone();
+        async move {
+            db.read(|c| {
+                Ok(
+                    c.query_row("SELECT holdout FROM sessions WHERE id = 'h'", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap()
+        }
+    };
+    zam_store::set_holdout(&db, "h", true).await.unwrap();
+    assert_eq!(holdout(&db).await, 1);
+    touch_session(&db, &touch("h")).await.unwrap();
+    assert_eq!(holdout(&db).await, 1);
+    zam_store::set_holdout(&db, "h", false).await.unwrap();
+    assert_eq!(holdout(&db).await, 0);
+    assert!(zam_store::set_holdout(&db, "", true).await.is_err());
+}
+
+/// Учёт без сессии (`tokens_unattributed`, §7.1): UPSERT прибавляет к строке `(day, event)`,
+/// другие день и событие — свои строки; некорректное событие — ошибка ввода.
+#[tokio::test]
+async fn unattributed_upsert_adds() {
+    let (_dd, db) = db("unattributed").await;
+    let d1 = jiff::civil::date(2026, 11, 5);
+    let d2 = jiff::civil::date(2026, 11, 6);
+    zam_store::add_unattributed(&db, d1, "mcp", 1, 100)
+        .await
+        .unwrap();
+    zam_store::add_unattributed(&db, d1, "mcp", 2, 50)
+        .await
+        .unwrap();
+    zam_store::add_unattributed(&db, d1, "search", 1, 7)
+        .await
+        .unwrap();
+    zam_store::add_unattributed(&db, d2, "mcp", 1, 1)
+        .await
+        .unwrap();
+    assert!(
+        zam_store::add_unattributed(&db, d1, "Bad-Event", 1, 1)
+            .await
+            .is_err()
+    );
+    let rows: Vec<(String, String, i64, i64)> = db
+        .read(|c| {
+            let mut st = c.prepare(
+                "SELECT day, event, calls, tokens FROM tokens_unattributed ORDER BY day, event",
+            )?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        rows,
+        [
+            (s("2026-11-05"), s("mcp"), 3, 150),
+            (s("2026-11-05"), s("search"), 1, 7),
+            (s("2026-11-06"), s("mcp"), 1, 1),
+        ]
+    );
+    // чтение с суток (M6 задача 3): свежие первыми, внутри суток — по событию
+    let row = |d: &str, e: &str, calls, tokens| zam_store::UnattributedRow {
+        day: s(d),
+        event: s(e),
+        calls,
+        tokens,
+    };
+    assert_eq!(
+        zam_store::unattributed_tokens(&db, d1).await.unwrap(),
+        [
+            row("2026-11-06", "mcp", 1, 1),
+            row("2026-11-05", "mcp", 3, 150),
+            row("2026-11-05", "search", 1, 7),
+        ]
+    );
+    assert_eq!(
+        zam_store::unattributed_tokens(&db, d2).await.unwrap(),
+        [row("2026-11-06", "mcp", 1, 1)]
+    );
+    // id `unattributed` занят путём `GET /sessions/unattributed` (ревью задачи 3, M3)
+    assert!(zam_store::check_session_id("unattributed").is_err());
+    assert!(zam_store::check_session_id(" unattributed ").is_err());
+    assert!(zam_store::check_session_id("unattributed-1").is_ok());
+}
+
+// ---------- M6, задача 7a: показ без эпохи, счётчик повторной выдачи ----------
+
+/// `seen_revs_any_epoch` (подсказки-идеи `prompt`, M6 §7.2): отметка любой эпохи сессии —
+/// большая ревизия; чужая сессия и неотмеченное — нет в ответе.
+#[tokio::test]
+async fn seen_revs_any_epoch_takes_max() {
+    let (_dd, db) = db("any-epoch").await;
+    let key = SeenKey {
+        owner_id: Id::new(),
+        target: node(Id::new()).into(),
+        part: WHOLE_TARGET.into(),
+    };
+    let other = SeenKey {
+        part: "chunk".into(),
+        ..key.clone()
+    };
+    seen_in_epoch(&db, "a", 0, &key, 2).await;
+    seen_in_epoch(&db, "a", 3, &key, 5).await;
+    seen_in_epoch(&db, "b", 0, &other, 1).await;
+    let keys = [key.clone(), other.clone()];
+    let m = zam_store::seen_revs_any_epoch(&db, "a", &keys)
+        .await
+        .unwrap();
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!(m[&key], 5);
+    assert!(seen_revs(&db, "a", 1, &keys).await.unwrap().is_empty());
+    assert_eq!(seen_revs(&db, "a", 0, &keys).await.unwrap()[&key], 2);
+    assert!(
+        zam_store::seen_revs_any_epoch(&db, "a", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// `reread_calls` (M6 §7.3): прибавка без выдач заводит строку события, суммируется и
+/// отдаётся в `TokenStat`; `Session.seen_epoch` — текущая эпоха.
+#[tokio::test]
+async fn reread_calls_accumulate() {
+    let (_dd, db) = db("reread").await;
+    let s = touch("s-r");
+    let c = |calls, tokens, reread_calls| zam_store::TokenCount {
+        event: "read".into(),
+        calls,
+        tokens,
+        reread_calls,
+    };
+    zam_store::add_token_counts(&db, &s, &[c(0, 0, 1)])
+        .await
+        .unwrap();
+    zam_store::add_token_counts(&db, &s, &[c(2, 30, 1)])
+        .await
+        .unwrap();
+    let t = zam_store::session_tokens(&db, "s-r").await.unwrap();
+    assert_eq!(
+        t["read"],
+        zam_store::TokenStat {
+            calls: 2,
+            tokens: 30,
+            reread_calls: 2
+        }
+    );
+    let v = serde_json::to_value(t["read"]).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"calls": 2, "tokens": 30, "reread_calls": 2})
+    );
+    // без повторов поле не выводится
+    let v = serde_json::to_value(zam_store::TokenStat {
+        calls: 1,
+        tokens: 5,
+        reread_calls: 0,
+    })
+    .unwrap();
+    assert_eq!(v, serde_json::json!({"calls": 1, "tokens": 5}));
+    assert_eq!(
+        get_session(&db, "s-r").await.unwrap().unwrap().seen_epoch,
+        0
+    );
+    zam_store::bump_epoch(&db, "s-r").await.unwrap();
+    assert_eq!(
+        get_session(&db, "s-r").await.unwrap().unwrap().seen_epoch,
+        1
+    );
+}
+
+/// M6 §8а (ревью решения М11): отметку конца снимает только регистрация сессии
+/// ([`register_session`], `resume`) — обращение и запись в память завершённую сессию не
+/// «оживляют». Регистрация создаёт сессию, если её нет, и дописывает поля, как обращение.
+#[tokio::test]
+async fn register_session_reopens_ended() {
+    let (_dd, db) = db("register").await;
+    let ended_at = |id: &'static str| {
+        let db = db.clone();
+        async move { get_session(&db, id).await.unwrap().unwrap().ended_at }
+    };
+    // новой сессии снимать нечего
+    assert!(!register_session(&db, &touch("s1")).await.unwrap());
+    assert_eq!(ended_at("s1").await, None);
+    assert!(end_session(&db, "s1", true).await.unwrap());
+    let ended = ended_at("s1").await;
+    assert!(ended.is_some());
+    // хвост запросов после `SessionEnd`: отметка на месте
+    touch_session(&db, &touch("s1")).await.unwrap();
+    add_memory_write(&db, &touch("s1")).await.unwrap();
+    assert_eq!(ended_at("s1").await, ended);
+    // регистрация (сессию продолжили): отметка снята, поля дописаны, счётчик цел
+    let again = SessionTouch {
+        agent: Some("claude-code".into()),
+        ..touch("s1")
+    };
+    assert!(register_session(&db, &again).await.unwrap());
+    let s = get_session(&db, "s1").await.unwrap().unwrap();
+    assert_eq!(s.ended_at, None);
+    assert_eq!(s.agent.as_deref(), Some("claude-code"));
+    assert_eq!(s.memory_writes, 1);
+    assert_eq!(
+        latest_session(&db, None, None, s.last_seen_at)
+            .await
+            .unwrap()
+            .map(|x| x.id)
+            .as_deref(),
+        Some("s1"),
+        "возобновлённая сессия — снова в выборке незавершённых"
+    );
+    assert!(!register_session(&db, &touch("s1")).await.unwrap());
+    // чужую отметку регистрация не трогает
+    touch_session(&db, &touch("s2")).await.unwrap();
+    assert!(end_session(&db, "s2", true).await.unwrap());
+    assert!(!register_session(&db, &touch("s1")).await.unwrap());
+    assert!(ended_at("s2").await.is_some());
+    assert!(register_session(&db, &touch("")).await.is_err());
+}
+
+/// Ревью задачи 19, M-5: неявная сессия R13 — только сессия верхнего уровня; субагент, который
+/// обращался последним (`parent_id` задан), не выбирается.
+#[tokio::test]
+async fn latest_session_skips_subagent_sessions() {
+    let (_dd, d1) = db("latest-sub").await;
+    let since = Timestamp::now() - SignedDuration::from_hours(12);
+    touch_session(
+        &d1,
+        &SessionTouch {
+            id: "parent".into(),
+            machine: Some("box".into()),
+            ..SessionTouch::default()
+        },
+    )
+    .await
+    .unwrap();
+    touch_session(
+        &d1,
+        &SessionTouch {
+            id: "parent:anon-1".into(),
+            machine: Some("box".into()),
+            parent_id: Some("parent".into()),
+            ..SessionTouch::default()
+        },
+    )
+    .await
+    .unwrap();
+    let got = latest_session(&d1, Some("box"), None, since).await.unwrap();
+    assert_eq!(got.map(|s| s.id).as_deref(), Some("parent"));
+    // только субагенты — неявной сессии нет
+    let (_dd2, db2) = db("latest-sub-only").await;
+    touch_session(
+        &db2,
+        &SessionTouch {
+            id: "p:a".into(),
+            parent_id: Some("p".into()),
+            ..SessionTouch::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(latest_session(&db2, None, None, since).await.unwrap(), None);
 }

@@ -82,6 +82,7 @@ fn rf(name: &str, count: u32) -> RefAgg {
         kind: RefKind::Call,
         count,
         first_line: 1,
+        recv_count: None,
     }
 }
 
@@ -1450,8 +1451,8 @@ async fn rank_inputs_store_ranks_and_map_rows() {
     assert_eq!(
         main.refs,
         [
-            ("Store".to_string(), RefKind::Call, 2),
-            ("parse_config".to_string(), RefKind::Call, 3)
+            ("Store".to_string(), RefKind::Call, 2, 0),
+            ("parse_config".to_string(), RefKind::Call, 3, 0)
         ]
     );
     let ranked = zam_code::rank(&inputs.files, None);
@@ -2542,4 +2543,84 @@ async fn inputs_memory_50k_symbols() {
     );
     assert_eq!(syms, 50_000);
     assert!(b > 0);
+}
+
+/// M6 §12а: `recv_count` хранится в `code_refs.recv_count` (повтор `(name, kind)` в загрузке
+/// складывается, больше `count` — не больше `count`), идёт во входы ранжирования и в `uses`
+/// карточки; данные старого клиента (поля нет) — 0, то есть все вызовы прямые.
+#[tokio::test]
+async fn recv_count_stored_old_client_zero() {
+    let (db, _) = setup("recv-count").await;
+    let r = |name: &str, count: u32, recv: Option<u32>| RefAgg {
+        recv_count: recv,
+        ..rf(name, count)
+    };
+    code_put_files(
+        &db,
+        G,
+        &meta("box"),
+        vec![
+            upload(
+                "src/new.rs",
+                &h('1'),
+                vec![sym("main", "main", &bh('1'), 1)],
+                vec![
+                    r("go", 3, Some(2)),
+                    r("go", 2, Some(1)),
+                    r("over", 2, Some(9)),
+                ],
+            ),
+            upload(
+                "src/old.rs",
+                &h('2'),
+                vec![sym("legacy", "legacy", &bh('2'), 1)],
+                vec![r("go", 4, None)],
+            ),
+            upload(
+                "src/go.rs",
+                &h('3'),
+                vec![sym("go", "go", &bh('3'), 1)],
+                vec![],
+            ),
+        ],
+        &[],
+    )
+    .await
+    .unwrap();
+    let inputs = code_rank_inputs(&db, G).await.unwrap();
+    let refs = |path: &str| {
+        let mut v = inputs
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .unwrap()
+            .refs
+            .clone();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        refs("src/new.rs"),
+        [
+            ("go".to_string(), RefKind::Call, 5, 3),
+            ("over".to_string(), RefKind::Call, 2, 2)
+        ]
+    );
+    assert_eq!(
+        refs("src/old.rs"),
+        [("go".to_string(), RefKind::Call, 4, 0)]
+    );
+    let hit = code_symbols_search(&db, G, "main", None, Some("src/new.rs"), 5)
+        .await
+        .unwrap()
+        .remove(0);
+    let card = code_symbol(&db, G, hit.id).await.unwrap().unwrap();
+    let go = card.uses.iter().find(|u| u.name == "go").unwrap();
+    assert_eq!((go.count, go.recv_count), (5, Some(3)));
+    let hit = code_symbols_search(&db, G, "legacy", None, Some("src/old.rs"), 5)
+        .await
+        .unwrap()
+        .remove(0);
+    let card = code_symbol(&db, G, hit.id).await.unwrap().unwrap();
+    assert_eq!(card.uses[0].recv_count, None, "{:?}", card.uses);
 }

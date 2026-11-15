@@ -910,3 +910,48 @@ async fn digest_open_questions_newest_across_targets() {
         "{text}"
     );
 }
+
+/// `session_start` с `source` в сессии `session`.
+async fn recall_src(a: &Api, session: &str, source: &str) -> String {
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            RECALL,
+            Some(json!({"event": "session_start", "agent_block_version": 1, "source": source})),
+            &[("x-zam-session", session)],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["text"].as_str().unwrap().to_string()
+}
+
+/// M6 §7.2, ревью задачи 7a (m4): `source=clear` начинает новую эпоху — ответ человека снова в
+/// дайджесте; если новая эпоха не записалась (тестовая точка `TEST_EPOCH_FAIL_PREFIX`), ответ
+/// тоже не прячется как показанный: лучше повторить, чем потерять. Без новой эпохи — один раз.
+#[tokio::test]
+async fn digest_answer_repeats_when_epoch_bump_fails() {
+    let a = api("questions-epoch-fail", roomy).await;
+    let qid = new_q(&a, "Какой формат логов?", options()).await;
+    let r = answer_webui(&a, &qid, json!({"option": "b"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let mark = format!("q:{qid}");
+    let fail = format!("{}-1", zam_server::api::recall::TEST_EPOCH_FAIL_PREFIX);
+    for s in ["s-norm", fail.as_str()] {
+        assert!(recall_src(&a, s, "startup").await.contains(&mark), "{s}");
+        // та же эпоха — не повторяется
+        assert!(!recall_src(&a, s, "startup").await.contains(&mark), "{s}");
+        // `clear`: новая эпоха (или её сбой) — снова
+        assert!(recall_src(&a, s, "clear").await.contains(&mark), "{s}");
+    }
+    let j = a
+        .t(Method::GET, &format!("/api/v1/sessions/{fail}"), None)
+        .await
+        .json();
+    assert_eq!(j["seen_epoch"], 0, "{j}");
+    let j = a
+        .t(Method::GET, "/api/v1/sessions/s-norm", None)
+        .await
+        .json();
+    assert_eq!(j["seen_epoch"], 1, "{j}");
+}

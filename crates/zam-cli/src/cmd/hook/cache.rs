@@ -9,6 +9,10 @@
 //!   сессии, и признак напоминания `checkpoint`;
 //! - `edits-<сессия>` — маркер правок Write/Edit/`apply_patch` (для `checkpoint`, R1): файл есть —
 //!   правки были; создаётся без чтения и перезаписи (fix round 1, m-2);
+//! - `holdout-<сессия>` — маркер контрольной группы агентного A/B (M6 §12, [`mark_holdout`]):
+//!   файл есть — все хуки сессии (и её субагентов: их события идут с id родителя) молчат,
+//!   локальный вывод не учитывается ([`note_tokens`]); служебная работа (журнал, очереди,
+//!   привязка MCP, отправка учёта) идёт как обычно;
 //! - `file-refs.json` — `{etag, fetched_at, server, solution, refs}` из `GET /file-refs`
 //!   (M4.5 §6.3; как `triggers.json`): знание о файле для `post-tool` и `pre-tool` без сети;
 //! - `changed-<сессия>.jsonl` — очередь `{path, hash}` правленых файлов (M4.5 §6.2): пишет
@@ -25,9 +29,12 @@
 //!   до [`SPAWN_MAX`] записей, каждая живёт [`SPAWN_TTL`]; правка — под замком `.spawn-….lock`;
 //!   просроченные записи снимает и `session-start` ([`prune_spawns`]), файл без изменений
 //!   дольше [`SPAWN_FILE_TTL`] удаляет [`gc_cache`];
+//! - `snapst-<сессия>.json` и `snapq-<сессия>.json` — состояние и очередь снимка сессии (M6 §8а,
+//!   [`super::snapshot_queue`]);
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
-//!   `shown-*`/`edits-*`/`events-*`/`changed-*`/`tokens-*` старше [`SHOWN_TTL`] и `.*.tmp`
-//!   старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
+//!   `shown-*`/`edits-*`/`holdout-*`/`events-*`/`changed-*`/`tokens-*`/`snapst-*`/`snapq-*`/
+//!   `agent-*` старше
+//!   [`SHOWN_TTL`] и `.*.tmp` старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
 //!   в `memory_writes` сессии хуков **[решение исполнителя]**.
@@ -50,7 +57,7 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 /// Срок, после которого брошенный временный файл записи удаляется.
 pub const TMP_TTL: Duration = Duration::from_secs(3600);
 /// Предел файла кэша, байт.
-const CACHE_MAX: u64 = 16 * 1024 * 1024;
+pub(super) const CACHE_MAX: u64 = 16 * 1024 * 1024;
 
 /// Триггер из `GET /triggers`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,21 +84,20 @@ impl Trigger {
         }
     }
 
-    /// Строка подсказки §10.3: `ZeroAIMemory: <lead><title> [<вид>, <certainty>] — i:<id>`.
+    /// Строка подсказки §10.3, M6 §4.3 (как у сервера, `zam_search::hint_line`):
+    /// `ZeroAIMemory: <lead><title> [<вид>·<cert>] i:<id>`, надёжность — `ax`, `th`, `hyp`.
     pub fn hint(&self, lead: &str) -> String {
         let title = self.title.split_whitespace().collect::<Vec<_>>().join(" ");
-        let tags: Vec<&str> = [
-            self.insight_kind.as_str(),
-            self.certainty.as_deref().unwrap_or(""),
-        ]
-        .into_iter()
-        .filter(|t| !t.is_empty())
-        .collect();
+        let cert = zam_core::certainty_short(self.certainty.as_deref().unwrap_or(""));
+        let tags: Vec<&str> = [self.insight_kind.as_str(), cert]
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .collect();
         let mut s = format!("ZeroAIMemory: {lead}{title}");
         if !tags.is_empty() {
-            s.push_str(&format!(" [{}]", tags.join(", ")));
+            s.push_str(&format!(" [{}]", tags.join("·")));
         }
-        s.push_str(&format!(" — i:{}", self.entry_id));
+        s.push_str(&format!(" i:{}", self.entry_id));
         s
     }
 }
@@ -163,7 +169,9 @@ pub fn private_options() -> std::fs::OpenOptions {
     o
 }
 
-fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, String> {
+pub(super) fn read_json_file<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+) -> Result<Option<T>, String> {
     match std::fs::metadata(path) {
         Ok(m) if m.len() > CACHE_MAX => return Err("файл слишком велик".into()),
         Ok(_) => {}
@@ -176,7 +184,7 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>
         .map_err(|e| e.to_string())
 }
 
-fn write_json_file<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
+pub(super) fn write_json_file<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(v).map_err(std::io::Error::other)?;
     write_atomic(path, &bytes)
 }
@@ -501,6 +509,12 @@ impl QueueLock {
     }
 }
 
+/// Строки очереди изменённых файлов сессии без замка и без изменения файла (вход влияния
+/// диффа `checkpoint`, M6 §12); нет очереди — пусто.
+pub fn peek_changed(env: &Env, session: &str) -> Vec<Changed> {
+    read_changed(&changed_path(env, session)).0
+}
+
 /// Строки очереди (битые пропускаются) и прочитанная длина файла, байт.
 fn read_changed(path: &Path) -> (Vec<Changed>, u64) {
     let bytes = std::fs::read(path).unwrap_or_default();
@@ -622,6 +636,14 @@ fn queue_files(env: &Env, session: Option<&str>) -> Vec<PathBuf> {
 /// следующий хук).
 pub const FLUSH_MIN_LEFT: Duration = Duration::from_millis(15);
 
+/// Очередей изменённых файлов, которые один хук забирает на отправку (`session-start` шлёт
+/// очереди всех сессий проекта). Каждая очередь — это замок, rename и чтение до запроса: без
+/// предела при долго недоступном сервере (очереди копятся у каждой сессии) разбор съедал бы
+/// бюджет до запроса, а возврат шёл уже после срока — время хука росло с числом очередей (замер
+/// 17d: +8 мс на очередь, 540 мс при 32 очередях и бюджете 300). Старые очереди — первыми;
+/// остальные уходят следующими хуками.
+pub const FLUSH_QUEUES_MAX: usize = 8;
+
 /// Отправка очередей изменённых файлов (fix round 1, I-2): все очереди (`session` задан —
 /// только его) забираются rename во временные файлы и уходят **одним** `POST /files/changed` до
 /// 500 путей (повтор пути — последний хэш); перед запросом проверяется остаток бюджета хука
@@ -630,35 +652,107 @@ pub const FLUSH_MIN_LEFT: Duration = Duration::from_millis(15);
 /// строкой в `hooks.log` (fix round 1, M-6; задача 9); прочее (сеть, 5xx, 401, 403, 404, 408,
 /// 410, 429: решение ещё не открыто для доступа, старый сервер) — всё возвращается.
 /// Строки, дописанные во время отправки, не теряются: они в новой очереди. Без решения — ничего.
+///
+/// Очередей за раз — не больше [`FLUSH_QUEUES_MAX`] (старые первыми) и пока есть бюджет на
+/// запрос. Если не отправлено ничего (сервер недоступен, срок), забранные файлы возвращаются
+/// на место как были ([`restore_taken`]: жёсткая ссылка, без замка, чтения и записи): эта работа
+/// идёт уже после срока HTTP и должна стоить как можно меньше.
+///
+/// Очередь, оставшаяся неотправленной без ошибки запроса, видна в `hooks.log` — каждая причина
+/// своей строкой `files/changed: очередь не отправлена — …`: остаток бюджета до работы с очередью,
+/// он же после её разбора (замки, rename, чтение — на занятом диске десятки мс), занятый замок
+/// очереди, сбой rename. Очередь при этом на месте (не забрана или возвращена) и уйдёт со
+/// следующим хуком.
 pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     let Some(sol) = env.solution.as_ref().map(|s| s.id.clone()) else {
         return;
     };
     if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+        // пропуск виден в журнале (раньше — молча: «очередь не ушла» было не отличить от
+        // задержки соседней работы хука); без очереди пропускать нечего — строки нет
+        if !queue_files(env, session).is_empty() {
+            env.log(&format!(
+                "files/changed: очередь не отправлена — остаток бюджета меньше {} мс (прошло {} мс)",
+                FLUSH_MIN_LEFT.as_millis(),
+                env.started.elapsed().as_millis()
+            ));
+        }
         return;
     }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    // (очередь, забранный файл)
-    let mut taken: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for (i, q) in queue_files(env, session).into_iter().enumerate() {
+    let mut queues = queue_files(env, session);
+    if queues.len() > FLUSH_QUEUES_MAX {
+        // старые первыми: очередь давно закрытой сессии не ждёт вечно за свежими
+        queues.sort_by_key(|q| std::fs::metadata(q).and_then(|m| m.modified()).ok());
+        queues.truncate(FLUSH_QUEUES_MAX);
+    }
+    // (очередь, забранный файл, его содержимое)
+    let mut taken: Vec<(PathBuf, PathBuf, Vec<u8>)> = Vec::new();
+    let mut touch_failed = false;
+    for (i, q) in queues.into_iter().enumerate() {
+        // бюджет на запрос кончается — остальные очереди не трогаются (уйдут следующим хуком)
+        if i > 0 && env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+            break;
+        }
         let name = q.file_name().and_then(|n| n.to_str()).unwrap_or("changed");
         let t = q.with_file_name(format!(".{name}.{}.{nanos}.{i}.tmp", std::process::id()));
-        // под замком: `post-tool`, открывший очередь до rename, допишет уже в забранный файл
-        let _lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
-        if std::fs::rename(&q, &t).is_ok() {
-            taken.push((q, t));
+        // под замком: `post-tool`, открывший очередь до rename, допишет уже в забранный файл;
+        // замок занят (уплотнение, другой хук) — очередь уйдёт в другой раз (ревью задачи 5 M6)
+        let lock = QueueLock::take(&q, CHANGED_LOCK_WAIT);
+        if !lock.held() {
+            env.log(&format!(
+                "files/changed: очередь не отправлена — замок очереди занят дольше {} мс (прошло {} мс)",
+                CHANGED_LOCK_WAIT.as_millis(),
+                env.started.elapsed().as_millis()
+            ));
+            continue;
+        }
+        // содержимое — под замком и **до** rename, время изменения — «сейчас»: забранный файл
+        // наследует время очереди, и для очереди старше [`TMP_TTL`] он сразу «брошенный временный
+        // файл» — уборка кэша ([`gc_cache`], у `session-start` идёт параллельно) удаляла его до
+        // чтения, и строки терялись молча (задача 17d). Прочитанное не зависит от судьбы файла,
+        // а свежее время не даёт уборке удалить его, пока идёт запрос
+        let bytes = match read_and_touch(&q) {
+            Ok((b, touched)) => {
+                // время не освежено: забранный файл старше часа уборка кэша может удалить за
+                // время запроса — строки целы (уже прочитаны), но возврат пойдёт переписыванием.
+                // Одна строка на хук
+                if let (Err(e), false) = (touched, touch_failed) {
+                    touch_failed = true;
+                    env.log(&format!("files/changed: время очереди не обновлено: {e}"));
+                }
+                b
+            }
+            // очередь уже забрал параллельный хук — не сбой
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                env.log(&format!(
+                    "files/changed: очередь не отправлена — не прочитана: {e} (прошло {} мс)",
+                    env.started.elapsed().as_millis()
+                ));
+                continue;
+            }
+        };
+        match std::fs::rename(&q, &t) {
+            Ok(()) => taken.push((q, t, bytes)),
+            // очередь уже забрал параллельный хук — не сбой
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => env.log(&format!(
+                "files/changed: очередь не отправлена — не забрана: {e} (прошло {} мс)",
+                env.started.elapsed().as_millis()
+            )),
         }
     }
     if taken.is_empty() {
         return;
     }
+    flush_stall();
     // (строка, номер очереди) — повтор пути: последняя строка (хэш и символы)
     let mut files: Vec<(Changed, usize)> = Vec::new();
-    for (qi, (_, t)) in taken.iter().enumerate() {
-        let bytes = std::fs::read(t).unwrap_or_default();
+    for (qi, (_, _, bytes)) in taken.iter().enumerate() {
         for l in bytes.split(|b| *b == b'\n') {
             let Ok(c) = serde_json::from_slice::<Changed>(l) else {
                 continue;
@@ -672,6 +766,14 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
     let mut done = 0usize;
     for b in changed_batches(&lines, CHANGED_BATCH_BYTES) {
         if env.http_left().is_none_or(|d| d < FLUSH_MIN_LEFT) {
+            // бюджет вышел уже после разбора очереди (замки, rename, чтение): раньше — молча
+            env.log(&format!(
+                "files/changed: очередь не отправлена — остаток бюджета меньше {} мс (прошло {} мс, \
+                 очередь разобрана, возвращено путей: {})",
+                FLUSH_MIN_LEFT.as_millis(),
+                env.started.elapsed().as_millis(),
+                lines.len() - done
+            ));
             break;
         }
         let n = b.len();
@@ -688,7 +790,12 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
         }
     }
     let back: Vec<(Changed, usize)> = files[done..].to_vec();
-    for (qi, (q, _)) in taken.iter().enumerate() {
+    // не отправлено ничего — забранные файлы возвращаются как были, без переписывания
+    let untouched = done == 0;
+    for (qi, (q, t, _)) in taken.iter().enumerate() {
+        if untouched && restore_taken(q, t) {
+            continue;
+        }
         let mine: Vec<Changed> = back
             .iter()
             .filter(|(_, i)| *i == qi)
@@ -698,8 +805,55 @@ pub fn flush_changed(env: &Env, client: &Client, session: Option<&str>) {
             return_changed(env, q, mine);
         }
     }
-    for (_, t) in &taken {
+    for (_, t, _) in &taken {
         let _ = std::fs::remove_file(t);
+    }
+}
+
+/// Возврат забранной очереди `taken` на место `q` жёсткой ссылкой (сам `taken` удаляет
+/// вызывающий): ссылка не создаётся, если `q` уже есть, — строки, дописанные `post-tool` за
+/// время запроса в новую очередь, не затираются (rename затёр бы), и замок не нужен. `false` —
+/// новая очередь уже есть, забранного файла нет (его удалила уборка кэша) или файловая система
+/// без жёстких ссылок: обычный возврат слиянием из прочитанного ([`return_changed`]). Время
+/// изменения у возвращённой очереди — момент, когда её забрали ([`read_and_touch`]): очередь,
+/// которую пытаются отправить, уборка кэша брошенной не считает (как и прежде, когда возврат её
+/// переписывал).
+fn restore_taken(q: &Path, taken: &Path) -> bool {
+    std::fs::hard_link(taken, q).is_ok()
+}
+
+/// Содержимое очереди и отметка времени изменения «сейчас» одним открытием файла; сбой отметки
+/// чтению не мешает (прочитанное уже есть) и возвращается вторым значением — вызывающий пишет о
+/// нём строку.
+fn read_and_touch(q: &Path) -> std::io::Result<(Vec<u8>, std::io::Result<()>)> {
+    use std::io::Read;
+    let mut f = std::fs::File::options().read(true).append(true).open(q)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    let touched = touch(&f);
+    Ok((bytes, touched))
+}
+
+/// Время изменения открытого файла — «сейчас»; отладочная сборка или фича `test-hooks` —
+/// `ZAM_TEST_TOUCH_FAIL` (любое значение): отметка «не удалась» (строка о сбое в `hooks.log`).
+fn touch(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if std::env::var_os("ZAM_TEST_TOUCH_FAIL").is_some() {
+        return Err(std::io::Error::other("тестовый сбой отметки времени"));
+    }
+    f.set_modified(SystemTime::now())
+}
+
+/// Точка подмены для тестов (только отладочная сборка и фича `test-hooks`, как
+/// `ZAM_TEST_BINDING_STALL_MS`): `ZAM_TEST_FLUSH_STALL_MS` — пауза между разбором очередей
+/// изменённых файлов и запросом (занятый диск: бюджет выходит после того, как очередь забрана).
+fn flush_stall() {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::env::var("ZAM_TEST_FLUSH_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -758,7 +912,8 @@ pub fn estimate_tokens(text: &str) -> u64 {
 /// Отмечает локальный вывод хука в очереди учёта (пустой текст — ничего): одна строка одним
 /// `write` с append, без замка (параллельные хуки строк не смешивают).
 pub fn note_tokens(env: &Env, session: &str, event: &str, text: &str) {
-    if text.trim().is_empty() {
+    // контрольная группа (M6 §12): вывода агенту нет — нет и учёта
+    if text.trim().is_empty() || is_holdout(env, session) {
         return;
     }
     let line = TokenLine {
@@ -928,6 +1083,47 @@ pub fn had_edits(env: &Env, session: &str) -> bool {
     edits_path(env, session).is_file()
 }
 
+pub fn holdout_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir()
+        .join(format!("holdout-{}", session_file_part(session)))
+}
+
+/// Ставит (`on`) или снимает маркер контрольной группы A/B сессии (M6 §12). Ставится каждый раз
+/// заново — время файла освежается, и [`gc_cache`] его не снимает у живой сессии.
+pub fn mark_holdout(env: &Env, session: &str, on: bool) {
+    let path = holdout_path(env, session);
+    let r = if on {
+        std::fs::create_dir_all(env.cache_dir()).and_then(|_| write_atomic(&path, b""))
+    } else {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
+    };
+    if let Err(e) = r {
+        env.log(&format!("маркер контрольной группы сессии: {e}"));
+    }
+}
+
+/// Сессия — в контрольной группе A/B по маркеру кэша (M6 §12).
+pub fn is_holdout(env: &Env, session: &str) -> bool {
+    holdout_path(env, session).is_file()
+}
+
+/// Успешный ответ сервера (`/recall`, `GET /sessions/{id}`) сверяет маркер сессии с меткой
+/// сервера (повторное ревью задачи 12, m2–m3): `holdout: true` — маркер ставится и его время
+/// освежается ([`gc_cache`] не снимет его у живой сессии); `false` или нет поля (метку сняли,
+/// старый сервер) — маркер снимается.
+pub fn note_holdout(env: &Env, session: Option<&str>, v: &Value) {
+    let Some(id) = session else {
+        return;
+    };
+    let on = v["holdout"].as_bool() == Some(true);
+    if on || is_holdout(env, id) {
+        mark_holdout(env, id, on);
+    }
+}
+
 pub fn shown_path(env: &Env, session: &str) -> PathBuf {
     env.cache_dir()
         .join(format!("shown-{}.json", session_file_part(session)))
@@ -981,7 +1177,7 @@ pub fn spawn_path(env: &Env, session: &str) -> PathBuf {
 /// Замок-файл `.<имя>.lock` очереди запусков и очереди изменённых файлов (создаётся только
 /// новым, внутри — токен владельца); брошенный старше [`SPAWN_LOCK_TTL`] снимается; не взят за
 /// `wait` — `None` (без замка).
-fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
+pub(super) fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
     use std::io::Write;
     let name = path.file_name()?.to_str()?;
     let lock = path.with_file_name(format!(".{name}.lock"));
@@ -1019,7 +1215,7 @@ fn file_lock(path: &Path, wait: Duration) -> Option<FileLock> {
 /// Взятый замок-файл: снимается при `Drop`, только если в файле всё ещё свой токен
 /// (`pid.nanos`) — замок, снятый как брошенный и взятый другим процессом, не удаляется
 /// (ревью задачи 9A, M1).
-struct FileLock {
+pub(super) struct FileLock {
     path: PathBuf,
     token: String,
 }
@@ -1107,9 +1303,10 @@ pub fn prune_spawns(env: &Env, session: &str) {
 }
 
 /// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`,
-/// `tokens-*.jsonl`) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
+/// `tokens-*.jsonl`, снимок сессии `snapst-*.json` и `snapq-*.json`) и привязки `agent-*.json` (M6 §7.1) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
 /// временные `.*.tmp` и замки старше [`TMP_TTL`].
 pub fn gc_cache(env: &Env) {
+    gc_stall();
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
         return;
     };
@@ -1118,9 +1315,15 @@ pub fn gc_cache(env: &Env) {
         let Some(n) = name.to_str() else { continue };
         let session_file = (n.starts_with("shown-") && n.ends_with(".json"))
             || n.starts_with("edits-")
+            || n.starts_with("holdout-")
             || (n.starts_with("events-") && n.ends_with(".jsonl"))
             || (n.starts_with("changed-") && n.ends_with(".jsonl"))
-            || (n.starts_with("tokens-") && n.ends_with(".jsonl"));
+            || (n.starts_with("tokens-") && n.ends_with(".jsonl"))
+            // снимок сессии (M6 §8а): состояние и очередь
+            || (n.starts_with("snapst-") && n.ends_with(".json"))
+            || (n.starts_with("snapq-") && n.ends_with(".json"))
+            // привязка `zam mcp` к сессии (M6 §7.1): pid агента, перезаписывается каждым стартом
+            || (n.starts_with(super::binding::BINDING_PREFIX) && n.ends_with(".json"));
         let ttl = if session_file {
             SHOWN_TTL
         } else if n.starts_with("spawn-") && n.ends_with(".json") {
@@ -1141,6 +1344,19 @@ pub fn gc_cache(env: &Env) {
         if old {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+/// Точка подмены для тестов (только отладочная сборка и фича `test-hooks`, как
+/// `ZAM_TEST_FLUSH_STALL_MS`): `ZAM_TEST_GC_STALL_MS` — пауза перед уборкой кэша (долгая уборка
+/// на занятом диске: хук её не ждёт дольше бюджета, привязка сессии записана до неё).
+fn gc_stall() {
+    #[cfg(any(feature = "test-hooks", debug_assertions))]
+    if let Some(ms) = std::env::var("ZAM_TEST_GC_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -1185,25 +1401,9 @@ pub fn now_rfc3339() -> String {
     rfc3339(secs)
 }
 
-/// Секунды Unix → RFC 3339 UTC (алгоритм civil-from-days, Howard Hinnant).
+/// Секунды Unix → RFC 3339 UTC (`zam_core::time`: один календарь на сервер и клиент).
 fn rfc3339(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
+    zam_core::time::rfc3339_from_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
 /// `zam triggers sync`: принудительное обновление кэша триггеров проекта.
@@ -1256,6 +1456,95 @@ mod tests {
         std::fs::write(&path, b"999.1").unwrap();
         drop(l);
         assert!(path.exists(), "чужой замок не тронут");
+    }
+
+    /// Ревью задачи 5 M6: очередь под чужим замком `flush_changed` не забирает (как
+    /// `compact_changed_queues`) — она остаётся на месте, запроса нет. Причина — строкой в журнале
+    /// хука (раньше — молча, как и сбой rename).
+    #[test]
+    fn flush_skips_locked_queue() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/zam-cli-flush-lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
+        std::fs::write(
+            dir.join(".zeroaimemory/solution.toml"),
+            "agent_solution_id = \"0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e77\"\nname = \"x\"\n",
+        )
+        .unwrap();
+        let env = Env::new(
+            super::super::Kind::SessionStart,
+            super::super::Agent::Claude,
+            // «старт» в будущем: бюджет не кончается, как бы ни была занята машина
+            std::time::Instant::now() + Duration::from_secs(600),
+            dir.clone(),
+            dir.join("home"),
+        );
+        assert!(env.solution.is_some());
+        let q = changed_path(&env, "s1");
+        std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+        let body = changed_bytes([&line("src/a.rs", 0)]);
+        std::fs::write(&q, &body).unwrap();
+        let held = QueueLock::take(&q, Duration::ZERO);
+        assert!(held.held());
+        // сервер недоступен: попытка отправки оставила бы в журнале вторую строку — ошибку сети
+        let client = Client::new("http://127.0.0.1:9", "t", None);
+        flush_changed(&env, &client, Some("s1"));
+        assert_eq!(std::fs::read(&q).unwrap(), body, "очередь на месте");
+        let log = std::fs::read_to_string(env.log_path()).unwrap_or_default();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(
+            log.contains(
+                "session-start files/changed: очередь не отправлена — замок очереди занят дольше \
+                 50 мс (прошло "
+            ),
+            "{log}"
+        );
+        drop(held);
+    }
+
+    /// Повторное ревью 76458e3 (17b), M1: очередь, не отправленная из-за остатка бюджета, видна
+    /// в журнале хука (с временем от старта процесса) и остаётся на месте; без очереди — тихо.
+    #[test]
+    fn flush_skipped_by_budget_is_logged() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/zam-cli-flush-budget");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
+        std::fs::write(
+            dir.join(".zeroaimemory/solution.toml"),
+            "agent_solution_id = \"0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e77\"\nname = \"x\"\n",
+        )
+        .unwrap();
+        // бюджет исчерпан: процесс «стартовал» 5 с назад
+        let env = Env::new(
+            super::super::Kind::Checkpoint,
+            super::super::Agent::Claude,
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .unwrap(),
+            dir.clone(),
+            dir.join("home"),
+        );
+        let client = Client::new("http://127.0.0.1:9", "t", None);
+        let log = || std::fs::read_to_string(env.log_path()).unwrap_or_default();
+        flush_changed(&env, &client, Some("s1"));
+        assert_eq!(log(), "", "очереди нет — строки нет");
+        let q = changed_path(&env, "s1");
+        std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+        let body = changed_bytes([&line("src/a.rs", 0)]);
+        std::fs::write(&q, &body).unwrap();
+        flush_changed(&env, &client, Some("s1"));
+        assert_eq!(std::fs::read(&q).unwrap(), body, "очередь на месте");
+        let got = log();
+        assert_eq!(got.lines().count(), 1, "{got}");
+        assert!(
+            got.contains(
+                "checkpoint files/changed: очередь не отправлена — остаток бюджета меньше 15 мс \
+                 (прошло 5"
+            ),
+            "{got}"
+        );
     }
 
     fn line(path: &str, symbols: usize) -> Changed {
@@ -1336,6 +1625,38 @@ mod tests {
         assert_eq!(rfc3339(1_793_102_461), "2026-10-27T12:01:01Z");
     }
 
+    /// Прежний календарь клиента (до M6, задача 6) — эталон совпадения вывода.
+    fn legacy_rfc3339(secs: u64) -> String {
+        let days = (secs / 86_400) as i64;
+        let rem = secs % 86_400;
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        )
+    }
+
+    /// `zam_core::time::rfc3339_from_secs` выводит то же, что прежний календарь клиента.
+    #[test]
+    fn rfc3339_matches_legacy() {
+        for secs in (0..4_102_444_800_u64)
+            .step_by(3_599_993)
+            .chain([0, 951_782_400, 4_102_444_799])
+        {
+            assert_eq!(rfc3339(secs), legacy_rfc3339(secs), "{secs}");
+        }
+    }
+
     #[test]
     fn hint_line_format() {
         let t = Trigger {
@@ -1347,14 +1668,14 @@ mod tests {
         };
         assert_eq!(
             t.hint("для **/*.sh: "),
-            "ZeroAIMemory: для **/*.sh: LF в скриптах [gotcha, theorem] — i:01J"
+            "ZeroAIMemory: для **/*.sh: LF в скриптах [gotcha·th] i:01J"
         );
         let bare = Trigger {
             entry_id: "01K".into(),
             title: "x".into(),
             ..Trigger::default()
         };
-        assert_eq!(bare.hint(""), "ZeroAIMemory: x — i:01K");
+        assert_eq!(bare.hint(""), "ZeroAIMemory: x i:01K");
         assert!(bare.for_tool(Some("Bash")));
         let only = Trigger {
             tools: Some(vec!["bash".into()]),

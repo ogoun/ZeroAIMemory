@@ -2,8 +2,16 @@
 //!
 //! - Читает stdin построчно: строка — одно сообщение JSON-RPC (запрос, уведомление, ответ или
 //!   пачка). Каждое уходит отдельным `POST /mcp` с `Authorization: Bearer`, `X-Zam-Solution`
-//!   (из `solution.toml`) и `X-Zam-Machine`; `X-Zam-Session` прокси не шлёт — сессию выбирает
-//!   сервер (R13; fix round 1, I-4); `Origin` не шлётся.
+//!   (из `solution.toml`) и `X-Zam-Machine`; `Origin` не шлётся.
+//! - **Сессия** (M6 §7.1, [`SessionSource`]): `X-Zam-Session` — по порядку `ZAM_SESSION_ID`,
+//!   затем файл привязки хука `session-start` по своей цепочке предков
+//!   ([`hook::binding::find_binding`]; цепочка — один раз при запуске, не прочиталась —
+//!   снова при поиске; поиск — не чаще раза в [`BINDING_RECHECK`], так что новая сессия после
+//!   `/clear` приходит со следующим вызовом). `CLAUDE_CODE_SESSION_ID` не читается (ревью задачи 3, I4): по
+//!   журналу изменений Claude Code 2.1.132 она есть у подпроцессов Bash, но не у
+//!   MCP-подпроцесса, и в справочнике переменных её нет. Нет ни одного источника — без
+//!   заголовка, сессию выбирает сервер неявно (R13), без учёта выданного в сессии. `ZAM_SESSION` и `session.json` хуков, как и раньше, на MCP
+//!   не влияют (fix round 1, I-4): `session.json` общий у параллельных агентов проекта.
 //! - Ответ `application/json` пишется в stdout одной строкой; `text/event-stream` (SSE)
 //!   разворачивается: каждое событие `data:` — отдельная строка. 202/204 — без вывода.
 //! - После `initialize` прокси шлёт `MCP-Protocol-Version` с согласованной версией, а
@@ -17,12 +25,81 @@
 //!   первым); stdout пишется построчно под блокировкой. Конец stdin — выход с кодом 0 после всех
 //!   ответов. Токен и тексты сообщений никуда, кроме сервера, не пишутся.
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::Ctx;
+use super::{Ctx, hook};
 use crate::client::{CliError, Client};
+
+/// Как часто `zam mcp` заново ищет привязку (ревью задачи 3, m2): после `/clear` и `resume`
+/// `session-start` перезаписывает файлы, и новая сессия должна прийти уже со следующим
+/// вызовом. Поиск — до [`hook::binding::BINDING_ANCESTORS_MAX`] файлов, не чаще раза в секунду.
+pub const BINDING_RECHECK: Duration = Duration::from_secs(1);
+
+/// Состояние привязки: цепочка предков, найденная сессия и время последнего поиска.
+#[derive(Default)]
+struct Bound {
+    /// Цепочка — один раз при запуске (I2); не прочиталась — снова при поиске (m4).
+    chain: Vec<hook::procs::Proc>,
+    session: Option<String>,
+    checked: Option<Instant>,
+}
+
+/// Источник `X-Zam-Session` (см. модуль): переменная окружения или файл привязки.
+struct SessionSource {
+    /// `ZAM_SESSION_ID` — на всё время процесса.
+    fixed: Option<String>,
+    /// Корень проекта: там `.zeroaimemory/cache/agent-<pid>.json`.
+    root: PathBuf,
+    bound: Mutex<Bound>,
+}
+
+impl SessionSource {
+    fn new(get: impl Fn(&str) -> Option<String>, root: PathBuf) -> SessionSource {
+        let fixed = hook::session_var(get(zam_core::MCP_SESSION_ENV));
+        // с переменной цепочка не нужна
+        let chain = if fixed.is_some() {
+            Vec::new()
+        } else {
+            hook::binding::chain()
+        };
+        SessionSource {
+            fixed,
+            root,
+            bound: Mutex::new(Bound {
+                chain,
+                ..Bound::default()
+            }),
+        }
+    }
+
+    /// Сессия запроса в момент `now`: поиск привязки не чаще [`BINDING_RECHECK`], между
+    /// поисками — прежний результат.
+    fn current_at(&self, now: Instant) -> Option<String> {
+        if let Some(s) = &self.fixed {
+            return Some(s.clone());
+        }
+        let mut b = self.bound.lock().unwrap_or_else(|e| e.into_inner());
+        let due = b
+            .checked
+            .is_none_or(|t| now.saturating_duration_since(t) >= BINDING_RECHECK);
+        if due {
+            if b.chain.is_empty() {
+                b.chain = hook::binding::chain();
+            }
+            b.session = hook::binding::find_binding(&self.root, &b.chain).map(|f| f.session);
+            b.checked = Some(now);
+        }
+        b.session.clone()
+    }
+
+    fn current(&self) -> Option<String> {
+        self.current_at(Instant::now())
+    }
+}
 
 /// Состояние сеанса MCP, общее для потоков запросов.
 #[derive(Default)]
@@ -136,7 +213,7 @@ fn fail_unanswered(ids: &[Value], answered: &[Value], reason: &str) {
 }
 
 /// Одно сообщение: запрос к серверу и вывод ответа.
-fn forward(client: &Client, state: &Mutex<Session>, line: &str) {
+fn forward(client: &Client, state: &Mutex<Session>, source: &SessionSource, line: &str) {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -160,6 +237,10 @@ fn forward(client: &Client, state: &Mutex<Session>, line: &str) {
     }
     if let Some(s) = sid.as_deref() {
         headers.push(("Mcp-Session-Id", s));
+    }
+    let agent_session = source.current();
+    if let Some(s) = agent_session.as_deref() {
+        headers.push(("X-Zam-Session", s));
     }
     let body = msg.to_string();
     let mut resp = match client.post_mcp(body.as_bytes(), &headers) {
@@ -235,10 +316,17 @@ fn fail_unanswered_quiet(ids: &[Value], answered: &[Value], reason: &str) {
 
 pub fn run(ctx: Ctx) -> Result<(), CliError> {
     let mut client = ctx.client;
-    // сессию MCP выбирает сервер (R13), а не `session.json` хуков (I-4)
+    // не `session.json` хуков (I-4): сессия — из [`SessionSource`] (M6 §7.1)
     client.set_session(None);
+    // долгие инструменты (вложения, реранк на CPU): ответ ждётся до 10 мин (m1)
+    client.set_timeouts(crate::client::Timeouts::Mcp);
     let client = Arc::new(client);
     let state = Arc::new(Mutex::new(Session::default()));
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let source = Arc::new(SessionSource::new(
+        |k| std::env::var(k).ok(),
+        hook::project_root(&cwd, &super::home_dir()),
+    ));
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut stdin = std::io::stdin().lock();
     let mut buf = Vec::new();
@@ -278,8 +366,8 @@ pub fn run(ctx: Ctx) -> Result<(), CliError> {
             let _ = workers.remove(0).join();
             workers.retain(|w| !w.is_finished());
         }
-        let (c, s) = (client.clone(), state.clone());
-        let h = std::thread::spawn(move || forward(&c, &s, &line));
+        let (c, s, src) = (client.clone(), state.clone(), source.clone());
+        let h = std::thread::spawn(move || forward(&c, &s, &src, &line));
         if first {
             let _ = h.join();
         } else {
@@ -339,6 +427,73 @@ fn read_line_limited(r: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> std
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp/zam-cli-mcp")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn session_env_beats_binding_claude_var_ignored() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let root = tmp_root("env");
+        hook::procs::set_fake_ancestors(vec![hook::procs::Proc {
+            pid: 801,
+            name: "claude".into(),
+        }]);
+        hook::binding::write_binding(&root, "bound").unwrap();
+        let s = SessionSource::new(env(&[("ZAM_SESSION_ID", "a")]), root.clone());
+        assert_eq!(s.current().as_deref(), Some("a"));
+        // CLAUDE_CODE_SESSION_ID MCP-подпроцессу не передаётся (I4) — не читается
+        let s = SessionSource::new(
+            env(&[("ZAM_SESSION_ID", " "), ("CLAUDE_CODE_SESSION_ID", "b")]),
+            root,
+        );
+        assert_eq!(s.current().as_deref(), Some("bound"));
+    }
+
+    /// I2, m2, m4: поиск привязки не чаще раза в секунду; новая сессия после `/clear` — со
+    /// следующей проверкой; цепочка, не прочитанная при запуске, читается снова.
+    #[test]
+    fn binding_refresh_schedule() {
+        use hook::procs::{Proc, set_fake_ancestors};
+        let root = tmp_root("refresh");
+        // при запуске цепочка не прочиталась
+        set_fake_ancestors(Vec::new());
+        let s = SessionSource::new(|_| None, root.clone());
+        set_fake_ancestors(vec![Proc {
+            pid: 901,
+            name: "claude".into(),
+        }]);
+        let t0 = Instant::now();
+        assert_eq!(s.current_at(t0), None);
+        hook::binding::write_binding(&root, "s1").unwrap();
+        assert_eq!(s.current_at(t0 + Duration::from_millis(500)), None);
+        let t1 = t0 + BINDING_RECHECK;
+        assert_eq!(s.current_at(t1).as_deref(), Some("s1"));
+        // `/clear`: файл перезаписан новой сессией — со следующей проверкой
+        hook::binding::write_binding(&root, "s2").unwrap();
+        assert_eq!(
+            s.current_at(t1 + Duration::from_millis(500)).as_deref(),
+            Some("s1")
+        );
+        let t2 = t1 + BINDING_RECHECK;
+        assert_eq!(s.current_at(t2).as_deref(), Some("s2"));
+        // файл пропал — без привязки
+        std::fs::remove_file(hook::binding::binding_path(&root, 901)).unwrap();
+        assert_eq!(s.current_at(t2 + BINDING_RECHECK), None);
+    }
 
     #[test]
     fn sse_events_become_lines() {

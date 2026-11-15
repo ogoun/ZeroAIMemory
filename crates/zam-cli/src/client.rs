@@ -2,7 +2,7 @@
 //! (RFC 9457) в [`CliError`] с кодом выхода. Токен нигде не печатается.
 use std::fmt;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use ureq::http::Response;
@@ -25,14 +25,36 @@ pub struct CliError {
     pub code: u8,
     pub msg: String,
     pub problem: Option<Value>,
+    /// Сетевая ошибка — истёк срок запроса, ответа сервера нет ([`CliError::is_timeout`]).
+    /// Поле закрыто: признак ставит только [`net_error`], прочие ошибки строятся через
+    /// [`CliError::new`] и [`CliError::with_problem`] — без него.
+    timeout: bool,
+    /// Запрос не начат: абсолютный срок клиента вышел до отправки ([`CliError::is_unsent`]).
+    unsent: bool,
 }
 
 impl CliError {
     pub fn new(code: u8, msg: impl Into<String>) -> CliError {
+        CliError::with_problem(code, msg, None)
+    }
+
+    /// Ошибка по ответу сервера: код выхода, текст и тело problem+json (`problem`).
+    pub fn with_problem(code: u8, msg: impl Into<String>, problem: Option<Value>) -> CliError {
         CliError {
             code,
             msg: msg.into(),
-            problem: None,
+            problem,
+            timeout: false,
+            unsent: false,
+        }
+    }
+
+    /// Запрос не начат: абсолютный срок клиента ([`Timeouts::Deadline`]) вышел до отправки. Текст —
+    /// [`zam_core::HOOK_BUDGET_SPENT`]: в `hooks.log` это та же причина, что и «клиента нет».
+    fn unsent() -> CliError {
+        CliError {
+            unsent: true,
+            ..CliError::new(EXIT_UNREACHABLE, zam_core::HOOK_BUDGET_SPENT)
         }
     }
 
@@ -51,6 +73,18 @@ impl CliError {
             .get("status")?
             .as_u64()
             .and_then(|s| u16::try_from(s).ok())
+    }
+
+    /// Запрос оборван сроком клиента (разрешение имени, соединение, ожидание ответа): сервер не
+    /// ответил вовремя. Отказ соединения, обрыв и ответ сервера с ошибкой — не срок.
+    pub fn is_timeout(&self) -> bool {
+        self.timeout
+    }
+
+    /// Запрос не начат — абсолютный срок клиента вышел до отправки ([`Timeouts::Deadline`]):
+    /// сервер запроса не видел. Это не [`CliError::is_timeout`] (там сервер не ответил вовремя).
+    pub fn is_unsent(&self) -> bool {
+        self.unsent
     }
 
     /// Уточнение: «<ctx>: <текст>».
@@ -90,9 +124,44 @@ pub enum Timeouts {
     Probe,
     /// Команды заметок: тело (вложение до 200 МБ) может идти долго, общего предела нет.
     Transfer,
-    /// Хуки агента (§10.3): весь запрос, включая чтение ответа, — не дольше срока
-    /// (бюджет хука минус 30 мс).
-    Deadline(Duration),
+    /// Хуки агента (§10.3): абсолютный срок — момент, к которому кончаются все запросы клиента
+    /// (старт хука + бюджет − резерв). Срок каждого запроса — остаток до этого момента в момент
+    /// отправки (весь запрос, включая чтение ответа): последовательные запросы и параллельные
+    /// потоки одного клиента делят один срок; без остатка запрос не начинается
+    /// ([`CliError::is_unsent`]).
+    Deadline(Instant),
+    /// `zam mcp`: как `Transfer`, но ответ ждётся до [`MCP_RECV_RESPONSE`] — сервер (`json_response`)
+    /// отдаёт заголовки только после конца инструмента.
+    Mcp,
+    /// `zam export`: заголовки — после снимка пространства (до [`MCP_RECV_RESPONSE`]), тело —
+    /// архив любого размера потоком, без общего предела на его приём.
+    Download,
+}
+
+/// Ожидание ответа `POST /mcp` (ревью задачи 3, m1). Сервер синхронно ждёт инструмент, а
+/// своего предела на запрос у него нет; самые долгие пути — разбор вложения рабочим процессом
+/// (`docs.timeout_ms`, 60 с по умолчанию, в очереди из `docs.workers` = 2), реранк на CPU и
+/// карта кода. 10 мин покрывают несколько таких сроков подряд при умолчаниях; дольше — пусть
+/// решает тайм-аут инструмента самого агента.
+pub const MCP_RECV_RESPONSE: Duration = Duration::from_secs(10 * 60);
+/// Ожидание ответа на `Expect: 100-continue` при импорте (по умолчанию ureq — 1 с: под нагрузкой
+/// тело уходило до ответа сервера).
+pub const AWAIT_100: Duration = Duration::from_secs(30);
+
+/// Остаток до абсолютного срока, с которым запрос ещё начинается ([`Timeouts::Deadline`]):
+/// меньше — ответа он не дождётся, только выйдет за срок на шаг таймера ОС. Порог — чуть больше
+/// шага таймера Windows (15,6 мс): ожидание сокета возвращается с такой точностью и **раньше**
+/// срока тоже, так что после запроса, снятого по сроку, остаток бывает от нуля до шага. С порогом
+/// 1 мс следующий запрос хука в этот остаток начинался (задача 17d: `GET /file-refs` после
+/// `POST /files/changed`, снятого сроком, — лишний запрос к серверу и ещё шаг таймера к выходу).
+pub const DEADLINE_MIN: Duration = Duration::from_millis(16);
+
+/// Абсолютный срок профиля ([`Timeouts::Deadline`]); у прочих профилей его нет.
+fn deadline_of(t: Timeouts) -> Option<Instant> {
+    match t {
+        Timeouts::Deadline(at) => Some(at),
+        _ => None,
+    }
 }
 
 pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
@@ -110,10 +179,23 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
             .timeout_send_body(Some(Duration::from_secs(30 * 60)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .timeout_recv_body(Some(Duration::from_secs(5 * 60))),
-        Timeouts::Deadline(d) => b
-            .timeout_resolve(Some(d))
-            .timeout_connect(Some(d))
-            .timeout_global(Some(d)),
+        Timeouts::Mcp => b
+            .timeout_send_request(Some(Duration::from_secs(30)))
+            .timeout_send_body(Some(Duration::from_secs(30 * 60)))
+            .timeout_recv_response(Some(MCP_RECV_RESPONSE))
+            .timeout_recv_body(Some(Duration::from_secs(5 * 60))),
+        Timeouts::Download => b
+            .timeout_send_request(Some(Duration::from_secs(30)))
+            .timeout_recv_response(Some(MCP_RECV_RESPONSE))
+            .timeout_recv_body(None),
+        // срок — у каждого запроса свой, по остатку до момента ([`Client::timed`]); у агента —
+        // тот же остаток на случай запроса мимо клиента
+        Timeouts::Deadline(at) => {
+            let d = at.saturating_duration_since(Instant::now());
+            b.timeout_resolve(Some(d))
+                .timeout_connect(Some(d))
+                .timeout_global(Some(d))
+        }
     };
     if bypass_proxy(url) {
         b = b.proxy(None);
@@ -151,6 +233,8 @@ pub struct Client {
     machine: Option<String>,
     solution: Option<String>,
     session: Option<String>,
+    /// Абсолютный срок запросов ([`Timeouts::Deadline`]); прочие профили — `None`.
+    deadline: Option<Instant>,
 }
 
 /// В Debug токен — только маска.
@@ -181,7 +265,39 @@ impl Client {
             machine: machine_from(|k| std::env::var(k).ok()),
             solution,
             session: None,
+            deadline: deadline_of(t),
         }
+    }
+
+    /// Сменить профиль таймаутов (`zam mcp` — [`Timeouts::Mcp`]).
+    pub fn set_timeouts(&mut self, t: Timeouts) {
+        self.agent = agent(&self.base, t);
+        self.deadline = deadline_of(t);
+    }
+
+    /// Остаток до абсолютного срока клиента ([`Timeouts::Deadline`]): `None` — срока нет (прочие
+    /// профили); ноль — срок вышел, запрос не начнётся.
+    pub fn deadline_left(&self) -> Option<Duration> {
+        self.deadline
+            .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+
+    /// Срок запроса по абсолютному сроку клиента: остаток в момент отправки — на разрешение
+    /// имени, соединение и весь запрос с чтением ответа. Остатка нет (меньше [`DEADLINE_MIN`]) —
+    /// запрос не начинается: ошибка [`CliError::is_unsent`]. Профили без срока — без изменений.
+    fn timed<B>(&self, rb: RequestBuilder<B>) -> Result<RequestBuilder<B>, CliError> {
+        let Some(left) = self.deadline_left() else {
+            return Ok(rb);
+        };
+        if left < DEADLINE_MIN {
+            return Err(CliError::unsent());
+        }
+        Ok(rb
+            .config()
+            .timeout_resolve(Some(left))
+            .timeout_connect(Some(left))
+            .timeout_global(Some(left))
+            .build())
     }
 
     /// Сессия агента для `X-Zam-Session` (запись в память учитывается в её `memory_writes`).
@@ -203,7 +319,9 @@ impl Client {
         format!("{}/api/v1{path}", self.base)
     }
 
-    fn prepare<B>(&self, mut rb: RequestBuilder<B>) -> RequestBuilder<B> {
+    /// Заголовки атрибуции и срок запроса ([`Client::timed`]).
+    fn prepare<B>(&self, rb: RequestBuilder<B>) -> Result<RequestBuilder<B>, CliError> {
+        let mut rb = self.timed(rb)?;
         rb = rb.header("Authorization", format!("Bearer {}", self.token));
         if let Some(m) = &self.machine {
             rb = rb.header("X-Zam-Machine", m.as_str());
@@ -214,12 +332,12 @@ impl Client {
         if let Some(s) = &self.session {
             rb = rb.header("X-Zam-Session", s.as_str());
         }
-        rb
+        Ok(rb)
     }
 
     /// GET `/api/v1{path}` с параметрами запроса (кодируются ureq).
     pub fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Response<Body>, CliError> {
-        let mut rb = self.prepare(self.agent.get(&self.url(path)));
+        let mut rb = self.prepare(self.agent.get(&self.url(path)))?;
         for (k, v) in query {
             rb = rb.query(*k, *v);
         }
@@ -233,7 +351,7 @@ impl Client {
         query: &[(&str, &str)],
         headers: &[(&str, &str)],
     ) -> Result<Response<Body>, CliError> {
-        let mut rb = self.prepare(self.agent.get(&self.url(path)));
+        let mut rb = self.prepare(self.agent.get(&self.url(path)))?;
         for (k, v) in query {
             rb = rb.query(*k, *v);
         }
@@ -244,7 +362,7 @@ impl Client {
     }
 
     pub fn post_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
-        let rb = self.prepare(self.agent.post(&self.url(path)));
+        let rb = self.prepare(self.agent.post(&self.url(path)))?;
         self.check(
             rb.content_type("application/json")
                 .send(body.to_string().as_bytes()),
@@ -258,7 +376,7 @@ impl Client {
         body: &Value,
         headers: &[(&str, &str)],
     ) -> Result<Response<Body>, CliError> {
-        let mut rb = self.prepare(self.agent.post(&self.url(path)));
+        let mut rb = self.prepare(self.agent.post(&self.url(path)))?;
         for (k, v) in headers {
             rb = rb.header(*k, *v);
         }
@@ -270,12 +388,12 @@ impl Client {
 
     /// DELETE `/api/v1{path}`.
     pub fn delete(&self, path: &str) -> Result<Response<Body>, CliError> {
-        self.check(self.prepare(self.agent.delete(&self.url(path))).call())
+        self.check(self.prepare(self.agent.delete(&self.url(path)))?.call())
     }
 
     /// PATCH JSON без `If-Match`.
     pub fn patch_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
-        let rb = self.prepare(self.agent.patch(&self.url(path)));
+        let rb = self.prepare(self.agent.patch(&self.url(path)))?;
         self.check(
             rb.content_type("application/json")
                 .send(body.to_string().as_bytes()),
@@ -290,7 +408,7 @@ impl Client {
         if_match: i64,
     ) -> Result<Response<Body>, CliError> {
         let rb = self
-            .prepare(self.agent.patch(&self.url(path)))
+            .prepare(self.agent.patch(&self.url(path)))?
             .header("If-Match", format!("\"{if_match}\""));
         self.check(
             rb.content_type("application/json")
@@ -306,7 +424,7 @@ impl Client {
         if_match: i64,
     ) -> Result<Response<Body>, CliError> {
         let rb = self
-            .prepare(self.agent.put(&self.url(path)))
+            .prepare(self.agent.put(&self.url(path)))?
             .header("If-Match", format!("\"{if_match}\""));
         self.check(
             rb.content_type("application/json")
@@ -316,7 +434,7 @@ impl Client {
 
     /// PUT JSON без `If-Match` (готовое тело: размер пачки считает вызывающий).
     pub fn put_json_body(&self, path: &str, body: Vec<u8>) -> Result<Response<Body>, CliError> {
-        let rb = self.prepare(self.agent.put(&self.url(path)));
+        let rb = self.prepare(self.agent.put(&self.url(path)))?;
         self.check(rb.content_type("application/json").send(&body[..]))
     }
 
@@ -331,6 +449,39 @@ impl Client {
         self.send_multipart_with(path, content_type, len, reader, &[])
     }
 
+    /// POST тела импорта: `.zip` — `len` (`Content-Length`), каталог — потоком (chunked, архив
+    /// собирается на лету) с оценкой объёма `expected` (`X-Zam-Expected-Bytes`: резерв места и
+    /// предел тела на сервере). `Expect: 100-continue`: ureq читает ответ сервера только после
+    /// всего тела, а так отказ до приёма (413, 503, 507, 404 старого сервера) приходит до тела —
+    /// тело не уходит, и ответ не теряется в обрыве записи. Ответ ждётся до [`AWAIT_100`];
+    /// сервер (прокси) молчит дольше — тело уходит как обычно. `Connection: close`: ureq 3.4.2
+    /// дочитывает ранний ответ на `Expect` только до закрытия соединения сервером (после
+    /// Await100 ждёт новых данных), а прокси с keep-alive, ответивший до тела, держал бы CLI до
+    /// срока ответа (10 мин); с `Connection: close` сервер обязан закрыть соединение после
+    /// ответа (RFC 9112 §9.6).
+    pub fn send_import(
+        &self,
+        path: &str,
+        content_type: &str,
+        len: Option<u64>,
+        expected: Option<u64>,
+        reader: impl Read + 'static,
+    ) -> Result<Response<Body>, CliError> {
+        let mut rb = self
+            .prepare(self.agent.post(&self.url(path)))?
+            .header("Content-Type", content_type)
+            .header("Expect", "100-continue")
+            .header("Connection", "close");
+        if let Some(n) = len {
+            rb = rb.header("Content-Length", n.to_string());
+        }
+        if let Some(n) = expected {
+            rb = rb.header("X-Zam-Expected-Bytes", n.to_string());
+        }
+        let rb = rb.config().timeout_await_100(Some(AWAIT_100)).build();
+        self.check(rb.send(ureq::SendBody::from_owned_reader(reader)))
+    }
+
     /// POST тела потоком с дополнительными заголовками (`Idempotency-Key`).
     pub fn send_multipart_with(
         &self,
@@ -341,7 +492,7 @@ impl Client {
         headers: &[(&str, &str)],
     ) -> Result<Response<Body>, CliError> {
         let mut rb = self
-            .prepare(self.agent.post(&self.url(path)))
+            .prepare(self.agent.post(&self.url(path)))?
             .header("Content-Type", content_type)
             .header("Content-Length", len.to_string());
         for (k, v) in headers {
@@ -358,27 +509,19 @@ impl Client {
         headers: &[(&str, &str)],
     ) -> Result<Response<Body>, CliError> {
         let mut rb = self
-            .prepare(self.agent.post(&format!("{}/mcp", self.base)))
+            .prepare(self.agent.post(&format!("{}/mcp", self.base)))?
             .header("Accept", "application/json, text/event-stream");
         for (k, v) in headers {
             rb = rb.header(*k, *v);
         }
-        rb.content_type("application/json").send(body).map_err(|e| {
-            CliError::new(
-                EXIT_UNREACHABLE,
-                format!("сервер {} недоступен: {e}", self.base),
-            )
-        })
+        rb.content_type("application/json")
+            .send(body)
+            .map_err(|e| net_error(&self.base, e))
     }
 
     /// 2xx и 304 (ответ на `If-None-Match`) → ответ; иначе ошибка с кодом выхода по статусу.
     fn check(&self, r: Result<Response<Body>, ureq::Error>) -> Result<Response<Body>, CliError> {
-        let resp = r.map_err(|e| {
-            CliError::new(
-                EXIT_UNREACHABLE,
-                format!("сервер {} недоступен: {e}", self.base),
-            )
-        })?;
+        let resp = r.map_err(|e| net_error(&self.base, e))?;
         if resp.status().is_success() || resp.status().as_u16() == 304 {
             return Ok(resp);
         }
@@ -389,6 +532,13 @@ impl Client {
 /// Ответ с ошибкой → [`CliError`]: текст из `detail` problem+json.
 fn problem(mut resp: Response<Body>) -> CliError {
     let status = resp.status().as_u16();
+    // занято, слишком велико, мало места: когда повторить — из `Retry-After`
+    let retry = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| format!("; повторите через {} с", v.trim()))
+        .unwrap_or_default();
     let text = resp
         .body_mut()
         .with_config()
@@ -411,7 +561,7 @@ fn problem(mut resp: Response<Body>) -> CliError {
     };
     let msg = match status {
         401 => "токен отклонён сервером".to_string(),
-        _ => format!("{detail} (HTTP {status})"),
+        _ => format!("{detail} (HTTP {status}{retry})"),
     };
     // статус — всегда в `problem` ([`CliError::http_status`]): у тела не problem+json тоже
     match v.as_mut() {
@@ -420,10 +570,33 @@ fn problem(mut resp: Response<Body>) -> CliError {
         }
         _ => v = Some(serde_json::json!({ "status": status })),
     }
+    CliError::with_problem(code, msg, v)
+}
+
+/// Сетевая ошибка запроса к серверу `base` (ответа нет): «сервер … недоступен» с кодом
+/// [`EXIT_UNREACHABLE`]. Срок клиента — по типу ошибки, а не по её тексту ([`timed_out`]) —
+/// [`CliError::is_timeout`].
+fn net_error(base: &str, e: ureq::Error) -> CliError {
     CliError {
-        code,
-        msg,
-        problem: v,
+        code: EXIT_UNREACHABLE,
+        msg: format!("сервер {base} недоступен: {e}"),
+        problem: None,
+        timeout: timed_out(&e),
+        unsent: false,
+    }
+}
+
+/// Ошибка клиента — истёкший срок: `Timeout` ureq или ввод-вывод сокета с `TimedOut` либо
+/// `WouldBlock`. Срок чтения и записи сокета (`SO_RCVTIMEO`/`SO_SNDTIMEO`) Windows отдаёт как
+/// `TimedOut`, unix — как `WouldBlock` (`EAGAIN`); сокеты клиента блокирующие, поэтому
+/// `WouldBlock` у них бывает только по сроку. ureq сам сводит его к `Timeout`, но не на каждом
+/// пути (ошибка ввода-вывода из чтения тела приходит как `Io`).
+fn timed_out(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
+    match e {
+        ureq::Error::Timeout(_) => true,
+        ureq::Error::Io(io) => matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock),
+        _ => false,
     }
 }
 
@@ -455,6 +628,150 @@ pub fn into_reader(resp: Response<Body>) -> impl Read {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// m1: `zam mcp` ждёт ответа инструмента до 10 мин, команды заметок — по-прежнему 60 с.
+    #[test]
+    fn mcp_profile_waits_long_for_response() {
+        let t = |p| agent("http://127.0.0.1:1", p).config().timeouts();
+        assert_eq!(t(Timeouts::Mcp).recv_response, Some(MCP_RECV_RESPONSE));
+        assert!(MCP_RECV_RESPONSE >= Duration::from_secs(10 * 60));
+        assert_eq!(
+            t(Timeouts::Transfer).recv_response,
+            Some(Duration::from_secs(60))
+        );
+        let mut c = Client::new("http://127.0.0.1:1", "t", None);
+        c.set_timeouts(Timeouts::Mcp);
+        assert_eq!(
+            c.agent.config().timeouts().recv_response,
+            Some(MCP_RECV_RESPONSE)
+        );
+    }
+
+    /// Повторное ревью 76458e3 (17b), I1: срок клиента — типизированный признак ошибки.
+    /// Сервер принял соединение и молчит — `is_timeout()`; отказ соединения — нет.
+    #[test]
+    fn timeout_is_typed_not_parsed_from_text() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(Instant::now() + Duration::from_millis(50)),
+        );
+        let e = c.put_json_body("/x", b"{}".to_vec()).unwrap_err();
+        assert!(e.is_timeout(), "{e}");
+        assert_eq!(e.code, EXIT_UNREACHABLE);
+        assert_eq!(e.http_status(), None);
+        drop(silent);
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(Instant::now() + Duration::from_secs(30)),
+        );
+        let e = c.put_json_body("/x", b"{}".to_vec()).unwrap_err();
+        assert!(!e.is_timeout(), "{e}");
+        assert_eq!(e.code, EXIT_UNREACHABLE);
+    }
+
+    /// Третье ревью 599c933 (17b), M2: срок сокета на unix приходит как `WouldBlock`; отказ и
+    /// обрыв соединения — не срок.
+    #[test]
+    fn socket_timeout_kinds_are_timeouts() {
+        use std::io::{Error, ErrorKind};
+        let io = |k: ErrorKind| ureq::Error::Io(Error::from(k));
+        assert!(timed_out(&io(ErrorKind::TimedOut)));
+        assert!(timed_out(&io(ErrorKind::WouldBlock)));
+        assert!(!timed_out(&io(ErrorKind::ConnectionRefused)));
+        assert!(!timed_out(&io(ErrorKind::ConnectionReset)));
+        assert!(net_error("http://x", io(ErrorKind::WouldBlock)).is_timeout());
+        assert!(!net_error("http://x", io(ErrorKind::ConnectionReset)).is_timeout());
+        assert!(!CliError::new(EXIT_UNREACHABLE, "timeout: global").is_timeout());
+        assert!(!CliError::with_problem(EXIT_CONFLICT, "x", None).is_timeout());
+    }
+
+    /// Задача 17b-http: срок клиента хуков — абсолютный, один на все запросы. Сервер принял
+    /// соединение и молчит: первый запрос оборван сроком, второй (тем же клиентом, срок вышел) не
+    /// начинается вовсе — оба вместе идут один срок, а не два. Сроки — сотни мс (срок 600, сон
+    /// 300): планировщик занятой машины и шаг таймера ОС на исход не влияют.
+    #[test]
+    fn deadline_is_absolute_and_shared_by_requests() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let ms = 600;
+        let t0 = Instant::now();
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(t0 + Duration::from_millis(ms)),
+        );
+        let e = c.post_json("/x", &serde_json::json!({})).unwrap_err();
+        assert!(e.is_timeout() && !e.is_unsent(), "{e}");
+        let first = t0.elapsed();
+        let e = c.get("/x", &[]).unwrap_err();
+        assert!(e.is_unsent() && !e.is_timeout(), "{e}");
+        assert_eq!(e.code, EXIT_UNREACHABLE);
+        assert_eq!(e.to_string(), zam_core::HOOK_BUDGET_SPENT);
+        let both = t0.elapsed();
+        assert!(first >= Duration::from_millis(ms - 20), "{first:?}");
+        assert!(
+            both < Duration::from_millis(2 * ms - 100),
+            "два запроса — один срок {ms} мс, а не два: {both:?}"
+        );
+        // ожидание сокета возвращается с точностью шага таймера ОС, бывает и чуть раньше срока
+        assert!(c.deadline_left().is_some_and(|d| d < DEADLINE_MIN));
+        // запрос, начатый позже, получает остаток, а не полный срок
+        let t0 = Instant::now();
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(t0 + Duration::from_millis(ms)),
+        );
+        let nap = 300;
+        std::thread::sleep(Duration::from_millis(nap));
+        let e = c.get("/x", &[]).unwrap_err();
+        // сон затянулся за срок (занятая машина) — запрос не начат: тоже верный исход
+        assert!(e.is_timeout() || e.is_unsent(), "{e}");
+        let took = t0.elapsed();
+        assert!(
+            e.is_unsent() || took < Duration::from_millis(ms + nap - 100),
+            "срок от создания клиента, а не от начала запроса: {took:?}"
+        );
+        // профили без срока — без изменений
+        assert_eq!(Client::new(&url, "t", None).deadline_left(), None);
+    }
+
+    /// Задача 17d: остаток до срока меньше шага таймера ОС ([`DEADLINE_MIN`]) — запрос не
+    /// начинается: сервер соединения не видит, ошибка — «бюджет исчерпан до запроса», не тайм-аут.
+    /// С прежним порогом 1 мс такой запрос уходил и возвращался по сроку с опозданием на шаг
+    /// таймера (после запроса, снятого сроком, остаток — от нуля до шага).
+    #[test]
+    fn request_with_remainder_below_timer_step_is_not_started() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        silent.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let c = Client::with_timeouts(
+            &url,
+            "t",
+            None,
+            Timeouts::Deadline(Instant::now() + Duration::from_millis(10)),
+        );
+        let e = c.get("/x", &[]).unwrap_err();
+        assert!(e.is_unsent() && !e.is_timeout(), "{e}");
+        assert_eq!(e.to_string(), zam_core::HOOK_BUDGET_SPENT);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            silent.accept().is_err(),
+            "запрос с остатком меньше шага таймера дошёл до сервера"
+        );
+    }
 
     #[test]
     fn loopback_hosts_bypass_proxy() {

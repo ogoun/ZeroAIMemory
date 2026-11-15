@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 use zam_code::{
-    Focus, Graph, RankFile, RefKind, SymbolKind, central, edges_among, focus_idents, focus_restart,
-    ident_mult, pagerank, rank, rank_on_graph,
+    Focus, Graph, RankFile, RankWeights, RefKind, SymbolKind, central, edges_among, focus_idents,
+    focus_restart, ident_mult, pagerank, rank, rank_on_graph, rank_with,
 };
 
 fn file(id: i64, path: &str, defs: &[(&str, SymbolKind)], refs: &[(&str, u32)]) -> RankFile {
@@ -18,8 +18,23 @@ fn file(id: i64, path: &str, defs: &[(&str, SymbolKind)], refs: &[(&str, u32)]) 
             .collect(),
         refs: refs
             .iter()
-            .map(|(n, c)| (n.to_string(), RefKind::Call, *c))
+            .map(|(n, c)| (n.to_string(), RefKind::Call, *c, 0))
             .collect(),
+    }
+}
+
+/// Вклад ссылки по таблице M6 §12а, записанной здесь независимо от `rank.rs`: тип и реализация
+/// 2,0, прочие 1,0; у вызова `recv` (не больше `count`) — 0,25.
+fn table_contribution(kind: RefKind, count: u32, recv: u32) -> f64 {
+    let k = match kind {
+        RefKind::Type | RefKind::Impl => 2.0,
+        RefKind::Call | RefKind::Import | RefKind::Other => 1.0,
+    };
+    if kind == RefKind::Call {
+        let r = recv.min(count);
+        f64::from(count - r) + 0.25 * f64::from(r)
+    } else {
+        k * f64::from(count)
     }
 }
 
@@ -179,12 +194,12 @@ fn graph30() -> Vec<RankFile> {
             id: m,
             path: format!("src/mid{m}.rs"),
             defs: vec![(name, SymbolKind::Function, Some(true))],
-            refs: vec![("shared_service_registry".into(), RefKind::Type, 2)],
+            refs: vec![("shared_service_registry".into(), RefKind::Type, 2, 0)],
         });
     }
     for i in 6..30 {
-        let mut refs = vec![("shared_service_registry".to_string(), RefKind::Type, 3)];
-        refs.push((format!("middle_layer_{}", i % 5 + 1), RefKind::Call, 2));
+        let mut refs = vec![("shared_service_registry".to_string(), RefKind::Type, 3, 0)];
+        refs.push((format!("middle_layer_{}", i % 5 + 1), RefKind::Call, 2, 0));
         let mut defs = vec![];
         if (25..=27).contains(&i) {
             defs.push((
@@ -198,7 +213,7 @@ fn graph30() -> Vec<RankFile> {
             // фокусный файл ссылается на хаб и три цели: вместе с ним — ровно пятёрка
             refs.truncate(1);
             for t in 25..=27 {
-                refs.push((format!("focus_target_{t}"), RefKind::Call, 1));
+                refs.push((format!("focus_target_{t}"), RefKind::Call, 1, 0));
             }
         }
         files.push(RankFile {
@@ -355,15 +370,15 @@ fn central_max_three_per_file() {
 
 #[test]
 fn edges_sum_ref_kinds_of_one_name() {
-    // `Store` как тип ×3 и вызов ×1: √(3 + 1), а не √3 + √1
+    // `Store` как тип ×3 (вес вида 2,0, M6 §12а) и вызов ×1: √(3 × 2 + 1), а не √6 + √1
     let mut a = file(1, "a.rs", &[], &[]);
     a.refs = vec![
-        ("Store".into(), RefKind::Type, 3),
-        ("Store".into(), RefKind::Call, 1),
+        ("Store".into(), RefKind::Type, 3, 0),
+        ("Store".into(), RefKind::Call, 1, 0),
     ];
     let files = [a, file(2, "b.rs", &[("Store", SymbolKind::Struct)], &[])];
     let e = edges_among(&files, &[0, 1]);
-    assert!(close(edge(&e, 0, 1).unwrap(), 2.0), "{e:?}");
+    assert!(close(edge(&e, 0, 1).unwrap(), 7f64.sqrt()), "{e:?}");
 }
 
 #[test]
@@ -430,19 +445,19 @@ fn dense_named(files: &[RankFile]) -> Vec<(usize, usize, String, f64)> {
     }
     let mut out = Vec::new();
     for (a, f) in files.iter().enumerate() {
-        let mut agg: HashMap<&str, u32> = HashMap::new();
-        for (n, _, c) in &f.refs {
-            *agg.entry(n).or_default() += c;
+        let mut agg: HashMap<&str, f64> = HashMap::new();
+        for (n, k, c, r) in &f.refs {
+            *agg.entry(n).or_default() += table_contribution(*k, *c, *r);
         }
         for (n, c) in agg {
             let Some(defs) = definers.get(n) else {
                 continue;
             };
-            if c == 0 {
+            if c == 0.0 {
                 continue;
             }
             let d = defs.len();
-            let w = f64::from(c).sqrt() * ident_mult(n, d) / d as f64;
+            let w = c.sqrt() * ident_mult(n, d) / d as f64;
             for &b in defs.iter().filter(|&&b| b != a) {
                 out.push((a, b, n.to_string(), w));
             }
@@ -540,7 +555,7 @@ fn arb_files() -> impl Strategy<Value = Vec<RankFile>> {
         0..SymbolKind::ALL.len(),
         any::<Option<bool>>(),
     );
-    let rf = (0..NAMES.len(), 0..RefKind::ALL.len(), 0u32..6);
+    let rf = (0..NAMES.len(), 0..RefKind::ALL.len(), 0u32..6, 0u32..8);
     let one = (
         proptest::collection::vec(def, 0..5),
         proptest::collection::vec(rf, 0..8),
@@ -558,7 +573,7 @@ fn arb_files() -> impl Strategy<Value = Vec<RankFile>> {
                     .collect(),
                 refs: refs
                     .into_iter()
-                    .map(|(n, k, c)| (NAMES[n].to_string(), RefKind::ALL[k], c))
+                    .map(|(n, k, c, r)| (NAMES[n].to_string(), RefKind::ALL[k], c, r))
                     .collect(),
             })
             .collect()
@@ -648,14 +663,19 @@ fn synth(n: usize, common_def: f64, common_ref: f64) -> Vec<RankFile> {
         let mut refs = Vec::new();
         for (ci, c) in common.iter().enumerate() {
             if (rnd() % 10_000) as f64 / 10_000.0 < common_ref / (1.0 + ci as f64 * 0.3) {
-                refs.push((c.to_string(), RefKind::Call, 1 + (rnd() % 8) as u32));
+                refs.push((c.to_string(), RefKind::Call, 1 + (rnd() % 8) as u32, 0));
             }
         }
         for _ in 0..40 {
             let u = (rnd() % 1_000_000) as f64 / 1_000_000.0;
             let t = ((n as f64).powf(u) as usize).min(n - 1);
             let k = rnd() % 12;
-            refs.push((format!("Sym{t}x{k}"), RefKind::Call, 1 + (rnd() % 4) as u32));
+            refs.push((
+                format!("Sym{t}x{k}"),
+                RefKind::Call,
+                1 + (rnd() % 4) as u32,
+                0,
+            ));
         }
         files.push(RankFile {
             id: i as i64,
@@ -683,4 +703,195 @@ fn rank_50k_files_under_1s_release() {
             assert!(el.as_secs_f64() < 1.0, "{el:?}");
         }
     }
+}
+
+/// M6 §12а: таблица весов вида объявлена до замера — тип и реализация 2,0, прямой вызов, импорт и
+/// прочее 1,0, вызов по получателю 0,25: вклад вызова `(count − recv) × 1,0 + recv × 0,25`
+/// (`recv` больше `count` — не больше `count`). Вес ребра — `√c` (имя `Store`: множитель 1, d = 1).
+#[test]
+fn weights_table_fixed() {
+    let weight = |kind: RefKind, count: u32, recv: u32| {
+        let mut a = file(1, "a.rs", &[], &[]);
+        a.refs = vec![("Store".into(), kind, count, recv)];
+        let files = [a, file(2, "b.rs", &[("Store", SymbolKind::Struct)], &[])];
+        edge(&edges_among(&files, &[0, 1]), 0, 1).unwrap()
+    };
+    for (kind, w) in [
+        (RefKind::Type, 2.0f64),
+        (RefKind::Impl, 2.0),
+        (RefKind::Call, 1.0),
+        (RefKind::Import, 1.0),
+        (RefKind::Other, 1.0),
+    ] {
+        assert!(close(weight(kind, 4, 0), (4.0 * w).sqrt()), "{kind}");
+    }
+    assert!(close(weight(RefKind::Call, 4, 4), 1.0));
+    assert!(close(weight(RefKind::Call, 4, 2), 2.5f64.sqrt()));
+    assert!(close(weight(RefKind::Call, 4, 9), 1.0), "recv â‰¤ count");
+    // счётчик получателя у не-вызова не действует
+    assert!(close(weight(RefKind::Type, 4, 4), 8f64.sqrt()));
+    // правила M5.7 для абляции: виды равны, получатель не различается
+    let mut a = file(1, "a.rs", &[], &[]);
+    a.refs = vec![
+        ("Store".into(), RefKind::Type, 3, 0),
+        ("Store".into(), RefKind::Call, 4, 2),
+    ];
+    let files = [a, file(2, "b.rs", &[("Store", SymbolKind::Struct)], &[])];
+    // M5.7: √(3 + 4); M6: √(3 × 2 + 2 + 2 × 0,25)
+    assert!(close(
+        edge(&edges_among(&files, &[0, 1]), 0, 1).unwrap(),
+        8.5f64.sqrt()
+    ));
+    let m57 = Graph::with_weights(&files, RankWeights::M57);
+    let m6 = Graph::new(&files);
+    assert_eq!(m6, Graph::with_weights(&files, RankWeights::M6));
+    assert_ne!(m57, m6);
+    let r57 = rank_with(&files, None, RankWeights::M57);
+    let uniform: Vec<RankFile> = files
+        .iter()
+        .map(|f| RankFile {
+            refs: f
+                .refs
+                .iter()
+                .map(|(n, _, c, _)| (n.clone(), RefKind::Call, *c, 0))
+                .collect(),
+            ..f.clone()
+        })
+        .collect();
+    assert_eq!(r57, rank(&uniform, None), "M5.7: все виды как прямой вызов");
+}
+
+/// Входы ранжирования из JSON эталона шага 0 задачи 14 M6 (`files[].defs [[name, kind,
+/// exported]]`, `refs [[name, kind, count]]` — данные клиента до M6, без `recv_count`).
+fn m57_inputs(v: &serde_json::Value) -> Vec<RankFile> {
+    v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| RankFile {
+            id: f["id"].as_i64().unwrap(),
+            path: f["path"].as_str().unwrap().to_string(),
+            defs: f["defs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| {
+                    (
+                        d[0].as_str().unwrap().to_string(),
+                        SymbolKind::parse(d[1].as_str().unwrap()).unwrap(),
+                        d[2].as_bool(),
+                    )
+                })
+                .collect(),
+            // старый клиент: поля нет — сервер M6 хранит `recv_count = 0`
+            refs: f["refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r[0].as_str().unwrap().to_string(),
+                        RefKind::parse(r[1].as_str().unwrap()).unwrap(),
+                        u32::try_from(r[2].as_u64().unwrap()).unwrap(),
+                        0,
+                    )
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn f64s(v: &serde_json::Value) -> Vec<f64> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap())
+        .collect()
+}
+
+/// Ранги кода M6 на входах `files` с правилами `w` совпадают с рангами библиотеки M5.7 `want`
+/// (`file_rank`, `symbol_share`) до последних знаков: допуск 1e-13 относительно — разбор чисел
+/// `serde_json` без `float_roundtrip` ошибается на единицу последнего разряда (≈ 2e-16).
+fn assert_same_ranks(files: &[RankFile], want: &serde_json::Value, w: RankWeights) {
+    let got = rank_with(files, None, w);
+    let same = |a: &[f64], b: &[f64]| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| (x - y).abs() <= 1e-13 * x.abs().max(y.abs()))
+    };
+    let want_rank = f64s(&want["file_rank"]);
+    assert!(same(&got.file_rank, &want_rank), "{w:?}: ранги файлов");
+    let shares: Vec<Vec<f64>> = want["symbol_share"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(f64s)
+        .collect();
+    assert_eq!(got.symbol_share.len(), shares.len());
+    for (g, s) in got.symbol_share.iter().zip(&shares) {
+        assert!(same(g, s), "{w:?}: доли символов");
+    }
+}
+
+/// M6 §12а: данные старого клиента (`recv_count` нет → 0) — вызовы прямые, вес вызова как в
+/// v0.0.10: ранги кода M6 при равных весах видов совпадают с рангами M5.7 (до 1e-13). Эталон —
+/// `tests/fixtures/rank_m57/`: входы — подмножество карты репозитория шага 0 (база прогона
+/// `code-bench` бинарниками `v0.0.10-m5.7` на снимке `045ef40`, файлы `crates/zam-code/**` и
+/// `crates/zam-cli/src/cmd/code/**`), ранги посчитаны библиотекой `zam-code` тега
+/// `v0.0.10-m5.7` (журнал этапа, задача 14). Таблица весов вида M6 — отдельное объявленное
+/// изменение (`weights_table_fixed`); с ней ранги другие.
+#[test]
+fn ranks_unchanged_when_recv_count_zero() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rank_m57");
+    let read = |f: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join(f)).unwrap()).unwrap()
+    };
+    let files = m57_inputs(&read("inputs.json"));
+    assert!(files.len() >= 20, "{}", files.len());
+    let want = read("ranks.json");
+    // получатель учитывается, но счётчиков нет — как M5.7
+    let recv_only = RankWeights {
+        kind_table: false,
+        recv: true,
+    };
+    assert_same_ranks(&files, &want, recv_only);
+    assert_same_ranks(&files, &want, RankWeights::M57);
+    // правила M6 с таблицей видов меняют ранги (иначе эталон ничего не проверял бы)
+    let m6 = rank(&files, None).file_rank;
+    let diff = m6
+        .iter()
+        .zip(f64s(&want["file_rank"]))
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    assert!(diff > 1e-6, "{diff}");
+}
+
+/// То же на всей карте репозитория шага 0 (не в наборе: эталон — `.tmp`, ≈ мегабайты):
+/// `ZAM_RANKS_M57=<ranks-m57.json> cargo test -p zam-code --test rank -- --ignored full_repo`.
+/// Сверка — с рангами библиотеки M5.7 (до 1e-13) и с сохранёнными сервером M5.7 (`f32`
+/// долей, перезапись при изменении больше 1e-4 — допуск 1e-3 относительно).
+#[test]
+#[ignore = "эталон всей карты — .tmp/m6/task14/ranks-m57.json (ZAM_RANKS_M57)"]
+fn ranks_unchanged_when_recv_count_zero_full_repo() {
+    let path = std::env::var("ZAM_RANKS_M57").expect("ZAM_RANKS_M57");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let files = m57_inputs(&v);
+    let recv_only = RankWeights {
+        kind_table: false,
+        recv: true,
+    };
+    assert_same_ranks(&files, &v["lib_ranks"], recv_only);
+    let got = rank_with(&files, None, recv_only);
+    let mut worst = 0.0f64;
+    for (i, f) in v["files"].as_array().unwrap().iter().enumerate() {
+        let stored = f["stored_rank"].as_f64().unwrap();
+        let rel = (got.file_rank[i] - stored).abs() / stored.max(1e-12);
+        worst = worst.max(rel);
+    }
+    println!(
+        "файлов {}, наибольшее относительное расхождение с рангами сервера M5.7: {worst:.2e}",
+        files.len()
+    );
+    assert!(worst < 1e-3, "{worst}");
 }

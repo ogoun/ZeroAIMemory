@@ -2,11 +2,11 @@
 //! разбор, чанки, FTS и задание outbox (`index_jobs`) фиксируются вместе или не
 //! фиксируются вовсе (§8.1 ТЗ).
 
-use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 
 use super::chunks::{NoteMeta, index_note, index_state, note_meta};
+use super::idempotency::{NodeKey, NodeOp, opt_part};
 use super::{Attribution, NewNote, Node, NodeKind, live_by_path, load_node, sha256_hex};
 use crate::certainty::{CertaintyChange, check_certainty};
 use crate::paths::NodePath;
@@ -23,9 +23,41 @@ pub async fn create_note(db: &Db, n: NewNote) -> Result<Node, StoreError> {
     db.write(move |tx| insert_note(tx, &n)).await
 }
 
+/// [`create_note`] с `Idempotency-Key` (`key`, [`super::idempotency`]): повтор того же запроса
+/// (пространство, путь, текст, L0) — тот же узел в текущем виде и `false`, а не `Conflict` «путь
+/// занят»; другой запрос с тем же ключом — `IdempotencyMismatch`, узел удалён — `Conflict`.
+/// Иначе — новый узел и `true`.
+pub async fn create_note_keyed(
+    db: &Db,
+    n: NewNote,
+    key: Option<String>,
+) -> Result<(Node, bool), StoreError> {
+    db.write(move |tx| {
+        let (space, l0) = (n.space_id.to_string(), opt_part(n.l0.as_deref()));
+        let parts: [&[u8]; 4] = [
+            space.as_bytes(),
+            n.path.as_str().as_bytes(),
+            n.content.as_bytes(),
+            &l0,
+        ];
+        let k = NodeKey::new(key, &n.attrib, NodeOp::Create, &parts)?;
+        if let Some(k) = &k
+            && let Some(node) = k.replay(tx)?
+        {
+            return Ok((node, false));
+        }
+        let node = insert_note(tx, &n)?;
+        if let Some(k) = &k {
+            k.remember(tx, node.id)?;
+        }
+        Ok((node, true))
+    })
+    .await
+}
+
 /// [`create_note`] внутри транзакции писателя (превращение выжимки кэша в заметку, §9.4).
 pub(crate) fn insert_note(tx: &Connection, n: &NewNote) -> Result<Node, StoreError> {
-    let now = fmt_ts(Timestamp::now());
+    let now = fmt_ts(crate::time::now());
     let kind = ensure_space(tx, n.space_id)?;
     ensure_free(tx, n.space_id, &n.path)?;
     let parent = ensure_ancestors(tx, n.space_id, &n.path, &now)?;
@@ -72,7 +104,7 @@ pub(crate) fn insert_note(tx: &Connection, n: &NewNote) -> Result<Node, StoreErr
 /// Создаёт папку и недостающих предков. Путь занят живым узлом → `Conflict`.
 pub async fn create_folder(db: &Db, space_id: Id, path: NodePath) -> Result<Node, StoreError> {
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         ensure_space(tx, space_id)?;
         ensure_free(tx, space_id, &path)?;
         let parent = ensure_ancestors(tx, space_id, &path, &now)?;

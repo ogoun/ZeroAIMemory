@@ -6,10 +6,10 @@
 локальной сети хранит знания в виде дерева Markdown-заметок. Агенты (Claude Code, Codex и
 другие) читают и пишут их через API по токену, человек — через встроенный WebUI.
 
-> **Статус: ранняя разработка.** Выпущены этапы M0–M5.6 (теги `v0.0.1-m0`, `v0.0.2-m1`,
-> `v0.0.3-m2`, `v0.0.4-m3`, `v0.0.5-m4`, `v0.0.6-m4.5`, `v0.0.7-m5`, `v0.0.8-m5.5`, `v0.0.9-m5.6`),
-> этап M5.7 «Идеи» готов в ветке `m5.7-ideas` (версия `0.0.10-m5.7`, тег — после слияния в `main` и
-> зелёного CI).
+> **Статус: ранняя разработка.** Выпущены этапы M0–M6 (теги `v0.0.1-m0`, `v0.0.2-m1`,
+> `v0.0.3-m2`, `v0.0.4-m3`, `v0.0.5-m4`, `v0.0.6-m4.5`, `v0.0.7-m5`, `v0.0.8-m5.5`, `v0.0.9-m5.6`,
+> `v0.0.10-m5.7`, `v0.0.11-m6`). В M6 «Экономия токенов» (2026-11-15) два условия приёмки не
+> выполнены — см. CHANGELOG, «Known limitations».
 > API и формат данных до версии 1.0 могут меняться. Ниже везде отмечено, что уже работает, а
 > что только запланировано.
 
@@ -62,9 +62,9 @@
 | **M5. Документы** | вложения DOCX, PPTX, XLSX, XLS, ODS, CSV, PDF: извлечение с `locator` в рабочем процессе с лимитами, поиск фрагментов, `/read` по `locator`, превью, просмотрщики WebUI, pdfium в комплектах, eval документов | выпущен, `v0.0.7-m5` |
 | **M5.5. Отчёты** | журнал решения «Отчёты»: агент пишет Markdown с картинками (`zam report`, MCP), пользователь читает в WebUI и выгружает в PDF; неизменяемость, удаление только владельцем, невидимость для агента, блок инструкции v4 | выпущен, `v0.0.8-m5.5` |
 | **M5.6. Карта кода** | встроенная карта кода решения: символы tree-sitter (Rust, TS/TSX, JS, Python, Go, Java, C#) на машине агента, на сервер — только метаданные; карта в бюджете токенов, поиск и карточка символа, влияние правки (`zam code`, MCP `memory_code`); ссылки памяти на символ `путь#Тип::метод` с устарелостью по телу символа; строка дайджеста, `### Код` субагенту, фоновая синхронизация из хуков; страница WebUI «Код»; блок инструкции v5 | выпущен, `0.0.9-m5.6` |
-| **M5.7. Идеи** | журнал «Идеи»: человек записывает замыслы (WebUI, MCP, `zam idea`), агент предлагает их к месту — раздел `### Идеи` первого старта сессии и подсказка к запросу — вопросом «начать / отложить / отказаться»; «начать» создаёт задачу со связью на идею; идеи «от агента» — только после «принять как свою»; выключатель `ideas.proactive`; блок инструкции v6 | готов, `0.0.10-m5.7` (ветка `m5.7-ideas`, тег — после слияния) |
-| M6. Экономия токенов | бюджеты и формат карточек по замерам, `promote` | запланирован (`0.0.11-m6`) |
-| M7. Полировка | экспорт и импорт, `doctor`, бэкап и восстановление, администрирование | запланирован |
+| **M5.7. Идеи** | журнал «Идеи»: человек записывает замыслы (WebUI, MCP, `zam idea`), агент предлагает их к месту — раздел `### Идеи` первого старта сессии и подсказка к запросу — вопросом «начать / отложить / отказаться»; «начать» создаёт задачу со связью на идею; идеи «от агента» — только после «принять как свою»; выключатель `ideas.proactive`; блок инструкции v6 | выпущен, `v0.0.10-m5.7` |
+| **M6. Экономия токенов** | карточки поиска v2 и честный бюджет в токенах bge-m3, фокусное чтение, «уже выдавалось» и эпохи сессии, привязка MCP к сессии (`zam mcp`), дайджест с правилами Rules сверх бюджета, пороги подсказок и бусты по сеткам, учёт выданного и страница «Сессии», снимок сессии из журнала агента, перенос памяти (`zam-server backup`/`restore`, `zam export`/`import`), `features` и `docs/api-compat.md` для своих клиентов, блок инструкции v7 | готов, `0.0.11-m6` (`v0.0.11-m6`) |
+| M7. Полировка | `doctor`, `rollback --to`, страница копий и импорт в WebUI, сборка мусора блобов, администрирование | запланирован |
 
 Что вошло в M2 (раздел `[0.0.3-m2]` в [CHANGELOG.md](CHANGELOG.md), итог и проверка
 критериев — [docs/journal.md](docs/journal.md)): чанкер §8.2, эмбеддер bge-m3 и реранкеры, супервизор
@@ -148,7 +148,27 @@ sync|status|map|sym|refs|impact` с инкрементальной синхро�
 (11-й инструмент), блок инструкции v5, страница WebUI «Код», `cargo xtask code-bench`, smoke карты
 в комплектах и e2e приёмки M5.6 (`crates/zam-server/tests/m56_acceptance.rs`,
 `crates/zam-cli/tests/m56_acceptance.rs`, `web/e2e/code.spec.ts`). Критерий «≥ 6 из 10 ключевых
-типов проекта среди центральных символов» не выполнен (1/10) — решение за владельцем.
+типов проекта среди центральных символов» не выполнен (1/10) — решение за владельцем (в M6 после
+правки ранжирования — 3/10, владелец принял как есть, способ счёта пересматривается в M7).
+
+Что вошло в M6 (раздел `[0.0.11-m6]` в [CHANGELOG.md](CHANGELOG.md), спецификация этапа —
+[docs/specs/2026-11-04-m6-token-economy.md](docs/specs/2026-11-04-m6-token-economy.md), перенесена в
+ТЗ v1.24; итог, замеры и решения — [журнал этапа](docs/plans/2026-11-04-m6-token-economy-log.md)):
+карточки поиска v2 (короткий хвост «оценка · ревизия · надёжность · дата UTC · размер») и бюджет
+ответа в токенах bge-m3 (`tokenizer.json` в комплекте сервера), фокусное чтение `focus` и
+дочитывание пропуска `range`, пометки «уже выдавалось» с эпохами сессии, привязка MCP к сессии
+агента через stdio `zam mcp`, дайджест старта по разделам с правилами Rules сверх бюджета, пороги
+подсказок, бусты вида и области и вес вложений — по сеткам eval, учёт выданного по сессиям
+(`zam sessions tokens`, страница WebUI «Сессии»), снимок сессии из журнала агента без LLM,
+перенос памяти (`zam-server backup`/`restore` с автокопиями, `zam export`/`import`, проверенный
+переезд Windows → Linux), возможности для своих клиентов (`features` в `/health`,
+[docs/api-compat.md](docs/api-compat.md), `session_id` в MCP, срок `timeout_ms` у `/recall`,
+`Idempotency-Key` у заметок), миграция 0025, блок инструкции v7, `LICENSES/` в архиве `zam` и
+упаковка без сети, замеры ТС-1 и ТС-2 и стенд агентного A/B (`cargo xtask ab`). Итог экономии —
+на вопросах агента на 11,2 % меньше токенов, чем у 0.0.5-m4 (`R` 0,888; цель −30 % не
+достигнута, полнота ответа в пределах допуска не подтверждена), расход сессии к 0.0.9-m5.6 —
+`R` 1,087–1,088 при допуске 1,15 (правила Rules и «Идеи»); подробно — CHANGELOG, «Known
+limitations».
 
 ## Возможности
 
@@ -217,7 +237,9 @@ sync|status|map|sym|refs|impact` с инкрементальной синхро�
 - **Хуки агента.** `zam hook session-start|prompt|pre-tool|post-tool|checkpoint` для Claude Code и
   Codex: дайджест на старте сессии, подсказки к запросу и к ошибке инструмента, локальная
   подсказка перед записью файла или командой (без сети, по кэшу триггеров), напоминание
-  записать итоги. Хук никогда не блокирует агента: при любой ошибке — тишина и код 0.
+  записать итоги, снимок сессии из журнала агента (M6: `Stop`, сжатие, `SessionEnd`, обрыв —
+  без LLM, с маскировкой секретов). Хук никогда не блокирует агента: при любой ошибке — тишина
+  и код 0.
 - **Экономия токенов.** Протокол «кэш → карточки → чтение пачкой → `cache_put`»: выжимка агента
   с источниками выдаётся первой в поиске и устаревает (`stale`) при изменении источника; в общем
   решении выжимки общие, с автором.
@@ -270,11 +292,14 @@ sync|status|map|sym|refs|impact` с инкрементальной синхро�
   Markdown вместе с картинками и файлами по относительным ссылкам (`![потери](figs/loss.png)`) и
   печатает ссылку на страницу; MCP — `memory_log kind=report` с картинками в base64. В WebUI —
   журнал решения «Отчёты»: лента с миниатюрами, фильтры, поиск, страница с формулами, Mermaid,
-  таблицами и кодом, «Скачать PDF» (печать браузера: A4, светлая тема, ждёт загрузки картинок и
+  таблицами и кодом, «PDF / печать» (печать браузера: A4, светлая тема, ждёт загрузки картинок и
   формул). Отчёт неизменяем (повтор — новый отчёт), удаляет его только владелец решения, агенту
-  он не виден — ни в поиске, ни в подсказках.
+  он не виден — ни в поиске, ни в подсказках. С M6 ссылки отчёта — только `http`, `https`,
+  `mailto`, `vscode` и `file` (`zam report` отклоняет прочие до отправки): ссылка на код
+  `vscode://file/<путь>:<строка>` открывается в VS Code, у неё и у `file:` — кнопка «копировать
+  путь».
 
-Добавлено в ветке M5.7, войдёт в следующий релиз (`0.0.10-m5.7`):
+Работает с `0.0.10-m5.7` (M5.7):
 
 - **Идеи.** `zam idea new "Экспорт отчётов в PDF" --priority high` (в WebUI — журнал «Идеи»)
   записывает замысел; агент получает до трёх идей решения в дайджесте первого старта сессии и
@@ -303,6 +328,43 @@ sync|status|map|sym|refs|impact` с инкрементальной синхро�
   субагенту, фоновая синхронизация из `session-start`/`checkpoint` (не чаще раза в 30 мин или при
   смене `HEAD`; тип подсказок `code_map`). В WebUI — пункт решения «Код»: состояние карты, поиск
   символа, таблица файлов, карточка, «Обзор» зависимостей Mermaid.
+
+Добавлено в M6 (`v0.0.11-m6`):
+
+- **Честный бюджет и короткие карточки.** Бюджеты ответов агенту (`budget_tokens`, строка
+  `~N tok`) считаются в токенах bge-m3 — и без модели: `tokenizer.json` лежит в комплекте сервера.
+  Карточка поиска — строка с коротким хвостом `[.82] r7 · th · 2026-10-10 14:03:22 · 340t`
+  (оценка, ревизия, надёжность, дата UTC, размер источника) и фрагмент под ней.
+- **Фокусное чтение — по явному запросу.** `memory_read {items: [{id, focus: "…"}]}` или `zam read
+  --focus "…"` отдаёт оглавление и ближайшие к запросу части длинной записи, пропуски помечены
+  адресом `[пропущено: range:r<rev>:S-E …]` — дочитать их можно `range` (`zam read --range`). По
+  умолчанию чтение по-прежнему целиком: фокус нужен длинным записям и дорогим моделям.
+- **«Уже выдавалось».** В пределах сессии повторное чтение отдаётся целиком с пометкой «уже
+  выдавалось в этой сессии», карточка поиска — с `(выдавалось)`; после сжатия контекста начинается
+  новая эпоха сессии, и пометки сбрасываются. MCP Claude Code подключается stdio-прокси `zam mcp`,
+  который сам находит сессию агента (привязку пишет хук `session-start`); свой клиент передаёт
+  сессию заголовком `X-Zam-Session` или аргументом `session_id`.
+- **Дайджест старта по разделам.** Правила Rules выдаются всегда и сверх бюджета дайджеста, затем
+  задачи, ответы человека и идеи, в остатке — окружение, словарь, карта кода (строкой-указателем),
+  ловушки, изменения строками-индексами; пороги подсказок, бусты вида и области и вес вложений
+  подобраны сетками eval.
+- **Учёт выданного.** `zam sessions tokens` и страница WebUI «Сессии»: сколько токенов память
+  выдала каждой сессии агента по событиям и доля повторных чтений; выданное без сессии — в общем
+  счётчике пользователя.
+- **Снимок сессии.** Хуки снимают из журнала агента (без LLM) хвост конспекта сжатия, последние
+  запросы, изменённые файлы и первую строку команд, маскируют секреты и хранят снимок на сервере
+  14 дней. Если сессия оборвалась, следующая получает его разделом «Последнее известное
+  состояние». Выключатель — `[hooks] session_snapshot = false` в `~/.zeroaimemory/config.toml`.
+- **Перенос памяти.** `zam-server backup` снимает согласованную копию без остановки сервера
+  (каталог или один zip, опись с SHA-256; автокопии — `[backup] schedule = "daily"`),
+  `zam-server restore` восстанавливает её на чистой машине любой из двух ОС, индекс Qdrant
+  пересобирается из кэша эмбеддингов. Одно пространство — `zam export` в zip с `.md` и
+  `zam import` на другом сервере (свой архив — `--own`); в WebUI — «Экспорт (.zip)» в меню
+  пространства. Пошагово — «Перенос на другую машину» в
+  [deploy/README-install.md](deploy/README-install.md).
+- **Свои клиенты.** `GET /api/v1/health` перечисляет возможности сборки в `features`; правило
+  совместимости `/api/v1` и все флаги — [docs/api-compat.md](docs/api-compat.md). Срок сбора
+  `/recall` — поле `timeout_ms`, повтор записи заметки без дубля — `Idempotency-Key`.
 
 ## Архитектура
 
@@ -362,7 +424,7 @@ flowchart LR
   models/<id>/                   # ONNX-модели (ml.models_dir), LICENSE и model.toml в каждой
   qdrant/                        # рабочий каталог управляемого Qdrant: config/zam.yaml, storage/, qdrant.pid
   previews/<user_id>/<sha256>/  # кэш превью документов (лист, миниатюра, текст; можно удалить)
-  backups/                       # зарезервирован: бэкапы (M7)
+  backups/                       # копии zam-server backup и автокопии (M6; [backup] dir — другой каталог)
   logs/
 ```
 
@@ -387,7 +449,7 @@ Linux через `PR_SET_PDEATHSIG`. При падении сервер пере
 | `zam-server-<ver>-<os>-x64-gpu` | то же с CUDA EP. Библиотек NVIDIA в нём нет, без GPU работает на CPU |
 | `zam-cuda-<ver>-<os>-x64` | библиотеки CUDA 13 и cuDNN 9 для GPU-комплекта, для машин без интернета |
 | `zam-models-<ver>-<id>.zip` | одна ONNX-модель (`bge-m3-int8`, `bge-m3-fp16`, `bge-reranker-v2-m3`), для машин без интернета |
-| `zam-<ver>-<os>-x64` | только CLI `zam` |
+| `zam-<ver>-<os>-x64` | только CLI `zam` (с M6 — вместе с `LICENSES/`: сводка лицензий его зависимостей) |
 
 `<os>` — `windows` (zip) или `linux` (tar.gz). В выпущенных `v0.0.1-m0` и `v0.0.2-m1`
 есть только комплекты `cpu` и архивы `zam`, а поиск в них полнотекстовый. Комплекты `gpu`,
@@ -430,10 +492,11 @@ zam status
 ```
 
 `zam init` создаёт `.zeroaimemory/solution.toml` (GUID решения: каталоги с одинаковым GUID на
-разных машинах делят одно решение), вставляет блок инструкции v2 в CLAUDE.md и/или AGENTS.md,
-сливает хуки в `.claude/settings.json` и `.codex/hooks.json` и сервер MCP в `.mcp.json`. Токена
-в файлах проекта нет: он хранится в `~/.zeroaimemory/config.toml`, а MCP берёт его из
-переменной `ZAM_TOKEN`. Подробно (Codex, ручная настройка, служба) —
+разных машинах делят одно решение), вставляет блок инструкции (v7) в CLAUDE.md и/или AGENTS.md,
+сливает хуки в `.claude/settings.json` и `.codex/hooks.json` и сервер MCP в `.mcp.json` (с M6 —
+stdio-прокси `zam mcp`). Токена в файлах проекта нет: он хранится в `~/.zeroaimemory/config.toml`,
+оттуда его берут `zam`, хуки и `zam mcp`; переменная `ZAM_TOKEN` нужна только MCP по HTTP.
+Подробно (Codex, ручная настройка, служба) —
 [deploy/README-install.md](deploy/README-install.md), раздел «Подключение агента (`zam init`)».
 
 ## Использование
@@ -452,7 +515,7 @@ zam status
 |---|---|
 | `zam status` | проверка сервера, токена, пользователя и `solution.toml` |
 | `zam tree [цель] [--depth 1..5]` | дерево с краткими сводками L0 |
-| `zam read <цель>… [--tier L0\|L1\|L2] [--section "A > B"] [--rev N]` | чтение Markdown как он сохранён; `--batch`, `--max-tokens N`, `--budget N`, `--if-rev N`, `--since-rev N` (дифф с ревизии, M4.5) — пачкой через `POST /read` с бюджетом токенов |
+| `zam read <цель>… [--tier L0\|L1\|L2\|focus] [--section "A > B"] [--rev N]` | чтение Markdown как он сохранён; `--batch`, `--max-tokens N`, `--budget N`, `--if-rev N`, `--since-rev N` (дифф с ревизии, M4.5), `--locator` (часть вложения, M5) — пачкой через `POST /read` с бюджетом токенов; `--focus "<запрос>"` (M6) — оглавление и ближайшие к запросу части, пропуски с адресом `range:r<rev>:S-E`; `--range r<rev>:S-E` (M6) — ровно пропущенный текст той ревизии |
 | `zam write <цель> [--file f.md] [-m сообщение] [--base-rev N] [--l0 текст]` | создать или заменить заметку (без `--file` текст читается из stdin) |
 | `zam history <цель> [--diff A..B \| --revert N]` | ревизии, дифф, откат |
 | `zam search <запрос> [--all] [--mode brief\|chunks\|notes] [--top-k N] [--rerank]` | поиск, по умолчанию Markdown-карточки; `--rerank` — серверный реранк |
@@ -461,6 +524,10 @@ zam status
 | `zam code sync [--full] [--prune] \| status \| map [--focus <путь\|имя>]… [--task T] [--tokens N] \| sym <имя\|путь#qual> \| refs <имя> \| impact [--since C]` | карта кода решения (M5.6): синхронизация рабочей копии, карта в бюджете, карточка символа, кто ссылается, влияние правки |
 | `zam idea list [--status S]… [--origin human\|agent] [--knowledge] \| new <заголовок> [--body T\|--file F] [--priority low\|normal\|high] [--horizon YYYY-MM-DD] [--tag X]… [--origin human\|agent] \| propose <w:id> [--text T] [--space <guid>] \| accept <w:id> [--by human\|agent] [--channel chat\|cli] [--space <guid>] \| defer\|decline <w:id> [--by human\|agent] [--channel chat\|cli]` | идеи (M5.7): лента, запись, предложение агентом, решение человека (`defer --until`, `decline --reason`); под агентом `--origin` и `--by` обязательны |
 | `zam cache put --query Q --sources ID[#секция][@rev],… [--promote note:<путь>\|insight:<вид>] < выжимка.md` | сохранить выжимку с источниками (печатает `c_<id>`); `zam cache list\|show\|rm` — список, карточка с изменившимися источниками, удаление |
+| `zam export [--space S] [--path P]… [--kind K]… [--no-history] -o <файл.zip>` | экспорт пространства (M6): архив zip — заметки `.md` с frontmatter, вложения, записи журналов, связи, история; без Vault, карты кода, корзины и сессий; токен — без Human и отчётов. Загрузка идёт в `<файл>.<pid>.part` (после убитого процесса его можно удалить); сервер молчит дольше `ZAM_EXPORT_IDLE_SECS` (300 с) — код 2. В WebUI — пункт «Экспорт (.zip)» в меню пространства |
+| `zam import <файл.zip\|каталог> [--space S] [--own] [--on-conflict skip\|revision] [--axioms demote\|keep] [--dry-run]` | импорт пространства (M6): архив `zam export` или каталог `.md` (без `manifest.json` — все `*.md` заметки, архив чужой). Свой архив (тот же пользователь или `--own` при переезде) — id и аксиомы как есть; чужой — новые id, ссылки переписаны, аксиомы → `theorem` (`--axioms keep` — как есть). Повтор того же архива пропускается, изменившееся — в отчёт конфликтов (`--on-conflict revision` — новая ревизия). Только владелец пространства или администратор; отчёты — только из сессии WebUI; предел — `import.max_bytes` (2 ГиБ). Сервер принимает архив и выполняет импорт заданием; `zam` опрашивает его и печатает этап, Ctrl+C прекращает только ожидание; каталог упаковывается на лету, скрытые пути не переносятся |
+| `zam sessions tokens [<id> \| --last N] [--by-holdout] [--json]` | выданное сессиям агента (M6): таблица «событие · вызовов · токенов · уже выдавалось» (Rules — строкой `rules`) и доля повторных чтений; без id — сессия агента или последняя; `--by-holdout` — отдельно контрольная группа A/B; та же сводка — на странице «Сессии» WebUI |
+| `zam session snapshot --transcript <файл> [--format claude\|codex] [--session <id>] [--json]` | снимок сессии из журнала агента вручную (M6): последние запросы, изменённые файлы, команды и хвост конспекта — после маскировки секретов; сессия — `--session`, `ZAM_SESSION_ID` или id из журнала (нет ни одного — код 1); сессии нет на сервере — регистрируется. Хуки снимают сами (`checkpoint`, `session-start`; выключатель `[hooks] session_snapshot`) |
 
 ```
 echo "# Bash-скрипты" | zam write "knowledge:Инструменты/Bash" -m "первая версия"
@@ -479,7 +546,8 @@ zam read "knowledge:Инструменты/Bash" --section "Установка >
 команды агента (`zam init`, `guide`, `mcp`, `hook …`, `triggers sync`, `cache`,
 `solution rename`) — с M4, рабочей памяти (`zam log term`, `glossary`, `task`, `question`,
 `refs check|verify`, `links file:`, `vault add`, `hook subagent-start`) — с M4.5, `zam report` — с
-M5.5, `zam code` — с M5.6; см.
+M5.5, `zam code` — с M5.6, `zam idea` — с M5.7, `zam export`, `import`, `sessions tokens|snapshot`
+(`zam session …` — то же) и `zam read --focus|--range` — с M6; см.
 [deploy/README-install.md](deploy/README-install.md). Хуки
 (`zam hook …`) всегда выходят с кодом 0.
 
@@ -493,8 +561,14 @@ M5.5, `zam code` — с M5.6; см.
 доступ, журналы, insights и триггеры, vault и граф, а с M4 — сессии, `POST /read`, кэш выжимок,
 `/recall`, `/agent-setup`, `/downloads`, вход пользователей и `/mcp`, с M4.5 — словарь,
 задачи (`claim`/`release`), ответы на вопросы, ссылки на файлы (`/files/changed`,
-`/files/verified`, `/file-refs`), `/recall` `recovery` и `brief`. Экспорт и импорт пока не
-сделаны.
+`/files/verified`, `/file-refs`), `/recall` `recovery` и `brief`, с M5–M5.7 — вложения-документы,
+отчёты, карта кода `/code/*` и идеи, а с M6 — экспорт и импорт пространства
+(`GET /spaces/{space}/export`, `POST /spaces/{space}/import`), снимок сессии
+(`PUT|GET /sessions/{id}/snapshot`), выданное без сессии (`GET /sessions/unattributed`), эпоха и
+контрольная группа сессии (`POST /sessions {new_epoch, holdout}`), поле `timeout_ms` у `/recall`,
+`Idempotency-Key` у `POST /nodes`, `PUT` и `PATCH /nodes/{id}`. Что умеет конкретный сервер —
+список `features` в `GET /api/v1/health`; что сервер обещает не ломать и как клиенту узнавать
+возможности — [docs/api-compat.md](docs/api-compat.md).
 
 ```
 curl -s -X POST http://<хост>:7700/api/v1/search \
@@ -514,6 +588,8 @@ curl -s -X POST http://<хост>:7700/api/v1/search \
 | `qdrant fetch\|status\|reset` | бинарник, состояние и сброс хранилища управляемого Qdrant (M2) |
 | `reindex [--user] [--space] [--full]` | пересборка векторного индекса на остановленном сервере (M2) |
 | `service install\|uninstall\|start\|stop\|status\|run` | режим службы: Windows SCM или systemd (M4) |
+| `backup [--dir D \| --zip F] [--json]` | копия сервера без остановки (M6): базы, блобы и опись `manifest.json` с SHA-256 в `<data_dir>/backups/<yyyy-MM-dd_HHmmss>/` (или `[backup] dir`, `--dir`) либо одним zip; мастер-ключ Vault в копию не входит — сохраните его отдельно |
+| `restore <каталог\|архив.zip> [--replace] [--no-reindex]` | восстановление копии на остановленном сервере в пустой каталог данных (M6): суммы и версии схем проверяются до записи; `--replace` переносит прежние данные в `backups/pre-restore-…`; индекс Qdrant пересобирается из кэша эмбеддингов |
 
 ### MCP
 
@@ -522,7 +598,13 @@ curl -s -X POST http://<хост>:7700/api/v1/search \
 `memory_update_entry`, `memory_link`, `memory_recall`, `memory_vault`; с M5.6 — `memory_code`,
 карта кода: `map`, `symbol`, `refs`, `impact`; ТЗ §13.1). Ответы —
 компактный Markdown с последней строкой `~N tok`. Для агентов без HTTP-транспорта MCP — `zam mcp`
-(stdio). Фрагмент `.mcp.json` пишет `zam init` или даёт «Подключение агента».
+(stdio). Фрагмент `.mcp.json` пишет `zam init` или даёт «Подключение агента»; с M6 это stdio
+`zam mcp`: он находит сессию агента по привязке хука `session-start`, поэтому работают пометки
+«уже выдавалось» и учёт токенов по сессии. Прежний HTTP-фрагмент работает без сессии. Свой
+клиент передаёт сессию заголовком `X-Zam-Session` или аргументом `session_id` у `memory_search`,
+`memory_read` и `memory_recall` (оба заданы и различаются — ошибка 400), срок сбора подсказок —
+`timeout_ms` у `memory_recall`, повтор записи без дубля — `idempotency_key` у `memory_write` и
+`memory_log` ([docs/api-compat.md](docs/api-compat.md)).
 
 ## Требования к системе
 
@@ -568,9 +650,18 @@ runtime ищется через vswhere или задаётся в `ZAM_VC_CRT_D
 cargo xtask fetch-deps --platform windows-x64      # Qdrant, ONNX Runtime CPU и GPU, pdfium → target/deps/
 cargo xtask fetch-models --test                    # тестовая модель MiniLM → target/models/
 cargo test --workspace
-cargo build --release -p zam-server -p zam-cli
+cargo build --release -p zam-server
+cargo build --release -p zam-cli                   # отдельной командой, см. ниже
 ```
 
+- `zam` для выпуска собирается отдельной командой: в одной команде с `zam-server` cargo
+  объединяет фичи общих крейтов, и в `zam` попадают зависимости сервера, которых нет в сводке
+  лицензий архива клиента (тест `release_cli_is_built_separately` в `xtask`).
+- Упаковке (`cargo xtask package`) нужен cargo-about ровно 0.9.2
+  (`cargo install cargo-about@0.9.2 --locked --features cli`), другая версия — ошибка. С M6
+  упаковка проходит без сети, если реестр cargo, кэш npm, `web/dist`, `target/deps` и
+  `tokenizer.json` уже получены: уточнённые тексты лицензий лежат в `deploy/licenses/`
+  (`clarify.files` в `about.toml`), их SHA-256 и строки авторских прав в сводке проверяются.
 - Тесты ML и индекса пропускаются, если нет ONNX Runtime или модели. С `ZAM_REQUIRE_ML=1`
   (так в CI) они вместо этого падают.
 - Интеграционные тесты запускают настоящий Qdrant из `target/deps`, Docker не нужен.
@@ -588,10 +679,12 @@ cargo build --release -p zam-server -p zam-cli
 | `smoke --archive … [--cuda-archive …] [--expect-device cpu\|cuda]` | smoke-тест комплекта: запуск, API, `zam`, Qdrant, векторный поиск на тестовой модели; документы — pdfium комплекта грузится рабочим процессом, PDF и DOCX находятся по фрагменту с `locator` и читаются по нему, превью листа XLSX и миниатюра PDF |
 | `smoke-cuda --archive …` | проверка архива `zam-cuda`: штампы, состав, формат библиотек, лицензии |
 | `changelog-section <версия>` | раздел версии из `CHANGELOG.md` для текста релиза |
-| `eval [--device cpu\|cuda] [--mode fts\|hybrid\|hybrid+rerank]… [--quality-gate] [--grid FILE] [--check]` | качество поиска на наборе `eval/`: recall@5, MRR@10, nDCG@10, гейт int8 против fp32, подбор весов и чанкинга; `--docs` — eval вложений на `eval/docs/` (recall@5, точность `locator`, `--compare A --compare B` — парные разности) |
+| `eval [--device cpu\|cuda] [--mode fts\|hybrid\|hybrid+rerank]… [--quality-gate] [--grid FILE] [--check]` | качество поиска на наборе `eval/`: recall@5, MRR@10, nDCG@10, гейт int8 против fp32, подбор весов и чанкинга; `--docs` — eval вложений на `eval/docs/` (recall@5, точность `locator`, `--compare A --compare B` — парные разности); `--hints` — подсказки хуков (M4); с M6 — `--tokens --via mcp` (расход токенов на наборе вопросов ТС-1), `--sessions` (сессии ТС-2), `--grid` у подсказок и сессий, `--split dev\|holdout`; методика — [eval/README.md](eval/README.md) |
 | `docs-corpus` | набор документов `eval/docs/` детерминированно из сида (DOCX, XLSX, PPTX, PDF, враждебные файлы; в git не кладётся) |
 | `code-bench [--repo <путь>]` | замеры карты кода (M5.6) на копии `HEAD` репозитория: первая и повторная `zam code sync`, правка и удаление файла, вторая копия, `GET /code/map` 200–2000 токенов, ключевые типы среди центральных, `zam --version` и запуск фоновой синхронизации p95 → `.tmp/m56/bench/report.json` |
 | `bench --profile cpu\|gpu [--notes N] [--phase …]… [--keep] [--reuse]` | замеры целей §17 ТЗ на корпусе eval с копиями до 10 000 заметок: поиск при пустой и полной очереди, FTS-only, реранк, индексация, запись, reindex, RSS, старт, падение Qdrant |
+| `ab --transcripts D --runs eval/ab/runs.toml [--server URL] [--out F] [--allow-missing]` | агентный A/B (M6): отчёт по плечам с интервалами из журналов агента (только поля `usage`) и `GET /sessions/{id}` сервера; методика — [eval/README.md](eval/README.md), «Агентный A/B» |
+| `transfer-check seed\|verify\|bindings` | проверка переезда на другую машину (M6): корпус и ожидания на старом сервере, те же данные на новом после `restore` (`--no-key` — без мастер-ключа), базы без прежнего каталога данных и имени машины |
 
 ```
 cargo xtask package --platform windows-x64 --flavor cpu --version 0.0.0-dev   # → target/dist/
@@ -669,6 +762,7 @@ crates/
   zam-core/        # идентификаторы (UUIDv7, Crockford base32), токены
   zam-store/       # SQLite: миграции, узлы, ревизии, FTS5, вложения, эмбеддинги, очередь индексации
   zam-markdown/    # comrak: разбор с позициями, секции, PATCH-splice, рендер HTML, чанкер, предложения, L0/L1
+  zam-secrets/     # сканер и маскировщик секретов §7.6 (только regex; реэкспорт zam_markdown::secrets)
   zam-docs/        # документы: sniff, извлечение DOCX/PPTX/XLSX/XLS/ODS/CSV/PDF/текста с лимитами, превью листа, миниатюры, locator
   zam-ml/          # ONNX Runtime: устройство CPU/CUDA, токенизатор, эмбеддер bge-m3, реранкер
   zam-index/       # VectorIndex и адаптер Qdrant, супервизор процесса Qdrant, воркер, reindex
@@ -677,7 +771,7 @@ crates/
   zam-server/      # axum: REST API, auth, WebUI, команды сервера
   zam-cli/         # клиент zam
 web/               # WebUI (Svelte 5 + Vite), e2e на Playwright
-xtask/             # cargo xtask: fetch-deps, fetch-models, package, smoke, smoke-cuda, eval, docs-corpus, bench
+xtask/             # cargo xtask: fetch-deps, fetch-models, package, smoke, smoke-cuda, eval, docs-corpus, bench, code-bench, ab, transfer-check
 eval/              # набор eval: корпус, запросы, сетки, результаты (eval/README.md)
 tools/             # вспомогательные скрипты (квантование bge-m3 для гейта качества)
 deploy/            # манифесты зависимостей и моделей, пример конфига, systemd, лицензии, README-install.md
@@ -712,9 +806,10 @@ docs/              # ТЗ, планы, исследования, журнал р
 
 | Документ | Что там |
 |---|---|
-| [docs/specs/2026-10-17-zeroaimemory-tz.md](docs/specs/2026-10-17-zeroaimemory-tz.md) | техническое задание (v1.3): цели, архитектура, модель данных, поиск, API, этапы |
-| [deploy/README-install.md](deploy/README-install.md) | установка и эксплуатация: первый запуск, CLI, Qdrant, модели, GPU, reindex, прокси, обновление |
-| [docs/plans/](docs/plans/) | планы реализации этапов (M0, M1, M2) и журналы их выполнения |
+| [docs/specs/2026-10-17-zeroaimemory-tz.md](docs/specs/2026-10-17-zeroaimemory-tz.md) | техническое задание (v1.24): цели, архитектура, модель данных, поиск, API, этапы |
+| [deploy/README-install.md](deploy/README-install.md) | установка и эксплуатация: первый запуск, подключение агента, CLI, Qdrant, модели, GPU, reindex, прокси, перенос на другую машину, обновление и откат |
+| [docs/api-compat.md](docs/api-compat.md) | для своих клиентов: правило совместимости `/api/v1`, флаги `features`, явная сессия, `timeout_ms`, `Idempotency-Key` |
+| [docs/plans/](docs/plans/) | планы реализации этапов (M0–M6) и журналы их выполнения |
 | [docs/research/](docs/research/) | исследования: аналоги, MD-движки, стек, аудит библиотек, индекс и ML |
 | [docs/journal.md](docs/journal.md) | журнал работ: решения, прогоны, замеры |
 | [CHANGELOG.md](CHANGELOG.md) | изменения по версиям |
@@ -739,9 +834,11 @@ docs/              # ТЗ, планы, исследования, журнал р
   входят в `THIRD-PARTY-NOTICES.txt` бандла WebUI.
 - Карта кода (M5.6): в `zam` встроены рантайм tree-sitter и грамматики Rust, TypeScript,
   JavaScript, Python, Go, Java, C# — MIT; их тексты — в `THIRD-PARTY-RUST.html` комплекта
-  `zam-server` (у TypeScript и Java — из репозитория на коммите пакета, `about.toml`), собственные
-  запросы тегов — `TREE-SITTER-QUERIES-MIT.txt`. Архив только CLI (`zam-*.zip`) уведомлений
-  сторонних лицензий пока не содержит — вопрос владельцу в журнале этапа.
+  `zam-server` (у TypeScript и Java — тексты из репозитория грамматики на коммите пакета; с M6
+  они лежат в `deploy/licenses/tree-sitter-{typescript,java}.LICENSE`, и упаковка не ходит за ними
+  в сеть), собственные запросы тегов — `TREE-SITTER-QUERIES-MIT.txt`. С M6 архив только CLI
+  (`zam-<версия>-<os>-x64`) содержит свой `LICENSES/`: сводку cargo-about по зависимостям одного
+  `zam` (`THIRD-PARTY-RUST.html`) и `TREE-SITTER-QUERIES-MIT.txt`.
 - MSVC runtime в комплекте Windows распространяется на условиях Microsoft
   (`MSVC-RUNTIME-NOTICE.txt`).
 - Библиотеки NVIDIA CUDA и cuDNN входят только в архив `zam-cuda` (или ставятся

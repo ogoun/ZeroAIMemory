@@ -1,0 +1,24 @@
+# Метки прогонов агентного A/B (спецификация M6 §12, задача 12) — заполняет владелец после
+# прогонов по eval/ab/tasks.toml; инструкция — eval/README.md, «Агентный A/B». Отчёт:
+#
+#   cargo xtask ab --transcripts <каталог журналов агента> --runs eval/ab/runs.toml \
+#       --server <адрес сервера> --out eval/results/<дата>-m6-ab.json
+#
+# Одна запись — один прогон задачи в плече:
+#   task    — id из eval/ab/tasks.toml;
+#   arm     — плечо (memory | off | map | nomap | impact | noimpact);
+#   rep     — номер повтора (1, 2, …); пара (task, arm, rep) уникальна;
+#   session — id сессии агента (Claude Code: имя файла журнала `<id>.jsonl` и `session_id`
+#             хуков; Codex: `session_meta.payload.id` журнала rollout);
+#   outcome — pass | fail по проверке задачи (`check` и `expect`);
+#   note    — необязательная заметка (в отчёт не идёт).
+#
+# Сравнения — `[[compare]] base = "off", arm = "memory"`; без них — известные пары плеч §12.
+#
+# Пример:
+# [[run]]
+# task = "t01"
+# arm = "memory"
+# rep = 1
+# session = "01J…"
+# outcome = "pass"

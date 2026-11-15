@@ -2,7 +2,7 @@
   // «Подключение агента» (§15.5): готовый текст для CLAUDE.md / AGENTS.md и фрагменты
   // настроек по `GET /agent-setup`. Администратор выбирает любого пользователя, пользователь —
   // только себя. Токен можно выпустить тут же: его открытый текст попадает только в команды
-  // установки и `zam init` (в блоке и `.mcp.json` — `${ZAM_TOKEN}`) и только в браузере —
+  // установки и `zam init` (в блоке и `.mcp.json` его нет: MCP — stdio `zam mcp`, M6) и только в браузере —
   // вместо заглушки сервера `'<токен>'`, серверу в адресе он не уходит. Страница открывается
   // сразу после создания пользователя или выпуска токена (lib/agentSetup.ts). Здесь же —
   // типы подсказок хуков пользователя на сервере (`hooks.<тип>`, §10.3, R5) и проактивность идей
@@ -266,9 +266,11 @@
 <section class="panel setup">
   <h2>Подключение агента</h2>
   <p class="muted small">
-    Готовый блок инструкции и фрагменты настроек. Токена в блоке и в <code>.mcp.json</code> нет: агент
-    берёт его из <code>ZAM_TOKEN</code> или из <code>~/.zeroaimemory/config.toml</code> (пишет
-    <code>zam init --token</code>). Однострочник <code>zam init</code> делает всё сам.
+    Готовый блок инструкции и фрагменты настроек. Токена в блоке и в <code>.mcp.json</code> нет: MCP
+    подключается через <code>zam mcp</code>, а он, как <code>zam</code> и хуки, берёт токен из
+    <code>~/.zeroaimemory/config.toml</code> (пишет <code>zam init --token</code>) или <code>ZAM_TOKEN</code>.
+    Однострочник <code>zam init</code> делает всё сам. Старый <code>.mcp.json</code> с HTTP работает, но без
+    учёта сессии — пересоздайте его через <code>zam init</code> или фрагмент ниже.
   </p>
 
   <div class="form" role="group" aria-label="Параметры подключения">
@@ -420,11 +422,30 @@
   {:else if !flagsError}
     <p class="muted">Загрузка…</p>
   {/if}
+  <section class="snapshot-keys" aria-label="Снимок сессии">
+    <h3>Снимок сессии</h3>
+    <p class="muted small">
+      Хуки снимают из журнала агента (без LLM) хвост конспекта сжатия, последние запросы, изменённые
+      файлы и команды — на событиях <code>PreCompact</code>, <code>PostCompact</code>,
+      <code>SessionStart</code> (compact), <code>Stop</code> и <code>SessionEnd</code>; секреты
+      маскируются. Снимок оборванной сессии приходит следующей сессии разделом «Последнее известное
+      состояние». Ключи клиента — в <code>[hooks]</code> файла <code>config.toml</code>:
+      <code>hooks.session_snapshot</code> (вкл.; выкл. — журнал агента не открывается),
+      <code>snapshot_tail_kb</code> (2048 — КиБ хвоста журнала), <code>snapshot_ms</code> (25 — срок
+      сборки, 5–50 мс). Сервер: <code>recall.snapshot_tokens</code> (400; 0 — не показывать),
+      <code>[snapshot] keep_days</code> (14). Снимок виден на странице «Сессии».
+    </p>
+  </section>
 </section>
 
 <TokenShown bind:shown />
 
 <style>
+  .snapshot-keys h3 {
+    margin: 12px 0 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
   .setup h3 {
     margin: 0;
     font-size: 14px;

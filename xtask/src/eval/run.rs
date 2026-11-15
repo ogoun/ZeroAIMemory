@@ -52,7 +52,7 @@ use super::metrics::{
 };
 use super::report;
 use super::{Device, EvalArgs, Mode, Paths};
-use crate::smoke::{Server, SmokeEnv, api, api_timeout, wait_health_for};
+use crate::smoke::{Server, SmokeEnv, api, api_with, wait_health_for};
 
 /// Ожидание `/health` после старта (загрузка модели с HDD, sha256 файла модели).
 const HEALTH_WAIT: Duration = Duration::from_secs(300);
@@ -99,7 +99,7 @@ pub fn parse_sets(raw: &[String]) -> Result<Vec<(String, String)>> {
 }
 
 /// `search.w_fts` → `ZAM_SEARCH__W_FTS`.
-fn env_key(k: &str) -> String {
+pub fn env_key(k: &str) -> String {
     format!("ZAM_{}", k.replace('.', "__").to_ascii_uppercase())
 }
 
@@ -218,6 +218,21 @@ pub fn build_server(repo: &Path, server_bin: Option<&Path>) -> Result<PathBuf> {
     Ok(exe.parent().context("каталог zam-server")?.to_path_buf())
 }
 
+/// Соседние попадания с **равным** баллом — по пути (M6, задача 1a2, ревью I-1): порядок равных
+/// сервер берёт по случайному id записи, у каждой загрузки свой, и метрики двух прогонов одного
+/// поведения различались бы. Порядок разных баллов не меняется.
+pub fn order_ties(hits: &mut [Hit]) {
+    let mut i = 0;
+    while i < hits.len() {
+        let mut j = i + 1;
+        while j < hits.len() && hits[j].score == hits[i].score {
+            j += 1;
+        }
+        hits[i..j].sort_by(|a, b| a.path.cmp(&b.path));
+        i = j;
+    }
+}
+
 /// Запущенный сервер прогона.
 pub struct Session {
     srv: Server,
@@ -236,6 +251,13 @@ pub struct Session {
     entry_keys: BTreeMap<String, String>,
     /// id узла → путь заметки корпуса (ссылки `n:<id>` ответов `format: md`, eval M4).
     node_paths: BTreeMap<String, String>,
+    /// Заметки с областью (M6 §11), которые [`Session::wait_indexed`] проверяет поиском с
+    /// `scope.area`: сервер не отдаёт область узла в ответах узлов.
+    area_probes: Vec<(Note, String)>,
+    /// Сервер умеет связь `contradicts` (M4.5; у B4 — нет, [`Session::without_contradicts`]).
+    contradicts: bool,
+    /// Пары `contradicts` (ключ insight → ключ цели), не созданные загрузчиком.
+    skipped_edges: Vec<(String, String)>,
 }
 
 /// Сообщение журнала сервера с действующими `[search]` и `[index]`.
@@ -403,7 +425,47 @@ impl Session {
             loaded_at: None,
             entry_keys,
             node_paths,
+            area_probes: Vec::new(),
+            contradicts: true,
+            skipped_edges: Vec::new(),
         })
+    }
+
+    /// Корпус целиком **до старта индексатора** (M6, ревью задачи 1a2, I-1): сервер без моделей
+    /// принимает записи (FTS — в транзакции, векторные задания копятся в очереди), затем
+    /// перезапуск на том же каталоге с моделью `spec` — индексатор получает всю очередь сразу, и
+    /// состав пачек эмбеддера не зависит от темпа загрузки. Время индексации — от перезапуска.
+    pub fn start_preloaded(
+        p: &Paths,
+        spec: &RunSpec,
+        server: &Path,
+        corpus: &Corpus,
+    ) -> Result<Session> {
+        let fts = RunSpec {
+            model: None,
+            device: Device::Cpu,
+            reranker: None,
+            ..spec.clone()
+        };
+        let mut s0 = Session::start(p, &fts, server, true)?;
+        s0.load_corpus(corpus)?;
+        let probes = std::mem::take(&mut s0.area_probes);
+        s0.stop()?;
+        let mut s = Session::start(p, spec, server, false)?;
+        s.area_probes = probes;
+        s.begin_load();
+        Ok(s)
+    }
+
+    /// Загрузчик не создаёт связи `contradicts`: у сервера их нет (B4, `v0.0.5-m4`; спецификация
+    /// M6 §3.3 — цель, которую старый сервер не умеет, исключается из всех плеч).
+    pub fn without_contradicts(&mut self) {
+        self.contradicts = false;
+    }
+
+    /// Пары `contradicts` (ключ insight → ключ цели), которые загрузчик не создал.
+    pub fn skipped_edges(&self) -> &[(String, String)] {
+        &self.skipped_edges
     }
 
     pub(super) fn api(&self, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
@@ -473,13 +535,11 @@ impl Session {
             bail!("POST /solutions: HTTP {st}: {v}");
         }
         for n in corpus.notes.values() {
-            let body = json!({
-                "space": note_space(&n.path),
-                "path": n.path,
-                "kind": "note",
-                "content": n.text,
-            });
-            let (st, v) = self.api("/api/v1/nodes", Some(&body))?;
+            let area = corpus.areas.get(&n.path).map(String::as_str);
+            let (st, v) = note_request(&self.base, &self.token, n, area)?;
+            if let Some(a) = area {
+                self.area_probes.push((n.clone(), a.to_string()));
+            }
             if st != 201 {
                 bail!("POST /nodes {}: HTTP {st}: {v}", n.path);
             }
@@ -525,7 +585,7 @@ impl Session {
                 if code == 200 && v["degraded"] == false && v["pending_count"] == 0 {
                     self.index_secs = t0.elapsed().as_secs_f64();
                     self.status = s;
-                    return Ok(());
+                    return self.verify_areas();
                 }
             }
             if t0.elapsed() > INDEX_WAIT {
@@ -547,6 +607,19 @@ impl Session {
             }
             thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    /// Области заметок корпуса дошли до сервера (M6 §11): каждая заметка с областью находится
+    /// своим заголовком при фильтре `scope.area` (у всех баз `caps::RELEASES` — с M3).
+    fn verify_areas(&mut self) -> Result<()> {
+        for (n, a) in std::mem::take(&mut self.area_probes) {
+            let (st, v) = self.api("/api/v1/search", Some(&area_probe_body(&n, &a)))?;
+            if st != 200 {
+                bail!("проверка области {}: HTTP {st}: {v}", n.path);
+            }
+            check_area_probe(&n.path, &a, &self.hits(&v))?;
+        }
+        Ok(())
     }
 
     /// Проверяет модель и устройство по `/index/status` (только с моделью).
@@ -587,13 +660,7 @@ impl Session {
     /// `POST /search` с проверками режима (деградация, реранк); ответ и время на клиенте, мс.
     fn search(&self, q: &Query, mode: Mode, body: &Value) -> Result<(Value, f64)> {
         let t0 = Instant::now();
-        let (st, v) = api_timeout(
-            &self.base,
-            &self.token,
-            "/api/v1/search",
-            Some(body),
-            SEARCH_TIMEOUT,
-        )?;
+        let (st, v) = search_request(&self.base, &self.token, q, body)?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if st != 200 {
             bail!("запрос {}: HTTP {st}: {v}", q.id);
@@ -627,6 +694,13 @@ impl Session {
     /// Элементы выдачи: путь заметки или `insight:<key>` записи набора (чужая запись —
     /// `entry:<id>`).
     fn hits(&self, v: &Value) -> Vec<Hit> {
+        let mut hits = self.raw_hits(v);
+        order_ties(&mut hits);
+        hits
+    }
+
+    /// Попадания ответа поиска в порядке сервера.
+    fn raw_hits(&self, v: &Value) -> Vec<Hit> {
         v["items"]
             .as_array()
             .map(|a| {
@@ -732,6 +806,80 @@ impl Session {
     pub fn kill(mut self) -> Result<()> {
         self.srv.kill()
     }
+}
+
+/// `POST /search` запроса набора: область запроса (`area`, M6 §11) — заголовком `X-Zam-Area`.
+pub fn search_request(base: &str, token: &str, q: &Query, body: &Value) -> Result<(u16, Value)> {
+    let headers: Vec<(&str, &str)> = q.area.iter().map(|a| ("X-Zam-Area", a.as_str())).collect();
+    api_with(
+        base,
+        token,
+        "/api/v1/search",
+        Some(body),
+        &headers,
+        SEARCH_TIMEOUT,
+    )
+}
+
+/// Область записи в ответе сервера совпадает с областью набора (`None` — без области). Ответ без
+/// поля `area` (сервер без областей) не проверяется.
+pub fn check_entry_area(key: &str, want: Option<&str>, entry: &Value) -> Result<()> {
+    let Some(got) = entry.get("area") else {
+        return Ok(());
+    };
+    if got.as_str() != want {
+        bail!("insight {key}: область в ответе сервера {got}, в наборе {want:?}");
+    }
+    Ok(())
+}
+
+/// Тело поиска проверки области заметки: её заголовок H1 (или путь) при `scope.area`.
+pub fn area_probe_body(n: &Note, area: &str) -> Value {
+    let title = n
+        .text
+        .lines()
+        .find_map(|l| l.strip_prefix("# "))
+        .map(str::trim)
+        .unwrap_or(&n.path);
+    json!({
+        "query": title,
+        "mode": "notes",
+        "top_k": TOP_K,
+        "scope": { "solution": EVAL_SOLUTION, "include_rules": false, "area": area },
+        "rerank": "off",
+    })
+}
+
+/// Заметка `path` нашлась в первых [`TOP_K`] поиска с фильтром области `area`.
+pub fn check_area_probe(path: &str, area: &str, hits: &[Hit]) -> Result<()> {
+    if !hits.iter().any(|h| h.path == path) {
+        bail!(
+            "заметка {path}: не найдена своим заголовком с scope.area = {area} — область не \
+             дошла до сервера (X-Zam-Area при POST /nodes)"
+        );
+    }
+    Ok(())
+}
+
+/// `POST /nodes` заметки корпуса: группа `e` — в решение набора, остальные — в Knowledge;
+/// область (`areas.toml`, M6 §11) — заголовком `X-Zam-Area` (сервер берёт область заметки из
+/// него, ТЗ §11.2).
+pub fn note_request(base: &str, token: &str, n: &Note, area: Option<&str>) -> Result<(u16, Value)> {
+    let body = json!({
+        "space": note_space(&n.path),
+        "path": n.path,
+        "kind": "note",
+        "content": n.text,
+    });
+    let headers: Vec<(&str, &str)> = area.iter().map(|a| ("X-Zam-Area", *a)).collect();
+    api_with(
+        base,
+        token,
+        "/api/v1/nodes",
+        Some(&body),
+        &headers,
+        Duration::from_secs(10),
+    )
 }
 
 /// Пространство заметки при загрузке: группа `e` — решение набора, остальное — Knowledge.
@@ -1045,6 +1193,16 @@ pub fn today() -> String {
     jiff::Zoned::now().strftime("%Y-%m-%d").to_string()
 }
 
+/// Сутки UTC (`yyyy-MM-dd`): окна дайджеста сервера (ответы, решения, горизонты идей) считаются
+/// от них, и сравнение ТС-2 сверяет именно их (задача 8c: локальная дата `today` у UTC+3 после
+/// полуночи разошлась с сутками UTC прогона).
+pub fn today_utc() -> String {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .strftime("%Y-%m-%d")
+        .to_string()
+}
+
 /// Модель и устройство по умолчанию для `--device`.
 pub fn default_model(device: Device) -> &'static str {
     match device {
@@ -1151,13 +1309,23 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
         keep_cuda_path: a.keep_cuda_path,
         ctrl_break: false,
     };
-    let mut s = Session::start(p, &spec, &server, !a.reuse)?;
+    let mut s = if a.preload {
+        Session::start_preloaded(p, &spec, &server, corpus)?
+    } else {
+        Session::start(p, &spec, &server, !a.reuse)?
+    };
     s.check_model()?;
     println!(
         "сервер {}: модель {}, устройство {}",
         s.base, s.status["model"]["id"], s.status["device"]
     );
-    if !a.reuse {
+    if a.preload {
+        println!(
+            "корпус загружен до старта индексатора: {} заметок и {} insight",
+            corpus.notes.len(),
+            corpus.insights.len()
+        );
+    } else if !a.reuse {
         let t0 = Instant::now();
         s.load_corpus(corpus)?;
         println!(
@@ -1282,9 +1450,48 @@ pub fn queries_fingerprint(queries: &[Query]) -> String {
     super::corpus::fnv1a(text.into_bytes())
 }
 
+/// Рекурсивная копия каталога `from` в существующий `to` (каталог прогона на точку сетки,
+/// фикстура проекта сессии).
+pub fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    for e in fs::read_dir(from).with_context(|| from.display().to_string())? {
+        let e = e?;
+        let dst = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            fs::create_dir_all(&dst)?;
+            copy_dir(&e.path(), &dst)?;
+        } else {
+            fs::copy(e.path(), &dst)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Равные баллы — по пути, разные — в порядке сервера (в том числе не по убыванию: реранк).
+    #[test]
+    fn ties_ordered_by_path() {
+        let h = |path: &str, score: f64| Hit {
+            path: path.into(),
+            score,
+            sources: Vec::new(),
+            reranked: false,
+        };
+        let mut hits = vec![
+            h("z", 0.9),
+            h("c", 0.7625),
+            h("a", 0.7625),
+            h("b", 0.7625),
+            h("y", 0.5),
+            h("x", 0.6),
+            h("w", 0.6),
+        ];
+        order_ties(&mut hits);
+        let got: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(got, ["z", "a", "b", "c", "y", "w", "x"]);
+    }
 
     #[test]
     fn history_control_fails_on_zero() {
@@ -1333,6 +1540,113 @@ mod tests {
         assert!(history_control(&r).is_some());
         r.metrics.cancelled5_history = Some(est(0.2));
         assert!(history_control(&r).is_none());
+    }
+
+    /// Мок-сервер на один запрос: отвечает `status` с телом `{}` и возвращает текст запроса
+    /// (строка запроса, заголовки, тело).
+    fn mock_once(status: u16) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut head = String::new();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+                head.push_str(&line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            head.push_str(&String::from_utf8_lossy(&body));
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n\r\n{{}}"
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+            tx.send(head).unwrap();
+        });
+        (base, rx)
+    }
+
+    /// Область запроса набора (`area`, спецификация M6 §11) уходит заголовком `X-Zam-Area`;
+    /// у запроса без области заголовка нет. Область заметки корпуса (`areas.toml`) — тоже
+    /// заголовком, при `POST /nodes`.
+    #[test]
+    fn area_header_sent_from_query() {
+        let mut q = crate::eval::corpus::tests_query("a-01", "en/web/x");
+        q.area = Some("frontend".into());
+        let body = Session::search_body(&q, Mode::Fts, "notes", false);
+        let (base, rx) = mock_once(200);
+        let (st, _) = search_request(&base, "tok", &q, &body).unwrap();
+        assert_eq!(st, 200);
+        let req = rx.recv().unwrap().to_ascii_lowercase();
+        assert!(req.contains("\r\nx-zam-area: frontend\r\n"), "{req}");
+        q.area = None;
+        let (base, rx) = mock_once(200);
+        search_request(&base, "tok", &q, &body).unwrap();
+        let req = rx.recv().unwrap().to_ascii_lowercase();
+        assert!(!req.contains("x-zam-area"), "{req}");
+        let note = Note {
+            path: "en/web/x".into(),
+            lang: Lang::En,
+            text: "# X\n\nText.\n".into(),
+        };
+        let (base, rx) = mock_once(201);
+        let (st, _) = note_request(&base, "tok", &note, Some("backend")).unwrap();
+        assert_eq!(st, 201);
+        let req = rx.recv().unwrap().to_ascii_lowercase();
+        assert!(req.contains("\r\nx-zam-area: backend\r\n"), "{req}");
+        assert!(req.starts_with("post /api/v1/nodes "), "{req}");
+    }
+
+    /// Область записи в ответе сервера сверяется с набором: расхождение — ошибка; ответ без
+    /// поля `area` (сервер без областей) не проверяется.
+    #[test]
+    fn entry_area_mismatch_is_an_error() {
+        check_entry_area("k01-t", Some("backend"), &json!({"area": "backend"})).unwrap();
+        check_entry_area("k01-t", None, &json!({"area": null})).unwrap();
+        check_entry_area("k01-t", Some("backend"), &json!({"id": "x"})).unwrap();
+        let e = check_entry_area("k01-t", Some("backend"), &json!({"area": "infra"}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("k01-t") && e.contains("infra"), "{e}");
+        assert!(check_entry_area("k02-t", None, &json!({"area": "web"})).is_err());
+    }
+
+    /// Область узла сервер в ответах узлов не отдаёт: заметка ищется своим заголовком с фильтром
+    /// `scope.area` — не нашлась в первых 10 — ошибка.
+    #[test]
+    fn note_area_probe_finds_note_in_its_area() {
+        let note = Note {
+            path: "ru/api/x".into(),
+            lang: Lang::Ru,
+            text: "# Повторы запросов\n\nТекст.\n".into(),
+        };
+        let b = area_probe_body(&note, "backend");
+        assert_eq!(b["query"], "Повторы запросов");
+        assert_eq!(b["scope"]["area"], "backend");
+        assert_eq!(b["scope"]["solution"], EVAL_SOLUTION);
+        let hit = |p: &str| Hit {
+            path: p.into(),
+            score: 1.0,
+            sources: Vec::new(),
+            reranked: false,
+        };
+        check_area_probe(&note.path, "backend", &[hit("en/web/y"), hit("ru/api/x")]).unwrap();
+        let e = check_area_probe(&note.path, "backend", &[hit("en/web/y")])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ru/api/x") && e.contains("backend"), "{e}");
     }
 
     #[test]

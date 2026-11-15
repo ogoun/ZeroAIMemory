@@ -74,10 +74,10 @@ export function codeOf(btn: HTMLElement): string {
   return code?.textContent ?? '';
 }
 
-/** Временная подпись кнопки после копирования. */
-export function flashButton(btn: HTMLElement, text: string): void {
+/** Временная подпись кнопки после копирования; затем — `label` (по умолчанию «Копировать»). */
+export function flashButton(btn: HTMLElement, text: string, label: string = COPY_LABEL): void {
   btn.textContent = text;
   window.setTimeout(() => {
-    btn.textContent = COPY_LABEL;
+    btn.textContent = label;
   }, 1500);
 }

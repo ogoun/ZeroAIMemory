@@ -1,4 +1,5 @@
-//! `zam read <target>… [--tier L0|L1|L2] [--section "A > B"] [--rev N] [--locator <loc>]`.
+//! `zam read <target>… [--tier L0|L1|L2] [--section "A > B"] [--rev N] [--locator <loc>]
+//! [--focus "<запрос>"] [--range r<rev>:S-E]`.
 //!
 //! - L2 (по умолчанию) — байты ревизии как сохранены (CRLF, BOM), без добавлений;
 //! - L0 и L1 — текст сводки и перевод строки;
@@ -28,6 +29,13 @@
 //!
 //! Нет секции `--section` — код 5 с подсказкой: путь секции — заголовки от верхнего или
 //! однозначный хвост пути.
+//!
+//! **Явный фокус** (`--focus "<запрос>"`, можно с `--tier focus`, M6 §6): пачкой, у каждой цели
+//! `focus` — сервер отдаёт оглавление, ближайшие к запросу листы и пометки `[пропущено: <адрес>
+//! (<подпись>) · ~N t]`: у заметки адрес `range:r<rev>:S-E` — дочитать `--range r<rev>:S-E`, у документа —
+//! `--locator`. Короткая цель и запись журнала — целиком. С `--section`, `--locator`,
+//! `--since-rev`, `--range` и другим `--tier` несовместим, `--tier focus` без `--focus` — тоже
+//! (код 6). `--range r<rev>:S-E` — байты текста L2 ревизии (пачкой; только L2, без `--section` и `--since-rev`).
 //!
 //! **Вложения** (M5, задача 7): `a:<chunk>` из выдачи `zam search` — фрагмент по `locator`
 //! чанка, `b:<sha256>` и `d:<id>` — документ; `--locator page:12|slide:3|para:40|
@@ -59,6 +67,10 @@ pub struct Opts<'a> {
     pub since_rev: Option<i64>,
     /// Часть вложения (M5): `page:12`, `sheet:Итоги!A1:F40`.
     pub locator: Option<&'a str>,
+    /// Явный фокус (M6 §6): текст запроса.
+    pub focus: Option<&'a str>,
+    /// Байты `S-E` текста L2 (адрес пропуска фокуса, M6 §6).
+    pub range: Option<&'a str>,
 }
 
 impl Opts<'_> {
@@ -69,6 +81,9 @@ impl Opts<'_> {
             || self.if_rev.is_some()
             || self.since_rev.is_some()
             || self.locator.is_some()
+            || self.focus.is_some()
+            || self.range.is_some()
+            || self.tier.is_some_and(|t| t.eq_ignore_ascii_case("focus"))
     }
 }
 
@@ -264,7 +279,7 @@ fn item_id(ctx: &Ctx, raw: &str) -> Result<String, CliError> {
 fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
     if o.rev.is_some() {
         return Err(CliError::input(
-            "--rev несовместим с пачкой (--batch, --max-tokens, --budget, --if-rev, --since-rev, --locator, вложения)",
+            "--rev несовместим с пачкой (--batch, --max-tokens, --budget, --if-rev, --since-rev, --locator, --focus, --range, вложения)",
         ));
     }
     if (o.if_rev.is_some() || o.since_rev.is_some()) && targets.len() > 1 {
@@ -272,10 +287,30 @@ fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
             "--if-rev и --since-rev задают ревизию одной цели: передайте ровно одну цель",
         ));
     }
+    let tier_focus = o.tier.is_some_and(|t| t.eq_ignore_ascii_case("focus"));
+    if tier_focus && o.focus.is_none() {
+        return Err(CliError::input("--tier focus требует --focus \"<запрос>\""));
+    }
+    if o.focus.is_some()
+        && ((o.tier.is_some() && !tier_focus)
+            || o.section.is_some()
+            || o.locator.is_some()
+            || o.since_rev.is_some()
+            || o.range.is_some())
+    {
+        return Err(CliError::input(
+            "--focus несовместим с --section, --locator, --since-rev, --range и --tier кроме focus",
+        ));
+    }
+    if o.range.is_some() && (o.section.is_some() || o.since_rev.is_some() || o.tier.is_some()) {
+        return Err(CliError::input(
+            "--range несовместим с --section, --since-rev и --tier",
+        ));
+    }
     let mut items = Vec::with_capacity(targets.len());
     for t in targets {
         let mut it = json!({ "id": item_id(ctx, t)? });
-        if let Some(v) = o.tier {
+        if let Some(v) = o.tier.filter(|_| !tier_focus) {
             it["tier"] = json!(v.to_ascii_uppercase());
         }
         if let Some(v) = o.section {
@@ -292,6 +327,12 @@ fn batch(ctx: &Ctx, targets: &[String], o: &Opts) -> Result<(), CliError> {
         }
         if let Some(v) = o.locator {
             it["locator"] = json!(v);
+        }
+        if let Some(v) = o.focus {
+            it["focus"] = json!(v);
+        }
+        if let Some(v) = o.range {
+            it["range"] = json!(v);
         }
         items.push(it);
     }

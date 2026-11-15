@@ -1,8 +1,10 @@
 //! Карта кода решения (спецификация M5.6 §5, §7, §9, §12–§13; хранилище — [`zam_store::code`]).
 //!
 //! - `POST /code/sync {solution, commit?, branch?, machine?, manifest: [{path, hash}]}` →
-//!   `{need, removed, etag}`: файлы карты вне манифеста удаляются, `need` — пути без строки или с
-//!   другим хэшем. Повтор пути (после нормализации) — 422 `manifest[i]: повтор пути`.
+//!   `{need, removed, etag, recv_count: true}`: файлы карты вне манифеста удаляются, `need` —
+//!   пути без строки или с другим хэшем. Повтор пути (после нормализации) — 422 `manifest[i]:
+//!   повтор пути`. `recv_count: true` — сервер принимает `refs[].recv_count` (M6 §12а; ≤ `count`,
+//!   только у `call`, иначе 422): клиент M6 без этого признака шлёт прежнюю форму ссылок.
 //! - `PUT /code/files {solution, commit?, branch?, machine?, files: [FileUpload]}` (до 500, а
 //!   карта целиком — до `code.max_files`) → `{accepted, stale_refs, warnings}`; сигнатуры
 //!   маскируются (`zam_markdown::mask_text`) и хранятся маскированными; правило карты для ссылок
@@ -48,13 +50,12 @@ use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use jiff::Timestamp;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use zam_code::{
     FileUpload, Focus, Graph, ManifestItem, MapFile, MapSym, NAME_MAX_CHARS, Packed, ParseState,
-    QUAL_MAX_CHARS, SIG_MAX_CHARS, SymbolHash, SymbolKind, UPLOAD_FILES_MAX, edges_among,
+    QUAL_MAX_CHARS, RefKind, SIG_MAX_CHARS, SymbolHash, SymbolKind, UPLOAD_FILES_MAX, edges_among,
     focus_restart, rank_on_graph, render_map_rest, split_ref,
 };
 use zam_core::Id;
@@ -259,6 +260,12 @@ pub struct CodeHooks {
     /// Задержка перед чтением входов для кэша фокуса, мс, и число таких чтений.
     pub inputs_delay_ms: std::sync::atomic::AtomicU64,
     pub inputs_reads: std::sync::atomic::AtomicUsize,
+    /// Чтение входов ждёт на барьере, пока поднят `inputs_hold` (после учёта в `inputs_reads`):
+    /// тест синхронизируется барьером, а не временем; [`CodeHooks::release_inputs`] — открыть.
+    pub inputs_hold: std::sync::atomic::AtomicBool,
+    pub inputs_release: tokio::sync::Notify,
+    /// Запросов с фокусом, у которых вышел срок ранжирования (`focus rank timeout`).
+    pub focus_timeouts: std::sync::atomic::AtomicUsize,
     /// Паника в следующем чтении входов (сбрасывается этим чтением).
     pub inputs_panic: std::sync::atomic::AtomicBool,
     /// Наибольшее число одновременных чтений входов одного решения.
@@ -267,6 +274,30 @@ pub struct CodeHooks {
     /// Занятых слотов тяжёлых операций ([`HEAVY_SLOTS`]) сейчас и наибольшее их число.
     pub heavy_active: std::sync::atomic::AtomicUsize,
     pub heavy_active_max: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "test-hooks")]
+impl CodeHooks {
+    /// Открывает барьер `inputs_hold`: ждущие чтения входов продолжаются.
+    pub fn release_inputs(&self) {
+        self.inputs_hold
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.inputs_release.notify_waiters();
+    }
+
+    /// Ждёт открытия барьера `inputs_hold` (без гонки с [`Self::release_inputs`]: ожидание
+    /// регистрируется до проверки флага).
+    async fn inputs_gate(&self) {
+        loop {
+            let notified = self.inputs_release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.inputs_hold.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Слот тяжёлой операции карты ([`HEAVY_SLOTS`]); освобождается при сбросе.
@@ -468,7 +499,7 @@ fn upload_meta(
         branch: text(branch, "branch")?,
         machine: text(machine, "machine")?,
         user_id,
-        now: Timestamp::now(),
+        now: zam_store::time::now(),
     })
 }
 
@@ -602,7 +633,7 @@ async fn store_rank(rt: Arc<CodeRuntime>, owner: Id, db: Db, guid: String) -> Re
         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     let (inputs, ranked) =
         ranked.map_err(|e| format!("ранжирование прервано (panic = {})", e.is_panic()))?;
-    code_store_ranks(&db, &guid, &inputs, &ranked, Timestamp::now())
+    code_store_ranks(&db, &guid, &inputs, &ranked, zam_store::time::now())
         .await
         .map(|written| written.is_some())
         .map_err(|e| e.to_string())
@@ -727,7 +758,7 @@ fn age_text(secs: i64) -> String {
 }
 
 fn age_s(s: &CodeSnapshot) -> i64 {
-    (Timestamp::now().as_second() - s.updated_at.as_second()).max(0)
+    (zam_store::time::now().as_second() - s.updated_at.as_second()).max(0)
 }
 
 /// Снимок: `ветка@коммит (машина)` — что известно.
@@ -792,14 +823,10 @@ pub const DIGEST_LINE_TOKENS: usize = 80;
 /// Предел имени ветки в строке дайджеста, символов (длиннее — обрезка с `…`).
 const DIGEST_BRANCH_MAX: usize = 40;
 
-/// Возраст снимка в строке дайджеста (Minor 7 ревью задачи 4): «N мин» (меньше часа), «N ч»
-/// (меньше 48 ч), иначе «N дн.».
-fn digest_age(secs: i64) -> String {
-    match secs.max(0) {
-        s @ ..3600 => format!("{} мин", s / 60),
-        s @ ..172_800 => format!("{} ч", s / 3600),
-        s => format!("{} дн.", s / 86_400),
-    }
+/// Дата снимка в строке дайджеста — `yyyy-MM-dd` UTC (M6 §8: в тексте дайджеста нет
+/// относительного возраста, два старта в одни сутки дают одну строку; прежде — «N мин»).
+fn digest_date(s: &CodeSnapshot) -> String {
+    zam_core::time::agent_date(&zam_store::time::fmt_ts(s.updated_at)).unwrap_or_default()
 }
 
 /// Снимок строки дайджеста: `ветка@коммит7` — что известно, без машины (Minor 7).
@@ -824,16 +851,17 @@ fn digest_snapshot(s: &CodeSnapshot) -> Option<String> {
     }
 }
 
-/// Строка дайджеста (§10): размер карты, возраст снимка, центральные символы — до
-/// [`DIGEST_CENTRAL`]; строка длиннее [`DIGEST_LINE_TOKENS`] по `count` — центральных 2, 1, 0,
-/// а без центральных всё ещё длиннее — и без скобки снимка.
-fn digest_line(s: &CodeStatus, central: &[Value], count: &dyn Fn(&str) -> usize) -> String {
+/// Строка дайджеста (§10): размер карты, дата снимка UTC (M6 §8), центральные символы — до
+/// [`DIGEST_CENTRAL`]; строка не помещается в [`DIGEST_LINE_TOKENS`] по `fits` (сервер —
+/// [`digest_fits`], M6 §4.2) — центральных 2, 1, 0, а без центральных всё ещё не помещается —
+/// и без скобки снимка.
+fn digest_line(s: &CodeStatus, central: &[Value], fits: &dyn Fn(&str) -> bool) -> String {
     let snap = &s.snapshot;
     let bare = format!(
         "ZeroAIMemory: карта кода: {}, {}, снимок {}",
         files_text(snap.files),
         symbols_text(snap.symbols),
-        digest_age(age_s(snap))
+        digest_date(snap)
     );
     let mut head = bare.clone();
     if let Some(t) = digest_snapshot(snap) {
@@ -856,8 +884,13 @@ fn digest_line(s: &CodeStatus, central: &[Value], count: &dyn Fn(&str) -> usize)
     (0..=names.len())
         .rev()
         .map(line)
-        .find(|l| count(l) <= DIGEST_LINE_TOKENS)
+        .find(|l| fits(l))
         .unwrap_or_else(|| format!("{bare} — `memory_code`/`zam code map`"))
+}
+
+/// Строка дайджеста помещается в [`DIGEST_LINE_TOKENS`] счётчиком сервера (`fits`, M6 §4.2).
+fn digest_fits(line: &str) -> bool {
+    zam_store::fits_budget(line, DIGEST_LINE_TOKENS)
 }
 
 /// Строка дайджеста карты решения `guid` в базе `db` (для `/recall`: `session_start` и
@@ -870,7 +903,33 @@ pub async fn code_line(db: &Db, guid: &str) -> Option<String> {
     let central = code_central(db, guid, DIGEST_CENTRAL, CENTRAL_FILES_MAX)
         .await
         .ok()?;
-    Some(digest_line(&s, &central_json(&central), &count_tokens))
+    Some(digest_line(&s, &central_json(&central), &digest_fits))
+}
+
+/// Символов-кандидатов мини-карты дайджеста (до бюджета ключа).
+const DIGEST_MAP_SYMBOLS: usize = 20;
+/// Заголовок раздела мини-карты дайджеста.
+pub const DIGEST_MAP_TITLE: &str = "### Карта кода";
+
+/// Мини-карта дайджеста (M6 §8, `recall.digest_code_map_tokens`): центральные символы карты
+/// решения `guid` строками `<путь>:<line> <kind> <qual>`, пока раздел `### Карта кода` с ними
+/// помещается в `budget` (сумма частей — против `budget_cap`, M6 §4.2); карты нет — пусто.
+pub async fn digest_map_lines(db: &Db, guid: &str, budget: usize) -> Vec<String> {
+    let Ok(central) = code_central(db, guid, DIGEST_MAP_SYMBOLS, CENTRAL_FILES_MAX).await else {
+        return Vec::new();
+    };
+    let cap = zam_store::budget_cap(budget);
+    let mut used = zam_store::count_tokens(&format!("\n{DIGEST_MAP_TITLE}\n"));
+    let mut out = Vec::new();
+    for s in central {
+        let line = format!("{}:{} {} {}", s.path, s.line, s.kind.as_str(), s.qual);
+        let cost = zam_store::count_tokens(&format!("{line}\n"));
+        if used + cost <= cap {
+            used += cost;
+            out.push(line);
+        }
+    }
+    out
 }
 
 // ---- POST /code/sync ----
@@ -923,7 +982,7 @@ fn parse_manifest(m: Vec<ManifestIn>, max: u32) -> Result<Vec<ManifestItem>, Api
     Ok(out)
 }
 
-/// `POST /code/sync` → `{need, removed, stale_refs, etag}`. С заголовком `X-Zam-Solution`
+/// `POST /code/sync` → `{need, removed, stale_refs, etag, recv_count: true}`. С заголовком `X-Zam-Solution`
 /// права проверяются до чтения тела (манифест — до десятков мегабайт), и `solution` тела
 /// обязан совпадать с ним.
 pub async fn sync(
@@ -1005,6 +1064,9 @@ pub async fn sync(
         "removed": out.removed,
         "stale_refs": stale_refs,
         "etag": out.etag,
+        // сервер принимает `refs[].recv_count` (M6 §12а): клиент M6 шлёт счётчик, только видя
+        // этот признак, — серверу до M6 (`deny_unknown_fields`) уходит прежняя форма
+        "recv_count": true,
     })))
 }
 
@@ -1082,6 +1144,17 @@ fn check_upload(
         check_text(&r.name, NAME_MAX_CHARS, &format!("{w}.name"), false)?;
         if r.count == 0 {
             return Err(unprocessable(format!("{w}.count: больше 0")));
+        }
+        // вызовы по получателю (M6 §12а) — часть вызовов `count`
+        if let Some(n) = r.recv_count {
+            if r.kind != RefKind::Call {
+                return Err(unprocessable(format!(
+                    "{w}.recv_count: только у ссылок вида call"
+                )));
+            }
+            if n > r.count {
+                return Err(unprocessable(format!("{w}.recv_count: не больше count")));
+            }
         }
     }
     Ok(masked)
@@ -1235,7 +1308,7 @@ pub async fn status(
         return with_etag(&headers, &etag, || Value::Null);
     }
     let central = central_json(&store_central(&sc, &g, STATUS_CENTRAL).await?);
-    let digest = (snap.files > 0).then(|| digest_line(&s, &central, &count_tokens));
+    let digest = (snap.files > 0).then(|| digest_line(&s, &central, &digest_fits));
     let skipped: Vec<Value> = s
         .skipped
         .iter()
@@ -1565,6 +1638,7 @@ fn inputs_load(
             if ms > 0 {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
             }
+            h.inputs_gate().await;
             if h.inputs_panic.swap(false, Ordering::SeqCst) {
                 panic!("тестовая паника чтения входов");
             }
@@ -1629,7 +1703,14 @@ async fn focus_file_ranks(
     };
     match tokio::time::timeout(wait, work).await {
         Ok(r) => r.map(Ok),
-        Err(_) => Ok(Err(())),
+        Err(_) => {
+            #[cfg(feature = "test-hooks")]
+            st.code
+                .hooks
+                .focus_timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Err(()))
+        }
     }
 }
 
@@ -1692,7 +1773,13 @@ async fn build_map(
         );
         let (h, files) = (header.clone(), pack_input(&rows, loaded));
         let packed = tokio::task::spawn_blocking(move || {
-            render_map_rest(&h, &files, rest, budget, &count_tokens)
+            render_map_rest(
+                &h,
+                &files,
+                rest,
+                zam_store::budget_cap(budget),
+                &count_tokens,
+            )
         })
         .await
         .map_err(|e| ApiError::aborted("упаковка карты", &e))?;
@@ -2315,21 +2402,17 @@ mod tests {
         assert!(hex_of("xyz", &[16]).is_none());
     }
 
-    /// Minor 7 ревью задачи 4: возраст «N мин / N ч / N дн.», без машины, центральные
-    /// сокращаются 3 → 2 → 1 → 0, пока строка длиннее предела.
+    /// Minor 7 ревью задачи 4: без машины, центральные сокращаются 3 → 2 → 1 → 0, пока строка
+    /// длиннее предела; M6 §8 (задача 8a): вместо возраста — дата снимка UTC (в тексте
+    /// дайджеста нет относительного возраста).
     #[test]
-    fn digest_line_age_snapshot_and_central_cut() {
-        assert_eq!(digest_age(59), "0 мин");
-        assert_eq!(digest_age(3599), "59 мин");
-        assert_eq!(digest_age(3600), "1 ч");
-        assert_eq!(digest_age(47 * 3600 + 59), "47 ч");
-        assert_eq!(digest_age(48 * 3600), "2 дн.");
+    fn digest_line_date_snapshot_and_central_cut() {
         let snap = |branch: Option<&str>, commit: Option<&str>| CodeSnapshot {
             solution: "g".into(),
             commit: commit.map(str::to_string),
             branch: branch.map(str::to_string),
             machine: Some("box".into()),
-            updated_at: Timestamp::now(),
+            updated_at: "2026-10-10T14:03:22Z".parse().unwrap(),
             files: 2,
             symbols: 5,
             etag: String::new(),
@@ -2348,20 +2431,23 @@ mod tests {
         let chars = |t: &str| t.chars().count();
         let s = status(snap(Some("main"), Some("abcdef1234")));
         assert_eq!(
-            digest_line(&s, &central, &|_| 0),
-            "ZeroAIMemory: карта кода: 2 файла, 5 символов, снимок 0 мин (main@abcdef1); \
+            digest_line(&s, &central, &|_| true),
+            "ZeroAIMemory: карта кода: 2 файла, 5 символов, снимок 2026-10-10 (main@abcdef1); \
              центральные: Store::open, Db, route — `memory_code`/`zam code map`"
         );
         // без ветки и коммита — без скобок; машина не показывается
         let s0 = status(snap(None, None));
-        let l = digest_line(&s0, &central[..1], &|_| 0);
-        assert!(l.contains("снимок 0 мин; центральные: Store::open"), "{l}");
+        let l = digest_line(&s0, &central[..1], &|_| true);
+        assert!(
+            l.contains("снимок 2026-10-10; центральные: Store::open"),
+            "{l}"
+        );
         assert!(!l.contains("box"), "{l}");
         // предел по счётчику: длина строки с 3, 2, 1 центральным
-        let full = chars(&digest_line(&s, &central, &|_| 0));
+        let full = chars(&digest_line(&s, &central, &|_| true));
         let cut = |limit: usize| {
             digest_line(&s, &central, &|t: &str| {
-                (chars(t) * DIGEST_LINE_TOKENS).div_ceil(limit)
+                (chars(t) * DIGEST_LINE_TOKENS).div_ceil(limit) <= DIGEST_LINE_TOKENS
             })
         };
         assert!(cut(full).contains("route"));
@@ -2374,8 +2460,8 @@ mod tests {
         // ревью задачи 6, M1: ветка в 256 символов — обрезка до 40 с «…», строка ≤ 80 токенов
         let long = "b".repeat(256);
         let sl = status(snap(Some(&long), Some("abcdef1234")));
-        let l = digest_line(&sl, &central, &zam_store::count_tokens);
+        let l = digest_line(&sl, &central, &digest_fits);
         assert!(l.contains(&format!("({}…@abcdef1)", "b".repeat(40))), "{l}");
-        assert!(zam_store::count_tokens(&l) <= DIGEST_LINE_TOKENS, "{l}");
+        assert!(digest_fits(&l), "{l}");
     }
 }

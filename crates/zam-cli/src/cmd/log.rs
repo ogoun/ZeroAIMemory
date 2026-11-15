@@ -193,11 +193,7 @@ fn explain_term_conflict(e: CliError) -> CliError {
         "что дальше: выберите другое имя или псевдоним либо замените существующий термин \
          (zam glossary <имя> покажет карточку)",
     );
-    CliError {
-        code: crate::client::EXIT_CONFLICT,
-        msg,
-        problem: e.problem,
-    }
+    CliError::with_problem(crate::client::EXIT_CONFLICT, msg, e.problem)
 }
 
 /// `zam log term`.
@@ -237,14 +233,14 @@ mod tests {
 
     #[test]
     fn term_conflict_explained() {
-        let e = CliError {
-            code: 4,
-            msg: "x".into(),
-            problem: Some(json!({
+        let e = CliError::with_problem(
+            4,
+            "x",
+            Some(json!({
                 "type": "/problems/term-conflict",
                 "conflicts": [{"id": "i1", "title": "Выжимка", "matched": "summary"}],
             })),
-        };
+        );
         let r = explain_term_conflict(e);
         assert_eq!(r.code, crate::client::EXIT_CONFLICT);
         assert!(
@@ -253,11 +249,7 @@ mod tests {
             r.msg
         );
         // чужая ошибка не меняется
-        let other = CliError {
-            code: 4,
-            msg: "иное".into(),
-            problem: None,
-        };
+        let other = CliError::with_problem(4, "иное", None);
         assert_eq!(explain_term_conflict(other).msg, "иное");
     }
 

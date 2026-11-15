@@ -14,6 +14,15 @@ use zam_server::build;
 use zam_server::config::ServerConfig;
 use zam_store::Access;
 
+/// Версия блока инструкции сервера (`zam_core::AGENT_BLOCK_VERSION`): маркеры и напоминания
+/// сверяются с ней, а не с числом — новая версия блока не требует правки теста.
+const V: u32 = zam_core::AGENT_BLOCK_VERSION;
+
+/// Маркер начала текущего блока.
+fn begin() -> String {
+    format!("<!-- zeroaimemory:begin v{V} -->")
+}
+
 fn tmp(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-init-{name}"));
     let _ = std::fs::remove_dir_all(&d);
@@ -198,9 +207,9 @@ fn init_creates_solution_block_hooks_mcp() {
     let (code, body) = api_get(&p, &format!("/solutions/{guid}"));
     assert_eq!(code, 200, "{body}");
     assert!(body.contains("\"role\":\"owner\""), "{body}");
-    // блок v5 с адресом и решением, без токена
+    // текущий блок с адресом и решением, без токена
     let md = p.read("CLAUDE.md");
-    assert!(md.starts_with("<!-- zeroaimemory:begin v6 -->\n"), "{md}");
+    assert!(md.starts_with(&format!("{}\n", begin())), "{md}");
     assert!(md.contains(&format!("ZeroAIMemoryUrl={url}\n")), "{md}");
     assert!(md.contains(&guid) && md.contains("«Демо»"), "{md}");
     assert!(!md.contains(&tok), "токен в CLAUDE.md");
@@ -225,17 +234,18 @@ fn init_creates_solution_block_hooks_mcp() {
         assert_eq!(s["hooks"][ev][0]["hooks"][0]["command"], "zam", "{ev}");
         assert_eq!(s["hooks"][ev][0]["hooks"][0]["timeout"], 2, "{ev}");
     }
-    // .mcp.json — без токена, с решением
+    // .mcp.json — stdio `zam mcp` (M6 §7.1): без токена и адреса, решение — из solution.toml
     let m = p.json(".mcp.json");
     let z = &m["mcpServers"]["zeroaimemory"];
-    assert_eq!(z["type"], "http");
-    assert_eq!(z["url"], format!("{url}/mcp"));
-    assert_eq!(z["headers"]["Authorization"], "Bearer ${ZAM_TOKEN}");
-    assert_eq!(z["headers"]["X-Zam-Solution"], guid.as_str());
+    assert_eq!(
+        *z,
+        json!({"type": "stdio", "command": "zam", "args": ["mcp"]}),
+        "{m}"
+    );
     assert!(!p.read(".mcp.json").contains(&tok));
     assert!(!p.read(".claude/settings.json").contains(&tok));
     assert_eq!(p.read(".zeroaimemory/.gitignore"), "cache/\nlogs/\n");
-    // токен — в домашнем конфиге; подсказка про ZAM_TOKEN для Windows и Linux
+    // токен — в домашнем конфиге; zam mcp берёт его оттуда же — подсказки про ZAM_TOKEN нет
     let home: toml::Table =
         toml::from_str(&std::fs::read_to_string(p.home.join(".zeroaimemory/config.toml")).unwrap())
             .unwrap();
@@ -247,14 +257,10 @@ fn init_creates_solution_block_hooks_mcp() {
     );
     assert!(stdout.contains("Токен и адрес сохранены"), "{stdout}");
     assert!(!stdout.contains(">> ~/.profile"), "{stdout}");
-    assert!(stdout.contains("ZAM_TOKEN"), "{stdout}");
-    assert!(
-        stdout.contains("SetEnvironmentVariable('ZAM_TOKEN'"),
-        "{stdout}"
-    );
-    assert!(stdout.contains("export ZAM_TOKEN="), "{stdout}");
-    // ZAM_MACHINE в окружении теста нет — подсказка для MCP (финальное ревью M4, M-4)
-    assert!(stdout.contains("ZAM_MACHINE"), "{stdout}");
+    assert!(!stdout.contains("ZAM_TOKEN"), "{stdout}");
+    assert!(stdout.contains("zam mcp"), "{stdout}");
+    // машину zam mcp берёт сам (ZAM_MACHINE или имя хоста) — подсказки нет
+    assert!(!stdout.contains("ZAM_MACHINE"), "{stdout}");
     assert!(
         !stdout.contains(&tok) && !err(&o).contains(&tok),
         "токен в выводе"
@@ -267,7 +273,7 @@ fn init_creates_solution_block_hooks_mcp() {
     let o = p.cmd().arg("status").output().unwrap();
     ok(&o);
     assert!(
-        out(&o).contains("Блок инструкции: v6 (актуален)"),
+        out(&o).contains(&format!("Блок инструкции: v{V} (актуален)")),
         "{}",
         out(&o)
     );
@@ -334,7 +340,7 @@ fn init_is_idempotent_and_preserves_foreign_text_and_hooks() {
     assert!(md.starts_with(head), "{md:?}");
     assert!(md.ends_with(tail), "{md:?}");
     assert!(
-        md.contains("<!-- zeroaimemory:begin v6 -->\r\n"),
+        md.contains(&format!("{}\r\n", begin())),
         "CRLF файла: {md:?}"
     );
     assert!(!md.contains(&tok), "прежний токен убран из блока");
@@ -368,10 +374,7 @@ fn init_is_idempotent_and_preserves_foreign_text_and_hooks() {
     );
     let m = p.json(".mcp.json");
     assert_eq!(m["mcpServers"]["other"], json!({"command": "x"}));
-    assert_eq!(
-        m["mcpServers"]["zeroaimemory"]["headers"]["X-Zam-Solution"],
-        g
-    );
+    assert_eq!(m["mcpServers"]["zeroaimemory"]["command"], "zam");
 
     // повторный запуск ничего не меняет
     let before = p.snapshot();
@@ -409,7 +412,7 @@ fn init_codex_writes_codex_hooks() {
     ok(&o);
     let md = p.read("AGENTS.md");
     assert!(
-        md.starts_with("<!-- zeroaimemory:begin v6 -->\n## ZeroAIMemory memory\n"),
+        md.starts_with(&format!("{}\n## ZeroAIMemory memory\n", begin())),
         "{md}"
     );
     assert!(!p.repo.join("CLAUDE.md").exists());
@@ -484,8 +487,10 @@ fn status_warns_outdated_block() {
     ok(&o);
     let s = out(&o);
     assert_eq!(
-        s.matches("Блок ZeroAIMemory устарел (v1 → v6): обнови через `zam init` или WebUI")
-            .count(),
+        s.matches(&format!(
+            "Блок ZeroAIMemory устарел (v1 → v{V}): обнови через `zam init` или WebUI"
+        ))
+        .count(),
         1,
         "{s}"
     );
@@ -494,7 +499,7 @@ fn status_warns_outdated_block() {
     let j: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(
         j["agent_block"],
-        json!({"version": 1, "current": 6, "outdated": true})
+        json!({"version": 1, "current": V, "outdated": true})
     );
 }
 
@@ -618,10 +623,7 @@ fn init_bom_files_and_v1_token_without_flag() {
     ok(&o);
     let stdout = out(&o);
     let md = p.read("CLAUDE.md");
-    assert!(
-        md.starts_with("\u{feff}<!-- zeroaimemory:begin v6 -->\n"),
-        "{md:?}"
-    );
+    assert!(md.starts_with(&format!("\u{feff}{}\n", begin())), "{md:?}");
     assert!(md.ends_with("<!-- zeroaimemory:end -->\nхвост\n"), "{md:?}");
     assert_eq!(md.matches("zeroaimemory:begin").count(), 1);
     assert!(!md.contains(&tok));
@@ -902,11 +904,7 @@ fn init_keeps_symlink_and_writes_target() {
     assert!(meta.file_type().is_symlink(), "ссылка сохранена");
     let t = p.read("CLAUDE.md");
     assert!(
-        t.starts_with(
-            "# свой текст
-
-<!-- zeroaimemory:begin v6 -->"
-        ),
+        t.starts_with(&format!("# свой текст\n\n{}", begin())),
         "{t}"
     );
 }
@@ -1079,7 +1077,7 @@ fn init_updates_pre_tool_matcher() {
     assert_eq!(p.snapshot(), before);
 }
 
-/// Хуки и блок M4 (v2) заменяются текущим набором (v6): прежние обработчики `zam hook`
+/// Хуки и блок M4 (v2) заменяются текущим набором (`AGENT_BLOCK_VERSION`): прежние обработчики `zam hook`
 /// удаляются, а не дублируются; чужие обработчики остаются на местах.
 #[test]
 fn init_replaces_v2_handlers() {
@@ -1120,7 +1118,7 @@ fn init_replaces_v2_handlers() {
     ok(&o);
     let md = p.read("CLAUDE.md");
     assert!(
-        md.starts_with("# Проект\n\n<!-- zeroaimemory:begin v6 -->\n"),
+        md.starts_with(&format!("# Проект\n\n{}\n", begin())),
         "{md}"
     );
     assert!(!md.contains("старые правила"), "{md}");

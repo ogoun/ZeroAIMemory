@@ -386,6 +386,38 @@ async fn verify(
     })
 }
 
+/// Подходит ли мастер-ключ этой машины (`ZAM_MASTER_KEY` из `env_key`, иначе файл ключа) к
+/// ключам Vault восстановленной `system.db` (`zam-server restore`, M6 §12б.3). Ничего не
+/// создаёт и не записывает. Ключей Vault нет — `true` (раскрывать нечего).
+pub async fn restored_key_fits(
+    cfg: &ServerConfig,
+    sys: &SystemStore,
+    env_key: Option<&str>,
+) -> anyhow::Result<bool> {
+    match has_keys(sys).await? {
+        Ok(false) => return Ok(true),
+        Ok(true) => {}
+        Err(_) => return Ok(false),
+    }
+    let key = match env_key.filter(|k| !k.trim().is_empty()) {
+        Some(raw) => decode_key(raw),
+        None => match std::fs::read_to_string(master_key_path(cfg)) {
+            Ok(t) => decode_key(&Zeroizing::new(t)),
+            Err(_) => None,
+        },
+    };
+    let Some(key) = key else {
+        return Ok(false);
+    };
+    if let Ok(Some(blob)) = sys.vault_key_check().await {
+        return Ok(key_check_ok(&key, &blob));
+    }
+    Ok(match sys.vault_any_user_key().await? {
+        Some((user, wrapped)) => unwrap_user_key(&key, user, &wrapped).is_ok(),
+        None => true,
+    })
+}
+
 impl VaultKeys {
     /// Загружает мастер-ключ (`ZAM_MASTER_KEY` из окружения процесса, иначе файл).
     /// Блокировка Vault — не ошибка старта.

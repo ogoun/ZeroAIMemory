@@ -94,6 +94,8 @@ pub fn session_touch(
         agent: None,
         parent_id: None,
         agent_type: None,
+        // эпоха `session_seen` (M6 §7.2) — из базы сессии: её читает `request_session`
+        epoch: 0,
     }))
 }
 

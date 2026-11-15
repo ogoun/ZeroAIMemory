@@ -7,9 +7,12 @@
 //!   ссылки-сноски `[…][метка]` с определением `[метка]: путь`; вне кода, формул и frontmatter.
 //!   Путь — относительно каталога файла, percent-декодируется, ведущие `./` снимаются: это и имя
 //!   части `file` (сервер сверяет его с телом тем же правилом). Повтор пути — одна часть.
-//!   Схемы (`https:`, `mailto:`), якоря и `//…` — не файлы ([`resolve_local`] → `None`, их
-//!   проверяет сервер). `..`, абсолютный путь, `\`, символы `" : * ? < > |`, выход за каталог
-//!   (символическая ссылка), нет файла — ошибка ввода **до** любого запроса к серверу.
+//!   Схемы из [`zam_core::REPORT_LINK_SCHEMES`] (`http:`, `https:`, `mailto:`, `vscode:`,
+//!   `file:` — M6 §16 п. 15), якоря и `//…` — не файлы ([`resolve_local`] → `None`; картинку
+//!   со схемой отклонит сервер). Прочая схема (`ftp:`, `javascript:`, `data:` …, в том числе
+//!   с регистром, пробелом и табуляцией — [`zam_core::link::url_scheme`]), `..`, абсолютный
+//!   путь, `\`, символы `" : * ? < > |`, выход за каталог (символическая ссылка), нет файла —
+//!   ошибка ввода **до** любого запроса к серверу.
 //! - **Пределы до отправки** — не больше [`MAX_FILES`] файлов и [`MAX_TOTAL_BYTES`] в сумме по
 //!   `stat` (умолчания сервера `reports.*`; окончательно проверяет сервер).
 //! - **Разбор ссылок** — свой лёгкий сканер ([`local_links`]): `zam` не тянет `comrak` в путь
@@ -326,8 +329,9 @@ impl Read for LazyFile {
 
 // ---- пути ----
 
-/// Имя файла отчёта по назначению ссылки: `None` — не файл (схема, якорь, `//`); путь
-/// percent-декодирован, без якоря и ведущих `./`; нарушение правил пути — ошибка ввода.
+/// Имя файла отчёта по назначению ссылки: `None` — не файл (разрешённая схема, якорь, `//`);
+/// путь percent-декодирован, без якоря и ведущих `./`; схема не из
+/// [`zam_core::REPORT_LINK_SCHEMES`] и нарушение правил пути — ошибка ввода.
 fn local_name(link: &str) -> Result<Option<String>, CliError> {
     let t = link.trim();
     if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
@@ -340,8 +344,15 @@ fn local_name(link: &str) -> Result<Option<String>, CliError> {
             "абсолютный путь — только путь относительно файла отчёта",
         ));
     }
-    if scheme_of(t) {
-        return Ok(None);
+    if let Some(scheme) = zam_core::link::url_scheme(t) {
+        return if zam_core::link::report_scheme_allowed(&scheme) {
+            Ok(None)
+        } else {
+            Err(bad(&format!(
+                "схема {scheme}: не поддерживается ({} или файл отчёта)",
+                zam_core::link::report_schemes_text()
+            )))
+        };
     }
     let path = t.split('#').next().unwrap_or_default();
     if path.is_empty() {
@@ -426,17 +437,6 @@ pub(crate) fn resolve_local(base: &Path, link: &str) -> Result<Option<PathBuf>, 
     Ok(Some(real))
 }
 
-/// Есть ли у ссылки схема URL (`https:`, `mailto:`, `data:`).
-fn scheme_of(t: &str) -> bool {
-    let Some(colon) = t.find(':') else {
-        return false;
-    };
-    let s = &t[..colon];
-    let mut b = s.bytes();
-    b.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && b.all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c))
-}
-
 /// `%XX` → байты; `None` — неверная последовательность или не UTF-8.
 fn percent_decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
@@ -469,8 +469,8 @@ enum Line {
     Para,
 }
 
-/// Блоки документа: текст для разбора строк (код, frontmatter и определения ссылок заменены
-/// пробелами — смещения те же), определения `[метка]: путь` (первое по тексту) и первый
+/// Блоки документа: текст для разбора строк (код, frontmatter, блоки HTML и определения ссылок
+/// заменены пробелами — смещения те же), определения `[метка]: путь` (первое по тексту) и первый
 /// заголовок `#`.
 struct Blocks {
     text: Vec<u8>,
@@ -555,6 +555,30 @@ fn blocks(md: &str) -> Blocks {
                 prev = Line::Break;
                 continue;
             }
+            // блок HTML: разбор сервера ссылок в нём не видит (`<div>ftp://e.org/a</div>`)
+            if let Some(end) = html_block(rest, prev == Line::Break) {
+                blank(&mut text, r);
+                match end {
+                    // до пустой строки
+                    None => {
+                        while k < lines.len() && !line_str(&lines[k]).trim().is_empty() {
+                            blank(&mut text, lines[k].clone());
+                            k += 1;
+                        }
+                    }
+                    // до строки с закрывающей последовательностью (включая её; может быть этой же)
+                    Some(close) => {
+                        let mut l = rest.to_ascii_lowercase();
+                        while !l.contains(close) && k < lines.len() {
+                            blank(&mut text, lines[k].clone());
+                            l = line_str(&lines[k]).to_ascii_lowercase();
+                            k += 1;
+                        }
+                    }
+                }
+                prev = Line::Break;
+                continue;
+            }
             // определение сноски `[^1]: …` — блок текста: его ссылки ищутся как обычно
             if prev == Line::Break
                 && let Some((label, dest)) = definition(rest)
@@ -574,6 +598,133 @@ fn blocks(md: &str) -> Blocks {
         prev = Line::Para;
     }
     Blocks { text, defs, h1 }
+}
+
+/// Теги, с которых начинается блок HTML вида 6 (CommonMark 0.31, §4.6).
+const HTML_BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+];
+
+/// Строка (без отступа, он меньше 4) начинает блок HTML (CommonMark §4.6): `Some(None)` — блок
+/// до пустой строки, `Some(Some(конец))` — до строки с закрывающей последовательностью (в нижнем
+/// регистре). `after_break` — перед строкой нет абзаца: вид 7 (любой одиночный тег) абзац не
+/// прерывает. Приближение: у вида 7 атрибуты тега не разбираются — тег должен занимать строку
+/// целиком и не содержать `<` и `>` внутри.
+fn html_block(rest: &str, after_break: bool) -> Option<Option<&'static str>> {
+    let low = rest
+        .chars()
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let after = low.strip_prefix('<')?;
+    for (open, close) in [
+        ("script", "</script>"),
+        ("pre", "</pre>"),
+        ("style", "</style>"),
+        ("textarea", "</textarea>"),
+    ] {
+        if let Some(t) = after.strip_prefix(open)
+            && matches!(t.bytes().next(), None | Some(b' ' | b'\t' | b'>'))
+        {
+            return Some(Some(close));
+        }
+    }
+    if after.starts_with("!--") {
+        return Some(Some("-->"));
+    }
+    if after.starts_with('?') {
+        return Some(Some("?>"));
+    }
+    if after.starts_with("![cdata[") {
+        return Some(Some("]]>"));
+    }
+    if after.starts_with('!') && after[1..].starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return Some(Some(">"));
+    }
+    let full = rest[1..].strip_prefix('/').unwrap_or(&rest[1..]);
+    let name_len = full
+        .bytes()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        .count();
+    let (name, tail) = full.split_at(name_len);
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    if HTML_BLOCK_TAGS.contains(&name.as_str())
+        && (tail.is_empty() || tail.starts_with([' ', '\t', '>']) || tail.starts_with("/>"))
+    {
+        return Some(None);
+    }
+    // вид 7: один открывающий или закрывающий тег на всю строку
+    let whole = rest.trim_end();
+    (after_break
+        && !matches!(name.as_str(), "script" | "pre" | "style" | "textarea")
+        && whole.ends_with('>')
+        && !whole[1..whole.len() - 1].contains(['<', '>'])
+        && (tail.starts_with([' ', '\t', '>']) || tail.starts_with("/>")))
+    .then_some(None)
 }
 
 /// Отступ строки в колонках (табуляция — до кратного 4).
@@ -695,24 +846,58 @@ fn first_h1(md: &str) -> Option<String> {
 
 /// Назначения ссылок и картинок тела вне кода, формул и frontmatter, как их видит разбор
 /// CommonMark сервера: inline `(путь)` и `(<путь>)`, сноски `[текст][метка]`, `[метка][]`,
-/// `[метка]` по определениям `[метка]: путь`. Экранирование `\` снимается; якорь и схема —
-/// как в тексте (их отбрасывает [`resolve_local`]). Вики-ссылки `[[…]]` и сноски `[^1]` — не
+/// `[метка]` по определениям `[метка]: путь`, автоссылки `<схема:адрес>` и голые автоссылки GFM с
+/// недопустимой схемой — `ftp://…`, `xmpp:имя@узел` (файлом не бывают — ради проверки схемы). Экранирование `\` снимается; якорь и схема — как в тексте (их
+/// отбрасывает или отклоняет [`resolve_local`]). Вики-ссылки `[[…]]` и сноски `[^1]` — не
 /// ссылки на файлы.
 pub(crate) fn local_links(md: &str) -> Vec<String> {
     let Blocks { text, defs, .. } = blocks(md);
+    // замена на пробелы шла целыми строками: текст остался корректным UTF-8
+    let text = String::from_utf8_lossy(&text);
     Scanner::new(&text, &defs).run()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Счётчик шагов сканера ссылок — для теста линейности (без порогов времени).
+    static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `n` шагов просмотра текста сканером (считаются только в тестах).
+#[inline]
+fn steps(n: usize) {
+    #[cfg(test)]
+    STEPS.with(|s| s.set(s.get() + n as u64));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 struct Scanner<'a> {
+    /// Текст тела (код, frontmatter, блоки HTML и определения ссылок заменены пробелами).
+    s: &'a str,
     b: &'a [u8],
     defs: &'a HashMap<String, String>,
     /// Начала пустых строк (граница абзаца для поиска скобок и `` ` ``).
     breaks: Vec<usize>,
     out: Vec<String>,
+    /// Счёт скобок для почты, по строке: просмотрено до позиции, начало счёта (строки или конец
+    /// предыдущей автоссылки), разность числа `[` и `]`.
+    line_brackets: (usize, usize, i32),
+    /// Для [`inline_html`]: концы абзацев, в которых закрывающей последовательности дальше нет.
+    html_miss: [usize; 6],
+    /// Для комментария HTML: конец абзаца, откуда искали, и первый годный конец `-->` оттуда
+    /// (начало серии дефисов и позиция за `>`); `None` — годного конца в абзаце дальше нет.
+    comment_end: (usize, usize, Option<(usize, usize)>),
+    /// Конец абзаца, до которого нет закрывающего `$` формулы: второй раз до конца абзаца его
+    /// не ищут (непарный знак в каждой строке длинной таблицы).
+    math_miss: usize,
+    /// Пары вложенных скобок, найденные попутно ([`Scanner::match_bracket`]); `None` — пары нет.
+    bracket_pairs: HashMap<usize, Option<usize>>,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(b: &'a [u8], defs: &'a HashMap<String, String>) -> Scanner<'a> {
+    fn new(s: &'a str, defs: &'a HashMap<String, String>) -> Scanner<'a> {
+        let b = s.as_bytes();
         let mut breaks = Vec::new();
         let mut line_start = 0;
         let mut only_ws = true;
@@ -733,10 +918,16 @@ impl<'a> Scanner<'a> {
             breaks.push(line_start);
         }
         Scanner {
+            s,
             b,
             defs,
             breaks,
             out: Vec::new(),
+            line_brackets: (0, 0, 0),
+            html_miss: [0; 6],
+            comment_end: (0, 0, None),
+            math_miss: 0,
+            bracket_pairs: HashMap::new(),
         }
     }
 
@@ -746,14 +937,54 @@ impl<'a> Scanner<'a> {
         self.breaks.get(k).copied().unwrap_or(self.b.len())
     }
 
-    fn run(mut self) -> Vec<String> {
+    /// Для почты в позиции `i`: начало её текста (строки или `floor` — конца предыдущей голой
+    /// автоссылки) и разность числа `[` и `]` от него до `i`. Счёт продолжается с места прошлого
+    /// запроса ([`Scanner::line_brackets`]).
+    fn line_brackets(&mut self, i: usize, floor: usize) -> (usize, i32) {
         let b = self.b;
-        // (откуда, куда): дойдя до `]` текста найденной ссылки, перепрыгнуть её назначение
-        let mut jumps: Vec<(usize, usize)> = Vec::new();
+        let (mut j, mut line, mut depth) = self.line_brackets;
+        if floor > j {
+            (j, line, depth) = (floor, floor, 0);
+        }
+        steps(i.saturating_sub(j));
+        while j < i {
+            match b[j] {
+                b'\n' => (line, depth) = (j + 1, 0),
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        self.line_brackets = (j, line, depth);
+        (line, depth)
+    }
+
+    fn run(mut self) -> Vec<String> {
+        let (b, s) = (self.b, self.s);
+        // откуда → куда: дойдя до `]` текста найденной ссылки, перепрыгнуть её назначение
+        // (по ключу: вложенные ссылки копят переходы, перебор на каждом байте был бы квадратичен)
+        let mut jumps: HashMap<usize, usize> = HashMap::new();
+        // конец последней голой автоссылки (`схема://…`, `www.…`, почта)
+        let mut bare_end = 0;
+        // Сколько `[` блока не закрыто — как стек скобок разбора сервера: `[` кладёт, `]`
+        // снимает (стала скобка ссылкой или нет). Внутри скобок сервер голых автоссылок
+        // `схема://…`, `www.…` и вики-ссылок не ищет. Считается в этом же проходе: код, формулы,
+        // строчный HTML и назначения ссылок уже пропущены. Блок — от пустой строки или строки с
+        // маркером заголовка, списка, цитаты (приближение: ячейки таблицы — один блок).
+        let mut depth = 0u32;
+        let mut next_break = 0;
         let mut i = 0;
         while i < b.len() {
-            if let Some(k) = jumps.iter().position(|j| j.0 == i) {
-                i = jumps.swap_remove(k).1;
+            steps(1);
+            while self.breaks.get(next_break).is_some_and(|&p| p <= i) {
+                depth = 0;
+                next_break += 1;
+            }
+            if let Some(to) = jumps.remove(&i) {
+                // `]` текста найденной ссылки
+                depth = depth.saturating_sub(1);
+                i = to;
                 continue;
             }
             match b[i] {
@@ -767,20 +998,66 @@ impl<'a> Scanner<'a> {
                 b'`' => i = self.skip_code(i),
                 b'$' => i = self.skip_math(i),
                 b'<' => i = self.skip_angle(i),
-                b'!' if b.get(i + 1) == Some(&b'[') => {
+                b'\n' => {
+                    if block_marker(&b[i + 1..]) {
+                        depth = 0;
+                    }
+                    i += 1;
+                }
+                // `[` и `]` внутри голой автоссылки (`https://e.org/b[t](x.png)`) — часть её
+                // адреса: разбор сервера ссылки там не видит
+                b'!' if b.get(i + 1) == Some(&b'[') && i >= bare_end => {
                     self.link(i + 1, &mut jumps);
+                    depth += 1;
                     i += 2;
                 }
-                b'[' => {
-                    if b.get(i + 1) == Some(&b'[') {
-                        // вики-ссылка `[[…]]` — не файл отчёта
-                        let end = self.para_end(i);
-                        if let Some(k) = find(&b[i..end], b"]]") {
-                            i += k + 2;
-                            continue;
-                        }
+                b'[' if i >= bare_end => {
+                    // вики-ссылка `[[…]]` — не файл отчёта
+                    if depth == 0
+                        && let Some(n) = wikilink(&b[i..self.para_end(i)])
+                    {
+                        steps(n);
+                        i += n;
+                        continue;
                     }
                     self.link(i, &mut jumps);
+                    depth += 1;
+                    i += 1;
+                }
+                b']' if i >= bare_end => {
+                    depth = depth.saturating_sub(1);
+                    i += 1;
+                }
+                // голые автоссылки GFM — только ради отказа по схеме (файлом отчёта они не
+                // бывают); внутри уже найденной (`https://a/ftp://b`) новых нет
+                b':' if i >= bare_end && depth == 0 => {
+                    if let Some(l) = bare_url_autolink(s, i) {
+                        bare_end = l.end;
+                        if l.ftp {
+                            self.out
+                                .push(String::from_utf8_lossy(&b[l.start..l.end]).into_owned());
+                        }
+                    }
+                    i += 1;
+                }
+                b'w' if i >= bare_end && depth == 0 => {
+                    if let Some(end) = bare_www_autolink(s, i) {
+                        bare_end = end;
+                    }
+                    i += 1;
+                }
+                b'@' if i >= bare_end => {
+                    let (line, depth) = self.line_brackets(i, bare_end);
+                    if depth <= 0
+                        && let Some((url, end)) = bare_email_autolink(s, i, line)
+                    {
+                        bare_end = end;
+                        if zam_core::link::url_scheme(&url)
+                            .is_some_and(|s| !zam_core::link::report_scheme_allowed(&s))
+                        {
+                            self.out.push(url);
+                        }
+                    }
                     i += 1;
                 }
                 _ => i += 1,
@@ -791,6 +1068,8 @@ impl<'a> Scanner<'a> {
 
     /// После кода `` `…` ``: позиция за закрывающей последовательностью той же длины (нет —
     /// за открывающей).
+    /// Без пары остаётся не больше одной последовательности каждой длины на абзац — повторных
+    /// просмотров до конца абзаца здесь не бывает (как и у `$$`).
     fn skip_code(&self, i: usize) -> usize {
         let b = self.b;
         let n = b[i..].iter().take_while(|&&c| c == b'`').count();
@@ -800,6 +1079,7 @@ impl<'a> Scanner<'a> {
             if b[k] == b'`' {
                 let m = b[k..end].iter().take_while(|&&c| c == b'`').count();
                 if m == n {
+                    steps(k - i);
                     return k + m;
                 }
                 k += m;
@@ -807,19 +1087,25 @@ impl<'a> Scanner<'a> {
                 k += 1;
             }
         }
+        steps(end - i);
         i + n
     }
 
     /// После формулы `$…$` или `$$…$$` (математика разбора сервера: ссылки внутри не видны).
-    fn skip_math(&self, i: usize) -> usize {
+    fn skip_math(&mut self, i: usize) -> usize {
         let b = self.b;
         if b.get(i + 1) == Some(&b'$') {
-            return find(&b[i + 2..], b"$$").map_or(i + 2, |k| i + 2 + k + 2);
+            let found = find(&b[i + 2..], b"$$");
+            steps(found.unwrap_or(b.len() - i));
+            return found.map_or(i + 2, |k| i + 2 + k + 2);
         }
         if b.get(i + 1).is_none_or(|c| c.is_ascii_whitespace()) {
             return i + 1;
         }
         let end = self.para_end(i);
+        if self.math_miss == end {
+            return i + 1;
+        }
         let mut k = i + 1;
         while k < end {
             match b[k] {
@@ -827,34 +1113,52 @@ impl<'a> Scanner<'a> {
                 b'$' if !b[k - 1].is_ascii_whitespace()
                     && !b.get(k + 1).is_some_and(u8::is_ascii_digit) =>
                 {
+                    steps(k - i);
                     return k + 1;
                 }
                 _ => {}
             }
             k += 1;
         }
+        // закрывающего `$` до конца абзаца нет — и для следующих `$` тоже
+        steps(end - i);
+        self.math_miss = end;
         i + 1
     }
 
-    /// `<…>` — автоссылка или тег HTML: до `>` (ссылки внутри тега не ищутся).
-    fn skip_angle(&self, i: usize) -> usize {
+    /// `<…>` — автоссылка `<схема:адрес>` (её назначение — в вывод: схема проверяется как у
+    /// прочих ссылок) или строчный HTML (ссылки внутри не ищутся): позиция за ним. Не то и не
+    /// другое — `<` остаётся текстом (`<!--ftp://x>` — не комментарий: ссылка в нём видна).
+    fn skip_angle(&mut self, i: usize) -> usize {
         let b = self.b;
-        let tag = b
-            .get(i + 1)
-            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?'));
-        if !tag {
-            return i + 1;
-        }
         let end = self.para_end(i);
-        b[i..end]
+        let rest = &b[i..end];
+        // автоссылка — без пробелов и `<`: дальше них `>` искать незачем
+        if let Some(k) = rest
             .iter()
-            .position(|&c| c == b'>')
-            .map_or(i + 1, |k| i + k + 1)
+            .skip(1)
+            .position(|&c| c == b'>' || c == b'<' || c <= b' ')
+            .map(|k| k + 1)
+            && rest[k] == b'>'
+            && is_autolink(&rest[1..k])
+        {
+            steps(k);
+            self.out
+                .push(String::from_utf8_lossy(&rest[1..k]).into_owned());
+            return i + k + 1;
+        }
+        match inline_html(rest, end, &mut self.html_miss, &mut self.comment_end) {
+            Some(n) => {
+                steps(n);
+                i + n
+            }
+            None => i + 1,
+        }
     }
 
     /// Ссылка с текстом с позиции `[` (`open`): назначение — в вывод, переход через него — в
     /// `jumps`.
-    fn link(&mut self, open: usize, jumps: &mut Vec<(usize, usize)>) {
+    fn link(&mut self, open: usize, jumps: &mut HashMap<usize, usize>) {
         let b = self.b;
         let Some(close) = self.match_bracket(open) else {
             return;
@@ -869,7 +1173,7 @@ impl<'a> Scanner<'a> {
             && let Some((dest, end)) = self.inline_dest(after)
         {
             self.out.push(dest);
-            jumps.push((close, end));
+            jumps.insert(close, end);
             return;
         }
         if b.get(after) == Some(&b'[')
@@ -879,7 +1183,7 @@ impl<'a> Scanner<'a> {
             let label = if label.is_empty() { text } else { label };
             if let Some(d) = self.def(label) {
                 self.out.push(d);
-                jumps.push((close, lc + 1));
+                jumps.insert(close, lc + 1);
             }
             return;
         }
@@ -911,28 +1215,43 @@ impl<'a> Scanner<'a> {
     }
 
     /// Парная `]` текста ссылки (вложенные скобки, экранирование, код).
-    fn match_bracket(&self, open: usize) -> Option<usize> {
+    ///
+    /// Один просмотр находит пары и всем вложенным скобкам — они запоминаются
+    /// ([`Scanner::bracket_pairs`]): незакрытая `[` в длинном абзаце (`[0, 5)` в каждой строке
+    /// таблицы) не заставляет просматривать абзац заново от каждой следующей.
+    fn match_bracket(&mut self, open: usize) -> Option<usize> {
+        if let Some(&close) = self.bracket_pairs.get(&open) {
+            return close;
+        }
         let b = self.b;
         let end = self.para_end(open);
-        let mut depth = 0usize;
+        let mut opened: Vec<usize> = Vec::new();
         let mut k = open;
         while k < end {
+            steps(1);
             match b[k] {
                 b'\\' => k += 1,
                 b'`' => {
                     k = self.skip_code(k);
                     continue;
                 }
-                b'[' => depth += 1,
+                b'[' => opened.push(k),
                 b']' => {
-                    depth -= 1;
-                    if depth == 0 {
+                    // стек не пуст: просмотр начат с `[` и кончается на её паре
+                    let inner = opened.pop();
+                    if opened.is_empty() {
                         return Some(k);
+                    }
+                    if let Some(inner) = inner {
+                        self.bracket_pairs.insert(inner, Some(k));
                     }
                 }
                 _ => {}
             }
             k += 1;
+        }
+        for o in opened {
+            self.bracket_pairs.insert(o, None);
         }
         None
     }
@@ -1023,6 +1342,441 @@ fn skip_ws(b: &[u8], mut i: usize, end: usize) -> usize {
     i
 }
 
+/// Содержимое `<…>` — автоссылка CommonMark с адресом: схема из 2–32 символов (буква, затем
+/// буквы, цифры, `+.-`), `:`, дальше без пробелов, управляющих символов и `<`.
+fn is_autolink(s: &[u8]) -> bool {
+    let Some(colon) = s.iter().take(33).position(|&c| c == b':') else {
+        return false;
+    };
+    (2..=32).contains(&colon)
+        && s[0].is_ascii_alphabetic()
+        && s[1..colon]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || b"+.-".contains(c))
+        && !s.iter().any(|&c| c <= b' ' || c == b'<')
+}
+
+/// Длина строчного HTML в начале `s` (`s[0] == b'<'`; CommonMark §6.6): открывающий тег с
+/// атрибутами, закрывающий тег, комментарий `<!-- … -->`, инструкция `<? … ?>`, объявление
+/// `<!NAME … >`, `<![CDATA[ … ]]>`. `None` — не HTML: `<` — обычный текст. `s` — до конца абзаца
+/// `para`; `miss` помнит, каких закрывающих последовательностей в этом абзаце дальше нет
+/// (второй раз до конца абзаца их не ищут), `comment` — первый годный конец комментария.
+fn inline_html(
+    s: &[u8],
+    para: usize,
+    miss: &mut [usize; 6],
+    comment: &mut (usize, usize, Option<(usize, usize)>),
+) -> Option<usize> {
+    let mut until = |kind: usize, from: usize, close: &[u8]| -> Option<usize> {
+        if miss[kind] == para {
+            return None;
+        }
+        let found = find(&s[from..], close).map(|k| from + k + close.len());
+        if found.is_none() {
+            steps(s.len());
+            miss[kind] = para;
+        }
+        found
+    };
+    let space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
+    match s.get(1)? {
+        b'!' if s[2..].starts_with(b"--") => html_comment_len(s, para, comment),
+        // CDATA — как в разборе сервера (`cdata`): конец `]]>` — после серии `]` годной длины;
+        // годность от начала не зависит, поэтому промах запоминается на абзац
+        b'!' if s[2..].starts_with(b"[CDATA[") => {
+            if miss[1] == para {
+                return None;
+            }
+            let end = closing_run(s, 9, b']').map(|(_, end)| end);
+            if end.is_none() {
+                miss[1] = para;
+            }
+            end
+        }
+        // объявление — как в разборе сервера (comrak 0.56, `declaration`): заглавные буквы,
+        // затем пробельный символ; `<!D<ftp://q.org>` — не объявление, а текст и автоссылка
+        b'!' if s.get(2).is_some_and(u8::is_ascii_uppercase) => {
+            let name = s[2..].iter().take_while(|c| c.is_ascii_uppercase()).count();
+            if !s
+                .get(2 + name)
+                .is_some_and(|&c| space(c) || matches!(c, 0x0b | 0x0c))
+            {
+                return None;
+            }
+            until(2, 2 + name, b">")
+        }
+        b'?' => until(3, 2, b"?>"),
+        b'/' => {
+            if !s.get(2)?.is_ascii_alphabetic() {
+                return None;
+            }
+            let mut k = 2 + s[2..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == b'-')
+                .count();
+            k += s[k..].iter().take_while(|&&c| space(c)).count();
+            (s.get(k) == Some(&b'>')).then_some(k + 1)
+        }
+        c if c.is_ascii_alphabetic() => {
+            let mut k = 1 + s[1..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == b'-')
+                .count();
+            loop {
+                let ws = s[k..].iter().take_while(|&&c| space(c)).count();
+                k += ws;
+                match s.get(k)? {
+                    b'>' => return Some(k + 1),
+                    b'/' => return (s.get(k + 1) == Some(&b'>')).then_some(k + 2),
+                    c if ws > 0 && (c.is_ascii_alphabetic() || matches!(c, b'_' | b':')) => {}
+                    _ => return None,
+                }
+                // имя атрибута и необязательное значение
+                k += s[k..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(c))
+                    .count();
+                let eq = k + s[k..].iter().take_while(|&&c| space(c)).count();
+                if s.get(eq) != Some(&b'=') {
+                    continue;
+                }
+                k = eq + 1 + s[eq + 1..].iter().take_while(|&&c| space(c)).count();
+                match s.get(k)? {
+                    q @ (b'"' | b'\'') => {
+                        let kind = if *q == b'"' { 4 } else { 5 };
+                        k = until(kind, k + 1, &[*q])?;
+                    }
+                    _ => {
+                        let n = s[k..]
+                            .iter()
+                            .take_while(|&&c| !space(c) && !b"\"'=<>`".contains(&c))
+                            .count();
+                        if n == 0 {
+                            return None;
+                        }
+                        k += n;
+                    }
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Первая с позиции `from` серия знаков `ch`, которой кончается комментарий (`-`) или CDATA
+/// (`]`): начало серии и позиция за `>`. Разбор сервера (comrak 0.56, `htmlcomment`, `cdata`)
+/// читает текст кусками «не знак», «знак и не знак», «два знака и не `>`», конец — два знака и
+/// `>` на границе куска. Серия из `L` знаков перед `>` разбирается тройками, поэтому конец годен,
+/// только когда `L` при делении на 3 даёт 2: `-->` и `----->` кончают комментарий, `--->` и
+/// `---->` — нет. Годность зависит только от самой серии (перед ней — не знак), не от начала
+/// комментария.
+fn closing_run(s: &[u8], from: usize, ch: u8) -> Option<(usize, usize)> {
+    let mut k = from;
+    while k < s.len() {
+        if s[k] != ch {
+            k += 1;
+            continue;
+        }
+        let run = s[k..].iter().take_while(|&&c| c == ch).count();
+        if run % 3 == 2 && s.get(k + run) == Some(&b'>') {
+            steps(k + run - from);
+            return Some((k, k + run + 1));
+        }
+        k += run;
+    }
+    steps(s.len().saturating_sub(from));
+    None
+}
+
+/// Длина комментария HTML в начале `s` (`<!--…`; `s` — до конца абзаца `para`) — как
+/// `htmlcomment` разбора сервера; `<!-->` и `<!--->` — тоже комментарии. Серия дефисов сразу
+/// за `<!--` разбирается здесь (она зависит от начала), дальше конец — первая годная серия
+/// ([`closing_run`]). Он ищется один раз: `cache` помнит конец абзаца, позицию, с которой искали,
+/// и найденное — следующий `<!--` того же абзаца (позиции только растут) берёт готовый ответ,
+/// пока не зайдёт за него. Так `<!--` в каждой строке при негодном `--->` в конце абзаца не
+/// заставляет проходить абзац заново.
+fn html_comment_len(
+    s: &[u8],
+    para: usize,
+    cache: &mut (usize, usize, Option<(usize, usize)>),
+) -> Option<usize> {
+    let run = s[4..].iter().take_while(|&&c| c == b'-').count();
+    let after = 4 + run;
+    if s.get(after) == Some(&b'>') && (run < 2 || run % 3 == 2) {
+        return Some(after + 1);
+    }
+    // серия за `<!--` разобрана тройками; остаток из одного или двух дефисов забирает и
+    // следующий знак (`-x`, `--x`)
+    let from = if run % 3 == 0 { after } else { after + 1 };
+    let base = para - s.len();
+    let q = base + from;
+    let (p, asked, found) = *cache;
+    let found = if p == para && asked <= q && found.is_none_or(|(start, _)| q <= start) {
+        found
+    } else {
+        let found = (from < s.len())
+            .then(|| closing_run(s, from, b'-'))
+            .flatten()
+            .map(|(start, end)| (base + start, base + end));
+        *cache = (para, q, found);
+        found
+    };
+    found.map(|(_, end)| end - base)
+}
+
+/// Длина вики-ссылки `[[адрес]]` или `[[адрес|текст]]` в начале `s` — как `handle_wikilink`
+/// разбора сервера (comrak 0.56): в частях нет `[`, `]`, `|` (экранирование `\` — как в тексте),
+/// часть не длиннее 1000 символов. `[[a][b]]` — не вики-ссылка, а две обычные.
+fn wikilink(s: &[u8]) -> Option<usize> {
+    if !s.starts_with(b"[[") {
+        return None;
+    }
+    // конец части, начатой в `from` (`[` или `|`)
+    let part = |from: usize| -> Option<usize> {
+        let (mut k, mut len) = (from + 1, 0);
+        while let Some(&c) = s.get(k) {
+            if matches!(c, b'[' | b']' | b'|') {
+                break;
+            }
+            if c == b'\\' && s.get(k + 1).is_some_and(u8::is_ascii_punctuation) {
+                k += 1;
+                len += 1;
+            }
+            k += 1;
+            len += 1;
+            if len > 1000 {
+                return None;
+            }
+        }
+        Some(k)
+    };
+    let mut k = part(1)?;
+    if s.get(k) == Some(&b'|') {
+        k = part(k)?;
+    }
+    s[k..].starts_with(b"]]").then_some(k + 2)
+}
+
+/// Знак годится для имени узла голой автоссылки GFM — как `is_valid_hostchar` разбора сервера
+/// (comrak): не пробельный, не знак препинания и не символ Юникода. Для ASCII — точно (буква,
+/// цифра или непробельный управляющий); вне ASCII таблиц категорий у клиента нет — отсекаются
+/// только частые знаки (кавычки, тире, многоточие, стрелки, полноширинная пунктуация), прочее
+/// считается буквой. Ошибка приближения — только лишний отказ клиента или отказ сервера `422`
+/// вместо отказа клиента.
+fn host_char(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || (c.is_ascii_control() && !c.is_whitespace());
+    }
+    !(c.is_whitespace()
+        || matches!(
+            c,
+            '\u{A1}'..='\u{BF}'
+                | '\u{D7}'
+                | '\u{F7}'
+                | '\u{2010}'..='\u{2027}'
+                | '\u{2030}'..='\u{205E}'
+                | '\u{2190}'..='\u{23FF}'
+                | '\u{2500}'..='\u{27BF}'
+                | '\u{3001}'..='\u{3003}'
+                | '\u{3008}'..='\u{3011}'
+                | '\u{FF01}'..='\u{FF0F}'
+        ))
+}
+
+/// Имя узла голой автоссылки GFM принимается — `check_domain` разбора сервера: узел — знаки
+/// [`host_char`], `-`, `_`, `.`; в двух последних метках нет `_` (если точек не больше десяти);
+/// `short` — точка в узле не обязательна (`схема://узел`; у `www.` — обязательна). `tail` — текст
+/// от начала узла: просматривается только сам узел.
+fn bare_domain_ok(tail: &str, short: bool) -> bool {
+    let (mut dots, mut underscores, mut prev_underscores, mut seen) = (0, 0, 0, 0);
+    for (k, c) in tail.char_indices() {
+        seen += 1;
+        match c {
+            '\\' if k + 1 < tail.len() => {}
+            '_' => underscores += 1,
+            '.' => {
+                prev_underscores = underscores;
+                underscores = 0;
+                dots += 1;
+            }
+            c if host_char(c) || c == '-' => {}
+            _ => break,
+        }
+    }
+    steps(seen);
+    dots > 10 || (underscores == 0 && prev_underscores == 0 && (short || dots > 0))
+}
+
+/// Строка начинает новый блок: маркер заголовка, цитаты или пункта списка.
+fn block_marker(line: &[u8]) -> bool {
+    let line = &line[line.iter().take_while(|&&c| c == b' ').count()..];
+    match line.first() {
+        Some(b'#' | b'>') => true,
+        Some(b'-' | b'*' | b'+') => line.get(1).is_none_or(|&c| c == b' '),
+        Some(c) if c.is_ascii_digit() => {
+            let n = line.iter().take_while(|c| c.is_ascii_digit()).count();
+            matches!(line.get(n), Some(b'.' | b')')) && line.get(n + 1).is_none_or(|&c| c == b' ')
+        }
+        _ => false,
+    }
+}
+
+/// Пробельный символ ASCII разбора сервера (`isspace`).
+fn bare_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Конец голой автоссылки, начатой до `from`: первый пробельный символ или `<`.
+fn bare_link_end(b: &[u8], from: usize) -> usize {
+    let end = b[from..]
+        .iter()
+        .position(|&c| bare_space(c) || c == b'<')
+        .map_or(b.len(), |k| from + k);
+    steps(end - from);
+    end
+}
+
+/// Голая автоссылка `схема://…`: байты `start..end` текста.
+struct BareUrl {
+    start: usize,
+    end: usize,
+    /// Схема `ftp` — её сервер отклоняет; иначе `http`/`https`.
+    ftp: bool,
+}
+
+/// Голая автоссылка GFM `схема://узел…` (расширение `autolink` разбора сервера, `url_match`
+/// comrak 0.56) по двоеточию в позиции `i`. Ссылку `ftp://…` сервер отклоняет по схеме;
+/// `http(s)://…` разрешена, но нужна её граница: всё до пробельного символа — её адрес, новых
+/// ссылок внутри нет. Правило снято с разбора сервера:
+/// - за двоеточием `//`, перед ним — буквы ASCII, целиком равные `http`, `https` или `ftp` без
+///   учёта регистра (`словоftp://…` и `1ftp://…` — ссылки, `aftp://…`, `sftp://…` — нет);
+/// - первый знак узла — [`host_char`], узел — [`bare_domain_ok`].
+///
+/// Конец ссылки ищется только у принятой: отказ стоит не больше длины узла.
+fn bare_url_autolink(s: &str, i: usize) -> Option<BareUrl> {
+    let b = s.as_bytes();
+    if b.get(i + 1) != Some(&b'/') || b.get(i + 2) != Some(&b'/') {
+        return None;
+    }
+    // схема — не длиннее `https`: дальше шести букв назад смотреть незачем
+    let back = b[..i]
+        .iter()
+        .rev()
+        .take(6)
+        .take_while(|c| c.is_ascii_alphabetic())
+        .count();
+    let start = i - back;
+    let scheme = &b[start..i];
+    let ftp = scheme.eq_ignore_ascii_case(b"ftp");
+    if !(ftp || scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https")) {
+        return None;
+    }
+    // `i + 3` — граница символа: перед ней ASCII `/`
+    let tail = &s[i + 3..];
+    if !(tail.chars().next().is_some_and(host_char) && bare_domain_ok(tail, true)) {
+        return None;
+    }
+    let end = bare_link_end(b, i + 3);
+    Some(BareUrl { start, end, ftp })
+}
+
+/// Голая автоссылка GFM `www.узел.зона…` (`www_match` comrak 0.56) с позиции `i`: её конец. Схема
+/// (`http`) разрешена — нужна только граница, как у [`bare_url_autolink`]. Перед `www.` — начало
+/// текста, пробельный символ или один из `*_~([`.
+fn bare_www_autolink(s: &str, i: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let before = i == 0 || bare_space(b[i - 1]) || b"*_~([".contains(&b[i - 1]);
+    if !before || !b[i..].starts_with(b"www.") {
+        return None;
+    }
+    bare_domain_ok(&s[i + 4..], false).then(|| bare_link_end(b, i + 4))
+}
+
+/// Голая автоссылка почты GFM (`имя@узел.зона`, `xmpp:имя@узел.зона`; `email_match` comrak 0.56)
+/// по знаку `@` в позиции `i`: её адрес и конец в тексте. С протоколом адрес — текст от начала
+/// имени, вместе со всем, что стоит перед протоколом слитно (`a.xmpp:имя@узел.зона` — схема
+/// `a.xmpp`), поэтому решает [`zam_core::link::url_scheme`] у вызывающего; без протокола сервер
+/// подставляет `mailto:`. `line` — начало текста, в который может входить адрес: начало строки
+/// или конец предыдущей голой автоссылки ([`Scanner::line_brackets`]).
+/// Правило снято с разбора сервера:
+/// - имя — назад по буквам, цифрам и `.+-_`; двоеточие входит, если перед ним буквы ASCII,
+///   целиком равные `mailto` или `xmpp` (регистр важен);
+/// - узел — вперёд по буквам, цифрам, `-`, `_`, точке перед буквой или цифрой (нужна хотя бы
+///   одна), у `xmpp` ещё `/`; второй `@` — не адрес; последний знак — буква или точка;
+/// - `@` внутри незакрытой `[` — не адрес (проверяет вызывающий; глубина скобок считается по
+///   строке — приближение: разбор сервера считает её по текстовому узлу);
+/// - текст адреса кончается там, где начинается голая автоссылка `схема://…` (она разбирается
+///   раньше почты): узел не содержит `:`, поэтому такая ссылка может начаться только у
+///   двоеточия, на котором узел остановился.
+fn bare_email_autolink(s: &str, i: usize, line: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let protocol = |name: &[u8], colon: usize| {
+        let from = colon
+            - b[line..colon]
+                .iter()
+                .rev()
+                .take(name.len() + 1)
+                .take_while(|c| c.is_ascii_alphabetic())
+                .count();
+        &b[from..colon] == name
+    };
+    let (mut start, mut with_protocol, mut xmpp) = (i, false, false);
+    while start > line {
+        let c = b[start - 1];
+        if c.is_ascii_alphanumeric() || b".+-_".contains(&c) {
+            start -= 1;
+        } else if c == b':' && protocol(b"mailto", start - 1) {
+            with_protocol = true;
+            start -= 1;
+        } else if c == b':' && protocol(b"xmpp", start - 1) {
+            (with_protocol, xmpp) = (true, true);
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    steps(i - start);
+    if start == i {
+        return None;
+    }
+    // узел: до `limit` (конец текста или начало следующей автоссылки), не дальше конца строки;
+    // `None` — в узле второй `@`
+    let host = |limit: usize| -> Option<(usize, usize)> {
+        let (mut len, mut dots) = (1, 0);
+        while i + len < limit {
+            let c = b[i + len];
+            if c.is_ascii_alphanumeric() {
+            } else if c == b'@' {
+                return None;
+            } else if c == b'.' && i + len + 1 < limit && b[i + len + 1].is_ascii_alphanumeric() {
+                dots += 1;
+            } else if !(c == b'-' || c == b'_' || (c == b'/' && xmpp)) {
+                break;
+            }
+            len += 1;
+        }
+        steps(len);
+        Some((len, dots))
+    };
+    let (mut len, mut dots) = host(b.len())?;
+    if b.get(i + len) == Some(&b':')
+        && let Some(next) = bare_url_autolink(s, i + len)
+    {
+        (len, dots) = host(next.start.max(i + 1))?;
+    }
+    let last = b[i + len - 1];
+    if len < 2 || dots == 0 || !(last.is_ascii_alphabetic() || last == b'.') {
+        return None;
+    }
+    let text = &s[start..i + len];
+    let url = if with_protocol {
+        text.to_string()
+    } else {
+        format!("mailto:{text}")
+    };
+    Some((url, i + len))
+}
+
 fn find(h: &[u8], n: &[u8]) -> Option<usize> {
     h.windows(n.len()).position(|w| w == n)
 }
@@ -1036,7 +1790,7 @@ mod tests {
         let mut v: Vec<String> = v
             .into_iter()
             .filter(|t| !t.is_empty() && !t.starts_with('#') && !t.starts_with("//"))
-            .filter(|t| !scheme_of(t))
+            .filter(|t| zam_core::link::url_scheme(t).is_none())
             .map(|t| t.split('#').next().unwrap_or_default().to_string())
             .filter(|t| !t.is_empty())
             .collect();
@@ -1109,6 +1863,393 @@ mod tests {
         );
     }
 
+    /// Автоссылка `<схема:адрес>` попадает в назначения (её схему проверяет `local_name`);
+    /// тег HTML, почта и `<…>` с пробелом — нет.
+    #[test]
+    fn autolinks_are_scanned_for_scheme_check() {
+        let md = "<ftp://e.org/a> и <https://e.org/b> и <FILE:///etc/hosts>\n\n\
+                  <a href=\"x:y\">тег</a> <b> <a@b.c> <не ссылка: текст> <c:\\x> `<javascript:x>`\n";
+        assert_eq!(
+            local_links(md),
+            ["ftp://e.org/a", "https://e.org/b", "FILE:///etc/hosts"]
+        );
+        assert!(local_name("ftp://e.org/a").is_err());
+        assert!(local_name("https://e.org/b").unwrap().is_none());
+        assert!(local_name("FILE:///etc/hosts").unwrap().is_none());
+        for (s, auto) in [
+            ("ab:c", true),
+            ("a:c", false),
+            ("ab", false),
+            ("1b:c", false),
+            ("ab:c d", false),
+            ("ab:c<d", false),
+            ("a-b+c.d:x", true),
+        ] {
+            assert_eq!(is_autolink(s.as_bytes()), auto, "{s}");
+        }
+    }
+
+    /// Ревью 15a, Minor 5: всё, что разбор сервера (comrak с расширением `autolink`) считает
+    /// ссылкой с недопустимой схемой, сканер CLI тоже видит и отклоняет — и голые `ftp://…`,
+    /// `xmpp:…` в тексте; а где сервер ссылки не видит (код, середина слова) — не отклоняет.
+    #[test]
+    fn rejected_schemes_agree_with_server_parse() {
+        let rejected = |targets: Vec<String>| -> Vec<String> {
+            let mut v: Vec<String> = targets
+                .iter()
+                .filter_map(|t| zam_core::link::url_scheme(t))
+                .filter(|s| !zam_core::link::report_scheme_allowed(s))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let corpus: [(&str, &[&str]); 27] = [
+            // объявление HTML — заглавные буквы и пробельный символ после имени (ревью, круг 4,
+            // Minor 1); иначе `<!…` — текст, автоссылка за ним видна
+            ("т <!D<ftp://q.org>\n", &["ftp"]),
+            // в начале строки `<!` с буквой открывает блок HTML: ссылок в нём нет
+            ("<!D<ftp://q.org>\n", &[]),
+            (
+                "т <!DOCTYPE ftp://q.org/a> и <!d ftp://q.org/b>\n",
+                &["ftp"],
+            ),
+            ("т <!DOCTYPE<ftp://q.org/a> x>\n", &["ftp"]),
+            // адрес почты кончается там, где начинается голая ссылка `схема://…`: от почты
+            // остаётся `xmpp:@www.` (не адрес), ссылка — `FTP://…`
+            ("т xmpp:@www.FTP://example.org/a\n", &["ftp"]),
+            ("т xmpp:u@h.org-http://example.org/a\n", &[]),
+            // блок HTML: ссылок в нём разбор сервера не видит (повторное ревью, Minor 2)
+            ("<div>ftp://example.org/a</div>\n", &[]),
+            (
+                "<div>\nftp://example.org/a\n</div>\n\nftp://example.org/b\n",
+                &["ftp"],
+            ),
+            ("<!-- ftp://example.org/a -->\n", &[]),
+            (
+                "<pre>\nftp://example.org/a\n\nftp://example.org/b\n</pre>\nтекст\n",
+                &[],
+            ),
+            ("<details open>\nxmpp:user@example.org\n", &[]),
+            // одиночный тег абзац не прерывает: это строчный HTML, ссылка дальше видна
+            ("текст\n<span>\nftp://example.org/a\n", &["ftp"]),
+            ("<span>\nftp://example.org/a\n\nтекст\n", &[]),
+            ("см. ftp://example.org/a тут\n", &["ftp"]),
+            ("ftp://example.org/a в начале\n", &["ftp"]),
+            ("(ftp://example.org/a) и *ftp://example.org/b*\n", &["ftp"]),
+            ("FTP://EXAMPLE.ORG/a\n", &["ftp"]),
+            ("пишите xmpp:user@example.org сюда\n", &["xmpp"]),
+            (
+                "<ftp://example.org/a> и [x](ftp://example.org/b)\n",
+                &["ftp"],
+            ),
+            ("сайт https://example.org и www.example.org\n", &[]),
+            (
+                "`ftp://example.org/a` в коде\n\n```\nftp://example.org/b\n```\n",
+                &[],
+            ),
+            ("словоftp://example.org/a слитно\n", &["ftp"]),
+            ("aftp://example.org/a и sftp://example.org/b\n", &[]),
+            ("1ftp://example.org/b\n", &["ftp"]),
+            ("ftp:/example.org и ftp: текст и xmpp: текст\n", &[]),
+            (
+                "[x](javascript:alert(1)) и ftp://example.org/a\n",
+                &["ftp", "javascript"],
+            ),
+            (
+                "- пункт ftp://example.org/a\n\n> цитата ftp://example.org/b\n",
+                &["ftp"],
+            ),
+        ];
+        for (md, want) in corpus {
+            let server = rejected(
+                zam_markdown::parse(md)
+                    .links
+                    .into_iter()
+                    .filter(|l| l.kind != zam_markdown::LinkKind::Wiki)
+                    .map(|l| l.target)
+                    .collect(),
+            );
+            assert_eq!(server, want, "разбор сервера:\n{md}");
+            assert_eq!(rejected(local_links(md)), want, "сканер CLI:\n{md}");
+        }
+    }
+
+    /// Ревью 15a, Minor 5: то же согласие на случайном тексте (фиксированное зерно) — голые
+    /// автоссылки среди слов, знаков препинания, переводов строк и выделения. Сравнивается
+    /// решение «отклонить» по набору схем: сканер CLI и разбор сервера.
+    ///
+    /// Чего в наборе кусков нет намеренно: одиночного `_` (выделение `_xmpp:имя@узел_` делит
+    /// текст на узлы, и адрес начинается с протокола; сканер границ выделения не знает и видит
+    /// `_xmpp:…` — относительный адрес; такой отчёт отклонит сервер, `422`).
+    #[test]
+    fn bare_autolinks_agree_with_server_parse_on_random_text() {
+        #[rustfmt::skip]
+        const PARTS: &[&str] = &[
+            "ftp://", "FTP://", "Ftp://", "xmpp:", "XMPP:", "ftp:", "ftp:/", "example.org/a",
+            "user@example.org", "host", "a", "z", "я", "1", " ", " ", "\n", "\n\n", "(", ")", "*",
+            "~", ".", ",", "-", "/", ":", "@", "\"", "'", "!", "?", "www.", "https://", "> ", "- ",
+            "# ", "    ", "|", "mailto:", "h.org", "u@h.org/r", "+", "a.", "_b", "a_b", "[", "]",
+            "`", "<", ">", "«", "…", "<div>", "</div>", "\n<div>", "\n<span>\n", "<!--", "-->",
+            "\n<pre>", "</pre>",
+        ];
+        let rejected = |targets: Vec<String>| -> Vec<String> {
+            let mut v: Vec<String> = targets
+                .iter()
+                .filter_map(|t| zam_core::link::url_scheme(t))
+                .filter(|s| !zam_core::link::report_scheme_allowed(s))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let mut x: u32 = 0x15A_2026;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let (mut with_link, mut diff) = (0, Vec::new());
+        for _ in 0..60_000 {
+            let n = 1 + next() % 9;
+            let mut md = String::from("т ");
+            for _ in 0..n {
+                md.push_str(PARTS[(next() % PARTS.len() as u32) as usize]);
+            }
+            md.push('\n');
+            let server = rejected(
+                zam_markdown::parse(&md)
+                    .links
+                    .into_iter()
+                    .filter(|l| l.kind != zam_markdown::LinkKind::Wiki)
+                    .map(|l| l.target)
+                    .collect(),
+            );
+            with_link += usize::from(!server.is_empty());
+            let cli = rejected(local_links(&md));
+            if server != cli {
+                diff.push(format!("{md:?}: сервер {server:?}, CLI {cli:?}"));
+            }
+        }
+        assert!(with_link > 300, "{with_link}");
+        assert!(
+            diff.is_empty(),
+            "{} расхождений:\n{}",
+            diff.len(),
+            diff[..diff.len().min(40)].join("\n")
+        );
+    }
+
+    /// Ревью 15a, круг 4, Minor 2: ссылки на файлы рядом с голыми автоссылками — те же, что видит
+    /// разбор сервера. Скобка внутри голой автоссылки (`https://e.org/b[t](x.png)`) — часть её
+    /// адреса, а не начало ссылки. Случайный текст с фиксированным зерном.
+    #[test]
+    fn file_links_near_bare_autolinks_agree_with_server_parse() {
+        for (md, want) in [
+            (
+                "<a href=\"h.png\"><!--https://e.org/b[t](<e f.png>)\n",
+                vec![],
+            ),
+            ("https://e.org/b[t](x.png) и [u](y.png)\n", vec!["y.png"]),
+            ("www.e.org/[t](x.png) ![i](z.png)\n", vec!["z.png"]),
+            ("ftp://q.org/![i](x.png)\n", vec![]),
+            ("[t https://e.org/a](x.png)\n", vec!["x.png"]),
+            ("(https://e.org/a) [t](x.png)\n", vec!["x.png"]),
+            // конец комментария и CDATA — по серии знаков перед `>` (ревью, круг 5): `--->` и
+            // `]]]>` их не кончают
+            ("т <!-- a ---> [t](x.png) --> [u](y.png)\n", vec!["y.png"]),
+            (
+                "т <!-- a -----> [t](x.png) --> [u](y.png)\n",
+                vec!["x.png", "y.png"],
+            ),
+            ("т <!-- a ---> [t](x.png)\n", vec!["x.png"]),
+            (
+                "т <!-----> [t](x.png) <!----> [u](y.png)\n",
+                vec!["x.png", "y.png"],
+            ),
+            (
+                "т <![CDATA[ a ]]]> [t](x.png) ]]> [u](y.png)\n",
+                vec!["y.png"],
+            ),
+            ("т <![CDATA[ a ]]]> [t](x.png)\n", vec!["x.png"]),
+            // `<!D[` без пробела — не объявление: в строке ссылка за ним видна обоим
+            ("т <!D[t](<e f.png>)<![CDATA[\n", vec!["e f.png"]),
+        ] {
+            assert_eq!(server(md), want, "разбор сервера:\n{md}");
+            assert_eq!(local(local_links(md)), want, "сканер CLI:\n{md}");
+        }
+        // Известное приближение (→ M7): в начале пункта списка `<!D…` открывает блок HTML, и
+        // сервер ссылки в нём не видит; блок HTML внутри пункта списка и цитаты сканер не
+        // распознаёт и ссылку видит.
+        let in_list = "[t](c d.png)\n- <!D[t](<e f.png>)<![CDATA[\n";
+        assert_eq!(server(in_list), Vec::<String>::new());
+        assert_eq!(local(local_links(in_list)), ["e f.png"]);
+        #[rustfmt::skip]
+        const PARTS: &[&str] = &[
+            "https://e.org/b", "http://e.org", "www.e.org/", "ftp://q.org/", "[t](x.png)",
+            "![i](<e f.png>)", "[u](y.png)", "[v][r]", " ", " ", "\n", "<!--", "-->",
+            "<a href=\"h.png\">", "(", ")", ",", ".", "т", "a", "[", "]", "u@h.org", ":", "/",
+        ];
+        let mut x: u32 = 0x15A_2026;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let (mut with_link, mut diff) = (0, Vec::new());
+        for _ in 0..40_000 {
+            let n = 1 + next() % 8;
+            let mut md = String::from("т ");
+            for _ in 0..n {
+                md.push_str(PARTS[(next() % PARTS.len() as u32) as usize]);
+            }
+            md.push_str("\n\n[r]: r.png\n");
+            let want = server(&md);
+            with_link += usize::from(!want.is_empty());
+            let got = local(local_links(&md));
+            if want != got {
+                diff.push(format!("{md:?}: сервер {want:?}, CLI {got:?}"));
+            }
+        }
+        assert!(with_link > 3000, "{with_link}");
+        assert!(
+            diff.is_empty(),
+            "{} расхождений:\n{}",
+            diff.len(),
+            diff[..diff.len().min(40)].join("\n")
+        );
+    }
+
+    /// Тела для проверки линейности: `rows` строк одного вида без пустых строк между ними (один
+    /// блок — худший случай для счёта скобок).
+    fn long_bodies(rows: usize) -> Vec<(&'static str, String)> {
+        let make = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
+        vec![
+            (
+                "таблица со ссылками",
+                format!(
+                    "| источник | адрес |\n|---|---|\n{}",
+                    make(&|k| format!(
+                        "| работа {k} | https://example.org/papers/{k}?a=b и [pdf](files/p{k}.pdf) |\n"
+                    ))
+                ),
+            ),
+            (
+                "https + почта + www",
+                make(&|k| {
+                    format!(
+                        "см. https://e{k}.example.org/a, u{k}@example.org и www.example.org/{k}\n"
+                    )
+                }),
+            ),
+            (
+                "перечень источников",
+                make(&|k| {
+                    format!("{k}. Автор. Название: подзаголовок. ftp-зеркало http://h{k}.org/x\n")
+                }),
+            ),
+            (
+                "одна строка",
+                make(&|k| format!("a{k}@ b: w c@d https://e{k}.org/x_y [t{k}] ")),
+            ),
+            (
+                "почта без узла в одной строке",
+                make(&|k| format!("n{k}@ x.y:z {k}@. ")),
+            ),
+            (
+                "слитные адреса без пробелов",
+                make(&|k| format!("http://a_b{k},www.a_b,")),
+            ),
+            // непарные знаки в каждой строке таблицы: до конца абзаца ищут один раз
+            (
+                "интервалы и цены",
+                make(&|k| format!("| [{k}, 5) | $10{k} и $x{k} | a <b{k} c | `` x |\n")),
+            ),
+            (
+                "незакрытый HTML и вики",
+                make(&|k| format!("{k} <!-- a <? b <!D c <![CDATA[ d <a b=\"c e='f [[g\n")),
+            ),
+            (
+                "вложенные скобки",
+                make(&|k| format!("[a{k} [b] [c [d] e] f ![g](h{k}.png)\n")),
+            ),
+            // ссылки, вложенные друг в друга на всю глубину: переходы через назначения копятся
+            (
+                "вложенные ссылки",
+                format!(
+                    "{}{}\n",
+                    make(&|k| format!("[a{k} ")),
+                    make(&|k| format!("](x{k}.png)"))
+                ),
+            ),
+            // `<!--` в каждой строке, а в конце абзаца — `--->`, которым комментарий не кончается
+            (
+                "комментарии без годного конца",
+                format!("{}--->\n", make(&|k| format!("a{k} <!-- b\n"))),
+            ),
+            (
+                "CDATA без годного конца",
+                format!("{}]]]>\n", make(&|k| format!("a{k} <![CDATA[ b\n"))),
+            ),
+        ]
+    }
+
+    /// Повторное ревью 15a, I-3: сканер ссылок линеен по длине тела. Счётчик шагов вместо
+    /// времени: при удвоении числа строк шагов вдвое больше (квадратичный сканер давал вчетверо).
+    #[test]
+    fn local_links_scanner_is_linear() {
+        let count = |md: &str| {
+            STEPS.with(|s| s.set(0));
+            let n = local_links(md).len();
+            (STEPS.with(std::cell::Cell::get), n)
+        };
+        let small = long_bodies(5_000);
+        let big = long_bodies(10_000);
+        // все нелинейные тела — в одном сообщении (а не только первое)
+        let mut bad = Vec::new();
+        for ((name, a), (_, b)) in small.iter().zip(&big) {
+            let (sa, _) = count(a);
+            let (sb, _) = count(b);
+            assert!(
+                sa as usize >= a.len(),
+                "{name}: счётчик считает шаги ({sa})"
+            );
+            let ratio = sb as f64 / sa as f64;
+            // при удвоении тела шагов вдвое больше — и не больше нескольких проходов по тексту
+            if !(1.8..2.3).contains(&ratio) || sb as usize >= 12 * b.len() {
+                bad.push(format!(
+                    "{name}: шагов {sa} → {sb} на {} байт, отношение {ratio:.2}",
+                    b.len()
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "нелинейно:\n{}", bad.join("\n"));
+        // запрещённая схема в длинном теле по-прежнему находится
+        let (_, md) = &long_bodies(2_000)[0];
+        let md = format!("{md}| x | ftp://example.org/a |\n");
+        assert!(local_links(&md).iter().any(|t| t.starts_with("ftp://")));
+    }
+
+    /// Замер времени сканера (не проверка): `cargo test --release -p zam-cli --bins -- --ignored
+    /// --nocapture local_links_scanner_timing`.
+    #[test]
+    #[ignore = "замер времени, запускается вручную"]
+    fn local_links_scanner_timing() {
+        for rows in [4_000, 8_000, 16_000] {
+            for (name, md) in long_bodies(rows) {
+                let t = std::time::Instant::now();
+                let n = local_links(&md).len();
+                println!(
+                    "{rows} строк, {name}: {} кБ, ссылок {n}, {:.1} мс",
+                    md.len() / 1000,
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+    }
+
     #[test]
     fn names_and_rules() {
         assert_eq!(
@@ -1118,12 +2259,34 @@ mod tests {
         assert_eq!(local_name("././a.png#x").unwrap().unwrap(), "a.png");
         for none in [
             "https://e.com/a.png",
+            "http://e.com",
             "mailto:a@b.c",
+            "vscode://file/C:/proj/a.rs:10",
+            "file:///C:/data/a.csv",
+            "FILE:///etc/hosts",
             "#sec",
             "//host/a.png",
             "",
         ] {
             assert!(local_name(none).unwrap().is_none(), "{none}");
+        }
+        // схема не из общего списка — ошибка ввода с перечнем разрешённых (M6 §16 п. 15)
+        for (bad, scheme) in [
+            ("ftp://e.com/a", "ftp"),
+            ("javascript:alert(1)", "javascript"),
+            ("JaVaScRiPt:alert(1)", "javascript"),
+            (" javascript:alert(1)", "javascript"),
+            ("java\tscript:alert(1)", "javascript"),
+            ("data:image/png;base64,AAAA", "data"),
+            ("vscode-insiders://file/x", "vscode-insiders"),
+        ] {
+            let e = local_name(bad).unwrap_err();
+            assert!(
+                e.msg.contains(&format!("схема {scheme}:"))
+                    && e.msg.contains("http, https, mailto, vscode, file"),
+                "{bad}: {}",
+                e.msg
+            );
         }
         for bad in [
             "../a.png",

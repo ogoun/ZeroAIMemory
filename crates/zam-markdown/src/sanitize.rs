@@ -93,6 +93,11 @@ const SET_ATTRIBUTES: &[(&str, &str, &str)] = &[("input", "disabled", "")];
 /// Схемы абсолютных URL; относительные проходят как есть.
 const URL_SCHEMES: &[&str] = &["http", "https", "mailto"];
 
+/// Схемы URL-атрибутов страницы отчёта (M6 §16 п. 15): к обычным добавлена только `vscode` —
+/// и только для `<a href>` вида `vscode://file/…` ([`report_filter`]). `file:` в `href` не
+/// бывает: ссылка без перехода несёт адрес в `data-url`.
+const REPORT_URL_SCHEMES: &[&str] = &["http", "https", "mailto", "vscode"];
+
 /// Префиксы допустимых классов.
 const CLASS_PREFIXES: &[&str] = &[
     "hl-",
@@ -113,18 +118,37 @@ pub(crate) const EXTERNAL_REL: &str = "noopener noreferrer";
 /// атрибуте, после удаления пробельных и управляющих символов).
 const DANGEROUS_VALUES: &[&str] = &["javascript:", "vbscript:", "data:text/html"];
 
-static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
+static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| builder(URL_SCHEMES, filter, &[]));
+
+/// Атрибуты тегов сверх [`TAG_ATTRIBUTES`] на странице отчёта: адрес ссылки без перехода.
+const REPORT_TAG_ATTRIBUTES: &[(&str, &str)] = &[("a", "data-url")];
+
+/// Санитайзер страницы отчёта: тот же allowlist, схемы — [`REPORT_URL_SCHEMES`], `href` — только
+/// ссылкам, по которым разрешён переход, прочим — `data-url` ([`report_filter`]).
+static REPORT_SANITIZER: LazyLock<Builder<'static>> =
+    LazyLock::new(|| builder(REPORT_URL_SCHEMES, report_filter, REPORT_TAG_ATTRIBUTES));
+
+/// Проверка значений атрибутов ([`filter`], [`report_filter`]).
+type AttributeFilter = for<'u> fn(&str, &str, &'u str) -> Option<Cow<'u, str>>;
+
+fn builder(
+    schemes: &'static [&'static str],
+    attribute_filter: AttributeFilter,
+    extra: &[(&'static str, &'static str)],
+) -> Builder<'static> {
+    let mut tag_attributes: HashMap<&str, HashSet<&str>> = TAG_ATTRIBUTES
+        .iter()
+        .map(|&(t, a)| (t, a.iter().copied().collect()))
+        .collect();
+    for &(t, a) in extra {
+        tag_attributes.entry(t).or_default().insert(a);
+    }
     let mut b = Builder::empty();
     b.tags(TAGS.iter().copied().collect())
         .clean_content_tags(CLEAN_CONTENT_TAGS.iter().copied().collect())
         .generic_attributes(GENERIC_ATTRIBUTES.iter().copied().collect())
         .generic_attribute_prefixes(HashSet::new())
-        .tag_attributes(
-            TAG_ATTRIBUTES
-                .iter()
-                .map(|&(t, a)| (t, a.iter().copied().collect()))
-                .collect(),
-        )
+        .tag_attributes(tag_attributes)
         .tag_attribute_values(HashMap::new())
         .set_tag_attribute_values(SET_ATTRIBUTES.iter().fold(
             HashMap::<&str, HashMap<&str, &str>>::new(),
@@ -134,20 +158,59 @@ static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
             },
         ))
         .allowed_classes(HashMap::new())
-        .url_schemes(URL_SCHEMES.iter().copied().collect())
+        .url_schemes(schemes.iter().copied().collect())
         .url_relative(UrlRelative::PassThrough)
         .link_rel(None)
         .id_prefix(None)
         .strip_comments(true)
-        .attribute_filter(filter);
+        .attribute_filter(attribute_filter);
     b
-});
+}
 
 /// Санитизирует HTML-фрагмент по allowlist рендера. Вызывается из
 /// [`render_html`](crate::render_html); публична для тестов и для HTML,
 /// собранного вне рендера.
 pub fn sanitize_html(html: &str) -> String {
     SANITIZER.clean(html).to_string()
+}
+
+/// Санитизирует HTML страницы отчёта: как [`sanitize_html`], но `<a href>` разрешён ещё адрес
+/// `vscode://file/…` ([`zam_core::link::report_link_clickable`]), а ссылке без перехода (`file:`,
+/// прочие `vscode:`) — атрибут `data-url` с адресом. Вызывается из
+/// [`render_report_html`](crate::render_report_html).
+pub fn sanitize_report_html(html: &str) -> String {
+    REPORT_SANITIZER.clean(html).to_string()
+}
+
+/// [`filter`] отчёта:
+/// - `a[href]` — только адрес, по которому разрешён переход
+///   ([`zam_core::link::report_link_clickable`]): `file:` и `vscode:` не вида `vscode://file/…`
+///   без `href` остаются и тогда, когда HTML собран не рендером;
+/// - `a[data-url]` — адрес ссылки без перехода: только схемы `file` и `vscode`;
+/// - `src` картинки, видео и аудио (единственный другой URL-атрибут из [`TAG_ATTRIBUTES`]) —
+///   без `vscode:`: файл с диска пользователя странице отчёта не нужен (и CSP WebUI
+///   `img-src 'self' data: blob:` его не покажет).
+///
+/// Текстовые атрибуты (`alt`, `title`) с двоеточием не трогаются.
+fn report_filter<'u>(element: &str, attribute: &str, value: &'u str) -> Option<Cow<'u, str>> {
+    use zam_core::link::{report_link_clickable, url_scheme};
+    let ok = match (element, attribute) {
+        ("a", "href") => report_link_clickable(value),
+        // адрес показывают человеку (подсказка, печать): невидимые, bidi и управляющие символы
+        // подменили бы его вид — такая ссылка остаётся текстом
+        ("a", "data-url") => {
+            matches!(url_scheme(value).as_deref(), Some("file" | "vscode"))
+                && !value
+                    .chars()
+                    .any(|c| c.is_control() || zam_core::text::is_invisible(c))
+        }
+        (_, "src") => url_scheme(value).is_none_or(|s| URL_SCHEMES.contains(&s.as_str())),
+        _ => true,
+    };
+    if !ok {
+        return None;
+    }
+    filter(element, attribute, value)
 }
 
 /// Проверка значений разрешённых атрибутов; `None` — атрибут удаляется.
@@ -190,17 +253,13 @@ fn filter<'u>(element: &str, attribute: &str, value: &'u str) -> Option<Cow<'u, 
 }
 
 /// Значение содержит схему скрипта или HTML-данных — с учётом обходов через
-/// регистр, пробельные, управляющие и невидимые символы.
+/// регистр, пробельные, управляющие и невидимые символы (общий список
+/// [`zam_core::text::INVISIBLE_RANGES`]).
 fn is_dangerous(value: &str) -> bool {
     let norm: String = value
         .chars()
-        .filter(|c| !c.is_whitespace() && !c.is_control() && !is_invisible(*c))
+        .filter(|c| !c.is_whitespace() && !c.is_control() && !zam_core::text::is_invisible(*c))
         .flat_map(char::to_lowercase)
         .collect();
     DANGEROUS_VALUES.iter().any(|d| norm.contains(d))
-}
-
-/// Символы нулевой ширины, которые браузер может отбросить.
-fn is_invisible(c: char) -> bool {
-    matches!(c, '\u{200b}'..='\u{200f}' | '\u{2060}'..='\u{2064}' | '\u{feff}' | '\u{ad}')
 }

@@ -923,7 +923,8 @@ pub async fn patch(
             Some(check_data(sc.entry.kind, &merged)?)
         }
         (Some(d), EntryKind::Insight) => {
-            super::insights::check_insight_data(d)?;
+            // ADR-ключи верхнего уровня, уже лежащие в записи, правке не мешают (ревью 13a, m1)
+            super::insights::check_insight_data_patch(d, &sc.entry.data)?;
             Some(d.clone())
         }
         (Some(d), EntryKind::Idea) => {

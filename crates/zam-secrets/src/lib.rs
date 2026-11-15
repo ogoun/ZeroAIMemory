@@ -12,6 +12,11 @@
 //!
 //! Диапазоны результата отсортированы, не пересекаются и лежат на границах символов UTF-8.
 //! Бюджет — не больше 2 мс на 100 КБ (release).
+//!
+//! Отдельный крейт с одной зависимостью (`regex`) — с задачи 15b M6: сканер нужен не только
+//! серверу (через `zam-markdown`, реэкспорт `zam_markdown::secrets` и прежние имена), но и
+//! клиенту `zam` без comrak (маскировка снимка сессии, задача 17a). [`scan_secrets_ext`]
+//! дополнительно сообщает число повторов скана и упор в их предел ([`ScanOutcome`]).
 
 use std::ops::Range;
 use std::sync::LazyLock;
@@ -20,6 +25,14 @@ use regex::Regex;
 
 /// Замена секрета в тексте чанка.
 pub const SECRET_MARK: &str = "‹secret›";
+
+/// Версия правил сканера. Увеличивается при каждой правке правил, после которой сканер находит
+/// больше: хранилище (`zam-store`, ключи `meta` `secrets_scanned_v2` и `secrets_scanned_v3`)
+/// записывает версию, с которой база перемаскирована, и при открытии базы с меньшей версией один
+/// раз перенарезает заметки и записи, где теперь есть находки, и проверяет теги payload и папки.
+/// 1 — правила M3–M5.7 (значение `'1'` старых баз); 2 — значение в обратных кавычках (задача 15b
+/// M6, I1).
+pub const RULES_VERSION: u32 = 2;
 
 /// Тип сработавшего правила.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -182,14 +195,16 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Ключ-значение; необязательная кавычка перед разделителем покрывает JSON (`"password": "…"`)
-/// [решение исполнителя]. Значение — группа 2.
+/// [решение исполнителя].
 ///
 /// Значение в кавычках берётся до закрывающей кавычки (пароль-фраза с пробелами); без кавычек —
 /// до пробела. Словарь ключей расширен `secret_key`, `signing_key`, `private_key`
-/// [решение исполнителя]. Значение — группа 1 (в `"`), 2 (в `'`) или 3 (без кавычек).
+/// [решение исполнителя]. Значение — группа 1 (в `"`), 2 (в `'`), 3 (в обратных кавычках,
+/// `` password=`…` ``, ревью задачи 15b M6, I1) или 4 (без кавычек). Обычный inline code без ключа
+/// (`` `cargo build` ``) правило не задевает.
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     rx(
-        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key)["']?\s*[:=]\s*(?:"([^"\r\n]{6,})"|'([^'\r\n]{6,})'|([^\s"'`]{6,}))"#,
+        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key)["']?\s*[:=]\s*(?:"([^"\r\n]{6,})"|'([^'\r\n]{6,})'|`([^`\r\n]{6,})`|([^\s"'`]{6,}))"#,
     )
 });
 
@@ -355,7 +370,23 @@ fn url_token_masked(text: &str, r: &Range<usize>, masked_end: usize) -> String {
 
 /// Предел повторных сканов вида с масками в [`scan_secrets`]: каждый скан линеен, их число —
 /// константа. На практике хватает одного-двух (маска одного правила открывает находку другого).
-const FIXPOINT_MAX: usize = 4;
+pub const FIXPOINT_MAX: u32 = 4;
+
+/// Итог скана [`scan_secrets_ext`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanOutcome {
+    /// Находки — те же, что у [`scan_secrets`].
+    pub hits: Vec<SecretHit>,
+    /// Повторных сканов по виду с масками ([`MaskedView`]), от 0 до [`FIXPOINT_MAX`]: 0 —
+    /// находок нет или вид из одних масок; 1 — первый повтор уже ничего не нашёл (обычный
+    /// текст с секретами).
+    pub passes: u32,
+    /// Скан упёрся в [`FIXPOINT_MAX`]: все повторы давали находки, и ещё один повтор по виду
+    /// находит новые. Неподвижная точка не достигнута — [`mask_text`] на таком тексте не
+    /// идемпотентна (повторная маскировка заменит ещё что-то). Проверочный повтор в находки не
+    /// идёт: они те же, что у [`scan_secrets`].
+    pub depth_capped: bool,
+}
 
 /// Находит секреты. Результат отсортирован по началу, диапазоны не пересекаются
 /// (пересёкшиеся объединяются, вид берётся у первого), `line` считается с 1.
@@ -368,13 +399,19 @@ const FIXPOINT_MAX: usize = 4;
 /// второй проход, маскируется сразу. Находки первого прохода остаются: вид их не отменяет
 /// (энтропия по тексту видит длинного кандидата целиком, по виду — обрывки между масками).
 /// Скан останавливается, когда вид не даёт находок, — тогда `mask_text` идемпотентна; не дольше
-/// [`FIXPOINT_MAX`] повторов.
+/// [`FIXPOINT_MAX`] повторов (упор — [`scan_secrets_ext`]).
 pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
+    scan_secrets_ext(text).hits
+}
+
+/// [`scan_secrets`] с числом повторов скана и признаком упора в [`FIXPOINT_MAX`]
+/// ([`ScanOutcome`]). Упор стоит одного лишнего скана — только на таком тексте.
+pub fn scan_secrets_ext(text: &str) -> ScanOutcome {
     let mut raw = scan_rules(text);
-    for _ in 0..FIXPOINT_MAX {
-        if raw.is_empty() {
-            break;
-        }
+    let mut passes = 0u32;
+    let mut depth_capped = false;
+    // повторы `1..=FIXPOINT_MAX` дают находки; повтор `FIXPOINT_MAX + 1` — только проверка упора
+    while !raw.is_empty() {
         let view = MaskedView::new(text, &raw);
         // вид из одних масок находок не даст (ни одно правило не совпадает внутри `‹secret›`):
         // цепочка из десятков тысяч ключей не сканируется второй раз
@@ -382,6 +419,11 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
             break;
         }
         let found = scan_rules(&view.text);
+        if passes == FIXPOINT_MAX {
+            depth_capped = !found.is_empty();
+            break;
+        }
+        passes += 1;
         if found.is_empty() {
             break;
         }
@@ -394,7 +436,7 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
     let merged = merge_ranges(raw);
     // номера строк одним проходом
     let (mut line, mut pos) = (1usize, 0usize);
-    merged
+    let hits = merged
         .into_iter()
         .map(|(range, kind)| {
             line += text.as_bytes()[pos..range.start]
@@ -404,7 +446,12 @@ pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
             pos = range.start;
             SecretHit { kind, range, line }
         })
-        .collect()
+        .collect();
+    ScanOutcome {
+        hits,
+        passes,
+        depth_capped,
+    }
 }
 
 /// Все правила по `text` (один проход, без объединения).
@@ -422,7 +469,7 @@ fn scan_rules(text: &str) -> Vec<(Range<usize>, SecretKind)> {
         raw.push((m.range(), SecretKind::PrivateKey));
     }
     for c in KEY_VALUE.captures_iter(text) {
-        if let Some(v) = c.get(1).or_else(|| c.get(2)).or_else(|| c.get(3))
+        if let Some(v) = (1..=4).find_map(|i| c.get(i))
             && !is_placeholder(v.as_str())
         {
             raw.push((v.range(), SecretKind::KeyValue));

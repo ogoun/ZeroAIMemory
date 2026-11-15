@@ -21,7 +21,7 @@ use serde::Serialize;
 use crate::doc::{Link, OutlineItem, doc_from_root, outline, split_anchor};
 use crate::highlight::{Budget, Highlighted, highlight};
 use crate::options::{HEADER_ID_PREFIX, comrak_options};
-use crate::sanitize::{EXTERNAL_REL, sanitize_html};
+use crate::sanitize::{EXTERNAL_REL, sanitize_html, sanitize_report_html};
 
 /// Версия вывода рендера: часть ключа кэша `(content_hash, render_version)`.
 /// Растёт при любом изменении HTML.
@@ -73,6 +73,22 @@ pub struct Rendered {
 
 /// Рендерит заметку в санитизированный HTML. Не паникует на любом входе.
 pub fn render_html(src: &str, resolver: &dyn Resolver) -> Rendered {
+    render(src, resolver, false)
+}
+
+/// Рендерит тело отчёта (M6 §16 п. 15): как [`render_html`], но ссылкам (не картинкам)
+/// разрешены схемы [`zam_core::REPORT_LINK_SCHEMES`] — к `http`, `https`, `mailto` добавлены
+/// `vscode:` и `file:`. `href` получает только ссылка, по которой разрешён переход
+/// ([`zam_core::link::report_link_clickable`]: `http`, `https`, `mailto`, `vscode://file/…`), и
+/// каждая такая ссылка со схемой или `//host` — `rel="noopener noreferrer"`. Ссылке `file:` и
+/// прочим `vscode:` вместо `href` пишется `data-url` с адресом: перехода из HTML нет, что бы ни
+/// делал потребитель страницы. Ссылка с иной схемой остаётся без обоих атрибутов. HTML заметок
+/// этот рендер не меняет: [`RENDER_VERSION`] прежняя.
+pub fn render_report_html(src: &str, resolver: &dyn Resolver) -> Rendered {
+    render(src, resolver, true)
+}
+
+fn render(src: &str, resolver: &dyn Resolver, report: bool) -> Rendered {
     let arena = Arena::new();
     let options = comrak_options();
     let root = parse_document(&arena, src, &options);
@@ -80,7 +96,8 @@ pub fn render_html(src: &str, resolver: &dyn Resolver) -> Rendered {
     let doc = doc_from_root(src, root);
 
     let mut warnings = Vec::new();
-    let state = prepare(&arena, root, resolver, &mut warnings);
+    let mut state = prepare(&arena, root, resolver, &mut warnings);
+    state.report = report;
     let mut raw = String::new();
     // запись в String не возвращает ошибок; на всякий случай — пустой вывод
     if format_document_with_formatter(
@@ -97,7 +114,11 @@ pub fn render_html(src: &str, resolver: &dyn Resolver) -> Rendered {
     }
 
     Rendered {
-        html: sanitize_html(&raw),
+        html: if report {
+            sanitize_report_html(&raw)
+        } else {
+            sanitize_html(&raw)
+        },
         toc: outline(&doc),
         links: doc.links,
         warnings,
@@ -159,6 +180,8 @@ struct State {
     plans: HashMap<usize, Plan>,
     /// Остаток бюджетов подсветки документа: байт исходника и байт HTML.
     highlight_budget: Budget,
+    /// Рендер отчёта ([`render_report_html`]): схемы ссылок — по списку отчёта.
+    report: bool,
 }
 
 fn key(node: &AstNode<'_>) -> usize {
@@ -729,13 +752,35 @@ fn link<'a>(
     }
     ctx.write_str("<a")?;
     render_sourcepos(ctx, node)?;
-    write_href(ctx, &l.url)?;
+    // отчёт: схема — по общему списку; `href` — только ссылке с разрешённым переходом,
+    // `file:` и прочим `vscode:` — адрес в `data-url`, иной схеме — ничего
+    let scheme = if ctx.user.report {
+        zam_core::link::url_scheme(&l.url)
+    } else {
+        None
+    };
+    let mut clickable = false;
+    match &scheme {
+        Some(s) if !zam_core::link::report_scheme_allowed(s) => {}
+        Some(_) if zam_core::link::report_link_clickable(&l.url) => {
+            clickable = true;
+            ctx.write_str(" href=\"")?;
+            ctx.escape_href(&l.url)?;
+            ctx.write_str("\"")?;
+        }
+        Some(_) => {
+            ctx.write_str(" data-url=\"")?;
+            ctx.escape(&l.url)?;
+            ctx.write_str("\"")?;
+        }
+        None => write_href(ctx, &l.url)?,
+    }
     if !l.title.is_empty() {
         ctx.write_str(" title=\"")?;
         ctx.escape(&l.title)?;
         ctx.write_str("\"")?;
     }
-    if is_external(&l.url) {
+    if clickable || (scheme.is_none() && is_external(&l.url)) {
         write!(ctx, " rel=\"{EXTERNAL_REL}\"")?;
     }
     ctx.write_str(">")

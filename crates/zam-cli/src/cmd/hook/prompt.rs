@@ -65,12 +65,16 @@ fn recall(env: &Env, inp: &Input, client: &crate::client::Client, prompt: &str) 
         "session_id": inp.session_id,
         "solution": env.solution.as_ref().map(|x| x.id.clone()),
         "prompt": head_bytes(prompt, PROMPT_SEND_MAX),
+        // предел канала агента (ревью 8a M6, C1)
+        "output_limit": super::output::output_limit(env.agent, ""),
     });
     match client.post_json("/recall", &body).and_then(read_json) {
         Ok(v) => {
             for w in cache::strings(&v["warnings"]) {
                 env.log(&format!("recall(prompt): предупреждение сервера: {w}"));
             }
+            // контрольная группа A/B (M6 §12): маркер сессии
+            cache::note_holdout(env, inp.session_id.as_deref(), &v);
             Output::context(&inp.event, v["text"].as_str().unwrap_or_default())
         }
         Err(e) => {

@@ -1,22 +1,30 @@
 //! Ядро ZeroAIMemory: общие типы и логика.
 
+pub mod fsx;
 pub mod id;
+pub mod link;
+pub mod snapshot;
 pub mod solution;
 pub mod target;
+pub mod text;
+pub mod time;
 pub mod token;
+pub mod toolpath;
 
 pub use id::{Id, ParseIdError};
+pub use link::REPORT_LINK_SCHEMES;
 pub use solution::SolutionGuid;
 pub use target::{TargetKind, TargetRef};
 pub use token::{NewToken, generate_token, hash_token, looks_like_token, mask_token};
 
 /// Текущая версия блока инструкции агента ZeroAIMemory в CLAUDE.md/AGENTS.md (§14.2, §15.5;
 /// v3 — M4.5 §11, v4 — M5.5: строка об отчётах, v5 — M5.6: карта кода и `путь#Тип::метод`,
-/// v6 — M5.7: строка об идеях, четыре фразы — в протокол):
+/// v6 — M5.7: строка об идеях, четыре фразы — в протокол; v7 — M6 §13: `focus` в строке поиска,
+/// «`certainty` меняй с `reason`» и «функция — `путь#Тип::метод`» — в протокол):
 /// маркер `<!-- zeroaimemory:begin vN -->`. Нижняя граница версии сервера: действующая версия —
 /// `max(AGENT_BLOCK_VERSION, версия шаблонов в settings)` (`zam_server::agent_setup`), с ней
 /// сравнивают `/recall(session_start)` и `zam status`, её пишет в маркер `GET /agent-setup`.
-pub const AGENT_BLOCK_VERSION: u32 = 6;
+pub const AGENT_BLOCK_VERSION: u32 = 7;
 
 /// Предел длины имени решения, символов (§11.6): регистрация (`POST /solutions`), переименование
 /// (`PATCH /solutions/{guid}`), `GET /agent-setup?name=`, однострочник `zam init` и `zam init
@@ -69,9 +77,50 @@ pub const AGENT_ENV_VARS: [&str; 6] = [
     "CODEX_THREAD_ID",
 ];
 
-/// Клиентские переменные `zam` (не агента): явная сессия хуков, признак агента, имя машины.
-/// Сервер не читает их как ключи конфигурации, тесты убирают из окружения дочернего `zam`.
-pub const CLIENT_ENV_VARS: [&str; 3] = ["ZAM_SESSION", "ZAM_AGENT", MACHINE_ENV];
+/// Сокращение надёжности `certainty` в тексте агенту (M6 §4.1, §4.3): `ax`, `th`, `hyp`;
+/// прочее — как есть. Одна функция для карточек поиска, подсказок сервера и клиента, ответов MCP.
+pub fn certainty_short(c: &str) -> &str {
+    match c {
+        "axiom" => "ax",
+        "theorem" => "th",
+        "hypothesis" => "hyp",
+        other => other,
+    }
+}
+
+/// Строка `hooks.log`: у хука кончился бюджет до запроса к серверу. Общая для клиента `zam` и
+/// замера ТС-2 (xtask считает такие строки промахами бюджета хука).
+pub const HOOK_BUDGET_SPENT: &str = "бюджет исчерпан до запроса к серверу";
+
+/// Явная сессия `zam mcp` (M6 §7.1): сильнее `CLAUDE_CODE_SESSION_ID` и файла привязки.
+pub const MCP_SESSION_ENV: &str = "ZAM_SESSION_ID";
+
+/// Предел простоя тела `zam export`, с (M6 §12б.5).
+pub const EXPORT_IDLE_ENV: &str = "ZAM_EXPORT_IDLE_SECS";
+
+/// Предел отсутствия хода задания `zam import`, с (M6 §12б.5).
+pub const IMPORT_IDLE_ENV: &str = "ZAM_IMPORT_IDLE_SECS";
+
+/// Явная сессия команд `zam` (`X-Zam-Session`; `-` — без сессии).
+pub const SESSION_ENV: &str = "ZAM_SESSION";
+
+/// Явный признак «команду запустил агент» (`ZAM_AGENT=1`).
+pub const AGENT_FLAG_ENV: &str = "ZAM_AGENT";
+
+/// Клиентские переменные `zam` (не агента): явная сессия хуков, признак агента, имя машины,
+/// сессия `zam mcp`, пределы ожидания `zam export`/`zam import`. Сервер не читает их как ключи
+/// конфигурации (иначе такая переменная в окружении пользователя — неизвестный ключ, и сервер
+/// не стартует), тесты убирают их из окружения дочернего `zam`. Новая переменная, которую читает
+/// `zam`, добавляется сюда. `ZAM_URL` и `ZAM_TOKEN` `zam` тоже читает, но они не здесь: это адрес и
+/// секрет, сервер пропускает их своим списком (`RESERVED_ENV` в `zam-server`).
+pub const CLIENT_ENV_VARS: [&str; 6] = [
+    SESSION_ENV,
+    AGENT_FLAG_ENV,
+    MACHINE_ENV,
+    MCP_SESSION_ENV,
+    EXPORT_IDLE_ENV,
+    IMPORT_IDLE_ENV,
+];
 
 #[cfg(test)]
 mod machine_tests {

@@ -25,8 +25,9 @@ pub const UPLOAD_FILES_MAX: usize = 500;
 /// Версия выдачи экстрактора (`qual`, виды, сигнатуры). Смена — клиент, чьё состояние
 /// `code-state.json` записано другой версией, перезагружает все файлы (`zam code sync` как с
 /// `--full`): сервер решает `need` по хэшу содержимого и сам смену разбора не увидит.
-/// 2 — `impl dyn Trait` по трейту (ревью задачи 1, M8).
-pub const EXTRACT_VERSION: u32 = 2;
+/// 2 — `impl dyn Trait` по трейту (ревью задачи 1, M8); 3 — `RefAgg::recv_count`, вызовы по
+/// получателю (M6 §12а).
+pub const EXTRACT_VERSION: u32 = 3;
 /// Хэш удалённого файла: 64 нуля, как `zam-cli` `refs::MISSING_HASH` (очередь хуков M4.5).
 pub const MISSING_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -172,6 +173,11 @@ pub struct RefAgg {
     pub kind: RefKind,
     pub count: u32,
     pub first_line: u32,
+    /// Сколько из `count` — вызовы по получателю (`x.f()`, `self.f()`, `a.b.f()`; M6 §12а), только
+    /// у `call`. Нет поля — 0 (клиент до M6 или вызовов по получателю нет): экстрактор пишет
+    /// `Some` только при n > 0, а серверу до M6 клиент поле не шлёт (`deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_count: Option<u32>,
 }
 
 /// Файл в `PUT /code/files` (§4): только метаданные, содержимое не уходит.

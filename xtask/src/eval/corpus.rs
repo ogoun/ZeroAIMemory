@@ -164,6 +164,65 @@ pub const INSIGHT_REF: &str = "insight:";
 pub struct Corpus {
     pub notes: BTreeMap<String, Note>,
     pub insights: Vec<Insight>,
+    /// Области заметок (M6 §11): путь → `backend` | `frontend` | `infra` из
+    /// [`AREAS_FILE`] корпуса; загрузчик шлёт её заголовком `X-Zam-Area` при `POST /nodes`.
+    /// Область insight — его поле `area`.
+    pub areas: BTreeMap<String, String>,
+}
+
+/// Файл областей заметок в корне каталога корпуса (M6 §11).
+pub const AREAS_FILE: &str = "areas.toml";
+
+/// Области целей набора (M6 §11): у каждой — не меньше [`MIN_PER_AREA`] целей полного набора.
+pub const AREAS: [&str; 3] = ["backend", "frontend", "infra"];
+/// Минимум целей (заметок и insight) на область у полного набора (M6 §11).
+pub const MIN_PER_AREA: usize = 8;
+/// Минимум пар «`hypothesis` `gotcha` → `theorem`» со связью `contradicts` (M6 §10).
+pub const MIN_GOTCHA_CONTRADICTS: usize = 8;
+
+/// Имя каталога корпуса ТС-2 (`eval/sessions-corpus`, M6 §3.2): его грузит только ТС-2 и
+/// наборы идей; загрузчик корпуса ТС-1 и основного набора его не читает.
+pub const SESSIONS_CORPUS_DIR: &str = "sessions-corpus";
+
+/// `areas.toml`: `[area] "<путь заметки>" = "<область>"`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AreasFile {
+    #[serde(default)]
+    area: BTreeMap<String, String>,
+}
+
+/// Каталог `dir` — не корпус ТС-2 и не содержит его (рецензия плана M6, C1): иначе ТС-1 и
+/// основной набор получили бы сущности ТС-2 (идеи, Rules), которых у старых баз нет.
+fn ensure_not_sessions_corpus(dir: &Path) -> Result<()> {
+    let refuse = |p: &Path| {
+        anyhow::anyhow!(
+            "{}: каталог {SESSIONS_CORPUS_DIR} — корпус ТС-2, его грузит только ТС-2 (eval \
+             --sessions) и наборы идей; ТС-1 и основной набор берут eval/corpus",
+            p.display()
+        )
+    };
+    let full = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if full
+        .components()
+        .any(|c| c.as_os_str() == SESSIONS_CORPUS_DIR)
+    {
+        return Err(refuse(dir));
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if e.file_name() == SESSIONS_CORPUS_DIR {
+                    return Err(refuse(&p));
+                }
+                stack.push(p);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Запрос с ожидаемыми заметками или insight.
@@ -189,11 +248,41 @@ pub struct Query {
     /// `chunk`: дословная подстрока ожидаемой заметки — лист должен содержать её целиком.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// Текущая область запроса (M6 §11): уходит заголовком `X-Zam-Area` (буст области).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
+    /// Вид запроса набора областей (M6 §11, `eval/area-queries.toml`): где ответ относительно
+    /// текущей области `area`. Требует `area`; проверяется по областям целей; сетка отчитывается
+    /// по видам отдельными частями (`<часть>_<вид>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area_kind: Option<AreaKind>,
     /// Дополнительно релевантные цели (`insight:<key>` или заметки M3): засчитываются в метриках
     /// прогона вместе с `expect`, в сравнении с прежним прогоном (`--compare`) не участвуют —
     /// разметка M2 (`id`, `expect`) не меняется.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also: Vec<String>,
+}
+
+/// Вид запроса набора областей (M6 §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AreaKind {
+    /// Ответ в текущей области; рядом сосед той же темы из другой.
+    Same,
+    /// Ответ в другой области.
+    Other,
+    /// Ответ без области.
+    None,
+}
+
+impl AreaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AreaKind::Same => "same",
+            AreaKind::Other => "other",
+            AreaKind::None => "none",
+        }
+    }
 }
 
 impl Query {
@@ -574,6 +663,10 @@ pub fn is_identifier(tok: &str) -> bool {
     if n < 2 {
         return false;
     }
+    // атрибут Rust `#[instrument]` (M6, задача 10: набор буста вида)
+    if let Some(inner) = tok.strip_prefix("#[").and_then(|t| t.strip_suffix(']')) {
+        return !inner.is_empty() && inner.chars().next().is_some_and(char::is_alphabetic);
+    }
     let has_digit = tok.chars().any(|c| c.is_ascii_digit());
     let has_alpha = tok.chars().any(char::is_alphabetic);
     let punct = tok
@@ -591,11 +684,30 @@ pub fn is_identifier(tok: &str) -> bool {
 
 /// Идентификаторы запроса (по пробелам, без обрамляющей пунктуации).
 pub fn identifiers(text: &str) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    // вызов конструктора `new Date` — одно имя из двух слов (JS/Java/C#)
+    let ctors = words.windows(2).filter_map(|w| {
+        let name = w[1].trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        (w[0] == "new" && name.starts_with(|c: char| c.is_ascii_uppercase()))
+            .then(|| format!("new {name}"))
+    });
+    let mut out: Vec<String> = ctors.collect();
+    out.extend(identifier_tokens(text));
+    out
+}
+
+/// Однословные идентификаторы запроса ([`identifiers`]).
+fn identifier_tokens(text: &str) -> Vec<String> {
     text.split_whitespace()
-        // кавычки и скобки вокруг токена; точка и двоеточие в конце — пунктуация фразы,
-        // в начале — часть имени (`.gitignore`), дефисы флага (`--cached`) сохраняются
-        .map(|t| t.trim_matches(|c: char| "\"'`()[]{},;!?«»".contains(c)))
-        .map(|t| t.trim_end_matches(['.', ':']))
+        // атрибут `#[name]`/`#[name(…)]` — целиком до `]` (скобки — часть имени)
+        .map(|t| match (t.find("#["), t.find(']')) {
+            (Some(a), Some(b)) if b > a => &t[a..=b],
+            // кавычки и скобки вокруг токена; точка и двоеточие в конце — пунктуация фразы,
+            // в начале — часть имени (`.gitignore`), дефисы флага (`--cached`) сохраняются
+            _ => t
+                .trim_matches(|c: char| "\"'`()[]{},;!?«»".contains(c))
+                .trim_end_matches(['.', ':']),
+        })
         .filter(|t| is_identifier(t))
         .map(str::to_string)
         .collect()
@@ -616,9 +728,19 @@ fn valid_note_path(p: &str) -> bool {
 }
 
 impl Corpus {
-    /// Загружает все `*.md` под `dir` (рекурсивно). Пути — относительно `dir`, без `.md`.
+    /// Загружает все `*.md` под `dir` (рекурсивно) и области заметок [`AREAS_FILE`]. Пути —
+    /// относительно `dir`, без `.md`. Корпус ТС-2 ([`SESSIONS_CORPUS_DIR`]) — ошибка.
     pub fn load(dir: &Path) -> Result<Corpus> {
+        ensure_not_sessions_corpus(dir)?;
         let mut c = Corpus::default();
+        let areas = dir.join(AREAS_FILE);
+        if areas.is_file() {
+            let text = fs::read_to_string(&areas)
+                .with_context(|| format!("чтение {}", areas.display()))?;
+            let f: AreasFile =
+                toml::from_str(&text).with_context(|| format!("разбор {}", areas.display()))?;
+            c.areas = f.area;
+        }
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
             for e in fs::read_dir(&d).with_context(|| format!("чтение {}", d.display()))? {
@@ -680,7 +802,15 @@ impl Corpus {
                         .flatten()
                         .copied()
                 })
-                .chain(insights),
+                .chain(insights)
+                .chain(
+                    // области (M6): без файла областей отпечаток прежний
+                    self.areas
+                        .iter()
+                        .flat_map(|(p, a)| [b"area\0", p.as_bytes(), b"\0", a.as_bytes(), b"\0"])
+                        .flatten()
+                        .copied(),
+                ),
         )
     }
 }
@@ -734,6 +864,13 @@ pub struct Summary {
     pub long_paragraphs: usize,
     /// Запросов с `also`.
     pub with_also: usize,
+    /// Целей (заметок и insight) по области (M6 §11).
+    pub areas: BTreeMap<String, usize>,
+    /// Пары «`hypothesis` `gotcha` → `theorem`» со связью `contradicts` (M6 §10).
+    pub gotcha_contradicts: usize,
+    /// Из них — с ответом (`theorem`) вида `gotcha`/`failure` (M6 §10: ответ набора буста вида —
+    /// ловушка или сбой).
+    pub gotcha_answer_contradicts: usize,
 }
 
 impl Summary {
@@ -829,6 +966,14 @@ impl Target<'_> {
             Target::Insight(i) => format!("{INSIGHT_REF}{}", i.key),
         }
     }
+
+    /// Область цели: заметки — по [`AREAS_FILE`], insight — поле `area`.
+    fn area<'c>(&'c self, corpus: &'c Corpus) -> Option<&'c str> {
+        match self {
+            Target::Note(n) => corpus.areas.get(&n.path).map(String::as_str),
+            Target::Insight(i) => i.area.as_deref(),
+        }
+    }
 }
 
 fn resolve<'a>(corpus: &'a Corpus, r: &str) -> Option<Target<'a>> {
@@ -882,6 +1027,44 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         }
     }
     validate_insights(corpus, &mut errs);
+    let mut areas: BTreeMap<String, usize> = BTreeMap::new();
+    for (p, a) in &corpus.areas {
+        if !corpus.notes.contains_key(p) {
+            errs.push(format!("{AREAS_FILE}: нет заметки {p}"));
+        }
+        if !AREAS.contains(&a.as_str()) {
+            errs.push(format!(
+                "{AREAS_FILE}: {p}: область — одна из {}",
+                AREAS.join(", ")
+            ));
+        }
+        *areas.entry(a.clone()).or_default() += 1;
+    }
+    for i in &corpus.insights {
+        if let Some(a) = &i.area {
+            if !AREAS.contains(&a.as_str()) {
+                errs.push(format!(
+                    "insight {}: область — одна из {}",
+                    i.key,
+                    AREAS.join(", ")
+                ));
+            }
+            *areas.entry(a.clone()).or_default() += 1;
+        }
+    }
+    let gotcha_pairs: Vec<&Insight> = corpus
+        .insights
+        .iter()
+        .filter(|i| i.kind == "gotcha" && corpus.insight_certainty(&i.key) == Some("hypothesis"))
+        .flat_map(|i| &i.contradicts)
+        .filter(|t| corpus.insight_certainty(t) == Some("theorem"))
+        .filter_map(|t| corpus.insight(t))
+        .collect();
+    let gotcha_contradicts = gotcha_pairs.len();
+    let gotcha_answer_contradicts = gotcha_pairs
+        .iter()
+        .filter(|t| matches!(t.kind.as_str(), "gotcha" | "failure"))
+        .count();
     let mut ids: BTreeSet<&str> = BTreeSet::new();
     let mut s = Summary {
         notes: corpus.notes.len(),
@@ -914,6 +1097,9 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
             .iter()
             .filter(|i| i.retract_reason.is_some())
             .count(),
+        areas,
+        gotcha_contradicts,
+        gotcha_answer_contradicts,
         ..Summary::default()
     };
     let mut referenced: BTreeSet<&str> = BTreeSet::new();
@@ -972,7 +1158,35 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         if q.evidence.is_some() && q.kind != Kind::Chunk {
             bad("evidence — только у chunk".into());
         }
-        if Kind::M2.contains(&q.kind) && notes.len() != targets.len() {
+        if q.area.as_deref().is_some_and(|a| !AREAS.contains(&a)) {
+            bad(format!("область — одна из {}", AREAS.join(", ")));
+        }
+        if let Some(ak) = q.area_kind {
+            match q.area.as_deref() {
+                None => bad("area_kind без area".into()),
+                Some(cur) => {
+                    for t in &targets {
+                        let ta = t.area(corpus);
+                        let ok = match ak {
+                            AreaKind::Same => ta == Some(cur),
+                            AreaKind::Other => ta.is_some_and(|a| a != cur),
+                            AreaKind::None => ta.is_none(),
+                        };
+                        if !ok {
+                            bad(format!(
+                                "area_kind = {}, область {} — {}",
+                                ak.as_str(),
+                                t.name(),
+                                ta.unwrap_or("нет")
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // полный набор: виды M2 — поиск заметок; во фрагменте (`--queries`, наборы M6 вроде
+        // `kind-queries.toml`) вид описывает формулировку, и ответом может быть insight
+        if full && Kind::M2.contains(&q.kind) && notes.len() != targets.len() {
             bad("запросы видов M2 ждут только заметки".into());
         }
         match q.kind {
@@ -994,12 +1208,17 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                 if toks.is_empty() {
                     bad("identifier без идентификатора в тексте".into());
                 }
-                for n in &notes {
-                    let low = n.text.to_lowercase();
-                    if !toks.iter().any(|t| low.contains(&t.to_lowercase())) {
+                // идентификатор дословно есть в каждой цели: заметке (как в M2) или insight
+                // (заголовок и тело; наборы M6)
+                for t in &targets {
+                    let low = match t {
+                        Target::Note(n) => n.text.to_lowercase(),
+                        Target::Insight(i) => format!("{} {}", i.title, i.body).to_lowercase(),
+                    };
+                    if !toks.iter().any(|x| low.contains(&x.to_lowercase())) {
                         bad(format!(
                             "ни один идентификатор {toks:?} не встречается в {}",
-                            n.path
+                            t.name()
                         ));
                     }
                 }
@@ -1082,7 +1301,8 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
                             if corpus.insight_certainty(&i.key) == Some("hypothesis")
                                 && corpus.insight_active(&i.key) =>
                         {
-                            if i.lang != q.lang {
+                            // фрагмент (наборы M6): `certainty` может быть и межъязыковым
+                            if full && i.lang != q.lang {
                                 bad(format!("язык weaker {w} отличается от запроса"));
                             }
                             for e in &q.expect {
@@ -1141,7 +1361,12 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
             }
         }
         // broad может собирать тему на обоих языках
+        // фрагмент (набор областей M6 §11): цели на двух языках — вид по формулировке, если хотя
+        // бы одна цель на языке запроса (cross-lang такому запросу не подходит, иначе — ни один)
+        let mixed_ok = !full && q.area_kind.is_some() && targets.iter().any(|t| t.lang() == q.lang);
         if !matches!(q.kind, Kind::CrossLang | Kind::Broad)
+            && (full || q.kind != Kind::Certainty)
+            && !mixed_ok
             && let Some(t) = targets.iter().find(|t| t.lang() != q.lang)
         {
             bad(format!(
@@ -1270,6 +1495,24 @@ pub fn validate(corpus: &Corpus, queries: &[Query], full: bool) -> Result<Summar
         if s.retracted < MIN_RETRACTED {
             errs.push(format!("отзывов {} < {MIN_RETRACTED}", s.retracted));
         }
+        for a in AREAS {
+            let n = s.areas.get(a).copied().unwrap_or(0);
+            if n < MIN_PER_AREA {
+                errs.push(format!("целей области {a}: {n} < {MIN_PER_AREA}"));
+            }
+        }
+        if s.gotcha_contradicts < MIN_GOTCHA_CONTRADICTS {
+            errs.push(format!(
+                "пар hypothesis gotcha → theorem (contradicts) {} < {MIN_GOTCHA_CONTRADICTS}",
+                s.gotcha_contradicts
+            ));
+        }
+        if s.gotcha_answer_contradicts < MIN_GOTCHA_CONTRADICTS {
+            errs.push(format!(
+                "пар hypothesis gotcha → theorem gotcha/failure {} < {MIN_GOTCHA_CONTRADICTS}",
+                s.gotcha_answer_contradicts
+            ));
+        }
         if s.contradictions < MIN_CONTRADICTIONS {
             errs.push(format!(
                 "пар противоречий {} < {MIN_CONTRADICTIONS}",
@@ -1306,6 +1549,8 @@ pub fn tests_query(id: &str, note: &str) -> Query {
         weaker: Vec::new(),
         evidence: None,
         also: Vec::new(),
+        area: None,
+        area_kind: None,
     }
 }
 
@@ -1356,6 +1601,16 @@ mod tests {
             ["HashMap", "BTreeMap"]
         );
         assert!(identifiers("обычный вопрос про git").is_empty());
+        assert_eq!(
+            identifiers("почему #[instrument] на обработчике"),
+            ["#[instrument]"]
+        );
+        assert!(!is_identifier("#[]"));
+        assert_eq!(
+            identifiers("почему new Date от строки вида ГГГГ-ММ-ДД"),
+            ["new Date", "ГГГГ-ММ-ДД"]
+        );
+        assert!(identifiers("new работа над new версией").is_empty());
     }
 
     fn note(path: &str, text: &str) -> Note {
@@ -1382,6 +1637,8 @@ mod tests {
             weaker: Vec::new(),
             evidence: None,
             also: Vec::new(),
+            area: None,
+            area_kind: None,
         }
     }
 
@@ -1436,6 +1693,114 @@ mod tests {
             retracted,
         ];
         c
+    }
+
+    /// `identifier` с ответом-insight (фрагмент M6): идентификатор сверяется с заголовком и
+    /// телом записи; виды M2 во фрагменте могут ждать insight.
+    #[test]
+    fn identifier_checked_against_insight_text() {
+        let mut c = m3_corpus();
+        c.insights[0].body = "Retry loop reused AbortController after timeout".into();
+        let ok = [q(
+            "i",
+            "why does AbortController make retries fail",
+            Lang::En,
+            &["insight:old"],
+            Kind::Identifier,
+            false,
+        )];
+        validate(&c, &ok, false).unwrap();
+        let bad = [q(
+            "j",
+            "why does IntersectionObserver fire twice",
+            Lang::En,
+            &["insight:old"],
+            Kind::Identifier,
+            false,
+        )];
+        let err = validate(&c, &bad, false).unwrap_err().to_string();
+        assert!(
+            err.contains("IntersectionObserver") && err.contains("insight:old"),
+            "{err}"
+        );
+    }
+
+    /// Набор областей (M6 §11): `area_kind` требует `area` и сверяется с областью каждой цели
+    /// (заметка — `areas.toml`, insight — поле `area`); разбор `same`/`other`/`none`.
+    #[test]
+    fn area_kind_checked_against_target_areas() {
+        let mut c = m3_corpus();
+        c.insights[0].area = Some("backend".into());
+        c.areas.insert("en/long/ingest".into(), "infra".into());
+        let mk = |id: &str, area: Option<&str>, ak: AreaKind, expect: &str| {
+            let mut x = q(
+                id,
+                "query text",
+                Lang::En,
+                &[expect],
+                Kind::Paraphrase,
+                false,
+            );
+            x.area = area.map(String::from);
+            x.area_kind = Some(ak);
+            x
+        };
+        let ok = [
+            mk("s", Some("backend"), AreaKind::Same, "insight:old"),
+            mk("o", Some("frontend"), AreaKind::Other, "en/long/ingest"),
+            mk("n", Some("infra"), AreaKind::None, "insight:new"),
+        ];
+        validate(&c, &ok, false).unwrap();
+        let bad = [
+            mk("s2", Some("infra"), AreaKind::Same, "insight:old"),
+            mk("o2", Some("infra"), AreaKind::Other, "en/long/ingest"),
+            mk("o3", Some("infra"), AreaKind::Other, "insight:new"),
+            mk("n2", Some("infra"), AreaKind::None, "insight:old"),
+            mk("x", None, AreaKind::Same, "insight:old"),
+        ];
+        let err = validate(&c, &bad, false).unwrap_err().to_string();
+        for id in ["s2", "o2", "o3", "n2"] {
+            assert!(
+                err.contains(&format!("запрос {id}: area_kind")),
+                "{id}: {err}"
+            );
+        }
+        assert!(err.contains("запрос x: area_kind без area"), "{err}");
+        // цели на двух языках: вид по формулировке, если одна цель на языке запроса
+        c.insights[1].area = Some("backend".into());
+        c.insights[1].lang = Lang::Ru;
+        let mut two = mk("m", Some("backend"), AreaKind::Same, "insight:old");
+        two.expect
+            .push(format!("{INSIGHT_REF}{}", c.insights[1].key));
+        validate(&c, &[two.clone()], false).unwrap();
+        two.area_kind = None;
+        assert!(
+            validate(&c, &[two], false).is_err(),
+            "без area_kind — прежнее правило"
+        );
+        let t: QueryFile = toml::from_str(
+            "[[query]]\nid = \"a\"\ntext = \"t\"\nlang = \"en\"\nexpect = [\"x\"]\n\
+             kind = \"exact\"\narea = \"infra\"\narea_kind = \"none\"\n",
+        )
+        .unwrap();
+        assert_eq!(t.query[0].area_kind, Some(AreaKind::None));
+    }
+
+    /// Пары §10 считаются двояко: все «`hypothesis` `gotcha` → `theorem`» и только те, где
+    /// ответ (`theorem`) сам `gotcha`/`failure` (правка ревью задачи 1c M6).
+    #[test]
+    fn gotcha_pairs_counted_by_answer_kind() {
+        let mut c = m3_corpus();
+        let mut t2 = insight("disc-ok", Some("theorem"), None);
+        t2.kind = "discovery".into();
+        t2.evidence = c.insight("cache-ok").unwrap().evidence.clone();
+        c.insights.push(t2);
+        let mut h2 = insight("disc-guess", Some("hypothesis"), None);
+        h2.contradicts = vec!["disc-ok".into()];
+        c.insights.push(h2);
+        c.insights[3].contradicts = vec!["cache-ok".into()];
+        let s = validate(&c, &[], false).unwrap();
+        assert_eq!((s.gotcha_contradicts, s.gotcha_answer_contradicts), (2, 1));
     }
 
     fn m3_query(id: &str, kind: Kind, expect: &str) -> Query {

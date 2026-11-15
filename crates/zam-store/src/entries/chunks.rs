@@ -10,7 +10,6 @@
 //! запись Human и отчёт (`report`, M5.5: только FTS для WebUI) — `excluded`, без задания.
 //! Удаление — `delete`.
 
-use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_markdown::{parse, scan_secrets};
@@ -161,6 +160,26 @@ fn enqueue_entry(
         enqueue_target(c, TargetKind::Entry, id, rev, op, priority, now)?;
     }
     Ok(op)
+}
+
+/// Перемаскировка одной живой записи текущими правилами сканера (разностная перепроверка,
+/// [`crate::secrets_delta`]): чанки пересобираются, ставится задание с `priority`. `false` —
+/// записи нет или она удалена.
+pub(crate) fn remask_entry(
+    c: &Connection,
+    id: Id,
+    priority: i64,
+    now: &str,
+) -> Result<bool, StoreError> {
+    let prev: Option<IndexState> = c
+        .prepare_cached("SELECT index_state FROM entries WHERE id = ?1 AND deleted_at IS NULL")?
+        .query_row([id], |r| r.get(0))
+        .optional()?;
+    let Some(prev) = prev else {
+        return Ok(false);
+    };
+    index_entry(c, id, Some(prev), priority, now)?;
+    Ok(true)
 }
 
 /// [`index_entry`] с приоритетом записи.
@@ -340,7 +359,7 @@ pub async fn enqueue_entry_upserts(db: &Db, entries: Vec<Id>) -> Result<u64, Sto
         return Ok(0);
     }
     db.write(move |tx| {
-        let now = fmt_ts(Timestamp::now());
+        let now = fmt_ts(crate::time::now());
         let mut pick = tx.prepare_cached(&format!(
             "UPDATE entries SET index_state = 'pending'
              WHERE id = ?1 AND EXISTS (SELECT 1 FROM entries e JOIN spaces s ON s.id = e.space_id
@@ -415,7 +434,7 @@ pub(crate) async fn rechunk_entries(
         let cursor = after;
         let (n, u, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, IndexState, EntryKind)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT id, index_state, kind FROM entries
@@ -472,7 +491,7 @@ pub(crate) async fn rescan_entry_secrets(db: &Db, priority: i64) -> Result<u64, 
         let cursor = after;
         let (n, found, last) = db
             .write(move |tx| {
-                let now = fmt_ts(Timestamp::now());
+                let now = fmt_ts(crate::time::now());
                 let batch: Vec<(Id, IndexState, String, String)> = {
                     let mut st = tx.prepare_cached(
                         "SELECT id, index_state, title, body FROM entries

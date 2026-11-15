@@ -58,6 +58,19 @@ pub trait TokenCounter: Send + Sync {
     /// он совпадает, у разных — различается (например, хэш `tokenizer.json`). Смена
     /// идентификатора при точном счётчике перенарезает базу.
     fn tokenizer_id(&self) -> String;
+
+    /// Наибольший счёт [`TokenCounter::count`], который помещается в бюджет `budget` (M6 §4.2):
+    /// для упаковки суммами частей — сравнение суммы с ним, а не с бюджетом. У точного счётчика —
+    /// сам бюджет, у оценки — с запасом ([`EstimateCounter`]).
+    fn budget_cap(&self, budget: usize) -> usize {
+        budget
+    }
+
+    /// Помещается ли `text` целиком в бюджет `budget` (M6 §4.2): единая точка проверки бюджета
+    /// для всех потребителей. У точного счётчика — `count ≤ budget`, у оценки — с запасом.
+    fn fits(&self, text: &str, budget: usize) -> bool {
+        self.count(text) <= self.budget_cap(budget)
+    }
 }
 
 /// Оценка без токенизатора: `ceil(символы / 3,5)` (исследование 05 §10).
@@ -76,6 +89,245 @@ impl TokenCounter for ApproxCounter {
 
     fn tokenizer_id(&self) -> String {
         "approx".into()
+    }
+}
+
+/// Оценка без токенизатора для **размеров и бюджетов выдачи** — запасной путь, когда нет ни
+/// токенизатора модели, ни `tokenizer.json` комплекта (M6, задача 5; ревью I-2) — две роли:
+/// - [`TokenCounter::count`] — **несмещённая** оценка: размеры, которые видит агент (хвост `Nt`,
+///   `tokens` у `/read` и выжимок, `~N tok`). Сумма по слою к bge-m3 на проверочной половине —
+///   ×0,99–1,06 (проза, заметки eval, выдача с id, код, идентификаторы, письменности), у
+///   вспомогательных слоёв (пути, строки карты кода, синтетика C#/Java/TS, смешанные строки,
+///   карточки, фразы восьми письменностей по отдельности) — ×0,97–1,09 (журнал задачи 5);
+/// - [`TokenCounter::fits`] — `m · оценка + c ≤ бюджет` ([`ESTIMATE_M`], [`ESTIMATE_C`]): запас,
+///   подобранный на **целых ответах** dev-прогонов ТС-1/ТС-2 и синтетике (код, письменности).
+///   Половины подбора и проверки разделены группами (сценарий ТС-1, сессия ТС-2, файл заметки,
+///   зерно синтетики) после дедупликации с обезличенными id и цифрами: на проверочной половине
+///   bge-m3 больше бюджета у 0 из 512 ответов, недогрузка — 13,4 %.
+///   Гарантия — на ответ целиком, не на отдельную строку: короткая строка редких слов
+///   (`Скрипт`, повтор `αβγ`) может расходиться с bge-m3 в разы.
+///
+/// Текст делится на серии «слова» (буквы, цифры и знаки-модификаторы [`ESTIMATE_WORD_MARKS`]),
+/// пробелы и отдельные прочие символы. Серия режется на подсерии ([`estimate_subruns`]): смена
+/// вида символа (цифра, ASCII, кириллица, CJK, греческий, кана, хангыль, прочие письменности),
+/// переход строчная→заглавная, конец серии заглавных перед строчной (`HTTPServer` →
+/// `HTTP|Server`). Серия «кодовая», если у неё больше одной подсерии или рядом знак кода
+/// (`_./\:#<>()[]{}=-@$`), иначе — слово прозы. Стоимость подсерии — основа и цена символа по
+/// классу ([`ESTIMATE_TABLE`], тысячные токена), знака ASCII — 0,854, прочего знака — 1,446.
+/// Коэффициенты — медианная регрессия (линейная программа) к bge-m3 с ограничениями «сумма по
+/// слою в пределах» и монотонностью: «кодовая» подсерия не дешевле такой же в прозе, длинная —
+/// не дешевле короткой на границе классов, поэтому оценка не убывает при дописывании текста по
+/// символу. Подбор воспроизводит `eval/tools/estimate_fit.py` на закреплённых входах
+/// (`eval/tools/estimate_coef.json`: коммит исходников, SHA-256 прогонов и токенизатора). Чанкер её не использует: размеры
+/// листов подобраны под [`ApproxCounter`] и токенизатор модели.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EstimateCounter;
+
+/// Множитель запаса бюджета у [`EstimateCounter`], тысячные (`m` = 1,11: максимум по слоям
+/// p99 отношения bge-m3 / оценка на целых ответах половины подбора).
+pub const ESTIMATE_M: usize = 1110;
+/// Сдвиг запаса бюджета у [`EstimateCounter`], токенов (`c`: p99 остатка на ответах короче 150
+/// токенов).
+pub const ESTIMATE_C: usize = 3;
+
+/// Класс подсерии для [`ESTIMATE_TABLE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EstClass {
+    Digit,
+    /// ASCII буквы, 1–3 символа.
+    Latin,
+    /// ASCII буквы, 4–7.
+    Latin4,
+    /// ASCII буквы, 8 и больше.
+    Latin8,
+    /// Только заглавные ASCII, от 2 символов.
+    Upper,
+    /// Кириллица, 1–5.
+    Cyr,
+    /// Кириллица, 6 и больше.
+    Cyr6,
+    /// Иероглифы CJK и полноширинные формы.
+    Cjk,
+    /// Греческий.
+    Greek,
+    /// Хирагана и катакана.
+    Kana,
+    /// Хангыль.
+    Hangul,
+    /// Прочие письменности (иврит, арабский, деванагари, тайский…).
+    Other,
+}
+
+/// Стоимость подсерии, тысячные токена: `(основа, за символ)`.
+type EstCost = (usize, usize);
+
+/// Стоимость подсерии по классу: в прозе и в «кодовой» серии.
+const ESTIMATE_TABLE: [(EstClass, EstCost, EstCost); 12] = [
+    (EstClass::Digit, (538, 254), (538, 254)),
+    (EstClass::Latin, (1000, 0), (1000, 191)),
+    (EstClass::Latin4, (1000, 0), (1212, 90)),
+    (EstClass::Latin8, (1303, 77), (1303, 156)),
+    (EstClass::Upper, (630, 339), (630, 339)),
+    (EstClass::Cyr, (0, 242), (0, 385)),
+    (EstClass::Cyr6, (2436, 0), (2436, 0)),
+    (EstClass::Cjk, (54, 750), (54, 750)),
+    (EstClass::Greek, (431, 214), (431, 214)),
+    (EstClass::Kana, (611, 389), (611, 389)),
+    (EstClass::Hangul, (640, 400), (906, 400)),
+    (EstClass::Other, (648, 233), (648, 283)),
+];
+
+/// Знак ASCII (не буква, не цифра, не пробел), тысячные токена.
+const ESTIMATE_PUNCT: usize = 854;
+/// Прочий знак (не ASCII).
+const ESTIMATE_SYMBOL: usize = 1446;
+/// Знаки кода рядом с серией — серия «кодовая».
+const ESTIMATE_CODE_PUNCT: &str = "_./\\:#<>()[]{}=-@$";
+
+/// Диапазоны, символы которых — часть слова наравне с буквами: комбинируемые знаки, огласовки
+/// иврита и арабского, блоки индийских письменностей, тайский и лаосский (знаки гласных там —
+/// не буквы по Unicode, но токенизатор не режет по ним слово).
+const ESTIMATE_WORD_MARKS: [(u32, u32); 13] = [
+    (0x0300, 0x036F),
+    (0x0483, 0x0489),
+    (0x0591, 0x05C7),
+    (0x0610, 0x061A),
+    (0x064B, 0x065F),
+    (0x0670, 0x0670),
+    (0x06D6, 0x06ED),
+    (0x0900, 0x0DFF),
+    (0x0E00, 0x0EFF),
+    (0x1AB0, 0x1AFF),
+    (0x1DC0, 0x1DFF),
+    (0x20D0, 0x20FF),
+    (0xFE20, 0xFE2F),
+];
+
+/// Символ серии «слова»: буква, цифра или знак из [`ESTIMATE_WORD_MARKS`].
+fn estimate_word(c: char) -> bool {
+    let o = c as u32;
+    c.is_alphanumeric()
+        || ESTIMATE_WORD_MARKS
+            .iter()
+            .any(|&(a, b)| (a..=b).contains(&o))
+}
+
+/// Вид символа серии: 0 — ASCII цифра, 1 — ASCII буква, 2 — кириллица, 4 — CJK, 5 — греческий,
+/// 6 — кана, 7 — хангыль, 3 — прочее.
+fn estimate_kind(c: char) -> u8 {
+    let o = c as u32;
+    if c.is_ascii_digit() {
+        0
+    } else if c.is_ascii() {
+        1
+    } else if (0x0400..=0x04FF).contains(&o) {
+        2
+    } else if (0x3040..=0x30FF).contains(&o) {
+        6
+    } else if (0xAC00..=0xD7AF).contains(&o) {
+        7
+    } else if (0x2E80..=0x9FFF).contains(&o)
+        || (0xF900..=0xFAFF).contains(&o)
+        || (0xFF00..=0xFFEF).contains(&o)
+    {
+        4
+    } else if (0x0370..=0x03FF).contains(&o) || (0x1F00..=0x1FFF).contains(&o) {
+        5
+    } else {
+        3
+    }
+}
+
+/// Подсерии серии букв и цифр (см. [`EstimateCounter`]).
+fn estimate_subruns(run: &[char]) -> Vec<&[char]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 1..run.len() {
+        let (a, c) = (run[i - 1], run[i]);
+        let next = run.get(i + 1).copied();
+        let split = estimate_kind(a) != estimate_kind(c)
+            || (c.is_uppercase() && a.is_lowercase())
+            || (a.is_uppercase() && c.is_uppercase() && next.is_some_and(char::is_lowercase));
+        if split {
+            out.push(&run[start..i]);
+            start = i;
+        }
+    }
+    out.push(&run[start..]);
+    out
+}
+
+/// Класс подсерии.
+fn estimate_class(s: &[char]) -> EstClass {
+    match estimate_kind(s[0]) {
+        0 => EstClass::Digit,
+        1 if s.len() >= 2 && s.iter().all(|c| c.is_uppercase()) => EstClass::Upper,
+        1 if s.len() >= 8 => EstClass::Latin8,
+        1 if s.len() >= 4 => EstClass::Latin4,
+        1 => EstClass::Latin,
+        2 if s.len() >= 6 => EstClass::Cyr6,
+        2 => EstClass::Cyr,
+        4 => EstClass::Cjk,
+        5 => EstClass::Greek,
+        6 => EstClass::Kana,
+        7 => EstClass::Hangul,
+        _ => EstClass::Other,
+    }
+}
+
+impl TokenCounter for EstimateCounter {
+    fn count(&self, text: &str) -> usize {
+        let chars: Vec<char> = text.chars().collect();
+        let mut milli = 0;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if estimate_word(c) {
+                let mut j = i;
+                while j < chars.len() && estimate_word(chars[j]) {
+                    j += 1;
+                }
+                let subs = estimate_subruns(&chars[i..j]);
+                let near = |k: Option<&char>| k.is_some_and(|c| ESTIMATE_CODE_PUNCT.contains(*c));
+                let code = subs.len() > 1
+                    || near(i.checked_sub(1).and_then(|p| chars.get(p)))
+                    || near(chars.get(j));
+                for s in subs {
+                    let class = estimate_class(s);
+                    let (_, prose, kode) = ESTIMATE_TABLE
+                        .iter()
+                        .find(|(k, _, _)| *k == class)
+                        .copied()
+                        .expect("класс в таблице");
+                    let (base, per) = if code { kode } else { prose };
+                    milli += base + per * s.len();
+                }
+                i = j;
+                continue;
+            }
+            if !c.is_whitespace() {
+                milli += if c.is_ascii() {
+                    ESTIMATE_PUNCT
+                } else {
+                    ESTIMATE_SYMBOL
+                };
+            }
+            i += 1;
+        }
+        // округление к ближайшему: оценка несмещённая
+        (milli + 500) / 1000
+    }
+
+    fn is_exact(&self) -> bool {
+        false
+    }
+
+    fn tokenizer_id(&self) -> String {
+        "estimate-v6".into()
+    }
+
+    fn budget_cap(&self, budget: usize) -> usize {
+        budget.saturating_sub(ESTIMATE_C) * 1000 / ESTIMATE_M
     }
 }
 

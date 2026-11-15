@@ -237,7 +237,7 @@ async fn brief_sections_and_budget() {
     let files = &t[pos(t, "### Файлы")..];
     assert!(
         files.contains(&format!(
-            "файл docs/plan.md: Схема плана [insight] — i:{}",
+            "файл docs/plan.md: Схема плана [insight] i:{}",
             w.file_note
         )),
         "{t}"
@@ -292,11 +292,11 @@ async fn brief_sections_and_budget() {
         a,
         &a.token,
         "p1:ag2",
-        json!({"event": "brief", "solution": G, "task": TASK, "budget_tokens": 40}),
+        json!({"event": "brief", "solution": G, "task": TASK, "budget_tokens": 70}),
     )
     .await;
     let t = text(&j);
-    assert!(j["tokens"].as_u64().unwrap() <= 40, "{t}");
+    assert!(j["tokens"].as_u64().unwrap() <= 70, "{t}");
     assert!(t.starts_with("### Правила\n"), "{t}");
     assert!(!t.contains("### Файлы"), "{t}");
 
@@ -339,7 +339,12 @@ async fn brief_sections_and_budget() {
     .await;
     let tokens = j["tokens"].as_u64().unwrap();
     assert!(tokens > 0 && tokens <= 100, "{tokens}: {j}");
-    assert!(text(&j).matches("правило правило-").count() < 10, "{j}");
+    // строка правила пакета — `<путь> — <L0> n:<id>` без метки (ревью 8c, п. 13)
+    let shown = text(&j)
+        .lines()
+        .filter(|l| l.starts_with("правило-"))
+        .count();
+    assert!(shown < 10, "{j}");
 }
 
 /// Без `task` — мини-дайджест: правила L0, ловушки, задачи (захваченная родителем — первой);

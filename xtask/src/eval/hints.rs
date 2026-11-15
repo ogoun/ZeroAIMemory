@@ -30,6 +30,10 @@
 //! эмбеддинг запроса не из кэша), `post_tool`, `session_start` и процессы `zam hook prompt |
 //! post-tool | session-start | pre-tool` — время на клиенте (с запуском процесса у хуков) и
 //! `timings.total_ms` сервера, число ответов с `recall timeout`.
+//!
+//! **M6 §9** (задача 9): набор ≥ 120 случаев, `post_tool` ≥ 48 с корзинами длины ошибки
+//! ([`LEN_BUCKETS`], метрики по корзинам — `post_tool_by_bucket`); сетки порогов
+//! `recall.post_tool_coverage` и `recall.prompt_min_score_fts` — [`grid`] (`--hints --grid`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -52,10 +56,36 @@ use super::run::{self, RunSpec, Session};
 use super::{Device, EvalArgs, Mode, Paths};
 use crate::smoke::{admin_login, agent_with, api_timeout, scrub_zam_env};
 
+pub mod grid;
+pub mod ideas;
+
 /// Ссылка на заметку Rules набора: `rule:<key>`.
 pub const RULE_REF: &str = "rule:";
-/// Не меньше стольких случаев в наборе.
-pub const MIN_CASES: usize = 60;
+/// Не меньше стольких случаев в наборе (M6 §9: ≥ 120; M4 — 60).
+pub const MIN_CASES: usize = 120;
+/// Не меньше стольких случаев `post_tool` (M6 §9), из них половина нерелевантных.
+pub const MIN_POST_TOOL: usize = 48;
+/// Не меньше стольких случаев `post_tool` в каждой корзине длины ошибки ([`LEN_BUCKETS`]).
+pub const MIN_PER_BUCKET: usize = 10;
+/// Корзины длины ошибки `post_tool` (M6 §9, I11): слов [`error_len`] — ≤ 3, 4–8, 9–20, > 20.
+pub const LEN_BUCKETS: [&str; 4] = ["≤3", "4–8", "9–20", ">20"];
+
+/// Длина ошибки для корзин: слов [`error_terms`] нормализованной ошибки ([`normalize_error`]) —
+/// `n` порога покрытия **по правилу `plain`** (у `stems` `n` после служебных слов меньше; корзины
+/// у всех точек сетки одни и те же — по `plain`).
+pub fn error_len(input: &str) -> usize {
+    error_terms(&normalize_error(input)).len()
+}
+
+/// Корзина длины ошибки ([`LEN_BUCKETS`]).
+pub fn len_bucket(input: &str) -> &'static str {
+    match error_len(input) {
+        0..=3 => LEN_BUCKETS[0],
+        4..=8 => LEN_BUCKETS[1],
+        9..=20 => LEN_BUCKETS[2],
+        _ => LEN_BUCKETS[3],
+    }
+}
 /// Доля релевантных (и нерелевантных) случаев — «половина»: от 45 до 55 %.
 const HALF: std::ops::RangeInclusive<f64> = 0.45..=0.55;
 /// Подсказок `prompt` и `post_tool` в ответе (`PROMPT_MAX`, `POST_TOOL_MAX` сервера).
@@ -134,6 +164,18 @@ pub struct Case {
     pub expected: Vec<String>,
     #[serde(default)]
     pub note: String,
+    /// Происхождение случая ([`SOURCES`]): `m4` (по умолчанию), `task9` (исполнитель задачи 9
+    /// M6), `independent` и `independent_b` (два независимых набора ревью задачи 9 — авторы не видели
+    /// код, сетки и результаты).
+    #[serde(default = "default_source")]
+    pub source: String,
+}
+
+/// Происхождения случаев набора.
+pub const SOURCES: [&str; 4] = ["m4", "task9", "independent", "independent_b"];
+
+fn default_source() -> String {
+    SOURCES[0].to_string()
 }
 
 /// Набор `eval/hints.toml`.
@@ -164,6 +206,8 @@ pub struct HintSummary {
     pub irrelevant: usize,
     /// Событие → (релевантных, нерелевантных).
     pub by_event: BTreeMap<String, (usize, usize)>,
+    /// `post_tool`: корзина длины ошибки → (релевантных, нерелевантных).
+    pub post_tool_buckets: BTreeMap<String, (usize, usize)>,
     pub insights: usize,
     pub rules: usize,
 }
@@ -229,6 +273,9 @@ pub fn validate_hints(set: &HintSet, corpus: &Corpus) -> Result<HintSummary> {
         if c.input.trim().is_empty() {
             bad("пустой input".into());
         }
+        if !SOURCES.contains(&c.source.as_str()) {
+            bad(format!("source {} — ожидается {SOURCES:?}", c.source));
+        }
         match (c.event, c.tool.as_deref()) {
             (Event::PreTool, Some("Write" | "Edit" | "Bash")) => {}
             (Event::PreTool, _) => bad("pre_tool: tool — Write, Edit или Bash".into()),
@@ -275,6 +322,17 @@ pub fn validate_hints(set: &HintSet, corpus: &Corpus) -> Result<HintSummary> {
             s.relevant += 1;
             slot.0 += 1;
         }
+        if c.event == Event::PostTool {
+            let b = s
+                .post_tool_buckets
+                .entry(len_bucket(&c.input).to_string())
+                .or_default();
+            if c.expected.is_empty() {
+                b.1 += 1;
+            } else {
+                b.0 += 1;
+            }
+        }
     }
     if s.cases < MIN_CASES {
         errs.push(format!("случаев {} < {MIN_CASES}", s.cases));
@@ -285,6 +343,25 @@ pub fn validate_hints(set: &HintSet, corpus: &Corpus) -> Result<HintSummary> {
             "релевантных {:.0} % — ожидается половина (45–55 %)",
             share * 100.0
         ));
+    }
+    let (pr, pi) = s.by_event.get("post_tool").copied().unwrap_or_default();
+    if pr + pi < MIN_POST_TOOL {
+        errs.push(format!("post_tool: случаев {} < {MIN_POST_TOOL}", pr + pi));
+    }
+    if !HALF.contains(&(pi as f64 / (pr + pi).max(1) as f64)) {
+        errs.push(format!(
+            "post_tool: нерелевантных {pi} из {} — ожидается половина",
+            pr + pi
+        ));
+    }
+    for b in LEN_BUCKETS {
+        let (r, i) = s.post_tool_buckets.get(b).copied().unwrap_or_default();
+        if r + i < MIN_PER_BUCKET {
+            errs.push(format!(
+                "post_tool: корзина длины {b} — {} случаев < {MIN_PER_BUCKET}",
+                r + i
+            ));
+        }
     }
     for e in Event::ALL {
         let (r, i) = s.by_event.get(e.as_str()).copied().unwrap_or_default();
@@ -399,7 +476,7 @@ pub enum Coverage {
 }
 
 impl Coverage {
-    /// Текущее правило сервера (`zam_search::recall::coverage_enough`).
+    /// Правило M4 сервера (`zam_search::recall::CoverageRule::M4`).
     pub const CURRENT: Coverage = Coverage::Ceil { k: 3, lo: 2, hi: 4 };
 
     pub fn need(self, n: usize) -> Option<usize> {
@@ -575,6 +652,8 @@ pub struct CaseRun {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     pub note: String,
+    /// Происхождение случая ([`Case::source`]).
+    pub source: String,
 }
 
 /// Строка перебора порога.
@@ -716,6 +795,9 @@ pub struct HintsResult {
     pub info: HintsInfo,
     pub overall: HintMetrics,
     pub by_event: BTreeMap<String, HintMetrics>,
+    /// `post_tool` по корзинам длины ошибки ([`LEN_BUCKETS`], M6 §9).
+    #[serde(default)]
+    pub post_tool_by_bucket: BTreeMap<String, HintMetrics>,
     pub calibration: Calibration,
     /// `/recall` по событиям и процессы хуков по командам.
     pub recall_latency: BTreeMap<String, Latency>,
@@ -740,16 +822,18 @@ fn recall_budget(device: Option<&str>) -> f64 {
 
 /// Каталог проекта для хуков: `.zeroaimemory/solution.toml` решения набора; свой «дом» без
 /// `~/.zeroaimemory/config.toml` (адрес и токен — `ZAM_URL`, `ZAM_TOKEN`).
-struct Hooks {
-    zam: PathBuf,
-    project: PathBuf,
-    home: PathBuf,
-    base: String,
-    token: String,
+pub(crate) struct Hooks {
+    pub(crate) zam: PathBuf,
+    pub(crate) project: PathBuf,
+    pub(crate) home: PathBuf,
+    pub(crate) base: String,
+    pub(crate) token: String,
+    /// `zam hook --agent <агент>`; `None` — умолчание `zam` (claude).
+    pub(crate) agent: Option<&'static str>,
 }
 
 impl Hooks {
-    fn prepare(dir: &Path, zam: PathBuf, base: &str, token: &str) -> Result<Hooks> {
+    pub(crate) fn prepare(dir: &Path, zam: PathBuf, base: &str, token: &str) -> Result<Hooks> {
         let project = dir.join("project");
         let home = dir.join("home");
         if project.exists() {
@@ -767,18 +851,22 @@ impl Hooks {
             home,
             base: base.to_string(),
             token: token.to_string(),
+            agent: None,
         })
     }
 
     /// `zam hook <cmd>` со входом `stdin`: вывод и время процесса, мс.
-    fn run(&self, cmd: &str, stdin: &Value) -> Result<(String, f64)> {
+    pub(crate) fn run(&self, cmd: &str, stdin: &Value) -> Result<(String, f64)> {
         let mut c = Command::new(&self.zam);
         scrub_zam_env(&mut c, &[]);
         for k in zam_core::AGENT_ENV_VARS {
             c.env_remove(k);
         }
-        c.args(["hook", cmd])
-            .current_dir(&self.project)
+        c.args(["hook", cmd]);
+        if let Some(agent) = self.agent {
+            c.args(["--agent", agent]);
+        }
+        c.current_dir(&self.project)
             .env("ZAM_URL", &self.base)
             .env("ZAM_TOKEN", &self.token)
             .env("USERPROFILE", &self.home)
@@ -847,12 +935,12 @@ impl Hooks {
     }
 
     /// Строки журнала хуков проекта.
-    fn log_lines(&self) -> usize {
+    pub(crate) fn log_lines(&self) -> usize {
         self.log_text().lines().count()
     }
 
     /// Строки журнала после первых `before`.
-    fn new_log(&self, before: usize) -> Vec<String> {
+    pub(crate) fn new_log(&self, before: usize) -> Vec<String> {
         self.log_text()
             .lines()
             .skip(before)
@@ -881,7 +969,7 @@ fn kill_pid(pid: u32) {
 }
 
 /// Текст подсказки хука из вывода (`hookSpecificOutput.additionalContext`).
-fn hook_context(out: &str) -> String {
+pub(crate) fn hook_context(out: &str) -> String {
     serde_json::from_str::<Value>(out.trim())
         .ok()
         .and_then(|v| {
@@ -1028,7 +1116,7 @@ fn prompt_candidates(s: &Session, refs: &RefMap, prompt: &str) -> Result<Vec<Pro
 /// Загрузка заметок Rules набора (`POST /nodes`, пространство `rules`): id → `rule:<key>`.
 /// Пишет администратор через сессию WebUI: агенту запись в Rules по умолчанию запрещена
 /// (`rules.agent_write = false`, §11), человек пишет в свои Rules всегда (решение T12-a).
-fn load_rules(s: &mut Session, rules: &[Rule]) -> Result<()> {
+pub(crate) fn load_rules(s: &mut Session, rules: &[Rule]) -> Result<()> {
     let admin = admin_login(&s.base)?;
     let agent = agent_with(CALL_TIMEOUT);
     for r in rules {
@@ -1059,6 +1147,44 @@ fn tool_input(h: &Hooks, c: &Case) -> Value {
     }
 }
 
+/// Пустой итог случая `c`.
+fn case_run(c: &Case) -> CaseRun {
+    CaseRun {
+        id: c.id.clone(),
+        event: c.event,
+        input: c.input.clone(),
+        tool: c.tool.clone(),
+        expected: c.expected.clone(),
+        shown: Vec::new(),
+        reasons: Vec::new(),
+        candidates: Vec::new(),
+        ms: 0.0,
+        warnings: Vec::new(),
+        note: c.note.clone(),
+        source: c.source.clone(),
+    }
+}
+
+/// Случай `prompt` или `post_tool` через `POST /recall` без сессии: показанные подсказки
+/// (ссылки набора), `reason`, время и предупреждения — в `run`.
+fn api_case(s: &Session, refs: &RefMap, c: &Case, run: &mut CaseRun) -> Result<()> {
+    let body = match c.event {
+        Event::Prompt => json!({"event": "prompt", "prompt": c.input, "solution": EVAL_SOLUTION}),
+        _ => json!({"event": "post_tool", "error": c.input, "tool": "Bash",
+                    "solution": EVAL_SOLUTION}),
+    };
+    let (v, ms) = recall(s, &body)?;
+    run.ms = ms;
+    run.warnings = warnings_of(&v);
+    for it in v["items"].as_array().into_iter().flatten() {
+        run.shown
+            .push(refs.map(it["id"].as_str().unwrap_or_default()));
+        run.reasons
+            .push(it["reason"].as_str().unwrap_or_default().to_string());
+    }
+    Ok(())
+}
+
 /// Случаи набора.
 fn run_cases(
     s: &Session,
@@ -1069,37 +1195,10 @@ fn run_cases(
 ) -> Result<Vec<CaseRun>> {
     let mut out = Vec::with_capacity(set.cases.len());
     for c in &set.cases {
-        let mut run = CaseRun {
-            id: c.id.clone(),
-            event: c.event,
-            input: c.input.clone(),
-            tool: c.tool.clone(),
-            expected: c.expected.clone(),
-            shown: Vec::new(),
-            reasons: Vec::new(),
-            candidates: Vec::new(),
-            ms: 0.0,
-            warnings: Vec::new(),
-            note: c.note.clone(),
-        };
+        let mut run = case_run(c);
         match c.event {
             Event::Prompt | Event::PostTool => {
-                let body = match c.event {
-                    Event::Prompt => {
-                        json!({"event": "prompt", "prompt": c.input, "solution": EVAL_SOLUTION})
-                    }
-                    _ => json!({"event": "post_tool", "error": c.input, "tool": "Bash",
-                                "solution": EVAL_SOLUTION}),
-                };
-                let (v, ms) = recall(s, &body)?;
-                run.ms = ms;
-                run.warnings = warnings_of(&v);
-                for it in v["items"].as_array().into_iter().flatten() {
-                    run.shown
-                        .push(refs.map(it["id"].as_str().unwrap_or_default()));
-                    run.reasons
-                        .push(it["reason"].as_str().unwrap_or_default().to_string());
-                }
+                api_case(s, refs, c, &mut run)?;
                 if c.event == Event::Prompt {
                     run.candidates = prompt_candidates(s, refs, &c.input)?;
                 }
@@ -1122,6 +1221,19 @@ fn run_cases(
         out.push(run);
     }
     Ok(out)
+}
+
+/// Метрики `post_tool` по корзинам длины ошибки (все корзины, пустые — без метрик).
+pub(crate) fn by_bucket(runs: &[CaseRun]) -> BTreeMap<String, HintMetrics> {
+    LEN_BUCKETS
+        .iter()
+        .map(|b| {
+            let rs = runs
+                .iter()
+                .filter(|r| r.event == Event::PostTool && len_bucket(&r.input) == *b);
+            (b.to_string(), hint_metrics(&outcomes(rs)))
+        })
+        .collect()
 }
 
 fn outcomes<'a>(runs: impl Iterator<Item = &'a CaseRun>) -> Vec<Outcome> {
@@ -1541,6 +1653,7 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) -> Resul
         },
         overall: hint_metrics(&outcomes(runs.iter())),
         by_event,
+        post_tool_by_bucket: by_bucket(&runs),
         calibration,
         recall_latency,
         hook_latency,
@@ -1657,6 +1770,9 @@ pub fn render_md(r: &HintsResult) -> String {
     for (e, m) in &r.by_event {
         s.push_str(&metrics_row(e, m));
     }
+    for (b, m) in &r.post_tool_by_bucket {
+        s.push_str(&metrics_row(&format!("post_tool, слов {b}"), m));
+    }
     s.push_str("\n## Калибровка\n\n");
     s.push_str(&format!(
         "`recall.prompt_min_score` (модель отбора совпала с `/recall` при 0,60 в {:.0} % случаев):\n\n",
@@ -1664,7 +1780,10 @@ pub fn render_md(r: &HintsResult) -> String {
     ));
     sweep_rows(&mut s, "порог", &r.calibration.prompt);
     s.push_str(&format!(
-        "\nПорог покрытия ослабленного FTS `post_tool` (модель совпала с `/recall` при текущем правиле в {:.0} % случаев):\n\n",
+        "\nПорог покрытия ослабленного FTS `post_tool` (модель отбора M4 знает только правило \
+         `plain`, у сервера — `recall.post_tool_coverage`; при `stems` совпадение ниже, перебор \
+         справочный — сетка M6 — `--hints --grid`; модель совпала с `/recall` в {:.0} % \
+         случаев):\n\n",
         r.calibration.post_tool_agreement * 100.0
     ));
     sweep_rows(&mut s, "правило", &r.calibration.post_tool);
@@ -1799,11 +1918,8 @@ mod tests {
         for n in 0..40 {
             for m in 0..=n {
                 let ours = Coverage::CURRENT.need(n).is_some_and(|k| n > 0 && m >= k);
-                assert_eq!(
-                    ours,
-                    zam_search::recall::coverage_enough(m, n),
-                    "n={n} m={m}"
-                );
+                let rule = zam_search::recall::CoverageRule::M4;
+                assert_eq!(ours, n > 0 && m >= rule.need(n), "n={n} m={m}");
             }
         }
         assert_eq!(Coverage::StrictOnly.need(5), None);

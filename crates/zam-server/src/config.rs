@@ -8,12 +8,15 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString, rand_core:
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use toml::{Table, Value};
+use zam_search::KindBoostMode;
+use zam_search::recall::CoverageRule;
 
-/// Переменные `ZAM_*`, которые не являются слоем конфигурации:
-/// секреты и адрес клиента, переменные клиента `zam` (сессия, признак агента, имя машины —
-/// `zam_core::CLIENT_ENV_VARS`: без этого `ZAM_MACHINE` в окружении пользователя ломала бы
-/// ручной запуск сервера), а также сборочные (build.rs, xtask), попадающие в окружение CI.
-const RESERVED_ENV: [&str; 12] = [
+/// Переменные `ZAM_*`, которые не являются слоем конфигурации: секреты и адрес клиента,
+/// сборочные (build.rs, xtask), попадающие в окружение CI. Переменные клиента `zam` —
+/// [`zam_core::CLIENT_ENV_VARS`] (сессия, признак агента, имя машины, сессия `zam mcp`, пределы
+/// ожидания `zam export`/`zam import`): без этого `ZAM_MACHINE` или `ZAM_EXPORT_IDLE_SECS` в
+/// окружении пользователя ломали бы ручной запуск сервера.
+const RESERVED_ENV: [&str; 9] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
@@ -23,10 +26,13 @@ const RESERVED_ENV: [&str; 12] = [
     "ZAM_WEB_INDEX",
     "ZAM_VCRUNTIME_DLL",
     "ZAM_VC_CRT_DIR",
-    zam_core::CLIENT_ENV_VARS[0],
-    zam_core::CLIENT_ENV_VARS[1],
-    zam_core::CLIENT_ENV_VARS[2],
 ];
+
+/// `ZAM_*` (в верхнем регистре) — не ключ конфигурации, а секрет, сборочная переменная или
+/// переменная клиента `zam`.
+fn reserved_env(upper: &str) -> bool {
+    RESERVED_ENV.contains(&upper) || zam_core::CLIENT_ENV_VARS.contains(&upper)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +55,10 @@ pub struct ServerConfig {
     pub reports: ReportsSection,
     pub code: CodeSection,
     pub ideas: IdeasSection,
+    pub backup: BackupSection,
+    pub export: ExportSection,
+    pub import: ImportSection,
+    pub snapshot: SnapshotSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -518,11 +528,15 @@ pub struct SearchSection {
     /// документов задачи 10 M5 (`eval/results/2026-11-02-m5-docs-summary.md`).
     pub attach_prefetch: usize,
     /// Множители слитого балла (§9.2 п. 4) для insight вида `gotcha` и `failure` и для узлов и
-    /// записей текущей области (`X-Zam-Area`). По умолчанию 1,05 / 1,05 / 1,10 — сетка eval задачи
-    /// 18 M3: буст вида должен быть ниже буста `theorem` (1,10), иначе гипотеза `gotcha` обходит
+    /// записей текущей области (`X-Zam-Area`). По умолчанию 1,05 / 1,05 / 1,0. Буст вида — сетка
+    /// eval задачи 18 M3: буст вида должен быть ниже буста `theorem` (1,10), иначе гипотеза `gotcha` обходит
     /// противоречащую ей теорему (при 1,15 и 1,10 `reliable_first` 0,857, при 1,05 — 1,000);
     /// 1,05 против 1,0 — Δ nDCG@10 −0,001 [−0,004…+0,003] и сохраняет подъём `failure`-записи над
-    /// заметками (`s-29`). Буст области набором не проверяется — **[решение исполнителя, M3]**.
+    /// заметками (`s-29`). Буст области 1,0 (без буста) — сетка задачи 11 M6 по набору областей
+    /// (`eval/area-queries.toml`, решение контролёра): при 1,10 запросы с ответом без области
+    /// теряют −0,110 nDCG@10 (5 из 12 хуже), с ответом в другой области — −0,026, а выигрыш своей
+    /// области (+0,035, 4/0) по знаковому тесту незначим (p = 0,0625); весь набор 1,0 − 1,10 =
+    /// +0,033. Прежние 1,10 (M3) — без замера.
     pub boost_gotcha: f64,
     pub boost_failure: f64,
     pub boost_area: f64,
@@ -547,6 +561,26 @@ pub struct SearchSection {
     /// выдаче (axiom → axiom и theorem → theorem не переставляются). `false` — порядок
     /// реранкера без поправки (по умолчанию `true`).
     pub contradicts_order: bool,
+    /// Когда действует буст вида insight `boost_gotcha`/`boost_failure` (M6 §10): `always` —
+    /// всегда (v0.0.9); `unless_contradicted` — не у записи, которой противоречит связью
+    /// `contradicts` действующая более надёжная запись (`theorem`/`axiom`) среди всех кандидатов
+    /// после слияния, до отсечения `top_k`; `reliable_only` — только у `theorem`/`axiom`.
+    /// По умолчанию `always` — сетка задачи 10 M6 (журнал).
+    pub kind_boost_mode: KindBoostMode,
+    /// Вес фрагментов документов-вложений (M6 §11, решение 14): множитель их балла рядом с
+    /// бустами — слитого и реранкера (0..=10, по умолчанию 1,0 — выдача побайтово как в v0.0.9).
+    /// Выбор 1,0 — сетка eval документов задачи 11 M6 (журнал).
+    pub w_attach: f64,
+    /// Бюджет выдачи `POST /search` и `memory_search` без явного `budget_tokens`, токенов
+    /// счётчика сервера (1..=200000, 800; M6 §4.2): Markdown `brief`/`notes` целиком, вместе
+    /// со строкой `~N tok` MCP, укладывается в него; первая карточка отдаётся всегда.
+    pub budget_tokens: usize,
+    /// Отсечка слабых карточек `brief`/`notes` (0..=1, 0 — выключена, поведение v0.0.9; M6
+    /// §4.2): карточка с баллом ниже `brief_min_rel × лучший` не выдаётся, явный `top_k` её
+    /// не снимает. По умолчанию 0 — сетка ТС-1 dev задачи 5 M6: 0,4 ничего не отсекает, 0,5
+    /// экономит 0,16 %, но выбрасывает находки только канала `alias` (его вес 0,5 — балл вдвое
+    /// ниже: приёмка M4.5 `glossary_ru_en`), поэтому остаётся значение v0.0.9.
+    pub brief_min_rel: f64,
 }
 
 impl SearchSection {
@@ -598,6 +632,15 @@ impl SearchSection {
         if !(self.graph_weight.is_finite() && (0.0..=1.0).contains(&self.graph_weight)) {
             return Err(bad("graph_weight", "должно быть в 0..=1"));
         }
+        if !(self.w_attach.is_finite() && (0.0..=10.0).contains(&self.w_attach)) {
+            return Err(bad("w_attach", "должно быть в 0..=10"));
+        }
+        if !(1..=200_000).contains(&self.budget_tokens) {
+            return Err(bad("budget_tokens", "от 1 до 200000"));
+        }
+        if !(self.brief_min_rel.is_finite() && (0.0..=1.0).contains(&self.brief_min_rel)) {
+            return Err(bad("brief_min_rel", "должно быть в 0..=1"));
+        }
         Ok(())
     }
 }
@@ -644,6 +687,16 @@ pub struct ReadSection {
     pub max_items: usize,
     /// Бюджет токенов на весь ответ по умолчанию (1..=200000, по умолчанию 1500).
     pub budget_tokens: usize,
+    /// Явный фокус (M6 §6): не больше листов в выдаче (1..=10, по умолчанию 3).
+    pub focus_leaves: usize,
+    /// Цель не длиннее (полный текст, токенов) — целиком без фокуса (0..=20000, по умолчанию 600).
+    pub focus_min_tokens: usize,
+    /// Срок эмбеддинга запроса и чтения векторов листов, мс; вышел — фокус по лексике
+    /// (1..=10000, по умолчанию 80). Срок вызова — это × число различных `focus`, не больше
+    /// `focus_timeout_max_ms`.
+    pub focus_timeout_ms: u64,
+    /// Потолок срока вызова фокуса, мс (1..=10000, не меньше `focus_timeout_ms`, по умолчанию 300).
+    pub focus_timeout_max_ms: u64,
 }
 
 impl ReadSection {
@@ -658,6 +711,24 @@ impl ReadSection {
         }
         if !(1..=200_000).contains(&self.budget_tokens) {
             return Err(bad("budget_tokens", "от 1 до 200000"));
+        }
+        if !(1..=10).contains(&self.focus_leaves) {
+            return Err(bad("focus_leaves", "от 1 до 10"));
+        }
+        if self.focus_min_tokens > 20_000 {
+            return Err(bad("focus_min_tokens", "от 0 до 20000"));
+        }
+        if !(1..=10_000).contains(&self.focus_timeout_ms) {
+            return Err(bad("focus_timeout_ms", "от 1 до 10000"));
+        }
+        if !(1..=10_000).contains(&self.focus_timeout_max_ms) {
+            return Err(bad("focus_timeout_max_ms", "от 1 до 10000"));
+        }
+        if self.focus_timeout_max_ms < self.focus_timeout_ms {
+            return Err(bad(
+                "focus_timeout_max_ms",
+                "не меньше read.focus_timeout_ms",
+            ));
         }
         Ok(())
     }
@@ -714,18 +785,57 @@ impl CacheSection {
 #[serde(deny_unknown_fields)]
 pub struct RecallSection {
     /// Бюджет дайджеста старта сессии и подсказок по умолчанию, токенов (1..=20000, 1500).
+    /// Без Rules (резерв сверх бюджета, M6 §8). 1500 — по сетке ТС-2 (M6 §8, задача 8c): 800 не
+    /// проходит (выпадают идеи тяжёлых сессий); 1000 проходит, но дешевле не больше чем на 2 %
+    /// (Claude R 0,996, Codex 1,003) — по §3.5 берётся больший бюджет; запаса у 1000 нет.
     pub digest_tokens: usize,
     /// Бюджет пакета восстановления после сжатия контекста и `resume`, токенов (1..=20000,
     /// 2000; M4.5 §9.2): `/recall` `event: recovery` или `session_start` после `compact|resume`.
+    /// Сетка ТС-2 {1200, 1500, 2000} вырождена (пакеты без Rules меньше 1200) — 2000 (задача 8c).
     pub recovery_tokens: usize,
     /// Бюджет пакета под задачу, токенов (1..=20000, 800; M4.5 §9.4): `/recall` `event: brief`
     /// (хук `subagent-start`, MCP `memory_recall` при составлении задания субагенту).
+    /// 800 — по сетке ТС-2 (задача 8c): 500 экономит 1,43 % токенов сессии (Claude, R 0,986;
+    /// ≤ 2 % — больший бюджет, §3.5), а субагент теряет треть правил и решения.
     pub brief_tokens: usize,
     /// Наименьший балл поиска подсказки к запросу пользователя (0..=1, 0,6).
     pub prompt_min_score: f64,
+    /// Тот же порог, когда поиск `prompt` деградировал до FTS (`degraded`, нет модели или Qdrant;
+    /// M6 §9, M4.5 M-9), 0..=1 — подсказки `prompt` и подсказки-идеи (пакет субагенту — всегда
+    /// `prompt_min_score`). Не задан — равен `prompt_min_score`, как до M6 (ревью задачи 9, M-1):
+    /// сетка {0,2…0,6} условий §9 не выполнила ни при одном значении (тишина 0,27 < 0,7).
+    #[serde(default)]
+    pub prompt_min_score_fts: Option<f64>,
+    /// Порог покрытия слов ошибки у ослабленного FTS `post_tool` (M6 §9):
+    /// `{divisor, cap, word_match}` — `clamp(⌈n / divisor⌉, 2, cap)`, слова `plain` | `stems`;
+    /// `{2, 6, plain}` — по сетке задачи 9 (до M6 — `{3, 4, plain}`; [`CoverageRule::M6`]).
+    pub post_tool_coverage: CoverageRule,
     /// Бюджет сервера на сбор подсказок, мс (1..=60000, 200): по превышении отдаётся собранное
     /// и `warnings: ["recall timeout"]`.
     pub timeout_ms: u64,
+    /// Верхний предел поля `timeout_ms` тела `/recall`, мс (1..=60000, 2000; M6 §16 п. 19,
+    /// CR-7): нативный клиент может ждать полный дайджест дольше хуков; больше предела — 400.
+    /// Действует `max(max_timeout_ms, timeout_ms)`: срок сервера больше предела тоже допустим.
+    pub max_timeout_ms: u64,
+    /// Фрагмент под подсказкой поиска (правило, insight), токенов (0..=200, 60; M6 §4.3);
+    /// 0 — без фрагмента.
+    pub snippet_tokens: usize,
+    /// Записей в разделе дайджеста и пакета восстановления (задачи, ответы, ловушки, revisit,
+    /// changelog, решения), 1..=20, 5 (M6 §8; прежде константа `DIGEST_ENTRIES_MAX`). Сетка ТС-2
+    /// (задача 8c): при 3 выпадают задачи и ответы, 8 не дешевле 5.
+    pub digest_entries: usize,
+    /// Мини-карта кода дайджеста `### Карта кода` (центральные символы), токенов, 0..=1000,
+    /// 0 — только строка-указатель карты (M6 §8, решение 16; включение — по A/B).
+    pub digest_code_map_tokens: usize,
+    /// Раздел «Последнее известное состояние» (снимок сессии, M6 §8а) в дайджесте (только
+    /// оборванная сессия) и пакете восстановления, токенов (0..=2000, 400), внутри `digest_tokens`/`recovery_tokens`;
+    /// 0 — не показывать (снимок хранится).
+    pub snapshot_tokens: usize,
+    /// Задача снимка «давно не обновлялась», если её последняя ревизия старше снимка на столько
+    /// минут (0..=1440, 30; M6 §8а).
+    pub snapshot_stale_min: u32,
+    /// Окно дайджеста для снимков других сессий, суток UTC от начала текущих (1..=30, 2).
+    pub snapshot_digest_days: u32,
 }
 
 impl RecallSection {
@@ -747,8 +857,41 @@ impl RecallSection {
         if !(self.prompt_min_score.is_finite() && (0.0..=1.0).contains(&self.prompt_min_score)) {
             return Err(bad("prompt_min_score", "должно быть в 0..=1"));
         }
+        if let Some(fts) = self.prompt_min_score_fts
+            && !(fts.is_finite() && (0.0..=1.0).contains(&fts))
+        {
+            return Err(bad("prompt_min_score_fts", "должно быть в 0..=1"));
+        }
+        let cov = &self.post_tool_coverage;
+        if !(1..=10).contains(&cov.divisor) {
+            return Err(bad("post_tool_coverage.divisor", "от 1 до 10"));
+        }
+        if !(2..=32).contains(&cov.cap) {
+            return Err(bad("post_tool_coverage.cap", "от 2 до 32"));
+        }
         if !(1..=60_000).contains(&self.timeout_ms) {
             return Err(bad("timeout_ms", "от 1 до 60000"));
+        }
+        if !(1..=60_000).contains(&self.max_timeout_ms) {
+            return Err(bad("max_timeout_ms", "от 1 до 60000"));
+        }
+        if self.snippet_tokens > 200 {
+            return Err(bad("snippet_tokens", "от 0 до 200"));
+        }
+        if !(1..=20).contains(&self.digest_entries) {
+            return Err(bad("digest_entries", "от 1 до 20"));
+        }
+        if self.digest_code_map_tokens > 1000 {
+            return Err(bad("digest_code_map_tokens", "от 0 до 1000"));
+        }
+        if self.snapshot_tokens > 2000 {
+            return Err(bad("snapshot_tokens", "от 0 до 2000"));
+        }
+        if self.snapshot_stale_min > 1440 {
+            return Err(bad("snapshot_stale_min", "от 0 до 1440"));
+        }
+        if !(1..=30).contains(&self.snapshot_digest_days) {
+            return Err(bad("snapshot_digest_days", "от 1 до 30"));
         }
         Ok(())
     }
@@ -981,7 +1124,8 @@ pub struct CodeSection {
     pub max_request_bytes: u64,
     /// Бюджет карты по умолчанию, токенов (1..=20000, 1000).
     pub map_tokens: usize,
-    /// Бюджет раздела `### Код` пакета субагенту, токенов (0..=1000, 150).
+    /// Бюджет раздела `### Код` пакета субагенту, токенов (0..=1000, 150; сетка ТС-2 {100, 150}
+    /// вырождена — раздел фикстуры меньше 100, задача 8c).
     pub brief_tokens: usize,
     /// Сколько запрос карты ждёт пересчёта рангов, мс (0..=60000, 1000; 0 — не ждать); дольше —
     /// старые ранги и `warnings: ["rank pending"]`, пересчёт продолжается в фоне.
@@ -1088,6 +1232,216 @@ impl IdeasSection {
     }
 }
 
+/// Расписание автокопий (M6 §12б.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupSchedule {
+    Off,
+    Daily,
+}
+
+/// Секция `[backup]` (M6 §12б.2–§12б.4): копии `zam-server backup` и автокопии.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSection {
+    /// Каталог копий; по умолчанию `<data_dir>/backups`.
+    pub dir: Option<PathBuf>,
+    /// `off` (по умолчанию: копия на том же диске может его заполнить) или `daily`.
+    pub schedule: BackupSchedule,
+    /// Время автокопии, `HH:MM` UTC (по умолчанию `03:30`).
+    pub at: String,
+    /// Сколько автокопий хранить (1..=365, 7); сверх — удаляются самые старые.
+    pub keep: u32,
+    /// `GET /index/status` предупреждает `no_recent_backup`, если последней копии больше
+    /// стольких суток или её нет (1..=365, 7).
+    pub warn_days: u32,
+    /// Признак копии `.zam-backup` старше стольких часов — брошенный (1..=168, 6).
+    pub flag_max_hours: u32,
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            schedule: BackupSchedule::Off,
+            at: "03:30".into(),
+            keep: 7,
+            warn_days: 7,
+            flag_max_hours: 6,
+        }
+    }
+}
+
+impl BackupSection {
+    /// Каталог копий: `backup.dir` или `<data_dir>/backups`.
+    pub fn dir(&self, data_dir: &Path) -> PathBuf {
+        self.dir.clone().unwrap_or_else(|| data_dir.join("backups"))
+    }
+
+    /// `at` как (часы, минуты); проверено [`BackupSection::validate`].
+    pub fn at_hm(&self) -> (i8, i8) {
+        parse_hm(&self.at).unwrap_or((3, 30))
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("backup.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if parse_hm(&self.at).is_none() {
+            return Err(bad("at", "время HH:MM (UTC), например 03:30"));
+        }
+        if !(1..=365).contains(&self.keep) {
+            return Err(bad("keep", "от 1 до 365"));
+        }
+        if !(1..=365).contains(&self.warn_days) {
+            return Err(bad("warn_days", "от 1 до 365"));
+        }
+        if !(1..=168).contains(&self.flag_max_hours) {
+            return Err(bad("flag_max_hours", "от 1 до 168"));
+        }
+        Ok(())
+    }
+}
+
+/// Секция `[snapshot]` (M6 §8а): снимок сессии `PUT /sessions/{id}/snapshot`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotSection {
+    /// Предел записи снимка — всего тела JSON после маскировки, байт (1024..=65536, 16384):
+    /// больше — 413.
+    pub max_bytes: usize,
+    /// Срок хранения снимка от `taken_at`, суток (1..=90, 14): старше удаляет воркер
+    /// обслуживания раз в сутки; вместе с сессией снимок уходит и раньше (`gc_sessions`).
+    pub keep_days: u32,
+}
+
+impl Default for SnapshotSection {
+    fn default() -> Self {
+        Self {
+            max_bytes: 16_384,
+            keep_days: 14,
+        }
+    }
+}
+
+impl SnapshotSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("snapshot.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1024..=65_536).contains(&self.max_bytes) {
+            return Err(bad("max_bytes", "от 1024 до 65536"));
+        }
+        if !(1..=90).contains(&self.keep_days) {
+            return Err(bad("keep_days", "от 1 до 90"));
+        }
+        Ok(())
+    }
+}
+
+/// Секция `[export]` (M6 §12б.5): экспорт пространства `GET /spaces/{space}/export`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportSection {
+    /// Предел длительности одного экспорта, с (1..=604800, 14400 — 4 ч): дольше — поток
+    /// обрывается (`complete: false` в аудите), транзакция чтения закрывается.
+    pub max_secs: u64,
+}
+
+impl Default for ExportSection {
+    fn default() -> Self {
+        Self { max_secs: 4 * 3600 }
+    }
+}
+
+impl ExportSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=604_800).contains(&self.max_secs) {
+            return Err(ConfigError::Invalid {
+                key: "export.max_secs".into(),
+                source_name: "итог".into(),
+                message: "от 1 до 604800 (7 суток)".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Секция `[import]` (M6 §12б.5): импорт пространства `POST /spaces/{space}/import`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportSection {
+    /// Предел тела запроса (zip) и распакованного объёма архива, байт (1 МиБ..=64 ГиБ, 2 ГиБ):
+    /// больше — 413 (тело) или 422 (распакованный объём).
+    pub max_bytes: u64,
+    /// Файлов в архиве не больше (1..=1 000 000, 100 000): больше — 422.
+    pub max_files: usize,
+    /// Тексты архива (всё, кроме вложений `_attachments/`: заметки, записи, история, связи)
+    /// держит в памяти план импорта — их объём не больше, байт (1 МиБ..=64 ГиБ, 256 МиБ): больше —
+    /// 422.
+    pub max_text_bytes: u64,
+    /// Запас свободного места, байт (0..=1 ТиБ, 2 ГиБ): перед приёмом тела на диске каталога
+    /// данных должно быть свободно `min_free_bytes + 2 × ожидаемый объём` сверх места,
+    /// зарезервированного идущими приёмами; иначе 507.
+    pub min_free_bytes: u64,
+}
+
+impl Default for ImportSection {
+    fn default() -> Self {
+        Self {
+            max_bytes: 2 << 30,
+            max_files: 100_000,
+            max_text_bytes: zam_store::import::MAX_TEXT_BYTES_DEFAULT,
+            min_free_bytes: 2 << 30,
+        }
+    }
+}
+
+impl ImportSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("import.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        const MIB: u64 = 1 << 20;
+        const MAX: u64 = 64 << 30;
+        if !(MIB..=MAX).contains(&self.max_bytes) {
+            return Err(bad(
+                "max_bytes",
+                "от 1048576 (1 МиБ) до 68719476736 (64 ГиБ)",
+            ));
+        }
+        if !(1..=1_000_000).contains(&self.max_files) {
+            return Err(bad("max_files", "от 1 до 1000000"));
+        }
+        if self.min_free_bytes > 1 << 40 {
+            return Err(bad("min_free_bytes", "от 0 до 1099511627776 (1 ТиБ)"));
+        }
+        if !(MIB..=MAX).contains(&self.max_text_bytes) {
+            return Err(bad(
+                "max_text_bytes",
+                "от 1048576 (1 МиБ) до 68719476736 (64 ГиБ)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `HH:MM` → (часы 0..=23, минуты 0..=59).
+fn parse_hm(s: &str) -> Option<(i8, i8)> {
+    let (h, m) = s.trim().split_once(':')?;
+    if h.len() != 2 || m.len() != 2 {
+        return None;
+    }
+    let (h, m): (i8, i8) = (h.parse().ok()?, m.parse().ok()?);
+    ((0..=23).contains(&h) && (0..=59).contains(&m)).then_some((h, m))
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -1164,7 +1518,7 @@ impl Default for ServerConfig {
                 attach_prefetch: zam_index::ATTACH_PREFETCH,
                 boost_gotcha: 1.05,
                 boost_failure: 1.05,
-                boost_area: 1.10,
+                boost_area: 1.0,
                 boost_axiom: 1.20,
                 boost_theorem: 1.10,
                 boost_hypothesis: 1.00,
@@ -1172,6 +1526,10 @@ impl Default for ServerConfig {
                 w_folder: 0.0,
                 max_folders: 2,
                 contradicts_order: true,
+                kind_boost_mode: KindBoostMode::Always,
+                w_attach: 1.0,
+                budget_tokens: 800,
+                brief_min_rel: 0.0,
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
@@ -1180,6 +1538,10 @@ impl Default for ServerConfig {
             read: ReadSection {
                 max_items: 20,
                 budget_tokens: 1500,
+                focus_leaves: 3,
+                focus_min_tokens: 600,
+                focus_timeout_ms: 80,
+                focus_timeout_max_ms: 300,
             },
             cache: CacheSection {
                 summary_tokens: 600,
@@ -1194,7 +1556,16 @@ impl Default for ServerConfig {
                 recovery_tokens: 2000,
                 brief_tokens: 800,
                 prompt_min_score: 0.6,
+                prompt_min_score_fts: None,
+                post_tool_coverage: CoverageRule::M6,
                 timeout_ms: 200,
+                max_timeout_ms: 2000,
+                snippet_tokens: 60,
+                digest_entries: 5,
+                digest_code_map_tokens: 0,
+                snapshot_tokens: 400,
+                snapshot_stale_min: 30,
+                snapshot_digest_days: 2,
             },
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
@@ -1205,6 +1576,10 @@ impl Default for ServerConfig {
             reports: ReportsSection::default(),
             code: CodeSection::default(),
             ideas: IdeasSection::default(),
+            backup: BackupSection::default(),
+            export: ExportSection::default(),
+            import: ImportSection::default(),
+            snapshot: SnapshotSection::default(),
         }
     }
 }
@@ -1296,7 +1671,7 @@ pub fn load(
         let Some(rest) = upper.strip_prefix("ZAM_") else {
             continue;
         };
-        if RESERVED_ENV.contains(&upper.as_str()) || rest.is_empty() {
+        if reserved_env(&upper) || rest.is_empty() {
             continue;
         }
         let path: Vec<String> = rest
@@ -1380,6 +1755,10 @@ pub fn load(
     cfg.reports.validate()?;
     cfg.code.validate()?;
     cfg.ideas.validate()?;
+    cfg.backup.validate()?;
+    cfg.export.validate()?;
+    cfg.import.validate()?;
+    cfg.snapshot.validate()?;
     Ok(cfg)
 }
 
@@ -1516,8 +1895,9 @@ mod tests {
                 c.search.boost_failure,
                 c.search.boost_area
             ),
-            // сетка задачи 18 M3 (fix round 1): буст вида ниже буста theorem — 1,05
-            (1.05, 1.05, 1.10)
+            // сетка задачи 18 M3 (fix round 1): буст вида ниже буста theorem — 1,05; буст
+            // области — 1,0 (сетка задачи 11 M6)
+            (1.05, 1.05, 1.0)
         );
         assert_eq!(
             (
@@ -1534,12 +1914,59 @@ mod tests {
         // M4.5: близкие аксиомы решений и порядок по `contradicts`
         assert_eq!(c.insights.decision_conflict_threshold, 0.80);
         assert!(c.search.contradicts_order);
+        assert_eq!(c.search.kind_boost_mode, KindBoostMode::Always);
+    }
+
+    /// M6 §10: `search.kind_boost_mode` из `ZAM_*`, неизвестное значение — ошибка.
+    #[test]
+    fn kind_boost_mode_key() {
+        for (v, want) in [
+            ("always", KindBoostMode::Always),
+            ("unless_contradicted", KindBoostMode::UnlessContradicted),
+            ("reliable_only", KindBoostMode::ReliableOnly),
+        ] {
+            let c = load(
+                None,
+                &[env("ZAM_SEARCH__KIND_BOOST_MODE", v)],
+                &Default::default(),
+            )
+            .unwrap();
+            assert_eq!(c.search.kind_boost_mode, want, "{v}");
+        }
+        assert!(
+            load(
+                None,
+                &[env("ZAM_SEARCH__KIND_BOOST_MODE", "sometimes")],
+                &Default::default()
+            )
+            .is_err()
+        );
+    }
+
+    /// M6 §11: `search.w_attach` — по умолчанию 1,0, из `ZAM_*`, вне 0..=10 — ошибка.
+    #[test]
+    fn w_attach_key() {
+        let c = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(c.search.w_attach, 1.0);
+        for (v, ok) in [
+            ("0", true),
+            ("1.3", true),
+            ("10", true),
+            ("10.5", false),
+            ("-0.1", false),
+        ] {
+            let r = load(None, &[env("ZAM_SEARCH__W_ATTACH", v)], &Default::default());
+            assert_eq!(r.is_ok(), ok, "{v}");
+            if let Ok(c) = r {
+                assert_eq!(c.search.w_attach, v.parse::<f64>().unwrap());
+            }
+        }
     }
 
     #[test]
     fn boosts_and_dedup_threshold_validated() {
         let ok = vec![
-            env("ZAM_SEARCH__BOOST_AREA", "1.0"),
+            env("ZAM_SEARCH__BOOST_AREA", "1.3"),
             env("ZAM_INSIGHTS__DEDUP_THRESHOLD", "0.85"),
             env("ZAM_INSIGHTS__DECISION_CONFLICT_THRESHOLD", "0.7"),
             env("ZAM_SEARCH__CONTRADICTS_ORDER", "false"),
@@ -1549,7 +1976,7 @@ mod tests {
         assert!(!c.search.contradicts_order);
         assert_eq!(
             (c.search.boost_area, c.insights.dedup_threshold),
-            (1.0, 0.85)
+            (1.3, 0.85)
         );
         for (k, v) in [
             ("ZAM_SEARCH__BOOST_GOTCHA", "0"),
@@ -1638,6 +2065,24 @@ note_max_bytes = 1000
             env("ZAM_MACHINE", "box"),
         ];
         assert!(load(None, &env, &Default::default()).is_ok());
+    }
+
+    /// Переменные клиента `zam` (все `zam_core::CLIENT_ENV_VARS`, в том числе пределы ожидания
+    /// `zam export`/`zam import`) в окружении сервера — не ключи конфигурации: сервер с ними
+    /// стартует с умолчаниями.
+    #[test]
+    fn client_env_are_skipped() {
+        let mut env: Vec<(String, String)> = zam_core::CLIENT_ENV_VARS
+            .iter()
+            .map(|k| (k.to_string(), "1".to_string()))
+            .collect();
+        for k in ["ZAM_EXPORT_IDLE_SECS", "ZAM_IMPORT_IDLE_SECS"] {
+            env.push((k.to_string(), "300".to_string()));
+        }
+        assert_eq!(
+            load(None, &env, &Default::default()).unwrap(),
+            ServerConfig::default()
+        );
     }
 
     #[test]
@@ -2205,6 +2650,9 @@ master_key = \"x\"
             ("ZAM_RECALL__BRIEF_TOKENS", "20001"),
             ("ZAM_RECALL__PROMPT_MIN_SCORE", "1.5"),
             ("ZAM_RECALL__TIMEOUT_MS", "0"),
+            ("ZAM_RECALL__DIGEST_ENTRIES", "0"),
+            ("ZAM_RECALL__DIGEST_ENTRIES", "21"),
+            ("ZAM_RECALL__DIGEST_CODE_MAP_TOKENS", "1001"),
         ] {
             let e = load(None, &[env(k, v)], &Default::default())
                 .unwrap_err()
@@ -2221,6 +2669,22 @@ master_key = \"x\"
         assert_eq!(c.recall.digest_tokens, 1500);
         assert_eq!(c.recall.recovery_tokens, 2000);
         assert_eq!(c.recall.brief_tokens, 800);
+        // M6 §8: записей в разделах дайджеста и мини-карта кода (0 — только строка-указатель)
+        assert_eq!(c.recall.digest_entries, 5);
+        assert_eq!(c.recall.digest_code_map_tokens, 0);
+        let c = load(
+            None,
+            &[
+                env("ZAM_RECALL__DIGEST_ENTRIES", "20"),
+                env("ZAM_RECALL__DIGEST_CODE_MAP_TOKENS", "1000"),
+            ],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (c.recall.digest_entries, c.recall.digest_code_map_tokens),
+            (20, 1000)
+        );
     }
 
     #[test]
@@ -2374,6 +2838,191 @@ master_key = \"x\"
         assert_eq!(c.rank_timeout_ms, 0, "0 — пересчёт только в фоне");
         let e = load(None, &[env("ZAM_CODE__AUTO", "true")], &Default::default());
         assert!(e.is_err(), "неизвестный ключ секции — ошибка");
+    }
+
+    /// M6 §9: `recall.prompt_min_score_fts` и `recall.post_tool_coverage` — умолчания, `ZAM_*`
+    /// вложенного ключа, диапазоны.
+    #[test]
+    fn recall_hint_threshold_keys() {
+        use zam_search::recall::WordMatch;
+        let d = load(None, &[], &Default::default()).unwrap().recall;
+        assert_eq!(
+            d.prompt_min_score_fts, None,
+            "не задан — как prompt_min_score"
+        );
+        assert_eq!(d.post_tool_coverage, CoverageRule::M6);
+        let e = vec![
+            env("ZAM_RECALL__PROMPT_MIN_SCORE_FTS", "0.3"),
+            env("ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR", "2"),
+            env("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "6"),
+            env("ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH", "stems"),
+        ];
+        let r = load(None, &e, &Default::default()).unwrap().recall;
+        assert_eq!(r.prompt_min_score_fts, Some(0.3));
+        assert_eq!(
+            r.post_tool_coverage,
+            CoverageRule {
+                divisor: 2,
+                cap: 6,
+                word_match: WordMatch::Stems
+            }
+        );
+        for (k, v) in [
+            ("ZAM_RECALL__PROMPT_MIN_SCORE_FTS", "1.5"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR", "0"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "1"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "33"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH", "snowball"),
+        ] {
+            assert!(
+                load(None, &[env(k, v)], &Default::default()).is_err(),
+                "{k}={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_section_defaults_and_ranges() {
+        let b = load(None, &[], &Default::default()).unwrap().backup;
+        assert_eq!(b, BackupSection::default());
+        assert_eq!(b.schedule, BackupSchedule::Off);
+        assert_eq!(
+            (b.at_hm(), b.keep, b.warn_days, b.flag_max_hours),
+            ((3, 30), 7, 7, 6)
+        );
+        let ok = load(
+            None,
+            &[
+                env("ZAM_BACKUP__SCHEDULE", "daily"),
+                env("ZAM_BACKUP__AT", "23:05"),
+            ],
+            &Default::default(),
+        )
+        .unwrap()
+        .backup;
+        assert_eq!((ok.schedule, ok.at_hm()), (BackupSchedule::Daily, (23, 5)));
+        for (k, v) in [
+            ("ZAM_BACKUP__AT", "24:00"),
+            ("ZAM_BACKUP__AT", "3:30"),
+            ("ZAM_BACKUP__KEEP", "0"),
+            ("ZAM_BACKUP__KEEP", "366"),
+            ("ZAM_BACKUP__WARN_DAYS", "0"),
+            ("ZAM_BACKUP__FLAG_MAX_HOURS", "169"),
+            ("ZAM_BACKUP__SCHEDULE", "weekly"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default());
+            assert!(e.unwrap_err().to_string().contains("backup."), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn export_section_defaults_and_ranges() {
+        let e = load(None, &[], &Default::default()).unwrap().export;
+        assert_eq!(e.max_secs, 14_400);
+        for v in ["0", "604801"] {
+            let r = load(None, &[env("ZAM_EXPORT__MAX_SECS", v)], &Default::default());
+            assert!(
+                r.unwrap_err().to_string().contains("export.max_secs"),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_section_defaults_and_ranges() {
+        let i = load(None, &[], &Default::default()).unwrap().import;
+        assert_eq!(i.max_bytes, 2 << 30);
+        assert_eq!(i.max_files, 100_000);
+        assert_eq!(i.max_text_bytes, 256 << 20);
+        assert_eq!(i.min_free_bytes, 2 << 30);
+        for (k, v) in [
+            ("ZAM_IMPORT__MAX_BYTES", "1048575"),
+            ("ZAM_IMPORT__MAX_BYTES", "68719476737"),
+            ("ZAM_IMPORT__MAX_FILES", "0"),
+            ("ZAM_IMPORT__MAX_FILES", "1000001"),
+            ("ZAM_IMPORT__MAX_TEXT_BYTES", "1048575"),
+            ("ZAM_IMPORT__MIN_FREE_BYTES", "1099511627777"),
+        ] {
+            let r = load(None, &[env(k, v)], &Default::default());
+            assert!(
+                r.unwrap_err().to_string().contains(&format!(
+                    "import.{}",
+                    k.trim_start_matches("ZAM_IMPORT__").to_lowercase()
+                )),
+                "{k}={v}"
+            );
+        }
+    }
+
+    /// M6 §8а: ключи снимка — умолчания и пределы.
+    #[test]
+    fn snapshot_keys_defaults_and_ranges() {
+        let c = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(
+            (
+                c.recall.snapshot_tokens,
+                c.recall.snapshot_stale_min,
+                c.recall.snapshot_digest_days
+            ),
+            (400, 30, 2)
+        );
+        assert_eq!((c.snapshot.max_bytes, c.snapshot.keep_days), (16_384, 14));
+        for (k, v) in [
+            ("ZAM_RECALL__SNAPSHOT_TOKENS", "2001"),
+            ("ZAM_RECALL__SNAPSHOT_STALE_MIN", "1441"),
+            ("ZAM_RECALL__SNAPSHOT_DIGEST_DAYS", "0"),
+            ("ZAM_RECALL__SNAPSHOT_DIGEST_DAYS", "31"),
+            ("ZAM_SNAPSHOT__MAX_BYTES", "1023"),
+            ("ZAM_SNAPSHOT__MAX_BYTES", "65537"),
+            ("ZAM_SNAPSHOT__KEEP_DAYS", "0"),
+            ("ZAM_SNAPSHOT__KEEP_DAYS", "91"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            let key = k
+                .trim_start_matches("ZAM_")
+                .replace("__", ".")
+                .to_lowercase();
+            assert!(e.contains(&key), "{k}={v}: {e}");
+        }
+        let c = load(
+            None,
+            &[
+                env("ZAM_RECALL__SNAPSHOT_TOKENS", "0"),
+                env("ZAM_SNAPSHOT__MAX_BYTES", "65536"),
+            ],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (c.recall.snapshot_tokens, c.snapshot.max_bytes),
+            (0, 65_536)
+        );
+    }
+
+    /// M6 §16 п. 19 (CR-7): `recall.max_timeout_ms` — 1..=60000, по умолчанию 2000.
+    #[test]
+    fn recall_max_timeout_default_and_range() {
+        let c = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(c.recall.max_timeout_ms, 2000);
+        for v in ["0", "60001"] {
+            let e = load(
+                None,
+                &[env("ZAM_RECALL__MAX_TIMEOUT_MS", v)],
+                &Default::default(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("recall.max_timeout_ms"), "{v}: {e}");
+        }
+        let c = load(
+            None,
+            &[env("ZAM_RECALL__MAX_TIMEOUT_MS", "60000")],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(c.recall.max_timeout_ms, 60_000);
     }
 
     #[test]

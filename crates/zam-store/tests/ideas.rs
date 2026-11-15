@@ -18,9 +18,9 @@ use zam_store::{
     IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewAnswer,
     NewDecision, NewEdge, NewEntry, ProposalKind, QuestionData, QuestionError, SpaceKind,
     StoreError, TaskData, TaskState, UserDbs, adopt_idea, answer_question, check_idea,
-    check_idea_transition, create_entry, create_solution, decide_idea, delete_entry, get_entry,
-    idea_candidate, idea_task_state, list_entries, list_spaces, proactive_ideas, propose_idea,
-    restore_entry, update_entry,
+    check_idea_transition, create_entry, create_solution, decide_idea, delete_entry,
+    entry_revisions, get_entry, idea_candidate, idea_task_state, list_entries, list_spaces,
+    proactive_ideas, propose_idea, restore_entry, update_entry,
 };
 
 // ---------- окружение ----------
@@ -2519,19 +2519,149 @@ async fn fts_entry_ids_filter() {
     assert_eq!(only, [b.id].into_iter().collect::<HashSet<_>>());
 }
 
+/// M6, задача 16: лёгкий поиск FTS (`search_fts_channels_light`) — каналы не длиннее
+/// `channel_depth` и совпадают с началом обычных, сниппеты не строятся; обычный поиск прежний.
+#[tokio::test]
+async fn fts_light_search_depth_and_snippets() {
+    use zam_store::search::{FtsQuery, TargetFilter, search_fts_channels};
+    use zam_store::{LightSearch, search_fts_channels_light};
+    let (db, sol, _) = setup("fts-light").await;
+    for n in 0..30 {
+        new_idea(
+            &db,
+            sol,
+            &format!("Экспорт отчётов report_v{n} в PDF"),
+            "human",
+            "normal",
+        )
+        .await;
+    }
+    let q = |text: &str| FtsQuery {
+        alias_groups: Vec::new(),
+        text: text.into(),
+        space_ids: vec![sol],
+        path_prefix: None,
+        top_k: 100,
+        targets: TargetFilter {
+            kinds: vec!["idea".into()],
+            ..TargetFilter::default()
+        },
+    };
+    let ids =
+        |l: &[zam_store::FtsHit]| -> Vec<String> { l.iter().map(|h| h.chunk_id.clone()).collect() };
+    let light = |depth: usize, snippets: bool| LightSearch {
+        channel_depth: depth,
+        snippets,
+    };
+    // слово с подчёркиванием и цифрой — идентификатор: работает и канал trigram
+    let text = "экспорт отчётов report_v";
+    let full = search_fts_channels(&db, q(text)).await.unwrap();
+    assert!(full.bm25.len() > 20, "bm25 {}", full.bm25.len());
+    assert!(full.trigram.len() > 5, "trigram {}", full.trigram.len());
+    assert!(
+        full.bm25
+            .iter()
+            .chain(&full.trigram)
+            .all(|h| !h.snippet.is_empty()),
+        "обычный поиск — со сниппетами"
+    );
+    let l = search_fts_channels_light(&db, q(text), light(20, false))
+        .await
+        .unwrap();
+    assert_eq!(ids(&l.bm25), ids(&full.bm25)[..20]);
+    assert_eq!(l.trigram.len(), 20.min(full.trigram.len()));
+    assert_eq!(ids(&l.trigram), ids(&full.trigram)[..l.trigram.len()]);
+    assert!(
+        l.bm25
+            .iter()
+            .chain(&l.trigram)
+            .all(|h| h.snippet.is_empty()),
+        "лёгкий поиск — без сниппетов"
+    );
+    assert_eq!(l.relaxed, full.relaxed);
+    // баллы и тексты хитов те же — отличается только сниппет
+    for (a, b) in l.bm25.iter().zip(&full.bm25) {
+        assert_eq!(
+            (a.raw_score, a.score, &a.text),
+            (b.raw_score, b.score, &b.text)
+        );
+        assert_eq!(a.target, b.target);
+    }
+    // глубина 5 режет и trigram; глубина больше обычной и 0 — в обычных пределах канала
+    let l = search_fts_channels_light(&db, q(text), light(5, true))
+        .await
+        .unwrap();
+    assert_eq!((l.bm25.len(), l.trigram.len()), (5, 5));
+    assert!(l.bm25.iter().all(|h| !h.snippet.is_empty()));
+    let l = search_fts_channels_light(&db, q(text), light(1000, true))
+        .await
+        .unwrap();
+    assert_eq!(ids(&l.bm25), ids(&full.bm25));
+    assert_eq!(ids(&l.trigram), ids(&full.trigram));
+    let l = search_fts_channels_light(&db, q(text), light(0, false))
+        .await
+        .unwrap();
+    assert_eq!(l.bm25.len(), 1);
+}
+
+/// Время ревизии, которой задача `task` последний раз стала `done` (первая ревизия последней
+/// непрерывной серии `done`).
+async fn task_done_ts(db: &Db, task: Id) -> Timestamp {
+    let revs = entry_revisions(db, task).await.unwrap();
+    let mut ts = None;
+    for r in &revs {
+        if r.status != Some(EntryStatus::Done) {
+            ts = None;
+        } else if ts.is_none() {
+            ts = Some(r.ts);
+        }
+    }
+    ts.expect("у задачи есть ревизия done")
+}
+
 /// Финальное ревью M5.7, Minor 1: идея в корзине не видит смену статуса задачи — при
 /// восстановлении `accepted` при задаче `done` становится `done`, `done` при открытой задаче —
-/// `accepted`.
+/// `accepted`. M6, задача 16: `done_at` идеи — время ревизии, которой задача стала `done`, а не
+/// время восстановления; поздняя правка сделанной задачи и повторное `done` учитываются.
 #[tokio::test]
 async fn restored_idea_reconciles_with_task_status() {
     let (db, sol, _) = setup("restore-reconcile").await;
     let (i, t) = accepted_idea(&db, sol, "Сделали, пока идея в корзине").await;
     delete_entry(&db, i.id, None, &human()).await.unwrap();
     set_task_status(&db, t.id, EntryStatus::Done).await;
+    // правка уже сделанной задачи: ревизия `done` позже перехода — время перехода прежнее
+    update_entry(
+        &db,
+        t.id,
+        None,
+        EntryPatch {
+            append_body: Some("Итог записан позже.".into()),
+            ..EntryPatch::default()
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let done_ts = task_done_ts(&db, t.id).await;
+    let task_revs = entry_revisions(&db, t.id).await.unwrap();
+    let last = task_revs.last().unwrap();
+    assert!(
+        last.status == Some(EntryStatus::Done) && last.ts > done_ts,
+        "поздняя ревизия done — позже перехода"
+    );
     restore_entry(&db, i.id, None, &human()).await.unwrap();
     let e = get_entry(&db, i.id).await.unwrap();
     assert_eq!(e.status, Some(EntryStatus::Done));
-    assert!(data_of(&e).done_at.is_some());
+    let restored_ts = entry_revisions(&db, i.id).await.unwrap().last().unwrap().ts;
+    assert!(
+        done_ts < restored_ts,
+        "проверка содержательна: переход раньше восстановления"
+    );
+    assert_eq!(
+        data_of(&e).done_at,
+        Some(done_ts),
+        "done_at — время ревизии done задачи, не восстановления ({restored_ts})"
+    );
     // и наоборот: done → задача переоткрыта, пока идея в корзине → accepted
     delete_entry(&db, i.id, None, &human()).await.unwrap();
     set_task_status(&db, t.id, EntryStatus::Open).await;
@@ -2539,6 +2669,20 @@ async fn restored_idea_reconciles_with_task_status() {
     let e = get_entry(&db, i.id).await.unwrap();
     assert_eq!(e.status, Some(EntryStatus::Accepted));
     assert!(data_of(&e).done_at.is_none());
+    // задача сделана второй раз: берётся переход последней серии `done`, не первой
+    delete_entry(&db, i.id, None, &human()).await.unwrap();
+    set_task_status(&db, t.id, EntryStatus::Done).await;
+    let second = task_done_ts(&db, t.id).await;
+    assert!(second > done_ts);
+    restore_entry(&db, i.id, None, &human()).await.unwrap();
+    let e = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(e.status, Some(EntryStatus::Done));
+    assert_eq!(data_of(&e).done_at, Some(second));
+    delete_entry(&db, i.id, None, &human()).await.unwrap();
+    set_task_status(&db, t.id, EntryStatus::Open).await;
+    restore_entry(&db, i.id, None, &human()).await.unwrap();
+    let e = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(e.status, Some(EntryStatus::Accepted));
     // согласованная идея восстанавливается без новой ревизии
     delete_entry(&db, i.id, None, &human()).await.unwrap();
     let before = get_entry(&db, i.id).await.unwrap().rev;

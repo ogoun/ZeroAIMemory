@@ -3,9 +3,12 @@
 //! Таблица лежит в базе, где лежит цель: владелец решения видит показы и оценки записей своего
 //! решения, в том числе от участников (`user_id` — кто показал или оценил). Хранится бессрочно,
 //! только дописывается.
+//!
+//! Учёт выданного без сессии (`tokens_unattributed`, спецификация M6 §7.1, миграция 0025) —
+//! здесь же, в базе пользователя запроса: сутки UTC × событие, [`add_unattributed`] и
+//! [`unattributed_tokens`].
 use std::collections::HashMap;
 
-use jiff::Timestamp;
 use rusqlite::params;
 use serde::Serialize;
 use zam_core::{Id, TargetKind, TargetRef};
@@ -104,7 +107,7 @@ pub async fn record_usages(db: &Db, events: &[UsageEvent]) -> Result<(), StoreEr
     }
     let events = events.to_vec();
     db.write(move |t| {
-        let ts = fmt_ts(Timestamp::now());
+        let ts = fmt_ts(crate::time::now());
         let mut st = t.prepare_cached(
             "INSERT INTO usage (ts, user_id, session_id, target_kind, target_id, event, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -121,6 +124,64 @@ pub async fn record_usages(db: &Db, events: &[UsageEvent]) -> Result<(), StoreEr
             ])?;
         }
         Ok(())
+    })
+    .await
+}
+
+/// Выдача без сессии (MCP без явной сессии и прочие, M6 §7.1): прибавляет `calls` и `tokens` к
+/// строке `(day, event)` (UPSERT). Событие — как у `session_tokens` (`[a-z0-9_]`, до 32).
+pub async fn add_unattributed(
+    db: &Db,
+    day: jiff::civil::Date,
+    event: &str,
+    calls: u32,
+    tokens: u64,
+) -> Result<(), StoreError> {
+    crate::sessions::check_event(event)?;
+    let (day, event) = (day.strftime("%Y-%m-%d").to_string(), event.to_string());
+    let tokens = i64::try_from(tokens).unwrap_or(i64::MAX);
+    db.write(move |t| {
+        t.prepare_cached(
+            "INSERT INTO tokens_unattributed (day, event, calls, tokens) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (day, event) DO UPDATE SET
+               calls = calls + excluded.calls, tokens = tokens + excluded.tokens",
+        )?
+        .execute(params![day, event, calls, tokens])?;
+        Ok(())
+    })
+    .await
+}
+
+/// Строка учёта выданного без сессии: сутки UTC (`YYYY-MM-DD`), событие, вызовы и токены.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnattributedRow {
+    pub day: String,
+    pub event: String,
+    pub calls: i64,
+    pub tokens: i64,
+}
+
+/// Учёт выданного без сессии с суток `since` (включительно): свежие сутки первыми, внутри
+/// суток — по событию.
+pub async fn unattributed_tokens(
+    db: &Db,
+    since: jiff::civil::Date,
+) -> Result<Vec<UnattributedRow>, StoreError> {
+    let since = since.strftime("%Y-%m-%d").to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT day, event, calls, tokens FROM tokens_unattributed WHERE day >= ?1
+             ORDER BY day DESC, event",
+        )?;
+        let rows = st.query_map([since], |r| {
+            Ok(UnattributedRow {
+                day: r.get(0)?,
+                event: r.get(1)?,
+                calls: r.get(2)?,
+                tokens: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     })
     .await
 }

@@ -41,11 +41,6 @@ async fn secret_report(w: &W) -> String {
     .await
 }
 
-/// Случайный несуществующий id.
-fn ghost() -> String {
-    zam_core::Id::new().to_string()
-}
-
 /// Ответ без id: статус и тело (id отчёта или несуществующий — `ID`).
 fn shape(r: &Resp, id: &str) -> (StatusCode, String) {
     (r.status, r.text().replace(id, "ID"))
@@ -87,7 +82,7 @@ async fn oracle(
     body: impl Fn(&str) -> Option<Value>,
     extra: &[(&str, &str)],
 ) -> Resp {
-    let g = ghost();
+    let g = common::ghost_like(report);
     let r = tok_call(a, tok, &m, &uri(report), body(report), extra).await;
     let n = tok_call(a, tok, &m, &uri(&g), body(&g), extra).await;
     assert_eq!(
@@ -422,7 +417,7 @@ async fn token_never_sees_report_matrix() {
         ok(&r, StatusCode::BAD_REQUEST, "лента kind=report");
         // MCP memory_read и memory_link
         for pre in ["p:", "e:"] {
-            let g = ghost();
+            let g = common::ghost_like(&id);
             let a = mcp(
                 &w.a,
                 tok,
@@ -643,7 +638,7 @@ async fn token_read_p_and_e_not_found() {
     let id = secret_report(&w).await;
     for tok in [&w.o.tok, &w.rw.tok] {
         for pre in ["p:", "e:", ""] {
-            let g = ghost();
+            let g = common::ghost_like(&id);
             let body = |x: &str| json!({"items": [{"id": format!("{pre}{x}")}]});
             let r =
                 w.a.tok(tok, Method::POST, "/api/v1/read", Some(body(&id)))
@@ -802,7 +797,7 @@ async fn token_cache_put_report_source_rejected() {
         ok(&r, StatusCode::UNPROCESSABLE_ENTITY, "cache_put Knowledge");
     }
     // MCP memory_cache_put
-    let g = ghost();
+    let g = common::ghost_like(&id);
     let args = |x: &str| {
         json!({"query": "итог обучения", "summary": "Точность выросла.",
                "sources": [{"id": format!("p:{x}")}], "solution": G})
@@ -1207,7 +1202,7 @@ async fn token_mcp_update_link_feedback_oracle() {
     ] {
         for pre in ["p:", "e:", ""] {
             for args in &actions {
-                let g = ghost();
+                let g = common::ghost_like(&id);
                 let with = |x: &str| {
                     let mut a = args.clone();
                     a["id"] = json!(format!("{pre}{x}"));
@@ -1222,7 +1217,7 @@ async fn token_mcp_update_link_feedback_oracle() {
         }
         // граф: связь от отчёта (к отчёту — в матрице)
         for pre in ["p:", "e:"] {
-            let g = ghost();
+            let g = common::ghost_like(&id);
             let link =
                 |x: &str| json!({"src": format!("{pre}{x}"), "type": "relates_to", "dst": note});
             let a = mcp(&w.a, tok, "memory_link", link(&id)).await;

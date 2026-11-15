@@ -1,11 +1,12 @@
 //! Чтение пачкой `POST /read` (§9.3 шаг 2, §12; задача 6 M4).
 //!
 //! ```text
-//! POST /read {items: [{id, tier?, section?, locator?, max_tokens?, if_rev?}],
+//! POST /read {items: [{id, tier?, section?, locator?, max_tokens?, if_rev?, since_rev?, focus?,
+//!                     range?}],
 //!             session_id?, format?: "json"|"md", budget_tokens?}
 //! ```
 //!
-//! - `id`: `n:<id>` (узел), `i:|c:|r:|t:|k:|q:<id>` (запись журнала; `e:` тоже), голый id (узел,
+//! - `id`: `n:<id>` (узел), `i:|c:|r:|t:|k:|q:|w:<id>` (запись журнала; `e:` тоже), голый id (узел,
 //!   иначе запись) или путь `<пространство>:/<путь>` (`knowledge:/Инструменты/Bash`). Не больше
 //!   `read.max_items` (20) элементов, пусто или больше — 422. Некорректный `tier`, нулевые
 //!   `max_tokens` и `budget_tokens` — 400. Всё это проверяется до чтения;
@@ -53,7 +54,37 @@
 //!   целиком, — ключ `blob` (sha256), часть — `locator`, ревизия 0; оглавление не отмечается.
 //!   Касание сессии и отметка — одна
 //!   транзакция; сбой учёта — WARN (без id сессии и текста), ответ не портится. Некорректный
-//!   id сессии — 400;
+//!   id сессии — 400. Учитывается только явная сессия (M6 §7.1) и её текущая эпоха (§7.2);
+//! - **«уже выдавалось»** (M6 §7.3, решение владельца 7): полный текст L2 без `section` (или
+//!   часть вложения по `locator`), который сессия уже получила целиком в той же ревизии и эпохе
+//!   (все ключи элемента отмечены), отдаётся **полностью**, как раньше, но с пометкой
+//!   ([`REREAD_MARK`]) в конце заголовка md и `seen: true` в json — агент видит, что текст уже
+//!   у него, если контекст не сжат. Пометка — до упаковки, её токены входят в бюджет;
+//!   обрезанный бюджетом или `max_tokens` повтор и `(budget)` помечаются так же. Дифф
+//!   `since_rev`, секции, L0/L1, `unchanged` и ошибки — без пометки. Вызов с хотя бы одной
+//!   пометкой прибавляет 1 к `session_tokens.reread_calls` (той же транзакцией, что и отметка
+//!   выданного): у REST и CLI — события `read`, из MCP — события `mcp_read`. Учёт выдачи (M6
+//!   §8): вызов `/read` с явной сессией не из MCP — событие `read` (`calls` + 1, `tokens` —
+//!   `total_tokens` ответа); из MCP — `mcp_read` (`calls` + 1, `tokens` 0: токены вызова считает
+//!   инструмент событием `mcp`, итог не удваивается). Без сессии ответ
+//!   прежний (эталон `read_l2_m57.json`);
+//! - **явный фокус** (M6 §6, [`super::read_focus`]): `focus: "<запрос>"` (или `tier: "focus"` с
+//!   ним) — оглавление, лучшие листы и пометки `[пропущено: <адрес> (<подпись>) · ~N t]`,
+//!   `tier: "focus"` и `focus_parts` в json, `· фокус` в заголовке md; без текста — 400 «нужен
+//!   текст focus», с `section`, `locator`, `since_rev`, `range` или другим `tier` — 400. Цель не
+//!   длиннее `read.focus_min_tokens` (или листов не больше `focus_leaves`), запись журнала и
+//!   фрагмент `a:` — целиком с `warnings: ["focus skipped: short"]`; листов нет или нарезка
+//!   отстала — целиком с `focus skipped: not indexed`; в `session_seen` — только выданные листы
+//!   (`part = chunk_id`). Без `focus` ответ прежний;
+//! - **`range: "r<rev>:S-E"`** (адрес пропуска фокуса, M6 §6) — байты `[S, E)` текста L2 ревизии
+//!   `rev` узла (той, по которой выдан фокус; устарела — её текст и предупреждение `range: rev7,
+//!   текущая rev8`; снята сроком хранения — `not_found` «ревизия N недоступна — перечитайте с
+//!   focus»); без ревизии — 400; середина символа и выход за текст — `invalid` с причиной; у
+//!   записи — `invalid`, у вложения (`a:`/`b:`/`d:`) — 400 всему запросу. Права, Vault и
+//!   маскирование — как у L2 (тот же текст и путь доступа).
+//!   Листы, целиком лежащие в диапазоне текущей ревизии, отмечаются выданными сессии. `range` в
+//!   json, ` › range:r<rev>:S-E` в заголовке md; не L2, с `section` или
+//!   `since_rev` — 400, вне текста или не на границе символа — `invalid`, у вложения — 400;
 //! - если у какого-то элемента ошибка, в ответе (md и json) заголовок
 //!   `X-Zam-Read-Error: <код первой>`:
 //!   клиенту не нужно разбирать Markdown, где текст заметки мог бы выглядеть как заголовок ошибки;
@@ -64,6 +95,7 @@
 //!
 //! Маршрут — служебный, не в `memory_routes`: `/read` читает память и не пишет в неё, потому
 //! `memory_writes` сессии не растёт (решение контроллера R12).
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
@@ -79,20 +111,25 @@ use zam_markdown::mask_text;
 use zam_search::truncate_to_tokens;
 use zam_store::{
     CHUNK_REF_LETTER, DocLookup, EntryKind, NodeKind, NodePath, SeenItem, SeenKey, SeenTarget,
-    StoreError, WHOLE_TARGET, count_tokens, doc_chunk_heads, doc_chunk_texts, entry_revisions,
-    entry_snapshot_text, get_node_by_path, mark_seen, node_content,
+    StoreError, TokenCount, WHOLE_TARGET, count_tokens, doc_chunk_heads, doc_chunk_texts,
+    entry_revisions, entry_snapshot_text, get_node_by_path, mark_seen_with_tokens, node_content,
+    seen_revs,
 };
 
 use super::doc_locator::Sheets;
 use super::json_body;
 use super::nodes::diff_blocking;
 use super::nodes::read::{Tier, l1, parse_tier, section_slice};
+use super::read_focus::{
+    FOCUS_NOT_INDEXED, FOCUS_SKIPPED, FocusCtx, FocusOut, FocusPart, FocusResult, FocusTarget,
+    focus_read, leaves_within,
+};
 use super::scope::{
     AttachmentScope, EntryScope, Mode, NodeScope, attachment_scope, entry_scope, live, live_entry,
     node_scope, space_scope,
 };
 use super::search::md_inline;
-use super::sessions::request_session;
+use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -118,6 +155,10 @@ pub struct ReadItem {
     if_rev: Option<i64>,
     /// Изменения с этой ревизии (M4.5 §7).
     since_rev: Option<i64>,
+    /// Явный фокус (M6 §6): текст запроса; `tier: "focus"` требует его.
+    focus: Option<String>,
+    /// Байты `S-E` текста L2 текущей ревизии (адрес пометки пропуска фокуса, M6 §6).
+    range: Option<String>,
 }
 
 /// Ошибка элемента: код, пояснение и дополнительные поля.
@@ -208,7 +249,7 @@ impl Content {
 struct Fetched {
     /// `id` как в запросе.
     raw: String,
-    /// Каноническая ссылка `n:<id>` | `i:|c:|r:|t:|k:|q:<id>`.
+    /// Каноническая ссылка `n:<id>` | `i:|c:|r:|t:|k:|q:|w:<id>`.
     reference: String,
     /// `node` или вид записи (`insight`, `changelog`, `release`, `term`, `task`, `question`).
     kind: &'static str,
@@ -237,6 +278,31 @@ struct Fetched {
     att: Option<AttMeta>,
     /// Предупреждения элемента (`b:` с несколькими вложениями).
     warnings: Vec<String>,
+    /// Уже выдан этой сессии целиком в той же ревизии и эпохе (M6 §7.3, [`mark_rereads`]).
+    reread: bool,
+    /// Текст — явный фокус (M6 §6): `tier: "focus"`, в `seen` — выданные листы (`chunk_id`).
+    focus: bool,
+    /// Части фокуса по порядку (`focus_parts` в json).
+    focus_parts: Vec<FocusPart>,
+    /// Выданы байты `r<rev>:S-E` текста (`range`).
+    range: Option<String>,
+    /// В `seen` — части цели (листы фокуса или `range`): отмечаются, если текст не обрезан.
+    parts_seen: bool,
+    /// Токены текста, уже посчитанные (фокус — суммой частей): упаковка не токенизирует его снова.
+    tokens_hint: Option<usize>,
+}
+
+/// Что выдано из документа вложения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttView {
+    /// Оглавление (без `locator`, L0/L1).
+    Toc,
+    /// Часть по `locator`.
+    Part,
+    /// Документ целиком: `focus` у документа короче `read.focus_min_tokens` (M6 §6).
+    Whole,
+    /// Явный фокус (M6 §6).
+    Focus,
 }
 
 /// Поля элемента-вложения.
@@ -245,7 +311,8 @@ struct AttMeta {
     attachment_id: Id,
     node_id: Id,
     blob_sha256: String,
-    /// `locator` выданной части (имя листа — через сканер секретов); `None` — оглавление.
+    view: AttView,
+    /// `locator` выданной части (имя листа — через сканер секретов); `None` — не часть.
     locator: Option<String>,
     /// Подпись `locator` (`стр. 12`, `лист «Итоги» A1:F40`), тоже замаскирована.
     locator_text: Option<String>,
@@ -305,7 +372,7 @@ fn is_doc_letter(k: &str) -> bool {
     k == CHUNK_REF_LETTER || k == BLOB_REF_LETTER || k == DOC_REF_LETTER
 }
 
-/// Префикс ссылки элемента: `n` (узел), буква записи (`i|c|r|t|k|q|e`) или вложения (`a|b|d`) и
+/// Префикс ссылки элемента: `n` (узел), буква записи (`i|c|r|t|k|q|p|w|e`) или вложения (`a|b|d`) и
 /// остаток; без известного префикса — `(None, raw)`.
 fn split_ref(raw: &str) -> (Option<&str>, &str) {
     match raw.split_once(':') {
@@ -313,6 +380,15 @@ fn split_ref(raw: &str) -> (Option<&str>, &str) {
             (Some(k), rest)
         }
         _ => (None, raw),
+    }
+}
+
+/// Фокус у цели возможен (эмбеддинг `focus` запускается заранее): узел (`n:`, путь, голый id) и
+/// документ `d:`/`b:`; не запись журнала и не фрагмент `a:`.
+fn focus_possible(raw: &str) -> bool {
+    match split_ref(raw.trim()) {
+        (Some(k), _) => k == "n" || k == BLOB_REF_LETTER || k == DOC_REF_LETTER,
+        (None, _) => true,
     }
 }
 
@@ -412,9 +488,21 @@ fn slice<'a>(text: &'a str, section: &str) -> Result<&'a str, Failure> {
     })
 }
 
-async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched, Failure> {
+async fn fetch_node(
+    sc: NodeScope,
+    it: &ReadItem,
+    tier: Tier,
+    fx: &FocusCtx<'_>,
+    focus: Option<&str>,
+    limit: usize,
+) -> Result<Fetched, Failure> {
     live(&sc)?;
     let node = &sc.node;
+    let mut warnings = Vec::new();
+    let mut focused: Option<FocusOut> = None;
+    // `range`: ревизия адреса и листы, целиком лежащие в диапазоне
+    let mut range_rev: Option<i64> = None;
+    let mut range_leaves: Vec<String> = Vec::new();
     let section = (tier != Tier::L0)
         .then(|| {
             it.section
@@ -439,6 +527,35 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
             Err(e) => return Err(e.into()),
         };
         changes(old, new, since, node.current_rev).await?
+    } else if let Some(r) = it.range.as_deref().filter(|_| section.is_none()) {
+        let (rev, a, b) = parse_range(r).map_err(Failure::Fatal)?;
+        if rev > node.current_rev {
+            return Err(Failure::Item(Fail::new(
+                "invalid",
+                Some(format!(
+                    "range: ревизии {rev} нет (текущая rev{})",
+                    node.current_rev
+                )),
+            )));
+        }
+        let text = match node_content(&sc.db, node.id, Some(rev)).await {
+            Ok((_, t)) => t,
+            Err(StoreError::NotFound) => {
+                return Err(Failure::Item(Fail::new(
+                    "not_found",
+                    Some(format!("ревизия {rev} недоступна — перечитайте с focus")),
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let piece = byte_range(&text, a, b, rev)?.to_string();
+        if rev != node.current_rev {
+            warnings.push(format!("range: rev{rev}, текущая rev{}", node.current_rev));
+        } else {
+            range_leaves = leaves_within(&sc.db, node.id, rev, &text, a, b).await?;
+        }
+        range_rev = Some(rev);
+        Content::plain(piece, false)
     } else {
         // ровно та ревизия, что в снимке узла
         let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
@@ -446,15 +563,44 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
             Some(s) => (slice(&text, s)?.to_string(), false),
             None => (text, true),
         };
-        match tier {
-            Tier::L1 => Content::plain(l1(&text), false),
-            _ => Content::plain(text, whole),
+        // фокус (M6 §6): `section` и `range` с ним отвергнуты до чтения, уровень — L2
+        if let Some(q) = focus.filter(|_| whole && tier == Tier::L2) {
+            // байт не больше порога — и токенов не больше (без токенизации всего текста: её
+            // делает фокус по частям, и там же — точная проверка порога)
+            if text.len() <= fx.min_tokens() {
+                warnings.push(FOCUS_SKIPPED.to_string());
+            } else {
+                let t = FocusTarget::Note {
+                    db: &sc.db,
+                    node: node.id,
+                    text: &text,
+                    rev: node.current_rev,
+                };
+                match focus_read(fx, &t, q, limit).await? {
+                    FocusResult::Focused(o) => focused = Some(o),
+                    FocusResult::Short => warnings.push(FOCUS_SKIPPED.to_string()),
+                    FocusResult::NotIndexed => warnings.push(FOCUS_NOT_INDEXED.to_string()),
+                }
+            }
+        }
+        match (&focused, tier) {
+            (Some(o), _) => Content::plain(o.text.clone(), false),
+            (None, Tier::L1) => Content::plain(l1(&text), false),
+            (None, _) => Content::plain(text, whole),
         }
     };
     let reference = format!("n:{}", node.id);
     let target = TargetRef {
         kind: TargetKind::Node,
         id: node.id,
+    };
+    let (parts, focus_parts): (Vec<String>, Vec<FocusPart>) = match &focused {
+        Some(o) => {
+            warnings.extend(o.warnings.iter().cloned());
+            (o.leaves.clone(), o.parts.clone())
+        }
+        None if range_rev.is_some() => (range_leaves, Vec::new()),
+        None => (vec![WHOLE_TARGET.to_string()], Vec::new()),
     };
     Ok(Fetched {
         raw: it.id.clone(),
@@ -468,19 +614,28 @@ async fn fetch_node(sc: NodeScope, it: &ReadItem, tier: Tier) -> Result<Fetched,
         certainty: node.certainty.map(|c| c.as_str().to_string()),
         section: section.map(str::to_string),
         tier,
-        rev: node.current_rev,
+        rev: range_rev.unwrap_or(node.current_rev),
         max_tokens: it.max_tokens,
-        seen: vec![SeenKey {
-            owner_id: sc.owner,
-            target: target.into(),
-            part: WHOLE_TARGET.to_string(),
-        }],
+        seen: parts
+            .into_iter()
+            .map(|part| SeenKey {
+                owner_id: sc.owner,
+                target: target.into(),
+                part,
+            })
+            .collect(),
         content,
         omitted: 0,
         stale_refs: Vec::new(),
         stale_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
-        warnings: Vec::new(),
+        warnings,
+        reread: false,
+        focus: focused.is_some(),
+        focus_parts,
+        range: range_rev.and(it.range.clone()),
+        parts_seen: focused.is_some() || range_rev.is_some(),
+        tokens_hint: focused.as_ref().map(|o| o.tokens),
     })
 }
 
@@ -499,7 +654,12 @@ fn summary_of(e: &zam_store::Entry) -> String {
     e.title.clone()
 }
 
-async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetched, Failure> {
+async fn fetch_entry(
+    sc: EntryScope,
+    it: &ReadItem,
+    tier: Tier,
+    focus: bool,
+) -> Result<Fetched, Failure> {
     live_entry(&sc)?;
     let e = &sc.entry;
     let section = (tier != Tier::L0)
@@ -526,6 +686,12 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
         let new = snap(e.rev).unwrap_or_else(|| entry_snapshot_text(&e.title, &e.body, &e.data));
         changes(snap(since), new, since, e.rev).await?
     } else {
+        if it.range.is_some() {
+            return Err(Failure::Item(Fail::new(
+                "invalid",
+                Some("range — только у заметки (адрес пропуска фокуса)".into()),
+            )));
+        }
         let (text, whole) = match section {
             Some(s) => (slice(&e.body, s)?.to_string(), false),
             None => (e.body.clone(), true),
@@ -552,6 +718,12 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
     let sub = match e.kind {
         EntryKind::Release => None,
         _ => e.data.get("kind").and_then(Value::as_str),
+    };
+    // запись журнала с фокусом — целиком (M6 §6)
+    let warnings = if focus && matches!(content, Content::Text { .. }) {
+        vec![FOCUS_SKIPPED.to_string()]
+    } else {
+        Vec::new()
     };
     let label = match sub {
         Some(k) => format!("{kind}/{}", md_inline(k)),
@@ -581,8 +753,60 @@ async fn fetch_entry(sc: EntryScope, it: &ReadItem, tier: Tier) -> Result<Fetche
         stale_refs: Vec::new(),
         stale_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
-        warnings: Vec::new(),
+        warnings,
+        reread: false,
+        focus: false,
+        focus_parts: Vec::new(),
+        range: None,
+        parts_seen: false,
+        tokens_hint: None,
     })
+}
+
+/// Байты `[a, b)` текста ревизии `rev`: за концом текста или на середине символа — `invalid` с
+/// причиной.
+fn byte_range(text: &str, a: usize, b: usize, rev: i64) -> Result<&str, Failure> {
+    let bad = |why: String| Failure::Item(Fail::new("invalid", Some(why)));
+    if b > text.len() {
+        return Err(bad(format!(
+            "range: {a}-{b} за концом текста rev{rev} ({} байт)",
+            text.len()
+        )));
+    }
+    for x in [a, b] {
+        if !text.is_char_boundary(x) {
+            return Err(bad(format!(
+                "range: байт {x} — середина символа UTF-8 (адрес не из пометки фокуса)"
+            )));
+        }
+    }
+    Ok(&text[a..b])
+}
+
+/// `r<rev>:S-E` (можно с префиксом `range:`) → `(rev, S, E)`, `S < E`; без ревизии — 400.
+fn parse_range(raw: &str) -> Result<(i64, usize, usize), ApiError> {
+    let r = raw.trim();
+    let r = r.strip_prefix("range:").unwrap_or(r);
+    let bad = || {
+        ApiError::BadRequest(
+            "range: r<ревизия>:S-E — байты текста L2 этой ревизии, S < E (адрес пометки фокуса)"
+                .into(),
+        )
+    };
+    let (rev, span) = r
+        .strip_prefix('r')
+        .and_then(|x| x.split_once(':'))
+        .ok_or_else(bad)?;
+    let rev: i64 = rev.parse().map_err(|_| bad())?;
+    let (a, b) = span.split_once('-').ok_or_else(bad)?;
+    let (a, b): (usize, usize) = (
+        a.trim().parse().map_err(|_| bad())?,
+        b.trim().parse().map_err(|_| bad())?,
+    );
+    if a >= b || rev < 1 {
+        return Err(bad());
+    }
+    Ok((rev, a, b))
 }
 
 /// `since_rev` больше текущей ревизии — 400 запроса (а не ошибка элемента): клиент прислал
@@ -852,8 +1076,10 @@ fn within_budget(
     (taken, omitted)
 }
 
-/// Вложение: текст по `locator` (явному или фрагмента `a:`) либо оглавление; текст читается не
-/// дальше `limit` токенов ([`within_budget`]).
+/// Вложение: текст по `locator` (явному или фрагмента `a:`), фокус `d:`/`b:` (M6 §6; короткий
+/// документ — целиком) либо оглавление; текст читается не дальше `limit` токенов
+/// ([`within_budget`]). Фрагмент `a:` с фокусом — целиком (он и есть единица).
+#[allow(clippy::too_many_arguments)]
 async fn fetch_attachment(
     sc: AttachmentScope,
     reference: String,
@@ -861,6 +1087,8 @@ async fn fetch_attachment(
     tier: Tier,
     locator: Option<Locator>,
     limit: usize,
+    fx: &FocusCtx<'_>,
+    focus: Option<&str>,
 ) -> Result<Fetched, Failure> {
     let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
     if section || it.since_rev.is_some() {
@@ -883,6 +1111,11 @@ async fn fetch_attachment(
     let mut parts: Vec<String> = Vec::new();
     let mut omitted = 0usize;
     let mut shown: Option<(String, String)> = None;
+    let mut view = AttView::Part;
+    let mut fwarn: Vec<String> = Vec::new();
+    let mut fparts: Vec<FocusPart> = Vec::new();
+    let mut focus_tokens: Option<usize> = None;
+    let chunk_ref = reference.starts_with(&format!("{CHUNK_REF_LETTER}:"));
     let content = if it.if_rev == Some(DOC_REV) {
         Content::Unchanged
     } else {
@@ -898,7 +1131,63 @@ async fn fetch_attachment(
         }
         let sheets = Sheets::of(heads.iter().filter_map(|h| h.locator.as_deref()));
         match &want {
-            None => Content::plain(toc(&sc.db, doc.id, &heads, &sheets).await?, false),
+            None => match focus.filter(|_| !chunk_ref) {
+                None => {
+                    view = AttView::Toc;
+                    Content::plain(toc(&sc.db, doc.id, &heads, &sheets).await?, false)
+                }
+                Some(q) => {
+                    let total: usize = heads
+                        .iter()
+                        .map(|h| usize::try_from(h.token_count).unwrap_or(0))
+                        .sum();
+                    let out = if total <= fx.min_tokens() {
+                        FocusResult::Short
+                    } else {
+                        let t = FocusTarget::Doc {
+                            db: &sc.db,
+                            att: doc.id,
+                            sheets: &sheets,
+                        };
+                        focus_read(fx, &t, q, limit).await?
+                    };
+                    match out {
+                        FocusResult::Focused(o) => {
+                            view = AttView::Focus;
+                            fwarn = o.warnings;
+                            parts = o.leaves;
+                            fparts = o.parts;
+                            focus_tokens = Some(o.tokens);
+                            Content::plain(o.text, false)
+                        }
+                        other => {
+                            // короткий документ — целиком, как часть по `locator`
+                            view = AttView::Whole;
+                            fwarn.push(
+                                match other {
+                                    FocusResult::NotIndexed => FOCUS_NOT_INDEXED,
+                                    _ => FOCUS_SKIPPED,
+                                }
+                                .to_string(),
+                            );
+                            let all: Vec<i64> = heads.iter().map(|h| h.ordinal).collect();
+                            let (ordinals, rest) = within_budget(&heads, &all, limit);
+                            omitted = rest;
+                            let chosen: HashSet<i64> = ordinals.iter().copied().collect();
+                            let mut uniq: HashSet<&str> = HashSet::new();
+                            for h in heads.iter().filter(|h| chosen.contains(&h.ordinal)) {
+                                if let Some(l) = &h.locator
+                                    && uniq.insert(l)
+                                {
+                                    parts.push(l.clone());
+                                }
+                            }
+                            let texts = doc_chunk_texts(&sc.db, doc.id, ordinals, None).await?;
+                            Content::plain(join_chunks(&heads, &texts), true)
+                        }
+                    }
+                }
+            },
             Some(w) => {
                 let raw = sheets.resolve(w);
                 let ordinals = raw.as_ref().map(|r| select(&heads, r)).unwrap_or_default();
@@ -938,6 +1227,9 @@ async fn fetch_attachment(
         want.as_ref()
             .map(|w| (mask_text(&w.render()), mask_text(&w.label())))
     });
+    if chunk_ref && focus.is_some() && matches!(content, Content::Text { .. }) {
+        fwarn.push(FOCUS_SKIPPED.to_string());
+    }
     let mut warnings = Vec::new();
     if sc.others > 0 {
         warnings.push(format!(
@@ -948,6 +1240,9 @@ async fn fetch_attachment(
             doc.path
         ));
     }
+    warnings.extend(fwarn);
+    // выдан фокус — листы документа (`chunk_id`), иначе — `locator` единиц
+    let focus_view = view == AttView::Focus;
     Ok(Fetched {
         raw: it.id.clone(),
         head: format!(
@@ -984,13 +1279,21 @@ async fn fetch_attachment(
             attachment_id: doc.id,
             node_id: doc.node_id,
             blob_sha256: doc.blob_sha256.clone(),
+            view,
             locator: shown.as_ref().map(|s| s.0.clone()),
             locator_text: shown.map(|s| s.1),
         }),
         warnings,
+        reread: false,
+        tokens_hint: focus_tokens,
+        focus: focus_view,
+        focus_parts: fparts,
+        range: None,
+        parts_seen: focus_view,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch(
     st: &AppState,
     p: &Principal,
@@ -999,14 +1302,25 @@ async fn fetch(
     tier: Tier,
     locator: Option<Locator>,
     budget: usize,
+    fx: &FocusCtx<'_>,
+    focus: Option<&str>,
 ) -> Result<Fetched, Failure> {
+    // больше бюджета пачки (и `max_tokens` элемента) выдано не будет — дальше не читается;
+    // фокус укладывает в него листы и пометки (без заголовка элемента)
+    let limit = it.max_tokens.unwrap_or(budget).min(budget);
+    let focus_limit = limit.saturating_sub(FOCUS_HEADER_RESERVE).max(1);
     match resolve(st, p, headers, &it.id).await? {
-        Located::Node(sc) => fetch_node(sc, it, tier).await,
-        Located::Entry(sc) => fetch_entry(sc, it, tier).await,
+        Located::Node(sc) => fetch_node(sc, it, tier, fx, focus, focus_limit).await,
+        Located::Entry(sc) => fetch_entry(sc, it, tier, focus.is_some()).await,
         Located::Attachment(sc, reference) => {
-            // больше бюджета пачки (и `max_tokens` элемента) выдано не будет — дальше не читается
-            let limit = it.max_tokens.unwrap_or(budget).min(budget);
-            fetch_attachment(*sc, reference, it, tier, locator, limit).await
+            if it.range.is_some() {
+                return Err(Failure::Item(Fail::new(
+                    "invalid",
+                    Some("range к вложению неприменим: часть документа — locator".into()),
+                )));
+            }
+            let l = if focus.is_some() { focus_limit } else { limit };
+            fetch_attachment(*sc, reference, it, tier, locator, l, fx, focus).await
         }
     }
 }
@@ -1018,10 +1332,19 @@ fn header(f: &Fetched, tail: &str) -> String {
         line.push_str(" › ");
         line.push_str(s);
     }
-    // вложение: подпись части или «оглавление»; ревизий у документа нет
+    if let Some(r) = &f.range {
+        line.push_str(" › range:");
+        line.push_str(r.trim().strip_prefix("range:").unwrap_or(r.trim()));
+    }
+    // вложение: подпись части, «оглавление», «весь документ» или «фокус»; ревизий у документа нет
     if let Some(a) = &f.att {
         line.push_str(" · ");
-        line.push_str(a.locator_text.as_deref().unwrap_or("оглавление"));
+        line.push_str(match a.view {
+            AttView::Part => a.locator_text.as_deref().unwrap_or("оглавление"),
+            AttView::Toc => "оглавление",
+            AttView::Whole => "весь документ",
+            AttView::Focus => FOCUS_MARK,
+        });
     }
     let mut parts: Vec<String> = [&f.status, &f.certainty]
         .into_iter()
@@ -1030,10 +1353,74 @@ fn header(f: &Fetched, tail: &str) -> String {
         .collect();
     if f.att.is_none() {
         parts.push(format!("rev{}", f.rev));
+        if f.focus {
+            parts.push(FOCUS_MARK.to_string());
+        }
     }
     parts.push(tail.to_string());
+    if f.reread {
+        parts.push(REREAD_MARK.to_string());
+    }
     line.push_str(&format!("  {}", parts.join(" · ")));
     line
+}
+
+/// Резерв токенов заголовка элемента и пометок md при укладке фокуса в бюджет.
+const FOCUS_HEADER_RESERVE: usize = 40;
+
+/// `tier` явного фокуса (M6 §6): требует `focus`, без него — 400.
+const FOCUS_TIER: &str = "focus";
+
+/// Пометка заголовка элемента с явным фокусом (M6 §6): `… rev3 · фокус · ~420 tok`.
+const FOCUS_MARK: &str = "фокус";
+
+/// Пометка заголовка повторной выдачи (M6 §7.3): `… · ~120 tok · уже выдавалось в этой сессии`.
+pub const REREAD_MARK: &str = "уже выдавалось в этой сессии";
+
+/// Событие `session_tokens` вызова `/read` REST и CLI (M6 §8: вызов, токены ответа и повторная
+/// выдача `reread_calls`).
+pub const READ_TOKEN_EVENT: &str = "read";
+/// Событие `session_tokens` чтений `/read` из MCP (ревью 8b): вызов и `reread_calls`, токенов 0
+/// (их считает событие `mcp` инструмента).
+pub const MCP_READ_TOKEN_EVENT: &str = "mcp_read";
+
+/// Элемент — полный текст, который повтором можно отдать с пометкой: L2 без секции (или часть
+/// вложения по `locator`), не дифф `since_rev`; есть ключи выданного.
+fn rereadable(f: &Fetched) -> bool {
+    !f.seen.is_empty()
+        && matches!(
+            f.content,
+            Content::Text { whole: true, form, .. } if !matches!(form, Form::Diff { .. })
+        )
+}
+
+/// Помечает элементы, выданные сессии целиком в той же ревизии и текущей эпохе (§7.3): все
+/// ключи элемента отмечены с ревизией не меньше текущей. Сбой чтения — WARN, без пометок.
+async fn mark_rereads(s: &RequestSession, fetched: &mut [Result<Fetched, (String, Fail)>]) {
+    let keys: Vec<SeenKey> = fetched
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .filter(|f| rereadable(f))
+        .flat_map(|f| f.seen.iter().cloned())
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    let revs = match seen_revs(&s.db, &s.touch.id, s.touch.epoch, &keys).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "чтение: выданное сессии не прочитано, без пометок");
+            return;
+        }
+    };
+    for f in fetched.iter_mut().filter_map(|r| r.as_mut().ok()) {
+        if rereadable(f) {
+            f.reread = f
+                .seen
+                .iter()
+                .all(|k| revs.get(k).is_some_and(|&r| r >= f.rev));
+        }
+    }
 }
 
 fn err_line(raw: &str, fail: &Fail) -> String {
@@ -1057,7 +1444,7 @@ fn floor_cost(r: &Result<Fetched, (String, Fail)>) -> usize {
         Ok(f) => match &f.content {
             Content::Unchanged => count_tokens(&header(f, "unchanged")),
             Content::Text { text, .. } => {
-                let full = count_tokens(text) + f.omitted;
+                let full = f.tokens_hint.unwrap_or_else(|| count_tokens(text)) + f.omitted;
                 count_tokens(&header(f, &format!("~{full} tok"))) + count_tokens(BUDGET_LINE)
             }
         },
@@ -1097,7 +1484,7 @@ fn pack(fetched: Vec<Result<Fetched, (String, Fail)>>, budget: usize) -> (Vec<Pi
             Content::Text { text, form, .. } => (text.clone(), *form),
         };
         let whole = matches!(f.content, Content::Text { whole: true, .. });
-        let full = count_tokens(&text) + f.omitted;
+        let full = f.tokens_hint.unwrap_or_else(|| count_tokens(&text)) + f.omitted;
         let hc = count_tokens(&header(&f, &format!("~{full} tok")));
         if exhausted {
             total += hc + count_tokens(BUDGET_LINE);
@@ -1107,7 +1494,7 @@ fn pack(fetched: Vec<Result<Fetched, (String, Fail)>>, budget: usize) -> (Vec<Pi
         let mut kept: &str = &text;
         // часть текста не прочитана (бюджет) — элемент уже обрезан
         let mut cut = f.omitted > 0;
-        if let Some(m) = f.max_tokens
+        if let Some(m) = f.max_tokens.map(zam_store::budget_cap)
             && full > m
         {
             kept = truncate_to_tokens(kept, m, &count_tokens);
@@ -1163,7 +1550,15 @@ fn item_json(piece: &Piece) -> Value {
         if let Some(s) = &f.section {
             o.insert("section".into(), json!(s));
         }
-        o.insert("tier".into(), json!(tier_str(f.tier)));
+        let tier = if f.focus { "focus" } else { tier_str(f.tier) };
+        o.insert("tier".into(), json!(tier));
+        if let Some(r) = &f.range {
+            o.insert("range".into(), json!(r));
+        }
+        if !f.focus_parts.is_empty() {
+            let p: Vec<Value> = f.focus_parts.iter().map(FocusPart::json).collect();
+            o.insert("focus_parts".into(), Value::Array(p));
+        }
         o.insert("rev".into(), json!(f.rev));
         if !f.stale_refs.is_empty() {
             o.insert("stale_refs".into(), json!(f.stale_refs));
@@ -1173,18 +1568,23 @@ fn item_json(piece: &Piece) -> Value {
             o.insert("attachment_id".into(), json!(a.attachment_id));
             o.insert("node_id".into(), json!(a.node_id));
             o.insert("blob_sha256".into(), json!(a.blob_sha256));
-            match (&a.locator, &a.locator_text) {
-                (Some(l), Some(t)) => {
+            match (a.view, &a.locator, &a.locator_text) {
+                (AttView::Part, Some(l), Some(t)) => {
                     o.insert("locator".into(), json!(l));
                     o.insert("locator_text".into(), json!(t));
                 }
-                _ => {
+                (AttView::Part | AttView::Toc, _, _) => {
                     o.insert("toc".into(), json!(true));
                 }
+                // документ целиком или фокус: части — в тексте
+                (AttView::Whole | AttView::Focus, _, _) => {}
             }
         }
         if !f.warnings.is_empty() {
             o.insert("warnings".into(), json!(f.warnings));
+        }
+        if f.reread {
+            o.insert("seen".into(), json!(true));
         }
     };
     match piece {
@@ -1312,6 +1712,7 @@ pub async fn read(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
     let req: ReadRequest = json_body(body)?;
@@ -1332,6 +1733,7 @@ pub async fn read(
     }
     let mut tiers = Vec::with_capacity(req.items.len());
     let mut locators = Vec::with_capacity(req.items.len());
+    let mut focuses: Vec<Option<String>> = Vec::with_capacity(req.items.len());
     for it in &req.items {
         let locator = parse_locator(it.locator.as_ref())?;
         if locator.is_some() && !is_doc_ref(&it.id) {
@@ -1339,11 +1741,56 @@ pub async fn read(
                 "locator — только у вложений: a:<фрагмент>, b:<sha256>, d:<документ>".into(),
             ));
         }
-        locators.push(locator);
+        locators.push(locator.clone());
         if it.max_tokens == Some(0) {
             return Err(ApiError::BadRequest("max_tokens: больше 0".into()));
         }
-        let tier = parse_tier(it.tier.as_deref())?;
+        // явный фокус (M6 §6): `tier: "focus"` или поле `focus`; уровень — L2
+        let tier_focus = it
+            .tier
+            .as_deref()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(FOCUS_TIER));
+        let focus = it.focus.as_deref().map(str::trim);
+        if tier_focus || focus.is_some() {
+            if focus.is_none_or(str::is_empty) {
+                return Err(ApiError::BadRequest("focus: нужен текст focus".into()));
+            }
+            if it.tier.is_some() && !tier_focus {
+                return Err(ApiError::BadRequest(
+                    "focus: только без tier или с tier focus".into(),
+                ));
+            }
+            let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
+            if section || locator.is_some() || it.since_rev.is_some() || it.range.is_some() {
+                return Err(ApiError::BadRequest(
+                    "focus несовместим с section, locator, since_rev и range".into(),
+                ));
+            }
+        }
+        if let Some(r) = &it.range {
+            parse_range(r)?;
+            if is_doc_ref(&it.id) {
+                return Err(ApiError::BadRequest(
+                    "range — только у заметки: часть документа — locator".into(),
+                ));
+            }
+            let section = it.section.as_deref().is_some_and(|s| !s.trim().is_empty());
+            let l2 = it
+                .tier
+                .as_deref()
+                .is_none_or(|t| t.trim().eq_ignore_ascii_case("L2"));
+            if section || it.since_rev.is_some() || !l2 {
+                return Err(ApiError::BadRequest(
+                    "range: только L2, без section и since_rev".into(),
+                ));
+            }
+        }
+        focuses.push(focus.map(str::to_string));
+        let tier = if tier_focus {
+            Tier::L2
+        } else {
+            parse_tier(it.tier.as_deref())?
+        };
         if let Some(since) = it.since_rev {
             if since < 1 {
                 return Err(ApiError::BadRequest("since_rev: от 1".into()));
@@ -1358,8 +1805,17 @@ pub async fn read(
         tiers.push(tier);
     }
     // сессия: некорректный id — 400; сбой её базы чтение не валит (WARN)
-    let session = match request_session(&st, &p, &headers, req.session_id.as_deref()).await {
-        Ok(s) => s,
+    let session = match seen_session(
+        &st,
+        &p,
+        &headers,
+        origin.as_deref(),
+        req.session_id.as_deref(),
+    )
+    .await
+    {
+        // неявная сессия MCP (M6 §7.1) — без отметок выданного
+        Ok(s) => explicit_only(s),
         // некорректный id — 400, несуществующий пользователь (`X-Zam-User`) — 404
         Err(e @ (ApiError::BadRequest(_) | ApiError::NotFound)) => return Err(e),
         Err(e) => {
@@ -1368,36 +1824,97 @@ pub async fn read(
         }
     };
 
+    // срок фокуса — один на вызов; эмбеддинги различных `focus` — сразу, параллельно чтению, и
+    // только у целей, где фокус возможен (не запись журнала и не фрагмент `a:`)
+    let fx = FocusCtx::new(
+        &st,
+        req.items
+            .iter()
+            .zip(&focuses)
+            .filter(|(it, _)| focus_possible(&it.id))
+            .filter_map(|(_, f)| f.as_deref()),
+    );
+    // цели вызова — конкурентно (чтение, фокус); порядок ответа — порядок запроса
+    let jobs = req.items.iter().zip(tiers).zip(locators).zip(&focuses).map(
+        |(((it, tier), locator), focus)| {
+            let (st, p, headers, fx) = (&st, &p, &headers, &fx);
+            async move {
+                let r = fetch(
+                    st,
+                    p,
+                    headers,
+                    it,
+                    tier,
+                    locator,
+                    budget,
+                    fx,
+                    focus.as_deref(),
+                )
+                .await;
+                (it.id.clone(), r)
+            }
+        },
+    );
     let mut fetched = Vec::with_capacity(req.items.len());
-    for ((it, tier), locator) in req.items.iter().zip(tiers).zip(locators) {
-        fetched.push(
-            match fetch(&st, &p, &headers, it, tier, locator, budget).await {
-                Ok(f) => Ok(f),
-                Err(Failure::Item(fail)) => Err((it.id.clone(), fail)),
-                Err(Failure::Fatal(e)) => return Err(e),
-            },
-        );
+    for (id, r) in futures_util::future::join_all(jobs).await {
+        fetched.push(match r {
+            Ok(f) => Ok(f),
+            Err(Failure::Item(fail)) => Err((id, fail)),
+            Err(Failure::Fatal(e)) => return Err(e),
+        });
     }
+    drop(fx);
     fill_stale_refs(&mut fetched).await?;
-    let (pieces, total) = pack(fetched, budget);
+    // повторная выдача (§7.3) — до упаковки: пометка входит в бюджет
+    if let Some(s) = &session {
+        mark_rereads(s, &mut fetched).await;
+    }
+    // упаковка суммами частей — против `budget_cap` (M6 §4.2: без модели — с запасом оценки)
+    let (pieces, total) = pack(fetched, zam_store::budget_cap(budget));
 
     if let Some(s) = &session {
         let given: Vec<SeenItem> = pieces
             .iter()
             .filter_map(|p| match p {
+                // целиком — цель; фокус без обрезки — его листы (M6 §6)
                 Piece::Text {
                     f,
-                    given_whole: true,
+                    given_whole,
+                    more,
                     ..
-                } => Some(f.seen.iter().map(|k| SeenItem {
-                    key: k.clone(),
-                    rev: f.rev,
-                })),
+                } if *given_whole || (f.parts_seen && *more == 0) => {
+                    Some(f.seen.iter().map(|k| SeenItem {
+                        key: k.clone(),
+                        rev: f.rev,
+                    }))
+                }
                 _ => None,
             })
             .flatten()
             .collect();
-        if let Err(e) = mark_seen(&s.db, &s.touch, &given).await {
+        let reread = pieces
+            .iter()
+            .any(|p| matches!(p, Piece::Text { f, .. } | Piece::Budget { f, .. } if f.reread));
+        // учёт выданного (M6 §8): REST и CLI — событие `read` (вызов и токены ответа); из MCP
+        // токены считает инструмент событием `mcp`, сюда — строка `mcp_read` (вызов чтения и
+        // пометка повтора, токенов 0 — итог не удваивается; ревью 8b, решение контролёра): доля
+        // «уже выдавалось» MCP — к чтениям MCP, а не ко всем вызовам MCP
+        let counts = vec![if s.via_mcp {
+            TokenCount {
+                event: MCP_READ_TOKEN_EVENT.into(),
+                calls: 1,
+                tokens: 0,
+                reread_calls: u64::from(reread),
+            }
+        } else {
+            TokenCount {
+                event: READ_TOKEN_EVENT.into(),
+                calls: 1,
+                tokens: total as u64,
+                reread_calls: u64::from(reread),
+            }
+        }];
+        if let Err(e) = mark_seen_with_tokens(&s.db, &s.touch, &given, &counts).await {
             tracing::warn!(error = %e, "чтение: отметка выданного сессии не выполнена");
         }
     }

@@ -10,8 +10,12 @@ publish = false
 zam-fetch = { path = "../crates/zam-fetch" }
 # переменные окружения агента (`AGENT_ENV_VARS`) — общий список для smoke и eval хуков
 zam-core = { path = "../crates/zam-core" }
+# M6 (задача 14): справочная абляция ранжирования карты `code-bench` — те же функции, что у
+# сервера (`zam_code::rank_with`, без фичи `parse`); свой крейт workspace
+zam-code = { path = "../crates/zam-code" }
 anyhow.workspace = true
-clap.workspace = true
+# `env`: токен `transfer-check` из `ZAM_TOKEN`, а не из списка процессов (фича того же крейта)
+clap = { workspace = true, features = ["env"] }
 zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
@@ -37,6 +41,9 @@ tokenizers.workspace = true
 sha2.workspace = true
 zam-docs = { path = "../crates/zam-docs", features = ["pdfium"] }
 zstd.workspace = true
+# M6 (задача 1a1): разбиение dev/holdout по blake3(соль ‖ id) и отпечатки набора ТС-1; крейт
+# уже в workspace (zam-cli; CC0-1.0 OR Apache-2.0)
+blake3.workspace = true
 # A/B PDF (задача 10 M5): чисто-Rust `pdf_oxide` против pdfium — только в xtask и только за фичей
 # `pdf-oxide` (`cargo run -p xtask --release --features pdf-oxide -- eval --docs --pdf-backend
 # pdf_oxide`): обычная сборка xtask и бинарники продукта его не компилируют; в общем

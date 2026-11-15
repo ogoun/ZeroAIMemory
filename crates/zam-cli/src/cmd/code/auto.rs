@@ -131,27 +131,10 @@ fn packed_ref(path: &Path, r: &str) -> Option<String> {
         })
 }
 
-/// Секунды Unix из RFC 3339 UTC `ГГГГ-ММ-ДДTчч:мм:сс[.доли]Z` (как пишет `cache::now_rfc3339`);
-/// иное — `None` (алгоритм days-from-civil, Howard Hinnant).
+/// Секунды Unix из RFC 3339 (как пишет `cache::now_rfc3339`); иное — `None`
+/// (`zam_core::time::unix_secs`: один календарь на сервер и клиент).
 fn rfc3339_secs(s: &str) -> Option<u64> {
-    let s = s.trim().strip_suffix('Z')?;
-    let (date, time) = s.split_once('T')?;
-    let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
-    let (y, m, dd) = (d.next()??, d.next()??, d.next()??);
-    let time = time.split('.').next()?;
-    let mut t = time.split(':').map(|x| x.parse::<i64>().ok());
-    let (hh, mi, ss) = (t.next()??, t.next()??, t.next()??);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&dd) || hh > 23 || mi > 59 || ss > 60 {
-        return None;
-    }
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + dd - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days * 86_400 + hh * 3600 + mi * 60 + ss).ok()
+    zam_core::time::unix_secs(s.trim()).and_then(|v| u64::try_from(v).ok())
 }
 
 /// Пора ли запускать: опорная точка — самое позднее из успешной синхронизации этого решения и
@@ -243,6 +226,7 @@ pub fn maybe_spawn_sync(env: &Env, s: &Settings) -> bool {
         ));
         return false;
     }
+    let spawned = t0.elapsed();
     let a = Attempt { at: now, head };
     if let Err(e) = serde_json::to_vec(&a)
         .map_err(std::io::Error::other)
@@ -250,10 +234,19 @@ pub fn maybe_spawn_sync(env: &Env, s: &Settings) -> bool {
     {
         env.log(&format!("карта кода: code-auto.json: {e}"));
     }
+    // время — по частям: проверки, создание процесса и отметка запуска `code-auto.json`.
+    // Редкие десятки мс здесь — отметка: создание временного файла на занятом диске (замер
+    // 17b-http M6: создание процесса — p95 3 мс, «горб» 45–120 мс — у записи файла и без запуска
+    // процесса), а не `CreateProcess`
+    let total = t0.elapsed();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     env.log(&format!(
-        "карта кода: фоновая синхронизация карты запущена за {:.2} мс (проверки {:.2} мс)",
-        t0.elapsed().as_secs_f64() * 1000.0,
-        checks.as_secs_f64() * 1000.0
+        "карта кода: фоновая синхронизация карты запущена за {:.2} мс (проверки {:.2} мс, процесс \
+         {:.2} мс, отметка {:.2} мс)",
+        ms(total),
+        ms(checks),
+        ms(spawned.saturating_sub(checks)),
+        ms(total.saturating_sub(spawned))
     ));
     true
 }
@@ -338,6 +331,41 @@ mod tests {
         assert!(now_secs().abs_diff(back) <= 2, "{now}");
         for bad in ["", "2026-10-27", "2026-13-01T00:00:00Z", "x-y-zTa:b:cZ"] {
             assert_eq!(rfc3339_secs(bad), None, "{bad}");
+        }
+    }
+
+    /// Прежний разбор клиента (до M6, задача 6) — эталон совпадения.
+    fn legacy_rfc3339_secs(s: &str) -> Option<u64> {
+        let s = s.trim().strip_suffix('Z')?;
+        let (date, time) = s.split_once('T')?;
+        let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
+        let (y, m, dd) = (d.next()??, d.next()??, d.next()??);
+        let time = time.split('.').next()?;
+        let mut t = time.split(':').map(|x| x.parse::<i64>().ok());
+        let (hh, mi, ss) = (t.next()??, t.next()??, t.next()??);
+        if !(1..=12).contains(&m) || !(1..=31).contains(&dd) || hh > 23 || mi > 59 || ss > 60 {
+            return None;
+        }
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + dd - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        u64::try_from(days * 86_400 + hh * 3600 + mi * 60 + ss).ok()
+    }
+
+    /// `zam_core::time::unix_secs` разбирает метки клиента так же, как прежний календарь.
+    #[test]
+    fn rfc3339_secs_matches_legacy() {
+        for secs in (0..4_102_444_800_u64).step_by(3_599_993) {
+            for s in [
+                zam_core::time::rfc3339_from_secs(secs as i64),
+                zam_core::time::rfc3339_from_secs(secs as i64).replace('Z', ".123456Z"),
+            ] {
+                assert_eq!(rfc3339_secs(&s), legacy_rfc3339_secs(&s), "{s}");
+            }
         }
     }
 

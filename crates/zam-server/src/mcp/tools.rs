@@ -12,7 +12,7 @@
 //! - **Пространство по умолчанию** (`memory_tree`, `memory_write`, `memory_log`,
 //!   `memory_vault`) **[решение исполнителя]** — решение из `X-Zam-Solution`, без него —
 //!   `knowledge`.
-//! - **Ссылки** `i:|c:|r:|t:|k:|q:|e:<id>` (как в карточках поиска) принимаются везде, где REST
+//! - **Ссылки** `i:|c:|r:|t:|k:|q:|w:|e:<id>` (как в карточках поиска) принимаются везде, где REST
 //!   ждёт id записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`.
 use std::sync::{Arc, LazyLock};
 
@@ -83,16 +83,16 @@ impl ToolName {
     fn description(self) -> &'static str {
         match self {
             ToolName::Search => {
-                "Поиск в памяти (Knowledge, Rules, решение): сначала выжимки кэша, затем \
-                 карточки — id, путь, ревизия, возраст, ~токены, seen (уже выдано); вложение — \
-                 a:<id>, файл, locator. filters: kinds (и term, task, question, attachment), \
-                 insight_kinds, file — знание о файле, decided_by. Дальше — memory_read."
+                "Поиск (Knowledge, Rules, решение): [cache] и карточки id, путь › секция, [балл] \
+                 rN · ax|th|hyp · дата UTC · Nt; (выдавалось) — было в сессии, (…, в выжимке) — \
+                 текст в [cache]; вложение a:<id>. filters: kinds (+term, task, question, \
+                 attachment), file, decided_by. Далее memory_read, длинное — focus."
             }
             ToolName::Read => {
-                "Чтение пачкой до 20 целей: n:<id>, i:|c:|r:|t:|k:|q:<id>, путь <пространство>:/<путь>; \
-                 вложение — a:<id> или b:<sha256>, locator page:N|slide:N|para:N|sheet:Лист!A1:F40, \
-                 без него — оглавление. tier, section, max_tokens; if_rev — unchanged; since_rev — \
-                 дифф. Ошибка — в элементе."
+                "Чтение до 20 целей: n:|i:|c:|r:|t:|k:|q:|w:<id>, <пространство>:/<путь>; вложение \
+                 a:<id>|b:<sha256> с locator page:N|sheet:Лист!A1:F40. tier, section, max_tokens, \
+                 if_rev, since_rev (дифф). Длинное — focus, один на пачку; [пропущено: адрес] — \
+                 дочитать range. «уже выдавалось» — текст у тебя есть."
             }
             ToolName::CachePut => {
                 "Сохранить выжимку ответа на запрос (до 600 токенов) с источниками [{id, rev?, \
@@ -119,8 +119,8 @@ impl ToolName {
             ToolName::UpdateEntry => {
                 "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
                  claim|release|answer|propose|decide; rev — ревизия (кроме feedback, claim, \
-                 release, answer). certify — certainty, reason; feedback — value; задача: status, \
-                 claim, release; вопрос: answer (by обязателен), status obsolete."
+                 release, answer, propose, decide). certify — certainty, reason; feedback — value; \
+                 вопрос: answer (by обязателен), status obsolete."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
@@ -171,6 +171,9 @@ impl ToolName {
                     "budget_tokens": {"type": "integer", "minimum": 1},
                     "expand": {"type": "string", "enum": ["none", "section", "neighbors", "graph"]},
                     "rerank": {"type": "string", "enum": ["off", "on"]},
+                    "skip_seen": {"type": "boolean", "description":
+                        "true — выданное в сессии без фрагмента (seen); по умолчанию фрагмент и (выдавалось)"},
+                    "session_id": session_id(),
                     "format": fmt,
                 }),
                 &["query"],
@@ -181,18 +184,23 @@ impl ToolName {
                         "type": "object",
                         "properties": {
                             "id": {"type": "string"},
-                            "tier": {"type": "string", "enum": ["L0", "L1", "L2"]},
+                            "tier": {"type": "string", "enum": ["L0", "L1", "L2", "focus"]},
+                            "focus": {"type": "string", "description":
+                                "запрос, один и тот же текст на пачку: оглавление, ближайшие листы, [пропущено: адрес · ~N t]"},
+                            "range": {"type": "string",
+                                      "description": "r<rev>:S-E — байты ревизии (адрес [пропущено])"},
                             "section": {"type": "string", "description": "путь заголовков «A > B»"},
                             "max_tokens": {"type": "integer", "minimum": 1},
                             "if_rev": {"type": "integer"},
                             "since_rev": {"type": "integer", "minimum": 1,
                                           "description": "дифф с этой ревизии"},
                             "locator": {"type": "string",
-                                        "description": "часть вложения: page:12, sheet:Итоги!A1:F40"},
+                                        "description": "часть вложения: page:N | slide:N | para:N | sheet:Лист!A1:F40 (sheet:#N!A1:F40 — по номеру); без locator — оглавление"},
                         },
                         "required": ["id"],
                     }},
                     "budget_tokens": {"type": "integer", "minimum": 1},
+                    "session_id": session_id(),
                     "format": fmt,
                 }),
                 &["items"],
@@ -247,6 +255,8 @@ impl ToolName {
                     "base_rev": {"type": "integer"},
                     "message": {"type": "string"},
                     "l0": {"type": "string"},
+                    "idempotency_key": {"type": "string", "description":
+                        "повтор с тем же ключом не пишет второй раз (сбой связи); другое тело — 422"},
                     "format": fmt,
                 }),
                 &["path"],
@@ -256,7 +266,9 @@ impl ToolName {
                     "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "idea", "question", "report"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}; idea: origin обязателен — human (записана по словам человека) | agent (своя мысль: не предлагается, человек принимает её в WebUI), priority low|normal|high, horizon YYYY-MM-DD («не раньше»), links"},
+                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}; idea: origin обязателен — human (записана по словам человека) | agent (своя мысль: не предлагается, человек принимает её в WebUI), priority low|normal|high, horizon YYYY-MM-DD («не раньше»), links",
+                        "properties": {"kind": {"type": "string", "description":
+                            "insight: gotcha|failure|experiment|discovery|decision. Отверг подход после проверки — kind: decision, поля решения — в data.decision: {options: [отвергнутое], chosen: выбранное, rationale: «отвергнуто, потому что…»} (на верхнем уровне data — 422, и рядом с data.decision); или failure с результатом"}}},
                     "images": {"type": "array", "description": "report: файлы по ссылкам тела ![…](figs/a.png); name — путь из ссылки, data — base64",
                         "items": {"type": "object", "properties": {
                             "name": {"type": "string"}, "data": {"type": "string"}},
@@ -333,9 +345,14 @@ impl ToolName {
                         "description": "brief: задача субагента, до 2000 символов"},
                     "error": {"type": "string"},
                     "tool": {"type": "string"},
-                    "session_id": {"type": "string",
-                        "description": "по умолчанию — X-Zam-Session"},
+                    "session_id": session_id(),
                     "budget_tokens": {"type": "integer", "minimum": 1},
+                    "source": {"type": "string", "description":
+                        "session_start: startup|resume|clear|compact|fork; compact и resume — пакет восстановления"},
+                    "agent_block_version": {"type": "integer", "minimum": 0, "description":
+                        "версия блока инструкции агента; старее сервера — напоминание в дайджесте"},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "description":
+                        "срок сбора, мс (до recall.max_timeout_ms; по умолчанию recall.timeout_ms)"},
                     "format": fmt,
                 }),
                 &["event"],
@@ -392,6 +409,12 @@ impl ToolName {
     }
 }
 
+/// Схема аргумента `session_id` ([`SESSION_ARG_TOOLS`]).
+fn session_id() -> Value {
+    json!({"type": "string", "description":
+        "явная сессия учёта и отметок; по умолчанию — X-Zam-Session, с ним не расходится (иначе 400)"})
+}
+
 /// Определения инструментов (собираются один раз).
 pub fn definitions() -> &'static [Tool] {
     static DEFS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
@@ -416,6 +439,18 @@ pub struct Output {
 }
 
 impl Output {
+    /// Расход вызова — число последней строки `~N tok` (то, что видит агент; M6 §7.1).
+    pub fn tokens(&self) -> u64 {
+        self.text
+            .trim_end()
+            .rsplit('\n')
+            .next()
+            .and_then(|l| l.trim().strip_prefix('~'))
+            .and_then(|l| l.strip_suffix(" tok"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| count_tokens(&self.text) as u64)
+    }
+
     pub fn into_result(self) -> CallToolResult {
         let content = vec![ContentBlock::text(self.text)];
         if self.is_error {
@@ -490,6 +525,30 @@ pub async fn call(tool: ToolName, rest: &Rest, mut args: JsonObject) -> Output {
             text: with_tokens(fail_text(&f)),
             is_error: true,
         },
+    }
+}
+
+/// Инструменты с аргументом `session_id` — явной сессией вызова (M6 §16 п. 19, CR-8).
+pub const SESSION_ARG_TOOLS: [ToolName; 3] = [ToolName::Recall, ToolName::Search, ToolName::Read];
+
+/// Аргумент `session_id` инструмента из [`SESSION_ARG_TOOLS`] без пробелов по краям (пусто или
+/// нет — `None`; у прочих инструментов не читается). Не строка — текст ошибки.
+pub fn session_arg(tool: ToolName, args: Option<&JsonObject>) -> Result<Option<String>, String> {
+    if !SESSION_ARG_TOOLS.contains(&tool) {
+        return Ok(None);
+    }
+    match args.and_then(|a| a.get("session_id")) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.trim().to_string()).filter(|s| !s.is_empty())),
+        Some(_) => Err("session_id: строка".into()),
+    }
+}
+
+/// Ответ-ошибка инструмента с семантикой HTTP (`Ошибка <код> …`) и `~N tok` — до вызова REST.
+pub fn problem(status: StatusCode, detail: String) -> Output {
+    Output {
+        text: with_tokens(fail_text(&Fail::Problem { status, detail })),
+        is_error: true,
     }
 }
 
@@ -681,7 +740,7 @@ fn default_space(rest: &Rest) -> String {
         .to_string()
 }
 
-/// Id записи журнала без префикса ссылки `i:|c:|r:|t:|k:|q:|p:|e:` (или `entry:`).
+/// Id записи журнала без префикса ссылки `i:|c:|r:|t:|k:|q:|p:|w:|e:` (или `entry:`).
 fn entry_id(raw: &str) -> &str {
     let t = raw.trim();
     match t.split_once(':') {
@@ -690,7 +749,7 @@ fn entry_id(raw: &str) -> &str {
     }
 }
 
-/// Ссылка графа: `i:|c:|r:|t:|k:|q:|p:<id>` → `e:<id>`, остальное — как есть (отчёт `p:` токену
+/// Ссылка графа: `i:|c:|r:|t:|k:|q:|p:|w:<id>` → `e:<id>`, остальное — как есть (отчёт `p:` токену
 /// — 404 в REST, как несуществующая запись).
 fn graph_ref(raw: &str) -> String {
     let t = raw.trim();
@@ -724,6 +783,14 @@ async fn call_rest(
     }
 }
 
+/// Заголовок `Idempotency-Key` из аргумента `idempotency_key` (`memory_write`, `memory_log`).
+fn idempotency_header(args: &JsonObject) -> Result<Vec<(HeaderName, String)>, Fail> {
+    Ok(opt_str(args, "idempotency_key")?
+        .map(|k| (HeaderName::from_static("idempotency-key"), k.to_string()))
+        .into_iter()
+        .collect())
+}
+
 fn if_match(rev: i64) -> (HeaderName, String) {
     (header::IF_MATCH, rev.to_string())
 }
@@ -752,6 +819,24 @@ fn warnings_md(v: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Предупреждения ответа в ту же строку (`memory_update_entry`, M6 §5: ответ — одна строка):
+/// ` · warning: <a>; <b>`; нет предупреждений — пусто.
+fn warnings_inline(v: &Value) -> String {
+    let items: Vec<String> = v["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.is_empty() {
+        String::new()
+    } else {
+        format!(" · warning: {}", items.join("; "))
+    }
+}
+
 // ---- инструменты ----
 
 async fn search(rest: &Rest, args: &JsonObject) -> Res {
@@ -769,6 +854,7 @@ async fn search(rest: &Rest, args: &JsonObject) -> Res {
             "expand",
             "rerank",
             "include_history",
+            "skip_seen",
         ],
     );
     body.insert("format".into(), json!(fmt_str(f)));
@@ -847,17 +933,17 @@ async fn cache_put(rest: &Rest, args: &JsonObject) -> Res {
         &[],
     )
     .await?;
+    // одна строка без эха запроса и выжимки (M6 §5): агент их только что прислал
     done(f, &r, |v| {
         let n = v["sources"].as_array().map_or(0, Vec::len);
         let mut s = format!(
-            "Выжимка {} сохранена: «{}» · {} tok · источников {n} · {}",
+            "Выжимка {} · {}t · ист. {n} · {}",
             v["ref"].as_str().unwrap_or("?"),
-            v["query"].as_str().unwrap_or(""),
             v["tokens"],
             v["state"].as_str().unwrap_or("")
         );
         if let Some(p) = v["promoted"].as_str() {
-            s.push_str(&format!("\nПревращена в {p}"));
+            s.push_str(&format!(" → {p}"));
         }
         s
     })
@@ -936,6 +1022,8 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
     let content = opt_str(args, "content")?;
     let ops = args.get("ops").filter(|v| !v.is_null());
     let base_rev = opt_int(args, "base_rev")?;
+    // `Idempotency-Key` для всех трёх путей (M6 §16 п. 19, CR-20)
+    let key = idempotency_header(args)?;
     let reread = "Перечитайте заметку (memory_read) и повторите с base_rev текущей ревизии.";
     let r = match (content, ops, base_rev) {
         (Some(_), Some(_), _) => {
@@ -959,7 +1047,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
                 Method::PATCH,
                 &format!("/api/v1/nodes/{}", enc(&id)),
                 Some(&Value::Object(body)),
-                &[],
+                &key,
             )
             .await
             .map_err(|e| e.hint(reread))?
@@ -967,12 +1055,14 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
         (Some(_), None, Some(rev)) => {
             let id = node_id(rest, &space, &path).await?;
             let body = pick(args, &["content", "l0", "message"]);
+            let mut extra = vec![if_match(rev)];
+            extra.extend(key.iter().cloned());
             call_rest(
                 rest,
                 Method::PUT,
                 &format!("/api/v1/nodes/{}", enc(&id)),
                 Some(&Value::Object(body)),
-                &[if_match(rev)],
+                &extra,
             )
             .await
             .map_err(|e| e.hint(reread))?
@@ -987,7 +1077,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
                 Method::POST,
                 "/api/v1/nodes",
                 Some(&Value::Object(body)),
-                &[],
+                &key,
             )
             .await
             .map_err(|e| {
@@ -1024,6 +1114,26 @@ fn idea_outcome(v: &Value) -> String {
     );
     if let Some(t) = v["task"]["id"].as_str() {
         s.push_str(&format!(" → задача k:{t}"));
+    }
+    s
+}
+
+/// Ссылка записи журнала `i:<id>` (буква — по виду).
+fn entry_ref_of(e: &Value) -> String {
+    let kind = e["kind"].as_str().unwrap_or("entry");
+    let prefix = zam_store::EntryKind::parse(kind).map_or("e", zam_store::EntryKind::ref_letter);
+    format!("{prefix}:{}", e["id"].as_str().unwrap_or("?"))
+}
+
+/// Короткая строка записи журнала для ответов изменения (M6 §5): `i:<id> rev<N>[ · статус][ ·
+/// ax|th|hyp]` — без заголовка (агент знает, что менял), статус — только не `active`.
+fn entry_short(e: &Value) -> String {
+    let mut s = format!("{} rev{}", entry_ref_of(e), e["rev"]);
+    if let Some(x) = e["status"].as_str().filter(|x| *x != "active") {
+        s.push_str(&format!(" · {x}"));
+    }
+    if let Some(x) = e["certainty"].as_str() {
+        s.push_str(&format!(" · {}", zam_core::certainty_short(x)));
     }
     s
 }
@@ -1087,10 +1197,7 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
             body.insert("images".into(), images);
         }
     }
-    let extra: Vec<(HeaderName, String)> = opt_str(args, "idempotency_key")?
-        .map(|k| (HeaderName::from_static("idempotency-key"), k.to_string()))
-        .into_iter()
-        .collect();
+    let extra = idempotency_header(args)?;
     let r = call_rest(
         rest,
         Method::POST,
@@ -1112,7 +1219,7 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
             s.push_str(&format!(" · dedup {d}"));
         }
         if let Some(old) = v.get("superseded").filter(|o| o.is_object()) {
-            s.push_str(&format!("\nЗамещена {}", entry_line(old)));
+            s.push_str(&format!(" · замещена {}", entry_ref_of(old)));
         }
         s.push_str(&warnings_md(v));
         s
@@ -1226,13 +1333,13 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             .await?;
             return done(f, &r, |v| {
                 let mut s = format!(
-                    "Ответ записан {}\nРешение {}",
-                    entry_line(&v["entry"]),
-                    entry_line(&v["decision"])
+                    "Ответ записан {} · решение {}",
+                    entry_short(&v["entry"]),
+                    entry_short(&v["decision"])
                 );
                 // ответ на вопрос-предложение: переход идеи (и задача при «начать»)
                 if v["idea"].is_object() {
-                    s.push('\n');
+                    s.push_str(" · ");
                     s.push_str(&idea_outcome(v));
                 }
                 s
@@ -1256,13 +1363,13 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
                 // вопрос «вернуть» идею со снятой задачей (§16)
                 if v["question"]["data"]["proposal"] == "reopen" {
                     return format!(
-                        "Предложено вернуть w:{idea} → вопрос q:{q}\nСпроси человека: вернуть \
-                         или отказаться; решает человек."
+                        "Предложено вернуть w:{idea} → вопрос q:{q} · спроси человека: вернуть \
+                         или отказаться, решает человек."
                     );
                 }
                 format!(
-                    "Предложено w:{idea} → вопрос q:{q}\nСпроси человека: начать, отложить или \
-                     отказаться; без ответа «начать» не начинай."
+                    "Предложено w:{idea} → вопрос q:{q} · спроси человека: начать, отложить или \
+                     отказаться, без ответа «начать» не начинай."
                 )
             });
         }
@@ -1328,15 +1435,16 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         .map_err(|e| {
             e.hint("Ревизию записи (rev) даёт memory_read её id или карточка memory_search.")
         })?;
+    // одна строка (M6 §5), предупреждения — в ней же через «; »
     done(f, &r, |v| match v.get("entry").filter(|e| e.is_object()) {
         // замещение: {entry, superseded}
         Some(new) => format!(
-            "Новая {}\nЗамещена {}{}",
-            entry_line(new),
-            entry_line(&v["superseded"]),
-            warnings_md(v)
+            "Новая {} · замещена {}{}",
+            entry_short(new),
+            entry_ref_of(&v["superseded"]),
+            warnings_inline(v)
         ),
-        None => format!("Обновлено {}{}", entry_line(v), warnings_md(v)),
+        None => format!("Обновлено {}{}", entry_short(v), warnings_inline(v)),
     })
 }
 
@@ -1387,6 +1495,7 @@ async fn recall(rest: &Rest, args: &JsonObject) -> Res {
             "budget_tokens",
             "agent_block_version",
             "source",
+            "timeout_ms",
         ],
     );
     let r = call_rest(
@@ -1727,14 +1836,32 @@ async fn code_map(rest: &Rest, args: &JsonObject, f: Fmt) -> Res {
     })
 }
 
-/// Адрес символа `путь#qual` строки поиска или карточки.
+/// Адрес символа `путь#qual` строки поиска или карточки для показа. У `qual` вида якоря строки
+/// (`L10`, `L1-L2`; M6 §12а) `путь#L10` адресует строку файла (REST — 400), поэтому показ —
+/// путь, `qual` и `id` карточки ([`sym_addr`]).
 fn sym_ref(v: &Value) -> String {
-    format!(
-        "{}#{}",
+    let (path, qual) = (
         v["path"].as_str().unwrap_or("?"),
-        v["qual"].as_str().unwrap_or("?")
-    )
+        v["qual"].as_str().unwrap_or("?"),
+    );
+    match v["id"].as_i64().filter(|_| zam_code::is_line_anchor(qual)) {
+        Some(id) => format!("{path} · {qual} · id {id}"),
+        None => format!("{path}#{qual}"),
+    }
 }
+
+/// Адрес карточки для `query`: `путь#qual`, у якоря строки — `id` (`GET /code/symbols/{id}`).
+fn sym_addr(v: &Value) -> String {
+    let qual = v["qual"].as_str().unwrap_or("?");
+    match v["id"].as_i64().filter(|_| zam_code::is_line_anchor(qual)) {
+        Some(id) => id.to_string(),
+        None => format!("{}#{qual}", v["path"].as_str().unwrap_or("?")),
+    }
+}
+
+/// Подсказка к символу с `qual` вида якоря строки (M6 §12а).
+const LINE_ANCHOR_HINT: &str = "имя — якорь строки: адрес путь#qual указывает на строку файла; \
+     карточка — query=<id> (id меняется при перезагрузке файла) или уточните path";
 
 /// Предупреждения `extra` и ответа `v` строками `> warning: …` (сначала свои).
 fn with_warnings(mut s: String, v: &Value, extra: &[String]) -> String {
@@ -1770,6 +1897,17 @@ async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) ->
     let path = opt_text(args, "path")?;
     let mut extra: Vec<String> = Vec::new();
     let addr = match zam_code::split_ref(query) {
+        // число — `id` карточки (так адресуется символ с `qual` вида якоря строки `L10`, M6 §12а;
+        // имя символа с цифры не начинается)
+        _ if !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()) => {
+            if let Some(p) = path {
+                extra.push(format!(
+                    "path «{}» не учтён: query — уже id карточки",
+                    zam_store::shown_ref(p)
+                ));
+            }
+            query.to_string()
+        }
         (_, Some(_)) => {
             if let Some(p) = path {
                 extra.push(format!(
@@ -1805,7 +1943,10 @@ async fn code_symbol(rest: &Rest, args: &JsonObject, f: Fmt, refs_only: bool) ->
                             .filter_map(Value::as_str)
                             .map(str::to_string),
                     );
-                    sym_ref(one)
+                    if zam_code::is_line_anchor(one["qual"].as_str().unwrap_or("")) {
+                        extra.push(LINE_ANCHOR_HINT.to_string());
+                    }
+                    sym_addr(one)
                 }
                 _ => return done(f, &r, |v| symbols_md(v, query)),
             }
@@ -1875,6 +2016,9 @@ fn symbols_md(v: &Value, query: &str) -> String {
             h["kind"].as_str().unwrap_or("?"),
             h["line"]
         ));
+        if zam_code::is_line_anchor(h["qual"].as_str().unwrap_or("")) {
+            s.push_str(&format!(" ({LINE_ANCHOR_HINT})"));
+        }
         if let Some(sig) = h["sig"].as_str().filter(|x| !x.is_empty()) {
             s.push_str(&format!(" · {sig}"));
         }

@@ -1,0 +1,40 @@
+# Корпус ТС-2 (спецификация M6 §3.1, задача 1c): словарь домена проекта «магазин».
+#
+# [[term]] — как в eval/glossary.toml: key, title (каноническое имя), definition (≤ 300
+# символов), aliases. Термины создаются в пространстве решения (`kind: term`).
+
+[[term]]
+key = "storefront"
+title = "Витрина"
+definition = "Веб-приложение для покупателей: каталог, карточка товара, корзина и оформление заказа."
+aliases = ["storefront", "фронт магазина"]
+
+[[term]]
+key = "seller-dashboard"
+title = "Кабинет продавца"
+definition = "Веб-приложение для продавцов: товары, прайс-листы, загрузка фото, отчёты по заказам."
+aliases = ["seller dashboard", "кабинет", "селлерка"]
+
+[[term]]
+key = "price-list"
+title = "Прайс-лист"
+definition = "Файл продавца с ценами и остатками (CSV или XLSX до 50 МБ), импортируется фоновой задачей."
+aliases = ["прайс", "price list"]
+
+[[term]]
+key = "outbox"
+title = "Outbox"
+definition = "Таблица исходящих событий сервиса в той же базе: запись события и изменения данных — одна транзакция, рассылку делает отдельный обработчик."
+aliases = ["аутбокс", "исходящая очередь"]
+
+[[term]]
+key = "flag-rule-set"
+title = "Rule set"
+definition = "Full set of feature flags with targeting rules that the flag SDK downloads and evaluates locally."
+aliases = ["набор правил флагов", "ruleset"]
+
+[[term]]
+key = "stand"
+title = "Стенд"
+definition = "Отдельное окружение проекта (staging, demo, нагрузочный) со своей конфигурацией шлюза и базой."
+aliases = ["staging", "стейдж"]

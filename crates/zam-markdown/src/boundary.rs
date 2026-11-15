@@ -20,6 +20,7 @@ use std::ops::Range;
 use std::sync::OnceLock;
 
 use rust_stemmers::{Algorithm, Stemmer};
+use zam_core::text::is_stop_word;
 
 /// Сила границы, при которой разрез запрещён: после заголовка и после вводной фразы на «:».
 pub(crate) const FORBIDDEN: i32 = -5;
@@ -139,29 +140,6 @@ const MIN_WORD_CHARS: usize = 4;
 /// Предел бонуса связности (глубина провала TextTiling — от 0 до 2).
 const MAX_BONUS: f64 = 2.0;
 
-/// Стоп-слова ru/en через пробел — служебные слова. Мешку основ границ нужны слова от
-/// 4 символов (короткие он отбрасывает до проверки); трёхбуквенные — для подтверждения
-/// подсказок-идей сервера ([`is_stop_word`], финальное ревью M5.7).
-const STOP_WORDS: &str = concat!(
-    "that this with from have were which when they them their there also into been what ",
-    "then than will would could should after before about because while where these those ",
-    "only other этот этой этого этом эти этих который которая которое которые которых были ",
-    "было была если когда тоже также чтобы потому только после через между перед более ",
-    "менее очень даже уже ещё еще всех всего всё весь свой своих можно нужно есть ",
-    "the and for not are was you its our who how why can has had any all but ",
-    "что как для при или его она они так был без над под про это эта все там тут где чем ",
-);
-
-/// Служебное ли слово (ru/en, в нижнем регистре) — общий стоп-список границ разделов и
-/// подтверждения подсказок-идей сервера.
-pub fn is_stop_word(w: &str) -> bool {
-    // множество строится один раз: линейный разбор строки на каждом слове стоил подсказкам-идеям
-    // сервера ~3 мс на `prompt` в отладочной сборке
-    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    SET.get_or_init(|| STOP_WORDS.split_whitespace().collect())
-        .contains(w)
-}
-
 fn stemmer(cyrillic: bool) -> &'static Stemmer {
     static RU: OnceLock<Stemmer> = OnceLock::new();
     static EN: OnceLock<Stemmer> = OnceLock::new();
@@ -269,6 +247,40 @@ fn depth_bonus(sim: &[f64]) -> Vec<f64> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// Стоп-список M5.7, побайтово (задача 9 M6: перенос в `zam_core::text` без изменений —
+    /// он задаёт границы разделов и подтверждение подсказок-идей).
+    const STOP_WORDS_M57: &str = concat!(
+        "that this with from have were which when they them their there also into been what ",
+        "then than will would could should after before about because while where these those ",
+        "only other этот этой этого этом эти этих который которая которое которые которых были ",
+        "было была если когда тоже также чтобы потому только после через между перед более ",
+        "менее очень даже уже ещё еще всех всего всё весь свой своих можно нужно есть ",
+        "the and for not are was you its our who how why can has had any all but ",
+        "что как для при или его она они так был без над под про это эта все там тут где чем ",
+    );
+
+    #[test]
+    fn stop_words_identical_after_move() {
+        assert_eq!(zam_core::text::STOP_WORDS, STOP_WORDS_M57);
+        // реэкспорт `zam_markdown::is_stop_word` — та же функция
+        assert!(crate::is_stop_word("чтобы") && !crate::is_stop_word("changelog"));
+        for w in STOP_WORDS_M57.split_whitespace() {
+            assert!(is_stop_word(w), "{w}");
+        }
+        for w in [
+            "",
+            "это ",
+            "That",
+            "ЧТО",
+            "changelog",
+            "file",
+            "error",
+            "ёще",
+        ] {
+            assert!(!is_stop_word(w), "{w}");
+        }
+    }
 
     /// Прямой подъём из каждой границы (реализация задачи 17, O(n²)) — эталон для
     /// [`depth_bonus`].
