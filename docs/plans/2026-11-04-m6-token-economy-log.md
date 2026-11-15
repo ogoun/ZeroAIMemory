@@ -13304,6 +13304,54 @@ fp16 K = 3 у M6 на корпусе B4 (B4 — те же три индекса�
 проверках подряд (5 мин); владелец занял её во время блока ТС-2 — блок прерывается и переснимается
 целиком, попыткой не считается. Порядок: ТС-2 Claude → ТС-2 Codex → ТС-1 CUDA (А и Б) → качество CUDA.
 
+## Слияние веток и проверка кода выпуска (координатор, 2026-11-14 … 15)
+
+**Слияние.** `m6-token-economy` (`ac0a32d`: 13b — предрегистрация, тесты приёмки, `--targets-of`)
+влита в `m6-portability` (`77d097b`). Конфликты:
+- `crates/zam-server/tests/common/process.rs` — `start_env` (13c) и `start_exe` (13b) сведены к
+  общему закрытому `start_with(exe, conf, addr, env)`; `start`, `start_env`, `start_exe` — обёртки;
+- этот журнал — разделы по времени: правки ревью 17d → 13c → 13b → «Итог M6».
+
+Версия `0.0.11-m6` — `a6ce1c0` (`Cargo.toml`, `Cargo.lock` — 13 крейтов workspace,
+`web/package.json`, `web/package-lock.json`); подстановка чисел 13b — шаг 2 задачи 13c.
+
+**Проверка слитого кода** (`.tmp/m6/release/verify*.ps1`, `-j 2`, без инкрементальной сборки, шаги
+ждут снятия `quiet.lock` замеров 13b и прерываются при его появлении):
+- `cargo fmt --check`, `clippy --workspace --all-targets -D warnings`, rustdoc с
+  `-D rustdoc::broken_intra_doc_links`, WebUI `check`, `test:build`, `build` — чисто;
+- `cargo test --workspace` (`ZAM_REQUIRE_ML=1`, бинарники тега v0.0.10-m5.7 для совместимости):
+  199 наборов, 3095 passed, 44 ignored, 1 failed — нестабильный тест (ниже), исправлен.
+
+**Нестабильные тесты под полной нагрузкой HDD** (оба — запас по времени в тесте, код не менялся):
+- `late_waits_for_writer_when_lock_stays_busy` (`zam-cli`, `snapshot_queue.rs`): запись строки
+  снимка под нагрузкой дольше 200 мс, а ожидание в `late_with` ограничено `LOG_WAIT_MAX` 250 мс →
+  строка не дописана. Предел ожидания вынесен в `late_bounded(…, log_wait)`; `late` и `late_with` —
+  с `LOG_WAIT_MAX`, тест — 10 с (`e713872`, `5516d03` — форма под rustfmt). `zam-cli` юниты — 187
+  passed.
+- `recall_timeout_ms_param_full_digest` (`zam-server`, `recall.rs`): задержка сбора 600 мс при
+  `timeout_ms` 1000 — сбор занял 965 мс, сработал срок. Задержка 400 мс, `timeout_ms` 2000 (предел
+  поля `recall.max_timeout_ms`, проверка в тесте), запас 1,6 с; проверено, что ожидание ≥ задержки
+  (`3f1b4ac`). `recall` — 43 passed и ещё 3 повтора.
+
+**LNK1104 при перекомпоновке тестов.** `cargo test --workspace --no-run` в каталоге `t13c` упал на
+`LNK1104: cannot open file …\deps\ideas_recall-….exe` (затем `m5_acceptance`). Процессов тестов не
+было; держатель по Restart Manager (`RmGetList`) — процесс владельца `UAGame.exe` (вместе с
+UnrealEditor): 7 тест-бинарников `zam-server` открыты им и не переименовываются. Перекомпоновка
+понадобилась, потому что `npm run build` обновил `web/dist`, за которым следит `build.rs`
+`zam-server`. Процесс владельца не трогали: `t13c` удалён (кроме занятых файлов), сборка и тесты —
+в новом каталоге `t13c2` (сборка 18 мин, тесты 85 мин).
+
+**CI на `3f1b4ac`:** CI, Edge, CUDA — success (`43652745022`, `43652745034`, `43652745011`).
+
+**Блоки ТС-2 Claude, прерванные процессами владельца на GPU** (в решение не входят, попытками не
+считаются; `.tmp/m6/task13b/aborted/`):
+- `gpu1` — 2026-11-14 19:12 UTC, `python.exe … pipeline.py` владельца (`worker.py --phase pilot4`);
+- `gpu2` — 20:50 … 21:08 UTC, `UnrealEditor.exe` 67–82 % SM;
+- `gpu3` — 2026-11-15 00:02 … 00:18 UTC (старт в 00:02 по правилу полуночи — свободное окно с
+  22:53 UTC было короче 95 мин до 00:00), `UnrealEditor.exe` 58 % SM на 16-й минуте плеча B5.6.
+
+Цепочка `gpu-chain.ps1` ждёт двух проверок подряд без процессов владельца и снимает блок заново.
+
 ## Итог M6
 
 > Черновик задачи 13c (шаг 1, 2026-11-14) до чисел приёмки: метки `[13b: …]` заменяются итогами
