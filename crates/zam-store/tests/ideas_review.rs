@@ -8,11 +8,12 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::{
-    AnswerBy, Attribution, AuthorKind, DataDir, Db, DecidedAs, DecidedVia, Entry, EntryKind,
-    EntryPatch, EntryStatus, IdeaData, IdeaDecision, IdeaError, IdeaPriority, NewDecision,
-    NewEntry, NewNote, NewReview, NodePath, REVIEW_MIN_CHARS_DEFAULT, REVIEWS_MAX, ReviewOutcome,
-    ReviewTask, SpaceKind, TaskData, create_entry, create_note, create_solution, decide_idea,
-    delete_entry, entry_revisions, get_entry, list_spaces, review_idea, update_entry,
+    AnswerBy, Attribution, AuthorKind, Channel, DataDir, Db, DecidedAs, DecidedVia, Entry,
+    EntryKind, EntryPatch, EntryStatus, IdeaData, IdeaDecision, IdeaError, IdeaPriority,
+    NewDecision, NewEntry, NewNote, NewReview, NodePath, REVIEW_MIN_CHARS_DEFAULT, REVIEW_REFS_MAX,
+    REVIEWS_MAX, ReviewOutcome, ReviewTask, SpaceKind, TaskData, create_entry, create_note,
+    create_solution, decide_idea, delete_entry, entry_revisions, get_entry, list_spaces,
+    review_idea, update_entry,
 };
 
 // ---------- окружение ----------
@@ -115,6 +116,32 @@ async fn new_changelog(db: &Db, space: Id, title: &str) -> Entry {
         json!({"kind": "feat"}),
     );
     create_entry(db, e, &agent()).await.unwrap().0
+}
+
+async fn new_release(db: &Db, space: Id, version: &str) -> Entry {
+    let e = entry(
+        space,
+        EntryKind::Release,
+        version,
+        "Выпуск.",
+        json!({ "version": version }),
+    );
+    create_entry(db, e, &agent()).await.unwrap().0
+}
+
+/// Решение человека в WebUI (`decide`).
+fn nd(decision: IdeaDecision) -> NewDecision {
+    NewDecision {
+        decision,
+        horizon: None,
+        reason: None,
+        by: AnswerBy::Human,
+        channel: Channel::Webui,
+        task_space: None,
+        request_solution: None,
+        defer_days: 30,
+        expected_origin: None,
+    }
 }
 
 async fn new_note(db: &Db, space: Id, path: &str) -> Id {
@@ -482,7 +509,8 @@ async fn review_return_and_decline() {
 }
 
 /// M6.5 §5 `done` — «уже сделано»: идея `done` с `done_at`; в `basis` нужна ссылка на сделанное
-/// (`c:`, `commit:`, `k:` задачи `done`, `r:`), иначе `ReviewInput("basis: …сделанное…")`.
+/// (`c:`, `commit:`, `k:` задачи `done`, `r:`), иначе `ReviewInput("basis: …сделанное…")`;
+/// заметка и открытая задача сделанным не считаются.
 #[tokio::test]
 async fn review_done_requires_done_ref() {
     let (db, sol, _) = setup("done").await;
@@ -528,9 +556,11 @@ async fn review_done_requires_done_ref() {
         vec![format!("n:{note}"), format!("c:{}", c.id)]
     );
     assert_eq!(d.decided.unwrap().decision, DecidedAs::Done);
-    // `k:` задачи `done` и `commit:` — тоже сделанное
+    // `k:` задачи `done`, `r:` релиза и `commit:` — тоже сделанное
+    let rel = new_release(&db, sol, "0.0.12-m6.5").await;
     for basis in [
         vec![format!("k:{}", finished.id)],
+        vec![format!("r:{}", rel.id)],
         vec!["commit:0123abc".to_string()],
     ] {
         let j = new_idea(&db, sol, "Сделанное", "human", "normal").await;
@@ -539,6 +569,44 @@ async fn review_done_requires_done_ref() {
             .unwrap();
         assert_eq!(out.idea.status, Some(EntryStatus::Done), "{basis:?}");
     }
+}
+
+/// У идеи `new` может остаться `task_id` снятой задачи (M5.7: `decline` из `accepted` его
+/// оставляет, `reopen` из `declined` не переносит). Разбор переносит его в `prev_task_ids`:
+/// переоткрытие той задачи идею, разобранную как `done`, не трогает (иначе хук статуса задачи
+/// вернул бы её в `accepted`).
+#[tokio::test]
+async fn review_moves_stale_task_to_prev() {
+    let (db, sol, _) = setup("stale-task").await;
+    let user = Id::new();
+    let i = new_idea(&db, sol, "Кэш", "human", "normal").await;
+    let t = decide_idea(&db, i.id, nd(IdeaDecision::Accept), &human())
+        .await
+        .unwrap()
+        .task
+        .unwrap();
+    set_task_status(&db, t.id, EntryStatus::Dropped).await;
+    decide_idea(&db, i.id, nd(IdeaDecision::Decline), &human())
+        .await
+        .unwrap();
+    let mut reopen = nd(IdeaDecision::Reopen);
+    reopen.reason = Some("снова актуально".into());
+    let back = decide_idea(&db, i.id, reopen, &human()).await.unwrap().idea;
+    assert_eq!(back.status, Some(EntryStatus::New));
+    assert_eq!(data_of(&back).task_id, Some(t.id), "предусловие M5.7");
+
+    let c = new_changelog(&db, sol, "Кэш сделан").await;
+    let mut r = nr(ReviewOutcome::Done, user);
+    r.basis = vec![format!("c:{}", c.id)];
+    let out = review_idea(&db, i.id, r, &agent_of(user)).await.unwrap();
+    let d = data_of(&out.idea);
+    assert_eq!(out.idea.status, Some(EntryStatus::Done));
+    assert_eq!((d.task_id, d.prev_task_ids), (None, vec![t.id]));
+
+    set_task_status(&db, t.id, EntryStatus::Open).await;
+    let e = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(snap(&e), snap(&out.idea));
+    assert_eq!(data_of(&e).prev_task_ids, vec![t.id]);
 }
 
 // ---------- условия и пределы ----------
@@ -557,24 +625,9 @@ async fn review_preconditions() {
     assert_eq!(snap(&get_entry(&db, a.id).await.unwrap()), snap(&a));
 
     let h = new_idea(&db, sol, "Принята человеком", "human", "normal").await;
-    let acc = decide_idea(
-        &db,
-        h.id,
-        NewDecision {
-            decision: IdeaDecision::Accept,
-            horizon: None,
-            reason: None,
-            by: AnswerBy::Human,
-            channel: zam_store::Channel::Webui,
-            task_space: None,
-            request_solution: None,
-            defer_days: 30,
-            expected_origin: None,
-        },
-        &human(),
-    )
-    .await
-    .unwrap();
+    let acc = decide_idea(&db, h.id, nd(IdeaDecision::Accept), &human())
+        .await
+        .unwrap();
     let r = review_idea(&db, h.id, nr(ReviewOutcome::Plan, user), &agent_of(user)).await;
     assert!(
         matches!(
@@ -671,7 +724,7 @@ async fn review_history_keeps_ten() {
 
 /// M6.5 §5, Review Focus 1: повтор того же разбора с тем же ключом после обрыва связи — прежний
 /// итог (`replay: true`) с той же задачей, без новой ревизии и второй задачи. Тот же ключ другого
-/// пользователя — не повтор (обычные условия: идея уже не `new`).
+/// пользователя или с другим исходом — не повтор (обычные условия: идея уже не `new` — 409).
 #[tokio::test]
 async fn review_retry_same_key_returns_same_task() {
     let (db, sol, _) = setup("replay").await;
@@ -701,28 +754,36 @@ async fn review_retry_same_key_returns_same_task() {
     assert_eq!(again.task.map(|t| t.id), first.task.as_ref().map(|t| t.id));
     assert_eq!(tasks_in(&db, sol).await, 1);
     assert_eq!(entry_revisions(&db, i.id).await.unwrap().len(), revs);
-    // чужой пользователь с тем же ключом — не повтор
-    let mut other = r.clone();
-    other.by_user = Id::new();
-    let x = review_idea(&db, i.id, other, &agent()).await;
-    assert!(
-        matches!(
-            x,
-            Err(IdeaError::Transition {
-                from: EntryStatus::Accepted,
-                ..
-            })
-        ),
-        "{x:?}"
-    );
+    // чужой пользователь с тем же ключом и тот же ключ с другим исходом — не повтор: обычные
+    // условия, идея уже не `new` — переход не разрешён, ничего не записано
+    let mut other_user = r.clone();
+    other_user.by_user = Id::new();
+    let mut other_outcome = nr(ReviewOutcome::Decline, user);
+    other_outcome.key = r.key.clone();
+    for (who, x) in [(other_user, agent()), (other_outcome, agent_of(user))] {
+        let res = review_idea(&db, i.id, who.clone(), &x).await;
+        assert!(
+            matches!(
+                res,
+                Err(IdeaError::Transition {
+                    from: EntryStatus::Accepted,
+                    to: "review"
+                })
+            ),
+            "{:?}: {res:?}",
+            who.outcome
+        );
+    }
     assert_eq!(tasks_in(&db, sol).await, 1);
+    assert_eq!(entry_revisions(&db, i.id).await.unwrap().len(), revs);
+    assert_eq!(get_entry(&db, i.id).await.unwrap(), first.idea);
 }
 
 /// M6.5 §5, Review Focus 4: мусор в ссылках — `ReviewInput` с названием поля, ничего не записано:
 /// неизвестный id, чужое пространство, буква не того вида, без префикса, `file:` с `..` или
-/// абсолютный, `commit:` не hex 7–64; в `similar` — только идеи `w:`. Принятые ссылки хранятся
-/// нормализованными (канонический id с префиксом, `file:` с `/`, `commit:` в нижнем регистре),
-/// повторы — один раз.
+/// абсолютный, `commit:` не hex 7–64, больше 50 ссылок в поле; в `similar` — только идеи `w:`
+/// (отклонённая — можно). Принятые ссылки хранятся нормализованными (канонический id с префиксом,
+/// `file:` с `/`, `commit:` в нижнем регистре), повторы — один раз.
 #[tokio::test]
 async fn review_rejects_bad_refs() {
     let (db, sol, kn) = setup("bad-refs").await;
@@ -776,8 +837,28 @@ async fn review_rejects_bad_refs() {
         .await;
         assert!(input_err(&r, "similar"), "{bad}: {r:?}");
     }
+    // больше [`REVIEW_REFS_MAX`] ссылок в поле — ошибка поля; ровно столько — можно
+    let files =
+        |n: usize| -> Vec<String> { (0..n).map(|k| format!("file:docs/f{k}.md")).collect() };
+    assert_eq!(REVIEW_REFS_MAX, 50);
+    let r = review_idea(&db, i.id, with(files(51), Vec::new()), &agent_of(user)).await;
+    assert!(
+        matches!(&r, Err(IdeaError::ReviewInput(m)) if m.starts_with("basis:") && m.contains("50")),
+        "{r:?}"
+    );
+    let r = review_idea(&db, i.id, with(Vec::new(), files(51)), &agent_of(user)).await;
+    assert!(input_err(&r, "similar"), "{r:?}");
     assert_eq!(snap(&get_entry(&db, i.id).await.unwrap()), snap(&i));
+    let many = new_idea(&db, sol, "Много ссылок", "human", "normal").await;
+    let out = review_idea(&db, many.id, with(files(50), Vec::new()), &agent_of(user))
+        .await
+        .unwrap();
+    assert_eq!(data_of(&out.idea).review.unwrap().basis.len(), 50);
 
+    // похожая идея — в том числе отклонённая (образец «уже обсуждали», §6)
+    decide_idea(&db, other.id, nd(IdeaDecision::Decline), &human())
+        .await
+        .unwrap();
     let out = review_idea(
         &db,
         i.id,

@@ -63,9 +63,10 @@ pub const GRAPH_MAX_NODES: usize = 500;
 /// Предел рёбер подграфа (по порядку создания) — сверх него `truncated`.
 pub const GRAPH_MAX_EDGES: usize = 2000;
 
-/// Отказ клиентскому `derived_from` с целью-идеей (M5.7 §4): текст [`StoreError::IdeaLinkDenied`].
+/// Отказ клиентскому `derived_from` с целью-идеей (M5.7 §4, M6.5 §5): текст
+/// [`StoreError::IdeaLinkDenied`].
 pub const IDEA_DERIVED_FROM_DENIED: &str =
-    "связь задачи с идеей создаёт только «начать» (decide accept)";
+    "связь задачи с идеей создают только «начать» (decide accept) и разбор идеи с исходом plan";
 
 /// Тип связи (§8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -687,7 +688,7 @@ pub(crate) fn add_explicit(
 
 /// Ребро с проверками концов и прав: явное (клиент) или системное (связи, которые ставит
 /// сервер в операциях идей, M5.7). Клиентское `derived_from` на идею → `IdeaLinkDenied`: связь задачи
-/// с идеей создаёт только «начать» (спецификация M5.7 §4).
+/// с идеей создают только «начать» и разбор `plan` (спецификации M5.7 §4, M6.5 §5).
 fn add_checked(
     c: &Connection,
     e: NewEdge,

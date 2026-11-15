@@ -32,7 +32,7 @@ use crate::entries::{
     ENTRY_COLS, Entry, EntryKind, EntryStatus, Maker, NewEntry, REASON_MAX_CHARS, TITLE_MAX_CHARS,
     check_key, ensure_not_report, entry_row, insert_entry_as, load_entry, revise_with,
 };
-use crate::file_refs::{normalize_ref_path, shown_ref};
+use crate::file_refs::{COMMIT_MAX_CHARS, check_commit, normalize_ref_path, shown_ref};
 use crate::graph::{EdgeOrigin, EdgeType, insert_entry_links};
 use crate::nodes::Attribution;
 use crate::questions::{
@@ -1184,6 +1184,40 @@ fn joined(parts: &[&str]) -> String {
         .join("\n\n")
 }
 
+/// Задача из идеи — у «начать» ([`apply_decision_tx`]) и разбора `plan` ([`review_task_tx`]) в
+/// пространстве `space`: заголовок — `title` или заголовок идеи; тело — `plan` (план шагов) или
+/// тело идеи и строка «Идея: w:<id>»; `data` — ссылки идеи и `priority`; область и теги идеи;
+/// ребро `derived_from` задача → идея (системное: задачу создаёт сервер, [`Maker::Server`]).
+fn task_from_idea(
+    idea: &Entry,
+    data: &IdeaData,
+    space: Id,
+    title: Option<String>,
+    plan: Option<&str>,
+    priority: Option<IdeaPriority>,
+) -> NewEntry {
+    NewEntry {
+        refs: None,
+        space_id: space,
+        kind: EntryKind::Task,
+        title: title.unwrap_or_else(|| idea.title.clone()),
+        body: joined(&[plan.unwrap_or(&idea.body), &idea_line(idea.id)]),
+        data: TaskData {
+            links: data.links.clone(),
+            priority,
+            ..TaskData::default()
+        }
+        .to_value(),
+        area: idea.area.clone(),
+        tags: idea.tags.clone(),
+        status: None,
+        certainty: None,
+        idempotency_key: None,
+        triggers: Vec::new(),
+        links: vec![(EdgeType::DerivedFrom, entry_ref(idea.id))],
+    }
+}
+
 /// Предлагает начать идею одной транзакцией писателя (§5.1): новый вопрос с вариантами
 /// [`IDEA_OPTIONS`] (`data.idea`, `data.task_space`), системное ребро `relates_to` вопрос →
 /// идея, идея → `proposed` с `question_id` и `proposed_at`. Возвращает `(идея, вопрос)`; при
@@ -1390,25 +1424,7 @@ pub(crate) fn apply_decision_tx(
                 Ok(s) => s,
                 Err(e) => return Ok(Err(e)),
             };
-        let t = NewEntry {
-            refs: None,
-            space_id: space,
-            kind: EntryKind::Task,
-            title: idea.title.clone(),
-            body: joined(&[&idea.body, &idea_line(idea.id)]),
-            data: TaskData {
-                links: data.links.clone(),
-                ..TaskData::default()
-            }
-            .to_value(),
-            area: idea.area.clone(),
-            tags: idea.tags.clone(),
-            status: None,
-            certainty: None,
-            idempotency_key: None,
-            triggers: Vec::new(),
-            links: vec![(EdgeType::DerivedFrom, entry_ref(idea.id))],
-        };
+        let t = task_from_idea(idea, &data, space, None, None, None);
         let tid = insert_entry_as(tx, t, None, attrib, None, now, Maker::Server)?;
         data.task_id = Some(tid);
         task_id = Some(tid);
@@ -1555,10 +1571,19 @@ fn review_input(field: &str, msg: impl std::fmt::Display) -> IdeaError {
 /// Буквы ссылок на записи в ссылках разбора: все виды записей, кроме отчёта (`p:`), без общей
 /// `e:` — буква называет вид, и он сверяется с записью.
 const REVIEW_ENTRY_LETTERS: [&str; 7] = ["i", "c", "r", "t", "k", "q", "w"];
-/// Префиксы ссылок разбора — для текста ошибки.
-const REVIEW_REF_PREFIXES: &str = "n:, i:, c:, r:, t:, k:, q:, w:, file: или commit:";
-/// Длина sha коммита в `commit:`, символов.
-const REVIEW_COMMIT_LEN: std::ops::RangeInclusive<usize> = 7..=64;
+/// Нижний предел sha в `commit:`, символов (короче — неоднозначно в истории); верхний —
+/// [`COMMIT_MAX_CHARS`] ([`check_commit`]).
+const REVIEW_COMMIT_MIN_CHARS: usize = 7;
+
+/// Префиксы ссылок разбора для текста ошибки: `n:`, буквы [`REVIEW_ENTRY_LETTERS`], `file:`,
+/// `commit:` — из того же списка, что и разбор, чтобы текст с ним не расходился.
+fn review_ref_prefixes() -> String {
+    let letters: Vec<String> = REVIEW_ENTRY_LETTERS
+        .iter()
+        .map(|l| format!("{l}:"))
+        .collect();
+    format!("n:, {}, file: или commit:", letters.join(", "))
+}
 
 /// Ссылка разбора, разобранная по форме ([`parse_review_ref`]).
 enum ReviewRef {
@@ -1581,16 +1606,19 @@ impl ReviewRef {
     }
 }
 
-/// Форма ссылки поля `field` без обращения к базе: префикс из [`REVIEW_REF_PREFIXES`]; у
+/// Форма ссылки поля `field` без обращения к базе: префикс из [`review_ref_prefixes`]; у
 /// `file:` — путь относительно корня решения без сегмента `..` ([`normalize_ref_path`]); у
-/// `commit:` — от 7 до 64 шестнадцатеричных символов.
+/// `commit:` — [`check_commit`] не короче [`REVIEW_COMMIT_MIN_CHARS`].
 fn parse_review_ref(field: &str, raw: &str) -> Result<ReviewRef, IdeaError> {
     let s = raw.trim();
     let shown = shown_ref(s);
     let bad_prefix = || {
         review_input(
             field,
-            format!("«{shown}» — нужна ссылка с префиксом {REVIEW_REF_PREFIXES}"),
+            format!(
+                "«{shown}» — нужна ссылка с префиксом {}",
+                review_ref_prefixes()
+            ),
         )
     };
     let Some((prefix, rest)) = s.split_once(':') else {
@@ -1613,17 +1641,18 @@ fn parse_review_ref(field: &str, raw: &str) -> Result<ReviewRef, IdeaError> {
                 .map(ReviewRef::File)
                 .map_err(|e| review_input(field, format!("{shown} — {e}")))
         }
-        "commit" => {
-            let c = rest.trim();
-            if REVIEW_COMMIT_LEN.contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()) {
-                Ok(ReviewRef::Commit(c.to_ascii_lowercase()))
-            } else {
-                Err(review_input(
+        "commit" => check_commit(rest)
+            .filter(|c| c.len() >= REVIEW_COMMIT_MIN_CHARS)
+            .map(ReviewRef::Commit)
+            .ok_or_else(|| {
+                review_input(
                     field,
-                    format!("{shown} — sha коммита: от 7 до 64 шестнадцатеричных символов"),
-                ))
-            }
-        }
+                    format!(
+                        "{shown} — sha коммита: от {REVIEW_COMMIT_MIN_CHARS} до \
+                         {COMMIT_MAX_CHARS} шестнадцатеричных символов"
+                    ),
+                )
+            }),
         "n" => Ok(ReviewRef::Node(id()?)),
         l if REVIEW_ENTRY_LETTERS.contains(&l) => {
             let kind = EntryKind::from_ref_letter(l).ok_or_else(bad_prefix)?;
@@ -1830,26 +1859,14 @@ fn review_task_tx(
             body,
             priority,
         } => {
-            let t = NewEntry {
-                refs: None,
-                space_id: idea.space_id,
-                kind: EntryKind::Task,
-                title: title.unwrap_or_else(|| idea.title.clone()),
-                body: joined(&[body.as_deref().unwrap_or(&idea.body), &idea_line(idea.id)]),
-                data: TaskData {
-                    links: data.links.clone(),
-                    priority: Some(priority.unwrap_or(data.priority)),
-                    ..TaskData::default()
-                }
-                .to_value(),
-                area: idea.area.clone(),
-                tags: idea.tags.clone(),
-                status: None,
-                certainty: None,
-                idempotency_key: None,
-                triggers: Vec::new(),
-                links: vec![(EdgeType::DerivedFrom, entry_ref(idea.id))],
-            };
+            let t = task_from_idea(
+                idea,
+                data,
+                idea.space_id,
+                title,
+                body.as_deref(),
+                Some(priority.unwrap_or(data.priority)),
+            );
             Ok(Ok(Some(insert_entry_as(
                 tx,
                 t,
@@ -2552,6 +2569,30 @@ mod tests {
         assert!(d.reopen_proposed());
         d.question_id = None;
         assert!(!d.reopen_proposed());
+    }
+
+    /// Буквы ссылок разбора — все виды записей, кроме отчёта; каждая разбирается в ссылку своего
+    /// вида и есть в тексте ошибки (текст собирается из того же списка).
+    #[test]
+    fn review_ref_letters_match_kinds() {
+        for k in EntryKind::ALL {
+            assert_eq!(
+                REVIEW_ENTRY_LETTERS.contains(&k.ref_letter()),
+                k != EntryKind::Report,
+                "{k:?}"
+            );
+        }
+        let id = Id::new();
+        for l in REVIEW_ENTRY_LETTERS {
+            match parse_review_ref("basis", &format!("{l}:{id}")) {
+                Ok(ReviewRef::Entry(k, i)) => assert_eq!((k.ref_letter(), i), (l, id)),
+                _ => panic!("{l}: не ссылка записи"),
+            }
+        }
+        assert_eq!(
+            review_ref_prefixes(),
+            "n:, i:, c:, r:, t:, k:, q:, w:, file: или commit:"
+        );
     }
 
     #[test]
