@@ -9,3 +9,9 @@ xtask = "run -p xtask --"
 # Статический CRT: exe не зависят от VC Redistributable на чистой Windows
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Тесты workspace: поиск файлов проекта вверх от cwd (CLAUDE.md, .zeroaimemory/) не выходит за
+# target/ (там target/test-tmp и CARGO_TARGET_TMPDIR = <каталог сборки>/tmp) — иначе тесты находят подключение к памяти самого репозитория разработчика
+# (`zam init` в корне; обкатка M6.5). Смысл переменной — как GIT_CEILING_DIRECTORIES.
+[env]
+ZAM_CEILING_DIRECTORIES = { value = "target", relative = true }

@@ -595,10 +595,10 @@ pub fn log_line(path: &Path, source: &str, msg: &str) {
 /// `solution.toml` (как [`locate::find_solution`], решение в подкаталоге монорепо), иначе корень
 /// git (каталог с `.git` — каталогом или файлом у worktree), иначе сам `cwd`.
 pub fn project_root(cwd: &Path, home: &Path) -> PathBuf {
-    let marked = cwd.ancestors().find(|d| {
+    let marked = crate::locate::ancestors(cwd).find(|d| {
         (*d != home && d.join(".zeroaimemory").is_dir()) || d.join("solution.toml").is_file()
     });
-    let git = || cwd.ancestors().find(|d| d.join(".git").exists());
+    let git = || crate::locate::ancestors(cwd).find(|d| d.join(".git").exists());
     marked.or_else(git).unwrap_or(cwd).to_path_buf()
 }
 

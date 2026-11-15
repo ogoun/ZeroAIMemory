@@ -107,19 +107,24 @@ pub const SESSION_ENV: &str = "ZAM_SESSION";
 /// Явный признак «команду запустил агент» (`ZAM_AGENT=1`).
 pub const AGENT_FLAG_ENV: &str = "ZAM_AGENT";
 
+/// Каталоги-потолки поиска файлов проекта вверх от cwd (`CLAUDE.md`, `.zeroaimemory/`), как
+/// `GIT_CEILING_DIRECTORIES` у git (M6.5, обкатка).
+pub const CEILING_ENV: &str = "ZAM_CEILING_DIRECTORIES";
+
 /// Клиентские переменные `zam` (не агента): явная сессия хуков, признак агента, имя машины,
-/// сессия `zam mcp`, пределы ожидания `zam export`/`zam import`. Сервер не читает их как ключи
+/// сессия `zam mcp`, пределы ожидания `zam export`/`zam import`, потолки поиска. Сервер не читает их как ключи
 /// конфигурации (иначе такая переменная в окружении пользователя — неизвестный ключ, и сервер
 /// не стартует), тесты убирают их из окружения дочернего `zam`. Новая переменная, которую читает
 /// `zam`, добавляется сюда. `ZAM_URL` и `ZAM_TOKEN` `zam` тоже читает, но они не здесь: это адрес и
 /// секрет, сервер пропускает их своим списком (`RESERVED_ENV` в `zam-server`).
-pub const CLIENT_ENV_VARS: [&str; 6] = [
+pub const CLIENT_ENV_VARS: [&str; 7] = [
     SESSION_ENV,
     AGENT_FLAG_ENV,
     MACHINE_ENV,
     MCP_SESSION_ENV,
     EXPORT_IDLE_ENV,
     IMPORT_IDLE_ENV,
+    CEILING_ENV,
 ];
 
 #[cfg(test)]

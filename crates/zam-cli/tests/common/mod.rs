@@ -5,6 +5,9 @@
 //!   ([`zam_core::AGENT_ENV_VARS`]: `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, переменные Codex),
 //!   без клиентских (все [`zam_core::CLIENT_ENV_VARS`]) и
 //!   без любых других `ZAM_*` процесса тестов; нужные значения тест задаёт сам после вызова.
+//!   Потолок поиска файлов проекта (`ZAM_CEILING_DIRECTORIES`, [`ceilings`]) ставится заново:
+//!   иначе `zam` из каталога теста находит `CLAUDE.md` и `.zeroaimemory/` репозитория, если он сам
+//!   подключён к памяти (обкатка M6.5).
 //!   Иначе `zam`, запущенный из сессии агента, писал бы в журнал этой сессии.
 //! - [`sandbox`] — каталог теста `<CARGO_TARGET_TMPDIR>/<префикс>-<имя>/w`, а уровнем выше —
 //!   файл `.git` (как у worktree, с несуществующим `gitdir`): корень проекта (`project_root`) не
@@ -50,7 +53,20 @@ pub fn zam_cmd() -> Command {
             c.env_remove(k);
         }
     }
+    // потолок поиска — после очистки `ZAM_*`: иначе из каталогов тестов `zam` находит
+    // `CLAUDE.md` и `.zeroaimemory/` репозитория, подключённого к памяти (обкатка M6.5)
+    c.env(zam_core::CEILING_ENV, ceilings());
     c
+}
+
+/// Потолки поиска файлов проекта для дочернего `zam`: `target/` репозитория и
+/// `CARGO_TARGET_TMPDIR` (каталог сборки может лежать вне `target/`).
+pub fn ceilings() -> std::ffi::OsString {
+    std::env::join_paths([
+        repo_root().join("target"),
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")),
+    ])
+    .unwrap()
 }
 
 /// Каталог теста с маркером проекта уровнем выше (см. модуль); пересоздаётся.

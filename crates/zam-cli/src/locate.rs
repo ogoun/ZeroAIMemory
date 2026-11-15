@@ -1,6 +1,79 @@
 //! Поиск настроек подключения (§11.4): флаги → env → CLAUDE.md/AGENTS.md вверх от cwd → config.toml в home.
 //! URL и токен разрешаются независимо.
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Предки `start` (с ним самим) для поиска файлов проекта вверх: `CLAUDE.md`/`AGENTS.md`,
+/// `.zeroaimemory/`, `solution.toml`. Как `GIT_CEILING_DIRECTORIES` у git: если `start` лежит
+/// внутри каталога из `ZAM_CEILING_DIRECTORIES` (список путей, как `PATH`), поиск не смотрит сам
+/// этот каталог и всё выше. Тесты workspace ставят потолок `target/`
+/// (`.cargo/config.toml`): иначе из их каталогов поиск доходил до настоящих `CLAUDE.md` и
+/// `.zeroaimemory/` репозитория, подключённого к памяти (обкатка 0.0.11-m6).
+pub fn ancestors(start: &Path) -> impl Iterator<Item = &Path> {
+    ancestors_below(start, ceilings())
+}
+
+fn ancestors_below<'a>(
+    start: &'a Path,
+    ceilings: &[Vec<String>],
+) -> impl Iterator<Item = &'a Path> {
+    let s = path_key(start);
+    let active: Vec<Vec<String>> = ceilings
+        .iter()
+        .filter(|c| s.len() > c.len() && s.starts_with(c))
+        .cloned()
+        .collect();
+    start.ancestors().take_while(move |d| {
+        let d = path_key(d);
+        active.iter().all(|c| d.len() > c.len() && d.starts_with(c))
+    })
+}
+
+fn ceilings() -> &'static [Vec<String>] {
+    static C: OnceLock<Vec<Vec<String>>> = OnceLock::new();
+    C.get_or_init(|| {
+        std::env::var_os(zam_core::CEILING_ENV)
+            .map(|v| {
+                std::env::split_paths(&v)
+                    .filter(|p| p.is_absolute())
+                    .map(|p| path_key(&p))
+                    .filter(|k| k.len() > 1)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Путь для сравнения: компоненты после лексической нормализации (`.` и `..`), префикс диска
+/// без `\\?\`; на Windows — без учёта регистра.
+fn path_key(p: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // префикс диска и корень `..` не снимает
+    let mut base = 0;
+    for c in p.components() {
+        let s = match c {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                if out.len() > base {
+                    out.pop();
+                }
+                continue;
+            }
+            Component::Prefix(x) => {
+                base += 1;
+                let s = x.as_os_str().to_string_lossy();
+                s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+            }
+            Component::RootDir => {
+                base += 1;
+                "/".to_string()
+            }
+            Component::Normal(n) => n.to_string_lossy().into_owned(),
+        };
+        out.push(if cfg!(windows) { s.to_lowercase() } else { s });
+    }
+    out
+}
 
 /// Значения из флагов командной строки.
 #[derive(Debug, Default, Clone)]
@@ -199,7 +272,7 @@ pub fn resolve(
         });
     }
     // 3. файлы вверх от cwd: выигрывает ближайший каталог, где нашлось значение
-    for dir in cwd.ancestors() {
+    for dir in ancestors(cwd) {
         if r.url.is_some() && r.token.is_some() {
             break;
         }
@@ -315,8 +388,7 @@ pub fn plan_home(home: &Path, url: &str, token: &str, force: bool) -> Result<Hom
 /// Ближайший вверх от `start` файл решения: в каждом каталоге сначала
 /// `.zeroaimemory/solution.toml` (§11.1), затем `solution.toml` (совместимость с M0).
 pub fn find_solution(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
+    ancestors(start)
         .flat_map(|d| {
             [
                 d.join(".zeroaimemory").join("solution.toml"),
@@ -356,6 +428,35 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn ceiling_stops_upward_search() {
+        let root = if cfg!(windows) { "C:/w" } else { "/w" };
+        let p = |s: &str| PathBuf::from(format!("{root}/{s}"));
+        let c = vec![path_key(&p("repo/target/test-tmp"))];
+        let start = p("repo/crates/x/../../target/test-tmp/t1/a/b");
+        let got: Vec<Vec<String>> = ancestors_below(&start, &c).map(path_key).collect();
+        assert_eq!(
+            got.len(),
+            3,
+            "a/b, a, t1 — без самого потолка и выше: {got:?}"
+        );
+        assert_eq!(
+            *got.last().unwrap(),
+            path_key(&p("repo/target/test-tmp/t1"))
+        );
+        // вне потолка — поиск до корня, как раньше
+        let out = p("repo/src/m");
+        assert_eq!(ancestors_below(&out, &c).count(), out.ancestors().count());
+        // сам потолок как стартовый каталог — без ограничения
+        let at = p("repo/target/test-tmp");
+        assert_eq!(ancestors_below(&at, &c).count(), at.ancestors().count());
+        if cfg!(windows) {
+            let upper = PathBuf::from("C:/W/REPO/TARGET/TEST-TMP/t2");
+            assert_eq!(ancestors_below(&upper, &c).count(), 1);
+        }
+        assert_eq!(path_key(Path::new("a/../../b")), vec!["b".to_string()]);
     }
 
     #[test]

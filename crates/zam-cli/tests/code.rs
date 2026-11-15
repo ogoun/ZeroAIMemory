@@ -749,6 +749,7 @@ fn code_sync_lock_second_skips_stale_lock_taken() {
         }
     }
     first
+        .env(zam_core::CEILING_ENV, common::ceilings())
         .env("ZAM_URL", &q.url)
         .env("ZAM_TOKEN", &q.token)
         .env("HOME", &q.home)
