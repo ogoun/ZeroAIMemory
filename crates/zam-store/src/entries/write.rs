@@ -484,6 +484,11 @@ pub(crate) fn save(
     a: &Attribution,
     now: &str,
 ) -> Result<(), StoreError> {
+    // идея вышла из `returned` любым путём (правка человеком, решение, разбор) — без
+    // `returned_at` в этой же ревизии (M6.5 §6); `returned` бывает только у идеи
+    let left_returned = crate::ideas::returned_exit_data(cur.status, f.status, &f.data)
+        .map(|data| Fields { data, ..f.clone() });
+    let f = left_returned.as_ref().unwrap_or(f);
     let rev = cur.rev + 1;
     c.prepare_cached(
         "UPDATE entries SET title = ?2, title_norm = ?3, body = ?4, data = ?5, tags = ?6,
@@ -659,8 +664,8 @@ pub async fn create_entry(
 /// триггеры в ревизию не входят. Правка содержимого (заголовок, тело, `data`, теги, область,
 /// триггеры) insight `superseded`/`retracted` → `Conflict`. Отчёт → `ReportImmutable`.
 /// Содержимое идеи меняется только в `new`, `deferred` и `returned` (иначе `Conflict`); правка
-/// человеком (`p.human_edit`) заголовка или тела идеи `returned` возвращает её на разбор: статус
-/// `new` и без `data.returned_at` в той же ревизии (M6.5 §6).
+/// человеком (`p.human_edit`) заголовка или тела (в том числе `append_body`) идеи `returned`
+/// возвращает её на разбор: статус `new` и без `data.returned_at` в той же ревизии (M6.5 §6).
 pub async fn update_entry(
     db: &Db,
     id: Id,
@@ -685,7 +690,6 @@ pub async fn update_entry(
             || p.area.is_some()
             || p.triggers.is_some();
         let term_edit = cur.kind == EntryKind::Term && (p.title.is_some() || p.data.is_some());
-        let (title_given, body_given) = (p.title.is_some(), p.body.is_some());
         if content {
             ensure_editable(&cur)?;
         }
@@ -832,17 +836,15 @@ pub async fn update_entry(
             idd.apply_patch(d).map_err(bad)?;
             f.data = idd.to_value();
         }
-        // возвращённую идею человек дописал (заголовок или тело, не `append_body`) — снова на
-        // разбор: `returned → new` без `returned_at` в той же ревизии, история разборов
-        // остаётся (M6.5 §6); правка агента и правка без изменений статус не меняют
+        // возвращённую идею дописал человек (заголовок, тело или `append_body`) — снова на
+        // разбор: `returned → new`, история разборов остаётся, `returned_at` снимает запись
+        // ревизии ([`save`]); правку определяет, кто правит (M6.5 §6): правка агента, правка
+        // только `data` и правка без изменений статус не меняют
         if p.human_edit
             && cur.kind == EntryKind::Idea
             && cur.status == Some(EntryStatus::Returned)
-            && ((title_given && f.title != cur.title) || (body_given && f.body != cur.body))
+            && (f.title != cur.title || f.body != cur.body)
         {
-            let mut idd = IdeaData::from_stored(&f.data);
-            idd.returned_at = None;
-            f.data = idd.to_value();
             f.status = Some(EntryStatus::New);
         }
         if let Some(c) = p.certainty {

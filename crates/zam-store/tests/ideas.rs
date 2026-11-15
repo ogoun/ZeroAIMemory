@@ -2921,11 +2921,12 @@ async fn returned_idea(db: &Db, sol: Id, title: &str) -> Entry {
     e
 }
 
-/// M6.5 §6, Review Focus 2: правка возвращённой идеи человеком (`human_edit`) заголовка или тела
-/// — `returned → new` в той же ревизии, `returned_at` снят, разборы на месте. Правка с устаревшей
-/// ревизией (форма открыта до дописки агента; повтор уже принятой правки) — конфликт без записи.
-/// Дописка агента и правка тела агентом (`human_edit: false`), правка человеком только `data` —
-/// статус прежний; правка без изменений — без ревизии.
+/// M6.5 §6, Review Focus 2: правка возвращённой идеи человеком (`human_edit`) заголовка, тела или
+/// дописка (`append_body`) — `returned → new` в той же ревизии, `returned_at` снят, разборы на
+/// месте: переход определяет, кто правит, а не поле. Правка с устаревшей ревизией (форма открыта
+/// до дописки агента; повтор уже принятой правки) — конфликт без записи. Дописка агента и правка
+/// тела агентом (`human_edit: false`), правка человеком только `data` — статус прежний; правка
+/// без изменений — без ревизии.
 #[tokio::test]
 async fn human_edit_returned_goes_new_and_stale_rev_conflicts() {
     use EntryStatus::*;
@@ -3044,10 +3045,30 @@ async fn human_edit_returned_goes_new_and_stale_rev_conflicts() {
         .unwrap();
     assert_eq!((g.status, g.body.as_str()), (Some(Returned), BODY));
     assert!(data_of(&g).returned_at.is_some());
+    // дописка человеком (`append_body`, `human_edit: true`) — `new`, разборы на месте
+    let m = returned_idea(&db, sol, "Четвёртый кэш").await;
+    let h = update_entry(
+        &db,
+        m.id,
+        Some(m.rev),
+        EntryPatch {
+            append_body: Some("Человек: на 10 минут.".into()),
+            human_edit: true,
+            ..EntryPatch::default()
+        },
+        &human(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((h.rev, h.status), (m.rev + 1, Some(New)));
+    assert!(h.body.ends_with("Человек: на 10 минут."), "{}", h.body);
+    let d = data_of(&h);
+    assert_eq!((d.returned_at, d.reviews), (None, data_of(&m).reviews));
 }
 
 /// M6.5 §6: возвращённую идею человек может решить сам — «Начать», «Отложить», «Отказаться»;
-/// `reopen` из `returned` не переход (идея и так у человека) — 409 `transition-not-allowed`.
+/// выход из `returned` снимает `returned_at` (история разборов остаётся). `reopen` из
+/// `returned` не переход (идея и так у человека) — 409 `transition-not-allowed` без записи.
 #[tokio::test]
 async fn returned_human_decisions() {
     let (db, sol, _) = setup("returned-decide").await;
@@ -3065,11 +3086,19 @@ async fn returned_human_decisions() {
         ),
         "{r:?}"
     );
+    assert_eq!(snap(&get_entry(&db, i.id).await.unwrap()), snap(&i));
     let acc = decide_idea(&db, i.id, nd(IdeaDecision::Accept), &human())
         .await
         .unwrap();
     assert_eq!(acc.idea.status, Some(EntryStatus::Accepted));
     assert!(acc.task.is_some());
+    let left = |e: &Entry, was: &Entry| {
+        let d = data_of(e);
+        assert_eq!(d.returned_at, None, "{}: {}", e.title, e.data);
+        assert_eq!(d.reviews, data_of(was).reviews, "{}", e.title);
+        assert_eq!(d.review, data_of(was).review, "{}", e.title);
+    };
+    left(&acc.idea, &i);
     for (dec, want) in [
         (IdeaDecision::Defer, EntryStatus::Deferred),
         (IdeaDecision::Decline, EntryStatus::Declined),
@@ -3077,6 +3106,12 @@ async fn returned_human_decisions() {
         let j = returned_idea(&db, sol, dec.as_str()).await;
         let r = decide_idea(&db, j.id, nd(dec), &human()).await.unwrap();
         assert_eq!(r.idea.status, Some(want));
+        left(&r.idea, &j);
+        // и в ревизии решения
+        let revs = entry_revisions(&db, j.id).await.unwrap();
+        let last = revs.iter().max_by_key(|r| r.rev).unwrap();
+        assert_eq!(last.status, Some(want));
+        assert!(last.data.get("returned_at").is_none(), "{}", last.data);
     }
 }
 

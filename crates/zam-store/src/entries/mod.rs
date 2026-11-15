@@ -391,7 +391,8 @@ pub struct EntryPatch {
     /// новые строки `data.refs.files` дописываются ссылками без хэша.
     pub refs: Option<Vec<crate::file_refs::FileRef>>,
     /// Правку сделал человек (сервер ставит у сессии WebUI и у токена с `by: human`; M6.5 §6):
-    /// правка заголовка или тела идеи `returned` переводит её в `new`.
+    /// правка заголовка или тела (в том числе `append_body`) идеи `returned` переводит её в
+    /// `new`.
     pub human_edit: bool,
 }
 

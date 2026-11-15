@@ -302,7 +302,8 @@ pub struct IdeaData {
     pub review: Option<Review>,
     /// История разборов: не больше 10, новые в начале (предел держит запись разбора).
     pub reviews: Vec<Review>,
-    /// Когда идея ушла «На доработку» (`returned`); снимается правкой человека.
+    /// Когда идея ушла «На доработку» (`returned`); снимается при любом выходе из `returned`
+    /// ([`returned_exit_data`]).
     pub returned_at: Option<Timestamp>,
 }
 
@@ -663,6 +664,26 @@ pub fn check_idea_transition(
         return Err("reason-required");
     }
     Ok(to)
+}
+
+/// `data` новой ревизии идеи при смене статуса `from → to`: выход из `returned` любым путём
+/// (правка человеком, решение человека, разбор агентом) снимает `returned_at` (M6.5 §6).
+/// `None` — `data` без изменений. Единственное место правила — запись ревизии
+/// (`entries::write::save`), через которую идут и `update_entry`, и [`revise_with`].
+pub(crate) fn returned_exit_data(
+    from: Option<EntryStatus>,
+    to: Option<EntryStatus>,
+    data: &Value,
+) -> Option<Value> {
+    if from != Some(EntryStatus::Returned)
+        || to == Some(EntryStatus::Returned)
+        || data.get("returned_at").is_none()
+    {
+        return None;
+    }
+    let mut d = data.clone();
+    d.as_object_mut()?.remove("returned_at");
+    Some(d)
 }
 
 /// Решение по идее, как его присылает клиент.
