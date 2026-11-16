@@ -1,6 +1,16 @@
 //! Git-хэш для `zam --version`: `ZAM_GIT_SHA` из окружения, иначе `git rev-parse --short=12 HEAD`.
+//!
+//! Стек главного потока `zam` на Windows (MSVC) — 8 МБ, как у главного потока Linux (M6.5,
+//! задача 6): clap derive строит дерево команд целиком при любом вызове (`zam --version` тоже),
+//! а в отладочной сборке кадры `augment_subcommands` не переиспользуют слоты временных `Arg`.
+//! С `zam idea review` разбор аргументов потребовал ≈ 1,08 МБ при 1 МБ по умолчанию у
+//! компоновщика MSVC — `STATUS_STACK_OVERFLOW` до первой строки `main`. Размер — резерв
+//! адресного пространства, память выделяется по мере роста стека: холодный старт не меняется.
 use std::path::Path;
 use std::process::Command;
+
+/// Резерв стека главного потока `zam` на Windows, байт.
+const WINDOWS_MAIN_STACK: u32 = 8 * 1024 * 1024;
 
 fn watch(p: &Path) {
     if p.exists() {
@@ -9,6 +19,11 @@ fn watch(p: &Path) {
 }
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-arg-bin=zam=/STACK:{WINDOWS_MAIN_STACK}");
+    }
     println!("cargo:rerun-if-env-changed=ZAM_GIT_SHA");
     let git = Path::new("../../.git");
     if git.is_dir() {
