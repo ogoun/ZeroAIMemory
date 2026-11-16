@@ -1409,6 +1409,16 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         "zam idea queue",
         "zam idea review w:<id>",
         "без новых доводов",
+        // ревью задачи 7 (Minor 1–7): пункт плана — только после текущей работы; правило
+        // «без ответа «начать»» — для режима `propose`; уточнения по коду
+        "Посреди другой задачи план не начинай",
+        "**Без ответа «начать» не начинай** (режим `propose`",
+        "и человек не дал другой работы",
+        "в работе или заблокированы",
+        "`missing` — только у `return`, `task` — только у `plan`, иначе 422",
+        "новый первым, до 10",
+        "новой идеи человека (`new`) решения",
+        "очереди нет — разделом `### Идеи`",
     ] {
         assert!(ideas.contains(want), "{want}: {ideas}");
     }
@@ -1456,6 +1466,14 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         "zam idea queue",
         "zam idea review w:<id>",
         "without new arguments",
+        "Do not start the plan in the middle of another task",
+        "**Without the answer “start”, do not start** (`propose` mode",
+        "and the human has not given you other work",
+        "in progress or blocked",
+        "`missing` — only with `return`, `task` — only with `plan`, otherwise 422",
+        "newest first, up to 10",
+        "a new human idea (`new`) of the solution",
+        "without a queue — in the `### Идеи` section",
     ] {
         assert!(ideas.contains(want), "{want}: {ideas}");
     }
