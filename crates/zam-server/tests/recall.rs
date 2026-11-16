@@ -629,6 +629,14 @@ async fn prompt_subagent_handback_silent() {
             "hb4",
             format!("<task-notification>\n<summary>{report}</summary>\n</task-notification>"),
         ),
+        // маркер после 600 пробельных символов — за пределом запроса поиска (512): признак
+        // пересылки — по сырому промпту, как у хука (ревью задачи 2, R2, S2). Различие с проверкой
+        // по запросу ответом не видно: первые 512 символов — пробелы, предмета нет и там; правило
+        // держит юнит-тест `zam-search` `prompt_gate_rules`
+        (
+            "hb7",
+            format!("{}[Subagent hand-back] {report}", " \n\t".repeat(200)),
+        ),
     ] {
         let j = ok(
             &a,
