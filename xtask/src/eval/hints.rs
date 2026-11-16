@@ -93,6 +93,9 @@ const HINTS_MAX: usize = 3;
 /// Тело внутреннего поиска `/recall(prompt)` (`PROMPT_SEARCH_TOP_K`, `PROMPT_SEARCH_BUDGET`).
 const PROMPT_SEARCH_TOP_K: usize = 20;
 const PROMPT_SEARCH_BUDGET: usize = 4000;
+/// Короткий запрос `/recall(prompt)` — предметных слов не больше (`PROMPT_SHORT_WORDS` сервера,
+/// M6.6 §3.2): подсказка — только с лексическим совпадением.
+const PROMPT_SHORT_WORDS: usize = 2;
 /// Пороги `recall.prompt_min_score` для перебора.
 const PROMPT_THRESHOLDS: [f64; 13] = [
     0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90,
@@ -166,13 +169,14 @@ pub struct Case {
     pub note: String,
     /// Происхождение случая ([`SOURCES`]): `m4` (по умолчанию), `task9` (исполнитель задачи 9
     /// M6), `independent` и `independent_b` (два независимых набора ревью задачи 9 — авторы не видели
-    /// код, сетки и результаты).
+    /// код, сетки и результаты), `m66` (случаи тишины M6.6 §3: реплики и пересланные сообщения;
+    /// в решающие части сеток [`grid::DECISION_SOURCES`] не входят).
     #[serde(default = "default_source")]
     pub source: String,
 }
 
 /// Происхождения случаев набора.
-pub const SOURCES: [&str; 4] = ["m4", "task9", "independent", "independent_b"];
+pub const SOURCES: [&str; 5] = ["m4", "task9", "independent", "independent_b", "m66"];
 
 fn default_source() -> String {
     SOURCES[0].to_string()
@@ -1068,9 +1072,33 @@ fn recall(s: &Session, body: &Value) -> Result<(Value, f64)> {
     Ok((v, ms))
 }
 
-/// Кандидаты `prompt` того же внутреннего поиска, что у `/recall(prompt)`.
+/// Правила тишины `/recall(prompt)` до поиска (M6.6 §3.1–§3.3, модель сервера на тех же
+/// функциях): `None` — подсказок поиска нет (пересланное сообщение агента или запрос без
+/// предметных слов), `Some(short)` — поиск идёт, `short` — только карточки лексических каналов.
+pub fn prompt_gate(query: &str) -> Option<bool> {
+    if zam_core::text::is_relayed_message(query) {
+        return None;
+    }
+    let n = zam_search::recall::subject_terms(query).len();
+    (n > 0).then_some(n <= PROMPT_SHORT_WORDS)
+}
+
+/// Карточку нашёл лексический канал (`fts`, `alias`, `trigram` в `sources`) — как у сервера.
+fn lexical_card(it: &Value) -> bool {
+    it["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|s| matches!(s.as_str(), Some("fts" | "alias" | "trigram")))
+}
+
+/// Кандидаты `prompt` того же внутреннего поиска, что у `/recall(prompt)`, с правилами тишины
+/// сервера ([`prompt_gate`]).
 fn prompt_candidates(s: &Session, refs: &RefMap, prompt: &str) -> Result<Vec<PromptCand>> {
     let query: String = prompt.chars().take(512).collect();
+    let Some(short) = prompt_gate(&query) else {
+        return Ok(Vec::new());
+    };
     let body = json!({
         "query": query,
         "scope": {"solution": EVAL_SOLUTION, "include_knowledge": true, "include_rules": true},
@@ -1095,6 +1123,9 @@ fn prompt_candidates(s: &Session, refs: &RefMap, prompt: &str) -> Result<Vec<Pro
     }
     let mut out = Vec::new();
     for it in v["items"].as_array().into_iter().flatten() {
+        if short && !lexical_card(it) {
+            continue;
+        }
         let space = it["space"]["kind"].as_str().unwrap_or_default();
         let r = match (
             it["kind"].as_str(),
@@ -1911,6 +1942,23 @@ mod tests {
         assert_eq!(prompt_pick(&cands, 0.6), ["a", "c", "d"]);
         assert_eq!(prompt_pick(&cands, 0.8), ["a"]);
         assert!(prompt_pick(&cands, 0.95).is_empty());
+    }
+
+    /// Модель правил тишины сервера (M6.6 §3): реплика и пересланное сообщение — без поиска,
+    /// до двух предметных слов — короткий запрос.
+    #[test]
+    fn prompt_gate_matches_server_rules() {
+        assert_eq!(prompt_gate("согласен"), None);
+        assert_eq!(prompt_gate("Да, давай, продолжай"), None);
+        assert_eq!(
+            prompt_gate("[Subagent hand-back] квазар найден в каталоге"),
+            None
+        );
+        assert_eq!(prompt_gate("квазар"), Some(true));
+        assert_eq!(prompt_gate("согласен, мигрируй 0026"), Some(true));
+        assert_eq!(prompt_gate("почему квазар светит ярко"), Some(false));
+        assert!(lexical_card(&json!({"sources": ["vector", "fts"]})));
+        assert!(!lexical_card(&json!({"sources": ["vector"]})));
     }
 
     #[test]

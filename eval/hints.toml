@@ -5,7 +5,9 @@
 # eval/insights.toml, добавляет записи этого файла (`[[insight]]` — с триггерами, `[[rule]]` —
 # заметки Rules) и проверяет случаи `[[case]]`:
 # - `prompt` — `POST /recall {event: prompt}` (поиск по insight и Rules, балл ≥
-#   `recall.prompt_min_score`, до 3 подсказок);
+#   `recall.prompt_min_score`, до 3 подсказок; M6.6 §3: реплика без предметных слов и
+#   пересланное сообщение агента — тишина, запрос до двух предметных слов — только с лексическим
+#   совпадением);
 # - `post_tool` — `POST /recall {event: post_tool, tool: "Bash"}` (`error_regex`, затем FTS по
 #   insight с порогом покрытия слов ошибки);
 # - `pre_tool` — процесс `zam hook pre-tool` (только локально: `file_glob` по пути файла
@@ -652,6 +654,32 @@ input = "how do I center a div with flexbox"
 expected = []
 note = "M6: UI"
 source = "task9"
+
+# M6.6 §3 (замечания 17, 22): реплика и пересланный отчёт субагента — тишина
+
+[[case]]
+id = "p-51"
+event = "prompt"
+input = "согласен"
+expected = []
+note = "M6.6: реплика согласия"
+source = "m66"
+
+[[case]]
+id = "p-52"
+event = "prompt"
+input = "продолжай"
+expected = []
+note = "M6.6: реплика-понукание"
+source = "m66"
+
+[[case]]
+id = "p-53"
+event = "prompt"
+input = "[Subagent hand-back] Готово: в CI на Windows шаг сборки падал из-за CRLF в скрипте deploy.sh; добавил eol=lf в .gitattributes, тесты зелёные."
+expected = []
+note = "M6.6: пересланный отчёт субагента (без маркера тема — h01-sh-lf)"
+source = "m66"
 
 # ======================= случаи: post_tool =======================
 

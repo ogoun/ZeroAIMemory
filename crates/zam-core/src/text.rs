@@ -1,6 +1,8 @@
 //! Общие правила слов текста без зависимостей: стоп-список ru/en (границы разделов чанкера
 //! `zam-markdown`, совпадение слов подсказок `zam-search`). Перенесён из
 //! `zam-markdown::boundary` побайтово (задача 9 M6), чтобы `zam-search` не тянул `zam-markdown`.
+//! Здесь же — признак пересланного сообщения ([`is_relayed_message`], M6.6 §3.3): его читают и
+//! хук `zam hook prompt`, и сервер `/recall`.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -26,6 +28,25 @@ pub fn is_stop_word(w: &str) -> bool {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| STOP_WORDS.split_whitespace().collect())
         .contains(w)
+}
+
+/// Начала пересланных сообщений, которые агент передаёт как промпт пользователя (M6.6 §3.3,
+/// замечание 22; **[решение координатора]**): отчёт субагента Claude Code (`[Subagent
+/// hand-back]`), сообщение агента (`<agent-message …>`) и уведомление фоновой задачи
+/// (`<task-notification>`). Человек так не пишет. Эквивалент у Codex не проверен (журнал этапа
+/// M6.6).
+pub const RELAYED_PREFIXES: [&str; 3] = [
+    "[Subagent hand-back]",
+    "<agent-message",
+    "<task-notification>",
+];
+
+/// Пересланное сообщение, а не слова человека: текст после ведущих пробелов и переводов строк
+/// начинается с одного из [`RELAYED_PREFIXES`] (с учётом регистра). Маркер в середине текста —
+/// слова человека (он мог процитировать отчёт).
+pub fn is_relayed_message(s: &str) -> bool {
+    let s = s.trim_start();
+    RELAYED_PREFIXES.iter().any(|p| s.starts_with(p))
 }
 
 /// Невидимые символы и символы управления форматом (диапазоны включительно): мягкий перенос,
@@ -104,5 +125,34 @@ mod tests {
         let n = STOP_WORDS.split_whitespace().count();
         let set: HashSet<&str> = STOP_WORDS.split_whitespace().collect();
         assert_eq!(set.len(), n);
+    }
+
+    /// M6.6 §3.3 (замечание 22): пересланное сообщение — по началу текста после ведущих
+    /// пробелов и переводов строк, с учётом регистра; маркер в середине — слова человека.
+    #[test]
+    fn relayed_message_prefixes() {
+        for s in [
+            "[Subagent hand-back] Отчёт: квазар найден",
+            "  \n\t[Subagent hand-back]\nОтчёт",
+            "<agent-message from=\"explore\">готово</agent-message>",
+            "\r\n<agent-message>",
+            "<task-notification>\n<task-id>b1</task-id>\n</task-notification>",
+        ] {
+            assert!(is_relayed_message(s), "{s:?}");
+        }
+        for s in [
+            "",
+            "   ",
+            "согласен",
+            "посмотри [Subagent hand-back] выше",
+            "ответ: <agent-message>",
+            "[subagent hand-back] строчными",
+            "[Subagent hand back] без дефиса",
+            "<TASK-NOTIFICATION>",
+            "<agent",
+        ] {
+            assert!(!is_relayed_message(s), "{s:?}");
+        }
+        assert_eq!(RELAYED_PREFIXES.len(), 3);
     }
 }

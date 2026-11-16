@@ -530,6 +530,201 @@ async fn prompt_returns_0_to_3_above_threshold() {
     assert!(ids(&j).len() <= 1, "{j}");
 }
 
+/// Термин словаря в Knowledge; id.
+async fn term(a: &Api, title: &str) -> String {
+    entry(
+        a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "term", "title": title, "body": "",
+               "data": {"definition": format!("Определение: {title}")}}),
+    )
+    .await
+}
+
+/// Тишина `prompt`: пустой `text` и `items`.
+fn assert_silent(j: &Value, what: &str) {
+    assert_eq!(j["text"], "", "{what}: {j}");
+    assert!(j["items"].as_array().unwrap().is_empty(), "{what}: {j}");
+}
+
+/// M6.6 §3.1 (замечание 17): реплика («согласен», «продолжай») — не предмет запроса: ни
+/// подсказок поиска, ни идей, ни задач, даже если слово стоит в теле записи (FTS его находит);
+/// подсказка термина словаря остаётся — имя термина и есть предметное слово. Предметное слово —
+/// подсказка, как раньше.
+#[tokio::test]
+async fn prompt_reply_words_silent() {
+    let a = server("reply-words").await;
+    let id = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Квазар: каталог в одном файле",
+        "Владелец: согласен, каталог квазаров ведём в одном файле. Продолжай так же.",
+        "decision",
+    )
+    .await;
+    for (s, prompt) in [
+        ("rw1", "согласен"),
+        ("rw2", "Согласен, давай"),
+        ("rw3", "продолжай"),
+        ("rw4", "ok, go"),
+    ] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(s),
+            json!({"event": "prompt", "prompt": prompt}),
+        )
+        .await;
+        assert_silent(&j, prompt);
+    }
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rw5"),
+        json!({"event": "prompt", "prompt": "квазар"}),
+    )
+    .await;
+    assert_eq!(ids(&j), [format!("i:{id}")], "{j}");
+    assert_marked(&j);
+    // термин с именем-репликой — строка словаря остаётся (`term_cands`)
+    let t = term(&a, "LGTM").await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rw6"),
+        json!({"event": "prompt", "prompt": "LGTM"}),
+    )
+    .await;
+    assert_eq!(ids(&j), [format!("t:{t}")], "{j}");
+    assert_eq!(j["items"][0]["reason"], "glossary", "{j}");
+}
+
+/// M6.6 §3.3 (замечание 22): пересланное сообщение — отчёт субагента, сообщение агента,
+/// уведомление фоновой задачи — тишина без подсказок терминов (сервер — и для старых клиентов);
+/// тот же текст без маркера — подсказки, как раньше.
+#[tokio::test]
+async fn prompt_subagent_handback_silent() {
+    let a = server("handback").await;
+    let id = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Квазар светит ярче галактики",
+        "Квазар — активное ядро далёкой галактики.",
+        "discovery",
+    )
+    .await;
+    let t = term(&a, "каталог").await;
+    let report = "Готово: проверил квазар, каталог без расхождений.";
+    for (s, msg) in [
+        ("hb1", format!("[Subagent hand-back] {report}")),
+        ("hb2", format!("\n  [Subagent hand-back]\n{report}")),
+        (
+            "hb3",
+            format!("<agent-message from=\"explore\">{report}</agent-message>"),
+        ),
+        (
+            "hb4",
+            format!("<task-notification>\n<summary>{report}</summary>\n</task-notification>"),
+        ),
+    ] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(s),
+            json!({"event": "prompt", "prompt": msg}),
+        )
+        .await;
+        assert_silent(&j, &msg);
+    }
+    // без маркера (и с маркером не в начале) — слова человека
+    for (s, msg) in [
+        ("hb5", report.to_string()),
+        ("hb6", format!("{report} [Subagent hand-back]")),
+    ] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(s),
+            json!({"event": "prompt", "prompt": msg}),
+        )
+        .await;
+        let got = ids(&j);
+        assert!(got.contains(&format!("i:{id}")), "{msg}: {j}");
+        assert!(got.contains(&format!("t:{t}")), "{msg}: {j}");
+    }
+}
+
+/// M6.6 §3.4 (замечание 28б): промпт с почти дословным заголовком открытой задачи —
+/// подсказка-задача `ZeroAIMemory: задача «…» [<статус>] k:<id>` (`reason: task`): одна на
+/// ответ, раз за сессию; закрытая задача и одно общее слово — нет.
+#[tokio::test]
+async fn prompt_task_title_hint() {
+    let a = server("task-title").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let task = |title: &str| json!({"kind": "task", "title": title, "data": {"next_step": "шаг"}});
+    let open = entry(&a, &a.token, G, task("Перенос памяти ZeroAgent")).await;
+    let done = entry(&a, &a.token, G, task("Перенос памяти ZeroAgent в архив")).await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{done}"),
+            Some(json!({"status": "done"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let prompt = "давай займёмся переносом памяти ZeroAgent";
+    let body = json!({"event": "prompt", "solution": G, "prompt": prompt});
+    let j = ok(&a, &a.token, Some("tt1"), body.clone()).await;
+    let line = format!("ZeroAIMemory: задача «Перенос памяти ZeroAgent» [open] k:{open}");
+    let text = j["text"].as_str().unwrap();
+    assert!(text.lines().any(|l| l == line), "{j}");
+    assert!(!text.contains(&done), "закрытая задача: {j}");
+    let tasks: Vec<&Value> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["reason"] == "task")
+        .collect();
+    assert_eq!(tasks.len(), 1, "{j}");
+    assert_eq!(tasks[0]["id"], format!("k:{open}"), "{j}");
+    assert_eq!(tasks[0]["kind"], "task", "{j}");
+    // повтор в той же сессии — нет
+    let j = ok(&a, &a.token, Some("tt1"), body.clone()).await;
+    assert!(!j["text"].as_str().unwrap().contains(&open), "{j}");
+    // одно общее слово с заголовком — нет
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tt2"),
+        json!({"event": "prompt", "solution": G, "prompt": "перенос логов на другой диск"}),
+    )
+    .await;
+    assert!(!j["text"].as_str().unwrap().contains("задача «"), "{j}");
+    // вторая подходящая задача в работе — по-прежнему одна строка на ответ
+    let busy = entry(&a, &a.token, G, task("Перенос памяти ZeroAgent: проверка")).await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{busy}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = ok(&a, &a.token, Some("tt3"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert_eq!(text.matches("задача «").count(), 1, "{j}");
+    assert!(
+        text.contains(&format!("[open] k:{open}"))
+            || text.contains(&format!("[in_progress] k:{busy}")),
+        "{j}"
+    );
+}
+
 /// `post_tool`: совпадение `error_regex` (с учётом `tools`) и FTS по нормализованной ошибке;
 /// строка «эта ошибка уже разбиралась»; случайное общее слово подсказку не поднимает.
 #[tokio::test]

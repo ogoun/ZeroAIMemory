@@ -6,6 +6,12 @@
 //! очередь изменённых файлов сессии уходит `POST /files/changed` параллельно с `/recall` в
 //! том же бюджете ([`cache::flush_changed`]), очередь учёта выданных токенов — так же
 //! ([`cache::flush_tokens`], §9.5).
+//!
+//! M6.6 §3.3 (замечание 22): пересланное сообщение — отчёт субагента, сообщение агента,
+//! уведомление фоновой задачи ([`zam_core::text::is_relayed_message`]) — не слова человека: без
+//! `/recall` и без `Ev::Prompt` в журнале сессии; очереди файлов и токенов уходят как прежде
+//! **[решение координатора; журнал — решение исполнителя, задача 2]**. Сервер отвечает на такие
+//! сообщения тишиной и сам — для клиентов 0.0.12.
 use serde_json::json;
 
 use super::cache;
@@ -21,14 +27,16 @@ pub const PROMPT_SEND_MAX: usize = 2048;
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     let session = inp.session_id.as_deref();
     let raw = inp.str("prompt").unwrap_or_default();
+    // отчёт субагента и уведомление фоновой задачи — не промпт человека (M6.6 §3.3)
+    let relayed = zam_core::text::is_relayed_message(raw);
     if let Some(id) = session {
         cache::write_current_session(env, id);
-        if s.flag_on(Flag::SessionJournal) {
+        if s.flag_on(Flag::SessionJournal) && !relayed {
             let len = raw.chars().count();
             journal::note(env, id, &Ev::Prompt { len });
         }
     }
-    let prompt = Some(raw.trim()).filter(|p| !p.is_empty() && s.on(Kind::Prompt));
+    let prompt = Some(raw.trim()).filter(|p| !p.is_empty() && !relayed && s.on(Kind::Prompt));
     let queued =
         env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
     let tokens = cache::tokens_queued(env, session);

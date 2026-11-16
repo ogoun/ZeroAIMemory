@@ -2230,6 +2230,53 @@ fn prompt_flushes_changed_queue() {
     assert!(ev.iter().any(|e| e["ev"] == "prompt"), "{ev:?}");
 }
 
+/// M6.6 §3.3 (замечание 22): пересланное сообщение (отчёт субагента, уведомление фоновой задачи)
+/// — не слова человека: хук `prompt` молчит, не зовёт `/recall` и не пишет событие `prompt` в
+/// журнал сессии, а очередь `files/changed` уходит как прежде. Тот же текст без маркера — обычный
+/// запрос.
+#[test]
+fn prompt_hook_skips_relayed_message() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"stale":0,"text":""}"#, Duration::ZERO);
+    let p = Proj::new("relayed", &url, "zam_x");
+    let posts = |path: &str| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, q, _)| m == "POST" && q == path)
+            .count()
+    };
+    let msgs = [
+        "[Subagent hand-back] Отчёт: квазар найден, правки в src/a.rs",
+        "\n<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>",
+        "  <agent-message from=\"explore\">готово</agent-message>",
+    ];
+    for (i, msg) in msgs.iter().enumerate() {
+        let s = format!("rl{i}");
+        put_queue(&p, &s, &[("src/a.rs".into(), 'a')]);
+        let pr = p.ev("UserPromptSubmit", &s, json!({"prompt": msg}));
+        let (o, _) = p.hook_content(&url, "prompt", "claude", pr.to_string().as_bytes());
+        empty(&o);
+        assert!(queue(&p, &s).is_empty(), "очередь отправлена: {}", p.log());
+        let ev = events(&p, &s);
+        assert!(!ev.iter().any(|e| e["ev"] == "prompt"), "{msg:?}: {ev:?}");
+    }
+    assert_eq!(posts("/api/v1/recall"), 0, "{:?}", seen.lock().unwrap());
+    assert_eq!(posts("/api/v1/files/changed"), msgs.len(), "{}", p.log());
+    assert!(!p.log().contains("recall(prompt)"), "{}", p.log());
+    // без маркера — обычный запрос и событие журнала
+    let pr = p.ev(
+        "UserPromptSubmit",
+        "rl-plain",
+        json!({"prompt": "Отчёт: квазар найден, правки в src/a.rs"}),
+    );
+    let (o, _) = p.hook_content(&url, "prompt", "claude", pr.to_string().as_bytes());
+    empty(&o);
+    assert_eq!(posts("/api/v1/recall"), 1, "{}", p.log());
+    let ev = events(&p, "rl-plain");
+    assert!(ev.iter().any(|e| e["ev"] == "prompt"), "{ev:?}");
+}
+
 /// `memory_write` из `zam` агента — только в журнал, который уже завели хуки этой сессии;
 /// без журнала команда ничего не создаёт.
 #[test]

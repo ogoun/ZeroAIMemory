@@ -2,12 +2,13 @@
 //! нормализация ошибки инструмента ([`normalize_error`]), сопоставление `error_regex`
 //! ([`error_regex_matches`]), покрытие слов ошибки найденным текстом ([`error_terms`],
 //! [`term_coverage`], [`coverage_enough`] по правилу [`CoverageRule`]: слова как есть или
-//! основы [`StemWord`] — общий код с подсказками-идеями сервера, M6 §9), строка подсказки
-//! ([`hint_line`]) и упаковка дайджеста в бюджет токенов ([`pack_sections`]).
+//! основы [`StemWord`] — общий код с подсказками-идеями сервера, M6 §9), предметные слова
+//! запроса пользователя ([`subject_terms`], M6.6 §3.1), строка подсказки ([`hint_line`]) и
+//! упаковка дайджеста в бюджет токенов ([`pack_sections`]).
 //!
 //! Сервер собирает кандидатов (SQLite, поиск), здесь — только то, что от данных не зависит.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -298,6 +299,97 @@ pub fn stem_words(terms: &[String]) -> Vec<StemWord> {
         .into_iter()
         .map(StemWord::new)
         .collect()
+}
+
+/// Слова-реплики ru/en (M6.6 §3.1, замечание 17): согласие, понукание, благодарность — не
+/// предмет запроса. Сравниваются со словом запроса после [`norm_word`] **целиком**, без основ:
+/// основа «продол» съела бы «продолжительность». Слова короче трёх символов («да», «ок», «go»)
+/// отсекает уже [`error_terms`].
+pub const PROMPT_REPLY_WORDS: [&str; 65] = [
+    "согласен",
+    "согласна",
+    "согласны",
+    "хорошо",
+    "отлично",
+    "супер",
+    "давай",
+    "давайте",
+    "продолжай",
+    "продолжайте",
+    "продолжи",
+    "дальше",
+    "далее",
+    "делай",
+    "делайте",
+    "вперед",
+    "вперёд",
+    "поехали",
+    "погнали",
+    "понял",
+    "поняла",
+    "понятно",
+    "ясно",
+    "принято",
+    "верно",
+    "точно",
+    "конечно",
+    "угу",
+    "ага",
+    "окей",
+    "спасибо",
+    "годится",
+    "подходит",
+    "одобряю",
+    "начинай",
+    "запускай",
+    "готово",
+    "норм",
+    "нормально",
+    "правильно",
+    "именно",
+    "нет",
+    "yes",
+    "yep",
+    "yeah",
+    "sure",
+    "agreed",
+    "agree",
+    "okay",
+    "fine",
+    "great",
+    "good",
+    "thanks",
+    "thank",
+    "continue",
+    "proceed",
+    "next",
+    "lgtm",
+    "done",
+    "right",
+    "correct",
+    "exactly",
+    "please",
+    "ahead",
+    "approved",
+];
+
+/// Слово запроса (уже [`norm_word`]) — реплика [`PROMPT_REPLY_WORDS`].
+fn is_reply_word(w: &str) -> bool {
+    // множество нормализованных слов — один раз на процесс (`вперёд` и `вперед` — одно слово)
+    static SET: OnceLock<HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| PROMPT_REPLY_WORDS.iter().map(|w| norm_word(w)).collect())
+        .contains(w)
+}
+
+/// Предметные слова запроса пользователя (M6.6 §3.1): слова [`error_terms`] (от 3 символов,
+/// нижний регистр) → [`prepared_terms`] при [`WordMatch::Stems`] (без служебных слов ru/en,
+/// [`norm_word`], без повторов, по алфавиту) → без слов-реплик [`PROMPT_REPLY_WORDS`]. Пусто —
+/// запрос без предмета («согласен», «да, давай», «продолжай дальше»): сервер не ищет к нему
+/// подсказок.
+pub fn subject_terms(prompt: &str) -> Vec<String> {
+    let mut out = prepared_terms(&error_terms(prompt), WordMatch::Stems);
+    out.retain(|w| !is_reply_word(w));
+    out
 }
 
 /// Порог покрытия слов запроса текстом записи у ослабленного FTS (любое слово):
@@ -926,5 +1018,46 @@ mod tests {
         let (text, taken) = pack_sections(&secs, 0, &words, &|_| true);
         assert_eq!(taken, [(1, 0), (1, 1)]);
         assert_eq!(text, "### R\nr1 r1 r1\nr2 r2\n");
+    }
+
+    /// M6.6 §3.1 (замечание 17): реплики согласия и служебные слова — не предмет запроса;
+    /// реплики сравниваются целиком (без основ), предметное слово рядом с репликой остаётся.
+    #[test]
+    fn subject_terms_drop_replies_and_stops() {
+        for reply in [
+            "согласен",
+            "Да, давай",
+            "ok go",
+            "продолжай дальше",
+            "Согласен!",
+            "  ок, поехали  ",
+            "Вперёд",
+            "yes, please continue",
+            "LGTM",
+            "",
+        ] {
+            assert!(subject_terms(reply).is_empty(), "{reply:?}");
+        }
+        // служебные слова — тоже не предмет
+        assert!(subject_terms("что это так").is_empty());
+        // слова — в форме `prepared_terms` (нижний регистр, `ё` → `е`, без повторов, по алфавиту)
+        assert_eq!(
+            subject_terms("согласен, мигрируй 0026"),
+            ["0026", "мигрируй"]
+        );
+        assert_eq!(subject_terms("Давай Перенос перенос"), ["перенос"]);
+        // реплика — только целиком: основа «продол» не съедает предметное слово
+        assert_eq!(subject_terms("продолжительность"), ["продолжительность"]);
+        assert_eq!(subject_terms("продолжай индексацию"), ["индексацию"]);
+        // список реплик: нижний регистр, без повторов, только слова от 3 символов (короче
+        // `error_terms` и так отсекает)
+        let mut seen = std::collections::HashSet::new();
+        for w in PROMPT_REPLY_WORDS {
+            assert_eq!(w, w.to_lowercase(), "{w}");
+            assert!(w.chars().count() >= MIN_TERM_CHARS, "{w}");
+            assert!(w.chars().all(char::is_alphanumeric), "{w}");
+            assert!(seen.insert(w), "повтор {w}");
+            assert!(subject_terms(w).is_empty(), "{w}");
+        }
     }
 }

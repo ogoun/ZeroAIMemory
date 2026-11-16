@@ -81,7 +81,15 @@
 //!   перед ними — до [`TERM_HINTS_MAX`] строк словаря (M4.5): имя или псевдоним действующего
 //!   термина решения и Knowledge в первых 512 символах `prompt` —
 //!   `ZeroAIMemory: термин «<имя>» — <определение> t:<id>`, `reason: glossary`, каждый термин
-//!   раз за сессию (`session_seen`); словарь — из кэша [`crate::glossary::GlossaryCache`];
+//!   раз за сессию (`session_seen`); словарь — из кэша [`crate::glossary::GlossaryCache`]; за
+//!   подсказками поиска — до [`TASK_HINTS_MAX`] подсказки-задачи (M6.6 §3.4: заголовок открытой
+//!   задачи решения или Knowledge покрыт промптом — `ZeroAIMemory: задача «…» [<статус>] k:<id>`,
+//!   `reason: task`). Тишина (M6.6 §3): пересланное сообщение агента
+//!   ([`zam_core::text::is_relayed_message`]) — без строк словаря; запрос без предметных слов
+//!   ([`zam_search::recall::subject_terms`] пуст: «согласен», «продолжай») — только строки
+//!   словаря; короткий запрос (до [`PROMPT_SHORT_WORDS`] предметных слов) — подсказка поиска
+//!   только с лексическим совпадением (канал `fts`, `alias` или `trigram`). Подробно — подмодуль
+//!   `prompt`;
 //! - **идеи** (M5.7 §6; `[ideas] proactive` сервера и `ideas.proactive` пользователя): в
 //!   дайджесте `session_start` — раздел `### Идеи` сразу после строки открытых вопросов
 //!   ([`digest_ideas`]: строка-указание и до `ideas.digest_max` строк
@@ -202,11 +210,14 @@
 //! `session_seen`, а не память, поэтому `memory_writes` не растёт (решение контроллера R12).
 //!
 //! Код идей — раздел дайджеста, подсказки к `prompt`, строка плана и пакет `idea_review` — в
-//! подмодуле `ideas` (M6.6 §11.1).
+//! подмодуле `ideas` (M6.6 §11.1); подсказки к запросу `prompt` — разделы ответа, правила тишины
+//! и подсказка-задача — в подмодуле `prompt` (M6.6 §3).
 //!
 //! [`knowledge_ideas_related`]: ideas::knowledge_ideas_related
 //! [`idea_light_search`]: ideas::idea_light_search
+//! [`prompt_ideas`]: ideas::prompt_ideas
 mod ideas;
+mod prompt;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -225,7 +236,7 @@ use zam_search::recall::{
     CoverageQuery, CoverageRule, HINT_PREFIX, Section, error_regex_matches, error_terms, hint_line,
     normalize_error, one_line, pack_sections, reserved_text,
 };
-use zam_search::{truncate_marked, truncate_to_tokens};
+use zam_search::truncate_marked;
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, NodeKind, RECALL_PART,
     SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind, UsageEvent,
@@ -254,12 +265,15 @@ pub use ideas::{
 };
 use ideas::{
     REASON_IDEA, REASON_IDEA_REVIEW, digest_ideas, ideas_enabled, ideas_section_head, plan_line,
-    prompt_ideas, review_pack, review_shown_line, solution_ideas_mode,
+    review_pack, review_shown_line, solution_ideas_mode,
 };
 #[cfg(feature = "test-hooks")]
 pub use ideas::{
     TEST_IDEA_LIGHT_OFF, TEST_IDEA_SEARCH_TIMES, TEST_SECOND_PASS_QUERIES, TEST_SLOW_IDEA_MARK,
 };
+use prompt::prompt_sections;
+// пределы подсказок к запросу — по путям `api::recall::…`, как `PROMPT_MAX` и `TERM_HINTS_MAX`
+pub use prompt::{PROMPT_SHORT_WORDS, TASK_HINTS_MAX};
 
 /// Предупреждение: сбор подсказок не уложился в `recall.timeout_ms`.
 pub const WARN_RECALL_TIMEOUT: &str = "recall timeout";
@@ -299,6 +313,9 @@ pub const PROMPT_MAX: usize = 3;
 pub const TERM_HINTS_MAX: usize = 2;
 /// `reason` подсказки термина словаря.
 const REASON_GLOSSARY: &str = "glossary";
+/// `reason` задачи: раздел `### Задачи` дайджеста и пакетов, подсказка-задача к `prompt`
+/// (M6.6 §3.4).
+const REASON_TASK: &str = "task";
 /// `reason` записи о файле пакета под задачу: ревизия неизвестна (индекс ссылок её не несёт),
 /// поэтому показ в `session_seen` не отмечается — иначе он гасил бы подсказки `prompt`.
 const REASON_FILE: &str = "file";
@@ -1047,7 +1064,7 @@ async fn task_cands(
     Ok(rows
         .iter()
         .map(|(i, e)| {
-            let mut c = entry_cand(*i, e, "task", "");
+            let mut c = entry_cand(*i, e, REASON_TASK, "");
             let mark = (e.status == Some(EntryStatus::Open)).then(|| match session {
                 _ if mine(e) => mine_mark,
                 Some(_) => CLAIMED_OTHER,
@@ -2565,136 +2582,6 @@ async fn term_cands(
     out
 }
 
-/// `prompt`: внутренний `POST /search` (см. модуль) и отбор insight и заметок Rules.
-async fn prompt_hints(
-    st: &AppState,
-    p: &Principal,
-    headers: &HeaderMap,
-    req: &RecallReq,
-    health: &mut Health<'_>,
-    deadline: &mut Deadline,
-) -> Result<Vec<Cand>, ApiError> {
-    let query: String = req
-        .prompt
-        .as_deref()
-        .unwrap_or_default()
-        .chars()
-        .take(zam_store::search::QUERY_MAX_CHARS)
-        .collect();
-    if query.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let body = json!({
-        "query": query,
-        "scope": {"solution": req.solution, "include_knowledge": true, "include_rules": true},
-        "filters": {"kinds": ["insight", "note"]},
-        "mode": "brief",
-        "top_k": PROMPT_SEARCH_TOP_K,
-        "budget_tokens": PROMPT_SEARCH_BUDGET,
-        // отсечка карточек поиска (M6 §4.2) — не для подсказок: у них свой порог балла
-        "brief_min_rel": 0.0,
-        "rerank": "off",
-        "skip_seen": false,
-        "no_cache": true,
-        "format": "json",
-    });
-    let area = req.area.as_deref();
-    let Some(v) = inner_search(st, p, headers, area, body, None, health, deadline).await? else {
-        return Ok(Vec::new());
-    };
-    let min = prompt_min_score(st, &v);
-    let targets = health.targets();
-    let mut out: Vec<Cand> = Vec::new();
-    for it in v["items"].as_array().into_iter().flatten() {
-        if it["score"].as_f64().unwrap_or(0.0) < min {
-            continue;
-        }
-        let space_kind = it["space"]["kind"].as_str().unwrap_or_default();
-        let kind = it["kind"].as_str().unwrap_or_default();
-        let (tref, raw_id) = match (kind, it["entry_id"].as_str(), it["node_id"].as_str()) {
-            ("insight", Some(id), _) => (TargetKind::Entry, id),
-            ("note", _, Some(id)) if space_kind == "rules" => (TargetKind::Node, id),
-            _ => continue,
-        };
-        let Ok(id) = raw_id.parse::<Id>() else {
-            continue;
-        };
-        let Some(space) = it["space"]["id"]
-            .as_str()
-            .and_then(|s| s.parse::<Id>().ok())
-        else {
-            continue;
-        };
-        let Some(target) = targets
-            .iter()
-            .position(|t| t.spaces.iter().any(|s| s.id == space))
-        else {
-            continue;
-        };
-        let certainty = it["certainty"].as_str().map(str::to_string);
-        let snippet = one_line(
-            &it["snippet"]
-                .as_str()
-                .unwrap_or_default()
-                .replace([zam_store::MARK_START, zam_store::MARK_END], ""),
-        );
-        let snippet =
-            truncate_to_tokens(&snippet, st.cfg.recall.snippet_tokens, &count_tokens).to_string();
-        let (reference, title, lead, tags, out_kind, reason) = match tref {
-            TargetKind::Entry => (
-                format!("i:{id}"),
-                it["title"].as_str().unwrap_or_default().to_string(),
-                "",
-                it["insight_kind"].as_str().unwrap_or_default().to_string(),
-                "insight",
-                "search",
-            ),
-            TargetKind::Node => {
-                let path = it["path"].as_str().unwrap_or_default();
-                let hp = it["heading_path"].as_str().unwrap_or_default();
-                let title = if hp.is_empty() {
-                    path.to_string()
-                } else {
-                    format!("{path} › {hp}")
-                };
-                (
-                    format!("n:{id}"),
-                    title,
-                    "правило ",
-                    String::new(),
-                    "note",
-                    "rules",
-                )
-            }
-            // вложения в подсказки не входят: виды внутреннего поиска заданы явно (`note`, `insight`)
-            TargetKind::Attachment => continue,
-        };
-        let mut block = hint_line(
-            lead,
-            &title,
-            &[tags.as_str(), certainty.as_deref().unwrap_or_default()],
-            &reference,
-        );
-        if !snippet.is_empty() {
-            block.push_str("\n  ");
-            block.push_str(&snippet);
-        }
-        out.push(Cand {
-            target,
-            tref: TargetRef { kind: tref, id },
-            rev: it["rev"].as_i64().unwrap_or(0),
-            reference,
-            kind: out_kind,
-            title,
-            certainty,
-            reason,
-            block,
-            age_days: item_age(it),
-        });
-    }
-    Ok(out)
-}
-
 /// Порог балла подсказки к `prompt` по ответу внутреннего поиска `search`: поиск деградировал до
 /// FTS (`degraded`) — `recall.prompt_min_score_fts` (не задан — `prompt_min_score`), иначе
 /// `recall.prompt_min_score` (M6 §9).
@@ -3024,7 +2911,8 @@ async fn record(
 
 /// Предел подсказок раздела `title`: у пакета под задачу — свои (§9.4), у дайджеста — по
 /// разделу (`entries` — `recall.digest_entries`, M6 §8), у разделов без заголовка — строки
-/// словаря или общий предел события `limit`.
+/// словаря, подсказки-задачи `prompt` ([`TASK_HINTS_MAX`], M6.6 §3.4), идеи или общий предел
+/// события `limit`.
 fn section_limit(
     event: Event,
     title: Option<&str>,
@@ -3050,6 +2938,7 @@ fn section_limit(
         Some("### Решение") => SOLUTION_ROOT_MAX,
         Some(_) => entries,
         None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,
+        None if cands.iter().any(|c| c.reason == REASON_TASK) => TASK_HINTS_MAX,
         None if cands
             .iter()
             .any(|c| matches!(c.reason, REASON_IDEA | REASON_IDEA_REVIEW)) =>
@@ -3564,24 +3453,13 @@ pub async fn recall(
             }
             (l, s, true)
         }
+        // словарь, поиск, задача, идеи — у каждого раздела свой предел (подмодуль `prompt`)
         Event::Prompt => {
-            // строки словаря — перед подсказками insight; у каждого свой предел
-            let prompt = req.prompt.as_deref().unwrap_or_default();
-            let chars = crate::glossary::HINT_TEXT_CHARS;
-            let terms = term_cands(&st, prompt, chars, &mut health, &mut deadline).await;
-            let c = prompt_hints(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
-            // идеи — отдельным поиском после основного, своей строкой и своим пределом
-            let ideas = if ideas_on {
-                let s = session.as_ref();
-                prompt_ideas(&st, &p, &sh, &req, s, &mut health, &deadline, review).await?
-            } else {
-                Vec::new()
-            };
-            (
-                Lines::default(),
-                vec![(None, terms), (None, c), (None, ideas)],
-                false,
-            )
+            let s = session.as_ref();
+            let ideas = ideas_on.then_some(review);
+            let secs =
+                prompt_sections(&st, &p, &sh, &req, s, ideas, &mut health, &mut deadline).await?;
+            (Lines::default(), secs, false)
         }
         Event::PostTool => {
             let rule = st.cfg.recall.post_tool_coverage;
