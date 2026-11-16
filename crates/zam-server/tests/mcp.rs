@@ -2890,6 +2890,380 @@ async fn mcp_propose_reopen_dropped_task() {
     assert!(o.text.contains(&format!("Идея w:{id}: new")), "{}", o.text);
 }
 
+// ---- разбор идей агентом (M6.5 §5, §7, задача 5) ----
+
+/// Разбор не короче `ideas.review_min_chars` (200).
+fn review_summary() -> String {
+    let s = "Идея просит показывать статус разбора в ленте. В плане такого пункта нет, в ТЗ §7 \
+             журнал «Идеи» описан без статусов разбора, сделанного по теме нет. Решение — в план: \
+             это канал обратной связи обкатки, без него владелец не видит, что стало с идеей."
+        .to_string();
+    assert!(s.chars().count() >= 200, "{}", s.chars().count());
+    s
+}
+
+/// Сервер `name` с решением `G` администратора; срок `/recall` поднят (отладочная сборка на HDD).
+async fn review_world(name: &str) -> Api {
+    let a = api(name, |c| c.recall.timeout_ms = 30_000).await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    a
+}
+
+/// Заголовки сессии и решения `G`.
+fn sol_sess() -> [(&'static str, &'static str); 3] {
+    [
+        ("x-zam-session", SESSION),
+        ("x-zam-machine", MACHINE),
+        ("x-zam-solution", G),
+    ]
+}
+
+/// Идея человека в решении `G` через MCP (пространство по умолчанию — решение заголовка): `id`.
+async fn mcp_sol_idea(a: &Api, title: &str, body: &str) -> String {
+    let o = ok(
+        a,
+        &a.token,
+        &sol_sess(),
+        "memory_log",
+        json!({"kind": "idea", "title": title, "body": body, "data": {"origin": "human"}}),
+    )
+    .await;
+    assert!(o.text.starts_with("Записано w:"), "{}", o.text);
+    o.text
+        .trim_start_matches("Записано w:")
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// Задачи решения `G` (REST).
+async fn sol_tasks(a: &Api) -> Vec<Value> {
+    let r = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/spaces/{G}/entries?kind=task"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"].as_array().unwrap().clone()
+}
+
+/// M6.5 §5 (задача 5): `memory_update_entry action=review`. Без `summary` — ошибка инструмента с
+/// полем (422 REST), идея остаётся `new`; план шагов на верхнем уровне (`body`) — ошибка с
+/// подсказкой `task.body`; `plan` с `task.body` — одна строка «Идея w:<id>: В плане · разбор plan
+/// → задача k:<id>», задача `open` в решении с планом и приоритетом; повтор с тем же
+/// `idempotency_key` — тот же итог с пометкой повтора, без второй задачи; второй разбор без ключа
+/// — 409 `transition-not-allowed`; `decline` — подпись «Отклонена», без задачи; `format: json` —
+/// ответ REST; неизвестное действие называет `review`.
+#[tokio::test]
+async fn mcp_review_plan_and_errors() {
+    let a = review_world("mcp-review").await;
+    let h = sol_sess();
+    let id = mcp_sol_idea(
+        &a,
+        "Статусы разбора в ленте",
+        "Показывать в ленте, что стало с идеей.",
+    )
+    .await;
+    let w = format!("w:{id}");
+    let o = tool(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        json!({"id": w, "action": "review", "outcome": "plan"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("Ошибка 422"), "{}", o.text);
+    assert!(o.text.contains("summary"), "{}", o.text);
+    let o = tool(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        json!({"id": w, "action": "review", "outcome": "plan", "summary": review_summary(),
+               "body": "1. Статусы в ленте"}),
+    )
+    .await;
+    assert!(o.is_error, "план шагов не теряется молча: {}", o.text);
+    assert!(o.text.contains("task.body"), "{}", o.text);
+    let st = a
+        .t(Method::GET, &format!("/api/v1/entries/{id}"), None)
+        .await
+        .json();
+    assert_eq!(st["status"], "new", "{st}");
+
+    let args = json!({"id": w, "action": "review", "outcome": "plan", "summary": review_summary(),
+                      "task": {"body": "1. Статусы в ленте\n2. Плашка разбора", "priority": "high"},
+                      "idempotency_key": "mcp-review-plan-1"});
+    let o = ok(&a, &a.token, &h, "memory_update_entry", args.clone()).await;
+    let head = format!("Идея w:{id}: В плане · разбор plan → задача k:");
+    assert!(o.text.starts_with(&head), "{}", o.text);
+    assert_eq!(body_lines(&o).len(), 1, "{}", o.text);
+    let tid = o.text[head.len()..]
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .unwrap()
+        .to_string();
+    let idea = a
+        .t(Method::GET, &format!("/api/v1/entries/{id}"), None)
+        .await
+        .json();
+    assert_eq!(idea["status"], "accepted", "{idea}");
+    assert_eq!(idea["data"]["task_id"], tid.as_str(), "{idea}");
+    assert_eq!(idea["data"]["review"]["outcome"], "plan", "{idea}");
+    let t = a
+        .t(Method::GET, &format!("/api/v1/entries/{tid}"), None)
+        .await
+        .json();
+    assert_eq!(t["kind"], "task", "{t}");
+    assert_eq!(t["status"], "open", "{t}");
+    assert_eq!(t["data"]["priority"], "high", "{t}");
+    assert!(
+        t["body"].as_str().unwrap().contains("2. Плашка разбора"),
+        "{t}"
+    );
+
+    // повтор после сбоя связи: тот же ключ — тот же итог, второй задачи нет
+    let o = ok(&a, &a.token, &h, "memory_update_entry", args.clone()).await;
+    assert!(o.text.starts_with(&format!("{head}{tid}")), "{}", o.text);
+    assert!(o.text.contains("повтор"), "{}", o.text);
+    assert_eq!(body_lines(&o).len(), 1, "{}", o.text);
+    assert_eq!(sol_tasks(&a).await.len(), 1);
+    // второй разбор той же идеи без ключа — 409
+    let mut again = args.clone();
+    again.as_object_mut().unwrap().remove("idempotency_key");
+    let o = tool(&a, &a.token, &h, "memory_update_entry", again).await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("Ошибка 409"), "{}", o.text);
+    assert!(o.text.contains("transition-not-allowed"), "{}", o.text);
+    assert_eq!(sol_tasks(&a).await.len(), 1);
+
+    // decline — подпись статуса, без задачи
+    let d = mcp_sol_idea(&a, "Звук уведомлений", "Звуковой сигнал при новой идее.").await;
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        json!({"id": format!("w:{d}"), "action": "review", "outcome": "decline",
+               "summary": review_summary()}),
+    )
+    .await;
+    assert_eq!(
+        body_lines(&o),
+        [format!("Идея w:{d}: Отклонена · разбор decline")],
+        "{}",
+        o.text
+    );
+    // format: json — ответ REST {entry, replay}
+    let r = mcp_sol_idea(&a, "Экспорт ленты", "Выгрузка ленты идей.").await;
+    let j = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        json!({"id": format!("w:{r}"), "action": "review", "outcome": "return",
+               "summary": review_summary(), "missing": "Куда выгружать: файл или почта?",
+               "format": "json"}),
+    )
+    .await
+    .json();
+    assert_eq!(j["entry"]["status"], "returned", "{j}");
+    assert_eq!(j["replay"], false, "{j}");
+    assert!(j.get("task").is_none(), "{j}");
+    // неизвестное действие — подсказка называет review
+    let o = tool(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        json!({"id": w, "action": "nope"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("review"), "{}", o.text);
+}
+
+/// M6.5 §7 (задача 5): `memory_recall event=idea_review` — пакет разбора со строкой шагов;
+/// `limit: 1` — одна идея (самая старая) из двух; без `limit` — обе; `limit` доходит до REST:
+/// вне 1..=20 — ошибка 400 с полем.
+#[tokio::test]
+async fn mcp_recall_idea_review_limit() {
+    let a = review_world("mcp-review-pack").await;
+    let h = sol_sess();
+    let first = mcp_sol_idea(&a, "Экспорт отчётов", "Выгрузка отчётов в PDF.").await;
+    let second = mcp_sol_idea(&a, "Тёмная тема", "Тёмная тема интерфейса.").await;
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_recall",
+        json!({"event": "idea_review", "limit": 1}),
+    )
+    .await;
+    assert!(o.text.starts_with("### Идеи на разбор\n"), "{}", o.text);
+    assert!(
+        o.text.contains(zam_server::api::recall::IDEA_REVIEW_STEPS),
+        "строка шагов разбора: {}",
+        o.text
+    );
+    assert!(o.text.contains(&format!("— w:{first}\n")), "{}", o.text);
+    assert!(!o.text.contains(&format!("— w:{second}\n")), "{}", o.text);
+    assert_eq!(
+        o.text.matches("ZeroAIMemory: идея «").count(),
+        1,
+        "{}",
+        o.text
+    );
+    assert!(
+        o.text.contains("Показано идей на разбор: 1 из 2."),
+        "{}",
+        o.text
+    );
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_recall",
+        json!({"event": "idea_review"}),
+    )
+    .await;
+    assert!(o.text.contains(&format!("— w:{second}\n")), "{}", o.text);
+    assert!(
+        o.text.contains("Показано идей на разбор: 2 из 2."),
+        "{}",
+        o.text
+    );
+    for l in [0, 21] {
+        let o = tool(
+            &a,
+            &a.token,
+            &h,
+            "memory_recall",
+            json!({"event": "idea_review", "limit": l}),
+        )
+        .await;
+        assert!(o.is_error, "{l}: {}", o.text);
+        assert!(o.text.contains("Ошибка 400"), "{l}: {}", o.text);
+        assert!(o.text.contains("limit"), "{l}: {}", o.text);
+    }
+}
+
+/// Строки `description` схемы `v` с путями полей (вложенные `properties` и `items` — тоже).
+fn schema_descriptions(v: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    let Some(o) = v.as_object() else { return };
+    if let Some(d) = o.get("description").and_then(Value::as_str) {
+        out.push((path.to_string(), d.to_string()));
+    }
+    if let Some(p) = o.get("properties").and_then(Value::as_object) {
+        for (k, x) in p {
+            schema_descriptions(x, &format!("{path}.{k}"), out);
+        }
+    }
+    if let Some(x) = o.get("items") {
+        schema_descriptions(x, &format!("{path}[]"), out);
+    }
+}
+
+/// M6.5 §5 (задача 5): разбор — через прежние инструменты, их по-прежнему 11. В схеме
+/// `memory_update_entry` — действие `review` и поля разбора с описаниями, `rev` у `review` не
+/// нужна; в `memory_recall` — событие `idea_review` и `limit` 1..=20. Описания этих инструментов
+/// и всех их полей (с вложенными) — до 300 символов.
+#[tokio::test]
+async fn mcp_tools_still_eleven() {
+    let a = api("mcp-review-schema", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let tools = list["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 11, "{list}");
+    let def = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("нет {name}"))
+            .clone()
+    };
+    let upd = def("memory_update_entry");
+    let d = upd["description"].as_str().unwrap();
+    assert!(d.contains("review — разбор идеи (outcome, summary)"), "{d}");
+    let p = &upd["inputSchema"]["properties"];
+    let actions = p["action"]["enum"].as_array().unwrap();
+    assert!(actions.contains(&json!("review")), "{upd}");
+    assert_eq!(
+        p["outcome"]["enum"],
+        json!(["plan", "return", "decline", "done"]),
+        "{upd}"
+    );
+    for k in [
+        "outcome",
+        "summary",
+        "missing",
+        "basis",
+        "similar",
+        "task",
+        "idempotency_key",
+    ] {
+        assert!(
+            p[k]["description"]
+                .as_str()
+                .is_some_and(|s| s.contains("review")),
+            "memory_update_entry.{k}: {upd}"
+        );
+    }
+    for k in ["basis", "similar"] {
+        assert_eq!(p[k]["type"], "array", "{k}: {upd}");
+        assert_eq!(p[k]["items"]["type"], "string", "{k}: {upd}");
+    }
+    assert_eq!(p["task"]["type"], "object", "{upd}");
+    for k in ["id", "title", "body", "priority"] {
+        assert!(p["task"]["properties"][k].is_object(), "task.{k}: {upd}");
+    }
+    assert_eq!(
+        p["task"]["properties"]["priority"]["enum"],
+        json!(["low", "normal", "high"]),
+        "{upd}"
+    );
+    assert!(
+        p["rev"]["description"].as_str().unwrap().contains("review"),
+        "rev не нужна у review: {upd}"
+    );
+    let rec = def("memory_recall");
+    assert!(
+        rec["description"].as_str().unwrap().contains("idea_review"),
+        "{rec}"
+    );
+    let rp = &rec["inputSchema"]["properties"];
+    assert!(
+        rp["event"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("idea_review")),
+        "{rec}"
+    );
+    assert_eq!(rp["limit"]["type"], "integer", "{rec}");
+    assert_eq!(rp["limit"]["minimum"], 1, "{rec}");
+    assert_eq!(rp["limit"]["maximum"], 20, "{rec}");
+    assert!(
+        rp["limit"]["description"]
+            .as_str()
+            .is_some_and(|s| s.contains("idea_review")),
+        "{rec}"
+    );
+    for t in [&upd, &rec] {
+        let n = t["description"].as_str().unwrap().chars().count();
+        assert!(n <= 300, "{}: {n} символов", t["name"]);
+        let mut all = Vec::new();
+        schema_descriptions(&t["inputSchema"], t["name"].as_str().unwrap(), &mut all);
+        for (path, d) in all {
+            let n = d.chars().count();
+            assert!(n <= 300, "{path}: {n} символов");
+        }
+    }
+}
+
 // ---- M6 §7.1: сессия MCP — явная или никакая ----
 
 /// `~N tok` последней строки ответа инструмента.
