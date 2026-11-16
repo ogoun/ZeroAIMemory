@@ -36,16 +36,16 @@ use crate::config::IdeasMode;
 use crate::error::ApiError;
 
 /// Заголовок раздела идей дайджеста (M5.7 §6.1): сразу после строки открытых вопросов.
-pub(super) const SECTION_IDEAS: &str = "### Идеи";
+const SECTION_IDEAS: &str = "### Идеи";
 /// Строка-указание под заголовком [`SECTION_IDEAS`]: правило «без ответа не начинай» приходит
 /// ровно тогда, когда идея предложена (блок инструкции v6 тратит на него одну строку).
-pub(super) const IDEAS_HINT: &str = "Предложи человеку одну: memory_update_entry action=propose — \
-    вопрос «начать / отложить / отказаться»; без ответа «начать» не начинай.";
+const IDEAS_HINT: &str = "Предложи человеку одну: memory_update_entry action=propose — вопрос \
+    «начать / отложить / отказаться»; без ответа «начать» не начинай.";
 /// Добавка к [`IDEAS_HINT`], если в разделе есть идея со снятой задачей (ревью задачи 7, M3).
-pub(super) const IDEAS_HINT_REOPEN: &str =
-    " Со снятой задачей — предложи вернуть: propose с text, почему пора; решает человек.";
+const IDEAS_HINT_REOPEN: &str = " Со снятой задачей — предложи вернуть: propose с text, почему \
+    пора; решает человек.";
 /// Хвост пометки строки идеи со снятой задачей (§16, п. 1).
-pub(super) const REOPEN_MARK_TAIL: &str = "можно предложить вернуть";
+const REOPEN_MARK_TAIL: &str = "можно предложить вернуть";
 /// `reason` подсказки-идеи (дайджест и `prompt`).
 pub(super) const REASON_IDEA: &str = "idea";
 /// Предел заголовка идеи в строке дайджеста и подсказки, символов.
@@ -218,8 +218,30 @@ fn idea_cand(target: usize, e: &Entry, reason: &'static str, block: String) -> C
 }
 
 /// Строка-указание [`IDEAS_REVIEW_HINT`] с длиной очереди `n`.
-pub(super) fn ideas_review_hint(n: usize) -> String {
+fn ideas_review_hint(n: usize) -> String {
     IDEAS_REVIEW_HINT.replace("{n}", &n.to_string())
+}
+
+/// Заголовок раздела идей дайджеста со строкой-указанием (раскладка [`super::arrange`]) и
+/// признак очереди разбора. Есть идея очереди (M6.5 §7) — [`SECTION_IDEAS_REVIEW`] и
+/// [`IDEAS_REVIEW_HINT`] с длиной очереди `queue`: хвост кандидатов предложения несёт указание
+/// `propose` в строке ([`idea_tail_line`]). Иначе — [`SECTION_IDEAS`] и [`IDEAS_HINT`], с
+/// добавкой [`IDEAS_HINT_REOPEN`], если в разделе есть идея со снятой задачей.
+pub(super) fn ideas_section_head(ideas: &[&Cand], queue: usize) -> (String, bool) {
+    let review = ideas.iter().any(|c| c.reason == REASON_IDEA_REVIEW);
+    let head = if review {
+        format!("{SECTION_IDEAS_REVIEW}\n{}", ideas_review_hint(queue))
+    } else {
+        format!(
+            "{SECTION_IDEAS}\n{IDEAS_HINT}{}",
+            if ideas.iter().any(|c| c.block.contains(REOPEN_MARK_TAIL)) {
+                IDEAS_HINT_REOPEN
+            } else {
+                ""
+            }
+        )
+    };
+    (head, review)
 }
 
 /// Строка-хвост раздела [`SECTION_IDEAS_REVIEW`] (M6.5 §7, «прочие случаи M5.7»): идея, которую

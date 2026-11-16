@@ -253,9 +253,8 @@ pub use ideas::{
     SECTION_IDEAS_REVIEW,
 };
 use ideas::{
-    IDEAS_HINT, IDEAS_HINT_REOPEN, REASON_IDEA, REASON_IDEA_REVIEW, REOPEN_MARK_TAIL,
-    SECTION_IDEAS, digest_ideas, ideas_enabled, ideas_review_hint, plan_line, prompt_ideas,
-    review_pack, review_shown_line, solution_ideas_mode,
+    REASON_IDEA, REASON_IDEA_REVIEW, digest_ideas, ideas_enabled, ideas_section_head, plan_line,
+    prompt_ideas, review_pack, review_shown_line, solution_ideas_mode,
 };
 #[cfg(feature = "test-hooks")]
 pub use ideas::{
@@ -3065,12 +3064,12 @@ fn section_limit(
 /// подсказки записей — уведомления, словарь, открытые вопросы, карта кода, — пустой список: ни
 /// `session_seen`, ни `usage`). Уведомления — первыми; в пакете восстановления — после задач,
 /// ответов и решений (§9.2), а если других разделов нет — в конце. Открытые вопросы — после
-/// ответов (в пакете — вместе с уведомлениями), за ними — раздел [`SECTION_IDEAS`] (`ideas`,
-/// строка-указание — в заголовке: она выводится, только если вошла хоть одна идея; есть идея
-/// очереди разбора — раздел [`SECTION_IDEAS_REVIEW`] со строкой [`IDEAS_REVIEW_HINT`], M6.5
-/// §7), строки словаря, проверенных команд и карты кода и мини-карта [`SECTION_CODE_MAP`] —
-/// после правил. Строка плана из идей — сразу за задачами. Раздел пакета `idea_review` — со
-/// строкой шагов разбора [`IDEA_REVIEW_STEPS`] в заголовке.
+/// ответов (в пакете — вместе с уведомлениями), за ними — раздел `### Идеи` (`ideas`,
+/// строка-указание — в заголовке [`ideas_section_head`]: она выводится, только если вошла хоть
+/// одна идея; есть идея очереди разбора — раздел [`SECTION_IDEAS_REVIEW`] со строкой
+/// [`IDEAS_REVIEW_HINT`], M6.5 §7), строки словаря, проверенных команд и карты кода и мини-карта
+/// [`SECTION_CODE_MAP`] — после правил. Строка плана из идей — сразу за задачами. Раздел пакета
+/// `idea_review` — со строкой шагов разбора [`IDEA_REVIEW_STEPS`] в заголовке.
 /// `rules_reserved` — раздел Rules — резерв сверх бюджета (дайджест и пакет восстановления,
 /// M6 §8; у `brief` — L0 Rules в бюджете).
 fn arrange<'c>(
@@ -3148,21 +3147,8 @@ fn arrange<'c>(
             out.omit_last(OMIT_OPEN_QUESTIONS);
         }
         if title == Some(SECTION_ANSWERS) && !recovery && !ideas.is_empty() {
-            // очередь разбора (M6.5 §7) — свой заголовок и строка-указание; хвост кандидатов
-            // предложения несёт указание `propose` в строке ([`idea_tail_line`])
-            let review = ideas.iter().any(|c| c.reason == REASON_IDEA_REVIEW);
-            let head = if review {
-                format!("{SECTION_IDEAS_REVIEW}\n{}", ideas_review_hint(ideas_queue))
-            } else {
-                format!(
-                    "{SECTION_IDEAS}\n{IDEAS_HINT}{}",
-                    if ideas.iter().any(|c| c.block.contains(REOPEN_MARK_TAIL)) {
-                        IDEAS_HINT_REOPEN
-                    } else {
-                        ""
-                    }
-                )
-            };
+            // очередь разбора (M6.5 §7) — свой заголовок и строка-указание
+            let (head, review) = ideas_section_head(&ideas, ideas_queue);
             let mut sec = Section::new(Some(head), ideas.iter().map(|c| c.block.clone()).collect());
             sec.keep = KEEP_MANDATORY;
             sec.omit = Some(if review {
