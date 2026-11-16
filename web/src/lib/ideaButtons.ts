@@ -3,9 +3,11 @@
 // «Группировать по статусу», разбор агента (строка решения ленты, ссылки «Опирался на»), поля идеи.
 // Импортирует только `IdeasView` — модуль живёт в его ленивом чанке; общее с «Вопросами» — в
 // `ideaForms.ts`. Вёрстка — в компоненте. Зависимости времени выполнения — `ideaForms.ts` и
-// `ideaStatus.ts` (с расширением: модуль проверяется `node --test`), остальное — `import type`.
+// `ideaStatus.ts`, `entryRefs.ts` (с расширением: модуль проверяется `node --test`), остальное —
+// `import type`.
 import type { Entry, EntryStatus, IdeaDecision, IdeaReview, ReviewOutcome } from './api';
 import { DEFER_FORM, START_SUBMIT, type FormText, type IdeaForm } from './ideaForms.ts';
+import { JOURNAL_OF_LETTER } from './entryRefs.ts';
 import { IDEA_STATUSES, IDEA_STATUS_TEXT, type IdeaStatus } from './ideaStatus.ts';
 import type { IdeaPriority } from './journals';
 import type { Journal } from './router';
@@ -243,42 +245,37 @@ export function clip(s: string, n: number): string {
 /** Ссылки на сделанное — для строки «Сделано: …» (как правило сервера у исхода `done`). */
 const DONE_PREFIXES = ['c:', 'r:', 'commit:', 'k:'];
 
+/** Строка решения ленты: исход разбора (`kind`, пусто — строки нет) и текст. */
+export interface ReviewLine {
+  kind: ReviewOutcome | '';
+  text: string;
+}
+
 /**
  * Строка решения ленты (M6.5 §9): «В план → k:<id> «…»» (заголовок задачи, если известен) |
- * «Не хватает: <60 символов>» | «Отклонена: <60 символов разбора>» | «Сделано: <ссылка>». Пусто —
- * разбора нет или он уже не определяет состояние идеи ({@link reviewCurrent}).
+ * «Не хватает: <60 символов>» | «Отклонена: <60 символов разбора>» | «Сделано: <ссылка>». Пусто
+ * (`kind: ''`) — разбора нет или он уже не определяет состояние идеи ({@link reviewCurrent}).
  */
-export function reviewLine(e: Entry): string {
+export function reviewLine(e: Entry): ReviewLine {
   const r = reviewOf(e);
-  if (!r || !reviewCurrent(e)) return '';
+  if (!r || !reviewCurrent(e)) return { kind: '', text: '' };
+  const line = (text: string): ReviewLine => ({ kind: r.outcome, text });
   switch (r.outcome) {
     case 'plan': {
       const ref = r.task ?? (typeof e.data.task_id === 'string' ? `k:${e.data.task_id}` : '');
       const title = e.task && !e.task.deleted ? (e.task.title ?? '') : '';
-      return `В план → ${ref}${title ? ` «${clip(title, 60)}»` : ''}`.trimEnd();
+      return line(`В план → ${ref}${title ? ` «${clip(title, 60)}»` : ''}`.trimEnd());
     }
     case 'return':
-      return `Не хватает: ${clip(r.missing ?? '', 60)}`;
+      return line(`Не хватает: ${clip(r.missing ?? '', 60)}`);
     case 'decline':
-      return `Отклонена: ${clip(r.summary, 60)}`;
+      return line(`Отклонена: ${clip(r.summary, 60)}`);
     case 'done': {
       const ref = r.basis.find((b) => DONE_PREFIXES.some((p) => b.startsWith(p))) ?? r.basis[0] ?? '';
-      return ref ? `Сделано: ${ref}` : 'Сделано';
+      return line(ref ? `Сделано: ${ref}` : 'Сделано');
     }
   }
 }
-
-/** Буква ссылки записи → журнал (буквы — как `REF_LETTER` в `journals.ts`; `n:` — заметка). */
-const REF_JOURNAL: Record<string, Journal> = {
-  i: 'insights',
-  c: 'changelog',
-  r: 'releases',
-  p: 'reports',
-  t: 'glossary',
-  k: 'tasks',
-  q: 'questions',
-  w: 'ideas',
-};
 
 /** Куда ведёт ссылка разбора (`basis`, `similar`): журнал записи, заметка, текст для копирования. */
 export type RefTarget = { journal: Journal; id: string } | { node: string } | { copy: string } | null;
@@ -294,6 +291,5 @@ export function refTarget(ref: string): RefTarget {
   if (p === 'file' || p === 'commit') return { copy: rest };
   if (!/^[0-9A-Za-z]{1,64}$/.test(rest)) return null;
   if (p === 'n') return { node: rest };
-  const journal = REF_JOURNAL[p];
-  return journal ? { journal, id: rest } : null;
+  return Object.hasOwn(JOURNAL_OF_LETTER, p) ? { journal: JOURNAL_OF_LETTER[p], id: rest } : null;
 }

@@ -894,7 +894,8 @@ async fn entries_counts_and_from_idea() {
     assert_eq!(acc[0]["task"]["title"], "В план идея");
     assert_eq!(acc[0]["task"]["status"], "open");
 
-    // вторая идея на ту же задачу (plan с task.id): ideas — обе, idea — первая по созданию
+    // вторая идея на ту же задачу (plan с task.id): ideas — обе по времени ребра, idea — исходная
+    // идея задачи (n1 создана раньше pl, но привязана к задаче позже)
     let r = review(
         &a,
         &n1,
@@ -903,14 +904,14 @@ async fn entries_counts_and_from_idea() {
     .await;
     ok(&r, StatusCode::OK);
     let t = get(&a, &tid).await;
-    assert_eq!(t["idea"]["id"], n1.as_str(), "первая по созданию: {t}");
+    assert_eq!(t["idea"]["id"], pl.as_str(), "исходная идея задачи: {t}");
     let both: Vec<&str> = t["ideas"]
         .as_array()
         .unwrap()
         .iter()
         .map(|x| x["id"].as_str().unwrap())
         .collect();
-    assert_eq!(both, vec![n1.as_str(), pl.as_str()]);
+    assert_eq!(both, vec![pl.as_str(), n1.as_str()]);
     // идеи в корзине (человек) — задача больше не «из идеи»
     for i in [&n1, &pl] {
         let r = adm_rev(&a, Method::DELETE, &ent(i), None).await;
@@ -944,4 +945,112 @@ async fn entries_counts_and_from_idea() {
         let r = a.t(Method::GET, &format!("{}{sep}{q}", sol()), None).await;
         ok(&r, s);
     }
+}
+
+/// §9, ревью задачи 8: у задачи общего решения, появившейся из личной идеи Knowledge владельца
+/// («Начать» с задачей в решении), участник идеи не видит — ни в `GET`, ни в ленте, ни в фильтре
+/// `from_idea` и счётчиках; владелец видит. Идея самого решения видна обоим.
+#[tokio::test]
+async fn task_idea_hidden_from_member_when_in_owner_knowledge() {
+    let a = api("idrev-task-idea-rights", |_| {}).await;
+    let (_o_id, o_tok) = a.new_user("Ольга").await;
+    let (m_id, m_tok) = a.new_user("Марк").await;
+    let r = a
+        .tok(
+            &o_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let r = a
+        .tok(
+            &m_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    ok(&r, StatusCode::ACCEPTED);
+    a.set_access(&o_tok, G, &m_id, "rw").await;
+    let idea = |title: &str| json!({"kind": "idea", "title": title, "body": "Замысел", "data": {"origin": "human"}});
+    // личная идея Knowledge владельца → «Начать» с задачей в общем решении
+    let k = create_tok(&a, &o_tok, KN, idea("Личная идея владельца")).await;
+    let r = a
+        .tok(
+            &o_tok,
+            Method::POST,
+            &format!("{}/decide", ent(&k)),
+            Some(json!({"decision": "accept", "by": "human", "space": G})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let kt = id(&r.json()["task"]);
+    // идея самого решения → разбор «в план»
+    let s = create_tok(&a, &o_tok, &sol(), idea("Идея решения")).await;
+    let r = review_h(
+        &a,
+        &o_tok,
+        &s,
+        json!({"outcome": "plan", "summary": summary()}),
+        &[],
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let st = id(&r.json()["task"]);
+
+    let get_as = |tok: String, id: String| {
+        let a = &a;
+        async move {
+            let r = a.tok(&tok, Method::GET, &ent(&id), None).await;
+            ok(&r, StatusCode::OK);
+            r.json()
+        }
+    };
+    let list_as = |tok: String, q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(&tok, Method::GET, &format!("{}{q}", sol()), None)
+                .await;
+            ok(&r, StatusCode::OK);
+            r.json()
+        }
+    };
+    // владелец: обе задачи «из идеи», у задачи Knowledge — её идея
+    let t = get_as(o_tok.clone(), kt.clone()).await;
+    assert_eq!(t["idea"]["id"], k.as_str(), "{t}");
+    assert_ne!(
+        t["idea"]["space_id"], t["space_id"],
+        "идея — в Knowledge: {t}"
+    );
+    let from = list_as(o_tok.clone(), "?kind=task&from_idea=1").await;
+    let mut ids: Vec<String> = from["items"].as_array().unwrap().iter().map(id).collect();
+    ids.sort();
+    let mut want = vec![kt.clone(), st.clone()];
+    want.sort();
+    assert_eq!(ids, want);
+    let c = list_as(o_tok.clone(), "/counts?kind=task&from_idea=1").await;
+    assert_eq!(c["open"], 2, "{c}");
+
+    // участник: у задачи из Knowledge владельца идеи нет; идея решения — есть
+    let t = get_as(m_tok.clone(), kt.clone()).await;
+    assert!(t.get("idea").is_none() && t.get("ideas").is_none(), "{t}");
+    let t = get_as(m_tok.clone(), st.clone()).await;
+    assert_eq!(t["idea"]["id"], s.as_str(), "{t}");
+    let all = list_as(m_tok.clone(), "?kind=task").await;
+    let kt_row = all["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| id(x) == kt)
+        .cloned()
+        .unwrap();
+    assert!(kt_row.get("idea").is_none(), "{kt_row}");
+    let from = list_as(m_tok.clone(), "?kind=task&from_idea=1").await;
+    let ids: Vec<String> = from["items"].as_array().unwrap().iter().map(id).collect();
+    assert_eq!(ids, vec![st.clone()]);
+    let c = list_as(m_tok.clone(), "/counts?kind=task&from_idea=1").await;
+    assert_eq!(c["open"], 1, "{c}");
 }

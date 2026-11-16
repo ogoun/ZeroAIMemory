@@ -661,7 +661,7 @@ pub async fn list(
             "priority",
             zam_store::IdeaPriority::parse,
         )?,
-        from_idea,
+        from_idea: from_idea.then(|| super::tasks::idea_spaces(sc.role, sc.space.id)),
     };
     let (items, next) = list_entries(&sc.db, f).await?;
     // у insight — показы и оценки (столбец списка Insights WebUI, задача 13), одним запросом
@@ -677,7 +677,12 @@ pub async fn list(
         .filter(|e| e.kind == EntryKind::Task)
         .map(|e| e.id)
         .collect();
-    let task_ideas = zam_store::ideas_of_tasks(&sc.db, &task_ids).await?;
+    let task_ideas = zam_store::ideas_of_tasks(
+        &sc.db,
+        &task_ids,
+        &super::tasks::idea_spaces(sc.role, sc.space.id),
+    )
+    .await?;
     let idea_tasks = super::ideas::idea_tasks_many(&sc.db, &items).await?;
     let mut out = Vec::with_capacity(items.len());
     for e in &items {
@@ -771,7 +776,7 @@ pub async fn counts(
             "priority",
             zam_store::IdeaPriority::parse,
         )?,
-        from_idea,
+        from_idea: from_idea.then(|| super::tasks::idea_spaces(sc.role, sc.space.id)),
     };
     let counts = zam_store::count_by_status(&sc.db, f).await?;
     let mut out = serde_json::Map::new();
@@ -817,7 +822,7 @@ pub async fn get(
         let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
         return super::reports::view::get_html(&st, &sc, viewer).await;
     }
-    let mut v = entry_json(&sc.db, &sc.entry).await?;
+    let mut v = entry_json(&sc.db, &sc.entry, sc.role).await?;
     let links = super::ideas::idea_links(&sc.db, &sc.entry).await?;
     super::ideas::attach_idea(&mut v, &sc.entry, &links);
     // показы и оценки — из базы, где лежит запись (§10.5)
@@ -1109,7 +1114,7 @@ pub async fn patch(
     if e.rev != before {
         st.index.notify();
     }
-    let mut v = entry_json(&sc.db, &e).await?;
+    let mut v = entry_json(&sc.db, &e, sc.role).await?;
     super::secrets::attach_entry(&mut v, &e);
     if e.kind != EntryKind::Term {
         super::glossary::attach_warnings(

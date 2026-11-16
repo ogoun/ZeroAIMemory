@@ -363,6 +363,15 @@
           await deleteEntry(user, c.id, c.rev);
         } catch (e) {
           if (e instanceof ApiError && e.status === 401) return onexpired();
+          // 409: идею изменили или решили в другом месте — как act(): окно закрыть, ленту и
+          // карточку перечитать, ошибку показать в карточке
+          if (e instanceof ApiError && e.status === 409) {
+            const msg = errorText(e);
+            await load(user, space, true);
+            await open(user, c.id);
+            actionError = msg;
+            return;
+          }
           throw new Error(errorText(e));
         }
         go({ name: 'journal', user, space, journal: 'ideas', entry: null }, { replace: true });
@@ -460,7 +469,7 @@
       <div class="row" role="group" aria-label="Статус идей">
         {#each IDEA_CHIPS as ch (ch.id)}
           <button type="button" class="schip" aria-pressed={chip === ch.id} data-chip={ch.id} onclick={() => pickChip(ch.id)}>
-            {chipTitle(ch.id)}{#if counts}{' '}<span class="count">{chipCount(ch.id, counts)}</span>{/if}
+            {chipTitle(ch.id)}{#if counts && !applied.query}{' '}<span class="count">{chipCount(ch.id, counts)}</span>{/if}
           </button>
         {/each}
       </div>
@@ -490,26 +499,33 @@
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#if notice && !cur}<p class="muted" role="status">{notice}</p>{/if}
 
-    <div class="feed" role="feed" aria-label={hits ? 'Найденные идеи' : 'Лента идей'} aria-busy={loading}>
-      {#if grouped}
-        <!-- разделы в порядке чипов; поиск и лента не бывают вместе -->
+    {#if grouped}
+      <!-- разделы в порядке чипов, у каждого — своя лента (в role=feed — только статьи); поиск и
+           лента не бывают вместе; число в заголовке — «показано из» счётчика сервера -->
+      <div class="groups">
         {#each groupByStatus(hits ?? []) as g (g.status)}
           <section class="group" aria-label={`Раздел «${statusText(g.status)}»`} data-group={g.status}>
-            {@render head(g.status, g.items.length)}
-            {#each g.items as h (h.entry_id)}{@render hit(h)}{/each}
+            {@render head(g.status, g.items.length, undefined)}
+            <div class="feed" role="feed" aria-label={`Идеи раздела «${statusText(g.status)}»`} aria-busy={loading}>
+              {#each g.items as h (h.entry_id)}{@render hit(h)}{/each}
+            </div>
           </section>
         {/each}
         {#each groupByStatus(items) as g (g.status)}
           <section class="group" aria-label={`Раздел «${statusText(g.status)}»`} data-group={g.status}>
-            {@render head(g.status, g.items.length)}
-            {#each g.items as it (it.id)}{@render row(it)}{/each}
+            {@render head(g.status, g.items.length, counts?.[g.status as EntryStatus])}
+            <div class="feed" role="feed" aria-label={`Идеи раздела «${statusText(g.status)}»`} aria-busy={loading}>
+              {#each g.items as it (it.id)}{@render row(it)}{/each}
+            </div>
           </section>
         {/each}
-      {:else}
+      </div>
+    {:else}
+      <div class="feed" role="feed" aria-label={hits ? 'Найденные идеи' : 'Лента идей'} aria-busy={loading}>
         {#each hits ?? [] as h (h.entry_id)}{@render hit(h)}{/each}
         {#each items as it (it.id)}{@render row(it)}{/each}
-      {/if}
-    </div>
+      </div>
+    {/if}
     {#if !loading && !error && !(hits ?? items).length}
       <p class="muted">{hits ? 'Ничего не найдено.' : filtered ? 'Идей по выбранным фильтрам нет.' : 'Идей нет.'}</p>
     {/if}
@@ -617,8 +633,8 @@
 
 <Prompt bind:ask />
 
-{#snippet head(status: string, n: number)}
-  <h3>{statusText(status)} <span class="muted small">{n}</span></h3>
+{#snippet head(status: string, shown: number, total: number | undefined)}
+  <h3>{statusText(status)} <span class="muted small">{total !== undefined && total !== shown ? `${shown} из ${total}` : shown}</span></h3>
 {/snippet}
 
 {#snippet hit(h: SearchItem)}
@@ -636,7 +652,7 @@
   {@const q = str(it.data, 'question_id')}
   {@const hz = it.status === 'deferred' && str(it.data, 'horizon')}
   {@const line = reviewLine(it)}
-  {@const planLine = line.startsWith('В план') && !!task && !knowledge}
+  {@const planLine = line.kind === 'plan' && !!task && !knowledge}
   <article class="idea" class:selected={it.id === entry} data-idea={it.id}>
     <button type="button" class="link title" onclick={() => select(it.id)}>{it.title}</button>
     <span class="chip prio" data-priority={priorityOf(it)}>{PRIORITY_TEXT[priorityOf(it)]}</span>
@@ -644,8 +660,8 @@
     <span class="muted small">{fmtTime(it.updated_at)}</span>
     {#if hz}<span class="muted small">не раньше {hz} UTC</span>{/if}
     {@render marks(originOf(it) === 'agent', [])}
-    {#if planLine}<a class="small decision" href={taskHref(task, space)} data-testid="review-line">{line}</a>
-    {:else if line}<span class="small decision" data-testid="review-line">{line}</span>{/if}
+    {#if planLine}<a class="small decision" href={taskHref(task, space)} data-testid="review-line">{line.text}</a>
+    {:else if line.kind}<span class="small decision" data-testid="review-line">{line.text}</span>{/if}
     {#if planLine}<!-- ссылка на задачу — в строке решения -->
     {:else if task && !knowledge}<a class="small" href={taskHref(task, space)}>задача {entryRef('task', task)}</a>
     {:else if task}<button type="button" class="link small" onclick={() => select(it.id)} title="Задача может быть в решении: ссылка — в карточке">задача {entryRef('task', task)}</button>
@@ -750,7 +766,8 @@
     min-width: 0;
   }
   .feed,
-  .group {
+  .group,
+  .groups {
     display: grid;
     gap: 6px;
   }

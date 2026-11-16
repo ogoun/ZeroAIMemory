@@ -125,7 +125,7 @@ pub use graph::{
 pub use ideas::{
     Decided, DecidedAs, DecidedVia, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS,
     IDEA_LINKS_MAX, IDEA_OPTIONS, IDEA_ORIGIN_REQUIRED, IDEA_REOPEN_OPTIONS, IdeaData,
-    IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewDecision, NewReview,
+    IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, IdeaSpaces, NewDecision, NewReview,
     PROPOSE_TEXT_MAX_CHARS, ProposalKind, REVIEW_MIN_CHARS_DEFAULT, REVIEW_MISSING_MAX_CHARS,
     REVIEW_REFS_MAX, REVIEW_SUMMARY_MAX_CHARS, REVIEWS_MAX, Review, ReviewOutcome, ReviewTask,
     Reviewed, TaskIdea, TaskState, adopt_idea, any_idea, any_new_idea, check_idea,

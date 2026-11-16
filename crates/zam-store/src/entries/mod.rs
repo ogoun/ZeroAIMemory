@@ -430,9 +430,10 @@ pub struct EntryFilter {
     pub origin: Option<crate::ideas::IdeaOrigin>,
     /// Идеи с таким `data.priority` (M5.7); только при `kind = Some(Idea)`, иначе `BadInput`.
     pub priority: Option<crate::ideas::IdeaPriority>,
-    /// Только задачи из идей — с системным ребром `derived_from` на живую идею (пункты плана,
-    /// M6.5 §9, фильтр «Из идей» «Задач» WebUI); только при `kind = Some(Task)`, иначе `BadInput`.
-    pub from_idea: bool,
+    /// Только задачи из идей — с системным ребром `derived_from` на живую идею из видимых
+    /// запрашивающему пространств (пункты плана, M6.5 §9, фильтр «Из идей» «Задач» WebUI);
+    /// `None` — без фильтра; только при `kind = Some(Task)`, иначе `BadInput`.
+    pub from_idea: Option<crate::ideas::IdeaSpaces>,
 }
 
 /// Нормализованный заголовок (дедупликация, §7.5): нижний регистр, всё, что не буква и не

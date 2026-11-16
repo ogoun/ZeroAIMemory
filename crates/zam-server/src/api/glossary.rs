@@ -89,7 +89,7 @@ pub async fn get(
     if let Some(name) = q.term.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         let t = find_term(&terms, name).ok_or(ApiError::NotFound)?;
         let e = get_entry(&sc.db, t.id).await?;
-        return Ok(Json(entry_json(&sc.db, &e).await?));
+        return Ok(Json(entry_json(&sc.db, &e, sc.role).await?));
     }
     let mut items = Vec::with_capacity(terms.len());
     for t in &terms {

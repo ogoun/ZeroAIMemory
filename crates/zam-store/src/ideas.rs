@@ -2149,29 +2149,56 @@ pub struct TaskIdea {
     pub space_id: Id,
 }
 
-/// Идеи задач `tasks` одним запросом (лента «Задач» — без запроса на задачу): живые идеи по
-/// системным рёбрам `derived_from` — те же, что у [`ideas_of_task`]; у задачи — по времени
-/// создания идеи (первая — та, из которой задача появилась раньше всех). Задач без идей в ответе
-/// нет.
+/// Какие идеи учитывать у задач — в фильтре «из идей» ([`crate::EntryFilter::from_idea`]) и в поле
+/// `idea` задачи ([`ideas_of_tasks`]): идеи любого пространства базы или только перечисленных — тех,
+/// что может читать запрашивающий (участник общего решения не видит личную Knowledge владельца, из
+/// идеи которой задача «начать» могла появиться в решении, M6.5 §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdeaSpaces {
+    All,
+    Only(Vec<Id>),
+}
+
+impl IdeaSpaces {
+    /// JSON-массив пространств для `json_each` или `None` — любые.
+    pub(crate) fn sql(&self) -> Option<String> {
+        match self {
+            IdeaSpaces::All => None,
+            IdeaSpaces::Only(v) => Some(
+                serde_json::Value::from(v.iter().map(Id::to_string).collect::<Vec<_>>())
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Идеи задач `tasks` одним запросом (лента «Задач» — без запроса на задачу): живые идеи из
+/// пространств `spaces` по системным рёбрам `derived_from` — тем же, что у [`ideas_of_task`]; у
+/// задачи — по времени ребра (первая — исходная идея задачи: ребро «начать» или разбора `plan`
+/// появляется вместе с задачей, привязки других идей разбором с `task.id` — позже). Задач без
+/// идей в ответе нет.
 pub async fn ideas_of_tasks(
     db: &Db,
     tasks: &[Id],
+    spaces: &IdeaSpaces,
 ) -> Result<std::collections::HashMap<Id, Vec<TaskIdea>>, StoreError> {
-    if tasks.is_empty() {
+    if tasks.is_empty() || matches!(spaces, IdeaSpaces::Only(v) if v.is_empty()) {
         return Ok(std::collections::HashMap::new());
     }
     let list =
         serde_json::Value::from(tasks.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    let spaces = spaces.sql();
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT DISTINCT g.src_id, i.id, i.title, i.status, i.space_id, i.created_at
+            "SELECT g.src_id, i.id, i.title, i.status, i.space_id
              FROM edges g JOIN entries i ON i.id = g.dst_id
              WHERE g.src_kind = 'entry' AND g.src_id IN (SELECT value FROM json_each(?1))
                AND g.dst_kind = 'entry' AND g.type = 'derived_from' AND g.origin = 'system'
                AND g.deleted_at IS NULL AND i.kind = 'idea' AND i.deleted_at IS NULL
-             ORDER BY g.src_id, i.created_at, i.id",
+               AND (?2 IS NULL OR i.space_id IN (SELECT value FROM json_each(?2)))
+             ORDER BY g.src_id, g.created_at, g.id",
         )?;
-        let rows = st.query_map([list], |r| {
+        let rows = st.query_map(params![list, spaces], |r| {
             Ok((
                 r.get::<_, Id>(0)?,
                 TaskIdea {

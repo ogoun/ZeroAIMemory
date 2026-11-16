@@ -1484,7 +1484,7 @@ fn idea_filter(space: Id) -> EntryFilter {
         deleted_only: false,
         origin: None,
         priority: None,
-        from_idea: false,
+        from_idea: None,
     }
 }
 

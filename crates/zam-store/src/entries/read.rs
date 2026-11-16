@@ -38,7 +38,8 @@ fn json_list<T>(v: &[T], f: impl Fn(&T) -> &'static str) -> Option<String> {
 /// совпадали с лентой. Параметры: `?1` пространство, `?2` вид, `?3` статусы (JSON), `?4`
 /// `certainty` (JSON), `?5` область, `?6` тег, `?7`–`?8` интервал `created_at`, `?9`–`?10`
 /// курсор (`key`, id), `?12` `data.kind`, `?13` `decided_by`, `?14` с отчётами, `?15`–`?16`
-/// `origin`, `priority` идеи, `?17` только задачи из идей; `?11` — `LIMIT` ленты. `alive` —
+/// `origin`, `priority` идеи, `?17` только задачи из идей, `?18` пространства их идей (JSON,
+/// `NULL` — любые); `?11` — `LIMIT` ленты. `alive` —
 /// живые или удалённые записи, `key` — столбец порядка и курсора.
 fn feed_where(alive: &str, key: &str) -> String {
     format!(
@@ -66,12 +67,14 @@ fn feed_where(alive: &str, key: &str) -> String {
     )
 }
 
-/// Задача `e` — из идеи: системное ребро `derived_from` на живую идею — то же правило, что у
-/// пунктов плана дайджеста (`ideas::PLANNED_SQL`) и у поля `idea` задачи ([`crate::ideas_of_tasks`]).
+/// Задача `e` — из идеи: системное ребро `derived_from` на живую идею пространства из `?18` (или
+/// любого) — то же правило, что у пунктов плана дайджеста (`ideas::PLANNED_SQL`) и у поля `idea`
+/// задачи ([`crate::ideas_of_tasks`]).
 const FROM_IDEA_SQL: &str = "EXISTS (SELECT 1 FROM edges g JOIN entries i ON i.id = g.dst_id
      WHERE g.src_kind = 'entry' AND g.src_id = e.id AND g.dst_kind = 'entry'
        AND g.type = 'derived_from' AND g.origin = 'system' AND g.deleted_at IS NULL
-       AND i.kind = 'idea' AND i.deleted_at IS NULL)";
+       AND i.kind = 'idea' AND i.deleted_at IS NULL
+       AND (?18 IS NULL OR i.space_id IN (SELECT value FROM json_each(?18))))";
 
 /// Фильтры `data` идеи (`origin`, `priority`) — только у ленты идей, «из идей» — только у
 /// ленты задач (иначе `BadInput`).
@@ -81,7 +84,7 @@ fn check_kind_filters(f: &EntryFilter) -> Result<(), StoreError> {
             "origin и priority — фильтры идей: только с kind=idea".into(),
         ));
     }
-    if f.from_idea && f.kind != Some(EntryKind::Task) {
+    if f.from_idea.is_some() && f.kind != Some(EntryKind::Task) {
         return Err(StoreError::BadInput(
             "from_idea — фильтр задач: только с kind=task".into(),
         ));
@@ -151,7 +154,8 @@ pub async fn list_entries(
                 f.with_reports,
                 origin,
                 priority,
-                f.from_idea,
+                f.from_idea.is_some(),
+                f.from_idea.as_ref().and_then(crate::ideas::IdeaSpaces::sql),
             ],
             entry_row,
         )?;
@@ -232,7 +236,8 @@ pub async fn count_by_status(
                     false,
                     origin,
                     priority,
-                    f.from_idea,
+                    f.from_idea.is_some(),
+                    f.from_idea.as_ref().and_then(crate::ideas::IdeaSpaces::sql),
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;

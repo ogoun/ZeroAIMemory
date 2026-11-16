@@ -27,30 +27,9 @@ export function journalsOf(kind: string): Journal[] {
   return [];
 }
 
-/** Вид записи журнала → журнал (переход из поиска). */
-export const JOURNAL_OF_KIND: Record<string, Journal> = {
-  insight: 'insights',
-  changelog: 'changelog',
-  release: 'releases',
-  report: 'reports',
-  term: 'glossary',
-  task: 'tasks',
-  idea: 'ideas',
-  question: 'questions',
-};
-
-/** Буква ссылки записи по виду (`i:`, `t:`, … — как в `/read` и индексе ссылок на файлы). */
-const REF_LETTER: Record<string, string> = {
-  insight: 'i',
-  changelog: 'c',
-  release: 'r',
-  report: 'p',
-  term: 't',
-  task: 'k',
-  idea: 'w',
-  question: 'q',
-};
-export const entryRef = (kind: string, id: string): string => `${REF_LETTER[kind] ?? 'e'}:${id}`;
+/** Вид записи → журнал, буква ссылки и `entryRef` — в `entryRefs.ts` (без зависимостей: его
+ * импортирует и `ideaButtons.ts`, проверяемый `node --test`). */
+export { JOURNAL_OF_KIND, entryRef } from './entryRefs';
 
 /** Колонки доски задач (M4.5 §3) и подписи. */
 export const TASK_COLUMNS: EntryStatus[] = ['open', 'in_progress', 'blocked', 'done', 'dropped'];

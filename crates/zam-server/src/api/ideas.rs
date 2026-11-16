@@ -575,7 +575,9 @@ pub async fn adopt(
     let e = adopt_idea(&sc.db, sc.entry.id, user, &attrib).await?;
     st.index.notify();
     audit(&st, &p, &client, &sc, "entry.idea.adopt", json!({})).await?;
-    Ok(Json(super::insights::entry_json(&sc.db, &e).await?))
+    Ok(Json(
+        super::insights::entry_json(&sc.db, &e, sc.role).await?,
+    ))
 }
 
 #[derive(Deserialize)]

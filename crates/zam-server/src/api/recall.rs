@@ -914,7 +914,7 @@ fn entry_filter(space: Id, kind: EntryKind) -> EntryFilter {
         deleted_only: false,
         origin: None,
         priority: None,
-        from_idea: false,
+        from_idea: None,
     }
 }
 

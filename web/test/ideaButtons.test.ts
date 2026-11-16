@@ -28,6 +28,7 @@ import {
   tagsOf,
 } from '../src/lib/ideaButtons.ts';
 import { IDEA_STATUSES, IDEA_STATUS_TEXT } from '../src/lib/ideaStatus.ts';
+import { JOURNAL_OF_KIND, JOURNAL_OF_LETTER, REF_LETTER, entryRef } from '../src/lib/entryRefs.ts';
 import { DEFER_FORM, START_SUBMIT, deferDefault, deferError, deferMin, sharedWarning, utcDate } from '../src/lib/ideaForms.ts';
 
 const acts = (status: EntryStatus | null, agent = false, released = false) =>
@@ -219,24 +220,24 @@ test('reviewLine: строка решения для четырёх исходо
     data: { review: review({ outcome: 'plan', task: 'k:01TASK' }), task_id: '01TASK' },
     task: { id: '01TASK', status: 'open', title: 'Статусы в ленте' },
   });
-  assert.equal(reviewLine(plan), 'В план → k:01TASK «Статусы в ленте»');
+  assert.deepEqual(reviewLine(plan), { kind: 'plan', text: 'В план → k:01TASK «Статусы в ленте»' });
   // без заголовка задачи (удалена) — только ссылка
-  assert.equal(reviewLine(entry({ ...plan, task: { id: '01TASK', deleted: true } })), 'В план → k:01TASK');
+  assert.deepEqual(reviewLine(entry({ ...plan, task: { id: '01TASK', deleted: true } })), { kind: 'plan', text: 'В план → k:01TASK' });
   // задача выполнена — идея done, строка та же
-  assert.equal(reviewLine(entry({ ...plan, status: 'done' })), 'В план → k:01TASK «Статусы в ленте»');
+  assert.equal(reviewLine(entry({ ...plan, status: 'done' })).text, 'В план → k:01TASK «Статусы в ленте»');
   // return — начало missing, не длиннее 60 символов
   const ret = entry({ status: 'returned', data: { review: review({ outcome: 'return', missing: long }) } });
-  assert.equal(reviewLine(ret), `Не хватает: ${clip(long, 60)}`);
-  assert.ok(reviewLine(ret).endsWith('…'));
+  assert.deepEqual(reviewLine(ret), { kind: 'return', text: `Не хватает: ${clip(long, 60)}` });
+  assert.ok(reviewLine(ret).text.endsWith('…'));
   assert.ok(Array.from(clip(long, 60)).length <= 61);
   // decline — начало разбора (переносы — пробелом)
   const dec = entry({ status: 'declined', data: { review: review({ outcome: 'decline', summary: `Уже обсуждали.\n\n${long}` }) } });
-  assert.equal(reviewLine(dec), `Отклонена: ${clip(`Уже обсуждали. ${long}`, 60)}`);
+  assert.deepEqual(reviewLine(dec), { kind: 'decline', text: `Отклонена: ${clip(`Уже обсуждали. ${long}`, 60)}` });
   // done — ссылка на сделанное (первая c:/r:/commit:/k:)
   const done = entry({ status: 'done', data: { review: review({ outcome: 'done', basis: ['n:01NOTE', 'commit:abc1234', 'c:01CL'] }) } });
-  assert.equal(reviewLine(done), 'Сделано: commit:abc1234');
+  assert.deepEqual(reviewLine(done), { kind: 'done', text: 'Сделано: commit:abc1234' });
   // нет разбора — пусто
-  assert.equal(reviewLine(entry({ status: 'new' })), '');
+  assert.deepEqual(reviewLine(entry({ status: 'new' })), { kind: '', text: '' });
   // короткий текст — без «…»
   assert.equal(clip('  коротко \n ', 60), 'коротко');
 });
@@ -245,7 +246,7 @@ test('reviewLine и reviewCurrent: разбор, который уже не оп
   // возвращённую дописали — снова «Непросмотрено»: «Не хватает» уже неактуально
   const edited = entry({ status: 'new', data: { review: review({ outcome: 'return', missing: 'что дописать' }) } });
   assert.equal(reviewCurrent(edited), false);
-  assert.equal(reviewLine(edited), '');
+  assert.deepEqual(reviewLine(edited), { kind: '', text: '' });
   assert.equal(reviewNote(edited), 'После разбора статус изменился: Непросмотрено.');
   // после разбора человек решил сам — решение человека позже разбора
   const human = entry({
@@ -256,7 +257,7 @@ test('reviewLine и reviewCurrent: разбор, который уже не оп
     },
   });
   assert.equal(reviewCurrent(human), false);
-  assert.equal(reviewLine(human), '');
+  assert.deepEqual(reviewLine(human), { kind: '', text: '' });
   assert.equal(reviewNote(human), 'После разбора решение принял человек.');
   // решение самого разбора — текущее
   const agent = entry({
@@ -305,4 +306,16 @@ test('refTarget: ссылки «Опирался на» и «Похожие»', 
   assert.equal(refTarget('x:01ABC'), null);
   assert.equal(refTarget('k:'), null);
   assert.equal(refTarget('k:../../admin'), null);
+  // свойства прототипа объекта — не буквы ссылок
+  assert.equal(refTarget('constructor:01ABC'), null);
+  assert.equal(refTarget('toString:01ABC'), null);
+  // буквы ссылок — те же, что у entryRef (entryRefs.ts)
+  assert.deepEqual(refTarget(`${entryRef('report', '01R').split(':')[0]}:01R`), { journal: 'reports', id: '01R' });
+  assert.equal(entryRef('idea', '01W'), 'w:01W');
+  assert.equal(entryRef('нет такого', '01E'), 'e:01E');
+});
+
+test('entryRefs: буква ссылки → журнал — обратное REF_LETTER', () => {
+  for (const [kind, letter] of Object.entries(REF_LETTER)) assert.equal(JOURNAL_OF_LETTER[letter], JOURNAL_OF_KIND[kind], kind);
+  assert.equal(Object.keys(JOURNAL_OF_LETTER).length, Object.keys(REF_LETTER).length);
 });
