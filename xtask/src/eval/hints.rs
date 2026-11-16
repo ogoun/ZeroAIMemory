@@ -45,7 +45,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use zam_search::recall::{error_regex_matches, error_terms, normalize_error, term_coverage};
+use zam_search::recall::{
+    PromptGate, error_regex_matches, error_terms, normalize_error, prompt_gate, term_coverage,
+};
 
 use super::corpus::{Corpus, EVAL_SOLUTION, INSIGHT_REF, Query, fnv1a, valid_key};
 use super::insights::Insight;
@@ -93,9 +95,6 @@ const HINTS_MAX: usize = 3;
 /// Тело внутреннего поиска `/recall(prompt)` (`PROMPT_SEARCH_TOP_K`, `PROMPT_SEARCH_BUDGET`).
 const PROMPT_SEARCH_TOP_K: usize = 20;
 const PROMPT_SEARCH_BUDGET: usize = 4000;
-/// Короткий запрос `/recall(prompt)` — предметных слов не больше (`PROMPT_SHORT_WORDS` сервера,
-/// M6.6 §3.2): подсказка — только с лексическим совпадением.
-const PROMPT_SHORT_WORDS: usize = 2;
 /// Пороги `recall.prompt_min_score` для перебора.
 const PROMPT_THRESHOLDS: [f64; 13] = [
     0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90,
@@ -1072,33 +1071,39 @@ fn recall(s: &Session, body: &Value) -> Result<(Value, f64)> {
     Ok((v, ms))
 }
 
-/// Правила тишины `/recall(prompt)` до поиска (M6.6 §3.1–§3.3, модель сервера на тех же
-/// функциях): `None` — подсказок поиска нет (пересланное сообщение агента или запрос без
-/// предметных слов), `Some(short)` — поиск идёт, `short` — только карточки лексических каналов.
-pub fn prompt_gate(query: &str) -> Option<bool> {
-    if zam_core::text::is_relayed_message(query) {
-        return None;
-    }
-    let n = zam_search::recall::subject_terms(query).len();
-    (n > 0).then_some(n <= PROMPT_SHORT_WORDS)
-}
-
-/// Карточку нашёл лексический канал (`fts`, `alias`, `trigram` в `sources`) — как у сервера.
-fn lexical_card(it: &Value) -> bool {
-    it["sources"]
+/// Карточки ответа внутреннего поиска, из которых сервер отбирает подсказки `prompt` (M6.6 §3):
+/// правило тишины — та же функция сервера [`prompt_gate`] (пересланное сообщение и запрос без
+/// предметных слов — ни одной), у короткого запроса — только карточки лексических каналов
+/// ([`zam_search::any_lexical`]). Политики здесь нет — только разбор JSON (ревью задачи 2, I1).
+fn prompt_cards<'a>(gate: &PromptGate, search: &'a Value) -> Vec<&'a Value> {
+    let PromptGate::Search { short, .. } = gate else {
+        return Vec::new();
+    };
+    let lexical = |it: &Value| {
+        zam_search::any_lexical(
+            it["sources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
+    };
+    search["items"]
         .as_array()
         .into_iter()
         .flatten()
-        .any(|s| matches!(s.as_str(), Some("fts" | "alias" | "trigram")))
+        .filter(|it| !short || lexical(it))
+        .collect()
 }
 
 /// Кандидаты `prompt` того же внутреннего поиска, что у `/recall(prompt)`, с правилами тишины
-/// сервера ([`prompt_gate`]).
+/// сервера ([`prompt_cards`]).
 fn prompt_candidates(s: &Session, refs: &RefMap, prompt: &str) -> Result<Vec<PromptCand>> {
     let query: String = prompt.chars().take(512).collect();
-    let Some(short) = prompt_gate(&query) else {
+    let gate = prompt_gate(&query);
+    if !matches!(gate, PromptGate::Search { .. }) {
         return Ok(Vec::new());
-    };
+    }
     let body = json!({
         "query": query,
         "scope": {"solution": EVAL_SOLUTION, "include_knowledge": true, "include_rules": true},
@@ -1122,10 +1127,7 @@ fn prompt_candidates(s: &Session, refs: &RefMap, prompt: &str) -> Result<Vec<Pro
         bail!("POST /search: HTTP {st}: {v}");
     }
     let mut out = Vec::new();
-    for it in v["items"].as_array().into_iter().flatten() {
-        if short && !lexical_card(it) {
-            continue;
-        }
+    for it in prompt_cards(&gate, &v) {
         let space = it["space"]["kind"].as_str().unwrap_or_default();
         let r = match (
             it["kind"].as_str(),
@@ -1944,21 +1946,67 @@ mod tests {
         assert!(prompt_pick(&cands, 0.95).is_empty());
     }
 
-    /// Модель правил тишины сервера (M6.6 §3): реплика и пересланное сообщение — без поиска,
-    /// до двух предметных слов — короткий запрос.
+    /// Модель калибровки отбирает карточки по правилу сервера (ревью задачи 2, I1; как
+    /// `coverage_rule_matches_server`): ожидание каждого запроса — из функций сервера
+    /// `zam_search::recall::prompt_gate` и `zam_search::any_lexical`, а не из копии правил.
     #[test]
-    fn prompt_gate_matches_server_rules() {
-        assert_eq!(prompt_gate("согласен"), None);
-        assert_eq!(prompt_gate("Да, давай, продолжай"), None);
+    fn prompt_cards_follow_server_gate() {
+        let search = json!({"items": [
+            {"kind": "insight", "entry_id": "v", "sources": ["vector"]},
+            {"kind": "insight", "entry_id": "f", "sources": ["vector", "fts"]},
+            {"kind": "insight", "entry_id": "t", "sources": ["trigram"]},
+            {"kind": "insight", "entry_id": "d", "sources": ["folder"]},
+        ]});
+        let ids = |cards: Vec<&Value>| -> Vec<String> {
+            cards
+                .iter()
+                .map(|c| c["entry_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for q in [
+            "согласен",
+            "Да, давай, продолжай",
+            "[Subagent hand-back] квазар найден в каталоге",
+            "квазар",
+            "квазар светит",
+            "почему квазар светит ярко",
+            "согласен, мигрируй 0026",
+        ] {
+            let gate = prompt_gate(q);
+            let want: Vec<String> = match &gate {
+                PromptGate::Search { short, .. } => search["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|it| {
+                        !short
+                            || zam_search::any_lexical(
+                                it["sources"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|s| s.as_str().unwrap()),
+                            )
+                    })
+                    .map(|it| it["entry_id"].as_str().unwrap().to_string())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            assert_eq!(ids(prompt_cards(&gate, &search)), want, "{q}");
+        }
+        // опорные случаи: реплика — ничего, короткий — лексические, длинный — все
+        assert!(prompt_cards(&prompt_gate("согласен"), &search).is_empty());
         assert_eq!(
-            prompt_gate("[Subagent hand-back] квазар найден в каталоге"),
-            None
+            ids(prompt_cards(&prompt_gate("квазар"), &search)),
+            ["f", "t"]
         );
-        assert_eq!(prompt_gate("квазар"), Some(true));
-        assert_eq!(prompt_gate("согласен, мигрируй 0026"), Some(true));
-        assert_eq!(prompt_gate("почему квазар светит ярко"), Some(false));
-        assert!(lexical_card(&json!({"sources": ["vector", "fts"]})));
-        assert!(!lexical_card(&json!({"sources": ["vector"]})));
+        assert_eq!(
+            ids(prompt_cards(
+                &prompt_gate("почему квазар светит ярко"),
+                &search
+            )),
+            ["v", "f", "t", "d"]
+        );
     }
 
     #[test]

@@ -3,31 +3,37 @@
 //! порядку: строки словаря ([`super::term_cands`]), подсказки поиска ([`prompt_hints`]),
 //! подсказка-задача ([`task_prompt_cands`]) и подсказки-идеи ([`super::ideas::prompt_ideas`]);
 //! у каждого раздела свой предел ([`super::section_limit`]). Правила выдачи, учёт показа и
-//! сроки — в документации модуля [`super`].
+//! сроки — в документации модуля [`super`]. Правило тишины — общее с моделью калибровки
+//! `xtask eval --hints`: [`zam_search::recall::prompt_gate`] (ревью задачи 2, I1).
 //!
 //! - **Пересланное сообщение** ([`zam_core::text::is_relayed_message`], M6.6 §3.3: отчёт
 //!   субагента, сообщение агента, уведомление фоновой задачи) — не слова человека: тишина, без
-//!   строк словаря (сервер — и для клиентов 0.0.12 и старше, которые такие сообщения шлют).
-//! - **Нет предметных слов** ([`subject_terms`] пуст, M6.6 §3.1: «согласен», «продолжай», «ok»,
-//!   только служебные слова) — только строки словаря: имя термина в запросе — уже предметное
-//!   слово. Поиска подсказок, задач и идей нет.
+//!   строк словаря (сервер — и для клиентов 0.0.12 и раньше, которые такие сообщения шлют).
+//! - **Нет предметных слов** ([`zam_search::recall::subject_terms`] пуст, M6.6 §3.1:
+//!   «согласен», «продолжай», «ok», только служебные слова) — только строки словаря: имя термина
+//!   в запросе — уже предметное слово. Поиска подсказок, задач и идей нет.
 //! - **Короткий запрос** (предметных слов не больше [`PROMPT_SHORT_WORDS`], M6.6 §3.2) —
-//!   подсказка поиска проходит, только если запись нашёл лексический канал ([`lexical`]): балл
-//!   гибрида нормирован по непустым каналам, и у слова без FTS-совпадения ближайшая по вектору
-//!   запись получала бы 1,0 при пороге 0,6. Поиск без модели (`degraded`) правило не меняет: там
-//!   все карточки и так из FTS.
+//!   подсказка поиска проходит, только если запись нашёл лексический канал
+//!   ([`zam_search::any_lexical`]): балл гибрида нормирован по непустым каналам, и у слова без
+//!   FTS-совпадения ближайшая по вектору запись получала бы 1,0 при пороге 0,6. Поиск без модели
+//!   (`degraded`) правило не меняет: там все карточки и так из FTS.
 //! - **Подсказка-задача** (M6.6 §3.4): отдельный проход FTS без эмбеддинга по задачам `open |
 //!   in_progress | blocked` решения и Knowledge — строгий запрос (все слова) проходит, ослабленный
-//!   (любое слово) — если промпт покрывает слова заголовка ([`title_covered`]); строка
+//!   (любое слово) — если промпт покрывает слова заголовка ([`title_covered`]); у короткого
+//!   запроса заголовок нужен и строгому (**[решение координатора]**, ревью задачи 2, M1: одно
+//!   слово из тела задачи подсказки не даёт); строка
 //!   `ZeroAIMemory: задача «<заголовок>» [<статус>] k:<id>`, `reason: task`, не больше
 //!   [`TASK_HINTS_MAX`] на ответ, раз за сессию (`session_seen`, как у остальных подсказок).
+//!
+//! [`PROMPT_SHORT_WORDS`]: zam_search::recall::PROMPT_SHORT_WORDS
 use std::collections::HashSet;
 
 use axum::http::HeaderMap;
-use serde_json::{Value, json};
+use serde_json::json;
 use zam_core::TargetKind;
-use zam_core::text::is_relayed_message;
-use zam_search::recall::{StemWord, error_terms, hint_line, one_line, stem_words, subject_terms};
+use zam_search::recall::{
+    PromptGate, StemWord, error_terms, hint_line, one_line, prompt_gate, stem_words,
+};
 use zam_search::truncate_to_tokens;
 use zam_store::{
     EntryKind, EntryStatus, FtsHit, FtsQuery, TargetFilter, count_tokens, search_fts_channels,
@@ -36,7 +42,7 @@ use zam_store::{
 use super::ideas::prompt_ideas;
 use super::{
     Cand, Deadline, REASON_TASK, RecallReq, age_of, entry_spaces, inner_search, item_age,
-    prompt_min_score, term_cands,
+    lexical_card, prompt_min_score, term_cands,
 };
 use crate::api::search::Health;
 use crate::api::sessions::RequestSession;
@@ -44,10 +50,6 @@ use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
 
-/// Предметных слов запроса ([`subject_terms`]), при которых он «короткий» (M6.6 §3.2,
-/// **[решение координатора]** — константа, не ключ конфигурации): подсказка поиска проходит,
-/// только если запись нашёл лексический канал (`fts`, `alias` или `trigram`, проверка `lexical`).
-pub const PROMPT_SHORT_WORDS: usize = 2;
 /// Подсказок-задач в ответе `prompt` (M6.6 §3.4).
 pub const TASK_HINTS_MAX: usize = 1;
 /// Кандидатов FTS задач с базы цели (M6.6 §3.4).
@@ -56,9 +58,9 @@ const TASK_PROMPT_TOP_K: usize = 10;
 const TASK_LEAD: &str = "задача ";
 
 /// Разделы ответа `prompt` (см. модуль): строки словаря, подсказки поиска, подсказка-задача,
-/// подсказки-идеи (`ideas` — `Some(review)`, если идеи включены, [`super::ideas_enabled`]).
-/// Проход задач — до идей: у идей свой срок, и шаг после их просрочки ставил бы
-/// `recall timeout`, которого у ответа без идей нет.
+/// подсказки-идеи (`ideas_on` — идеи включены, [`super::ideas_enabled`]; `review` — режим
+/// `ideas.mode = review`). Проход задач — до идей: у идей свой срок, и шаг после их просрочки
+/// ставил бы `recall timeout`, которого у ответа без идей нет.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prompt_sections(
     st: &AppState,
@@ -66,31 +68,30 @@ pub(super) async fn prompt_sections(
     headers: &HeaderMap,
     req: &RecallReq,
     session: Option<&RequestSession>,
-    ideas: Option<bool>,
+    ideas_on: bool,
+    review: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Vec<(Option<&'static str>, Vec<Cand>)>, ApiError> {
     let prompt = req.prompt.as_deref().unwrap_or_default();
-    if is_relayed_message(prompt) {
+    let query = query_head(prompt);
+    let gate = prompt_gate(&query);
+    if gate == PromptGate::Relayed {
         return Ok(Vec::new());
     }
     // строки словаря — перед подсказками insight; у каждого свой предел
     let chars = crate::glossary::HINT_TEXT_CHARS;
     let terms = term_cands(st, prompt, chars, health, deadline).await;
-    let query = query_head(prompt);
-    let subject = subject_terms(&query);
-    if subject.is_empty() {
+    let PromptGate::Search { subject, short } = gate else {
         return Ok(vec![(None, terms)]);
-    }
-    let short = subject.len() <= PROMPT_SHORT_WORDS;
+    };
     let hints = prompt_hints(st, p, headers, req, &query, short, health, deadline).await?;
-    let tasks = task_prompt_cands(&query, &subject, health, deadline).await?;
+    let tasks = task_prompt_cands(&query, &subject, short, health, deadline).await?;
     // идеи — отдельным поиском после основного, своей строкой и своим пределом
-    let ideas = match ideas {
-        Some(review) => {
-            prompt_ideas(st, p, headers, req, session, health, deadline, review).await?
-        }
-        None => Vec::new(),
+    let ideas = if ideas_on {
+        prompt_ideas(st, p, headers, req, session, health, deadline, review).await?
+    } else {
+        Vec::new()
     };
     Ok(vec![
         (None, terms),
@@ -108,21 +109,9 @@ fn query_head(prompt: &str) -> String {
         .collect()
 }
 
-/// Карточку внутреннего поиска нашёл лексический канал — `fts`, `alias` или `trigram` в её
-/// `sources` (M6.6 §3.2; общая проверка с подтверждением подсказок-идей
-/// [`super::ideas`]): балл гибрида нормирован по непустым каналам, и карточка одного векторного
-/// канала получает 1,0 на любой запрос.
-pub(super) fn lexical(item: &Value) -> bool {
-    item["sources"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|s| matches!(s.as_str(), Some("fts" | "alias" | "trigram")))
-}
-
-/// Внутренний `POST /search` (см. модуль [`super`]) по запросу `query` и отбор insight и
-/// заметок Rules; `short` — короткий запрос: только карточки с лексическим совпадением
-/// ([`lexical`]).
+/// Внутренний `POST /search` (см. модуль [`super`]) по запросу `query` (в нём есть предметные
+/// слова — [`prompt_gate`]) и отбор insight и заметок Rules; `short` — короткий запрос: только
+/// карточки с лексическим совпадением ([`lexical_card`]).
 #[allow(clippy::too_many_arguments)]
 async fn prompt_hints(
     st: &AppState,
@@ -134,9 +123,6 @@ async fn prompt_hints(
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Vec<Cand>, ApiError> {
-    if query.trim().is_empty() {
-        return Ok(Vec::new());
-    }
     let body = json!({
         "query": query,
         "scope": {"solution": req.solution, "include_knowledge": true, "include_rules": true},
@@ -159,7 +145,7 @@ async fn prompt_hints(
     let targets = health.targets();
     let mut out: Vec<Cand> = Vec::new();
     for it in v["items"].as_array().into_iter().flatten() {
-        if it["score"].as_f64().unwrap_or(0.0) < min || (short && !lexical(it)) {
+        if it["score"].as_f64().unwrap_or(0.0) < min || (short && !lexical_card(it)) {
             continue;
         }
         let space_kind = it["space"]["kind"].as_str().unwrap_or_default();
@@ -250,13 +236,15 @@ async fn prompt_hints(
 
 /// Подсказка-задача (см. модуль): FTS по задачам `open | in_progress | blocked` пространств
 /// решения и Knowledge каждой живой цели (до [`TASK_PROMPT_TOP_K`] находок с базы), слияние
-/// баз — по сырому баллу bm25, как у `post_tool`; находка ослабленного запроса — только с
-/// покрытым заголовком ([`title_covered`] по предметным словам `subject`). Предел в ответе —
-/// [`TASK_HINTS_MAX`] (раздел упаковки, [`super::section_limit`]): кандидатов больше — на
-/// случай уже показанных сессии.
-pub(super) async fn task_prompt_cands(
+/// баз — по сырому баллу bm25, как у `post_tool`; находка ослабленного запроса, а у короткого
+/// запроса (`short`) и строгого, — только с покрытым заголовком ([`title_covered`] по
+/// предметным словам `subject`; **[решение координатора]**, ревью задачи 2, M1). Предел в
+/// ответе — [`TASK_HINTS_MAX`] (раздел упаковки, [`super::section_limit`]): кандидатов больше —
+/// на случай уже показанных сессии.
+async fn task_prompt_cands(
     query: &str,
     subject: &[String],
+    short: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Vec<Cand>, ApiError> {
@@ -312,8 +300,9 @@ pub(super) async fn task_prompt_cands(
         let Some(e) = &h.entry else {
             continue;
         };
-        // у задачи может быть несколько чанков: заголовок один — и решение одно
-        if !taken.insert(h.target) || (relaxed && !title_covered(&e.title, &words)) {
+        // у задачи может быть несколько чанков: заголовок один — и решение одно; строгое
+        // совпадение одного-двух слов (они могут быть только в теле) заголовок не заменяет
+        if !taken.insert(h.target) || ((relaxed || short) && !title_covered(&e.title, &words)) {
             continue;
         }
         let reference = format!("{}:{}", EntryKind::Task.ref_letter(), h.target.id);
@@ -366,7 +355,7 @@ mod tests {
     use super::*;
 
     fn words(prompt: &str) -> Vec<StemWord> {
-        subject_terms(prompt)
+        zam_search::recall::subject_terms(prompt)
             .into_iter()
             .map(StemWord::new)
             .collect()
@@ -403,15 +392,5 @@ mod tests {
         // заголовок из служебных слов — не задача промпта
         assert!(!title_covered("что это", &words("что это такое")));
         assert!(!title_covered(title, &[]));
-    }
-
-    #[test]
-    fn lexical_sources() {
-        assert!(lexical(&json!({"sources": ["vector", "fts"]})));
-        assert!(lexical(&json!({"sources": ["alias"]})));
-        assert!(lexical(&json!({"sources": ["trigram"]})));
-        assert!(!lexical(&json!({"sources": ["vector"]})));
-        assert!(!lexical(&json!({"sources": ["vector", "folder"]})));
-        assert!(!lexical(&json!({})));
     }
 }

@@ -271,9 +271,11 @@ use ideas::{
 pub use ideas::{
     TEST_IDEA_LIGHT_OFF, TEST_IDEA_SEARCH_TIMES, TEST_SECOND_PASS_QUERIES, TEST_SLOW_IDEA_MARK,
 };
+pub use prompt::TASK_HINTS_MAX;
 use prompt::prompt_sections;
-// пределы подсказок к запросу — по путям `api::recall::…`, как `PROMPT_MAX` и `TERM_HINTS_MAX`
-pub use prompt::{PROMPT_SHORT_WORDS, TASK_HINTS_MAX};
+// порог короткого запроса — один на сервер и модель калибровки xtask (`zam_search::recall`);
+// здесь — по пути `api::recall::…`, как `PROMPT_MAX` и `TERM_HINTS_MAX`
+pub use zam_search::recall::PROMPT_SHORT_WORDS;
 
 /// Предупреждение: сбор подсказок не уложился в `recall.timeout_ms`.
 pub const WARN_RECALL_TIMEOUT: &str = "recall timeout";
@@ -772,6 +774,19 @@ fn item_age(it: &Value) -> Option<u32> {
     it["age_days"]
         .as_u64()
         .map(|d| u32::try_from(d).unwrap_or(u32::MAX))
+}
+
+/// Карточку внутреннего поиска нашёл лексический канал ([`zam_search::any_lexical`] по её
+/// `sources`): короткий запрос подсказок `prompt` (подмодуль `prompt`, M6.6 §3.2) и
+/// подтверждение подсказок-идей (`ideas`).
+fn lexical_card(it: &Value) -> bool {
+    zam_search::any_lexical(
+        it["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )
 }
 
 /// Срок сбора подсказок (`recall.timeout_ms`).
@@ -3456,9 +3471,8 @@ pub async fn recall(
         // словарь, поиск, задача, идеи — у каждого раздела свой предел (подмодуль `prompt`)
         Event::Prompt => {
             let s = session.as_ref();
-            let ideas = ideas_on.then_some(review);
-            let secs =
-                prompt_sections(&st, &p, &sh, &req, s, ideas, &mut health, &mut deadline).await?;
+            let (h, d) = (&mut health, &mut deadline);
+            let secs = prompt_sections(&st, &p, &sh, &req, s, ideas_on, review, h, d).await?;
             (Lines::default(), secs, false)
         }
         Event::PostTool => {
@@ -3704,6 +3718,18 @@ mod tests {
             block: format!("ZeroAIMemory: {title}"),
             age_days: None,
         }
+    }
+
+    /// Карточка внутреннего поиска — лексическая по `sources` (`zam_search::any_lexical`).
+    #[test]
+    fn lexical_card_reads_sources() {
+        assert!(lexical_card(&json!({"sources": ["vector", "fts"]})));
+        assert!(lexical_card(&json!({"sources": ["alias"]})));
+        assert!(lexical_card(&json!({"sources": ["trigram"]})));
+        assert!(!lexical_card(&json!({"sources": ["vector"]})));
+        assert!(!lexical_card(&json!({"sources": ["vector", "folder"]})));
+        assert!(!lexical_card(&json!({"sources": [1, null]})));
+        assert!(!lexical_card(&json!({})));
     }
 
     /// Ревью задачи 9: в пакете восстановления без раздела после трёх первых уведомления и

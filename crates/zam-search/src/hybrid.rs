@@ -41,8 +41,17 @@ pub enum Channel {
 }
 
 impl Channel {
+    /// Все каналы.
+    pub const ALL: [Channel; 5] = [
+        Channel::Vector,
+        Channel::Fts,
+        Channel::Trigram,
+        Channel::Alias,
+        Channel::Folder,
+    ];
+
     /// Имя в `sources` ответа.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Channel::Vector => "vector",
             Channel::Fts => "fts",
@@ -51,6 +60,25 @@ impl Channel {
             Channel::Folder => "folder",
         }
     }
+
+    /// Лексический канал — нашёл слово запроса в тексте (`fts`, `trigram`, `alias`), а не по
+    /// смыслу (`vector`, `folder` — точки папок из векторного поиска); M6.6 §3.2.
+    pub const fn is_lexical(self) -> bool {
+        matches!(self, Channel::Fts | Channel::Trigram | Channel::Alias)
+    }
+}
+
+/// Карточку поиска нашёл лексический канал: среди её `sources` (имена [`Channel::as_str`])
+/// есть лексический ([`Channel::is_lexical`]); неизвестное имя — не лексическое. Одно правило
+/// для подсказок сервера — короткий запрос `prompt` и подтверждение подсказок-идей (балл гибрида
+/// нормирован по непустым каналам: карточка одного вектора получает 1,0 на любой запрос, M6.6
+/// §3.2) — и для модели калибровки `xtask eval --hints`.
+pub fn any_lexical<'a>(sources: impl IntoIterator<Item = &'a str>) -> bool {
+    sources.into_iter().any(|s| {
+        Channel::ALL
+            .iter()
+            .any(|c| c.is_lexical() && c.as_str() == s)
+    })
 }
 
 /// Уровень чанка (§8.2).
@@ -759,5 +787,26 @@ mod tests {
         let mut inp = base.clone();
         inp.folders = vec![folder(s, "ops", 1)];
         assert_eq!(fuse(&inp, &Weights::default(), now()), m2);
+    }
+
+    /// M6.6 §3.2: лексические каналы — `fts`, `trigram`, `alias` (слово запроса есть в тексте);
+    /// `vector` и `folder` — по смыслу. Неизвестное имя — не лексическое.
+    #[test]
+    fn lexical_channels_and_sources() {
+        let names: HashSet<&str> = Channel::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names.len(), Channel::ALL.len(), "имена каналов различны");
+        let lexical: Vec<&str> = Channel::ALL
+            .iter()
+            .filter(|c| c.is_lexical())
+            .map(|c| c.as_str())
+            .collect();
+        assert_eq!(lexical, ["fts", "trigram", "alias"]);
+        assert!(any_lexical(["vector", "fts"]));
+        assert!(any_lexical(["alias"]));
+        assert!(any_lexical(["trigram"]));
+        assert!(!any_lexical(["vector"]));
+        assert!(!any_lexical(["vector", "folder"]));
+        assert!(!any_lexical(["FTS", "bm25"]));
+        assert!(!any_lexical(std::iter::empty::<&str>()));
     }
 }

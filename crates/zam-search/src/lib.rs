@@ -28,7 +28,7 @@ pub use adjust::{
     recency_factor, rescale_overflow, summaries_without_leaf, target_cap,
 };
 pub use hybrid::{
-    Channel, ChunkMeta, FolderHit, Level, Ranked, SearchInputs, Weights, folder_score, fuse,
-    fuse_normed,
+    Channel, ChunkMeta, FolderHit, Level, Ranked, SearchInputs, Weights, any_lexical, folder_score,
+    fuse, fuse_normed,
 };
 pub use pack::{Cost, ELLIPSIS, Fit, pack, truncate_marked, truncate_to_tokens};

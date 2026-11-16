@@ -723,6 +723,96 @@ async fn prompt_task_title_hint() {
             || text.contains(&format!("[in_progress] k:{busy}")),
         "{j}"
     );
+    // заблокированная задача — тоже подсказка, со своим статусом (ревью задачи 2, M7)
+    let blocked = entry(&a, &a.token, G, task("Миграция журнала Vault")).await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{blocked}"),
+            Some(json!({"status": "blocked", "blocked_by": "ждём ревью"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tt4"),
+        json!({"event": "prompt", "solution": G, "prompt": "займёмся миграцией журнала Vault"}),
+    )
+    .await;
+    let line = format!("ZeroAIMemory: задача «Миграция журнала Vault» [blocked] k:{blocked}");
+    assert!(
+        j["text"].as_str().unwrap().lines().any(|l| l == line),
+        "{j}"
+    );
+}
+
+/// Ревью задачи 2, M1 (**решение координатора**): строгое совпадение FTS (все слова промпта —
+/// в тексте задачи) у короткого промпта (до `PROMPT_SHORT_WORDS` предметных слов) тоже требует
+/// покрытого заголовка — одно слово из тела задачи подсказки не даёт; у длинного промпта строгое
+/// совпадение проходит и без слов заголовка (§3.4).
+#[tokio::test]
+async fn prompt_task_strict_match() {
+    let a = server("task-strict").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let id = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": "Перенос памяти ZeroAgent",
+               "body": "Скопировать каталог базы на новый диск через zam backup.",
+               "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let line = format!("ZeroAIMemory: задача «Перенос памяти ZeroAgent» [open] k:{id}");
+    // одно слово — только в теле: строгий запрос его находит, заголовок не покрыт
+    for (s, prompt) in [("ts1", "каталог"), ("ts2", "каталог базы")] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(s),
+            json!({"event": "prompt", "solution": G, "prompt": prompt}),
+        )
+        .await;
+        assert!(
+            !j["text"].as_str().unwrap().contains("задача «"),
+            "{prompt}: {j}"
+        );
+    }
+    // все слова длинного промпта — в теле задачи (строгий запрос): подсказка
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ts3"),
+        json!({"event": "prompt", "solution": G,
+               "prompt": "скопировать каталог базы на новый диск"}),
+    )
+    .await;
+    assert!(
+        j["text"].as_str().unwrap().lines().any(|l| l == line),
+        "{j}"
+    );
+    // короткий промпт со словом заголовка — подсказка (заголовок из одного слова покрыт)
+    let one = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": "Индексатор", "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ts4"),
+        json!({"event": "prompt", "solution": G, "prompt": "индексатор"}),
+    )
+    .await;
+    let line = format!("ZeroAIMemory: задача «Индексатор» [open] k:{one}");
+    assert!(
+        j["text"].as_str().unwrap().lines().any(|l| l == line),
+        "{j}"
+    );
 }
 
 /// `post_tool`: совпадение `error_regex` (с учётом `tools`) и FTS по нормализованной ошибке;

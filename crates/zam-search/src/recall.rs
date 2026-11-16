@@ -392,6 +392,42 @@ pub fn subject_terms(prompt: &str) -> Vec<String> {
     out
 }
 
+/// Предметных слов ([`subject_terms`]), при которых запрос к подсказкам «короткий» (M6.6 §3.2,
+/// **[решение координатора]** — константа, не ключ конфигурации): у одного-двух слов векторный
+/// сигнал самый слабый, поэтому подсказка поиска — только с лексическим совпадением
+/// ([`crate::any_lexical`]), а подсказка-задача — только с покрытым заголовком (ревью задачи 2,
+/// M1).
+pub const PROMPT_SHORT_WORDS: usize = 2;
+
+/// Решение по запросу пользователя к подсказкам (`/recall` `prompt`, M6.6 §3.1–§3.3) — до
+/// поиска: одно правило для сервера и модели калибровки `xtask eval --hints` ([`prompt_gate`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptGate {
+    /// Пересланное сообщение агента ([`zam_core::text::is_relayed_message`]) — тишина, без
+    /// строк словаря.
+    Relayed,
+    /// Предметных слов нет — только строки словаря (имя термина в запросе — уже предмет).
+    NoSubject,
+    /// Поиск подсказок: предметные слова и «короткий запрос» (`subject.len() <=`
+    /// [`PROMPT_SHORT_WORDS`]).
+    Search { subject: Vec<String>, short: bool },
+}
+
+/// Правило тишины подсказок к запросу `query` (первые 512 символов промпта): пересланное
+/// сообщение — раньше всего, затем запрос без предметных слов, иначе — поиск с признаком
+/// короткого запроса.
+pub fn prompt_gate(query: &str) -> PromptGate {
+    if zam_core::text::is_relayed_message(query) {
+        return PromptGate::Relayed;
+    }
+    let subject = subject_terms(query);
+    if subject.is_empty() {
+        return PromptGate::NoSubject;
+    }
+    let short = subject.len() <= PROMPT_SHORT_WORDS;
+    PromptGate::Search { subject, short }
+}
+
 /// Порог покрытия слов запроса текстом записи у ослабленного FTS (любое слово):
 /// `need = clamp(⌈n / divisor⌉, 2, cap)`, не больше `n` — иначе общие слова ошибки («file»,
 /// «error») поднимали бы случайные записи, а длинная ошибка (stack trace) требовала бы от
@@ -1059,5 +1095,40 @@ mod tests {
             assert!(seen.insert(w), "повтор {w}");
             assert!(subject_terms(w).is_empty(), "{w}");
         }
+    }
+
+    /// M6.6 §3.1–§3.3: правило тишины подсказок к запросу — одно для сервера и модели
+    /// калибровки (ревью задачи 2, I1). Пересланное сообщение — раньше всего (даже с предметом),
+    /// затем «нет предмета», затем граница короткого запроса `<= PROMPT_SHORT_WORDS`.
+    #[test]
+    fn prompt_gate_rules() {
+        let search = |p: &str| match prompt_gate(p) {
+            PromptGate::Search { subject, short } => Some((subject.len(), short)),
+            _ => None,
+        };
+        assert_eq!(
+            prompt_gate("[Subagent hand-back] квазар найден в каталоге"),
+            PromptGate::Relayed
+        );
+        assert_eq!(prompt_gate("\n<task-notification>"), PromptGate::Relayed);
+        assert_eq!(prompt_gate("согласен"), PromptGate::NoSubject);
+        assert_eq!(prompt_gate("Да, давай, продолжай"), PromptGate::NoSubject);
+        assert_eq!(prompt_gate(""), PromptGate::NoSubject);
+        assert_eq!(
+            prompt_gate("согласен, мигрируй 0026"),
+            PromptGate::Search {
+                subject: vec!["0026".into(), "мигрируй".into()],
+                short: true
+            }
+        );
+        assert_eq!(search("квазар"), Some((1, true)));
+        assert_eq!(PROMPT_SHORT_WORDS, 2);
+        assert_eq!(search("квазар светит"), Some((2, true)));
+        assert_eq!(search("квазар светит ярко"), Some((3, false)));
+        // маркер не в начале — слова человека
+        assert_eq!(
+            search("посмотри [Subagent hand-back] квазар"),
+            Some((5, false))
+        );
     }
 }

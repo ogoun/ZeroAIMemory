@@ -973,10 +973,10 @@ async fn any_prompt_candidates(
 /// Лексическое подтверждение идеи решения в подсказке (финальное ревью M5.7, I-1): балл
 /// отдельного поиска только по идеям нормирован по непустым каналам, и без порога вектора
 /// ближайшая идея получала бы 1,0 на любой запрос. Нужны канал `fts`, `alias` или `trigram` в
-/// `sources` ([`super::prompt::lexical`] — общая проверка с коротким запросом подсказок поиска,
+/// `sources` ([`super::lexical_card`] — общая проверка с коротким запросом подсказок поиска,
 /// M6.6 §3.2) и совпадение слов запроса со словами идеи по основам ([`IdeaQuery::matches`]).
 fn idea_lexically_matched(item: &Value, e: &Entry, q: &IdeaQuery) -> bool {
-    super::prompt::lexical(item) && q.matches(&e.title, &e.body)
+    super::lexical_card(item) && q.matches(&e.title, &e.body)
 }
 
 /// Значимых слов идеи в пороге [`IdeaQuery::matches`], не больше: длинное тело не делает порог

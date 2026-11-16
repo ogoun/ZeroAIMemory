@@ -136,7 +136,7 @@ async fn wait_indexed(a: &Api, ids: &[String]) {
 /// M6.6 §3.2 (замечание 17, ML, MiniLM): короткий запрос (≤ 2 предметных слов) без
 /// лексического совпадения — тишина: балл гибрида нормирован по непустым каналам, и без правила
 /// ближайшая по вектору запись получала бы 1,0 при пороге 0,6 на любое слово. То же слово в
-/// записи (канал `fts`) — подсказка.
+/// записи (канал `fts`) — подсказка; запрос из трёх предметных слов правило не трогает.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prompt_short_vector_only_silent() {
     use common::ml::{MINILM, external, have, ml, vector_ready};
@@ -177,6 +177,28 @@ async fn prompt_short_vector_only_silent() {
         assert_eq!(j["text"], "", "{prompt}: только вектор — тишина: {j}");
         assert!(j["items"].as_array().unwrap().is_empty(), "{prompt}: {j}");
     }
+    // граница правила (ревью задачи 2, M2): три и больше предметных слова без FTS-совпадения —
+    // гибрид как прежде, подсказка по вектору остаётся
+    let long = "stellar nursery clouds collapse";
+    let j = ok(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "prompt", "prompt": long}),
+    )
+    .await;
+    assert!(
+        !ids(&j).is_empty(),
+        "{long}: длинный запрос — по вектору: {j}"
+    );
+    assert!(
+        j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["reason"] == "search"),
+        "{j}"
+    );
     let nebula = insight(
         &a,
         &a.token,
