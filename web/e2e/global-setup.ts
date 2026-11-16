@@ -127,7 +127,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     // карта кода решения E2E (M5.6): REST как у `zam code sync`, синтетические символы
     await seedCodeMap(base, token);
     const code = await seedCodeKnowledge(base, token);
-    // журнал «Идеи» (M5.7): своё общее решение, идеи человека и агента, вопрос-предложение, Knowledge
+    // журнал «Идеи» (M5.7): своё общее решение, идеи человека и агента, вопрос-предложение, Knowledge;
+    // разборы агента (M6.5): отклонённая, возвращённая, в плане с историей
     const ideas = await seedIdeas(base, token, admin);
     await rc.storageState({ path: ADMIN_STATE });
     await rc.dispose();
@@ -161,6 +162,11 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_IDEA_PROPOSED = ideas.proposed;
     process.env.E2E_IDEA_QUESTION = ideas.question;
     process.env.E2E_IDEA_KNOWLEDGE = ideas.knowledge;
+    process.env.E2E_IDEA_PLANNED = ideas.planned;
+    process.env.E2E_IDEA_PLAN_TASK = ideas.planTask;
+    process.env.E2E_IDEA_RETURNED = ideas.returned;
+    process.env.E2E_IDEA_DECLINED = ideas.declined;
+    process.env.E2E_IDEA_BASIS_TASK = ideas.basisTask;
   } catch (e) {
     child.kill();
     log.end();

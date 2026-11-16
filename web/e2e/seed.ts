@@ -731,6 +731,21 @@ export const IDEA_WORD = 'звездолётная';
 export const IDEA_AGENT_TITLE = 'Идея агента E2E: кэш миниатюр';
 export const IDEA_PROPOSED_TITLE = 'Идея E2E: экспорт графа в SVG';
 export const IDEA_KNOWLEDGE_TITLE = 'Общая идея E2E: шаблоны заметок';
+/** Разбор агентом (M6.5): идея в плане с историей «на доработку → дописана → в план». */
+export const IDEA_PLANNED_TITLE = 'Идея E2E: разбор в карточке';
+export const IDEA_RETURNED_TITLE = 'Идея E2E: статусы в ленте';
+export const IDEA_DECLINED_TITLE = 'Идея E2E: отклонена разбором';
+/** Опора разбора «в план» — обычная задача решения (без идеи). */
+export const IDEA_BASIS_TASK_TITLE = 'Задача E2E: журнал идей M5.7';
+export const REVIEW_FILE = 'docs/specs/2026-11-15-m6.5-idea-review.md';
+export const REVIEW_COMMIT = 'abc1234';
+/** Что агент просил дописать у возвращённой идеи. */
+export const REVIEW_MISSING = 'Какие статусы показывать в ленте и нужна ли группировка по ним?';
+/** Разбор (не короче `ideas.review_min_chars` = 200); второй абзац — проверка переносов. */
+export const reviewSummary = (what: string) =>
+  `Идея просит ${what}. В плане такого пункта нет, в ТЗ §7 журнал «Идеи» описан без статусов разбора, ` +
+  'сделанного по теме нет.\n\nРешение и почему: это канал обратной связи обкатки, без него владелец не видит, ' +
+  'что стало с идеей и почему агент решил так, а не иначе.';
 
 export interface IdeaSeed {
   human: string;
@@ -738,12 +753,21 @@ export interface IdeaSeed {
   proposed: string;
   question: string;
   knowledge: string;
+  planned: string;
+  planTask: string;
+  returned: string;
+  declined: string;
+  basisTask: string;
 }
 
 /**
  * Решение «Идеи E2E» (общее: одобренный участник `rw`) и идеи по токену администратора (агент):
  * идея человека (по его словам, `origin: human`), своя идея агента, идея с вопросом-предложением
- * (`propose`) и общая идея Knowledge.
+ * (`propose` — в режиме `ideas.mode = propose`, M5.7: в режиме `review` по умолчанию новую идею
+ * разбирает агент, propose — 409; после — снова `review`), общая идея Knowledge и разборы агента
+ * (M6.5): отклонённая, возвращённая на доработку и принятая в план с историей «на доработку →
+ * дописана человеком → в план» (ссылки «Опирался на» — задача, файл, коммит; «Похожие» —
+ * отклонённая).
  */
 export async function seedIdeas(base: string, token: string, admin: AdminCall): Promise<IdeaSeed> {
   const post = <T>(path: string, body: unknown) => api<T>(base, token, 'POST', path, json(body));
@@ -767,9 +791,45 @@ export async function seedIdeas(base: string, token: string, admin: AdminCall): 
   });
   const agent = await idea(IDEA_AGENT_TITLE, 'agent');
   const proposed = await idea(IDEA_PROPOSED_TITLE, 'human');
+  await admin('PATCH', 'auth/settings', { ideas: { mode: 'propose' } });
   const pr = await post<{ question: { id: string } }>(`entries/${proposed.id}/propose`, {
     text: 'Сейчас правим граф — экспорт ляжет рядом.',
   });
+  await admin('PATCH', 'auth/settings', { ideas: { mode: 'review' } });
   const knowledge = await idea(IDEA_KNOWLEDGE_TITLE, 'human', {}, 'spaces/knowledge/entries');
-  return { human: human.id, agent: agent.id, proposed: proposed.id, question: pr.question.id, knowledge: knowledge.id };
+
+  // разборы агента (M6.5): POST /entries/{id}/review токеном
+  const review = (id: string, body: Record<string, unknown>) =>
+    post<{ entry: { id: string; rev: number }; task?: { id: string } }>(`entries/${id}/review`, body);
+  const basisTask = await post<EntryResp>(sp, { kind: 'task', title: IDEA_BASIS_TASK_TITLE, body: 'Журнал «Идеи» M5.7.' });
+  const declined = await idea(IDEA_DECLINED_TITLE, 'human');
+  await review(declined.id, { outcome: 'decline', summary: reviewSummary('то, что уже отклоняли') });
+  const returned = await idea(IDEA_RETURNED_TITLE, 'human');
+  await review(returned.id, { outcome: 'return', summary: reviewSummary('статусы в ленте'), missing: REVIEW_MISSING });
+  const planned = await idea(IDEA_PLANNED_TITLE, 'human');
+  const back = await review(planned.id, { outcome: 'return', summary: reviewSummary('разбор в карточке'), missing: 'Что показывать в карточке?' });
+  // человек дописал (слова из чата — `by: human`): идея снова «Непросмотрено»
+  await api(base, token, 'PATCH', `entries/${planned.id}`, {
+    headers: { 'Content-Type': 'application/json', 'If-Match': `"${back.entry.rev}"` },
+    body: JSON.stringify({ append_body: 'Человек: исход, разбор, ссылки и историю.', by: 'human' }),
+  });
+  const plan = await review(planned.id, {
+    outcome: 'plan',
+    summary: reviewSummary('показать разбор в карточке'),
+    basis: [`k:${basisTask.id}`, `file:${REVIEW_FILE}`, `commit:${REVIEW_COMMIT}`],
+    similar: [`w:${declined.id}`],
+    task: { body: '1. Раздел «Разбор агента»\n2. История разборов', priority: 'high' },
+  });
+  return {
+    human: human.id,
+    agent: agent.id,
+    proposed: proposed.id,
+    question: pr.question.id,
+    knowledge: knowledge.id,
+    planned: planned.id,
+    planTask: plan.task!.id,
+    returned: returned.id,
+    declined: declined.id,
+    basisTask: basisTask.id,
+  };
 }

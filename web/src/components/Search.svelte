@@ -12,7 +12,7 @@
   import CertaintyBadge from './CertaintyBadge.svelte';
   import { ApiError, getOutline, listSpaces, search, spaceRef, type SearchItem } from '../lib/api';
   import { reasonText, warningText } from '../lib/indexing';
-  import { JOURNAL_OF_KIND, STATUS_TEXT } from '../lib/journals';
+  import { JOURNAL_OF_KIND, entryStatusText } from '../lib/journals';
   import { staleText } from '../lib/fileRefs';
   import { snippetParts } from '../lib/snippet';
   import { go } from '../lib/router';
@@ -239,7 +239,7 @@
                   <span class="ekind">{it.kind === 'report' ? 'отчёт' : it.kind === 'idea' ? 'идея' : it.kind}{it.insight_kind ? `/${it.insight_kind}` : ''}</span>
                   <span class="space">{it.space?.name ?? '?'}</span>
                   <span class="etitle">{it.title ?? ''}</span>
-                  {#if it.status}<span class="estatus">{STATUS_TEXT[it.status] ?? it.status}</span>{/if}
+                  {#if it.status}<span class="estatus">{entryStatusText(it.kind, it.status)}</span>{/if}
                   <CertaintyBadge value={it.certainty} />
                   {#if it.stale_refs?.length}<span class="stale" title={staleText(it.stale_refs)}>{staleText(it.stale_refs)}</span>{/if}
                   {#each it.sources ?? [] as src (src)}<span class="src" title={SOURCE_TITLE[src] ?? src}>{src}</span>{/each}

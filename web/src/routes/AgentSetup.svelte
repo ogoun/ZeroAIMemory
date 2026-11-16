@@ -5,8 +5,9 @@
   // установки и `zam init` (в блоке и `.mcp.json` его нет: MCP — stdio `zam mcp`, M6) и только в браузере —
   // вместо заглушки сервера `'<токен>'`, серверу в адресе он не уходит. Страница открывается
   // сразу после создания пользователя или выпуска токена (lib/agentSetup.ts). Здесь же —
-  // типы подсказок хуков пользователя на сервере (`hooks.<тип>`, §10.3, R5) и проактивность идей
-  // (`ideas.proactive`, M5.7 §8: раздел дайджеста «Идеи» и подсказки идей).
+  // типы подсказок хуков пользователя на сервере (`hooks.<тип>`, §10.3, R5), проактивность идей
+  // (`ideas.proactive`, M5.7 §8: раздел дайджеста об идеях и подсказки идей) и режим идей
+  // (`ideas.mode`, M6.5 §7: «Идеи: разбирать сам / предлагать мне»).
   import { onMount } from 'svelte';
   import TokenShown from '../components/TokenShown.svelte';
   import {
@@ -27,6 +28,7 @@
     type AgentSetup,
     type HookFlags,
     type HookKind,
+    type IdeasMode,
     type IssuedToken,
     type Lang,
     type Me,
@@ -88,6 +90,8 @@
   let flags = $state<HookFlags | null>(null);
   /** `ideas.proactive` пользователя (`null` — ещё не прочитано). */
   let ideasOn = $state<boolean | null>(null);
+  /** `ideas.mode` пользователя: `review` — разбирать сам, `propose` — предлагать мне. */
+  let ideasMode = $state<IdeasMode>('review');
   let flagsError = $state('');
   let copied = $state('');
   let copyHint = $state('');
@@ -161,6 +165,7 @@
       const s = await getUserSettings(admin ? userId : null);
       flags = s.hooks;
       ideasOn = s.ideas?.proactive ?? true;
+      ideasMode = s.ideas?.mode === 'propose' ? 'propose' : 'review';
     } catch (e) {
       flagsError = fail(e);
     }
@@ -195,7 +200,18 @@
   async function setIdeas(on: boolean) {
     flagsError = '';
     try {
-      ideasOn = (await setUserIdeas(admin ? userId : null, on)).ideas.proactive;
+      ideasOn = (await setUserIdeas(admin ? userId : null, { proactive: on })).ideas.proactive;
+    } catch (e) {
+      flagsError = fail(e);
+      await loadFlags();
+    }
+  }
+
+  async function setIdeasMode(m: IdeasMode) {
+    flagsError = '';
+    try {
+      const r = await setUserIdeas(admin ? userId : null, { mode: m });
+      ideasMode = r.ideas.mode === 'propose' ? 'propose' : 'review';
     } catch (e) {
       flagsError = fail(e);
       await loadFlags();
@@ -415,8 +431,23 @@
       {#if ideasOn !== null}
         <label class="opt">
           <input type="checkbox" checked={ideasOn} onchange={(e) => setIdeas(e.currentTarget.checked)} />
-          Идеи: предлагать (дайджест и подсказки) <code class="muted small">ideas.proactive</code>
+          Идеи: раздел дайджеста и подсказки (разбор и предложения) <code class="muted small">ideas.proactive</code>
         </label>
+        <div class="opt row" role="radiogroup" aria-label="Идеи: разбирать сам / предлагать мне">
+          Идеи:
+          {#each [['review', 'разбирать сам'], ['propose', 'предлагать мне']] as const as [m, title] (m)}
+            <label class="opt">
+              <input type="radio" name="ideas-mode" value={m} checked={ideasMode === m} onchange={() => setIdeasMode(m)} />
+              {title}
+            </label>
+          {/each}
+          <code class="muted small">ideas.mode</code>
+        </div>
+        <p class="muted small">
+          «Разбирать сам» — агент сам разбирает новые идеи: вносит в план («Задачи»), возвращает на доработку с
+          вопросами или отклоняет с причиной; разбор виден в карточке идеи. «Предлагать мне» — агент предлагает
+          идею вопросом, решаете вы. Выключенные подсказки идей гасят и то и другое.
+        </p>
       {/if}
     </div>
   {:else if !flagsError}
