@@ -205,6 +205,34 @@ fn yesterday() -> String {
         .to_string()
 }
 
+/// Новая ревизия записи `id` — копия последней без причины (прямой SQL): так выглядит поздняя
+/// ревизия с тем же `data.decided` (правка или хук сервера после решения).
+async fn later_revision_without_reason(a: &Api, id: &str) {
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let id = id.to_string();
+    db.write(move |tx| {
+        let n = tx.execute(
+            "INSERT INTO entry_revisions (entry_id, rev, title, body, data, tags, area, status,
+                                          certainty, reason, ts, author_kind, user_id,
+                                          token_id, session_id, machine)
+             SELECT entry_id, rev + 1, title, body, data, tags, area, status, certainty, NULL,
+                    ts, author_kind, user_id, token_id, session_id, machine
+             FROM entry_revisions
+             WHERE entry_id = ?1
+               AND rev = (SELECT max(rev) FROM entry_revisions WHERE entry_id = ?1)",
+            [&id],
+        )?;
+        assert_eq!(n, 1);
+        tx.execute(
+            "UPDATE entries SET current_rev = current_rev + 1 WHERE id = ?1",
+            [&id],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
 /// Отложенная идея с наступившим `horizon`: `defer` человеком, затем `horizon` — вчера (SQL).
 async fn defer_due(a: &Api, id: &str) {
     let r = post(
@@ -541,7 +569,7 @@ async fn idea_review_pack_has_similar_and_reasons() {
         "сама идея — не похожая: {b}"
     );
     assert!(!b.contains("История:"), "{b}");
-    assert!(t.ends_with("\nПоказано идей на разбор: 1 из 1.\n"), "{t}");
+    assert!(t.ends_with("\n\nПоказано идей на разбор: 1 из 1.\n"), "{t}");
     // вернули на разбор с доводом — довод и прежний разбор в пакете
     let reason = "Бухгалтерии нужен именно PDF: печать из браузера не подходит.";
     let r = post(
@@ -574,21 +602,31 @@ async fn idea_review_pack_has_similar_and_reasons() {
     let j = pack(&a, json!({"limit": 1})).await;
     assert_eq!(items(&j, "idea_review"), [format!("w:{declined}")], "{j}");
     assert!(!text(&j).contains(&format!("— w:{x}\n")), "{j}");
+    // строка «показано» отделена от блока последней идеи пустой строкой (раунд 2)
     assert!(
-        text(&j).contains("\nПоказано идей на разбор: 1 из 2.\n"),
+        text(&j).contains("\n\nПоказано идей на разбор: 1 из 2.\n"),
         "{j}"
     );
     assert!(!text(&j).contains("не показано"), "{j}");
-    // не вошедшие в бюджет — строкой «не показано» с адресом (ревью задачи 4, Minor 3)
+    // в бюджет не вошла ни одна идея — совет про бюджет, а не «после разбора показанных»
+    // (ревью задачи 4, Minor 3; раунд 2); текста перед строкой нет — без пустой строки
     let j = pack(&a, json!({"budget_tokens": 20})).await;
     assert!(items(&j, "idea_review").is_empty(), "{j}");
-    assert!(
-        text(&j).contains(
-            "Показано идей на разбор: 0 из 2.\nZeroAIMemory: не показано — идей на разбор: 2 \
-             (memory_recall event=idea_review после разбора показанных)\n"
-        ),
+    assert_eq!(
+        text(&j),
+        "Показано идей на разбор: 0 из 2.\nZeroAIMemory: не показано — идей на разбор: 2 \
+         (подними budget_tokens или уменьши limit)\n",
         "{j}"
     );
+    // предел вывода клиента: строка — только если помещается (раунд 2)
+    let limited = |max: usize| json!({"output_limit": {"unit": "chars", "max": max}});
+    let j = pack(&a, limited(100_000)).await;
+    assert!(text(&j).contains("Показано идей на разбор: 2 из 2."), "{j}");
+    let full = text(&j).chars().count();
+    let j = pack(&a, limited(full - 5)).await;
+    let t = text(&j);
+    assert!(t.chars().count() <= full - 5, "{t}");
+    assert!(!t.contains("Показано идей на разбор"), "{t}");
 }
 
 /// Причина у отклонённой похожей идеи — только из её отклонения (ревью задачи 4, Important 1):
@@ -636,6 +674,9 @@ async fn pack_declined_reason_only_from_decline() {
     )
     .await;
     ok(&r, StatusCode::OK);
+    // поздняя ревизия с тем же решением и без причины (правка, хук сервера; содержимое
+    // отклонённой идеи API не правит — ревизия прямым SQL): причина отказа не теряется (раунд 2)
+    later_revision_without_reason(&a, &said).await;
     let x = idea(&a, "Экспорт в PDF", "Выгружать отчёт в PDF.", json!({})).await;
     let j = pack(&a, json!({})).await;
     let b = idea_block(text(&j), &x);

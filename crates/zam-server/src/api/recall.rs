@@ -1549,20 +1549,31 @@ async fn review_pack(
     Ok((lines, out))
 }
 
-/// Строки после пакета `idea_review` (ревью задачи 4, Minor 3): «Показано идей на разбор: k из
-/// N.» — `shown` вошедших в текст из `n` в очереди; не вошедшие в бюджет (`picked` идей собрано
-/// больше, чем показано) — строка «не показано — идей на разбор: M (…)» в формате строк о снятом
-/// ([`Section::omit`]). Бюджет снимает блоки молча (строки о снятом — только у предела вывода
-/// канала, [`pack_limited`]), поэтому строка — здесь; под пределом вывода (`limited`) её даёт
-/// сам предел (`omit` раздела, [`omit_of`]).
-fn review_shown_line(shown: usize, picked: usize, n: usize, limited: bool) -> String {
-    let mut s = format!("Показано идей на разбор: {shown} из {n}.\n");
+/// Строки после пакета `idea_review` (ревью задачи 4, Minor 3; раунд 2): «Показано идей на
+/// разбор: k из N.» — `shown` вошедших в текст из `n` в очереди; не вошедшие в бюджет (`picked`
+/// идей собрано больше, чем показано) — строка «не показано — идей на разбор: M (…)» в формате
+/// строк о снятом ([`Section::omit`]): часть показана — следующий пакет после разбора показанных
+/// ([`REVIEW_OMIT_NEXT`]), не вошла ни одна — бюджет мал для одной идеи
+/// ([`REVIEW_OMIT_BUDGET`]). Бюджет снимает блоки молча (строки о снятом — только у предела
+/// вывода канала, [`pack_limited`]), поэтому строка — здесь; под пределом вывода (`limited`) её
+/// даёт сам предел (`omit` раздела, [`omit_of`]). `after` — текст перед строками не пуст: они
+/// отделяются от блока последней идеи пустой строкой.
+fn review_shown_line(shown: usize, picked: usize, n: usize, limited: bool, after: bool) -> String {
+    let mut s = String::new();
+    if after {
+        s.push('\n');
+    }
+    s.push_str(&format!("Показано идей на разбор: {shown} из {n}.\n"));
     if shown < picked && !limited {
+        let whole = if shown == 0 {
+            REVIEW_OMIT_BUDGET
+        } else {
+            REVIEW_OMIT_NEXT
+        };
         s.push_str(&format!(
-            "{HINT_PREFIX} не показано — {}: {} ({})\n",
+            "{HINT_PREFIX} не показано — {}: {} ({whole})\n",
             OMIT_IDEAS_REVIEW.0,
-            picked - shown,
-            OMIT_IDEAS_REVIEW.1
+            picked - shown
         ));
     }
     s
@@ -1811,9 +1822,10 @@ async fn review_similar(
 /// Причина отклонения идеи `id` для строки похожей записи (ревью задачи 4, Important 1):
 /// отклонил агент разбором (`data.decided` — `decline` канала `review`) — ` — разбор: <первая
 /// строка разбора>`; отклонил человек — ` — причина человека: <причина>` только из ревизии, где
-/// `data.decided` — `decline` человека (причину в ревизию пишет `decide`, у «Отказаться» она
-/// необязательна: причина другой ревизии — довод «вернуть» или «отложить» — отказу не
-/// принадлежит). Нет такой причины, сбой чтения, срок — `None`.
+/// это решение появилось (первая ревизия с тем же `data.decided`, вместе с `at`): причину в
+/// ревизию пишет `decide`, у «Отказаться» она необязательна — причина другой ревизии (довод
+/// «вернуть» или «отложить») отказу не принадлежит, а поздние ревизии с тем же решением её не
+/// несут. Нет такой причины, сбой чтения, срок — `None`.
 async fn decline_reason(db: &zam_store::Db, id: Id, deadline: &mut Deadline) -> Option<String> {
     use zam_store::{AnswerBy, DecidedAs, DecidedVia, ReviewOutcome};
     let e = match deadline.step(zam_store::get_entry(db, id)).await? {
@@ -1848,12 +1860,11 @@ async fn decline_reason(db: &zam_store::Db, id: Id, deadline: &mut Deadline) -> 
             return None;
         }
     };
-    // последняя ревизия отклонения человеком — та, что записала нынешнее решение
-    let rev = revs.iter().rev().find(|r| {
-        zam_store::IdeaData::from_stored(&r.data)
-            .decided
-            .is_some_and(|dc| dc.decision == DecidedAs::Decline && dc.by == AnswerBy::Human)
-    })?;
+    // ревизия, где нынешнее решение появилось (то же `decided`, в том числе `at`, — первая):
+    // поздние ревизии с тем же `decided` (правки, хуки) причины не несут (ревью задачи 4, раунд 2)
+    let rev = revs
+        .iter()
+        .find(|r| zam_store::IdeaData::from_stored(&r.data).decided.as_ref() == Some(decided))?;
     let why = rev.reason.as_deref().filter(|s| !s.trim().is_empty())?;
     Some(format!(
         "причина человека: {}",
@@ -4717,12 +4728,18 @@ const OMIT_OPEN_QUESTIONS: Omit = ("строк открытых вопросов
 /// Адрес снятой строки плана из идей.
 const OMIT_PLAN: Omit = ("строк плана из идей", "memory_search kinds=[task]");
 
-/// Адрес идей пакета `idea_review`, не вошедших в ответ: следующий пакет после разбора
-/// показанных (разобранные из очереди уходят).
+/// Адрес идей пакета `idea_review`, снятых пределом вывода канала ([`omit_of`]): тот же пакет с
+/// меньшим `limit`.
 const OMIT_IDEAS_REVIEW: Omit = (
     "идей на разбор",
-    "memory_recall event=idea_review после разбора показанных",
+    "memory_recall event=idea_review с меньшим limit",
 );
+/// Адрес идей пакета, не вошедших в бюджет, когда часть показана ([`review_shown_line`]):
+/// следующий пакет после разбора показанных (разобранные из очереди уходят).
+const REVIEW_OMIT_NEXT: &str = "memory_recall event=idea_review после разбора показанных";
+/// Адрес, когда в бюджет не вошла ни одна идея ([`review_shown_line`]): разбор показанных
+/// очередь не продвинет — нужен бюджет больше или идей меньше.
+const REVIEW_OMIT_BUDGET: &str = "подними budget_tokens или уменьши limit";
 
 /// Адрес снятого блока `(что, где полностью)` — строка «не показано — <что>: N (<где>)».
 type Omit = (&'static str, &'static str);
@@ -5181,12 +5198,19 @@ pub async fn recall(
             .iter()
             .filter(|c| c.reason == REASON_IDEA_REVIEW)
             .count();
-        text.push_str(&review_shown_line(
+        let tail = review_shown_line(
             shown,
             review_picked,
             review_total,
             limit.is_some(),
-        ));
+            !text.is_empty(),
+        );
+        // под пределом вывода клиента (ревью задачи 4, раунд 2) — только если строка в него
+        // помещается: предел важнее справочной строки
+        let next = format!("{text}{tail}");
+        if limit.is_none_or(|l| l.fits(&next)) {
+            text = next;
+        }
     }
     // контрольная группа (M6 §12): ничего не выдано — ни текста, ни отметок показа
     let (text, rules_tokens, shown_now) = if holdout {
@@ -5404,6 +5428,35 @@ mod tests {
         assert_eq!(words("update the changelog and the makefile"), (2, 1));
         assert_eq!(words("fix tests"), (0, 2));
         assert!(IdeaQuery::new(&error_terms("fix tests")).is_empty());
+    }
+
+    /// Ревью задачи 4 (Minor 3, раунд 2): строки после пакета — пустая строка после блока,
+    /// «показано k из N»; не вошедшие в бюджет — адрес по случаю; под пределом вывода — без
+    /// строки «не показано» (её даёт предел).
+    #[test]
+    fn review_shown_line_advice() {
+        assert_eq!(
+            review_shown_line(1, 1, 1, false, true),
+            "\nПоказано идей на разбор: 1 из 1.\n"
+        );
+        assert_eq!(
+            review_shown_line(1, 1, 3, false, false),
+            "Показано идей на разбор: 1 из 3.\n"
+        );
+        assert_eq!(
+            review_shown_line(1, 3, 4, false, true),
+            "\nПоказано идей на разбор: 1 из 4.\nZeroAIMemory: не показано — идей на разбор: 2 \
+             (memory_recall event=idea_review после разбора показанных)\n"
+        );
+        assert_eq!(
+            review_shown_line(0, 2, 2, false, false),
+            "Показано идей на разбор: 0 из 2.\nZeroAIMemory: не показано — идей на разбор: 2 \
+             (подними budget_tokens или уменьши limit)\n"
+        );
+        assert_eq!(
+            review_shown_line(1, 3, 4, true, true),
+            "\nПоказано идей на разбор: 1 из 4.\n"
+        );
     }
 
     /// M6 §16 (задача 16): глубина каналов лёгкого поиска идей — `max(4 × top_k, 20)`, без
