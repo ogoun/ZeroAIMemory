@@ -1302,16 +1302,20 @@ async fn acceptance_task_lifecycle_and_dead_ends() {
 /// §13 п. 11: блок v6 (ru, en) со строкой идей ≤ 500 токенов bge-m3 и без четырёх перенесённых
 /// фраз (они — в протоколе вместе с разделом «Идеи» и `--channel chat`); напоминание v5 → v6 —
 /// одно; MCP — 11 инструментов, описания ≤ 300 символов, `propose`/`decide`/`horizon` в схеме.
-/// Худший случай (длинные адрес, имя, GUID) — `agent_setup_block_v6_under_500_tokens_ru_en`.
+/// Худший случай (длинные адрес, имя, GUID) — `agent_setup_block_v8_under_500_tokens_ru_en`. С M6.5
+/// строка идей — блока v8 (разбор агентом, §8 спецификации M6.5).
 #[tokio::test]
 async fn acceptance_block_v6_and_mcp() {
     use zam_markdown::TokenCounter as _;
     let a = world("block", |_| {}).await;
     let counter = common::ml::bge_counter();
+    // строка идей — блока v8 (M6.5 §8: разбор агентом); правило «без ответа «начать» не начинай»
+    // осталось в протоколе для режима `propose`
     let cases = [
         (
             "ru",
-            "- Идея → `idea`; начинать её — только после ответа человека «начать».\n",
+            "- Идея → `idea`; новые идеи человека разбирай сам (action=review) после текущего \
+             шага; режим `propose` — предлагай, решает человек.\n",
             [
                 "(409 — перечитай)",
                 "заметке — `l0`",
@@ -1323,7 +1327,8 @@ async fn acceptance_block_v6_and_mcp() {
         ),
         (
             "en",
-            "- Idea → `idea`; start it only after the human answers “start”.\n",
+            "- Idea → `idea`; review new human ideas yourself (action=review) after the current \
+             step; in `propose` mode — propose, the human decides.\n",
             [
                 "(409 — reread)",
                 "give notes an `l0`",
@@ -1346,9 +1351,9 @@ async fn acceptance_block_v6_and_mcp() {
             .await;
         ok(&r, StatusCode::OK, "agent-setup");
         let j = r.json();
-        // с M6 — блок v7 (строка идей и перенесённые фразы M5.7 в нём сохранены)
+        // с M6 — блок v7, с M6.5 — v8 (перенесённые фразы M5.7 в протоколе, строка идей — v8)
         let v = zam_core::AGENT_BLOCK_VERSION;
-        assert!(v >= 6, "{v}");
+        assert!(v >= 8, "{v}");
         assert_eq!(j["version"], v);
         let block = j["block"].as_str().unwrap();
         assert!(
@@ -1361,7 +1366,7 @@ async fn acceptance_block_v6_and_mcp() {
         }
         if let Some(c) = &counter {
             let n = c.count(block);
-            eprintln!("ZAM_TIMING блок v6 {lang}: {n} токенов bge-m3");
+            eprintln!("ZAM_TIMING блок v{v} {lang}: {n} токенов bge-m3");
             assert!(n <= 500, "{lang}: {n} токенов");
         }
         let r = a
