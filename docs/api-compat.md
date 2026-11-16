@@ -67,6 +67,7 @@
 | `recall_timeout` | M6 §16 п. 19 (CR-7) | Поле `timeout_ms` тела `POST /recall` и аргумент `memory_recall`: 1..=`max(recall.max_timeout_ms, recall.timeout_ms)` (предел `recall.max_timeout_ms` по умолчанию 2000); без поля — `recall.timeout_ms` (200). |
 | `idempotent_nodes` | M6 §16 п. 19 (CR-20) | `Idempotency-Key` у `POST /nodes`, `PUT` и `PATCH /nodes/{id}`; `idempotency_key` у `memory_write`. |
 | `mcp_session_arg` | M6 §16 п. 19 (CR-8) | Аргумент `session_id` у `memory_recall`, `memory_search`, `memory_read` — явная сессия для учёта и отметок, как `X-Zam-Session`. |
+| `idea_review` | M6.5 §5–§7 | Разбор идей агентом: `POST /entries/{id}/review` (исходы `plan`, `return`, `decline`, `done`; повтор по `Idempotency-Key`), статус идеи `returned`, режим `ideas.mode` (`review` по умолчанию — `[ideas] default_mode`, или `propose`) в `/auth/settings`; в режиме `review` `propose` идеи `new` — 409 `/problems/idea-mode`; пакет `POST /recall {event: "idea_review", limit}`, счётчики `GET /spaces/{space}/entries/counts`, фильтр `from_idea` и поле `idea` задачи (раздел «Разбор идей» ниже). Старый сервер без флага разбора не знает. |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -129,3 +130,73 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
 - Без ключа всё как раньше: повтор `PATCH append` с тем же `base_rev` допишет текст ещё раз
   (`append` и `prepend` применяются к текущему тексту при любом `base_rev` не новее текущей).
 - MCP: `memory_write {…, idempotency_key}` и `memory_log {…, idempotency_key}`.
+
+## Разбор идей (`idea_review`)
+
+Введён в M6.5 (`0.0.12-m6.5`, спецификация `docs/specs/2026-11-15-m6.5-idea-review.md`). Всё
+ниже клиент использует, только увидев флаг `idea_review` в `features`.
+
+- **Статус идеи `returned`** («На доработку»). Сервер без флага его не знает: фильтр ленты
+  `status=returned` у него — 400. `zam idea list` без `--status` на таком сервере повторяет запрос
+  без `returned`.
+- **`POST /entries/{id}/review`** — разбор идеи агентом, только по токену. Тело (строгий
+  разбор): `{outcome, summary, missing?, basis?, similar?, task?, space?, message?}`.
+  - `outcome` — `plan | return | decline | done`; `summary` — 200 (`[ideas] review_min_chars`)
+    — 8000 символов; `missing` — только у `return` и обязателен у него, ≤ 2000.
+  - `basis` — на что опирался разбор: ссылки на живые записи и заметки того же пространства
+    (`n: i: c: r: t: k: q: w:`), `file:<путь от корня решения без ..>`, `commit:<hex 7–64>`; у
+    `done` нужна хотя бы одна ссылка на сделанное (`c:`, `r:`, `commit:`, `k:` задачи `done`).
+  - `similar` — похожие идеи: **только** `w:<id>` живых идей того же пространства (любого
+    статуса, в том числе отклонённые), не сама разбираемая идея; другой префикс — 422.
+  - В каждом из полей `basis` и `similar` — не больше 50 ссылок (`REVIEW_REFS_MAX`): предел
+    считается по присланному списку до схлопывания повторов (51 одинаковая ссылка — 422), затем
+    повторы схлопываются — хранится первое вхождение; неверная ссылка — 422 с именем поля. Рёбер
+    графа ссылки не создают — они хранятся только в `data.review`. Импорт пространства
+    переписывает их (`basis`, `similar`, `task` в `data.review` и `data.reviews`) на новые id;
+    `by_user` — голый id пользователя исходного сервера, импорт его не переписывает.
+  - Тексты `summary`, `missing`, `task.body` — не больше `limits.note_max_bytes` байт (как тело
+    записи): больше — 413 `/problems/too-large`, `detail` начинается с имени поля.
+  - `task` у `plan`: `{title?, body?, priority?}` — новая задача `open` (план шагов в `body`), или
+    `{id: "k:<id>"}` — привязать к открытой задаче (`open | in_progress | blocked`) того же
+    пространства.
+  - Ответ — 200 `{entry, task?, replay}`. `Idempotency-Key` — на один вызов разбора: повтор с тем
+    же ключом — 200 с `replay: true`, без второй задачи и аудита, только пока идея не менялась
+    после того разбора и исход тот же. Ключ, уже использованный разбором этой идеи тем же
+    пользователем, в остальных случаях (идею после разбора правили, другой исход, ключ прежнего
+    разбора из истории) — 422 `/problems/idempotency-mismatch`: новому разбору — новый ключ.
+  - Ошибки: сессия WebUI и идея Knowledge — 422; токен `ro` — 403; идея «от агента» — 409
+    `/problems/idea-agent-origin`; статус не `new` (в том числе после решения человека и второй
+    разбор) — 409 `/problems/conflict` с `code: transition-not-allowed`; режим `propose` владельца
+    базы — 409 `/problems/idea-mode`; неверное поле — 422, `detail` начинается с имени поля
+    (`summary:`, `missing:`, `basis:`, `task.id:` …); неизвестное поле тела — 400.
+- **Режим `ideas.mode`**: `GET/PATCH /auth/settings` → `{ideas: {proactive, mode}}`, `mode` —
+  `review` (по умолчанию — `[ideas] default_mode` сервера) или `propose`; не строка — 400,
+  другая строка — 422; токен свою настройку не меняет (403). Значение, равное умолчанию сервера,
+  не хранится: правка на него удаляет сохранённый выбор (пользователь снова идёт за `[ideas]
+  default_mode`), аудит `{key, from, to}` — как у любой правки. В общем решении действует режим
+  владельца базы. В режиме `review` `POST /entries/{id}/propose` идеи `new` — 409
+  `/problems/idea-mode`.
+- **`PATCH /entries/{id}` `by: "human" | "agent"`** — только у токена и только вместе с правкой
+  заголовка или тела идеи (иначе 422): правка возвращённой идеи со словами человека (`by:
+  human`) переводит её в `new`, правка агентом статус не меняет. MCP `memory_update_entry
+  action=append` передаёт `by`; CLI — `zam insight append <id> --by human|agent`.
+- **`GET /entries/{id}` идеи с разборами** — поле `reviewers {<id пользователя>: <имя>}`: имена
+  пользователей `by_user` разборов (`data.review` и `data.reviews`) для подписи «чей агент
+  разбирал»; только в ответе, в `data` не хранится; пользователя нет — его id в поле нет.
+- **`POST /recall {event: "idea_review", limit?}`** — пакет разбора: до `limit` (1..=20, по
+  умолчанию 5; иначе 400) идей очереди с историей разборов, доводами человека и до 5 похожих
+  записей решения; `items[]` — `kind: idea`, `reason: idea_review`. Бюджет — `budget_tokens`
+  (по умолчанию 3000), срок по умолчанию — `max(recall.max_timeout_ms, recall.timeout_ms)`. Без
+  идей — строка-уведомление (очередь пуста, решение не задано, нет права записи, режим
+  `propose`). В режиме `review` у `session_start` раздел `### Идеи на разбор` и строка «План из
+  идей: …», у `prompt` подсказка к идее `new` — с `reason: idea_review`.
+- **Лента для WebUI**: `GET /spaces/{space}/entries/counts?kind=<вид>` → `{<статус>: n}` — все
+  статусы вида, нулевые тоже, с фильтрами ленты (`area`, `tag`, у идей `origin` и `priority`, у
+  задач `from_idea`); без `kind` или у вида без статусов — 400, фильтр не своего вида — 422.
+  `from_idea=1` у `kind=task` — только задачи с системным ребром `derived_from` на живую идею.
+  У задачи из идеи в `GET` и в ленте — `idea {id, title, status, space_id}` (исходная идея) и
+  `ideas` (все, по времени ребра); участнику общего решения — только идеи пространства решения.
+  У принятой идеи в ленте — `task {id, title, status}`.
+- **MCP**: `memory_update_entry {id: "w:…", action: "review", outcome, summary, missing?, basis?,
+  similar?, task?, idempotency_key?}` и `memory_recall {event: "idea_review", limit?}`;
+  инструментов по-прежнему 11.

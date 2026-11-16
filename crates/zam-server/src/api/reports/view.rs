@@ -131,7 +131,7 @@ pub async fn get_html(
     })
     .await?;
     Ok(Json(json!({
-        "entry": entry_json(&sc.db, e).await?,
+        "entry": entry_json(&sc.db, e, sc.role).await?,
         "html": r.html,
         "toc": r.toc,
         "warnings": r.warnings,

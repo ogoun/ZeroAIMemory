@@ -47,6 +47,30 @@ impl Resp {
     }
 }
 
+/// `id` записи в ответе (нет — паника с телом).
+pub fn id(v: &Value) -> String {
+    v["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("нет id: {v}"))
+        .to_string()
+}
+
+/// Ответ со статусом `s` (иначе паника с телом).
+pub fn ok(r: &Resp, s: StatusCode) {
+    assert_eq!(r.status, s, "{}", r.text());
+}
+
+/// Ответ — problem с типом `/problems/<kind>` и статусом `s`.
+pub fn problem(r: &Resp, s: StatusCode, kind: &str) {
+    ok(r, s);
+    assert_eq!(
+        r.json()["type"],
+        format!("/problems/{kind}"),
+        "{}",
+        r.text()
+    );
+}
+
 /// Percent-encoding всех байтов, кроме ASCII-букв и цифр.
 pub fn enc(s: &str) -> String {
     s.bytes()
@@ -223,6 +247,20 @@ impl Api {
             .await;
         assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
         r.json()["plaintext"].as_str().unwrap().to_string()
+    }
+
+    /// Владелец решения `guid` (токен `owner_tok`) одобряет доступ участника `member` с режимом
+    /// `access` (`rw` | `ro`).
+    pub async fn set_access(&self, owner_tok: &str, guid: &str, member: &str, access: &str) {
+        let r = self
+            .tok(
+                owner_tok,
+                Method::POST,
+                &format!("/api/v1/solutions/{guid}/access/{member}/approve"),
+                Some(json!({ "access": access })),
+            )
+            .await;
+        ok(&r, StatusCode::OK);
     }
 
     /// Id пользователя администратора.

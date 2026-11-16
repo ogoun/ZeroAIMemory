@@ -1,9 +1,20 @@
-//! `zam idea` — журнал «Идеи» (M5.7 §7.3): `list`, `new`, `propose`, `accept`, `defer`,
-//! `decline`.
+//! `zam idea` — журнал «Идеи» (M5.7 §7.3, M6.5 §5, §7): `list`, `new`, `queue`, `review`,
+//! `propose`, `accept`, `defer`, `decline`.
 //!
 //! - `list [--status S]… [--origin human|agent] [--knowledge]` — строки `w:<id> [статус]
-//!   [приоритет] заголовок`, у идеи агента — `(от агента)`, у начатой — `→ k:<задача>`; без
-//!   `--status` — `new, proposed, deferred, accepted`;
+//!   [приоритет] заголовок`, у идеи агента — `(от агента)`, у начатой — `→ k:<задача>`, у
+//!   возвращённой на доработку — `— не хватает: <начало missing>`; без `--status` — `new,
+//!   returned, proposed, deferred, accepted` (сервер до M6.5 отвечает на `returned` 400 — повтор
+//!   без него);
+//! - `queue [--limit N]` — пакет разбора `idea_review` (`POST /recall`, M6.5 §7): идеи
+//!   «Непросмотрено» с историей, похожими записями решения и шагами разбора (текст сервера);
+//!   сервер без флага `idea_review` — код 1, как у `review`;
+//! - `review <w:id> --plan|--return|--decline|--done --summary-file F [--missing T] [--basis
+//!   ID]… [--similar w:ID]… [--task k:ID | --task-title T --task-body-file F --task-priority
+//!   P] [--key K]` — разбор идеи агентом (`POST /entries/{id}/review`, M6.5 §5): «Разобрано
+//!   w:<id>: <исход>[ → задача k:<id>]», повтор по `--key` (`Idempotency-Key` одного разбора) —
+//!   с « (повтор)». Разбор — всегда действие агента: `--by` нет. Сервер без флага
+//!   `idea_review` в `/health` — код 1 с [`OLD_SERVER_REVIEW`];
 //! - `new <заголовок> [--body T | --file F.md] [--priority …] [--horizon YYYY-MM-DD] [--tag X]…
 //!   [--origin human|agent] [--knowledge]` — новая идея (`<id>@<rev>`);
 //! - `propose <w:id> [--text T] [--space GUID]` — предложить человеку: вопрос-предложение
@@ -21,7 +32,7 @@
 //!
 //! Пространство — решение из `solution.toml`, `--knowledge` — Knowledge. Ссылка — `w:<id>`,
 //! `e:<id>` или голый id; иначе код 6.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -30,13 +41,30 @@ use super::{Ctx, emit, emit_json, post_entry, solution_guid};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
 use crate::target::is_node_id;
 
-/// Статусы ленты по умолчанию: живые идеи (как умолчания поиска WebUI, спецификация §4).
-const ACTIVE: &str = "new,proposed,deferred,accepted";
+/// Статусы ленты по умолчанию: живые идеи (как умолчания поиска WebUI, спецификация M5.7 §4;
+/// `returned` — M6.5 §4).
+const ACTIVE: &str = "new,returned,proposed,deferred,accepted";
 
-/// Статусы идеи (спецификация §5).
-const STATUSES: [&str; 6] = [
-    "new", "proposed", "accepted", "deferred", "declined", "done",
+/// Умолчание ленты у сервера до M6.5 (`returned` нет): он разбирает статусы строго и на
+/// [`ACTIVE`] отвечает 400 «status: неизвестное значение» — `list` без `--status` повторяет
+/// запрос с этим списком (клиент новее сервера, `docs/api-compat.md`).
+const ACTIVE_M57: &str = "new,proposed,deferred,accepted";
+
+/// Статусы идеи (спецификация M5.7 §5; `returned` — M6.5 §4).
+const STATUSES: [&str; 7] = [
+    "new", "returned", "proposed", "accepted", "deferred", "declined", "done",
 ];
+
+/// Сообщение для сервера без разбора идей (нет флага `idea_review` в `GET /health` `features`,
+/// M6.5 §10).
+pub const OLD_SERVER_REVIEW: &str =
+    "сервер не поддерживает разбор идей: нужен zam-server 0.0.12-m6.5 или новее";
+
+/// Флаг разбора идей в `GET /health` `features` (`docs/api-compat.md`).
+const FEATURE_REVIEW: &str = "idea_review";
+
+/// Символов начала `missing` в строке ленты возвращённой идеи.
+const MISSING_SHOWN: usize = 80;
 
 /// Голый id идеи из `w:<id>`, `e:<id>` или id (канонический вид); иначе код 6.
 pub fn idea_id(raw: &str) -> Result<String, CliError> {
@@ -92,7 +120,10 @@ fn check_horizon<'a>(raw: &'a str, flag: &str) -> Result<&'a str, CliError> {
     Ok(s)
 }
 
-/// Строка ленты: `w:<id> [статус] [приоритет] заголовок`, `(от агента)`, `→ k:<задача>`.
+/// Строка ленты: `w:<id> [статус] [приоритет] заголовок`, `(от агента)`, `→ k:<задача>`; у
+/// возвращённой на доработку — `— не хватает: <первая строка missing>` (до [`MISSING_SHOWN`]
+/// символов, дальше есть текст — `…`): что человеку дописать, без `zam read` (как строка
+/// решения ленты WebUI, M6.5 §9).
 fn line(e: &Value) -> String {
     let d = &e["data"];
     let mut s = format!(
@@ -107,6 +138,18 @@ fn line(e: &Value) -> String {
     }
     if let Some(t) = d["task_id"].as_str() {
         s.push_str(&format!(" → k:{t}"));
+    }
+    if e["status"] == "returned"
+        && let Some(m) = d["review"]["missing"].as_str()
+    {
+        let mut lines = m.lines().map(str::trim).filter(|l| !l.is_empty());
+        if let Some(first) = lines.next() {
+            let mut shown: String = first.chars().take(MISSING_SHOWN).collect();
+            if first.chars().count() > MISSING_SHOWN || lines.next().is_some() {
+                shown.push('…');
+            }
+            s.push_str(&format!(" — не хватает: {shown}"));
+        }
     }
     s
 }
@@ -128,8 +171,9 @@ pub struct List<'a> {
     pub knowledge: bool,
 }
 
-/// Статусы ленты через запятую; неизвестный статус идеи — код 6.
-fn statuses(raw: &[String]) -> Result<String, CliError> {
+/// Статусы ленты через запятую; не заданы — `None` (умолчание [`ACTIVE`]); неизвестный статус
+/// идеи — код 6.
+fn statuses(raw: &[String]) -> Result<Option<String>, CliError> {
     let mut out: Vec<&str> = Vec::new();
     for s in raw.iter().flat_map(|r| r.split(',')).map(str::trim) {
         if s.is_empty() {
@@ -145,22 +189,26 @@ fn statuses(raw: &[String]) -> Result<String, CliError> {
             out.push(s);
         }
     }
-    Ok(if out.is_empty() {
-        ACTIVE.to_string()
-    } else {
-        out.join(",")
-    })
+    Ok((!out.is_empty()).then(|| out.join(",")))
 }
 
-/// `zam idea list`.
+/// `zam idea list`; без `--status` у сервера до M6.5 (400 на [`ACTIVE`]) — повтор с
+/// [`ACTIVE_M57`]; явный `--status returned` такому серверу — его 400 (код 6).
 pub fn list(ctx: &Ctx, o: &List) -> Result<(), CliError> {
     let st = statuses(o.status)?;
     let space = space(ctx, o.knowledge)?;
-    let mut q = vec![("kind", "idea"), ("status", st.as_str()), ("limit", "200")];
-    if let Some(origin) = o.origin {
-        q.push(("origin", origin));
-    }
-    let v = read_json(ctx.client.get(&format!("/spaces/{space}/entries"), &q)?)?;
+    let path = format!("/spaces/{space}/entries");
+    let get = |status: &str| {
+        let mut q = vec![("kind", "idea"), ("status", status), ("limit", "200")];
+        if let Some(origin) = o.origin {
+            q.push(("origin", origin));
+        }
+        ctx.client.get(&path, &q).and_then(read_json)
+    };
+    let v = match (get(st.as_deref().unwrap_or(ACTIVE)), &st) {
+        (Err(e), None) if e.http_status() == Some(400) => get(ACTIVE_M57)?,
+        (r, _) => r?,
+    };
     if ctx.json {
         return emit_json(&v);
     }
@@ -247,6 +295,173 @@ pub fn propose(
         )
         .as_bytes(),
     )
+}
+
+/// Ошибка `e` запроса разбора идей: HTTP-статус `status` — так отвечает сервер до M6.5 (404 —
+/// нет маршрута `/review`, 400 — неизвестное событие `idea_review` у `/recall`). В `GET /health`
+/// `features` нет [`FEATURE_REVIEW`] (у сервера до M6 нет и самого поля) — код 1 с
+/// [`OLD_SERVER_REVIEW`]; флаг есть или `/health` не ответил — `e` как есть (404 — нет такой
+/// идеи, код 5).
+fn old_server(ctx: &Ctx, e: CliError, status: u16) -> CliError {
+    if e.http_status() != Some(status) {
+        return e;
+    }
+    match ctx.client.get("/health", &[]).and_then(read_json) {
+        Ok(h) if !has_feature(&h, FEATURE_REVIEW) => CliError::config(OLD_SERVER_REVIEW),
+        _ => e,
+    }
+}
+
+/// Флаг `f` в `features` ответа `/health`.
+fn has_feature(health: &Value, f: &str) -> bool {
+    health["features"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|x| x == f))
+}
+
+/// `zam idea queue`: пакет разбора `POST /recall {event: idea_review, limit}` решения из
+/// `solution.toml` — готовый текст сервера (пустая очередь, режим `propose`, нет права записи —
+/// строка-уведомление); `--json` — ответ сервера целиком (`items` с `reason: idea_review`).
+pub fn queue(ctx: &Ctx, limit: u32) -> Result<(), CliError> {
+    let solution = solution_guid(ctx, None)?;
+    let body = json!({ "event": "idea_review", "solution": solution, "limit": limit });
+    let v = ctx
+        .client
+        .post_json("/recall", &body)
+        .and_then(read_json)
+        .map_err(|e| old_server(ctx, e, 400))?;
+    if ctx.json {
+        return emit_json(&v);
+    }
+    let mut out = v["text"]
+        .as_str()
+        .unwrap_or_default()
+        .trim_end()
+        .to_string();
+    out.push('\n');
+    emit(out.as_bytes())
+}
+
+/// Параметры `zam idea review` (M6.5 §5); исход и сочетания флагов проверил clap.
+pub struct ReviewOpts {
+    /// `w:<id>`, `e:<id>` или id идеи.
+    pub id: String,
+    /// `plan | return | decline | done`.
+    pub outcome: &'static str,
+    /// Разбор для человека (Markdown).
+    pub summary_file: PathBuf,
+    /// Что дописать человеку (`return`).
+    pub missing: Option<String>,
+    /// На что опирался разбор: ссылки с префиксом (`k:`, `file:`, `commit:` …).
+    pub basis: Vec<String>,
+    /// Похожие идеи `w:<id>`.
+    pub similar: Vec<String>,
+    /// Уже открытая задача плана `k:<id>` (`plan`).
+    pub task: Option<String>,
+    /// Заголовок новой задачи (`plan`).
+    pub task_title: Option<String>,
+    /// План шагов новой задачи (`plan`).
+    pub task_body_file: Option<PathBuf>,
+    /// Приоритет новой задачи `low | normal | high` (`plan`).
+    pub task_priority: Option<String>,
+    /// `Idempotency-Key` этого разбора (ruling 5: ключ — на один вызов, неявных ключей нет).
+    pub key: Option<String>,
+}
+
+/// Ссылка `k:<id>` на задачу из `k:<id>` или голого id; иначе код 6.
+fn task_ref(raw: &str) -> Result<String, CliError> {
+    let t = raw.trim();
+    let id = match t.split_once(':') {
+        Some(("k", id)) => id,
+        Some(_) => "",
+        None => t,
+    };
+    if is_node_id(id) {
+        Ok(format!("k:{id}"))
+    } else {
+        Err(CliError::input(format!(
+            "--task «{raw}»: ссылка на задачу — k:<id> или id задачи"
+        )))
+    }
+}
+
+/// Тело `POST /entries/{id}/review`: исход, разбор, поля исхода; `task_body` — прочитанный
+/// `--task-body-file`. Задача — `{id}` открытой (`--task`) или `{title, body, priority}` новой.
+fn review_body(o: &ReviewOpts, summary: &str, task_body: Option<&str>) -> Result<Value, CliError> {
+    let mut b = json!({ "outcome": o.outcome, "summary": summary });
+    if let Some(m) = &o.missing {
+        b["missing"] = json!(m);
+    }
+    if !o.basis.is_empty() {
+        b["basis"] = json!(o.basis);
+    }
+    if !o.similar.is_empty() {
+        b["similar"] = json!(o.similar);
+    }
+    if let Some(t) = &o.task {
+        b["task"] = json!({ "id": task_ref(t)? });
+    } else {
+        let mut t = serde_json::Map::new();
+        for (k, v) in [
+            ("title", o.task_title.as_deref()),
+            ("body", task_body),
+            ("priority", o.task_priority.as_deref()),
+        ] {
+            if let Some(v) = v {
+                t.insert(k.to_string(), json!(v));
+            }
+        }
+        if !t.is_empty() {
+            b["task"] = Value::Object(t);
+        }
+    }
+    Ok(b)
+}
+
+/// Строка итога разбора: «Разобрано w:<id>: <исход>[ → задача k:<id>]», повтор по ключу —
+/// « (повтор)».
+fn review_line(id: &str, outcome: &str, v: &Value) -> String {
+    let mut s = format!("Разобрано w:{id}: {outcome}");
+    if let Some(t) = v["task"]["id"].as_str() {
+        s.push_str(&format!(" → задача k:{t}"));
+    }
+    if v["replay"] == true {
+        s.push_str(" (повтор)");
+    }
+    s.push('\n');
+    s
+}
+
+/// `zam idea review`: ссылки, файлы и тело проверяются до запроса (код 6); 404 — проверка
+/// старого сервера ([`old_server`]).
+pub fn review(ctx: &Ctx, o: ReviewOpts) -> Result<(), CliError> {
+    let id = idea_id(&o.id)?;
+    let summary = read_text(Some(&o.summary_file))?;
+    let task_body = o
+        .task_body_file
+        .as_deref()
+        .map(|f| read_text(Some(f)))
+        .transpose()?;
+    let body = review_body(&o, &summary, task_body.as_deref())?;
+    let headers: Vec<(&str, &str)> = o
+        .key
+        .as_deref()
+        .map(|k| ("Idempotency-Key", k))
+        .into_iter()
+        .collect();
+    let v = ctx
+        .client
+        .post_json_with(&format!("/entries/{id}/review"), &body, &headers)
+        .and_then(read_json)
+        .map_err(|e| old_server(ctx, e, 404))?;
+    // повтор по ключу ничего не записал
+    if v["replay"] != true {
+        ctx.note_write("idea");
+    }
+    if ctx.json {
+        return emit_json(&v);
+    }
+    emit(review_line(&id, o.outcome, &v).as_bytes())
 }
 
 /// Тело `POST /entries/{id}/decide`: решение, `by`, `channel` и поля решения (`extra`).
@@ -436,10 +651,13 @@ mod tests {
         assert!(decide_req("defer", &d).is_err());
 
         // статусы ленты
-        assert_eq!(statuses(&[]).unwrap(), ACTIVE);
+        assert_eq!(statuses(&[]).unwrap(), None);
+        assert_eq!(statuses(&[" , ".into()]).unwrap(), None);
         assert_eq!(
-            statuses(&["deferred,new".into(), "new".into()]).unwrap(),
-            "deferred,new"
+            statuses(&["deferred,new".into(), "new".into()])
+                .unwrap()
+                .as_deref(),
+            Some("deferred,new")
         );
         assert!(statuses(&["open".into()]).is_err());
 
@@ -465,5 +683,121 @@ mod tests {
             (r.code, r.msg.as_str()),
             (EXIT_CONFLICT, "идея уже начата → задача k:01T")
         );
+    }
+
+    fn opts(outcome: &'static str) -> ReviewOpts {
+        ReviewOpts {
+            id: ID.to_string(),
+            outcome,
+            summary_file: PathBuf::from("s.md"),
+            missing: None,
+            basis: Vec::new(),
+            similar: Vec::new(),
+            task: None,
+            task_title: None,
+            task_body_file: None,
+            task_priority: None,
+            key: None,
+        }
+    }
+
+    /// M6.5 (задача 6): статус `returned` ленты, тело и строка разбора, ссылка на задачу, флаг
+    /// старого сервера.
+    #[test]
+    fn review_bodies_and_lines() {
+        // статусы ленты: returned — фильтр и умолчание
+        assert_eq!(
+            statuses(&["returned".into()]).unwrap().as_deref(),
+            Some("returned")
+        );
+        assert!(ACTIVE.split(',').any(|s| s == "returned"));
+        // умолчание сервера до M6.5 — то же без returned
+        assert_eq!(
+            ACTIVE_M57.split(',').collect::<Vec<_>>(),
+            ACTIVE
+                .split(',')
+                .filter(|s| *s != "returned")
+                .collect::<Vec<_>>()
+        );
+        let e = json!({"id": ID, "status": "returned", "title": "Тема",
+                       "data": {"review": {"outcome": "return",
+                                           "missing": "\n Какие экраны? \nА меню?"}}});
+        assert_eq!(
+            line(&e),
+            format!("w:{ID} [returned] [normal] Тема — не хватает: Какие экраны?…")
+        );
+        let long = "я".repeat(MISSING_SHOWN + 1);
+        let e = json!({"id": ID, "status": "returned", "title": "Т",
+                       "data": {"review": {"missing": long}}});
+        assert!(
+            line(&e).ends_with(&format!(": {}…", "я".repeat(MISSING_SHOWN))),
+            "{}",
+            line(&e)
+        );
+        // `missing` прежнего разбора у новой идеи (после правки человеком) не показывается
+        let e = json!({"id": ID, "status": "new", "title": "Т",
+                       "data": {"review": {"missing": "что-то"}}});
+        assert_eq!(line(&e), format!("w:{ID} [new] [normal] Т"));
+
+        // тело разбора
+        assert_eq!(
+            review_body(&opts("decline"), "разбор", None).unwrap(),
+            json!({"outcome": "decline", "summary": "разбор"})
+        );
+        let o = ReviewOpts {
+            missing: Some("что дописать".into()),
+            basis: vec!["k:01T".into(), "file:docs/a.md".into()],
+            similar: vec![format!("w:{ID}")],
+            ..opts("return")
+        };
+        assert_eq!(
+            review_body(&o, "р", None).unwrap(),
+            json!({"outcome": "return", "summary": "р", "missing": "что дописать",
+                   "basis": ["k:01T", "file:docs/a.md"], "similar": [format!("w:{ID}")]})
+        );
+        let o = ReviewOpts {
+            task_title: Some("Задача".into()),
+            task_priority: Some("high".into()),
+            ..opts("plan")
+        };
+        assert_eq!(
+            review_body(&o, "р", Some("1. шаг")).unwrap(),
+            json!({"outcome": "plan", "summary": "р",
+                   "task": {"title": "Задача", "body": "1. шаг", "priority": "high"}})
+        );
+        for raw in [format!("k:{ID}"), format!(" {ID} ")] {
+            let o = ReviewOpts {
+                task: Some(raw.clone()),
+                ..opts("plan")
+            };
+            assert_eq!(
+                review_body(&o, "р", None).unwrap()["task"],
+                json!({"id": format!("k:{ID}")}),
+                "{raw}"
+            );
+        }
+        for bad in [format!("w:{ID}"), "k:".into(), "мусор".into()] {
+            let e = task_ref(&bad).unwrap_err();
+            assert_eq!(e.code, crate::client::EXIT_INPUT, "{bad}");
+            assert!(e.msg.contains("k:<id>"), "{}", e.msg);
+        }
+
+        // строка итога
+        assert_eq!(
+            review_line(ID, "plan", &json!({"task": {"id": "01T"}, "replay": false})),
+            format!("Разобрано w:{ID}: plan → задача k:01T\n")
+        );
+        assert_eq!(
+            review_line(ID, "decline", &json!({"entry": {}, "replay": true})),
+            format!("Разобрано w:{ID}: decline (повтор)\n")
+        );
+
+        // флаг сервера
+        assert!(has_feature(
+            &json!({"features": ["m6", FEATURE_REVIEW]}),
+            "idea_review"
+        ));
+        assert!(!has_feature(&json!({"features": ["m6"]}), "idea_review"));
+        assert!(!has_feature(&json!({"version": "0.0.10"}), "idea_review"));
     }
 }

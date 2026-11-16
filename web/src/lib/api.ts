@@ -670,7 +670,8 @@ export type Certainty = 'axiom' | 'theorem' | 'hypothesis';
 export type EntryKind = 'changelog' | 'release' | 'report' | 'insight' | 'term' | 'task' | 'question' | 'idea';
 /** Статус по виду: insight/term — `active…retracted` (у term без `revisit`), task —
  * `open…dropped`, question — `open`, `answered`, `obsolete`, idea — `new`, `proposed`,
- * `accepted`, `deferred`, `declined`, `done` (M5.7 §5). */
+ * `accepted`, `deferred`, `declined`, `done` (M5.7 §5) и `returned` — «На доработку» после
+ * разбора агентом (M6.5 §4). */
 export type EntryStatus =
   | 'active'
   | 'revisit'
@@ -687,7 +688,8 @@ export type EntryStatus =
   | 'proposed'
   | 'accepted'
   | 'deferred'
-  | 'declined';
+  | 'declined'
+  | 'returned';
 export type TriggerType = 'file_glob' | 'command_regex' | 'error_regex' | 'keyword';
 
 export interface AuthorView {
@@ -747,10 +749,48 @@ export interface Entry {
   usage?: UsageCounts;
   /** У задачи `done`: минуты от `started_at` до `done_at` (`null` — старта не было). */
   duration_min?: number | null;
-  /** У идеи в `GET /entries/{id}`: задача из «начать» (удалённая — `deleted`, M5.7 §7.1). */
+  /** У идеи в `GET /entries/{id}` и в ленте: задача из «начать» или разбора `plan` (удалённая —
+   * `deleted`, M5.7 §7.1). */
   task?: { id: string; status?: EntryStatus; title?: string; deleted?: boolean };
   /** У идеи в `GET /entries/{id}`: последний вопрос-предложение. */
   question?: { id: string; status?: EntryStatus; deleted?: boolean };
+  /** У идеи с разборами в `GET /entries/{id}`: имена пользователей разборов `{<by_user>: <имя>}`
+   * — подпись «чей агент разбирал» (M6.5 §7 «Общие решения»). */
+  reviewers?: Record<string, string>;
+  /** У задачи из идеи (запись и лента, M6.5 §9): первая идея плана; `ideas` — все её идеи. */
+  idea?: TaskIdea;
+  ideas?: TaskIdea[];
+}
+
+/** Идея задачи плана (поле `idea` задачи); `space_id` — пространство идеи (у идеи Knowledge
+ * задача «начать» бывает в решении). */
+export interface TaskIdea {
+  id: string;
+  title: string;
+  status: EntryStatus | null;
+  space_id: string;
+}
+
+/** Исход разбора идеи агентом (M6.5 §5). */
+export type ReviewOutcome = 'plan' | 'return' | 'decline' | 'done';
+
+/** Разбор идеи агентом — `data.review` и элементы `data.reviews` (новые первыми, до 10). */
+export interface IdeaReview {
+  outcome: ReviewOutcome;
+  /** Разбор для человека (Markdown; WebUI показывает текстом с переносами). */
+  summary: string;
+  /** Что дописать (у `return`). */
+  missing?: string;
+  /** На что опирался: `k:…`, `n:…`, `i:…`, `file:…`, `commit:…`. */
+  basis: string[];
+  /** Похожие идеи `w:…`. */
+  similar: string[];
+  /** Задача плана `k:<id>` (у `plan`). */
+  task?: string;
+  /** Пользователь, от имени которого разбирал агент. */
+  by_user: string;
+  session?: string;
+  at: string;
 }
 
 export interface EntryQuery {
@@ -767,6 +807,8 @@ export interface EntryQuery {
   origin?: 'human' | 'agent';
   /** Только `kind: idea`: `data.priority`. */
   priority?: 'low' | 'normal' | 'high';
+  /** Только `kind: task`: задачи из идей (пункты плана, M6.5 §9). */
+  fromIdea?: boolean;
   cursor?: string | null;
   limit?: number;
 }
@@ -783,6 +825,7 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
   if (f.decidedBy) p.set('decided_by', f.decidedBy);
   if (f.origin) p.set('origin', f.origin);
   if (f.priority) p.set('priority', f.priority);
+  if (f.fromIdea) p.set('from_idea', '1');
   if (f.cursor) p.set('cursor', f.cursor);
   if (f.limit) p.set('limit', String(f.limit));
   return call<{ items: Entry[]; next_cursor: string | null }>(
@@ -791,6 +834,22 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
     undefined,
     user,
   );
+}
+
+/** Число живых записей вида по статусам с фильтрами ленты (`GET …/entries/counts`, M6.5 §9):
+ * все статусы вида, нулевые тоже. */
+export function entryCounts(
+  user: string,
+  space: string,
+  f: Pick<EntryQuery, 'kind' | 'area' | 'tag' | 'origin' | 'priority' | 'fromIdea'> & { kind: EntryKind },
+) {
+  const p = new URLSearchParams({ kind: f.kind });
+  if (f.area) p.set('area', f.area);
+  if (f.tag) p.set('tag', f.tag);
+  if (f.origin) p.set('origin', f.origin);
+  if (f.priority) p.set('priority', f.priority);
+  if (f.fromIdea) p.set('from_idea', '1');
+  return call<Partial<Record<EntryStatus, number>>>('GET', `spaces/${q(space)}/entries/counts?${p}`, undefined, user);
 }
 
 export const getEntry = (user: string, id: string) =>
@@ -1317,10 +1376,15 @@ export const HOOK_KINDS: HookKind[] = [
 ];
 export type HookFlags = Record<HookKind, boolean>;
 
-/** Настройки пользователя: типы подсказок хуков и проактивность идей (`ideas.proactive`, M5.7 §8). */
+/** Режим идей (M6.5 §7): `review` — новые идеи человека разбирает агент, `propose` — агент
+ * предлагает их вопросом, решает человек (M5.7). */
+export type IdeasMode = 'review' | 'propose';
+
+/** Настройки пользователя: типы подсказок хуков, проактивность идей (`ideas.proactive`, M5.7 §8)
+ * и режим идей (`ideas.mode`, M6.5 §7). */
 export interface UserSettings {
   hooks: HookFlags;
-  ideas: { proactive: boolean };
+  ideas: { proactive: boolean; mode?: IdeasMode };
 }
 
 /** Свои настройки (`own`) или пользователя `userId` (администратор). */
@@ -1330,8 +1394,9 @@ export const getUserSettings = (userId: string | null) =>
   call<UserSettings>('GET', settingsPath(userId));
 export const setUserHooks = (userId: string | null, hooks: Partial<HookFlags>) =>
   call<UserSettings>('PATCH', settingsPath(userId), { hooks });
-export const setUserIdeas = (userId: string | null, proactive: boolean) =>
-  call<UserSettings>('PATCH', settingsPath(userId), { ideas: { proactive } });
+/** Настройки идей: меняются только переданные поля (`proactive`, `mode`). */
+export const setUserIdeas = (userId: string | null, ideas: { proactive?: boolean; mode?: IdeasMode }) =>
+  call<UserSettings>('PATCH', settingsPath(userId), { ideas });
 
 // ---- кэш выжимок (§9.4, §15.4) ----
 

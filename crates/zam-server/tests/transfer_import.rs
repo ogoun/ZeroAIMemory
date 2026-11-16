@@ -360,6 +360,17 @@ struct Src {
 
 async fn src(w: &W) -> Src {
     let (a, o) = (&w.a, &w.o);
+    // источник предлагает идею вопросом (`propose`) — режим идей M5.7 владельца решения; в
+    // режиме `review` M6.5 `propose` новой идеи — 409
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{}/settings", o.id),
+            Some(json!({"ideas": {"mode": "propose"}})),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK, "ideas.mode = propose");
     let res = note(a, &o.tok, G, "Итоги", "# Итоги\n\nитог").await;
     let plan = note(
         a,
@@ -1000,6 +1011,129 @@ async fn remap_all_letters_and_columns() {
     assert_eq!(o2["superseded_by_id"], json!(new2));
     assert_eq!(o2["status"], "superseded");
     let _ = t;
+}
+
+/// Финальное ревью M6.5, M7: импорт чужого архива переписывает ссылки разборов идеи (M6.5 §5 —
+/// они хранятся только в `data.review` и `data.reviews` с префиксами): `basis` (`i:`, `c:`, `n:`),
+/// `similar` (`w:`) и `task` (`k:`) указывают на новые id и в текущем разборе, и в истории;
+/// `file:` и `commit:` — как есть; `by_user` — голый id пользователя, импорт его не переписывает.
+#[tokio::test]
+async fn import_rewrites_idea_review_refs() {
+    let w = world("imp-review").await;
+    let (a, o) = (&w.a, &w.o);
+    let ins = entry(
+        a,
+        &o.tok,
+        G,
+        json!({"kind": "insight", "title": "Опора разбора", "data": {"kind": "pattern"}}),
+    )
+    .await;
+    let cl = entry(
+        a,
+        &o.tok,
+        G,
+        json!({"kind": "changelog", "title": "Сделано раньше", "data": {"kind": "feat"}}),
+    )
+    .await;
+    let nid = note(a, &o.tok, G, "docs/разбор", "# План\n\nтекст").await;
+    let idea_body = |title: &str| json!({"kind": "idea", "title": title, "body": "Замысел.", "data": {"origin": "human"}});
+    let sim = entry(a, &o.tok, G, idea_body("Похожая идея")).await;
+    let idea = entry(a, &o.tok, G, idea_body("Идея с разбором")).await;
+    let summary =
+        "Что просит идея: выгрузку разборов. Что уже есть: экспорт пространства в архив, \
+                   задачи плана о разборах нет, ТЗ о переносе разборов молчит. Решение и почему: \
+                   сверка с планом и сделанным показала, что пункт нужен, ссылки — в basis."
+            .to_string();
+    assert!(summary.chars().count() >= 200);
+    let uri = format!("/api/v1/entries/{idea}/review");
+    let uri = uri.as_str();
+    let review = |body: Value| async move {
+        let r = a.tok(&o.tok, Method::POST, uri, Some(body)).await;
+        ok(&r, StatusCode::OK, "разбор");
+        r.json()
+    };
+    // разбор 1 — на доработку; человек дописывает в WebUI — снова «Непросмотрено»
+    review(
+        json!({"outcome": "return", "summary": &summary, "missing": "Какие поля?",
+                  "basis": [format!("i:{ins}"), format!("n:{nid}")],
+                  "similar": [format!("w:{sim}")]}),
+    )
+    .await;
+    let rev = get_entry(a, &o.tok, &idea).await["rev"].to_string();
+    let r = common::reports::web_h(
+        a,
+        &o.web,
+        Method::PATCH,
+        &format!("/api/v1/entries/{idea}"),
+        Some(json!({"append_body": "Поля: заголовок и исход."})),
+        &[("if-match", rev.as_str())],
+    )
+    .await;
+    ok(&r, StatusCode::OK, "правка человеком");
+    assert_eq!(r.json()["status"], "new");
+    // разбор 2 — в план
+    let j = review(json!({"outcome": "plan", "summary": &summary,
+                          "basis": [format!("i:{ins}"), format!("c:{cl}"),
+                                    "file:docs/plan.md", "commit:abcdef1"],
+                          "similar": [format!("w:{sim}")],
+                          "task": {"title": "Задача разбора", "body": "1. Шаг."}}))
+    .await;
+    let task = j["task"]["id"].as_str().unwrap().to_string();
+
+    let zip = export_tok(a, &o.tok, G, "").await;
+    report(&import_tok(a, &w.rw.tok, "knowledge", "", zip).await);
+    let bdb = db(a, &w.rw.id).await;
+    let ins2 = entry_by_title(&bdb, "Опора разбора").await;
+    let cl2 = entry_by_title(&bdb, "Сделано раньше").await;
+    let sim2 = entry_by_title(&bdb, "Похожая идея").await;
+    let idea2 = entry_by_title(&bdb, "Идея с разбором").await;
+    let task2 = entry_by_title(&bdb, "Задача разбора").await;
+    let nid2 = node_by_path(&bdb, "docs/разбор").await.unwrap();
+    for (old, new) in [
+        (&ins, &ins2),
+        (&cl, &cl2),
+        (&sim, &sim2),
+        (&idea, &idea2),
+        (&task, &task2),
+        (&nid, &nid2),
+    ] {
+        assert_ne!(old, new, "чужой архив — новые id");
+    }
+    let e = get_entry(a, &w.rw.tok, &idea2).await;
+    let d = &e["data"];
+    let plan = &d["review"];
+    assert_eq!(plan["outcome"], "plan", "{e}");
+    assert_eq!(
+        plan["basis"],
+        json!([
+            format!("i:{ins2}"),
+            format!("c:{cl2}"),
+            "file:docs/plan.md",
+            "commit:abcdef1"
+        ]),
+        "{e}"
+    );
+    assert_eq!(plan["similar"], json!([format!("w:{sim2}")]), "{e}");
+    assert_eq!(plan["task"], json!(format!("k:{task2}")), "{e}");
+    assert_eq!(d["reviews"][0], *plan, "{e}");
+    let ret = &d["reviews"][1];
+    assert_eq!(ret["outcome"], "return", "{e}");
+    assert_eq!(
+        ret["basis"],
+        json!([format!("i:{ins2}"), format!("n:{nid2}")]),
+        "{e}"
+    );
+    assert_eq!(ret["similar"], json!([format!("w:{sim2}")]), "{e}");
+    // `by_user` — id пользователя, не записи: как есть
+    assert_eq!(plan["by_user"], json!(o.id), "{e}");
+    assert_eq!(ret["by_user"], json!(o.id), "{e}");
+    let text = d.to_string();
+    for old in [&ins, &cl, &sim, &idea, &task, &nid] {
+        assert!(
+            !text.contains(old.as_str()),
+            "старый id {old} в data: {text}"
+        );
+    }
 }
 
 /// Производные таблицы строит запись: `file_refs` и `triggers` после круга совпадают (с

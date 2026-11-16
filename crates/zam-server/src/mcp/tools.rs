@@ -117,10 +117,10 @@ impl ToolName {
                  data base64}], большой — zam report. Дубль insight — 409: force."
             }
             ToolName::UpdateEntry => {
-                "Правка записи: action supersede|retract|revisit|certify|append|feedback|status|\
-                 claim|release|answer|propose|decide; rev — ревизия (кроме feedback, claim, \
-                 release, answer, propose, decide). certify — certainty, reason; feedback — value; \
-                 вопрос: answer (by обязателен), status obsolete."
+                "Правка записи: action supersede|retract|revisit|certify|append|status — с \
+                 ревизией rev; кроме того, без rev: feedback|claim|release|answer|propose|decide|\
+                 review. certify — certainty, reason; feedback — value; вопрос: answer (by \
+                 обязателен), status obsolete; review — разбор идеи (outcome, summary)."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
@@ -128,10 +128,10 @@ impl ToolName {
                  удалить связь."
             }
             ToolName::Recall => {
-                "Подсказки памяти к событию: session_start — дайджест, prompt — к запросу \
-                 пользователя, post_tool — к ошибке инструмента (error, tool), recovery — после \
-                 сжатия контекста, brief — пакет под задачу task (задание субагенту, первый \
-                 вызов субагента). Повторы в сессии отсекаются, кроме brief и recovery."
+                "Подсказки памяти к событию: session_start — дайджест, prompt — к запросу, \
+                 post_tool — к ошибке инструмента (error, tool); повторы в сессии отсекаются. \
+                 Пакеты без отсева: recovery — после сжатия контекста, brief — под задачу task \
+                 (первый вызов субагента), idea_review — идеи на разбор (limit)."
             }
             ToolName::Vault => {
                 "Vault: list — записи без значений (name — поиск), get — по name или id (v:<id> из \
@@ -291,10 +291,10 @@ impl ToolName {
                 json!({
                     "id": {"type": "string"},
                     "rev": {"type": "integer",
-                        "description": "ревизия записи; не нужна у feedback, claim, release, answer, propose, decide"},
+                        "description": "ревизия записи; не нужна у feedback, claim, release, answer, propose, decide, review"},
                     "action": {"type": "string", "enum": ["supersede", "retract", "revisit",
                         "certify", "append", "feedback", "status", "claim", "release", "answer",
-                        "propose", "decide"]},
+                        "propose", "decide", "review"]},
                     "status": {"type": "string", "description": "задача: open, in_progress, blocked, done, dropped"},
                     "next_step": {"type": ["string", "null"]},
                     "blocked_by": {"type": ["string", "null"]},
@@ -305,13 +305,42 @@ impl ToolName {
                     "channel": {"type": "string", "enum": ["chat", "cli"],
                         "description": "answer, decide: где человек ответил (по умолчанию chat)"},
                     "by": {"type": "string", "enum": ["human", "agent"],
-                        "description": "answer, decide: обязателен — human: слова человека (axiom), agent: решение агента (hypothesis; у идеи — только decline своей)"},
+                        "description": "answer, decide: обязателен — human: слова человека (axiom), agent: решение агента (hypothesis; у идеи — только decline своей); append идеи: human — слова человека, возвращённая идея снова на разбор"},
                     "decision": {"type": "string", "enum": ["accept", "defer", "decline", "reopen"],
                         "description": "decide: решение человека по идее w: (by обязателен; без ответа «начать» не начинай); accept создаёт задачу k:, reopen — с reason"},
                     "horizon": {"type": "string", "description": "decide defer и answer defer вопроса-предложения: «не раньше» YYYY-MM-DD (UTC, позже сегодня; по умолчанию +30 дней)"},
-                    "space": {"type": "string", "description": "propose, decide accept: пространство будущей задачи — GUID решения или knowledge; по умолчанию — решение запроса"},
+                    "space": {"type": "string", "description": "propose, decide accept: пространство будущей задачи — GUID решения или knowledge; по умолчанию — решение запроса; review — только пространство идеи"},
+                    // разбор идеи агентом (M6.5 §5): поля и пределы проверяет REST
+                    "outcome": {"type": "string", "enum": ["plan", "return", "decline", "done"],
+                        "description": "review: plan — в план (задача k:), return — на доработку (missing), decline — отклонить (причина — в summary), done — уже сделано (в basis — ссылка на сделанное)"},
+                    "summary": {"type": "string", "description": format!(
+                        "review: разбор для человека, Markdown не короче ideas.review_min_chars \
+                         ({}) и до {} символов — что просит идея, что уже есть в плане, ТЗ и \
+                         сделанном (ссылки), решение и почему",
+                        zam_store::REVIEW_MIN_CHARS_DEFAULT, zam_store::REVIEW_SUMMARY_MAX_CHARS)},
+                    "missing": {"type": "string", "description": format!(
+                        "review return (обязательно): что дописать — короткий список вопросов \
+                         человеку, до {} символов",
+                        zam_store::REVIEW_MISSING_MAX_CHARS)},
+                    "basis": {"type": "array", "items": {"type": "string"},
+                        "description": "review: на что опирался — k:, n:, i:, c:, r:, w:, file:<путь от корня решения>, commit:<sha>; у done — хотя бы одна ссылка на сделанное (c:, r:, commit:, k: задачи done)"},
+                    "similar": {"type": "array", "items": {"type": "string"},
+                        "description": "review: похожие идеи w:<id>, в том числе отклонённые"},
+                    "task": {"type": "object",
+                        "description": "review plan: новая задача {title (по умолчанию — заголовок идеи), body — план шагов, priority} или {id: k:<id>} уже открытой задачи плана",
+                        "properties": {
+                            "id": {"type": "string",
+                                   "description": "k:<id> открытой задачи плана — без новой задачи"},
+                            "title": {"type": "string"},
+                            "body": {"type": "string",
+                                     "description": "план шагов; сервер добавит строку «Идея: w:<id>»"},
+                            "priority": {"type": "string", "enum": ["low", "normal", "high"],
+                                         "description": "по умолчанию — приоритет идеи"},
+                        }},
+                    "idempotency_key": {"type": "string", "description":
+                        "review: повтор с тем же ключом после сбоя связи не пишет второй раз (ключ — на один разбор)"},
                     "title": {"type": "string"},
-                    "body": {"type": "string", "description": "supersede — тело; append — дописать"},
+                    "body": {"type": "string", "description": "supersede — тело; append — дописать; review — в task.body"},
                     "data": {"type": "object"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "triggers": {"type": "array", "items": {"type": "object"}},
@@ -339,7 +368,11 @@ impl ToolName {
             ),
             ToolName::Recall => (
                 json!({
-                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery", "brief"]},
+                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery", "brief", "idea_review"]},
+                    "limit": {"type": "integer", "minimum": 1,
+                        "maximum": crate::api::recall::IDEA_REVIEW_LIMIT_MAX,
+                        "description": format!("idea_review: идей в пакете (по умолчанию {})",
+                                               crate::api::recall::IDEA_REVIEW_LIMIT)},
                     "prompt": {"type": "string"},
                     "task": {"type": "string",
                         "description": "brief: задача субагента, до 2000 символов"},
@@ -783,7 +816,8 @@ async fn call_rest(
     }
 }
 
-/// Заголовок `Idempotency-Key` из аргумента `idempotency_key` (`memory_write`, `memory_log`).
+/// Заголовок `Idempotency-Key` из аргумента `idempotency_key` (`memory_write`, `memory_log`,
+/// `memory_update_entry action=review`).
 fn idempotency_header(args: &JsonObject) -> Result<Vec<(HeaderName, String)>, Fail> {
     Ok(opt_str(args, "idempotency_key")?
         .map(|k| (HeaderName::from_static("idempotency-key"), k.to_string()))
@@ -1100,7 +1134,8 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
 }
 
 /// Итог решения по идее (`decide`, ответ на вопрос-предложение): `Идея w:<id>: <статус>`, при
-/// «начать» — ` → задача k:<id>`.
+/// «начать» — ` → задача k:<id>`. Статус — значение в базе (строка M5.7); подпись статуса — у
+/// итога разбора ([`review_outcome`]).
 fn idea_outcome(v: &Value) -> String {
     let idea = if v["idea"].is_object() {
         &v["idea"]
@@ -1112,8 +1147,46 @@ fn idea_outcome(v: &Value) -> String {
         idea["id"].as_str().unwrap_or("?"),
         idea["status"].as_str().unwrap_or("?")
     );
-    if let Some(t) = v["task"]["id"].as_str() {
-        s.push_str(&format!(" → задача k:{t}"));
+    s.push_str(&idea_task_tail(v));
+    s
+}
+
+/// ` → задача k:<id>` ответа с задачей идеи («начать», разбор `plan`); задачи нет — пусто.
+fn idea_task_tail(v: &Value) -> String {
+    v["task"]["id"]
+        .as_str()
+        .map(|t| format!(" → задача k:{t}"))
+        .unwrap_or_default()
+}
+
+/// Подпись статуса идеи (M6.5 §4, как в WebUI); незнакомый статус — как есть.
+fn idea_status_label(status: &str) -> &str {
+    match status {
+        "new" => "Непросмотрено",
+        "returned" => "На доработку",
+        "accepted" => "В плане",
+        "declined" => "Отклонена",
+        "done" => "Сделано",
+        "deferred" => "Отложена",
+        "proposed" => "Предложена",
+        other => other,
+    }
+}
+
+/// Итог разбора идеи (`review`, M6.5 §5) одной строкой: `Идея w:<id>: <подпись статуса> · разбор
+/// <outcome>`, у `plan` — ` → задача k:<id>`; повтор по `idempotency_key` — ` · повтор (записано
+/// ранее)`.
+fn review_outcome(v: &Value) -> String {
+    let idea = &v["entry"];
+    let mut s = format!(
+        "Идея w:{}: {} · разбор {}{}",
+        idea["id"].as_str().unwrap_or("?"),
+        idea_status_label(idea["status"].as_str().unwrap_or("?")),
+        idea["data"]["review"]["outcome"].as_str().unwrap_or("?"),
+        idea_task_tail(v)
+    );
+    if v["replay"] == true {
+        s.push_str(" · повтор (записано ранее)");
     }
     s
 }
@@ -1295,7 +1368,9 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             let text = opt_str(args, "body")?.ok_or_else(|| {
                 Fail::Invalid("append: нужен body — текст для дописывания".into())
             })?;
-            let mut b = pick(args, &["message", "refs"]);
+            // `by` — чья дописка идеи (M6.5 §6): `human` — слова человека из чата, возвращённая
+            // идея снова идёт на разбор; сервер принимает его только у правки идеи
+            let mut b = pick(args, &["message", "refs", "by"]);
             b.insert("append_body".into(), json!(text));
             (Method::PATCH, entry, b)
         }
@@ -1400,6 +1475,37 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             .await?;
             return done(f, &r, idea_outcome);
         }
+        "review" => {
+            // поля задачи плана — только в `task`: верхние `title` и `body` разбор не читает, и
+            // план шагов пропал бы молча; пустая строка — как отсутствие (как у `req_str`)
+            let given = |k: &str| match args.get(k) {
+                None | Some(Value::Null) => false,
+                Some(Value::String(s)) => !s.trim().is_empty(),
+                Some(_) => true,
+            };
+            if given("title") || given("body") {
+                return Err(Fail::Invalid(
+                    "для review план шагов — task.body, заголовок задачи — task.title".into(),
+                ));
+            }
+            // поля и пределы проверяет REST (422 с именем поля); ключ повтора — на один вызов
+            // разбора, только из `idempotency_key` (ruling 5: неявного ключа нет)
+            let b = pick(
+                args,
+                &[
+                    "outcome", "summary", "missing", "basis", "similar", "task", "space", "message",
+                ],
+            );
+            let r = call_rest(
+                rest,
+                Method::POST,
+                &format!("{entry}/review"),
+                Some(&Value::Object(b)),
+                &idempotency_header(args)?,
+            )
+            .await?;
+            return done(f, &r, review_outcome);
+        }
         "claim" => (
             Method::POST,
             format!("{entry}/claim"),
@@ -1425,7 +1531,7 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         _ => {
             return Err(Fail::Invalid(
                 "action: supersede, retract, revisit, certify, append, feedback, status, claim, \
-                 release, answer, propose или decide"
+                 release, answer, propose, decide или review"
                     .into(),
             ));
         }
@@ -1496,6 +1602,7 @@ async fn recall(rest: &Rest, args: &JsonObject) -> Res {
             "agent_block_version",
             "source",
             "timeout_ms",
+            "limit",
         ],
     );
     let r = call_rest(
@@ -2297,6 +2404,49 @@ mod tests {
             );
         }
         assert!(entry_line(&json!({"id": "01ABC", "kind": "?", "rev": 1})).starts_with("e:01ABC"));
+    }
+
+    /// Строка итога разбора (M6.5 §5): подпись статуса и исход, задача — только при её наличии,
+    /// пометка повтора; подписи всех статусов идеи (§4), незнакомый — как есть.
+    #[test]
+    fn review_outcome_line() {
+        let v = json!({"entry": {"id": "01A", "status": "accepted",
+                                 "data": {"review": {"outcome": "plan"}}},
+                       "task": {"id": "01T"}, "replay": false});
+        assert_eq!(
+            review_outcome(&v),
+            "Идея w:01A: В плане · разбор plan → задача k:01T"
+        );
+        let mut again = v.clone();
+        again["replay"] = json!(true);
+        assert_eq!(
+            review_outcome(&again),
+            "Идея w:01A: В плане · разбор plan → задача k:01T · повтор (записано ранее)"
+        );
+        for (status, outcome, label) in [
+            ("returned", "return", "На доработку"),
+            ("declined", "decline", "Отклонена"),
+            ("done", "done", "Сделано"),
+        ] {
+            let v = json!({"entry": {"id": "01B", "status": status,
+                                     "data": {"review": {"outcome": outcome}}},
+                           "replay": false});
+            assert_eq!(
+                review_outcome(&v),
+                format!("Идея w:01B: {label} · разбор {outcome}")
+            );
+        }
+        for (s, label) in [
+            ("new", "Непросмотрено"),
+            ("deferred", "Отложена"),
+            ("proposed", "Предложена"),
+            ("archived", "archived"),
+        ] {
+            assert_eq!(idea_status_label(s), label);
+        }
+        // решение M5.7 — прежняя строка со значением статуса
+        let v = json!({"entry": {"id": "01C", "status": "accepted"}, "task": {"id": "01T"}});
+        assert_eq!(idea_outcome(&v), "Идея w:01C: accepted → задача k:01T");
     }
 
     #[test]

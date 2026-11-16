@@ -20,11 +20,13 @@ pub use token::{NewToken, generate_token, hash_token, looks_like_token, mask_tok
 /// Текущая версия блока инструкции агента ZeroAIMemory в CLAUDE.md/AGENTS.md (§14.2, §15.5;
 /// v3 — M4.5 §11, v4 — M5.5: строка об отчётах, v5 — M5.6: карта кода и `путь#Тип::метод`,
 /// v6 — M5.7: строка об идеях, четыре фразы — в протокол; v7 — M6 §13: `focus` в строке поиска,
-/// «`certainty` меняй с `reason`» и «функция — `путь#Тип::метод`» — в протокол):
-/// маркер `<!-- zeroaimemory:begin vN -->`. Нижняя граница версии сервера: действующая версия —
-/// `max(AGENT_BLOCK_VERSION, версия шаблонов в settings)` (`zam_server::agent_setup`), с ней
-/// сравнивают `/recall(session_start)` и `zam status`, её пишет в маркер `GET /agent-setup`.
-pub const AGENT_BLOCK_VERSION: u32 = 7;
+/// «`certainty` меняй с `reason`» и «функция — `путь#Тип::метод`» — в протокол; v8 — M6.5 §8:
+/// строка идей — новые идеи человека агент разбирает сам (action=review), «без ответа «начать»
+/// не начинай» — в протокол, для режима `propose`): маркер `<!-- zeroaimemory:begin vN -->`.
+/// Нижняя граница версии сервера: действующая версия — `max(AGENT_BLOCK_VERSION, версия шаблонов в
+/// settings)` (`zam_server::agent_setup`), с ней сравнивают `/recall(session_start)` и
+/// `zam status`, её пишет в маркер `GET /agent-setup`.
+pub const AGENT_BLOCK_VERSION: u32 = 8;
 
 /// Предел длины имени решения, символов (§11.6): регистрация (`POST /solutions`), переименование
 /// (`PATCH /solutions/{guid}`), `GET /agent-setup?name=`, однострочник `zam init` и `zam init
@@ -107,19 +109,24 @@ pub const SESSION_ENV: &str = "ZAM_SESSION";
 /// Явный признак «команду запустил агент» (`ZAM_AGENT=1`).
 pub const AGENT_FLAG_ENV: &str = "ZAM_AGENT";
 
+/// Каталоги-потолки поиска файлов проекта вверх от cwd (`CLAUDE.md`, `.zeroaimemory/`), как
+/// `GIT_CEILING_DIRECTORIES` у git (M6.5, обкатка).
+pub const CEILING_ENV: &str = "ZAM_CEILING_DIRECTORIES";
+
 /// Клиентские переменные `zam` (не агента): явная сессия хуков, признак агента, имя машины,
-/// сессия `zam mcp`, пределы ожидания `zam export`/`zam import`. Сервер не читает их как ключи
+/// сессия `zam mcp`, пределы ожидания `zam export`/`zam import`, потолки поиска. Сервер не читает их как ключи
 /// конфигурации (иначе такая переменная в окружении пользователя — неизвестный ключ, и сервер
 /// не стартует), тесты убирают их из окружения дочернего `zam`. Новая переменная, которую читает
 /// `zam`, добавляется сюда. `ZAM_URL` и `ZAM_TOKEN` `zam` тоже читает, но они не здесь: это адрес и
 /// секрет, сервер пропускает их своим списком (`RESERVED_ENV` в `zam-server`).
-pub const CLIENT_ENV_VARS: [&str; 6] = [
+pub const CLIENT_ENV_VARS: [&str; 7] = [
     SESSION_ENV,
     AGENT_FLAG_ENV,
     MACHINE_ENV,
     MCP_SESSION_ENV,
     EXPORT_IDLE_ENV,
     IMPORT_IDLE_ENV,
+    CEILING_ENV,
 ];
 
 #[cfg(test)]

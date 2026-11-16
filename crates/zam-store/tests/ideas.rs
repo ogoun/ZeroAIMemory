@@ -13,14 +13,15 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
-    AnswerBy, Answered, Attribution, AuthorKind, Channel, DataDir, Db, EdgeType, Entry,
-    EntryFilter, EntryKind, EntryPatch, EntryStatus, GraphStore, IDEA_LINKS_MAX, IDEA_OPTIONS,
-    IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, NewAnswer,
-    NewDecision, NewEdge, NewEntry, ProposalKind, QuestionData, QuestionError, SpaceKind,
+    AnswerBy, Answered, Attribution, AuthorKind, Channel, DataDir, Db, DecidedAs, DecidedVia,
+    EdgeType, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, GraphStore, IDEA_LINKS_MAX,
+    IDEA_OPTIONS, IDEA_REOPEN_OPTIONS, IdeaData, IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority,
+    NewAnswer, NewDecision, NewEdge, NewEntry, NewReview, ProposalKind, QuestionData,
+    QuestionError, REVIEW_MIN_CHARS_DEFAULT, Review, ReviewOutcome, ReviewTask, SpaceKind,
     StoreError, TaskData, TaskState, UserDbs, adopt_idea, answer_question, check_idea,
     check_idea_transition, create_entry, create_solution, decide_idea, delete_entry,
     entry_revisions, get_entry, idea_candidate, idea_task_state, list_entries, list_spaces,
-    proactive_ideas, propose_idea, restore_entry, update_entry,
+    proactive_ideas, propose_idea, restore_entry, review_idea, update_entry,
 };
 
 // ---------- окружение ----------
@@ -347,9 +348,14 @@ fn transitions_table() {
     let ag = check_idea(&json!({}), IdeaOrigin::Agent).unwrap();
     let r = Some("причина");
     let live = Some(TaskState::Live);
-    let table: [(EntryStatus, [Result<EntryStatus, &str>; 4]); 6] = [
+    let table: [(EntryStatus, [Result<EntryStatus, &str>; 4]); 7] = [
         // accept, defer, decline, reopen
         (New, [Ok(Accepted), Ok(Deferred), Ok(Declined), Err(TNA)]),
+        // «На доработку» (M6.5 §6): человек может решить сам; «вернуть на разбор» — правкой
+        (
+            Returned,
+            [Ok(Accepted), Ok(Deferred), Ok(Declined), Err(TNA)],
+        ),
         (
             Proposed,
             [Ok(Accepted), Ok(Deferred), Ok(Declined), Err(TNA)],
@@ -384,7 +390,7 @@ fn transitions_table() {
         );
     }
     // «от агента» не начинается
-    for cur in [New, Proposed, Deferred] {
+    for cur in [New, Proposed, Deferred, Returned] {
         assert_eq!(
             check_idea_transition(cur, &ag, None, Accept, r),
             Err("idea-agent-origin")
@@ -606,7 +612,7 @@ async fn accept_creates_task_edge_and_answers_question() {
     let decided = d.decided.unwrap();
     assert_eq!(
         (decided.decision, decided.by, decided.channel),
-        (IdeaDecision::Accept, AnswerBy::Human, Channel::Webui)
+        (DecidedAs::Accept, AnswerBy::Human, DecidedVia::Webui)
     );
     assert_eq!(task.kind, EntryKind::Task);
     assert_eq!(task.status, Some(EntryStatus::Open));
@@ -1478,6 +1484,7 @@ fn idea_filter(space: Id) -> EntryFilter {
         deleted_only: false,
         origin: None,
         priority: None,
+        from_idea: None,
     }
 }
 
@@ -2091,7 +2098,7 @@ async fn answer_reopen_moves_task_to_prev() {
     assert_eq!(i.status, Some(EntryStatus::New));
     let d = data_of(&i);
     assert_eq!((d.task_id, d.prev_task_ids.clone()), (None, vec![t.id]));
-    assert_eq!(d.decided.unwrap().decision, IdeaDecision::Reopen);
+    assert_eq!(d.decided.unwrap().decision, DecidedAs::Reopen);
     assert!(r.task.is_none());
     assert_eq!(count(&db, DECISIONS).await, before + 1);
     let reason = last_reason(&db, idea.id).await.unwrap();
@@ -2552,6 +2559,7 @@ async fn fts_light_search_depth_and_snippets() {
     let light = |depth: usize, snippets: bool| LightSearch {
         channel_depth: depth,
         snippets,
+        any_terms: false,
     };
     // слово с подчёркиванием и цифрой — идентификатор: работает и канал trigram
     let text = "экспорт отчётов report_v";
@@ -2602,6 +2610,52 @@ async fn fts_light_search_depth_and_snippets() {
         .await
         .unwrap();
     assert_eq!(l.bm25.len(), 1);
+}
+
+/// M6.5, задача 4: `any_terms` — канал bm25 сразу ослабленным запросом (любое слово). Запрос —
+/// текст самой записи (похожие пакета разбора идей): строгий находит только её, ослабленный — и
+/// записи с частью слов. Запрос из одного слова — строгий и с `any_terms`.
+#[tokio::test]
+async fn fts_light_any_terms_relaxed_first() {
+    use zam_store::search::{FtsChannels, FtsQuery, TargetFilter, search_fts_channels};
+    use zam_store::{LightSearch, search_fts_channels_light};
+    let (db, sol, _) = setup("fts-any").await;
+    let text = "Экспорт выгрузки продаж";
+    let me = new_idea(&db, sol, text, "human", "normal").await;
+    let other = new_idea(&db, sol, "Печать продаж", "human", "normal").await;
+    let q = |text: &str| FtsQuery {
+        alias_groups: Vec::new(),
+        text: text.into(),
+        space_ids: vec![sol],
+        path_prefix: None,
+        top_k: 100,
+        targets: TargetFilter {
+            kinds: vec!["idea".into()],
+            ..TargetFilter::default()
+        },
+    };
+    let found = |ch: &FtsChannels| -> HashSet<Id> { ch.bm25.iter().map(|h| h.target.id).collect() };
+    let any = LightSearch {
+        channel_depth: 50,
+        snippets: false,
+        any_terms: true,
+    };
+    let strict = search_fts_channels(&db, q(text)).await.unwrap();
+    assert_eq!(found(&strict), [me.id].into_iter().collect::<HashSet<_>>());
+    assert!(!strict.relaxed);
+    let relaxed = search_fts_channels_light(&db, q(text), any).await.unwrap();
+    assert_eq!(
+        found(&relaxed),
+        [me.id, other.id].into_iter().collect::<HashSet<_>>()
+    );
+    assert!(relaxed.relaxed);
+    // сама запись — первой: в ней все слова запроса
+    assert_eq!(relaxed.bm25[0].target.id, me.id);
+    let one = search_fts_channels_light(&db, q("продаж"), any)
+        .await
+        .unwrap();
+    assert!(!one.relaxed);
+    assert_eq!(found(&one).len(), 2);
 }
 
 /// Время ревизии, которой задача `task` последний раз стала `done` (первая ревизия последней
@@ -2711,4 +2765,473 @@ async fn any_new_idea_check() {
             .unwrap()
     );
     assert!(!zam_store::any_new_idea(&db, &[], today()).await.unwrap());
+}
+
+// ---------- M6.5: разбор идей агентом — данные, `returned`, несколько идей у задачи ----------
+
+/// Разбор для проверок данных: со всеми необязательными полями (`full`) или без них.
+fn review(outcome: ReviewOutcome, full: bool, at: &str) -> Review {
+    Review {
+        outcome,
+        summary: "Идея просит кэш ответов: в плане его нет, в ТЗ §9.4 — есть.".into(),
+        missing: full.then(|| "Каких ответов и на какой срок?".into()),
+        basis: if full {
+            vec![
+                format!("k:{}", Id::new()),
+                "file:docs/tz.md".into(),
+                "commit:abc1234".into(),
+            ]
+        } else {
+            Vec::new()
+        },
+        similar: if full {
+            vec![format!("w:{}", Id::new())]
+        } else {
+            Vec::new()
+        },
+        task: full.then(|| format!("k:{}", Id::new())),
+        by_user: Id::new(),
+        session: full.then(|| "s-review".into()),
+        key: full.then(|| "rk-1".into()),
+        at: at.parse().unwrap(),
+    }
+}
+
+/// M6.5 §5: `review`, `reviews` и `returned_at` ведёт сервер — клиентская `data` с ними (при
+/// создании и правке) — «data.<поле>: поле ведёт сервер» без частичного результата; разбор
+/// переносится через `data` туда и обратно без потерь (необязательные поля без значения в `data`
+/// не пишутся); повреждённое в базе читается умолчанием.
+#[test]
+fn idea_review_fields_server_only() {
+    use ReviewOutcome::*;
+    for k in ["review", "reviews", "returned_at"] {
+        let want = format!("data.{k}: поле ведёт сервер");
+        assert_eq!(
+            check_idea(&json!({ k: null }), IdeaOrigin::Human).unwrap_err(),
+            want
+        );
+        let mut d = check_idea(&json!({}), IdeaOrigin::Human).unwrap();
+        let before = d.clone();
+        assert_eq!(
+            d.apply_patch(&json!({ k: [], "priority": "high" }))
+                .unwrap_err(),
+            want
+        );
+        assert_eq!(d, before);
+    }
+    assert_eq!(
+        [Plan, Return, Decline, Done].map(ReviewOutcome::as_str),
+        ["plan", "return", "decline", "done"]
+    );
+    for o in [Plan, Return, Decline, Done] {
+        assert_eq!(ReviewOutcome::parse(o.as_str()), Some(o));
+    }
+    assert_eq!(ReviewOutcome::parse("accept"), None);
+
+    let last = review(Return, true, "2026-11-15T10:00:00.123456Z");
+    let first = review(Plan, false, "2026-11-14T09:00:00Z");
+    let d = IdeaData {
+        origin: IdeaOrigin::Human,
+        review: Some(last.clone()),
+        reviews: vec![last.clone(), first.clone()],
+        returned_at: Some("2026-11-15T10:00:00.123456Z".parse().unwrap()),
+        ..IdeaData::default()
+    };
+    let v = d.to_value();
+    assert_eq!(IdeaData::from_stored(&v), d);
+    assert_eq!(v["review"]["outcome"], "return");
+    assert_eq!(v["review"]["at"], "2026-11-15T10:00:00.123456Z");
+    assert_eq!(v["review"]["by_user"], json!(last.by_user.to_string()));
+    assert_eq!(v["review"]["task"], json!(last.task));
+    assert_eq!(v["reviews"][0], v["review"]);
+    assert_eq!(v["returned_at"], "2026-11-15T10:00:00.123456Z");
+    let bare = &v["reviews"][1];
+    for k in ["missing", "task", "session", "key"] {
+        assert!(bare.get(k).is_none(), "{k}: {bare}");
+    }
+    assert_eq!(
+        (bare["basis"].clone(), bare["similar"].clone()),
+        (json!([]), json!([]))
+    );
+    let empty = IdeaData::default().to_value();
+    for k in ["review", "reviews", "returned_at"] {
+        assert!(empty.get(k).is_none(), "{k}: {empty}");
+    }
+    // повреждённый элемент истории пропускается, остальные остаются
+    let mut broken = v.clone();
+    broken["reviews"] = json!([1, {"outcome": "maybe"}, v["review"].clone()]);
+    broken["review"] = json!("текст");
+    broken["returned_at"] = json!("вчера");
+    let b = IdeaData::from_stored(&broken);
+    assert_eq!(
+        (b.review, b.reviews, b.returned_at),
+        (None, vec![last.clone()], None)
+    );
+    // клиентский патч поля сервера не трогает
+    let mut p = d.clone();
+    p.apply_patch(&json!({"priority": "low"})).unwrap();
+    assert_eq!(
+        (p.review, p.reviews, p.returned_at),
+        (d.review.clone(), d.reviews.clone(), d.returned_at)
+    );
+}
+
+/// M6.5 §5: приоритет задачи `data.priority` (`low | normal | high`) ведёт клиент: сохраняется
+/// при записи и правке (слиянием с прочими полями), неизвестное значение — ошибка поля, `null`
+/// снимает; повреждённое в базе читается как отсутствие.
+#[tokio::test]
+async fn task_priority_roundtrip() {
+    let (db, sol, _) = setup("task-priority").await;
+    let mut t = idea_entry(
+        sol,
+        "Задача плана",
+        json!({"priority": "high", "next_step": "начать"}),
+    );
+    t.kind = EntryKind::Task;
+    let (task, _) = create_entry(&db, t.clone(), &agent()).await.unwrap();
+    assert_eq!(task.data["priority"], "high");
+    let td = TaskData::from_stored(&get_entry(&db, task.id).await.unwrap().data);
+    assert_eq!(td.priority, Some(IdeaPriority::High));
+    assert_eq!(TaskData::from_stored(&td.to_value()), td);
+    let patch = |data: Value| EntryPatch {
+        data: Some(data),
+        ..EntryPatch::default()
+    };
+    for bad in [json!("urgent"), json!(2)] {
+        t.data = json!({ "priority": bad });
+        let r = create_entry(&db, t.clone(), &agent()).await;
+        assert!(
+            matches!(&r, Err(StoreError::BadInput(m)) if m.starts_with("data.priority:")),
+            "{r:?}"
+        );
+        let r = update_entry(
+            &db,
+            task.id,
+            None,
+            patch(json!({ "priority": bad })),
+            &agent(),
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(StoreError::BadInput(m)) if m.starts_with("data.priority:")),
+            "{r:?}"
+        );
+    }
+    let low = update_entry(
+        &db,
+        task.id,
+        None,
+        patch(json!({"priority": "low"})),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (low.data["priority"].clone(), low.data["next_step"].clone()),
+        (json!("low"), json!("начать"))
+    );
+    let none = update_entry(
+        &db,
+        task.id,
+        None,
+        patch(json!({"priority": null})),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert!(none.data.get("priority").is_none(), "{}", none.data);
+    assert_eq!(
+        TaskData::from_stored(&json!({"priority": "urgent"})).priority,
+        None
+    );
+}
+
+/// Идея человека в `returned` — настоящим разбором `return` агентом ([`review_idea`]): строка
+/// записи и её последняя ревизия согласованы (`review`, `reviews`, `returned_at`).
+async fn returned_idea(db: &Db, sol: Id, title: &str) -> Entry {
+    let i = new_idea(db, sol, title, "human", "normal").await;
+    let r = NewReview {
+        outcome: ReviewOutcome::Return,
+        summary: "Идея просит кэш ответов: в плане его нет, в ТЗ §9.4 — только кэш выжимок. "
+            .repeat(4),
+        missing: Some("Каких ответов и на какой срок?".into()),
+        basis: Vec::new(),
+        similar: Vec::new(),
+        task: ReviewTask::None,
+        by_user: Id::new(),
+        session: None,
+        key: None,
+        min_chars: REVIEW_MIN_CHARS_DEFAULT,
+    };
+    let e = review_idea(db, i.id, r, &agent()).await.unwrap().idea;
+    assert_eq!(e.status, Some(EntryStatus::Returned));
+    assert!(data_of(&e).returned_at.is_some());
+    let revs = entry_revisions(db, i.id).await.unwrap();
+    let last = revs.iter().max_by_key(|r| r.rev).unwrap();
+    assert_eq!((last.status, &last.data), (e.status, &e.data));
+    e
+}
+
+/// M6.5 §6, Review Focus 2: правка возвращённой идеи человеком (`human_edit`) заголовка, тела или
+/// дописка (`append_body`) — `returned → new` в той же ревизии, `returned_at` снят, разборы на
+/// месте: переход определяет, кто правит, а не поле. Правка с устаревшей ревизией (форма открыта
+/// до дописки агента; повтор уже принятой правки) — конфликт без записи. Дописка агента и правка
+/// тела агентом (`human_edit: false`), правка человеком только `data` — статус прежний; правка
+/// без изменений — без ревизии.
+#[tokio::test]
+async fn human_edit_returned_goes_new_and_stale_rev_conflicts() {
+    use EntryStatus::*;
+    let (db, sol, _) = setup("returned-edit").await;
+    let i = returned_idea(&db, sol, "Кэш ответов").await;
+    let reviews = data_of(&i).reviews;
+    assert_eq!(reviews.len(), 1);
+    const BODY: &str = "Кэшировать ответы /recall на 10 минут.";
+    let body = |human_edit: bool| EntryPatch {
+        body: Some(BODY.into()),
+        human_edit,
+        ..EntryPatch::default()
+    };
+    // дописка агента: статус и `returned_at` прежние
+    let a = update_entry(
+        &db,
+        i.id,
+        Some(i.rev),
+        EntryPatch {
+            append_body: Some("Агент: уточните объём.".into()),
+            ..EntryPatch::default()
+        },
+        &agent(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((a.rev, a.status), (i.rev + 1, Some(Returned)));
+    assert!(data_of(&a).returned_at.is_some());
+    // форма человека открыта до дописки: конфликт ревизии, ничего не записано
+    let r = update_entry(&db, i.id, Some(i.rev), body(true), &human()).await;
+    assert!(
+        matches!(r, Err(StoreError::StaleRevision { expected, current })
+            if expected == i.rev && current == a.rev),
+        "{r:?}"
+    );
+    assert_eq!(snap(&get_entry(&db, i.id).await.unwrap()), snap(&a));
+    // человек правит только `data`: статус прежний
+    let p = update_entry(
+        &db,
+        i.id,
+        Some(a.rev),
+        EntryPatch {
+            data: Some(json!({"priority": "high"})),
+            human_edit: true,
+            ..EntryPatch::default()
+        },
+        &human(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.status, Some(Returned));
+    assert!(data_of(&p).returned_at.is_some());
+    // человек правит тело по текущей ревизии: `new`, `returned_at` снят, разборы на месте
+    let e = update_entry(&db, i.id, Some(p.rev), body(true), &human())
+        .await
+        .unwrap();
+    assert_eq!(
+        (e.rev, e.status, e.body.as_str()),
+        (p.rev + 1, Some(New), BODY)
+    );
+    let d = data_of(&e);
+    assert_eq!(d.returned_at, None);
+    assert_eq!(d.reviews, reviews);
+    assert_eq!(d.review.as_ref(), reviews.first());
+    assert_eq!(d.priority, IdeaPriority::High);
+    let revs = entry_revisions(&db, i.id).await.unwrap();
+    let rev = revs.iter().find(|r| r.rev == e.rev).unwrap();
+    assert_eq!(rev.status, Some(New));
+    assert!(rev.data.get("returned_at").is_none(), "{}", rev.data);
+    assert_eq!(revs.iter().filter(|r| r.rev > p.rev).count(), 1);
+    // та же правка с прежней ревизией — конфликт
+    let r = update_entry(&db, i.id, Some(p.rev), body(true), &human()).await;
+    assert!(
+        matches!(r, Err(StoreError::StaleRevision { expected, current })
+            if expected == p.rev && current == e.rev),
+        "{r:?}"
+    );
+    assert_eq!(snap(&get_entry(&db, i.id).await.unwrap()), snap(&e));
+
+    // заголовок человеком — тоже `new`; правка без изменений — ничего
+    let j = returned_idea(&db, sol, "Второй кэш").await;
+    let same = update_entry(
+        &db,
+        j.id,
+        None,
+        EntryPatch {
+            title: Some(j.title.clone()),
+            body: Some(j.body.clone()),
+            human_edit: true,
+            ..EntryPatch::default()
+        },
+        &human(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(snap(&same), snap(&j));
+    let t = update_entry(
+        &db,
+        j.id,
+        None,
+        EntryPatch {
+            title: Some("Кэш ответов на 10 минут".into()),
+            human_edit: true,
+            ..EntryPatch::default()
+        },
+        &human(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(t.status, Some(New));
+    assert!(data_of(&t).returned_at.is_none());
+    // тело агентом (`human_edit: false`): содержимое новое, статус прежний
+    let k = returned_idea(&db, sol, "Третий кэш").await;
+    let g = update_entry(&db, k.id, None, body(false), &agent())
+        .await
+        .unwrap();
+    assert_eq!((g.status, g.body.as_str()), (Some(Returned), BODY));
+    assert!(data_of(&g).returned_at.is_some());
+    // дописка человеком (`append_body`, `human_edit: true`) — `new`, разборы на месте
+    let m = returned_idea(&db, sol, "Четвёртый кэш").await;
+    let h = update_entry(
+        &db,
+        m.id,
+        Some(m.rev),
+        EntryPatch {
+            append_body: Some("Человек: на 10 минут.".into()),
+            human_edit: true,
+            ..EntryPatch::default()
+        },
+        &human(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((h.rev, h.status), (m.rev + 1, Some(New)));
+    assert!(h.body.ends_with("Человек: на 10 минут."), "{}", h.body);
+    let d = data_of(&h);
+    assert_eq!((d.returned_at, d.reviews), (None, data_of(&m).reviews));
+}
+
+/// M6.5 §6: возвращённую идею человек может решить сам — «Начать», «Отложить», «Отказаться»;
+/// выход из `returned` снимает `returned_at` (история разборов остаётся). `reopen` из
+/// `returned` не переход (идея и так у человека) — 409 `transition-not-allowed` без записи.
+#[tokio::test]
+async fn returned_human_decisions() {
+    let (db, sol, _) = setup("returned-decide").await;
+    let i = returned_idea(&db, sol, "Начать").await;
+    let mut d = nd(IdeaDecision::Reopen);
+    d.reason = Some("ещё раз".into());
+    let r = decide_idea(&db, i.id, d, &human()).await;
+    assert!(
+        matches!(
+            r,
+            Err(IdeaError::Transition {
+                from: EntryStatus::Returned,
+                to: "reopen"
+            })
+        ),
+        "{r:?}"
+    );
+    assert_eq!(snap(&get_entry(&db, i.id).await.unwrap()), snap(&i));
+    let acc = decide_idea(&db, i.id, nd(IdeaDecision::Accept), &human())
+        .await
+        .unwrap();
+    assert_eq!(acc.idea.status, Some(EntryStatus::Accepted));
+    assert!(acc.task.is_some());
+    let left = |e: &Entry, was: &Entry| {
+        let d = data_of(e);
+        assert_eq!(d.returned_at, None, "{}: {}", e.title, e.data);
+        assert_eq!(d.reviews, data_of(was).reviews, "{}", e.title);
+        assert_eq!(d.review, data_of(was).review, "{}", e.title);
+    };
+    left(&acc.idea, &i);
+    for (dec, want) in [
+        (IdeaDecision::Defer, EntryStatus::Deferred),
+        (IdeaDecision::Decline, EntryStatus::Declined),
+    ] {
+        let j = returned_idea(&db, sol, dec.as_str()).await;
+        let r = decide_idea(&db, j.id, nd(dec), &human()).await.unwrap();
+        assert_eq!(r.idea.status, Some(want));
+        left(&r.idea, &j);
+        // и в ревизии решения
+        let revs = entry_revisions(&db, j.id).await.unwrap();
+        let last = revs.iter().max_by_key(|r| r.rev).unwrap();
+        assert_eq!(last.status, Some(want));
+        assert!(last.data.get("returned_at").is_none(), "{}", last.data);
+    }
+}
+
+/// Системное ребро `derived_from` задача → идея прямым SQL (привязка к открытой задаче —
+/// разбор `plan`, задача 2).
+async fn system_edge(db: &Db, sol: Id, task: Id, idea: Id) {
+    let now = zam_store::time::fmt_ts(Timestamp::now());
+    db.write(move |tx| {
+        tx.execute(
+            "INSERT INTO edges (id, space_id, src_kind, src_id, dst_kind, dst_id, dst_space_id,
+                                type, origin, created_at)
+             VALUES (?1, ?2, 'entry', ?3, 'entry', ?4, ?2, 'derived_from', 'system', ?5)",
+            rusqlite::params![Id::new(), sol, task, idea, now],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+/// Идея `accepted` задачи `task`: `data.task_id` и ребро [`system_edge`].
+async fn link_idea(db: &Db, sol: Id, idea: &Entry, task: Id) {
+    let mut d = data_of(idea);
+    d.task_id = Some(task);
+    let (id, data) = (idea.id, d.to_value().to_string());
+    db.write(move |tx| {
+        tx.execute(
+            "UPDATE entries SET status = 'accepted', data = ?2 WHERE id = ?1",
+            rusqlite::params![id, data],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    system_edge(db, sol, task, idea.id).await;
+}
+
+/// M6.5 §5, Review Focus 3: у задачи плана может быть несколько идей. Задача `done` — все её
+/// живые идеи `done` с `done_at`, переоткрытие — снова `accepted`. Идея с ребром от задачи, но с
+/// другой `data.task_id` (её вернули и начали заново), и удалённая идея не меняются.
+#[tokio::test]
+async fn task_done_closes_all_linked_ideas() {
+    use EntryStatus::*;
+    let (db, sol, _) = setup("task-many-ideas").await;
+    let (a, t) = accepted_idea(&db, sol, "Первая идея").await;
+    let b = new_idea(&db, sol, "Вторая идея", "human", "normal").await;
+    link_idea(&db, sol, &b, t.id).await;
+    let (c, _) = accepted_idea(&db, sol, "Идея другой задачи").await;
+    system_edge(&db, sol, t.id, c.id).await;
+    let gone = new_idea(&db, sol, "Удалённая идея", "human", "normal").await;
+    link_idea(&db, sol, &gone, t.id).await;
+    delete_entry(&db, gone.id, None, &human()).await.unwrap();
+    const ACCEPTED: &str = "SELECT count(*) FROM entries WHERE id = ?1 AND status = 'accepted'";
+
+    set_task_status(&db, t.id, Done).await;
+    for id in [a.id, b.id] {
+        let e = get_entry(&db, id).await.unwrap();
+        assert_eq!(e.status, Some(Done), "{}", e.title);
+        assert!(data_of(&e).done_at.is_some(), "{}", e.title);
+    }
+    assert_eq!(snap(&get_entry(&db, c.id).await.unwrap()), snap(&c));
+    assert_eq!(count_id(&db, ACCEPTED, gone.id).await, 1);
+
+    set_task_status(&db, t.id, Open).await;
+    for id in [a.id, b.id] {
+        let e = get_entry(&db, id).await.unwrap();
+        assert_eq!(e.status, Some(Accepted), "{}", e.title);
+        assert!(data_of(&e).done_at.is_none(), "{}", e.title);
+    }
+    assert_eq!(snap(&get_entry(&db, c.id).await.unwrap()), snap(&c));
+    assert_eq!(count_id(&db, ACCEPTED, gone.id).await, 1);
 }

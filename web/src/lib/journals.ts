@@ -1,4 +1,5 @@
 // Подписи журналов решения для WebUI (§7.2–7.6): виды записей, статусы, надёжность.
+import { IDEA_STATUS_TEXT } from './ideaStatus';
 import { localTime } from './time';
 import type { Certainty, EntryStatus, TriggerType } from './api';
 import type { Journal } from './router';
@@ -26,30 +27,9 @@ export function journalsOf(kind: string): Journal[] {
   return [];
 }
 
-/** Вид записи журнала → журнал (переход из поиска). */
-export const JOURNAL_OF_KIND: Record<string, Journal> = {
-  insight: 'insights',
-  changelog: 'changelog',
-  release: 'releases',
-  report: 'reports',
-  term: 'glossary',
-  task: 'tasks',
-  idea: 'ideas',
-  question: 'questions',
-};
-
-/** Буква ссылки записи по виду (`i:`, `t:`, … — как в `/read` и индексе ссылок на файлы). */
-const REF_LETTER: Record<string, string> = {
-  insight: 'i',
-  changelog: 'c',
-  release: 'r',
-  report: 'p',
-  term: 't',
-  task: 'k',
-  idea: 'w',
-  question: 'q',
-};
-export const entryRef = (kind: string, id: string): string => `${REF_LETTER[kind] ?? 'e'}:${id}`;
+/** Вид записи → журнал, буква ссылки и `entryRef` — в `entryRefs.ts` (без зависимостей: его
+ * импортирует и `ideaButtons.ts`, проверяемый `node --test`). */
+export { JOURNAL_OF_KIND, entryRef } from './entryRefs';
 
 /** Колонки доски задач (M4.5 §3) и подписи. */
 export const TASK_COLUMNS: EntryStatus[] = ['open', 'in_progress', 'blocked', 'done', 'dropped'];
@@ -137,30 +117,26 @@ export const STATUS_TEXT: Record<EntryStatus, string> = {
   dropped: 'снят',
   answered: 'отвечен',
   obsolete: 'неактуален',
-  // статусы идеи (M5.7) — для поиска Ctrl+K; в журнале «Идеи» — IDEA_STATUS_TEXT
-  new: 'новая',
+  // статусы идеи (M5.7, M6.5 §4) — строчными, как прочие; подписи журнала «Идеи» и Ctrl+K —
+  // IDEA_STATUS_TEXT (entryStatusText)
+  new: 'непросмотрено',
   proposed: 'предложена',
-  accepted: 'начата',
+  accepted: 'в плане',
   deferred: 'отложена',
   declined: 'отклонена',
+  returned: 'на доработку',
 };
 
-/** Статусы идеи (M5.7 §5) в порядке фильтра журнала «Идеи». */
-export const IDEA_STATUSES: EntryStatus[] = ['new', 'proposed', 'deferred', 'accepted', 'done', 'declined'];
+/** Статусы идеи и подписи (M5.7 §5, M6.5 §4): порядок чипов и разделов журнала «Идеи». */
+export { IDEA_STATUSES, IDEA_STATUS_TEXT, type IdeaStatus } from './ideaStatus';
 
 export type IdeaPriority = 'low' | 'normal' | 'high';
 export const PRIORITIES: IdeaPriority[] = ['high', 'normal', 'low'];
 export const PRIORITY_TEXT: Record<IdeaPriority, string> = { low: 'низкий', normal: 'обычный', high: 'высокий' };
 
-/** Подписи статусов идеи (женский род: «идея»); STATUS_TEXT общий — для задач и вопросов. */
-export const IDEA_STATUS_TEXT: Record<'new' | 'proposed' | 'accepted' | 'deferred' | 'declined' | 'done', string> = {
-  new: 'новая',
-  proposed: 'предложена',
-  accepted: 'начата',
-  deferred: 'отложена',
-  declined: 'отклонена',
-  done: 'выполнена',
-};
+/** Подпись статуса записи вида `kind`: у идеи — IDEA_STATUS_TEXT, у прочих — STATUS_TEXT. */
+export const entryStatusText = (kind: string | null | undefined, s: EntryStatus): string =>
+  (kind === 'idea' ? (IDEA_STATUS_TEXT as Record<string, string>)[s] : undefined) ?? STATUS_TEXT[s] ?? s;
 
 export const TRIGGER_TYPES: TriggerType[] = ['file_glob', 'command_regex', 'error_regex', 'keyword'];
 

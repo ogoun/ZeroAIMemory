@@ -217,6 +217,10 @@ pub struct LightSearch {
     /// Строить ли сниппеты; `false` — [`FtsHit::snippet`] пуст (ни `snippet()` FTS5, ни фрагмента
     /// по подстрокам).
     pub snippets: bool,
+    /// Канал `bm25` сразу по ослабленному запросу (любое слово), без строгого (M6.5 §7: похожие
+    /// пакета разбора идей). Запрос — текст самой записи: строгий (все слова) находил бы её одну,
+    /// и до ослабленного дело не доходило бы.
+    pub any_terms: bool,
 }
 
 /// Группа расширения запроса: слова запроса `start..start + len` ([`query_terms`]) заменяются
@@ -790,6 +794,7 @@ pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError>
             &q.targets.args(),
             &[],
             None,
+            false,
         )?;
         let ranked = merge(ch.a, ch.b, q.top_k);
         fetch_hits(&tx, &ranked, ch.a_fts.as_deref(), None, &ch.needles, true)
@@ -850,6 +855,7 @@ async fn fts_channels(
             &q.targets.args(),
             &q.alias_groups,
             light.map(|l| l.channel_depth),
+            light.is_some_and(|l| l.any_terms),
         )?;
         let in_a: HashSet<i64> = ch.a.iter().map(|c| c.0).collect();
         let in_alias: HashSet<i64> = ch.alias.iter().map(|c| c.0).collect();
@@ -929,7 +935,9 @@ struct Channels<'q> {
     needles: Vec<&'q str>,
 }
 
-/// Канал A (строгий запрос, при пустой выдаче — ослабленный) и канал B.
+/// Канал A (строгий запрос, при пустой выдаче — ослабленный; `any` — сразу ослабленный,
+/// [`LightSearch::any_terms`]) и канал B.
+#[allow(clippy::too_many_arguments)]
 fn run_channels<'q>(
     tx: &Connection,
     text: &'q str,
@@ -938,16 +946,18 @@ fn run_channels<'q>(
     t: &TargetArgs,
     groups: &[AliasGroup],
     depth: Option<usize>,
+    any: bool,
 ) -> Result<Channels<'q>, StoreError> {
-    let mut a_fts = sanitize_fts(text);
+    let mut a_fts = if any { None } else { sanitize_fts(text) };
     let mut relaxed = false;
     let mut a = match &a_fts {
         Some(fts) => run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?,
         None => Vec::new(),
     };
-    if a.is_empty() && terms(text).len() > 1 {
+    if a.is_empty() && (any || terms(text).len() > 1) {
         a_fts = sanitize_fts_any(text);
-        relaxed = true;
+        // запрос из одного слова и «любым словом» — строгий
+        relaxed = terms(text).len() > 1;
         if let Some(fts) = &a_fts {
             a = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
         }

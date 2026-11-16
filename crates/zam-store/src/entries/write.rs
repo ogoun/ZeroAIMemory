@@ -475,7 +475,9 @@ fn insert_revision(
 }
 
 /// Новая ревизия `cur.rev + 1` с полями `f`: строка записи, ревизия, чанки и задание
-/// `upsert` (payload меняется и при смене одного статуса или `certainty`).
+/// `upsert` (payload меняется и при смене одного статуса или `certainty`). Выход идеи из
+/// `returned` `save` снимает сам — записанная `data` тогда без `returned_at`, чем и отличается
+/// от переданной (`ideas::returned_exit_data`, M6.5 §6).
 pub(crate) fn save(
     c: &Connection,
     cur: &Entry,
@@ -484,6 +486,11 @@ pub(crate) fn save(
     a: &Attribution,
     now: &str,
 ) -> Result<(), StoreError> {
+    // идея вышла из `returned` любым путём (правка человеком, решение, разбор) — без
+    // `returned_at` в этой же ревизии (M6.5 §6); `returned` бывает только у идеи
+    let left_returned = crate::ideas::returned_exit_data(cur.status, f.status, &f.data)
+        .map(|data| Fields { data, ..f.clone() });
+    let f = left_returned.as_ref().unwrap_or(f);
     let rev = cur.rev + 1;
     c.prepare_cached(
         "UPDATE entries SET title = ?2, title_norm = ?3, body = ?4, data = ?5, tags = ?6,
@@ -658,6 +665,9 @@ pub async fn create_entry(
 /// `triggers` заменяет набор триггеров insight в той же транзакции (неверный → `BadInput`);
 /// триггеры в ревизию не входят. Правка содержимого (заголовок, тело, `data`, теги, область,
 /// триггеры) insight `superseded`/`retracted` → `Conflict`. Отчёт → `ReportImmutable`.
+/// Содержимое идеи меняется только в `new`, `deferred` и `returned` (иначе `Conflict`); правка
+/// человеком (`p.human_edit`) заголовка или тела (в том числе `append_body`) идеи `returned`
+/// возвращает её на разбор: статус `new` и без `data.returned_at` в той же ревизии (M6.5 §6).
 pub async fn update_entry(
     db: &Db,
     id: Id,
@@ -702,10 +712,13 @@ pub async fn update_entry(
         }
         if content
             && cur.kind == EntryKind::Idea
-            && !matches!(cur.status, Some(EntryStatus::New | EntryStatus::Deferred))
+            && !matches!(
+                cur.status,
+                Some(EntryStatus::New | EntryStatus::Deferred | EntryStatus::Returned)
+            )
         {
             return Err(StoreError::Conflict(format!(
-                "идея {}: содержимое меняется только в new и deferred",
+                "идея {}: содержимое меняется только в new, deferred и returned",
                 cur.status.map_or("?", EntryStatus::as_str)
             )));
         }
@@ -824,6 +837,17 @@ pub async fn update_entry(
         if let (Some(mut idd), Some(d)) = (idea, &idea_patch) {
             idd.apply_patch(d).map_err(bad)?;
             f.data = idd.to_value();
+        }
+        // возвращённую идею дописал человек (заголовок, тело или `append_body`) — снова на
+        // разбор: `returned → new`, история разборов остаётся, `returned_at` снимает запись
+        // ревизии ([`save`]); правку определяет, кто правит (M6.5 §6): правка агента, правка
+        // только `data` и правка без изменений статус не меняют
+        if p.human_edit
+            && cur.kind == EntryKind::Idea
+            && cur.status == Some(EntryStatus::Returned)
+            && (f.title != cur.title || f.body != cur.body)
+        {
+            f.status = Some(EntryStatus::New);
         }
         if let Some(c) = p.certainty {
             if !has_certainty(cur.kind) {

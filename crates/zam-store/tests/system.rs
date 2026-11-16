@@ -410,6 +410,26 @@ async fn user_settings_roundtrip() {
             ("hooks.prompt".to_string(), json!(true))
         ]
     );
+    // `null` удаляет строку (ключ снова идёт за умолчанием, финальное ревью M6.5, M3): прежнее
+    // значение — в ответе; строки нет — ничего не изменилось
+    let changed = s
+        .set_user_settings(
+            u.id,
+            vec![
+                ("hooks.prompt".into(), json!(null)),
+                ("ideas.mode".into(), json!(null)),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec![("hooks.prompt".to_string(), Some(json!(true)))]
+    );
+    assert_eq!(
+        s.user_settings(u.id).await.unwrap(),
+        vec![("hooks.checkpoint".to_string(), json!(true))]
+    );
     // настройки одного пользователя не видны другому
     assert!(s.user_settings(other.id).await.unwrap().is_empty());
     let err = s

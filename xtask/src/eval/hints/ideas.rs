@@ -56,6 +56,13 @@ pub const RUN_CONFIG: [(&str, &str); 5] = [
     ("recall.prompt_min_score", "0.6"),
     ("recall.timeout_ms", "60000"),
 ];
+/// Режим идей M5.7 у сервера M6.5+ (ключ `ideas.default_mode`, возможность `idea_review`;
+/// Ruling 6 задачи 4 M6.5): замер подсказок-идей мерит поведение M5.7 — предложение вопросом. В
+/// режиме `review` (умолчание M6.5) `propose` новой идеи — 409, а подсказка к запросу у идеи
+/// `new` — «на разбор» (`reason: idea_review`). Старым серверам ключ не шлётся (конфигурация с
+/// `deny_unknown_fields`): у них режима нет, поведение и так M5.7. В `config` отчёта — только если
+/// поставлен (эталон M5.7 без него).
+pub const M57_MODE: (&str, &str) = ("ideas.default_mode", "propose");
 /// Ключ M6 (§9, задача 9): у v0.0.10-m5.7 его нет — порог FTS-only там тот же
 /// `recall.prompt_min_score`; в эталоне — `null`.
 pub const ABSENT_IN_M57: &str = "recall.prompt_min_score_fts";
@@ -545,7 +552,7 @@ pub fn run(a: &EvalArgs, p: &Paths, queries_path: &Path) -> Result<()> {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    let spec = RunSpec {
+    let mut spec = RunSpec {
         name: "idea-hints".into(),
         model: None,
         device: Device::Cpu,
@@ -558,6 +565,14 @@ pub fn run(a: &EvalArgs, p: &Paths, queries_path: &Path) -> Result<()> {
     let caps = caps::probe(&s.base)?;
     if !caps.ideas {
         bail!("сервер {}: вида idea нет (M5.7+)", caps.tag());
+    }
+    // режим M5.7 — только серверу, который знает ключ (до загрузки идей: `propose` в `review` — 409)
+    let mut config = run_config();
+    if caps.keys.contains(&M57_MODE.0) {
+        s.stop()?;
+        spec.sets.push((M57_MODE.0.into(), M57_MODE.1.into()));
+        s = Session::start(p, &spec, &server, false)?;
+        config.insert(M57_MODE.0.into(), json!(M57_MODE.1));
     }
     let (keys, due) = load_ideas(&s, &corpus.ideas)?;
     if !due.is_empty() {
@@ -615,7 +630,7 @@ pub fn run(a: &EvalArgs, p: &Paths, queries_path: &Path) -> Result<()> {
              приходят новые подсказки-идеи (items[].reason = idea), не больше {TOP}; \
              w:<id> → idea:<key>"
         ),
-        config: run_config(),
+        config,
         rows,
     };
     print_summary(&queries, &fx);
@@ -800,6 +815,13 @@ mod tests {
             .map(|(k, v)| (crate::eval::run::env_key(k), v.to_string()))
             .collect();
         assert!(caps::check_known(&env).is_ok());
+        // режим M5.7 у M6.5+ — ключ таблицы замера; в `config` эталона M5.7 его нет
+        let mode = [(
+            crate::eval::run::env_key(M57_MODE.0),
+            M57_MODE.1.to_string(),
+        )];
+        assert!(caps::check_known(&mode).is_ok());
+        assert!(!c.contains_key(M57_MODE.0));
     }
 
     #[test]

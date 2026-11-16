@@ -147,6 +147,10 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
                 .layer(entries_body_limit(cfg)),
         )
         .route(
+            "/api/v1/spaces/{space}/entries/counts",
+            get(entries::counts),
+        )
+        .route(
             "/api/v1/entries/{id}",
             get(entries::get)
                 .patch(entries::patch)
@@ -160,6 +164,7 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/entries/{id}/propose", post(ideas::propose))
         .route("/api/v1/entries/{id}/decide", post(ideas::decide))
         .route("/api/v1/entries/{id}/adopt", post(ideas::adopt))
+        .route("/api/v1/entries/{id}/review", post(ideas::review))
         .route("/api/v1/entries/{id}/release", post(tasks::release))
         .route(
             "/api/v1/entries/{id}/supersede",

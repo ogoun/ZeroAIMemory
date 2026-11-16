@@ -143,6 +143,12 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0025_session_epochs.sql"),
         rebuild: true,
     },
+    // M6.5: статус идеи `returned` (пересборка `entries` по рецепту 0024)
+    Migration {
+        version: 26,
+        sql: include_str!("../migrations/user/0026_idea_review.sql"),
+        rebuild: true,
+    },
 ];
 
 /// Вид пространства.

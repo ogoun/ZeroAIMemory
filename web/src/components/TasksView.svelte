@@ -3,7 +3,9 @@
   // у карточки — следующий шаг, блокер, захват («в работе у <агент>, до <время>»), у выполненных —
   // длительность. Человек меняет статус и поля (PATCH с If-Match; переоткрытие из done/dropped —
   // с причиной) и снимает захват агента. Захватывает задачу агент: захват привязан к сессии
-  // агента (`X-Zam-Session`), у WebUI сессии агента нет.
+  // агента (`X-Zam-Session`), у WebUI сессии агента нет. План работ (M6.5 §9): у задачи из идеи —
+  // пометка «из идеи w:<id> «…»» со ссылкой на идею (поле `idea`, в карточке — все её идеи),
+  // кнопка «Из идей» — только такие задачи (`from_idea=1` на сервере).
   import { untrack } from 'svelte';
   import FileRefs from './FileRefs.svelte';
   import {
@@ -19,8 +21,8 @@
     type EntryStatus,
   } from '../lib/api';
   import { loadRefs, staleOf, type RefsByTarget } from '../lib/fileRefs';
-  import { AUTHOR_TEXT, STATUS_TEXT, TASK_COLUMNS, entryRef, fmtTime } from '../lib/journals';
-  import { go } from '../lib/router';
+  import { AUTHOR_TEXT, STATUS_TEXT, TASK_COLUMNS, entryRef, entryStatusText, fmtTime } from '../lib/journals';
+  import { go, href } from '../lib/router';
 
   interface Props {
     user: string;
@@ -38,6 +40,8 @@
   let loading = $state(false);
   let error = $state('');
   let refs = $state<RefsByTarget>(new Map());
+  /** Только задачи из идей (пункты плана). */
+  let fromIdea = $state(false);
   let seq = 0;
 
   let cur = $state<Entry | null>(null);
@@ -66,6 +70,7 @@
     const u = user;
     const s = space;
     untrack(() => {
+      fromIdea = false;
       load(u, s, true);
       loadRefs(u, s).then((r) => {
         if (u === user && s === space) refs = r;
@@ -84,7 +89,7 @@
     loading = true;
     error = '';
     try {
-      const r = await listEntries(u, s, { kind: 'task', cursor: reset ? null : next, limit: PAGE });
+      const r = await listEntries(u, s, { kind: 'task', fromIdea, cursor: reset ? null : next, limit: PAGE });
       if (my !== seq) return;
       items = reset ? r.items : [...items, ...r.items];
       next = r.next_cursor;
@@ -145,6 +150,16 @@
   };
 
   let columns = $derived(TASK_COLUMNS.map((s) => ({ status: s, tasks: items.filter((t) => t.status === s) })));
+
+  function toggleFromIdea() {
+    fromIdea = !fromIdea;
+    load(user, space, true);
+  }
+
+  /** Ссылка на идею задачи: идея в пространстве задачи — в нём же, иначе — Knowledge (задача
+   * «начать» общей идеи бывает в решении той же базы). */
+  const ideaHref = (t: Entry, id: string, ideaSpace: string) =>
+    href({ name: 'journal', user, space: ideaSpace === t.space_id ? space : 'knowledge', journal: 'ideas', entry: id });
 
   function select(id: string) {
     notice = '';
@@ -258,11 +273,12 @@
 <section class="journal tasks">
   <div class="row bar">
     <button type="button" class="primary" onclick={startCreate}>Новая задача</button>
+    <button type="button" class="toggle" aria-pressed={fromIdea} onclick={toggleFromIdea} title="Только задачи из идей — пункты плана работ">Из идей</button>
   </div>
 
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}
-  {#if !loading && items.length === 0 && !error}<p class="muted">Задач нет.</p>{/if}
+  {#if !loading && items.length === 0 && !error}<p class="muted">{fromIdea ? 'Задач из идей нет.' : 'Задач нет.'}</p>{/if}
 
   <div class="board" role="group" aria-label="Доска задач">
     {#each columns as col (col.status)}
@@ -273,6 +289,11 @@
           {@const stale = staleOf(refs.get(entryRef('task', t.id)))}
           <article class="task" class:selected={t.id === entry} data-task={t.id}>
             <button type="button" class="link title" onclick={() => select(t.id)}>{t.title}</button>
+            {#if t.idea}
+              <a class="small from-idea" href={ideaHref(t, t.idea.id, t.idea.space_id)} data-testid="from-idea">
+                из идеи {entryRef('idea', t.idea.id)} «{t.idea.title}»{#if (t.ideas?.length ?? 1) > 1}&nbsp;и ещё {(t.ideas?.length ?? 1) - 1}{/if}
+              </a>
+            {/if}
             {#if str(t.data, 'next_step')}<div class="small">Дальше: {str(t.data, 'next_step')}</div>{/if}
             {#if t.status === 'blocked' && str(t.data, 'blocked_by')}
               <div class="small blocked">Блокер: {str(t.data, 'blocked_by')}</div>
@@ -304,6 +325,15 @@
         </div>
       </header>
       {#if c.body}<p class="body">{c.body}</p>{/if}
+      {#if c.ideas?.length}
+        <div class="ideas" data-testid="task-ideas">
+          <span class="muted">{c.ideas.length > 1 ? 'Из идей:' : 'Из идеи:'}</span>
+          {#each c.ideas as i (i.id)}
+            <a href={ideaHref(c, i.id, i.space_id)}>{entryRef('idea', i.id)} «{i.title}»</a>
+            {#if i.status}<span class="chip">{entryStatusText('idea', i.status)}</span>{/if}
+          {/each}
+        </div>
+      {/if}
       {#if claim}
         <p class="claim" data-testid="claim">{claimText(claim)}</p>
       {/if}
@@ -373,6 +403,21 @@
 <style>
   .bar {
     margin-bottom: 8px;
+  }
+  .toggle[aria-pressed='true'] {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--selected);
+  }
+  .from-idea {
+    overflow-wrap: anywhere;
+  }
+  .ideas {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    overflow-wrap: anywhere;
   }
   .board {
     display: grid;

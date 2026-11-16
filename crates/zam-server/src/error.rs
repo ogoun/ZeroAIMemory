@@ -91,6 +91,11 @@ pub enum ApiError {
     /// начинается, пока человек не примет её как свою.
     #[error("идея от агента: сначала человек принимает идею как свою")]
     IdeaAgentOrigin,
+    /// 409 `/problems/idea-mode` (M6.5 §7): операция не того режима идей `ideas.mode` владельца
+    /// базы — разбор в режиме `propose` или `propose` идеи `new` в режиме `review`; в `detail` —
+    /// что делать вместо неё.
+    #[error("{0}")]
+    IdeaMode(String),
     /// 409 `/problems/already-decided` (M5.7 §5): «начать» уже было; тело несёт `task_id`.
     #[error("по идее уже решено «начать»: задача создана (task_id)")]
     AlreadyDecided { task_id: Option<zam_core::Id> },
@@ -249,6 +254,7 @@ impl ApiError {
                 "/problems/idea-agent-origin",
                 "Conflict",
             ),
+            ApiError::IdeaMode(_) => (StatusCode::CONFLICT, "/problems/idea-mode", "Conflict"),
             ApiError::AlreadyDecided { .. } => (
                 StatusCode::CONFLICT,
                 "/problems/already-decided",

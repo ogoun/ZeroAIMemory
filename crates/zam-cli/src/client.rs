@@ -111,10 +111,87 @@ fn host_of(url: &str) -> &str {
     auth.split(':').next().unwrap_or("")
 }
 
-/// К loopback системный прокси не применяется; для остальных хостов работают
-/// ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY (по умолчанию ureq).
+/// К loopback системный прокси не применяется (см. [`proxy_env_for`]).
 fn bypass_proxy(url: &str) -> bool {
     matches!(host_of(url), "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Адрес прокси для `url` по переменным окружения — как у curl: схема `https` —
+/// `https_proxy`/`HTTPS_PROXY`, остальные — `http_proxy`/`HTTP_PROXY`, затем у обеих
+/// `all_proxy`/`ALL_PROXY`; хост из `no_proxy`/`NO_PROXY` ([`no_proxy_matches`]) и loopback —
+/// без прокси. Сам ureq берёт первую из ALL/HTTPS/HTTP для любой схемы: `HTTPS_PROXY` уводил
+/// `http://` к серверу в локальной сети в прокси (обкатка 0.0.11-m6).
+fn proxy_env_for(url: &str, get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if bypass_proxy(url) {
+        return None;
+    }
+    let var = |keys: &[&str]| {
+        keys.iter().find_map(|k| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+    };
+    if var(&["no_proxy", "NO_PROXY"]).is_some_and(|l| no_proxy_matches(&l, host_of(url))) {
+        return None;
+    }
+    let https = url
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+    if https {
+        var(&["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"])
+    } else {
+        var(&["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"])
+    }
+}
+
+/// Хост попадает в список `NO_PROXY` (через запятую или пробел): `*` — все; имя — оно само и
+/// его поддомены (`example.com`, `.example.com`, `*.example.com`); IP — точное совпадение;
+/// подсеть CIDR (`192.0.2.0/24`, `fd00::/8`). Порт у элемента (`host:7700`) не учитывается.
+fn no_proxy_matches(list: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let ip = host.parse::<std::net::IpAddr>().ok();
+    list.split([',', ' ', '\t'])
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .any(|e| {
+            if e == "*" {
+                return true;
+            }
+            let e = e.to_ascii_lowercase();
+            if let Some((net, bits)) = e.split_once('/') {
+                let net = net.trim_matches(['[', ']']).parse::<std::net::IpAddr>();
+                return match (ip, net, bits.parse::<u8>()) {
+                    (Some(ip), Ok(net), Ok(bits)) => in_cidr(ip, net, bits),
+                    _ => false,
+                };
+            }
+            let e = match e.strip_prefix('[') {
+                Some(v6) => v6.split(']').next().unwrap_or(""),
+                None if e.matches(':').count() == 1 => e.split(':').next().unwrap_or(""),
+                None => e.as_str(),
+            };
+            let d = e.trim_start_matches("*.").trim_start_matches('.');
+            if let (Some(ip), Ok(eip)) = (ip, d.parse::<std::net::IpAddr>()) {
+                return ip == eip;
+            }
+            !d.is_empty() && (host == d || host.ends_with(&format!(".{d}")))
+        })
+}
+
+fn in_cidr(ip: std::net::IpAddr, net: std::net::IpAddr, bits: u8) -> bool {
+    use std::net::IpAddr::{V4, V6};
+    match (ip, net) {
+        (V4(a), V4(n)) if bits <= 32 => {
+            let m = u32::MAX.checked_shl(32 - u32::from(bits)).unwrap_or(0);
+            u32::from(a) & m == u32::from(n) & m
+        }
+        (V6(a), V6(n)) if bits <= 128 => {
+            let m = u128::MAX.checked_shl(128 - u32::from(bits)).unwrap_or(0);
+            u128::from(a) & m == u128::from(n) & m
+        }
+        _ => false,
+    }
 }
 
 /// Профиль таймаутов агента.
@@ -197,9 +274,10 @@ pub fn agent(url: &str, t: Timeouts) -> ureq::Agent {
                 .timeout_global(Some(d))
         }
     };
-    if bypass_proxy(url) {
-        b = b.proxy(None);
-    }
+    // прокси выбирается всегда явно: умолчание ureq (`Proxy::try_from_env`) не смотрит на схему
+    let proxy =
+        proxy_env_for(url, |k| std::env::var(k).ok()).and_then(|p| ureq::Proxy::new(&p).ok());
+    b = b.proxy(proxy);
     ureq::Agent::new_with_config(b.build())
 }
 
@@ -792,6 +870,87 @@ mod tests {
         ] {
             assert!(!bypass_proxy(u), "{u}");
         }
+    }
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn proxy_by_scheme_like_curl() {
+        // обкатка 0.0.11-m6: HTTPS_PROXY не должен уводить http:// к серверу в LAN
+        let only_https = env_of(&[("HTTPS_PROXY", "http://p:3128")]);
+        assert_eq!(proxy_env_for("http://192.0.2.20:7700", &only_https), None);
+        assert_eq!(
+            proxy_env_for("https://zam.example.com", &only_https).as_deref(),
+            Some("http://p:3128")
+        );
+        let only_http = env_of(&[("http_proxy", "http://h:8080")]);
+        assert_eq!(
+            proxy_env_for("http://zam.lan:7700", &only_http).as_deref(),
+            Some("http://h:8080")
+        );
+        assert_eq!(proxy_env_for("https://zam.lan", &only_http), None);
+        let all = env_of(&[("ALL_PROXY", "socks5://s:1080"), ("HTTP_PROXY", " ")]);
+        assert_eq!(
+            proxy_env_for("http://zam.lan", &all).as_deref(),
+            Some("socks5://s:1080")
+        );
+        assert_eq!(
+            proxy_env_for("HTTPS://zam.lan", &all).as_deref(),
+            Some("socks5://s:1080")
+        );
+        let both = env_of(&[("https_proxy", "http://a:1"), ("ALL_PROXY", "http://b:2")]);
+        assert_eq!(
+            proxy_env_for("https://x", &both).as_deref(),
+            Some("http://a:1")
+        );
+        assert_eq!(proxy_env_for("http://localhost:7700", &all), None);
+        assert_eq!(proxy_env_for("http://x", env_of(&[])), None);
+    }
+
+    #[test]
+    fn no_proxy_patterns() {
+        let env = env_of(&[
+            ("ALL_PROXY", "http://p:3128"),
+            (
+                "NO_PROXY",
+                "zam.lan, .corp.example ,*.int, 10.0.0.0/8,192.0.2.20:7700,[fd00::1],fc00::/7",
+            ),
+        ]);
+        for u in [
+            "http://zam.lan:7700",
+            "http://ZAM.LAN.",
+            "http://a.zam.lan",
+            "http://corp.example",
+            "http://b.corp.example",
+            "http://x.int",
+            "http://10.20.30.40:7700",
+            "http://192.0.2.20:7700",
+            "http://[fd00::1]:7700",
+            "http://[fc12::5]/",
+        ] {
+            assert_eq!(proxy_env_for(u, &env), None, "{u}");
+        }
+        for u in [
+            "http://zam.lan.evil.com",
+            "http://xzam.lan",
+            "http://192.0.2.21",
+            "http://11.0.0.1",
+            "http://[fe80::1]",
+        ] {
+            assert!(proxy_env_for(u, &env).is_some(), "{u}");
+        }
+        let star = env_of(&[("HTTP_PROXY", "http://p:1"), ("no_proxy", "*")]);
+        assert_eq!(proxy_env_for("http://any.host", &star), None);
+        assert!(no_proxy_matches("0.0.0.0/0", "8.8.8.8"));
+        assert!(!no_proxy_matches("192.0.2.0/33", "192.0.2.1"));
+        assert!(!no_proxy_matches("bad/x,,", "bad"));
     }
 
     #[test]

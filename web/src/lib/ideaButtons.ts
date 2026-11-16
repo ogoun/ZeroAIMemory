@@ -1,14 +1,19 @@
-// Карточка идеи журнала «Идеи» (M5.7 §10; M6 §16, задача 16): состав кнопок по состоянию идеи,
-// разбор формы решения, текст итога, вкладки, поля идеи. Импортирует только `IdeasView` — модуль
-// живёт в его ленивом чанке; общее с «Вопросами» — в `ideaForms.ts`. Вёрстка — в компоненте.
-// Зависимость времени выполнения одна — `ideaForms.ts` (с расширением: модуль проверяется
-// `node --test`), остальное — `import type`.
-import type { Entry, EntryStatus, IdeaDecision } from './api';
+// Карточка и лента журнала «Идеи» (M5.7 §10; M6 §16, задача 16; M6.5 §9): состав кнопок по
+// состоянию идеи, разбор формы решения, текст итога, вкладки, чипы статусов и разделы
+// «Группировать по статусу», разбор агента (строка решения ленты, ссылки «Опирался на»), поля идеи.
+// Импортирует только `IdeasView` — модуль живёт в его ленивом чанке; общее с «Вопросами» — в
+// `ideaForms.ts`. Вёрстка — в компоненте. Зависимости времени выполнения — `ideaForms.ts` и
+// `ideaStatus.ts`, `entryRefs.ts` (с расширением: модуль проверяется `node --test`), остальное —
+// `import type`.
+import type { Entry, EntryStatus, IdeaDecision, IdeaReview, ReviewOutcome } from './api';
 import { DEFER_FORM, START_SUBMIT, type FormText, type IdeaForm } from './ideaForms.ts';
+import { JOURNAL_OF_LETTER } from './entryRefs.ts';
+import { IDEA_STATUSES, IDEA_STATUS_TEXT, type IdeaStatus } from './ideaStatus.ts';
 import type { IdeaPriority } from './journals';
+import type { Journal } from './router';
 
-/** Действие кнопки карточки идеи. */
-export type IdeaAction = 'start' | 'adopt' | 'defer' | 'decline' | 'reopen' | 'edit';
+/** Действие кнопки карточки идеи; `delete` — в корзину (у отклонённой, M6.5 §6). */
+export type IdeaAction = 'start' | 'adopt' | 'defer' | 'decline' | 'reopen' | 'edit' | 'delete';
 
 export interface IdeaButton {
   act: IdeaAction;
@@ -17,8 +22,38 @@ export interface IdeaButton {
   cls: '' | 'primary' | 'danger';
 }
 
-/** «Активные» идеи — фильтр журнала по умолчанию (§10); им же доступны «начать» и «отложить». */
-export const IDEA_ACTIVE: EntryStatus[] = ['new', 'proposed', 'deferred'];
+/** «Активные» идеи — фильтр журнала по умолчанию (§10; M6.5 §4 — и «На доработку»); им же
+ * доступны «начать», «отложить» и «отказаться». */
+export const IDEA_ACTIVE: EntryStatus[] = ['new', 'returned', 'proposed', 'deferred'];
+
+/** Чип статусов ленты (M6.5 §9): «Активные» (по умолчанию), статусы идеи по порядку, «Все». */
+export type IdeaChip = 'active' | IdeaStatus | 'all';
+export const IDEA_CHIPS: { id: IdeaChip; statuses: EntryStatus[] }[] = [
+  { id: 'active', statuses: IDEA_ACTIVE },
+  ...IDEA_STATUSES.map((s) => ({ id: s, statuses: [s] as EntryStatus[] })),
+  { id: 'all', statuses: [] },
+];
+
+/** Счётчик чипа по ответу `entries/counts`: сумма его статусов («Все» — всех статусов идеи). */
+export function chipCount(chip: IdeaChip, counts: Partial<Record<EntryStatus, number>>): number {
+  const of = (ss: readonly EntryStatus[]) => ss.reduce((n, s) => n + (counts[s] ?? 0), 0);
+  if (chip === 'all') return of(IDEA_STATUSES);
+  return of(IDEA_CHIPS.find((c) => c.id === chip)?.statuses ?? []);
+}
+
+/** Разделы «Группировать по статусу» — в порядке чипов, пустых нет; неизвестный статус — в конце. */
+export function groupByStatus<T extends { status?: EntryStatus | null }>(items: T[]): { status: string; items: T[] }[] {
+  const order: string[] = IDEA_STATUSES;
+  const groups = new Map<string, T[]>();
+  for (const it of items) {
+    const k = it.status ?? '';
+    const g = groups.get(k);
+    if (g) g.push(it);
+    else groups.set(k, [it]);
+  }
+  const rank = (k: string) => (order.includes(k) ? order.indexOf(k) : order.length);
+  return [...groups.entries()].sort(([a], [b]) => rank(a) - rank(b)).map(([status, items]) => ({ status, items }));
+}
 
 /** Вкладки журнала по происхождению (§10). */
 export type IdeaTab = 'human' | 'agent' | 'all';
@@ -54,17 +89,23 @@ export const tagsOf = (s: string): string[] =>
 /**
  * Кнопки карточки идеи в порядке показа: `status` идеи, `agent` — идея «от агента» («Начать» нет до
  * «Принять как свою»), `released` — задача принятой идеи снята или удалена ({@link releasedOf}).
+ * Возвращённую (M6.5 §6) человек дописывает — «Изменить» главное действие — или решает сам
+ * («Начать», «Отложить», «Отказаться», §4, §6; «Вернуть» из неё нет — на разбор её возвращает
+ * правка); отклонённую можно вернуть на разбор или удалить в корзину.
  */
 export function ideaButtons(status: EntryStatus | null, agent: boolean, released: boolean): IdeaButton[] {
   const active = !!status && IDEA_ACTIVE.includes(status);
+  const returned = status === 'returned';
   const editable = status === 'new' || status === 'deferred';
   const all: [boolean, IdeaAction, string, IdeaButton['cls']][] = [
-    [active && !agent, 'start', 'Начать', 'primary'],
+    [returned, 'edit', 'Изменить', 'primary'],
+    [active && !agent, 'start', 'Начать', returned ? '' : 'primary'],
     [agent && editable, 'adopt', 'Принять как свою', 'primary'],
     [active, 'defer', 'Отложить', ''],
     [active || released, 'decline', 'Отказаться', 'danger'],
-    [status === 'declined' || status === 'deferred' || released, 'reopen', 'Вернуть', ''],
+    [status === 'declined' || status === 'deferred' || released, 'reopen', 'Вернуть на разбор', ''],
     [editable, 'edit', 'Изменить', ''],
+    [status === 'declined', 'delete', 'Удалить', 'danger'],
   ];
   return all.filter((b) => b[0]).map(([, act, title, cls]) => ({ act, title, cls }));
 }
@@ -76,7 +117,7 @@ export const IDEA_FORMS: Record<IdeaForm, FormText> = {
   start: { aria: 'Начать идею', title: 'Начать: где поставить задачу', submit: START_SUBMIT },
   defer: DEFER_FORM,
   decline: { aria: 'Отказаться от идеи', title: 'Отказаться', submit: 'Отказаться' },
-  reopen: { aria: 'Вернуть идею', title: 'Вернуть в новые', submit: 'Вернуть' },
+  reopen: { aria: 'Вернуть идею', title: 'Вернуть на разбор', submit: 'Вернуть' },
 };
 
 export interface DecisionFields {
@@ -113,4 +154,151 @@ export const decisionNotice = (decision: IdeaDecision, taskRef: string, horizon?
       ? `Идея отложена до ${horizon} (UTC).`
       : decision === 'decline'
         ? 'Отказ записан.'
-        : 'Идея возвращена в новые.';
+        : 'Идея возвращена на разбор.';
+
+/** Итог правки идеи: возвращённую человек дописал, и сервер вернул её в «Непросмотрено» —
+ * «Отправлено на разбор» (M6.5 §6); иначе — «Идея сохранена». */
+export const editNotice = (before: EntryStatus | null, after: EntryStatus | null): string =>
+  before === 'returned' && after === 'new' ? 'Отправлено на разбор.' : 'Идея сохранена.';
+
+// ---- разбор агента (M6.5 §5, §9) ----
+
+/** Подписи исходов разбора. */
+export const REVIEW_OUTCOME_TEXT: Record<ReviewOutcome, string> = {
+  plan: 'В план',
+  return: 'На доработку',
+  decline: 'Отклонена',
+  done: 'Сделано',
+};
+
+/** Статусы идеи, которые даёт исход (`plan` — и `done`: задача плана выполнена). */
+const OUTCOME_STATUSES: Record<ReviewOutcome, EntryStatus[]> = {
+  plan: ['accepted', 'done'],
+  return: ['returned'],
+  decline: ['declined'],
+  done: ['done'],
+};
+
+const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+
+/** Разбор из JSON (`data.review`, элемент `data.reviews`) или `null` — не разбор. */
+function parseReview(v: unknown): IdeaReview | null {
+  if (!v || typeof v !== 'object') return null;
+  const o = v as Record<string, unknown>;
+  const outcome = o.outcome;
+  if (outcome !== 'plan' && outcome !== 'return' && outcome !== 'decline' && outcome !== 'done') return null;
+  const s = (k: string) => (typeof o[k] === 'string' ? (o[k] as string) : undefined);
+  return {
+    outcome,
+    summary: s('summary') ?? '',
+    missing: s('missing'),
+    basis: strs(o.basis),
+    similar: strs(o.similar),
+    task: s('task'),
+    by_user: s('by_user') ?? '',
+    session: s('session'),
+    at: s('at') ?? '',
+  };
+}
+
+/** Чей агент разбирал (M6.5 §7 «Общие решения»): «ваш агент» — разбирал смотрящий (`viewer` —
+ * его id пользователя), иначе «агент <имя>» по `reviewers` из `GET /entries/{id}`; имени нет —
+ * «агент». */
+export function reviewerLabel(r: IdeaReview, reviewers: Record<string, string> | undefined, viewer: string): string {
+  if (r.by_user && r.by_user === viewer) return 'ваш агент';
+  const name = r.by_user ? reviewers?.[r.by_user] : undefined;
+  return name ? `агент ${name}` : 'агент';
+}
+
+/** Последний разбор агента (`data.review`) или `null`. */
+export const reviewOf = (e: Entry): IdeaReview | null => parseReview(e.data.review);
+
+/** Прежние разборы (`data.reviews` без текущего), новые первыми. */
+export function olderReviews(e: Entry): IdeaReview[] {
+  const raw = Array.isArray(e.data.reviews) ? (e.data.reviews as unknown[]) : [];
+  const all = raw.map(parseReview).filter((r): r is IdeaReview => r !== null);
+  const cur = reviewOf(e);
+  return cur && all.length && all[0].at === cur.at && all[0].outcome === cur.outcome ? all.slice(1) : all;
+}
+
+/** Последний разбор определяет нынешнее состояние идеи: статус — тот, что дал исход, и после
+ * разбора человек не решал иначе (`data.decided` не разбора и позже него). */
+export function reviewCurrent(e: Entry): boolean {
+  const r = reviewOf(e);
+  if (!r || !e.status || !OUTCOME_STATUSES[r.outcome].includes(e.status)) return false;
+  const d = e.data.decided;
+  if (!d || typeof d !== 'object') return true;
+  const o = d as Record<string, unknown>;
+  const at = typeof o.at === 'string' ? Date.parse(o.at) : NaN;
+  const rat = Date.parse(r.at);
+  return o.channel === 'review' || Number.isNaN(at) || Number.isNaN(rat) || at <= rat;
+}
+
+/** Пояснение в карточке, когда последний разбор уже не определяет состояние идеи: статус после
+ * него другой (возвращённую дописали, отклонённую вернули на разбор) или решал человек. */
+export function reviewNote(e: Entry): string {
+  if (!reviewOf(e) || reviewCurrent(e)) return '';
+  const label = (IDEA_STATUS_TEXT as Record<string, string>)[e.status ?? ''] ?? e.status ?? '';
+  const r = reviewOf(e)!;
+  return e.status && OUTCOME_STATUSES[r.outcome].includes(e.status)
+    ? 'После разбора решение принял человек.'
+    : `После разбора статус изменился: ${label}.`;
+}
+
+/** Текст в одну строку не длиннее `n` символов (длиннее — обрезка с «…»). */
+export function clip(s: string, n: number): string {
+  const t = Array.from(s.replace(/\s+/g, ' ').trim());
+  return t.length <= n ? t.join('') : `${t.slice(0, n).join('').trimEnd()}…`;
+}
+
+/** Ссылки на сделанное — для строки «Сделано: …» (как правило сервера у исхода `done`). */
+const DONE_PREFIXES = ['c:', 'r:', 'commit:', 'k:'];
+
+/** Строка решения ленты: исход разбора (`kind`, пусто — строки нет) и текст. */
+export interface ReviewLine {
+  kind: ReviewOutcome | '';
+  text: string;
+}
+
+/**
+ * Строка решения ленты (M6.5 §9): «В план → k:<id> «…»» (заголовок задачи, если известен) |
+ * «Не хватает: <60 символов>» | «Отклонена: <60 символов разбора>» | «Сделано: <ссылка>». Пусто
+ * (`kind: ''`) — разбора нет или он уже не определяет состояние идеи ({@link reviewCurrent}).
+ */
+export function reviewLine(e: Entry): ReviewLine {
+  const r = reviewOf(e);
+  if (!r || !reviewCurrent(e)) return { kind: '', text: '' };
+  const line = (text: string): ReviewLine => ({ kind: r.outcome, text });
+  switch (r.outcome) {
+    case 'plan': {
+      const ref = r.task ?? (typeof e.data.task_id === 'string' ? `k:${e.data.task_id}` : '');
+      const title = e.task && !e.task.deleted ? (e.task.title ?? '') : '';
+      return line(`В план → ${ref}${title ? ` «${clip(title, 60)}»` : ''}`.trimEnd());
+    }
+    case 'return':
+      return line(`Не хватает: ${clip(r.missing ?? '', 60)}`);
+    case 'decline':
+      return line(`Отклонена: ${clip(r.summary, 60)}`);
+    case 'done': {
+      const ref = r.basis.find((b) => DONE_PREFIXES.some((p) => b.startsWith(p))) ?? r.basis[0] ?? '';
+      return line(ref ? `Сделано: ${ref}` : 'Сделано');
+    }
+  }
+}
+
+/** Куда ведёт ссылка разбора (`basis`, `similar`): журнал записи, заметка, текст для копирования. */
+export type RefTarget = { journal: Journal; id: string } | { node: string } | { copy: string } | null;
+
+/** Ссылка разбора → журнал записи (`k:`, `i:`, …) или заметка (`n:`); `file:` и `commit:` — текст
+ * для «копировать» (путь или sha без префикса); иное — `null` (показывается как есть). */
+export function refTarget(ref: string): RefTarget {
+  const i = ref.indexOf(':');
+  if (i < 0) return null;
+  const p = ref.slice(0, i);
+  const rest = ref.slice(i + 1).trim();
+  if (!rest) return null;
+  if (p === 'file' || p === 'commit') return { copy: rest };
+  if (!/^[0-9A-Za-z]{1,64}$/.test(rest)) return null;
+  if (p === 'n') return { node: rest };
+  return Object.hasOwn(JOURNAL_OF_LETTER, p) ? { journal: JOURNAL_OF_LETTER[p], id: rest } : null;
+}

@@ -10,20 +10,27 @@
 //!   расхождение — 409 с текущей ревизией `rev`; ревизия проверяется раньше прав;
 //!   `POST /entries/{id}/restore` (`If-Match` необязателен, при наличии проверяется),
 //!   `GET /entries/{id}/revisions`; `GET /entries/{id}` отдаёт и `usage: {shown, useful,
-//!   useless}` (§10.5, оценка — [`super::feedback`]), список — у каждой insight (задача 13).
+//!   useless}` (§10.5, оценка — [`super::feedback`]), список — у каждой insight (задача 13);
+//! - `GET /spaces/{space}/entries/counts?kind=<вид>` — число живых записей вида по статусам с
+//!   фильтрами ленты (`area`, `tag`, `origin`, `priority`, `from_idea`): чипы статусов ленты
+//!   идей WebUI (M6.5 §9).
 //!
 //! `kind: task` — журнал задач (M4.5 §3, [`super::tasks`]): в решении и Knowledge, `data`
 //! по [`zam_store::TaskData`]; `PATCH` меняет `status` (с `next_step`, `blocked_by`, `reason`;
 //! переоткрытие `done`/`dropped` → `open` — только с `reason`, иначе 422 `reason-required`) и
-//! поля задачи слиянием; у `done` в ответах — `duration_min`.
+//! поля задачи слиянием; у `done` в ответах — `duration_min`; у задачи из идеи (системное ребро
+//! `derived_from` на живую идею) — `idea {id, title, status, space_id}` и `ideas` (все её идеи), у ленты —
+//! фильтр `from_idea=1` (M6.5 §9).
 //! `kind: question` — вопрос к человеку (M4.5 §4, [`super::questions`]): в решении и Knowledge,
 //! `data` по [`zam_store::QuestionData`] (`options`, `recommendation`); совпавший заголовок
 //! `open`/`answered` вопроса — 409 `possible-duplicate` (`force` пишет всё равно); `PATCH` —
 //! `data` пока `open` и `status: obsolete` с `reason`; ответ — `POST /entries/{id}/answer`.
 //! `kind: idea` — идея (M5.7, [`super::ideas`]): в решении и Knowledge; `data.origin` у токена
-//! обязателен, у WebUI — всегда `human`; `PATCH status` — 422, содержимое — только в `new` и
-//! `deferred` (иначе 409); токен по идее человека — 403 `idea-human-owned`, кроме `append_body`
-//! (и на `DELETE`); лента — фильтры `origin`, `priority`; `GET` — ещё `task` и `question`.
+//! обязателен, у WebUI — всегда `human`; `PATCH status` — 422, содержимое — только в `new`,
+//! `deferred` и `returned` (иначе 409); токен по идее человека — 403 `idea-human-owned`, кроме
+//! `append_body` (и на `DELETE`); правка человеком (сессия WebUI или токен с `by: human`, M6.5
+//! §6) заголовка или тела возвращённой идеи переводит её в `new`; лента — фильтры `origin`,
+//! `priority`; `GET` — ещё `task` и `question`, лента — `task`.
 //! `kind: report` — отчёт (M5.5, [`super::reports`]): `multipart/form-data` или JSON с
 //! `images`, только агентом и только в решении; ответ — `{id, url}`.
 //! Changelog и release создаются только в пространстве решения (иначе 422); `kind: insight`
@@ -48,8 +55,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use zam_core::{Id, TargetKind};
 use zam_store::{
-    Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, NewEntry, SpaceKind,
-    create_entry, delete_entry, entry_by_idempotency_key, entry_revisions, list_entries,
+    AnswerBy, Certainty, Entry, EntryFilter, EntryKind, EntryPatch, EntryStatus, NewEntry,
+    SpaceKind, create_entry, delete_entry, entry_by_idempotency_key, entry_revisions, list_entries,
     restore_entry, update_entry, usage_counts,
 };
 
@@ -452,7 +459,7 @@ pub async fn create(
     };
     let mut v = json!(entry);
     super::secrets::attach_entry(&mut v, &entry);
-    super::tasks::attach_task(&mut v, &entry);
+    super::tasks::attach_task(&mut v, &entry, &[]);
     super::glossary::attach_warnings(
         &mut v,
         super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &entry.title, &entry.body)
@@ -485,6 +492,19 @@ pub struct ListQuery {
     origin: Option<String>,
     /// Только `kind=idea`: `low` | `normal` | `high`.
     priority: Option<String>,
+    /// Только `kind=task`: `1` — задачи из идей (пункты плана, M6.5 §9).
+    from_idea: Option<String>,
+}
+
+/// Флаг запроса: нет, пусто, `0`, `false` — выключен, `1`, `true` — включён, иное — 400.
+fn parse_flag(raw: Option<&str>, what: &str) -> Result<bool, ApiError> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None | Some("0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(v) => Err(ApiError::BadRequest(format!(
+            "{what}: неизвестное значение «{v}»; допустимы 1, 0"
+        ))),
+    }
 }
 
 /// `deleted` ленты: нет или пусто — живые записи, `only` — корзина; иное — 400.
@@ -607,6 +627,10 @@ pub async fn list(
             "origin и priority — фильтры ленты идей (kind=idea)",
         ));
     }
+    let from_idea = parse_flag(q.from_idea.as_deref(), "from_idea")?;
+    if from_idea && kind != Some(EntryKind::Task) {
+        return Err(unprocessable("from_idea — фильтр ленты задач (kind=task)"));
+    }
     let f = EntryFilter {
         space_id: sc.space.id,
         kind,
@@ -637,6 +661,7 @@ pub async fn list(
             "priority",
             zam_store::IdeaPriority::parse,
         )?,
+        from_idea: from_idea.then(|| super::tasks::idea_spaces(sc.role, sc.space.id)),
     };
     let (items, next) = list_entries(&sc.db, f).await?;
     // у insight — показы и оценки (столбец списка Insights WebUI, задача 13), одним запросом
@@ -646,6 +671,19 @@ pub async fn list(
         .map(|e| e.id)
         .collect();
     let usage = zam_store::usage_counts_many(&sc.db, TargetKind::Entry, &ids).await?;
+    // у задачи — идеи плана, у идеи — её задача (M6.5 §9): по запросу на страницу, без N+1
+    let task_ids: Vec<Id> = items
+        .iter()
+        .filter(|e| e.kind == EntryKind::Task)
+        .map(|e| e.id)
+        .collect();
+    let task_ideas = zam_store::ideas_of_tasks(
+        &sc.db,
+        &task_ids,
+        &super::tasks::idea_spaces(sc.role, sc.space.id),
+    )
+    .await?;
+    let idea_tasks = super::ideas::idea_tasks_many(&sc.db, &items).await?;
     let mut out = Vec::with_capacity(items.len());
     for e in &items {
         let mut v = serde_json::to_value(e)
@@ -653,7 +691,8 @@ pub async fn list(
         if e.kind == EntryKind::Insight {
             v["usage"] = json!(usage.get(&e.id).copied().unwrap_or_default());
         }
-        super::tasks::attach_task(&mut v, e);
+        super::tasks::attach_task(&mut v, e, task_ideas.get(&e.id).map_or(&[], Vec::as_slice));
+        super::ideas::attach_idea_task(&mut v, e, &idea_tasks);
         out.push(v);
     }
     if kind == Some(EntryKind::Report) {
@@ -661,6 +700,90 @@ pub async fn list(
         super::reports::view::report_feed(&sc.db, &items, &mut out, viewer).await?;
     }
     Ok(Json(json!({ "items": out, "next_cursor": next })))
+}
+
+#[derive(Deserialize)]
+pub struct CountsQuery {
+    kind: Option<String>,
+    area: Option<String>,
+    tag: Option<String>,
+    /// Только `kind=idea`: `human` | `agent`.
+    origin: Option<String>,
+    /// Только `kind=idea`: `low` | `normal` | `high`.
+    priority: Option<String>,
+    /// Только `kind=task`: `1` — задачи из идей.
+    from_idea: Option<String>,
+}
+
+/// `GET /spaces/{space}/entries/counts?kind=<вид>` → `{<статус>: n}` — все статусы вида
+/// ([`zam_store::allowed_statuses`], нулевые тоже) с фильтрами ленты [`list`]: `area`,
+/// `tag`, у идей `origin` и `priority`, у задач `from_idea` (M6.5 §9, чипы статусов ленты идей
+/// WebUI). Без `kind` или у вида без статусов — 400; фильтр не своего вида — 422; вид, невидимый
+/// агенту, токену — 400, как у ленты.
+pub async fn counts(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path(space): Path<String>,
+    q: Result<Query<CountsQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let q = query(q)?;
+    let sc = space_scope(&st, &p, &headers, &space, Mode::Read).await?;
+    let raw = q
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("kind: обязателен".into()))?;
+    let kind = EntryKind::parse(raw)
+        .filter(|k| p.is_human() || k.agent_visible())
+        .ok_or_else(|| ApiError::BadRequest(format!("kind: «{raw}»")))?;
+    if zam_store::allowed_statuses(kind).is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "kind: у вида «{raw}» нет статусов"
+        )));
+    }
+    let idea_filter = [&q.origin, &q.priority]
+        .into_iter()
+        .any(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()));
+    if idea_filter && kind != EntryKind::Idea {
+        return Err(unprocessable(
+            "origin и priority — фильтры ленты идей (kind=idea)",
+        ));
+    }
+    let from_idea = parse_flag(q.from_idea.as_deref(), "from_idea")?;
+    if from_idea && kind != EntryKind::Task {
+        return Err(unprocessable("from_idea — фильтр ленты задач (kind=task)"));
+    }
+    let f = EntryFilter {
+        space_id: sc.space.id,
+        kind: Some(kind),
+        statuses: Vec::new(),
+        certainty: Vec::new(),
+        area: q.area.filter(|a| !a.is_empty()),
+        tag: q.tag.filter(|a| !a.is_empty()),
+        data_kind: None,
+        decided_by: None,
+        since: None,
+        until: None,
+        cursor: None,
+        limit: 1,
+        with_reports: false,
+        deleted_only: false,
+        origin: parse_one(q.origin.as_deref(), "origin", zam_store::IdeaOrigin::parse)?,
+        priority: parse_one(
+            q.priority.as_deref(),
+            "priority",
+            zam_store::IdeaPriority::parse,
+        )?,
+        from_idea: from_idea.then(|| super::tasks::idea_spaces(sc.role, sc.space.id)),
+    };
+    let counts = zam_store::count_by_status(&sc.db, f).await?;
+    let mut out = serde_json::Map::new();
+    for (s, n) in counts {
+        out.insert(s.as_str().into(), json!(n));
+    }
+    Ok(Json(Value::Object(out)))
 }
 
 #[derive(Deserialize)]
@@ -699,9 +822,10 @@ pub async fn get(
         let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
         return super::reports::view::get_html(&st, &sc, viewer).await;
     }
-    let mut v = entry_json(&sc.db, &sc.entry).await?;
+    let mut v = entry_json(&sc.db, &sc.entry, sc.role).await?;
     let links = super::ideas::idea_links(&sc.db, &sc.entry).await?;
     super::ideas::attach_idea(&mut v, &sc.entry, &links);
+    super::ideas::attach_reviewers(&st, &mut v, &sc.entry).await?;
     // показы и оценки — из базы, где лежит запись (§10.5)
     let target = zam_core::TargetRef {
         kind: zam_core::TargetKind::Entry,
@@ -746,6 +870,30 @@ pub struct Patch {
     message: Option<String>,
     /// Новый набор ссылок на файлы `{files: [...]}` целиком (M4.5 §6.1); ревизии не создаёт.
     refs: Option<Value>,
+    /// Только токен и только с правкой идеи (`title`, `body`, `append_body`; M6.5 §6): чья это
+    /// правка — `human` (агент записывает слова человека из чата: возвращённая идея снова идёт
+    /// на разбор) или `agent` (по умолчанию). Сессия WebUI — всегда человек.
+    by: Option<AnswerBy>,
+}
+
+/// `by` правки (M6.5 §6): только у токена и только вместе с правкой заголовка или тела идеи,
+/// иначе 422.
+fn check_patch_by(p: &Principal, e: &Entry, req: &Patch) -> Result<(), ApiError> {
+    if req.by.is_none() {
+        return Ok(());
+    }
+    if p.is_human() {
+        return Err(unprocessable(
+            "by: только у токена агента — правка из WebUI и так правка человека",
+        ));
+    }
+    let edit = req.title.is_some() || req.body.is_some() || req.append_body.is_some();
+    if e.kind != EntryKind::Idea || !edit {
+        return Err(unprocessable(
+            "by: только у правки идеи — вместе с title, body или append_body",
+        ));
+    }
+    Ok(())
 }
 
 /// Смена статуса task: переходы §3 M4.5; переоткрытие без `reason` — 422 `reason-required`.
@@ -873,6 +1021,10 @@ pub async fn patch(
     deny_report_mutation(&p, &sc)?;
     let rev = Some(if_match(&headers)?);
     let req: Patch = json_body(body)?;
+    check_patch_by(&p, &sc.entry, &req)?;
+    // правку сделал человек: сессия WebUI или слова человека токеном (`by: human`, M6.5 §6) —
+    // возвращённая идея снова идёт на разбор
+    let human_edit = p.is_human() || req.by == Some(AnswerBy::Human);
     // токен по идее человека — только дополнение `append_body` (M5.7 §7.1), до записи
     let content = req.title.is_some()
         || req.body.is_some()
@@ -956,13 +1108,14 @@ pub async fn patch(
         reason: req.reason,
         triggers,
         refs,
+        human_edit,
     };
     let before = sc.entry.rev;
     let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;
     if e.rev != before {
         st.index.notify();
     }
-    let mut v = entry_json(&sc.db, &e).await?;
+    let mut v = entry_json(&sc.db, &e, sc.role).await?;
     super::secrets::attach_entry(&mut v, &e);
     if e.kind != EntryKind::Term {
         super::glossary::attach_warnings(

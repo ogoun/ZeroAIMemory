@@ -92,7 +92,8 @@ async fn heavy_sh05_digest_complete_hybrid() {
     .await;
     let text = j["text"].as_str().unwrap();
     check_digest("session_start (гибрид)", text, &w, s.code_map);
-    assert!(text.contains("### Идеи"), "{text}");
+    // раздел M5.7: загрузчик ТС-2 ставит владельцу `ideas.mode = propose` (`common::heavy`)
+    assert!(text.contains("### Идеи\n"), "{text}");
     // в бюджете — всё, кроме Rules (точный счётчик модели)
     let rest = without_rules(text);
     assert!(zam_store::fits_budget(&rest, budget), "{rest}");

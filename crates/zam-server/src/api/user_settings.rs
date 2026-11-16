@@ -1,6 +1,6 @@
 //! Настройки пользователя на сервере (§10.3 «Настройки», решение контроллера R5, задача 13 M4):
-//! переключатели типов подсказок хуков `hooks.<тип>` и с M5.7 (§8) выключатель проактивности
-//! идей `ideas.proactive`.
+//! переключатели типов подсказок хуков `hooks.<тип>`, с M5.7 (§8) выключатель проактивности
+//! идей `ideas.proactive`, с M6.5 (§7) режим идей `ideas.mode`.
 //!
 //! - Хранение — `system.db`, таблица `user_settings` (миграция 0007): настройка — часть учётной
 //!   записи, как пароль и токены, а не память; читается без открытия базы пользователя
@@ -9,15 +9,23 @@
 //!   hooks.checkpoint` и с M4.5 (§9.6) `hooks.subagent_start | hooks.file_context |
 //!   hooks.session_journal | hooks.recovery`, с M5.6 (§10) `hooks.code_map`, значение — `bool`;
 //!   нет строки — `true` (новые ключи у старых пользователей включены); `ideas.proactive` —
-//!   `bool`, нет строки — `true`, действует вместе с `[ideas] proactive` сервера.
+//!   `bool`, нет строки — `true`, действует вместе с `[ideas] proactive` сервера;
+//!   `ideas.mode` — строка `review | propose`, нет строки — `[ideas] default_mode` сервера.
 //! - `GET/PATCH /auth/settings` — свои (сессия пользователя; администратор — своего
 //!   пользователя); по токену — 403: агент свои подсказки не выключает.
 //!   `GET/PATCH /admin/users/{id}/settings` — администратор, любой пользователь.
-//! - `PATCH {hooks?: {<тип>: bool, …}, ideas?: {proactive: bool}}`: неизвестный тип или поле —
-//!   400, пустая правка — 400. Ответ — все настройки `{hooks: {…}, ideas: {proactive}}`. Аудит
-//!   `user.settings.update {key, from, to}` на каждое изменение.
+//! - `PATCH {hooks?: {<тип>: bool, …}, ideas?: {proactive?: bool, mode?: "review"|"propose"}}`:
+//!   неизвестный тип или поле, значение не того типа (в том числе `null`) и пустая правка — 400;
+//!   строка `ideas.mode` не из `review | propose` — 422. Ответ — все настройки `{hooks: {…},
+//!   ideas: {proactive, mode}}`. Аудит `user.settings.update {key, from, to}` на каждое изменение.
+//! - Выбор, совпавший с действующим умолчанием, не сохраняется: такой пользователь пойдёт за
+//!   новым `[ideas] default_mode`, если администратор его сменит (как `hooks` — за `true`).
+//!   Переключение `ideas.mode` обратно на умолчание сервера удаляет сохранённую строку
+//!   (финальное ревью M6.5, M3).
 //! - Сервер отдаёт их в `/recall(session_start)` полем `hooks`; выключенный тип `/recall`
 //!   (`session_start`, `prompt`, `post_tool`) отвечает пустым `text` и показ не учитывает (N4).
+//! - Режим идей решения — режим **владельца базы** ([`ideas_mode`]): идеи общего решения лежат в
+//!   его базе (M6.5 §7 «Общие решения»).
 
 use axum::Json;
 use axum::body::Bytes;
@@ -29,6 +37,7 @@ use zam_store::SystemStore;
 
 use crate::app::AppState;
 use crate::auth::{AdminOnly, Client, Principal};
+use crate::config::IdeasMode;
 use crate::error::ApiError;
 
 use super::{parse_body, parse_id};
@@ -53,6 +62,8 @@ pub const HOOK_KINDS: [&str; 10] = [
 const HOOKS_PREFIX: &str = "hooks.";
 /// Ключ выключателя проактивности идей (M5.7 §8).
 pub const IDEAS_PROACTIVE: &str = "ideas.proactive";
+/// Ключ режима идей (M6.5 §7): `review | propose`.
+pub const IDEAS_MODE: &str = "ideas.mode";
 
 /// Переключатели типов подсказок пользователя (по умолчанию все включены).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,29 +94,45 @@ impl HookFlags {
     }
 }
 
-/// Действующие значения всех настроек пользователя (нет строки — `true`).
+/// Действующие значения всех настроек пользователя (нет строки — `true`, у `ideas.mode` —
+/// умолчание сервера).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserFlags {
     /// Типы подсказок хуков `hooks.<тип>`.
     pub hooks: HookFlags,
     /// Проактивность идей `ideas.proactive` (действует вместе с `[ideas] proactive`).
     pub ideas_proactive: bool,
+    /// Режим идей `ideas.mode` этого пользователя (нет строки — `[ideas] default_mode` сервера).
+    /// Для идей чужой (общей) базы действует режим её владельца — [`ideas_mode`]`(st, owner)`.
+    pub ideas_mode: IdeasMode,
 }
 
-impl Default for UserFlags {
-    fn default() -> Self {
+impl UserFlags {
+    /// Настройки без строк `user_settings`: всё включено, режим идей — `default_mode` сервера.
+    pub fn defaults(default_mode: IdeasMode) -> UserFlags {
         UserFlags {
             hooks: HookFlags::default(),
             ideas_proactive: true,
+            ideas_mode: default_mode,
         }
     }
 }
 
-/// Все настройки пользователя одним чтением `user_settings`; нечитаемое значение — `true`
-/// (как без строки).
-pub async fn user_flags(sys: &SystemStore, user: Id) -> Result<UserFlags, zam_store::StoreError> {
-    let mut f = UserFlags::default();
+/// Все настройки пользователя одним чтением `user_settings`; `default_mode` — `[ideas]
+/// default_mode` сервера. Нечитаемое значение — как без строки.
+pub async fn user_flags(
+    sys: &SystemStore,
+    user: Id,
+    default_mode: IdeasMode,
+) -> Result<UserFlags, zam_store::StoreError> {
+    let mut f = UserFlags::defaults(default_mode);
     for (key, value) in sys.user_settings(user).await? {
+        if key == IDEAS_MODE {
+            if let Some(m) = value.as_str().and_then(IdeasMode::parse) {
+                f.ideas_mode = m;
+            }
+            continue;
+        }
         let Some(b) = value.as_bool() else {
             continue;
         };
@@ -123,28 +150,42 @@ pub async fn user_flags(sys: &SystemStore, user: Id) -> Result<UserFlags, zam_st
 
 /// Переключатели типов подсказок пользователя ([`user_flags`]).
 pub async fn hook_flags(sys: &SystemStore, user: Id) -> Result<HookFlags, zam_store::StoreError> {
-    Ok(user_flags(sys, user).await?.hooks)
+    Ok(user_flags(sys, user, IdeasMode::default()).await?.hooks)
 }
 
 /// Проактивность идей пользователя (`ideas.proactive`, [`user_flags`]).
 pub async fn ideas_proactive(sys: &SystemStore, user: Id) -> Result<bool, ApiError> {
-    Ok(user_flags(sys, user).await?.ideas_proactive)
+    Ok(user_flags(sys, user, IdeasMode::default())
+        .await?
+        .ideas_proactive)
+}
+
+/// Режим идей базы `owner` (M6.5 §7): настройка `ideas.mode` владельца базы или `[ideas]
+/// default_mode` сервера. В общем решении действует режим владельца, а не участника: идеи лежат
+/// в его базе.
+pub async fn ideas_mode(st: &AppState, owner: Id) -> Result<IdeasMode, ApiError> {
+    Ok(user_flags(&st.system, owner, st.cfg.ideas.default_mode)
+        .await?
+        .ideas_mode)
 }
 
 impl UserFlags {
-    /// Значение по ключу `user_settings`.
-    fn value(&self, key: &str) -> bool {
-        if key == IDEAS_PROACTIVE {
-            return self.ideas_proactive;
+    /// Действующее значение по ключу `user_settings` (JSON, как в строке настройки).
+    fn value(&self, key: &str) -> Value {
+        match key {
+            IDEAS_PROACTIVE => Value::Bool(self.ideas_proactive),
+            IDEAS_MODE => json!(self.ideas_mode.as_str()),
+            _ => Value::Bool(
+                self.hooks
+                    .enabled(key.strip_prefix(HOOKS_PREFIX).unwrap_or(key)),
+            ),
         }
-        self.hooks
-            .enabled(key.strip_prefix(HOOKS_PREFIX).unwrap_or(key))
     }
 
     fn to_json(self) -> Value {
         json!({
             "hooks": self.hooks.to_json(),
-            "ideas": {"proactive": self.ideas_proactive},
+            "ideas": {"proactive": self.ideas_proactive, "mode": self.ideas_mode.as_str()},
         })
     }
 }
@@ -163,24 +204,45 @@ fn parse_patch(body: &Bytes) -> Result<Vec<(String, Value)>, ApiError> {
     let ideas = req.ideas.unwrap_or_default();
     if hooks.is_empty() && ideas.is_empty() {
         return Err(ApiError::BadRequest(format!(
-            "нужно поле hooks: {{{}: bool}} или ideas: {{proactive: bool}}",
+            "нужно поле hooks: {{{}: bool}} или ideas: {{proactive: bool, mode: review|propose}}",
             HOOK_KINDS.join("|")
         )));
     }
     let mut out = Vec::with_capacity(hooks.len() + ideas.len());
     for (k, v) in ideas {
-        if k != "proactive" {
-            return Err(ApiError::BadRequest(format!(
-                "ideas: неизвестное поле «{k}» — proactive"
-            )));
+        match k.as_str() {
+            "proactive" => {
+                // null — не «оставить как есть», а ошибка: значение задаётся явно
+                let Value::Bool(b) = v else {
+                    return Err(ApiError::BadRequest(
+                        "ideas.proactive: true или false".into(),
+                    ));
+                };
+                out.push((IDEAS_PROACTIVE.to_string(), Value::Bool(b)));
+            }
+            // не строка (в том числе null) — 400, как тип `proactive`; строка не из режимов — 422
+            // (значение по смыслу, как у полей операций идей)
+            "mode" => {
+                let Value::String(s) = v else {
+                    return Err(ApiError::BadRequest(
+                        "ideas.mode: строка review или propose".into(),
+                    ));
+                };
+                let Some(m) = IdeasMode::parse(s.trim()) else {
+                    return Err(ApiError::Unprocessable(
+                        "ideas.mode: review — агент сам разбирает новые идеи, propose — \
+                         предлагает их человеку вопросом"
+                            .into(),
+                    ));
+                };
+                out.push((IDEAS_MODE.to_string(), json!(m.as_str())));
+            }
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "ideas: неизвестное поле «{k}» — proactive или mode"
+                )));
+            }
         }
-        // null — не «оставить как есть», а ошибка: значение задаётся явно
-        let Value::Bool(b) = v else {
-            return Err(ApiError::BadRequest(
-                "ideas.proactive: true или false".into(),
-            ));
-        };
-        out.push((IDEAS_PROACTIVE.to_string(), Value::Bool(b)));
     }
     for (k, v) in hooks {
         if !HOOK_KINDS.contains(&k.as_str()) {
@@ -198,11 +260,15 @@ fn parse_patch(body: &Bytes) -> Result<Vec<(String, Value)>, ApiError> {
 }
 
 async fn settings_json(st: &AppState, user: Id) -> Result<Value, ApiError> {
-    Ok(user_flags(&st.system, user).await?.to_json())
+    Ok(user_flags(&st.system, user, st.cfg.ideas.default_mode)
+        .await?
+        .to_json())
 }
 
 /// Сохраняет правки и пишет аудит каждого изменения. Правка сравнивается с действующим
-/// значением (нет строки — `true`): совпало — ни записи, ни аудита (fix round 1, I-2).
+/// значением (нет строки — `true`, у `ideas.mode` — умолчание сервера): совпало — ни записи, ни
+/// аудита (fix round 1, I-2). `ideas.mode`, равный умолчанию сервера, удаляет строку настройки
+/// (аудит — как у правки).
 async fn apply(
     st: &AppState,
     actor: &str,
@@ -211,19 +277,34 @@ async fn apply(
     body: &Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let edits = parse_patch(body)?;
-    let current = user_flags(&st.system, user).await?;
+    let current = user_flags(&st.system, user, st.cfg.ideas.default_mode).await?;
     let edits: Vec<(String, Value)> = edits
         .into_iter()
-        .filter(|(key, v)| v.as_bool() != Some(current.value(key)))
+        .filter(|(key, v)| *v != current.value(key))
         .collect();
     if !edits.is_empty() {
-        let changed = st.system.set_user_settings(user, edits.clone()).await?;
+        // `ideas.mode`, равный умолчанию сервера, не хранится (M6.5 §7): правка на него снимает
+        // сохранённый выбор, и пользователь снова идёт за `[ideas] default_mode` (финальное ревью
+        // M6.5, M3); аудит — с действующими значениями, как у любой правки
+        let default_mode = json!(st.cfg.ideas.default_mode.as_str());
+        let stored: Vec<(String, Value)> = edits
+            .iter()
+            .map(|(k, v)| {
+                let v = if k == IDEAS_MODE && *v == default_mode {
+                    Value::Null
+                } else {
+                    v.clone()
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        let changed = st.system.set_user_settings(user, stored).await?;
         for (key, _) in changed {
             let to = edits
                 .iter()
                 .find(|(k, _)| *k == key)
-                .and_then(|(_, v)| v.as_bool())
-                .unwrap_or(true);
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null);
             st.system
                 .audit(
                     actor,
@@ -252,13 +333,13 @@ fn own_user(st: &AppState, p: &Principal) -> Result<Id, ApiError> {
     }
 }
 
-/// `GET /auth/settings` → `{hooks: {…}, ideas: {proactive}}`.
+/// `GET /auth/settings` → `{hooks: {…}, ideas: {proactive, mode}}`.
 pub async fn get_own(State(st): State<AppState>, p: Principal) -> Result<Json<Value>, ApiError> {
     let user = own_user(&st, &p)?;
     Ok(Json(settings_json(&st, user).await?))
 }
 
-/// `PATCH /auth/settings {hooks?: {<тип>: bool}, ideas?: {proactive}}` → все настройки.
+/// `PATCH /auth/settings {hooks?: {<тип>: bool}, ideas?: {proactive?, mode?}}` → все настройки.
 pub async fn patch_own(
     State(st): State<AppState>,
     client: Client,
@@ -275,7 +356,7 @@ async fn existing_user(st: &AppState, id: &str) -> Result<Id, ApiError> {
     Ok(id)
 }
 
-/// `GET /admin/users/{id}/settings` → `{hooks: {…}, ideas: {proactive}}`.
+/// `GET /admin/users/{id}/settings` → `{hooks: {…}, ideas: {proactive, mode}}`.
 pub async fn get_user(
     _: AdminOnly,
     State(st): State<AppState>,
@@ -351,5 +432,48 @@ mod tests {
         ] {
             assert!(parse_patch(&Bytes::from(bad.to_string())).is_err(), "{bad}");
         }
+    }
+
+    /// M6.5 §7: `ideas.mode` — строка `review | propose` (с пробелами по краям — та же); другая
+    /// строка — 422, не строка (в том числе `null`) — 400, как тип `proactive`.
+    #[test]
+    fn patch_ideas_mode() {
+        let mut ok = parse_patch(&Bytes::from_static(
+            br#"{"ideas":{"proactive":true,"mode":" propose "}}"#,
+        ))
+        .unwrap();
+        ok.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            ok,
+            vec![
+                (IDEAS_MODE.to_string(), json!("propose")),
+                (IDEAS_PROACTIVE.to_string(), Value::Bool(true)),
+            ]
+        );
+        for bad in [
+            r#"{"ideas":{"mode":"auto"}}"#,
+            r#"{"ideas":{"mode":"Review"}}"#,
+            r#"{"ideas":{"mode":""}}"#,
+        ] {
+            let e = parse_patch(&Bytes::from(bad.to_string())).unwrap_err();
+            assert!(matches!(e, ApiError::Unprocessable(_)), "{bad}: {e:?}");
+        }
+        for bad in [
+            r#"{"ideas":{"mode":true}}"#,
+            r#"{"ideas":{"mode":1}}"#,
+            r#"{"ideas":{"mode":null}}"#,
+            r#"{"ideas":{"mode":["review"]}}"#,
+        ] {
+            let e = parse_patch(&Bytes::from(bad.to_string())).unwrap_err();
+            assert!(matches!(e, ApiError::BadRequest(_)), "{bad}: {e:?}");
+        }
+        let f = UserFlags::defaults(IdeasMode::Propose);
+        assert_eq!(f.value(IDEAS_MODE), json!("propose"));
+        assert_eq!(f.value(IDEAS_PROACTIVE), json!(true));
+        assert_eq!(f.value("hooks.prompt"), json!(true));
+        assert_eq!(
+            f.to_json()["ideas"],
+            json!({"proactive": true, "mode": "propose"})
+        );
     }
 }

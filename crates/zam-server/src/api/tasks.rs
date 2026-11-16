@@ -9,7 +9,8 @@
 //! - `POST /entries/{id}/release` → 200 `Entry`: снимает захват своей сессии; чужой действующий
 //!   захват снимает только человек (WebUI), агенту — 403. Аудит `entry.release`;
 //! - смена статуса и полей задачи — `PATCH /entries/{id}` ([`super::entries::patch`]);
-//! - у `done`-задач в ответах (запись, лента) есть `duration_min` — `done_at − started_at`.
+//! - у `done`-задач в ответах (запись, лента) есть `duration_min` — `done_at − started_at`;
+//! - у задачи из идеи (запись, лента) — `idea {id, title, status, space_id}` и `ideas` (M6.5 §9).
 //!
 //! Запись задач идёт общим путём `POST /spaces/{space}/entries` (`kind: task`) в пространствах
 //! решения и Knowledge.
@@ -20,15 +21,16 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use zam_core::Id;
 use zam_store::{
-    CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Entry, EntryKind, EntryStatus, TaskData, TaskError,
-    claim_task, get_entry, release_task,
+    CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Entry, EntryKind, EntryStatus, IdeaSpaces, TaskData,
+    TaskError, TaskIdea, claim_task, get_entry, release_task,
 };
 
 use super::entries::{audit_details, unprocessable};
 use super::json_body;
 use super::nodes::audit_node;
-use super::scope::{Mode, deny_report_mutation, entry_scope, live_entry};
+use super::scope::{Mode, Role, deny_report_mutation, entry_scope, live_entry};
 use crate::app::AppState;
 use crate::attrib::attribution;
 use crate::auth::{Client, Principal};
@@ -45,16 +47,37 @@ impl From<TaskError> for ApiError {
     }
 }
 
-/// `duration_min` у `done`-задачи: `done_at − started_at` в минутах, `null` — нет `started_at`.
-pub fn attach_task(v: &mut Value, e: &Entry) {
-    if e.kind == EntryKind::Task
-        && e.status == Some(EntryStatus::Done)
-        && let Value::Object(o) = v
-    {
+/// Идеи каких пространств видны у задачи пространства `space` (поле `idea`, фильтр «из идей»):
+/// участнику общего решения — только идеи самого решения (личная Knowledge владельца, из идеи
+/// которой задача «начать» могла появиться в решении, ему не видна), владельцу базы и
+/// администратору — любые (M6.5 §9).
+pub fn idea_spaces(role: Role, space: Id) -> IdeaSpaces {
+    match role {
+        Role::Member(_) => IdeaSpaces::Only(vec![space]),
+        Role::Personal | Role::Owner | Role::Admin => IdeaSpaces::All,
+    }
+}
+
+/// Поля задачи в ответах: у `done` — `duration_min` (`done_at − started_at` в минутах, `null` —
+/// нет `started_at`); у задачи из идеи (`ideas` — её живые идеи по системным рёбрам
+/// `derived_from`, [`zam_store::ideas_of_tasks`]) — `idea {id, title, status, space_id}` первой идеи и
+/// `ideas` — все (M6.5 §9: пометка «из идеи» в «Задачах» WebUI).
+pub fn attach_task(v: &mut Value, e: &Entry, ideas: &[TaskIdea]) {
+    if e.kind != EntryKind::Task {
+        return;
+    }
+    let Value::Object(o) = v else {
+        return;
+    };
+    if e.status == Some(EntryStatus::Done) {
         o.insert(
             "duration_min".into(),
             json!(TaskData::from_stored(&e.data).duration_min()),
         );
+    }
+    if let Some(first) = ideas.first() {
+        o.insert("idea".into(), json!(first));
+        o.insert("ideas".into(), json!(ideas));
     }
 }
 
@@ -133,7 +156,9 @@ pub async fn claim(
     )
     .await?;
     let e = get_entry(&sc.db, sc.entry.id).await?;
-    Ok(Json(super::insights::entry_json(&sc.db, &e).await?))
+    Ok(Json(
+        super::insights::entry_json(&sc.db, &e, sc.role).await?,
+    ))
 }
 
 /// `POST /entries/{id}/release`.
@@ -168,5 +193,7 @@ pub async fn release(
         .await?;
     }
     let e = get_entry(&sc.db, sc.entry.id).await?;
-    Ok(Json(super::insights::entry_json(&sc.db, &e).await?))
+    Ok(Json(
+        super::insights::entry_json(&sc.db, &e, sc.role).await?,
+    ))
 }

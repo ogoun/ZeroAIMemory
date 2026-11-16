@@ -446,7 +446,7 @@ pub fn block_version(cwd: &Path, root: &Path, agent: super::Agent) -> Option<u32
     } else {
         None
     };
-    for dir in cwd.ancestors() {
+    for dir in crate::locate::ancestors(cwd) {
         for n in names {
             if let Some(v) = marker_version(&dir.join(n)) {
                 return Some(v);

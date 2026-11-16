@@ -52,7 +52,8 @@ pub(crate) use chunks::{
 };
 pub use read::{
     CHANGELOG_BETWEEN_MAX, DEDUP_CANDIDATES_MAX, DedupCandidate, changelog_between,
-    entry_revisions, find_release_by_version, get_entry, list_entries, title_duplicates,
+    count_by_status, entry_revisions, find_release_by_version, get_entry, list_entries,
+    live_entries_by_ids, title_duplicates,
 };
 pub(crate) use reports::{ATT_COLS, att_row};
 pub use reports::{
@@ -196,9 +197,9 @@ pub fn is_entry_ref_letter(s: &str) -> bool {
 
 text_enum!(
     /// Статус записи по виду (§7.5 ТЗ, спецификация M4.5 §1.3): у insight и term — жизненный
-    /// цикл знания, у task — ход работы, у question — ответ, у idea — решение человека (M5.7).
-    /// Допустимые множества — [`allowed_statuses`]; `open` общий у task и question, `done` — у
-    /// task и idea.
+    /// цикл знания, у task — ход работы, у question — ответ, у idea — решение по ней (M5.7;
+    /// `returned` — «На доработку» после разбора агентом, M6.5 §4). Допустимые множества —
+    /// [`allowed_statuses`]; `open` общий у task и question, `done` — у task и idea.
     EntryStatus {
         Active => "active",
         Revisit => "revisit",
@@ -216,11 +217,12 @@ text_enum!(
         Accepted => "accepted",
         Deferred => "deferred",
         Declined => "declined",
+        Returned => "returned",
     }
 );
 
-/// Допустимые статусы вида (спецификация M4.5 §1.3, M5.7 §5; та же таблица — CHECK миграций
-/// 0015, 0022 и 0024). У changelog, release и report статуса нет — пусто.
+/// Допустимые статусы вида (спецификация M4.5 §1.3, M5.7 §5, M6.5 §4; та же таблица — CHECK
+/// миграций 0015, 0022, 0024 и 0026). У changelog, release и report статуса нет — пусто.
 pub fn allowed_statuses(kind: EntryKind) -> &'static [EntryStatus] {
     use EntryStatus::*;
     match kind {
@@ -229,7 +231,7 @@ pub fn allowed_statuses(kind: EntryKind) -> &'static [EntryStatus] {
         EntryKind::Term => &[Active, Superseded, Retracted],
         EntryKind::Task => &[Open, InProgress, Blocked, Done, Dropped],
         EntryKind::Question => &[Open, Answered, Obsolete],
-        EntryKind::Idea => &[New, Proposed, Accepted, Deferred, Declined, Done],
+        EntryKind::Idea => &[New, Proposed, Accepted, Deferred, Declined, Done, Returned],
     }
 }
 
@@ -389,6 +391,10 @@ pub struct EntryPatch {
     /// Заменить набор ссылок на файлы (M4.5 §6.1); ревизии не создаёт. Без поля у changelog
     /// новые строки `data.refs.files` дописываются ссылками без хэша.
     pub refs: Option<Vec<crate::file_refs::FileRef>>,
+    /// Правку сделал человек (сервер ставит у сессии WebUI и у токена с `by: human`; M6.5 §6):
+    /// правка заголовка или тела (в том числе `append_body`) идеи `returned` переводит её в
+    /// `new`.
+    pub human_edit: bool,
 }
 
 /// Фильтр ленты записей пространства.
@@ -424,6 +430,10 @@ pub struct EntryFilter {
     pub origin: Option<crate::ideas::IdeaOrigin>,
     /// Идеи с таким `data.priority` (M5.7); только при `kind = Some(Idea)`, иначе `BadInput`.
     pub priority: Option<crate::ideas::IdeaPriority>,
+    /// Только задачи из идей — с системным ребром `derived_from` на живую идею из видимых
+    /// запрашивающему пространств (пункты плана, M6.5 §9, фильтр «Из идей» «Задач» WebUI);
+    /// `None` — без фильтра; только при `kind = Some(Task)`, иначе `BadInput`.
+    pub from_idea: Option<crate::ideas::IdeaSpaces>,
 }
 
 /// Нормализованный заголовок (дедупликация, §7.5): нижний регистр, всё, что не буква и не

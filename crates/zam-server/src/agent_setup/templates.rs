@@ -1,9 +1,9 @@
 //! Шаблоны по умолчанию блока инструкции агента (§14.2) и полный протокол `GET /agent-guide`.
 //!
-//! Блок v7 (ниже); до него v6 (M4.5 §11, M5.5 — строка об отчётах `zam report`, M5.6 — строка о карте кода и
-//! ссылках `путь#Тип::метод`, M5.7 — строка об идеях): правило — одна строка, не больше 500
-//! токенов bge-m3 в худшем случае теста (ru и en); пояснения — в протоколе
-//! (`guide.{ru,en}.md`), а не в блоке. Ради строки v5 в протокол перенесены «исследование —
+//! Блок v8 (ниже, M6.5 §8); до него v7 и v6 (M4.5 §11, M5.5 — строка об отчётах `zam report`,
+//! M5.6 — строка о карте кода и ссылках `путь#Тип::метод`, M5.7 — строка об идеях): правило —
+//! одна строка, не больше 500 токенов bge-m3 в худшем случае теста (ru и en); пояснения — в
+//! протоколе (`guide.{ru,en}.md`), а не в блоке. Ради строки v5 в протокол перенесены «исследование —
 //! `insight_kinds=[experiment,failure]`», «не про проект — `scope=global`» и «пиши
 //! каноническими терминами»; ради строки v6 — «(409 — перечитай)», «заметке — `l0`», «перед
 //! работой» и «в чате», строки задач и вопросов слиты (порядок предложения идеи приходит с
@@ -14,6 +14,15 @@
 //! противоречия») и «функция — `путь#Тип::метод`» (раздел «Карта кода»). Правило отвергнутых
 //! подходов, «один `focus` на пачку», вид ссылки на код в отчёте, сессия MCP — только в
 //! протоколе и описаниях MCP (принцип §13: в блоке — то, что нужно каждой сессии).
+//!
+//! Блок v8 (M6.5 §8, задача 7): строка идей — новые идеи человека агент разбирает сам
+//! (action=review) после текущего шага; в режиме `propose` — предлагает, решает человек.
+//! Правило M5.7 «без ответа «начать» не начинай» — в протоколе (раздел «Идеи», режим
+//! `propose`); шаги разбора и пункты плана из идей — подраздел «Разбор идей» протокола. Строка
+//! блока по плану (задача 7: «(`action=review`), когда закончишь текущий шаг») давала 505 токенов
+//! ru и 501 en в худшем случае теста: `action=review` — без обратных кавычек, как в
+//! строке-указании дайджеста, и «после текущего шага» — 500 ru и 497 en **[решение координатора,
+//! ruling 11]**.
 //!
 //! Шаблон — текст между маркерами `<!-- zeroaimemory:begin vN -->` и `<!-- zeroaimemory:end -->`
 //! (маркеры добавляет [`super::render_block`]). Подстановки:
@@ -36,7 +45,7 @@ ZeroAIMemoryUrl={url}
 - Ловушка, сбой → `insight` gotcha|failure с триггерами; изменение → `changelog`; устарело → supersede/retract.
 - Итог исследования, эксперимента, сравнения — пользователю `zam report`, себе — `insight`.
 - Задача → `task` (claim, `status` с `next_step`); вопрос человеку → `question`, его ответ → `answer`.
-- Идея → `idea`; начинать её — только после ответа человека «начать».
+- Идея → `idea`; новые идеи человека разбирай сам (action=review) после текущего шага; режим `propose` — предлагай, решает человек.
 - Код — `refs.files`; карта — `zam code map`, символ — `zam code sym`; новое понятие → `term`.
 - `axiom` — только по прямому указанию пользователя; несогласен — `hypothesis`/`theorem` с `contradicts` и скажи ему.
 - Секреты, хосты → `memory_vault`. {rules}
@@ -55,7 +64,7 @@ No MCP — `zam`; protocol — `zam guide`.
 - Gotcha, failure → `insight` gotcha|failure with triggers; change → `changelog`; outdated → supersede/retract.
 - Outcome of research, an experiment, a comparison — for the user `zam report`, for yourself — `insight`.
 - Task → `task` (claim, `status` with `next_step`); question for the human → `question`, their answer → `answer`.
-- Idea → `idea`; start it only after the human answers “start”.
+- Idea → `idea`; review new human ideas yourself (action=review) after the current step; in `propose` mode — propose, the human decides.
 - Code — `refs.files`; map — `zam code map`, symbol — `zam code sym`; new concept → `term`.
 - `axiom` — only on the user's direct instruction; if you disagree — `hypothesis`/`theorem` with `contradicts` and tell the user.
 - Secrets, hosts → `memory_vault`. {rules}

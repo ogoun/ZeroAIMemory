@@ -2,7 +2,10 @@
 // «Принять как свою», «Начать» (ссылка на задачу; идея Knowledge — в общее решение с
 // предупреждением), «Отложить» с датой UTC, «Отказаться», «Вернуть», задача снята, ответ на
 // вопрос-предложение в «Вопросах» (и вопрос «вернуть» идею со снятой задачей, задача 7), конфликт
-// ревизии, выключатель ideas.proactive, Ctrl+K.
+// ревизии, выключатель ideas.proactive, Ctrl+K. Разбор агентом (M6.5 §9, задача 8): чипы статусов
+// со счётчиками и «Группировать по статусу», строка решения в ленте, «Разбор агента» и «История
+// разборов» в карточке, «Изменить» у возвращённой → «Отправлено на разбор», «Удалить» отклонённой,
+// пометка и фильтр «из идеи» в «Задачах», режим ideas.mode в «Подключении агента».
 // Данные — seedIdeas (global-setup); сценарии, которые меняют статус, создают свою идею по токену
 // администратора (агент: идея человека — `origin: human`, решения — `by: human`).
 import { expect, test, type Locator, type Page } from '@playwright/test';
@@ -13,10 +16,16 @@ import {
   IDEAS_GUID,
   IDEAS_NAME,
   IDEA_AGENT_TITLE,
+  IDEA_BASIS_TASK_TITLE,
   IDEA_HUMAN_TITLE,
   IDEA_KNOWLEDGE_TITLE,
+  IDEA_PLANNED_TITLE,
   IDEA_PROPOSED_TITLE,
   IDEA_WORD,
+  REVIEW_COMMIT,
+  REVIEW_FILE,
+  REVIEW_MISSING,
+  reviewSummary,
 } from './seed';
 
 const env = (k: string) => {
@@ -123,6 +132,9 @@ async function openIdeas(page: Page, entry: string | null = null, space = IDEAS_
 
 const card = (page: Page) => page.getByRole('article', { name: 'Карточка идеи' });
 const feed = (page: Page) => page.getByRole('feed', { name: 'Лента идей' });
+/** Чипы статусов ленты и чип по подписи (имя кнопки — «<подпись> <счётчик>»). */
+const chips = (page: Page) => page.getByRole('group', { name: 'Статус идей' });
+const chip = (page: Page, title: string) => chips(page).getByRole('button', { name: new RegExp(`^${title}( \\d+)?$`) });
 const tree = (page: Page) => page.locator('nav[aria-label="Дерево заметок"]');
 
 test('ideas_create_and_list', async ({ page }) => {
@@ -146,7 +158,7 @@ test('ideas_create_and_list', async ({ page }) => {
   await expect(feed(page)).not.toContainText(IDEA_AGENT_TITLE);
   const row = feed(page).locator(`[data-idea="${env('E2E_IDEA_HUMAN')}"]`);
   await expect(row).toContainText('высокий');
-  await expect(row).toContainText('новая');
+  await expect(row).toContainText('Непросмотрено');
   await expect(row).toContainText('#ui');
 
   // создание: заголовок, замысел, приоритет, теги; origin ставит сервер (human)
@@ -222,13 +234,13 @@ test('ideas_start_creates_task_link', async ({ page }) => {
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
   await card(page).getByRole('button', { name: 'Начать' }).click();
   expect((await sent).postDataJSON()).toEqual({ decision: 'accept' });
-  await expect(card(page)).toContainText('начата');
+  await expect(card(page).locator('[data-status]')).toHaveText('В плане');
   const link = card(page).getByTestId('task-link');
   await expect(link).toHaveText(/^Задача k:[0-9A-Z]{26}$/);
   await expect(page.getByRole('status')).toContainText('Идея начата: задача k:');
   const task = (await link.textContent())!.replace('Задача k:', '');
   // ссылка на задачу — и в строке ленты (идея решения: задача в том же решении)
-  await page.getByLabel('Статус идей').selectOption('accepted');
+  await chip(page, 'В плане').click();
   const rowLink = feed(page).locator(`[data-idea="${idea.id}"]`).getByRole('link', { name: `задача k:${task}` });
   await expect(rowLink).toHaveAttribute('href', new RegExp(`/s/${IDEAS_GUID}/j/tasks/${task}$`));
   await link.click();
@@ -287,7 +299,7 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
   await form.getByRole('button', { name: 'Отложить' }).click();
   expect((await sent).postDataJSON()).toEqual({ decision: 'defer', horizon: utc(5) });
-  await expect(card(page).locator('[data-status]')).toHaveText('отложена');
+  await expect(card(page).locator('[data-status]')).toHaveText('Отложена');
   await expect(card(page)).toContainText(`Отложена до ${utc(5)} (UTC).`);
   await expect(feed(page).locator(`[data-idea="${idea.id}"]`)).toContainText(`не раньше ${utc(5)}`);
 
@@ -295,7 +307,7 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   const dec = page.getByRole('form', { name: 'Отказаться от идеи' });
   await dec.getByLabel('Причина (необязательно)').fill('уже не нужно');
   await dec.getByRole('button', { name: 'Отказаться' }).click();
-  await expect(card(page).locator('[data-status]')).toHaveText('отклонена');
+  await expect(card(page).locator('[data-status]')).toHaveText('Отклонена');
   // «Активные» отклонённую не показывают
   await expect(feed(page)).not.toContainText('Идея E2E: отложить и отказаться');
   const e = await api('GET', `entries/${idea.id}`);
@@ -331,17 +343,18 @@ test('ideas_reopen_declined_with_reason', async ({ page }) => {
   const idea = await newIdea('Идея E2E: вернуть отклонённую');
   await decide(idea.id, 'decline');
   await openIdeas(page);
-  await page.getByLabel('Статус идей').selectOption('declined');
+  await chip(page, 'Отклонена').click();
   await feed(page).getByRole('button', { name: 'Идея E2E: вернуть отклонённую' }).click();
-  await expect(card(page).locator('[data-status]')).toHaveText('отклонена');
+  await expect(card(page).locator('[data-status]')).toHaveText('Отклонена');
   await expect(card(page).getByRole('button', { name: 'Начать' })).toHaveCount(0);
-  await card(page).getByRole('button', { name: 'Вернуть' }).click();
+  await card(page).getByRole('button', { name: 'Вернуть на разбор' }).click();
   const form = page.getByRole('form', { name: 'Вернуть идею' });
+  await expect(form).toContainText('Вернуть на разбор');
   await form.getByLabel('Причина').fill('снова актуально');
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
   await form.getByRole('button', { name: 'Вернуть' }).click();
   expect((await sent).postDataJSON()).toEqual({ decision: 'reopen', reason: 'снова актуально' });
-  await expect(card(page).locator('[data-status]')).toHaveText('новая');
+  await expect(card(page).locator('[data-status]')).toHaveText('Непросмотрено');
   await expect(card(page).getByRole('button', { name: 'Начать' })).toBeVisible();
   expect((await api('GET', `entries/${idea.id}`)).status).toBe('new');
   expect(problems, problems.join('\n')).toEqual([]);
@@ -354,15 +367,15 @@ test('ideas_accepted_dropped_task_reopen', async ({ page }) => {
   const task = r.task!;
   await api('PATCH', `entries/${task.id}`, { status: 'dropped' }, { 'If-Match': `"${task.rev}"` });
   await openIdeas(page, idea.id);
-  await expect(card(page).locator('[data-status]')).toHaveText('начата');
+  await expect(card(page).locator('[data-status]')).toHaveText('В плане');
   await expect(card(page).getByTestId('task-released')).toContainText('Задача снята');
   await expect(card(page).getByRole('button', { name: 'Начать' })).toHaveCount(0);
   await expect(card(page).getByRole('button', { name: 'Отказаться' })).toBeVisible();
-  await card(page).getByRole('button', { name: 'Вернуть' }).click();
+  await card(page).getByRole('button', { name: 'Вернуть на разбор' }).click();
   const form = page.getByRole('form', { name: 'Вернуть идею' });
   await form.getByLabel('Причина').fill('задачу сняли, вернёмся позже');
   await form.getByRole('button', { name: 'Вернуть' }).click();
-  await expect(card(page).locator('[data-status]')).toHaveText('новая');
+  await expect(card(page).locator('[data-status]')).toHaveText('Непросмотрено');
   await expect(card(page).getByTestId('task-released')).toHaveCount(0);
   const e = await api('GET', `entries/${idea.id}`);
   expect(e.status).toBe('new');
@@ -376,7 +389,7 @@ test('ideas_proposal_answered_in_questions', async ({ page }) => {
   const qid = env('E2E_IDEA_QUESTION');
   // карточка идеи: вопрос агента с его текстом
   await openIdeas(page, ideaId);
-  await expect(card(page).locator('[data-status]')).toHaveText('предложена');
+  await expect(card(page).locator('[data-status]')).toHaveText('Предложена');
   await expect(card(page)).toContainText('Сейчас правим граф — экспорт ляжет рядом.');
 
   const u = await me(page);
@@ -402,7 +415,7 @@ test('ideas_proposal_answered_in_questions', async ({ page }) => {
   // ссылка «Идея w:…» ведёт в журнал идей
   await q.getByTestId('idea-link').click();
   await expect(page).toHaveURL(new RegExp(`/s/${IDEAS_GUID}/j/ideas/${ideaId}$`));
-  await expect(card(page).locator('[data-status]')).toHaveText('отложена');
+  await expect(card(page).locator('[data-status]')).toHaveText('Отложена');
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
@@ -469,13 +482,13 @@ test('ideas_accepted_deleted_task_decline', async ({ page }) => {
   });
   expect(r.ok, await r.text()).toBe(true);
   await openIdeas(page, idea.id);
-  await expect(card(page).locator('[data-status]')).toHaveText('начата');
+  await expect(card(page).locator('[data-status]')).toHaveText('В плане');
   await expect(card(page).getByTestId('task-released')).toContainText('Задача удалена');
   await expect(card(page).getByTestId('task-link')).toHaveCount(0);
-  await expect(card(page).getByRole('button', { name: 'Вернуть' })).toBeVisible();
+  await expect(card(page).getByRole('button', { name: 'Вернуть на разбор' })).toBeVisible();
   await card(page).getByRole('button', { name: 'Отказаться' }).click();
   await page.getByRole('form', { name: 'Отказаться от идеи' }).getByRole('button', { name: 'Отказаться' }).click();
-  await expect(card(page).locator('[data-status]')).toHaveText('отклонена');
+  await expect(card(page).locator('[data-status]')).toHaveText('Отклонена');
   expect((await api('GET', `entries/${idea.id}`)).status).toBe('declined');
   expect(problems, problems.join('\n')).toEqual([]);
 });
@@ -494,12 +507,12 @@ test('ideas_reopen_proposal_answered_in_questions', async ({ page }) => {
   expect(p.entry.status).toBe('accepted');
   const qid = p.question.id;
   await openIdeas(page, idea.id);
-  await expect(card(page).locator('[data-status]')).toHaveText('начата');
+  await expect(card(page).locator('[data-status]')).toHaveText('В плане');
   const mark = card(page).getByTestId('reopen-proposed');
   await expect(mark).toContainText('Предложено вернуть.');
   await expect(mark).toContainText('Снова просят экспорт — пора вернуть.');
   await expect(mark.getByRole('link', { name: `Вопрос q:${qid}` })).toHaveAttribute('href', new RegExp(`/j/questions/${qid}$`));
-  await expect(card(page).getByRole('button', { name: 'Вернуть' })).toBeVisible();
+  await expect(card(page).getByRole('button', { name: 'Вернуть на разбор' })).toBeVisible();
   await expect(card(page).getByRole('button', { name: 'Отказаться' })).toBeVisible();
 
   const u = await me(page);
@@ -518,7 +531,7 @@ test('ideas_reopen_proposal_answered_in_questions', async ({ page }) => {
   expect(e.status).toBe('new');
   expect(e.data.prev_task_ids).toContain(task.id);
   await q.getByTestId('idea-link').click();
-  await expect(card(page).locator('[data-status]')).toHaveText('новая');
+  await expect(card(page).locator('[data-status]')).toHaveText('Непросмотрено');
   await expect(card(page).getByTestId('reopen-proposed')).toHaveCount(0);
   expect(problems, problems.join('\n')).toEqual([]);
 });
@@ -570,7 +583,7 @@ test('agent_setup_ideas_toggle_persists', async ({ page }) => {
   await page.goto(`${base()}#/agent-setup`);
   const box = page.getByRole('group', { name: 'Типы подсказок' }).getByLabel(/ideas\.proactive$/);
   await expect(box).toBeChecked();
-  await expect(page.getByText('Идеи: предлагать (дайджест и подсказки)')).toBeVisible();
+  await expect(page.getByText('Идеи: раздел дайджеста и подсказки (разбор и предложения)')).toBeVisible();
   try {
     const saved = page.waitForResponse((r) => r.url().includes('/settings') && r.request().method() === 'PATCH');
     await box.uncheck();
@@ -580,7 +593,8 @@ test('agent_setup_ideas_toggle_persists', async ({ page }) => {
     await page.reload();
     await expect(box).not.toBeChecked();
     const mine = await page.request.get(`${base()}api/v1/auth/settings`);
-    expect((await mine.json()).ideas).toEqual({ proactive: false });
+    // режим идей (ideas.mode, M6.5) выключатель не меняет
+    expect((await mine.json()).ideas).toEqual({ proactive: false, mode: 'review' });
     const back = page.waitForResponse((r) => r.url().includes('/settings') && r.request().method() === 'PATCH');
     await box.check();
     expect((await (await back).json()).ideas.proactive).toBe(true);
@@ -672,5 +686,309 @@ test('webui_search_finds_cached_summary_ideas_in_defaults', async ({ page }) => 
   const search = page.getByRole('combobox', { name: 'Поиск по заметкам' });
   await search.fill('пентаграммными');
   await expect(page.getByRole('option').filter({ hasText: 'Источник выжимки идей E2E' })).toBeVisible();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// ---- разбор идей агентом (M6.5 §9, задача 8) ----
+
+/** Возвращённая идея: идея человека и разбор `return` токеном (агент). */
+async function returnedIdea(title: string, missing = REVIEW_MISSING) {
+  const idea = await newIdea(title);
+  const r = await api<{ entry: { id: string; rev: number; status: string } }>('POST', `entries/${idea.id}/review`, {
+    outcome: 'return',
+    summary: reviewSummary(title),
+    missing,
+  });
+  expect(r.entry.status).toBe('returned');
+  return r.entry;
+}
+
+const LABELS = ['Непросмотрено', 'На доработку', 'В плане', 'Отклонена', 'Сделано', 'Отложена', 'Предложена'];
+const STATUSES = ['new', 'returned', 'accepted', 'declined', 'done', 'deferred', 'proposed'];
+
+test('ideas_review_chips_and_grouping', async ({ page }) => {
+  const problems = watch(page);
+  const own = await returnedIdea('Идея E2E: чип «На доработку»');
+  await openIdeas(page);
+  const group = chips(page);
+  // чипы со счётчиками: «Активные», статусы по порядку, «Все»; числа — как у сервера (вкладка «Мои»)
+  const c = await api<Record<string, number>>('GET', `${SP}/entries/counts?kind=idea&origin=human`);
+  const active = c.new + c.returned + c.proposed + c.deferred;
+  const all = STATUSES.reduce((n, s) => n + c[s], 0);
+  await expect(group.getByRole('button')).toHaveText([
+    `Активные ${active}`,
+    ...STATUSES.map((s, i) => `${LABELS[i]} ${c[s]}`),
+    `Все ${all}`,
+  ]);
+  await expect(chip(page, 'Активные')).toHaveAttribute('aria-pressed', 'true');
+  expect(c.returned).toBeGreaterThanOrEqual(2);
+
+  // щелчок по «На доработку» — на сервере: в ленте только возвращённые, сколько в чипе
+  const req = page.waitForRequest((r) => r.url().includes('kind=idea') && r.url().includes('status=returned'));
+  await chip(page, 'На доработку').click();
+  await req;
+  await expect(chip(page, 'На доработку')).toHaveAttribute('aria-pressed', 'true');
+  const rows = feed(page).locator('article.idea');
+  await expect(rows).toHaveCount(c.returned);
+  await expect(feed(page).locator(`[data-idea="${own.id}"]`)).toContainText('На доработку');
+  await expect(feed(page).locator('article.idea [data-status]:not([data-status="returned"])')).toHaveCount(0);
+  // строка решения у возвращённой — «Не хватает: <начало missing>»
+  // (вопрос длиннее 60 символов — обрезка с «…»)
+  const clipped = `${[...REVIEW_MISSING].slice(0, 60).join('').trimEnd()}…`;
+  expect([...REVIEW_MISSING].length).toBeGreaterThan(60);
+  await expect(feed(page).locator(`[data-idea="${own.id}"]`).getByTestId('review-line')).toHaveText(`Не хватает: ${clipped}`);
+
+  // «Все» + «Группировать по статусу»: разделы — в порядке чипов, только непустые
+  await chip(page, 'Все').click();
+  await expect(feed(page).locator('article.idea')).toHaveCount(all);
+  await page.getByLabel('Группировать по статусу').check();
+  // разделы — в порядке чипов; у каждого своя лента (в role=feed — только статьи), общей ленты нет
+  const groups = page.locator('[data-group]');
+  const expected = STATUSES.filter((s) => c[s] > 0);
+  await expect(groups).toHaveCount(expected.length);
+  expect(await groups.evaluateAll((els) => els.map((e) => e.getAttribute('data-group')))).toEqual(expected);
+  await expect(page.getByRole('feed', { name: 'Лента идей' })).toHaveCount(0);
+  const returnedGroup = page.getByRole('region', { name: 'Раздел «На доработку»' });
+  // все загружены — в заголовке число сервера
+  await expect(returnedGroup.locator('h3')).toHaveText(`На доработку ${c.returned}`);
+  await expect(returnedGroup.getByRole('feed', { name: 'Идеи раздела «На доработку»' }).locator(`[data-idea="${own.id}"]`)).toBeVisible();
+  await page.screenshot({ path: `${screens}ideas-review-grouped.png`, fullPage: true });
+  // в плане — строка «В план → k:<id> «…»» ведёт на задачу
+  const planned = page.locator(`[data-idea="${env('E2E_IDEA_PLANNED')}"]`);
+  const line = planned.getByTestId('review-line');
+  await expect(line).toHaveText(`В план → k:${env('E2E_IDEA_PLAN_TASK')} «${IDEA_PLANNED_TITLE}»`);
+  await expect(line).toHaveAttribute('href', new RegExp(`/s/${IDEAS_GUID}/j/tasks/${env('E2E_IDEA_PLAN_TASK')}$`));
+  // отклонённая разбором — «Отклонена: <начало разбора>»
+  await expect(page.locator(`[data-idea="${env('E2E_IDEA_DECLINED')}"]`).getByTestId('review-line')).toContainText('Отклонена: Идея просит');
+  // выключили — снова одна лента
+  await page.getByLabel('Группировать по статусу').uncheck();
+  await expect(groups).toHaveCount(0);
+  await expect(feed(page)).toBeVisible();
+  // при поиске чипы без чисел (числа — ленты, не выдачи поиска)
+  await page.getByLabel('Поиск по идеям').fill('доработку');
+  await page.getByRole('button', { name: 'Применить' }).click();
+  await expect(page.getByRole('feed', { name: 'Найденные идеи' })).toBeVisible();
+  await expect(chip(page, 'Все')).toHaveText('Все');
+  await page.getByRole('button', { name: 'Сбросить' }).click();
+  await expect(chip(page, 'Все')).toHaveText(`Все ${all}`);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('ideas_review_card_shows_summary_and_history', async ({ page }) => {
+  const problems = watch(page);
+  const id = env('E2E_IDEA_PLANNED');
+  const task = env('E2E_IDEA_PLAN_TASK');
+  await openIdeas(page, id);
+  await expect(card(page).locator('[data-status]')).toHaveText('В плане');
+  const rv = card(page).getByRole('region', { name: 'Разбор агента' });
+  // исход, чей агент (разбирал агент самого администратора — «ваш агент»), задача плана, разбор
+  // текстом с переносами
+  await expect(rv.locator('[data-outcome]')).toHaveText('В план');
+  await expect(rv.getByTestId('review-by')).toContainText('ваш агент');
+  await expect(rv.getByRole('link', { name: `k:${task}` }).first()).toHaveAttribute('href', new RegExp(`/j/tasks/${task}$`));
+  const summary = rv.locator('p.body').first();
+  await expect(summary).toBeVisible();
+  expect(await summary.textContent()).toBe(reviewSummary('показать разбор в карточке'));
+  expect(await summary.evaluate((e) => getComputedStyle(e).whiteSpace)).toBe('pre-wrap');
+  // «Опирался на»: запись — ссылка в её журнал, файл и коммит — текстом с «копировать»
+  const basis = rv.getByTestId('review-basis');
+  await expect(basis).toContainText('Опирался на:');
+  const basisLink = basis.getByRole('link', { name: `k:${env('E2E_IDEA_BASIS_TASK')}` });
+  await expect(basisLink).toHaveAttribute('href', new RegExp(`/s/${IDEAS_GUID}/j/tasks/${env('E2E_IDEA_BASIS_TASK')}$`));
+  await expect(basis.locator('code')).toHaveText([`file:${REVIEW_FILE}`, `commit:${REVIEW_COMMIT}`]);
+  await expect(basis.getByRole('button', { name: 'копировать' })).toHaveCount(2);
+  await expect(basis.getByRole('link', { name: /^file:|^commit:/ })).toHaveCount(0);
+  // «Похожие» — идея, ссылка в «Идеи»
+  const similar = rv.getByTestId('review-similar');
+  await expect(similar.getByRole('link', { name: `w:${env('E2E_IDEA_DECLINED')}` })).toHaveAttribute(
+    'href',
+    new RegExp(`/j/ideas/${env('E2E_IDEA_DECLINED')}$`),
+  );
+  // ссылка на задачу в карточке — как у «Начать»
+  await expect(card(page).getByTestId('task-link')).toHaveText(`Задача k:${task}`);
+  // «История разборов» — свёрнута, раскрывается: прежний разбор «на доработку» с вопросом
+  const history = card(page).getByTestId('review-history');
+  await expect(history.locator('summary')).toHaveText('История разборов (1)');
+  await expect(history.getByText('Что показывать в карточке?')).toBeHidden();
+  await history.locator('summary').click();
+  await expect(history.locator('[data-outcome]')).toHaveText('На доработку');
+  await expect(history.locator('.past .row')).toContainText('ваш агент');
+  await expect(history.getByText('Что показывать в карточке?')).toBeVisible();
+  await page.screenshot({ path: `${screens}ideas-review-card.png`, fullPage: true });
+  // ссылка «Опирался на» ведёт в карточку задачи
+  await basisLink.click();
+  await expect(page.getByRole('article', { name: 'Карточка задачи' })).toContainText(IDEA_BASIS_TASK_TITLE);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('ideas_returned_edit_sends_back', async ({ page }) => {
+  const problems = watch(page);
+  const idea = await returnedIdea('Идея E2E: дописать и отправить');
+  await openIdeas(page, idea.id);
+  await expect(card(page).locator('[data-status]')).toHaveText('На доработку');
+  const ask = card(page).getByTestId('review-missing');
+  await expect(ask).toContainText('Агент просит дописать:');
+  await expect(ask).toContainText(REVIEW_MISSING);
+  // «Изменить» — главное действие; решить самому тоже можно, «Вернуть» нет
+  const actions = card(page).getByRole('group', { name: 'Решение по идее' });
+  await expect(actions.getByRole('button')).toHaveText(['Изменить', 'Начать', 'Отложить', 'Отказаться']);
+  await expect(actions.getByRole('button', { name: 'Изменить' })).toHaveClass(/primary/);
+  await actions.getByRole('button', { name: 'Изменить' }).click();
+  const form = page.getByRole('form', { name: 'Правка идеи' });
+  const body = form.getByLabel('Замысел');
+  await body.fill(`${await body.inputValue()}\nСтатусы — все семь, группировка нужна.`);
+  const saved = page.waitForResponse((r) => r.url().endsWith(`/entries/${idea.id}`) && r.request().method() === 'PATCH');
+  await form.getByRole('button', { name: 'Сохранить' }).click();
+  expect((await saved).status()).toBe(200);
+  await expect(card(page).getByRole('status')).toHaveText('Отправлено на разбор.');
+  await expect(card(page).locator('[data-status]')).toHaveText('Непросмотрено');
+  await expect(card(page).getByTestId('review-missing')).toHaveCount(0);
+  // разбор остался в карточке, но уже не текущий
+  await expect(card(page).getByTestId('review-note')).toHaveText('После разбора статус изменился: Непросмотрено.');
+  const e = await api('GET', `entries/${idea.id}`);
+  expect(e.status).toBe('new');
+  expect(e.data.returned_at).toBeUndefined();
+  expect(e.data.reviews).toHaveLength(1);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// Решение координатора (задача 8): возвращённую человек может решить сам (§4, §6) — «Начать».
+test('ideas_returned_start_by_human', async ({ page }) => {
+  const problems = watch(page);
+  const idea = await returnedIdea('Идея E2E: начать возвращённую');
+  await openIdeas(page, idea.id);
+  const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
+  await card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Начать' }).click();
+  expect((await sent).postDataJSON()).toEqual({ decision: 'accept' });
+  await expect(card(page).locator('[data-status]')).toHaveText('В плане');
+  await expect(card(page).getByTestId('task-link')).toHaveText(/^Задача k:[0-9A-Z]{26}$/);
+  // разбор «на доработку» остался в карточке; решение — человека
+  await expect(card(page).getByTestId('review-note')).toHaveText('После разбора статус изменился: В плане.');
+  const e = await api('GET', `entries/${idea.id}`);
+  expect(e.status).toBe('accepted');
+  expect(e.data.decided.by).toBe('human');
+  expect(e.data.returned_at).toBeUndefined();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('ideas_declined_by_review_delete_to_trash', async ({ page }) => {
+  const problems = watch(page);
+  const idea = await newIdea('Идея E2E: удалить отклонённую');
+  await api('POST', `entries/${idea.id}/review`, { outcome: 'decline', summary: reviewSummary('то, что не нужно') });
+  await openIdeas(page, idea.id);
+  await expect(card(page).locator('[data-status]')).toHaveText('Отклонена');
+  const actions = card(page).getByRole('group', { name: 'Решение по идее' });
+  await expect(actions.getByRole('button')).toHaveText(['Вернуть на разбор', 'Удалить']);
+  await expect(card(page).getByRole('region', { name: 'Разбор агента' })).toContainText('удалите идею или оставьте её');
+  await actions.getByRole('button', { name: 'Удалить' }).click();
+  const dlg = page.getByRole('dialog');
+  await expect(dlg).toContainText('Удалить идею?');
+  const del = page.waitForResponse((r) => r.url().endsWith(`/entries/${idea.id}`) && r.request().method() === 'DELETE');
+  await dlg.getByRole('button', { name: 'Удалить' }).click();
+  expect((await del).status()).toBeLessThan(300);
+  await expect(card(page)).toHaveCount(0);
+  await expect(page.getByRole('status')).toHaveText('Идея «Идея E2E: удалить отклонённую» перемещена в корзину.');
+  await expect(page).toHaveURL(new RegExp(`/s/${IDEAS_GUID}/j/ideas$`));
+  const r = await fetch(`${base()}api/v1/entries/${idea.id}`, { headers: { Authorization: `Bearer ${env('E2E_ADMIN_TOKEN')}` } });
+  expect(r.status).toBe(404);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// Ревью задачи 8 (Minor 3): удаление с устаревшей ревизией (409) — как у остальных действий
+// карточки: окно закрывается, лента и карточка перечитаны, ошибка — в карточке.
+test('ideas_delete_stale_rev_rereads', async ({ page }) => {
+  const problems = watch(page, [409]);
+  const idea = await newIdea('Идея E2E: удалить устаревшую');
+  await api('POST', `entries/${idea.id}/review`, { outcome: 'decline', summary: reviewSummary('то, что передумали') });
+  await openIdeas(page, idea.id);
+  await expect(card(page).locator('[data-status]')).toHaveText('Отклонена');
+  // пока карточка открыта, человек в чате вернул идею на разбор (агент записал его слова)
+  await decide(idea.id, 'reopen', { reason: 'передумал' });
+  const actions = card(page).getByRole('group', { name: 'Решение по идее' });
+  await actions.getByRole('button', { name: 'Удалить' }).click();
+  const del = page.waitForResponse((r) => r.url().endsWith(`/entries/${idea.id}`) && r.request().method() === 'DELETE');
+  await page.getByRole('dialog').getByRole('button', { name: 'Удалить' }).click();
+  expect((await del).status()).toBe(409);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(card(page).locator('[data-status]')).toHaveText('Непросмотрено');
+  await expect(card(page).getByRole('alert')).toBeVisible();
+  await expect(actions.getByRole('button', { name: 'Удалить' })).toHaveCount(0);
+  expect((await api('GET', `entries/${idea.id}`)).status).toBe('new');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('tasks_from_idea_mark_and_filter', async ({ page }) => {
+  const problems = watch(page);
+  const task = env('E2E_IDEA_PLAN_TASK');
+  const idea = env('E2E_IDEA_PLANNED');
+  const u = await me(page);
+  await page.goto(`${base()}#/u/${u}/s/${IDEAS_GUID}/j/tasks`);
+  const board = page.getByRole('group', { name: 'Доска задач' });
+  const item = board.locator(`[data-task="${task}"]`);
+  // пометка «из идеи w:<id> «…»» со ссылкой на идею; у обычной задачи пометки нет
+  const mark = item.getByTestId('from-idea');
+  await expect(mark).toHaveText(`из идеи w:${idea} «${IDEA_PLANNED_TITLE}»`);
+  await expect(mark).toHaveAttribute('href', new RegExp(`/s/${IDEAS_GUID}/j/ideas/${idea}$`));
+  const plain = board.locator(`[data-task="${env('E2E_IDEA_BASIS_TASK')}"]`);
+  await expect(plain).toBeVisible();
+  await expect(plain.getByTestId('from-idea')).toHaveCount(0);
+  // «Из идей» — только задачи из идей (на сервере)
+  const req = page.waitForRequest((r) => r.url().includes('kind=task') && r.url().includes('from_idea=1'));
+  const toggle = page.getByRole('button', { name: 'Из идей' });
+  await toggle.click();
+  await req;
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  await expect(plain).toHaveCount(0);
+  await expect(item).toBeVisible();
+  const n = await board.locator('[data-task]').count();
+  await expect(board.locator('[data-task] [data-testid="from-idea"]')).toHaveCount(n);
+  await page.screenshot({ path: `${screens}tasks-from-ideas.png`, fullPage: true });
+  // карточка задачи — «Из идеи:» со ссылкой и статусом идеи
+  await item.getByRole('button', { name: IDEA_PLANNED_TITLE }).click();
+  const tc = page.getByRole('article', { name: 'Карточка задачи' });
+  const ideas = tc.getByTestId('task-ideas');
+  await expect(ideas).toContainText('Из идеи:');
+  await expect(ideas).toContainText('В плане');
+  await ideas.getByRole('link', { name: `w:${idea} «${IDEA_PLANNED_TITLE}»` }).click();
+  await expect(page).toHaveURL(new RegExp(`/s/${IDEAS_GUID}/j/ideas/${idea}$`));
+  await expect(card(page)).toContainText(IDEA_PLANNED_TITLE);
+  // снова все задачи
+  await page.goto(`${base()}#/u/${u}/s/${IDEAS_GUID}/j/tasks`);
+  await expect(page.getByRole('button', { name: 'Из идей' })).toHaveAttribute('aria-pressed', 'false');
+  await expect(board.locator(`[data-task="${env('E2E_IDEA_BASIS_TASK')}"]`)).toBeVisible();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('agent_setup_ideas_mode_persists', async ({ page }) => {
+  const problems = watch(page);
+  await page.goto(base());
+  await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+  await page.goto(`${base()}#/agent-setup`);
+  const mode = page.getByRole('radiogroup', { name: 'Идеи: разбирать сам / предлагать мне' });
+  await expect(mode.getByLabel('разбирать сам')).toBeChecked();
+  await expect(mode.getByLabel('предлагать мне')).not.toBeChecked();
+  try {
+    const saved = page.waitForResponse((r) => r.url().includes('/settings') && r.request().method() === 'PATCH');
+    await mode.getByLabel('предлагать мне').check();
+    const resp = await saved;
+    expect(resp.request().postDataJSON()).toEqual({ ideas: { mode: 'propose' } });
+    expect((await resp.json()).ideas).toEqual({ proactive: true, mode: 'propose' });
+    await page.reload();
+    await expect(mode.getByLabel('предлагать мне')).toBeChecked();
+    const mine = await page.request.get(`${base()}api/v1/auth/settings`);
+    expect((await mine.json()).ideas).toEqual({ proactive: true, mode: 'propose' });
+    const back = page.waitForResponse((r) => r.url().includes('/settings') && r.request().method() === 'PATCH');
+    await mode.getByLabel('разбирать сам').check();
+    expect((await (await back).json()).ideas.mode).toBe('review');
+    await expect(mode.getByLabel('разбирать сам')).toBeChecked();
+  } finally {
+    // умолчание возвращается и при сбое: остальные сценарии (разбор, propose — 409) ждут review
+    const { csrf } = (await (await page.request.get(`${base()}api/v1/auth/me`)).json()) as { csrf: string };
+    const r = await page.request.patch(`${base()}api/v1/auth/settings`, {
+      headers: { 'X-CSRF-Token': csrf },
+      data: { ideas: { mode: 'review' } },
+    });
+    expect(r.status()).toBe(200);
+  }
   expect(problems, problems.join('\n')).toEqual([]);
 });

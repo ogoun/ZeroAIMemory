@@ -251,7 +251,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: QuestionCmd,
     },
-    /// Журнал «Идеи»: лента, запись, предложение человеку и решение (начать, отложить, отказаться)
+    /// Журнал «Идеи»: лента, запись, очередь и разбор агентом, предложение человеку и решение
+    /// (начать, отложить, отказаться)
     Idea {
         #[command(subcommand)]
         cmd: IdeaCmd,
@@ -711,9 +712,10 @@ enum QuestionCmd {
 #[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum IdeaCmd {
-    /// Лента идей (по умолчанию new, proposed, deferred, accepted)
+    /// Лента идей (по умолчанию new, returned, proposed, deferred, accepted)
     List {
-        /// Статусы (повторяемый, через запятую): new, proposed, accepted, deferred, declined, done
+        /// Статусы (повторяемый, через запятую): new, returned, proposed, accepted, deferred,
+        /// declined, done
         #[arg(long)]
         status: Vec<String>,
         /// Только идеи человека или агента
@@ -749,6 +751,79 @@ enum IdeaCmd {
         /// Knowledge вместо решения
         #[arg(long)]
         knowledge: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Очередь разбора: идеи «Непросмотрено» с историей, похожими записями и шагами разбора
+    Queue {
+        /// Идей в пакете (1–20)
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=20))]
+        limit: u32,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Разобрать идею человека (действие агента): в план, на доработку, отклонить или «уже
+    /// сделано»; повтор с тем же --key не заводит вторую задачу
+    #[command(group(
+        clap::ArgGroup::new("outcome")
+            .required(true)
+            .args(["plan", "ret", "decline", "done"])
+    ))]
+    Review {
+        /// w:<id>
+        id: String,
+        /// В план: новая задача (--task-title, --task-body-file, --task-priority) или уже
+        /// открытая задача плана (--task)
+        #[arg(long)]
+        plan: bool,
+        /// На доработку: человек дописывает идею (--missing — что дописать)
+        #[arg(long = "return", requires = "missing")]
+        ret: bool,
+        /// Отклонить: причина — в разборе, прежнее решение — в --similar
+        #[arg(long)]
+        decline: bool,
+        /// Уже сделано: ссылка на сделанное в --basis (c:, commit:, k: задачи done, r:)
+        #[arg(long)]
+        done: bool,
+        /// Файл с разбором для человека (Markdown): что просит идея, что уже есть, решение и
+        /// почему (не короче [ideas] review_min_chars сервера)
+        #[arg(long)]
+        summary_file: PathBuf,
+        // «только у исхода» — конфликтом с прочими исходами: `requires` на флаг-bool clap
+        // считает выполненным всегда (у флага есть значение по умолчанию `false`)
+        /// Что дописать человеку (только у --return, до 2000 символов)
+        #[arg(long, conflicts_with_all = ["plan", "decline", "done"])]
+        missing: Option<String>,
+        /// На что опирался разбор (повторяемый): k:, n:, i:, c:, w:, r:, file:PATH, commit:SHA
+        #[arg(long)]
+        basis: Vec<String>,
+        /// Похожая идея w:<id>, в том числе отклонённая (повторяемый)
+        #[arg(long)]
+        similar: Vec<String>,
+        /// Уже открытая задача плана k:<id>, которая покрывает идею (только у --plan)
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "ret", "decline", "done", "task_title", "task_body_file", "task_priority"
+            ]
+        )]
+        task: Option<String>,
+        /// Заголовок новой задачи (иначе заголовок идеи; только у --plan)
+        #[arg(long, conflicts_with_all = ["ret", "decline", "done"])]
+        task_title: Option<String>,
+        /// Файл с планом шагов новой задачи (Markdown; только у --plan)
+        #[arg(long, conflicts_with_all = ["ret", "decline", "done"])]
+        task_body_file: Option<PathBuf>,
+        /// Приоритет новой задачи (иначе приоритет идеи; только у --plan)
+        #[arg(
+            long,
+            value_parser = ["low", "normal", "high"],
+            conflicts_with_all = ["ret", "decline", "done"]
+        )]
+        task_priority: Option<String>,
+        /// Ключ идемпотентности этого разбора: повтор после сбоя связи не создаёт вторую задачу
+        #[arg(long)]
+        key: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -892,11 +967,15 @@ enum InsightCmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Дописать к тексту insight (из --body-file или stdin)
+    /// Дописать к тексту записи (из --body-file или stdin); у идеи `--by human` — слова
+    /// человека из чата: возвращённая идея снова идёт на разбор
     Append {
         id: String,
         #[arg(long)]
         body_file: Option<PathBuf>,
+        /// Чья дописка идеи: human — слова человека, agent — своя (по умолчанию); только у идеи
+        #[arg(long, value_parser = ["human", "agent"])]
+        by: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -1505,6 +1584,50 @@ fn idea(c: IdeaCmd) -> Result<(), CliError> {
                 origin,
             )
         }
+        IdeaCmd::Queue { limit, common } => w::queue(&cmd::connect(&common)?, limit),
+        // разбор — всегда действие агента: `--by` нет и под агентом (M6.5 §5)
+        IdeaCmd::Review {
+            id,
+            plan,
+            ret,
+            decline,
+            done,
+            summary_file,
+            missing,
+            basis,
+            similar,
+            task,
+            task_title,
+            task_body_file,
+            task_priority,
+            key,
+            common,
+        } => {
+            // ровно один исход — обязательная взаимоисключающая группа clap `outcome`
+            let outcome = match (plan, ret, decline, done) {
+                (true, false, false, false) => "plan",
+                (false, true, false, false) => "return",
+                (false, false, true, false) => "decline",
+                (false, false, false, true) => "done",
+                _ => unreachable!("группа clap `outcome`: ровно один исход"),
+            };
+            w::review(
+                &cmd::connect(&common)?,
+                w::ReviewOpts {
+                    id,
+                    outcome,
+                    summary_file,
+                    missing,
+                    basis,
+                    similar,
+                    task,
+                    task_title,
+                    task_body_file,
+                    task_priority,
+                    key,
+                },
+            )
+        }
         IdeaCmd::Propose {
             id,
             text,
@@ -1605,8 +1728,14 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
         InsightCmd::Append {
             id,
             body_file,
+            by,
             common,
-        } => i::append(&cmd::connect(&common)?, &id, body_file.as_deref()),
+        } => i::append(
+            &cmd::connect(&common)?,
+            &id,
+            body_file.as_deref(),
+            by.as_deref(),
+        ),
         InsightCmd::Feedback {
             id,
             value,

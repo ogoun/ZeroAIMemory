@@ -12,7 +12,8 @@
 //!   ключ в [`KEYS`] помечен этой строкой ([`Since::Feature`]): `budget` (§4.2, задача 5),
 //!   `snippet` (§4.3, задача 5), `focus` (§6, задача 7b), `digest` (§8, задача 8a),
 //!   `hint_thresholds` (§9, задача 9), `kind_boost` (§10), `attach_weight` (§11), `snapshot`
-//!   (§8а, задача 17c), `recall_timeout` (§16 п. 19, задача 19); `code_recv` (§12а, задача 14) — возможность без ключа конфигурации (в
+//!   (§8а, задача 17c), `recall_timeout` (§16 п. 19, задача 19), `idea_review` (M6.5 §7,
+//!   ключ `ideas.default_mode`); `code_recv` (§12а, задача 14) — возможность без ключа конфигурации (в
 //!   [`KEYS`] её нет). Пока строки нет, ключ этой сборке не шлётся (а прогон с ним — не
 //!   сравнивается);
 //! - `features` нет — выпуск по таблице [`RELEASES`]: версия и коммит (`git`, 12 знаков) должны
@@ -223,6 +224,7 @@ pub const KEYS: &[(&str, Since)] = &[
     ("snapshot.max_bytes", F("snapshot")),
     ("snapshot.keep_days", F("snapshot")),
     ("recall.max_timeout_ms", F("recall_timeout")),
+    ("ideas.default_mode", F("idea_review")),
 ];
 
 /// Цели корпуса ТС-1, которые сервер умеет создать (загрузчик `--via mcp`): связь
@@ -522,6 +524,12 @@ mod tests {
                 && full.keys.contains("read.focus_min_tokens")
         );
         assert!(!full.keys.contains("search.kind_boost_mode"));
+        // режим идей M6.5 — только у сборки с `idea_review`: старому серверу ключ не шлётся
+        assert!(
+            !full.keys.contains("ideas.default_mode") && !m57.keys.contains("ideas.default_mode")
+        );
+        let m65 = caps_from(&health("0.0.12-m6.5", "abc", Some(&["m6", "idea_review"]))).unwrap();
+        assert!(m65.keys.contains("ideas.default_mode"));
         // features без "m6" — не сборка ветки M6
         assert!(caps_from(&health("0.0.10-m5.7", "abc", Some(&["focus"]))).is_err());
     }

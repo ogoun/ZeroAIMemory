@@ -69,7 +69,7 @@ use super::graph::insight_links;
 use super::json_body;
 use super::nodes::audit_node;
 use super::scope::{
-    EntryScope, MemScope, Mode, deny_report_mutation, entry_scope, hidden_entry, live_entry,
+    EntryScope, MemScope, Mode, Role, deny_report_mutation, entry_scope, hidden_entry, live_entry,
     space_scope,
 };
 use crate::app::AppState;
@@ -664,15 +664,25 @@ async fn decision_vector(
     }
 }
 
-/// Запись insight с её триггерами как JSON (`triggers` — массив, у не-insight — нет поля).
-pub async fn entry_json(db: &Db, e: &Entry) -> Result<Value, ApiError> {
+/// Запись как JSON: у insight — её триггеры (`triggers` — массив, у не-insight — нет поля), у
+/// задачи — поля [`super::tasks::attach_task`] (длительность, идеи плана — видимые с ролью `role`,
+/// [`super::tasks::idea_spaces`]).
+pub async fn entry_json(db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
     let mut v = serde_json::to_value(e).map_err(|e| ApiError::Internal(e.to_string()))?;
     if e.kind == EntryKind::Insight
         && let Value::Object(o) = &mut v
     {
         o.insert("triggers".into(), json!(entry_triggers(db, e.id).await?));
     }
-    super::tasks::attach_task(&mut v, e);
+    let ideas = if e.kind == EntryKind::Task {
+        zam_store::ideas_of_tasks(db, &[e.id], &super::tasks::idea_spaces(role, e.space_id))
+            .await?
+            .remove(&e.id)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    super::tasks::attach_task(&mut v, e, &ideas);
     Ok(v)
 }
 
@@ -846,7 +856,7 @@ pub async fn create(
             )
             .await?;
         }
-        let mut v = entry_json(&sc.db, &n).await?;
+        let mut v = entry_json(&sc.db, &n, sc.role).await?;
         super::secrets::attach_entry(&mut v, &n);
         v["superseded"] =
             serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -899,7 +909,7 @@ pub async fn create(
     if created {
         st.index.notify();
     }
-    let mut v = entry_json(&sc.db, &e).await?;
+    let mut v = entry_json(&sc.db, &e, sc.role).await?;
     super::secrets::attach_entry(&mut v, &e);
     if kind == EntryKind::Insight {
         v["dedup"] = json!(mode.as_str());
@@ -993,7 +1003,7 @@ pub async fn supersede(
     } else {
         StatusCode::CREATED
     };
-    let mut entry = entry_json(&sc.db, &n).await?;
+    let mut entry = entry_json(&sc.db, &n, sc.role).await?;
     super::secrets::attach_entry(&mut entry, &n);
     if kind == EntryKind::Insight {
         let w = alias_warnings(&st, &sc.db, sc.space.id, &n.title, &n.body).await?;
@@ -1015,7 +1025,7 @@ pub async fn supersede(
         status,
         Json(json!({
             "entry": entry,
-            "superseded": entry_json(&sc.db, &o).await?,
+            "superseded": entry_json(&sc.db, &o, sc.role).await?,
         })),
     ))
 }
@@ -1067,7 +1077,7 @@ pub async fn retract(
         audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
-    Ok(Json(entry_json(&sc.db, &e).await?))
+    Ok(Json(entry_json(&sc.db, &e, sc.role).await?))
 }
 
 #[cfg(test)]
