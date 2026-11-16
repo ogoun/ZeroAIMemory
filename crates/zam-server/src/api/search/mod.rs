@@ -253,7 +253,7 @@ use zam_store::{
 
 /// Параметры лёгкого поиска ([`search_with`]; M6 §16): глубина каналов FTS и сниппеты. Для
 /// подсказок-идей — `channel_depth = max(4 × top_k, 20)`, `snippets = false`
-/// (`api/recall.rs`, `idea_light_search`).
+/// (`api/recall/ideas.rs`, `idea_light_search`).
 pub use zam_store::LightSearch;
 
 use self::merge::merge_channels;
@@ -2359,7 +2359,7 @@ pub static TEST_LIGHT_SEARCHES: std::sync::Mutex<Vec<LightProbe>> =
     std::sync::Mutex::new(Vec::new());
 
 /// [`search`] с облегчением `light` (M6 §16, задача 16) — только для внутреннего поиска
-/// подсказок-идей к `prompt` и похожих пакета разбора идей (`api/recall.rs`; у пакета — ещё и
+/// подсказок-идей к `prompt` и похожих пакета разбора идей (`api/recall/ideas.rs`; у пакета — ещё и
 /// [`LightSearch::any_terms`]: FTS сразу ослабленным запросом, M6.5 §7): каналы FTS не длиннее
 /// [`LightSearch::channel_depth`], сниппеты строятся только при [`LightSearch::snippets`]
 /// (у элементов выдачи `snippet` пуст), непроиндексированные заметки не считаются
