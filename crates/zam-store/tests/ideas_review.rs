@@ -13,7 +13,7 @@ use zam_store::{
     NewDecision, NewEntry, NewNote, NewReview, NodePath, REVIEW_MIN_CHARS_DEFAULT, REVIEW_REFS_MAX,
     REVIEWS_MAX, ReviewOutcome, ReviewTask, SpaceKind, TaskData, create_entry, create_note,
     create_solution, decide_idea, delete_entry, entry_revisions, get_entry, list_spaces,
-    review_idea, update_entry,
+    planned_from_ideas, review_idea, review_queue, review_queue_len, update_entry,
 };
 
 // ---------- окружение ----------
@@ -887,4 +887,105 @@ async fn review_rejects_bad_refs() {
         ]
     );
     assert_eq!(rv.similar, vec![format!("w:{}", other.id)]);
+}
+
+// ---------- очередь разбора и строка плана (M6.5 §7, задача 4) ----------
+
+/// Очередь разбора: живые идеи человека `new` пространства — `high` первыми, затем самые старые;
+/// без идей агента, разобранных, удалённых и чужого пространства; предел `limit`, длина — без
+/// предела.
+#[tokio::test]
+async fn review_queue_order_and_filters() {
+    let (db, sol, kn) = setup("queue").await;
+    let old = new_idea(&db, sol, "Старая", "human", "normal").await;
+    let low = new_idea(&db, sol, "Низкая", "human", "low").await;
+    let high = new_idea(&db, sol, "Срочная", "human", "high").await;
+    let young = new_idea(&db, sol, "Новая", "human", "normal").await;
+    new_idea(&db, sol, "Идея агента", "agent", "high").await;
+    new_idea(&db, kn, "Идея Knowledge", "human", "high").await;
+    let gone = new_idea(&db, sol, "Удалённая", "human", "high").await;
+    delete_entry(&db, gone.id, None, &human()).await.unwrap();
+    let done = new_idea(&db, sol, "Разобранная", "human", "high").await;
+    review_idea(
+        &db,
+        done.id,
+        nr(ReviewOutcome::Decline, Id::new()),
+        &agent(),
+    )
+    .await
+    .unwrap();
+    let ids = |v: Vec<Entry>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(review_queue(&db, sol, 10).await.unwrap()),
+        [high.id, old.id, young.id, low.id]
+    );
+    assert_eq!(
+        ids(review_queue(&db, sol, 2).await.unwrap()),
+        [high.id, old.id]
+    );
+    assert!(review_queue(&db, sol, 0).await.unwrap().is_empty());
+    assert_eq!(review_queue_len(&db, sol).await.unwrap(), 4);
+    // очередь — одного пространства: идея Knowledge в очередь решения не попадает
+    assert_eq!(review_queue_len(&db, kn).await.unwrap(), 1);
+}
+
+/// Строка плана: живые задачи `open | in_progress | blocked` с системным ребром `derived_from`
+/// на живую идею; следующая — по `data.priority` (нет — `normal`), затем самая старая. Задача без
+/// ребра, снятая, сделанная и с ребром только на удалённую идею не считаются.
+#[tokio::test]
+async fn planned_from_ideas_next_by_priority() {
+    let (db, sol, _) = setup("planned").await;
+    assert_eq!(planned_from_ideas(&db, sol).await.unwrap().0, 0);
+    let plan = |priority: Option<IdeaPriority>| {
+        let mut r = nr(ReviewOutcome::Plan, Id::new());
+        r.task = ReviewTask::New {
+            title: None,
+            body: Some("1. Шаг.".into()),
+            priority,
+        };
+        r
+    };
+    let planned = |title: &'static str, priority: Option<IdeaPriority>| {
+        let db = db.clone();
+        async move {
+            let i = new_idea(&db, sol, title, "human", "normal").await;
+            review_idea(&db, i.id, plan(priority), &agent())
+                .await
+                .unwrap()
+                .task
+                .unwrap()
+        }
+    };
+    // задача «начать» M5.7 без `data.priority` — как `normal`
+    let started = new_idea(&db, sol, "Начатая", "human", "low").await;
+    let first = decide_idea(&db, started.id, nd(IdeaDecision::Accept), &human())
+        .await
+        .unwrap()
+        .task
+        .unwrap();
+    assert_eq!(TaskData::from_stored(&first.data).priority, None);
+    planned("Низкая", Some(IdeaPriority::Low)).await;
+    planned("Обычная", Some(IdeaPriority::Normal)).await;
+    let (n, next) = planned_from_ideas(&db, sol).await.unwrap();
+    assert_eq!(
+        (n, next.unwrap().id),
+        (3, first.id),
+        "без приоритета — normal, старше"
+    );
+    let high = planned("Срочная", Some(IdeaPriority::High)).await;
+    set_task_status(&db, high.id, EntryStatus::InProgress).await;
+    let (n, next) = planned_from_ideas(&db, sol).await.unwrap();
+    assert_eq!((n, next.unwrap().id), (4, high.id));
+    // не считаются: без ребра, снятая, сделанная, с ребром только на удалённую идею
+    new_task(&db, sol, "Ручная").await;
+    let dropped = planned("Снятая", Some(IdeaPriority::High)).await;
+    set_task_status(&db, dropped.id, EntryStatus::Dropped).await;
+    let done = planned("Сделанная", Some(IdeaPriority::High)).await;
+    set_task_status(&db, done.id, EntryStatus::Done).await;
+    let orphan = new_task(&db, sol, "Сирота").await;
+    let gone = new_idea(&db, sol, "Удалённая", "human", "high").await;
+    system_edge(&db, sol, orphan.id, gone.id).await;
+    delete_entry(&db, gone.id, None, &human()).await.unwrap();
+    let (n, next) = planned_from_ideas(&db, sol).await.unwrap();
+    assert_eq!((n, next.unwrap().id), (4, high.id));
 }

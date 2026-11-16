@@ -3178,6 +3178,13 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
     if f.ideas {
         base_sets.push(("ideas.proactive".into(), f.ideas_on.to_string()));
     }
+    // режим идей M5.7 у сервера M6.5+ (Ruling 6 задачи 4 M6.5): мир грузит идеи `proposed`
+    // (`propose` новой идеи в `review` — 409), а подсказки-идеи сравниваются с B5.7; старым
+    // серверам ключ не шлётся
+    if f.ideas && caps.keys.contains(&hints::ideas::M57_MODE.0) {
+        let (k, v) = hints::ideas::M57_MODE;
+        base_sets.push((k.into(), v.into()));
+    }
     for (k, v) in run::parse_sets(&a.sets)? {
         base_sets.push((k, v));
     }

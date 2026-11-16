@@ -400,9 +400,9 @@ const HUMAN_DEFAULT_KINDS: [&str; 9] = [
     IDEA,
 ];
 /// Статусы записей `filters.status`: insight и term, с M4.5 — task и question (спецификация
-/// M4.5 §1.3), с M5.7 — идеи ([`IDEA_STATUSES`]; `done` — общий с task). Умолчания по виду —
-/// [`default_statuses`].
-const STATUSES: [&str; 16] = [
+/// M4.5 §1.3), с M5.7 — идеи ([`IDEA_STATUSES`]; `done` — общий с task; с M6.5 — `returned`).
+/// Умолчания по виду — [`default_statuses`].
+const STATUSES: [&str; 17] = [
     "active",
     "revisit",
     "superseded",
@@ -419,11 +419,15 @@ const STATUSES: [&str; 16] = [
     "accepted",
     "deferred",
     "declined",
+    "returned",
 ];
 /// Статусы, которые бывают только у идей: в ключ кэша выжимок не входят ([`scope_key`]).
-const IDEA_STATUSES: [&str; 5] = ["new", "proposed", "accepted", "deferred", "declined"];
-/// Статусы идей по умолчанию (M5.7 §4): живые замыслы и начатые, без `declined` и `done`.
-const IDEA_DEFAULT_STATUSES: [&str; 4] = ["new", "proposed", "deferred", "accepted"];
+const IDEA_STATUSES: [&str; 6] = [
+    "new", "proposed", "accepted", "deferred", "declined", "returned",
+];
+/// Статусы идей по умолчанию (M5.7 §4; M6.5 §4 — и `returned` «На доработку»): живые замыслы и
+/// начатые, без `declined` и `done`.
+const IDEA_DEFAULT_STATUSES: [&str; 5] = ["new", "proposed", "deferred", "accepted", "returned"];
 /// Статусы по умолчанию (§7.5): действующие.
 const DEFAULT_STATUSES: [&str; 2] = ["active", "revisit"];
 
@@ -2355,7 +2359,8 @@ pub static TEST_LIGHT_SEARCHES: std::sync::Mutex<Vec<LightProbe>> =
     std::sync::Mutex::new(Vec::new());
 
 /// [`search`] с облегчением `light` (M6 §16, задача 16) — только для внутреннего поиска
-/// подсказок-идей к `prompt` (`api/recall.rs`): каналы FTS не длиннее
+/// подсказок-идей к `prompt` и похожих пакета разбора идей (`api/recall.rs`; у пакета — ещё и
+/// [`LightSearch::any_terms`]: FTS сразу ослабленным запросом, M6.5 §7): каналы FTS не длиннее
 /// [`LightSearch::channel_depth`], сниппеты строятся только при [`LightSearch::snippets`]
 /// (у элементов выдачи `snippet` пуст), непроиндексированные заметки не считаются
 /// (`pending_count` — 0), устаревшие ссылки на файлы в карточках не помечаются. Состав, порядок
@@ -4153,5 +4158,16 @@ mod tests {
             assert!(t.statuses.contains(&s.to_string()), "{s}");
         }
         assert!(!t.statuses.contains(&"declined".to_string()));
+        // M6.5 §4: «На доработку» — среди живых; явный `filters.status` его принимает
+        assert!(t.statuses.contains(&"returned".to_string()));
+        let returned = Filters {
+            kinds: Some(vec!["idea".into()]),
+            status: Some(vec!["returned".into()]),
+            ..Filters::default()
+        };
+        assert_eq!(
+            target_filter(&returned, false, false).unwrap().statuses,
+            ["returned"]
+        );
     }
 }

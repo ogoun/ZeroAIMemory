@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! POST /recall {event, session_id?, solution?, area?, prompt?, error?, tool?, budget_tokens?,
-//!               agent_block_version?, task?, parent_id?, timeout_ms?}
+//!               agent_block_version?, task?, parent_id?, timeout_ms?, limit?}
 //!   → 200 {text, items: [{id, kind, title, certainty, reason, age_days?}], tokens,
 //!          rules_tokens, timings, warnings, hooks?, holdout?}
 //! ```
@@ -13,7 +13,8 @@
 //!   changelog — `c:<id>`), под ней с отступом может идти пояснение (L1 правила, фрагмент).
 //!   `items` — показанные подсказки по порядку: `id` — та же ссылка, `kind` — `insight`,
 //!   `changelog`, `note` или `folder`, `reason` — откуда подсказка (`rules`, `solution`,
-//!   `gotcha`, `failure`, `revisit`, `changelog`, `search`, `error_regex`, `error_fts`),
+//!   `gotcha`, `failure`, `revisit`, `changelog`, `search`, `error_regex`, `error_fts`; у идей —
+//!   `idea` и `idea_review`),
 //!   `age_days` — возраст записи в сутках (M4.5 §7; нет у строк окружения, файлов, терминов и
 //!   триггеров `error_regex`: время там неизвестно); `tokens` — размер `text` (счётчик
 //!   выдачи), `rules_tokens` — размер раздела-резерва Rules (M6 §8, §17 п. 3; 0 — резерва нет),
@@ -94,6 +95,28 @@
 //!   `horizon` и `accepted` с живой задачей не предлагаются никогда; `accepted` со снятой или
 //!   удалённой задачей (§16) — после `new`/`deferred`, строка с пометкой «задача снята|удалена,
 //!   можно предложить вернуть»; показ — `session_seen`, раз за сессию;
+//! - **режим идей `review`** (M6.5 §7; `ideas.mode` владельца базы решения — в общем решении
+//!   его, а не участника; по умолчанию `[ideas] default_mode` = `review`, `propose` — всё как в
+//!   M5.7 выше): на месте `### Идеи` — раздел [`SECTION_IDEAS_REVIEW`] со строкой
+//!   «Непросмотренных идей: N…» ([`IDEAS_REVIEW_HINT`]) и до `ideas.digest_max` строк: очередь
+//!   разбора [`zam_store::review_queue`] (идеи человека `new`, `high` первыми, затем самые старые;
+//!   `reason: idea_review`), за ней кандидаты предложения M5.7 (`deferred` с наступившим
+//!   `horizon`, `accepted` со снятой задачей) с указанием `action=propose` в строке; очереди нет —
+//!   раздел M5.7 из них одних. Подсказка к `prompt` у идеи решения `new` — «к задаче подходит
+//!   идея на разбор w:<id>» (`reason: idea_review`). Строка плана [`PLAN_LINE`] — сразу за
+//!   задачами дайджеста и пакета восстановления: пункты плана из идей (задачи `open |
+//!   in_progress | blocked` с ребром `derived_from` на идею) и следующий по `data.priority`,
+//!   затем самый старый ([`zam_store::planned_from_ideas`]); нет пунктов — строки нет. Идеи
+//!   выключены (`ideas.proactive`) — ни раздела, ни подсказок, ни строки плана;
+//! - **пакет разбора идей `idea_review`** (M6.5 §7; MCP `memory_recall`, `zam idea queue`;
+//!   явный вызов: без гейта `hooks.<тип>` и `ideas.proactive`, без контрольной группы A/B, не
+//!   фильтруется показанным, показ отмечается, `usage.source = agent`): до `limit` (1..=
+//!   [`IDEA_REVIEW_LIMIT_MAX`], по умолчанию [`IDEA_REVIEW_LIMIT`]) идей очереди — заголовок,
+//!   приоритет, тело, история (прежние разборы и доводы человека), до
+//!   [`IDEA_REVIEW_SIMILAR_MAX`] похожих записей решения и строка шагов разбора
+//!   ([`review_pack`]); бюджет — `budget_tokens` или [`IDEA_REVIEW_BUDGET`], срок по умолчанию —
+//!   `max(recall.max_timeout_ms, recall.timeout_ms)`; режим `propose`, нет права записи, нет
+//!   решения или пустая очередь — одна строка-уведомление;
 //! - **`post_tool`** — ошибка инструмента: совпадения `error_regex` действующих триггеров
 //!   insight решения и Knowledge (по первым [`ERROR_SCAN_MAX`] байтам `error`; триггер с
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
@@ -171,7 +194,7 @@
 //!   `keep`, правила — со строкой «не показано — правил: N»); хук без поля (есть `source` или
 //!   `code_map`) — 7500 байт; `max` вне 1..=1 000 000 или иная единица — 400;
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
-//!   recovery | brief` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
+//!   recovery | brief | idea_review` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
 //!
 //! Маршрут — служебный, рядом с `/search` и `/read`: `/recall` пишет только `usage` и
 //! `session_seen`, а не память, поэтому `memory_writes` не растёт (решение контроллера R12).
@@ -206,10 +229,11 @@ use super::json_body;
 use super::search::targets::{ScopeReq, SearchTarget, dedup_keep_order, resolve_targets};
 use super::search::{Health, LightSearch, SOLUTION_HEADER};
 use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
-use super::user_settings::{UserFlags, user_flags};
+use super::user_settings::{UserFlags, ideas_mode, user_flags};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, SESSION_HEADER};
 use crate::auth::{Principal, target_user_id};
+use crate::config::IdeasMode;
 use crate::error::ApiError;
 
 /// Предупреждение: сбор подсказок не уложился в `recall.timeout_ms`.
@@ -276,6 +300,9 @@ enum Event {
     Recovery,
     /// Пакет под задачу (M4.5 §9.4): хук `subagent-start` и MCP.
     Brief,
+    /// Пакет разбора идей (M6.5 §7): очередь идей `new` с похожими записями — MCP и
+    /// `zam idea queue`.
+    IdeaReview,
 }
 
 impl Event {
@@ -288,18 +315,20 @@ impl Event {
             Event::SessionStart => Some("session_start"),
             Event::Prompt => Some("prompt"),
             Event::PostTool => Some("post_tool"),
-            Event::Recovery | Event::Brief => None,
+            Event::Recovery | Event::Brief | Event::IdeaReview => None,
         }
     }
 
     /// Источник показа в `usage`: у пакета восстановления — `session_start` (так с задачи 9),
-    /// у пакета под задачу — `brief` (в `usage.source` нет CHECK, миграция не нужна).
+    /// у пакета под задачу — `brief` (в `usage.source` нет CHECK, миграция не нужна), у пакета
+    /// разбора идей — `agent`: его зовёт сам агент, не хук.
     fn source(self) -> UsageSource {
         match self {
             Event::SessionStart | Event::Recovery => UsageSource::SessionStart,
             Event::Prompt => UsageSource::Prompt,
             Event::PostTool => UsageSource::PostTool,
             Event::Brief => UsageSource::Brief,
+            Event::IdeaReview => UsageSource::Agent,
         }
     }
 }
@@ -313,6 +342,7 @@ fn token_event(event: Event, recovery: bool) -> &'static str {
         Event::Prompt => "prompt",
         Event::PostTool => "post_tool",
         Event::Brief => "brief",
+        Event::IdeaReview => "idea_review",
     }
 }
 
@@ -381,8 +411,12 @@ pub struct RecallReq {
     /// клиент режет только страховочно. Нет у хука (старый клиент) — [`HOOK_OUTPUT_LIMIT`].
     output_limit: Option<OutputLimit>,
     /// Срок сбора этого запроса, мс (M6 §16 п. 19, CR-7): 1..=`max(recall.max_timeout_ms,
-    /// recall.timeout_ms)`, иначе 400; нет — `recall.timeout_ms`.
+    /// recall.timeout_ms)`, иначе 400; нет — `recall.timeout_ms` (у `idea_review` — верхний
+    /// предел: пакет — явный вызов агента, не бюджет хука).
     timeout_ms: Option<u64>,
+    /// Идей в пакете `idea_review` (M6.5 §7): 1..=[`IDEA_REVIEW_LIMIT_MAX`], иначе 400; нет —
+    /// [`IDEA_REVIEW_LIMIT`]. У прочих событий не действует.
+    limit: Option<u32>,
 }
 
 /// Единица предела вывода: символы (Claude Code) или байты UTF-8 (Codex).
@@ -914,6 +948,80 @@ const REOPEN_MARK_TAIL: &str = "можно предложить вернуть";
 const REASON_IDEA: &str = "idea";
 /// Предел заголовка идеи в строке дайджеста и подсказки, символов.
 const IDEA_TITLE_CHARS: usize = 120;
+/// Заголовок раздела очереди разбора (M6.5 §7, режим `ideas.mode = review`): в дайджесте — на
+/// месте [`SECTION_IDEAS`], в пакете `idea_review` — его раздел.
+pub const SECTION_IDEAS_REVIEW: &str = "### Идеи на разбор";
+/// Строка-указание под [`SECTION_IDEAS_REVIEW`] дайджеста (`{n}` — длина очереди,
+/// [`ideas_review_hint`]): агент сам выбирает момент — «когда закончишь текущий шаг».
+pub const IDEAS_REVIEW_HINT: &str = "Непросмотренных идей: {n}. Разбери, когда закончишь текущий \
+    шаг: memory_recall event=idea_review → memory_update_entry action=review.";
+/// Строка плана дайджеста (M6.5 §7, [`plan_line`]): пункты плана из идей и следующий из них.
+pub const PLAN_LINE: &str = "План из идей: {n} открытых, следующая — k:{id} «{title}» [{priority}]";
+/// `reason` идеи очереди разбора (`new` в режиме `review`): строки дайджеста и подсказки к
+/// `prompt`, идеи пакета `idea_review`.
+const REASON_IDEA_REVIEW: &str = "idea_review";
+/// Пометка строки-хвоста раздела [`SECTION_IDEAS_REVIEW`] у отложенной идеи с наступившим
+/// `horizon` ([`idea_tail_line`]).
+const DEFERRED_DUE_MARK: &str = "срок отсрочки вышел";
+/// Указание строки-хвоста раздела [`SECTION_IDEAS_REVIEW`]: строка-указание раздела — о разборе,
+/// а такую идею по M5.7 предлагают человеку вопросом ([`IDEAS_HINT`]).
+const TAIL_PROPOSE: &str = "(предложи человеку: action=propose — вопрос «начать / отложить / \
+    отказаться»; без ответа «начать» не начинай)";
+/// Указание строки-хвоста у идеи со снятой задачей ([`IDEAS_HINT_REOPEN`]).
+const TAIL_REOPEN: &str = "(предложи вернуть: action=propose с text — почему пора; решает человек)";
+/// Идей в пакете `idea_review` по умолчанию (M6.5 §7).
+pub const IDEA_REVIEW_LIMIT: usize = 5;
+/// Наибольший `limit` пакета `idea_review`.
+pub const IDEA_REVIEW_LIMIT_MAX: u32 = 20;
+/// Бюджет пакета `idea_review` и карточек его поиска похожих по умолчанию, токенов.
+pub const IDEA_REVIEW_BUDGET: usize = 3000;
+/// Похожих записей у идеи пакета (M6.5 §7).
+pub const IDEA_REVIEW_SIMILAR_MAX: usize = 5;
+/// `top_k` поиска похожих: [`IDEA_REVIEW_SIMILAR_MAX`] и сама идея.
+const IDEA_REVIEW_TOP_K: usize = IDEA_REVIEW_SIMILAR_MAX + 1;
+/// Предел тела идеи в пакете, символов: длиннее — с «…» и указанием `memory_read`.
+const IDEA_REVIEW_BODY_CHARS: usize = 1500;
+/// Предел строки истории разбора и строки похожей записи, символов.
+const IDEA_REVIEW_LINE_CHARS: usize = 200;
+/// Предел довода человека в истории идеи пакета, символов.
+const IDEA_REVIEW_REASON_CHARS: usize = 500;
+/// Виды похожих записей пакета: идеи, задачи (план и сделанное), changelog, решения, заметки.
+const IDEA_REVIEW_KINDS: [&str; 5] = ["idea", "task", "changelog", "insight", "note"];
+/// Статусы поиска похожих: все статусы идей и задач и действующие insight — без `active` и
+/// `revisit` общий фильтр статусов отсёк бы решения (`decision`); у changelog и заметок статуса
+/// нет — они проходят всегда.
+const IDEA_REVIEW_STATUSES: [&str; 13] = [
+    "new",
+    "proposed",
+    "accepted",
+    "deferred",
+    "declined",
+    "returned",
+    "done",
+    "open",
+    "in_progress",
+    "blocked",
+    "dropped",
+    "active",
+    "revisit",
+];
+/// Строка шагов разбора под заголовком раздела пакета `idea_review` (M6.5 §8).
+pub const IDEA_REVIEW_STEPS: &str = "Шаги разбора: сверь идею с планом (открытые задачи), ТЗ и \
+    сделанным (changelog, задачи done, код) и с похожими; повтор отклонённой без новых доводов — \
+    decline со ссылкой в similar; итог — memory_update_entry id=w:<id> action=review \
+    outcome=plan|return|decline|done summary=… (return — missing, plan — task.body с планом \
+    шагов).";
+/// Пакет `idea_review`: очередь пуста.
+pub const IDEA_REVIEW_EMPTY: &str = "Идей на разбор нет.";
+/// Пакет `idea_review` без решения в области запроса.
+pub const IDEA_REVIEW_NO_SOLUTION: &str =
+    "Идей на разбор нет: решение не задано (solution или X-Zam-Solution).";
+/// Пакет `idea_review` при режиме `propose` владельца базы решения: разбора нет — у агента не
+/// должно быть двух противоречивых указаний (M6.5 §7).
+pub const IDEA_REVIEW_OFF: &str = "Разбор идей выключен: ideas.mode = propose — предлагай идею \
+    человеку (memory_update_entry action=propose).";
+/// Пакет `idea_review` без права записи в решение (токен `ro`, участник с `ro`): разбор дал бы 403.
+pub const IDEA_REVIEW_READ_ONLY: &str = "Разбор идей недоступен: нет права записи в решение.";
 /// Тестовая метка заголовка идеи: отдельный поиск идей к `prompt` «не укладывается в срок»
 /// (фича `test-hooks`, проверка тишины по идеям).
 #[cfg(feature = "test-hooks")]
@@ -1183,6 +1291,59 @@ fn idea_cand(target: usize, e: &Entry, block: String) -> Cand {
     c
 }
 
+/// Идея очереди разбора цели `target` со строкой `block` (`kind: idea`, `reason: idea_review`).
+fn idea_review_cand(target: usize, e: &Entry, block: String) -> Cand {
+    let mut c = entry_cand(target, e, REASON_IDEA_REVIEW, "");
+    c.block = block;
+    c
+}
+
+/// Строка-указание [`IDEAS_REVIEW_HINT`] с длиной очереди `n`.
+fn ideas_review_hint(n: usize) -> String {
+    IDEAS_REVIEW_HINT.replace("{n}", &n.to_string())
+}
+
+/// Строка-хвост раздела [`SECTION_IDEAS_REVIEW`] (M6.5 §7, «прочие случаи M5.7»): идея, которую
+/// агент предлагает человеку вопросом, — `deferred` с наступившим `horizon` или `accepted` со
+/// снятой задачей (`mark`, [`released_mark`]). Указание `action=propose` — в самой строке:
+/// строка-указание раздела говорит о разборе.
+fn idea_tail_line(e: &Entry, mark: Option<&str>) -> String {
+    match mark {
+        None => format!(
+            "ZeroAIMemory: идея «{}» [{}] — {DEFERRED_DUE_MARK} — {} {TAIL_PROPOSE}",
+            idea_title(e),
+            zam_store::IdeaData::from_stored(&e.data).priority.as_str(),
+            entry_ref(e)
+        ),
+        Some(_) => format!("{} {TAIL_REOPEN}", idea_line(e, mark)),
+    }
+}
+
+/// Строка подсказки к `prompt` у идеи очереди разбора (M6.5 §7): «к задаче подходит идея на
+/// разбор w:<id>» — без `propose`: идею `new` в режиме `review` разбирает агент.
+fn idea_review_prompt_line(e: &Entry) -> String {
+    format!(
+        "ZeroAIMemory: к задаче подходит идея на разбор {} «{}» — разбери, когда закончишь \
+         текущий шаг (memory_recall event=idea_review)",
+        entry_ref(e),
+        idea_title(e)
+    )
+}
+
+/// Строка плана [`PLAN_LINE`]: `n` пунктов плана из идей, следующий — `next`
+/// ([`zam_store::planned_from_ideas`]; нет `data.priority` — `normal`).
+fn plan_text(n: usize, next: &Entry) -> String {
+    let priority = zam_store::TaskData::from_stored(&next.data)
+        .priority
+        .unwrap_or(zam_store::IdeaPriority::Normal);
+    // заголовок — последним: подстановки в тексте человека не раскрываются
+    PLAN_LINE
+        .replace("{n}", &n.to_string())
+        .replace("{id}", &next.id.to_string())
+        .replace("{priority}", priority.as_str())
+        .replace("{title}", &idea_title(next))
+}
+
 /// Проактивность идей (§8): `[ideas] proactive` сервера и `ideas.proactive` пользователя
 /// (`server && user`; настройки пользователя — одним чтением с `hooks.<тип>`, сбой чтения —
 /// всё включено).
@@ -1221,45 +1382,63 @@ async fn idea_shown_in_session(s: Option<&RequestSession>, t: &SearchTarget) -> 
 /// показана ни одна идея этой базы ([`idea_shown_in_session`]). Иначе каждый `/compact`
 /// приносил бы следующие три. Сбой чтения идей — WARN и раздела нет: ни ответ, ни остальной
 /// дайджест цели (`health.alive`) он не трогает.
+///
+/// Режим `review` (M6.5 §7, `review` — режим владельца базы решения): сначала очередь разбора
+/// [`zam_store::review_queue`] (`reason: idea_review`, раздел [`SECTION_IDEAS_REVIEW`]), за ней —
+/// кандидаты предложения по M5.7 [`zam_store::proposal_ideas`] (`deferred` с наступившим
+/// `horizon`, `accepted` со снятой задачей; строка — [`idea_tail_line`]), всего не больше
+/// `ideas.digest_max`. Очереди нет — раздел M5.7 из одних кандидатов предложения. Итог — идеи и
+/// длина очереди (строка «Непросмотренных идей: N»).
 async fn digest_ideas(
     st: &AppState,
     p: &Principal,
     session: Option<&RequestSession>,
     health: &Health<'_>,
     deadline: &mut Deadline,
-) -> Vec<Cand> {
+    review: bool,
+) -> (Vec<Cand>, usize) {
     let max = st.cfg.ideas.digest_max as usize;
     let Some((i, space)) = solution_space(health.targets()) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     if max == 0 || !health.alive[i] || !ideas_writable(p, &health.targets()[i]) {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let t = &health.targets()[i];
     match deadline.step(idea_shown_in_session(session, t)).await {
         Some(false) => {}
-        Some(true) | None => return Vec::new(),
+        Some(true) | None => return (Vec::new(), 0),
     }
-    let Some(r) = deadline
-        .step(zam_store::proactive_ideas(
-            &t.db,
-            &[space],
-            zam_store::time::utc_today(),
-            &HashSet::new(),
-            max,
-        ))
-        .await
-    else {
-        return Vec::new();
+    let today = zam_store::time::utc_today();
+    let db = &t.db;
+    let read = async {
+        if !review {
+            let c = zam_store::proactive_ideas(db, &[space], today, &HashSet::new(), max).await?;
+            return Ok::<_, StoreError>((0, Vec::new(), c));
+        }
+        let n = zam_store::review_queue_len(db, space).await?;
+        let queue = if n > 0 {
+            zam_store::review_queue(db, space, max).await?
+        } else {
+            Vec::new()
+        };
+        let tail = zam_store::proposal_ideas(db, &[space], today, max - queue.len()).await?;
+        Ok((n, queue, tail))
     };
-    let cands = match r {
-        Ok(c) => c,
+    let Some(r) = deadline.step(read).await else {
+        return (Vec::new(), 0);
+    };
+    let (n, queue, cands) = match r {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "recall: идеи дайджеста не прочитаны");
-            return Vec::new();
+            return (Vec::new(), 0);
         }
     };
-    let mut out = Vec::with_capacity(cands.len());
+    let mut out: Vec<Cand> = queue
+        .iter()
+        .map(|e| idea_review_cand(i, e, idea_line(e, None)))
+        .collect();
     for e in &cands {
         // пометка «задача снята» — по состоянию задачи (только у `accepted`, §16)
         let task = if e.status == Some(EntryStatus::Accepted) {
@@ -1274,9 +1453,370 @@ async fn digest_ideas(
         } else {
             None
         };
-        out.push(idea_cand(i, e, idea_line(e, released_mark(e, task))));
+        let mark = released_mark(e, task);
+        // за очередью разбора — строка с указанием `propose`; без очереди — раздел M5.7
+        let block = if queue.is_empty() {
+            idea_line(e, mark)
+        } else {
+            idea_tail_line(e, mark)
+        };
+        out.push(idea_cand(i, e, block));
     }
-    out
+    (out, if queue.is_empty() { 0 } else { n })
+}
+
+/// Режим идей решения запроса (M6.5 §7): `ideas.mode` владельца базы решения — в общем решении
+/// действует режим владельца, а не участника; своё решение — режим пользователя запроса
+/// (`flags`, уже прочитан). Решения в области нет — режим пользователя. Сбой чтения настроек
+/// владельца — WARN и `[ideas] default_mode` сервера.
+async fn solution_ideas_mode(
+    st: &AppState,
+    targets: &[SearchTarget],
+    user: Id,
+    flags: &UserFlags,
+) -> IdeasMode {
+    match solution_space(targets) {
+        Some((i, _)) if targets[i].owner != user => match ideas_mode(st, targets[i].owner).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "recall: режим идей владельца решения не прочитан");
+                st.cfg.ideas.default_mode
+            }
+        },
+        _ => flags.ideas_mode,
+    }
+}
+
+/// Пакет разбора идей `event: idea_review` (M6.5 §7): идеи очереди [`zam_store::review_queue`]
+/// пространства решения запроса (до `limit`, по умолчанию [`IDEA_REVIEW_LIMIT`]) — по блоку
+/// [`review_block`] на идею (`reason: idea_review`): строка с приоритетом, тело, история
+/// ([`review_history`]: прежние разборы и доводы человека) и до [`IDEA_REVIEW_SIMILAR_MAX`]
+/// похожих записей решения ([`review_similar`]). Вместо идей — одна строка-уведомление: решения
+/// нет ([`IDEA_REVIEW_NO_SOLUTION`]), режим `propose` владельца базы ([`IDEA_REVIEW_OFF`]), нет
+/// права записи ([`IDEA_REVIEW_READ_ONLY`]), очередь пуста ([`IDEA_REVIEW_EMPTY`]). Срок сбора
+/// вышел — собранное (у идей без поиска — строка «не собраны») и `recall timeout`.
+#[allow(clippy::too_many_arguments)]
+async fn review_pack(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    req: &RecallReq,
+    mode: IdeasMode,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Result<(Lines, Vec<Cand>), ApiError> {
+    let notice = |s: &str| Lines {
+        notices: vec![s.to_string()],
+        ..Lines::default()
+    };
+    let targets = health.targets();
+    let Some((i, space)) = solution_space(targets) else {
+        return Ok((notice(IDEA_REVIEW_NO_SOLUTION), Vec::new()));
+    };
+    if mode == IdeasMode::Propose {
+        return Ok((notice(IDEA_REVIEW_OFF), Vec::new()));
+    }
+    if !ideas_writable(p, &targets[i]) {
+        return Ok((notice(IDEA_REVIEW_READ_ONLY), Vec::new()));
+    }
+    // решение исключено (`solution unavailable` уже в предупреждениях)
+    if !health.alive[i] {
+        return Ok((Lines::default(), Vec::new()));
+    }
+    let db = targets[i].db.clone();
+    let limit = req.limit.map_or(IDEA_REVIEW_LIMIT, |l| l as usize);
+    let Some(r) = deadline
+        .step(zam_store::review_queue(&db, space, limit))
+        .await
+    else {
+        return Ok((Lines::default(), Vec::new()));
+    };
+    let Some(queue) = health.soft(i, r)? else {
+        return Ok((Lines::default(), Vec::new()));
+    };
+    if queue.is_empty() {
+        return Ok((notice(IDEA_REVIEW_EMPTY), Vec::new()));
+    }
+    let mut out = Vec::with_capacity(queue.len());
+    for e in &queue {
+        let history = review_history(&db, e, deadline).await;
+        let similar = review_similar(st, p, headers, req, e, health, deadline).await?;
+        out.push(idea_review_cand(
+            i,
+            e,
+            review_block(e, &history, similar.as_deref()),
+        ));
+    }
+    Ok((Lines::default(), out))
+}
+
+/// Блок идеи пакета `idea_review`: строка идеи (как в дайджесте), тело (до
+/// [`IDEA_REVIEW_BODY_CHARS`], длиннее — с указанием `memory_read`), «История:» (если есть) и
+/// «Похожие:» — строки с отступом; `similar: None` — поиск не состоялся (срок, сбой). Секреты
+/// маскируются.
+fn review_block(e: &Entry, history: &[String], similar: Option<&[String]>) -> String {
+    let mut b = idea_line(e, None);
+    let body = zam_markdown::mask_text(e.body.trim());
+    let cut = body.chars().count() > IDEA_REVIEW_BODY_CHARS;
+    let shown: String = body.chars().take(IDEA_REVIEW_BODY_CHARS).collect();
+    for l in shown
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+    {
+        b.push_str("\n  ");
+        b.push_str(l);
+    }
+    if cut {
+        b.push_str(&format!("…\n  (полностью — memory_read {})", entry_ref(e)));
+    }
+    if !history.is_empty() {
+        b.push_str("\n  История:");
+        for h in history {
+            b.push_str("\n  - ");
+            b.push_str(h);
+        }
+    }
+    match similar {
+        None => b.push_str(
+            "\n  Похожие: не собраны — срок сбора вышел или поиск не удался (memory_search)",
+        ),
+        Some([]) => b.push_str("\n  Похожих нет."),
+        Some(lines) => {
+            b.push_str("\n  Похожие:");
+            for l in lines {
+                b.push_str("\n  - ");
+                b.push_str(l);
+            }
+        }
+    }
+    b
+}
+
+/// Первая непустая строка текста.
+fn first_line(s: &str) -> &str {
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+}
+
+/// Строка текста человека или агента в пакете: первая строка, до `max` символов, секреты
+/// маскируются.
+fn pack_text(s: &str, max: usize) -> String {
+    zam_markdown::mask_text(&clip(first_line(s), max))
+}
+
+/// Дата UTC времени `t` (`YYYY-MM-DD`).
+fn utc_date(t: jiff::Timestamp) -> String {
+    t.to_zoned(jiff::tz::TimeZone::UTC).date().to_string()
+}
+
+/// История идеи пакета `idea_review` по времени: прежние разборы агента (`data.reviews`:
+/// исход, первая строка разбора, у `return` — чего не хватало) и доводы человека — причины
+/// ревизий с его решением (`data.decided.by: human`; «Вернуть на разбор» — `reopen`,
+/// «Отказаться» с причиной — `decline`). Ревизии читаются, только если по идее было решение;
+/// сбой чтения или срок — WARN, без доводов.
+async fn review_history(db: &zam_store::Db, e: &Entry, deadline: &mut Deadline) -> Vec<String> {
+    let d = zam_store::IdeaData::from_stored(&e.data);
+    let mut out: Vec<(jiff::Timestamp, String)> = d
+        .reviews
+        .iter()
+        .map(|r| {
+            let mut s = format!(
+                "{} разбор {}: {}",
+                utc_date(r.at),
+                r.outcome.as_str(),
+                pack_text(&r.summary, IDEA_REVIEW_LINE_CHARS)
+            );
+            if let Some(m) = &r.missing {
+                s.push_str(&format!(
+                    "; не хватало: {}",
+                    pack_text(m, IDEA_REVIEW_LINE_CHARS)
+                ));
+            }
+            (r.at, s)
+        })
+        .collect();
+    if d.decided.is_some() {
+        match deadline.step(zam_store::entry_revisions(db, e.id)).await {
+            Some(Ok(revs)) => {
+                for rev in revs {
+                    let Some(reason) = rev.reason.as_deref().filter(|r| !r.trim().is_empty())
+                    else {
+                        continue;
+                    };
+                    let decided = zam_store::IdeaData::from_stored(&rev.data).decided;
+                    if let Some(dc) = decided.filter(|dc| dc.by == zam_store::AnswerBy::Human) {
+                        out.push((
+                            rev.ts,
+                            format!(
+                                "{} довод человека ({}): {}",
+                                utc_date(rev.ts),
+                                dc.decision.as_str(),
+                                pack_text(reason, IDEA_REVIEW_REASON_CHARS)
+                            ),
+                        ));
+                    }
+                }
+            }
+            Some(Err(err)) => {
+                tracing::warn!(error = %err, "recall: ревизии идеи пакета не прочитаны");
+            }
+            None => {}
+        }
+    }
+    out.sort_by_key(|(t, _)| *t);
+    out.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Похожие записи идеи `e` пакета `idea_review` (M6.5 §7): внутренний поиск в пространстве
+/// решения запроса по заголовку и началу тела идеи (`mode=brief`, видов
+/// [`IDEA_REVIEW_KINDS`], статусов [`IDEA_REVIEW_STATUSES`], решения — `insight_kinds
+/// [decision]`, `top_k` [`IDEA_REVIEW_TOP_K`], `budget_tokens` запроса или
+/// [`IDEA_REVIEW_BUDGET`], без кэша выжимок, без реранка, без учёта выданного). FTS — сразу
+/// ослабленным запросом ([`LightSearch::any_terms`]): строгий по тексту идеи находил бы её одну.
+/// Сама идея исключается, остальные — до [`IDEA_REVIEW_SIMILAR_MAX`] строк
+/// `<ссылка> · <вид insight> · <статус> · «<заголовок>»` (у заметки — путь); у отклонённой идеи
+/// — ` — разбор: <первая строка>` ([`decline_reason`]). `None` — срок вышел или поиск не удался.
+#[allow(clippy::too_many_arguments)]
+async fn review_similar(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    req: &RecallReq,
+    e: &Entry,
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Result<Option<Vec<String>>, ApiError> {
+    let query: String = format!("{}\n{}", e.title, e.body)
+        .chars()
+        .take(zam_store::search::QUERY_MAX_CHARS)
+        .collect();
+    let body = json!({
+        "query": query,
+        "scope": {"solution": req.solution, "include_knowledge": false, "include_rules": false},
+        "filters": {
+            "kinds": IDEA_REVIEW_KINDS,
+            "status": IDEA_REVIEW_STATUSES,
+            "insight_kinds": ["decision"],
+        },
+        "mode": "brief",
+        "top_k": IDEA_REVIEW_TOP_K,
+        "budget_tokens": req.budget_tokens.unwrap_or(IDEA_REVIEW_BUDGET),
+        // отсечка карточек поиска (M6 §4.2) — не для похожих: их немного, порядок — по баллу
+        "brief_min_rel": 0.0,
+        "rerank": "off",
+        "skip_seen": false,
+        "no_cache": true,
+        "format": "json",
+    });
+    let light = LightSearch {
+        channel_depth: (4 * IDEA_REVIEW_TOP_K).max(IDEA_LIGHT_DEPTH_MIN),
+        snippets: false,
+        any_terms: true,
+    };
+    let area = req.area.as_deref();
+    let Some(v) = inner_search(st, p, headers, area, body, Some(light), health, deadline).await?
+    else {
+        return Ok(None);
+    };
+    let targets = health.targets();
+    let mut out: Vec<String> = Vec::new();
+    for it in v["items"].as_array().into_iter().flatten() {
+        if out.len() == IDEA_REVIEW_SIMILAR_MAX {
+            break;
+        }
+        let kind = it["kind"].as_str().unwrap_or_default();
+        let id = |k: &str| it[k].as_str().and_then(|s| s.parse::<Id>().ok());
+        let (reference, entry) = match (id("entry_id"), id("node_id")) {
+            (Some(eid), _) => {
+                if eid == e.id {
+                    continue;
+                }
+                let Some(k) = EntryKind::parse(kind) else {
+                    continue;
+                };
+                (format!("{}:{eid}", k.ref_letter()), Some((k, eid)))
+            }
+            (None, Some(nid)) => (format!("n:{nid}"), None),
+            (None, None) => continue,
+        };
+        let mut parts = vec![reference];
+        for k in ["insight_kind", "status"] {
+            if let Some(v) = it[k].as_str().filter(|v| !v.is_empty()) {
+                parts.push(v.to_string());
+            }
+        }
+        let line = match entry {
+            Some(_) => format!(
+                "«{}»",
+                zam_markdown::mask_text(&clip(
+                    it["title"].as_str().unwrap_or_default(),
+                    IDEA_TITLE_CHARS
+                ))
+            ),
+            None => zam_markdown::mask_text(&clip(
+                it["path"].as_str().unwrap_or_default(),
+                IDEA_TITLE_CHARS,
+            )),
+        };
+        parts.push(line);
+        let mut s = parts.join(" · ");
+        // отклонённая идея — с причиной: повтор без новых доводов агент отклоняет (§8)
+        if let Some((EntryKind::Idea, eid)) = entry
+            && it["status"] == "declined"
+        {
+            let db = it["space"]["id"]
+                .as_str()
+                .and_then(|sp| sp.parse::<Id>().ok())
+                .and_then(|sp| targets.iter().find(|t| t.spaces.iter().any(|x| x.id == sp)))
+                .map(|t| t.db.clone());
+            if let Some(db) = db
+                && let Some(why) = decline_reason(&db, eid, deadline).await
+            {
+                s.push_str(&format!(" — разбор: {why}"));
+            }
+        }
+        out.push(s);
+    }
+    Ok(Some(out))
+}
+
+/// Причина отклонения идеи `id` для строки похожей записи: первая строка разбора агента, если
+/// отклонил он (`data.review`, исход `decline`), иначе — причина последней ревизии с причиной
+/// (решение человека «Отказаться»). Нет причины, сбой чтения, срок — `None`.
+async fn decline_reason(db: &zam_store::Db, id: Id, deadline: &mut Deadline) -> Option<String> {
+    let e = match deadline.step(zam_store::get_entry(db, id)).await? {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(error = %err, "recall: похожая идея пакета не прочитана");
+            return None;
+        }
+    };
+    let d = zam_store::IdeaData::from_stored(&e.data);
+    let by_review = d
+        .decided
+        .as_ref()
+        .is_some_and(|dc| dc.channel == zam_store::DecidedVia::Review);
+    if let Some(r) = d
+        .review
+        .as_ref()
+        .filter(|r| by_review && r.outcome == zam_store::ReviewOutcome::Decline)
+    {
+        return Some(pack_text(&r.summary, IDEA_REVIEW_LINE_CHARS));
+    }
+    match deadline.step(zam_store::entry_revisions(db, id)).await? {
+        Ok(revs) => revs
+            .iter()
+            .rev()
+            .find_map(|r| r.reason.as_deref().filter(|s| !s.trim().is_empty()))
+            .map(|s| pack_text(s, IDEA_REVIEW_LINE_CHARS)),
+        Err(err) => {
+            tracing::warn!(error = %err, "recall: ревизии похожей идеи не прочитаны");
+            None
+        }
+    }
 }
 
 /// Подсказки-идеи к `prompt` (§6.2): отдельный лёгкий поиск после основного (`mode=brief`,
@@ -1293,6 +1833,10 @@ async fn digest_ideas(
 ///
 /// Срок — остаток общего (до общего срока сбора минус `ACCOUNTING_RESERVE_MS`): не уложился —
 /// тишина по идеям без предупреждений (ни `recall timeout`, ни ошибок поиска идей).
+///
+/// `review` — режим `review` владельца базы решения (M6.5 §7): идея решения `new` — строка
+/// [`idea_review_prompt_line`] (`reason: idea_review`) вместо «предложи»; прочие — по M5.7.
+#[allow(clippy::too_many_arguments)]
 async fn prompt_ideas(
     st: &AppState,
     p: &Principal,
@@ -1301,6 +1845,7 @@ async fn prompt_ideas(
     session: Option<&RequestSession>,
     health: &mut Health<'_>,
     deadline: &Deadline,
+    review: bool,
 ) -> Result<Vec<Cand>, ApiError> {
     let max = st.cfg.ideas.prompt_max as usize;
     if max == 0 {
@@ -1322,7 +1867,7 @@ async fn prompt_ideas(
         expired: deadline.expired,
     };
     let warned = health.warnings.len();
-    let r = collect_prompt_ideas(st, p, headers, req, &query, health, &mut own).await;
+    let r = collect_prompt_ideas(st, p, headers, req, &query, health, &mut own, review).await;
     health.warnings.truncate(warned);
     if own.expired {
         return Ok(Vec::new());
@@ -1559,6 +2104,7 @@ type FoundIdea = (usize, Entry, bool, Option<&'static str>);
 /// Первый проход [`prompt_ideas`] (`status [new, deferred]`) со своим сроком `d`. Ошибки
 /// чтения баз не трогают `health.alive`: иначе сбой поиска идей снял бы основные подсказки той
 /// же цели.
+#[allow(clippy::too_many_arguments)]
 async fn collect_prompt_ideas(
     st: &AppState,
     p: &Principal,
@@ -1567,6 +2113,7 @@ async fn collect_prompt_ideas(
     query: &str,
     health: &mut Health<'_>,
     d: &mut Deadline,
+    review: bool,
 ) -> Result<Vec<Cand>, ApiError> {
     match any_prompt_candidates(p, health, d).await {
         Some(true) => {}
@@ -1595,7 +2142,14 @@ async fn collect_prompt_ideas(
     Ok(found
         .iter()
         .filter(|(_, e, shared, _)| !shared || related.contains(&e.id))
-        .map(|(i, e, _, mark)| idea_cand(*i, e, idea_prompt_line(e, *mark)))
+        .map(|(i, e, shared, mark)| {
+            // идея решения `new` в режиме `review` — в очереди разбора (M6.5 §7)
+            if review && !shared && e.status == Some(EntryStatus::New) {
+                idea_review_cand(*i, e, idea_review_prompt_line(e))
+            } else {
+                idea_cand(*i, e, idea_prompt_line(e, *mark))
+            }
+        })
         .collect())
 }
 
@@ -1797,6 +2351,7 @@ fn idea_light_search(top_k: usize) -> LightSearch {
     LightSearch {
         channel_depth: (4 * top_k).max(IDEA_LIGHT_DEPTH_MIN),
         snippets: false,
+        any_terms: false,
     }
 }
 
@@ -2075,8 +2630,37 @@ async fn environment_cands(
         .collect())
 }
 
+/// Строка плана (M6.5 §7, [`PLAN_LINE`]): в решении запроса есть пункты плана из идей —
+/// живые задачи `open | in_progress | blocked` с ребром `derived_from` на идею
+/// ([`zam_store::planned_from_ideas`]). Нет пунктов, нет права записи (взять пункт плана нельзя),
+/// цель исключена или срок вышел — строки нет; сбой чтения — WARN, дайджест не валится.
+async fn plan_line(
+    p: &Principal,
+    health: &Health<'_>,
+    deadline: &mut Deadline,
+    sol: Option<(usize, Id)>,
+) -> Option<String> {
+    let (i, space) = sol?;
+    let t = &health.targets()[i];
+    if !health.alive[i] || !ideas_writable(p, t) {
+        return None;
+    }
+    match deadline
+        .step(zam_store::planned_from_ideas(&t.db, space))
+        .await?
+    {
+        Ok((n, Some(next))) if n > 0 => Some(plan_text(n, &next)),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: пункты плана из идей не прочитаны");
+            None
+        }
+    }
+}
+
 /// Разделы дайджеста `session_start` (см. модуль); каждый — кандидаты по приоритету.
 /// `recovery` — пакет восстановления: после ответов — раздел решений ([`decision_cands`]).
+/// `plan` — строка плана из идей ([`plan_line`]; режим `review`, идеи включены).
 #[allow(clippy::too_many_arguments)]
 async fn digest(
     st: &AppState,
@@ -2085,6 +2669,7 @@ async fn digest(
     req: &RecallReq,
     recovery: bool,
     code_on: bool,
+    plan: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Digest, ApiError> {
@@ -2140,6 +2725,12 @@ async fn digest(
     )
     .await?;
     sections.push((Some(SECTION_TASKS), tasks));
+    // строка плана из идей (M6.5 §7) — за задачами
+    let plan_line = if plan {
+        plan_line(p, health, deadline, sol).await
+    } else {
+        None
+    };
     // ответы человека и открытые вопросы — сразу после задач (M4.5 §4)
     let (answers, open_line) = question_cands(health, deadline, &insight_spaces).await?;
     sections.push((Some(SECTION_ANSWERS), answers));
@@ -2354,6 +2945,9 @@ async fn digest(
     let lines = Lines {
         notices,
         open_line,
+        plan_line,
+        // длину очереди разбора ставит [`recall`] вместе с идеями дайджеста
+        ideas_queue: 0,
         after_rules,
         code_line,
         code_map,
@@ -2856,6 +3450,10 @@ async fn decision_cands(
 struct Lines {
     notices: Vec<String>,
     open_line: Option<String>,
+    /// Строка плана из идей ([`plan_line`]): за разделом задач.
+    plan_line: Option<String>,
+    /// Длина очереди разбора (строка [`IDEAS_REVIEW_HINT`]); 0 — очереди нет.
+    ideas_queue: usize,
     /// Строки словаря и проверенных команд — с адресом снятой строки ([`Omit`]).
     after_rules: Vec<(String, Omit)>,
     /// Строка карты кода (M5.6 §10): в дайджесте и восстановлении — резерв вместе с Rules, под
@@ -3878,13 +4476,22 @@ fn section_limit(
             _ => BRIEF_ENTRIES_MAX,
         };
     }
+    // пакет разбора идей: очередь уже отобрана по `limit` ([`review_pack`])
+    if event == Event::IdeaReview {
+        return usize::MAX;
+    }
     match title {
         Some(SECTION_RULES) => RULES_MAX,
         Some(SECTION_ENVIRONMENT) => ENVIRONMENT_MAX,
         Some("### Решение") => SOLUTION_ROOT_MAX,
         Some(_) => entries,
         None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,
-        None if cands.iter().any(|c| c.reason == REASON_IDEA) => ideas_max,
+        None if cands
+            .iter()
+            .any(|c| matches!(c.reason, REASON_IDEA | REASON_IDEA_REVIEW)) =>
+        {
+            ideas_max
+        }
         None => limit,
     }
 }
@@ -3894,8 +4501,11 @@ fn section_limit(
 /// `session_seen`, ни `usage`). Уведомления — первыми; в пакете восстановления — после задач,
 /// ответов и решений (§9.2), а если других разделов нет — в конце. Открытые вопросы — после
 /// ответов (в пакете — вместе с уведомлениями), за ними — раздел [`SECTION_IDEAS`] (`ideas`,
-/// строка-указание — в заголовке: она выводится, только если вошла хоть одна идея), строки
-/// словаря, проверенных команд и карты кода и мини-карта [`SECTION_CODE_MAP`] — после правил.
+/// строка-указание — в заголовке: она выводится, только если вошла хоть одна идея; есть идея
+/// очереди разбора — раздел [`SECTION_IDEAS_REVIEW`] со строкой [`IDEAS_REVIEW_HINT`], M6.5
+/// §7), строки словаря, проверенных команд и карты кода и мини-карта [`SECTION_CODE_MAP`] —
+/// после правил. Строка плана из идей — сразу за задачами. Раздел пакета `idea_review` — со
+/// строкой шагов разбора [`IDEA_REVIEW_STEPS`] в заголовке.
 /// `rules_reserved` — раздел Rules — резерв сверх бюджета (дайджест и пакет восстановления,
 /// M6 §8; у `brief` — L0 Rules в бюджете).
 fn arrange<'c>(
@@ -3908,6 +4518,8 @@ fn arrange<'c>(
     let Lines {
         notices,
         mut open_line,
+        plan_line,
+        ideas_queue,
         after_rules,
         code_line,
         code_map,
@@ -3933,10 +4545,14 @@ fn arrange<'c>(
         {
             out.notices(&mut notices, &mut open_line);
         }
-        let mut sec = Section::new(
-            title.map(str::to_string),
-            cands.iter().map(|c| c.block.clone()).collect(),
-        );
+        // пакет разбора идей: строка шагов — под заголовком, выводится вместе с ним
+        let head = match title {
+            Some(SECTION_IDEAS_REVIEW) => {
+                Some(format!("{SECTION_IDEAS_REVIEW}\n{IDEA_REVIEW_STEPS}"))
+            }
+            t => t.map(str::to_string),
+        };
+        let mut sec = Section::new(head, cands.iter().map(|c| c.block.clone()).collect());
         sec.reserved = rules_reserved && title == Some(SECTION_RULES);
         sec.keep = keep_of(title);
         sec.omit = omit_of(title);
@@ -3953,6 +4569,12 @@ fn arrange<'c>(
         }
         out.packed.push(sec);
         out.picked.push(cands);
+        if title == Some(SECTION_TASKS)
+            && let Some(l) = &plan_line
+        {
+            out.line(None, vec![l.clone()], KEEP_POINTERS);
+            out.omit_last(OMIT_PLAN);
+        }
         if title == Some(SECTION_ANSWERS)
             && !recovery
             && let Some(line) = open_line.take()
@@ -3961,19 +4583,31 @@ fn arrange<'c>(
             out.omit_last(OMIT_OPEN_QUESTIONS);
         }
         if title == Some(SECTION_ANSWERS) && !recovery && !ideas.is_empty() {
-            let mut sec = Section::new(
-                Some(format!(
+            // очередь разбора (M6.5 §7) — свой заголовок и строка-указание; хвост кандидатов
+            // предложения несёт указание `propose` в строке ([`idea_tail_line`])
+            let review = ideas.iter().any(|c| c.reason == REASON_IDEA_REVIEW);
+            let head = if review {
+                format!("{SECTION_IDEAS_REVIEW}\n{}", ideas_review_hint(ideas_queue))
+            } else {
+                format!(
                     "{SECTION_IDEAS}\n{IDEAS_HINT}{}",
                     if ideas.iter().any(|c| c.block.contains(REOPEN_MARK_TAIL)) {
                         IDEAS_HINT_REOPEN
                     } else {
                         ""
                     }
-                )),
-                ideas.iter().map(|c| c.block.clone()).collect(),
-            );
+                )
+            };
+            let mut sec = Section::new(Some(head), ideas.iter().map(|c| c.block.clone()).collect());
             sec.keep = KEEP_MANDATORY;
-            sec.omit = Some(("идей".into(), "memory_search kinds=[idea]".into()));
+            sec.omit = Some(if review {
+                (
+                    "идей на разбор".into(),
+                    "memory_recall event=idea_review".into(),
+                )
+            } else {
+                ("идей".into(), "memory_search kinds=[idea]".into())
+            });
             out.packed.push(sec);
             out.picked.push(std::mem::take(&mut ideas));
         }
@@ -4037,6 +4671,9 @@ const OMIT_SNAPSHOT: Omit = ("строк снимка сессии", "WebUI «С
 
 /// Адрес снятой строки открытых вопросов.
 const OMIT_OPEN_QUESTIONS: Omit = ("строк открытых вопросов", "memory_search kinds=[question]");
+
+/// Адрес снятой строки плана из идей.
+const OMIT_PLAN: Omit = ("строк плана из идей", "memory_search kinds=[task]");
 
 /// Адрес снятого блока `(что, где полностью)` — строка «не показано — <что>: N (<где>)».
 type Omit = (&'static str, &'static str);
@@ -4140,6 +4777,15 @@ pub async fn recall(
             "timeout_ms: от 1 до {max_timeout} (max(recall.max_timeout_ms, recall.timeout_ms))"
         )));
     }
+    if req.event == Event::IdeaReview
+        && req
+            .limit
+            .is_some_and(|l| !(1..=IDEA_REVIEW_LIMIT_MAX).contains(&l))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "limit: от 1 до {IDEA_REVIEW_LIMIT_MAX}"
+        )));
+    }
     let area = zam_store::normalize_area(req.area.as_deref());
     if area.as_ref().is_some_and(|a| {
         a.chars().count() > zam_store::AREA_MAX_CHARS || a.chars().any(char::is_control)
@@ -4211,7 +4857,8 @@ pub async fn recall(
     // контрольная группа агентного A/B (M6 §12): хукам — пустой `text` (сбор идёт как обычно,
     // учёт — вызов без токенов); инструмент MCP агент зовёт сам — ему как обычно. Сбой чтения
     // — WARN, не контрольная группа
-    let holdout = match (&session, origin.is_none()) {
+    // пакет разбора идей — явный вызов агента или `zam idea queue`, не подсказка хука: без A/B
+    let holdout = match (&session, origin.is_none() && req.event != Event::IdeaReview) {
         (Some(s), true) => session_holdout(&s.db, &s.touch.id, req.parent_id.as_deref())
             .await
             .unwrap_or_else(|e| {
@@ -4253,6 +4900,8 @@ pub async fn recall(
         st.cfg.recall.recovery_tokens
     } else if brief_event {
         st.cfg.recall.brief_tokens
+    } else if req.event == Event::IdeaReview {
+        IDEA_REVIEW_BUDGET
     } else {
         st.cfg.recall.digest_tokens
     });
@@ -4289,7 +4938,13 @@ pub async fn recall(
     }
     // сбор — до срока минус резерв на учёт показа; учёт — только до полного срока
     // срок — из тела (нативный клиент, CR-7) или `recall.timeout_ms` (бюджет хуков)
-    let timeout = req.timeout_ms.unwrap_or(st.cfg.recall.timeout_ms);
+    // пакет разбора идей — явный вызов агента с поиском на каждую идею: по умолчанию — верхний
+    // предел поля, а не бюджет хука
+    let timeout = req.timeout_ms.unwrap_or(if req.event == Event::IdeaReview {
+        max_timeout
+    } else {
+        st.cfg.recall.timeout_ms
+    });
     let total_deadline = t0 + Duration::from_millis(timeout);
     let mut deadline = Deadline {
         at: t0 + Duration::from_millis(timeout - ACCOUNTING_RESERVE_MS.min(timeout / 2)),
@@ -4313,25 +4968,40 @@ pub async fn recall(
         && matches!(req.event, Event::SessionStart | Event::Prompt)
         && !recovery
         && ideas_enabled(&st, &flags);
+    // режим идей (M6.5 §7) — владельца базы решения, одним чтением на запрос и только когда
+    // нужен: раздел и подсказки идей, строка плана (и в пакете восстановления), пакет разбора
+    let plan_on = enabled
+        && matches!(req.event, Event::SessionStart | Event::Recovery)
+        && ideas_enabled(&st, &flags);
+    let mode = if ideas_on || plan_on || req.event == Event::IdeaReview {
+        solution_ideas_mode(&st, &targets, user, &flags).await
+    } else {
+        flags.ideas_mode
+    };
+    let review = mode == IdeasMode::Review;
     let mut idea_cands: Vec<Cand> = Vec::new();
     let (mut lines, sections, repeatable) = match req.event {
         _ if !enabled => (Lines::default(), Vec::new(), true),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
         // `session_id`, а контекст агента уже потерян (показ всё равно отмечается)
         Event::SessionStart | Event::Recovery => {
-            let (l, s) = digest(
+            let (mut l, s) = digest(
                 &st,
                 &p,
                 &sh,
                 &req,
                 recovery,
                 code_on,
+                plan_on && review,
                 &mut health,
                 &mut deadline,
             )
             .await?;
             if ideas_on {
-                idea_cands = digest_ideas(&st, &p, session.as_ref(), &health, &mut deadline).await;
+                let (c, n) =
+                    digest_ideas(&st, &p, session.as_ref(), &health, &mut deadline, review).await;
+                idea_cands = c;
+                l.ideas_queue = n;
             }
             (l, s, true)
         }
@@ -4343,7 +5013,8 @@ pub async fn recall(
             let c = prompt_hints(&st, &p, &sh, &req, &mut health, &mut deadline).await?;
             // идеи — отдельным поиском после основного, своей строкой и своим пределом
             let ideas = if ideas_on {
-                prompt_ideas(&st, &p, &sh, &req, session.as_ref(), &mut health, &deadline).await?
+                let s = session.as_ref();
+                prompt_ideas(&st, &p, &sh, &req, s, &mut health, &deadline, review).await?
             } else {
                 Vec::new()
             };
@@ -4368,6 +5039,11 @@ pub async fn recall(
             }
             (Lines::default(), s, true)
         }
+        // пакет разбора идей повторяется: агент зовёт его сам (показ отмечается)
+        Event::IdeaReview => {
+            let (l, c) = review_pack(&st, &p, &sh, &req, mode, &mut health, &mut deadline).await?;
+            (l, vec![(Some(SECTION_IDEAS_REVIEW), c)], true)
+        }
     };
     // без повторов: показанное сессии, повторы между разделами, исключённые цели; ответ на
     // вопрос показывается сессии один раз и в повторяемом дайджесте, а в пакете восстановления —
@@ -4386,7 +5062,7 @@ pub async fn recall(
         shown(session.as_ref(), &targets, &all).await
     };
     let limit = match req.event {
-        Event::SessionStart | Event::Recovery | Event::Brief => usize::MAX,
+        Event::SessionStart | Event::Recovery | Event::Brief | Event::IdeaReview => usize::MAX,
         Event::Prompt => PROMPT_MAX,
         Event::PostTool => POST_TOOL_MAX,
     };
@@ -4669,7 +5345,8 @@ mod tests {
                 idea_light_search(top_k),
                 LightSearch {
                     channel_depth: depth,
-                    snippets: false
+                    snippets: false,
+                    any_terms: false
                 },
                 "top_k {top_k}"
             );

@@ -2457,6 +2457,31 @@ pub async fn proactive_ideas(
     seen: &HashSet<Id>,
     limit: usize,
 ) -> Result<Vec<Entry>, StoreError> {
+    candidate_ideas(db, spaces, today, seen, limit, true).await
+}
+
+/// Кандидаты предложения вопросом в режиме `review` (M6.5 §7, «прочие случаи M5.7»): те же, что
+/// у [`proactive_ideas`], но без `new` — новые идеи разбирает агент ([`review_queue`]). Остаются
+/// состояния, которые выбрал человек: `deferred` с наступившим `horizon` и `accepted` со снятой
+/// или удалённой задачей; порядок и предел — как у [`proactive_ideas`].
+pub async fn proposal_ideas(
+    db: &Db,
+    spaces: &[Id],
+    today: Date,
+    limit: usize,
+) -> Result<Vec<Entry>, StoreError> {
+    candidate_ideas(db, spaces, today, &HashSet::new(), limit, false).await
+}
+
+/// Отбор [`proactive_ideas`]; `with_new` — вместе с идеями `new` (режим `propose`).
+async fn candidate_ideas(
+    db: &Db,
+    spaces: &[Id],
+    today: Date,
+    seen: &HashSet<Id>,
+    limit: usize,
+    with_new: bool,
+) -> Result<Vec<Entry>, StoreError> {
     if spaces.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
@@ -2464,6 +2489,7 @@ pub async fn proactive_ideas(
     let mut args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
     args.push(today.to_string());
     let seen = seen.clone();
+    let new = if with_new { "e.status = 'new' OR " } else { "" };
     // в выдаче SQL не больше `seen` лишних: снятая задача и открытый вопрос «вернуть»
     // отсекаются уже в SQL (иначе предложенные идеи с новым `updated_at` вытесняли бы прочие
     // под `LIMIT`), предикат — вторая линия
@@ -2473,8 +2499,7 @@ pub async fn proactive_ideas(
             "SELECT {ENTRY_COLS} FROM entries e INDEXED BY entries_feed
              WHERE e.space_id IN ({}) AND e.kind = 'idea' AND e.deleted_at IS NULL
                AND json_extract(e.data, '$.origin') = 'human'
-               AND (e.status = 'new'
-                    OR (e.status = 'deferred' AND json_extract(e.data, '$.horizon') <= ?{})
+               AND ({new}(e.status = 'deferred' AND json_extract(e.data, '$.horizon') <= ?{})
                     OR (e.status = 'accepted' AND {RELEASED_SQL}
                         AND {NOT_REOPEN_PROPOSED_SQL}))
              ORDER BY e.status = 'accepted',
@@ -2506,6 +2531,84 @@ pub async fn proactive_ideas(
             }
         }
         Ok(out)
+    })
+    .await
+}
+
+/// SQL очереди разбора (M6.5 §7): живые идеи человека `new` пространства `?1`. Решения
+/// человека отдельно не проверяются: идея, по которой человек решил сам, уже не `new` (решение
+/// составителя плана M6.5, п. 3).
+const REVIEW_QUEUE_SQL: &str = "FROM entries e INDEXED BY entries_feed
+     WHERE e.space_id = ?1 AND e.kind = 'idea' AND e.deleted_at IS NULL AND e.status = 'new'
+       AND json_extract(e.data, '$.origin') = 'human'";
+
+/// Очередь разбора идей агентом (M6.5 §7): живые идеи человека `new` пространства `space` —
+/// `high` первыми, затем самые старые (`created_at`); не больше `limit`.
+pub async fn review_queue(db: &Db, space: Id, limit: usize) -> Result<Vec<Entry>, StoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {ENTRY_COLS} {REVIEW_QUEUE_SQL}
+             ORDER BY CASE json_extract(e.data, '$.priority')
+                          WHEN 'high' THEN 2 WHEN 'low' THEN 0 ELSE 1 END DESC,
+                      e.created_at, e.id
+             LIMIT ?2"
+        ))?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = st.query_map(params![space, limit], entry_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// Длина очереди разбора [`review_queue`] пространства `space` (строка «Непросмотренных идей:
+/// N» дайджеста).
+pub async fn review_queue_len(db: &Db, space: Id) -> Result<usize, StoreError> {
+    db.read(move |c| {
+        let n: i64 = c
+            .prepare_cached(&format!("SELECT count(*) {REVIEW_QUEUE_SQL}"))?
+            .query_row([space], |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    })
+    .await
+}
+
+/// SQL «пункт плана из идей» (M6.5 §7): живая задача `open | in_progress | blocked`
+/// пространства `?1` с системным ребром `derived_from` на живую идею — то же ребро, что у
+/// [`ideas_of_task`].
+const PLANNED_SQL: &str = "FROM entries e
+     WHERE e.space_id = ?1 AND e.kind = 'task' AND e.deleted_at IS NULL
+       AND e.status IN ('open', 'in_progress', 'blocked')
+       AND EXISTS (SELECT 1 FROM edges g JOIN entries i ON i.id = g.dst_id
+                   WHERE g.src_kind = 'entry' AND g.src_id = e.id AND g.dst_kind = 'entry'
+                     AND g.type = 'derived_from' AND g.origin = 'system'
+                     AND g.deleted_at IS NULL
+                     AND i.kind = 'idea' AND i.deleted_at IS NULL)";
+
+/// Строка плана дайджеста (M6.5 §7): число пунктов плана из идей пространства `space`
+/// ([`PLANNED_SQL`]) и следующий — по `data.priority` (`high`, `normal`, `low`; нет — `normal`),
+/// затем самый старый (`created_at`). Пунктов нет — `(0, None)`.
+pub async fn planned_from_ideas(db: &Db, space: Id) -> Result<(usize, Option<Entry>), StoreError> {
+    db.read(move |c| {
+        let n: i64 = c
+            .prepare_cached(&format!("SELECT count(*) {PLANNED_SQL}"))?
+            .query_row([space], |r| r.get(0))?;
+        if n == 0 {
+            return Ok((0, None));
+        }
+        let next = c
+            .prepare_cached(&format!(
+                "SELECT {ENTRY_COLS} {PLANNED_SQL}
+                 ORDER BY CASE json_extract(e.data, '$.priority')
+                              WHEN 'high' THEN 2 WHEN 'low' THEN 0 ELSE 1 END DESC,
+                          e.created_at, e.id
+                 LIMIT 1"
+            ))?
+            .query_row([space], entry_row)
+            .optional()?;
+        Ok((usize::try_from(n).unwrap_or(0), next))
     })
     .await
 }

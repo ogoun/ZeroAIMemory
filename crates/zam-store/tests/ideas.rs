@@ -2558,6 +2558,7 @@ async fn fts_light_search_depth_and_snippets() {
     let light = |depth: usize, snippets: bool| LightSearch {
         channel_depth: depth,
         snippets,
+        any_terms: false,
     };
     // слово с подчёркиванием и цифрой — идентификатор: работает и канал trigram
     let text = "экспорт отчётов report_v";
@@ -2608,6 +2609,52 @@ async fn fts_light_search_depth_and_snippets() {
         .await
         .unwrap();
     assert_eq!(l.bm25.len(), 1);
+}
+
+/// M6.5, задача 4: `any_terms` — канал bm25 сразу ослабленным запросом (любое слово). Запрос —
+/// текст самой записи (похожие пакета разбора идей): строгий находит только её, ослабленный — и
+/// записи с частью слов. Запрос из одного слова — строгий и с `any_terms`.
+#[tokio::test]
+async fn fts_light_any_terms_relaxed_first() {
+    use zam_store::search::{FtsChannels, FtsQuery, TargetFilter, search_fts_channels};
+    use zam_store::{LightSearch, search_fts_channels_light};
+    let (db, sol, _) = setup("fts-any").await;
+    let text = "Экспорт выгрузки продаж";
+    let me = new_idea(&db, sol, text, "human", "normal").await;
+    let other = new_idea(&db, sol, "Печать продаж", "human", "normal").await;
+    let q = |text: &str| FtsQuery {
+        alias_groups: Vec::new(),
+        text: text.into(),
+        space_ids: vec![sol],
+        path_prefix: None,
+        top_k: 100,
+        targets: TargetFilter {
+            kinds: vec!["idea".into()],
+            ..TargetFilter::default()
+        },
+    };
+    let found = |ch: &FtsChannels| -> HashSet<Id> { ch.bm25.iter().map(|h| h.target.id).collect() };
+    let any = LightSearch {
+        channel_depth: 50,
+        snippets: false,
+        any_terms: true,
+    };
+    let strict = search_fts_channels(&db, q(text)).await.unwrap();
+    assert_eq!(found(&strict), [me.id].into_iter().collect::<HashSet<_>>());
+    assert!(!strict.relaxed);
+    let relaxed = search_fts_channels_light(&db, q(text), any).await.unwrap();
+    assert_eq!(
+        found(&relaxed),
+        [me.id, other.id].into_iter().collect::<HashSet<_>>()
+    );
+    assert!(relaxed.relaxed);
+    // сама запись — первой: в ней все слова запроса
+    assert_eq!(relaxed.bm25[0].target.id, me.id);
+    let one = search_fts_channels_light(&db, q("продаж"), any)
+        .await
+        .unwrap();
+    assert!(!one.relaxed);
+    assert_eq!(found(&one).len(), 2);
 }
 
 /// Время ревизии, которой задача `task` последний раз стала `done` (первая ревизия последней
