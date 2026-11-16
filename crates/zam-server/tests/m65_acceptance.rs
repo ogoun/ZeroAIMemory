@@ -308,6 +308,26 @@ fn after(text: &str, prefix: &str) -> String {
         .to_string()
 }
 
+/// `detail` ответа problem+json (нет — паника с телом).
+fn detail_of(r: &Resp) -> String {
+    r.json()["detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("нет detail: {}", r.text()))
+        .to_string()
+}
+
+/// Отказ инструмента MCP: `isError`, «Ошибка <status>» и причина problem — его `detail`
+/// (MCP пишет «Ошибка <код> <title>: <detail>»; `title` у 409 общий — «Conflict», поэтому
+/// разные problem различаются по `detail`).
+fn mcp_refusal(text: &str, is_error: bool, status: u16, detail: &str) {
+    assert!(is_error, "ожидалась ошибка инструмента: {text}");
+    assert!(
+        text.starts_with(&format!("Ошибка {status} ")),
+        "ожидалась «Ошибка {status}»: {text}"
+    );
+    assert!(text.contains(detail), "нет причины «{detail}»: {text}");
+}
+
 /// Строки аудита `action` по цели `target`.
 async fn audit_of(a: &Api, action: &str, target: &str) -> Vec<zam_store::AuditRow> {
     a.st.system
@@ -907,6 +927,8 @@ async fn acceptance_refusals() {
     let ag = idea_tok(&a, "Своя идея агента", "agent").await;
     let r = review(&a, &ag, plan.clone()).await;
     problem(&r, StatusCode::CONFLICT, "idea-agent-origin", "идея агента");
+    let agent_detail = detail_of(&r);
+    assert!(agent_detail.contains("идея от агента"), "{agent_detail}");
     let (t, err) = mcp(
         &a,
         "f1",
@@ -915,7 +937,9 @@ async fn acceptance_refusals() {
                "summary": summary("Решение — в план.")}),
     )
     .await;
-    assert!(err && t.contains("Ошибка 409"), "{t}");
+    // в ответе MCP — причина problem (`detail`), а не только код: idea-agent-origin, не idea-mode
+    mcp_refusal(&t, err, 409, &agent_detail);
+    assert!(!t.contains("ideas.mode"), "{t}");
     // общая идея Knowledge — 422 (остаётся по M5.7)
     let kn = idea_web(&a, KN, "Общая идея", "Замысел.", json!({})).await;
     let r = review(&a, &kn, plan.clone()).await;
@@ -998,7 +1022,11 @@ async fn acceptance_refusals() {
     // режим review: предлагать новую идею вопросом нельзя — её разбирает агент (REST и MCP)
     let r = post_tok(&a, &i, "propose", json!({"text": "подходит к задаче"})).await;
     problem(&r, StatusCode::CONFLICT, "idea-mode", "propose идеи new");
-    assert!(r.text().contains("action=review"), "{}", r.text());
+    let mode_detail = detail_of(&r);
+    assert!(
+        mode_detail.contains("ideas.mode = review") && mode_detail.contains("action=review"),
+        "{mode_detail}"
+    );
     let (t, err) = mcp(
         &a,
         "f1",
@@ -1006,7 +1034,8 @@ async fn acceptance_refusals() {
         json!({"id": w(&i), "action": "propose", "text": "подходит к задаче"}),
     )
     .await;
-    assert!(err && t.contains("Ошибка 409"), "{t}");
+    mcp_refusal(&t, err, 409, &mode_detail);
+    assert!(!t.contains("идея от агента"), "{t}");
     assert_eq!(get(&a, &i).await["status"], "new");
 
     // решение человека агент не пересматривает: «Отложить», «Отказаться» в WebUI, «Начать» из
@@ -1634,7 +1663,11 @@ async fn acceptance_propose_mode_is_m57() {
         "idea-mode",
         "review в режиме propose",
     );
-    assert!(r.text().contains("propose"), "{}", r.text());
+    let off_detail = detail_of(&r);
+    assert!(
+        off_detail.contains("ideas.mode = propose") && off_detail.contains("action=propose"),
+        "{off_detail}"
+    );
     let (t, err) = mcp(
         &a,
         "p1",
@@ -1643,7 +1676,7 @@ async fn acceptance_propose_mode_is_m57() {
                "summary": summary("Решение — в план.")}),
     )
     .await;
-    assert!(err && t.contains("Ошибка 409"), "{t}");
+    mcp_refusal(&t, err, 409, &off_detail);
     let (t, err) = mcp(&a, "p1", "memory_recall", json!({"event": "idea_review"})).await;
     assert!(!err, "{t}");
     assert!(
