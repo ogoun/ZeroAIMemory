@@ -1580,10 +1580,7 @@ fn idea(c: IdeaCmd) -> Result<(), CliError> {
                 origin,
             )
         }
-        IdeaCmd::Queue { limit, common } => {
-            let ctx = cmd::connect(&common)?;
-            w::queue(&ctx, limit, ctx.json)
-        }
+        IdeaCmd::Queue { limit, common } => w::queue(&cmd::connect(&common)?, limit),
         // разбор — всегда действие агента: `--by` нет и под агентом (M6.5 §5)
         IdeaCmd::Review {
             id,
@@ -1602,12 +1599,13 @@ fn idea(c: IdeaCmd) -> Result<(), CliError> {
             key,
             common,
         } => {
-            // ровно один исход — группа clap `outcome`
+            // ровно один исход — обязательная взаимоисключающая группа clap `outcome`
             let outcome = match (plan, ret, decline, done) {
-                (true, ..) => "plan",
-                (_, true, ..) => "return",
-                (_, _, true, _) => "decline",
-                _ => "done",
+                (true, false, false, false) => "plan",
+                (false, true, false, false) => "return",
+                (false, false, true, false) => "decline",
+                (false, false, false, true) => "done",
+                _ => unreachable!("группа clap `outcome`: ровно один исход"),
             };
             w::review(
                 &cmd::connect(&common)?,

@@ -955,6 +955,22 @@ fn idea_review_old_server_message() {
             }
         }))
     };
+    // запросы заглушки с номера `from`: (метод, путь)
+    let reqs = |seen: &common::Seen, from: usize| -> Vec<(String, String)> {
+        seen.lock().unwrap()[from..]
+            .iter()
+            .map(|(m, p, _)| (m.clone(), p.clone()))
+            .collect()
+    };
+    let pair = |m: &str, p: &str| (m.to_string(), p.to_string());
+    let review_path = format!("/api/v1/entries/{id}/review");
+    // разбор, затем пакет: сначала сам запрос, потом проба `/health`
+    let expected = [
+        pair("POST", &review_path),
+        pair("GET", "/api/v1/health"),
+        pair("POST", "/api/v1/recall"),
+        pair("GET", "/api/v1/health"),
+    ];
     for health in [
         r#"{"status":"ok","version":"0.0.11-m6","features":["m6","export","import"]}"#,
         r#"{"status":"ok","version":"0.0.10-m5.7"}"#,
@@ -963,27 +979,76 @@ fn idea_review_old_server_message() {
         let o = stub_z(&url, &dir, &review);
         assert_eq!(code(&o), Some(1), "{health}: {}", err(&o));
         assert_eq!(err(&o).trim(), OLD_SERVER_REVIEW, "{health}");
-        let s = seen.lock().unwrap().clone();
-        assert_eq!(s.len(), 2, "{s:?}");
-        assert_eq!(
-            (s[0].0.as_str(), s[0].1.as_str()),
-            ("POST", format!("/api/v1/entries/{id}/review").as_str())
-        );
-        assert_eq!(
-            (s[1].0.as_str(), s[1].1.as_str()),
-            ("GET", "/api/v1/health")
-        );
+        assert_eq!(reqs(&seen, 0), expected[..2], "{health}");
         let o = stub_z(&url, &dir, &["idea", "queue"]);
         assert_eq!(code(&o), Some(1), "{health}: {}", err(&o));
         assert_eq!(err(&o).trim(), OLD_SERVER_REVIEW, "{health}");
+        assert_eq!(reqs(&seen, 2), expected[2..], "{health}");
     }
-    // новый сервер: 404 — нет такой идеи (код 5), 400 пакета — неверный ввод (код 6)
-    let (url, _) =
+    // новый сервер: 404 — нет такой идеи (код 5), 400 пакета — неверный ввод (код 6); проба
+    // `/health` — та же, ошибка — прежняя
+    let (url, seen) =
         stub(r#"{"status":"ok","version":"0.0.12-m6.5","features":["m6","idea_review"]}"#);
     let o = stub_z(&url, &dir, &review);
     assert_eq!(code(&o), Some(5), "{}", err(&o));
     assert!(err(&o).contains("ресурс не найден"), "{}", err(&o));
     let o = stub_z(&url, &dir, &["idea", "queue"]);
     assert_eq!(code(&o), Some(6), "{}", err(&o));
-    assert!(!err(&o).contains("не поддерживает"), "{}", err(&o));
+    assert!(
+        err(&o).contains("unknown variant") && !err(&o).contains("не поддерживает"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(reqs(&seen, 0), expected);
+}
+
+/// Клиент новее сервера (ревью задачи 6, Important 1; `docs/api-compat.md`): сервер до M6.5
+/// разбирает статусы строго и на умолчание ленты с `returned` отвечает 400 — `zam idea list` без
+/// `--status` повторяет запрос со списком M5.7 и печатает ленту (код 0); явный `--status
+/// returned` — 400 сервера, код 6, без повтора. Сервер M6.5 получает один запрос.
+#[test]
+fn idea_list_old_server_without_returned() {
+    let dir = repo("list-old-repo");
+    let id = zam_core::Id::new().to_string();
+    let items = serde_json::json!({"items": [{"id": id, "status": "new", "title": "Старая лента",
+        "data": {"origin": "human", "priority": "high"}}]})
+    .to_string();
+    let (url, seen) = common::stub_body(Arc::new(move |_: &str, p: &str, _: usize, _: &Value| {
+        if p.contains("returned") {
+            (
+                    400,
+                    r#"{"type":"about:blank","title":"Bad Request","status":400,"detail":"status: неизвестное значение «returned»"}"#
+                        .to_string(),
+                    Duration::ZERO,
+                )
+        } else {
+            (200, items.clone(), Duration::ZERO)
+        }
+    }));
+    let o = stub_z(&url, &dir, &["idea", "list"]);
+    assert_eq!(
+        out(&o),
+        format!("w:{id} [new] [high] Старая лента\n"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(code(&o), Some(0), "{}", err(&o));
+    let o = stub_z(&url, &dir, &["idea", "list", "--json", "--origin", "human"]);
+    assert_eq!(code(&o), Some(0), "{}", err(&o));
+    let j: Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(j["items"][0]["id"], id.as_str(), "{j}");
+    let s: Vec<String> = seen.lock().unwrap().iter().map(|r| r.1.clone()).collect();
+    assert_eq!(s.len(), 4, "{s:?}");
+    for (i, p) in s.iter().enumerate() {
+        assert!(p.contains(&format!("/api/v1/spaces/{G}/entries?")), "{p}");
+        // первый запрос каждой команды — с returned, повтор — без него, прочее — как было
+        assert_eq!(p.contains("returned"), i % 2 == 0, "{s:?}");
+        assert!(p.contains("proposed") && p.contains("kind=idea"), "{p}");
+        assert_eq!(p.contains("origin=human"), i >= 2, "{p}");
+    }
+    // явный --status returned: ошибка сервера как есть, без повтора
+    let o = stub_z(&url, &dir, &["idea", "list", "--status", "returned"]);
+    assert_eq!(code(&o), Some(6), "{}", err(&o));
+    assert!(err(&o).contains("неизвестное значение"), "{}", err(&o));
+    assert_eq!(seen.lock().unwrap().len(), 5);
 }

@@ -4,7 +4,8 @@
 //! - `list [--status S]… [--origin human|agent] [--knowledge]` — строки `w:<id> [статус]
 //!   [приоритет] заголовок`, у идеи агента — `(от агента)`, у начатой — `→ k:<задача>`, у
 //!   возвращённой на доработку — `— не хватает: <начало missing>`; без `--status` — `new,
-//!   returned, proposed, deferred, accepted`;
+//!   returned, proposed, deferred, accepted` (сервер до M6.5 отвечает на `returned` 400 — повтор
+//!   без него);
 //! - `queue [--limit N]` — пакет разбора `idea_review` (`POST /recall`, M6.5 §7): идеи
 //!   «Непросмотрено» с историей, похожими записями решения и шагами разбора (текст сервера);
 //!   сервер без флага `idea_review` — код 1, как у `review`;
@@ -43,6 +44,11 @@ use crate::target::is_node_id;
 /// Статусы ленты по умолчанию: живые идеи (как умолчания поиска WebUI, спецификация M5.7 §4;
 /// `returned` — M6.5 §4).
 const ACTIVE: &str = "new,returned,proposed,deferred,accepted";
+
+/// Умолчание ленты у сервера до M6.5 (`returned` нет): он разбирает статусы строго и на
+/// [`ACTIVE`] отвечает 400 «status: неизвестное значение» — `list` без `--status` повторяет
+/// запрос с этим списком (клиент новее сервера, `docs/api-compat.md`).
+const ACTIVE_M57: &str = "new,proposed,deferred,accepted";
 
 /// Статусы идеи (спецификация M5.7 §5; `returned` — M6.5 §4).
 const STATUSES: [&str; 7] = [
@@ -165,8 +171,9 @@ pub struct List<'a> {
     pub knowledge: bool,
 }
 
-/// Статусы ленты через запятую; неизвестный статус идеи — код 6.
-fn statuses(raw: &[String]) -> Result<String, CliError> {
+/// Статусы ленты через запятую; не заданы — `None` (умолчание [`ACTIVE`]); неизвестный статус
+/// идеи — код 6.
+fn statuses(raw: &[String]) -> Result<Option<String>, CliError> {
     let mut out: Vec<&str> = Vec::new();
     for s in raw.iter().flat_map(|r| r.split(',')).map(str::trim) {
         if s.is_empty() {
@@ -182,22 +189,26 @@ fn statuses(raw: &[String]) -> Result<String, CliError> {
             out.push(s);
         }
     }
-    Ok(if out.is_empty() {
-        ACTIVE.to_string()
-    } else {
-        out.join(",")
-    })
+    Ok((!out.is_empty()).then(|| out.join(",")))
 }
 
-/// `zam idea list`.
+/// `zam idea list`; без `--status` у сервера до M6.5 (400 на [`ACTIVE`]) — повтор с
+/// [`ACTIVE_M57`]; явный `--status returned` такому серверу — его 400 (код 6).
 pub fn list(ctx: &Ctx, o: &List) -> Result<(), CliError> {
     let st = statuses(o.status)?;
     let space = space(ctx, o.knowledge)?;
-    let mut q = vec![("kind", "idea"), ("status", st.as_str()), ("limit", "200")];
-    if let Some(origin) = o.origin {
-        q.push(("origin", origin));
-    }
-    let v = read_json(ctx.client.get(&format!("/spaces/{space}/entries"), &q)?)?;
+    let path = format!("/spaces/{space}/entries");
+    let get = |status: &str| {
+        let mut q = vec![("kind", "idea"), ("status", status), ("limit", "200")];
+        if let Some(origin) = o.origin {
+            q.push(("origin", origin));
+        }
+        ctx.client.get(&path, &q).and_then(read_json)
+    };
+    let v = match (get(st.as_deref().unwrap_or(ACTIVE)), &st) {
+        (Err(e), None) if e.http_status() == Some(400) => get(ACTIVE_M57)?,
+        (r, _) => r?,
+    };
     if ctx.json {
         return emit_json(&v);
     }
@@ -310,8 +321,8 @@ fn has_feature(health: &Value, f: &str) -> bool {
 
 /// `zam idea queue`: пакет разбора `POST /recall {event: idea_review, limit}` решения из
 /// `solution.toml` — готовый текст сервера (пустая очередь, режим `propose`, нет права записи —
-/// строка-уведомление); `json` — ответ сервера целиком (`items` с `reason: idea_review`).
-pub fn queue(ctx: &Ctx, limit: u32, json: bool) -> Result<(), CliError> {
+/// строка-уведомление); `--json` — ответ сервера целиком (`items` с `reason: idea_review`).
+pub fn queue(ctx: &Ctx, limit: u32) -> Result<(), CliError> {
     let solution = solution_guid(ctx, None)?;
     let body = json!({ "event": "idea_review", "solution": solution, "limit": limit });
     let v = ctx
@@ -319,7 +330,7 @@ pub fn queue(ctx: &Ctx, limit: u32, json: bool) -> Result<(), CliError> {
         .post_json("/recall", &body)
         .and_then(read_json)
         .map_err(|e| old_server(ctx, e, 400))?;
-    if json {
+    if ctx.json {
         return emit_json(&v);
     }
     let mut out = v["text"]
@@ -640,10 +651,13 @@ mod tests {
         assert!(decide_req("defer", &d).is_err());
 
         // статусы ленты
-        assert_eq!(statuses(&[]).unwrap(), ACTIVE);
+        assert_eq!(statuses(&[]).unwrap(), None);
+        assert_eq!(statuses(&[" , ".into()]).unwrap(), None);
         assert_eq!(
-            statuses(&["deferred,new".into(), "new".into()]).unwrap(),
-            "deferred,new"
+            statuses(&["deferred,new".into(), "new".into()])
+                .unwrap()
+                .as_deref(),
+            Some("deferred,new")
         );
         assert!(statuses(&["open".into()]).is_err());
 
@@ -692,8 +706,19 @@ mod tests {
     #[test]
     fn review_bodies_and_lines() {
         // статусы ленты: returned — фильтр и умолчание
-        assert_eq!(statuses(&["returned".into()]).unwrap(), "returned");
+        assert_eq!(
+            statuses(&["returned".into()]).unwrap().as_deref(),
+            Some("returned")
+        );
         assert!(ACTIVE.split(',').any(|s| s == "returned"));
+        // умолчание сервера до M6.5 — то же без returned
+        assert_eq!(
+            ACTIVE_M57.split(',').collect::<Vec<_>>(),
+            ACTIVE
+                .split(',')
+                .filter(|s| *s != "returned")
+                .collect::<Vec<_>>()
+        );
         let e = json!({"id": ID, "status": "returned", "title": "Тема",
                        "data": {"review": {"outcome": "return",
                                            "missing": "\n Какие экраны? \nА меню?"}}});
