@@ -109,9 +109,7 @@
   статусов с фильтрами ленты; фильтр ленты задач `from_idea=1`; у задачи из идеи — `idea` и
   `ideas`, у принятой идеи в ленте — `task`; приоритет задачи `data.priority` (`low|normal|high`);
   флаг `features` — `idea_review`.
-- **`ZAM_CEILING_DIRECTORIES`** — потолок поиска файлов проекта для `zam` (как
-  `GIT_CEILING_DIRECTORIES`): поиск `CLAUDE.md`/`AGENTS.md`, `.zeroaimemory/` и `solution.toml`
-  вверх не заходит за эти каталоги.
+- Переменная `ZAM_CEILING_DIRECTORIES` у `zam` — см. «Fixed».
 
 ### Изменения ответа
 
@@ -158,10 +156,11 @@
   нет, новые правила блока — только с выносом текста в протокол (M7).
 - Тест `ideas_recall::prompt_ideas_timeout_silent` под нагрузкой машины иногда превышает срок
   (8,35–8,38 с при 8 с) — тайминговый флейк, повтор отдельно проходит; запас срока — M7.
-- Тест `zam-index` `supervisor::shutdown_waits_for_flush_bounded` на занятом и почти полном диске
-  (HDD) не дожидается подтверждения WAL Qdrant за 30 с; код `zam-index` в этапе не менялся,
-  повтор отдельно проходит. Набор `supervisor` пишет около 2,4 ГБ данных Qdrant в каталог тестов —
-  держите место на диске.
+- Тест `zam-index` `supervisor::shutdown_waits_for_flush_bounded` падает на почти полном и
+  загруженном диске (HDD): Qdrant не подтверждает WAL за 30 с, а при нехватке места — отказывает
+  вовсе («No space left on device: WAL buffer size exceeds available disk space»). Это сбой среды,
+  не регрессия: код `zam-index` в этапе не менялся, при свободном месте тест и весь набор проходят.
+  Набор `supervisor` пишет около 2,4 ГБ данных Qdrant в каталог тестов — держите место на диске.
 - Открытые замечания обкатки (журнал этапа, «Итог») — в M7: `zam init` пишет адрес сервера в
   коммитящийся `CLAUDE.md` (обход — `.git/info/exclude`), «первый токен администратора» не
   открывает админ-API, пакет субагенту на CPU-сервере кончается `recall timeout`, Vault без
