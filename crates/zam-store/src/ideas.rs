@@ -1917,13 +1917,18 @@ fn review_task_tx(
     }
 }
 
+/// Текст ошибки ключа повтора, уже использованного другим разбором идеи (или до её правки).
+const REVIEW_KEY_USED: &str = "Idempotency-Key: ключ уже использован прежним разбором этой идеи; новый разбор — с новым ключом";
+
 /// Текст ошибки исхода `done` без ссылки на сделанное.
 const REVIEW_DONE_REF_REQUIRED: &str =
     "у исхода done нужна ссылка на сделанное — c:, r:, commit: или k: задачи done";
 
 /// Разбор идеи агентом одной транзакцией писателя (M6.5 §5):
-/// 1. повтор — `key` совпал с ключом последнего разбора того же пользователя и исхода: текущая
-///    идея и её задача плана, `replay: true`, ничего не записано;
+/// 1. повтор — `key` совпал с ключом последнего разбора того же пользователя и исхода, и идея
+///    после него не менялась (текущая ревизия — его): текущая идея и её задача плана, `replay:
+///    true`, ничего не записано; ключ того же пользователя из истории разборов в остальных
+///    случаях — [`StoreError::IdempotencyMismatch`];
 /// 2. условия — живая идея ([`IdeaError::IdeaDeleted`], [`IdeaError::NotIdea`]) человека
 ///    ([`IdeaError::AgentOrigin`]) в статусе `new` (иначе [`IdeaError::Transition`] с `to:
 ///    "review"`; второй разбор той же идеи получает его же — захват не нужен), поля
@@ -1970,9 +1975,20 @@ fn review_tx(
         Err(StoreError::BadInput(m)) => return Ok(Err(IdeaError::ReviewInput(m))),
         Err(e) => return Err(e),
     };
-    if let Some(prev) = data.review.as_ref().filter(|p| {
-        key.is_some() && p.key == key && p.by_user == r.by_user && p.outcome == r.outcome
-    }) {
+    // ключ этого пользователя уже записан разбором идеи: повтор — только того же разбора, пока
+    // идея после него не менялась (её текущая ревизия — та, что записал разбор: время ревизии —
+    // `review.at`); иначе — другой запрос с тем же ключом (финальное ревью M6.5, M1)
+    let used = |p: &Review| key.is_some() && p.key == key && p.by_user == r.by_user;
+    if data.review.iter().chain(&data.reviews).any(used) {
+        let Some(prev) = data
+            .review
+            .as_ref()
+            .filter(|p| used(p) && p.outcome == r.outcome && idea.updated_at == p.at)
+        else {
+            return Ok(Err(IdeaError::Store(StoreError::IdempotencyMismatch(
+                REVIEW_KEY_USED.into(),
+            ))));
+        };
         let task = prev
             .task
             .as_deref()

@@ -11,9 +11,9 @@ use zam_store::{
     AnswerBy, Attribution, AuthorKind, Channel, DataDir, Db, DecidedAs, DecidedVia, Entry,
     EntryKind, EntryPatch, EntryStatus, IdeaData, IdeaDecision, IdeaError, IdeaPriority,
     NewDecision, NewEntry, NewNote, NewReview, NodePath, REVIEW_MIN_CHARS_DEFAULT, REVIEW_REFS_MAX,
-    REVIEWS_MAX, ReviewOutcome, ReviewTask, SpaceKind, TaskData, create_entry, create_note,
-    create_solution, decide_idea, delete_entry, entry_revisions, get_entry, list_spaces,
-    planned_from_ideas, review_idea, review_queue, update_entry,
+    REVIEWS_MAX, ReviewOutcome, ReviewTask, SpaceKind, StoreError, TaskData, create_entry,
+    create_note, create_solution, decide_idea, delete_entry, entry_revisions, get_entry,
+    list_spaces, planned_from_ideas, review_idea, review_queue, update_entry,
 };
 
 // ---------- окружение ----------
@@ -724,7 +724,9 @@ async fn review_history_keeps_ten() {
 
 /// M6.5 §5, Review Focus 1: повтор того же разбора с тем же ключом после обрыва связи — прежний
 /// итог (`replay: true`) с той же задачей, без новой ревизии и второй задачи. Тот же ключ другого
-/// пользователя или с другим исходом — не повтор (обычные условия: идея уже не `new` — 409).
+/// пользователя — не повтор (ключи у каждого свои; обычные условия: идея уже не `new` — 409); тот
+/// же ключ того же пользователя с другим исходом — другой запрос с тем же ключом:
+/// `IdempotencyMismatch` (финальное ревью ветки, M1).
 #[tokio::test]
 async fn review_retry_same_key_returns_same_task() {
     let (db, sol, _) = setup("replay").await;
@@ -754,29 +756,89 @@ async fn review_retry_same_key_returns_same_task() {
     assert_eq!(again.task.map(|t| t.id), first.task.as_ref().map(|t| t.id));
     assert_eq!(tasks_in(&db, sol).await, 1);
     assert_eq!(entry_revisions(&db, i.id).await.unwrap().len(), revs);
-    // чужой пользователь с тем же ключом и тот же ключ с другим исходом — не повтор: обычные
-    // условия, идея уже не `new` — переход не разрешён, ничего не записано
+    // чужой пользователь с тем же ключом — не повтор: обычные условия, идея уже не `new` —
+    // переход не разрешён; тот же ключ с другим исходом — расхождение ключа; ничего не записано
     let mut other_user = r.clone();
     other_user.by_user = Id::new();
+    let res = review_idea(&db, i.id, other_user, &agent()).await;
+    assert!(
+        matches!(
+            res,
+            Err(IdeaError::Transition {
+                from: EntryStatus::Accepted,
+                to: "review"
+            })
+        ),
+        "{res:?}"
+    );
     let mut other_outcome = nr(ReviewOutcome::Decline, user);
     other_outcome.key = r.key.clone();
-    for (who, x) in [(other_user, agent()), (other_outcome, agent_of(user))] {
-        let res = review_idea(&db, i.id, who.clone(), &x).await;
-        assert!(
-            matches!(
-                res,
-                Err(IdeaError::Transition {
-                    from: EntryStatus::Accepted,
-                    to: "review"
-                })
-            ),
-            "{:?}: {res:?}",
-            who.outcome
-        );
-    }
+    let res = review_idea(&db, i.id, other_outcome, &agent_of(user)).await;
+    assert!(
+        matches!(
+            res,
+            Err(IdeaError::Store(StoreError::IdempotencyMismatch(_)))
+        ),
+        "{res:?}"
+    );
     assert_eq!(tasks_in(&db, sol).await, 1);
     assert_eq!(entry_revisions(&db, i.id).await.unwrap().len(), revs);
     assert_eq!(get_entry(&db, i.id).await.unwrap(), first.idea);
+}
+
+/// Финальное ревью ветки, M1: повтор по ключу — только пока идея не менялась после разбора с
+/// этим ключом. Разбор K (`return`) → человек дописал (`new`) → тот же разбор с K —
+/// `IdempotencyMismatch` («ключ уже использован прежним разбором»), ничего не записано, идея
+/// остаётся в очереди; новый ключ — обычный разбор. Ключ прежнего разбора из истории
+/// (`data.reviews`, не последний) — тоже расхождение.
+#[tokio::test]
+async fn review_key_after_change_is_mismatch() {
+    let (db, sol, _) = setup("replay-changed").await;
+    let user = Id::new();
+    let i = new_idea(&db, sol, "Кэш", "human", "normal").await;
+    let ret = |key: &str| {
+        let mut r = nr(ReviewOutcome::Return, user);
+        r.missing = Some("Какой срок жизни кэша?".into());
+        r.key = Some(key.into());
+        r
+    };
+    let first = review_idea(&db, i.id, ret("rk-a"), &agent_of(user))
+        .await
+        .unwrap();
+    assert!(!first.replay);
+    assert_eq!(first.idea.status, Some(EntryStatus::Returned));
+    // без правки — повтор
+    let again = review_idea(&db, i.id, ret("rk-a"), &agent_of(user))
+        .await
+        .unwrap();
+    assert!(again.replay);
+    let edited = human_edit(&db, i.id, "Кэш на час.").await;
+    assert_eq!(edited.status, Some(EntryStatus::New));
+    let mismatch = |res: &Result<zam_store::Reviewed, IdeaError>| match res {
+        Err(IdeaError::Store(StoreError::IdempotencyMismatch(m))) => {
+            assert!(m.contains("ключ уже использован прежним разбором"), "{m}");
+            assert!(m.contains("новый разбор — с новым ключом"), "{m}");
+        }
+        other => panic!("ожидалось IdempotencyMismatch: {other:?}"),
+    };
+    mismatch(&review_idea(&db, i.id, ret("rk-a"), &agent_of(user)).await);
+    let cur = get_entry(&db, i.id).await.unwrap();
+    assert_eq!(snap(&cur), snap(&edited));
+    assert_eq!(review_queue(&db, sol, 10).await.unwrap().0, 1);
+    // новый ключ — обычный разбор
+    let second = review_idea(&db, i.id, ret("rk-b"), &agent_of(user))
+        .await
+        .unwrap();
+    assert!(!second.replay);
+    assert_eq!(data_of(&second.idea).reviews.len(), 2);
+    // ключ прежнего разбора (уже не последнего) после новой правки — расхождение
+    human_edit(&db, i.id, "Кэш на два часа.").await;
+    mismatch(&review_idea(&db, i.id, ret("rk-a"), &agent_of(user)).await);
+    // другой пользователь со своим ключом «rk-a» — обычный разбор (ключи у каждого свои)
+    let mut other = ret("rk-a");
+    other.by_user = Id::new();
+    let r = review_idea(&db, i.id, other, &agent()).await.unwrap();
+    assert!(!r.replay);
 }
 
 /// M6.5 §5, Review Focus 4: мусор в ссылках — `ReviewInput` с названием поля, ничего не записано:
