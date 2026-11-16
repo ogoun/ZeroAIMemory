@@ -132,6 +132,8 @@
 - Статус `returned` — в умолчаниях `zam idea list` и поиска WebUI: клиент со строгим перечнем
   статусов идеи должен его пропускать.
 - `GET /auth/settings` — `ideas: {proactive, mode}` (было `{proactive}`).
+- MCP `memory_update_entry action=append` передаёт `by` серверу (раньше поле молча отбрасывалось):
+  `by` у записи, которая не идея, — 422 «by: только у правки идеи».
 
 ### Changed
 - `zam` на Windows (MSVC) резервирует главному потоку 8 МБ стека (`/STACK`,
