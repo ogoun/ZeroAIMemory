@@ -373,7 +373,11 @@ async fn acceptance_migration_0025() {
         &json!({"event": "session_start", "solution": G}),
     );
     let text = digest["text"].as_str().unwrap();
-    assert!(text.contains("### Идеи") && text.contains(&shown), "{text}");
+    // сервер v0.0.10-m5.7 — раздел M5.7 (у «### Идеи на разбор» M6.5 тот же префикс)
+    assert!(
+        text.contains("### Идеи\n") && text.contains(&shown),
+        "{text}"
+    );
     let p = call(
         &old,
         &tok,

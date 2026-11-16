@@ -101,6 +101,19 @@ async fn post(a: &Api, id: &str, op: &str, body: Value) -> Resp {
     .await
 }
 
+/// Статус задачи `task` токеном администратора (с `If-Match`).
+async fn task_status(a: &Api, task: &str, status: &str) {
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{task}"),
+            Some(json!({"status": status})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+}
+
 /// Разбор идеи токеном администратора; ответ `{entry, task?}`.
 async fn review(a: &Api, id: &str, body: Value) -> Value {
     let r = post(a, id, "review", body).await;
@@ -337,16 +350,9 @@ async fn digest_plan_line_orders_by_priority() {
     .await;
     let i3 = idea(&a, "Идея снятая", "Замысел.", json!({})).await;
     let t3 = id(&review(&a, &i3, plan("Снятый пункт", "high")).await["task"]);
-    let r = a
-        .tok_rev(
-            &a.token,
-            Method::PATCH,
-            &format!("/api/v1/entries/{t3}"),
-            Some(json!({"status": "dropped"})),
-        )
-        .await;
-    ok(&r, StatusCode::OK);
+    task_status(&a, &t3, "dropped").await;
     assert_eq!(t1["task"]["status"], "open", "{t1}");
+    let t1 = id(&t1["task"]);
     let j = start(&a, "s1").await;
     let line = format!("План из идей: 2 открытых, следующая — k:{t2} «Срочный пункт» [high]");
     assert!(text(&j).lines().any(|l| l == line), "{j}");
@@ -367,6 +373,102 @@ async fn digest_plan_line_orders_by_priority() {
     )
     .await;
     assert!(text(&j).lines().any(|l| l == line), "{j}");
+    // ревью задачи 4, Important 2: взятый в работу пункт — в счёте, но «следующим» не бывает
+    task_status(&a, &t2, "in_progress").await;
+    let j = start(&a, "s2").await;
+    let line = format!("План из идей: 2 открытых, следующая — k:{t1} «Обычный пункт» [normal]");
+    assert!(text(&j).lines().any(|l| l == line), "{j}");
+    // открытых не осталось — строка без «следующая»
+    task_status(&a, &t1, "blocked").await;
+    let j = start(&a, "s3").await;
+    assert!(
+        text(&j).lines().any(|l| l == "План из идей: 2 открытых"),
+        "{j}"
+    );
+    assert!(!text(&j).contains("следующая"), "{j}");
+}
+
+/// `ideas.proactive = false` пользователя гасит и раздел «Идеи на разбор», и строку плана; пакет
+/// `idea_review` — явный вызов — по-прежнему отвечает.
+#[tokio::test]
+async fn proactive_off_hides_review_section_and_plan() {
+    let a = server("proactive-off", |_| {}).await;
+    let planned = idea(&a, "Идея в плане", "Замысел.", json!({})).await;
+    review(
+        &a,
+        &planned,
+        json!({"outcome": "plan", "summary": summary("Решение — в план.")}),
+    )
+    .await;
+    let queued = idea(&a, "Идея в очереди", "Замысел.", json!({})).await;
+    let j = start(&a, "on").await;
+    assert!(text(&j).contains(&format!("{REVIEW_SECTION}\n")), "{j}");
+    assert!(text(&j).contains("План из идей: 1 открытых"), "{j}");
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{}/settings", a.admin_id()),
+            Some(json!({"ideas": {"proactive": false}})),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let j = start(&a, "off").await;
+    assert!(!text(&j).contains("### Идеи"), "{j}");
+    assert!(!text(&j).contains("План из идей"), "{j}");
+    assert!(items(&j, "idea_review").is_empty(), "{j}");
+    let j = pack(&a, json!({})).await;
+    assert_eq!(items(&j, "idea_review"), [format!("w:{queued}")], "{j}");
+}
+
+/// Режим `review`: идея `accepted` со снятой задачей — строкой-хвостом очереди с пометкой «задача
+/// снята, можно предложить вернуть» и указанием «предложи вернуть: action=propose с text».
+#[tokio::test]
+async fn digest_review_tail_released_task() {
+    let a = server("tail-released", |_| {}).await;
+    let queued = idea(&a, "Идея в очереди", "Замысел.", json!({})).await;
+    let started = idea(&a, "Начатая идея", "Замысел.", json!({})).await;
+    let r = post(
+        &a,
+        &started,
+        "decide",
+        json!({"decision": "accept", "by": "human"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    task_status(&a, &id(&r.json()["task"]), "dropped").await;
+    let j = start(&a, "s1").await;
+    let lines = section_lines(&j, REVIEW_SECTION).unwrap_or_else(|| panic!("{j}"));
+    assert_eq!(lines.len(), 3, "{j}");
+    assert_eq!(lines[0], review_hint(1), "{j}");
+    assert!(lines[1].ends_with(&format!("w:{queued}")), "{j}");
+    assert_eq!(
+        lines[2],
+        format!(
+            "ZeroAIMemory: идея «Начатая идея» [normal] — задача снята, можно предложить вернуть \
+             — w:{started} (предложи вернуть: action=propose с text — почему пора; решает человек)"
+        ),
+        "{j}"
+    );
+    assert_eq!(items(&j, "idea"), [format!("w:{started}")], "{j}");
+}
+
+/// Пакет с сессией отмечает показ: раздел дайджеста этой сессии не повторяется, в новой — есть.
+#[tokio::test]
+async fn pack_in_session_suppresses_digest_section() {
+    let a = server("pack-session", |_| {}).await;
+    let x = idea(&a, "Идея", "Замысел.", json!({})).await;
+    let j = recall(
+        &a,
+        Some("s1"),
+        json!({"event": "idea_review", "solution": G}),
+    )
+    .await;
+    assert_eq!(items(&j, "idea_review"), [format!("w:{x}")], "{j}");
+    let j = start(&a, "s1").await;
+    assert!(!text(&j).contains(REVIEW_SECTION), "{j}");
+    let j = start(&a, "s2").await;
+    assert!(text(&j).contains(REVIEW_SECTION), "{j}");
 }
 
 // ---- пакет idea_review ----
@@ -439,6 +541,7 @@ async fn idea_review_pack_has_similar_and_reasons() {
         "сама идея — не похожая: {b}"
     );
     assert!(!b.contains("История:"), "{b}");
+    assert!(t.ends_with("\nПоказано идей на разбор: 1 из 1.\n"), "{t}");
     // вернули на разбор с доводом — довод и прежний разбор в пакете
     let reason = "Бухгалтерии нужен именно PDF: печать из браузера не подходит.";
     let r = post(
@@ -467,14 +570,132 @@ async fn idea_review_pack_has_similar_and_reasons() {
         b.find(" довод").unwrap(),
     );
     assert!(rev < arg, "история — по времени: {b}");
-    // `limit: 1` — одна идея
+    // `limit: 1` — одна идея, «показано 1 из 2»
     let j = pack(&a, json!({"limit": 1})).await;
     assert_eq!(items(&j, "idea_review"), [format!("w:{declined}")], "{j}");
     assert!(!text(&j).contains(&format!("— w:{x}\n")), "{j}");
+    assert!(
+        text(&j).contains("\nПоказано идей на разбор: 1 из 2.\n"),
+        "{j}"
+    );
+    assert!(!text(&j).contains("не показано"), "{j}");
+    // не вошедшие в бюджет — строкой «не показано» с адресом (ревью задачи 4, Minor 3)
+    let j = pack(&a, json!({"budget_tokens": 20})).await;
+    assert!(items(&j, "idea_review").is_empty(), "{j}");
+    assert!(
+        text(&j).contains(
+            "Показано идей на разбор: 0 из 2.\nZeroAIMemory: не показано — идей на разбор: 2 \
+             (memory_recall event=idea_review после разбора показанных)\n"
+        ),
+        "{j}"
+    );
 }
 
-/// Пакет без идей — строка-уведомление: очередь пуста, решения нет, режим `propose` владельца;
-/// `limit` вне 1..=20 — 400.
+/// Причина у отклонённой похожей идеи — только из её отклонения (ревью задачи 4, Important 1):
+/// человек отложил «после релиза» и отказался без причины — причины нет; отказался с причиной —
+/// «причина человека: …»; отклонил разбором — «разбор: …».
+#[tokio::test]
+async fn pack_declined_reason_only_from_decline() {
+    let a = server("pack-decline", |_| {}).await;
+    let silent = idea(
+        &a,
+        "PDF-выгрузка отчётов",
+        "Выгрузка отчётов в PDF.",
+        json!({}),
+    )
+    .await;
+    let r = post(
+        &a,
+        &silent,
+        "decide",
+        json!({"decision": "defer", "by": "human", "horizon": tomorrow(),
+               "reason": "после релиза"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let r = post(
+        &a,
+        &silent,
+        "decide",
+        json!({"decision": "decline", "by": "human"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let said = idea(
+        &a,
+        "PDF-отчёт бухгалтерии",
+        "Отчёт в PDF для бухгалтерии.",
+        json!({}),
+    )
+    .await;
+    let r = post(
+        &a,
+        &said,
+        "decide",
+        json!({"decision": "decline", "by": "human", "reason": "дублирует печать отчёта"}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let x = idea(&a, "Экспорт в PDF", "Выгружать отчёт в PDF.", json!({})).await;
+    let j = pack(&a, json!({})).await;
+    let b = idea_block(text(&j), &x);
+    let line = |w: &str| {
+        b.lines()
+            .find(|l| l.starts_with(&format!("  - w:{w} ")))
+            .unwrap_or_else(|| panic!("нет похожей {w}: {b}"))
+            .to_string()
+    };
+    assert_eq!(
+        line(&silent),
+        format!("  - w:{silent} · declined · «PDF-выгрузка отчётов»"),
+        "{b}"
+    );
+    assert!(!b.contains("после релиза"), "{b}");
+    assert_eq!(
+        line(&said),
+        format!(
+            "  - w:{said} · declined · «PDF-отчёт бухгалтерии» — причина человека: дублирует \
+             печать отчёта"
+        ),
+        "{b}"
+    );
+}
+
+/// Частичный пакет по сроку: у «медленной» идеи (тестовая метка) похожие не собраны, у первой —
+/// собраны; `warnings: ["recall timeout"]`; обе идеи в ответе.
+#[tokio::test]
+async fn pack_partial_on_timeout() {
+    let a = server("pack-timeout", |_| {}).await;
+    let first = idea(&a, "Экспорт отчётов", "Выгрузка отчётов.", json!({})).await;
+    task(&a, "Печать отчётов", "Печать.", json!({})).await;
+    let mark = zam_server::api::recall::TEST_SLOW_IDEA_MARK;
+    let slow = idea(&a, &format!("Медленная идея {mark}"), "Замысел.", json!({})).await;
+    let j = pack(&a, json!({"timeout_ms": 3000})).await;
+    assert_eq!(
+        items(&j, "idea_review"),
+        [format!("w:{first}"), format!("w:{slow}")],
+        "{j}"
+    );
+    assert!(
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w == "recall timeout"),
+        "{j}"
+    );
+    assert!(
+        idea_block(text(&j), &first).contains("\n  Похожие:\n"),
+        "{j}"
+    );
+    assert!(
+        idea_block(text(&j), &slow).contains("Похожие: не собраны"),
+        "{j}"
+    );
+}
+
+/// Пакет без идей — строка-уведомление: очередь пуста, решения нет, нет права записи, режим
+/// `propose` владельца; `limit` вне 1..=20 — 400.
 #[tokio::test]
 async fn idea_review_pack_notices_and_limit() {
     let a = server("notices", |_| {}).await;
@@ -497,6 +718,21 @@ async fn idea_review_pack_notices_and_limit() {
         ok(&r, StatusCode::BAD_REQUEST);
         assert!(r.text().contains("limit"), "{}", r.text());
     }
+    // токен `ro` — разбор дал бы 403: уведомление вместо идей
+    idea(&a, "Идея", "Замысел.", json!({})).await;
+    let ro = a.issue(&a.admin_id(), "ro").await;
+    let j = recall_as(
+        &a,
+        &ro,
+        None,
+        json!({"event": "idea_review", "solution": G}),
+    )
+    .await;
+    assert!(
+        text(&j).starts_with("Разбор идей недоступен: нет права записи"),
+        "{j}"
+    );
+    assert!(j["items"].as_array().unwrap().is_empty(), "{j}");
     let b = server("notices-propose", |c| {
         c.ideas.default_mode = IdeasMode::Propose
     })

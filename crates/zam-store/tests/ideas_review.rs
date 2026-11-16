@@ -13,7 +13,7 @@ use zam_store::{
     NewDecision, NewEntry, NewNote, NewReview, NodePath, REVIEW_MIN_CHARS_DEFAULT, REVIEW_REFS_MAX,
     REVIEWS_MAX, ReviewOutcome, ReviewTask, SpaceKind, TaskData, create_entry, create_note,
     create_solution, decide_idea, delete_entry, entry_revisions, get_entry, list_spaces,
-    planned_from_ideas, review_idea, review_queue, review_queue_len, update_entry,
+    planned_from_ideas, review_idea, review_queue, update_entry,
 };
 
 // ---------- окружение ----------
@@ -892,8 +892,8 @@ async fn review_rejects_bad_refs() {
 // ---------- очередь разбора и строка плана (M6.5 §7, задача 4) ----------
 
 /// Очередь разбора: живые идеи человека `new` пространства — `high` первыми, затем самые старые;
-/// без идей агента, разобранных, удалённых и чужого пространства; предел `limit`, длина — без
-/// предела.
+/// без идей агента, разобранных, удалённых и чужого пространства; предел `limit`, длина очереди
+/// — без предела (тем же чтением).
 #[tokio::test]
 async fn review_queue_order_and_filters() {
     let (db, sol, kn) = setup("queue").await;
@@ -914,24 +914,25 @@ async fn review_queue_order_and_filters() {
     )
     .await
     .unwrap();
-    let ids = |v: Vec<Entry>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
+    let ids = |(n, v): (usize, Vec<Entry>)| (n, v.into_iter().map(|e| e.id).collect::<Vec<_>>());
     assert_eq!(
         ids(review_queue(&db, sol, 10).await.unwrap()),
-        [high.id, old.id, young.id, low.id]
+        (4, vec![high.id, old.id, young.id, low.id])
     );
     assert_eq!(
         ids(review_queue(&db, sol, 2).await.unwrap()),
-        [high.id, old.id]
+        (4, vec![high.id, old.id])
     );
-    assert!(review_queue(&db, sol, 0).await.unwrap().is_empty());
-    assert_eq!(review_queue_len(&db, sol).await.unwrap(), 4);
+    assert_eq!(ids(review_queue(&db, sol, 0).await.unwrap()), (4, vec![]));
     // очередь — одного пространства: идея Knowledge в очередь решения не попадает
-    assert_eq!(review_queue_len(&db, kn).await.unwrap(), 1);
+    assert_eq!(review_queue(&db, kn, 10).await.unwrap().0, 1);
 }
 
 /// Строка плана: живые задачи `open | in_progress | blocked` с системным ребром `derived_from`
-/// на живую идею; следующая — по `data.priority` (нет — `normal`), затем самая старая. Задача без
-/// ребра, снятая, сделанная и с ребром только на удалённую идею не считаются.
+/// на живую идею; следующая — только среди `open`, по `data.priority` (нет — `normal`), затем
+/// самая старая (ревью задачи 4, Important 2: взятая в работу «следующей» не бывает); открытых
+/// нет — `(N, None)`. Задача без ребра, снятая, сделанная и с ребром только на удалённую идею не
+/// считаются.
 #[tokio::test]
 async fn planned_from_ideas_next_by_priority() {
     let (db, sol, _) = setup("planned").await;
@@ -973,9 +974,12 @@ async fn planned_from_ideas_next_by_priority() {
         "без приоритета — normal, старше"
     );
     let high = planned("Срочная", Some(IdeaPriority::High)).await;
+    let (n, next) = planned_from_ideas(&db, sol).await.unwrap();
+    assert_eq!((n, next.unwrap().id), (4, high.id), "high — первой");
+    // взятая в работу — в счёте, но не «следующая»
     set_task_status(&db, high.id, EntryStatus::InProgress).await;
     let (n, next) = planned_from_ideas(&db, sol).await.unwrap();
-    assert_eq!((n, next.unwrap().id), (4, high.id));
+    assert_eq!((n, next.unwrap().id), (4, first.id));
     // не считаются: без ребра, снятая, сделанная, с ребром только на удалённую идею
     new_task(&db, sol, "Ручная").await;
     let dropped = planned("Снятая", Some(IdeaPriority::High)).await;
@@ -987,5 +991,26 @@ async fn planned_from_ideas_next_by_priority() {
     system_edge(&db, sol, orphan.id, gone.id).await;
     delete_entry(&db, gone.id, None, &human()).await.unwrap();
     let (n, next) = planned_from_ideas(&db, sol).await.unwrap();
-    assert_eq!((n, next.unwrap().id), (4, high.id));
+    assert_eq!((n, next.unwrap().id), (4, first.id));
+    // открытых не осталось (в работе и заблокированы) — пункты есть, «следующей» нет
+    let open: Vec<Id> = db
+        .read(move |c| {
+            let mut st = c.prepare(
+                "SELECT id FROM entries WHERE space_id = ?1 AND kind = 'task' AND status = 'open'",
+            )?;
+            let ids = st.query_map([sol], |r| r.get::<_, Id>(0))?;
+            Ok(ids.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .unwrap();
+    for (k, t) in open.iter().enumerate() {
+        let to = if k % 2 == 0 {
+            EntryStatus::InProgress
+        } else {
+            EntryStatus::Blocked
+        };
+        set_task_status(&db, *t, to).await;
+    }
+    let (n, next) = planned_from_ideas(&db, sol).await.unwrap();
+    assert_eq!((n, next.map(|e| e.id)), (4, None));
 }

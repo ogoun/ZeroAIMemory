@@ -2542,38 +2542,41 @@ const REVIEW_QUEUE_SQL: &str = "FROM entries e INDEXED BY entries_feed
      WHERE e.space_id = ?1 AND e.kind = 'idea' AND e.deleted_at IS NULL AND e.status = 'new'
        AND json_extract(e.data, '$.origin') = 'human'";
 
-/// Очередь разбора идей агентом (M6.5 §7): живые идеи человека `new` пространства `space` —
-/// `high` первыми, затем самые старые (`created_at`); не больше `limit`.
-pub async fn review_queue(db: &Db, space: Id, limit: usize) -> Result<Vec<Entry>, StoreError> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    db.read(move |c| {
-        let mut st = c.prepare_cached(&format!(
-            "SELECT {ENTRY_COLS} {REVIEW_QUEUE_SQL}
-             ORDER BY CASE json_extract(e.data, '$.priority')
-                          WHEN 'high' THEN 2 WHEN 'low' THEN 0 ELSE 1 END DESC,
-                      e.created_at, e.id
-             LIMIT ?2"
-        ))?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = st.query_map(params![space, limit], entry_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    })
-    .await
-}
-
-/// Длина очереди разбора [`review_queue`] пространства `space` (строка «Непросмотренных идей:
-/// N» дайджеста).
-pub async fn review_queue_len(db: &Db, space: Id) -> Result<usize, StoreError> {
+/// Очередь разбора идей агентом (M6.5 §7): длина очереди — живые идеи человека `new`
+/// пространства `space` — и первые `limit` из них: `high` первыми, затем самые старые
+/// (`created_at`). Одно чтение: обоим вызывающим (строка «Непросмотренных идей: N» дайджеста,
+/// «показано k из N» пакета) нужны и длина, и идеи.
+pub async fn review_queue(
+    db: &Db,
+    space: Id,
+    limit: usize,
+) -> Result<(usize, Vec<Entry>), StoreError> {
     db.read(move |c| {
         let n: i64 = c
             .prepare_cached(&format!("SELECT count(*) {REVIEW_QUEUE_SQL}"))?
             .query_row([space], |r| r.get(0))?;
-        Ok(usize::try_from(n).unwrap_or(0))
+        if n == 0 || limit == 0 {
+            return Ok((usize::try_from(n).unwrap_or(0), Vec::new()));
+        }
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {ENTRY_COLS} {REVIEW_QUEUE_SQL}
+             ORDER BY {PRIORITY_DESC}, e.created_at, e.id
+             LIMIT ?2"
+        ))?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = st.query_map(params![space, limit], entry_row)?;
+        Ok((
+            usize::try_from(n).unwrap_or(0),
+            rows.collect::<Result<_, _>>()?,
+        ))
     })
     .await
 }
+
+/// Порядок `data.priority` по убыванию (`high`, `normal`, `low`; нет — `normal`) — как
+/// [`IdeaPriority::rank`].
+const PRIORITY_DESC: &str = "CASE json_extract(e.data, '$.priority')
+                                 WHEN 'high' THEN 2 WHEN 'low' THEN 0 ELSE 1 END DESC";
 
 /// SQL «пункт плана из идей» (M6.5 §7): живая задача `open | in_progress | blocked`
 /// пространства `?1` с системным ребром `derived_from` на живую идею — то же ребро, что у
@@ -2588,8 +2591,10 @@ const PLANNED_SQL: &str = "FROM entries e
                      AND i.kind = 'idea' AND i.deleted_at IS NULL)";
 
 /// Строка плана дайджеста (M6.5 §7): число пунктов плана из идей пространства `space`
-/// ([`PLANNED_SQL`]) и следующий — по `data.priority` (`high`, `normal`, `low`; нет — `normal`),
-/// затем самый старый (`created_at`). Пунктов нет — `(0, None)`.
+/// ([`PLANNED_SQL`]: `open`, `in_progress`, `blocked`) и следующий — только среди `open` (взятый
+/// в работу или заблокированный пункт «следующим» не бывает), по `data.priority` (`high`,
+/// `normal`, `low`; нет — `normal`), затем самый старый (`created_at`). Пунктов нет —
+/// `(0, None)`; открытых среди них нет — `(N, None)`.
 pub async fn planned_from_ideas(db: &Db, space: Id) -> Result<(usize, Option<Entry>), StoreError> {
     db.read(move |c| {
         let n: i64 = c
@@ -2600,10 +2605,8 @@ pub async fn planned_from_ideas(db: &Db, space: Id) -> Result<(usize, Option<Ent
         }
         let next = c
             .prepare_cached(&format!(
-                "SELECT {ENTRY_COLS} {PLANNED_SQL}
-                 ORDER BY CASE json_extract(e.data, '$.priority')
-                              WHEN 'high' THEN 2 WHEN 'low' THEN 0 ELSE 1 END DESC,
-                          e.created_at, e.id
+                "SELECT {ENTRY_COLS} {PLANNED_SQL} AND e.status = 'open'
+                 ORDER BY {PRIORITY_DESC}, e.created_at, e.id
                  LIMIT 1"
             ))?
             .query_row([space], entry_row)

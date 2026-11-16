@@ -105,8 +105,9 @@
 //!   раздел M5.7 из них одних. Подсказка к `prompt` у идеи решения `new` — «к задаче подходит
 //!   идея на разбор w:<id>» (`reason: idea_review`). Строка плана [`PLAN_LINE`] — сразу за
 //!   задачами дайджеста и пакета восстановления: пункты плана из идей (задачи `open |
-//!   in_progress | blocked` с ребром `derived_from` на идею) и следующий по `data.priority`,
-//!   затем самый старый ([`zam_store::planned_from_ideas`]); нет пунктов — строки нет. Идеи
+//!   in_progress | blocked` с ребром `derived_from` на идею) и следующий — только `open`, по
+//!   `data.priority`, затем самый старый ([`zam_store::planned_from_ideas`]; открытых нет —
+//!   [`PLAN_LINE_NO_NEXT`] без «следующая»); нет пунктов — строки нет. Идеи
 //!   выключены (`ideas.proactive`) — ни раздела, ни подсказок, ни строки плана;
 //! - **пакет разбора идей `idea_review`** (M6.5 §7; MCP `memory_recall`, `zam idea queue`;
 //!   явный вызов: без гейта `hooks.<тип>` и `ideas.proactive`, без контрольной группы A/B, не
@@ -115,8 +116,9 @@
 //!   приоритет, тело, история (прежние разборы и доводы человека), до
 //!   [`IDEA_REVIEW_SIMILAR_MAX`] похожих записей решения и строка шагов разбора
 //!   ([`review_pack`]); бюджет — `budget_tokens` или [`IDEA_REVIEW_BUDGET`], срок по умолчанию —
-//!   `max(recall.max_timeout_ms, recall.timeout_ms)`; режим `propose`, нет права записи, нет
-//!   решения или пустая очередь — одна строка-уведомление;
+//!   `max(recall.max_timeout_ms, recall.timeout_ms)`; в конце — «Показано идей на разбор: k из
+//!   N.» и, если идеи не вошли в бюджет, строка «не показано — идей на разбор: M (…)»; режим
+//!   `propose`, нет права записи, нет решения или пустая очередь — одна строка-уведомление;
 //! - **`post_tool`** — ошибка инструмента: совпадения `error_regex` действующих триггеров
 //!   insight решения и Knowledge (по первым [`ERROR_SCAN_MAX`] байтам `error`; триггер с
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
@@ -957,6 +959,8 @@ pub const IDEAS_REVIEW_HINT: &str = "Непросмотренных идей: {n
     шаг: memory_recall event=idea_review → memory_update_entry action=review.";
 /// Строка плана дайджеста (M6.5 §7, [`plan_line`]): пункты плана из идей и следующий из них.
 pub const PLAN_LINE: &str = "План из идей: {n} открытых, следующая — k:{id} «{title}» [{priority}]";
+/// Строка плана без открытого пункта (все пункты в работе или заблокированы): «следующей» нет.
+pub const PLAN_LINE_NO_NEXT: &str = "План из идей: {n} открытых";
 /// `reason` идеи очереди разбора (`new` в режиме `review`): строки дайджеста и подсказки к
 /// `prompt`, идеи пакета `idea_review`.
 const REASON_IDEA_REVIEW: &str = "idea_review";
@@ -1284,16 +1288,10 @@ fn idea_prompt_line(e: &Entry, mark: Option<&str>) -> String {
     }
 }
 
-/// Подсказка-идея цели `target` со строкой `block` (`kind: idea`, `reason: idea`).
-fn idea_cand(target: usize, e: &Entry, block: String) -> Cand {
-    let mut c = entry_cand(target, e, REASON_IDEA, "");
-    c.block = block;
-    c
-}
-
-/// Идея очереди разбора цели `target` со строкой `block` (`kind: idea`, `reason: idea_review`).
-fn idea_review_cand(target: usize, e: &Entry, block: String) -> Cand {
-    let mut c = entry_cand(target, e, REASON_IDEA_REVIEW, "");
+/// Подсказка-идея цели `target` со строкой `block` (`kind: idea`): `reason` — [`REASON_IDEA`]
+/// (предложение по M5.7) или [`REASON_IDEA_REVIEW`] (очередь разбора, M6.5 §7).
+fn idea_cand(target: usize, e: &Entry, reason: &'static str, block: String) -> Cand {
+    let mut c = entry_cand(target, e, reason, "");
     c.block = block;
     c
 }
@@ -1330,9 +1328,13 @@ fn idea_review_prompt_line(e: &Entry) -> String {
     )
 }
 
-/// Строка плана [`PLAN_LINE`]: `n` пунктов плана из идей, следующий — `next`
-/// ([`zam_store::planned_from_ideas`]; нет `data.priority` — `normal`).
-fn plan_text(n: usize, next: &Entry) -> String {
+/// Строка плана [`PLAN_LINE`]: `n` пунктов плана из идей, следующий — `next`, открытый
+/// ([`zam_store::planned_from_ideas`]; нет `data.priority` — `normal`). Открытых нет (все в
+/// работе или заблокированы) — [`PLAN_LINE_NO_NEXT`].
+fn plan_text(n: usize, next: Option<&Entry>) -> String {
+    let Some(next) = next else {
+        return PLAN_LINE_NO_NEXT.replace("{n}", &n.to_string());
+    };
     let priority = zam_store::TaskData::from_stored(&next.data)
         .priority
         .unwrap_or(zam_store::IdeaPriority::Normal);
@@ -1416,12 +1418,7 @@ async fn digest_ideas(
             let c = zam_store::proactive_ideas(db, &[space], today, &HashSet::new(), max).await?;
             return Ok::<_, StoreError>((0, Vec::new(), c));
         }
-        let n = zam_store::review_queue_len(db, space).await?;
-        let queue = if n > 0 {
-            zam_store::review_queue(db, space, max).await?
-        } else {
-            Vec::new()
-        };
+        let (n, queue) = zam_store::review_queue(db, space, max).await?;
         let tail = zam_store::proposal_ideas(db, &[space], today, max - queue.len()).await?;
         Ok((n, queue, tail))
     };
@@ -1437,7 +1434,7 @@ async fn digest_ideas(
     };
     let mut out: Vec<Cand> = queue
         .iter()
-        .map(|e| idea_review_cand(i, e, idea_line(e, None)))
+        .map(|e| idea_cand(i, e, REASON_IDEA_REVIEW, idea_line(e, None)))
         .collect();
     for e in &cands {
         // пометка «задача снята» — по состоянию задачи (только у `accepted`, §16)
@@ -1460,7 +1457,7 @@ async fn digest_ideas(
         } else {
             idea_tail_line(e, mark)
         };
-        out.push(idea_cand(i, e, block));
+        out.push(idea_cand(i, e, REASON_IDEA, block));
     }
     (out, if queue.is_empty() { 0 } else { n })
 }
@@ -1531,7 +1528,7 @@ async fn review_pack(
     else {
         return Ok((Lines::default(), Vec::new()));
     };
-    let Some(queue) = health.soft(i, r)? else {
+    let Some((n, queue)) = health.soft(i, r)? else {
         return Ok((Lines::default(), Vec::new()));
     };
     if queue.is_empty() {
@@ -1541,13 +1538,34 @@ async fn review_pack(
     for e in &queue {
         let history = review_history(&db, e, deadline).await;
         let similar = review_similar(st, p, headers, req, e, health, deadline).await?;
-        out.push(idea_review_cand(
-            i,
-            e,
-            review_block(e, &history, similar.as_deref()),
+        let block = review_block(e, &history, similar.as_deref());
+        out.push(idea_cand(i, e, REASON_IDEA_REVIEW, block));
+    }
+    // длина очереди — для строки «показано k из N» ([`review_shown_line`])
+    let lines = Lines {
+        ideas_queue: n,
+        ..Lines::default()
+    };
+    Ok((lines, out))
+}
+
+/// Строки после пакета `idea_review` (ревью задачи 4, Minor 3): «Показано идей на разбор: k из
+/// N.» — `shown` вошедших в текст из `n` в очереди; не вошедшие в бюджет (`picked` идей собрано
+/// больше, чем показано) — строка «не показано — идей на разбор: M (…)» в формате строк о снятом
+/// ([`Section::omit`]). Бюджет снимает блоки молча (строки о снятом — только у предела вывода
+/// канала, [`pack_limited`]), поэтому строка — здесь; под пределом вывода (`limited`) её даёт
+/// сам предел (`omit` раздела, [`omit_of`]).
+fn review_shown_line(shown: usize, picked: usize, n: usize, limited: bool) -> String {
+    let mut s = format!("Показано идей на разбор: {shown} из {n}.\n");
+    if shown < picked && !limited {
+        s.push_str(&format!(
+            "{HINT_PREFIX} не показано — {}: {} ({})\n",
+            OMIT_IDEAS_REVIEW.0,
+            picked - shown,
+            OMIT_IDEAS_REVIEW.1
         ));
     }
-    Ok((Lines::default(), out))
+    s
 }
 
 /// Блок идеи пакета `idea_review`: строка идеи (как в дайджесте), тело (до
@@ -1678,7 +1696,8 @@ async fn review_history(db: &zam_store::Db, e: &Entry, deadline: &mut Deadline) 
 /// ослабленным запросом ([`LightSearch::any_terms`]): строгий по тексту идеи находил бы её одну.
 /// Сама идея исключается, остальные — до [`IDEA_REVIEW_SIMILAR_MAX`] строк
 /// `<ссылка> · <вид insight> · <статус> · «<заголовок>»` (у заметки — путь); у отклонённой идеи
-/// — ` — разбор: <первая строка>` ([`decline_reason`]). `None` — срок вышел или поиск не удался.
+/// — ` — разбор: <первая строка>` или ` — причина человека: …` ([`decline_reason`]). `None` —
+/// срок вышел или поиск не удался.
 #[allow(clippy::too_many_arguments)]
 async fn review_similar(
     st: &AppState,
@@ -1716,6 +1735,12 @@ async fn review_similar(
         snippets: false,
         any_terms: true,
     };
+    // тестовая задержка (частичный пакет по сроку): только с фичей test-hooks
+    #[cfg(feature = "test-hooks")]
+    if e.title.contains(TEST_SLOW_IDEA_MARK) {
+        test_slow_idea(deadline).await;
+        return Ok(None);
+    }
     let area = req.area.as_deref();
     let Some(v) = inner_search(st, p, headers, area, body, Some(light), health, deadline).await?
     else {
@@ -1775,7 +1800,7 @@ async fn review_similar(
             if let Some(db) = db
                 && let Some(why) = decline_reason(&db, eid, deadline).await
             {
-                s.push_str(&format!(" — разбор: {why}"));
+                s.push_str(&format!(" — {why}"));
             }
         }
         out.push(s);
@@ -1783,10 +1808,14 @@ async fn review_similar(
     Ok(Some(out))
 }
 
-/// Причина отклонения идеи `id` для строки похожей записи: первая строка разбора агента, если
-/// отклонил он (`data.review`, исход `decline`), иначе — причина последней ревизии с причиной
-/// (решение человека «Отказаться»). Нет причины, сбой чтения, срок — `None`.
+/// Причина отклонения идеи `id` для строки похожей записи (ревью задачи 4, Important 1):
+/// отклонил агент разбором (`data.decided` — `decline` канала `review`) — ` — разбор: <первая
+/// строка разбора>`; отклонил человек — ` — причина человека: <причина>` только из ревизии, где
+/// `data.decided` — `decline` человека (причину в ревизию пишет `decide`, у «Отказаться» она
+/// необязательна: причина другой ревизии — довод «вернуть» или «отложить» — отказу не
+/// принадлежит). Нет такой причины, сбой чтения, срок — `None`.
 async fn decline_reason(db: &zam_store::Db, id: Id, deadline: &mut Deadline) -> Option<String> {
+    use zam_store::{AnswerBy, DecidedAs, DecidedVia, ReviewOutcome};
     let e = match deadline.step(zam_store::get_entry(db, id)).await? {
         Ok(e) => e,
         Err(err) => {
@@ -1795,28 +1824,41 @@ async fn decline_reason(db: &zam_store::Db, id: Id, deadline: &mut Deadline) -> 
         }
     };
     let d = zam_store::IdeaData::from_stored(&e.data);
-    let by_review = d
-        .decided
-        .as_ref()
-        .is_some_and(|dc| dc.channel == zam_store::DecidedVia::Review);
-    if let Some(r) = d
-        .review
-        .as_ref()
-        .filter(|r| by_review && r.outcome == zam_store::ReviewOutcome::Decline)
-    {
-        return Some(pack_text(&r.summary, IDEA_REVIEW_LINE_CHARS));
+    let decided = d.decided.as_ref()?;
+    if decided.decision != DecidedAs::Decline {
+        return None;
     }
-    match deadline.step(zam_store::entry_revisions(db, id)).await? {
-        Ok(revs) => revs
-            .iter()
-            .rev()
-            .find_map(|r| r.reason.as_deref().filter(|s| !s.trim().is_empty()))
-            .map(|s| pack_text(s, IDEA_REVIEW_LINE_CHARS)),
+    if decided.channel == DecidedVia::Review {
+        let r = d
+            .review
+            .as_ref()
+            .filter(|r| r.outcome == ReviewOutcome::Decline)?;
+        return Some(format!(
+            "разбор: {}",
+            pack_text(&r.summary, IDEA_REVIEW_LINE_CHARS)
+        ));
+    }
+    if decided.by != AnswerBy::Human {
+        return None;
+    }
+    let revs = match deadline.step(zam_store::entry_revisions(db, id)).await? {
+        Ok(revs) => revs,
         Err(err) => {
             tracing::warn!(error = %err, "recall: ревизии похожей идеи не прочитаны");
-            None
+            return None;
         }
-    }
+    };
+    // последняя ревизия отклонения человеком — та, что записала нынешнее решение
+    let rev = revs.iter().rev().find(|r| {
+        zam_store::IdeaData::from_stored(&r.data)
+            .decided
+            .is_some_and(|dc| dc.decision == DecidedAs::Decline && dc.by == AnswerBy::Human)
+    })?;
+    let why = rev.reason.as_deref().filter(|s| !s.trim().is_empty())?;
+    Some(format!(
+        "причина человека: {}",
+        pack_text(why, IDEA_REVIEW_LINE_CHARS)
+    ))
 }
 
 /// Подсказки-идеи к `prompt` (§6.2): отдельный лёгкий поиск после основного (`mode=brief`,
@@ -2145,9 +2187,9 @@ async fn collect_prompt_ideas(
         .map(|(i, e, shared, mark)| {
             // идея решения `new` в режиме `review` — в очереди разбора (M6.5 §7)
             if review && !shared && e.status == Some(EntryStatus::New) {
-                idea_review_cand(*i, e, idea_review_prompt_line(e))
+                idea_cand(*i, e, REASON_IDEA_REVIEW, idea_review_prompt_line(e))
             } else {
-                idea_cand(*i, e, idea_prompt_line(e, *mark))
+                idea_cand(*i, e, REASON_IDEA, idea_prompt_line(e, *mark))
             }
         })
         .collect())
@@ -2335,7 +2377,7 @@ async fn released_prompt_ideas(
         .iter()
         .filter(|(_, e, shared, _)| !shared || related.contains(&e.id))
         .take(want)
-        .map(|(i, e, _, mark)| idea_cand(*i, e, idea_prompt_line(e, *mark)))
+        .map(|(i, e, _, mark)| idea_cand(*i, e, REASON_IDEA, idea_prompt_line(e, *mark)))
         .collect()
 }
 
@@ -2649,7 +2691,7 @@ async fn plan_line(
         .step(zam_store::planned_from_ideas(&t.db, space))
         .await?
     {
-        Ok((n, Some(next))) if n > 0 => Some(plan_text(n, &next)),
+        Ok((n, next)) if n > 0 => Some(plan_text(n, next.as_ref())),
         Ok(_) => None,
         Err(e) => {
             tracing::warn!(error = %e, "recall: пункты плана из идей не прочитаны");
@@ -4675,6 +4717,13 @@ const OMIT_OPEN_QUESTIONS: Omit = ("строк открытых вопросов
 /// Адрес снятой строки плана из идей.
 const OMIT_PLAN: Omit = ("строк плана из идей", "memory_search kinds=[task]");
 
+/// Адрес идей пакета `idea_review`, не вошедших в ответ: следующий пакет после разбора
+/// показанных (разобранные из очереди уходят).
+const OMIT_IDEAS_REVIEW: Omit = (
+    "идей на разбор",
+    "memory_recall event=idea_review после разбора показанных",
+);
+
 /// Адрес снятого блока `(что, где полностью)` — строка «не показано — <что>: N (<где>)».
 type Omit = (&'static str, &'static str);
 /// Адрес снятой строки словаря.
@@ -4700,6 +4749,7 @@ fn omit_of(title: Option<&str>) -> Option<(String, String)> {
         }
         "### Решение" => ("корней решения", "memory_tree"),
         SECTION_ENVIRONMENT => ("записей окружения", "memory_vault"),
+        SECTION_IDEAS_REVIEW => OMIT_IDEAS_REVIEW,
         _ => return None,
     };
     Some((what.to_string(), whole.to_string()))
@@ -5093,6 +5143,13 @@ pub async fn recall(
     let rules_reserved = matches!(req.event, Event::SessionStart | Event::Recovery);
     let rules_short = std::mem::take(&mut lines.rules_short);
     let rules_hidden = lines.rules_hidden;
+    // пакет разбора идей: длина очереди и собранные идеи — для строки «показано k из N»
+    let review_total = lines.ideas_queue;
+    let review_picked = if req.event == Event::IdeaReview {
+        chosen.iter().map(|(_, c)| c.len()).sum()
+    } else {
+        0
+    };
     let (mut packed, mut picked) = arrange(recovery, rules_reserved, lines, ideas, chosen);
     if !code_section.is_empty() {
         // раздел `### Код` — после `### Файлы`; строки карты не подсказки записей (без учёта)
@@ -5118,6 +5175,19 @@ pub async fn recall(
         .iter()
         .filter_map(|&(si, bi)| picked.get(si).and_then(|p| p.get(bi)).copied())
         .collect();
+    let mut text = text;
+    if review_picked > 0 {
+        let shown = shown_now
+            .iter()
+            .filter(|c| c.reason == REASON_IDEA_REVIEW)
+            .count();
+        text.push_str(&review_shown_line(
+            shown,
+            review_picked,
+            review_total,
+            limit.is_some(),
+        ));
+    }
     // контрольная группа (M6 §12): ничего не выдано — ни текста, ни отметок показа
     let (text, rules_tokens, shown_now) = if holdout {
         (String::new(), 0, Vec::new())

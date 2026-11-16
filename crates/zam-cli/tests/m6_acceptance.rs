@@ -438,8 +438,10 @@ fn context(o: &Output) -> String {
 
 const NOTE: &str = "# Кэш миниатюр\n\nКэш миниатюр чистится раз в сутки.\n";
 
-/// Общие шаги обоих направлений: запись, поиск, чтение, идея в дайджесте, MCP, `code sync`.
-fn common_steps(p: &Proj, who: &str) {
+/// Общие шаги обоих направлений: запись, поиск, чтение, идея в дайджесте (раздел `ideas` —
+/// по серверу: M5.7 — `### Идеи`, текущий в режиме по умолчанию `review` — `### Идеи на
+/// разбор`), MCP, `code sync`.
+fn common_steps(p: &Proj, who: &str, ideas: &str) {
     ok(
         &p.z(&["write", "knowledge:m6/cache"], NOTE.as_bytes()),
         &format!("{who}: write"),
@@ -472,7 +474,7 @@ fn common_steps(p: &Proj, who: &str) {
         ),
     ));
     assert!(
-        ctx.contains("### Идеи") && ctx.contains(&format!("w:{idea}")),
+        ctx.contains(&format!("{ideas}\n")) && ctx.contains(&format!("w:{idea}")),
         "{who}: идея в дайджесте: {ctx}\n{}",
         p.log()
     );
@@ -499,7 +501,7 @@ fn compat_new_zam_old_server() {
     let s = Srv::start(&srv, "new-zam-old-srv");
     assert_eq!(s.version(), "0.0.10-m5.7");
     let p = Proj::new("nz-os", &s.url, &s.token, None, "recovery = true\n");
-    common_steps(&p, "zam M6 → сервер M5.7");
+    common_steps(&p, "zam M6 → сервер M5.7", "### Идеи");
     // фокус: старый ReadItem — 400 «unknown field `focus`», код выхода не 0, причина названа
     let o = p.z(&["read", "knowledge:m6/cache", "--focus", "кэш"], b"");
     assert_ne!(
@@ -604,7 +606,7 @@ fn compat_old_zam_new_server() {
     let p = Proj::new("oz-ns", &url, &tok, Some(zam), "recovery = true\n");
     let v = ok(&p.z(&["--version"], b""), "zam --version");
     assert!(v.contains("0.0.10-m5.7"), "{v}");
-    common_steps(&p, "zam M5.7 → сервер M6");
+    common_steps(&p, "zam M5.7 → сервер M6", "### Идеи на разбор");
     let sid = "oz-ns-1";
     let ctx = context(&p.hook(
         "session-start",

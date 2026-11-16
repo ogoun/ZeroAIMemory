@@ -44,7 +44,8 @@ async fn heavy_sh05_digest_complete_fts() {
     check_digest("session_start", text, &w, s.code_map);
     check_omits("session_start", text, &w);
     eprintln!("sh-05 session_start (7500 байт): {}", shape(text, &w));
-    assert!(text.contains("### Идеи"), "{text}");
+    // раздел M5.7: загрузчик ТС-2 ставит владельцу `ideas.mode = propose` (`common::heavy`)
+    assert!(text.contains("### Идеи\n"), "{text}");
     // пакет восстановления — те же обязательные строки, кроме идей (§8)
     let mut rec = w.required.clone();
     rec.retain(|r| r.kind != "idea");
