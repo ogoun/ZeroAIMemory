@@ -147,7 +147,7 @@ fn proxy_env_for(url: &str, get: impl Fn(&str) -> Option<String>) -> Option<Stri
 
 /// Хост попадает в список `NO_PROXY` (через запятую или пробел): `*` — все; имя — оно само и
 /// его поддомены (`example.com`, `.example.com`, `*.example.com`); IP — точное совпадение;
-/// подсеть CIDR (`192.168.0.0/16`, `fd00::/8`). Порт у элемента (`host:7700`) не учитывается.
+/// подсеть CIDR (`192.0.2.0/24`, `fd00::/8`). Порт у элемента (`host:7700`) не учитывается.
 fn no_proxy_matches(list: &str, host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let ip = host.parse::<std::net::IpAddr>().ok();
@@ -885,7 +885,7 @@ mod tests {
     fn proxy_by_scheme_like_curl() {
         // обкатка 0.0.11-m6: HTTPS_PROXY не должен уводить http:// к серверу в LAN
         let only_https = env_of(&[("HTTPS_PROXY", "http://p:3128")]);
-        assert_eq!(proxy_env_for("http://192.168.1.20:7700", &only_https), None);
+        assert_eq!(proxy_env_for("http://192.0.2.20:7700", &only_https), None);
         assert_eq!(
             proxy_env_for("https://zam.example.com", &only_https).as_deref(),
             Some("http://p:3128")
@@ -920,7 +920,7 @@ mod tests {
             ("ALL_PROXY", "http://p:3128"),
             (
                 "NO_PROXY",
-                "zam.lan, .corp.example ,*.int, 10.0.0.0/8,192.168.1.20:7700,[fd00::1],fc00::/7",
+                "zam.lan, .corp.example ,*.int, 10.0.0.0/8,192.0.2.20:7700,[fd00::1],fc00::/7",
             ),
         ]);
         for u in [
@@ -931,7 +931,7 @@ mod tests {
             "http://b.corp.example",
             "http://x.int",
             "http://10.20.30.40:7700",
-            "http://192.168.1.20:7700",
+            "http://192.0.2.20:7700",
             "http://[fd00::1]:7700",
             "http://[fc12::5]/",
         ] {
@@ -940,7 +940,7 @@ mod tests {
         for u in [
             "http://zam.lan.evil.com",
             "http://xzam.lan",
-            "http://192.168.1.21",
+            "http://192.0.2.21",
             "http://11.0.0.1",
             "http://[fe80::1]",
         ] {
@@ -949,7 +949,7 @@ mod tests {
         let star = env_of(&[("HTTP_PROXY", "http://p:1"), ("no_proxy", "*")]);
         assert_eq!(proxy_env_for("http://any.host", &star), None);
         assert!(no_proxy_matches("0.0.0.0/0", "8.8.8.8"));
-        assert!(!no_proxy_matches("192.168.0.0/33", "192.168.0.1"));
+        assert!(!no_proxy_matches("192.0.2.0/33", "192.0.2.1"));
         assert!(!no_proxy_matches("bad/x,,", "bad"));
     }
 

@@ -1975,9 +1975,10 @@ async fn test_slow_idea(d: &mut Deadline) {
     d.expired = true;
 }
 
-/// Запас тестовой «медленной идеи» до срока ([`test_slow_idea`]).
+/// Запас тестовой «медленной идеи» до срока ([`test_slow_idea`]): под нагрузкой диска упаковке
+/// и учёту после неё не хватало 0,3 с (сбор 8,35–8,38 с при сроке 8 с, финальное ревью M6.5, F1).
 #[cfg(feature = "test-hooks")]
-const TEST_SLOW_MARGIN: Duration = Duration::from_millis(300);
+const TEST_SLOW_MARGIN: Duration = Duration::from_millis(2000);
 
 /// Предлагать идеи цели `t` можно, только если `propose` в неё пройдёт: токен `ro` и участник
 /// общего решения с `ro` получили бы 403 — им ни раздела `### Идеи`, ни подсказок-идей
