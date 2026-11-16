@@ -776,19 +776,6 @@ fn item_age(it: &Value) -> Option<u32> {
         .map(|d| u32::try_from(d).unwrap_or(u32::MAX))
 }
 
-/// Карточку внутреннего поиска нашёл лексический канал ([`zam_search::any_lexical`] по её
-/// `sources`): короткий запрос подсказок `prompt` (подмодуль `prompt`, M6.6 §3.2) и
-/// подтверждение подсказок-идей (`ideas`).
-fn lexical_card(it: &Value) -> bool {
-    zam_search::any_lexical(
-        it["sources"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str),
-    )
-}
-
 /// Срок сбора подсказок (`recall.timeout_ms`).
 struct Deadline {
     at: Instant,
@@ -3718,18 +3705,6 @@ mod tests {
             block: format!("ZeroAIMemory: {title}"),
             age_days: None,
         }
-    }
-
-    /// Карточка внутреннего поиска — лексическая по `sources` (`zam_search::any_lexical`).
-    #[test]
-    fn lexical_card_reads_sources() {
-        assert!(lexical_card(&json!({"sources": ["vector", "fts"]})));
-        assert!(lexical_card(&json!({"sources": ["alias"]})));
-        assert!(lexical_card(&json!({"sources": ["trigram"]})));
-        assert!(!lexical_card(&json!({"sources": ["vector"]})));
-        assert!(!lexical_card(&json!({"sources": ["vector", "folder"]})));
-        assert!(!lexical_card(&json!({"sources": [1, null]})));
-        assert!(!lexical_card(&json!({})));
     }
 
     /// Ревью задачи 9: в пакете восстановления без раздела после трёх первых уведомления и

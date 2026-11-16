@@ -7107,6 +7107,7 @@ dependencies = [
  "jiff",
  "regex",
  "serde",
+ "serde_json",
  "zam-core",
 ]
 

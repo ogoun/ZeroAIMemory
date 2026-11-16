@@ -25,60 +25,69 @@ use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::adjust::recency_factor;
 
-/// Канал кандидатов.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Channel {
+/// Перечисление каналов, [`Channel::ALL`] и имена [`Channel::as_str`] — из одного списка
+/// (ревью задачи 2 M6.6, R3): новый канал не может не попасть в `ALL`, а значит и в разбор имени
+/// [`Channel::from_name`] (иначе он молча стал бы «не лексическим» в [`any_lexical`]).
+macro_rules! channels {
+    ($($(#[$doc:meta])* $variant:ident => $name:literal,)+) => {
+        /// Канал кандидатов.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Channel {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl Channel {
+            /// Все каналы, в порядке объявления.
+            pub const ALL: &'static [Channel] = &[$(Channel::$variant,)+];
+
+            /// Имя в `sources` ответа.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Channel::$variant => $name,)+
+                }
+            }
+        }
+    };
+}
+
+channels! {
     /// Qdrant: dense + sparse по листам и dense по сводкам, слитые RRF в Qdrant.
-    Vector,
+    Vector => "vector",
     /// FTS5 `bm25` (unicode61).
-    Fts,
+    Fts => "fts",
     /// FTS5 `trigram`: идентификаторы и код.
-    Trigram,
+    Trigram => "trigram",
     /// FTS5 `bm25` по запросу, расширенному именами и псевдонимами терминов словаря (M4.5).
-    Alias,
+    Alias => "alias",
     /// Подъём потомков найденной папки (см. модуль).
-    Folder,
+    Folder => "folder",
 }
 
 impl Channel {
-    /// Все каналы.
-    pub const ALL: [Channel; 5] = [
-        Channel::Vector,
-        Channel::Fts,
-        Channel::Trigram,
-        Channel::Alias,
-        Channel::Folder,
-    ];
-
-    /// Имя в `sources` ответа.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Channel::Vector => "vector",
-            Channel::Fts => "fts",
-            Channel::Trigram => "trigram",
-            Channel::Alias => "alias",
-            Channel::Folder => "folder",
-        }
+    /// Канал по имени в `sources` ([`Channel::as_str`]); неизвестное имя — `None`.
+    pub fn from_name(name: &str) -> Option<Channel> {
+        Channel::ALL.iter().copied().find(|c| c.as_str() == name)
     }
 
     /// Лексический канал — нашёл слово запроса в тексте (`fts`, `trigram`, `alias`), а не по
-    /// смыслу (`vector`, `folder` — точки папок из векторного поиска); M6.6 §3.2.
+    /// смыслу (`vector`, `folder` — точки папок из векторного поиска); M6.6 §3.2. Сопоставление
+    /// без `_`: новый канал не соберётся, пока его не отнесут к одной из сторон.
     pub const fn is_lexical(self) -> bool {
-        matches!(self, Channel::Fts | Channel::Trigram | Channel::Alias)
+        match self {
+            Channel::Fts | Channel::Trigram | Channel::Alias => true,
+            Channel::Vector | Channel::Folder => false,
+        }
     }
 }
 
 /// Карточку поиска нашёл лексический канал: среди её `sources` (имена [`Channel::as_str`])
-/// есть лексический ([`Channel::is_lexical`]); неизвестное имя — не лексическое. Одно правило
-/// для подсказок сервера — короткий запрос `prompt` и подтверждение подсказок-идей (балл гибрида
-/// нормирован по непустым каналам: карточка одного вектора получает 1,0 на любой запрос, M6.6
-/// §3.2) — и для модели калибровки `xtask eval --hints`.
+/// есть лексический ([`Channel::is_lexical`]); неизвестное имя — не лексическое. Строковая
+/// основа правила [`crate::recall::lexical_card`] (подсказки `prompt` и идеи сервера, модель
+/// калибровки `xtask eval --hints`; M6.6 §3.2).
 pub fn any_lexical<'a>(sources: impl IntoIterator<Item = &'a str>) -> bool {
-    sources.into_iter().any(|s| {
-        Channel::ALL
-            .iter()
-            .any(|c| c.is_lexical() && c.as_str() == s)
-    })
+    sources
+        .into_iter()
+        .any(|s| Channel::from_name(s).is_some_and(Channel::is_lexical))
 }
 
 /// Уровень чанка (§8.2).
@@ -795,6 +804,10 @@ mod tests {
     fn lexical_channels_and_sources() {
         let names: HashSet<&str> = Channel::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(names.len(), Channel::ALL.len(), "имена каналов различны");
+        for c in Channel::ALL {
+            assert_eq!(Channel::from_name(c.as_str()), Some(*c));
+        }
+        assert_eq!(Channel::from_name("bm25"), None);
         let lexical: Vec<&str> = Channel::ALL
             .iter()
             .filter(|c| c.is_lexical())

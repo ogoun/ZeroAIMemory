@@ -14,7 +14,7 @@
 //!   в запросе — уже предметное слово. Поиска подсказок, задач и идей нет.
 //! - **Короткий запрос** (предметных слов не больше [`PROMPT_SHORT_WORDS`], M6.6 §3.2) —
 //!   подсказка поиска проходит, только если запись нашёл лексический канал
-//!   ([`zam_search::any_lexical`]): балл гибрида нормирован по непустым каналам, и у слова без
+//!   ([`PromptGate::admits_card`]): балл гибрида нормирован по непустым каналам, и у слова без
 //!   FTS-совпадения ближайшая по вектору запись получала бы 1,0 при пороге 0,6. Поиск без модели
 //!   (`degraded`) правило не меняет: там все карточки и так из FTS.
 //! - **Подсказка-задача** (M6.6 §3.4): отдельный проход FTS без эмбеддинга по задачам `open |
@@ -42,7 +42,7 @@ use zam_store::{
 use super::ideas::prompt_ideas;
 use super::{
     Cand, Deadline, REASON_TASK, RecallReq, age_of, entry_spaces, inner_search, item_age,
-    lexical_card, prompt_min_score, term_cands,
+    prompt_min_score, term_cands,
 };
 use crate::api::search::Health;
 use crate::api::sessions::RequestSession;
@@ -74,19 +74,20 @@ pub(super) async fn prompt_sections(
     deadline: &mut Deadline,
 ) -> Result<Vec<(Option<&'static str>, Vec<Cand>)>, ApiError> {
     let prompt = req.prompt.as_deref().unwrap_or_default();
-    let query = query_head(prompt);
-    let gate = prompt_gate(&query);
+    // признак пересылки — по всему промпту, как у хука; предметные слова — по запросу поиска
+    let gate = prompt_gate(prompt, zam_store::search::QUERY_MAX_CHARS);
     if gate == PromptGate::Relayed {
         return Ok(Vec::new());
     }
     // строки словаря — перед подсказками insight; у каждого свой предел
     let chars = crate::glossary::HINT_TEXT_CHARS;
     let terms = term_cands(st, prompt, chars, health, deadline).await;
-    let PromptGate::Search { subject, short } = gate else {
+    let PromptGate::Search { subject, short } = &gate else {
         return Ok(vec![(None, terms)]);
     };
-    let hints = prompt_hints(st, p, headers, req, &query, short, health, deadline).await?;
-    let tasks = task_prompt_cands(&query, &subject, short, health, deadline).await?;
+    let query = query_head(prompt);
+    let hints = prompt_hints(st, p, headers, req, &query, &gate, health, deadline).await?;
+    let tasks = task_prompt_cands(&query, subject, *short, health, deadline).await?;
     // идеи — отдельным поиском после основного, своей строкой и своим пределом
     let ideas = if ideas_on {
         prompt_ideas(st, p, headers, req, session, health, deadline, review).await?
@@ -109,9 +110,9 @@ fn query_head(prompt: &str) -> String {
         .collect()
 }
 
-/// Внутренний `POST /search` (см. модуль [`super`]) по запросу `query` (в нём есть предметные
-/// слова — [`prompt_gate`]) и отбор insight и заметок Rules; `short` — короткий запрос: только
-/// карточки с лексическим совпадением ([`lexical_card`]).
+/// Внутренний `POST /search` (см. модуль [`super`]) по запросу `query` и отбор insight и заметок
+/// Rules: карточка — с баллом не ниже порога и принятая правилом тишины `gate`
+/// ([`PromptGate::admits_card`]: у короткого запроса — только лексические).
 #[allow(clippy::too_many_arguments)]
 async fn prompt_hints(
     st: &AppState,
@@ -119,7 +120,7 @@ async fn prompt_hints(
     headers: &HeaderMap,
     req: &RecallReq,
     query: &str,
-    short: bool,
+    gate: &PromptGate,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Vec<Cand>, ApiError> {
@@ -145,7 +146,7 @@ async fn prompt_hints(
     let targets = health.targets();
     let mut out: Vec<Cand> = Vec::new();
     for it in v["items"].as_array().into_iter().flatten() {
-        if it["score"].as_f64().unwrap_or(0.0) < min || (short && !lexical_card(it)) {
+        if it["score"].as_f64().unwrap_or(0.0) < min || !gate.admits_card(it) {
             continue;
         }
         let space_kind = it["space"]["kind"].as_str().unwrap_or_default();

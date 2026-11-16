@@ -395,12 +395,13 @@ pub fn subject_terms(prompt: &str) -> Vec<String> {
 /// Предметных слов ([`subject_terms`]), при которых запрос к подсказкам «короткий» (M6.6 §3.2,
 /// **[решение координатора]** — константа, не ключ конфигурации): у одного-двух слов векторный
 /// сигнал самый слабый, поэтому подсказка поиска — только с лексическим совпадением
-/// ([`crate::any_lexical`]), а подсказка-задача — только с покрытым заголовком (ревью задачи 2,
-/// M1).
+/// ([`PromptGate::admits_card`]), а подсказка-задача — только с покрытым заголовком (ревью задачи
+/// 2, M1).
 pub const PROMPT_SHORT_WORDS: usize = 2;
 
 /// Решение по запросу пользователя к подсказкам (`/recall` `prompt`, M6.6 §3.1–§3.3) — до
-/// поиска: одно правило для сервера и модели калибровки `xtask eval --hints` ([`prompt_gate`]).
+/// поиска: одно правило для сервера и модели калибровки `xtask eval --hints` ([`prompt_gate`],
+/// отбор карточек — [`PromptGate::admits_card`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptGate {
     /// Пересланное сообщение агента ([`zam_core::text::is_relayed_message`]) — тишина, без
@@ -413,14 +414,44 @@ pub enum PromptGate {
     Search { subject: Vec<String>, short: bool },
 }
 
-/// Правило тишины подсказок к запросу `query` (первые 512 символов промпта): пересланное
-/// сообщение — раньше всего, затем запрос без предметных слов, иначе — поиск с признаком
-/// короткого запроса.
-pub fn prompt_gate(query: &str) -> PromptGate {
-    if zam_core::text::is_relayed_message(query) {
+impl PromptGate {
+    /// Карточка внутреннего поиска `/search` (JSON элемента `items`) может стать подсказкой
+    /// поиска: поиск идёт ([`PromptGate::Search`]) и запрос не короткий — или карточку нашёл
+    /// лексический канал ([`lexical_card`]). Порог балла и виды записей — у сервера.
+    pub fn admits_card(&self, card: &serde_json::Value) -> bool {
+        match self {
+            PromptGate::Search { short, .. } => !short || lexical_card(card),
+            PromptGate::Relayed | PromptGate::NoSubject => false,
+        }
+    }
+}
+
+/// Имена каналов карточки `/search` — её поле `sources` (нестроковые элементы пропускаются).
+pub fn card_sources(card: &serde_json::Value) -> impl Iterator<Item = &str> {
+    card["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+}
+
+/// Карточку `/search` нашёл лексический канал ([`crate::any_lexical`] по [`card_sources`]):
+/// короткий запрос подсказок ([`PromptGate::admits_card`]) и подтверждение подсказок-идей
+/// сервера (M6.6 §3.2).
+pub fn lexical_card(card: &serde_json::Value) -> bool {
+    crate::any_lexical(card_sources(card))
+}
+
+/// Правило тишины подсказок к запросу (M6.6 §3.1–§3.3). Пересланное сообщение — раньше всего и
+/// по всему `prompt` (тот же признак, что у хука `zam hook prompt`); предметные слова — по
+/// первым `head_chars` символам (запрос поиска подсказок, у сервера —
+/// `zam_store::search::QUERY_MAX_CHARS`); иначе — поиск с признаком короткого запроса.
+pub fn prompt_gate(prompt: &str, head_chars: usize) -> PromptGate {
+    if zam_core::text::is_relayed_message(prompt) {
         return PromptGate::Relayed;
     }
-    let subject = subject_terms(query);
+    let head: String = prompt.chars().take(head_chars).collect();
+    let subject = subject_terms(&head);
     if subject.is_empty() {
         return PromptGate::NoSubject;
     }
@@ -1102,20 +1133,31 @@ mod tests {
     /// затем «нет предмета», затем граница короткого запроса `<= PROMPT_SHORT_WORDS`.
     #[test]
     fn prompt_gate_rules() {
-        let search = |p: &str| match prompt_gate(p) {
+        // запрос поиска подсказок сервера — первые 512 символов промпта
+        const HEAD: usize = 512;
+        let gate = |p: &str| prompt_gate(p, HEAD);
+        let search = |p: &str| match gate(p) {
             PromptGate::Search { subject, short } => Some((subject.len(), short)),
             _ => None,
         };
         assert_eq!(
-            prompt_gate("[Subagent hand-back] квазар найден в каталоге"),
+            gate("[Subagent hand-back] квазар найден в каталоге"),
             PromptGate::Relayed
         );
-        assert_eq!(prompt_gate("\n<task-notification>"), PromptGate::Relayed);
-        assert_eq!(prompt_gate("согласен"), PromptGate::NoSubject);
-        assert_eq!(prompt_gate("Да, давай, продолжай"), PromptGate::NoSubject);
-        assert_eq!(prompt_gate(""), PromptGate::NoSubject);
+        assert_eq!(gate("\n<task-notification>"), PromptGate::Relayed);
+        // признак пересылки — по всему промпту, как у хука (ревью задачи 2, R2): маркер за
+        // пределом запроса поиска после ведущих пробелов — тоже пересланное сообщение
+        let far = format!("{}[Subagent hand-back] квазар", " ".repeat(HEAD + 10));
+        assert!(zam_core::text::is_relayed_message(&far));
+        assert_eq!(gate(&far), PromptGate::Relayed);
+        // предметные слова — только из первых `head_chars` символов
+        let tail = format!("{} квазар светит ярко", "да ".repeat(HEAD / 3 + 1));
+        assert_eq!(gate(&tail), PromptGate::NoSubject);
+        assert_eq!(gate("согласен"), PromptGate::NoSubject);
+        assert_eq!(gate("Да, давай, продолжай"), PromptGate::NoSubject);
+        assert_eq!(gate(""), PromptGate::NoSubject);
         assert_eq!(
-            prompt_gate("согласен, мигрируй 0026"),
+            gate("согласен, мигрируй 0026"),
             PromptGate::Search {
                 subject: vec!["0026".into(), "мигрируй".into()],
                 short: true
@@ -1130,5 +1172,38 @@ mod tests {
             search("посмотри [Subagent hand-back] квазар"),
             Some((5, false))
         );
+    }
+
+    /// Отбор карточек `/search` правилом тишины (ревью задачи 2, R1): реплика и пересланное —
+    /// ни одной; короткий запрос — только лексические (`fts`, `trigram`, `alias` в `sources`);
+    /// длинный — любые.
+    #[test]
+    fn prompt_gate_admits_cards() {
+        let card = |sources: serde_json::Value| serde_json::json!({"sources": sources});
+        let (vector, fts, trigram, alias, folder, odd, none) = (
+            card(serde_json::json!(["vector"])),
+            card(serde_json::json!(["vector", "fts"])),
+            card(serde_json::json!(["trigram"])),
+            card(serde_json::json!(["alias"])),
+            card(serde_json::json!(["vector", "folder"])),
+            card(serde_json::json!([1, null, "FTS"])),
+            serde_json::json!({}),
+        );
+        for c in [&fts, &trigram, &alias] {
+            assert!(lexical_card(c), "{c}");
+        }
+        for c in [&vector, &folder, &odd, &none] {
+            assert!(!lexical_card(c), "{c}");
+        }
+        assert_eq!(card_sources(&odd).collect::<Vec<_>>(), ["FTS"]);
+        let all = [&vector, &fts, &trigram, &alias, &folder, &odd, &none];
+        let admitted = |p: &str| -> usize {
+            let g = prompt_gate(p, 512);
+            all.iter().filter(|c| g.admits_card(c)).count()
+        };
+        assert_eq!(admitted("согласен"), 0);
+        assert_eq!(admitted("[Subagent hand-back] квазар светит ярко"), 0);
+        assert_eq!(admitted("квазар"), 3);
+        assert_eq!(admitted("квазар светит ярко"), all.len());
     }
 }
