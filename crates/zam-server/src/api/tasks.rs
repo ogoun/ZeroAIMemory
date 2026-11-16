@@ -9,7 +9,8 @@
 //! - `POST /entries/{id}/release` → 200 `Entry`: снимает захват своей сессии; чужой действующий
 //!   захват снимает только человек (WebUI), агенту — 403. Аудит `entry.release`;
 //! - смена статуса и полей задачи — `PATCH /entries/{id}` ([`super::entries::patch`]);
-//! - у `done`-задач в ответах (запись, лента) есть `duration_min` — `done_at − started_at`.
+//! - у `done`-задач в ответах (запись, лента) есть `duration_min` — `done_at − started_at`;
+//! - у задачи из идеи (запись, лента) — `idea {id, title, status, space_id}` и `ideas` (M6.5 §9).
 //!
 //! Запись задач идёт общим путём `POST /spaces/{space}/entries` (`kind: task`) в пространствах
 //! решения и Knowledge.
@@ -22,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_store::{
     CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Entry, EntryKind, EntryStatus, TaskData, TaskError,
-    claim_task, get_entry, release_task,
+    TaskIdea, claim_task, get_entry, release_task,
 };
 
 use super::entries::{audit_details, unprocessable};
@@ -45,16 +46,26 @@ impl From<TaskError> for ApiError {
     }
 }
 
-/// `duration_min` у `done`-задачи: `done_at − started_at` в минутах, `null` — нет `started_at`.
-pub fn attach_task(v: &mut Value, e: &Entry) {
-    if e.kind == EntryKind::Task
-        && e.status == Some(EntryStatus::Done)
-        && let Value::Object(o) = v
-    {
+/// Поля задачи в ответах: у `done` — `duration_min` (`done_at − started_at` в минутах, `null` —
+/// нет `started_at`); у задачи из идеи (`ideas` — её живые идеи по системным рёбрам
+/// `derived_from`, [`zam_store::ideas_of_tasks`]) — `idea {id, title, status, space_id}` первой идеи и
+/// `ideas` — все (M6.5 §9: пометка «из идеи» в «Задачах» WebUI).
+pub fn attach_task(v: &mut Value, e: &Entry, ideas: &[TaskIdea]) {
+    if e.kind != EntryKind::Task {
+        return;
+    }
+    let Value::Object(o) = v else {
+        return;
+    };
+    if e.status == Some(EntryStatus::Done) {
         o.insert(
             "duration_min".into(),
             json!(TaskData::from_stored(&e.data).duration_min()),
         );
+    }
+    if let Some(first) = ideas.first() {
+        o.insert("idea".into(), json!(first));
+        o.insert("ideas".into(), json!(ideas));
     }
 }
 

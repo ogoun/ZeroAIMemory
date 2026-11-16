@@ -2,7 +2,8 @@
 //! аудит, повтор по `Idempotency-Key`, отказы), режим `ideas.mode` (настройка пользователя,
 //! умолчание сервера `[ideas] default_mode`, режим владельца базы в общем решении), `propose`
 //! идеи `new` в режиме `review` — 409, правка возвращённой идеи человеком (`by: human` токена,
-//! сессия WebUI). Сервер без моделей (поиск — FTS).
+//! сессия WebUI); для WebUI (§9, задача 8) — счётчики статусов `entries/counts`, фильтр
+//! `from_idea` и поле `idea` задачи. Сервер без моделей (поиск — FTS).
 mod common;
 
 use axum::http::{Method, StatusCode};
@@ -799,4 +800,148 @@ async fn review_shared_solution_rights_and_owner_mode() {
         )
         .await;
     ok(&r, StatusCode::OK);
+}
+
+/// Лента токеном: `items` ответа `GET <path>`.
+async fn items(a: &Api, path: &str) -> Vec<Value> {
+    let r = a.t(Method::GET, path, None).await;
+    ok(&r, StatusCode::OK);
+    r.json()["items"].as_array().unwrap().clone()
+}
+
+fn ids_of(items: &[Value]) -> Vec<String> {
+    items.iter().map(id).collect()
+}
+
+/// §9 (WebUI, задача 8): `GET /spaces/{space}/entries/counts?kind=idea` — все статусы идеи
+/// (нулевые тоже), числа совпадают с лентой по каждому статусу и с её фильтрами (`origin`);
+/// `from_idea=1` у задач — только задачи с системным ребром `derived_from` на живую идею (и у
+/// счётчиков задач); у задачи из идеи в `GET` и в ленте — `idea {id, title, status}` первой идеи
+/// и `ideas` — все; у идеи ленты — `task` с заголовком; ошибки фильтров — 400/422.
+#[tokio::test]
+async fn entries_counts_and_from_idea() {
+    let a = setup("counts").await;
+    let n1 = idea_tok(&a, &sol(), "Новая первая", "human").await;
+    idea_tok(&a, &sol(), "Новая вторая", "human").await;
+    idea_tok(&a, &sol(), "Своя идея агента", "agent").await;
+    returned_idea(&a, "На доработку").await;
+    let pl = idea_tok(&a, &sol(), "В план идея", "human").await;
+    let r = review(&a, &pl, json!({"outcome": "plan", "summary": summary()})).await;
+    ok(&r, StatusCode::OK);
+    let tid = id(&r.json()["task"]);
+    let d = idea_tok(&a, &sol(), "Отклонить идею", "human").await;
+    let r = review(&a, &d, json!({"outcome": "decline", "summary": summary()})).await;
+    ok(&r, StatusCode::OK);
+    let plain = task_tok(&a, "Обычная задача").await;
+
+    // счётчики: все статусы вида, в том числе нулевые
+    let r = a
+        .t(Method::GET, &format!("{}/counts?kind=idea", sol()), None)
+        .await;
+    ok(&r, StatusCode::OK);
+    let c = r.json();
+    assert_eq!(
+        c,
+        json!({"new": 3, "proposed": 0, "accepted": 1, "deferred": 0, "declined": 1,
+                "done": 0, "returned": 1}),
+        "{c}"
+    );
+    // счётчик каждого статуса — столько же, сколько строк ленты с этим статусом
+    for (s, n) in c.as_object().unwrap() {
+        let got = items(&a, &format!("{}?kind=idea&status={s}&limit=200", sol())).await;
+        assert_eq!(got.len() as u64, n.as_u64().unwrap(), "статус {s}");
+    }
+    // фильтр ленты: только идеи человека
+    let r = a
+        .t(
+            Method::GET,
+            &format!("{}/counts?kind=idea&origin=human", sol()),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["new"], 2, "{}", r.text());
+    let human_new = items(&a, &format!("{}?kind=idea&status=new&origin=human", sol())).await;
+    assert_eq!(human_new.len(), 2);
+
+    // from_idea=1 — только задача из идеи; у неё — idea, у обычной — нет
+    let from = items(&a, &format!("{}?kind=task&from_idea=1", sol())).await;
+    assert_eq!(ids_of(&from), vec![tid.clone()]);
+    assert_eq!(from[0]["idea"]["id"], pl.as_str());
+    assert_eq!(from[0]["idea"]["title"], "В план идея");
+    assert_eq!(from[0]["idea"]["status"], "accepted");
+    assert_eq!(from[0]["idea"]["space_id"], from[0]["space_id"]);
+    let all = items(&a, &format!("{}?kind=task", sol())).await;
+    assert_eq!(all.len(), 2, "{all:?}");
+    let p = all.iter().find(|t| id(t) == plain).unwrap();
+    assert!(p.get("idea").is_none() && p.get("ideas").is_none(), "{p}");
+    let r = a
+        .t(
+            Method::GET,
+            &format!("{}/counts?kind=task&from_idea=1", sol()),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["open"], 1, "{}", r.text());
+    // GET задачи — idea первой идеи
+    let t = get(&a, &tid).await;
+    assert_eq!(t["idea"]["id"], pl.as_str(), "{t}");
+    assert_eq!(t["ideas"].as_array().unwrap().len(), 1);
+    // у идеи ленты — задача с заголовком (строка решения «В план → k:<id> «…»»)
+    let acc = items(&a, &format!("{}?kind=idea&status=accepted", sol())).await;
+    assert_eq!(acc[0]["task"]["id"], tid.as_str(), "{:?}", acc[0]);
+    assert_eq!(acc[0]["task"]["title"], "В план идея");
+    assert_eq!(acc[0]["task"]["status"], "open");
+
+    // вторая идея на ту же задачу (plan с task.id): ideas — обе, idea — первая по созданию
+    let r = review(
+        &a,
+        &n1,
+        json!({"outcome": "plan", "summary": summary(), "task": {"id": format!("k:{tid}")}}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    let t = get(&a, &tid).await;
+    assert_eq!(t["idea"]["id"], n1.as_str(), "первая по созданию: {t}");
+    let both: Vec<&str> = t["ideas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(both, vec![n1.as_str(), pl.as_str()]);
+    // идеи в корзине (человек) — задача больше не «из идеи»
+    for i in [&n1, &pl] {
+        let r = adm_rev(&a, Method::DELETE, &ent(i), None).await;
+        assert!(r.status.is_success(), "{}", r.text());
+    }
+    assert!(
+        items(&a, &format!("{}?kind=task&from_idea=1", sol()))
+            .await
+            .is_empty()
+    );
+    let t = get(&a, &tid).await;
+    assert!(t.get("idea").is_none(), "{t}");
+
+    // ошибки: без kind и вид без статусов — 400, фильтр не своего вида — 422, флаг — 400
+    for (q, s) in [
+        ("counts", StatusCode::BAD_REQUEST),
+        ("counts?kind=changelog", StatusCode::BAD_REQUEST),
+        (
+            "counts?kind=task&origin=human",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "counts?kind=idea&from_idea=1",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        ("counts?kind=task&from_idea=2", StatusCode::BAD_REQUEST),
+        ("?kind=idea&from_idea=1", StatusCode::UNPROCESSABLE_ENTITY),
+        ("?kind=task&from_idea=yes", StatusCode::BAD_REQUEST),
+    ] {
+        let sep = if q.starts_with('?') { "" } else { "/" };
+        let r = a.t(Method::GET, &format!("{}{sep}{q}", sol()), None).await;
+        ok(&r, s);
+    }
 }

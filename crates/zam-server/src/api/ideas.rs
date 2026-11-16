@@ -25,6 +25,8 @@
 //!
 //! Аудит в `system.db` без текста: `entry.idea.propose`, `entry.idea.decide {decision}`,
 //! `entry.idea.adopt`, `entry.idea.review {outcome, task?}`.
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -210,13 +212,7 @@ pub fn attach_idea(v: &mut Value, e: &Entry, links: &IdeaLinks) {
         return;
     };
     if let Some(t) = &links.task {
-        o.insert(
-            "task".into(),
-            match &t.entry {
-                Some(x) => json!({"id": t.id, "status": x.status, "title": x.title}),
-                None => json!({"id": t.id, "deleted": true}),
-            },
-        );
+        o.insert("task".into(), task_value(t.id, t.entry.as_ref()));
     }
     if let Some(q) = &links.question {
         o.insert(
@@ -226,6 +222,38 @@ pub fn attach_idea(v: &mut Value, e: &Entry, links: &IdeaLinks) {
                 None => json!({"id": q.id, "deleted": true}),
             },
         );
+    }
+}
+
+/// `task` идеи: `{id, status, title}`, удалённая или несуществующая — `{id, deleted: true}`.
+fn task_value(id: Id, task: Option<&Entry>) -> Value {
+    match task {
+        Some(x) => json!({"id": id, "status": x.status, "title": x.title}),
+        None => json!({"id": id, "deleted": true}),
+    }
+}
+
+/// Задачи идей ленты (`data.task_id`) одним запросом: id → живая задача (M6.5 §9: строка решения
+/// «В план → k:<id> «…»» ленты WebUI).
+pub async fn idea_tasks_many(db: &Db, items: &[Entry]) -> Result<HashMap<Id, Entry>, ApiError> {
+    let ids: Vec<Id> = items
+        .iter()
+        .filter(|e| e.kind == EntryKind::Idea)
+        .filter_map(|e| IdeaData::from_stored(&e.data).task_id)
+        .collect();
+    Ok(zam_store::live_entries_by_ids(db, &ids).await?)
+}
+
+/// У идеи ленты — `task` в виде [`attach_idea`] по задачам [`idea_tasks_many`].
+pub fn attach_idea_task(v: &mut Value, e: &Entry, tasks: &HashMap<Id, Entry>) {
+    if e.kind != EntryKind::Idea {
+        return;
+    }
+    let Some(id) = IdeaData::from_stored(&e.data).task_id else {
+        return;
+    };
+    if let Value::Object(o) = v {
+        o.insert("task".into(), task_value(id, tasks.get(&id)));
     }
 }
 

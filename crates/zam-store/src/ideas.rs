@@ -2139,6 +2139,60 @@ pub(crate) fn ideas_of_task(c: &Connection, task: Id) -> Result<Vec<Entry>, Stor
     Ok(out)
 }
 
+/// Идея задачи для ответов API (поле `idea` задачи, M6.5 §9): id, заголовок, статус и
+/// пространство (у идеи Knowledge задача «начать» бывает в решении той же базы).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskIdea {
+    pub id: Id,
+    pub title: String,
+    pub status: Option<EntryStatus>,
+    pub space_id: Id,
+}
+
+/// Идеи задач `tasks` одним запросом (лента «Задач» — без запроса на задачу): живые идеи по
+/// системным рёбрам `derived_from` — те же, что у [`ideas_of_task`]; у задачи — по времени
+/// создания идеи (первая — та, из которой задача появилась раньше всех). Задач без идей в ответе
+/// нет.
+pub async fn ideas_of_tasks(
+    db: &Db,
+    tasks: &[Id],
+) -> Result<std::collections::HashMap<Id, Vec<TaskIdea>>, StoreError> {
+    if tasks.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let list =
+        serde_json::Value::from(tasks.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT DISTINCT g.src_id, i.id, i.title, i.status, i.space_id, i.created_at
+             FROM edges g JOIN entries i ON i.id = g.dst_id
+             WHERE g.src_kind = 'entry' AND g.src_id IN (SELECT value FROM json_each(?1))
+               AND g.dst_kind = 'entry' AND g.type = 'derived_from' AND g.origin = 'system'
+               AND g.deleted_at IS NULL AND i.kind = 'idea' AND i.deleted_at IS NULL
+             ORDER BY g.src_id, i.created_at, i.id",
+        )?;
+        let rows = st.query_map([list], |r| {
+            Ok((
+                r.get::<_, Id>(0)?,
+                TaskIdea {
+                    id: r.get(1)?,
+                    title: r.get(2)?,
+                    status: r.get(3)?,
+                    space_id: r.get(4)?,
+                },
+            ))
+        })?;
+        let mut out: std::collections::HashMap<Id, Vec<TaskIdea>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (task, idea) = row?;
+            out.entry(task).or_default().push(idea);
+        }
+        Ok(out)
+    })
+    .await
+}
+
 /// Причина устаревания вопроса «вернуть», когда задача идеи снова живая (§16, п. 4).
 const TASK_REVIVED_REASON: &str = "задача возобновлена";
 

@@ -664,7 +664,8 @@ async fn decision_vector(
     }
 }
 
-/// Запись insight с её триггерами как JSON (`triggers` — массив, у не-insight — нет поля).
+/// Запись как JSON: у insight — её триггеры (`triggers` — массив, у не-insight — нет поля), у
+/// задачи — поля [`super::tasks::attach_task`] (длительность, идеи плана).
 pub async fn entry_json(db: &Db, e: &Entry) -> Result<Value, ApiError> {
     let mut v = serde_json::to_value(e).map_err(|e| ApiError::Internal(e.to_string()))?;
     if e.kind == EntryKind::Insight
@@ -672,7 +673,15 @@ pub async fn entry_json(db: &Db, e: &Entry) -> Result<Value, ApiError> {
     {
         o.insert("triggers".into(), json!(entry_triggers(db, e.id).await?));
     }
-    super::tasks::attach_task(&mut v, e);
+    let ideas = if e.kind == EntryKind::Task {
+        zam_store::ideas_of_tasks(db, &[e.id])
+            .await?
+            .remove(&e.id)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    super::tasks::attach_task(&mut v, e, &ideas);
     Ok(v)
 }
 

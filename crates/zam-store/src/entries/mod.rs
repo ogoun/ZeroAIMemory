@@ -52,7 +52,8 @@ pub(crate) use chunks::{
 };
 pub use read::{
     CHANGELOG_BETWEEN_MAX, DEDUP_CANDIDATES_MAX, DedupCandidate, changelog_between,
-    entry_revisions, find_release_by_version, get_entry, list_entries, title_duplicates,
+    count_by_status, entry_revisions, find_release_by_version, get_entry, list_entries,
+    live_entries_by_ids, title_duplicates,
 };
 pub(crate) use reports::{ATT_COLS, att_row};
 pub use reports::{
@@ -429,6 +430,9 @@ pub struct EntryFilter {
     pub origin: Option<crate::ideas::IdeaOrigin>,
     /// Идеи с таким `data.priority` (M5.7); только при `kind = Some(Idea)`, иначе `BadInput`.
     pub priority: Option<crate::ideas::IdeaPriority>,
+    /// Только задачи из идей — с системным ребром `derived_from` на живую идею (пункты плана,
+    /// M6.5 §9, фильтр «Из идей» «Задач» WebUI); только при `kind = Some(Task)`, иначе `BadInput`.
+    pub from_idea: bool,
 }
 
 /// Нормализованный заголовок (дедупликация, §7.5): нижний регистр, всё, что не буква и не

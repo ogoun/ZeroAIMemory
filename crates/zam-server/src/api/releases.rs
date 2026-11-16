@@ -99,6 +99,7 @@ pub async fn compare(
                 deleted_only: false,
                 origin: None,
                 priority: None,
+                from_idea: false,
             };
             list_entries(&sc.db, f).await?.0.into_iter().next()
         }

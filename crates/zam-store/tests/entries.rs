@@ -836,6 +836,7 @@ async fn deleted_entry_not_in_fts_restore_returns() {
         deleted_only: false,
         origin: None,
         priority: None,
+        from_idea: false,
     };
     assert!(list_entries(&db, feed.clone()).await.unwrap().0.is_empty());
     assert!(matches!(
@@ -911,6 +912,7 @@ async fn list_entries_cursor_and_filters() {
         deleted_only: false,
         origin: None,
         priority: None,
+        from_idea: false,
     };
     // постранично, новые первыми, без повторов и пропусков
     let mut seen = Vec::new();

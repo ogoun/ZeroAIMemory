@@ -34,6 +34,61 @@ fn json_list<T>(v: &[T], f: impl Fn(&T) -> &'static str) -> Option<String> {
         .then(|| serde_json::Value::from(v.iter().map(&f).collect::<Vec<_>>()).to_string())
 }
 
+/// Условия ленты пространства — общие у [`list_entries`] и [`count_by_status`], чтобы счётчики
+/// совпадали с лентой. Параметры: `?1` пространство, `?2` вид, `?3` статусы (JSON), `?4`
+/// `certainty` (JSON), `?5` область, `?6` тег, `?7`–`?8` интервал `created_at`, `?9`–`?10`
+/// курсор (`key`, id), `?12` `data.kind`, `?13` `decided_by`, `?14` с отчётами, `?15`–`?16`
+/// `origin`, `priority` идеи, `?17` только задачи из идей; `?11` — `LIMIT` ленты. `alive` —
+/// живые или удалённые записи, `key` — столбец порядка и курсора.
+fn feed_where(alive: &str, key: &str) -> String {
+    format!(
+        "e.space_id = ?1 AND {alive}
+           AND (?2 IS NULL OR e.kind = ?2)
+           AND (?2 IS NOT NULL OR ?14 OR e.kind <> 'report')
+           AND (?3 IS NULL OR e.status IN (SELECT value FROM json_each(?3)))
+           AND (?4 IS NULL OR e.certainty IN (SELECT value FROM json_each(?4)))
+           AND (?5 IS NULL OR e.area = ?5)
+           AND (?6 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) t
+                                      WHERE t.value = ?6))
+           AND (?7 IS NULL OR e.created_at >= ?7)
+           AND (?8 IS NULL OR e.created_at < ?8)
+           AND (?9 IS NULL OR {key} < ?9 OR ({key} = ?9 AND e.id < ?10))
+           AND (?12 IS NULL OR json_extract(e.data, '$.kind') = ?12)
+           AND (?13 IS NULL OR (e.kind = 'insight'
+                AND json_extract(e.data, '$.kind') = 'decision'
+                AND CASE WHEN json_type(e.data, '$.decision.decided_by') = 'text'
+                         THEN json_extract(e.data, '$.decision.decided_by')
+                         ELSE CASE WHEN e.author_kind = 'agent' THEN 'agent'
+                              ELSE 'human' END END = ?13))
+           AND (?15 IS NULL OR json_extract(e.data, '$.origin') = ?15)
+           AND (?16 IS NULL OR json_extract(e.data, '$.priority') = ?16)
+           AND (NOT ?17 OR {FROM_IDEA_SQL})"
+    )
+}
+
+/// Задача `e` — из идеи: системное ребро `derived_from` на живую идею — то же правило, что у
+/// пунктов плана дайджеста (`ideas::PLANNED_SQL`) и у поля `idea` задачи ([`crate::ideas_of_tasks`]).
+const FROM_IDEA_SQL: &str = "EXISTS (SELECT 1 FROM edges g JOIN entries i ON i.id = g.dst_id
+     WHERE g.src_kind = 'entry' AND g.src_id = e.id AND g.dst_kind = 'entry'
+       AND g.type = 'derived_from' AND g.origin = 'system' AND g.deleted_at IS NULL
+       AND i.kind = 'idea' AND i.deleted_at IS NULL)";
+
+/// Фильтры `data` идеи (`origin`, `priority`) — только у ленты идей, «из идей» — только у
+/// ленты задач (иначе `BadInput`).
+fn check_kind_filters(f: &EntryFilter) -> Result<(), StoreError> {
+    if (f.origin.is_some() || f.priority.is_some()) && f.kind != Some(EntryKind::Idea) {
+        return Err(StoreError::BadInput(
+            "origin и priority — фильтры идей: только с kind=idea".into(),
+        ));
+    }
+    if f.from_idea && f.kind != Some(EntryKind::Task) {
+        return Err(StoreError::BadInput(
+            "from_idea — фильтр задач: только с kind=task".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Лента живых записей пространства: новые первыми (`created_at`, затем id по убыванию),
 /// не больше `limit` (1..=200, иначе `BadInput`). Вторым значением — курсор следующей
 /// страницы (`None` — страниц больше нет); некорректный курсор → `BadInput`. Фильтры:
@@ -43,7 +98,8 @@ fn json_list<T>(v: &[T], f: impl Fn(&T) -> &'static str) -> Option<String> {
 /// Без вида отчёты (`report`) не выдаются, если не задан `with_reports` (сессии WebUI).
 /// `deleted_only` — корзина: только удалённые записи, новые удаления первыми (курсор —
 /// `<deleted_at>|<id>`). `origin` и `priority` — фильтры идей по `data` (M5.7), только при
-/// `kind = idea` (иначе `BadInput`).
+/// `kind = idea`; `from_idea` — задачи из идей (M6.5 §9), только при `kind = task` (иначе
+/// `BadInput`).
 pub async fn list_entries(
     db: &Db,
     f: EntryFilter,
@@ -53,11 +109,7 @@ pub async fn list_entries(
             "limit: от 1 до {LIST_LIMIT_MAX}"
         )));
     }
-    if (f.origin.is_some() || f.priority.is_some()) && f.kind != Some(EntryKind::Idea) {
-        return Err(StoreError::BadInput(
-            "origin и priority — фильтры идей: только с kind=idea".into(),
-        ));
-    }
+    check_kind_filters(&f)?;
     let origin = f.origin.map(|o| o.as_str());
     let priority = f.priority.map(|p| p.as_str());
     let cursor = f.cursor.as_deref().map(parse_cursor).transpose()?;
@@ -76,28 +128,10 @@ pub async fn list_entries(
     db.read(move |c| {
         let mut st = c.prepare_cached(&format!(
             "SELECT {ENTRY_COLS} FROM entries e
-             WHERE e.space_id = ?1 AND {alive}
-               AND (?2 IS NULL OR e.kind = ?2)
-               AND (?2 IS NOT NULL OR ?14 OR e.kind <> 'report')
-               AND (?3 IS NULL OR e.status IN (SELECT value FROM json_each(?3)))
-               AND (?4 IS NULL OR e.certainty IN (SELECT value FROM json_each(?4)))
-               AND (?5 IS NULL OR e.area = ?5)
-               AND (?6 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) t
-                                          WHERE t.value = ?6))
-               AND (?7 IS NULL OR e.created_at >= ?7)
-               AND (?8 IS NULL OR e.created_at < ?8)
-               AND (?9 IS NULL OR {key} < ?9 OR ({key} = ?9 AND e.id < ?10))
-               AND (?12 IS NULL OR json_extract(e.data, '$.kind') = ?12)
-               AND (?13 IS NULL OR (e.kind = 'insight'
-                    AND json_extract(e.data, '$.kind') = 'decision'
-                    AND CASE WHEN json_type(e.data, '$.decision.decided_by') = 'text'
-                             THEN json_extract(e.data, '$.decision.decided_by')
-                             ELSE CASE WHEN e.author_kind = 'agent' THEN 'agent'
-                                  ELSE 'human' END END = ?13))
-               AND (?15 IS NULL OR json_extract(e.data, '$.origin') = ?15)
-               AND (?16 IS NULL OR json_extract(e.data, '$.priority') = ?16)
+             WHERE {}
              ORDER BY {key} DESC, e.id DESC
-             LIMIT ?11"
+             LIMIT ?11",
+            feed_where(alive, key)
         ))?;
         let rows = st.query_map(
             params![
@@ -117,6 +151,7 @@ pub async fn list_entries(
                 f.with_reports,
                 origin,
                 priority,
+                f.from_idea,
             ],
             entry_row,
         )?;
@@ -135,6 +170,110 @@ pub async fn list_entries(
             None
         };
         Ok((out, next))
+    })
+    .await
+}
+
+/// Число живых записей вида `f.kind` по статусам — с теми же фильтрами, что у
+/// [`list_entries`] (чипы статусов ленты идей WebUI, M6.5 §9): каждый статус вида
+/// ([`super::allowed_statuses`], в его порядке), отсутствующий — с нулём. `statuses`, `cursor` и
+/// `limit` фильтра не учитываются. Без вида, у вида без статусов и с `deleted_only` — `BadInput`.
+pub async fn count_by_status(
+    db: &Db,
+    f: EntryFilter,
+) -> Result<Vec<(EntryStatus, usize)>, StoreError> {
+    let Some(kind) = f.kind else {
+        return Err(StoreError::BadInput(
+            "счётчики статусов — только с kind".into(),
+        ));
+    };
+    let all = super::allowed_statuses(kind);
+    if all.is_empty() {
+        return Err(StoreError::BadInput(format!(
+            "у вида {} нет статусов",
+            kind.as_str()
+        )));
+    }
+    if f.deleted_only {
+        return Err(StoreError::BadInput(
+            "счётчики статусов — только у живых записей".into(),
+        ));
+    }
+    check_kind_filters(&f)?;
+    let origin = f.origin.map(|o| o.as_str());
+    let priority = f.priority.map(|p| p.as_str());
+    let certainty = json_list(&f.certainty, |c| c.as_str());
+    let since = f.since.map(fmt_ts);
+    let until = f.until.map(fmt_ts);
+    let counts: Vec<(Option<EntryStatus>, i64)> = db
+        .read(move |c| {
+            // `?3` (статусы) и курсор `?9`–`?10` — пустые, `?11` (`LIMIT` ленты) не участвует
+            let mut st = c.prepare_cached(&format!(
+                "SELECT e.status, count(*) FROM entries e
+                 WHERE {}
+                 GROUP BY e.status",
+                feed_where("e.deleted_at IS NULL", "e.created_at")
+            ))?;
+            let rows = st.query_map(
+                params![
+                    f.space_id,
+                    Some(kind),
+                    None::<String>,
+                    certainty,
+                    f.area,
+                    f.tag,
+                    since,
+                    until,
+                    None::<String>,
+                    None::<Id>,
+                    0_i64,
+                    f.data_kind,
+                    f.decided_by,
+                    false,
+                    origin,
+                    priority,
+                    f.from_idea,
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await?;
+    Ok(all
+        .iter()
+        .map(|s| {
+            let n = counts
+                .iter()
+                .find(|(st, _)| *st == Some(*s))
+                .map_or(0, |(_, n)| usize::try_from(*n).unwrap_or(0));
+            (*s, n)
+        })
+        .collect())
+}
+
+/// Живые записи по id (одним запросом, для полей ленты вроде задачи идеи): id → запись;
+/// удалённых и несуществующих в ответе нет.
+pub async fn live_entries_by_ids(
+    db: &Db,
+    ids: &[Id],
+) -> Result<std::collections::HashMap<Id, Entry>, StoreError> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let list =
+        serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {ENTRY_COLS} FROM entries e
+             WHERE e.id IN (SELECT value FROM json_each(?1)) AND e.deleted_at IS NULL"
+        ))?;
+        let rows = st.query_map([list], entry_row)?;
+        let mut out = std::collections::HashMap::new();
+        for e in rows {
+            let e = e?;
+            out.insert(e.id, e);
+        }
+        Ok(out)
     })
     .await
 }

@@ -147,6 +147,10 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
                 .layer(entries_body_limit(cfg)),
         )
         .route(
+            "/api/v1/spaces/{space}/entries/counts",
+            get(entries::counts),
+        )
+        .route(
             "/api/v1/entries/{id}",
             get(entries::get)
                 .patch(entries::patch)
