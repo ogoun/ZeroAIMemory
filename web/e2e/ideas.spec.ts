@@ -815,9 +815,10 @@ test('ideas_returned_edit_sends_back', async ({ page }) => {
   const ask = card(page).getByTestId('review-missing');
   await expect(ask).toContainText('Агент просит дописать:');
   await expect(ask).toContainText(REVIEW_MISSING);
-  // «Изменить» — главное действие, «Начать» нет
+  // «Изменить» — главное действие; решить самому тоже можно, «Вернуть» нет
   const actions = card(page).getByRole('group', { name: 'Решение по идее' });
-  await expect(actions.getByRole('button')).toHaveText(['Изменить', 'Отложить', 'Отказаться']);
+  await expect(actions.getByRole('button')).toHaveText(['Изменить', 'Начать', 'Отложить', 'Отказаться']);
+  await expect(actions.getByRole('button', { name: 'Изменить' })).toHaveClass(/primary/);
   await actions.getByRole('button', { name: 'Изменить' }).click();
   const form = page.getByRole('form', { name: 'Правка идеи' });
   const body = form.getByLabel('Замысел');
@@ -834,6 +835,25 @@ test('ideas_returned_edit_sends_back', async ({ page }) => {
   expect(e.status).toBe('new');
   expect(e.data.returned_at).toBeUndefined();
   expect(e.data.reviews).toHaveLength(1);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// Решение координатора (задача 8): возвращённую человек может решить сам (§4, §6) — «Начать».
+test('ideas_returned_start_by_human', async ({ page }) => {
+  const problems = watch(page);
+  const idea = await returnedIdea('Идея E2E: начать возвращённую');
+  await openIdeas(page, idea.id);
+  const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
+  await card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Начать' }).click();
+  expect((await sent).postDataJSON()).toEqual({ decision: 'accept' });
+  await expect(card(page).locator('[data-status]')).toHaveText('В плане');
+  await expect(card(page).getByTestId('task-link')).toHaveText(/^Задача k:[0-9A-Z]{26}$/);
+  // разбор «на доработку» остался в карточке; решение — человека
+  await expect(card(page).getByTestId('review-note')).toHaveText('После разбора статус изменился: В плане.');
+  const e = await api('GET', `entries/${idea.id}`);
+  expect(e.status).toBe('accepted');
+  expect(e.data.decided.by).toBe('human');
+  expect(e.data.returned_at).toBeUndefined();
   expect(problems, problems.join('\n')).toEqual([]);
 });
 

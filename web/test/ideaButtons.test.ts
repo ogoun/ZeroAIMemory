@@ -41,9 +41,11 @@ test('ideaButtons: состав и порядок кнопок по состоя
   assert.deepEqual(acts('new'), ['start', 'defer', 'decline', 'edit']);
   assert.deepEqual(acts('proposed'), ['start', 'defer', 'decline']);
   assert.deepEqual(acts('deferred'), ['start', 'defer', 'decline', 'reopen', 'edit']);
-  // возвращённая (M6.5 §6): «Изменить» первой и главной, «Начать» нет — её дописывают
-  assert.deepEqual(acts('returned'), ['edit', 'defer', 'decline']);
+  // возвращённая (M6.5 §4, §6): «Изменить» первой и главной; человек может и решить сам —
+  // «Начать», «Отложить», «Отказаться»; «Вернуть» нет (на разбор её возвращает правка)
+  assert.deepEqual(acts('returned'), ['edit', 'start', 'defer', 'decline']);
   assert.equal(ideaButtons('returned', false, false)[0].cls, 'primary');
+  assert.deepEqual(ideaButtons('returned', false, false)[1], { act: 'start', title: 'Начать', cls: '' });
   // отклонённая: вернуть на разбор или удалить в корзину
   assert.deepEqual(acts('declined'), ['reopen', 'delete']);
   assert.deepEqual(acts('done'), []);
@@ -57,17 +59,18 @@ test('ideaButtons: состав и порядок кнопок по состоя
   assert.deepEqual(acts('proposed', true), ['defer', 'decline']);
 });
 
-test('ideaButtons: «отложить» — ровно у активных статусов (IDEA_ACTIVE), «начать» — у них же, кроме returned', () => {
+test('ideaButtons: «начать» и «отложить» — ровно у активных статусов (IDEA_ACTIVE)', () => {
   assert.deepEqual(IDEA_ACTIVE, ['new', 'returned', 'proposed', 'deferred']);
   const all: (EntryStatus | null)[] = ['new', 'returned', 'proposed', 'deferred', 'accepted', 'declined', 'done', 'open', null];
   for (const s of all) {
     const active = s !== null && IDEA_ACTIVE.includes(s);
-    assert.equal(acts(s).includes('start'), active && s !== 'returned', `start у ${s}`);
+    assert.equal(acts(s).includes('start'), active, `start у ${s}`);
     assert.equal(acts(s).includes('defer'), active, `defer у ${s}`);
   }
-  // у returned есть «Изменить», нет «Начать» (задача 8)
+  // у returned есть «Изменить» и «Начать», нет «Вернуть» (решение координатора по задаче 8)
   assert.ok(acts('returned').includes('edit'));
-  assert.ok(!acts('returned').includes('start'));
+  assert.ok(acts('returned').includes('start'));
+  assert.ok(!acts('returned').includes('reopen'));
   assert.deepEqual(
     IDEA_TABS.map((t) => t.id),
     ['human', 'agent', 'all'],

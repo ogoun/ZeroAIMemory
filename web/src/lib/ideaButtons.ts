@@ -21,7 +21,7 @@ export interface IdeaButton {
 }
 
 /** «Активные» идеи — фильтр журнала по умолчанию (§10; M6.5 §4 — и «На доработку»); им же
- * доступны «отложить» и «отказаться», «начать» — всем, кроме возвращённой (её дописывают). */
+ * доступны «начать», «отложить» и «отказаться». */
 export const IDEA_ACTIVE: EntryStatus[] = ['new', 'returned', 'proposed', 'deferred'];
 
 /** Чип статусов ленты (M6.5 §9): «Активные» (по умолчанию), статусы идеи по порядку, «Все». */
@@ -87,8 +87,9 @@ export const tagsOf = (s: string): string[] =>
 /**
  * Кнопки карточки идеи в порядке показа: `status` идеи, `agent` — идея «от агента» («Начать» нет до
  * «Принять как свою»), `released` — задача принятой идеи снята или удалена ({@link releasedOf}).
- * Возвращённую (M6.5 §6) человек дописывает: «Изменить» — главное действие, «Начать» нет;
- * отклонённую можно вернуть на разбор или удалить в корзину.
+ * Возвращённую (M6.5 §6) человек дописывает — «Изменить» главное действие — или решает сам
+ * («Начать», «Отложить», «Отказаться», §4, §6; «Вернуть» из неё нет — на разбор её возвращает
+ * правка); отклонённую можно вернуть на разбор или удалить в корзину.
  */
 export function ideaButtons(status: EntryStatus | null, agent: boolean, released: boolean): IdeaButton[] {
   const active = !!status && IDEA_ACTIVE.includes(status);
@@ -96,7 +97,7 @@ export function ideaButtons(status: EntryStatus | null, agent: boolean, released
   const editable = status === 'new' || status === 'deferred';
   const all: [boolean, IdeaAction, string, IdeaButton['cls']][] = [
     [returned, 'edit', 'Изменить', 'primary'],
-    [active && !agent && !returned, 'start', 'Начать', 'primary'],
+    [active && !agent, 'start', 'Начать', returned ? '' : 'primary'],
     [agent && editable, 'adopt', 'Принять как свою', 'primary'],
     [active, 'defer', 'Отложить', ''],
     [active || released, 'decline', 'Отказаться', 'danger'],
