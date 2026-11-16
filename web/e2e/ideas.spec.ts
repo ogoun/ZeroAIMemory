@@ -781,8 +781,10 @@ test('ideas_review_card_shows_summary_and_history', async ({ page }) => {
   await openIdeas(page, id);
   await expect(card(page).locator('[data-status]')).toHaveText('В плане');
   const rv = card(page).getByRole('region', { name: 'Разбор агента' });
-  // исход, задача плана, разбор текстом с переносами
+  // исход, чей агент (разбирал агент самого администратора — «ваш агент»), задача плана, разбор
+  // текстом с переносами
   await expect(rv.locator('[data-outcome]')).toHaveText('В план');
+  await expect(rv.getByTestId('review-by')).toContainText('ваш агент');
   await expect(rv.getByRole('link', { name: `k:${task}` }).first()).toHaveAttribute('href', new RegExp(`/j/tasks/${task}$`));
   const summary = rv.locator('p.body').first();
   await expect(summary).toBeVisible();
@@ -810,6 +812,7 @@ test('ideas_review_card_shows_summary_and_history', async ({ page }) => {
   await expect(history.getByText('Что показывать в карточке?')).toBeHidden();
   await history.locator('summary').click();
   await expect(history.locator('[data-outcome]')).toHaveText('На доработку');
+  await expect(history.locator('.past .row')).toContainText('ваш агент');
   await expect(history.getByText('Что показывать в карточке?')).toBeVisible();
   await page.screenshot({ path: `${screens}ideas-review-card.png`, fullPage: true });
   // ссылка «Опирался на» ведёт в карточку задачи

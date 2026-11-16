@@ -346,7 +346,7 @@
           {#await import('../components/IdeasView.svelte')}
             <p class="muted">Загрузка…</p>
           {:then { default: IdeasView }}
-            <IdeasView user={r.user} space={r.space} entry={r.entry} spaces={journalSpaces?.spaces ?? []} {onexpired} />
+            <IdeasView user={r.user} space={r.space} entry={r.entry} spaces={journalSpaces?.spaces ?? []} viewer={me.user_id} {onexpired} />
           {:catch e}
             <p class="error" role="alert">Страница не загрузилась: {errorText(e)}</p>
           {/await}

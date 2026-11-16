@@ -21,7 +21,8 @@
 //!   разбирает агент), прочие случаи M5.7 (`deferred`, `accepted` со снятой задачей, Knowledge) —
 //!   как раньше (M6.5 §7);
 //! - права правки и корзины идей человека ([`deny_token_on_human_idea`]), `origin` при создании
-//!   ([`create_data`]) и связанные записи в `GET /entries/{id}` ([`attach_idea`]).
+//!   ([`create_data`]), связанные записи в `GET /entries/{id}` ([`attach_idea`]) и имена
+//!   пользователей разборов ([`attach_reviewers`]).
 //!
 //! Аудит в `system.db` без текста: `entry.idea.propose`, `entry.idea.decide {decision}`,
 //! `entry.idea.adopt`, `entry.idea.review {outcome, task?}`.
@@ -223,6 +224,36 @@ pub fn attach_idea(v: &mut Value, e: &Entry, links: &IdeaLinks) {
             },
         );
     }
+}
+
+/// Имена пользователей разборов идеи `e` — подпись «чей агент разбирал» в карточке WebUI (M6.5
+/// §7 «Общие решения»; финальное ревью ветки, M4): поле ответа `GET /entries/{id}` `reviewers
+/// {<id пользователя>: <имя>}` по `by_user` из `data.review` и `data.reviews`. Только в выдаче —
+/// в `data` не хранится; пользователя нет — его id в поле нет; у идеи без разборов поля нет.
+pub async fn attach_reviewers(st: &AppState, v: &mut Value, e: &Entry) -> Result<(), ApiError> {
+    if e.kind != EntryKind::Idea {
+        return Ok(());
+    }
+    let d = IdeaData::from_stored(&e.data);
+    let mut ids: Vec<Id> = Vec::new();
+    for r in d.review.iter().chain(&d.reviews) {
+        if !ids.contains(&r.by_user) {
+            ids.push(r.by_user);
+        }
+    }
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut names = Map::new();
+    for id in ids {
+        if let Some(u) = st.system.get_user(id).await? {
+            names.insert(id.to_string(), json!(u.name));
+        }
+    }
+    if let Value::Object(o) = v {
+        o.insert("reviewers".into(), Value::Object(names));
+    }
+    Ok(())
 }
 
 /// `task` идеи: `{id, status, title}`, удалённая или несуществующая — `{id, deleted: true}`.
@@ -643,6 +674,20 @@ impl ReviewTaskReq {
     }
 }
 
+/// Текст разбора `field` — не больше `limits.note_max_bytes` байт: тот же 413
+/// `/problems/too-large`, что у тела записи ([`super::entries::check_size`]), `detail` — с
+/// именем поля.
+fn review_size(st: &AppState, field: &str, text: Option<&str>) -> Result<(), ApiError> {
+    let max = st.cfg.limits.note_max_bytes;
+    match text {
+        Some(t) if t.len() > max => Err(ApiError::PayloadTooLarge(format!(
+            "{field}: {} байт, предел {max}",
+            t.len()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// `space` тела разбора: только пространство самой идеи (задача плана заводится в нём).
 async fn review_space(sc: &EntryScope, raw: Option<&str>) -> Result<(), ApiError> {
     let bad = || unprocessable("space: разбор — в пространстве идеи, задача плана — там же");
@@ -683,6 +728,15 @@ pub async fn review(
         ));
     }
     let req: ReviewReq = json_body(body)?;
+    // тексты разбора — под пределом обычной записи, как тело записи задачи (финальное ревью
+    // M6.5, M5); заголовок задачи плана ограничивает хранилище (500 символов, как у задачи)
+    review_size(&st, "summary", req.summary.as_deref())?;
+    review_size(&st, "missing", req.missing.as_deref())?;
+    review_size(
+        &st,
+        "task.body",
+        req.task.as_ref().and_then(|t| t.body.as_deref()),
+    )?;
     let outcome = req
         .outcome
         .as_deref()

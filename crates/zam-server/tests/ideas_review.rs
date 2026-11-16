@@ -395,6 +395,60 @@ async fn review_rest_refusals() {
     assert_eq!(r.json()["entry"]["status"], "accepted");
 }
 
+/// Финальное ревью ветки, M5: тексты разбора — под пределом обычной записи
+/// `limits.note_max_bytes` (тот же 413 `/problems/too-large`, что у тела записи задачи):
+/// `task.body`, `summary`, `missing`; `detail` начинается с имени поля, ничего не записано. В
+/// пределе — обычный разбор.
+#[tokio::test]
+async fn review_texts_limited_by_note_max_bytes() {
+    let a = setup_with("size", |c| c.limits.note_max_bytes = 1000).await;
+    let i = idea_tok(&a, &sol(), "Большой план", "human").await;
+    let big = "ш".repeat(501); // 1002 байта
+    for (body, field) in [
+        (
+            json!({"outcome": "plan", "summary": summary(), "task": {"body": big}}),
+            "task.body:",
+        ),
+        (
+            json!({"outcome": "decline", "summary": format!("{}{big}", summary())}),
+            "summary:",
+        ),
+        (
+            json!({"outcome": "return", "summary": summary(), "missing": big}),
+            "missing:",
+        ),
+    ] {
+        let r = review(&a, &i, body).await;
+        problem(&r, StatusCode::PAYLOAD_TOO_LARGE, "too-large");
+        let detail = r.json()["detail"].as_str().unwrap().to_string();
+        assert!(detail.starts_with(field), "{field}: {detail}");
+        assert!(detail.contains("предел 1000"), "{detail}");
+    }
+    let e = get(&a, &i).await;
+    assert_eq!(
+        (e["status"].as_str(), e["rev"].as_i64()),
+        (Some("new"), Some(1)),
+        "{e}"
+    );
+    // обычная запись задачи с тем же телом — тот же отказ
+    let r = a
+        .t(
+            Method::POST,
+            &sol(),
+            Some(json!({"kind": "task", "title": "Задача", "body": big})),
+        )
+        .await;
+    problem(&r, StatusCode::PAYLOAD_TOO_LARGE, "too-large");
+    // в пределе — разбор проходит
+    let r = review(
+        &a,
+        &i,
+        json!({"outcome": "plan", "summary": summary(), "task": {"body": "1. Шаг."}}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+}
+
 /// Прямой SQL по базе администратора (наступивший `horizon`).
 async fn sql(a: &Api, q: &'static str, id: &str, v: &str) {
     let db = a.st.users.get(a.st.admin_id).await.unwrap();
@@ -597,9 +651,22 @@ async fn human_patch_returned_by_token_with_by_human() {
     assert_eq!(r.json()["status"], "new");
 }
 
+/// Ключи сохранённых настроек пользователя `u` (строки `user_settings`).
+async fn stored_keys(a: &Api, u: zam_core::Id) -> Vec<String> {
+    a.st.system
+        .user_settings(u)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
 /// §7: `ideas.mode` в `GET/PATCH /auth/settings` и у администратора: по умолчанию — `[ideas]
 /// default_mode` сервера; правка сессией с аудитом `{key, from, to}`; строка не из режимов — 422,
-/// не строка — 400; повтор действующего значения — без аудита; [`ideas_mode`] — то же значение.
+/// не строка — 400; повтор действующего значения — без аудита; [`ideas_mode`] — то же значение;
+/// выбор, равный умолчанию сервера, удаляет строку настройки (с аудитом) — пользователь снова идёт
+/// за `default_mode` (финальное ревью ветки, M3).
 #[tokio::test]
 async fn ideas_mode_setting_roundtrip() {
     let a = setup("mode-setting").await;
@@ -698,6 +765,36 @@ async fn ideas_mode_setting_roundtrip() {
         details.contains(&&json!({"key": "ideas.proactive", "from": true, "to": false})),
         "{details:?}"
     );
+    // выбор, равный умолчанию сервера (`review`), не хранится (финальное ревью, M3): строка
+    // удаляется — пользователь снова идёт за `[ideas] default_mode`; аудит — как у правки
+    assert!(
+        stored_keys(&a, admin)
+            .await
+            .contains(&"ideas.mode".to_string())
+    );
+    let r = a
+        .adm(
+            Method::PATCH,
+            SETTINGS,
+            Some(json!({"ideas": {"mode": "review"}})),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["ideas"]["mode"], "review");
+    assert!(
+        !stored_keys(&a, admin)
+            .await
+            .contains(&"ideas.mode".to_string())
+    );
+    let all = audit(&a).await;
+    let rs = rows(&all, "user.settings.update");
+    assert!(
+        rs.iter()
+            .any(|r| r.details == json!({"key": "ideas.mode", "from": "propose", "to": "review"})),
+        "{:?}",
+        rs.iter().map(|r| &r.details).collect::<Vec<_>>()
+    );
     // умолчание сервера — propose: без настройки пользователя действует оно
     let b = setup_with("mode-default", |c| {
         c.ideas.default_mode = IdeasMode::Propose
@@ -725,11 +822,33 @@ async fn ideas_mode_setting_roundtrip() {
         .await
         .unwrap();
     assert_eq!(mode, IdeasMode::Review);
+    assert!(
+        stored_keys(&b, admin_b)
+            .await
+            .contains(&"ideas.mode".to_string())
+    );
+    // обратно к умолчанию этого сервера (`propose`) — строки нет
+    let r = b
+        .adm(
+            Method::PATCH,
+            SETTINGS,
+            Some(json!({"ideas": {"mode": "propose"}})),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["ideas"]["mode"], "propose");
+    assert!(
+        !stored_keys(&b, admin_b)
+            .await
+            .contains(&"ideas.mode".to_string())
+    );
 }
 
 /// §7 «Общие решения»: участник `ro` — 403; участник `rw` разбирает, `data.review.by_user` —
-/// его id, задача — в базе владельца; действует режим владельца базы: `propose` участника не
-/// мешает, `propose` владельца — 409 `idea-mode` и участнику.
+/// его id, задача — в базе владельца, в карточке — его имя (`reviewers`); действует режим
+/// владельца базы: `propose` участника не мешает, `propose` владельца — 409 `idea-mode` и
+/// участнику.
 #[tokio::test]
 async fn review_shared_solution_rights_and_owner_mode() {
     let a = api("idrev-shared", |_| {}).await;
@@ -786,6 +905,22 @@ async fn review_shared_solution_rights_and_owner_mode() {
     assert_eq!(rs.len(), 1, "{rs:?}");
     assert_eq!(rs[0].user_id.map(|u| u.to_string()), Some(m_id.clone()));
     assert_eq!(rs[0].details["owner"], o_id.as_str());
+    // в карточке видно, чей агент разбирал (финальное ревью ветки, M4): `GET /entries/{id}`
+    // отдаёт имена пользователей разборов `reviewers {<id>: <имя>}` — и владельцу, и участнику;
+    // в `data` их нет
+    let mut want = serde_json::Map::new();
+    want.insert(m_id.clone(), json!("Марк"));
+    for t in [&o_tok, &m_tok] {
+        let r = a.tok(t, Method::GET, &ent(&i), None).await;
+        ok(&r, StatusCode::OK);
+        let e = r.json();
+        assert_eq!(e["reviewers"], Value::Object(want.clone()), "{e}");
+        assert!(e["data"].get("reviewers").is_none(), "{e}");
+        assert!(e["data"]["review"].get("by_user_name").is_none(), "{e}");
+    }
+    // у идеи без разбора поля нет
+    let r = a.tok(&o_tok, Method::GET, &ent(&j), None).await;
+    assert!(r.json().get("reviewers").is_none(), "{}", r.text());
     // режим владельца propose — участнику тоже 409, propose участника идеи new — проходит
     set_mode(&a, &o_id, "propose").await;
     set_mode(&a, &m_id, "review").await;

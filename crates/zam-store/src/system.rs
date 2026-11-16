@@ -948,7 +948,8 @@ impl SystemStore {
 
     /// Пишет настройки пользователя одной транзакцией; нет пользователя — `NotFound`.
     /// Возвращает прежние значения изменённых ключей (`None` — не было строки); ключ, значение
-    /// которого не меняется, не пишется и не возвращается.
+    /// которого не меняется, не пишется и не возвращается. Значение `null` удаляет строку ключа
+    /// (вызывающий снова берёт умолчание); строки не было — ничего не меняется.
     pub async fn set_user_settings(
         &self,
         user: Id,
@@ -975,6 +976,17 @@ impl SystemStore {
                         .map(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(json_err))
                         .transpose()?;
                     if old.as_ref() == Some(&value) {
+                        continue;
+                    }
+                    // `null` — снять сохранённое значение: ключ снова идёт за умолчанием
+                    if value.is_null() {
+                        if old.is_some() {
+                            tx.execute(
+                                "DELETE FROM user_settings WHERE user_id = ?1 AND key = ?2",
+                                params![user, key],
+                            )?;
+                            changed.push((key, old));
+                        }
                         continue;
                     }
                     let json = serde_json::to_string(&value).map_err(json_err)?;

@@ -754,6 +754,9 @@ export interface Entry {
   task?: { id: string; status?: EntryStatus; title?: string; deleted?: boolean };
   /** У идеи в `GET /entries/{id}`: последний вопрос-предложение. */
   question?: { id: string; status?: EntryStatus; deleted?: boolean };
+  /** У идеи с разборами в `GET /entries/{id}`: имена пользователей разборов `{<by_user>: <имя>}`
+   * — подпись «чей агент разбирал» (M6.5 §7 «Общие решения»). */
+  reviewers?: Record<string, string>;
   /** У задачи из идеи (запись и лента, M6.5 §9): первая идея плана; `ideas` — все её идеи. */
   idea?: TaskIdea;
   ideas?: TaskIdea[];

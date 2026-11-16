@@ -825,6 +825,7 @@ pub async fn get(
     let mut v = entry_json(&sc.db, &sc.entry, sc.role).await?;
     let links = super::ideas::idea_links(&sc.db, &sc.entry).await?;
     super::ideas::attach_idea(&mut v, &sc.entry, &links);
+    super::ideas::attach_reviewers(&st, &mut v, &sc.entry).await?;
     // показы и оценки — из базы, где лежит запись (§10.5)
     let target = zam_core::TargetRef {
         kind: zam_core::TargetKind::Entry,

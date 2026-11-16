@@ -55,6 +55,7 @@
     reviewLine,
     reviewNote,
     reviewOf,
+    reviewerLabel,
     type DecisionOpts,
     type IdeaAction,
     type IdeaChip,
@@ -82,10 +83,12 @@
     entry: string | null;
     /** Пространства пользователя (`GET /spaces`): решения для «Начать» у идеи Knowledge. */
     spaces: Space[];
+    /** Id пользователя сессии: его разборы подписаны «ваш агент» (M6.5 §7 «Общие решения»). */
+    viewer: string;
     onexpired: () => void;
   }
 
-  let { user, space, entry, spaces, onexpired }: Props = $props();
+  let { user, space, entry, spaces, viewer, onexpired }: Props = $props();
 
   const PAGE = 50;
 
@@ -587,7 +590,7 @@
           <p class="row">
             <span class="chip outcome" data-outcome={rv.outcome}>{REVIEW_OUTCOME_TEXT[rv.outcome]}</span>
             {#if rv.outcome === 'plan' && rv.task}<span>→ {@render ref(rv.task)}</span>{/if}
-            <span class="muted small">агент · {fmtTime(rv.at)}</span>
+            <span class="muted small" data-testid="review-by">{reviewerLabel(rv, c.reviewers, viewer)} · {fmtTime(rv.at)}</span>
           </p>
           {#if reviewNote(c)}<p class="muted small" data-testid="review-note">{reviewNote(c)}</p>{/if}
           <p class="body">{rv.summary}</p>
@@ -606,7 +609,7 @@
             <div class="past">
               <p class="row">
                 <span class="chip outcome" data-outcome={h.outcome}>{REVIEW_OUTCOME_TEXT[h.outcome]}</span>
-                <span class="muted small">{fmtTime(h.at)}</span>
+                <span class="muted small">{reviewerLabel(h, c.reviewers, viewer)} · {fmtTime(h.at)}</span>
               </p>
               <p class="body">{h.summary}</p>
               {#if h.missing}<p class="body"><strong>Не хватало:</strong> {h.missing}</p>{/if}

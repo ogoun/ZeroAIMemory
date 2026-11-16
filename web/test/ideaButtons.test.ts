@@ -25,6 +25,8 @@ import {
   reviewCurrent,
   reviewLine,
   reviewNote,
+  reviewOf,
+  reviewerLabel,
   tagsOf,
 } from '../src/lib/ideaButtons.ts';
 import { IDEA_STATUSES, IDEA_STATUS_TEXT } from '../src/lib/ideaStatus.ts';
@@ -287,6 +289,17 @@ test('olderReviews: история без текущего, новые перв�
   assert.deepEqual(olderReviews(entry({ data: {} })), []);
   // мусор в истории пропускается
   assert.equal(olderReviews(entry({ data: { review: cur, reviews: [cur, { outcome: 'x' }, 5, prev] } })).length, 1);
+});
+
+test('reviewerLabel: чей агент разбирал — свой или по имени из reviewers (финальное ревью M6.5, M4)', () => {
+  const r = (by_user: string) => reviewOf(entry({ data: { review: review({ by_user }) } }))!;
+  const names = { me: 'ogoun', m: 'Марк' };
+  assert.equal(reviewerLabel(r('me'), names, 'me'), 'ваш агент');
+  assert.equal(reviewerLabel(r('m'), names, 'me'), 'агент Марк');
+  // имени нет (пользователь удалён, старый сервер без reviewers) — просто «агент»
+  assert.equal(reviewerLabel(r('gone'), names, 'me'), 'агент');
+  assert.equal(reviewerLabel(r('m'), undefined, 'me'), 'агент');
+  assert.equal(reviewerLabel(r(''), names, ''), 'агент');
 });
 
 test('refTarget: ссылки «Опирался на» и «Похожие»', () => {

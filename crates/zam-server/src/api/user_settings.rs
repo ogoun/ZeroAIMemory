@@ -20,6 +20,8 @@
 //!   ideas: {proactive, mode}}`. Аудит `user.settings.update {key, from, to}` на каждое изменение.
 //! - Выбор, совпавший с действующим умолчанием, не сохраняется: такой пользователь пойдёт за
 //!   новым `[ideas] default_mode`, если администратор его сменит (как `hooks` — за `true`).
+//!   Переключение `ideas.mode` обратно на умолчание сервера удаляет сохранённую строку
+//!   (финальное ревью M6.5, M3).
 //! - Сервер отдаёт их в `/recall(session_start)` полем `hooks`; выключенный тип `/recall`
 //!   (`session_start`, `prompt`, `post_tool`) отвечает пустым `text` и показ не учитывает (N4).
 //! - Режим идей решения — режим **владельца базы** ([`ideas_mode`]): идеи общего решения лежат в
@@ -265,7 +267,8 @@ async fn settings_json(st: &AppState, user: Id) -> Result<Value, ApiError> {
 
 /// Сохраняет правки и пишет аудит каждого изменения. Правка сравнивается с действующим
 /// значением (нет строки — `true`, у `ideas.mode` — умолчание сервера): совпало — ни записи, ни
-/// аудита (fix round 1, I-2).
+/// аудита (fix round 1, I-2). `ideas.mode`, равный умолчанию сервера, удаляет строку настройки
+/// (аудит — как у правки).
 async fn apply(
     st: &AppState,
     actor: &str,
@@ -280,7 +283,22 @@ async fn apply(
         .filter(|(key, v)| *v != current.value(key))
         .collect();
     if !edits.is_empty() {
-        let changed = st.system.set_user_settings(user, edits.clone()).await?;
+        // `ideas.mode`, равный умолчанию сервера, не хранится (M6.5 §7): правка на него снимает
+        // сохранённый выбор, и пользователь снова идёт за `[ideas] default_mode` (финальное ревью
+        // M6.5, M3); аудит — с действующими значениями, как у любой правки
+        let default_mode = json!(st.cfg.ideas.default_mode.as_str());
+        let stored: Vec<(String, Value)> = edits
+            .iter()
+            .map(|(k, v)| {
+                let v = if k == IDEAS_MODE && *v == default_mode {
+                    Value::Null
+                } else {
+                    v.clone()
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        let changed = st.system.set_user_settings(user, stored).await?;
         for (key, _) in changed {
             let to = edits
                 .iter()

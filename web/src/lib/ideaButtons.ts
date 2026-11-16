@@ -201,6 +201,15 @@ function parseReview(v: unknown): IdeaReview | null {
   };
 }
 
+/** Чей агент разбирал (M6.5 §7 «Общие решения»): «ваш агент» — разбирал смотрящий (`viewer` —
+ * его id пользователя), иначе «агент <имя>» по `reviewers` из `GET /entries/{id}`; имени нет —
+ * «агент». */
+export function reviewerLabel(r: IdeaReview, reviewers: Record<string, string> | undefined, viewer: string): string {
+  if (r.by_user && r.by_user === viewer) return 'ваш агент';
+  const name = r.by_user ? reviewers?.[r.by_user] : undefined;
+  return name ? `агент ${name}` : 'агент';
+}
+
 /** Последний разбор агента (`data.review`) или `null`. */
 export const reviewOf = (e: Entry): IdeaReview | null => parseReview(e.data.review);
 
