@@ -1,7 +1,9 @@
 //! Приёмка M6.5 «Разбор идей агентом» (спецификация `docs/specs/2026-11-15-m6.5-idea-review.md`
 //! §11, задача 9), серверная часть — сквозными сценариями через REST и MCP:
 //! - п. 1 и п. 6 (строка плана по `priority`, `plan` с `task.id`) — `acceptance_plan_flow`;
-//! - п. 2 — `acceptance_return_edit_rereview`;
+//! - п. 2 — `acceptance_return_edit_rereview` и `acceptance_return_append_by_human_mcp` (слова
+//!   человека из чата — MCP `append` с `by: human`; повтор разбора прежним ключом после правки —
+//!   422);
 //! - п. 3 — `acceptance_decline_reopen_with_reason`;
 //! - п. 4 и п. 6 (`done` без ссылки на сделанное, второй разбор, `propose` у `new` в режиме
 //!   `review`) — `acceptance_refusals`;
@@ -766,6 +768,121 @@ async fn acceptance_return_edit_rereview() {
         outcomes.contains(&"return".to_string()) && outcomes.contains(&"plan".to_string()),
         "{outcomes:?}"
     );
+}
+
+/// §11 п. 2 и §6, слова человека из чата (финальное ревью ветки, I1): агент дописывает к
+/// возвращённой идее через MCP `append` — без `by` (своя дописка) статус прежний, идеи в очереди
+/// нет; с `by: human` (слова человека) — `new`, идея снова в пакете `idea_review` с дописанным
+/// текстом; `by` у дописки не идеи — 422 сервера. Повтор разбора с прежним ключом после правки
+/// (финальное ревью, M1) — 422 `/problems/idempotency-mismatch`, ничего не записано; новый ключ —
+/// обычный разбор.
+#[tokio::test]
+async fn acceptance_return_append_by_human_mcp() {
+    let a = world("append-by").await;
+    let title = "Экспорт идей в CSV";
+    let id = idea_web(&a, &sol(), title, "Выгрузить идеи таблицей.", json!({})).await;
+    let missing = "Какие столбцы нужны? Куда класть файл?";
+    let key = "acc-append-by-1";
+    let first = json!({"id": w(&id), "action": "review", "outcome": "return",
+                       "summary": summary("Не хватает: столбцы и место файла."),
+                       "missing": missing, "idempotency_key": key});
+    let (t, err) = mcp(&a, "ab1", "memory_update_entry", first.clone()).await;
+    assert!(!err, "{t}");
+    assert!(t.starts_with(&format!("Идея w:{id}: На доработку")), "{t}");
+    // дописка агента без `by` — статус прежний, в очереди идеи нет
+    let rev = get(&a, &id).await["rev"].as_i64().unwrap();
+    let (t, err) = mcp(
+        &a,
+        "ab1",
+        "memory_update_entry",
+        json!({"id": w(&id), "action": "append", "rev": rev,
+               "body": "Агент: уточню у человека."}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let e = get(&a, &id).await;
+    assert_eq!(e["status"], "returned", "{e}");
+    assert!(e["body"].as_str().unwrap().contains("Агент: уточню"), "{e}");
+    let (t, err) = mcp(&a, "ab2", "memory_recall", json!({"event": "idea_review"})).await;
+    assert!(!err, "{t}");
+    assert!(!t.contains(&format!("— w:{id}\n")), "{t}");
+    // слова человека из чата — `by: human`: снова «Непросмотрено» и в пакете разбора
+    let words = "Человек: столбцы — заголовок, статус и дата; файл — в загрузки.";
+    let (t, err) = mcp(
+        &a,
+        "ab2",
+        "memory_update_entry",
+        json!({"id": w(&id), "action": "append", "rev": e["rev"], "body": words,
+               "by": "human"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let e = get(&a, &id).await;
+    assert_eq!(e["status"], "new", "{e}");
+    assert!(e["data"].get("returned_at").is_none(), "{e}");
+    let (t, err) = mcp(&a, "ab3", "memory_recall", json!({"event": "idea_review"})).await;
+    assert!(!err, "{t}");
+    assert!(idea_block(&t, &id).contains(words), "{t}");
+    // `by` у дописки не идеи — отказ сервера (422) доходит до агента
+    let task = create_tok(
+        &a,
+        json!({"kind": "task", "title": "Задача", "body": "Текст."}),
+    )
+    .await;
+    let rev = get(&a, &task).await["rev"].clone();
+    let (t, err) = mcp(
+        &a,
+        "ab3",
+        "memory_update_entry",
+        json!({"id": format!("k:{task}"), "action": "append", "rev": rev, "body": "Ещё.",
+               "by": "human"}),
+    )
+    .await;
+    mcp_refusal(&t, err, 422, "by: только у правки идеи");
+
+    // повтор разбора с прежним ключом после правки — не повтор, а 422; ничего не записано
+    let before = get(&a, &id).await;
+    let (t, err) = mcp(&a, "ab3", "memory_update_entry", first.clone()).await;
+    mcp_refusal(&t, err, 422, "ключ уже использован");
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("{}/review", ent(&id)),
+            Some(json!({"outcome": "return", "summary": summary("Повтор."),
+                        "missing": missing})),
+            &[("idempotency-key", key)],
+        )
+        .await;
+    problem(
+        &r,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "idempotency-mismatch",
+        "прежний ключ",
+    );
+    assert!(
+        detail_of(&r).contains("новый разбор — с новым ключом"),
+        "{}",
+        r.text()
+    );
+    let after = get(&a, &id).await;
+    for k in ["rev", "status", "data"] {
+        assert_eq!(after[k], before[k], "{k}");
+    }
+    assert_eq!(audit_of(&a, "entry.idea.review", &id).await.len(), 1);
+    // новый ключ — обычный разбор, история из двух
+    let mut second = first.clone();
+    second["idempotency_key"] = json!("acc-append-by-2");
+    second["outcome"] = json!("decline");
+    second["summary"] = json!(summary(
+        "Отклонена: выгрузка уже есть в экспорте пространства."
+    ));
+    second.as_object_mut().unwrap().remove("missing");
+    let (t, err) = mcp(&a, "ab3", "memory_update_entry", second).await;
+    assert!(!err, "{t}");
+    let e = get(&a, &id).await;
+    assert_eq!(e["status"], "declined", "{e}");
+    assert_eq!(e["data"]["reviews"].as_array().unwrap().len(), 2, "{e}");
 }
 
 // ---------- п. 3: отклонена ----------

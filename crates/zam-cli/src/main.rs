@@ -967,11 +967,15 @@ enum InsightCmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Дописать к тексту insight (из --body-file или stdin)
+    /// Дописать к тексту записи (из --body-file или stdin); у идеи `--by human` — слова
+    /// человека из чата: возвращённая идея снова идёт на разбор
     Append {
         id: String,
         #[arg(long)]
         body_file: Option<PathBuf>,
+        /// Чья дописка идеи: human — слова человека, agent — своя (по умолчанию); только у идеи
+        #[arg(long, value_parser = ["human", "agent"])]
+        by: Option<String>,
         #[command(flatten)]
         common: Common,
     },
@@ -1724,8 +1728,14 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
         InsightCmd::Append {
             id,
             body_file,
+            by,
             common,
-        } => i::append(&cmd::connect(&common)?, &id, body_file.as_deref()),
+        } => i::append(
+            &cmd::connect(&common)?,
+            &id,
+            body_file.as_deref(),
+            by.as_deref(),
+        ),
         InsightCmd::Feedback {
             id,
             value,

@@ -4,7 +4,9 @@
 //! `zam read w:<id>` и регрессия `zam question answer --by`. Сервер без моделей.
 //!
 //! M6.5 (задача 6): `zam idea review` (исходы, повтор по `--key`, флаги — код 6 до сети, старый
-//! сервер — код 1), `zam idea queue` и статус `returned` в ленте.
+//! сервер — код 1), `zam idea queue` и статус `returned` в ленте; финальное ревью ветки —
+//! слова человека из чата `zam insight append w:<id> --by human` (возвращённая идея снова на
+//! разбор).
 mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -920,6 +922,77 @@ fn idea_queue_lists_new() {
     {
         assert!(q.contains(title), "{title}: {q}");
     }
+}
+
+/// Слова человека из чата (M6.5 §6; финальное ревью ветки, I1): агент дописывает их к
+/// возвращённой идее `zam insight append w:<id> --by human` — идея снова «Непросмотрено» и в
+/// очереди; своя дописка агента без `--by` статус не меняет; `--by` у дописки не идеи — 422
+/// сервера, код 6; значение не из `human|agent` — ошибка разбора аргументов, тоже код 6.
+#[test]
+fn idea_append_by_human_returns_to_review() {
+    let t = T::new("append-by");
+    let id = t.idea("Тёмная тема", &[]);
+    let w = format!("w:{id}");
+    let s = t.file("s.md", &summary());
+    ok(&t.agent(&[
+        "idea",
+        "review",
+        &w,
+        "--return",
+        "--missing",
+        "Какие экраны?",
+        "--summary-file",
+        &s,
+    ]));
+    let own = t.file("own.md", "Агент: уточню у человека.");
+    ok(&t.agent(&["insight", "append", &w, "--body-file", &own]));
+    assert_eq!(entry(&t, &id)["status"], "returned");
+    let q = ok(&t.agent(&["idea", "queue"]));
+    assert!(!q.contains(&w), "{q}");
+    let words = t.file("words.md", "Человек: все экраны, системная тема — да.");
+    ok(&t.agent(&[
+        "insight",
+        "append",
+        &w,
+        "--by",
+        "human",
+        "--body-file",
+        &words,
+    ]));
+    let e = entry(&t, &id);
+    assert_eq!(e["status"], "new", "{e}");
+    assert!(
+        e["body"].as_str().unwrap().contains("системная тема — да"),
+        "{e}"
+    );
+    let q = ok(&t.agent(&["idea", "queue"]));
+    assert!(q.contains(&w), "{q}");
+    // `--by` у дописки задачи — 422 сервера, код 6
+    let id2 = t.idea("Горячие клавиши", &[]);
+    let r = ok(&t.agent(&["idea", "review", &id2, "--plan", "--summary-file", &s]));
+    let k = format!("k:{}", r.trim().rsplit("k:").next().unwrap());
+    let o = t.agent(&[
+        "insight",
+        "append",
+        &k,
+        "--by",
+        "human",
+        "--body-file",
+        &words,
+    ]);
+    assert_eq!(code(&o), Some(6), "{}", err(&o));
+    assert!(err(&o).contains("by:"), "{}", err(&o));
+    let o = t.agent(&[
+        "insight",
+        "append",
+        &w,
+        "--by",
+        "robot",
+        "--body-file",
+        &words,
+    ]);
+    assert_eq!(code(&o), Some(6), "{}", err(&o));
+    assert!(err(&o).contains("'robot'"), "{}", err(&o));
 }
 
 /// Старый сервер (M6.5 §10): 404 на `/review`, а в `GET /health` `features` нет `idea_review`

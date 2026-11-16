@@ -305,7 +305,7 @@ impl ToolName {
                     "channel": {"type": "string", "enum": ["chat", "cli"],
                         "description": "answer, decide: где человек ответил (по умолчанию chat)"},
                     "by": {"type": "string", "enum": ["human", "agent"],
-                        "description": "answer, decide: обязателен — human: слова человека (axiom), agent: решение агента (hypothesis; у идеи — только decline своей)"},
+                        "description": "answer, decide: обязателен — human: слова человека (axiom), agent: решение агента (hypothesis; у идеи — только decline своей); append идеи: human — слова человека, возвращённая идея снова на разбор"},
                     "decision": {"type": "string", "enum": ["accept", "defer", "decline", "reopen"],
                         "description": "decide: решение человека по идее w: (by обязателен; без ответа «начать» не начинай); accept создаёт задачу k:, reopen — с reason"},
                     "horizon": {"type": "string", "description": "decide defer и answer defer вопроса-предложения: «не раньше» YYYY-MM-DD (UTC, позже сегодня; по умолчанию +30 дней)"},
@@ -1368,7 +1368,9 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             let text = opt_str(args, "body")?.ok_or_else(|| {
                 Fail::Invalid("append: нужен body — текст для дописывания".into())
             })?;
-            let mut b = pick(args, &["message", "refs"]);
+            // `by` — чья дописка идеи (M6.5 §6): `human` — слова человека из чата, возвращённая
+            // идея снова идёт на разбор; сервер принимает его только у правки идеи
+            let mut b = pick(args, &["message", "refs", "by"]);
             b.insert("append_body".into(), json!(text));
             (Method::PATCH, entry, b)
         }

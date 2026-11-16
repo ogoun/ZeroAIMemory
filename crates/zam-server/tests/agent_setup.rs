@@ -1419,6 +1419,10 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         "новый первым, до 10",
         "новой идеи человека (`new`) решения",
         "очереди нет — разделом `### Идеи`",
+        // финальное ревью ветки, I1: слова человека из чата к возвращённой идее — `by: human`
+        "action: \"append\", rev, body, by: \"human\"",
+        "zam insight append w:<id> --by human",
+        "своя дописка (без `by`) статус не меняет",
     ] {
         assert!(ideas.contains(want), "{want}: {ideas}");
     }
@@ -1474,6 +1478,9 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         "newest first, up to 10",
         "a new human idea (`new`) of the solution",
         "without a queue — in the `### Идеи` section",
+        "action: \"append\", rev, body, by: \"human\"",
+        "zam insight append w:<id> --by human",
+        "your own addition (without `by`) does not change the status",
     ] {
         assert!(ideas.contains(want), "{want}: {ideas}");
     }

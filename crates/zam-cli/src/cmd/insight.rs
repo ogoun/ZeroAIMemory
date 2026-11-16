@@ -15,7 +15,8 @@
 //! - `zam insight list [--status S,…] [--global] [--solution GUID] [--limit N]` — лента insight;
 //!   `show ID` — карточка с текстом и триггерами; `supersede ID --title T [--kind K] …` —
 //!   замещение (вид по умолчанию — у старой записи); `retract ID --reason R`; `revisit ID
-//!   [--reason R]`; `append ID [--body-file F | stdin]` — дописать к телу.
+//!   [--reason R]`; `append ID [--body-file F | stdin] [--by human|agent]` — дописать к телу
+//!   (`--by human` у идеи — слова человека: возвращённая идея снова на разбор, M6.5 §6).
 //! - `zam insight certify ID axiom|theorem|hypothesis|none --reason R [--evidence-file F]` —
 //!   смена эпистемического статуса (§7.5) обычным токеном: `theorem` — с доказательством
 //!   (`--evidence-file` дописывается в `data.evidence`); `axiom` агент ставит и меняет только
@@ -524,8 +525,17 @@ pub fn feedback(ctx: &Ctx, id: &str, value: &str, session: Option<&str>) -> Resu
     emit(format!("{id} {value}\n").as_bytes())
 }
 
-/// `zam insight append <id>` — текст из `--body-file` или stdin; пустой → код 6.
-pub fn append(ctx: &Ctx, id: &str, body_file: Option<&Path>) -> Result<(), CliError> {
+/// `zam insight append <id> [--by human|agent]` — текст из `--body-file` или stdin; пустой →
+/// код 6. `id` — голый или со своей буквой (`i:`, `w:` …). `--by` — чья дописка идеи (M6.5 §6):
+/// `human` — слова человека из чата, возвращённая идея снова идёт на разбор; у записи не идеи
+/// сервер отвечает 422 (код 6).
+pub fn append(
+    ctx: &Ctx,
+    id: &str,
+    body_file: Option<&Path>,
+    by: Option<&str>,
+) -> Result<(), CliError> {
+    let id = crate::target::bare_entry_id(id);
     let text = read_text(body_file)?;
     if text.trim().is_empty() {
         return Err(CliError::input(
@@ -533,10 +543,11 @@ pub fn append(ctx: &Ctx, id: &str, body_file: Option<&Path>) -> Result<(), CliEr
         ));
     }
     let rev = rev_of(&get_entry(ctx, id)?)?;
-    emit_changed(
-        ctx,
-        &patch_entry(ctx, id, rev, &json!({ "append_body": text }))?,
-    )
+    let mut body = json!({ "append_body": text });
+    if let Some(by) = by {
+        body["by"] = json!(by);
+    }
+    emit_changed(ctx, &patch_entry(ctx, id, rev, &body)?)
 }
 
 #[cfg(test)]
