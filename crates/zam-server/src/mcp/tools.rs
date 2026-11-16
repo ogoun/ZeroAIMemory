@@ -1474,16 +1474,16 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             return done(f, &r, idea_outcome);
         }
         "review" => {
-            // поля задачи плана — только в `task`: верхние `title` и `body` (у supersede) разбор
-            // не читает, и план шагов пропал бы молча
-            if ["title", "body"]
-                .iter()
-                .any(|k| args.get(*k).is_some_and(|v| !v.is_null()))
-            {
+            // поля задачи плана — только в `task`: верхние `title` и `body` разбор не читает, и
+            // план шагов пропал бы молча; пустая строка — как отсутствие (как у `req_str`)
+            let given = |k: &str| match args.get(k) {
+                None | Some(Value::Null) => false,
+                Some(Value::String(s)) => !s.trim().is_empty(),
+                Some(_) => true,
+            };
+            if given("title") || given("body") {
                 return Err(Fail::Invalid(
-                    "review: план шагов — в task.body, заголовок задачи — в task.title (верхние \
-                     body и title — у supersede)"
-                        .into(),
+                    "для review план шагов — task.body, заголовок задачи — task.title".into(),
                 ));
             }
             // поля и пределы проверяет REST (422 с именем поля); ключ повтора — на один вызов

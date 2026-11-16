@@ -3042,7 +3042,7 @@ async fn mcp_review_plan_and_errors() {
     assert!(o.text.contains("transition-not-allowed"), "{}", o.text);
     assert_eq!(sol_tasks(&a).await.len(), 1);
 
-    // decline — подпись статуса, без задачи
+    // decline — подпись статуса, без задачи; пустые верхние body/title — как их нет
     let d = mcp_sol_idea(&a, "Звук уведомлений", "Звуковой сигнал при новой идее.").await;
     let o = ok(
         &a,
@@ -3050,7 +3050,7 @@ async fn mcp_review_plan_and_errors() {
         &h,
         "memory_update_entry",
         json!({"id": format!("w:{d}"), "action": "review", "outcome": "decline",
-               "summary": review_summary()}),
+               "summary": review_summary(), "body": "", "title": "  "}),
     )
     .await;
     assert_eq!(
@@ -3086,6 +3086,114 @@ async fn mcp_review_plan_and_errors() {
     .await;
     assert!(o.is_error, "{}", o.text);
     assert!(o.text.contains("review"), "{}", o.text);
+}
+
+/// Ссылка записи `<буква>:<id>` из ответа `Записано <буква>:<id> …` инструмента `memory_log`.
+async fn mcp_sol_log(a: &Api, args: Value, letter: &str) -> String {
+    let o = ok(a, &a.token, &sol_sess(), "memory_log", args).await;
+    let head = format!("Записано {letter}:");
+    assert!(o.text.starts_with(&head), "{}", o.text);
+    o.text[head.len()..].split(' ').next().unwrap().to_string()
+}
+
+/// Ревью задачи 5 (Minor 2): все ключи `review` доходят до REST — опечатка в списке полей
+/// ловится. `space` чужого пространства — 422 с полем; `message` длиннее предела — 400 с полем;
+/// `done` с `basis` (`c:`, `commit:`), `similar` (`w:` отклонённой), своим `space` и `message` —
+/// «Сделано», ссылки в `data.review`; `plan` с `task: {id: "k:…"}` открытой задачи — «→ задача
+/// k:<та же>», новой задачи нет.
+#[tokio::test]
+async fn mcp_review_fields_reach_rest() {
+    let a = review_world("mcp-review-fields").await;
+    let h = sol_sess();
+    let task = mcp_sol_log(
+        &a,
+        json!({"kind": "task", "title": "Пункт плана: статусы в ленте"}),
+        "k",
+    )
+    .await;
+    let cl = mcp_sol_log(
+        &a,
+        json!({"kind": "changelog", "title": "Статусы идей в ленте", "data": {"kind": "feat"}}),
+        "c",
+    )
+    .await;
+    let d = mcp_sol_idea(&a, "Цвета статусов", "Красить статусы идей.").await;
+    ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        json!({"id": format!("w:{d}"), "action": "review", "outcome": "decline",
+               "summary": review_summary()}),
+    )
+    .await;
+    let x = mcp_sol_idea(&a, "Статусы в ленте", "Показывать статусы идей в ленте.").await;
+    let commit = "0123abcd4567";
+    let done = json!({"id": format!("w:{x}"), "action": "review", "outcome": "done",
+                      "summary": review_summary(),
+                      "basis": [format!("c:{cl}"), format!("commit:{commit}")],
+                      "similar": [format!("w:{d}")], "space": G,
+                      "message": "разбор: уже сделано"});
+    // space — пространство идеи, иное — 422 (поле доходит до REST)
+    let mut bad = done.clone();
+    bad["space"] = json!("knowledge");
+    let o = tool(&a, &a.token, &h, "memory_update_entry", bad).await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("Ошибка 422"), "{}", o.text);
+    assert!(o.text.contains("space"), "{}", o.text);
+    // message длиннее предела ревизии — 400 (поле доходит до REST)
+    let mut bad = done.clone();
+    bad["message"] = json!("м".repeat(zam_server::attrib::MESSAGE_MAX_CHARS + 1));
+    let o = tool(&a, &a.token, &h, "memory_update_entry", bad).await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("Ошибка 400"), "{}", o.text);
+    assert!(o.text.contains("message"), "{}", o.text);
+    let o = ok(&a, &a.token, &h, "memory_update_entry", done).await;
+    assert_eq!(
+        body_lines(&o),
+        [format!("Идея w:{x}: Сделано · разбор done")],
+        "{}",
+        o.text
+    );
+    let idea = a
+        .t(Method::GET, &format!("/api/v1/entries/{x}"), None)
+        .await
+        .json();
+    assert_eq!(idea["status"], "done", "{idea}");
+    let rv = &idea["data"]["review"];
+    assert_eq!(
+        rv["basis"],
+        json!([format!("c:{cl}"), format!("commit:{commit}")]),
+        "{idea}"
+    );
+    assert_eq!(rv["similar"], json!([format!("w:{d}")]), "{idea}");
+    // plan с task.id открытой задачи плана — привязка без новой задачи
+    let y = mcp_sol_idea(&a, "Статусы в карточке", "То же, что пункт плана.").await;
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        json!({"id": format!("w:{y}"), "action": "review", "outcome": "plan",
+               "summary": review_summary(), "task": {"id": format!("k:{task}")}}),
+    )
+    .await;
+    assert_eq!(
+        body_lines(&o),
+        [format!(
+            "Идея w:{y}: В плане · разбор plan → задача k:{task}"
+        )],
+        "{}",
+        o.text
+    );
+    let tasks = sol_tasks(&a).await;
+    assert_eq!(tasks.len(), 1, "новой задачи нет: {tasks:?}");
+    let idea = a
+        .t(Method::GET, &format!("/api/v1/entries/{y}"), None)
+        .await
+        .json();
+    assert_eq!(idea["status"], "accepted", "{idea}");
+    assert_eq!(idea["data"]["task_id"], task.as_str(), "{idea}");
 }
 
 /// M6.5 §7 (задача 5): `memory_recall event=idea_review` — пакет разбора со строкой шагов;
@@ -4421,7 +4529,8 @@ async fn memory_write_idempotency_key() {
 }
 
 /// Мелочи приложения zero-agent: префикс `w:` есть в списках ссылок MCP и работает в
-/// `memory_read`; описание `memory_update_entry` называет все действия без `rev`.
+/// `memory_read`; описание `memory_update_entry` называет все действия без `rev` (отрезок
+/// «без rev: … .», с `review` M6.5) и с ней («action … — с ревизией rev»).
 #[tokio::test]
 async fn mcp_ref_prefixes_include_w() {
     let a = api("mcp-ref-w", |_| {}).await;
@@ -4430,13 +4539,36 @@ async fn mcp_ref_prefixes_include_w() {
     assert!(d.contains("|w:") || d.contains("w:<id>"), "{d}");
     let upd = tool_def(&a, "memory_update_entry").await;
     let d = upd["description"].as_str().unwrap();
-    for act in [
-        "feedback", "claim", "release", "answer", "propose", "decide",
-    ] {
-        let tail = d.split("кроме").nth(1).unwrap_or("");
-        let list = tail.split(')').next().unwrap_or("");
-        assert!(list.contains(act), "rev не нужна у {act}: {d}");
-    }
+    let segment = |from: &str, to: &str| -> Vec<String> {
+        let tail = d
+            .split_once(from)
+            .unwrap_or_else(|| panic!("нет «{from}»: {d}"))
+            .1;
+        let list = tail
+            .split_once(to)
+            .unwrap_or_else(|| panic!("нет «{to}» после «{from}»: {d}"))
+            .0;
+        list.split('|').map(|s| s.trim().to_string()).collect()
+    };
+    assert_eq!(
+        segment("без rev:", "."),
+        [
+            "feedback", "claim", "release", "answer", "propose", "decide", "review"
+        ],
+        "действия без rev: {d}"
+    );
+    assert_eq!(
+        segment("action ", " — с ревизией rev"),
+        [
+            "supersede",
+            "retract",
+            "revisit",
+            "certify",
+            "append",
+            "status"
+        ],
+        "действия с rev: {d}"
+    );
     let id = mcp_idea(&a, "Идея о префиксе w").await;
     let o = ok(
         &a,
