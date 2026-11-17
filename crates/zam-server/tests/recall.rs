@@ -3243,36 +3243,50 @@ async fn mandatory_lines_kept_before_rule_phrases() {
     assert!(bare_seen, "шаг (1″) не встретился ни при одном пределе");
 }
 
+/// MCP `memory_recall` токеном администратора в сессии `session` (`None` — без
+/// `X-Zam-Session`); текст результата.
+async fn mcp_recall_text(a: &Api, session: Option<&str>, args: Value) -> String {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "memory_recall", "arguments": args}});
+    let mut b = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(axum::http::header::HOST, "memory.lan:7700")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", a.token),
+        );
+    if let Some(s) = session {
+        b = b.header("x-zam-session", s);
+    }
+    let r = a
+        .send(b.body(axum::body::Body::from(body.to_string())).unwrap())
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_ne!(j["result"]["isError"], true, "{j}");
+    j["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 /// Повторное ревью 8a, m2: MCP `memory_recall` с `source` (восстановление) — без предела
 /// канала: хуков в MCP нет, текст не урезается под 7500 байт.
 #[tokio::test]
 async fn mcp_recall_with_source_has_no_limit() {
     let (a, _) = heavy_rules_world("limit-mcp", 20).await;
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                      "params": {"name": "memory_recall",
-                                 "arguments": {"event": "recovery", "source": "compact"}}});
-    let r = a
-        .send(
-            axum::http::Request::builder()
-                .method(Method::POST)
-                .uri("/mcp")
-                .header(axum::http::header::HOST, "memory.lan:7700")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header(
-                    axum::http::header::ACCEPT,
-                    "application/json, text/event-stream",
-                )
-                .header(
-                    axum::http::header::AUTHORIZATION,
-                    format!("Bearer {}", a.token),
-                )
-                .header("x-zam-session", "mcp-limit-1")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    let text = r.text();
+    let text = mcp_recall_text(
+        &a,
+        Some("mcp-limit-1"),
+        json!({"event": "recovery", "source": "compact"}),
+    )
+    .await;
     assert!(
         !text.contains("— Кратко о правиле"),
         "MCP — L1 у всех: {text}"
@@ -3342,38 +3356,6 @@ async fn recall_timeout_ms_param_full_digest() {
     assert!(j["text"].as_str().unwrap().contains("звёздный"), "{j}");
 }
 
-/// MCP `memory_recall` токеном администратора; текст результата.
-async fn mcp_recall_text(a: &Api, args: Value) -> String {
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                      "params": {"name": "memory_recall", "arguments": args}});
-    let r = a
-        .send(
-            axum::http::Request::builder()
-                .method(Method::POST)
-                .uri("/mcp")
-                .header(axum::http::header::HOST, "memory.lan:7700")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header(
-                    axum::http::header::ACCEPT,
-                    "application/json, text/event-stream",
-                )
-                .header(
-                    axum::http::header::AUTHORIZATION,
-                    format!("Bearer {}", a.token),
-                )
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    let j = r.json();
-    assert_ne!(j["result"]["isError"], true, "{j}");
-    j["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
-
 /// M6.6 §5.1 (замечание 20): явный вызов без поля `timeout_ms` ждёт `max(recall.max_timeout_ms,
 /// recall.timeout_ms)`, хук — `recall.timeout_ms`. Шаг сбора задержан на 400 мс: `brief` из REST
 /// без `code_map` и через MCP — полный пакет (раздел ловушек) без `recall timeout`; `brief` с
@@ -3414,7 +3396,7 @@ async fn recall_explicit_brief_waits_max_timeout() {
     let text = j["text"].as_str().unwrap();
     assert!(text.contains("### Ловушки"), "{j}");
     assert!(text.contains(&format!("i:{trap}")), "{j}");
-    let t = mcp_recall_text(&a, json!({"event": "brief", "task": TASK})).await;
+    let t = mcp_recall_text(&a, None, json!({"event": "brief", "task": TASK})).await;
     assert!(
         !t.contains("recall timeout"),
         "MCP brief — явный вызов: {t}"
