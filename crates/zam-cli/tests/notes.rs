@@ -442,6 +442,171 @@ fn solution_toml_scopes_write_and_search() {
     assert_eq!(o.status.code(), Some(1), "{}", err(&o));
 }
 
+/// Номера карточек Markdown поиска (строки `<n>. …`).
+fn cards(md: &str) -> usize {
+    md.lines()
+        .filter(|l| {
+            l.split_once(". ")
+                .is_some_and(|(n, _)| n.parse::<usize>().is_ok())
+        })
+        .count()
+}
+
+/// M6.6 §9 (замечание 11): флаги `zam search` уходят полями запроса (`--budget` →
+/// `budget_tokens`, `--kind` повторяемый → `filters.kinds`, `--insight-kind`, `--certainty`,
+/// `--status`, `--decided-by`, `--file` — путь как у ссылок, `--history` → `include_history`);
+/// усечение — строкой stderr «показано K из L: бюджет — ещё N (--budget), слабые — M» (JSON —
+/// поле `omitted`, Markdown — заголовок `X-Zam-Omitted`); сервер без `omitted` — молча.
+#[test]
+fn search_filters_and_budget_flags() {
+    let e = Env::new("search-flags");
+    // заглушка: тело запроса и строка по `omitted` JSON
+    let reply = r#"{"items":[{"kind":"note","path":"a"}],"omitted":{"budget":2,"weak":1},"degraded":false,"warnings":[]}"#;
+    let (url, seen) = common::stub(200, reply, std::time::Duration::ZERO);
+    let proj = e.cwd.join("proj");
+    std::fs::create_dir_all(proj.join(".zeroaimemory")).unwrap();
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::write(proj.join("src").join("a.rs"), "fn a() {}\n").unwrap();
+    let stub = |cwd: &Path, args: &[&str]| -> Output {
+        let o = e
+            .zam()
+            .env("ZAM_URL", &url)
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        e.no_token(&o);
+        o
+    };
+    let o = stub(
+        &proj.join("src"),
+        &[
+            "search",
+            "квазар",
+            "--budget",
+            "300",
+            "--kind",
+            "note",
+            "--kind",
+            "insight",
+            "--insight-kind",
+            "gotcha",
+            "--certainty",
+            "theorem",
+            "--status",
+            "active",
+            "--decided-by",
+            "human",
+            "--file",
+            "a.rs",
+            "--history",
+            "--json",
+        ],
+    );
+    ok(&o);
+    assert_eq!(
+        err(&o),
+        "показано 1 из 4: бюджет — ещё 2 (--budget), слабые — 1\n"
+    );
+    let body = seen.lock().unwrap().last().unwrap().2.clone();
+    assert_eq!(body["budget_tokens"], 300, "{body}");
+    assert_eq!(body["include_history"], true, "{body}");
+    assert_eq!(
+        body["filters"],
+        serde_json::json!({"kinds": ["note", "insight"], "insight_kinds": ["gotcha"],
+                           "certainty": ["theorem"], "status": ["active"],
+                           "decided_by": "human", "file": "src/a.rs"}),
+        "{body}"
+    );
+    // без флагов — прежнее тело: ни `filters`, ни `budget_tokens`, ни `include_history`
+    ok(&stub(&proj, &["search", "квазар", "--json"]));
+    let body = seen.lock().unwrap().last().unwrap().2.clone();
+    for k in ["filters", "budget_tokens", "include_history"] {
+        assert!(body.get(k).is_none(), "{k}: {body}");
+    }
+    // неверные значения — код 6 до запроса
+    let before = seen.lock().unwrap().len();
+    for bad in [
+        &["--decided-by", "robot"][..],
+        &["--certainty", "maybe"],
+        &["--budget", "0"],
+        &["--file", "../../вне-проекта.rs"],
+    ] {
+        let mut args = vec!["search", "квазар"];
+        args.extend_from_slice(bad);
+        let o = stub(&proj, &args);
+        assert_eq!(o.status.code(), Some(6), "{bad:?}: {}", err(&o));
+    }
+    assert_eq!(seen.lock().unwrap().len(), before, "запросов не было");
+    // сервер без `omitted` (до 0.0.13-m6.6) — без строки, как раньше
+    let (old, _) = common::stub(
+        200,
+        r#"{"items":[{"kind":"note"}],"degraded":false,"warnings":[]}"#,
+        std::time::Duration::ZERO,
+    );
+    let o = e
+        .zam()
+        .env("ZAM_URL", &old)
+        .args(["search", "квазар", "--json"])
+        .output()
+        .unwrap();
+    ok(&o);
+    assert!(err(&o).is_empty(), "{}", err(&o));
+
+    // настоящий сервер: бюджет усекает выдачу — строка хвоста в Markdown и строка stderr
+    for i in 0..12 {
+        let text = format!(
+            "# Квазар {i:02}\n\nквазар светит ярко; {}\n",
+            "пояснение про далёкие галактики и их ядра ".repeat(6)
+        );
+        ok(&e.run_stdin(
+            &["write", &format!("knowledge:Квазары/Заметка {i:02}")],
+            text.as_bytes(),
+        ));
+    }
+    let o = e.run(&["search", "квазар", "--top-k", "30", "--budget", "200"]);
+    let md = ok(&o);
+    let k = cards(&md);
+    let line = md
+        .lines()
+        .find_map(|l| l.strip_prefix("> не поместилось по бюджету: "))
+        .unwrap_or_else(|| panic!("нет строки хвоста: {md}"));
+    assert!(line.ends_with(" (budget_tokens 200)"), "{line}");
+    let n: usize = line.split_once(' ').unwrap().0.parse().unwrap();
+    assert!(k >= 1 && n >= 1 && k + n == 12, "{k} + {n}: {md}");
+    assert!(
+        err(&o).contains(&format!(
+            "показано {k} из {}: бюджет — ещё {n} (--budget), слабые — 0",
+            k + n
+        )),
+        "{}",
+        err(&o)
+    );
+    // `--json` — та же строка по полю `omitted`
+    let o = e.run(&[
+        "search",
+        "квазар",
+        "--top-k",
+        "30",
+        "--budget",
+        "200",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&ok(&o)).unwrap();
+    assert_eq!(v["omitted"]["budget"], n, "{v}");
+    assert!(
+        err(&o).contains(&format!("показано {k} из {}", k + n)),
+        "{}",
+        err(&o)
+    );
+    // бюджета хватает — строки нет
+    let o = e.run(&["search", "квазар", "--top-k", "30", "--budget", "20000"]);
+    let md = ok(&o);
+    assert_eq!(cards(&md), 12, "{md}");
+    assert!(!md.contains("не поместилось"), "{md}");
+    assert!(!err(&o).contains("показано"), "{}", err(&o));
+}
+
 /// Пачка (`POST /read`): заголовки элементов, `--max-tokens`, `--if-rev`, ошибка по элементу
 /// не обрывает остальные (код 5), `--json` и несовместимость с `--rev`.
 #[test]

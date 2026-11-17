@@ -195,6 +195,32 @@ enum Cmd {
         /// реранкера: zam-server models fetch --reranker)
         #[arg(long)]
         rerank: bool,
+        /// Бюджет ответа, токенов (budget_tokens, 1–200000; по умолчанию — сервера, 800)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=200_000))]
+        budget: Option<u32>,
+        /// Вид цели (можно повторять): note, insight, changelog, release, term, task, question,
+        /// idea, folder, attachment; по умолчанию — виды сервера
+        #[arg(long, value_name = "K")]
+        kind: Vec<String>,
+        /// Вид insight (можно повторять)
+        #[arg(long, value_name = "K",
+              value_parser = ["gotcha", "failure", "discovery", "decision", "experiment", "pattern"])]
+        insight_kind: Vec<String>,
+        /// Надёжность (можно повторять); без флага — любая
+        #[arg(long, value_parser = ["axiom", "theorem", "hypothesis"])]
+        certainty: Vec<String>,
+        /// Статус записи (можно повторять); по умолчанию — действующие
+        #[arg(long, value_name = "S")]
+        status: Vec<String>,
+        /// Только решения, принятые человеком или агентом (data.decision.decided_by)
+        #[arg(long, value_parser = ["human", "agent"])]
+        decided_by: Option<String>,
+        /// Только знания со ссылкой на файл (путь — как у ссылок, от корня проекта)
+        #[arg(long, value_name = "P")]
+        file: Option<String>,
+        /// С историей: замещённые, отозванные и закрытые записи тоже (include_history)
+        #[arg(long)]
+        history: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -1131,6 +1157,16 @@ enum ReleaseCmd {
         /// GUID решения (иначе agent_solution_id из solution.toml)
         #[arg(long)]
         solution: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Релизы решения, новые первыми: id, версия, дата, тег, число коммитов
+    List {
+        /// GUID решения (иначе agent_solution_id из solution.toml)
+        #[arg(long)]
+        solution: Option<String>,
+        #[command(flatten)]
+        page: cmd::Paging,
         #[command(flatten)]
         common: Common,
     },
@@ -2086,6 +2122,14 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             mode,
             top_k,
             rerank,
+            budget,
+            kind,
+            insight_kind,
+            certainty,
+            status,
+            decided_by,
+            file,
+            history,
             common,
         } => {
             let o = cmd::search::Opts {
@@ -2093,6 +2137,14 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 mode: &mode,
                 top_k,
                 rerank,
+                budget,
+                kinds: &kind,
+                insight_kinds: &insight_kind,
+                certainty: &certainty,
+                status: &status,
+                decided_by: decided_by.as_deref(),
+                file: file.as_deref(),
+                history,
             };
             cmd::search::run(&cmd::connect(&common)?, &query, &o)
         }
@@ -2249,6 +2301,14 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             with.as_deref(),
             solution.as_deref(),
         ),
+        Cmd::Release {
+            cmd:
+                ReleaseCmd::List {
+                    solution,
+                    page,
+                    common,
+                },
+        } => cmd::release::list(&cmd::connect(&common)?, solution.as_deref(), page),
         Cmd::Link { args, common } => match args.as_slice() {
             [rm, id] if rm == "rm" => cmd::link::remove(&cmd::connect(&common)?, id),
             [src, kind, dst] => cmd::link::create(&cmd::connect(&common)?, src, kind, dst),

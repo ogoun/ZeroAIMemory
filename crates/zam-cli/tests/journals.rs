@@ -248,6 +248,78 @@ fn release_from_git_collects_commits() {
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
 }
 
+/// M6.6 §9 (замечание 14): `zam release list` — строки `<id> <версия> <дата>[ тег <tag>][ ·
+/// коммитов K]`, новые первыми (по дате релиза, при равной — по времени создания); `--json` —
+/// записи сервера в том же порядке; обход ленты — общий (`--limit`, `--all`, строка «есть ещё»).
+#[test]
+fn release_list_newest_first() {
+    let (url, tok) = start("release-list");
+    let r = repo("release-list-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    // порядок создания не совпадает с порядком дат: 0.9.0 создан после 1.1.0
+    ok(&z(&[
+        "release",
+        "add",
+        "1.1.0",
+        "--date",
+        "2026-02-01",
+        "--from-git",
+        "v1..v2",
+    ]));
+    ok(&z(&["release", "add", "0.9.0", "--date", "2025-12-01"]));
+    ok(&z(&[
+        "release",
+        "add",
+        "1.2.0",
+        "--date",
+        "2026-03-01",
+        "--tag",
+        "v2",
+    ]));
+    ok(&z(&["release", "add", "1.2.1", "--date", "2026-03-01"]));
+    let s = ok(&z(&["release", "list"]));
+    let rows: Vec<(&str, &str)> = s
+        .lines()
+        .map(|l| l.split_once(' ').unwrap_or_else(|| panic!("{s}")))
+        .collect();
+    assert!(rows.iter().all(|(id, _)| id.len() == 26), "{s}");
+    let rest: Vec<&str> = rows.iter().map(|(_, r)| *r).collect();
+    assert_eq!(
+        rest,
+        [
+            "1.2.1 2026-03-01",
+            "1.2.0 2026-03-01 тег v2",
+            "1.1.0 2026-02-01 · коммитов 2",
+            "0.9.0 2025-12-01",
+        ],
+        "{s}"
+    );
+    // --json — записи сервера, тот же порядок
+    let j = json(&z(&["release", "list", "--json"]));
+    let versions: Vec<&str> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["data"]["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(versions, ["1.2.1", "1.2.0", "1.1.0", "0.9.0"], "{j}");
+    assert_eq!(j["items"][0]["id"].as_str(), Some(rows[0].0), "{j}");
+    assert!(j["next_cursor"].is_null(), "{j}");
+    // страница меньше ленты — строка «есть ещё»; --all — вся лента
+    let o = z(&["release", "list", "--limit", "2"]);
+    assert_eq!(ok(&o).lines().count(), 2);
+    assert_eq!(err(&o), "показано 2, есть ещё: --limit 200 или --all\n");
+    let o = z(&["release", "list", "--all"]);
+    assert_eq!(ok(&o).lines().count(), 4);
+    assert!(err(&o).is_empty(), "{}", err(&o));
+    // сравнение по версии — прежнее (обход ленты общий с list)
+    let c = json(&z(&["release", "compare", "1.2.0", "--json"]));
+    assert_eq!(c["to"]["data"]["version"], "1.2.0", "{c}");
+    // неверный GUID решения — код 6
+    let o = z(&["release", "list", "--solution", "x"]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+}
+
 /// Каталог проекта с `solution.toml` (без git).
 fn project(name: &str) -> PathBuf {
     let r = tmp(name);

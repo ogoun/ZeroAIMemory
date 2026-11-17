@@ -1022,3 +1022,53 @@ async fn brief_min_rel_drops_weak() {
     let ch = search(&on, body("chunks")).await.json();
     assert_eq!(ch["items"].as_array().unwrap().len(), all.len(), "{ch}");
 }
+
+/// M6.6 §9 (замечание 11): усечение выдачи не молчит. JSON — `omitted {budget, weak}` всегда
+/// (нули — без усечения), Markdown — строка хвоста «> не поместилось по бюджету: N
+/// (budget_tokens B)» только при N > 0, в резерве упаковки: ответ вместе со строкой MCP `~N tok`
+/// укладывается в бюджет; слабые карточки (`brief_min_rel`) в строку не идут. Заголовок
+/// `X-Zam-Omitted: budget=N; weak=M` — у Markdown, для клиента без JSON.
+#[tokio::test]
+async fn search_reports_omitted_by_budget() {
+    let a = api("search-omitted", |_| {}).await;
+    budget_corpus(&a).await;
+    let body = |budget: usize, min_rel: f64, format: &str| {
+        json!({"query": "сборка скрипт", "mode": "brief", "top_k": 30, "budget_tokens": budget,
+               "brief_min_rel": min_rel, "format": format})
+    };
+    // без усечения: все кандидаты, нули, строки нет
+    let all = search(&a, body(20000, 0.0, "json")).await.json();
+    let total = all["items"].as_array().unwrap().len();
+    assert!(total >= 10, "{all}");
+    assert_eq!(all["omitted"], json!({"budget": 0, "weak": 0}), "{all}");
+    let r = search(&a, body(20000, 0.0, "md")).await;
+    assert!(!r.text().contains("не поместилось"), "{}", r.text());
+    assert_eq!(r.header("x-zam-omitted"), "budget=0; weak=0");
+    // малый бюджет: N > 0, K + N — все кандидаты, JSON и Markdown — один отбор
+    for budget in [400usize, 800] {
+        let j = search(&a, body(budget, 0.0, "json")).await.json();
+        let shown = j["items"].as_array().unwrap().len();
+        let n = j["omitted"]["budget"].as_u64().unwrap() as usize;
+        assert!(n > 0, "{budget}: {j}");
+        assert_eq!(shown + n, total, "{budget}: {j}");
+        assert_eq!(j["omitted"]["weak"], 0, "{budget}: {j}");
+        let r = search(&a, body(budget, 0.0, "md")).await;
+        let md = r.text();
+        assert_eq!(card_numbers(&md).len(), shown, "{budget}: {md}");
+        let line = format!("> не поместилось по бюджету: {n} (budget_tokens {budget})\n");
+        assert!(md.ends_with(&line), "{budget}: {md}");
+        assert_eq!(md.matches("не поместилось").count(), 1, "{md}");
+        let cost = md_cost(&md);
+        assert!(cost <= budget, "{budget}: {cost} токенов\n{md}");
+        assert_eq!(r.header("x-zam-omitted"), format!("budget={n}; weak=0"));
+    }
+    // слабые: отсечка 0,99 — `weak > 0`, в Markdown строки о них нет
+    let j = search(&a, body(20000, 0.99, "json")).await.json();
+    let weak = j["omitted"]["weak"].as_u64().unwrap() as usize;
+    assert!(weak > 0, "{j}");
+    assert_eq!(j["items"].as_array().unwrap().len() + weak, total, "{j}");
+    assert_eq!(j["omitted"]["budget"], 0, "{j}");
+    let r = search(&a, body(20000, 0.99, "md")).await;
+    assert!(!r.text().contains("не поместилось"), "{}", r.text());
+    assert_eq!(r.header("x-zam-omitted"), format!("budget=0; weak={weak}"));
+}

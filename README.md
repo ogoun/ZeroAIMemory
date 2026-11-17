@@ -556,10 +556,11 @@ stdio-прокси `zam mcp`). Токена в файлах проекта не�
 | `zam read <цель>… [--tier L0\|L1\|L2\|focus] [--section "A > B"] [--rev N]` | чтение Markdown как он сохранён; `--batch`, `--max-tokens N`, `--budget N`, `--if-rev N`, `--since-rev N` (дифф с ревизии, M4.5), `--locator` (часть вложения, M5) — пачкой через `POST /read` с бюджетом токенов; `--focus "<запрос>"` (M6) — оглавление и ближайшие к запросу части, пропуски с адресом `range:r<rev>:S-E`; `--range r<rev>:S-E` (M6) — ровно пропущенный текст той ревизии |
 | `zam write <цель> [--file f.md] [-m сообщение] [--base-rev N] [--l0 текст]` | создать или заменить заметку (без `--file` текст читается из stdin) |
 | `zam history <цель> [--diff A..B \| --revert N]` | ревизии, дифф, откат |
-| `zam search <запрос> [--all] [--mode brief\|chunks\|notes] [--top-k N] [--rerank]` | поиск, по умолчанию Markdown-карточки; `--rerank` — серверный реранк |
+| `zam search <запрос> [--all] [--mode brief\|chunks\|notes] [--top-k N] [--rerank] [--budget N] [--kind K]… [--insight-kind K]… [--certainty C]… [--status S]… [--decided-by human\|agent] [--file P] [--history]` | поиск, по умолчанию Markdown-карточки; `--rerank` — серверный реранк. M6.6: бюджет ответа и фильтры `filters` флагами; бюджет или отсечка слабых срезали карточки — строка в stderr «показано K из L: бюджет — ещё N (--budget), слабые — M» |
+| `zam release add <версия> [--date D] [--tag T] [--from-git [FROM..TO]] \| compare <версия> [--with prev\|<версия>] \| list [--limit N \| --all]` | релизы решения (M3); M6.6: `list` — новые первыми, строками `<id> <версия> <дата>[ тег <tag>][ · коммитов K]` |
 | `zam attach <цель> <файл>` | загрузить вложение и напечатать ссылку `_attachments/…` |
 | `zam report <файл.md> [--title T] [--tag X]… [--area A] [--ref commit:<sha>\|file:<путь>\|note:<id>\|task:k:<id>]… [--key K] [--json]` | отчёт пользователю (M5.5): Markdown с картинками и файлами по относительным ссылкам — одним запросом; печатает ссылку на страницу WebUI |
-| `zam code sync [--full] [--prune] \| status \| map [--focus <путь\|имя>]… [--task T] [--tokens N] \| sym <имя\|путь#qual> \| refs <имя> \| impact [--since C]` | карта кода решения (M5.6): синхронизация рабочей копии, карта в бюджете, карточка символа, кто ссылается, влияние правки |
+| `zam code sync [--full] [--prune] \| status \| map [--focus <путь\|имя>]… [--task T] [--tokens N] \| sym <имя\|путь#qual> \| refs <имя> \| impact [--since C]` | карта кода решения (M5.6): синхронизация рабочей копии, карта в бюджете, карточка символа, кто ссылается, влияние правки. M6.6: секреты сигнатур клиент маскирует до отправки правилами сервера — итог строкой stderr «секреты в сигнатурах: N (файлов F) — …», список мест — `masked` в `--json` |
 | `zam log insight --kind K --title T [--scope global] [--certainty C] [--evidence-file F \| --evidence-checked C --evidence-method M --evidence-result R] [--context C] [--option O]… [--chosen C] [--rationale R] [--consequences C] [--decided-by human\|agent] [--revisit-if R]` | insight (открытие, ловушка, решение); M6.6: поля решения `data.decision` флагами — только у `--kind decision` (у `zam insight supersede` без `--kind` — вид замещаемой записи), до 8 `--option`; доказательство без файла — три флага `--evidence-*` вместе; без `--certainty` — строка в stderr об умолчании агента `hypothesis` |
 | `zam task new --title T [--next S] [--owner agent\|human] [--estimate МИН] [--link L]… [--priority low\|normal\|high]` | задача (M4.5); M6.6: владелец, оценка в минутах, ссылки и приоритет — в `data` задачи, их печатает `zam task show` |
 | `zam insight\|task\|question\|idea list [--global] [--limit N \| --all]` | ленты журналов; M6.6: есть ещё записи — строка в stderr «показано N, есть ещё: --limit 200 или --all», `--all` — вся лента. Область Knowledge — `--global` у лент, записей и Vault; `--knowledge` — синоним |
@@ -580,7 +581,9 @@ zam read "knowledge:Инструменты/Bash" --section "Установка >
 Если векторный поиск выключен (нет моделей, Qdrant недоступен), `zam search` отвечает
 результатами полнотекстового поиска: в Markdown остаётся строка сервера `> degraded: <код> — <причина>`,
 а в stderr печатается причина по-русски. Предупреждения ответа (например, «реранкер не
-установлен» при `--rerank`) тоже идут в stderr, в Markdown — строками `> warning:`.
+установлен» при `--rerank`) тоже идут в stderr, в Markdown — строками `> warning:`. Бюджет срезал
+карточки — в Markdown последняя строка сервера `> не поместилось по бюджету: N (budget_tokens B)`,
+в stderr — «показано K из L: бюджет — ещё N (--budget), слабые — M» (сервер 0.0.13-m6.6 и новее).
 
 Коды выхода: 0 — успех, 1 — конфигурация, 2 — сервер недоступен, 3 — токен, 4 — конфликт
 ревизий (дифф в stderr), 5 — не найдено, 6 — неверный ввод. Команды журналов, Vault, связей и
@@ -591,11 +594,14 @@ zam read "knowledge:Инструменты/Bash" --section "Установка >
 M5.5, `zam code` — с M5.6, `zam idea` — с M5.7, `zam export`, `import`, `sessions tokens|snapshot`
 (`zam session …` — то же) и `zam read --focus|--range` — с M6, `zam idea review|queue` — с M6.5,
 `zam vault rm|rename|mv` — с M6.6 (`mv` — сервер `0.0.13-m6.6` и новее), флаги решения и
-доказательства `zam log insight`, поля `zam task new` и `--all` лент — с M6.6. Нужный сервер:
+доказательства `zam log insight`, поля `zam task new`, `--all` лент, флаги бюджета и фильтров
+`zam search` и `zam release list` — с M6.6. Нужный сервер:
 `--evidence-checked|method|result` (`data.evidence`) и `--all`/`--limit` (курсор `next_cursor`,
 страница до 200) — `0.0.4-m3` и новее (лента задач и вопросов — с `0.0.6-m4.5`, идей — с
 `0.0.10-m5.7`); поля решения (`data.decision`) и `--owner`, `--estimate`, `--link` задачи —
-`0.0.6-m4.5`; `--priority` задачи — `0.0.12-m6.5`; см.
+`0.0.6-m4.5`; `--priority` задачи — `0.0.12-m6.5`; фильтры `zam search` (`--decided-by`,
+`--file`, `--insight-kind`) — `0.0.6-m4.5` (старый сервер неизвестные фильтры пропускает молча),
+строка «показано K из L» — `0.0.13-m6.6`; `zam release list` — любой; см.
 [deploy/README-install.md](deploy/README-install.md). Хуки
 (`zam hook …`) всегда выходят с кодом 0.
 

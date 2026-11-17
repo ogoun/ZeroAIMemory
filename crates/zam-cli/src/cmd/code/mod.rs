@@ -142,6 +142,9 @@ pub fn run(c: CodeCmd) -> Result<(), CliError> {
                     emit_json(&serde_json::to_value(&r).unwrap_or_default())
                 }
                 Outcome::Done(r) => {
+                    if let Some(m) = r.masked_line() {
+                        eprintln!("{m}");
+                    }
                     for w in &r.warnings {
                         eprintln!("предупреждение: {w}");
                     }

@@ -372,6 +372,10 @@ zam history "knowledge:Инструменты/Bash скрипты" --revert 1
 # поиск: Markdown, в области — текущее решение, Knowledge и Rules; --all — все решения
 zam search "bash скрипты"
 zam search docker --all --mode notes --top-k 5
+# бюджет и фильтры (с 0.0.13-m6.6): ловушки и провалы о файле, с историей; бюджет срезал
+# карточки — в stderr «показано K из L: бюджет — ещё N (--budget), слабые — M»
+zam search "сборка" --kind insight --insight-kind gotcha --insight-kind failure \
+  --file src/build.rs --history --budget 2000
 
 # вложение: печатает ссылку _attachments/… для вставки в заметку
 zam attach "knowledge:Инструменты/Bash скрипты" ./схема.png
