@@ -339,7 +339,8 @@ pub fn remove(ctx: &Ctx, a: &Area, name: &str) -> Result<(), CliError> {
 }
 
 /// `zam vault rename`: новое имя `new_name` — новая ревизия с `If-Match` прочитанной; имя занято
-/// в той же области или запись изменилась между чтением и правкой — 409, код 4.
+/// в той же области или запись изменилась между чтением и правкой — 409, код 4. Прежнее имя —
+/// сервер ревизию не создаёт: `<id>@<rev>` и строка в stderr, как у `mv` в ту же область.
 pub fn rename(ctx: &Ctx, a: &Area, name: &str, new_name: &str) -> Result<(), CliError> {
     let (_, item) = located(ctx, a, name)?;
     let id = item["id"].as_str().unwrap_or_default();
@@ -348,7 +349,11 @@ pub fn rename(ctx: &Ctx, a: &Area, name: &str, new_name: &str) -> Result<(), Cli
         &json!({ "title": new_name.trim() }),
         item["rev"].as_i64().unwrap_or(0),
     )?;
-    written(ctx, &read_json(r)?)
+    let m = read_json(r)?;
+    if m["rev"] == item["rev"] {
+        eprintln!("запись «{}» уже называется так: без изменений", name.trim());
+    }
+    written(ctx, &m)
 }
 
 /// `zam vault mv`: перенос записи `name` из области `a` в `to` (`POST /vault/{id}/move`, M6.6

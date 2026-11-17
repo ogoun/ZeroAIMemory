@@ -1425,6 +1425,19 @@ async fn mcp_vault_delete_rename() {
         o.text
     );
     assert!(!vault_call(&a, &a.token, &h, get).await.is_error);
+    // то же имя — без новой ревизии (ревью задачи 6, M4)
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "rename", "name": "third-name", "new_name": "third-name"}),
+    )
+    .await;
+    assert!(
+        !o.is_error && o.text.contains("без изменений") && o.text.contains("rev3"),
+        "{}",
+        o.text
+    );
     let o = vault_call(
         &a,
         &a.token,
@@ -1483,6 +1496,71 @@ async fn mcp_vault_delete_rename() {
     let mut want = vec![by_name.as_str(), by_ref.as_str()];
     want.sort();
     assert_eq!(deleted, want);
+}
+
+/// Ревью задачи 6, M3 (решение координатора): `delete` по имени без `scope`, когда точное имя
+/// есть и в Vault решения, и в личном, — ошибка 409 со списком `v:<id>` и областей и подсказкой
+/// «укажи scope или v:<id>», ничего не удалено; `rename` и `move` по имени по-прежнему берут
+/// запись решения (как `get`), ответ называет область. Со `scope` удаление проходит.
+#[tokio::test]
+async fn mcp_vault_delete_ambiguous_name() {
+    let a = api("mcp-vault-del-ambig", |_| {}).await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    let h = [
+        ("x-zam-solution", G),
+        ("x-zam-session", SESSION),
+        ("x-zam-machine", MACHINE),
+    ];
+    for scope in ["solution", "global"] {
+        let o = vault_call(
+            &a,
+            &a.token,
+            &h,
+            json!({"action": "set", "name": "dup", "scope": scope, "value": format!("val-{scope}")}),
+        )
+        .await;
+        assert!(!o.is_error, "{}", o.text);
+    }
+    let sol = vault_ids(&a, &h, json!({})).await[0].1.clone();
+    let per = vault_ids(&a, &h, json!({"scope": "global"})).await[0]
+        .1
+        .clone();
+    let o = vault_call(&a, &a.token, &h, json!({"action": "delete", "name": "dup"})).await;
+    assert!(o.is_error && o.text.contains("409"), "{}", o.text);
+    for want in [
+        format!("v:{sol}"),
+        format!("v:{per}"),
+        G.to_string(),
+        "knowledge".to_string(),
+        "укажи scope или v:<id>".to_string(),
+    ] {
+        assert!(o.text.contains(&want), "{want}: {}", o.text);
+    }
+    assert!(!o.text.contains("val-"), "значения в списке: {}", o.text);
+    assert_eq!(vault_ids(&a, &h, json!({})).await.len(), 1);
+    assert_eq!(vault_ids(&a, &h, json!({"scope": "global"})).await.len(), 1);
+    // rename без scope — как get: запись решения, ответ называет область
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "rename", "name": "dup", "new_name": "dup"}),
+    )
+    .await;
+    assert!(!o.is_error && o.text.contains(&sol), "{}", o.text);
+    assert!(o.text.contains(G), "{}", o.text);
+    // со scope удаление однозначно; потом имя одно — удаляется без scope
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "delete", "name": "dup", "scope": "global"}),
+    )
+    .await;
+    assert!(!o.is_error && o.text.contains(&per), "{}", o.text);
+    let o = vault_call(&a, &a.token, &h, json!({"action": "delete", "name": "dup"})).await;
+    assert!(!o.is_error && o.text.contains(&sol), "{}", o.text);
+    assert!(vault_ids(&a, &h, json!({})).await.is_empty());
 }
 
 /// M6.6 §7 (замечание 25): `memory_vault action=move` с `to` — по имени (откуда — `scope`) и по

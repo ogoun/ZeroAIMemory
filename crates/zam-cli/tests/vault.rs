@@ -332,6 +332,10 @@ fn vault_rm_and_rename() {
     );
     let o = z(&["vault", "rename", "missing", "x", "--global"], b"");
     assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    // то же имя — без новой ревизии, строка в stderr (ревью задачи 6, M4)
+    let o = z(&["vault", "rename", "gh-main", "gh-main", "--global"], b"");
+    assert!(ok(&o).trim().ends_with("@2"), "{}", out(&o));
+    assert!(err(&o).contains("без изменений"), "{}", err(&o));
     // rm и синоним delete
     let s = ok(&z(&["vault", "rm", "gh-main", "--global"], b""));
     assert!(s.contains("удалена"), "{s}");

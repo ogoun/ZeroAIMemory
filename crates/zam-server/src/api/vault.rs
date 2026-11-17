@@ -501,9 +501,50 @@ pub struct Patch {
     secret: Option<Zeroizing<String>>,
 }
 
+/// Ожидаемая ревизия правки: `If-Match` или, без заголовка, текущая.
+fn expected_rev(headers: &HeaderMap, m: &VaultMeta) -> Result<i64, ApiError> {
+    if headers.contains_key(header::IF_MATCH) {
+        if_match(headers)
+    } else {
+        Ok(m.rev)
+    }
+}
+
+/// Ожидаемая ревизия не текущая — 409. Проверяется до перешифровки (ревью задачи 6, M2):
+/// устаревшая правка не расшифровывает значение, а транзакция хранилища сверяет ревизию ещё раз.
+fn check_rev(m: &VaultMeta, expected: i64) -> Result<(), ApiError> {
+    if expected == m.rev {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "ревизия записи Vault {}, а не {expected}",
+        m.rev
+    )))
+}
+
+/// Значение записи `item` под ревизией `to_rev`: AAD шифротекста связан с ревизией, поэтому
+/// значение ревизии `from_rev` расшифровывается и шифруется заново. Пустой блоб (окружение без
+/// значения) — пустой: шифровать нечего. Общее у `patch` и `move_to`.
+async fn reencrypt(
+    st: &AppState,
+    user: Id,
+    item: Id,
+    from_rev: i64,
+    to_rev: i64,
+    blob: &[u8],
+) -> Result<Vec<u8>, ApiError> {
+    if blob.is_empty() {
+        return Ok(Vec::new());
+    }
+    let plain = st.vault.decrypt(user, item, from_rev, blob).await?;
+    st.vault.encrypt(user, item, to_rev, &plain).await
+}
+
 /// `PATCH /vault/{id}` (необязательный `If-Match: <rev>`) → 200 метаданные / 409.
 /// Каждая правка — новая ревизия со своим шифротекстом (AAD связан с ревизией): без нового
-/// значения прежнее перешифровывается. Пустая правка — запись как есть.
+/// значения прежнее перешифровывается. Пустая правка — запись как есть; прежнее имя без других
+/// полей — тоже пустая правка (без ревизии и перешифровки). Устаревший `If-Match` — 409 после
+/// проверки полей тела и до перешифровки.
 pub async fn patch(
     State(st): State<AppState>,
     p: Principal,
@@ -513,48 +554,32 @@ pub async fn patch(
 ) -> Result<Json<Value>, ApiError> {
     let (a, m, blob) = item(&st, &p, &headers, &id, true, true).await?;
     let req: Patch = vault_body(body)?;
-    let expected = if headers.contains_key(header::IF_MATCH) {
-        if_match(&headers)?
-    } else {
-        m.rev
-    };
-    let title = req.title.as_deref().map(check_title).transpose()?;
+    let expected = expected_rev(&headers, &m)?;
+    // прежнее имя — не правка имени (ревью задачи 6, M4)
+    let title = req
+        .title
+        .as_deref()
+        .map(check_title)
+        .transpose()?
+        .filter(|t| *t != m.title);
     let data = req.data.as_ref().map(check_data).transpose()?;
     if let Some(s) = &req.secret {
         check_secret(s)?;
     }
+    check_rev(&m, expected)?;
     if title.is_none() && data.is_none() && req.secret.is_none() {
-        if expected != m.rev {
-            return Err(ApiError::conflict(format!(
-                "ревизия записи Vault {}, а не {expected}",
-                m.rev
-            )));
-        }
         return Ok(Json(meta_json(&m)));
     }
     let attrib = attribution(&p, &headers, None)?;
     // тип после правки без значения — только окружение (пустой блоб у прежнего типа не в счёт)
     let after_env = data.as_ref().map_or_else(|| env_type(&m.data), env_type);
+    let rev = m.rev + 1;
     let new_blob = match &req.secret {
-        Some(s) => {
-            st.vault
-                .encrypt(a.user.id, m.id, expected + 1, s.as_bytes())
-                .await?
-        }
-        None if blob.is_empty() => {
-            if !after_env {
-                return Err(secret_required());
-            }
-            Vec::new()
-        }
-        None => {
-            let plain = st.vault.decrypt(a.user.id, m.id, m.rev, &blob).await?;
-            st.vault
-                .encrypt(a.user.id, m.id, expected + 1, &plain)
-                .await?
-        }
+        Some(s) => st.vault.encrypt(a.user.id, m.id, rev, s.as_bytes()).await?,
+        None if blob.is_empty() && !after_env => return Err(secret_required()),
+        None => reencrypt(&st, a.user.id, m.id, m.rev, rev, &blob).await?,
     };
-    let m = vault_update(&a.db, m.id, expected, title, data, new_blob, &attrib).await?;
+    let m = vault_update(&a.db, m.id, m.rev, title, data, new_blob, &attrib).await?;
     Ok(Json(meta_json(&m)))
 }
 
@@ -603,9 +628,9 @@ fn moved_json(m: &VaultMeta) -> Value {
 /// agent_solution_id}` (M6.6 §7). `space` — `knowledge` или GUID решения (как `{space}` пути).
 /// Права записи в исходной и целевой области; заблокированный Vault — 503 раньше проверки цели.
 /// Перенос — новая ревизия: значение перешифровывается под `rev + 1` (AAD связан с ревизией, а
-/// не с областью), имя и `data` прежние; та же область — запись как есть, без ревизии и аудита
-/// (устаревший `If-Match` — 409, как у пустой правки). Имя занято в цели — 409, запись не
-/// тронута. Аудит `vault.move {item, from, to, rev}`.
+/// не с областью), имя и `data` прежние; та же область — запись как есть, без ревизии и аудита.
+/// Устаревший `If-Match` — 409 после проверки прав цели и до перешифровки. Имя занято в цели —
+/// 409, запись не тронута. Аудит `vault.move {item, from, to, rev}`.
 pub async fn move_to(
     State(st): State<AppState>,
     p: Principal,
@@ -619,31 +644,14 @@ pub async fn move_to(
     let to = parse_scope(&req.space)?;
     let role = scope_role(&st, &p, &a.user, &to).await?;
     effective_write(&p, role)?;
-    let expected = if headers.contains_key(header::IF_MATCH) {
-        if_match(&headers)?
-    } else {
-        m.rev
-    };
+    check_rev(&m, expected_rev(&headers, &m)?)?;
     if to == m.scope {
-        if expected != m.rev {
-            return Err(ApiError::conflict(format!(
-                "ревизия записи Vault {}, а не {expected}",
-                m.rev
-            )));
-        }
         return Ok(Json(moved_json(&m)));
     }
     let attrib = attribution(&p, &headers, None)?;
-    // окружение без значения — пустой блоб, шифровать нечего; значение не покидает сервер
-    let new_blob = if blob.is_empty() {
-        Vec::new()
-    } else {
-        let plain = st.vault.decrypt(a.user.id, m.id, m.rev, &blob).await?;
-        st.vault
-            .encrypt(a.user.id, m.id, expected + 1, &plain)
-            .await?
-    };
-    let moved = vault_move(&a.db, m.id, expected, &to, new_blob, &attrib).await?;
+    // значение не покидает сервер: перешифровка под новую ревизию
+    let new_blob = reencrypt(&st, a.user.id, m.id, m.rev, m.rev + 1, &blob).await?;
+    let moved = vault_move(&a.db, m.id, m.rev, &to, new_blob, &attrib).await?;
     audit(
         &st,
         &p,

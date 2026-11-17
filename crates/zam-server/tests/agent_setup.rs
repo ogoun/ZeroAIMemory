@@ -1292,6 +1292,7 @@ async fn guide_vault_scope_and_delete_rule() {
         "new_name",
         "action: \"delete\"",
         "удаляй только свою ошибочную запись или по просьбе человека",
+        "укажи `scope` или `v:<id>`",
         "zam vault set <имя>",
     ] {
         assert!(ru.contains(want), "{want}: {ru}");
@@ -1307,6 +1308,7 @@ async fn guide_vault_scope_and_delete_rule() {
         "new_name",
         "action: \"delete\"",
         "delete only your own erroneous record or at the human's request",
+        "pass `scope` or `v:<id>`",
         "zam vault set <name>",
     ] {
         assert!(en.contains(want), "{want}: {en}");

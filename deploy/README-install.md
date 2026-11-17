@@ -1180,10 +1180,8 @@ jina — модель с динамическим int8: пары «запрос 
   репозитории это утечка адреса внутренней сети (обход — `CLAUDE.md`, `.mcp.json`, `.claude/`,
   `.zeroaimemory/` в `.git/info/exclude`); «Первый токен администратора» не открывает админ-API
   (`/api/v1/admin/*` — 403): нужен вход логином и паролем WebUI; пакет субагенту (`memory_recall
-  event=brief`) на сервере без GPU может кончаться `recall timeout` (только Rules); `zam vault
-  add` скрыт в `--help` (там — `set`), удаления и переименования записи Vault нет в CLI и MCP
-  (только REST). Остальные замечания — журнал этапа в репозитории
-  (`docs/plans/2026-11-15-m6.5-dogfood-log.md`).
+  event=brief`) на сервере без GPU может кончаться `recall timeout` (только Rules). Остальные
+  замечания — журнал этапа в репозитории (`docs/plans/2026-11-15-m6.5-dogfood-log.md`).
 
 - Для собирающих из исходников (0.0.12-m6.5): `supervisor::shutdown_waits_for_flush_bounded`
   (`zam-index`) падает на почти полном и загруженном HDD — Qdrant не подтверждает WAL за 30 с, а

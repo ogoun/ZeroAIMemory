@@ -1736,6 +1736,197 @@ async fn vault_rename_stale_if_match_409() {
     );
 }
 
+/// Портит шифротекст записи `id` в базе пользователя запроса: расшифровка дальше — 500.
+async fn corrupt_blob(a: &Api, id: &str) {
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let id = id.to_string();
+    db.write(move |tx| {
+        tx.execute(
+            "UPDATE vault_items SET secret = ?2 WHERE id = ?1",
+            rusqlite::params![id, vec![1u8; 64]],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+/// Ревью задачи 6, M2: устаревший `If-Match` переноса в другую область — 409 до расшифровки и
+/// шифрования (испорченный шифротекст не даёт 500); значение, область и история не тронуты,
+/// аудита нет. Ревизия «из будущего» (`rev + 1`) — тоже 409.
+#[tokio::test]
+async fn vault_move_stale_if_match_409() {
+    let a = api("vault-move-stale", |_| {}).await;
+    register(&a, &a.token, G, "Своё").await;
+    let v = value("st");
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", &v).await);
+    let r = a
+        .t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{id}"),
+            Some(json!({ "secret": v })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let stale_move = |id: String, rev: &'static str| {
+        let a = &a;
+        async move {
+            a.tok_h(
+                &a.token,
+                Method::POST,
+                &format!("/api/v1/vault/{id}/move"),
+                Some(json!({ "space": G })),
+                &[("if-match", rev)],
+            )
+            .await
+        }
+    };
+    for rev in ["1", "3"] {
+        let r = stale_move(id.clone(), rev).await;
+        assert_eq!(
+            r.status,
+            StatusCode::CONFLICT,
+            "If-Match {rev}: {}",
+            r.text()
+        );
+    }
+    let m = meta(&a, &a.token, &id).await;
+    assert_eq!(
+        (m["space"].clone(), m["rev"].clone()),
+        (json!("knowledge"), json!(2))
+    );
+    assert_eq!(revs(&a, &a.token, &id).await, [1, 2]);
+    assert_eq!(reveal(&a, &a.token, &id).await.json()["secret"], v);
+    assert!(move_audit(&a).await.is_empty());
+    // проверка ревизии — раньше криптографии: испорченный шифротекст не доходит до расшифровки
+    let bad = id_of(&set(&a, &a.token, "knowledge", "broken", &value("br")).await);
+    corrupt_blob(&a, &bad).await;
+    let r = stale_move(bad.clone(), "7").await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(meta(&a, &a.token, &bad).await["space"], "knowledge");
+}
+
+/// Ревью задачи 6, M2: у `PATCH` устаревший `If-Match` — тоже 409 до перешифровки (испорченный
+/// шифротекст не даёт 500), запись не тронута.
+#[tokio::test]
+async fn vault_patch_stale_if_match_before_crypto_409() {
+    let a = api("vault-patch-stale", |_| {}).await;
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", &value("ps")).await);
+    corrupt_blob(&a, &id).await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/vault/{id}"),
+            Some(json!({"data": {"type": "token", "description": "новое"}})),
+            &[("if-match", "5")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let m = meta(&a, &a.token, &id).await;
+    assert_eq!(m["rev"], 1, "{m}");
+    assert_eq!(m["data"]["description"], "деплой", "{m}");
+}
+
+/// Ревью задачи 6, M4: переименование в прежнее имя (в том числе с пробелами по краям) — 200
+/// без новой ревизии и перешифровки, как перенос в ту же область; устаревший `If-Match` — 409.
+#[tokio::test]
+async fn vault_rename_same_name_no_rev() {
+    let a = api("vault-rename-same", |_| {}).await;
+    let v = value("sn");
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", &v).await);
+    let before = meta(&a, &a.token, &id).await;
+    for title in ["github", "  github "] {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::PATCH,
+                &format!("/api/v1/vault/{id}"),
+                Some(json!({ "title": title })),
+                &[("if-match", "1")],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{title:?}: {}", r.text());
+        assert_eq!(r.json()["rev"], 1, "{title:?}: {}", r.text());
+    }
+    assert_eq!(revs(&a, &a.token, &id).await, [1]);
+    assert_eq!(meta(&a, &a.token, &id).await, before);
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/vault/{id}"),
+            Some(json!({ "title": "github" })),
+            &[("if-match", "4")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(reveal(&a, &a.token, &id).await.json()["secret"], v);
+}
+
+/// Ревью задачи 6, M5 (`docs/api-compat.md`, «Перенос записи Vault»): перенос в решение, доступ к
+/// которому ждёт ответа владельца или отклонён, — 403 `/problems/solution-access` с состоянием;
+/// без запроса доступа решение не видно — 404. Запись на месте, аудита нет.
+#[tokio::test]
+async fn vault_move_to_solution_without_access_403() {
+    let a = api("vault-move-no-access", |_| {}).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    let (c_id, c_tok) = a.new_user("Вера").await;
+    register(&a, &a_tok, G, "Общее").await;
+    let r = a
+        .tok(
+            &b_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let own = id_of(&set(&a, &b_tok, "knowledge", "member-own", &value("na")).await);
+    let r = move_item(&a, &b_tok, &own, G).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(
+        r.json()["type"],
+        "/problems/solution-access",
+        "{}",
+        r.text()
+    );
+    assert_eq!(r.json()["state"], "pending", "{}", r.text());
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{G}/access/{b_id}/reject"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = move_item(&a, &b_tok, &own, G).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert_eq!(r.json()["state"], "rejected", "{}", r.text());
+    // без запроса доступа — 404, как у списка Vault решения
+    let stranger = id_of(&set(&a, &c_tok, "knowledge", "stranger", &value("nc")).await);
+    let r = move_item(&a, &c_tok, &stranger, G).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    for (id, user) in [(&own, &b_id), (&stranger, &c_id)] {
+        let r = a
+            .adm(
+                Method::GET,
+                &format!("/api/v1/vault/{id}"),
+                None,
+                Some(user),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(
+            (r.json()["space"].clone(), r.json()["rev"].clone()),
+            (json!("knowledge"), json!(1))
+        );
+    }
+    assert!(move_audit(&a).await.is_empty());
+}
+
 /// Права записи в обеих областях: участник общего решения с `ro` не переносит ни из Vault
 /// решения, ни в него (403), `ro`-токен — тоже; записи не тронуты.
 #[tokio::test]
