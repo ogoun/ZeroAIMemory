@@ -398,33 +398,74 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Соединитель частей идентификатора (M6.6 §6.2): `zam-server`, `hooks.rs`, `crates/zam`,
-/// `C:\zam`, `zam::foo`, `user@zam`, `C#`, `$ZAM`; `_` — и так знак слова.
+/// Соединитель частей идентификатора (M6.6 §6.2): `_ - . / \ : @ # $` (`_` — и так знак слова).
+/// Соединяет, только если за ним знак слова ([`joined`]): `zam-server`, `hooks.rs`,
+/// `crates/zam`, `C:\zam`, `zam::foo`, `user@zam`, `issue#12`, `$ZAM_HOME`. Без знака слова за
+/// ним соединитель — граница: «$ZAM», «#ZAM», «C#», «hooks.» в прозе находят `ZAM`, `C`, `hooks`.
 fn is_connector(c: char) -> bool {
     matches!(c, '_' | '-' | '.' | '/' | '\\' | ':' | '@' | '#' | '$')
 }
 
-/// За краем вхождения (`beyond` — знаки от края наружу) слово продолжается: знак слова или
-/// серия соединителей, за которой знак слова (`zam::foo`). Соединитель без знака слова за ним —
-/// граница: точка в конце предложения («настроены hooks.»), «hooks: …».
-fn joined(mut beyond: impl Iterator<Item = char>) -> bool {
-    match beyond.next() {
-        Some(c) if is_word(c) => true,
-        Some(c) if is_connector(c) => beyond
-            .find(|&c| is_word(c) || !is_connector(c))
-            .is_some_and(is_word),
-        _ => false,
+/// Письменность буквы для правила `-` и `/` ([`joined`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Latin,
+    Cyrillic,
+}
+
+fn script(c: char) -> Option<Script> {
+    if !c.is_alphabetic() {
+        return None;
     }
+    match c as u32 {
+        0x41..=0x5A | 0x61..=0x7A | 0xC0..=0x24F | 0x1E00..=0x1EFF => Some(Script::Latin),
+        0x400..=0x52F => Some(Script::Cyrillic),
+        _ => None,
+    }
+}
+
+/// Буквы разных письменностей (латиница и кириллица).
+fn other_script(a: char, b: char) -> bool {
+    matches!((script(a), script(b)), (Some(x), Some(y)) if x != y)
+}
+
+/// За краем вхождения `edge` (`beyond` — знаки от края наружу) слово продолжается: знак слова
+/// или серия соединителей, за которой знак слова (`zam::foo`). Соединитель без знака слова за
+/// ним — граница: точка в конце предложения («настроены hooks.»), «hooks: …». Серия из `-` и `/`
+/// между буквами латиницы и кириллицы — тоже граница (ревью задачи 5, M3, решение координатора):
+/// «MCP-сервер», «API-ключ», «ZAM-а», «summary/выжимка» — слова прозы, а `zam-code`,
+/// `summary/cache`, `crates/zam` — идентификаторы.
+fn joined(edge: char, mut beyond: impl Iterator<Item = char>) -> bool {
+    let Some(c) = beyond.next() else {
+        return false;
+    };
+    if is_word(c) {
+        return true;
+    }
+    if !is_connector(c) {
+        return false;
+    }
+    let mut soft = matches!(c, '-' | '/');
+    for c in beyond {
+        if is_word(c) {
+            return !(soft && other_script(edge, c));
+        }
+        if !is_connector(c) {
+            return false;
+        }
+        soft &= matches!(c, '-' | '/');
+    }
+    false
 }
 
 /// Вхождение `hay[r]` — слово прозы, а не часть слова или идентификатора: граница проверяется у
 /// края из знака слова (у «C++» правый край — знак: «C++17» находит «C++»).
 fn bounded(hay: &str, r: &Range<usize>) -> bool {
     let s = &hay[r.clone()];
-    let starts_word = s.chars().next().is_some_and(is_word);
-    let ends_word = s.chars().next_back().is_some_and(is_word);
-    (!starts_word || !joined(hay[..r.start].chars().rev()))
-        && (!ends_word || !joined(hay[r.end..].chars()))
+    let first = s.chars().next().filter(|&c| is_word(c));
+    let last = s.chars().next_back().filter(|&c| is_word(c));
+    first.is_none_or(|c| !joined(c, hay[..r.start].chars().rev()))
+        && last.is_none_or(|c| !joined(c, hay[r.end..].chars()))
 }
 
 /// Нижний регистр без сдвига смещений: знак, чья строчная форма — другой длины в UTF-8 или
@@ -480,17 +521,52 @@ pub fn broad_alias(alias: &str) -> Option<BroadAlias> {
 
 /// Текст для поиска имён и псевдонимов терминов (M6.6 §6): проза без кода
 /// ([`zam_markdown::prose_mask`]: код — пробелами) с исходным регистром и в нижнем регистре
-/// (по знакам, без сдвига смещений); смещения в байтах у обеих копий — как у исходного текста.
-pub struct ProseText {
+/// (по знакам, без сдвига смещений), а также сам исходник; смещения в байтах у всех трёх — одни.
+pub struct ProseText<'a> {
+    /// Исходный текст: промежуток между словами имени — пробельные знаки и в нём (пробелы
+    /// маски на месте кода не в счёт).
+    source: &'a str,
     cased: String,
     folded: String,
 }
 
-impl ProseText {
-    pub fn new(text: &str) -> ProseText {
-        let cased = zam_markdown::prose_mask(text);
+impl<'a> ProseText<'a> {
+    pub fn new(text: &'a str) -> ProseText<'a> {
+        Self::with_mask(text, zam_markdown::prose_mask(text))
+    }
+
+    /// Проза первых `chars` знаков `text` (подсказка к запросу — 512, пакет `brief` — 2000) с
+    /// маской всего текста (ревью задачи 5, M1): код, открытый до края и закрытый за ним, —
+    /// код, а не проза. Маскируется окно до первой пустой строки за краем: инлайн-код пустую
+    /// строку не переходит, а незакрытый блок и так идёт до конца окна, поэтому на голове маска
+    /// окна совпадает с маской всего текста.
+    pub fn head(text: &'a str, chars: usize) -> ProseText<'a> {
+        let cut = text
+            .char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(i, _)| i);
+        if cut == text.len() {
+            return Self::new(text);
+        }
+        let b = text.as_bytes();
+        let end = (cut..b.len())
+            .find(|&q| {
+                b[q] == b'\n' && (b[q + 1..].starts_with(b"\n") || b[q + 1..].starts_with(b"\r\n"))
+            })
+            .unwrap_or(b.len());
+        let mut masked = zam_markdown::prose_mask(&text[..end]);
+        // `cut` — граница знака: в коде маска — ASCII-пробелы, вне кода — байты исходника
+        masked.truncate(cut);
+        Self::with_mask(&text[..cut], masked)
+    }
+
+    fn with_mask(source: &'a str, cased: String) -> ProseText<'a> {
         let folded = fold(&cased);
-        ProseText { cased, folded }
+        ProseText {
+            source,
+            cased,
+            folded,
+        }
     }
 
     /// Проза с исходным регистром: код заменён пробелами.
@@ -506,16 +582,16 @@ impl ProseText {
     /// - идентификатор не слово — у края из знака слова нет знака слова (`_` — тоже), а у
     ///   соединителя (`- . / \ : @ # $`) за ним нет знака слова: `zam-server`, `hooks.rs`,
     ///   `ZAM_X`, `crates/zam`, `zam::foo` не находят `zam`/`hooks`; точка в конце предложения
-    ///   — граница;
+    ///   — граница, `-` и `/` между латиницей и кириллицей («MCP-сервер») — тоже;
     /// - `acronym` ([`is_acronym`] имени, вызывающий считает один раз) — с учётом регистра,
     ///   иначе без;
-    /// - слова многословного имени разделяет в тексте один пробельный знак или `\r\n` (перенос
-    ///   строки), а не несколько: на месте кода в маске — серия пробелов.
-    pub fn spans<'a>(
-        &'a self,
+    /// - слова многословного имени разделяет в тексте любая серия пробельных знаков исходника
+    ///   («Карта\n  кода» в пункте списка), но не вырезанный код («Карта `x` кода»).
+    pub fn spans<'s>(
+        &'s self,
         name: &str,
         acronym: bool,
-    ) -> impl Iterator<Item = Range<usize>> + 'a {
+    ) -> impl Iterator<Item = Range<usize>> + 's {
         let (hay, needle) = if acronym {
             (self.cased.as_str(), name.to_string())
         } else {
@@ -523,6 +599,7 @@ impl ProseText {
         };
         Spans {
             hay,
+            source: self.source,
             parts: needle.split_whitespace().map(str::to_string).collect(),
             from: 0,
         }
@@ -532,6 +609,8 @@ impl ProseText {
 /// Итератор [`ProseText::spans`].
 struct Spans<'a> {
     hay: &'a str,
+    /// Исходник с теми же смещениями ([`ProseText`]).
+    source: &'a str,
     /// Слова имени (по пробельным знакам).
     parts: Vec<String>,
     /// Байт, с которого ищется следующее вхождение первого слова.
@@ -539,20 +618,17 @@ struct Spans<'a> {
 }
 
 impl Spans<'_> {
-    /// Конец имени, чьё первое слово кончается в `end`: остальные слова — через один
-    /// пробельный знак или `\r\n`.
+    /// Конец имени, чьё первое слово кончается в `end`: остальные слова — через серию
+    /// пробельных знаков, которые пробельные и в исходнике (ревью задачи 5, I1).
     fn tail(&self, mut end: usize) -> Option<usize> {
         for p in &self.parts[1..] {
             let rest = &self.hay[end..];
-            let gap = if rest.starts_with("\r\n") {
-                2
-            } else {
-                rest.chars()
-                    .next()
-                    .filter(|c| c.is_whitespace())?
-                    .len_utf8()
-            };
-            if !rest[gap..].starts_with(p.as_str()) {
+            let gap = rest.len() - rest.trim_start().len();
+            let spaces = self
+                .source
+                .get(end..end + gap)
+                .is_some_and(|s| s.chars().all(char::is_whitespace));
+            if gap == 0 || !spaces || !rest[gap..].starts_with(p.as_str()) {
                 return None;
             }
             end += gap + p.len();
@@ -794,6 +870,58 @@ mod tests {
         assert_eq!(hit("SUMMARY"), [("summary".into(), "Выжимка".into())]);
     }
 
+    /// Ревью задачи 5, M1: голова текста маскируется как весь текст — код, закрытый за краем,
+    /// остаётся кодом; обратная кавычка, не закрытая до пустой строки, — проза.
+    #[test]
+    fn prose_head_keeps_full_text_mask() {
+        assert_eq!(ProseText::head("a `b c` d", 4).as_str(), "a   ");
+        assert_eq!(ProseText::head("a `b\n\nc` d", 4).as_str(), "a `b");
+        assert_eq!(ProseText::head("a `b\nc\n\nd`", 4).as_str(), "a `b");
+        assert_eq!(
+            ProseText::head("a\n```\nb\n```\nc", 7).as_str(),
+            "a\n   \n "
+        );
+        assert_eq!(ProseText::head("ёж `ёж` ёж", 5).as_str(), "ёж    ");
+        assert_eq!(ProseText::head("кратко", 100).as_str(), "кратко");
+    }
+
+    /// Ревью задачи 5, M3 (решение координатора): `-` и `/` между латиницей и кириллицей —
+    /// граница слова («MCP-сервер», «summary/выжимка»); в одной письменности — идентификатор.
+    #[test]
+    fn alias_uses_across_scripts() {
+        let terms = [
+            entry("Протокол модели", &["MCP"]),
+            entry("Интерфейс", &["API"]),
+            entry("ZeroAIMemory", &["ZAM"]),
+            entry("Выжимка", &["summary"]),
+            entry("Сводка", &["выжимка"]),
+            entry("Карта кода", &["code map", "zam code"]),
+        ];
+        let hit = |t: &str| find_alias_uses(t, &terms);
+        assert_eq!(
+            hit("Подними MCP-сервер"),
+            [("MCP".into(), "Протокол модели".into())]
+        );
+        assert_eq!(hit("Нужен API-ключ"), [("API".into(), "Интерфейс".into())]);
+        assert_eq!(hit("Логи ZAM-а"), [("ZAM".into(), "ZeroAIMemory".into())]);
+        assert_eq!(
+            hit("Поле summary/выжимка"),
+            [
+                ("summary".into(), "Выжимка".into()),
+                ("выжимка".into(), "Сводка".into())
+            ]
+        );
+        for text in [
+            "команда zam-code",
+            "Карта — `zam code map`.",
+            "кэш summary/cache",
+            "путь crates/ZAM",
+            "ZAM-code и ZAM_сервер",
+        ] {
+            assert!(hit(text).is_empty(), "{text:?}: {:?}", hit(text));
+        }
+    }
+
     #[test]
     fn acronym_and_broad_alias_rules() {
         for a in ["ZAM", "MCP", "AWS S3", "ЗАМ", "C2C"] {
@@ -819,12 +947,18 @@ mod tests {
         let text = "Ёж `код` code\nmap и code\r\nmap, code `x` map, code  map; İzmir";
         let p = ProseText::new(text);
         let got: Vec<&str> = p.spans("Code Map", false).map(|r| &text[r]).collect();
-        assert_eq!(got, ["code\nmap", "code\r\nmap"]);
+        // ревью задачи 5, I1: любая серия пробельных знаков исходника, но не вырезанный код
+        assert_eq!(got, ["code\nmap", "code\r\nmap", "code  map"]);
         let got: Vec<&str> = p.spans("ёж", false).map(|r| &text[r]).collect();
         assert_eq!(got, ["Ёж"]);
         assert_eq!(p.spans("İzmir", false).count(), 1);
         assert_eq!(p.spans("код", false).count(), 0);
         assert_eq!(p.spans("", false).count(), 0);
+        // перенос с отступом пункта списка, табуляция; код между словами — не промежуток
+        let text = "обновлена Карта\n  кода; Карта\tкода; Карта `x` кода; Карта\n```\nx\n```\nкода";
+        let p = ProseText::new(text);
+        let got: Vec<&str> = p.spans("Карта кода", false).map(|r| &text[r]).collect();
+        assert_eq!(got, ["Карта\n  кода", "Карта\tкода"]);
         // перекрывающиеся вхождения: первое («xa a») не на границе, второе — на ней
         let p = ProseText::new("xa a a");
         let got: Vec<(usize, usize)> = p.spans("a a", false).map(|r| (r.start, r.end)).collect();

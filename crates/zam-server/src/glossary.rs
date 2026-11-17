@@ -37,12 +37,31 @@ struct Name {
     term: usize,
     /// Слова имени в нижнем регистре.
     words: Vec<String>,
-    /// Имя как записано.
+    /// Имя как записано (первое написание этих слов у термина).
     raw: String,
-    /// Аббревиатура ([`zam_store::is_acronym`], при сборке индекса): подсказка к запросу — с
-    /// учётом регистра; расширение запроса регистр не учитывает. Имя с теми же словами в другом
-    /// написании того же термина («ZAM» и «Zam») снимает признак.
+    /// Все написания этих слов у термина — имя и псевдонимы (`Plan B` и `plan-b`, `ZAM` и
+    /// `Zam`; ревью задачи 5, I2): подсказка к запросу ищет каждое, расширение запроса — по
+    /// `words`, как прежде.
+    spellings: Vec<Spelling>,
+}
+
+/// Написание имени для подсказки к запросу.
+struct Spelling {
+    text: String,
+    /// Аббревиатура ([`zam_store::is_acronym`], при сборке индекса) — с учётом регистра.
     acronym: bool,
+}
+
+impl Spelling {
+    /// Находит то же, что `o`: та же строка (без регистра, если не аббревиатура).
+    fn same(&self, o: &Spelling) -> bool {
+        self.acronym == o.acronym
+            && if self.acronym {
+                self.text == o.text
+            } else {
+                self.text.to_lowercase() == o.text.to_lowercase()
+            }
+    }
 }
 
 /// Расширение одного слова запроса (поле `expanded` ответа `/search`).
@@ -105,9 +124,15 @@ impl GlossaryIndex {
                 if words.iter().all(|w| w.chars().count() < 2) {
                     continue;
                 }
-                let acronym = is_acronym(raw);
+                let spelling = Spelling {
+                    text: raw.trim().to_string(),
+                    acronym: is_acronym(raw),
+                };
                 if let Some(&(_, ni)) = seen.iter().find(|(w, _)| *w == words) {
-                    names[ni].acronym &= acronym;
+                    let all = &mut names[ni].spellings;
+                    if !all.iter().any(|s| s.same(&spelling)) {
+                        all.push(spelling);
+                    }
                     continue;
                 }
                 seen.push((words.clone(), names.len()));
@@ -118,8 +143,8 @@ impl GlossaryIndex {
                 names.push(Name {
                     term: ti,
                     words,
-                    raw: raw.trim().to_string(),
-                    acronym,
+                    raw: spelling.text.clone(),
+                    spellings: vec![spelling],
                 });
             }
         }
@@ -233,16 +258,16 @@ impl GlossaryIndex {
 
     /// Как [`GlossaryIndex::find_in_text`], но по первым `chars` символам `text` (пакет под
     /// задачу `brief` — до 2000 символов). Сравнение — как у предупреждений `term_alias`
-    /// ([`ProseText::spans`], M6.6 §6): код и идентификаторы — не проза, аббревиатура
-    /// (`Name.acronym`) — с учётом регистра. Кандидаты — имена, чьё первое слово есть среди
-    /// слов прозы (индекс по первому слову); в каждой позиции — самое длинное имя (при равной
-    /// длине — имена всех терминов), следующее ищется после него, как у расширения запроса.
+    /// ([`ProseText::spans`], M6.6 §6): код и идентификаторы — не проза, аббревиатура — с учётом
+    /// регистра; ищется каждое написание имени (`Spelling`); код, открытый на краю `chars`, —
+    /// код ([`ProseText::head`]). Кандидаты — имена, чьё первое слово есть среди слов прозы
+    /// (индекс по первому слову); в каждой позиции — самое длинное имя (при равной длине — имена
+    /// всех терминов), следующее ищется после него, как у расширения запроса.
     pub fn find_in_head(&self, text: &str, spaces: &[Id], chars: usize) -> Vec<&GlossaryEntry> {
         if self.is_empty() {
             return Vec::new();
         }
-        let head: String = text.chars().take(chars).collect();
-        let prose = ProseText::new(&head);
+        let prose = ProseText::head(text, chars);
         // (начало, конец, имя) всех вхождений имён-кандидатов
         let mut found: Vec<(usize, usize, usize)> = Vec::new();
         let words = lower_words(prose.as_str());
@@ -253,8 +278,15 @@ impl GlossaryIndex {
             }
             for &ni in self.by_first.get(w).into_iter().flatten() {
                 let n = &self.names[ni];
-                if spaces.contains(&self.terms[n.term].space_id) {
-                    found.extend(prose.spans(&n.raw, n.acronym).map(|r| (r.start, r.end, ni)));
+                if !spaces.contains(&self.terms[n.term].space_id) {
+                    continue;
+                }
+                for s in &n.spellings {
+                    found.extend(
+                        prose
+                            .spans(&s.text, s.acronym)
+                            .map(|r| (r.start, r.end, ni)),
+                    );
                 }
             }
         }
@@ -478,5 +510,52 @@ mod tests {
         assert_eq!(titles("обнови zam code map"), ["Карта кода"]);
         // в позиции — самое длинное имя, как прежде: «ZAM code» поглощает и «ZAM», и «code map»
         assert_eq!(titles("ZAM code map"), ["Карта кода"]);
+    }
+
+    /// Ревью задачи 5: I1 — слова имени через любую серию пробельных знаков исходника (перенос
+    /// с отступом пункта списка), но не через вырезанный код; I2 — каждое написание термина
+    /// (`plan-b` при имени `Plan B`); M3 — `-` между латиницей и кириллицей — граница.
+    #[test]
+    fn find_in_text_spellings_spaces_and_scripts() {
+        let sp = Id::new();
+        let idx = GlossaryIndex::build(vec![
+            entry(sp, "Карта кода", &[]),
+            entry(sp, "Plan B", &["plan-b"]),
+            entry(sp, "Протокол модели", &["MCP"]),
+            entry(sp, "ZeroAIMemory", &["ZAM"]),
+        ]);
+        let titles = |t: &str| -> Vec<String> {
+            idx.find_in_text(t, &[sp])
+                .iter()
+                .map(|t| t.title.clone())
+                .collect()
+        };
+        assert_eq!(titles("- обновлена Карта\n  кода"), ["Карта кода"]);
+        assert_eq!(titles("Карта  кода"), ["Карта кода"]);
+        assert!(titles("Карта `x` кода").is_empty());
+        assert_eq!(titles("собери plan-b"), ["Plan B"]);
+        assert_eq!(titles("собери plan B"), ["Plan B"]);
+        assert_eq!(titles("подними MCP-сервер"), ["Протокол модели"]);
+        assert!(titles("собери zam-code и ZAM-code").is_empty());
+        // написания, отличные регистром: явный «Zam» снимает учёт регистра
+        let idx = GlossaryIndex::build(vec![entry(sp, "ZAM", &["Zam"])]);
+        assert_eq!(idx.find_in_text("zam тут", &[sp]).len(), 1);
+    }
+
+    /// Ревью задачи 5, M1: код, открытый на краю головы (`chars`), — код, а не проза.
+    #[test]
+    fn find_in_head_masks_code_open_at_cut() {
+        let sp = Id::new();
+        let idx = GlossaryIndex::build(vec![entry(sp, "Хуки", &["hooks"])]);
+        let text = "Смотри `hooks тут` и всё";
+        assert_eq!("Смотри `hooks ".chars().count(), 14);
+        assert!(idx.find_in_head(text, &[sp], 14).is_empty());
+        assert!(idx.find_in_head(text, &[sp], 100).is_empty());
+        // блок, открытый до края, — тоже код
+        let text = "Пример:\n```\nhooks\nи дальше\n```\nконец";
+        assert!(idx.find_in_head(text, &[sp], 17).is_empty());
+        // проза до кода на краю находится
+        let text = "Смотри hooks `тут` и всё";
+        assert_eq!(idx.find_in_head(text, &[sp], 14).len(), 1);
     }
 }
