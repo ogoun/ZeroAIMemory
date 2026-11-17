@@ -1874,7 +1874,10 @@ async fn brief(
     };
     let (decisions, traps) = brief_search(st, p, headers, req, task, health, deadline).await?;
     sections.push((Some(SECTION_DECISIONS), decisions));
-    let terms = term_cands(st, task, BRIEF_TASK_MAX_CHARS, health, deadline).await;
+    // термины — по заданию без обрезки по длине: `find_in_head` сам берёт первые
+    // BRIEF_TASK_MAX_CHARS символов, а маску кода строит и за краем (ревью задачи 5, M1)
+    let whole = req.task.as_deref().map_or(task, str::trim);
+    let terms = term_cands(st, whole, BRIEF_TASK_MAX_CHARS, health, deadline).await;
     sections.push((Some(SECTION_TERMS), terms));
     sections.push((Some(SECTION_TRAPS), traps));
     let files = file_cands(req, headers, task, health, deadline).await;

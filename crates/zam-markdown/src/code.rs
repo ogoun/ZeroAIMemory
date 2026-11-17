@@ -89,8 +89,18 @@ pub(crate) fn fenced_lines(text: &str, lines: &[Line]) -> Vec<bool> {
 /// ([`inline_spans`]). Инлайн-код открывается только вне блоков, но может закрыться внутри блока —
 /// тогда участки пересекаются.
 pub(crate) fn code_spans(text: &str, lines: &[Line], fenced: &[bool]) -> Vec<Range<usize>> {
+    code_spans_of(text, lines, fenced, false)
+}
+
+/// [`code_spans`]; `open_tail` — `text` лишь начало более длинного текста ([`inline_spans`]).
+fn code_spans_of(
+    text: &str,
+    lines: &[Line],
+    fenced: &[bool],
+    open_tail: bool,
+) -> Vec<Range<usize>> {
     let mut spans = fence_spans(lines, fenced);
-    let inline = inline_spans(text.as_bytes(), &spans);
+    let inline = inline_spans(text.as_bytes(), &spans, open_tail);
     spans.extend(inline);
     spans
 }
@@ -124,7 +134,11 @@ fn fence_spans(lines: &[Line], fenced: &[bool]) -> Vec<Range<usize>> {
 /// же длины — по таблице, указатели на блоки и пустые строки идут только вперёд. Прежний поиск
 /// закрывающей серии от каждой открывающей стоил O(n·k) на текстах с многими незакрытыми
 /// сериями разной длины; результат тот же (тесты `inline_scan_matches_oracle*`).
-fn inline_spans(b: &[u8], fences: &[Range<usize>]) -> Vec<Range<usize>> {
+///
+/// `open_tail` — `b` лишь начало более длинного текста: серия без закрывающей и без пустой
+/// строки до конца `b` может закрыться дальше — она открывает код до конца `b` (повторное ревью
+/// задачи 5: код, открытый на краю окна маски, — код).
+fn inline_spans(b: &[u8], fences: &[Range<usize>], open_tail: bool) -> Vec<Range<usize>> {
     // серии обратных кавычек (начало, длина) и начала пустых строк — по порядку
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut blanks: Vec<usize> = Vec::new();
@@ -178,6 +192,11 @@ fn inline_spans(b: &[u8], fences: &[Range<usize>]) -> Vec<Range<usize>> {
                 p = end;
                 k = j + 1;
             }
+            // ни закрывающей серии, ни пустой строки до конца: дальше начала текста не видно
+            _ if open_tail && bi == blanks.len() => {
+                out.push(start..b.len());
+                break;
+            }
             _ => p = open_end,
         }
     }
@@ -190,9 +209,21 @@ fn inline_spans(b: &[u8], fences: &[Range<usize>]) -> Vec<Range<usize>> {
 /// байтах, смещения и число строк сохраняются: позиция в маске — позиция в исходнике. Границы
 /// кода — те же, что у [`crate::split_sentences`].
 pub fn prose_mask(text: &str) -> String {
+    mask(text, false)
+}
+
+/// Как [`prose_mask`], но `prefix` — лишь начало более длинного текста (окно маски головы
+/// промпта, повторное ревью задачи 5): инлайн-код, не закрытый до конца `prefix` и не прерванный
+/// пустой строкой, может закрыться дальше — он код до конца `prefix`. Незакрытый блок в
+/// ограждении и так идёт до конца.
+pub fn prose_mask_prefix(prefix: &str) -> String {
+    mask(prefix, true)
+}
+
+fn mask(text: &str, open_tail: bool) -> String {
     let lines = lines_of(text);
     let fenced = fenced_lines(text, &lines);
-    let mut spans = code_spans(text, &lines, &fenced);
+    let mut spans = code_spans_of(text, &lines, &fenced, open_tail);
     if spans.is_empty() {
         return text.to_string();
     }
@@ -277,6 +308,21 @@ mod tests {
         );
     }
 
+    /// Повторное ревью задачи 5: начало более длинного текста — инлайн-код, не закрытый до
+    /// конца и не прерванный пустой строкой, — код до конца; прочее — как у [`prose_mask`].
+    #[test]
+    fn prose_mask_prefix_keeps_open_code() {
+        assert_eq!(prose_mask_prefix("a `b c"), format!("a {}", sp(4)));
+        assert_eq!(
+            prose_mask_prefix("a `b` c `d"),
+            format!("a {} c {}", sp(3), sp(2))
+        );
+        assert_eq!(prose_mask_prefix("a `b\n\nc"), "a `b\n\nc");
+        assert_eq!(prose_mask_prefix("a ``b` c"), format!("a {}", sp(6)));
+        assert_eq!(prose_mask_prefix("a\n```\nb"), "a\n   \n ");
+        assert_eq!(prose_mask_prefix("проза"), "проза");
+    }
+
     /// Прежний поиск инлайн-кода (квадратичный в худшем случае, до ревью задачи 5) — образец
     /// для [`inline_spans`].
     fn oracle_inline(b: &[u8], fences: &[Range<usize>]) -> Vec<Range<usize>> {
@@ -329,7 +375,7 @@ mod tests {
         let fenced = fenced_lines(text, &lines);
         let fences = fence_spans(&lines, &fenced);
         (
-            inline_spans(text.as_bytes(), &fences),
+            inline_spans(text.as_bytes(), &fences, false),
             oracle_inline(text.as_bytes(), &fences),
         )
     }

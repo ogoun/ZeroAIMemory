@@ -400,7 +400,7 @@ fn is_word(c: char) -> bool {
 
 /// Соединитель частей идентификатора (M6.6 §6.2): `_ - . / \ : @ # $` (`_` — и так знак слова).
 /// Соединяет, только если за ним знак слова ([`joined`]): `zam-server`, `hooks.rs`,
-/// `crates/zam`, `C:\zam`, `zam::foo`, `user@zam`, `issue#12`, `$ZAM_HOME`. Без знака слова за
+/// `crates/zam`, `C:\zam`, `zam::foo`, `user@zam`, `issue#12`, `PATH$ZAM`. Без знака слова за
 /// ним соединитель — граница: «$ZAM», «#ZAM», «C#», «hooks.» в прозе находят `ZAM`, `C`, `hooks`.
 fn is_connector(c: char) -> bool {
     matches!(c, '_' | '-' | '.' | '/' | '\\' | ':' | '@' | '#' | '$')
@@ -519,6 +519,12 @@ pub fn broad_alias(alias: &str) -> Option<BroadAlias> {
     }
 }
 
+/// Окно маски головы за краем ([`ProseText::head`]), байт: дальше маска не смотрит, а код,
+/// открытый на краю окна, считается кодом (повторное ревью задачи 5). 16 КиБ — с запасом на
+/// инлайн-код и блоки обычного промпта и задания субагенту; вставленный лог в сотни КБ без
+/// пустых строк на каждом `/recall` не маскируется целиком.
+pub const PROSE_HEAD_LOOKAHEAD_BYTES: usize = 16 * 1024;
+
 /// Текст для поиска имён и псевдонимов терминов (M6.6 §6): проза без кода
 /// ([`zam_markdown::prose_mask`]: код — пробелами) с исходным регистром и в нижнем регистре
 /// (по знакам, без сдвига смещений), а также сам исходник; смещения в байтах у всех трёх — одни.
@@ -536,10 +542,12 @@ impl<'a> ProseText<'a> {
     }
 
     /// Проза первых `chars` знаков `text` (подсказка к запросу — 512, пакет `brief` — 2000) с
-    /// маской всего текста (ревью задачи 5, M1): код, открытый до края и закрытый за ним, —
+    /// маской текста за краем (ревью задачи 5, M1): код, открытый до края и закрытый за ним, —
     /// код, а не проза. Маскируется окно до первой пустой строки за краем: инлайн-код пустую
     /// строку не переходит, а незакрытый блок и так идёт до конца окна, поэтому на голове маска
-    /// окна совпадает с маской всего текста.
+    /// окна совпадает с маской всего текста. Окно — не дальше [`PROSE_HEAD_LOOKAHEAD_BYTES`] за
+    /// краем (повторное ревью: длинный промпт без пустых строк не маскируется целиком); код,
+    /// открытый на краю такого окна, — код ([`zam_markdown::prose_mask_prefix`]).
     pub fn head(text: &'a str, chars: usize) -> ProseText<'a> {
         let cut = text
             .char_indices()
@@ -549,12 +557,18 @@ impl<'a> ProseText<'a> {
             return Self::new(text);
         }
         let b = text.as_bytes();
-        let end = (cut..b.len())
-            .find(|&q| {
-                b[q] == b'\n' && (b[q + 1..].starts_with(b"\n") || b[q + 1..].starts_with(b"\r\n"))
-            })
-            .unwrap_or(b.len());
-        let mut masked = zam_markdown::prose_mask(&text[..end]);
+        let mut limit = cut.saturating_add(PROSE_HEAD_LOOKAHEAD_BYTES).min(b.len());
+        while !text.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let blank = (cut..limit).find(|&q| {
+            b[q] == b'\n' && (b[q + 1..].starts_with(b"\n") || b[q + 1..].starts_with(b"\r\n"))
+        });
+        let mut masked = match blank {
+            Some(end) => zam_markdown::prose_mask(&text[..end]),
+            None if limit == b.len() => zam_markdown::prose_mask(text),
+            None => zam_markdown::prose_mask_prefix(&text[..limit]),
+        };
         // `cut` — граница знака: в коде маска — ASCII-пробелы, вне кода — байты исходника
         masked.truncate(cut);
         Self::with_mask(&text[..cut], masked)
@@ -883,6 +897,22 @@ mod tests {
         );
         assert_eq!(ProseText::head("ёж `ёж` ёж", 5).as_str(), "ёж    ");
         assert_eq!(ProseText::head("кратко", 100).as_str(), "кратко");
+        // повторное ревью: окно маски — не дальше PROSE_HEAD_LOOKAHEAD_BYTES за краем; код,
+        // открытый на краю окна, — код, закрытый внутри окна — как во всём тексте
+        let far = "x".repeat(PROSE_HEAD_LOOKAHEAD_BYTES + 100);
+        assert_eq!(ProseText::head(&format!("a `b {far}"), 4).as_str(), "a   ");
+        assert_eq!(
+            ProseText::head(&format!("a `b {far}` hooks"), 4).as_str(),
+            "a   "
+        );
+        assert_eq!(
+            ProseText::head(&format!("a `b` hooks {far}"), 11).as_str(),
+            "a     hooks"
+        );
+        assert_eq!(
+            ProseText::head(&format!("a `b\n\nc {far}"), 4).as_str(),
+            "a `b"
+        );
     }
 
     /// Ревью задачи 5, M3 (решение координатора): `-` и `/` между латиницей и кириллицей —
