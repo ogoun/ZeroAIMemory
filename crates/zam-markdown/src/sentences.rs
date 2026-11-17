@@ -13,6 +13,8 @@ use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::code::{Line, code_spans, fence_of, fenced_lines, lines_of};
+
 /// Сокращения, за которыми предложение не кончается: дальше идёт имя,
 /// номер или продолжение мысли. Строчными, без пробелов между частями.
 const PREFIX_ABBREVS: &[&str] = &[
@@ -83,83 +85,6 @@ fn push_trimmed(text: &str, r: Range<usize>, out: &mut Vec<Range<usize>>) {
     }
 }
 
-/// Строка: содержимое и перевод строки после него (может быть пустым).
-struct Line {
-    content: Range<usize>,
-    eol: Range<usize>,
-}
-
-/// Строки с концами `\n`, `\r\n` и одиночным `\r` (как в [`crate::LineIndex`]).
-fn lines_of(text: &str) -> Vec<Line> {
-    let b = text.as_bytes();
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < b.len() {
-        let eol_len = match b[i] {
-            b'\n' => 1,
-            b'\r' if b.get(i + 1) == Some(&b'\n') => 2,
-            b'\r' => 1,
-            _ => 0,
-        };
-        if eol_len > 0 {
-            out.push(Line {
-                content: start..i,
-                eol: i..i + eol_len,
-            });
-            i += eol_len;
-            start = i;
-        } else {
-            i += 1;
-        }
-    }
-    out.push(Line {
-        content: start..b.len(),
-        eol: b.len()..b.len(),
-    });
-    out
-}
-
-/// Ограждение кода: символ и длина серии, если строка открывает или закрывает блок.
-fn fence_of(line: &str) -> Option<(u8, usize)> {
-    let t = line.trim_start_matches(' ');
-    if line.len() - t.len() > 3 {
-        return None;
-    }
-    let c = *t.as_bytes().first()?;
-    if c != b'`' && c != b'~' {
-        return None;
-    }
-    let n = t.bytes().take_while(|&b| b == c).count();
-    (n >= 3).then_some((c, n))
-}
-
-/// Для каждой строки — принадлежит ли она fenced-блоку (включая ограждения).
-fn fenced_lines(text: &str, lines: &[Line]) -> Vec<bool> {
-    let mut out = vec![false; lines.len()];
-    let mut open: Option<(u8, usize)> = None;
-    for (i, l) in lines.iter().enumerate() {
-        let s = &text[l.content.clone()];
-        match open {
-            None => {
-                if let Some(f) = fence_of(s) {
-                    open = Some(f);
-                    out[i] = true;
-                }
-            }
-            Some((c, n)) => {
-                out[i] = true;
-                let closes = fence_of(s)
-                    .is_some_and(|(c2, n2)| c2 == c && n2 >= n && s.trim().bytes().all(|b| b == c));
-                if closes {
-                    open = None;
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Строка начинает блок Markdown: заголовок, цитату, таблицу, ограждение, пункт списка.
 fn is_block_start(line: &str) -> bool {
     let t = line.trim_start();
@@ -199,70 +124,10 @@ fn soften_newlines(text: &str, lines: &[Line], fenced: &[bool]) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| text.to_string())
 }
 
-/// Участки, внутри которых нет границ: fenced-блоки, `` `код` ``, URL и пути.
-/// Результат отсортирован и без пересечений.
+/// Участки, внутри которых нет границ: fenced-блоки и `` `код` `` ([`code_spans`]), URL и
+/// пути. Результат отсортирован и без пересечений.
 fn protected_spans(text: &str, lines: &[Line], fenced: &[bool]) -> Vec<Range<usize>> {
-    let mut spans = Vec::new();
-    // fenced-блоки — от первой строки до конца содержимого последней
-    let mut i = 0;
-    while i < lines.len() {
-        if fenced[i] {
-            let start = lines[i].content.start;
-            let mut j = i;
-            while j + 1 < lines.len() && fenced[j + 1] {
-                j += 1;
-            }
-            spans.push(start..lines[j].content.end);
-            i = j + 1;
-        } else {
-            i += 1;
-        }
-    }
-    let fences = spans.clone();
-
-    // инлайн-код: серия из n обратных кавычек до такой же серии, не через пустую строку
-    let b = text.as_bytes();
-    let mut p = 0;
-    // fenced-участки упорядочены: указатель на ближайший, не закончившийся до `p`
-    let mut fi = 0;
-    while p < b.len() {
-        while fences.get(fi).is_some_and(|f| f.end <= p) {
-            fi += 1;
-        }
-        if let Some(f) = fences.get(fi).filter(|f| f.start <= p) {
-            p = f.end;
-            continue;
-        }
-        if b[p] != b'`' {
-            p += 1;
-            continue;
-        }
-        let n = b[p..].iter().take_while(|&&c| c == b'`').count();
-        let mut q = p + n;
-        let mut found = None;
-        while q < b.len() {
-            if b[q] == b'`' {
-                let m = b[q..].iter().take_while(|&&c| c == b'`').count();
-                if m == n {
-                    found = Some(q + m);
-                    break;
-                }
-                q += m;
-            // побайтно: `q` идёт по байтам и может стоять внутри многобайтового символа
-            } else if b[q..].starts_with(b"\n\n") || b[q..].starts_with(b"\n\r\n") {
-                break;
-            } else {
-                q += 1;
-            }
-        }
-        match found {
-            Some(end) => {
-                spans.push(p..end);
-                p = end;
-            }
-            None => p += n,
-        }
-    }
+    let mut spans = code_spans(text, lines, fenced);
 
     // URL и пути: непробельные токены со схемой, `www.`, `/` или `\`
     let mut start = None;

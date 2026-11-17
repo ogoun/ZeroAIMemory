@@ -115,8 +115,9 @@ pub use file_refs::{
     refs_to_path, shown_ref, stale_refs_of, symbols_uploaded, verified_notes,
 };
 pub use glossary::{
-    ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,
-    all_active_terms, check_term, find_alias_uses, find_term, glossary_version,
+    ALIAS_USES_MAX, BroadAlias, GlossaryEntry, ProseText, TERM_TITLE_MAX_CHARS, TermConflict,
+    TermData, active_terms, all_active_terms, broad_alias, check_term, find_alias_uses, find_term,
+    glossary_version, is_acronym,
 };
 pub use graph::{
     EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,

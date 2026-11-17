@@ -409,6 +409,129 @@ async fn note_write_warns_alias() {
     assert!(n.get("warnings").is_none(), "{n}");
 }
 
+/// M6.6 §6 (замечание 12): `term_alias` не ищет псевдонимы в коде и идентификаторах,
+/// аббревиатура — с учётом регистра. Живой случай обкатки 2026-11-17: «ZAM» → «ZeroAIMemory» на
+/// `zam-code`, «code map»/«zam code» → «Карта кода» на `` `zam code map` ``.
+#[tokio::test]
+async fn term_alias_skips_code_and_identifiers() {
+    let a = api("glossary-code", |_| {}).await;
+    created(&a, term("ZeroAIMemory", &["ZAM"])).await;
+    created(&a, term("Карта кода", &["code map", "zam code"])).await;
+    created(&a, term("Хуки", &["hooks"])).await;
+    let body = "Команда zam-code обновляет карту; полная — `zam code map`, сервер — \
+                `zam-server`, правка в hooks.rs, переменная ZAM_X, путь crates/zam.\n\n\
+                ```sh\nzam code map --hooks\n```\n";
+    let r = post(
+        &a,
+        json!({"kind": "insight", "title": "Карта обновляется хуком", "body": body,
+               "data": {"kind": "gotcha"}, "force": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert!(r.json().get("warnings").is_none(), "{}", r.text());
+    // в прозе: аббревиатура в своём регистре, псевдоним в конце предложения
+    let r = post(
+        &a,
+        json!({"kind": "insight", "title": "ZAM не видит правок",
+               "body": "Проверь, что настроены hooks.", "data": {"kind": "gotcha"},
+               "force": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(
+        r.json()["warnings"],
+        json!([
+            "term_alias: «ZAM» → «ZeroAIMemory»",
+            "term_alias: «hooks» → «Хуки»"
+        ]),
+        "{}",
+        r.text()
+    );
+    // заметка — по тем же правилам
+    let n = a
+        .note(
+            "knowledge",
+            "c1",
+            "# Заметка\n\nЗапусти `zam-server`; zam работает, hooks.rs на месте.\n",
+        )
+        .await;
+    assert!(n.get("warnings").is_none(), "{n}");
+}
+
+/// M6.6 §6.5: слишком общий псевдоним термина (меньше 3 букв или цифр, служебное слово) —
+/// предупреждение `term_alias_broad` при записи и правке `term`; запись не отклоняется.
+#[tokio::test]
+async fn term_alias_broad_warning_on_term_write() {
+    let a = api("glossary-broad", |_| {}).await;
+    let r = post(&a, term("Подтверждение", &["ok", "для", "confirm"])).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let e = r.json();
+    assert_eq!(
+        e["warnings"],
+        json!([
+            "term_alias_broad: «ok» — меньше 3 букв или цифр",
+            "term_alias_broad: «для» — служебное слово"
+        ]),
+        "{e}"
+    );
+    let tid = id(&e);
+    assert_eq!(
+        entry(&a, &tid).await["data"]["aliases"],
+        json!(["ok", "для", "confirm"])
+    );
+    // правка `data` — предупреждение по новым псевдонимам; правка без `data` — без
+    let uri = format!("/api/v1/entries/{tid}");
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &uri,
+            Some(json!({"data": {"definition": "d", "aliases": ["the", "confirm"]}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["warnings"],
+        json!(["term_alias_broad: «the» — служебное слово"])
+    );
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &uri,
+            Some(json!({"body": "Новое тело."})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.json().get("warnings").is_none(), "{}", r.text());
+    // замещение и замещение через supersedes_id — тоже запись термина
+    let r = a
+        .t(
+            Method::POST,
+            &format!("{uri}/supersede"),
+            Some(term("Подтверждение", &["OK"])),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        j["entry"]["warnings"],
+        json!(["term_alias_broad: «OK» — меньше 3 букв или цифр"]),
+        "{j}"
+    );
+    let mut next = term("Подтверждение", &["S3"]);
+    next["supersedes_id"] = json!(id(&j["entry"]));
+    let r = post(&a, next).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(
+        r.json()["warnings"],
+        json!(["term_alias_broad: «S3» — меньше 3 букв или цифр"])
+    );
+    // точные псевдонимы, в том числе аббревиатура из трёх букв, — без предупреждений
+    let t = created(&a, term("Протокол модели", &["MCP", "model context"])).await;
+    assert!(t.get("warnings").is_none(), "{t}");
+}
+
 /// Действующий термин по имени (через карточку словаря).
 async fn entry_by_title(a: &Api, name: &str) -> Value {
     let r = a

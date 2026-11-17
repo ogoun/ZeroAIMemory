@@ -64,7 +64,7 @@ use super::entries::{
     audit_details, check_size, check_title, empty_object, idempotency_key, optional_if_match,
     unprocessable,
 };
-use super::glossary::{alias_warnings, attach_warnings};
+use super::glossary::{alias_warnings, attach_warnings, broad_alias_warnings};
 use super::graph::insight_links;
 use super::json_body;
 use super::nodes::audit_node;
@@ -874,6 +874,8 @@ pub async fn create(
                 &mut v,
             )
             .await;
+        } else if kind == EntryKind::Term {
+            attach_warnings(&mut v, broad_alias_warnings(&n.data));
         }
         let status = if repeat {
             StatusCode::OK
@@ -927,6 +929,8 @@ pub async fn create(
             )
             .await;
         }
+    } else if kind == EntryKind::Term {
+        attach_warnings(&mut v, broad_alias_warnings(&e.data));
     }
     let status = if created {
         StatusCode::CREATED
@@ -1020,6 +1024,8 @@ pub async fn supersede(
             )
             .await;
         }
+    } else if kind == EntryKind::Term {
+        attach_warnings(&mut entry, broad_alias_warnings(&n.data));
     }
     Ok((
         status,

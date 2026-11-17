@@ -119,6 +119,7 @@ A term (`term`) is the canonical name of a project or domain concept.
 
 - **New concept** — `memory_log {kind: "term", title: name, data: {definition (up to 300 characters, required), aliases?, not_to_confuse?, code?: [identifiers]}}` → `t:<id>`. The name or an alias is taken by another active term — 409 `term-conflict`: refine it or replace the old one (`supersede`).
 - **Write with canonical terms.** An alias instead of the name in a record gives a `term_alias: "alias" → "name"` warning.
+- An alias shorter than 3 letters or digits, or a stop word, gives a `term_alias_broad: "alias" — …` warning (the term is written): such an alias fires on unrelated words — replace it with a more specific one.
 - Search expands the query with aliases by itself (`expanded` in the response); `[[Name]]` in a note with no note of that name links to the term. The glossary — `memory_search {filters: {kinds: [term]}}`, CLI `zam glossary [<term>]`; a term met in a prompt arrives as a hint with its definition.
 
 ## Decisions and contradictions

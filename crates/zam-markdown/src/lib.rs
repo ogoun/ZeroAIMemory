@@ -1,6 +1,7 @@
 //! Разбор Markdown ZeroAIMemory на comrak: байтовые позиции, заголовки,
 //! секции, ссылки, frontmatter, санитизированный HTML, а также чанкер §8.2,
-//! сегментация на предложения и уровни L1 (§8.3).
+//! сегментация на предложения и уровни L1 (§8.3), маска прозы без кода
+//! ([`prose_mask`], M6.6 §6.1).
 //!
 //! Единственное место в проекте, которое разбирает Markdown (ТЗ §5.3).
 //! Все диапазоны — байтовые оффсеты в исходной строке; исходник никогда
@@ -8,6 +9,7 @@
 
 mod boundary;
 mod chunk;
+mod code;
 mod doc;
 mod frontmatter;
 mod highlight;
@@ -23,6 +25,7 @@ pub use chunk::{
     ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, ESTIMATE_C, ESTIMATE_M, EstimateCounter,
     TokenCounter, chunk_note, split_plain,
 };
+pub use code::prose_mask;
 pub use doc::{
     Doc, Frontmatter, Heading, Link, LinkKind, OutlineItem, Section, SectionLookup,
     first_paragraph, outline, parse, resolve_section, section_by_path, slug,

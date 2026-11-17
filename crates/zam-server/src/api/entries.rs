@@ -1095,6 +1095,8 @@ pub async fn patch(
         (Some(d), kind) => Some(check_data(kind, d)?),
         (None, _) => None,
     };
+    // псевдонимы термина приходят только с `data`: правка без неё о них не предупреждает
+    let term_data = sc.entry.kind == EntryKind::Term && data.is_some();
     let attrib = attribution(&p, &headers, req.message)?;
     let patch = EntryPatch {
         title: req.title,
@@ -1122,6 +1124,8 @@ pub async fn patch(
             &mut v,
             super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &e.title, &e.body).await?,
         );
+    } else if term_data {
+        super::glossary::attach_warnings(&mut v, super::glossary::broad_alias_warnings(&e.data));
     }
     Ok(Json(v))
 }
