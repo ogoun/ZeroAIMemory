@@ -1176,15 +1176,37 @@ fn init_replaces_v2_handlers() {
     assert_eq!(p.snapshot(), before);
 }
 
-/// git в каталоге `dir` с потолками тестов: не поднимается до репозитория ZeroAIMemory.
+/// git в каталоге `dir` с потолками тестов (не поднимается до репозитория ZeroAIMemory), своим
+/// автором и без подписи коммитов — как в `tests/code.rs`.
 fn git(dir: &Path, args: &[&str]) -> Output {
     std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
+        .args([
+            "-c",
+            "user.name=zam",
+            "-c",
+            "user.email=zam@example.invalid",
+        ])
+        .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
         .args(args)
         .env("GIT_CEILING_DIRECTORIES", common::ceilings())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .unwrap()
+}
+
+/// git с обязательным кодом 0.
+fn git_ok(dir: &Path, args: &[&str]) {
+    let o = git(dir, args);
+    assert!(o.status.success(), "git {args:?}: {}", err(&o));
+}
+
+/// Сколько в тексте строк, равных `line`.
+fn lines_eq(text: &str, line: &str) -> usize {
+    text.lines().filter(|l| *l == line).count()
 }
 
 /// Настоящий репозиторий git в проекте вместо пустого `.git`: `info/exclude` и `check-ignore`
@@ -1323,16 +1345,19 @@ fn init_url_local_writes_claude_local_and_exclude() {
     assert_eq!(exclude(&p), ex0, "исключение не подтверждено");
     assert!(err(&o).contains("CLAUDE.local.md не внесён"), "{}", err(&o));
     assert!(!git_ignored(&p, "CLAUDE.local.md"));
-    // --yes — без вопроса
+    // --yes — без вопроса; ожидание не зависит от того, создал ли git init файл exclude
     let o = p.init(&["--url-to", "local", "--yes"], "");
     ok(&o);
     let ex = exclude(&p);
-    assert!(
-        ex.starts_with(&ex0) && ex.ends_with("\n/CLAUDE.local.md\n"),
-        "{ex}"
-    );
+    assert!(ex.starts_with(&ex0), "{ex}");
+    assert_eq!(lines_eq(&ex, "/CLAUDE.local.md"), 1, "{ex}");
     assert!(git_ignored(&p, "CLAUDE.local.md"));
     assert!(out(&o).contains("--url-to local"), "{}", out(&o));
+    assert!(
+        out(&o).contains("CLAUDE.local.md внесён в .git/info/exclude."),
+        "{}",
+        out(&o)
+    );
     // токен — в домашнем конфиге, адреса там нет
     let home: toml::Table =
         toml::from_str(&std::fs::read_to_string(home_cfg(&p)).unwrap()).unwrap();
@@ -1352,15 +1377,196 @@ fn init_url_local_writes_claude_local_and_exclude() {
         s.contains(&format!("Сервер:   {url}")) && s.contains("CLAUDE.local.md"),
         "{s}"
     );
-    // Codex: локального файла нет, а CLAUDE.local.md выключает AGENTS.md у Claude Code
-    let o = p.init(&["--url-to", "local", "--agent", "both", "--yes"], "");
+    // Codex: локального файла нет, а CLAUDE.local.md выключает AGENTS.md у Claude Code — и у
+    // одного Codex, и у обоих
+    for agent in ["codex", "both"] {
+        let o = p.init(&["--url-to", "local", "--agent", agent, "--yes"], "");
+        ok(&o);
+        assert!(
+            err(&o).contains("Claude Code не читает AGENTS.md")
+                && err(&o).contains("для Codex выберите zam init --url-to home"),
+            "{agent}: {}",
+            err(&o)
+        );
+        assert!(!p.read("AGENTS.md").contains(&url));
+    }
+}
+
+/// `--url-to local` (ревью задачи 10, I1): `CLAUDE.local.md` в индексе git — исключение не
+/// действует: предупреждение, без вопроса, без записи и без ложного «внесён»; правило «!» в
+/// `.gitignore` сильнее `info/exclude` — после записи git повторно проверяет, итог —
+/// предупреждение; строка уже есть — без вопроса и без повторной записи.
+#[test]
+fn init_url_local_tracked_or_negated_not_reported_excluded() {
+    let (url, tok) = start("url-local-tracked");
+    let p = Proj::new("url-local-tracked", &url, &tok);
+    git_init(&p);
+    // CLAUDE.local.md закоммичен (руководство писало «обычно не коммитится», а не «никогда»)
+    std::fs::write(p.repo.join("CLAUDE.local.md"), "# мои\n").unwrap();
+    git_ok(&p.repo, &["add", "CLAUDE.local.md"]);
+    git_ok(&p.repo, &["commit", "-q", "-m", "local"]);
+    let ex0 = exclude(&p);
+    // без --yes: на вопрос о файлах агента — «y», вопроса об исключении нет
+    let o = p.init(&["--url-to", "local"], "y\n");
     ok(&o);
+    let (s, e) = (out(&o), err(&o));
     assert!(
-        err(&o).contains("AGENTS.md") && err(&o).contains("--url-to home"),
+        e.contains(
+            "CLAUDE.local.md в индексе git — исключение не действует: git rm --cached \
+             CLAUDE.local.md"
+        ),
+        "{e}"
+    );
+    assert!(!s.contains("Внести") && !s.contains("внесён"), "{s}");
+    assert_eq!(exclude(&p), ex0, "исключение не писалось");
+    // снят с индекса, но .gitignore возвращает его правилом «!»
+    git_ok(&p.repo, &["rm", "--cached", "-q", "CLAUDE.local.md"]);
+    std::fs::write(p.repo.join(".gitignore"), "!/CLAUDE.local.md\n").unwrap();
+    let o = p.init(&["--url-to", "local", "--yes"], "");
+    ok(&o);
+    let (s, e) = (out(&o), err(&o));
+    assert!(!s.contains("внесён"), "{s}");
+    assert!(
+        e.contains(
+            "строка /CLAUDE.local.md дописана в .git/info/exclude, но git по-прежнему не исключает"
+        ),
+        "{e}"
+    );
+    let ex = exclude(&p);
+    assert_eq!(lines_eq(&ex, "/CLAUDE.local.md"), 1, "{ex}");
+    // строка уже есть: без вопроса (stdin пуст) и без второй строки
+    let o = p.init(&["--url-to", "local"], "");
+    ok(&o);
+    assert!(!out(&o).contains("Внести"), "{}", out(&o));
+    assert!(
+        err(&o).contains("строка /CLAUDE.local.md уже есть в .git/info/exclude"),
         "{}",
         err(&o)
     );
-    assert!(!p.read("AGENTS.md").contains(&url));
+    assert_eq!(exclude(&p), ex);
+    // без правила «!» — исключён, итог молчит
+    std::fs::remove_file(p.repo.join(".gitignore")).unwrap();
+    let o = p.init(&["--url-to", "local", "--yes"], "");
+    ok(&o);
+    assert!(git_ignored(&p, "CLAUDE.local.md"));
+    assert!(!err(&o).contains("CLAUDE.local.md"), "{}", err(&o));
+    assert_eq!(exclude(&p), ex);
+}
+
+/// Проект в подкаталоге репозитория со спецсимволом шаблонов gitignore в имени (`sub[1]`) и в
+/// связанном worktree (ревью задачи 10, I1 и M6): строка исключения — с экранированным
+/// префиксом, в общем `info/exclude` основного репозитория, и действует в обоих рабочих копиях.
+#[test]
+fn init_url_local_subdir_in_worktree_escaped_prefix() {
+    let (url, tok) = start("url-local-wt");
+    let root = tmp("url-local-wt");
+    let (main, wt, home) = (root.join("main"), root.join("wt"), root.join("home"));
+    std::fs::create_dir_all(main.join("sub[1]/.zeroaimemory")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(main.join("sub[1]/.zeroaimemory/keep"), "x\n").unwrap();
+    git_ok(&main, &["init", "-q"]);
+    git_ok(&main, &["add", "sub[1]/.zeroaimemory/keep"]);
+    git_ok(&main, &["commit", "-q", "-m", "init"]);
+    git_ok(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    let proj = wt.join("sub[1]");
+    let ex_path = main.join(".git/info/exclude");
+    let ex0 = std::fs::read_to_string(&ex_path).unwrap_or_default();
+    let o = common::zam_cmd()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&proj)
+        .args(["init", "--url", &url, "--token", &tok])
+        .args(["--url-to", "local", "--yes"])
+        .output()
+        .unwrap();
+    ok(&o);
+    assert!(out(&o).contains("CLAUDE.local.md внесён в "), "{}", out(&o));
+    let ex = std::fs::read_to_string(&ex_path).unwrap();
+    assert!(ex.starts_with(&ex0), "{ex}");
+    assert_eq!(lines_eq(&ex, "/sub\\[1\\]/CLAUDE.local.md"), 1, "{ex}");
+    assert!(
+        std::fs::read_to_string(proj.join("CLAUDE.local.md"))
+            .unwrap()
+            .contains(&format!("ZeroAIMemoryUrl={url}")),
+    );
+    for dir in [&proj, &main.join("sub[1]")] {
+        let o = git(dir, &["check-ignore", "-q", "CLAUDE.local.md"]);
+        assert!(o.status.success(), "{}: не исключён", dir.display());
+    }
+}
+
+/// Переход с `--url-to local` на `home` или `block` (ревью задачи 10, M1): строка адреса уходит
+/// из `CLAUDE.local.md` (файл только с ней — удаляется, свой текст остаётся), иначе она важнее
+/// и повтор без флага выбрал бы `local`; повтор держит новый режим.
+#[test]
+fn init_url_local_to_home_or_block_drops_local_line() {
+    let (url, tok) = start("url-local-switch");
+    let p = Proj::new("url-local-switch", &url, &tok);
+    let local = p.repo.join("CLAUDE.local.md");
+    // local → home: файл, созданный zam init, удаляется
+    ok(&p.init(&["--url-to", "local", "--yes"], ""));
+    assert_eq!(
+        p.read("CLAUDE.local.md"),
+        format!("ZeroAIMemoryUrl={url}\n")
+    );
+    let o = p.init(&["--url-to", "home", "--yes"], "");
+    ok(&o);
+    assert!(!local.exists(), "CLAUDE.local.md удалён");
+    let s = out(&o);
+    assert!(s.contains("удалён   CLAUDE.local.md"), "{s}");
+    assert!(
+        s.contains("CLAUDE.local.md удалён: кроме строки адреса"),
+        "{s}"
+    );
+    let home: toml::Table =
+        toml::from_str(&std::fs::read_to_string(home_cfg(&p)).unwrap()).unwrap();
+    assert_eq!(home["url"].as_str(), Some(url.as_str()));
+    let before = p.snapshot();
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    assert!(out(&o).contains("--url-to home"), "{}", out(&o));
+    assert_eq!(p.snapshot(), before);
+    // local → block: свой текст файла остаётся, строки адреса нет
+    std::fs::write(&local, "# мои\n").unwrap();
+    ok(&p.init(&["--url-to", "local", "--yes"], ""));
+    let o = p.init(&["--url-to", "block", "--yes"], "");
+    ok(&o);
+    assert_eq!(p.read("CLAUDE.local.md"), "# мои\n");
+    assert!(
+        out(&o).contains("Строка ZeroAIMemoryUrl убрана из CLAUDE.local.md (--url-to block)"),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        p.read("CLAUDE.md")
+            .contains(&format!("ZeroAIMemoryUrl={url}\n"))
+    );
+    let before = p.snapshot();
+    ok(&p.init(&["--yes"], ""));
+    assert_eq!(p.snapshot(), before);
+}
+
+/// Своя строка `ZeroAIMemoryUrl=` вне блока в CLAUDE.md при `--url-to home` (ревью задачи 10,
+/// M3): текст пользователя не вырезается, но предупреждение — адрес уйдёт в репозиторий.
+#[test]
+fn init_url_home_warns_own_url_line_outside_block() {
+    let (url, tok) = start("url-own-line");
+    let p = Proj::new("url-own-line", &url, &tok);
+    let own = "ZeroAIMemoryUrl=http://198.51.100.7:7700";
+    std::fs::write(p.repo.join("CLAUDE.md"), format!("# Проект\n{own}\n")).unwrap();
+    let o = p.init(&["--url-to", "home", "--yes"], "");
+    ok(&o);
+    assert!(
+        err(&o).contains(
+            "в CLAUDE.md своя строка ZeroAIMemoryUrl вне блока ZeroAIMemory — адрес сервера \
+             уйдёт в репозиторий"
+        ),
+        "{}",
+        err(&o)
+    );
+    let md = p.read("CLAUDE.md");
+    assert!(md.starts_with(&format!("# Проект\n{own}\n")), "{md}");
+    assert!(!md.contains(&url), "{md}");
 }
 
 /// Потолок поиска: git у `zam init` не поднимается выше `ZAM_CEILING_DIRECTORIES` — проект без
@@ -1518,8 +1724,9 @@ fn init_url_home_conflicting_home_url() {
     assert!(!p.read("CLAUDE.md").contains(&url));
 }
 
-/// Режим block в репозитории git: CLAUDE.md не исключён — предупреждение «адрес сервера
-/// окажется в репозитории»; исключён или режим home — без него.
+/// Режим block в репозитории git: CLAUDE.md не исключён или уже в индексе (исключение тогда не
+/// действует) — предупреждение «адрес сервера окажется в репозитории»; исключён или режим home
+/// — без него.
 #[test]
 fn init_block_warns_tracked_claude_md() {
     const W: &str = "адрес сервера окажется в репозитории: zam init --url-to home";
@@ -1539,6 +1746,16 @@ fn init_block_warns_tracked_claude_md() {
     let o = p.init(&["--yes"], "");
     ok(&o);
     assert!(!err(&o).contains(W), "{}", err(&o));
+    // в индексе (`git add -f` при `/CLAUDE.md` в exclude) — исключение не действует
+    git_ok(&p.repo, &["add", "-f", "CLAUDE.md"]);
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    assert!(
+        err(&o).contains(&format!("CLAUDE.md не исключён из git — {W}")),
+        "{}",
+        err(&o)
+    );
+    git_ok(&p.repo, &["rm", "--cached", "-q", "CLAUDE.md"]);
     std::fs::write(&exclude_path, "").unwrap();
     let o = p.init(&["--url-to", "home", "--yes"], "");
     ok(&o);

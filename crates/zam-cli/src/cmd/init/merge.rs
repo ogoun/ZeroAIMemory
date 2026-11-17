@@ -98,6 +98,35 @@ pub fn cut_url_lines(block: &str) -> (String, Vec<String>) {
     (rest, urls)
 }
 
+/// Значения строк адреса в тексте файла (`CLAUDE.local.md`; BOM в начале пропускается).
+pub fn url_values(text: &str) -> Vec<String> {
+    cut_url_lines(text.strip_prefix(BOM).unwrap_or(text)).1
+}
+
+/// Текст файла без строк адреса (переход `--url-to local` → `home|block`); BOM и прочий текст
+/// сохраняются. Кроме строк адреса и пробелов в файле ничего нет — `None` (файл удалить).
+pub fn drop_url_lines(text: &str) -> Option<String> {
+    let (bom, body) = match text.strip_prefix(BOM) {
+        Some(rest) => (BOM, rest),
+        None => ("", text),
+    };
+    let rest = cut_url_lines(body).0;
+    (!rest.trim().is_empty()).then(|| format!("{bom}{rest}"))
+}
+
+/// Экранирование для шаблона gitignore (`info/exclude`): `\`, `*`, `?`, `[`, `]` в пути
+/// каталога иначе читаются как символы шаблона, и строка не совпала бы с путём.
+pub fn gitignore_escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Текст `CLAUDE.local.md` со строкой `ZeroAIMemoryUrl=<url>`: прежние строки адреса (все — у
 /// `zam` побеждает последняя) заменяются ею, нет ни одной — она дописывается в конец. Прочий
 /// текст, BOM и CRLF файла сохраняются (M6.6 §10.1).
@@ -427,5 +456,31 @@ mod tests {
             format!("\u{feff}a\r\n{line}\r\nb\r\n{line}")
         );
         assert_eq!(set_url_line(Some("a\r\n"), u), format!("a\r\n{line}\r\n"));
+    }
+
+    /// Переход с `--url-to local`: строки адреса уходят из `CLAUDE.local.md`, свой текст и BOM
+    /// остаются; файл только со строкой адреса — удалить (`None`).
+    #[test]
+    fn url_lines_dropped_from_local_file() {
+        let u = "http://192.0.2.1:7700";
+        assert_eq!(url_values(&format!("\u{feff}ZeroAIMemoryUrl={u}\n")), [u]);
+        assert!(url_values("# мои\n").is_empty());
+        assert_eq!(drop_url_lines(&set_url_line(None, u)), None);
+        assert_eq!(
+            drop_url_lines(&format!("\u{feff}\n ZeroAIMemoryUrl={u}\r\n")),
+            None
+        );
+        assert_eq!(
+            drop_url_lines(&format!("\u{feff}# мои\r\nZeroAIMemoryUrl={u}\r\nхвост")),
+            Some("\u{feff}# мои\r\nхвост".to_string())
+        );
+    }
+
+    /// Префикс каталога в шаблоне `info/exclude`: символы шаблона gitignore экранируются.
+    #[test]
+    fn gitignore_prefix_escaped() {
+        assert_eq!(gitignore_escape("sub/dir/"), "sub/dir/");
+        assert_eq!(gitignore_escape("a[1] b/"), "a\\[1\\] b/");
+        assert_eq!(gitignore_escape("x*y?/z\\"), "x\\*y\\?/z\\\\");
     }
 }

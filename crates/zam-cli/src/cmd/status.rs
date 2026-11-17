@@ -249,6 +249,7 @@ impl Report {
                 "solution": sol.map(|d| d.to_string()),
                 "solution_id": file.map(|s| s.id.as_str()),
                 "solution_name": name,
+                "solution_file_name": file.map(|s| s.name.as_str()),
                 "solution_error": self.sol.as_ref().and_then(|r| r.as_ref().err()),
                 "solution_role": self.role,
                 "access_requests_pending": self.pending,

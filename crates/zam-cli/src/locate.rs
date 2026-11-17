@@ -192,6 +192,12 @@ pub fn block_token(text: &str) -> Option<String> {
     parse_md_parts(text).0.1
 }
 
+/// Адрес из своей строки `ZeroAIMemoryUrl=` вне блока ZeroAIMemory: `zam init --url-to
+/// home|local` её не трогает (текст пользователя), а предупреждает — файл коммитится (M6.6).
+pub fn outside_url(text: &str) -> Option<String> {
+    parse_md_parts(text).1.0
+}
+
 type Pair = (Option<String>, Option<String>);
 
 /// Ключ строки адреса сервера в CLAUDE.md/AGENTS.md/CLAUDE.local.md.

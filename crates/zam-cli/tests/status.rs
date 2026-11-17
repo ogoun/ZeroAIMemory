@@ -112,7 +112,7 @@ async fn status_json_has_fields_and_only_mask() {
     assert!(v["user"]["id"].is_string() && v["user"]["name"].is_string());
     assert!(v["solution"].is_null());
     // поля решения есть и без solution.toml (M6.6, замечание 23)
-    for k in ["solution_id", "solution_name"] {
+    for k in ["solution_id", "solution_name", "solution_file_name"] {
         assert!(v.as_object().unwrap().contains_key(k), "{k}: {v}");
         assert!(v[k].is_null(), "{k}: {v}");
     }
@@ -182,6 +182,7 @@ async fn status_prints_solution_name_and_guid() {
         let v = json(&run(&["--token", &token, "--json"]));
         assert_eq!(v["solution_id"], g, "{v}");
         assert_eq!(v["solution_name"], "Файловое", "{v}");
+        assert_eq!(v["solution_file_name"], "Файловое", "{v}");
         assert!(v["solution"].as_str().unwrap().ends_with("solution.toml"), "{v}");
         // переименовано в реестре (zam solution rename) — имя реестра с пометкой
         let body = serde_json::json!({"name": "Реестровое"});
@@ -192,7 +193,10 @@ async fn status_prints_solution_name_and_guid() {
                 && s.contains("(в solution.toml — «Файловое»)"),
             "{s}"
         );
-        assert_eq!(json(&run(&["--token", &token, "--json"]))["solution_name"], "Реестровое");
+        // в JSON видны оба имени: реестра и файла (ревью задачи 10, M8)
+        let v = json(&run(&["--token", &token, "--json"]));
+        assert_eq!(v["solution_name"], "Реестровое", "{v}");
+        assert_eq!(v["solution_file_name"], "Файловое", "{v}");
         // без токена реестр не спрашивается — имя из файла, без ошибки о решении
         let o = run(&[]);
         assert_eq!(o.status.code(), Some(3));
