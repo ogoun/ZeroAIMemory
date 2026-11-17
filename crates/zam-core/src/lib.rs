@@ -80,6 +80,11 @@ pub const AGENT_ENV_VARS: [&str; 6] = [
     "CODEX_THREAD_ID",
 ];
 
+/// Заголовок ответа Markdown `POST /search` с числами усечения выдачи `budget=N; weak=M` (M6.6
+/// §9, замечание 11): сервер его ставит, `zam search` читает (в JSON те же числа — поле
+/// `omitted`). Имя — в нижнем регистре, как его хранит `http::HeaderMap`.
+pub const SEARCH_OMITTED_HEADER: &str = "x-zam-omitted";
+
 /// Сокращение надёжности `certainty` в тексте агенту (M6 §4.1, §4.3): `ax`, `th`, `hyp`;
 /// прочее — как есть. Одна функция для карточек поиска, подсказок сервера и клиента, ответов MCP.
 pub fn certainty_short(c: &str) -> &str {

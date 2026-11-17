@@ -18,12 +18,10 @@
 //! `omitted` (JSON) или заголовку `X-Zam-Omitted` (Markdown); у сервера до 0.0.13-m6.6 их нет —
 //! строки нет.
 use serde_json::{Map, Value, json};
+use zam_core::SEARCH_OMITTED_HEADER;
 
 use super::{Ctx, emit, refs};
 use crate::client::{CliError, read_text};
-
-/// Заголовок ответа Markdown с числами усечения (`budget=N; weak=M`, сервер 0.0.13-m6.6).
-const OMITTED_HEADER: &str = "x-zam-omitted";
 
 pub struct Opts<'a> {
     pub all: bool,
@@ -111,7 +109,7 @@ pub fn run(ctx: &Ctx, query: &str, o: &Opts) -> Result<(), CliError> {
         .post_json("/search", &body(ctx, query, o, file.as_deref()))?;
     let header = resp
         .headers()
-        .get(OMITTED_HEADER)
+        .get(SEARCH_OMITTED_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(omitted_header);
     let mut text = read_text(resp)?;
@@ -225,7 +223,8 @@ struct Omitted {
     weak: u64,
 }
 
-/// Заголовок [`OMITTED_HEADER`] `budget=N; weak=M`; иная форма — `None` (молча).
+/// Заголовок [`SEARCH_OMITTED_HEADER`] `budget=N; weak=M` (сервер 0.0.13-m6.6); иная форма —
+/// `None` (молча).
 fn omitted_header(s: &str) -> Option<Omitted> {
     let (b, w) = s.split_once("; ")?;
     Some(Omitted {

@@ -552,6 +552,20 @@ fn search_filters_and_budget_flags() {
         .unwrap();
     ok(&o);
     assert!(err(&o).is_empty(), "{}", err(&o));
+    // и в Markdown: ответ `text/markdown` без заголовка `X-Zam-Omitted` — тоже молча (ревью, M2)
+    let md = "1. n:01AAAAAAAAAAAAAAAAAAAAAAAA Knowledge/a  [1.0] r1 · 2026-11-17 10:00:00 · 5t\n   \
+              квазар\n2. n:01BBBBBBBBBBBBBBBBBBBBBBBB Knowledge/b  [.98] r1 · 2026-11-17 10:00:00 · \
+              5t\n";
+    let (old_md, seen_md) = common::stub_markdown(md);
+    let o = e
+        .zam()
+        .env("ZAM_URL", &old_md)
+        .args(["search", "квазар"])
+        .output()
+        .unwrap();
+    assert_eq!(ok(&o), md);
+    assert!(err(&o).is_empty(), "{}", err(&o));
+    assert_eq!(seen_md.lock().unwrap().last().unwrap().2["format"], "md");
 
     // настоящий сервер: бюджет усекает выдачу — строка хвоста в Markdown и строка stderr
     for i in 0..12 {

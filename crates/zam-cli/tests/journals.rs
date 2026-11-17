@@ -309,6 +309,24 @@ fn release_list_newest_first() {
     let o = z(&["release", "list", "--limit", "2"]);
     assert_eq!(ok(&o).lines().count(), 2);
     assert_eq!(err(&o), "показано 2, есть ещё: --limit 200 или --all\n");
+    // ревью, Important 1: --limit режет ленту, уже упорядоченную по дате, — новейшие, а не
+    // последние созданные (0.9.0 создан после 1.1.0, но старше)
+    let o = z(&["release", "list", "--limit", "3"]);
+    let versions: Vec<String> = ok(&o)
+        .lines()
+        .map(|l| l.split(' ').nth(1).unwrap().to_string())
+        .collect();
+    assert_eq!(versions, ["1.2.1", "1.2.0", "1.1.0"], "{}", out(&o));
+    assert_eq!(err(&o), "показано 3, есть ещё: --limit 200 или --all\n");
+    let j = json(&z(&["release", "list", "--limit", "3", "--json"]));
+    let jv: Vec<&str> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["data"]["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(jv, ["1.2.1", "1.2.0", "1.1.0"], "{j}");
+    assert!(j["next_cursor"].is_null(), "{j}");
     let o = z(&["release", "list", "--all"]);
     assert_eq!(ok(&o).lines().count(), 4);
     assert!(err(&o).is_empty(), "{}", err(&o));

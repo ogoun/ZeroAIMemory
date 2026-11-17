@@ -13,13 +13,16 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 use super::log::read_text;
-use super::{Ctx, Paging, emit, emit_json, list_entries, post_entry, solution_guid};
+use super::{Ctx, Paging, emit, emit_json, list_entries, more_hint, post_entry, solution_guid};
 use crate::client::{CliError, EXIT_CONFIG, EXIT_NOT_FOUND, read_json};
 
 /// Предел числа коммитов релиза на сервере.
 const COMMITS_MAX: usize = 5000;
 /// Фильтр ленты записей — релизы.
 const RELEASES: [(&str, &str); 1] = [("kind", "release")];
+/// Релизов в `zam release list` без `--limit` и `--all` — как страница ленты сервера по
+/// умолчанию (`LIST_DEFAULT` в `zam-server`, `api/entries.rs`).
+const LIST_DEFAULT: usize = 50;
 
 pub struct Add<'a> {
     pub version: &'a str,
@@ -186,14 +189,19 @@ fn version(e: &Value) -> &str {
 }
 
 /// `zam release list`: релизы решения, новые первыми — по дате релиза (`data.date`), при равной
-/// — по времени создания (порядок ленты сервера; сортировка устойчивая). Страница — умолчание
-/// сервера (50) или `--limit`, `--all` — вся лента, строка «есть ещё» — [`list_entries`];
-/// `--json` — записи сервера в том же порядке.
+/// — по времени создания. Сервер режет страницы ленты по времени создания, поэтому лента
+/// читается целиком ([`list_entries`] с `all`; релизов единицы–десятки), сортируется и только
+/// потом режется: `--limit` (по умолчанию [`LIST_DEFAULT`]) — первые новейшие, отрезано —
+/// строка «есть ещё», как у лент журналов; `--all` — все. `--json` — записи сервера в том же
+/// порядке, `next_cursor: null` (ревью задачи 9 M6.6, Important 1).
 pub fn list(ctx: &Ctx, solution: Option<&str>, page: Paging) -> Result<(), CliError> {
     let guid = solution_guid(ctx, solution)?;
-    let mut v = list_entries(ctx, &guid, &RELEASES, page.limit, page.all)?;
+    let mut v = list_entries(ctx, &guid, &RELEASES, None, true)?;
     if let Some(items) = v["items"].as_array_mut() {
-        items.sort_by(|a, b| b["data"]["date"].as_str().cmp(&a["data"]["date"].as_str()));
+        let limit = (!page.all).then(|| page.limit.map_or(LIST_DEFAULT, |l| l as usize));
+        if newest_first(items, limit) {
+            eprintln!("{}", more_hint(items.len()));
+        }
     }
     if ctx.json {
         return emit_json(&v);
@@ -205,6 +213,19 @@ pub fn list(ctx: &Ctx, solution: Option<&str>, page: Paging) -> Result<(), CliEr
         .map(|e| format!("{}\n", list_line(e)))
         .collect();
     emit(out.as_bytes())
+}
+
+/// Релизы ленты сервера (новые созданные первыми) — новые по дате релиза первыми (сортировка
+/// устойчивая: при равной дате — порядок создания) и первые `limit`; `true` — отрезано.
+fn newest_first(items: &mut Vec<Value>, limit: Option<usize>) -> bool {
+    items.sort_by(|a, b| b["data"]["date"].as_str().cmp(&a["data"]["date"].as_str()));
+    match limit {
+        Some(n) if items.len() > n => {
+            items.truncate(n);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Строка ленты релизов: `<id> <версия> <дата>[ тег <tag>][ · коммитов K]`.
@@ -293,6 +314,36 @@ mod tests {
         let e =
             json!({"id": "01B", "data": {"version": "0.9", "date": "2025-12-01", "commits": []}});
         assert_eq!(list_line(&e), "01B 0.9 2025-12-01");
+    }
+
+    /// Ревью задачи 9 M6.6, Important 1: порядок — по дате релиза поверх порядка создания, а
+    /// `limit` режет уже отсортированную ленту (новейшие по дате, а не последние созданные).
+    #[test]
+    fn newest_first_sorts_then_limits() {
+        // лента сервера — новые созданные первыми: 0.9.0 заведён после 1.1.0
+        let feed = || -> Vec<Value> {
+            [
+                ("1.2.1", "2026-03-01"),
+                ("1.2.0", "2026-03-01"),
+                ("0.9.0", "2025-12-01"),
+                ("1.1.0", "2026-02-01"),
+            ]
+            .iter()
+            .map(|(v, d)| json!({"data": {"version": v, "date": d}}))
+            .collect()
+        };
+        let versions = |items: &[Value]| -> Vec<String> {
+            items.iter().map(|e| version(e).to_string()).collect()
+        };
+        let mut all = feed();
+        assert!(!newest_first(&mut all, None));
+        assert_eq!(versions(&all), ["1.2.1", "1.2.0", "1.1.0", "0.9.0"]);
+        let mut three = feed();
+        assert!(newest_first(&mut three, Some(3)));
+        assert_eq!(versions(&three), ["1.2.1", "1.2.0", "1.1.0"]);
+        let mut whole = feed();
+        assert!(!newest_first(&mut whole, Some(4)));
+        assert_eq!(whole.len(), 4);
     }
 
     #[test]

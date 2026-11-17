@@ -1440,6 +1440,27 @@ struct Packed {
     tokens: usize,
 }
 
+impl Packed {
+    /// Элемент целиком: текст `chunks` (если есть) — не урезан.
+    fn whole(mut it: Item) -> Packed {
+        let text = it.text.take();
+        Packed {
+            tokens: text
+                .as_ref()
+                .map_or(it.hit.token_count.max(0) as usize, |t| t.1),
+            text: text.map(|(t, _)| (t, false)),
+            item: it,
+        }
+    }
+
+    /// Обратно в элемент, как он был до [`Packed::whole`] (только неурезанный — [`pack_whole`]).
+    fn into_item(self) -> Item {
+        let mut it = self.item;
+        it.text = self.text.map(|(t, _)| (t, self.tokens));
+        it
+    }
+}
+
 /// Строка карточки без текста: по ней считается стоимость в токенах. У вложения L0 нет — в
 /// `notes` тоже сниппет.
 fn card_summary(it: &Item, mode: SearchMode) -> &str {
@@ -1467,10 +1488,6 @@ fn md_tail(degraded: Option<DegradedReason>, warnings: &[String]) -> String {
     }
     s
 }
-
-/// Заголовок ответа Markdown с числами усечения выдачи: `budget=N; weak=M` (M6.6 §9,
-/// замечание 11) — клиенту без JSON (`zam search`); в JSON те же числа — поле `omitted`.
-const OMITTED_HEADER: &str = "x-zam-omitted";
 
 /// Строка хвоста Markdown об усечении бюджетом (M6.6 §9, замечание 11): `n` карточек не
 /// поместились в `budget_tokens` = `budget`; без усечения (`n = 0`) — пусто. Слабые карточки
@@ -1527,11 +1544,9 @@ fn cut_summary(full: &str, cost: &dyn Fn(&str) -> usize, room: usize) -> String 
 /// ([`item_md`]: номер, id, путь, секция, хвост, пометки, фрагмент или текст) счётчиком
 /// `count`; элементы берутся по порядку, пока помещаются. Первая карточка отдаётся всегда:
 /// не помещается — урезается её фрагмент (L0) или текст (`chunks`), вплоть до пустого. У
-/// следующей в `chunks` урезается текст до остатка, в `brief`/`notes` — стоп. Кандидаты берутся
-/// по ссылке (копируются только упакованные): упаковку повторяют с другим бюджетом
-/// ([`budget_line`] в резерве).
+/// следующей в `chunks` урезается текст до остатка, в `brief`/`notes` — стоп.
 fn pack_items(
-    items: &[Item],
+    items: Vec<Item>,
     mode: SearchMode,
     budget_tokens: usize,
     count: &dyn Fn(&str) -> usize,
@@ -1540,16 +1555,8 @@ fn pack_items(
     let mut out: Vec<Packed> = Vec::new();
     let mut used = 0usize;
     for it in items {
-        let mut it = it.clone();
         let n = out.len() + 1;
-        let text = it.text.take();
-        let mut p = Packed {
-            tokens: text
-                .as_ref()
-                .map_or(it.hit.token_count.max(0) as usize, |t| t.1),
-            text: text.map(|(t, _)| (t, false)),
-            item: it,
-        };
+        let mut p = Packed::whole(it);
         let cost = count(&item_md(n, &p, mode, spaces));
         if used + cost <= budget_tokens {
             used += cost;
@@ -1608,6 +1615,92 @@ fn pack_items(
         break;
     }
     out
+}
+
+/// Все элементы целиком в `budget_tokens` (та же стоимость, что у [`pack_items`]) — упакованы
+/// переносом, без копий; не помещаются — элементы обратно, нетронутыми (`Err`), для
+/// [`pack_items`] с усечением.
+fn pack_whole(
+    items: Vec<Item>,
+    mode: SearchMode,
+    budget_tokens: usize,
+    count: &dyn Fn(&str) -> usize,
+    spaces: &HashMap<Id, Space>,
+) -> Result<Vec<Packed>, Vec<Item>> {
+    let mut out: Vec<Packed> = Vec::with_capacity(items.len());
+    let mut used = 0usize;
+    let mut rest = items.into_iter();
+    while let Some(it) = rest.next() {
+        let p = Packed::whole(it);
+        let cost = count(&item_md(out.len() + 1, &p, mode, spaces));
+        if used + cost > budget_tokens {
+            let mut back: Vec<Item> = out.into_iter().map(Packed::into_item).collect();
+            back.push(p.into_item());
+            back.extend(rest);
+            return Err(back);
+        }
+        used += cost;
+        out.push(p);
+    }
+    Ok(out)
+}
+
+/// Упаковка ответа поиска в бюджет вместе со строкой хвоста об усечении (M6 §4.2, M6.6 §9,
+/// замечание 11): карточки, Markdown целиком и число карточек, не поместившихся по бюджету.
+struct ReplyPack<'a> {
+    mode: SearchMode,
+    /// `budget_tokens` запроса — число в строке хвоста ([`budget_line`]).
+    budget: usize,
+    /// Место под карточки: `budget_cap` без выжимок шага 0, строк хвоста и `~N tok` MCP.
+    room: usize,
+    cache_md: &'a str,
+    /// Строки деградации и предупреждений ([`md_tail`]).
+    tail_md: &'a str,
+    spaces: &'a HashMap<Id, Space>,
+    count: &'a dyn Fn(&str) -> usize,
+    /// Markdown ответа целиком (со строкой MCP `~N tok`) укладывается в бюджет.
+    fits: &'a dyn Fn(&str) -> bool,
+}
+
+impl ReplyPack<'_> {
+    /// Всё помещается целиком — отбор прежний, без копий ([`pack_whole`]). Иначе — [`pack_items`];
+    /// срезала карточки — упаковка заново с ценой строки хвоста (число в ней — не больше всех
+    /// кандидатов), для этого кандидаты копируются. Суммы частей и счёт целого могут разойтись на
+    /// стыках: пока целое не влезло ([`ReplyPack::fits`]), с конца снимаются карточки, а строка
+    /// хвоста пересчитывается. Хотя бы одна карточка остаётся.
+    fn pack(&self, items: Vec<Item>) -> (Vec<Packed>, String, usize) {
+        let total = items.len();
+        let pack = |items: Vec<Item>, room: usize| {
+            pack_items(items, self.mode, room, self.count, self.spaces)
+        };
+        let mut packed = match pack_whole(items, self.mode, self.room, self.count, self.spaces) {
+            Ok(p) => p,
+            Err(items) => {
+                let first = pack(items.clone(), self.room);
+                if first.len() < total {
+                    let line = (self.count)(&budget_line(total, self.budget));
+                    pack(items, self.room.saturating_sub(line))
+                } else {
+                    first
+                }
+            }
+        };
+        let md = |packed: &[Packed]| {
+            let tail = format!(
+                "{}{}",
+                self.tail_md,
+                budget_line(total - packed.len(), self.budget)
+            );
+            md_body(self.cache_md, packed, self.mode, self.spaces, &tail)
+        };
+        let mut text = md(&packed);
+        while packed.len() > 1 && !(self.fits)(&text) {
+            packed.pop();
+            text = md(&packed);
+        }
+        let over_budget = total - packed.len();
+        (packed, text, over_budget)
+    }
 }
 
 /// Отсечка слабых карточек `brief`/`notes` (M6 §4.2, `search.brief_min_rel`): балл ниже
@@ -2967,40 +3060,24 @@ pub(crate) async fn search_with(
         + count_tokens(&tail_md)
         + count_tokens(&format!("~{budget} tok"))
         + 1;
-    // упаковка суммами частей — против `budget_cap` (без модели — с запасом оценки), итог — `fits`
-    let room = zam_store::budget_cap(budget).saturating_sub(reserve);
-    let mut packed = pack_items(&items, mode, room, &count_tokens, &by_id);
-    // бюджет срезал карточки (M6.6 §9): строка хвоста об этом — тоже в резерве, упаковка заново
-    // с её ценой (число в строке — не больше всех кандидатов); без усечения отбор прежний
-    if packed.len() < items.len() {
-        let line = count_tokens(&budget_line(items.len(), budget));
-        packed = pack_items(
-            &items,
-            mode,
-            room.saturating_sub(line),
-            &count_tokens,
-            &by_id,
-        );
-    }
-    let tail = |packed: &[Packed]| {
-        format!(
-            "{tail_md}{}",
-            budget_line(items.len() - packed.len(), budget)
-        )
+    // упаковка суммами частей — против `budget_cap` (без модели — с запасом оценки), итог — `fits`;
+    // бюджет срезал карточки (M6.6 §9) — строка хвоста об этом тоже в резерве. Markdown ответа
+    // (он же — размер выдачи для учёта) считается один раз на итог отбора
+    let fits = |md: &str| {
+        let n = count_tokens(md);
+        zam_store::fits_budget(&format!("{md}~{n} tok"), budget)
     };
-    // суммы частей и счёт целого могут разойтись на стыках: с конца снимаются карточки
-    // Markdown ответа (он же — размер выдачи для учёта) считается один раз на итог отбора
-    let mut md_text = md_body(&cache_md, &packed, mode, &by_id, &tail(&packed));
-    while packed.len() > 1 {
-        let n = count_tokens(&md_text);
-        if zam_store::fits_budget(&format!("{md_text}~{n} tok"), budget) {
-            break;
-        }
-        packed.pop();
-        md_text = md_body(&cache_md, &packed, mode, &by_id, &tail(&packed));
+    let (packed, md_text, over_budget) = ReplyPack {
+        mode,
+        budget,
+        room: zam_store::budget_cap(budget).saturating_sub(reserve),
+        cache_md: &cache_md,
+        tail_md: &tail_md,
+        spaces: &by_id,
+        count: &count_tokens,
+        fits: &fits,
     }
-    // не вошли в ответ (M6.6 §9, замечание 11): по бюджету — среди кандидатов после отсечки
-    let over_budget = items.len() - packed.len();
+    .pack(items);
     if let Some(s) = &session {
         // чанки `mode=chunks`, отданные целиком, — выданы сессии (R11: по `chunk_id`)
         let given: Vec<SeenItem> = if mode == SearchMode::Chunks {
@@ -3075,7 +3152,8 @@ pub(crate) async fn search_with(
                 HeaderValue::from_static("text/markdown; charset=utf-8"),
             );
             if let Ok(v) = HeaderValue::from_str(&format!("budget={over_budget}; weak={weak}")) {
-                r.headers_mut().insert(OMITTED_HEADER, v);
+                // числа усечения — клиенту без JSON (`zam search`), M6.6 §9
+                r.headers_mut().insert(zam_core::SEARCH_OMITTED_HEADER, v);
             }
             r
         }
@@ -3116,7 +3194,7 @@ mod tests {
 
     /// Упаковка счётчиком сервера без пространств (карточки — `?/<путь>`).
     fn pk(items: Vec<Item>, mode: SearchMode, budget: usize) -> Vec<Packed> {
-        pack_items(&items, mode, budget, &count_tokens, &HashMap::new())
+        pack_items(items, mode, budget, &count_tokens, &HashMap::new())
     }
 
     fn items(hits: Vec<FtsHit>, with_text: bool) -> Vec<Item> {
@@ -3270,6 +3348,80 @@ mod tests {
         let p = card(att_hit(doc, "x"));
         let j = item_json(&p, SearchMode::Notes, &HashMap::new(), now);
         assert_eq!(j["snippet"], json!(p.item.hit.snippet));
+    }
+
+    /// Ревью задачи 9 M6.6, M1: граница резерва строки хвоста. Счётчик — символы, пространств нет.
+    /// Инвариант: ответ целиком проходит `fits`, K + N — все кандидаты, строка — только при N > 0.
+    #[test]
+    fn reply_pack_tail_line_reserve_edges() {
+        let chars = |s: &str| s.chars().count();
+        let spaces = HashMap::new();
+        let cands = || {
+            let hs = ["альфа", "бета", "гамма", "дельта"]
+                .map(|t| hit(Id::new(), &format!("{t} {}", "слово ".repeat(5))));
+            items(Vec::from(hs), false)
+        };
+        let base = cands();
+        let cost: Vec<usize> = base
+            .iter()
+            .enumerate()
+            .map(|(i, it)| {
+                let p = Packed::whole(it.clone());
+                chars(&item_md(i + 1, &p, SearchMode::Brief, &spaces))
+            })
+            .collect();
+        let tail = "> warning: w\n";
+        let line = |n: usize| budget_line(n, 100);
+        let run = |items: Vec<Item>, room: usize, fits: &dyn Fn(&str) -> bool| {
+            ReplyPack {
+                mode: SearchMode::Brief,
+                budget: 100,
+                room,
+                cache_md: "",
+                tail_md: tail,
+                spaces: &spaces,
+                count: &chars,
+                fits,
+            }
+            .pack(items)
+        };
+        let any = |_: &str| true;
+        let check = |(p, md, n): &(Vec<Packed>, String, usize), k: usize| {
+            assert_eq!((p.len(), *n), (k, 4 - k), "{md}");
+            if *n > 0 {
+                assert!(md.ends_with(&format!("{tail}{}", line(*n))), "{md}");
+            } else {
+                assert!(md.ends_with(tail) && !md.contains("не поместилось"), "{md}");
+            }
+        };
+        let three: usize = cost[..3].iter().sum();
+        assert!(
+            cost.iter().all(|c| *c > chars(&line(4))),
+            "карточка дороже строки: {cost:?}"
+        );
+        // всё целиком — строки нет, отбор прежний
+        check(&run(cands(), cost.iter().sum(), &any), 4);
+        // без строки помещаются три, цена строки снимает ровно одну — две и «2»
+        check(&run(cands(), three, &any), 2);
+        // места ровно на три и строку — три и «1»
+        check(&run(cands(), three + chars(&line(4)), &any), 3);
+        // первый проход вместил всё, а целое не влезло: цикл снял карточку и добавил строку
+        let limit = {
+            let p: Vec<Packed> = cands().into_iter().take(3).map(Packed::whole).collect();
+            chars(&md_body(
+                "",
+                &p,
+                SearchMode::Brief,
+                &spaces,
+                &format!("{tail}{}", line(1)),
+            ))
+        };
+        let strict = |md: &str| chars(md) <= limit;
+        let r = run(cands(), cost.iter().sum(), &strict);
+        check(&r, 3);
+        assert!(strict(&r.1), "{}", r.1);
+        // хотя бы одна карточка остаётся и при «ничего не влезает»
+        check(&run(cands(), 0, &|_: &str| false), 1);
     }
 
     #[test]

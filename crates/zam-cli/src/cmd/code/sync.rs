@@ -44,6 +44,10 @@ pub const BATCH_BYTES_MAX: usize = 8 * 1024 * 1024;
 const ENVELOPE_RESERVE: usize = 4096;
 /// Предохранитель массового удаления действует от этого числа файлов прошлого состояния.
 pub const PRUNE_GUARD_MIN: usize = 20;
+/// Сколько символов строки за пределом сигнатуры (160) ещё маскируется до обрезки ([`mask_sig`],
+/// ревью задачи 9 M6.6, M3): токен секрета короче, а правила `zam_secrets` не идут по
+/// сверхдлинной строке (почти минифицированный код) целиком — дальше обрезки всё равно не уходит.
+const SIG_SCAN_EXTRA: usize = 4096;
 /// Пределы символов и ссылок файла (как умолчания сервера `[code]`).
 const MAX_SYMBOLS: usize = 5000;
 const MAX_REFS: usize = 20_000;
@@ -530,7 +534,8 @@ fn mask_tokens(text: &str) -> String {
 /// (`zam_secrets::mask_text` — неподвижная точка). Итог не длиннее 160 символов и тогда, когда
 /// маска длиннее значения (`password = "abcdef"`): сервер отверг бы такую сигнатуру. Второе
 /// значение — отправляется не то, что ушло бы без маскировки с той же обрезкой: секрет за
-/// пределом обрезки, сама обрезка и снятый оборванный токен маскировкой не считаются.
+/// пределом обрезки, сама обрезка и снятый оборванный токен маскировкой не считаются. Остаток
+/// строки маскируется не дальше [`SIG_SCAN_EXTRA`] символов за пределом сигнатуры.
 fn mask_sig(sig: &str, tail: Option<String>) -> (String, bool) {
     // (без маскировки, с маскировкой до обрезки) — с одной и той же обрезкой
     let (plain, masked) = match sig.strip_suffix('…') {
@@ -538,7 +543,14 @@ fn mask_sig(sig: &str, tail: Option<String>) -> (String, bool) {
         Some(head) => {
             let full = tail
                 .as_deref()
-                .and_then(|l| l.find(head).map(|i| l[i..].to_string()))
+                .and_then(|l| {
+                    l.find(head).map(|i| {
+                        l[i..]
+                            .chars()
+                            .take(zam_code::SIG_MAX_CHARS + SIG_SCAN_EXTRA)
+                            .collect::<String>()
+                    })
+                })
                 .unwrap_or_else(|| {
                     let keep = head.trim_end_matches(token_char).trim_end();
                     format!("{keep}…")
@@ -553,12 +565,25 @@ fn mask_sig(sig: &str, tail: Option<String>) -> (String, bool) {
     (fixed, hit)
 }
 
-/// Сигнатура не длиннее предела сервера: длиннее — первые 159 символов и `…`.
+/// Сигнатура не длиннее предела сервера: длиннее — первые 159 символов и `…`. Разрез внутри маски
+/// `‹secret›` отступает к её началу (обломок маски `‹sec…` читался бы как текст сигнатуры).
 fn cut_sig(s: String) -> String {
     if s.chars().count() <= zam_code::SIG_MAX_CHARS {
         return s;
     }
-    let mut c: String = s.chars().take(zam_code::SIG_MAX_CHARS - 1).collect();
+    let mut keep = zam_code::SIG_MAX_CHARS - 1;
+    let mark_chars = zam_secrets::SECRET_MARK.chars().count();
+    for (b, _) in s.match_indices(zam_secrets::SECRET_MARK) {
+        let start = s[..b].chars().count();
+        if start >= keep {
+            break;
+        }
+        if start + mark_chars > keep {
+            keep = start;
+            break;
+        }
+    }
+    let mut c: String = s.chars().take(keep).collect();
     c.push('…');
     c
 }
@@ -1099,6 +1124,42 @@ mod tests {
             hit && !s.contains("abcdef") && s.chars().count() <= 160,
             "{s}"
         );
+    }
+
+    /// Ревью задачи 9 M6.6, M4: разрез обрезки внутри маски `‹secret›` отступает к её началу;
+    /// маска до разреза остаётся целой.
+    #[test]
+    fn cut_sig_keeps_mask_whole() {
+        // 160 символов, маска длиннее значения: 162 — разрез (159) пришёлся бы внутрь маски
+        let tight = format!("fn f({}, password = \"abcdef\")", "x".repeat(133));
+        let (s, hit) = mask_sig(&tight, None);
+        assert!(hit, "{s}");
+        assert!(s.ends_with("password = \"…"), "{s}");
+        assert!(!s.contains('‹') && !s.contains("abcdef"), "{s}");
+        assert!(s.chars().count() < 160, "{s}");
+        // маска целиком до разреза — на месте, разрез — как обычно (159 и «…»)
+        let long = format!("fn f({}, password = \"abcdef\", y: u32)", "x".repeat(125));
+        assert_eq!(long.chars().count(), 160);
+        let (s, hit) = mask_sig(&long, None);
+        assert!(hit && s.contains("password = \"‹secret›\""), "{s}");
+        assert_eq!(s.chars().count(), 160, "{s}");
+        assert!(s.ends_with('…'), "{s}");
+    }
+
+    /// Ревью задачи 9 M6.6, M3: остаток сверхдлинной строки маскируется не целиком, а окном
+    /// [`SIG_SCAN_EXTRA`] за пределом сигнатуры: итог тот же, что у короткой строки.
+    #[test]
+    fn long_line_tail_scanned_in_window() {
+        let pw = ["hunter", "2-prod-", "q7"].concat();
+        let head = format!("export function f(a, password = \"{pw}\", ");
+        let line = format!("{head}{}) {{", "b, ".repeat(100_000));
+        let short: String = line.chars().take(400).collect();
+        let sig: String = line.chars().take(159).collect::<String>() + "…";
+        let long_r = mask_sig(&sig, Some(line.clone()));
+        assert_eq!(long_r, mask_sig(&sig, Some(short)));
+        let (s, hit) = long_r;
+        assert!(hit && !s.contains(&pw) && s.contains("‹secret›"), "{s}");
+        assert_eq!(s.chars().count(), 160, "{s}");
     }
 
     #[test]
