@@ -350,6 +350,48 @@ fn two_pages(kind: &str, path: &str) -> String {
     .to_string()
 }
 
+/// Ревью задачи 8 (M2): `--all` не зацикливается на неверных курсорах сервера — тот же курсор
+/// (`c1` всегда), цикл `A→B→A` и пустая страница с курсором — код 2 с причиной; запросов
+/// ровно столько, сколько нужно, чтобы увидеть повтор.
+#[test]
+fn journal_list_all_stops_on_cursor_loop() {
+    let r = project("lists-loop");
+    let cases: [(&str, &str, usize); 3] = [
+        ("same", "сервер повторил курсор ленты «c1»", 2),
+        ("aba", "сервер повторил курсор ленты «A»", 3),
+        (
+            "empty",
+            "сервер вернул пустую страницу ленты с курсором «c9»",
+            1,
+        ),
+    ];
+    for (mode, text, requests) in cases {
+        let (url, seen) = common::stub_body(std::sync::Arc::new(
+            move |_: &str, p: &str, _: usize, _: &serde_json::Value| {
+                let (items, next) = match mode {
+                    "same" => (serde_json::json!([{"id": "01A", "status": "open"}]), "c1"),
+                    "empty" => (serde_json::json!([]), "c9"),
+                    // A→B→A: первая страница → A, по A → B, по B → снова A
+                    _ if p.contains("cursor=B") => {
+                        (serde_json::json!([{"id": "01C", "status": "open"}]), "A")
+                    }
+                    _ if p.contains("cursor=A") => {
+                        (serde_json::json!([{"id": "01B", "status": "open"}]), "B")
+                    }
+                    _ => (serde_json::json!([{"id": "01A", "status": "open"}]), "A"),
+                };
+                let body = serde_json::json!({"items": items, "next_cursor": next});
+                (200, body.to_string(), std::time::Duration::ZERO)
+            },
+        ));
+        let o = zam(&url, "t", &r, &["task", "list", "--all"], b"");
+        assert_eq!(o.status.code(), Some(2), "{mode}: {}", err(&o));
+        assert!(err(&o).contains(text), "{mode}: {}", err(&o));
+        assert!(out(&o).is_empty(), "{mode}: {}", out(&o));
+        assert_eq!(seen.lock().unwrap().len(), requests, "{mode}");
+    }
+}
+
 /// M6.6 §9 (16г): ленты `zam task|question|idea list` — общий обход `list_entries`: `--all`
 /// идёт по `next_cursor` страницами по 200 до конца; без `--all` при `next_cursor` — строка
 /// stderr «показано N, есть ещё: --limit 200 или --all»; `--limit N` уходит серверу;

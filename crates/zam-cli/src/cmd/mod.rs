@@ -82,7 +82,8 @@ fn more_hint(n: usize) -> String {
 /// странице (`None` — умолчание сервера, 50); `all` — страницы по [`LIST_LIMIT_MAX`] по
 /// `next_cursor` до конца. Записи ещё есть, а `all` нет — строка [`more_hint`] в stderr (и с
 /// `--json`): лента больше не обрезается молча. Ответ — как у сервера, `{items, next_cursor}`;
-/// у `all` — все записи и `next_cursor: null`.
+/// у `all` — все записи и `next_cursor: null`. Обход `all` не зацикливается: курсор, который уже
+/// был (`A→A`, `A→B→A`), и пустая страница с курсором — код 2 ([`cursor_loop`]).
 pub fn list_entries(
     ctx: &Ctx,
     space: &str,
@@ -94,6 +95,7 @@ pub fn list_entries(
     let page = if all { Some(LIST_LIMIT_MAX) } else { limit }.map(|l| l.to_string());
     let mut items: Vec<Value> = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let mut v = {
             let mut q = query.to_vec();
@@ -105,18 +107,22 @@ pub fn list_entries(
             }
             read_json(ctx.client.get(&path, &q)?)?
         };
-        if let Some(a) = v["items"].as_array_mut() {
-            items.append(a);
-        }
-        match v["next_cursor"].as_str().map(str::to_string) {
-            // сервер вернул тот же курсор — обход не закончится
-            Some(c) if all && cursor.as_deref() == Some(c.as_str()) => {
-                return Err(CliError::new(
-                    EXIT_UNREACHABLE,
-                    format!("сервер повторил курсор ленты «{c}»"),
-                ));
+        let got = match v["items"].as_array_mut() {
+            Some(a) => {
+                let n = a.len();
+                items.append(a);
+                n
             }
-            Some(c) if all => cursor = Some(c),
+            None => 0,
+        };
+        match v["next_cursor"].as_str().map(str::to_string) {
+            Some(c) if all => {
+                if let Some(e) = cursor_loop(&seen, &c, got) {
+                    return Err(e);
+                }
+                seen.insert(c.clone());
+                cursor = Some(c);
+            }
             next => {
                 if next.is_some() {
                     eprintln!("{}", more_hint(items.len()));
@@ -126,6 +132,29 @@ pub fn list_entries(
                 return Ok(v);
             }
         }
+    }
+}
+
+/// Обход `--all` зациклился бы: следующий курсор `next` уже был (`seen`) или страница из `got`
+/// записей пуста, а курсор есть (у keyset-ленты сервера так не бывает) — ошибка с кодом 2, как
+/// у прочих неверных ответов сервера.
+fn cursor_loop(
+    seen: &std::collections::HashSet<String>,
+    next: &str,
+    got: usize,
+) -> Option<CliError> {
+    if seen.contains(next) {
+        Some(CliError::new(
+            EXIT_UNREACHABLE,
+            format!("сервер повторил курсор ленты «{next}»"),
+        ))
+    } else if got == 0 {
+        Some(CliError::new(
+            EXIT_UNREACHABLE,
+            format!("сервер вернул пустую страницу ленты с курсором «{next}»"),
+        ))
+    } else {
+        None
     }
 }
 
@@ -429,5 +458,27 @@ mod tests {
             "показано 199, есть ещё: --limit 200 или --all"
         );
         assert_eq!(more_hint(200), "показано 200, есть ещё: --all");
+    }
+
+    /// Ревью задачи 8, M2: обход `--all` останавливается на любом уже виденном курсоре и на
+    /// пустой странице с курсором — код 2.
+    #[test]
+    fn cursor_loop_detected() {
+        let seen: std::collections::HashSet<String> =
+            ["A".to_string(), "B".to_string()].into_iter().collect();
+        assert!(cursor_loop(&seen, "C", 1).is_none());
+        let e = cursor_loop(&seen, "A", 1).expect("A уже был");
+        assert_eq!(
+            (e.code, e.msg.as_str()),
+            (EXIT_UNREACHABLE, "сервер повторил курсор ленты «A»")
+        );
+        let e = cursor_loop(&seen, "C", 0).expect("пустая страница с курсором");
+        assert_eq!(
+            (e.code, e.msg.as_str()),
+            (
+                EXIT_UNREACHABLE,
+                "сервер вернул пустую страницу ленты с курсором «C»"
+            )
+        );
     }
 }

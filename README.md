@@ -591,8 +591,11 @@ zam read "knowledge:Инструменты/Bash" --section "Установка >
 M5.5, `zam code` — с M5.6, `zam idea` — с M5.7, `zam export`, `import`, `sessions tokens|snapshot`
 (`zam session …` — то же) и `zam read --focus|--range` — с M6, `zam idea review|queue` — с M6.5,
 `zam vault rm|rename|mv` — с M6.6 (`mv` — сервер `0.0.13-m6.6` и новее), флаги решения и
-доказательства `zam log insight`, поля `zam task new` и `--all` лент — с M6.6 (сервер
-`0.0.6-m4.5` и новее; `--priority` задачи — `0.0.12-m6.5` и новее); см.
+доказательства `zam log insight`, поля `zam task new` и `--all` лент — с M6.6. Нужный сервер:
+`--evidence-checked|method|result` (`data.evidence`) и `--all`/`--limit` (курсор `next_cursor`,
+страница до 200) — `0.0.4-m3` и новее (лента задач и вопросов — с `0.0.6-m4.5`, идей — с
+`0.0.10-m5.7`); поля решения (`data.decision`) и `--owner`, `--estimate`, `--link` задачи —
+`0.0.6-m4.5`; `--priority` задачи — `0.0.12-m6.5`; см.
 [deploy/README-install.md](deploy/README-install.md). Хуки
 (`zam hook …`) всегда выходят с кодом 0.
 
