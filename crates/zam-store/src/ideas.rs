@@ -133,6 +133,10 @@ pub enum IdeaPriority {
 }
 
 impl IdeaPriority {
+    /// Все значения (для SQL по [`IdeaPriority::rank`], M6.6 §4.2).
+    pub const ALL: [IdeaPriority; 3] =
+        [IdeaPriority::Low, IdeaPriority::Normal, IdeaPriority::High];
+
     pub fn as_str(self) -> &'static str {
         match self {
             IdeaPriority::Low => "low",

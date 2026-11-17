@@ -923,6 +923,35 @@ fn personal_space(targets: &[SearchTarget], kind: SpaceKind) -> Option<(usize, I
     })
 }
 
+/// Обход баз области (ревью задачи 3, M6): живые цели (`health.alive`) с непустым списком
+/// пространств `spaces_of(i, цель)` — `(i, база, пространства)` по порядку целей. Живость
+/// берётся на момент вызова: шаг обхода (`health.soft`) исключает только свою цель, так что
+/// это то же, что проверка на каждом шаге.
+fn live_targets(
+    health: &Health<'_>,
+    spaces_of: impl Fn(usize, &SearchTarget) -> Vec<Id>,
+) -> Vec<(usize, zam_store::Db, Vec<Id>)> {
+    health
+        .targets()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| health.alive[*i])
+        .filter_map(|(i, t)| {
+            let ids = spaces_of(i, t);
+            (!ids.is_empty()).then(|| (i, t.db.clone(), ids))
+        })
+        .collect()
+}
+
+/// Пространства цели `i` из списка `(цель, пространство)`.
+fn spaces_of(spaces: &[(usize, Id)], i: usize) -> Vec<Id> {
+    spaces
+        .iter()
+        .filter(|(t, _)| *t == i)
+        .map(|(_, s)| *s)
+        .collect()
+}
+
 /// Записи журнала пространств `spaces` по фильтру `f` (без пространства) — новые первыми.
 async fn entries_of(
     health: &mut Health<'_>,
@@ -1004,6 +1033,12 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// Текст агенту без секретов и до `max` символов: маска — до обрезки (ревью задачи 3, M4),
+/// иначе ключ, разрезанный границей, маска не узнала бы и его начало ушло бы в выдачу.
+fn masked_clip(s: &str, max: usize) -> String {
+    clip(&zam_markdown::mask_text(s), max)
+}
+
 /// Строка задачи дайджеста: `ZeroAIMemory: [<статус>] <заголовок> — далее: <next_step> —
 /// k:<id>`, у `blocked` после ссылки — ` — блокер: <blocked_by>`. `next_step` и `blocked_by` —
 /// свободный текст до 1000 символов (туда попадают команды с ключами): секреты маскируются, как
@@ -1018,14 +1053,14 @@ fn task_block(e: &Entry, claim: Option<&str>) -> String {
     };
     let mut s = format!("ZeroAIMemory: [{status}] {}", one_line(&e.title));
     if let Some(n) = &t.next_step {
-        let n = clip(&zam_markdown::mask_text(n), TASK_LINE_TEXT_CHARS);
+        let n = masked_clip(n, TASK_LINE_TEXT_CHARS);
         s.push_str(&format!(" — далее: {n}"));
     }
     s.push_str(&format!(" — {}", entry_ref(e)));
     if e.status == Some(EntryStatus::Blocked)
         && let Some(b) = &t.blocked_by
     {
-        let b = clip(&zam_markdown::mask_text(b), TASK_LINE_TEXT_CHARS);
+        let b = masked_clip(b, TASK_LINE_TEXT_CHARS);
         s.push_str(&format!(" — блокер: {b}"));
     }
     s
@@ -1095,8 +1130,8 @@ async fn task_cands(
 
 /// Строка ответа на вопрос: `ZeroAIMemory: ответ на «<вопрос>»: <ответ> — q:<id> → i:<решение>`.
 fn answer_block(e: &Entry, qd: &zam_store::QuestionData, a: &zam_store::Answer) -> String {
-    let q = zam_markdown::mask_text(&clip(&e.title, TASK_LINE_TEXT_CHARS));
-    let ans = zam_markdown::mask_text(&clip(&a.brief(&qd.options), TASK_LINE_TEXT_CHARS));
+    let q = masked_clip(&e.title, TASK_LINE_TEXT_CHARS);
+    let ans = masked_clip(&a.brief(&qd.options), TASK_LINE_TEXT_CHARS);
     format!(
         "ZeroAIMemory: ответ на «{q}»: {ans} — {} → i:{}",
         entry_ref(e),
@@ -1118,16 +1153,7 @@ async fn question_cands(
     let mut answered: Vec<(usize, Entry, zam_store::Answer)> = Vec::new();
     // заголовки открытых вопросов всех баз с временем создания: берутся новейшие по общей сортировке
     let (mut open_n, mut titles) = (0usize, Vec::<(jiff::Timestamp, String)>::new());
-    for i in 0..health.targets().len() {
-        let ids: Vec<Id> = spaces
-            .iter()
-            .filter(|(t, _)| *t == i)
-            .map(|(_, s)| *s)
-            .collect();
-        if ids.is_empty() || !health.alive[i] {
-            continue;
-        }
-        let db = health.targets()[i].db.clone();
+    for (i, db, ids) in live_targets(health, |i, _| spaces_of(spaces, i)) {
         let Some(r) = deadline
             .step(zam_store::recent_answered(&db, &ids, since, ENTRY_FETCH))
             .await
@@ -1167,12 +1193,7 @@ async fn question_cands(
         let list: Vec<String> = titles
             .iter()
             .take(OPEN_QUESTIONS_TITLES)
-            .map(|(_, t)| {
-                format!(
-                    "«{}»",
-                    zam_markdown::mask_text(&clip(t, TASK_LINE_TEXT_CHARS))
-                )
-            })
+            .map(|(_, t)| format!("«{}»", masked_clip(t, TASK_LINE_TEXT_CHARS)))
             .collect();
         format!("{open_n} открытых: {}", list.join(", "))
     });
@@ -1191,16 +1212,7 @@ async fn open_tasks_line(
 ) -> Result<Option<String>, ApiError> {
     // число и заголовки всех баз: заголовки сливаются по общему ключу порядка
     let (mut n, mut tasks) = (0usize, Vec::<zam_store::OpenTask>::new());
-    for i in 0..health.targets().len() {
-        let ids: Vec<Id> = spaces
-            .iter()
-            .filter(|(t, _)| *t == i)
-            .map(|(_, s)| *s)
-            .collect();
-        if ids.is_empty() || !health.alive[i] {
-            continue;
-        }
-        let db = health.targets()[i].db.clone();
+    for (i, db, ids) in live_targets(health, |i, _| spaces_of(spaces, i)) {
         let Some(r) = deadline
             .step(zam_store::open_tasks(&db, &ids, OPEN_TASKS_TITLES))
             .await
@@ -1221,21 +1233,16 @@ async fn open_tasks_line(
     Ok((n > 0).then(|| open_tasks_text(n, &titles)))
 }
 
-/// Текст строки открытых задач: `Открыто задач: N — «…», «…», «…»`; заголовок — без секретов
-/// (маска до обрезки: обрезанный секрет маска не узнала бы) и до [`OPEN_TASK_TITLE_CHARS`]
-/// символов. Заголовков нет (все открытые захвачены) — `Открыто задач: N`.
+/// Текст строки открытых задач: `Открыто задач: N — «…», «…», «…»`; заголовок — без секретов и
+/// до [`OPEN_TASK_TITLE_CHARS`] символов ([`masked_clip`]). Заголовков нет (все открытые
+/// захвачены) — `Открыто задач: N`.
 fn open_tasks_text(n: usize, titles: &[&str]) -> String {
     if titles.is_empty() {
         return format!("Открыто задач: {n}");
     }
     let list: Vec<String> = titles
         .iter()
-        .map(|t| {
-            format!(
-                "«{}»",
-                clip(&zam_markdown::mask_text(t), OPEN_TASK_TITLE_CHARS)
-            )
-        })
+        .map(|t| format!("«{}»", masked_clip(t, OPEN_TASK_TITLE_CHARS)))
         .collect();
     format!("Открыто задач: {n} — {}", list.join(", "))
 }
@@ -1254,7 +1261,7 @@ fn environment_block(m: &zam_store::VaultMeta) -> String {
         m.data
             .get(k)
             .and_then(Value::as_str)
-            .map(|v| zam_markdown::mask_text(&clip(v, TASK_LINE_TEXT_CHARS)))
+            .map(|v| masked_clip(v, TASK_LINE_TEXT_CHARS))
             .map(|v| environment_part(&v).to_string())
             .filter(|v| !v.is_empty())
     };
@@ -2009,17 +2016,7 @@ async fn file_cands(
     if paths.is_empty() {
         return out;
     }
-    for i in 0..health.targets().len() {
-        if !health.alive[i] {
-            continue;
-        }
-        let (db, spaces) = {
-            let t = &health.targets()[i];
-            (t.db.clone(), entry_spaces(t))
-        };
-        if spaces.is_empty() {
-            continue;
-        }
+    for (i, db, spaces) in live_targets(health, |_, t| entry_spaces(t)) {
         let Some(r) = deadline
             .step(zam_store::file_refs::refs_index(
                 &db,
@@ -2618,17 +2615,7 @@ async fn glossary_line(
     deadline: &mut Deadline,
 ) -> Option<String> {
     let mut n = 0;
-    for i in 0..health.targets().len() {
-        if !health.alive[i] {
-            continue;
-        }
-        let (db, spaces) = {
-            let t = &health.targets()[i];
-            (t.db.clone(), entry_spaces(t))
-        };
-        if spaces.is_empty() {
-            continue;
-        }
+    for (_, db, spaces) in live_targets(health, |_, t| entry_spaces(t)) {
         match deadline.step(st.glossary.index(&db)).await? {
             Ok(idx) => n += idx.count_in(&spaces),
             Err(e) => tracing::warn!(error = %e, "recall: словарь не прочитан"),
@@ -2654,17 +2641,7 @@ async fn term_cands(
     if prompt.trim().is_empty() {
         return out;
     }
-    for i in 0..health.targets().len() {
-        if !health.alive[i] {
-            continue;
-        }
-        let (db, spaces) = {
-            let t = &health.targets()[i];
-            (t.db.clone(), entry_spaces(t))
-        };
-        if spaces.is_empty() {
-            continue;
-        }
+    for (i, db, spaces) in live_targets(health, |_, t| entry_spaces(t)) {
         let Some(r) = deadline.step(st.glossary.index(&db)).await else {
             break;
         };
@@ -3082,9 +3059,9 @@ fn section_limit(
 /// строка-указание — в заголовке [`ideas_section_head`]: она выводится, только если вошла хоть
 /// одна идея; есть идея очереди разбора — раздел [`SECTION_IDEAS_REVIEW`] со строкой
 /// [`IDEAS_REVIEW_HINT`], M6.5 §7), строки словаря, проверенных команд и карты кода и мини-карта
-/// [`SECTION_CODE_MAP`] — после правил. Строка открытых задач — сразу за задачами, под их
-/// заголовком (задач раздела нет — со своим заголовком [`SECTION_TASKS`], M6.6 §4.2), за ней —
-/// строка плана из идей. Раздел пакета
+/// [`SECTION_CODE_MAP`] — после правил. Строка открытых задач — сразу за задачами, с тем же
+/// заголовком [`SECTION_TASKS`]: упаковка его не повторяет, а если строки задач не вошли или их
+/// нет, заголовок выводится у неё (M6.6 §4.2); за ней — строка плана из идей. Раздел пакета
 /// `idea_review` — со строкой шагов разбора [`IDEA_REVIEW_STEPS`] в заголовке.
 /// `rules_reserved` — раздел Rules — резерв сверх бюджета (дайджест и пакет восстановления,
 /// M6 §8; у `brief` — L0 Rules в бюджете).
@@ -3148,19 +3125,15 @@ fn arrange<'c>(
         if title == Some(SECTION_RULES) && rules_hidden > 0 {
             sec.blocks.push(rules_hidden_line(rules_hidden));
         }
-        let no_blocks = cands.is_empty();
         out.packed.push(sec);
         out.picked.push(cands);
         if title == Some(SECTION_TASKS)
             && let Some(l) = &open_tasks
         {
-            // строка раздела задач: без строк задач — под своим заголовком, раздел появляется и
-            // без захваченных задач; снимается раньше обязательных строк (M6.6 §4.2)
-            out.line(
-                no_blocks.then_some(SECTION_TASKS),
-                vec![l.clone()],
-                KEEP_POINTERS,
-            );
+            // строка раздела задач — всегда с его заголовком: вошли строки задач — заголовок не
+            // повторяется (`pack_sections` продолжает раздел), не вошли или их нет — он у строки
+            // (ревью задачи 3, M2); снимается раньше обязательных строк (M6.6 §4.2)
+            out.line(Some(SECTION_TASKS), vec![l.clone()], KEEP_POINTERS);
             out.omit_last(OMIT_OPEN_TASKS);
         }
         if title == Some(SECTION_TASKS)
@@ -3975,15 +3948,16 @@ mod tests {
         assert_eq!(OPEN_TASKS_TITLES, 3);
     }
 
-    /// M6.6 §4.2: строка открытых задач — сразу за задачами (до строки плана), под их
-    /// заголовком; раздел без задач — строка со своим заголовком `### Задачи`; стойкость
-    /// указателя (снимается раньше обязательных строк), адрес снятой — `kinds=[task]`; в пакете
-    /// восстановления — так же.
+    /// M6.6 §4.2: строка открытых задач — сразу за задачами (до строки плана), всегда с
+    /// заголовком `### Задачи` (ревью задачи 3, M2): вошли строки задач — заголовок один, над
+    /// ними; не вошли или их нет — заголовок у строки. Стойкость указателя (снимается раньше
+    /// обязательных строк), адрес снятой — `kinds=[task]`; в пакете восстановления — так же.
     #[test]
     fn open_tasks_line_under_tasks_heading() {
         let t = cand("задача");
         let own = |o: Omit| Some((o.0.to_string(), o.1.to_string()));
         let open = "Открыто задач: 2 — «а»";
+        let words = |s: &str| s.split_whitespace().count();
         for recovery in [false, true] {
             let chosen = vec![
                 (Some(SECTION_TASKS), vec![&t]),
@@ -3997,11 +3971,31 @@ mod tests {
             let (packed, picked) = arrange(recovery, true, lines, Vec::new(), chosen);
             let k = packed.iter().position(|s| s.blocks == [open]).unwrap();
             assert_eq!(packed[k - 1].title.as_deref(), Some(SECTION_TASKS));
-            assert_eq!(packed[k].title, None, "{recovery}");
+            assert_eq!(
+                packed[k].title.as_deref(),
+                Some(SECTION_TASKS),
+                "{recovery}"
+            );
             assert!(packed[k].keep == KEEP_POINTERS && packed[k].keep < KEEP_MANDATORY);
             assert_eq!(packed[k].omit, own(OMIT_OPEN_TASKS));
             assert!(picked[k].is_empty());
             assert_eq!(packed[k + 1].blocks, ["План"]);
+            // строка задачи вошла — заголовок один, строка открытых задач продолжает раздел
+            let (text, _) = pack_sections(&packed, 10_000, &words, &|_| true);
+            assert_eq!(
+                text,
+                format!("{SECTION_TASKS}\nZeroAIMemory: задача\n{open}\nПлан\n"),
+                "{recovery}"
+            );
+            // строка задачи не вошла в бюджет, строка открытых задач вошла — заголовок у неё
+            let mut big = packed.clone();
+            big[k - 1].blocks = vec!["задача ".repeat(50)];
+            let (text, _) = pack_sections(&big, 10, &words, &|_| true);
+            assert_eq!(
+                text,
+                format!("{SECTION_TASKS}\n{open}\nПлан\n"),
+                "{recovery}"
+            );
         }
         let chosen = vec![(Some(SECTION_TASKS), Vec::new())];
         let lines = Lines {
@@ -4013,6 +4007,25 @@ mod tests {
         assert_eq!(packed[k].title.as_deref(), Some(SECTION_TASKS));
         let (text, _) = pack_sections(&packed, 10_000, &count_tokens, &|_| true);
         assert_eq!(text, format!("{SECTION_TASKS}\n{open}\n"));
+    }
+
+    /// Ревью задачи 3, M4: маска — до обрезки. Ключ, который обрезка разрезала бы на границе,
+    /// маска уже не узнала бы, и его начало ушло бы в дайджест; с маской сначала — только метка.
+    #[test]
+    fn masked_clip_hides_key_cut_at_boundary() {
+        // фиктивный ключ AWS — склейкой во время выполнения
+        let key = format!("{}{}", "AK", "IAABCDEFGHIJKLMNOP");
+        let s = format!("{} {key}", "з".repeat(185));
+        // прежний порядок «обрезка, затем маска» оставлял начало ключа
+        let old = zam_markdown::mask_text(&clip(&s, TASK_LINE_TEXT_CHARS));
+        assert!(old.contains(&key[..8]), "{old}");
+        let out = masked_clip(&s, TASK_LINE_TEXT_CHARS);
+        assert!(!out.contains(&key[..4]), "{out}");
+        assert!(out.contains(zam_markdown::SECRET_MARK), "{out}");
+        assert!(out.chars().count() <= TASK_LINE_TEXT_CHARS, "{out}");
+        // без секрета — та же обрезка, что у `clip`
+        let plain = "слово ".repeat(60);
+        assert_eq!(masked_clip(&plain, 80), clip(&plain, 80));
     }
 
     /// Повторное ревью 8a, I-b: вторая фраза L0 не теряется молча — первая кончается «…».

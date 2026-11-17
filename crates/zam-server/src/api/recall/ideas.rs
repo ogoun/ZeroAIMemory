@@ -21,9 +21,9 @@ use zam_store::{
 };
 
 use super::{
-    Cand, Deadline, Lines, OMIT_IDEAS_REVIEW, PROMPT_SEARCH_BUDGET, RecallReq, clip, entry_cand,
-    entry_filter, entry_ref, entry_spaces, inner_search, personal_space, prompt_min_score,
-    seen_key, shown, solution_space,
+    Cand, Deadline, Lines, OMIT_IDEAS_REVIEW, PROMPT_SEARCH_BUDGET, RecallReq, entry_cand,
+    entry_filter, entry_ref, entry_spaces, inner_search, masked_clip, personal_space,
+    prompt_min_score, seen_key, shown, solution_space,
 };
 use crate::api::search::targets::SearchTarget;
 use crate::api::search::{Health, LightSearch};
@@ -158,7 +158,7 @@ pub static TEST_IDEA_LIGHT_OFF: std::sync::atomic::AtomicBool =
 
 /// Заголовок идеи в строке: до [`IDEA_TITLE_CHARS`] символов, секреты маскируются.
 fn idea_title(e: &Entry) -> String {
-    zam_markdown::mask_text(&clip(&e.title, IDEA_TITLE_CHARS))
+    masked_clip(&e.title, IDEA_TITLE_CHARS)
 }
 
 /// Пометка строки идеи `accepted` со снятой или удалённой задачей (§16, п. 1): `task` —
@@ -586,7 +586,7 @@ fn first_line(s: &str) -> &str {
 /// Строка текста человека или агента в пакете: первая строка, до `max` символов, секреты
 /// маскируются.
 fn pack_text(s: &str, max: usize) -> String {
-    zam_markdown::mask_text(&clip(first_line(s), max))
+    masked_clip(first_line(s), max)
 }
 
 /// Дата UTC времени `t` (`YYYY-MM-DD`).
@@ -740,15 +740,9 @@ async fn review_similar(
         let line = match entry {
             Some(_) => format!(
                 "«{}»",
-                zam_markdown::mask_text(&clip(
-                    it["title"].as_str().unwrap_or_default(),
-                    IDEA_TITLE_CHARS
-                ))
+                masked_clip(it["title"].as_str().unwrap_or_default(), IDEA_TITLE_CHARS)
             ),
-            None => zam_markdown::mask_text(&clip(
-                it["path"].as_str().unwrap_or_default(),
-                IDEA_TITLE_CHARS,
-            )),
+            None => masked_clip(it["path"].as_str().unwrap_or_default(), IDEA_TITLE_CHARS),
         };
         parts.push(line);
         let mut s = parts.join(" · ");

@@ -604,7 +604,9 @@ pub fn hint_line(lead: &str, title: &str, tags: &[&str], reference: &str) -> Str
 }
 
 /// Раздел дайджеста: заголовок (строка `### …`, ставится, только если в раздел вошёл хоть
-/// один блок) и блоки — по одному на подсказку (строка и, возможно, строки с отступом).
+/// один блок, и не повторяется, если раздел предыдущего выведенного блока — с тем же
+/// заголовком: такой раздел продолжает его, M6.6 §4.2) и блоки — по одному на подсказку
+/// (строка и, возможно, строки с отступом).
 /// `reserved` — раздел-резерв (Rules дайджеста и пакета восстановления, M6 §8): выводится
 /// целиком сверх бюджета и в бюджете не считается.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -672,17 +674,25 @@ pub fn pack_sections(
 ) -> (String, Vec<(usize, usize)>) {
     let mut used = 0usize;
     let mut budgeted: Vec<(usize, usize)> = Vec::new();
-    for (si, sec) in sections.iter().enumerate().filter(|(_, s)| !s.reserved) {
-        let mut opened = false;
+    // раздел последнего выведенного блока (резерв выводится всегда): заголовок, совпавший с его
+    // заголовком, не выводится и не оплачивается — как в [`render`]
+    let mut last: Option<usize> = None;
+    for (si, sec) in sections.iter().enumerate() {
+        if sec.reserved {
+            if !sec.blocks.is_empty() {
+                last = Some(si);
+            }
+            continue;
+        }
         for (bi, block) in sec.blocks.iter().enumerate() {
-            let head = match (&sec.title, opened) {
-                (Some(t), false) => count(&format!("\n{t}\n")),
+            let head = match &sec.title {
+                Some(t) if !continues(sections, last, si) => count(&format!("\n{t}\n")),
                 _ => 0,
             };
             let cost = head + count(&format!("{block}\n"));
             if used + cost <= cap {
                 used += cost;
-                opened = true;
+                last = Some(si);
                 budgeted.push((si, bi));
             }
         }
@@ -771,13 +781,21 @@ pub fn reserved_text(sections: &[Section]) -> String {
     render(sections, &taken)
 }
 
+/// Блок раздела `si` идёт сразу за блоком раздела `last` и продолжает его: тот же раздел или
+/// раздел с тем же заголовком — заголовок `si` не выводится.
+fn continues(sections: &[Section], last: Option<usize>, si: usize) -> bool {
+    last.is_some_and(|l| l == si || sections[l].title == sections[si].title)
+}
+
 /// Текст вошедших блоков (см. [`pack_sections`]).
 fn render(sections: &[Section], taken: &[(usize, usize)]) -> String {
     let mut out = String::new();
     let mut last: Option<usize> = None;
     for &(si, bi) in taken {
         if last != Some(si) {
-            if let Some(t) = &sections[si].title {
+            if let Some(t) = &sections[si].title
+                && !continues(sections, last, si)
+            {
                 if !out.is_empty() {
                     out.push('\n');
                 }
@@ -1085,6 +1103,38 @@ mod tests {
         let (text, taken) = pack_sections(&secs, 0, &words, &|_| true);
         assert_eq!(taken, [(1, 0), (1, 1)]);
         assert_eq!(text, "### R\nr1 r1 r1\nr2 r2\n");
+    }
+
+    /// M6.6 §4.2 (ревью задачи 3, M2): раздел с тем же заголовком, что у раздела предыдущего
+    /// выведенного блока, заголовок не повторяет и в бюджете его не оплачивает (продолжение
+    /// раздела); предыдущий не вывелся — заголовок у него свой; между ними другой раздел —
+    /// заголовок повторяется.
+    #[test]
+    fn pack_sections_same_title_continues_section() {
+        let words = |s: &str| s.split_whitespace().count();
+        let secs = vec![
+            Section::new(Some("### T".into()), vec!["t1 t1".into()]),
+            Section::new(Some("### T".into()), vec!["o1".into()]),
+            Section::new(None, vec!["p1".into()]),
+        ];
+        // «### T t1 t1» (4) + «o1» (1) + «p1» (1): заголовок второго раздела не оплачивается
+        let (text, taken) = pack_sections(&secs, 6, &words, &|_| true);
+        assert_eq!(taken, [(0, 0), (1, 0), (2, 0)]);
+        assert_eq!(text, "### T\nt1 t1\no1\np1\n");
+        // первый раздел не вошёл в бюджет — заголовок у второго
+        let mut big = secs.clone();
+        big[0].blocks = vec!["big ".repeat(50)];
+        let (text, taken) = pack_sections(&big, 6, &words, &|_| true);
+        assert_eq!(taken, [(1, 0), (2, 0)]);
+        assert_eq!(text, "### T\no1\np1\n");
+        // между ними другой выведенный раздел — заголовок повторяется
+        let secs3 = vec![
+            secs[0].clone(),
+            Section::new(Some("### U".into()), vec!["u1".into()]),
+            secs[1].clone(),
+        ];
+        let (text, _) = pack_sections(&secs3, 20, &words, &|_| true);
+        assert_eq!(text, "### T\nt1 t1\n\n### U\nu1\n\n### T\no1\n");
     }
 
     /// M6.6 §3.1 (замечание 17): реплики согласия и служебные слова — не предмет запроса;

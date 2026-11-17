@@ -2760,6 +2760,69 @@ async fn digest_open_tasks_line() {
     assert!(!text.contains("Открыто задач"), "{text}");
 }
 
+/// Ревью задачи 3, M2: строка захваченной задачи не вошла в маленький `budget_tokens`, а строка
+/// открытых задач вошла — она выходит под заголовком `### Задачи`, а не под чужим разделом; с
+/// обычным бюджетом заголовок один над обеими строками.
+#[tokio::test]
+async fn digest_open_tasks_line_keeps_heading_under_budget() {
+    let a = server("open-tasks-budget").await;
+    let long = "Длинная захваченная задача с подробным заголовком ".repeat(6);
+    let long = long.trim_end();
+    let claimed = entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "task", "title": long, "data": {"next_step": "шаг ".repeat(40)}}),
+    )
+    .await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{claimed}/claim"),
+            Some(json!({})),
+            &[("x-zam-session", "ob-1")],
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "task", "title": "Короткая"}),
+    )
+    .await;
+    let line = "Открыто задач: 2 — «Короткая»";
+    // наименьший бюджет, в который входит строка открытых задач с заголовком (и запас на
+    // расхождение суммы частей с целым); строка захваченной задачи — в разы длиннее
+    let cost =
+        zam_store::count_tokens("\n### Задачи\n") + zam_store::count_tokens(&format!("{line}\n"));
+    let budget = (1..400)
+        .find(|&b| zam_store::budget_cap(b) >= cost + 3)
+        .unwrap();
+    assert!(zam_store::count_tokens(long) > zam_store::budget_cap(budget));
+    let body = json!({"event": "session_start", "budget_tokens": budget});
+    let j = ok(&a, &a.token, Some("ob-1"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(!text.contains(long), "строка задачи вошла: {text}");
+    assert_eq!(section(text, "### Задачи"), [line], "{text}");
+    assert_eq!(text.matches("### Задачи").count(), 1, "{text}");
+    // обычный бюджет: обе строки под одним заголовком
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ob-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let lines = section(text, "### Задачи");
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].contains("захвачена этой сессией"), "{text}");
+    assert_eq!(lines[1], line, "{text}");
+    assert_eq!(text.matches("### Задачи").count(), 1, "{text}");
+}
+
 // ---- ревью задачи 8a (C1, I1, I3, M1, M3): предел вывода канала, приоритет правил ----
 
 /// Пределы каналов агентов (`zam-cli` `hook::output`): Claude Code — символы, Codex — байты.

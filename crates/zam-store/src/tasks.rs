@@ -16,6 +16,8 @@
 //! - [`open_tasks`] — число открытых задач и заголовки незахваченных для строки дайджеста
 //!   «Открыто задач: N — …» (M6.6 §4.2).
 
+use std::cmp::Reverse;
+
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::{params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -474,17 +476,24 @@ pub struct OpenTask {
 }
 
 impl OpenTask {
-    /// Ключ порядка [`open_tasks`] — для слияния заголовков нескольких баз: `priority` (`high` →
-    /// `normal` → `low` → нет), затем новые первыми.
-    pub fn order_key(&self) -> (u8, std::cmp::Reverse<(Timestamp, Id)>) {
-        let p = match self.priority {
-            Some(IdeaPriority::High) => 0,
-            Some(IdeaPriority::Normal) => 1,
-            Some(IdeaPriority::Low) => 2,
-            None => 3,
-        };
-        (p, std::cmp::Reverse((self.created_at, self.id)))
+    /// Ключ порядка [`open_tasks`] — для слияния заголовков нескольких баз, по возрастанию:
+    /// `priority` по [`IdeaPriority::rank`] (`high` → `normal` → `low`; без приоритета —
+    /// последней: `None` меньше любого ранга), затем новые первыми. Тот же ранг — в SQL
+    /// `open_tasks` (`priority_rank_sql`), равенство порядков проверяет тест хранилища.
+    pub fn order_key(&self) -> Reverse<(Option<u8>, Timestamp, Id)> {
+        let rank = self.priority.map(IdeaPriority::rank);
+        Reverse((rank, self.created_at, self.id))
     }
+}
+
+/// Ранг `data.priority` в SQL — те же числа, что [`IdeaPriority::rank`]; без приоритета —
+/// `NULL` (в `ORDER BY … DESC` — последним, как `None` в [`OpenTask::order_key`]).
+fn priority_rank_sql() -> String {
+    let arms: String = IdeaPriority::ALL
+        .iter()
+        .map(|p| format!("WHEN '{}' THEN {} ", p.as_str(), p.rank()))
+        .collect();
+    format!("CASE json_extract(data, '$.priority') {arms}END")
 }
 
 /// Отбор [`open_tasks`]: живые задачи `open` пространств `?1..?n`.
@@ -523,11 +532,10 @@ pub async fn open_tasks(
         let mut st = c.prepare(&format!(
             "SELECT id, title, data, created_at {from}
                AND NOT ifnull(json_extract(data, '$.claimed_by.until') > ?{}, 0)
-             ORDER BY CASE json_extract(data, '$.priority')
-                          WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 ELSE 3 END,
-                      created_at DESC, id DESC
+             ORDER BY {} DESC, created_at DESC, id DESC
              LIMIT {titles}",
-            n + 1
+            n + 1,
+            priority_rank_sql()
         ))?;
         let rows = st
             .query_map(params_from_iter(args), |r| {

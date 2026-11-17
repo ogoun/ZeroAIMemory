@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::{
     Attribution, AuthorKind, DataDir, Db, EntryKind, EntryPatch, EntryStatus, IdeaPriority,
-    NewEntry, SpaceKind, claim_task, create_entry, create_solution, delete_entry, list_spaces,
-    open_tasks, update_entry,
+    NewEntry, OpenTask, SpaceKind, claim_task, create_entry, create_solution, delete_entry,
+    list_spaces, open_tasks, update_entry,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -158,6 +158,12 @@ async fn open_tasks_count_and_order() {
     assert!(titles.iter().all(|t| t.id != claimed), "{titles:?}");
     // время создания — для слияния заголовков нескольких баз: новые первыми внутри приоритета
     assert!(titles[0].created_at > titles[1].created_at, "{titles:?}");
+    // ревью задачи 3, M3: порядок SQL — тот же, что у ключа слияния `order_key` (один источник
+    // ранга приоритета — `IdeaPriority::rank`)
+    let mut by_key = titles.clone();
+    by_key.reverse();
+    by_key.sort_by_key(OpenTask::order_key);
+    assert_eq!(by_key, titles);
 
     // предел заголовков и одно пространство: число — всех открытых пространства
     let (n, titles) = open_tasks(&db, &[sol], 2).await.unwrap();
