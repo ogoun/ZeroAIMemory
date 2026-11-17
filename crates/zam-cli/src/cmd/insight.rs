@@ -12,7 +12,14 @@
 //!   Успех → `<id>@<rev>`; проверка только по заголовку (нет модели) — пометка в stderr.
 //!   `--certainty axiom` — только по прямому указанию пользователя и только с `--reason`
 //!   (иначе код 6 до запроса); `--reason` уходит сообщением ревизии (`message`) (стенд M4).
-//! - `zam insight list [--status S,…] [--global] [--solution GUID] [--limit N]` — лента insight;
+//!   Без `--certainty` сервер ставит агенту `hypothesis` — об этом строка в stderr (M6.6 §9).
+//!   Доказательство без файла — `--evidence-checked C --evidence-method M --evidence-result R`
+//!   (все три вместе, не с `--evidence-file`). Поля решения `data.decision` (ADR) — `--context`,
+//!   `--option` (до 8), `--chosen`, `--rationale`, `--consequences`, `--decided-by
+//!   human|agent`, `--revisit-if`: только у `--kind decision` (у `supersede` без `--kind` — вид
+//!   старой записи), иначе код 6 до записи.
+//! - `zam insight list [--status S,…] [--global] [--solution GUID] [--limit N | --all]` — лента
+//!   insight (страница — умолчание сервера, 50; обход и подсказка — [`super::list_entries`]);
 //!   `show ID` — карточка с текстом и триггерами; `supersede ID --title T [--kind K] …` —
 //!   замещение (вид по умолчанию — у старой записи); `retract ID --reason R`; `revisit ID
 //!   [--reason R]`; `append ID [--body-file F | stdin] [--by human|agent]` — дописать к телу
@@ -37,12 +44,108 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::log::read_text;
-use super::{Ctx, emit, emit_json, solution_guid};
+use super::{Ctx, Paging, emit, emit_json, list_entries, solution_guid};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
 use crate::target::Loc;
 
 /// Виды триггеров (`--trigger TYPE:PATTERN`).
 const TRIGGER_KINDS: [&str; 4] = ["file_glob", "command_regex", "error_regex", "keyword"];
+
+/// Вариантов `data.decision.options` — как у сервера
+/// (`zam_server::api::insights::DECISION_OPTIONS_MAX`, 422 сверх него).
+const DECISION_OPTIONS_MAX: usize = 8;
+
+/// Строка stderr, когда `--certainty` не задан и сервер поставил insight агента умолчание
+/// `hypothesis` (M6.6 §9, замечание 8).
+const DEFAULT_CERTAINTY_NOTE: &str =
+    "certainty: hypothesis (умолчание агента; проверено — --certainty theorem и доказательство)";
+
+/// Поля решения `data.decision` (ADR, M4.5 §5.1) из флагов `--context`, `--option`, `--chosen`,
+/// `--rationale`, `--consequences`, `--decided-by`, `--revisit-if` (M6.6 §9, замечание 8).
+#[derive(Default)]
+pub struct Decision<'a> {
+    pub context: Option<&'a str>,
+    /// Отвергнутые варианты (`--option`, до [`DECISION_OPTIONS_MAX`]).
+    pub options: &'a [String],
+    pub chosen: Option<&'a str>,
+    pub rationale: Option<&'a str>,
+    pub consequences: Option<&'a str>,
+    /// `human | agent` (проверил clap).
+    pub decided_by: Option<&'a str>,
+    pub revisit_if: Option<&'a str>,
+}
+
+impl Decision<'_> {
+    /// Строковые поля: флаг, ключ `data.decision`, значение.
+    fn texts(&self) -> [(&'static str, &'static str, Option<&str>); 6] {
+        [
+            ("--context", "context", self.context),
+            ("--chosen", "chosen", self.chosen),
+            ("--rationale", "rationale", self.rationale),
+            ("--consequences", "consequences", self.consequences),
+            ("--decided-by", "decided_by", self.decided_by),
+            ("--revisit-if", "revisit_if", self.revisit_if),
+        ]
+    }
+
+    /// `data.decision` из заданных флагов; ни одного — `None`. Вариантов больше
+    /// [`DECISION_OPTIONS_MAX`] — код 6: проверка без вида записи, до любого запроса.
+    fn data(&self) -> Result<Option<Value>, CliError> {
+        if self.options.len() > DECISION_OPTIONS_MAX {
+            return Err(CliError::input(format!(
+                "--option: не больше {DECISION_OPTIONS_MAX} вариантов решения (задано {})",
+                self.options.len()
+            )));
+        }
+        let mut d = serde_json::Map::new();
+        if !self.options.is_empty() {
+            d.insert("options".into(), json!(self.options));
+        }
+        for (_, key, v) in self.texts() {
+            if let Some(v) = v {
+                d.insert(key.into(), json!(v));
+            }
+        }
+        Ok((!d.is_empty()).then_some(Value::Object(d)))
+    }
+
+    /// Заданные флаги решения — для текста ошибки.
+    fn given(&self) -> Vec<&'static str> {
+        let mut g: Vec<&str> = self
+            .texts()
+            .iter()
+            .filter(|(_, _, v)| v.is_some())
+            .map(|(flag, _, _)| *flag)
+            .collect();
+        if !self.options.is_empty() {
+            g.insert(0, "--option");
+        }
+        g
+    }
+}
+
+/// `data.decision` записи вида `kind`: флаги решения — только у `decision` (у замещения без
+/// `--kind` — вид старой записи), иначе код 6 до запроса записи.
+fn decision_for(d: &Decision, kind: &str) -> Result<Option<Value>, CliError> {
+    let Some(v) = d.data()? else {
+        return Ok(None);
+    };
+    if kind != "decision" {
+        return Err(CliError::input(format!(
+            "{}: поля решения — только у --kind decision (вид записи — {kind})",
+            d.given().join(", ")
+        )));
+    }
+    Ok(Some(v))
+}
+
+/// Доказательство флагами `--evidence-checked`, `--evidence-method`, `--evidence-result`
+/// (только все три — `requires_all` clap) → `data.evidence`.
+pub struct Evidence<'a> {
+    pub checked: &'a str,
+    pub method: &'a str,
+    pub result: &'a str,
+}
 
 /// Общие поля новой записи insight (`log insight` и `insight supersede`).
 pub struct Fields<'a> {
@@ -53,6 +156,9 @@ pub struct Fields<'a> {
     /// Причина статуса (`message` первой ревизии); для `axiom` обязательна.
     pub reason: Option<&'a str>,
     pub evidence_file: Option<&'a Path>,
+    /// Доказательство без файла (с `--evidence-file` не бывает — конфликт clap).
+    pub evidence: Option<Evidence<'a>>,
+    pub decision: Decision<'a>,
     pub triggers: &'a [String],
     pub tags: &'a [String],
     /// Файлы `--ref` (M4.5 §6.1): ссылки `{path, hash, commit}`; у замещения без `--ref`
@@ -115,12 +221,18 @@ fn status_reason<'a>(f: &Fields<'a>) -> Result<Option<&'a str>, CliError> {
     Ok(reason)
 }
 
-/// Тело запроса новой записи insight (без `scope`, `force`, `supersedes_id`).
+/// Тело запроса новой записи insight (без `scope`, `force`, `supersedes_id`). Флаги решения и
+/// доказательства проверяются до чтения stdin.
 fn insight_body(f: &Fields, kind: &str) -> Result<Value, CliError> {
     let reason = status_reason(f)?;
     let mut data = json!({ "kind": kind });
+    if let Some(d) = decision_for(&f.decision, kind)? {
+        data["decision"] = d;
+    }
     if let Some(p) = f.evidence_file {
         data["evidence"] = read_evidence(p)?;
+    } else if let Some(e) = &f.evidence {
+        data["evidence"] = json!({ "checked": e.checked, "method": e.method, "result": e.result });
     }
     let triggers = f
         .triggers
@@ -247,7 +359,18 @@ pub fn log(ctx: &Ctx, o: &Log) -> Result<(), CliError> {
     if created {
         ctx.note_write("insight");
     }
-    emit_entry(ctx, &read_json(r)?, created)
+    let e = read_json(r)?;
+    note_default_certainty(&o.fields, &e);
+    emit_entry(ctx, &e, created)
+}
+
+/// Строка [`DEFAULT_CERTAINTY_NOTE`] в stderr (и с `--json`): `--certainty` не задан, а сервер
+/// поставил записи `e` умолчание агента `hypothesis` — агент узнаёт, что запись не `theorem`
+/// (M6.6 §9). stdout `<id>@<rev>` не меняется: его разбирают тесты и скрипты.
+fn note_default_certainty(f: &Fields, e: &Value) {
+    if f.certainty.is_none() && e["certainty"] == "hypothesis" {
+        eprintln!("{DEFAULT_CERTAINTY_NOTE}");
+    }
 }
 
 /// Пространство ленты: `knowledge` при `--global`, иначе решение.
@@ -259,24 +382,21 @@ fn list_space(ctx: &Ctx, global: bool, solution: Option<&str>) -> Result<String,
     }
 }
 
-/// `zam insight list`.
+/// `zam insight list`: страница по умолчанию — умолчание сервера (50); обход и подсказка о
+/// продолжении — [`list_entries`].
 pub fn list(
     ctx: &Ctx,
     status: Option<&str>,
     global: bool,
     solution: Option<&str>,
-    limit: Option<u32>,
+    page: Paging,
 ) -> Result<(), CliError> {
     let space = list_space(ctx, global, solution)?;
-    let limit = limit.map(|l| l.to_string());
     let mut q: Vec<(&str, &str)> = vec![("kind", "insight")];
     if let Some(s) = status {
         q.push(("status", s));
     }
-    if let Some(l) = &limit {
-        q.push(("limit", l));
-    }
-    let v = read_json(ctx.client.get(&format!("/spaces/{space}/entries"), &q)?)?;
+    let v = list_entries(ctx, &space, &q, page.limit, page.all)?;
     if ctx.json {
         return emit_json(&v);
     }
@@ -424,8 +544,11 @@ pub fn triggers(ctx: &Ctx, id: &str, raw: &[String]) -> Result<(), CliError> {
 }
 
 /// `zam insight supersede <id>`: новая запись замещает старую (вид — у старой, если не задан).
+/// Флаги решения — только у решения: число вариантов проверяется до запросов, вид — после
+/// чтения старой записи и до замещения (M6.6 §9).
 pub fn supersede(ctx: &Ctx, id: &str, f: &Fields) -> Result<(), CliError> {
     status_reason(f)?;
+    f.decision.data()?;
     let kind = match f.kind {
         Some(k) => k.to_string(),
         None => get_entry(ctx, id)?["data"]["kind"]
@@ -442,6 +565,7 @@ pub fn supersede(ctx: &Ctx, id: &str, f: &Fields) -> Result<(), CliError> {
     let created = r.status().as_u16() == 201;
     let v = read_json(r)?;
     ctx.note_write("insight");
+    note_default_certainty(f, &v["entry"]);
     if ctx.json {
         return emit_json(
             &json!({ "entry": v["entry"], "superseded": v["superseded"], "created": created }),
@@ -624,6 +748,8 @@ mod tests {
             certainty,
             reason,
             evidence_file: None,
+            evidence: None,
+            decision: Decision::default(),
             triggers: &[],
             tags: &[],
             refs: &[],
@@ -641,6 +767,45 @@ mod tests {
         );
         assert_eq!(status_reason(&f(Some("hypothesis"), None)).unwrap(), None);
         assert_eq!(status_reason(&f(None, Some("R"))).unwrap(), Some("R"));
+    }
+
+    /// M6.6 §9: `data.decision` — только заданные поля; флаги решения у не-решения — код 6 с
+    /// именами флагов и видом; вариантов больше 8 — код 6 при любом виде.
+    #[test]
+    fn decision_fields_and_kind() {
+        assert_eq!(decision_for(&Decision::default(), "gotcha").unwrap(), None);
+        let opts = ["a".to_string(), "b".to_string()];
+        let d = Decision {
+            options: &opts,
+            chosen: Some("c"),
+            decided_by: Some("human"),
+            ..Decision::default()
+        };
+        assert_eq!(
+            decision_for(&d, "decision").unwrap(),
+            Some(json!({"options": ["a", "b"], "chosen": "c", "decided_by": "human"}))
+        );
+        let e = decision_for(&d, "gotcha").unwrap_err();
+        assert_eq!(e.code, crate::client::EXIT_INPUT);
+        assert_eq!(
+            e.msg,
+            "--option, --chosen, --decided-by: поля решения — только у --kind decision \
+             (вид записи — gotcha)"
+        );
+        let nine: Vec<String> = (1..=9).map(|i| i.to_string()).collect();
+        let many = Decision {
+            options: &nine,
+            ..Decision::default()
+        };
+        let e = decision_for(&many, "decision").unwrap_err();
+        assert_eq!(
+            (e.code, e.msg.as_str()),
+            (
+                crate::client::EXIT_INPUT,
+                "--option: не больше 8 вариантов решения (задано 9)"
+            )
+        );
+        assert_eq!(many.data().unwrap_err().code, crate::client::EXIT_INPUT);
     }
 
     #[test]

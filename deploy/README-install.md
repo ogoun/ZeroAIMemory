@@ -391,6 +391,34 @@ HTTP знает машину только из заголовка `X-Zam-Machine
 2 — сервер недоступен, 3 — нет токена или он отклонён (в том числе нет прав на запись),
 4 — конфликт ревизий, 5 — не найдено, 6 — неверный ввод (аргументы, путь, не UTF-8).
 
+**Журналы из CLI** (`zam log insight`, `zam task`, `zam question`, `zam idea`). Общая область —
+Knowledge: флаг `--global` у лент, записей и Vault (у `zam log insight` — `--scope global`);
+`--knowledge` — его синоним (с 0.0.13-m6.6; у `zam idea` раньше было только `--knowledge`). Ленты
+`zam insight|task|question|idea list` печатают одну страницу — insight по 50 записей (умолчание
+сервера), задачи, вопросы и идеи по 200; есть ещё — строка в stderr «показано N, есть ещё:
+--limit 200 или --all», `--all` проходит ленту до конца. С 0.0.13-m6.6:
+
+```
+# решение с полями ADR (только --kind decision; --option — отвергнутый вариант, до 8)
+zam log insight --kind decision --title "Кэш сборки: sccache" --context "сборка 20 минут" \
+    --option ccache --option "без кэша" --chosen sccache --rationale "работает с MSVC" \
+    --decided-by human --revisit-if "появится удалённый кэш" < решение.md
+# проверенный вывод: доказательство без файла — три флага вместе (или --evidence-file F)
+zam log insight --kind discovery --title "sccache ускоряет сборку вдвое" --certainty theorem \
+    --evidence-checked "3 сборки" --evidence-method "чистая и повторная сборка" \
+    --evidence-result "20 мин → 9 мин" < вывод.md
+# задача: кто ведёт, оценка в минутах, ссылки, приоритет (сервер 0.0.12-m6.5 и новее)
+zam task new --title "Кэш сборки" --next "замерить" --owner human --estimate 90 \
+    --link https://example.invalid/pr/1 --priority high < план.md
+zam insight list --global --all
+```
+
+Флаги решения у другого вида (у `zam insight supersede` без `--kind` — вид замещаемой записи) —
+код 6 до записи. Без `--certainty` insight агента получает `hypothesis`, и `zam` пишет об этом
+строку в stderr «certainty: hypothesis (умолчание агента; проверено — --certainty theorem и
+доказательство)»; stdout — по-прежнему `<id>@<rev>`. Значение флага, начинающееся с «-»,
+передаётся через «=»: `zam log term … --code=--dry-run`.
+
 ## Vault: секреты и мастер-ключ
 
 Vault хранит креды, токены и ссылки (§7.6 ТЗ). Значение шифруется (XChaCha20-Poly1305) ключом
@@ -702,7 +730,7 @@ Knowledge. Что агент делает с новой идеей челове�
 
 ```
 zam idea new "Экспорт отчётов в PDF" --priority high --tag pdf   # идея человека
-zam idea list [--status S]… [--origin human|agent] [--knowledge]
+zam idea list [--status S]… [--origin human|agent] [--global] [--limit N | --all]   # --global — Knowledge
 zam idea queue [--limit N]                                       # агент: пакет разбора (1–20, по умолчанию 5)
 zam idea review w:<id> --plan|--return|--decline|--done --summary-file F \
     [--missing T] [--basis ID]… [--similar w:ID]… \

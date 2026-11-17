@@ -1,9 +1,13 @@
 //! `zam task` — журнал задач (M4.5 §3): `list`, `show`, `new`, `status`, `claim`, `release`.
 //!
-//! - `list [--status S,…] [--global] [--solution GUID]` — строки `<id> [статус] «заголовок»
-//!   · далее: …`; без `--status` — `open, in_progress, blocked`. У `done` — длительность;
+//! - `list [--status S,…] [--global] [--solution GUID] [--limit N | --all]` — строки `<id>
+//!   [статус] «заголовок» · далее: …`; без `--status` — `open, in_progress, blocked`. У `done` —
+//!   длительность. Страница — 200, обход и подсказка о продолжении — [`super::list_entries`];
 //! - `show <k:id>` — карточка: статус, шаги, захват, времена, план (тело);
-//! - `new --title T [--next S] [--body-file F | stdin]` — новая задача (`<id>@<rev>`);
+//! - `new --title T [--next S] [--owner agent|human] [--estimate МИН] [--link L]… [--priority
+//!   low|normal|high] [--body-file F | stdin]` — новая задача (`<id>@<rev>`); поля — в `data`
+//!   (`owner`, `estimate_min`, `links`, `priority`; M6.6 §9), статус при создании не
+//!   передаётся (сервер — `open`);
 //! - `status <k:id> <статус> [--next S] [--blocked-by S] [--reason R]` — ревизию берёт из
 //!   `GET` и шлёт `If-Match`; переоткрытие `done`/`dropped` → `open` — с `--reason`;
 //! - `claim <k:id> [--ttl 120]` / `release <k:id>` — захват сессией агента (`X-Zam-Session`:
@@ -15,7 +19,10 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::log::read_text;
-use super::{Ctx, agent_time, emit, emit_json, post_entry, solution_guid};
+use super::{
+    Ctx, LIST_LIMIT_MAX, Paging, agent_time, emit, emit_json, list_entries, post_entry,
+    solution_guid,
+};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
 // `k:<id>` / `e:<id>` / `t:<id>` … → голый id (буквы — общий источник `target`)
 use crate::target::bare_entry_id as bare_id;
@@ -111,12 +118,13 @@ fn explain_claimed(e: CliError) -> CliError {
     )
 }
 
-/// `zam task list`.
+/// `zam task list`; без `--limit` страница прежняя — 200.
 pub fn list(
     ctx: &Ctx,
     status: Option<&str>,
     global: bool,
     solution: Option<&str>,
+    page: Paging,
 ) -> Result<(), CliError> {
     let space = if global {
         "knowledge".to_string()
@@ -124,10 +132,13 @@ pub fn list(
         solution_guid(ctx, solution)?
     };
     let st = status.unwrap_or(ACTIVE);
-    let v = read_json(ctx.client.get(
-        &format!("/spaces/{space}/entries"),
-        &[("kind", "task"), ("status", st), ("limit", "200")],
-    )?)?;
+    let v = list_entries(
+        ctx,
+        &space,
+        &[("kind", "task"), ("status", st)],
+        page.limit.or(Some(LIST_LIMIT_MAX)),
+        page.all,
+    )?;
     if ctx.json {
         return emit_json(&v);
     }
@@ -152,11 +163,40 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
 pub struct New<'a> {
     pub title: &'a str,
     pub next: Option<&'a str>,
+    /// `agent | human` (проверил clap).
+    pub owner: Option<&'a str>,
+    /// Оценка, минут (1–525600, проверил clap).
+    pub estimate: Option<u32>,
+    pub links: &'a [String],
+    /// `low | normal | high` (проверил clap).
+    pub priority: Option<&'a str>,
     pub body_file: Option<&'a Path>,
     pub area: Option<&'a str>,
     pub global: bool,
     pub solution: Option<&'a str>,
     pub key: Option<&'a str>,
+}
+
+/// `data` новой задачи: только заданные поля клиента (`next_step`, `owner`, `estimate_min`,
+/// `links`, `priority`); `status` не передаётся — при создании сервер его не принимает (422).
+fn new_data(o: &New) -> Value {
+    let mut data = json!({});
+    for (k, v) in [
+        ("next_step", o.next),
+        ("owner", o.owner),
+        ("priority", o.priority),
+    ] {
+        if let Some(v) = v {
+            data[k] = json!(v);
+        }
+    }
+    if let Some(m) = o.estimate {
+        data["estimate_min"] = json!(m);
+    }
+    if !o.links.is_empty() {
+        data["links"] = json!(o.links);
+    }
+    data
 }
 
 /// `zam task new`.
@@ -167,11 +207,7 @@ pub fn new(ctx: &Ctx, o: &New) -> Result<(), CliError> {
         solution_guid(ctx, o.solution)?
     };
     let body = read_text(o.body_file)?;
-    let mut data = json!({});
-    if let Some(n) = o.next {
-        data["next_step"] = json!(n);
-    }
-    let req = json!({ "kind": "task", "title": o.title, "body": body, "data": data });
+    let req = json!({ "kind": "task", "title": o.title, "body": body, "data": new_data(o) });
     post_entry(ctx, &space, &req, o.key, o.area)
 }
 
@@ -306,6 +342,36 @@ mod tests {
         let d = json!({"id": "01B", "status": "done", "title": "T", "duration_min": 42,
                        "data": {}});
         assert_eq!(line(&d), "01B [done] «T» · 42 мин");
+    }
+
+    /// M6.6 §9 (замечание 9): `data` новой задачи — только заданные поля, без `status`.
+    #[test]
+    fn new_data_forms() {
+        let links = ["https://example.invalid/pr/1".to_string()];
+        let mut o = New {
+            title: "T",
+            next: None,
+            owner: None,
+            estimate: None,
+            links: &[],
+            priority: None,
+            body_file: None,
+            area: None,
+            global: false,
+            solution: None,
+            key: None,
+        };
+        assert_eq!(new_data(&o), json!({}));
+        o.next = Some("n");
+        o.owner = Some("human");
+        o.estimate = Some(90);
+        o.links = &links;
+        o.priority = Some("high");
+        assert_eq!(
+            new_data(&o),
+            json!({"next_step": "n", "owner": "human", "estimate_min": 90,
+                   "links": ["https://example.invalid/pr/1"], "priority": "high"})
+        );
     }
 
     #[test]

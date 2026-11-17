@@ -453,7 +453,8 @@ enum LogCmd {
         /// Псевдоним (можно повторять)
         #[arg(long = "alias")]
         aliases: Vec<String>,
-        /// Идентификатор в коде (можно повторять)
+        /// Идентификатор в коде (можно повторять); значение, начинающееся с «-», — через «=»:
+        /// --code=--dry-run
         #[arg(long)]
         code: Vec<String>,
         /// С чем термин не путать (можно повторять)
@@ -480,8 +481,10 @@ enum LogCmd {
         /// Вид: gotcha, failure, discovery, decision, experiment, pattern
         #[arg(long, value_parser = ["gotcha", "failure", "discovery", "decision", "experiment", "pattern"])]
         kind: String,
+        // `Box`: с полями решения и доказательства (M6.6) структура велика для варианта
+        // (clippy `large_enum_variant`); clap разбирает `Box<T: Args>` как `T`
         #[command(flatten)]
-        new: InsightArgs,
+        new: Box<InsightArgs>,
         /// solution (по умолчанию) или global — в Knowledge, для всех проектов
         #[arg(long, value_parser = ["solution", "global"])]
         scope: Option<String>,
@@ -499,6 +502,9 @@ enum LogCmd {
     },
 }
 
+/// Раздел справки флагов `data.decision` (`log insight`, `insight supersede`).
+const DECISION_HEADING: &str = "Поля решения (только --kind decision)";
+
 /// Поля новой записи insight (`log insight`, `insight supersede`).
 #[derive(clap::Args)]
 struct InsightArgs {
@@ -509,7 +515,8 @@ struct InsightArgs {
     #[arg(long)]
     body_file: Option<PathBuf>,
     /// Эпистемический статус: axiom (только по прямому указанию пользователя, с --reason),
-    /// theorem (с --evidence-file) или hypothesis
+    /// theorem (с доказательством: --evidence-file или --evidence-checked, --evidence-method,
+    /// --evidence-result) или hypothesis; без флага — hypothesis
     #[arg(long, value_parser = ["axiom", "theorem", "hypothesis"])]
     certainty: Option<String>,
     /// Причина статуса — сообщение ревизии; для axiom обязательна (что сказал пользователь)
@@ -518,6 +525,49 @@ struct InsightArgs {
     /// JSON-файл доказательства {checked, method, result} → data.evidence
     #[arg(long)]
     evidence_file: Option<PathBuf>,
+    /// Доказательство без файла: что проверено (вместе с --evidence-method и --evidence-result,
+    /// не с --evidence-file) → data.evidence
+    #[arg(
+        long,
+        requires_all = ["evidence_method", "evidence_result"],
+        conflicts_with = "evidence_file"
+    )]
+    evidence_checked: Option<String>,
+    /// Доказательство без файла: как проверено
+    #[arg(
+        long,
+        requires_all = ["evidence_checked", "evidence_result"],
+        conflicts_with = "evidence_file"
+    )]
+    evidence_method: Option<String>,
+    /// Доказательство без файла: что получилось
+    #[arg(
+        long,
+        requires_all = ["evidence_checked", "evidence_method"],
+        conflicts_with = "evidence_file"
+    )]
+    evidence_result: Option<String>,
+    /// Контекст: что вынудило решать → data.decision
+    #[arg(long, help_heading = DECISION_HEADING)]
+    context: Option<String>,
+    /// Отвергнутый вариант (можно повторять, до 8)
+    #[arg(long = "option", value_name = "OPTION", help_heading = DECISION_HEADING)]
+    options: Vec<String>,
+    /// Выбранный вариант
+    #[arg(long, help_heading = DECISION_HEADING)]
+    chosen: Option<String>,
+    /// Почему выбран
+    #[arg(long, help_heading = DECISION_HEADING)]
+    rationale: Option<String>,
+    /// Последствия выбора
+    #[arg(long, help_heading = DECISION_HEADING)]
+    consequences: Option<String>,
+    /// Кто решил: human — слова человека, agent — решение агента
+    #[arg(long, value_parser = ["human", "agent"], help_heading = DECISION_HEADING)]
+    decided_by: Option<String>,
+    /// Когда пересмотреть решение
+    #[arg(long, help_heading = DECISION_HEADING)]
+    revisit_if: Option<String>,
     /// Триггер вспоминания ВИД:ШАБЛОН: file_glob:**/*.sh, command_regex:…, error_regex:…,
     /// keyword:… (можно повторять)
     #[arg(long = "trigger")]
@@ -545,6 +595,28 @@ impl InsightArgs {
             certainty: self.certainty.as_deref(),
             reason: self.reason.as_deref(),
             evidence_file: self.evidence_file.as_deref(),
+            // три флага доказательства — только вместе (`requires_all` clap)
+            evidence: match (
+                &self.evidence_checked,
+                &self.evidence_method,
+                &self.evidence_result,
+            ) {
+                (Some(checked), Some(method), Some(result)) => Some(cmd::insight::Evidence {
+                    checked,
+                    method,
+                    result,
+                }),
+                _ => None,
+            },
+            decision: cmd::insight::Decision {
+                context: self.context.as_deref(),
+                options: &self.options,
+                chosen: self.chosen.as_deref(),
+                rationale: self.rationale.as_deref(),
+                consequences: self.consequences.as_deref(),
+                decided_by: self.decided_by.as_deref(),
+                revisit_if: self.revisit_if.as_deref(),
+            },
             triggers: &self.triggers,
             tags: &self.tags,
             refs: &self.refs,
@@ -556,17 +628,19 @@ impl InsightArgs {
 
 #[derive(Subcommand)]
 enum TaskCmd {
-    /// Лента задач (по умолчанию open, in_progress, blocked)
+    /// Лента задач (по умолчанию open, in_progress, blocked; страница — 200)
     List {
         /// Статусы через запятую: open, in_progress, blocked, done, dropped
         #[arg(long)]
         status: Option<String>,
         /// Knowledge вместо решения
-        #[arg(long)]
+        #[arg(long, visible_alias = "knowledge")]
         global: bool,
         /// GUID решения (иначе agent_solution_id из solution.toml)
         #[arg(long)]
         solution: Option<String>,
+        #[command(flatten)]
+        page: cmd::Paging,
         #[command(flatten)]
         common: Common,
     },
@@ -584,6 +658,22 @@ enum TaskCmd {
         /// Следующий шаг
         #[arg(long)]
         next: Option<String>,
+        /// Кто ведёт задачу: agent или human
+        #[arg(long, value_parser = ["agent", "human"])]
+        owner: Option<String>,
+        /// Оценка, минут (1–525600) → estimate_min
+        #[arg(
+            long,
+            value_name = "МИН",
+            value_parser = clap::value_parser!(u32).range(1..=525_600)
+        )]
+        estimate: Option<u32>,
+        /// Ссылка: PR, коммит, заметка, задача (можно повторять) → links
+        #[arg(long = "link", value_name = "L")]
+        links: Vec<String>,
+        /// Приоритет: low, normal или high (сервер 0.0.12-m6.5 и новее)
+        #[arg(long, value_parser = ["low", "normal", "high"])]
+        priority: Option<String>,
         /// Файл с планом (иначе stdin)
         #[arg(long)]
         body_file: Option<PathBuf>,
@@ -591,7 +681,7 @@ enum TaskCmd {
         #[arg(long)]
         area: Option<String>,
         /// Knowledge вместо решения
-        #[arg(long)]
+        #[arg(long, visible_alias = "knowledge")]
         global: bool,
         /// GUID решения (иначе agent_solution_id из solution.toml)
         #[arg(long)]
@@ -641,17 +731,19 @@ enum TaskCmd {
 
 #[derive(Subcommand)]
 enum QuestionCmd {
-    /// Лента вопросов (по умолчанию open)
+    /// Лента вопросов (по умолчанию open; страница — 200)
     List {
         /// Статусы через запятую: open, answered, obsolete
         #[arg(long)]
         status: Option<String>,
         /// Knowledge вместо решения
-        #[arg(long)]
+        #[arg(long, visible_alias = "knowledge")]
         global: bool,
         /// GUID решения (иначе agent_solution_id из solution.toml)
         #[arg(long)]
         solution: Option<String>,
+        #[command(flatten)]
+        page: cmd::Paging,
         #[command(flatten)]
         common: Common,
     },
@@ -672,7 +764,7 @@ enum QuestionCmd {
         #[arg(long)]
         area: Option<String>,
         /// Knowledge вместо решения
-        #[arg(long)]
+        #[arg(long, visible_alias = "knowledge")]
         global: bool,
         /// GUID решения (иначе agent_solution_id из solution.toml)
         #[arg(long)]
@@ -712,7 +804,7 @@ enum QuestionCmd {
 #[allow(rustdoc::broken_intra_doc_links)]
 #[derive(Subcommand)]
 enum IdeaCmd {
-    /// Лента идей (по умолчанию new, returned, proposed, deferred, accepted)
+    /// Лента идей (по умолчанию new, returned, proposed, deferred, accepted; страница — 200)
     List {
         /// Статусы (повторяемый, через запятую): new, returned, proposed, accepted, deferred,
         /// declined, done
@@ -722,8 +814,10 @@ enum IdeaCmd {
         #[arg(long, value_parser = ["human", "agent"])]
         origin: Option<String>,
         /// Knowledge вместо решения
-        #[arg(long)]
-        knowledge: bool,
+        #[arg(long, visible_alias = "knowledge")]
+        global: bool,
+        #[command(flatten)]
+        page: cmd::Paging,
         #[command(flatten)]
         common: Common,
     },
@@ -749,8 +843,8 @@ enum IdeaCmd {
         #[arg(long, value_parser = ["human", "agent"])]
         origin: Option<String>,
         /// Knowledge вместо решения
-        #[arg(long)]
-        knowledge: bool,
+        #[arg(long, visible_alias = "knowledge")]
+        global: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -893,19 +987,19 @@ enum IdeaCmd {
 
 #[derive(Subcommand)]
 enum InsightCmd {
-    /// Лента insight решения (или Knowledge с --global)
+    /// Лента insight решения (или Knowledge с --global; страница — 50, умолчание сервера)
     List {
         /// Статусы через запятую: active, revisit, superseded, retracted
         #[arg(long)]
         status: Option<String>,
         /// Knowledge вместо решения
-        #[arg(long)]
+        #[arg(long, visible_alias = "knowledge")]
         global: bool,
         /// GUID решения (иначе agent_solution_id из solution.toml)
         #[arg(long)]
         solution: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=200))]
-        limit: Option<u32>,
+        #[command(flatten)]
+        page: cmd::Paging,
         #[command(flatten)]
         common: Common,
     },
@@ -921,8 +1015,9 @@ enum InsightCmd {
         /// Вид (по умолчанию — как у замещаемой)
         #[arg(long, value_parser = ["gotcha", "failure", "discovery", "decision", "experiment", "pattern"])]
         kind: Option<String>,
+        // `Box` — как у `log insight` (clippy `large_enum_variant`)
         #[command(flatten)]
-        new: InsightArgs,
+        new: Box<InsightArgs>,
         #[command(flatten)]
         common: Common,
     },
@@ -1045,7 +1140,7 @@ enum ReleaseCmd {
 #[derive(clap::Args)]
 struct VaultOpts {
     /// Личный Vault (Knowledge, для всех проектов) вместо Vault решения
-    #[arg(long)]
+    #[arg(long, visible_alias = "knowledge")]
     global: bool,
     /// GUID решения (иначе agent_solution_id из solution.toml)
     #[arg(long, conflicts_with = "global")]
@@ -1481,17 +1576,23 @@ fn task(c: TaskCmd) -> Result<(), CliError> {
             status,
             global,
             solution,
+            page,
             common,
         } => t::list(
             &cmd::connect(&common)?,
             status.as_deref(),
             global,
             solution.as_deref(),
+            page,
         ),
         TaskCmd::Show { id, common } => t::show(&cmd::connect(&common)?, &id),
         TaskCmd::New {
             title,
             next,
+            owner,
+            estimate,
+            links,
+            priority,
             body_file,
             area,
             global,
@@ -1503,6 +1604,10 @@ fn task(c: TaskCmd) -> Result<(), CliError> {
             &t::New {
                 title: &title,
                 next: next.as_deref(),
+                owner: owner.as_deref(),
+                estimate,
+                links: &links,
+                priority: priority.as_deref(),
                 body_file: body_file.as_deref(),
                 area: area.as_deref(),
                 global,
@@ -1537,12 +1642,14 @@ fn question(c: QuestionCmd) -> Result<(), CliError> {
             status,
             global,
             solution,
+            page,
             common,
         } => q::list(
             &cmd::connect(&common)?,
             status.as_deref(),
             global,
             solution.as_deref(),
+            page,
         ),
         QuestionCmd::Ask {
             title,
@@ -1602,14 +1709,16 @@ fn idea(c: IdeaCmd) -> Result<(), CliError> {
         IdeaCmd::List {
             status,
             origin,
-            knowledge,
+            global,
+            page,
             common,
         } => w::list(
             &cmd::connect(&common)?,
             &w::List {
                 status: &status,
                 origin: origin.as_deref(),
-                knowledge,
+                global,
+                page,
             },
         ),
         IdeaCmd::New {
@@ -1620,7 +1729,7 @@ fn idea(c: IdeaCmd) -> Result<(), CliError> {
             horizon,
             tag,
             origin,
-            knowledge,
+            global,
             common,
         } => {
             let origin = resolve_human_agent(origin.as_deref(), "--origin", agent_env())?;
@@ -1633,7 +1742,7 @@ fn idea(c: IdeaCmd) -> Result<(), CliError> {
                     priority: priority.as_deref(),
                     horizon: horizon.as_deref(),
                     tags: &tag,
-                    knowledge,
+                    global,
                 },
                 origin,
             )
@@ -1757,14 +1866,14 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
             status,
             global,
             solution,
-            limit,
+            page,
             common,
         } => i::list(
             &cmd::connect(&common)?,
             status.as_deref(),
             global,
             solution.as_deref(),
-            limit,
+            page,
         ),
         InsightCmd::Show { id, common } => i::show(&cmd::connect(&common)?, &id),
         InsightCmd::Supersede {
@@ -2164,6 +2273,299 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 opts.solution.as_deref(),
                 &action,
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Разбор и обход дерева команд clap — в потоке со стеком 8 МБ, как у главного потока `zam`
+    /// (`build.rs`): в отладочной сборке дерево `Cmd` не помещается в стек потока теста.
+    fn big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let args: Vec<String> = std::iter::once("zam")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        big_stack(move || Cli::try_parse_from(args))
+    }
+
+    /// Справка флага `--<long>` команды `path` (`["log", "term"]`) и его видимые синонимы.
+    fn arg_help(path: &[&str], long: &str) -> (String, Vec<String>) {
+        let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        let long = long.to_string();
+        big_stack(move || {
+            let mut c = Cli::command();
+            for p in &path {
+                c = c
+                    .find_subcommand(p)
+                    .unwrap_or_else(|| panic!("{p}"))
+                    .clone();
+            }
+            let a = c
+                .get_arguments()
+                .find(|a| a.get_long() == Some(long.as_str()))
+                .unwrap_or_else(|| panic!("--{long}"));
+            let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+            let aliases = a
+                .get_visible_aliases()
+                .unwrap_or_default()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            (help, aliases)
+        })
+    }
+
+    /// M6.6 §9 (24): область — канон `--global`, `--knowledge` — видимый синоним у всех лент и
+    /// записей (у идей — прежний `--knowledge` работает).
+    #[test]
+    fn scope_flag_global_with_knowledge_alias() {
+        for flag in ["--global", "--knowledge"] {
+            let Ok(Cli {
+                cmd:
+                    Cmd::Insight {
+                        cmd: InsightCmd::List { global, .. },
+                    },
+            }) = parse(&["insight", "list", flag])
+            else {
+                panic!("insight list {flag}");
+            };
+            assert!(global, "insight list {flag}");
+            let Ok(Cli {
+                cmd:
+                    Cmd::Idea {
+                        cmd: IdeaCmd::List { global, .. },
+                    },
+            }) = parse(&["idea", "list", flag])
+            else {
+                panic!("idea list {flag}");
+            };
+            assert!(global, "idea list {flag}");
+            let Ok(Cli {
+                cmd:
+                    Cmd::Idea {
+                        cmd: IdeaCmd::New { global, .. },
+                    },
+            }) = parse(&["idea", "new", "Т", flag])
+            else {
+                panic!("idea new {flag}");
+            };
+            assert!(global, "idea new {flag}");
+            let Ok(Cli {
+                cmd:
+                    Cmd::Task {
+                        cmd: TaskCmd::New { global, .. },
+                    },
+            }) = parse(&["task", "new", "--title", "Т", flag])
+            else {
+                panic!("task new {flag}");
+            };
+            assert!(global, "task new {flag}");
+            let Ok(Cli {
+                cmd:
+                    Cmd::Vault {
+                        cmd: VaultCmd::List { opts, .. },
+                    },
+            }) = parse(&["vault", "list", flag])
+            else {
+                panic!("vault list {flag}");
+            };
+            assert!(opts.global, "vault list {flag}");
+            for args in [
+                vec!["task", "list", flag],
+                vec!["question", "list", flag],
+                vec!["question", "ask", "--title", "Т", flag],
+            ] {
+                assert!(parse(&args).is_ok(), "{args:?}");
+            }
+        }
+        for path in [
+            &["insight", "list"][..],
+            &["task", "list"],
+            &["task", "new"],
+            &["question", "list"],
+            &["question", "ask"],
+            &["idea", "list"],
+            &["idea", "new"],
+            &["vault", "list"],
+        ] {
+            let (_, aliases) = arg_help(path, "global");
+            assert_eq!(aliases, ["knowledge"], "{path:?}");
+        }
+    }
+
+    /// M6.6 §9 (16д): значение `--code`, начинающееся с «-», — через «=»; справка это говорит.
+    #[test]
+    fn term_code_hyphen_value_help() {
+        let (help, _) = arg_help(&["log", "term"], "code");
+        assert!(help.contains("--code=--dry-run"), "{help}");
+        let Ok(Cli {
+            cmd: Cmd::Log {
+                cmd: LogCmd::Term { code, .. },
+            },
+        }) = parse(&[
+            "log",
+            "term",
+            "--title",
+            "Т",
+            "--definition",
+            "О",
+            "--code=--dry-run",
+        ])
+        else {
+            panic!("--code=--dry-run");
+        };
+        assert_eq!(code, ["--dry-run"]);
+        // без «=» значение с «-» — ошибка разбора, а не молча проглоченный флаг
+        assert!(
+            parse(&[
+                "log",
+                "term",
+                "--title",
+                "Т",
+                "--definition",
+                "О",
+                "--code",
+                "--dry-run",
+            ])
+            .is_err()
+        );
+    }
+
+    /// M6.6 §9 (8): справка `--certainty` называет умолчание; флаги решения и доказательства
+    /// разбираются у `log insight` и `insight supersede`; доказательство — все три флага вместе,
+    /// не с `--evidence-file`.
+    #[test]
+    fn insight_decision_and_evidence_flags() {
+        for path in [&["log", "insight"][..], &["insight", "supersede"]] {
+            let (help, _) = arg_help(path, "certainty");
+            assert!(help.contains("без флага — hypothesis"), "{path:?}: {help}");
+        }
+        let Ok(Cli {
+            cmd:
+                Cmd::Insight {
+                    cmd: InsightCmd::Supersede { new, .. },
+                },
+        }) = parse(&[
+            "insight",
+            "supersede",
+            "01E",
+            "--title",
+            "Т",
+            "--option",
+            "a",
+            "--option",
+            "b",
+            "--chosen",
+            "c",
+            "--decided-by",
+            "agent",
+        ])
+        else {
+            panic!("supersede с флагами решения");
+        };
+        let f = new.fields(None);
+        assert_eq!(f.decision.options, ["a", "b"]);
+        assert_eq!(
+            (f.decision.chosen, f.decision.decided_by),
+            (Some("c"), Some("agent"))
+        );
+        let base = ["log", "insight", "--kind", "decision", "--title", "Т"];
+        let ev = [
+            "--evidence-checked",
+            "c",
+            "--evidence-method",
+            "m",
+            "--evidence-result",
+            "r",
+        ];
+        let Ok(Cli {
+            cmd: Cmd::Log {
+                cmd: LogCmd::Insight { new, .. },
+            },
+        }) = parse(&[&base[..], &ev].concat())
+        else {
+            panic!("три флага доказательства");
+        };
+        let e = new
+            .fields(Some("decision"))
+            .evidence
+            .expect("доказательство");
+        assert_eq!((e.checked, e.method, e.result), ("c", "m", "r"));
+        let with_file: Vec<&str> = ev
+            .iter()
+            .copied()
+            .chain(["--evidence-file", "e.json"])
+            .collect();
+        for extra in [
+            &ev[..4],
+            &ev[2..],
+            &["--decided-by", "robot"][..],
+            &with_file[..],
+        ] {
+            assert!(parse(&[&base[..], extra].concat()).is_err(), "{extra:?}");
+        }
+    }
+
+    /// M6.6 §9 (9, 16г): поля `task new`; `--limit` и `--all` у четырёх лент, вместе — ошибка.
+    #[test]
+    fn task_fields_and_list_paging() {
+        let Ok(Cli {
+            cmd:
+                Cmd::Task {
+                    cmd:
+                        TaskCmd::New {
+                            owner,
+                            estimate,
+                            links,
+                            priority,
+                            ..
+                        },
+                },
+        }) = parse(&[
+            "task",
+            "new",
+            "--title",
+            "Т",
+            "--owner",
+            "agent",
+            "--estimate",
+            "30",
+            "--link",
+            "a",
+            "--link",
+            "b",
+            "--priority",
+            "low",
+        ])
+        else {
+            panic!("task new с полями");
+        };
+        assert_eq!(
+            (owner.as_deref(), estimate, priority.as_deref()),
+            (Some("agent"), Some(30), Some("low"))
+        );
+        assert_eq!(links, ["a", "b"]);
+        for kind in ["insight", "task", "question", "idea"] {
+            assert!(parse(&[kind, "list", "--all"]).is_ok(), "{kind}");
+            assert!(parse(&[kind, "list", "--limit", "7"]).is_ok(), "{kind}");
+            assert!(
+                parse(&[kind, "list", "--all", "--limit", "7"]).is_err(),
+                "{kind}"
+            );
+            assert!(parse(&[kind, "list", "--limit", "201"]).is_err(), "{kind}");
         }
     }
 }

@@ -54,6 +54,18 @@
   `evidence` (объект с обязательными `checked`, `method`, `result`), `decision` (объект ADR);
   поля других видов принимаются, как раньше. Общее описание `data` — короче 300 символов.
   Протокол `zam guide` называет форму `data` у `release` и `experiment`.
+- Поля решения флагами `zam log insight` и `zam insight supersede`: `--context`, `--option`
+  (отвергнутый вариант, повторяемый, до 8), `--chosen`, `--rationale`, `--consequences`,
+  `--decided-by human|agent`, `--revisit-if` → `data.decision`. Только у `--kind decision` (у
+  `supersede` без `--kind` — вид замещаемой записи), иначе код 6 до записи; больше 8 вариантов —
+  код 6 до любого запроса. Доказательство без файла — `--evidence-checked`, `--evidence-method`,
+  `--evidence-result` (все три вместе, не с `--evidence-file`) → `data.evidence`.
+- `zam task new`: `--owner agent|human`, `--estimate МИН` (1–525600 → `estimate_min`), `--link L`
+  (повторяемый → `links`) и `--priority low|normal|high` (сервер 0.0.12-m6.5 и новее) — в `data`
+  задачи; их печатает `zam task show`.
+- `--all` у `zam insight|task|question|idea list` — вся лента обходом `next_cursor` страницами по
+  200 (`--json` — все записи и `next_cursor: null`); `--limit N` (1–200) — у всех четырёх лент
+  (раньше — только у `insight list`), вместе с `--all` — код 6.
 
 ### Fixed
 - Подсказки к запросу больше не приходят на реплики без предмета — «согласен», «да, давай»,
@@ -153,6 +165,19 @@
   так было и раньше, у `memory_tree` теперь так же; прочее слово (`foo:/a`, `Knowledge:/a`) —
   ошибка аргументов со списком пространств, а не путь «foo:/a» (раньше — 404). Форма `foo:a` без
   косой — путь, как в CLI.
+- Ленты `zam insight|task|question|idea list` больше не обрезаются молча: есть ещё записи, а
+  `--all` нет — строка в stderr «показано N, есть ещё: --limit 200 или --all» (на странице уже
+  200 — «показано 200, есть ещё: --all»), и с `--json`. stdout и страница по умолчанию прежние:
+  insight — 50 (умолчание сервера), задачи, вопросы и идеи — 200.
+- `zam log insight` и `zam insight supersede` без `--certainty` пишут в stderr «certainty:
+  hypothesis (умолчание агента; проверено — --certainty theorem и доказательство)», когда сервер
+  поставил записи умолчание агента; stdout `<id>@<rev>` прежний. Справка `--certainty` — «без
+  флага — hypothesis».
+- Область Knowledge называется одинаково: `--global` у `zam insight list`, `zam task list|new`,
+  `zam question list|ask`, `zam idea list|new` и команд Vault, `--knowledge` — видимый синоним у
+  всех (у `zam idea` раньше было только `--knowledge` — работает как прежде).
+- Справка `zam log term --code`: значение, начинающееся с «-», — через «=»: `--code=--dry-run`
+  (`--code --dry-run` — по-прежнему ошибка разбора: флаг не проглатывается значением).
 
 ## [0.0.12-m6.5] - 2026-11-16
 

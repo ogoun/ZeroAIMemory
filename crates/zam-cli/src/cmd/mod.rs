@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use clap::Args;
 use serde_json::{Value, json};
 
-use crate::client::{CliError, Client, EXIT_CONFIG, EXIT_TOKEN, read_json};
+use crate::client::{CliError, Client, EXIT_CONFIG, EXIT_TOKEN, EXIT_UNREACHABLE, read_json};
 use crate::locate::{self, Flags};
 use crate::target::{self, Loc, Solution};
 
@@ -50,6 +50,83 @@ pub struct Common {
     /// Вывод в JSON
     #[arg(long)]
     pub json: bool,
+}
+
+/// Наибольшая страница ленты записей у сервера — `zam_store::entries::LIST_LIMIT_MAX` (клиент
+/// от `zam-store` не зависит: значение повторено здесь, менять вместе).
+pub const LIST_LIMIT_MAX: u32 = 200;
+
+/// Страницы ленты журнала (`zam insight|task|question|idea list`, M6.6 §9, замечание 16г).
+#[derive(Args, Debug, Clone, Copy)]
+pub struct Paging {
+    /// Записей на странице, 1–200 (вся лента — --all)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(LIST_LIMIT_MAX)))]
+    pub limit: Option<u32>,
+    /// Вся лента: страницы по 200 до конца
+    #[arg(long, conflicts_with = "limit")]
+    pub all: bool,
+}
+
+/// Строка stderr об обрезанной ленте: показано `n` записей, на сервере есть ещё. Совет
+/// `--limit` — только пока страница меньше [`LIST_LIMIT_MAX`].
+fn more_hint(n: usize) -> String {
+    if n >= LIST_LIMIT_MAX as usize {
+        format!("показано {n}, есть ещё: --all")
+    } else {
+        format!("показано {n}, есть ещё: --limit {LIST_LIMIT_MAX} или --all")
+    }
+}
+
+/// Лента записей журнала `GET /spaces/{space}/entries` с фильтрами `query` — общий обход
+/// `zam insight|task|question|idea list` (M6.6 §9, замечание 16г). `limit` — записей на
+/// странице (`None` — умолчание сервера, 50); `all` — страницы по [`LIST_LIMIT_MAX`] по
+/// `next_cursor` до конца. Записи ещё есть, а `all` нет — строка [`more_hint`] в stderr (и с
+/// `--json`): лента больше не обрезается молча. Ответ — как у сервера, `{items, next_cursor}`;
+/// у `all` — все записи и `next_cursor: null`.
+pub fn list_entries(
+    ctx: &Ctx,
+    space: &str,
+    query: &[(&str, &str)],
+    limit: Option<u32>,
+    all: bool,
+) -> Result<Value, CliError> {
+    let path = format!("/spaces/{space}/entries");
+    let page = if all { Some(LIST_LIMIT_MAX) } else { limit }.map(|l| l.to_string());
+    let mut items: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut v = {
+            let mut q = query.to_vec();
+            if let Some(l) = &page {
+                q.push(("limit", l));
+            }
+            if let Some(c) = &cursor {
+                q.push(("cursor", c));
+            }
+            read_json(ctx.client.get(&path, &q)?)?
+        };
+        if let Some(a) = v["items"].as_array_mut() {
+            items.append(a);
+        }
+        match v["next_cursor"].as_str().map(str::to_string) {
+            // сервер вернул тот же курсор — обход не закончится
+            Some(c) if all && cursor.as_deref() == Some(c.as_str()) => {
+                return Err(CliError::new(
+                    EXIT_UNREACHABLE,
+                    format!("сервер повторил курсор ленты «{c}»"),
+                ));
+            }
+            Some(c) if all => cursor = Some(c),
+            next => {
+                if next.is_some() {
+                    eprintln!("{}", more_hint(items.len()));
+                }
+                v["items"] = Value::Array(items);
+                v["next_cursor"] = next.map_or(Value::Null, Value::String);
+                return Ok(v);
+            }
+        }
+    }
 }
 
 pub fn home_dir() -> PathBuf {
@@ -334,4 +411,23 @@ pub fn post_entry(
         return emit_json(&json!({ "entry": e, "created": created }));
     }
     emit(format!("{}@{}\n", e["id"].as_str().unwrap_or("?"), e["rev"]).as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M6.6 §9 (16г): совет `--limit` — пока страница меньше наибольшей, дальше — только `--all`.
+    #[test]
+    fn more_hint_forms() {
+        assert_eq!(
+            more_hint(50),
+            "показано 50, есть ещё: --limit 200 или --all"
+        );
+        assert_eq!(
+            more_hint(199),
+            "показано 199, есть ещё: --limit 200 или --all"
+        );
+        assert_eq!(more_hint(200), "показано 200, есть ещё: --all");
+    }
 }
