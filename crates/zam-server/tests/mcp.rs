@@ -5034,6 +5034,23 @@ fn first_line(o: &Out) -> String {
     o.text.lines().next().unwrap_or("").to_string()
 }
 
+/// Есть ли в тексте ссылка `e:<id>`: `e:` на границе слова и 26 знаков Crockford id — без
+/// крейта `regex` (как `\be:[0-9A-Z]{26}`), чтобы `type:` и `note:` не считались ссылкой.
+fn has_e_ref(t: &str) -> bool {
+    t.match_indices("e:").any(|(i, _)| {
+        let boundary = t[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let id = t.as_bytes().get(i + 2..i + 28);
+        boundary
+            && id.is_some_and(|b| {
+                b.iter()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+            })
+    })
+}
+
 /// Замечание 13 (M6.6 §8): `memory_update_entry action=triggers` с `rev` заменяет набор
 /// триггеров insight целиком (`PATCH {triggers}` с `If-Match`), `[]` снимает все; ответ —
 /// «Обновлено i:<id> rev<N> · триггеров K» (ревизии триггеры не создают, M3), ETag
@@ -5296,6 +5313,50 @@ async fn mcp_tree_space_prefix() {
     )
     .await;
     assert!(o.is_error && o.text.contains("foo"), "{}", o.text);
+    // исключение MCP (решение координатора, задача 7): 26-символьный id пространства перед «:/»
+    // — это пространство, у memory_write и memory_tree; `foo:x` без косой — путь, как в CLI
+    let j = tree(json!({"space": "knowledge", "format": "json"}))
+        .await
+        .json();
+    let sid = j["space"]["id"].as_str().unwrap().to_string();
+    assert_eq!(sid.len(), 26, "{j}");
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": format!("{sid}:/Сборка/По id"), "content": "# По id\n"}),
+    )
+    .await;
+    assert!(
+        o.text.contains(&format!("{sid}:/Сборка/По id")),
+        "{}",
+        o.text
+    );
+    let o = tree(json!({"path": format!("{sid}:/Сборка")})).await;
+    assert!(!o.is_error, "{}", o.text);
+    assert!(o.text.contains("Сборка/По id"), "{}", o.text);
+    let o = tree(json!({"space": "knowledge", "path": "Сборка"})).await;
+    assert!(o.text.contains("Сборка/По id"), "в Knowledge: {}", o.text);
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": "foo:Сборка/Заметка", "content": "# foo\n"}),
+    )
+    .await;
+    assert!(
+        o.text.contains("knowledge:/foo:Сборка/Заметка"),
+        "{}",
+        o.text
+    );
+    let o = tree(json!({"path": "foo:Сборка"})).await;
+    assert!(
+        o.text.contains("foo:Сборка/Заметка"),
+        "foo:Сборка — путь: {}",
+        o.text
+    );
     let def = tool_def(&a, "memory_tree").await;
     let d = def["description"].as_str().unwrap();
     assert!(d.contains("rules:/"), "{d}");
@@ -5359,7 +5420,7 @@ async fn mcp_link_reply_uses_agent_refs() {
             line.ends_with(&format!("{src} —relates_to→ {}", dst.trim())),
             "{line}"
         );
-        assert!(!o.text.contains("e:"), "{}", o.text);
+        assert!(!has_e_ref(&o.text), "{}", o.text);
     }
     let o = link(format!("i:{i}"), "[[Ripgrep]]".into()).await;
     let line = &body_lines(&o)[0];
@@ -5367,7 +5428,13 @@ async fn mcp_link_reply_uses_agent_refs() {
         line.ends_with(&format!("i:{i} —relates_to→ [[Ripgrep]] (n:{nid})")),
         "{line}"
     );
-    assert!(!o.text.contains("e:"), "{}", o.text);
+    assert!(!has_e_ref(&o.text), "{}", o.text);
+    // сама проверка: ссылка `e:` находится, слова с двоеточием — нет
+    let id = "01M7M3NBMFEF39Q8FMKV32NXD1";
+    assert!(has_e_ref(&format!("Связь x: e:{id} —relates_to→ n:{id}")));
+    assert!(has_e_ref(&format!("(e:{id})")));
+    assert!(!has_e_ref(&format!("type: note: n:{id} ~12 tok")));
+    assert!(!has_e_ref(&format!("une:{id}")));
 }
 
 /// Замечание 31 (M6.6 §8): схема `memory_log.data` — подсвойства с типами (`version` у

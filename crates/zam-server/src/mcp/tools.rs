@@ -487,7 +487,7 @@ fn log_data_schema() -> Value {
             "required": ["checked", "method", "result"]},
         "decision": {"type": "object",
             "description": format!(
-                "insight decision — ADR: context, options (отвергнутое и выбранное, до \
+                "insight decision — ADR: context, options (отвергнутые варианты, до \
                  {DECISION_OPTIONS_MAX}), chosen, rationale, consequences, decided_by \
                  human|agent, revisit_if"),
             "properties": {
@@ -1053,8 +1053,8 @@ async fn tree(rest: &Rest, args: &JsonObject) -> Res {
 
 /// Пространство `memory_tree`: `space` (как префикс: `solution` — решение из `X-Zam-Solution`,
 /// GUID — в нижнем регистре; прочее — как есть) или префикс `path`; заданы оба — должны
-/// совпадать, иначе ошибка аргумента: какое из двух имел в виду агент, неизвестно (M6.6 §8,
-/// решение координатора 3). Ни того, ни другого — пространство по умолчанию.
+/// совпадать, иначе ошибка аргумента: какое из двух имел в виду агент, неизвестно (M6.6 §8). Ни
+/// того, ни другого — пространство по умолчанию.
 fn tree_space(rest: &Rest, arg: Option<&str>, prefix: Option<String>) -> Result<String, Fail> {
     let arg = match arg.map(str::trim).filter(|s| !s.is_empty()) {
         None => None,
@@ -1087,10 +1087,12 @@ fn header_solution(rest: &Rest, what: &str) -> Result<String, Fail> {
 
 /// Префикс пространства в `path` (`memory_tree`, `memory_write`; M6.6 §8) по правилу CLI
 /// [`zam_core::space::split_space`]: пространство REST (`solution:` — решение из
-/// `X-Zam-Solution`; `None` — префикса нет) и путь без `/` по краям. Слово, которого правило не
-/// знает, перед `:/` (`foo:/a`, `Knowledge:/a`, имя решения из заголовка дерева) — ошибка
-/// аргумента, а не путь «foo:/a» в пространстве по умолчанию: так оно и раньше было ошибкой
-/// (404), а молча завести папку «foo:» хуже **[решение исполнителя, задача 7]**.
+/// `X-Zam-Solution`; `None` — префикса нет) и путь без `/` по краям. Исключение MCP — форма
+/// `<слово>:/…`, слово которой правило не знает **[решение координатора, задача 7]**:
+/// 26-символьный id пространства ([`zam_core::Id`], как принимает REST) — это пространство
+/// (прежнее поведение `memory_write`); прочее (`foo:/a`, `Knowledge:/a`, имя решения из заголовка
+/// дерева) — ошибка аргумента, а не путь «foo:/a»: раньше это было 404, а молча завести папку
+/// «foo:» хуже. `слово:x` без косой — путь, как в CLI.
 fn space_prefix<'a>(rest: &Rest, raw: &'a str) -> Result<(Option<String>, &'a str), Fail> {
     use zam_core::space::SpaceSel;
     let (sel, path) = zam_core::space::split_space(raw);
@@ -1098,18 +1100,19 @@ fn space_prefix<'a>(rest: &Rest, raw: &'a str) -> Result<(Option<String>, &'a st
         SpaceSel::Fixed(n) => Some(n.to_string()),
         SpaceSel::Guid(g) => Some(g),
         SpaceSel::Solution => Some(header_solution(rest, "path solution:…")?),
-        SpaceSel::Default => {
-            if let Some((word, _)) = raw.split_once(":/")
-                && !word.is_empty()
-                && !word.contains('/')
-            {
+        SpaceSel::Default => match raw.split_once(":/") {
+            Some((word, tail)) if !word.is_empty() && !word.contains('/') => {
+                if word.len() == 26 && word.parse::<zam_core::Id>().is_ok() {
+                    return Ok((Some(word.to_string()), tail.trim_matches('/')));
+                }
                 return Err(Fail::Invalid(format!(
                     "path: неизвестное пространство «{word}» — rules, knowledge, human, \
-                     solution или GUID решения; без префикса — пространство по умолчанию"
+                     solution, GUID решения или id пространства; без префикса — пространство по \
+                     умолчанию"
                 )));
             }
-            None
-        }
+            _ => None,
+        },
     };
     Ok((space, path))
 }
