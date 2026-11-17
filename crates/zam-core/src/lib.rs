@@ -5,6 +5,7 @@ pub mod id;
 pub mod link;
 pub mod snapshot;
 pub mod solution;
+pub mod space;
 pub mod target;
 pub mod text;
 pub mod time;

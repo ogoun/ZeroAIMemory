@@ -87,7 +87,7 @@ pub const INSIGHT_KINDS: [&str; 6] = [
     "pattern",
 ];
 /// Итоги эксперимента (`data.experiment.result`).
-const EXPERIMENT_RESULTS: [&str; 3] = ["confirmed", "refuted", "inconclusive"];
+pub(crate) const EXPERIMENT_RESULTS: [&str; 3] = ["confirmed", "refuted", "inconclusive"];
 /// Ближайших точек на запрос дедупликации: у записи несколько чанков, часть кандидатов
 /// отсеивается проверкой по SQLite. [решение исполнителя]
 const DEDUP_NEAREST: usize = 20;
@@ -201,7 +201,7 @@ const DECISION_TOP_LEVEL: [&str; 5] = [
 /// Предел длины строк `data.decision` (символов).
 const DECISION_TEXT_MAX: usize = 2000;
 /// Вариантов в `data.decision.options`.
-const DECISION_OPTIONS_MAX: usize = 8;
+pub(crate) const DECISION_OPTIONS_MAX: usize = 8;
 /// Ключи `data.decision` (ADR, спецификация M4.5 §5.1).
 const DECISION_KEYS: [&str; 7] = [
     "context",

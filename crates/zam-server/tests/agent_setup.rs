@@ -1563,3 +1563,81 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         }
     }
 }
+
+/// Протокол (M6.6 §8, замечания 13, 31, 33; ru и en синхронно): правка триггеров без замещения
+/// (`action=triggers`, набор целиком, CLI `zam insight triggers`), формы `data` у `release` и
+/// `experiment`, статус задачи при создании не задаётся (`data.status` — 422, дальше —
+/// `action=status`); `triggers` — среди действий правки записи.
+#[tokio::test]
+async fn guide_has_release_experiment_forms_and_triggers() {
+    let a = api("agent-guide-m66-mcp", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    fn section<'a>(g: &'a str, title: &str) -> &'a str {
+        let sec = g
+            .split(&format!("\n## {title}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("нет раздела «## {title}»"));
+        sec.split("\n## ").next().unwrap()
+    }
+    let ru = guide("").await;
+    let w = section(&ru, "Запись");
+    for want in [
+        "широкий или неверный триггер — `action=triggers` (набор целиком), замещать запись не нужно",
+        "memory_update_entry {id, rev, action: \"triggers\", triggers: […]}",
+        "`[]` — снять все",
+        "zam insight triggers <id> --trigger ВИД:ШАБЛОН",
+        "--clear",
+        "`release` — релиз: `data: {version (обязательна, 1–64), date?: YYYY-MM-DD, git_tag?, \
+         commits?: [{sha, subject?}]}`; CLI — `zam release add`",
+        "`data.experiment: {hypothesis?, method?, result: confirmed|refuted|inconclusive}`",
+        "`certify`, `append`, `triggers`, `feedback`",
+    ] {
+        assert!(w.contains(want), "ru «Запись»: нет «{want}»: {w}");
+    }
+    let t = section(&ru, "Задачи и передача работы");
+    assert!(
+        t.contains(
+            "статус при создании не задаётся: `data.status` — 422, новая задача — `open`, \
+             дальше — `action: \"status\"` (CLI `zam task status`)"
+        ),
+        "{t}"
+    );
+    let en = guide("?lang=en").await;
+    let w = section(&en, "Writing");
+    for want in [
+        "a broad or wrong trigger — `action=triggers` (the whole set), no need to supersede the \
+         record",
+        "memory_update_entry {id, rev, action: \"triggers\", triggers: […]}",
+        "`[]` — remove all",
+        "zam insight triggers <id> --trigger TYPE:PATTERN",
+        "--clear",
+        "`release` — a release: `data: {version (required, 1–64), date?: YYYY-MM-DD, git_tag?, \
+         commits?: [{sha, subject?}]}`; CLI — `zam release add`",
+        "`data.experiment: {hypothesis?, method?, result: confirmed|refuted|inconclusive}`",
+        "`certify`, `append`, `triggers`, `feedback`",
+    ] {
+        assert!(w.contains(want), "en «Writing»: нет «{want}»: {w}");
+    }
+    let t = section(&en, "Tasks and handing work over");
+    assert!(
+        t.contains(
+            "the status is not set on creation: `data.status` — 422, a new task is `open`, \
+             then — `action: \"status\"` (CLI `zam task status`)"
+        ),
+        "{t}"
+    );
+}

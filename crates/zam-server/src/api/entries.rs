@@ -85,7 +85,7 @@ pub(crate) const REF_MAX_CHARS: usize = 1000;
 /// Предел числа коммитов релиза.
 const COMMITS_MAX: usize = 5000;
 /// Предел длины версии релиза, символов.
-const VERSION_MAX_CHARS: usize = 64;
+pub(crate) const VERSION_MAX_CHARS: usize = 64;
 /// Предел длины `git_tag` и `sha`, символов. [решение исполнителя]
 const TAG_MAX_CHARS: usize = 200;
 const SUBJECT_MAX_CHARS: usize = 1000;
@@ -231,6 +231,11 @@ fn check_data(kind: EntryKind, data: &Value) -> Result<Value, ApiError> {
         EntryKind::Term => Err(unprocessable(
             "term пишется через POST /spaces/{space}/entries с kind: term",
         )),
+        // только создание (`PATCH` задачи — `task_data_patch`): статус новой задачи — `open`, его
+        // меняет правка, и 422 говорит какая (M6.6 §8, решение координатора 19)
+        EntryKind::Task if data.get("status").is_some() => {
+            Err(unprocessable(super::tasks::STATUS_ON_CREATE))
+        }
         EntryKind::Task => zam_store::check_task(data)
             .map(|t| t.to_value())
             .map_err(unprocessable),

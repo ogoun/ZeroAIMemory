@@ -1,5 +1,5 @@
 //! Insights (§7.5, §13.2): `zam log insight …` и `zam insight list|show|supersede|retract|
-//! revisit|append|certify|feedback`.
+//! revisit|triggers|append|certify|feedback`.
 //!
 //! - `zam log insight --kind K --title T [--scope solution|global] [--certainty C]
 //!   [--reason R] [--evidence-file F] [--trigger TYPE:PATTERN]… [--tag X]… [--force] [--supersedes ID]
@@ -22,11 +22,14 @@
 //!   (`--evidence-file` дописывается в `data.evidence`); `axiom` агент ставит и меняет только
 //!   по прямому указанию пользователя (§14.2), сервер это не проверяет.
 //!
+//! - `zam insight triggers ID (--trigger TYPE:PATTERN… | --clear)` — набор триггеров целиком без
+//!   замещения записи (M6.6 §8): `[]` при `--clear`; печать — `<id>@<rev> триггеров K` и строки
+//!   `триггер: вид:шаблон`, как в `show`.
 //! - `zam insight feedback ID useful|useless [--session S]` — оценка полезности записи (§10.5,
 //!   `POST /entries/{id}/feedback`, источник `agent`); печатает `<id> <оценка>`. Показы и оценки
 //!   (`usage`) — в `insight show`.
 //!
-//! `certify`, `append` и `revisit` правят запись с ревизией (§11.3): `rev` — из
+//! `certify`, `append`, `revisit` и `triggers` правят запись с ревизией (§11.3): `rev` — из
 //! `GET /entries/{id}`, запрос — с `If-Match`; запись изменилась между чтением и правкой (409) —
 //! «запись изменилась (rev N → M): перечитайте», код 4.
 use std::path::Path;
@@ -361,13 +364,7 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
             out.push_str(&format!("{label}: {x}\n"));
         }
     }
-    for t in e["triggers"].as_array().into_iter().flatten() {
-        out.push_str(&format!(
-            "триггер: {}:{}\n",
-            t["type"].as_str().unwrap_or("?"),
-            t["pattern"].as_str().unwrap_or("")
-        ));
-    }
+    out.push_str(&trigger_lines(&e));
     let u = &e["usage"];
     if u.is_object() {
         out.push_str(&format!(
@@ -381,6 +378,48 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
         out.push_str(body.trim_end());
         out.push('\n');
     }
+    emit(out.as_bytes())
+}
+
+/// Строки `триггер: <вид>:<шаблон>` записи (`show`, `triggers`).
+fn trigger_lines(e: &Value) -> String {
+    e["triggers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            format!(
+                "триггер: {}:{}\n",
+                t["type"].as_str().unwrap_or("?"),
+                t["pattern"].as_str().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+/// `zam insight triggers <id> (--trigger ВИД:ШАБЛОН… | --clear)` (M6.6 §8, замечание 13): набор
+/// триггеров заменяется целиком без замещения записи — `PATCH {triggers}` с `If-Match` ревизии
+/// из `GET`, как у `certify`; пустой набор снимает все. Неверный триггер — код 6 до запросов;
+/// запись изменилась между чтением и правкой — код 4. Печать — `<id>@<rev> триггеров K` (как
+/// `<id>@<rev> <статус>` соседних правок) и новый набор строками, как в `show`.
+pub fn triggers(ctx: &Ctx, id: &str, raw: &[String]) -> Result<(), CliError> {
+    let id = crate::target::bare_entry_id(id);
+    let set = raw
+        .iter()
+        .map(|t| parse_trigger(t))
+        .collect::<Result<Vec<_>, _>>()?;
+    let rev = rev_of(&get_entry(ctx, id)?)?;
+    let e = patch_entry(ctx, id, rev, &json!({ "triggers": set }))?;
+    if ctx.json {
+        return emit_json(&e);
+    }
+    let n = e["triggers"].as_array().map_or(0, Vec::len);
+    let mut out = format!(
+        "{}@{} триггеров {n}\n",
+        e["id"].as_str().unwrap_or(id),
+        e["rev"]
+    );
+    out.push_str(&trigger_lines(&e));
     emit(out.as_bytes())
 }
 

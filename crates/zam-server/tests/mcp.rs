@@ -4848,7 +4848,7 @@ async fn memory_write_idempotency_key() {
 
 /// Мелочи приложения zero-agent: префикс `w:` есть в списках ссылок MCP и работает в
 /// `memory_read`; описание `memory_update_entry` называет все действия без `rev` (отрезок
-/// «без rev: … .», с `review` M6.5) и с ней («action … — с ревизией rev»).
+/// «без rev: … .», с `review` M6.5) и с ней («action … — с ревизией rev», с `triggers` M6.6).
 #[tokio::test]
 async fn mcp_ref_prefixes_include_w() {
     let a = api("mcp-ref-w", |_| {}).await;
@@ -4883,7 +4883,8 @@ async fn mcp_ref_prefixes_include_w() {
             "revisit",
             "certify",
             "append",
-            "status"
+            "status",
+            "triggers"
         ],
         "действия с rev: {d}"
     );
@@ -5000,4 +5001,439 @@ async fn mcp_v7_descriptions_focus_seen_rejected() {
     ] {
         assert!(s.contains(w), "instructions: нет «{w}»: {s}");
     }
+}
+
+// ---- M6.6 §8: ответы MCP и правка триггеров ----
+
+/// Id из ответа инструмента по букве ссылки (`i:`, `k:`, `n:` …).
+fn ref_id(o: &Out, letter: &str) -> String {
+    let p = format!("{letter}:");
+    o.text
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix(p.as_str()))
+        .unwrap_or_else(|| panic!("нет {p}: {}", o.text))
+        .to_string()
+}
+
+/// Действующие триггеры Knowledge (`GET /triggers`): ETag и шаблоны по порядку.
+async fn triggers_now(a: &Api) -> (String, Vec<String>) {
+    let r = a.t(Method::GET, "/api/v1/triggers", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let patterns = j["triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["pattern"].as_str().unwrap().to_string())
+        .collect();
+    (r.header("etag").to_string(), patterns)
+}
+
+/// Первая строка текста (problem без подсказки инструмента).
+fn first_line(o: &Out) -> String {
+    o.text.lines().next().unwrap_or("").to_string()
+}
+
+/// Замечание 13 (M6.6 §8): `memory_update_entry action=triggers` с `rev` заменяет набор
+/// триггеров insight целиком (`PATCH {triggers}` с `If-Match`), `[]` снимает все; ответ —
+/// «Обновлено i:<id> rev<N> · триггеров K» (ревизии триггеры не создают, M3), ETag
+/// `GET /triggers` меняется. Неверный триггер —
+/// тот же 422, что у `memory_log insight` (общий разбор REST); без `triggers` — ошибка
+/// аргументов; устаревшая `rev` — 409 с текущей. В описании `triggers` — в отрезке действий «с
+/// ревизией rev».
+#[tokio::test]
+async fn mcp_update_entry_triggers_replace() {
+    let a = api("mcp-triggers-replace", |_| {}).await;
+    let h = sess();
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_log",
+        json!({"kind": "insight", "title": "LF в shell", "body": "CRLF ломает shebang.",
+               "data": {"kind": "gotcha"},
+               "triggers": [{"type": "file_glob", "pattern": "**/*"}]}),
+    )
+    .await;
+    let id = ref_id(&o, "i");
+    let (e1, p1) = triggers_now(&a).await;
+    assert_eq!(p1, ["**/*"]);
+    let upd = |rev: i64, triggers: Value| json!({"id": format!("i:{id}"), "rev": rev, "action": "triggers", "triggers": triggers});
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        upd(
+            1,
+            json!([{"type": "file_glob", "pattern": "**/*.sh"},
+                   {"type": "error_regex", "pattern": "bad interpreter", "tools": ["Bash"]}]),
+        ),
+    )
+    .await;
+    // триггеры в ревизию записи не входят (M3): ревизия та же, `If-Match` — проверяется
+    assert_eq!(
+        body_lines(&o),
+        [format!("Обновлено i:{id} rev1 · триггеров 2")]
+    );
+    let (e2, p2) = triggers_now(&a).await;
+    assert_ne!(e1, e2, "ETag набора триггеров не изменился");
+    assert_eq!(p2, ["**/*.sh", "bad interpreter"]);
+    // устаревшая ревизия (запись дописана — rev2) — 409 с текущей, набор прежний
+    ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_update_entry",
+        json!({"id": format!("i:{id}"), "rev": 1, "action": "append", "body": "Ещё."}),
+    )
+    .await;
+    let o = tool(&a, &a.token, &h, "memory_update_entry", upd(1, json!([]))).await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(
+        o.text.contains("Ошибка 409") && o.text.contains("Текущая ревизия — 2"),
+        "{}",
+        o.text
+    );
+    // без triggers (или null) — ошибка аргументов, не пустая правка
+    for args in [
+        json!({"id": format!("i:{id}"), "rev": 2, "action": "triggers"}),
+        json!({"id": format!("i:{id}"), "rev": 2, "action": "triggers", "triggers": null}),
+    ] {
+        let o = tool(&a, &a.token, &h, "memory_update_entry", args).await;
+        assert!(o.is_error, "{}", o.text);
+        assert!(
+            o.text.starts_with("Ошибка аргументов: triggers"),
+            "{}",
+            o.text
+        );
+    }
+    // неверный триггер — тот же текст 422, что у memory_log insight
+    let bad = json!([{"type": "glob", "pattern": "*.sh"}]);
+    let u = tool(&a, &a.token, &h, "memory_update_entry", upd(2, bad.clone())).await;
+    let l = tool(
+        &a,
+        &a.token,
+        &h,
+        "memory_log",
+        json!({"kind": "insight", "title": "Другая ловушка", "data": {"kind": "gotcha"},
+               "triggers": bad}),
+    )
+    .await;
+    assert!(u.is_error && l.is_error, "{}\n{}", u.text, l.text);
+    assert!(first_line(&u).contains("triggers[0]"), "{}", u.text);
+    assert_eq!(first_line(&u), first_line(&l));
+    assert_eq!(triggers_now(&a).await, (e2.clone(), p2));
+    // [] снимает все
+    let o = ok(&a, &a.token, &h, "memory_update_entry", upd(2, json!([]))).await;
+    assert_eq!(
+        body_lines(&o),
+        [format!("Обновлено i:{id} rev2 · триггеров 0")]
+    );
+    let (e3, p3) = triggers_now(&a).await;
+    assert_ne!(e2, e3);
+    assert!(p3.is_empty(), "{p3:?}");
+    // format: json — запись REST с новым набором
+    let mut args = upd(2, json!([{"type": "keyword", "pattern": "crlf"}]));
+    args["format"] = json!("json");
+    let o = ok(&a, &a.token, &h, "memory_update_entry", args).await;
+    let j = o.json();
+    assert_eq!(j["rev"], 2, "{j}");
+    assert_eq!(j["triggers"][0]["pattern"], "crlf", "{j}");
+    // схема: действие в enum, в описании — в отрезке «с ревизией rev»
+    let def = tool_def(&a, "memory_update_entry").await;
+    let d = def["description"].as_str().unwrap();
+    assert!(d.chars().count() <= 300, "{}", d.chars().count());
+    let with_rev = d
+        .split_once("action ")
+        .and_then(|(_, t)| t.split_once(" — с ревизией rev"))
+        .map(|(l, _)| l.split('|').map(str::trim).collect::<Vec<_>>())
+        .unwrap_or_else(|| panic!("нет отрезка «с ревизией rev»: {d}"));
+    assert!(with_rev.contains(&"triggers"), "{d}");
+    let p = &def["inputSchema"]["properties"];
+    assert!(
+        p["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("triggers")),
+        "{def}"
+    );
+    let td = p["triggers"]["description"].as_str().unwrap_or("");
+    assert!(td.contains("triggers") && td.contains("[]"), "{td}");
+}
+
+/// Замечание 26 (M6.6 §8): `memory_tree` и `memory_write` разбирают префикс пространства в
+/// `path` по правилу CLI (`rules:`, `rules:/`, `rules:/a`, `rules:a`; `knowledge`, `human`,
+/// `solution`, GUID); `space` и префикс расходятся — ошибка аргумента, совпадают — принято.
+#[tokio::test]
+async fn mcp_tree_space_prefix() {
+    let a = api("mcp-tree-prefix", |_| {}).await;
+    // Rules агенту по токену только для чтения (rules.agent_write) — пишет администратор
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": "rules", "path": "Стиль/Коротко", "kind": "note",
+                        "content": "# Коротко\n\nПиши коротко.\n"}),
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    a.note("knowledge", "Сборка/Кэш", "# Кэш\n\nОбщий target.\n")
+        .await;
+    let ar = &a;
+    let tree = |args: Value| async move { tool(ar, &ar.token, &[], "memory_tree", args).await };
+    for path in ["rules:", "rules:/"] {
+        let o = tree(json!({"path": path, "depth": 2})).await;
+        assert!(!o.is_error, "{path}: {}", o.text);
+        assert!(
+            o.text.contains("Стиль/Коротко") && !o.text.contains("Сборка"),
+            "{path}: {}",
+            o.text
+        );
+    }
+    for path in ["rules:/Стиль", "rules:Стиль", "rules:/Стиль/"] {
+        let o = tree(json!({"path": path})).await;
+        assert!(!o.is_error, "{path}: {}", o.text);
+        assert!(o.text.contains("Стиль/Коротко"), "{path}: {}", o.text);
+    }
+    // space и префикс совпадают — принято; расходятся — ошибка аргумента
+    let o = tree(json!({"space": "rules", "path": "rules:/Стиль"})).await;
+    assert!(!o.is_error, "{}", o.text);
+    let o = tree(json!({"space": "knowledge", "path": "rules:/Стиль"})).await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(
+        o.text.starts_with("Ошибка аргументов:")
+            && o.text.contains("space")
+            && o.text.contains("rules"),
+        "{}",
+        o.text
+    );
+    // без префикса — space или пространство по умолчанию, как раньше
+    let o = tree(json!({"space": "knowledge", "path": "Сборка"})).await;
+    assert!(o.text.contains("Сборка/Кэш"), "{}", o.text);
+    // неизвестное пространство перед «:/» — ошибка аргумента, а не путь «foo:/…»
+    let o = tree(json!({"path": "foo:/Стиль"})).await;
+    assert!(o.is_error && o.text.contains("foo"), "{}", o.text);
+    // GUID решения — в любом регистре; solution: — из X-Zam-Solution
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    let upper = G.to_uppercase();
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": format!("{upper}:/Решение/Заметка"), "content": "# Заметка\n"}),
+    )
+    .await;
+    assert!(
+        o.text.contains(&format!("{G}:/Решение/Заметка")),
+        "{}",
+        o.text
+    );
+    let o = tree(json!({"path": format!("{G}:"), "depth": 2})).await;
+    assert!(o.text.contains("Решение/Заметка"), "{}", o.text);
+    let o = tree(json!({"space": G, "path": format!("{upper}:/Решение")})).await;
+    assert!(!o.is_error, "{}", o.text);
+    let hdr = [("x-zam-solution", G)];
+    let o = ok(
+        &a,
+        &a.token,
+        &hdr,
+        "memory_tree",
+        json!({"path": "solution:/Решение"}),
+    )
+    .await;
+    assert!(o.text.contains("Решение/Заметка"), "{}", o.text);
+    for args in [
+        json!({"space": G, "path": "solution:Решение"}),
+        json!({"space": "solution", "path": "Решение"}),
+        json!({"space": "solution", "path": format!("{upper}:Решение")}),
+    ] {
+        let o = ok(&a, &a.token, &hdr, "memory_tree", args.clone()).await;
+        assert!(o.text.contains("Решение/Заметка"), "{args}: {}", o.text);
+    }
+    let o = tree(json!({"path": "solution:/Решение"})).await;
+    assert!(
+        o.is_error && o.text.contains("X-Zam-Solution"),
+        "{}",
+        o.text
+    );
+    // memory_write: префикс без косой, пустой путь после префикса — ошибка аргумента
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": "knowledge:Сборка/Новая", "content": "# Новая\n"}),
+    )
+    .await;
+    assert!(o.text.contains("knowledge:/Сборка/Новая"), "{}", o.text);
+    for path in ["rules:", "rules:/", "knowledge:/"] {
+        let o = tool(
+            &a,
+            &a.token,
+            &[],
+            "memory_write",
+            json!({"path": path, "content": "# X\n"}),
+        )
+        .await;
+        assert!(o.is_error, "{path}: {}", o.text);
+        assert!(
+            o.text.starts_with("Ошибка аргументов: path"),
+            "{path}: {}",
+            o.text
+        );
+    }
+    let o = tool(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": "foo:/Сборка/X", "content": "# X\n"}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("foo"), "{}", o.text);
+    let def = tool_def(&a, "memory_tree").await;
+    let d = def["description"].as_str().unwrap();
+    assert!(d.contains("rules:/"), "{d}");
+}
+
+/// Замечание 29 (M6.6 §8): ответ `memory_link` называет концы так, как их передал агент
+/// (`i:`, `k:`, `n:` …), без `e:` маршрута `/edges`; у `[[Имя]]` — ещё найденная заметка.
+#[tokio::test]
+async fn mcp_link_reply_uses_agent_refs() {
+    let a = api("mcp-link-refs", |_| {}).await;
+    let h = sess();
+    let n = a
+        .note(
+            "knowledge",
+            "Инструменты/Ripgrep",
+            "# Ripgrep\n\nrg --hidden.\n",
+        )
+        .await;
+    let nid = n["id"].as_str().unwrap().to_string();
+    let i = ref_id(
+        &ok(
+            &a,
+            &a.token,
+            &h,
+            "memory_log",
+            json!({"kind": "insight", "title": "rg пропускает скрытые", "data": {"kind": "gotcha"}}),
+        )
+        .await,
+        "i",
+    );
+    let k = ref_id(
+        &ok(
+            &a,
+            &a.token,
+            &h,
+            "memory_log",
+            json!({"kind": "task", "title": "Проверить поиск", "body": "план"}),
+        )
+        .await,
+        "k",
+    );
+    let ar = &a;
+    let link = |src: String, dst: String| async move {
+        ok(
+            ar,
+            &ar.token,
+            &sess(),
+            "memory_link",
+            json!({"src": src, "type": "relates_to", "dst": dst}),
+        )
+        .await
+    };
+    for (src, dst) in [
+        (format!("i:{i}"), format!("k:{k}")),
+        (format!("n:{nid}"), format!(" i:{i} ")),
+        (format!("k:{k}"), format!("n:{nid}")),
+    ] {
+        let o = link(src.clone(), dst.clone()).await;
+        let line = &body_lines(&o)[0];
+        assert!(
+            line.ends_with(&format!("{src} —relates_to→ {}", dst.trim())),
+            "{line}"
+        );
+        assert!(!o.text.contains("e:"), "{}", o.text);
+    }
+    let o = link(format!("i:{i}"), "[[Ripgrep]]".into()).await;
+    let line = &body_lines(&o)[0];
+    assert!(
+        line.ends_with(&format!("i:{i} —relates_to→ [[Ripgrep]] (n:{nid})")),
+        "{line}"
+    );
+    assert!(!o.text.contains("e:"), "{}", o.text);
+}
+
+/// Замечание 31 (M6.6 §8): схема `memory_log.data` — подсвойства с типами (`version` у
+/// release, `date`, `experiment` с `result`, `evidence` с обязательными полями, `decision`),
+/// общее описание — до 300 символов, прочие поля видов по-прежнему проходят (`additionalProperties`
+/// не закрыт).
+#[tokio::test]
+async fn mcp_log_data_schema_typed() {
+    let a = api("mcp-log-data-schema", |_| {}).await;
+    let log = tool_def(&a, "memory_log").await;
+    let data = &log["inputSchema"]["properties"]["data"];
+    assert_eq!(data["type"], "object", "{data}");
+    assert_ne!(data["additionalProperties"], json!(false), "{data}");
+    let d = data["description"].as_str().unwrap();
+    assert!(
+        d.chars().count() <= 300,
+        "data: {} символов",
+        d.chars().count()
+    );
+    for w in ["release", "version", "insight", "term", "question", "idea"] {
+        assert!(d.contains(w), "data: нет «{w}»: {d}");
+    }
+    let p = &data["properties"];
+    assert_eq!(p["version"]["type"], "string", "{data}");
+    assert_eq!(p["version"]["minLength"], 1, "{data}");
+    assert_eq!(p["version"]["maxLength"], 64, "{data}");
+    let vd = p["version"]["description"].as_str().unwrap();
+    assert!(vd.contains("release") && vd.contains("обязательна"), "{vd}");
+    assert_eq!(p["date"]["type"], "string", "{data}");
+    assert!(
+        p["date"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("YYYY-MM-DD"),
+        "{data}"
+    );
+    assert_eq!(p["experiment"]["type"], "object", "{data}");
+    assert_eq!(
+        p["experiment"]["properties"]["result"]["enum"],
+        json!(["confirmed", "refuted", "inconclusive"]),
+        "{data}"
+    );
+    assert_eq!(p["evidence"]["type"], "object", "{data}");
+    assert_eq!(
+        p["evidence"]["required"],
+        json!(["checked", "method", "result"]),
+        "{data}"
+    );
+    assert_eq!(p["decision"]["type"], "object", "{data}");
+    assert!(p["kind"]["description"].is_string(), "{data}");
+    let mut all = Vec::new();
+    schema_descriptions(&log["inputSchema"], "memory_log", &mut all);
+    for (path, d) in all {
+        assert!(
+            d.chars().count() <= 300,
+            "{path}: {} символов",
+            d.chars().count()
+        );
+    }
+    // поля других видов проходят: термин с definition и aliases
+    ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "term", "title": "Выжимка", "data": {"definition": "Короткая сводка"}}),
+    )
+    .await;
 }

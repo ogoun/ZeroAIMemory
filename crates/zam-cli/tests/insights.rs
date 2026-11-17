@@ -588,3 +588,130 @@ fn insight_feedback_counts() {
         Some(0)
     );
 }
+
+/// `zam insight triggers <id> [--trigger ВИД:ШАБЛОН]… [--clear]` (M6.6 §8, замечание 13): набор
+/// заменяется целиком без замещения записи — `PATCH {triggers}` с `If-Match` ревизии из `GET`;
+/// `--clear` снимает все. Вывод — `<id>@<rev> триггеров K` и строки `триггер: вид:шаблон`, как в
+/// `insight show`. Ни `--trigger`, ни `--clear`, оба вместе, неверный триггер — код 6 до
+/// запроса.
+#[test]
+fn insight_triggers_replace_and_clear() {
+    let (url, tok) = start("triggers");
+    let r = tmp("triggers-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "LF в shell",
+            "--scope",
+            "global",
+            "--trigger",
+            "file_glob:**/*",
+        ],
+        "CRLF ломает shebang.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    let o = z(&[
+        "insight",
+        "triggers",
+        &format!("i:{id}"),
+        "--trigger",
+        "file_glob:**/*.sh",
+        "--trigger",
+        "error_regex:bad interpreter: /bin/bash",
+    ]);
+    // триггеры в ревизию записи не входят (M3): ревизия та же
+    assert_eq!(
+        ok(&o),
+        format!(
+            "{id}@1 триггеров 2\nтриггер: file_glob:**/*.sh\n\
+             триггер: error_regex:bad interpreter: /bin/bash\n"
+        )
+    );
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["rev"], 1, "{e}");
+    assert_eq!(e["status"], "active", "запись не замещена: {e}");
+    assert_eq!(e["triggers"][0]["pattern"], "**/*.sh", "{e}");
+    assert_eq!(e["triggers"][1]["type"], "error_regex", "{e}");
+    assert_eq!(e["triggers"].as_array().unwrap().len(), 2, "{e}");
+    let o = z(&["insight", "triggers", &id, "--clear"]);
+    assert_eq!(ok(&o), format!("{id}@1 триггеров 0\n"));
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["triggers"], serde_json::json!([]), "{e}");
+    let j = json(&z(&[
+        "insight",
+        "triggers",
+        &id,
+        "--trigger",
+        "keyword:crlf",
+        "--json",
+    ]));
+    assert_eq!(
+        (&j["rev"], &j["triggers"][0]["pattern"]),
+        (&serde_json::json!(1), &serde_json::json!("crlf"))
+    );
+    // ошибки разбора — код 6 до запроса: недоступный адрес не мешает
+    for args in [
+        vec!["insight", "triggers", "01E"],
+        vec![
+            "insight",
+            "triggers",
+            "01E",
+            "--clear",
+            "--trigger",
+            "keyword:x",
+        ],
+        vec!["insight", "triggers", "01E", "--trigger", "glob:*.sh"],
+    ] {
+        let o = zam("http://127.0.0.1:9", "t", &r, &args, b"");
+        assert_eq!(o.status.code(), Some(6), "{args:?}: {}", err(&o));
+    }
+}
+
+/// `zam insight triggers` берёт ревизию из `GET /entries/{id}` и шлёт `If-Match` с ней; запись
+/// изменилась между чтением и правкой (409) — код 4, как у `certify`.
+#[test]
+fn insight_triggers_sends_if_match() {
+    let (url, seen) = fake_entry_server(
+        200,
+        r#"{"id":"01E","rev":4,"status":"active","triggers":[]}"#,
+    );
+    let r = tmp("triggers-if-match");
+    let o = zam(
+        &url,
+        "t",
+        &r,
+        &["insight", "triggers", "01E", "--clear"],
+        b"",
+    );
+    assert_eq!(ok(&o), "01E@4 триггеров 0\n");
+    let seen = seen.lock().unwrap().clone();
+    let patch: Vec<&Seen> = seen.iter().filter(|s| s.0 == "PATCH").collect();
+    assert_eq!(patch.len(), 1, "{seen:?}");
+    assert_eq!(patch[0].1, "/api/v1/entries/01E");
+    assert_eq!(patch[0].2.as_deref(), Some("\"3\""), "{seen:?}");
+    let (url, _) = fake_entry_server(
+        409,
+        r#"{"type":"/problems/conflict","title":"Conflict","status":409,"detail":"ревизия записи 5, а не 3","rev":5}"#,
+    );
+    let o = zam(
+        &url,
+        "t",
+        &r,
+        &["insight", "triggers", "01E", "--clear"],
+        b"",
+    );
+    assert_eq!(o.status.code(), Some(4), "{}", err(&o));
+    assert!(
+        err(&o).contains("запись изменилась (rev 3 → 5): перечитайте"),
+        "{}",
+        err(&o)
+    );
+}

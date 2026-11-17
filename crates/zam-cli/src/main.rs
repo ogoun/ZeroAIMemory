@@ -942,6 +942,25 @@ enum InsightCmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Заменить набор триггеров вспоминания целиком, без замещения записи: --trigger
+    /// ВИД:ШАБЛОН (можно повторять) или --clear — снять все
+    #[command(group(
+        clap::ArgGroup::new("set")
+            .required(true)
+            .args(["triggers", "clear"])
+    ))]
+    Triggers {
+        id: String,
+        /// Триггер ВИД:ШАБЛОН: file_glob:**/*.sh, command_regex:…, error_regex:…, keyword:…
+        /// (можно повторять)
+        #[arg(long = "trigger")]
+        triggers: Vec<String>,
+        /// Снять все триггеры
+        #[arg(long, conflicts_with = "triggers")]
+        clear: bool,
+        #[command(flatten)]
+        common: Common,
+    },
     /// Сменить эпистемический статус (обычный токен): axiom (только по прямому указанию
     /// пользователя), theorem (с --evidence-file), hypothesis или none; причина обязательна
     Certify {
@@ -1760,6 +1779,13 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
         InsightCmd::Revisit { id, reason, common } => {
             i::revisit(&cmd::connect(&common)?, &id, reason.as_deref())
         }
+        // `--clear` — пустой набор: группа `set` требует одно из двух, вместе они — конфликт
+        InsightCmd::Triggers {
+            id,
+            triggers,
+            common,
+            ..
+        } => i::triggers(&cmd::connect(&common)?, &id, &triggers),
         InsightCmd::Append {
             id,
             body_file,

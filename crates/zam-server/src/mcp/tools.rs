@@ -11,9 +11,14 @@
 //!   `isError: true`.
 //! - **Пространство по умолчанию** (`memory_tree`, `memory_write`, `memory_log`,
 //!   `memory_vault`) **[решение исполнителя]** — решение из `X-Zam-Solution`, без него —
-//!   `knowledge`.
+//!   `knowledge`. Префикс пространства в `path` у `memory_tree` и `memory_write` — по правилу CLI
+//!   ([`zam_core::space::split_space`], M6.6 §8): `rules:`, `rules:/a`, `knowledge:a`, `human:`,
+//!   `solution:` (решение из `X-Zam-Solution`), GUID решения; `space` дерева и префикс
+//!   расходятся — ошибка аргумента.
 //! - **Ссылки** `i:|c:|r:|t:|k:|q:|w:|e:<id>` (как в карточках поиска) принимаются везде, где REST
-//!   ждёт id записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`.
+//!   ждёт id записи; в `memory_link` они приводятся к `e:<id>` маршрута `/edges`, а ответ называет
+//!   концы так, как их передал агент (M6.6 §8).
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::{HeaderName, Method, StatusCode, header};
@@ -101,8 +106,8 @@ impl ToolName {
             }
             ToolName::Tree => {
                 "Дерево узлов пространства с L0: space — knowledge, rules или GUID решения (по \
-                 умолчанию решение из X-Zam-Solution, иначе knowledge), path — поддерево, depth \
-                 1–5."
+                 умолчанию решение из X-Zam-Solution, иначе knowledge), path — поддерево, можно \
+                 с префиксом пространства (rules:/a), depth 1–5."
             }
             ToolName::Write => {
                 "Запись заметки по пути [<пространство>:/]<путь>: без base_rev — создать (content); \
@@ -117,10 +122,10 @@ impl ToolName {
                  data base64}], большой — zam report. Дубль insight — 409: force."
             }
             ToolName::UpdateEntry => {
-                "Правка записи: action supersede|retract|revisit|certify|append|status — с \
-                 ревизией rev; кроме того, без rev: feedback|claim|release|answer|propose|decide|\
-                 review. certify — certainty, reason; feedback — value; вопрос: answer (by \
-                 обязателен), status obsolete; review — разбор идеи (outcome, summary)."
+                "Правка записи: action supersede|retract|revisit|certify|append|status|triggers \
+                 — с ревизией rev; без rev: feedback|claim|release|answer|propose|decide|review. \
+                 certify — certainty, reason; feedback — value; вопрос: answer (by обязателен), \
+                 status obsolete; review — разбор идеи (outcome, summary)."
             }
             ToolName::Link => {
                 "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
@@ -232,7 +237,8 @@ impl ToolName {
             ToolName::Tree => (
                 json!({
                     "space": {"type": "string"},
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description":
+                        "поддерево; префикс пространства — rules:/a, knowledge:a, solution:, <GUID>: (с space не расходится)"},
                     "depth": {"type": "integer", "minimum": 1, "maximum": 5},
                     "format": fmt,
                 }),
@@ -240,7 +246,8 @@ impl ToolName {
             ),
             ToolName::Write => (
                 json!({
-                    "path": {"type": "string", "description": "[<пространство>:/]<путь>"},
+                    "path": {"type": "string", "description":
+                        "[<пространство>:/]<путь>: rules, knowledge, human, solution или GUID решения"},
                     "content": {"type": "string"},
                     "ops": {"type": "array", "items": {
                         "type": "object",
@@ -266,9 +273,7 @@ impl ToolName {
                     "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "idea", "question", "report"]},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "data": {"type": "object", "description": "insight: kind, experiment, evidence; term: definition (до 300 символов), aliases, not_to_confuse, code; question: options [{key, text}] до 8, recommendation (ключ); report: refs {commits, files, notes, tasks}; idea: origin обязателен — human (записана по словам человека) | agent (своя мысль: не предлагается, человек принимает её в WebUI), priority low|normal|high, horizon YYYY-MM-DD («не раньше»), links",
-                        "properties": {"kind": {"type": "string", "description":
-                            "insight: gotcha|failure|experiment|discovery|decision. Отверг подход после проверки — kind: decision, поля решения — в data.decision: {options: [отвергнутое], chosen: выбранное, rationale: «отвергнуто, потому что…»} (на верхнем уровне data — 422, и рядом с data.decision); или failure с результатом"}}},
+                    "data": log_data_schema(),
                     "images": {"type": "array", "description": "report: файлы по ссылкам тела ![…](figs/a.png); name — путь из ссылки, data — base64",
                         "items": {"type": "object", "properties": {
                             "name": {"type": "string"}, "data": {"type": "string"}},
@@ -293,8 +298,8 @@ impl ToolName {
                     "rev": {"type": "integer",
                         "description": "ревизия записи; не нужна у feedback, claim, release, answer, propose, decide, review"},
                     "action": {"type": "string", "enum": ["supersede", "retract", "revisit",
-                        "certify", "append", "feedback", "status", "claim", "release", "answer",
-                        "propose", "decide", "review"]},
+                        "certify", "append", "feedback", "status", "triggers", "claim", "release",
+                        "answer", "propose", "decide", "review"]},
                     "status": {"type": "string", "description": "задача: open, in_progress, blocked, done, dropped"},
                     "next_step": {"type": ["string", "null"]},
                     "blocked_by": {"type": ["string", "null"]},
@@ -343,7 +348,8 @@ impl ToolName {
                     "body": {"type": "string", "description": "supersede — тело; append — дописать; review — в task.body"},
                     "data": {"type": "object"},
                     "tags": {"type": "array", "items": {"type": "string"}},
-                    "triggers": {"type": "array", "items": {"type": "object"}},
+                    "triggers": {"type": "array", "items": {"type": "object"}, "description":
+                        "supersede и triggers: набор целиком [{type: file_glob|command_regex|error_regex|keyword, pattern, tools?}]; [] — снять все"},
                     "links": {"type": "array", "items": {"type": "object"}},
                     "refs": {"type": "object", "description": "supersede и append: новый набор ссылок на файлы {files: [...]}"},
                     "certainty": {"type": ["string", "null"],
@@ -444,6 +450,52 @@ impl ToolName {
         };
         json!({"type": "object", "properties": props, "required": required})
     }
+}
+
+/// Схема `memory_log.data` (M6.6 §8, замечание 31): общее описание — перечень полей по видам
+/// (до 300 символов), поля, которые агент узнавал только по 422, — подсвойства с типами;
+/// `additionalProperties` открыт — поля прочих видов проходят, проверяет их REST. Подробности
+/// `origin` идеи — в протоколе (раздел «Идеи»).
+fn log_data_schema() -> Value {
+    use crate::api::entries::VERSION_MAX_CHARS;
+    use crate::api::insights::{DECISION_OPTIONS_MAX, EXPERIMENT_RESULTS};
+    json!({"type": "object", "description":
+    "insight: kind и подполя ниже; term: definition (до 300), aliases, not_to_confuse, code; \
+     question: options [{key, text}] до 8, recommendation; report: refs {commits, files, \
+     notes, tasks}; idea: origin human|agent (обязателен), priority, horizon, links; \
+     release: version, date, git_tag, commits",
+    "properties": {
+        "kind": {"type": "string", "description":
+            "insight: gotcha|failure|experiment|discovery|decision. Отверг подход после проверки — kind: decision, поля решения — в data.decision: {options: [отвергнутое], chosen: выбранное, rationale: «отвергнуто, потому что…»} (на верхнем уровне data — 422, и рядом с data.decision); или failure с результатом"},
+        "version": {"type": "string", "minLength": 1, "maxLength": VERSION_MAX_CHARS,
+            "description": format!("release: версия, обязательна (1–{VERSION_MAX_CHARS} символа)")},
+        "date": {"type": "string", "description": "release: YYYY-MM-DD (по умолчанию сегодня, UTC)"},
+        "experiment": {"type": "object",
+            "description": "insight experiment: {hypothesis, method, result, metrics, revisit_if}; объект, не строка",
+            "properties": {
+                "hypothesis": {"type": "string"},
+                "method": {"type": "string"},
+                "result": {"type": "string", "enum": EXPERIMENT_RESULTS},
+            }},
+        "evidence": {"type": "object",
+            "description": "доказательство theorem: что проверено, каким методом, итог — три непустые строки",
+            "properties": {
+                "checked": {"type": "string"},
+                "method": {"type": "string"},
+                "result": {"type": "string"},
+            },
+            "required": ["checked", "method", "result"]},
+        "decision": {"type": "object",
+            "description": format!(
+                "insight decision — ADR: context, options (отвергнутое и выбранное, до \
+                 {DECISION_OPTIONS_MAX}), chosen, rationale, consequences, decided_by \
+                 human|agent, revisit_if"),
+            "properties": {
+                "options": {"type": "array", "items": {"type": "string"},
+                            "maxItems": DECISION_OPTIONS_MAX},
+                "decided_by": {"type": "string", "enum": ["human", "agent"]},
+            }},
+    }})
 }
 
 /// Схема аргумента `session_id` ([`SESSION_ARG_TOOLS`]).
@@ -989,10 +1041,8 @@ async fn cache_put(rest: &Rest, args: &JsonObject) -> Res {
 
 async fn tree(rest: &Rest, args: &JsonObject) -> Res {
     let f = fmt(args)?;
-    let space = opt_str(args, "space")?
-        .map(str::to_string)
-        .unwrap_or_else(|| default_space(rest));
-    let path = opt_str(args, "path")?.unwrap_or("").trim_matches('/');
+    let (prefix, path) = space_prefix(rest, opt_str(args, "path")?.unwrap_or(""))?;
+    let space = tree_space(rest, opt_str(args, "space")?, prefix)?;
     let mut uri = format!("/api/v1/spaces/{}/tree?path={}", enc(&space), enc(path));
     if let Some(d) = opt_int(args, "depth")? {
         uri.push_str(&format!("&depth={d}"));
@@ -1001,9 +1051,81 @@ async fn tree(rest: &Rest, args: &JsonObject) -> Res {
     done(f, &r, |v| tree_md(v, path))
 }
 
+/// Пространство `memory_tree`: `space` (как префикс: `solution` — решение из `X-Zam-Solution`,
+/// GUID — в нижнем регистре; прочее — как есть) или префикс `path`; заданы оба — должны
+/// совпадать, иначе ошибка аргумента: какое из двух имел в виду агент, неизвестно (M6.6 §8,
+/// решение координатора 3). Ни того, ни другого — пространство по умолчанию.
+fn tree_space(rest: &Rest, arg: Option<&str>, prefix: Option<String>) -> Result<String, Fail> {
+    let arg = match arg.map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some("solution") => Some(header_solution(rest, "space solution")?),
+        Some(g) if zam_core::space::is_guid(g) => Some(g.to_ascii_lowercase()),
+        Some(a) => Some(a.to_string()),
+    };
+    match (arg, prefix) {
+        (Some(a), Some(p)) if a != p => Err(Fail::Invalid(format!(
+            "space «{a}» и префикс пространства в path ({p}) расходятся — задайте пространство \
+             чем-то одним"
+        ))),
+        (Some(a), _) => Ok(a),
+        (None, Some(p)) => Ok(p),
+        (None, None) => Ok(default_space(rest)),
+    }
+}
+
+/// Решение из `X-Zam-Solution` для `solution` в `what` (`space solution`, `path solution:…`);
+/// заголовка нет — ошибка аргумента.
+fn header_solution(rest: &Rest, what: &str) -> Result<String, Fail> {
+    rest.header(crate::api::search::SOLUTION_HEADER)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            Fail::Invalid(format!(
+                "{what} — нет заголовка X-Zam-Solution: укажите GUID решения"
+            ))
+        })
+}
+
+/// Префикс пространства в `path` (`memory_tree`, `memory_write`; M6.6 §8) по правилу CLI
+/// [`zam_core::space::split_space`]: пространство REST (`solution:` — решение из
+/// `X-Zam-Solution`; `None` — префикса нет) и путь без `/` по краям. Слово, которого правило не
+/// знает, перед `:/` (`foo:/a`, `Knowledge:/a`, имя решения из заголовка дерева) — ошибка
+/// аргумента, а не путь «foo:/a» в пространстве по умолчанию: так оно и раньше было ошибкой
+/// (404), а молча завести папку «foo:» хуже **[решение исполнителя, задача 7]**.
+fn space_prefix<'a>(rest: &Rest, raw: &'a str) -> Result<(Option<String>, &'a str), Fail> {
+    use zam_core::space::SpaceSel;
+    let (sel, path) = zam_core::space::split_space(raw);
+    let space = match sel {
+        SpaceSel::Fixed(n) => Some(n.to_string()),
+        SpaceSel::Guid(g) => Some(g),
+        SpaceSel::Solution => Some(header_solution(rest, "path solution:…")?),
+        SpaceSel::Default => {
+            if let Some((word, _)) = raw.split_once(":/")
+                && !word.is_empty()
+                && !word.contains('/')
+            {
+                return Err(Fail::Invalid(format!(
+                    "path: неизвестное пространство «{word}» — rules, knowledge, human, \
+                     solution или GUID решения; без префикса — пространство по умолчанию"
+                )));
+            }
+            None
+        }
+    };
+    Ok((space, path))
+}
+
+/// Дерево Markdown: строка на узел, отступ — от `base`; у заметки — ревизия и L0. L0 папки —
+/// свёртка её детей (`<имя>: <L0>` строками, `zam_index::rollup::folder_l0`): дети есть в
+/// выдаче — не печатается (повторяет их); папка на границе глубины — первая строка свёртки и
+/// «(+K)» (M6.6 §9, 16б). Сама свёртка (поиск, WebUI) не меняется.
 fn tree_md(v: &Value, base: &str) -> String {
     let base_depth = base.split('/').filter(|s| !s.is_empty()).count();
     let items = v["items"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    // пути родителей узлов выдачи — папки, чьи дети показаны
+    let shown: HashSet<&str> = items
+        .iter()
+        .filter_map(|n| Some(n["path"].as_str()?.rsplit_once('/')?.0))
+        .collect();
     let mut s = format!(
         "{}:/{base} — узлов {}",
         v["space"]["name"].as_str().unwrap_or("?"),
@@ -1022,21 +1144,39 @@ fn tree_md(v: &Value, base: &str) -> String {
         if !folder {
             s.push_str(&format!(" rev{}", n["current_rev"]));
         }
-        if let Some(l0) = n["l0"].as_str().filter(|l| !l.is_empty()) {
+        let Some(l0) = n["l0"].as_str().map(str::trim).filter(|l| !l.is_empty()) else {
+            continue;
+        };
+        if !folder {
             s.push_str(&format!(" · {l0}"));
+        } else if !shown.contains(path) {
+            let mut lines = l0.lines().map(str::trim).filter(|l| !l.is_empty());
+            if let Some(first) = lines.next() {
+                s.push_str(&format!(" · {first}"));
+            }
+            let more = lines.count();
+            if more > 0 {
+                s.push_str(&format!(" (+{more})"));
+            }
         }
     }
     s
 }
 
-/// `[<пространство>:/]<путь>` → (пространство, путь).
-fn split_path(rest: &Rest, raw: &str) -> (String, String) {
-    match raw.split_once(":/") {
-        Some((sp, p)) if !sp.is_empty() && !sp.contains('/') => {
-            (sp.to_string(), p.trim_matches('/').to_string())
-        }
-        _ => (default_space(rest), raw.trim_matches('/').to_string()),
+/// `[<пространство>:]<путь>` заметки `memory_write` → (пространство, путь) по [`space_prefix`];
+/// без префикса — пространство по умолчанию, пустой путь (`rules:`, `knowledge:/`) — ошибка
+/// аргумента.
+fn split_path(rest: &Rest, raw: &str) -> Result<(String, String), Fail> {
+    let (space, path) = space_prefix(rest, raw)?;
+    if path.is_empty() {
+        return Err(Fail::Invalid(
+            "path: нужен путь заметки после префикса пространства — rules:/<путь>".into(),
+        ));
     }
+    Ok((
+        space.unwrap_or_else(|| default_space(rest)),
+        path.to_string(),
+    ))
 }
 
 /// Id узла по пути (`GET /nodes/by-path`).
@@ -1056,7 +1196,7 @@ async fn node_id(rest: &Rest, space: &str, path: &str) -> Result<String, Fail> {
 
 async fn write(rest: &Rest, args: &JsonObject) -> Res {
     let f = fmt(args)?;
-    let (space, path) = split_path(rest, req_str(args, "path")?);
+    let (space, path) = split_path(rest, req_str(args, "path")?)?;
     let content = opt_str(args, "content")?;
     let ops = args.get("ops").filter(|v| !v.is_null());
     let base_rev = opt_int(args, "base_rev")?;
@@ -1390,6 +1530,7 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
             }
             (Method::PATCH, entry, b)
         }
+        "triggers" => (Method::PATCH, entry, triggers_body(args)?),
         "answer" => {
             // `by` обязателен (финальное ревью M4.5, I-2): умолчания нет — чей ответ, знает агент
             if !args.get("by").is_some_and(Value::is_string) {
@@ -1534,8 +1675,8 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         }
         _ => {
             return Err(Fail::Invalid(
-                "action: supersede, retract, revisit, certify, append, feedback, status, claim, \
-                 release, answer, propose, decide или review"
+                "action: supersede, retract, revisit, certify, append, feedback, status, \
+                 triggers, claim, release, answer, propose, decide или review"
                     .into(),
             ));
         }
@@ -1545,17 +1686,76 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
         .map_err(|e| {
             e.hint("Ревизию записи (rev) даёт memory_read её id или карточка memory_search.")
         })?;
-    // одна строка (M6 §5), предупреждения — в ней же через «; »
-    done(f, &r, |v| match v.get("entry").filter(|e| e.is_object()) {
-        // замещение: {entry, superseded}
-        Some(new) => format!(
-            "Новая {} · замещена {}{}",
+    done(f, &r, |v| changed_line(action, v))
+}
+
+/// Тело `action=triggers` (M6.6 §8, замечание 13): новый набор триггеров insight целиком, `[]` —
+/// снять все; `PATCH` идёт с `If-Match` из `rev`. Объекты проверяет REST тем же разбором, что у
+/// `memory_log insight` (`parse_triggers`: тот же 422 `triggers[i]: …`); нет массива — ошибка
+/// аргументов, а не пустая правка.
+fn triggers_body(args: &JsonObject) -> Result<Map<String, Value>, Fail> {
+    let Some(set @ Value::Array(_)) = args.get("triggers") else {
+        return Err(Fail::Invalid(
+            "triggers: нужен массив [{type, pattern, tools?}] — набор целиком, [] — снять все"
+                .into(),
+        ));
+    };
+    let mut b = pick(args, &["message"]);
+    b.insert("triggers".into(), set.clone());
+    Ok(b)
+}
+
+/// Строка ответа правки — одна (M6 §5), предупреждения — в ней же через «; »: замещение —
+/// «Новая … · замещена …»; `triggers` — «Обновлено i:<id> rev<N> · триггеров K»; `claim` и
+/// `release` — захват ([`claim_line`]; M6.6 §8, замечание 19); прочее — «Обновлено
+/// <entry_short>».
+fn changed_line(action: &str, v: &Value) -> String {
+    let w = warnings_inline(v);
+    // замещение: {entry, superseded}
+    if let Some(new) = v.get("entry").filter(|e| e.is_object()) {
+        return format!(
+            "Новая {} · замещена {}{w}",
             entry_short(new),
-            entry_ref_of(&v["superseded"]),
-            warnings_inline(v)
+            entry_ref_of(&v["superseded"])
+        );
+    }
+    match action {
+        "triggers" => format!(
+            "Обновлено {} rev{} · триггеров {}{w}",
+            entry_ref_of(v),
+            v["rev"],
+            v["triggers"].as_array().map_or(0, Vec::len)
         ),
-        None => format!("Обновлено {}{}", entry_short(v), warnings_inline(v)),
-    })
+        "claim" => format!("{}{w}", claim_line(v)),
+        "release" => format!(
+            "Захват снят {} · rev{} · {}{w}",
+            entry_ref_of(v),
+            v["rev"],
+            v["status"].as_str().unwrap_or("?")
+        ),
+        _ => format!("Обновлено {}{w}", entry_short(v)),
+    }
+}
+
+/// Захват задачи: «Захвачена k:<id> до <yyyy-MM-dd HH:mm:ss> (сессия <s>[, агент <a>]) · rev<N> ·
+/// <статус>» — срок временем агента (UTC без `T`, `Z` и смещения, M6 §4.4), как у `zam task
+/// claim`.
+fn claim_line(v: &Value) -> String {
+    let c = &v["data"]["claimed_by"];
+    let until = c["until"]
+        .as_str()
+        .and_then(zam_core::time::agent_ts)
+        .unwrap_or_else(|| "?".into());
+    let mut who = format!("сессия {}", c["session"].as_str().unwrap_or("?"));
+    if let Some(a) = c["agent"].as_str().filter(|a| !a.is_empty()) {
+        who.push_str(&format!(", агент {a}"));
+    }
+    format!(
+        "Захвачена {} до {until} ({who}) · rev{} · {}",
+        entry_ref_of(v),
+        v["rev"],
+        v["status"].as_str().unwrap_or("?")
+    )
 }
 
 async fn link(rest: &Rest, args: &JsonObject) -> Res {
@@ -1575,18 +1775,29 @@ async fn link(rest: &Rest, args: &JsonObject) -> Res {
         });
     }
     let (src, kind, dst) = (
-        graph_ref(req_str(args, "src")?),
+        req_str(args, "src")?.trim(),
         req_str(args, "type")?,
-        graph_ref(req_str(args, "dst")?),
+        req_str(args, "dst")?.trim(),
     );
-    let body = json!({ "src": src, "type": kind, "dst": dst });
+    let body = json!({ "src": graph_ref(src), "type": kind, "dst": graph_ref(dst) });
     let r = call_rest(rest, Method::POST, "/api/v1/edges", Some(&body), &[]).await?;
-    done(f, &r, |v| {
-        format!(
-            "Связь {}: {src} —{kind}→ {dst}",
-            v["id"].as_str().unwrap_or("?")
-        )
-    })
+    done(f, &r, |v| link_line(v, src, kind, dst))
+}
+
+/// Строка созданной связи: концы — так, как их передал агент (`i:`, `k:`, `n:` …; M6.6 §8,
+/// замечание 29), а не `e:<id>` маршрута `/edges` — такой буквы в протоколе нет. У `[[Имя]]` —
+/// ещё найденная заметка (`dst` ребра, `n:<id>`).
+fn link_line(v: &Value, src: &str, kind: &str, dst: &str) -> String {
+    let mut s = format!(
+        "Связь {}: {src} —{kind}→ {dst}",
+        v["id"].as_str().unwrap_or("?")
+    );
+    if dst.starts_with("[[")
+        && let Some(n) = v["dst"].as_str().filter(|d| d.starts_with("n:"))
+    {
+        s.push_str(&format!(" ({n})"));
+    }
+    s
 }
 
 async fn recall(rest: &Rest, args: &JsonObject) -> Res {
@@ -2486,6 +2697,87 @@ mod tests {
                 Some(&*t.name)
             );
         }
+    }
+
+    /// Строки `description` схемы `v` с путями (M6.6 §8): `properties`, `items` (схема или
+    /// массив схем), `oneOf`/`anyOf`/`allOf`, `if`/`then`/`else`, `additionalProperties` и
+    /// прочие вложенные объекты — всё, где может лежать описание.
+    fn descriptions(v: &Value, path: &str, out: &mut Vec<(String, String)>) {
+        match v {
+            Value::Object(o) => {
+                for (k, x) in o {
+                    match (k.as_str(), x) {
+                        ("description", Value::String(d)) => out.push((path.into(), d.clone())),
+                        _ => descriptions(x, &format!("{path}.{k}"), out),
+                    }
+                }
+            }
+            Value::Array(a) => {
+                for (i, x) in a.iter().enumerate() {
+                    descriptions(x, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Предел описаний (§13.1, M6.6 §8): у **всех** 11 инструментов каждое описание схемы
+    /// аргументов на любой глубине — не длиннее 300 символов.
+    #[test]
+    fn all_schema_descriptions_under_300() {
+        let defs = definitions();
+        assert_eq!(defs.len(), 11);
+        let mut seen = 0;
+        for t in defs {
+            let mut all = Vec::new();
+            descriptions(&Value::Object((*t.input_schema).clone()), &t.name, &mut all);
+            seen += all.len();
+            for (path, d) in all {
+                let n = d.chars().count();
+                assert!(n <= 300, "{path}: {n} символов");
+            }
+        }
+        // обход дошёл до вложенных схем (items.properties, properties.*.properties)
+        let mut nested = Vec::new();
+        descriptions(&ToolName::Read.schema(), "memory_read", &mut nested);
+        assert!(
+            nested
+                .iter()
+                .any(|(p, _)| p == "memory_read.properties.items.items.properties.focus"),
+            "{nested:?}"
+        );
+        assert!(seen > 80, "описаний {seen}");
+    }
+
+    /// Показ дерева (M6.6 §9, 16б): у папки, чьи дети есть в выдаче, L0 (свёртка детей) не
+    /// печатается; у папки на границе глубины — первая строка свёртки и «(+K)».
+    #[test]
+    fn tree_md_folder_l0_only_at_depth_boundary() {
+        let v = json!({"space": {"name": "knowledge"}, "items": [
+            {"id": "1", "path": "a", "kind": "folder", "l0": "b: про b\nc: про c"},
+            {"id": "2", "path": "a/b", "kind": "note", "current_rev": 2, "l0": "про b"},
+            {"id": "3", "path": "a/c", "kind": "folder", "l0": "x: про x\ny/: про y\nz"},
+            {"id": "4", "path": "d", "kind": "folder", "l0": "e: про e"},
+            {"id": "5", "path": "f", "kind": "folder", "l0": null},
+        ]});
+        assert_eq!(
+            tree_md(&v, ""),
+            "knowledge:/ — узлов 5\n\
+             - n:1 a/\n  \
+               - n:2 a/b rev2 · про b\n  \
+               - n:3 a/c/ · x: про x (+2)\n\
+             - n:4 d/ · e: про e\n\
+             - n:5 f/"
+        );
+        // поддерево: отступ — от base, папка «a» в выдачу не входит
+        let v = json!({"space": {"name": "rules"}, "items": [
+            {"id": "3", "path": "a/c", "kind": "folder", "l0": "x: про x"},
+            {"id": "6", "path": "a/c/x", "kind": "note", "current_rev": 1, "l0": "про x"},
+        ]});
+        assert_eq!(
+            tree_md(&v, "a"),
+            "rules:/a — узлов 2\n- n:3 a/c/\n  - n:6 a/c/x rev1 · про x"
+        );
     }
 
     #[test]

@@ -609,13 +609,15 @@ async fn digest_tasks_section_order() {
         )),
         "{text}"
     );
-    // захваченная сессией — первой, затем недавно менявшиеся; open и done не показаны
+    // захваченная сессией — первой, затем недавно менявшиеся; open и done строками задач не
+    // показаны — open только в строке «Открыто задач» (M6.6 §4, задача 3)
     assert!(pos("Моя задача") < pos("Застряла"), "{text}");
     assert!(pos("Застряла") < pos("Чужая задача"), "{text}");
     assert!(
-        !text.contains("Открытая") && !text.contains("Готовая"),
+        !text.contains("] Открытая") && !text.contains("Готовая"),
         "{text}"
     );
+    assert!(text.contains("Открыто задач: 1 — «Открытая»"), "{text}");
     let items = j["items"].as_array().unwrap();
     let task_items: Vec<&Value> = items.iter().filter(|i| i["reason"] == "task").collect();
     assert_eq!(task_items.len(), 3, "{j}");
@@ -839,6 +841,52 @@ async fn mcp(a: &Api, name: &str, args: Value) -> (String, bool) {
     (mcp_text(&j["result"]), j["result"]["isError"] == true)
 }
 
+/// Первая строка ответа MCP (без `~N tok`).
+fn first(t: &str) -> String {
+    t.lines().next().unwrap_or("").to_string()
+}
+
+/// Текст 422 статуса задачи при создании (M6.6 §8, замечание 33, решение координатора 19).
+const STATUS_ON_CREATE: &str =
+    "data.status: статус задаётся правкой — memory_update_entry action=status (zam task status)";
+
+/// Задача с `data.status` при создании — 422 с подсказкой, как задать статус (REST и MCP —
+/// один текст); задача не создаётся. Без `data.status` — создаётся `open`, как прежде.
+#[tokio::test]
+async fn task_create_status_422_names_action() {
+    let a = api("tasks-create-status", |_| {}).await;
+    for status in [json!("in_progress"), json!("open"), Value::Null] {
+        let r = a
+            .t(
+                Method::POST,
+                KN,
+                Some(json!({"kind": "task", "title": "Со статусом",
+                            "data": {"status": status, "next_step": "начать"}})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+        assert_eq!(r.json()["detail"], STATUS_ON_CREATE, "{status}");
+    }
+    let (t, err) = mcp(
+        &a,
+        "memory_log",
+        json!({"kind": "task", "title": "Через MCP со статусом", "space": "knowledge",
+               "data": {"status": "in_progress"}}),
+    )
+    .await;
+    assert!(err, "{t}");
+    assert!(t.contains(STATUS_ON_CREATE), "{t}");
+    let list = a
+        .t(Method::GET, &format!("{KN}?kind=task"), None)
+        .await
+        .json();
+    assert_eq!(list["items"].as_array().unwrap().len(), 0, "{list}");
+    assert_eq!(
+        new_task(&a, "Без статуса", json!({})).await["status"],
+        "open"
+    );
+}
+
 #[tokio::test]
 async fn mcp_update_entry_status_claim() {
     let a = api("tasks-mcp", |_| {}).await;
@@ -870,6 +918,33 @@ async fn mcp_update_entry_status_claim() {
     assert!(!err, "{t}");
     let cur = get(&a, &tid).await;
     assert_eq!(cur["data"]["claimed_by"]["session"], "mcp-task");
+    // M6.6 §8 (замечание 19): срок захвата — время агента (M6 §4.4), сессия, ревизия, статус
+    let until = |e: &Value| {
+        zam_core::time::agent_ts(e["data"]["claimed_by"]["until"].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(
+        first(&t),
+        format!(
+            "Захвачена {k} до {} (сессия mcp-task) · rev1 · open",
+            until(&cur)
+        )
+    );
+    // продление той же сессией с агентом — агент в скобках
+    let (t, err) = mcp(
+        &a,
+        "memory_update_entry",
+        json!({"id": k, "action": "claim", "ttl_min": 45, "agent": "claude"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let cur = get(&a, &tid).await;
+    assert_eq!(
+        first(&t),
+        format!(
+            "Захвачена {k} до {} (сессия mcp-task, агент claude) · rev1 · open",
+            until(&cur)
+        )
+    );
     // status: нужна ревизия; next_step и blocked_by
     let (t, err) = mcp(
         &a,
@@ -923,7 +998,12 @@ async fn mcp_update_entry_status_claim() {
     )
     .await;
     assert!(!err, "{t}");
-    assert!(get(&a, &tid).await["data"].get("claimed_by").is_none());
+    let cur = get(&a, &tid).await;
+    assert!(cur["data"].get("claimed_by").is_none());
+    assert_eq!(
+        first(&t),
+        format!("Захват снят {k} · rev{} · in_progress", cur["rev"])
+    );
     let (t, err) = mcp(
         &a,
         "memory_update_entry",
