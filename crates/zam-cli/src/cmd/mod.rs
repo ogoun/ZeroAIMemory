@@ -266,6 +266,27 @@ pub fn emit_written(ctx: &Ctx, node: &Value, created: bool) -> Result<(), CliErr
     emit(format!("{id}@{rev}\n").as_bytes())
 }
 
+/// Флаг `f` в `features` ответа `GET /health` (`docs/api-compat.md`).
+pub fn has_feature(health: &Value, f: &str) -> bool {
+    health["features"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|x| x == f))
+}
+
+/// Ошибка `e` запроса возможности сервера с флагом `feature`: HTTP-статус из `statuses` — так
+/// старый сервер отвечает на неизвестный маршрут или значение. В `GET /health` `features` нет
+/// `feature` (у сервера до M6 нет и самого поля) — код 1 с текстом `old`; флаг есть или `/health`
+/// не ответил — `e` как есть (например, 404 — нет такой записи, код 5).
+pub fn old_server(ctx: &Ctx, e: CliError, statuses: &[u16], feature: &str, old: &str) -> CliError {
+    if !e.http_status().is_some_and(|s| statuses.contains(&s)) {
+        return e;
+    }
+    match ctx.client.get("/health", &[]).and_then(read_json) {
+        Ok(h) if !has_feature(&h, feature) => CliError::config(old),
+        _ => e,
+    }
+}
+
 /// GUID решения для команд журналов: флаг `--solution` или `solution.toml`.
 pub fn solution_guid(ctx: &Ctx, flag: Option<&str>) -> Result<String, CliError> {
     match flag {

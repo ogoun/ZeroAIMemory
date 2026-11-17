@@ -470,20 +470,45 @@ icacls "<data_dir>\master.key" /inheritance:r /grant:r "*S-1-3-4:F" "*S-1-5-18:F
 printf '%s' "$GITHUB_TOKEN" | zam vault set github --type token --link https://github.com --global
 zam vault set postgres --type connection_string --username app      # Vault текущего решения; ввод скрыт
 zam vault list --global --q git                                      # без значений; поиск по открытым полям
-zam vault add stage --type host --purpose 'приёмочный стенд' --address 10.0.0.5:22 --limits 'только ночью' --global  # окружение: значение необязательно (--secret-stdin)
+zam vault set stage --type host --purpose 'приёмочный стенд' --address 192.0.2.5:22 --limits 'только ночью' --global  # окружение: значение необязательно (--secret-stdin)
 zam vault get github --global --raw                                  # в stdout только значение
+zam vault rename stage stage-old --global                            # новое имя — новая ревизия (If-Match)
+zam vault mv postgres --to global                                    # из Vault решения в личный: --to global|solution|<GUID>
+zam vault rm stage-old --global                                      # мягкое удаление
 ```
+
+`add` — синоним `set`, `delete` — синоним `rm`.
 
 `--global` — личный Vault (Knowledge, для всех проектов), без него — Vault решения из
 `solution.toml` (`--solution GUID`). Vault решения лежит в вашей базе пользователя: владелец и
 другие участники общего решения его не видят. Повторный `set` с тем же именем создаёт новую
 ревизию; прежние значения раскрывает только администратор (`GET /vault/{id}/revisions?reveal=1&rev=N`).
 
+Хост или стенд, общий для проектов (рабочая станция, сервер памяти), — в личный Vault
+(`--global`); только этого проекта — в Vault решения (без флага). Умолчание — Vault решения, поэтому
+`zam vault set --type host|environment` без `--global` и `--solution` печатает в stderr строку
+«записано в Vault решения «<имя решения>»; общий для проектов — --global (перенести: zam vault mv
+<имя> --to global)». Запись легла не туда — `zam vault mv <имя> --to global|solution|<GUID>`
+(откуда — `--global` или `--solution`, как у других команд; `--to solution` — решение из
+`solution.toml`): нужны права записи в обеих областях и разблокированный Vault; перенос — новая
+ревизия с тем же именем, данными и значением (id и история сохраняются, значение через клиента
+не проходит), перенос в ту же область ревизии не создаёт, аудит — `vault.move` с `from` и `to`.
+Имя уже занято в цели — код 4, запись остаётся на месте. Сервер до `0.0.13-m6.6` переноса не знает
+(нет флага `vault_move` в `GET /health`): код 1 «сервер не поддерживает перенос записей Vault:
+нужен zam-server 0.0.13-m6.6 или новее».
+
+`rename` передаёт `If-Match` прочитанной ревизии: имя занято в той же области или запись
+изменилась между чтением и правкой — код 4. Удаление (`rm`) мягкое: имя освобождается, ревизии
+и аудит `vault.delete` остаются (историю удалённой записи видит администратор). Агент через MCP
+(`memory_vault action=delete|rename|move`, поля `new_name` и `to`) по протоколу `zam guide`
+удаляет только свою ошибочную запись или по просьбе человека.
+
 При заблокированном Vault список и метаданные отвечают: `GET /spaces/{space}/vault`,
 `GET /vault/{id}` без `reveal` и `GET /vault/{id}/revisions` — 200 с полем `locked: true` и
 `reason` (только открытые поля: имя, вид, привязка, даты), `zam vault list` печатает список и
 в stderr строку «Vault заблокирован: <причина>», WebUI показывает список с баннером и неактивной
-кнопкой «Показать». Значения (`reveal=1`), создание, правка и удаление — 503 `vault-locked`.
+кнопкой «Показать». Значения (`reveal=1`), создание, правка, удаление и перенос — 503
+`vault-locked`.
 
 Если `ZAM_MASTER_KEY` задан, файл ключа не создаётся и не читается: резервируйте значение
 переменной так же, как файл. Смена ключа (перешифровка) в M3 не поддерживается.

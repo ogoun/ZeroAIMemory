@@ -10,7 +10,11 @@
 //! - `GET /vault/{id}` — метаданные; `?reveal=1` — и значение (`Cache-Control: no-store`,
 //!   аудит `vault.reveal` с `{item, session, machine}`, `actor` — id токена);
 //! - `PATCH /vault/{id} {title?, data?, secret?}` (`If-Match: <rev>` необязателен) — новая
-//!   ревизия; `DELETE /vault/{id}` — мягко, аудит `vault.delete`;
+//!   ревизия (занятое имя — 409 «имя занято»); `DELETE /vault/{id}` — мягко, аудит
+//!   `vault.delete`;
+//! - `POST /vault/{id}/move {space}` (M6.6 §7, флаг `vault_move`; `If-Match` необязателен) —
+//!   перенос в другую область: права записи в обеих, новая ревизия (значение перешифровано под
+//!   `rev+1`), та же область — без ревизии; аудит `vault.move {item, from, to, rev}`;
 //! - `GET /vault/{id}/revisions` — ревизии без значений; `?reveal=1&rev=N` — значение
 //!   старой ревизии, только администратору (аудит `vault.reveal` с `rev`); администратору
 //!   история доступна и после удаления записи.
@@ -27,7 +31,7 @@
 //! действующего мастер-ключа метаданные отвечают 200 с полем верхнего уровня `locked`
 //! (`true` и `reason` при блокировке, иначе `false`): список, `GET /vault/{id}` без `reveal`,
 //! `GET /vault/{id}/revisions` без `reveal`; в них только открытые поля и даты, без значений
-//! и шифротекста. Значения (`reveal=1`), создание, правка и удаление — 503
+//! и шифротекста. Значения (`reveal=1`), создание, правка, удаление и перенос — 503
 //! `/problems/vault-locked`.
 //!
 //! Значения не попадают в логи, аудит, FTS и Qdrant: тело запроса не логируется, ошибки
@@ -44,13 +48,13 @@ use serde_json::{Map, Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
     Db, User, VaultMeta, VaultScope, check_vault_title, vault_delete, vault_get, vault_get_any,
-    vault_list, vault_put, vault_revision_secret, vault_revisions, vault_update,
+    vault_list, vault_move, vault_put, vault_revision_secret, vault_revisions, vault_update,
 };
 use zeroize::Zeroizing;
 
 use super::nodes::{actor, write::if_match};
 use super::scope::{Role, effective_write, solution_role};
-use super::{parse_id, query};
+use super::{json_body, parse_id, query};
 use crate::app::AppState;
 use crate::attrib::{MACHINE_HEADER, SESSION_HEADER, attribution, header_value};
 use crate::auth::{Client, Principal, target_user};
@@ -322,7 +326,8 @@ fn revealed(v: Value) -> Response {
     r
 }
 
-/// Аудит операции Vault (без значения): `{item, session, machine, rev?}`.
+/// Аудит операции Vault (без значения): `{item, session, machine}` и поля объекта `extra`
+/// (`rev` раскрытой ревизии; у переноса — `rev`, `from`, `to`).
 #[allow(clippy::too_many_arguments)]
 async fn audit(
     st: &AppState,
@@ -332,15 +337,15 @@ async fn audit(
     user: Id,
     action: &str,
     item: Id,
-    rev: Option<i64>,
+    extra: Value,
 ) -> Result<(), ApiError> {
     let mut details = json!({
         "item": item,
         "session": header_value(headers, SESSION_HEADER)?,
         "machine": header_value(headers, MACHINE_HEADER)?,
     });
-    if let (Some(r), Value::Object(o)) = (rev, &mut details) {
-        o.insert("rev".into(), json!(r));
+    if let (Value::Object(o), Value::Object(e)) = (&mut details, extra) {
+        o.extend(e);
     }
     st.system
         .audit(
@@ -479,7 +484,7 @@ pub async fn get(
         a.user.id,
         "vault.reveal",
         m.id,
-        None,
+        json!({}),
     )
     .await?;
     if let Value::Object(o) = &mut v {
@@ -572,10 +577,85 @@ pub async fn remove(
         a.user.id,
         "vault.delete",
         m.id,
-        None,
+        json!({}),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Move {
+    space: String,
+}
+
+/// Ответ переноса (M6.6 §7): `{id, rev, scope, agent_solution_id}`.
+fn moved_json(m: &VaultMeta) -> Value {
+    json!({
+        "id": m.id,
+        "rev": m.rev,
+        "scope": m.scope,
+        "agent_solution_id": m.agent_solution_id().map(|g| g.as_str()),
+    })
+}
+
+/// `POST /vault/{id}/move {space}` (необязательный `If-Match: <rev>`) → 200 `{id, rev, scope,
+/// agent_solution_id}` (M6.6 §7). `space` — `knowledge` или GUID решения (как `{space}` пути).
+/// Права записи в исходной и целевой области; заблокированный Vault — 503 раньше проверки цели.
+/// Перенос — новая ревизия: значение перешифровывается под `rev + 1` (AAD связан с ревизией, а
+/// не с областью), имя и `data` прежние; та же область — запись как есть, без ревизии и аудита
+/// (устаревший `If-Match` — 409, как у пустой правки). Имя занято в цели — 409, запись не
+/// тронута. Аудит `vault.move {item, from, to, rev}`.
+pub async fn move_to(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    client: Client,
+    Path(id): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let (a, m, blob) = item(&st, &p, &headers, &id, true, true).await?;
+    let req: Move = json_body(body)?;
+    let to = parse_scope(&req.space)?;
+    let role = scope_role(&st, &p, &a.user, &to).await?;
+    effective_write(&p, role)?;
+    let expected = if headers.contains_key(header::IF_MATCH) {
+        if_match(&headers)?
+    } else {
+        m.rev
+    };
+    if to == m.scope {
+        if expected != m.rev {
+            return Err(ApiError::conflict(format!(
+                "ревизия записи Vault {}, а не {expected}",
+                m.rev
+            )));
+        }
+        return Ok(Json(moved_json(&m)));
+    }
+    let attrib = attribution(&p, &headers, None)?;
+    // окружение без значения — пустой блоб, шифровать нечего; значение не покидает сервер
+    let new_blob = if blob.is_empty() {
+        Vec::new()
+    } else {
+        let plain = st.vault.decrypt(a.user.id, m.id, m.rev, &blob).await?;
+        st.vault
+            .encrypt(a.user.id, m.id, expected + 1, &plain)
+            .await?
+    };
+    let moved = vault_move(&a.db, m.id, expected, &to, new_blob, &attrib).await?;
+    audit(
+        &st,
+        &p,
+        &headers,
+        &client,
+        a.user.id,
+        "vault.move",
+        m.id,
+        json!({ "rev": moved.rev, "from": m.scope.space(), "to": to.space() }),
+    )
+    .await?;
+    Ok(Json(moved_json(&moved)))
 }
 
 #[derive(Deserialize)]
@@ -627,7 +707,7 @@ pub async fn revisions(
         a.user.id,
         "vault.reveal",
         m.id,
-        Some(rev),
+        json!({ "rev": rev }),
     )
     .await?;
     let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);

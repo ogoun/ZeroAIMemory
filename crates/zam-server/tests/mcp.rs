@@ -1227,7 +1227,17 @@ async fn mcp_descriptions_under_300() {
             ],
         ),
         ("memory_link", &["contradicts"]),
-        ("memory_vault", &["host", "environment"]),
+        (
+            "memory_vault",
+            &[
+                "host",
+                "environment",
+                "delete",
+                "rename",
+                "new_name",
+                "move",
+            ],
+        ),
         (
             "memory_code",
             &["map", "focus", "symbol", "refs", "impact", "путь#qual"],
@@ -1324,6 +1334,236 @@ async fn mcp_vault_set_environment_fields() {
     )
     .await;
     assert!(o.is_error, "{}", o.text);
+}
+
+/// Id записей Vault области по умолчанию по имени (`list` в JSON).
+async fn vault_ids(a: &Api, h: &[(&str, &str)], args: Value) -> Vec<(String, String)> {
+    let mut args = args;
+    args["action"] = json!("list");
+    args["format"] = json!("json");
+    let o = ok(a, &a.token, h, "memory_vault", args).await;
+    o.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["title"].as_str().unwrap().to_string(),
+                m["id"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// M6.6 §7 (замечание 7): `memory_vault action=rename` (`new_name`) и `delete` — по имени и по
+/// ссылке `v:<id>`; значение после переименования то же, занятое имя — ошибка 409 «имя занято»
+/// (запись прежняя); удалённая запись не видна в `list` и не раскрывается, удаление — в аудите.
+#[tokio::test]
+async fn mcp_vault_delete_rename() {
+    let a = api("mcp-vault-del-ren", |_| {}).await;
+    let h = sess();
+    for (name, value) in [
+        ("old-name", "val-rename-1"),
+        ("busy", "val-busy"),
+        ("by-name", "val-del-1"),
+        ("by-ref", "val-del-2"),
+    ] {
+        let o = vault_call(
+            &a,
+            &a.token,
+            &h,
+            json!({"action": "set", "name": name, "value": value}),
+        )
+        .await;
+        assert!(!o.is_error, "{}", o.text);
+    }
+    let ids = vault_ids(&a, &h, json!({})).await;
+    let id_of = |t: &str| ids.iter().find(|(n, _)| n == t).unwrap().1.clone();
+    let (old, by_name, by_ref) = (id_of("old-name"), id_of("by-name"), id_of("by-ref"));
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "rename", "name": "old-name", "new_name": "new-name"}),
+    )
+    .await;
+    assert!(
+        !o.is_error && o.text.contains("«new-name»") && o.text.contains("rev2"),
+        "{}",
+        o.text
+    );
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "rename", "id": format!("v:{old}"), "new_name": "third-name"}),
+    )
+    .await;
+    assert!(
+        !o.is_error && o.text.contains("«third-name»") && o.text.contains("rev3"),
+        "{}",
+        o.text
+    );
+    let get = json!({"action": "get", "name": "third-name"});
+    let o = vault_call(&a, &a.token, &h, get.clone()).await;
+    assert!(
+        !o.is_error && o.text.contains("value: val-rename-1"),
+        "{}",
+        o.text
+    );
+    // занятое имя — 409, запись прежняя; без new_name — ошибка аргумента
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "rename", "name": "third-name", "new_name": "busy"}),
+    )
+    .await;
+    assert!(
+        o.is_error && o.text.contains("409") && o.text.contains("имя занято"),
+        "{}",
+        o.text
+    );
+    assert!(!vault_call(&a, &a.token, &h, get).await.is_error);
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "rename", "name": "third-name"}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("new_name"), "{}", o.text);
+    // удаление по имени и по ссылке
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "delete", "name": "by-name"}),
+    )
+    .await;
+    assert!(
+        !o.is_error && o.text.contains("Удалено") && o.text.contains("by-name"),
+        "{}",
+        o.text
+    );
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "delete", "id": format!("v:{by_ref}")}),
+    )
+    .await;
+    assert!(!o.is_error && o.text.contains(&by_ref), "{}", o.text);
+    let o = ok(&a, &a.token, &h, "memory_vault", json!({"action": "list"})).await;
+    assert!(
+        !o.text.contains("by-name") && !o.text.contains("by-ref"),
+        "{}",
+        o.text
+    );
+    assert!(
+        o.text.contains("third-name") && o.text.contains("busy"),
+        "{}",
+        o.text
+    );
+    for args in [
+        json!({"action": "get", "name": "by-name"}),
+        json!({"action": "get", "id": format!("v:{by_ref}")}),
+        json!({"action": "delete", "id": by_ref}),
+    ] {
+        let o = vault_call(&a, &a.token, &h, args.clone()).await;
+        assert!(o.is_error && o.text.contains("404"), "{args}: {}", o.text);
+    }
+    let audit = a.st.system.list_audit(100, None).await.unwrap();
+    let mut deleted: Vec<&str> = audit
+        .iter()
+        .filter(|x| x.action == "vault.delete")
+        .filter_map(|x| x.target.as_deref())
+        .collect();
+    deleted.sort();
+    let mut want = vec![by_name.as_str(), by_ref.as_str()];
+    want.sort();
+    assert_eq!(deleted, want);
+}
+
+/// M6.6 §7 (замечание 25): `memory_vault action=move` с `to` — по имени (откуда — `scope`) и по
+/// `v:<id>` (`to: solution` — решение из `X-Zam-Solution`); после переноса запись в списке цели и
+/// не в исходной области; та же область — без новой ревизии; цель не область Vault — 404.
+#[tokio::test]
+async fn mcp_vault_move() {
+    let a = api("mcp-vault-move", |_| {}).await;
+    assert_eq!(register(&a, &a.token).await, StatusCode::CREATED);
+    let h = [
+        ("x-zam-solution", G),
+        ("x-zam-session", SESSION),
+        ("x-zam-machine", MACHINE),
+    ];
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "lan-stand", "type": "host",
+               "purpose": "общий стенд", "address": "192.0.2.20"}),
+    )
+    .await;
+    assert!(!o.is_error && o.text.contains(G), "{}", o.text);
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "move", "name": "lan-stand", "scope": "solution", "to": "knowledge"}),
+    )
+    .await;
+    assert!(
+        !o.is_error
+            && o.text.contains("Перенесено")
+            && o.text.contains("«lan-stand»")
+            && o.text.contains("knowledge")
+            && o.text.contains("rev2"),
+        "{}",
+        o.text
+    );
+    let global = vault_ids(&a, &h, json!({"scope": "global"})).await;
+    assert_eq!(global.len(), 1, "{global:?}");
+    let id = global[0].1.clone();
+    assert!(vault_ids(&a, &h, json!({})).await.is_empty());
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "move", "id": format!("v:{id}"), "to": "solution", "format": "json"}),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.text);
+    assert_eq!(
+        o.json(),
+        json!({"id": id, "rev": 3, "scope": "solution", "agent_solution_id": G})
+    );
+    assert_eq!(vault_ids(&a, &h, json!({})).await.len(), 1);
+    // та же область — без новой ревизии
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "move", "id": id, "to": G}),
+    )
+    .await;
+    assert!(
+        !o.is_error && o.text.contains("без изменений") && o.text.contains("rev3"),
+        "{}",
+        o.text
+    );
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "move", "id": id, "to": "rules"}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("404"), "{}", o.text);
+    let o = vault_call(&a, &a.token, &h, json!({"action": "move", "id": id})).await;
+    assert!(o.is_error && o.text.contains("to"), "{}", o.text);
+    let audit = a.st.system.list_audit(100, None).await.unwrap();
+    assert_eq!(audit.iter().filter(|x| x.action == "vault.move").count(), 2);
 }
 
 /// Параллельные `set` разных полей одной записи не теряют правки молча (задача 14, ревью

@@ -68,6 +68,7 @@
 | `idempotent_nodes` | M6 §16 п. 19 (CR-20) | `Idempotency-Key` у `POST /nodes`, `PUT` и `PATCH /nodes/{id}`; `idempotency_key` у `memory_write`. |
 | `mcp_session_arg` | M6 §16 п. 19 (CR-8) | Аргумент `session_id` у `memory_recall`, `memory_search`, `memory_read` — явная сессия для учёта и отметок, как `X-Zam-Session`. |
 | `idea_review` | M6.5 §5–§7 | Разбор идей агентом: `POST /entries/{id}/review` (исходы `plan`, `return`, `decline`, `done`; повтор по `Idempotency-Key`), статус идеи `returned`, режим `ideas.mode` (`review` по умолчанию — `[ideas] default_mode`, или `propose`) в `/auth/settings`; в режиме `review` `propose` идеи `new` — 409 `/problems/idea-mode`; пакет `POST /recall {event: "idea_review", limit}`, счётчики `GET /spaces/{space}/entries/counts`, фильтр `from_idea` и поле `idea` задачи (раздел «Разбор идей» ниже). Старый сервер без флага разбора не знает. |
+| `vault_move` | M6.6 §7 | `POST /vault/{id}/move {space}` — перенос записи Vault между личным Vault (`knowledge`) и Vault решения (GUID) новой ревизией с тем же id, именем, `data` и значением; ответ 200 `{id, rev, scope, agent_solution_id}` (раздел «Перенос записи Vault» ниже). Старый сервер на маршрут отвечает 404. |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -222,3 +223,29 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
 - **MCP**: `memory_update_entry {id: "w:…", action: "review", outcome, summary, missing?, basis?,
   similar?, task?, idempotency_key?}` и `memory_recall {event: "idea_review", limit?}`;
   инструментов по-прежнему 11.
+
+## Перенос записи Vault (`vault_move`)
+
+Введён в M6.6 (`0.0.13-m6.6`, спецификация `docs/specs/2026-11-16-m6.6-dogfood-fixes.md` §7).
+Маршрут клиент использует, только увидев флаг `vault_move` в `features`: сервер без флага на него
+отвечает 404, как на несуществующую запись.
+
+- **`POST /vault/{id}/move {space}`** — тело разбирается строго; `If-Match: <rev>` необязателен,
+  как у `PATCH /vault/{id}`. `space` — `knowledge` (личный Vault) или GUID доступного решения, по
+  тому же правилу, что `{space}` в `/spaces/{space}/vault`; прочее (`rules`, `human`,
+  незарегистрированный GUID) — 404.
+- **Права** — запись в обеих областях, по тем же правилам, что у правки записи: токен `ro` и
+  участник с доступом `ro` к решению-источнику или решению-цели — 403; запрос доступа ждёт
+  ответа, отклонён или отозван — 403 `/problems/solution-access`. Vault заблокирован — 503
+  `/problems/vault-locked` (раньше проверки цели).
+- **Успех** — 200 `{id, rev, scope, agent_solution_id}` (`scope` — `knowledge` или `solution`):
+  новая ревизия `rev + 1`, значение перешифровано под неё сервером (через клиента не проходит),
+  имя, `data` и значение прежние, прежние ревизии раскрываются как были. Та же область — 200 без
+  новой ревизии и без аудита.
+- **Ошибки** — имя занято живой записью цели: 409 «имя занято», запись не тронута; устаревший
+  `If-Match` — 409; удалённая или чужая запись — 404.
+- **Аудит** — `vault.move`, `details` `{item, from, to, rev, session, machine}` (`from`, `to` —
+  `knowledge` или GUID); значение в аудит не попадает.
+- Удаление (`DELETE /vault/{id}`, мягкое) и переименование (`PATCH /vault/{id} {title}` с
+  `If-Match`; занятое имя — 409 «имя занято») есть с M3 и флага не требуют. MCP: `memory_vault
+  action=delete|rename|move` (`new_name`, `to`); инструментов по-прежнему 11.

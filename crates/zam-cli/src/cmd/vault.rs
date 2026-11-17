@@ -5,25 +5,41 @@
 //!   <причина>» (код выхода 0; `get` и `set` получают 503);
 //! - `zam vault get <имя> [--global] [--raw]` — в stdout только значение (`--raw` — без
 //!   перевода строки в конце); раскрытие пишется в аудит сервера;
-//! - `zam vault set|add <имя|--title Т> --type T [--username U] [--link URL] [--description D]
-//!   [--purpose P] [--address A] [--limits L] [--notes N] [--secret-stdin] [--global]` —
-//!   у `host`/`environment` (окружение, M4.5 §8) значение необязательно: читается из stdin
-//!   только с `--secret-stdin`. Значение **только** из stdin (один завершающий перевод строки
-//!   отбрасывается) или скрытого ввода с терминала, никогда из аргументов. Есть запись с этим
-//!   именем — новая ревизия (`If-Match`), открытые поля, не указанные флагами, сохраняются. Адрес
-//!   ресурса — `--link` (`data.url`): `--url` у всех команд — адрес сервера **[решение
-//!   исполнителя]**.
+//! - `zam vault set <имя|--title Т> --type T [--username U] [--link URL] [--description D]
+//!   [--purpose P] [--address A] [--limits L] [--notes N] [--secret-stdin] [--global]` (видимый
+//!   синоним — `add`, M6.6 §7) — у `host`/`environment` (окружение, M4.5 §8) значение
+//!   необязательно: читается из stdin только с `--secret-stdin`. Значение **только** из stdin
+//!   (один завершающий перевод строки отбрасывается) или скрытого ввода с терминала, никогда из
+//!   аргументов. Есть запись с этим именем — новая ревизия (`If-Match`), открытые поля, не
+//!   указанные флагами, сохраняются. Адрес ресурса — `--link` (`data.url`): `--url` у всех команд
+//!   — адрес сервера **[решение исполнителя]**. Окружение без `--global` и `--solution` — строка
+//!   в stderr о Vault решения и `--global` ([`global_hint`]);
+//! - `zam vault rm <имя>` (синоним `delete`) — мягкое удаление (`DELETE /vault/{id}`): ревизии и
+//!   аудит остаются, имя освобождается; печатает `<id> удалена`;
+//! - `zam vault rename <имя> <новое>` — новое имя, новая ревизия с `If-Match` прочитанной;
+//!   занятое имя или запись изменилась — 409, код 4;
+//! - `zam vault mv <имя> --to global|solution|<GUID>` — перенос в другую область
+//!   (`POST /vault/{id}/move`, M6.6 §7): новая ревизия, id и история те же; та же область — без
+//!   ревизии (строка в stderr). Сервер без флага `vault_move` — код 1 с [`OLD_SERVER_MOVE`].
 //!
-//! Область: `--global` — личный Vault (`knowledge`), иначе Vault решения из `solution.toml`
-//! (или `--solution`). Vault решения лежит в базе пользователя токена и другим участникам не
-//! виден. Успешный `set` печатает `<id>@<rev>`.
+//! Область (где искать запись): `--global` — личный Vault (`knowledge`), иначе Vault решения из
+//! `solution.toml` (или `--solution`). Vault решения лежит в базе пользователя токена и другим
+//! участникам не виден. Успешные `set`, `rename` и `mv` печатают `<id>@<rev>`.
 use std::io::{IsTerminal, Read};
 
 use serde_json::{Map, Value, json};
 
-use super::{Ctx, emit, emit_json, solution_guid};
+use super::{Ctx, emit, emit_json, old_server, solution_guid};
 use crate::client::{CliError, EXIT_NOT_FOUND, read_json};
-use crate::target::Loc;
+use crate::target::{Loc, is_guid};
+
+/// Сообщение для сервера без переноса записей Vault (нет флага `vault_move` в `GET /health`
+/// `features`, M6.6 §7).
+pub const OLD_SERVER_MOVE: &str =
+    "сервер не поддерживает перенос записей Vault: нужен zam-server 0.0.13-m6.6 или новее";
+
+/// Флаг переноса записей Vault в `GET /health` `features` (`docs/api-compat.md`).
+const FEATURE_MOVE: &str = "vault_move";
 
 /// Где искать запись: Knowledge или решение.
 pub struct Area<'a> {
@@ -60,6 +76,56 @@ fn space(ctx: &Ctx, a: &Area) -> Result<String, CliError> {
     } else {
         solution_guid(ctx, a.solution)
     }
+}
+
+/// `{space}` цели `zam vault mv --to`: `global` (или `knowledge`) — личный Vault, `solution` —
+/// решение из `solution.toml`, GUID — решение по GUID; иначе код 6 до запроса.
+fn target_space(ctx: &Ctx, to: &str) -> Result<String, CliError> {
+    match to.trim() {
+        "global" | "knowledge" => Ok("knowledge".into()),
+        "solution" => solution_guid(ctx, None),
+        g if is_guid(g) => Ok(g.to_ascii_lowercase()),
+        _ => Err(CliError::input(format!(
+            "--to «{to}»: global, solution или GUID решения"
+        ))),
+    }
+}
+
+/// Vault решения `space`: своё решение регистрируется (идемпотентно), иначе Vault решения —
+/// 404; личный Vault — ничего.
+fn ensure_space(ctx: &Ctx, space: &str) -> Result<(), CliError> {
+    if space == "knowledge" {
+        return Ok(());
+    }
+    let own = ctx.solution.as_ref().is_some_and(|x| x.id == space);
+    ctx.ensure_solution(&Loc::Path {
+        space: space.to_string(),
+        path: String::new(),
+        own_solution: own,
+    })
+}
+
+/// Запись с именем `name` в области `a`: `(space, запись)`; нет — код 5.
+fn located(ctx: &Ctx, a: &Area, name: &str) -> Result<(String, Value), CliError> {
+    let space = space(ctx, a)?;
+    let item = find(ctx, &space, name)?.ok_or_else(|| not_found(name, &space))?;
+    Ok((space, item))
+}
+
+/// Метаданные записанной записи: `<id>@<rev>` или JSON ответа.
+fn written(ctx: &Ctx, m: &Value) -> Result<(), CliError> {
+    if ctx.json {
+        return emit_json(m);
+    }
+    emit(format!("{}@{}\n", m["id"].as_str().unwrap_or("?"), m["rev"]).as_bytes())
+}
+
+/// Совет после `set --type host|environment` без области (M6.6 §7): запись легла в Vault
+/// решения `solution`, общий для проектов хост — в личный Vault.
+pub fn global_hint(solution: &str, name: &str) -> String {
+    format!(
+        "записано в Vault решения «{solution}»; общий для проектов — --global (перенести: zam vault mv {name} --to global)"
+    )
 }
 
 /// Ответ списка области: метаданные записей; `q` — подстрока открытых полей.
@@ -189,8 +255,7 @@ pub fn list(ctx: &Ctx, a: &Area, q: Option<&str>) -> Result<(), CliError> {
 
 /// `zam vault get`: в stdout только значение.
 pub fn get(ctx: &Ctx, a: &Area, name: &str, raw: bool) -> Result<(), CliError> {
-    let space = space(ctx, a)?;
-    let item = find(ctx, &space, name)?.ok_or_else(|| not_found(name, &space))?;
+    let (_, item) = located(ctx, a, name)?;
     let id = item["id"].as_str().unwrap_or_default();
     let v = read_json(
         ctx.client
@@ -217,15 +282,7 @@ pub fn get(ctx: &Ctx, a: &Area, name: &str, raw: bool) -> Result<(), CliError> {
 /// `zam vault set`: создание или новая ревизия записи с именем `name`.
 pub fn set(ctx: &Ctx, a: &Area, s: &Set) -> Result<(), CliError> {
     let space = space(ctx, a)?;
-    if space != "knowledge" {
-        // своё решение регистрируется (идемпотентно), иначе Vault решения — 404
-        let own = ctx.solution.as_ref().is_some_and(|x| x.id == space);
-        ctx.ensure_solution(&Loc::Path {
-            space: space.clone(),
-            path: String::new(),
-            own_solution: own,
-        })?;
-    }
+    ensure_space(ctx, &space)?;
     let existing = find(ctx, &space, s.name)?;
     let secret = s
         .wants_secret()
@@ -254,10 +311,64 @@ pub fn set(ctx: &Ctx, a: &Area, s: &Set) -> Result<(), CliError> {
         }
     };
     let m = read_json(r)?;
-    if ctx.json {
-        return emit_json(&m);
+    // окружение без явной области легло в Vault решения (умолчание не меняется, M6.6 §7);
+    // имя решения — из `solution.toml` (оно там обязательно), иначе — имя записи
+    if !a.global && a.solution.is_none() && matches!(s.kind, "host" | "environment") {
+        let name = s.name.trim();
+        let solution = ctx
+            .solution
+            .as_ref()
+            .map(|x| x.name.as_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(name);
+        eprintln!("{}", global_hint(solution, name));
     }
-    emit(format!("{}@{}\n", m["id"].as_str().unwrap_or("?"), m["rev"]).as_bytes())
+    written(ctx, &m)
+}
+
+/// `zam vault rm`: мягкое удаление записи `name` (ревизии и аудит `vault.delete` остаются, имя
+/// освобождается) — `<id> удалена`.
+pub fn remove(ctx: &Ctx, a: &Area, name: &str) -> Result<(), CliError> {
+    let (_, item) = located(ctx, a, name)?;
+    let id = item["id"].as_str().unwrap_or_default();
+    ctx.client.delete(&format!("/vault/{id}"))?;
+    if ctx.json {
+        return emit_json(&json!({ "deleted": id }));
+    }
+    emit(format!("{id} удалена\n").as_bytes())
+}
+
+/// `zam vault rename`: новое имя `new_name` — новая ревизия с `If-Match` прочитанной; имя занято
+/// в той же области или запись изменилась между чтением и правкой — 409, код 4.
+pub fn rename(ctx: &Ctx, a: &Area, name: &str, new_name: &str) -> Result<(), CliError> {
+    let (_, item) = located(ctx, a, name)?;
+    let id = item["id"].as_str().unwrap_or_default();
+    let r = ctx.client.patch_json_if(
+        &format!("/vault/{id}"),
+        &json!({ "title": new_name.trim() }),
+        item["rev"].as_i64().unwrap_or(0),
+    )?;
+    written(ctx, &read_json(r)?)
+}
+
+/// `zam vault mv`: перенос записи `name` из области `a` в `to` (`POST /vault/{id}/move`, M6.6
+/// §7) — `<id>@<rev>`; та же область — без новой ревизии (строка в stderr). Цель — своё решение —
+/// регистрируется, как у `set`. Сервер без флага `vault_move` (404 или 405 на маршрут) — код 1 с
+/// [`OLD_SERVER_MOVE`].
+pub fn mv(ctx: &Ctx, a: &Area, name: &str, to: &str) -> Result<(), CliError> {
+    let to = target_space(ctx, to)?;
+    let (_, item) = located(ctx, a, name)?;
+    ensure_space(ctx, &to)?;
+    let id = item["id"].as_str().unwrap_or_default();
+    let m = ctx
+        .client
+        .post_json(&format!("/vault/{id}/move"), &json!({ "space": to }))
+        .and_then(read_json)
+        .map_err(|e| old_server(ctx, e, &[404, 405], FEATURE_MOVE, OLD_SERVER_MOVE))?;
+    if m["rev"] == item["rev"] {
+        eprintln!("запись «{}» уже в Vault {to}: без изменений", name.trim());
+    }
+    written(ctx, &m)
 }
 
 #[cfg(test)]
@@ -281,6 +392,23 @@ mod tests {
                 .as_deref(),
             Some("Vault заблокирован: нет мастер-ключа")
         );
+    }
+
+    /// Текст совета §7 и флаг переноса — дословно.
+    #[test]
+    fn move_texts() {
+        assert_eq!(
+            global_hint("Проект", "stage"),
+            "записано в Vault решения «Проект»; общий для проектов — --global (перенести: zam vault mv stage --to global)"
+        );
+        assert_eq!(
+            OLD_SERVER_MOVE,
+            "сервер не поддерживает перенос записей Vault: нужен zam-server 0.0.13-m6.6 или новее"
+        );
+        assert!(super::super::has_feature(
+            &json!({"features": ["m6", FEATURE_MOVE]}),
+            "vault_move"
+        ));
     }
 
     #[test]

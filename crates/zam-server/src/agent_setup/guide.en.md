@@ -41,7 +41,7 @@ By default `memory_read` returns L2 in full. Focus — only on an explicit reque
   - `term`, `task`, `question`, `idea` — glossary, tasks, questions for the human, ideas (sections below).
 - **Editing a record** — `memory_update_entry {id, rev, action}` (409 — reread): `supersede`, `retract` (with a reason), `revisit`, `certify`, `append`, `feedback`; for tasks — `status`, `claim`, `release`; for questions — `answer`; for ideas — `propose`, `decide`, `review` (section "Ideas"). `rev` is required (except `feedback`, `claim`, `release`, `answer`, `propose`, `decide`, `review`): without it — 428, after someone else's edit — 409 with the current revision. On 409/428 reread the record and retry.
 - **Links** — `memory_link {src, type, dst}`: `links_to`, `relates_to`, `depends_on`, `part_of`, `caused_by`, `fixes`, `derived_from`, `mentions`, `contradicts`.
-- **Secrets** — only `memory_vault` (`get | set | list`). Values never reach search, summaries or logs; do not copy them into notes.
+- **Secrets** — only `memory_vault` (`get | set | list | rename | move | delete`). Values never reach search, summaries or logs; do not copy them into notes.
 - A write response may carry `warnings` (`term_alias`, `decision_near_axiom`, …) — read them and fix the record when needed.
 - **A report for the user** — `zam report` (section "Reports").
 
@@ -176,7 +176,9 @@ If a session broke off (a limit, a closed window) and the task's `next_step` was
 ## Environment in Vault
 
 - Hosts, stands, environments — Vault records of types `host` and `environment` with open fields `purpose`, `address`, `limits`, `notes` (a secret value is optional). The session digest lists them in the "Environment" section (without secrets).
-- Find — `memory_vault {action: "list", name: "<word>"}`; open fields and the value (if any) — `memory_vault {action: "get", id: "v:<id>"}` — the reveal is audited. Create or extend — `memory_vault {action: "set", name, type: "host", purpose?, address?, limits?, notes?, value?}` (the value is optional; an update changes only the fields you pass), CLI `zam vault add <name> --type host --purpose … --address … --limits …` (a value only with `--secret-stdin`) or WebUI.
+- Find — `memory_vault {action: "list", name: "<word>"}`; open fields and the value (if any) — `memory_vault {action: "get", id: "v:<id>"}` — the reveal is audited. Create or extend — `memory_vault {action: "set", name, type: "host", purpose?, address?, limits?, notes?, value?}` (the value is optional; an update changes only the fields you pass), CLI `zam vault set <name> --type host --purpose … --address … --limits …` (a value only with `--secret-stdin`; `add` is an alias) or WebUI.
+- Scope: a host or stand shared across projects — `scope: global` (CLI `--global`); only this project — without it; landed in the wrong place — `move`: `memory_vault {action: "move", name | id, to: "knowledge" | "<GUID>"}` (CLI `zam vault mv <name> --to global`) — a new revision, the same id and history.
+- Rename — `memory_vault {action: "rename", name | id, new_name}` (CLI `zam vault rename`); delete — `memory_vault {action: "delete", name | id}` (CLI `zam vault rm`): deletion is soft, revisions and the audit remain; delete only your own erroneous record or at the human's request.
 - Learned something important about the environment (an address, stand limits) — record it in Vault, not in a note; passwords and keys — only as the record value.
 
 ## Proactive recall

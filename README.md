@@ -281,7 +281,7 @@ limitations».
 - **Знание о коде.** Записи ссылаются на файлы (`--ref`, `refs:` во frontmatter) с хэшем;
   правка файла помечает знание «возможно устарело» (хук или `zam refs check`), а при чтении
   файла хук без сети подсказывает, что о нём есть в памяти.
-- **Окружение в Vault.** Хосты и стенды (`zam vault add --type host`): открытые поля ищутся
+- **Окружение в Vault.** Хосты и стенды (`zam vault set --type host`): открытые поля ищутся
   `vault?q=` и видны в дайджесте, секрет — только раскрытием с аудитом.
 - **Рабочая память хуков.** Локальный журнал событий сессии (только метаданные), пакет
   восстановления после `/compact`, пакет под задачу субагента (`SubagentStart`, `brief`),
@@ -561,6 +561,7 @@ stdio-прокси `zam mcp`). Токена в файлах проекта не�
 | `zam report <файл.md> [--title T] [--tag X]… [--area A] [--ref commit:<sha>\|file:<путь>\|note:<id>\|task:k:<id>]… [--key K] [--json]` | отчёт пользователю (M5.5): Markdown с картинками и файлами по относительным ссылкам — одним запросом; печатает ссылку на страницу WebUI |
 | `zam code sync [--full] [--prune] \| status \| map [--focus <путь\|имя>]… [--task T] [--tokens N] \| sym <имя\|путь#qual> \| refs <имя> \| impact [--since C]` | карта кода решения (M5.6): синхронизация рабочей копии, карта в бюджете, карточка символа, кто ссылается, влияние правки |
 | `zam idea list [--status S]… [--origin human\|agent] [--knowledge] \| new <заголовок> [--body T\|--file F] [--priority low\|normal\|high] [--horizon YYYY-MM-DD] [--tag X]… [--origin human\|agent] \| propose <w:id> [--text T] [--space <guid>] \| accept <w:id> [--by human\|agent] [--channel chat\|cli] [--space <guid>] \| defer\|decline <w:id> [--by human\|agent] [--channel chat\|cli] \| queue [--limit N] \| review <w:id> --plan\|--return\|--decline\|--done --summary-file F [--missing T] [--basis ID]… [--similar w:ID]… [--task k:ID \| --task-title T --task-body-file F --task-priority P] [--key K]` | идеи (M5.7): лента, запись, предложение агентом, решение человека (`defer --until`, `decline --reason`); под агентом `--origin` и `--by` обязательны. M6.5: `queue` — пакет разбора, `review` — исход разбора агентом (в план, на доработку, отклонить, уже сделано) |
+| `zam vault list [--q Q] \| get <имя> [--raw] \| set <имя> --type T [--purpose P] [--address A] [--limits L] [--secret-stdin] \| rm <имя> \| rename <имя> <новое> \| mv <имя> --to global\|solution\|<GUID>` | Vault: записи без значений, значение в stdout (раскрытие — в аудит), запись (значение — только из stdin или скрытого ввода; у `host` и `environment` необязательно), мягкое удаление, переименование, перенос между личным Vault и Vault решения (M6.6, новая ревизия). Область — `--global` (личный, для всех проектов) или `--solution G`, без них — решение из `solution.toml`. `add` — синоним `set`, `delete` — синоним `rm` |
 | `zam cache put --query Q --sources ID[#секция][@rev],… [--promote note:<путь>\|insight:<вид>] < выжимка.md` | сохранить выжимку с источниками (печатает `c_<id>`); `zam cache list\|show\|rm` — список, карточка с изменившимися источниками, удаление |
 | `zam export [--space S] [--path P]… [--kind K]… [--no-history] -o <файл.zip>` | экспорт пространства (M6): архив zip — заметки `.md` с frontmatter, вложения, записи журналов, связи, история; без Vault, карты кода, корзины и сессий; токен — без Human и отчётов. Загрузка идёт в `<файл>.<pid>.part` (после убитого процесса его можно удалить); сервер молчит дольше `ZAM_EXPORT_IDLE_SECS` (300 с) — код 2. В WebUI — пункт «Экспорт (.zip)» в меню пространства |
 | `zam import <файл.zip\|каталог> [--space S] [--own] [--on-conflict skip\|revision] [--axioms demote\|keep] [--dry-run]` | импорт пространства (M6): архив `zam export` или каталог `.md` (без `manifest.json` — все `*.md` заметки, архив чужой). Свой архив (тот же пользователь или `--own` при переезде) — id и аксиомы как есть; чужой — новые id, ссылки переписаны, аксиомы → `theorem` (`--axioms keep` — как есть). Повтор того же архива пропускается, изменившееся — в отчёт конфликтов (`--on-conflict revision` — новая ревизия). Только владелец пространства или администратор; отчёты — только из сессии WebUI; предел — `import.max_bytes` (2 ГиБ). Сервер принимает архив и выполняет импорт заданием; `zam` опрашивает его и печатает этап, Ctrl+C прекращает только ожидание; каталог упаковывается на лету, скрытые пути не переносятся |
@@ -583,9 +584,10 @@ zam read "knowledge:Инструменты/Bash" --section "Установка >
 доступа (`zam log`, `insight`, `release`, `vault`, `link`, `links`, `solution access`) есть с M3,
 команды агента (`zam init`, `guide`, `mcp`, `hook …`, `triggers sync`, `cache`,
 `solution rename`) — с M4, рабочей памяти (`zam log term`, `glossary`, `task`, `question`,
-`refs check|verify`, `links file:`, `vault add`, `hook subagent-start`) — с M4.5, `zam report` — с
+`refs check|verify`, `links file:`, `vault set --type host`, `hook subagent-start`) — с M4.5, `zam report` — с
 M5.5, `zam code` — с M5.6, `zam idea` — с M5.7, `zam export`, `import`, `sessions tokens|snapshot`
-(`zam session …` — то же) и `zam read --focus|--range` — с M6, `zam idea review|queue` — с M6.5; см.
+(`zam session …` — то же) и `zam read --focus|--range` — с M6, `zam idea review|queue` — с M6.5,
+`zam vault rm|rename|mv` — с M6.6 (`mv` — сервер `0.0.13-m6.6` и новее); см.
 [deploy/README-install.md](deploy/README-install.md). Хуки
 (`zam hook …`) всегда выходят с кодом 0.
 

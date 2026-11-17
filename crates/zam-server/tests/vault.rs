@@ -1450,3 +1450,422 @@ async fn vault_locked_digest_still_lists_open_fields() {
         .await;
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
 }
+
+// ---- перенос между областями (M6.6 §7, задача 6): POST /vault/{id}/move ----
+
+const G2: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e52";
+
+async fn register(a: &Api, tok: &str, guid: &str, name: &str) {
+    let r = a
+        .tok(
+            tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": guid, "name": name})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+}
+
+/// `POST /vault/{id}/move {space}` с заголовками атрибуции.
+async fn move_item(a: &Api, tok: &str, id: &str, space: &str) -> Resp {
+    a.tok_h(
+        tok,
+        Method::POST,
+        &format!("/api/v1/vault/{id}/move"),
+        Some(json!({ "space": space })),
+        &attrib_h(),
+    )
+    .await
+}
+
+/// Метаданные записи (без значения) по токену `tok`.
+async fn meta(a: &Api, tok: &str, id: &str) -> serde_json::Value {
+    let r = a
+        .tok(tok, Method::GET, &format!("/api/v1/vault/{id}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+/// Номера ревизий записи.
+async fn revs(a: &Api, tok: &str, id: &str) -> Vec<i64> {
+    let r = a
+        .tok(
+            tok,
+            Method::GET,
+            &format!("/api/v1/vault/{id}/revisions"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["rev"].as_i64().unwrap())
+        .collect()
+}
+
+/// Строки аудита `vault.move`.
+async fn move_audit(a: &Api) -> Vec<zam_store::AuditRow> {
+    a.st.system
+        .list_audit(200, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|x| x.action == "vault.move")
+        .collect()
+}
+
+/// Замечание 25: хост, записанный в Vault решения, после переноса в личный Vault виден в разделе
+/// «Окружение» дайджеста другого решения и в поиске личного Vault, а в Vault решения его нет.
+/// Запись со значением и ревизиями переносится новой ревизией (перешифровка под `rev+1`):
+/// значение то же, прежние ревизии раскрываются; перенос обратно — в решение.
+#[tokio::test]
+async fn vault_move_between_scopes() {
+    let a = api("vault-move-scopes", |c| c.recall.timeout_ms = 30_000).await;
+    register(&a, &a.token, G, "Первое").await;
+    register(&a, &a.token, G2, "Второе").await;
+    let body = json!({"title": "lan-stand",
+        "data": {"type": "host", "purpose": "общий стенд", "address": "192.0.2.10:22"}});
+    let host = id_of(
+        &a.t(
+            Method::POST,
+            &format!("/api/v1/spaces/{G}/vault"),
+            Some(body),
+        )
+        .await,
+    );
+    let api_ref = &a;
+    let digest = |sol: &'static str| async move {
+        let j = recall_digest(
+            api_ref,
+            &api_ref.token,
+            json!({"event": "session_start", "solution": sol}),
+        )
+        .await;
+        j["text"].as_str().unwrap().to_string()
+    };
+    let line = format!("lan-stand — общий стенд; 192.0.2.10:22 — v:{host}");
+    let t = digest(G2).await;
+    assert!(
+        !t.contains("lan-stand"),
+        "до переноса — только в своём решении: {t}"
+    );
+    let r = move_item(&a, &a.token, &host, "knowledge").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json(),
+        json!({"id": host, "rev": 2, "scope": "knowledge", "agent_solution_id": null})
+    );
+    let t = digest(G2).await;
+    assert!(t.contains(&line), "{t}");
+    assert_eq!(titles(&list_q(&a, "стенд").await), ["lan-stand"]);
+    let r = a
+        .t(Method::GET, &format!("/api/v1/spaces/{G}/vault"), None)
+        .await;
+    assert!(titles(&r).is_empty(), "{}", r.text());
+    let m = meta(&a, &a.token, &host).await;
+    assert_eq!(m["space"], "knowledge", "{m}");
+    assert_eq!(m["title"], "lan-stand", "{m}");
+    assert_eq!(m["data"]["address"], "192.0.2.10:22", "{m}");
+    assert!(reveal(&a, &a.token, &host).await.json()["secret"].is_null());
+    // запись со значением и второй ревизией
+    let (v1, v2) = (value("mv1"), value("mv2"));
+    let tid = id_of(&set(&a, &a.token, G, "deploy-token", &v1).await);
+    let r = a
+        .t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{tid}"),
+            Some(json!({ "secret": v2 })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = move_item(&a, &a.token, &tid, "knowledge").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["rev"], 3, "{}", r.text());
+    assert!(!r.text().contains(&v2), "ответ переноса без значения");
+    assert_eq!(reveal(&a, &a.token, &tid).await.json()["secret"], v2);
+    assert_eq!(revs(&a, &a.token, &tid).await, [1, 2, 3]);
+    // AAD связан с ревизией, а не с областью: прежние ревизии раскрываются как были
+    for (rev, v) in [(1, &v1), (2, &v2)] {
+        let r = a
+            .adm(
+                Method::GET,
+                &format!("/api/v1/vault/{tid}/revisions?reveal=1&rev={rev}"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json()["secret"], *v, "rev {rev}");
+    }
+    // обратно в Vault решения
+    let r = move_item(&a, &a.token, &tid, G).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json(),
+        json!({"id": tid, "rev": 4, "scope": "solution", "agent_solution_id": G})
+    );
+    let j = reveal(&a, &a.token, &tid).await.json();
+    assert_eq!(
+        (j["secret"].clone(), j["space"].clone()),
+        (json!(v2), json!(G))
+    );
+    // цель — не область Vault или незарегистрированное решение — 404; лишнее поле — 400
+    for space in ["rules", "human", "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e99"] {
+        let r = move_item(&a, &a.token, &tid, space).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{space}: {}", r.text());
+    }
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/vault/{tid}/move"),
+            Some(json!({"space": "knowledge", "title": "x"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // устаревший If-Match — 409, запись на месте
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/vault/{tid}/move"),
+            Some(json!({"space": "knowledge"})),
+            &[("if-match", "2")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let m = meta(&a, &a.token, &tid).await;
+    assert_eq!((m["space"].clone(), m["rev"].clone()), (json!(G), json!(4)));
+    // удалённая запись не переносится
+    let r = a
+        .t(Method::DELETE, &format!("/api/v1/vault/{tid}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = move_item(&a, &a.token, &tid, "knowledge").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}
+
+/// Имя занято в целевой области — 409 «имя занято»; исходная запись не тронута (область,
+/// ревизия, значение, история), аудита переноса нет. Имя освободилось — перенос проходит.
+#[tokio::test]
+async fn vault_move_title_taken_409() {
+    let a = api("vault-move-taken", |_| {}).await;
+    register(&a, &a.token, G, "Своё").await;
+    let (vk, vs) = (value("tk"), value("ts"));
+    let kid = id_of(&set(&a, &a.token, "knowledge", "github", &vk).await);
+    let sid = id_of(&set(&a, &a.token, G, "github", &vs).await);
+    let r = move_item(&a, &a.token, &sid, "knowledge").await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert!(
+        r.json()["detail"].as_str().unwrap().contains("имя занято"),
+        "{}",
+        r.text()
+    );
+    let m = meta(&a, &a.token, &sid).await;
+    assert_eq!((m["space"].clone(), m["rev"].clone()), (json!(G), json!(1)));
+    assert_eq!(revs(&a, &a.token, &sid).await, [1]);
+    assert_eq!(reveal(&a, &a.token, &sid).await.json()["secret"], vs);
+    assert_eq!(reveal(&a, &a.token, &kid).await.json()["secret"], vk);
+    assert!(move_audit(&a).await.is_empty());
+    let r = a
+        .t(Method::DELETE, &format!("/api/v1/vault/{kid}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = move_item(&a, &a.token, &sid, "knowledge").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["rev"], 2);
+}
+
+/// Переименование (замечание 7; `zam vault rename`, `memory_vault rename`) — `PATCH {title}` с
+/// `If-Match`: параллельная правка между чтением и записью — 409, имя прежнее; занятое имя — 409
+/// «имя занято».
+#[tokio::test]
+async fn vault_rename_stale_if_match_409() {
+    let a = api("vault-rename-stale", |_| {}).await;
+    let v = value("rn");
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", &v).await);
+    id_of(&set(&a, &a.token, "knowledge", "gitlab", &value("rn2")).await);
+    // «другой клиент» успел поменять значение: ревизия 2
+    let r = a
+        .t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{id}"),
+            Some(json!({ "secret": value("rn3") })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rename = |title: &'static str, rev: &'static str| {
+        let (a, id) = (&a, id.clone());
+        async move {
+            a.tok_h(
+                &a.token,
+                Method::PATCH,
+                &format!("/api/v1/vault/{id}"),
+                Some(json!({ "title": title })),
+                &[("if-match", rev)],
+            )
+            .await
+        }
+    };
+    let r = rename("gh-main", "1").await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let r = rename("gitlab", "2").await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert!(
+        r.json()["detail"].as_str().unwrap().contains("имя занято"),
+        "{}",
+        r.text()
+    );
+    let m = meta(&a, &a.token, &id).await;
+    assert_eq!(
+        (m["title"].clone(), m["rev"].clone()),
+        (json!("github"), json!(2))
+    );
+    let r = rename("gh-main", "2").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        (r.json()["title"].clone(), r.json()["rev"].clone()),
+        (json!("gh-main"), json!(3))
+    );
+    assert_eq!(
+        reveal(&a, &a.token, &id).await.json()["secret"],
+        value("rn3")
+    );
+}
+
+/// Права записи в обеих областях: участник общего решения с `ro` не переносит ни из Vault
+/// решения, ни в него (403), `ro`-токен — тоже; записи не тронуты.
+#[tokio::test]
+async fn vault_move_member_ro_403() {
+    let a = api("vault-move-ro", |_| {}).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    register(&a, &a_tok, G, "Общее").await;
+    let reg = json!({"agent_solution_id": G, "name": "Общее"});
+    let r = a
+        .tok(&b_tok, Method::POST, "/api/v1/solutions", Some(reg))
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    a.set_access(&a_tok, G, &b_id, "rw").await;
+    let sol = id_of(&set(&a, &b_tok, G, "member-db", &value("ro-sol")).await);
+    let own = id_of(&set(&a, &b_tok, "knowledge", "member-own", &value("ro-own")).await);
+    a.set_access(&a_tok, G, &b_id, "ro").await;
+    for (id, to) in [(&sol, "knowledge"), (&own, G)] {
+        let r = move_item(&a, &b_tok, id, to).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "→ {to}: {}", r.text());
+    }
+    for (id, space) in [(&sol, G), (&own, "knowledge")] {
+        let r = a
+            .adm(
+                Method::GET,
+                &format!("/api/v1/vault/{id}"),
+                None,
+                Some(&b_id),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json()["space"], space, "{}", r.text());
+        assert_eq!(r.json()["rev"], 1, "{}", r.text());
+    }
+    // `ro`-токен своего Vault — 403
+    let ro = a.issue(&a.admin_id(), "ro").await;
+    let mine = id_of(&set(&a, &a.token, "knowledge", "github", &value("ro-tok")).await);
+    register(&a, &a.token, G2, "Своё").await;
+    let r = move_item(&a, &ro, &mine, G2).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert!(move_audit(&a).await.is_empty());
+}
+
+/// Заблокированный Vault (другой мастер-ключ) — 503 `vault-locked` до проверки цели; запись на
+/// месте.
+#[tokio::test]
+async fn vault_move_locked_503() {
+    let (b, token, id, _dir) = locked_world("vault-move-locked", &value("ml")).await;
+    register(&b, &token, G, "Своё").await;
+    for to in [G, "knowledge", "rules"] {
+        let r = move_item(&b, &token, &id, to).await;
+        assert_eq!(
+            r.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{to}: {}",
+            r.text()
+        );
+        assert_eq!(r.json()["type"], "/problems/vault-locked", "{to}");
+    }
+    let m = meta(&b, &token, &id).await;
+    assert_eq!(
+        (m["space"].clone(), m["rev"].clone()),
+        (json!("knowledge"), json!(1))
+    );
+}
+
+/// Аудит `vault.move {item, from, to}` (с ревизией, сессией и машиной, как у прочих операций
+/// Vault; `actor` — id токена), без значения; перенос обратно — вторая строка.
+#[tokio::test]
+async fn vault_move_audit() {
+    let a = api("vault-move-audit", |_| {}).await;
+    register(&a, &a.token, G, "Своё").await;
+    let v = value("au");
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", &v).await);
+    let r = move_item(&a, &a.token, &id, G).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rows = move_audit(&a).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let tok = a.st.system.list_tokens(a.st.admin_id).await.unwrap();
+    let row = &rows[0];
+    assert_eq!(row.actor, tok[0].id.to_string());
+    assert_eq!(row.target.as_deref(), Some(id.as_str()));
+    assert_eq!(row.user_id, Some(a.st.admin_id));
+    let d = &row.details;
+    assert_eq!(d["item"], id.as_str(), "{d}");
+    assert_eq!(d["from"], "knowledge", "{d}");
+    assert_eq!(d["to"], G, "{d}");
+    assert_eq!(d["rev"], 2, "{d}");
+    assert_eq!(d["session"], SESSION, "{d}");
+    assert_eq!(d["machine"], MACHINE, "{d}");
+    let r = move_item(&a, &a.token, &id, "knowledge").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rows = move_audit(&a).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|x| x.details["from"] == G && x.details["to"] == "knowledge"),
+        "{rows:?}"
+    );
+    for x in a.st.system.list_audit(200, None).await.unwrap() {
+        assert!(!x.details.to_string().contains(&v), "значение в аудите");
+    }
+}
+
+/// Та же область — 200 без новой ревизии и без аудита; устаревший `If-Match` — 409, как у
+/// пустой правки `PATCH`.
+#[tokio::test]
+async fn vault_move_same_scope_no_rev() {
+    let a = api("vault-move-same", |_| {}).await;
+    register(&a, &a.token, G, "Своё").await;
+    let id = id_of(&set(&a, &a.token, G, "github", &value("same")).await);
+    let before = meta(&a, &a.token, &id).await;
+    let r = move_item(&a, &a.token, &id, G).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json(),
+        json!({"id": id, "rev": 1, "scope": "solution", "agent_solution_id": G})
+    );
+    assert_eq!(revs(&a, &a.token, &id).await, [1]);
+    assert_eq!(meta(&a, &a.token, &id).await, before);
+    assert!(move_audit(&a).await.is_empty());
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/vault/{id}/move"),
+            Some(json!({ "space": G })),
+            &[("if-match", "7")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(revs(&a, &a.token, &id).await, [1]);
+}

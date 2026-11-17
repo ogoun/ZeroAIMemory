@@ -301,22 +301,9 @@ pub fn propose(
 /// нет маршрута `/review`, 400 — неизвестное событие `idea_review` у `/recall`). В `GET /health`
 /// `features` нет [`FEATURE_REVIEW`] (у сервера до M6 нет и самого поля) — код 1 с
 /// [`OLD_SERVER_REVIEW`]; флаг есть или `/health` не ответил — `e` как есть (404 — нет такой
-/// идеи, код 5).
+/// идеи, код 5). Проба — общая [`super::old_server`].
 fn old_server(ctx: &Ctx, e: CliError, status: u16) -> CliError {
-    if e.http_status() != Some(status) {
-        return e;
-    }
-    match ctx.client.get("/health", &[]).and_then(read_json) {
-        Ok(h) if !has_feature(&h, FEATURE_REVIEW) => CliError::config(OLD_SERVER_REVIEW),
-        _ => e,
-    }
-}
-
-/// Флаг `f` в `features` ответа `/health`.
-fn has_feature(health: &Value, f: &str) -> bool {
-    health["features"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|x| x == f))
+    super::old_server(ctx, e, &[status], FEATURE_REVIEW, OLD_SERVER_REVIEW)
 }
 
 /// `zam idea queue`: пакет разбора `POST /recall {event: idea_review, limit}` решения из
@@ -793,6 +780,7 @@ mod tests {
         );
 
         // флаг сервера
+        use crate::cmd::has_feature;
         assert!(has_feature(
             &json!({"features": ["m6", FEATURE_REVIEW]}),
             "idea_review"

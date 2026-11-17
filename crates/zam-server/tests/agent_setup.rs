@@ -1252,6 +1252,68 @@ async fn guide_has_reports_section() {
     }
 }
 
+/// Протокол (M6.6 §7, замечания 7 и 25): раздел «Окружение в Vault» (ru, en) — совет об области
+/// (`scope: global` для общего хоста, лёг не туда — `move`), переименование и удаление с правилом
+/// «удаляй только свою ошибочную запись или по просьбе человека»; CLI — `set`, `add` — синоним.
+#[tokio::test]
+async fn guide_vault_scope_and_delete_rule() {
+    let a = api("agent-guide-vault", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    let section = |g: &str, head: &str| {
+        g.split(head)
+            .nth(1)
+            .unwrap_or_else(|| panic!("нет {head}"))
+            .split("\n## ")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let ru = section(&guide("").await, "## Окружение в Vault\n");
+    for want in [
+        "хост или стенд, общий для проектов, — `scope: global` (CLI `--global`); только этого \
+         проекта — без него; лёг не туда — `move`",
+        "action: \"move\"",
+        "zam vault mv <имя> --to global",
+        "action: \"rename\"",
+        "new_name",
+        "action: \"delete\"",
+        "удаляй только свою ошибочную запись или по просьбе человека",
+        "zam vault set <имя>",
+    ] {
+        assert!(ru.contains(want), "{want}: {ru}");
+    }
+    assert!(!ru.contains("zam vault add <"), "{ru}");
+    let en = section(&guide("?lang=en").await, "## Environment in Vault\n");
+    for want in [
+        "a host or stand shared across projects — `scope: global` (CLI `--global`); only this \
+         project — without it; landed in the wrong place — `move`",
+        "action: \"move\"",
+        "zam vault mv <name> --to global",
+        "action: \"rename\"",
+        "new_name",
+        "action: \"delete\"",
+        "delete only your own erroneous record or at the human's request",
+        "zam vault set <name>",
+    ] {
+        assert!(en.contains(want), "{want}: {en}");
+    }
+    assert!(!en.contains("zam vault add <"), "{en}");
+}
+
 /// Протокол (M5.6): раздел о карте кода (ru, en) и три фразы, перенесённые из блока v5 ради
 /// бюджета 500 токенов, — в своих разделах протокола; в блоке их нет.
 #[tokio::test]

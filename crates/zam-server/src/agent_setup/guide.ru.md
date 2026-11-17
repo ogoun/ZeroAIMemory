@@ -41,7 +41,7 @@
   - `term`, `task`, `question`, `idea` — словарь, задачи, вопросы человеку, идеи (разделы ниже).
 - **Правка записи** — `memory_update_entry {id, rev, action}` (409 — перечитай): `supersede` (замена новой), `retract` (отзыв с причиной), `revisit`, `certify`, `append`, `feedback`; у задач — `status`, `claim`, `release`, у вопросов — `answer`, у идей — `propose`, `decide`, `review` (раздел «Идеи»). `rev` обязателен (кроме `feedback`, `claim`, `release`, `answer`, `propose`, `decide`, `review`): без него — 428, при чужой правке — 409 с текущей ревизией. На 409/428 перечитай запись и повтори.
 - **Связи** — `memory_link {src, type, dst}`: `links_to`, `relates_to`, `depends_on`, `part_of`, `caused_by`, `fixes`, `derived_from`, `mentions`, `contradicts`.
-- **Секреты** — только `memory_vault` (`get | set | list`). Значения не попадают в поиск, выжимки и журналы; не копируй их в заметки.
+- **Секреты** — только `memory_vault` (`get | set | list | rename | move | delete`). Значения не попадают в поиск, выжимки и журналы; не копируй их в заметки.
 - Ответ записи может нести `warnings` (`term_alias`, `decision_near_axiom` и др.) — прочитай и при необходимости поправь запись.
 - **Отчёт для пользователя** — `zam report` (раздел «Отчёты»).
 
@@ -176,7 +176,9 @@
 ## Окружение в Vault
 
 - Хосты, стенды, окружения — записи Vault типов `host` и `environment` с открытыми полями `purpose`, `address`, `limits`, `notes` (значение-секрет необязательно). Дайджест старта показывает их разделом «Окружение» (без секретов).
-- Найти — `memory_vault {action: "list", name: "<слово>"}`; открытые поля и (если есть) значение — `memory_vault {action: "get", id: "v:<id>"}` — раскрытие пишется в аудит. Создать или дополнить — `memory_vault {action: "set", name, type: "host", purpose?, address?, limits?, notes?, value?}` (значение необязательно; при обновлении меняются только переданные поля), CLI `zam vault add <имя> --type host --purpose … --address … --limits …` (значение — только с `--secret-stdin`) или WebUI.
+- Найти — `memory_vault {action: "list", name: "<слово>"}`; открытые поля и (если есть) значение — `memory_vault {action: "get", id: "v:<id>"}` — раскрытие пишется в аудит. Создать или дополнить — `memory_vault {action: "set", name, type: "host", purpose?, address?, limits?, notes?, value?}` (значение необязательно; при обновлении меняются только переданные поля), CLI `zam vault set <имя> --type host --purpose … --address … --limits …` (значение — только с `--secret-stdin`; `add` — синоним) или WebUI.
+- Область: хост или стенд, общий для проектов, — `scope: global` (CLI `--global`); только этого проекта — без него; лёг не туда — `move`: `memory_vault {action: "move", name | id, to: "knowledge" | "<GUID>"}` (CLI `zam vault mv <имя> --to global`) — новая ревизия, id и история те же.
+- Переименовать — `memory_vault {action: "rename", name | id, new_name}` (CLI `zam vault rename`); удалить — `memory_vault {action: "delete", name | id}` (CLI `zam vault rm`): удаление мягкое, ревизии и аудит остаются; удаляй только свою ошибочную запись или по просьбе человека.
 - Узнал важное об окружении (адрес, ограничения стенда) — запиши в Vault, а не в заметку; пароли и ключи — только значением записи.
 
 ## Проактивное вспоминание

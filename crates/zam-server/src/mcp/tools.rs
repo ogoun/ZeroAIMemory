@@ -134,10 +134,10 @@ impl ToolName {
                  (первый вызов субагента), idea_review — идеи на разбор (limit)."
             }
             ToolName::Vault => {
-                "Vault: list — записи без значений (name — поиск), get — по name или id (v:<id> из \
-                 дайджеста; раскрытие пишется в аудит), set — создать или обновить name = value. \
-                 Типы host и environment — окружение: purpose, address, limits. scope: global \
-                 (личный) или solution (из X-Zam-Solution)."
+                "Vault: list — без значений (name — поиск); get — по name или id v:<id> (раскрытие \
+                 — в аудит); set — создать или обновить name = value; rename — new_name; delete; \
+                 move — to. host и environment — окружение: purpose, address, limits. scope: \
+                 global (личный) или solution (X-Zam-Solution)."
             }
             ToolName::Code => {
                 "Карта кода решения, перед правкой незнакомого кода: map — ключевые файлы и \
@@ -392,10 +392,14 @@ impl ToolName {
             ),
             ToolName::Vault => (
                 json!({
-                    "action": {"type": "string", "enum": ["get", "set", "list"]},
+                    "action": {"type": "string",
+                        "enum": ["get", "set", "list", "delete", "rename", "move"]},
                     "name": {"type": "string"},
-                    "id": {"type": "string"},
+                    "id": {"type": "string", "description": "id записи или v:<id>"},
                     "value": {"type": "string"},
+                    "new_name": {"type": "string", "description": "rename: новое имя"},
+                    "to": {"type": "string", "description":
+                        "move: куда — knowledge (global), solution или GUID решения"},
                     "type": {"type": "string", "description":
                         "set: тип записи (password по умолчанию; host, environment — окружение, \
                          value необязателен)"},
@@ -404,7 +408,7 @@ impl ToolName {
                     "limits": {"type": "string", "description": "set: ограничения, до 1000"},
                     "notes": {"type": "string", "description": "set: заметки, до 2000"},
                     "scope": {"type": "string", "description":
-                        "global, solution или GUID решения"},
+                        "global, solution или GUID решения (у move — откуда)"},
                     "format": fmt,
                 }),
                 &["action"],
@@ -1625,21 +1629,26 @@ async fn recall(rest: &Rest, args: &JsonObject) -> Res {
     })
 }
 
-/// Пространство Vault: `global` → `knowledge`, `solution` → решение из `X-Zam-Solution`,
-/// иначе — как есть (GUID решения); не задано — по умолчанию. Второе — задано ли явно.
+/// Область Vault из значения `raw` аргумента `key` (`scope`, у `move` — и `to`): `global` и
+/// `knowledge` → `knowledge`, `solution` → решение из `X-Zam-Solution`, иначе — как есть (GUID
+/// решения; прочее отклонит REST).
+fn vault_area(rest: &Rest, key: &str, raw: &str) -> Result<String, Fail> {
+    Ok(match raw.trim() {
+        "global" | "knowledge" => "knowledge".into(),
+        "solution" => rest
+            .header(crate::api::search::SOLUTION_HEADER)
+            .ok_or_else(|| Fail::Invalid(format!("{key} solution: нет заголовка X-Zam-Solution")))?
+            .to_string(),
+        s => s.to_string(),
+    })
+}
+
+/// Пространство Vault из `scope` ([`vault_area`]); не задано — по умолчанию. Второе — задано ли
+/// явно.
 fn vault_space(rest: &Rest, args: &JsonObject) -> Result<(String, bool), Fail> {
     Ok(match opt_str(args, "scope")?.map(str::trim) {
         None | Some("") => (default_space(rest), false),
-        Some("global" | "knowledge") => ("knowledge".into(), true),
-        Some("solution") => (
-            rest.header(crate::api::search::SOLUTION_HEADER)
-                .ok_or_else(|| {
-                    Fail::Invalid("scope solution: нет заголовка X-Zam-Solution".into())
-                })?
-                .to_string(),
-            true,
-        ),
-        Some(s) => (s.to_string(), true),
+        Some(s) => (vault_area(rest, "scope", s)?, true),
     })
 }
 
@@ -1717,6 +1726,19 @@ async fn vault_locate(rest: &Rest, args: &JsonObject) -> Result<Value, Fail> {
             })
         }
     }
+}
+
+/// Запись для `delete`, `rename`, `move` с метаданными (имя, область, ревизия): по `name` — как
+/// у `get` ([`vault_locate`]), по `id` (`v:<id>` — как голый id) — `GET /vault/{id}` без
+/// раскрытия.
+async fn vault_target(rest: &Rest, args: &JsonObject) -> Result<Value, Fail> {
+    let m = vault_locate(rest, args).await?;
+    if m.get("title").is_some() {
+        return Ok(m);
+    }
+    let id = m["id"].as_str().unwrap_or("");
+    let uri = format!("/api/v1/vault/{}", enc(id));
+    Ok(call_rest(rest, Method::GET, &uri, None, &[]).await?.json())
 }
 
 /// Открытые поля окружения из аргументов `set` (`purpose`, `address`, `limits`, `notes`):
@@ -1883,7 +1905,71 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
             };
             done(f, &r, |v| format!("Сохранено\n{}", vault_meta_line(v)))
         }
-        _ => Err(Fail::Invalid("action: get, set или list".into())),
+        // удаление мягкое: ревизии и аудит `vault.delete` остаются (M6.6 §7, решение 11)
+        "delete" => {
+            let m = vault_target(rest, args).await?;
+            let id = m["id"].as_str().unwrap_or("").to_string();
+            let uri = format!("/api/v1/vault/{}", enc(&id));
+            call_rest(rest, Method::DELETE, &uri, None, &[]).await?;
+            Ok(match f {
+                Fmt::Json => Done::Json(json!({ "deleted": id })),
+                Fmt::Md => Done::Md(format!(
+                    "Удалено (ревизии и аудит остаются)\n{}",
+                    vault_meta_line(&m)
+                )),
+            })
+        }
+        "rename" => {
+            let new_name = req_str(args, "new_name")?.trim().to_string();
+            let m = vault_target(rest, args).await?;
+            let id = m["id"].as_str().unwrap_or("").to_string();
+            // имя — с `If-Match` прочитанной ревизии: чужая правка между чтением и записью — 409
+            let guard: Vec<(HeaderName, String)> =
+                m["rev"].as_i64().map(if_match).into_iter().collect();
+            let r = call_rest(
+                rest,
+                Method::PATCH,
+                &format!("/api/v1/vault/{}", enc(&id)),
+                Some(&json!({ "title": new_name })),
+                &guard,
+            )
+            .await
+            .map_err(|e| match e {
+                Fail::Rest { ref reply, .. } if reply.status == StatusCode::CONFLICT => e.hint(
+                    "Имя занято — другое new_name; запись изменилась — повторите memory_vault rename.",
+                ),
+                e => e,
+            })?;
+            done(f, &r, |v| format!("Переименовано\n{}", vault_meta_line(v)))
+        }
+        // перенос — маршрутом сервера: значение не раскрывается, id и история те же (решение 12)
+        "move" => {
+            let to = vault_area(rest, "to", req_str(args, "to")?)?;
+            let m = vault_target(rest, args).await?;
+            let id = m["id"].as_str().unwrap_or("").to_string();
+            let r = call_rest(
+                rest,
+                Method::POST,
+                &format!("/api/v1/vault/{}/move", enc(&id)),
+                Some(&json!({ "space": to })),
+                &[],
+            )
+            .await?;
+            done(f, &r, |v| {
+                let mut moved = m.clone();
+                moved["space"] = json!(v["agent_solution_id"].as_str().unwrap_or("knowledge"));
+                moved["rev"] = v["rev"].clone();
+                let what = if v["rev"] == m["rev"] {
+                    "Уже в этой области — без изменений"
+                } else {
+                    "Перенесено"
+                };
+                format!("{what}\n{}", vault_meta_line(&moved))
+            })
+        }
+        _ => Err(Fail::Invalid(
+            "action: get, set, list, delete, rename или move".into(),
+        )),
     }
 }
 

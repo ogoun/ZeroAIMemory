@@ -1221,7 +1221,7 @@ enum VaultCmd {
         opts: VaultOpts,
     },
     /// Записать значение из stdin или скрытого ввода с терминала (не из аргументов)
-    #[command(alias = "add")]
+    #[command(visible_alias = "add")]
     Set {
         /// Имя записи (или `--title`)
         name: Option<String>,
@@ -1255,6 +1255,32 @@ enum VaultCmd {
         /// Описание (data.description)
         #[arg(long)]
         description: Option<String>,
+        #[command(flatten)]
+        opts: VaultOpts,
+    },
+    /// Удалить запись (мягко: ревизии и аудит остаются, имя освобождается)
+    #[command(visible_alias = "delete")]
+    Rm {
+        name: String,
+        #[command(flatten)]
+        opts: VaultOpts,
+    },
+    /// Переименовать запись: новая ревизия с If-Match; имя занято — код 4
+    Rename {
+        name: String,
+        /// Новое имя (в той же области)
+        new_name: String,
+        #[command(flatten)]
+        opts: VaultOpts,
+    },
+    /// Перенести запись в другую область: новая ревизия, id и история те же
+    ///
+    /// Где искать запись — --global или --solution, как у остальных команд Vault.
+    Mv {
+        name: String,
+        /// Куда: global (личный Vault), solution (решение из solution.toml) или GUID решения
+        #[arg(long)]
+        to: String,
         #[command(flatten)]
         opts: VaultOpts,
     },
@@ -1299,6 +1325,15 @@ fn vault(c: VaultCmd) -> Result<(), CliError> {
                 secret_stdin,
             };
             v::set(&cmd::connect(&opts.common)?, &opts.area(), &s)
+        }
+        VaultCmd::Rm { name, opts } => v::remove(&cmd::connect(&opts.common)?, &opts.area(), &name),
+        VaultCmd::Rename {
+            name,
+            new_name,
+            opts,
+        } => v::rename(&cmd::connect(&opts.common)?, &opts.area(), &name, &new_name),
+        VaultCmd::Mv { name, to, opts } => {
+            v::mv(&cmd::connect(&opts.common)?, &opts.area(), &name, &to)
         }
     }
 }
