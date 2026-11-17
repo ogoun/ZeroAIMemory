@@ -23,11 +23,17 @@
 //! MCP Claude Code (`.mcp.json`) — stdio-прокси `zam mcp` (M6 §7.1): токен, адрес и решение
 //! — те же, что у `zam`; для Codex — подсказка про `~/.codex/config.toml`. Файлы проекта пишутся атомарно, BOM и CRLF
 //! сохраняются. Повторный запуск идемпотентен.
+//!
+//! **Адрес сервера** (M6.6 §10.1, замечание обкатки 1) — [`UrlTo`]: `block` (по умолчанию) —
+//! строкой `ZeroAIMemoryUrl=` в блоке; `home` и `local` — блок без этой строки (её вырезает
+//! клиент, поэтому годится любой сервер), адрес — в `~/.zeroaimemory/config.toml` или в
+//! `CLAUDE.local.md`, исключённом из git. Без `--url-to` режим берётся из прежнего блока.
 mod merge;
 mod ojson;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use serde_json::Value;
 
@@ -49,6 +55,17 @@ pub enum InitAgent {
     Both,
 }
 
+/// Куда записать адрес сервера (M6.6 §10.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum UrlTo {
+    /// Строкой ZeroAIMemoryUrl= в блоке CLAUDE.md/AGENTS.md (как раньше)
+    Block,
+    /// В ~/.zeroaimemory/config.toml; блок без адреса
+    Home,
+    /// Строкой в CLAUDE.local.md (исключается из git); блок без адреса
+    Local,
+}
+
 pub struct Opts {
     pub name: Option<String>,
     pub id: Option<String>,
@@ -59,7 +76,12 @@ pub struct Opts {
     pub no_mcp: bool,
     pub yes: bool,
     pub lang: String,
+    /// `None` — режим прежнего блока ([`kept_url_to`]).
+    pub url_to: Option<UrlTo>,
 }
+
+/// Локальный файл Claude Code для `--url-to local`.
+const LOCAL_MD: &str = "CLAUDE.local.md";
 
 /// Файл, который надо записать.
 struct Planned {
@@ -321,6 +343,139 @@ fn remove_stale_tmp(dir: &Path) {
     }
 }
 
+/// `git -C root <args>`: код выхода и stdout без перевода строки в конце; git не запустился —
+/// `None`. Потолки поиска `zam` (`ZAM_CEILING_DIRECTORIES`) дописываются в
+/// `GIT_CEILING_DIRECTORIES`: git не поднимается выше них, как и поиск файлов проекта — иначе из
+/// каталога теста он нашёл бы репозиторий выше и его `info/exclude` (M6.6 §10.1).
+fn git(root: &Path, args: &[&str]) -> Option<(i32, String)> {
+    let mut c = std::process::Command::new("git");
+    c.arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(z) = std::env::var_os(zam_core::CEILING_ENV) {
+        let mut dirs: Vec<PathBuf> = std::env::split_paths(&z)
+            .filter(|p| p.is_absolute())
+            .collect();
+        if let Some(g) = std::env::var_os("GIT_CEILING_DIRECTORIES") {
+            dirs.extend(std::env::split_paths(&g).filter(|p| p.is_absolute()));
+        }
+        if let Ok(j) = std::env::join_paths(dirs) {
+            c.env("GIT_CEILING_DIRECTORIES", j);
+        }
+    }
+    let o = c.output().ok()?;
+    let out = String::from_utf8_lossy(&o.stdout);
+    Some((
+        o.status.code()?,
+        out.trim_end_matches(['\r', '\n']).to_string(),
+    ))
+}
+
+/// Исключён ли `rel` (путь от корня проекта) из git: `Some(false)` — нет или файл уже в индексе
+/// (`check-ignore` не применяет правила к отслеживаемым); `None` — не репозиторий git или git
+/// недоступен.
+fn git_ignored(root: &Path, rel: &str) -> Option<bool> {
+    match git(root, &["check-ignore", "-q", "--", rel])?.0 {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+/// Исключение `CLAUDE.local.md` из git для `--url-to local`.
+enum Exclude {
+    /// Уже исключён или проект не в git (коммитить некуда).
+    Done,
+    /// Дописать строку `line` в `path` — `info/exclude` репозитория, общий для всех worktree.
+    Add {
+        path: PathBuf,
+        old: Option<String>,
+        line: String,
+    },
+    /// `.git` есть, а git не ответил — проверить нельзя.
+    Unknown,
+}
+
+/// План исключения `CLAUDE.local.md` (только чтение: `check-ignore`, `rev-parse`).
+fn plan_exclude(root: &Path) -> Result<Exclude, CliError> {
+    match git_ignored(root, LOCAL_MD) {
+        Some(true) => return Ok(Exclude::Done),
+        Some(false) => {}
+        None => {
+            let in_git = crate::locate::ancestors(root).any(|d| d.join(".git").exists());
+            return Ok(if in_git {
+                Exclude::Unknown
+            } else {
+                Exclude::Done
+            });
+        }
+    }
+    let path = git(root, &["rev-parse", "--git-path", "info/exclude"]);
+    let prefix = git(root, &["rev-parse", "--show-prefix"]);
+    let (Some((0, path)), Some((0, prefix))) = (path, prefix) else {
+        return Ok(Exclude::Unknown);
+    };
+    let path = root.join(path);
+    let old = read_opt(&path)?;
+    Ok(Exclude::Add {
+        path,
+        old,
+        line: format!("/{prefix}{LOCAL_MD}"),
+    })
+}
+
+/// Режим адреса без `--url-to`: прежний блок файлов агента без строки адреса (и без адреса в
+/// другом месте — свой шаблон) — адрес вне блока: `local`, если в `CLAUDE.local.md` есть строка
+/// адреса, иначе `home`. Иначе (блок с адресом или блока нет) — `block`. Так переход блока на
+/// новую версию не возвращает адрес в коммитящийся файл.
+fn kept_url_to(olds: &[Option<String>], urls: &[String], root: &Path) -> Result<UrlTo, CliError> {
+    let Some(block) = olds
+        .iter()
+        .flatten()
+        .find_map(|t| merge::find_block(t).ok().flatten())
+    else {
+        return Ok(UrlTo::Block);
+    };
+    let (rest, cut) = merge::cut_url_lines(block);
+    if !cut.is_empty() || urls.iter().any(|u| rest.contains(u.as_str())) {
+        return Ok(UrlTo::Block);
+    }
+    let local = read_opt(&root.join(LOCAL_MD))?;
+    Ok(if local_urls(local.as_deref()).is_empty() {
+        UrlTo::Home
+    } else {
+        UrlTo::Local
+    })
+}
+
+/// Адреса строк `ZeroAIMemoryUrl=` файла `CLAUDE.local.md`.
+fn local_urls(text: Option<&str>) -> Vec<String> {
+    let t = text.unwrap_or("");
+    merge::cut_url_lines(t.strip_prefix(merge::BOM).unwrap_or(t)).1
+}
+
+/// Блок для `--url-to home|local`: без строк адреса. Адрес остался в блоке где-то ещё (свой
+/// шаблон администратора) — отказ (код 1): иначе он попал бы в файл проекта.
+fn block_without_url(file: &str, block: &str, urls: &[String]) -> Result<String, CliError> {
+    let (rest, cut) = merge::cut_url_lines(block);
+    if let Some(u) = urls
+        .iter()
+        .chain(&cut)
+        .find(|u| !u.is_empty() && rest.contains(u.as_str()))
+    {
+        return Err(CliError::config(format!(
+            "{file}: адрес сервера {u} есть в блоке не только строкой ZeroAIMemoryUrl= (свой \
+             шаблон администратора) — с --url-to home|local он попал бы в файл проекта. Уберите \
+             {{url}} из остального текста шаблона (WebUI: Настройки → Шаблон инструкции) или \
+             подключите с --url-to block"
+        )));
+    }
+    Ok(rest)
+}
+
 fn ask(question: &str) -> bool {
     print!("{question} [y/N] ");
     let _ = std::io::stdout().flush();
@@ -406,16 +561,35 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             remove_stale_tmp(&d);
         }
     }
+    // режим адреса (M6.6 §10.1): флаг или прежний блок; адреса — клиента и подставленный
+    // сервером в блок (`url` ответа /agent-setup, `server.public_url`)
+    let olds = setups
+        .iter()
+        .map(|(_, file, _)| read_opt(&root.join(file)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut urls = vec![url.value.clone()];
+    urls.extend(
+        setups
+            .iter()
+            .filter_map(|(_, _, v)| v["url"].as_str())
+            .map(|u| u.trim().trim_end_matches('/').to_string()),
+    );
+    let url_to = match o.url_to {
+        Some(m) => m,
+        None => kept_url_to(&olds, &urls, &root)?,
+    };
     // токен прежнего блока (v1) того файла, где блок заменяется (I-6); у `both` — из любого
     // из двух, разные — предупреждение, берётся из первого (N-6)
     let mut migrated: Option<(String, &str)> = None;
     let mut differs: Option<&str> = None;
-    for (_, file, v) in &setups {
+    for ((_, file, v), old) in setups.iter().zip(&olds) {
         let block = v["block"]
             .as_str()
             .ok_or_else(|| CliError::config("в ответе /agent-setup нет block"))?;
-        let path = root.join(file);
-        let old = read_opt(&path)?;
+        let block = match url_to {
+            UrlTo::Block => block.to_string(),
+            UrlTo::Home | UrlTo::Local => block_without_url(file, block, &urls)?,
+        };
         if let Some(t) = old.as_deref().and_then(locate::block_token) {
             match &migrated {
                 None => migrated = Some((t, *file)),
@@ -423,9 +597,47 @@ pub fn run(o: Opts) -> Result<(), CliError> {
                 Some(_) => {}
             }
         }
-        let text = merge::upsert_block(old.as_deref(), block)
+        let text = merge::upsert_block(old.as_deref(), &block)
             .map_err(|e| CliError::config(format!("{file}: {e}")))?;
-        plan.extend(Planned::new(path, old.as_deref(), text));
+        plan.extend(Planned::new(root.join(file), old.as_deref(), text));
+    }
+    // адрес вне блока: home — домашний конфиг (другой адрес там — отказ), local —
+    // CLAUDE.local.md и его исключение из git; block — проверка, что файл не уйдёт в git
+    let local_path = root.join(LOCAL_MD);
+    let mut home_url = locate::HomeUrlPlan::Unchanged;
+    let mut local_other: Vec<String> = Vec::new();
+    let mut exclude = Exclude::Done;
+    let mut tracked: Vec<&str> = Vec::new();
+    match url_to {
+        UrlTo::Block => {
+            for (_, file, _) in &setups {
+                if git_ignored(&root, file) == Some(false) {
+                    tracked.push(*file);
+                }
+            }
+        }
+        UrlTo::Home => {
+            home_url = match locate::plan_home_url(&home, &url.value).map_err(CliError::config)? {
+                locate::HomeUrlPlan::Conflict { path, old } => {
+                    return Err(CliError::config(format!(
+                        "{}: там уже адрес {old} — он общий для всех проектов машины. Адрес \
+                         только этого проекта — zam init --url-to local (CLAUDE.local.md); \
+                         сменить общий — поправьте url в этом файле",
+                        path.display()
+                    )));
+                }
+                p => p,
+            };
+            // строка адреса в CLAUDE.local.md важнее домашнего конфига
+            local_other = local_urls(read_opt(&local_path)?.as_deref());
+            local_other.retain(|u| u.trim_end_matches('/') != url.value);
+        }
+        UrlTo::Local => {
+            let old = read_opt(&local_path)?;
+            let text = merge::set_url_line(old.as_deref(), &url.value);
+            plan.extend(Planned::new(local_path, old.as_deref(), text));
+            exclude = plan_exclude(&root)?;
+        }
     }
     let mut agent_plan: Vec<Planned> = Vec::new();
     if !o.no_hooks {
@@ -461,9 +673,17 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     } else {
         migrated.as_ref().map(|(t, _)| t.clone())
     };
+    // у `--url-to local` адрес домашнего конфига не трогается
+    let home_addr = (url_to != UrlTo::Local).then_some(url.value.as_str());
     let home_plan = match &candidate {
-        Some(t) => locate::plan_home(&home, &url.value, t, forced).map_err(CliError::config)?,
+        Some(t) => locate::plan_home(&home, home_addr, t, forced).map_err(CliError::config)?,
         None => locate::HomePlan::Unchanged,
+    };
+    // одна запись домашнего конфига: план токена (адрес в нём тот же) или только адрес
+    let home_write = match (&home_plan, &home_url) {
+        (locate::HomePlan::Write { path, text, .. }, _)
+        | (_, locate::HomeUrlPlan::Write { path, text }) => Some((path, text)),
+        _ => None,
     };
 
     // куда пишется каждый файл: симлинк вне корня или висячий — отказ до любой записи и
@@ -490,6 +710,17 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         }
         ask("Записать?")
     };
+    // исключение CLAUDE.local.md из git — тоже с подтверждением (или `--yes`)
+    let exclude_ok = match &exclude {
+        Exclude::Add { path, .. } => {
+            o.yes
+                || ask(&format!(
+                    "Внести {LOCAL_MD} в {} (адрес сервера не попадёт в git)?",
+                    rel(&root, path)
+                ))
+        }
+        _ => false,
+    };
 
     // запись
     let mut report = Vec::new();
@@ -509,9 +740,15 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             rel(&root, &p.path)
         ));
     }
-    if let locate::HomePlan::Write { path, text, .. } = &home_plan {
+    if let Some((path, text)) = home_write {
         hook::cache::write_atomic(path, text.as_bytes())
             .map_err(|e| CliError::config(format!("{}: {e}", path.display())))?;
+    }
+    if let (true, Exclude::Add { path, old, line }) = (exclude_ok, &exclude) {
+        write_project_file(
+            path,
+            merge::append_lines(old.as_deref(), &[line]).as_bytes(),
+        )?;
     }
 
     // итог
@@ -534,6 +771,9 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         locate::HomePlan::Write { replaced: true, .. } => eprintln!(
             "предупреждение: в ~/.zeroaimemory/config.toml был другой токен — заменён на заданный --token"
         ),
+        locate::HomePlan::Write { .. } if url_to == UrlTo::Local => {
+            println!("Токен сохранён в ~/.zeroaimemory/config.toml (его берут zam и хуки).")
+        }
         locate::HomePlan::Write { .. } => {
             println!("Токен и адрес сохранены в ~/.zeroaimemory/config.toml (их берут zam и хуки).")
         }
@@ -553,6 +793,15 @@ pub fn run(o: Opts) -> Result<(), CliError> {
              репозитории): выпустите новый токен в WebUI и отзовите старый."
         );
     }
+    report_url_to(
+        url_to,
+        &root,
+        &tracked,
+        &local_other,
+        &exclude,
+        exclude_ok,
+        codex,
+    );
     if !o.no_mcp && claude && agent_ok {
         // M6 §7.1: stdio `zam mcp` — адрес, токен, решение и машина те же, что у zam и хуков
         println!(
@@ -577,6 +826,63 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+/// Итог по адресу сервера (M6.6 §10.1): где он, исключение `CLAUDE.local.md`, предупреждения.
+fn report_url_to(
+    url_to: UrlTo,
+    root: &Path,
+    tracked: &[&str],
+    local_other: &[String],
+    exclude: &Exclude,
+    exclude_ok: bool,
+    codex: bool,
+) {
+    match url_to {
+        UrlTo::Block => {
+            for f in tracked {
+                eprintln!(
+                    "предупреждение: {f} не исключён из git — адрес сервера окажется в \
+                     репозитории: zam init --url-to home"
+                );
+            }
+        }
+        UrlTo::Home => {
+            println!(
+                "Адрес сервера — в ~/.zeroaimemory/config.toml, в блоке его нет (--url-to home)."
+            );
+            for u in local_other {
+                eprintln!(
+                    "предупреждение: {LOCAL_MD} задаёт адрес {u} — он важнее домашнего конфига; \
+                     уберите оттуда строку ZeroAIMemoryUrl"
+                );
+            }
+        }
+        UrlTo::Local => {
+            println!("Адрес сервера — в {LOCAL_MD}, в блоке его нет (--url-to local).");
+            match exclude {
+                Exclude::Add { path, .. } if exclude_ok => {
+                    println!("{LOCAL_MD} внесён в {}.", rel(root, path))
+                }
+                Exclude::Add { path, line, .. } => eprintln!(
+                    "предупреждение: {LOCAL_MD} не внесён в {}: адрес сервера может попасть в \
+                     репозиторий — повторите с --yes или допишите туда строку {line}",
+                    rel(root, path)
+                ),
+                Exclude::Unknown => eprintln!(
+                    "предупреждение: git не ответил — проверьте, что {LOCAL_MD} исключён из git \
+                     (в нём адрес сервера)"
+                ),
+                Exclude::Done => {}
+            }
+            if codex {
+                eprintln!(
+                    "предупреждение: при {LOCAL_MD} Claude Code не читает AGENTS.md, а у Codex \
+                     локального файла нет — для Codex выберите zam init --url-to home"
+                );
+            }
+        }
+    }
 }
 
 /// Строка TOML в кавычках.

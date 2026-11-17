@@ -4,7 +4,7 @@
 
 ## Подключение
 
-- Адрес сервера — строка `ZeroAIMemoryUrl=` в блоке (или `ZAM_URL`). Токен — переменная `ZAM_TOKEN` или `~/.zeroaimemory/config.toml`; в CLAUDE.md, AGENTS.md и `.mcp.json` его нет.
+- Адрес сервера — строка `ZeroAIMemoryUrl=` в блоке; без неё (`zam init --url-to home|local`) — `url` в `~/.zeroaimemory/config.toml` или строка `ZeroAIMemoryUrl=` в `CLAUDE.local.md`; либо `ZAM_URL`. Откуда взят — `zam status`. Токен — переменная `ZAM_TOKEN` или `~/.zeroaimemory/config.toml`; в CLAUDE.md, AGENTS.md и `.mcp.json` его нет.
 - Решение — `.zeroaimemory/solution.toml` (`agent_solution_id`, `name`); его создаёт `zam init`. Все клоны с этим GUID делят одну память.
 - MCP — у Claude Code `.mcp.json` со stdio-прокси `zam mcp` (его пишет `zam init`): прокси сам привязывает вызовы к сессии агента. Прочим клиентам — `zam mcp` или `<url>/mcp` (streamable HTTP, `Authorization: Bearer`, заголовок `X-Zam-Solution`); сессию передай заголовком `X-Zam-Session` или аргументом `session_id` у `memory_search`, `memory_read`, `memory_recall` — один постоянный id на сессию, до 128 символов; заданы оба и различаются — 400. Без сессии всё работает, но без пометок «уже выдавалось». Без MCP — CLI `zam`, без CLI — REST `/api/v1`.
 - Хуки (`zam hook …`) `zam init` ставит для Claude Code и Codex. Прочим агентам (Cursor, Gemini CLI, Copilot, Windsurf, Cline и др.) — MCP и этот протокол: всё, что делают хуки, доступно вызовами MCP (раздел «После сжатия и для субагентов»).

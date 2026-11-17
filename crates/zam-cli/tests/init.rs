@@ -1175,3 +1175,373 @@ fn init_replaces_v2_handlers() {
     ok(&p.init(&["--agent", "both", "--yes"], ""));
     assert_eq!(p.snapshot(), before);
 }
+
+/// git в каталоге `dir` с потолками тестов: не поднимается до репозитория ZeroAIMemory.
+fn git(dir: &Path, args: &[&str]) -> Output {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CEILING_DIRECTORIES", common::ceilings())
+        .output()
+        .unwrap()
+}
+
+/// Настоящий репозиторий git в проекте вместо пустого `.git`: `info/exclude` и `check-ignore`
+/// — его, а не репозитория ZeroAIMemory.
+fn git_init(p: &Proj) {
+    let _ = std::fs::remove_dir_all(p.repo.join(".git"));
+    let o = git(&p.repo, &["init", "-q"]);
+    assert!(o.status.success(), "git init: {}", err(&o));
+}
+
+/// `.git/info/exclude` проекта (нет — пусто).
+fn exclude(p: &Proj) -> String {
+    std::fs::read_to_string(p.repo.join(".git/info/exclude")).unwrap_or_default()
+}
+
+/// Исключён ли путь проекта из git (`git check-ignore -q`).
+fn git_ignored(p: &Proj, rel: &str) -> bool {
+    git(&p.repo, &["check-ignore", "-q", rel]).status.success()
+}
+
+/// Домашний конфиг `zam` проекта теста.
+fn home_cfg(p: &Proj) -> PathBuf {
+    p.home.join(".zeroaimemory").join("config.toml")
+}
+
+/// Свой шаблон блока `claude.ru` администратора: вход логином и паролем, `PATCH /admin/settings`.
+fn admin_template(p: &Proj, tpl: &str) {
+    let a = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut r = a
+        .post(&format!("{}/api/v1/auth/login", p.url))
+        .content_type("application/json")
+        .send(json!({"login": "admin", "password": "pw"}).to_string())
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200, "вход администратора");
+    let cookie = r
+        .headers()
+        .get("set-cookie")
+        .and_then(|c| c.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .expect("cookie сессии администратора")
+        .to_string();
+    let v: Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap();
+    let csrf = v["csrf"].as_str().unwrap().to_string();
+    let st = a
+        .patch(&format!("{}/api/v1/admin/settings", p.url))
+        .header("Cookie", &cookie)
+        .header("X-CSRF-Token", &csrf)
+        .content_type("application/json")
+        .send(json!({"agent_setup": {"templates": {"claude.ru": tpl}}}).to_string())
+        .unwrap()
+        .status();
+    assert_eq!(st.as_u16(), 200, "шаблон блока");
+}
+
+/// M6.6 §10.1 (замечание 1): `--url-to home` — блок без строки адреса, адрес — в домашнем
+/// конфиге (токен и свои ключи там не трогаются), `zam status` без флагов находит сервер.
+#[test]
+fn init_url_home_block_without_url() {
+    let (url, tok) = start("url-home");
+    let p = Proj::new("url-home", &url, &tok);
+    let cfg = home_cfg(&p);
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    std::fs::write(
+        &cfg,
+        format!("token = \"{tok}\"\n\n[hooks]\nprompt = false\n"),
+    )
+    .unwrap();
+    // токен — из окружения: в домашний конфиг пишется только адрес
+    let o = p
+        .cmd()
+        .env("ZAM_TOKEN", &tok)
+        .args(["init", "--url", &url, "--url-to", "home", "--yes"])
+        .output()
+        .unwrap();
+    ok(&o);
+    let md = p.read("CLAUDE.md");
+    assert!(md.starts_with(&format!("{}\n", begin())), "{md}");
+    assert!(md.contains("## Память ZeroAIMemory"), "{md}");
+    assert!(
+        !md.contains("ZeroAIMemoryUrl") && !md.contains(&url),
+        "адрес в блоке: {md}"
+    );
+    for f in [
+        ".mcp.json",
+        ".claude/settings.json",
+        ".zeroaimemory/solution.toml",
+    ] {
+        assert!(!p.read(f).contains(&url), "{f}");
+    }
+    let home: toml::Table = toml::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(home["url"].as_str(), Some(url.as_str()));
+    assert_eq!(home["token"].as_str(), Some(tok.as_str()));
+    assert_eq!(home["hooks"]["prompt"].as_bool(), Some(false), "свои ключи");
+    assert!(out(&o).contains("--url-to home"), "{}", out(&o));
+    assert!(!err(&o).contains("окажется в репозитории"), "{}", err(&o));
+    // zam без флагов: адрес — из домашнего конфига
+    let o = p.cmd().arg("status").output().unwrap();
+    ok(&o);
+    let s = out(&o);
+    assert!(s.contains(&format!("Сервер:   {url}")), "{s}");
+    assert!(s.contains("Источник: ~/.zeroaimemory/config.toml"), "{s}");
+    assert!(
+        s.contains(&format!("Блок инструкции: v{V} (актуален)")),
+        "{s}"
+    );
+}
+
+/// `--url-to local`: блок без адреса, адрес — строкой в `CLAUDE.local.md` (свой текст файла
+/// сохраняется), файл — в `info/exclude` после подтверждения (отказ — предупреждение);
+/// домашний адрес не пишется; повтор без флага ничего не меняет; Codex — совет `--url-to home`.
+#[test]
+fn init_url_local_writes_claude_local_and_exclude() {
+    let (url, tok) = start("url-local");
+    let p = Proj::new("url-local", &url, &tok);
+    git_init(&p);
+    std::fs::write(p.repo.join("CLAUDE.local.md"), "# мои заметки\n").unwrap();
+    let ex0 = exclude(&p);
+    // файлы агента — да, исключение — нет
+    let o = p.init(&["--url-to", "local"], "y\nn\n");
+    ok(&o);
+    assert_eq!(
+        p.read("CLAUDE.local.md"),
+        format!("# мои заметки\nZeroAIMemoryUrl={url}\n")
+    );
+    let md = p.read("CLAUDE.md");
+    assert!(
+        !md.contains("ZeroAIMemoryUrl") && !md.contains(&url),
+        "адрес в блоке: {md}"
+    );
+    assert!(p.repo.join(".mcp.json").is_file(), "файлы агента записаны");
+    assert_eq!(exclude(&p), ex0, "исключение не подтверждено");
+    assert!(err(&o).contains("CLAUDE.local.md не внесён"), "{}", err(&o));
+    assert!(!git_ignored(&p, "CLAUDE.local.md"));
+    // --yes — без вопроса
+    let o = p.init(&["--url-to", "local", "--yes"], "");
+    ok(&o);
+    let ex = exclude(&p);
+    assert!(
+        ex.starts_with(&ex0) && ex.ends_with("\n/CLAUDE.local.md\n"),
+        "{ex}"
+    );
+    assert!(git_ignored(&p, "CLAUDE.local.md"));
+    assert!(out(&o).contains("--url-to local"), "{}", out(&o));
+    // токен — в домашнем конфиге, адреса там нет
+    let home: toml::Table =
+        toml::from_str(&std::fs::read_to_string(home_cfg(&p)).unwrap()).unwrap();
+    assert_eq!(home["token"].as_str(), Some(tok.as_str()));
+    assert!(home.get("url").is_none(), "{home:?}");
+    // повтор без флага: режим сохранён, ничего не меняется, строка исключения одна
+    let before = p.snapshot();
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    assert_eq!(p.snapshot(), before);
+    assert_eq!(exclude(&p), ex);
+    // zam без флагов: адрес — из CLAUDE.local.md
+    let o = p.cmd().arg("status").output().unwrap();
+    ok(&o);
+    let s = out(&o);
+    assert!(
+        s.contains(&format!("Сервер:   {url}")) && s.contains("CLAUDE.local.md"),
+        "{s}"
+    );
+    // Codex: локального файла нет, а CLAUDE.local.md выключает AGENTS.md у Claude Code
+    let o = p.init(&["--url-to", "local", "--agent", "both", "--yes"], "");
+    ok(&o);
+    assert!(
+        err(&o).contains("AGENTS.md") && err(&o).contains("--url-to home"),
+        "{}",
+        err(&o)
+    );
+    assert!(!p.read("AGENTS.md").contains(&url));
+}
+
+/// Потолок поиска: git у `zam init` не поднимается выше `ZAM_CEILING_DIRECTORIES` — проект без
+/// своего репозитория внутри чужого (здесь — внешний репозиторий теста) не трогает чужой
+/// `info/exclude` (замечание обкатки 5: тест переписал настоящий CLAUDE.md).
+#[test]
+fn init_url_local_respects_git_ceiling() {
+    let (url, tok) = start("url-ceiling");
+    let root = tmp("url-ceiling");
+    let outer = root.join("outer");
+    let proj = outer.join("proj");
+    let home = root.join("home");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    assert!(git(&outer, &["init", "-q"]).status.success());
+    let ex = outer.join(".git/info/exclude");
+    let ex0 = std::fs::read_to_string(&ex).unwrap_or_default();
+    let mut ceil: Vec<PathBuf> = std::env::split_paths(&common::ceilings()).collect();
+    ceil.push(outer.clone());
+    let o = common::zam_cmd()
+        .env(zam_core::CEILING_ENV, std::env::join_paths(ceil).unwrap())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&proj)
+        .args(["init", "--url", &url, "--token", &tok])
+        .args(["--url-to", "local", "--yes"])
+        .output()
+        .unwrap();
+    ok(&o);
+    assert!(proj.join("CLAUDE.local.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(&ex).unwrap_or_default(),
+        ex0,
+        "внешний репозиторий не тронут"
+    );
+}
+
+/// Повтор `zam init` без `--url-to` сохраняет режим: в прежнем блоке нет строки адреса — не
+/// `block`, поэтому замена устаревшего блока новой версией адрес в CLAUDE.md не возвращает;
+/// `--url-to block` возвращает строку, и дальше повтор держит `block`.
+#[test]
+fn init_rerun_keeps_url_mode() {
+    let (url, tok) = start("url-keep");
+    let p = Proj::new("url-keep", &url, &tok);
+    ok(&p.init(&["--url-to", "home", "--yes"], ""));
+    // блок прежней версии, записанный в режиме home (без адреса)
+    std::fs::write(
+        p.repo.join("CLAUDE.md"),
+        "# Проект\n\n<!-- zeroaimemory:begin v7 -->\n## Память ZeroAIMemory\nстарые правила\n<!-- zeroaimemory:end -->\n",
+    )
+    .unwrap();
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    let md = p.read("CLAUDE.md");
+    assert!(
+        md.starts_with(&format!("# Проект\n\n{}\n", begin())),
+        "{md}"
+    );
+    assert!(!md.contains("старые правила"), "{md}");
+    assert!(
+        !md.contains("ZeroAIMemoryUrl") && !md.contains(&url),
+        "адрес вернулся в блок: {md}"
+    );
+    assert!(out(&o).contains("--url-to home"), "{}", out(&o));
+    let before = p.snapshot();
+    ok(&p.init(&["--yes"], ""));
+    assert_eq!(p.snapshot(), before);
+    // явный block возвращает строку адреса; дальше повтор держит block
+    ok(&p.init(&["--url-to", "block", "--yes"], ""));
+    assert!(
+        p.read("CLAUDE.md")
+            .contains(&format!("ZeroAIMemoryUrl={url}\n")),
+        "{}",
+        p.read("CLAUDE.md")
+    );
+    let before = p.snapshot();
+    ok(&p.init(&["--yes"], ""));
+    assert_eq!(p.snapshot(), before);
+}
+
+/// Адрес есть в своём шаблоне администратора не только строкой `ZeroAIMemoryUrl=`: в режимах
+/// home и local — отказ (код 1) до записи файлов и регистрации решения; в block — как раньше.
+#[test]
+fn init_url_home_refuses_url_elsewhere_in_template() {
+    let (url, tok) = start("url-tpl");
+    let p = Proj::new("url-tpl", &url, &tok);
+    for tpl in [
+        "## Память\nZeroAIMemoryUrl={url}\nWebUI: {url}/ui\nРешение: {solution}.\n",
+        "## Память\nСервер памяти — {url}.\nРешение: {solution}.\n",
+    ] {
+        admin_template(&p, tpl);
+        let before = p.snapshot();
+        for mode in ["home", "local"] {
+            let o = p.init(&["--url-to", mode, "--yes"], "");
+            assert_eq!(o.status.code(), Some(1), "{mode}: {}", out(&o));
+            let e = err(&o);
+            assert!(
+                e.contains("CLAUDE.md") && e.contains("шаблон") && e.contains("--url-to block"),
+                "{mode}: {e}"
+            );
+            assert_eq!(p.snapshot(), before, "{mode}: ничего не записано");
+        }
+    }
+    let (_, body) = api_get(&p, "/solutions");
+    assert!(
+        !body.contains("\"repo\""),
+        "решение не зарегистрировано: {body}"
+    );
+    // block — как раньше: адрес в блоке там, где его поставил шаблон
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    assert!(
+        p.read("CLAUDE.md")
+            .contains(&format!("Сервер памяти — {url}.")),
+        "{}",
+        p.read("CLAUDE.md")
+    );
+}
+
+/// `--url-to home`, а в домашнем конфиге другой адрес: отказ (код 1) с советом `--url-to local`,
+/// ничего не записано; тот же адрес (с «/» в конце) — конфиг не переписывается, свой токен там
+/// не заменяется.
+#[test]
+fn init_url_home_conflicting_home_url() {
+    let (url, tok) = start("url-home-conflict");
+    let p = Proj::new("url-home-conflict", &url, &tok);
+    let cfg = home_cfg(&p);
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    std::fs::write(&cfg, "url = \"http://198.51.100.20:7700\"\n").unwrap();
+    let before = p.snapshot();
+    let o = p.init(&["--url-to", "home", "--yes"], "");
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    let e = err(&o);
+    assert!(
+        e.contains("http://198.51.100.20:7700") && e.contains("--url-to local"),
+        "{e}"
+    );
+    assert_eq!(p.snapshot(), before, "ничего не записано");
+    // тот же адрес: токен zam init — из окружения, в конфиге — свой
+    let other = "zam_000000000000000000000000000000000000000003";
+    let text = format!("url = \"{url}/\"\ntoken = \"{other}\"\n");
+    std::fs::write(&cfg, &text).unwrap();
+    let o = p
+        .cmd()
+        .env("ZAM_TOKEN", &tok)
+        .args(["init", "--url", &url, "--url-to", "home", "--yes"])
+        .output()
+        .unwrap();
+    ok(&o);
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        text,
+        "конфиг тот же"
+    );
+    assert!(!p.read("CLAUDE.md").contains(&url));
+}
+
+/// Режим block в репозитории git: CLAUDE.md не исключён — предупреждение «адрес сервера
+/// окажется в репозитории»; исключён или режим home — без него.
+#[test]
+fn init_block_warns_tracked_claude_md() {
+    const W: &str = "адрес сервера окажется в репозитории: zam init --url-to home";
+    let (url, tok) = start("url-block-warn");
+    let p = Proj::new("url-block-warn", &url, &tok);
+    git_init(&p);
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    let e = err(&o);
+    assert!(
+        e.contains(&format!("CLAUDE.md не исключён из git — {W}")),
+        "{e}"
+    );
+    assert_eq!(e.matches(W).count(), 1, "{e}");
+    let exclude_path = p.repo.join(".git/info/exclude");
+    std::fs::write(&exclude_path, "/CLAUDE.md\n").unwrap();
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    assert!(!err(&o).contains(W), "{}", err(&o));
+    std::fs::write(&exclude_path, "").unwrap();
+    let o = p.init(&["--url-to", "home", "--yes"], "");
+    ok(&o);
+    assert!(!err(&o).contains(W), "{}", err(&o));
+    assert!(!p.read("CLAUDE.md").contains(&url));
+}

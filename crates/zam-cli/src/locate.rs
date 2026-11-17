@@ -194,6 +194,21 @@ pub fn block_token(text: &str) -> Option<String> {
 
 type Pair = (Option<String>, Option<String>);
 
+/// Ключ строки адреса сервера в CLAUDE.md/AGENTS.md/CLAUDE.local.md.
+pub const URL_KEY: &str = "ZeroAIMemoryUrl";
+
+/// Ключ и значение строки настроек `Ключ=значение` (допускаются `- `, `*`, обратные кавычки
+/// вокруг и пробелы у `=`; значение без кавычек, может быть пустым). Одно правило для поиска
+/// настроек и для `zam init`, который вырезает и пишет строку адреса (M6.6 §10.1).
+pub fn md_setting(line: &str) -> Option<(&str, &str)> {
+    let l = line
+        .trim()
+        .trim_start_matches(['-', '*', ' '])
+        .trim_matches('`');
+    let (k, v) = l.split_once('=')?;
+    Some((k.trim(), v.trim().trim_matches(['`', '"', '\'']).trim()))
+}
+
 /// (url, token) внутри блока и вне его. BOM в начале файла пропускается (fix round 1, I-1).
 fn parse_md_parts(text: &str) -> (Pair, Pair) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -208,17 +223,12 @@ fn parse_md_parts(text: &str) -> (Pair, Pair) {
             in_block = false;
             continue;
         }
-        let l = l.trim_start_matches(['-', '*', ' ']).trim_matches('`');
-        let Some((k, v)) = l.split_once('=') else {
+        let Some((k, v)) = md_setting(l).filter(|(_, v)| !v.is_empty()) else {
             continue;
         };
-        let v = v.trim().trim_matches(['`', '"', '\'']).trim();
-        if v.is_empty() {
-            continue;
-        }
         let slot = if in_block { &mut inside } else { &mut outside };
-        match k.trim() {
-            "ZeroAIMemoryUrl" => slot.0 = Some(v.to_string()),
+        match k {
+            URL_KEY => slot.0 = Some(v.to_string()),
             "ZeroAIMemoryToken" => slot.1 = Some(v.to_string()),
             _ => {}
         }
@@ -351,31 +361,49 @@ pub enum HomePlan {
     Conflict(PathBuf),
 }
 
-/// План записи токена `token` и адреса `url` в `~/.zeroaimemory/config.toml`: остальные ключи
-/// сохраняются (комментарии — нет: файл пишет `zam`). Другой токен заменяется, только если
-/// `force` (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
-pub fn plan_home(home: &Path, url: &str, token: &str, force: bool) -> Result<HomePlan, String> {
+/// `~/.zeroaimemory/config.toml` таблицей TOML (нет файла — пустая); битый файл — ошибка.
+fn home_table(home: &Path) -> Result<(PathBuf, toml::Table), String> {
     let path = home.join(".zeroaimemory").join("config.toml");
-    let mut t: toml::Table = match read_limited(&path) {
+    let t = match read_limited(&path) {
         Read::Skip => toml::Table::new(),
         Read::Failed(e) => return Err(format!("не удалось прочитать {}: {e}", path.display())),
         Read::Text(s) => toml::from_str(s.strip_prefix('\u{feff}').unwrap_or(&s))
             .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
     };
-    let url = url.trim().trim_end_matches('/');
-    let old_token = t.get("token").and_then(toml::Value::as_str);
-    let old_url = t
-        .get("url")
+    Ok((path, t))
+}
+
+/// Адрес `url` домашнего конфига без пробелов и `/` в конце.
+fn home_url(t: &toml::Table) -> Option<&str> {
+    t.get("url")
         .and_then(toml::Value::as_str)
-        .map(|u| u.trim().trim_end_matches('/'));
-    if old_token == Some(token) && old_url == Some(url) {
+        .map(|u| u.trim().trim_end_matches('/'))
+        .filter(|u| !u.is_empty())
+}
+
+/// План записи токена `token` и адреса `url` в `~/.zeroaimemory/config.toml`: остальные ключи
+/// сохраняются (комментарии — нет: файл пишет `zam`). Без `url` (`zam init --url-to local`,
+/// M6.6 §10.1) адрес файла не трогается. Другой токен заменяется, только если `force`
+/// (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
+pub fn plan_home(
+    home: &Path,
+    url: Option<&str>,
+    token: &str,
+    force: bool,
+) -> Result<HomePlan, String> {
+    let (path, mut t) = home_table(home)?;
+    let url = url.map(|u| u.trim().trim_end_matches('/'));
+    let old_token = t.get("token").and_then(toml::Value::as_str);
+    if old_token == Some(token) && (url.is_none() || home_url(&t) == url) {
         return Ok(HomePlan::Unchanged);
     }
     let replaced = old_token.is_some_and(|o| o != token);
     if replaced && !force {
         return Ok(HomePlan::Conflict(path));
     }
-    t.insert("url".into(), toml::Value::String(url.to_string()));
+    if let Some(u) = url {
+        t.insert("url".into(), toml::Value::String(u.to_string()));
+    }
     t.insert("token".into(), toml::Value::String(token.to_string()));
     let text = toml::to_string(&t).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(HomePlan::Write {
@@ -383,6 +411,37 @@ pub fn plan_home(home: &Path, url: &str, token: &str, force: bool) -> Result<Hom
         text,
         replaced,
     })
+}
+
+/// Что `zam init --url-to home` делает с адресом в `~/.zeroaimemory/config.toml` (M6.6 §10.1).
+#[derive(Debug, PartialEq, Eq)]
+pub enum HomeUrlPlan {
+    /// Там уже этот адрес.
+    Unchanged,
+    /// Записать `text` в `path`: адрес добавлен, остальное как было.
+    Write { path: PathBuf, text: String },
+    /// Там другой адрес `old`: он общий для всех проектов машины — не заменять.
+    Conflict { path: PathBuf, old: String },
+}
+
+/// План записи одного адреса `url` в `~/.zeroaimemory/config.toml`: токен и остальные ключи
+/// не трогаются; там уже другой адрес — [`HomeUrlPlan::Conflict`]. Битый файл — ошибка.
+pub fn plan_home_url(home: &Path, url: &str) -> Result<HomeUrlPlan, String> {
+    let (path, mut t) = home_table(home)?;
+    let url = url.trim().trim_end_matches('/');
+    match home_url(&t) {
+        Some(old) if old == url => return Ok(HomeUrlPlan::Unchanged),
+        Some(old) => {
+            return Ok(HomeUrlPlan::Conflict {
+                path,
+                old: old.to_string(),
+            });
+        }
+        None => {}
+    }
+    t.insert("url".into(), toml::Value::String(url.to_string()));
+    let text = toml::to_string(&t).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(HomeUrlPlan::Write { path, text })
 }
 
 /// Ближайший вверх от `start` файл решения: в каждом каталоге сначала
@@ -661,6 +720,63 @@ mod tests {
         assert!(!format!("{f:?}").contains(TOKEN));
         assert!(!format!("{r:?}").contains(TOKEN));
         assert!(format!("{f:?}").contains("zam_abcdefgh"));
+    }
+
+    /// M6.6 §10.1: `--url-to home` пишет только адрес (токен и свои ключи — как были), тот же
+    /// адрес — без записи, другой — отказ; `plan_home` без адреса (`--url-to local`) адрес
+    /// домашнего конфига не трогает.
+    #[test]
+    fn home_url_plan_keeps_token_and_refuses_other_url() {
+        let root = tmp("homeurl");
+        let home = root.join("home");
+        let cfg = home.join(".zeroaimemory").join("config.toml");
+        let write = |s: &str| {
+            std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+            std::fs::write(&cfg, s).unwrap();
+        };
+        let u = "http://192.0.2.5:7700";
+        match plan_home_url(&home, &format!("{u}/")).unwrap() {
+            HomeUrlPlan::Write { path, text } => {
+                assert_eq!(path, cfg);
+                assert_eq!(text, format!("url = \"{u}\"\n"));
+            }
+            p => panic!("{p:?}"),
+        }
+        write(&format!("token = \"t\"\nurl = \"{u}/\"\n"));
+        assert_eq!(plan_home_url(&home, u).unwrap(), HomeUrlPlan::Unchanged);
+        write("url = \"http://198.51.100.1:7700\"\n");
+        assert_eq!(
+            plan_home_url(&home, u).unwrap(),
+            HomeUrlPlan::Conflict {
+                path: cfg.clone(),
+                old: "http://198.51.100.1:7700".into()
+            }
+        );
+        write("token = \"t\"\n[hooks]\nprompt = false\n");
+        let HomeUrlPlan::Write { text, .. } = plan_home_url(&home, u).unwrap() else {
+            panic!("запись адреса");
+        };
+        let t: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(t["token"].as_str(), Some("t"));
+        assert_eq!(t["url"].as_str(), Some(u));
+        assert_eq!(t["hooks"]["prompt"].as_bool(), Some(false));
+        write("url = [");
+        assert!(plan_home_url(&home, u).is_err());
+        // без адреса: только токен
+        write("url = \"http://198.51.100.1:7700\"\ntoken = \"t\"\n");
+        assert_eq!(
+            plan_home(&home, None, "t", false).unwrap(),
+            HomePlan::Unchanged
+        );
+        let HomePlan::Write { text, replaced, .. } = plan_home(&home, None, "t2", true).unwrap()
+        else {
+            panic!("замена токена");
+        };
+        assert!(replaced);
+        assert!(
+            text.contains("http://198.51.100.1:7700") && text.contains("t2"),
+            "{text}"
+        );
     }
 
     #[test]

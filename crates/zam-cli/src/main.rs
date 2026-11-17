@@ -366,6 +366,9 @@ enum Cmd {
         /// Язык блока инструкции
         #[arg(long, default_value = "ru", value_parser = ["ru", "en"])]
         lang: String,
+        /// Куда записать адрес сервера (без флага — как в прежнем блоке, нового — block)
+        #[arg(long, value_enum)]
+        url_to: Option<cmd::init::UrlTo>,
     },
     /// Полный протокол работы агента с памятью (Markdown)
     Guide {
@@ -2001,6 +2004,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             no_mcp,
             yes,
             lang,
+            url_to,
         } => cmd::init::run(cmd::init::Opts {
             name,
             id,
@@ -2011,6 +2015,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             no_mcp,
             yes,
             lang,
+            url_to,
         }),
         Cmd::Guide { lang, common } => cmd::guide::run(&cmd::connect(&common)?, &lang),
         Cmd::Mcp { common } => cmd::mcp::run(cmd::connect(&common)?),

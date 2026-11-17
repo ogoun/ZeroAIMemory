@@ -534,6 +534,10 @@ zam status
 сливает хуки в `.claude/settings.json` и `.codex/hooks.json` и сервер MCP в `.mcp.json` (с M6 —
 stdio-прокси `zam mcp`). Токена в файлах проекта нет: он хранится в `~/.zeroaimemory/config.toml`,
 оттуда его берут `zam`, хуки и `zam mcp`; переменная `ZAM_TOKEN` нужна только MCP по HTTP.
+Адрес сервера по умолчанию — строкой `ZeroAIMemoryUrl=` в блоке; с 0.0.13-m6.6
+`zam init --url-to home` хранит его в `~/.zeroaimemory/config.toml`, `--url-to local` — в
+`CLAUDE.local.md`, исключённом из git: в блоке адреса нет, и `CLAUDE.md` можно коммитить в
+публичный репозиторий. Повторный `zam init` режим сохраняет.
 Подробно (Codex, ручная настройка, служба) —
 [deploy/README-install.md](deploy/README-install.md), раздел «Подключение агента (`zam init`)».
 
@@ -551,7 +555,7 @@ stdio-прокси `zam mcp`). Токена в файлах проекта не�
 
 | Команда | Что делает |
 |---|---|
-| `zam status` | проверка сервера, токена, пользователя и `solution.toml` |
+| `zam status` | проверка сервера, токена (печатается префикс `zam_XXXXXXXX…`, как в списке токенов WebUI), пользователя и решения: M6.6 — строка `Решение:  «<имя>» (<GUID>) — <путь solution.toml>`, в `--json` — `solution_id`, `solution_name` |
 | `zam tree [цель] [--depth 1..5]` | дерево с краткими сводками L0 |
 | `zam read <цель>… [--tier L0\|L1\|L2\|focus] [--section "A > B"] [--rev N]` | чтение Markdown как он сохранён; `--batch`, `--max-tokens N`, `--budget N`, `--if-rev N`, `--since-rev N` (дифф с ревизии, M4.5), `--locator` (часть вложения, M5) — пачкой через `POST /read` с бюджетом токенов; `--focus "<запрос>"` (M6) — оглавление и ближайшие к запросу части, пропуски с адресом `range:r<rev>:S-E`; `--range r<rev>:S-E` (M6) — ровно пропущенный текст той ревизии |
 | `zam write <цель> [--file f.md] [-m сообщение] [--base-rev N] [--l0 текст]` | создать или заменить заметку (без `--file` текст читается из stdin) |

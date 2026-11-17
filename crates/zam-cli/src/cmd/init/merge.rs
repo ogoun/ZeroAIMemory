@@ -1,8 +1,10 @@
 //! Слияние файлов проекта для `zam init` (§14.1): блок между маркерами в CLAUDE.md/AGENTS.md,
 //! хуки в `.claude/settings.json` / `.codex/hooks.json`, сервер в `.mcp.json`, строки
-//! `.zeroaimemory/.gitignore`. Всё чистые функции над текстом: повторный запуск даёт тот же
-//! результат (идемпотентность), чужое содержимое не меняется.
+//! `.zeroaimemory/.gitignore` и `info/exclude`, строка адреса сервера (вырезать из блока,
+//! записать в `CLAUDE.local.md` — M6.6 §10.1). Всё чистые функции над текстом: повторный запуск
+//! даёт тот же результат (идемпотентность), чужое содержимое не меняется.
 use super::ojson::J;
+use crate::locate::{URL_KEY, md_setting};
 
 const BEGIN: &str = "<!-- zeroaimemory:begin";
 const END: &str = "<!-- zeroaimemory:end";
@@ -28,6 +30,22 @@ pub fn upsert_block(existing: Option<&str>, block: &str) -> Result<String, Strin
     } else {
         block.to_string()
     };
+    let Some((b, end)) = block_span(text)? else {
+        let nl = if crlf { "\r\n" } else { "\n" };
+        let mut out = text.to_string();
+        if !out.ends_with('\n') {
+            out.push_str(nl);
+        }
+        out.push_str(nl);
+        out.push_str(&block);
+        return Ok(out);
+    };
+    Ok(format!("{}{block}{}", &text[..b], &text[end..]))
+}
+
+/// Байты блока в тексте: от начала строки маркера начала до конца строки маркера конца
+/// (с переводом строки). Нет блока — `None`; начало без конца — ошибка.
+fn block_span(text: &str) -> Result<Option<(usize, usize)>, String> {
     // начала строк
     let mut starts = vec![0usize];
     starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
@@ -41,14 +59,7 @@ pub fn upsert_block(existing: Option<&str>, block: &str) -> Result<String, Strin
         .copied()
         .find(|&i| line_at(i).0.trim_start().starts_with(BEGIN));
     let Some(b) = begin else {
-        let nl = if crlf { "\r\n" } else { "\n" };
-        let mut out = text.to_string();
-        if !out.ends_with('\n') {
-            out.push_str(nl);
-        }
-        out.push_str(nl);
-        out.push_str(&block);
-        return Ok(out);
+        return Ok(None);
     };
     let end = starts
         .iter()
@@ -57,7 +68,66 @@ pub fn upsert_block(existing: Option<&str>, block: &str) -> Result<String, Strin
         .find(|&i| line_at(i).0.trim_start().starts_with(END))
         .map(|i| line_at(i).1)
         .ok_or_else(|| "начало блока ZeroAIMemory без <!-- zeroaimemory:end -->".to_string())?;
-    Ok(format!("{}{block}{}", &text[..b], &text[end..]))
+    Ok(Some((b, end)))
+}
+
+/// Блок ZeroAIMemory в тексте файла (с маркерами); нет блока — `None`, начало без конца —
+/// ошибка, как у [`upsert_block`].
+pub fn find_block(text: &str) -> Result<Option<&str>, String> {
+    Ok(block_span(text)?.map(|(b, e)| &text[b..e]))
+}
+
+/// Вырезает из блока строки адреса сервера (ключ `ZeroAIMemoryUrl` — по правилу
+/// [`md_setting`], как их находит `zam`): блок без них (остальное байт в байт) и непустые
+/// значения вырезанных строк (M6.6 §10.1).
+pub fn cut_url_lines(block: &str) -> (String, Vec<String>) {
+    let mut urls = Vec::new();
+    let rest = block
+        .split_inclusive('\n')
+        .filter(|l| match md_setting(l) {
+            Some((URL_KEY, v)) => {
+                if !v.is_empty() {
+                    urls.push(v.to_string());
+                }
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    (rest, urls)
+}
+
+/// Текст `CLAUDE.local.md` со строкой `ZeroAIMemoryUrl=<url>`: прежние строки адреса (все — у
+/// `zam` побеждает последняя) заменяются ею, нет ни одной — она дописывается в конец. Прочий
+/// текст, BOM и CRLF файла сохраняются (M6.6 §10.1).
+pub fn set_url_line(existing: Option<&str>, url: &str) -> String {
+    let text = existing.unwrap_or("");
+    let (bom, body) = match text.strip_prefix(BOM) {
+        Some(rest) => (BOM, rest),
+        None => ("", text),
+    };
+    let line = format!("{URL_KEY}={url}");
+    let mut found = false;
+    let mut out: String = body
+        .split_inclusive('\n')
+        .map(|l| match md_setting(l) {
+            Some((URL_KEY, _)) => {
+                found = true;
+                let eol = &l[l.trim_end_matches(['\r', '\n']).len()..];
+                format!("{line}{eol}")
+            }
+            _ => l.to_string(),
+        })
+        .collect();
+    if !found {
+        let nl = if body.contains("\r\n") { "\r\n" } else { "\n" };
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(nl);
+        }
+        out.push_str(&line);
+        out.push_str(nl);
+    }
+    format!("{bom}{out}")
 }
 
 /// Обработчик хука — наш: exec form `command == "zam"` и `args[0] == "hook"` (Claude Code)
@@ -147,8 +217,14 @@ pub fn merge_mcp(root: &mut J, fragment: &J) -> Result<(), String> {
 
 /// `.zeroaimemory/.gitignore`: дописывает недостающие `cache/` и `logs/`.
 pub fn gitignore(existing: Option<&str>) -> String {
+    append_lines(existing, &["cache/", "logs/"])
+}
+
+/// Дописывает в конец файла правил git (`.gitignore`, `info/exclude`) недостающие строки
+/// `lines` (строка уже есть — без изменений).
+pub fn append_lines(existing: Option<&str>, lines: &[&str]) -> String {
     let mut out = existing.unwrap_or("").to_string();
-    for line in ["cache/", "logs/"] {
+    for &line in lines {
         if !out
             .strip_prefix(BOM)
             .unwrap_or(&out)
@@ -296,5 +372,57 @@ mod tests {
         assert_eq!(gitignore(None), "cache/\nlogs/\n");
         assert_eq!(gitignore(Some("x")), "x\ncache/\nlogs/\n");
         assert_eq!(gitignore(Some("logs/\ncache/\n")), "logs/\ncache/\n");
+        assert_eq!(
+            append_lines(Some("# свои\n"), &["/CLAUDE.local.md"]),
+            "# свои\n/CLAUDE.local.md\n"
+        );
+        let once = append_lines(None, &["/CLAUDE.local.md"]);
+        assert_eq!(append_lines(Some(&once), &["/CLAUDE.local.md"]), once);
+    }
+
+    /// M6.6 §10.1: строки адреса вырезаются из блока (ключ — как у `locate`: `- `, обратные
+    /// кавычки, пробелы у `=`), остальное — байт в байт; повтор ничего не меняет.
+    #[test]
+    fn url_lines_cut_from_block() {
+        let b = "<!-- zeroaimemory:begin v8 -->\n## Память\nZeroAIMemoryUrl=http://192.0.2.1:7700\n\
+                 - `ZeroAIMemoryUrl = http://192.0.2.2`\nZeroAIMemoryUrlX=y\nZeroAIMemoryUrl=\n\
+                 Решение: x.\n<!-- zeroaimemory:end -->\n";
+        let (cut, urls) = cut_url_lines(b);
+        assert_eq!(
+            cut,
+            "<!-- zeroaimemory:begin v8 -->\n## Память\nZeroAIMemoryUrlX=y\nРешение: x.\n\
+             <!-- zeroaimemory:end -->\n"
+        );
+        assert_eq!(urls, ["http://192.0.2.1:7700", "http://192.0.2.2"]);
+        assert_eq!(cut_url_lines(&cut), (cut.clone(), Vec::new()));
+        // блок в тексте файла
+        let text = format!("# Проект\r\n{b}хвост");
+        assert_eq!(find_block(&text), Ok(Some(b)));
+        assert_eq!(find_block("# только текст\n"), Ok(None));
+        assert!(find_block("<!-- zeroaimemory:begin v1 -->\nx\n").is_err());
+    }
+
+    /// Строка адреса в `CLAUDE.local.md`: заменяет прежние (все), иначе дописывается в конец;
+    /// BOM и CRLF файла сохраняются.
+    #[test]
+    fn url_line_set_in_local_file() {
+        let u = "http://192.0.2.1:7700";
+        let line = format!("ZeroAIMemoryUrl={u}");
+        assert_eq!(set_url_line(None, u), format!("{line}\n"));
+        assert_eq!(set_url_line(Some(""), u), format!("{line}\n"));
+        assert_eq!(set_url_line(Some("a"), u), format!("a\n{line}\n"));
+        let mine = set_url_line(Some("# мои\n"), u);
+        assert_eq!(mine, format!("# мои\n{line}\n"));
+        assert_eq!(set_url_line(Some(&mine), u), mine);
+        assert_eq!(
+            set_url_line(
+                Some(
+                    "\u{feff}a\r\nZeroAIMemoryUrl=http://198.51.100.1\r\nb\r\n- `ZeroAIMemoryUrl=`"
+                ),
+                u
+            ),
+            format!("\u{feff}a\r\n{line}\r\nb\r\n{line}")
+        );
+        assert_eq!(set_url_line(Some("a\r\n"), u), format!("a\r\n{line}\r\n"));
     }
 }

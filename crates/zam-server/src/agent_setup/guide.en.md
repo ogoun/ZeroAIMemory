@@ -4,7 +4,7 @@ The short rules live in the ZeroAIMemory block of CLAUDE.md / AGENTS.md. This is
 
 ## Connection
 
-- Server address — the `ZeroAIMemoryUrl=` line of the block (or `ZAM_URL`). Token — `ZAM_TOKEN` or `~/.zeroaimemory/config.toml`; it is never stored in CLAUDE.md, AGENTS.md or `.mcp.json`.
+- Server address — the `ZeroAIMemoryUrl=` line of the block; without it (`zam init --url-to home|local`) — `url` in `~/.zeroaimemory/config.toml` or the `ZeroAIMemoryUrl=` line of `CLAUDE.local.md`; or `ZAM_URL`. Where it comes from — `zam status`. Token — `ZAM_TOKEN` or `~/.zeroaimemory/config.toml`; it is never stored in CLAUDE.md, AGENTS.md or `.mcp.json`.
 - Solution — `.zeroaimemory/solution.toml` (`agent_solution_id`, `name`), created by `zam init`. All clones with this GUID share one memory.
 - MCP — for Claude Code, `.mcp.json` with the stdio proxy `zam mcp` (written by `zam init`): the proxy binds the calls to the agent session by itself. Other clients — `zam mcp` or `<url>/mcp` (streamable HTTP, `Authorization: Bearer`, `X-Zam-Solution` header); pass the session in the `X-Zam-Session` header or in the `session_id` argument of `memory_search`, `memory_read`, `memory_recall` — one constant id per session, up to 128 characters; both given and different — 400. Without a session everything works, but without the “already given” marks. Without MCP — CLI `zam`; without CLI — REST `/api/v1`.
 - Hooks (`zam hook …`) are installed by `zam init` for Claude Code and Codex. Other agents (Cursor, Gemini CLI, Copilot, Windsurf, Cline, …) use MCP and this protocol: everything the hooks do is available as MCP calls (section "After compaction and for subagents").
