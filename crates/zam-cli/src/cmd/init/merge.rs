@@ -71,9 +71,10 @@ fn block_span(text: &str) -> Result<Option<(usize, usize)>, String> {
     Ok(Some((b, end)))
 }
 
-/// Блок ZeroAIMemory в тексте файла (с маркерами); нет блока — `None`, начало без конца —
-/// ошибка, как у [`upsert_block`].
+/// Блок ZeroAIMemory в тексте файла (с маркерами; BOM в начале файла пропускается, как у
+/// [`upsert_block`]); нет блока — `None`, начало без конца — ошибка.
 pub fn find_block(text: &str) -> Result<Option<&str>, String> {
+    let text = text.strip_prefix(BOM).unwrap_or(text);
     Ok(block_span(text)?.map(|(b, e)| &text[b..e]))
 }
 
@@ -398,6 +399,8 @@ mod tests {
         // блок в тексте файла
         let text = format!("# Проект\r\n{b}хвост");
         assert_eq!(find_block(&text), Ok(Some(b)));
+        // блок первой строкой файла с BOM
+        assert_eq!(find_block(&format!("{BOM}{b}хвост")), Ok(Some(b)));
         assert_eq!(find_block("# только текст\n"), Ok(None));
         assert!(find_block("<!-- zeroaimemory:begin v1 -->\nx\n").is_err());
     }
