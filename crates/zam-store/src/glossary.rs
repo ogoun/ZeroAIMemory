@@ -915,6 +915,39 @@ mod tests {
         );
     }
 
+    /// Повторное ревью задачи 5 (круг 3): предел окна `край + PROSE_HEAD_LOOKAHEAD_BYTES` внутри
+    /// многобайтового знака (кириллица — 2 байта, эмодзи — 4) сдвигается к границе знака: без
+    /// паники, маска головы той же длины, код на краю окна — код, проза до него — проза.
+    #[test]
+    fn prose_head_window_edge_inside_multibyte_char() {
+        let head = "hooks `hooks ";
+        let cut = "hooks `hooks".len();
+        for filler in ["я", "😀"] {
+            let n = PROSE_HEAD_LOOKAHEAD_BYTES / filler.len() + 10;
+            let text = format!("{head}{}", filler.repeat(n));
+            // предел окна попадает внутрь знака — ветка сдвига к границе выполняется
+            assert!(
+                !text.is_char_boundary(cut + PROSE_HEAD_LOOKAHEAD_BYTES),
+                "{filler}"
+            );
+            let p = ProseText::head(&text, "hooks `hooks".chars().count());
+            assert_eq!(
+                p.as_str(),
+                format!("hooks{}", " ".repeat(cut - 5)),
+                "{filler}"
+            );
+            assert_eq!(p.as_str().len(), cut);
+            let hits: Vec<(usize, usize)> =
+                p.spans("hooks", false).map(|r| (r.start, r.end)).collect();
+            assert_eq!(hits, [(0, 5)], "{filler}");
+            let terms = [entry("Хуки", &["hooks"])];
+            assert_eq!(
+                find_alias_uses(p.as_str(), &terms),
+                [("hooks".into(), "Хуки".into())]
+            );
+        }
+    }
+
     /// Ревью задачи 5, M3 (решение координатора): `-` и `/` между латиницей и кириллицей —
     /// граница слова («MCP-сервер», «summary/выжимка»); в одной письменности — идентификатор.
     #[test]
