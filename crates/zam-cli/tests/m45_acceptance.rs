@@ -889,7 +889,7 @@ fn glossary_ru_en() {
     for (agent, s) in [("claude", "wm-g1"), ("codex", "wm-g2")] {
         let d = p.session_start_until(agent, s, "startup", |c| !c.is_empty());
         assert!(
-            d.contains("Словарь: 1 терминов — memory_search kinds=[term]"),
+            d.contains("Словарь: 1 термин — memory_search kinds=[term]"),
             "{d}"
         );
         let pr = p.ev(

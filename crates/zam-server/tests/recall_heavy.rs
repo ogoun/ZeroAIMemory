@@ -53,6 +53,7 @@ async fn heavy_sh05_digest_complete_fts() {
         required: rec,
         traps: w.traps.clone(),
         rules: w.rules,
+        open_tasks: w.open_tasks,
     };
     let j = recall(
         &a,
@@ -115,6 +116,7 @@ async fn heavy_sh05_fits_output_limit() {
             required: w.required.clone(),
             traps: w.traps.clone(),
             rules: w.rules,
+            open_tasks: w.open_tasks,
         };
         wr.required.retain(|r| r.kind != "idea");
         eprintln!("sh-05 {who} recovery: {}", shape(text, &wr));

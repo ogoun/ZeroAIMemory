@@ -1221,6 +1221,48 @@ async fn digest_environment_section_no_secret() {
     assert_eq!(env.matches("v:").count(), 5, "{text}");
 }
 
+/// M6.6 §4.3 (замечание 16а): у частей строки окружения (`purpose`, `address`, `limits`) хвостовые
+/// `.`, `;`, `,` и пробелы срезаются до склейки «; » — не «стенд.; адрес»; многоточие `…`
+/// остаётся, часть из одной пунктуации опускается.
+#[tokio::test]
+async fn digest_environment_trims_trailing_punct() {
+    let a = api("vault-digest-env-punct", |c| c.recall.timeout_ms = 30_000).await;
+    let h = id_of(
+        &post_env(
+            &a,
+            "stage",
+            "host",
+            json!({"purpose": "приёмочный стенд.", "address": "192.0.2.10:22;",
+                "limits": "только ночью, "}),
+            None,
+        )
+        .await,
+    );
+    let w = id_of(
+        &post_env(
+            &a,
+            "wait",
+            "environment",
+            json!({"purpose": "ждём доступа…", "address": "."}),
+            None,
+        )
+        .await,
+    );
+    let j = recall_digest(&a, &a.token, json!({"event": "session_start"})).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!(
+            "stage — приёмочный стенд; 192.0.2.10:22; ограничения: только ночью — v:{h}"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("wait — ждём доступа… — v:{w}")),
+        "{text}"
+    );
+    assert!(!text.contains(".;") && !text.contains(";;"), "{text}");
+}
+
 /// Vault решения: в дайджесте — личное окружение и окружение запрошенного решения.
 #[tokio::test]
 async fn digest_environment_solution_scope() {

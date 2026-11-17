@@ -59,6 +59,7 @@ use zam_code::{
     focus_restart, rank_on_graph, render_map_rest, split_ref,
 };
 use zam_core::Id;
+use zam_core::text::plural_ru;
 use zam_store::code::{
     CodeSnapshot, CodeStatus, MapFileRow, MapSymRow, RankInputs, RankState, SymbolHit, UploadMeta,
     code_central, code_clear, code_files_page, code_impact, code_map_files, code_map_symbols,
@@ -729,22 +730,13 @@ async fn ranked_status(
 
 // ---- тексты ----
 
-/// Русская форма числительного: 1 файл, 2 файла, 5 файлов.
-fn plural<'a>(n: u64, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
-    match (n % 10, n % 100) {
-        (_, 11..=14) => many,
-        (1, _) => one,
-        (2..=4, _) => few,
-        _ => many,
-    }
-}
-
+/// «1 файл», «2 файла», «5 файлов» ([`plural_ru`]).
 fn files_text(n: u64) -> String {
-    format!("{n} {}", plural(n, "файл", "файла", "файлов"))
+    format!("{n} {}", plural_ru(n, "файл", "файла", "файлов"))
 }
 
 fn symbols_text(n: u64) -> String {
-    format!("{n} {}", plural(n, "символ", "символа", "символов"))
+    format!("{n} {}", plural_ru(n, "символ", "символа", "символов"))
 }
 
 /// Возраст снимка: «только что», «12 мин назад», «3 ч назад», «2 дн назад».

@@ -12,7 +12,9 @@
 //!   `claimed_by`; ревизию записи не создаёт (меняется только `entries.data`), аудит ведёт
 //!   вызывающий (сервер: `entry.claim`, `entry.release` в `system.db`);
 //! - [`claimed_tasks`] — задачи, захваченные сессией (для `GET /sessions/{id}` и хука
-//!   `checkpoint`).
+//!   `checkpoint`);
+//! - [`open_tasks`] — число открытых задач и заголовки незахваченных для строки дайджеста
+//!   «Открыто задач: N — …» (M6.6 §4.2).
 
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::{params, params_from_iter};
@@ -458,6 +460,88 @@ pub async fn claimed_tasks(
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
+}
+
+/// Открытая задача строки дайджеста ([`open_tasks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTask {
+    pub id: Id,
+    pub title: String,
+    pub priority: Option<IdeaPriority>,
+    pub created_at: Timestamp,
+}
+
+impl OpenTask {
+    /// Ключ порядка [`open_tasks`] — для слияния заголовков нескольких баз: `priority` (`high` →
+    /// `normal` → `low` → нет), затем новые первыми.
+    pub fn order_key(&self) -> (u8, std::cmp::Reverse<(Timestamp, Id)>) {
+        let p = match self.priority {
+            Some(IdeaPriority::High) => 0,
+            Some(IdeaPriority::Normal) => 1,
+            Some(IdeaPriority::Low) => 2,
+            None => 3,
+        };
+        (p, std::cmp::Reverse((self.created_at, self.id)))
+    }
+}
+
+/// Отбор [`open_tasks`]: живые задачи `open` пространств `?1..?n`.
+fn open_tasks_where(n: usize) -> String {
+    format!(
+        "FROM entries INDEXED BY entries_feed
+         WHERE space_id IN ({}) AND kind = 'task' AND status = 'open' AND deleted_at IS NULL",
+        crate::questions::in_list(n)
+    )
+}
+
+/// Открытые задачи пространств `spaces` (M6.6 §4.2, строка дайджеста «Открыто задач: N — …»):
+/// число всех живых задач `open` и до `titles` задач без живого захвата на текущий момент
+/// ([`crate::time::now`]; захваченные дайджест уже показывает строками раздела задач) в порядке
+/// [`OpenTask::order_key`] — `data.priority` (`high` → `normal` → `low` → нет), затем новые
+/// первыми. Захват — то же сравнение `claimed_by.until`, что у [`claimed_tasks`]. Вызывающий,
+/// объединяющий несколько баз, сортирует заголовки по [`OpenTask::order_key`] сам. Пустой
+/// список пространств — `(0, [])` без запроса.
+pub async fn open_tasks(
+    db: &Db,
+    spaces: &[Id],
+    titles: usize,
+) -> Result<(usize, Vec<OpenTask>), StoreError> {
+    if spaces.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+    let n = spaces.len();
+    let mut args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+    db.read(move |c| {
+        let from = open_tasks_where(n);
+        let count: i64 = c
+            .prepare(&format!("SELECT COUNT(*) {from}"))?
+            .query_row(params_from_iter(args.iter()), |r| r.get(0))?;
+        // захват жив — `until` позже момента запроса (нет захвата — NULL, задача свободна)
+        args.push(fmt_ts(crate::time::now()));
+        let mut st = c.prepare(&format!(
+            "SELECT id, title, data, created_at {from}
+               AND NOT ifnull(json_extract(data, '$.claimed_by.until') > ?{}, 0)
+             ORDER BY CASE json_extract(data, '$.priority')
+                          WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 ELSE 3 END,
+                      created_at DESC, id DESC
+             LIMIT {titles}",
+            n + 1
+        ))?;
+        let rows = st
+            .query_map(params_from_iter(args), |r| {
+                let data: String = r.get(2)?;
+                let data = serde_json::from_str(&data).unwrap_or(Value::Null);
+                Ok(OpenTask {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    priority: TaskData::from_stored(&data).priority,
+                    created_at: crate::time::ts_at(r, 3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((usize::try_from(count).unwrap_or(0), rows))
     })
     .await
 }

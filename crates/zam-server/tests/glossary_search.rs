@@ -372,7 +372,7 @@ async fn recall_prompt_term_hint_once() {
 }
 
 /// Дайджест `session_start`: строка `Словарь: N терминов — memory_search kinds=[term]`, если
-/// N > 0.
+/// N > 0; число — с согласованным словом (M6.6 §4.3: «2 термина», не «2 терминов»).
 #[tokio::test]
 async fn digest_glossary_line() {
     let a = api("gs-digest", recall_cfg).await;
@@ -383,7 +383,7 @@ async fn digest_glossary_line() {
     let j = recall(&a, "s-d1", json!({"event": "session_start"})).await;
     let text = j["text"].as_str().unwrap();
     assert!(
-        text.contains("Словарь: 2 терминов — memory_search kinds=[term]"),
+        text.contains("Словарь: 2 термина — memory_search kinds=[term]"),
         "{text}"
     );
     // строка не подсказка записи: в items её нет

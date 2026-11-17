@@ -24,6 +24,9 @@ parse = [
 [dependencies]
 blake3.workspace = true
 serde.workspace = true
+# общая форма числительного `zam_core::text::plural_ru` (M6.6 §4.3); без фичи `sqlite` — ядро
+# без SQLite и tokio
+zam-core = { path = "../zam-core" }
 streaming-iterator = { workspace = true, optional = true }
 tree-sitter = { workspace = true, optional = true }
 tree-sitter-c-sharp = { workspace = true, optional = true }

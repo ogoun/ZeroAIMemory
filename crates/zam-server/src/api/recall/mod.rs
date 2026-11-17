@@ -46,20 +46,28 @@
 //!   `blocked`, затем `open`, захваченные другими; внутри — недавно менявшиеся; строка
 //!   `[<статус>] <заголовок> — далее: … — k:<id>`, у `open` — `[open · захвачена этой сессией]`
 //!   или `[open · захвачена другой сессией]`, у `blocked` — ещё ` — блокер: …`;
-//!   `reason: task`), `### Ответы человека` (M4.5 §4: вопросы, отвеченные за [`ANSWERS_DAYS`]
+//!   `reason: task`; за ними — строка `Открыто задач: N — «…», «…», «…»` (M6.6 §4.2: `N` — все
+//!   живые `open` решения и Knowledge, до [`OPEN_TASKS_TITLES`] заголовков незахваченных,
+//!   `priority`, затем новые; не подсказка записи; раздел появляется и без строк задач; снимается
+//!   пределом канала раньше обязательных строк), `### Ответы человека` (M4.5 §4: вопросы,
+//!   отвеченные за [`ANSWERS_DAYS`]
 //!   суток от начала текущих суток UTC и ещё не показанные этой сессии — `session_seen`; строка
 //!   `ZeroAIMemory: ответ на «<вопрос>»: <ответ> — q:<id> → i:<решение>`, `reason: answer`) и
 //!   `### Открытые вопросы` (`N открытых: «…», «…», «…»`, до [`OPEN_QUESTIONS_TITLES`]
 //!   заголовков, не подсказка записи), `### Окружение` (M4.5 §8: до [`ENVIRONMENT_MAX`] записей
-//!   Vault `host`/`environment`, `<имя> — <purpose>; <address>; ограничения: … — v:<id>`; без
-//!   учёта показа; в `recovery` и `brief` нет), Rules (текст каждой заметки, до
+//!   Vault `host`/`environment`, `<имя> — <purpose>; <address>; ограничения: … — v:<id>`, части —
+//!   без хвостовых `.`, `;`, `,` (M6.6 §4.3); без учёта показа; в `recovery` и `brief` нет),
+//!   Rules (текст каждой заметки, до
 //!   [`RULES_MAX`] заметок, текст — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
 //!   пространства решения, строка на корень — путь и L0 до [`SOLUTION_ROOT_L0_TOKENS`] (до
 //!   [`SOLUTION_ROOT_MAX`]), действующие (`active`) `gotcha`/`failure` решения и Knowledge
-//!   (новые первыми; строка — заголовок, без фрагмента), записи `revisit` и последние записи
+//!   (M6.6 §4.1: ловушки решения — первыми, одно место из `recall.digest_entries` — самой новой
+//!   ловушке Knowledge, [`DIGEST_KNOWLEDGE_TRAPS`]; внутри области — новые первыми; строка —
+//!   заголовок, без фрагмента), записи `revisit` и последние записи
 //!   changelog решения — индексы `<ссылка> «<заголовок>» · Nt` (M6 §8; разделов — до
 //!   `recall.digest_entries`); сразу после правил — строка
-//!   `Словарь: N терминов — memory_search kinds=[term]` (N > 0, термины решения и Knowledge) и
+//!   `Словарь: N терминов — memory_search kinds=[term]` (N > 0, термины решения и Knowledge;
+//!   слово согласовано с числом — «1 термин», «74 термина») и
 //!   строка `Проверенные команды: <путь> (проверено <verified_at>)[; …]` — до
 //!   [`VERIFIED_COMMANDS_MAX`] заметок пространства решения с `verified_at`, новые проверки
 //!   первыми (M4.5 §7, решение владельца 2026-10-28), за ней — строка карты кода решения
@@ -172,7 +180,8 @@
 //! - **пакет восстановления** (M4.5 §9.2) — `event: recovery` (MCP, агенты без
 //!   `SessionStart compact`) или `session_start` с `source` `compact | resume`: бюджет по
 //!   умолчанию `recall.recovery_tokens` (2000), разделы по порядку — `### Задачи` (захваченные
-//!   сессией первыми), `### Ответы человека` **без** фильтра `session_seen` (контекст агента
+//!   сессией первыми, строка открытых задач — как в дайджесте), `### Ответы человека` **без**
+//!   фильтра `session_seen` (контекст агента
 //!   потерян; показ всё равно отмечается), `### Решения` (действующие `decision` пространства
 //!   решения за [`RECOVERY_DECISIONS_DAYS`] суток от начала текущих суток UTC, до
 //!   `recall.digest_entries`, `reason: decision`), затем обычный дайджест в остатке бюджета
@@ -192,7 +201,8 @@
 //!   `min(code.brief_tokens, остаток)`; у хука `subagent-start` (поле `code_map`) выключенный
 //!   `hooks.code_map` или `code_map: false` — раздела нет, явный вызов не гасится; учёта показа
 //!   нет). Без `task` — мини-дайджест: правила L0,
-//!   ловушки решения и Knowledge, `### Задачи` (захваченные `parent_id` или сессией — первыми).
+//!   ловушки решения и Knowledge (порядок дайджеста на [`BRIEF_ENTRIES_MAX`] мест), `### Задачи`
+//!   (захваченные `parent_id` или сессией — первыми; без строки открытых задач).
 //!   Поиск — `mode=brief`, балл ≥ `recall.prompt_min_score`. Повторы не отсекаются (у субагента
 //!   свой контекст); показ учитывается (`usage.source = brief`), кроме записей раздела
 //!   «Файлы» (ревизия неизвестна — `session_seen` не отмечается). От настроек подсказок хуков
@@ -966,6 +976,11 @@ const TASK_LINE_TEXT_CHARS: usize = 200;
 pub const ANSWERS_DAYS: i64 = 14;
 /// Заголовков открытых вопросов в дайджесте.
 pub const OPEN_QUESTIONS_TITLES: usize = 3;
+/// Заголовков в строке открытых задач `Открыто задач: N — «…», …` раздела `### Задачи`
+/// (M6.6 §4.2, решение координатора 7).
+pub const OPEN_TASKS_TITLES: usize = 3;
+/// Предел заголовка в строке открытых задач, символов.
+const OPEN_TASK_TITLE_CHARS: usize = 80;
 /// `reason` подсказки с ответом на вопрос: показывается сессии один раз.
 const REASON_ANSWER: &str = "answer";
 /// Заголовок раздела дайджеста с ответами.
@@ -1164,14 +1179,83 @@ async fn question_cands(
     Ok((cands, line))
 }
 
+/// Строка открытых задач раздела `### Задачи` (M6.6 §4.2, замечание 28а): `N` — живые задачи
+/// `open` пространств `spaces` (решение и Knowledge), заголовки — до [`OPEN_TASKS_TITLES`] задач
+/// без живого захвата (захваченные уже строками раздела, [`task_cands`]) по
+/// [`zam_store::OpenTask::order_key`]: `priority`, затем новые. От сессии не зависит —
+/// детерминизм дайджеста сохраняется. Открытых нет — `None`.
+async fn open_tasks_line(
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+    spaces: &[(usize, Id)],
+) -> Result<Option<String>, ApiError> {
+    // число и заголовки всех баз: заголовки сливаются по общему ключу порядка
+    let (mut n, mut tasks) = (0usize, Vec::<zam_store::OpenTask>::new());
+    for i in 0..health.targets().len() {
+        let ids: Vec<Id> = spaces
+            .iter()
+            .filter(|(t, _)| *t == i)
+            .map(|(_, s)| *s)
+            .collect();
+        if ids.is_empty() || !health.alive[i] {
+            continue;
+        }
+        let db = health.targets()[i].db.clone();
+        let Some(r) = deadline
+            .step(zam_store::open_tasks(&db, &ids, OPEN_TASKS_TITLES))
+            .await
+        else {
+            break;
+        };
+        if let Some((k, t)) = health.soft(i, r)? {
+            n += k;
+            tasks.extend(t);
+        }
+    }
+    tasks.sort_by_key(zam_store::OpenTask::order_key);
+    let titles: Vec<&str> = tasks
+        .iter()
+        .take(OPEN_TASKS_TITLES)
+        .map(|t| t.title.as_str())
+        .collect();
+    Ok((n > 0).then(|| open_tasks_text(n, &titles)))
+}
+
+/// Текст строки открытых задач: `Открыто задач: N — «…», «…», «…»`; заголовок — без секретов
+/// (маска до обрезки: обрезанный секрет маска не узнала бы) и до [`OPEN_TASK_TITLE_CHARS`]
+/// символов. Заголовков нет (все открытые захвачены) — `Открыто задач: N`.
+fn open_tasks_text(n: usize, titles: &[&str]) -> String {
+    if titles.is_empty() {
+        return format!("Открыто задач: {n}");
+    }
+    let list: Vec<String> = titles
+        .iter()
+        .map(|t| {
+            format!(
+                "«{}»",
+                clip(&zam_markdown::mask_text(t), OPEN_TASK_TITLE_CHARS)
+            )
+        })
+        .collect();
+    format!("Открыто задач: {n} — {}", list.join(", "))
+}
+
+/// Часть строки окружения без хвостовых `.`, `;`, `,` и пробелов (M6.6 §4.3, замечание 16а):
+/// склейка «; » не даёт «стенд.; адрес»; многоточие `…` (в том числе от [`clip`]) остаётся.
+fn environment_part(s: &str) -> &str {
+    s.trim_end_matches(|c: char| matches!(c, '.' | ';' | ',') || c.is_whitespace())
+}
+
 /// Строка окружения: `ZeroAIMemory: <имя> — <purpose>; <address>; ограничения: <limits> —
-/// v:<id>`; пустые поля опускаются. Берёт только открытые поля: секрета и шифротекста здесь нет.
+/// v:<id>`; пустые поля опускаются, хвостовая пунктуация частей срезается
+/// ([`environment_part`]). Берёт только открытые поля: секрета и шифротекста здесь нет.
 fn environment_block(m: &zam_store::VaultMeta) -> String {
     let field = |k: &str| {
         m.data
             .get(k)
             .and_then(Value::as_str)
             .map(|v| zam_markdown::mask_text(&clip(v, TASK_LINE_TEXT_CHARS)))
+            .map(|v| environment_part(&v).to_string())
             .filter(|v| !v.is_empty())
     };
     let mut parts: Vec<String> = Vec::new();
@@ -1306,6 +1390,8 @@ async fn digest(
     )
     .await?;
     sections.push((Some(SECTION_TASKS), tasks));
+    // открытые задачи (M6.6 §4.2) — строкой раздела задач, в дайджесте и пакете восстановления
+    let open_tasks = open_tasks_line(health, deadline, &insight_spaces).await?;
     // строка плана из идей (M6.5 §7) — за задачами
     let plan_line = if plan {
         plan_line(p, health, deadline, sol).await
@@ -1481,7 +1567,8 @@ async fn digest(
     sections.push((Some("### Решение"), overview));
 
     // действующие gotcha/failure, revisit — решение и Knowledge; changelog — решение
-    let traps = trap_cands(health, deadline, &insight_spaces).await?;
+    let entries = st.cfg.recall.digest_entries;
+    let traps = trap_cands(health, deadline, &insight_spaces, sol, entries).await?;
     sections.push((Some("### Ловушки и сбои"), traps));
     let revisit = entries_of(health, deadline, &insight_spaces, |s| EntryFilter {
         statuses: vec![EntryStatus::Revisit],
@@ -1526,6 +1613,7 @@ async fn digest(
     let lines = Lines {
         notices,
         open_line,
+        open_tasks,
         plan_line,
         // длину очереди разбора ставит [`recall`] вместе с идеями дайджеста
         ideas_queue: 0,
@@ -1597,11 +1685,35 @@ async fn snapshot_part(
     }
 }
 
-/// Действующие `gotcha`/`failure` пространств `spaces`, новые первыми.
+/// Мест ловушек Knowledge среди первых `entries` мест раздела ловушек (M6.6 §4.1, решение
+/// координатора 6): ловушки проекта — первыми, но общие ловушки не пропадают совсем.
+pub const DIGEST_KNOWLEDGE_TRAPS: usize = 1;
+
+/// Порядок ловушек (M6.6 §4.1, замечание 27): ловушки решения `sol` (новые первыми) занимают
+/// первые `entries − DIGEST_KNOWLEDGE_TRAPS` мест, следующие — самые новые ловушки Knowledge
+/// `kn`, затем остальные решения и остальные Knowledge: `sol[..k] ++ kn[..1] ++ sol[k..] ++
+/// kn[1..]`. Ловушек решения меньше `k` — их места занимает Knowledge, как прежде. Первое
+/// место — всегда ловушке решения, если она есть (и при `entries = 1`, **[решение
+/// исполнителя, задача 3]**): ради неё правка и делалась, и её держит [`KEEP_FIRST_TRAP`].
+fn trap_order<T>(sol: Vec<T>, kn: Vec<T>, entries: usize) -> Vec<T> {
+    let k = entries.saturating_sub(DIGEST_KNOWLEDGE_TRAPS).max(1);
+    let mut out = Vec::with_capacity(sol.len() + kn.len());
+    let (mut sol, mut kn) = (sol.into_iter(), kn.into_iter());
+    out.extend(sol.by_ref().take(k));
+    out.extend(kn.by_ref().take(DIGEST_KNOWLEDGE_TRAPS));
+    out.extend(sol);
+    out.extend(kn);
+    out
+}
+
+/// Действующие `gotcha`/`failure` пространств `spaces` (решение `sol` и Knowledge) в порядке
+/// [`trap_order`] под `entries` мест раздела; внутри области — новые первыми.
 async fn trap_cands(
     health: &mut Health<'_>,
     deadline: &mut Deadline,
     spaces: &[(usize, Id)],
+    sol: Option<(usize, Id)>,
+    entries: usize,
 ) -> Result<Vec<Cand>, ApiError> {
     let mut traps: Vec<(usize, Entry)> = Vec::new();
     for kind in ["gotcha", "failure"] {
@@ -1616,7 +1728,10 @@ async fn trap_cands(
         );
     }
     traps.sort_by_key(|e| std::cmp::Reverse((e.1.created_at, e.1.id)));
-    Ok(traps
+    let (own, kn): (Vec<_>, Vec<_>) = traps
+        .into_iter()
+        .partition(|(i, e)| sol == Some((*i, e.space_id)));
+    Ok(trap_order(own, kn, entries)
         .iter()
         .map(|(i, e)| {
             let reason = if data_kind(e) == "failure" {
@@ -1684,12 +1799,14 @@ async fn brief(
 ) -> Result<Vec<(Option<&'static str>, Vec<Cand>)>, ApiError> {
     let targets = health.targets();
     // участнику — только пространство решения (его цель другой базы иных пространств не несёт)
-    let mut insight_spaces: Vec<(usize, Id)> = solution_space(targets).into_iter().collect();
+    let sol = solution_space(targets);
+    let mut insight_spaces: Vec<(usize, Id)> = sol.into_iter().collect();
     insight_spaces.extend(personal_space(targets, SpaceKind::Knowledge));
     let mut sections: Vec<(Option<&'static str>, Vec<Cand>)> = Vec::new();
     sections.push((Some(SECTION_RULES), rules_l0(health, deadline).await?));
     let Some(task) = task else {
-        let traps = trap_cands(health, deadline, &insight_spaces).await?;
+        // ловушки мини-дайджеста — то же правило под его [`BRIEF_ENTRIES_MAX`] мест
+        let traps = trap_cands(health, deadline, &insight_spaces, sol, BRIEF_ENTRIES_MAX).await?;
         sections.push((Some(SECTION_TRAPS), traps));
         let session = req
             .parent_id
@@ -2025,12 +2142,14 @@ async fn decision_cands(
 }
 
 /// Строки дайджеста, что не подсказки записей (ни `session_seen`, ни `usage`): уведомления,
-/// строка открытых вопросов, строки после правил (словарь, проверенные команды, строка карты
-/// кода) и мини-карта кода `### Карта кода`.
+/// строка открытых вопросов, строка открытых задач, строки после правил (словарь, проверенные
+/// команды, строка карты кода) и мини-карта кода `### Карта кода`.
 #[derive(Default)]
 struct Lines {
     notices: Vec<String>,
     open_line: Option<String>,
+    /// Строка открытых задач ([`open_tasks_line`]): в разделе задач, до строки плана.
+    open_tasks: Option<String>,
     /// Строка плана из идей ([`plan_line`]): за разделом задач.
     plan_line: Option<String>,
     /// Длина очереди разбора (строка [`IDEAS_REVIEW_HINT`]); 0 — очереди нет.
@@ -2491,7 +2610,8 @@ async fn verified_line(
 }
 
 /// Строка `Словарь: N терминов — memory_search kinds=[term]` (N — действующие термины решения
-/// и Knowledge области); `None` — терминов нет или срок вышел.
+/// и Knowledge области; «1 термин», «74 термина» — [`zam_core::text::plural_ru`], M6.6 §4.3);
+/// `None` — терминов нет или срок вышел.
 async fn glossary_line(
     st: &AppState,
     health: &mut Health<'_>,
@@ -2514,7 +2634,10 @@ async fn glossary_line(
             Err(e) => tracing::warn!(error = %e, "recall: словарь не прочитан"),
         }
     }
-    (n > 0).then(|| format!("Словарь: {n} терминов — memory_search kinds=[term]"))
+    (n > 0).then(|| {
+        let word = zam_core::text::plural_ru(n as u64, "термин", "термина", "терминов");
+        format!("Словарь: {n} {word} — memory_search kinds=[term]")
+    })
 }
 
 /// Строки словаря к тексту (`prompt` — первые 512 символов, `task` пакета — 2000): термины
@@ -2959,7 +3082,9 @@ fn section_limit(
 /// строка-указание — в заголовке [`ideas_section_head`]: она выводится, только если вошла хоть
 /// одна идея; есть идея очереди разбора — раздел [`SECTION_IDEAS_REVIEW`] со строкой
 /// [`IDEAS_REVIEW_HINT`], M6.5 §7), строки словаря, проверенных команд и карты кода и мини-карта
-/// [`SECTION_CODE_MAP`] — после правил. Строка плана из идей — сразу за задачами. Раздел пакета
+/// [`SECTION_CODE_MAP`] — после правил. Строка открытых задач — сразу за задачами, под их
+/// заголовком (задач раздела нет — со своим заголовком [`SECTION_TASKS`], M6.6 §4.2), за ней —
+/// строка плана из идей. Раздел пакета
 /// `idea_review` — со строкой шагов разбора [`IDEA_REVIEW_STEPS`] в заголовке.
 /// `rules_reserved` — раздел Rules — резерв сверх бюджета (дайджест и пакет восстановления,
 /// M6 §8; у `brief` — L0 Rules в бюджете).
@@ -2973,6 +3098,7 @@ fn arrange<'c>(
     let Lines {
         notices,
         mut open_line,
+        open_tasks,
         plan_line,
         ideas_queue,
         after_rules,
@@ -3022,8 +3148,21 @@ fn arrange<'c>(
         if title == Some(SECTION_RULES) && rules_hidden > 0 {
             sec.blocks.push(rules_hidden_line(rules_hidden));
         }
+        let no_blocks = cands.is_empty();
         out.packed.push(sec);
         out.picked.push(cands);
+        if title == Some(SECTION_TASKS)
+            && let Some(l) = &open_tasks
+        {
+            // строка раздела задач: без строк задач — под своим заголовком, раздел появляется и
+            // без захваченных задач; снимается раньше обязательных строк (M6.6 §4.2)
+            out.line(
+                no_blocks.then_some(SECTION_TASKS),
+                vec![l.clone()],
+                KEEP_POINTERS,
+            );
+            out.omit_last(OMIT_OPEN_TASKS);
+        }
         if title == Some(SECTION_TASKS)
             && let Some(l) = &plan_line
         {
@@ -3094,8 +3233,9 @@ fn arrange<'c>(
 const KEEP_MANDATORY: u8 = 2;
 /// Первая (самая новая) ловушка: шаг (2) снимает её последней — после обязательных строк.
 const KEEP_FIRST_TRAP: u8 = 3;
-/// Строки-указатели: открытые вопросы, строки после правил (словарь, проверенные команды, карта
-/// кода) и ловушки; при снятии — с конца, то есть открытые вопросы — последними.
+/// Строки-указатели: открытые задачи и вопросы, строки после правил (словарь, проверенные
+/// команды, карта кода) и ловушки; при снятии — с конца, то есть открытые задачи и вопросы —
+/// последними.
 const KEEP_POINTERS: u8 = 1;
 
 /// Стойкость раздела дайджеста: обязательные — [`KEEP_MANDATORY`], ловушки — [`KEEP_POINTERS`],
@@ -3116,6 +3256,9 @@ const OMIT_OPEN_QUESTIONS: Omit = ("строк открытых вопросов
 
 /// Адрес снятой строки плана из идей.
 const OMIT_PLAN: Omit = ("строк плана из идей", "memory_search kinds=[task]");
+
+/// Адрес снятой строки открытых задач (M6.6 §4.2).
+const OMIT_OPEN_TASKS: Omit = ("строк открытых задач", "memory_search kinds=[task]");
 
 /// Адрес идей пакета `idea_review`, снятых пределом вывода канала ([`omit_of`]): тот же пакет с
 /// меньшим `limit`.
@@ -3777,6 +3920,99 @@ mod tests {
                 "Проверенные команды: a (проверено 2026-10-28)"
             ]
         );
+    }
+
+    /// M6.6 §4.1 (замечание 27): ловушки решения — первыми, одно место из `entries` — самой
+    /// новой Knowledge (`sol[..n-1] ++ kn[..1] ++ sol[n-1..] ++ kn[1..]`); у решения меньше
+    /// `n − 1` ловушек — места занимает Knowledge; первое место — всегда решения, если у него
+    /// есть ловушки (и при `entries = 1`).
+    #[test]
+    fn trap_order_solution_first_knowledge_slot() {
+        let s = |n: usize| (0..n).map(|k| format!("s{k}")).collect::<Vec<_>>();
+        let kn = |n: usize| (0..n).map(|k| format!("k{k}")).collect::<Vec<_>>();
+        assert_eq!(
+            trap_order(s(5), kn(6), 5)[..5],
+            ["s0", "s1", "s2", "s3", "k0"]
+        );
+        assert_eq!(
+            trap_order(s(5), kn(2), 5),
+            ["s0", "s1", "s2", "s3", "k0", "s4", "k1"]
+        );
+        assert_eq!(
+            trap_order(s(2), kn(4), 5),
+            ["s0", "s1", "k0", "k1", "k2", "k3"]
+        );
+        assert_eq!(trap_order(s(0), kn(3), 5), ["k0", "k1", "k2"]);
+        assert_eq!(trap_order(s(6), kn(0), 5), s(6));
+        // мини-дайджест `brief` — 3 места
+        assert_eq!(trap_order(s(5), kn(2), 3)[..3], ["s0", "s1", "k0"]);
+        assert_eq!(trap_order(s(2), kn(2), 1), ["s0", "k0", "s1", "k1"]);
+        assert_eq!(DIGEST_KNOWLEDGE_TRAPS, 1);
+    }
+
+    /// M6.6 §4.2: строка открытых задач — число и заголовки (секреты замаскированы, длинный —
+    /// до 80 символов с «…»); без заголовков (все открытые захвачены) — только число.
+    #[test]
+    fn open_tasks_text_format() {
+        // фиктивный ключ AWS — склейкой во время выполнения
+        let key = format!("{}{}", "AK", "IAABCDEFGHIJKLMNOP");
+        let secret = format!("Ротация ключа {key}");
+        let long = "длинный заголовок ".repeat(8);
+        let text = open_tasks_text(5, &["Первая", &secret, &long]);
+        assert!(
+            text.starts_with("Открыто задач: 5 — «Первая», «Ротация ключа "),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&key) && text.contains(zam_markdown::SECRET_MARK),
+            "{text}"
+        );
+        let last = text.rsplit_once(", «").unwrap().1;
+        let last = last.strip_suffix('»').unwrap();
+        assert!(last.ends_with('…') && last.chars().count() <= 80, "{last}");
+        assert!(long.starts_with(last.trim_end_matches('…')), "{last}");
+        assert_eq!(open_tasks_text(1, &[]), "Открыто задач: 1");
+        assert_eq!(OPEN_TASKS_TITLES, 3);
+    }
+
+    /// M6.6 §4.2: строка открытых задач — сразу за задачами (до строки плана), под их
+    /// заголовком; раздел без задач — строка со своим заголовком `### Задачи`; стойкость
+    /// указателя (снимается раньше обязательных строк), адрес снятой — `kinds=[task]`; в пакете
+    /// восстановления — так же.
+    #[test]
+    fn open_tasks_line_under_tasks_heading() {
+        let t = cand("задача");
+        let own = |o: Omit| Some((o.0.to_string(), o.1.to_string()));
+        let open = "Открыто задач: 2 — «а»";
+        for recovery in [false, true] {
+            let chosen = vec![
+                (Some(SECTION_TASKS), vec![&t]),
+                (Some(SECTION_ANSWERS), Vec::new()),
+            ];
+            let lines = Lines {
+                open_tasks: Some(open.into()),
+                plan_line: Some("План".into()),
+                ..Lines::default()
+            };
+            let (packed, picked) = arrange(recovery, true, lines, Vec::new(), chosen);
+            let k = packed.iter().position(|s| s.blocks == [open]).unwrap();
+            assert_eq!(packed[k - 1].title.as_deref(), Some(SECTION_TASKS));
+            assert_eq!(packed[k].title, None, "{recovery}");
+            assert!(packed[k].keep == KEEP_POINTERS && packed[k].keep < KEEP_MANDATORY);
+            assert_eq!(packed[k].omit, own(OMIT_OPEN_TASKS));
+            assert!(picked[k].is_empty());
+            assert_eq!(packed[k + 1].blocks, ["План"]);
+        }
+        let chosen = vec![(Some(SECTION_TASKS), Vec::new())];
+        let lines = Lines {
+            open_tasks: Some(open.into()),
+            ..Lines::default()
+        };
+        let (packed, _) = arrange(false, true, lines, Vec::new(), chosen);
+        let k = packed.iter().position(|s| s.blocks == [open]).unwrap();
+        assert_eq!(packed[k].title.as_deref(), Some(SECTION_TASKS));
+        let (text, _) = pack_sections(&packed, 10_000, &count_tokens, &|_| true);
+        assert_eq!(text, format!("{SECTION_TASKS}\n{open}\n"));
     }
 
     /// Повторное ревью 8a, I-b: вторая фраза L0 не теряется молча — первая кончается «…».

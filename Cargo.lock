@@ -6988,6 +6988,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "zam-core",
 ]
 
 [[package]]

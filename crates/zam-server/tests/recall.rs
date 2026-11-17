@@ -2491,7 +2491,8 @@ async fn code_map_pointer_only_at_zero() {
 
 /// Предложение zero-agent (приложение исследования 2026-11-06): задача в `open`, захваченная
 /// сессией (`claim`), видна в дайджесте — своя первой с пометкой, чужая — после задач в работе,
-/// с пометкой; незахваченная `open` — нет.
+/// с пометкой; незахваченная `open` — строкой подсказки нет, только заголовком в строке
+/// открытых задач (M6.6 §4.2).
 #[tokio::test]
 async fn digest_shows_claimed_open_tasks() {
     let a = server("claimed-open").await;
@@ -2543,7 +2544,7 @@ async fn digest_shows_claimed_open_tasks() {
     .await;
     let text = j["text"].as_str().unwrap();
     let lines = section(text, "### Задачи");
-    assert_eq!(lines.len(), 3, "{text}");
+    assert_eq!(lines.len(), 4, "{text}");
     assert!(
         lines[0].contains("Моя захваченная") && lines[0].contains("захвачена этой сессией"),
         "{text}"
@@ -2554,6 +2555,8 @@ async fn digest_shows_claimed_open_tasks() {
         lines[2].contains("Чужая захваченная") && lines[2].contains("захвачена другой сессией"),
         "{text}"
     );
+    // M6.6 §4.2: открытых три (захваченные — в числе), заголовок — только у свободной
+    assert_eq!(lines[3], "Открыто задач: 3 — «Свободная»", "{text}");
     assert!(!text.contains(free.as_str()), "{text}");
     // у другой сессии — наоборот
     let j = ok(
@@ -2572,6 +2575,189 @@ async fn digest_shows_claimed_open_tasks() {
         lines[2].contains("Моя захваченная") && lines[2].contains("захвачена другой сессией"),
         "{lines:?}"
     );
+    assert_eq!(lines[3], "Открыто задач: 3 — «Свободная»", "{lines:?}");
+}
+
+/// M6.6 §4.1 (замечание 27): ловушки решения — первыми (новые первыми), одно место из
+/// `recall.digest_entries` (5) — самой новой ловушке Knowledge: 5 ловушек решения и 6 более
+/// новых Knowledge → 4 решения и 1 Knowledge; у решения меньше 4 ловушек — остальные места
+/// занимает Knowledge; без решения — 5 Knowledge. Мини-дайджест `brief` (3 места) — то же правило.
+#[tokio::test]
+async fn digest_traps_solution_first_knowledge_slot() {
+    const G2: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e53";
+    let a = server("traps-order").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G2, "name": "Второе"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // метка ловушки по ссылке: `s<k>` — решения G, `f<k>` — решения G2, `k<k>` — Knowledge;
+    // Knowledge пишется последней — её ловушки новее всех ловушек решений
+    let mut label = std::collections::HashMap::new();
+    for (space, mark, n, kind) in [
+        (G, "s", 5, "gotcha"),
+        (G2, "f", 2, "failure"),
+        ("knowledge", "k", 6, "gotcha"),
+    ] {
+        for k in 0..n {
+            let id = insight(
+                &a,
+                &a.token,
+                space,
+                &format!("Ловушка {mark}{k}"),
+                "x",
+                kind,
+            )
+            .await;
+            label.insert(format!("i:{id}"), format!("{mark}{k}"));
+        }
+    }
+    let traps = |j: &Value, title: &str| -> Vec<String> {
+        section(j["text"].as_str().unwrap(), title)
+            .iter()
+            .map(|l| {
+                let r = l.rsplit_once(' ').map_or(l.as_str(), |(_, r)| r);
+                label.get(r).cloned().unwrap_or_else(|| r.to_string())
+            })
+            .collect()
+    };
+    let digest = |solution: Option<&str>| {
+        let mut body = json!({"event": "session_start"});
+        if let Some(g) = solution {
+            body["solution"] = json!(g);
+        }
+        body
+    };
+    let j = ok(&a, &a.token, Some("to-1"), digest(Some(G))).await;
+    let want = ["s4", "s3", "s2", "s1", "k5"];
+    assert_eq!(traps(&j, "### Ловушки и сбои"), want, "{}", j["text"]);
+    // у решения две ловушки — остальные три места занимает Knowledge (новые первыми)
+    let j = ok(&a, &a.token, Some("to-2"), digest(Some(G2))).await;
+    let want = ["f1", "f0", "k5", "k4", "k3"];
+    assert_eq!(traps(&j, "### Ловушки и сбои"), want, "{}", j["text"]);
+    // без решения — только Knowledge, 5 самых новых
+    let j = ok(&a, &a.token, Some("to-3"), digest(None)).await;
+    let want = ["k5", "k4", "k3", "k2", "k1"];
+    assert_eq!(traps(&j, "### Ловушки и сбои"), want, "{}", j["text"]);
+    // мини-дайджест субагенту: 3 места — 2 ловушки решения и самая новая Knowledge
+    let body = json!({"event": "brief", "solution": G});
+    let j = ok(&a, &a.token, Some("to-4"), body).await;
+    assert_eq!(
+        traps(&j, "### Ловушки"),
+        ["s4", "s3", "k5"],
+        "{}",
+        j["text"]
+    );
+}
+
+/// M6.6 §4.2 (замечание 28а): в `### Задачи` — строка `Открыто задач: N — «…», «…», «…»`: N —
+/// все живые `open` решения и Knowledge (захваченные — тоже), до 3 заголовков без задач с живым
+/// захватом (те уже строками раздела), `high` первыми, затем новые; заголовок — до 80 символов.
+/// Раздел появляется и без захваченных задач; нет открытых — нет строки. То же — в пакете
+/// восстановления; в мини-дайджесте `brief` строки нет; строка — не подсказка записи.
+#[tokio::test]
+async fn digest_open_tasks_line() {
+    let a = server("open-tasks").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let start = json!({"event": "session_start", "solution": G});
+    let j = ok(&a, &a.token, Some("ot-0"), start.clone()).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(
+        !text.contains("Открыто задач") && !text.contains("### Задачи"),
+        "{text}"
+    );
+    let long = format!("Срочная: {}", "очень длинный заголовок задачи ".repeat(5));
+    let long = long.trim_end().to_string();
+    let mut ids_of = Vec::new();
+    for (space, title, priority) in [
+        (G, "Обычная старая", Some("normal")),
+        ("knowledge", "Без приоритета", None),
+        (G, long.as_str(), Some("high")),
+        (G, "Низкая", Some("low")),
+        ("knowledge", "Обычная новая", Some("normal")),
+    ] {
+        let mut data = json!({});
+        if let Some(p) = priority {
+            data["priority"] = json!(p);
+        }
+        let body = json!({"kind": "task", "title": title, "data": data});
+        ids_of.push(entry(&a, &a.token, space, body).await);
+    }
+    // заголовок длиннее 80 символов — 79 символов и «…»
+    let cut: String = long.chars().take(79).collect();
+    let cut = format!("{}…", cut.trim_end());
+    assert!(cut.chars().count() <= 80);
+    // без захваченных задач и задач в работе — раздел из одной строки
+    let j = ok(&a, &a.token, Some("ot-1"), start.clone()).await;
+    let text = j["text"].as_str().unwrap();
+    assert_eq!(
+        section(text, "### Задачи"),
+        [format!(
+            "Открыто задач: 5 — «{cut}», «Обычная новая», «Обычная старая»"
+        )],
+        "{text}"
+    );
+    // строка — не подсказка записи: заголовков задач нет в `items`
+    assert!(
+        ids_of
+            .iter()
+            .all(|id| !ids(&j).contains(&format!("k:{id}"))),
+        "{j}"
+    );
+    // задача в работе — строкой раздела, не в числе открытых; захваченная другой сессией — в
+    // числе, но не в заголовках
+    let busy = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": "В работе", "data": {"priority": "high"}}),
+    )
+    .await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{busy}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{}/claim", ids_of[4]),
+            Some(json!({})),
+            &[("x-zam-session", "ot-other")],
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let line = format!("Открыто задач: 5 — «{cut}», «Обычная старая», «Низкая»");
+    let j = ok(&a, &a.token, Some("ot-2"), start.clone()).await;
+    let text = j["text"].as_str().unwrap();
+    let lines = section(text, "### Задачи");
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(lines[0].contains("[in_progress] В работе"), "{text}");
+    assert!(
+        lines[1].contains("Обычная новая") && lines[1].contains("захвачена другой сессией"),
+        "{text}"
+    );
+    assert_eq!(lines[2], line, "{text}");
+    // пакет восстановления — та же строка
+    let body = json!({"event": "recovery", "solution": G});
+    let j = ok(&a, &a.token, Some("ot-3"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(section(text, "### Задачи").contains(&line), "{text}");
+    // мини-дайджест субагенту — без неё
+    let body = json!({"event": "brief", "solution": G});
+    let j = ok(&a, &a.token, Some("ot-4"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.contains("### Задачи"), "{text}");
+    assert!(!text.contains("Открыто задач"), "{text}");
 }
 
 // ---- ревью задачи 8a (C1, I1, I3, M1, M3): предел вывода канала, приоритет правил ----
