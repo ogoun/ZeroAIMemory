@@ -64,7 +64,7 @@
 | `backup` | M6 §12б.2–§12б.3 | Команды сервера `zam-server backup` и `restore` (полная копия каталога данных). |
 | `export` | M6 §12б.5 | `GET /spaces/{space}/export` — архив пространства. |
 | `import` | M6 §12б.5 | `POST /spaces/{space}/import` и `GET /spaces/{space}/imports/{job}`. |
-| `recall_timeout` | M6 §16 п. 19 (CR-7) | Поле `timeout_ms` тела `POST /recall` и аргумент `memory_recall`: 1..=`max(recall.max_timeout_ms, recall.timeout_ms)` (предел `recall.max_timeout_ms` по умолчанию 2000); без поля — `recall.timeout_ms` (200). |
+| `recall_timeout` | M6 §16 п. 19 (CR-7) | Поле `timeout_ms` тела `POST /recall` и аргумент `memory_recall`: 1..=`max(recall.max_timeout_ms, recall.timeout_ms)` (предел `recall.max_timeout_ms` по умолчанию 2000); без поля у хука — `recall.timeout_ms` (200), у явного вызова (MCP; `recovery`, `brief`, `idea_review` без `code_map`) — предел поля (M6.6 §5.1). |
 | `idempotent_nodes` | M6 §16 п. 19 (CR-20) | `Idempotency-Key` у `POST /nodes`, `PUT` и `PATCH /nodes/{id}`; `idempotency_key` у `memory_write`. |
 | `mcp_session_arg` | M6 §16 п. 19 (CR-8) | Аргумент `session_id` у `memory_recall`, `memory_search`, `memory_read` — явная сессия для учёта и отметок, как `X-Zam-Session`. |
 | `idea_review` | M6.5 §5–§7 | Разбор идей агентом: `POST /entries/{id}/review` (исходы `plan`, `return`, `decline`, `done`; повтор по `Idempotency-Key`), статус идеи `returned`, режим `ideas.mode` (`review` по умолчанию — `[ideas] default_mode`, или `propose`) в `/auth/settings`; в режиме `review` `propose` идеи `new` — 409 `/problems/idea-mode`; пакет `POST /recall {event: "idea_review", limit}`, счётчики `GET /spaces/{space}/entries/counts`, фильтр `from_idea` и поле `idea` задачи (раздел «Разбор идей» ниже). Старый сервер без флага разбора не знает. |
@@ -94,8 +94,12 @@
 
 ## Срок `/recall` (`recall_timeout`)
 
-`POST /recall {…, timeout_ms}` — срок сбора подсказок этого запроса, мс. Без поля действует
-`recall.timeout_ms` сервера (200: бюджет хуков). Допустимо 1..=`max(recall.max_timeout_ms,
+`POST /recall {…, timeout_ms}` — срок сбора подсказок этого запроса, мс. Без поля у хука действует
+`recall.timeout_ms` сервера (200: бюджет хуков), у явного вызова — `max(recall.max_timeout_ms,
+recall.timeout_ms)` (с 0.0.13-m6.6, M6.6 §5.1). Хук — запрос без происхождения MCP с событием
+`session_start`, `prompt`, `post_tool` или с полем `code_map` (его шлют хуки `session-start` и
+`subagent-start`); явные — все вызовы MCP `memory_recall` и `recovery`, `brief`, `idea_review` из
+REST без `code_map`. Допустимо 1..=`max(recall.max_timeout_ms,
 recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), иначе 400: если срок сервера больше предела поля
 (сетки замера ставят 60000), явно попросить можно и его. Нативный агент, который может подождать, шлёт, например, `timeout_ms: 1000`
 и получает полный дайджест там, где хук получил бы собранное и `warnings: ["recall timeout"]`.
@@ -188,7 +192,8 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
   записей решения; `items[]` — `kind: idea`, `reason: idea_review`. Бюджет — `budget_tokens`
   (по умолчанию 3000), срок по умолчанию — `max(recall.max_timeout_ms, recall.timeout_ms)`. Без
   идей — строка-уведомление (очередь пуста, решение не задано, нет права записи, режим
-  `propose`). В режиме `review` у `session_start` раздел `### Идеи на разбор` и строка «План из
+  `propose`; с 0.0.13-m6.6 решение передано, но не в области: «нет доступа к решению (см.
+  warnings)» или «решение <GUID> не зарегистрировано на сервере»). В режиме `review` у `session_start` раздел `### Идеи на разбор` и строка «План из
   идей: …», у `prompt` подсказка к идее `new` — с `reason: idea_review`.
 - **Лента для WebUI**: `GET /spaces/{space}/entries/counts?kind=<вид>` → `{<статус>: n}` — все
   статусы вида, нулевые тоже, с фильтрами ленты (`area`, `tag`, у идей `origin` и `priority`, у

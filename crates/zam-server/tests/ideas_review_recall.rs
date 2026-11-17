@@ -736,7 +736,10 @@ async fn pack_partial_on_timeout() {
 }
 
 /// Пакет без идей — строка-уведомление: очередь пуста, решения нет, нет права записи, режим
-/// `propose` владельца; `limit` вне 1..=20 — 400.
+/// `propose` владельца; `limit` вне 1..=20 — 400. Решение передано, но его нет в области (M6.6
+/// §5.2): GUID не в реестре (в теле и в `X-Zam-Solution`) — «не зарегистрировано на сервере» с
+/// этим GUID; ожидающий доступ (`warnings: solution access pending`) и решение в реестре без
+/// запроса доступа — «нет доступа к решению».
 #[tokio::test]
 async fn idea_review_pack_notices_and_limit() {
     let a = server("notices", |_| {}).await;
@@ -748,6 +751,62 @@ async fn idea_review_pack_notices_and_limit() {
         text(&j).starts_with("Идей на разбор нет: решение не задано"),
         "{j}"
     );
+    let unknown = uuid::Uuid::now_v7().to_string();
+    let unregistered = format!(
+        "Идей на разбор нет: решение {unknown} не зарегистрировано на сервере — подключите его \
+         `zam init`."
+    );
+    let j = recall(
+        &a,
+        None,
+        json!({"event": "idea_review", "solution": unknown}),
+    )
+    .await;
+    assert_eq!(text(&j).trim_end(), unregistered, "{j}");
+    assert!(j["items"].as_array().unwrap().is_empty(), "{j}");
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            RECALL,
+            Some(json!({"event": "idea_review"})),
+            &[("x-zam-solution", unknown.as_str())],
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(text(&r.json()).trim_end(), unregistered, "{}", r.text());
+    let no_access = "Идей на разбор нет: нет доступа к решению (см. warnings).";
+    // ожидающий доступ: запрос участника к решению `G` администратора
+    let (_, b_tok) = a.new_user("Борис").await;
+    let r = a
+        .tok(
+            &b_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Проект"})),
+        )
+        .await;
+    ok(&r, StatusCode::ACCEPTED);
+    let j = recall_as(
+        &a,
+        &b_tok,
+        None,
+        json!({"event": "idea_review", "solution": G}),
+    )
+    .await;
+    assert_eq!(text(&j).trim_end(), no_access, "{j}");
+    assert_eq!(j["warnings"], json!(["solution access pending"]), "{j}");
+    // решение в реестре, запроса доступа нет — предупреждений нет, уведомление то же
+    let (_, c_tok) = a.new_user("Вера").await;
+    let j = recall_as(
+        &a,
+        &c_tok,
+        None,
+        json!({"event": "idea_review", "solution": G}),
+    )
+    .await;
+    assert_eq!(text(&j).trim_end(), no_access, "{j}");
+    assert!(j["warnings"].as_array().is_none_or(|w| w.is_empty()), "{j}");
     for l in [0, 21] {
         let r = a
             .t(
@@ -927,4 +986,75 @@ async fn shared_solution_uses_owner_mode() {
     )
     .await;
     assert!(text(&j).starts_with("Разбор идей выключен"), "{j}");
+}
+
+/// M6.6 §5.3: режим идей владельца общего решения и настройки участника `/recall` берёт из кэша
+/// процесса (`AppState::user_flags`): повтор `prompt` участника системную базу не читает. Владелец
+/// переключил `ideas.mode` (`PATCH` администратора) — следующий `prompt` участника видит новый
+/// режим: перечитана только запись владельца, запись участника осталась в кэше.
+#[tokio::test]
+async fn owner_mode_change_reaches_member_prompt() {
+    let a = api("idrev-recall-owner-mode", |c| c.recall.timeout_ms = 30_000).await;
+    let (o_id, o_tok) = a.new_user("Ольга").await;
+    let (m_id, m_tok) = a.new_user("Марк").await;
+    let r = a
+        .tok(
+            &o_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let r = a
+        .tok(
+            &m_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    ok(&r, StatusCode::ACCEPTED);
+    a.set_access(&o_tok, G, &m_id, "rw").await;
+    let i = create_tok(
+        &a,
+        &o_tok,
+        json!({"kind": "idea", "title": "Экспорт отчётов в PDF", "body": "Замысел.",
+               "data": {"origin": "human"}}),
+    )
+    .await;
+    // подсказка к запросу — раз за сессию: у каждого вызова своя сессия
+    let prompt_m = |s: &'static str| {
+        recall_as(
+            &a,
+            &m_tok,
+            Some(s),
+            json!({"event": "prompt", "solution": G,
+                   "prompt": "как сделать экспорт отчётов в PDF"}),
+        )
+    };
+    let review_line = format!("к задаче подходит идея на разбор w:{i}");
+    let j = prompt_m("om1").await;
+    assert!(text(&j).contains(&review_line), "режим review: {j}");
+    let loads = a.st.user_flags.loads();
+    let j = prompt_m("om2").await;
+    assert!(text(&j).contains(&review_line), "{j}");
+    assert_eq!(a.st.user_flags.loads(), loads, "повтор — из кэша");
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{o_id}/settings"),
+            Some(json!({"ideas": {"mode": "propose"}})),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let j = prompt_m("om3").await;
+    assert!(text(&j).contains("action=propose"), "режим propose: {j}");
+    assert!(!text(&j).contains("на разбор"), "{j}");
+    assert_eq!(
+        a.st.user_flags.loads(),
+        loads + 1,
+        "перечитан только владелец"
+    );
 }

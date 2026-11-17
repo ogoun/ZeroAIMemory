@@ -3342,6 +3342,96 @@ async fn recall_timeout_ms_param_full_digest() {
     assert!(j["text"].as_str().unwrap().contains("звёздный"), "{j}");
 }
 
+/// MCP `memory_recall` токеном администратора; текст результата.
+async fn mcp_recall_text(a: &Api, args: Value) -> String {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "memory_recall", "arguments": args}});
+    let r = a
+        .send(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(axum::http::header::HOST, "memory.lan:7700")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {}", a.token),
+                )
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_ne!(j["result"]["isError"], true, "{j}");
+    j["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// M6.6 §5.1 (замечание 20): явный вызов без поля `timeout_ms` ждёт `max(recall.max_timeout_ms,
+/// recall.timeout_ms)`, хук — `recall.timeout_ms`. Шаг сбора задержан на 400 мс: `brief` из REST
+/// без `code_map` и через MCP — полный пакет (раздел ловушек) без `recall timeout`; `brief` с
+/// `code_map` (хук `subagent-start`) — срок 200 мс и `recall timeout`. Запас после задержки —
+/// 1,6 с, как у `recall_timeout_ms_param_full_digest`.
+#[tokio::test]
+async fn recall_explicit_brief_waits_max_timeout() {
+    let a = api("recall-explicit-brief", |c| {
+        assert_eq!(c.recall.timeout_ms, 200, "умолчание сервера");
+        assert_eq!(c.recall.max_timeout_ms, 2000, "предел поля");
+        // поиск — только FTS: порог балла снят, как в `recall_brief`
+        c.recall.prompt_min_score = 0.0;
+    })
+    .await;
+    let trap = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Звёздный кэш сбрасывается",
+        "Звёздный кэш сбрасывается при миграции схемы.",
+        "gotcha",
+    )
+    .await;
+    const TASK: &str = "Звёздный кэш сбрасывается";
+    const DELAY_MS: u64 = 400;
+    let _d = RecallDelay::set(&a, DELAY_MS);
+    let t = Instant::now();
+    let j = ok(
+        &a,
+        &a.token,
+        Some("eb1"),
+        json!({"event": "brief", "task": TASK}),
+    )
+    .await;
+    let waited = t.elapsed();
+    assert!(waited.as_millis() >= u128::from(DELAY_MS), "{waited:?}");
+    assert!(!has_timeout_warning(&j), "REST brief — явный вызов: {j}");
+    let text = j["text"].as_str().unwrap();
+    assert!(text.contains("### Ловушки"), "{j}");
+    assert!(text.contains(&format!("i:{trap}")), "{j}");
+    let t = mcp_recall_text(&a, json!({"event": "brief", "task": TASK})).await;
+    assert!(
+        !t.contains("recall timeout"),
+        "MCP brief — явный вызов: {t}"
+    );
+    assert!(t.contains("### Ловушки"), "{t}");
+    assert!(t.contains(&format!("i:{trap}")), "{t}");
+    // хук `subagent-start` шлёт `code_map` — бюджет хука
+    let j = ok(
+        &a,
+        &a.token,
+        Some("eb3"),
+        json!({"event": "brief", "task": TASK, "code_map": true}),
+    )
+    .await;
+    assert!(has_timeout_warning(&j), "brief хука — срок 200 мс: {j}");
+}
+
 /// CR-7: `timeout_ms` — 1..=`recall.max_timeout_ms` (по умолчанию 2000), иначе 400; верхний
 /// предел берётся из конфигурации.
 #[tokio::test]

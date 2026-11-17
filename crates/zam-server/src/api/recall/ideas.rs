@@ -117,9 +117,22 @@ pub const IDEA_REVIEW_STEPS: &str = "Шаги разбора: сверь иде�
     шагов).";
 /// Пакет `idea_review`: очередь пуста.
 pub const IDEA_REVIEW_EMPTY: &str = "Идей на разбор нет.";
-/// Пакет `idea_review` без решения в области запроса.
+/// Пакет `idea_review` без решения в области запроса: решение не передано.
 pub const IDEA_REVIEW_NO_SOLUTION: &str =
     "Идей на разбор нет: решение не задано (solution или X-Zam-Solution).";
+/// Пакет `idea_review`: решение передано и есть в реестре, но доступа к нему нет — запрос доступа
+/// ждёт, отклонён или отозван (`warnings: ["solution access …"]`), запроса нет, база владельца
+/// недоступна (M6.6 §5.2).
+pub const IDEA_REVIEW_NO_ACCESS: &str = "Идей на разбор нет: нет доступа к решению (см. warnings).";
+/// Пакет `idea_review`: решения нет в реестре сервера (M6.6 §5.2); `<GUID>` заменяется GUID
+/// решения запроса.
+pub const IDEA_REVIEW_UNREGISTERED: &str = "Идей на разбор нет: решение <GUID> не \
+    зарегистрировано на сервере — подключите его `zam init`.";
+/// Начало предупреждений [`resolve_targets`] о доступе к чужому решению: `solution access
+/// pending | rejected | revoked`.
+///
+/// [`resolve_targets`]: crate::api::search::targets::resolve_targets
+const WARN_ACCESS_PREFIX: &str = "solution access ";
 /// Пакет `idea_review` при режиме `propose` владельца базы решения: разбора нет — у агента не
 /// должно быть двух противоречивых указаний (M6.5 §7).
 pub const IDEA_REVIEW_OFF: &str = "Разбор идей выключен: ideas.mode = propose — предлагай идею \
@@ -432,9 +445,9 @@ pub(super) async fn solution_ideas_mode(
 /// [`review_block`] на идею (`reason: idea_review`): строка с приоритетом, тело, история
 /// ([`review_history`]: прежние разборы и доводы человека) и до [`IDEA_REVIEW_SIMILAR_MAX`]
 /// похожих записей решения ([`review_similar`]). Вместо идей — одна строка-уведомление: решения
-/// нет ([`IDEA_REVIEW_NO_SOLUTION`]), режим `propose` владельца базы ([`IDEA_REVIEW_OFF`]), нет
-/// права записи ([`IDEA_REVIEW_READ_ONLY`]), очередь пуста ([`IDEA_REVIEW_EMPTY`]). Срок сбора
-/// вышел — собранное (у идей без поиска — строка «не собраны») и `recall timeout`.
+/// нет в области ([`no_solution_notice`]), режим `propose` владельца базы ([`IDEA_REVIEW_OFF`]),
+/// нет права записи ([`IDEA_REVIEW_READ_ONLY`]), очередь пуста ([`IDEA_REVIEW_EMPTY`]). Срок
+/// сбора вышел — собранное (у идей без поиска — строка «не собраны») и `recall timeout`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn review_pack(
     st: &AppState,
@@ -451,7 +464,8 @@ pub(super) async fn review_pack(
     };
     let targets = health.targets();
     let Some((i, space)) = solution_space(targets) else {
-        return Ok((notice(IDEA_REVIEW_NO_SOLUTION), Vec::new()));
+        let n = no_solution_notice(st, req, headers, &health.warnings).await?;
+        return Ok((notice(&n), Vec::new()));
     };
     if mode == IdeasMode::Propose {
         return Ok((notice(IDEA_REVIEW_OFF), Vec::new()));
@@ -490,6 +504,28 @@ pub(super) async fn review_pack(
         ..Lines::default()
     };
     Ok((lines, out))
+}
+
+/// Уведомление пакета `idea_review`, когда решения нет в области запроса (M6.6 §5.2): решение не
+/// передано (ни `solution`, ни `X-Zam-Solution`) — [`IDEA_REVIEW_NO_SOLUTION`]; есть
+/// предупреждение о доступе (`solution access …`) или решение есть в реестре — доступа нет
+/// ([`IDEA_REVIEW_NO_ACCESS`]); решения нет в реестре — [`IDEA_REVIEW_UNREGISTERED`] с его GUID.
+async fn no_solution_notice(
+    st: &AppState,
+    req: &RecallReq,
+    headers: &HeaderMap,
+    warnings: &[String],
+) -> Result<String, ApiError> {
+    let Some(guid) = crate::api::files::query_solution(req.solution.as_deref(), headers)? else {
+        return Ok(IDEA_REVIEW_NO_SOLUTION.to_string());
+    };
+    if warnings.iter().any(|w| w.starts_with(WARN_ACCESS_PREFIX)) {
+        return Ok(IDEA_REVIEW_NO_ACCESS.to_string());
+    }
+    Ok(match st.system.get_solution(&guid).await? {
+        Some(_) => IDEA_REVIEW_NO_ACCESS.to_string(),
+        None => IDEA_REVIEW_UNREGISTERED.replace("<GUID>", guid.as_str()),
+    })
 }
 
 /// Строки после пакета `idea_review` (ревью задачи 4, Minor 3; раунд 2): «Показано идей на

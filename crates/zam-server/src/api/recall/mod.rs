@@ -134,7 +134,9 @@
 //!   ([`review_pack`]); бюджет — `budget_tokens` или [`IDEA_REVIEW_BUDGET`], срок по умолчанию —
 //!   `max(recall.max_timeout_ms, recall.timeout_ms)`; в конце — «Показано идей на разбор: k из
 //!   N.» и, если идеи не вошли в бюджет, строка «не показано — идей на разбор: M (…)»; режим
-//!   `propose`, нет права записи, нет решения или пустая очередь — одна строка-уведомление;
+//!   `propose`, нет права записи, нет решения или пустая очередь — одна строка-уведомление
+//!   (решение передано, но его нет в области, — «нет доступа» или «не зарегистрировано», M6.6
+//!   §5.2);
 //! - **`post_tool`** — ошибка инструмента: совпадения `error_regex` действующих триггеров
 //!   insight решения и Knowledge (по первым [`ERROR_SCAN_MAX`] байтам `error`; триггер с
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
@@ -157,14 +159,17 @@
 //!   и чужой Knowledge не подмешиваются никогда; решение без доступа исключается с
 //!   `warnings: ["solution access pending|rejected|revoked"]`, недоступная база владельца —
 //!   `solution unavailable`. Решение — `solution` тела (не GUID — 400) или `X-Zam-Solution`;
-//! - **бюджет сервера** `recall.timeout_ms` (200): шаги сбора идут до `timeout_ms −`
-//!   [`ACCOUNTING_RESERVE_MS`] (40 мс, не больше половины срока), по превышении отдаётся
-//!   собранное и `warnings: ["recall timeout"]`; учёт показов — после сбора и только до полного
-//!   срока: вышел — собранное отдаётся без `session_seen` и `usage` (`timings.record_ms: null`)
-//!   и с тем же предупреждением. Поле тела `timeout_ms` (M6 §16 п. 19, CR-7) задаёт срок этого
-//!   запроса вместо `recall.timeout_ms`: 1..=`max(recall.max_timeout_ms, recall.timeout_ms)`
-//!   (по умолчанию 2000), иначе 400 — нативный
-//!   клиент может ждать полный дайджест дольше хуков. Сбой внутреннего поиска `prompt` — тишина и
+//! - **срок сбора**: у хука — бюджет сервера `recall.timeout_ms` (200), у явного вызова —
+//!   `max(recall.max_timeout_ms, recall.timeout_ms)` (по умолчанию 2000; `collect_timeout`,
+//!   M6.6 §5.1). Хук — запрос без происхождения MCP с событием `session_start | prompt |
+//!   post_tool` или с полем `code_map` (хуки `session-start`, `subagent-start`); явные — MCP
+//!   (все события) и `recovery`, `brief`, `idea_review` из REST и `zam` без `code_map`. Шаги
+//!   сбора идут до срока минус [`ACCOUNTING_RESERVE_MS`] (40 мс, не больше половины срока), по
+//!   превышении отдаётся собранное и `warnings: ["recall timeout"]`; учёт показов — после сбора и
+//!   только до полного срока: вышел — собранное отдаётся без `session_seen` и `usage`
+//!   (`timings.record_ms: null`) и с тем же предупреждением. Поле тела `timeout_ms` (M6 §16 п. 19,
+//!   CR-7) задаёт срок этого запроса вместо умолчания: 1..=`max(recall.max_timeout_ms,
+//!   recall.timeout_ms)`, иначе 400. Сбой внутреннего поиска `prompt` — тишина и
 //!   `warnings: ["recall search failed"]`;
 //! - `record: false` (по умолчанию `true`) — ответ без учёта: ни `session_seen`, ни `usage`,
 //!   `timings.record_ms: null` (хук `session-start` с выключенным в клиенте дайджестом берёт
@@ -259,19 +264,19 @@ use super::json_body;
 use super::search::targets::{ScopeReq, SearchTarget, dedup_keep_order, resolve_targets};
 use super::search::{Health, LightSearch, SOLUTION_HEADER};
 use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
-use super::user_settings::{UserFlags, user_flags};
+use super::user_settings::{UserFlags, cached_user_flags};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, SESSION_HEADER};
 use crate::auth::{Principal, target_user_id};
-use crate::config::IdeasMode;
+use crate::config::{IdeasMode, RecallSection};
 use crate::error::ApiError;
 
 // имена идей — по прежним путям `api::recall::…` (MCP, тесты)
 pub use ideas::{
     IDEA_REVIEW_BUDGET, IDEA_REVIEW_EMPTY, IDEA_REVIEW_LIMIT, IDEA_REVIEW_LIMIT_MAX,
-    IDEA_REVIEW_NO_SOLUTION, IDEA_REVIEW_OFF, IDEA_REVIEW_READ_ONLY, IDEA_REVIEW_SIMILAR_MAX,
-    IDEA_REVIEW_STEPS, IDEA_STOP_STEMS, IDEAS_REVIEW_HINT, PLAN_LINE, PLAN_LINE_NO_NEXT,
-    SECTION_IDEAS_REVIEW,
+    IDEA_REVIEW_NO_ACCESS, IDEA_REVIEW_NO_SOLUTION, IDEA_REVIEW_OFF, IDEA_REVIEW_READ_ONLY,
+    IDEA_REVIEW_SIMILAR_MAX, IDEA_REVIEW_STEPS, IDEA_REVIEW_UNREGISTERED, IDEA_STOP_STEMS,
+    IDEAS_REVIEW_HINT, PLAN_LINE, PLAN_LINE_NO_NEXT, SECTION_IDEAS_REVIEW,
 };
 use ideas::{
     REASON_IDEA, REASON_IDEA_REVIEW, digest_ideas, ideas_enabled, ideas_section_head, plan_line,
@@ -287,7 +292,8 @@ use prompt::prompt_sections;
 // здесь — по пути `api::recall::…`, как `PROMPT_MAX` и `TERM_HINTS_MAX`
 pub use zam_search::recall::PROMPT_SHORT_WORDS;
 
-/// Предупреждение: сбор подсказок не уложился в `recall.timeout_ms`.
+/// Предупреждение: сбор подсказок не уложился в срок (у хука — `recall.timeout_ms`, у явного
+/// вызова — `max(recall.max_timeout_ms, recall.timeout_ms)`).
 pub const WARN_RECALL_TIMEOUT: &str = "recall timeout";
 /// Предупреждение: внутренний поиск подсказок к запросу не удался (ответ — тишина).
 pub const WARN_PROMPT_SEARCH_FAILED: &str = "recall search failed";
@@ -387,6 +393,37 @@ impl Event {
     }
 }
 
+/// Предел поля `timeout_ms` и срок явного вызова, мс: `max(recall.max_timeout_ms,
+/// recall.timeout_ms)` — не меньше срока сервера: при `recall.timeout_ms` больше `max_timeout_ms`
+/// (сетки замера ставят 60000) клиент может попросить и сам срок сервера (ревью задачи 19 M6, M-3).
+fn timeout_field_max(cfg: &RecallSection) -> u64 {
+    cfg.max_timeout_ms.max(cfg.timeout_ms)
+}
+
+/// Срок сбора запроса, мс (M6.6 §5.1, замечание 20): поле `timeout_ms` (`field`) важнее; без него
+/// у хука — `recall.timeout_ms` (бюджет хуков), у явного вызова — [`timeout_field_max`]. Хук —
+/// запрос без происхождения MCP (`mcp`) с событием `session_start | prompt | post_tool` или с полем
+/// `code_map` (его шлют хуки `session-start` и `subagent-start`). Явные — все вызовы MCP и
+/// `recovery`, `brief`, `idea_review` из REST и `zam` без `code_map`: агент ждёт пакет сам, а
+/// поиск `brief` на CPU в 200 мс не укладывался.
+fn collect_timeout(
+    field: Option<u64>,
+    event: Event,
+    code_map: bool,
+    mcp: bool,
+    cfg: &RecallSection,
+) -> u64 {
+    field.unwrap_or_else(|| {
+        let hook = !mcp
+            && (code_map || matches!(event, Event::SessionStart | Event::Prompt | Event::PostTool));
+        if hook {
+            cfg.timeout_ms
+        } else {
+            timeout_field_max(cfg)
+        }
+    })
+}
+
 /// Событие учёта выданных токенов (`session_tokens`, M4.5 §9.5): пакет восстановления — и по
 /// `event: recovery`, и по `session_start` после `compact | resume`.
 fn token_event(event: Event, recovery: bool) -> &'static str {
@@ -465,8 +502,9 @@ pub struct RecallReq {
     /// клиент режет только страховочно. Нет у хука (старый клиент) — [`HOOK_OUTPUT_LIMIT`].
     output_limit: Option<OutputLimit>,
     /// Срок сбора этого запроса, мс (M6 §16 п. 19, CR-7): 1..=`max(recall.max_timeout_ms,
-    /// recall.timeout_ms)`, иначе 400; нет — `recall.timeout_ms` (у `idea_review` — верхний
-    /// предел: пакет — явный вызов агента, не бюджет хука).
+    /// recall.timeout_ms)`, иначе 400; нет — у хука `recall.timeout_ms`, у явного вызова (MCP;
+    /// `recovery`, `brief`, `idea_review` без `code_map`) — верхний предел ([`collect_timeout`],
+    /// M6.6 §5.1).
     timeout_ms: Option<u64>,
     /// Идей в пакете `idea_review` (M6.5 §7): 1..=[`IDEA_REVIEW_LIMIT_MAX`], иначе 400; нет —
     /// [`IDEA_REVIEW_LIMIT`]. У прочих событий не действует.
@@ -786,7 +824,7 @@ fn item_age(it: &Value) -> Option<u32> {
         .map(|d| u32::try_from(d).unwrap_or(u32::MAX))
 }
 
-/// Срок сбора подсказок (`recall.timeout_ms`).
+/// Срок сбора подсказок ([`collect_timeout`]).
 struct Deadline {
     at: Instant,
     expired: bool,
@@ -3332,9 +3370,7 @@ pub async fn recall(
             "output_limit.max: от 1 до {OUTPUT_LIMIT_MAX}"
         )));
     }
-    // предел поля — не меньше срока сервера: при `recall.timeout_ms` больше `max_timeout_ms`
-    // (сетки замера ставят 60000) клиент может попросить и сам срок сервера (ревью задачи 19, M-3)
-    let max_timeout = st.cfg.recall.max_timeout_ms.max(st.cfg.recall.timeout_ms);
+    let max_timeout = timeout_field_max(&st.cfg.recall);
     if req
         .timeout_ms
         .is_some_and(|t| !(1..=max_timeout).contains(&t))
@@ -3434,9 +3470,9 @@ pub async fn recall(
         _ => false,
     };
     let user = target_user_id(&st, &p, &headers)?;
-    // R5: настройки пользователя (`hooks.<тип>`, `ideas.proactive`) одним чтением; сбой
-    // чтения — всё включено (подсказки не валятся)
-    let flags = match user_flags(&st.system, user, st.cfg.ideas.default_mode).await {
+    // R5: настройки пользователя (`hooks.<тип>`, `ideas.proactive`) одним чтением (кэш процесса,
+    // M6.6 §5.3); сбой чтения — всё включено (подсказки не валятся)
+    let flags = match cached_user_flags(&st, user).await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "recall: настройки пользователя не прочитаны");
@@ -3502,15 +3538,15 @@ pub async fn recall(
     if let Some(src) = req.source.as_deref() {
         tracing::debug!(event = ?req.event, source = %src, recovery, "recall");
     }
-    // сбор — до срока минус резерв на учёт показа; учёт — только до полного срока
-    // срок — из тела (нативный клиент, CR-7) или `recall.timeout_ms` (бюджет хуков)
-    // пакет разбора идей — явный вызов агента с поиском на каждую идею: по умолчанию — верхний
-    // предел поля, а не бюджет хука
-    let timeout = req.timeout_ms.unwrap_or(if req.event == Event::IdeaReview {
-        max_timeout
-    } else {
-        st.cfg.recall.timeout_ms
-    });
+    // сбор — до срока минус резерв на учёт показа; учёт — только до полного срока; срок — из
+    // тела (нативный клиент, CR-7), у хука — `recall.timeout_ms`, у явного вызова — предел поля
+    let timeout = collect_timeout(
+        req.timeout_ms,
+        req.event,
+        req.code_map.is_some(),
+        origin.is_some(),
+        &st.cfg.recall,
+    );
     let total_deadline = t0 + Duration::from_millis(timeout);
     let mut deadline = Deadline {
         at: t0 + Duration::from_millis(timeout - ACCOUNTING_RESERVE_MS.min(timeout / 2)),
@@ -4157,5 +4193,53 @@ mod tests {
         };
         assert_eq!(names(&exact), ["mod.rs", "x/y.rs"]);
         assert_eq!(names(&tail), ["a/mod.rs", "b/mod.rs"]);
+    }
+
+    /// M6.6 §5.1: срок сбора без поля — хук (без MCP, событие хука или поле `code_map`) —
+    /// `recall.timeout_ms`, явный вызов — `max(recall.max_timeout_ms, recall.timeout_ms)`; поле
+    /// `timeout_ms` важнее всего.
+    #[test]
+    fn collect_timeout_hook_or_explicit() {
+        let mut cfg = crate::config::ServerConfig::default().recall;
+        (cfg.timeout_ms, cfg.max_timeout_ms) = (200, 2000);
+        let (hook, explicit) = (200, 2000);
+        use Event::*;
+        // (событие, code_map, MCP, срок)
+        let table = [
+            (SessionStart, false, false, hook),
+            (Prompt, false, false, hook),
+            (PostTool, false, false, hook),
+            (Recovery, false, false, explicit),
+            (Brief, false, false, explicit),
+            (IdeaReview, false, false, explicit),
+            // хук `subagent-start` (и `session-start`) шлёт `code_map`
+            (Brief, true, false, hook),
+            (Recovery, true, false, hook),
+            (SessionStart, true, false, hook),
+            // MCP — всегда явный вызов
+            (SessionStart, false, true, explicit),
+            (Prompt, false, true, explicit),
+            (PostTool, false, true, explicit),
+            (Recovery, false, true, explicit),
+            (Brief, false, true, explicit),
+            (IdeaReview, false, true, explicit),
+            (Brief, true, true, explicit),
+        ];
+        for (event, code_map, mcp, want) in table {
+            assert_eq!(
+                collect_timeout(None, event, code_map, mcp, &cfg),
+                want,
+                "{event:?} code_map={code_map} mcp={mcp}"
+            );
+            assert_eq!(
+                collect_timeout(Some(700), event, code_map, mcp, &cfg),
+                700,
+                "поле важнее: {event:?} code_map={code_map} mcp={mcp}"
+            );
+        }
+        // срок сервера больше предела поля (сетки замера) — явный вызов ждёт его
+        cfg.timeout_ms = 60_000;
+        assert_eq!(collect_timeout(None, Brief, false, true, &cfg), 60_000);
+        assert_eq!(collect_timeout(None, Prompt, false, false, &cfg), 60_000);
     }
 }

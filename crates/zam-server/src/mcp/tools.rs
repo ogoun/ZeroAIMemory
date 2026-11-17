@@ -385,7 +385,7 @@ impl ToolName {
                     "agent_block_version": {"type": "integer", "minimum": 0, "description":
                         "версия блока инструкции агента; старее сервера — напоминание в дайджесте"},
                     "timeout_ms": {"type": "integer", "minimum": 1, "description":
-                        "срок сбора, мс (до recall.max_timeout_ms; по умолчанию recall.timeout_ms)"},
+                        "срок сбора, мс (до recall.max_timeout_ms; по умолчанию: хук — recall.timeout_ms, явный вызов — recall.max_timeout_ms)"},
                     "format": fmt,
                 }),
                 &["event"],
