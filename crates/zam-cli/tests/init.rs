@@ -1392,10 +1392,10 @@ fn init_url_local_writes_claude_local_and_exclude() {
     }
 }
 
-/// `--url-to local` (ревью задачи 10, I1): `CLAUDE.local.md` в индексе git — исключение не
-/// действует: предупреждение, без вопроса, без записи и без ложного «внесён»; правило «!» в
-/// `.gitignore` сильнее `info/exclude` — после записи git повторно проверяет, итог —
-/// предупреждение; строка уже есть — без вопроса и без повторной записи.
+/// `--url-to local` (ревью задачи 10, I1; решение координатора, круг 2): `CLAUDE.local.md` в
+/// индексе git — отказ (код 1) до записи файлов и регистрации решения: адрес попал бы в
+/// репозиторий; правило «!» в `.gitignore` сильнее `info/exclude` — после записи git повторно
+/// проверяет, итог — предупреждение; строка уже есть — без вопроса и без повторной записи.
 #[test]
 fn init_url_local_tracked_or_negated_not_reported_excluded() {
     let (url, tok) = start("url-local-tracked");
@@ -1406,19 +1406,26 @@ fn init_url_local_tracked_or_negated_not_reported_excluded() {
     git_ok(&p.repo, &["add", "CLAUDE.local.md"]);
     git_ok(&p.repo, &["commit", "-q", "-m", "local"]);
     let ex0 = exclude(&p);
-    // без --yes: на вопрос о файлах агента — «y», вопроса об исключении нет
+    let before = p.snapshot();
     let o = p.init(&["--url-to", "local"], "y\n");
-    ok(&o);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
     let (s, e) = (out(&o), err(&o));
     assert!(
         e.contains(
-            "CLAUDE.local.md в индексе git — исключение не действует: git rm --cached \
-             CLAUDE.local.md"
+            "CLAUDE.local.md в индексе git — адрес попал бы в репозиторий: git rm --cached \
+             CLAUDE.local.md или zam init --url-to home"
         ),
         "{e}"
     );
     assert!(!s.contains("Внести") && !s.contains("внесён"), "{s}");
+    assert_eq!(p.snapshot(), before, "файлы проекта не тронуты");
+    assert_eq!(p.read("CLAUDE.local.md"), "# мои\n");
     assert_eq!(exclude(&p), ex0, "исключение не писалось");
+    let (_, body) = api_get(&p, "/solutions");
+    assert!(
+        !body.contains("\"repo\""),
+        "решение не зарегистрировано: {body}"
+    );
     // снят с индекса, но .gitignore возвращает его правилом «!»
     git_ok(&p.repo, &["rm", "--cached", "-q", "CLAUDE.local.md"]);
     std::fs::write(p.repo.join(".gitignore"), "!/CLAUDE.local.md\n").unwrap();
@@ -1544,6 +1551,102 @@ fn init_url_local_to_home_or_block_drops_local_line() {
     let before = p.snapshot();
     ok(&p.init(&["--yes"], ""));
     assert_eq!(p.snapshot(), before);
+}
+
+/// Переход `local` → `block`, когда в итоговом блоке нет строки адреса (ревью задачи 10, круг 2,
+/// N2): строка в `CLAUDE.local.md` остаётся с предупреждением, иначе адрес потерялся бы. Шаблон
+/// без `{url}` сервер не принимает (`validate_template` — 400), поэтому случай — `{url}` не
+/// строкой `ZeroAIMemoryUrl=`: такой адрес `zam` из блока не читает.
+#[test]
+fn init_url_local_to_block_keeps_line_without_block_url() {
+    let (url, tok) = start("url-local-keep");
+    let p = Proj::new("url-local-keep", &url, &tok);
+    ok(&p.init(&["--url-to", "local", "--yes"], ""));
+    admin_template(
+        &p,
+        "## Память\nСервер памяти — {url}.\nРешение: {solution}.\n",
+    );
+    // токен — из окружения: домашний конфиг адреса не получит
+    let o = p
+        .cmd()
+        .env("ZAM_TOKEN", &tok)
+        .args(["init", "--url", &url, "--url-to", "block", "--yes"])
+        .output()
+        .unwrap();
+    ok(&o);
+    assert_eq!(
+        p.read("CLAUDE.local.md"),
+        format!("ZeroAIMemoryUrl={url}\n")
+    );
+    assert!(
+        err(&o).contains(
+            "строка ZeroAIMemoryUrl в CLAUDE.local.md оставлена: в блоке нет строки \
+             ZeroAIMemoryUrl="
+        ),
+        "{}",
+        err(&o)
+    );
+    assert!(
+        !out(&o).contains("убрана") && !out(&o).contains("удалён"),
+        "{}",
+        out(&o)
+    );
+    // адрес не потерян: zam без флагов находит сервер по строке CLAUDE.local.md
+    let o = p.cmd().arg("status").output().unwrap();
+    ok(&o);
+    assert!(out(&o).contains(&format!("Сервер:   {url}")), "{}", out(&o));
+}
+
+/// Переход с `local`, когда `CLAUDE.local.md` — символическая ссылка (ревью задачи 10, круг 2,
+/// N1): ссылка внутри проекта не удаляется — в её цель пишется текст без строки адреса; ссылка
+/// за пределы проекта — предупреждение без правки, `zam init` не падает. Без прав на ссылки
+/// (Windows без режима разработчика) — SKIP.
+#[test]
+fn init_url_local_symlink_switch_keeps_link() {
+    const NAME: &str = "init_url_local_symlink_switch_keeps_link";
+    let (url, tok) = start("url-local-link");
+    let p = Proj::new("url-local-link", &url, &tok);
+    let link = p.repo.join("CLAUDE.local.md");
+    let real = p.repo.join("notes-local.md");
+    std::fs::write(&real, "").unwrap();
+    if !symlink_file(Path::new("notes-local.md"), &link) {
+        eprintln!("SKIP {NAME}: символическую ссылку создать нельзя (нет прав)");
+        return;
+    }
+    ok(&p.init(&["--url-to", "local", "--yes"], ""));
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        format!("ZeroAIMemoryUrl={url}\n")
+    );
+    let o = p.init(&["--url-to", "home", "--yes"], "");
+    ok(&o);
+    let meta = std::fs::symlink_metadata(&link).unwrap();
+    assert!(meta.file_type().is_symlink(), "ссылка осталась");
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "",
+        "цель — без строки"
+    );
+    assert!(
+        out(&o).contains("Строка ZeroAIMemoryUrl убрана из CLAUDE.local.md"),
+        "{}",
+        out(&o)
+    );
+    // ссылка за пределы проекта со строкой адреса: предупреждение и пропуск
+    std::fs::remove_file(&link).unwrap();
+    let outside = p.home.join("outside-local.md");
+    let text = format!("ZeroAIMemoryUrl={url}\n");
+    std::fs::write(&outside, &text).unwrap();
+    assert!(symlink_file(&outside, &link));
+    let o = p.init(&["--url-to", "block", "--yes"], "");
+    ok(&o);
+    let e = err(&o);
+    assert!(
+        e.contains("строка ZeroAIMemoryUrl в CLAUDE.local.md оставлена")
+            && e.contains("за пределы проекта"),
+        "{e}"
+    );
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), text);
 }
 
 /// Своя строка `ZeroAIMemoryUrl=` вне блока в CLAUDE.md при `--url-to home` (ревью задачи 10,

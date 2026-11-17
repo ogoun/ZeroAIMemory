@@ -92,15 +92,6 @@ impl Planned {
             remove: false,
         })
     }
-
-    fn remove(path: PathBuf) -> Planned {
-        Planned {
-            path,
-            text: String::new(),
-            existed: true,
-            remove: true,
-        }
-    }
 }
 
 /// Предел размера читаемых файлов проекта, байт.
@@ -298,6 +289,50 @@ fn resolve_in_root(root: &Path, path: &Path) -> Result<PathBuf, CliError> {
     Ok(target)
 }
 
+/// Переход с `--url-to local` (`--url-to home|block`): строки адреса уходят из `CLAUDE.local.md`
+/// (`path`, текст `old`). `Ok((план, удалён))`: свой текст остаётся, файл только со строкой
+/// адреса удаляется; символическая ссылка не удаляется — в её цель внутри проекта пишется текст
+/// без строк. `Err(причина)` — строку оставить с предупреждением, не роняя `zam init`: в блоке
+/// нет строки адреса (`lost` — адрес потерялся бы) или ссылка ведёт за пределы проекта или
+/// висит (ревью задачи 10, круг 2, N1, N2).
+fn drop_local_url(
+    root: &Path,
+    path: PathBuf,
+    old: &str,
+    lost: bool,
+) -> Result<(Planned, bool), String> {
+    if lost {
+        return Err(
+            "в блоке нет строки ZeroAIMemoryUrl= (свой шаблон администратора) — без неё zam и \
+             хуки потеряли бы адрес сервера"
+                .into(),
+        );
+    }
+    let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+    if link {
+        resolve_in_root(root, &path).map_err(|e| {
+            format!(
+                "{} — уберите строку сами: она важнее домашнего конфига и блока",
+                e.msg
+            )
+        })?;
+    }
+    let (text, remove) = match merge::drop_url_lines(old) {
+        Some(text) => (text, false),
+        None if link => (merge::without_url_lines(old), false),
+        None => (String::new(), true),
+    };
+    Ok((
+        Planned {
+            path,
+            text,
+            existed: true,
+            remove,
+        },
+        remove,
+    ))
+}
+
 /// Запись файла проекта (fix round 1, M-5; fix round 3, N-3): `target` — уже разрешённый
 /// [`resolve_in_root`] путь, так что ссылка остаётся ссылкой; временный файл в
 /// каталоге цели с правами прежнего и rename (3 попытки через 50 мс: на Windows файл бывает
@@ -446,12 +481,17 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     // из двух, разные — предупреждение, берётся из первого (N-6)
     let mut migrated: Option<(String, &str)> = None;
     let mut differs: Option<&str> = None;
+    // `block`: у всех итоговых блоков есть строка адреса (её находит `zam`)
+    let mut block_has_url = true;
     for ((_, file, v), old) in setups.iter().zip(&olds) {
         let block = v["block"]
             .as_str()
             .ok_or_else(|| CliError::config("в ответе /agent-setup нет block"))?;
         let block = match url_to {
-            UrlTo::Block => block.to_string(),
+            UrlTo::Block => {
+                block_has_url &= !merge::cut_url_lines(block).1.is_empty();
+                block.to_string()
+            }
             UrlTo::Home | UrlTo::Local => {
                 // своя строка адреса вне блока — текст пользователя: не вырезается, а
                 // предупреждение (файл коммитится)
@@ -498,16 +538,14 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         && let Some(old) = read_opt(&local_path)?
         && !merge::url_values(&old).is_empty()
     {
-        ur.local_dropped = Some(match merge::drop_url_lines(&old) {
-            Some(text) => {
-                plan.extend(Planned::new(local_path, Some(&old), text));
-                false
+        let lost = url_to == UrlTo::Block && !block_has_url;
+        match drop_local_url(&root, local_path, &old, lost) {
+            Ok((p, removed)) => {
+                plan.push(p);
+                ur.local_dropped = Some(removed);
             }
-            None => {
-                plan.push(Planned::remove(local_path));
-                true
-            }
-        });
+            Err(why) => ur.local_kept = Some(why),
+        }
     }
     let mut agent_plan: Vec<Planned> = Vec::new();
     if !o.no_hooks {
@@ -604,8 +642,9 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     for p in all {
         let target = &targets[&p.path];
         let verb = if p.remove {
-            std::fs::remove_file(target)
-                .map_err(|e| CliError::config(format!("удаление {}: {e}", target.display())))?;
+            // удаляется сам путь, а не разрешённая цель (у ссылки удаление не планируется)
+            std::fs::remove_file(&p.path)
+                .map_err(|e| CliError::config(format!("удаление {}: {e}", p.path.display())))?;
             "удалён  "
         } else {
             write_project_file(target, p.text.as_bytes())?;

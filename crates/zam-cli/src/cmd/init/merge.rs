@@ -103,15 +103,21 @@ pub fn url_values(text: &str) -> Vec<String> {
     cut_url_lines(text.strip_prefix(BOM).unwrap_or(text)).1
 }
 
-/// Текст файла без строк адреса (переход `--url-to local` → `home|block`); BOM и прочий текст
-/// сохраняются. Кроме строк адреса и пробелов в файле ничего нет — `None` (файл удалить).
-pub fn drop_url_lines(text: &str) -> Option<String> {
+/// Текст файла без строк адреса; BOM и прочий текст сохраняются байт в байт.
+pub fn without_url_lines(text: &str) -> String {
     let (bom, body) = match text.strip_prefix(BOM) {
         Some(rest) => (BOM, rest),
         None => ("", text),
     };
-    let rest = cut_url_lines(body).0;
-    (!rest.trim().is_empty()).then(|| format!("{bom}{rest}"))
+    format!("{bom}{}", cut_url_lines(body).0)
+}
+
+/// Текст файла без строк адреса (переход `--url-to local` → `home|block`), как
+/// [`without_url_lines`]; кроме строк адреса и пробелов в файле ничего нет — `None` (файл
+/// удалить).
+pub fn drop_url_lines(text: &str) -> Option<String> {
+    let rest = without_url_lines(text);
+    (!rest.strip_prefix(BOM).unwrap_or(&rest).trim().is_empty()).then_some(rest)
 }
 
 /// Экранирование для шаблона gitignore (`info/exclude`): `\`, `*`, `?`, `[`, `]` в пути
@@ -473,6 +479,11 @@ mod tests {
         assert_eq!(
             drop_url_lines(&format!("\u{feff}# мои\r\nZeroAIMemoryUrl={u}\r\nхвост")),
             Some("\u{feff}# мои\r\nхвост".to_string())
+        );
+        // цель ссылки не удаляется — пишется текст без строк адреса, даже пустой
+        assert_eq!(
+            without_url_lines(&format!("\u{feff}\nZeroAIMemoryUrl={u}\n")),
+            "\u{feff}\n"
         );
     }
 

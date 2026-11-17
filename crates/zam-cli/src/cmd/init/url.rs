@@ -81,8 +81,6 @@ fn git_tracked(root: &Path, rel: &str) -> Option<bool> {
 pub enum Exclude {
     /// Уже исключён или проект не в git (коммитить некуда).
     Done,
-    /// Файл в индексе git: правила исключения к нему не применяются.
-    Tracked,
     /// Дописать строку `line` в `path` (`info/exclude` репозитория, общий для всех worktree);
     /// новый текст файла — `text`.
     Add {
@@ -99,10 +97,17 @@ pub enum Exclude {
 
 /// План исключения `CLAUDE.local.md` (только чтение: `ls-files`, `check-ignore`, `rev-parse`).
 /// Строка — `/<префикс>CLAUDE.local.md`, префикс каталога (`--show-prefix`) — с экранированием
-/// символов шаблона gitignore.
+/// символов шаблона gitignore. Файл уже в индексе git — отказ (код 1) до записи и регистрации:
+/// правила исключения к отслеживаемому файлу не применяются, и адрес ушёл бы в репозиторий
+/// следующим коммитом (решение координатора, круг правок 2 задачи 10).
 pub fn plan_exclude(root: &Path) -> Result<Exclude, CliError> {
     match git_tracked(root, LOCAL_MD) {
-        Some(true) => return Ok(Exclude::Tracked),
+        Some(true) => {
+            return Err(CliError::config(format!(
+                "{LOCAL_MD} в индексе git — адрес попал бы в репозиторий: git rm --cached \
+                 {LOCAL_MD} или zam init --url-to home"
+            )));
+        }
         Some(false) => {}
         None => {
             let in_git = locate::ancestors(root).any(|d| d.join(".git").exists());
@@ -237,6 +242,8 @@ pub struct UrlReport {
     /// Переход с `local` (`--url-to home|block`): строки адреса убраны из `CLAUDE.local.md`;
     /// `true` — в нём больше ничего не было, файл удалён.
     pub local_dropped: Option<bool>,
+    /// Переход с `local`: строки адреса в `CLAUDE.local.md` оставлены — почему.
+    pub local_kept: Option<String>,
     pub exclude: Exclude,
     /// Запись исключения подтверждена.
     pub exclude_ok: bool,
@@ -253,6 +260,7 @@ impl UrlReport {
             tracked: Vec::new(),
             outside: Vec::new(),
             local_dropped: None,
+            local_kept: None,
             exclude: Exclude::Done,
             exclude_ok: false,
             excluded: None,
@@ -300,6 +308,9 @@ impl UrlReport {
             ),
             None => {}
         }
+        if let Some(why) = &self.local_kept {
+            eprintln!("предупреждение: строка ZeroAIMemoryUrl в {LOCAL_MD} оставлена: {why}");
+        }
         for f in &self.outside {
             eprintln!(
                 "предупреждение: в {f} своя строка ZeroAIMemoryUrl вне блока ZeroAIMemory — \
@@ -315,43 +326,103 @@ impl UrlReport {
     }
 
     fn print_exclude(&self, root: &Path) {
-        let leak = "адрес сервера может попасть в репозиторий";
-        match &self.exclude {
-            Exclude::Done => {}
-            Exclude::Tracked => eprintln!(
-                "предупреждение: {LOCAL_MD} в индексе git — исключение не действует: git rm \
-                 --cached {LOCAL_MD} (иначе адрес сервера уйдёт в репозиторий со следующим \
-                 коммитом), затем повторите zam init --url-to local"
-            ),
-            Exclude::Add { path, .. } if self.exclude_ok && self.excluded == Some(true) => {
-                println!("{LOCAL_MD} внесён в {}.", rel(root, path))
-            }
-            Exclude::Add { path, line, .. } if self.exclude_ok => eprintln!(
-                "предупреждение: строка {line} дописана в {}, но git по-прежнему не исключает \
-                 {LOCAL_MD} (правило «!» в .gitignore?) — {leak}",
-                rel(root, path)
-            ),
-            Exclude::Add { path, line, .. } => eprintln!(
-                "предупреждение: {LOCAL_MD} не внесён в {}: {leak} — повторите с --yes или \
-                 допишите туда строку {line}",
-                rel(root, path)
-            ),
-            Exclude::Ineffective { path, line } => eprintln!(
-                "предупреждение: строка {line} уже есть в {}, но git не исключает {LOCAL_MD} \
-                 (правило «!» в .gitignore?) — {leak}",
-                rel(root, path)
-            ),
-            Exclude::Unknown => eprintln!(
-                "предупреждение: git не ответил — проверьте, что {LOCAL_MD} исключён из git (в \
-                 нём адрес сервера)"
-            ),
+        match self.exclude_message(root) {
+            Some((false, m)) => println!("{m}"),
+            Some((true, m)) => eprintln!("предупреждение: {m}"),
+            None => {}
         }
+    }
+
+    /// Строка итога об исключении `CLAUDE.local.md`: `(предупреждение?, текст)`.
+    fn exclude_message(&self, root: &Path) -> Option<(bool, String)> {
+        let leak = "адрес сервера может попасть в репозиторий";
+        Some(match &self.exclude {
+            Exclude::Done => return None,
+            Exclude::Add { path, line, .. } if self.exclude_ok => {
+                let path = rel(root, path);
+                match self.excluded {
+                    Some(true) => (false, format!("{LOCAL_MD} внесён в {path}.")),
+                    Some(false) => (
+                        true,
+                        format!(
+                            "строка {line} дописана в {path}, но git по-прежнему не исключает \
+                             {LOCAL_MD} (правило «!» в .gitignore?) — {leak}"
+                        ),
+                    ),
+                    None => (
+                        true,
+                        format!(
+                            "строка {line} дописана в {path}, но не удалось проверить \
+                             исключение (git check-ignore не ответил) — проверьте, что \
+                             {LOCAL_MD} исключён из git"
+                        ),
+                    ),
+                }
+            }
+            Exclude::Add { path, line, .. } => (
+                true,
+                format!(
+                    "{LOCAL_MD} не внесён в {}: {leak} — повторите с --yes или допишите туда \
+                     строку {line}",
+                    rel(root, path)
+                ),
+            ),
+            Exclude::Ineffective { path, line } => (
+                true,
+                format!(
+                    "строка {line} уже есть в {}, но git не исключает {LOCAL_MD} (правило «!» в \
+                     .gitignore?) — {leak}",
+                    rel(root, path)
+                ),
+            ),
+            Exclude::Unknown => (
+                true,
+                format!(
+                    "git не ответил — проверьте, что {LOCAL_MD} исключён из git (в нём адрес \
+                     сервера)"
+                ),
+            ),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Итог исключения после записи (ревью задачи 10, круг 2, N3): повторный `check-ignore` не
+    /// ответил — «не удалось проверить», а не догадка о правиле «!»; исключён — «внесён».
+    #[test]
+    fn exclude_message_after_write() {
+        let root = Path::new("/p");
+        let mut r = UrlReport::new(UrlTo::Local, false);
+        r.exclude = Exclude::Add {
+            path: root.join(".git/info/exclude"),
+            text: String::new(),
+            line: "/CLAUDE.local.md".into(),
+        };
+        r.exclude_ok = true;
+        let msg = |r: &UrlReport| r.exclude_message(root).unwrap();
+        let (warn, m) = msg(&r);
+        assert!(warn, "{m}");
+        assert!(
+            m.contains("не удалось проверить исключение (git check-ignore не ответил)")
+                && !m.contains("«!»"),
+            "{m}"
+        );
+        r.excluded = Some(false);
+        assert!(msg(&r).1.contains("правило «!» в .gitignore?"));
+        r.excluded = Some(true);
+        assert_eq!(
+            msg(&r),
+            (
+                false,
+                "CLAUDE.local.md внесён в .git/info/exclude.".to_string()
+            )
+        );
+        r.exclude_ok = false;
+        assert!(msg(&r).1.contains("не внесён"));
+    }
 
     /// Пустой `url` ответа `/agent-setup` (или `/`) — не адрес: иначе `contains("")` всегда
     /// истинно, и режим без флага навсегда остался бы `block` (ревью задачи 10, M2).
