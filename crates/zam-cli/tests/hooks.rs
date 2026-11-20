@@ -1526,7 +1526,7 @@ pre_tool = true
 /// 250 и 100 мс), p95 — не больше ×4 от него (1200, 1000, 1000 и 400 мс; прежде — только p95 и
 /// на весь процесс); запуск и выход процесса — отдельно, нормировкой по пустому вызову
 /// ([`assert_launch`]); пустых ответов (хук замолчал по
-/// внутреннему сроку, fail-open) — не больше 5 % всех 80 вызовов, как у
+/// внутреннему сроку, fail-open) — не больше 5 % из 80 вызовов засчитанных серий, как у
 /// `m4_acceptance::hook_budgets`: на общем раннере CI отладочная сборка изредка не укладывается
 /// в бюджет (ubuntu: 872cfc4, e32fe1f, d020f16; на стенде A/B p95 ~15 мс без пустых — журнал
 /// M5, «Финальное ревью ветки»).
@@ -1535,7 +1535,11 @@ pre_tool = true
 /// первая уложившаяся, все печатаются. Пределы не меняются. Остановка диска под общим прогоном
 /// даёт два-три выброса из 20 и роняет p95 одной серии при разбросе пустого вызова в единицы
 /// мс (M6.6: `checkpoint` p95 812 мс при пределе 400 мс и разбросе 1,6 мс, отдельно — проходит);
-/// систематическое замедление хука не проходит ни одной серии (M6.6, задача 12).
+/// систематическое замедление хука не проходит ни одной серии (M6.6, задача 12). Повтор идёт
+/// тем же путём, что первая серия: в свежих сессиях `tm{i}-{хук}-{попытка}` (в сессиях первой
+/// серии `checkpoint` уже напомнил — `reminded` — и молчал бы без сети), перед замером —
+/// неизмеряемые `session-start` этих сессий, у `checkpoint` — ещё `pre-tool` с Write. Пустые
+/// ответы отвергнутых серий печатаются отдельно и в долю не входят.
 #[test]
 fn hooks_with_server_within_margin() {
     let _g = serial();
@@ -1557,63 +1561,67 @@ fn hooks_with_server_within_margin() {
             &[],
         );
     }
-    let (mut report, mut silent, mut calls) = (Vec::new(), Vec::new(), 0usize);
-    // событие вызова `i` попытки `a`: повтор `session-start` — новые сессии, остальные хуки —
-    // в сессиях первой серии `session-start` (они начаты при любом её исходе по времени)
+    let (mut report, mut calls) = (Vec::new(), 0usize);
+    // пустые ответы засчитанных серий (критерий) и отвергнутых по времени (только печать)
+    let (mut silent, mut silent_rejected) = (Vec::new(), Vec::new());
+    // сессия вызова `i` хука `k` в попытке `a`: первая серия всех хуков — `tm{i}` (их начинает
+    // серия `session-start`), повтор — свои свежие сессии, чтобы хук шёл тем же путём
+    let sid = |k: &str, a: usize, i: usize| {
+        if a == 0 {
+            format!("tm{i}")
+        } else {
+            format!("tm{i}-{k}-{a}")
+        }
+    };
     for (k, mk) in [
         (
             "session-start",
-            Box::new(|a: usize, i: usize| {
-                let sid = if a == 0 {
-                    format!("tm{i}")
-                } else {
-                    format!("tm{i}-{a}")
-                };
-                p.ev("SessionStart", &sid, json!({"source": "startup"}))
-            }) as Box<dyn Fn(usize, usize) -> Value>,
+            Box::new(|s: &str| p.ev("SessionStart", s, json!({"source": "startup"})))
+                as Box<dyn Fn(&str) -> Value>,
         ),
         (
             "prompt",
-            Box::new(|_, i| {
+            Box::new(|s: &str| {
                 p.ev(
                     "UserPromptSubmit",
-                    &format!("tm{i}"),
+                    s,
                     json!({"prompt": "почему квазар светит"}),
                 )
             }),
         ),
         (
             "post-tool",
-            Box::new(|_, i| {
+            Box::new(|s: &str| {
                 p.ev(
                     "PostToolUseFailure",
-                    &format!("tm{i}"),
+                    s,
                     json!({"tool_name": "Bash", "error": "/bin/bash^M: bad interpreter"}),
                 )
             }),
         ),
         (
             "checkpoint",
-            Box::new(|_, i| {
-                p.ev(
-                    "Stop",
-                    &format!("tm{i}"),
-                    json!({"stop_hook_active": false}),
-                )
-            }),
+            Box::new(|s: &str| p.ev("Stop", s, json!({"stop_hook_active": false}))),
         ),
     ] {
         let mut failed = Vec::new();
         for a in 0..MARGIN_ATTEMPTS {
-            let (mut times, mut idle) = (Vec::new(), Vec::new());
-            for i in 0..20 {
-                if k == "checkpoint" {
-                    p.hook("pre-tool", &write_ev(&p, &format!("tm{i}"), "a.txt"));
+            // повтор: свежие сессии начинаются, как в первой серии, — до замера и не в замер
+            if a > 0 && k != "session-start" {
+                for i in 0..20 {
+                    let ev = p.ev("SessionStart", &sid(k, a, i), json!({"source": "startup"}));
+                    p.hook("session-start", &ev);
                 }
-                let (o, t) = p.hook_times(&url, k, "claude", mk(a, i).to_string().as_bytes());
-                calls += 1;
+            }
+            let (mut times, mut idle, mut quiet) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..20 {
+                let s = sid(k, a, i);
+                if k == "checkpoint" {
+                    p.hook("pre-tool", &write_ev(&p, &s, "a.txt"));
+                }
+                let (o, t) = p.hook_times(&url, k, "claude", mk(&s).to_string().as_bytes());
                 if ok(&o).trim().is_empty() {
-                    silent.push(format!("{k} #{a}.{i} {:?}", t.inner));
+                    quiet.push(format!("{k} #{}.{i} {:?}", a + 1, t.inner));
                 }
                 times.push(t);
                 idle.push(p.idle(k));
@@ -1633,11 +1641,14 @@ fn hooks_with_server_within_margin() {
                         p95(times.iter().map(|t| t.outer).collect()),
                         a + 1
                     ));
+                    calls += times.len();
+                    silent.extend(quiet);
                     break;
                 }
                 Err(e) => {
                     eprintln!("ZAM_TIMING серия {} не уложилась: {e}", a + 1);
                     failed.push(e);
+                    silent_rejected.extend(quiet);
                 }
             }
         }
@@ -1647,10 +1658,13 @@ fn hooks_with_server_within_margin() {
             failed.join("\n")
         );
     }
-    eprintln!("ZAM_TIMING {}; пустые: {silent:?}", report.join(", "));
+    eprintln!(
+        "ZAM_TIMING {}; пустые: {silent:?}; пустые отвергнутых серий: {silent_rejected:?}",
+        report.join(", ")
+    );
     assert!(
         silent.len() * 20 <= calls,
-        "пустые ответы {silent:?} из {calls} (> 5 %)"
+        "пустые ответы {silent:?} из {calls} вызовов засчитанных серий (> 5 %)"
     );
 }
 

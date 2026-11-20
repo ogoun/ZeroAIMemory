@@ -38,7 +38,7 @@ const PROTECTED: [&str; 12] = [
 /// Аргументы `cargo xtask clean-test-tmp`.
 #[derive(clap::Args)]
 pub struct CleanTestTmpArgs {
-    /// Удалять записи, в которых ничего не менялось дольше: `<число><s|m|h|d>`
+    /// Удалять записи, в которых ничего не менялось дольше: `<число><s|m|h|d>`, не меньше 1m
     #[arg(long, default_value = "6h", value_parser = parse_age)]
     older_than: Duration,
     /// Только показать, что было бы удалено
@@ -49,7 +49,11 @@ pub struct CleanTestTmpArgs {
     target_dir: Option<PathBuf>,
 }
 
-/// Порог возраста `<число><s|m|h|d>` (`90m`, `6h`, `2d`).
+/// Наименьший порог возраста: запись, менявшаяся меньше минуты назад, — почти наверняка данные
+/// запущенного теста (на Linux удаление открытых файлов не отказывает, и тест их потерял бы).
+pub const MIN_AGE: Duration = Duration::from_secs(60);
+
+/// Порог возраста `<число><s|m|h|d>` (`90m`, `6h`, `2d`), не меньше [`MIN_AGE`].
 pub fn parse_age(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let err = || format!("порог «{s}»: ожидается <целое число><s|m|h|d>, например 6h или 90m");
@@ -66,7 +70,16 @@ pub fn parse_age(s: &str) -> Result<Duration, String> {
         return Err(err());
     }
     let n: u64 = num.parse().map_err(|_| err())?;
-    n.checked_mul(secs).map(Duration::from_secs).ok_or_else(err)
+    let age = n
+        .checked_mul(secs)
+        .map(Duration::from_secs)
+        .ok_or_else(err)?;
+    if age < MIN_AGE {
+        return Err(format!(
+            "порог «{s}» меньше 1m: так можно удалить данные запущенного теста"
+        ));
+    }
+    Ok(age)
 }
 
 /// Итог уборки.
@@ -282,11 +295,17 @@ mod tests {
     fn age_parses_units() {
         assert_eq!(parse_age("6h"), Ok(Duration::from_secs(6 * 3600)));
         assert_eq!(parse_age("90m"), Ok(Duration::from_secs(90 * 60)));
-        assert_eq!(parse_age("45s"), Ok(Duration::from_secs(45)));
+        assert_eq!(parse_age("60s"), Ok(MIN_AGE));
+        assert_eq!(parse_age("1m"), Ok(MIN_AGE));
         assert_eq!(parse_age("2d"), Ok(Duration::from_secs(2 * 86400)));
         assert_eq!(parse_age(" 3h "), Ok(Duration::from_secs(3 * 3600)));
         for bad in ["", "6", "h", "6x", "-1h", "1.5h", "6 h"] {
             assert!(parse_age(bad).is_err(), "{bad:?} принят");
+        }
+        // меньше минуты — данные запущенного теста: отказ с причиной
+        for small in ["0s", "45s", "59s", "0m"] {
+            let e = parse_age(small).unwrap_err();
+            assert!(e.contains("меньше 1m"), "{small}: {e}");
         }
     }
 
@@ -429,5 +448,59 @@ mod tests {
         clean(&t, cutoff, false).unwrap();
         assert!(!t.join("test-tmp").join("old").exists());
         assert!(outside.join("precious").exists(), "цель ссылки удалена");
+    }
+
+    /// Windows: junction (`mklink /J`, без прав администратора) удаляется как ссылка — и когда
+    /// он сам старая запись, и когда лежит внутри старой записи; цели (вне подопытного
+    /// `target`, внутри настоящего) целы.
+    #[cfg(windows)]
+    #[test]
+    fn junction_target_is_not_followed() {
+        // `mklink` не принимает `..` и `/`: пути — абсолютные и нормализованные
+        let w = std::path::absolute(work("clean-test-tmp-junction")).unwrap();
+        let junction = |link: &Path, to: &Path| {
+            let st = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(to)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(
+                st.success(),
+                "mklink /J {} {}",
+                link.display(),
+                to.display()
+            );
+            assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        };
+        let (outside_a, outside_b) = (w.join("outside-a"), w.join("outside-b"));
+        for o in [&outside_a, &outside_b] {
+            fs::create_dir_all(o.join("deep")).unwrap();
+            fs::write(o.join("deep").join("precious"), b"x").unwrap();
+        }
+        let tt = w.join("target").join("test-tmp");
+        fs::create_dir_all(tt.join("old-dir")).unwrap();
+        fs::write(tt.join("old-dir").join("f"), b"old").unwrap();
+        junction(&tt.join("old-junction"), &outside_a);
+        junction(&tt.join("old-dir").join("link"), &outside_b);
+        std::thread::sleep(Duration::from_millis(300));
+        let cutoff = SystemTime::now();
+        // свежая запись в цели после отсечки: ссылку она «свежей» не делает — обхода нет
+        fs::write(outside_a.join("deep").join("new"), b"new").unwrap();
+        let r = clean(&w.join("target"), cutoff, false).unwrap();
+        assert!(r.failed.is_empty(), "{:?}", r.failed);
+        let mut removed = r.removed.clone();
+        removed.sort();
+        assert_eq!(removed, vec![tt.join("old-dir"), tt.join("old-junction")]);
+        assert!(fs::symlink_metadata(tt.join("old-junction")).is_err());
+        assert!(!tt.join("old-dir").exists());
+        for o in [&outside_a, &outside_b] {
+            assert!(
+                o.join("deep").join("precious").exists(),
+                "цель junction удалена"
+            );
+        }
+        assert!(outside_a.join("deep").join("new").exists());
     }
 }

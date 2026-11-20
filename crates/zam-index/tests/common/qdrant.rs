@@ -94,11 +94,15 @@ fn max_running() -> usize {
 static RUNNING: Mutex<usize> = Mutex::new(0);
 static FREED: Condvar = Condvar::new();
 
-/// Занятый слот запуска; освобождается в `Drop` (после остановки процесса).
-struct Slot;
+/// Занятый слот запуска; освобождается в `Drop` (после остановки процесса). Тесты, которые
+/// поднимают Qdrant мимо [`TestQdrant`] (управляемый супервизором, проба `kill_parent_probe`),
+/// берут слот сами на весь тест: иначе предел их не касается, и под полным параллелизмом набора
+/// `supervisor.rs` шло до 17 процессов сразу (M6.6, задача 12, ревью).
+pub struct Slot;
 
 impl Slot {
-    fn take() -> Slot {
+    /// Ждёт свободного слота (не больше `ZAM_TEST_QDRANT_MAX` сразу в процессе теста).
+    pub fn take() -> Slot {
         let max = max_running();
         let mut n = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
         while *n >= max {
@@ -124,19 +128,24 @@ pub struct TestQdrant {
     pub http_port: u16,
     pub grpc_port: u16,
     pub api_key: String,
+    /// Процесс остановлен тестом ([`TestQdrant::stop`]): его отсутствие — не сбой.
+    stopped: bool,
     /// Последним полем: слот освобождается после остановки процесса в `Drop`.
     _slot: Slot,
 }
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
+// ---- Ход создания коллекции. Копия: держать дословно одинаковой в
+// ---- `zam-index/tests/common/qdrant.rs` и `zam-server/tests/common/qdrant.rs`.
+
 /// Ход создания коллекции [`zam_index::COLLECTION`]: есть ли она и сколько payload-индексов уже
 /// создано (`storage/collections/<имя>/payload_index.json` Qdrant 1.19 — его дописывает каждый
 /// `create_field_index`). Файл читается без запроса к Qdrant: запрос к коллекции ждал бы
 /// блокировки сегментов, которую держит создание индекса. Под общим прогоном на занятом HDD
 /// один индекс пустой коллекции создаётся 17–35 с (M6.6, задача 12): ожидания, в которые
-/// входит создание коллекции, продлеваются, пока этот ход меняется.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// входит создание коллекции, продлеваются, пока этот ход растёт. Порядок — `(exists, indexes)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct CollectionProgress {
     pub exists: bool,
     pub indexes: usize,
@@ -151,6 +160,73 @@ impl std::fmt::Display for CollectionProgress {
         }
     }
 }
+
+/// [`CollectionProgress`] Qdrant с каталогом данных `dir`. `None` — нет данных: файл индексов
+/// не прочитан или не разобран (занят на время атомарной замены, обрезан) — это не «ноль
+/// индексов».
+pub fn collection_progress(dir: &Path) -> Option<CollectionProgress> {
+    let coll = dir
+        .join("storage")
+        .join("collections")
+        .join(zam_index::COLLECTION);
+    if !coll.join("config.json").is_file() {
+        return Some(CollectionProgress::default());
+    }
+    let indexes = match std::fs::read(coll.join("payload_index.json")) {
+        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b).ok()?["schema"]
+            .as_object()?
+            .len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return None,
+    };
+    Some(CollectionProgress {
+        exists: true,
+        indexes,
+    })
+}
+
+/// Продвижение создания коллекции за одно ожидание: максимум наблюдений и время его последнего
+/// роста. Продвижение — только новый максимум: «мигание» чтения (N → нет данных → N) и
+/// пересоздание коллекции по кругу ожидание не продлевают.
+pub struct ProgressWatch {
+    best: Option<CollectionProgress>,
+    moved: Instant,
+}
+
+impl ProgressWatch {
+    pub fn new(first: Option<CollectionProgress>) -> ProgressWatch {
+        ProgressWatch {
+            best: first,
+            moved: Instant::now(),
+        }
+    }
+
+    /// Учитывает наблюдение (`None` — нет данных, не учитывается).
+    pub fn observe(&mut self, p: Option<CollectionProgress>) {
+        if let Some(p) = p
+            && self.best.is_none_or(|b| p > b)
+        {
+            self.best = Some(p);
+            self.moved = Instant::now();
+        }
+    }
+
+    /// Сколько максимум не растёт.
+    pub fn stalled(&self) -> Duration {
+        self.moved.elapsed()
+    }
+}
+
+impl std::fmt::Display for ProgressWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.best {
+            Some(p) => p.fmt(f),
+            None => f.write_str("нет данных о коллекции"),
+        }
+    }
+}
+
+// ---- конец копии
 
 impl TestQdrant {
     /// Запускает Qdrant и ждёт `GET /readyz` (до 60 с: данные проекта на HDD). Если процесс
@@ -199,6 +275,7 @@ impl TestQdrant {
                         http_port,
                         grpc_port,
                         api_key,
+                        stopped: false,
                         _slot: slot,
                     };
                 }
@@ -213,6 +290,7 @@ impl TestQdrant {
 
     /// Останавливает процесс (данные и порты сохраняются для [`TestQdrant::restart`]).
     pub fn stop(&mut self) {
+        self.stopped = true;
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -227,6 +305,7 @@ impl TestQdrant {
                 self.dir.join("qdrant.log").display()
             );
         }
+        self.stopped = false;
     }
 
     /// pid процесса.
@@ -234,27 +313,19 @@ impl TestQdrant {
         self.child.id()
     }
 
+    /// Процесс завершился сам, без [`TestQdrant::stop`]: ждать коллекцию дальше бессмысленно.
+    pub fn died(&self) -> bool {
+        !self.stopped && !zam_index::supervisor::pid_alive(self.pid())
+    }
+
     /// gRPC-адрес для `QdrantIndex::connect`.
     pub fn grpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.grpc_port)
     }
 
-    /// Ход создания коллекции ([`CollectionProgress`]).
-    pub fn collection_progress(&self) -> CollectionProgress {
-        let coll = self
-            .dir
-            .join("storage")
-            .join("collections")
-            .join(zam_index::COLLECTION);
-        let indexes = std::fs::read(coll.join("payload_index.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v["schema"].as_object().map(serde_json::Map::len))
-            .unwrap_or(0);
-        CollectionProgress {
-            exists: coll.join("config.json").is_file(),
-            indexes,
-        }
+    /// Ход создания коллекции ([`collection_progress`]).
+    pub fn collection_progress(&self) -> Option<CollectionProgress> {
+        collection_progress(&self.dir)
     }
 }
 

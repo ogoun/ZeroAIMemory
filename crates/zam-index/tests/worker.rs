@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::disk::TestDir;
-use common::qdrant::TestQdrant;
+use common::qdrant::{ProgressWatch, TestQdrant};
 use zam_core::Id;
 use zam_index::{
     PassageEmbedder, QdrantIndex, ReindexRequest, VectorFilter, VectorIndex, WorkerConfig,
@@ -280,24 +280,34 @@ impl Env {
         w.status().last_reindex.unwrap().result.unwrap()
     }
 
-    /// Ждёт `f`: не дольше [`LIMIT`] без продвижения создания коллекции Qdrant теста
-    /// ([`TestQdrant::collection_progress`]) и [`LIMIT_MAX`] всего.
+    /// Ждёт `f`: не дольше [`LIMIT`] без роста создания коллекции Qdrant теста
+    /// ([`ProgressWatch`]) и [`LIMIT_MAX`] всего; Qdrant завершился сам — отказ сразу. Дольше
+    /// [`LIMIT`] — строка `ZAM_TIMING`: так в журналах видно, что продление сработало.
     async fn until(&self, what: &str, f: impl AsyncFn() -> bool) {
         let t = Instant::now();
-        let (mut seen, mut moved) = (self._q.collection_progress(), Instant::now());
+        let mut watch = ProgressWatch::new(self._q.collection_progress());
         while !f().await {
-            let now = self._q.collection_progress();
-            if now != seen {
-                seen = now;
-                moved = Instant::now();
-            }
+            watch.observe(self._q.collection_progress());
             assert!(
-                moved.elapsed() < LIMIT && t.elapsed() < LIMIT_MAX,
-                "не дождались за {:?}: {what} (без продвижения — {:?}); Qdrant: {seen}",
+                !self._q.died(),
+                "не дождались: {what} — Qdrant теста завершился (pid {}) за {:?}; Qdrant: {watch}",
+                self._q.pid(),
+                t.elapsed()
+            );
+            assert!(
+                watch.stalled() < LIMIT && t.elapsed() < LIMIT_MAX,
+                "не дождались за {:?}: {what} (без продвижения — {:?}); Qdrant: {watch}",
                 t.elapsed(),
-                moved.elapsed()
+                watch.stalled()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if t.elapsed() > LIMIT {
+            eprintln!(
+                "ZAM_TIMING {what}: дождались за {:?} — дольше прежнего предела {LIMIT:?}, \
+                 продление по ходу создания коллекции; Qdrant: {watch}",
+                t.elapsed()
+            );
         }
     }
 }

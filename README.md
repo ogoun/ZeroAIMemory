@@ -745,9 +745,11 @@ cargo build --release -p zam-cli                   # отдельной кома
   следующий запуск набора.
 - Данные тестов копятся в `target/tmp`, `target/<сборка>/tmp` (при `CARGO_TARGET_DIR`) и
   `target/test-tmp`. Убрать их можно командой `cargo xtask clean-test-tmp [--older-than 6h]
-  [--dry-run]`. Она удаляет только записи, в дереве которых ничего не менялось дольше порога,
-  поэтому данные запущенных тестов остаются. `target/tags`, `target/models`, `target/deps`,
-  `target/deps-cache`, `target/dist`, `target/release` и всё вне `target/` команда не трогает.
+  [--dry-run] [--target-dir DIR]`. Она удаляет только записи, в дереве которых ничего не
+  менялось дольше порога (не меньше 1m), поэтому данные запущенных тестов остаются.
+  `target/tags`, `target/models`, `target/deps`, `target/deps-cache`, `target/dist`,
+  `target/release` и всё вне `target/` команда не трогает. `--target-dir` убирает вместо
+  `target/` другой каталог, но только внутри `target/` — например, копию для проверки.
 - CI дополнительно проверяет `cargo fmt --check` и `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ### Команды xtask
@@ -765,7 +767,7 @@ cargo build --release -p zam-cli                   # отдельной кома
 | `code-bench [--repo <путь>]` | замеры карты кода (M5.6) на копии `HEAD` репозитория: первая и повторная `zam code sync`, правка и удаление файла, вторая копия, `GET /code/map` 200–2000 токенов, ключевые типы среди центральных, `zam --version` и запуск фоновой синхронизации p95 → `.tmp/m56/bench/report.json` |
 | `bench --profile cpu\|gpu [--notes N] [--phase …]… [--keep] [--reuse]` | замеры целей §17 ТЗ на корпусе eval с копиями до 10 000 заметок: поиск при пустой и полной очереди, FTS-only, реранк, индексация, запись, reindex, RSS, старт, падение Qdrant |
 | `ab --transcripts D --runs eval/ab/runs.toml [--server URL] [--out F] [--allow-missing]` | агентный A/B (M6): отчёт по плечам с интервалами из журналов агента (только поля `usage`) и `GET /sessions/{id}` сервера; методика — [eval/README.md](eval/README.md), «Агентный A/B» |
-| `clean-test-tmp [--older-than 6h] [--dry-run]` | уборка данных тестов: записи `target/tmp`, `target/<сборка>/tmp` и `target/test-tmp`, в дереве которых ничего не менялось дольше порога (`<число><s\|m\|h\|d>`) |
+| `clean-test-tmp [--older-than 6h] [--dry-run] [--target-dir DIR]` | уборка данных тестов: записи `target/tmp`, `target/<сборка>/tmp` и `target/test-tmp`, в дереве которых ничего не менялось дольше порога (`<число><s\|m\|h\|d>`, не меньше 1m); `--target-dir` — другой каталог, только внутри `target/` |
 | `transfer-check seed\|verify\|bindings` | проверка переезда на другую машину (M6): корпус и ожидания на старом сервере, те же данные на новом после `restore` (`--no-key` — без мастер-ключа), базы без прежнего каталога данных и имени машины |
 
 ```

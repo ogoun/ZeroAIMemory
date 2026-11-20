@@ -4,6 +4,11 @@
 //! Каждый тест — свой каталог данных под `CARGO_TARGET_TMPDIR` и свои порты 127.0.0.1. Данные
 //! успешного теста удаляются ([`TestDir`]); тест, пишущий в Qdrant, сначала проверяет место на
 //! диске ([`common::disk::enough_disk`]: мало — `SKIP`, в CI и с `ZAM_REQUIRE_DISK=1` — падение).
+//! Тест, который поднимает Qdrant (супервизор, проба), первой строкой берёт слот запуска
+//! [`common::qdrant::Slot`] на весь тест — предел `ZAM_TEST_QDRANT_MAX`, как у `TestQdrant`: при
+//! полном параллелизме без него шло до 17 процессов сразу, и тесты со сроками («Ready (повтор)»,
+//! «WAL не подтверждён») падали от взаимной нагрузки (M6.6, задача 12, ревью). Слот не кладётся
+//! в [`TestDir`] и `FlushRun`: четыре каталога `flush_run` заняли бы четыре слота.
 
 mod common;
 
@@ -179,6 +184,7 @@ const RESTART_LIMIT: Duration = Duration::from_secs(20);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_ready_restart_with_collection_and_clean_shutdown() {
+    let _slot = common::qdrant::Slot::take();
     if !enough_disk("start_ready_restart_with_collection_and_clean_shutdown") {
         return;
     }
@@ -275,6 +281,7 @@ async fn start_ready_restart_with_collection_and_clean_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_kill_restarts_and_five_crashes_break() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("crash");
     let sup = Supervisor::start(SupervisorConfig::Managed(managed()), &dir)
         .await
@@ -327,6 +334,7 @@ async fn external_kill_restarts_and_five_crashes_break() {
 /// подняться за время проверки.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_alive_drops_right_after_kill() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("alive");
     let mut cfg = managed();
     cfg.restart.initial = Duration::from_secs(3);
@@ -362,6 +370,7 @@ async fn process_alive_drops_right_after_kill() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn old_stamp_wipes_storage_and_sets_rebuilt() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("stamp");
     let qdir = dir.join("qdrant");
     std::fs::create_dir_all(qdir.join("storage")).unwrap();
@@ -399,6 +408,7 @@ async fn old_stamp_wipes_storage_and_sets_rebuilt() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn storage_panic_is_detected_wiped_and_restarted_once() {
+    let _slot = common::qdrant::Slot::take();
     if !enough_disk("storage_panic_is_detected_wiped_and_restarted_once") {
         return;
     }
@@ -450,6 +460,7 @@ async fn storage_panic_is_detected_wiped_and_restarted_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_supervisor_on_same_dir_is_lock_error_and_reset_refuses() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("lock");
     let cfg = managed();
     let a = Supervisor::start(SupervisorConfig::Managed(cfg.clone()), &dir)
@@ -475,6 +486,7 @@ async fn second_supervisor_on_same_dir_is_lock_error_and_reset_refuses() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn orphan_from_pid_file_is_killed() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("orphan");
     let cfg = managed();
     // Первый запуск генерирует конфиг в <data_dir>/qdrant/config/zam.yaml.
@@ -531,6 +543,7 @@ async fn orphan_from_pid_file_is_killed() {
 /// опознать как нашего сироту) держит наш порт и отвечает как Qdrant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reset_refuses_while_live_qdrant_holds_our_port() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("reset-live");
     let cfg = managed();
     let sup = Supervisor::start(SupervisorConfig::Managed(cfg.clone()), &dir)
@@ -593,6 +606,8 @@ fn wait_listening(port: u16) {
 /// его не трогаем, pid-файл просто удаляется.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_pid_file_of_foreign_qdrant_is_not_killed() {
+    // один слот на два процесса: `TestQdrant` уже держит слот запуска, второй
+    // (`Slot::take` для управляемого Qdrant) при `ZAM_TEST_QDRANT_MAX=1` заблокировал бы тест
     let foreign = TestQdrant::start("foreign");
     let fpid = foreign.pid();
     let dir = data_dir("foreign");
@@ -654,6 +669,7 @@ async fn missing_binary_is_broken_and_external_has_no_process() {
 /// Windows, PDEATHSIG на Linux.
 #[test]
 fn qdrant_dies_with_killed_parent() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("parent");
     let cfg = managed();
     let mut probe = Command::new(env!("CARGO_BIN_EXE_kill_parent_probe"))
@@ -712,6 +728,7 @@ fn collection_config(dir: &Path) -> serde_json::Value {
 /// (в `UpdateCollection` нет `wal_config`) — он остаётся прежним до пересоздания.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_renders_flush_interval_and_wal() {
+    let _slot = common::qdrant::Slot::take();
     if !enough_disk("config_renders_flush_interval_and_wal") {
         return;
     }
@@ -847,6 +864,7 @@ async fn flush_run(
 /// предел — не ждёт.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_waits_for_flush_bounded() {
+    let _slot = common::qdrant::Slot::take();
     // интервал сброса 1 с, предел 30 с: дожидается подтверждения раньше предела (на HDD
     // два прохода фонового сброса — 6–10 с, задача 19)
     let Some(full) = flush_run(
@@ -980,6 +998,7 @@ async fn unacked(test: &str, name: &str, cap: Duration) -> Option<(TestDir, Supe
 /// предела (`timeout`), а не переходит на паузу по времени.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_first_index_means_nothing_acked() {
+    let _slot = common::qdrant::Slot::take();
     let Some((dir, sup)) = unacked(
         "missing_first_index_means_nothing_acked",
         "noack",
@@ -1008,6 +1027,7 @@ async fn missing_first_index_means_nothing_acked() {
 /// неподтверждённых неизвестно (`None`), ожидание — пауза по времени (`time`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreadable_first_index_falls_back_to_time() {
+    let _slot = common::qdrant::Slot::take();
     let Some((dir, sup)) = unacked(
         "unreadable_first_index_falls_back_to_time",
         "badack",

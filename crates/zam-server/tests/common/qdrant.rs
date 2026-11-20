@@ -123,36 +123,65 @@ pub struct TestQdrant {
     pub http_port: u16,
     pub grpc_port: u16,
     pub api_key: String,
+    /// Процесс остановлен тестом ([`TestQdrant::stop`]): его отсутствие — не сбой.
+    stopped: bool,
     /// Последним полем: слот освобождается после остановки процесса в `Drop`.
     _slot: Slot,
 }
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// Каталоги запущенных [`TestQdrant`] по gRPC-порту: по адресу из конфигурации сервера
-/// ([`data_dir_of`]) ожидание готовности видит, как идёт создание коллекции.
-static DIRS: Mutex<Vec<(u16, PathBuf)>> = Mutex::new(Vec::new());
+/// Запущенный [`TestQdrant`] в реестре ([`registered`]): каталог данных и `pid` (0 — остановлен
+/// тестом).
+#[derive(Debug, Clone)]
+pub struct Registered {
+    pub grpc_port: u16,
+    pub dir: PathBuf,
+    pub pid: u32,
+}
 
-/// Каталог данных [`TestQdrant`] с gRPC-адресом `grpc_url` (`http://127.0.0.1:<порт>`); не
-/// тестовый Qdrant (управляемый супервизором, чужой) — `None`.
-pub fn data_dir_of(grpc_url: &str) -> Option<PathBuf> {
+impl Registered {
+    /// Процесс завершился сам, без [`TestQdrant::stop`].
+    pub fn died(&self) -> bool {
+        self.pid != 0 && !zam_index::supervisor::pid_alive(self.pid)
+    }
+}
+
+/// Реестр запущенных [`TestQdrant`]: по адресу из конфигурации сервера ожидание готовности
+/// видит, как идёт создание коллекции и жив ли процесс.
+static REGISTRY: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
+
+/// `pid` записи реестра с gRPC-портом `port` (0 — остановлен тестом).
+fn set_registered_pid(port: u16, pid: u32) {
+    let mut reg = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(r) = reg.iter_mut().find(|r| r.grpc_port == port) {
+        r.pid = pid;
+    }
+}
+
+/// [`TestQdrant`] с gRPC-адресом `grpc_url` (`http://127.0.0.1:<порт>`); не тестовый Qdrant
+/// (управляемый супервизором, чужой) — `None`.
+pub fn registered(grpc_url: &str) -> Option<Registered> {
     let port: u16 = grpc_url
         .rsplit_once(':')?
         .1
         .trim_end_matches('/')
         .parse()
         .ok()?;
-    let dirs = DIRS.lock().unwrap_or_else(|p| p.into_inner());
-    dirs.iter()
-        .find(|(p, _)| *p == port)
-        .map(|(_, d)| d.clone())
+    let reg = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    reg.iter().find(|r| r.grpc_port == port).cloned()
 }
 
-/// Ход создания коллекции [`zam_index::COLLECTION`]: есть ли она и сколько payload-индексов
-/// уже создано (`storage/collections/<имя>/payload_index.json` Qdrant 1.19 — его дописывает
-/// каждый `create_field_index`). Файл читается без запроса к Qdrant: запрос к коллекции ждал бы
-/// блокировки сегментов, которую держит создание индекса.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// ---- Ход создания коллекции. Копия: держать дословно одинаковой в
+// ---- `zam-index/tests/common/qdrant.rs` и `zam-server/tests/common/qdrant.rs`.
+
+/// Ход создания коллекции [`zam_index::COLLECTION`]: есть ли она и сколько payload-индексов уже
+/// создано (`storage/collections/<имя>/payload_index.json` Qdrant 1.19 — его дописывает каждый
+/// `create_field_index`). Файл читается без запроса к Qdrant: запрос к коллекции ждал бы
+/// блокировки сегментов, которую держит создание индекса. Под общим прогоном на занятом HDD
+/// один индекс пустой коллекции создаётся 17–35 с (M6.6, задача 12): ожидания, в которые
+/// входит создание коллекции, продлеваются, пока этот ход растёт. Порядок — `(exists, indexes)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct CollectionProgress {
     pub exists: bool,
     pub indexes: usize,
@@ -168,22 +197,72 @@ impl std::fmt::Display for CollectionProgress {
     }
 }
 
-/// [`CollectionProgress`] Qdrant с каталогом данных `dir`.
-pub fn collection_progress(dir: &Path) -> CollectionProgress {
+/// [`CollectionProgress`] Qdrant с каталогом данных `dir`. `None` — нет данных: файл индексов
+/// не прочитан или не разобран (занят на время атомарной замены, обрезан) — это не «ноль
+/// индексов».
+pub fn collection_progress(dir: &Path) -> Option<CollectionProgress> {
     let coll = dir
         .join("storage")
         .join("collections")
         .join(zam_index::COLLECTION);
-    let indexes = std::fs::read(coll.join("payload_index.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v["schema"].as_object().map(serde_json::Map::len))
-        .unwrap_or(0);
-    CollectionProgress {
-        exists: coll.join("config.json").is_file(),
+    if !coll.join("config.json").is_file() {
+        return Some(CollectionProgress::default());
+    }
+    let indexes = match std::fs::read(coll.join("payload_index.json")) {
+        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b).ok()?["schema"]
+            .as_object()?
+            .len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return None,
+    };
+    Some(CollectionProgress {
+        exists: true,
         indexes,
+    })
+}
+
+/// Продвижение создания коллекции за одно ожидание: максимум наблюдений и время его последнего
+/// роста. Продвижение — только новый максимум: «мигание» чтения (N → нет данных → N) и
+/// пересоздание коллекции по кругу ожидание не продлевают.
+pub struct ProgressWatch {
+    best: Option<CollectionProgress>,
+    moved: Instant,
+}
+
+impl ProgressWatch {
+    pub fn new(first: Option<CollectionProgress>) -> ProgressWatch {
+        ProgressWatch {
+            best: first,
+            moved: Instant::now(),
+        }
+    }
+
+    /// Учитывает наблюдение (`None` — нет данных, не учитывается).
+    pub fn observe(&mut self, p: Option<CollectionProgress>) {
+        if let Some(p) = p
+            && self.best.is_none_or(|b| p > b)
+        {
+            self.best = Some(p);
+            self.moved = Instant::now();
+        }
+    }
+
+    /// Сколько максимум не растёт.
+    pub fn stalled(&self) -> Duration {
+        self.moved.elapsed()
     }
 }
+
+impl std::fmt::Display for ProgressWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.best {
+            Some(p) => p.fmt(f),
+            None => f.write_str("нет данных о коллекции"),
+        }
+    }
+}
+
+// ---- конец копии
 
 impl TestQdrant {
     /// Запускает Qdrant и ждёт `GET /readyz` (до 60 с: данные проекта на HDD). Если процесс
@@ -224,15 +303,21 @@ impl TestQdrant {
             let mut child = spawn(&bin, &dir, &api_key);
             match wait_ready(&mut child, &dir, http_port, grpc_port) {
                 Ok(()) => {
-                    DIRS.lock()
+                    REGISTRY
+                        .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .push((grpc_port, dir.clone()));
+                        .push(Registered {
+                            grpc_port,
+                            dir: dir.clone(),
+                            pid: child.id(),
+                        });
                     return TestQdrant {
                         child,
                         dir,
                         http_port,
                         grpc_port,
                         api_key,
+                        stopped: false,
                         _slot: slot,
                     };
                 }
@@ -247,6 +332,8 @@ impl TestQdrant {
 
     /// Останавливает процесс (данные и порты сохраняются для [`TestQdrant::restart`]).
     pub fn stop(&mut self) {
+        self.stopped = true;
+        set_registered_pid(self.grpc_port, 0);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -261,11 +348,18 @@ impl TestQdrant {
                 self.dir.join("qdrant.log").display()
             );
         }
+        self.stopped = false;
+        set_registered_pid(self.grpc_port, self.child.id());
     }
 
     /// pid процесса.
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Процесс завершился сам, без [`TestQdrant::stop`]: ждать коллекцию дальше бессмысленно.
+    pub fn died(&self) -> bool {
+        !self.stopped && !zam_index::supervisor::pid_alive(self.pid())
     }
 
     /// gRPC-адрес для `QdrantIndex::connect`.
@@ -274,7 +368,7 @@ impl TestQdrant {
     }
 
     /// Ход создания коллекции ([`collection_progress`]).
-    pub fn collection_progress(&self) -> CollectionProgress {
+    pub fn collection_progress(&self) -> Option<CollectionProgress> {
         collection_progress(&self.dir)
     }
 
@@ -401,9 +495,10 @@ fn readyz(port: u16) -> bool {
 
 impl Drop for TestQdrant {
     fn drop(&mut self) {
-        DIRS.lock()
+        REGISTRY
+            .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .retain(|(p, _)| *p != self.grpc_port);
+            .retain(|r| r.grpc_port != self.grpc_port);
         // Тестовый процесс — жёсткое завершение; штатную остановку делает супервизор (задача 6).
         let _ = self.child.kill();
         let _ = self.child.wait();
