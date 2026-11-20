@@ -68,7 +68,7 @@ Qdrant пути длиннее 260 символов выдерживает. С �
    Для скриптов в Linux — чтение без отображения:
 
    ```
-   read -rs -p 'Пароль: ' PW && echo >&2 && printf '%s\n' "$PW" | zam-server hash-password; unset PW
+   IFS= read -rs -p 'Пароль: ' PW && echo >&2 && printf '%s\n' "$PW" | zam-server hash-password; unset PW
    ```
 2. Переменная окружения `ZAM_ADMIN_PASSWORD` (пароль хэшируется в памяти; удобно для проверки).
 
@@ -143,11 +143,12 @@ zam-server serve --config config.toml
 
 Пример (Linux, `curl` и `jq`): пароль вводится без отображения и не попадает ни в историю, ни в
 аргументы команд (`printf` — встроенная команда bash, `jq` читает пароль из stdin); cookie — в
-файле `jar`, доступном только владельцу (`umask 077` действует до конца сеанса оболочки):
+файле `jar`, доступном только владельцу (`umask 077` — на время примера: команды можно
+выполнять по одной, подставив `<id>` из списка, а прежний umask возвращает последняя строка):
 
 ```bash
-umask 077
-read -rs -p 'Пароль администратора: ' PW && echo >&2
+old_umask=$(umask); umask 077
+IFS= read -rs -p 'Пароль администратора: ' PW && echo >&2
 CSRF=$(printf '%s' "$PW" | jq -Rs '{login: "admin", password: .}' |
   curl -sf -c jar -H 'Content-Type: application/json' --data-binary @- \
     http://localhost:7700/api/v1/auth/login | jq -r .csrf); unset PW
@@ -156,18 +157,20 @@ curl -sf -b jar -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"name": "laptop", "access": "rw"}' \
   http://localhost:7700/api/v1/admin/users/<id>/tokens | jq -r .plaintext
 curl -sf -b jar -H "x-csrf-token: $CSRF" -X POST http://localhost:7700/api/v1/auth/logout
-rm -f jar
+rm -f jar; umask "$old_umask"
 ```
 
-То же в Windows PowerShell 5.1 (`-WebSession` хранит cookie; тело — байтами UTF-8, чтобы пароль
-с не-ASCII символами не перекодировался):
+То же в Windows PowerShell 5.1 (`-WebSession` хранит cookie; логин — из
+`GetNetworkCredential().UserName`, без префикса домена: диалог 5.1 может вернуть `\admin`, и вход
+ответил бы 401; тело — байтами UTF-8, чтобы пароль с не-ASCII символами не перекодировался):
 
 ```powershell
 $c = Get-Credential -UserName admin -Message 'Вход администратора ZeroAIMemory'
-$b = @{ login = $c.UserName; password = $c.GetNetworkCredential().Password } | ConvertTo-Json
+$n = $c.GetNetworkCredential()
+$b = @{ login = $n.UserName; password = $n.Password } | ConvertTo-Json
 $r = Invoke-RestMethod -Method Post http://localhost:7700/api/v1/auth/login -SessionVariable zam `
   -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($b))
-Remove-Variable b, c
+Remove-Variable b, c, n
 Invoke-RestMethod http://localhost:7700/api/v1/admin/users -WebSession $zam
 (Invoke-RestMethod -Method Post http://localhost:7700/api/v1/admin/users/<id>/tokens `
   -WebSession $zam -Headers @{ 'x-csrf-token' = $r.csrf } -ContentType 'application/json' `
@@ -1799,9 +1802,10 @@ export`) — ещё и без пространства Human и отчётов: 
 
 ## Обновление
 
-Порядок: копия каталога данных, затем остановка сервера, замена файлов комплекта (конфигурацию и
-каталог данных не трогайте) и запуск: миграции баз применяются автоматически, копия файла
-создаётся перед миграцией.
+Порядок: копия каталога данных (`zam-server backup` — на работающем сервере; ручная копия —
+только после остановки), остановка сервера, замена файлов комплекта (конфигурацию и каталог
+данных не трогайте), запуск: миграции баз применяются автоматически, копия файла создаётся перед
+миграцией.
 
 **Сначала — копия каталога данных до обновления.** Лучше — `zam-server backup` прежнего
 комплекта (с 0.0.11-m6; сервер можно не останавливать): копия каждой базы согласованна и
