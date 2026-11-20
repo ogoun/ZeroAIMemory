@@ -926,9 +926,9 @@ docs/              # ТЗ, планы, исследования, журнал р
 
 | Документ | Что там |
 |---|---|
-| [docs/specs/2026-10-17-zeroaimemory-tz.md](docs/specs/2026-10-17-zeroaimemory-tz.md) | техническое задание (v1.25): цели, архитектура, модель данных, поиск, API, этапы |
+| [docs/specs/2026-10-17-zeroaimemory-tz.md](docs/specs/2026-10-17-zeroaimemory-tz.md) | техническое задание (v1.26): цели, архитектура, модель данных, поиск, API, этапы |
 | [deploy/README-install.md](deploy/README-install.md) | установка и эксплуатация: первый запуск, подключение агента, CLI, Qdrant, модели, GPU, reindex, прокси, перенос на другую машину, обновление и откат |
-| [docs/api-compat.md](docs/api-compat.md) | для своих клиентов: правило совместимости `/api/v1`, флаги `features`, явная сессия, `timeout_ms`, `Idempotency-Key`, разбор идей |
+| [docs/api-compat.md](docs/api-compat.md) | для своих клиентов: правило совместимости `/api/v1`, флаги `features`, явная сессия, `timeout_ms`, `Idempotency-Key`, разбор идей, перенос записи Vault, усечение выдачи поиска (`omitted`), закрытие задачи, подсказки к запросу |
 | [docs/plans/](docs/plans/) | планы реализации этапов (M0–M6.6) и журналы их выполнения |
 | [docs/research/](docs/research/) | исследования: аналоги, MD-движки, стек, аудит библиотек, индекс и ML |
 | [docs/journal.md](docs/journal.md) | журнал работ: решения, прогоны, замеры |

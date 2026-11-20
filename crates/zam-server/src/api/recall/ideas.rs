@@ -1075,10 +1075,8 @@ impl QueueHead {
     ///
     /// [`recall`]: super::recall
     pub(super) fn line(&self, ideas: &[Cand]) -> Vec<Cand> {
-        // `ahead` — подсказки-идеи только этой цели (базы владельца), а `recall` берёт первые
-        // `ideas.prompt_max` по всем целям, в том числе общие идеи Knowledge: идея решения,
-        // которую вытеснит подсказка Knowledge, может выпасть из строки этого ответа и из
-        // « (ещё N)» — строка придёт к следующему ответу (ревью задачи 14, вреда нет)
+        // Knowledge — пространство той же личной цели: `ahead` совпадает с отбором
+        // подсказок-идей `recall`; других целей у владельца в области `prompt` нет
         let ahead: HashSet<Id> = ideas
             .iter()
             .filter(|c| c.target == self.target && !self.seen_any.contains(&c.tref.id))

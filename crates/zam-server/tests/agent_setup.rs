@@ -1318,7 +1318,8 @@ async fn guide_vault_scope_and_delete_rule() {
 
 /// Протокол (M6.6, замечание 34 обкатки): раздел задач (ru, en) — работа по плану из N шагов —
 /// N задач со связью `part_of` к общей, статус на каждом переходе, общая закрывается после
-/// выпуска. Правило — только в протоколе: блока v8 оно не касается.
+/// выпуска; общая — с планом в теле (и задача из разбора идеи), у исхода `plan` разбора — та же
+/// оговорка. Правило — только в протоколе: блока v8 оно не касается.
 #[tokio::test]
 async fn guide_plan_steps_are_part_of_tasks() {
     let a = api("agent-guide-plan-steps", |_| {}).await;
@@ -1353,9 +1354,16 @@ async fn guide_plan_steps_are_part_of_tasks() {
         "zam link k:<шаг> part_of k:<общая>",
         "взял шаг — `in_progress` с `next_step`, закончил — `done`",
         "Общая задача закрывается после выпуска",
+        "общая задача — с планом в теле, в том числе задача из разбора идеи",
     ] {
         assert!(ru.contains(want), "{want}: {ru}");
     }
+    // исход `plan` разбора идеи (раздел «Идеи») — та же оговорка о подзадачах
+    let ru_ideas = section(&guide("").await, "## Идеи\n");
+    assert!(
+        ru_ideas.contains("план из многих шагов — ещё подзадачи `part_of`"),
+        "{ru_ideas}"
+    );
     let en = section(&guide("?lang=en").await, "## Tasks and handing work over\n");
     for want in [
         "Work on a plan of N steps",
@@ -1363,9 +1371,15 @@ async fn guide_plan_steps_are_part_of_tasks() {
         "zam link k:<step> part_of k:<umbrella>",
         "took a step — `in_progress` with `next_step`, finished — `done`",
         "The umbrella task is closed after the release",
+        "the umbrella task carries the plan in its body, including a task from an idea review",
     ] {
         assert!(en.contains(want), "{want}: {en}");
     }
+    let en_ideas = section(&guide("?lang=en").await, "## Ideas\n");
+    assert!(
+        en_ideas.contains("a plan of many steps — also `part_of` subtasks"),
+        "{en_ideas}"
+    );
 }
 
 /// Протокол (M5.6): раздел о карте кода (ru, en) и три фразы, перенесённые из блока v5 ради
