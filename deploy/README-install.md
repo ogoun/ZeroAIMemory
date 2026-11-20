@@ -141,12 +141,14 @@ zam-server serve --config config.toml
    — 201 `{"info": {…, "prefix": "zam_XXXXXXXX"}, "plaintext": "<токен>"}`: токен целиком
    показывается один раз. Человеческих токенов нет: `"human": true` — 400.
 
-Пример (Linux, `curl` и `jq`; пароль вводится без отображения и не попадает в историю, cookie —
-в файле `jar`):
+Пример (Linux, `curl` и `jq`): пароль вводится без отображения и не попадает ни в историю, ни в
+аргументы команд (`printf` — встроенная команда bash, `jq` читает пароль из stdin); cookie — в
+файле `jar`, доступном только владельцу (`umask 077` действует до конца сеанса оболочки):
 
 ```bash
+umask 077
 read -rs -p 'Пароль администратора: ' PW && echo >&2
-CSRF=$(jq -n --arg p "$PW" '{login: "admin", password: $p}' |
+CSRF=$(printf '%s' "$PW" | jq -Rs '{login: "admin", password: .}' |
   curl -sf -c jar -H 'Content-Type: application/json' --data-binary @- \
     http://localhost:7700/api/v1/auth/login | jq -r .csrf); unset PW
 curl -sf -b jar http://localhost:7700/api/v1/admin/users | jq '.[] | {id, name}'
@@ -165,10 +167,13 @@ $c = Get-Credential -UserName admin -Message 'Вход администрато�
 $b = @{ login = $c.UserName; password = $c.GetNetworkCredential().Password } | ConvertTo-Json
 $r = Invoke-RestMethod -Method Post http://localhost:7700/api/v1/auth/login -SessionVariable zam `
   -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($b))
+Remove-Variable b, c
 Invoke-RestMethod http://localhost:7700/api/v1/admin/users -WebSession $zam
 (Invoke-RestMethod -Method Post http://localhost:7700/api/v1/admin/users/<id>/tokens `
   -WebSession $zam -Headers @{ 'x-csrf-token' = $r.csrf } -ContentType 'application/json' `
   -Body '{"name": "laptop", "access": "rw"}').plaintext
+Invoke-RestMethod -Method Post http://localhost:7700/api/v1/auth/logout -WebSession $zam `
+  -Headers @{ 'x-csrf-token' = $r.csrf } | Out-Null
 ```
 
 Сессия пользователя WebUI (не администратора) на админ-маршруты получает 403 «только
@@ -1794,12 +1799,14 @@ export`) — ещё и без пространства Human и отчётов: 
 
 ## Обновление
 
-Остановите сервер, замените файлы комплекта (конфигурацию и каталог данных не трогайте),
-запустите сервер: миграции баз применяются автоматически, копия файла создаётся перед миграцией.
+Порядок: копия каталога данных, затем остановка сервера, замена файлов комплекта (конфигурацию и
+каталог данных не трогайте) и запуск: миграции баз применяются автоматически, копия файла
+создаётся перед миграцией.
 
-**Копия каталога данных до обновления.** Лучше — `zam-server backup` прежнего комплекта (с
-0.0.11-m6; сервер можно не останавливать): копия каждой базы согласованна и проверена — код 0
-означает, что суммы SHA-256 из `manifest.json` сошлись (см. «Перенос на другую машину», шаг 1):
+**Сначала — копия каталога данных до обновления.** Лучше — `zam-server backup` прежнего
+комплекта (с 0.0.11-m6; сервер можно не останавливать): копия каждой базы согласованна и
+проверена — код 0 означает, что суммы SHA-256 из `manifest.json` сошлись (см. «Перенос на другую
+машину», шаг 1):
 
 ```
 zam-server backup --config <config.toml>                    # каталог <data_dir>/backups/<время>/
@@ -1814,14 +1821,16 @@ zam-server backup --config <config.toml> --dir <каталог>    # или --zi
 Btrfs со сжатием он показывает место на диске, а не объём файлов (при обкатке 0.0.12-m6.5 —
 251 КБ у каталога в 503 МБ), и копия на другой файловой системе выглядит «не того размера».
 Сравнивайте объём файлов — `du -sh --apparent-size <каталог>` (GNU coreutils) у оригинала и копии
-— или список и размеры баз:
+— или список и размеры всех файлов (базы, блобы вложений и прочее):
 
 ```bash
-# Linux: размер и путь от корня каталога; diff молчит — базы скопированы целиком
-find /var/lib/zeroaimemory -name '*.db*' -printf '%s %P\n' | sort -k2 > orig.txt
-find /backup/zam-data -name '*.db*' -printf '%s %P\n' | sort -k2 > copy.txt
+# Linux: размер и путь от корня каталога; diff молчит — скопировано всё
+find /var/lib/zeroaimemory -type f -printf '%s %P\n' | sort -k2 > orig.txt
+find /backup/zam-data -type f -printf '%s %P\n' | sort -k2 > copy.txt
 diff orig.txt copy.txt && echo 'копия совпадает'
 ```
+
+Быстрая сверка только баз — то же с `-name '*.db*'` вместо `-type f`.
 
 ```powershell
 # Windows: объём файлов оригинала и копии (Length — размер файла, не место на диске)
@@ -2160,8 +2169,8 @@ diff orig.txt copy.txt && echo 'копия совпадает'
 - сохраните текущие базы целиком, чтобы можно было вернуться на новую версию: при
   остановленном сервере скопируйте каталог данных или хотя бы `system.db`, `users/*.db`
   **вместе с их `-wal` и `-shm`**, если они есть (сейчас работает 0.0.11-m6 или новее — удобнее
-  `zam-server backup`). Копию проверяйте не `du -sh`, а объёмом файлов или сверкой списка баз —
-  см. «Копия каталога данных до обновления» в начале раздела.
+  `zam-server backup`). Копию проверяйте не `du -sh`, а объёмом файлов или сверкой списка
+  файлов — см. «Сначала — копия каталога данных до обновления» в начале раздела.
 
 **Как подложить копию (для любого отката).** Базы открываются в режиме WAL: рядом с
 `system.db` и `users/<id>.db` живут `system.db-wal`/`system.db-shm` и

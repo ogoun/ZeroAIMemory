@@ -54,6 +54,19 @@ async fn get(a: &Api, id: &str) -> Value {
     r.json()
 }
 
+/// Ревизии записи (`GET …/revisions`, `items`), от первой к последней.
+async fn revisions(a: &Api, id: &str) -> Vec<Value> {
+    let r = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/entries/{id}/revisions"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"].as_array().unwrap().clone()
+}
+
 /// PATCH токеном администратора с `If-Match` текущей ревизии.
 async fn patch(a: &Api, id: &str, body: Value) -> Resp {
     a.tok_rev(
@@ -240,16 +253,8 @@ async fn task_reopen_requires_reason() {
     assert_eq!(j["status"], "open");
     assert!(j["data"].get("done_at").is_none(), "{j}");
     assert!(j["data"]["started_at"].is_string());
-    let revs = a
-        .t(
-            Method::GET,
-            &format!("/api/v1/entries/{tid}/revisions"),
-            None,
-        )
-        .await
-        .json();
     assert_eq!(
-        revs["items"].as_array().unwrap().last().unwrap()["reason"],
+        revisions(&a, &tid).await.last().unwrap()["reason"],
         "нашли баг"
     );
     // из любого статуса — в dropped; и из dropped — только в open
@@ -303,15 +308,7 @@ async fn claim_free_expired_same_session() {
     assert!((29 * 60..=30 * 60).contains(&left), "{left}");
     assert_eq!(j["rev"], before["rev"]);
     assert_eq!(j["updated_at"], before["updated_at"]);
-    let revs = a
-        .t(
-            Method::GET,
-            &format!("/api/v1/entries/{tid}/revisions"),
-            None,
-        )
-        .await
-        .json();
-    assert_eq!(revs["items"].as_array().unwrap().len(), 1, "ревизии нет");
+    assert_eq!(revisions(&a, &tid).await.len(), 1, "ревизии нет");
 
     // та же сессия — продление (по умолчанию 120 мин)
     let j = claim(&a, &tid, Some("s1"), json!({})).await.json();
@@ -1028,17 +1025,9 @@ async fn claimed_by_not_in_revision_snapshots() {
         .await
         .json();
     assert_eq!(j["data"]["claimed_by"]["session"], "s1");
-    let revs = a
-        .t(
-            Method::GET,
-            &format!("/api/v1/entries/{tid}/revisions"),
-            None,
-        )
-        .await
-        .json();
-    let items = revs["items"].as_array().unwrap();
-    assert_eq!(items.len(), 3, "{revs}");
-    for r in items {
+    let items = revisions(&a, &tid).await;
+    assert_eq!(items.len(), 3, "{items:?}");
+    for r in &items {
         assert!(r["data"].get("claimed_by").is_none(), "{r}");
     }
     assert_eq!(items[2]["data"]["next_step"], "новый шаг");
@@ -1055,20 +1044,11 @@ async fn claimed_by_not_in_revision_snapshots() {
     assert_eq!(d2["rev"], d1["rev"], "done → done без изменений");
 }
 
-/// `data` ревизий задачи (`GET …/revisions`), от первой к последней.
+/// `data` ревизий задачи, от первой к последней.
 async fn revision_data(a: &Api, id: &str) -> Vec<Value> {
-    let r = a
-        .t(
-            Method::GET,
-            &format!("/api/v1/entries/{id}/revisions"),
-            None,
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    r.json()["items"]
-        .as_array()
-        .unwrap()
-        .iter()
+    revisions(a, id)
+        .await
+        .into_iter()
         .map(|x| x["data"].clone())
         .collect()
 }

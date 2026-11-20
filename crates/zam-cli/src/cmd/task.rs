@@ -384,5 +384,12 @@ mod tests {
             status_body("blocked", Some("n"), Some("b"), Some("r")),
             json!({"status": "blocked", "next_step": "n", "blocked_by": "b", "reason": "r"})
         );
+        // `--next ""` (M6.6, замечание 35: снять шаг задачи, закрытой раньше) — пустая строка
+        // уходит как есть, а не `null`: сервер снимает поле одинаково (`TaskData::apply_patch`,
+        // тест сервера `task_done_with_explicit_next_keeps_it`)
+        assert_eq!(
+            status_body("done", Some(""), None, None),
+            json!({"status": "done", "next_step": ""})
+        );
     }
 }

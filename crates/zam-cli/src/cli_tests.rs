@@ -285,6 +285,21 @@ fn task_fields_and_list_paging() {
     }
 }
 
+/// M6.6, замечание 35: `zam task status <id> done --next ""` — способ снять шаг задачи, закрытой
+/// раньше; clap принимает пустое значение (`Some("")`), тело — `cmd::task::status_body`.
+#[test]
+fn task_status_empty_next_accepted() {
+    let Ok(Cli {
+        cmd: Cmd::Task {
+            cmd: TaskCmd::Status { status, next, .. },
+        },
+    }) = parse(&["task", "status", "k:1", "done", "--next", ""])
+    else {
+        panic!("task status done --next \"\"");
+    };
+    assert_eq!((status.as_str(), next.as_deref()), ("done", Some("")));
+}
+
 /// Ревью задачи 8, M4: отладочные проверки clap по всему дереву команд (имена и синонимы без
 /// повторов, `conflicts_with`, `requires_all`, группы ссылаются на существующие аргументы) — а не
 /// только у подкоманд, которые разбирают другие тесты.
