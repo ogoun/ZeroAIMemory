@@ -7,7 +7,8 @@
 //! - [`check_task_transition`] — переходы статусов: между `open`, `in_progress`, `blocked` —
 //!   любые; в `done`/`dropped` — из любого; из `done`/`dropped` — только в `open` и с причиной.
 //!   `started_at` ставится при первом переходе в `in_progress`, `done_at` — при `done` (снимается
-//!   при переоткрытии), закрытие (`done`/`dropped`) снимает захват;
+//!   при переоткрытии), закрытие (`done`/`dropped`) снимает захват, `next_step` и `blocked_by`
+//!   (явные значения той же правки сильнее; M6.6, замечание 35);
 //! - захват ([`claim_task`], [`release_task`]) — одна транзакция писателя с проверкой текущего
 //!   `claimed_by`; ревизию записи не создаёт (меняется только `entries.data`), аудит ведёт
 //!   вызывающий (сервер: `entry.claim`, `entry.release` в `system.db`);
@@ -248,8 +249,16 @@ impl TaskData {
 
     /// Следы смены статуса: `started_at` при первом `in_progress`, `done_at` при `done` (и снятие
     /// при переоткрытии), снятие захвата при закрытии, `blocked_by` теряется при выходе из
-    /// `blocked` (явное значение той же правки накладывается после — [`TaskData::apply_patch`]).
+    /// `blocked`; переход в `done`/`dropped` снимает `next_step` и `blocked_by` (M6.6, замечание
+    /// 35: у выполненной задачи нет «далее»; прежнее — в истории ревизий), повтор того же
+    /// статуса — не переход. Явное значение той же правки накладывается после —
+    /// [`TaskData::apply_patch`].
     pub fn on_transition(&mut self, from: Option<EntryStatus>, to: EntryStatus, now: Timestamp) {
+        let from_status = from.unwrap_or(EntryStatus::Open);
+        if matches!(to, EntryStatus::Done | EntryStatus::Dropped) && from_status != to {
+            self.next_step = None;
+            self.blocked_by = None;
+        }
         match to {
             EntryStatus::InProgress if self.started_at.is_none() => self.started_at = Some(now),
             EntryStatus::Done => {
@@ -682,6 +691,41 @@ mod tests {
         };
         t.on_transition(Some(Blocked), InProgress, t0);
         assert_eq!(t.blocked_by, None);
+    }
+
+    /// M6.6, замечание 35: закрытие (`done`/`dropped`) снимает «следующий шаг» и блокер из
+    /// любого живого статуса; повтор того же статуса — не переход, поля не трогает.
+    #[test]
+    fn closing_clears_next_step_and_blocker() {
+        let t0: Timestamp = "2026-10-28T10:00:00Z".parse().unwrap();
+        let open = || TaskData {
+            next_step: Some("ревью".into()),
+            blocked_by: Some("ждём".into()),
+            ..TaskData::default()
+        };
+        for from in [Open, InProgress, Blocked] {
+            for to in [Done, Dropped] {
+                let mut t = open();
+                t.on_transition(Some(from), to, t0);
+                assert_eq!(t.next_step, None, "{from:?} → {to:?}");
+                assert_eq!(t.blocked_by, None, "{from:?} → {to:?}");
+            }
+        }
+        // задача без статуса в базе читается как open
+        let mut t = open();
+        t.on_transition(None, Done, t0);
+        assert_eq!((t.next_step, t.blocked_by), (None, None));
+        // done → done, dropped → dropped: шаг, заданный после закрытия, остаётся
+        for s in [Done, Dropped] {
+            let mut t = open();
+            t.on_transition(Some(s), s, t0);
+            assert_eq!(t.next_step.as_deref(), Some("ревью"), "{s:?}");
+            assert_eq!(t.blocked_by.as_deref(), Some("ждём"), "{s:?}");
+        }
+        // прочие переходы шаг не трогают
+        let mut t = open();
+        t.on_transition(Some(Open), InProgress, t0);
+        assert_eq!(t.next_step.as_deref(), Some("ревью"));
     }
 
     #[test]
