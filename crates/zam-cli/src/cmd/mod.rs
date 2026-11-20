@@ -56,7 +56,9 @@ pub struct Common {
 /// от `zam-store` не зависит: значение повторено здесь, менять вместе).
 pub const LIST_LIMIT_MAX: u32 = 200;
 
-/// Страницы ленты журнала (`zam insight|task|question|idea list`, M6.6 §9, замечание 16г).
+/// Страницы ленты журнала (`zam insight|task|question|idea list`, M6.6 §9, замечание 16г). У
+/// `zam release list` `--limit` — N новейших по дате после чтения всей ленты: его справку
+/// переопределяет команда (`mut_arg` в `ReleaseCmd::List`).
 #[derive(Args, Debug, Clone, Copy)]
 pub struct Paging {
     /// Записей на странице, 1–200 (вся лента — --all)

@@ -5173,6 +5173,9 @@ async fn mcp_update_entry_triggers_replace() {
 /// Замечание 26 (M6.6 §8): `memory_tree` и `memory_write` разбирают префикс пространства в
 /// `path` по правилу CLI (`rules:`, `rules:/`, `rules:/a`, `rules:a`; `knowledge`, `human`,
 /// `solution`, GUID); `space` и префикс расходятся — ошибка аргумента, совпадают — принято.
+/// Исключение MCP (решение координатора, задача 7): в форме `<слово>:/…` с незнакомым правилу
+/// словом 26-символьный id пространства адресует это пространство, прочее слово (`foo:/…`) —
+/// ошибка аргумента; `слово:x` без косой — путь, как в CLI.
 #[tokio::test]
 async fn mcp_tree_space_prefix() {
     let a = api("mcp-tree-prefix", |_| {}).await;

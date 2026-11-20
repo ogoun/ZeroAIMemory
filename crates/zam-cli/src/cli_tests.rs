@@ -123,6 +123,19 @@ fn scope_flag_global_with_knowledge_alias() {
     }
 }
 
+/// M6.6 §9 (14): у `zam release list` `--limit` — N новейших по дате (лента читается целиком), а
+/// не страница сервера: справка команды переопределяет общую справку `cmd::Paging`; у лент
+/// журналов — прежняя.
+#[test]
+fn release_list_limit_help_newest() {
+    let (limit, _) = arg_help(&["release", "list"], "limit");
+    assert!(limit.contains("Новейших релизов по дате"), "{limit}");
+    let (all, _) = arg_help(&["release", "list"], "all");
+    assert_eq!(all, "Все релизы решения");
+    let (page, _) = arg_help(&["task", "list"], "limit");
+    assert!(page.contains("Записей на странице"), "{page}");
+}
+
 /// M6.6 §9 (16д): значение `--code`, начинающееся с «-», — через «=»; справка это говорит.
 #[test]
 fn term_code_hyphen_value_help() {

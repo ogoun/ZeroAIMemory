@@ -1,5 +1,7 @@
-//! `cargo xtask clean-test-tmp [--older-than 6h] [--dry-run]` — уборка данных тестов в `target/`
-//! (M6.6, задача 12).
+//! `cargo xtask clean-test-tmp [--older-than 6h] [--dry-run] [--target-dir DIR]` — уборка
+//! данных тестов в `target/` (M6.6, задача 12). Порог `--older-than` — не меньше 1m
+//! ([`MIN_AGE`]); `--target-dir` — каталог вместо `target/` репозитория, только внутри него
+//! (проверка на копии).
 //!
 //! Каталоги данных тестов: `target/tmp` (`CARGO_TARGET_TMPDIR` сборки в `target/` и жёсткие
 //! пути модульных тестов), `target/<сборка>/tmp` (сборка с `CARGO_TARGET_DIR=target/<сборка>`:

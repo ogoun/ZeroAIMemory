@@ -1316,6 +1316,58 @@ async fn guide_vault_scope_and_delete_rule() {
     assert!(!en.contains("zam vault add <"), "{en}");
 }
 
+/// Протокол (M6.6, замечание 34 обкатки): раздел задач (ru, en) — работа по плану из N шагов —
+/// N задач со связью `part_of` к общей, статус на каждом переходе, общая закрывается после
+/// выпуска. Правило — только в протоколе: блока v8 оно не касается.
+#[tokio::test]
+async fn guide_plan_steps_are_part_of_tasks() {
+    let a = api("agent-guide-plan-steps", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    let section = |g: &str, head: &str| {
+        g.split(head)
+            .nth(1)
+            .unwrap_or_else(|| panic!("нет {head}"))
+            .split("\n## ")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let ru = section(&guide("").await, "## Задачи и передача работы\n");
+    for want in [
+        "Работа по плану из N шагов",
+        "type: \"part_of\"",
+        "zam link k:<шаг> part_of k:<общая>",
+        "взял шаг — `in_progress` с `next_step`, закончил — `done`",
+        "Общая задача закрывается после выпуска",
+    ] {
+        assert!(ru.contains(want), "{want}: {ru}");
+    }
+    let en = section(&guide("?lang=en").await, "## Tasks and handing work over\n");
+    for want in [
+        "Work on a plan of N steps",
+        "type: \"part_of\"",
+        "zam link k:<step> part_of k:<umbrella>",
+        "took a step — `in_progress` with `next_step`, finished — `done`",
+        "The umbrella task is closed after the release",
+    ] {
+        assert!(en.contains(want), "{want}: {en}");
+    }
+}
+
 /// Протокол (M5.6): раздел о карте кода (ru, en) и три фразы, перенесённые из блока v5 ради
 /// бюджета 500 токенов, — в своих разделах протокола; в блоке их нет.
 #[tokio::test]
