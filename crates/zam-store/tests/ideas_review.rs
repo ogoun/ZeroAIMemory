@@ -13,7 +13,7 @@ use zam_store::{
     NewDecision, NewEntry, NewNote, NewReview, NodePath, REVIEW_MIN_CHARS_DEFAULT, REVIEW_REFS_MAX,
     REVIEWS_MAX, ReviewOutcome, ReviewTask, SpaceKind, StoreError, TaskData, create_entry,
     create_note, create_solution, decide_idea, delete_entry, entry_revisions, get_entry,
-    list_spaces, planned_from_ideas, review_idea, review_queue, update_entry,
+    list_spaces, planned_from_ideas, review_idea, review_queue, review_queue_unseen, update_entry,
 };
 
 // ---------- окружение ----------
@@ -988,6 +988,41 @@ async fn review_queue_order_and_filters() {
     assert_eq!(ids(review_queue(&db, sol, 0).await.unwrap()), (4, vec![]));
     // очередь — одного пространства: идея Knowledge в очередь решения не попадает
     assert_eq!(review_queue(&db, kn, 10).await.unwrap().0, 1);
+}
+
+/// Очередь разбора без показанного (M6.6 §3.5, строка к `prompt`): число идей очереди не из
+/// `exclude` и первая из них в порядке очереди; id вне очереди в `exclude` счёт не меняют; всё
+/// показано или очереди нет — `(0, None)`.
+#[tokio::test]
+async fn review_queue_unseen_skips_excluded() {
+    let (db, sol, kn) = setup("queue-unseen").await;
+    let old = new_idea(&db, sol, "Старая", "human", "normal").await;
+    let young = new_idea(&db, sol, "Новая", "human", "normal").await;
+    let high = new_idea(&db, sol, "Срочная", "human", "high").await;
+    let agents = new_idea(&db, sol, "Идея агента", "agent", "high").await;
+    let first = |(n, e): (usize, Option<Entry>)| (n, e.map(|e| e.id));
+    assert_eq!(
+        first(review_queue_unseen(&db, sol, &[]).await.unwrap()),
+        (3, Some(high.id))
+    );
+    // показанное и id вне очереди (идея агента, случайный) — не считаются
+    let exclude = [high.id, agents.id, Id::new()];
+    assert_eq!(
+        first(review_queue_unseen(&db, sol, &exclude).await.unwrap()),
+        (2, Some(old.id))
+    );
+    let all = [high.id, old.id, young.id];
+    assert_eq!(
+        first(review_queue_unseen(&db, sol, &all).await.unwrap()),
+        (0, None)
+    );
+    assert_eq!(
+        first(review_queue_unseen(&db, kn, &[]).await.unwrap()),
+        (0, None)
+    );
+    // запись — целиком (заголовок для строки)
+    let (_, e) = review_queue_unseen(&db, sol, &[high.id]).await.unwrap();
+    assert_eq!(e.unwrap().title, "Старая");
 }
 
 /// Строка плана: живые задачи `open | in_progress | blocked` с системным ребром `derived_from`

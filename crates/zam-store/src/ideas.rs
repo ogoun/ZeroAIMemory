@@ -2674,6 +2674,34 @@ pub async fn review_queue(
     .await
 }
 
+/// Очередь разбора без показанного (M6.6 §3.5, строка очереди к `prompt`): сколько идей очереди
+/// [`review_queue`] пространства `space` нет в `exclude` (показанное сессии и то, что ответ уже
+/// несёт), и первая из них в порядке очереди (`high` первыми, затем самые старые). Одно чтение:
+/// id очереди без тел, запись — только первой; id вне очереди в `exclude` счёт не меняют.
+pub async fn review_queue_unseen(
+    db: &Db,
+    space: Id,
+    exclude: &[Id],
+) -> Result<(usize, Option<Entry>), StoreError> {
+    let exclude: HashSet<Id> = exclude.iter().copied().collect();
+    db.read(move |c| {
+        let ids: Vec<Id> = {
+            let mut st = c.prepare_cached(&format!(
+                "SELECT e.id {REVIEW_QUEUE_SQL} ORDER BY {PRIORITY_DESC}, e.created_at, e.id"
+            ))?;
+            let rows = st.query_map([space], |r| r.get::<_, Id>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut unseen = ids.into_iter().filter(|id| !exclude.contains(id));
+        let Some(first) = unseen.next() else {
+            return Ok((0, None));
+        };
+        let n = 1 + unseen.count();
+        Ok((n, Some(load_entry(c, first)?)))
+    })
+    .await
+}
+
 /// Порядок `data.priority` по убыванию (`high`, `normal`, `low`; нет — `normal`) — как
 /// [`IdeaPriority::rank`].
 const PRIORITY_DESC: &str = "CASE json_extract(e.data, '$.priority')

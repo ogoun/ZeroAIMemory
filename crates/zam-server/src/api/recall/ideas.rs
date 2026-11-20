@@ -13,7 +13,8 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_search::recall::{
-    CoverageRule, HINT_PREFIX, StemWord, WordMatch, error_terms, prepared_terms, stem_words,
+    CoverageRule, HINT_PREFIX, StemWord, WordMatch, error_terms, hint_line, prepared_terms,
+    stem_words,
 };
 use zam_store::{
     Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, GraphStore, RECALL_PART, SpaceKind,
@@ -282,6 +283,25 @@ fn idea_review_prompt_line(e: &Entry) -> String {
         entry_ref(e),
         idea_title(e)
     )
+}
+
+/// Начало строки очереди разбора к `prompt` после `ZeroAIMemory: ` (M6.6 §3.5).
+const REVIEW_QUEUE_LEAD: &str = "новая идея на разбор ";
+
+/// Строка очереди разбора к `prompt` (M6.6 §3.5) — по образцу подсказки-задачи (M6.6 §3.4):
+/// `ZeroAIMemory: новая идея на разбор «<заголовок до 120>» w:<id>`, при `more` > 0 других
+/// непоказанных идей очереди — ` (ещё <more>)`.
+fn review_queue_line(e: &Entry, more: usize) -> String {
+    let mut s = hint_line(
+        REVIEW_QUEUE_LEAD,
+        &format!("«{}»", idea_title(e)),
+        &[],
+        &entry_ref(e),
+    );
+    if more > 0 {
+        s.push_str(&format!(" (ещё {more})"));
+    }
+    s
 }
 
 /// Строка плана [`PLAN_LINE`]: `n` пунктов плана из идей, следующий — `next`, открытый
@@ -945,6 +965,93 @@ pub(super) async fn prompt_ideas(
         first.extend(more);
     }
     Ok(first)
+}
+
+/// Строка очереди разбора к `prompt` (M6.6 §3.5, замечание 36): в режиме `review` (решает
+/// вызывающий) у владельца базы решения — пространство решения в личной цели (участнику общего
+/// решения — нет), с правом записи ([`ideas_writable`]: разбор с `ro` дал бы 403) — первая идея
+/// очереди [`zam_store::review_queue_unseen`], не показанная этой сессии (`seen_entry_ids`,
+/// [`RECALL_PART`], любая эпоха и ревизия — в том числе разделом дайджеста, пакетом
+/// `idea_review` и подсказкой-идеей прежнего запроса) и не в подсказках-идеях этого ответа
+/// (`ahead` — [`prompt_ideas`]: первые `ideas.prompt_max` непоказанных, как их отбирает
+/// [`recall`]), — одной строкой [`review_queue_line`] с числом остальных таких идей; `reason:
+/// idea_review`, показ — в `session_seen` общим учётом ответа. Строка не зависит от близости к
+/// запросу; `ideas.prompt_max = 0` (подсказок-идей к `prompt` нет) — нет и её
+/// **[решение исполнителя, задача 14]**. Без сессии — без фильтра показанного, как у прочих
+/// подсказок.
+///
+/// Срок — остаток общего срока `prompt` своей копией: не уложился (или сбой чтения — WARN) —
+/// тишина без предупреждений, `recall timeout` эта строка не ставит.
+///
+/// [`recall`]: super::recall
+pub(super) async fn prompt_review_queue(
+    st: &AppState,
+    p: &Principal,
+    session: Option<&RequestSession>,
+    ahead: &[Cand],
+    health: &Health<'_>,
+    deadline: &Deadline,
+) -> Vec<Cand> {
+    let max = st.cfg.ideas.prompt_max as usize;
+    let targets = health.targets();
+    let Some((i, space)) = solution_space(targets) else {
+        return Vec::new();
+    };
+    let t = &targets[i];
+    if max == 0 || t.solution.is_some() || !health.alive[i] || !ideas_writable(p, t) {
+        return Vec::new();
+    }
+    let mut own = Deadline {
+        at: deadline.at,
+        expired: deadline.expired,
+    };
+    let mut exclude: Vec<Id> = match session {
+        Some(s) => {
+            let seen = zam_store::seen_entry_ids(&s.db, &s.touch.id, t.owner, RECALL_PART);
+            match own.step(seen).await {
+                Some(Ok(ids)) => ids,
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "recall: показанное сессии не прочитано, без строки очереди разбора");
+                    return Vec::new();
+                }
+                None => return Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
+    // своё решение — единственная цель области: подсказки-идеи ответа — той же базы
+    let seen: HashSet<Id> = exclude.iter().copied().collect();
+    exclude.extend(
+        ahead
+            .iter()
+            .filter(|c| c.target == i && !seen.contains(&c.tref.id))
+            .take(max)
+            .map(|c| c.tref.id),
+    );
+    let Some(r) = own
+        .step(zam_store::review_queue_unseen(&t.db, space, &exclude))
+        .await
+    else {
+        return Vec::new();
+    };
+    let (n, first) = match r {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "recall: очередь разбора не прочитана");
+            return Vec::new();
+        }
+    };
+    let Some(e) = first else {
+        return Vec::new();
+    };
+    // тестовая задержка (тишина по сроку): только с фичей test-hooks
+    #[cfg(feature = "test-hooks")]
+    if e.title.contains(TEST_SLOW_IDEA_MARK) {
+        test_slow_idea(&mut own).await;
+        return Vec::new();
+    }
+    let block = review_queue_line(&e, n - 1);
+    vec![idea_cand(i, &e, REASON_IDEA_REVIEW, block)]
 }
 
 /// Тестовая «медленная идея» (фича `test-hooks`): шаг сбора идей «не уложился в срок» `d`.

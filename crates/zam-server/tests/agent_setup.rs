@@ -1459,6 +1459,8 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         // M6.5 §8: разбор идей агентом и пункты плана из идей
         "### Разбор идей",
         "### Идеи на разбор",
+        // M6.6 §3.5: строка очереди разбора к любому запросу человека
+        "строкой «новая идея на разбор «…» w:<id>» к любому запросу человека, и к короткой реплике",
         "event=idea_review",
         "action=review",
         "`outcome`",
@@ -1520,6 +1522,7 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         "`w:`",
         "### Idea review",
         "### Идеи на разбор",
+        "as the line “новая идея на разбор «…» w:<id>” (a new idea to review) for any human prompt",
         "event=idea_review",
         "action=review",
         "`outcome`",
