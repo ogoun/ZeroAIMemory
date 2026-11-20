@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use common::disk::TestDir;
 use common::qdrant::TestQdrant;
 use zam_core::Id;
 use zam_index::{
@@ -25,8 +26,13 @@ use zam_store::{
 const DIM: usize = 16;
 const MODEL: &str = "fake/test@00000001";
 /// Предел ожиданий: создание коллекции с payload-индексами на HDD занимает секунды, а при
-/// параллельном прогоне тестов (до 7 процессов Qdrant) — до минуты и больше.
+/// параллельном прогоне тестов (до 7 процессов Qdrant) — до минуты и больше. У [`Env::until`] и
+/// [`Env::indexed`] — предел **без продвижения** создания коллекции Qdrant теста.
 const LIMIT: Duration = Duration::from_secs(240);
+/// Общий предел [`Env::until`], пока создание коллекции продвигается: под общим прогоном на
+/// занятом HDD один payload-индекс создавался ≈ 17 с, и первые четыре теста набора падали на
+/// 240 с с 12–13 индексами из 13 (M6.6, задача 12).
+const LIMIT_MAX: Duration = Duration::from_secs(900);
 
 /// Детерминированная «модель»: вектор из blake3 текста, считает вызовы.
 struct Fake {
@@ -84,6 +90,10 @@ struct Env {
     rules: Id,
     human: Id,
     fake: Arc<Fake>,
+    /// Каталог данных держит лок до конца теста; поля удаляются по порядку объявления:
+    /// базы и лок — до каталога.
+    _dd: DataDir,
+    _dir: TestDir,
 }
 
 async fn env(name: &str) -> Env {
@@ -91,13 +101,11 @@ async fn env(name: &str) -> Env {
         .with_env_filter("zam_index=debug")
         .with_test_writer()
         .try_init();
+    // каталог — до Qdrant: подметание прежних прогонов не совпадает с его запуском
+    let dir = TestDir::new("zam-index-worker", name);
     let q = TestQdrant::start(&format!("worker-{name}"));
     let vector: Arc<dyn VectorIndex> =
         Arc::new(QdrantIndex::connect(&q.grpc_url(), Some(&q.api_key)).unwrap());
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("zam-index-worker")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
     let dd = DataDir::open(&dir).unwrap();
     let system = SystemStore::open(&dd).unwrap();
     let user = system.create_user("u", false).await.unwrap().id;
@@ -106,8 +114,6 @@ async fn env(name: &str) -> Env {
     let db = users.get(user).await.unwrap();
     let spaces = list_spaces(&db).await.unwrap();
     let find = |k: SpaceKind| spaces.iter().find(|s| s.kind == k).unwrap().id;
-    // каталог данных держит лок: живёт до конца процесса теста
-    std::mem::forget(dd);
     Env {
         _q: q,
         users_dir,
@@ -122,6 +128,8 @@ async fn env(name: &str) -> Env {
         fake: Arc::new(Fake {
             texts: AtomicU64::new(0),
         }),
+        _dd: dd,
+        _dir: dir,
     }
 }
 
@@ -206,13 +214,12 @@ impl Env {
         get_node(&self.db, node).await.unwrap().index_state
     }
 
-    /// Ждёт `index_state = 'indexed'` (до [`LIMIT`]: создание коллекции на HDD).
+    /// Ждёт `index_state = 'indexed'` ([`Env::until`]: создание коллекции на HDD).
     async fn indexed(&self, node: Id) {
-        let t = Instant::now();
-        while self.state(node).await != "indexed" {
-            assert!(t.elapsed() < LIMIT, "узел не проиндексирован");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        self.until("узел не проиндексирован", async || {
+            self.state(node).await == "indexed"
+        })
+        .await;
     }
 
     /// Чанков узла (= точек его заметки в индексе).
@@ -273,10 +280,23 @@ impl Env {
         w.status().last_reindex.unwrap().result.unwrap()
     }
 
+    /// Ждёт `f`: не дольше [`LIMIT`] без продвижения создания коллекции Qdrant теста
+    /// ([`TestQdrant::collection_progress`]) и [`LIMIT_MAX`] всего.
     async fn until(&self, what: &str, f: impl AsyncFn() -> bool) {
         let t = Instant::now();
+        let (mut seen, mut moved) = (self._q.collection_progress(), Instant::now());
         while !f().await {
-            assert!(t.elapsed() < LIMIT, "не дождались: {what}");
+            let now = self._q.collection_progress();
+            if now != seen {
+                seen = now;
+                moved = Instant::now();
+            }
+            assert!(
+                moved.elapsed() < LIMIT && t.elapsed() < LIMIT_MAX,
+                "не дождались за {:?}: {what} (без продвижения — {:?}); Qdrant: {seen}",
+                t.elapsed(),
+                moved.elapsed()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -604,10 +624,7 @@ async fn auto_l0_and_folder_rollup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chunk_embed_key_column_equals_helper() {
     // без Qdrant: только база
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("zam-index-worker")
-        .join(format!("ekey-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TestDir::new("zam-index-worker", "ekey");
     let dd = DataDir::open(&dir).unwrap();
     let db = UserDbs::new(dd.users_dir()).get(Id::new()).await.unwrap();
     let knowledge = list_spaces(&db)

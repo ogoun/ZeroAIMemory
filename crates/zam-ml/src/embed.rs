@@ -501,12 +501,15 @@ mod tests {
     use super::*;
 
     /// Батч индексации уступает запросам: ждёт, пока запрос не закончится, но не дольше
-    /// предела; без запросов — не ждёт.
+    /// предела; без запросов — не ждёт. Верхние границы — «не ждал предела»: доля предела, а
+    /// не миллисекунды (поток под нагрузкой машины вытесняют дольше 5 мс; M6.6, задача 12);
+    /// нижние — «действительно ждал».
     #[test]
     fn index_batch_yields_to_running_queries() {
         use std::time::Duration;
         let q = AtomicUsize::new(0);
-        assert!(wait_queries(&q, Duration::from_secs(1)) < Duration::from_millis(5));
+        let idle = wait_queries(&q, Duration::from_secs(1));
+        assert!(idle < Duration::from_millis(200), "{idle:?}");
         // запрос в работе 50 мс: батч ждёт его конца
         let waited = std::thread::scope(|sc| {
             let g = QueryGuard::new(&q);
@@ -517,12 +520,15 @@ mod tests {
             wait_queries(&q, Duration::from_secs(5))
         });
         assert!(waited >= Duration::from_millis(40), "{waited:?}");
-        assert!(waited < Duration::from_secs(1), "{waited:?}");
+        assert!(waited < Duration::from_secs(4), "{waited:?}");
         assert_eq!(q.load(Ordering::SeqCst), 0);
         // запросы идут непрерывно: не дольше предела
         let _g = QueryGuard::new(&q);
         let waited = wait_queries(&q, Duration::from_millis(30));
-        assert!(waited >= Duration::from_millis(30) && waited < Duration::from_millis(500));
+        assert!(
+            waited >= Duration::from_millis(30) && waited < Duration::from_secs(2),
+            "{waited:?}"
+        );
     }
 
     #[test]

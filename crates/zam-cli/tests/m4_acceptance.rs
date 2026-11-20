@@ -5,9 +5,10 @@
 //!   триггеры `file_glob` и `error_regex`) на одной машине в проекте A; на другой машине в проекте B
 //!   `zam hook session-start` обновляет кэш триггеров, сервер останавливается, и `pre-tool`
 //!   (Write `deploy.sh`) и `post-tool` («bad interpreter») выдают подсказки без сети;
-//! - `hook_budgets` — p95 каждого хука на корпусе eval в пределах бюджетов §10.3 с запасом ×2
-//!   (M4.5: и `post-tool` успеха — 50 мс без сети, и `subagent-start` — 300 мс; M5.7 — с 50
-//!   идеями в решении: раздел `### Идеи` и отдельный поиск идей к `prompt`; M6 §12 —
+//! - `hook_budgets` (`#[ignore]`, тихое окно) — p95 каждого хука на корпусе eval в пределах
+//!   бюджетов §10.3 с запасом ×2 (M4.5: и `post-tool` успеха — 50 мс без сети, и
+//!   `subagent-start` — 300 мс; M5.7 — с 50 идеями в решении: раздел `### Идеи` и отдельный
+//!   поиск идей к `prompt`; M6 §12 —
 //!   `checkpoint` с `hooks.checkpoint_impact = true`: `POST /code/impact` по правке файла со
 //!   знанием параллельно с `GET /sessions/{id}`; `session-start` контрольной группы A/B —
 //!   `hooks.holdout = 0.5`, сессии из группы: метка `POST /sessions {holdout}` до `/recall` в
@@ -957,8 +958,12 @@ fn load_eval(srv: &Srv) -> toml::Table {
 /// других строк (401/403/5xx, разбор, конфигурация), ответ есть там, где он ожидается
 /// (дайджест, `decision: block`, подсказки `pre-tool` и `error_regex` по разметке
 /// `eval/hints.toml`), иначе быстрый отказ прошёл бы замер. Цифры машины владельца (release,
-/// bge-m3 int8 на CPU) — в журнале этапа.
+/// bge-m3 int8 на CPU) — в журнале этапа. Под общим прогоном на занятой машине p95 выходит за
+/// предел без регрессии (M6.6: `session-start-holdout` 887 мс при 600 мс, отдельно — проходит), и
+/// замер приёмки ничего не доказывает (задача 12): запуск — в тихое окно,
+/// `cargo test -p zam-cli --test m4_acceptance hook_budgets -- --ignored --exact`.
 #[test]
+#[ignore = "замер времени для приёмки: тихое окно"]
 fn hook_budgets() {
     let _g = serial();
     let srv = Srv::start("budgets", &["Анна"], |_| {});

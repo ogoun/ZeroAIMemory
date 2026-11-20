@@ -130,6 +130,28 @@ pub struct TestQdrant {
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// Ход создания коллекции [`zam_index::COLLECTION`]: есть ли она и сколько payload-индексов уже
+/// создано (`storage/collections/<имя>/payload_index.json` Qdrant 1.19 — его дописывает каждый
+/// `create_field_index`). Файл читается без запроса к Qdrant: запрос к коллекции ждал бы
+/// блокировки сегментов, которую держит создание индекса. Под общим прогоном на занятом HDD
+/// один индекс пустой коллекции создаётся 17–35 с (M6.6, задача 12): ожидания, в которые
+/// входит создание коллекции, продлеваются, пока этот ход меняется.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CollectionProgress {
+    pub exists: bool,
+    pub indexes: usize,
+}
+
+impl std::fmt::Display for CollectionProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.exists {
+            write!(f, "коллекция есть, payload-индексов {}", self.indexes)
+        } else {
+            f.write_str("коллекции нет")
+        }
+    }
+}
+
 impl TestQdrant {
     /// Запускает Qdrant и ждёт `GET /readyz` (до 60 с: данные проекта на HDD). Если процесс
     /// завершился из-за занятого адреса, запуск повторяется на новых портах (до 3 попыток).
@@ -140,11 +162,13 @@ impl TestQdrant {
             "нет бинарника Qdrant {}: выполните `cargo xtask fetch-deps`",
             bin.display()
         );
+        // каталоги упавших прогонов (после паники `Drop` их оставляет для разбора) — до первого
+        // запуска процесса; живые прогоны других бинарников не трогаются
+        let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("zam-index");
+        super::disk::sweep_once(&base, super::disk::pid_before_seq);
         let slot = Slot::take();
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("zam-index")
-            .join(format!("{name}-{}-{seq}", std::process::id()));
+        let dir = base.join(format!("{name}-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("config")).expect("каталог теста");
 
@@ -213,6 +237,24 @@ impl TestQdrant {
     /// gRPC-адрес для `QdrantIndex::connect`.
     pub fn grpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.grpc_port)
+    }
+
+    /// Ход создания коллекции ([`CollectionProgress`]).
+    pub fn collection_progress(&self) -> CollectionProgress {
+        let coll = self
+            .dir
+            .join("storage")
+            .join("collections")
+            .join(zam_index::COLLECTION);
+        let indexes = std::fs::read(coll.join("payload_index.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["schema"].as_object().map(serde_json::Map::len))
+            .unwrap_or(0);
+        CollectionProgress {
+            exists: coll.join("config.json").is_file(),
+            indexes,
+        }
     }
 }
 

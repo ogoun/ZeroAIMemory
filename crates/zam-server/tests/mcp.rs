@@ -3236,23 +3236,22 @@ fn sol_sess() -> [(&'static str, &'static str); 3] {
     ]
 }
 
+/// `id` записи из ответа `Записано <буква>:<id> …` инструмента `memory_log` в решении `G`.
+async fn mcp_sol_log(a: &Api, args: Value, letter: &str) -> String {
+    let o = ok(a, &a.token, &sol_sess(), "memory_log", args).await;
+    let head = format!("Записано {letter}:");
+    assert!(o.text.starts_with(&head), "{}", o.text);
+    o.text[head.len()..].split(' ').next().unwrap().to_string()
+}
+
 /// Идея человека в решении `G` через MCP (пространство по умолчанию — решение заголовка): `id`.
 async fn mcp_sol_idea(a: &Api, title: &str, body: &str) -> String {
-    let o = ok(
+    mcp_sol_log(
         a,
-        &a.token,
-        &sol_sess(),
-        "memory_log",
         json!({"kind": "idea", "title": title, "body": body, "data": {"origin": "human"}}),
+        "w",
     )
-    .await;
-    assert!(o.text.starts_with("Записано w:"), "{}", o.text);
-    o.text
-        .trim_start_matches("Записано w:")
-        .split(' ')
-        .next()
-        .unwrap()
-        .to_string()
+    .await
 }
 
 /// Задачи решения `G` (REST).
@@ -3404,14 +3403,6 @@ async fn mcp_review_plan_and_errors() {
     .await;
     assert!(o.is_error, "{}", o.text);
     assert!(o.text.contains("review"), "{}", o.text);
-}
-
-/// Ссылка записи `<буква>:<id>` из ответа `Записано <буква>:<id> …` инструмента `memory_log`.
-async fn mcp_sol_log(a: &Api, args: Value, letter: &str) -> String {
-    let o = ok(a, &a.token, &sol_sess(), "memory_log", args).await;
-    let head = format!("Записано {letter}:");
-    assert!(o.text.starts_with(&head), "{}", o.text);
-    o.text[head.len()..].split(' ').next().unwrap().to_string()
 }
 
 /// Ревью задачи 5 (Minor 2): все ключи `review` доходят до REST — опечатка в списке полей

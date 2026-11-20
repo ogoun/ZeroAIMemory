@@ -129,6 +129,62 @@ pub struct TestQdrant {
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// Каталоги запущенных [`TestQdrant`] по gRPC-порту: по адресу из конфигурации сервера
+/// ([`data_dir_of`]) ожидание готовности видит, как идёт создание коллекции.
+static DIRS: Mutex<Vec<(u16, PathBuf)>> = Mutex::new(Vec::new());
+
+/// Каталог данных [`TestQdrant`] с gRPC-адресом `grpc_url` (`http://127.0.0.1:<порт>`); не
+/// тестовый Qdrant (управляемый супервизором, чужой) — `None`.
+pub fn data_dir_of(grpc_url: &str) -> Option<PathBuf> {
+    let port: u16 = grpc_url
+        .rsplit_once(':')?
+        .1
+        .trim_end_matches('/')
+        .parse()
+        .ok()?;
+    let dirs = DIRS.lock().unwrap_or_else(|p| p.into_inner());
+    dirs.iter()
+        .find(|(p, _)| *p == port)
+        .map(|(_, d)| d.clone())
+}
+
+/// Ход создания коллекции [`zam_index::COLLECTION`]: есть ли она и сколько payload-индексов
+/// уже создано (`storage/collections/<имя>/payload_index.json` Qdrant 1.19 — его дописывает
+/// каждый `create_field_index`). Файл читается без запроса к Qdrant: запрос к коллекции ждал бы
+/// блокировки сегментов, которую держит создание индекса.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CollectionProgress {
+    pub exists: bool,
+    pub indexes: usize,
+}
+
+impl std::fmt::Display for CollectionProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.exists {
+            write!(f, "коллекция есть, payload-индексов {}", self.indexes)
+        } else {
+            f.write_str("коллекции нет")
+        }
+    }
+}
+
+/// [`CollectionProgress`] Qdrant с каталогом данных `dir`.
+pub fn collection_progress(dir: &Path) -> CollectionProgress {
+    let coll = dir
+        .join("storage")
+        .join("collections")
+        .join(zam_index::COLLECTION);
+    let indexes = std::fs::read(coll.join("payload_index.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["schema"].as_object().map(serde_json::Map::len))
+        .unwrap_or(0);
+    CollectionProgress {
+        exists: coll.join("config.json").is_file(),
+        indexes,
+    }
+}
+
 impl TestQdrant {
     /// Запускает Qdrant и ждёт `GET /readyz` (до 60 с: данные проекта на HDD). Если процесс
     /// завершился из-за занятого адреса, запуск повторяется на новых портах (до 3 попыток).
@@ -168,6 +224,9 @@ impl TestQdrant {
             let mut child = spawn(&bin, &dir, &api_key);
             match wait_ready(&mut child, &dir, http_port, grpc_port) {
                 Ok(()) => {
+                    DIRS.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((grpc_port, dir.clone()));
                     return TestQdrant {
                         child,
                         dir,
@@ -212,6 +271,11 @@ impl TestQdrant {
     /// gRPC-адрес для `QdrantIndex::connect`.
     pub fn grpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.grpc_port)
+    }
+
+    /// Ход создания коллекции ([`collection_progress`]).
+    pub fn collection_progress(&self) -> CollectionProgress {
+        collection_progress(&self.dir)
     }
 
     /// Все точки коллекции с payload — прямым REST API Qdrant, мимо адаптера и его фильтров.
@@ -337,6 +401,9 @@ fn readyz(port: u16) -> bool {
 
 impl Drop for TestQdrant {
     fn drop(&mut self) {
+        DIRS.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(p, _)| *p != self.grpc_port);
         // Тестовый процесс — жёсткое завершение; штатную остановку делает супервизор (задача 6).
         let _ = self.child.kill();
         let _ = self.child.wait();

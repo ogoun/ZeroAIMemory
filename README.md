@@ -725,6 +725,29 @@ cargo build --release -p zam-cli                   # отдельной кома
 - Интеграционные тесты запускают настоящий Qdrant из `target/deps`, Docker не нужен.
   `ZAM_TEST_QDRANT_MAX` ограничивает число одновременно запущенных экземпляров в одном
   тестовом бинарнике (по умолчанию 4). На HDD это убирает падения тестов от взаимной нагрузки.
+  Тесты сервера и `zam-index` (`worker.rs`) ждут создания коллекции до 240 с без
+  продвижения: пока добавляются payload-индексы, ожидание продлевается, но не дольше 900 с.
+  Тесты сервера печатают время готовности строкой `ZAM_TIMING векторный канал готов за …`.
+- Замеры времени для приёмки помечены `#[ignore = "замер времени для приёмки: тихое окно"]`:
+  `m4_acceptance::hook_budgets`, `m57_acceptance::acceptance_recall_p95_with_50_ideas`,
+  `m6_acceptance::acceptance_hook_budgets`. Под общим прогоном на занятой машине их пороги
+  проверить нельзя. Запускайте их отдельно, когда машина свободна (сборок, игр и редакторов
+  нет), например
+  `cargo test -p zam-cli --test m4_acceptance hook_budgets -- --ignored --exact`. Так же
+  запускается `m57_acceptance`, а `m6_acceptance acceptance_hook_budgets` — с `--release` и
+  бинарниками тега (см. описание теста). Пороги в них не ослаблены.
+- Тесты `zam-index`, которые пишут в Qdrant, сначала проверяют свободное место на диске
+  (по умолчанию 4096 МБ, порог задаёт `ZAM_TEST_MIN_FREE_MB`). Если места мало, тест
+  пропускается со строкой
+  `SKIP <тест>: свободно N МБ < M МБ на <путь> — освободите место (cargo xtask clean-test-tmp)`.
+  В CI (переменная `CI`) и с `ZAM_REQUIRE_DISK=1` такой тест падает. Данные успешных тестов
+  `zam-index` удаляются сразу. Каталоги прогонов, которые упали или были прерваны, удаляет
+  следующий запуск набора.
+- Данные тестов копятся в `target/tmp`, `target/<сборка>/tmp` (при `CARGO_TARGET_DIR`) и
+  `target/test-tmp`. Убрать их можно командой `cargo xtask clean-test-tmp [--older-than 6h]
+  [--dry-run]`. Она удаляет только записи, в дереве которых ничего не менялось дольше порога,
+  поэтому данные запущенных тестов остаются. `target/tags`, `target/models`, `target/deps`,
+  `target/deps-cache`, `target/dist`, `target/release` и всё вне `target/` команда не трогает.
 - CI дополнительно проверяет `cargo fmt --check` и `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ### Команды xtask
@@ -742,6 +765,7 @@ cargo build --release -p zam-cli                   # отдельной кома
 | `code-bench [--repo <путь>]` | замеры карты кода (M5.6) на копии `HEAD` репозитория: первая и повторная `zam code sync`, правка и удаление файла, вторая копия, `GET /code/map` 200–2000 токенов, ключевые типы среди центральных, `zam --version` и запуск фоновой синхронизации p95 → `.tmp/m56/bench/report.json` |
 | `bench --profile cpu\|gpu [--notes N] [--phase …]… [--keep] [--reuse]` | замеры целей §17 ТЗ на корпусе eval с копиями до 10 000 заметок: поиск при пустой и полной очереди, FTS-only, реранк, индексация, запись, reindex, RSS, старт, падение Qdrant |
 | `ab --transcripts D --runs eval/ab/runs.toml [--server URL] [--out F] [--allow-missing]` | агентный A/B (M6): отчёт по плечам с интервалами из журналов агента (только поля `usage`) и `GET /sessions/{id}` сервера; методика — [eval/README.md](eval/README.md), «Агентный A/B» |
+| `clean-test-tmp [--older-than 6h] [--dry-run]` | уборка данных тестов: записи `target/tmp`, `target/<сборка>/tmp` и `target/test-tmp`, в дереве которых ничего не менялось дольше порога (`<число><s\|m\|h\|d>`) |
 | `transfer-check seed\|verify\|bindings` | проверка переезда на другую машину (M6): корпус и ожидания на старом сервере, те же данные на новом после `restore` (`--no-key` — без мастер-ключа), базы без прежнего каталога данных и имени машины |
 
 ```
