@@ -123,6 +123,57 @@ zam-server serve --config config.toml
 Сохраните токен: повторно он не показывается. Новые токены выпускаются в WebUI
 (`http://<хост>:7700/`, вход администратора) или через админ-API.
 
+**Первый токен — агентский, админ-API он не открывает.** Любой токен, в том числе этот, — токен
+агента (решение владельца 2026-10-26, §11.4 ТЗ): с ним работают `zam`, хуки и MCP, а
+`/api/v1/admin/*` отвечают на него 403 «администраторский маршрут: нужен вход администратора
+(POST /api/v1/auth/login, cookie и x-csrf-token); токен — агентский»; выпуск своих токенов
+(`/api/v1/auth/tokens`) по токену — тоже 403: агент токены не выпускает. Админ-API — только по
+входу администратора, как в WebUI:
+
+1. `POST /api/v1/auth/login` с телом `{"login": "<логин>", "password": "<пароль>"}` (логин —
+   `[admin] login`, по умолчанию `admin`) → 200, cookie `zam_session` (сессия на 12 часов) и
+   тело `{"csrf": "…"}`. Попыток входа — 5 в минуту с одного адреса.
+2. Чтение (`GET`) — с этой cookie; изменяющие запросы (`POST`, `PATCH`, `DELETE`) — с cookie и
+   заголовком `x-csrf-token: <csrf>` (без него — 403).
+3. Свой токен администратора — `POST /api/v1/auth/tokens {"name": "…", "access": "rw"|"ro"}`,
+   токен пользователю — `POST /api/v1/admin/users/<id>/tokens` с тем же телом (`id` — из
+   `GET /api/v1/admin/users`), отзыв — `DELETE /api/v1/admin/tokens/<id токена>`. Ответ выпуска
+   — 201 `{"info": {…, "prefix": "zam_XXXXXXXX"}, "plaintext": "<токен>"}`: токен целиком
+   показывается один раз. Человеческих токенов нет: `"human": true` — 400.
+
+Пример (Linux, `curl` и `jq`; пароль вводится без отображения и не попадает в историю, cookie —
+в файле `jar`):
+
+```bash
+read -rs -p 'Пароль администратора: ' PW && echo >&2
+CSRF=$(jq -n --arg p "$PW" '{login: "admin", password: $p}' |
+  curl -sf -c jar -H 'Content-Type: application/json' --data-binary @- \
+    http://localhost:7700/api/v1/auth/login | jq -r .csrf); unset PW
+curl -sf -b jar http://localhost:7700/api/v1/admin/users | jq '.[] | {id, name}'
+curl -sf -b jar -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"name": "laptop", "access": "rw"}' \
+  http://localhost:7700/api/v1/admin/users/<id>/tokens | jq -r .plaintext
+curl -sf -b jar -H "x-csrf-token: $CSRF" -X POST http://localhost:7700/api/v1/auth/logout
+rm -f jar
+```
+
+То же в Windows PowerShell 5.1 (`-WebSession` хранит cookie; тело — байтами UTF-8, чтобы пароль
+с не-ASCII символами не перекодировался):
+
+```powershell
+$c = Get-Credential -UserName admin -Message 'Вход администратора ZeroAIMemory'
+$b = @{ login = $c.UserName; password = $c.GetNetworkCredential().Password } | ConvertTo-Json
+$r = Invoke-RestMethod -Method Post http://localhost:7700/api/v1/auth/login -SessionVariable zam `
+  -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($b))
+Invoke-RestMethod http://localhost:7700/api/v1/admin/users -WebSession $zam
+(Invoke-RestMethod -Method Post http://localhost:7700/api/v1/admin/users/<id>/tokens `
+  -WebSession $zam -Headers @{ 'x-csrf-token' = $r.csrf } -ContentType 'application/json' `
+  -Body '{"name": "laptop", "access": "rw"}').plaintext
+```
+
+Сессия пользователя WebUI (не администратора) на админ-маршруты получает 403 «только
+администратору».
+
 Проверка подключения клиентом:
 
 ```
@@ -1278,11 +1329,10 @@ jina — модель с динамическим int8: пары «запрос 
   проектам только адрес, и `zam init --token` второго сервера заменит токен первого — второму
   серверу на той же машине токен задавайте переменной `ZAM_TOKEN` в окружении агента.
 
-- Обкатка (0.0.12-m6.5), открытые замечания журнала этапа (с обходами; исправления — M7):
-  «Первый токен администратора» не открывает админ-API
-  (`/api/v1/admin/*` — 403): нужен вход логином и паролем WebUI; пакет субагенту (`memory_recall
-  event=brief`) на сервере без GPU может кончаться `recall timeout` (только Rules). Остальные
-  замечания — журнал этапа в репозитории (`docs/plans/2026-11-15-m6.5-dogfood-log.md`).
+- Обкатка (0.0.12-m6.5), открытые замечания журнала этапа (с обходами; исправления — M7): пакет
+  субагенту (`memory_recall event=brief`) на сервере без GPU может кончаться `recall timeout`
+  (только Rules). Остальные замечания — журнал этапа в репозитории
+  (`docs/plans/2026-11-15-m6.5-dogfood-log.md`).
 
 - Для собирающих из исходников (0.0.12-m6.5): `supervisor::shutdown_waits_for_flush_bounded`
   (`zam-index`) падает на почти полном и загруженном HDD — Qdrant не подтверждает WAL за 30 с, а
@@ -1747,6 +1797,38 @@ export`) — ещё и без пространства Human и отчётов: 
 Остановите сервер, замените файлы комплекта (конфигурацию и каталог данных не трогайте),
 запустите сервер: миграции баз применяются автоматически, копия файла создаётся перед миграцией.
 
+**Копия каталога данных до обновления.** Лучше — `zam-server backup` прежнего комплекта (с
+0.0.11-m6; сервер можно не останавливать): копия каждой базы согласованна и проверена — код 0
+означает, что суммы SHA-256 из `manifest.json` сошлись (см. «Перенос на другую машину», шаг 1):
+
+```
+zam-server backup --config <config.toml>                    # каталог <data_dir>/backups/<время>/
+zam-server backup --config <config.toml> --dir <каталог>    # или --zip <архив>.zip
+```
+
+Восстанавливает её `zam-server restore` версии 0.0.11-m6 и новее; для отката на версию до
+0.0.11-m6 она не годится (см. «Что теряет откат» ниже). Мастер-ключ Vault в копию не входит.
+
+Ручная копия каталога (сервер старше 0.0.11-m6 или нужна копия файлами) — только при
+остановленном сервере, базы — вместе с `-wal` и `-shm`. Проверяйте её **не** `du -sh`: на ZFS и
+Btrfs со сжатием он показывает место на диске, а не объём файлов (при обкатке 0.0.12-m6.5 —
+251 КБ у каталога в 503 МБ), и копия на другой файловой системе выглядит «не того размера».
+Сравнивайте объём файлов — `du -sh --apparent-size <каталог>` (GNU coreutils) у оригинала и копии
+— или список и размеры баз:
+
+```bash
+# Linux: размер и путь от корня каталога; diff молчит — базы скопированы целиком
+find /var/lib/zeroaimemory -name '*.db*' -printf '%s %P\n' | sort -k2 > orig.txt
+find /backup/zam-data -name '*.db*' -printf '%s %P\n' | sort -k2 > copy.txt
+diff orig.txt copy.txt && echo 'копия совпадает'
+```
+
+```powershell
+# Windows: объём файлов оригинала и копии (Length — размер файла, не место на диске)
+(Get-ChildItem C:\ZeroAIMemory\data -Recurse -File | Measure-Object Length -Sum).Sum
+(Get-ChildItem D:\zam-data -Recurse -File | Measure-Object Length -Sum).Sum
+```
+
 **Копии перед миграцией.** Каждая база, схему которой обновляет новая версия, копируется
 рядом с собой: `system.db.bak-v<N>` и `users/<id>.db.bak-v<N>`, где `N` — версия схемы до
 обновления (копия делается `VACUUM INTO`, на HDD — секунды на сотню мегабайт). Копии
@@ -2077,7 +2159,9 @@ export`) — ещё и без пространства Human и отчётов: 
   0.0.11-m6 и новее;
 - сохраните текущие базы целиком, чтобы можно было вернуться на новую версию: при
   остановленном сервере скопируйте каталог данных или хотя бы `system.db`, `users/*.db`
-  **вместе с их `-wal` и `-shm`**, если они есть.
+  **вместе с их `-wal` и `-shm`**, если они есть (сейчас работает 0.0.11-m6 или новее — удобнее
+  `zam-server backup`). Копию проверяйте не `du -sh`, а объёмом файлов или сверкой списка баз —
+  см. «Копия каталога данных до обновления» в начале раздела.
 
 **Как подложить копию (для любого отката).** Базы открываются в режиме WAL: рядом с
 `system.db` и `users/<id>.db` живут `system.db-wal`/`system.db-shm` и
