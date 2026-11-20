@@ -19,7 +19,7 @@
 //!   ([`on_entry_deleted_tx`]);
 //! - отбор для проактивности: [`proactive_ideas`] и предикат [`idea_candidate`] (§6).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use jiff::civil::Date;
 use jiff::{Span, Timestamp};
@@ -2674,30 +2674,40 @@ pub async fn review_queue(
     .await
 }
 
-/// Очередь разбора без показанного (M6.6 §3.5, строка очереди к `prompt`): сколько идей очереди
-/// [`review_queue`] пространства `space` нет в `exclude` (показанное сессии и то, что ответ уже
-/// несёт), и первая из них в порядке очереди (`high` первыми, затем самые старые). Одно чтение:
-/// id очереди без тел, запись — только первой; id вне очереди в `exclude` счёт не меняют.
+/// Очередь разбора без показанного (M6.6 §3.5, строка очереди к `prompt`): идеи очереди
+/// [`review_queue`] пространства `space` в её порядке (`high` первыми, затем самые старые), не
+/// показанные в их текущей ревизии — `seen`: id → наибольшая выданная ревизия (показ сессии в
+/// текущей эпохе); показ прежней ревизии не считается (идея, вернувшаяся в `new` новой
+/// ревизией, снова непоказана). Итог — id всех таких идей и записи первых `take` из них. Одно
+/// чтение: id и ревизии очереди без тел, записи — только первых `take`; id вне очереди в `seen`
+/// ничего не меняют.
 pub async fn review_queue_unseen(
     db: &Db,
     space: Id,
-    exclude: &[Id],
-) -> Result<(usize, Option<Entry>), StoreError> {
-    let exclude: HashSet<Id> = exclude.iter().copied().collect();
+    seen: &HashMap<Id, i64>,
+    take: usize,
+) -> Result<(Vec<Id>, Vec<Entry>), StoreError> {
+    let seen = seen.clone();
     db.read(move |c| {
-        let ids: Vec<Id> = {
+        let rows: Vec<(Id, i64)> = {
             let mut st = c.prepare_cached(&format!(
-                "SELECT e.id {REVIEW_QUEUE_SQL} ORDER BY {PRIORITY_DESC}, e.created_at, e.id"
+                "SELECT e.id, e.current_rev {REVIEW_QUEUE_SQL}
+                 ORDER BY {PRIORITY_DESC}, e.created_at, e.id"
             ))?;
-            let rows = st.query_map([space], |r| r.get::<_, Id>(0))?;
+            let rows = st.query_map([space], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?)))?;
             rows.collect::<Result<_, _>>()?
         };
-        let mut unseen = ids.into_iter().filter(|id| !exclude.contains(id));
-        let Some(first) = unseen.next() else {
-            return Ok((0, None));
-        };
-        let n = 1 + unseen.count();
-        Ok((n, Some(load_entry(c, first)?)))
+        let unseen: Vec<Id> = rows
+            .into_iter()
+            .filter(|(id, rev)| seen.get(id).is_none_or(|s| s < rev))
+            .map(|(id, _)| id)
+            .collect();
+        let head = unseen
+            .iter()
+            .take(take)
+            .map(|id| load_entry(c, *id))
+            .collect::<Result<_, _>>()?;
+        Ok((unseen, head))
     })
     .await
 }

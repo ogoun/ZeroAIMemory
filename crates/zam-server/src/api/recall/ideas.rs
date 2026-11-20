@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
-#[cfg(feature = "test-hooks")]
 use tokio::time::Instant;
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_search::recall::{
@@ -150,6 +149,10 @@ const REVIEW_OMIT_BUDGET: &str = "подними budget_tokens или умень
 /// (фича `test-hooks`, проверка тишины по идеям).
 #[cfg(feature = "test-hooks")]
 pub const TEST_SLOW_IDEA_MARK: &str = "zam-test-slow-idea";
+/// Тестовая метка заголовка идеи очереди: чтение головы очереди разбора к `prompt`
+/// ([`review_queue_head`]) «не укладывается в срок» — шаг обрывает срок (фича `test-hooks`).
+#[cfg(feature = "test-hooks")]
+pub const TEST_SLOW_QUEUE_MARK: &str = "zam-test-slow-queue";
 /// Запросы, по которым шёл второй проход подсказки-идей ([`released_prompt_ideas`]) — только с
 /// фичей `test-hooks` (тест: второй проход не нужен, когда первый уже дал предел).
 #[cfg(feature = "test-hooks")]
@@ -967,91 +970,134 @@ pub(super) async fn prompt_ideas(
     Ok(first)
 }
 
-/// Строка очереди разбора к `prompt` (M6.6 §3.5, замечание 36): в режиме `review` (решает
-/// вызывающий) у владельца базы решения — пространство решения в личной цели (участнику общего
-/// решения — нет), с правом записи ([`ideas_writable`]: разбор с `ro` дал бы 403) — первая идея
-/// очереди [`zam_store::review_queue_unseen`], не показанная этой сессии (`seen_entry_ids`,
-/// [`RECALL_PART`], любая эпоха и ревизия — в том числе разделом дайджеста, пакетом
-/// `idea_review` и подсказкой-идеей прежнего запроса) и не в подсказках-идеях этого ответа
-/// (`ahead` — [`prompt_ideas`]: первые `ideas.prompt_max` непоказанных, как их отбирает
-/// [`recall`]), — одной строкой [`review_queue_line`] с числом остальных таких идей; `reason:
-/// idea_review`, показ — в `session_seen` общим учётом ответа. Строка не зависит от близости к
-/// запросу; `ideas.prompt_max = 0` (подсказок-идей к `prompt` нет) — нет и её
-/// **[решение исполнителя, задача 14]**. Без сессии — без фильтра показанного, как у прочих
-/// подсказок.
+/// Голова очереди разбора к `prompt` (M6.6 §3.5, замечание 36), прочитанная **до поиска**
+/// ([`review_queue_head`]; ревью задачи 14, M1): строку выбирает [`QueueHead::line`] после
+/// подсказок-идей ответа.
+pub(super) struct QueueHead {
+    /// Цель — база решения (личная цель владельца).
+    target: usize,
+    /// Идеи очереди, не показанные в текущей эпохе сессии в их текущей ревизии, — по порядку
+    /// очереди.
+    unseen: Vec<Id>,
+    /// Записи первых `ideas.prompt_max + 1` из [`QueueHead::unseen`]: подсказки-идеи ответа
+    /// займут не больше `ideas.prompt_max`.
+    head: Vec<Entry>,
+    /// Записи базы цели, показанные сессии в любой эпохе: так подсказки-идеи отбирает
+    /// [`recall`] (показ идей без эпохи, M6 §7.2) — по ним [`QueueHead::line`] узнаёт идеи,
+    /// которые ответ понесёт подсказкой-идеей.
+    ///
+    /// [`recall`]: super::recall
+    seen_any: HashSet<Id>,
+    /// `ideas.prompt_max`.
+    max: usize,
+}
+
+/// Чтение головы очереди разбора к `prompt` (M6.6 §3.5) — до поиска, без эмбеддинга: срок
+/// поиска строку не вытесняет (ревью задачи 14, M1). Условия: режим `review` (решает
+/// вызывающий), вызывающий — владелец базы решения (пространство решения в личной цели;
+/// участнику общего решения — нет), право записи ([`ideas_writable`]: разбор с `ro` дал бы
+/// 403), цель жива, `ideas.prompt_max > 0` (подсказок-идей к `prompt` нет — нет и строки
+/// **[решение исполнителя, задача 14]**). Иначе — `None`.
 ///
-/// Срок — остаток общего срока `prompt` своей копией: не уложился (или сбой чтения — WARN) —
-/// тишина без предупреждений, `recall timeout` эта строка не ставит.
+/// Показанной идея считается в **текущей эпохе сессии в её текущей ревизии**
+/// ([`zam_store::seen_entry_revs`], [`RECALL_PART`]; решение координатора, ревью задачи 14):
+/// показ дайджестом той же эпохи считается; после сжатия контекста (новая эпоха) голова очереди
+/// приходит снова — пакет восстановления раздела идей не несёт, повторный старт раздел идей не
+/// повторяет ([`idea_shown_in_session`]); идея, вернувшаяся в `new` новой ревизией, приходит
+/// снова и в той же эпохе. Без сессии — без фильтра показанного, как у прочих подсказок.
 ///
-/// [`recall`]: super::recall
-pub(super) async fn prompt_review_queue(
+/// Срок — своя копия общего срока `prompt`, не дальше половины его остатка (чтение идёт до
+/// поиска): не уложилось чтение (или сбой — WARN) — тишина без предупреждений, `recall timeout`
+/// строка не ставит.
+pub(super) async fn review_queue_head(
     st: &AppState,
     p: &Principal,
     session: Option<&RequestSession>,
-    ahead: &[Cand],
     health: &Health<'_>,
     deadline: &Deadline,
-) -> Vec<Cand> {
+) -> Option<QueueHead> {
     let max = st.cfg.ideas.prompt_max as usize;
     let targets = health.targets();
-    let Some((i, space)) = solution_space(targets) else {
-        return Vec::new();
-    };
+    let (i, space) = solution_space(targets)?;
     let t = &targets[i];
     if max == 0 || t.solution.is_some() || !health.alive[i] || !ideas_writable(p, t) {
-        return Vec::new();
+        return None;
     }
+    // чтение — до поиска: не дольше половины остатка срока, чтобы зависшее чтение не оставило
+    // поиск подсказок без срока **[решение исполнителя, задача 14, круг правок 1]**
+    let now = Instant::now();
     let mut own = Deadline {
-        at: deadline.at,
+        at: now + deadline.at.saturating_duration_since(now) / 2,
         expired: deadline.expired,
     };
-    let mut exclude: Vec<Id> = match session {
-        Some(s) => {
-            let seen = zam_store::seen_entry_ids(&s.db, &s.touch.id, t.owner, RECALL_PART);
-            match own.step(seen).await {
-                Some(Ok(ids)) => ids,
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, "recall: показанное сессии не прочитано, без строки очереди разбора");
-                    return Vec::new();
-                }
-                None => return Vec::new(),
+    let read = async {
+        let (any, epoch) = match session {
+            Some(s) => {
+                let (id, owner) = (&s.touch.id, t.owner);
+                let any = zam_store::seen_entry_ids(&s.db, id, owner, RECALL_PART).await?;
+                let epoch = s.touch.epoch;
+                let revs = zam_store::seen_entry_revs(&s.db, id, owner, RECALL_PART, epoch).await?;
+                (any, revs)
             }
+            None => (Vec::new(), std::collections::HashMap::new()),
+        };
+        let (unseen, head) = zam_store::review_queue_unseen(&t.db, space, &epoch, max + 1).await?;
+        // тестовое «медленное чтение» (фича test-hooks): шаг не уложился в срок — его обрывает
+        // `own.step`, как настоящее медленное чтение
+        #[cfg(feature = "test-hooks")]
+        if head.iter().any(|e| e.title.contains(TEST_SLOW_QUEUE_MARK)) {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
         }
-        None => Vec::new(),
+        Ok::<_, StoreError>((any, unseen, head))
     };
-    // своё решение — единственная цель области: подсказки-идеи ответа — той же базы
-    let seen: HashSet<Id> = exclude.iter().copied().collect();
-    exclude.extend(
-        ahead
-            .iter()
-            .filter(|c| c.target == i && !seen.contains(&c.tref.id))
-            .take(max)
-            .map(|c| c.tref.id),
-    );
-    let Some(r) = own
-        .step(zam_store::review_queue_unseen(&t.db, space, &exclude))
-        .await
-    else {
-        return Vec::new();
-    };
-    let (n, first) = match r {
+    let (any, unseen, head) = match own.step(read).await? {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "recall: очередь разбора не прочитана");
-            return Vec::new();
+            return None;
         }
     };
-    let Some(e) = first else {
-        return Vec::new();
-    };
-    // тестовая задержка (тишина по сроку): только с фичей test-hooks
-    #[cfg(feature = "test-hooks")]
-    if e.title.contains(TEST_SLOW_IDEA_MARK) {
-        test_slow_idea(&mut own).await;
-        return Vec::new();
+    Some(QueueHead {
+        target: i,
+        unseen,
+        head,
+        seen_any: any.into_iter().collect(),
+        max,
+    })
+}
+
+impl QueueHead {
+    /// Строка очереди разбора ответа (M6.6 §3.5): первая непоказанная идея головы, которой нет в
+    /// подсказках-идеях этого ответа (`ideas` — [`prompt_ideas`]: первые `ideas.prompt_max`
+    /// непоказанных, как их отбирает [`recall`]), — одной строкой [`review_queue_line`] с числом
+    /// остальных таких идей; `reason: idea_review`, показ — в `session_seen` общим учётом ответа.
+    /// Строка не зависит от близости к запросу.
+    ///
+    /// [`recall`]: super::recall
+    pub(super) fn line(&self, ideas: &[Cand]) -> Vec<Cand> {
+        // своё решение — единственная цель области: подсказки-идеи ответа — той же базы
+        let ahead: HashSet<Id> = ideas
+            .iter()
+            .filter(|c| c.target == self.target && !self.seen_any.contains(&c.tref.id))
+            .take(self.max)
+            .map(|c| c.tref.id)
+            .collect();
+        let rest: Vec<Id> = self
+            .unseen
+            .iter()
+            .copied()
+            .filter(|id| !ahead.contains(id))
+            .collect();
+        // `ahead` — не больше `max`, голова — `max + 1`: первая из `rest` в голове есть
+        let Some(e) = rest
+            .first()
+            .and_then(|id| self.head.iter().find(|e| e.id == *id))
+        else {
+            return Vec::new();
+        };
+        let block = review_queue_line(e, rest.len() - 1);
+        vec![idea_cand(self.target, e, REASON_IDEA_REVIEW, block)]
     }
-    let block = review_queue_line(&e, n - 1);
-    vec![idea_cand(i, &e, REASON_IDEA_REVIEW, block)]
 }
 
 /// Тестовая «медленная идея» (фича `test-hooks`): шаг сбора идей «не уложился в срок» `d`.

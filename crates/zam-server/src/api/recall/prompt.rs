@@ -2,7 +2,7 @@
 //! из `mod.rs`, правила тишины и подсказка-задача). Разделы ответа ([`prompt_sections`]) — по
 //! порядку: строки словаря ([`super::term_cands`]), подсказки поиска ([`prompt_hints`]),
 //! подсказка-задача ([`task_prompt_cands`]), подсказки-идеи ([`super::ideas::prompt_ideas`]) и
-//! строка очереди разбора ([`super::ideas::prompt_review_queue`]);
+//! строка очереди разбора ([`super::ideas::review_queue_head`], [`super::ideas::QueueHead::line`]);
 //! у каждого раздела свой предел ([`super::section_limit`]). Правила выдачи, учёт показа и
 //! сроки — в документации модуля [`super`]. Правило тишины — общее с моделью калибровки
 //! `xtask eval --hints`: [`zam_search::recall::prompt_gate`] (ревью задачи 2, I1).
@@ -11,8 +11,9 @@
 //!   субагента, сообщение агента, уведомление фоновой задачи) — не слова человека: тишина, без
 //!   строк словаря (сервер — и для клиентов 0.0.12 и раньше, которые такие сообщения шлют).
 //! - **Нет предметных слов** ([`zam_search::recall::subject_terms`] пуст, M6.6 §3.1:
-//!   «согласен», «продолжай», «ok», только служебные слова) — только строки словаря: имя термина
-//!   в запросе — уже предметное слово. Поиска подсказок, задач и идей нет.
+//!   «согласен», «продолжай», «ok», только служебные слова) — только строки словаря (имя термина
+//!   в запросе — уже предметное слово) и строка очереди разбора (§3.5, ниже). Поиска подсказок,
+//!   задач и идей нет.
 //! - **Короткий запрос** (предметных слов не больше [`PROMPT_SHORT_WORDS`], M6.6 §3.2) —
 //!   подсказка поиска проходит, только если запись нашёл лексический канал
 //!   ([`PromptGate::admits_card`]): балл гибрида нормирован по непустым каналам, и у слова без
@@ -28,10 +29,13 @@
 //! - **Очередь разбора** (M6.6 §3.5, замечание 36): режим `review`, владелец базы решения, идеи
 //!   включены — строка `ZeroAIMemory: новая идея на разбор «<заголовок>» w:<id>` (при
 //!   нескольких непоказанных — ` (ещё N)`), `reason: idea_review`, одна на ответ, раз на идею за
-//!   сессию (в том числе показанную дайджестом). От близости к запросу не зависит и идёт мимо
-//!   правила «нет предметных слов» («продолжай»), но не мимо пересылки; срок — общий срок
-//!   `prompt`, не уложился — тишина без предупреждений. Режим `propose`, участник общего решения,
-//!   выключенные идеи — без строки.
+//!   эпоху сессии в её текущей ревизии (показ дайджестом той же эпохи считается; после сжатия
+//!   контекста — снова; идея, вернувшаяся в `new` новой ревизией, — снова). От близости к
+//!   запросу не зависит и идёт мимо правила «нет предметных слов» («продолжай»), но не мимо
+//!   пересылки; голова очереди читается до поиска; срок — общий срок `prompt`, не уложился —
+//!   тишина без предупреждений. Режим `propose`, участник общего решения, выключенные идеи — без
+//!   строки; снятая пределом вывода канала — строка «не показано — идей на разбор: 1
+//!   (memory_recall event=idea_review)».
 //!
 //! [`PROMPT_SHORT_WORDS`]: zam_search::recall::PROMPT_SHORT_WORDS
 use std::collections::HashSet;
@@ -47,7 +51,7 @@ use zam_store::{
     EntryKind, EntryStatus, FtsHit, FtsQuery, TargetFilter, count_tokens, search_fts_channels,
 };
 
-use super::ideas::{prompt_ideas, prompt_review_queue};
+use super::ideas::{prompt_ideas, review_queue_head};
 use super::{
     Cand, Deadline, REASON_TASK, RecallReq, age_of, entry_spaces, inner_search, item_age,
     prompt_min_score, term_cands,
@@ -66,12 +70,16 @@ const TASK_PROMPT_TOP_K: usize = 10;
 const TASK_LEAD: &str = "задача ";
 
 /// Разделы ответа `prompt` (см. модуль): строки словаря, подсказки поиска, подсказка-задача,
-/// подсказки-идеи и строка очереди разбора (`ideas_on` — идеи включены,
-/// [`super::ideas_enabled`]; `review` — режим `ideas.mode = review`). Проход задач — до идей: у
-/// идей свой срок, и шаг после их просрочки ставил бы `recall timeout`, которого у ответа без
-/// идей нет. Строка очереди — после правила пересылки (§3.3), но мимо правила «нет предметных
-/// слов» (§3.1) и последней: от запроса она не зависит и не повторяет идею, которую ответ уже
-/// несёт подсказкой-идеей.
+/// подсказки-идеи (`ideas_on` — идеи включены, [`super::ideas_enabled`]; `review` — режим
+/// `ideas.mode = review`) — и отдельно строка очереди разбора (M6.6 §3.5): у неё свой отбор
+/// показанного (эпоха и ревизия, [`super::ideas::review_queue_head`]), общий фильтр показанного
+/// `recall` её не трогает. Проход задач — до идей: у идей свой срок, и шаг после их просрочки
+/// ставил бы `recall timeout`, которого у ответа без идей нет.
+///
+/// Голова очереди читается после правила пересылки (§3.3) и до правила «нет предметных слов»
+/// (§3.1) — до поиска, чтобы срок поиска её не вытеснял (ревью задачи 14, M1); строка выбирается
+/// после подсказок-идей и идёт в ответе последней: от запроса она не зависит и не повторяет
+/// идею, которую ответ уже несёт подсказкой-идеей.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prompt_sections(
     st: &AppState,
@@ -83,16 +91,23 @@ pub(super) async fn prompt_sections(
     review: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
-) -> Result<Vec<(Option<&'static str>, Vec<Cand>)>, ApiError> {
+) -> Result<(Vec<(Option<&'static str>, Vec<Cand>)>, Vec<Cand>), ApiError> {
     let prompt = req.prompt.as_deref().unwrap_or_default();
     // признак пересылки — по всему промпту, как у хука; предметные слова — по запросу поиска
     let gate = prompt_gate(prompt, zam_store::search::QUERY_MAX_CHARS);
     if gate == PromptGate::Relayed {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     // строки словаря — перед подсказками insight; у каждого свой предел
     let chars = crate::glossary::HINT_TEXT_CHARS;
     let terms = term_cands(st, prompt, chars, health, deadline).await;
+    // очередь разбора (M6.6 §3.5) — и к реплике без предметных слов; пустой запрос — не запрос
+    // человека (как у подсказок-идей)
+    let queue = if ideas_on && review && !prompt.trim().is_empty() {
+        review_queue_head(st, p, session, health, deadline).await
+    } else {
+        None
+    };
     let mut out = vec![(None, terms)];
     let mut ideas = Vec::new();
     if let PromptGate::Search { subject, short } = &gate {
@@ -105,15 +120,9 @@ pub(super) async fn prompt_sections(
         }
         out.extend([(None, hints), (None, tasks)]);
     }
-    // очередь разбора (M6.6 §3.5) — и к реплике без предметных слов; пустой запрос — не запрос
-    // человека (как у подсказок-идей)
-    let queue = if ideas_on && review && !prompt.trim().is_empty() {
-        prompt_review_queue(st, p, session, &ideas, health, deadline).await
-    } else {
-        Vec::new()
-    };
-    out.extend([(None, ideas), (None, queue)]);
-    Ok(out)
+    let line = queue.map(|q| q.line(&ideas)).unwrap_or_default();
+    out.push((None, ideas));
+    Ok((out, line))
 }
 
 /// Первые [`zam_store::search::QUERY_MAX_CHARS`] символов промпта — запрос поиска подсказок.

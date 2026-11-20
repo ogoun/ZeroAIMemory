@@ -121,10 +121,11 @@
 //!   `horizon`, `accepted` со снятой задачей) с указанием `action=propose` в строке; очереди нет —
 //!   раздел M5.7 из них одних. Подсказка к `prompt` у идеи решения `new` — «к задаче подходит
 //!   идея на разбор w:<id>» (`reason: idea_review`); у владельца базы решения ответ `prompt`
-//!   несёт и строку очереди разбора (M6.6 §3.5): первая идея очереди, не показанная сессии
-//!   (дайджестом, пакетом, прежней подсказкой) и не в подсказках-идеях этого ответа, —
-//!   `ZeroAIMemory: новая идея на разбор «…» w:<id>` и ` (ещё N)` при нескольких, одна на ответ,
-//!   без зависимости от близости к запросу. Строка плана [`PLAN_LINE`] — сразу за
+//!   несёт и строку очереди разбора (M6.6 §3.5): первая идея очереди, не показанная в текущей
+//!   эпохе сессии в её текущей ревизии (дайджестом той же эпохи, пакетом, прежней подсказкой) и
+//!   не в подсказках-идеях этого ответа, — `ZeroAIMemory: новая идея на разбор «…» w:<id>` и
+//!   ` (ещё N)` при нескольких, одна на ответ, без зависимости от близости к запросу; голова
+//!   очереди читается до поиска. Строка плана [`PLAN_LINE`] — сразу за
 //!   задачами дайджеста и пакета восстановления: пункты плана из идей (задачи `open |
 //!   in_progress | blocked` с ребром `derived_from` на идею) и следующий — только `open`, по
 //!   `data.priority`, затем самый старый ([`zam_store::planned_from_ideas`]; открытых нет —
@@ -184,7 +185,9 @@
 //!   выданное в прежних эпохах больше не считается показанным (повторы подсказок, ответы на
 //!   вопросы), а показ этого ответа отмечается в новой. Не зависит от `record` и настроек
 //!   подсказок: эпоха — состояние контекста агента. Показ идей — без эпохи: раздел `### Идеи` и
-//!   подсказки-идеи `prompt` видят показ любой эпохи. Сбой — WARN, эпоха прежняя, и этот
+//!   подсказки-идеи `prompt` видят показ любой эпохи; кроме строки очереди разбора к `prompt`
+//!   (M6.6 §3.5): она — по текущей эпохе и ревизии идеи, после сжатия голова очереди приходит
+//!   снова (пакет восстановления раздела идей не несёт). Сбой — WARN, эпоха прежняя, и этот
 //!   ответ ничего не прячет как показанное (фильтра повторов текущей эпохи нет): лучше
 //!   повторить, чем потерять выданное до сжатия;
 //! - **пакет восстановления** (M4.5 §9.2) — `event: recovery` (MCP, агенты без
@@ -290,6 +293,7 @@ use ideas::{
 #[cfg(feature = "test-hooks")]
 pub use ideas::{
     TEST_IDEA_LIGHT_OFF, TEST_IDEA_SEARCH_TIMES, TEST_SECOND_PASS_QUERIES, TEST_SLOW_IDEA_MARK,
+    TEST_SLOW_QUEUE_MARK,
 };
 pub use prompt::TASK_HINTS_MAX;
 use prompt::prompt_sections;
@@ -3201,10 +3205,7 @@ fn arrange<'c>(
             let mut sec = Section::new(Some(head), ideas.iter().map(|c| c.block.clone()).collect());
             sec.keep = KEEP_MANDATORY;
             sec.omit = Some(if review {
-                (
-                    "идей на разбор".into(),
-                    "memory_recall event=idea_review".into(),
-                )
+                (OMIT_REVIEW_QUEUE.0.into(), OMIT_REVIEW_QUEUE.1.into())
             } else {
                 ("идей".into(), "memory_search kinds=[idea]".into())
             });
@@ -3278,6 +3279,10 @@ const OMIT_PLAN: Omit = ("строк плана из идей", "memory_search k
 
 /// Адрес снятой строки открытых задач (M6.6 §4.2).
 const OMIT_OPEN_TASKS: Omit = ("строк открытых задач", "memory_search kinds=[task]");
+
+/// Адрес снятых пределом вывода идей очереди разбора: раздела дайджеста [`SECTION_IDEAS_REVIEW`]
+/// и строки очереди к `prompt` (M6.6 §3.5; ревью задачи 14, M2) — пакет разбора.
+const OMIT_REVIEW_QUEUE: Omit = ("идей на разбор", "memory_recall event=idea_review");
 
 /// Адрес идей пакета `idea_review`, снятых пределом вывода канала ([`omit_of`]): тот же пакет с
 /// меньшим `limit`.
@@ -3590,6 +3595,9 @@ pub async fn recall(
     };
     let review = mode == IdeasMode::Review;
     let mut idea_cands: Vec<Cand> = Vec::new();
+    // строка очереди разбора к `prompt` (M6.6 §3.5): свой отбор показанного — по эпохе и
+    // ревизии ([`ideas::review_queue_head`]), а не общий фильтр идей «любая эпоха»
+    let mut queue_cands: Vec<Cand> = Vec::new();
     let (mut lines, sections, repeatable) = match req.event {
         _ if !enabled => (Lines::default(), Vec::new(), true),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
@@ -3619,7 +3627,9 @@ pub async fn recall(
         Event::Prompt => {
             let s = session.as_ref();
             let (h, d) = (&mut health, &mut deadline);
-            let secs = prompt_sections(&st, &p, &sh, &req, s, ideas_on, review, h, d).await?;
+            let (secs, queue) =
+                prompt_sections(&st, &p, &sh, &req, s, ideas_on, review, h, d).await?;
+            queue_cands = queue;
             (Lines::default(), secs, false)
         }
         Event::PostTool => {
@@ -3667,7 +3677,7 @@ pub async fn recall(
     let ideas_max = st.cfg.ideas.prompt_max as usize;
     let entries = st.cfg.recall.digest_entries;
     let mut dup: HashSet<TargetRef> = HashSet::new();
-    let chosen: Vec<(Option<&'static str>, Vec<&Cand>)> = sections
+    let mut chosen: Vec<(Option<&'static str>, Vec<&Cand>)> = sections
         .iter()
         .map(|(title, cands)| {
             let per = section_limit(req.event, *title, cands, limit, ideas_max, entries);
@@ -3681,6 +3691,17 @@ pub async fn recall(
             (*title, chosen)
         })
         .collect();
+    // строка очереди — последним разделом `prompt`, показанное уже отсеяно своим правилом
+    if !queue_cands.is_empty() {
+        let per = section_limit(req.event, None, &queue_cands, limit, ideas_max, entries);
+        let queue: Vec<&Cand> = queue_cands
+            .iter()
+            .filter(|c| health.alive[c.target])
+            .filter(|c| dup.insert(c.tref))
+            .take(per)
+            .collect();
+        chosen.push((None, queue));
+    }
     // идеи дайджеста — не раздел `sections`: свой отбор уже сделан ([`digest_ideas`])
     let ideas: Vec<&Cand> = idea_cands
         .iter()
@@ -3699,6 +3720,12 @@ pub async fn recall(
         0
     };
     let (mut packed, mut picked) = arrange(recovery, rules_reserved, lines, ideas, chosen);
+    // строка очереди, снятая пределом вывода канала, — с адресом очереди, а не общим «строк:
+    // 1 (memory_recall)» (ревью задачи 14, M2)
+    let is_queue = |c: &Cand| queue_cands.iter().any(|q| std::ptr::eq(c, q));
+    if let Some(si) = picked.iter().position(|p| p.iter().any(|c| is_queue(c))) {
+        packed[si].omit = Some((OMIT_REVIEW_QUEUE.0.into(), OMIT_REVIEW_QUEUE.1.into()));
+    }
     if !code_section.is_empty() {
         // раздел `### Код` — после `### Файлы`; строки карты не подсказки записей (без учёта)
         packed.push(Section::new(Some(SECTION_CODE.to_string()), code_section));

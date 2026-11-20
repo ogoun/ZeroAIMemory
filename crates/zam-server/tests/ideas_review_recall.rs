@@ -925,9 +925,8 @@ async fn prompt_review_queue_line_once() {
 }
 
 /// Дайджест `session_start` этой сессии показал очередь (`### Идеи на разбор`, отметка в
-/// `session_seen`) — запрос без строки, и после сжатия контекста (новая эпоха: показ идей — любой
-/// эпохи). Идея, записанная человеком посреди сессии, — строкой к следующему запросу (случай
-/// замечания 36), один раз.
+/// `session_seen` той же эпохи) — запрос без строки. Идея, записанная человеком посреди сессии, —
+/// строкой к следующему запросу (случай замечания 36), один раз.
 #[tokio::test]
 async fn prompt_review_queue_after_digest_silent() {
     let a = server("queue-digest", |_| {}).await;
@@ -936,14 +935,6 @@ async fn prompt_review_queue_after_digest_silent() {
     assert_eq!(items(&j, "idea_review"), [format!("w:{x}")], "{j}");
     let j = ask(&a, "d1", "продолжай").await;
     assert_eq!(text(&j), "", "{j}");
-    recall(
-        &a,
-        Some("d1"),
-        json!({"event": "session_start", "solution": G, "source": "compact"}),
-    )
-    .await;
-    let j = ask(&a, "d1", "продолжай").await;
-    assert_eq!(text(&j), "", "после сжатия: {j}");
     let y = idea(&a, "Тёмная тема", "Замысел.", json!({})).await;
     let j = ask(&a, "d1", "Продолжай!").await;
     assert_eq!(
@@ -952,6 +943,127 @@ async fn prompt_review_queue_after_digest_silent() {
         "{j}"
     );
     let j = ask(&a, "d1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+}
+
+/// Ревью задачи 14 (Important 1, решение координатора): показ строки очереди — по текущей эпохе
+/// сессии. Дайджест показал две идеи → запрос без строки → сжатие контекста (`session_start
+/// source=compact`, новая эпоха; пакет восстановления раздела идей не несёт) → голова очереди
+/// снова, по идее на запрос с « (ещё N)», затем тишина. Второе сжатие — снова.
+#[tokio::test]
+async fn prompt_review_queue_after_compaction() {
+    let a = server("queue-compact", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let y = idea(&a, "Тёмная тема", "Замысел.", json!({})).await;
+    let j = start(&a, "c1").await;
+    assert_eq!(
+        items(&j, "idea_review"),
+        [format!("w:{x}"), format!("w:{y}")],
+        "{j}"
+    );
+    let j = ask(&a, "c1", "продолжай").await;
+    assert_eq!(text(&j), "", "та же эпоха: {j}");
+    let compact = json!({"event": "session_start", "solution": G, "source": "compact"});
+    for round in 0..2 {
+        let j = recall(&a, Some("c1"), compact.clone()).await;
+        assert!(
+            !text(&j).contains(REVIEW_SECTION),
+            "пакет восстановления: {j}"
+        );
+        let j = ask(&a, "c1", "продолжай").await;
+        assert_eq!(
+            text_lines(&j),
+            [queue_line("Экспорт отчётов в PDF", &x, 1).as_str()],
+            "сжатие {round}: {j}"
+        );
+        let j = ask(&a, "c1", "продолжай").await;
+        assert_eq!(
+            text_lines(&j),
+            [queue_line("Тёмная тема", &y, 0).as_str()],
+            "сжатие {round}: {j}"
+        );
+        let j = ask(&a, "c1", "продолжай").await;
+        assert_eq!(text(&j), "", "сжатие {round}: {j}");
+    }
+}
+
+/// Ревью задачи 14 (Important 1): показ — по ревизии идеи. Идея, вернувшаяся в `new` новой
+/// ревизией, приходит строкой снова и в той же эпохе: разбор «на доработку» и дописка человека
+/// (`returned` → `new`); предложение человеку в режиме `propose` и снятый вопрос (`proposed` →
+/// `new`). Пока идея не `new`, строки нет.
+#[tokio::test]
+async fn prompt_review_queue_new_revision() {
+    let a = server("queue-rev", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let line = queue_line("Экспорт отчётов в PDF", &x, 0);
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text_lines(&j), [line.as_str()], "{j}");
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+    // на доработку → дописка человека: снова `new`, новая ревизия
+    review(
+        &a,
+        &x,
+        json!({"outcome": "return", "summary": summary("Нужны подробности."),
+               "missing": "какие отчёты"}),
+    )
+    .await;
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "returned — не в очереди: {j}");
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{x}"),
+            Some(json!({"append_body": "Человек: все отчёты.", "by": "human"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["status"], "new");
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text_lines(&j), [line.as_str()], "снова new: {j}");
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+    // предложение (режим propose) → вопрос снят: снова `new`, новая ревизия
+    let settings = format!("/api/v1/admin/users/{}/settings", a.admin_id());
+    let set_mode = |mode: &'static str| {
+        let (a, uri) = (&a, &settings);
+        async move {
+            let r = a
+                .adm(
+                    Method::PATCH,
+                    uri,
+                    Some(json!({"ideas": {"mode": mode}})),
+                    None,
+                )
+                .await;
+            ok(&r, StatusCode::OK);
+        }
+    };
+    set_mode("propose").await;
+    let r = post(&a, &x, "propose", json!({})).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["entry"]["status"], "proposed");
+    let q = id(&r.json()["question"]);
+    set_mode("review").await;
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "proposed — не в очереди: {j}");
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::DELETE,
+            &format!("/api/v1/entries/{q}"),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::NO_CONTENT);
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(
+        text_lines(&j),
+        [line.as_str()],
+        "вопрос снят — снова new: {j}"
+    );
+    let j = ask(&a, "v1", "продолжай").await;
     assert_eq!(text(&j), "", "{j}");
 }
 
@@ -1095,14 +1207,63 @@ async fn prompt_review_queue_skips_idea_hint() {
     assert_eq!(text(&j), "", "{j}");
 }
 
-/// Строка очереди не уложилась в срок `prompt` (тестовая метка в заголовке идеи, фича
-/// `test-hooks`: шаг «спит» до срока без запаса) — тишина без предупреждений (`recall timeout`
-/// нет), показ не отмечается. Сбор длился больше секунды — строка шла медленным путём, а не
+/// Ревью задачи 14 (M3): без строки очереди — токен `ro` (разбор дал бы 403), `[ideas]
+/// prompt_max = 0` (подсказок-идей к запросу нет), запрос из одних пробелов (не запрос
+/// человека); тот же сервер другим токеном и другим запросом строку даёт.
+#[tokio::test]
+async fn prompt_review_queue_ro_max0_blank_silent() {
+    let a = server("queue-cond", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let ro = a.issue(&a.admin_id(), "ro").await;
+    let body = |s: &str| json!({"event": "prompt", "solution": G, "prompt": s});
+    let j = recall_as(&a, &ro, Some("ro1"), body("продолжай")).await;
+    assert_eq!(text(&j), "", "токен ro: {j}");
+    for blank in ["   ", " \n\t "] {
+        let j = ask(&a, "b1", blank).await;
+        assert_eq!(text(&j), "", "{blank:?}: {j}");
+    }
+    let j = ask(&a, "b1", "продолжай").await;
+    assert_eq!(
+        text_lines(&j),
+        [queue_line("Экспорт отчётов в PDF", &x, 0).as_str()],
+        "{j}"
+    );
+    let a = server("queue-max0", |c| c.ideas.prompt_max = 0).await;
+    idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let j = ask(&a, "z1", "продолжай").await;
+    assert_eq!(text(&j), "", "prompt_max = 0: {j}");
+}
+
+/// Ревью задачи 14 (M3): запрос без сессии (ни `session_id`, ни `X-Zam-Session`) — без учёта
+/// показанного, как у прочих подсказок: строка к каждому такому запросу; сессия после них — тоже
+/// со строкой.
+#[tokio::test]
+async fn prompt_review_queue_without_session_repeats() {
+    let a = server("queue-nosession", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let line = queue_line("Экспорт отчётов в PDF", &x, 0);
+    for _ in 0..2 {
+        let j = recall(
+            &a,
+            None,
+            json!({"event": "prompt", "solution": G, "prompt": "продолжай"}),
+        )
+        .await;
+        assert_eq!(text_lines(&j), [line.as_str()], "{j}");
+    }
+    let j = ask(&a, "n1", "продолжай").await;
+    assert_eq!(text_lines(&j), [line.as_str()], "{j}");
+}
+
+/// Чтение головы очереди не уложилось в срок (тестовая метка в заголовке идеи, фича
+/// `test-hooks`: шаг чтения «зависает», его обрывает срок `own.step` — у чтения до поиска не
+/// дальше половины остатка) — тишина без предупреждений (`recall timeout` нет), показ в
+/// `session_seen` не отмечен. Сбор длился больше секунды — строка шла медленным путём, а не
 /// пропущена.
 #[tokio::test]
 async fn prompt_review_queue_timeout_silent() {
     let a = server("queue-timeout", |_| {}).await;
-    let mark = zam_server::api::recall::TEST_SLOW_IDEA_MARK;
+    let mark = zam_server::api::recall::TEST_SLOW_QUEUE_MARK;
     idea(&a, &format!("Медленная идея {mark}"), "Замысел.", json!({})).await;
     let j = recall(
         &a,
@@ -1117,6 +1278,41 @@ async fn prompt_review_queue_timeout_silent() {
         j["timings"]["collect_ms"].as_f64().unwrap() >= 1000.0,
         "{j}"
     );
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let seen = zam_store::seen_entry_ids(&db, "t1", a.st.admin_id, zam_store::RECALL_PART)
+        .await
+        .unwrap();
+    assert!(seen.is_empty(), "{seen:?}");
+}
+
+/// Ревью задачи 14 (M2): строка очереди, снятая пределом вывода канала, — со своим адресом
+/// «не показано — идей на разбор: 1 (memory_recall event=idea_review)», а не общим «строк»;
+/// показ не отмечается — без предела строка приходит.
+#[tokio::test]
+async fn prompt_review_queue_output_limit_omit() {
+    let a = server("queue-limit", |_| {}).await;
+    let x = idea(
+        &a,
+        &"Очень длинный заголовок идеи ".repeat(4),
+        "Замысел.",
+        json!({}),
+    )
+    .await;
+    let j = recall(
+        &a,
+        Some("l1"),
+        json!({"event": "prompt", "solution": G, "prompt": "продолжай",
+               "output_limit": {"unit": "chars", "max": 120}}),
+    )
+    .await;
+    assert_eq!(
+        text(&j).trim_end(),
+        "ZeroAIMemory: не показано — идей на разбор: 1 (memory_recall event=idea_review)",
+        "{j}"
+    );
+    assert!(items(&j, "idea_review").is_empty(), "{j}");
+    let j = ask(&a, "l1", "продолжай").await;
+    assert!(text(&j).contains(&format!("w:{x}")), "{j}");
 }
 
 // ---- режим propose ----
