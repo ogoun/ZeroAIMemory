@@ -1875,18 +1875,54 @@ async fn import_links_outside_skipped_reported() {
     );
 }
 
-/// Сканер секретов работает, как при обычной записи: предупреждение `secrets_detected`.
+/// Сканер секретов работает, как при обычной записи: предупреждение `secrets_detected`. Архив —
+/// из сессии WebUI: экспорт по токену маскирует секреты (задача 5 M7.1), находить было бы нечего.
 #[tokio::test]
 async fn import_secrets_detected_warning() {
     let w = world("imp-secret").await;
     // фиктивный ключ собирается конкатенацией: в исходнике его нет целиком (push protection)
     let key = format!("{}{}", "AK", "IAQWERTYUIOPASDFGH");
     note(&w.a, &w.o.tok, G, "s", &format!("ключ {key} тут")).await;
-    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let zip = export_web(&w.a, &w.o, G, "").await;
     let r = report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
     let ws = r["warnings"].to_string();
     assert!(ws.contains("secrets_detected"), "{r}");
     assert!(!ws.contains(&key), "значение секрета в отчёте: {r}");
+    assert!(
+        !ws.contains("замаскированы"),
+        "архив сессии — исходник: {r}"
+    );
+}
+
+/// Импорт архива, снятого по токену (опись `secrets_masked: true`, задача 5 M7.1, спецификация
+/// M7 §4.3.1 п. 6), — предупреждение «секреты в архиве замаскированы и не восстановятся»; метка
+/// `‹secret›` ложится в базу как есть (значения в архиве нет). Архив по токену без секретов
+/// признака не несёт — и предупреждения нет.
+#[tokio::test]
+async fn import_masked_archive_warns() {
+    let w = world("imp-masked").await;
+    let key = format!("{}{}", "AK", "IAQWERTYUIOPASDFGH");
+    note(&w.a, &w.o.tok, G, "s", &format!("ключ {key} тут")).await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let r = report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+    let ws = r["warnings"].to_string();
+    assert!(
+        ws.contains("секреты в архиве замаскированы и не восстановятся"),
+        "{r}"
+    );
+    assert!(!ws.contains(&key), "{r}");
+    let db = db(&w.a, &w.rw.id).await;
+    let id = node_by_path(&db, "s").await.expect("заметка импортирована");
+    let (_, text) = zam_store::node_content(&db, id.parse().unwrap(), None)
+        .await
+        .unwrap();
+    assert!(text.contains("ключ ‹secret› тут"), "{text}");
+    // без секретов — признака и предупреждения нет
+    let w = world("imp-masked-clean").await;
+    note(&w.a, &w.o.tok, G, "c", "чистый текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let r = report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+    assert!(!r["warnings"].to_string().contains("замаскированы"), "{r}");
 }
 
 /// Участник решения (`rw` и `ro`) не импортирует — 403; владелец и администратор — да.

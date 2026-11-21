@@ -123,6 +123,10 @@ pub async fn tree(
         Some(get_node_by_path(&sc.db, sc.space.id, &np).await?.id)
     };
     let items = list_children(&sc.db, sc.space.id, parent, depth).await?;
+    // агенту по токену — `frontmatter` и L0 узлов с маской секретов (задача 5 M7.1; MCP
+    // `memory_tree`)
+    let mut items = json!(items);
+    super::agent_view::view_json(&p, &mut items, super::agent_view::NODE_FIELDS);
     Ok(Json(json!({ "space": sc.space, "items": items })))
 }
 

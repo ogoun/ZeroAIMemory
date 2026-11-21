@@ -106,6 +106,8 @@ fn health_features_documented() {
         "recall_timeout",
         "mcp_session_arg",
         "epochs",
+        // выдача агенту по токену — с `‹secret›` (задача 5 M7.1)
+        "agent_text_masked",
     ] {
         assert!(built.contains(f), "{f}");
     }

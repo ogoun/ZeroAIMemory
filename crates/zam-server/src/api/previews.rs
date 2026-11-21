@@ -8,8 +8,8 @@
 //!   листа в `/read` и карточках поиска (порядок листов среди единиц, `api::doc_locator`) — у
 //!   каждого листа с единицами извлечения, когда документ извлечён (иначе `null`); `header`,
 //!   `rows`, `first_row`,
-//!   `total_rows`, `cols`, `warnings`. Ячейки не маскируются: превью показывает файл, как
-//!   скачивание блоба.
+//!   `total_rows`, `cols`, `warnings`. Сессии WebUI ячейки — как в файле (превью показывает файл,
+//!   как скачивание блоба); токену — с маской секретов (ниже).
 //! - `kind=thumb&page=<N>&px=<1..=1024>` — PNG: страница PDF (pdfium) или изображение PNG, JPEG,
 //!   GIF, WebP (вид — по сигнатуре; SVG — не изображение); по умолчанию `page=1`, `px=256`.
 //! - `kind=text` — JSON: PPTX — `{format: "slides", slides: [{slide, title, text, notes}]}`;
@@ -19,6 +19,13 @@
 //!   подсвечиваются первые 64 КиБ; разметка больше 40 × исходник (`[` в JSON и т. п.) — весь
 //!   текст экранирован, `highlight_skipped: "too_large"`. HTML от рабочего процесса проверяется
 //!   (`zam_markdown::is_highlight_html`): иной — отброшен, текст экранируется здесь.
+//!
+//! **Токену** (агент: задача 5 M7.1, спецификация M7 §4.3.1 п. 7 — **[решение координатора]**)
+//! текст и ячейки — с `‹secret›` вместо значений ([`crate::api::agent_view`]): лист — маска
+//! заголовка и строк страницы при ответе (кэш страницы общий, сырой); слайды PPTX — маска текста;
+//! HTML подсветки — по маскированному тексту файла (маска всего начала файла до подсветки: по
+//! разметке маска не работает), в своём файле кэша `m<RULES_VERSION>-…`. ETag маски — свой (у
+//! листа — с суффиксом `.m<RULES_VERSION>`). Миниатюры и сам файл (`GET /blobs/…`) — как есть.
 //!
 //! Неудача построения (422) помнится: свойство файла (`parse_error`, `too_large`, `unsupported`)
 //! — 5 мин, сбой процесса (`parse_timeout`, `parse_crash`, `parse_oom`) — 45 с
@@ -53,11 +60,13 @@ use tokio::io::AsyncReadExt as _;
 use zam_core::Id;
 use zam_docs::{DocError, DocKind, Limits, Locator};
 use zam_markdown::mask_text;
+use zam_markdown::secrets::RULES_VERSION;
 use zam_store::blobs::is_sha256;
 use zam_store::{
     BlobStore, Db, blob_meta_by_sha, blob_meta_by_sha_in_space, report_blob_meta_by_sha,
 };
 
+use super::agent_view;
 use super::blobs::NoCompress;
 use super::doc_locator::Sheets;
 use super::query;
@@ -321,10 +330,23 @@ pub async fn preview(
         return Err(ApiError::NotFound);
     }
     let svc = st.previews.clone();
-    let name = svc.file_name(&key, &loc.filename);
+    // агенту — маска текста и ячеек (миниатюра — картинка, как есть)
+    let masked = agent_view::masks(&p) && !matches!(key, PreviewKey::Thumb { .. });
+    let raw_name = svc.file_name(&key, &loc.filename);
+    // вид с маской — свой ETag; у текста — и свой файл кэша (HTML строится по маске)
+    let tag_name = if masked {
+        format!("m{RULES_VERSION}-{raw_name}")
+    } else {
+        raw_name.clone()
+    };
+    let name = if masked && key == PreviewKey::Text {
+        tag_name.clone()
+    } else {
+        raw_name
+    };
     let base_tag = format!(
         "\"{sha}.{}\"",
-        name.rsplit_once('.').map_or(&*name, |(n, _)| n)
+        tag_name.rsplit_once('.').map_or(&*tag_name, |(n, _)| n)
     );
     let ctype = match key {
         PreviewKey::Thumb { .. } => "image/png",
@@ -359,7 +381,7 @@ pub async fn preview(
                 return Err(ApiError::Unprocessable(detail));
             }
             let _permit = svc.permit().await;
-            match build(&st, &loc, &path, &key).await {
+            match build(&st, &loc, &path, &key, masked).await {
                 Ok(b) => b,
                 Err(ApiError::Unprocessable(detail)) => {
                     svc.remember_failure(loc.owner, &sha, &name, detail.clone());
@@ -376,7 +398,7 @@ pub async fn preview(
         PreviewKey::Sheet { no, .. } => {
             let page: WireSheetPage = serde_json::from_slice(&built.data)
                 .map_err(|e| ApiError::Internal(format!("страница листа превью: {e}")))?;
-            let (body, refs) = sheet_json(&loc, &sha, no, page).await;
+            let (body, refs) = sheet_json(&loc, &sha, no, page, masked).await;
             let etag = match refs {
                 Some(r) => format!("{}.n{r}\"", base_tag.trim_end_matches('"')),
                 None => base_tag,
@@ -414,12 +436,14 @@ struct Built {
     cache: bool,
 }
 
-/// Строит превью в рабочем процессе.
+/// Строит превью в рабочем процессе; `masked` — текст агенту с маской секретов (лист маскируется
+/// при ответе, [`sheet_json`]).
 async fn build(
     st: &AppState,
     loc: &Located,
     path: &std::path::Path,
     key: &PreviewKey,
+    masked: bool,
 ) -> Result<Built, ApiError> {
     let svc = &st.previews;
     let limits = svc.limits().clone();
@@ -486,7 +510,14 @@ async fn build(
                     .extract(DocKind::Pptx, bytes)
                     .await
                     .map_err(|f| failed(st, f, false))?;
-                slides_json(x)
+                let mut v = slides_json(x);
+                if masked {
+                    agent_view::mask_fields(
+                        &mut v,
+                        &["slides.title", "slides.text", "slides.notes"],
+                    );
+                }
+                v
             } else {
                 let (head, more) = read_head(path, TEXT_MAX).await?;
                 let textual = matches!(kind, None | Some(DocKind::Text | DocKind::Csv))
@@ -495,6 +526,13 @@ async fn build(
                 if !textual {
                     return Err(unfit("текста"));
                 }
+                // агенту — подсветка маскированного текста: маска всего начала файла до разметки
+                // (в HTML значение разрезано тегами подсветки, по нему маска не работает)
+                let head = if masked {
+                    masked_head(head, more).await?
+                } else {
+                    head
+                };
                 let head = Bytes::from(head);
                 let h = pool
                     .highlight(head.clone(), loc.filename.clone(), more)
@@ -536,6 +574,20 @@ fn checked_html(h: WireHtml, head: &[u8], truncated: bool) -> WireHtml {
         highlighted: 0,
         skipped: None,
     }
+}
+
+/// Начало текстового файла `head` с маской секретов: текст — как его подсвечивает рабочий процесс
+/// (BOM снят, обрезанный последний символ отброшен, неверный UTF-8 — U+FFFD,
+/// [`crate::docs::worker::source_text`]), маска — в пуле блокирующих задач (до 1 МиБ — до 20 мс).
+/// Двоичный файл (нулевой байт) — как есть: подсветка его отвергнет.
+async fn masked_head(head: Vec<u8>, truncated: bool) -> Result<Vec<u8>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let masked = crate::docs::worker::source_text(&head, truncated)
+            .map(|t| agent_view::mask(&t).into_owned().into_bytes());
+        masked.unwrap_or(head)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("маска превью: {e}")))
 }
 
 async fn read_all(path: &std::path::Path) -> Result<Bytes, ApiError> {
@@ -586,6 +638,7 @@ async fn sheet_json(
     sha: &str,
     no: u32,
     p: WireSheetPage,
+    masked: bool,
 ) -> (Value, Option<String>) {
     let secret: Vec<bool> = p.sheets.iter().map(|n| mask_text(n) != *n).collect();
     let refs = match zam_store::blob_sheet_locators(&loc.db, sha).await {
@@ -613,7 +666,7 @@ async fn sheet_json(
             .collect();
         blake3::hash(nos.join(",").as_bytes()).to_hex()[..8].to_string()
     });
-    let body = json!({
+    let mut body = json!({
         "kind": "sheet",
         "sheet": no,
         "name": mask_text(&p.sheet),
@@ -625,6 +678,10 @@ async fn sheet_json(
         "cols": p.cols,
         "warnings": p.warnings,
     });
+    // агенту — ячейки с маской: каждая ячейка — свой текст
+    if masked {
+        agent_view::mask_fields(&mut body, &["header", "rows"]);
+    }
     (body, tag)
 }
 

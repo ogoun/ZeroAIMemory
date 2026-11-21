@@ -81,7 +81,8 @@
 //!   текущая rev8`; снята сроком хранения — `not_found` «ревизия N недоступна — перечитайте с
 //!   focus»); без ревизии — 400; середина символа и выход за текст — `invalid` с причиной; у
 //!   записи — `invalid`, у вложения (`a:`/`b:`/`d:`) — 400 всему запросу. Права, Vault и
-//!   маскирование — как у L2 (тот же текст и путь доступа).
+//!   маскирование — как у L2 (тот же текст и путь доступа): по токену `S-E` — байты
+//!   **маскированного** текста ревизии (маска всей ревизии, затем срез).
 //!   Листы, целиком лежащие в диапазоне текущей ревизии, отмечаются выданными сессии. `range` в
 //!   json, ` › range:r<rev>:S-E` в заголовке md; не L2, с `section` или
 //!   `since_rev` — 400, вне текста или не на границе символа — `invalid`, у вложения — 400;
@@ -92,6 +93,13 @@
 //!   заголовок на элемент `### n:<id> <пространство>/<путь> › <секция>  rev<N> · ~<T> tok`
 //!   (у записи — как карточка §9.3: `### i:<id> insight/gotcha «заголовок»  active ·
 //!   hypothesis · rev2 · ~120 tok`), текст и последняя строка `~<total> tok`.
+//!
+//! **Секреты в выдаче агенту** (задача 5 M7.1, спецификация M7 §4.3.1, [`super::agent_view`]):
+//! по токену текст узла (L0, L1, L2, `section`, фокус, `range`, дифф `since_rev`) и записи
+//! журнала (заголовок, L0, L1, L2, `section`, дифф снимков) — с `‹secret›` вместо значения; маска
+//! накладывается на всю ревизию **до** нарезки, смещения `range`, пропуски фокуса и их `~N` — по
+//! маскированному тексту. Сессии WebUI — исходник. Вложения — текст чанков (маскирован при
+//! нарезке); имена файлов и пути — как есть.
 //!
 //! Маршрут — служебный, не в `memory_routes`: `/read` читает память и не пишет в неё, потому
 //! `memory_writes` сессии не растёт (решение контроллера R12).
@@ -116,6 +124,7 @@ use zam_store::{
     seen_revs,
 };
 
+use super::agent_view;
 use super::doc_locator::Sheets;
 use super::json_body;
 use super::nodes::diff_blocking;
@@ -488,7 +497,14 @@ fn slice<'a>(text: &'a str, section: &str) -> Result<&'a str, Failure> {
     })
 }
 
+/// Текст ревизии для зрителя `p` ([`agent_view::view_owned`]): агенту — маска **всей** ревизии,
+/// до секции, L1, фокуса, `range` и диффа (§4.3.1).
+async fn shown_text(p: &Principal, text: String) -> String {
+    agent_view::view_owned(p, text).await
+}
+
 async fn fetch_node(
+    p: &Principal,
     sc: NodeScope,
     it: &ReadItem,
     tier: Tier,
@@ -514,7 +530,9 @@ async fn fetch_node(
     let content = if it.if_rev == Some(node.current_rev) || it.since_rev == Some(node.current_rev) {
         Content::Unchanged
     } else if tier == Tier::L0 {
-        Content::plain(node.l0.clone().unwrap_or_default(), false)
+        // L0 хранится маскированным (кроме ручного L0 папки старого импорта): маска идемпотентна
+        let l0 = node.l0.as_deref().unwrap_or_default();
+        Content::plain(agent_view::view(p, l0).into_owned(), false)
     } else if node.kind == NodeKind::Folder {
         return Err(ApiError::BadRequest("узел — папка: текста нет".into()).into());
     } else if let Some(since) = it.since_rev {
@@ -526,6 +544,12 @@ async fn fetch_node(
             Err(StoreError::NotFound) => None,
             Err(e) => return Err(e.into()),
         };
+        // каждая ревизия — маской до диффа: маска строки диффа ≠ строка диффа масок
+        let old = match old {
+            Some(t) => Some(shown_text(p, t).await),
+            None => None,
+        };
+        let new = shown_text(p, new).await;
         changes(old, new, since, node.current_rev).await?
     } else if let Some(r) = it.range.as_deref().filter(|_| section.is_none()) {
         let (rev, a, b) = parse_range(r).map_err(Failure::Fatal)?;
@@ -548,6 +572,9 @@ async fn fetch_node(
             }
             Err(e) => return Err(e.into()),
         };
+        // агенту — маска всей ревизии, затем срез: адрес выдан по маскированному тексту, а маска
+        // куска исходника — не кусок маски
+        let text = shown_text(p, text).await;
         let piece = byte_range(&text, a, b, rev)?.to_string();
         if rev != node.current_rev {
             warnings.push(format!("range: rev{rev}, текущая rev{}", node.current_rev));
@@ -557,8 +584,10 @@ async fn fetch_node(
         range_rev = Some(rev);
         Content::plain(piece, false)
     } else {
-        // ровно та ревизия, что в снимке узла
+        // ровно та ревизия, что в снимке узла; агенту — маска всей ревизии до секции, фокуса и
+        // L1 (листы нарезаны по тому же маскированному тексту — фокус их находит)
         let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
+        let text = shown_text(p, text).await;
         let (text, whole) = match section {
             Some(s) => (slice(&text, s)?.to_string(), false),
             None => (text, true),
@@ -655,6 +684,7 @@ fn summary_of(e: &zam_store::Entry) -> String {
 }
 
 async fn fetch_entry(
+    p: &Principal,
     sc: EntryScope,
     it: &ReadItem,
     tier: Tier,
@@ -670,10 +700,12 @@ async fn fetch_entry(
                 .filter(|s| !s.is_empty())
         })
         .flatten();
+    // сводка и заголовок записи — для зрителя (агенту — маска, §4.3.1 п. 1)
+    let summary = || agent_view::view(p, &summary_of(e)).into_owned();
     let content = if it.if_rev == Some(e.rev) || it.since_rev == Some(e.rev) {
         Content::Unchanged
     } else if tier == Tier::L0 {
-        Content::plain(summary_of(e), false)
+        Content::plain(summary(), false)
     } else if let Some(since) = it.since_rev {
         check_since(since, e.rev)?;
         let revs = entry_revisions(&sc.db, e.id).await?;
@@ -684,7 +716,12 @@ async fn fetch_entry(
         };
         // снимка текущей ревизии нет (запись до M3) — по самой записи
         let new = snap(e.rev).unwrap_or_else(|| entry_snapshot_text(&e.title, &e.body, &e.data));
-        changes(snap(since), new, since, e.rev).await?
+        // каждый снимок — маской до диффа
+        let old = match snap(since) {
+            Some(t) => Some(shown_text(p, t).await),
+            None => None,
+        };
+        changes(old, shown_text(p, new).await, since, e.rev).await?
     } else {
         if it.range.is_some() {
             return Err(Failure::Item(Fail::new(
@@ -692,23 +729,22 @@ async fn fetch_entry(
                 Some("range — только у заметки (адрес пропуска фокуса)".into()),
             )));
         }
+        // тело целиком — маской до секции и L1
+        let body = shown_text(p, e.body.clone()).await;
         let (text, whole) = match section {
-            Some(s) => (slice(&e.body, s)?.to_string(), false),
-            None => (e.body.clone(), true),
+            Some(s) => (slice(&body, s)?.to_string(), false),
+            None => (body, true),
         };
         match tier {
             Tier::L1 => {
                 let t = l1(&text);
-                let t = if t.trim().is_empty() {
-                    summary_of(e)
-                } else {
-                    t
-                };
+                let t = if t.trim().is_empty() { summary() } else { t };
                 Content::plain(t, false)
             }
             _ => Content::plain(text, whole),
         }
     };
+    let title = agent_view::view(p, &e.title).into_owned();
     let (letter, kind) = (e.kind.ref_letter(), e.kind.as_str());
     let reference = format!("{letter}:{}", e.id);
     let target = TargetRef {
@@ -731,12 +767,12 @@ async fn fetch_entry(
     };
     Ok(Fetched {
         raw: it.id.clone(),
-        head: format!("{reference} {label} «{}»", md_inline(&e.title)),
+        head: format!("{reference} {label} «{}»", md_inline(&title)),
         reference,
         kind,
         space: sc.space.name.clone(),
         path: None,
-        title: Some(e.title.clone()),
+        title: Some(title),
         status: e.status.map(|s| s.as_str().to_string()),
         certainty: e.certainty.map(|c| c.as_str().to_string()),
         section: section.map(str::to_string),
@@ -1310,8 +1346,8 @@ async fn fetch(
     let limit = it.max_tokens.unwrap_or(budget).min(budget);
     let focus_limit = limit.saturating_sub(FOCUS_HEADER_RESERVE).max(1);
     match resolve(st, p, headers, &it.id).await? {
-        Located::Node(sc) => fetch_node(sc, it, tier, fx, focus, focus_limit).await,
-        Located::Entry(sc) => fetch_entry(sc, it, tier, focus.is_some()).await,
+        Located::Node(sc) => fetch_node(p, sc, it, tier, fx, focus, focus_limit).await,
+        Located::Entry(sc) => fetch_entry(p, sc, it, tier, focus.is_some()).await,
         Located::Attachment(sc, reference) => {
             if it.range.is_some() {
                 return Err(Failure::Item(Fail::new(

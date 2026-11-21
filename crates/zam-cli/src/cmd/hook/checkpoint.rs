@@ -8,6 +8,8 @@
 //! Задачи журнала (M4.5 §3): `GET /sessions/{id}` несёт `claimed_tasks`; есть задача `in_progress`,
 //! захваченная сессией, и маркер правок — единственное напоминание содержит «обнови next_step
 //! задачи k:<id>» и приходит, даже если в память уже писали (сам захват — запись в память).
+//! Заголовки задач и знаний в напоминании — с маской секретов `zam-secrets` до обрезки (задача 5
+//! M7.1, [`shown_title`]).
 //! Пары «ошибка → исправление» (M4.5 §9.3, ключ `session_journal`): в журнале сессии есть пара
 //! ([`journal::fixes_at`]), а после последней не было записи insight — то же напоминание
 //! содержит «запиши gotcha/failure с error_regex: <ошибка> (правки: <файлы>)» ([`fix_line`]) и
@@ -70,6 +72,13 @@ pub const REMINDER: &str = "ZeroAIMemory: в этой сессии были пр
 (MCP: memory_log), открытие, ловушку или провал — `zam log insight`. Если записывать нечего — \
 просто заверши работу.";
 
+/// Заголовок записи в напоминании агенту: маска секретов `zam-secrets` **до** обрезки (иначе
+/// разрезанный границей ключ маска не узнала бы) и не длиннее `max` символов (задача 5 M7.1;
+/// сервер M7.1 уже маскирует его для токена — здесь ещё и для старого сервера).
+fn shown_title(title: &str, max: usize) -> String {
+    zam_secrets::mask_text(title).chars().take(max).collect()
+}
+
 /// Строка про next_step захваченных задач `in_progress` (до 3); пусто — таких нет.
 pub fn task_line(v: &serde_json::Value) -> Option<String> {
     let items: Vec<String> = v["claimed_tasks"]
@@ -79,10 +88,7 @@ pub fn task_line(v: &serde_json::Value) -> Option<String> {
         .filter_map(|t| {
             let id = t["id"].as_str()?;
             let title = t["title"].as_str().unwrap_or("");
-            Some(format!(
-                "k:{id} («{}»)",
-                title.chars().take(60).collect::<String>()
-            ))
+            Some(format!("k:{id} («{}»)", shown_title(title, 60)))
         })
         .take(3)
         .collect();
@@ -461,15 +467,13 @@ pub fn impact_lines(v: &Value) -> Vec<String> {
             Some(sym) => format!("{path}#{sym}"),
             None => path.to_string(),
         };
-        let title: String = k["title"]
+        let one_line = k["title"]
             .as_str()
             .unwrap_or("")
             .split_whitespace()
             .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(IMPACT_TITLE_MAX)
-            .collect();
+            .join(" ");
+        let title = shown_title(&one_line, IMPACT_TITLE_MAX);
         let line = format!("ZeroAIMemory: правка затрагивает `{target}` → {id} «{title}»");
         if !out.contains(&line) {
             out.push(line);

@@ -29,6 +29,13 @@
 //! WebUI, как у вложений). Vault, карта кода, эмбеддинги, кэш выжимок, сессии, корзина в
 //! снимок не входят ([`zam_store::export`]).
 //!
+//! **Секреты** (задача 5 M7.1, спецификация M7 §4.3.1 п. 6): экспорт по токену (агент, `zam
+//! export`) маскирует тексты так же, как выдача агенту ([`crate::api::agent_view`]): текст
+//! заметки целиком, `tags` и `l0` frontmatter, L0 папок, заголовок, тело и строки `data` записей,
+//! причины отзыва, история ревизий (текст, сообщение правки; у записи — те же поля). Маска что-то
+//! заменила — опись получает `secrets_masked: true`. Блобы — как есть (бинарь не маскируется:
+//! ограничение в руководстве). Экспорт из сессии WebUI — исходник.
+//!
 //! **Аудит** — две записи: `space.export {space, user, owner, filter}` до тела (не записалась —
 //! 500, архив не отдаётся) и `space.export.done {space, user, owner, files, bytes, complete,
 //! reason}` по
@@ -62,6 +69,7 @@ use super::archive::{
     EXPORT_FORMAT, ExportFilter, ExportManifest, FOLDERS_FILE, Fingerprint, HISTORY_DIR,
     JOURNALS_DIR, LINKS_FILE, MANIFEST_FILE, attachment_file, file_name_for, front_matter,
 };
+use crate::api::agent_view;
 use crate::api::blobs::{NoCompress, admin_user};
 use crate::api::query;
 use crate::api::scope::{Mode, graph_spaces, space_scope};
@@ -386,9 +394,44 @@ struct ArchiveWriter<W: Write> {
     att: HashMap<(String, String), String>,
     blobs: Vec<BlobItem>,
     missing: Vec<String>,
+    /// Экспорт по токену: тексты — с маской секретов.
+    mask: bool,
+    /// Маска что-то заменила (опись: `secrets_masked`).
+    masked: bool,
 }
 
 impl<W: Write> ArchiveWriter<W> {
+    /// Текст для архива: по токену — с маской секретов ([`agent_view::mask_tracked`]).
+    fn shown(&mut self, s: String) -> String {
+        if self.mask {
+            agent_view::mask_tracked(s, &mut self.masked)
+        } else {
+            s
+        }
+    }
+
+    /// Строки значения `v` для архива (по токену — с маской).
+    fn shown_value(&mut self, v: &mut Value) {
+        if self.mask {
+            self.masked |= agent_view::mask_value(v);
+        }
+    }
+
+    /// Дописывает к `out` текст `s` для архива без копии исходника (по токену — с маской).
+    fn push_shown(&mut self, out: &mut String, s: &str) {
+        if !self.mask {
+            out.push_str(s);
+            return;
+        }
+        match agent_view::mask(s) {
+            std::borrow::Cow::Owned(m) => {
+                self.masked = true;
+                out.push_str(&m);
+            }
+            std::borrow::Cow::Borrowed(b) => out.push_str(b),
+        }
+    }
+
     fn text(&mut self, name: &str, data: &[u8]) -> Result<(), StoreError> {
         self.z
             .start_file(name, opts(CompressionMethod::Deflated, data.len() as u64))
@@ -443,9 +486,21 @@ impl<W: Write> ArchiveWriter<W> {
             w.bytes += line.len() as u64;
             Ok(())
         };
+        // по токену — каждая ревизия с маской (текст, сообщение; у записи — заголовок, тело,
+        // `data`, причина)
         match kind {
-            TargetKind::Node => r.for_each_node_revision(id, |rev| put(self, &rev))?,
-            _ => r.for_each_entry_revision(id, |rev| put(self, &rev))?,
+            TargetKind::Node => r.for_each_node_revision(id, |mut rev| {
+                rev.content = self.shown(std::mem::take(&mut rev.content));
+                rev.info.message = rev.info.message.take().map(|m| self.shown(m));
+                put(self, &rev)
+            })?,
+            _ => r.for_each_entry_revision(id, |mut rev| {
+                rev.title = self.shown(std::mem::take(&mut rev.title));
+                rev.body = self.shown(std::mem::take(&mut rev.body));
+                rev.reason = rev.reason.take().map(|m| self.shown(m));
+                self.shown_value(&mut rev.data);
+                put(self, &rev)
+            })?,
         }
         self.fp.end();
         self.files += 1;
@@ -494,12 +549,13 @@ mod erased {
 }
 
 /// Архив пространства в `w` (см. модуль). Порядок: заметки, папки, записи, связи, история,
-/// блобы, опись.
+/// блобы, опись. `mask` — экспорт по токену: тексты с маской секретов.
 fn write_archive<W: Write>(
     r: &SpaceReader,
     w: W,
     store: BlobStore,
     history: bool,
+    mask: bool,
     mut manifest: ExportManifest,
     stats: &mut Stats,
 ) -> Result<W, StoreError> {
@@ -513,6 +569,8 @@ fn write_archive<W: Write>(
         att: HashMap::new(),
         blobs: Vec::new(),
         missing: Vec::new(),
+        mask,
+        masked: false,
     };
     let res = write_parts(r, &mut a, history);
     stats.files = a.files;
@@ -521,6 +579,7 @@ fn write_archive<W: Write>(
     manifest.files = a.files;
     manifest.archive_fingerprint = a.fp.hex();
     manifest.missing_blobs = std::mem::take(&mut a.missing);
+    manifest.secrets_masked = a.masked;
     let m = serde_json::to_vec_pretty(&manifest).map_err(json_store)?;
     a.z.start_file(
         MANIFEST_FILE,
@@ -562,12 +621,14 @@ fn write_parts<W: Write>(
                 "created_at": fmt_ts(att.created_at), "file": file, "doc": att.doc,
             }));
         }
-        let tags = node
+        let mut tags = node
             .frontmatter
             .as_ref()
             .and_then(|f| f.get("tags"))
             .cloned()
             .unwrap_or_else(|| json!([]));
+        a.shown_value(&mut tags);
+        let l0 = node.l0.clone().map(|s| a.shown(s));
         let mut text = front_matter(&[
             ("id", json!(node.id)),
             ("path", json!(node.path)),
@@ -575,22 +636,26 @@ fn write_parts<W: Write>(
             ("certainty", json!(node.certainty)),
             ("tags", tags),
             ("refs", json!(r.refs("node", node.id)?)),
-            ("l0", json!(node.l0)),
+            ("l0", json!(l0)),
             ("l0_source", json!(node.l0_source)),
             ("created_at", json!(fmt_ts(node.created_at))),
             ("updated_at", json!(fmt_ts(node.updated_at))),
             ("attachments", Value::Array(files)),
         ]);
-        text.push_str(&r.note_content(node)?);
+        // текст ревизии — целиком (по токену — с маской всей ревизии)
+        let content = r.note_content(node)?;
+        text.push_str(&a.shown(content));
         a.text(&format!("{name}.md"), text.as_bytes())?;
     }
     if !folders.is_empty() {
         let mut rows = Vec::new();
         for f in &folders {
+            // ручной L0 папки старого импорта хранится исходником — по токену маска
+            let l0 = f.l0.clone().map(|s| a.shown(s));
             serde_json::to_writer(
                 &mut rows,
                 &json!({
-                    "id": f.id, "path": f.path, "l0": f.l0, "l0_source": f.l0_source,
+                    "id": f.id, "path": f.path, "l0": l0, "l0_source": f.l0_source,
                     "created_at": fmt_ts(f.created_at),
                 }),
             )
@@ -612,13 +677,18 @@ fn write_parts<W: Write>(
                 "created_at": fmt_ts(f.created_at), "file": file,
             }));
         }
+        // по токену — заголовок, `data`, причина отзыва и тело с маской
+        let title = a.shown(x.title.clone());
+        let mut data = x.data.clone();
+        a.shown_value(&mut data);
+        let retract_reason = x.retract_reason.clone().map(|s| a.shown(s));
         let mut text = front_matter(&[
             ("id", json!(x.id)),
             ("kind", json!(x.kind)),
-            ("title", json!(x.title)),
+            ("title", json!(title)),
             ("status", json!(x.status)),
             ("certainty", json!(x.certainty)),
-            ("data", x.data.clone()),
+            ("data", data),
             ("tags", json!(x.tags)),
             ("area", json!(x.area)),
             ("refs", json!(e.refs)),
@@ -628,7 +698,7 @@ fn write_parts<W: Write>(
             ),
             ("supersedes_id", json!(x.supersedes_id)),
             ("superseded_by_id", json!(x.superseded_by_id)),
-            ("retract_reason", json!(x.retract_reason)),
+            ("retract_reason", json!(retract_reason)),
             ("rev", json!(x.rev)),
             (
                 "author",
@@ -638,7 +708,7 @@ fn write_parts<W: Write>(
             ("updated_at", json!(fmt_ts(x.updated_at))),
             ("files", Value::Array(files)),
         ]);
-        text.push_str(&x.body);
+        a.push_shown(&mut text, &x.body);
         a.text(
             &format!("{JOURNALS_DIR}/{}/{}.md", x.kind.as_str(), x.id),
             text.as_bytes(),
@@ -785,7 +855,10 @@ pub async fn export(
         files: 0,
         archive_fingerprint: String::new(),
         missing_blobs: Vec::new(),
+        secrets_masked: false,
     };
+    // по токену — тексты с маской секретов (§4.3.1 п. 6); сессия WebUI — исходник
+    let mask = agent_view::masks(&p);
     let store = BlobStore::new(&st.data_dir.blobs_dir(), sc.owner);
     let audit = AuditCtx {
         actor: p.actor(),
@@ -813,11 +886,12 @@ pub async fn export(
         let res = export_space(&db, sel, move |r| {
             let mut stats = Stats::default();
             let w = ChanWriter::new(tx.clone(), guard, STALL);
-            let res =
-                write_archive(r, w, store, history, manifest, &mut stats).and_then(|mut w| {
+            let res = write_archive(r, w, store, history, mask, manifest, &mut stats).and_then(
+                |mut w| {
                     w.flush().map_err(io_store)?;
                     Ok(w)
-                });
+                },
+            );
             let w = match res {
                 Ok(w) => Some(w),
                 Err(e) => {

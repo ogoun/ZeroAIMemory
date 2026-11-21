@@ -358,10 +358,12 @@ async fn audit(
     .await
 }
 
-/// Запись с маскированием секретов для ответа.
-fn entry_value(e: &Entry) -> Value {
+/// Запись для ответа зрителю `p`: находки секретов (`secrets_detected`, без значений) и — агенту
+/// по токену — маска текста записи (задача 5 M7.1, [`super::agent_view::ENTRY_FIELDS`]).
+fn entry_value(p: &Principal, e: &Entry) -> Value {
     let mut v = json!(e);
     super::secrets::attach_entry(&mut v, e);
+    super::agent_view::view_json(p, &mut v, super::agent_view::ENTRY_FIELDS);
     v
 }
 
@@ -442,8 +444,8 @@ pub async fn propose(
         .await?;
     }
     Ok(Json(json!({
-        "entry": entry_value(&idea),
-        "question": entry_value(&question),
+        "entry": entry_value(&p, &idea),
+        "question": entry_value(&p, &question),
     })))
 }
 
@@ -574,12 +576,12 @@ pub async fn decide(
         extra["question"] = json!(q.id);
     }
     audit(&st, &p, &client, &sc, "entry.idea.decide", extra).await?;
-    let mut out = json!({ "entry": entry_value(&d.idea) });
+    let mut out = json!({ "entry": entry_value(&p, &d.idea) });
     if let Some(t) = &d.task {
-        out["task"] = entry_value(t);
+        out["task"] = entry_value(&p, t);
     }
     if let Some(q) = &d.question {
-        out["question"] = entry_value(q);
+        out["question"] = entry_value(&p, q);
     }
     Ok(Json(out))
 }
@@ -607,7 +609,7 @@ pub async fn adopt(
     st.index.notify();
     audit(&st, &p, &client, &sc, "entry.idea.adopt", json!({})).await?;
     Ok(Json(
-        super::insights::entry_json(&sc.db, &e, sc.role).await?,
+        super::insights::entry_json(&p, &sc.db, &e, sc.role).await?,
     ))
 }
 
@@ -780,9 +782,9 @@ pub async fn review(
         }
         audit(&st, &p, &client, &sc, "entry.idea.review", extra).await?;
     }
-    let mut out = json!({ "entry": entry_value(&r.idea), "replay": r.replay });
+    let mut out = json!({ "entry": entry_value(&p, &r.idea), "replay": r.replay });
     if let Some(t) = &r.task {
-        out["task"] = entry_value(t);
+        out["task"] = entry_value(&p, t);
     }
     Ok(Json(out))
 }

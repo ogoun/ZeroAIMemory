@@ -28,6 +28,10 @@
 //! **Коллизии id.** Для всех кандидатов id назначения проверяются базы других пользователей
 //! сервера и точки Qdrant других тенантов ([`zam_index::VectorIndex::foreign_targets`]).
 //!
+//! **Архив, снятый по токену** (опись `secrets_masked: true`, задача 5 M7.1): первым
+//! предупреждением итога — [`super::archive::SECRETS_MASKED_WARNING`] («секреты в архиве
+//! замаскированы и не восстановятся»); метки `‹secret›` записываются как есть.
+//!
 //! **Аудит** — без текста: `space.import {space, user, owner, own, on_conflict, axioms,
 //! dry_run}` до тела и `space.import.done {space, user, owner, job?, complete, reason?,
 //! created, revised, skipped, conflicts, bytes}` по окончании (`reason`: `client`, `too_large`,
@@ -1033,6 +1037,11 @@ async fn run(
     .map_err(|e| ApiError::Internal(format!("проверка архива: {e}")))?
     .map_err(|e| import_err(e, out))?;
     plan.folder_label = folder;
+    // архив снят по токену (задача 5 M7.1, §4.3.1 п. 6): значений секретов в нём нет
+    if plan.secrets_masked {
+        plan.warnings
+            .insert(0, super::archive::SECRETS_MASKED_WARNING.to_string());
+    }
     let own = plan.is_own(t.owner, opts.own);
     opts.own = own;
     let mut warnings = Vec::new();

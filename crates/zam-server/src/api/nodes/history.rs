@@ -1,6 +1,10 @@
 //! Ревизии заметки: список, текст ревизии, дифф и откат.
 //!
 //! История удалённого узла доступна (как в `zam-store`); откат — только живой заметки.
+//!
+//! Агенту по токену (задача 5 M7.1, [`crate::api::agent_view`]) текст ревизии, обе стороны диффа
+//! (каждая ревизия — маской до диффа), сообщения правок списка ревизий и узел ответа отката — с
+//! `‹secret›` вместо значений; сессии WebUI — исходник.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -9,10 +13,11 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
-use zam_store::{Node, RevisionInfo, list_revisions, node_content, revert_note};
+use zam_store::{RevisionInfo, list_revisions, node_content, revert_note};
 
 use super::read::markdown_response;
 use super::{audit_node, diff_blocking};
+use crate::api::agent_view;
 use crate::api::scope::{Mode, live, node_scope};
 use crate::api::{json_body, query};
 use crate::app::AppState;
@@ -28,7 +33,14 @@ pub async fn revisions(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<RevisionInfo>>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
-    Ok(Json(list_revisions(&sc.db, sc.node.id).await?))
+    let mut revs = list_revisions(&sc.db, sc.node.id).await?;
+    // сообщение правки — свободный текст автора
+    for r in &mut revs {
+        if let Some(m) = r.message.take() {
+            r.message = Some(agent_view::view(&p, &m).into_owned());
+        }
+    }
+    Ok(Json(revs))
 }
 
 #[derive(Deserialize)]
@@ -56,6 +68,7 @@ pub async fn revision(
     };
     let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
     let (rev, text) = node_content(&sc.db, sc.node.id, Some(rev)).await?;
+    let text = agent_view::view_owned(&p, text).await;
     Ok(if md {
         markdown_response(text, rev)
     } else {
@@ -89,6 +102,11 @@ pub async fn diff(
     } else {
         node_content(&sc.db, sc.node.id, Some(from)).await?.1
     };
+    // агенту — каждая ревизия маской до диффа
+    let (old, new) = (
+        agent_view::view_owned(&p, old).await,
+        agent_view::view_owned(&p, new).await,
+    );
     let mut r = diff_blocking(old, new, format!("rev {from}"), format!("rev {to}"))
         .await?
         .into_response();
@@ -114,7 +132,7 @@ pub async fn revert(
     client: Client,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let req: Revert = json_body(body)?;
@@ -134,5 +152,5 @@ pub async fn revert(
         details,
     )
     .await?;
-    Ok(Json(node))
+    Ok(Json(agent_view::node_json(&p, &node)))
 }

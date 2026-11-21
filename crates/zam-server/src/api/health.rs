@@ -41,6 +41,7 @@ pub const FEATURES: &[&str] = &[
     "idea_review",
     "vault_move",
     "idea_queue_line",
+    "agent_text_masked",
 ];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {

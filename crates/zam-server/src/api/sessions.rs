@@ -384,7 +384,11 @@ pub async fn get(
     let tasks = claimed_tasks_of(&st, &p, &headers, &db, &s).await;
     let tokens = session_tokens(&db, &s.id).await?;
     let mut v = serde_json::to_value(&s).map_err(|e| ApiError::Internal(e.to_string()))?;
-    v["claimed_tasks"] = json!(tasks);
+    // заголовки задач — в напоминание `Stop` агенту: по токену с маской секретов (задача 5 M7.1;
+    // клиент маскирует ещё раз — для старого сервера)
+    let mut tasks = json!(tasks);
+    super::agent_view::view_json(&p, &mut tasks, &["title"]);
+    v["claimed_tasks"] = tasks;
     v["tokens"] = json!(tokens);
     Ok(Json(v))
 }

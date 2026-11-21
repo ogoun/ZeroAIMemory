@@ -245,6 +245,66 @@ async fn export_layout_and_manifest() {
     assert!(z.files.contains_key(&format!("_history/{ins}.jsonl")));
 }
 
+/// Экспорт по токену (задача 5 M7.1, спецификация M7 §4.3.1 п. 6): текст заметок, frontmatter
+/// (`tags`, `l0`), заголовки, тела и `data` записей, история ревизий — с `‹secret›` вместо
+/// значения, опись — `secrets_masked: true`; блоб вложения — как есть (бинарь не маскируется).
+/// Экспорт из сессии WebUI — исходник, признака в описи нет.
+#[tokio::test]
+async fn export_by_token_masked() {
+    let w = world("export-masked").await;
+    let (a, o) = (&w.a, &w.o);
+    // фиктивный ключ собирается из частей: в исходнике его нет целиком (push protection)
+    let s = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let v1 = format!("---\ntags: [\"t-{s}\"]\nl0: \"сводка {s}\"\n---\n# Ключи\n\ntoken: {s}\n");
+    let n = note_as(a, &o.tok, G, "ops/ключи", &v1).await;
+    let r = a
+        .tok_h(
+            &o.tok,
+            Method::PUT,
+            &format!("/api/v1/nodes/{n}"),
+            Some(json!({"content": format!("{v1}\nвторая ревизия\n")})),
+            &[("if-match", "1")],
+        )
+        .await;
+    ok(&r, StatusCode::OK, "правка");
+    let blob = format!("файл с ключом {s}\n");
+    common::attach::upload(a, &o.tok, &n, "keys.txt", blob.as_bytes()).await;
+    let e = entry_as(
+        a,
+        &o.tok,
+        G,
+        json!({"kind": "insight", "title": format!("Ключ {s} в логе"),
+               "body": format!("API_TOKEN={s}"),
+               "data": {"kind": "experiment",
+                        "experiment": {"method": format!("token: {s}"), "result": "confirmed"}}}),
+    )
+    .await;
+    let z = Zip::of(&export_tok(a, &o.tok, G, "").await);
+    check_fingerprint(&z);
+    let manifest: Value = serde_json::from_slice(&z.files["manifest.json"]).unwrap();
+    assert_eq!(manifest["secrets_masked"], json!(true), "{manifest}");
+    // значение — только в файле вложения (бинарь как есть)
+    let leaks: Vec<&String> = z.contains(&s);
+    assert_eq!(leaks.len(), 1, "{leaks:?}");
+    assert!(leaks[0].starts_with("_attachments/"), "{leaks:?}");
+    let (f, body) = z.front("ops/ключи.md");
+    assert!(body.contains("token: ‹secret›"), "{body}");
+    let tags = f["tags"].to_string();
+    assert!(!tags.contains(&s) && tags.contains("‹secret›"), "{f:?}");
+    let (f, ebody) = z.front(&format!("_journals/insight/{e}.md"));
+    assert!(f["title"].as_str().unwrap().contains("‹secret›"), "{f:?}");
+    assert!(ebody.contains("‹secret›"), "{ebody}");
+    assert!(z.text(&format!("_history/{n}.jsonl")).contains("‹secret›"));
+    assert!(z.text(&format!("_history/{e}.jsonl")).contains("‹secret›"));
+    // сессия WebUI — исходник, без признака
+    let z = Zip::of(&export_web(a, o, G, "").await);
+    let manifest: Value = serde_json::from_slice(&z.files["manifest.json"]).unwrap();
+    assert!(manifest.get("secrets_masked").is_none(), "{manifest}");
+    let (_, body) = z.front("ops/ключи.md");
+    assert!(body.contains(&format!("token: {s}")), "{body}");
+    assert!(z.text(&format!("_history/{n}.jsonl")).contains(&s));
+}
+
 /// Имена файлов для Windows: запрещённые символы, имена устройств, конечная точка, пара по
 /// регистру; исходный путь — во frontmatter. Все имена архива допустимы в Windows и различны
 /// без учёта регистра.

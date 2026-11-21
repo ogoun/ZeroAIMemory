@@ -112,7 +112,7 @@ pub async fn get(
     if let Some(name) = q.term.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         let t = find_term(&terms, name).ok_or(ApiError::NotFound)?;
         let e = get_entry(&sc.db, t.id).await?;
-        return Ok(Json(entry_json(&sc.db, &e, sc.role).await?));
+        return Ok(Json(entry_json(&p, &sc.db, &e, sc.role).await?));
     }
     let mut items = Vec::with_capacity(terms.len());
     for t in &terms {
@@ -123,6 +123,9 @@ pub async fn get(
             "definition": t.definition,
         }));
     }
+    // агенту по токену — с маской секретов (задача 5 M7.1)
+    let mut items = Value::Array(items);
+    super::agent_view::view_json(&p, &mut items, &["title", "aliases", "definition"]);
     Ok(Json(json!({
         "version": glossary_version(&sc.db).await?,
         "items": items,
