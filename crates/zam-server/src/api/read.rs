@@ -497,12 +497,6 @@ fn slice<'a>(text: &'a str, section: &str) -> Result<&'a str, Failure> {
     })
 }
 
-/// Текст ревизии для зрителя `p` ([`agent_view::view_owned`]): агенту — маска **всей** ревизии,
-/// до секции, L1, фокуса, `range` и диффа (§4.3.1).
-async fn shown_text(p: &Principal, text: String) -> String {
-    agent_view::view_owned(p, text).await
-}
-
 async fn fetch_node(
     p: &Principal,
     sc: NodeScope,
@@ -546,10 +540,10 @@ async fn fetch_node(
         };
         // каждая ревизия — маской до диффа: маска строки диффа ≠ строка диффа масок
         let old = match old {
-            Some(t) => Some(shown_text(p, t).await),
+            Some(t) => Some(agent_view::view_owned(p, t).await?),
             None => None,
         };
-        let new = shown_text(p, new).await;
+        let new = agent_view::view_owned(p, new).await?;
         changes(old, new, since, node.current_rev).await?
     } else if let Some(r) = it.range.as_deref().filter(|_| section.is_none()) {
         let (rev, a, b) = parse_range(r).map_err(Failure::Fatal)?;
@@ -574,7 +568,7 @@ async fn fetch_node(
         };
         // агенту — маска всей ревизии, затем срез: адрес выдан по маскированному тексту, а маска
         // куска исходника — не кусок маски
-        let text = shown_text(p, text).await;
+        let text = agent_view::view_owned(p, text).await?;
         let piece = byte_range(&text, a, b, rev)?.to_string();
         if rev != node.current_rev {
             warnings.push(format!("range: rev{rev}, текущая rev{}", node.current_rev));
@@ -587,7 +581,7 @@ async fn fetch_node(
         // ровно та ревизия, что в снимке узла; агенту — маска всей ревизии до секции, фокуса и
         // L1 (листы нарезаны по тому же маскированному тексту — фокус их находит)
         let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
-        let text = shown_text(p, text).await;
+        let text = agent_view::view_owned(p, text).await?;
         let (text, whole) = match section {
             Some(s) => (slice(&text, s)?.to_string(), false),
             None => (text, true),
@@ -718,10 +712,10 @@ async fn fetch_entry(
         let new = snap(e.rev).unwrap_or_else(|| entry_snapshot_text(&e.title, &e.body, &e.data));
         // каждый снимок — маской до диффа
         let old = match snap(since) {
-            Some(t) => Some(shown_text(p, t).await),
+            Some(t) => Some(agent_view::view_owned(p, t).await?),
             None => None,
         };
-        changes(old, shown_text(p, new).await, since, e.rev).await?
+        changes(old, agent_view::view_owned(p, new).await?, since, e.rev).await?
     } else {
         if it.range.is_some() {
             return Err(Failure::Item(Fail::new(
@@ -730,7 +724,7 @@ async fn fetch_entry(
             )));
         }
         // тело целиком — маской до секции и L1
-        let body = shown_text(p, e.body.clone()).await;
+        let body = agent_view::view_owned(p, e.body.clone()).await?;
         let (text, whole) = match section {
             Some(s) => (slice(&body, s)?.to_string(), false),
             None => (body, true),

@@ -1415,16 +1415,17 @@ async fn expand_items(
     Ok(out)
 }
 
-/// Маска секретов в полях карточек, которые не из чанков: заголовок записи журнала и L0
-/// (L0 узла хранится маскированным, кроме ручного L0 папки старого импорта; маска идемпотентна).
-fn mask_cards(items: &mut [Item]) {
-    use crate::api::agent_view::mask_string;
+/// Поля карточек, которые не из чанков, для зрителя `p` (агенту — с маской секретов): заголовок
+/// записи журнала и L0 (L0 узла хранится маскированным, кроме ручного L0 папки старого импорта;
+/// маска идемпотентна).
+fn view_cards(p: &Principal, items: &mut [Item]) {
+    use crate::api::agent_view::view_in_place;
     for it in items {
         if let Some(e) = it.hit.entry.as_mut() {
-            e.title = mask_string(std::mem::take(&mut e.title));
+            view_in_place(p, &mut e.title);
         }
-        if let Some(l0) = it.l0.take() {
-            it.l0 = Some(mask_string(l0));
+        if let Some(l0) = it.l0.as_mut() {
+            view_in_place(p, l0);
         }
     }
 }
@@ -3079,9 +3080,7 @@ pub(crate) async fn search_with(
     // агенту по токену (задача 5 M7.1) — заголовки записей журналов и L0 карточек с маской
     // секретов: до упаковки, бюджет считается по выданному тексту (сниппеты и тексты листов — из
     // маскированных чанков, секция — из маски ревизии)
-    if crate::api::agent_view::masks(&p) {
-        mask_cards(&mut items);
-    }
+    view_cards(&p, &mut items);
     // слабые карточки `brief`/`notes` — вон (M6 §4.2, `search.brief_min_rel`)
     let weak = drop_weak(&mut items, mode, min_rel);
     let degraded = available.err().or(vrun.failed);

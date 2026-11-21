@@ -368,11 +368,8 @@ pub async fn graph(
 /// Заголовки записей журналов среди узлов графа агенту по токену — с маской секретов (задача 5
 /// M7.1); имя заметки — адрес, как есть.
 fn shown_titles(p: &Principal, nodes: &mut [zam_store::GraphNode]) {
-    if !super::agent_view::masks(p) {
-        return;
-    }
     for n in nodes.iter_mut().filter(|n| n.r.kind == TargetKind::Entry) {
-        n.title = super::agent_view::mask_string(std::mem::take(&mut n.title));
+        super::agent_view::view_in_place(p, &mut n.title);
     }
 }
 

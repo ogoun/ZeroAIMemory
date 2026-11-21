@@ -419,17 +419,13 @@ impl<W: Write> ArchiveWriter<W> {
 
     /// Дописывает к `out` текст `s` для архива без копии исходника (по токену — с маской).
     fn push_shown(&mut self, out: &mut String, s: &str) {
-        if !self.mask {
-            out.push_str(s);
-            return;
-        }
-        match agent_view::mask(s) {
-            std::borrow::Cow::Owned(m) => {
-                self.masked = true;
-                out.push_str(&m);
-            }
-            std::borrow::Cow::Borrowed(b) => out.push_str(b),
-        }
+        let shown = if self.mask {
+            agent_view::mask(s)
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        };
+        self.masked |= matches!(shown, std::borrow::Cow::Owned(_));
+        out.push_str(&shown);
     }
 
     fn text(&mut self, name: &str, data: &[u8]) -> Result<(), StoreError> {
@@ -499,6 +495,11 @@ impl<W: Write> ArchiveWriter<W> {
                 rev.body = self.shown(std::mem::take(&mut rev.body));
                 rev.reason = rev.reason.take().map(|m| self.shown(m));
                 self.shown_value(&mut rev.data);
+                rev.tags = std::mem::take(&mut rev.tags)
+                    .into_iter()
+                    .map(|t| self.shown(t))
+                    .collect();
+                rev.area = rev.area.take().map(|a| self.shown(a));
                 put(self, &rev)
             })?,
         }
@@ -677,10 +678,13 @@ fn write_parts<W: Write>(
                 "created_at": fmt_ts(f.created_at), "file": file,
             }));
         }
-        // по токену — заголовок, `data`, причина отзыва и тело с маской
+        // по токену — заголовок, `data`, теги, область, причина отзыва и тело с маской
         let title = a.shown(x.title.clone());
         let mut data = x.data.clone();
         a.shown_value(&mut data);
+        let mut tags = json!(x.tags);
+        a.shown_value(&mut tags);
+        let area = x.area.clone().map(|s| a.shown(s));
         let retract_reason = x.retract_reason.clone().map(|s| a.shown(s));
         let mut text = front_matter(&[
             ("id", json!(x.id)),
@@ -689,8 +693,8 @@ fn write_parts<W: Write>(
             ("status", json!(x.status)),
             ("certainty", json!(x.certainty)),
             ("data", data),
-            ("tags", json!(x.tags)),
-            ("area", json!(x.area)),
+            ("tags", tags),
+            ("area", json!(area)),
             ("refs", json!(e.refs)),
             (
                 "triggers",

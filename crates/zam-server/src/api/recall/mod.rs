@@ -882,7 +882,7 @@ fn entry_ref(e: &Entry) -> String {
 /// п. 5): `/recall` — текст для агента (WebUI его не зовёт), поэтому маска — для любого
 /// принципала, как [`masked_clip`] с M4 **[решение исполнителя, задача 5]**.
 fn hint_title(title: &str) -> String {
-    zam_markdown::mask_text(title)
+    crate::api::agent_view::mask(title).into_owned()
 }
 
 /// Подсказка-запись журнала.

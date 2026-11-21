@@ -492,6 +492,7 @@ async fn agent_node_json_frontmatter_masked() {
     let base = format!("/api/v1/nodes/{nid}");
     for uri in [
         base.clone(),
+        format!("{base}?format=md"),
         format!("{base}?format=html"),
         format!("{base}/outline"),
         format!("{base}?tier=L1"),
@@ -513,12 +514,27 @@ async fn agent_node_json_frontmatter_masked() {
         j["content"].as_str().unwrap().contains("token: ‹secret›"),
         "{j}"
     );
-    // человеку — исходник, в том числе HTML (кэш рендера — свой у маски)
-    for uri in [base.clone(), format!("{base}?format=html")] {
+    // человеку — исходник, в том числе md (целиком, с frontmatter) и HTML (кэш рендера — свой у
+    // маски); `node.frontmatter` — исходный
+    for uri in [
+        base.clone(),
+        format!("{base}?format=md"),
+        format!("{base}?format=html"),
+    ] {
         let r = a.adm(Method::GET, &uri, None, None).await;
         assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
         assert!(r.text().contains(&s), "{uri}: {}", r.text());
     }
+    let r = a.adm(Method::GET, &base, None, None).await;
+    let fm = &r.json()["node"]["frontmatter"];
+    assert_eq!(fm["description"], format!("ключ {s}"), "{fm}");
+    assert_eq!(fm["tags"][0], format!("t-{s}"), "{fm}");
+    let md = get(&a, &format!("{base}?format=md")).await.text();
+    assert_eq!(
+        md,
+        zam_markdown::mask_text(&content),
+        "md агенту — маска всего файла"
+    );
     let h = get(&a, &format!("{base}?format=html")).await;
     assert!(
         !h.text().contains(&s),

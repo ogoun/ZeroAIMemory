@@ -132,11 +132,11 @@ pub async fn compare(
     };
     let old_label = from.as_ref().map_or_else(|| "(начало)".to_string(), label);
     // агенту по токену — тексты обоих релизов маской до диффа (задача 5 M7.1)
-    let old = agent_view::view_owned(&p, old).await;
-    let new = agent_view::view_owned(&p, to.body.clone()).await;
+    let old = agent_view::view_owned(&p, old).await?;
+    let new = agent_view::view_owned(&p, to.body.clone()).await?;
     let notes_diff = diff_blocking(old, new, old_label, label(&to)).await?;
     let commits = to.data.get("commits").cloned().unwrap_or_else(|| json!([]));
-    let mut v = json!({
+    let v = json!({
         "from": from,
         "to": to,
         "changelog": group_by_kind(items)?,
@@ -144,14 +144,21 @@ pub async fn compare(
         "notes_diff": notes_diff,
         "commits": commits,
     });
-    // записи (`from`, `to`, группы changelog — массивы записей) и сообщения коммитов
-    agent_view::view_json(&p, &mut v["from"], ENTRY_FIELDS);
-    agent_view::view_json(&p, &mut v["to"], ENTRY_FIELDS);
-    if let Some(groups) = v["changelog"].as_object_mut() {
-        for g in groups.values_mut() {
-            agent_view::view_json(&p, g, ENTRY_FIELDS);
+    // записи (`from`, `to`, группы changelog — массивы записей) и сообщения коммитов; длинные
+    // тексты — в пуле блокирующих задач
+    let v = agent_view::view_json_with(&p, v, |v| {
+        for k in ["from", "to"] {
+            if let Some(e) = v.get_mut(k) {
+                agent_view::mask_fields(e, ENTRY_FIELDS);
+            }
         }
-    }
-    agent_view::view_json(&p, &mut v, &["commits"]);
+        if let Some(groups) = v.get_mut("changelog").and_then(Value::as_object_mut) {
+            for g in groups.values_mut() {
+                agent_view::mask_fields(g, ENTRY_FIELDS);
+            }
+        }
+        agent_view::mask_fields(v, &["commits"]);
+    })
+    .await?;
     Ok(Json(v))
 }

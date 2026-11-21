@@ -42,7 +42,7 @@ use super::input::Input;
 use super::journal::{self, Ev};
 use super::output::Output;
 use super::pre_tool::{is_edit_tool, patch_files};
-use super::{Agent, Env, Flag, Kind, Settings, head_bytes};
+use super::{Agent, Env, Flag, Kind, Settings, head_bytes, shown_title};
 use crate::client::read_json;
 use crate::cmd::refs::{self, MISSING_HASH};
 
@@ -495,14 +495,10 @@ pub fn file_hint(pr: &PathRefs) -> String {
     let parts: Vec<String> = items
         .iter()
         .map(|i| {
-            let title: String = i
-                .title
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(TITLE_MAX)
-                .collect();
+            // заголовок — с маской секретов до обрезки ([`shown_title`]): сервер M7.1 маскирует
+            // его для токена сам, старый — нет
+            let one_line = i.title.split_whitespace().collect::<Vec<_>>().join(" ");
+            let title = shown_title(&one_line, TITLE_MAX);
             // теги как у `hint_line`: пустые опускаются, без тегов — без скобок
             let stale = if i.state == "stale" {
                 "возможно устарело"
@@ -613,6 +609,30 @@ mod tests {
             "ZeroAIMemory: о файле a.rs в памяти: Без вида i:01E; \
              Без вида, устарело [возможно устарело] i:01F"
         );
+    }
+
+    /// Заголовок с секретом (старый сервер его не маскирует) — меткой `‹secret›` до обрезки:
+    /// ключ на границе [`TITLE_MAX`] не выходит префиксом (круг правок 1 задачи 5 M7.1).
+    #[test]
+    fn file_hint_title_masked() {
+        // ключ из частей: целиком его в исходнике нет (push protection)
+        let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+        let pad = "п".repeat(TITLE_MAX - 10);
+        let item = |title: String| cache::RefItem {
+            id: "i:01A".into(),
+            kind: "gotcha".into(),
+            title,
+            state: "ok".into(),
+            symbol: None,
+        };
+        let pr = PathRefs {
+            path: "src/a.rs".into(),
+            hash: None,
+            items: vec![item(format!("ключ {key}")), item(format!("{pad} {key}"))],
+        };
+        let line = file_hint(&pr);
+        assert!(!line.contains(&key) && !line.contains("ghp_aB3"), "{line}");
+        assert!(line.contains("ключ ‹secret› [gotcha] i:01A"), "{line}");
     }
 
     #[test]

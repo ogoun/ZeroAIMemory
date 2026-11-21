@@ -331,7 +331,7 @@ pub async fn move_to(
     }
     st.index.notify();
     st.docs.notify();
-    Ok(Json(agent_view::node_json(&p, &node)))
+    Ok(Json(agent_view::node_json(&p, &node)?))
 }
 
 /// `DELETE /nodes/{id}` — мягкое удаление поддерева → 204; аудит `node.delete`.
@@ -389,7 +389,7 @@ pub async fn restore(
         details,
     )
     .await?;
-    Ok(Json(agent_view::node_json(&p, &node)))
+    Ok(Json(agent_view::node_json(&p, &node)?))
 }
 
 #[derive(Deserialize)]

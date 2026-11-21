@@ -1925,6 +1925,39 @@ async fn import_masked_archive_warns() {
     assert!(!r["warnings"].to_string().contains("замаскированы"), "{r}");
 }
 
+/// Итог задания импорта называет записи заголовком (`secrets_detected: «<заголовок>»`): опрос
+/// `GET /spaces/{space}/imports/{job}` по токену — с маской `‹secret›` (круг правок 1 задачи 5
+/// M7.1), из сессии WebUI — исходник.
+#[tokio::test]
+async fn import_job_warnings_masked_for_token() {
+    let w = world("imp-job-mask").await;
+    let key = format!("{}{}", "AK", "IAQWERTYUIOPASDFGH");
+    entry(
+        &w.a,
+        &w.o.tok,
+        G,
+        json!({"kind": "insight", "title": format!("Ключ {key} в логе"),
+               "body": format!("API_KEY={key}"), "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let zip = export_web(&w.a, &w.o, G, "").await;
+    let accepted = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
+    ok(&accepted, StatusCode::ACCEPTED, "задание импорта");
+    let status = format!("/api/v1{}", accepted.json()["status"].as_str().unwrap());
+    let r = report(&wait_job(&w.a, Who::Tok(&w.rw.tok), accepted).await);
+    let ws = r["warnings"].to_string();
+    assert!(
+        ws.contains("secrets_detected") && ws.contains("‹secret›"),
+        "{r}"
+    );
+    assert!(!ws.contains(&key), "{r}");
+    // то же задание из сессии WebUI того же пользователя — исходник заголовка
+    let h = get_as(&w.a, Who::Web(&w.rw), &status).await;
+    ok(&h, StatusCode::OK, "опрос из WebUI");
+    let ws = h.json()["report"]["warnings"].to_string();
+    assert!(ws.contains(&key), "{ws}");
+}
+
 /// Участник решения (`rw` и `ro`) не импортирует — 403; владелец и администратор — да.
 #[tokio::test]
 async fn member_cannot_import() {

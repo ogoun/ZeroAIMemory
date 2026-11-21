@@ -668,11 +668,11 @@ async fn decision_vector(
 /// Запись как JSON: у insight — её триггеры (`triggers` — массив, у не-insight — нет поля), у
 /// задачи — поля [`super::tasks::attach_task`] (длительность, идеи плана — видимые с ролью `role`,
 /// [`super::tasks::idea_spaces`]). Агенту `p` по токену — с маской секретов
-/// ([`agent_view::ENTRY_FIELDS`], задача 5 M7.1); сессии WebUI — исходник.
+/// ([`agent_view::ENTRY_FIELDS`], задача 5 M7.1; длинное тело — в пуле блокирующих задач);
+/// сессии WebUI — исходник.
 pub async fn entry_json(p: &Principal, db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
-    let mut v = entry_json_raw(db, e, role).await?;
-    agent_view::view_json(p, &mut v, agent_view::ENTRY_FIELDS);
-    Ok(v)
+    let v = entry_json_raw(db, e, role).await?;
+    agent_view::view_json_owned(p, v, agent_view::ENTRY_FIELDS).await
 }
 
 /// [`entry_json`] без маски (исходник для любого зрителя).
@@ -849,7 +849,9 @@ pub async fn create(
         let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
         // замещение через supersedes_id: ревизия старой не сверяется (If-Match у POST
         // коллекции относился бы к новой записи) [решение исполнителя]
-        let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib).await?;
+        let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib)
+            .await
+            .map_err(|e| agent_view::view_error(p, e.into()))?;
         st.index.notify();
         // аудит — как у POST /entries/{id}/supersede (повтор по ключу — без новой строки)
         if !repeat {
@@ -867,9 +869,8 @@ pub async fn create(
         }
         let mut v = entry_json(p, &sc.db, &n, sc.role).await?;
         super::secrets::attach_entry(&mut v, &n);
-        let mut old_v = serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
-        agent_view::view_json(p, &mut old_v, agent_view::ENTRY_FIELDS);
-        v["superseded"] = old_v;
+        let old_v = serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
+        v["superseded"] = agent_view::view_json_owned(p, old_v, agent_view::ENTRY_FIELDS).await?;
         if kind == EntryKind::Insight {
             v["dedup"] = json!(DedupMode::Skipped.as_str());
             let w = alias_warnings(st, &sc.db, sc.space.id, &n.title, &n.body).await?;
@@ -914,7 +915,7 @@ pub async fn create(
         if !cands.is_empty() {
             // заголовки похожих записей в 409 — агенту с маской
             for c in &mut cands {
-                c.title = agent_view::view(p, &c.title).into_owned();
+                agent_view::view_in_place(p, &mut c.title);
             }
             return Err(duplicate(cands, mode));
         }
@@ -922,7 +923,10 @@ pub async fn create(
         mode
     };
     let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
-    let (e, created) = create_entry(&sc.db, new, &attrib).await?;
+    // 409 term-conflict — заголовки занятых терминов агенту с маской
+    let (e, created) = create_entry(&sc.db, new, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(p, e.into()))?;
     if created {
         st.index.notify();
     }
@@ -1003,7 +1007,9 @@ pub async fn supersede(
         None => false,
     };
     let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
-    let (n, o) = supersede_entry(&sc.db, sc.entry.id, rev, new, &attrib).await?;
+    let (n, o) = supersede_entry(&sc.db, sc.entry.id, rev, new, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(&p, e.into()))?;
     st.index.notify();
     if !repeat {
         audit_node(

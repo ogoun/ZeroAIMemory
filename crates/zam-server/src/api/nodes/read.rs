@@ -133,7 +133,7 @@ pub async fn outline(
     }
     let (_, text) = node_content(&sc.db, sc.node.id, None).await?;
     // агенту — заголовки маскированного текста
-    let text = agent_view::view_owned(&p, text).await;
+    let text = agent_view::view_owned(&p, text).await?;
     Ok(Json(doc_outline(&parse(&text))))
 }
 
@@ -163,7 +163,7 @@ async fn read(
         let l0 = node.l0.as_deref().map(|s| agent_view::view(p, s));
         return Ok(Json(json!({ "l0": l0, "rev": node.current_rev })).into_response());
     }
-    let node_v = agent_view::node_json(p, node);
+    let node_v = agent_view::node_json(p, node)?;
     if node.kind == NodeKind::Folder {
         return match (tier, format) {
             (Tier::L2, Format::Json) => {
@@ -203,7 +203,7 @@ async fn read(
     // хэш ключа кэша HTML — по прочитанному исходнику (`content_hash` ревизии), до маски
     let hash = (format == Format::Html && q.section.is_none()).then(|| key_hash(node, rev, &text));
     // агенту — маска всей ревизии до секции, L1 и рендера
-    let text = agent_view::view_owned(p, text).await;
+    let text = agent_view::view_owned(p, text).await?;
     let (text, whole) = match q.section.as_deref() {
         Some(path) => (section_slice(&text, path)?.to_string(), false),
         None => (text, true),

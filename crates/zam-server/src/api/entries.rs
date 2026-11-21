@@ -459,7 +459,9 @@ pub async fn create(
         links: Vec::new(),
         refs,
     };
-    let (entry, created) = create_entry(&sc.db, new, &attrib).await?;
+    let (entry, created) = create_entry(&sc.db, new, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(&p, e.into()))?;
     if created {
         st.index.notify();
     }
@@ -476,7 +478,7 @@ pub async fn create(
         super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &entry.title, &entry.body)
             .await?,
     );
-    agent_view::view_json(&p, &mut v, ENTRY_FIELDS);
+    let mut v = agent_view::view_json_owned(&p, v, ENTRY_FIELDS).await?;
     agent_view::view_json(&p, &mut v, &["warnings"]);
     Ok((status, Json(v)))
 }
@@ -706,13 +708,14 @@ pub async fn list(
         }
         super::tasks::attach_task(&mut v, e, task_ideas.get(&e.id).map_or(&[], Vec::as_slice));
         super::ideas::attach_idea_task(&mut v, e, &idea_tasks);
-        agent_view::view_json(&p, &mut v, ENTRY_FIELDS);
         out.push(v);
     }
     if kind == Some(EntryKind::Report) {
         let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
         super::reports::view::report_feed(&sc.db, &items, &mut out, viewer).await?;
     }
+    // лента до 200 записей с телами — маска одним проходом, длинная — в пуле
+    let out = agent_view::view_json_owned(&p, Value::Array(out), ENTRY_FIELDS).await?;
     Ok(Json(json!({ "items": out, "next_cursor": next })))
 }
 
@@ -1129,7 +1132,9 @@ pub async fn patch(
         human_edit,
     };
     let before = sc.entry.rev;
-    let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;
+    let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(&p, e.into()))?;
     if e.rev != before {
         st.index.notify();
     }
@@ -1200,7 +1205,10 @@ pub async fn restore(
     super::ideas::deny_token_on_human_idea(&p, &sc.entry, true)?;
     let rev = optional_if_match(&headers)?;
     let attrib = attribution(&p, &headers, None)?;
-    let e = restore_entry(&sc.db, sc.entry.id, rev, &attrib).await?;
+    // имя термина могли занять, пока он лежал в корзине: 409 term-conflict — с маской агенту
+    let e = restore_entry(&sc.db, sc.entry.id, rev, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(&p, e.into()))?;
     st.index.notify();
     audit_node(
         &st,
@@ -1213,9 +1221,9 @@ pub async fn restore(
         audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
-    let mut v = json!(e);
-    agent_view::view_json(&p, &mut v, ENTRY_FIELDS);
-    Ok(Json(v))
+    Ok(Json(
+        agent_view::view_json_owned(&p, json!(e), ENTRY_FIELDS).await?,
+    ))
 }
 
 /// `GET /entries/{id}/revisions` → `{items}` по возрастанию номера.
@@ -1228,8 +1236,8 @@ pub async fn revisions(
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
     let items = entry_revisions(&sc.db, sc.entry.id).await?;
-    let mut items = json!(items);
-    agent_view::view_json(&p, &mut items, ENTRY_FIELDS);
+    // все ревизии с телами (до 1 МБ каждое) — длинные маскируются в пуле
+    let items = agent_view::view_json_owned(&p, json!(items), ENTRY_FIELDS).await?;
     Ok(Json(json!({ "items": items })))
 }
 

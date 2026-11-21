@@ -972,7 +972,7 @@ pub async fn status(
     };
     // место в очереди — пока задание ждёт записи
     let queue = (j.stage == "queued").then(|| st.imports.queue_position(id));
-    Ok(Json(json!({
+    let mut v = json!({
         "job": id,
         "state": state,
         "stage": j.stage,
@@ -984,7 +984,11 @@ pub async fn status(
         },
         "report": j.report,
         "error": j.error,
-    })))
+    });
+    // предупреждения итога называют записи заголовком («запись «…»: …», найденные секреты), текст
+    // ошибки — строку архива: агенту по токену — с маской (задача 5 M7.1, круг правок 1)
+    crate::api::agent_view::view_json(&p, &mut v, &["report.warnings", "error"]);
+    Ok(Json(v))
 }
 
 /// Слот записи (очередь): ждём, пока сервер не остановится.

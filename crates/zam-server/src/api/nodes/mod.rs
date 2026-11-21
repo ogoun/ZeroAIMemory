@@ -67,8 +67,11 @@ async fn write_error(p: &Principal, db: &Db, id: Id, base_rev: i64, e: WriteErro
                 Ok((_, t)) => t,
                 Err(_) => String::new(),
             };
-            let base = crate::api::agent_view::view_owned(p, base).await;
-            let current = crate::api::agent_view::view_owned(p, current).await;
+            let shown = |t| crate::api::agent_view::view_owned(p, t);
+            let (base, current) = match (shown(base).await, shown(current).await) {
+                (Ok(b), Ok(c)) => (b, c),
+                (Err(e), _) | (_, Err(e)) => return e,
+            };
             let diff = match diff_blocking(
                 base,
                 current,

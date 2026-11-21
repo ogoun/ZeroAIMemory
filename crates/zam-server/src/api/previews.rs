@@ -88,6 +88,9 @@ const ROWS_MAX: u32 = 1000;
 const PX_DEFAULT: u32 = 256;
 /// Начало текстового файла для `kind=text`, байт.
 pub const TEXT_MAX: u64 = 1024 * 1024;
+/// Запас за [`TEXT_MAX`] для маски агенту, байт: ключ на границе обрезки маска видит целиком
+/// (иначе его начало вышло бы префиксом), выдача — всё равно до [`TEXT_MAX`] ([`masked_head`]).
+const MASK_LOOKAHEAD: u64 = 4 * 1024;
 /// Начало файла для определения вида (как `zam_docs::sniff_file`).
 const HEAD: u64 = 64 * 1024 + 16;
 
@@ -519,19 +522,26 @@ async fn build(
                 }
                 v
             } else {
-                let (head, more) = read_head(path, TEXT_MAX).await?;
+                // агенту — с запасом за границей: маска по нему, выдача — до `TEXT_MAX`
+                let read = if masked {
+                    TEXT_MAX + MASK_LOOKAHEAD
+                } else {
+                    TEXT_MAX
+                };
+                let (head, more) = read_head(path, read).await?;
+                let probe = &head[..head.len().min(TEXT_MAX as usize)];
                 let textual = matches!(kind, None | Some(DocKind::Text | DocKind::Csv))
-                    && zam_docs::is_text(&head)
-                    && zam_docs::sniff_image(&head).is_none();
+                    && zam_docs::is_text(probe)
+                    && zam_docs::sniff_image(probe).is_none();
                 if !textual {
                     return Err(unfit("текста"));
                 }
-                // агенту — подсветка маскированного текста: маска всего начала файла до разметки
+                // агенту — подсветка маскированного текста: маска всего прочитанного до разметки
                 // (в HTML значение разрезано тегами подсветки, по нему маска не работает)
-                let head = if masked {
+                let (head, more) = if masked {
                     masked_head(head, more).await?
                 } else {
-                    head
+                    (head, more)
                 };
                 let head = Bytes::from(head);
                 let h = pool
@@ -576,18 +586,30 @@ fn checked_html(h: WireHtml, head: &[u8], truncated: bool) -> WireHtml {
     }
 }
 
-/// Начало текстового файла `head` с маской секретов: текст — как его подсвечивает рабочий процесс
-/// (BOM снят, обрезанный последний символ отброшен, неверный UTF-8 — U+FFFD,
-/// [`crate::docs::worker::source_text`]), маска — в пуле блокирующих задач (до 1 МиБ — до 20 мс).
-/// Двоичный файл (нулевой байт) — как есть: подсветка его отвергнет.
-async fn masked_head(head: Vec<u8>, truncated: bool) -> Result<Vec<u8>, ApiError> {
-    tokio::task::spawn_blocking(move || {
-        let masked = crate::docs::worker::source_text(&head, truncated)
-            .map(|t| agent_view::mask(&t).into_owned().into_bytes());
-        masked.unwrap_or(head)
-    })
+/// Начало текстового файла `head` (прочитано до [`TEXT_MAX`] + [`MASK_LOOKAHEAD`], `more` — файл
+/// длиннее) с маской секретов и обрезкой до [`TEXT_MAX`] ([`agent_view::mask_head`]: маска — по
+/// всему прочитанному, показ — не дальше `TEXT_MAX` исходника и не длиннее `TEXT_MAX`, метка не
+/// разрезается); второе — «показано не всё». Текст — как его подсвечивает рабочий процесс (BOM
+/// снят, обрезанный последний символ отброшен, неверный UTF-8 — U+FFFD,
+/// [`crate::docs::worker::source_text`]); маска — в пуле блокирующих задач (1 МиБ — до 20 мс).
+/// Двоичный файл (нулевой байт) — как есть до `TEXT_MAX`: подсветка его отвергнет.
+async fn masked_head(head: Vec<u8>, more: bool) -> Result<(Vec<u8>, bool), ApiError> {
+    let max = TEXT_MAX as usize;
+    agent_view::blocking(
+        move || match crate::docs::worker::source_text(&head, more) {
+            Some(t) => {
+                let (shown, cut) = agent_view::mask_head(&t, max);
+                (shown.into_bytes(), cut || more)
+            }
+            None => {
+                let mut head = head;
+                let cut = more || head.len() > max;
+                head.truncate(max);
+                (head, cut)
+            }
+        },
+    )
     .await
-    .map_err(|e| ApiError::Internal(format!("маска превью: {e}")))
 }
 
 async fn read_all(path: &std::path::Path) -> Result<Bytes, ApiError> {

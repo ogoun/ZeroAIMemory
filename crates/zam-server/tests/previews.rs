@@ -562,6 +562,59 @@ async fn previews_text_masked_for_token() {
     assert!(r.text().contains(&key));
 }
 
+/// Ключ на границе обрезки текста (1 МиБ, `TEXT_MAX`): агенту маска — по началу файла с запасом
+/// за границей, ключ — меткой целиком, а не префиксом; показ — до прежней границы, `truncated`
+/// (круг правок 1 задачи 5 M7.1). Человеку — исходник до той же границы.
+#[tokio::test]
+async fn preview_text_key_on_boundary_masked() {
+    const MAX: usize = 1024 * 1024;
+    let (a, _) = world("prev-mask-edge").await;
+    let n = note(&a, &a.token, "knowledge", "p/граница").await;
+    let key = ["AK", "IA", "Z7Q4", "MRT2", "WXPH", "BK9C"].concat();
+    let head = &key[..8];
+    let lead = "key = ";
+    let mut text = String::new();
+    // ключ — с байта MAX - 16 до MAX + 4: метка (12 байт) влезает в показ, префикс ключа — нет
+    while text.len() + 128 < MAX - 16 - lead.len() {
+        text.push_str("обычная строка файла конфигурации\n");
+    }
+    let fill = MAX - 16 - lead.len() - text.len() - 1;
+    text.push_str(&"x".repeat(fill));
+    text.push('\n');
+    text.push_str(lead);
+    text.push_str(&key);
+    text.push_str("\nхвост файла\n");
+    assert_eq!(text.find(&key), Some(MAX - 16), "ключ пересекает границу");
+    let sha = sha_of(&upload(&a, &a.token, &n, "edge.txt", text.as_bytes()).await);
+    let r = get(&a, &a.token, &sha, "kind=text").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let html = j["html"].as_str().unwrap();
+    let tail = |s: &str| -> String {
+        let v: Vec<char> = s.chars().rev().take(120).collect();
+        v.into_iter().rev().collect()
+    };
+    assert!(
+        !html.contains(head),
+        "префикс ключа на границе: …{}",
+        tail(html)
+    );
+    assert!(html.contains("‹secret›"), "…{}", tail(html));
+    assert!(!html.contains("хвост файла"), "показ — до границы");
+    assert_eq!(j["truncated"], true, "{}", tail(html));
+    let h = a
+        .adm(Method::GET, &uri(&sha, "kind=text"), None, None)
+        .await;
+    assert_eq!(h.status, StatusCode::OK, "{}", h.text());
+    let hj = h.json();
+    let hh = hj["html"].as_str().unwrap();
+    assert!(
+        hh.contains(head) && !hh.contains(&key),
+        "человеку — исходник до границы"
+    );
+    assert_eq!(hj["truncated"], true);
+}
+
 /// Права — как у скачивания блоба: Human по токену, Knowledge владельца участнику решения,
 /// посторонний, неодобренный запрос доступа — ответ тот же, что у несуществующего sha
 /// (статус и тело); участник видит вложение пространства решения, администратор — Human.

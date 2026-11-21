@@ -275,6 +275,7 @@ async fn export_by_token_masked() {
         G,
         json!({"kind": "insight", "title": format!("Ключ {s} в логе"),
                "body": format!("API_TOKEN={s}"),
+               "tags": [format!("t-{s}"), "ops"], "area": format!("зона {s}"),
                "data": {"kind": "experiment",
                         "experiment": {"method": format!("token: {s}"), "result": "confirmed"}}}),
     )
@@ -294,6 +295,10 @@ async fn export_by_token_masked() {
     let (f, ebody) = z.front(&format!("_journals/insight/{e}.md"));
     assert!(f["title"].as_str().unwrap().contains("‹secret›"), "{f:?}");
     assert!(ebody.contains("‹secret›"), "{ebody}");
+    // теги и область записи (круг правок 1): без значения, чистый тег — как есть
+    let etags = f["tags"].to_string();
+    assert!(!etags.contains(&s) && etags.contains("\"ops\""), "{f:?}");
+    assert_eq!(f["area"].as_str().unwrap(), "зона ‹secret›", "{f:?}");
     assert!(z.text(&format!("_history/{n}.jsonl")).contains("‹secret›"));
     assert!(z.text(&format!("_history/{e}.jsonl")).contains("‹secret›"));
     // сессия WebUI — исходник, без признака

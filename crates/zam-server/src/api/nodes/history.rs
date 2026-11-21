@@ -35,10 +35,8 @@ pub async fn revisions(
     let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
     let mut revs = list_revisions(&sc.db, sc.node.id).await?;
     // сообщение правки — свободный текст автора
-    for r in &mut revs {
-        if let Some(m) = r.message.take() {
-            r.message = Some(agent_view::view(&p, &m).into_owned());
-        }
+    for m in revs.iter_mut().filter_map(|r| r.message.as_mut()) {
+        agent_view::view_in_place(&p, m);
     }
     Ok(Json(revs))
 }
@@ -68,7 +66,7 @@ pub async fn revision(
     };
     let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
     let (rev, text) = node_content(&sc.db, sc.node.id, Some(rev)).await?;
-    let text = agent_view::view_owned(&p, text).await;
+    let text = agent_view::view_owned(&p, text).await?;
     Ok(if md {
         markdown_response(text, rev)
     } else {
@@ -104,8 +102,8 @@ pub async fn diff(
     };
     // агенту — каждая ревизия маской до диффа
     let (old, new) = (
-        agent_view::view_owned(&p, old).await,
-        agent_view::view_owned(&p, new).await,
+        agent_view::view_owned(&p, old).await?,
+        agent_view::view_owned(&p, new).await?,
     );
     let mut r = diff_blocking(old, new, format!("rev {from}"), format!("rev {to}"))
         .await?
@@ -152,5 +150,5 @@ pub async fn revert(
         details,
     )
     .await?;
-    Ok(Json(agent_view::node_json(&p, &node)))
+    Ok(Json(agent_view::node_json(&p, &node)?))
 }

@@ -762,6 +762,13 @@ pub fn head_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Заголовок записи в строке хука агенту: маска секретов `zam-secrets` **до** обрезки (иначе
+/// разрезанный границей ключ маска не узнала бы) и не длиннее `max` символов (задача 5 M7.1;
+/// сервер M7.1 уже маскирует заголовки для токена — здесь ещё и для старого сервера).
+pub fn shown_title(title: &str, max: usize) -> String {
+    zam_secrets::mask_text(title).chars().take(max).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

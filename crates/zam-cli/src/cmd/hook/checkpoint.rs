@@ -50,7 +50,7 @@ use super::input::Input;
 use super::journal::{self, Ev};
 use super::output::Output;
 use super::snapshot_queue;
-use super::{Env, Flag, Kind, Settings, encode_segment};
+use super::{Env, Flag, Kind, Settings, encode_segment, shown_title};
 use crate::client::{Client, EXIT_NOT_FOUND, read_json};
 
 /// Срок `POST /code/impact` внутри бюджета `checkpoint` (100 мс), мс (M6 §12).
@@ -71,13 +71,6 @@ pub const REMINDER: &str = "ZeroAIMemory: в этой сессии были пр
 записано. Если сделано что-то значимое, запиши итоги: изменение — `zam log changelog` \
 (MCP: memory_log), открытие, ловушку или провал — `zam log insight`. Если записывать нечего — \
 просто заверши работу.";
-
-/// Заголовок записи в напоминании агенту: маска секретов `zam-secrets` **до** обрезки (иначе
-/// разрезанный границей ключ маска не узнала бы) и не длиннее `max` символов (задача 5 M7.1;
-/// сервер M7.1 уже маскирует его для токена — здесь ещё и для старого сервера).
-fn shown_title(title: &str, max: usize) -> String {
-    zam_secrets::mask_text(title).chars().take(max).collect()
-}
 
 /// Строка про next_step захваченных задач `in_progress` (до 3); пусто — таких нет.
 pub fn task_line(v: &serde_json::Value) -> Option<String> {

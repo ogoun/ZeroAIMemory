@@ -8,7 +8,7 @@ mod common;
 mod scan_common;
 
 use axum::http::{Method, StatusCode};
-use common::api::{Api, api};
+use common::api::{Api, Resp, api};
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::{chunks_for_index, entry_chunks_for_index};
@@ -511,6 +511,384 @@ async fn agent_entries_masked() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.text().contains(&gotcha), "{}", r.text());
     assert!(!r.text().contains(&s), "{}", r.text());
+}
+
+/// Решение тестов маски круга правок 1 (задача 5 M7.1): журналы релизов и ссылки на файлы
+/// ведутся в решении.
+const SOL: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e55";
+
+async fn with_solution(name: &str) -> Api {
+    let a = api(name, |_| {}).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": SOL, "name": "Маска"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    a
+}
+
+/// `POST` записи токеном → ответ (201).
+async fn post_entry(a: &Api, space: &str, body: Value) -> Value {
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/spaces/{space}/entries"),
+            Some(body),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    r.json()
+}
+
+/// `GET uri` по токену — без значения `s` и с меткой; тот же запрос из сессии WebUI — исходник.
+async fn get_pair(a: &Api, uri: &str, s: &str) -> (Resp, Resp) {
+    let t = a.t(Method::GET, uri, None).await;
+    assert_eq!(t.status, StatusCode::OK, "{uri}: {}", t.text());
+    assert!(
+        !t.text().contains(s) && t.text().contains(MARK),
+        "{uri}: {}",
+        t.text()
+    );
+    let h = a.adm(Method::GET, uri, None, None).await;
+    assert_eq!(h.status, StatusCode::OK, "{uri}: {}", h.text());
+    assert!(
+        h.text().contains(s),
+        "человеку — исходник: {uri}: {}",
+        h.text()
+    );
+    (t, h)
+}
+
+/// Ответ по токену без значения `s` (и с меткой, если `mark`).
+fn clean(r: &Resp, s: &str, mark: bool, what: &str) {
+    assert!(!r.text().contains(s), "{what}: {}", r.text());
+    assert!(!mark || r.text().contains(MARK), "{what}: {}", r.text());
+}
+
+/// `GET /file-refs` (хук `post-tool` печатает заголовки агенту, круг правок 1): по токену —
+/// заголовки с маской, `ETag` — по выданному (у маски свой, повтор с ним — 304); сессии WebUI —
+/// исходник.
+#[tokio::test]
+async fn agent_file_refs_titles_masked() {
+    let a = with_solution("secrets-file-refs").await;
+    let s = secret();
+    post_entry(
+        &a,
+        SOL,
+        json!({"kind": "insight", "title": format!("Ключ {s} в конфиге"),
+               "body": "Файл конфигурации.", "data": {"kind": "gotcha"},
+               "refs": {"files": [{"path": "src/config.rs"}]}, "force": true}),
+    )
+    .await;
+    let uri = format!("/api/v1/file-refs?solution={SOL}");
+    let (t, h) = get_pair(&a, &uri, &s).await;
+    assert!(t.text().contains("src/config.rs"), "{}", t.text());
+    assert_ne!(t.header("etag"), h.header("etag"), "ETag — по выданному");
+    let etag = t.header("etag").to_string();
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::GET,
+            &uri,
+            None,
+            &[("if-none-match", etag.as_str())],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED, "{}", r.text());
+}
+
+/// Словарь и 409 `term-conflict`: заголовок и определение термина агенту — с маской (и в
+/// `conflicts[].title`, и в `detail`), сессии WebUI — исходник.
+#[tokio::test]
+async fn agent_glossary_and_term_conflict_masked() {
+    let a = api("secrets-glossary", |_| {}).await;
+    let s = secret();
+    let j = post_entry(
+        &a,
+        "knowledge",
+        json!({"kind": "term", "title": format!("Ключ {s}"), "body": "Термин.",
+               "data": {"definition": format!("Определение: token: {s}"),
+                        "aliases": ["деплой-ключ"]}}),
+    )
+    .await;
+    assert!(!j.to_string().contains(&s), "эхо термина: {j}");
+    get_pair(&a, "/api/v1/spaces/knowledge/glossary", &s).await;
+    let dup = json!({"kind": "term", "title": "деплой-ключ", "body": "Другой.",
+                     "data": {"definition": "Другое определение"}});
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(dup.clone()),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let p = r.json();
+    assert_eq!(p["type"], "/problems/term-conflict", "{p}");
+    clean(&r, &s, true, "409 term-conflict");
+    assert!(
+        p["conflicts"][0]["title"].as_str().unwrap().contains(MARK),
+        "{p}"
+    );
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(dup),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert!(r.text().contains(&s), "человеку — исходник: {}", r.text());
+}
+
+/// 409 `possible-duplicate`: заголовки кандидатов агенту — с маской.
+#[tokio::test]
+async fn agent_dedup_candidates_masked() {
+    let a = api("secrets-dedup", |_| {}).await;
+    let s = secret();
+    let title = format!("Ключ {s} в логах деплоя");
+    post_entry(
+        &a,
+        "knowledge",
+        json!({"kind": "insight", "title": &title, "body": "Первое.", "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(
+                json!({"kind": "insight", "title": &title, "body": "Второе.",
+                        "data": {"kind": "gotcha"}}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let p = r.json();
+    assert_eq!(p["type"], "/problems/possible-duplicate", "{p}");
+    clean(&r, &s, true, "409 possible-duplicate");
+}
+
+/// Выжимки кэша (`GET /cache`, `GET /cache/{id}`) и шаг 0 поиска: запрос и текст выжимки агенту
+/// — с маской, сессии WebUI — исходник.
+#[tokio::test]
+async fn agent_cache_summaries_masked() {
+    let a = api("secrets-cache", |_| {}).await;
+    let s = secret();
+    let n = a
+        .note(
+            "knowledge",
+            "ops/deploy-keys",
+            "# Деплой\n\nКлючи деплоя лежат в Vault.\n",
+        )
+        .await;
+    let body = json!({"query": "где ключи деплоя",
+                      "summary": format!("Ключ деплоя: token: {s} (n:x)."),
+                      "sources": [{"id": format!("n:{}", n["id"].as_str().unwrap()), "rev": 1}]});
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/cache",
+            Some(body),
+            &[("x-zam-session", "s-mask")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    clean(&r, &s, false, "эхо выжимки");
+    let cid = r.json()["id"].as_str().unwrap().to_string();
+    get_pair(&a, "/api/v1/cache", &s).await;
+    get_pair(&a, &format!("/api/v1/cache/{cid}"), &s).await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "где ключи деплоя"})),
+            &[("x-zam-session", "s-other")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    clean(&r, &s, false, "шаг 0 поиска");
+}
+
+/// Сравнение релизов: тексты релизов, дифф заметок, записи changelog и сообщения коммитов агенту
+/// — с маской, сессии WebUI — исходник.
+#[tokio::test]
+async fn agent_release_compare_masked() {
+    let a = with_solution("secrets-releases").await;
+    let s = secret();
+    let release = |version: &str, notes: String, commits: Value| {
+        json!({"kind": "release", "title": format!("Релиз {version}"), "body": notes,
+               "data": {"version": version, "commits": commits}})
+    };
+    post_entry(&a, SOL, release("1.0.0", "старое\n".into(), json!([]))).await;
+    post_entry(
+        &a,
+        SOL,
+        json!({"kind": "changelog", "title": format!("Починка ключа {s}"),
+               "body": "Подробности.", "data": {"kind": "fix"}}),
+    )
+    .await;
+    let r2 = post_entry(
+        &a,
+        SOL,
+        release(
+            "1.1.0",
+            format!("новое\ntoken: {s}\n"),
+            json!([{"sha": "abc123", "subject": format!("fix: ключ {s}")}]),
+        ),
+    )
+    .await;
+    let uri = format!("/api/v1/releases/{}/compare", r2["id"].as_str().unwrap());
+    let (t, _) = get_pair(&a, &uri, &s).await;
+    let j = t.json();
+    assert!(
+        j["notes_diff"]
+            .as_str()
+            .unwrap()
+            .contains("+token: ‹secret›"),
+        "{j}"
+    );
+    assert!(
+        j["commits"][0]["subject"].as_str().unwrap().contains(MARK),
+        "{j}"
+    );
+}
+
+/// `claimed_tasks` сессии: заголовок захваченной задачи агенту — с маской.
+#[tokio::test]
+async fn agent_claimed_tasks_masked() {
+    let a = api("secrets-claimed", |_| {}).await;
+    let s = secret();
+    let t = post_entry(
+        &a,
+        "knowledge",
+        json!({"kind": "task", "title": format!("Ротация ключа {s}"), "body": "План.",
+               "data": {}}),
+    )
+    .await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{}/claim", t["id"].as_str().unwrap()),
+            Some(json!({})),
+            &[("x-zam-session", "cs-mask")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    clean(&r, &s, false, "эхо захвата");
+    let r = a.t(Method::GET, "/api/v1/sessions/cs-mask", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["claimed_tasks"].as_array().unwrap().len(), 1, "{j}");
+    clean(&r, &s, true, "claimed_tasks");
+}
+
+/// Узел и запись после операций — `revert`, `move`, удаление в корзину, корзина, `restore`: ответ
+/// агенту без значения (frontmatter узла и текст записи — с маской).
+#[tokio::test]
+async fn agent_node_and_entry_ops_masked() {
+    let a = api("secrets-ops", |_| {}).await;
+    let s = secret();
+    let content = format!("---\ndescription: \"ключ {s}\"\n---\n# Доступ\n\ntoken: {s}\n");
+    let n = a.note("knowledge", "ops/ops-mask", &content).await;
+    let nid = n["id"].as_str().unwrap().to_string();
+    let node = format!("/api/v1/nodes/{nid}");
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &node,
+            Some(json!({"content": format!("{content}\nстрока 2\n")})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let ops = [
+        (
+            Method::POST,
+            format!("{node}/revert"),
+            Some(json!({"rev": 1})),
+        ),
+        (
+            Method::POST,
+            format!("{node}/move"),
+            Some(json!({"path": "ops/moved-mask"})),
+        ),
+    ];
+    for (m, uri, body) in ops {
+        let r = a.t(m, &uri, body).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        clean(&r, &s, true, &uri);
+    }
+    let r = a.t(Method::DELETE, &node, None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let r = a.t(Method::GET, "/api/v1/trash", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    clean(&r, &s, false, "корзина");
+    let r = a.t(Method::POST, &format!("{node}/restore"), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    clean(&r, &s, true, "восстановление узла");
+    // запись: в корзину и обратно
+    let e = post_entry(
+        &a,
+        "knowledge",
+        json!({"kind": "insight", "title": format!("Ключ {s} в CI"), "body": format!("token: {s}"),
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let entry = format!("/api/v1/entries/{}", e["id"].as_str().unwrap());
+    let r = a
+        .tok_h(&a.token, Method::DELETE, &entry, None, &[("if-match", "1")])
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let r = a.t(Method::POST, &format!("{entry}/restore"), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    clean(&r, &s, true, "восстановление записи");
+}
+
+/// `range` из сессии WebUI режет исходник (смещения — по исходному тексту), по токену — маску
+/// всей ревизии (смещения — по ней).
+#[tokio::test]
+async fn range_session_original_token_masked() {
+    let a = api("secrets-range-pair", |_| {}).await;
+    let s = secret();
+    let content = format!("# Ключи\n\ntoken: {s}\n\nхвост\n");
+    let n = a.note("knowledge", "ops/range-pair", &content).await;
+    let nid = format!("n:{}", n["id"].as_str().unwrap());
+    let masked = zam_markdown::mask_text(&content);
+    let body = |len: usize| json!({"items": [{"id": &nid, "range": format!("r1:0-{len}")}]});
+    let r = a
+        .t(Method::POST, "/api/v1/read", Some(body(masked.len())))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["items"][0]["text"],
+        masked.as_str(),
+        "{}",
+        r.text()
+    );
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/read",
+            Some(body(content.len())),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["items"][0]["text"],
+        content.as_str(),
+        "{}",
+        r.text()
+    );
 }
 
 /// Вход, на котором сканер правил M6 упирался в предел повторов (фикстура `zam-secrets`, задача
