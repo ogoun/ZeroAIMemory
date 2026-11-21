@@ -80,9 +80,13 @@ impl DepManifest {
             }
             // до загрузки: иначе неизвестный формат выяснился бы только после скачивания
             if crate::download::format_of(&e.url).is_none() {
+                let known: Vec<&str> = crate::download::ARCHIVE_SUFFIXES
+                    .iter()
+                    .map(|&(s, _)| s)
+                    .collect();
                 return Err(FetchError::Invalid(format!(
-                    "{ctx}: неизвестный формат архива по окончанию url (zip, nupkg, tar.gz, \
-                     tgz, tar.xz, txz)"
+                    "{ctx}: неизвестный формат архива по окончанию url (допустимы: {})",
+                    known.join(", ")
                 )));
             }
             let h = e.sha256.trim();
@@ -150,6 +154,10 @@ rename = { "qdrant" = "qdrant-bin" }
             .validate(true)
             .unwrap_err();
         assert!(err.to_string().contains("формат архива"), "{err}");
+        // список допустимых — из того же источника, что и распознавание
+        for (s, _) in crate::download::ARCHIVE_SUFFIXES {
+            assert!(err.to_string().contains(s), "{s}: {err}");
+        }
         let nupkg = ok.replace("q.zip", "q.1.0.0.nupkg");
         DepManifest::parse(&nupkg).unwrap().validate(true).unwrap();
     }

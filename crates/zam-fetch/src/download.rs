@@ -77,8 +77,9 @@ fn is_loopback(url: &str) -> bool {
 
 /// Скачивает `url` в `dest` (через прокси из окружения, кроме локальной петли), с таймаутами.
 /// `size` — закреплённый размер, если задан: тело длиннее обрывает загрузку (сервер отдаёт не
-/// тот файл — гигабайты впустую не качаются), короче — ошибка после загрузки
-/// ([`FetchError::SizeMismatch`]). При ошибке частичный `dest` остаётся — его удаляет вызывающий.
+/// тот файл — гигабайты впустую не качаются; [`FetchError::SizeExceeded`]), короче — ошибка
+/// после загрузки ([`FetchError::SizeMismatch`]). При ошибке частичный `dest` остаётся — его
+/// удаляет вызывающий.
 pub fn download(url: &str, dest: &Path, size: Option<u64>) -> Result<(), FetchError> {
     let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
@@ -110,11 +111,11 @@ pub fn download(url: &str, dest: &Path, size: Option<u64>) -> Result<(), FetchEr
         Some(max) => {
             let mut limited = reader.take(max.saturating_add(1));
             let n = io::copy(&mut limited, &mut out).map_err(copy_err)?;
+            // прочитано max + 1 — сколько всего, неизвестно
             if n > max {
-                return Err(FetchError::SizeMismatch {
+                return Err(FetchError::SizeExceeded {
                     what: url.to_string(),
-                    expected: max,
-                    actual: n,
+                    max,
                 });
             }
         }
@@ -340,18 +341,25 @@ pub(crate) enum Format {
     TarXz,
 }
 
-/// Формат по окончанию URL без учёта регистра; `None` — архив не поддерживается.
+/// Окончания URL поддерживаемых архивов и их форматы — единственный источник для
+/// [`format_of`] и текста ошибки проверки манифеста.
+pub(crate) const ARCHIVE_SUFFIXES: [(&str, Format); 6] = [
+    (".zip", Format::Zip),
+    (".nupkg", Format::Zip),
+    (".tar.gz", Format::TarGz),
+    (".tgz", Format::TarGz),
+    (".tar.xz", Format::TarXz),
+    (".txz", Format::TarXz),
+];
+
+/// Формат по окончанию URL без учёта регистра ([`ARCHIVE_SUFFIXES`]); `None` — архив не
+/// поддерживается.
 pub(crate) fn format_of(url: &str) -> Option<Format> {
     let lower = url.to_ascii_lowercase();
-    if lower.ends_with(".zip") || lower.ends_with(".nupkg") {
-        Some(Format::Zip)
-    } else if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
-        Some(Format::TarGz)
-    } else if lower.ends_with(".txz") || lower.ends_with(".tar.xz") {
-        Some(Format::TarXz)
-    } else {
-        None
-    }
+    ARCHIVE_SUFFIXES
+        .iter()
+        .find(|(s, _)| lower.ends_with(s))
+        .map(|&(_, f)| f)
 }
 
 /// Извлекает из архива (zip и nupkg, tar.gz, tar.xz) только перечисленные в `entry.extract`
@@ -1264,10 +1272,19 @@ mod tests {
         std::fs::write(d.join("m").join("model.onnx.4242.part"), b"old").unwrap();
         std::fs::write(d.join("m").join("model.onnx.x.part"), b"keep").unwrap();
         std::fs::write(d.join("m").join("tokenizer.json.77.part"), b"keep").unwrap();
-        // тело длиннее закреплённого размера — загрузка обрывается
+        // тело длиннее закреплённого размера — загрузка обрывается на size + 1 байте, поэтому
+        // в тексте «больше N байт», а не число прочитанного
         let (url, _) = serve(b"hello", "file.bin", 1);
         let err = fetch_file(&url, HELLO_SHA, Some(3), &dest).unwrap_err();
-        assert!(matches!(err, FetchError::SizeMismatch { .. }), "{err}");
+        assert!(
+            matches!(err, FetchError::SizeExceeded { max: 3, .. }),
+            "{err}"
+        );
+        let err = err.to_string();
+        assert!(
+            err.contains("больше 3 байт") && !err.contains("получено 4"),
+            "{err}"
+        );
         // короче закреплённого — ошибка до хэша
         let (url, _) = serve(b"hello", "file.bin", 1);
         let err = fetch_file(&url, HELLO_SHA, Some(10), &dest).unwrap_err();

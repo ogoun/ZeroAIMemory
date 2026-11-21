@@ -53,6 +53,13 @@ pub enum FetchError {
         expected: u64,
         actual: u64,
     },
+    /// Тело загрузки длиннее закреплённого размера: загрузка оборвана после `max + 1` байта,
+    /// полный размер неизвестен.
+    #[error(
+        "несовпадение размера {what}: ожидалось {max} байт, получено больше {max} байт \
+         (загрузка оборвана)"
+    )]
+    SizeExceeded { what: String, max: u64 },
     /// Модель с некоммерческой лицензией без явного согласия (`--accept-nc-license`).
     #[error(
         "модель '{id}' распространяется по лицензии {license} (только некоммерческое \
@@ -90,6 +97,10 @@ impl FetchError {
                 what: format!("{ctx}: {what}"),
                 expected,
                 actual,
+            },
+            FetchError::SizeExceeded { what, max } => FetchError::SizeExceeded {
+                what: format!("{ctx}: {what}"),
+                max,
             },
             FetchError::Invalid(m) => FetchError::Invalid(format!("{ctx}: {m}")),
             // в URL уже видно, что качалось; согласие — о модели целиком

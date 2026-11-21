@@ -325,7 +325,10 @@ mod tests {
             "{:#}",
             fetch_one("dep", &e, &d, &d.join("out")).unwrap_err()
         );
-        assert!(err.contains("размер"), "{err}");
+        assert!(
+            err.contains("размер") && err.contains("больше 4 байт"),
+            "{err}"
+        );
         assert_eq!(std::fs::read_dir(d.join("deps-cache")).unwrap().count(), 0);
     }
 

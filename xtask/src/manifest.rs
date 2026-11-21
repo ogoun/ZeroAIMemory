@@ -57,10 +57,10 @@ rename = { "qdrant" = "qdrant-bin" }
             for p in PLATFORMS {
                 assert!(m.platform.contains_key(p), "{name}: нет платформы {p}");
             }
-        }
-        // M7.1 (§4.1 п. 1): ONNX Runtime — пакеты NuGet с закреплённым размером, без rename
-        for name in ["onnxruntime", "onnxruntime-gpu"] {
-            let m = Manifest::load(&dir.join(format!("{name}.toml"))).unwrap();
+            // M7.1 (§4.1 п. 1): ONNX Runtime — пакеты NuGet с закреплённым размером, без rename
+            if !matches!(name, "onnxruntime" | "onnxruntime-gpu") {
+                continue;
+            }
             for (p, e) in &m.platform {
                 assert!(
                     e.url.starts_with("https://api.nuget.org/v3-flatcontainer/")
