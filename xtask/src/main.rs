@@ -50,6 +50,10 @@ enum Cmd {
         /// (по умолчанию — оба, они нужны тестам zam-ml)
         #[arg(long, value_enum)]
         flavor: Option<Flavor>,
+        /// Без загрузки: удалить из target/deps-cache файлы, sha256 которых нет ни в одном
+        /// манифесте deploy/*.toml (прежние версии архивов, *.part прерванных загрузок)
+        #[arg(long, conflicts_with_all = ["platform", "print_hashes", "flavor"])]
+        prune_cache: bool,
     },
     /// Скачать модели из deploy/models.toml в target/models/<id>/ с проверкой SHA-256
     /// (по умолчанию — модели комплекта zam-models, bundle = true)
@@ -172,7 +176,12 @@ fn load_manifests(root: &Path) -> Result<Vec<Manifest>> {
         .collect()
 }
 
-fn fetch_deps(platform: Option<String>, print_hashes: bool, flavor: Option<Flavor>) -> Result<()> {
+fn fetch_deps(
+    platform: Option<String>,
+    print_hashes: bool,
+    flavor: Option<Flavor>,
+    prune_cache: bool,
+) -> Result<()> {
     let root = repo_root();
     let target = root.join("target");
     let manifests = load_manifests(&root)?;
@@ -182,6 +191,18 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool, flavor: Option<Flavo
     // Библиотеки NVIDIA здесь не скачиваются (это `zam-server cuda fetch`), но манифест проверяется.
     let cuda = CudaManifest::load(&root.join("deploy").join(CUDA_MANIFEST))?;
     cuda.validate()?;
+    // После проверки манифестов: по неверному манифесту кэш не чистится.
+    if prune_cache {
+        let keep = fetch::manifest_hashes(&root.join("deploy"))?;
+        let cache = target.join("deps-cache");
+        let (n, bytes) = fetch::prune_cache(&cache, &keep)?;
+        println!(
+            "{}: удалено файлов — {n} ({:.1} МБ)",
+            cache.display(),
+            bytes as f64 / 1e6
+        );
+        return Ok(());
+    }
     if let Some(p) = platform.as_deref()
         && !PLATFORMS.contains(&p)
     {
@@ -198,8 +219,8 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool, flavor: Option<Flavo
                     continue;
                 }
                 println!("# {} {} [{plat}] {}", m.name, m.version, e.url);
-                let h = fetch::print_hash(&e.url, &target)?;
-                println!("{}.toml [platform.{plat}] sha256 = \"{h}\"", m.name);
+                let (h, size) = fetch::print_hash(&e.url, &target)?;
+                println!("{}", print_hashes_lines(&m.name, plat, &h, size));
             }
         }
         return Ok(());
@@ -249,6 +270,12 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool, flavor: Option<Flavo
         );
     }
     Ok(())
+}
+
+/// Строки `--print-hashes` для архива: комментарий с местом в манифесте, затем `sha256` и
+/// `size` — каждое своей строкой TOML, их вставляют в `[platform.<плат>]` как есть.
+fn print_hashes_lines(name: &str, plat: &str, sha256: &str, size: u64) -> String {
+    format!("# {name}.toml [platform.{plat}]\nsha256 = \"{sha256}\"\nsize = {size}")
 }
 
 /// Нужен ли манифест зависимостей сборке: ORT CPU — только cpu, ORT GPU — только gpu; без
@@ -493,7 +520,8 @@ fn run(cmd: Cmd) -> Result<()> {
             platform,
             print_hashes,
             flavor,
-        } => fetch_deps(platform, print_hashes, flavor),
+            prune_cache,
+        } => fetch_deps(platform, print_hashes, flavor, prune_cache),
         Cmd::FetchModels {
             test,
             ids,
@@ -552,6 +580,22 @@ mod tests {
     #[test]
     fn gha_escape_encodes_newlines_and_percent() {
         assert_eq!(gha_escape("50% a\r\nb"), "50%25 a%0D%0Ab");
+    }
+
+    /// Вывод `--print-hashes` вставляется в `[platform.<плат>]` манифеста как есть: sha256 и size —
+    /// отдельными строками TOML под комментарием с местом.
+    #[test]
+    fn print_hashes_lines_are_toml() {
+        let h = "a".repeat(64);
+        let s = print_hashes_lines("onnxruntime", "windows-x64", &h, 159_626_085);
+        assert!(
+            s.starts_with("# onnxruntime.toml [platform.windows-x64]\n"),
+            "{s}"
+        );
+        assert_eq!(s.lines().count(), 3, "{s}");
+        let t: toml::Table = s.parse().unwrap();
+        assert_eq!(t["sha256"].as_str(), Some(h.as_str()));
+        assert_eq!(t["size"].as_integer(), Some(159_626_085));
     }
 
     #[test]
