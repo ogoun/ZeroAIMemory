@@ -6,9 +6,12 @@
 
 mod common;
 
-use common::rnd;
+use common::{hex, rnd};
 use proptest::prelude::*;
-use zam_secrets::{SECRET_MARK, SecretKind, mask_secrets, mask_text, scan_secrets};
+use zam_secrets::{SECRET_MARK, SecretKind, mask_flags, mask_secrets, mask_text, scan_secrets};
+
+/// Шаблон фикстуры цепочки «пароль в URL ↔ ключ-значение» (`common::expand`).
+const DEPTH_FIXTURE: &str = include_str!("fixtures/scan_depth_capped.txt");
 
 fn kinds(text: &str) -> Vec<SecretKind> {
     scan_secrets(text).into_iter().map(|h| h.kind).collect()
@@ -263,7 +266,7 @@ fn lines_and_order() {
 
 /// Имя перед замаскированным значением (`<имя>=<значение>`, значение — по правилу
 /// ключ-значение) проверяется в первом же проходе: повторная маскировка ничего не меняет
-/// (находка proptest `mask_is_idempotent`, финальная волна M3).
+/// (находка proptest `mask_text_idempotent`, прежде `mask_is_idempotent`, финальная волна M3).
 #[test]
 fn name_before_masked_value_idempotent() {
     for t in [
@@ -351,11 +354,21 @@ proptest! {
         prop_assert_eq!(mask_secrets(&text, &hits), masked_expected);
     }
 
-    /// Повторная маскировка ничего не меняет.
+    /// Повторная маскировка ничего не меняет (задача 3 M7.1: для любого текста — и на цепочках
+    /// «пароль в URL ↔ ключ-значение», и на правилах M7.1: русские слова-ключи, Digest).
     #[test]
-    fn mask_is_idempotent(
+    fn mask_text_idempotent(
         parts in proptest::collection::vec(
             prop_oneof![
+                // атомы генератора входа упора (`common::atoms`) и звено цепочки фикстуры
+                proptest::sample::select(common::atoms()).prop_map(|a| common::expand(&a)),
+                Just(common::expand(DEPTH_FIXTURE.trim_end())),
+                Just("\"pwd=:`@".to_string()),
+                Just("токен: ".to_string()),
+                Just("паролем `".to_string()),
+                Just("ключ API = ".to_string()),
+                Just(common::hex(64, 5)),
+                Just("Authorization: Digest username=\"u\", response=\"".to_string()),
                 "[ -~]{0,40}",
                 "\\PC{0,20}",
                 Just("password=abcdef123".to_string()),
@@ -435,16 +448,17 @@ fn name_left_of_masked_url_value_idempotent() {
     }
 }
 
-/// Полный прогон перед слиянием M5.6 (`mask_is_idempotent`, seed `cc ef3a6e…`): ключ вплотную
-/// после буквы (`Ahf_<34>`, граница слова правила префикса не срабатывает — ловит правило
-/// энтропии), дальше в том же URL-токене — `password=…postgres://…`. Первый проход видел `://`
-/// ещё не замаскированного значения и отбрасывал кандидата как часть URL, второй — уже нет:
-/// ключ уходил открытым. Правило энтропии смотрит на текст, каким его увидит повторный проход.
+/// Полный прогон перед слиянием M5.6 (`mask_text_idempotent`, прежде `mask_is_idempotent`; seed
+/// `cc ef3a6e…`): ключ вплотную после буквы (`Ahf_<34>`, граница слова правила префикса не
+/// срабатывает — ловит правило энтропии), дальше в том же URL-токене — `password=…postgres://…`.
+/// Первый проход видел `://` ещё не замаскированного значения и отбрасывал кандидата как часть
+/// URL, второй — уже нет: ключ уходил открытым. Правило энтропии смотрит на текст, каким его
+/// увидит повторный проход.
 #[test]
 fn key_glued_after_letter_before_masked_url_value() {
     let tail = format!("{SECRET_MARK}password=abcdef123postgres://u:pw12345@h/");
     let keys = [
-        // тело — как у генератора `mask_is_idempotent` (`rnd(34, 40)`)
+        // тело — как у генератора `mask_text_idempotent` (`rnd(34, 40)`)
         format!("{}_{}", "hf", rnd(34, 40)),
         format!("{}_{}", "hf", rnd(34, 70)),
         format!("gh{}_{}", "p", rnd(36, 71)),
@@ -661,5 +675,226 @@ fn backtick_value_masked() {
         "password=`short`",
     ] {
         assert!(scan_secrets(t).is_empty(), "{t}: {:?}", scan_secrets(t));
+    }
+}
+
+/// Задача 3 M7.1 (`i:01M7Z9C3FAE8ARBCX00WSZJ6SD`): русские слова-ключи и их падежные формы, после
+/// которых естественно стоит значение; значение маскируется и тогда, когда оно только из hex.
+/// Слово «ключ» само по себе, другие формы слова, проза после двоеточия, идентификаторы и хэши без
+/// слова-ключа — не секреты.
+#[test]
+fn ru_key_value_masked_and_guards() {
+    let h64 = hex(64, 1);
+    let h40 = hex(40, 2);
+    let pw = format!("Qw{}", "erty12345");
+    let v = format!("s3cr3t{}", "-value");
+    let cases = [
+        (format!("токен: {h64}"), format!("токен: {SECRET_MARK}")),
+        (format!("Токен = {h40}"), format!("Токен = {SECRET_MARK}")),
+        (format!("ТОКЕН:{h64}"), format!("ТОКЕН:{SECRET_MARK}")),
+        (format!("пароль: {pw}"), format!("пароль: {SECRET_MARK}")),
+        (
+            format!("Пароль: \"{pw} {pw}\""),
+            format!("Пароль: \"{SECRET_MARK}\""),
+        ),
+        (format!("секрет: {v}"), format!("секрет: {SECRET_MARK}")),
+        (format!("ключ API: {v}"), format!("ключ API: {SECRET_MARK}")),
+        (
+            format!("Ключ api = {v}"),
+            format!("Ключ api = {SECRET_MARK}"),
+        ),
+        (format!("api-ключ: {v}"), format!("api-ключ: {SECRET_MARK}")),
+        (
+            format!("API-токен: {h64}"),
+            format!("API-токен: {SECRET_MARK}"),
+        ),
+        // падежные формы: «значение токена: …», «пароля: …», «секрета: …», «токеном `…`»
+        (
+            format!("значение токена: {h64}"),
+            format!("значение токена: {SECRET_MARK}"),
+        ),
+        (format!("Пароля: {pw}"), format!("Пароля: {SECRET_MARK}")),
+        (format!("секрета: {v}"), format!("секрета: {SECRET_MARK}")),
+        (
+            format!("войти с паролем `{pw}`"),
+            format!("войти с паролем `{SECRET_MARK}`"),
+        ),
+        (
+            format!("подписан токеном \"{h64}\""),
+            format!("подписан токеном \"{SECRET_MARK}\""),
+        ),
+        (format!("паролем: {pw}"), format!("паролем: {SECRET_MARK}")),
+    ];
+    for (t, want) in &cases {
+        assert_eq!(one(t), SecretKind::KeyValue, "{t}");
+        assert_eq!(&mask_text(t), want, "{t}");
+        assert_eq!(mask_text(want), *want, "идемпотентно: {t}");
+    }
+    let id = zam_core::Id::new().to_string();
+    let sha1 = "9fceb02d0ae598e95dc970b74767f19372d61af8";
+    let guards = [
+        "ключ идемпотентности: abc123".to_string(),
+        "ключ: abcdef123456".to_string(),
+        "токенов: 1500".to_string(),
+        "Токенов: 1500000".to_string(),
+        "токен — это строка".to_string(),
+        "токены: строки доступа".to_string(),
+        format!("token_id: {id}"),
+        format!("токен_id: {id}"),
+        "/password/reset и /пароль/сброс".to_string(),
+        format!("коммит {sha1}"),
+        format!("sha256 {h64}"),
+        format!("хэш {h64} и {}", h64.to_ascii_uppercase()),
+        // «паролем» без кавычек и без разделителя — проза, а не значение
+        "войти с паролем администратора".to_string(),
+        "подписан токеном доступа".to_string(),
+        // проза после двоеточия: одно слово кириллицей — не значение
+        "Пароль: хранится в Vault".to_string(),
+        "Токен: устарел.".to_string(),
+        // значение — только на той же строке: «…токен:» в конце строки вводит блок ниже
+        format!("В логе нашёлся токен:\n{pw}"),
+        format!("пароль =\n\n`{pw}`"),
+        // слово-ключ внутри другого слова
+        "секретарь: Иванова".to_string(),
+        format!("автотокен: {pw}"),
+        // заглушки
+        "пароль: <ваш-пароль>".to_string(),
+        "токен: ${GITHUB_TOKEN}".to_string(),
+    ];
+    for t in &guards {
+        assert!(scan_secrets(t).is_empty(), "{t}: {:?}", scan_secrets(t));
+    }
+}
+
+/// Значение только из hex после английского слова-ключа маскируется (так было и до M7.1 —
+/// сторож: исключение hex остаётся только у правила энтропии).
+#[test]
+fn en_key_value_hex_value_masked() {
+    for (t, want) in [
+        (
+            format!("token: {}", hex(64, 3)),
+            format!("token: {SECRET_MARK}"),
+        ),
+        (
+            format!("api_key={}", hex(40, 4)),
+            format!("api_key={SECRET_MARK}"),
+        ),
+        (
+            format!("\"secret\": \"{}\"", hex(32, 5)),
+            format!("\"secret\": \"{SECRET_MARK}\""),
+        ),
+    ] {
+        assert_eq!(one(&t), SecretKind::KeyValue, "{t}");
+        assert_eq!(mask_text(&t), want, "{t}");
+    }
+}
+
+/// `Authorization: Digest …` (и `Proxy-Authorization:`): маскируется значение `response`, а
+/// `username`, `nonce`, `cnonce`, `opaque` — не секреты; `response=` без схемы Digest — тоже.
+#[test]
+fn digest_authorization_masked() {
+    let r = hex(32, 6);
+    let cases = [
+        (
+            format!(
+                r#"Authorization: Digest username="u", realm="r", nonce="n0nce1", uri="/", cnonce="c0nce2", response="{r}", opaque="o"#
+            ),
+            format!(
+                r#"Authorization: Digest username="u", realm="r", nonce="n0nce1", uri="/", cnonce="c0nce2", response="{SECRET_MARK}", opaque="o"#
+            ),
+        ),
+        (
+            format!("Proxy-Authorization: digest username=u, response={r}, nc=00000001"),
+            format!("Proxy-Authorization: digest username=u, response={SECRET_MARK}, nc=00000001"),
+        ),
+        // заголовок в JSON журнала: кавычки экранированы
+        (
+            format!(r#"{{"authorization": "Digest username=\"u\", response=\"{r}\""}}"#),
+            format!(r#"{{"authorization": "Digest username=\"u\", response=\"{SECRET_MARK}\""}}"#),
+        ),
+    ];
+    for (t, want) in &cases {
+        assert_eq!(one(t), SecretKind::KeyValue, "{t}");
+        assert_eq!(&mask_text(t), want, "{t}");
+        assert_eq!(mask_text(want), *want, "идемпотентно: {t}");
+    }
+    for t in [
+        format!(r#"HTTP response="{r}""#),
+        r#"WWW-Authenticate: Digest realm="r", nonce="n0nce1abcdef", opaque="0paque1234""#
+            .to_string(),
+        "Authorization: Digest username=\"u\", response=\"<hex>\"".to_string(),
+    ] {
+        assert!(scan_secrets(&t).is_empty(), "{t}: {:?}", scan_secrets(&t));
+    }
+}
+
+/// Правила флагов командной строки перенесены из клиента (`zam-cli` `snapshot::mask_flags`) в
+/// `zam-secrets` без изменения поведения: ожидаемые строки — вывод прежней функции клиента на
+/// `main` (задача 3 M7.1, проверено до переноса).
+#[test]
+fn mask_flags_moved() {
+    let pw = ["Sx9", "kQ2", "vLm", "7Rt"].concat();
+    let plain = ["Abc", "123", "Def", "456"].concat();
+    let m = SECRET_MARK;
+    let cases = [
+        (
+            format!("psql --password {pw} -h h"),
+            format!("psql --password {m} -h h"),
+        ),
+        (
+            format!("az login --client-secret={pw}"),
+            format!("az login --client-secret={m}"),
+        ),
+        (
+            format!("gpg --batch --passphrase \"{pw} {pw}\" -d f.gpg"),
+            format!("gpg --batch --passphrase \"{m}\" -d f.gpg"),
+        ),
+        (
+            format!("mysql -u root -p{pw} db"),
+            format!("mysql -u root -p{m} db"),
+        ),
+        (
+            format!("mysql -u root -p'{pw} {pw}' db"),
+            format!("mysql -u root -p'{m}' db"),
+        ),
+        (
+            format!("curl -u admin:{pw} https://h/x"),
+            format!("curl -u admin:{m} https://h/x"),
+        ),
+        (
+            format!("wget --user=admin:{pw} http://h"),
+            format!("wget --user=admin:{m} http://h"),
+        ),
+        (
+            format!("curl -H \"Authorization: Bearer {plain}\" https://h"),
+            format!("curl -H \"Authorization: Bearer {m}\" https://h"),
+        ),
+        (
+            format!("curl -H 'X-Api-Key: {plain}' https://h"),
+            format!("curl -H 'X-Api-Key: {m}' https://h"),
+        ),
+        (
+            format!(
+                "curl -H \"Authorization: {}\" https://h",
+                ["$2b$10$", "abcdefghijklmnop"].concat()
+            ),
+            format!("curl -H \"Authorization: {m}\" https://h"),
+        ),
+    ];
+    for (t, want) in &cases {
+        assert_eq!(&mask_flags(t), want, "{t}");
+        assert_eq!(mask_flags(want), *want, "повторно: {t}");
+    }
+    for t in [
+        "docker run -u 1000:1000 image",
+        "curl -u 1000:1000 http://h",
+        "cargo test -pzam-cli",
+        "ssh -u admin:secretword host",
+        "curl -H \"Authorization: Bearer $TOKEN\" https://h",
+        "curl -H 'Authorization: Bearer ${API_TOKEN}' https://h",
+        "curl -H \"Authorization: Basic %CREDS%\" https://h",
+        "This is a basic implementation; bearer of bad news",
+    ] {
+        assert_eq!(mask_flags(t), t, "{t}");
     }
 }

@@ -970,7 +970,8 @@ async fn put_caps_fields_to_limits() {
 
 /// Ревью 17c, Minor 5, 6, 10: `agent` — только формат журнала (`claude`, `codex`), иначе 422;
 /// `taken_at` из будущего сводится к «сейчас» сервера; снимок старше хранимого принимается
-/// (204), но не заменяет его; упор сканера секретов — `secrets_scan_depth`.
+/// (204), но не заменяет его; вход, на котором сканер секретов правил M6 упирался в предел
+/// повторов, с задачи 3 M7.1 сходится — только `secrets_masked`, без `secrets_scan_depth`.
 #[tokio::test]
 async fn put_validates_agent_time_and_order() {
     let a = world("order", |_| {}).await;
@@ -1042,7 +1043,7 @@ async fn put_validates_agent_time_and_order() {
             .starts_with("2026-11-10T08:00:00"),
         "{g}"
     );
-    // упор сканера в предел повторов — предупреждение рядом с secrets_masked
+    // вход упора правил M6: маскируется, но предела повторов больше не достигает
     let capped = scan_common::expand(
         include_str!("../../zam-secrets/tests/fixtures/scan_depth_capped.txt").trim_end(),
     );
@@ -1055,10 +1056,7 @@ async fn put_validates_agent_time_and_order() {
     )
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    assert_eq!(
-        r.json()["warnings"],
-        json!(["secrets_masked", "secrets_scan_depth"])
-    );
+    assert_eq!(r.json()["warnings"], json!(["secrets_masked"]));
 }
 
 /// Ревью 17c, I2: текст снимка в дайджесте помечен как данные — строка-пометка, конспект

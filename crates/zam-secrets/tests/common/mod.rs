@@ -1,6 +1,6 @@
-//! Общие данные тестов сканера секретов: генератор `rnd`, корпус входов тестов сканера
-//! ([`corpus`]), атомы генератора ([`atoms`]) и закреплённый вход упора в `FIXPOINT_MAX`
-//! ([`depth_capped_input`]).
+//! Общие данные тестов сканера секретов: генераторы `rnd` и `hex`, корпус входов тестов сканера
+//! ([`corpus`]), атомы генератора ([`atoms`]) и раскрытие шаблонов фикстур ([`expand`]: вход упора
+//! правил M6 в `FIXPOINT_MAX` — `fixtures/scan_depth_capped.txt`).
 //!
 //! Модуль подключают тесты `zam-secrets` (`mod common;`) и тест реэкспорта `zam-markdown`
 //! (`#[path = "../../zam-secrets/tests/common/mod.rs"]`), поэтому зависимостей, кроме `std`, у
@@ -27,6 +27,23 @@ pub fn rnd(len: usize, seed: u64) -> String {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             A[((x >> 33) % 62) as usize] as char
+        })
+        .collect()
+}
+
+/// Псевдослучайная строка строчных hex-символов заданной длины (детерминированная): токен,
+/// sha256, ответ Digest. Правило энтропии такие строки не берёт — только слово-ключ перед ними.
+pub fn hex(len: usize, seed: u64) -> String {
+    const A: &[u8] = b"0123456789abcdef";
+    let mut x = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (0..len)
+        .map(|_| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            A[((x >> 33) % 16) as usize] as char
         })
         .collect()
 }
@@ -126,7 +143,7 @@ pub fn note_text() -> String {
     t
 }
 
-/// Атомы генератора входов (как у proptest `mask_is_idempotent`) в виде шаблонов [`expand`]:
+/// Атомы генератора входов (как у proptest `mask_text_idempotent`) в виде шаблонов [`expand`]:
 /// ключи, маски, фрагменты URL, `имя=значение`, случайные строки с `/`, `=`, `,`, `"`, `:`, `@`.
 pub fn atoms() -> Vec<String> {
     let mut a: Vec<String> = [
@@ -167,6 +184,16 @@ pub fn atoms() -> Vec<String> {
     );
     a.push("pwd=".into());
     a.push("`".into());
+    // правила M7.1: русские слова-ключи (с разделителем и «паролем `…`»), ответ Digest
+    a.extend(
+        [
+            "токен:",
+            "пароль=",
+            "паролем ",
+            "Authorization: Digest response=",
+        ]
+        .map(String::from),
+    );
     a.extend((0..keys().len()).map(|i| format!("{{key:{i}}}")));
     for s in 0..6 {
         a.push(format!("{{rnd:40:{}}}", 100 + s));

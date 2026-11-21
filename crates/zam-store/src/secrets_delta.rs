@@ -3,7 +3,8 @@
 //!
 //! Сохранённое уже замаскировано правилами своей версии, поэтому вход скана — **сохранённое**, а не
 //! исходник: любая находка текущими правилами в `chunks.text`, `chunks.context_prefix` (имя, путь,
-//! заголовки, теги — те же, что уходят в payload точек), `nodes.l0` заметок и папок или
+//! заголовки, теги — те же, что уходят в payload точек), `nodes.l0` заметок и папок, имени и пути
+//! папки без живых заметок (задача 3 M7.1: в префиксы чанков они не входят) или
 //! `code_symbols.sig` — значение, которое прежние правила пропустили. Переписываются и получают
 //! задания только такие места:
 //! - заметка — L0 маскируется, чанки пересобираются из исходника, `upsert` (точки и payload
@@ -12,7 +13,9 @@
 //! - документ вложения — `extract_state = 'pending'` и задание извлечения (текст — из кэша
 //!   `blob_extract`, нарезка маскирует его текущими правилами);
 //! - L0 папки — маскируется сразу (карточки папок), а `upsert` живой заметки внутри неё
-//!   запускает свёртку папки и её точку;
+//!   запускает свёртку папки и её точку; у папки без живых заметок точку пересвернёт сверка
+//!   точек папок воркера при запуске (ключ точки — по входу эмбеддинга, замаскированному
+//!   текущими правилами), имя и путь остаются исходником (это адреса);
 //! - сигнатура символа карты кода — `mask_text` на месте.
 //!
 //! Чтение и скан — пакетами в читателях (`Db::read`), писатель получает только id с находками:
@@ -73,6 +76,15 @@ pub(crate) struct DeltaStats {
     pub sigs: u64,
     pub scan_ms: u64,
 }
+
+/// Живые папки без живых заметок на любой глубине: `(id, path, name)`. Потомки — по диапазону
+/// пути (`f.path/` ≤ путь < `f.path0`, `'0'` — следующий за `'/'` байт) в `nodes_live_path`.
+const BARE_FOLDERS_SQL: &str = "SELECT f.id, f.path, f.name FROM nodes f
+     WHERE f.kind = 'folder' AND f.deleted_at IS NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM nodes d
+           WHERE d.space_id = f.space_id AND d.deleted_at IS NULL AND d.kind = 'note'
+             AND d.path > f.path || '/' AND d.path < f.path || '0')";
 
 /// Строка чанка: `(seq, node_id, entry_id, attachment_id, text, context_prefix)`.
 type ChunkRow = (i64, Option<Id>, Option<Id>, Option<Id>, String, String);
@@ -154,6 +166,22 @@ pub(crate) async fn scan(db: &Db) -> Result<Delta, StoreError> {
             } else {
                 d.notes.insert(id);
             }
+        }
+    }
+    // имена и пути папок без живых заметок внутри (задача 3 M7.1): у папки с живой заметкой они
+    // входят в `context_prefix` её чанков (скан выше), у пустой — никуда
+    let bare: Vec<(Id, String, String)> = db
+        .read(|c| {
+            let mut st = c.prepare(BARE_FOLDERS_SQL)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<_, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    for (id, path, name) in bare {
+        if !scan_secrets(&path).is_empty() || !scan_secrets(&name).is_empty() {
+            d.folders.insert(id);
         }
     }
     // сигнатуры карты кода
@@ -247,21 +275,26 @@ pub(crate) async fn apply(db: &Db, d: Delta) -> Result<DeltaStats, StoreError> {
                 let now = fmt_ts(crate::time::now());
                 let mut n = 0;
                 for id in batch {
-                    let l0: Option<String> = tx
+                    // папки нет или она в корзине — `None`; L0 может быть пустым (находка в имени)
+                    let row: Option<Option<String>> = tx
                         .prepare_cached(
                             "SELECT l0 FROM nodes WHERE id = ?1 AND deleted_at IS NULL",
                         )?
                         .query_row([id], |r| r.get(0))
-                        .optional()?
-                        .flatten();
-                    let Some(l0) = l0 else { continue };
-                    let m = mask_text(&l0);
-                    if m == l0 {
-                        continue;
+                        .optional()?;
+                    let Some(l0) = row else { continue };
+                    if let Some(l0) = l0 {
+                        let m = mask_text(&l0);
+                        if m != l0 {
+                            tx.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
+                                .execute(params![id, m])?;
+                        }
                     }
-                    tx.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
-                        .execute(params![id, m])?;
-                    // точка папки — свёрткой: её запускает `upsert` живой заметки внутри
+                    // точка папки — свёрткой: её запускает `upsert` живой заметки внутри. У папки
+                    // без живых заметок (находка в имени или пути) точку с L0 пересвернёт сверка
+                    // точек папок воркера при запуске: ключ точки считается по входу эмбеддинга,
+                    // замаскированному текущими правилами (`folder_embed_input`); имя и путь
+                    // хранятся исходником — это адреса (спецификация M7 §4.3)
                     let child: Option<(Id, i64, String)> = tx
                         .prepare_cached(
                             "SELECT d.id, d.current_rev, d.index_state
@@ -393,6 +426,96 @@ mod tests {
         assert_eq!(
             crate::job_stats(&db).await.unwrap().queued,
             want.len() as i64
+        );
+    }
+
+    /// Задача 3 M7.1 («Передать в M7» задачи 15b M6): папка с секретом в имени, у которой нет
+    /// живых заметок (пустая или только с заметками в корзине), попадает в находки перепроверки —
+    /// её имя и путь не входят ни в один `context_prefix` живых чанков. Папка с живой заметкой
+    /// покрыта префиксом чанков заметки и отдельно не берётся; чистая пустая папка — тоже.
+    #[tokio::test]
+    async fn secrets_delta_folder_without_live_notes() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/unit-tmp/zam-store-secrets-delta-folder");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = UserDbs::new(dir).get(Id::new()).await.unwrap();
+        let k = list_spaces(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind == SpaceKind::Knowledge)
+            .unwrap()
+            .id;
+        let pw = format!("Sup3r{}", "S3cretValue1");
+        let path = |p: &str| NodePath::parse(p).unwrap();
+        let empty = crate::create_folder(&db, k, path(&format!("ops/password={pw}")))
+            .await
+            .unwrap()
+            .id;
+        // все заметки папки — в корзине
+        let trashed_dir = crate::create_folder(&db, k, path(&format!("old/token={pw}")))
+            .await
+            .unwrap()
+            .id;
+        let gone = crate::create_note(
+            &db,
+            NewNote {
+                space_id: k,
+                path: path(&format!("old/token={pw}/n")),
+                content: "# N\n\nтекст\n".into(),
+                l0: None,
+                attrib: Attribution::new(AuthorKind::Agent),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        crate::delete_node(&db, gone, AuthorKind::Agent)
+            .await
+            .unwrap();
+        let clean = crate::create_folder(&db, k, path("docs/пусто"))
+            .await
+            .unwrap()
+            .id;
+        // папка с живой заметкой: её имя — в `context_prefix` чанков заметки (там замаскировано)
+        crate::create_note(
+            &db,
+            NewNote {
+                space_id: k,
+                path: path(&format!("live/secret={pw}/n")),
+                content: "# N\n\nтекст\n".into(),
+                l0: None,
+                attrib: Attribution::new(AuthorKind::Agent),
+            },
+        )
+        .await
+        .unwrap();
+        db.write(|tx| {
+            tx.execute("DELETE FROM index_jobs", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let d = scan(&db).await.unwrap();
+        assert!(d.folders.contains(&empty), "пустая папка: {d:?}");
+        assert!(
+            d.folders.contains(&trashed_dir),
+            "папка с заметкой в корзине: {d:?}"
+        );
+        assert!(!d.folders.contains(&clean), "{d:?}");
+        // родители `ops`, `old` и `live` — без секрета в имени; `live/secret=…` — с живой заметкой
+        assert_eq!(d.folders.len(), 2, "{d:?}");
+        assert!(
+            d.notes.is_empty(),
+            "префикс чанков живой заметки замаскирован: {d:?}"
+        );
+        let st = apply(&db, d).await.unwrap();
+        assert_eq!(st.folders, 2, "находки в счётчике перепроверки");
+        assert_eq!(
+            crate::job_stats(&db).await.unwrap().queued,
+            0,
+            "живых заметок нет"
         );
     }
 }

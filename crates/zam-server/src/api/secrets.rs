@@ -15,7 +15,8 @@ use zam_store::Entry;
 pub const SECRETS_DETECTED: &str = "secrets_detected";
 
 /// Предупреждение в `warnings`: скан упёрся в предел повторов (`zam_markdown::secrets::
-/// FIXPOINT_MAX`) — часть значений может уйти в индекс незамаскированной.
+/// FIXPOINT_MAX`) — неустойчивые находки замаскированы с соседним текстом (до пробелов, строки или
+/// весь текст; задача 3 M7.1), в индекс значения не уходят, но поиск по этому месту хуже.
 pub const SECRETS_SCAN_DEPTH: &str = "secrets_scan_depth";
 
 /// Подсказка, куда класть секреты.

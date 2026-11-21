@@ -1167,7 +1167,7 @@ async fn guide_has_focus_rejected_snapshot() {
                 assert!(sec.contains(p), "«{title}»{q}: нет «{p}»:\n{sec}");
             }
         }
-        // правила флагов снимка — только у команд (`zam-cli` `snapshot::mask_flags`, правки
+        // правила флагов снимка — только у команд (`zam_secrets::mask_flags` в `zam-cli`, правки
         // ревью 17a): протокол не обещает агенту маскировку флагов в запросах и путях
         for wrong in [
             "Во всех текстовых полях снимка",
