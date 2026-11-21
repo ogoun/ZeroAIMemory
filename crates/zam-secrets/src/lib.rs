@@ -403,7 +403,6 @@ fn ru_key_values(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
         let Some((v, quoted)) = value else {
             continue;
         };
-        at = v.end + usize::from(quoted);
         // косвенная форма — всё, кроме именительного `токен`, `пароль`, `секрет`. Начало слова —
         // одно из трёх написаний основы, поэтому форма видна по длине и окончанию первого слова
         // (без перевода в нижний регистр: он вдвое удорожал разбор каждого совпадения)
@@ -419,7 +418,13 @@ fn ru_key_values(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
         };
         let indirect = !nominative;
         let val = &text[v.clone()];
-        if (!quoted && ru_prose_value(val, indirect)) || is_placeholder(val) {
+        // проза — не значение и ничего не поглощает: следующий ключ в ней виден («Тип токена:
+        // пароль: X» — `X` маскируется; ревью круга 1, п. 3)
+        if !quoted && ru_prose_value(val, indirect) {
+            continue;
+        }
+        at = v.end + usize::from(quoted);
+        if is_placeholder(val) {
             continue;
         }
         raw.push((v, SecretKind::KeyValue));
@@ -445,41 +450,59 @@ fn is_punct(c: char) -> bool {
 /// - после именительного `токен`, `пароль`, `секрет` — слово с кириллицей из одних букв (и
 ///   дефиса), строчное или с заглавной первой («Пароль: хранится в Vault»); латинское слово —
 ///   значение («пароль: admin»), смешанный регистр — тоже («пароль: ПарольДляВхода»);
-/// - после косвенных форм и `ключ API`, `api-ключ` — ещё и латинское слово («Тип токена: Bearer»,
-///   «API-ключ: managed»), число с `.`/`,` и необязательной единицей или знаком валюты
-///   («Стоимость токена: 0,00002 $») и термин вида «буквы, одна группа цифр, буквы» до 10
-///   символов, строчными латинскими, не только из hex («Хэш пароля: argon2id», «Формат токена:
-///   base64url») [решение исполнителя: так проходят сторожа ревью с цифрами].
+/// - после косвенных форм и `ключ API`, `api-ключ` — слово из букв любой письменности и любого
+///   регистра («Тип токена: Bearer», «Тип токена: OAuth», «API-ключ: managed»; ревью круга 1,
+///   п. 2), число с `.`/`,` и необязательной единицей — строчной или `КБ`/`МБ`/`ГБ` — или знаком
+///   валюты («Стоимость токена: 0,00002 $»; `123456Qwer` — значение), и термин ([`ru_term`]).
 ///
 /// Значение в кавычках — всегда значение.
 fn ru_prose_value(v: &str, indirect: bool) -> bool {
     static NUMBER: LazyLock<Regex> =
-        LazyLock::new(|| rx(r"^[+\-−]?\d+(?:[.,]\d+)*(?:[%‰]|\p{Sc}|\p{L}{1,4})?$"));
+        LazyLock::new(|| rx(r"^[+\-−]?\d+(?:[.,]\d+)*(?:[%‰]|\p{Sc}|\p{Ll}{1,4}|КБ|МБ|ГБ)?$"));
     let w = v.trim_matches(is_punct);
-    // слово из букв (части через дефис): строчное или с заглавной первой
-    let word = !w.is_empty()
-        && w.split('-').all(|p| {
-            let mut cs = p.chars();
-            cs.next().is_some_and(char::is_alphabetic)
-                && cs.all(|c| c.is_alphabetic() && !c.is_uppercase())
-        });
-    if !indirect {
-        return word
-            && w.chars()
-                .any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'));
+    // слово из букв (части через дефис)
+    let letters = !w.is_empty()
+        && w.split('-')
+            .all(|p| !p.is_empty() && p.chars().all(char::is_alphabetic));
+    if indirect {
+        return letters || ru_term(w) || NUMBER.is_match(w);
     }
-    let term = w.len() <= 10
-        && w.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        && w.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
-        && w.bytes().last().is_some_and(|b| b.is_ascii_lowercase())
-        && w.as_bytes()
-            .windows(2)
-            .filter(|p| !p[0].is_ascii_digit() && p[1].is_ascii_digit())
-            .count()
-            == 1
-        && !w.bytes().all(|b| b.is_ascii_hexdigit());
-    word || term || NUMBER.is_match(w)
+    // именительная форма: строчное или с заглавной первой, с кириллицей
+    letters
+        && w.split('-')
+            .all(|p| p.chars().skip(1).all(|c| !c.is_uppercase()))
+        && w.chars()
+            .any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'))
+}
+
+/// Термин после косвенной формы — проза: строчные латинские буквы, одна группа цифр внутри и не
+/// меньше двух букв с каждой стороны, до 10 символов, не только hex («Хэш пароля: argon2id»,
+/// «Формат токена: base64url») [решение исполнителя, круг 1]. Одиночная цифра из 0, 1, 3, 4, 5, 7 —
+/// замена буквы в пароле, признак значения: `passw0rd`, `p4ssword`, `s3cret`, `letme1n`,
+/// `kx7qpmzt` маскируются **[решение координатора, круг 2]**. Буква после цифр одна
+/// (`hunter2x`) — тоже значение [решение исполнителя, круг 2: так `hunter2x` из примеров
+/// координатора маскируется, а `argon2id` — нет].
+fn ru_term(w: &str) -> bool {
+    let b = w.as_bytes();
+    if b.len() > 10
+        || !b
+            .iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        || b.iter().all(u8::is_ascii_hexdigit)
+    {
+        return false;
+    }
+    let (Some(ds), Some(de)) = (
+        b.iter().position(u8::is_ascii_digit),
+        b.iter().rposition(u8::is_ascii_digit),
+    ) else {
+        return false;
+    };
+    let digits = &b[ds..=de];
+    digits.iter().all(u8::is_ascii_digit)
+        && ds >= 2
+        && b.len() - de > 2
+        && !(digits.len() == 1 && b"013457".contains(&digits[0]))
 }
 
 /// Заголовок `Authorization: Digest …` (и `Proxy-Authorization:`, в том числе в JSON с `\"`) —

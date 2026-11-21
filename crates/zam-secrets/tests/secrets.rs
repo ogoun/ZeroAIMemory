@@ -816,7 +816,33 @@ fn ru_key_value_masked_and_guards() {
             format!("ключ\u{a0}API\u{202f}=\u{a0}{v}"),
             format!("ключ\u{a0}API\u{202f}=\u{a0}{SECRET_MARK}"),
         ),
+        // ревью круга 1, п. 3: проза после косвенной формы не прячет следующий ключ
+        (
+            format!("Тип токена: пароль: {pw}"),
+            format!("Тип токена: пароль: {SECRET_MARK}"),
+        ),
     ];
+    // ревью круга 1, п. 1: после косвенной формы одиночная цифра 0, 1, 3, 4, 5, 7 внутри слова —
+    // замена буквы, это значение; буква после цифр одна — тоже; единица числа — только строчная
+    for (form, value) in [
+        ("пароля", "passw0rd"),
+        ("пароля", "p4ssword"),
+        ("паролем", "s3cret"),
+        ("пароля", "letme1n"),
+        ("токена", "hunter2x"),
+        ("пароля", "admin1pass"),
+        ("api-ключ", "sk1testx"),
+        ("токена", "kx7qpmzt"),
+        ("пароля", "123456Qwer"),
+    ] {
+        let t = format!("Значение {form}: {value}");
+        assert_eq!(one(&t), SecretKind::KeyValue, "{t}");
+        assert_eq!(
+            mask_text(&t),
+            format!("Значение {form}: {SECRET_MARK}"),
+            "{t}"
+        );
+    }
     for (t, want) in &cases {
         assert_eq!(one(t), SecretKind::KeyValue, "{t}");
         assert_eq!(&mask_text(t), want, "{t}");
@@ -847,6 +873,9 @@ fn ru_key_value_masked_and_guards() {
         // ревью задачи 3: после косвенных форм и «ключ API» — ещё латинское слово, число и
         // термин с одной группой цифр (в том числе примеры из репозитория)
         "Тип токена: Bearer".to_string(),
+        // ревью круга 1, п. 2: после косвенной формы регистр слова не важен
+        "Тип токена: OAuth, формат токена: JWT".to_string(),
+        "Размер токена: 512КБ, срок секрета: 30дн".to_string(),
         "Хэш пароля: argon2id".to_string(),
         "Формат токена: base64url".to_string(),
         "Стоимость токена: 0,00002 $".to_string(),
