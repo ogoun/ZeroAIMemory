@@ -168,7 +168,19 @@ fn wait_gone(pid: u32, limit: Duration) -> bool {
     !pid_alive(pid)
 }
 
+/// Предел первой готовности (старт Qdrant на пустом каталоге данных) и переходов супервизора
+/// (`Restarting`, `Broken`).
 const READY_LIMIT: Duration = Duration::from_secs(10);
+/// Предел повторной готовности — после перезапуска Qdrant: рестарт супервизором после смерти
+/// или паники процесса, новый `Supervisor::start` на каталоге прежнего запуска. Тесты с этим
+/// пределом проверяют не скорость старта, а то, что готовность наступает: предел лишь ловит
+/// зависание. Полный прогон на загруженной машине (две параллельные сборки, `-j 2`; финальное
+/// ревью M6.6) не уложил повторную готовность `config_renders_flush_interval_and_wal`
+/// (коллекция с payload-индексами) в 10 с — состояние оставалось `Starting`; под общим прогоном
+/// на HDD Qdrant медлит и в других местах (один payload-индекс пустой коллекции создаётся
+/// 17–35 с, задача 12 M6.6). 60 с — как у готовности `TestQdrant` (`common::qdrant`, «данные
+/// проекта на HDD»). Время повторного старта с коллекцией сторожит отдельный [`RESTART_LIMIT`].
+const READY_AGAIN_LIMIT: Duration = Duration::from_secs(60);
 /// Предел повторного старта сразу после создания коллекции в
 /// `start_ready_restart_with_collection_and_clean_shutdown`. Коллекция пишется клиентом без
 /// отметки супервизора (`QdrantIndex::connect`, не `connect_index`), поэтому остановка не
@@ -289,7 +301,14 @@ async fn external_kill_restarts_and_five_crashes_break() {
     let mut rx = sup.state();
     let mut pids = Vec::new();
     for i in 1..=5u32 {
-        wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+        // первая готовность — пустой каталог; дальше — после рестарта супервизором (окно падений
+        // 10 мин, четыре ожидания по READY_AGAIN_LIMIT в него укладываются)
+        let limit = if i == 1 {
+            READY_LIMIT
+        } else {
+            READY_AGAIN_LIMIT
+        };
+        wait_state(&mut rx, limit, "Ready", is_ready).await;
         let pid = sup.pid().expect("pid");
         // Windows сразу отдаёт освободившийся PID новому процессу (CI 41605984312): там
         // перезапуск доказывают `Restarting { attempt }` и новый `Ready`, а не новый PID.
@@ -362,7 +381,7 @@ async fn process_alive_drops_right_after_kill() {
         matches!(s, QdrantState::Restarting { .. })
     })
     .await;
-    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    wait_state(&mut rx, READY_AGAIN_LIMIT, "Ready (повтор)", is_ready).await;
     assert!(sup.process_alive());
     assert_ne!(sup.pid(), Some(pid));
     sup.shutdown().await;
@@ -441,13 +460,7 @@ async fn storage_panic_is_detected_wiped_and_restarted_once() {
         "метка совместима — до запуска не стираем"
     );
     let mut rx = sup.state();
-    let st = wait_state(
-        &mut rx,
-        Duration::from_secs(20),
-        "Ready после wipe",
-        is_ready,
-    )
-    .await;
+    let st = wait_state(&mut rx, READY_AGAIN_LIMIT, "Ready после wipe", is_ready).await;
     assert!(sup.storage_rebuilt(), "детектор panic не сработал");
     assert!(
         matches!(st, QdrantState::Ready { rebuilt: true, .. }),
@@ -522,7 +535,8 @@ async fn orphan_from_pid_file_is_killed() {
     assert!(wait_gone(opid, Duration::from_secs(2)), "сирота жив");
     let _ = orphan.wait();
     let mut rx = sup.state();
-    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    // повторный старт на данных, которые писали прежний Qdrant и сирота
+    wait_state(&mut rx, READY_AGAIN_LIMIT, "Ready (повтор)", is_ready).await;
     assert_ne!(sup.pid(), Some(opid));
     sup.shutdown().await;
 
@@ -764,7 +778,9 @@ async fn config_renders_flush_interval_and_wal() {
         .await
         .unwrap();
     let mut rx = sup.state();
-    wait_state(&mut rx, READY_LIMIT, "Ready (повтор)", is_ready).await;
+    // повторный старт с коллекцией и её payload-индексами: предел — READY_AGAIN_LIMIT, тест
+    // проверяет конфигурацию, а не скорость старта (финальное ревью M6.6: 10 с не хватило)
+    wait_state(&mut rx, READY_AGAIN_LIMIT, "Ready (повтор)", is_ready).await;
     let idx = sup.connect_index().unwrap();
     let meta = idx
         .ensure(common::cases::MODEL, common::cases::DIM)
@@ -865,17 +881,16 @@ async fn flush_run(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_waits_for_flush_bounded() {
     let _slot = common::qdrant::Slot::take();
-    // интервал сброса 1 с, предел 30 с: дожидается подтверждения раньше предела (на HDD
-    // два прохода фонового сброса — 6–10 с, задача 19)
-    let Some(full) = flush_run(
-        "flushwait-full",
-        1,
-        Duration::from_secs(30),
-        true,
-        Duration::ZERO,
-    )
-    .await
-    else {
+    // интервал сброса 1 с, предел FULL_CAP: дожидается подтверждения раньше предела. На HDD два
+    // прохода фонового сброса — 6–10 с (задача 19 M3), но полный прогон на загруженной машине
+    // (две параллельные сборки, `-j 2`; финальное ревью M6.6) ждал подтверждения 29,79 с при
+    // прежнем пределе 30 с — WAL подтверждён, а проверка «< 29 с» упала. Предел 120 с — около 4×
+    // от худшего наблюдения: тест проверяет, что остановка ждёт подтверждения, а не скорость
+    // сброса. Запас FULL_MARGIN отличает подтверждение от упора в предел: упёрлась бы остановка
+    // в предел — `took` был бы не меньше FULL_CAP.
+    const FULL_CAP: Duration = Duration::from_secs(120);
+    const FULL_MARGIN: Duration = Duration::from_secs(10);
+    let Some(full) = flush_run("flushwait-full", 1, FULL_CAP, true, Duration::ZERO).await else {
         return;
     };
     let op = full.last_op.expect("номер операции из ответа upsert");
@@ -886,7 +901,11 @@ async fn shutdown_waits_for_flush_bounded() {
         full.free_mb,
         env!("CARGO_TARGET_TMPDIR")
     );
-    assert!(full.took < Duration::from_secs(29), "{:?}", full.took);
+    assert!(
+        full.took < FULL_CAP - FULL_MARGIN,
+        "{:?} — остановка упёрлась в предел {FULL_CAP:?}, а не дождалась подтверждения",
+        full.took
+    );
     assert_eq!(
         full.wait.map(|w| w.result),
         Some("acked"),
