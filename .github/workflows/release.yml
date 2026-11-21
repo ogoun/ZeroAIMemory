@@ -103,8 +103,11 @@ jobs:
         with:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@v2
-      # Тот же кэш, что в ci.yml (ключ deps-models-v3 — хэш deploy/*.toml; v3 — с токенизатором
-      # bge-m3, задача 11 M4): тег видит кэш ветки по умолчанию.
+      # Тот же кэш, что в ci.yml (ключ deps-models-v3 — хэш только манифестов зависимостей и
+      # моделей, без deploy/config.example.toml; v3 — с токенизатором bge-m3, задача 11 M4): тег
+      # видит кэш ветки по умолчанию. restore-keys: при новом хэше берётся последний кэш
+      # платформы — fetch-deps и fetch-models сверяют sha256 с манифестами и докачивают только
+      # несовпавшее.
       # Шаг идёт после rust-cache: его post-шаг сохраняет кэш раньше, чем rust-cache чистит target/.
       - name: кэш зависимостей и моделей
         uses: actions/cache@v4
@@ -112,7 +115,9 @@ jobs:
           path: |
             target/deps
             target/models
-          key: deps-models-v3-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
+          key: deps-models-v3-${{ matrix.platform }}-${{ hashFiles('deploy/onnxruntime.toml', 'deploy/onnxruntime-gpu.toml', 'deploy/cuda.toml', 'deploy/models.toml', 'deploy/pdfium.toml', 'deploy/qdrant.toml') }}
+          restore-keys: |
+            deps-models-v3-${{ matrix.platform }}-
       # тесты zam-index запускают настоящий Qdrant из target/deps и без него падают
       - name: fetch-deps
         run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
