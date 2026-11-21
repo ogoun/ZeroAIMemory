@@ -824,24 +824,23 @@ fn ru_key_value_masked_and_guards() {
     ];
     // ревью круга 1, п. 1: после косвенной формы одиночная цифра 0, 1, 3, 4, 5, 7 внутри слова —
     // замена буквы, это значение; буква после цифр одна — тоже; единица числа — только строчная
+    // или единица размера. Значения-пароли — склейкой из частей (правило проекта)
     for (form, value) in [
-        ("пароля", "passw0rd"),
-        ("пароля", "p4ssword"),
-        ("паролем", "s3cret"),
-        ("пароля", "letme1n"),
-        ("токена", "hunter2x"),
-        ("пароля", "admin1pass"),
-        ("api-ключ", "sk1testx"),
-        ("токена", "kx7qpmzt"),
-        ("пароля", "123456Qwer"),
+        ("пароля", ["pass", "w0rd"].concat()),
+        ("пароля", ["p4", "ssword"].concat()),
+        ("паролем", ["s3", "cret"].concat()),
+        ("пароля", ["letme", "1n"].concat()),
+        ("токена", ["hunter", "2x"].concat()),
+        ("пароля", ["admin", "1pass"].concat()),
+        ("api-ключ", ["sk1", "testx"].concat()),
+        ("токена", ["kx7", "qpmzt"].concat()),
+        ("пароля", ["123456", "Qwer"].concat()),
     ] {
         let t = format!("Значение {form}: {value}");
+        let want = format!("Значение {form}: {SECRET_MARK}");
         assert_eq!(one(&t), SecretKind::KeyValue, "{t}");
-        assert_eq!(
-            mask_text(&t),
-            format!("Значение {form}: {SECRET_MARK}"),
-            "{t}"
-        );
+        assert_eq!(mask_text(&t), want, "{t}");
+        assert_eq!(mask_text(&want), want, "идемпотентно: {t}");
     }
     for (t, want) in &cases {
         assert_eq!(one(t), SecretKind::KeyValue, "{t}");
@@ -894,6 +893,52 @@ fn ru_key_value_masked_and_guards() {
     ];
     for t in &guards {
         assert!(scan_secrets(t).is_empty(), "{t}: {:?}", scan_secrets(t));
+    }
+    // ревью круга 2, п. 1: имена алгоритмов и кодировок после косвенных форм — проза, без учёта
+    // регистра; по группе: хэши, хэширование паролей, кодировки, подписи JWT, ключи и протоколы
+    for name in [
+        "sha256",
+        "SHA512",
+        "sha3-256",
+        "blake3",
+        "blake2b",
+        "argon2",
+        "argon2i",
+        "pbkdf2",
+        "scrypt",
+        "base64",
+        "base58",
+        "Base32",
+        "utf8mb4",
+        "utf16",
+        "HS256",
+        "RS512",
+        "ES384",
+        "ps256",
+        "ed25519",
+        "x25519",
+        "secp256k1",
+        "aes256",
+        "rsa4096",
+        "OAuth2",
+        "EdDSA",
+    ] {
+        for form in [
+            "Хэш пароля",
+            "Формат токена",
+            "Алгоритм секрета",
+            "ключ API",
+        ] {
+            let t = format!("{form}: {name}");
+            assert!(scan_secrets(&t).is_empty(), "{t}: {:?}", scan_secrets(&t));
+        }
+    }
+    // ревью круга 2, п. 2: единицы размера после числа — проза
+    for size in [
+        "512KB", "1024MB", "16GB", "2TB", "512KiB", "2GiB", "512Мб", "4096Кб", "2048ТБ",
+    ] {
+        let t = format!("Размер токена: {size}");
+        assert!(scan_secrets(&t).is_empty(), "{t}: {:?}", scan_secrets(&t));
     }
 }
 
