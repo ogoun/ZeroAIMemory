@@ -601,10 +601,17 @@ fn big_csv(rows: usize) -> Vec<u8> {
     s.into_bytes()
 }
 
+/// Пауза рабочего процесса перед разбором (`DocPool::set_extract_stall_ms`): процесс убивают
+/// посреди неё. Меньше `docs.timeout_ms` (60 с): не убитый тестом процесс убил бы срок пула —
+/// `parse_timeout` вместо `parse_crash`, тест упал бы с понятной причиной.
+const KILL_STALL_MS: u64 = 30_000;
+
 /// Рабочий процесс разбора убит посреди разбора большого файла: документ `failed`
 /// (`parse_crash`; на Linux внешний SIGKILL пул принимает за OOM-killer ядра — `parse_oom`),
 /// процесс не остаётся, сервер работает; следующий файл разбирает новый процесс; повтор разбора
 /// (`reindex_docs` — то, что делает reindex) убитого файла — `done`, он находится поиском.
+/// Разбор стоит на тестовой паузе ([`KILL_STALL_MS`]), пока тест не убьёт процесс: исход не
+/// зависит от скорости сборки и машины (в release разбор успевал до `kill`, журнал M5.5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_killed_attachment_failed_server_alive() {
     let w = world_with("m5acc-kill", false, |c| c.docs.workers = 1).await;
@@ -617,8 +624,8 @@ async fn worker_killed_attachment_failed_server_alive() {
         pool.worker_pids().iter().all(|p| *p == 0),
         "процесс заранее"
     );
-    // ~3,5 МБ: разбор и нарезка в debug — сотни миллисекунд и дольше, а убийство — через
-    // миллисекунды после запуска процесса
+    pool.set_extract_stall_ms(Some(KILL_STALL_MS));
+    // ~3,5 МБ: тот же файл потом разбирается повтором (поиск по его последней строке)
     let mut csv = big_csv(50_000);
     csv.extend_from_slice("итог;zirconium walrus ledger;0\n".as_bytes());
     upload(a, &tok, &node, "реестр.csv", &csv).await;
@@ -636,6 +643,8 @@ async fn worker_killed_attachment_failed_server_alive() {
         docs_of(a, user, &node).await[0].extract_state == ExtractState::Failed
     })
     .await;
+    // дальше разбор — без паузы: новый процесс и повтор разбирают сразу
+    pool.set_extract_stall_ms(None);
     let d = docs_of(a, user, &node).await.remove(0);
     let want = if cfg!(windows) {
         "parse_crash"

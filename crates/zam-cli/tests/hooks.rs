@@ -515,6 +515,78 @@ fn p95(mut v: Vec<Duration>) -> Duration {
     v[(v.len() * 95).div_ceil(100) - 1]
 }
 
+/// Предел повторов хука, пропустившего работу по причине среды ([`until_hook_done`]).
+const ENV_RETRY_LIMIT: Duration = Duration::from_secs(120);
+/// Строка `hooks.log`: очередь изменённых файлов не отправлена и осталась на месте (срок, занятый
+/// замок, сбой rename на занятом диске) — пропуск по причине среды ([`until_hook_done`]).
+const SKIP_FLUSH: &str = "files/changed: очередь не отправлена";
+/// Строки `hooks.log`: кэш `session-start` не обновлён по причине среды — сеть или срок запроса
+/// (`RefreshError::reason`). Ответ сервера с ошибкой (`(ответ: <код>)`), неразобранный ответ и
+/// сбой записи кэша (`(кэш: …)`) — не среда: на них повтора нет.
+const TRIGGERS_NET: &str = "кэш триггеров не обновлён (сеть:";
+const TRIGGERS_DEADLINE: &str = "кэш триггеров не обновлён (срок:";
+const FILE_REFS_NET: &str = "кэш file-refs не обновлён (сеть:";
+const FILE_REFS_DEADLINE: &str = "кэш file-refs не обновлён (срок:";
+/// Строка `hooks.log`: `session.json` и привязка не дописаны за `CRITICAL_WAIT_MAX` (остановка
+/// диска).
+const SKIP_CRITICAL: &str = "привязка MCP к сессии: запись не завершилась";
+
+/// Строки журнала `log` говорят о пропуске работы по причине среды: строка из `skips` или
+/// `HOOK_BUDGET_SPENT` (запрос не начат за сроком).
+fn env_skipped(log: &str, skips: &[&str]) -> bool {
+    skips
+        .iter()
+        .chain(&[zam_core::HOOK_BUDGET_SPENT])
+        .any(|s| log.contains(s))
+}
+
+/// Хук ради действия (кэш, очередь) — условием, а не одним вызовом в пределах срока (M7.1,
+/// задача 7): `run` — вызов хука с щедрым бюджетом, `done` — то же утверждение теста. Не выполнено
+/// — повтор, только если вызов записал в `hooks.log` пропуск по причине среды ([`env_skipped`]):
+/// работа не потеряна (очередь, кэш на месте) и делается следующим вызовом, как в продукте. Без
+/// такой строки — отказ сразу (повтор не прячет сбой хука), с ней — до [`ENV_RETRY_LIMIT`]. Только
+/// где повтор события безвреден (как [`Proj::hook_best`]). Вывод — первого вызова.
+///
+/// Строки вызова — хвост журнала с длины до вызова. В него могут попасть и строки фонового
+/// процесса прошлого вызова (`zam code sync --background` пишет в тот же журнал; в тестах автозапуск
+/// выключен, [`Proj::auto_on`]).
+fn until_hook_done(
+    p: &Proj,
+    what: &str,
+    skips: &[&str],
+    run: impl Fn() -> Output,
+    done: impl Fn() -> bool,
+) -> Output {
+    let t = Instant::now();
+    let mut since = p.log().len();
+    let first = run();
+    while !done() {
+        let log = p.log();
+        // журнал короче прежнего — ротация по размеру (`LOG_MAX`): файл новый, читать с начала
+        let new = if log.len() < since {
+            log.as_str()
+        } else {
+            log.get(since..).unwrap_or(log.as_str())
+        };
+        assert!(
+            env_skipped(new, skips),
+            "{what}: не выполнено, пропуска по причине среды нет; hooks.log вызова: {new}"
+        );
+        assert!(
+            t.elapsed() < ENV_RETRY_LIMIT,
+            "{what}: не выполнено за {:?}; hooks.log вызова: {new}",
+            t.elapsed()
+        );
+        eprintln!(
+            "ZAM_TIMING {what}: хук пропустил работу по причине среды, повтор: {}",
+            new.trim()
+        );
+        since = log.len();
+        run();
+    }
+    first
+}
+
 /// Кэш триггеров вручную: один `file_glob`, один `command_regex`, один `error_regex`.
 fn write_cache(p: &Proj, server: &str) {
     let t = |id: &str, kind: &str, pattern: &str, title: &str| {
@@ -753,8 +825,23 @@ fn pre_tool_codex_apply_patch_paths() {
     assert!(p.session_file("edits", "py", "").is_some());
 }
 
+/// ETag `GET /triggers` решения теста — как его видит сервер.
+fn triggers_etag(p: &Proj) -> String {
+    let r = http()
+        .get(&format!("{}/api/v1/triggers?solution={G}", p.url))
+        .header("Authorization", format!("Bearer {}", p.token))
+        .call()
+        .unwrap();
+    let v: Value = serde_json::from_str(&r.into_body().read_to_string().unwrap()).unwrap();
+    v["etag"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{v}"))
+        .to_string()
+}
+
 /// `session-start`: сессия на сервере, дайджест с ловушкой, кэш триггеров с ETag; повтор —
-/// `If-None-Match` (304: кэш не переписывается составом), новый триггер — новый ETag.
+/// `If-None-Match` (304: кэш не переписывается составом), новый триггер — новый ETag (ETag
+/// сервера). Действия хука — условием ([`until_hook_done`]), а не одним вызовом в сроке.
 #[test]
 fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
     let _g = serial();
@@ -776,7 +863,19 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
         "ss-1",
         json!({"source": "startup", "model": "m"}),
     );
-    let c = context(&p.hook("session-start", &ev), "SessionStart");
+    let path = p.cache().join("triggers.json");
+    let read =
+        || -> Value { serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap() };
+    // дайджест — первого вызова; кэш, пропущенный по причине среды, дописывает повтор
+    // ([`until_hook_done`]: дайджест повтора не проверяется — запись уже показана в сессии)
+    let first = until_hook_done(
+        &p,
+        "session-start: кэш триггеров",
+        &[TRIGGERS_NET, TRIGGERS_DEADLINE],
+        || p.hook("session-start", &ev),
+        || path.is_file(),
+    );
+    let c = context(&first, "SessionStart");
     assert!(
         c.contains(&format!("Скрипты — только LF [gotcha·hyp] i:{id}")),
         "{c}"
@@ -793,35 +892,53 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
     assert_eq!(s["agent"], "claude-code", "{s}");
     assert_eq!(s["solution"], G, "{s}");
     assert_eq!(s["machine"], "hook-box", "{s}");
-    let path = p.cache().join("triggers.json");
-    let read =
-        || -> Value { serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap() };
     let c1 = read();
     assert_eq!(c1["server"], url.as_str());
     assert_eq!(c1["solution"], G);
     assert_eq!(c1["triggers"][0]["entry_id"], id.as_str(), "{c1}");
     let etag = c1["etag"].as_str().unwrap().to_string();
     assert!(!etag.is_empty());
+    assert_eq!(etag, triggers_etag(&p), "кэш — ETag сервера");
     // 304: подменённый состав остаётся — значит, ответ без тела
     let mut tampered = c1.clone();
     tampered["triggers"] = json!([]);
     tampered["fetched_at"] = json!("2000-01-01T00:00:00Z");
     std::fs::write(&path, tampered.to_string()).unwrap();
-    p.hook("session-start", &ev);
+    until_hook_done(
+        &p,
+        "session-start: 304",
+        &[TRIGGERS_NET, TRIGGERS_DEADLINE],
+        || p.hook("session-start", &ev),
+        || read()["fetched_at"] != "2000-01-01T00:00:00Z",
+    );
     let c2 = read();
     assert_eq!(c2["etag"], etag.as_str());
     assert_eq!(c2["triggers"], json!([]));
     assert_ne!(c2["fetched_at"], "2000-01-01T00:00:00Z");
-    // новый триггер — новый ETag и состав
+    // новый триггер — новый ETag и состав: ETag сервера сменился сразу (считается синхронно из
+    // строк базы), кэш хука — ровно он (флейк CI: «etag не сменился», журнал M5.5, п. 10)
     p.insight(
         "Не форсить main",
         "failure",
         "global",
         &["command_regex:^git push --force"],
     );
-    p.hook("session-start", &ev);
+    let fresh = triggers_etag(&p);
+    assert_ne!(fresh, etag, "ETag сервера после нового триггера");
+    let session = p.cache().join("session.json");
+    until_hook_done(
+        &p,
+        "session-start: новый ETag",
+        &[TRIGGERS_NET, TRIGGERS_DEADLINE, SKIP_CRITICAL],
+        || p.hook("session-start", &ev),
+        || {
+            read()["etag"] == fresh.as_str()
+                && std::fs::read_to_string(&session).is_ok_and(|s| s.contains("ss-1"))
+        },
+    );
     let c3 = read();
     assert_ne!(c3["etag"], etag.as_str());
+    assert_eq!(c3["etag"], fresh.as_str());
     assert_eq!(c3["triggers"].as_array().unwrap().len(), 2, "{c3}");
     // настройки сервера (R5) и текущая сессия для CLI
     let h: Value =
@@ -838,6 +955,52 @@ fn session_start_outputs_digest_and_refreshes_cache_with_etag() {
     let o = p.zam(&["triggers", "sync"], b"");
     assert!(ok(&o).contains("триггеров: 2"), "{}", out(&o));
     assert_eq!(read()["triggers"].as_array().unwrap().len(), 2);
+}
+
+/// M7.1, задача 7 (ревью, Important 1): причина в строке «кэш … не обновлён» — `(ответ: 500)` у
+/// ответа сервера с ошибкой (без текста ответа, §10.7) и `(сеть: …)` или `(срок: …)` у
+/// недоступного сервера. Первое средой не считается — [`until_hook_done`] на нём хук не повторяет
+/// и падает сразу, второе считается.
+#[test]
+fn cache_refresh_failure_reason_in_log() {
+    let _g = serial();
+    let (bad, _) = common::stub(
+        500,
+        r#"{"type":"/problems/internal","status":500,"detail":"тайна ответа"}"#,
+        Duration::ZERO,
+    );
+    let p = Proj::new("refresh-reason", &bad, "zam_x");
+    let ev = p.ev("SessionStart", "rr-1", json!({"source": "startup"}));
+    let (o, _) = p.hook_content(&bad, "session-start", "claude", ev.to_string().as_bytes());
+    ok(&o);
+    let log = p.log();
+    for what in ["кэш триггеров не обновлён", "кэш file-refs не обновлён"]
+    {
+        let line = log
+            .lines()
+            .find(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("нет строки «{what}»: {log}"));
+        assert!(line.ends_with(&format!("{what} (ответ: 500)")), "{line}");
+    }
+    assert!(
+        !log.lines()
+            .filter(|l| l.contains("не обновлён"))
+            .any(|l| l.contains("тайна")),
+        "текст ответа в строке кэша: {log}"
+    );
+    let env = [
+        TRIGGERS_NET,
+        TRIGGERS_DEADLINE,
+        FILE_REFS_NET,
+        FILE_REFS_DEADLINE,
+    ];
+    assert!(!env_skipped(&log, &env), "ответ 500 — не среда: {log}");
+    // сервер недоступен — сеть или срок (на Windows отказ закрытого порта приходит позже срока)
+    let dead = Proj::new("refresh-reason-dead", DEAD, "zam_x");
+    let ev = dead.ev("SessionStart", "rr-2", json!({"source": "startup"}));
+    let _ = dead.hook_at(DEAD, "session-start", "claude", ev.to_string().as_bytes());
+    let log = dead.log();
+    assert!(env_skipped(&log, &env), "недоступный сервер — среда: {log}");
 }
 
 /// M6, задача 5 (A): привязка `zam mcp` к сессии (цепочка предков и файл `agent-<pid>.json`)
@@ -2212,6 +2375,8 @@ fn ref_state(idx: &Value, path: &str) -> Vec<String> {
 /// машине отладочная сборка не доходит до запроса за 70–220 мс (запуск потока — до кванта
 /// планировщика, каждая операция с файлом очереди — десятки мс), и это свойство машины, а не
 /// порядка отправки; бюджеты меряют `m4_acceptance::hook_budgets` (release) и тесты времени.
+/// Отправка очереди и кэш — условием ([`until_hook_done`]): пропуск по причине среды (замок,
+/// rename на занятом диске) хук пишет в журнал, и очередь уходит следующим вызовом.
 #[test]
 fn prompt_flushes_changed_queue() {
     let _g = serial();
@@ -2236,10 +2401,15 @@ fn prompt_flushes_changed_queue() {
     assert_eq!(ref_state(&file_refs_index(&p), "src/pool.rs"), ["ok"]);
     // session-start: индекс в кэш
     let ss = p.ev("SessionStart", "fl", json!({"source": "startup"}));
-    ok(&hook_slow(&p, &url, "session-start", &ss));
-    let cache: Value =
-        serde_json::from_str(&std::fs::read_to_string(p.cache().join("file-refs.json")).unwrap())
-            .unwrap();
+    let refs = p.cache().join("file-refs.json");
+    ok(&until_hook_done(
+        &p,
+        "session-start: кэш file-refs",
+        &[FILE_REFS_NET, FILE_REFS_DEADLINE, SKIP_FLUSH],
+        || hook_slow(&p, &url, "session-start", &ss),
+        || refs.is_file(),
+    ));
+    let cache: Value = serde_json::from_str(&std::fs::read_to_string(&refs).unwrap()).unwrap();
     assert_eq!(cache["solution"], G);
     assert!(!cache["etag"].as_str().unwrap().is_empty());
     assert_eq!(cache["refs"][0]["items"][0]["id"], format!("i:{id}"));
@@ -2262,7 +2432,13 @@ fn prompt_flushes_changed_queue() {
     ok(&hook_slow(&p, &url, "post-tool", &edit));
     assert_eq!(queue(&p, "fl").len(), 1);
     let pr = p.ev("UserPromptSubmit", "fl", json!({"prompt": "что с пулом"}));
-    ok(&hook_slow(&p, &url, "prompt", &pr));
+    ok(&until_hook_done(
+        &p,
+        "prompt: очередь изменённых",
+        &[SKIP_FLUSH],
+        || hook_slow(&p, &url, "prompt", &pr),
+        || queue(&p, "fl").is_empty(),
+    ));
     assert!(
         queue(&p, "fl").is_empty(),
         "очередь отправлена: {}",
@@ -2276,7 +2452,13 @@ fn prompt_flushes_changed_queue() {
     let _ = p.hook_at(DEAD, "prompt", "claude", pr.to_string().as_bytes());
     assert_eq!(queue(&p, "fl").len(), 1, "ошибка — очередь цела");
     let stop = p.ev("Stop", "fl", json!({"stop_hook_active": false}));
-    ok(&hook_slow(&p, &url, "checkpoint", &stop));
+    ok(&until_hook_done(
+        &p,
+        "checkpoint: очередь изменённых",
+        &[SKIP_FLUSH],
+        || hook_slow(&p, &url, "checkpoint", &stop),
+        || queue(&p, "fl").is_empty(),
+    ));
     assert!(
         queue(&p, "fl").is_empty(),
         "checkpoint отправил: {}",
@@ -2564,17 +2746,25 @@ fn session_start_slow_server_one_deadline_for_all_requests() {
     // Отправка очереди ушла и кончилась сроком — второго запроса потока у этого хука нет. Хук, не
     // успевший до отправки (до срока оставалось меньше 15 мс — `FLUSH_MIN_LEFT`), очередь не шлёт,
     // а `GET /file-refs` с остатком в 1–15 мс начать вправе: запрос уходит и снимается сроком
-    // (строка «… не обновлён: сервер … timeout» — правда о нём). Поэтому: запросов `GET` — не
-    // больше, чем хуков без отправки; строка «сервер» запрещена, только когда отправка была у всех
+    // (строка «… не обновлён (срок: сервер … timeout)» — правда о нём). Поэтому: запросов `GET` —
+    // не больше, чем хуков без отправки; строка о запросе к серверу запрещена, только когда
+    // отправка была у всех
     let gets = count("GET", "/api/v1/file-refs");
     assert!(
         gets <= 3 - posts,
         "запрос после срока хука: GET {gets} при отправках {posts}: {sent:?}; {log}"
     );
     if posts == 3 {
-        let unsent = format!("кэш file-refs не обновлён: {}", zam_core::HOOK_BUDGET_SPENT);
+        let unsent = format!(
+            "кэш file-refs не обновлён (срок: {})",
+            zam_core::HOOK_BUDGET_SPENT
+        );
         assert_eq!(log.matches(&unsent).count(), 3, "одна строка на хук: {log}");
-        assert!(!log.contains("file-refs не обновлён: сервер"), "{log}");
+        assert!(
+            !log.contains("file-refs не обновлён (срок: сервер")
+                && !log.contains("file-refs не обновлён (сеть:"),
+            "{log}"
+        );
     }
     let inner: Vec<Duration> = times.iter().map(|t| t.inner).collect();
     let best = *inner.iter().min().unwrap();

@@ -187,8 +187,13 @@ fn respond(body: &[u8], st: &mut State) -> Response {
             kind,
             limits,
             soft_ms,
+            #[cfg(feature = "test-hooks")]
+            stall_ms,
             bytes,
         } => {
+            // тест: процесс «разбирает» файл, пока тест его не убьёт (`set_extract_stall_ms`)
+            #[cfg(feature = "test-hooks")]
+            std::thread::sleep(Duration::from_millis(stall_ms));
             let Some(kind) = parse_kind(&kind) else {
                 return error(DocError::Unsupported);
             };

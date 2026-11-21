@@ -279,7 +279,7 @@ fn digest_net(
             want_refs.then(|| cache::refresh_file_refs(env, c))
         });
         match refs.join() {
-            Ok(Some(Err(e))) => env.log(&format!("кэш file-refs не обновлён: {e}")),
+            Ok(Some(Err(e))) => env.log(&format!("кэш file-refs не обновлён ({})", e.reason())),
             Err(_) => env.log("files/changed, file-refs: паника"),
             _ => {}
         }
@@ -311,7 +311,7 @@ fn digest_net(
                 env.log(&format!("триггеры: предупреждение сервера: {w}"));
             }
         }
-        Ok(Err(e)) => env.log(&format!("кэш триггеров не обновлён: {e}")),
+        Ok(Err(e)) => env.log(&format!("кэш триггеров не обновлён ({})", e.reason())),
         Err(_) => env.log("кэш триггеров: паника"),
     }
     let v: Value = match recall {

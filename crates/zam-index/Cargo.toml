@@ -24,8 +24,9 @@ name = "index_bench"
 test = false
 
 [features]
-# Точка остановки воркера перед записью пачки в Qdrant — только для тестов (включает
-# dev-зависимость zam-server); в сборке сервера и релизе её нет.
+# Тестовые точки (`src/test_hooks.rs`): остановка воркера перед записью пачки в Qdrant,
+# перезапуска супервизора, сбои `delete_collection` — только для тестов (включают
+# dev-зависимости zam-server и самого пакета); в сборке сервера и релизе их нет.
 test-hooks = []
 # Прототип встроенного индекса Qdrant Edge (задача 16 M2, ADR 0001): не по умолчанию,
 # в сервер и релизные комплекты не входит; включается только для тестов и `cargo xtask bench --edge`.
@@ -68,3 +69,5 @@ tokenizers.workspace = true
 rusqlite.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
+# сбои `delete_collection` в тестах воркера (tests/worker.rs, M7.1 задача 7)
+zam-index = { path = ".", features = ["test-hooks"] }

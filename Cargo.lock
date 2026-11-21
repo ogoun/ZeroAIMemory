@@ -7059,6 +7059,7 @@ dependencies = [
  "uuid",
  "windows",
  "zam-core",
+ "zam-index",
  "zam-markdown",
  "zam-store",
 ]
