@@ -762,6 +762,28 @@ ignored); zam-store — оба теста ok.
 (`PUT`/`PATCH` узла, правка тела или `data` записи), затрёт значение литералом `‹secret›`; без
 задачи 6 выпуск нельзя (спецификация §4.3.2).
 
+**Цена маски на L2 в 1 МБ** (release, `cargo test --release -p zam-server --lib -- --ignored
+bench_mask_l2_1mb`, `target\m71-t5-rel`): Markdown 1 048 664 байт — 1970 разделов с прозой на
+двух языках, кодом, таблицей, `token: <ключ>` и URL с паролем, 3940 находок (по ключу на ~270
+байт — тяжелее обычной заметки); `mask_owned` (`spawn_blocking`) — медиана **15,3 мс**, мин
+14,9 мс, макс 30,9 мс из 9 прогонов, то есть ≈ 1,5 мс на 100 КБ — в пределе спецификации (до
+2 мс на 100 КБ). Заметка 5 МБ — порядка 75 мс в пуле блокирующих задач; текст до 64 КиБ
+маскируется на месте (меньше 1 мс).
+
+**Прогоны** (dev, `target\m71-t5`):
+- RED (исходник задачи временно возвращён к `HEAD`, новые тесты): 15 из 17 отобранных тестов
+  `zam-server` падают по значению секрета в ответе или отсутствию признака; проходят и до задачи
+  `focus_not_indexed_and_few_leaves` (сессия) и `import_secrets_detected_warning` (экспорт из
+  сессии) — поведение человека не меняется; `zam-cli` `stop_reminder_title_masked` — заголовок с
+  ключом в напоминании.
+- GREEN: `cargo test -p zam-server --lib` и 29 целей (`secrets`, `read_focus`, `read_batch`,
+  `read_since_rev`, `search`, `recall`, `mcp`, `transfer_export`, `transfer_import`, `previews`,
+  `nodes`, `boot`, `agent_setup`, `tasks`, `read_attachments`, `attachments_search`, `snapshot`,
+  `cache_api`, `glossary`, `insights`, `journals`, `entries_revision`, `ideas`, `questions`,
+  `triggers`, `code_api`, `sessions`, `render`, `solutions_access`, затем `graph`) — 0 failed;
+  `cargo test -p zam-cli --bin zam --test hooks` — 222 + 115 ok; `cargo clippy -p zam-server -p
+  zam-store -p zam-cli --lib --bins --tests` — без предупреждений.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия
