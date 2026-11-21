@@ -792,7 +792,8 @@ cargo build --release -p zam-cli                   # отдельной кома
 
 | Команда | Назначение |
 |---|---|
-| `fetch-deps --platform windows-x64\|linux-x64 [--flavor cpu\|gpu] [--print-hashes]` | зависимости поставки по манифестам `deploy/*.toml` с проверкой SHA-256 |
+| `fetch-deps --platform windows-x64\|linux-x64 [--flavor cpu\|gpu] [--print-hashes]` | зависимости поставки по манифестам `deploy/*.toml` с проверкой размера (`size`, если задан) и SHA-256 |
+| `fetch-deps --prune-cache` | удалить из `target/deps-cache` архивы, sha256 которых нет ни в одном манифесте `deploy/*.toml` (прежние версии, `*.part`) |
 | `fetch-models [--test] [--id ID]… [--accept-nc-license]` | модели из `deploy/models.toml` в `target/models/<id>/` |
 | `package --platform … --flavor cpu\|gpu --version X.Y.Z [--with-models] [--cuda] [--no-kit]` | архивы поставки в `target/dist/` и `SHA256SUMS` |
 | `smoke --archive … [--cuda-archive …] [--expect-device cpu\|cuda]` | smoke-тест комплекта: запуск, API, `zam`, Qdrant, векторный поиск на тестовой модели; документы — pdfium комплекта грузится рабочим процессом, PDF и DOCX находятся по фрагменту с `locator` и читаются по нему, превью листа XLSX и миниатюра PDF |
@@ -942,9 +943,11 @@ docs/              # ТЗ, планы, исследования, журнал р
 [deploy/licenses/](deploy/licenses/) и попадают в каталог `LICENSES/` комплекта вместе со
 сводкой Rust- и npm-зависимостей (cargo-about, license-checker):
 
-- Qdrant — Apache-2.0; ONNX Runtime — MIT; pdfium — BSD-3-Clause (сборка pdfium-binaries — MIT;
-  компоненты внутри pdfium — `PDFIUM-THIRD-PARTY.txt`). Что входит в комплект для документов,
-  лимиты разбора и проверка — `deploy/README-install.md`, раздел «Документы (вложения)».
+- Qdrant — Apache-2.0; ONNX Runtime — MIT (с M7.1 — из официальных пакетов NuGet; компоненты
+  внутри ONNX Runtime — `ONNXRUNTIME-THIRD-PARTY-NOTICES.txt` из пакета); pdfium — BSD-3-Clause
+  (сборка pdfium-binaries — MIT; компоненты внутри pdfium — `PDFIUM-THIRD-PARTY.txt`). Что
+  входит в комплект для документов, лимиты разбора и проверка — `deploy/README-install.md`,
+  раздел «Документы (вложения)».
 - WebUI: бандл содержит `elkjs` (раскладка ELK для диаграмм Mermaid с `layout: elk`) под
   **EPL-2.0** — слабым копилефтом на уровне файлов, не заражающим остальной код под MIT.
   Это единственное исключение из списка допустимых лицензий бандла (решение владельца

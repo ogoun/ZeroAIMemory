@@ -50,6 +50,10 @@ enum Cmd {
         /// (по умолчанию — оба, они нужны тестам zam-ml)
         #[arg(long, value_enum)]
         flavor: Option<Flavor>,
+        /// Без загрузки: удалить из target/deps-cache файлы, sha256 которых нет ни в одном
+        /// манифесте deploy/*.toml (прежние версии архивов, *.part прерванных загрузок)
+        #[arg(long, conflicts_with_all = ["platform", "print_hashes", "flavor"])]
+        prune_cache: bool,
     },
     /// Скачать модели из deploy/models.toml в target/models/<id>/ с проверкой SHA-256
     /// (по умолчанию — модели комплекта zam-models, bundle = true)
@@ -172,7 +176,12 @@ fn load_manifests(root: &Path) -> Result<Vec<Manifest>> {
         .collect()
 }
 
-fn fetch_deps(platform: Option<String>, print_hashes: bool, flavor: Option<Flavor>) -> Result<()> {
+fn fetch_deps(
+    platform: Option<String>,
+    print_hashes: bool,
+    flavor: Option<Flavor>,
+    prune_cache: bool,
+) -> Result<()> {
     let root = repo_root();
     let target = root.join("target");
     let manifests = load_manifests(&root)?;
@@ -182,6 +191,18 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool, flavor: Option<Flavo
     // Библиотеки NVIDIA здесь не скачиваются (это `zam-server cuda fetch`), но манифест проверяется.
     let cuda = CudaManifest::load(&root.join("deploy").join(CUDA_MANIFEST))?;
     cuda.validate()?;
+    // После проверки манифестов: по неверному манифесту кэш не чистится.
+    if prune_cache {
+        let keep = fetch::manifest_hashes(&root.join("deploy"))?;
+        let cache = target.join("deps-cache");
+        let (n, bytes) = fetch::prune_cache(&cache, &keep)?;
+        println!(
+            "{}: удалено файлов — {n} ({:.1} МБ)",
+            cache.display(),
+            bytes as f64 / 1e6
+        );
+        return Ok(());
+    }
     if let Some(p) = platform.as_deref()
         && !PLATFORMS.contains(&p)
     {
@@ -198,8 +219,11 @@ fn fetch_deps(platform: Option<String>, print_hashes: bool, flavor: Option<Flavo
                     continue;
                 }
                 println!("# {} {} [{plat}] {}", m.name, m.version, e.url);
-                let h = fetch::print_hash(&e.url, &target)?;
-                println!("{}.toml [platform.{plat}] sha256 = \"{h}\"", m.name);
+                let (h, size) = fetch::print_hash(&e.url, &target)?;
+                println!(
+                    "{}.toml [platform.{plat}] sha256 = \"{h}\" size = {size}",
+                    m.name
+                );
             }
         }
         return Ok(());
@@ -493,7 +517,8 @@ fn run(cmd: Cmd) -> Result<()> {
             platform,
             print_hashes,
             flavor,
-        } => fetch_deps(platform, print_hashes, flavor),
+            prune_cache,
+        } => fetch_deps(platform, print_hashes, flavor, prune_cache),
         Cmd::FetchModels {
             test,
             ids,

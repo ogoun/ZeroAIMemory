@@ -78,6 +78,13 @@ impl DepManifest {
                     "{ctx}: url должен начинаться с https://"
                 )));
             }
+            // до загрузки: иначе неизвестный формат выяснился бы только после скачивания
+            if crate::download::format_of(&e.url).is_none() {
+                return Err(FetchError::Invalid(format!(
+                    "{ctx}: неизвестный формат архива по окончанию url (zip, nupkg, tar.gz, \
+                     tgz, tar.xz, txz)"
+                )));
+            }
             let h = e.sha256.trim();
             if h.is_empty() {
                 if !allow_empty_hash {
@@ -136,6 +143,15 @@ rename = { "qdrant" = "qdrant-bin" }
             "http://example.invalid/q.zip",
         );
         assert!(DepManifest::parse(&http).unwrap().validate(true).is_err());
+        // формат архива — по окончанию url: неизвестный отвергается до загрузки
+        let exe = ok.replace("q.zip", "q.exe");
+        let err = DepManifest::parse(&exe)
+            .unwrap()
+            .validate(true)
+            .unwrap_err();
+        assert!(err.to_string().contains("формат архива"), "{err}");
+        let nupkg = ok.replace("q.zip", "q.1.0.0.nupkg");
+        DepManifest::parse(&nupkg).unwrap().validate(true).unwrap();
     }
 
     #[test]

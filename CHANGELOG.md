@@ -5,6 +5,32 @@
 
 ## [Unreleased]
 
+### Changed
+- ONNX Runtime 1.31.0 (CPU и GPU) теперь берётся из официальных пакетов NuGet
+  `Microsoft.ML.OnnxRuntime`, `Microsoft.ML.OnnxRuntime.Gpu.Windows` и
+  `Microsoft.ML.OnnxRuntime.Gpu.Linux`: релизы github.com/microsoft/onnxruntime с 2026-11-17
+  недоступны (404). Версия прежняя, и библиотеки в комплектах побайтово те же: sha256 сверены с
+  архивами GitHub v1.31.0, коммит сборки тот же. GPU-пакеты — прежняя сборка под CUDA 13, поэтому
+  `deploy/cuda.toml` и требования к драйверу не меняются.
+- В `LICENSES/` комплекта сервера добавлен `ONNXRUNTIME-THIRD-PARTY-NOTICES.txt` — уведомления о
+  сторонних компонентах внутри ONNX Runtime (`ThirdPartyNotices.txt` пакета, тот же, что в
+  прежних архивах GitHub). Раньше он в комплект не входил.
+
+### Для разработчиков
+- `deploy/onnxruntime.toml` и `deploy/onnxruntime-gpu.toml` указывают на `.nupkg` с
+  `api.nuget.org`: sha256 и `size` пакета, пути `runtimes/<rid>/native/…`, без `rename` (в пакете
+  Linux-библиотека уже называется `libonnxruntime.so`). Загрузчик `zam-fetch` распознаёт `.nupkg`
+  как zip. Проверка манифеста зависимостей отвергает адрес с неизвестным форматом архива ещё до
+  загрузки — раньше это выяснялось только после скачивания.
+- `cargo xtask fetch-deps` сверяет `size` из манифеста. Загрузка длиннее `size` обрывается;
+  архив в `target/deps-cache` другого размера — ошибка до хэша и распаковки.
+  `--print-hashes` печатает рядом с sha256 и размер.
+- `cargo xtask fetch-deps --prune-cache` удаляет из `target/deps-cache` файлы, имени которых
+  (sha256) нет ни в одном манифесте `deploy/*.toml`: прежние версии архивов и `*.part`
+  прерванных загрузок. Печатает число и объём удалённого. В `package.yml` этот шаг идёт перед
+  сохранением кэша, ключ кэша — с новым префиксом `deps-v2-`: без чистки `restore-keys` переносили
+  прежние версии из кэша в кэш до лимита кэша репозитория (10 ГБ).
+
 ## [0.0.13-m6.6] - 2026-11-21
 
 Этап M6.6 «Недочёты обкатки»: замечания первых дней работы этого проекта через собственную память
