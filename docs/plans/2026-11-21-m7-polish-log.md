@@ -734,6 +734,8 @@ ignored); zam-store — оба теста ok.
 - **`mask_flags` в выдаче не применяется** [решение исполнителя, задача 5]: выдача — проза и
   Markdown, где «basic», «bearer», `-u` — не пароль; правила флагов — только поле команд снимка
   (как и было решено в 17a M6). Вход задания «Consumes: `mask_flags`» поэтому не использован.
+  **Заменено** в круге правок 1 решением координатора: флаги маскируются сканером, но только
+  внутри кода Markdown (ниже).
 - **`/recall` маскирует для любого принципала** [решение исполнителя, задача 5]: это текст
   агенту (WebUI его не зовёт), так же, как `masked_clip` с M4; принципал в глубину сборщиков
   подсказок не протягивается. Заголовки — `hint_title` во всех кандидатах (`entry_cand`,
@@ -783,6 +785,72 @@ bench_mask_l2_1mb`, `target\m71-t5-rel`): Markdown 1 048 664 байт — 1970 �
   `triggers`, `code_api`, `sessions`, `render`, `solutions_access`, затем `graph`) — 0 failed;
   `cargo test -p zam-cli --bin zam --test hooks` — 222 + 115 ok; `cargo clippy -p zam-server -p
   zam-store -p zam-cli --lib --bins --tests` — без предупреждений.
+
+#### Круг правок 1 (ревью задачи 5: Needs fixes — Important 1–2, Minor 1–8)
+
+Работа шла с перерывом: компьютер перезагрузился посреди оптимизации правила флагов; три
+незакоммиченных файла `zam-secrets` проверены (длина, NUL/CR, хвосты) — целы, сборка
+`target\m71-t5` пересобралась без чистки.
+
+- **Important 1 — `GET /file-refs`** отдавал `refs[].items[].title` исходником, хук `post-tool`
+  печатал его агенту («о файле … в памяти»). `files::index` маскирует заголовки по токену до
+  `Canon`/`ETag` (`ETag` маски — свой, повтор с ним — 304; длинный индекс — в пуле). Клиент:
+  общий хелпер `cmd::hook::shown_title` (маска `zam-secrets` до обрезки) — в `file_hint`,
+  напоминании `Stop`, влиянии правки и строке триггера (`Trigger::hint`) — для старого сервера.
+- **Important 2 — флаги только внутри кода** (решение координатора, вместо прежнего «не
+  применять в выдаче»): правило встроено в сканер — `flags::code_flag_ranges` (участки кода
+  `code_segments`: fenced ```` ``` ````/`~~~` любой длины серии, в списках, незакрытый — до
+  конца; inline-спаны в строке вне блоков), вид `SecretKind::CommandFlag`, отдельная функция
+  находок `scan_flags_in_code`; входит в `scan_secrets`/`scan_secrets_ext`/`mask_text`,
+  `RULES_VERSION` — прежняя 3. Ворота `-p`/`-u` — по логической строке кода (склейка `\`) или по
+  спану. Идемпотентность — структурная (скан до неподвижной точки) и proptest с атомами заборов,
+  кавычек, переносов, команд и флагов. `mask_flags` клиента — без изменений (тот же
+  `flag_values`, ворота по всему тексту).
+  - Цена: первая версия — 2,2–2,4 мс на 100 КБ плотного кода (ворота на каждое совпадение:
+    логическая строка + перебор литералов + регулярка с юникодной `\b`). Стало: ворота —
+    последней проверкой (после значения, `uid:gid`, ссылок и метки), регулярки ворот с ASCII-`\b`
+    (`(?i-u)`: юникодная граница на коде с кириллицей снимает быстрый DFA), ячейки групп
+    `captures_read_at` без выделений на совпадение. Release, `bench_scan_100kb*` (два прогона):
+    проза 0,46 мс, русская 0,73–0,75 мс, значения 1,41–1,50 мс, **код (профиль runbook, ≈120
+    находок) 1,40–1,45 мс** — в бюджете 2 мс. Самый плотный синтетический код (по паре паролей в
+    каждом блоке, 1640 участков, ≈1230 совпадений) — 2,0 мс на весь `scan_secrets`.
+- **Minor 1** — `view_json_owned` (строк в полях больше 64 КиБ — `spawn_blocking`): карточка и
+  эхо записи (`entry_json`), лента (одним проходом после `report_feed`), ревизии, восстановление,
+  замещённая запись; сравнение релизов — `view_json_with` (несколько групп полей). Общий путь —
+  `view_with<T>`.
+- **Minor 2** — `conflicts[].title`/`matched` и `detail` 409 `term-conflict` (`view_error` у
+  `create_entry`, `supersede_entry`, `update_entry`, `restore_entry`); `tags` и `area` — в
+  `ENTRY_FIELDS` и в экспорте (запись и её ревизии); итог задания импорта: `report.warnings`
+  (`secrets_detected: «<заголовок>»`, «запись «…»: …») и `error` по токену — с маской.
+- **Minor 3** — предпросмотр текста: агенту читается `TEXT_MAX` + 4 КиБ, `agent_view::mask_head`
+  маскирует всё прочитанное и показывает не дальше `TEXT_MAX` исходника и не длиннее `TEXT_MAX`
+  (секрет на границе — меткой целиком, метка не режется); `truncated` — «показано не всё».
+- **Minor 4** — `view_in_place` (граф, триггеры, выжимки шага 0, карточки поиска —
+  `view_cards`, сообщения ревизий, кандидаты dedup); `hint_title` — через `agent_view::mask`;
+  обёртка `shown_text` убрана; разбор `Cow` сведён в `masked`/`mask_in_place`.
+- **Minor 5** — `node_json` → `Result` (сбой сериализации — 500); `mask_owned`/`view_owned` →
+  `Result`, снятый пул — 503 (`ApiError::Unavailable`), а не метка вместо документа с 200; маска
+  предпросмотра — тот же путь.
+- **Minor 6** — тесты: варианты `Cow` (`matches!`), `view_error`, `mask_head`; интеграционные —
+  `file-refs` (пара и 304), словарь и `term-conflict`, кандидаты 409, выжимки кэша и шаг 0,
+  сравнение релизов, `claimed_tasks`, `revert`/`move`/корзина/`restore` узла и записи, `range`
+  сессии и токена, `md` и `frontmatter` человеку, `/code` (карточка и влияние), теги и область в
+  экспорте, итог задания импорта, ключ на границе предпросмотра; клиент — `file_hint_title_masked`.
+- **Minor 7** — `docs/api-compat.md`: `secrets_masked` — «только если маска что-то заменила»,
+  флаги в коде, новые места маски, 503; протокол ru/en — про флаги в коде.
+- Предпросмотр: метка, которая не влезает в `TEXT_MAX` у самой границы, не ставится (показ
+  кончается перед секретом, `truncated: true`) — показ не длиннее `TEXT_MAX` по требованию ревью.
+
+Прогоны круга 1 (dev, `target\m71-t5`): `cargo test -p zam-secrets` — 3 + 3 + 28 ok (бенчи —
+release, выше); `zam-store` — `--lib` 117 и `secrets_rescan`, `snapshots`, `rechunk_exact`,
+`rechunk_chunker`, `rechunk_notice` — ok; `zam-cli --bin zam` 223 и `--test hooks` 115 — ok;
+`zam-server --lib` 311 и 33 цели (`secrets`, `read_focus`, `read_batch`, `read_since_rev`,
+`search`, `recall`, `mcp`, `transfer_export`, `transfer_import`, `previews`, `nodes`, `boot`,
+`agent_setup`, `tasks`, `read_attachments`, `attachments_search`, `snapshot`, `cache_api`,
+`glossary`, `insights`, `journals`, `entries_revision`, `ideas`, `questions`, `triggers`,
+`code_api`, `code_memory`, `code_access`, `sessions`, `render`, `solutions_access`, `graph`,
+`certainty`) — 0 failed после двух правок тестов (фраза протокола про флаги снимка; имя каталога
+данных нового теста `/code` совпало с прежним); clippy `-D warnings` и `fmt --check` — чисто.
 
 ## Уточнить у владельца
 
