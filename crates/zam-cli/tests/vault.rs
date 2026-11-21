@@ -477,7 +477,9 @@ fn vault_mv_old_server() {
 
 /// Замечание 25: `zam vault set --type host|environment` без области — строка в stderr о Vault
 /// решения и `--global`; с `--global`, `--solution` и у прочих типов строки нет; stdout —
-/// по-прежнему `<id>@<rev>`.
+/// по-прежнему `<id>@<rev>`. Финальное ревью M6.6, Minor 9: строка — только при создании
+/// записи (новая ревизия — без неё), имя записи в `zam vault mv` — в кавычках; без имени решения
+/// имя записи вместо него не подставляется.
 #[test]
 fn vault_set_host_hints_global() {
     let (url, tok) = start("hint");
@@ -485,10 +487,15 @@ fn vault_set_host_hints_global() {
     let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
     let hint = |name: &str| {
         format!(
-            "записано в Vault решения «Проект»; общий для проектов — --global (перенести: zam vault mv {name} --to global)"
+            "записано в Vault решения «Проект»; общий для проектов — --global (перенести: zam vault mv \"{name}\" --to global)"
         )
     };
-    for (name, ty) in [("stage", "host"), ("bench", "environment")] {
+    // имя с пробелом — команда переноса из строки работает и в оболочке
+    for (name, ty) in [
+        ("stage", "host"),
+        ("bench", "environment"),
+        ("lab box", "host"),
+    ] {
         let o = z(
             &["vault", "set", name, "--type", ty, "--purpose", "стенд"],
             b"",
@@ -500,6 +507,44 @@ fn vault_set_host_hints_global() {
             err(&o)
         );
     }
+    // новая ревизия существующей записи — без строки: запись уже там, куда её положили
+    let o = z(
+        &[
+            "vault",
+            "set",
+            "stage",
+            "--type",
+            "host",
+            "--purpose",
+            "стенд 2",
+        ],
+        b"",
+    );
+    assert!(ok(&o).trim().ends_with("@2"), "{}", out(&o));
+    assert!(!err(&o).contains("записано в Vault"), "{}", err(&o));
+    // пустое имя решения: `zam` отказывает до запроса («name не задан»), имя записи в совет не
+    // подставляется; текст без имени решения (`global_hint(None, …)`) — модульный тест
+    // `cmd::vault::tests::move_texts`
+    let bare = tmp("repo-hint-bare");
+    std::fs::create_dir_all(bare.join(".zeroaimemory")).unwrap();
+    std::fs::write(
+        bare.join(".zeroaimemory").join("solution.toml"),
+        format!("agent_solution_id = \"{G}\"\nname = \"\"\n"),
+    )
+    .unwrap();
+    let o = zam(
+        &url,
+        &tok,
+        &bare,
+        &["vault", "set", "edge", "--type", "host"],
+        b"",
+    );
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(
+        err(&o).contains("name не задан") && !err(&o).contains("записано в Vault"),
+        "{}",
+        err(&o)
+    );
     for args in [
         &["vault", "set", "lan", "--type", "host", "--global"][..],
         &["vault", "set", "lan2", "--type", "host", "--solution", G][..],

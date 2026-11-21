@@ -291,9 +291,12 @@ impl UrlReport {
                 println!("Адрес сервера — в {LOCAL_MD}, в блоке его нет (--url-to local).");
                 self.print_exclude(root);
                 if self.codex {
+                    // `locate::resolve` от агента не зависит: хуки Codex и `zam mcp` читают
+                    // CLAUDE.local.md; не видит адреса только сам агент (финальное ревью M6.6, M2)
                     eprintln!(
-                        "предупреждение: при {LOCAL_MD} Claude Code не читает AGENTS.md, а у \
-                         Codex локального файла нет — для Codex выберите zam init --url-to home"
+                        "предупреждение: {LOCAL_MD} агент Codex не читает и адреса сервера в \
+                         контексте не увидит (как и при --url-to home); zam, хуки и zam mcp адрес \
+                         находят — поиск адреса от агента не зависит"
                     );
                 }
             }

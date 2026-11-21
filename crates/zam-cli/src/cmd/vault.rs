@@ -12,8 +12,8 @@
 //!   (один завершающий перевод строки отбрасывается) или скрытого ввода с терминала, никогда из
 //!   аргументов. Есть запись с этим именем — новая ревизия (`If-Match`), открытые поля, не
 //!   указанные флагами, сохраняются. Адрес ресурса — `--link` (`data.url`): `--url` у всех команд
-//!   — адрес сервера **[решение исполнителя]**. Окружение без `--global` и `--solution` — строка
-//!   в stderr о Vault решения и `--global` ([`global_hint`]);
+//!   — адрес сервера **[решение исполнителя]**. Новое окружение без `--global` и `--solution` —
+//!   строка в stderr о Vault решения и `--global` ([`global_hint`]; при новой ревизии — нет);
 //! - `zam vault rm <имя>` (синоним `delete`) — мягкое удаление (`DELETE /vault/{id}`): ревизии и
 //!   аудит остаются, имя освобождается; печатает `<id> удалена`;
 //! - `zam vault rename <имя> <новое>` — новое имя, новая ревизия с `If-Match` прочитанной;
@@ -120,11 +120,17 @@ fn written(ctx: &Ctx, m: &Value) -> Result<(), CliError> {
     emit(format!("{}@{}\n", m["id"].as_str().unwrap_or("?"), m["rev"]).as_bytes())
 }
 
-/// Совет после `set --type host|environment` без области (M6.6 §7): запись легла в Vault
-/// решения `solution`, общий для проектов хост — в личный Vault.
-pub fn global_hint(solution: &str, name: &str) -> String {
+/// Совет после создания записи `set --type host|environment` без области (M6.6 §7): запись
+/// легла в Vault решения `solution`, общий для проектов хост — в личный Vault. Имя записи — в
+/// кавычках (в нём бывают пробелы); имени решения нет — без него, имя записи вместо него не
+/// подставляется (финальное ревью M6.6, Minor 9).
+pub fn global_hint(solution: Option<&str>, name: &str) -> String {
+    let vault = match solution {
+        Some(s) => format!("Vault решения «{s}»"),
+        None => "Vault решения".to_string(),
+    };
     format!(
-        "записано в Vault решения «{solution}»; общий для проектов — --global (перенести: zam vault mv {name} --to global)"
+        "записано в {vault}; общий для проектов — --global (перенести: zam vault mv \"{name}\" --to global)"
     )
 }
 
@@ -311,17 +317,21 @@ pub fn set(ctx: &Ctx, a: &Area, s: &Set) -> Result<(), CliError> {
         }
     };
     let m = read_json(r)?;
-    // окружение без явной области легло в Vault решения (умолчание не меняется, M6.6 §7);
-    // имя решения — из `solution.toml` (оно там обязательно), иначе — имя записи
-    if !a.global && a.solution.is_none() && matches!(s.kind, "host" | "environment") {
-        let name = s.name.trim();
+    // новое окружение без явной области легло в Vault решения (умолчание не меняется, M6.6 §7);
+    // новая ревизия существующей записи совета не печатает: запись уже лежит там, куда её
+    // положили (признак — запись не нашлась до запроса и создана `POST`, финальное ревью M6.6,
+    // Minor 9); имя решения — из `solution.toml`, пустого нет — совет без имени
+    if existing.is_none()
+        && !a.global
+        && a.solution.is_none()
+        && matches!(s.kind, "host" | "environment")
+    {
         let solution = ctx
             .solution
             .as_ref()
-            .map(|x| x.name.as_str())
-            .filter(|n| !n.is_empty())
-            .unwrap_or(name);
-        eprintln!("{}", global_hint(solution, name));
+            .map(|x| x.name.trim())
+            .filter(|n| !n.is_empty());
+        eprintln!("{}", global_hint(solution, s.name.trim()));
     }
     written(ctx, &m)
 }
@@ -399,12 +409,17 @@ mod tests {
         );
     }
 
-    /// Текст совета §7 и флаг переноса — дословно.
+    /// Текст совета §7 и флаг переноса — дословно; имя записи — в кавычках, без имени решения —
+    /// совет без него, а не с именем записи (финальное ревью M6.6, Minor 9).
     #[test]
     fn move_texts() {
         assert_eq!(
-            global_hint("Проект", "stage"),
-            "записано в Vault решения «Проект»; общий для проектов — --global (перенести: zam vault mv stage --to global)"
+            global_hint(Some("Проект"), "stage"),
+            "записано в Vault решения «Проект»; общий для проектов — --global (перенести: zam vault mv \"stage\" --to global)"
+        );
+        assert_eq!(
+            global_hint(None, "lab box"),
+            "записано в Vault решения; общий для проектов — --global (перенести: zam vault mv \"lab box\" --to global)"
         );
         assert_eq!(
             OLD_SERVER_MOVE,

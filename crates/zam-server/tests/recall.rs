@@ -832,6 +832,70 @@ async fn prompt_task_strict_match() {
     );
 }
 
+/// Финальное ревью M6.6, Minor 3: заголовок задачи в подсказке к запросу — без секретов и до 80
+/// символов, как в строке «Открыто задач» дайджеста (`masked_clip`): ключ в заголовке не уходит
+/// агенту, длинный заголовок обрезается с многоточием.
+#[tokio::test]
+async fn prompt_task_title_masked_and_clipped() {
+    let a = server("task-mask").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    // фиктивный ключ AWS — склейкой во время выполнения
+    let key = format!("{}{}", "AK", "IAABCDEFGHIJKLMNOP");
+    let id = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": format!("Перенос памяти ZeroAgent {key}"),
+               "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tm1"),
+        json!({"event": "prompt", "solution": G,
+               "prompt": "давай займёмся переносом памяти ZeroAgent"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let line = format!("ZeroAIMemory: задача «Перенос памяти ZeroAgent ‹secret›» [open] k:{id}");
+    assert!(text.lines().any(|l| l == line), "{j}");
+    assert!(!text.contains(&key) && !text.contains(&key[..8]), "{j}");
+    // длинный заголовок: до 80 символов с многоточием, хвост в строку не попадает
+    let long = "Индексатор вложений проекта перестраивает чанки после смены модели \
+                эмбеддингов и пересчитывает хвост очереди переиндексации";
+    let lid = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": long, "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tm2"),
+        json!({"event": "prompt", "solution": G, "prompt": long}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.ends_with(&format!("k:{lid}")))
+        .unwrap_or_else(|| panic!("нет подсказки-задачи: {j}"));
+    let title = line
+        .strip_prefix("ZeroAIMemory: задача «")
+        .and_then(|l| l.split_once("» ["))
+        .map(|(t, _)| t)
+        .unwrap_or_else(|| panic!("{line}"));
+    assert!(
+        title.chars().count() <= 80 && title.ends_with('…'),
+        "{line}"
+    );
+    assert!(long.starts_with(title.trim_end_matches('…')), "{line}");
+    assert!(!line.contains("переиндексации"), "{line}");
+}
+
 /// `post_tool`: совпадение `error_regex` (с учётом `tools`) и FTS по нормализованной ошибке;
 /// строка «эта ошибка уже разбиралась»; случайное общее слово подсказку не поднимает.
 #[tokio::test]

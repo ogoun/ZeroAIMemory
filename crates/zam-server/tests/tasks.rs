@@ -775,12 +775,16 @@ async fn session_claimed_tasks_scoped_to_solution() {
 }
 
 /// `next_step` и `blocked_by` в дайджесте и пакете восстановления маскируются (финальное ревью
-/// M4.5, M-2): ключ из команды в шаге не уходит агенту.
+/// M4.5, M-2): ключ из команды в шаге не уходит агенту. Заголовок задачи — тоже (финальное
+/// ревью M6.6, Minor 3, как в строке «Открыто задач»).
 #[tokio::test]
 async fn digest_masks_task_texts() {
     let a = api("tasks-mask", roomy).await;
     // «ключ» собирается из частей: в исходниках нет строки, похожей на настоящий
     let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let aws = format!("{}{}", "AK", "IAABCDEFGHIJKLMNOP");
+    let t3 = id(&new_task(&a, &format!("Ротация {aws}"), json!({})).await);
+    status(&a, &t3, "in_progress").await;
     let t1 = id(&new_task(
         &a,
         "Деплой",
@@ -814,6 +818,10 @@ async fn digest_masks_task_texts() {
         );
         assert!(!text.contains(&key), "{event}: {text}");
         assert!(text.contains("‹secret›"), "{event}: {text}");
+        // заголовок с ключом — маска в строке задачи
+        let line = format!("ZeroAIMemory: [in_progress] Ротация ‹secret› — k:{t3}");
+        assert!(text.lines().any(|l| l == line), "{event}: {text}");
+        assert!(!text.contains(&aws[..8]), "{event}: {text}");
     }
 }
 

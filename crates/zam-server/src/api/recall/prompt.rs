@@ -24,8 +24,9 @@
 //!   (любое слово) — если промпт покрывает слова заголовка ([`title_covered`]); у короткого
 //!   запроса заголовок нужен и строгому (**[решение координатора]**, ревью задачи 2, M1: одно
 //!   слово из тела задачи подсказки не даёт); строка
-//!   `ZeroAIMemory: задача «<заголовок>» [<статус>] k:<id>`, `reason: task`, не больше
-//!   [`TASK_HINTS_MAX`] на ответ, раз за сессию (`session_seen`, как у остальных подсказок).
+//!   `ZeroAIMemory: задача «<заголовок>» [<статус>] k:<id>` (заголовок — без секретов и до 80
+//!   символов, как в строке открытых задач), `reason: task`, не больше [`TASK_HINTS_MAX`] на
+//!   ответ, раз за сессию (`session_seen`, как у остальных подсказок).
 //! - **Очередь разбора** (M6.6 §3.5, замечание 36): режим `review`, владелец базы решения, идеи
 //!   включены — строка `ZeroAIMemory: новая идея на разбор «<заголовок>» w:<id>` (при
 //!   нескольких непоказанных — ` (ещё N)`), `reason: idea_review`, одна на ответ, раз на идею за
@@ -53,8 +54,8 @@ use zam_store::{
 
 use super::ideas::{prompt_ideas, review_queue_head};
 use super::{
-    Cand, Deadline, REASON_TASK, RecallReq, age_of, entry_spaces, inner_search, item_age,
-    prompt_min_score, term_cands,
+    Cand, Deadline, REASON_TASK, RecallReq, TASK_TITLE_CHARS, age_of, entry_spaces, inner_search,
+    item_age, masked_clip, prompt_min_score, term_cands,
 };
 use crate::api::search::Health;
 use crate::api::sessions::RequestSession;
@@ -335,9 +336,11 @@ async fn task_prompt_cands(
             .as_deref()
             .unwrap_or(EntryStatus::Open.as_str())
             .to_string();
+        // заголовок — без секретов и до `TASK_TITLE_CHARS`, как в строке открытых задач
+        // дайджеста (финальное ревью M6.6, Minor 3)
         let block = hint_line(
             TASK_LEAD,
-            &format!("«{}»", one_line(&e.title)),
+            &format!("«{}»", masked_clip(&e.title, TASK_TITLE_CHARS)),
             &[status.as_str()],
             &reference,
         );

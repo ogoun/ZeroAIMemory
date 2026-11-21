@@ -1055,8 +1055,10 @@ pub const OPEN_QUESTIONS_TITLES: usize = 3;
 /// Заголовков в строке открытых задач `Открыто задач: N — «…», …` раздела `### Задачи`
 /// (M6.6 §4.2, решение координатора 7).
 pub const OPEN_TASKS_TITLES: usize = 3;
-/// Предел заголовка в строке открытых задач, символов.
-const OPEN_TASK_TITLE_CHARS: usize = 80;
+/// Предел заголовка задачи в строках агенту, символов: строка открытых задач, строка задачи
+/// дайджеста ([`task_block`]) и подсказка-задача к запросу (`prompt::task_prompt_cands`);
+/// заголовок везде проходит [`masked_clip`] (финальное ревью M6.6, Minor 3).
+const TASK_TITLE_CHARS: usize = 80;
 /// `reason` подсказки с ответом на вопрос: показывается сессии один раз.
 const REASON_ANSWER: &str = "answer";
 /// Заголовок раздела дайджеста с ответами.
@@ -1089,8 +1091,9 @@ fn masked_clip(s: &str, max: usize) -> String {
 /// Строка задачи дайджеста: `ZeroAIMemory: [<статус>] <заголовок> — далее: <next_step> —
 /// k:<id>`, у `blocked` после ссылки — ` — блокер: <blocked_by>`. `next_step` и `blocked_by` —
 /// свободный текст до 1000 символов (туда попадают команды с ключами): секреты маскируются, как
-/// в L1 правил и ответах (финальное ревью M4.5, M-2). `claim` — пометка захвата у `open`:
-/// `[open · <пометка>]`.
+/// в L1 правил и ответах (финальное ревью M4.5, M-2); заголовок — тоже, и до
+/// [`TASK_TITLE_CHARS`] символов, как в строке открытых задач (финальное ревью M6.6, Minor 3).
+/// `claim` — пометка захвата у `open`: `[open · <пометка>]`.
 fn task_block(e: &Entry, claim: Option<&str>) -> String {
     let t = zam_store::TaskData::from_stored(&e.data);
     let status = e.status.map_or("open", EntryStatus::as_str);
@@ -1098,7 +1101,8 @@ fn task_block(e: &Entry, claim: Option<&str>) -> String {
         Some(m) => format!("{status} · {m}"),
         None => status.to_string(),
     };
-    let mut s = format!("ZeroAIMemory: [{status}] {}", one_line(&e.title));
+    let title = masked_clip(&e.title, TASK_TITLE_CHARS);
+    let mut s = format!("ZeroAIMemory: [{status}] {title}");
     if let Some(n) = &t.next_step {
         let n = masked_clip(n, TASK_LINE_TEXT_CHARS);
         s.push_str(&format!(" — далее: {n}"));
@@ -1281,7 +1285,7 @@ async fn open_tasks_line(
 }
 
 /// Текст строки открытых задач: `Открыто задач: N — «…», «…», «…»`; заголовок — без секретов и
-/// до [`OPEN_TASK_TITLE_CHARS`] символов ([`masked_clip`]). Заголовков нет (все открытые
+/// до [`TASK_TITLE_CHARS`] символов ([`masked_clip`]). Заголовков нет (все открытые
 /// захвачены) — `Открыто задач: N`.
 fn open_tasks_text(n: usize, titles: &[&str]) -> String {
     if titles.is_empty() {
@@ -1289,7 +1293,7 @@ fn open_tasks_text(n: usize, titles: &[&str]) -> String {
     }
     let list: Vec<String> = titles
         .iter()
-        .map(|t| format!("«{}»", masked_clip(t, OPEN_TASK_TITLE_CHARS)))
+        .map(|t| format!("«{}»", masked_clip(t, TASK_TITLE_CHARS)))
         .collect();
     format!("Открыто задач: {n} — {}", list.join(", "))
 }

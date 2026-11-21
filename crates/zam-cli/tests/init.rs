@@ -1321,7 +1321,8 @@ fn init_url_home_block_without_url() {
 
 /// `--url-to local`: блок без адреса, адрес — строкой в `CLAUDE.local.md` (свой текст файла
 /// сохраняется), файл — в `info/exclude` после подтверждения (отказ — предупреждение);
-/// домашний адрес не пишется; повтор без флага ничего не меняет; Codex — совет `--url-to home`.
+/// домашний адрес не пишется; повтор без флага ничего не меняет; Codex — предупреждение: агент
+/// Codex `CLAUDE.local.md` не читает, а `zam` и хуки адрес находят (финальное ревью M6.6, M2).
 #[test]
 fn init_url_local_writes_claude_local_and_exclude() {
     let (url, tok) = start("url-local");
@@ -1377,18 +1378,27 @@ fn init_url_local_writes_claude_local_and_exclude() {
         s.contains(&format!("Сервер:   {url}")) && s.contains("CLAUDE.local.md"),
         "{s}"
     );
-    // Codex: локального файла нет, а CLAUDE.local.md выключает AGENTS.md у Claude Code — и у
-    // одного Codex, и у обоих
+    // Codex: агент CLAUDE.local.md не читает и адреса в контексте не видит, `zam` и хуки
+    // находят — и у одного Codex, и у обоих; причина про AGENTS.md у Claude Code была неверной
     for agent in ["codex", "both"] {
         let o = p.init(&["--url-to", "local", "--agent", agent, "--yes"], "");
         ok(&o);
         assert!(
-            err(&o).contains("Claude Code не читает AGENTS.md")
-                && err(&o).contains("для Codex выберите zam init --url-to home"),
+            err(&o).contains("CLAUDE.local.md агент Codex не читает и адреса сервера в контексте")
+                && err(&o).contains("zam, хуки и zam mcp адрес находят"),
             "{agent}: {}",
             err(&o)
         );
+        assert!(!err(&o).contains("Claude Code не читает"), "{}", err(&o));
         assert!(!p.read("AGENTS.md").contains(&url));
+        // адрес находит и `zam` (`locate::resolve` от агента не зависит)
+        let o = p.cmd().arg("status").output().unwrap();
+        ok(&o);
+        assert!(
+            out(&o).contains(&format!("Сервер:   {url}")) && out(&o).contains("CLAUDE.local.md"),
+            "{agent}: {}",
+            out(&o)
+        );
     }
 }
 
