@@ -2,7 +2,7 @@
 //! эмбеддинги, Qdrant), исходник заметки читается без изменений, ответ записи предупреждает
 //! `secrets_detected` без значений. Без моделей (FTS).
 mod common;
-/// Шаблоны тестовых входов сканера (`zam-secrets`): вход упора в предел повторов.
+/// Шаблоны тестовых входов сканера (`zam-secrets`): вход упора правил M6 в предел повторов.
 #[path = "../../zam-secrets/tests/common/mod.rs"]
 mod scan_common;
 
@@ -250,26 +250,27 @@ async fn secret_in_title_and_tag_masked_in_prefix() {
     assert_eq!(count(&search(&a, &s).await), 0);
 }
 
-/// Закреплённый вход упора сканера в предел повторов (фикстура `zam-secrets`, задача 15b M6).
+/// Вход, на котором сканер правил M6 упирался в предел повторов (фикстура `zam-secrets`, задача
+/// 15b M6).
 fn depth_capped_text() -> String {
     scan_common::expand(
         include_str!("../../zam-secrets/tests/fixtures/scan_depth_capped.txt").trim_end(),
     )
 }
 
-/// Долг M5.6 (задача 15b M6): упор сканера в `FIXPOINT_MAX` не молчит — у записи заметки и
-/// записи журнала `warnings` получает `secrets_scan_depth` (рядом с `secrets_detected`); обычный
-/// секрет этого предупреждения не даёт.
+/// Задача 3 M7.1 (спецификация M7 §4.2 п. 4): цепочка «пароль в URL ↔ ключ-значение», на которой
+/// сканер правил M6 упирался в `FIXPOINT_MAX`, доходит до неподвижной точки — запись заметки и
+/// записи журнала получает `secrets_detected`, но не `secrets_scan_depth`, а значения цепочки в
+/// поиск не попадают. Обычный секрет — тоже только `secrets_detected`. (Упор теперь расширяет
+/// находки, и известные входы до него не доходят: поиск `generate_depth_capped` — журнал M7.)
 #[tokio::test]
-async fn scan_depth_capped_warns() {
+async fn scan_depth_fixture_no_warning() {
     let a = api("secrets-depth", |_| {}).await;
     let t = depth_capped_text();
     let n = a
         .note("knowledge", "ops/depth", &format!("# Глубина\n\n{t}\n"))
         .await;
-    let w = n["warnings"].as_array().expect("warnings");
-    assert!(w.contains(&json!("secrets_detected")), "{n}");
-    assert!(w.contains(&json!("secrets_scan_depth")), "{n}");
+    assert_eq!(n["warnings"], json!(["secrets_detected"]), "{n}");
     let e = a
         .t(
             Method::POST,
@@ -282,12 +283,13 @@ async fn scan_depth_capped_warns() {
         .await;
     assert_eq!(e.status, StatusCode::CREATED, "{}", e.text());
     let e = e.json();
-    assert!(
-        e["warnings"]
-            .as_array()
-            .is_some_and(|w| w.contains(&json!("secrets_scan_depth"))),
-        "{e}"
-    );
+    let w = e["warnings"].as_array().expect("warnings");
+    assert!(w.contains(&json!("secrets_detected")), "{e}");
+    assert!(!w.contains(&json!("secrets_scan_depth")), "{e}");
+    // значения цепочки замаскированы в чанках заметки и записи
+    for v in [scan_common::rnd(40, 101), scan_common::rnd(20, 301)] {
+        assert_eq!(count(&search(&a, &v).await), 0, "{v}");
+    }
     // обычный секрет — только `secrets_detected`
     let n = a
         .note(
@@ -299,9 +301,8 @@ async fn scan_depth_capped_warns() {
     assert_eq!(n["warnings"], json!(["secrets_detected"]), "{n}");
 }
 
-/// Упор сканера — WARN в журнал сервера без текста находок и самого текста (только счётчики).
-#[test]
-fn scan_depth_capped_logs_without_text() {
+/// Журнал сервера в буфер (подписчик `tracing` на время `f`).
+fn captured_log(f: impl FnOnce()) -> String {
     use std::sync::{Arc, Mutex};
     #[derive(Clone, Default)]
     struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -325,36 +326,58 @@ fn scan_depth_capped_logs_without_text() {
         .with_writer(buf.clone())
         .with_ansi(false)
         .finish();
+    tracing::subscriber::with_default(sub, f);
+    String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+}
+
+/// Задача 3 M7.1: на входе упора правил M6 сервер больше не пишет WARN `secrets_scan_depth` (скан
+/// сходится), ответ — только `secrets_detected`.
+#[test]
+fn scan_depth_fixture_not_logged() {
     let t = depth_capped_text();
     let mut v = json!({});
-    tracing::subscriber::with_default(sub, || zam_server::api::secrets::attach(&mut v, &t));
-    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    let log = captured_log(|| zam_server::api::secrets::attach(&mut v, &t));
+    assert!(!log.contains("secrets_scan_depth"), "{log}");
+    assert_eq!(v["warnings"], json!(["secrets_detected"]), "{v}");
+}
+
+/// Упор сканера — WARN в журнал сервера без текста находок и самого текста (только счётчики), и
+/// `warnings` получает `secrets_scan_depth`. Входа, который упирается в предел, с задачи 3 M7.1
+/// нет: итог скана с упором подаётся в `attach_scan` (находки — настоящие, со входа фикстуры).
+#[test]
+fn scan_depth_warn_without_text() {
+    let t = depth_capped_text();
+    let hits = zam_markdown::scan_secrets(&t);
+    assert!(!hits.is_empty());
+    let scan = zam_markdown::ScanOutcome {
+        hits: hits.clone(),
+        passes: 7,
+        depth_capped: true,
+    };
+    let mut v = json!({});
+    let log = captured_log(|| zam_server::api::secrets::attach_scan(&mut v, t.len(), scan));
     assert!(
         log.contains("WARN") && log.contains("secrets_scan_depth"),
         "{log}"
     );
-    assert!(log.contains("passes=4"), "{log}");
+    assert!(log.contains("passes=7"), "{log}");
+    assert!(log.contains(&format!("text_bytes={}", t.len())), "{log}");
     // ни значений находок, ни фрагментов текста (в том числе случайных строк фикстуры)
-    let hits = zam_markdown::scan_secrets(&t);
-    assert!(!hits.is_empty());
     for h in &hits {
-        let v = &t[h.range.clone()];
-        assert!(!log.contains(v), "{v}: {log}");
+        let s = &t[h.range.clone()];
+        assert!(!log.contains(s), "{s}: {log}");
     }
-    let rnd40 = scan_common::rnd(40, 101);
-    assert!(t.contains(&rnd40), "фикстура с {{rnd:40:101}}");
     for frag in [
-        &rnd40[..12],
+        &scan_common::rnd(40, 101)[..12],
         &scan_common::rnd(20, 301)[..12],
         "x://",
         "pwd=",
     ] {
         assert!(!log.contains(frag), "{frag}: {log}");
     }
-    assert!(
-        v["warnings"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("secrets_scan_depth"))
+    assert_eq!(
+        v["warnings"],
+        json!(["secrets_detected", "secrets_scan_depth"]),
+        "{v}"
     );
 }

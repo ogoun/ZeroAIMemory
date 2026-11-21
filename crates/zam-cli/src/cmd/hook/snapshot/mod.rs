@@ -12,9 +12,10 @@
 //!
 //! Маскировка ([`mask_and_limit`]) — `zam_secrets` по каждому текстовому полю (то же, что
 //! `mask_text`, плюс признак упора `depth_capped`), а у команд (первая строка) ещё и правила
-//! флагов командной строки ([`mask_flags`]: `-pXXX` у mysql, `--password X`, `curl -u u:p`,
-//! `Bearer X`; в прозе запросов «basic»/«-u» — не пароль, поэтому там их нет). Затем пределы
-//! §8а: поля по отдельности, потом общий размер JSON — однозначный порядок сокращения.
+//! флагов командной строки ([`zam_secrets::mask_flags`]: `-pXXX` у mysql, `--password X`,
+//! `curl -u u:p`, `Bearer X`; в прозе запросов «basic»/«-u» — не пароль, поэтому там их нет; с
+//! задачи 3 M7.1 правила живут в `zam-secrets`, а не в клиенте). Затем пределы §8а: поля по
+//! отдельности, потом общий размер JSON — однозначный порядок сокращения.
 //!
 //! Форматы агентов знают только адаптеры; ядро (`zam_core::snapshot`) — нейтральный снимок.
 //! Модуль не зависит от остального клиента (`crate::…`): его исходник подключают и тесты
@@ -26,11 +27,9 @@ mod codex;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use regex::Regex;
 use serde::Serialize;
 use zam_core::snapshot::{SnapCommand, SnapStatus, SnapTrigger, SnapshotData};
 
@@ -421,12 +420,12 @@ fn read_head(f: &mut File, limit: u64) -> Option<(String, bool)> {
 }
 
 /// Маскировка и пределы §8а. Каждое текстовое поле: `zam_secrets` (как `mask_text`); поле
-/// команд — ещё и [`mask_flags`] (только оно). Затем поля ограничиваются сами (запросы 5 × 500
-/// символов, файлы 20, команды 10 × 200 символов первой строки, конспект ≤ 8 КиБ —
-/// [`summary_tail`]); если сериализованный
-/// снимок с запасом [`ENVELOPE_RESERVE`] всё ещё больше `max_bytes`, сокращаются по шагам:
-/// команды (с самых старых), запросы (с самых старых), конспект (с начала), файлы (с самых
-/// старых, сверх §8а — иначе предел недостижим). Сокращение второго шага — статус `partial`.
+/// команд — ещё и [`zam_secrets::mask_flags`] (только оно). Затем поля ограничиваются сами
+/// (запросы 5 × 500 символов, файлы 20, команды 10 × 200 символов первой строки, конспект
+/// ≤ 8 КиБ — [`summary_tail`]); если сериализованный снимок с запасом [`ENVELOPE_RESERVE`] всё
+/// ещё больше `max_bytes`, сокращаются по шагам: команды (с самых старых), запросы (с самых
+/// старых), конспект (с начала), файлы (с самых старых, сверх §8а — иначе предел недостижим).
+/// Сокращение второго шага — статус `partial`.
 pub fn mask_and_limit(mut s: Snapshot, max_bytes: usize) -> Snapshot {
     let mut capped = s.scan_depth_capped;
     let mut mask = |t: &str| -> String {
@@ -467,7 +466,7 @@ pub fn mask_and_limit(mut s: Snapshot, max_bytes: usize) -> Snapshot {
         .map(|c| SnapCommand {
             // флаги командной строки — только у команд: в прозе «basic»/«-u» не пароль
             cmd: trunc_chars(
-                &mask_flags(first_line(&mask(head_chars(
+                &zam_secrets::mask_flags(first_line(&mask(head_chars(
                     first_line(&c.cmd),
                     COMMAND_CHARS + MASK_MARGIN,
                 )))),
@@ -707,130 +706,6 @@ pub fn summary_tail(text: &str, max: usize) -> String {
     }
     let out = out.trim();
     tail_bytes(out, max).to_string()
-}
-
-/// Флаги командной строки с паролем или токеном, которых не знает сканер `zam_secrets`
-/// (только поле команд — в прозе «basic»/«bearer» и `-u` не пароль):
-/// - `-pXXX`/`-p'a b'` у mysql-подобных команд и `sshpass`;
-/// - `--password X`/`--password=X` (и `--passphrase`, `--secret-key`, `--client-secret`, `--token`,
-///   `--api-key`, `--secret`, …);
-/// - `-u user:pass`/`--user user:pass` у curl, wget и подобных (числовые `uid:gid` — нет);
-/// - значение заголовка `Authorization:` (`Bearer X`, `Basic X`, `Token X`) и `X-Api-Key:`;
-///   ссылка на переменную (`Bearer $TOKEN`) и сама схема не маскируются.
-///
-/// Значение заменяется меткой `‹secret›`; ссылки на переменные (`$X`, `%X%`) и заглушки (`<…>`)
-/// остаются.
-pub fn mask_flags(text: &str) -> String {
-    static RE: OnceLock<[Regex; 4]> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        [
-            // --password X, --password=X, --token "a b"
-            Regex::new(
-                r#"(?i)(?:^|[\s'"])--(?:password|passwd|pass|pwd|passphrase|token|api-key|apikey|api-token|secret|secret-key|client-secret|access-token|auth-token|http-password|proxy-password)(?:=|\s+)("[^"]*"|'[^']*'|[^\s"']+)"#,
-            )
-            .expect("regex"),
-            // curl -u user:pass, --user user:pass, -uuser:pass
-            Regex::new(r#"(?:^|\s)(?:-u\s*|--user(?:=|\s+))["']?([^\s:"']+):([^\s"'@]+)"#)
-                .expect("regex"),
-            // Authorization: Bearer X | Basic X | Token X | X; X-Api-Key: X
-            Regex::new(
-                r#"(?i)(?:authorization\s*:\s*(?:(?:bearer|basic|token|digest)\s+)?|x-api-key\s*:\s*)([^\s"']{6,})"#,
-            )
-            .expect("regex"),
-            // -pXXX, -p'a b' (значение слитно с флагом)
-            Regex::new(r#"(?:^|\s)-p("[^"]*"|'[^']*'|[^\s"']+)"#).expect("regex"),
-        ]
-    });
-    static GATES: OnceLock<[Regex; 2]> = OnceLock::new();
-    let [mysql, curl] = GATES.get_or_init(|| {
-        [
-            Regex::new(r"(?i)\b(?:mysql\w*|mariadb\w*|sshpass)\b").expect("regex"),
-            Regex::new(r"(?i)\b(?:curl|wget|wget2|http|https|httpie|xh|lftp|aria2c)\b")
-                .expect("regex"),
-        ]
-    });
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for (i, r) in re.iter().enumerate() {
-        if (i == 3 && !mysql.is_match(text)) || (i == 1 && !curl.is_match(text)) {
-            continue;
-        }
-        for c in r.captures_iter(text) {
-            // `-u user:pass` — значение во второй группе; числовые `uid:gid` — не пароль
-            let m = if i == 1 {
-                let (Some(u), Some(p)) = (c.get(1), c.get(2)) else {
-                    continue;
-                };
-                let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-                if digits(u.as_str()) && digits(p.as_str()) {
-                    continue;
-                }
-                p
-            } else {
-                let Some(m) = c.get(1) else { continue };
-                m
-            };
-            let v = m.as_str();
-            let (mut b, mut e) = (m.start(), m.end());
-            if (v.starts_with('"') || v.starts_with('\'')) && v.len() >= 2 {
-                b += 1;
-                e -= 1;
-            }
-            let inner = &text[b..e];
-            // значение целиком — ссылка на переменную (`$NAME`, `${NAME}`, `%NAME%`) или заглушка
-            // `<…>` ([`is_reference`]); у заголовка без значения длиной ≥ 6 регулярка берёт
-            // слово-схему — его не трогаем
-            let scheme = i == 2
-                && ["bearer", "basic", "token", "digest"]
-                    .iter()
-                    .any(|w| inner.eq_ignore_ascii_case(w));
-            if inner.is_empty()
-                || scheme
-                || inner.contains(zam_secrets::SECRET_MARK)
-                || is_reference(inner)
-            {
-                continue;
-            }
-            ranges.push((b, e));
-        }
-    }
-    if ranges.is_empty() {
-        return text.to_string();
-    }
-    ranges.sort();
-    let mut out = String::with_capacity(text.len());
-    let mut pos = 0;
-    for (b, e) in ranges {
-        if b < pos {
-            continue;
-        }
-        out.push_str(&text[pos..b]);
-        out.push_str(zam_secrets::SECRET_MARK);
-        pos = e;
-    }
-    out.push_str(&text[pos..]);
-    out
-}
-
-/// Значение — целиком ссылка на переменную или заглушка, а не секрет: `$NAME`, `${NAME}`,
-/// `%NAME%` (имя — `[A-Za-z_][A-Za-z0-9_]*`) или `<…>`. `%2Fabc…`, `$2b$10$…` (хэш bcrypt) —
-/// не ссылки.
-fn is_reference(v: &str) -> bool {
-    let ident = |s: &str| {
-        let mut c = s.chars();
-        c.next()
-            .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
-            && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
-    };
-    if let Some(r) = v.strip_prefix("${") {
-        return r.strip_suffix('}').is_some_and(ident);
-    }
-    if let Some(r) = v.strip_prefix('$') {
-        return ident(r);
-    }
-    if let Some(r) = v.strip_prefix('%') {
-        return r.strip_suffix('%').is_some_and(ident);
-    }
-    v.len() >= 2 && v.starts_with('<') && v.ends_with('>')
 }
 
 /// Текст без вставок `<тег>…</тег>`; пробелы по краям сняты. Незакрытая вставка (`<тег>` без

@@ -17,11 +17,20 @@
 //! серверу (через `zam-markdown`, реэкспорт `zam_markdown::secrets` и прежние имена), но и
 //! клиенту `zam` без comrak (маскировка снимка сессии, задача 17a). [`scan_secrets_ext`]
 //! дополнительно сообщает число повторов скана и упор в их предел ([`ScanOutcome`]).
+//!
+//! [`mask_text`] идемпотентна для любого текста (задача 3 M7.1): скан идёт до неподвижной
+//! точки, а упор в [`FIXPOINT_MAX`] расширяет неустойчивые находки, пока вид не перестанет
+//! меняться ([`ScanOutcome::depth_capped`]). Правила флагов командной строки — отдельно,
+//! [`mask_flags`] (только текст команд).
+
+mod flags;
 
 use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
+
+pub use flags::mask_flags;
 
 /// Замена секрета в тексте чанка.
 pub const SECRET_MARK: &str = "‹secret›";
@@ -31,8 +40,10 @@ pub const SECRET_MARK: &str = "‹secret›";
 /// записывает версию, с которой база перемаскирована, и при открытии базы с меньшей версией один
 /// раз перенарезает заметки и записи, где теперь есть находки, и проверяет теги payload и папки.
 /// 1 — правила M3–M5.7 (значение `'1'` старых баз); 2 — значение в обратных кавычках (задача 15b
-/// M6, I1).
-pub const RULES_VERSION: u32 = 2;
+/// M6, I1); 3 — русские слова-ключи (значение и тогда, когда оно только из hex), `response`
+/// заголовка `Authorization: Digest`, идемпотентность на цепочках «пароль в URL ↔ ключ-значение»
+/// (задача 3 M7.1).
+pub const RULES_VERSION: u32 = 3;
 
 /// Тип сработавшего правила.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -194,17 +205,436 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
+/// Значение в кавычках правил «ключ-значение»: в `"`, в `'` или в обратных кавычках — до
+/// закрывающей кавычки (пароль-фраза с пробелами), от `min` символов.
+///
+/// Задача 3 M7.1 — значение устойчиво к маскам ([`MaskedView`]), чтобы по виду с масками правило
+/// не находило того, чего не видело в тексте (иначе находки открывались по одной за повтор, и
+/// цепочка повторов не кончалась — `tests/fixtures/scan_depth_capped.txt`):
+/// - значение не заходит в метку `‹`: иначе короткий остаток склеивался с маской другого правила
+///   (`pwd=:‹secret›@…` — в тексте `:` упирался в `` ` ``); остаток до метки — начало значения,
+///   которое правило уже видело в тексте целиком;
+/// - значение не начинается с метки и с признаков заглушки — пути и ссылки (`/`, `~`), переменной
+///   (`$`), шаблона (`<`, `{`): такое совпадение раньше отвергалось проверкой
+///   [`is_placeholder`] уже после поиска и поглощало текст до конца значения вместе с ключами
+///   внутри него, а по виду (значение начинается с метки — совпадения нет) эти ключи
+///   открывались. Теперь совпадения нет ни в тексте, ни в виде, и вложенный ключ виден сразу
+///   (`pwd=/путь,password=…`).
+fn kv_quoted(min: usize) -> String {
+    let n = min - 1;
+    format!(
+        r#""([^"\r\n‹/~$<{{][^"\r\n‹]{{{n},}})"|'([^'\r\n‹/~$<{{][^'\r\n‹]{{{n},}})'|`([^`\r\n‹/~$<{{][^`\r\n‹]{{{n},}})`"#
+    )
+}
+
+/// Значение без кавычек — до пробела, кавычки или метки `‹`, от `min` символов; первый символ —
+/// не признак заглушки ([`kv_quoted`]).
+fn kv_bare(min: usize) -> String {
+    let n = min - 1;
+    format!(r#"([^\s"'`‹/~$<{{][^\s"'`‹]{{{n},}})"#)
+}
+
+/// Конец слова-ключа: необязательная кавычка (JSON `"password": "…"`) или разметка Markdown вокруг
+/// ключа — `**Пароль**: …`, `*token*: …`, `«Токен»: …` (ревью задачи 3 M7.1).
+const KEY_END: &str = r#"(?:\*\*|__|[*_»"'])?"#;
+
+/// Разметка Markdown сразу после разделителя: `**Password:** …`, `__Пароль:__ …`.
+const SEP_END: &str = r"(?:\*\*|__|[*_])?";
+
 /// Ключ-значение; необязательная кавычка перед разделителем покрывает JSON (`"password": "…"`)
-/// [решение исполнителя].
+/// [решение исполнителя], разметка Markdown вокруг ключа — [`KEY_END`], [`SEP_END`].
 ///
 /// Значение в кавычках берётся до закрывающей кавычки (пароль-фраза с пробелами); без кавычек —
-/// до пробела. Словарь ключей расширен `secret_key`, `signing_key`, `private_key`
-/// [решение исполнителя]. Значение — группа 1 (в `"`), 2 (в `'`), 3 (в обратных кавычках,
-/// `` password=`…` ``, ревью задачи 15b M6, I1) или 4 (без кавычек). Обычный inline code без ключа
-/// (`` `cargo build` ``) правило не задевает.
+/// до пробела ([`kv_quoted`], [`kv_bare`]), от 6 символов. Словарь ключей расширен `secret_key`,
+/// `signing_key`, `private_key` [решение исполнителя]. Значение — группа 1 (в `"`), 2 (в `'`), 3
+/// (в обратных кавычках, `` password=`…` ``, ревью задачи 15b M6, I1) или 4 (без кавычек).
+/// Обычный inline code без ключа (`` `cargo build` ``) правило не задевает. Значение только из hex
+/// (64 hex — типичный токен) — тоже значение: исключение hex есть только у правила энтропии.
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    let (q, b) = (kv_quoted(6), kv_bare(6));
+    rx(&format!(
+        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key){KEY_END}\s*[:=]{SEP_END}\s*(?:{q}|{b})"#
+    ))
+});
+
+/// Слово в трёх написаниях — строчное, с заглавной, прописное: `(?:токен|Токен|ТОКЕН)`.
+/// Литералы без `(?i)` дают поиску префильтр: у кириллицы `(?i)` втрое дороже трёх написаний
+/// (ревью задачи 3 M7.1, Minor 1; замер — журнал этапа). Смешанное написание внутри слова
+/// («тОКЕН») не ищется.
+fn three_cases(s: &str) -> String {
+    let mut cs = s.chars();
+    let cap: String = cs
+        .next()
+        .map(|f| f.to_uppercase().chain(cs).collect())
+        .unwrap_or_default();
+    format!("(?:{s}|{cap}|{})", s.to_uppercase())
+}
+
+/// Русские слова-ключи (задача 3 M7.1, `i:01M7Z9C3FAE8ARBCX00WSZJ6SD`): `токен`, `пароль`,
+/// `секрет`, `ключ API`, `api-ключ` и падежные формы, после которых естественно стоит значение, —
+/// `токена`, `токеном`, `пароля`, `паролем`, `секрета` **[решение координатора]**. Слово «ключ»
+/// само по себе — не ключ: «ключ идемпотентности: abc123» не маскируется. Шаблон — форма слова и
+/// разделитель, без значения: совпадение не заходит в значение и, отвергнутое проверкой границы,
+/// ничего лишнего не поглощает. Значение после него разбирает [`ru_value_at`].
+///
+/// Разделитель — `:` или `=`, как у [`KEY_VALUE`], но значение — на той же строке: «нашёлся
+/// токен:» в конце строки вводит блок ниже, и следующая строка (`API_TOKEN=ghp_…`) — не значение
+/// этого ключа **[решение исполнителя, задача 3 M7.1]**. Пробелы — и неразрывные (`\p{Zs}`). У
+/// форм «с паролем», «токеном» значение стоит и без разделителя, но только в кавычках (шаблон
+/// кончается открывающей кавычкой: «войти с паролем `…`»); без кавычек это проза («с паролем
+/// администратора»). Разметка Markdown вокруг ключа — [`KEY_END`]. Граница слова справа — сам
+/// разделитель («токенов: 1500» не совпадает), слева — по Unicode ([`ru_key_boundary`]). Начало
+/// слова — в трёх написаниях ([`three_cases`]), окончания — без учёта регистра.
+static KEY_SEP_RU: LazyLock<Regex> = LazyLock::new(|| {
+    let [token, pass, secret, key, api] =
+        ["токен", "парол", "секрет", "ключ", "api"].map(three_cases);
+    let zs = r"[\t\p{Zs}]";
+    rx(&format!(
+        r#"(?:{token}(?i:а|ом)?|{pass}(?i:ь|я|ем)|{secret}(?i:а)?|{key}{zs}+(?i:api)|{api}[-_\p{{Zs}}]?(?i:ключ)){KEY_END}{zs}*[:=]|(?:{token}(?i:ом)|{pass}(?i:ем)){KEY_END}{zs}+["'`]"#
+    ))
+});
+
+/// Наименьшая длина значения русского слова-ключа, символов: «пароль: admin» — настоящий пароль
+/// (ревью задачи 3 M7.1; у английских ключей — 6).
+const RU_VALUE_MIN: usize = 5;
+
+/// Пробельный разделитель `\t` или `\p{Zs}` (пробел, неразрывные, тонкие, идеографический).
+fn is_zs(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
+/// Значение в кавычках с байта `at` (там открывающая кавычка): диапазон содержимого — те же
+/// правила, что у [`kv_quoted`] с наименьшей длиной `min` (первый символ — не признак заглушки,
+/// внутри нет `\r`, `\n`, метки; закрывающая кавычка обязательна).
+fn quoted_value_at(text: &str, at: usize, min: usize) -> Option<Range<usize>> {
+    let q = text[at..]
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let start = at + 1;
+    for (n, (i, c)) in text[start..].char_indices().enumerate() {
+        if c == q {
+            return (n >= min).then_some(start..start + i);
+        }
+        let banned =
+            matches!(c, '\r' | '\n' | '‹') || (n == 0 && matches!(c, '/' | '~' | '$' | '<' | '{'));
+        if banned {
+            return None;
+        }
+    }
+    None
+}
+
+/// Значение без кавычек с байта `at` — правила [`kv_bare`] с наименьшей длиной `min`.
+fn bare_value_at(text: &str, at: usize, min: usize) -> Option<Range<usize>> {
+    let mut n = 0usize;
+    let mut end = at;
+    for (i, c) in text[at..].char_indices() {
+        let stop = c.is_whitespace()
+            || matches!(c, '"' | '\'' | '`' | '‹')
+            || (n == 0 && matches!(c, '/' | '~' | '$' | '<' | '{'));
+        if stop {
+            break;
+        }
+        n += 1;
+        end = at + i + c.len_utf8();
+    }
+    (n >= min).then_some(at..end)
+}
+
+/// Значение после разделителя [`KEY_SEP_RU`] (байт `at` — сразу за `:`/`=`): необязательная
+/// разметка [`SEP_END`], пробелы `[\t\p{Zs}]`, затем значение в кавычках или без. Порядок попыток —
+/// как у шаблона `{SEP_END}[\t\p{Zs}]*(?:{kv_quoted}|{kv_bare})`: сначала с разметкой (`**`, `__`,
+/// `*`, `_`), потом без. `(диапазон, в кавычках)`.
+fn ru_value_at(text: &str, at: usize) -> Option<(Range<usize>, bool)> {
+    for mark in ["**", "__", "*", "_", ""] {
+        if !text[at..].starts_with(mark) {
+            continue;
+        }
+        let rest = &text[at + mark.len()..];
+        let p = at + mark.len() + rest.len() - rest.trim_start_matches(is_zs).len();
+        if let Some(r) = quoted_value_at(text, p, RU_VALUE_MIN) {
+            return Some((r, true));
+        }
+        if let Some(r) = bare_value_at(text, p, RU_VALUE_MIN) {
+            return Some((r, false));
+        }
+    }
+    None
+}
+
+/// Слово-ключ с позиции `at` — отдельное слово: перед ним не буква и не цифра (Unicode;
+/// «автотокен: …» — не ключ). Конец метки `›` — тоже не граница: ключ вплотную за замаскированным
+/// значением (`<ключ>токен: …`) в тексте границы не имел, и вид с масками ([`MaskedView`]) не
+/// должен её получать (находка генератора `generate_depth_capped`).
+fn ru_key_boundary(text: &str, at: usize) -> bool {
+    !text[..at]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || c == '›')
+}
+
+/// Находки русских слов-ключей в `text`. Совпадение [`KEY_SEP_RU`] — только форма слова и
+/// разделитель: без границы слова оно пропускается, не поглощая значения (иначе ключ внутри
+/// значения открылся бы только по виду с масками — цепочка повторов). Принятое совпадение
+/// поглощает текст до конца значения, как `captures_iter`; каждый символ текста просматривается
+/// не больше постоянного числа раз.
+fn ru_key_values(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
+    // конец поглощённого принятым совпадением значения: совпадения внутри него пропускаются
+    // (один проход `find_iter`: повторный `find_at` с позиции стоил втрое дороже самого поиска)
+    let mut at = 0;
+    for m in KEY_SEP_RU.find_iter(text) {
+        let s = m.start();
+        let sep_end = m.end();
+        if s < at || !ru_key_boundary(text, s) {
+            continue;
+        }
+        // форма «с паролем `…`» — шаблон кончается открывающей кавычкой: только значение в кавычках
+        let instrumental = !matches!(m.as_str().chars().next_back(), Some(':' | '='));
+        let value = if instrumental {
+            quoted_value_at(text, sep_end - 1, RU_VALUE_MIN).map(|r| (r, true))
+        } else {
+            ru_value_at(text, sep_end)
+        };
+        let Some((v, quoted)) = value else {
+            continue;
+        };
+        // косвенная форма — всё, кроме именительного `токен`, `пароль`, `секрет`. Начало слова —
+        // одно из трёх написаний основы, поэтому форма видна по длине и окончанию первого слова
+        // (без перевода в нижний регистр: он вдвое удорожал разбор каждого совпадения)
+        let word = text[s..]
+            .split(|c: char| !c.is_alphabetic())
+            .next()
+            .unwrap_or("");
+        let nominative = match word.chars().next() {
+            Some('т' | 'Т') => word.chars().count() == 5,
+            Some('с' | 'С') => word.chars().count() == 6,
+            Some('п' | 'П') => word.ends_with(['ь', 'Ь']),
+            _ => false,
+        };
+        let indirect = !nominative;
+        let val = &text[v.clone()];
+        // проза — не значение и ничего не поглощает: следующий ключ в ней виден («Тип токена:
+        // пароль: X» — `X` маскируется; ревью круга 1, п. 3)
+        if !quoted && ru_prose_value(val, indirect) {
+            continue;
+        }
+        at = v.end + usize::from(quoted);
+        if is_placeholder(val) {
+            continue;
+        }
+        raw.push((v, SecretKind::KeyValue));
+    }
+}
+
+/// Знак препинания Unicode (`\p{P}`).
+fn is_punct(c: char) -> bool {
+    static P: LazyLock<Regex> = LazyLock::new(|| rx(r"^\p{P}$"));
+    if c.is_alphanumeric() {
+        return false;
+    }
+    if c.is_ascii() {
+        return c.is_ascii_punctuation()
+            && !matches!(c, '$' | '+' | '<' | '=' | '>' | '^' | '`' | '|' | '~');
+    }
+    P.is_match(c.encode_utf8(&mut [0; 4]))
+}
+
+/// Имена алгоритмов и кодировок — проза после косвенных форм, без учёта регистра («Хэш пароля:
+/// sha256», «Формат токена: base64», «Алгоритм токена: HS256», «Тип токена: OAuth2») **[решение
+/// координатора, круг 3]**. Сравнение — целым словом без `-`, `.`, `_` ([`is_prose_term`]):
+/// `SHA-256`, `UTF-8`, `X.509`, `P-256`, `HMAC-SHA256` — тоже проза, `sha-256secret` — значение
+/// (круг 4).
+/// - хэши: `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, `sha3`, `sha3-224`, `sha3-256`,
+///   `sha3-384`, `sha3-512`, `md5`, `blake2`, `blake2b`, `blake2s`, `blake3`, `hmacsha1`,
+///   `hmacsha256`, `hmacsha384`, `hmacsha512`, `sha256sum`;
+/// - хэширование паролей: `argon2`, `argon2i`, `argon2d`, `argon2id`, `pbkdf2`, `pbkdf2sha256`,
+///   `pbkdf2hmacsha256` (`PBKDF2-HMAC-SHA256`, запись OWASP), `bcrypt`, `scrypt`, `sha512crypt`,
+///   `sha256crypt`, `md5crypt`;
+/// - кодировки: `base32`, `base58`, `base64`, `base64url`, `utf8`, `utf8mb4`, `utf8bin`, `utf16`,
+///   `utf16le`, `utf16be`, `cp1251`, `koi8r`;
+/// - подписи JWT: `hs256`, `hs384`, `hs512`, `rs256`, `rs384`, `rs512`, `es256`, `es256k`, `es384`,
+///   `es512`, `ps256`, `ps384`, `ps512`;
+/// - шифры: `aes128`, `aes256`, `aes128gcm`, `aes256gcm`, `chacha20`, `chacha20poly1305`,
+///   `xchacha20poly1305`;
+/// - ключи и протоколы: `eddsa`, `ed25519`, `x25519`, `x509`, `rsa2048`, `rsa4096`, `p256`,
+///   `secp256k1`, `pkcs8`, `pkcs12`, `oauth2`, `oauth20` (`OAuth 2.0`), `saml2`.
+const RU_PROSE_TERMS: &[&str] = &[
+    "sha1",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "sha3",
+    "sha3-224",
+    "sha3-256",
+    "sha3-384",
+    "sha3-512",
+    "md5",
+    "blake2",
+    "blake2b",
+    "blake2s",
+    "blake3",
+    "hmacsha256",
+    "hmacsha512",
+    "argon2",
+    "argon2i",
+    "argon2d",
+    "argon2id",
+    "pbkdf2",
+    "pbkdf2sha256",
+    "bcrypt",
+    "scrypt",
+    "base32",
+    "base58",
+    "base64",
+    "base64url",
+    "utf8",
+    "utf8mb4",
+    "utf16",
+    "hs256",
+    "hs384",
+    "hs512",
+    "rs256",
+    "rs384",
+    "rs512",
+    "es256",
+    "es384",
+    "es512",
+    "ps256",
+    "ps384",
+    "ps512",
+    "eddsa",
+    "ed25519",
+    "x25519",
+    "x509",
+    "aes128",
+    "aes256",
+    "rsa2048",
+    "rsa4096",
+    "p256",
+    "secp256k1",
+    "oauth2",
+    // круг 5
+    "hmacsha1",
+    "hmacsha384",
+    "sha256sum",
+    "pbkdf2hmacsha256",
+    "sha512crypt",
+    "sha256crypt",
+    "md5crypt",
+    "utf8bin",
+    "utf16le",
+    "utf16be",
+    "cp1251",
+    "koi8r",
+    "es256k",
+    "aes128gcm",
+    "aes256gcm",
+    "chacha20",
+    "chacha20poly1305",
+    "xchacha20poly1305",
+    "pkcs8",
+    "pkcs12",
+    "oauth20",
+    "saml2",
+];
+
+/// Слово `w` — имя из [`RU_PROSE_TERMS`]: целиком, без учёта регистра ASCII и без `-`, `.`, `_`
+/// с обеих сторон сравнения (`SHA-256` = `sha256`, `sha3-256` = `SHA3_256`).
+fn is_prose_term(w: &str) -> bool {
+    /// Нормализованные имена — один раз (ревью круга 4: нормализация списка на каждый вызов
+    /// стоила ≈ 10 мс на 100 КБ «Хэш пароля: 12345»).
+    static TERMS: LazyLock<std::collections::HashSet<Vec<u8>>> = LazyLock::new(|| {
+        RU_PROSE_TERMS
+            .iter()
+            .map(|t| {
+                t.bytes()
+                    .filter(|b| !matches!(b, b'-' | b'.' | b'_'))
+                    .map(|b| b.to_ascii_lowercase())
+                    .collect()
+            })
+            .collect()
+    });
+    // слово нормализуется в буфер на стеке: имена короче 24 байт и только ASCII
+    let mut buf = [0u8; 24];
+    let mut n = 0;
+    for b in w.bytes() {
+        if matches!(b, b'-' | b'.' | b'_') {
+            continue;
+        }
+        if !b.is_ascii() || n == buf.len() {
+            return false;
+        }
+        buf[n] = b.to_ascii_lowercase();
+        n += 1;
+    }
+    TERMS.contains(&buf[..n])
+}
+
+/// Значение без кавычек после русского слова-ключа — проза, а не секрет (знаки препинания `\p{P}`
+/// по краям не в счёт: «Токен: «одноразовый»», «Токен: устарел.») [решение координатора, ревью
+/// задачи 3 M7.1]:
+/// - после именительного `токен`, `пароль`, `секрет` — слово с кириллицей из одних букв (и
+///   дефиса), строчное или с заглавной первой («Пароль: хранится в Vault»); латинское слово —
+///   значение («пароль: admin»), смешанный регистр — тоже («пароль: ПарольДляВхода»);
+/// - после косвенных форм и `ключ API`, `api-ключ` — слово из букв любой письменности и любого
+///   регистра («Тип токена: Bearer», «Тип токена: OAuth», «API-ключ: managed»; ревью круга 1,
+///   п. 2), имя алгоритма или кодировки ([`is_prose_term`]) и число с `.`/`,` — без единицы, с
+///   единицей из закрытого списка (времени, размера, экрана, частоты) или со знаком валюты
+///   («Стоимость токена: 0,00002 $», «Размер токена: 512KB», «Срок токена: 3600с») **[решение
+///   координатора, круг 4]**. Слова «буквы + цифры» вне списка — значения (`oauth2pass`,
+///   `hunter2x`, `md5hash`), как и число с другой единицей (`123456qwer`, `2024love`).
+///
+/// Значение в кавычках — всегда значение.
+fn ru_prose_value(v: &str, indirect: bool) -> bool {
+    static NUMBER: LazyLock<Regex> = LazyLock::new(|| {
+        rx(concat!(
+            r"^[+\-−]?\d+(?:[.,]\d+)*(?:[%‰]|\p{Sc}",
+            // время, количество, размер (строчными), экран, частота
+            r"|с|сек|мс|мкс|мин|ч|дн|нед|мес|г|шт|бит|байт",
+            r"|s|sec|secs|ms|us|[µμ]s|ns|m|min|mins|h|hour|hours|d|day|days|bit|bits|byte|bytes",
+            r"|px|pt|em|rem|fps|rps|qps|tps|rpm",
+            // размеры — без учёта регистра: `KB`, `kB`, `KiB`, `МБ`, `Мб`, `мБ`…
+            r"|(?i:[kmgt]i?b|[кмгт]б)",
+            r")?$",
+        ))
+    });
+    let w = v.trim_matches(is_punct);
+    // слово из букв (части через дефис)
+    let letters = !w.is_empty()
+        && w.split('-')
+            .all(|p| !p.is_empty() && p.chars().all(char::is_alphabetic));
+    if indirect {
+        // число — раньше имени: чисел в прозе после «Хэш пароля:», «Размер токена:» больше
+        return letters || NUMBER.is_match(w) || is_prose_term(w);
+    }
+    // именительная форма: строчное или с заглавной первой, с кириллицей
+    letters
+        && w.split('-')
+            .all(|p| p.chars().skip(1).all(|c| !c.is_uppercase()))
+        && w.chars()
+            .any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'))
+}
+
+/// Заголовок `Authorization: Digest …` (и `Proxy-Authorization:`, в том числе в JSON с `\"`) —
+/// от имени до конца строки (задача 3 M7.1). Параметры в нём — [`DIGEST_RESPONSE`].
+static DIGEST_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| rx(r#"(?i)authorization["']?\s*:\s*["']?\s*digest\s[^\r\n]*"#));
+
+/// Параметр `response` заголовка Digest: значение — группа 1 (в кавычках) или 2 (без кавычек).
+/// `username`, `realm`, `nonce`, `cnonce`, `opaque`, `uri` — не секреты и не маскируются. Все
+/// `response` заголовка берутся за один проход: по виду с масками первое значение — метка, и
+/// поиск «первого `response`» перешёл бы к следующему, по одному за повтор. Перед `response` —
+/// пробел или запятая (входят в совпадение): граница слова `\b` появилась бы и после метки
+/// (`‹secret›response=`), то есть только по виду с масками.
+static DIGEST_RESPONSE: LazyLock<Regex> = LazyLock::new(|| {
     rx(
-        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key)["']?\s*[:=]\s*(?:"([^"\r\n]{6,})"|'([^'\r\n]{6,})'|`([^`\r\n]{6,})`|([^\s"'`]{6,}))"#,
+        r#"(?i)[\s,]response\s*=\s*(?:\\?"([^"\\\r\n‹$<][^"\\\r\n‹]{5,})|([^\s,"\\‹$<][^\s,"\\‹]{5,}))"#,
     )
 });
 
@@ -368,49 +798,67 @@ fn url_token_masked(text: &str, r: &Range<usize>, masked_end: usize) -> String {
     out
 }
 
-/// Предел повторных сканов вида с масками в [`scan_secrets`]: каждый скан линеен, их число —
-/// константа. На практике хватает одного-двух (маска одного правила открывает находку другого).
+/// Предел обычных повторных сканов вида с масками в [`scan_secrets`]: каждый скан линеен, их
+/// число — константа. На практике хватает одного-двух (маска одного правила открывает находку
+/// другого). Повторы сверх предела расширяют находки (три ступени `WIDEN_STEPS`: до пробелов,
+/// строки, всего текста).
 pub const FIXPOINT_MAX: u32 = 4;
+
+/// Ступени расширения находок после [`FIXPOINT_MAX`] (задача 3 M7.1): находка повтора
+/// `FIXPOINT_MAX + 1` маскируется до пробелов вокруг, `+ 2` — вся строка, `+ 3` — весь текст
+/// ([`widen`]). Расширенная маска захватывает и звенья, которые открыл бы следующий повтор:
+/// цепочка находок кончается за постоянное число сканов, а весь текст под одной маской новых
+/// находок не даёт — неподвижная точка достигается всегда, и [`mask_text`] идемпотентна.
+const WIDEN_STEPS: u32 = 3;
 
 /// Итог скана [`scan_secrets_ext`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanOutcome {
     /// Находки — те же, что у [`scan_secrets`].
     pub hits: Vec<SecretHit>,
-    /// Повторных сканов по виду с масками ([`MaskedView`]), от 0 до [`FIXPOINT_MAX`]: 0 —
-    /// находок нет или вид из одних масок; 1 — первый повтор уже ничего не нашёл (обычный
-    /// текст с секретами).
+    /// Повторных сканов по виду с масками ([`MaskedView`]), от 0 до `FIXPOINT_MAX +
+    /// WIDEN_STEPS`: 0 — находок нет или вид из одних масок; 1 — первый повтор уже ничего не
+    /// нашёл (обычный текст с секретами). Последний повтор находок не дал (или вид — из одних
+    /// масок): скан дошёл до неподвижной точки.
     pub passes: u32,
-    /// Скан упёрся в [`FIXPOINT_MAX`]: все повторы давали находки, и ещё один повтор по виду
-    /// находит новые. Неподвижная точка не достигнута — [`mask_text`] на таком тексте не
-    /// идемпотентна (повторная маскировка заменит ещё что-то). Проверочный повтор в находки не
-    /// идёт: они те же, что у [`scan_secrets`].
+    /// Скан упёрся в [`FIXPOINT_MAX`]: обычные повторы не сошлись, и находки следующих повторов
+    /// расширены (до пробелов, строки или всего текста). Маскировка такого текста грубее
+    /// (вместе с секретом скрыт и соседний текст), но [`mask_text`] по-прежнему идемпотентна
+    /// (до задачи 3 M7.1 — не была). Предупреждение `secrets_scan_depth` сервера и клиента.
     pub depth_capped: bool,
 }
 
 /// Находит секреты. Результат отсортирован по началу, диапазоны не пересекаются
 /// (пересёкшиеся объединяются, вид берётся у первого), `line` считается с 1.
 ///
-/// Скан — до неподвижной точки (полный прогон перед слиянием M5.6, `mask_is_idempotent`):
+/// Скан — до неподвижной точки (полный прогон перед слиянием M5.6, `mask_text_idempotent`):
 /// после первого прохода по тексту все правила повторяются по [`MaskedView`] — тексту, каким его
 /// увидит повторная маскировка. Маска одного правила меняет контекст другого: убирает `://` из
 /// URL-токена кандидата энтропии (`Ahf_<34>‹secret›password=…postgres://…`), `/` и `"` из имени
 /// пользователя в URL (`s://x,Ab/<40>:пароль@h`), — и находка, которую иначе открыл бы только
 /// второй проход, маскируется сразу. Находки первого прохода остаются: вид их не отменяет
 /// (энтропия по тексту видит длинного кандидата целиком, по виду — обрывки между масками).
-/// Скан останавливается, когда вид не даёт находок, — тогда `mask_text` идемпотентна; не дольше
-/// [`FIXPOINT_MAX`] повторов (упор — [`scan_secrets_ext`]).
+/// Скан останавливается, когда вид не даёт находок (находка ровно на метке вида его не меняет),
+/// — тогда `mask_text` идемпотентна. Сверх [`FIXPOINT_MAX`] повторов находки расширяются
+/// (`WIDEN_STEPS`), поэтому неподвижная точка достигается всегда, не дольше чем за
+/// `FIXPOINT_MAX + WIDEN_STEPS` повторов (упор — [`scan_secrets_ext`]).
 pub fn scan_secrets(text: &str) -> Vec<SecretHit> {
     scan_secrets_ext(text).hits
 }
 
 /// [`scan_secrets`] с числом повторов скана и признаком упора в [`FIXPOINT_MAX`]
-/// ([`ScanOutcome`]). Упор стоит одного лишнего скана — только на таком тексте.
+/// ([`ScanOutcome`]).
 pub fn scan_secrets_ext(text: &str) -> ScanOutcome {
+    scan_to_fixpoint(text, FIXPOINT_MAX)
+}
+
+/// Скан до неподвижной точки: обычных повторов — не больше `limit`, дальше — расширение находок
+/// ([`WIDEN_STEPS`]). Предел — параметр ради юнит-тестов ступеней расширения: обычные входы в
+/// [`FIXPOINT_MAX`] укладываются.
+fn scan_to_fixpoint(text: &str, limit: u32) -> ScanOutcome {
     let mut raw = scan_rules(text);
     let mut passes = 0u32;
     let mut depth_capped = false;
-    // повторы `1..=FIXPOINT_MAX` дают находки; повтор `FIXPOINT_MAX + 1` — только проверка упора
     while !raw.is_empty() {
         let view = MaskedView::new(text, &raw);
         // вид из одних масок находок не даст (ни одно правило не совпадает внутри `‹secret›`):
@@ -418,20 +866,20 @@ pub fn scan_secrets_ext(text: &str) -> ScanOutcome {
         if view.all_masked() {
             break;
         }
-        let found = scan_rules(&view.text);
-        if passes == FIXPOINT_MAX {
-            depth_capped = !found.is_empty();
-            break;
-        }
+        let mut found = scan_rules(&view.text);
+        // находка ровно на метке вида его не меняет: повторная маскировка заменит метку меткой
+        found.retain(|(r, _)| view.text.get(r.clone()) != Some(SECRET_MARK));
         passes += 1;
         if found.is_empty() {
             break;
         }
-        raw.extend(
-            found
-                .into_iter()
-                .map(|(r, k)| (view.start_in_text(r.start)..view.end_in_text(r.end), k)),
-        );
+        // упор: обычные повторы не сошлись — находки расширяются, ступень за ступенью
+        let step = passes.saturating_sub(limit).min(WIDEN_STEPS);
+        depth_capped |= step > 0;
+        raw.extend(found.into_iter().map(|(r, k)| {
+            let r = widen(&view.text, r, step);
+            (view.start_in_text(r.start)..view.end_in_text(r.end), k)
+        }));
     }
     let merged = merge_ranges(raw);
     // номера строк одним проходом
@@ -475,6 +923,19 @@ fn scan_rules(text: &str) -> Vec<(Range<usize>, SecretKind)> {
             raw.push((v.range(), SecretKind::KeyValue));
         }
     }
+    ru_key_values(text, &mut raw);
+    for h in DIGEST_HEADER.find_iter(text) {
+        for c in DIGEST_RESPONSE.captures_iter(h.as_str()) {
+            if let Some(v) = (1..=2).find_map(|i| c.get(i))
+                && !is_placeholder(v.as_str())
+            {
+                raw.push((
+                    h.start() + v.start()..h.start() + v.end(),
+                    SecretKind::KeyValue,
+                ));
+            }
+        }
+    }
     for c in URL_PASSWORD.captures_iter(text) {
         if let Some(v) = c.get(1)
             && !is_placeholder(v.as_str())
@@ -507,6 +968,30 @@ fn merge_ranges(mut raw: Vec<(Range<usize>, SecretKind)>) -> Vec<(Range<usize>, 
         }
     }
     merged
+}
+
+/// Находка `r` в `text`, расширенная по ступени `step` ([`WIDEN_STEPS`]): 0 — как есть; 1 — до
+/// пробельных символов по обе стороны; 2 — до границ строки; 3 и больше — весь текст. Границы —
+/// на границах символов UTF-8.
+fn widen(text: &str, r: Range<usize>, step: u32) -> Range<usize> {
+    let (head, tail) = (&text[..r.start], &text[r.end..]);
+    let after = |i: usize| i + head[i..].chars().next().map_or(0, char::len_utf8);
+    match step {
+        0 => r,
+        1 => {
+            let s = head.rfind(char::is_whitespace).map_or(0, after);
+            let e = tail
+                .find(char::is_whitespace)
+                .map_or(text.len(), |i| r.end + i);
+            s..e
+        }
+        2 => {
+            let s = head.rfind('\n').map_or(0, |i| i + 1);
+            let e = tail.find('\n').map_or(text.len(), |i| r.end + i);
+            s..e
+        }
+        _ => 0..text.len(),
+    }
 }
 
 /// Текст, каким его увидит повторный проход маскировки: находки заменены [`SECRET_MARK`]
@@ -624,7 +1109,7 @@ fn entropy_hits(text: &str, others: &[Range<usize>]) -> Vec<Range<usize>> {
                 {
                     // окрестность имени — как во втором проходе, где значение уже заменено
                     // маской: иначе `://` замаскированного значения скрывает имя только в первом
-                    // проходе (CI 41605984321, `mask_is_idempotent`)
+                    // проходе (CI 41605984321, proptest `mask_text_idempotent`)
                     masked_end = Some(masked_span_end(&raw, others, r.start));
                     end = r.start;
                 }
@@ -667,5 +1152,82 @@ pub fn mask_text(text: &str) -> String {
         text.to_string()
     } else {
         mask_secrets(text, &hits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Псевдослучайная строка base62 (как `rnd` тестов крейта): секретов в исходнике нет.
+    fn rnd(len: usize, seed: u64) -> String {
+        const A: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut x = seed.wrapping_mul(6364136223846793005) | 1;
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                A[((x >> 33) % 62) as usize] as char
+            })
+            .collect()
+    }
+
+    /// Ступени расширения: до пробельных символов (в том числе не ASCII), до строки, весь текст.
+    #[test]
+    fn widen_steps() {
+        let t = "до\u{a0}ab cd\u{2003}ef gh\nij kl";
+        let at = t.find('d').unwrap();
+        let r = at..at + 1;
+        assert_eq!(widen(t, r.clone(), 0), r);
+        assert_eq!(&t[widen(t, r.clone(), 1)], "cd");
+        assert_eq!(&t[widen(t, r.clone(), 2)], "до\u{a0}ab cd\u{2003}ef gh");
+        assert_eq!(widen(t, r.clone(), 3), 0..t.len());
+        assert_eq!(widen(t, r, 7), 0..t.len());
+        // находка с краю текста
+        assert_eq!(widen("abc", 0..1, 1), 0..3);
+        assert_eq!(widen("abc", 2..3, 2), 0..3);
+    }
+
+    /// Задача 3 M7.1: упор в предел не ломает идемпотентность — при любом пределе обычных повторов
+    /// (здесь занижен, чтобы ступени расширения сработали на настоящих каскадах) скан доходит до
+    /// неподвижной точки не дольше чем за `предел + WIDEN_STEPS` повторов, маскировка его
+    /// находками повторно ничего не меняет, значения скрыты.
+    #[test]
+    fn widening_reaches_fixpoint_at_any_limit() {
+        let (r40, r20) = (rnd(40, 1), rnd(20, 2));
+        // каскады: маска энтропии открывает пароль в URL; цепочка «пароль в URL ↔ ключ-значение»
+        // фикстуры `scan_depth_capped.txt`; то же в строке среди обычного текста
+        let chain = format!("x://pwd=:`/{r40}@pwd=://{r20}\"pwd=:`@");
+        let cases = [
+            (format!("до s://x,Ab/{r40}:hunter22@h после"), "hunter22"),
+            (chain.clone(), r40.as_str()),
+            (
+                format!("первая строка\nтекст {chain} ещё\nпоследняя"),
+                r20.as_str(),
+            ),
+        ];
+        for limit in 0..=FIXPOINT_MAX {
+            for (t, secret) in &cases {
+                let o = scan_to_fixpoint(t, limit);
+                assert!(o.passes <= limit + WIDEN_STEPS, "{limit}: {} {t}", o.passes);
+                let once = mask_secrets(t, &o.hits);
+                assert!(!once.contains(secret), "{limit}: {once}");
+                let again = scan_to_fixpoint(&once, limit);
+                assert_eq!(mask_secrets(&once, &again.hits), once, "{limit}: {t}");
+                assert!(!again.depth_capped, "{limit}: {once}");
+            }
+        }
+        // предел 0: каскад сразу расширяется — до пробелов, соседние слова остаются
+        let (t, _) = &cases[0];
+        let o = scan_to_fixpoint(t, 0);
+        assert!(o.depth_capped);
+        assert_eq!(mask_secrets(t, &o.hits), format!("до {SECRET_MARK} после"));
+        let (t, _) = &cases[2];
+        let o = scan_to_fixpoint(t, 0);
+        let once = mask_secrets(t, &o.hits);
+        assert!(once.starts_with("первая строка\nтекст ") && once.ends_with(" ещё\nпоследняя"));
+        // обычный предел: цепочка фикстуры сходится без упора
+        assert!(!scan_to_fixpoint(&chain, FIXPOINT_MAX).depth_capped);
     }
 }

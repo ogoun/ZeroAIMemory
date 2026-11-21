@@ -793,6 +793,208 @@ async fn rules_version_bump_rescans_old_db_once() {
     assert_eq!(job_stats(&db).await.unwrap().queued, 0);
 }
 
+/// Задача 3 M7.1: правила сканера 3 (русские слова-ключи, значение только из hex) — база,
+/// проверенная правилами 2 (`secrets_scanned_v2/v3 = '2'`), с заметкой и записью «токен: <hex>»
+/// при открытии перемаскирована: в чанках `‹secret›` вместо значения, флаги — 3.
+#[tokio::test]
+async fn remask_on_rules_v3() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("secrets-rules-v3");
+    let _ = std::fs::remove_dir_all(&dir);
+    let dd = DataDir::open(&dir).unwrap();
+    let user = Id::new();
+    // 64 hex — типичный токен; собран из частей (push protection)
+    let tok = ["9f3a", "c1d2", "e4b5"].concat().repeat(5) + "a1b2";
+    assert_eq!(tok.len(), 64);
+    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    let k = knowledge(&db).await;
+    let note = note_in(&db, k, "ops/api", format!("# API\n\nтокен: {tok}\n")).await;
+    let entry = create_entry(
+        &db,
+        NewEntry {
+            refs: None,
+            space_id: k,
+            kind: EntryKind::Insight,
+            title: "Токен в логе".into(),
+            body: format!("в логе был токен: {tok}"),
+            data: json!({"kind": "gotcha"}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: Some(Certainty::Hypothesis),
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &Attribution::new(AuthorKind::Agent),
+    )
+    .await
+    .unwrap()
+    .0
+    .id;
+    // имитация базы правил 2: флаги '2', значение в чанках открыто (как его оставили правила 2)
+    let old = tok.clone();
+    db.write(move |tx| {
+        tx.execute(
+            "UPDATE meta SET value = '2' WHERE key IN (?1, ?2)",
+            [FLAG, FLAG_V3],
+        )?;
+        tx.execute(
+            "UPDATE chunks SET text = replace(text, ?2, ?1) WHERE instr(text, ?2) > 0",
+            [old.as_str(), zam_markdown::SECRET_MARK],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let like = format!("%{tok}%");
+    let open_in = |db: Db, col: &'static str, id: Id| {
+        let like = like.clone();
+        async move {
+            db.read(move |c| {
+                Ok(c.query_row(
+                    &format!("SELECT count(*) FROM chunks WHERE {col} = ?1 AND text LIKE ?2"),
+                    rusqlite::params![id, like],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap()
+        }
+    };
+    assert!(
+        open_in(db.clone(), "node_id", note).await > 0,
+        "значение открыто в заметке"
+    );
+    assert!(
+        open_in(db.clone(), "entry_id", entry).await > 0,
+        "и в записи"
+    );
+    drain(&db).await;
+    drop(db);
+
+    let dbs = UserDbs::new(dd.users_dir());
+    let db = dbs.get(user).await.unwrap();
+    dbs.wait_rechunk(user).await;
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM chunks WHERE text LIKE ?1", like).await,
+        0,
+        "значение убрано из chunks"
+    );
+    assert_eq!(fts_hits(&db, &tok).await, 0, "и из FTS");
+    for (kind, col, id) in [("node", "node_id", note), ("entry", "entry_id", entry)] {
+        assert_eq!(
+            job_of(&db, kind, id).await.as_deref(),
+            Some("upsert"),
+            "{kind}"
+        );
+        let marked: i64 = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    &format!(
+                        "SELECT count(*) FROM chunks WHERE {col} = ?1 AND instr(text, ?2) > 0"
+                    ),
+                    rusqlite::params![id, SECRET_MARK],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(marked > 0, "{kind}: ‹secret› в чанках");
+    }
+    for flag in [FLAG, FLAG_V3] {
+        assert_eq!(meta_value(&db, flag).await, "3", "{flag}");
+    }
+}
+
+/// Задача 3 M7.1, шаг 5: цена перемаскировки по правилам 3 на базе размера рабочего сервера —
+/// 2 000 записей (1 000 заметок и 1 000 записей журнала), у каждой десятой «токен: <hex>» в
+/// сохранённом открыт, флаги — '2'. Открытие базы перепроверку не ждёт. `cargo test -p zam-store
+/// --release --test secrets_rescan -- --ignored remask_v3_timing_2000 --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn remask_v3_timing_2000() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("secrets-v3-timing");
+    let _ = std::fs::remove_dir_all(&dir);
+    let dd = DataDir::open(&dir).unwrap();
+    let user = Id::new();
+    let tok = ["9f3a", "c1d2", "e4b5"].concat().repeat(5) + "a1b2";
+    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    let k = knowledge(&db).await;
+    const N: usize = 1000;
+    let body = "Обычный абзац заметки про архитектуру памяти и поиск. ".repeat(20);
+    let attrib = Attribution::new(AuthorKind::Agent);
+    for i in 0..N {
+        let extra = if i % 10 == 0 {
+            format!("\n\nтокен: {tok}\n")
+        } else {
+            String::new()
+        };
+        note_in(
+            &db,
+            k,
+            &format!("n/{}/note{i}", i % 50),
+            format!("# Заметка {i}\n\n{body}{extra}"),
+        )
+        .await;
+        create_entry(
+            &db,
+            NewEntry {
+                refs: None,
+                space_id: k,
+                kind: EntryKind::Insight,
+                title: format!("Запись {i}"),
+                body: format!("{body}{extra}"),
+                data: json!({"kind": "discovery"}),
+                area: None,
+                tags: Vec::new(),
+                status: None,
+                certainty: Some(Certainty::Hypothesis),
+                idempotency_key: None,
+                triggers: Vec::new(),
+                links: Vec::new(),
+            },
+            &attrib,
+        )
+        .await
+        .unwrap();
+    }
+    let old = tok.clone();
+    db.write(move |tx| {
+        tx.execute(
+            "UPDATE meta SET value = '2' WHERE key IN (?1, ?2)",
+            [FLAG, FLAG_V3],
+        )?;
+        tx.execute(
+            "UPDATE chunks SET text = replace(text, ?2, ?1)",
+            [old.as_str(), zam_markdown::SECRET_MARK],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    drain(&db).await;
+    let chunks = count(
+        &db,
+        "SELECT count(*) FROM chunks WHERE ?1 = ?1",
+        String::new(),
+    )
+    .await;
+    drop(db);
+    let dbs = UserDbs::new(dd.users_dir());
+    let t0 = std::time::Instant::now();
+    let db = dbs.get(user).await.unwrap();
+    let open = t0.elapsed();
+    dbs.wait_rechunk(user).await;
+    let total = t0.elapsed();
+    let queued = job_stats(&db).await.unwrap().queued;
+    println!(
+        "записей {}, чанков {chunks}: открытие {open:?}, перепроверка до конца {total:?}, заданий {queued}",
+        2 * N
+    );
+    assert_eq!(queued, (2 * N / 10) as i64);
+    assert_eq!(meta_value(&db, FLAG).await, "3");
+}
+
 /// Повторное ревью 15b, M4: база открыта более новым сервером (флаги `RULES_VERSION + 1`) —
 /// откат сервера ничего не перепроверяет и флаги не уменьшает.
 #[tokio::test]
