@@ -835,6 +835,27 @@ fn ru_key_value_masked_and_guards() {
         ("api-ключ", ["sk1", "testx"].concat()),
         ("токена", ["kx7", "qpmzt"].concat()),
         ("пароля", ["123456", "Qwer"].concat()),
+        // ревью круга 3, п. 1: «буквы + цифры + буквы» вне белого списка — значения
+        ("пароля", ["oauth2", "pass"].concat()),
+        ("токена", ["base64", "abc"].concat()),
+        ("токена", ["hs256", "key"].concat()),
+        ("пароля", ["pass2", "word"].concat()),
+        ("пароля", ["admin2", "pass"].concat()),
+        ("секрета", ["secret22", "ab"].concat()),
+        ("пароля", ["hunter22", "pw"].concat()),
+        ("паролем", ["mypass", "99xy"].concat()),
+        ("пароля", ["md5", "hash"].concat()),
+        ("токена", ["v2", "beta"].concat()),
+        // п. 3: белый список — целым словом
+        ("пароля", ["sha256", "secret"].concat()),
+        ("пароля", ["Sha256", "Secret"].concat()),
+        ("пароля", ["sha-256", "secret"].concat()),
+        ("токена", ["utf8mb4", "x"].concat()),
+        // п. 2: единица числа — из закрытого списка
+        ("пароля", ["123456", "qwer"].concat()),
+        ("пароля", ["1234", "pass"].concat()),
+        ("пароля", ["2024", "love"].concat()),
+        ("ключ API", ["12345", "abc"].concat()),
     ] {
         let t = format!("Значение {form}: {value}");
         let want = format!("Значение {form}: {SECRET_MARK}");
@@ -922,6 +943,18 @@ fn ru_key_value_masked_and_guards() {
         "rsa4096",
         "OAuth2",
         "EdDSA",
+        "argon2id",
+        "base64url",
+        // ревью круга 3, п. 3: написания с дефисом, точкой, подчёркиванием
+        "SHA-256",
+        "UTF-8",
+        "AES-256",
+        "RSA-2048",
+        "X.509",
+        "P-256",
+        "HMAC-SHA256",
+        "PBKDF2-SHA256",
+        "SHA3_512",
     ] {
         for form in [
             "Хэш пароля",
@@ -933,9 +966,11 @@ fn ru_key_value_masked_and_guards() {
             assert!(scan_secrets(&t).is_empty(), "{t}: {:?}", scan_secrets(&t));
         }
     }
-    // ревью круга 2, п. 2: единицы размера после числа — проза
+    // ревью кругов 2–3: число с единицей из закрытого списка — проза (значения от 5 символов, иначе
+    // правило не совпадает вовсе): размеры в любом регистре, время, частота, экран
     for size in [
-        "512KB", "1024MB", "16GB", "2TB", "512KiB", "2GiB", "512Мб", "4096Кб", "2048ТБ",
+        "512KB", "512kB", "1024MB", "16384GB", "2048TB", "512KiB", "1024GiB", "512Мб", "512мБ",
+        "4096Кб", "2048ТБ", "3600с", "2048bit", "1500ms", "120fps", "1920px", "10000rps",
     ] {
         let t = format!("Размер токена: {size}");
         assert!(scan_secrets(&t).is_empty(), "{t}: {:?}", scan_secrets(&t));

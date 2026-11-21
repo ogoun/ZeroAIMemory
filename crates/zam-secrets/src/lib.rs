@@ -446,10 +446,14 @@ fn is_punct(c: char) -> bool {
 
 /// Имена алгоритмов и кодировок — проза после косвенных форм, без учёта регистра («Хэш пароля:
 /// sha256», «Формат токена: base64», «Алгоритм токена: HS256», «Тип токена: OAuth2») **[решение
-/// координатора, круг 3]**:
+/// координатора, круг 3]**. Сравнение — целым словом без `-`, `.`, `_` ([`is_prose_term`]):
+/// `SHA-256`, `UTF-8`, `X.509`, `P-256`, `HMAC-SHA256` — тоже проза, `sha-256secret` — значение
+/// (круг 4).
 /// - хэши: `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, `sha3`, `sha3-224`, `sha3-256`,
-///   `sha3-384`, `sha3-512`, `md5`, `blake2`, `blake2b`, `blake2s`, `blake3`;
-/// - хэширование паролей: `argon2`, `argon2i`, `argon2d`, `argon2id`, `pbkdf2`, `bcrypt`, `scrypt`;
+///   `sha3-384`, `sha3-512`, `md5`, `blake2`, `blake2b`, `blake2s`, `blake3`, `hmacsha256`,
+///   `hmacsha512`;
+/// - хэширование паролей: `argon2`, `argon2i`, `argon2d`, `argon2id`, `pbkdf2`, `pbkdf2sha256`,
+///   `bcrypt`, `scrypt`;
 /// - кодировки: `base32`, `base58`, `base64`, `base64url`, `utf8`, `utf8mb4`, `utf16`;
 /// - подписи JWT: `hs256`, `hs384`, `hs512`, `rs256`, `rs384`, `rs512`, `es256`, `es384`, `es512`,
 ///   `ps256`, `ps384`, `ps512`;
@@ -471,11 +475,14 @@ const RU_PROSE_TERMS: &[&str] = &[
     "blake2b",
     "blake2s",
     "blake3",
+    "hmacsha256",
+    "hmacsha512",
     "argon2",
     "argon2i",
     "argon2d",
     "argon2id",
     "pbkdf2",
+    "pbkdf2sha256",
     "bcrypt",
     "scrypt",
     "base32",
@@ -510,6 +517,19 @@ const RU_PROSE_TERMS: &[&str] = &[
     "oauth2",
 ];
 
+/// Слово `w` — имя из [`RU_PROSE_TERMS`]: целиком, без учёта регистра ASCII и без `-`, `.`, `_`
+/// с обеих сторон сравнения (`SHA-256` = `sha256`, `sha3-256` = `SHA3_256`).
+fn is_prose_term(w: &str) -> bool {
+    let norm = |s: &str| {
+        s.bytes()
+            .filter(|b| !matches!(b, b'-' | b'.' | b'_'))
+            .map(|b| b.to_ascii_lowercase())
+            .collect::<Vec<u8>>()
+    };
+    let w = norm(w);
+    RU_PROSE_TERMS.iter().any(|t| norm(t) == w)
+}
+
 /// Значение без кавычек после русского слова-ключа — проза, а не секрет (знаки препинания `\p{P}`
 /// по краям не в счёт: «Токен: «одноразовый»», «Токен: устарел.») [решение координатора, ревью
 /// задачи 3 M7.1]:
@@ -518,15 +538,24 @@ const RU_PROSE_TERMS: &[&str] = &[
 ///   значение («пароль: admin»), смешанный регистр — тоже («пароль: ПарольДляВхода»);
 /// - после косвенных форм и `ключ API`, `api-ключ` — слово из букв любой письменности и любого
 ///   регистра («Тип токена: Bearer», «Тип токена: OAuth», «API-ключ: managed»; ревью круга 1,
-///   п. 2); число с `.`/`,` и необязательной единицей — строчной, размера (`KB`…`TB`,
-///   `KiB`…`TiB`, `КБ`/`Кб`…`ТБ`/`Тб`) — или знаком валюты («Стоимость токена: 0,00002 $»,
-///   «512KB»; `123456Qwer` — значение); имя алгоритма или кодировки ([`RU_PROSE_TERMS`]) и
-///   термин ([`ru_term`]).
+///   п. 2), имя алгоритма или кодировки ([`is_prose_term`]) и число с `.`/`,` — без единицы, с
+///   единицей из закрытого списка (времени, размера, экрана, частоты) или со знаком валюты
+///   («Стоимость токена: 0,00002 $», «Размер токена: 512KB», «Срок токена: 3600с») **[решение
+///   координатора, круг 4]**. Слова «буквы + цифры» вне списка — значения (`oauth2pass`,
+///   `hunter2x`, `md5hash`), как и число с другой единицей (`123456qwer`, `2024love`).
 ///
 /// Значение в кавычках — всегда значение.
 fn ru_prose_value(v: &str, indirect: bool) -> bool {
     static NUMBER: LazyLock<Regex> = LazyLock::new(|| {
-        rx(r"^[+\-−]?\d+(?:[.,]\d+)*(?:[%‰]|\p{Sc}|\p{Ll}{1,4}|[KMGT]i?B|[КМГТ][Бб])?$")
+        rx(concat!(
+            r"^[+\-−]?\d+(?:[.,]\d+)*(?:[%‰]|\p{Sc}",
+            // время, размер, экран, частота
+            r"|с|мс|мкс|мин|ч|дн|нед|мес|г|бит|байт|s|ms|us|ns|min|h|d|bit|bits|byte|bytes",
+            r"|px|pt|em|rem|fps|rps|qps|rpm",
+            // размеры — без учёта регистра: `KB`, `kB`, `KiB`, `МБ`, `Мб`, `мБ`…
+            r"|(?i:[kmgt]i?b|[кмгт]б)",
+            r")?$",
+        ))
     });
     let w = v.trim_matches(is_punct);
     // слово из букв (части через дефис)
@@ -534,10 +563,7 @@ fn ru_prose_value(v: &str, indirect: bool) -> bool {
         && w.split('-')
             .all(|p| !p.is_empty() && p.chars().all(char::is_alphabetic));
     if indirect {
-        return letters
-            || RU_PROSE_TERMS.iter().any(|t| w.eq_ignore_ascii_case(t))
-            || ru_term(w)
-            || NUMBER.is_match(w);
+        return letters || is_prose_term(w) || NUMBER.is_match(w);
     }
     // именительная форма: строчное или с заглавной первой, с кириллицей
     letters
@@ -545,36 +571,6 @@ fn ru_prose_value(v: &str, indirect: bool) -> bool {
             .all(|p| p.chars().skip(1).all(|c| !c.is_uppercase()))
         && w.chars()
             .any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'))
-}
-
-/// Термин после косвенной формы — проза: строчные латинские буквы, одна группа цифр внутри и не
-/// меньше двух букв с каждой стороны, до 10 символов, не только hex («Хэш пароля: argon2id»,
-/// «Формат токена: base64url») [решение исполнителя, круг 1]. Одиночная цифра из 0, 1, 3, 4, 5, 7 —
-/// замена буквы в пароле, признак значения: `passw0rd`, `p4ssword`, `s3cret`, `letme1n`,
-/// `kx7qpmzt` маскируются **[решение координатора, круг 2]**. Буква после цифр одна
-/// (`hunter2x`) — тоже значение [решение исполнителя, круг 2: так `hunter2x` из примеров
-/// координатора маскируется, а `argon2id` — нет].
-fn ru_term(w: &str) -> bool {
-    let b = w.as_bytes();
-    if b.len() > 10
-        || !b
-            .iter()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        || b.iter().all(u8::is_ascii_hexdigit)
-    {
-        return false;
-    }
-    let (Some(ds), Some(de)) = (
-        b.iter().position(u8::is_ascii_digit),
-        b.iter().rposition(u8::is_ascii_digit),
-    ) else {
-        return false;
-    };
-    let digits = &b[ds..=de];
-    digits.iter().all(u8::is_ascii_digit)
-        && ds >= 2
-        && b.len() - de > 2
-        && !(digits.len() == 1 && b"013457".contains(&digits[0]))
 }
 
 /// Заголовок `Authorization: Digest …` (и `Proxy-Authorization:`, в том числе в JSON с `\"`) —
