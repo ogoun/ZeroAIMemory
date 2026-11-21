@@ -44,7 +44,7 @@ pub use url::UrlTo;
 use serde_json::Value;
 
 use super::hook;
-use super::{home_dir, missing_token, zam_env};
+use super::{home_dir, missing_token, unbound_token_note, zam_env};
 use crate::client::{CliError, Client, read_json};
 use crate::locate::{self, Flags, Source};
 use crate::target::{self, Solution};
@@ -583,11 +583,16 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     } else {
         migrated.as_ref().map(|(t, _)| t.clone())
     };
-    // `url` верхнего уровня (адрес для каталогов без своего) пишет только `--url-to home`
-    let top_url = url_to == UrlTo::Home;
+    // `url` верхнего уровня (адрес для каталогов без своего): block — если его нет, home — этот,
+    // local — не трогается
+    let top = match url_to {
+        UrlTo::Block => locate::TopUrl::IfAbsent,
+        UrlTo::Home => locate::TopUrl::Set,
+        UrlTo::Local => locate::TopUrl::Keep,
+    };
     let home_plan = match &candidate {
         Some(t) => {
-            locate::plan_home(&home, &url.value, t, forced, top_url).map_err(CliError::config)?
+            locate::plan_home(&home, &url.value, t, forced, top).map_err(CliError::config)?
         }
         None => locate::HomePlan::Unchanged,
     };
@@ -696,6 +701,13 @@ pub fn run(o: Opts) -> Result<(), CliError> {
              (заменить: zam init --token <токен>)"
         ),
         locate::HomePlan::Unchanged => {}
+    }
+    if let locate::HomePlan::Write {
+        unbound_left: Some(mask),
+        ..
+    } = &home_plan
+    {
+        eprintln!("предупреждение: {}", unbound_token_note(mask, None));
     }
     if let (Some((_, first)), Some(other)) = (&migrated, differs) {
         eprintln!(

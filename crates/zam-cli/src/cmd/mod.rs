@@ -193,6 +193,22 @@ pub fn missing_token(url: &str, elsewhere: bool) -> CliError {
     }
 }
 
+/// Ключ без адреса в домашнем конфиге (`token` без `url`, [`locate::UnboundToken`]) и команда
+/// привязки: `used_for` — адрес, на который он сейчас уходит (записей `[servers]` нет, как в
+/// 0.0.13-m6.6); `None` — он больше не используется. `mask` — маска ключа, сам ключ не печатается.
+pub fn unbound_token_note(mask: &str, used_for: Option<&str>) -> String {
+    match used_for {
+        Some(url) => format!(
+            "в ~/.zeroaimemory/config.toml ключ без адреса ({mask}): пока ключей [servers] нет, он \
+             уходит на любой адрес — привяжите: zam init --url {url} --token <токен>"
+        ),
+        None => format!(
+            "в ~/.zeroaimemory/config.toml ключ без адреса ({mask}) больше не используется (ключи \
+             хранятся по адресам) — привяжите: zam init --url <адрес его сервера> --token <токен>"
+        ),
+    }
+}
+
 /// Подключение команды заметок.
 pub struct Ctx {
     pub client: Client,

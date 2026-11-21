@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use super::{home_dir, missing_token, zam_env};
+use super::{home_dir, missing_token, unbound_token_note, zam_env};
 use crate::client::{EXIT_CONFIG, EXIT_TOKEN, EXIT_UNREACHABLE, Timeouts, agent};
 use crate::locate::{self, Flags, Found};
 use crate::target::Solution;
@@ -45,6 +45,11 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
     if let Err(e) = locate::check_url(&url.value) {
         eprintln!("{e}");
         return EXIT_CONFIG;
+    }
+    // ключ без адреса в домашнем конфиге — примечание с командой привязки (M7 §4.4)
+    if let Some(u) = &r.unbound_token {
+        let used = u.used.then_some(url.value.as_str());
+        eprintln!("примечание: {}", unbound_token_note(&u.mask, used));
     }
     // в домашнем конфиге токены только других адресов — ошибка настройки до сети (M7 §4.4)
     if r.token.is_none() && r.other_server_keys {

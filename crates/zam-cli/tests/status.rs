@@ -341,6 +341,40 @@ async fn status_names_server_token_source() {
     assert!(!s.contains(&token) && !err(&o).contains(&token));
 }
 
+/// M7 §4.4 (решение координатора): ключ без адреса (`token` без `url`) и пустой `[servers]` —
+/// ключ уходит на адрес проекта, как в 0.0.13-m6.6; примечание с командой привязки, без ключа.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_uses_unbound_token_with_note() {
+    let (url, token) = start("unbound").await;
+    let o = tokio::task::spawn_blocking({
+        let (url, token) = (url.clone(), token.clone());
+        move || {
+            let mut c = zam("unbound");
+            with_home(
+                &mut c,
+                "unbound-home",
+                &format!("token = \"{token}\"\n\n[servers]\n"),
+            );
+            c.args(["status", "--url", &url]).output().unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    let (s, e) = (out(&o), err(&o));
+    assert_eq!(o.status.code(), Some(0), "{s}{e}");
+    assert!(
+        s.contains("Источник токена: ~/.zeroaimemory/config.toml\n"),
+        "{s}"
+    );
+    assert!(
+        e.contains("ключ без адреса")
+            && e.contains(&format!("привяжите: zam init --url {url} --token")),
+        "{e}"
+    );
+    assert!(e.contains(&zam_core::mask_token(&token)), "{e}");
+    assert!(!s.contains(&token) && !e.contains(&token));
+}
+
 /// M7 §4.4: адрес без ключа, а в домашнем конфиге — ключ другого сервера: код 1 до сети с
 /// подсказкой `zam init --url <адрес> --token`; ключ другого сервера не отправляется и не
 /// печатается — у `zam status` и у команд заметок.
