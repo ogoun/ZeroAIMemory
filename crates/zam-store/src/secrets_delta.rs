@@ -283,11 +283,14 @@ pub(crate) async fn apply(db: &Db, d: Delta) -> Result<DeltaStats, StoreError> {
                         .query_row([id], |r| r.get(0))
                         .optional()?;
                     let Some(l0) = row else { continue };
+                    // в счётчик — только переписанное: L0 замаскирован или поставлена свёртка
+                    let mut rewritten = false;
                     if let Some(l0) = l0 {
                         let m = mask_text(&l0);
                         if m != l0 {
                             tx.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
                                 .execute(params![id, m])?;
+                            rewritten = true;
                         }
                     }
                     // точка папки — свёрткой: её запускает `upsert` живой заметки внутри. У папки
@@ -314,8 +317,9 @@ pub(crate) async fn apply(db: &Db, d: Delta) -> Result<DeltaStats, StoreError> {
                             PRIORITY_REINDEX,
                             &now,
                         )?;
+                        rewritten = true;
                     }
-                    n += 1;
+                    n += u64::from(rewritten);
                 }
                 Ok(n)
             })
@@ -491,8 +495,14 @@ mod tests {
         )
         .await
         .unwrap();
-        db.write(|tx| {
+        // у папки, чьи заметки в корзине, — прежняя свёртка L0 с незамаскированным значением
+        let l0 = format!("n: pwd=`{pw}`");
+        db.write(move |tx| {
             tx.execute("DELETE FROM index_jobs", [])?;
+            tx.execute(
+                "UPDATE nodes SET l0 = ?2 WHERE id = ?1",
+                params![trashed_dir, l0],
+            )?;
             Ok(())
         })
         .await
@@ -511,7 +521,22 @@ mod tests {
             "префикс чанков живой заметки замаскирован: {d:?}"
         );
         let st = apply(&db, d).await.unwrap();
-        assert_eq!(st.folders, 2, "находки в счётчике перепроверки");
+        // в счётчике — только переписанное: L0 папки с корзиной; пустая папка без L0 не считается
+        assert_eq!(st.folders, 1, "переписанные папки");
+        let masked: String = db
+            .read(move |c| {
+                Ok(
+                    c.query_row("SELECT l0 FROM nodes WHERE id = ?1", [trashed_dir], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            !masked.contains(&pw) && masked.contains(zam_markdown::SECRET_MARK),
+            "{masked}"
+        );
         assert_eq!(
             crate::job_stats(&db).await.unwrap().queued,
             0,

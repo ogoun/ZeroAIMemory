@@ -191,6 +191,10 @@ pub fn atoms() -> Vec<String> {
             "пароль=",
             "паролем ",
             "Authorization: Digest response=",
+            // ревью задачи 3: разметка Markdown вокруг ключа, проза после косвенной формы
+            "**",
+            "»: ",
+            "Тип токена: ",
         ]
         .map(String::from),
     );

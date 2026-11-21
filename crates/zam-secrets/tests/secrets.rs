@@ -433,6 +433,76 @@ fn bench_scan_100kb() {
     assert!(per.as_millis() <= 2, "бюджет 2 мс превышен: {per:?}");
 }
 
+/// Бюджет на плотной русской прозе со словами-ключами без находок (ревью задачи 3 M7.1, Minor 1:
+/// русское правило не должно отключать префильтр литералов): не больше 2 мс на 100 КБ (release).
+/// `cargo test -p zam-secrets --release --test secrets -- --ignored bench_scan_100kb_ru
+/// --nocapture`.
+#[test]
+#[ignore]
+fn bench_scan_100kb_ru() {
+    let mut text = String::new();
+    let mut i = 0u64;
+    while text.len() < 100 * 1024 {
+        text.push_str(&format!(
+            "Заметка {i}: токен и пароль хранятся в Vault, секрет не пишем; токенов: 1500, \
+             ключ идемпотентности: abc123, тип токена: opaque, пароль: хранится, API-ключ: \
+             managed, обычный текст про архитектуру памяти.\n"
+        ));
+        i += 1;
+    }
+    assert!(scan_secrets(&text).is_empty(), "проза без находок");
+    let n = 20;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        std::hint::black_box(scan_secrets(&text));
+    }
+    let per = t.elapsed() / n;
+    println!(
+        "scan_secrets (русская проза): {per:?} на {} байт",
+        text.len()
+    );
+    assert!(per.as_millis() <= 2, "бюджет 2 мс превышен: {per:?}");
+}
+
+/// Ревью задачи 3 M7.1, Minor 2: сканер работает по сырому Markdown — разметка вокруг слова-ключа
+/// (`**Пароль:**`, `**Пароль**:`, `*token*:`, `__Пароль__:`) и кавычки `«»`/`"` вокруг него не
+/// мешают, у русских и английских ключей. Таблицы (`| Пароль | X |`) — нет (→ M7, отдельная
+/// задача, журнал этапа).
+#[test]
+fn markdown_key_labels_masked() {
+    let pw = ["Sx9", "kQ2", "vLm", "7Rt"].concat();
+    let m = SECRET_MARK;
+    for (t, want) in [
+        (format!("**Пароль:** {pw}"), format!("**Пароль:** {m}")),
+        (format!("**Пароль**: {pw}"), format!("**Пароль**: {m}")),
+        (format!("__Токен__: {pw}"), format!("__Токен__: {m}")),
+        (format!("«Токен»: {pw}"), format!("«Токен»: {m}")),
+        (
+            format!("\"секрет\": \"{pw}\""),
+            format!("\"секрет\": \"{m}\""),
+        ),
+        (
+            format!("- *ключ API*: `{pw}`"),
+            format!("- *ключ API*: `{m}`"),
+        ),
+        (format!("**Password:** {pw}"), format!("**Password:** {m}")),
+        (format!("*token*: {pw}"), format!("*token*: {m}")),
+        (format!("__api_key__ = {pw}"), format!("__api_key__ = {m}")),
+    ] {
+        assert_eq!(one(&t), SecretKind::KeyValue, "{t}");
+        assert_eq!(mask_text(&t), want, "{t}");
+        assert_eq!(mask_text(&want), want, "идемпотентно: {t}");
+    }
+    // разметка без значения и проза — по-прежнему не секреты
+    for t in [
+        "**Пароль:** хранится в Vault",
+        "**Тип токена:** Bearer",
+        "*token*: <your-token>",
+    ] {
+        assert!(scan_secrets(t).is_empty(), "{t}: {:?}", scan_secrets(t));
+    }
+}
+
 /// Регрессия (CI 41605984321): `://` замаскированного значения не должен скрывать длинное имя
 /// слева только в первом проходе.
 #[test]
@@ -724,6 +794,28 @@ fn ru_key_value_masked_and_guards() {
             format!("подписан токеном \"{SECRET_MARK}\""),
         ),
         (format!("паролем: {pw}"), format!("паролем: {SECRET_MARK}")),
+        // ревью задачи 3: после именительного латинское слово — значение («пароль: admin» —
+        // настоящий пароль), смешанный регистр — тоже; неразрывный пробел — тоже пробел
+        (
+            "пароль: admin".to_string(),
+            format!("пароль: {SECRET_MARK}"),
+        ),
+        (
+            format!("токен: abcdef{}", "12"),
+            format!("токен: {SECRET_MARK}"),
+        ),
+        (
+            "пароль: ПарольДляВхода".to_string(),
+            format!("пароль: {SECRET_MARK}"),
+        ),
+        (
+            format!("пароль:\u{a0}{pw}"),
+            format!("пароль:\u{a0}{SECRET_MARK}"),
+        ),
+        (
+            format!("ключ\u{a0}API\u{202f}=\u{a0}{v}"),
+            format!("ключ\u{a0}API\u{202f}=\u{a0}{SECRET_MARK}"),
+        ),
     ];
     for (t, want) in &cases {
         assert_eq!(one(t), SecretKind::KeyValue, "{t}");
@@ -748,9 +840,19 @@ fn ru_key_value_masked_and_guards() {
         // «паролем» без кавычек и без разделителя — проза, а не значение
         "войти с паролем администратора".to_string(),
         "подписан токеном доступа".to_string(),
-        // проза после двоеточия: одно слово кириллицей — не значение
+        // проза после двоеточия: одно слово кириллицей — не значение (знаки по краям не в счёт)
         "Пароль: хранится в Vault".to_string(),
         "Токен: устарел.".to_string(),
+        "Токен: «одноразовый»".to_string(),
+        // ревью задачи 3: после косвенных форм и «ключ API» — ещё латинское слово, число и
+        // термин с одной группой цифр (в том числе примеры из репозитория)
+        "Тип токена: Bearer".to_string(),
+        "Хэш пароля: argon2id".to_string(),
+        "Формат токена: base64url".to_string(),
+        "Стоимость токена: 0,00002 $".to_string(),
+        "`zam insight certify` обычным токеном: theorem — с доказательством".to_string(),
+        "API-ключ: managed — случайный ключ этого запуска".to_string(),
+        "Срок токена: 3600с, размер ключа API: 2048bit".to_string(),
         // значение — только на той же строке: «…токен:» в конце строки вводит блок ниже
         format!("В логе нашёлся токен:\n{pw}"),
         format!("пароль =\n\n`{pw}`"),

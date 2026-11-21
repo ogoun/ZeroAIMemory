@@ -8,7 +8,7 @@
 //! и WARN в журнал сервера без текста находок (число находок и повторов, длина текста).
 
 use serde_json::{Value, json};
-use zam_markdown::scan_secrets_ext;
+use zam_markdown::{ScanOutcome, scan_secrets_ext};
 use zam_store::Entry;
 
 /// Предупреждение в массиве `warnings`.
@@ -27,7 +27,13 @@ pub const SECRETS_HINT: &str = "В тексте найдены значения,
 /// Добавляет в ответ-объект `v` предупреждение и список находок по тексту `text`;
 /// без находок ответ не меняется.
 pub fn attach(v: &mut Value, text: &str) {
-    let scan = scan_secrets_ext(text);
+    attach_scan(v, text.len(), scan_secrets_ext(text));
+}
+
+/// [`attach`] по готовому итогу скана текста длиной `text_bytes`: сам текст сюда не передаётся,
+/// поэтому WARN упора без текста находок по построению. Отдельно от [`attach`] — ради теста этого
+/// свойства: входа, который упирается в предел, с задачи 3 M7.1 нет (ревью, Minor 5).
+pub fn attach_scan(v: &mut Value, text_bytes: usize, scan: ScanOutcome) {
     let hits = scan.hits;
     if hits.is_empty() {
         return;
@@ -37,7 +43,7 @@ pub fn attach(v: &mut Value, text: &str) {
         tracing::warn!(
             hits = hits.len(),
             passes = scan.passes,
-            text_bytes = text.len(),
+            text_bytes,
             "сканер секретов упёрся в предел повторов (secrets_scan_depth)"
         );
     }

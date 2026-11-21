@@ -301,10 +301,8 @@ async fn scan_depth_fixture_no_warning() {
     assert_eq!(n["warnings"], json!(["secrets_detected"]), "{n}");
 }
 
-/// Задача 3 M7.1: на входе упора правил M6 сервер больше не пишет WARN `secrets_scan_depth` (скан
-/// сходится), ответ — только `secrets_detected`.
-#[test]
-fn scan_depth_fixture_not_logged() {
+/// Журнал сервера в буфер (подписчик `tracing` на время `f`).
+fn captured_log(f: impl FnOnce()) -> String {
     use std::sync::{Arc, Mutex};
     #[derive(Clone, Default)]
     struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -328,10 +326,58 @@ fn scan_depth_fixture_not_logged() {
         .with_writer(buf.clone())
         .with_ansi(false)
         .finish();
+    tracing::subscriber::with_default(sub, f);
+    String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+}
+
+/// Задача 3 M7.1: на входе упора правил M6 сервер больше не пишет WARN `secrets_scan_depth` (скан
+/// сходится), ответ — только `secrets_detected`.
+#[test]
+fn scan_depth_fixture_not_logged() {
     let t = depth_capped_text();
     let mut v = json!({});
-    tracing::subscriber::with_default(sub, || zam_server::api::secrets::attach(&mut v, &t));
-    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    let log = captured_log(|| zam_server::api::secrets::attach(&mut v, &t));
     assert!(!log.contains("secrets_scan_depth"), "{log}");
     assert_eq!(v["warnings"], json!(["secrets_detected"]), "{v}");
+}
+
+/// Упор сканера — WARN в журнал сервера без текста находок и самого текста (только счётчики), и
+/// `warnings` получает `secrets_scan_depth`. Входа, который упирается в предел, с задачи 3 M7.1
+/// нет: итог скана с упором подаётся в `attach_scan` (находки — настоящие, со входа фикстуры).
+#[test]
+fn scan_depth_warn_without_text() {
+    let t = depth_capped_text();
+    let hits = zam_markdown::scan_secrets(&t);
+    assert!(!hits.is_empty());
+    let scan = zam_markdown::ScanOutcome {
+        hits: hits.clone(),
+        passes: 7,
+        depth_capped: true,
+    };
+    let mut v = json!({});
+    let log = captured_log(|| zam_server::api::secrets::attach_scan(&mut v, t.len(), scan));
+    assert!(
+        log.contains("WARN") && log.contains("secrets_scan_depth"),
+        "{log}"
+    );
+    assert!(log.contains("passes=7"), "{log}");
+    assert!(log.contains(&format!("text_bytes={}", t.len())), "{log}");
+    // ни значений находок, ни фрагментов текста (в том числе случайных строк фикстуры)
+    for h in &hits {
+        let s = &t[h.range.clone()];
+        assert!(!log.contains(s), "{s}: {log}");
+    }
+    for frag in [
+        &scan_common::rnd(40, 101)[..12],
+        &scan_common::rnd(20, 301)[..12],
+        "x://",
+        "pwd=",
+    ] {
+        assert!(!log.contains(frag), "{frag}: {log}");
+    }
+    assert_eq!(
+        v["warnings"],
+        json!(["secrets_detected", "secrets_scan_depth"]),
+        "{v}"
+    );
 }
