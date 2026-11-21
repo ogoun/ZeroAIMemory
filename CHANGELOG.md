@@ -77,6 +77,17 @@
   другом регистре: «удаление — только по точному имени или v:<id>». `get`, `rename`, `move`
   находят запись, как раньше.
 
+### Fixed
+- **Reindex после смены модели на Windows** больше не срывается из-за сбоя Qdrant `failed to
+  rename file … storage\collections\zam_chunks` при удалении коллекции другой модели (каталог
+  коллекции держит антивирус или индексатор): удаление повторяется до 5 раз с паузой от 0,5 до
+  2 с — только при этой ошибке (`Internal` с «rename»), прочие ошибки Qdrant, как раньше, сразу.
+  Не помогло — reindex завершается ошибкой «коллекция zam_chunks удалена частично … остановите
+  zam-server и выполните `zam-server qdrant reset --yes`», и новая коллекция поверх остатка не
+  создаётся. Тот же совет вместо «Can't create collection … Collection data already exists» —
+  когда коллекцию нельзя создать, потому что каталог прежней остался в хранилище Qdrant.
+  Руководство: `deploy/README-install.md`, «Состояние индекса и reindex».
+
 ### Для разработчиков
 - `deploy/onnxruntime.toml` и `deploy/onnxruntime-gpu.toml` указывают на `.nupkg` с
   `api.nuget.org`: sha256 и `size` пакета, пути `runtimes/<rid>/native/…`, без `rename` (в пакете
@@ -98,6 +109,20 @@
   большее); `review_queue_unseen` и `seen_entry_revs` (строка на идею M6.6) удалены. Миграций нет.
 - `eval/hints.toml`: 6 случаев тишины `prompt` с новыми формами реплик (`source = "m71"`, всего
   189); `xtask eval` знает происхождение `m71` (в решающие части сеток не входит).
+- `zam-index` (фича `test-hooks`): сбои `delete_collection` одного клиента —
+  `test_hooks::DeleteFaults` и `QdrantIndex::with_delete_faults` (взведённые попытки отвечают
+  `Internal` без запроса к Qdrant, журнал — число попыток). Тесты самого пакета включают фичу
+  dev-зависимостью на себя (`zam-index = { path = ".", features = ["test-hooks"] }`).
+- `zam-server` (фича `test-hooks`): `DocPool::set_extract_stall_ms` — пауза рабочего процесса
+  перед разбором (поле `stall_ms` запроса `extract`).
+- Тайминговые тесты — по условию, а не по сроку (M7 §4.7 п. 2):
+  `index_api::managed_status_rss_and_cli_reindex_on_stopped_server` считает точки после покоя
+  воркера (точку папки пишет отложенная свёртка — было 3 точки вместо 4 и 240 с ожидания);
+  `m5_acceptance::worker_killed_attachment_failed_server_alive` убивает рабочий процесс на тестовой
+  паузе разбора (в release разбор успевал до `kill`); `hooks::session_start_outputs_digest_and_
+  refreshes_cache_with_etag` ждёт смены ETag на сервере и сверяет кэш с ним, а
+  `hooks::prompt_flushes_changed_queue` и он — действия хука условием (`until_hook_done`: повтор
+  только после строки `hooks.log` о пропуске по причине среды, до 120 с).
 
 ## [0.0.13-m6.6] - 2026-11-21
 

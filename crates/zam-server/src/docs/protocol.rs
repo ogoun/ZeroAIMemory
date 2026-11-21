@@ -11,8 +11,8 @@
 //! `image` — миниатюра изображения ([`zam_docs::thumb::image_thumb`]), `highlight` — HTML
 //! syntect исходного текста ([`zam_markdown::highlight_source`]); миниатюра PDF — `thumb`.
 //!
-//! Тестовые запросы (`Crash`, `Sleep`, `Alloc`, `Spam`, `LongError`) есть только в сборке с
-//! фичей `test-hooks`.
+//! Тестовые запросы (`Crash`, `Sleep`, `Alloc`, `Spam`, `LongError`) и поле `stall_ms` запроса
+//! `extract` есть только в сборке с фичей `test-hooks`.
 
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
@@ -147,6 +147,11 @@ pub enum Request<'a> {
         kind: String,
         limits: WireLimits,
         soft_ms: u64,
+        /// Тест: процесс стоит `stall_ms` мс до разбора (0 — нет), см.
+        /// [`super::pool::DocPool::set_extract_stall_ms`].
+        #[cfg(feature = "test-hooks")]
+        #[serde(default)]
+        stall_ms: u64,
         /// Последнее поле: [`request_body`] дописывает base64 прямо в тело кадра.
         #[serde(borrow)]
         bytes: Cow<'a, str>,
@@ -439,6 +444,8 @@ mod tests {
             kind: "pdf".into(),
             limits: WireLimits::from(&Limits::default()),
             soft_ms: 5,
+            #[cfg(feature = "test-hooks")]
+            stall_ms: 0,
             bytes: Cow::Borrowed(""),
         };
         let body = request_body(&x, Some(&[0u8, 0xFF, 7]));
@@ -446,6 +453,26 @@ mod tests {
             serde_json::from_slice::<Request<'_>>(&body).unwrap(),
             Request::Extract { soft_ms: 5, .. }
         ));
+        // тестовая пауза разбора (фича `test-hooks`) доходит до процесса; `bytes` — по-прежнему
+        // последнее поле
+        #[cfg(feature = "test-hooks")]
+        {
+            let x = Request::Extract {
+                kind: "csv".into(),
+                limits: WireLimits::from(&Limits::default()),
+                soft_ms: 5,
+                stall_ms: 30_000,
+                bytes: Cow::Borrowed(""),
+            };
+            let body = request_body(&x, Some(b"a;b\n"));
+            assert!(matches!(
+                serde_json::from_slice::<Request<'_>>(&body).unwrap(),
+                Request::Extract {
+                    stall_ms: 30_000,
+                    ..
+                }
+            ));
+        }
         let e: Response = serde_json::from_str(r#"{"op":"pong","pdfium":null}"#).unwrap();
         assert!(matches!(e, Response::Pong { pdfium: None }));
     }

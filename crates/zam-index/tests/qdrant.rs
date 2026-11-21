@@ -229,6 +229,34 @@ async fn ensure_adds_indexes_to_existing_collection() {
     assert!(!idx.ensure(MODEL, DIM).await.unwrap().created);
 }
 
+/// Частично удалённая коллекция (Windows, `i:01M7Y3C3A6E069FQ3QJXGZZGTQ`): Qdrant убрал коллекцию
+/// из своего списка, а её каталог с конфигурацией остался в хранилище. Создать коллекцию поверх
+/// Qdrant 1.19 отказывается («Collection data already exists»), `ensure` — понятной ошибкой с
+/// советом `zam-server qdrant reset`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_over_half_deleted_collection_is_clear_error() {
+    let q = TestQdrant::start("half-del");
+    let idx = connect(&q);
+    assert!(idx.ensure(MODEL, DIM).await.unwrap().created);
+    let coll = q
+        .dir
+        .join("storage")
+        .join("collections")
+        .join(zam_index::COLLECTION);
+    let config = std::fs::read(coll.join("config.json")).unwrap();
+    idx.drop_all().await.unwrap();
+    // остаток неудачного переименования: каталог коллекции, которой в Qdrant уже нет
+    std::fs::create_dir_all(&coll).unwrap();
+    std::fs::write(coll.join("config.json"), config).unwrap();
+    let err = idx.ensure(MODEL, DIM).await.unwrap_err();
+    assert!(matches!(err, IndexError::Corrupt(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(
+        text.contains("удалена частично") && text.contains("zam-server qdrant reset"),
+        "{text}"
+    );
+}
+
 /// Недетерминизм векторного канала (M6, задача 5, шаг 0): слияние RRF внутри Qdrant отдаёт
 /// точки с равным баллом в разном порядке от вызова к вызову, а на границе лимита — разный
 /// состав. Пары «лист dense ранга r» и «лист sparse ранга r» дают равные баллы: выдача

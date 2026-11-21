@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use common::disk::TestDir;
 use common::qdrant::{ProgressWatch, TestQdrant};
 use zam_core::Id;
+use zam_index::test_hooks::DeleteFaults;
 use zam_index::{
     PassageEmbedder, QdrantIndex, ReindexRequest, VectorFilter, VectorIndex, WorkerConfig,
     WorkerDeps, WorkerHandle, embed_input, embed_key, folder_embed_key,
@@ -82,6 +83,8 @@ struct Env {
     _q: TestQdrant,
     users_dir: PathBuf,
     vector: Arc<dyn VectorIndex>,
+    /// Сбои `delete_collection` клиента [`Env::vector`] (фича `test-hooks`).
+    faults: Arc<DeleteFaults>,
     users: UserDbs,
     system: SystemStore,
     user: Id,
@@ -104,8 +107,12 @@ async fn env(name: &str) -> Env {
     // каталог — до Qdrant: подметание прежних прогонов не совпадает с его запуском
     let dir = TestDir::new("zam-index-worker", name);
     let q = TestQdrant::start(&format!("worker-{name}"));
-    let vector: Arc<dyn VectorIndex> =
-        Arc::new(QdrantIndex::connect(&q.grpc_url(), Some(&q.api_key)).unwrap());
+    let faults = Arc::new(DeleteFaults::default());
+    let vector: Arc<dyn VectorIndex> = Arc::new(
+        QdrantIndex::connect(&q.grpc_url(), Some(&q.api_key))
+            .unwrap()
+            .with_delete_faults(faults.clone()),
+    );
     let dd = DataDir::open(&dir).unwrap();
     let system = SystemStore::open(&dd).unwrap();
     let user = system.create_user("u", false).await.unwrap().id;
@@ -118,6 +125,7 @@ async fn env(name: &str) -> Env {
         _q: q,
         users_dir,
         vector,
+        faults,
         users,
         system,
         user,
@@ -259,9 +267,20 @@ impl Env {
 
     /// Запрос reindex воркеру и его итог.
     async fn reindex(&self, w: &WorkerHandle, req: ReindexRequest) -> zam_index::ReindexReport {
+        self.try_reindex(w, req)
+            .await
+            .unwrap_or_else(|e| panic!("reindex не выполнен: {e}"))
+    }
+
+    /// Запрос reindex воркеру и его итог как есть: отчёт или ошибка.
+    async fn try_reindex(
+        &self,
+        w: &WorkerHandle,
+        req: ReindexRequest,
+    ) -> Result<zam_index::ReindexReport, String> {
         let prev = w.status().last_reindex.map(|o| o.finished_at);
         w.request_reindex(req);
-        self.reindexed(w, prev).await
+        self.outcome(w, prev).await
     }
 
     /// Ждёт итога reindex, завершённого позже `prev`.
@@ -270,6 +289,17 @@ impl Env {
         w: &WorkerHandle,
         prev: Option<jiff::Timestamp>,
     ) -> zam_index::ReindexReport {
+        self.outcome(w, prev)
+            .await
+            .unwrap_or_else(|e| panic!("reindex не выполнен: {e}"))
+    }
+
+    /// Ждёт итога reindex, завершённого позже `prev`: отчёт или ошибка.
+    async fn outcome(
+        &self,
+        w: &WorkerHandle,
+        prev: Option<jiff::Timestamp>,
+    ) -> Result<zam_index::ReindexReport, String> {
         self.until("reindex завершён", async || {
             let st = w.status();
             st.last_reindex.as_ref().map(|o| o.finished_at) != prev
@@ -277,7 +307,7 @@ impl Env {
                 && st.reindex_queued == 0
         })
         .await;
-        w.status().last_reindex.unwrap().result.unwrap()
+        w.status().last_reindex.unwrap().result
     }
 
     /// Ждёт `f`: не дольше [`LIMIT`] без роста создания коллекции Qdrant теста
@@ -857,6 +887,114 @@ async fn reindex_recreates_foreign_model_collection() {
     assert_eq!(meta.model_id.as_deref(), Some("fake/test@00000001"));
     assert_eq!(e.count(None, Some("a"), &[]).await, e.chunks(a).await);
     assert_eq!(w.embedded_texts(), before);
+    w.shutdown().await;
+}
+
+/// `model_id` коллекции чужой модели в тестах повтора удаления.
+const FOREIGN: &str = "other/model@ffff";
+/// Ответ Qdrant 1.19 на Windows, когда каталог коллекции занят посторонним процессом (CI
+/// `44858770363`, `i:01M7Y3C3A6E069FQ3QJXGZZGTQ`).
+const RENAME_FAILURE: &str = r"Service internal error: failed to rename file from \\?\D:\q\storage\collections\zam_chunks to \\?\D:\q\storage\.deleted\zam_chunks.1f0c";
+
+/// Коллекция чужой модели и воркер, который это заметил (векторный канал выключен).
+async fn foreign_worker(e: &Env) -> WorkerHandle {
+    e.vector.ensure(FOREIGN, DIM).await.unwrap();
+    let w = e.spawn();
+    e.until("mismatch", async || w.status().model_mismatch.is_some())
+        .await;
+    w
+}
+
+/// Сбой Qdrant на Windows (`i:01M7Y3C3A6E069FQ3QJXGZZGTQ`): `delete_collection` коллекции чужой
+/// модели дважды не переименовал её каталог — reindex повторяет удаление и выполняется: три
+/// попытки (две неудачи и удача), коллекция — текущей модели, точки заметки на месте.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reindex_retries_delete_on_rename_error() {
+    let e = env("del-retry").await;
+    let a = e.note(e.knowledge, "a", NOTE).await;
+    let w = foreign_worker(&e).await;
+    e.faults.fail_next(2, RENAME_FAILURE);
+    let rep = e
+        .reindex(
+            &w,
+            ReindexRequest {
+                user: Some(e.user),
+                space: None,
+                full: false,
+            },
+        )
+        .await;
+    assert_eq!(e.faults.attempts(), 3, "две неудачи и удача");
+    assert!(rep.recreated, "{rep:?}");
+    // эмбеддингов заметки в кэше нет: точки — заданием воркера в новой коллекции
+    e.indexed(a).await;
+    e.until("канал включён", async || {
+        let st = w.status();
+        st.vector_ready && st.model_mismatch.is_none()
+    })
+    .await;
+    let meta = e.vector.ensure(MODEL, DIM).await.unwrap();
+    assert_eq!(meta.model_id.as_deref(), Some(MODEL));
+    assert_eq!(e.count(None, Some("a"), &[]).await, e.chunks(a).await);
+    w.shutdown().await;
+}
+
+/// `delete_collection` не проходит за 5 попыток: reindex — ошибка с советом `zam-server qdrant
+/// reset`; новая коллекция поверх недоудалённой не создаётся и точки в неё не пишутся
+/// (метаданные — прежней модели, точек нет), векторный канал остаётся выключенным.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reindex_partial_delete_clear_error() {
+    let e = env("del-partial").await;
+    let w = foreign_worker(&e).await;
+    e.faults.fail_next(u32::MAX, RENAME_FAILURE);
+    let err = e
+        .try_reindex(
+            &w,
+            ReindexRequest {
+                user: Some(e.user),
+                space: None,
+                full: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.faults.attempts(), 5);
+    assert!(err.contains("zam-server qdrant reset"), "{err}");
+    assert!(err.contains("удалена частично"), "{err}");
+    let meta = e.vector.ensure(FOREIGN, DIM).await.unwrap();
+    assert_eq!(
+        (meta.model_id.as_deref(), meta.created, meta.points),
+        (Some(FOREIGN), false, 0)
+    );
+    let st = w.status();
+    assert!(st.model_mismatch.is_some() && !st.vector_ready, "{st:?}");
+    w.shutdown().await;
+}
+
+/// `Internal` без «rename» (другая ошибка Qdrant) — без повтора: одна попытка, ошибка Qdrant как
+/// есть, без совета про сброс.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reindex_other_internal_not_retried() {
+    let e = env("del-other").await;
+    let w = foreign_worker(&e).await;
+    e.faults.fail_next(
+        u32::MAX,
+        "Service internal error: No space left on device (os error 112)",
+    );
+    let err = e
+        .try_reindex(
+            &w,
+            ReindexRequest {
+                user: Some(e.user),
+                space: None,
+                full: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.faults.attempts(), 1);
+    assert!(err.contains("No space left on device"), "{err}");
+    assert!(!err.contains("qdrant reset"), "{err}");
     w.shutdown().await;
 }
 

@@ -376,6 +376,128 @@ release-сборка рабочего дерева задачи (`target\m71-t4-
   warnings`, `cargo clippy -p zam-server -- -D warnings`, `cargo fmt --all --check` — чисто;
   `cargo doc --no-deps` — zam-server 60, zam-store 55.
 
+### M7.1 · Задача 7 — Надёжность Qdrant и тестов
+
+Спецификация §4.7; сбой `i:01M7Y3C3A6E069FQ3QJXGZZGTQ`, задача `k:01M7GAQQJFE19B8VSHAZ5X30YA`. Ветка
+`m7.1-t7`.
+
+**Разбор `delete_collection` (Qdrant 1.19.2, `lib/storage/src/content_manager/toc/
+collection_meta_ops.rs`).** `delete_collection` сначала убирает коллекцию из списка (TOC) и
+останавливает её, потом переносит каталог в `.deleted` (`safe_delete_in_tmp`); сбой переноса —
+`Err` (gRPC `Internal`, текст `fs_err` «failed to rename file from … to …»), а коллекция уже не в
+списке, каталог — на месте. Повторный `delete_collection` идёт другой веткой: коллекции в списке
+нет, но каталог есть — Qdrant удаляет его («not loaded, but its directory still exists. Deleting
+it», ответ `false`). Поэтому повтор действительно доделывает удаление. `create_collection` поверх
+такого остатка Qdrant отклоняет («Can't create collection with name zam_chunks. Collection data
+already exists at …», `bad_input` → `InvalidArgument`) — тест `ensure_over_half_deleted_…`
+воспроизводит это на настоящем Qdrant (каталог с `config.json` удалённой коллекции).
+
+Сделано:
+- `QdrantIndex::delete_collection_retry` (`qdrant.rs`): до 5 попыток, паузы 0,5 → 1 → 2 → 2 с
+  (`delete_pause`), только `Internal` со словом «rename» без учёта регистра (`rename_failure`);
+  каждая попытка — `WARN` с номером и паузой, удача после повтора — `INFO «коллекция удалена с
+  повтора»`. Все пять неудачны — `IndexError::Corrupt` «delete_collection: коллекция zam_chunks
+  удалена частично — Qdrant за 5 попыток не переименовал её каталог (…); остановите zam-server и
+  выполните `zam-server qdrant reset --yes` — при старте индекс пересоберётся из кэша эмбеддингов».
+  `reindex` прерывается на `drop_all` (`?`), до `ensure`, — коллекция поверх не создаётся.
+- Проверка перед `create_collection`: `ensure` по-прежнему спрашивает `collection_exists`, а отказ
+  Qdrant «Collection data already exists» (коллекции нет в списке, каталог остался) теперь —
+  тот же `Corrupt` с советом (`create_err`), а не `Other("create_collection: InvalidArgument…")`.
+- Тестовые сбои `test_hooks::DeleteFaults` + `QdrantIndex::with_delete_faults` (фича `test-hooks`,
+  на клиента, а не на процесс: параллельные тесты бинарника не мешают друг другу): взведённые
+  попытки отвечают настоящей `QdrantError::ResponseError { Internal }` без запроса к Qdrant —
+  классификация и повтор проверяются целиком; журнал — число попыток с последнего взвода. Тесты
+  пакета включают фичу dev-зависимостью на себя (как `zam-server`).
+- Документация: `deploy/README-install.md` («Состояние индекса и reindex»), CHANGELOG, модульные
+  комментарии `qdrant.rs`, `reindex.rs`, `IndexError::Corrupt`.
+
+Решения:
+- **[решение исполнителя, задача 7]** «Три попытки в журнале» — журнал попыток тестового хука
+  (`DeleteFaults::attempts`, считает и удачные), а не разбор строк `tracing`: подписчик `tracing`
+  глобален на бинарник, а тесты `worker.rs` идут параллельно (строки чужих тестов не отделить).
+  Строки `WARN`/`INFO` повтора в журнале есть, их видно в выводе упавшего теста.
+- **[решение исполнителя, задача 7]** Частично удалённая коллекция — `IndexError::Corrupt`
+  («индекс повреждён: …»), не новый вариант: воркер записывает его в итог reindex
+  (`last_reindex.result`, `/index/status`, WebUI) и не повторяет, как прочие не-сетевые ошибки.
+- **[решение исполнителя, задача 7]** Сам `ensure` остаток не удаляет (хотя Qdrant 1.19 удалил бы
+  его тем же `delete_collection`): по спецификации — понятная ошибка с советом. Самовосстановление
+  — предложение в отчёте задачи.
+
+Флейки (§4.7 п. 2) — причины по журналам M3–M6 и правки:
+- `index_api::managed_status_rss_and_cli_reindex_on_stopped_server` — в M6 (задача 7a)
+  «не дождались за 240s: точки … points 4 … ожидалось точек 3». `pts` считались сразу после
+  `indexed`, а точку папки `keep` пишет отложенная свёртка L0 (дебаунс, после закрытия задания):
+  иногда счёт попадал до неё (3), пересборка из кэша давала 4, и ожидание равенства упиралось в
+  предел. Теперь `pts` — после покоя воркера (`rollups_pending == 0 && !batch_running`, условие с
+  пределом `READY`), как у соседнего `index_worker` (задача 17 M2).
+- `m5_acceptance::worker_killed_attachment_failed_server_alive` — «не дождались за 90s: документ
+  failed» (M5.5 release, M6 8a/8c): гонка «разбор против `taskkill`» (запуск `taskkill` под
+  нагрузкой — сотни мс). Тестовая пауза разбора `DocPool::set_extract_stall_ms` (поле `stall_ms`
+  запроса `extract`, фича `test-hooks`): процесс стоит 30 с до разбора, тест убивает его на паузе,
+  затем пауза снимается — новый процесс и повтор разбирают сразу. Пауза меньше `docs.timeout_ms`
+  (60 с): не убитый тестом процесс убил бы срок пула (`parse_timeout`, тест упал бы с причиной).
+- `hooks::session_start_outputs_digest_and_refreshes_cache_with_etag` — CI Linux M5.5 (`:575`,
+  «etag не сменился») и M6 8c (`hook_event_name = null`). Гипотеза журнала M5.5 («та же
+  секунда/версия») не подтвердилась: ETag — blake3 состава триггеров, запись записи журнала и
+  `GET /triggers` синхронны, обновление кэша — в потоке хука, который тот ждёт. Кэш не менялся,
+  потому что запрос хука обрывал бюджет продукта (тогда 300 мс); в M6 (`feb05307`) тесты
+  содержимого перешли на щедрый бюджет. Сейчас: смена ETag на сервере — условием (опрос
+  `GET /triggers`), кэш сверяется с ETag сервера (утверждение строже); каждое действие хука —
+  `until_hook_done`.
+- `hooks::prompt_flushes_changed_queue` — «очередь не ушла» (M5.6, M5.7, M6: остаток бюджета
+  меньше 15 мс, молча) и «NotFound при чтении файла» (M6 17b; вероятно, `file-refs.json` не
+  записан — `refresh_file_refs` оборван бюджетом: других файлов, которые тест читает с `unwrap`
+  после хука, нет). Бюджет — щедрый с M6 (`hook_slow`), пропуски — строкой
+  журнала (`ad49e3b`). Остались фиксированные сроки продукта внутри хука, от которых зависит
+  содержимое: замок очереди (`CHANGED_LOCK_WAIT` 50 мс), rename на занятом диске,
+  `CRITICAL_WAIT_MAX` 1,5 с (`session.json`). Теперь действия хука — `until_hook_done`.
+- **[решение исполнителя, задача 7]** `until_hook_done(p, what, skips, run, done)`: `done` — то же
+  утверждение теста; не выполнено — повтор хука, **только** если этот вызов записал в `hooks.log`
+  пропуск по причине среды (`files/changed: очередь не отправлена`, `кэш триггеров не обновлён`,
+  `кэш file-refs не обновлён`, `привязка MCP к сессии: запись не завершилась`,
+  `HOOK_BUDGET_SPENT`), до 120 с. Без такой строки — отказ сразу с журналом вызова: повтор не
+  прячет сбой хука. Работа при пропуске не теряется (очередь и кэш на месте) и делается следующим
+  вызовом — так устроен продукт. Повтор — только там, где он безвреден: дайджест `session-start`
+  берётся из первого вызова (у повтора запись уже показана в сессии), правка (`post-tool Edit`) не
+  повторяется.
+
+Прогоны (Windows, `CARGO_TARGET_DIR=target\m71-t7`, `-j 2`, `CARGO_INCREMENTAL=0`; логи —
+`.tmp/t7/` worktree задачи, вне git; машина под чужими сборками):
+- RED (хук и тесты до повтора): `cargo test -p zam-index --test qdrant --
+  ensure_over_half_deleted_collection_is_clear_error` — `Other("create_collection:
+  InvalidArgument: Wrong input: Can't create collection with name zam_chunks. Collection data
+  already exists at \\?\H:\…\storage\collections\zam_…")` вместо `Corrupt` (настоящий Qdrant
+  1.19.2 отвечает, как разобрано выше); `cargo test -p zam-index --test worker -- reindex_…` —
+  `reindex_retries_delete_on_rename_error`: «reindex не выполнен: ошибка индекса:
+  delete_collection: Internal: Service internal error: failed to rename file from …» (то же, что в
+  CI `44858770363`), `reindex_partial_delete_clear_error`: попыток 1 вместо 5,
+  `reindex_other_internal_not_retried` — ok (сторож: повтора не было и до правки).
+- GREEN: `zam-index --lib` 43 (3 новых: `rename_failure_only_internal_with_rename`,
+  `delete_pauses_grow_to_two_seconds`, `data_left_on_create_is_partial_collection`), `--test
+  qdrant` 32, `--test supervisor` 17, `--test worker` 20 (2 ignored — замеры): весь
+  `cargo test -p zam-index --no-fail-fast` зелёный. После упрощения `delete_collection_retry`
+  (без неиспользуемого `bool`) — повтор трёх новых, `ensure_over_half_deleted_…`,
+  `drop_all_removes_collection`, `reindex_recreates_foreign_model_collection`,
+  `interrupted_reindex_is_resumed_on_start`, `dropped_collection_is_rebuilt_from_embeddings` — ok.
+- `zam-server --lib` 307 (1 ignored, в том числе `docs::protocol::request_json_shape` со
+  `stall_ms`), `--test doc_worker` 10 (1 ignored), `--test m5_acceptance` 5, `--test index_api` 4
+  (в общем прогоне с наборами `zam-index` параллельно `status_ready_and_admin_reindex_…` упал на
+  `drop_all`: `Unavailable("delete_collection: Timeout expired")` — срок gRPC 30 с на перегруженном
+  HDD, повтора по сроку правка не меняла; файл отдельно — 4/4).
+- `zam-cli --test hooks` — 113 из 114: упал `session_start_spawns_background_sync_once_per_interval`
+  (p95 запуска 89 мс: 4 из 20 запусков ≈ 89 мс при остальных 6 мс — известный тайминговый, журнал
+  M6, задача 8c; правка его не трогает), отдельно — ok.
+- **Пять прогонов подряд** (`.tmp/t7/runs/summary.txt`), каждый — отдельный `cargo test … --
+  --exact <тест>`: `zam-cli --test hooks` `session_start_outputs_digest_and_refreshes_cache_with_etag`
+  5/5 и `prompt_flushes_changed_queue` 5/5 (и ещё по 5/5 после последней правки `zam-index`);
+  `zam-server --test m5_acceptance` `worker_killed_attachment_failed_server_alive` 5/5 (5–10 с);
+  `zam-server --test index_api` `managed_status_rss_and_cli_reindex_on_stopped_server` 5/5 (66–132
+  с, `ZAM_REQUIRE_ML=1`).
+- `cargo fmt --all -- --check`; `cargo clippy -p zam-index -p zam-server -p zam-cli --all-targets
+  -- -D warnings`; `cargo clippy -p zam-index -p zam-server -- -D warnings` (без `test-hooks`) —
+  чисто. `cargo doc --no-deps -p zam-index -p zam-server` — 2 и 60 предупреждений (базовые линии,
+  новых нет).
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

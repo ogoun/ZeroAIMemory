@@ -421,6 +421,19 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
         err.contains("занят") && err.contains("admin/reindex"),
         "{err}"
     );
+    // покой воркера, а не только `indexed`: точку папки `keep` пишет отложенная свёртка L0 после
+    // закрытия задания. Счёт до неё давал 3 точки вместо 4, и ожидание тех же точек после
+    // пересборки упиралось в предел (журнал M6, задача 7a; так же — `index_worker`, задача 17 M2)
+    until_diag(
+        "покой воркера",
+        READY,
+        async || {
+            let s = a.st.index.worker.status();
+            s.rollups_pending == 0 && !s.batch_running
+        },
+        async || vector_diag(&a),
+    )
+    .await;
     let pts = points(&a, Some("keep")).await;
     assert!(pts > 0);
     a.st.shutdown().await;
