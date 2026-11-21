@@ -1,7 +1,8 @@
 //! Детерминированность дайджеста (M6 §8, §17 п. 9; задача 8a): два `session_start` разных
 //! сессий при неизменной базе в те же сутки UTC — побайтово одинаковый `text`; окна ответов
 //! человека (`ANSWERS_DAYS`) и решений пакета восстановления (`RECOVERY_DECISIONS_DAYS`) — от
-//! начала суток UTC; в тексте нет относительного возраста.
+//! начала суток UTC; в тексте нет относительного возраста. Строка очереди разбора к запросу
+//! сравнивается с последним показом (M7.1 §4.5 п. 1).
 //!
 //! Все тесты файла замораживают часы (`freeze_now` держит блокировку тестовых точек): часы общие
 //! для процесса, поэтому тесты, чувствительные к сроку, рядом с замороженными не идут —
@@ -319,6 +320,89 @@ async fn recovery_decisions_window_from_utc_day_start() {
     let _clock = freeze_now(ts("2026-10-09T00:00:00Z"));
     let j = recall(&a, "dw-3", body).await;
     assert!(!j["text"].as_str().unwrap().contains(&d), "{j}");
+}
+
+/// M7.1 §4.5 п. 1 (ревью задачи 4, Minor 1): строку очереди разбора повторяет очередь длиннее
+/// **последнего** показа. Показ «3» → очередь разобрана → новая идея и показ «1» → идея,
+/// записанная в тот же момент, что и этот показ (её ревизия не новее показа — пришла, пока шёл
+/// ответ), — очередь «2»: строка снова, затем тишина. С наибольшим числом за эпоху (3) эта идея
+/// ждала бы сжатия контекста.
+#[tokio::test]
+async fn queue_line_compares_with_last_show() {
+    let sol = format!("/api/v1/spaces/{G}/entries");
+    let idea = |title: &str| {
+        json!({"kind": "idea", "title": title, "body": "Замысел.",
+                                   "data": {"origin": "human"}})
+    };
+    let (a, ids) = {
+        let _clock = freeze_now(ts("2026-10-10T01:00:00Z"));
+        let a = api("recall-frozen-queue-last", roomy).await;
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/solutions",
+                Some(json!({"agent_solution_id": G, "name": "Очередь"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        let mut ids = Vec::new();
+        for t in ["Идея 1", "Идея 2", "Идея 3"] {
+            ids.push(created(a.t(Method::POST, &sol, Some(idea(t))).await).await);
+        }
+        (a, ids)
+    };
+    let prompt = json!({"event": "prompt", "solution": G, "prompt": "продолжай"});
+    let line = |n: usize, first: &str| {
+        format!("ZeroAIMemory: идей ждут разбора: {n}, первая «{first}» — список: `zam idea queue`")
+    };
+    let text = |j: &Value| j["text"].as_str().unwrap().trim_end().to_string();
+    {
+        let _clock = freeze_now(ts("2026-10-10T02:00:00Z"));
+        let j = recall(&a, "ql", prompt.clone()).await;
+        assert_eq!(text(&j), line(3, "Идея 1"), "{j}");
+    }
+    {
+        let _clock = freeze_now(ts("2026-10-10T03:00:00Z"));
+        let summary = format!(
+            "Не нужно. {}",
+            "В плане такого пункта нет, сделанного по теме нет, решение — по сверке. ".repeat(4)
+        );
+        for id in &ids {
+            let r = a
+                .t(
+                    Method::POST,
+                    &format!("/api/v1/entries/{id}/review"),
+                    Some(json!({"outcome": "decline", "summary": summary})),
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        }
+        created(
+            a.t(Method::POST, &sol, Some(idea("Идея после разбора")))
+                .await,
+        )
+        .await;
+    }
+    {
+        let _clock = freeze_now(ts("2026-10-10T04:00:00Z"));
+        let j = recall(&a, "ql", prompt.clone()).await;
+        assert_eq!(text(&j), line(1, "Идея после разбора"), "{j}");
+        // записана в момент показа: ревизия не новее отметки
+        created(
+            a.t(Method::POST, &sol, Some(idea("Идея посреди ответа")))
+                .await,
+        )
+        .await;
+    }
+    let _clock = freeze_now(ts("2026-10-10T05:00:00Z"));
+    let j = recall(&a, "ql", prompt.clone()).await;
+    assert_eq!(
+        text(&j),
+        line(2, "Идея после разбора"),
+        "очередь длиннее последнего показа: {j}"
+    );
+    let j = recall(&a, "ql", prompt).await;
+    assert_eq!(text(&j), "", "{j}");
 }
 
 /// Ревью 8a, I3 (M6 §8): захваты задач и статусы задач — состояние сессий, на них гарантия

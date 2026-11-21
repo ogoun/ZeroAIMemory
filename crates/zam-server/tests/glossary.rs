@@ -509,14 +509,14 @@ async fn term_alias_broad_warning_on_term_write() {
         .t(
             Method::POST,
             &format!("{uri}/supersede"),
-            Some(term("Подтверждение", &["OK"])),
+            Some(term("Подтверждение", &["Ok"])),
         )
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let j = r.json();
     assert_eq!(
         j["entry"]["warnings"],
-        json!(["term_alias_broad: «OK» — меньше 3 букв или цифр"]),
+        json!(["term_alias_broad: «Ok» — меньше 3 букв или цифр"]),
         "{j}"
     );
     let mut next = term("Подтверждение", &["S3"]);
@@ -527,8 +527,11 @@ async fn term_alias_broad_warning_on_term_write() {
         r.json()["warnings"],
         json!(["term_alias_broad: «S3» — меньше 3 букв или цифр"])
     );
-    // точные псевдонимы, в том числе аббревиатура из трёх букв, — без предупреждений
+    // точные псевдонимы, в том числе аббревиатуры (и из двух заглавных — с учётом регистра, M7.1
+    // §4.5 п. 3), — без предупреждений
     let t = created(&a, term("Протокол модели", &["MCP", "model context"])).await;
+    assert!(t.get("warnings").is_none(), "{t}");
+    let t = created(&a, term("Интерфейс", &["UI"])).await;
     assert!(t.get("warnings").is_none(), "{t}");
 }
 

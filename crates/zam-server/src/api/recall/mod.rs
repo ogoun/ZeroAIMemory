@@ -121,11 +121,12 @@
 //!   `horizon`, `accepted` со снятой задачей) с указанием `action=propose` в строке; очереди нет —
 //!   раздел M5.7 из них одних. Подсказка к `prompt` у идеи решения `new` — «к задаче подходит
 //!   идея на разбор w:<id>» (`reason: idea_review`); у владельца базы решения ответ `prompt`
-//!   несёт и строку очереди разбора (M6.6 §3.5): первая идея очереди, не показанная в текущей
-//!   эпохе сессии в её текущей ревизии (дайджестом той же эпохи, пакетом, прежней подсказкой) и
-//!   не в подсказках-идеях этого ответа, — `ZeroAIMemory: новая идея на разбор «…» w:<id>` и
-//!   ` (ещё N)` при нескольких, одна на ответ, без зависимости от близости к запросу; голова
-//!   очереди читается до поиска. Строка плана [`PLAN_LINE`] — сразу за
+//!   несёт и строку очереди разбора (M6.6 §3.5; одна на очередь — M7.1 §4.5 п. 1):
+//!   [`REVIEW_QUEUE_LINE`] — число идей очереди и заголовок первой, раз за эпоху сессии (раздел
+//!   очереди дайджеста той же эпохи — тоже показ; отметка — `session_seen` с частью
+//!   [`zam_store::REVIEW_QUEUE_PART`] и числом идей) и ещё раз, когда после показа в очереди
+//!   появилась идея (`ideas::review_queue_line`); без зависимости от близости к запросу;
+//!   очередь читается до поиска. Строка плана [`PLAN_LINE`] — сразу за
 //!   задачами дайджеста и пакета восстановления: пункты плана из идей (задачи `open |
 //!   in_progress | blocked` с ребром `derived_from` на идею) и следующий — только `open`, по
 //!   `data.priority`, затем самый старый ([`zam_store::planned_from_ideas`]; открытых нет —
@@ -284,11 +285,11 @@ pub use ideas::{
     IDEA_REVIEW_BUDGET, IDEA_REVIEW_EMPTY, IDEA_REVIEW_LIMIT, IDEA_REVIEW_LIMIT_MAX,
     IDEA_REVIEW_NO_ACCESS, IDEA_REVIEW_NO_SOLUTION, IDEA_REVIEW_OFF, IDEA_REVIEW_READ_ONLY,
     IDEA_REVIEW_SIMILAR_MAX, IDEA_REVIEW_STEPS, IDEA_REVIEW_UNREGISTERED, IDEA_STOP_STEMS,
-    IDEAS_REVIEW_HINT, PLAN_LINE, PLAN_LINE_NO_NEXT, SECTION_IDEAS_REVIEW,
+    IDEAS_REVIEW_HINT, PLAN_LINE, PLAN_LINE_NO_NEXT, REVIEW_QUEUE_LINE, SECTION_IDEAS_REVIEW,
 };
 use ideas::{
-    REASON_IDEA, REASON_IDEA_REVIEW, digest_ideas, ideas_enabled, ideas_section_head, plan_line,
-    review_pack, review_shown_line, solution_ideas_mode,
+    QueueLine, REASON_IDEA, REASON_IDEA_REVIEW, digest_ideas, ideas_enabled, ideas_section_head,
+    plan_line, queue_mark, review_pack, review_shown_line, solution_ideas_mode,
 };
 #[cfg(feature = "test-hooks")]
 pub use ideas::{
@@ -3020,29 +3021,57 @@ async fn shown(
     }
 }
 
-/// Учёт показа: `session_seen` (с касанием сессии) и выданные токены `session_tokens`
-/// (M4.5 §9.5) одной транзакцией базы сессии, `usage` в базах целей. Сбой — WARN.
+/// Отметки показа ответа в `session_seen` ([`record`]): подсказки записей — часть
+/// [`RECALL_PART`] с ревизией записи (без строк файлов и окружения). Показ очереди разбора (M7.1
+/// §4.5 п. 1) — отметка [`queue_mark`] с числом идей очереди: у строки очереди `prompt` (`line`) —
+/// вместо отметки подсказки (строка — об очереди, а не показ идеи: подсказка-идея по близости к
+/// запросу для её первой идеи остаётся), у раздела `### Идеи на разбор` дайджеста
+/// (`digest_queue` — длина очереди) — вместе с отметками его идей.
+fn seen_items(
+    targets: &[SearchTarget],
+    shown: &[&Cand],
+    line: Option<&QueueLine>,
+    digest_queue: Option<usize>,
+) -> Vec<SeenItem> {
+    let is_line = |c: &Cand| line.is_some_and(|q| q.is(c));
+    let queue = match (line, digest_queue) {
+        (Some(q), _) => shown
+            .iter()
+            .find(|c| is_line(c))
+            .map(|c| queue_mark(targets, c, q.total)),
+        (None, Some(n)) => shown
+            .iter()
+            .find(|c| c.reason == REASON_IDEA_REVIEW)
+            .map(|c| queue_mark(targets, c, n)),
+        (None, None) => None,
+    };
+    shown
+        .iter()
+        .filter(|c| c.reason != REASON_FILE && c.reason != REASON_ENVIRONMENT && !is_line(c))
+        .map(|c| SeenItem {
+            key: seen_key(targets, c),
+            rev: c.rev,
+        })
+        .chain(queue)
+        .collect()
+}
+
+/// Учёт показа: `session_seen` (с касанием сессии; отметки — [`seen_items`]) и выданные токены
+/// `session_tokens` (M4.5 §9.5) одной транзакцией базы сессии, `usage` в базах целей. Сбой — WARN.
 async fn record(
     s: Option<&RequestSession>,
     targets: &[SearchTarget],
     user: Id,
     event: Event,
     shown: &[&Cand],
+    items: &[SeenItem],
     tokens: &[TokenCount],
 ) {
     if let Some(s) = s {
-        let items: Vec<SeenItem> = shown
-            .iter()
-            .filter(|c| c.reason != REASON_FILE && c.reason != REASON_ENVIRONMENT)
-            .map(|c| SeenItem {
-                key: seen_key(targets, c),
-                rev: c.rev,
-            })
-            .collect();
         let r = if items.is_empty() && tokens.is_empty() {
             touch_session(&s.db, &s.touch).await
         } else {
-            mark_seen_with_tokens(&s.db, &s.touch, &items, tokens).await
+            mark_seen_with_tokens(&s.db, &s.touch, items, tokens).await
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "recall: учёт сессии не выполнен");
@@ -3599,9 +3628,9 @@ pub async fn recall(
     };
     let review = mode == IdeasMode::Review;
     let mut idea_cands: Vec<Cand> = Vec::new();
-    // строка очереди разбора к `prompt` (M6.6 §3.5): свой отбор показанного — по эпохе и
-    // ревизии ([`ideas::review_queue_head`]), а не общий фильтр идей «любая эпоха»
-    let mut queue_cands: Vec<Cand> = Vec::new();
+    // строка очереди разбора к `prompt` (M7.1 §4.5 п. 1): свой учёт показа — раз за эпоху
+    // ([`ideas::review_queue_line`]), а не общий фильтр идей «любая эпоха»
+    let mut queue_line: Option<QueueLine> = None;
     let (mut lines, sections, repeatable) = match req.event {
         _ if !enabled => (Lines::default(), Vec::new(), true),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
@@ -3633,7 +3662,7 @@ pub async fn recall(
             let (h, d) = (&mut health, &mut deadline);
             let (secs, queue) =
                 prompt_sections(&st, &p, &sh, &req, s, ideas_on, review, h, d).await?;
-            queue_cands = queue;
+            queue_line = queue;
             (Lines::default(), secs, false)
         }
         Event::PostTool => {
@@ -3695,14 +3724,13 @@ pub async fn recall(
             (*title, chosen)
         })
         .collect();
-    // строка очереди — последним разделом `prompt`, показанное уже отсеяно своим правилом
-    if !queue_cands.is_empty() {
-        let per = section_limit(req.event, None, &queue_cands, limit, ideas_max, entries);
-        let queue: Vec<&Cand> = queue_cands
-            .iter()
+    // строка очереди — последним разделом `prompt`, показанное уже отсеяно своим правилом;
+    // первая идея строки уже идёт подсказкой-идеей — строка ждёт следующего запроса (её показ
+    // не отмечается)
+    if let Some(q) = &queue_line {
+        let queue: Vec<&Cand> = std::iter::once(&q.cand)
             .filter(|c| health.alive[c.target])
             .filter(|c| dup.insert(c.tref))
-            .take(per)
             .collect();
         chosen.push((None, queue));
     }
@@ -3726,7 +3754,7 @@ pub async fn recall(
     let (mut packed, mut picked) = arrange(recovery, rules_reserved, lines, ideas, chosen);
     // строка очереди, снятая пределом вывода канала, — с адресом очереди, а не общим «строк:
     // 1 (memory_recall)» (ревью задачи 14, M2)
-    let is_queue = |c: &Cand| queue_cands.iter().any(|q| std::ptr::eq(c, q));
+    let is_queue = |c: &Cand| queue_line.as_ref().is_some_and(|q| q.is(c));
     if let Some(si) = picked.iter().position(|p| p.iter().any(|c| is_queue(c))) {
         packed[si].omit = Some((OMIT_REVIEW_QUEUE.0.into(), OMIT_REVIEW_QUEUE.1.into()));
     }
@@ -3818,12 +3846,16 @@ pub async fn recall(
                 });
             }
         }
+        // показ очереди разбора дайджеста — длина очереди его раздела (M7.1 §4.5 п. 1)
+        let digest_queue = (req.event == Event::SessionStart).then_some(review_total);
+        let seen = seen_items(&targets, &shown_now, queue_line.as_ref(), digest_queue);
         record(
             session.as_ref(),
             &targets,
             user,
             req.event,
             &shown_now,
+            &seen,
             &tokens,
         )
         .await;

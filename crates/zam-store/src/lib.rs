@@ -128,11 +128,11 @@ pub use ideas::{
     IDEA_LINKS_MAX, IDEA_OPTIONS, IDEA_ORIGIN_REQUIRED, IDEA_REOPEN_OPTIONS, IdeaData,
     IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, IdeaSpaces, NewDecision, NewReview,
     PROPOSE_TEXT_MAX_CHARS, ProposalKind, REVIEW_MIN_CHARS_DEFAULT, REVIEW_MISSING_MAX_CHARS,
-    REVIEW_REFS_MAX, REVIEW_SUMMARY_MAX_CHARS, REVIEWS_MAX, Review, ReviewOutcome, ReviewTask,
-    Reviewed, TaskIdea, TaskState, adopt_idea, any_idea, any_new_idea, check_idea,
+    REVIEW_REFS_MAX, REVIEW_SUMMARY_MAX_CHARS, REVIEWS_MAX, Review, ReviewOutcome, ReviewQueueHead,
+    ReviewTask, Reviewed, TaskIdea, TaskState, adopt_idea, any_idea, any_new_idea, check_idea,
     check_idea_shape, check_idea_transition, decide_idea, idea_candidate, idea_task_state,
     ideas_of_tasks, planned_from_ideas, proactive_ideas, proposal_ideas, propose_idea,
-    released_ideas, review_idea, review_queue, review_queue_unseen, task_released,
+    released_ideas, review_idea, review_queue, review_queue_head, task_released,
 };
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
@@ -168,12 +168,12 @@ pub use search::{
     search_fts_channels, search_fts_channels_light, text_snippet,
 };
 pub use sessions::{
-    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,
-    TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
-    add_tokens, bump_epoch, check_session_id, end_session, gc_sessions, get_session,
-    latest_session, list_sessions, mark_seen, mark_seen_with_tokens, register_session,
-    seen_entry_ids, seen_entry_revs, seen_revs, seen_revs_any_epoch, session_epoch,
-    session_holdout, session_tokens, sessions_tokens, set_holdout, touch_session,
+    QueueShown, RECALL_PART, REVIEW_QUEUE_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey,
+    SeenTarget, Session, SessionTouch, TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET,
+    add_memory_write, add_token_counts, add_tokens, bump_epoch, check_session_id, end_session,
+    gc_sessions, get_session, latest_session, list_sessions, mark_seen, mark_seen_with_tokens,
+    register_session, review_queue_shown, seen_entry_ids, seen_revs, seen_revs_any_epoch,
+    session_epoch, session_holdout, session_tokens, sessions_tokens, set_holdout, touch_session,
 };
 pub use snapshots::{
     SnapTask, SnapshotRow, digest_snapshot, gc_snapshots, get_snapshot, put_snapshot,

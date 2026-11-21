@@ -168,14 +168,15 @@ pub struct Case {
     pub note: String,
     /// Происхождение случая ([`SOURCES`]): `m4` (по умолчанию), `task9` (исполнитель задачи 9
     /// M6), `independent` и `independent_b` (два независимых набора ревью задачи 9 — авторы не видели
-    /// код, сетки и результаты), `m66` (случаи тишины M6.6 §3: реплики и пересланные сообщения;
-    /// в решающие части сеток [`grid::DECISION_SOURCES`] не входят).
+    /// код, сетки и результаты), `m66` (случаи тишины M6.6 §3: реплики и пересланные сообщения),
+    /// `m71` (случаи тишины M7.1 §4.5: новые формы слов-реплик); `m66` и `m71` в решающие части
+    /// сеток [`grid::DECISION_SOURCES`] не входят.
     #[serde(default = "default_source")]
     pub source: String,
 }
 
 /// Происхождения случаев набора.
-pub const SOURCES: [&str; 5] = ["m4", "task9", "independent", "independent_b", "m66"];
+pub const SOURCES: [&str; 6] = ["m4", "task9", "independent", "independent_b", "m66", "m71"];
 
 fn default_source() -> String {
     SOURCES[0].to_string()

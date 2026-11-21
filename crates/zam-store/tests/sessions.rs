@@ -1,6 +1,5 @@
 //! Сессии агентов, выданное сессии (`session_seen`) и показы/оценки (`usage`) — §6.3, §9.3,
 //! §10.5 (задача 5 M4).
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use jiff::{SignedDuration, Timestamp};
@@ -664,13 +663,15 @@ async fn seen_ideas_ignore_epoch() {
     assert_eq!(ids, want);
 }
 
-/// M6.6 §3.5 (ревью задачи 14): `seen_entry_revs` — записи, выданные с частью `RECALL_PART` в
-/// заданную эпоху, с наибольшей ревизией; прежние эпохи, другие части и владельцы не видны.
+/// M7.1 §4.5 п. 1: показ очереди разбора сессии в эпоху — отметки части `REVIEW_QUEUE_PART`
+/// (цель — первая идея очереди, ревизия — число идей очереди при показе): число и время
+/// **последнего** показа (ревью задачи 4, Minor 1), в том числе меньшее прежнего и с той же первой
+/// идеей; подсказки (`RECALL_PART`), чужой владелец и прежние эпохи не видны.
 #[tokio::test]
-async fn seen_entry_revs_by_epoch() {
-    let (_dd, db) = db("entry-revs").await;
+async fn review_queue_shown_by_epoch() {
+    let (_dd, db) = db("queue-shown").await;
     let owner = Id::new();
-    let (idea, other) = (Id::new(), Id::new());
+    let (first, next) = (Id::new(), Id::new());
     let key = |owner, id, part: &str| SeenKey {
         owner_id: owner,
         target: TargetRef {
@@ -680,18 +681,35 @@ async fn seen_entry_revs_by_epoch() {
         .into(),
         part: part.into(),
     };
-    let recall = zam_store::RECALL_PART;
-    seen_in_epoch(&db, "r", 0, &key(owner, idea, recall), 2).await;
-    seen_in_epoch(&db, "r", 0, &key(owner, idea, recall), 1).await;
-    seen_in_epoch(&db, "r", 0, &key(owner, other, WHOLE_TARGET), 5).await;
-    seen_in_epoch(&db, "r", 0, &key(Id::new(), other, recall), 5).await;
-    let revs = |epoch| zam_store::seen_entry_revs(&db, "r", owner, recall, epoch);
-    assert_eq!(revs(0).await.unwrap(), HashMap::from([(idea, 2)]));
-    zam_store::bump_epoch(&db, "r").await.unwrap();
-    assert!(revs(1).await.unwrap().is_empty());
-    seen_in_epoch(&db, "r", 1, &key(owner, other, recall), 3).await;
-    assert_eq!(revs(1).await.unwrap(), HashMap::from([(other, 3)]));
-    assert_eq!(revs(0).await.unwrap(), HashMap::from([(idea, 2)]));
+    let queue = zam_store::REVIEW_QUEUE_PART;
+    let shown = |epoch| zam_store::review_queue_shown(&db, "q", owner, epoch);
+    assert_eq!(shown(0).await.unwrap(), None);
+    seen_in_epoch(&db, "q", 0, &key(owner, first, zam_store::RECALL_PART), 7).await;
+    seen_in_epoch(&db, "q", 0, &key(Id::new(), first, queue), 9).await;
+    assert_eq!(shown(0).await.unwrap(), None);
+    seen_in_epoch(&db, "q", 0, &key(owner, first, queue), 20).await;
+    let a = shown(0).await.unwrap().unwrap();
+    assert_eq!(a.total, 20);
+    // показ с той же первой идеей и меньшей очередью — число последнего показа, не большее
+    seen_in_epoch(&db, "q", 0, &key(owner, first, queue), 5).await;
+    let b = shown(0).await.unwrap().unwrap();
+    assert_eq!(b.total, 5);
+    assert!(b.at > a.at, "{b:?} {a:?}");
+    // показ с другой первой идеей — тоже последний
+    seen_in_epoch(&db, "q", 0, &key(owner, next, queue), 3).await;
+    let c = shown(0).await.unwrap().unwrap();
+    assert_eq!(c.total, 3);
+    assert!(c.at > b.at, "{c:?} {b:?}");
+    // отметка подсказки по-прежнему хранит большую ревизию
+    seen_in_epoch(&db, "q", 0, &key(owner, first, zam_store::RECALL_PART), 2).await;
+    let recall = key(owner, first, zam_store::RECALL_PART);
+    let revs = seen_revs(&db, "q", 0, std::slice::from_ref(&recall)).await;
+    assert_eq!(revs.unwrap()[&recall], 7);
+    zam_store::bump_epoch(&db, "q").await.unwrap();
+    assert_eq!(shown(1).await.unwrap(), None);
+    seen_in_epoch(&db, "q", 1, &key(owner, next, queue), 2).await;
+    assert_eq!(shown(1).await.unwrap().unwrap().total, 2);
+    assert_eq!(shown(0).await.unwrap().unwrap().total, 3);
 }
 
 /// `holdout` сессии (§12): ставится и снимается, сессии нет — создаётся.

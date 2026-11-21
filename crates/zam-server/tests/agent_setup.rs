@@ -1525,8 +1525,9 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         // M6.5 §8: разбор идей агентом и пункты плана из идей
         "### Разбор идей",
         "### Идеи на разбор",
-        // M6.6 §3.5: строка очереди разбора к любому запросу человека
-        "строкой «новая идея на разбор «…» w:<id>» к любому запросу человека, и к короткой реплике",
+        // M6.6 §3.5, M7.1 §4.5: одна строка очереди разбора к любому запросу человека
+        "к любому запросу человека, и к короткой реплике («продолжай»): раз в контексте",
+        "когда после показа в очереди появилась идея",
         "event=idea_review",
         "action=review",
         "`outcome`",
@@ -1561,6 +1562,11 @@ async fn guide_has_ideas_section_and_moved_phrases() {
     // строка-указание раздела `### Идеи на разбор` — дословно, как её пишет сервер (M6.5 §7)
     let hint = zam_server::api::recall::IDEAS_REVIEW_HINT.replace("{n}", "N");
     assert!(ideas.contains(&hint), "{hint}: {ideas}");
+    // строка очереди разбора к запросу — дословно, как её пишет сервер (M7.1 §4.5 п. 1)
+    let queue = zam_server::api::recall::REVIEW_QUEUE_LINE
+        .replace("{n}", "N")
+        .replace("{title}", "…");
+    assert!(ideas.contains(&queue), "{queue}: {ideas}");
     assert!(section(&ru, "Запись").contains("(409 — перечитай)"));
     assert!(section(&ru, "Запись").contains("заметке — `l0`"));
     assert!(section(&ru, "Задачи и передача работы").contains("перед работой"));
@@ -1588,7 +1594,8 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         "`w:`",
         "### Idea review",
         "### Идеи на разбор",
-        "as the line “новая идея на разбор «…» w:<id>” (a new idea to review) for any human prompt",
+        "for any human prompt, a short reply (“continue”) included: once per context",
+        "when an idea appeared in the queue after it was shown",
         "event=idea_review",
         "action=review",
         "`outcome`",
@@ -1618,6 +1625,7 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         assert!(ideas.contains(want), "{want}: {ideas}");
     }
     assert!(ideas.contains(&hint), "{hint}: {ideas}");
+    assert!(ideas.contains(&queue), "{queue}: {ideas}");
     assert!(section(&en, "Writing").contains("(409 — reread)"));
     assert!(section(&en, "Writing").contains("give notes an `l0`"));
     assert!(section(&en, "Tasks and handing work over").contains("before work"));
