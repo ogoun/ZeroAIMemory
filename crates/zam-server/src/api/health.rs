@@ -41,6 +41,7 @@ pub const FEATURES: &[&str] = &[
     "idea_review",
     "vault_move",
     "idea_queue_line",
+    "post_tool_subject",
 ];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {

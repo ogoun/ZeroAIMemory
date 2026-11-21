@@ -906,6 +906,62 @@ async fn fts_channels(
     .await
 }
 
+/// Документная частота слов среди действующих insight (M7.1 §4.6 п. 3: частые слова ошибки
+/// `/recall(post_tool)`): `(insight всего, по каждому слову `terms` — insight, в чанках которых
+/// есть слово с этим началом)`. Слово ищется тем же термом FTS, что у поиска (`"слово"*` от 3
+/// символов, короче — точное; все колонки `chunks_fts`); insight — живые записи вида `insight` в
+/// `space_ids` со статусом из `statuses`. Как [`leaf_term_hits`]: чанки insight (индексы
+/// `entries_feed`, `chunks_entry`) и по одному проходу индекса FTS на слово — только `rowid`,
+/// пересечение — в памяти. Пустые `space_ids` или `terms` — нули без запросов.
+pub async fn insight_term_docs(
+    db: &Db,
+    space_ids: Vec<Id>,
+    statuses: Vec<String>,
+    terms: Vec<String>,
+) -> Result<(usize, Vec<usize>), StoreError> {
+    if space_ids.is_empty() || terms.is_empty() {
+        return Ok((0, vec![0; terms.len()]));
+    }
+    db.read(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let statuses = serde_json::Value::from(statuses).to_string();
+        let mut st = tx.prepare_cached(&format!(
+            "SELECT c.seq, e.id FROM entries e CROSS JOIN chunks c ON c.entry_id = e.id
+             WHERE e.kind = 'insight' AND e.deleted_at IS NULL AND e.space_id IN ({})
+               AND e.status IN (SELECT value FROM json_each(?1))",
+            placeholders(2, space_ids.len())
+        ))?;
+        let mut args: Vec<&dyn ToSql> = vec![&statuses];
+        args.extend(space_ids.iter().map(|s| s as &dyn ToSql));
+        // `seq` чанка → номер insight
+        let mut doc_of: HashMap<i64, usize> = HashMap::new();
+        let mut docs: HashMap<Id, usize> = HashMap::new();
+        let rows = st.query_map(params_from_iter(args), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Id>(1)?))
+        })?;
+        for row in rows {
+            let (seq, id) = row?;
+            let next = docs.len();
+            doc_of.insert(seq, *docs.entry(id).or_insert(next));
+        }
+        let mut df = Vec::with_capacity(terms.len());
+        let mut st = tx.prepare_cached("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1")?;
+        for t in &terms {
+            let mut with: HashSet<usize> = HashSet::new();
+            if !docs.is_empty() && !t.is_empty() {
+                for seq in st.query_map([quote_term(t)], |r| r.get::<_, i64>(0))? {
+                    if let Some(d) = doc_of.get(&seq?) {
+                        with.insert(*d);
+                    }
+                }
+            }
+            df.push(with.len());
+        }
+        Ok((docs.len(), df))
+    })
+    .await
+}
+
 /// `seq → chunks.id` для кандидатов.
 fn chunk_ids_of(c: &Connection, ranked: &[Ranked]) -> Result<HashMap<i64, String>, StoreError> {
     if ranked.is_empty() {

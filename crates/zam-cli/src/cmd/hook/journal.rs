@@ -564,65 +564,12 @@ pub fn error_text(normalized: &str) -> String {
     normalized.chars().take(ERROR_TEXT_MAX).collect()
 }
 
-/// Слова команды с учётом кавычек `"…"` и `'…'` (и `\\` вне одинарных) — грубый разбор
-/// shell, достаточный для первого слова.
-fn shell_words(command: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut started = false;
-    let mut quote: Option<char> = None;
-    let mut chars = command.chars();
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            // в двойных кавычках `\` экранирует только `"`, `\`, `$` и `` ` `` (POSIX):
-            // `"C:\Tools\zam.exe"` остаётся путём Windows
-            (Some('"'), '\\') => match chars.clone().next() {
-                Some(n @ ('"' | '\\' | '$' | '`')) => {
-                    chars.next();
-                    cur.push(n);
-                }
-                _ => cur.push('\\'),
-            },
-            (Some(_), c) => cur.push(c),
-            (None, '"' | '\'') => {
-                quote = Some(c);
-                started = true;
-            }
-            (None, c) if c.is_whitespace() => {
-                if started {
-                    out.push(std::mem::take(&mut cur));
-                    started = false;
-                }
-            }
-            (None, c) => {
-                cur.push(c);
-                started = true;
-            }
-        }
-    }
-    if started {
-        out.push(cur);
-    }
-    out
-}
-
-/// Присваивание окружения перед командой: `ИМЯ=…` (имя — `[A-Za-z_][A-Za-z0-9_]*`).
-fn is_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let mut cs = name.chars();
-    cs.next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 /// Первое слово команды без аргументов и пути (`FOO="a b" /usr/bin/git push` → `git`), до 64
-/// символов; пусто — `None`. Слова — с учётом кавычек (fix round 1, M-3).
+/// символов; пусто — `None`. Слова — с учётом кавычек (fix round 1, M-3;
+/// [`zam_core::shell::words`]).
 pub fn exe_of(command: &str) -> Option<String> {
-    let words = shell_words(command);
-    let word = words.iter().find(|w| !is_assignment(w))?;
+    let words = zam_core::shell::words(command);
+    let word = words.iter().find(|w| !zam_core::shell::is_assignment(w))?;
     let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
     let base: String = base.chars().take(64).collect();
     (!base.is_empty()).then_some(base)

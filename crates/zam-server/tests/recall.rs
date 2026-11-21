@@ -1453,6 +1453,107 @@ async fn post_tool_stems_codes_match_whole() {
     assert!(!got.contains(&format!("i:{other}")), "{j}");
 }
 
+/// `POST /recall {event: post_tool}` без сессии с ошибкой `error` (и полями `extra`): ссылки
+/// подсказок.
+async fn post_tool_ids(a: &Api, error: &str, extra: Value) -> Vec<String> {
+    let mut body = json!({"event": "post_tool", "tool": "Bash", "error": error});
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    ids(&ok(a, &a.token, None, body).await)
+}
+
+/// M7.1 §4.6 п. 3 (замечание обкатки 37): покрытие — по предметным словам ошибки. На `ls` с
+/// кодом 2 ловушка LNK1104 со словами `test`, `build`, `web` не приходит: строка `Exit code`,
+/// фраза «No such file or directory» и слова, частые в insight (`cannot`, `access`, `test`,
+/// `build` — во всех семи), в покрытие не идут. Ошибка с кодом `LNK1104` — подсказка есть:
+/// одного совпадения кода ошибки достаточно.
+#[tokio::test]
+async fn post_tool_common_words_not_enough() {
+    let a = server("post-tool-common").await;
+    let lnk = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "LNK1104 при пересборке тестов: exe держит процесс владельца",
+        "cargo test и cargo build на Windows: LNK1104: cannot open file target\\debug\\deps\\zam.exe \
+         — access denied, exit code 1104; после npm run build в web/ тест-бинарники \
+         пересобираются, держатель файла ищется в каталоге (directory) target.",
+        "gotcha",
+    )
+    .await;
+    for (title, body) in [
+        (
+            "Тесты не видят .env",
+            "test cannot access .env из песочницы; build копирует файл заранее",
+        ),
+        (
+            "Снимок Qdrant",
+            "snapshot cannot access каталог данных — права службы; test стенда",
+        ),
+        (
+            "Сборка WebUI",
+            "build: vite cannot access node_modules после чистки — npm ci; test e2e",
+        ),
+        (
+            "Реестр из PowerShell",
+            "скрипт cannot access реестр без прав администратора; build и test в CI",
+        ),
+        (
+            "Ключ SSH",
+            "git cannot access remote — добавь ключ в агент; build и test на стенде",
+        ),
+        (
+            "Кэш хуков",
+            "zam cannot access cache при параллельном test — свой каталог; build отдельно",
+        ),
+    ] {
+        insight(&a, &a.token, "knowledge", title, body, "gotcha").await;
+    }
+    let ls = "Exit code 2\nls: cannot access 'web/playwright.config.*': No such file or directory";
+    assert_eq!(post_tool_ids(&a, ls, json!({})).await, Vec::<String>::new());
+    // как в замечании 37: перед ошибкой — список каталогов `ls web/ web/e2e`
+    let listing = "Exit code 2\nweb/:\nbuild\ndist\ne2e\npackage.json\nsrc\ntest\n\nweb/e2e:\n\
+                   smoke.spec.ts\nls: cannot access 'web/playwright.config.*': No such file or \
+                   directory";
+    assert_eq!(
+        post_tool_ids(&a, listing, json!({})).await,
+        Vec::<String>::new()
+    );
+    let got = post_tool_ids(
+        &a,
+        "LINK : fatal error LNK1104: cannot open file 'x.exe'",
+        json!({}),
+    )
+    .await;
+    assert_eq!(got, [format!("i:{lnk}")]);
+}
+
+/// M7.1 §4.6 п. 3: слова путей команды (`path_words`, их шлёт хук `zam`) — не предмет ошибки:
+/// имена каталогов и файлов из `ls web e2e web/playwright.config.*` в выводе подсказку не
+/// поднимают; без поля — поднимают, как прежде.
+#[tokio::test]
+async fn post_tool_path_words_not_subject() {
+    let a = server("post-tool-path-words").await;
+    let id = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Playwright e2e в web",
+        "Тесты e2e WebUI: playwright.config.ts лежит в web, запуск — npx playwright test из web.",
+        "gotcha",
+    )
+    .await;
+    let err = "web:\ne2e\nplaywright.config.ts\nls: cannot access 'zzz'";
+    assert_eq!(
+        post_tool_ids(&a, err, json!({})).await,
+        [format!("i:{id}")],
+        "без path_words — как прежде"
+    );
+    let words = json!({"path_words": ["web", "e2e", "playwright", "config"]});
+    assert_eq!(post_tool_ids(&a, err, words).await, Vec::<String>::new());
+}
+
 /// M6 §9: поиск `prompt` без модели деградировал до FTS — порог балла подсказки
 /// `recall.prompt_min_score_fts`, а `recall.prompt_min_score` не действует.
 #[tokio::test]

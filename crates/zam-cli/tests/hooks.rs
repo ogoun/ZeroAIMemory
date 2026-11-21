@@ -7347,3 +7347,156 @@ fn subagent_brief_does_not_mute_parent_hints() {
     assert!(c.contains(&want), "{c}");
     assert_eq!(t19_children(&p, "t19-par").len(), 2);
 }
+
+// ---------- M7.1 §4.6: подсказки к ошибкам команд ----------
+
+/// Строки классов «не повторяй» (M7.1 §4.6 п. 2).
+const AUTH_LINE: &str =
+    "ZeroAIMemory: доступ отклонён (401/invalid_grant) — проверь ключ, не повторяй тот же запрос";
+const NO_SPACE_LINE: &str = "ZeroAIMemory: нет места на диске — освободи место, повтор не поможет";
+
+/// `post-tool` на ошибку Bash `command` с текстом `error` при выключенном сервере (`DEAD`), со
+/// щедрым бюджетом: вывод хука.
+fn fail_dead(p: &Proj, session: &str, command: &str, error: &str) -> Output {
+    let ev = bash_fail(p, session, command, error);
+    p.hook_content(DEAD, "post-tool", "claude", ev.to_string().as_bytes())
+        .0
+}
+
+/// Сколько раз хук пытался спросить сервер: у `DEAD` каждая попытка — строка
+/// `recall(post_tool): …` в `hooks.log` (отказ соединения или срок).
+fn server_asks(p: &Proj) -> usize {
+    p.log().matches("recall(post_tool)").count()
+}
+
+/// Событий `error` в журнале сессии.
+fn journal_errors(p: &Proj, session: &str) -> usize {
+    events(p, session)
+        .iter()
+        .filter(|e| e["ev"] == "error")
+        .count()
+}
+
+/// M7.1 §4.6 п. 1: «Exit code 1» у простой `grep` без stderr — не ошибка: вывода нет (и строки
+/// петли на третий раз), в журнале сессии нет `error` — значит, нет ни пары «ошибка →
+/// исправление», ни петли; запроса `/recall(post_tool)` нет. Команда в журнале — как успешная.
+#[test]
+fn grep_exit_1_not_error() {
+    let _g = serial();
+    let p = Proj::new("exit1-grep", DEAD, "zam_x");
+    for _ in 0..3 {
+        empty(&fail_dead(&p, "ge", "grep -c x f", "Exit code 1"));
+    }
+    // `grep -c` печатает «0» в stdout — это не stderr
+    empty(&fail_dead(&p, "ge", "grep -c x f", "Exit code 1\n0"));
+    let ev = events(&p, "ge");
+    assert_eq!(journal_errors(&p, "ge"), 0, "{ev:?}");
+    assert_eq!(ev.len(), 4, "{ev:?}");
+    assert!(
+        ev.iter()
+            .all(|e| e["ev"] == "cmd" && e["exe"] == "grep" && e["ok"] == true),
+        "{ev:?}"
+    );
+    assert_eq!(server_asks(&p), 0, "{}", p.log());
+}
+
+/// M7.1 §4.6 п. 1: ожидаемый код — только у простой команды из списка, с кодом 1 и без stderr.
+/// Конвейер `grep x f | wc -l` с кодом 1, `grep x nofile` с кодом 2 и `cmp` с кодом 1 и сообщением
+/// `cmp:` — ошибки, как прежде (событие `error`, запрос к серверу); `diff a b` с кодом 1 и
+/// разницей в stdout — не ошибка.
+#[test]
+fn expected_exit_code_only_simple_command() {
+    let _g = serial();
+    let p = Proj::new("exit1-simple", DEAD, "zam_x");
+    for (session, command, error) in [
+        ("pipe", "grep x f | wc -l", "Exit code 1"),
+        (
+            "code2",
+            "grep x nofile",
+            "Exit code 2\ngrep: nofile: No such file or directory",
+        ),
+        (
+            "cmp",
+            "cmp a b",
+            "Exit code 1\ncmp: EOF on a after byte 3, line 1",
+        ),
+    ] {
+        let asks = server_asks(&p);
+        let _ = fail_dead(&p, session, command, error);
+        assert_eq!(journal_errors(&p, session), 1, "{command}");
+        assert_eq!(server_asks(&p), asks + 1, "{command}: {}", p.log());
+    }
+    let asks = server_asks(&p);
+    empty(&fail_dead(
+        &p,
+        "diff",
+        "diff a b",
+        "Exit code 1\n1c1\n< a\n---\n> b",
+    ));
+    assert_eq!(journal_errors(&p, "diff"), 0, "{:?}", events(&p, "diff"));
+    assert_eq!(server_asks(&p), asks, "diff: {}", p.log());
+}
+
+/// M7.1 §4.6 п. 2: сбой, который повтор не исправит, — строка класса «не повторяй» локально, без
+/// запроса к серверу; раз за сессию на класс и отпечаток: та же ошибка снова — тишина, другой
+/// отпечаток того же класса и другая сессия — строка снова. Ошибка в журнале — как обычно.
+#[test]
+fn dont_repeat_line_once_per_class() {
+    let _g = serial();
+    let p = Proj::new("dont-repeat", DEAD, "zam_x");
+    let line = |session: &str, error: &str| -> String {
+        let o = fail_dead(&p, session, "gh api user", error);
+        if ok(&o).trim().is_empty() {
+            String::new()
+        } else {
+            context(&o, "PostToolUseFailure")
+        }
+    };
+    let auth = "Exit code 1\nHTTP 401 invalid_grant";
+    assert_eq!(line("dr", auth), AUTH_LINE);
+    assert_eq!(line("dr", auth), "", "раз за сессию на класс и отпечаток");
+    assert_eq!(journal_errors(&p, "dr"), 2);
+    let disk = "Exit code 101\nerror: failed to write target/debug/deps/x.rlib: No space left on \
+                device (os error 28)";
+    assert_eq!(line("dr", disk), NO_SPACE_LINE);
+    assert_eq!(
+        line(
+            "dr",
+            "Exit code 22\ncurl: (22) The requested URL returned error: 401"
+        ),
+        AUTH_LINE,
+        "другой отпечаток того же класса"
+    );
+    assert_eq!(line("dr-2", auth), AUTH_LINE, "другая сессия");
+    assert_eq!(server_asks(&p), 0, "{}", p.log());
+}
+
+/// M7.1 §4.6 п. 3: в запрос `/recall(post_tool)` — слова путей команды `path_words` (аргументы
+/// с разделителем и существующие каталоги), после маскировки секретов: значение
+/// `--password=…` не уходит.
+#[test]
+fn post_tool_sends_path_words() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"text":"","items":[]}"#, Duration::ZERO);
+    let p = Proj::new("path-words", &url, "zam_x");
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    let pass = ["--password=Qwe", "/rty", "123"].concat();
+    let ev = bash_fail(
+        &p,
+        "pw",
+        &format!("ls web/ web/e2e src {pass} && cat out/dir/f.txt"),
+        "Exit code 2\nls: cannot access 'web/e2e': No such file or directory",
+    );
+    let _ = p.hook_content(&url, "post-tool", "claude", ev.to_string().as_bytes());
+    let seen = seen.lock().unwrap();
+    let body = &seen
+        .iter()
+        .find(|(m, path, _)| m == "POST" && path.ends_with("/recall"))
+        .unwrap_or_else(|| panic!("нет запроса /recall: {seen:?}"))
+        .2;
+    assert_eq!(
+        body["path_words"],
+        json!(["web", "e2e", "src", "out", "dir", "txt"]),
+        "{body}"
+    );
+}

@@ -919,3 +919,66 @@ async fn entry_leaves_and_term_hits() {
     assert_eq!(hits[0].target, t);
     assert!(hits[0].heading_path.ends_with("Вторая"), "{hits:?}");
 }
+
+/// Insight `title`/`body` в пространстве `space`; id.
+async fn insight_in(db: &Db, space: Id, title: &str, body: &str) -> Id {
+    let (e, _) = zam_store::create_entry(
+        db,
+        zam_store::NewEntry {
+            refs: None,
+            space_id: space,
+            kind: zam_store::EntryKind::Insight,
+            title: title.into(),
+            body: body.into(),
+            data: serde_json::json!({"kind": "gotcha"}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: None,
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &attrib(),
+    )
+    .await
+    .unwrap();
+    e.id
+}
+
+/// M7.1 §4.6 п. 3: документная частота слов среди действующих insight пространств — по началу
+/// слова (как терм FTS), один раз на insight; удалённые, отозванные, заметки и чужие
+/// пространства не считаются.
+#[tokio::test]
+async fn insight_term_docs_counts_live_insights() {
+    let (db, k, h) = setup("insight-term-docs").await;
+    insight_in(&db, k, "Квазары", "quasar quasars quasar — одна запись").await;
+    insight_in(&db, k, "Пульсар", "pulsar рядом с quasar").await;
+    insight_in(&db, k, "Без слова", "только pulsar").await;
+    let gone = insight_in(&db, k, "Удалённая", "quasar").await;
+    zam_store::delete_entry(&db, gone, None, &attrib())
+        .await
+        .unwrap();
+    let off = insight_in(&db, k, "Отозванная", "quasar").await;
+    zam_store::retract_entry(&db, off, None, "неверно", &attrib())
+        .await
+        .unwrap();
+    insight_in(&db, h, "Human", "quasar").await;
+    add(&db, k, "notes/q", "# Q\n\nquasar в заметке\n").await;
+    let st = || vec!["active".to_string(), "revisit".to_string()];
+    let terms = vec![
+        "quasar".into(),
+        "quas".into(),
+        "pulsar".into(),
+        "nebula".into(),
+    ];
+    let (docs, df) = zam_store::insight_term_docs(&db, vec![k], st(), terms.clone())
+        .await
+        .unwrap();
+    assert_eq!((docs, df), (3, vec![2, 2, 2, 0]));
+    // пустые пространства или слова — без запросов
+    let (docs, df) = zam_store::insight_term_docs(&db, Vec::new(), st(), terms)
+        .await
+        .unwrap();
+    assert_eq!((docs, df), (0, vec![0; 4]));
+}

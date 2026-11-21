@@ -1175,11 +1175,13 @@ fn idea_lexically_matched(item: &Value, e: &Entry, q: &IdeaQuery) -> bool {
 /// недостижимым (половина от 6 — 3 слова, не больше порога покрытия запроса 4).
 const IDEA_WORDS_CAP: usize = 6;
 /// Порог покрытия слов запроса у подсказок-идей — свой и фиксированный (M5.7: ⌈n/3⌉ от 2 до 4,
-/// основы): ключ `recall.post_tool_coverage` (M6 §9) на него не влияет.
+/// основы): ключ `recall.post_tool_coverage` (M6 §9) на него не влияет; частые слова ошибки
+/// (`common_pct`, M7.1 §4.6 п. 3) идеи не снимают.
 const IDEA_QUERY_RULE: CoverageRule = CoverageRule {
     divisor: 3,
     cap: 4,
     word_match: WordMatch::Stems,
+    common_pct: 100,
 };
 
 /// Стоп-основы общих глаголов и слов работы с кодом — **только для слов запроса подсказок-идей**

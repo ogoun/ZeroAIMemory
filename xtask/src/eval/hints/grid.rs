@@ -932,6 +932,7 @@ mod tests {
                 event: Event::PostTool,
                 input: "e".into(),
                 tool: None,
+                command: None,
                 expected: vec!["x".into()],
                 note: String::new(),
                 source: "m4".into(),

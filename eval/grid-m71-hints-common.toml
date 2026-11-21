@@ -1,0 +1,39 @@
+# Сетка порога частого слова ошибки у ослабленного FTS `post_tool` (M7.1 §4.6 п. 3, задача 8):
+#   cargo xtask eval --hints --grid eval/grid-m71-hints-common.toml --mode fts
+# `recall.post_tool_coverage.common_pct` — слово ошибки, которое есть больше чем в этой доле
+# действующих insight области поиска (и не меньше чем в 5), в покрытие не идёт. Правило и порог
+# записаны в журнал этапа M7 (раздел «M7.1 · Задача 8») до прогона. Первая точка — база: правило
+# выключено (100 %; строка `Exit code`, фраза «No such file or directory» и слова путей команды
+# сняты во всех точках); дальше — от большего порога к меньшему: при равенстве остаётся больший.
+# Выбор — правило сетки M6 §9 с правками ревью задачи 9 (`xtask/src/eval/hints/grid.rs`,
+# `choose_coverage`) на решающей части `m4`, `independent`, `independent_b`.
+
+rule = "post_tool_coverage"
+
+[[point]]
+name = "common-100"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT = "100" }
+
+[[point]]
+name = "common-50"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT = "50" }
+
+[[point]]
+name = "common-30"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT = "30" }
+
+[[point]]
+name = "common-20"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT = "20" }
+
+[[point]]
+name = "common-15"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT = "15" }
+
+[[point]]
+name = "common-10"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT = "10" }
+
+[[point]]
+name = "common-5"
+env = { ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT = "5" }

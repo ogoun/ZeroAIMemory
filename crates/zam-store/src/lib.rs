@@ -163,9 +163,9 @@ pub use questions::{
 pub use search::{
     AliasGroup, AttachmentHit, ChunkScope, EntryHit, FocusLeaf, FolderRow, FtsChannels, FtsHit,
     FtsQuery, LeafChunk, LeafHit, LightSearch, MARK_END, MARK_START, TargetFilter, first_leaves,
-    focus_leaves, leaf_term_hits, leaves_of_targets, live_chunks, live_folders, neighbor_leaves,
-    node_leaves, pending_count, query_needles, query_terms, sanitize_fts, search_fts,
-    search_fts_channels, search_fts_channels_light, text_snippet,
+    focus_leaves, insight_term_docs, leaf_term_hits, leaves_of_targets, live_chunks, live_folders,
+    neighbor_leaves, node_leaves, pending_count, query_needles, query_terms, sanitize_fts,
+    search_fts, search_fts_channels, search_fts_channels_light, text_snippet,
 };
 pub use sessions::{
     QueueShown, RECALL_PART, REVIEW_QUEUE_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey,

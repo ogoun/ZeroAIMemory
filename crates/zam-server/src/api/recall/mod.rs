@@ -147,10 +147,13 @@
 //! - **`post_tool`** — ошибка инструмента: совпадения `error_regex` действующих триггеров
 //!   insight решения и Knowledge (по первым [`ERROR_SCAN_MAX`] байтам `error`; триггер с
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
-//!   нормализованной ошибке ([`normalize_error`]): строгий запрос (все слова) — как есть,
-//!   ослабленный (любое слово) — если запись покрывает достаточно слов ошибки
-//!   ([`CoverageQuery`], правило `recall.post_tool_coverage`, M6 §9). Не больше [`POST_TOOL_MAX`]; строка — «ZeroAIMemory: эта ошибка уже
-//!   разбиралась: …»;
+//!   нормализованной ошибке ([`normalize_error`]; первая строка `Exit code <N>` агента снята —
+//!   [`strip_exit_header`], M7.1 §4.6 п. 3): строгий запрос (все слова) — как есть,
+//!   ослабленный (любое слово) — если запись покрывает достаточно **предметных** слов ошибки
+//!   ([`CoverageQuery::subject`], правило `recall.post_tool_coverage`, M6 §9 и M7.1 §4.6 п. 3:
+//!   без фразы «No such file or directory», слов путей команды `path_words` и частых в insight
+//!   области слов — `subject_cover`; одного совпадения кода ошибки достаточно). Не больше
+//!   [`POST_TOOL_MAX`]; строка — «ZeroAIMemory: эта ошибка уже разбиралась: …»;
 //! - **без повторов**: подсказка `prompt` показывается не больше раза за сессию — по
 //!   `session_seen` с частью [`RECALL_PART`] (любая ревизия). Дайджест `session_start` не
 //!   фильтруется (после `/compact` и `resume` Claude Code шлёт тот же `session_id`, а контекст
@@ -227,6 +230,8 @@
 //!   `text` в нём (Rules — первыми, хвост их приоритета — L0, затем снимаются разделы с меньшим
 //!   `keep`, правила — со строкой «не показано — правил: N»); хук без поля (есть `source` или
 //!   `code_map`) — 7500 байт; `max` вне 1..=1 000 000 или иная единица — 400;
+//! - `path_words` (M7.1 §4.6 п. 3, только `post_tool`) — слова путей из аргументов команды:
+//!   не предмет ошибки, в покрытие не идут (первые 64);
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
 //!   recovery | brief | idea_review` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
 //!
@@ -258,15 +263,16 @@ use tokio::time::Instant;
 use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
     CoverageQuery, CoverageRule, HINT_PREFIX, Section, error_regex_matches, error_terms, hint_line,
-    normalize_error, one_line, pack_sections, reserved_text,
+    is_common, is_error_code, normalize_error, one_line, pack_sections, reserved_text,
+    strip_exit_header, subject_error_terms,
 };
 use zam_search::truncate_marked;
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, NodeKind, RECALL_PART,
     SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind, UsageEvent,
-    UsageKind, UsageSource, active_triggers, bump_epoch, count_tokens, list_children, list_entries,
-    mark_seen_with_tokens, node_content, record_usages, search_fts_channels, seen_revs,
-    seen_revs_any_epoch, session_holdout, touch_session,
+    UsageKind, UsageSource, active_triggers, bump_epoch, count_tokens, insight_term_docs,
+    list_children, list_entries, mark_seen_with_tokens, node_content, record_usages,
+    search_fts_channels, seen_revs, seen_revs_any_epoch, session_holdout, touch_session,
 };
 
 use super::json_body;
@@ -519,7 +525,14 @@ pub struct RecallReq {
     /// Идей в пакете `idea_review` (M6.5 §7): 1..=[`IDEA_REVIEW_LIMIT_MAX`], иначе 400; нет —
     /// [`IDEA_REVIEW_LIMIT`]. У прочих событий не действует.
     limit: Option<u32>,
+    /// `post_tool` (M7.1 §4.6 п. 3): слова путей из аргументов команды (их шлёт хук `zam`,
+    /// `zam_core::shell::path_words`) — в покрытие слов ошибки не идут; берутся первые
+    /// [`PATH_WORDS_MAX`], без учёта регистра. У прочих событий не действует.
+    path_words: Option<Vec<String>>,
 }
+
+/// Слов `path_words` запроса, не больше.
+const PATH_WORDS_MAX: usize = 64;
 
 /// Единица предела вывода: символы (Claude Code) или байты UTF-8 (Codex).
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -2907,11 +2920,10 @@ async fn error_hints(
         }
     }
 
-    // 2. FTS по insight по нормализованной ошибке
-    let normalized = normalize_error(raw);
+    // 2. FTS по insight по нормализованной ошибке; строка `Exit code <N>` агента — служебная
+    // (M7.1 §4.6 п. 3)
+    let normalized = normalize_error(strip_exit_header(raw));
     let terms = error_terms(&normalized);
-    // порог покрытия ослабленного FTS — `recall.post_tool_coverage` (M6 §9)
-    let cover = CoverageQuery::new(&terms, rule);
     if out.len() < POST_TOOL_MAX && !terms.is_empty() {
         let mut hits: Vec<(f64, usize, zam_store::FtsHit, bool)> = Vec::new();
         for (i, t) in targets.iter().enumerate() {
@@ -2945,6 +2957,13 @@ async fn error_hints(
         }
         // bm25: меньше — лучше (слияние баз — по сырому баллу, как в поиске)
         hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // порог покрытия ослабленного FTS — `recall.post_tool_coverage` (M6 §9) по предметным
+        // словам ошибки (M7.1 §4.6 п. 3); нужен, только если ослабленный запрос что-то нашёл
+        let cover = if hits.iter().any(|h| h.3) {
+            Some(subject_cover(req, rule, &normalized, targets, health, deadline).await)
+        } else {
+            None
+        };
         for (_, i, h, relaxed) in hits {
             if out.len() >= POST_TOOL_MAX {
                 break;
@@ -2955,7 +2974,11 @@ async fn error_hints(
             if taken.contains(&h.target) {
                 continue;
             }
-            if relaxed && !cover.enough(&format!("{}\n{}", e.title, h.text)) {
+            if relaxed
+                && !cover
+                    .as_ref()
+                    .is_some_and(|c| c.enough(&format!("{}\n{}", e.title, h.text)))
+            {
                 continue;
             }
             taken.insert(h.target);
@@ -2982,6 +3005,74 @@ async fn error_hints(
         }
     }
     Ok(out)
+}
+
+/// Покрытие `post_tool` по предметным словам ошибки (M7.1 §4.6 п. 3,
+/// [`CoverageQuery::subject`]): слова `normalized` без служебных фраз
+/// ([`subject_error_terms`]), без слов путей команды (`path_words` запроса) и без частых слов —
+/// [`is_common`] по документной частоте среди действующих insight области поиска (пространства
+/// решения и Knowledge живых целей, [`insight_term_docs`]); коды ошибок не снимаются.
+/// `recall.post_tool_coverage.common_pct = 100` — частота не считается. Сбой чтения частоты (WARN
+/// в журнал) или срок сбора — без частых слов, как при `common_pct = 100`: подсказка не
+/// теряется из-за вспомогательного запроса.
+async fn subject_cover(
+    req: &RecallReq,
+    rule: &CoverageRule,
+    normalized: &str,
+    targets: &[SearchTarget],
+    health: &Health<'_>,
+    deadline: &mut Deadline,
+) -> CoverageQuery {
+    let terms = subject_error_terms(normalized);
+    let path: HashSet<String> = req
+        .path_words
+        .iter()
+        .flatten()
+        .take(PATH_WORDS_MAX)
+        .map(|w| w.to_lowercase())
+        .collect();
+    let counted: Vec<String> = terms
+        .iter()
+        .filter(|t| !is_error_code(t) && !path.contains(*t))
+        .cloned()
+        .collect();
+    let mut common: HashSet<String> = HashSet::new();
+    if rule.common_pct < 100 && !counted.is_empty() {
+        let (mut docs, mut df) = (0usize, vec![0usize; counted.len()]);
+        let mut complete = true;
+        for (i, t) in targets.iter().enumerate() {
+            let spaces = entry_spaces(t);
+            if spaces.is_empty() || !health.alive[i] {
+                continue;
+            }
+            let statuses = vec!["active".to_string(), "revisit".to_string()];
+            let step = insight_term_docs(&t.db, spaces, statuses, counted.clone());
+            match deadline.step(step).await {
+                Some(Ok((n, d))) => {
+                    docs += n;
+                    df.iter_mut().zip(d).for_each(|(a, b)| *a += b);
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "post_tool: частота слов ошибки не прочитана");
+                    complete = false;
+                    break;
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            common = counted
+                .iter()
+                .zip(df)
+                .filter(|(_, n)| is_common(*n, docs, rule.common_pct))
+                .map(|(t, _)| t.clone())
+                .collect();
+        }
+    }
+    CoverageQuery::subject(&terms, rule, |t| path.contains(t) || common.contains(t))
 }
 
 /// Ключ показа подсказки в `session_seen`.
