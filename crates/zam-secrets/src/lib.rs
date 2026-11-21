@@ -450,15 +450,19 @@ fn is_punct(c: char) -> bool {
 /// `SHA-256`, `UTF-8`, `X.509`, `P-256`, `HMAC-SHA256` — тоже проза, `sha-256secret` — значение
 /// (круг 4).
 /// - хэши: `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, `sha3`, `sha3-224`, `sha3-256`,
-///   `sha3-384`, `sha3-512`, `md5`, `blake2`, `blake2b`, `blake2s`, `blake3`, `hmacsha256`,
-///   `hmacsha512`;
+///   `sha3-384`, `sha3-512`, `md5`, `blake2`, `blake2b`, `blake2s`, `blake3`, `hmacsha1`,
+///   `hmacsha256`, `hmacsha384`, `hmacsha512`, `sha256sum`;
 /// - хэширование паролей: `argon2`, `argon2i`, `argon2d`, `argon2id`, `pbkdf2`, `pbkdf2sha256`,
-///   `bcrypt`, `scrypt`;
-/// - кодировки: `base32`, `base58`, `base64`, `base64url`, `utf8`, `utf8mb4`, `utf16`;
-/// - подписи JWT: `hs256`, `hs384`, `hs512`, `rs256`, `rs384`, `rs512`, `es256`, `es384`, `es512`,
-///   `ps256`, `ps384`, `ps512`;
-/// - ключи и протоколы: `eddsa`, `ed25519`, `x25519`, `x509`, `aes128`, `aes256`, `rsa2048`,
-///   `rsa4096`, `p256`, `secp256k1`, `oauth2`.
+///   `pbkdf2hmacsha256` (`PBKDF2-HMAC-SHA256`, запись OWASP), `bcrypt`, `scrypt`, `sha512crypt`,
+///   `sha256crypt`, `md5crypt`;
+/// - кодировки: `base32`, `base58`, `base64`, `base64url`, `utf8`, `utf8mb4`, `utf8bin`, `utf16`,
+///   `utf16le`, `utf16be`, `cp1251`, `koi8r`;
+/// - подписи JWT: `hs256`, `hs384`, `hs512`, `rs256`, `rs384`, `rs512`, `es256`, `es256k`, `es384`,
+///   `es512`, `ps256`, `ps384`, `ps512`;
+/// - шифры: `aes128`, `aes256`, `aes128gcm`, `aes256gcm`, `chacha20`, `chacha20poly1305`,
+///   `xchacha20poly1305`;
+/// - ключи и протоколы: `eddsa`, `ed25519`, `x25519`, `x509`, `rsa2048`, `rsa4096`, `p256`,
+///   `secp256k1`, `pkcs8`, `pkcs12`, `oauth2`, `oauth20` (`OAuth 2.0`), `saml2`.
 const RU_PROSE_TERMS: &[&str] = &[
     "sha1",
     "sha224",
@@ -515,19 +519,61 @@ const RU_PROSE_TERMS: &[&str] = &[
     "p256",
     "secp256k1",
     "oauth2",
+    // круг 5
+    "hmacsha1",
+    "hmacsha384",
+    "sha256sum",
+    "pbkdf2hmacsha256",
+    "sha512crypt",
+    "sha256crypt",
+    "md5crypt",
+    "utf8bin",
+    "utf16le",
+    "utf16be",
+    "cp1251",
+    "koi8r",
+    "es256k",
+    "aes128gcm",
+    "aes256gcm",
+    "chacha20",
+    "chacha20poly1305",
+    "xchacha20poly1305",
+    "pkcs8",
+    "pkcs12",
+    "oauth20",
+    "saml2",
 ];
 
 /// Слово `w` — имя из [`RU_PROSE_TERMS`]: целиком, без учёта регистра ASCII и без `-`, `.`, `_`
 /// с обеих сторон сравнения (`SHA-256` = `sha256`, `sha3-256` = `SHA3_256`).
 fn is_prose_term(w: &str) -> bool {
-    let norm = |s: &str| {
-        s.bytes()
-            .filter(|b| !matches!(b, b'-' | b'.' | b'_'))
-            .map(|b| b.to_ascii_lowercase())
-            .collect::<Vec<u8>>()
-    };
-    let w = norm(w);
-    RU_PROSE_TERMS.iter().any(|t| norm(t) == w)
+    /// Нормализованные имена — один раз (ревью круга 4: нормализация списка на каждый вызов
+    /// стоила ≈ 10 мс на 100 КБ «Хэш пароля: 12345»).
+    static TERMS: LazyLock<std::collections::HashSet<Vec<u8>>> = LazyLock::new(|| {
+        RU_PROSE_TERMS
+            .iter()
+            .map(|t| {
+                t.bytes()
+                    .filter(|b| !matches!(b, b'-' | b'.' | b'_'))
+                    .map(|b| b.to_ascii_lowercase())
+                    .collect()
+            })
+            .collect()
+    });
+    // слово нормализуется в буфер на стеке: имена короче 24 байт и только ASCII
+    let mut buf = [0u8; 24];
+    let mut n = 0;
+    for b in w.bytes() {
+        if matches!(b, b'-' | b'.' | b'_') {
+            continue;
+        }
+        if !b.is_ascii() || n == buf.len() {
+            return false;
+        }
+        buf[n] = b.to_ascii_lowercase();
+        n += 1;
+    }
+    TERMS.contains(&buf[..n])
 }
 
 /// Значение без кавычек после русского слова-ключа — проза, а не секрет (знаки препинания `\p{P}`
@@ -549,9 +595,10 @@ fn ru_prose_value(v: &str, indirect: bool) -> bool {
     static NUMBER: LazyLock<Regex> = LazyLock::new(|| {
         rx(concat!(
             r"^[+\-−]?\d+(?:[.,]\d+)*(?:[%‰]|\p{Sc}",
-            // время, размер, экран, частота
-            r"|с|мс|мкс|мин|ч|дн|нед|мес|г|бит|байт|s|ms|us|ns|min|h|d|bit|bits|byte|bytes",
-            r"|px|pt|em|rem|fps|rps|qps|rpm",
+            // время, количество, размер (строчными), экран, частота
+            r"|с|сек|мс|мкс|мин|ч|дн|нед|мес|г|шт|бит|байт",
+            r"|s|sec|secs|ms|us|[µμ]s|ns|m|min|mins|h|hour|hours|d|day|days|bit|bits|byte|bytes",
+            r"|px|pt|em|rem|fps|rps|qps|tps|rpm",
             // размеры — без учёта регистра: `KB`, `kB`, `KiB`, `МБ`, `Мб`, `мБ`…
             r"|(?i:[kmgt]i?b|[кмгт]б)",
             r")?$",
@@ -563,7 +610,8 @@ fn ru_prose_value(v: &str, indirect: bool) -> bool {
         && w.split('-')
             .all(|p| !p.is_empty() && p.chars().all(char::is_alphabetic));
     if indirect {
-        return letters || is_prose_term(w) || NUMBER.is_match(w);
+        // число — раньше имени: чисел в прозе после «Хэш пароля:», «Размер токена:» больше
+        return letters || NUMBER.is_match(w) || is_prose_term(w);
     }
     // именительная форма: строчное или с заглавной первой, с кириллицей
     letters
