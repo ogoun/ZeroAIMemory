@@ -3033,7 +3033,7 @@ fn seen_items(
     line: Option<&QueueLine>,
     digest_queue: Option<usize>,
 ) -> Vec<SeenItem> {
-    let is_line = |c: &Cand| line.is_some_and(|q| std::ptr::eq(c, &q.cand));
+    let is_line = |c: &Cand| line.is_some_and(|q| q.is(c));
     let queue = match (line, digest_queue) {
         (Some(q), _) => shown
             .iter()
@@ -3754,11 +3754,7 @@ pub async fn recall(
     let (mut packed, mut picked) = arrange(recovery, rules_reserved, lines, ideas, chosen);
     // строка очереди, снятая пределом вывода канала, — с адресом очереди, а не общим «строк:
     // 1 (memory_recall)» (ревью задачи 14, M2)
-    let is_queue = |c: &Cand| {
-        queue_line
-            .as_ref()
-            .is_some_and(|q| std::ptr::eq(c, &q.cand))
-    };
+    let is_queue = |c: &Cand| queue_line.as_ref().is_some_and(|q| q.is(c));
     if let Some(si) = picked.iter().position(|p| p.iter().any(|c| is_queue(c))) {
         packed[si].omit = Some((OMIT_REVIEW_QUEUE.0.into(), OMIT_REVIEW_QUEUE.1.into()));
     }
