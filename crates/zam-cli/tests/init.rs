@@ -32,6 +32,12 @@ fn tmp(name: &str) -> PathBuf {
 
 /// Сервер в фоновом потоке: адрес и токен `rw` пользователя «Анна».
 fn start(name: &str) -> (String, String) {
+    let (url, mut t) = start_n(name, 1);
+    (url, t.remove(0))
+}
+
+/// [`start`] с `n` токенами `rw` пользователя «Анна».
+fn start_n(name: &str, n: usize) -> (String, Vec<String>) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -46,10 +52,19 @@ fn start(name: &str) -> (String, String) {
             };
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
-            let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
+            let mut tokens = Vec::with_capacity(n);
+            for i in 0..n {
+                let label = format!("t{i}");
+                let (_, t) = st
+                    .system
+                    .issue_token(u.id, &label, Access::Rw)
+                    .await
+                    .unwrap();
+                tokens.push(t);
+            }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            tx.send((url, t)).unwrap();
+            tx.send((url, tokens)).unwrap();
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -1314,9 +1329,15 @@ fn init_url_home_block_without_url() {
     ] {
         assert!(!p.read(f).contains(&url), "{f}");
     }
+    // ключ без адреса и тот же токен (`ZAM_TOKEN`) — ключ этого адреса (M7 §4.4, круг правок 1)
     let home: toml::Table = toml::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
     assert_eq!(home["url"].as_str(), Some(url.as_str()));
-    assert_eq!(home["token"].as_str(), Some(tok.as_str()));
+    assert_eq!(
+        home["servers"][&url]["token"].as_str(),
+        Some(tok.as_str()),
+        "{home:?}"
+    );
+    assert!(home.get("token").is_none(), "{home:?}");
     assert_eq!(home["hooks"]["prompt"].as_bool(), Some(false), "свои ключи");
     assert!(out(&o).contains("--url-to home"), "{}", out(&o));
     assert!(!err(&o).contains("окажется в репозитории"), "{}", err(&o));
@@ -2028,4 +2049,76 @@ fn init_second_server_leaves_unbound_token() {
         e.contains("zam init --url http://192.0.2.9:7700 --token") && e.contains("ключ без адреса"),
         "{e}"
     );
+    // предупреждение не теряется (круг правок 1): повтор без `--token` и повтор с тем же
+    // `--token` (без записи) — та же строка
+    let before = p.snapshot();
+    for o in [
+        p.cmd().args(["init", "--yes"]).output().unwrap(),
+        p.init(&["--yes"], ""),
+    ] {
+        ok(&o);
+        let e = err(&o);
+        assert!(
+            e.contains("ключ без адреса") && e.contains("больше не используется"),
+            "{e}"
+        );
+        assert!(!e.contains(&old), "{e}");
+    }
+    assert_eq!(p.snapshot(), before);
+}
+
+/// M7 §4.4 (круг правок 1): `--url-to home` при ключе без адреса T1 — ключ без адреса не
+/// становится ключом этого адреса молча и не удаляется. Другой токен (`--token` или `ZAM_TOKEN`)
+/// — отказ (код 1) до любой записи с маской и советом привязать или удалить; тот же токен
+/// (`ZAM_TOKEN=T1`, в конфиге уже есть `[servers]`) — переносится в `[servers."<адрес>"]`.
+#[test]
+fn init_url_home_unbound_token() {
+    let (url, toks) = start_n("url-home-unbound", 2);
+    let (t1, t2) = (&toks[0], &toks[1]);
+    let p = Proj::new("url-home-unbound", &url, t1);
+    let cfg = home_cfg(&p);
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    let other = ["zam_", &"9".repeat(40)].concat();
+    std::fs::write(
+        &cfg,
+        format!("token = \"{t1}\"\n\n[servers.\"http://192.0.2.7:7700\"]\ntoken = \"{other}\"\n"),
+    )
+    .unwrap();
+    let before = p.snapshot();
+    let home_init = |c: &mut Command, extra: &[&str]| {
+        c.args(["init", "--url", &url, "--url-to", "home", "--yes"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    for o in [
+        home_init(&mut p.cmd(), &["--token", t2]),
+        home_init(p.cmd().env("ZAM_TOKEN", t2), &[]),
+    ] {
+        let e = err(&o);
+        assert_eq!(o.status.code(), Some(1), "{}{e}", out(&o));
+        assert!(
+            e.contains("ключ без адреса")
+                && e.contains(&zam_core::mask_token(t1))
+                && e.contains("удалите строку token"),
+            "{e}"
+        );
+        assert!(!e.contains(t1.as_str()) && !e.contains(t2.as_str()), "{e}");
+        assert_eq!(p.snapshot(), before, "файл не изменён");
+    }
+    let o = home_init(p.cmd().env("ZAM_TOKEN", t1), &[]);
+    ok(&o);
+    let home: toml::Table = toml::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+    assert!(home.get("token").is_none(), "{home:?}");
+    assert_eq!(home["url"].as_str(), Some(url.as_str()));
+    assert_eq!(
+        home["servers"][&url]["token"].as_str(),
+        Some(t1.as_str()),
+        "{home:?}"
+    );
+    assert_eq!(
+        home["servers"]["http://192.0.2.7:7700"]["token"].as_str(),
+        Some(other.as_str())
+    );
+    assert!(!err(&o).contains("ключ без адреса"), "{}", err(&o));
 }

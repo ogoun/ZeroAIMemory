@@ -516,6 +516,17 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     // адрес вне блока: home — домашний конфиг (другой адрес там — отказ), local —
     // CLAUDE.local.md и его исключение из git; block — проверка, что файл не уйдёт в git
     let local_path = root.join(LOCAL_MD);
+    // токен — в домашний конфиг ключом своего адреса `[servers."<адрес>"]` (не в файлы проекта,
+    // M7 §4.4): `--token` заменяет другой токен этого адреса с предупреждением, перенесённый из
+    // блока v1 — нет; токены других адресов не трогаются
+    let forced = token.source == Source::Flag;
+    let candidate = if forced {
+        Some(token.value.clone())
+    } else {
+        migrated.as_ref().map(|(t, _)| t.clone())
+    };
+    // токен адреса после запуска: записываемый или найденный
+    let addr_token = candidate.as_deref().unwrap_or(&token.value);
     let mut home_url = locate::HomeUrlPlan::Unchanged;
     match url_to {
         UrlTo::Block => {
@@ -525,7 +536,9 @@ pub fn run(o: Opts) -> Result<(), CliError> {
                 .map(|(_, file, _)| file.to_string())
                 .collect();
         }
-        UrlTo::Home => home_url = url::plan_home(&home, &url.value)?,
+        // ключ без адреса рядом с `url` стал бы ключом этого адреса: сверка с токеном, который
+        // пишется или найден для адреса
+        UrlTo::Home => home_url = url::plan_home(&home, &url.value, addr_token)?,
         UrlTo::Local => {
             let old = read_opt(&local_path)?;
             let text = merge::set_url_line(old.as_deref(), &url.value);
@@ -574,15 +587,6 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             merge::merge_mcp(j, &frag)
         })?);
     }
-    // токен — в домашний конфиг ключом своего адреса `[servers."<адрес>"]` (не в файлы проекта,
-    // M7 §4.4): `--token` заменяет другой токен этого адреса с предупреждением, перенесённый из
-    // блока v1 — нет; токены других адресов не трогаются
-    let forced = token.source == Source::Flag;
-    let candidate = if forced {
-        Some(token.value.clone())
-    } else {
-        migrated.as_ref().map(|(t, _)| t.clone())
-    };
     // `url` верхнего уровня (адрес для каталогов без своего): block — если его нет, home — этот,
     // local — не трогается
     let top = match url_to {
@@ -595,6 +599,12 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             locate::plan_home(&home, &url.value, t, forced, top).map_err(CliError::config)?
         }
         None => locate::HomePlan::Unchanged,
+    };
+    // ключ без адреса, который после запуска остаётся и не используется, — предупреждение и без
+    // записи токена (M7 §4.4): у записи — из плана, иначе — из файла
+    let unbound_left = match &home_plan {
+        locate::HomePlan::Write { unbound_left, .. } => unbound_left.clone(),
+        _ => locate::unused_unbound_token(&home, addr_token).map_err(CliError::config)?,
     };
     // одна запись домашнего конфига: план токена (у `--url-to home` — с адресом) или только адрес
     let home_write = match (&home_plan, &home_url) {
@@ -702,11 +712,7 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         ),
         locate::HomePlan::Unchanged => {}
     }
-    if let locate::HomePlan::Write {
-        unbound_left: Some(mask),
-        ..
-    } = &home_plan
-    {
+    if let Some(mask) = &unbound_left {
         eprintln!("предупреждение: {}", unbound_token_note(mask, None));
     }
     if let (Some((_, first)), Some(other)) = (&migrated, differs) {

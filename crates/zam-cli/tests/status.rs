@@ -398,6 +398,25 @@ fn missing_token_for_url_hint() {
         );
         assert!(!e.contains(&other) && !out(&o).contains(&other), "{args:?}");
     }
+    // `--json` — отчёт с полем `error`, как у кода 3 (круг правок 1)
+    let mut c = zam("nokey");
+    with_home(&mut c, "nokey-home", &home);
+    let o = c
+        .args(["status", "--json", "--url", "http://192.0.2.2:7700"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}{}", out(&o), err(&o));
+    let v: serde_json::Value =
+        serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", out(&o)));
+    assert_eq!(v["url"], "http://192.0.2.2:7700", "{v}");
+    assert!(v["token"].is_null(), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("zam init --url http://192.0.2.2:7700 --token")),
+        "{v}"
+    );
+    assert!(!out(&o).contains(&other));
 }
 
 #[test]

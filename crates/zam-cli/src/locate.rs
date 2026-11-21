@@ -356,10 +356,6 @@ fn nonempty(v: Option<&str>) -> Option<String> {
     v.map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
 
-fn norm_url(u: String) -> String {
-    u.trim_end_matches('/').to_string()
-}
-
 pub fn resolve(
     flags: &Flags,
     env: &[(String, String)],
@@ -458,7 +454,7 @@ pub fn resolve(
         }
     }
     if let Some(u) = r.url.as_mut() {
-        u.value = norm_url(std::mem::take(&mut u.value));
+        u.value = normalize_url(&u.value);
     }
     Ok(r)
 }
@@ -486,33 +482,58 @@ pub enum HomePlan {
 pub enum TopUrl {
     /// Не трогать (`--url-to local`).
     Keep,
-    /// Записать, если его нет (`--url-to block`, как в 0.0.13-m6.6); другой адрес не заменяется.
-    /// Не пишется и тогда, когда в файле остаётся ключ без адреса: рядом с `url` он стал бы ключом
-    /// этого адреса.
+    /// Записать, если его нет (`--url-to block`; 0.0.13-m6.6 перезаписывал его адресом каждого
+    /// `zam init`); другой адрес не заменяется. Не пишется и тогда, когда в файле остаётся ключ
+    /// без адреса: рядом с `url` он стал бы ключом этого адреса.
     IfAbsent,
-    /// Записать, если его нет (`--url-to home`; другой адрес там `zam init` отклоняет раньше);
-    /// ключ без адреса — ключ этого адреса, как у `--url-to home` 0.0.13-m6.6.
+    /// Записать, если его нет (`--url-to home`; другой адрес там `zam init` отклоняет раньше).
+    /// Ключ без адреса рядом с `url` стал бы ключом этого адреса: другой токен — отказ.
     Set,
 }
 
-/// `~/.zeroaimemory/config.toml` таблицей TOML (нет файла — пустая); битый файл — ошибка.
-fn home_table(home: &Path) -> Result<(PathBuf, toml::Table), String> {
+/// `~/.zeroaimemory/config.toml` таблицей TOML (нет файла — пустая) и для поиска настроек:
+/// битый файл или не та форма (`servers` не таблица) — ошибка, а не тихая чистка.
+fn home_doc(home: &Path) -> Result<(PathBuf, toml::Table, HomeConfig), String> {
     let path = home.join(".zeroaimemory").join("config.toml");
-    let t = match read_limited(&path) {
+    let t: toml::Table = match read_limited(&path) {
         Read::Skip => toml::Table::new(),
         Read::Failed(e) => return Err(format!("не удалось прочитать {}: {e}", path.display())),
         Read::Text(s) => toml::from_str(s.strip_prefix('\u{feff}').unwrap_or(&s))
             .map_err(|e| format!("не удалось разобрать {}: {}", path.display(), e.message()))?,
     };
-    Ok((path, t))
+    let cfg = toml::Value::Table(t.clone())
+        .try_into()
+        .map_err(|e| format!("не удалось разобрать {}: {e}", path.display()))?;
+    Ok((path, t, cfg))
 }
 
-/// Адрес `url` домашнего конфига без пробелов и `/` в конце.
-fn home_url(t: &toml::Table) -> Option<&str> {
-    t.get("url")
-        .and_then(toml::Value::as_str)
-        .map(|u| u.trim().trim_end_matches('/'))
-        .filter(|u| !u.is_empty())
+/// Таблица `[servers]` из `t` (её нет — пустая; форму проверил [`home_doc`]).
+fn take_servers(t: &mut toml::Table) -> toml::Table {
+    match t.remove("servers") {
+        Some(toml::Value::Table(s)) => s,
+        _ => toml::Table::new(),
+    }
+}
+
+/// Отказ `--url-to home` (M7 §4.4): ключ без адреса не становится ключом этого адреса молча и не
+/// удаляется.
+fn unbound_refusal(path: &Path, unbound: &str) -> String {
+    format!(
+        "{}: в домашнем конфиге есть ключ без адреса ({}) — привяжите его к его серверу: zam init \
+         --url <адрес> --token … — или удалите строку token, затем повторите",
+        path.display(),
+        zam_core::mask_token(unbound)
+    )
+}
+
+/// Маска ключа без адреса, который остаётся в домашнем конфиге и не используется — есть записи
+/// `[servers]` с токеном — и не равен `token` (M7 §4.4); битый файл — ошибка.
+pub fn unused_unbound_token(home: &Path, token: &str) -> Result<Option<String>, String> {
+    let (_, _, cfg) = home_doc(home)?;
+    Ok(cfg
+        .unbound_token()
+        .filter(|u| u != token && cfg.has_server_tokens())
+        .map(|u| zam_core::mask_token(&u)))
 }
 
 /// План записи токена `token` адреса `url` в `~/.zeroaimemory/config.toml` (M7 §4.4): ключом
@@ -521,9 +542,9 @@ fn home_url(t: &toml::Table) -> Option<&str> {
 /// ключа: `token` верхнего уровня уходит в `[servers."<url верхнего уровня>"]`, если там своего
 /// нет (тогда действует свой, прежний и так не читался), а `url` остаётся. Ключ без адреса
 /// (`token` без `url`), равный записываемому, становится ключом этого адреса; другой остаётся как
-/// есть — `unbound_left` у [`HomePlan::Write`]. Остальные ключи сохраняются (комментарии — нет: файл
-/// пишет `zam`). Другой токен этого адреса заменяется, только если `force` (`--token`), иначе
-/// [`HomePlan::Conflict`]. Битый файл — ошибка.
+/// есть — `unbound_left` у [`HomePlan::Write`], а у [`TopUrl::Set`] — отказ. Остальные ключи
+/// сохраняются (комментарии — нет: файл пишет `zam`). Другой токен этого адреса заменяется, только
+/// если `force` (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
 pub fn plan_home(
     home: &Path,
     url: &str,
@@ -531,26 +552,24 @@ pub fn plan_home(
     force: bool,
     top: TopUrl,
 ) -> Result<HomePlan, String> {
-    let (path, mut t) = home_table(home)?;
-    // форма файла — как у поиска настроек (`servers` не таблица — ошибка, а не тихая чистка)
-    let cfg: HomeConfig = toml::Value::Table(t.clone())
-        .try_into()
-        .map_err(|e| format!("не удалось разобрать {}: {e}", path.display()))?;
+    let (path, mut t, cfg) = home_doc(home)?;
     let key = normalize_url(url);
     let top_token = nonempty(cfg.token.as_deref());
-    // чей `token` верхнего уровня: `url` верхнего уровня, у `--url-to home` без него — этого
-    // адреса (он и станет `url`); иначе это ключ без адреса
-    let owner = nonempty(cfg.url.as_deref())
-        .map(|u| normalize_url(&u))
-        .or_else(|| (top == TopUrl::Set).then(|| key.clone()));
-    let unbound_left = top_token.clone().filter(|u| owner.is_none() && u != token);
+    // чей `token` верхнего уровня: `url` верхнего уровня; без него — ключ без адреса
+    let owner = nonempty(cfg.url.as_deref()).map(|u| normalize_url(&u));
+    let unbound_left = cfg.unbound_token().filter(|u| u != token);
+    if top == TopUrl::Set
+        && let Some(u) = &unbound_left
+    {
+        return Err(unbound_refusal(&path, u));
+    }
     let old = cfg.server_token(&key).map(|(_, v)| v).or_else(|| {
         top_token
             .clone()
             .filter(|_| owner.as_deref() == Some(key.as_str()))
     });
     let migrate = top_token.is_some() && unbound_left.is_none();
-    let write_url = top != TopUrl::Keep && home_url(&t).is_none() && unbound_left.is_none();
+    let write_url = top != TopUrl::Keep && owner.is_none() && unbound_left.is_none();
     if old.as_deref() == Some(token) && !migrate && !write_url {
         return Ok(HomePlan::Unchanged);
     }
@@ -558,10 +577,7 @@ pub fn plan_home(
     if replaced && !force {
         return Ok(HomePlan::Conflict(path));
     }
-    let mut servers = match t.remove("servers") {
-        Some(toml::Value::Table(s)) => s,
-        _ => toml::Table::new(),
-    };
+    let mut servers = take_servers(&mut t);
     if migrate {
         t.remove("token");
         if let (Some(o), Some(lt)) = (&owner, &top_token)
@@ -573,8 +589,7 @@ pub fn plan_home(
     set_server_token(&mut servers, &key, token);
     t.insert("servers".into(), toml::Value::Table(servers));
     if write_url {
-        let u = url.trim().trim_end_matches('/');
-        t.insert("url".into(), toml::Value::String(u.to_string()));
+        t.insert("url".into(), toml::Value::String(key));
     }
     let text = toml::to_string(&t).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(HomePlan::Write {
@@ -616,23 +631,31 @@ pub enum HomeUrlPlan {
     Conflict { path: PathBuf, old: String },
 }
 
-/// План записи одного адреса `url` в `~/.zeroaimemory/config.toml`: токены и остальные ключи
-/// не трогаются; там уже другой адрес (сравнение — после [`normalize_url`]) —
-/// [`HomeUrlPlan::Conflict`]. Битый файл — ошибка.
-pub fn plan_home_url(home: &Path, url: &str) -> Result<HomeUrlPlan, String> {
-    let (path, mut t) = home_table(home)?;
-    let url = url.trim().trim_end_matches('/');
-    match home_url(&t) {
-        Some(old) if normalize_url(old) == normalize_url(url) => return Ok(HomeUrlPlan::Unchanged),
-        Some(old) => {
-            return Ok(HomeUrlPlan::Conflict {
-                path,
-                old: old.to_string(),
-            });
-        }
+/// План записи адреса `url` в `~/.zeroaimemory/config.toml` (`--url-to home`, M6.6 §10.1;
+/// M7 §4.4): токены других адресов и остальные ключи не трогаются; там уже другой адрес
+/// (сравнение — после [`normalize_url`]) — [`HomeUrlPlan::Conflict`]. Ключ без адреса рядом с
+/// `url` стал бы ключом этого адреса: равный `token` (записываемому или найденному для адреса)
+/// переносится в `[servers."<адрес>"]`, другой (или у адреса уже свой ключ) — отказ, файл не
+/// меняется. Битый файл — ошибка.
+pub fn plan_home_url(home: &Path, url: &str, token: &str) -> Result<HomeUrlPlan, String> {
+    let (path, mut t, cfg) = home_doc(home)?;
+    let url = normalize_url(url);
+    match nonempty(cfg.url.as_deref()).map(|u| normalize_url(&u)) {
+        Some(old) if old == url => return Ok(HomeUrlPlan::Unchanged),
+        Some(old) => return Ok(HomeUrlPlan::Conflict { path, old }),
         None => {}
     }
-    t.insert("url".into(), toml::Value::String(url.to_string()));
+    if let Some(u) = cfg.unbound_token() {
+        let own = cfg.server_token(&url).map(|(_, v)| v);
+        if u != token || own.is_some_and(|o| o != u) {
+            return Err(unbound_refusal(&path, &u));
+        }
+        t.remove("token");
+        let mut servers = take_servers(&mut t);
+        set_server_token(&mut servers, &url, &u);
+        t.insert("servers".into(), toml::Value::Table(servers));
+    }
+    t.insert("url".into(), toml::Value::String(url));
     let text = toml::to_string(&t).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(HomeUrlPlan::Write { path, text })
 }
@@ -915,9 +938,10 @@ mod tests {
         assert!(format!("{f:?}").contains("zam_abcdefgh"));
     }
 
-    /// M6.6 §10.1: `--url-to home` пишет только адрес (токен и свои ключи — как были), тот же
-    /// адрес — без записи, другой — отказ; `plan_home` без адреса (`--url-to local`) адрес
-    /// домашнего конфига не трогает.
+    /// M6.6 §10.1: `--url-to home` пишет адрес (токены других адресов и свои ключи — как были),
+    /// тот же адрес — без записи, другой — отказ; `plan_home` без адреса (`--url-to local`) адрес
+    /// домашнего конфига не трогает. M7 §4.4 (круг правок 1): ключ без адреса рядом с `url` —
+    /// только свой токен (переносится в `[servers]`), иначе отказ без записи.
     #[test]
     fn home_url_plan_keeps_token_and_refuses_other_url() {
         let root = tmp("homeurl");
@@ -928,7 +952,7 @@ mod tests {
             std::fs::write(&cfg, s).unwrap();
         };
         let u = "http://192.0.2.5:7700";
-        match plan_home_url(&home, &format!("{u}/")).unwrap() {
+        match plan_home_url(&home, &format!("{u}/"), "t").unwrap() {
             HomeUrlPlan::Write { path, text } => {
                 assert_eq!(path, cfg);
                 assert_eq!(text, format!("url = \"{u}\"\n"));
@@ -936,28 +960,49 @@ mod tests {
             p => panic!("{p:?}"),
         }
         write(&format!("token = \"t\"\nurl = \"{u}/\"\n"));
-        assert_eq!(plan_home_url(&home, u).unwrap(), HomeUrlPlan::Unchanged);
+        assert_eq!(
+            plan_home_url(&home, u, "t").unwrap(),
+            HomeUrlPlan::Unchanged
+        );
         // адреса сравниваются после нормализации (M7 §4.4)
         write("url = \"HTTP://192.0.2.5:7700/\"\n");
-        assert_eq!(plan_home_url(&home, u).unwrap(), HomeUrlPlan::Unchanged);
+        assert_eq!(
+            plan_home_url(&home, u, "t").unwrap(),
+            HomeUrlPlan::Unchanged
+        );
         write("url = \"http://198.51.100.1:7700\"\n");
         assert_eq!(
-            plan_home_url(&home, u).unwrap(),
+            plan_home_url(&home, u, "t").unwrap(),
             HomeUrlPlan::Conflict {
                 path: cfg.clone(),
                 old: "http://198.51.100.1:7700".into()
             }
         );
-        write("token = \"t\"\n[hooks]\nprompt = false\n");
-        let HomeUrlPlan::Write { text, .. } = plan_home_url(&home, u).unwrap() else {
+        // ключ без адреса и свой токен — ключ этого адреса, свои ключи файла — как были
+        let unbound = "token = \"t\"\n[hooks]\nprompt = false\n\n[servers.\"http://192.0.2.6:7700\"]\ntoken = \"t6\"\n";
+        write(unbound);
+        let HomeUrlPlan::Write { text, .. } = plan_home_url(&home, u, "t").unwrap() else {
             panic!("запись адреса");
         };
         let t: toml::Table = toml::from_str(&text).unwrap();
-        assert_eq!(t["token"].as_str(), Some("t"));
+        assert!(t.get("token").is_none(), "{text}");
+        assert_eq!(t["servers"][u]["token"].as_str(), Some("t"), "{text}");
+        assert_eq!(
+            t["servers"]["http://192.0.2.6:7700"]["token"].as_str(),
+            Some("t6")
+        );
         assert_eq!(t["url"].as_str(), Some(u));
         assert_eq!(t["hooks"]["prompt"].as_bool(), Some(false));
+        // другой токен или у адреса уже свой ключ — отказ с маской
+        let e = plan_home_url(&home, u, "t3").unwrap_err();
+        assert!(
+            e.contains("ключ без адреса") && e.contains("удалите строку token"),
+            "{e}"
+        );
+        write(&format!("{unbound}\n[servers.\"{u}\"]\ntoken = \"t5\"\n"));
+        assert!(plan_home_url(&home, u, "t").is_err());
         write("url = [");
-        assert!(plan_home_url(&home, u).is_err());
+        assert!(plan_home_url(&home, u, "t").is_err());
         // токен другого адреса: `--url-to local` адрес домашнего конфига не трогает, block другой
         // адрес не заменяет
         write("url = \"http://198.51.100.1:7700\"\n");
@@ -1130,7 +1175,8 @@ mod tests {
     /// считает заменой; прежний формат переводится в новый без потери ключа (`url` верхнего
     /// уровня остаётся); тот же ключ — без записи; другой ключ того же адреса — только `force`.
     /// `url` верхнего уровня: local не трогает, block пишет, если его нет, home — свой.
-    /// Ключ без адреса: тот же токен его привязывает, другой оставляет (маска — в плане).
+    /// Ключ без адреса: тот же токен его привязывает, другой оставляет (маска — в плане), а у home
+    /// — отказ.
     #[test]
     fn plan_home_keys_by_server() {
         let (a, b) = ("http://192.0.2.1:7700", "http://192.0.2.2:7700");
@@ -1233,20 +1279,26 @@ mod tests {
         assert!(t.get("token").is_none(), "{t:?}");
         assert_eq!(t["url"].as_str(), Some(a), "{t:?}");
         assert_eq!(token_of(&t, a), Some(t1.clone()), "{t:?}");
-        // `--url-to home`: ключ без адреса — ключ этого адреса, другой токен — замена (force)
+        // `--url-to home` (круг правок 1): ключ без адреса и другой токен — отказ и с `force`
+        // (ключ не становится ключом этого адреса и не удаляется); свой токен — ключ адреса
         std::fs::write(&cfg, &unbound).unwrap();
+        for force in [false, true] {
+            let e = plan_home(&home, a, &t2, force, TopUrl::Set).unwrap_err();
+            assert!(
+                e.contains("ключ без адреса") && e.contains(&zam_core::mask_token(&t1)),
+                "{e}"
+            );
+            assert!(!e.contains(&t1), "{e}");
+        }
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), unbound);
         assert_eq!(
-            plan_home(&home, a, &t2, false, TopUrl::Set).unwrap(),
-            HomePlan::Conflict(cfg.clone())
-        );
-        assert_eq!(
-            write(plan_home(&home, a, &t2, true, TopUrl::Set).unwrap()),
-            (true, None)
+            write(plan_home(&home, a, &t1, false, TopUrl::Set).unwrap()),
+            (false, None)
         );
         let t = table();
         assert!(t.get("token").is_none(), "{t:?}");
         assert_eq!(t["url"].as_str(), Some(a), "{t:?}");
-        assert_eq!(token_of(&t, a), Some(t2.clone()), "{t:?}");
+        assert_eq!(token_of(&t, a), Some(t1.clone()), "{t:?}");
         // block: `url` пишется, если его нет; другой адрес не заменяется; повтор — без записи
         std::fs::remove_file(&cfg).unwrap();
         write(plan_home(&home, a, &t1, false, TopUrl::IfAbsent).unwrap());
