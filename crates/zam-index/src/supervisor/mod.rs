@@ -219,12 +219,14 @@ impl Supervisor {
         })
     }
 
-    /// Клиент Qdrant этого супервизора: ключ, параметры коллекции (managed) и отметка
-    /// записей, по которой [`Self::shutdown`] ждёт сброса WAL.
+    /// Клиент Qdrant этого супервизора: ключ, параметры коллекции и режим (managed — совет
+    /// `zam-server qdrant reset` при частично удалённой коллекции) и отметка записей, по которой
+    /// [`Self::shutdown`] ждёт сброса WAL.
     pub fn connect_index(&self) -> Result<QdrantIndex, IndexError> {
         let idx = QdrantIndex::connect(&self.grpc_url, self.api_key.as_deref())?
             .with_write_mark(self.writes.clone())
-            .with_exact_search(self.exact_search);
+            .with_exact_search(self.exact_search)
+            .with_managed(self.shared.is_some());
         Ok(match self.tuning {
             Some(t) => idx.with_tuning(t),
             None => idx,

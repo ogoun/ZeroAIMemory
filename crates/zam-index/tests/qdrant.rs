@@ -229,14 +229,10 @@ async fn ensure_adds_indexes_to_existing_collection() {
     assert!(!idx.ensure(MODEL, DIM).await.unwrap().created);
 }
 
-/// Частично удалённая коллекция (Windows, `i:01M7Y3C3A6E069FQ3QJXGZZGTQ`): Qdrant убрал коллекцию
-/// из своего списка, а её каталог с конфигурацией остался в хранилище. Создать коллекцию поверх
-/// Qdrant 1.19 отказывается («Collection data already exists»), `ensure` — понятной ошибкой с
-/// советом `zam-server qdrant reset`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ensure_over_half_deleted_collection_is_clear_error() {
-    let q = TestQdrant::start("half-del");
-    let idx = connect(&q);
+/// Частично удалённая коллекция (Windows, `i:01M7Y3C3A6E069FQ3QJXGZZGTQ`) — как после неудачного
+/// переименования: коллекции в списке Qdrant нет, а её каталог с конфигурацией остался в
+/// хранилище. Каталог коллекции — результат.
+async fn half_deleted(q: &TestQdrant, idx: &QdrantIndex) -> std::path::PathBuf {
     assert!(idx.ensure(MODEL, DIM).await.unwrap().created);
     let coll = q
         .dir
@@ -245,16 +241,69 @@ async fn ensure_over_half_deleted_collection_is_clear_error() {
         .join(zam_index::COLLECTION);
     let config = std::fs::read(coll.join("config.json")).unwrap();
     idx.drop_all().await.unwrap();
-    // остаток неудачного переименования: каталог коллекции, которой в Qdrant уже нет
     std::fs::create_dir_all(&coll).unwrap();
     std::fs::write(coll.join("config.json"), config).unwrap();
+    coll
+}
+
+/// Создать коллекцию поверх остатка ([`half_deleted`]) Qdrant 1.19 отказывается («Collection data
+/// already exists»); `ensure` — понятной ошибкой с советом по режиму: управляемый Qdrant —
+/// `zam-server qdrant reset`, внешний — удалить коллекцию на своём Qdrant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_over_half_deleted_collection_is_clear_error() {
+    let q = TestQdrant::start("half-del");
+    let idx = connect(&q);
+    half_deleted(&q, &idx).await;
     let err = idx.ensure(MODEL, DIM).await.unwrap_err();
     assert!(matches!(err, IndexError::Corrupt(_)), "{err:?}");
     let text = err.to_string();
     assert!(
-        text.contains("удалена частично") && text.contains("zam-server qdrant reset"),
+        text.contains("удалена частично")
+            && text.contains("DELETE /collections/zam_chunks")
+            && !text.contains("qdrant reset"),
         "{text}"
     );
+    let err = connect(&q)
+        .with_managed(true)
+        .ensure(MODEL, DIM)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("удалена частично") && err.contains("zam-server qdrant reset"),
+        "{err}"
+    );
+}
+
+/// Посылка повтора `delete_collection_retry`: остаток коллекции ([`half_deleted`]) Qdrant 1.19
+/// удаляет тем же `delete_collection` («not loaded, but its directory still exists»), и `ensure`
+/// после этого создаёт коллекцию.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_collection_removes_half_deleted_leftover() {
+    use qdrant_client::Qdrant;
+    use qdrant_client::qdrant::DeleteCollectionBuilder;
+
+    let q = TestQdrant::start("half-del-retry");
+    let idx = connect(&q);
+    let coll = half_deleted(&q, &idx).await;
+    assert!(matches!(
+        idx.ensure(MODEL, DIM).await.unwrap_err(),
+        IndexError::Corrupt(_)
+    ));
+    let raw = Qdrant::from_url(&q.grpc_url())
+        .api_key(Some(q.api_key.clone()))
+        .skip_compatibility_check()
+        .build()
+        .unwrap();
+    raw.delete_collection(DeleteCollectionBuilder::new(zam_index::COLLECTION))
+        .await
+        .unwrap();
+    assert!(
+        !coll.exists(),
+        "остаток каталога удалён: {}",
+        coll.display()
+    );
+    assert!(idx.ensure(MODEL, DIM).await.unwrap().created);
 }
 
 /// Недетерминизм векторного канала (M6, задача 5, шаг 0): слияние RRF внутри Qdrant отдаёт

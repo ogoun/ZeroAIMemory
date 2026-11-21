@@ -498,6 +498,60 @@ already exists at …», `bad_input` → `InvalidArgument`) — тест `ensure
   чисто. `cargo doc --no-deps -p zam-index -p zam-server` — 2 и 60 предупреждений (базовые линии,
   новых нет).
 
+#### Круг правок 1 (ревью задачи 7: Needs fixes — Important 1, Minor 1–7)
+
+- **Important 1 (а) — причина в строке журнала** (решение координатора). `cache::RefreshError`
+  (`Request(CliError)` | `Cache(String)`) у `refresh_triggers` и `refresh_file_refs`, `reason()`:
+  `срок: …` (`is_unsent` или `is_timeout`), `сеть: …` (новый `CliError::is_network`: его ставят
+  `net_error` и `body_error` — тело, не дочитанное по вводу-выводу или сроку), `ответ: <код>`,
+  `ответ: не разобран`, `кэш: …` (сбой записи файла). Строки `session-start`:
+  `кэш триггеров не обновлён (<причина>)`, `кэш file-refs не обновлён (<причина>)` — текста ответа
+  сервера в них больше нет (§10.7). `zam triggers sync` — прежняя ошибка (`From<RefreshError> for
+  CliError`). В тестах повтор `until_hook_done` — только по `(сеть:` и `(срок:` этих строк
+  (`env_skipped`); `files/changed: очередь не отправлена` — как было. Тест
+  `cache_refresh_failure_reason_in_log`: заглушка отвечает 500 — строки `… (ответ: 500)` без текста
+  ответа и `env_skipped` = false; недоступный сервер — `env_skipped` = true. Обратная мутация
+  (все ошибки запроса — «сеть») — тест падает: «кэш триггеров не обновлён (сеть: тайна ответа
+  (HTTP 500))». Тест `session_start_slow_server_one_deadline_for_all_requests` сверяет новый вид
+  строки (`(срок: бюджет исчерпан …)`, запрет `(срок: сервер` и `(сеть:`). ТЗ §10.3 «Строки
+  `hooks.log`» и CHANGELOG дополнены.
+- **Important 1 (б)** — опрос ETag сервера заменён одной проверкой `assert_ne!(fresh, etag)`;
+  сверка «кэш = ETag сервера» осталась.
+- **Minor 1** — `reindex_partial_delete_clear_error`: у заметки эмбеддинги текущей модели в кэше
+  (`Env::cache_embeddings`), так что reindex, продолживший бы поверх, записал бы точки — `points ==
+  0` теперь проверяет запись.
+- **Minor 2** — `tests/qdrant.rs` `delete_collection_removes_half_deleted_leftover`: остаток
+  (`half_deleted`, общий с `ensure_over_half_deleted_…`), `ensure` — `Corrupt`, сырой
+  `delete_collection` убирает каталог, `ensure` создаёт коллекцию (настоящий Qdrant 1.19.2).
+- **Minor 3** — `delete_collection_retry` разбирает `QdrantError::ResponseError { status }` в
+  образце, `rename_failure(&tonic::Status)`; ветки `other =>` нет.
+- **Minor 4** — `until_hook_done`: журнал короче длины до вызова — ротация, читается целиком;
+  в комментарии — строки фонового процесса прошлого вызова могут попасть в срез.
+- **Minor 5** — совет по режиму: `QdrantIndex::with_managed` (ставит `Supervisor::connect_index`
+  при managed). Managed — `zam-server qdrant reset --yes`; внешний — удалить коллекцию
+  `zam_chunks` на своём Qdrant (`DELETE /collections/zam_chunks`) или перейти на управляемый, без
+  команды сброса. Тесты: `reindex_partial_delete_clear_error` (managed — reset, затем внешний
+  `drop_all` — без reset), `ensure_over_half_deleted_…` (оба режима), модульные
+  `data_left_on_create_is_partial_collection`, `reset_advice_follows_mode`. Руководство — оба
+  совета.
+- **Minor 6** — ADR 0001, «Сборки»: `index_bench` собирается с `test-hooks` (dev-зависимость на
+  себя), что это значит для замера.
+- **Minor 7** — `index_api` managed_status: покой — ещё и пустая очередь заданий (`job_stats`).
+- **Minor 8** — шум `ZipWriter::drop` не трогался.
+- Прогоны круга (логи — `.tmp/t7/fr1-*`; машина под чужими сборками и своими наборами
+  параллельно): `cargo fmt --all -- --check`, `cargo clippy -p zam-index -p zam-server -p zam-cli
+  --all-targets -- -D warnings` и без `--all-targets` (без `test-hooks`) — чисто. `zam-index --lib`
+  44, `--test worker` 20 (2 ignored), `--test qdrant` 32 из 33: `ensure_adds_indexes_to_existing_
+  collection` — `Timeout expired` сырого `delete_field_index` под нагрузкой (тест не менялся),
+  отдельно вместе с `ensure_over_half_deleted_…` и `delete_collection_removes_half_deleted_leftover`
+  — 3/3. `zam-cli --bin zam` (`client::`, `cmd::hook::cache::`) 21, `--test hooks` 113 из 115 под
+  той же нагрузкой: `changed_queue_dropped_on_permanent_4xx` (бюджет продукта, очередь не ушла) и
+  `checkpoint_precompact_new_epoch_in_hook_budget` (899 мс) — отдельно вместе с
+  `cache_refresh_failure_reason_in_log` и `session_start_slow_server_one_deadline_for_all_requests`
+  4/4. Пять прогонов подряд: `session_start_outputs_digest_and_refreshes_cache_with_etag` 5/5,
+  `prompt_flushes_changed_queue` 5/5 (`.tmp/t7/fr1-runs/summary.txt`). `zam-server --test index_api`
+  4/4, `--test m5_acceptance` 5/5 (`ZAM_REQUIRE_ML=1`).
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

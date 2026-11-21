@@ -43,8 +43,9 @@
 //!
 //! **Удаление коллекции** (M7.1, задача 7): `delete_collection` повторяется при сбое
 //! переименования её каталога на Windows ([`QdrantIndex::delete_collection_retry`]). Частично
-//! удалённая коллекция — [`IndexError::Corrupt`] с советом `zam-server qdrant reset`: и когда
-//! повторы не помогли, и когда `create_collection` упирается в оставшийся каталог ([`create_err`]).
+//! удалённая коллекция — [`IndexError::Corrupt`] с советом по режиму ([`QdrantIndex::with_managed`]:
+//! `zam-server qdrant reset` или удалить коллекцию на своём Qdrant): и когда повторы не помогли, и
+//! когда `create_collection` упирается в оставшийся каталог ([`create_err`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -116,9 +117,14 @@ const DELETE_ATTEMPTS: u32 = 5;
 /// Пауза перед первым повтором удаления; дальше она удваивается до [`DELETE_PAUSE_MAX`].
 const DELETE_PAUSE: Duration = Duration::from_millis(500);
 const DELETE_PAUSE_MAX: Duration = Duration::from_secs(2);
-/// Совет при частично удалённой коллекции (её каталог остался в хранилище Qdrant).
-const RESET_ADVICE: &str = "остановите zam-server и выполните `zam-server qdrant reset --yes` — \
-                            при старте индекс пересоберётся из кэша эмбеддингов";
+/// Совет при частично удалённой коллекции (её каталог остался в хранилище Qdrant), управляемый
+/// Qdrant: хранилище стирает `zam-server qdrant reset`.
+const RESET_ADVICE_MANAGED: &str = "остановите zam-server и выполните `zam-server qdrant reset \
+                                    --yes` — при старте индекс пересоберётся из кэша эмбеддингов";
+/// То же для внешнего Qdrant (`qdrant.mode = "external"`): его хранилищем сервер не управляет.
+const RESET_ADVICE_EXTERNAL: &str = "удалите на своём Qdrant коллекцию zam_chunks (`DELETE \
+                                     /collections/zam_chunks`) или переключитесь на управляемый \
+                                     Qdrant (`qdrant.mode = \"managed\"`), затем повторите reindex";
 
 const LEVEL_CHUNK: &str = "chunk";
 const LEVELS_NOTE: [&str; 2] = ["note", "section"];
@@ -208,6 +214,9 @@ pub struct QdrantIndex {
     writes: WriteMark,
     /// Точный поиск (см. модуль): только eval.
     exact: bool,
+    /// Клиент управляемого Qdrant (супервизор, [`QdrantIndex::with_managed`]): от режима зависит
+    /// совет при частично удалённой коллекции.
+    managed: bool,
     /// Тестовые сбои `delete_collection` (фича `test-hooks`).
     #[cfg(feature = "test-hooks")]
     delete_faults: Arc<crate::test_hooks::DeleteFaults>,
@@ -237,9 +246,27 @@ impl QdrantIndex {
             tuning: None,
             writes: WriteMark::default(),
             exact: false,
+            managed: false,
             #[cfg(feature = "test-hooks")]
             delete_faults: Arc::default(),
         })
+    }
+
+    /// Клиент управляемого Qdrant (`Supervisor::connect_index` в режиме managed): совет при
+    /// частично удалённой коллекции — `zam-server qdrant reset`; иначе (внешний Qdrant) — удалить
+    /// коллекцию на своём Qdrant или перейти на управляемый.
+    pub fn with_managed(mut self, managed: bool) -> Self {
+        self.managed = managed;
+        self
+    }
+
+    /// Совет при частично удалённой коллекции по режиму Qdrant ([`QdrantIndex::with_managed`]).
+    fn reset_advice(&self) -> &'static str {
+        if self.managed {
+            RESET_ADVICE_MANAGED
+        } else {
+            RESET_ADVICE_EXTERNAL
+        }
     }
 
     /// Тестовые сбои `delete_collection` этого клиента (фича `test-hooks`, см.
@@ -414,7 +441,7 @@ impl QdrantIndex {
         self.client
             .create_collection(req)
             .await
-            .map_err(create_err)?;
+            .map_err(|e| create_err(e, self.reset_advice()))?;
         for (field, ty, tenant) in PAYLOAD_INDEXES {
             self.create_index(field, ty, tenant).await?;
         }
@@ -773,13 +800,14 @@ impl QdrantIndex {
     /// которой уже нет в списке, Qdrant удаляет сам («not loaded, but its directory still exists»).
     /// До [`DELETE_ATTEMPTS`] попыток с паузой 0,5 → 1 → 2 → 2 с, только при `Internal` с «rename»
     /// ([`rename_failure`]); прочие ошибки — сразу, как раньше. Ни одна попытка не прошла —
-    /// коллекция удалена частично: [`IndexError::Corrupt`] с советом `zam-server qdrant reset`, и
-    /// вызывающий (`reindex`) новую коллекцию поверх не создаёт.
+    /// коллекция удалена частично: [`IndexError::Corrupt`] с советом по режиму Qdrant
+    /// ([`QdrantIndex::with_managed`]: `zam-server qdrant reset` или удалить коллекцию на своём
+    /// Qdrant), и вызывающий (`reindex`) новую коллекцию поверх не создаёт.
     async fn delete_collection_retry(&self) -> Result<(), IndexError> {
         let mut attempt = 1;
         loop {
             self.writes.touch();
-            let e = match self.delete_collection_once().await {
+            let status = match self.delete_collection_once().await {
                 Ok(()) => {
                     if attempt > 1 {
                         tracing::info!(
@@ -790,17 +818,15 @@ impl QdrantIndex {
                     }
                     return Ok(());
                 }
-                Err(e) if rename_failure(&e) => e,
+                Err(QdrantError::ResponseError { status }) if rename_failure(&status) => status,
                 Err(e) => return Err(map_err("delete_collection", e)),
             };
-            let msg = match &e {
-                QdrantError::ResponseError { status } => truncate(status.message()),
-                other => truncate(&other.to_string()),
-            };
+            let msg = truncate(status.message());
             if attempt >= DELETE_ATTEMPTS {
                 return Err(IndexError::Corrupt(format!(
                     "delete_collection: коллекция {COLLECTION} удалена частично — Qdrant за \
-                     {DELETE_ATTEMPTS} попыток не переименовал её каталог ({msg}); {RESET_ADVICE}"
+                     {DELETE_ATTEMPTS} попыток не переименовал её каталог ({msg}); {}",
+                    self.reset_advice()
                 )));
             }
             let pause = delete_pause(attempt);
@@ -1231,13 +1257,8 @@ fn map_err(op: &'static str, e: QdrantError) -> IndexError {
 /// Сбой переименования каталога коллекции у `delete_collection` (Windows, файлы заняты):
 /// ответ `Internal` со словом «rename» в тексте, без учёта регистра. Только его повторяет
 /// [`QdrantIndex::delete_collection_retry`].
-fn rename_failure(e: &QdrantError) -> bool {
-    matches!(
-        e,
-        QdrantError::ResponseError { status }
-            if status.code() == Code::Internal
-                && status.message().to_lowercase().contains("rename")
-    )
+fn rename_failure(status: &tonic::Status) -> bool {
+    status.code() == Code::Internal && status.message().to_lowercase().contains("rename")
 }
 
 /// Пауза после неудачной попытки удаления `attempt` (с 1): [`DELETE_PAUSE`], удваивается, не
@@ -1251,9 +1272,9 @@ fn delete_pause(attempt: u32) -> Duration {
 /// Ошибка `create_collection`. Перед созданием `ensure` проверяет, что коллекции нет
 /// (`collection_exists`), но частично удалённой коллекции нет только в списке Qdrant: её каталог
 /// с конфигурацией остался в хранилище, и Qdrant 1.19 создавать поверх отказывается («Collection
-/// data already exists»). Это [`IndexError::Corrupt`] с советом `zam-server qdrant reset`;
-/// прочее — [`map_err`].
-fn create_err(e: QdrantError) -> IndexError {
+/// data already exists»). Это [`IndexError::Corrupt`] с советом `advice` (по режиму Qdrant,
+/// [`QdrantIndex::with_managed`]); прочее — [`map_err`].
+fn create_err(e: QdrantError, advice: &str) -> IndexError {
     if let QdrantError::ResponseError { status } = &e
         && status
             .message()
@@ -1262,7 +1283,7 @@ fn create_err(e: QdrantError) -> IndexError {
     {
         return IndexError::Corrupt(format!(
             "create_collection: коллекция {COLLECTION} удалена частично — её каталог остался в \
-             хранилище Qdrant ({}); {RESET_ADVICE}",
+             хранилище Qdrant ({}); {advice}",
             truncate(status.message())
         ));
     }
@@ -1372,9 +1393,7 @@ mod tests {
     /// Повтор `delete_collection` — только `Internal` с «rename» (без учёта регистра).
     #[test]
     fn rename_failure_only_internal_with_rename() {
-        let st = |c: Code, m: &str| QdrantError::ResponseError {
-            status: tonic::Status::new(c, m),
-        };
+        let st = tonic::Status::new;
         assert!(rename_failure(&st(
             Code::Internal,
             "Service internal error: failed to rename file from a to b"
@@ -1398,25 +1417,48 @@ mod tests {
         assert_eq!(delete_pause(u32::MAX), DELETE_PAUSE_MAX);
     }
 
-    /// Создание поверх остатка каталога — частично удалённая коллекция с советом сброса.
+    /// Создание поверх остатка каталога — частично удалённая коллекция с советом по режиму:
+    /// управляемый Qdrant — `zam-server qdrant reset`, внешний — удалить коллекцию на своём
+    /// Qdrant, без команды сброса.
     #[test]
     fn data_left_on_create_is_partial_collection() {
         let st = |c: Code, m: &str| QdrantError::ResponseError {
             status: tonic::Status::new(c, m),
         };
-        let e = create_err(st(
-            Code::InvalidArgument,
-            "Wrong input: Can't create collection with name zam_chunks. Collection data already \
-             exists at ./storage/collections/zam_chunks",
-        ));
+        let left = || {
+            st(
+                Code::InvalidArgument,
+                "Wrong input: Can't create collection with name zam_chunks. Collection data \
+                 already exists at ./storage/collections/zam_chunks",
+            )
+        };
+        let e = create_err(left(), RESET_ADVICE_MANAGED);
         assert!(
             matches!(&e, IndexError::Corrupt(m) if m.contains("zam-server qdrant reset")),
             "{e:?}"
         );
+        let e = create_err(left(), RESET_ADVICE_EXTERNAL);
+        assert!(
+            matches!(&e, IndexError::Corrupt(m)
+                if m.contains("DELETE /collections/zam_chunks") && !m.contains("qdrant reset")),
+            "{e:?}"
+        );
         assert!(matches!(
-            create_err(st(Code::InvalidArgument, "Wrong input: bad vector size")),
+            create_err(
+                st(Code::InvalidArgument, "Wrong input: bad vector size"),
+                RESET_ADVICE_MANAGED
+            ),
             IndexError::Other(_)
         ));
+    }
+
+    /// Совет — по режиму клиента: по умолчанию внешний Qdrant, `with_managed(true)` —
+    /// управляемый (так его строит `Supervisor::connect_index`).
+    #[test]
+    fn reset_advice_follows_mode() {
+        let idx = QdrantIndex::connect("http://127.0.0.1:1", None).unwrap();
+        assert_eq!(idx.reset_advice(), RESET_ADVICE_EXTERNAL);
+        assert_eq!(idx.with_managed(true).reset_advice(), RESET_ADVICE_MANAGED);
     }
 
     #[test]

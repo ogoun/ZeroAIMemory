@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use zam_core::Id;
 use zam_index::VectorFilter;
 use zam_server::config::{QdrantMode, ServerConfig};
-use zam_store::{chunks_for_index, claim_jobs, enqueue_upserts, fail_job, get_node};
+use zam_store::{chunks_for_index, claim_jobs, enqueue_upserts, fail_job, get_node, job_stats};
 
 fn uid(a: &Api) -> Id {
     a.st.admin_id
@@ -423,17 +423,23 @@ async fn managed_status_rss_and_cli_reindex_on_stopped_server() {
     );
     // покой воркера, а не только `indexed`: точку папки `keep` пишет отложенная свёртка L0 после
     // закрытия задания. Счёт до неё давал 3 точки вместо 4, и ожидание тех же точек после
-    // пересборки упиралось в предел (журнал M6, задача 7a; так же — `index_worker`, задача 17 M2)
-    until_diag(
-        "покой воркера",
-        READY,
-        async || {
-            let s = a.st.index.worker.status();
-            s.rollups_pending == 0 && !s.batch_running
-        },
-        async || vector_diag(&a),
-    )
-    .await;
+    // пересборки упиралось в предел (журнал M6, задача 7a; так же — `index_worker`, задача 17 M2).
+    // Покой — как в документации `WorkerStatus`: очередь пуста, пачки нет, свёрток не ждёт ни
+    // одна папка
+    {
+        let db = a.st.users.get(uid(&a)).await.unwrap();
+        until_diag(
+            "покой воркера",
+            READY,
+            async || {
+                let q = job_stats(&db).await.unwrap();
+                let s = a.st.index.worker.status();
+                q.queued + q.running == 0 && s.rollups_pending == 0 && !s.batch_running
+            },
+            async || vector_diag(&a),
+        )
+        .await;
+    }
     let pts = points(&a, Some("keep")).await;
     assert!(pts > 0);
     a.st.shutdown().await;
