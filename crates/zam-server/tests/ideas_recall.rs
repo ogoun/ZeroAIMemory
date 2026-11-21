@@ -531,7 +531,7 @@ async fn prompt_skips_idea_seen_in_digest() {
     assert_eq!(idea_items(&j), [format!("w:{id}")], "{j}");
 }
 
-/// Основной поиск подсказок `prompt` (то же тело, что у `prompt_hints` в `recall.rs`):
+/// Основной поиск подсказок `prompt` (то же тело, что у `prompt_hints` в `api/recall/mod.rs`):
 /// `(id, балл)` по порядку.
 async fn main_search(a: &Api, q: &str) -> Vec<(String, f64)> {
     let r = a

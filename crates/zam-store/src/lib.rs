@@ -115,8 +115,9 @@ pub use file_refs::{
     refs_to_path, shown_ref, stale_refs_of, symbols_uploaded, verified_notes,
 };
 pub use glossary::{
-    ALIAS_USES_MAX, GlossaryEntry, TERM_TITLE_MAX_CHARS, TermConflict, TermData, active_terms,
-    all_active_terms, check_term, find_alias_uses, find_term, glossary_version,
+    ALIAS_USES_MAX, BroadAlias, GlossaryEntry, ProseText, TERM_TITLE_MAX_CHARS, TermConflict,
+    TermData, active_terms, all_active_terms, broad_alias, check_term, find_alias_uses, find_term,
+    glossary_version, is_acronym,
 };
 pub use graph::{
     EdgeOrigin, EdgeType, EdgeView, GRAPH_DEPTH_MAX, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, Graph,
@@ -131,7 +132,7 @@ pub use ideas::{
     Reviewed, TaskIdea, TaskState, adopt_idea, any_idea, any_new_idea, check_idea,
     check_idea_shape, check_idea_transition, decide_idea, idea_candidate, idea_task_state,
     ideas_of_tasks, planned_from_ideas, proactive_ideas, proposal_ideas, propose_idea,
-    released_ideas, review_idea, review_queue, task_released,
+    released_ideas, review_idea, review_queue, review_queue_unseen, task_released,
 };
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
@@ -171,8 +172,8 @@ pub use sessions::{
     TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
     add_tokens, bump_epoch, check_session_id, end_session, gc_sessions, get_session,
     latest_session, list_sessions, mark_seen, mark_seen_with_tokens, register_session,
-    seen_entry_ids, seen_revs, seen_revs_any_epoch, session_epoch, session_holdout, session_tokens,
-    sessions_tokens, set_holdout, touch_session,
+    seen_entry_ids, seen_entry_revs, seen_revs, seen_revs_any_epoch, session_epoch,
+    session_holdout, session_tokens, sessions_tokens, set_holdout, touch_session,
 };
 pub use snapshots::{
     SnapTask, SnapshotRow, digest_snapshot, gc_snapshots, get_snapshot, put_snapshot,
@@ -184,8 +185,9 @@ pub use system::{
     WebSession,
 };
 pub use tasks::{
-    CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Claim, ClaimedTask, Owner, TaskData, TaskError,
-    check_task, check_task_transition, claim_task, claimed_tasks, release_task,
+    CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Claim, ClaimedTask, OpenTask, Owner, TaskData,
+    TaskError, check_task, check_task_transition, claim_task, claimed_tasks, open_tasks,
+    release_task,
 };
 pub use usage::{
     UnattributedRow, UsageCounts, UsageEvent, UsageKind, UsageSource, add_unattributed,
@@ -199,7 +201,8 @@ pub use user_db::{
 pub use vault::{
     KEY_CHECK_SETTING, VAULT_ENV_TYPES, VAULT_OPEN_FIELDS, VAULT_TITLE_MAX_CHARS, VaultMeta,
     VaultRevision, VaultScope, check_vault_title, vault_delete, vault_environment, vault_get,
-    vault_get_any, vault_list, vault_put, vault_revision_secret, vault_revisions, vault_update,
+    vault_get_any, vault_list, vault_move, vault_put, vault_revision_secret, vault_revisions,
+    vault_update,
 };
 
 /// Ошибки слоя хранения.

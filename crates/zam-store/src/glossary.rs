@@ -12,11 +12,17 @@
 //!   там же перепроверяются неразрешённые вики-ссылки `[[Имя]]` пространства
 //!   ([`crate::graph::terms_changed`]);
 //! - чтение: [`active_terms`], [`glossary_version`], [`find_alias_uses`] (псевдоним вместо
-//!   имени в тексте — предупреждение записи заметки или журнала).
+//!   имени в тексте — предупреждение записи заметки или журнала);
+//! - поиск имён и псевдонимов в тексте (M6.6 §6) — одно сравнение [`ProseText::spans`] на
+//!   предупреждения `term_alias` и подсказки терминов к запросу: код и идентификаторы — не
+//!   проза, аббревиатуры ([`is_acronym`]) — с учётом регистра; слишком общий псевдоним —
+//!   [`broad_alias`] (предупреждение `term_alias_broad` при записи термина).
 //!
 //! Текст чанков термина ([`chunk_source`]) отличается от прочих записей: имя, строка
 //! `Псевдонимы: …`, определение, тело; псевдонимы и идентификаторы кода идут и в префикс
 //! контекста чанка ([`prefix_terms`]), поэтому FTS находит термин по ним.
+
+use std::ops::Range;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -387,41 +393,297 @@ pub(crate) fn term_by_name(
     Ok(None)
 }
 
-/// Буква слова: буква или цифра (как в [`normalize_title`]).
+/// Знак слова: буква, цифра или `_` (как `\w`, M6.6 §6.2: `ZAM_X` — одно слово).
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric()
+    c.is_alphanumeric() || c == '_'
 }
 
-/// `alias` встречается в `lower_text` (оба в нижнем регистре) по границе слова.
-fn has_word(lower_text: &str, alias: &str) -> bool {
-    if alias.is_empty() {
+/// Соединитель частей идентификатора (M6.6 §6.2): `_ - . / \ : @ # $` (`_` — и так знак слова).
+/// Соединяет, только если за ним знак слова ([`joined`]): `zam-server`, `hooks.rs`,
+/// `crates/zam`, `C:\zam`, `zam::foo`, `user@zam`, `issue#12`, `PATH$ZAM`. Без знака слова за
+/// ним соединитель — граница: «$ZAM», «#ZAM», «C#», «hooks.» в прозе находят `ZAM`, `C`, `hooks`.
+fn is_connector(c: char) -> bool {
+    matches!(c, '_' | '-' | '.' | '/' | '\\' | ':' | '@' | '#' | '$')
+}
+
+/// Письменность буквы для правила `-` и `/` ([`joined`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Latin,
+    Cyrillic,
+}
+
+fn script(c: char) -> Option<Script> {
+    if !c.is_alphabetic() {
+        return None;
+    }
+    match c as u32 {
+        0x41..=0x5A | 0x61..=0x7A | 0xC0..=0x24F | 0x1E00..=0x1EFF => Some(Script::Latin),
+        0x400..=0x52F => Some(Script::Cyrillic),
+        _ => None,
+    }
+}
+
+/// Буквы разных письменностей (латиница и кириллица).
+fn other_script(a: char, b: char) -> bool {
+    matches!((script(a), script(b)), (Some(x), Some(y)) if x != y)
+}
+
+/// За краем вхождения `edge` (`beyond` — знаки от края наружу) слово продолжается: знак слова
+/// или серия соединителей, за которой знак слова (`zam::foo`). Соединитель без знака слова за
+/// ним — граница: точка в конце предложения («настроены hooks.»), «hooks: …». Серия из `-` и `/`
+/// между буквами латиницы и кириллицы — тоже граница (ревью задачи 5, M3, решение координатора):
+/// «MCP-сервер», «API-ключ», «ZAM-а», «summary/выжимка» — слова прозы, а `zam-code`,
+/// `summary/cache`, `crates/zam` — идентификаторы.
+fn joined(edge: char, mut beyond: impl Iterator<Item = char>) -> bool {
+    let Some(c) = beyond.next() else {
+        return false;
+    };
+    if is_word(c) {
+        return true;
+    }
+    if !is_connector(c) {
         return false;
     }
-    let (first, last) = (
-        alias.chars().next().expect("не пусто"),
-        alias.chars().next_back().expect("не пусто"),
-    );
-    lower_text.match_indices(alias).any(|(i, m)| {
-        let before = lower_text[..i].chars().next_back();
-        let after = lower_text[i + m.len()..].chars().next();
-        (!is_word(first) || !before.is_some_and(is_word))
-            && (!is_word(last) || !after.is_some_and(is_word))
-    })
+    let mut soft = matches!(c, '-' | '/');
+    for c in beyond {
+        if is_word(c) {
+            return !(soft && other_script(edge, c));
+        }
+        if !is_connector(c) {
+            return false;
+        }
+        soft &= matches!(c, '-' | '/');
+    }
+    false
 }
 
-/// Псевдонимы терминов `terms`, встреченные в `text` вместо имени: пары `(псевдоним, имя)`,
-/// по границе слова, без учёта регистра, не больше [`ALIAS_USES_MAX`] (порядок — терминов, затем
-/// псевдонимов).
+/// Вхождение `hay[r]` — слово прозы, а не часть слова или идентификатора: граница проверяется у
+/// края из знака слова (у «C++» правый край — знак: «C++17» находит «C++»).
+fn bounded(hay: &str, r: &Range<usize>) -> bool {
+    let s = &hay[r.clone()];
+    let first = s.chars().next().filter(|&c| is_word(c));
+    let last = s.chars().next_back().filter(|&c| is_word(c));
+    first.is_none_or(|c| !joined(c, hay[..r.start].chars().rev()))
+        && last.is_none_or(|c| !joined(c, hay[r.end..].chars()))
+}
+
+/// Нижний регистр без сдвига смещений: знак, чья строчная форма — другой длины в UTF-8 или
+/// несколько знаков («İ»), остаётся как есть (одинаково в тексте и в имени).
+fn fold(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let mut l = c.to_lowercase();
+            match (l.next(), l.next()) {
+                (Some(x), None) if x.len_utf8() == c.len_utf8() => x,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// Имя или псевдоним термина — аббревиатура (M6.6 §6.3, решение координатора 10): не меньше
+/// двух букв, и все буквы заглавные (`ZAM`, `MCP`, `AWS S3`); цифры и знаки не мешают, одна
+/// буква (`S3`, `C++`) — не аббревиатура. Аббревиатура сравнивается с учётом регистра
+/// ([`ProseText::spans`]), прочие имена — без.
+pub fn is_acronym(name: &str) -> bool {
+    let mut letters = 0;
+    for c in name.chars().filter(|c| c.is_alphabetic()) {
+        if !c.is_uppercase() {
+            return false;
+        }
+        letters += 1;
+    }
+    letters >= 2
+}
+
+/// Почему псевдоним слишком общий ([`broad_alias`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadAlias {
+    /// Меньше 3 букв или цифр («ok», «S3»).
+    Short,
+    /// Служебное слово ([`zam_core::text::is_stop_word`]: «для», «the»).
+    StopWord,
+}
+
+/// Псевдоним термина слишком общий (M6.6 §6.5): меньше 3 букв или цифр либо служебное слово
+/// (без регистра и знаков, [`normalize_title`]). Запись термина не отклоняется — сервер
+/// предупреждает `term_alias_broad`.
+pub fn broad_alias(alias: &str) -> Option<BroadAlias> {
+    if alias.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
+        Some(BroadAlias::Short)
+    } else if zam_core::text::is_stop_word(&normalize_title(alias)) {
+        Some(BroadAlias::StopWord)
+    } else {
+        None
+    }
+}
+
+/// Окно маски головы за краем ([`ProseText::head`]), байт: дальше маска не смотрит, а код,
+/// открытый на краю окна, считается кодом (повторное ревью задачи 5). 16 КиБ — с запасом на
+/// инлайн-код и блоки обычного промпта и задания субагенту; вставленный лог в сотни КБ без
+/// пустых строк на каждом `/recall` не маскируется целиком.
+pub const PROSE_HEAD_LOOKAHEAD_BYTES: usize = 16 * 1024;
+
+/// Текст для поиска имён и псевдонимов терминов (M6.6 §6): проза без кода
+/// ([`zam_markdown::prose_mask`]: код — пробелами) с исходным регистром и в нижнем регистре
+/// (по знакам, без сдвига смещений), а также сам исходник; смещения в байтах у всех трёх — одни.
+pub struct ProseText<'a> {
+    /// Исходный текст: промежуток между словами имени — пробельные знаки и в нём (пробелы
+    /// маски на месте кода не в счёт).
+    source: &'a str,
+    cased: String,
+    folded: String,
+}
+
+impl<'a> ProseText<'a> {
+    pub fn new(text: &'a str) -> ProseText<'a> {
+        Self::with_mask(text, zam_markdown::prose_mask(text))
+    }
+
+    /// Проза первых `chars` знаков `text` (подсказка к запросу — 512, пакет `brief` — 2000) с
+    /// маской текста за краем (ревью задачи 5, M1): код, открытый до края и закрытый за ним, —
+    /// код, а не проза. Маскируется окно до первой пустой строки за краем: инлайн-код пустую
+    /// строку не переходит, а незакрытый блок и так идёт до конца окна, поэтому на голове маска
+    /// окна совпадает с маской всего текста. Окно — не дальше [`PROSE_HEAD_LOOKAHEAD_BYTES`] за
+    /// краем (повторное ревью: длинный промпт без пустых строк не маскируется целиком); код,
+    /// открытый на краю такого окна, — код ([`zam_markdown::prose_mask_prefix`]).
+    pub fn head(text: &'a str, chars: usize) -> ProseText<'a> {
+        let cut = text
+            .char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(i, _)| i);
+        if cut == text.len() {
+            return Self::new(text);
+        }
+        let b = text.as_bytes();
+        let mut limit = cut.saturating_add(PROSE_HEAD_LOOKAHEAD_BYTES).min(b.len());
+        while !text.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let blank = (cut..limit).find(|&q| {
+            b[q] == b'\n' && (b[q + 1..].starts_with(b"\n") || b[q + 1..].starts_with(b"\r\n"))
+        });
+        let mut masked = match blank {
+            Some(end) => zam_markdown::prose_mask(&text[..end]),
+            None if limit == b.len() => zam_markdown::prose_mask(text),
+            None => zam_markdown::prose_mask_prefix(&text[..limit]),
+        };
+        // `cut` — граница знака: в коде маска — ASCII-пробелы, вне кода — байты исходника
+        masked.truncate(cut);
+        Self::with_mask(&text[..cut], masked)
+    }
+
+    fn with_mask(source: &'a str, cased: String) -> ProseText<'a> {
+        let folded = fold(&cased);
+        ProseText {
+            source,
+            cased,
+            folded,
+        }
+    }
+
+    /// Проза с исходным регистром: код заменён пробелами.
+    pub fn as_str(&self) -> &str {
+        &self.cased
+    }
+
+    /// Вхождения имени или псевдонима `name` в прозе — байтовые диапазоны по возрастанию
+    /// начала (могут перекрываться). Одно сравнение на предупреждения `term_alias`
+    /// ([`find_alias_uses`]) и подсказки терминов к запросу (`GlossaryIndex::find_in_head`
+    /// сервера), M6.6 §6:
+    /// - код не текст — ищется в [`ProseText`];
+    /// - идентификатор не слово — у края из знака слова нет знака слова (`_` — тоже), а у
+    ///   соединителя (`- . / \ : @ # $`) за ним нет знака слова: `zam-server`, `hooks.rs`,
+    ///   `ZAM_X`, `crates/zam`, `zam::foo` не находят `zam`/`hooks`; точка в конце предложения
+    ///   — граница, `-` и `/` между латиницей и кириллицей («MCP-сервер») — тоже;
+    /// - `acronym` ([`is_acronym`] имени, вызывающий считает один раз) — с учётом регистра,
+    ///   иначе без;
+    /// - слова многословного имени разделяет в тексте любая серия пробельных знаков исходника
+    ///   («Карта\n  кода» в пункте списка), но не вырезанный код («Карта `x` кода»).
+    pub fn spans<'s>(
+        &'s self,
+        name: &str,
+        acronym: bool,
+    ) -> impl Iterator<Item = Range<usize>> + 's {
+        let (hay, needle) = if acronym {
+            (self.cased.as_str(), name.to_string())
+        } else {
+            (self.folded.as_str(), fold(name))
+        };
+        Spans {
+            hay,
+            source: self.source,
+            parts: needle.split_whitespace().map(str::to_string).collect(),
+            from: 0,
+        }
+    }
+}
+
+/// Итератор [`ProseText::spans`].
+struct Spans<'a> {
+    hay: &'a str,
+    /// Исходник с теми же смещениями ([`ProseText`]).
+    source: &'a str,
+    /// Слова имени (по пробельным знакам).
+    parts: Vec<String>,
+    /// Байт, с которого ищется следующее вхождение первого слова.
+    from: usize,
+}
+
+impl Spans<'_> {
+    /// Конец имени, чьё первое слово кончается в `end`: остальные слова — через серию
+    /// пробельных знаков, которые пробельные и в исходнике (ревью задачи 5, I1).
+    fn tail(&self, mut end: usize) -> Option<usize> {
+        for p in &self.parts[1..] {
+            let rest = &self.hay[end..];
+            let gap = rest.len() - rest.trim_start().len();
+            let spaces = self
+                .source
+                .get(end..end + gap)
+                .is_some_and(|s| s.chars().all(char::is_whitespace));
+            if gap == 0 || !spaces || !rest[gap..].starts_with(p.as_str()) {
+                return None;
+            }
+            end += gap + p.len();
+        }
+        Some(end)
+    }
+}
+
+impl Iterator for Spans<'_> {
+    type Item = Range<usize>;
+
+    fn next(&mut self) -> Option<Range<usize>> {
+        let first = self.parts.first()?;
+        let step = first.chars().next().map_or(1, char::len_utf8);
+        loop {
+            let start = self.from + self.hay.get(self.from..)?.find(first.as_str())?;
+            // следующий поиск — со следующего знака: вхождения могут перекрываться
+            self.from = start + step;
+            if let Some(end) = self.tail(start + first.len()) {
+                let r = start..end;
+                if bounded(self.hay, &r) {
+                    return Some(r);
+                }
+            }
+        }
+    }
+}
+
+/// Псевдонимы терминов `terms`, встреченные в прозе `text` вместо имени ([`ProseText::spans`]:
+/// не в коде и не в идентификаторах, аббревиатуры — с учётом регистра, прочие — без): пары
+/// `(псевдоним, имя)`, не больше [`ALIAS_USES_MAX`] (порядок — терминов, затем псевдонимов).
 pub fn find_alias_uses<'a>(
     text: &str,
     terms: impl IntoIterator<Item = &'a GlossaryEntry>,
 ) -> Vec<(String, String)> {
-    let lower = text.to_lowercase();
+    let prose = ProseText::new(text);
     let mut out: Vec<(String, String)> = Vec::new();
     'terms: for t in terms {
         let own = normalize_title(&t.title);
         for a in &t.aliases {
-            if normalize_title(a) == own || !has_word(&lower, &a.to_lowercase()) {
+            if normalize_title(a) == own || prose.spans(a, is_acronym(a)).next().is_none() {
                 continue;
             }
             out.push((a.clone(), t.title.clone()));
@@ -557,6 +819,213 @@ mod tests {
         // граница только у буквенного края: «C++» оканчивается знаком
         assert_eq!(hit("на C++17"), [("C++".into(), "Выжимка".into())]);
         assert!(hit("").is_empty());
+    }
+
+    /// M6.6 §6.1–§6.2 (замечание 12): код в обратных кавычках и ограждениях и идентификаторы
+    /// (`zam-server`, `hooks.rs`, `ZAM_X`, `crates/zam`, `zam::foo`) — не проза; точка в конце
+    /// предложения — граница. Живой случай обкатки 2026-11-17: «ZAM» на `zam-code`,
+    /// «code map»/«zam code» на `` `zam code map` ``.
+    #[test]
+    fn alias_uses_skip_code_and_identifiers() {
+        let terms = [
+            entry("Сервер памяти", &["zam"]),
+            entry("Хуки", &["hooks"]),
+            entry("ZeroAIMemory", &["ZAM"]),
+            entry("Карта кода", &["code map", "zam code"]),
+        ];
+        let hit = |t: &str| find_alias_uses(t, &terms);
+        for text in [
+            "Запусти `zam-server` сейчас",
+            "Запусти `zam` сейчас",
+            "Пример:\n```\nzam start\nhooks\n```\nвсё",
+            "Пример:\n~~~sh\nzam start\n~~~\n",
+            "правка в hooks.rs готова",
+            "переменная ZAM_X и zam_y",
+            "путь crates/zam и C:\\zam",
+            "вызов zam::foo и user@zam",
+            "команда zam-code обновляет карту",
+            "команда ZAM-code обновляет карту",
+            "Карта — `zam code map`.",
+            "",
+        ] {
+            assert!(hit(text).is_empty(), "{text:?}: {:?}", hit(text));
+        }
+        assert_eq!(
+            hit("Все настроены hooks."),
+            [("hooks".into(), "Хуки".into())]
+        );
+        assert_eq!(hit("hooks: готовы\n"), [("hooks".into(), "Хуки".into())]);
+        assert_eq!(
+            hit("Запусти zam сейчас, а `zam` — в коде"),
+            [("zam".into(), "Сервер памяти".into())]
+        );
+        assert_eq!(
+            hit("Обнови code map."),
+            [("code map".into(), "Карта кода".into())]
+        );
+    }
+
+    /// M6.6 §6.3 (решение координатора 10): аббревиатура (две и более буквы, все заглавные) —
+    /// с учётом регистра, прочие псевдонимы — без, как прежде.
+    #[test]
+    fn alias_uses_acronym_case() {
+        let terms = [
+            entry("ZeroAIMemory", &["ZAM"]),
+            entry("Выжимка", &["summary"]),
+        ];
+        let hit = |t: &str| find_alias_uses(t, &terms);
+        assert!(hit("zam тут").is_empty(), "{:?}", hit("zam тут"));
+        assert!(hit("Zam тут").is_empty(), "{:?}", hit("Zam тут"));
+        assert_eq!(hit("ZAM тут"), [("ZAM".into(), "ZeroAIMemory".into())]);
+        assert_eq!(
+            hit("Summary в начале фразы"),
+            [("summary".into(), "Выжимка".into())]
+        );
+        assert_eq!(hit("SUMMARY"), [("summary".into(), "Выжимка".into())]);
+    }
+
+    /// Ревью задачи 5, M1: голова текста маскируется как весь текст — код, закрытый за краем,
+    /// остаётся кодом; обратная кавычка, не закрытая до пустой строки, — проза.
+    #[test]
+    fn prose_head_keeps_full_text_mask() {
+        assert_eq!(ProseText::head("a `b c` d", 4).as_str(), "a   ");
+        assert_eq!(ProseText::head("a `b\n\nc` d", 4).as_str(), "a `b");
+        assert_eq!(ProseText::head("a `b\nc\n\nd`", 4).as_str(), "a `b");
+        assert_eq!(
+            ProseText::head("a\n```\nb\n```\nc", 7).as_str(),
+            "a\n   \n "
+        );
+        assert_eq!(ProseText::head("ёж `ёж` ёж", 5).as_str(), "ёж    ");
+        assert_eq!(ProseText::head("кратко", 100).as_str(), "кратко");
+        // повторное ревью: окно маски — не дальше PROSE_HEAD_LOOKAHEAD_BYTES за краем; код,
+        // открытый на краю окна, — код, закрытый внутри окна — как во всём тексте
+        let far = "x".repeat(PROSE_HEAD_LOOKAHEAD_BYTES + 100);
+        assert_eq!(ProseText::head(&format!("a `b {far}"), 4).as_str(), "a   ");
+        assert_eq!(
+            ProseText::head(&format!("a `b {far}` hooks"), 4).as_str(),
+            "a   "
+        );
+        assert_eq!(
+            ProseText::head(&format!("a `b` hooks {far}"), 11).as_str(),
+            "a     hooks"
+        );
+        assert_eq!(
+            ProseText::head(&format!("a `b\n\nc {far}"), 4).as_str(),
+            "a `b"
+        );
+    }
+
+    /// Повторное ревью задачи 5 (круг 3): предел окна `край + PROSE_HEAD_LOOKAHEAD_BYTES` внутри
+    /// многобайтового знака (кириллица — 2 байта, эмодзи — 4) сдвигается к границе знака: без
+    /// паники, маска головы той же длины, код на краю окна — код, проза до него — проза.
+    #[test]
+    fn prose_head_window_edge_inside_multibyte_char() {
+        let head = "hooks `hooks ";
+        let cut = "hooks `hooks".len();
+        for filler in ["я", "😀"] {
+            let n = PROSE_HEAD_LOOKAHEAD_BYTES / filler.len() + 10;
+            let text = format!("{head}{}", filler.repeat(n));
+            // предел окна попадает внутрь знака — ветка сдвига к границе выполняется
+            assert!(
+                !text.is_char_boundary(cut + PROSE_HEAD_LOOKAHEAD_BYTES),
+                "{filler}"
+            );
+            let p = ProseText::head(&text, "hooks `hooks".chars().count());
+            assert_eq!(
+                p.as_str(),
+                format!("hooks{}", " ".repeat(cut - 5)),
+                "{filler}"
+            );
+            assert_eq!(p.as_str().len(), cut);
+            let hits: Vec<(usize, usize)> =
+                p.spans("hooks", false).map(|r| (r.start, r.end)).collect();
+            assert_eq!(hits, [(0, 5)], "{filler}");
+            let terms = [entry("Хуки", &["hooks"])];
+            assert_eq!(
+                find_alias_uses(p.as_str(), &terms),
+                [("hooks".into(), "Хуки".into())]
+            );
+        }
+    }
+
+    /// Ревью задачи 5, M3 (решение координатора): `-` и `/` между латиницей и кириллицей —
+    /// граница слова («MCP-сервер», «summary/выжимка»); в одной письменности — идентификатор.
+    #[test]
+    fn alias_uses_across_scripts() {
+        let terms = [
+            entry("Протокол модели", &["MCP"]),
+            entry("Интерфейс", &["API"]),
+            entry("ZeroAIMemory", &["ZAM"]),
+            entry("Выжимка", &["summary"]),
+            entry("Сводка", &["выжимка"]),
+            entry("Карта кода", &["code map", "zam code"]),
+        ];
+        let hit = |t: &str| find_alias_uses(t, &terms);
+        assert_eq!(
+            hit("Подними MCP-сервер"),
+            [("MCP".into(), "Протокол модели".into())]
+        );
+        assert_eq!(hit("Нужен API-ключ"), [("API".into(), "Интерфейс".into())]);
+        assert_eq!(hit("Логи ZAM-а"), [("ZAM".into(), "ZeroAIMemory".into())]);
+        assert_eq!(
+            hit("Поле summary/выжимка"),
+            [
+                ("summary".into(), "Выжимка".into()),
+                ("выжимка".into(), "Сводка".into())
+            ]
+        );
+        for text in [
+            "команда zam-code",
+            "Карта — `zam code map`.",
+            "кэш summary/cache",
+            "путь crates/ZAM",
+            "ZAM-code и ZAM_сервер",
+        ] {
+            assert!(hit(text).is_empty(), "{text:?}: {:?}", hit(text));
+        }
+    }
+
+    #[test]
+    fn acronym_and_broad_alias_rules() {
+        for a in ["ZAM", "MCP", "AWS S3", "ЗАМ", "C2C"] {
+            assert!(is_acronym(a), "{a}");
+        }
+        for a in ["Zam", "zam", "S3", "C++", "Z", "summary", "42", ""] {
+            assert!(!is_acronym(a), "{a}");
+        }
+        assert_eq!(broad_alias("ok"), Some(BroadAlias::Short));
+        assert_eq!(broad_alias("S3"), Some(BroadAlias::Short));
+        assert_eq!(broad_alias("C++"), Some(BroadAlias::Short));
+        assert_eq!(broad_alias("для"), Some(BroadAlias::StopWord));
+        assert_eq!(broad_alias("The!"), Some(BroadAlias::StopWord));
+        for a in ["MCP", "zam", "summary", "for the"] {
+            assert_eq!(broad_alias(a), None, "{a}");
+        }
+    }
+
+    /// Диапазоны [`ProseText::spans`] — смещения исходного текста; слова имени — через один
+    /// пробельный знак или перенос строки, не через вырезанный код.
+    #[test]
+    fn prose_spans_offsets_and_multiword() {
+        let text = "Ёж `код` code\nmap и code\r\nmap, code `x` map, code  map; İzmir";
+        let p = ProseText::new(text);
+        let got: Vec<&str> = p.spans("Code Map", false).map(|r| &text[r]).collect();
+        // ревью задачи 5, I1: любая серия пробельных знаков исходника, но не вырезанный код
+        assert_eq!(got, ["code\nmap", "code\r\nmap", "code  map"]);
+        let got: Vec<&str> = p.spans("ёж", false).map(|r| &text[r]).collect();
+        assert_eq!(got, ["Ёж"]);
+        assert_eq!(p.spans("İzmir", false).count(), 1);
+        assert_eq!(p.spans("код", false).count(), 0);
+        assert_eq!(p.spans("", false).count(), 0);
+        // перенос с отступом пункта списка, табуляция; код между словами — не промежуток
+        let text = "обновлена Карта\n  кода; Карта\tкода; Карта `x` кода; Карта\n```\nx\n```\nкода";
+        let p = ProseText::new(text);
+        let got: Vec<&str> = p.spans("Карта кода", false).map(|r| &text[r]).collect();
+        assert_eq!(got, ["Карта\n  кода", "Карта\tкода"]);
+        // перекрывающиеся вхождения: первое («xa a») не на границе, второе — на ней
+        let p = ProseText::new("xa a a");
+        let got: Vec<(usize, usize)> = p.spans("a a", false).map(|r| (r.start, r.end)).collect();
+        assert_eq!(got, [(3, 6)]);
     }
 
     #[test]

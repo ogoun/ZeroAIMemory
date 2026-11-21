@@ -16,7 +16,8 @@
 //!   ([`SessionTouch::epoch`]), [`seen_revs`] читает только её. Отметки прежних эпох хранятся до
 //!   срока сессии (аналитика). Показ идей — без эпохи (§7.2, «одна идея — один показ за
 //!   сессию»): раздел идей дайджеста читает [`seen_entry_ids`], подсказка идей к запросу —
-//!   [`seen_revs_any_epoch`];
+//!   [`seen_revs_any_epoch`]; строка очереди разбора к запросу (M6.6 §3.5) — по эпохе и ревизии,
+//!   [`seen_entry_revs`];
 //! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12); признак с
 //!   наследованием от родителя — [`session_holdout`];
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
@@ -650,6 +651,39 @@ pub async fn seen_entry_ids(
         for id in rows {
             if let Ok(id) = id?.parse::<Id>() {
                 out.push(id);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Записи журналов (`target_kind = entry`) базы владельца `owner`, выданные сессии с частью
+/// `part` **в эпоху `epoch`**, с наибольшей выданной ревизией (M6.6 §3.5, ревью задачи 14:
+/// строка очереди разбора к запросу — показ по эпохе и ревизии; одно чтение на запрос).
+pub async fn seen_entry_revs(
+    db: &Db,
+    session: &str,
+    owner: Id,
+    part: &str,
+    epoch: u32,
+) -> Result<HashMap<Id, i64>, StoreError> {
+    let (session, part) = (session.to_string(), part.to_string());
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT target_id, max(rev) FROM session_seen
+             WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = 'entry' AND part = ?3
+               AND epoch = ?4
+             GROUP BY target_id",
+        )?;
+        let rows = st.query_map(params![session, owner, part, epoch], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, rev) = row?;
+            if let Ok(id) = id.parse::<Id>() {
+                out.insert(id, rev);
             }
         }
         Ok(out)

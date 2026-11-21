@@ -478,14 +478,22 @@ fn common_steps(p: &Proj, who: &str, ideas: &str) {
         "{who}: идея в дайджесте: {ctx}\n{}",
         p.log()
     );
+    // ответы — по `id`: после `initialize` `zam mcp` обрабатывает сообщения параллельно и пишет
+    // ответы в порядке готовности (`memory_search` бывает раньше `tools/list`; M6.6, задача 12)
     let m = p.mcp(&[]);
     assert_eq!(m.len(), 3, "{who}: {m:?}");
-    let tools = m[1]["result"]["tools"].as_array().map_or(0, Vec::len);
+    let by_id = |id: u64| {
+        m.iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("{who}: нет ответа id {id}: {m:?}"))
+    };
+    let tools = by_id(2)["result"]["tools"].as_array().map_or(0, Vec::len);
     assert!(tools >= 11, "{who}: tools/list — {tools} инструментов");
-    let found = m[2]["result"]["content"][0]["text"]
+    let search = by_id(3);
+    let found = search["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default();
-    assert!(found.contains("m6/cache"), "{who}: memory_search: {}", m[2]);
+    assert!(found.contains("m6/cache"), "{who}: memory_search: {search}");
     p.code_files();
     let o = p.z(&["code", "sync", "--full"], b"");
     ok(&o, &format!("{who}: code sync"));

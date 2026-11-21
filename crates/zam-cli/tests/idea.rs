@@ -488,6 +488,14 @@ fn idea_list_filters_status_origin_knowledge() {
     let kn = ok(&t.z(&["idea", "list", "--knowledge"]));
     assert!(kn.contains(&format!("w:{k} [new] [normal] Общая")), "{kn}");
     assert!(!kn.contains(&h), "{kn}");
+    // M6.6 §9 (24): канон — --global, --knowledge — синоним (та же лента)
+    let g = t.idea("Общая через global", &["--global"]);
+    let gl = ok(&t.z(&["idea", "list", "--global"]));
+    assert!(
+        gl.contains(&k) && gl.contains(&g) && !gl.contains(&h),
+        "{gl}"
+    );
+    assert_eq!(ok(&t.z(&["idea", "list", "--knowledge"])), gl);
 
     let j = t.json(&["idea", "list", "--origin", "agent"]);
     assert_eq!(j["items"].as_array().unwrap().len(), 1);

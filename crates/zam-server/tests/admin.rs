@@ -417,6 +417,8 @@ async fn audit_pagination() {
 async fn admin_routes_reject_tokens_and_anonymous() {
     let c = ctx("authz").await;
     let uri = "/api/v1/admin/users";
+    // первый токен администратора — агентский: 403 с подсказкой, как войти (M6.6 §10.2,
+    // замечание 3); тип и код прежние
     let r = c
         .app
         .clone()
@@ -424,6 +426,78 @@ async fn admin_routes_reject_tokens_and_anonymous() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let j = json_of(r).await;
+    assert_eq!(j["type"], "about:blank", "{j}");
+    assert_eq!(
+        j["detail"],
+        "администраторский маршрут: нужен вход администратора (POST /api/v1/auth/login, cookie \
+         и x-csrf-token); токен — агентский",
+        "{j}"
+    );
+    // сессия пользователя WebUI (пароль сменён) — «только администратору»
+    let uid = c.create("olga").await["user"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, j) = c
+        .call(
+            Method::POST,
+            &format!("/api/v1/admin/users/{uid}/password"),
+            Some(json!({"password": "olga-first-pass"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    let r = c
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/login")
+                .body(Body::from(
+                    json!({"login": "olga", "password": "olga-first-pass"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let user_cookie = r.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let user_csrf = json_of(r).await["csrf"].as_str().unwrap().to_string();
+    let r = c
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/password")
+                .header(header::COOKIE, &user_cookie)
+                .header("x-csrf-token", &user_csrf)
+                .body(Body::from(
+                    json!({"old": "olga-first-pass", "new": "olga-second-pass"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    let r = c
+        .app
+        .clone()
+        .oneshot(
+            Request::get(uri)
+                .header(header::COOKIE, &user_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let j = json_of(r).await;
+    assert_eq!(j["type"], "about:blank", "{j}");
+    assert_eq!(j["detail"], "только администратору", "{j}");
     let r = c
         .app
         .clone()

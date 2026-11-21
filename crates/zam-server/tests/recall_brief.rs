@@ -434,6 +434,51 @@ async fn brief_long_task_truncated() {
     assert!(!j["warnings"].to_string().contains("task truncated"), "{j}");
 }
 
+/// Ревью задачи 5, M1 (край 2000): инлайн-код, открытый до 2000-го символа задания и закрытый
+/// после него, — код: термин внутри него подсказкой не приходит (маска — по всему заданию, а
+/// не по обрезанному); обрезка задания для поиска и предупреждение — как прежде.
+#[tokio::test]
+async fn brief_task_code_open_at_cut_is_code() {
+    let w = world("code-cut").await;
+    let a = &w.a;
+    entry(
+        a,
+        &a.token,
+        &sol(),
+        json!({"kind": "term", "title": "Мегатерм", "body": "",
+               "data": {"definition": "Термин в коде на краю"}}),
+    )
+    .await;
+    let head = "квазикэш ";
+    let open = " `мегатерм ";
+    let pad = "я".repeat(1995 - head.chars().count() - open.chars().count());
+    let before = format!("{head}{pad}{open}");
+    assert_eq!(before.chars().count(), 1995);
+    let task = format!("{before}ещё код` хвост");
+    // обратная кавычка открывает код до края 2000, закрывает — после
+    let ticks: Vec<usize> = task
+        .chars()
+        .enumerate()
+        .filter(|&(_, c)| c == '`')
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        ticks.len() == 2 && ticks[0] < 2000 && ticks[1] >= 2000,
+        "{ticks:?}"
+    );
+    let j = brief(
+        a,
+        &a.token,
+        "s",
+        json!({"event": "brief", "solution": G, "task": task}),
+    )
+    .await;
+    let t = text(&j);
+    assert!(t.contains("«Квазикэш»"), "{t}");
+    assert!(!t.contains("Мегатерм"), "{t}");
+    assert!(j["warnings"].to_string().contains("task truncated"), "{j}");
+}
+
 /// Участник общего решения получает решение, термины и файлы пространства решения, но не
 /// Knowledge владельца (ловушку, термин и ссылку на файл с `X-Zam-Solution` этого решения).
 #[tokio::test]

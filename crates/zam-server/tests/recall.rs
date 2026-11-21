@@ -530,6 +530,372 @@ async fn prompt_returns_0_to_3_above_threshold() {
     assert!(ids(&j).len() <= 1, "{j}");
 }
 
+/// Термин словаря в Knowledge; id.
+async fn term(a: &Api, title: &str) -> String {
+    entry(
+        a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "term", "title": title, "body": "",
+               "data": {"definition": format!("Определение: {title}")}}),
+    )
+    .await
+}
+
+/// Тишина `prompt`: пустой `text` и `items`.
+fn assert_silent(j: &Value, what: &str) {
+    assert_eq!(j["text"], "", "{what}: {j}");
+    assert!(j["items"].as_array().unwrap().is_empty(), "{what}: {j}");
+}
+
+/// M6.6 §3.1 (замечание 17): реплика («согласен», «продолжай») — не предмет запроса: ни
+/// подсказок поиска, ни идей, ни задач, даже если слово стоит в теле записи (FTS его находит);
+/// подсказка термина словаря остаётся — имя термина и есть предметное слово. Предметное слово —
+/// подсказка, как раньше.
+#[tokio::test]
+async fn prompt_reply_words_silent() {
+    let a = server("reply-words").await;
+    let id = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Квазар: каталог в одном файле",
+        "Владелец: согласен, каталог квазаров ведём в одном файле. Продолжай так же.",
+        "decision",
+    )
+    .await;
+    for (s, prompt) in [
+        ("rw1", "согласен"),
+        ("rw2", "Согласен, давай"),
+        ("rw3", "продолжай"),
+        ("rw4", "ok, go"),
+    ] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(s),
+            json!({"event": "prompt", "prompt": prompt}),
+        )
+        .await;
+        assert_silent(&j, prompt);
+    }
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rw5"),
+        json!({"event": "prompt", "prompt": "квазар"}),
+    )
+    .await;
+    assert_eq!(ids(&j), [format!("i:{id}")], "{j}");
+    assert_marked(&j);
+    // термин с именем-репликой — строка словаря остаётся (`term_cands`)
+    let t = term(&a, "LGTM").await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rw6"),
+        json!({"event": "prompt", "prompt": "LGTM"}),
+    )
+    .await;
+    assert_eq!(ids(&j), [format!("t:{t}")], "{j}");
+    assert_eq!(j["items"][0]["reason"], "glossary", "{j}");
+}
+
+/// M6.6 §3.3 (замечание 22): пересланное сообщение — отчёт субагента, сообщение агента,
+/// уведомление фоновой задачи — тишина без подсказок терминов (сервер — и для старых клиентов);
+/// тот же текст без маркера — подсказки, как раньше.
+#[tokio::test]
+async fn prompt_subagent_handback_silent() {
+    let a = server("handback").await;
+    let id = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Квазар светит ярче галактики",
+        "Квазар — активное ядро далёкой галактики.",
+        "discovery",
+    )
+    .await;
+    let t = term(&a, "каталог").await;
+    // слово маркера — термин словаря: строка словаря выдала бы проверку пересылки не по сырому
+    // промпту (`hb8`)
+    term(&a, "subagent").await;
+    let report = "Готово: проверил квазар, каталог без расхождений.";
+    for (s, msg) in [
+        ("hb1", format!("[Subagent hand-back] {report}")),
+        ("hb2", format!("\n  [Subagent hand-back]\n{report}")),
+        (
+            "hb3",
+            format!("<agent-message from=\"explore\">{report}</agent-message>"),
+        ),
+        (
+            "hb4",
+            format!("<task-notification>\n<summary>{report}</summary>\n</task-notification>"),
+        ),
+        // маркер после 600 пробельных символов — за пределом запроса поиска (512): признак
+        // пересылки — по сырому промпту, как у хука (ревью задачи 2, R2, S2). Сам по себе случай
+        // не отличает проверку по запросу: первые 512 символов — пробелы, предмета нет и там
+        (
+            "hb7",
+            format!("{}[Subagent hand-back] {report}", " \n\t".repeat(200)),
+        ),
+        // маркер пересекает границу 512 символов (ревью задачи 2, круг 3, S2): в первых 512 —
+        // `[Subagent ha`, не пересланное, и проверка по запросу дала бы строку термина
+        // «subagent»; по сырому промпту — тишина
+        (
+            "hb8",
+            format!("{}[Subagent hand-back] {report}", " ".repeat(500)),
+        ),
+    ] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(s),
+            json!({"event": "prompt", "prompt": msg}),
+        )
+        .await;
+        assert_silent(&j, &msg);
+    }
+    // без маркера (и с маркером не в начале) — слова человека
+    for (s, msg) in [
+        ("hb5", report.to_string()),
+        ("hb6", format!("{report} [Subagent hand-back]")),
+    ] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(s),
+            json!({"event": "prompt", "prompt": msg}),
+        )
+        .await;
+        let got = ids(&j);
+        assert!(got.contains(&format!("i:{id}")), "{msg}: {j}");
+        assert!(got.contains(&format!("t:{t}")), "{msg}: {j}");
+    }
+}
+
+/// M6.6 §3.4 (замечание 28б): промпт с почти дословным заголовком открытой задачи —
+/// подсказка-задача `ZeroAIMemory: задача «…» [<статус>] k:<id>` (`reason: task`): одна на
+/// ответ, раз за сессию; закрытая задача и одно общее слово — нет.
+#[tokio::test]
+async fn prompt_task_title_hint() {
+    let a = server("task-title").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let task = |title: &str| json!({"kind": "task", "title": title, "data": {"next_step": "шаг"}});
+    let open = entry(&a, &a.token, G, task("Перенос памяти ZeroAgent")).await;
+    let done = entry(&a, &a.token, G, task("Перенос памяти ZeroAgent в архив")).await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{done}"),
+            Some(json!({"status": "done"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let prompt = "давай займёмся переносом памяти ZeroAgent";
+    let body = json!({"event": "prompt", "solution": G, "prompt": prompt});
+    let j = ok(&a, &a.token, Some("tt1"), body.clone()).await;
+    let line = format!("ZeroAIMemory: задача «Перенос памяти ZeroAgent» [open] k:{open}");
+    let text = j["text"].as_str().unwrap();
+    assert!(text.lines().any(|l| l == line), "{j}");
+    assert!(!text.contains(&done), "закрытая задача: {j}");
+    let tasks: Vec<&Value> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["reason"] == "task")
+        .collect();
+    assert_eq!(tasks.len(), 1, "{j}");
+    assert_eq!(tasks[0]["id"], format!("k:{open}"), "{j}");
+    assert_eq!(tasks[0]["kind"], "task", "{j}");
+    // повтор в той же сессии — нет
+    let j = ok(&a, &a.token, Some("tt1"), body.clone()).await;
+    assert!(!j["text"].as_str().unwrap().contains(&open), "{j}");
+    // одно общее слово с заголовком — нет
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tt2"),
+        json!({"event": "prompt", "solution": G, "prompt": "перенос логов на другой диск"}),
+    )
+    .await;
+    assert!(!j["text"].as_str().unwrap().contains("задача «"), "{j}");
+    // вторая подходящая задача в работе — по-прежнему одна строка на ответ
+    let busy = entry(&a, &a.token, G, task("Перенос памяти ZeroAgent: проверка")).await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{busy}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = ok(&a, &a.token, Some("tt3"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert_eq!(text.matches("задача «").count(), 1, "{j}");
+    assert!(
+        text.contains(&format!("[open] k:{open}"))
+            || text.contains(&format!("[in_progress] k:{busy}")),
+        "{j}"
+    );
+    // заблокированная задача — тоже подсказка, со своим статусом (ревью задачи 2, M7)
+    let blocked = entry(&a, &a.token, G, task("Миграция журнала Vault")).await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{blocked}"),
+            Some(json!({"status": "blocked", "blocked_by": "ждём ревью"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tt4"),
+        json!({"event": "prompt", "solution": G, "prompt": "займёмся миграцией журнала Vault"}),
+    )
+    .await;
+    let line = format!("ZeroAIMemory: задача «Миграция журнала Vault» [blocked] k:{blocked}");
+    assert!(
+        j["text"].as_str().unwrap().lines().any(|l| l == line),
+        "{j}"
+    );
+}
+
+/// Ревью задачи 2, M1 (**решение координатора**): строгое совпадение FTS (все слова промпта —
+/// в тексте задачи) у короткого промпта (до `PROMPT_SHORT_WORDS` предметных слов) тоже требует
+/// покрытого заголовка — одно слово из тела задачи подсказки не даёт; у длинного промпта строгое
+/// совпадение проходит и без слов заголовка (§3.4).
+#[tokio::test]
+async fn prompt_task_strict_match() {
+    let a = server("task-strict").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let id = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": "Перенос памяти ZeroAgent",
+               "body": "Скопировать каталог базы на новый диск через zam backup.",
+               "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let line = format!("ZeroAIMemory: задача «Перенос памяти ZeroAgent» [open] k:{id}");
+    // одно слово — только в теле: строгий запрос его находит, заголовок не покрыт
+    for (s, prompt) in [("ts1", "каталог"), ("ts2", "каталог базы")] {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(s),
+            json!({"event": "prompt", "solution": G, "prompt": prompt}),
+        )
+        .await;
+        assert!(
+            !j["text"].as_str().unwrap().contains("задача «"),
+            "{prompt}: {j}"
+        );
+    }
+    // все слова длинного промпта — в теле задачи (строгий запрос): подсказка
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ts3"),
+        json!({"event": "prompt", "solution": G,
+               "prompt": "скопировать каталог базы на новый диск"}),
+    )
+    .await;
+    assert!(
+        j["text"].as_str().unwrap().lines().any(|l| l == line),
+        "{j}"
+    );
+    // короткий промпт со словом заголовка — подсказка (заголовок из одного слова покрыт)
+    let one = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": "Индексатор", "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ts4"),
+        json!({"event": "prompt", "solution": G, "prompt": "индексатор"}),
+    )
+    .await;
+    let line = format!("ZeroAIMemory: задача «Индексатор» [open] k:{one}");
+    assert!(
+        j["text"].as_str().unwrap().lines().any(|l| l == line),
+        "{j}"
+    );
+}
+
+/// Финальное ревью M6.6, Minor 3: заголовок задачи в подсказке к запросу — без секретов и до 80
+/// символов, как в строке «Открыто задач» дайджеста (`masked_clip`): ключ в заголовке не уходит
+/// агенту, длинный заголовок обрезается с многоточием.
+#[tokio::test]
+async fn prompt_task_title_masked_and_clipped() {
+    let a = server("task-mask").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    // фиктивный ключ AWS — склейкой во время выполнения
+    let key = format!("{}{}", "AK", "IAABCDEFGHIJKLMNOP");
+    let id = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": format!("Перенос памяти ZeroAgent {key}"),
+               "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tm1"),
+        json!({"event": "prompt", "solution": G,
+               "prompt": "давай займёмся переносом памяти ZeroAgent"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let line = format!("ZeroAIMemory: задача «Перенос памяти ZeroAgent ‹secret›» [open] k:{id}");
+    assert!(text.lines().any(|l| l == line), "{j}");
+    assert!(!text.contains(&key) && !text.contains(&key[..8]), "{j}");
+    // длинный заголовок: до 80 символов с многоточием, хвост в строку не попадает
+    let long = "Индексатор вложений проекта перестраивает чанки после смены модели \
+                эмбеддингов и пересчитывает хвост очереди переиндексации";
+    let lid = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": long, "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tm2"),
+        json!({"event": "prompt", "solution": G, "prompt": long}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.ends_with(&format!("k:{lid}")))
+        .unwrap_or_else(|| panic!("нет подсказки-задачи: {j}"));
+    let title = line
+        .strip_prefix("ZeroAIMemory: задача «")
+        .and_then(|l| l.split_once("» ["))
+        .map(|(t, _)| t)
+        .unwrap_or_else(|| panic!("{line}"));
+    assert!(
+        title.chars().count() <= 80 && title.ends_with('…'),
+        "{line}"
+    );
+    assert!(long.starts_with(title.trim_end_matches('…')), "{line}");
+    assert!(!line.contains("переиндексации"), "{line}");
+}
+
 /// `post_tool`: совпадение `error_regex` (с учётом `tools`) и FTS по нормализованной ошибке;
 /// строка «эта ошибка уже разбиралась»; случайное общее слово подсказку не поднимает.
 #[tokio::test]
@@ -2189,7 +2555,8 @@ async fn code_map_pointer_only_at_zero() {
 
 /// Предложение zero-agent (приложение исследования 2026-11-06): задача в `open`, захваченная
 /// сессией (`claim`), видна в дайджесте — своя первой с пометкой, чужая — после задач в работе,
-/// с пометкой; незахваченная `open` — нет.
+/// с пометкой; незахваченная `open` — строкой подсказки нет, только заголовком в строке
+/// открытых задач (M6.6 §4.2).
 #[tokio::test]
 async fn digest_shows_claimed_open_tasks() {
     let a = server("claimed-open").await;
@@ -2241,7 +2608,7 @@ async fn digest_shows_claimed_open_tasks() {
     .await;
     let text = j["text"].as_str().unwrap();
     let lines = section(text, "### Задачи");
-    assert_eq!(lines.len(), 3, "{text}");
+    assert_eq!(lines.len(), 4, "{text}");
     assert!(
         lines[0].contains("Моя захваченная") && lines[0].contains("захвачена этой сессией"),
         "{text}"
@@ -2252,6 +2619,8 @@ async fn digest_shows_claimed_open_tasks() {
         lines[2].contains("Чужая захваченная") && lines[2].contains("захвачена другой сессией"),
         "{text}"
     );
+    // M6.6 §4.2: открытых три (захваченные — в числе), заголовок — только у свободной
+    assert_eq!(lines[3], "Открыто задач: 3 — «Свободная»", "{text}");
     assert!(!text.contains(free.as_str()), "{text}");
     // у другой сессии — наоборот
     let j = ok(
@@ -2270,6 +2639,252 @@ async fn digest_shows_claimed_open_tasks() {
         lines[2].contains("Моя захваченная") && lines[2].contains("захвачена другой сессией"),
         "{lines:?}"
     );
+    assert_eq!(lines[3], "Открыто задач: 3 — «Свободная»", "{lines:?}");
+}
+
+/// M6.6 §4.1 (замечание 27): ловушки решения — первыми (новые первыми), одно место из
+/// `recall.digest_entries` (5) — самой новой ловушке Knowledge: 5 ловушек решения и 6 более
+/// новых Knowledge → 4 решения и 1 Knowledge; у решения меньше 4 ловушек — остальные места
+/// занимает Knowledge; без решения — 5 Knowledge. Мини-дайджест `brief` (3 места) — то же правило.
+#[tokio::test]
+async fn digest_traps_solution_first_knowledge_slot() {
+    const G2: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e53";
+    let a = server("traps-order").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G2, "name": "Второе"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // метка ловушки по ссылке: `s<k>` — решения G, `f<k>` — решения G2, `k<k>` — Knowledge;
+    // Knowledge пишется последней — её ловушки новее всех ловушек решений
+    let mut label = std::collections::HashMap::new();
+    for (space, mark, n, kind) in [
+        (G, "s", 5, "gotcha"),
+        (G2, "f", 2, "failure"),
+        ("knowledge", "k", 6, "gotcha"),
+    ] {
+        for k in 0..n {
+            let id = insight(
+                &a,
+                &a.token,
+                space,
+                &format!("Ловушка {mark}{k}"),
+                "x",
+                kind,
+            )
+            .await;
+            label.insert(format!("i:{id}"), format!("{mark}{k}"));
+        }
+    }
+    let traps = |j: &Value, title: &str| -> Vec<String> {
+        section(j["text"].as_str().unwrap(), title)
+            .iter()
+            .map(|l| {
+                let r = l.rsplit_once(' ').map_or(l.as_str(), |(_, r)| r);
+                label.get(r).cloned().unwrap_or_else(|| r.to_string())
+            })
+            .collect()
+    };
+    let digest = |solution: Option<&str>| {
+        let mut body = json!({"event": "session_start"});
+        if let Some(g) = solution {
+            body["solution"] = json!(g);
+        }
+        body
+    };
+    let j = ok(&a, &a.token, Some("to-1"), digest(Some(G))).await;
+    let want = ["s4", "s3", "s2", "s1", "k5"];
+    assert_eq!(traps(&j, "### Ловушки и сбои"), want, "{}", j["text"]);
+    // у решения две ловушки — остальные три места занимает Knowledge (новые первыми)
+    let j = ok(&a, &a.token, Some("to-2"), digest(Some(G2))).await;
+    let want = ["f1", "f0", "k5", "k4", "k3"];
+    assert_eq!(traps(&j, "### Ловушки и сбои"), want, "{}", j["text"]);
+    // без решения — только Knowledge, 5 самых новых
+    let j = ok(&a, &a.token, Some("to-3"), digest(None)).await;
+    let want = ["k5", "k4", "k3", "k2", "k1"];
+    assert_eq!(traps(&j, "### Ловушки и сбои"), want, "{}", j["text"]);
+    // мини-дайджест субагенту: 3 места — 2 ловушки решения и самая новая Knowledge
+    let body = json!({"event": "brief", "solution": G});
+    let j = ok(&a, &a.token, Some("to-4"), body).await;
+    assert_eq!(
+        traps(&j, "### Ловушки"),
+        ["s4", "s3", "k5"],
+        "{}",
+        j["text"]
+    );
+}
+
+/// M6.6 §4.2 (замечание 28а): в `### Задачи` — строка `Открыто задач: N — «…», «…», «…»`: N —
+/// все живые `open` решения и Knowledge (захваченные — тоже), до 3 заголовков без задач с живым
+/// захватом (те уже строками раздела), `high` первыми, затем новые; заголовок — до 80 символов.
+/// Раздел появляется и без захваченных задач; нет открытых — нет строки. То же — в пакете
+/// восстановления; в мини-дайджесте `brief` строки нет; строка — не подсказка записи.
+#[tokio::test]
+async fn digest_open_tasks_line() {
+    let a = server("open-tasks").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let start = json!({"event": "session_start", "solution": G});
+    let j = ok(&a, &a.token, Some("ot-0"), start.clone()).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(
+        !text.contains("Открыто задач") && !text.contains("### Задачи"),
+        "{text}"
+    );
+    let long = format!("Срочная: {}", "очень длинный заголовок задачи ".repeat(5));
+    let long = long.trim_end().to_string();
+    let mut ids_of = Vec::new();
+    for (space, title, priority) in [
+        (G, "Обычная старая", Some("normal")),
+        ("knowledge", "Без приоритета", None),
+        (G, long.as_str(), Some("high")),
+        (G, "Низкая", Some("low")),
+        ("knowledge", "Обычная новая", Some("normal")),
+    ] {
+        let mut data = json!({});
+        if let Some(p) = priority {
+            data["priority"] = json!(p);
+        }
+        let body = json!({"kind": "task", "title": title, "data": data});
+        ids_of.push(entry(&a, &a.token, space, body).await);
+    }
+    // заголовок длиннее 80 символов — 79 символов и «…»
+    let cut: String = long.chars().take(79).collect();
+    let cut = format!("{}…", cut.trim_end());
+    assert!(cut.chars().count() <= 80);
+    // без захваченных задач и задач в работе — раздел из одной строки
+    let j = ok(&a, &a.token, Some("ot-1"), start.clone()).await;
+    let text = j["text"].as_str().unwrap();
+    assert_eq!(
+        section(text, "### Задачи"),
+        [format!(
+            "Открыто задач: 5 — «{cut}», «Обычная новая», «Обычная старая»"
+        )],
+        "{text}"
+    );
+    // строка — не подсказка записи: заголовков задач нет в `items`
+    assert!(
+        ids_of
+            .iter()
+            .all(|id| !ids(&j).contains(&format!("k:{id}"))),
+        "{j}"
+    );
+    // задача в работе — строкой раздела, не в числе открытых; захваченная другой сессией — в
+    // числе, но не в заголовках
+    let busy = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "task", "title": "В работе", "data": {"priority": "high"}}),
+    )
+    .await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{busy}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{}/claim", ids_of[4]),
+            Some(json!({})),
+            &[("x-zam-session", "ot-other")],
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let line = format!("Открыто задач: 5 — «{cut}», «Обычная старая», «Низкая»");
+    let j = ok(&a, &a.token, Some("ot-2"), start.clone()).await;
+    let text = j["text"].as_str().unwrap();
+    let lines = section(text, "### Задачи");
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(lines[0].contains("[in_progress] В работе"), "{text}");
+    assert!(
+        lines[1].contains("Обычная новая") && lines[1].contains("захвачена другой сессией"),
+        "{text}"
+    );
+    assert_eq!(lines[2], line, "{text}");
+    // пакет восстановления — та же строка
+    let body = json!({"event": "recovery", "solution": G});
+    let j = ok(&a, &a.token, Some("ot-3"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(section(text, "### Задачи").contains(&line), "{text}");
+    // мини-дайджест субагенту — без неё
+    let body = json!({"event": "brief", "solution": G});
+    let j = ok(&a, &a.token, Some("ot-4"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.contains("### Задачи"), "{text}");
+    assert!(!text.contains("Открыто задач"), "{text}");
+}
+
+/// Ревью задачи 3, M2: строка захваченной задачи не вошла в маленький `budget_tokens`, а строка
+/// открытых задач вошла — она выходит под заголовком `### Задачи`, а не под чужим разделом; с
+/// обычным бюджетом заголовок один над обеими строками.
+#[tokio::test]
+async fn digest_open_tasks_line_keeps_heading_under_budget() {
+    let a = server("open-tasks-budget").await;
+    let long = "Длинная захваченная задача с подробным заголовком ".repeat(6);
+    let long = long.trim_end();
+    let claimed = entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "task", "title": long, "data": {"next_step": "шаг ".repeat(40)}}),
+    )
+    .await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{claimed}/claim"),
+            Some(json!({})),
+            &[("x-zam-session", "ob-1")],
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "task", "title": "Короткая"}),
+    )
+    .await;
+    let line = "Открыто задач: 2 — «Короткая»";
+    // наименьший бюджет, в который входит строка открытых задач с заголовком (и запас на
+    // расхождение суммы частей с целым); строка захваченной задачи — в разы длиннее
+    let cost =
+        zam_store::count_tokens("\n### Задачи\n") + zam_store::count_tokens(&format!("{line}\n"));
+    let budget = (1..400)
+        .find(|&b| zam_store::budget_cap(b) >= cost + 3)
+        .unwrap();
+    assert!(zam_store::count_tokens(long) > zam_store::budget_cap(budget));
+    let body = json!({"event": "session_start", "budget_tokens": budget});
+    let j = ok(&a, &a.token, Some("ob-1"), body).await;
+    let text = j["text"].as_str().unwrap();
+    assert!(!text.contains(long), "строка задачи вошла: {text}");
+    assert_eq!(section(text, "### Задачи"), [line], "{text}");
+    assert_eq!(text.matches("### Задачи").count(), 1, "{text}");
+    // обычный бюджет: обе строки под одним заголовком
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ob-1"),
+        json!({"event": "session_start"}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    let lines = section(text, "### Задачи");
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].contains("захвачена этой сессией"), "{text}");
+    assert_eq!(lines[1], line, "{text}");
+    assert_eq!(text.matches("### Задачи").count(), 1, "{text}");
 }
 
 // ---- ревью задачи 8a (C1, I1, I3, M1, M3): предел вывода канала, приоритет правил ----
@@ -2692,36 +3307,50 @@ async fn mandatory_lines_kept_before_rule_phrases() {
     assert!(bare_seen, "шаг (1″) не встретился ни при одном пределе");
 }
 
+/// MCP `memory_recall` токеном администратора в сессии `session` (`None` — без
+/// `X-Zam-Session`); текст результата.
+async fn mcp_recall_text(a: &Api, session: Option<&str>, args: Value) -> String {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "memory_recall", "arguments": args}});
+    let mut b = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(axum::http::header::HOST, "memory.lan:7700")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", a.token),
+        );
+    if let Some(s) = session {
+        b = b.header("x-zam-session", s);
+    }
+    let r = a
+        .send(b.body(axum::body::Body::from(body.to_string())).unwrap())
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_ne!(j["result"]["isError"], true, "{j}");
+    j["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 /// Повторное ревью 8a, m2: MCP `memory_recall` с `source` (восстановление) — без предела
 /// канала: хуков в MCP нет, текст не урезается под 7500 байт.
 #[tokio::test]
 async fn mcp_recall_with_source_has_no_limit() {
     let (a, _) = heavy_rules_world("limit-mcp", 20).await;
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                      "params": {"name": "memory_recall",
-                                 "arguments": {"event": "recovery", "source": "compact"}}});
-    let r = a
-        .send(
-            axum::http::Request::builder()
-                .method(Method::POST)
-                .uri("/mcp")
-                .header(axum::http::header::HOST, "memory.lan:7700")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header(
-                    axum::http::header::ACCEPT,
-                    "application/json, text/event-stream",
-                )
-                .header(
-                    axum::http::header::AUTHORIZATION,
-                    format!("Bearer {}", a.token),
-                )
-                .header("x-zam-session", "mcp-limit-1")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    let text = r.text();
+    let text = mcp_recall_text(
+        &a,
+        Some("mcp-limit-1"),
+        json!({"event": "recovery", "source": "compact"}),
+    )
+    .await;
     assert!(
         !text.contains("— Кратко о правиле"),
         "MCP — L1 у всех: {text}"
@@ -2789,6 +3418,64 @@ async fn recall_timeout_ms_param_full_digest() {
     assert!(waited.as_millis() >= u128::from(DELAY_MS), "{waited:?}");
     assert!(!has_timeout_warning(&j), "{j}");
     assert!(j["text"].as_str().unwrap().contains("звёздный"), "{j}");
+}
+
+/// M6.6 §5.1 (замечание 20): явный вызов без поля `timeout_ms` ждёт `max(recall.max_timeout_ms,
+/// recall.timeout_ms)`, хук — `recall.timeout_ms`. Шаг сбора задержан на 400 мс: `brief` из REST
+/// без `code_map` и через MCP — полный пакет (раздел ловушек) без `recall timeout`; `brief` с
+/// `code_map` (хук `subagent-start`) — срок 200 мс и `recall timeout`. Запас после задержки —
+/// 1,6 с, как у `recall_timeout_ms_param_full_digest`.
+#[tokio::test]
+async fn recall_explicit_brief_waits_max_timeout() {
+    let a = api("recall-explicit-brief", |c| {
+        assert_eq!(c.recall.timeout_ms, 200, "умолчание сервера");
+        assert_eq!(c.recall.max_timeout_ms, 2000, "предел поля");
+        // поиск — только FTS: порог балла снят, как в `recall_brief`
+        c.recall.prompt_min_score = 0.0;
+    })
+    .await;
+    let trap = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Звёздный кэш сбрасывается",
+        "Звёздный кэш сбрасывается при миграции схемы.",
+        "gotcha",
+    )
+    .await;
+    const TASK: &str = "Звёздный кэш сбрасывается";
+    const DELAY_MS: u64 = 400;
+    let _d = RecallDelay::set(&a, DELAY_MS);
+    let t = Instant::now();
+    let j = ok(
+        &a,
+        &a.token,
+        Some("eb1"),
+        json!({"event": "brief", "task": TASK}),
+    )
+    .await;
+    let waited = t.elapsed();
+    assert!(waited.as_millis() >= u128::from(DELAY_MS), "{waited:?}");
+    assert!(!has_timeout_warning(&j), "REST brief — явный вызов: {j}");
+    let text = j["text"].as_str().unwrap();
+    assert!(text.contains("### Ловушки"), "{j}");
+    assert!(text.contains(&format!("i:{trap}")), "{j}");
+    let t = mcp_recall_text(&a, None, json!({"event": "brief", "task": TASK})).await;
+    assert!(
+        !t.contains("recall timeout"),
+        "MCP brief — явный вызов: {t}"
+    );
+    assert!(t.contains("### Ловушки"), "{t}");
+    assert!(t.contains(&format!("i:{trap}")), "{t}");
+    // хук `subagent-start` шлёт `code_map` — бюджет хука
+    let j = ok(
+        &a,
+        &a.token,
+        Some("eb3"),
+        json!({"event": "brief", "task": TASK, "code_map": true}),
+    )
+    .await;
+    assert!(has_timeout_warning(&j), "brief хука — срок 200 мс: {j}");
 }
 
 /// CR-7: `timeout_ms` — 1..=`recall.max_timeout_ms` (по умолчанию 2000), иначе 400; верхний

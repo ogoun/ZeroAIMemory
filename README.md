@@ -6,11 +6,12 @@
 локальной сети хранит знания в виде дерева Markdown-заметок. Агенты (Claude Code, Codex и
 другие) читают и пишут их через API по токену, человек — через встроенный WebUI.
 
-> **Статус: ранняя разработка.** Выпущены этапы M0–M6.5 (теги `v0.0.1-m0`, `v0.0.2-m1`,
+> **Статус: ранняя разработка.** Выпущены этапы M0–M6.6 (теги `v0.0.1-m0`, `v0.0.2-m1`,
 > `v0.0.3-m2`, `v0.0.4-m3`, `v0.0.5-m4`, `v0.0.6-m4.5`, `v0.0.7-m5`, `v0.0.8-m5.5`, `v0.0.9-m5.6`,
-> `v0.0.10-m5.7`, `v0.0.11-m6`, `v0.0.12-m6.5`). В M6 «Экономия токенов» (2026-11-15) два условия
-> приёмки не выполнены — см. CHANGELOG, «Known limitations». M6.5 «Обкатка» (2026-11-16) — работа
-> с памятью на сервере в локальной сети на этом проекте и разбор идей агентом.
+> `v0.0.10-m5.7`, `v0.0.11-m6`, `v0.0.12-m6.5`, `v0.0.13-m6.6`). В M6 «Экономия токенов»
+> (2026-11-15) два условия приёмки не выполнены — см. CHANGELOG, «Known limitations». M6.5
+> «Обкатка» (2026-11-16) — работа с памятью на сервере в локальной сети на этом проекте и разбор
+> идей агентом; M6.6 «Недочёты обкатки» (2026-11-21) — исправления по её журналу замечаний.
 > API и формат данных до версии 1.0 могут меняться. Ниже везде отмечено, что уже работает, а
 > что только запланировано.
 
@@ -66,6 +67,7 @@
 | **M5.7. Идеи** | журнал «Идеи»: человек записывает замыслы (WebUI, MCP, `zam idea`), агент предлагает их к месту — раздел `### Идеи` первого старта сессии и подсказка к запросу — вопросом «начать / отложить / отказаться»; «начать» создаёт задачу со связью на идею; идеи «от агента» — только после «принять как свою»; выключатель `ideas.proactive`; блок инструкции v6 | выпущен, `v0.0.10-m5.7` |
 | **M6. Экономия токенов** | карточки поиска v2 и честный бюджет в токенах bge-m3, фокусное чтение, «уже выдавалось» и эпохи сессии, привязка MCP к сессии (`zam mcp`), дайджест с правилами Rules сверх бюджета, пороги подсказок и бусты по сеткам, учёт выданного и страница «Сессии», снимок сессии из журнала агента, перенос памяти (`zam-server backup`/`restore`, `zam export`/`import`), `features` и `docs/api-compat.md` для своих клиентов, блок инструкции v7 | выпущен, `v0.0.11-m6` |
 | **M6.5. Обкатка** | память на сервере в локальной сети и разработка этого проекта через неё с журналом недочётов; разбор идей агентом: статусы «Непросмотрено / На доработку / В плане / Отклонена / Сделано», `POST /entries/{id}/review` (в план — задача со связью на идею, на доработку, отклонить, уже сделано), очередь в дайджесте и строка плана, пакет `idea_review`, `zam idea review\|queue`, режим `ideas.mode` (`review` / `propose`), чипы статусов и разбор в карточке WebUI; правки `zam` (прокси по схеме, `ZAM_CEILING_DIRECTORIES`); блок инструкции v8 | готов, `0.0.12-m6.5` (`v0.0.12-m6.5`) |
+| **M6.6. Недочёты обкатки** | исправления по журналу обкатки M6.5: подсказки к запросу без реплик и отчётов субагентов, строка задачи по заголовку и строка новой идеи на разбор; ловушки проекта и «Открыто задач» в дайджесте; полный пакет субагенту без GPU; словарь не ловит псевдонимы в коде и идентификаторах; `zam vault rm\|rename\|mv` и перенос записи Vault; правка триггеров без замещения; флаги `zam log insight`, `zam task new`, `zam search`, `--all` у лент, `zam release list`; `zam init --url-to` (адрес не в `CLAUDE.md`), имя и GUID решения в `zam status`; руководство администратора; без миграций, блок v8 прежний | готов, `0.0.13-m6.6` (`v0.0.13-m6.6`) |
 | M7. Полировка | `doctor`, `rollback --to`, страница копий и импорт в WebUI, сборка мусора блобов, администрирование | запланирован |
 
 Что вошло в M2 (раздел `[0.0.3-m2]` в [CHANGELOG.md](CHANGELOG.md), итог и проверка
@@ -186,6 +188,16 @@ limitations».
 `crates/zam-server/tests/m65_acceptance.rs` и `web/e2e/ideas.spec.ts`. Открытые замечания обкатки
 — в M7 (журнал этапа, «Итог»).
 
+Что вошло в M6.6 (раздел `[0.0.13-m6.6]` в [CHANGELOG.md](CHANGELOG.md), спецификация —
+[docs/specs/2026-11-16-m6.6-dogfood-fixes.md](docs/specs/2026-11-16-m6.6-dogfood-fixes.md),
+перенесена в ТЗ v1.26; [журнал этапа](docs/plans/2026-11-16-m6.6-dogfood-fixes-log.md), замечания —
+[журнал обкатки](docs/plans/2026-11-15-m6.5-dogfood-log.md)): исправлены замечания обкатки 1, 3,
+6–9, 11–17, 19, 20, 22–33, 35, 36 — подсказки к запросу, дайджест, пакеты субагенту, словарь,
+Vault, ответы MCP, флаги и вывод CLI, подключение без адреса в `CLAUDE.md`, руководство
+администратора, тесты и среда; правило «план из N шагов — N задач» в протоколе `zam guide`
+(замечание 34). Миграций нет, блок инструкции v8 и 11 инструментов MCP — прежние. Ранжирование
+поиска (замечание 10) — M7.
+
 ## Возможности
 
 Работает в выпущенных версиях (M0, M1):
@@ -281,7 +293,7 @@ limitations».
 - **Знание о коде.** Записи ссылаются на файлы (`--ref`, `refs:` во frontmatter) с хэшем;
   правка файла помечает знание «возможно устарело» (хук или `zam refs check`), а при чтении
   файла хук без сети подсказывает, что о нём есть в памяти.
-- **Окружение в Vault.** Хосты и стенды (`zam vault add --type host`): открытые поля ищутся
+- **Окружение в Vault.** Хосты и стенды (`zam vault set --type host`): открытые поля ищутся
   `vault?q=` и видны в дайджесте, секрет — только раскрытием с аудитом.
 - **Рабочая память хуков.** Локальный журнал событий сессии (только метаданные), пакет
   восстановления после `/compact`, пакет под задачу субагента (`SubagentStart`, `brief`),
@@ -403,6 +415,28 @@ limitations».
   (`propose` — поведение 0.0.10-m5.7).
 - **Правки по обкатке.** `zam` выбирает прокси из окружения по схеме адреса, как curl, и не ищет
   файлы проекта выше каталогов `ZAM_CEILING_DIRECTORIES`.
+
+Добавлено в M6.6 (`v0.0.13-m6.6`):
+
+- **Подсказки к запросу по делу.** На реплики без предмета («согласен», «продолжай») и на отчёты
+  субагентов подсказок нет; запрос из одного-двух слов получает подсказку, только если слово есть
+  в тексте записи. Промпт с заголовком открытой задачи даёт строку `задача «…» [<статус>] k:<id>`,
+  новая идея человека — строку «новая идея на разбор «…» w:<id>» к любому запросу (и после сжатия
+  контекста — снова).
+- **Дайджест о своём проекте.** Ловушки решения — первыми (одно место — общей ловушке Knowledge),
+  в разделе «Задачи» — «Открыто задач: N — «…», «…», «…»»; пакет субагенту и восстановление,
+  вызванные явно, ждут до 2 с — на сервере без GPU они больше не обрываются одними правилами.
+- **Словарь без ложных срабатываний.** Псевдоним не ищется в коде и внутри идентификаторов
+  (`zam-server`, `hooks.rs`), аббревиатуры (`ZAM`, `MCP`) — с учётом регистра; слишком общий
+  псевдоним — предупреждение `term_alias_broad`.
+- **Vault и MCP.** Удаление, переименование и перенос записи между личным Vault и Vault решения
+  (`zam vault rm|rename|mv`, `memory_vault action=delete|rename|move`); правка триггеров insight
+  без замещения (`zam insight triggers`, `action=triggers`); понятные ответы захвата задачи и
+  связей, префикс `rules:` в `memory_tree`.
+- **CLI.** Поля решения и доказательства у `zam log insight`, поля `zam task new`, `--all` у лент,
+  фильтры и бюджет `zam search` с признаком усечения, `zam release list`, маскировка секретов
+  сигнатур до отправки в `zam code sync`; имя и GUID решения в `zam status`; адрес сервера вне
+  коммитящегося `CLAUDE.md` — `zam init --url-to home|local`.
 
 ## Архитектура
 
@@ -534,6 +568,10 @@ zam status
 сливает хуки в `.claude/settings.json` и `.codex/hooks.json` и сервер MCP в `.mcp.json` (с M6 —
 stdio-прокси `zam mcp`). Токена в файлах проекта нет: он хранится в `~/.zeroaimemory/config.toml`,
 оттуда его берут `zam`, хуки и `zam mcp`; переменная `ZAM_TOKEN` нужна только MCP по HTTP.
+Адрес сервера по умолчанию — строкой `ZeroAIMemoryUrl=` в блоке; с 0.0.13-m6.6
+`zam init --url-to home` хранит его в `~/.zeroaimemory/config.toml`, `--url-to local` — в
+`CLAUDE.local.md`, исключённом из git: в блоке адреса нет, и `CLAUDE.md` можно коммитить в
+публичный репозиторий. Повторный `zam init` режим сохраняет.
 Подробно (Codex, ручная настройка, служба) —
 [deploy/README-install.md](deploy/README-install.md), раздел «Подключение агента (`zam init`)».
 
@@ -551,16 +589,22 @@ stdio-прокси `zam mcp`). Токена в файлах проекта не�
 
 | Команда | Что делает |
 |---|---|
-| `zam status` | проверка сервера, токена, пользователя и `solution.toml` |
+| `zam status` | проверка сервера, токена (печатается префикс `zam_XXXXXXXX…`, как в списке токенов WebUI), пользователя и решения: M6.6 — строка `Решение:  «<имя>» (<GUID>) — <путь solution.toml>`, в `--json` — `solution_id`, `solution_name` (имя реестра), `solution_file_name` (имя в файле) |
 | `zam tree [цель] [--depth 1..5]` | дерево с краткими сводками L0 |
 | `zam read <цель>… [--tier L0\|L1\|L2\|focus] [--section "A > B"] [--rev N]` | чтение Markdown как он сохранён; `--batch`, `--max-tokens N`, `--budget N`, `--if-rev N`, `--since-rev N` (дифф с ревизии, M4.5), `--locator` (часть вложения, M5) — пачкой через `POST /read` с бюджетом токенов; `--focus "<запрос>"` (M6) — оглавление и ближайшие к запросу части, пропуски с адресом `range:r<rev>:S-E`; `--range r<rev>:S-E` (M6) — ровно пропущенный текст той ревизии |
 | `zam write <цель> [--file f.md] [-m сообщение] [--base-rev N] [--l0 текст]` | создать или заменить заметку (без `--file` текст читается из stdin) |
 | `zam history <цель> [--diff A..B \| --revert N]` | ревизии, дифф, откат |
-| `zam search <запрос> [--all] [--mode brief\|chunks\|notes] [--top-k N] [--rerank]` | поиск, по умолчанию Markdown-карточки; `--rerank` — серверный реранк |
+| `zam search <запрос> [--all] [--mode brief\|chunks\|notes] [--top-k N] [--rerank] [--budget N] [--kind K]… [--insight-kind K]… [--certainty C]… [--status S]… [--decided-by human\|agent] [--file P] [--history]` | поиск, по умолчанию Markdown-карточки; `--rerank` — серверный реранк. M6.6: бюджет ответа и фильтры `filters` флагами; бюджет или отсечка слабых срезали карточки — строка в stderr «показано K из L: бюджет — ещё N (--budget), слабые — M» |
+| `zam release add <версия> [--date D] [--tag T] [--from-git [FROM..TO]] \| compare <версия> [--with prev\|<версия>] \| list [--limit N \| --all]` | релизы решения (M3); M6.6: `list` — новые первыми, строками `<id> <версия> <дата>[ тег <tag>][ · коммитов K]` |
 | `zam attach <цель> <файл>` | загрузить вложение и напечатать ссылку `_attachments/…` |
 | `zam report <файл.md> [--title T] [--tag X]… [--area A] [--ref commit:<sha>\|file:<путь>\|note:<id>\|task:k:<id>]… [--key K] [--json]` | отчёт пользователю (M5.5): Markdown с картинками и файлами по относительным ссылкам — одним запросом; печатает ссылку на страницу WebUI |
-| `zam code sync [--full] [--prune] \| status \| map [--focus <путь\|имя>]… [--task T] [--tokens N] \| sym <имя\|путь#qual> \| refs <имя> \| impact [--since C]` | карта кода решения (M5.6): синхронизация рабочей копии, карта в бюджете, карточка символа, кто ссылается, влияние правки |
-| `zam idea list [--status S]… [--origin human\|agent] [--knowledge] \| new <заголовок> [--body T\|--file F] [--priority low\|normal\|high] [--horizon YYYY-MM-DD] [--tag X]… [--origin human\|agent] \| propose <w:id> [--text T] [--space <guid>] \| accept <w:id> [--by human\|agent] [--channel chat\|cli] [--space <guid>] \| defer\|decline <w:id> [--by human\|agent] [--channel chat\|cli] \| queue [--limit N] \| review <w:id> --plan\|--return\|--decline\|--done --summary-file F [--missing T] [--basis ID]… [--similar w:ID]… [--task k:ID \| --task-title T --task-body-file F --task-priority P] [--key K]` | идеи (M5.7): лента, запись, предложение агентом, решение человека (`defer --until`, `decline --reason`); под агентом `--origin` и `--by` обязательны. M6.5: `queue` — пакет разбора, `review` — исход разбора агентом (в план, на доработку, отклонить, уже сделано) |
+| `zam code sync [--full] [--prune] \| status \| map [--focus <путь\|имя>]… [--task T] [--tokens N] \| sym <имя\|путь#qual> \| refs <имя> \| impact [--since C]` | карта кода решения (M5.6): синхронизация рабочей копии, карта в бюджете, карточка символа, кто ссылается, влияние правки. M6.6: секреты сигнатур клиент маскирует до отправки правилами сервера — итог строкой stderr «секреты в сигнатурах: N (файлов F) — …», список мест — `masked` в `--json` |
+| `zam log insight --kind K --title T [--scope global] [--certainty C] [--evidence-file F \| --evidence-checked C --evidence-method M --evidence-result R] [--context C] [--option O]… [--chosen C] [--rationale R] [--consequences C] [--decided-by human\|agent] [--revisit-if R]` | insight (открытие, ловушка, решение); M6.6: поля решения `data.decision` флагами — только у `--kind decision` (у `zam insight supersede` без `--kind` — вид замещаемой записи), до 8 `--option`; доказательство без файла — три флага `--evidence-*` вместе; без `--certainty` — строка в stderr об умолчании агента `hypothesis` |
+| `zam insight triggers <id> --trigger ВИД:ШАБЛОН… \| --clear` | правка набора триггеров insight без замещения записи (M6.6): ревизия — из записи, правка с `If-Match` (запись изменилась — код 4); печатает `<id>@<rev> триггеров K` и новый набор |
+| `zam task new --title T [--next S] [--owner agent\|human] [--estimate МИН] [--link L]… [--priority low\|normal\|high]` | задача (M4.5); M6.6: владелец, оценка в минутах, ссылки и приоритет — в `data` задачи, их печатает `zam task show` |
+| `zam insight\|task\|question\|idea list [--global] [--limit N \| --all]` | ленты журналов; M6.6: есть ещё записи — строка в stderr «показано N, есть ещё: --limit 200 или --all», `--all` — вся лента. Область Knowledge — `--global` у лент, записей и Vault; `--knowledge` — синоним |
+| `zam idea list [--status S]… [--origin human\|agent] [--global] \| new <заголовок> [--body T\|--file F] [--priority low\|normal\|high] [--horizon YYYY-MM-DD] [--tag X]… [--origin human\|agent] [--global] \| propose <w:id> [--text T] [--space <guid>] \| accept <w:id> [--by human\|agent] [--channel chat\|cli] [--space <guid>] \| defer\|decline <w:id> [--by human\|agent] [--channel chat\|cli] \| queue [--limit N] \| review <w:id> --plan\|--return\|--decline\|--done --summary-file F [--missing T] [--basis ID]… [--similar w:ID]… [--task k:ID \| --task-title T --task-body-file F --task-priority P] [--key K]` | идеи (M5.7): лента, запись, предложение агентом, решение человека (`defer --until`, `decline --reason`); под агентом `--origin` и `--by` обязательны. M6.5: `queue` — пакет разбора, `review` — исход разбора агентом (в план, на доработку, отклонить, уже сделано) |
+| `zam vault list [--q Q] \| get <имя> [--raw] \| set <имя> --type T [--purpose P] [--address A] [--limits L] [--secret-stdin] \| rm <имя> \| rename <имя> <новое> \| mv <имя> --to global\|solution\|<GUID>` | Vault: записи без значений, значение в stdout (раскрытие — в аудит), запись (значение — только из stdin или скрытого ввода; у `host` и `environment` необязательно), мягкое удаление, переименование, перенос между личным Vault и Vault решения (M6.6, новая ревизия). Область — `--global` (личный, для всех проектов) или `--solution G`, без них — решение из `solution.toml`. `add` — синоним `set`, `delete` — синоним `rm` |
 | `zam cache put --query Q --sources ID[#секция][@rev],… [--promote note:<путь>\|insight:<вид>] < выжимка.md` | сохранить выжимку с источниками (печатает `c_<id>`); `zam cache list\|show\|rm` — список, карточка с изменившимися источниками, удаление |
 | `zam export [--space S] [--path P]… [--kind K]… [--no-history] -o <файл.zip>` | экспорт пространства (M6): архив zip — заметки `.md` с frontmatter, вложения, записи журналов, связи, история; без Vault, карты кода, корзины и сессий; токен — без Human и отчётов. Загрузка идёт в `<файл>.<pid>.part` (после убитого процесса его можно удалить); сервер молчит дольше `ZAM_EXPORT_IDLE_SECS` (300 с) — код 2. В WebUI — пункт «Экспорт (.zip)» в меню пространства |
 | `zam import <файл.zip\|каталог> [--space S] [--own] [--on-conflict skip\|revision] [--axioms demote\|keep] [--dry-run]` | импорт пространства (M6): архив `zam export` или каталог `.md` (без `manifest.json` — все `*.md` заметки, архив чужой). Свой архив (тот же пользователь или `--own` при переезде) — id и аксиомы как есть; чужой — новые id, ссылки переписаны, аксиомы → `theorem` (`--axioms keep` — как есть). Повтор того же архива пропускается, изменившееся — в отчёт конфликтов (`--on-conflict revision` — новая ревизия). Только владелец пространства или администратор; отчёты — только из сессии WebUI; предел — `import.max_bytes` (2 ГиБ). Сервер принимает архив и выполняет импорт заданием; `zam` опрашивает его и печатает этап, Ctrl+C прекращает только ожидание; каталог упаковывается на лету, скрытые пути не переносятся |
@@ -576,16 +620,28 @@ zam read "knowledge:Инструменты/Bash" --section "Установка >
 Если векторный поиск выключен (нет моделей, Qdrant недоступен), `zam search` отвечает
 результатами полнотекстового поиска: в Markdown остаётся строка сервера `> degraded: <код> — <причина>`,
 а в stderr печатается причина по-русски. Предупреждения ответа (например, «реранкер не
-установлен» при `--rerank`) тоже идут в stderr, в Markdown — строками `> warning:`.
+установлен» при `--rerank`) тоже идут в stderr, в Markdown — строками `> warning:`. Бюджет срезал
+карточки — в Markdown строка хвоста сервера `> не поместилось по бюджету: N (budget_tokens B)`,
+в stderr — «показано K из L: бюджет — ещё N (--budget), слабые — M» (сервер 0.0.13-m6.6 и новее).
 
 Коды выхода: 0 — успех, 1 — конфигурация, 2 — сервер недоступен, 3 — токен, 4 — конфликт
 ревизий (дифф в stderr), 5 — не найдено, 6 — неверный ввод. Команды журналов, Vault, связей и
 доступа (`zam log`, `insight`, `release`, `vault`, `link`, `links`, `solution access`) есть с M3,
 команды агента (`zam init`, `guide`, `mcp`, `hook …`, `triggers sync`, `cache`,
 `solution rename`) — с M4, рабочей памяти (`zam log term`, `glossary`, `task`, `question`,
-`refs check|verify`, `links file:`, `vault add`, `hook subagent-start`) — с M4.5, `zam report` — с
+`refs check|verify`, `links file:`, `vault set --type host`, `hook subagent-start`) — с M4.5, `zam report` — с
 M5.5, `zam code` — с M5.6, `zam idea` — с M5.7, `zam export`, `import`, `sessions tokens|snapshot`
-(`zam session …` — то же) и `zam read --focus|--range` — с M6, `zam idea review|queue` — с M6.5; см.
+(`zam session …` — то же) и `zam read --focus|--range` — с M6, `zam idea review|queue` — с M6.5,
+`zam vault rm|rename|mv` — с M6.6 (`mv` — сервер `0.0.13-m6.6` и новее), `zam insight triggers`
+и `zam init --url-to` — с M6.6 (сервер любой), флаги решения и
+доказательства `zam log insight`, поля `zam task new`, `--all` лент, флаги бюджета и фильтров
+`zam search` и `zam release list` — с M6.6. Нужный сервер:
+`--evidence-checked|method|result` (`data.evidence`) и `--all`/`--limit` (курсор `next_cursor`,
+страница до 200) — `0.0.4-m3` и новее (лента задач и вопросов — с `0.0.6-m4.5`, идей — с
+`0.0.10-m5.7`); поля решения (`data.decision`) и `--owner`, `--estimate`, `--link` задачи —
+`0.0.6-m4.5`; `--priority` задачи — `0.0.12-m6.5`; фильтры `zam search` (`--decided-by`,
+`--file`, `--insight-kind`) — `0.0.6-m4.5` (старый сервер неизвестные фильтры пропускает молча),
+строка «показано K из L» — `0.0.13-m6.6`; `zam release list` — любой; см.
 [deploy/README-install.md](deploy/README-install.md). Хуки
 (`zam hook …`) всегда выходят с кодом 0.
 
@@ -705,6 +761,31 @@ cargo build --release -p zam-cli                   # отдельной кома
 - Интеграционные тесты запускают настоящий Qdrant из `target/deps`, Docker не нужен.
   `ZAM_TEST_QDRANT_MAX` ограничивает число одновременно запущенных экземпляров в одном
   тестовом бинарнике (по умолчанию 4). На HDD это убирает падения тестов от взаимной нагрузки.
+  Тесты сервера и `zam-index` (`worker.rs`) ждут создания коллекции до 240 с без
+  продвижения: пока добавляются payload-индексы, ожидание продлевается, но не дольше 900 с.
+  Тесты сервера печатают время готовности строкой `ZAM_TIMING векторный канал готов за …`.
+- Замеры времени для приёмки помечены `#[ignore = "замер времени для приёмки: тихое окно"]`:
+  `m4_acceptance::hook_budgets`, `m57_acceptance::acceptance_recall_p95_with_50_ideas`,
+  `m6_acceptance::acceptance_hook_budgets`. Под общим прогоном на занятой машине их пороги
+  проверить нельзя. Запускайте их отдельно, когда машина свободна (сборок, игр и редакторов
+  нет), например
+  `cargo test -p zam-cli --test m4_acceptance hook_budgets -- --ignored --exact`. Так же
+  запускается `m57_acceptance`, а `m6_acceptance acceptance_hook_budgets` — с `--release` и
+  бинарниками тега (см. описание теста). Пороги в них не ослаблены.
+- Тесты `zam-index`, которые пишут в Qdrant, сначала проверяют свободное место на диске
+  (по умолчанию 4096 МБ, порог задаёт `ZAM_TEST_MIN_FREE_MB`). Если места мало, тест
+  пропускается со строкой
+  `SKIP <тест>: свободно N МБ < M МБ на <путь> — освободите место (cargo xtask clean-test-tmp)`.
+  В CI (переменная `CI`) и с `ZAM_REQUIRE_DISK=1` такой тест падает. Данные успешных тестов
+  `zam-index` удаляются сразу. Каталоги прогонов, которые упали или были прерваны, удаляет
+  следующий запуск набора.
+- Данные тестов копятся в `target/tmp`, `target/<сборка>/tmp` (при `CARGO_TARGET_DIR`) и
+  `target/test-tmp`. Убрать их можно командой `cargo xtask clean-test-tmp [--older-than 6h]
+  [--dry-run] [--target-dir DIR]`. Она удаляет только записи, в дереве которых ничего не
+  менялось дольше порога (не меньше 1m), поэтому данные запущенных тестов остаются.
+  `target/tags`, `target/models`, `target/deps`, `target/deps-cache`, `target/dist`,
+  `target/release` и всё вне `target/` команда не трогает. `--target-dir` убирает вместо
+  `target/` другой каталог, но только внутри `target/` — например, копию для проверки.
 - CI дополнительно проверяет `cargo fmt --check` и `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ### Команды xtask
@@ -722,6 +803,7 @@ cargo build --release -p zam-cli                   # отдельной кома
 | `code-bench [--repo <путь>]` | замеры карты кода (M5.6) на копии `HEAD` репозитория: первая и повторная `zam code sync`, правка и удаление файла, вторая копия, `GET /code/map` 200–2000 токенов, ключевые типы среди центральных, `zam --version` и запуск фоновой синхронизации p95 → `.tmp/m56/bench/report.json` |
 | `bench --profile cpu\|gpu [--notes N] [--phase …]… [--keep] [--reuse]` | замеры целей §17 ТЗ на корпусе eval с копиями до 10 000 заметок: поиск при пустой и полной очереди, FTS-only, реранк, индексация, запись, reindex, RSS, старт, падение Qdrant |
 | `ab --transcripts D --runs eval/ab/runs.toml [--server URL] [--out F] [--allow-missing]` | агентный A/B (M6): отчёт по плечам с интервалами из журналов агента (только поля `usage`) и `GET /sessions/{id}` сервера; методика — [eval/README.md](eval/README.md), «Агентный A/B» |
+| `clean-test-tmp [--older-than 6h] [--dry-run] [--target-dir DIR]` | уборка данных тестов: записи `target/tmp`, `target/<сборка>/tmp` и `target/test-tmp`, в дереве которых ничего не менялось дольше порога (`<число><s\|m\|h\|d>`, не меньше 1m); `--target-dir` — другой каталог, только внутри `target/` |
 | `transfer-check seed\|verify\|bindings` | проверка переезда на другую машину (M6): корпус и ожидания на старом сервере, те же данные на новом после `restore` (`--no-key` — без мастер-ключа), базы без прежнего каталога данных и имени машины |
 
 ```
@@ -844,10 +926,10 @@ docs/              # ТЗ, планы, исследования, журнал р
 
 | Документ | Что там |
 |---|---|
-| [docs/specs/2026-10-17-zeroaimemory-tz.md](docs/specs/2026-10-17-zeroaimemory-tz.md) | техническое задание (v1.25): цели, архитектура, модель данных, поиск, API, этапы |
+| [docs/specs/2026-10-17-zeroaimemory-tz.md](docs/specs/2026-10-17-zeroaimemory-tz.md) | техническое задание (v1.26): цели, архитектура, модель данных, поиск, API, этапы |
 | [deploy/README-install.md](deploy/README-install.md) | установка и эксплуатация: первый запуск, подключение агента, CLI, Qdrant, модели, GPU, reindex, прокси, перенос на другую машину, обновление и откат |
-| [docs/api-compat.md](docs/api-compat.md) | для своих клиентов: правило совместимости `/api/v1`, флаги `features`, явная сессия, `timeout_ms`, `Idempotency-Key`, разбор идей |
-| [docs/plans/](docs/plans/) | планы реализации этапов (M0–M6.5) и журналы их выполнения |
+| [docs/api-compat.md](docs/api-compat.md) | для своих клиентов: правило совместимости `/api/v1`, флаги `features`, явная сессия, `timeout_ms`, `Idempotency-Key`, предупреждения словаря в `warnings`, разбор идей, перенос записи Vault, усечение выдачи поиска (`omitted`), закрытие задачи, подсказки к запросу |
+| [docs/plans/](docs/plans/) | планы реализации этапов (M0–M6.6) и журналы их выполнения |
 | [docs/research/](docs/research/) | исследования: аналоги, MD-движки, стек, аудит библиотек, индекс и ML |
 | [docs/journal.md](docs/journal.md) | журнал работ: решения, прогоны, замеры |
 | [CHANGELOG.md](CHANGELOG.md) | изменения по версиям |

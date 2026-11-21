@@ -41,8 +41,21 @@ pub enum Channel {
 }
 
 impl Channel {
+    /// Все каналы, в порядке объявления. Полноту проверяет сборка (ревью задачи 2 M6.6, R3,
+    /// S1): у каждого варианта в `index` — своя ветка без `_`, и она ищет вариант в `ALL` при
+    /// компиляции; забытый здесь канал — ошибка сборки «канал не перечислен в Channel::ALL», а
+    /// не молчаливое «не лексический» в [`any_lexical`]. Порядок объявления и отсутствие
+    /// повторов — тоже сборка: проверка `const _` после `impl` сверяет дискриминант с местом.
+    pub const ALL: [Channel; 5] = [
+        Channel::Vector,
+        Channel::Fts,
+        Channel::Trigram,
+        Channel::Alias,
+        Channel::Folder,
+    ];
+
     /// Имя в `sources` ответа.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Channel::Vector => "vector",
             Channel::Fts => "fts",
@@ -51,6 +64,70 @@ impl Channel {
             Channel::Folder => "folder",
         }
     }
+
+    /// Место канала в [`Channel::ALL`]. Сопоставление без `_`; место каждого варианта —
+    /// `const { … }`, его вычисляет сборка (и `cargo check`) во всех ветках, а не только в
+    /// выполненной: новый вариант не соберётся без ветки, ветка — без варианта в `ALL`.
+    const fn index(self) -> usize {
+        match self {
+            Channel::Vector => const { Channel::position(Channel::Vector) },
+            Channel::Fts => const { Channel::position(Channel::Fts) },
+            Channel::Trigram => const { Channel::position(Channel::Trigram) },
+            Channel::Alias => const { Channel::position(Channel::Alias) },
+            Channel::Folder => const { Channel::position(Channel::Folder) },
+        }
+    }
+
+    /// Место `c` в [`Channel::ALL`] (вычисляется при сборке); канала нет в `ALL` — ошибка сборки.
+    const fn position(c: Channel) -> usize {
+        let mut i = 0;
+        while i < Channel::ALL.len() {
+            if Channel::ALL[i] as u8 == c as u8 {
+                return i;
+            }
+            i += 1;
+        }
+        panic!("канал не перечислен в Channel::ALL");
+    }
+
+    /// Канал по имени в `sources` ([`Channel::as_str`]); неизвестное имя — `None`.
+    pub fn from_name(name: &str) -> Option<Channel> {
+        Channel::ALL.iter().copied().find(|c| c.as_str() == name)
+    }
+
+    /// Лексический канал — нашёл слово запроса в тексте (`fts`, `trigram`, `alias`), а не по
+    /// смыслу (`vector`, `folder` — точки папок из векторного поиска); M6.6 §3.2. Сопоставление
+    /// без `_`: новый канал не соберётся, пока его не отнесут к одной из сторон.
+    pub const fn is_lexical(self) -> bool {
+        match self {
+            Channel::Fts | Channel::Trigram | Channel::Alias => true,
+            Channel::Vector | Channel::Folder => false,
+        }
+    }
+}
+
+// `ALL` — в порядке объявления и без повторов, при сборке: дискриминант варианта равен его
+// месту в `ALL` (ревью задачи 2 M6.6, круг 4). Полноту `ALL` дают ветки `index`; вызов `index`
+// здесь вычисляет при сборке и `const { }` её веток.
+const _: () = {
+    let mut i = 0;
+    while i < Channel::ALL.len() {
+        assert!(
+            Channel::ALL[i] as usize == i && Channel::ALL[i].index() == i,
+            "Channel::ALL: не в порядке объявления или с повтором"
+        );
+        i += 1;
+    }
+};
+
+/// Карточку поиска нашёл лексический канал: среди её `sources` (имена [`Channel::as_str`])
+/// есть лексический ([`Channel::is_lexical`]); неизвестное имя — не лексическое. Строковая
+/// основа правила [`crate::recall::lexical_card`] (подсказки `prompt` и идеи сервера, модель
+/// калибровки `xtask eval --hints`; M6.6 §3.2).
+pub fn any_lexical<'a>(sources: impl IntoIterator<Item = &'a str>) -> bool {
+    sources
+        .into_iter()
+        .any(|s| Channel::from_name(s).is_some_and(Channel::is_lexical))
 }
 
 /// Уровень чанка (§8.2).
@@ -759,5 +836,31 @@ mod tests {
         let mut inp = base.clone();
         inp.folders = vec![folder(s, "ops", 1)];
         assert_eq!(fuse(&inp, &Weights::default(), now()), m2);
+    }
+
+    /// M6.6 §3.2: лексические каналы — `fts`, `trigram`, `alias` (слово запроса есть в тексте);
+    /// `vector` и `folder` — по смыслу. Неизвестное имя — не лексическое.
+    #[test]
+    fn lexical_channels_and_sources() {
+        let names: HashSet<&str> = Channel::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names.len(), Channel::ALL.len(), "имена каналов различны");
+        for (i, c) in Channel::ALL.into_iter().enumerate() {
+            assert_eq!(Channel::from_name(c.as_str()), Some(c));
+            assert_eq!(c.index(), i);
+        }
+        assert_eq!(Channel::from_name("bm25"), None);
+        let lexical: Vec<&str> = Channel::ALL
+            .iter()
+            .filter(|c| c.is_lexical())
+            .map(|c| c.as_str())
+            .collect();
+        assert_eq!(lexical, ["fts", "trigram", "alias"]);
+        assert!(any_lexical(["vector", "fts"]));
+        assert!(any_lexical(["alias"]));
+        assert!(any_lexical(["trigram"]));
+        assert!(!any_lexical(["vector"]));
+        assert!(!any_lexical(["vector", "folder"]));
+        assert!(!any_lexical(["FTS", "bm25"]));
+        assert!(!any_lexical(std::iter::empty::<&str>()));
     }
 }

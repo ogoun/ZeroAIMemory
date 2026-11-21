@@ -2,7 +2,8 @@
 //!
 //! - Префикс `space:` распознаётся, только если часть до первого `:` — ровно
 //!   `rules`, `knowledge`, `human`, `solution` или GUID (UUID с дефисами); иначе
-//!   вся строка — путь (`a:b` остаётся путём).
+//!   вся строка — путь (`a:b` остаётся путём). Правило общее с MCP (`memory_tree`,
+//!   `memory_write`) — [`zam_core::space::split_space`] (M6.6 §8).
 //! - Без префикса — решение из ближайшего `solution.toml`, иначе `knowledge`.
 //! - `solution:` без `solution.toml` — ошибка конфигурации.
 //! - 26 символов в канонической форме [`zam_core::Id`] — id узла; так же `n:<id>` — ссылка
@@ -48,14 +49,8 @@ pub fn load_solution(path: &Path) -> Result<Solution, CliError> {
     })
 }
 
-/// UUID строго в форме с дефисами (8-4-4-4-12).
-pub fn is_guid(s: &str) -> bool {
-    s.len() == 36
-        && s.bytes().enumerate().all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        })
-}
+/// Префикс пространства и GUID — общее правило CLI и MCP ([`zam_core::space`]).
+pub use zam_core::space::{SpaceSel, is_guid};
 
 /// Канонический id узла или записи (26 символов Crockford, как печатает сервер).
 pub fn is_node_id(s: &str) -> bool {
@@ -104,18 +99,6 @@ pub fn doc_ref(raw: &str) -> bool {
     }
 }
 
-/// Пространство цели до разрешения решения.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SpaceSel {
-    /// Без префикса: решение, если есть `solution.toml`, иначе knowledge.
-    Default,
-    Fixed(&'static str),
-    /// `solution:` — решение из `solution.toml`.
-    Solution,
-    /// GUID решения (нижний регистр).
-    Guid(String),
-}
-
 /// Разобранная цель.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -131,20 +114,11 @@ pub fn parse(raw: &str) -> Target {
     if let Some(id) = raw.strip_prefix("n:").filter(|id| is_node_id(id)) {
         return Target::Node(id.to_string());
     }
-    let (space, rest) = match raw.split_once(':') {
-        Some((p, rest)) => match p {
-            "rules" => (SpaceSel::Fixed("rules"), rest),
-            "knowledge" => (SpaceSel::Fixed("knowledge"), rest),
-            "human" => (SpaceSel::Fixed("human"), rest),
-            "solution" => (SpaceSel::Solution, rest),
-            g if is_guid(g) => (SpaceSel::Guid(g.to_ascii_lowercase()), rest),
-            _ => (SpaceSel::Default, raw),
-        },
-        None => (SpaceSel::Default, raw),
-    };
+    // без префикса — решение, если есть `solution.toml`, иначе knowledge ([`Target::resolve`])
+    let (space, path) = zam_core::space::split_space(raw);
     Target::Path {
         space,
-        path: rest.trim_matches('/').to_string(),
+        path: path.to_string(),
     }
 }
 

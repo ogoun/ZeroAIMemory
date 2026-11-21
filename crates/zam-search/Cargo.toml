@@ -13,3 +13,6 @@ jiff.workspace = true
 regex.workspace = true
 # правило покрытия `recall.post_tool_coverage` в конфигурации сервера
 serde.workspace = true
+# карточки ответа `/search` в правиле подсказок к запросу (`recall::PromptGate::admits_card`):
+# одно правило для сервера и модели калибровки xtask (M6.6, ревью задачи 2)
+serde_json.workspace = true

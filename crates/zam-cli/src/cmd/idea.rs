@@ -1,11 +1,12 @@
 //! `zam idea` — журнал «Идеи» (M5.7 §7.3, M6.5 §5, §7): `list`, `new`, `queue`, `review`,
 //! `propose`, `accept`, `defer`, `decline`.
 //!
-//! - `list [--status S]… [--origin human|agent] [--knowledge]` — строки `w:<id> [статус]
-//!   [приоритет] заголовок`, у идеи агента — `(от агента)`, у начатой — `→ k:<задача>`, у
-//!   возвращённой на доработку — `— не хватает: <начало missing>`; без `--status` — `new,
-//!   returned, proposed, deferred, accepted` (сервер до M6.5 отвечает на `returned` 400 — повтор
-//!   без него);
+//! - `list [--status S]… [--origin human|agent] [--global] [--limit N | --all]` — строки
+//!   `w:<id> [статус] [приоритет] заголовок`, у идеи агента — `(от агента)`, у начатой — `→
+//!   k:<задача>`, у возвращённой на доработку — `— не хватает: <начало missing>`; без
+//!   `--status` — `new, returned, proposed, deferred, accepted` (сервер до M6.5 отвечает на
+//!   `returned` 400 — повтор без него). Страница — 200, обход и подсказка о продолжении —
+//!   [`super::list_entries`];
 //! - `queue [--limit N]` — пакет разбора `idea_review` (`POST /recall`, M6.5 §7): идеи
 //!   «Непросмотрено» с историей, похожими записями решения и шагами разбора (текст сервера);
 //!   сервер без флага `idea_review` — код 1, как у `review`;
@@ -16,7 +17,7 @@
 //!   с « (повтор)». Разбор — всегда действие агента: `--by` нет. Сервер без флага
 //!   `idea_review` в `/health` — код 1 с [`OLD_SERVER_REVIEW`];
 //! - `new <заголовок> [--body T | --file F.md] [--priority …] [--horizon YYYY-MM-DD] [--tag X]…
-//!   [--origin human|agent] [--knowledge]` — новая идея (`<id>@<rev>`);
+//!   [--origin human|agent] [--global]` — новая идея (`<id>@<rev>`);
 //! - `propose <w:id> [--text T] [--space GUID]` — предложить человеку: вопрос-предложение
 //!   «начать / отложить / отказаться» (`Предложено w:<id> → вопрос q:<id>`); у принятой идеи
 //!   со снятой или удалённой задачей — вопрос «вернуть / отказаться», `--text` обязателен
@@ -30,14 +31,17 @@
 //! до обращения к серверу; человек в терминале — `human`. Даты `--horizon` и `--until` — строго
 //! `YYYY-MM-DD` (иначе код 6 без запроса); «позже сегодняшней даты UTC» проверяет сервер (422).
 //!
-//! Пространство — решение из `solution.toml`, `--knowledge` — Knowledge. Ссылка — `w:<id>`,
-//! `e:<id>` или голый id; иначе код 6.
+//! Пространство — решение из `solution.toml`, `--global` — Knowledge (как у `zam task`,
+//! `insight`, `question` и Vault; `--knowledge` — синоним, прежнее имя флага, M6.6 §9). Ссылка —
+//! `w:<id>`, `e:<id>` или голый id; иначе код 6.
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use super::log::read_text;
-use super::{Ctx, emit, emit_json, post_entry, solution_guid};
+use super::{
+    Ctx, LIST_LIMIT_MAX, Paging, emit, emit_json, list_entries, post_entry, solution_guid,
+};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
 use crate::target::is_node_id;
 
@@ -154,9 +158,9 @@ fn line(e: &Value) -> String {
     s
 }
 
-/// Пространство команды: Knowledge или решение из `solution.toml`.
-fn space(ctx: &Ctx, knowledge: bool) -> Result<String, CliError> {
-    if knowledge {
+/// Пространство команды: Knowledge (`--global`) или решение из `solution.toml`.
+fn space(ctx: &Ctx, global: bool) -> Result<String, CliError> {
+    if global {
         Ok("knowledge".to_string())
     } else {
         solution_guid(ctx, None)
@@ -168,7 +172,9 @@ pub struct List<'a> {
     /// Статусы (повторяемый флаг, каждый — через запятую).
     pub status: &'a [String],
     pub origin: Option<&'a str>,
-    pub knowledge: bool,
+    /// Knowledge (`--global`, синоним `--knowledge`).
+    pub global: bool,
+    pub page: Paging,
 }
 
 /// Статусы ленты через запятую; не заданы — `None` (умолчание [`ACTIVE`]); неизвестный статус
@@ -192,18 +198,19 @@ fn statuses(raw: &[String]) -> Result<Option<String>, CliError> {
     Ok((!out.is_empty()).then(|| out.join(",")))
 }
 
-/// `zam idea list`; без `--status` у сервера до M6.5 (400 на [`ACTIVE`]) — повтор с
-/// [`ACTIVE_M57`]; явный `--status returned` такому серверу — его 400 (код 6).
+/// `zam idea list` (страница без `--limit` — 200, обход — [`list_entries`]); без `--status` у
+/// сервера до M6.5 (400 на [`ACTIVE`]) — повтор с [`ACTIVE_M57`]; явный `--status returned`
+/// такому серверу — его 400 (код 6).
 pub fn list(ctx: &Ctx, o: &List) -> Result<(), CliError> {
     let st = statuses(o.status)?;
-    let space = space(ctx, o.knowledge)?;
-    let path = format!("/spaces/{space}/entries");
+    let space = space(ctx, o.global)?;
     let get = |status: &str| {
-        let mut q = vec![("kind", "idea"), ("status", status), ("limit", "200")];
+        let mut q = vec![("kind", "idea"), ("status", status)];
         if let Some(origin) = o.origin {
             q.push(("origin", origin));
         }
-        ctx.client.get(&path, &q).and_then(read_json)
+        let limit = o.page.limit.or(Some(LIST_LIMIT_MAX));
+        list_entries(ctx, &space, &q, limit, o.page.all)
     };
     let v = match (get(st.as_deref().unwrap_or(ACTIVE)), &st) {
         (Err(e), None) if e.http_status() == Some(400) => get(ACTIVE_M57)?,
@@ -228,7 +235,8 @@ pub struct New<'a> {
     pub priority: Option<&'a str>,
     pub horizon: Option<&'a str>,
     pub tags: &'a [String],
-    pub knowledge: bool,
+    /// Knowledge (`--global`, синоним `--knowledge`).
+    pub global: bool,
 }
 
 /// Тело запроса идеи (`POST /spaces/{space}/entries`, `kind: idea`); `origin` — уже разрешён.
@@ -255,7 +263,7 @@ pub fn new(ctx: &Ctx, o: &New, origin: &str) -> Result<(), CliError> {
         (None, None) => String::new(),
     };
     let req = new_body(o, &body, origin)?;
-    let space = space(ctx, o.knowledge)?;
+    let space = space(ctx, o.global)?;
     post_entry(ctx, &space, &req, None, None)
 }
 
@@ -301,22 +309,9 @@ pub fn propose(
 /// нет маршрута `/review`, 400 — неизвестное событие `idea_review` у `/recall`). В `GET /health`
 /// `features` нет [`FEATURE_REVIEW`] (у сервера до M6 нет и самого поля) — код 1 с
 /// [`OLD_SERVER_REVIEW`]; флаг есть или `/health` не ответил — `e` как есть (404 — нет такой
-/// идеи, код 5).
+/// идеи, код 5). Проба — общая [`super::old_server`].
 fn old_server(ctx: &Ctx, e: CliError, status: u16) -> CliError {
-    if e.http_status() != Some(status) {
-        return e;
-    }
-    match ctx.client.get("/health", &[]).and_then(read_json) {
-        Ok(h) if !has_feature(&h, FEATURE_REVIEW) => CliError::config(OLD_SERVER_REVIEW),
-        _ => e,
-    }
-}
-
-/// Флаг `f` в `features` ответа `/health`.
-fn has_feature(health: &Value, f: &str) -> bool {
-    health["features"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|x| x == f))
+    super::old_server(ctx, e, &[status], FEATURE_REVIEW, OLD_SERVER_REVIEW)
 }
 
 /// `zam idea queue`: пакет разбора `POST /recall {event: idea_review, limit}` решения из
@@ -603,7 +598,7 @@ mod tests {
             priority: Some("high"),
             horizon: Some("2099-01-01"),
             tags: &tags,
-            knowledge: false,
+            global: false,
         };
         assert_eq!(
             new_body(&o, "замысел", "human").unwrap(),
@@ -793,6 +788,7 @@ mod tests {
         );
 
         // флаг сервера
+        use crate::cmd::has_feature;
         assert!(has_feature(
             &json!({"features": ["m6", FEATURE_REVIEW]}),
             "idea_review"

@@ -1,16 +1,26 @@
-//! `zam search <query> [--all] [--mode brief|chunks|notes] [--top-k N] [--rerank]`.
+//! `zam search <query> [--all] [--mode brief|chunks|notes] [--top-k N] [--rerank] [--budget N]
+//! [--kind K]… [--insight-kind K]… [--certainty C]… [--status S]… [--decided-by human|agent]
+//! [--file P] [--history]`.
 //!
 //! Markdown от сервера по умолчанию, `--json` — JSON ответа. Область: решение из
 //! `solution.toml` (если есть) плюс Knowledge и Rules; `--all` — все решения. `--rerank` —
-//! серверный реранк первых кандидатов (`rerank: "on"`, по умолчанию выключен).
+//! серверный реранк первых кандидатов (`rerank: "on"`, по умолчанию выключен). Бюджет и фильтры
+//! (M6.6 §9, замечание 11) — поля запроса, которые сервер знает с 0.0.6-m4.5: `budget_tokens`,
+//! `filters.{kinds, insight_kinds, certainty, status, decided_by, file}`, `include_history`;
+//! путь `--file` нормализуется как путь ссылки ([`refs::ref_path`]); незаданные поля не
+//! уходят (тело — как раньше).
 //!
 //! stdout — ответ сервера как есть (в md строки `> degraded: …` и `> warning: …` остаются
 //! для агента). Деградация векторного канала (`degraded_reason`) и предупреждения
 //! (`warnings`, например, о реранкере) дополнительно печатаются в stderr по-русски — в
-//! обоих форматах, чтобы человек видел их и при `--json`, и при выводе в файл.
-use serde_json::{Value, json};
+//! обоих форматах, чтобы человек видел их и при `--json`, и при выводе в файл. Так же —
+//! усечение выдачи: «показано K из L: бюджет — ещё N (--budget), слабые — M» по полю
+//! `omitted` (JSON) или заголовку `X-Zam-Omitted` (Markdown); у сервера до 0.0.13-m6.6 их нет —
+//! строки нет.
+use serde_json::{Map, Value, json};
+use zam_core::SEARCH_OMITTED_HEADER;
 
-use super::{Ctx, emit};
+use super::{Ctx, emit, refs};
 use crate::client::{CliError, read_text};
 
 pub struct Opts<'a> {
@@ -18,10 +28,52 @@ pub struct Opts<'a> {
     pub mode: &'a str,
     pub top_k: Option<u32>,
     pub rerank: bool,
+    /// `budget_tokens` (1–200000, проверил clap).
+    pub budget: Option<u32>,
+    pub kinds: &'a [String],
+    /// Виды insight (проверил clap).
+    pub insight_kinds: &'a [String],
+    /// `axiom | theorem | hypothesis` (проверил clap).
+    pub certainty: &'a [String],
+    pub status: &'a [String],
+    /// `human | agent` (проверил clap).
+    pub decided_by: Option<&'a str>,
+    /// Путь файла как введён (нормализует [`file_filter`]).
+    pub file: Option<&'a str>,
+    pub history: bool,
 }
 
-/// Тело запроса `/search`.
-fn body(ctx: &Ctx, query: &str, o: &Opts) -> Value {
+/// Путь `--file` в форме пути ссылки: относительно корня проекта, `/`, регистр файловой системы
+/// ([`refs::ref_path`], как у `zam links file:`); вне проекта и неверный — код 6.
+fn file_filter(raw: &str) -> Result<String, CliError> {
+    let (cwd, root) = refs::cli_root();
+    refs::ref_path(raw, &cwd, &root).map_err(|e| CliError::input(format!("--file {raw}: {e}")))
+}
+
+/// `filters` запроса: только заданные флаги; ни одного — `None` (поля в теле нет).
+fn filters(o: &Opts, file: Option<&str>) -> Option<Value> {
+    let mut f = Map::new();
+    for (k, v) in [
+        ("kinds", o.kinds),
+        ("insight_kinds", o.insight_kinds),
+        ("certainty", o.certainty),
+        ("status", o.status),
+    ] {
+        if !v.is_empty() {
+            f.insert(k.into(), json!(v));
+        }
+    }
+    if let Some(d) = o.decided_by {
+        f.insert("decided_by".into(), json!(d));
+    }
+    if let Some(p) = file {
+        f.insert("file".into(), json!(p));
+    }
+    (!f.is_empty()).then_some(Value::Object(f))
+}
+
+/// Тело запроса `/search`; `file` — уже нормализованный путь `--file`.
+fn body(ctx: &Ctx, query: &str, o: &Opts, file: Option<&str>) -> Value {
     let mut scope = json!({ "all_solutions": o.all });
     if let Some(s) = &ctx.solution {
         scope["solution"] = json!(s.id);
@@ -38,13 +90,41 @@ fn body(ctx: &Ctx, query: &str, o: &Opts) -> Value {
     if o.rerank {
         body["rerank"] = json!("on");
     }
+    if let Some(b) = o.budget {
+        body["budget_tokens"] = json!(b);
+    }
+    if let Some(f) = filters(o, file) {
+        body["filters"] = f;
+    }
+    if o.history {
+        body["include_history"] = json!(true);
+    }
     body
 }
 
 pub fn run(ctx: &Ctx, query: &str, o: &Opts) -> Result<(), CliError> {
-    let mut text = read_text(ctx.client.post_json("/search", &body(ctx, query, o))?)?;
+    let file = o.file.map(file_filter).transpose()?;
+    let resp = ctx
+        .client
+        .post_json("/search", &body(ctx, query, o, file.as_deref()))?;
+    let header = resp
+        .headers()
+        .get(SEARCH_OMITTED_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(omitted_header);
+    let mut text = read_text(resp)?;
     for n in notices(&text, ctx.json) {
         eprintln!("{n}");
+    }
+    let omitted = if ctx.json {
+        serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| json_omitted(&v))
+    } else {
+        header.map(|h| (md_cards(&text), h))
+    };
+    if let Some(line) = omitted.and_then(|(shown, o)| omitted_notice(shown, o)) {
+        eprintln!("{line}");
     }
     // в md пустая выдача — пустое тело или только служебные строки сервера (`> degraded: …`,
     // `> warning: …`): их тоже печатаем, агент должен знать, что искал только FTS
@@ -136,6 +216,61 @@ fn notices(text: &str, json: bool) -> Vec<String> {
     out
 }
 
+/// Не вошедшие в ответ карточки (M6.6 §9): не поместились в бюджет и отсечены как слабые.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Omitted {
+    budget: u64,
+    weak: u64,
+}
+
+/// Заголовок [`SEARCH_OMITTED_HEADER`] `budget=N; weak=M` (сервер 0.0.13-m6.6); иная форма —
+/// `None` (молча).
+fn omitted_header(s: &str) -> Option<Omitted> {
+    let (b, w) = s.split_once("; ")?;
+    Some(Omitted {
+        budget: b.strip_prefix("budget=")?.parse().ok()?,
+        weak: w.strip_prefix("weak=")?.parse().ok()?,
+    })
+}
+
+/// Показано карточек и `omitted` ответа JSON; поля нет (сервер до 0.0.13-m6.6) — `None`.
+/// Выжимки шага 0 (`kind: cache`) — не карточки выдачи.
+fn json_omitted(v: &Value) -> Option<(usize, Omitted)> {
+    let o = &v["omitted"];
+    let omitted = Omitted {
+        budget: o["budget"].as_u64()?,
+        weak: o["weak"].as_u64()?,
+    };
+    let shown = v["items"]
+        .as_array()
+        .map_or(0, |a| a.iter().filter(|i| i["kind"] != "cache").count());
+    Some((shown, omitted))
+}
+
+/// Показано карточек Markdown: номер последней строки `<n>. …`. Карточки нумеруются подряд и
+/// идут после выжимок шага 0, их продолжения — с отступа, строки хвоста — с `> `, поэтому
+/// последний номер — их число, даже если в тексте выжимки есть нумерованный список.
+fn md_cards(md: &str) -> usize {
+    md.lines()
+        .rev()
+        .find_map(|l| l.split_once(". ")?.0.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Строка stderr об усечении (M6.6 §9): «показано K из L: бюджет — ещё N (--budget), слабые —
+/// M», L = K + N + M; ничего не срезано — `None`.
+fn omitted_notice(shown: usize, o: Omitted) -> Option<String> {
+    let more = o.budget + o.weak;
+    (more > 0).then(|| {
+        format!(
+            "показано {shown} из {}: бюджет — ещё {} (--budget), слабые — {}",
+            shown as u64 + more,
+            o.budget,
+            o.weak
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +315,35 @@ mod tests {
         assert!(n[0].contains(": new_reason — показаны"), "{n:?}");
         assert_eq!(n[1], "предупреждение: x");
         assert!(notices("1. **a**\n", false).is_empty());
+    }
+
+    /// M6.6 §9 (замечание 11): строка об усечении — только при N + M > 0, L = K + N + M;
+    /// заголовок `X-Zam-Omitted` разбирается строго (иначе — молча, как у старого сервера).
+    #[test]
+    fn omitted_notice_and_header() {
+        assert_eq!(
+            omitted_notice(1, Omitted { budget: 2, weak: 1 }).as_deref(),
+            Some("показано 1 из 4: бюджет — ещё 2 (--budget), слабые — 1")
+        );
+        assert_eq!(
+            omitted_notice(6, Omitted { budget: 0, weak: 3 }).as_deref(),
+            Some("показано 6 из 9: бюджет — ещё 0 (--budget), слабые — 3")
+        );
+        assert_eq!(omitted_notice(5, Omitted { budget: 0, weak: 0 }), None);
+        assert_eq!(
+            omitted_header("budget=3; weak=0"),
+            Some(Omitted { budget: 3, weak: 0 })
+        );
+        for bad in ["", "budget=3", "budget=x; weak=1", "weak=1; budget=2"] {
+            assert_eq!(omitted_header(bad), None, "{bad}");
+        }
+        let j = r#"{"items":[{"kind":"cache"},{"kind":"note"},{"kind":"insight"}],"omitted":{"budget":1,"weak":0}}"#;
+        let v: Value = serde_json::from_str(j).unwrap();
+        assert_eq!(json_omitted(&v), Some((2, Omitted { budget: 1, weak: 0 })));
+        assert_eq!(json_omitted(&json!({"items": []})), None);
+        // карточки Markdown — строки `<n>. …`, выжимки и строки хвоста не считаются
+        let md = "[cache] «q» — выжимка\n   текст\n1. n:01 K/a  [1.0]\n   фрагмент\n\
+                  2. i:02 insight/gotcha «x»\n> degraded: x (только FTS)\n";
+        assert_eq!(md_cards(md), 2);
     }
 }

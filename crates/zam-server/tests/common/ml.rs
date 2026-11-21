@@ -9,12 +9,18 @@ use std::time::{Duration, Instant};
 use zam_server::config::{MlDevice, QdrantMode, ServerConfig};
 
 use super::api::Api;
-use super::qdrant::{TestQdrant, qdrant_bin};
+use super::qdrant::{ProgressWatch, TestQdrant, collection_progress, qdrant_bin};
 
 /// Тестовая модель (англоязычная MiniLM-L6, int8).
 pub const MINILM: &str = "minilm-l6-int8";
-/// Предел ожидания готовности коллекции (создание payload-индексов на HDD — секунды).
+/// Предел ожидания готовности (создание payload-индексов на HDD — секунды); у
+/// [`vector_ready`] с тестовым Qdrant — предел ожидания **без продвижения** создания коллекции.
 pub const READY: Duration = Duration::from_secs(240);
+/// Общий предел [`vector_ready`], пока создание коллекции продвигается. Под общим прогоном на
+/// занятом HDD один `create_field_index` пустой коллекции занимал 17–35 с, и за 240 с создавалось
+/// 6–12 индексов из 13 (M6.6, задача 12: остатки упавших `hybrid`, `index_worker`,
+/// `transfer_import`); ≈ 450 с на коллекцию в худшем замеченном случае — 900 с с запасом ×2.
+pub const READY_MAX: Duration = Duration::from_secs(900);
 
 pub fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
@@ -118,15 +124,62 @@ pub fn vector_diag(a: &Api) -> String {
     )
 }
 
-/// Ждёт включения векторного канала (коллекция создана и проверена).
+/// Ждёт включения векторного канала (коллекция создана и проверена). С тестовым Qdrant
+/// ([`super::qdrant::registered`]) предел — [`READY`] **без роста** создания коллекции
+/// ([`ProgressWatch`]: коллекция появилась, добавился payload-индекс) и [`READY_MAX`] всего: под
+/// нагрузкой машины воркер создаёт коллекцию минутами, и тест падал на подготовке, хотя индексы
+/// шли (M6.6, задача 12); зависание по-прежнему падает за [`READY`], а процесс Qdrant,
+/// завершившийся сам, — сразу. Иначе — [`READY`] всего. Время печатается (`ZAM_TIMING`); дольше
+/// [`READY`] — с пометкой о продлении.
 pub async fn vector_ready(a: &Api) {
-    until_diag(
-        "векторный канал не включился",
-        READY,
-        async || a.st.index.vector_available().is_ok(),
-        async || vector_diag(a),
-    )
-    .await;
+    let url = a.st.cfg.qdrant.url.clone();
+    let reg = || url.as_deref().and_then(super::qdrant::registered);
+    let progress = || reg().and_then(|r| collection_progress(&r.dir));
+    let test = reg().is_some();
+    let t = Instant::now();
+    let mut watch = ProgressWatch::new(progress());
+    while a.st.index.vector_available().is_err() {
+        watch.observe(progress());
+        let qdrant = if test {
+            watch.to_string()
+        } else {
+            "не тестовый".to_string()
+        };
+        if let Some(r) = reg().filter(super::qdrant::Registered::died) {
+            panic!(
+                "не дождались: векторный канал не включился — Qdrant теста завершился (pid {}) за \
+                 {:?}; Qdrant: {qdrant}; {}",
+                r.pid,
+                t.elapsed(),
+                vector_diag(a)
+            );
+        }
+        let stalled = if test { watch.stalled() } else { t.elapsed() };
+        if stalled >= READY || t.elapsed() >= READY_MAX {
+            panic!(
+                "не дождались: векторный канал не включился за {:?} (без продвижения — {stalled:?}, \
+                 пределы {READY:?} без продвижения и {READY_MAX:?} всего); Qdrant: {qdrant}; {}",
+                t.elapsed(),
+                vector_diag(a)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.observe(progress());
+    let qdrant = if test {
+        watch.to_string()
+    } else {
+        "не тестовый".to_string()
+    };
+    let longer = if t.elapsed() > READY {
+        format!(" — дольше прежнего предела {READY:?}, продление по ходу создания коллекции")
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "ZAM_TIMING векторный канал готов за {:?}{longer}; Qdrant: {qdrant}",
+        t.elapsed()
+    );
 }
 
 /// Ждёт условия не дольше `limit`.

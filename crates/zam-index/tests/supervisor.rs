@@ -1,7 +1,14 @@
 //! Интеграционные тесты супервизора нативного Qdrant (задача 6 M2, §4.3) на настоящем
 //! бинарнике `target/deps/<платформа>/qdrant/` (`cargo xtask fetch-deps`).
 //!
-//! Каждый тест — свой каталог данных под `CARGO_TARGET_TMPDIR` и свои порты 127.0.0.1.
+//! Каждый тест — свой каталог данных под `CARGO_TARGET_TMPDIR` и свои порты 127.0.0.1. Данные
+//! успешного теста удаляются ([`TestDir`]); тест, пишущий в Qdrant, сначала проверяет место на
+//! диске ([`common::disk::enough_disk`]: мало — `SKIP`, в CI и с `ZAM_REQUIRE_DISK=1` — падение).
+//! Тест, который поднимает Qdrant (супервизор, проба), первой строкой берёт слот запуска
+//! [`common::qdrant::Slot`] на весь тест — предел `ZAM_TEST_QDRANT_MAX`, как у `TestQdrant`: при
+//! полном параллелизме без него шло до 17 процессов сразу, и тесты со сроками («Ready (повтор)»,
+//! «WAL не подтверждён») падали от взаимной нагрузки (M6.6, задача 12, ревью). Слот не кладётся
+//! в [`TestDir`] и `FlushRun`: четыре каталога `flush_run` заняли бы четыре слота.
 
 mod common;
 
@@ -10,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::disk::{TestDir, enough_disk};
 use common::qdrant::{TestQdrant, free_port, qdrant_bin};
 use tokio::sync::watch;
 use zam_index::supervisor::{
@@ -18,14 +26,67 @@ use zam_index::supervisor::{
 };
 use zam_index::{IndexError, QdrantIndex, VectorIndex};
 
-/// Свежий каталог данных теста.
-fn data_dir(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("zam-index-sup")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("каталог теста");
-    d
+/// Свежий каталог данных теста (`zam-index-sup/<имя>-<pid>`; удаляется после успешного теста).
+fn data_dir(name: &str) -> TestDir {
+    TestDir::new("zam-index-sup", name)
+}
+
+/// Порог места: `ZAM_TEST_MIN_FREE_MB` переопределяет 4096 МБ; при нехватке — текст `SKIP` с
+/// местом, порогом, путём и советом очистки; места хватает — пропуска нет.
+#[test]
+fn require_free_disk_threshold() {
+    use common::disk::{MIN_FREE_MB, disk_shortage, pid_before_seq, pid_suffix, threshold_mb};
+    assert_eq!(MIN_FREE_MB, 4096);
+    assert_eq!(threshold_mb(None), MIN_FREE_MB);
+    assert_eq!(threshold_mb(Some("99999999")), 99_999_999);
+    assert_eq!(threshold_mb(Some(" 512 ")), 512);
+    assert_eq!(threshold_mb(Some("много")), MIN_FREE_MB);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let msg = disk_shortage(dir, threshold_mb(Some("99999999")), "t").expect("пропуск");
+    assert!(msg.starts_with("SKIP t: свободно "), "{msg}");
+    assert!(msg.contains(" МБ < 99999999 МБ на "), "{msg}");
+    assert!(msg.contains(&dir.display().to_string()), "{msg}");
+    assert!(
+        msg.ends_with("освободите место (cargo xtask clean-test-tmp)"),
+        "{msg}"
+    );
+    assert_eq!(disk_shortage(dir, 0, "t"), None);
+    // имена каталогов прогонов: `<имя>-<pid>`, в имени теста тоже бывает «-»
+    assert_eq!(pid_suffix("flushwait-full-4242"), Some(4242));
+    assert_eq!(pid_suffix("ready-17"), Some(17));
+    assert_eq!(pid_suffix("ready"), None);
+    assert_eq!(pid_suffix("ready-x1"), None);
+    // каталоги TestQdrant: `<имя>-<pid>-<номер>`
+    assert_eq!(pid_before_seq("worker-gc-245184-1"), Some(245184));
+    assert_eq!(pid_before_seq("foreign-17-0"), Some(17));
+    assert_eq!(pid_before_seq("ready-17"), None);
+    assert_eq!(pid_before_seq("ready-17-x"), None);
+}
+
+/// [`TestDir`]: первое создание под базой удаляет каталоги завершившихся процессов, каталоги
+/// живого (своего) процесса и без `pid` в имени не трогает; после успешного теста каталог
+/// удаляется.
+#[test]
+fn test_dir_sweeps_dead_runs_and_removes_itself() {
+    const BASE: &str = "zam-index-sweep-probe";
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(BASE);
+    let _ = std::fs::remove_dir_all(&root);
+    // pid, которого нет ни в Windows, ни в Linux
+    let dead = root.join(format!("old-run-{}", u32::MAX - 1));
+    let mine = root.join(format!("other-{}", std::process::id()));
+    let plain = root.join("no-pid-here");
+    for d in [&dead, &mine, &plain] {
+        std::fs::create_dir_all(d.join("storage")).unwrap();
+        std::fs::write(d.join("storage").join("data"), b"x").unwrap();
+    }
+    let t = TestDir::new(BASE, "probe");
+    assert!(!dead.exists(), "каталог мёртвого прогона остался");
+    assert!(mine.exists() && plain.exists(), "лишнее удалено");
+    assert!(t.is_dir() && t.starts_with(&root));
+    let path = t.path().to_path_buf();
+    drop(t);
+    assert!(!path.exists(), "каталог успешного теста не удалён");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Конфигурация с быстрым перезапуском (умолчания 1→60 с слишком долгие для тестов).
@@ -107,7 +168,19 @@ fn wait_gone(pid: u32, limit: Duration) -> bool {
     !pid_alive(pid)
 }
 
+/// Предел первой готовности (старт Qdrant на пустом каталоге данных) и переходов супервизора
+/// (`Restarting`, `Broken`).
 const READY_LIMIT: Duration = Duration::from_secs(10);
+/// Предел повторной готовности — после перезапуска Qdrant: рестарт супервизором после смерти
+/// или паники процесса, новый `Supervisor::start` на каталоге прежнего запуска. Тесты с этим
+/// пределом проверяют не скорость старта, а то, что готовность наступает: предел лишь ловит
+/// зависание. Полный прогон на загруженной машине (две параллельные сборки, `-j 2`; финальное
+/// ревью M6.6) не уложил повторную готовность `config_renders_flush_interval_and_wal`
+/// (коллекция с payload-индексами) в 10 с — состояние оставалось `Starting`; под общим прогоном
+/// на HDD Qdrant медлит и в других местах (один payload-индекс пустой коллекции создаётся
+/// 17–35 с, задача 12 M6.6). 60 с — как у готовности `TestQdrant` (`common::qdrant`, «данные
+/// проекта на HDD»). Время повторного старта с коллекцией сторожит отдельный [`RESTART_LIMIT`].
+const READY_AGAIN_LIMIT: Duration = Duration::from_secs(60);
 /// Предел повторного старта сразу после создания коллекции в
 /// `start_ready_restart_with_collection_and_clean_shutdown`. Коллекция пишется клиентом без
 /// отметки супервизора (`QdrantIndex::connect`, не `connect_index`), поэтому остановка не
@@ -123,6 +196,10 @@ const RESTART_LIMIT: Duration = Duration::from_secs(20);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_ready_restart_with_collection_and_clean_shutdown() {
+    let _slot = common::qdrant::Slot::take();
+    if !enough_disk("start_ready_restart_with_collection_and_clean_shutdown") {
+        return;
+    }
     let dir = data_dir("ready");
     let cfg = managed();
     let t0 = Instant::now();
@@ -216,6 +293,7 @@ async fn start_ready_restart_with_collection_and_clean_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_kill_restarts_and_five_crashes_break() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("crash");
     let sup = Supervisor::start(SupervisorConfig::Managed(managed()), &dir)
         .await
@@ -223,7 +301,14 @@ async fn external_kill_restarts_and_five_crashes_break() {
     let mut rx = sup.state();
     let mut pids = Vec::new();
     for i in 1..=5u32 {
-        wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+        // первая готовность — пустой каталог; дальше — после рестарта супервизором (окно падений
+        // 10 мин, четыре ожидания по READY_AGAIN_LIMIT в него укладываются)
+        let limit = if i == 1 {
+            READY_LIMIT
+        } else {
+            READY_AGAIN_LIMIT
+        };
+        wait_state(&mut rx, limit, "Ready", is_ready).await;
         let pid = sup.pid().expect("pid");
         // Windows сразу отдаёт освободившийся PID новому процессу (CI 41605984312): там
         // перезапуск доказывают `Restarting { attempt }` и новый `Ready`, а не новый PID.
@@ -268,6 +353,7 @@ async fn external_kill_restarts_and_five_crashes_break() {
 /// подняться за время проверки.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_alive_drops_right_after_kill() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("alive");
     let mut cfg = managed();
     cfg.restart.initial = Duration::from_secs(3);
@@ -295,7 +381,7 @@ async fn process_alive_drops_right_after_kill() {
         matches!(s, QdrantState::Restarting { .. })
     })
     .await;
-    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    wait_state(&mut rx, READY_AGAIN_LIMIT, "Ready (повтор)", is_ready).await;
     assert!(sup.process_alive());
     assert_ne!(sup.pid(), Some(pid));
     sup.shutdown().await;
@@ -303,6 +389,7 @@ async fn process_alive_drops_right_after_kill() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn old_stamp_wipes_storage_and_sets_rebuilt() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("stamp");
     let qdir = dir.join("qdrant");
     std::fs::create_dir_all(qdir.join("storage")).unwrap();
@@ -340,6 +427,10 @@ async fn old_stamp_wipes_storage_and_sets_rebuilt() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn storage_panic_is_detected_wiped_and_restarted_once() {
+    let _slot = common::qdrant::Slot::take();
+    if !enough_disk("storage_panic_is_detected_wiped_and_restarted_once") {
+        return;
+    }
     let dir = data_dir("panic");
     let cfg = managed();
     let sup = Supervisor::start(SupervisorConfig::Managed(cfg.clone()), &dir)
@@ -369,13 +460,7 @@ async fn storage_panic_is_detected_wiped_and_restarted_once() {
         "метка совместима — до запуска не стираем"
     );
     let mut rx = sup.state();
-    let st = wait_state(
-        &mut rx,
-        Duration::from_secs(20),
-        "Ready после wipe",
-        is_ready,
-    )
-    .await;
+    let st = wait_state(&mut rx, READY_AGAIN_LIMIT, "Ready после wipe", is_ready).await;
     assert!(sup.storage_rebuilt(), "детектор panic не сработал");
     assert!(
         matches!(st, QdrantState::Ready { rebuilt: true, .. }),
@@ -388,6 +473,7 @@ async fn storage_panic_is_detected_wiped_and_restarted_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_supervisor_on_same_dir_is_lock_error_and_reset_refuses() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("lock");
     let cfg = managed();
     let a = Supervisor::start(SupervisorConfig::Managed(cfg.clone()), &dir)
@@ -413,6 +499,7 @@ async fn second_supervisor_on_same_dir_is_lock_error_and_reset_refuses() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn orphan_from_pid_file_is_killed() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("orphan");
     let cfg = managed();
     // Первый запуск генерирует конфиг в <data_dir>/qdrant/config/zam.yaml.
@@ -448,7 +535,8 @@ async fn orphan_from_pid_file_is_killed() {
     assert!(wait_gone(opid, Duration::from_secs(2)), "сирота жив");
     let _ = orphan.wait();
     let mut rx = sup.state();
-    wait_state(&mut rx, READY_LIMIT, "Ready", is_ready).await;
+    // повторный старт на данных, которые писали прежний Qdrant и сирота
+    wait_state(&mut rx, READY_AGAIN_LIMIT, "Ready (повтор)", is_ready).await;
     assert_ne!(sup.pid(), Some(opid));
     sup.shutdown().await;
 
@@ -469,6 +557,7 @@ async fn orphan_from_pid_file_is_killed() {
 /// опознать как нашего сироту) держит наш порт и отвечает как Qdrant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reset_refuses_while_live_qdrant_holds_our_port() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("reset-live");
     let cfg = managed();
     let sup = Supervisor::start(SupervisorConfig::Managed(cfg.clone()), &dir)
@@ -531,6 +620,8 @@ fn wait_listening(port: u16) {
 /// его не трогаем, pid-файл просто удаляется.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_pid_file_of_foreign_qdrant_is_not_killed() {
+    // один слот на два процесса: `TestQdrant` уже держит слот запуска, второй
+    // (`Slot::take` для управляемого Qdrant) при `ZAM_TEST_QDRANT_MAX=1` заблокировал бы тест
     let foreign = TestQdrant::start("foreign");
     let fpid = foreign.pid();
     let dir = data_dir("foreign");
@@ -592,10 +683,11 @@ async fn missing_binary_is_broken_and_external_has_no_process() {
 /// Windows, PDEATHSIG на Linux.
 #[test]
 fn qdrant_dies_with_killed_parent() {
+    let _slot = common::qdrant::Slot::take();
     let dir = data_dir("parent");
     let cfg = managed();
     let mut probe = Command::new(env!("CARGO_BIN_EXE_kill_parent_probe"))
-        .arg(&dir)
+        .arg(dir.path())
         .arg(&cfg.binary)
         .arg(cfg.http_port.to_string())
         .arg(cfg.grpc_port.to_string())
@@ -650,6 +742,10 @@ fn collection_config(dir: &Path) -> serde_json::Value {
 /// (в `UpdateCollection` нет `wal_config`) — он остаётся прежним до пересоздания.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_renders_flush_interval_and_wal() {
+    let _slot = common::qdrant::Slot::take();
+    if !enough_disk("config_renders_flush_interval_and_wal") {
+        return;
+    }
     let dir = data_dir("walcfg");
     let mut cfg = managed();
     cfg.flush_interval_sec = 1;
@@ -682,7 +778,9 @@ async fn config_renders_flush_interval_and_wal() {
         .await
         .unwrap();
     let mut rx = sup.state();
-    wait_state(&mut rx, READY_LIMIT, "Ready (повтор)", is_ready).await;
+    // повторный старт с коллекцией и её payload-индексами: предел — READY_AGAIN_LIMIT, тест
+    // проверяет конфигурацию, а не скорость старта (финальное ревью M6.6: 10 с не хватило)
+    wait_state(&mut rx, READY_AGAIN_LIMIT, "Ready (повтор)", is_ready).await;
     let idx = sup.connect_index().unwrap();
     let meta = idx
         .ensure(common::cases::MODEL, common::cases::DIM)
@@ -725,11 +823,27 @@ struct FlushRun {
     wait: Option<zam_index::supervisor::WalWait>,
     last_op: Option<u64>,
     ack: Option<u64>,
+    /// Свободное место тома данных после остановки, МБ — для разбора неподтверждённого WAL
+    /// (на почти полном диске Qdrant не успевает его подтвердить).
+    free_mb: Option<u64>,
+    /// Каталог прогона живёт до конца теста: проверки идут после `flush_run`, и при их отказе
+    /// данные Qdrant остаются для разбора.
+    _dir: TestDir,
 }
 
 /// Старт, запись (или нет), пауза `idle`, остановка с пределом `cap`; время остановки и
-/// подтверждённая часть WAL после неё.
-async fn flush_run(name: &str, flush: u64, cap: Duration, write: bool, idle: Duration) -> FlushRun {
+/// подтверждённая часть WAL после неё. Места на диске мало — `None` (тест пропускается; каждый
+/// из четырёх прогонов подряд пишет WAL Qdrant).
+async fn flush_run(
+    name: &str,
+    flush: u64,
+    cap: Duration,
+    write: bool,
+    idle: Duration,
+) -> Option<FlushRun> {
+    if !enough_disk(&format!("shutdown_waits_for_flush_bounded ({name})")) {
+        return None;
+    }
     let dir = data_dir(name);
     let mut cfg = managed();
     cfg.flush_interval_sec = flush;
@@ -751,12 +865,14 @@ async fn flush_run(name: &str, flush: u64, cap: Duration, write: bool, idle: Dur
     let t = Instant::now();
     let wait = sup.shutdown().await;
     let took = t.elapsed();
-    FlushRun {
+    Some(FlushRun {
         took,
         wait,
         last_op,
         ack: zam_index::supervisor::wal_ack_index(&dir.join("qdrant")),
-    }
+        free_mb: common::disk::free_mb(&dir),
+        _dir: dir,
+    })
 }
 
 /// Остановка после записи ждёт, пока Qdrant подтвердит её в WAL (`first-index` против
@@ -764,23 +880,32 @@ async fn flush_run(name: &str, flush: u64, cap: Duration, write: bool, idle: Dur
 /// предел — не ждёт.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_waits_for_flush_bounded() {
-    // интервал сброса 1 с, предел 30 с: дожидается подтверждения раньше предела (на HDD
-    // два прохода фонового сброса — 6–10 с, задача 19)
-    let full = flush_run(
-        "flushwait-full",
-        1,
-        Duration::from_secs(30),
-        true,
-        Duration::ZERO,
-    )
-    .await;
+    let _slot = common::qdrant::Slot::take();
+    // интервал сброса 1 с, предел FULL_CAP: дожидается подтверждения раньше предела. На HDD два
+    // прохода фонового сброса — 6–10 с (задача 19 M3), но полный прогон на загруженной машине
+    // (две параллельные сборки, `-j 2`; финальное ревью M6.6) ждал подтверждения 29,79 с при
+    // прежнем пределе 30 с — WAL подтверждён, а проверка «< 29 с» упала. Предел 120 с — около 4×
+    // от худшего наблюдения: тест проверяет, что остановка ждёт подтверждения, а не скорость
+    // сброса. Запас FULL_MARGIN отличает подтверждение от упора в предел: упёрлась бы остановка
+    // в предел — `took` был бы не меньше FULL_CAP.
+    const FULL_CAP: Duration = Duration::from_secs(120);
+    const FULL_MARGIN: Duration = Duration::from_secs(10);
+    let Some(full) = flush_run("flushwait-full", 1, FULL_CAP, true, Duration::ZERO).await else {
+        return;
+    };
     let op = full.last_op.expect("номер операции из ответа upsert");
     assert!(
         full.ack.is_some_and(|a| a >= op),
-        "WAL не подтверждён: ack {:?}, последняя операция {op}",
-        full.ack
+        "WAL не подтверждён: ack {:?}, последняя операция {op}; свободно {:?} МБ на {}",
+        full.ack,
+        full.free_mb,
+        env!("CARGO_TARGET_TMPDIR")
     );
-    assert!(full.took < Duration::from_secs(29), "{:?}", full.took);
+    assert!(
+        full.took < FULL_CAP - FULL_MARGIN,
+        "{:?} — остановка упёрлась в предел {FULL_CAP:?}, а не дождалась подтверждения",
+        full.took
+    );
     assert_eq!(
         full.wait.map(|w| w.result),
         Some("acked"),
@@ -788,14 +913,17 @@ async fn shutdown_waits_for_flush_bounded() {
         full.wait
     );
     // интервал 5 с, предел 1 с: подтверждения не будет раньше первого сброса — ждёт предел
-    let capped = flush_run(
+    let Some(capped) = flush_run(
         "flushwait-cap",
         5,
         Duration::from_secs(1),
         true,
         Duration::ZERO,
     )
-    .await;
+    .await
+    else {
+        return;
+    };
     assert!(
         capped.took >= Duration::from_millis(900) && capped.took < Duration::from_secs(6),
         "{:?}",
@@ -808,20 +936,26 @@ async fn shutdown_waits_for_flush_bounded() {
         "{w:?}"
     );
     // предел 0 — вариант выключен
-    let off = flush_run("flushwait-off", 5, Duration::ZERO, true, Duration::ZERO).await;
+    let Some(off) = flush_run("flushwait-off", 5, Duration::ZERO, true, Duration::ZERO).await
+    else {
+        return;
+    };
     // верхние пределы — с запасом на остановку Qdrant по SIGTERM (Linux: начатый проход
     // сброса доходит до конца); проверяется, что ожидания нет, а не скорость выхода
     assert!(off.took < Duration::from_secs(5), "{:?}", off.took);
     assert_eq!(off.wait, None, "при пределе 0 ожидания нет");
     // запись давно подтверждена — не ждёт
-    let idle = flush_run(
+    let Some(idle) = flush_run(
         "flushwait-idle",
         1,
         Duration::from_secs(6),
         true,
         Duration::from_secs(20),
     )
-    .await;
+    .await
+    else {
+        return;
+    };
     assert!(
         idle.ack >= idle.last_op,
         "{:?} < {:?}",
@@ -855,8 +989,12 @@ fn first_index(dir: &Path) -> PathBuf {
 /// Коллекция создана и записана, первого прохода сброса ещё не было: `flush_interval_sec`
 /// = 3600 — первый проход сброса через час, файла `first-index` нет (его пишет только
 /// `SerdeWal::ack`) при любой скорости диска и нагрузке параллельных тестов (с 60 с при
-/// параллельном прогоне на HDD подтверждение успевало). Супервизор с пределом `cap`.
-async fn unacked(name: &str, cap: Duration) -> (PathBuf, Supervisor) {
+/// параллельном прогоне на HDD подтверждение успевало). Супервизор с пределом `cap`. Места на
+/// диске мало — `None` (тест пропускается).
+async fn unacked(test: &str, name: &str, cap: Duration) -> Option<(TestDir, Supervisor)> {
+    if !enough_disk(test) {
+        return None;
+    }
     let dir = data_dir(name);
     let mut cfg = managed();
     cfg.flush_interval_sec = 3600;
@@ -871,7 +1009,7 @@ async fn unacked(name: &str, cap: Duration) -> (PathBuf, Supervisor) {
         .await
         .unwrap();
     write_batches(&idx, 2).await;
-    (dir, sup)
+    Some((dir, sup))
 }
 
 /// Файла `first-index` нет — подтверждений ещё не было (задача 19, fix round 2): все записи
@@ -879,7 +1017,16 @@ async fn unacked(name: &str, cap: Duration) -> (PathBuf, Supervisor) {
 /// предела (`timeout`), а не переходит на паузу по времени.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_first_index_means_nothing_acked() {
-    let (dir, sup) = unacked("noack", Duration::from_millis(1500)).await;
+    let _slot = common::qdrant::Slot::take();
+    let Some((dir, sup)) = unacked(
+        "missing_first_index_means_nothing_acked",
+        "noack",
+        Duration::from_millis(1500),
+    )
+    .await
+    else {
+        return;
+    };
     assert!(
         !first_index(&dir).exists(),
         "до первого прохода сброса файла нет"
@@ -899,7 +1046,16 @@ async fn missing_first_index_means_nothing_acked() {
 /// неподтверждённых неизвестно (`None`), ожидание — пауза по времени (`time`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreadable_first_index_falls_back_to_time() {
-    let (dir, sup) = unacked("badack", Duration::from_millis(1500)).await;
+    let _slot = common::qdrant::Slot::take();
+    let Some((dir, sup)) = unacked(
+        "unreadable_first_index_falls_back_to_time",
+        "badack",
+        Duration::from_millis(1500),
+    )
+    .await
+    else {
+        return;
+    };
     let f = first_index(&dir);
     std::fs::write(&f, "не JSON").unwrap();
     assert_eq!(

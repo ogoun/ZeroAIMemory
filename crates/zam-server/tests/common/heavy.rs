@@ -211,11 +211,14 @@ pub struct Required {
     pub needle: String,
 }
 
-/// Загруженный мир: обязательные строки и id ловушек (`gotcha`/`failure`).
+/// Загруженный мир: обязательные строки, id ловушек (`gotcha`/`failure`) и число открытых задач
+/// журнала сессии (задачи принятых идей — сверх них): есть — в дайджесте строка «Открыто задач:
+/// N» (M6.6 §4.2).
 pub struct World {
     pub required: Vec<Required>,
     pub traps: Vec<String>,
     pub rules: usize,
+    pub open_tasks: usize,
 }
 
 async fn post(a: &Api, path: &str, body: Value, want: StatusCode) -> Value {
@@ -310,7 +313,9 @@ pub async fn load(a: &Api, s: &Spec) -> World {
             traps.push(format!("i:{}", id_of(&v)));
         }
     }
+    let mut open_tasks = 0;
     for t in pick(&s.tasks, &c.task, |t| &t.key) {
+        open_tasks += usize::from(t.status == "open");
         let mut data = json!({});
         if let Some(n) = &t.next_step {
             data["next_step"] = json!(n);
@@ -488,6 +493,7 @@ pub async fn load(a: &Api, s: &Spec) -> World {
         required,
         traps,
         rules: rules.len(),
+        open_tasks,
     }
 }
 
@@ -665,7 +671,8 @@ pub fn shape(text: &str, w: &World) -> String {
 
 /// Повторное ревью 8a (2в): снятое пределом вывода не пропадает молча — у ловушек число
 /// непоказанных называет строка «не показано — ловушек: N», у снятых строк-указателей (открытые
-/// вопросы, словарь) — строка со своим адресом (`kinds=[question]`, `kinds=[term]`).
+/// вопросы, словарь, открытые задачи M6.6 §4.2) — строка со своим адресом (`kinds=[question]`,
+/// `kinds=[term]`, `kinds=[task]`).
 pub fn check_omits(what: &str, text: &str, w: &World) {
     let shown = w
         .traps
@@ -680,13 +687,20 @@ pub fn check_omits(what: &str, text: &str, w: &World) {
         );
     }
     // снятые строки-указатели — со своим адресом
+    let open_tasks = (
+        "Открыто задач:",
+        "строк открытых задач: 1 (memory_search kinds=[task])",
+    );
     for (line, omit) in [
         (
             "### Открытые вопросы",
             "строк открытых вопросов: 1 (memory_search kinds=[question])",
         ),
         ("Словарь:", "строк словаря: 1 (memory_search kinds=[term])"),
-    ] {
+    ]
+    .into_iter()
+    .chain((w.open_tasks > 0).then_some(open_tasks))
+    {
         if !text.contains(line) {
             assert!(
                 text.contains(&format!("не показано — {omit}")),

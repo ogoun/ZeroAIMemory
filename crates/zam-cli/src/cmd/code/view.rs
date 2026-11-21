@@ -10,7 +10,7 @@ use super::config::CodeConfig;
 use super::scan;
 use super::state::{CodeState, SyncMark};
 use crate::client::{CliError, EXIT_NOT_FOUND, read_json};
-use crate::cmd::{Ctx, agent_time, emit, emit_json, refs};
+use crate::cmd::{Ctx, emit, emit_json, refs};
 
 /// Предел бюджета карты (как у сервера `code.map_tokens`).
 pub const BUDGET_MAX: usize = 20_000;
@@ -58,14 +58,20 @@ pub fn status(ctx: &Ctx, guid: &str, root: &Path) -> Result<(), CliError> {
     emit(status_text(&v, mark.as_ref()).as_bytes())
 }
 
+/// Время ответа в тексте человеку: `yyyy-MM-dd HH:mm:ss UTC` — без `T`, `Z` и смещения (M6
+/// §4.4), с одной пометкой зоны (M6.6 §9, замечание 30); не время — как есть, без пометки.
+fn utc_time(s: &str) -> String {
+    zam_core::time::agent_ts(s).map_or_else(|| s.to_string(), |t| format!("{t} UTC"))
+}
+
 /// Текст `zam code status` по ответу `/code/status` и отметке синхронизации этой машины; время —
-/// UTC `yyyy-MM-dd HH:mm:ss` (M6 §4.4).
+/// [`utc_time`].
 fn status_text(v: &Value, mark: Option<&SyncMark>) -> String {
     let mut s = format!(
         "карта кода: файлов {}, символов {}; снимок {}",
         v["files"],
         v["symbols"],
-        agent_time(v["updated_at"].as_str().unwrap_or("?"))
+        utc_time(v["updated_at"].as_str().unwrap_or("?"))
     );
     let snap: Vec<String> = ["commit", "branch", "machine"]
         .iter()
@@ -115,7 +121,7 @@ fn status_text(v: &Value, mark: Option<&SyncMark>) -> String {
     if let Some(m) = mark {
         s.push_str(&format!(
             "синхронизация с этой машины: {}\n",
-            agent_time(&m.last_ok_at)
+            utc_time(&m.last_ok_at)
         ));
     }
     s
@@ -475,14 +481,21 @@ mod tests {
             head: None,
         };
         let s = status_text(&v, Some(&m));
+        // M6.6 §9 (30): человеческая команда — время с пометкой «UTC» (без `T`, `Z` и смещения)
         assert!(
-            s.starts_with("карта кода: файлов 2, символов 3; снимок 2026-10-10 14:03:22 (main)"),
+            s.starts_with(
+                "карта кода: файлов 2, символов 3; снимок 2026-10-10 14:03:22 UTC (main)"
+            ),
             "{s}"
         );
         assert!(
-            s.contains("синхронизация с этой машины: 2026-10-11 08:00:00\n"),
+            s.contains("синхронизация с этой машины: 2026-10-11 08:00:00 UTC\n"),
             "{s}"
         );
+        // не время — как есть, без пометки
+        let v = json!({"files": 1, "symbols": 1, "updated_at": "?", "rank_state": "ready"});
+        let s = status_text(&v, None);
+        assert!(s.contains("снимок ?;") && !s.contains("UTC"), "{s}");
     }
 
     use super::*;

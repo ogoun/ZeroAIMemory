@@ -54,6 +54,19 @@ async fn get(a: &Api, id: &str) -> Value {
     r.json()
 }
 
+/// Ревизии записи (`GET …/revisions`, `items`), от первой к последней.
+async fn revisions(a: &Api, id: &str) -> Vec<Value> {
+    let r = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/entries/{id}/revisions"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["items"].as_array().unwrap().clone()
+}
+
 /// PATCH токеном администратора с `If-Match` текущей ревизии.
 async fn patch(a: &Api, id: &str, body: Value) -> Resp {
     a.tok_rev(
@@ -240,16 +253,8 @@ async fn task_reopen_requires_reason() {
     assert_eq!(j["status"], "open");
     assert!(j["data"].get("done_at").is_none(), "{j}");
     assert!(j["data"]["started_at"].is_string());
-    let revs = a
-        .t(
-            Method::GET,
-            &format!("/api/v1/entries/{tid}/revisions"),
-            None,
-        )
-        .await
-        .json();
     assert_eq!(
-        revs["items"].as_array().unwrap().last().unwrap()["reason"],
+        revisions(&a, &tid).await.last().unwrap()["reason"],
         "нашли баг"
     );
     // из любого статуса — в dropped; и из dropped — только в open
@@ -303,15 +308,7 @@ async fn claim_free_expired_same_session() {
     assert!((29 * 60..=30 * 60).contains(&left), "{left}");
     assert_eq!(j["rev"], before["rev"]);
     assert_eq!(j["updated_at"], before["updated_at"]);
-    let revs = a
-        .t(
-            Method::GET,
-            &format!("/api/v1/entries/{tid}/revisions"),
-            None,
-        )
-        .await
-        .json();
-    assert_eq!(revs["items"].as_array().unwrap().len(), 1, "ревизии нет");
+    assert_eq!(revisions(&a, &tid).await.len(), 1, "ревизии нет");
 
     // та же сессия — продление (по умолчанию 120 мин)
     let j = claim(&a, &tid, Some("s1"), json!({})).await.json();
@@ -609,13 +606,15 @@ async fn digest_tasks_section_order() {
         )),
         "{text}"
     );
-    // захваченная сессией — первой, затем недавно менявшиеся; open и done не показаны
+    // захваченная сессией — первой, затем недавно менявшиеся; open и done строками задач не
+    // показаны — open только в строке «Открыто задач» (M6.6 §4, задача 3)
     assert!(pos("Моя задача") < pos("Застряла"), "{text}");
     assert!(pos("Застряла") < pos("Чужая задача"), "{text}");
     assert!(
-        !text.contains("Открытая") && !text.contains("Готовая"),
+        !text.contains("] Открытая") && !text.contains("Готовая"),
         "{text}"
     );
+    assert!(text.contains("Открыто задач: 1 — «Открытая»"), "{text}");
     let items = j["items"].as_array().unwrap();
     let task_items: Vec<&Value> = items.iter().filter(|i| i["reason"] == "task").collect();
     assert_eq!(task_items.len(), 3, "{j}");
@@ -776,12 +775,16 @@ async fn session_claimed_tasks_scoped_to_solution() {
 }
 
 /// `next_step` и `blocked_by` в дайджесте и пакете восстановления маскируются (финальное ревью
-/// M4.5, M-2): ключ из команды в шаге не уходит агенту.
+/// M4.5, M-2): ключ из команды в шаге не уходит агенту. Заголовок задачи — тоже (финальное
+/// ревью M6.6, Minor 3, как в строке «Открыто задач»).
 #[tokio::test]
 async fn digest_masks_task_texts() {
     let a = api("tasks-mask", roomy).await;
     // «ключ» собирается из частей: в исходниках нет строки, похожей на настоящий
     let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let aws = format!("{}{}", "AK", "IAABCDEFGHIJKLMNOP");
+    let t3 = id(&new_task(&a, &format!("Ротация {aws}"), json!({})).await);
+    status(&a, &t3, "in_progress").await;
     let t1 = id(&new_task(
         &a,
         "Деплой",
@@ -815,6 +818,10 @@ async fn digest_masks_task_texts() {
         );
         assert!(!text.contains(&key), "{event}: {text}");
         assert!(text.contains("‹secret›"), "{event}: {text}");
+        // заголовок с ключом — маска в строке задачи
+        let line = format!("ZeroAIMemory: [in_progress] Ротация ‹secret› — k:{t3}");
+        assert!(text.lines().any(|l| l == line), "{event}: {text}");
+        assert!(!text.contains(&aws[..8]), "{event}: {text}");
     }
 }
 
@@ -837,6 +844,52 @@ async fn mcp(a: &Api, name: &str, args: Value) -> (String, bool) {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
     (mcp_text(&j["result"]), j["result"]["isError"] == true)
+}
+
+/// Первая строка ответа MCP (без `~N tok`).
+fn first(t: &str) -> String {
+    t.lines().next().unwrap_or("").to_string()
+}
+
+/// Текст 422 статуса задачи при создании (M6.6 §8, замечание 33, решение координатора 19).
+const STATUS_ON_CREATE: &str =
+    "data.status: статус задаётся правкой — memory_update_entry action=status (zam task status)";
+
+/// Задача с `data.status` при создании — 422 с подсказкой, как задать статус (REST и MCP —
+/// один текст); задача не создаётся. Без `data.status` — создаётся `open`, как прежде.
+#[tokio::test]
+async fn task_create_status_422_names_action() {
+    let a = api("tasks-create-status", |_| {}).await;
+    for status in [json!("in_progress"), json!("open"), Value::Null] {
+        let r = a
+            .t(
+                Method::POST,
+                KN,
+                Some(json!({"kind": "task", "title": "Со статусом",
+                            "data": {"status": status, "next_step": "начать"}})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+        assert_eq!(r.json()["detail"], STATUS_ON_CREATE, "{status}");
+    }
+    let (t, err) = mcp(
+        &a,
+        "memory_log",
+        json!({"kind": "task", "title": "Через MCP со статусом", "space": "knowledge",
+               "data": {"status": "in_progress"}}),
+    )
+    .await;
+    assert!(err, "{t}");
+    assert!(t.contains(STATUS_ON_CREATE), "{t}");
+    let list = a
+        .t(Method::GET, &format!("{KN}?kind=task"), None)
+        .await
+        .json();
+    assert_eq!(list["items"].as_array().unwrap().len(), 0, "{list}");
+    assert_eq!(
+        new_task(&a, "Без статуса", json!({})).await["status"],
+        "open"
+    );
 }
 
 #[tokio::test]
@@ -870,6 +923,33 @@ async fn mcp_update_entry_status_claim() {
     assert!(!err, "{t}");
     let cur = get(&a, &tid).await;
     assert_eq!(cur["data"]["claimed_by"]["session"], "mcp-task");
+    // M6.6 §8 (замечание 19): срок захвата — время агента (M6 §4.4), сессия, ревизия, статус
+    let until = |e: &Value| {
+        zam_core::time::agent_ts(e["data"]["claimed_by"]["until"].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(
+        first(&t),
+        format!(
+            "Захвачена {k} до {} (сессия mcp-task) · rev1 · open",
+            until(&cur)
+        )
+    );
+    // продление той же сессией с агентом — агент в скобках
+    let (t, err) = mcp(
+        &a,
+        "memory_update_entry",
+        json!({"id": k, "action": "claim", "ttl_min": 45, "agent": "claude"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let cur = get(&a, &tid).await;
+    assert_eq!(
+        first(&t),
+        format!(
+            "Захвачена {k} до {} (сессия mcp-task, агент claude) · rev1 · open",
+            until(&cur)
+        )
+    );
     // status: нужна ревизия; next_step и blocked_by
     let (t, err) = mcp(
         &a,
@@ -923,7 +1003,12 @@ async fn mcp_update_entry_status_claim() {
     )
     .await;
     assert!(!err, "{t}");
-    assert!(get(&a, &tid).await["data"].get("claimed_by").is_none());
+    let cur = get(&a, &tid).await;
+    assert!(cur["data"].get("claimed_by").is_none());
+    assert_eq!(
+        first(&t),
+        format!("Захват снят {k} · rev{} · in_progress", cur["rev"])
+    );
     let (t, err) = mcp(
         &a,
         "memory_update_entry",
@@ -948,17 +1033,9 @@ async fn claimed_by_not_in_revision_snapshots() {
         .await
         .json();
     assert_eq!(j["data"]["claimed_by"]["session"], "s1");
-    let revs = a
-        .t(
-            Method::GET,
-            &format!("/api/v1/entries/{tid}/revisions"),
-            None,
-        )
-        .await
-        .json();
-    let items = revs["items"].as_array().unwrap();
-    assert_eq!(items.len(), 3, "{revs}");
-    for r in items {
+    let items = revisions(&a, &tid).await;
+    assert_eq!(items.len(), 3, "{items:?}");
+    for r in &items {
         assert!(r["data"].get("claimed_by").is_none(), "{r}");
     }
     assert_eq!(items[2]["data"]["next_step"], "новый шаг");
@@ -973,4 +1050,158 @@ async fn claimed_by_not_in_revision_snapshots() {
     let d2 = status(&a, &tid, "done").await;
     assert_eq!(d2["data"]["done_at"], done);
     assert_eq!(d2["rev"], d1["rev"], "done → done без изменений");
+}
+
+/// `data` ревизий задачи, от первой к последней.
+async fn revision_data(a: &Api, id: &str) -> Vec<Value> {
+    revisions(a, id)
+        .await
+        .into_iter()
+        .map(|x| x["data"].clone())
+        .collect()
+}
+
+/// M6.6, замечание 35: смена статуса на `done` без `next_step` снимает «следующий шаг» (и
+/// блокер) — у выполненной задачи в лентах нет «далее: …»; прежнее значение — в истории.
+#[tokio::test]
+async fn task_done_clears_next_step() {
+    let a = api("tasks-done-next", |_| {}).await;
+    let tid = id(&new_task(&a, "Ревью", json!({"next_step": "повторное ревью"})).await);
+    let j = patch(
+        &a,
+        &tid,
+        json!({"status": "blocked", "blocked_by": "ждём ревьюера"}),
+    )
+    .await
+    .json();
+    assert_eq!(j["data"]["next_step"], "повторное ревью", "{j}");
+    let j = status(&a, &tid, "done").await;
+    assert_eq!(j["status"], "done");
+    assert!(j["data"].get("next_step").is_none(), "{j}");
+    assert!(j["data"].get("blocked_by").is_none(), "{j}");
+    assert!(j["data"].get("done_at").is_some(), "{j}");
+    let cur = get(&a, &tid).await;
+    assert!(cur["data"].get("next_step").is_none(), "{cur}");
+    // лента выполненных — без шага
+    let items = a
+        .t(Method::GET, &format!("{KN}?kind=task&status=done"), None)
+        .await
+        .json()["items"]
+        .clone();
+    assert!(items[0]["data"].get("next_step").is_none(), "{items}");
+    // история хранит прежний шаг и блокер
+    let revs = revision_data(&a, &tid).await;
+    assert_eq!(revs.len(), 3, "{revs:?}");
+    assert_eq!(revs[1]["next_step"], "повторное ревью", "{revs:?}");
+    assert_eq!(revs[1]["blocked_by"], "ждём ревьюера", "{revs:?}");
+    assert!(revs[2].get("next_step").is_none(), "{revs:?}");
+
+    // блокер, заданный задаче не в `blocked`, закрытие тоже снимает
+    let t2 = id(&new_task(
+        &a,
+        "Без блока",
+        json!({"next_step": "шаг", "blocked_by": "x"}),
+    )
+    .await);
+    let j = status(&a, &t2, "done").await;
+    assert!(j["data"].get("next_step").is_none(), "{j}");
+    assert!(j["data"].get("blocked_by").is_none(), "{j}");
+    // переоткрытие шаг не возвращает
+    let j = patch(
+        &a,
+        &t2,
+        json!({"status": "open", "reason": "тесты красные"}),
+    )
+    .await
+    .json();
+    assert_eq!(j["status"], "open", "{j}");
+    assert!(j["data"].get("next_step").is_none(), "{j}");
+}
+
+/// Явный `next_step` (и `blocked_by`) той же правки сильнее: остаётся у выполненной задачи;
+/// повтор `done → done` — не переход, заданный после закрытия шаг не снимает.
+#[tokio::test]
+async fn task_done_with_explicit_next_keeps_it() {
+    let a = api("tasks-done-explicit", |_| {}).await;
+    let tid = id(&new_task(&a, "Выпуск", json!({"next_step": "собрать"})).await);
+    status(&a, &tid, "in_progress").await;
+    let r = patch(
+        &a,
+        &tid,
+        json!({"status": "done", "next_step": "передать в выпуск"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["data"]["next_step"], "передать в выпуск", "{j}");
+    // то же полем `data`
+    let t2 = id(&new_task(&a, "Через data", json!({"next_step": "старый"})).await);
+    let r = patch(
+        &a,
+        &t2,
+        json!({"status": "dropped", "data": {"next_step": "новый", "blocked_by": "решение"}}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["data"]["next_step"], "новый", "{j}");
+    assert_eq!(j["data"]["blocked_by"], "решение", "{j}");
+    // повтор done без next_step: шаг остаётся, ревизии нет
+    let before = get(&a, &tid).await;
+    let j = status(&a, &tid, "done").await;
+    assert_eq!(j["data"]["next_step"], "передать в выпуск", "{j}");
+    assert_eq!(j["rev"], before["rev"], "{j}");
+    // шаг задачи, закрытой раньше, снимает пустая строка (`zam task status <id> done --next ""`)
+    let r = patch(&a, &tid, json!({"status": "done", "next_step": ""})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert!(j["data"].get("next_step").is_none(), "{j}");
+    assert_eq!(j["status"], "done", "{j}");
+}
+
+/// `dropped` снимает шаг так же, как `done`.
+#[tokio::test]
+async fn task_dropped_clears_next_step() {
+    let a = api("tasks-dropped-next", |_| {}).await;
+    let tid = id(&new_task(&a, "Снята", json!({"next_step": "сделать"})).await);
+    status(&a, &tid, "in_progress").await;
+    let r = patch(&a, &tid, json!({"status": "dropped", "reason": "не нужно"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["status"], "dropped");
+    assert!(j["data"].get("next_step").is_none(), "{j}");
+    let revs = revision_data(&a, &tid).await;
+    assert_eq!(revs[revs.len() - 2]["next_step"], "сделать", "{revs:?}");
+}
+
+/// MCP `memory_update_entry action=status` идёт тем же `PATCH`: `done` снимает шаг, явный
+/// `next_step` вызова остаётся.
+#[tokio::test]
+async fn mcp_status_done_clears_next_step() {
+    let a = api("tasks-mcp-done-next", |_| {}).await;
+    let tid = id(&new_task(&a, "Через MCP", json!({"next_step": "ревью"})).await);
+    let k = format!("k:{tid}");
+    let cur = get(&a, &tid).await;
+    let (t, err) = mcp(
+        &a,
+        "memory_update_entry",
+        json!({"id": k, "action": "status", "rev": cur["rev"], "status": "done"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    assert!(get(&a, &tid).await["data"].get("next_step").is_none());
+    let t2 = id(&new_task(&a, "С шагом", json!({"next_step": "ревью"})).await);
+    let cur = get(&a, &t2).await;
+    let (t, err) = mcp(
+        &a,
+        "memory_update_entry",
+        json!({"id": format!("k:{t2}"), "action": "status", "rev": cur["rev"],
+               "status": "done", "next_step": "сообщить владельцу"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    assert_eq!(
+        get(&a, &t2).await["data"]["next_step"],
+        "сообщить владельцу"
+    );
 }

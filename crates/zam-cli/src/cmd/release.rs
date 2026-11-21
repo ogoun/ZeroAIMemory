@@ -1,23 +1,28 @@
-//! `zam release add <version> [--date D] [--tag T] [--notes-file F] [--from-git [FROM..TO]]`
-//! и `zam release compare <version|id> [--with prev|<version>|<id>]` (§7.4).
+//! `zam release add <version> [--date D] [--tag T] [--notes-file F] [--from-git [FROM..TO]]`,
+//! `zam release compare <version|id> [--with prev|<version>|<id>]` (§7.4) и
+//! `zam release list [--limit N | --all]` (M6.6 §9, замечание 14).
 //!
 //! `--from-git` собирает коммиты `git log --format=%H%x09%s FROM..TO` в `data.commits`;
 //! без диапазона — от предыдущего тега до `HEAD` (тег, указывающий на сам `HEAD`, не
 //! считается предыдущим; тегов нет — вся история). Сравнение печатает changelog по видам,
-//! дифф описаний и коммиты.
+//! дифф описаний и коммиты. Лента релизов (`list`, поиск по версии) — общий обход
+//! [`list_entries`].
 use std::path::Path;
 use std::process::Command;
 
 use serde_json::{Value, json};
 
 use super::log::read_text;
-use super::{Ctx, emit, emit_json, post_entry, solution_guid};
+use super::{Ctx, Paging, emit, emit_json, list_entries, more_hint, post_entry, solution_guid};
 use crate::client::{CliError, EXIT_CONFIG, EXIT_NOT_FOUND, read_json};
 
 /// Предел числа коммитов релиза на сервере.
 const COMMITS_MAX: usize = 5000;
-/// Страница при поиске релиза по версии.
-const PAGE: &str = "200";
+/// Фильтр ленты записей — релизы.
+const RELEASES: [(&str, &str); 1] = [("kind", "release")];
+/// Релизов в `zam release list` без `--limit` и `--all` — как страница ленты сервера по
+/// умолчанию (`LIST_DEFAULT` в `zam-server`, `api/entries.rs`).
+const LIST_DEFAULT: usize = 50;
 
 pub struct Add<'a> {
     pub version: &'a str,
@@ -135,24 +140,18 @@ pub fn add(ctx: &Ctx, o: &Add) -> Result<(), CliError> {
     post_entry(ctx, &guid, &req, o.key, None)
 }
 
-/// Id релиза по версии (точное совпадение `data.version`) или по id записи.
+/// Id релиза по версии (точное совпадение `data.version`; лента целиком — [`list_entries`] с
+/// `all`) или по id записи.
 fn resolve_release(ctx: &Ctx, guid: &str, raw: &str) -> Result<String, CliError> {
     let raw = raw.trim();
-    let mut cursor: Option<String> = None;
-    loop {
-        let mut q = vec![("kind", "release"), ("limit", PAGE)];
-        if let Some(c) = cursor.as_deref() {
-            q.push(("cursor", c));
-        }
-        let page = read_json(ctx.client.get(&format!("/spaces/{guid}/entries"), &q)?)?;
-        let items = page["items"].as_array().cloned().unwrap_or_default();
-        if let Some(e) = items.iter().find(|e| e["data"]["version"] == raw) {
-            return Ok(e["id"].as_str().unwrap_or_default().to_string());
-        }
-        match page["next_cursor"].as_str() {
-            Some(c) => cursor = Some(c.to_string()),
-            None => break,
-        }
+    let v = list_entries(ctx, guid, &RELEASES, None, true)?;
+    if let Some(e) = v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["data"]["version"] == raw)
+    {
+        return Ok(e["id"].as_str().unwrap_or_default().to_string());
     }
     if raw.len() == 26 && raw.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Ok(raw.to_string());
@@ -187,6 +186,64 @@ pub fn compare(
 
 fn version(e: &Value) -> &str {
     e["data"]["version"].as_str().unwrap_or("?")
+}
+
+/// `zam release list`: релизы решения, новые первыми — по дате релиза (`data.date`), при равной
+/// — по времени создания. Сервер режет страницы ленты по времени создания, поэтому лента
+/// читается целиком ([`list_entries`] с `all`; релизов единицы–десятки), сортируется и только
+/// потом режется: `--limit` (по умолчанию [`LIST_DEFAULT`]) — первые новейшие, отрезано —
+/// строка «есть ещё», как у лент журналов; `--all` — все. `--json` — записи сервера в том же
+/// порядке, `next_cursor: null` (ревью задачи 9 M6.6, Important 1).
+pub fn list(ctx: &Ctx, solution: Option<&str>, page: Paging) -> Result<(), CliError> {
+    let guid = solution_guid(ctx, solution)?;
+    let mut v = list_entries(ctx, &guid, &RELEASES, None, true)?;
+    if let Some(items) = v["items"].as_array_mut() {
+        let limit = (!page.all).then(|| page.limit.map_or(LIST_DEFAULT, |l| l as usize));
+        if newest_first(items, limit) {
+            eprintln!("{}", more_hint(items.len()));
+        }
+    }
+    if ctx.json {
+        return emit_json(&v);
+    }
+    let out: String = v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| format!("{}\n", list_line(e)))
+        .collect();
+    emit(out.as_bytes())
+}
+
+/// Релизы ленты сервера (новые созданные первыми) — новые по дате релиза первыми (сортировка
+/// устойчивая: при равной дате — порядок создания) и первые `limit`; `true` — отрезано.
+fn newest_first(items: &mut Vec<Value>, limit: Option<usize>) -> bool {
+    items.sort_by(|a, b| b["data"]["date"].as_str().cmp(&a["data"]["date"].as_str()));
+    match limit {
+        Some(n) if items.len() > n => {
+            items.truncate(n);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Строка ленты релизов: `<id> <версия> <дата>[ тег <tag>][ · коммитов K]`.
+fn list_line(e: &Value) -> String {
+    let d = &e["data"];
+    let mut s = format!(
+        "{} {} {}",
+        e["id"].as_str().unwrap_or("?"),
+        version(e),
+        d["date"].as_str().unwrap_or("?")
+    );
+    if let Some(t) = d["git_tag"].as_str() {
+        s.push_str(&format!(" тег {t}"));
+    }
+    if let Some(n) = d["commits"].as_array().map(Vec::len).filter(|&n| n > 0) {
+        s.push_str(&format!(" · коммитов {n}"));
+    }
+    s
 }
 
 /// Текст сравнения: заголовок, changelog по видам, дифф описаний, коммиты.
@@ -247,6 +304,46 @@ mod tests {
         assert_eq!(git_range("v1").unwrap(), "v1..HEAD");
         assert_eq!(git_range("..v2").unwrap(), "..v2");
         assert!(git_range("--output=x").is_err());
+    }
+
+    #[test]
+    fn list_line_forms() {
+        let e = json!({"id": "01A", "data": {"version": "1.2", "date": "2026-03-01",
+                       "git_tag": "v1.2", "commits": [{"sha": "a"}, {"sha": "b"}]}});
+        assert_eq!(list_line(&e), "01A 1.2 2026-03-01 тег v1.2 · коммитов 2");
+        let e =
+            json!({"id": "01B", "data": {"version": "0.9", "date": "2025-12-01", "commits": []}});
+        assert_eq!(list_line(&e), "01B 0.9 2025-12-01");
+    }
+
+    /// Ревью задачи 9 M6.6, Important 1: порядок — по дате релиза поверх порядка создания, а
+    /// `limit` режет уже отсортированную ленту (новейшие по дате, а не последние созданные).
+    #[test]
+    fn newest_first_sorts_then_limits() {
+        // лента сервера — новые созданные первыми: 0.9.0 заведён после 1.1.0
+        let feed = || -> Vec<Value> {
+            [
+                ("1.2.1", "2026-03-01"),
+                ("1.2.0", "2026-03-01"),
+                ("0.9.0", "2025-12-01"),
+                ("1.1.0", "2026-02-01"),
+            ]
+            .iter()
+            .map(|(v, d)| json!({"data": {"version": v, "date": d}}))
+            .collect()
+        };
+        let versions = |items: &[Value]| -> Vec<String> {
+            items.iter().map(|e| version(e).to_string()).collect()
+        };
+        let mut all = feed();
+        assert!(!newest_first(&mut all, None));
+        assert_eq!(versions(&all), ["1.2.1", "1.2.0", "1.1.0", "0.9.0"]);
+        let mut three = feed();
+        assert!(newest_first(&mut three, Some(3)));
+        assert_eq!(versions(&three), ["1.2.1", "1.2.0", "1.1.0"]);
+        let mut whole = feed();
+        assert!(!newest_first(&mut whole, Some(4)));
+        assert_eq!(whole.len(), 4);
     }
 
     #[test]

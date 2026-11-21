@@ -131,7 +131,8 @@ impl PrincipalSlot {
     }
 }
 
-/// Только администратор по cookie-сессии; токены — 403.
+/// Только администратор по cookie-сессии; токены и сессии пользователей — 403
+/// ([`ADMIN_ROUTE_TOKEN_DENIED`], [`ADMIN_ROUTE_USER_DENIED`]).
 #[derive(Clone)]
 pub struct AdminOnly(pub String /*session_id*/);
 
@@ -400,13 +401,23 @@ async fn authenticate(parts: &mut Parts, st: &AppState) -> Result<Authed, ApiErr
     })
 }
 
+/// 403 администраторского маршрута токену (M6.6 §10.2, замечание 3): любой токен, в том числе
+/// первый токен администратора, — агентский (§11.4); текст называет, как войти.
+pub const ADMIN_ROUTE_TOKEN_DENIED: &str = "администраторский маршрут: нужен вход администратора \
+     (POST /api/v1/auth/login, cookie и x-csrf-token); токен — агентский";
+/// 403 администраторского маршрута сессии пользователя WebUI.
+pub const ADMIN_ROUTE_USER_DENIED: &str = "только администратору";
+
 impl FromRequestParts<AppState> for AdminOnly {
     type Rejection = ApiError;
 
+    /// Тип problem (`about:blank`) и код 403 у токена и сессии пользователя прежние — клиенты
+    /// по `detail` не ветвятся (`docs/api-compat.md`); без входа — 401, как раньше.
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
         match Principal::from_request_parts(parts, st).await? {
             Principal::Admin { session_id } => Ok(AdminOnly(session_id)),
-            Principal::Token(_) | Principal::User { .. } => Err(ApiError::Forbidden),
+            Principal::Token(_) => Err(ApiError::Denied(ADMIN_ROUTE_TOKEN_DENIED.into())),
+            Principal::User { .. } => Err(ApiError::Denied(ADMIN_ROUTE_USER_DENIED.into())),
         }
     }
 }

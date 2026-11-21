@@ -1,7 +1,8 @@
 //! `zam question` — вопросы к человеку (M4.5 §4): `list`, `ask`, `answer`.
 //!
-//! - `list [--status S,…] [--global] [--solution GUID]` — строки `<id> [статус] «вопрос»`; без
-//!   `--status` — `open`. У `answered` — ответ, у `open` — варианты;
+//! - `list [--status S,…] [--global] [--solution GUID] [--limit N | --all]` — строки `<id>
+//!   [статус] «вопрос»`; без `--status` — `open`. У `answered` — ответ, у `open` — варианты.
+//!   Страница — 200, обход и подсказка о продолжении — [`super::list_entries`];
 //! - `ask --title T [--option key=text]… [--recommend key] [--body-file F | stdin] [--force]` —
 //!   новый вопрос (`<id>@<rev>`); тот же заголовок у `open` или `answered` — код 4 со списком
 //!   кандидатов (у отвеченного — его ответ); `--force` записывает всё равно;
@@ -17,7 +18,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::log::read_text;
-use super::{Ctx, emit, emit_json, post_entry, solution_guid};
+use super::{
+    Ctx, LIST_LIMIT_MAX, Paging, emit, emit_json, list_entries, post_entry, solution_guid,
+};
 use crate::client::{CliError, EXIT_CONFLICT, read_json};
 // `q:<id>` / `e:<id>` … → голый id (буквы — общий источник `target`)
 use crate::target::bare_entry_id as bare_id;
@@ -71,26 +74,26 @@ fn line(e: &Value) -> String {
     s
 }
 
-/// `zam question list`.
+/// `zam question list`; без `--limit` страница прежняя — 200.
 pub fn list(
     ctx: &Ctx,
     status: Option<&str>,
     global: bool,
     solution: Option<&str>,
+    page: Paging,
 ) -> Result<(), CliError> {
     let space = if global {
         "knowledge".to_string()
     } else {
         solution_guid(ctx, solution)?
     };
-    let v = read_json(ctx.client.get(
-        &format!("/spaces/{space}/entries"),
-        &[
-            ("kind", "question"),
-            ("status", status.unwrap_or(OPEN)),
-            ("limit", "200"),
-        ],
-    )?)?;
+    let v = list_entries(
+        ctx,
+        &space,
+        &[("kind", "question"), ("status", status.unwrap_or(OPEN))],
+        page.limit.or(Some(LIST_LIMIT_MAX)),
+        page.all,
+    )?;
     if ctx.json {
         return emit_json(&v);
     }

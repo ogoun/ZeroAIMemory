@@ -179,6 +179,7 @@ fn memory_routes(cfg: &ServerConfig) -> Router<AppState> {
             "/api/v1/vault/{id}",
             get(vault::get).patch(vault::patch).delete(vault::remove),
         )
+        .route("/api/v1/vault/{id}/move", post(vault::move_to))
         .route("/api/v1/edges", post(graph::create))
         .route("/api/v1/edges/{id}", delete(graph::remove))
         .route(

@@ -3,7 +3,8 @@
 //! предложения M5.7 с указанием `action=propose`), строка плана из идей, пакет
 //! `event=idea_review` (похожие записи решения, история разборов и доводы человека, `limit`),
 //! подсказка к `prompt` в режиме `review`, режим `propose` — поведение M5.7, режим владельца базы
-//! в общем решении. Сервер без моделей (поиск — FTS).
+//! в общем решении; строка очереди разбора в подсказке к любому запросу человека (M6.6 §3.5,
+//! задача 14). Сервер без моделей (поиск — FTS).
 mod common;
 
 use axum::http::{Method, StatusCode};
@@ -140,6 +141,37 @@ async fn start(a: &Api, session: &str) -> Value {
         json!({"event": "session_start", "solution": G}),
     )
     .await
+}
+
+/// `prompt` решения `G` с текстом `prompt` в сессии `session` (токен администратора — владельца
+/// базы решения).
+async fn ask(a: &Api, session: &str, prompt: &str) -> Value {
+    recall(
+        a,
+        Some(session),
+        json!({"event": "prompt", "solution": G, "prompt": prompt}),
+    )
+    .await
+}
+
+/// Строка очереди разбора к запросу (M6.6 §3.5): `more` > 0 — с « (ещё N)».
+fn queue_line(title: &str, w: &str, more: usize) -> String {
+    let tail = if more > 0 {
+        format!(" (ещё {more})")
+    } else {
+        String::new()
+    };
+    format!("ZeroAIMemory: новая идея на разбор «{title}» w:{w}{tail}")
+}
+
+/// Непустые строки текста ответа.
+fn text_lines(j: &Value) -> Vec<&str> {
+    text(j).lines().filter(|l| !l.trim().is_empty()).collect()
+}
+
+/// Предупреждения ответа.
+fn warnings(j: &Value) -> &Vec<Value> {
+    j["warnings"].as_array().unwrap()
 }
 
 /// Пакет разбора идей решения `G` с полями `extra`.
@@ -736,7 +768,10 @@ async fn pack_partial_on_timeout() {
 }
 
 /// Пакет без идей — строка-уведомление: очередь пуста, решения нет, нет права записи, режим
-/// `propose` владельца; `limit` вне 1..=20 — 400.
+/// `propose` владельца; `limit` вне 1..=20 — 400. Решение передано, но его нет в области (M6.6
+/// §5.2): GUID не в реестре (в теле и в `X-Zam-Solution`) — «не зарегистрировано на сервере» с
+/// этим GUID; ожидающий доступ (`warnings: solution access pending`) и решение в реестре без
+/// запроса доступа — «нет доступа к решению».
 #[tokio::test]
 async fn idea_review_pack_notices_and_limit() {
     let a = server("notices", |_| {}).await;
@@ -748,6 +783,62 @@ async fn idea_review_pack_notices_and_limit() {
         text(&j).starts_with("Идей на разбор нет: решение не задано"),
         "{j}"
     );
+    let unknown = uuid::Uuid::now_v7().to_string();
+    let unregistered = format!(
+        "Идей на разбор нет: решение {unknown} не зарегистрировано на сервере — подключите его \
+         `zam init`."
+    );
+    let j = recall(
+        &a,
+        None,
+        json!({"event": "idea_review", "solution": unknown}),
+    )
+    .await;
+    assert_eq!(text(&j).trim_end(), unregistered, "{j}");
+    assert!(j["items"].as_array().unwrap().is_empty(), "{j}");
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            RECALL,
+            Some(json!({"event": "idea_review"})),
+            &[("x-zam-solution", unknown.as_str())],
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(text(&r.json()).trim_end(), unregistered, "{}", r.text());
+    let no_access = "Идей на разбор нет: нет доступа к решению (см. warnings).";
+    // ожидающий доступ: запрос участника к решению `G` администратора
+    let (_, b_tok) = a.new_user("Борис").await;
+    let r = a
+        .tok(
+            &b_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Проект"})),
+        )
+        .await;
+    ok(&r, StatusCode::ACCEPTED);
+    let j = recall_as(
+        &a,
+        &b_tok,
+        None,
+        json!({"event": "idea_review", "solution": G}),
+    )
+    .await;
+    assert_eq!(text(&j).trim_end(), no_access, "{j}");
+    assert_eq!(j["warnings"], json!(["solution access pending"]), "{j}");
+    // решение в реестре, запроса доступа нет — предупреждений нет, уведомление то же
+    let (_, c_tok) = a.new_user("Вера").await;
+    let j = recall_as(
+        &a,
+        &c_tok,
+        None,
+        json!({"event": "idea_review", "solution": G}),
+    )
+    .await;
+    assert_eq!(text(&j).trim_end(), no_access, "{j}");
+    assert!(j["warnings"].as_array().is_none_or(|w| w.is_empty()), "{j}");
     for l in [0, 21] {
         let r = a
             .t(
@@ -808,6 +899,420 @@ async fn prompt_hint_review_wording() {
     );
     assert!(!t.contains("propose"), "{j}");
     assert_eq!(items(&j, "idea_review"), [format!("w:{x}")], "{j}");
+}
+
+// ---- очередь разбора в подсказке к запросу (M6.6 §3.5, замечание 36) ----
+
+/// Идея человека `new`, режим `review`, владелец базы: реплика без предметных слов («Продолжай!»,
+/// §3.1 — без поиска подсказок) несёт строку очереди разбора `reason: idea_review`, без
+/// предупреждений; второй запрос той же сессии — реплика и предметный — без строки; другая
+/// сессия — снова со строкой.
+#[tokio::test]
+async fn prompt_review_queue_line_once() {
+    let a = server("queue-once", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let line = queue_line("Экспорт отчётов в PDF", &x, 0);
+    let j = ask(&a, "q1", "Продолжай!").await;
+    assert_eq!(text_lines(&j), [line.as_str()], "{j}");
+    assert_eq!(items(&j, "idea_review"), [format!("w:{x}")], "{j}");
+    assert!(warnings(&j).is_empty(), "{j}");
+    let j = ask(&a, "q1", "согласен").await;
+    assert_eq!(text(&j), "", "повтор в сессии: {j}");
+    let j = ask(&a, "q1", "настрой логирование сервера").await;
+    assert!(!text(&j).contains("на разбор"), "повтор в сессии: {j}");
+    let j = ask(&a, "q2", "продолжай").await;
+    assert_eq!(text_lines(&j), [line.as_str()], "другая сессия: {j}");
+}
+
+/// Дайджест `session_start` этой сессии показал очередь (`### Идеи на разбор`, отметка в
+/// `session_seen` той же эпохи) — запрос без строки. Идея, записанная человеком посреди сессии, —
+/// строкой к следующему запросу (случай замечания 36), один раз.
+#[tokio::test]
+async fn prompt_review_queue_after_digest_silent() {
+    let a = server("queue-digest", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let j = start(&a, "d1").await;
+    assert_eq!(items(&j, "idea_review"), [format!("w:{x}")], "{j}");
+    let j = ask(&a, "d1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+    let y = idea(&a, "Тёмная тема", "Замысел.", json!({})).await;
+    let j = ask(&a, "d1", "Продолжай!").await;
+    assert_eq!(
+        text_lines(&j),
+        [queue_line("Тёмная тема", &y, 0).as_str()],
+        "{j}"
+    );
+    let j = ask(&a, "d1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+}
+
+/// Ревью задачи 14 (Important 1, решение координатора): показ строки очереди — по текущей эпохе
+/// сессии. Дайджест показал две идеи → запрос без строки → сжатие контекста (`session_start
+/// source=compact`, новая эпоха; пакет восстановления раздела идей не несёт) → голова очереди
+/// снова, по идее на запрос с « (ещё N)», затем тишина. Второе сжатие — снова.
+#[tokio::test]
+async fn prompt_review_queue_after_compaction() {
+    let a = server("queue-compact", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let y = idea(&a, "Тёмная тема", "Замысел.", json!({})).await;
+    let j = start(&a, "c1").await;
+    assert_eq!(
+        items(&j, "idea_review"),
+        [format!("w:{x}"), format!("w:{y}")],
+        "{j}"
+    );
+    let j = ask(&a, "c1", "продолжай").await;
+    assert_eq!(text(&j), "", "та же эпоха: {j}");
+    let compact = json!({"event": "session_start", "solution": G, "source": "compact"});
+    for round in 0..2 {
+        let j = recall(&a, Some("c1"), compact.clone()).await;
+        assert!(
+            !text(&j).contains(REVIEW_SECTION),
+            "пакет восстановления: {j}"
+        );
+        let j = ask(&a, "c1", "продолжай").await;
+        assert_eq!(
+            text_lines(&j),
+            [queue_line("Экспорт отчётов в PDF", &x, 1).as_str()],
+            "сжатие {round}: {j}"
+        );
+        let j = ask(&a, "c1", "продолжай").await;
+        assert_eq!(
+            text_lines(&j),
+            [queue_line("Тёмная тема", &y, 0).as_str()],
+            "сжатие {round}: {j}"
+        );
+        let j = ask(&a, "c1", "продолжай").await;
+        assert_eq!(text(&j), "", "сжатие {round}: {j}");
+    }
+}
+
+/// Ревью задачи 14 (Important 1): показ — по ревизии идеи. Идея, вернувшаяся в `new` новой
+/// ревизией, приходит строкой снова и в той же эпохе: разбор «на доработку» и дописка человека
+/// (`returned` → `new`); предложение человеку в режиме `propose` и снятый вопрос (`proposed` →
+/// `new`). Пока идея не `new`, строки нет.
+#[tokio::test]
+async fn prompt_review_queue_new_revision() {
+    let a = server("queue-rev", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let line = queue_line("Экспорт отчётов в PDF", &x, 0);
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text_lines(&j), [line.as_str()], "{j}");
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+    // на доработку → дописка человека: снова `new`, новая ревизия
+    review(
+        &a,
+        &x,
+        json!({"outcome": "return", "summary": summary("Нужны подробности."),
+               "missing": "какие отчёты"}),
+    )
+    .await;
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "returned — не в очереди: {j}");
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{x}"),
+            Some(json!({"append_body": "Человек: все отчёты.", "by": "human"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["status"], "new");
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text_lines(&j), [line.as_str()], "снова new: {j}");
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+    // предложение (режим propose) → вопрос снят: снова `new`, новая ревизия
+    let settings = format!("/api/v1/admin/users/{}/settings", a.admin_id());
+    let set_mode = |mode: &'static str| {
+        let (a, uri) = (&a, &settings);
+        async move {
+            let r = a
+                .adm(
+                    Method::PATCH,
+                    uri,
+                    Some(json!({"ideas": {"mode": mode}})),
+                    None,
+                )
+                .await;
+            ok(&r, StatusCode::OK);
+        }
+    };
+    set_mode("propose").await;
+    let r = post(&a, &x, "propose", json!({})).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["entry"]["status"], "proposed");
+    let q = id(&r.json()["question"]);
+    set_mode("review").await;
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "proposed — не в очереди: {j}");
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::DELETE,
+            &format!("/api/v1/entries/{q}"),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::NO_CONTENT);
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(
+        text_lines(&j),
+        [line.as_str()],
+        "вопрос снят — снова new: {j}"
+    );
+    let j = ask(&a, "v1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+}
+
+/// Несколько непоказанных идей — одна строка на ответ, первая по порядку очереди (`high`
+/// первыми, затем самые старые) с « (ещё N)»; следующие запросы сессии — следующие идеи, у
+/// последней — без « (ещё …)», потом тишина.
+#[tokio::test]
+async fn prompt_review_queue_more_count() {
+    let a = server("queue-more", |_| {}).await;
+    let old = idea(&a, "Первая идея", "Замысел.", json!({})).await;
+    let young = idea(&a, "Вторая идея", "Замысел.", json!({})).await;
+    let high = idea(&a, "Срочная идея", "Замысел.", json!({"priority": "high"})).await;
+    for (title, w, more) in [
+        ("Срочная идея", &high, 2),
+        ("Первая идея", &old, 1),
+        ("Вторая идея", &young, 0),
+    ] {
+        let j = ask(&a, "m1", "продолжай").await;
+        assert_eq!(text_lines(&j), [queue_line(title, w, more).as_str()], "{j}");
+        assert_eq!(items(&j, "idea_review"), [format!("w:{w}")], "{j}");
+    }
+    let j = ask(&a, "m1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+}
+
+/// Пересланное сообщение (отчёт субагента, сообщение агента, уведомление фоновой задачи; M6.6
+/// §3.3) — тишина и без строки очереди; показ не отмечается — запрос человека той же сессии
+/// получает строку.
+#[tokio::test]
+async fn prompt_review_queue_relayed_silent() {
+    let a = server("queue-relayed", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    for relayed in [
+        "[Subagent hand-back] Готово: экспорт отчётов в PDF.",
+        "<agent-message from=\"worker\">Продолжай</agent-message>",
+        "<task-notification>сборка завершена</task-notification>",
+    ] {
+        let j = ask(&a, "r1", relayed).await;
+        assert_eq!(text(&j), "", "{relayed}: {j}");
+        assert!(j["items"].as_array().unwrap().is_empty(), "{relayed}: {j}");
+    }
+    let j = ask(&a, "r1", "продолжай").await;
+    assert_eq!(
+        text_lines(&j),
+        [queue_line("Экспорт отчётов в PDF", &x, 0).as_str()],
+        "{j}"
+    );
+}
+
+/// Без строки очереди: режим `propose`, участник общего решения (очередь — владельца базы, режим
+/// владельца `review`), выключенные идеи (`ideas.proactive = false`). Владелец того же общего
+/// решения строку получает.
+#[tokio::test]
+async fn prompt_review_queue_propose_and_member_silent() {
+    let a = server("queue-propose", |c| {
+        c.ideas.default_mode = IdeasMode::Propose
+    })
+    .await;
+    idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let j = ask(&a, "p1", "продолжай").await;
+    assert_eq!(text(&j), "", "режим propose: {j}");
+
+    let a = api("idrev-recall-queue-member", |c| {
+        c.recall.timeout_ms = 30_000
+    })
+    .await;
+    let (_, o_tok) = a.new_user("Ольга").await;
+    let (m_id, m_tok) = a.new_user("Марк").await;
+    for (tok, code) in [
+        (&o_tok, StatusCode::CREATED),
+        (&m_tok, StatusCode::ACCEPTED),
+    ] {
+        let r = a
+            .tok(
+                tok,
+                Method::POST,
+                "/api/v1/solutions",
+                Some(json!({"agent_solution_id": G, "name": "Общее"})),
+            )
+            .await;
+        ok(&r, code);
+    }
+    a.set_access(&o_tok, G, &m_id, "rw").await;
+    let i = create_tok(
+        &a,
+        &o_tok,
+        json!({"kind": "idea", "title": "Идея владельца", "body": "Замысел.",
+               "data": {"origin": "human"}}),
+    )
+    .await;
+    let body = json!({"event": "prompt", "solution": G, "prompt": "продолжай"});
+    let j = recall_as(&a, &m_tok, Some("m1"), body.clone()).await;
+    assert_eq!(text(&j), "", "участник: {j}");
+    let j = recall_as(&a, &o_tok, Some("o1"), body).await;
+    assert_eq!(
+        text_lines(&j),
+        [queue_line("Идея владельца", &i, 0).as_str()],
+        "владелец: {j}"
+    );
+
+    let a = server("queue-proactive-off", |_| {}).await;
+    idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{}/settings", a.admin_id()),
+            Some(json!({"ideas": {"proactive": false}})),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let j = ask(&a, "f1", "продолжай").await;
+    assert_eq!(text(&j), "", "идеи выключены: {j}");
+}
+
+/// Идея очереди, которую ответ уже несёт подсказкой «к задаче подходит идея на разбор» (запрос о
+/// ней), строкой очереди не повторяется: строка очереди — о следующей непоказанной идее, и
+/// « (ещё N)» её не считает.
+#[tokio::test]
+async fn prompt_review_queue_skips_idea_hint() {
+    let a = server("queue-hint", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let y = idea(&a, "Тёмная тема", "Замысел.", json!({})).await;
+    let j = ask(&a, "h1", "как сделать экспорт отчётов в PDF").await;
+    let t = text(&j);
+    assert!(
+        t.contains(&format!("к задаче подходит идея на разбор w:{x}")),
+        "{j}"
+    );
+    assert!(t.contains(&queue_line("Тёмная тема", &y, 0)), "{j}");
+    assert!(
+        !t.contains(&format!("«Экспорт отчётов в PDF» w:{x}")),
+        "{j}"
+    );
+    assert_eq!(
+        items(&j, "idea_review"),
+        [format!("w:{x}"), format!("w:{y}")],
+        "{j}"
+    );
+    let j = ask(&a, "h1", "продолжай").await;
+    assert_eq!(text(&j), "", "{j}");
+}
+
+/// Ревью задачи 14 (M3): без строки очереди — токен `ro` (разбор дал бы 403), `[ideas]
+/// prompt_max = 0` (подсказок-идей к запросу нет), запрос из одних пробелов (не запрос
+/// человека); тот же сервер другим токеном и другим запросом строку даёт.
+#[tokio::test]
+async fn prompt_review_queue_ro_max0_blank_silent() {
+    let a = server("queue-cond", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let ro = a.issue(&a.admin_id(), "ro").await;
+    let body = |s: &str| json!({"event": "prompt", "solution": G, "prompt": s});
+    let j = recall_as(&a, &ro, Some("ro1"), body("продолжай")).await;
+    assert_eq!(text(&j), "", "токен ro: {j}");
+    for blank in ["   ", " \n\t "] {
+        let j = ask(&a, "b1", blank).await;
+        assert_eq!(text(&j), "", "{blank:?}: {j}");
+    }
+    let j = ask(&a, "b1", "продолжай").await;
+    assert_eq!(
+        text_lines(&j),
+        [queue_line("Экспорт отчётов в PDF", &x, 0).as_str()],
+        "{j}"
+    );
+    let a = server("queue-max0", |c| c.ideas.prompt_max = 0).await;
+    idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let j = ask(&a, "z1", "продолжай").await;
+    assert_eq!(text(&j), "", "prompt_max = 0: {j}");
+}
+
+/// Ревью задачи 14 (M3): запрос без сессии (ни `session_id`, ни `X-Zam-Session`) — без учёта
+/// показанного, как у прочих подсказок: строка к каждому такому запросу; сессия после них — тоже
+/// со строкой.
+#[tokio::test]
+async fn prompt_review_queue_without_session_repeats() {
+    let a = server("queue-nosession", |_| {}).await;
+    let x = idea(&a, "Экспорт отчётов в PDF", "Замысел.", json!({})).await;
+    let line = queue_line("Экспорт отчётов в PDF", &x, 0);
+    for _ in 0..2 {
+        let j = recall(
+            &a,
+            None,
+            json!({"event": "prompt", "solution": G, "prompt": "продолжай"}),
+        )
+        .await;
+        assert_eq!(text_lines(&j), [line.as_str()], "{j}");
+    }
+    let j = ask(&a, "n1", "продолжай").await;
+    assert_eq!(text_lines(&j), [line.as_str()], "{j}");
+}
+
+/// Чтение головы очереди не уложилось в срок (тестовая метка в заголовке идеи, фича
+/// `test-hooks`: шаг чтения «зависает», его обрывает срок `own.step` — у чтения до поиска не
+/// дальше половины остатка) — тишина без предупреждений (`recall timeout` нет), показ в
+/// `session_seen` не отмечен. Сбор длился больше секунды — строка шла медленным путём, а не
+/// пропущена.
+#[tokio::test]
+async fn prompt_review_queue_timeout_silent() {
+    let a = server("queue-timeout", |_| {}).await;
+    let mark = zam_server::api::recall::TEST_SLOW_QUEUE_MARK;
+    idea(&a, &format!("Медленная идея {mark}"), "Замысел.", json!({})).await;
+    let j = recall(
+        &a,
+        Some("t1"),
+        json!({"event": "prompt", "solution": G, "prompt": "продолжай", "timeout_ms": 3000}),
+    )
+    .await;
+    assert_eq!(text(&j), "", "{j}");
+    assert!(j["items"].as_array().unwrap().is_empty(), "{j}");
+    assert!(warnings(&j).is_empty(), "{j}");
+    assert!(
+        j["timings"]["collect_ms"].as_f64().unwrap() >= 1000.0,
+        "{j}"
+    );
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let seen = zam_store::seen_entry_ids(&db, "t1", a.st.admin_id, zam_store::RECALL_PART)
+        .await
+        .unwrap();
+    assert!(seen.is_empty(), "{seen:?}");
+}
+
+/// Ревью задачи 14 (M2): строка очереди, снятая пределом вывода канала, — со своим адресом
+/// «не показано — идей на разбор: 1 (memory_recall event=idea_review)», а не общим «строк»;
+/// показ не отмечается — без предела строка приходит.
+#[tokio::test]
+async fn prompt_review_queue_output_limit_omit() {
+    let a = server("queue-limit", |_| {}).await;
+    let x = idea(
+        &a,
+        &"Очень длинный заголовок идеи ".repeat(4),
+        "Замысел.",
+        json!({}),
+    )
+    .await;
+    let j = recall(
+        &a,
+        Some("l1"),
+        json!({"event": "prompt", "solution": G, "prompt": "продолжай",
+               "output_limit": {"unit": "chars", "max": 120}}),
+    )
+    .await;
+    assert_eq!(
+        text(&j).trim_end(),
+        "ZeroAIMemory: не показано — идей на разбор: 1 (memory_recall event=idea_review)",
+        "{j}"
+    );
+    assert!(items(&j, "idea_review").is_empty(), "{j}");
+    let j = ask(&a, "l1", "продолжай").await;
+    assert!(text(&j).contains(&format!("w:{x}")), "{j}");
 }
 
 // ---- режим propose ----
@@ -927,4 +1432,75 @@ async fn shared_solution_uses_owner_mode() {
     )
     .await;
     assert!(text(&j).starts_with("Разбор идей выключен"), "{j}");
+}
+
+/// M6.6 §5.3: режим идей владельца общего решения и настройки участника `/recall` берёт из кэша
+/// процесса (`AppState::user_flags`): повтор `prompt` участника системную базу не читает. Владелец
+/// переключил `ideas.mode` (`PATCH` администратора) — следующий `prompt` участника видит новый
+/// режим: перечитана только запись владельца, запись участника осталась в кэше.
+#[tokio::test]
+async fn owner_mode_change_reaches_member_prompt() {
+    let a = api("idrev-recall-owner-mode", |c| c.recall.timeout_ms = 30_000).await;
+    let (o_id, o_tok) = a.new_user("Ольга").await;
+    let (m_id, m_tok) = a.new_user("Марк").await;
+    let r = a
+        .tok(
+            &o_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let r = a
+        .tok(
+            &m_tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    ok(&r, StatusCode::ACCEPTED);
+    a.set_access(&o_tok, G, &m_id, "rw").await;
+    let i = create_tok(
+        &a,
+        &o_tok,
+        json!({"kind": "idea", "title": "Экспорт отчётов в PDF", "body": "Замысел.",
+               "data": {"origin": "human"}}),
+    )
+    .await;
+    // подсказка к запросу — раз за сессию: у каждого вызова своя сессия
+    let prompt_m = |s: &'static str| {
+        recall_as(
+            &a,
+            &m_tok,
+            Some(s),
+            json!({"event": "prompt", "solution": G,
+                   "prompt": "как сделать экспорт отчётов в PDF"}),
+        )
+    };
+    let review_line = format!("к задаче подходит идея на разбор w:{i}");
+    let j = prompt_m("om1").await;
+    assert!(text(&j).contains(&review_line), "режим review: {j}");
+    let loads = a.st.user_flags.loads();
+    let j = prompt_m("om2").await;
+    assert!(text(&j).contains(&review_line), "{j}");
+    assert_eq!(a.st.user_flags.loads(), loads, "повтор — из кэша");
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{o_id}/settings"),
+            Some(json!({"ideas": {"mode": "propose"}})),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let j = prompt_m("om3").await;
+    assert!(text(&j).contains("action=propose"), "режим propose: {j}");
+    assert!(!text(&j).contains("на разбор"), "{j}");
+    assert_eq!(
+        a.st.user_flags.loads(),
+        loads + 1,
+        "перечитан только владелец"
+    );
 }

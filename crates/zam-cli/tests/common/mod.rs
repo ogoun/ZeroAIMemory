@@ -138,6 +138,22 @@ pub type BodyReply = dyn Fn(&str, &str, usize, &serde_json::Value) -> (u16, Stri
 /// Заглушка с ответом и по телу запроса ([`BodyReply`]): например, 400 старого сервера только
 /// на `POST /sessions {holdout}`, а регистрация той же сессии — 201 (M6 §12).
 pub fn stub_body(reply: std::sync::Arc<BodyReply>) -> (String, Seen) {
+    stub_typed(reply, "application/json")
+}
+
+/// Заглушка, отвечающая Markdown (`text/markdown`, без заголовков сверх обычных) — как
+/// `POST /search` с `format: "md"` сервера до 0.0.13-m6.6 (без `X-Zam-Omitted`).
+pub fn stub_markdown(body: &'static str) -> (String, Seen) {
+    stub_typed(
+        std::sync::Arc::new(move |_: &str, _: &str, _: usize, _: &serde_json::Value| {
+            (200, body.to_string(), std::time::Duration::ZERO)
+        }),
+        "text/markdown; charset=utf-8",
+    )
+}
+
+/// [`stub_body`] с типом тела ответа `content_type`.
+fn stub_typed(reply: std::sync::Arc<BodyReply>, content_type: &'static str) -> (String, Seen) {
     use std::io::{BufRead, BufReader, Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -184,7 +200,7 @@ pub fn stub_body(reply: std::sync::Arc<BodyReply>) -> (String, Seen) {
                 let mut c = conn;
                 let _ = write!(
                     c,
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
             });

@@ -922,6 +922,89 @@ pub fn one() -> u32 { 1 } static NEIGHBOUR_X: &str = \"NEIGHBOUR_7f3a\";\n",
     }
 }
 
+/// Символ `name` карты сервера (первый с таким именем).
+fn server_symbol(p: &Proj, name: &str) -> Value {
+    let v = p.get(&format!("/code/symbols?solution={G}&q={name}&limit=100"));
+    v["symbols"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{v}"))
+        .iter()
+        .find(|s| s["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("нет символа {name}: {v}"))
+}
+
+/// M6.6 §9 (замечание 15): секреты сигнатур маскирует клиент — правилами сервера
+/// (`zam_secrets`) до отправки, поэтому предупреждений сервера «в N сигнатурах замаскированы
+/// секреты» нет; итог — одна строка stderr «секреты в сигнатурах: N (файлов F) — замаскированы
+/// до отправки: <путь#qual>, … (ещё K)», полный список — `masked` в `--json`. Повторная
+/// синхронизация ничего не меняет: без загрузки строки нет, `--full` — та же маска на сервере.
+#[test]
+fn sync_masks_signature_secrets_once() {
+    let (url, tok) = start("masked");
+    let Some(p) = Proj::git("masked", &url, &tok) else {
+        return;
+    };
+    // пароль «ключ = значение» — правило сервера, которого у прежнего клиента не было
+    let pw = ["hunter", "2-prod-", "q7"].concat();
+    let auth: String = (0..6)
+        .map(|i| {
+            format!("export function login{i}(user: string, password = \"{pw}\") {{\n  return user;\n}}\n")
+        })
+        .collect();
+    p.file("src/auth.ts", auth.as_bytes());
+    let key = ["glpat", "-", "Zx9Qw8Er7Ty6Ui5Op4As"].concat();
+    p.file(
+        "src/deploy.ts",
+        format!("export function deploy(key = \"{key}\") {{\n  return key;\n}}\n").as_bytes(),
+    );
+    p.commit("init");
+    let o = p.zam(&["code", "sync"]);
+    let stdout = ok(&o);
+    assert!(stdout.starts_with("карта кода: файлов 2"), "{stdout}");
+    let e = err(&o);
+    let lines: Vec<&str> = e.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "секреты в сигнатурах: 7 (файлов 2) — замаскированы до отправки: src/auth.ts#login0, \
+          src/auth.ts#login1, src/auth.ts#login2, src/auth.ts#login3, src/auth.ts#login4 (ещё 2)"
+        ],
+        "{e}"
+    );
+    // на сервере — уже маска клиента
+    let login = server_symbol(&p, "login0");
+    let sig = login["sig"].as_str().unwrap_or_else(|| panic!("{login}"));
+    assert!(sig.contains("‹secret›") && !sig.contains(&pw), "{sig}");
+    let deploy = server_symbol(&p, "deploy");
+    let dsig = deploy["sig"].as_str().unwrap().to_string();
+    assert!(
+        dsig.contains("‹secret›") && !dsig.contains(&key[..8]),
+        "{dsig}"
+    );
+    // повтор без изменений — загрузки нет, строки нет
+    let o = p.zam(&["code", "sync"]);
+    assert!(ok(&o).contains("загружено 0"), "{}", out(&o));
+    assert!(err(&o).is_empty(), "{}", err(&o));
+    // `--full --json`: полный список мест, предупреждений сервера нет, маска та же
+    let r = json_of(&ok(&p.zam(&["code", "sync", "--full", "--json"])));
+    let masked = r["masked"].as_array().unwrap_or_else(|| panic!("{r}"));
+    assert_eq!(masked.len(), 7, "{r}");
+    assert_eq!(
+        masked[0],
+        json!({"path": "src/auth.ts", "qual": "login0"}),
+        "{r}"
+    );
+    assert_eq!(
+        masked[6],
+        json!({"path": "src/deploy.ts", "qual": "deploy"}),
+        "{r}"
+    );
+    assert_eq!(r["warnings"], json!([]), "{r}");
+    assert_eq!(server_symbol(&p, "login0")["sig"], login["sig"]);
+    assert_eq!(server_symbol(&p, "deploy")["sig"], json!(dsig));
+}
+
 /// Заглушка, у которой `need` — все пути `paths`.
 fn stub_need(paths: &[String]) -> (String, common::Seen) {
     let body = json!({"need": paths, "removed": 0, "etag": "e", "accepted": 1,

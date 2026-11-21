@@ -13,7 +13,8 @@
 //! - у задачи из идеи (запись, лента) — `idea {id, title, status, space_id}` и `ideas` (M6.5 §9).
 //!
 //! Запись задач идёт общим путём `POST /spaces/{space}/entries` (`kind: task`) в пространствах
-//! решения и Knowledge.
+//! решения и Knowledge; `data.status` при создании — 422 [`STATUS_ON_CREATE`] (статус новой
+//! задачи — `open`, его меняет правка; M6.6 §8, решение координатора 19).
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -35,6 +36,10 @@ use crate::app::AppState;
 use crate::attrib::attribution;
 use crate::auth::{Client, Principal};
 use crate::error::ApiError;
+
+/// Текст 422 на `data.status` новой задачи: как задать статус — правкой (MCP и CLI).
+pub const STATUS_ON_CREATE: &str =
+    "data.status: статус задаётся правкой — memory_update_entry action=status (zam task status)";
 
 impl From<TaskError> for ApiError {
     fn from(e: TaskError) -> Self {

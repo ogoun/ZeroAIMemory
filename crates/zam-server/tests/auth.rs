@@ -407,6 +407,23 @@ async fn token_cannot_call_admin_routes() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    // текст 403 называет вход администратора (M6.6 §10.2, замечание 3)
+    let detail = body_json(r).await["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        detail.contains("POST /api/v1/auth/login") && detail.contains("x-csrf-token"),
+        "{detail}"
+    );
+    assert!(detail.contains("токен — агентский"), "{detail}");
+    // свои токены по токену не выпускаются: агент токены не выпускает
+    let r = app
+        .clone()
+        .oneshot(bearer("/api/v1/auth/tokens", &token))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
     let r = app
         .clone()
         .oneshot(bearer("/api/v1/auth/me", &token))

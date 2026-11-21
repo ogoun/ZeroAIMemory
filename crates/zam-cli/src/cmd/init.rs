@@ -23,11 +23,21 @@
 //! MCP Claude Code (`.mcp.json`) — stdio-прокси `zam mcp` (M6 §7.1): токен, адрес и решение
 //! — те же, что у `zam`; для Codex — подсказка про `~/.codex/config.toml`. Файлы проекта пишутся атомарно, BOM и CRLF
 //! сохраняются. Повторный запуск идемпотентен.
+//!
+//! **Адрес сервера** (M6.6 §10.1, замечание обкатки 1) — [`UrlTo`]: `block` (по умолчанию) —
+//! строкой `ZeroAIMemoryUrl=` в блоке; `home` и `local` — блок без этой строки (её вырезает
+//! клиент, поэтому годится любой сервер), адрес — в `~/.zeroaimemory/config.toml` или в
+//! `CLAUDE.local.md`, исключённом из git. Без `--url-to` режим берётся из прежнего блока. Код
+//! адреса — в [`url`].
 mod merge;
 mod ojson;
+mod url;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+
+use url::LOCAL_MD;
+pub use url::UrlTo;
 
 use serde_json::Value;
 
@@ -59,14 +69,18 @@ pub struct Opts {
     pub no_mcp: bool,
     pub yes: bool,
     pub lang: String,
+    /// `None` — режим прежнего блока ([`url::kept_url_to`]).
+    pub url_to: Option<UrlTo>,
 }
 
-/// Файл, который надо записать.
+/// Файл, который надо записать (или удалить).
 struct Planned {
     path: PathBuf,
     text: String,
     /// Было ли содержимое до этого.
     existed: bool,
+    /// Удалить файл (`CLAUDE.local.md`, где кроме строки адреса ничего не было).
+    remove: bool,
 }
 
 impl Planned {
@@ -75,6 +89,7 @@ impl Planned {
             path,
             text,
             existed: old.is_some(),
+            remove: false,
         })
     }
 }
@@ -274,6 +289,51 @@ fn resolve_in_root(root: &Path, path: &Path) -> Result<PathBuf, CliError> {
     Ok(target)
 }
 
+/// Переход с `--url-to local` (`--url-to home|block`): строки адреса уходят из `CLAUDE.local.md`
+/// (`path`, текст `old`). `Ok((план, удалён))`: свой текст остаётся, файл только со строкой
+/// адреса удаляется; символическая ссылка не удаляется — в её цель внутри проекта пишется текст
+/// без строк. `Err(причина)` — строку оставить с предупреждением, не роняя `zam init`: в блоке
+/// нет строки адреса (`lost` — адрес потерялся бы) или ссылка ведёт за пределы проекта (ревью
+/// задачи 10, круг 2, N1, N2). Висячая ссылка сюда не доходит: `read_opt` читает её как
+/// отсутствующий файл, строки адреса в нём нет.
+fn drop_local_url(
+    root: &Path,
+    path: PathBuf,
+    old: &str,
+    lost: bool,
+) -> Result<(Planned, bool), String> {
+    if lost {
+        return Err(
+            "в блоке нет строки ZeroAIMemoryUrl= (свой шаблон администратора) — без неё zam и \
+             хуки потеряли бы адрес сервера"
+                .into(),
+        );
+    }
+    let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+    if link {
+        resolve_in_root(root, &path).map_err(|e| {
+            format!(
+                "{} — уберите строку сами: она важнее домашнего конфига и блока",
+                e.msg
+            )
+        })?;
+    }
+    let (text, remove) = match merge::drop_url_lines(old) {
+        Some(text) => (text, false),
+        None if link => (merge::without_url_lines(old), false),
+        None => (String::new(), true),
+    };
+    Ok((
+        Planned {
+            path,
+            text,
+            existed: true,
+            remove,
+        },
+        remove,
+    ))
+}
+
 /// Запись файла проекта (fix round 1, M-5; fix round 3, N-3): `target` — уже разрешённый
 /// [`resolve_in_root`] путь, так что ссылка остаётся ссылкой; временный файл в
 /// каталоге цели с правами прежнего и rename (3 попытки через 50 мс: на Windows файл бывает
@@ -406,16 +466,42 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             remove_stale_tmp(&d);
         }
     }
+    // режим адреса (M6.6 §10.1): флаг или прежний блок; адреса — клиента и подставленный
+    // сервером в блок (`url` ответа /agent-setup, `server.public_url`)
+    let olds = setups
+        .iter()
+        .map(|(_, file, _)| read_opt(&root.join(file)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let urls = url::urls_of(&url.value, setups.iter().map(|(_, _, v)| v));
+    let url_to = match o.url_to {
+        Some(m) => m,
+        None => url::kept_url_to(&olds, &urls, &root)?,
+    };
+    let mut ur = url::UrlReport::new(url_to, o.agent != InitAgent::Claude);
     // токен прежнего блока (v1) того файла, где блок заменяется (I-6); у `both` — из любого
     // из двух, разные — предупреждение, берётся из первого (N-6)
     let mut migrated: Option<(String, &str)> = None;
     let mut differs: Option<&str> = None;
-    for (_, file, v) in &setups {
+    // `block`: у всех итоговых блоков есть строка адреса (её находит `zam`)
+    let mut block_has_url = true;
+    for ((_, file, v), old) in setups.iter().zip(&olds) {
         let block = v["block"]
             .as_str()
             .ok_or_else(|| CliError::config("в ответе /agent-setup нет block"))?;
-        let path = root.join(file);
-        let old = read_opt(&path)?;
+        let block = match url_to {
+            UrlTo::Block => {
+                block_has_url &= !merge::cut_url_lines(block).1.is_empty();
+                block.to_string()
+            }
+            UrlTo::Home | UrlTo::Local => {
+                // своя строка адреса вне блока — текст пользователя: не вырезается, а
+                // предупреждение (файл коммитится)
+                if old.as_deref().and_then(locate::outside_url).is_some() {
+                    ur.outside.push(file.to_string());
+                }
+                url::block_without_url(file, block, &urls)?
+            }
+        };
         if let Some(t) = old.as_deref().and_then(locate::block_token) {
             match &migrated {
                 None => migrated = Some((t, *file)),
@@ -423,9 +509,44 @@ pub fn run(o: Opts) -> Result<(), CliError> {
                 Some(_) => {}
             }
         }
-        let text = merge::upsert_block(old.as_deref(), block)
+        let text = merge::upsert_block(old.as_deref(), &block)
             .map_err(|e| CliError::config(format!("{file}: {e}")))?;
-        plan.extend(Planned::new(path, old.as_deref(), text));
+        plan.extend(Planned::new(root.join(file), old.as_deref(), text));
+    }
+    // адрес вне блока: home — домашний конфиг (другой адрес там — отказ), local —
+    // CLAUDE.local.md и его исключение из git; block — проверка, что файл не уйдёт в git
+    let local_path = root.join(LOCAL_MD);
+    let mut home_url = locate::HomeUrlPlan::Unchanged;
+    match url_to {
+        UrlTo::Block => {
+            ur.tracked = setups
+                .iter()
+                .filter(|(_, file, _)| url::git_ignored(&root, file) == Some(false))
+                .map(|(_, file, _)| file.to_string())
+                .collect();
+        }
+        UrlTo::Home => home_url = url::plan_home(&home, &url.value)?,
+        UrlTo::Local => {
+            let old = read_opt(&local_path)?;
+            let text = merge::set_url_line(old.as_deref(), &url.value);
+            plan.extend(Planned::new(local_path.clone(), old.as_deref(), text));
+            ur.exclude = url::plan_exclude(&root)?;
+        }
+    }
+    // переход с local (`--url-to home|block`): строки адреса уходят из CLAUDE.local.md — она
+    // важнее домашнего конфига и блока, а повтор без флага выбрал бы по ней local
+    if o.url_to.is_some_and(|m| m != UrlTo::Local)
+        && let Some(old) = read_opt(&local_path)?
+        && !merge::url_values(&old).is_empty()
+    {
+        let lost = url_to == UrlTo::Block && !block_has_url;
+        match drop_local_url(&root, local_path, &old, lost) {
+            Ok((p, removed)) => {
+                plan.push(p);
+                ur.local_dropped = Some(removed);
+            }
+            Err(why) => ur.local_kept = Some(why),
+        }
     }
     let mut agent_plan: Vec<Planned> = Vec::new();
     if !o.no_hooks {
@@ -446,7 +567,7 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     }
     // `.mcp.json` читает Claude Code; Codex берёт MCP из своего config.toml (M-6)
     let claude = o.agent != InitAgent::Codex;
-    let codex = o.agent != InitAgent::Claude;
+    let codex = ur.codex;
     if !o.no_mcp && claude {
         let frag = J::from(&setups[0].2["mcp_json"]);
         agent_plan.extend(merge_json(&root, root.join(".mcp.json"), |j| {
@@ -461,9 +582,17 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     } else {
         migrated.as_ref().map(|(t, _)| t.clone())
     };
+    // у `--url-to local` адрес домашнего конфига не трогается
+    let home_addr = (url_to != UrlTo::Local).then_some(url.value.as_str());
     let home_plan = match &candidate {
-        Some(t) => locate::plan_home(&home, &url.value, t, forced).map_err(CliError::config)?,
+        Some(t) => locate::plan_home(&home, home_addr, t, forced).map_err(CliError::config)?,
         None => locate::HomePlan::Unchanged,
+    };
+    // одна запись домашнего конфига: план токена (адрес в нём тот же) или только адрес
+    let home_write = match (&home_plan, &home_url) {
+        (locate::HomePlan::Write { path, text, .. }, _)
+        | (_, locate::HomeUrlPlan::Write { path, text }) => Some((path, text)),
+        _ => None,
     };
 
     // куда пишется каждый файл: симлинк вне корня или висячий — отказ до любой записи и
@@ -490,26 +619,46 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         }
         ask("Записать?")
     };
+    // исключение CLAUDE.local.md из git — тоже с подтверждением (или `--yes`); уже дописанная
+    // строка, которую перекрывает правило `!` (`Ineffective`), — без вопроса и записи, итог
+    // предупредит; файл в индексе git сюда не доходит — `plan_exclude` отказывает раньше
+    ur.exclude_ok = match &ur.exclude {
+        url::Exclude::Add { path, .. } => {
+            o.yes
+                || ask(&format!(
+                    "Внести {LOCAL_MD} в {} (адрес сервера не попадёт в git)?",
+                    rel(&root, path)
+                ))
+        }
+        _ => false,
+    };
 
-    // запись
+    // запись: исключение — раньше CLAUDE.local.md с адресом (обрыв между ними не оставит его
+    // вне исключения), затем повторная проверка git
+    ur.excluded = url::apply_exclude(&root, &ur.exclude, ur.exclude_ok)?;
     let mut report = Vec::new();
     let skipped = !agent_ok;
     let all = plan
         .into_iter()
         .chain(agent_plan.into_iter().filter(|_| agent_ok));
     for p in all {
-        write_project_file(&targets[&p.path], p.text.as_bytes())?;
-        report.push(format!(
-            "{} {}",
+        let target = &targets[&p.path];
+        let verb = if p.remove {
+            // удаляется сам путь, а не разрешённая цель (у ссылки удаление не планируется)
+            std::fs::remove_file(&p.path)
+                .map_err(|e| CliError::config(format!("удаление {}: {e}", p.path.display())))?;
+            "удалён  "
+        } else {
+            write_project_file(target, p.text.as_bytes())?;
             if p.existed {
                 "обновлён"
             } else {
                 "создан  "
-            },
-            rel(&root, &p.path)
-        ));
+            }
+        };
+        report.push(format!("{verb} {}", rel(&root, &p.path)));
     }
-    if let locate::HomePlan::Write { path, text, .. } = &home_plan {
+    if let Some((path, text)) = home_write {
         hook::cache::write_atomic(path, text.as_bytes())
             .map_err(|e| CliError::config(format!("{}: {e}", path.display())))?;
     }
@@ -534,6 +683,9 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         locate::HomePlan::Write { replaced: true, .. } => eprintln!(
             "предупреждение: в ~/.zeroaimemory/config.toml был другой токен — заменён на заданный --token"
         ),
+        locate::HomePlan::Write { .. } if url_to == UrlTo::Local => {
+            println!("Токен сохранён в ~/.zeroaimemory/config.toml (его берут zam и хуки).")
+        }
         locate::HomePlan::Write { .. } => {
             println!("Токен и адрес сохранены в ~/.zeroaimemory/config.toml (их берут zam и хуки).")
         }
@@ -553,6 +705,7 @@ pub fn run(o: Opts) -> Result<(), CliError> {
              репозитории): выпустите новый токен в WebUI и отзовите старый."
         );
     }
+    ur.print(&root);
     if !o.no_mcp && claude && agent_ok {
         // M6 §7.1: stdio `zam mcp` — адрес, токен, решение и машина те же, что у zam и хуков
         println!(

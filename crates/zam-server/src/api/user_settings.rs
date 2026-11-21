@@ -26,6 +26,18 @@
 //!   (`session_start`, `prompt`, `post_tool`) отвечает пустым `text` и показ не учитывает (N4).
 //! - Режим идей решения — режим **владельца базы** ([`ideas_mode`]): идеи общего решения лежат в
 //!   его базе (M6.5 §7 «Общие решения»).
+//! - Кэш процесса [`UserFlagsCache`] (`AppState::user_flags`, M6.6 §5.3): `/recall` (настройки
+//!   пользователя запроса и режим идей владельца общего решения) и [`ideas_mode`] читают
+//!   настройки через него ([`cached_user_flags`]), `GET`/`PATCH` настроек — из `system.db`.
+//!   Точность без TTL: каждый принятый `PATCH` (свой и администратора, и без изменений) после
+//!   записи увеличивает поколение и удаляет запись пользователя; значение, прочитанное, пока шла
+//!   правка, в кэш не попадает.
+//!   Других писателей `user_settings` в процессе нет: `zam-server restore` переписывает
+//!   `system.db` только при остановленном сервере (лок каталога данных).
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -148,6 +160,97 @@ pub async fn user_flags(
     Ok(f)
 }
 
+/// Кэш настроек пользователей процесса (M6.6 §5.3, по образцу [`crate::glossary::GlossaryCache`]):
+/// [`UserFlags`] по пользователю и счётчик поколения. Читатель запоминает поколение до чтения
+/// `system.db` и кладёт значение в кэш, только если поколение не изменилось (`store`); каждый
+/// `PATCH` настроек — [`Self::invalidate`] (после записи). Сверка поколения со вставкой и сдвиг
+/// поколения с удалением записи идут под одним замком: устаревшее значение не переживёт правку.
+/// Значения — с `[ideas] default_mode` сервера (неизменен до перезапуска). Записи не вытесняются:
+/// пользователей единицы, удаления пользователей нет.
+#[derive(Default)]
+pub struct UserFlagsCache {
+    map: Mutex<HashMap<Id, UserFlags>>,
+    generation: AtomicU64,
+    loads: AtomicUsize,
+}
+
+impl UserFlagsCache {
+    /// Настройки `user`: из кэша или одним чтением [`user_flags`] (в кэш — если за чтение не было
+    /// правки). `default_mode` — `[ideas] default_mode` сервера: его нет в ключе кэша, поэтому
+    /// вход снаружи — только [`cached_user_flags`] (умолчание из конфигурации сервера; ревью
+    /// задачи 4, M3).
+    async fn get(
+        &self,
+        sys: &SystemStore,
+        user: Id,
+        default_mode: IdeasMode,
+    ) -> Result<UserFlags, zam_store::StoreError> {
+        self.load(user, user_flags(sys, user, default_mode)).await
+    }
+
+    /// Шаг [`Self::get`] с чтением `read` (тест порядка — ревью задачи 4, M4): из кэша или
+    /// чтением, в кэш — если поколение за чтение не сменилось. Будущее `read` ленивое: чтение
+    /// базы идёт только в `read.await`, после снимка поколения.
+    async fn load(
+        &self,
+        user: Id,
+        read: impl Future<Output = Result<UserFlags, zam_store::StoreError>>,
+    ) -> Result<UserFlags, zam_store::StoreError> {
+        if let Some(f) = self.cached(user) {
+            return Ok(f);
+        }
+        // поколение — до чтения базы: правка, записанная за чтение, его сдвинет
+        let generation = self.generation();
+        let f = read.await?;
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        self.store(user, f, generation);
+        Ok(f)
+    }
+
+    /// `PATCH` настроек `user` (после записи, если она была): сдвиг поколения (идущие чтения своё
+    /// значение не сохранят) и удаление его записи.
+    pub fn invalidate(&self, user: Id) {
+        let mut m = self.lock();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        m.remove(&user);
+    }
+
+    /// Сколько раз настройки читались из `system.db` (проверка кэша в тестах).
+    pub fn loads(&self) -> usize {
+        self.loads.load(Ordering::Relaxed)
+    }
+
+    fn cached(&self, user: Id) -> Option<UserFlags> {
+        self.lock().get(&user).copied()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Значение, прочитанное с поколением `generation`, — в кэш, если поколение то же.
+    fn store(&self, user: Id, flags: UserFlags, generation: u64) {
+        let mut m = self.lock();
+        if self.generation() == generation {
+            m.insert(user, flags);
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Id, UserFlags>> {
+        self.map.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Настройки пользователя через кэш процесса ([`UserFlagsCache`], `st.user_flags`).
+pub async fn cached_user_flags(
+    st: &AppState,
+    user: Id,
+) -> Result<UserFlags, zam_store::StoreError> {
+    st.user_flags
+        .get(&st.system, user, st.cfg.ideas.default_mode)
+        .await
+}
+
 /// Переключатели типов подсказок пользователя ([`user_flags`]).
 pub async fn hook_flags(sys: &SystemStore, user: Id) -> Result<HookFlags, zam_store::StoreError> {
     Ok(user_flags(sys, user, IdeasMode::default()).await?.hooks)
@@ -162,11 +265,9 @@ pub async fn ideas_proactive(sys: &SystemStore, user: Id) -> Result<bool, ApiErr
 
 /// Режим идей базы `owner` (M6.5 §7): настройка `ideas.mode` владельца базы или `[ideas]
 /// default_mode` сервера. В общем решении действует режим владельца, а не участника: идеи лежат
-/// в его базе.
+/// в его базе. Читается через кэш процесса ([`cached_user_flags`], M6.6 §5.3).
 pub async fn ideas_mode(st: &AppState, owner: Id) -> Result<IdeasMode, ApiError> {
-    Ok(user_flags(&st.system, owner, st.cfg.ideas.default_mode)
-        .await?
-        .ideas_mode)
+    Ok(cached_user_flags(st, owner).await?.ideas_mode)
 }
 
 impl UserFlags {
@@ -268,7 +369,8 @@ async fn settings_json(st: &AppState, user: Id) -> Result<Value, ApiError> {
 /// Сохраняет правки и пишет аудит каждого изменения. Правка сравнивается с действующим
 /// значением (нет строки — `true`, у `ideas.mode` — умолчание сервера): совпало — ни записи, ни
 /// аудита (fix round 1, I-2). `ideas.mode`, равный умолчанию сервера, удаляет строку настройки
-/// (аудит — как у правки).
+/// (аудит — как у правки). Кэш — [`UserFlagsCache::invalidate`] (M6.6 §5.3): после записи, а
+/// у правки без изменений — после проверки пользователя.
 async fn apply(
     st: &AppState,
     actor: &str,
@@ -298,8 +400,10 @@ async fn apply(
                 (k.clone(), v)
             })
             .collect();
-        let changed = st.system.set_user_settings(user, stored).await?;
-        for (key, _) in changed {
+        let changed = st.system.set_user_settings(user, stored).await;
+        // и при ошибке: дошла ли правка до базы, неизвестно
+        st.user_flags.invalidate(user);
+        for (key, _) in changed? {
             let to = edits
                 .iter()
                 .find(|(k, _)| *k == key)
@@ -319,6 +423,9 @@ async fn apply(
     } else {
         // пользователь должен существовать и при правке без изменений
         st.system.get_user(user).await?.ok_or(ApiError::NotFound)?;
+        // кэш сбрасывает и `PATCH` без изменений (решение координатора, ревью задачи 4, M2):
+        // правка настроек — и способ самолечения кэша
+        st.user_flags.invalidate(user);
     }
     Ok(Json(settings_json(st, user).await?))
 }
@@ -475,5 +582,61 @@ mod tests {
             f.to_json()["ideas"],
             json!({"proactive": true, "mode": "propose"})
         );
+    }
+
+    /// M6.6 §5.3: значение, прочитанное до правки настроек (поколение сменилось за чтение), в кэш
+    /// не попадает; прочитанное без правки — попадает; правка удаляет запись пользователя, записи
+    /// других остаются.
+    #[test]
+    fn cache_generation_drops_stale_entry() {
+        let c = UserFlagsCache::default();
+        let (u, other) = (Id::new(), Id::new());
+        let stale = UserFlags::defaults(IdeasMode::Review);
+        let fresh = UserFlags::defaults(IdeasMode::Propose);
+        // чтение началось, затем `PATCH` — устаревшее значение отбрасывается
+        let g = c.generation();
+        c.invalidate(u);
+        c.store(u, stale, g);
+        assert_eq!(c.cached(u), None);
+        // чтение после правки — в кэше
+        let g = c.generation();
+        c.store(u, fresh, g);
+        c.store(other, stale, g);
+        assert_eq!(c.cached(u), Some(fresh));
+        // правка `u` удаляет только его запись
+        c.invalidate(u);
+        assert_eq!(c.cached(u), None);
+        assert_eq!(c.cached(other), Some(stale));
+    }
+
+    /// Ревью задачи 4, M4: `get` снимает поколение до чтения базы. Правка, записанная за чтение
+    /// (`invalidate` внутри `read`), отбрасывает прочитанное — значение отдаётся, но в кэш не
+    /// попадает; снимок после чтения сохранил бы устаревшее значение. Чтение без правки — в кэш,
+    /// повтор — без чтения.
+    #[tokio::test]
+    async fn cache_get_snapshots_generation_before_read() {
+        let c = UserFlagsCache::default();
+        let u = Id::new();
+        let stale = UserFlags::defaults(IdeasMode::Review);
+        let fresh = UserFlags::defaults(IdeasMode::Propose);
+        let got = c
+            .load(u, async {
+                c.invalidate(u);
+                Ok(stale)
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, stale);
+        assert_eq!(c.cached(u), None, "прочитанное за правку — не в кэше");
+        assert_eq!(c.loads(), 1);
+        let got = c.load(u, async { Ok(fresh) }).await.unwrap();
+        assert_eq!((got, c.cached(u)), (fresh, Some(fresh)));
+        let got = c
+            .load(u, async {
+                panic!("повтор — из кэша, без чтения")
+            })
+            .await
+            .unwrap();
+        assert_eq!((got, c.loads()), (fresh, 2));
     }
 }

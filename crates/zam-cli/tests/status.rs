@@ -111,6 +111,116 @@ async fn status_json_has_fields_and_only_mask() {
     assert!(v["server"]["version"].is_string());
     assert!(v["user"]["id"].is_string() && v["user"]["name"].is_string());
     assert!(v["solution"].is_null());
+    // поля решения есть и без solution.toml (M6.6, замечание 23)
+    for k in ["solution_id", "solution_name", "solution_file_name"] {
+        assert!(v.as_object().unwrap().contains_key(k), "{k}: {v}");
+        assert!(v[k].is_null(), "{k}: {v}");
+    }
+}
+
+/// HTTP с токеном: код ответа.
+fn api(url: &str, token: &str, method: &str, path: &str, body: serde_json::Value) -> u16 {
+    let a = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build(),
+    );
+    let uri = format!("{url}/api/v1{path}");
+    let req = match method {
+        "POST" => a.post(&uri),
+        "PATCH" => a.patch(&uri),
+        m => panic!("метод {m}"),
+    };
+    req.header("Authorization", format!("Bearer {token}"))
+        .content_type("application/json")
+        .send(body.to_string())
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// M6.6 §9 (замечание 23): «Решение:  «<имя>» (<GUID>) — <путь>», в JSON — `solution_id` и
+/// `solution_name`. Переименовано на сервере — имя реестра с пометкой; без токена (`/spaces` не
+/// спрашивается) — имя из файла; файл не читается — путь и причина.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_prints_solution_name_and_guid() {
+    let (url, token) = start("solname").await;
+    tokio::task::spawn_blocking(move || {
+        let g = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9ea1";
+        let dir = tmp("solname-cwd");
+        let file = dir.join(".zeroaimemory").join("solution.toml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            format!("agent_solution_id = \"{g}\"\nname = \"Файловое\"\n"),
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let mut c = common::zam_cmd();
+            c.env("HOME", &dir)
+                .env("USERPROFILE", &dir)
+                .current_dir(&dir)
+                .arg("status")
+                .args(["--url", &url])
+                .args(args);
+            c.output().unwrap()
+        };
+        let json = |o: &std::process::Output| -> serde_json::Value {
+            serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", out(o)))
+        };
+        let body = serde_json::json!({"agent_solution_id": g, "name": "Файловое"});
+        assert_eq!(api(&url, &token, "POST", "/solutions", body), 201);
+        let o = run(&["--token", &token]);
+        let s = out(&o);
+        assert_eq!(o.status.code(), Some(0), "{s}{}", err(&o));
+        assert!(
+            s.contains(&format!("Решение:  «Файловое» ({g}) — ")) && s.contains("solution.toml"),
+            "{s}"
+        );
+        assert!(!s.contains("в solution.toml —"), "{s}");
+        let v = json(&run(&["--token", &token, "--json"]));
+        assert_eq!(v["solution_id"], g, "{v}");
+        assert_eq!(v["solution_name"], "Файловое", "{v}");
+        assert_eq!(v["solution_file_name"], "Файловое", "{v}");
+        assert!(v["solution"].as_str().unwrap().ends_with("solution.toml"), "{v}");
+        // переименовано в реестре (zam solution rename) — имя реестра с пометкой
+        let body = serde_json::json!({"name": "Реестровое"});
+        assert_eq!(api(&url, &token, "PATCH", &format!("/solutions/{g}"), body), 200);
+        let s = out(&run(&["--token", &token]));
+        assert!(
+            s.contains(&format!("Решение:  «Реестровое» ({g}) — "))
+                && s.contains("(в solution.toml — «Файловое»)"),
+            "{s}"
+        );
+        // в JSON видны оба имени: реестра и файла (ревью задачи 10, M8)
+        let v = json(&run(&["--token", &token, "--json"]));
+        assert_eq!(v["solution_name"], "Реестровое", "{v}");
+        assert_eq!(v["solution_file_name"], "Файловое", "{v}");
+        // без токена реестр не спрашивается — имя из файла, без ошибки о решении
+        let o = run(&[]);
+        assert_eq!(o.status.code(), Some(3));
+        assert!(
+            out(&o).contains(&format!("Решение:  «Файловое» ({g}) — ")),
+            "{}",
+            out(&o)
+        );
+        // файл не читается — путь и причина
+        std::fs::write(&file, "agent_solution_id = 1\n").unwrap();
+        let o = run(&["--token", &token]);
+        let s = out(&o);
+        assert_eq!(o.status.code(), Some(0), "{s}{}", err(&o));
+        assert!(
+            s.lines()
+                .any(|l| l.starts_with("Решение:  ") && l.contains("solution.toml — не читается: ")),
+            "{s}"
+        );
+        let v = json(&run(&["--token", &token, "--json"]));
+        assert!(v["solution_id"].is_null() && v["solution_name"].is_null(), "{v}");
+        assert!(v["solution_error"].is_string(), "{v}");
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

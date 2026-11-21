@@ -118,13 +118,9 @@ pub(super) async fn lookup(
     out
 }
 
-/// Склонение «источник» по числу.
+/// Склонение «источник» по числу ([`zam_core::text::plural_ru`]).
 fn sources_word(n: usize) -> &'static str {
-    match (n % 10, n % 100) {
-        (1, x) if x != 11 => "источник",
-        (2..=4, x) if !(12..=14).contains(&x) => "источника",
-        _ => "источников",
-    }
+    zam_core::text::plural_ru(n as u64, "источник", "источника", "источников")
 }
 
 /// JSON элемента шага 0.

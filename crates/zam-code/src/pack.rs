@@ -5,6 +5,8 @@
 //! находит наибольший префикс, при котором текст вместе с хвостом «… ещё N файлов, M символов»
 //! укладывается в бюджет; итог не превышает бюджета никогда.
 
+use zam_core::text::plural_ru;
+
 use crate::SymbolKind;
 
 /// Символ карты.
@@ -44,22 +46,13 @@ pub fn map_line(s: &MapSym) -> String {
     format!("  {} {what} :{}", s.kind.as_str(), s.line)
 }
 
-/// Русская форма числительного: 1 файл, 2 файла, 5 файлов.
-fn plural<'a>(n: usize, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
-    match (n % 10, n % 100) {
-        (_, 11..=14) => many,
-        (1, _) => one,
-        (2..=4, _) => few,
-        _ => many,
-    }
-}
-
-/// Хвост карты: сколько не показано и как получить остальное.
+/// Хвост карты: сколько не показано и как получить остальное (1 файл, 2 файла, 5 файлов —
+/// [`plural_ru`]).
 fn tail_line(files_left: usize, symbols_left: usize) -> String {
     format!(
         "… ещё {files_left} {}, {symbols_left} {} — `memory_code action=map focus=…`",
-        plural(files_left, "файл", "файла", "файлов"),
-        plural(symbols_left, "символ", "символа", "символов"),
+        plural_ru(files_left as u64, "файл", "файла", "файлов"),
+        plural_ru(symbols_left as u64, "символ", "символа", "символов"),
     )
 }
 

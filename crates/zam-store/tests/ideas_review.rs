@@ -3,6 +3,7 @@
 //! `new`, живая идея), пределы полей, проверка ссылок `basis`/`similar`, история разборов и
 //! повтор по ключу.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
@@ -13,7 +14,7 @@ use zam_store::{
     NewDecision, NewEntry, NewNote, NewReview, NodePath, REVIEW_MIN_CHARS_DEFAULT, REVIEW_REFS_MAX,
     REVIEWS_MAX, ReviewOutcome, ReviewTask, SpaceKind, StoreError, TaskData, create_entry,
     create_note, create_solution, decide_idea, delete_entry, entry_revisions, get_entry,
-    list_spaces, planned_from_ideas, review_idea, review_queue, update_entry,
+    list_spaces, planned_from_ideas, review_idea, review_queue, review_queue_unseen, update_entry,
 };
 
 // ---------- окружение ----------
@@ -988,6 +989,63 @@ async fn review_queue_order_and_filters() {
     assert_eq!(ids(review_queue(&db, sol, 0).await.unwrap()), (4, vec![]));
     // очередь — одного пространства: идея Knowledge в очередь решения не попадает
     assert_eq!(review_queue(&db, kn, 10).await.unwrap().0, 1);
+}
+
+/// Очередь разбора без показанного (M6.6 §3.5, строка к `prompt`; ревью задачи 14 — по
+/// ревизии): id идей очереди, не показанных в текущей ревизии, в порядке очереди, и записи
+/// первых `take`; показ прежней ревизии не считается; id вне очереди в `seen` ничего не меняют;
+/// всё показано или очереди нет — пусто.
+#[tokio::test]
+async fn review_queue_unseen_skips_excluded() {
+    let (db, sol, kn) = setup("queue-unseen").await;
+    let old = new_idea(&db, sol, "Старая", "human", "normal").await;
+    let young = new_idea(&db, sol, "Новая", "human", "normal").await;
+    let high = new_idea(&db, sol, "Срочная", "human", "high").await;
+    let agents = new_idea(&db, sol, "Идея агента", "agent", "high").await;
+    let seen =
+        |v: &[(&Entry, i64)]| -> HashMap<Id, i64> { v.iter().map(|(e, r)| (e.id, *r)).collect() };
+    let got = |(ids, head): (Vec<Id>, Vec<Entry>)| {
+        (ids, head.into_iter().map(|e| e.id).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        got(review_queue_unseen(&db, sol, &HashMap::new(), 2)
+            .await
+            .unwrap()),
+        (vec![high.id, old.id, young.id], vec![high.id, old.id])
+    );
+    // показанное в текущей ревизии и id вне очереди (идея агента, случайный) — не считаются
+    let mut s = seen(&[(&high, high.rev), (&agents, agents.rev)]);
+    s.insert(Id::new(), 1);
+    assert_eq!(
+        got(review_queue_unseen(&db, sol, &s, 1).await.unwrap()),
+        (vec![old.id, young.id], vec![old.id])
+    );
+    // показ прежней ревизии — идея снова непоказана
+    let s = seen(&[(&high, high.rev - 1), (&old, old.rev)]);
+    assert_eq!(
+        got(review_queue_unseen(&db, sol, &s, 5).await.unwrap()),
+        (vec![high.id, young.id], vec![high.id, young.id])
+    );
+    let all = seen(&[(&high, high.rev), (&old, old.rev), (&young, young.rev)]);
+    assert_eq!(
+        got(review_queue_unseen(&db, sol, &all, 2).await.unwrap()),
+        (vec![], vec![])
+    );
+    assert_eq!(
+        got(review_queue_unseen(&db, kn, &HashMap::new(), 2)
+            .await
+            .unwrap()),
+        (vec![], vec![])
+    );
+    // `take` 0 — без записей; записи — целиком (заголовок для строки)
+    let (ids, head) = review_queue_unseen(&db, sol, &HashMap::new(), 0)
+        .await
+        .unwrap();
+    assert_eq!((ids.len(), head.len()), (3, 0));
+    let (_, head) = review_queue_unseen(&db, sol, &seen(&[(&high, high.rev)]), 1)
+        .await
+        .unwrap();
+    assert_eq!(head[0].title, "Старая");
 }
 
 /// Строка плана: живые задачи `open | in_progress | blocked` с системным ребром `derived_from`

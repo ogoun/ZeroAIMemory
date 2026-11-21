@@ -464,6 +464,8 @@ async fn user_session_admin_routes_403() {
             "/problems/password-change-required",
             "{m} {uri}"
         );
+        // M6.6 §10.2: текст сессии пользователя — не безликий «доступ запрещён»
+        assert_eq!(r.json()["detail"], "только администратору", "{m} {uri}");
     }
     // статус индекса — только своя база (баннер перенарезки у пользователя, R9)
     let r = web(&a, &w, Method::GET, "/api/v1/index/status", None).await;

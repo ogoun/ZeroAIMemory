@@ -45,7 +45,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use zam_search::recall::{error_regex_matches, error_terms, normalize_error, term_coverage};
+use zam_search::recall::{
+    PromptGate, error_regex_matches, error_terms, normalize_error, prompt_gate, term_coverage,
+};
 
 use super::corpus::{Corpus, EVAL_SOLUTION, INSIGHT_REF, Query, fnv1a, valid_key};
 use super::insights::Insight;
@@ -166,13 +168,14 @@ pub struct Case {
     pub note: String,
     /// Происхождение случая ([`SOURCES`]): `m4` (по умолчанию), `task9` (исполнитель задачи 9
     /// M6), `independent` и `independent_b` (два независимых набора ревью задачи 9 — авторы не видели
-    /// код, сетки и результаты).
+    /// код, сетки и результаты), `m66` (случаи тишины M6.6 §3: реплики и пересланные сообщения;
+    /// в решающие части сеток [`grid::DECISION_SOURCES`] не входят).
     #[serde(default = "default_source")]
     pub source: String,
 }
 
 /// Происхождения случаев набора.
-pub const SOURCES: [&str; 4] = ["m4", "task9", "independent", "independent_b"];
+pub const SOURCES: [&str; 5] = ["m4", "task9", "independent", "independent_b", "m66"];
 
 fn default_source() -> String {
     SOURCES[0].to_string()
@@ -1068,9 +1071,29 @@ fn recall(s: &Session, body: &Value) -> Result<(Value, f64)> {
     Ok((v, ms))
 }
 
-/// Кандидаты `prompt` того же внутреннего поиска, что у `/recall(prompt)`.
+/// Запрос поиска подсказок `/recall(prompt)` — первые символы промпта (`QUERY_MAX_CHARS` сервера).
+const PROMPT_QUERY_CHARS: usize = 512;
+
+/// Карточки ответа внутреннего поиска, из которых сервер отбирает подсказки `prompt` (M6.6 §3):
+/// правило — тот же метод сервера [`PromptGate::admits_card`] (ревью задачи 2, I1, R1); здесь —
+/// только перебор `items`.
+fn prompt_cards<'a>(gate: &PromptGate, search: &'a Value) -> Vec<&'a Value> {
+    search["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|it| gate.admits_card(it))
+        .collect()
+}
+
+/// Кандидаты `prompt` того же внутреннего поиска, что у `/recall(prompt)`, с правилами тишины
+/// сервера ([`prompt_cards`]).
 fn prompt_candidates(s: &Session, refs: &RefMap, prompt: &str) -> Result<Vec<PromptCand>> {
-    let query: String = prompt.chars().take(512).collect();
+    let query: String = prompt.chars().take(PROMPT_QUERY_CHARS).collect();
+    let gate = prompt_gate(prompt, PROMPT_QUERY_CHARS);
+    if !matches!(gate, PromptGate::Search { .. }) {
+        return Ok(Vec::new());
+    }
     let body = json!({
         "query": query,
         "scope": {"solution": EVAL_SOLUTION, "include_knowledge": true, "include_rules": true},
@@ -1094,7 +1117,7 @@ fn prompt_candidates(s: &Session, refs: &RefMap, prompt: &str) -> Result<Vec<Pro
         bail!("POST /search: HTTP {st}: {v}");
     }
     let mut out = Vec::new();
-    for it in v["items"].as_array().into_iter().flatten() {
+    for it in prompt_cards(&gate, &v) {
         let space = it["space"]["kind"].as_str().unwrap_or_default();
         let r = match (
             it["kind"].as_str(),
@@ -1911,6 +1934,52 @@ mod tests {
         assert_eq!(prompt_pick(&cands, 0.6), ["a", "c", "d"]);
         assert_eq!(prompt_pick(&cands, 0.8), ["a"]);
         assert!(prompt_pick(&cands, 0.95).is_empty());
+    }
+
+    /// Модель калибровки отбирает карточки методом сервера (ревью задачи 2, I1, R1; как
+    /// `coverage_rule_matches_server`): ожидание каждого запроса — из
+    /// `zam_search::recall::prompt_gate` и `PromptGate::admits_card`, а не из копии правила.
+    #[test]
+    fn prompt_cards_follow_server_gate() {
+        let search = json!({"items": [
+            {"kind": "insight", "entry_id": "v", "sources": ["vector"]},
+            {"kind": "insight", "entry_id": "f", "sources": ["vector", "fts"]},
+            {"kind": "insight", "entry_id": "t", "sources": ["trigram"]},
+            {"kind": "insight", "entry_id": "d", "sources": ["folder"]},
+        ]});
+        let ids = |cards: Vec<&Value>| -> Vec<String> {
+            cards
+                .iter()
+                .map(|c| c["entry_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let gate = |q: &str| prompt_gate(q, PROMPT_QUERY_CHARS);
+        for q in [
+            "согласен",
+            "Да, давай, продолжай",
+            "[Subagent hand-back] квазар найден в каталоге",
+            "квазар",
+            "квазар светит",
+            "почему квазар светит ярко",
+            "согласен, мигрируй 0026",
+        ] {
+            let g = gate(q);
+            let want: Vec<String> = search["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|it| g.admits_card(it))
+                .map(|it| it["entry_id"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(ids(prompt_cards(&g, &search)), want, "{q}");
+        }
+        // опорные случаи: реплика — ничего, короткий — лексические, длинный — все
+        assert!(prompt_cards(&gate("согласен"), &search).is_empty());
+        assert_eq!(ids(prompt_cards(&gate("квазар"), &search)), ["f", "t"]);
+        assert_eq!(
+            ids(prompt_cards(&gate("почему квазар светит ярко"), &search)),
+            ["v", "f", "t", "d"]
+        );
     }
 
     #[test]

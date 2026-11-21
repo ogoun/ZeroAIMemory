@@ -67,6 +67,11 @@ impl VaultScope {
             VaultScope::Solution(g) => Some(g.as_str()),
         }
     }
+
+    /// Область в API (`{space}`, поле `space`, аудит переноса): `knowledge` или GUID решения.
+    pub fn space(&self) -> &str {
+        self.guid().unwrap_or("knowledge")
+    }
 }
 
 impl Serialize for VaultScope {
@@ -196,8 +201,11 @@ fn fts_del(c: &Connection, id: Id) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// 409 занятого имени: «имя занято» — в начале (M6.6 §7, CLI и MCP показывают `detail`).
 fn busy_title(title: &str) -> StoreError {
-    StoreError::Conflict(format!("запись Vault с именем «{title}» уже есть"))
+    StoreError::Conflict(format!(
+        "имя занято: запись Vault с именем «{title}» уже есть"
+    ))
 }
 
 /// Живая запись и её текущий шифротекст; удалённой или нет — `NotFound`.
@@ -472,6 +480,62 @@ pub async fn vault_update(
     .await
 }
 
+/// Перенос живой записи в область `to` одной транзакцией (M6.6 §7): новая ревизия
+/// `expected_rev + 1` с шифротекстом `secret_blob` — AAD шифротекста связан с пользователем,
+/// записью и ревизией, а не с областью, поэтому значение перешифровывается под новый номер, как у
+/// [`vault_update`]. Имя и `data` прежние; в строке меняются `scope`, `agent_solution_id`,
+/// значение, `current_rev`, `updated_at` (`vault_fts` области не хранит). Та же область — запись
+/// как есть, без ревизии (`secret_blob` не используется). Текущая ревизия не `expected_rev` →
+/// `Conflict`; имя занято живой записью `to` → `Conflict` «имя занято», запись не тронута;
+/// удалённой или нет — `NotFound`.
+pub async fn vault_move(
+    db: &Db,
+    id: Id,
+    expected_rev: i64,
+    to: &VaultScope,
+    secret_blob: Vec<u8>,
+    a: &Attribution,
+) -> Result<VaultMeta, StoreError> {
+    let to = to.clone();
+    let a = a.clone();
+    db.write(move |tx| {
+        let (cur, _) = load_live(tx, id)?;
+        if cur.rev != expected_rev {
+            return Err(StoreError::Conflict(format!(
+                "ревизия записи Vault {}, а не {expected_rev}",
+                cur.rev
+            )));
+        }
+        if cur.scope == to {
+            return Ok(cur);
+        }
+        let data = serde_json::to_string(&cur.data).map_err(json_err)?;
+        let rev = cur.rev + 1;
+        let now = fmt_ts(crate::time::now());
+        let r = tx
+            .prepare_cached(
+                "UPDATE vault_items SET scope = ?2, agent_solution_id = ?3, secret = ?4,
+                     current_rev = ?5, updated_at = ?6
+                 WHERE id = ?1",
+            )?
+            .execute(params![id, to.as_str(), to.guid(), secret_blob, rev, now]);
+        match r {
+            Ok(_) => {}
+            Err(e) if is_unique_violation(&e) => {
+                return Err(StoreError::Conflict(format!(
+                    "имя занято: в Vault {} уже есть запись «{}»",
+                    to.space(),
+                    cur.title
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        insert_revision(tx, id, rev, &cur.title, &data, &secret_blob, &now, &a)?;
+        Ok(load_live(tx, id)?.0)
+    })
+    .await
+}
+
 /// Мягкое удаление (имя освобождается); ревизии остаются. Удалённой или нет — `NotFound`.
 /// Кто удалил — в аудите сервера (`vault.delete`): в схеме Vault столбцов для этого нет.
 pub async fn vault_delete(db: &Db, id: Id, _a: &Attribution) -> Result<(), StoreError> {
@@ -703,5 +767,49 @@ mod tests {
             })
             .await;
         assert!(e.is_err(), "ревизии только дописываются");
+    }
+
+    /// M6.6 §7: перенос между областями — одна транзакция: новая ревизия со своим шифротекстом,
+    /// имя и `data` прежние, поиск — в новой области; та же область — без ревизии; устаревшая
+    /// ревизия и занятое в цели имя — `Conflict` (запись на месте); удалённая — `NotFound`.
+    #[tokio::test]
+    async fn move_between_scopes() {
+        let db = db("move");
+        let k = VaultScope::Knowledge;
+        let s = VaultScope::Solution(guid());
+        let d = serde_json::json!({"type": "host", "purpose": "стенд приёмки"});
+        let id = Id::new();
+        vault_put(&db, id, &s, "stage", d.clone(), vec![1], &agent())
+            .await
+            .unwrap();
+        let m = vault_move(&db, id, 1, &k, vec![2], &agent()).await.unwrap();
+        assert_eq!((&m.scope, m.rev, m.title.as_str()), (&k, 2, "stage"));
+        assert_eq!(m.data, d);
+        assert_eq!(vault_get(&db, id).await.unwrap().1, vec![2]);
+        assert_eq!(vault_revision_secret(&db, id, 1).await.unwrap(), vec![1]);
+        assert_eq!(vault_list(&db, &k, Some("приёмки")).await.unwrap().len(), 1);
+        assert!(vault_list(&db, &s, None).await.unwrap().is_empty());
+        // та же область — запись как есть: ни ревизии, ни нового шифротекста
+        let m = vault_move(&db, id, 2, &k, vec![9], &agent()).await.unwrap();
+        assert_eq!(m.rev, 2);
+        assert_eq!(vault_get(&db, id).await.unwrap().1, vec![2]);
+        let e = vault_move(&db, id, 1, &s, vec![3], &agent()).await;
+        assert!(matches!(e, Err(StoreError::Conflict(_))), "{e:?}");
+        // имя занято в цели — запись не тронута
+        vault_put(&db, Id::new(), &s, "stage", d, vec![4], &agent())
+            .await
+            .unwrap();
+        match vault_move(&db, id, 2, &s, vec![5], &agent()).await {
+            Err(StoreError::Conflict(m)) => assert!(m.contains("имя занято"), "{m}"),
+            e => panic!("{e:?}"),
+        }
+        let (m, blob) = vault_get(&db, id).await.unwrap();
+        assert_eq!((m.scope, m.rev, blob), (k, 2, vec![2]));
+        assert_eq!(vault_revisions(&db, id).await.unwrap().len(), 2);
+        vault_delete(&db, id, &agent()).await.unwrap();
+        assert!(matches!(
+            vault_move(&db, id, 2, &s, vec![6], &agent()).await,
+            Err(StoreError::NotFound)
+        ));
     }
 }

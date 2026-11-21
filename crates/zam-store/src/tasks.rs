@@ -7,12 +7,17 @@
 //! - [`check_task_transition`] — переходы статусов: между `open`, `in_progress`, `blocked` —
 //!   любые; в `done`/`dropped` — из любого; из `done`/`dropped` — только в `open` и с причиной.
 //!   `started_at` ставится при первом переходе в `in_progress`, `done_at` — при `done` (снимается
-//!   при переоткрытии), закрытие (`done`/`dropped`) снимает захват;
+//!   при переоткрытии), закрытие (`done`/`dropped`) снимает захват, `next_step` и `blocked_by`
+//!   (явные значения той же правки сильнее; M6.6, замечание 35);
 //! - захват ([`claim_task`], [`release_task`]) — одна транзакция писателя с проверкой текущего
 //!   `claimed_by`; ревизию записи не создаёт (меняется только `entries.data`), аудит ведёт
 //!   вызывающий (сервер: `entry.claim`, `entry.release` в `system.db`);
 //! - [`claimed_tasks`] — задачи, захваченные сессией (для `GET /sessions/{id}` и хука
-//!   `checkpoint`).
+//!   `checkpoint`);
+//! - [`open_tasks`] — число открытых задач и заголовки незахваченных для строки дайджеста
+//!   «Открыто задач: N — …» (M6.6 §4.2).
+
+use std::cmp::Reverse;
 
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::{params, params_from_iter};
@@ -244,8 +249,16 @@ impl TaskData {
 
     /// Следы смены статуса: `started_at` при первом `in_progress`, `done_at` при `done` (и снятие
     /// при переоткрытии), снятие захвата при закрытии, `blocked_by` теряется при выходе из
-    /// `blocked` (явное значение той же правки накладывается после — [`TaskData::apply_patch`]).
+    /// `blocked`; переход в `done`/`dropped` снимает `next_step` и `blocked_by` (M6.6, замечание
+    /// 35: у выполненной задачи нет «далее»; прежнее — в истории ревизий), повтор того же
+    /// статуса — не переход. Явное значение той же правки накладывается после —
+    /// [`TaskData::apply_patch`].
     pub fn on_transition(&mut self, from: Option<EntryStatus>, to: EntryStatus, now: Timestamp) {
+        let from_status = from.unwrap_or(EntryStatus::Open);
+        if matches!(to, EntryStatus::Done | EntryStatus::Dropped) && from_status != to {
+            self.next_step = None;
+            self.blocked_by = None;
+        }
         match to {
             EntryStatus::InProgress if self.started_at.is_none() => self.started_at = Some(now),
             EntryStatus::Done => {
@@ -462,6 +475,94 @@ pub async fn claimed_tasks(
     .await
 }
 
+/// Открытая задача строки дайджеста ([`open_tasks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTask {
+    pub id: Id,
+    pub title: String,
+    pub priority: Option<IdeaPriority>,
+    pub created_at: Timestamp,
+}
+
+impl OpenTask {
+    /// Ключ порядка [`open_tasks`] — для слияния заголовков нескольких баз, по возрастанию:
+    /// `priority` по [`IdeaPriority::rank`] (`high` → `normal` → `low`; без приоритета —
+    /// последней: `None` меньше любого ранга), затем новые первыми. Тот же ранг — в SQL
+    /// `open_tasks` (`priority_rank_sql`), равенство порядков проверяет тест хранилища.
+    pub fn order_key(&self) -> Reverse<(Option<u8>, Timestamp, Id)> {
+        let rank = self.priority.map(IdeaPriority::rank);
+        Reverse((rank, self.created_at, self.id))
+    }
+}
+
+/// Ранг `data.priority` в SQL — те же числа, что [`IdeaPriority::rank`]; без приоритета —
+/// `NULL` (в `ORDER BY … DESC` — последним, как `None` в [`OpenTask::order_key`]).
+fn priority_rank_sql() -> String {
+    let arms: String = IdeaPriority::ALL
+        .iter()
+        .map(|p| format!("WHEN '{}' THEN {} ", p.as_str(), p.rank()))
+        .collect();
+    format!("CASE json_extract(data, '$.priority') {arms}END")
+}
+
+/// Отбор [`open_tasks`]: живые задачи `open` пространств `?1..?n`.
+fn open_tasks_where(n: usize) -> String {
+    format!(
+        "FROM entries INDEXED BY entries_feed
+         WHERE space_id IN ({}) AND kind = 'task' AND status = 'open' AND deleted_at IS NULL",
+        crate::questions::in_list(n)
+    )
+}
+
+/// Открытые задачи пространств `spaces` (M6.6 §4.2, строка дайджеста «Открыто задач: N — …»):
+/// число всех живых задач `open` и до `titles` задач без живого захвата на текущий момент
+/// ([`crate::time::now`]; захваченные дайджест уже показывает строками раздела задач) в порядке
+/// [`OpenTask::order_key`] — `data.priority` (`high` → `normal` → `low` → нет), затем новые
+/// первыми. Захват — то же сравнение `claimed_by.until`, что у [`claimed_tasks`]. Вызывающий,
+/// объединяющий несколько баз, сортирует заголовки по [`OpenTask::order_key`] сам. Пустой
+/// список пространств — `(0, [])` без запроса.
+pub async fn open_tasks(
+    db: &Db,
+    spaces: &[Id],
+    titles: usize,
+) -> Result<(usize, Vec<OpenTask>), StoreError> {
+    if spaces.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+    let n = spaces.len();
+    let mut args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+    db.read(move |c| {
+        let from = open_tasks_where(n);
+        let count: i64 = c
+            .prepare(&format!("SELECT COUNT(*) {from}"))?
+            .query_row(params_from_iter(args.iter()), |r| r.get(0))?;
+        // захват жив — `until` позже момента запроса (нет захвата — NULL, задача свободна)
+        args.push(fmt_ts(crate::time::now()));
+        let mut st = c.prepare(&format!(
+            "SELECT id, title, data, created_at {from}
+               AND NOT ifnull(json_extract(data, '$.claimed_by.until') > ?{}, 0)
+             ORDER BY {} DESC, created_at DESC, id DESC
+             LIMIT {titles}",
+            n + 1,
+            priority_rank_sql()
+        ))?;
+        let rows = st
+            .query_map(params_from_iter(args), |r| {
+                let data: String = r.get(2)?;
+                let data = serde_json::from_str(&data).unwrap_or(Value::Null);
+                Ok(OpenTask {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    priority: TaskData::from_stored(&data).priority,
+                    created_at: crate::time::ts_at(r, 3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((usize::try_from(count).unwrap_or(0), rows))
+    })
+    .await
+}
+
 /// SQL [`claimed_tasks`] для `n` пространств: `?1..?n` — пространства, затем сессия и момент.
 fn claimed_sql(n: usize) -> String {
     format!(
@@ -590,6 +691,41 @@ mod tests {
         };
         t.on_transition(Some(Blocked), InProgress, t0);
         assert_eq!(t.blocked_by, None);
+    }
+
+    /// M6.6, замечание 35: закрытие (`done`/`dropped`) снимает «следующий шаг» и блокер из
+    /// любого живого статуса; повтор того же статуса — не переход, поля не трогает.
+    #[test]
+    fn closing_clears_next_step_and_blocker() {
+        let t0: Timestamp = "2026-10-28T10:00:00Z".parse().unwrap();
+        let open = || TaskData {
+            next_step: Some("ревью".into()),
+            blocked_by: Some("ждём".into()),
+            ..TaskData::default()
+        };
+        for from in [Open, InProgress, Blocked] {
+            for to in [Done, Dropped] {
+                let mut t = open();
+                t.on_transition(Some(from), to, t0);
+                assert_eq!(t.next_step, None, "{from:?} → {to:?}");
+                assert_eq!(t.blocked_by, None, "{from:?} → {to:?}");
+            }
+        }
+        // задача без статуса в базе читается как open
+        let mut t = open();
+        t.on_transition(None, Done, t0);
+        assert_eq!((t.next_step, t.blocked_by), (None, None));
+        // done → done, dropped → dropped: шаг, заданный после закрытия, остаётся
+        for s in [Done, Dropped] {
+            let mut t = open();
+            t.on_transition(Some(s), s, t0);
+            assert_eq!(t.next_step.as_deref(), Some("ревью"), "{s:?}");
+            assert_eq!(t.blocked_by.as_deref(), Some("ждём"), "{s:?}");
+        }
+        // прочие переходы шаг не трогают
+        let mut t = open();
+        t.on_transition(Some(Open), InProgress, t0);
+        assert_eq!(t.next_step.as_deref(), Some("ревью"));
     }
 
     #[test]

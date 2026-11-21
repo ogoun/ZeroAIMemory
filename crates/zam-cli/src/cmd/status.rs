@@ -1,7 +1,8 @@
-//! `zam status`: сервер, токен, пользователь, solution.toml, роль в решении, число
-//! ожидающих запросов доступа к решениям пользователя (M0, холодный старт ≤ 20 мс) и версия
-//! блока инструкции в CLAUDE.md/AGENTS.md против версии сервера (`GET /agent-setup`, §15.5):
-//! устарел — одно напоминание.
+//! `zam status`: сервер, токен, пользователь, решение (имя и GUID из solution.toml, имя реестра
+//! при переименовании — M6.6 §9, замечание 23), роль в решении, число ожидающих запросов доступа
+//! к решениям пользователя (M0, холодный старт ≤ 20 мс) и версия блока инструкции в
+//! CLAUDE.md/AGENTS.md против версии сервера (`GET /agent-setup`, §15.5): устарел — одно
+//! напоминание.
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -9,6 +10,7 @@ use serde_json::{Value, json};
 use super::{home_dir, zam_env};
 use crate::client::{EXIT_CONFIG, EXIT_TOKEN, EXIT_UNREACHABLE, Timeouts, agent};
 use crate::locate::{self, Flags, Found};
+use crate::target::Solution;
 
 /// GET; Ok((код, тело)) или текст сетевой ошибки (токен в нём не встречается).
 fn get(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Result<(u16, String), String> {
@@ -45,6 +47,13 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
         return EXIT_CONFIG;
     }
     let solution = locate::find_solution(&cwd);
+    // файл читается сразу: имя и GUID печатаются и без ответа /spaces
+    let sol = solution.as_deref().map(|p| {
+        crate::target::load_solution(p).map_err(|e| {
+            let lead = format!("{}: ", p.display());
+            e.msg.strip_prefix(&lead).unwrap_or(&e.msg).to_string()
+        })
+    });
     let agent = agent(&url.value, Timeouts::Probe);
 
     // 1. сервер: /health без аутентификации
@@ -75,6 +84,8 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
         user: None,
         access: None,
         solution,
+        sol,
+        registry_name: None,
         role: None,
         pending: None,
         block: None,
@@ -95,9 +106,7 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
             rep.user = Some((str_of(&v["user"]["name"]), str_of(&v["user"]["id"])));
             rep.access = Some(str_of(&v["access"]));
             rep.pending = v["access_requests_pending"].as_u64();
-            if let Some(path) = &rep.solution
-                && let Ok(s) = crate::target::load_solution(path)
-            {
+            if let Some(Ok(s)) = &rep.sol {
                 rep.role = Some(solution_role(
                     &agent,
                     &rep.url.value,
@@ -105,6 +114,7 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
                     &v,
                     &s.id,
                 ));
+                rep.registry_name = registry_name(&v, s);
             }
             rep.block = block_versions(&agent, &rep.url.value, &token.value, &cwd);
             rep.print(as_json, None);
@@ -163,6 +173,19 @@ fn solution_role(
     }
 }
 
+/// Имя решения в реестре сервера (`spaces[].name` с этим GUID), если оно отличается от имени в
+/// `solution.toml` (переименовано `zam solution rename` или в WebUI).
+fn registry_name(spaces: &Value, s: &Solution) -> Option<String> {
+    spaces["spaces"]
+        .as_array()?
+        .iter()
+        .find(|x| x["agent_solution_id"] == s.id.as_str())?["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && *n != s.name)
+        .map(String::from)
+}
+
 /// Версия блока ближайшего CLAUDE.md/AGENTS.md (как у хука `session-start`) и версия
 /// сервера; сервер без `/agent-setup` (старый) — `None`.
 fn block_versions(
@@ -192,6 +215,10 @@ struct Report {
     user: Option<(String, String)>,
     access: Option<String>,
     solution: Option<PathBuf>,
+    /// Содержимое `solution.toml`; не читается — причина.
+    sol: Option<Result<Solution, String>>,
+    /// Имя решения в реестре сервера, если отличается от имени файла.
+    registry_name: Option<String>,
     /// Роль в решении из `solution.toml`.
     role: Option<String>,
     /// Ожидающие запросы доступа к решениям пользователя.
@@ -205,6 +232,11 @@ impl Report {
     fn print(&self, as_json: bool, problem: Option<&str>) {
         let mask = self.token.as_ref().map(|t| zam_core::mask_token(&t.value));
         let sol = self.solution.as_deref().map(Path::display);
+        let file = self.sol.as_ref().and_then(|r| r.as_ref().ok());
+        let name = self
+            .registry_name
+            .as_deref()
+            .or(file.map(|s| s.name.as_str()));
         if as_json {
             let v = json!({
                 "url": self.url.value,
@@ -215,6 +247,10 @@ impl Report {
                 "access": self.access,
                 "user": self.user.as_ref().map(|(n, i)| json!({ "name": n, "id": i })),
                 "solution": sol.map(|d| d.to_string()),
+                "solution_id": file.map(|s| s.id.as_str()),
+                "solution_name": name,
+                "solution_file_name": file.map(|s| s.name.as_str()),
+                "solution_error": self.sol.as_ref().and_then(|r| r.as_ref().err()),
                 "solution_role": self.role,
                 "access_requests_pending": self.pending,
                 "agent_block": self.block.map(|(local, server)| json!({
@@ -247,9 +283,20 @@ impl Report {
             Some((n, i)) => println!("Пользователь: {n} ({i})"),
             None => println!("Пользователь: неизвестен"),
         }
-        match sol {
-            Some(d) => println!("Решение:  {d}"),
-            None => println!("Решение:  не найдено"),
+        match (sol, &self.sol) {
+            (Some(d), Some(Ok(s))) => {
+                let note = match &self.registry_name {
+                    Some(_) => format!(" (в solution.toml — «{}»)", s.name),
+                    None => String::new(),
+                };
+                println!(
+                    "Решение:  «{}» ({}) — {d}{note}",
+                    name.unwrap_or(&s.name),
+                    s.id
+                );
+            }
+            (Some(d), Some(Err(e))) => println!("Решение:  {d} — не читается: {e}"),
+            _ => println!("Решение:  не найдено"),
         }
         if let Some(r) = &self.role {
             println!("Роль в решении: {r}");

@@ -39,6 +39,7 @@ pub const FEATURES: &[&str] = &[
     "idempotent_nodes",
     "mcp_session_arg",
     "idea_review",
+    "vault_move",
 ];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {

@@ -588,3 +588,500 @@ fn insight_feedback_counts() {
         Some(0)
     );
 }
+
+/// `zam insight triggers <id> [--trigger ВИД:ШАБЛОН]… [--clear]` (M6.6 §8, замечание 13): набор
+/// заменяется целиком без замещения записи — `PATCH {triggers}` с `If-Match` ревизии из `GET`;
+/// `--clear` снимает все. Вывод — `<id>@<rev> триггеров K` и строки `триггер: вид:шаблон`, как в
+/// `insight show`. Ни `--trigger`, ни `--clear`, оба вместе, неверный триггер — код 6 до
+/// запроса.
+#[test]
+fn insight_triggers_replace_and_clear() {
+    let (url, tok) = start("triggers");
+    let r = tmp("triggers-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "LF в shell",
+            "--scope",
+            "global",
+            "--trigger",
+            "file_glob:**/*",
+        ],
+        "CRLF ломает shebang.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    let o = z(&[
+        "insight",
+        "triggers",
+        &format!("i:{id}"),
+        "--trigger",
+        "file_glob:**/*.sh",
+        "--trigger",
+        "error_regex:bad interpreter: /bin/bash",
+    ]);
+    // триггеры в ревизию записи не входят (M3): ревизия та же
+    assert_eq!(
+        ok(&o),
+        format!(
+            "{id}@1 триггеров 2\nтриггер: file_glob:**/*.sh\n\
+             триггер: error_regex:bad interpreter: /bin/bash\n"
+        )
+    );
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["rev"], 1, "{e}");
+    assert_eq!(e["status"], "active", "запись не замещена: {e}");
+    assert_eq!(e["triggers"][0]["pattern"], "**/*.sh", "{e}");
+    assert_eq!(e["triggers"][1]["type"], "error_regex", "{e}");
+    assert_eq!(e["triggers"].as_array().unwrap().len(), 2, "{e}");
+    let o = z(&["insight", "triggers", &id, "--clear"]);
+    assert_eq!(ok(&o), format!("{id}@1 триггеров 0\n"));
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["triggers"], serde_json::json!([]), "{e}");
+    let j = json(&z(&[
+        "insight",
+        "triggers",
+        &id,
+        "--trigger",
+        "keyword:crlf",
+        "--json",
+    ]));
+    assert_eq!(
+        (&j["rev"], &j["triggers"][0]["pattern"]),
+        (&serde_json::json!(1), &serde_json::json!("crlf"))
+    );
+    // ошибки разбора — код 6 до запроса: недоступный адрес не мешает
+    for args in [
+        vec!["insight", "triggers", "01E"],
+        vec![
+            "insight",
+            "triggers",
+            "01E",
+            "--clear",
+            "--trigger",
+            "keyword:x",
+        ],
+        vec!["insight", "triggers", "01E", "--trigger", "glob:*.sh"],
+    ] {
+        let o = zam("http://127.0.0.1:9", "t", &r, &args, b"");
+        assert_eq!(o.status.code(), Some(6), "{args:?}: {}", err(&o));
+    }
+}
+
+/// `zam insight triggers` берёт ревизию из `GET /entries/{id}` и шлёт `If-Match` с ней; запись
+/// изменилась между чтением и правкой (409) — код 4, как у `certify`.
+#[test]
+fn insight_triggers_sends_if_match() {
+    let (url, seen) = fake_entry_server(
+        200,
+        r#"{"id":"01E","rev":4,"status":"active","triggers":[]}"#,
+    );
+    let r = tmp("triggers-if-match");
+    let o = zam(
+        &url,
+        "t",
+        &r,
+        &["insight", "triggers", "01E", "--clear"],
+        b"",
+    );
+    assert_eq!(ok(&o), "01E@4 триггеров 0\n");
+    let seen = seen.lock().unwrap().clone();
+    let patch: Vec<&Seen> = seen.iter().filter(|s| s.0 == "PATCH").collect();
+    assert_eq!(patch.len(), 1, "{seen:?}");
+    assert_eq!(patch[0].1, "/api/v1/entries/01E");
+    assert_eq!(patch[0].2.as_deref(), Some("\"3\""), "{seen:?}");
+    let (url, _) = fake_entry_server(
+        409,
+        r#"{"type":"/problems/conflict","title":"Conflict","status":409,"detail":"ревизия записи 5, а не 3","rev":5}"#,
+    );
+    let o = zam(
+        &url,
+        "t",
+        &r,
+        &["insight", "triggers", "01E", "--clear"],
+        b"",
+    );
+    assert_eq!(o.status.code(), Some(4), "{}", err(&o));
+    assert!(
+        err(&o).contains("запись изменилась (rev 3 → 5): перечитайте"),
+        "{}",
+        err(&o)
+    );
+}
+
+/// REST-запрос теста к серверу без системного прокси: код и JSON ответа (`Null` — не JSON).
+fn rest(url: &str, tok: &str, path: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
+    let a = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut r = a
+        .post(format!("{url}/api/v1{path}"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .content_type("application/json")
+        .send(body.to_string())
+        .unwrap_or_else(|e| panic!("POST {path}: {e}"));
+    let code = r.status().as_u16();
+    let text = r.body_mut().read_to_string().unwrap_or_default();
+    (code, serde_json::from_str(&text).unwrap_or_default())
+}
+
+/// Id записей выдачи `POST /search` (`entry_id` карточки записи или `id`).
+fn search_ids(v: &serde_json::Value) -> Vec<String> {
+    v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i["entry_id"].as_str().or(i["id"].as_str()))
+        .map(String::from)
+        .collect()
+}
+
+/// M6.6 §9 (замечание 8): флаги полей решения `zam log insight --kind decision` → `data.decision`
+/// со всеми полями; фильтр поиска `filters.decided_by` находит запись; у `insight supersede` без
+/// `--kind` флаги решения принимаются, когда замещаемая запись — решение.
+#[test]
+fn log_insight_decision_flags() {
+    let (url, tok) = start("decision-flags");
+    let r = tmp("decision-flags-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "decision",
+            "--title",
+            "Кэш сборки: sccache",
+            "--scope",
+            "global",
+            "--context",
+            "Сборка идёт 20 минут",
+            "--option",
+            "ccache",
+            "--option",
+            "без кэша",
+            "--chosen",
+            "sccache",
+            "--rationale",
+            "Работает с MSVC",
+            "--consequences",
+            "Нужен каталог кэша",
+            "--decided-by",
+            "human",
+            "--revisit-if",
+            "Появится удалённый кэш",
+        ],
+        "Кэш сборки ускоряет повторную сборку.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["data"]["kind"], "decision", "{e}");
+    assert_eq!(
+        e["data"]["decision"],
+        serde_json::json!({
+            "context": "Сборка идёт 20 минут",
+            "options": ["ccache", "без кэша"],
+            "chosen": "sccache",
+            "rationale": "Работает с MSVC",
+            "consequences": "Нужен каталог кэша",
+            "decided_by": "human",
+            "revisit_if": "Появится удалённый кэш"
+        }),
+        "{e}"
+    );
+    // поиск с фильтром decided_by: human находит, agent — нет
+    let search = |by: &str| {
+        let (c, v) = rest(
+            &url,
+            &tok,
+            "/search",
+            &serde_json::json!({"query": "кэш сборки", "top_k": 20,
+                                "filters": {"decided_by": by}}),
+        );
+        assert_eq!(c, 200, "{v}");
+        search_ids(&v)
+    };
+    assert!(search("human").contains(&id), "{:?}", search("human"));
+    assert!(!search("agent").contains(&id), "{:?}", search("agent"));
+
+    // замещение решения без --kind: вид — у старой записи (decision), флаги решения приняты
+    let o = z(&[
+        "insight",
+        "supersede",
+        &id,
+        "--title",
+        "Кэш сборки: sccache с удалённым хранилищем",
+        "--chosen",
+        "sccache + S3",
+        "--decided-by",
+        "agent",
+    ]);
+    let s = ok(&o);
+    assert!(s.contains(&format!("(замещает {id})")), "{s}");
+    let n = json(&z(&["insight", "show", &id_of(&s), "--json"]));
+    assert_eq!(n["data"]["kind"], "decision", "{n}");
+    assert_eq!(
+        n["data"]["decision"],
+        serde_json::json!({"chosen": "sccache + S3", "decided_by": "agent"}),
+        "{n}"
+    );
+}
+
+/// M6.6 §9: флаги решения — только у `--kind decision` (у замещения без `--kind` — вид старой
+/// записи), иначе код 6 до записи; больше 8 `--option` — код 6 до любого запроса.
+#[test]
+fn decision_flags_need_kind_decision() {
+    let r = tmp("decision-kind-repo");
+    let mut many: Vec<String> = Vec::new();
+    for i in 1..=9 {
+        many.push("--option".into());
+        many.push(format!("вариант {i}"));
+    }
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let log = |kind: &'static str| -> Vec<&'static str> {
+        vec![
+            "log", "insight", "--kind", kind, "--title", "Т", "--scope", "global",
+        ]
+    };
+    let cases: Vec<Vec<&str>> = vec![
+        [&log("gotcha")[..], &["--chosen", "x"]].concat(),
+        [
+            &log("pattern")[..],
+            &["--context", "к", "--revisit-if", "п"],
+        ]
+        .concat(),
+        [&log("decision")[..], &many].concat(),
+        [&["insight", "supersede", "01E", "--title", "Т"][..], &many].concat(),
+    ];
+    // до запроса: недоступный адрес не мешает — код 6, а не 2
+    for args in &cases {
+        let o = zam("http://127.0.0.1:9", "t", &r, args, b"");
+        assert_eq!(o.status.code(), Some(6), "{args:?}: {}", err(&o));
+    }
+    let o = zam("http://127.0.0.1:9", "t", &r, &cases[0], b"");
+    assert!(
+        err(&o).contains("--chosen") && err(&o).contains("--kind decision"),
+        "{}",
+        err(&o)
+    );
+    let o = zam("http://127.0.0.1:9", "t", &r, &cases[2], b"");
+    assert!(err(&o).contains("не больше 8"), "{}", err(&o));
+
+    // замещение не-решения без --kind: вид старой записи — gotcha, код 6, запись не замещена
+    let (url, tok) = start("decision-kind");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let id = id_of(&ok(&z(&[
+        "log",
+        "insight",
+        "--kind",
+        "gotcha",
+        "--title",
+        "LF в shell-скриптах",
+        "--scope",
+        "global",
+    ])));
+    let o = z(&[
+        "insight",
+        "supersede",
+        &id,
+        "--title",
+        "LF в shell-скриптах: уточнение",
+        "--rationale",
+        "r",
+    ]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    assert!(
+        err(&o).contains("--rationale") && err(&o).contains("gotcha"),
+        "{}",
+        err(&o)
+    );
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["status"], "active", "запись не замещена: {e}");
+    // явный --kind decision у замещения — флаги приняты
+    let o = z(&[
+        "insight",
+        "supersede",
+        &id,
+        "--kind",
+        "decision",
+        "--title",
+        "LF в shell-скриптах: решение",
+        "--chosen",
+        "LF везде",
+    ]);
+    let n = json(&z(&["insight", "show", &id_of(&ok(&o)), "--json"]));
+    assert_eq!(n["data"]["kind"], "decision", "{n}");
+    assert_eq!(n["data"]["decision"]["chosen"], "LF везде", "{n}");
+}
+
+/// M6.6 §9: доказательство без файла — `--evidence-checked`, `--evidence-method`,
+/// `--evidence-result` (все три вместе) → `data.evidence`; с `--evidence-file` — конфликт.
+#[test]
+fn log_insight_evidence_flags() {
+    let (url, tok) = start("evidence-flags");
+    let r = tmp("evidence-flags-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let base = [
+        "log",
+        "insight",
+        "--kind",
+        "discovery",
+        "--title",
+        "sccache ускоряет сборку вдвое",
+        "--scope",
+        "global",
+    ];
+    let ev = [
+        "--evidence-checked",
+        "3 сборки",
+        "--evidence-method",
+        "чистая и повторная сборка",
+        "--evidence-result",
+        "20 мин → 9 мин",
+    ];
+    let id = id_of(&ok(&z(
+        &[&base[..], &["--certainty", "theorem"], &ev].concat()
+    )));
+    let e = json(&z(&["insight", "show", &id, "--json"]));
+    assert_eq!(e["certainty"], "theorem", "{e}");
+    assert_eq!(
+        e["data"]["evidence"],
+        serde_json::json!({"checked": "3 сборки", "method": "чистая и повторная сборка",
+                           "result": "20 мин → 9 мин"}),
+        "{e}"
+    );
+    // неполный набор и конфликт с файлом — код 6 до запроса
+    let f = r.join("ev.json");
+    std::fs::write(&f, r#"{"checked": "c", "method": "m", "result": "r"}"#).unwrap();
+    for extra in [
+        vec!["--evidence-checked", "c", "--evidence-method", "m"],
+        vec!["--evidence-result", "r"],
+        [&ev[..], &["--evidence-file", f.to_str().unwrap()]].concat(),
+    ] {
+        let args = [&base[..], &extra].concat();
+        let o = zam("http://127.0.0.1:9", "t", &r, &args, b"");
+        assert_eq!(o.status.code(), Some(6), "{extra:?}: {}", err(&o));
+    }
+}
+
+/// Строка stderr об умолчании агента (M6.6 §9, замечание 8).
+const DEFAULT_NOTE: &str =
+    "certainty: hypothesis (умолчание агента; проверено — --certainty theorem и доказательство)";
+
+/// M6.6 §9: без `--certainty` у `log insight` и `insight supersede` — строка в stderr об
+/// умолчании `hypothesis`; stdout `<id>@<rev>` прежний; с явным `--certainty` строки нет.
+#[test]
+fn log_insight_notes_default_hypothesis() {
+    let (url, tok) = start("default-hypothesis");
+    let r = tmp("default-hypothesis-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let log = |title: &str, extra: &[&str]| {
+        let mut a = vec![
+            "log", "insight", "--kind", "pattern", "--title", title, "--scope", "global",
+        ];
+        a.extend_from_slice(extra);
+        z(&a)
+    };
+    let o = log("Скрипты сборки — в xtask", &[]);
+    let s = ok(&o);
+    let id = id_of(&s);
+    assert_eq!(s, format!("{id}@1\n"), "stdout прежний");
+    assert_eq!(id.len(), 26, "{s}");
+    assert!(
+        err(&o).lines().any(|l| l == DEFAULT_NOTE),
+        "stderr: {}",
+        err(&o)
+    );
+    let o = log("Тесты — рядом с кодом", &["--certainty", "hypothesis"]);
+    ok(&o);
+    assert!(!err(&o).contains("certainty:"), "{}", err(&o));
+    // замещение без --certainty — та же строка; stdout прежний
+    let o = z(&[
+        "insight",
+        "supersede",
+        &id,
+        "--title",
+        "Скрипты сборки и выпуска — в xtask",
+    ]);
+    let s = ok(&o);
+    assert!(s.ends_with(&format!("@1 (замещает {id})\n")), "{s}");
+    assert!(
+        err(&o).lines().any(|l| l == DEFAULT_NOTE),
+        "stderr: {}",
+        err(&o)
+    );
+}
+
+/// M6.6 §9 (16г): лента insight по умолчанию — страница сервера (50) и строка stderr
+/// «показано N, есть ещё: --limit 200 или --all»; `--all` — вся лента обходом `next_cursor`;
+/// `--limit` и `--all` — конфликт (код 6); `--knowledge` — синоним `--global`.
+#[test]
+fn insight_list_more_hint_and_all() {
+    let (url, tok) = start("list-all");
+    let r = tmp("list-all-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    for i in 0..61 {
+        let (c, v) = rest(
+            &url,
+            &tok,
+            "/spaces/knowledge/entries",
+            &serde_json::json!({"kind": "insight", "title": format!("Приём номер {i:02}"),
+                                "body": "", "data": {"kind": "pattern"}, "scope": "global",
+                                "force": true}),
+        );
+        assert_eq!(c, 201, "{v}");
+    }
+    let lines = |o: &Output| ok(o).lines().count();
+    let o = z(&["insight", "list", "--global"]);
+    assert_eq!(lines(&o), 50, "{}", out(&o));
+    assert_eq!(
+        err(&o),
+        "показано 50, есть ещё: --limit 200 или --all\n",
+        "{}",
+        err(&o)
+    );
+    let o = z(&["insight", "list", "--global", "--all"]);
+    assert_eq!(lines(&o), 61, "{}", out(&o));
+    assert!(!err(&o).contains("есть ещё"), "{}", err(&o));
+    let j = json(&z(&["insight", "list", "--knowledge", "--all", "--json"]));
+    assert_eq!(j["items"].as_array().unwrap().len(), 61, "{j}");
+    assert!(j["next_cursor"].is_null(), "{j}");
+    let ids: std::collections::BTreeSet<&str> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert_eq!(ids.len(), 61, "без повторов между страницами");
+    let o = z(&["insight", "list", "--global", "--limit", "10"]);
+    assert_eq!(lines(&o), 10, "{}", out(&o));
+    assert!(
+        err(&o).contains("показано 10, есть ещё: --limit 200 или --all"),
+        "{}",
+        err(&o)
+    );
+    let o = z(&["insight", "list", "--knowledge", "--limit", "61"]);
+    assert_eq!(lines(&o), 61, "{}", out(&o));
+    assert!(err(&o).is_empty(), "{}", err(&o));
+    let o = zam(
+        "http://127.0.0.1:9",
+        "t",
+        &r,
+        &["insight", "list", "--global", "--all", "--limit", "5"],
+        b"",
+    );
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+}

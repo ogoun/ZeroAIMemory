@@ -19,7 +19,7 @@
 //!   ([`on_entry_deleted_tx`]);
 //! - отбор для проактивности: [`proactive_ideas`] и предикат [`idea_candidate`] (§6).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use jiff::civil::Date;
 use jiff::{Span, Timestamp};
@@ -133,6 +133,10 @@ pub enum IdeaPriority {
 }
 
 impl IdeaPriority {
+    /// Все значения (для SQL по [`IdeaPriority::rank`], M6.6 §4.2).
+    pub const ALL: [IdeaPriority; 3] =
+        [IdeaPriority::Low, IdeaPriority::Normal, IdeaPriority::High];
+
     pub fn as_str(self) -> &'static str {
         match self {
             IdeaPriority::Low => "low",
@@ -2666,6 +2670,44 @@ pub async fn review_queue(
             usize::try_from(n).unwrap_or(0),
             rows.collect::<Result<_, _>>()?,
         ))
+    })
+    .await
+}
+
+/// Очередь разбора без показанного (M6.6 §3.5, строка очереди к `prompt`): идеи очереди
+/// [`review_queue`] пространства `space` в её порядке (`high` первыми, затем самые старые), не
+/// показанные в их текущей ревизии — `seen`: id → наибольшая выданная ревизия (показ сессии в
+/// текущей эпохе); показ прежней ревизии не считается (идея, вернувшаяся в `new` новой
+/// ревизией, снова непоказана). Итог — id всех таких идей и записи первых `take` из них. Одно
+/// чтение: id и ревизии очереди без тел, записи — только первых `take`; id вне очереди в `seen`
+/// ничего не меняют.
+pub async fn review_queue_unseen(
+    db: &Db,
+    space: Id,
+    seen: &HashMap<Id, i64>,
+    take: usize,
+) -> Result<(Vec<Id>, Vec<Entry>), StoreError> {
+    let seen = seen.clone();
+    db.read(move |c| {
+        let rows: Vec<(Id, i64)> = {
+            let mut st = c.prepare_cached(&format!(
+                "SELECT e.id, e.current_rev {REVIEW_QUEUE_SQL}
+                 ORDER BY {PRIORITY_DESC}, e.created_at, e.id"
+            ))?;
+            let rows = st.query_map([space], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let unseen: Vec<Id> = rows
+            .into_iter()
+            .filter(|(id, rev)| seen.get(id).is_none_or(|s| s < rev))
+            .map(|(id, _)| id)
+            .collect();
+        let head = unseen
+            .iter()
+            .take(take)
+            .map(|id| load_entry(c, *id))
+            .collect::<Result<_, _>>()?;
+        Ok((unseen, head))
     })
     .await
 }

@@ -88,7 +88,11 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # Распакованные зависимости (штампы <имя>.sha256) и модели; ключ — хэш манифестов deploy/*.toml.
+      # Распакованные зависимости (штампы <имя>.sha256) и модели; ключ — хэш только манифестов
+      # зависимостей и моделей (onnxruntime, onnxruntime-gpu, cuda, models, pdfium, qdrant):
+      # deploy/config.example.toml в ключ не входит — правка примера конфига кэш не сбрасывает.
+      # restore-keys: при новом хэше берётся последний кэш платформы — fetch-deps и fetch-models
+      # сверяют sha256 с манифестами и докачивают только несовпавшее.
       # Шаг идёт после rust-cache: его post-шаг сохраняет кэш раньше, чем rust-cache чистит target/.
       - name: кэш зависимостей и моделей
         uses: actions/cache@v4
@@ -98,7 +102,9 @@ jobs:
             target/models
           # v3: fetch-models --test качает ещё tokenizers/bge-m3-int8 (задача 11 M4) — новый
           # ключ, иначе восстановленный кэш без токенизатора не пересохранялся бы
-          key: deps-models-v3-${{ matrix.platform }}-${{ hashFiles('deploy/*.toml') }}
+          key: deps-models-v3-${{ matrix.platform }}-${{ hashFiles('deploy/onnxruntime.toml', 'deploy/onnxruntime-gpu.toml', 'deploy/cuda.toml', 'deploy/models.toml', 'deploy/pdfium.toml', 'deploy/qdrant.toml') }}
+          restore-keys: |
+            deps-models-v3-${{ matrix.platform }}-
       - name: fetch-deps
         run: cargo xtask fetch-deps --platform ${{ matrix.platform }}
       - name: fetch-models

@@ -1,6 +1,7 @@
-//! `zam vault list|get|set` против настоящего zam-server в том же процессе тестов (§7.6,
-//! §13.2): значение — только из stdin, `get --raw` — ровно значение без перевода строки,
-//! Vault решения из `solution.toml`, повторный `set` — новая ревизия.
+//! `zam vault list|get|set|rm|rename|mv` против настоящего zam-server в том же процессе тестов
+//! (§7.6, §13.2; M6.6 §7): значение — только из stdin, `get --raw` — ровно значение без перевода
+//! строки, Vault решения из `solution.toml`, повторный `set` — новая ревизия; синонимы `add` и
+//! `delete` в справке, перенос между областями, старый сервер без `vault_move`.
 mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -250,4 +251,313 @@ fn vault_add_host_without_secret() {
         b"",
     );
     assert_ne!(o.status.code(), Some(0));
+}
+
+// ---- M6.6 §7 (задача 6): синонимы, удаление, переименование, перенос между областями ----
+
+fn err(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// Каталог проекта с `solution.toml` решения [`G`] с именем `name`.
+fn repo(dir: &str, name: &str) -> PathBuf {
+    let r = tmp(dir);
+    std::fs::create_dir_all(r.join(".zeroaimemory")).unwrap();
+    std::fs::write(
+        r.join(".zeroaimemory").join("solution.toml"),
+        format!("agent_solution_id = \"{G}\"\nname = \"{name}\"\n"),
+    )
+    .unwrap();
+    r
+}
+
+/// Строка справки `zam vault --help` с подкомандой `cmd`.
+fn help_line(help: &str, cmd: &str) -> String {
+    help.lines()
+        .find(|l| l.trim_start().starts_with(&format!("{cmd} ")))
+        .unwrap_or_else(|| panic!("нет {cmd} в справке:\n{help}"))
+        .to_string()
+}
+
+/// Замечание 6: `add` — видимый синоним `set` в `zam vault --help`; `rm` — с видимым синонимом
+/// `delete`; `rename` и `mv` есть в справке.
+#[test]
+fn vault_help_shows_add_alias() {
+    let o = common::zam_cmd()
+        .args(["vault", "--help"])
+        .write_stdin(Vec::new())
+        .output()
+        .unwrap();
+    let help = ok(&o);
+    assert!(help_line(&help, "set").contains("add"), "{help}");
+    assert!(help_line(&help, "rm").contains("delete"), "{help}");
+    help_line(&help, "rename");
+    help_line(&help, "mv");
+}
+
+/// Замечание 7: `zam vault rename <имя> <новое>` — новая ревизия с `If-Match`, значение то же,
+/// занятое имя — код 4 «имя занято» (запись прежняя), нет записи — код 5; `zam vault rm <имя>`
+/// (синоним `delete`) удаляет мягко: записи нет в списке, имя свободно.
+#[test]
+fn vault_rm_and_rename() {
+    let (url, tok) = start("rm-rename");
+    let r = tmp("repo-rm");
+    let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
+    let v = format!("ghp_{}{}", "cli", "Rename-1");
+    ok(&z(
+        &["vault", "set", "github", "--type", "token", "--global"],
+        v.as_bytes(),
+    ));
+    ok(&z(
+        &["vault", "set", "gitlab", "--type", "token", "--global"],
+        b"other-value",
+    ));
+    let s = ok(&z(
+        &["vault", "rename", "github", "gh-main", "--global"],
+        b"",
+    ));
+    assert!(s.trim().ends_with("@2"), "{s}");
+    assert_eq!(
+        ok(&z(&["vault", "get", "gh-main", "--global", "--raw"], b"")),
+        v
+    );
+    let o = z(&["vault", "get", "github", "--global"], b"");
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    let o = z(&["vault", "rename", "gh-main", "gitlab", "--global"], b"");
+    assert_eq!(o.status.code(), Some(4), "{}", err(&o));
+    assert!(err(&o).contains("имя занято"), "{}", err(&o));
+    assert_eq!(
+        ok(&z(&["vault", "get", "gh-main", "--global", "--raw"], b"")),
+        v
+    );
+    let o = z(&["vault", "rename", "missing", "x", "--global"], b"");
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    // то же имя — без новой ревизии, строка в stderr (ревью задачи 6, M4)
+    let o = z(&["vault", "rename", "gh-main", "gh-main", "--global"], b"");
+    assert!(ok(&o).trim().ends_with("@2"), "{}", out(&o));
+    assert!(err(&o).contains("без изменений"), "{}", err(&o));
+    // rm и синоним delete
+    let s = ok(&z(&["vault", "rm", "gh-main", "--global"], b""));
+    assert!(s.contains("удалена"), "{s}");
+    let l = ok(&z(&["vault", "list", "--global"], b""));
+    assert!(!l.contains("gh-main") && l.contains("gitlab"), "{l}");
+    ok(&z(&["vault", "delete", "gitlab", "--global"], b""));
+    assert!(
+        ok(&z(&["vault", "list", "--global"], b""))
+            .trim()
+            .is_empty()
+    );
+    let o = z(&["vault", "rm", "gitlab", "--global"], b"");
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    // имя освободилось
+    let s = ok(&z(
+        &["vault", "set", "gitlab", "--type", "token", "--global"],
+        b"again",
+    ));
+    assert!(s.trim().ends_with("@1"), "{s}");
+}
+
+/// Замечание 25: `zam vault mv <имя> --to global` переносит запись Vault решения в личный Vault
+/// (`<id>@<rev+1>`, значение то же); откуда — `--global`/`--solution`, `--to solution` — решение
+/// из `solution.toml`, `--to <GUID>` — решение по GUID; та же область — без ревизии; неверная
+/// цель — код 6 до запроса; занятое в цели имя — код 4.
+#[test]
+fn vault_mv_to_global() {
+    let (url, tok) = start("mv");
+    let r = repo("repo-mv", "Проект");
+    let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
+    let v = format!("ghp_{}{}", "cli", "Move-1");
+    let s = ok(&z(
+        &["vault", "set", "deploy", "--type", "token"],
+        v.as_bytes(),
+    ));
+    assert!(s.trim().ends_with("@1"), "{s}");
+    let s = ok(&z(&["vault", "mv", "deploy", "--to", "global"], b""));
+    assert!(s.trim().ends_with("@2"), "{s}");
+    assert_eq!(
+        ok(&z(&["vault", "get", "deploy", "--global", "--raw"], b"")),
+        v
+    );
+    let o = z(&["vault", "get", "deploy"], b"");
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    let s = ok(&z(
+        &["vault", "mv", "deploy", "--global", "--to", "solution"],
+        b"",
+    ));
+    assert!(s.trim().ends_with("@3"), "{s}");
+    assert_eq!(ok(&z(&["vault", "get", "deploy", "--raw"], b"")), v);
+    // та же область по GUID — без новой ревизии
+    let o = z(&["vault", "mv", "deploy", "--solution", G, "--to", G], b"");
+    assert!(ok(&o).trim().ends_with("@3"), "{}", out(&o));
+    assert!(err(&o).contains("без изменений"), "{}", err(&o));
+    let o = z(&["vault", "mv", "deploy", "--to", "rules"], b"");
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    // в личном Vault имя занято — код 4, запись в решении
+    ok(&z(
+        &["vault", "set", "deploy", "--type", "token", "--global"],
+        b"personal",
+    ));
+    let o = z(&["vault", "mv", "deploy", "--to", "global"], b"");
+    assert_eq!(o.status.code(), Some(4), "{}", err(&o));
+    assert_eq!(ok(&z(&["vault", "get", "deploy", "--raw"], b"")), v);
+}
+
+/// Старый сервер (§7): 404 на `POST /vault/{id}/move`, а в `GET /health` `features` нет
+/// `vault_move` (или нет самого поля) — код 1 и текст §7; сервер с флагом и 404 — код 5.
+#[test]
+fn vault_mv_old_server() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    const OLD: &str =
+        "сервер не поддерживает перенос записей Vault: нужен zam-server 0.0.13-m6.6 или новее";
+    const ID: &str = "01M7JRWG4KE4STDJNSVSZM86EV";
+    let dir = tmp("repo-mv-old");
+    let not_found =
+        r#"{"type":"about:blank","title":"Not Found","status":404,"detail":"ресурс не найден"}"#;
+    let stub = |health: &'static str| {
+        common::stub_with(Arc::new(move |_: &str, p: &str, _: usize| {
+            if p == "/api/v1/health" {
+                (200, health, Duration::ZERO)
+            } else if p.starts_with("/api/v1/spaces/knowledge/vault") {
+                (
+                    200,
+                    r#"{"items":[{"id":"01M7JRWG4KE4STDJNSVSZM86EV","title":"github","rev":1,
+                        "data":{"type":"token"},"space":"knowledge"}],"locked":false}"#,
+                    Duration::ZERO,
+                )
+            } else {
+                (404, not_found, Duration::ZERO)
+            }
+        }))
+    };
+    let mv = ["vault", "mv", "github", "--global", "--to", G];
+    let run = |url: &str| {
+        common::zam_cmd()
+            .env("ZAM_URL", url)
+            .env("ZAM_TOKEN", "t")
+            .env("HOME", &dir)
+            .env("USERPROFILE", &dir)
+            .current_dir(&dir)
+            .args(mv)
+            .write_stdin(Vec::new())
+            .output()
+            .unwrap()
+    };
+    let move_path = format!("/api/v1/vault/{ID}/move");
+    for health in [
+        r#"{"status":"ok","version":"0.0.12-m6.5","features":["m6","idea_review"]}"#,
+        r#"{"status":"ok","version":"0.0.10-m5.7"}"#,
+    ] {
+        let (url, seen) = stub(health);
+        let o = run(&url);
+        assert_eq!(o.status.code(), Some(1), "{health}: {}", err(&o));
+        assert_eq!(err(&o).trim(), OLD, "{health}");
+        let reqs: Vec<(String, String)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(m, p, _)| (m.clone(), p.clone()))
+            .collect();
+        assert!(
+            reqs.contains(&("POST".into(), move_path.clone()))
+                && reqs.contains(&("GET".into(), "/api/v1/health".into())),
+            "{reqs:?}"
+        );
+    }
+    let (url, _) =
+        stub(r#"{"status":"ok","version":"0.0.13-m6.6","features":["m6","vault_move"]}"#);
+    let o = run(&url);
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    assert!(
+        err(&o).contains("ресурс не найден") && !err(&o).contains("не поддерживает"),
+        "{}",
+        err(&o)
+    );
+}
+
+/// Замечание 25: `zam vault set --type host|environment` без области — строка в stderr о Vault
+/// решения и `--global`; с `--global`, `--solution` и у прочих типов строки нет; stdout —
+/// по-прежнему `<id>@<rev>`. Финальное ревью M6.6, Minor 9: строка — только при создании
+/// записи (новая ревизия — без неё), имя записи в `zam vault mv` — в кавычках; без имени решения
+/// имя записи вместо него не подставляется.
+#[test]
+fn vault_set_host_hints_global() {
+    let (url, tok) = start("hint");
+    let r = repo("repo-hint", "Проект");
+    let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
+    let hint = |name: &str| {
+        format!(
+            "записано в Vault решения «Проект»; общий для проектов — --global (перенести: zam vault mv \"{name}\" --to global)"
+        )
+    };
+    // имя с пробелом — команда переноса из строки работает и в оболочке
+    for (name, ty) in [
+        ("stage", "host"),
+        ("bench", "environment"),
+        ("lab box", "host"),
+    ] {
+        let o = z(
+            &["vault", "set", name, "--type", ty, "--purpose", "стенд"],
+            b"",
+        );
+        assert!(ok(&o).trim().ends_with("@1"), "{}", out(&o));
+        assert!(
+            err(&o).lines().any(|l| l == hint(name)),
+            "{ty}: {}",
+            err(&o)
+        );
+    }
+    // новая ревизия существующей записи — без строки: запись уже там, куда её положили
+    let o = z(
+        &[
+            "vault",
+            "set",
+            "stage",
+            "--type",
+            "host",
+            "--purpose",
+            "стенд 2",
+        ],
+        b"",
+    );
+    assert!(ok(&o).trim().ends_with("@2"), "{}", out(&o));
+    assert!(!err(&o).contains("записано в Vault"), "{}", err(&o));
+    // пустое имя решения: `zam` отказывает до запроса («name не задан»), имя записи в совет не
+    // подставляется; текст без имени решения (`global_hint(None, …)`) — модульный тест
+    // `cmd::vault::tests::move_texts`
+    let bare = tmp("repo-hint-bare");
+    std::fs::create_dir_all(bare.join(".zeroaimemory")).unwrap();
+    std::fs::write(
+        bare.join(".zeroaimemory").join("solution.toml"),
+        format!("agent_solution_id = \"{G}\"\nname = \"\"\n"),
+    )
+    .unwrap();
+    let o = zam(
+        &url,
+        &tok,
+        &bare,
+        &["vault", "set", "edge", "--type", "host"],
+        b"",
+    );
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(
+        err(&o).contains("name не задан") && !err(&o).contains("записано в Vault"),
+        "{}",
+        err(&o)
+    );
+    for args in [
+        &["vault", "set", "lan", "--type", "host", "--global"][..],
+        &["vault", "set", "lan2", "--type", "host", "--solution", G][..],
+    ] {
+        let o = z(args, b"");
+        ok(&o);
+        assert!(
+            !err(&o).contains("записано в Vault"),
+            "{args:?}: {}",
+            err(&o)
+        );
+    }
+    let o = z(&["vault", "set", "tok", "--type", "token"], b"value-1");
+    ok(&o);
+    assert!(!err(&o).contains("записано в Vault"), "{}", err(&o));
 }

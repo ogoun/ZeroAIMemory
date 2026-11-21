@@ -2,12 +2,13 @@
 //! нормализация ошибки инструмента ([`normalize_error`]), сопоставление `error_regex`
 //! ([`error_regex_matches`]), покрытие слов ошибки найденным текстом ([`error_terms`],
 //! [`term_coverage`], [`coverage_enough`] по правилу [`CoverageRule`]: слова как есть или
-//! основы [`StemWord`] — общий код с подсказками-идеями сервера, M6 §9), строка подсказки
-//! ([`hint_line`]) и упаковка дайджеста в бюджет токенов ([`pack_sections`]).
+//! основы [`StemWord`] — общий код с подсказками-идеями сервера, M6 §9), предметные слова
+//! запроса пользователя ([`subject_terms`], M6.6 §3.1), строка подсказки ([`hint_line`]) и
+//! упаковка дайджеста в бюджет токенов ([`pack_sections`]).
 //!
 //! Сервер собирает кандидатов (SQLite, поиск), здесь — только то, что от данных не зависит.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -300,6 +301,164 @@ pub fn stem_words(terms: &[String]) -> Vec<StemWord> {
         .collect()
 }
 
+/// Слова-реплики ru/en (M6.6 §3.1, замечание 17): согласие, понукание, благодарность — не
+/// предмет запроса. Сравниваются со словом запроса после [`norm_word`] **целиком**, без основ:
+/// основа «продол» съела бы «продолжительность». Слова короче трёх символов («да», «ок», «go»)
+/// отсекает уже [`error_terms`].
+pub const PROMPT_REPLY_WORDS: [&str; 65] = [
+    "согласен",
+    "согласна",
+    "согласны",
+    "хорошо",
+    "отлично",
+    "супер",
+    "давай",
+    "давайте",
+    "продолжай",
+    "продолжайте",
+    "продолжи",
+    "дальше",
+    "далее",
+    "делай",
+    "делайте",
+    "вперед",
+    "вперёд",
+    "поехали",
+    "погнали",
+    "понял",
+    "поняла",
+    "понятно",
+    "ясно",
+    "принято",
+    "верно",
+    "точно",
+    "конечно",
+    "угу",
+    "ага",
+    "окей",
+    "спасибо",
+    "годится",
+    "подходит",
+    "одобряю",
+    "начинай",
+    "запускай",
+    "готово",
+    "норм",
+    "нормально",
+    "правильно",
+    "именно",
+    "нет",
+    "yes",
+    "yep",
+    "yeah",
+    "sure",
+    "agreed",
+    "agree",
+    "okay",
+    "fine",
+    "great",
+    "good",
+    "thanks",
+    "thank",
+    "continue",
+    "proceed",
+    "next",
+    "lgtm",
+    "done",
+    "right",
+    "correct",
+    "exactly",
+    "please",
+    "ahead",
+    "approved",
+];
+
+/// Слово запроса (уже [`norm_word`]) — реплика [`PROMPT_REPLY_WORDS`].
+fn is_reply_word(w: &str) -> bool {
+    // множество нормализованных слов — один раз на процесс (`вперёд` и `вперед` — одно слово)
+    static SET: OnceLock<HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| PROMPT_REPLY_WORDS.iter().map(|w| norm_word(w)).collect())
+        .contains(w)
+}
+
+/// Предметные слова запроса пользователя (M6.6 §3.1): слова [`error_terms`] (от 3 символов,
+/// нижний регистр) → [`prepared_terms`] при [`WordMatch::Stems`] (без служебных слов ru/en,
+/// [`norm_word`], без повторов, по алфавиту) → без слов-реплик [`PROMPT_REPLY_WORDS`]. Пусто —
+/// запрос без предмета («согласен», «да, давай», «продолжай дальше»): сервер не ищет к нему
+/// подсказок.
+pub fn subject_terms(prompt: &str) -> Vec<String> {
+    let mut out = prepared_terms(&error_terms(prompt), WordMatch::Stems);
+    out.retain(|w| !is_reply_word(w));
+    out
+}
+
+/// Предметных слов ([`subject_terms`]), при которых запрос к подсказкам «короткий» (M6.6 §3.2,
+/// **[решение координатора]** — константа, не ключ конфигурации): у одного-двух слов векторный
+/// сигнал самый слабый, поэтому подсказка поиска — только с лексическим совпадением
+/// ([`PromptGate::admits_card`]), а подсказка-задача — только с покрытым заголовком (ревью задачи
+/// 2, M1).
+pub const PROMPT_SHORT_WORDS: usize = 2;
+
+/// Решение по запросу пользователя к подсказкам (`/recall` `prompt`, M6.6 §3.1–§3.3) — до
+/// поиска: одно правило для сервера и модели калибровки `xtask eval --hints` ([`prompt_gate`],
+/// отбор карточек — [`PromptGate::admits_card`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptGate {
+    /// Пересланное сообщение агента ([`zam_core::text::is_relayed_message`]) — тишина, без
+    /// строк словаря.
+    Relayed,
+    /// Предметных слов нет — только строки словаря (имя термина в запросе — уже предмет).
+    NoSubject,
+    /// Поиск подсказок: предметные слова и «короткий запрос» (`subject.len() <=`
+    /// [`PROMPT_SHORT_WORDS`]).
+    Search { subject: Vec<String>, short: bool },
+}
+
+impl PromptGate {
+    /// Карточка внутреннего поиска `/search` (JSON элемента `items`) может стать подсказкой
+    /// поиска: поиск идёт ([`PromptGate::Search`]) и запрос не короткий — или карточку нашёл
+    /// лексический канал ([`lexical_card`]). Порог балла и виды записей — у сервера.
+    pub fn admits_card(&self, card: &serde_json::Value) -> bool {
+        match self {
+            PromptGate::Search { short, .. } => !short || lexical_card(card),
+            PromptGate::Relayed | PromptGate::NoSubject => false,
+        }
+    }
+}
+
+/// Имена каналов карточки `/search` — её поле `sources` (нестроковые элементы пропускаются).
+pub fn card_sources(card: &serde_json::Value) -> impl Iterator<Item = &str> {
+    card["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+}
+
+/// Карточку `/search` нашёл лексический канал ([`crate::any_lexical`] по [`card_sources`]):
+/// короткий запрос подсказок ([`PromptGate::admits_card`]) и подтверждение подсказок-идей
+/// сервера (M6.6 §3.2).
+pub fn lexical_card(card: &serde_json::Value) -> bool {
+    crate::any_lexical(card_sources(card))
+}
+
+/// Правило тишины подсказок к запросу (M6.6 §3.1–§3.3). Пересланное сообщение — раньше всего и
+/// по всему `prompt` (тот же признак, что у хука `zam hook prompt`); предметные слова — по
+/// первым `head_chars` символам (запрос поиска подсказок, у сервера —
+/// `zam_store::search::QUERY_MAX_CHARS`); иначе — поиск с признаком короткого запроса.
+pub fn prompt_gate(prompt: &str, head_chars: usize) -> PromptGate {
+    if zam_core::text::is_relayed_message(prompt) {
+        return PromptGate::Relayed;
+    }
+    let head: String = prompt.chars().take(head_chars).collect();
+    let subject = subject_terms(&head);
+    if subject.is_empty() {
+        return PromptGate::NoSubject;
+    }
+    let short = subject.len() <= PROMPT_SHORT_WORDS;
+    PromptGate::Search { subject, short }
+}
+
 /// Порог покрытия слов запроса текстом записи у ослабленного FTS (любое слово):
 /// `need = clamp(⌈n / divisor⌉, 2, cap)`, не больше `n` — иначе общие слова ошибки («file»,
 /// «error») поднимали бы случайные записи, а длинная ошибка (stack trace) требовала бы от
@@ -445,7 +604,9 @@ pub fn hint_line(lead: &str, title: &str, tags: &[&str], reference: &str) -> Str
 }
 
 /// Раздел дайджеста: заголовок (строка `### …`, ставится, только если в раздел вошёл хоть
-/// один блок) и блоки — по одному на подсказку (строка и, возможно, строки с отступом).
+/// один блок, и не повторяется, если раздел предыдущего выведенного блока — с тем же
+/// заголовком: такой раздел продолжает его, M6.6 §4.2) и блоки — по одному на подсказку
+/// (строка и, возможно, строки с отступом).
 /// `reserved` — раздел-резерв (Rules дайджеста и пакета восстановления, M6 §8): выводится
 /// целиком сверх бюджета и в бюджете не считается.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,17 +674,25 @@ pub fn pack_sections(
 ) -> (String, Vec<(usize, usize)>) {
     let mut used = 0usize;
     let mut budgeted: Vec<(usize, usize)> = Vec::new();
-    for (si, sec) in sections.iter().enumerate().filter(|(_, s)| !s.reserved) {
-        let mut opened = false;
+    // раздел последнего выведенного блока (резерв выводится всегда): заголовок, совпавший с его
+    // заголовком, не выводится и не оплачивается — как в [`render`]
+    let mut last: Option<usize> = None;
+    for (si, sec) in sections.iter().enumerate() {
+        if sec.reserved {
+            if !sec.blocks.is_empty() {
+                last = Some(si);
+            }
+            continue;
+        }
         for (bi, block) in sec.blocks.iter().enumerate() {
-            let head = match (&sec.title, opened) {
-                (Some(t), false) => count(&format!("\n{t}\n")),
+            let head = match &sec.title {
+                Some(t) if !continues(sections, last, si) => count(&format!("\n{t}\n")),
                 _ => 0,
             };
             let cost = head + count(&format!("{block}\n"));
             if used + cost <= cap {
                 used += cost;
-                opened = true;
+                last = Some(si);
                 budgeted.push((si, bi));
             }
         }
@@ -612,13 +781,21 @@ pub fn reserved_text(sections: &[Section]) -> String {
     render(sections, &taken)
 }
 
+/// Блок раздела `si` идёт сразу за блоком раздела `last` и продолжает его: тот же раздел или
+/// раздел с тем же заголовком — заголовок `si` не выводится.
+fn continues(sections: &[Section], last: Option<usize>, si: usize) -> bool {
+    last.is_some_and(|l| l == si || sections[l].title == sections[si].title)
+}
+
 /// Текст вошедших блоков (см. [`pack_sections`]).
 fn render(sections: &[Section], taken: &[(usize, usize)]) -> String {
     let mut out = String::new();
     let mut last: Option<usize> = None;
     for &(si, bi) in taken {
         if last != Some(si) {
-            if let Some(t) = &sections[si].title {
+            if let Some(t) = &sections[si].title
+                && !continues(sections, last, si)
+            {
                 if !out.is_empty() {
                     out.push('\n');
                 }
@@ -926,5 +1103,157 @@ mod tests {
         let (text, taken) = pack_sections(&secs, 0, &words, &|_| true);
         assert_eq!(taken, [(1, 0), (1, 1)]);
         assert_eq!(text, "### R\nr1 r1 r1\nr2 r2\n");
+    }
+
+    /// M6.6 §4.2 (ревью задачи 3, M2): раздел с тем же заголовком, что у раздела предыдущего
+    /// выведенного блока, заголовок не повторяет и в бюджете его не оплачивает (продолжение
+    /// раздела); предыдущий не вывелся — заголовок у него свой; между ними другой раздел —
+    /// заголовок повторяется.
+    #[test]
+    fn pack_sections_same_title_continues_section() {
+        let words = |s: &str| s.split_whitespace().count();
+        let secs = vec![
+            Section::new(Some("### T".into()), vec!["t1 t1".into()]),
+            Section::new(Some("### T".into()), vec!["o1".into()]),
+            Section::new(None, vec!["p1".into()]),
+        ];
+        // «### T t1 t1» (4) + «o1» (1) + «p1» (1): заголовок второго раздела не оплачивается
+        let (text, taken) = pack_sections(&secs, 6, &words, &|_| true);
+        assert_eq!(taken, [(0, 0), (1, 0), (2, 0)]);
+        assert_eq!(text, "### T\nt1 t1\no1\np1\n");
+        // первый раздел не вошёл в бюджет — заголовок у второго
+        let mut big = secs.clone();
+        big[0].blocks = vec!["big ".repeat(50)];
+        let (text, taken) = pack_sections(&big, 6, &words, &|_| true);
+        assert_eq!(taken, [(1, 0), (2, 0)]);
+        assert_eq!(text, "### T\no1\np1\n");
+        // между ними другой выведенный раздел — заголовок повторяется
+        let secs3 = vec![
+            secs[0].clone(),
+            Section::new(Some("### U".into()), vec!["u1".into()]),
+            secs[1].clone(),
+        ];
+        let (text, _) = pack_sections(&secs3, 20, &words, &|_| true);
+        assert_eq!(text, "### T\nt1 t1\n\n### U\nu1\n\n### T\no1\n");
+    }
+
+    /// M6.6 §3.1 (замечание 17): реплики согласия и служебные слова — не предмет запроса;
+    /// реплики сравниваются целиком (без основ), предметное слово рядом с репликой остаётся.
+    #[test]
+    fn subject_terms_drop_replies_and_stops() {
+        for reply in [
+            "согласен",
+            "Да, давай",
+            "ok go",
+            "продолжай дальше",
+            "Согласен!",
+            "  ок, поехали  ",
+            "Вперёд",
+            "yes, please continue",
+            "LGTM",
+            "",
+        ] {
+            assert!(subject_terms(reply).is_empty(), "{reply:?}");
+        }
+        // служебные слова — тоже не предмет
+        assert!(subject_terms("что это так").is_empty());
+        // слова — в форме `prepared_terms` (нижний регистр, `ё` → `е`, без повторов, по алфавиту)
+        assert_eq!(
+            subject_terms("согласен, мигрируй 0026"),
+            ["0026", "мигрируй"]
+        );
+        assert_eq!(subject_terms("Давай Перенос перенос"), ["перенос"]);
+        // реплика — только целиком: основа «продол» не съедает предметное слово
+        assert_eq!(subject_terms("продолжительность"), ["продолжительность"]);
+        assert_eq!(subject_terms("продолжай индексацию"), ["индексацию"]);
+        // список реплик: нижний регистр, без повторов, только слова от 3 символов (короче
+        // `error_terms` и так отсекает)
+        let mut seen = std::collections::HashSet::new();
+        for w in PROMPT_REPLY_WORDS {
+            assert_eq!(w, w.to_lowercase(), "{w}");
+            assert!(w.chars().count() >= MIN_TERM_CHARS, "{w}");
+            assert!(w.chars().all(char::is_alphanumeric), "{w}");
+            assert!(seen.insert(w), "повтор {w}");
+            assert!(subject_terms(w).is_empty(), "{w}");
+        }
+    }
+
+    /// M6.6 §3.1–§3.3: правило тишины подсказок к запросу — одно для сервера и модели
+    /// калибровки (ревью задачи 2, I1). Пересланное сообщение — раньше всего (даже с предметом),
+    /// затем «нет предмета», затем граница короткого запроса `<= PROMPT_SHORT_WORDS`.
+    #[test]
+    fn prompt_gate_rules() {
+        // запрос поиска подсказок сервера — первые 512 символов промпта
+        const HEAD: usize = 512;
+        let gate = |p: &str| prompt_gate(p, HEAD);
+        let search = |p: &str| match gate(p) {
+            PromptGate::Search { subject, short } => Some((subject.len(), short)),
+            _ => None,
+        };
+        assert_eq!(
+            gate("[Subagent hand-back] квазар найден в каталоге"),
+            PromptGate::Relayed
+        );
+        assert_eq!(gate("\n<task-notification>"), PromptGate::Relayed);
+        // признак пересылки — по всему промпту, как у хука (ревью задачи 2, R2): маркер за
+        // пределом запроса поиска после ведущих пробелов — тоже пересланное сообщение
+        let far = format!("{}[Subagent hand-back] квазар", " ".repeat(HEAD + 10));
+        assert!(zam_core::text::is_relayed_message(&far));
+        assert_eq!(gate(&far), PromptGate::Relayed);
+        // предметные слова — только из первых `head_chars` символов
+        let tail = format!("{} квазар светит ярко", "да ".repeat(HEAD / 3 + 1));
+        assert_eq!(gate(&tail), PromptGate::NoSubject);
+        assert_eq!(gate("согласен"), PromptGate::NoSubject);
+        assert_eq!(gate("Да, давай, продолжай"), PromptGate::NoSubject);
+        assert_eq!(gate(""), PromptGate::NoSubject);
+        assert_eq!(
+            gate("согласен, мигрируй 0026"),
+            PromptGate::Search {
+                subject: vec!["0026".into(), "мигрируй".into()],
+                short: true
+            }
+        );
+        assert_eq!(search("квазар"), Some((1, true)));
+        assert_eq!(PROMPT_SHORT_WORDS, 2);
+        assert_eq!(search("квазар светит"), Some((2, true)));
+        assert_eq!(search("квазар светит ярко"), Some((3, false)));
+        // маркер не в начале — слова человека
+        assert_eq!(
+            search("посмотри [Subagent hand-back] квазар"),
+            Some((5, false))
+        );
+    }
+
+    /// Отбор карточек `/search` правилом тишины (ревью задачи 2, R1): реплика и пересланное —
+    /// ни одной; короткий запрос — только лексические (`fts`, `trigram`, `alias` в `sources`);
+    /// длинный — любые.
+    #[test]
+    fn prompt_gate_admits_cards() {
+        let card = |sources: serde_json::Value| serde_json::json!({"sources": sources});
+        let (vector, fts, trigram, alias, folder, odd, none) = (
+            card(serde_json::json!(["vector"])),
+            card(serde_json::json!(["vector", "fts"])),
+            card(serde_json::json!(["trigram"])),
+            card(serde_json::json!(["alias"])),
+            card(serde_json::json!(["vector", "folder"])),
+            card(serde_json::json!([1, null, "FTS"])),
+            serde_json::json!({}),
+        );
+        for c in [&fts, &trigram, &alias] {
+            assert!(lexical_card(c), "{c}");
+        }
+        for c in [&vector, &folder, &odd, &none] {
+            assert!(!lexical_card(c), "{c}");
+        }
+        assert_eq!(card_sources(&odd).collect::<Vec<_>>(), ["FTS"]);
+        let all = [&vector, &fts, &trigram, &alias, &folder, &odd, &none];
+        let admitted = |p: &str| -> usize {
+            let g = prompt_gate(p, 512);
+            all.iter().filter(|c| g.admits_card(c)).count()
+        };
+        assert_eq!(admitted("согласен"), 0);
+        assert_eq!(admitted("[Subagent hand-back] квазар светит ярко"), 0);
+        assert_eq!(admitted("квазар"), 3);
+        assert_eq!(admitted("квазар светит ярко"), all.len());
     }
 }

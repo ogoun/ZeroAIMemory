@@ -10,7 +10,9 @@
 //! Запись терминов — обычный `POST /spaces/{space}/entries` с `kind: "term"`
 //! ([`super::insights::create`]). Предупреждения [`alias_warnings`] идут в ответе записи
 //! заметки и записи журнала (кроме `term`): `warnings: ["term_alias: «summary» →
-//! «Выжимка»"]`; запись не отклоняется.
+//! «Выжимка»"]` — псевдоним в прозе, не в коде и не в идентификаторе, аббревиатура — в своём
+//! регистре (M6.6 §6). Ответ записи и правки `term` несёт [`broad_alias_warnings`]:
+//! `["term_alias_broad: «ok» — меньше 3 букв или цифр"]`. Запись не отклоняется.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
@@ -19,7 +21,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::{
-    Db, GlossaryEntry, active_terms, find_alias_uses, find_term, get_entry, glossary_version,
+    ALIAS_USES_MAX, BroadAlias, Db, GlossaryEntry, active_terms, broad_alias, find_alias_uses,
+    find_term, get_entry, glossary_version,
 };
 
 use super::insights::entry_json;
@@ -51,6 +54,26 @@ pub async fn alias_warnings(
         .into_iter()
         .map(|(alias, title)| format!("term_alias: «{alias}» → «{title}»"))
         .collect())
+}
+
+/// Предупреждения `term_alias_broad: «<псевдоним>» — <причина>` о слишком общих псевдонимах
+/// `data.aliases` термина (M6.6 §6.5, [`zam_store::broad_alias`]): такой псевдоним находится в
+/// посторонних текстах. До [`ALIAS_USES_MAX`], в порядке псевдонимов; запись не отклоняется.
+pub fn broad_alias_warnings(data: &Value) -> Vec<String> {
+    data.get("aliases")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|a| {
+            let why = match broad_alias(a)? {
+                BroadAlias::Short => "меньше 3 букв или цифр",
+                BroadAlias::StopWord => "служебное слово",
+            };
+            Some(format!("term_alias_broad: «{a}» — {why}"))
+        })
+        .take(ALIAS_USES_MAX)
+        .collect()
 }
 
 /// Дописывает предупреждения `w` в `warnings` ответа `v` (поле появляется, только если есть
@@ -109,6 +132,15 @@ pub async fn get(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broad_alias_warnings_capped() {
+        assert!(broad_alias_warnings(&json!({"definition": "d"})).is_empty());
+        let many: Vec<String> = (0..8).map(|i| format!("a{i}")).collect();
+        let w = broad_alias_warnings(&json!({"aliases": many}));
+        assert_eq!(w.len(), ALIAS_USES_MAX);
+        assert_eq!(w[0], "term_alias_broad: «a0» — меньше 3 букв или цифр");
+    }
 
     #[test]
     fn warnings_attached_or_merged() {

@@ -1252,6 +1252,136 @@ async fn guide_has_reports_section() {
     }
 }
 
+/// Протокол (M6.6 §7, замечания 7 и 25): раздел «Окружение в Vault» (ru, en) — совет об области
+/// (`scope: global` для общего хоста, лёг не туда — `move`), переименование и удаление с правилом
+/// «удаляй только свою ошибочную запись или по просьбе человека»; CLI — `set`, `add` — синоним.
+#[tokio::test]
+async fn guide_vault_scope_and_delete_rule() {
+    let a = api("agent-guide-vault", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    let section = |g: &str, head: &str| {
+        g.split(head)
+            .nth(1)
+            .unwrap_or_else(|| panic!("нет {head}"))
+            .split("\n## ")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let ru = section(&guide("").await, "## Окружение в Vault\n");
+    for want in [
+        "хост или стенд, общий для проектов, — `scope: global` (CLI `--global`); только этого \
+         проекта — без него; лёг не туда — `move`",
+        "action: \"move\"",
+        "zam vault mv <имя> --to global",
+        "action: \"rename\"",
+        "new_name",
+        "action: \"delete\"",
+        "удаляй только свою ошибочную запись или по просьбе человека",
+        "укажи `scope` или `v:<id>`",
+        "zam vault set <имя>",
+    ] {
+        assert!(ru.contains(want), "{want}: {ru}");
+    }
+    assert!(!ru.contains("zam vault add <"), "{ru}");
+    let en = section(&guide("?lang=en").await, "## Environment in Vault\n");
+    for want in [
+        "a host or stand shared across projects — `scope: global` (CLI `--global`); only this \
+         project — without it; landed in the wrong place — `move`",
+        "action: \"move\"",
+        "zam vault mv <name> --to global",
+        "action: \"rename\"",
+        "new_name",
+        "action: \"delete\"",
+        "delete only your own erroneous record or at the human's request",
+        "pass `scope` or `v:<id>`",
+        "zam vault set <name>",
+    ] {
+        assert!(en.contains(want), "{want}: {en}");
+    }
+    assert!(!en.contains("zam vault add <"), "{en}");
+}
+
+/// Протокол (M6.6, замечание 34 обкатки): раздел задач (ru, en) — работа по плану из N шагов —
+/// N задач со связью `part_of` к общей, статус на каждом переходе, общая закрывается после
+/// выпуска; общая — с планом в теле (и задача из разбора идеи), у исхода `plan` разбора — та же
+/// оговорка. Правило — только в протоколе: блока v8 оно не касается.
+#[tokio::test]
+async fn guide_plan_steps_are_part_of_tasks() {
+    let a = api("agent-guide-plan-steps", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    let section = |g: &str, head: &str| {
+        g.split(head)
+            .nth(1)
+            .unwrap_or_else(|| panic!("нет {head}"))
+            .split("\n## ")
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let ru = section(&guide("").await, "## Задачи и передача работы\n");
+    for want in [
+        "Работа по плану из N шагов",
+        "type: \"part_of\"",
+        "zam link k:<шаг> part_of k:<общая>",
+        "взял шаг — `in_progress` с `next_step`, закончил — `done`",
+        "Общая задача закрывается после выпуска",
+        "общая задача — с планом в теле, в том числе задача из разбора идеи",
+    ] {
+        assert!(ru.contains(want), "{want}: {ru}");
+    }
+    // исход `plan` разбора идеи (раздел «Идеи») — та же оговорка о подзадачах
+    let ru_ideas = section(&guide("").await, "## Идеи\n");
+    assert!(
+        ru_ideas.contains("план из многих шагов — ещё подзадачи `part_of`"),
+        "{ru_ideas}"
+    );
+    let en = section(&guide("?lang=en").await, "## Tasks and handing work over\n");
+    for want in [
+        "Work on a plan of N steps",
+        "type: \"part_of\"",
+        "zam link k:<step> part_of k:<umbrella>",
+        "took a step — `in_progress` with `next_step`, finished — `done`",
+        "The umbrella task is closed after the release",
+        "the umbrella task carries the plan in its body, including a task from an idea review",
+    ] {
+        assert!(en.contains(want), "{want}: {en}");
+    }
+    let en_ideas = section(&guide("?lang=en").await, "## Ideas\n");
+    assert!(
+        en_ideas.contains("a plan of many steps — also `part_of` subtasks"),
+        "{en_ideas}"
+    );
+}
+
 /// Протокол (M5.6): раздел о карте кода (ru, en) и три фразы, перенесённые из блока v5 ради
 /// бюджета 500 токенов, — в своих разделах протокола; в блоке их нет.
 #[tokio::test]
@@ -1395,6 +1525,8 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         // M6.5 §8: разбор идей агентом и пункты плана из идей
         "### Разбор идей",
         "### Идеи на разбор",
+        // M6.6 §3.5: строка очереди разбора к любому запросу человека
+        "строкой «новая идея на разбор «…» w:<id>» к любому запросу человека, и к короткой реплике",
         "event=idea_review",
         "action=review",
         "`outcome`",
@@ -1456,6 +1588,7 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         "`w:`",
         "### Idea review",
         "### Идеи на разбор",
+        "as the line “новая идея на разбор «…» w:<id>” (a new idea to review) for any human prompt",
         "event=idea_review",
         "action=review",
         "`outcome`",
@@ -1498,4 +1631,82 @@ async fn guide_has_ideas_section_and_moved_phrases() {
             assert!(!block.contains(moved), "{lang}: {moved}: {block}");
         }
     }
+}
+
+/// Протокол (M6.6 §8, замечания 13, 31, 33; ru и en синхронно): правка триггеров без замещения
+/// (`action=triggers`, набор целиком, CLI `zam insight triggers`), формы `data` у `release` и
+/// `experiment`, статус задачи при создании не задаётся (`data.status` — 422, дальше —
+/// `action=status`); `triggers` — среди действий правки записи.
+#[tokio::test]
+async fn guide_has_release_experiment_forms_and_triggers() {
+    let a = api("agent-guide-m66-mcp", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    fn section<'a>(g: &'a str, title: &str) -> &'a str {
+        let sec = g
+            .split(&format!("\n## {title}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("нет раздела «## {title}»"));
+        sec.split("\n## ").next().unwrap()
+    }
+    let ru = guide("").await;
+    let w = section(&ru, "Запись");
+    for want in [
+        "широкий или неверный триггер — `action=triggers` (набор целиком), замещать запись не нужно",
+        "memory_update_entry {id, rev, action: \"triggers\", triggers: […]}",
+        "`[]` — снять все",
+        "zam insight triggers <id> --trigger ВИД:ШАБЛОН",
+        "--clear",
+        "`release` — релиз: `data: {version (обязательна, 1–64), date?: YYYY-MM-DD, git_tag?, \
+         commits?: [{sha, subject?}]}`; CLI — `zam release add`",
+        "`data.experiment: {hypothesis?, method?, result: confirmed|refuted|inconclusive}`",
+        "`certify`, `append`, `triggers`, `feedback`",
+    ] {
+        assert!(w.contains(want), "ru «Запись»: нет «{want}»: {w}");
+    }
+    let t = section(&ru, "Задачи и передача работы");
+    assert!(
+        t.contains(
+            "статус при создании не задаётся: `data.status` — 422, новая задача — `open`, \
+             дальше — `action: \"status\"` (CLI `zam task status`)"
+        ),
+        "{t}"
+    );
+    let en = guide("?lang=en").await;
+    let w = section(&en, "Writing");
+    for want in [
+        "a broad or wrong trigger — `action=triggers` (the whole set), no need to supersede the \
+         record",
+        "memory_update_entry {id, rev, action: \"triggers\", triggers: […]}",
+        "`[]` — remove all",
+        "zam insight triggers <id> --trigger TYPE:PATTERN",
+        "--clear",
+        "`release` — a release: `data: {version (required, 1–64), date?: YYYY-MM-DD, git_tag?, \
+         commits?: [{sha, subject?}]}`; CLI — `zam release add`",
+        "`data.experiment: {hypothesis?, method?, result: confirmed|refuted|inconclusive}`",
+        "`certify`, `append`, `triggers`, `feedback`",
+    ] {
+        assert!(w.contains(want), "en «Writing»: нет «{want}»: {w}");
+    }
+    let t = section(&en, "Tasks and handing work over");
+    assert!(
+        t.contains(
+            "the status is not set on creation: `data.status` — 422, a new task is `open`, \
+             then — `action: \"status\"` (CLI `zam task status`)"
+        ),
+        "{t}"
+    );
 }

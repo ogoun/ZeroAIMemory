@@ -54,6 +54,9 @@ pub struct AppState {
     pub maintenance: Arc<Maintenance>,
     /// Кэш словаря доменных терминов по базам (M4.5, [`crate::glossary`]).
     pub glossary: Arc<crate::glossary::GlossaryCache>,
+    /// Кэш настроек пользователей (M6.6 §5.3, [`api::user_settings::UserFlagsCache`]): `/recall`
+    /// и режим идей владельца базы; `PATCH` настроек сбрасывает запись пользователя.
+    pub user_flags: Arc<api::user_settings::UserFlagsCache>,
     /// Разрешения на большие тела запросов (`POST /entries` с отчётом MCP, `/mcp`; M5.5).
     pub big_bodies: api::big_body::BigBodies,
     /// Карта кода (M5.6 §7): пересчёты рангов (single-flight на решение), слоты и кэш входов
@@ -388,6 +391,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     let state = AppState {
         maintenance,
         glossary: Arc::default(),
+        user_flags: Arc::default(),
         code: Arc::default(),
         export_slots: Arc::new(tokio::sync::Semaphore::new(
             api::transfer::export::EXPORT_SLOTS,

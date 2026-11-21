@@ -17,8 +17,11 @@
 //!   бы из карты всё недостающее. Нет локального состояния этого решения (вторая машина, кэш
 //!   удалён) — сверка с числом файлов карты на сервере (`GET /code/status`, ревью задачи 5).
 //! - На сервер — только метаданные §4: без `code.send_signatures` поле `sig` не отправляется;
-//!   секреты сигнатуры клиент маскирует до обрезки ([`mask_sig`]); файл, чей JSON больше
-//!   предела запроса, уходит `skipped`/`limit` без символов.
+//!   секреты сигнатуры клиент маскирует до обрезки ([`mask_sig`]) — правилами сервера
+//!   (`zam_secrets`, M6.6 §9, замечание 15) и своими правилами токенов, поэтому сервер в
+//!   присланном ничего не находит; места — в итоге ([`SyncReport::masked`], одна строка
+//!   [`SyncReport::masked_line`]). Файл, чей JSON больше предела запроса, уходит
+//!   `skipped`/`limit` без символов.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -41,9 +44,24 @@ pub const BATCH_BYTES_MAX: usize = 8 * 1024 * 1024;
 const ENVELOPE_RESERVE: usize = 4096;
 /// Предохранитель массового удаления действует от этого числа файлов прошлого состояния.
 pub const PRUNE_GUARD_MIN: usize = 20;
+/// Сколько символов строки за пределом сигнатуры (160) ещё маскируется до обрезки ([`mask_sig`],
+/// ревью задачи 9 M6.6, M3): токен секрета короче, а правила `zam_secrets` не идут по
+/// сверхдлинной строке (почти минифицированный код) целиком — дальше обрезки всё равно не уходит.
+const SIG_SCAN_EXTRA: usize = 4096;
 /// Пределы символов и ссылок файла (как умолчания сервера `[code]`).
 const MAX_SYMBOLS: usize = 5000;
 const MAX_REFS: usize = 20_000;
+
+/// Мест маскировки в строке итога [`SyncReport::masked_line`]; остальные — «(ещё K)», полный
+/// список — `masked` в `zam code sync --json`.
+pub const MASKED_SHOWN: usize = 5;
+
+/// Сигнатура, в которой клиент замаскировал секреты до отправки: файл и `qual` символа.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MaskedSig {
+    pub path: String,
+    pub qual: String,
+}
 
 /// Итог синхронизации.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -63,6 +81,8 @@ pub struct SyncReport {
     pub ms: u128,
     /// Предупреждения сервера и клиента (stderr; в фоне — в строке итога `hooks.log`).
     pub warnings: Vec<String>,
+    /// Сигнатуры отправленных файлов, где клиент замаскировал секреты (по порядку разбора).
+    pub masked: Vec<MaskedSig>,
 }
 
 impl SyncReport {
@@ -87,9 +107,39 @@ impl SyncReport {
         s
     }
 
-    /// Строка итога с предупреждениями (фоновый режим: stderr не пишется).
+    /// Итог маскировки одной строкой (stderr, M6.6 §9): «секреты в сигнатурах: N (файлов F) —
+    /// замаскированы до отправки: путь#qual, … (ещё K)» — первые [`MASKED_SHOWN`] мест; масок
+    /// нет — `None`.
+    pub fn masked_line(&self) -> Option<String> {
+        if self.masked.is_empty() {
+            return None;
+        }
+        let files: HashSet<&str> = self.masked.iter().map(|m| m.path.as_str()).collect();
+        let places: Vec<String> = self
+            .masked
+            .iter()
+            .take(MASKED_SHOWN)
+            .map(|m| format!("{}#{}", m.path, m.qual))
+            .collect();
+        let mut s = format!(
+            "секреты в сигнатурах: {} (файлов {}) — замаскированы до отправки: {}",
+            self.masked.len(),
+            files.len(),
+            places.join(", ")
+        );
+        let rest = self.masked.len().saturating_sub(MASKED_SHOWN);
+        if rest > 0 {
+            s.push_str(&format!(" (ещё {rest})"));
+        }
+        Some(s)
+    }
+
+    /// Строка итога с маскировкой и предупреждениями (фоновый режим: stderr не пишется).
     pub fn line_with_warnings(&self) -> String {
         let mut s = self.line();
+        if let Some(m) = self.masked_line() {
+            s.push_str(&format!("; {m}"));
+        }
         if !self.warnings.is_empty() {
             s.push_str(&format!("; предупреждения: {}", self.warnings.join("; ")));
         }
@@ -273,7 +323,8 @@ impl Meta {
     }
 }
 
-/// Разбор одного файла под журналом падений → загрузка.
+/// Разбор одного файла под журналом падений → загрузка; сигнатуры, где замаскированы секреты, —
+/// в `masked`.
 fn parse_file(
     root: &Path,
     fp: &Fingerprint,
@@ -281,6 +332,7 @@ fn parse_file(
     state: &CodeState,
     cfg: &CodeConfig,
     crash: &CrashLog,
+    masked: &mut Vec<MaskedSig>,
 ) -> Option<FileUpload> {
     let lang = zam_code::lang_of(&fp.path)?;
     let mut up = FileUpload {
@@ -334,7 +386,14 @@ fn parse_file(
                 let tail = (s.end_line > s.line)
                     .then(|| line_of(src, s.line))
                     .flatten();
-                s.sig = Some(mask_sig(&sig, tail));
+                let (sig, hit) = mask_sig(&sig, tail);
+                if hit {
+                    masked.push(MaskedSig {
+                        path: up.path.clone(),
+                        qual: s.qual.clone(),
+                    });
+                }
+                s.sig = Some(sig);
             }
         }
     } else {
@@ -433,9 +492,13 @@ fn secret_token(t: &str) -> bool {
         || sig_high_entropy(t)
 }
 
-/// Секреты в тексте → `‹secret›`: пароль в URL, затем токены из [`token_char`].
+/// Секреты в тексте → `‹secret›`: сначала правила сервера (`zam_secrets`: ими же сервер
+/// маскирует присланные сигнатуры — `check_upload`; «ключ = значение», JWT, закрытый ключ…),
+/// затем свои — пароль в URL и токены из [`token_char`]. Маска `‹secret›` ни одним правилом не
+/// находится снова: повторная маскировка ничего не меняет.
 fn mask_tokens(text: &str) -> String {
-    let text = URL_PASSWORD.replace_all(text, |c: &regex::Captures| {
+    let text = zam_secrets::mask_text(text);
+    let text = URL_PASSWORD.replace_all(&text, |c: &regex::Captures| {
         format!("{}{}@", &c[1], crate::cmd::hook::journal::SECRET)
     });
     let mut out = String::with_capacity(text.len());
@@ -466,25 +529,63 @@ fn mask_tokens(text: &str) -> String {
 /// строка имени, если узел продолжается на следующих строках (тогда весь остаток строки —
 /// внутри узла); полный текст — от начала сигнатуры до конца строки. Нет `tail` (однострочный
 /// узел: конец узла на строке неизвестен, дальше может быть соседний код) — оборванный
-/// последний токен снимается. Сервер маскирует повторно.
-fn mask_sig(sig: &str, tail: Option<String>) -> String {
-    let Some(head) = sig.strip_suffix('…') else {
-        return mask_tokens(sig);
+/// последний токен снимается. Сервер маскирует повторно (старые клиенты), но в итоге этой
+/// функции ничего не находит: после обрезки сигнатура ещё раз проходит правила сервера
+/// (`zam_secrets::mask_text` — неподвижная точка). Итог не длиннее 160 символов и тогда, когда
+/// маска длиннее значения (`password = "abcdef"`): сервер отверг бы такую сигнатуру. Второе
+/// значение — отправляется не то, что ушло бы без маскировки с той же обрезкой: секрет за
+/// пределом обрезки, сама обрезка и снятый оборванный токен маскировкой не считаются. Остаток
+/// строки маскируется не дальше [`SIG_SCAN_EXTRA`] символов за пределом сигнатуры.
+fn mask_sig(sig: &str, tail: Option<String>) -> (String, bool) {
+    // (без маскировки, с маскировкой до обрезки) — с одной и той же обрезкой
+    let (plain, masked) = match sig.strip_suffix('…') {
+        None => (sig.to_string(), cut_sig(mask_tokens(sig))),
+        Some(head) => {
+            let full = tail
+                .as_deref()
+                .and_then(|l| {
+                    l.find(head).map(|i| {
+                        l[i..]
+                            .chars()
+                            .take(zam_code::SIG_MAX_CHARS + SIG_SCAN_EXTRA)
+                            .collect::<String>()
+                    })
+                })
+                .unwrap_or_else(|| {
+                    let keep = head.trim_end_matches(token_char).trim_end();
+                    format!("{keep}…")
+                });
+            let masked = cut_sig(mask_tokens(&full));
+            (cut_sig(full), masked)
+        }
     };
-    let full = tail
-        .as_deref()
-        .and_then(|l| l.find(head).map(|i| l[i..].to_string()))
-        .unwrap_or_else(|| {
-            let keep = head.trim_end_matches(token_char).trim_end();
-            format!("{keep}…")
-        });
-    let masked = mask_tokens(&full);
-    if masked.chars().count() <= zam_code::SIG_MAX_CHARS {
-        return masked;
+    // обрезка могла открыть находку правил сервера (кандидат энтропии потерял `/` пути)
+    let fixed = cut_sig(zam_secrets::mask_text(&masked));
+    let hit = fixed != plain;
+    (fixed, hit)
+}
+
+/// Сигнатура не длиннее предела сервера: длиннее — первые 159 символов и `…`. Разрез внутри маски
+/// `‹secret›` отступает к её началу (обломок маски `‹sec…` читался бы как текст сигнатуры).
+fn cut_sig(s: String) -> String {
+    if s.chars().count() <= zam_code::SIG_MAX_CHARS {
+        return s;
     }
-    let mut s: String = masked.chars().take(zam_code::SIG_MAX_CHARS - 1).collect();
-    s.push('…');
-    s
+    let mut keep = zam_code::SIG_MAX_CHARS - 1;
+    let mark_chars = zam_secrets::SECRET_MARK.chars().count();
+    for (b, _) in s.match_indices(zam_secrets::SECRET_MARK) {
+        let start = s[..b].chars().count();
+        if start >= keep {
+            break;
+        }
+        if start + mark_chars > keep {
+            keep = start;
+            break;
+        }
+    }
+    let mut c: String = s.chars().take(keep).collect();
+    c.push('…');
+    c
 }
 
 /// Файл, чей JSON не помещается в запрос (ревью задачи 5, M7): `skipped`/`limit` без символов
@@ -736,9 +837,11 @@ pub fn sync(
         sent: Vec::new(),
         warnings: Vec::new(),
     };
+    let mut masked: Vec<MaskedSig> = Vec::new();
     for fp in need {
         let h = &hashes[&fp.path];
-        let Some(mut file) = parse_file(root, fp, h, &state, cfg, &crash) else {
+        let from = masked.len();
+        let Some(mut file) = parse_file(root, fp, h, &state, cfg, &crash, &mut masked) else {
             continue;
         };
         if !recv_ok {
@@ -750,6 +853,8 @@ pub fn sync(
         let mut bytes = ser(&file)?;
         if !fits_request(bytes.len()) {
             file = over_limit(file);
+            // символы файла не уходят — и их маски тоже
+            masked.truncate(from);
             bytes = ser(&file)?;
         }
         if let Some(r) = file.skip_reason {
@@ -764,6 +869,7 @@ pub fn sync(
     report.uploaded = up.accepted;
     report.stale_refs += up.stale_refs;
     report.warnings.append(&mut up.warnings);
+    report.masked = masked;
     // состояние: текущие файлы; журнал падений — только для неизменившихся хэшей
     let now = cache::now_rfc3339();
     let sent: HashSet<&str> = up.sent.iter().map(String::as_str).collect();
@@ -917,22 +1023,22 @@ mod tests {
         let tok = "ghp_Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7c";
         let line = format!("export function f({}, key = \"{tok}\") {{", "a".repeat(120));
         let cut: String = line.chars().take(159).collect::<String>() + "…";
-        let s = mask_sig(&cut, Some(line.clone()));
+        let s = mask_sig(&cut, Some(line.clone())).0;
         assert!(!s.contains("ghp_"), "{s}");
         assert!(s.chars().count() <= 160 && s.contains("‹secret›"), "{s}");
         // строки нет — оборванный токен снимается
-        let s = mask_sig(&cut, None);
+        let s = mask_sig(&cut, None).0;
         assert!(!s.contains("ghp_") && s.ends_with('…'), "{s}");
         // короткая — как есть, секрет внутри — маскируется
-        assert_eq!(mask_sig("fn open() -> Store", None), "fn open() -> Store");
+        assert_eq!(mask_sig("fn open() -> Store", None).0, "fn open() -> Store");
         // необрезанная — соседний код строки не подхватывается (I2)
         let line = "pub fn a() -> u32 { 1 } static DB_PASSWORD: &str = \"hunter2-prod\";";
         assert_eq!(
-            mask_sig("pub fn a() -> u32 { 1 }", Some(line.into())),
+            mask_sig("pub fn a() -> u32 { 1 }", Some(line.into())).0,
             "pub fn a() -> u32 { 1 }"
         );
         assert_eq!(
-            mask_sig(&format!("const K = \"{tok}\";"), None),
+            mask_sig(&format!("const K = \"{tok}\";"), None).0,
             "const K = \"‹secret›\";"
         );
     }
@@ -960,10 +1066,10 @@ mod tests {
             format!("npm_{}", rnd(36, 3)),
             format!("SG.{}.{}", rnd(22, 4), rnd(43, 5)),
         ] {
-            let s = mask_sig(&format!("const K = \"{secret}\";"), None);
+            let s = mask_sig(&format!("const K = \"{secret}\";"), None).0;
             assert_eq!(s, "const K = \"‹secret›\";", "{secret}");
         }
-        let s = mask_sig("const DSN = \"postgres://admin:s3cr3tpw@db/app\";", None);
+        let s = mask_sig("const DSN = \"postgres://admin:s3cr3tpw@db/app\";", None).0;
         assert!(
             !s.contains("s3cr3tpw") && s.contains("admin:‹secret›@"),
             "{s}"
@@ -974,8 +1080,127 @@ mod tests {
             "const VIEW = \"src/components/Button2/index_view.tsx\";",
             "fn hf_model_loader_from_pretrained_v2(npm_package_version: &str)",
         ] {
-            assert_eq!(mask_sig(sig, None), sig);
+            assert_eq!(mask_sig(sig, None).0, sig);
         }
+    }
+
+    /// M6.6 §9 (замечание 15): сигнатура маскируется правилами сервера (`zam_secrets`) — пароль
+    /// «ключ = значение» тоже; признак маскировки — только при замене; повторная маскировка уже
+    /// замаскированной сигнатуры ничего не меняет (`‹secret›` не находится снова).
+    #[test]
+    fn sig_masked_with_server_rules_idempotent() {
+        let pw = ["hunter", "2-prod-", "q7"].concat();
+        let sig = format!("export function login(user: string, password = \"{pw}\")");
+        let (s, masked) = mask_sig(&sig, None);
+        assert_eq!(
+            s,
+            "export function login(user: string, password = \"‹secret›\")"
+        );
+        assert!(masked);
+        assert_eq!(zam_secrets::mask_text(&s), s, "сервер ничего не найдёт");
+        assert_eq!(
+            mask_sig(&s, None),
+            (s.clone(), false),
+            "повтор — без изменений"
+        );
+        let plain = "pub fn open() -> Store";
+        assert_eq!(mask_sig(plain, None), (plain.to_string(), false));
+        // обрезанная без строки: оборванный токен снимается, но это не секрет
+        let cut = format!("pub fn f({}…", "a".repeat(158));
+        assert!(!mask_sig(&cut, None).1, "обрезка — не маскировка");
+        // секрет строки за пределом обрезки на сервер не уходит и маской не считается
+        let line = format!(
+            "export function f({}, password = \"{pw}\") {{",
+            "a".repeat(150)
+        );
+        let head: String = line.chars().take(159).collect::<String>() + "…";
+        let (s, hit) = mask_sig(&head, Some(line.clone()));
+        assert!(!hit && !s.contains(&pw) && s.chars().count() == 160, "{s}");
+        // маска длиннее значения: итог — не длиннее предела сервера
+        let tight = format!("fn f({}, password = \"abcdef\")", "x".repeat(133));
+        assert_eq!(tight.chars().count(), 160);
+        let (s, hit) = mask_sig(&tight, None);
+        assert!(
+            hit && !s.contains("abcdef") && s.chars().count() <= 160,
+            "{s}"
+        );
+    }
+
+    /// Ревью задачи 9 M6.6, M4: разрез обрезки внутри маски `‹secret›` отступает к её началу;
+    /// маска до разреза остаётся целой.
+    #[test]
+    fn cut_sig_keeps_mask_whole() {
+        // 160 символов, маска длиннее значения: 162 — разрез (159) пришёлся бы внутрь маски
+        let tight = format!("fn f({}, password = \"abcdef\")", "x".repeat(133));
+        let (s, hit) = mask_sig(&tight, None);
+        assert!(hit, "{s}");
+        assert!(s.ends_with("password = \"…"), "{s}");
+        assert!(!s.contains('‹') && !s.contains("abcdef"), "{s}");
+        assert!(s.chars().count() < 160, "{s}");
+        // маска целиком до разреза — на месте, разрез — как обычно (159 и «…»)
+        let long = format!("fn f({}, password = \"abcdef\", y: u32)", "x".repeat(125));
+        assert_eq!(long.chars().count(), 160);
+        let (s, hit) = mask_sig(&long, None);
+        assert!(hit && s.contains("password = \"‹secret›\""), "{s}");
+        assert_eq!(s.chars().count(), 160, "{s}");
+        assert!(s.ends_with('…'), "{s}");
+    }
+
+    /// Ревью задачи 9 M6.6, M3: остаток сверхдлинной строки маскируется не целиком, а окном
+    /// [`SIG_SCAN_EXTRA`] за пределом сигнатуры: итог тот же, что у короткой строки.
+    #[test]
+    fn long_line_tail_scanned_in_window() {
+        let pw = ["hunter", "2-prod-", "q7"].concat();
+        let head = format!("export function f(a, password = \"{pw}\", ");
+        let line = format!("{head}{}) {{", "b, ".repeat(100_000));
+        let short: String = line.chars().take(400).collect();
+        let sig: String = line.chars().take(159).collect::<String>() + "…";
+        let long_r = mask_sig(&sig, Some(line.clone()));
+        assert_eq!(long_r, mask_sig(&sig, Some(short)));
+        let (s, hit) = long_r;
+        assert!(hit && !s.contains(&pw) && s.contains("‹secret›"), "{s}");
+        assert_eq!(s.chars().count(), 160, "{s}");
+    }
+
+    #[test]
+    fn masked_line_lists_places_and_rest() {
+        let place = |path: &str, qual: &str| MaskedSig {
+            path: path.into(),
+            qual: qual.into(),
+        };
+        let mut r = SyncReport::default();
+        assert_eq!(r.masked_line(), None);
+        r.masked = vec![
+            place("a.rs", "X::y"),
+            place("a.rs", "z"),
+            place("b.ts", "f"),
+        ];
+        assert_eq!(
+            r.masked_line().as_deref(),
+            Some(
+                "секреты в сигнатурах: 3 (файлов 2) — замаскированы до отправки: a.rs#X::y, \
+                 a.rs#z, b.ts#f"
+            )
+        );
+        r.masked = (0..MASKED_SHOWN + 3)
+            .map(|i| place("c.rs", &format!("f{i}")))
+            .collect();
+        let l = r.masked_line().unwrap();
+        assert!(
+            l.starts_with(&format!(
+                "секреты в сигнатурах: {} (файлов 1) — замаскированы до отправки: c.rs#f0, ",
+                MASKED_SHOWN + 3
+            )),
+            "{l}"
+        );
+        assert!(l.ends_with(" (ещё 3)"), "{l}");
+        assert_eq!(l.matches("c.rs#").count(), MASKED_SHOWN, "{l}");
+        // фоновый режим — та же строка в итоге `hooks.log`
+        assert!(
+            r.line_with_warnings().contains(&l),
+            "{}",
+            r.line_with_warnings()
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod common;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 
+use common::qdrant::free_port;
 use common::{cfg_in, tmp};
 use zam_index::supervisor::{QDRANT_VERSION, qdrant_exe_name};
 use zam_server::qdrant;
@@ -90,10 +91,16 @@ fn fetch_installs_binary_once_and_checks_version_and_url() {
     assert!(e.contains("https"), "{e}");
 }
 
+/// Остановленная установка: `status` и `reset` на свободных портах, а не на 6333/6334 по
+/// умолчанию — там на машине разработчика может работать чужой Qdrant (финальное ревью M6.6):
+/// `status` получил бы его версию (`running_version`), а `reset` отказал бы «порт занят».
 #[tokio::test]
 async fn status_and_reset_on_stopped_install() {
     let d = tmp("qdrant-status");
-    let cfg = cfg_in(d.clone());
+    let mut cfg = cfg_in(d.clone());
+    // два вызова реестра — разные порты: `grpc_port` не совпадает с `http_port` (config.rs)
+    cfg.qdrant.http_port = free_port();
+    cfg.qdrant.grpc_port = free_port();
     let s = qdrant::status(&cfg, &d.join("inst")).await.unwrap();
     for needle in [
         "режим: managed",

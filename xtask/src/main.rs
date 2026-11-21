@@ -4,6 +4,7 @@ mod ab;
 mod bench;
 mod bundles;
 mod changelog;
+mod clean_test_tmp;
 mod code_bench;
 mod docs_corpus;
 mod eval;
@@ -140,6 +141,10 @@ enum Cmd {
     /// Разбор одного PDF бэкендом A/B в этом процессе (JSON в stdout; для eval --docs)
     #[command(hide = true)]
     DocsExtract(eval::docs::extract::ExtractArgs),
+    /// Уборка данных тестов: записи target/tmp, target/<сборка>/tmp и target/test-tmp, в которых
+    /// ничего не менялось дольше порога (запущенные тесты не трогаются); tags, models, deps,
+    /// dist, release и прочее в target/ — никогда
+    CleanTestTmp(clean_test_tmp::CleanTestTmpArgs),
     /// Проверка архива zam-cuda: штампы совпадают с deploy/cuda.toml, файлы на месте
     /// (cuda fetch после распаковки ничего не скачает), формат библиотек, лицензии NVIDIA
     SmokeCuda {
@@ -536,6 +541,7 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::Bench(a) => bench::main(a, &repo_root()),
         Cmd::CodeBench(a) => code_bench::main(a, &repo_root()),
         Cmd::TransferCheck(a) => transfer_check::main(a, &repo_root()),
+        Cmd::CleanTestTmp(a) => clean_test_tmp::main(a, &repo_root()),
     }
 }
 
