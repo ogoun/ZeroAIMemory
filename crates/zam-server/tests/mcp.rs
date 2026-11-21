@@ -1563,6 +1563,47 @@ async fn mcp_vault_delete_ambiguous_name() {
     assert!(vault_ids(&a, &h, json!({})).await.is_empty());
 }
 
+/// M7.1 §4.5 п. 4: `delete` по имени — только точное имя (с учётом регистра): совпадение без учёта
+/// регистра — 404 с подсказкой точного имени, запись цела; точное имя удаляет.
+#[tokio::test]
+async fn vault_delete_exact_name_only() {
+    let a = api("mcp-vault-del-exact", |_| {}).await;
+    let h = sess();
+    let o = vault_call(
+        &a,
+        &a.token,
+        &h,
+        json!({"action": "set", "name": "Deploy-Key", "value": "val-deploy-1"}),
+    )
+    .await;
+    assert!(!o.is_error, "{}", o.text);
+    let id = vault_ids(&a, &h, json!({})).await[0].1.clone();
+    let del = |name: &str| json!({"action": "delete", "name": name});
+    let o = vault_call(&a, &a.token, &h, del("deploy-key")).await;
+    assert!(o.is_error && o.text.contains("404"), "{}", o.text);
+    assert!(
+        o.text.contains("«Deploy-Key»") && o.text.contains(&format!("v:{id}")),
+        "подсказка точного имени: {}",
+        o.text
+    );
+    assert!(
+        !o.text.contains("val-deploy"),
+        "значение в ответе: {}",
+        o.text
+    );
+    assert_eq!(
+        vault_ids(&a, &h, json!({})).await,
+        [("Deploy-Key".to_string(), id.clone())]
+    );
+    let o = vault_call(&a, &a.token, &h, del("Deploy-Key")).await;
+    assert!(
+        !o.is_error && o.text.contains("Удалено") && o.text.contains(&id),
+        "{}",
+        o.text
+    );
+    assert!(vault_ids(&a, &h, json!({})).await.is_empty());
+}
+
 /// M6.6 §7 (замечание 25): `memory_vault action=move` с `to` — по имени (откуда — `scope`) и по
 /// `v:<id>` (`to: solution` — решение из `X-Zam-Solution`); после переноса запись в списке цели и
 /// не в исходной области; та же область — без новой ревизии; цель не область Vault — 404.

@@ -16,8 +16,8 @@
 //!   ([`SessionTouch::epoch`]), [`seen_revs`] читает только её. Отметки прежних эпох хранятся до
 //!   срока сессии (аналитика). Показ идей — без эпохи (§7.2, «одна идея — один показ за
 //!   сессию»): раздел идей дайджеста читает [`seen_entry_ids`], подсказка идей к запросу —
-//!   [`seen_revs_any_epoch`]; строка очереди разбора к запросу (M6.6 §3.5) — по эпохе и ревизии,
-//!   [`seen_entry_revs`];
+//!   [`seen_revs_any_epoch`]; показ очереди разбора (M7.1 §4.5: строка к запросу, раздел
+//!   дайджеста) — своя отметка [`REVIEW_QUEUE_PART`] по эпохе, [`review_queue_shown`];
 //! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12); признак с
 //!   наследованием от родителя — [`session_holdout`];
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
@@ -47,6 +47,12 @@ pub const WHOLE_TARGET: &str = "";
 /// поэтому поиск (`skip_seen`) и `/read` такую отметку выдачей текста не считают
 /// **[решение исполнителя, задача 8 M4]**. Подсказка показывается не больше раза за сессию.
 pub const RECALL_PART: &str = "recall";
+/// `part` отметки показа очереди разбора идей (M7.1 §4.5 п. 1): строка очереди к запросу или
+/// раздел `### Идеи на разбор` дайджеста. Цель — первая идея очереди при показе, ревизия — **число
+/// идей в очереди** при показе (не ревизия цели; при повторном показе с той же первой идеей
+/// хранится большее, как у любой отметки). Подсказку записи ([`RECALL_PART`]) и выдачу текста
+/// такая отметка не задевает: их читают по своим частям.
+pub const REVIEW_QUEUE_PART: &str = "review_queue";
 
 /// Касание сессии: id и то, что о ней известно из запроса (`None` — не менять прежнее).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -658,35 +664,41 @@ pub async fn seen_entry_ids(
     .await
 }
 
-/// Записи журналов (`target_kind = entry`) базы владельца `owner`, выданные сессии с частью
-/// `part` **в эпоху `epoch`**, с наибольшей выданной ревизией (M6.6 §3.5, ревью задачи 14:
-/// строка очереди разбора к запросу — показ по эпохе и ревизии; одно чтение на запрос).
-pub async fn seen_entry_revs(
+/// Показ очереди разбора сессии в эпоху ([`review_queue_shown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueShown {
+    /// Число идей в очереди при показе (наибольшее за эпоху).
+    pub total: usize,
+    /// Время последнего показа.
+    pub at: Timestamp,
+}
+
+/// Показ очереди разбора идей базы владельца `owner` сессии в эпоху `epoch` (M7.1 §4.5 п. 1):
+/// отметки части [`REVIEW_QUEUE_PART`] — наибольшее число идей очереди и время последнего
+/// показа; показа в эпохе не было — `None`. Одно чтение на запрос.
+pub async fn review_queue_shown(
     db: &Db,
     session: &str,
     owner: Id,
-    part: &str,
     epoch: u32,
-) -> Result<HashMap<Id, i64>, StoreError> {
-    let (session, part) = (session.to_string(), part.to_string());
+) -> Result<Option<QueueShown>, StoreError> {
+    let session = session.to_string();
     db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT target_id, max(rev) FROM session_seen
-             WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = 'entry' AND part = ?3
-               AND epoch = ?4
-             GROUP BY target_id",
-        )?;
-        let rows = st.query_map(params![session, owner, part, epoch], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        let mut out = HashMap::new();
-        for row in rows {
-            let (id, rev) = row?;
-            if let Ok(id) = id.parse::<Id>() {
-                out.insert(id, rev);
-            }
-        }
-        Ok(out)
+        let (total, at): (Option<i64>, Option<String>) = c
+            .prepare_cached(
+                "SELECT max(rev), max(seen_at) FROM session_seen
+                 WHERE session_id = ?1 AND owner_id = ?2 AND part = ?3 AND epoch = ?4",
+            )?
+            .query_row(params![session, owner, REVIEW_QUEUE_PART, epoch], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        let (Some(total), Some(at)) = (total, at) else {
+            return Ok(None);
+        };
+        Ok(Some(QueueShown {
+            total: usize::try_from(total).unwrap_or(0),
+            at: crate::time::parse_ts(&at)?,
+        }))
     })
     .await
 }

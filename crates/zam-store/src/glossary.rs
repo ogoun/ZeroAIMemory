@@ -500,17 +500,18 @@ pub fn is_acronym(name: &str) -> bool {
 /// Почему псевдоним слишком общий ([`broad_alias`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadAlias {
-    /// Меньше 3 букв или цифр («ok», «S3»).
+    /// Меньше 3 букв или цифр и не аббревиатура («ok», «S3»).
     Short,
     /// Служебное слово ([`zam_core::text::is_stop_word`]: «для», «the»).
     StopWord,
 }
 
 /// Псевдоним термина слишком общий (M6.6 §6.5): меньше 3 букв или цифр либо служебное слово
-/// (без регистра и знаков, [`normalize_title`]). Запись термина не отклоняется — сервер
-/// предупреждает `term_alias_broad`.
+/// (без регистра и знаков, [`normalize_title`]). Аббревиатура ([`is_acronym`]: `UI`, `DB`, `CI`)
+/// короткой не считается — она сравнивается с учётом регистра (M7.1 §4.5 п. 3). Запись термина
+/// не отклоняется — сервер предупреждает `term_alias_broad`.
 pub fn broad_alias(alias: &str) -> Option<BroadAlias> {
-    if alias.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
+    if alias.chars().filter(|c| c.is_alphanumeric()).count() < 3 && !is_acronym(alias) {
         Some(BroadAlias::Short)
     } else if zam_core::text::is_stop_word(&normalize_title(alias)) {
         Some(BroadAlias::StopWord)
@@ -1000,6 +1001,18 @@ mod tests {
         assert_eq!(broad_alias("The!"), Some(BroadAlias::StopWord));
         for a in ["MCP", "zam", "summary", "for the"] {
             assert_eq!(broad_alias(a), None, "{a}");
+        }
+    }
+
+    /// M7.1 §4.5 п. 3: аббревиатура из двух заглавных сравнивается с учётом регистра — не
+    /// «слишком короткая»; прочие короткие — как прежде.
+    #[test]
+    fn broad_alias_acronym_not_short() {
+        for a in ["UI", "DB", "CI"] {
+            assert_eq!(broad_alias(a), None, "{a}");
+        }
+        for a in ["ok", "S3", "C++"] {
+            assert_eq!(broad_alias(a), Some(BroadAlias::Short), "{a}");
         }
     }
 

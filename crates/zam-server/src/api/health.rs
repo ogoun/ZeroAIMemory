@@ -40,6 +40,7 @@ pub const FEATURES: &[&str] = &[
     "mcp_session_arg",
     "idea_review",
     "vault_move",
+    "idea_queue_line",
 ];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {
