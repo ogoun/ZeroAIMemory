@@ -348,7 +348,7 @@ enum Cmd {
         /// Адрес сервера
         #[arg(long)]
         url: Option<String>,
-        /// Токен (сохраняется в ~/.zeroaimemory/config.toml, не в файлы проекта)
+        /// Токен (сохраняется в ~/.zeroaimemory/config.toml по адресу сервера, не в файлы проекта)
         #[arg(long)]
         token: Option<String>,
         /// Агент: claude (CLAUDE.md), codex (AGENTS.md), both

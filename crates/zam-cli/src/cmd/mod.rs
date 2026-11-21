@@ -175,6 +175,24 @@ pub fn zam_env() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Нет токена для адреса `url` (M7 §4.4) — подсказка `zam init --url <адрес> --token`. В домашнем
+/// конфиге есть токены только других адресов (`elsewhere`, [`locate::Resolved::other_server_keys`])
+/// — код 1 (настройка): на этот сервер они не отправляются; токена нет вовсе — код 3, как раньше.
+pub fn missing_token(url: &str, elsewhere: bool) -> CliError {
+    let init = format!("zam init --url {url} --token <токен>");
+    if elsewhere {
+        CliError::config(format!(
+            "в ~/.zeroaimemory/config.toml нет токена для {url} (токен другого адреса на этот сервер \
+             не отправляется): {init}"
+        ))
+    } else {
+        CliError::new(
+            EXIT_TOKEN,
+            format!("токен не задан для {url}: {init} (или флаг --token, ZAM_TOKEN)"),
+        )
+    }
+}
+
 /// Подключение команды заметок.
 pub struct Ctx {
     pub client: Client,
@@ -198,12 +216,10 @@ pub fn connect(c: &Common) -> Result<Ctx, CliError> {
         )
     })?;
     locate::check_url(&url.value).map_err(CliError::config)?;
-    let token = r.token.ok_or_else(|| {
-        CliError::new(
-            EXIT_TOKEN,
-            "токен не задан: флаг --token, ZAM_TOKEN, блок ZeroAIMemory в CLAUDE.md/AGENTS.md или ~/.zeroaimemory/config.toml",
-        )
-    })?;
+    let elsewhere = r.other_server_keys;
+    let token = r
+        .token
+        .ok_or_else(|| missing_token(&url.value, elsewhere))?;
     let solution = match locate::find_solution(&cwd) {
         Some(p) => Some(target::load_solution(&p)?),
         None => None,

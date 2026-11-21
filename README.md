@@ -566,8 +566,11 @@ zam status
 `zam init` создаёт `.zeroaimemory/solution.toml` (GUID решения: каталоги с одинаковым GUID на
 разных машинах делят одно решение), вставляет блок инструкции (v8) в CLAUDE.md и/или AGENTS.md,
 сливает хуки в `.claude/settings.json` и `.codex/hooks.json` и сервер MCP в `.mcp.json` (с M6 —
-stdio-прокси `zam mcp`). Токена в файлах проекта нет: он хранится в `~/.zeroaimemory/config.toml`,
-оттуда его берут `zam`, хуки и `zam mcp`; переменная `ZAM_TOKEN` нужна только MCP по HTTP.
+stdio-прокси `zam mcp`). Токена в файлах проекта нет: он хранится в `~/.zeroaimemory/config.toml`
+ключом адреса сервера `[servers."<адрес>"]`, оттуда его берут `zam`, хуки и `zam mcp`; переменная
+`ZAM_TOKEN` нужна только MCP по HTTP. С 0.0.14-m7.1 у каждого сервера свой токен: `zam init`
+второго сервера на той же машине токен первого не трогает, а токен одного сервера на другой не
+отправляется.
 Адрес сервера по умолчанию — строкой `ZeroAIMemoryUrl=` в блоке; с 0.0.13-m6.6
 `zam init --url-to home` хранит его в `~/.zeroaimemory/config.toml`, `--url-to local` — в
 `CLAUDE.local.md`, исключённом из git: в блоке адреса нет, и `CLAUDE.md` можно коммитить в
@@ -581,7 +584,8 @@ stdio-прокси `zam mcp`). Токена в файлах проекта не�
 
 Адрес и токен `zam` ищет по порядку: флаги `--url`/`--token`, переменные `ZAM_URL`/`ZAM_TOKEN`,
 блок в `CLAUDE.local.md`, `CLAUDE.md` или `AGENTS.md` от текущего каталога вверх, затем
-`~/.zeroaimemory/config.toml`. У всех команд есть `--json`.
+`~/.zeroaimemory/config.toml` (токен оттуда — только для найденного адреса). У всех команд есть
+`--json`.
 
 Цель команды — `[пространство:]путь` или id узла. Пространство: `knowledge`, `rules`, `human`,
 `solution` или GUID решения. Без префикса берётся решение из `.zeroaimemory/solution.toml`,

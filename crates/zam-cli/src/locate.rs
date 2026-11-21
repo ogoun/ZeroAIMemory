@@ -1,5 +1,7 @@
 //! Поиск настроек подключения (§11.4): флаги → env → CLAUDE.md/AGENTS.md вверх от cwd → config.toml в home.
-//! URL и токен разрешаются независимо.
+//! URL и токен разрешаются независимо; токен из config.toml в home — только для найденного адреса
+//! (`[servers."<адрес>"]`, M7 §4.4).
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -89,6 +91,8 @@ pub enum Source {
     Env(&'static str),
     File(PathBuf),
     Home(PathBuf),
+    /// Ключ домашнего конфига для адреса: `[servers."<адрес>"]` (адрес — ключ таблицы в файле).
+    HomeServer(PathBuf, String),
 }
 
 impl Source {
@@ -99,6 +103,9 @@ impl Source {
             Source::Env(n) => format!("env {n}"),
             Source::File(p) => format!("файл {}", p.display()),
             Source::Home(_) => "~/.zeroaimemory/config.toml".into(),
+            Source::HomeServer(_, url) => {
+                format!("~/.zeroaimemory/config.toml [servers.\"{url}\"]")
+            }
         }
     }
 }
@@ -128,6 +135,9 @@ impl std::fmt::Debug for Found {
 pub struct Resolved {
     pub url: Option<Found>,
     pub token: Option<Found>,
+    /// Токена для найденного адреса нет, а в домашнем конфиге есть токены других адресов (или
+    /// прежний `token` без `url`): на этот сервер они не отправляются (M7 §4.4).
+    pub other_server_keys: bool,
 }
 
 /// Файлы настроек больше этого размера пропускаются.
@@ -242,10 +252,77 @@ fn parse_md_parts(text: &str) -> (Pair, Pair) {
     (inside, outside)
 }
 
+/// `~/.zeroaimemory/config.toml` для поиска настроек (M7 §4.4): `url` — адрес для каталогов без
+/// своего; токены — по адресу сервера `[servers."<адрес>"]`. Прежний `token` верхнего уровня
+/// принадлежит `url` верхнего уровня. Прочие секции файла (`[hooks]`, `[code]`) читают свои модули.
 #[derive(serde::Deserialize, Default)]
 struct HomeConfig {
     url: Option<String>,
     token: Option<String>,
+    #[serde(default)]
+    servers: BTreeMap<String, ServerEntry>,
+}
+
+/// Запись `[servers."<адрес>"]`.
+#[derive(serde::Deserialize, Default)]
+struct ServerEntry {
+    token: Option<String>,
+}
+
+impl HomeConfig {
+    /// Токен адреса `url` (адреса сравниваются после [`normalize_url`]): `[servers."<адрес>"]`,
+    /// иначе прежний `token` верхнего уровня, если `url` верхнего уровня — этот адрес. Токен
+    /// другого адреса не берётся.
+    fn token_for(&self, url: &str, path: &Path) -> Option<Found> {
+        let want = normalize_url(url);
+        if let Some((k, value)) = self.server_token(&want) {
+            return Some(Found {
+                value,
+                source: Source::HomeServer(path.to_path_buf(), k.to_string()),
+            });
+        }
+        let own = nonempty(self.url.as_deref()).is_some_and(|u| normalize_url(&u) == want);
+        let value = nonempty(self.token.as_deref()).filter(|_| own)?;
+        Some(Found {
+            value,
+            source: Source::Home(path.to_path_buf()),
+        })
+    }
+
+    /// Ключ записи `[servers."<адрес>"]` нормализованного адреса `want` и её токен (ключи таблицы
+    /// сравниваются после [`normalize_url`]; запись без токена не в счёт).
+    fn server_token(&self, want: &str) -> Option<(&str, String)> {
+        self.servers
+            .iter()
+            .filter(|(k, _)| normalize_url(k) == want)
+            .find_map(|(k, e)| Some((k.as_str(), nonempty(e.token.as_deref())?)))
+    }
+
+    /// Есть ли в файле токены (любых адресов, прежний `token` — тоже).
+    fn has_tokens(&self) -> bool {
+        nonempty(self.token.as_deref()).is_some()
+            || self
+                .servers
+                .values()
+                .any(|e| nonempty(e.token.as_deref()).is_some())
+    }
+}
+
+/// Адрес сервера для сравнения и ключа `[servers."<адрес>"]` домашнего конфига (M7 §4.4): без
+/// пробелов по краям и `/` в конце, схема и хост — в нижнем регистре; userinfo, порт, путь и
+/// запрос — как есть. Строка без `://` — только без пробелов и `/` в конце.
+pub fn normalize_url(u: &str) -> String {
+    let u = u.trim().trim_end_matches('/');
+    let Some((scheme, rest)) = u.split_once("://") else {
+        return u.to_string();
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let (user, host) = authority.split_at(authority.rfind('@').map_or(0, |i| i + 1));
+    format!(
+        "{}://{user}{}{tail}",
+        scheme.to_ascii_lowercase(),
+        host.to_lowercase()
+    )
 }
 
 fn nonempty(v: Option<&str>) -> Option<String> {
@@ -317,7 +394,8 @@ pub fn resolve(
             }
         }
     }
-    // 4. ~/.zeroaimemory/config.toml
+    // 4. ~/.zeroaimemory/config.toml: адрес — `url`; токен — только найденного адреса (M7 §4.4),
+    //    токен другого сервера на этот не отправляется
     if r.url.is_none() || r.token.is_none() {
         let path = home.join(".zeroaimemory").join("config.toml");
         let cfg: HomeConfig = match read_limited(&path) {
@@ -338,12 +416,10 @@ pub fn resolve(
             });
         }
         if r.token.is_none()
-            && let Some(value) = nonempty(cfg.token.as_deref())
+            && let Some(url) = &r.url
         {
-            r.token = Some(Found {
-                value,
-                source: Source::Home(path),
-            });
+            r.token = cfg.token_for(&url.value, &path);
+            r.other_server_keys = r.token.is_none() && cfg.has_tokens();
         }
     }
     if let Some(u) = r.url.as_mut() {
@@ -352,18 +428,18 @@ pub fn resolve(
     Ok(r)
 }
 
-/// Что `zam init` делает с `~/.zeroaimemory/config.toml` (§14.1; fix round 1, I-6).
+/// Что `zam init` делает с `~/.zeroaimemory/config.toml` (§14.1; fix round 1, I-6; M7 §4.4).
 #[derive(Debug, PartialEq, Eq)]
 pub enum HomePlan {
-    /// Там уже этот токен и адрес.
+    /// Там уже этот токен этого адреса (и адрес верхнего уровня, если он нужен).
     Unchanged,
-    /// Записать `text` в `path`; `replaced` — заменяется другой токен.
+    /// Записать `text` в `path`; `replaced` — заменяется другой токен этого адреса.
     Write {
         path: PathBuf,
         text: String,
         replaced: bool,
     },
-    /// Там другой токен, а `--token` не задан: не трогать, предупредить.
+    /// Там другой токен этого адреса, а `--token` не задан: не трогать, предупредить.
     Conflict(PathBuf),
 }
 
@@ -387,36 +463,85 @@ fn home_url(t: &toml::Table) -> Option<&str> {
         .filter(|u| !u.is_empty())
 }
 
-/// План записи токена `token` и адреса `url` в `~/.zeroaimemory/config.toml`: остальные ключи
-/// сохраняются (комментарии — нет: файл пишет `zam`). Без `url` (`zam init --url-to local`,
-/// M6.6 §10.1) адрес файла не трогается. Другой токен заменяется, только если `force`
-/// (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
+/// План записи токена `token` адреса `url` в `~/.zeroaimemory/config.toml` (M7 §4.4): ключом
+/// `[servers."<адрес>"]` (адрес — [`normalize_url`]); токены других адресов не трогаются.
+/// Прежний формат переводится в новый без потери ключа: `token` верхнего уровня уходит в
+/// `[servers."<url верхнего уровня>"]`, если там своего нет (тогда действует свой, прежний и так
+/// не читался), а `url` остаётся — адрес для каталогов без своего; `token`
+/// без `url` ничей — убирается, только если это и есть записываемый токен. `top_url`
+/// (`--url-to home`, M6.6 §10.1) — записать и `url` верхнего уровня; иначе он не трогается.
+/// Остальные ключи сохраняются (комментарии — нет: файл пишет `zam`). Другой токен этого адреса
+/// заменяется, только если `force` (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
 pub fn plan_home(
     home: &Path,
-    url: Option<&str>,
+    url: &str,
     token: &str,
     force: bool,
+    top_url: bool,
 ) -> Result<HomePlan, String> {
     let (path, mut t) = home_table(home)?;
-    let url = url.map(|u| u.trim().trim_end_matches('/'));
-    let old_token = t.get("token").and_then(toml::Value::as_str);
-    if old_token == Some(token) && (url.is_none() || home_url(&t) == url) {
+    // форма файла — как у поиска настроек (`servers` не таблица — ошибка, а не тихая чистка)
+    let cfg: HomeConfig = toml::Value::Table(t.clone())
+        .try_into()
+        .map_err(|e| format!("не удалось разобрать {}: {e}", path.display()))?;
+    let key = normalize_url(url);
+    let old = cfg.token_for(&key, &path).map(|f| f.value);
+    let top_token = nonempty(cfg.token.as_deref());
+    let legacy_url = nonempty(cfg.url.as_deref()).map(|u| normalize_url(&u));
+    let migrate =
+        top_token.is_some() && (legacy_url.is_some() || top_token.as_deref() == Some(token));
+    let url_kept = !top_url || legacy_url.as_deref() == Some(key.as_str());
+    if old.as_deref() == Some(token) && !migrate && url_kept {
         return Ok(HomePlan::Unchanged);
     }
-    let replaced = old_token.is_some_and(|o| o != token);
+    let replaced = old.as_deref().is_some_and(|o| o != token);
     if replaced && !force {
         return Ok(HomePlan::Conflict(path));
     }
-    if let Some(u) = url {
+    let mut servers = match t.remove("servers") {
+        Some(toml::Value::Table(s)) => s,
+        _ => toml::Table::new(),
+    };
+    if migrate {
+        t.remove("token");
+        if let (Some(lu), Some(lt)) = (&legacy_url, &top_token)
+            && cfg.server_token(lu).is_none()
+        {
+            set_server_token(&mut servers, lu, lt);
+        }
+    }
+    set_server_token(&mut servers, &key, token);
+    t.insert("servers".into(), toml::Value::Table(servers));
+    if top_url {
+        let u = url.trim().trim_end_matches('/');
         t.insert("url".into(), toml::Value::String(u.to_string()));
     }
-    t.insert("token".into(), toml::Value::String(token.to_string()));
     let text = toml::to_string(&t).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(HomePlan::Write {
         path,
         text,
         replaced,
     })
+}
+
+/// Токен `token` адреса `key` (нормализованного) — в `[servers."<key>"]`; записи того же адреса
+/// под другим написанием ключа сливаются в эту (их прочие поля сохраняются).
+fn set_server_token(servers: &mut toml::Table, key: &str, token: &str) {
+    let same: Vec<String> = servers
+        .keys()
+        .filter(|k| normalize_url(k) == key)
+        .cloned()
+        .collect();
+    let mut entry = toml::Table::new();
+    for k in same {
+        if let Some(toml::Value::Table(e)) = servers.remove(&k) {
+            for (f, v) in e {
+                entry.insert(f, v);
+            }
+        }
+    }
+    entry.insert("token".into(), toml::Value::String(token.to_string()));
+    servers.insert(key.to_string(), toml::Value::Table(entry));
 }
 
 /// Что `zam init --url-to home` делает с адресом в `~/.zeroaimemory/config.toml` (M6.6 §10.1).
@@ -430,13 +555,14 @@ pub enum HomeUrlPlan {
     Conflict { path: PathBuf, old: String },
 }
 
-/// План записи одного адреса `url` в `~/.zeroaimemory/config.toml`: токен и остальные ключи
-/// не трогаются; там уже другой адрес — [`HomeUrlPlan::Conflict`]. Битый файл — ошибка.
+/// План записи одного адреса `url` в `~/.zeroaimemory/config.toml`: токены и остальные ключи
+/// не трогаются; там уже другой адрес (сравнение — после [`normalize_url`]) —
+/// [`HomeUrlPlan::Conflict`]. Битый файл — ошибка.
 pub fn plan_home_url(home: &Path, url: &str) -> Result<HomeUrlPlan, String> {
     let (path, mut t) = home_table(home)?;
     let url = url.trim().trim_end_matches('/');
     match home_url(&t) {
-        Some(old) if old == url => return Ok(HomeUrlPlan::Unchanged),
+        Some(old) if normalize_url(old) == normalize_url(url) => return Ok(HomeUrlPlan::Unchanged),
         Some(old) => {
             return Ok(HomeUrlPlan::Conflict {
                 path,
@@ -720,8 +846,8 @@ mod tests {
             source: Source::Flag,
         };
         let r = Resolved {
-            url: None,
             token: Some(f.clone()),
+            ..Resolved::default()
         };
         assert!(!format!("{f:?}").contains(TOKEN));
         assert!(!format!("{r:?}").contains(TOKEN));
@@ -750,6 +876,9 @@ mod tests {
         }
         write(&format!("token = \"t\"\nurl = \"{u}/\"\n"));
         assert_eq!(plan_home_url(&home, u).unwrap(), HomeUrlPlan::Unchanged);
+        // адреса сравниваются после нормализации (M7 §4.4)
+        write("url = \"HTTP://192.0.2.5:7700/\"\n");
+        assert_eq!(plan_home_url(&home, u).unwrap(), HomeUrlPlan::Unchanged);
         write("url = \"http://198.51.100.1:7700\"\n");
         assert_eq!(
             plan_home_url(&home, u).unwrap(),
@@ -768,21 +897,249 @@ mod tests {
         assert_eq!(t["hooks"]["prompt"].as_bool(), Some(false));
         write("url = [");
         assert!(plan_home_url(&home, u).is_err());
-        // без адреса: только токен
-        write("url = \"http://198.51.100.1:7700\"\ntoken = \"t\"\n");
-        assert_eq!(
-            plan_home(&home, None, "t", false).unwrap(),
-            HomePlan::Unchanged
-        );
-        let HomePlan::Write { text, replaced, .. } = plan_home(&home, None, "t2", true).unwrap()
+        // токен без адреса верхнего уровня (`--url-to local`, block): адрес домашнего конфига
+        // не трогается
+        write("url = \"http://198.51.100.1:7700\"\n");
+        let HomePlan::Write { text, replaced, .. } =
+            plan_home(&home, u, "t2", true, false).unwrap()
         else {
-            panic!("замена токена");
+            panic!("запись токена");
         };
-        assert!(replaced);
-        assert!(
-            text.contains("http://198.51.100.1:7700") && text.contains("t2"),
+        assert!(!replaced);
+        let t: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(
+            t["url"].as_str(),
+            Some("http://198.51.100.1:7700"),
             "{text}"
         );
+        assert_eq!(t["servers"][u]["token"].as_str(), Some("t2"), "{text}");
+    }
+
+    /// Домашний конфиг для ключей по адресу (M7 §4.4).
+    fn home_with(name: &str, text: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = tmp(name);
+        let home = root.join("home");
+        let cfg = home.join(".zeroaimemory").join("config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, text).unwrap();
+        (root, home, cfg)
+    }
+
+    fn at(url: &str) -> Flags {
+        Flags {
+            url: Some(url.into()),
+            token: None,
+        }
+    }
+
+    /// M7 §4.4: прежние `url`/`token` верхнего уровня — ключ этого `url`, `[servers."<адрес>"]` —
+    /// ключ своего адреса (с «/» в конце и в другом регистре хоста — тот же); адрес без ключа —
+    /// без токена, ключ другого адреса не берётся; флаг, `ZAM_TOKEN` и файл проекта сильнее.
+    #[test]
+    fn home_config_legacy_and_two_servers() {
+        let (root, home, cfg) = home_with(
+            "servers",
+            "url = \"http://a:1\"\ntoken = \"t1\"\n\n[servers.\"http://b:2\"]\ntoken = \"t2\"\n",
+        );
+        // адрес проекта — из CLAUDE.md
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("CLAUDE.md"), "ZeroAIMemoryUrl=http://b:2/\n").unwrap();
+        let r = res(&Flags::default(), &[], &proj, &home);
+        assert_eq!(r.url.as_ref().unwrap().value, "http://b:2");
+        let t = r.token.unwrap();
+        assert_eq!(t.value, "t2");
+        assert_eq!(
+            t.source,
+            Source::HomeServer(cfg.clone(), "http://b:2".into())
+        );
+        assert_eq!(
+            t.source.describe(),
+            "~/.zeroaimemory/config.toml [servers.\"http://b:2\"]"
+        );
+        let t = res(&at("http://A:1"), &[], &root, &home).token.unwrap();
+        assert_eq!(t.value, "t1");
+        assert_eq!(t.source, Source::Home(cfg.clone()));
+        let r = res(&at("http://c:3"), &[], &root, &home);
+        assert!(r.token.is_none(), "{r:?}");
+        assert!(r.other_server_keys);
+        // адрес — из домашнего конфига, ключ — его
+        let r = res(&Flags::default(), &[], &root, &home);
+        assert_eq!(r.url.unwrap().value, "http://a:1");
+        assert_eq!(r.token.unwrap().value, "t1");
+        assert!(!r.other_server_keys);
+        // флаг, ZAM_TOKEN и ключ в файлах проекта — сильнее домашнего конфига
+        let f = Flags {
+            url: Some("http://b:2".into()),
+            token: Some("flag".into()),
+        };
+        assert_eq!(res(&f, &[], &root, &home).token.unwrap().value, "flag");
+        let e = env(&[("ZAM_TOKEN", "env")]);
+        assert_eq!(
+            res(&at("http://b:2"), &e, &root, &home)
+                .token
+                .unwrap()
+                .value,
+            "env"
+        );
+        std::fs::write(proj.join("CLAUDE.md"), block("http://b:2", "file")).unwrap();
+        assert_eq!(
+            res(&Flags::default(), &[], &proj, &home)
+                .token
+                .unwrap()
+                .value,
+            "file"
+        );
+    }
+
+    /// M7 §4.4: прежний формат — ключ только своего `url`; `token` без `url` — ничей.
+    #[test]
+    fn home_token_not_sent_to_other_server() {
+        let (root, home, cfg) = home_with("othersrv", "url = \"http://a:1\"\ntoken = \"t1\"\n");
+        let r = res(&at("http://b:2"), &[], &root, &home);
+        assert_eq!(r.url.as_ref().unwrap().value, "http://b:2");
+        assert!(r.token.is_none(), "{r:?}");
+        assert!(r.other_server_keys);
+        std::fs::write(&cfg, "token = \"t1\"\n").unwrap();
+        let r = res(&at("http://a:1"), &[], &root, &home);
+        assert!(r.token.is_none(), "{r:?}");
+        assert!(r.other_server_keys);
+        // ключей нет вовсе — признака нет
+        std::fs::write(&cfg, "[hooks]\nprompt = false\n").unwrap();
+        let r = res(&at("http://a:1"), &[], &root, &home);
+        assert!(r.token.is_none() && !r.other_server_keys, "{r:?}");
+    }
+
+    #[test]
+    fn normalize_url_lowercases_scheme_and_host_only() {
+        assert_eq!(
+            normalize_url(" HTTP://Srv.Lan:7700/ "),
+            "http://srv.lan:7700"
+        );
+        assert_eq!(
+            normalize_url("https://H:1/Zam/Api//"),
+            "https://h:1/Zam/Api"
+        );
+        assert_eq!(normalize_url("http://User@HOST"), "http://User@host");
+        assert_eq!(normalize_url("http://H?Q=A"), "http://h?Q=A");
+        assert_eq!(normalize_url("Host:7700/"), "Host:7700");
+    }
+
+    /// M7 §4.4: `zam init --token` пишет `[servers."<адрес>"]`, другой адрес не трогает и не
+    /// считает заменой; прежний формат переводится в новый без потери ключа (`url` верхнего
+    /// уровня остаётся); тот же ключ — без записи; другой ключ того же адреса — только `force`.
+    #[test]
+    fn plan_home_keys_by_server() {
+        let (a, b) = ("http://192.0.2.1:7700", "http://192.0.2.2:7700");
+        let t1 = ["zam_", "t1"].concat();
+        let t2 = ["zam_", "t2"].concat();
+        let (_, home, cfg) = home_with("planservers", "");
+        std::fs::remove_file(&cfg).unwrap();
+        let write = |plan: HomePlan| -> bool {
+            let HomePlan::Write {
+                path,
+                text,
+                replaced,
+            } = plan
+            else {
+                panic!("{plan:?}");
+            };
+            assert_eq!(path, cfg);
+            std::fs::write(&cfg, text).unwrap();
+            replaced
+        };
+        let table =
+            || -> toml::Table { toml::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap() };
+        assert!(!write(
+            plan_home(&home, &format!("{a}/"), &t1, false, false).unwrap()
+        ));
+        assert!(!write(plan_home(&home, b, &t2, false, false).unwrap()));
+        let t = table();
+        assert_eq!(
+            t["servers"][a]["token"].as_str(),
+            Some(t1.as_str()),
+            "{t:?}"
+        );
+        assert_eq!(
+            t["servers"][b]["token"].as_str(),
+            Some(t2.as_str()),
+            "{t:?}"
+        );
+        assert!(t.get("url").is_none() && t.get("token").is_none(), "{t:?}");
+        // тот же ключ (адрес в другом регистре) — без записи; другой ключ — только force
+        assert_eq!(
+            plan_home(&home, "HTTP://192.0.2.2:7700", &t2, true, false).unwrap(),
+            HomePlan::Unchanged
+        );
+        assert_eq!(
+            plan_home(&home, b, &t1, false, false).unwrap(),
+            HomePlan::Conflict(cfg.clone())
+        );
+        assert!(write(plan_home(&home, b, &t1, true, false).unwrap()));
+        assert_eq!(table()["servers"][a]["token"].as_str(), Some(t1.as_str()));
+        // прежний формат: ключ верхнего уровня уходит в [servers."<url>"], url и свои ключи
+        // остаются; запись для другого адреса прежний ключ не теряет
+        std::fs::write(
+            &cfg,
+            format!("url = \"{a}/\"\ntoken = \"{t1}\"\n\n[hooks]\nprompt = false\n"),
+        )
+        .unwrap();
+        assert!(!write(plan_home(&home, b, &t2, false, false).unwrap()));
+        let t = table();
+        assert_eq!(t["url"].as_str(), Some(format!("{a}/").as_str()));
+        assert!(t.get("token").is_none(), "{t:?}");
+        assert_eq!(
+            t["servers"][a]["token"].as_str(),
+            Some(t1.as_str()),
+            "{t:?}"
+        );
+        assert_eq!(
+            t["servers"][b]["token"].as_str(),
+            Some(t2.as_str()),
+            "{t:?}"
+        );
+        assert_eq!(t["hooks"]["prompt"].as_bool(), Some(false));
+        // прежний формат и тот же ключ — перевод в новый формат
+        std::fs::write(&cfg, format!("url = \"{a}\"\ntoken = \"{t1}\"\n")).unwrap();
+        assert!(!write(plan_home(&home, a, &t1, false, false).unwrap()));
+        let t = table();
+        assert!(t.get("token").is_none(), "{t:?}");
+        assert_eq!(
+            t["servers"][a]["token"].as_str(),
+            Some(t1.as_str()),
+            "{t:?}"
+        );
+        // `token` без `url` — ничей: другой адрес его не трогает, запись того же токена убирает
+        std::fs::write(&cfg, format!("token = \"{t1}\"\n")).unwrap();
+        assert!(!write(plan_home(&home, b, &t2, false, false).unwrap()));
+        let t = table();
+        assert_eq!(t["token"].as_str(), Some(t1.as_str()), "{t:?}");
+        assert!(t["servers"].get(a).is_none(), "{t:?}");
+        assert!(!write(plan_home(&home, a, &t1, false, false).unwrap()));
+        let t = table();
+        assert!(t.get("token").is_none(), "{t:?}");
+        assert_eq!(
+            t["servers"][a]["token"].as_str(),
+            Some(t1.as_str()),
+            "{t:?}"
+        );
+        // адрес верхнего уровня (`--url-to home`) — вместе с ключом
+        std::fs::remove_file(&cfg).unwrap();
+        assert!(!write(plan_home(&home, a, &t1, false, true).unwrap()));
+        let t = table();
+        assert_eq!(t["url"].as_str(), Some(a));
+        assert_eq!(
+            t["servers"][a]["token"].as_str(),
+            Some(t1.as_str()),
+            "{t:?}"
+        );
+        assert_eq!(
+            plan_home(&home, a, &t1, false, true).unwrap(),
+            HomePlan::Unchanged
+        );
+        // `servers` не таблица — ошибка с путём
+        std::fs::write(&cfg, "servers = 1\n").unwrap();
+        assert!(plan_home(&home, a, &t1, true, false).is_err());
     }
 
     #[test]

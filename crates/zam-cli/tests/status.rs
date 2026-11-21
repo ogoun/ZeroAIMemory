@@ -300,6 +300,72 @@ fn bad_url_scheme_exit_1() {
     }
 }
 
+/// Домашний конфиг теста с текстом `text`; `HOME`/`USERPROFILE` команды — туда.
+fn with_home(c: &mut Command, name: &str, text: &str) {
+    let dir = tmp(name);
+    std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
+    std::fs::write(dir.join(".zeroaimemory/config.toml"), text).unwrap();
+    c.env("HOME", &dir).env("USERPROFILE", &dir);
+}
+
+/// M7 §4.4: ключ из `[servers."<адрес>"]` — источник с адресом; адрес с «/» в конце находит тот же
+/// ключ. Адрес — тестового сервера (`zam status` сначала спрашивает `/health`).
+#[tokio::test(flavor = "multi_thread")]
+async fn status_names_server_token_source() {
+    let (url, token) = start("srvkey").await;
+    let o = tokio::task::spawn_blocking({
+        let (url, token) = (url.clone(), token.clone());
+        move || {
+            let mut c = zam("srvkey");
+            with_home(
+                &mut c,
+                "srvkey-home",
+                &format!("[servers.\"{url}\"]\ntoken = \"{token}\"\n"),
+            );
+            c.args(["status", "--url", &format!("{url}/")])
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    let s = out(&o);
+    assert_eq!(o.status.code(), Some(0), "{s}{}", err(&o));
+    assert!(
+        s.contains(&format!(
+            "Источник токена: ~/.zeroaimemory/config.toml [servers.\"{url}\"]\n"
+        )),
+        "{s}"
+    );
+    assert!(s.contains(&zam_core::mask_token(&token)), "{s}");
+    assert!(!s.contains(&token) && !err(&o).contains(&token));
+}
+
+/// M7 §4.4: адрес без ключа, а в домашнем конфиге — ключ другого сервера: код 1 до сети с
+/// подсказкой `zam init --url <адрес> --token`; ключ другого сервера не отправляется и не
+/// печатается — у `zam status` и у команд заметок.
+#[test]
+fn missing_token_for_url_hint() {
+    let other = ["zam_", &"7".repeat(40)].concat();
+    let home = format!("[servers.\"http://192.0.2.1:7700\"]\ntoken = \"{other}\"\n");
+    for args in [&["status"][..], &["tree"][..]] {
+        let mut c = zam("nokey");
+        with_home(&mut c, "nokey-home", &home);
+        let o = c
+            .args(args)
+            .args(["--url", "http://192.0.2.2:7700"])
+            .output()
+            .unwrap();
+        let e = err(&o);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}{e}", out(&o));
+        assert!(
+            e.contains("zam init --url http://192.0.2.2:7700 --token"),
+            "{args:?}: {e}"
+        );
+        assert!(!e.contains(&other) && !out(&o).contains(&other), "{args:?}");
+    }
+}
+
 #[test]
 fn broken_home_config_exit_1_with_path() {
     let mut c = zam("brokenhome");

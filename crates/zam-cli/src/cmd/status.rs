@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use super::{home_dir, zam_env};
+use super::{home_dir, missing_token, zam_env};
 use crate::client::{EXIT_CONFIG, EXIT_TOKEN, EXIT_UNREACHABLE, Timeouts, agent};
 use crate::locate::{self, Flags, Found};
 use crate::target::Solution;
@@ -45,6 +45,12 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
     if let Err(e) = locate::check_url(&url.value) {
         eprintln!("{e}");
         return EXIT_CONFIG;
+    }
+    // в домашнем конфиге токены только других адресов — ошибка настройки до сети (M7 §4.4)
+    if r.token.is_none() && r.other_server_keys {
+        let e = missing_token(&url.value, true);
+        eprintln!("{}", e.msg);
+        return e.code;
     }
     let solution = locate::find_solution(&cwd);
     // файл читается сразу: имя и GUID печатаются и без ответа /spaces
@@ -93,8 +99,9 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
 
     // 2. токен: /spaces
     let Some(token) = r.token else {
-        rep.print(as_json, Some("токен не задан"));
-        return EXIT_TOKEN;
+        let e = missing_token(&rep.url.value, false);
+        rep.print(as_json, Some(&e.msg));
+        return e.code;
     };
     match get(
         &agent,

@@ -20,6 +20,60 @@
 
 Ветка `m7.1-foundation` от `main` `7af69d7`.
 
+### M7.1 · Задача 2 — Ключ доступа по адресу сервера
+
+Спецификация §4.4, задача памяти `k:01M7Z4T2T4E4ERXZVBY8VBYTPT` (решение владельца
+`i:01M7Z4SBS0EJA816CCYPKPA4TA`). Ветка `m7.1-t2`.
+
+Сделано: `locate::normalize_url`; `HomeConfig.servers` (`[servers."<адрес>"] token`);
+`Source::HomeServer(путь, адрес)`; шаг 4 `locate::resolve` берёт токен только для найденного
+адреса, `Resolved.other_server_keys` — в конфиге есть токены других адресов; `plan_home` пишет
+`[servers."<адрес>"]`, переводит прежний формат; `cmd::missing_token` — общий отказ с подсказкой
+`zam init --url <адрес> --token <токен>` для `connect`, `zam status`, `zam init` и журнала хуков.
+
+Решения:
+- **[решение исполнителя, задача 2]** Код отказа. Токена для адреса нет, а в домашнем конфиге есть
+  токены других адресов (или прежний `token` без `url`) — код 1 (настройка) до обращения к сети:
+  так требует тест задания `missing_token_for_url_hint`. Токена нет вовсе — код 3, как раньше
+  (`missing_token_exit_3_prints_server`, `notes.rs` «нет токена → 3» не меняются), но с той же
+  подсказкой. `zam status` в первом случае отказывает до `/health`.
+- **[решение исполнителя, задача 2]** `token` верхнего уровня без `url` (так писал
+  `zam init --url-to local` 0.0.13-m6.6) — ничей: не отправляется ни на один адрес (буква §4.4 п. 1
+  «token верхнего уровня принадлежит url верхнего уровня» и правило владельца «ключ одного сервера
+  на другой не отправляется»). Цена — таким пользователям после обновления нужен
+  `zam init --token`; подсказка это говорит. При записи того же токена `zam init` такой `token`
+  убирает (он оказался токеном этого адреса), другой — оставляет как есть.
+- **[решение исполнителя, задача 2]** `url` верхнего уровня `zam init` пишет только в режиме
+  `--url-to home`. Раньше `block` писал его вместе с токеном, чтобы привязать токен к адресу; теперь
+  привязка — ключ `[servers]`, а `url` верхнего уровня — адрес машины для каталогов без своего:
+  перезаписывать его каждым `zam init` второго сервера нельзя.
+- **[решение исполнителя, задача 2]** Тот же адрес, другой токен с `--token` — замена с прежним
+  предупреждением («был другой токен — заменён»): §4.4 п. 3 убирает предупреждение о замене ключа
+  *другого сервера*, а смена токена того же сервера — событие, о котором стоит сказать.
+- **[решение исполнителя, задача 2]** Значение адреса в `Resolved.url` не нормализуется дальше
+  прежнего (только `/` в конце): нормализация — для ключа и сравнения, адрес запросов и вывода —
+  как задан. `plan_home_url` (`--url-to home`) сравнивает адреса после нормализации, как и ключи.
+- Тесты `init_second_server_keeps_first`, `init_migrates_legacy_home_config`,
+  `status_names_server_token_source` ходят на тестовые серверы `127.0.0.1:<порт>` (`zam init` и
+  `zam status` обращаются к серверу), адреса RFC 5737 — в `missing_token_for_url_hint` и юнит-тестах
+  `plan_home_keys_by_server`. В задании `cargo test -p zam-cli --lib locate`, но у `zam-cli` нет
+  цели lib — юнит-тесты гоняются `--bin zam locate`.
+- Изменены и прежние тесты формата записи (`init_creates_solution_block_hooks_mcp`,
+  `init_bom_files_and_v1_token_without_flag`, `init_url_local_writes_claude_local_and_exclude`,
+  `home_url_plan_keeps_token_and_refuses_other_url`): они проверяли `token`/`url` верхнего уровня
+  после `zam init`. Тесты порядка поиска (`flag_beats_env_beats_file_beats_home` и др.) не менялись.
+
+Прогоны (Windows, `CARGO_TARGET_DIR=target\m71-t2`, `-j 2`):
+- RED: `cargo test -p zam-cli --bin zam locate` — 5 из 19 падают (`home_config_legacy_and_two_servers`:
+  ключ `t1` вместо `t2`; `home_token_not_sent_to_other_server`: `t1` ушёл на `http://b:2`;
+  `plan_home_keys_by_server`: `Conflict` для второго адреса; нормализация; `plan_home_url` —
+  `Conflict` на `HTTP://…/`); `--test status` — 2 из 2 новых (код 2 «недоступен» вместо 1; код 3
+  «токен не задан» при ключе в `[servers]`); `--test init` — 5 из 5 (нет `[servers]`;
+  «был другой токен — заменён» у второго сервера).
+- GREEN: `--bin zam locate` 19/19; `--test init` 30/30; `--test status` 12/12; `--test hooks`
+  113/113; `--test mcp_bind` 4/4; `cargo clippy -p zam-cli --all-targets -- -D warnings` и
+  `cargo fmt -p zam-cli -- --check` — чисто.
+
 ## Уточнить у владельца
 
 (пока пусто)
