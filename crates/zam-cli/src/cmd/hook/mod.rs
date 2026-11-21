@@ -523,8 +523,13 @@ impl Env {
                 return None;
             }
         };
-        let (Some(url), Some(token)) = (r.url, r.token) else {
+        let Some(url) = r.url else {
             self.log("не заданы адрес сервера или токен");
+            return None;
+        };
+        // токена этого адреса нет — подсказка `zam init` (M7 §4.4)
+        let Some(token) = r.token else {
+            self.log(&super::missing_token(&url.value, r.other_server_keys).msg);
             return None;
         };
         if let Err(e) = locate::check_url(&url.value) {

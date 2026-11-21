@@ -6666,6 +6666,40 @@ fn queue_lock_and_size_limit() {
     assert_eq!(puts(&seen).len(), 1, "{}", p.log());
 }
 
+/// M7 §4.4 (круг правок 1): адрес без токена, а в домашнем конфиге — токен другого сервера:
+/// `session-start` на сервер не идёт, а пишет в `hooks.log` подсказку
+/// `zam init --url <адрес> --token`; токен другого сервера в журнал не попадает.
+#[test]
+fn missing_token_for_url_logged() {
+    let p = Proj::new("hook-nokey", DEAD, "zam_x");
+    let other = ["zam_", &"8".repeat(40)].concat();
+    std::fs::write(
+        p.home.join(".zeroaimemory/config.toml"),
+        format!(
+            "[code]\nauto = false\n\n[servers.\"http://192.0.2.1:7700\"]\ntoken = \"{other}\"\n"
+        ),
+    )
+    .unwrap();
+    let ev = p.ev("SessionStart", "nk-1", json!({"source": "startup"}));
+    let o = p
+        .cmd("http://192.0.2.2:7700")
+        .env_remove("ZAM_TOKEN")
+        .env("ZAM_TEST_HOOK_BUDGET_MS", ROOMY_BUDGET_MS)
+        .args(["hook", "session-start", "--agent", "claude"])
+        .write_stdin(ev.to_string().into_bytes())
+        .output()
+        .unwrap();
+    ok(&o);
+    let log = p.log();
+    assert!(
+        log.contains("нет токена для http://192.0.2.2:7700")
+            && log.contains("zam init --url http://192.0.2.2:7700 --token"),
+        "{log}"
+    );
+    assert!(!log.contains("не заданы адрес сервера или токен"), "{log}");
+    assert!(!log.contains(&other), "{log}");
+}
+
 /// Ревью 17b, Minor 11: без адреса сервера `session-start` пишет одну строку «не заданы адрес
 /// сервера или токен» (снимок — только в очередь).
 #[test]

@@ -218,9 +218,10 @@ pub fn block_without_url(file: &str, block: &str, urls: &[String]) -> Result<Str
     Ok(rest)
 }
 
-/// План адреса `--url-to home`: другой адрес в домашнем конфиге — отказ (код 1).
-pub fn plan_home(home: &Path, url: &str) -> Result<locate::HomeUrlPlan, CliError> {
-    match locate::plan_home_url(home, url).map_err(CliError::config)? {
+/// План адреса `--url-to home`: другой адрес в домашнем конфиге — отказ (код 1); ключ без адреса,
+/// не равный `token` (записываемому или найденному для адреса), — тоже (M7 §4.4).
+pub fn plan_home(home: &Path, url: &str, token: &str) -> Result<locate::HomeUrlPlan, CliError> {
+    match locate::plan_home_url(home, url, token).map_err(CliError::config)? {
         locate::HomeUrlPlan::Conflict { path, old } => Err(CliError::config(format!(
             "{}: там уже адрес {old} — он общий для всех проектов машины. Адрес только этого \
              проекта — zam init --url-to local (CLAUDE.local.md); сменить общий — поправьте url \

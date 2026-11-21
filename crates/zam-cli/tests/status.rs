@@ -300,6 +300,125 @@ fn bad_url_scheme_exit_1() {
     }
 }
 
+/// Домашний конфиг теста с текстом `text`; `HOME`/`USERPROFILE` команды — туда.
+fn with_home(c: &mut Command, name: &str, text: &str) {
+    let dir = tmp(name);
+    std::fs::create_dir_all(dir.join(".zeroaimemory")).unwrap();
+    std::fs::write(dir.join(".zeroaimemory/config.toml"), text).unwrap();
+    c.env("HOME", &dir).env("USERPROFILE", &dir);
+}
+
+/// M7 §4.4: ключ из `[servers."<адрес>"]` — источник с адресом; адрес с «/» в конце находит тот же
+/// ключ. Адрес — тестового сервера (`zam status` сначала спрашивает `/health`).
+#[tokio::test(flavor = "multi_thread")]
+async fn status_names_server_token_source() {
+    let (url, token) = start("srvkey").await;
+    let o = tokio::task::spawn_blocking({
+        let (url, token) = (url.clone(), token.clone());
+        move || {
+            let mut c = zam("srvkey");
+            with_home(
+                &mut c,
+                "srvkey-home",
+                &format!("[servers.\"{url}\"]\ntoken = \"{token}\"\n"),
+            );
+            c.args(["status", "--url", &format!("{url}/")])
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    let s = out(&o);
+    assert_eq!(o.status.code(), Some(0), "{s}{}", err(&o));
+    assert!(
+        s.contains(&format!(
+            "Источник токена: ~/.zeroaimemory/config.toml [servers.\"{url}\"]\n"
+        )),
+        "{s}"
+    );
+    assert!(s.contains(&zam_core::mask_token(&token)), "{s}");
+    assert!(!s.contains(&token) && !err(&o).contains(&token));
+}
+
+/// M7 §4.4 (решение координатора): ключ без адреса (`token` без `url`) и пустой `[servers]` —
+/// ключ уходит на адрес проекта, как в 0.0.13-m6.6; примечание с командой привязки, без ключа.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_uses_unbound_token_with_note() {
+    let (url, token) = start("unbound").await;
+    let o = tokio::task::spawn_blocking({
+        let (url, token) = (url.clone(), token.clone());
+        move || {
+            let mut c = zam("unbound");
+            with_home(
+                &mut c,
+                "unbound-home",
+                &format!("token = \"{token}\"\n\n[servers]\n"),
+            );
+            c.args(["status", "--url", &url]).output().unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    let (s, e) = (out(&o), err(&o));
+    assert_eq!(o.status.code(), Some(0), "{s}{e}");
+    assert!(
+        s.contains("Источник токена: ~/.zeroaimemory/config.toml\n"),
+        "{s}"
+    );
+    assert!(
+        e.contains("ключ без адреса")
+            && e.contains(&format!("привяжите: zam init --url {url} --token")),
+        "{e}"
+    );
+    assert!(e.contains(&zam_core::mask_token(&token)), "{e}");
+    assert!(!s.contains(&token) && !e.contains(&token));
+}
+
+/// M7 §4.4: адрес без ключа, а в домашнем конфиге — ключ другого сервера: код 1 до сети с
+/// подсказкой `zam init --url <адрес> --token`; ключ другого сервера не отправляется и не
+/// печатается — у `zam status` и у команд заметок.
+#[test]
+fn missing_token_for_url_hint() {
+    let other = ["zam_", &"7".repeat(40)].concat();
+    let home = format!("[servers.\"http://192.0.2.1:7700\"]\ntoken = \"{other}\"\n");
+    for args in [&["status"][..], &["tree"][..]] {
+        let mut c = zam("nokey");
+        with_home(&mut c, "nokey-home", &home);
+        let o = c
+            .args(args)
+            .args(["--url", "http://192.0.2.2:7700"])
+            .output()
+            .unwrap();
+        let e = err(&o);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}{e}", out(&o));
+        assert!(
+            e.contains("zam init --url http://192.0.2.2:7700 --token"),
+            "{args:?}: {e}"
+        );
+        assert!(!e.contains(&other) && !out(&o).contains(&other), "{args:?}");
+    }
+    // `--json` — отчёт с полем `error`, как у кода 3 (круг правок 1)
+    let mut c = zam("nokey");
+    with_home(&mut c, "nokey-home", &home);
+    let o = c
+        .args(["status", "--json", "--url", "http://192.0.2.2:7700"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}{}", out(&o), err(&o));
+    let v: serde_json::Value =
+        serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}", out(&o)));
+    assert_eq!(v["url"], "http://192.0.2.2:7700", "{v}");
+    assert!(v["token"].is_null(), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("zam init --url http://192.0.2.2:7700 --token")),
+        "{v}"
+    );
+    assert!(!out(&o).contains(&other));
+}
+
 #[test]
 fn broken_home_config_exit_1_with_path() {
     let mut c = zam("brokenhome");
