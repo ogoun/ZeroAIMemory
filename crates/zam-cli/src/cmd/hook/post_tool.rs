@@ -15,9 +15,10 @@
 //!
 //! M7.1 §4.6: ожидаемый ненулевой код ([`expected_exit`]: `grep`, `diff`, `test`… с кодом 1 без
 //! stderr) — не ошибка, а успех команды (`Ev::Cmd {ok: true}`, без сети); сбой класса «не
-//! повторяй» ([`dont_repeat_class`]: 401, 403, квота, диск, 429, 400/422) — строка класса раз за
-//! сессию на класс и отпечаток, локальные `error_regex` и петля, без запроса к серверу; в запрос
-//! `/recall(post_tool)` — слова путей команды `path_words` ([`zam_core::shell::path_words`],
+//! повторяй» ([`dont_repeat_class`]: 401, 403, квота, диск, 429, 400/422) — к подсказкам сервера
+//! (запрос `/recall(post_tool)` — как у любой ошибки) и `error_regex` добавляется строка класса,
+//! построенная локально, раз за сессию на класс и отпечаток; сервер недоступен — строка всё
+//! равно есть; в запрос `/recall(post_tool)` — слова путей команды `path_words` ([`zam_core::shell::path_words`],
 //! после маскировки секретов): сервер не считает их предметом ошибки.
 //!
 //! **Успех** (M4.5 §6.3, §9.1; `PostToolUse` без ошибки; без сети, бюджет 50 мс):
@@ -193,7 +194,8 @@ fn has_diagnostics(body: &str, prog: &str) -> bool {
 }
 
 /// Класс сбоя, который повтор той же команды не исправит (M7.1 §4.6 п. 2): строка «не
-/// повторяй» ([`DontRepeat::line`]) — локально, без запроса к серверу.
+/// повторяй» ([`DontRepeat::line`]) строится локально, без сети, и добавляется к подсказкам
+/// сервера.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DontRepeat {
     /// 401, `invalid_grant` — учётные данные.
@@ -417,24 +419,6 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
         .as_ref()
         .map(|c| local_matches(&c.triggers, tool, error, env))
         .unwrap_or_default();
-    // сбой, который повтор не исправит (M7.1 §4.6 п. 2): локальные `error_regex`, строка класса
-    // и петля — без запроса к серверу; вывод без сети — в очередь учёта (M4.5 §9.5)
-    if let Some(class) = dont_repeat_class(error) {
-        let mut lines: Vec<String> = local.iter().map(|t| t.hint(LEAD)).collect();
-        lines.extend(dont_repeat_line(
-            env,
-            inp.session_id.as_deref(),
-            class,
-            &fp,
-            error,
-        ));
-        lines.extend(loop_line);
-        let text = lines.join("\n");
-        if let Some(id) = inp.session_id.as_deref() {
-            cache::note_tokens(env, id, cache::TOKENS_POST_TOOL_LOCAL, &text);
-        }
-        return Output::context(&inp.event, &text);
-    }
     // слова путей команды — не предмет ошибки (M7.1 §4.6 п. 3); значения секретов и флагов с
     // паролем не уходят (маскировка — как у команд снимка сессии)
     let path_words: Vec<String> = match (tool, command_of(inp)) {
@@ -506,6 +490,17 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
             known.push(r);
             lines.push(t.hint(LEAD));
         }
+    }
+    // сбой, который повтор не исправит (M7.1 §4.6 п. 2; решение координатора): строка класса
+    // строится локально и идёт после подсказок сервера и `error_regex` (сервер недоступен — и
+    // без них); сервер её не видел — она в очередь учёта (M4.5 §9.5)
+    if let Some(class) = dont_repeat_class(error)
+        && let Some(line) = dont_repeat_line(env, inp.session_id.as_deref(), class, &fp, error)
+    {
+        if let Some(id) = inp.session_id.as_deref() {
+            cache::note_tokens(env, id, cache::TOKENS_POST_TOOL_LOCAL, &line);
+        }
+        lines.push(line);
     }
     lines.extend(loop_line);
     Output::context(&inp.event, &lines.join("\n"))

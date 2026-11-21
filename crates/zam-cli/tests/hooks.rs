@@ -7437,9 +7437,10 @@ fn expected_exit_code_only_simple_command() {
     assert_eq!(server_asks(&p), asks, "diff: {}", p.log());
 }
 
-/// M7.1 §4.6 п. 2: сбой, который повтор не исправит, — строка класса «не повторяй» локально, без
-/// запроса к серверу; раз за сессию на класс и отпечаток: та же ошибка снова — тишина, другой
-/// отпечаток того же класса и другая сессия — строка снова. Ошибка в журнале — как обычно.
+/// M7.1 §4.6 п. 2: сбой, который повтор не исправит, — строка класса «не повторяй», построенная
+/// локально: сервер недоступен (`DEAD`), а строка есть. Запрос к серверу — как у любой ошибки
+/// (решение координатора). Раз за сессию на класс и отпечаток: та же ошибка снова — тишина,
+/// другой отпечаток того же класса и другая сессия — строка снова. Ошибка в журнале — как обычно.
 #[test]
 fn dont_repeat_line_once_per_class() {
     let _g = serial();
@@ -7468,7 +7469,42 @@ fn dont_repeat_line_once_per_class() {
         "другой отпечаток того же класса"
     );
     assert_eq!(line("dr-2", auth), AUTH_LINE, "другая сессия");
-    assert_eq!(server_asks(&p), 0, "{}", p.log());
+    assert_eq!(server_asks(&p), 5, "запрос — на каждую ошибку: {}", p.log());
+}
+
+/// Решение координатора к M7.1 §4.6 п. 2: на «HTTP 401 invalid_grant» хук спрашивает сервер, как
+/// на любую ошибку, — связанная ловушка из памяти приходит, а строка класса идёт за ней.
+#[test]
+fn dont_repeat_line_after_server_hint() {
+    let _g = serial();
+    let (url, tok) = start("dont-repeat-srv");
+    let p = Proj::new("dont-repeat-srv", &url, &tok);
+    let id = p.insight(
+        "OAuth: invalid_grant — refresh-токен отозван",
+        "failure",
+        "global",
+        &["error_regex:invalid_grant"],
+    );
+    let ev = bash_fail(
+        &p,
+        "ds",
+        "gh api user",
+        "Exit code 1\nHTTP 401 invalid_grant",
+    );
+    let c = context(&p.hook("post-tool", &ev), "PostToolUseFailure");
+    let hint = format!(
+        "ZeroAIMemory: эта ошибка уже разбиралась: OAuth: invalid_grant — refresh-токен отозван \
+         [failure·hyp] i:{id}"
+    );
+    assert!(c.starts_with(&hint), "подсказка сервера — первой: {c}");
+    assert!(
+        c.ends_with(&format!("\n{AUTH_LINE}")),
+        "строка класса — за ней: {c}"
+    );
+    assert_eq!(c.matches(AUTH_LINE).count(), 1, "{c}");
+    // повтор: подсказка сервера — снова, строка класса — нет (раз на класс и отпечаток)
+    let c = context(&p.hook("post-tool", &ev), "PostToolUseFailure");
+    assert!(c.starts_with(&hint) && !c.contains(AUTH_LINE), "{c}");
 }
 
 /// M7.1 §4.6 п. 3: в запрос `/recall(post_tool)` — слова путей команды `path_words` (аргументы
