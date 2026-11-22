@@ -13,5 +13,8 @@ regex.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# эталон CommonMark для сверки участков кода (`tests/commonmark.rs`, круг правок 5 задачи 5
+# M7.1): только для тестов — в обычную сборку клиента `zam` не попадает
+comrak.workspace = true
 # `Id` в тесте ложных срабатываний на base32-идентификаторах
 zam-core = { path = "../zam-core" }

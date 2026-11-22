@@ -7116,6 +7116,7 @@ dependencies = [
 name = "zam-secrets"
 version = "0.0.13-m6.6"
 dependencies = [
+ "comrak",
  "proptest",
  "regex",
  "zam-core",

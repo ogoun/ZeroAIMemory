@@ -1668,10 +1668,11 @@ fn code_flags_in_list_items() {
         assert!(!m.contains(&pw) && m.contains(SECRET_MARK), "{t:?} → {m:?}");
         assert_eq!(mask_text(&m), m, "повторно: {t:?}");
     }
-    // закрывающий забор левее пункта — закрывает блок: дальше проза, флаг в ней не маскируется
+    // забор левее пункта — по CommonMark конец пункта и новый блок: второй секрет тоже в коде
+    // (круг правок 5, N2; в круге 4 тест закреплял обратное)
     let t = format!("- a\n  ```\n  mysql -p{pw}\n```\nmysql -p{pw}\n");
     assert_eq!(
         mask_text(&t),
-        format!("- a\n  ```\n  mysql -p{SECRET_MARK}\n```\nmysql -p{pw}\n")
+        format!("- a\n  ```\n  mysql -p{SECRET_MARK}\n```\nmysql -p{SECRET_MARK}\n")
     );
 }

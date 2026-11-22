@@ -1,6 +1,19 @@
 //! Код в тексте Markdown без разбора comrak — **одно определение на проект** (круг правок 2
-//! задачи 5 M7.1, решение координатора): правило флагов сканера ([`code_regions`]) и
-//! `zam-markdown` (сегментация предложений, маска прозы M6.6 §6.1) берут участки кода отсюда.
+//! задачи 5 M7.1, решение координатора): правило флагов сканера и `zam-markdown` (сегментация
+//! предложений, маска прозы M6.6 §6.1) берут участки кода отсюда.
+//!
+//! Функций две (круг правок 5, решение координатора), потому что у потребителей разная цена
+//! ошибки:
+//! - [`code_regions`] — как можно ближе к CommonMark (без полного разбора контейнеров:
+//!   эвристика пунктов списков — [`fence_blocks`]); её берёт `zam-markdown`: лишний код там
+//!   прячет от поиска имена терминов и границы предложений;
+//! - [`mask_code_regions`] — для маски секретов: **объединение** [`code_regions`], правил круга 2
+//!   ([`code_regions_round2`], до учёта списков) и широкого правила ([`code_regions_loose`]:
+//!   забор после префиксов контейнеров в любом порядке — `10) >````, цитата в пункте). Эвристика
+//!   списков сходится к CommonMark плохо, а для секрета лишняя маска безопаснее утечки:
+//!   объединение не теряет кода ни против CommonMark (каждая строка блоков comrak —
+//!   тест-генератор `tests/commonmark.rs`), ни против круга 2. Три прохода и слияние интервалов
+//!   — линейно; правило флагов проходит наборы по отдельности ([`mask_code_region_sets`]).
 //!
 //! Правила (по CommonMark, без полного разбора контейнеров):
 //! - строки — с концами `\n`, `\r\n` и одиночным `\r` ([`lines_of`]);
@@ -12,7 +25,7 @@
 //! - ограждение внутри цитаты (`> ```sh`, вложенные `> >`) — блок той же цитаты: строки блока
 //!   несут те же маркеры `>`, строка с меньшей глубиной цитаты блок закрывает;
 //! - в пункте списка отступ забора считается от колонки содержимого пункта (`- ` — 2, `1. ` — 3,
-//!   вложенные — больше; [`fence_blocks`], круг правок 3 задачи 5 M7.1);
+//!   вложенные — больше; [`fence_blocks`], круги правок 3–5 задачи 5 M7.1; у круга 2 — от края);
 //! - инлайн-код: серия из n обратных кавычек — до ближайшей следующей серии той же длины, если
 //!   между ними нет пустой строки (спан может быть многострочным); серия внутри блока инлайн-код
 //!   не открывает, но закрыть может ([`code_spans`]);
@@ -160,25 +173,37 @@ pub struct FenceBlock {
 /// забор с отступом 4 и больше в пункте — забор. Колонки открытых пунктов — стеком; пункт
 /// закрывается строкой левее его колонки после пустой строки или строкой, начинающей блок
 /// (маркер, заголовок, ограждение); иначе строка — ленивое продолжение абзаца, и пункт остаётся
-/// (в сомнении — шире код: лишняя маска безопаснее утечки). Строкой левее колонки пункта (кроме
-/// пустых) кончается только блок, чей забор — забор лишь благодаря пункту (абсолютный отступ
-/// больше 3); блок с забором на отступе до 3 идёт, как и вне списка, до закрывающего забора или
-/// конца цитаты (круг правок 4: иначе в пунктах маскировалось меньше, чем в круге 2).
+/// (в сомнении — шире код). Блок пункта:
+/// - забор лишь благодаря пункту (абсолютный отступ больше 3) — блок кончается любой непустой
+///   строкой левее колонки пункта (пункт кончился; круг правок 3);
+/// - забор на отступе до 3 и забор на строке маркера — строка левее колонки пункта блок не
+///   закрывает (как и вне списка, круг правок 4), **кроме строки, начинающей блок** (забор,
+///   пункт, заголовок, цитата): по CommonMark она закрывает пункт и открывает свой блок (круг
+///   правок 5, N2; `1. ~~~\n~~~\nmysql -p…` — код);
+/// - закрывающий забор блока со строки маркера — с отступом от колонки содержимого пункта (круг
+///   правок 5, N1: `- a\n  - ```\n    x\n    ```` — блок кончается на `    ```` `).
 pub fn fence_blocks(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
     let mut out = Vec::new();
-    // открытый блок: знак, длина серии, глубина цитаты, колонка пункта, строка открытия
-    let mut open: Option<(u8, usize, usize, usize, usize)> = None;
+    // открытый блок: знак, длина серии, глубина цитаты, закрывается ли строкой левее пункта,
+    // колонка закрывающего забора, колонка пункта, строка открытия
+    let mut open: Option<(u8, usize, usize, bool, usize, usize, usize)> = None;
     // колонки содержимого открытых пунктов списка, по возрастанию
     let mut items: Vec<usize> = Vec::new();
     let mut prev_blank = true;
     for (i, l) in lines.iter().enumerate() {
         let s = &text[l.content.clone()];
-        if let Some((c, n, d, base, from)) = open {
+        if let Some((c, n, d, dedent, cbase, ibase, from)) = open {
             let (q, rest) = strip_quotes(s, d);
             let (ind, t) = indent_of(rest);
-            let dedent = base > 0 && !t.is_empty() && ind < base;
-            if q == d && !dedent {
-                let closes = ind.saturating_sub(base) <= 3
+            // строка левее колонки пункта: кончает пункт (и блок), если блок так закрывается или
+            // строка сама начинает блок — забор, пункт, заголовок, цитата (круг правок 5, N2: по
+            // CommonMark ленивого продолжения у блока кода нет)
+            let left = !t.is_empty() && ind < ibase;
+            let starts =
+                fence_run(t).is_some() || list_marker(t).is_some() || t.starts_with(['#', '>']);
+            let ends_item = left && (dedent || starts);
+            if q == d && !ends_item {
+                let closes = ind.saturating_sub(cbase) <= 3
                     && fence_run(t).is_some_and(|(c2, n2)| {
                         c2 == c && n2 >= n && t.trim_end().bytes().all(|b| b == c)
                     });
@@ -218,7 +243,9 @@ pub fn fence_blocks(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
         }
         let mut base = items.last().copied().unwrap_or(0);
         let mut on_marker = false;
-        if let Some((m, sp)) = marker
+        let mut marker = marker;
+        // маркеров на строке может быть несколько: `* - ````, `1. - ~~~` — вложенные пункты
+        while let Some((m, sp)) = marker
             && ind.saturating_sub(base) <= 3
         {
             on_marker = true;
@@ -232,9 +259,10 @@ pub fn fence_blocks(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
                 };
             }
             let sp_cols = col - ind - m;
-            // колонка содержимого: за маркером и пробелами (пустой пункт или код с отступом
-            // внутри — за одним пробелом)
-            let content = if sp == 0 || sp_cols > 4 {
+            // колонка содержимого: за маркером и пробелами; пустой пункт (за маркером — только
+            // пробелы или ничего) и код с отступом внутри — за одним пробелом
+            let empty = t.len() == m + sp;
+            let content = if sp == 0 || sp_cols > 4 || empty {
                 m + 1
             } else {
                 m + sp_cols
@@ -243,21 +271,21 @@ pub fn fence_blocks(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
             items.push(base);
             t = &t[m + sp..];
             ind = col;
+            marker = list_marker(t);
         }
         if let Some((c, n)) = fence_run(t)
             && ind.saturating_sub(base) <= 3
         {
-            // строкой левее пункта закрывается только блок, чей забор — забор лишь благодаря
-            // пункту (абсолютный отступ больше 3); забор с отступом до 3 и забор на строке маркера
-            // (`10) ```` `, `-\t```` ` — за маркером колонка больше 3) — блок по правилам круга 2:
-            // до закрывающего забора или конца цитаты (круг правок 4 задачи 5 M7.1; в сомнении —
-            // шире код)
-            let dedent_base = if ind <= 3 || on_marker { 0 } else { base };
-            open = Some((c, n, d, dedent_base, i));
+            // см. описание: строкой левее пункта кончается только блок с забором лишь благодаря
+            // пункту; закрывающий забор — от колонки пункта, кроме забора на отступе до 3 вне
+            // строки маркера (как вне списка — от края)
+            let dedent = ind > 3 && !on_marker;
+            let cbase = if dedent || on_marker { base } else { 0 };
+            open = Some((c, n, d, dedent, cbase, base, i));
         }
         prev_blank = false;
     }
-    if let Some((_, _, _, _, from)) = open {
+    if let Some((_, _, _, _, _, _, from)) = open {
         out.push(FenceBlock {
             open: from,
             last: lines.len() - 1,
@@ -410,15 +438,197 @@ pub struct CodeRegion {
     pub kind: CodeKind,
 }
 
-/// Содержимое кода `text` по порядку, без пересечений: строки блоков в ограждениях (без самих
-/// ограждений; маркеры цитаты остаются) и содержимое инлайн-кода (без обратных кавычек; спан,
-/// закрытый внутри блока, обрезается до начала блока). Пустые участки не входят.
+/// Содержимое кода `text` по порядку, без пересечений — как можно ближе к CommonMark
+/// ([`fence_blocks`]): строки блоков в ограждениях (без самих ограждений; маркеры цитаты
+/// остаются) и содержимое инлайн-кода (без обратных кавычек; спан, закрытый внутри блока,
+/// обрезается до начала блока). Пустые участки не входят. Его берёт `zam-markdown`; маска
+/// секретов — [`mask_code_regions`].
 pub fn code_regions(text: &str) -> Vec<CodeRegion> {
     let lines = lines_of(text);
-    let blocks = fence_blocks(text, &lines);
+    regions_of(text, &lines, &fence_blocks(text, &lines))
+}
+
+/// Участки кода по правилам круга 2 (коммит `2c4abf03`, до учёта списков): заборы — с отступом
+/// до трёх пробелов от края (после маркеров цитаты), пункты списков не разбираются
+/// ([`fence_blocks_round2`]); инлайн-код — тот же. Часть [`mask_code_regions`].
+pub fn code_regions_round2(text: &str) -> Vec<CodeRegion> {
+    let lines = lines_of(text);
+    regions_of(text, &lines, &fence_blocks_round2(text, &lines))
+}
+
+/// Участки кода по широкому правилу «в сомнении — код» ([`fence_blocks_loose`]): забор — после
+/// любых префиксов контейнеров в любом порядке (отступы, `>`, маркеры пунктов: `10) >````,
+/// `* - ````), пары заборов — без учёта границ контейнеров. Часть [`mask_code_regions`]: так маска
+/// не теряет строк блоков comrak там, где эвристика списков [`fence_blocks`] не разбирает
+/// вложение (цитата в пункте, пункт в цитате в пункте).
+pub fn code_regions_loose(text: &str) -> Vec<CodeRegion> {
+    let lines = lines_of(text);
+    regions_of(text, &lines, &fence_blocks_loose(text, &lines))
+}
+
+/// Наборы участков маски секретов ([`mask_code_regions`]): по CommonMark, по правилам круга 2 и
+/// широкий; совпадающие с первым не повторяются.
+pub fn mask_code_region_sets(text: &str) -> Vec<Vec<CodeRegion>> {
+    // строки — один раз; участки — только для различающихся наборов блоков (обычный текст без
+    // списков: блоки всех трёх правил совпадают — один набор)
+    let lines = lines_of(text);
+    let mut blocks = vec![fence_blocks(text, &lines)];
+    for b in [
+        fence_blocks_round2(text, &lines),
+        fence_blocks_loose(text, &lines),
+    ] {
+        if !blocks.contains(&b) {
+            blocks.push(b);
+        }
+    }
+    blocks.iter().map(|b| regions_of(text, &lines, b)).collect()
+}
+
+/// Участки кода для маски секретов (правило флагов сканера): **объединение** [`code_regions`],
+/// [`code_regions_round2`] и широкого [`code_regions_loose`], пересёкшиеся — одним участком (вид
+/// — инлайн, если в слиянии есть инлайн-код). Для секретов лишняя маска безопаснее утечки: маска
+/// не теряет кода ни против CommonMark (строгая сверка с comrak — тесты крейта), ни против круга
+/// 2. Три прохода и слияние интервалов — линейно.
+pub fn mask_code_regions(text: &str) -> Vec<CodeRegion> {
+    let mut sets = mask_code_region_sets(text);
+    if sets.len() == 1 {
+        return sets.pop().unwrap_or_default();
+    }
+    let mut all: Vec<CodeRegion> = sets.into_iter().flatten().collect();
+    all.sort_by_key(|r| (r.range.start, std::cmp::Reverse(r.range.end)));
+    let mut out: Vec<CodeRegion> = Vec::with_capacity(all.len());
+    for r in all {
+        match out.last_mut() {
+            Some(last) if r.range.start < last.range.end => {
+                last.range.end = last.range.end.max(r.range.end);
+                if r.kind == CodeKind::Inline {
+                    last.kind = CodeKind::Inline;
+                }
+            }
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Блоки в ограждениях по правилам круга 2 (без пунктов списков): забор — [`fence_of`] после
+/// маркеров цитаты; закрывает блок забор того же знака не короче с отступом до трёх пробелов или
+/// конец цитаты; незакрытый — до конца текста.
+pub fn fence_blocks_round2(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
+    let mut out = Vec::new();
+    // открытый блок: знак, длина серии, глубина цитаты, строка открытия
+    let mut open: Option<(u8, usize, usize, usize)> = None;
+    for (i, l) in lines.iter().enumerate() {
+        let s = &text[l.content.clone()];
+        if let Some((c, n, d, from)) = open {
+            let (q, rest) = strip_quotes(s, d);
+            if q == d {
+                let closes = fence_of(rest).is_some_and(|(c2, n2)| {
+                    c2 == c && n2 >= n && rest.trim().bytes().all(|b| b == c)
+                });
+                if closes {
+                    out.push(FenceBlock {
+                        open: from,
+                        last: i,
+                        closed: true,
+                    });
+                    open = None;
+                }
+                continue;
+            }
+            out.push(FenceBlock {
+                open: from,
+                last: i - 1,
+                closed: false,
+            });
+            open = None;
+        }
+        let (d, rest) = strip_quotes(s, usize::MAX);
+        if let Some((c, n)) = fence_of(rest) {
+            open = Some((c, n, d, i));
+        }
+    }
+    if let Some((_, _, _, from)) = open {
+        out.push(FenceBlock {
+            open: from,
+            last: lines.len() - 1,
+            closed: false,
+        });
+    }
+    out
+}
+
+/// Широкие блоки ([`code_regions_loose`]): строка без префиксов контейнеров ([`strip_containers`])
+/// — забор ([`fence_run`], отступ не ограничен) — открывает блок, если открытого нет, и
+/// закрывает открытый, если это серия того же знака не короче (и только она); незакрытый — до
+/// конца текста.
+pub fn fence_blocks_loose(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
+    let mut out = Vec::new();
+    let mut open: Option<(u8, usize, usize)> = None;
+    for (i, l) in lines.iter().enumerate() {
+        let t = strip_containers(&text[l.content.clone()]);
+        let Some((c2, n2)) = fence_run(t) else {
+            continue;
+        };
+        match open {
+            Some((c, n, from)) => {
+                if c2 == c && n2 >= n && t.trim_end().bytes().all(|b| b == c) {
+                    out.push(FenceBlock {
+                        open: from,
+                        last: i,
+                        closed: true,
+                    });
+                    open = None;
+                }
+            }
+            None => open = Some((c2, n2, i)),
+        }
+    }
+    if let Some((_, _, from)) = open {
+        out.push(FenceBlock {
+            open: from,
+            last: lines.len() - 1,
+            closed: false,
+        });
+    }
+    out
+}
+
+/// Строка без префиксов контейнеров: пробелов, табуляций, маркеров цитаты и пунктов списка — в
+/// любом порядке и сколько угодно.
+fn strip_containers(s: &str) -> &str {
+    let mut t = s;
+    loop {
+        let u = t.trim_start_matches([' ', '\t']);
+        if let Some(r) = u.strip_prefix('>') {
+            t = r;
+            continue;
+        }
+        if let Some((m, sp)) = list_marker(u)
+            && sp > 0
+        {
+            t = &u[m + sp..];
+            continue;
+        }
+        return u;
+    }
+}
+
+/// [`fenced_lines`] по правилам круга 2 ([`fence_blocks_round2`]) — для сверки маски прозы и
+/// сегментации `zam-markdown` с кругом 2.
+pub fn fenced_lines_round2(text: &str, lines: &[Line]) -> Vec<bool> {
+    let mut out = vec![false; lines.len()];
+    for b in fence_blocks_round2(text, lines) {
+        out[b.open..=b.last].iter_mut().for_each(|x| *x = true);
+    }
+    out
+}
+
+/// Участки кода по блокам `blocks` (см. [`code_regions`]).
+fn regions_of(text: &str, lines: &[Line], blocks: &[FenceBlock]) -> Vec<CodeRegion> {
     let mut fenced = vec![false; lines.len()];
     let mut out: Vec<CodeRegion> = Vec::new();
-    for b in &blocks {
+    for b in blocks {
         fenced[b.open..=b.last].iter_mut().for_each(|x| *x = true);
         let last = if b.closed {
             b.last.checked_sub(1)
@@ -435,7 +645,7 @@ pub fn code_regions(text: &str) -> Vec<CodeRegion> {
             }
         }
     }
-    let fences = fence_spans(&lines, &fenced);
+    let fences = fence_spans(lines, &fenced);
     let bytes = text.as_bytes();
     let mut fi = 0;
     for s in inline_spans(bytes, &fences, false) {
@@ -567,6 +777,10 @@ mod tests {
             fenced("-\tпункт\n\n      ```\n      y\n      ```\n"),
             ["      y"]
         );
+        // пустой пункт (за маркером только пробелы) — содержимое за одним пробелом (круг 5,
+        // случаи сверки с comrak)
+        assert_eq!(fenced("-    \n    ```\n   1. x\n"), ["   1. x\n"]);
+        assert_eq!(fenced("1.\t\n   ```sh\n ````\nx\n"), ["x\n"]);
     }
 
     /// Круг правок 4 задачи 5 M7.1: забор пункта на абсолютном отступе до 3 — блок по правилам
@@ -606,8 +820,9 @@ mod tests {
         ] {
             assert_eq!(fenced(t), [want], "{t:?}");
         }
-        // закрывающий забор левее пункта — закрывает блок; дальше — проза
-        assert_eq!(fenced("- a\n  ```\n  x\n```\nпосле\n"), ["  x"]);
+        // забор левее пункта — по CommonMark конец пункта и новый блок (круг правок 5, N2; в
+        // круге 4 он закрывал блок, и дальше шла проза)
+        assert_eq!(fenced("- a\n  ```\n  x\n```\nпосле\n"), ["  x", "после\n"]);
     }
 
     /// Инлайн-код: любая длина серии, многострочный до пустой строки (в том числе с одиночным
