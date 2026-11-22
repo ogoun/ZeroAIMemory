@@ -196,21 +196,25 @@
       }}
     >
       <Dialog.Title class="sr-title">Поиск по заметкам</Dialog.Title>
-      <input
-        bind:this={field}
-        bind:value={query}
-        {oninput}
-        {onkeydown}
-        class="q"
-        type="search"
-        placeholder="Поиск по заметкам…"
-        aria-label="Поиск по заметкам"
-        role="combobox"
-        aria-expanded={items.length > 0}
-        aria-controls="search-results"
-        aria-activedescendant={items.length ? `search-opt-${active}` : undefined}
-        autocomplete="off"
-      />
+      <div class="qrow">
+        <input
+          bind:this={field}
+          bind:value={query}
+          {oninput}
+          {onkeydown}
+          class="q"
+          type="search"
+          placeholder="Поиск по заметкам…"
+          aria-label="Поиск по заметкам"
+          role="combobox"
+          aria-expanded={items.length > 0}
+          aria-controls="search-results"
+          aria-activedescendant={items.length ? `search-opt-${active}` : undefined}
+          autocomplete="off"
+        />
+        <!-- на телефоне поиск — во весь экран: закрыть без Esc и без фона (§5.1 п. 7) -->
+        <Dialog.Close type="button" class="search-close" aria-label="Закрыть поиск">×</Dialog.Close>
+      </div>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
       {#if searched && query.trim() && (degraded !== null || warnings.length)}
         <div class="notices" role="status">
@@ -289,10 +293,24 @@
     overflow: hidden;
     clip-path: inset(50%);
   }
+  .qrow {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
   .q {
+    flex: 1;
+    min-width: 0;
     width: 100%;
     font-size: 16px;
     padding: 8px 12px;
+  }
+  :global(.search-close) {
+    display: none;
+    flex: none;
+    font-size: 22px;
+    line-height: 1;
+    padding: 4px 10px;
   }
   .results {
     list-style: none;
@@ -386,5 +404,32 @@
   .hint {
     margin: 8px 4px 0;
     font-size: 12px;
+  }
+  /* телефон: поиск во весь экран, результаты прокручиваются внутри */
+  @media (max-width: 719px) {
+    :global(.dialog.search) {
+      inset: 0;
+      transform: none;
+      width: 100%;
+      height: 100vh;
+      height: 100dvh;
+      max-height: none;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border: 0;
+      border-radius: 0;
+      padding: calc(12px + var(--safe-top)) max(12px, var(--safe-right)) calc(12px + var(--safe-bottom))
+        max(12px, var(--safe-left));
+    }
+    :global(.search-close) {
+      display: inline-grid;
+      place-items: center;
+    }
+    .results {
+      flex: 1;
+      min-height: 0;
+      max-height: none;
+    }
   }
 </style>
