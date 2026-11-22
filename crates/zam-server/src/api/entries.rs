@@ -484,6 +484,11 @@ pub async fn create(
     );
     let mut v = agent_view::view_json_owned(&p, v, ENTRY_FIELDS).await?;
     agent_view::view_json(&p, &mut v, &["warnings"]);
+    // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
+    // координатора по задаче 6 M7.1); повтор по ключу — без предупреждения
+    if created && agent_view::masks(&p) {
+        secret_restore::attach_kept(&mut v, secret_restore::entry_marks(&entry));
+    }
     Ok((status, Json(v)))
 }
 

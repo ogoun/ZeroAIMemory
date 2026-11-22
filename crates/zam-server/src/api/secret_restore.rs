@@ -162,6 +162,27 @@ pub fn marks_in(s: &str) -> usize {
     s.matches(SECRET_MARK).count()
 }
 
+/// Меток во всех строках значения (рекурсивно; ключи объектов — нет).
+pub fn marks_in_value(v: &Value) -> usize {
+    match v {
+        Value::String(s) => marks_in(s),
+        Value::Array(a) => a.iter().map(marks_in_value).sum(),
+        Value::Object(o) => o.values().map(marks_in_value).sum(),
+        _ => 0,
+    }
+}
+
+/// Меток в текстах созданной записи журнала — заголовок, тело, строки `data`, теги, область:
+/// при создании базы нет, каждая метка без пары (решение координатора по задаче 6 M7.1:
+/// создание по токену с `‹secret›` — то же предупреждение [`SECRET_MARK_KEPT`]).
+pub fn entry_marks(e: &zam_store::Entry) -> usize {
+    marks_in(&e.title)
+        + marks_in(&e.body)
+        + marks_in_value(&e.data)
+        + e.tags.iter().map(|t| marks_in(t)).sum::<usize>()
+        + e.area.as_deref().map_or(0, marks_in)
+}
+
 /// Строка `new` поля, прежний текст которого `base` (`None` — поля не было): восстановление на
 /// месте; меток без пары.
 pub fn restore_in_place(base: Option<&str>, new: &mut String) -> usize {

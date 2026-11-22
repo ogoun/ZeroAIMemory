@@ -1398,6 +1398,115 @@ async fn session_writes_literal_mark_as_is() {
     assert_eq!(h["body"], format!("token: {MARK} (человек)"));
 }
 
+/// Создание по токену с литералом `‹secret›` (базы нет — значение не сохранено; решение
+/// координатора по задаче 6): заметка, запись журнала каждого вида (insight, changelog, задача,
+/// идея, вопрос) — предупреждение `secret_mark_kept` с числом меток; повтор по ключу и создание
+/// без меток — без него; сессия WebUI — без предупреждения.
+#[tokio::test]
+async fn agent_create_with_mark_warns() {
+    let a = with_solution("secrets-create-mark").await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": "knowledge", "path": "ops/new-mark", "kind": "note",
+                        "content": format!("# K\n\ntoken: {MARK}\nещё {MARK}\n")}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(kept_of(&r.json()), Some(2), "{}", r.text());
+    let n = a
+        .note("knowledge", "ops/new-clean", "# K\n\nбез меток\n")
+        .await;
+    assert_eq!(kept_of(&n), None, "{n}");
+    for (space, body, want) in [
+        (
+            "knowledge",
+            json!({"kind": "insight", "title": format!("Ключ {MARK}"), "body": format!("token: {MARK}"),
+                   "data": {"kind": "gotcha"}, "force": true}),
+            2,
+        ),
+        (
+            "knowledge",
+            json!({"kind": "task", "title": "Ротация", "body": format!("ключ {MARK}"),
+                   "data": {"next_step": format!("проверить {MARK}")}}),
+            2,
+        ),
+        (
+            "knowledge",
+            json!({"kind": "idea", "title": "Идея", "body": format!("x {MARK}"),
+                   "tags": [MARK], "data": {"origin": "agent"}}),
+            2,
+        ),
+        (
+            "knowledge",
+            json!({"kind": "question", "title": "Какой ключ?", "body": format!("был {MARK}"),
+                   "force": true}),
+            1,
+        ),
+        (
+            SOL,
+            json!({"kind": "changelog", "title": "Сборка", "body": format!("token: {MARK}"),
+                   "data": {"kind": "ops"}}),
+            1,
+        ),
+    ] {
+        let uri = format!("/api/v1/spaces/{space}/entries");
+        let r = a.t(Method::POST, &uri, Some(body.clone())).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
+        assert_eq!(kept_of(&r.json()), Some(want), "{body}: {}", r.text());
+        // сессия WebUI: человек видит исходник — литерал его, без предупреждения
+        let mut human = body.clone();
+        human["title"] = json!(format!("{} (человек)", body["title"].as_str().unwrap()));
+        if human["data"].get("origin").is_some() {
+            human["data"].as_object_mut().unwrap().remove("origin");
+        }
+        let r = a.adm(Method::POST, &uri, Some(human.clone()), None).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{human}: {}", r.text());
+        assert_eq!(kept_of(&r.json()), None, "{human}: {}", r.text());
+    }
+    // повтор по ключу — запись уже создана, предупреждения нет
+    let body = json!({"kind": "task", "title": "Повтор", "body": format!("ключ {MARK}")});
+    let key = [("idempotency-key", "k-mark")];
+    let first = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(body.clone()),
+            &key,
+        )
+        .await;
+    assert_eq!(kept_of(&first.json()), Some(1), "{}", first.text());
+    let again = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(body),
+            &key,
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text());
+    assert_eq!(kept_of(&again.json()), None, "{}", again.text());
+    // человек создаёт заметку с литералом — без предупреждения
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": "knowledge", "path": "ops/human-mark", "kind": "note",
+                        "content": format!("# K\n\ntoken: {MARK}\n")}),
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(kept_of(&r.json()), None, "{}", r.text());
+}
+
 /// Замещение записи агентом по маскированному виду старой (`/supersede` и `supersedes_id`) —
 /// значения в новой записи на месте.
 #[tokio::test]

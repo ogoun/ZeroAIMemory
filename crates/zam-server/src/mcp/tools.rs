@@ -1335,6 +1335,8 @@ fn review_outcome(v: &Value) -> String {
     if v["replay"] == true {
         s.push_str(" · повтор (записано ранее)");
     }
+    // предупреждения ответа (`secret_mark_kept` задачи плана)
+    s.push_str(&warnings_inline(v));
     s
 }
 

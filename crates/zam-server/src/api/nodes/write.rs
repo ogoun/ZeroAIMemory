@@ -210,10 +210,13 @@ pub async fn create(
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
     st.docs.notify();
-    Ok((
-        StatusCode::CREATED,
-        Json(node_reply(&st, &p, &sc.db, sc.space.id, &node, &content).await?),
-    ))
+    let mut v = node_reply(&st, &p, &sc.db, sc.space.id, &node, &content).await?;
+    // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
+    // координатора по задаче 6 M7.1)
+    if agent_view::masks(&p) {
+        secret_restore::attach_kept(&mut v, secret_restore::marks_in(&content));
+    }
+    Ok((StatusCode::CREATED, Json(v)))
 }
 
 /// Ревизия из `If-Match`: `3`, `"3"` или `W/"3"`.

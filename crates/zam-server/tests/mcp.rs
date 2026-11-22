@@ -616,6 +616,34 @@ async fn mcp_write_restores_secret() {
         t.contains(&format!("token: {s}\n")) && t.contains(&format!("x {mark}")),
         "{t}"
     );
+    // создание с меткой (базы нет — значение не сохранено): заметка и запись журнала
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": "knowledge:/ops/mcp-new-mark", "content": format!("# N\n\nkey {mark}\n")}),
+    )
+    .await;
+    assert!(
+        o.text.contains("rev1") && o.text.contains("warning: secret_mark_kept: 1"),
+        "{}",
+        o.text
+    );
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "task", "space": "knowledge", "title": "Ротация",
+               "body": format!("ключ {mark}")}),
+    )
+    .await;
+    assert!(
+        o.text.contains("warning: secret_mark_kept: 1"),
+        "{}",
+        o.text
+    );
 }
 
 /// Текст заметки `uri` для человека (сессия WebUI) — исходник в базе.
