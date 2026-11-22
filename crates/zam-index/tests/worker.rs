@@ -659,6 +659,48 @@ async fn auto_l0_and_folder_rollup() {
     w.shutdown().await;
 }
 
+/// Флаг в инлайн-коде (`mysql -p…`) — единственный секрет заметки: ни авто-L0 заметки (первый
+/// абзац и сводка воркера), ни свёртка L0 папок значения не несут (круг правок 2 задачи 5 M7.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_l0_and_folder_rollup_hide_inline_flag() {
+    let e = env("rollup-flag").await;
+    // фиктивный пароль собирается из частей (push protection)
+    let pw = ["S3c", "ret", "9x"].concat();
+    let n = e
+        .note(
+            e.knowledge,
+            "ops/db/access",
+            &format!(
+                "Подключение к базе: `mysql -uroot -p{pw} prod`.\n\n## Детали\n\nБаза отвечает \
+                 медленно под нагрузкой. Индексы перестраиваются ночью. Резервная копия — утром.\n"
+            ),
+        )
+        .await;
+    assert!(
+        !get_node(&e.db, n).await.unwrap().l0.unwrap().contains(&pw),
+        "первый абзац"
+    );
+    let w = e.spawn();
+    e.indexed(n).await;
+    let node = get_node(&e.db, n).await.unwrap();
+    assert!(!node.l0.clone().unwrap().contains(&pw), "сводка воркера");
+    let db_folder = node.parent_id.unwrap();
+    let ops = get_node(&e.db, db_folder).await.unwrap().parent_id.unwrap();
+    e.until("свёртка папок", async || {
+        get_node(&e.db, ops)
+            .await
+            .unwrap()
+            .l0
+            .is_some_and(|l| l.contains("db/:"))
+    })
+    .await;
+    for f in [db_folder, ops] {
+        let l0 = get_node(&e.db, f).await.unwrap().l0.unwrap();
+        assert!(!l0.contains(&pw), "{l0}");
+    }
+    w.shutdown().await;
+}
+
 /// Ключ кэша в `chunks.embed_key` — ровно значение помощника `embed_key` (единая
 /// формула): после записи, правки и переноса (префикс меняется).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

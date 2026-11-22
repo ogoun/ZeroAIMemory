@@ -8,6 +8,8 @@
 //! Задачи журнала (M4.5 §3): `GET /sessions/{id}` несёт `claimed_tasks`; есть задача `in_progress`,
 //! захваченная сессией, и маркер правок — единственное напоминание содержит «обнови next_step
 //! задачи k:<id>» и приходит, даже если в память уже писали (сам захват — запись в память).
+//! Заголовки задач и знаний в напоминании — с маской секретов `zam-secrets` до обрезки (задача 5
+//! M7.1, [`shown_title`]).
 //! Пары «ошибка → исправление» (M4.5 §9.3, ключ `session_journal`): в журнале сессии есть пара
 //! ([`journal::fixes_at`]), а после последней не было записи insight — то же напоминание
 //! содержит «запиши gotcha/failure с error_regex: <ошибка> (правки: <файлы>)» ([`fix_line`]) и
@@ -48,7 +50,7 @@ use super::input::Input;
 use super::journal::{self, Ev};
 use super::output::Output;
 use super::snapshot_queue;
-use super::{Env, Flag, Kind, Settings, encode_segment};
+use super::{Env, Flag, Kind, Settings, encode_segment, shown_title};
 use crate::client::{Client, EXIT_NOT_FOUND, read_json};
 
 /// Срок `POST /code/impact` внутри бюджета `checkpoint` (100 мс), мс (M6 §12).
@@ -79,10 +81,7 @@ pub fn task_line(v: &serde_json::Value) -> Option<String> {
         .filter_map(|t| {
             let id = t["id"].as_str()?;
             let title = t["title"].as_str().unwrap_or("");
-            Some(format!(
-                "k:{id} («{}»)",
-                title.chars().take(60).collect::<String>()
-            ))
+            Some(format!("k:{id} («{}»)", shown_title(title, 60)))
         })
         .take(3)
         .collect();
@@ -461,15 +460,13 @@ pub fn impact_lines(v: &Value) -> Vec<String> {
             Some(sym) => format!("{path}#{sym}"),
             None => path.to_string(),
         };
-        let title: String = k["title"]
+        let one_line = k["title"]
             .as_str()
             .unwrap_or("")
             .split_whitespace()
             .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(IMPACT_TITLE_MAX)
-            .collect();
+            .join(" ");
+        let title = shown_title(&one_line, IMPACT_TITLE_MAX);
         let line = format!("ZeroAIMemory: правка затрагивает `{target}` → {id} «{title}»");
         if !out.contains(&line) {
             out.push(line);

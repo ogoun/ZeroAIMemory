@@ -391,8 +391,20 @@ fn visible_spaces(sc_role: Role, space: &Space) -> Option<Vec<Id>> {
     matches!(sc_role, Role::Member(_)).then(|| vec![space.id])
 }
 
-/// JSON выжимки: поля записи, итог проверки источников, автор и пространство.
-pub async fn cache_json(st: &AppState, h: &CacheHit, space: Option<&Space>) -> Value {
+/// JSON выжимки: поля записи, итог проверки источников, автор и пространство. Агенту `p` по
+/// токену запрос и текст выжимки — с маской секретов (задача 5 M7.1); сессии WebUI — исходник.
+pub async fn cache_json(
+    st: &AppState,
+    p: &Principal,
+    h: &CacheHit,
+    space: Option<&Space>,
+) -> Value {
+    let mut o = cache_json_raw(st, h, space).await;
+    super::agent_view::view_json(p, &mut o, &["query", "summary"]);
+    o
+}
+
+async fn cache_json_raw(st: &AppState, h: &CacheHit, space: Option<&Space>) -> Value {
     let e = &h.entry;
     let author = match st.system.get_user(e.author_user_id).await {
         Ok(Some(u)) => Some(u.name),
@@ -490,7 +502,7 @@ async fn do_promote(
     let a = attribution(p, headers, None)?;
     let (_, created) = cache_promote(&sc.db, id, to, &a).await?;
     let h = cache_get(&sc.db, id).await?.ok_or(ApiError::NotFound)?;
-    let mut v = cache_json(st, &h, Some(&sc.space)).await;
+    let mut v = cache_json(st, p, &h, Some(&sc.space)).await;
     if let Value::Object(m) = &mut v {
         m.insert("promoted".into(), json!(created));
     }
@@ -622,7 +634,7 @@ pub async fn put(
         .await
         .map_err(cache_error)?;
     let h = cache_get(&sc.db, e.id).await?.ok_or(ApiError::NotFound)?;
-    let mut v = cache_json(&st, &h, Some(&sc.space)).await;
+    let mut v = cache_json(&st, &p, &h, Some(&sc.space)).await;
     if let Value::Object(m) = &mut v {
         if let Some(t) = made {
             m.insert("promoted".into(), json!(t));
@@ -705,7 +717,7 @@ pub async fn list(
     let mut items = Vec::with_capacity(hits.len());
     for h in &hits {
         let space = spaces.iter().find(|s| s.id == h.entry.space_id);
-        items.push(cache_json(&st, h, space).await);
+        items.push(cache_json(&st, &p, h, space).await);
     }
     Ok(Json(json!({ "items": items })))
 }
@@ -756,7 +768,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let (sc, h) = locate(&st, &p, &headers, &id, Mode::Read).await?;
-    Ok(Json(cache_json(&st, &h, Some(&sc.space)).await))
+    Ok(Json(cache_json(&st, &p, &h, Some(&sc.space)).await))
 }
 
 /// `DELETE /cache/{id}`: автор, владелец пространства или администратор.

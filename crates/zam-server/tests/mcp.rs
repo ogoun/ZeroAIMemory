@@ -854,6 +854,50 @@ async fn mcp_vault_get_audited() {
     assert!(o.is_error, "{}", o.text);
 }
 
+/// Маскировка выдачи агенту (задача 5 M7.1, спецификация M7 §4.3.1) MCP покрывает сквозным
+/// REST с тем же bearer: `memory_read` заметки с ключом — `‹secret›` вместо значения; раскрытие
+/// Vault (`memory_vault get`) — способ получить ключ — отдаёт значение как есть.
+#[tokio::test]
+async fn vault_reveal_not_masked() {
+    let a = api("mcp-vault-reveal", |_| {}).await;
+    let h = sess();
+    // фиктивный ключ собирается из частей: в исходнике его нет целиком (push protection)
+    let value = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_vault",
+        json!({"action": "set", "name": "github-ci", "value": &value, "type": "token"}),
+    )
+    .await;
+    assert!(!o.text.contains(&value), "{}", o.text);
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_vault",
+        json!({"action": "get", "name": "github-ci"}),
+    )
+    .await;
+    assert!(o.text.contains(&value), "раскрытие — как есть: {}", o.text);
+    assert!(!o.text.contains("‹secret›"), "{}", o.text);
+    // заметка с тем же ключом: чтение через MCP — маска
+    let n = a
+        .note("knowledge", "ops/ci", &format!("# CI\n\ntoken: {value}\n"))
+        .await;
+    let o = ok(
+        &a,
+        &a.token,
+        &h,
+        "memory_read",
+        json!({"items": [{"id": format!("n:{}", n["id"].as_str().unwrap())}]}),
+    )
+    .await;
+    assert!(!o.text.contains(&value), "{}", o.text);
+    assert!(o.text.contains("token: ‹secret›"), "{}", o.text);
+}
+
 /// Запись окружения без значения: `memory_vault get id=v:<id>` (ссылка дайджеста) отдаёт
 /// открытые поля без строки `value`, поиск `list name=` идёт по открытым полям.
 #[tokio::test]

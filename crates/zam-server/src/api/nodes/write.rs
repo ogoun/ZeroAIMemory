@@ -39,6 +39,7 @@ use zam_store::{
 };
 
 use super::{audit_node, write_error};
+use crate::api::agent_view;
 use crate::api::entries::idempotency_key;
 use crate::api::scope::{Mode, live, node_scope, space_scope, user_db};
 use crate::api::spaces::readable_space_ids;
@@ -111,9 +112,12 @@ fn note_warnings(content: &str) -> Vec<String> {
 }
 
 /// `Node` как JSON с `warnings` (только непустые); `db` и `space` — база и пространство
-/// заметки для предупреждений о псевдонимах словаря (кэш словаря — в `st`).
+/// заметки для предупреждений о псевдонимах словаря (кэш словаря — в `st`). Агенту `p` по
+/// токену — эхо с маской (`frontmatter`, L0 и тексты предупреждений, задача 5 M7.1); находки
+/// `secrets_detected` — по исходнику `content`.
 async fn node_reply(
     st: &AppState,
+    p: &Principal,
     db: &zam_store::Db,
     space: zam_core::Id,
     node: &Node,
@@ -129,6 +133,8 @@ async fn node_reply(
     {
         o.insert("warnings".into(), json!(w));
     }
+    agent_view::view_json(p, &mut v, agent_view::NODE_FIELDS);
+    agent_view::view_json(p, &mut v, &["warnings"]);
     crate::api::secrets::attach(&mut v, content);
     Ok(v)
 }
@@ -191,7 +197,7 @@ pub async fn create(
         let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
         return Ok((
             StatusCode::OK,
-            Json(node_reply(&st, &sc.db, sc.space.id, &node, &text).await?),
+            Json(node_reply(&st, &p, &sc.db, sc.space.id, &node, &text).await?),
         ));
     }
     st.render_gen.bump_space(sc.owner, sc.space.id);
@@ -199,7 +205,7 @@ pub async fn create(
     st.docs.notify();
     Ok((
         StatusCode::CREATED,
-        Json(node_reply(&st, &sc.db, sc.space.id, &node, &content).await?),
+        Json(node_reply(&st, &p, &sc.db, sc.space.id, &node, &content).await?),
     ))
 }
 
@@ -251,9 +257,11 @@ pub async fn replace(
             } else {
                 node_content(&sc.db, n.id, Some(n.current_rev)).await?.1
             };
-            Ok(Json(node_reply(&st, &sc.db, sc.space.id, &n, &text).await?))
+            Ok(Json(
+                node_reply(&st, &p, &sc.db, sc.space.id, &n, &text).await?,
+            ))
         }
-        Err(e) => Err(write_error(&sc.db, sc.node.id, base, e).await),
+        Err(e) => Err(write_error(&p, &sc.db, sc.node.id, base, e).await),
     }
 }
 
@@ -287,9 +295,11 @@ pub async fn patch(
                 st.docs.notify();
             }
             let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
-            Ok(Json(node_reply(&st, &sc.db, sc.space.id, &n, &text).await?))
+            Ok(Json(
+                node_reply(&st, &p, &sc.db, sc.space.id, &n, &text).await?,
+            ))
         }
-        Err(e) => Err(write_error(&sc.db, sc.node.id, req.base_rev, e).await),
+        Err(e) => Err(write_error(&p, &sc.db, sc.node.id, req.base_rev, e).await),
     }
 }
 
@@ -305,7 +315,7 @@ pub async fn move_to(
     headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let req: Move = json_body(body)?;
@@ -321,7 +331,7 @@ pub async fn move_to(
     }
     st.index.notify();
     st.docs.notify();
-    Ok(Json(node))
+    Ok(Json(agent_view::node_json(&p, &node)?))
 }
 
 /// `DELETE /nodes/{id}` — мягкое удаление поддерева → 204; аудит `node.delete`.
@@ -360,7 +370,7 @@ pub async fn restore(
     headers: HeaderMap,
     client: Client,
     Path(id): Path<String>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     let author = attribution(&p, &headers, None)?.author_kind;
     let node = restore_node(&sc.db, sc.node.id, author).await?;
@@ -379,7 +389,7 @@ pub async fn restore(
         details,
     )
     .await?;
-    Ok(Json(node))
+    Ok(Json(agent_view::node_json(&p, &node)?))
 }
 
 #[derive(Deserialize)]
@@ -409,6 +419,8 @@ pub async fn trash(
             all
         }
     };
+    let mut items = json!(items);
+    agent_view::view_json(&p, &mut items, agent_view::NODE_FIELDS);
     Ok(Json(json!({ "items": items })))
 }
 

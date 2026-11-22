@@ -8,7 +8,9 @@ mod common;
 
 use common::{hex, rnd};
 use proptest::prelude::*;
-use zam_secrets::{SECRET_MARK, SecretKind, mask_flags, mask_secrets, mask_text, scan_secrets};
+use zam_secrets::{
+    SECRET_MARK, SecretKind, mask_flags, mask_secrets, mask_text, scan_flags_in_code, scan_secrets,
+};
 
 /// Шаблон фикстуры цепочки «пароль в URL ↔ ключ-значение» (`common::expand`).
 const DEPTH_FIXTURE: &str = include_str!("fixtures/scan_depth_capped.txt");
@@ -405,6 +407,96 @@ proptest! {
         let once = mask_text(&text);
         prop_assert_eq!(mask_text(&once), once);
     }
+
+    /// Круг правок 1 задачи 5 M7.1: идемпотентность и с флагами командной строки внутри кода —
+    /// заборы, обратные кавычки, переносы `\`, команды с воротами и без, вместе с атомами прочих
+    /// правил (маска одного меняет контекст другого и границы спанов).
+    #[test]
+    fn mask_text_idempotent_code_flags(
+        parts in proptest::collection::vec(
+            prop_oneof![
+                Just("```".to_string()),
+                Just("```sh\n".to_string()),
+                Just("~~~\n".to_string()),
+                Just("`".to_string()),
+                Just("``".to_string()),
+                Just("\n".to_string()),
+                Just(" \\\n".to_string()),
+                Just("mysql ".to_string()),
+                Just("curl ".to_string()),
+                Just("-uroot ".to_string()),
+                Just("-pS3cret9x".to_string()),
+                Just("-p'a b'".to_string()),
+                Just("-u admin:p4ss".to_string()),
+                Just("--user=adm:p4ss ".to_string()),
+                Just("--password \"x y\"".to_string()),
+                Just("--token=abc123def".to_string()),
+                Just("Authorization: Bearer abcdef123".to_string()),
+                Just("X-Api-Key: ".to_string()),
+                Just("$TOKEN".to_string()),
+                Just(" https://u:pw12345@h/ ".to_string()),
+                Just("password=abcdef123".to_string()),
+                Just(SECRET_MARK.to_string()),
+                Just(format!("gh{}_{}", "p", rnd(36, 44))),
+                // круг правок 2: цитаты, многострочный инлайн-код, одиночный `\r`, заглушки,
+                // JSON-заголовок, подстановка `$(…)`
+                Just("> ".to_string()),
+                Just("> ```sh\n".to_string()),
+                Just("`mysql -uroot\n-pS3cret9x`".to_string()),
+                Just("\r".to_string()),
+                Just("\n\n".to_string()),
+                Just("--token TOKEN ".to_string()),
+                Just("{\"Authorization\": \"Bearer abcdef123\"}".to_string()),
+                Just("$(".to_string()),
+                Just(")".to_string()),
+                "[A-Za-z0-9=/,:@\"' -]{1,12}",
+                "\\PC{0,8}",
+            ],
+            0..16,
+        )
+    ) {
+        let text = parts.concat();
+        let once = mask_text(&text);
+        prop_assert_eq!(mask_text(&once), once);
+    }
+}
+
+/// Бюджет на коде Markdown (профиль runbook): в каждом разделе — inline-спаны в прозе и блок
+/// ```` ```sh ```` с командами (флаги с воротами и без: `-p 8080`, `-u 1000:1000`, `curl -s`,
+/// перенос `\`), в каждом пятом — ещё `mysql -uroot -p<пароль>` и `curl -u admin:<пароль>`
+/// (≈ 120 находок на 100 КБ). Правило флагов в коде (круг правок 1 задачи 5 M7.1) проходит
+/// участки кода одним буфером: не больше 2 мс на 100 КБ (release). `cargo test -p zam-secrets
+/// --release --test secrets -- --ignored bench_scan_100kb_code --nocapture`.
+#[test]
+#[ignore]
+fn bench_scan_100kb_code() {
+    let mut text = String::new();
+    let mut i = 0u64;
+    while text.len() < 100 * 1024 {
+        let creds = if i.is_multiple_of(5) {
+            format!("mysql -uroot -pS3cret{i} db\ncurl -s -u admin:p4ss{i} https://example.com/a\n")
+        } else {
+            String::new()
+        };
+        text.push_str(&format!(
+            "## Шаг {i}\n\nЗапуск — `cargo test -p zam-cli` и `ls -la /var/log`, порт `-p 8080`.\n\n\
+             ```sh\n{creds}mysql --version\ncurl -s https://example.com/health\n\
+             docker run -u 1000:1000 -p 8080:80 image \\\n  --name app{i}\nls -la\n```\n\n"
+        ));
+        i += 1;
+    }
+    assert!(!scan_secrets(&text).is_empty());
+    let n = 20;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        std::hint::black_box(scan_secrets(&text));
+    }
+    let per = t.elapsed() / n;
+    println!("scan_secrets (код): {per:?} на {} байт", text.len());
+    assert!(
+        per <= std::time::Duration::from_millis(2),
+        "бюджет 2 мс превышен: {per:?}"
+    );
 }
 
 /// Бюджет: не больше 2 мс на 100 КБ (только release). `cargo test -p zam-secrets --release
@@ -1184,4 +1276,403 @@ fn mask_flags_moved() {
     ] {
         assert_eq!(mask_flags(t), t, "{t}");
     }
+}
+
+/// Круг правок 1 задачи 5 M7.1 (решение координатора): правила флагов командной строки — часть
+/// сканера, но **только внутри кода** Markdown: строки fenced-блоков (```` ``` ````/`~~~`, с
+/// языком и без) и inline-спаны `` `…` ``. Маскируются `mysql -uroot -pS3cret` в блоке `sh`,
+/// `curl -u admin:p4ss …` в inline-коде, `Authorization: Bearer <токен>` в блоке, перенос `\`;
+/// сторожа — проза («используйте -u для пользователя», `mysql -p…` вне кода), `ls -la`,
+/// `ssh -p 22`, `-p` без mysql и числовой `-u uid:gid` в коде. Вид — `command_flag`; повторная
+/// маскировка ничего не меняет; клиентская [`mask_flags`] по прежнему тексту — без изменений.
+#[test]
+fn code_flags_masked_and_guards() {
+    let pw = ["S3c", "ret", "9x"].concat();
+    let tok = ["Abc", "123", "Def", "456"].concat();
+    let m = SECRET_MARK;
+    let cases = [
+        (
+            format!("Вход:\n\n```sh\nmysql -uroot -p{pw} db\n```\n"),
+            format!("Вход:\n\n```sh\nmysql -uroot -p{m} db\n```\n"),
+        ),
+        (
+            format!("Запрос: `curl -u admin:{pw} https://example.com/x` и всё."),
+            format!("Запрос: `curl -u admin:{m} https://example.com/x` и всё."),
+        ),
+        (
+            format!("```http\nGET /v1 HTTP/1.1\nAuthorization: Bearer {tok}\n```"),
+            format!("```http\nGET /v1 HTTP/1.1\nAuthorization: Bearer {m}\n```"),
+        ),
+        (
+            format!("~~~\npsql --password {pw} -h db\n~~~\n"),
+            format!("~~~\npsql --password {m} -h db\n~~~\n"),
+        ),
+        (
+            format!("```\nmysql \\\n  -uroot \\\n  -p{pw}\n```\n"),
+            format!("```\nmysql \\\n  -uroot \\\n  -p{m}\n```\n"),
+        ),
+        (
+            format!("- шаг\n  ```bash\n  curl -H 'X-Api-Key: {tok}' https://h\n  ```\n"),
+            format!("- шаг\n  ```bash\n  curl -H 'X-Api-Key: {m}' https://h\n  ```\n"),
+        ),
+    ];
+    for (t, want) in &cases {
+        assert_eq!(&mask_text(t), want, "{t}");
+        assert_eq!(mask_text(want), *want, "повторно: {t}");
+        let hits = scan_flags_in_code(t);
+        assert_eq!(hits.len(), 1, "{t}: {hits:?}");
+        assert_eq!(hits[0].kind, SecretKind::CommandFlag);
+        assert_eq!(hits[0].kind.as_str(), "command_flag");
+        let want_value = if t.contains(&tok) {
+            tok.as_str()
+        } else {
+            pw.as_str()
+        };
+        assert_eq!(&t[hits[0].range.clone()], want_value, "{t}");
+    }
+    // номер строки находки — строка значения
+    assert_eq!(scan_flags_in_code(&cases[0].0)[0].line, 4);
+    for t in [
+        "Используйте -u для пользователя и -p для порта.".to_string(),
+        format!("curl -u admin:{pw} https://h — в прозе не код"),
+        "```sh\nls -la /tmp\n```".to_string(),
+        "```\nssh -p 22 host\nscp -P 2222 f host:\n```".to_string(),
+        "`grep -pfoo file`".to_string(),
+        "```\ndocker run -u 1000:1000 image\ncurl -u 1000:1000 http://h\n```".to_string(),
+        "`curl -H \"Authorization: Bearer $TOKEN\" https://h`".to_string(),
+        "```\n# This is a basic implementation; bearer of bad news\n```".to_string(),
+        // ворота — по своей строке: mysql в другой строке блока `-p` не открывает
+        "```\nmysql --version\ncargo test -pzam-cli\n```".to_string(),
+    ] {
+        assert!(
+            scan_flags_in_code(&t).is_empty(),
+            "{t}: {:?}",
+            scan_flags_in_code(&t)
+        );
+        assert_eq!(mask_text(&t), t, "{t}");
+    }
+    // текст команды снимка — прежняя функция клиента, без кода вокруг
+    assert_eq!(
+        mask_flags(&format!("mysql -uroot -p{pw} db")),
+        format!("mysql -uroot -p{m} db")
+    );
+    assert_eq!(
+        mask_text(&format!("mysql -uroot -p{pw} db")),
+        format!("mysql -uroot -p{pw} db"),
+        "в прозе (не в коде) сканер флаги не трогает"
+    );
+}
+
+/// Круг правок 2 задачи 5 M7.1: код по CommonMark ([`zam_secrets::code`]) — забор в цитате,
+/// многострочный инлайн-код (ворота — по спану целиком), одиночный `\r`; забор с отступом 4 — не
+/// забор (а инлайн-код через строки — код), блок с отступом — не код. Значение не съедает
+/// обратную кавычку и скобку без пары; заглушки из заглавных букв и `_` — не секрет; заголовок
+/// `Authorization` в JSON и YAML.
+#[test]
+fn code_flags_round2_cases() {
+    let pw = ["S3c", "ret", "9x"].concat();
+    let tok = ["Abc", "123", "Def", "456"].concat();
+    let m = SECRET_MARK;
+    for (t, want) in [
+        (
+            format!("> ```sh\n> mysql -uroot -p{pw} db\n> ```\n"),
+            format!("> ```sh\n> mysql -uroot -p{m} db\n> ```\n"),
+        ),
+        (
+            format!("run `mysql -uroot\n-p{pw}` now"),
+            format!("run `mysql -uroot\n-p{m}` now"),
+        ),
+        (
+            format!("```\rmysql -p{pw}\r```\r"),
+            format!("```\rmysql -p{m}\r```\r"),
+        ),
+        (
+            format!("para\n    ```\nmysql -p{pw}\n    ```\nmysql -p{pw}"),
+            format!("para\n    ```\nmysql -p{m}\n    ```\nmysql -p{pw}"),
+        ),
+        (
+            format!("`` `mysql -p{pw}` ``"),
+            format!("`` `mysql -p{m}` ``"),
+        ),
+        (
+            format!("```sh\nX=$(mysql -uroot -p{pw})\necho `mysql -p{pw}`\n```"),
+            format!("```sh\nX=$(mysql -uroot -p{m})\necho `mysql -p{m}`\n```"),
+        ),
+        (
+            format!("```json\n{{\"Authorization\": \"Bearer {tok}\"}}\n```"),
+            format!("```json\n{{\"Authorization\": \"Bearer {m}\"}}\n```"),
+        ),
+        (
+            format!("```yaml\nheaders:\n  Authorization: \"Bearer {tok}\"\n```"),
+            format!("```yaml\nheaders:\n  Authorization: \"Bearer {m}\"\n```"),
+        ),
+        (
+            format!("```yaml\nauthorization: Bearer {tok}\n```"),
+            format!("```yaml\nauthorization: Bearer {m}\n```"),
+        ),
+    ] {
+        assert_eq!(mask_text(&t), want, "{t:?}");
+        assert_eq!(mask_text(&want), want, "повторно: {t:?}");
+    }
+    for t in [
+        format!("Text\n\n    mysql -uroot -p{pw} db\n\nmore"),
+        "```\nmytool --token TOKEN --password PASSWORD\nmysql -pPASS_WORD\n```".to_string(),
+        "```\nmytool --token <TOKEN> --password \"PASSWORD\"\n```".to_string(),
+        format!("`mysql` then `-p{pw}`"),
+        format!("`-p{pw}`"),
+        format!("run `mysql -uroot\n\n-p{pw}` now"),
+    ] {
+        assert!(
+            scan_flags_in_code(&t).is_empty(),
+            "{t:?}: {:?}",
+            scan_flags_in_code(&t)
+        );
+    }
+    // клиентская функция — те же правила значения
+    assert_eq!(
+        mask_flags(&format!("X=$(mysql -uroot -p{pw}) && mytool --token TOKEN")),
+        format!("X=$(mysql -uroot -p{m}) && mytool --token TOKEN")
+    );
+}
+
+/// Враждебные входы правила флагов (круг правок 2 задачи 5 M7.1; прежние ворота были
+/// квадратичны — 38 с на строке в 1 МБ, пробы ревьюера): одна строка `-px -px …`, цепочка
+/// переносов `a -px \`, одна строка `-u a:b -u a:b …` в блоке кода — не больше 2 мс на 100 КБ и
+/// 20 мс на 1 МБ (release). Те же входы с открытыми воротами (`mysql`/`curl` в строке: каждое
+/// значение — настоящая находка, десятки тысяч масок на 100 КБ, цена — маскировка и повторный
+/// скан вида) — линейно, не больше 4 бюджетов. `cargo test -p zam-secrets --release --test secrets
+/// -- --ignored bench_scan_adversarial_flags --nocapture`.
+#[test]
+#[ignore]
+fn bench_scan_adversarial_flags() {
+    let build = |size: usize, head: &str, unit: &str| {
+        let mut t = format!("```\n{head}");
+        while t.len() < size {
+            t.push_str(unit);
+        }
+        t.push_str("\n```\n");
+        t
+    };
+    let mut rows = Vec::new();
+    for size in [100 * 1024, 1024 * 1024] {
+        for (name, head, unit, factor) in [
+            ("строка -px", "", " -px", 1),
+            ("цепочка \\", "", "a -px \\\n", 1),
+            ("строка -u a:b", "", " -u a:b", 1),
+            ("строка mysql -px", "mysql", " -px", 4),
+            ("цепочка mysql \\", "mysql \\\n", "a -px \\\n", 4),
+            ("строка curl -u a:b", "curl", " -u a:b", 4),
+        ] {
+            let t = build(size, head, unit);
+            if factor > 1 {
+                assert!(
+                    mask_text(&t).contains(SECRET_MARK),
+                    "{name}: маска не легла"
+                );
+            }
+            let n = if size > 200 * 1024 { 3 } else { 10 };
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(scan_secrets(&t));
+            }
+            let per = t0.elapsed() / n;
+            println!("scan_secrets ({name}, {} байт): {per:?}", t.len());
+            let budget =
+                std::time::Duration::from_micros((t.len() as u64 * 2000 * factor) / (100 * 1024));
+            rows.push((name, t.len(), per, budget));
+        }
+    }
+    for (name, len, per, budget) in rows {
+        assert!(per <= budget, "{name} {len} байт: {per:?} > {budget:?}");
+    }
+}
+
+/// Круг правок 3 задачи 5 M7.1: скобка у значения в кавычках — часть значения (`-p'X)'` →
+/// `-p'‹secret›'`); заглушка из заглавных — не длиннее 24 знаков (длинная — похожа на ключ);
+/// отвергнутое совпадение соседнее не прячет (`Authorization:"--password ""--password y`), и
+/// повторная маска клиента ничего не меняет.
+#[test]
+fn flags_round3_cases() {
+    let pw = ["S3c", "ret", "9x"].concat();
+    let m = SECRET_MARK;
+    assert_eq!(
+        mask_flags(&format!("mysql -p'{pw})'")),
+        format!("mysql -p'{m}'")
+    );
+    assert_eq!(
+        mask_text(&format!("```\nmysql -p\"{pw})\" db\n```")),
+        format!("```\nmysql -p\"{m}\" db\n```")
+    );
+    let caps = "XKQZJWPRMVNBTLHGFDSAYUEIOC";
+    assert_eq!(
+        mask_flags(&format!("mysql -p{caps}")),
+        format!("mysql -p{m}"),
+        "26 заглавных — не заглушка"
+    );
+    let max = "A".repeat(24);
+    assert_eq!(
+        mask_flags(&format!("mysql -p{max}")),
+        format!("mysql -p{max}")
+    );
+    for t in [
+        "Authorization:\"--password \"\"--password y",
+        "Authorization:\"--password \"\"--token=f",
+        "--token=X-Api-Key: ‹secret›X-Api-Key:\"zation",
+    ] {
+        let once = mask_flags(t);
+        assert_eq!(mask_flags(&once), once, "{t:?}");
+    }
+    assert_eq!(
+        mask_flags("Authorization:\"--password \"\"--password y"),
+        format!("Authorization:\"{m} \"\"--password {m}")
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+    /// Круг правок 3 задачи 5 M7.1: клиентская [`mask_flags`] идемпотентна — атомы флагов,
+    /// кавычек, заголовков (и JSON-формы), скобок, заглушек, меток и ворот (атомы пробы
+    /// ревьюера `t5r2probe idem`).
+    #[test]
+    fn mask_flags_idempotent(
+        parts in proptest::collection::vec(
+            prop_oneof![
+                Just("```".to_string()),
+                Just("`".to_string()),
+                Just("\n".to_string()),
+                Just("\r".to_string()),
+                Just(" \\\n".to_string()),
+                Just("    ".to_string()),
+                Just("> ".to_string()),
+                Just("- ".to_string()),
+                Just("mysql ".to_string()),
+                Just("curl ".to_string()),
+                Just("-uroot ".to_string()),
+                Just("-pS3cret9x".to_string()),
+                Just("-p'a b'".to_string()),
+                Just("-p\"a\nb\"".to_string()),
+                Just("-p\"a)\"".to_string()),
+                Just("-u admin:p4ss".to_string()),
+                Just("--user=adm:p4ss ".to_string()),
+                Just("--password \"x y\"".to_string()),
+                Just("--password ".to_string()),
+                Just("--token=abc123def".to_string()),
+                Just("--token TOKEN".to_string()),
+                Just("PASS_WORD".to_string()),
+                Just("Authorization: Bearer abcdef123".to_string()),
+                Just("{\"Authorization\": \"Bearer abcdef123\"}".to_string()),
+                Just("Authorization: \"".to_string()),
+                Just("Authorization:".to_string()),
+                Just("\"Authorization\"".to_string()),
+                Just(": ".to_string()),
+                Just("Bearer ".to_string()),
+                Just("X-Api-Key: ".to_string()),
+                Just("x-api-key:".to_string()),
+                Just("$TOKEN".to_string()),
+                Just("$(".to_string()),
+                Just("(".to_string()),
+                Just(")".to_string()),
+                Just("))".to_string()),
+                Just("<".to_string()),
+                Just(">".to_string()),
+                Just(SECRET_MARK.to_string()),
+                Just("\u{2039}".to_string()),
+                Just(" ".to_string()),
+                Just("a".to_string()),
+                Just("A".to_string()),
+                Just("=".to_string()),
+                Just("'".to_string()),
+                Just("\"".to_string()),
+                Just("ё".to_string()),
+                "[A-Za-z0-9=/,:@\"' ()-]{1,10}",
+            ],
+            0..24,
+        )
+    ) {
+        let text = parts.concat();
+        let once = mask_flags(&text);
+        prop_assert_eq!(mask_flags(&once), once, "{:?}", text);
+    }
+}
+
+/// Скобки без пары после флага — линейно (круг правок 3 задачи 5 M7.1; прежняя обрезка
+/// пересчитывала значение на каждую снятую скобку: 100 КБ — 18,7 с): `-p` + `)`, `--password )`,
+/// `Authorization: )`, `curl -u a:)` на 100 КБ и 1 МБ в блоке кода и клиентская [`mask_flags`] —
+/// не больше 2 мс на 100 КБ (release). `cargo test -p zam-secrets --release --test secrets --
+/// --ignored bench_scan_paren_flags --nocapture`.
+#[test]
+#[ignore]
+fn bench_scan_paren_flags() {
+    let mut rows = Vec::new();
+    for size in [100 * 1024, 1024 * 1024] {
+        for (name, head) in [
+            ("-p)))", "```\nmysql -p"),
+            ("--password )))", "```\n --password "),
+            ("Authorization: )))", "```\nAuthorization: "),
+            ("curl -u a:)))", "```\ncurl -u a:"),
+        ] {
+            let mut t = head.to_string();
+            t.push_str(&")".repeat(size));
+            t.push_str("\n```\n");
+            let n = if size > 200 * 1024 { 3 } else { 10 };
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(scan_secrets(&t));
+            }
+            let per = t0.elapsed() / n;
+            println!("scan_secrets ({name}, {} байт): {per:?}", t.len());
+            rows.push((name, t.len(), per));
+        }
+        let t = format!("mysql -p{}", ")".repeat(size));
+        // первый вызов собирает регулярки ворот — не в замер
+        std::hint::black_box(mask_flags("mysql -px"));
+        let n = if size > 200 * 1024 { 3 } else { 10 };
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(mask_flags(&t));
+        }
+        let per = t0.elapsed() / n;
+        println!("mask_flags (-p))), {} байт): {per:?}", t.len());
+        rows.push(("mask_flags -p)))", t.len(), per));
+    }
+    for (name, len, per) in rows {
+        let budget = std::time::Duration::from_micros((len as u64 * 2000) / (100 * 1024));
+        assert!(per <= budget, "{name} {len} байт: {per:?} > {budget:?}");
+    }
+}
+
+/// Круг правок 3–4 задачи 5 M7.1, сквозь [`mask_text`]: флаги в блоках пунктов списка — забор с
+/// отступом от колонки пункта (оба примера координатора, вложенный список) и забор на
+/// абсолютном отступе до 3, код которого левее пункта (шесть примеров ревьюера); закрывающий
+/// забор левее пункта закрывает блок.
+#[test]
+fn code_flags_in_list_items() {
+    let pw = ["S3c", "ret", "9x"].concat();
+    for t in [
+        format!(
+            "1. Шаг:\n\n    ```sh\n    mysql -uroot -p{pw}\n\n    mysql -p{pw} other\n    ```\n"
+        ),
+        format!(
+            "- Деплой:\n\n    ```bash\n    export A=1\n\n    curl -u admin:{pw} https://h\n    ```\n"
+        ),
+        format!("- a\n  - b\n\n      ```sh\n      mysql -p{pw}\n      ```\n"),
+        format!("- Подключение:\n  ```\nmysql -uroot -p{pw}\n  ```\n"),
+        format!("1. Run:\n   ```sh\n  mysql -uroot -p{pw}\n   ```"),
+        format!("1. Run:\n   ```sh\nmysql -uroot -p{pw}\n   ```"),
+        format!("- Шаг:\n  ```sh\n  cd /x\nmysql -uroot -p{pw}\n  ```"),
+        format!("- a\n> цитата\n  ```\nmysql -p{pw}\n  ```"),
+        format!("- a\n>   ```\n> mysql -p{pw}\n> ```"),
+        format!("- ```sh\nmysql -p{pw}\n```"),
+    ] {
+        let m = mask_text(&t);
+        assert!(!m.contains(&pw) && m.contains(SECRET_MARK), "{t:?} → {m:?}");
+        assert_eq!(mask_text(&m), m, "повторно: {t:?}");
+    }
+    // забор левее пункта — по CommonMark конец пункта и новый блок: второй секрет тоже в коде
+    // (круг правок 5, N2; в круге 4 тест закреплял обратное)
+    let t = format!("- a\n  ```\n  mysql -p{pw}\n```\nmysql -p{pw}\n");
+    assert_eq!(
+        mask_text(&t),
+        format!("- a\n  ```\n  mysql -p{SECRET_MARK}\n```\nmysql -p{SECRET_MARK}\n")
+    );
 }

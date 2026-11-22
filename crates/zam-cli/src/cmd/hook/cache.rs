@@ -85,9 +85,11 @@ impl Trigger {
     }
 
     /// Строка подсказки §10.3, M6 §4.3 (как у сервера, `zam_search::hint_line`):
-    /// `ZeroAIMemory: <lead><title> [<вид>·<cert>] i:<id>`, надёжность — `ax`, `th`, `hyp`.
+    /// `ZeroAIMemory: <lead><title> [<вид>·<cert>] i:<id>`, надёжность — `ax`, `th`, `hyp`;
+    /// заголовок — с маской секретов ([`super::shown_title`]: старый сервер его не маскирует).
     pub fn hint(&self, lead: &str) -> String {
-        let title = self.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let one_line = self.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title = super::shown_title(&one_line, usize::MAX);
         let cert = zam_core::certainty_short(self.certainty.as_deref().unwrap_or(""));
         let tags: Vec<&str> = [self.insight_kind.as_str(), cert]
             .into_iter()

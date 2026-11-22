@@ -462,9 +462,10 @@ async fn focus_duplicate_section_paths() {
     }
 }
 
-/// Лист с секретом (нарезка — по маскированному тексту) не находится в тексте — целиком с
-/// `focus skipped: not indexed` (ревью 7b, M-7); листов не больше `focus_leaves` — целиком с
-/// `focus skipped: short` без эмбеддинга (M-9).
+/// Человеку (сессия WebUI) текст — исходник, а лист с секретом нарезан по маскированному тексту и
+/// в исходнике не находится — целиком с `focus skipped: not indexed` (ревью 7b, M-7; агенту по
+/// токену фокус работает по маске — [`agent_range_offsets_on_masked_text`]); листов не больше
+/// `focus_leaves` — целиком с `focus skipped: short` без эмбеддинга (M-9).
 #[tokio::test]
 async fn focus_not_indexed_and_few_leaves() {
     let a = api("focus-noidx", |_| {}).await;
@@ -472,14 +473,21 @@ async fn focus_not_indexed_and_few_leaves() {
     let mut text = sections_note(8, 10, 5);
     text.push_str(&format!("## Ключи\n\nКлюч доступа {key} для склада.\n"));
     let n = id(&a.note("knowledge", "Секрет", &text).await);
-    let j = read_ok(
-        &a,
-        json!({"items": [{"id": format!("n:{n}"), "focus": "нейтрино"}],
-               "budget_tokens": 20000}),
-    )
-    .await;
+    let r = a
+        .adm(
+            Method::POST,
+            READ,
+            Some(
+                json!({"items": [{"id": format!("n:{n}"), "focus": "нейтрино"}],
+                        "budget_tokens": 20000}),
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
     let it = &j["items"][0];
-    // ключ AWS сканер маскирует — лист с ним в тексте не находится
+    // ключ AWS сканер маскирует — лист с ним в исходнике не находится
     assert_eq!(it["tier"], "L2", "{it}");
     assert_eq!(it["text"], text.as_str(), "{it}");
     assert_eq!(warnings(it), ["focus skipped: not indexed"], "{it}");
@@ -496,6 +504,65 @@ async fn focus_not_indexed_and_few_leaves() {
     assert_eq!(it["tier"], "L2", "{it}");
     assert_eq!(it["text"], text.as_str(), "{it}");
     assert_eq!(warnings(it), [SKIPPED], "{it}");
+}
+
+/// Агенту по токену (задача 5 M7.1, спецификация M7 §4.3.1) фокус заметки с секретом работает:
+/// текст ревизии маскируется целиком до фокуса, листы (нарезка — по тому же маскированному
+/// тексту) находятся — не `not indexed`; куски, пропуски, их адреса и `~N` — по маскированному
+/// тексту; адрес `range` из пропуска дочитывается тем же токеном и равен срезу маскированного L2
+/// (дочитывание маскирует всю ревизию и режет). Значения нет нигде в ответах.
+#[tokio::test]
+async fn agent_range_offsets_on_masked_text() {
+    let a = api("focus-masked", |_| {}).await;
+    let key = ["AK", "IA", "Z7Q4", "MRT2", "WXPH", "BK9C"].concat();
+    let mut text = sections_note(8, 10, 5);
+    // секрет — в начале раздела 7: после него байты маски и исходника расходятся
+    text = text.replacen(
+        "## Раздел 7\n\n",
+        &format!("## Раздел 7\n\nКлюч доступа {key} для склада. "),
+        1,
+    );
+    text.push_str(&format!("## Ключи\n\nЕщё ключ {key} в конце.\n"));
+    let n = id(&a.note("knowledge", "Секрет фокуса", &text).await);
+    let nid = format!("n:{n}");
+    let l2 = read_ok(&a, json!({"items": [{"id": &nid}], "budget_tokens": 20000})).await;
+    let l2 = l2["items"][0]["text"].as_str().unwrap().to_string();
+    assert!(!l2.contains(&key) && l2.contains("‹secret›"), "{l2}");
+    assert_eq!(l2, zam_markdown::mask_text(&text));
+    assert_ne!(
+        l2.len(),
+        text.len(),
+        "маска меняет длину: смещения различаются"
+    );
+    let j = read_ok(
+        &a,
+        json!({"items": [{"id": &nid, "focus": "нейтрино"}], "budget_tokens": 20000}),
+    )
+    .await;
+    assert!(!j.to_string().contains(&key), "{j}");
+    let it = &j["items"][0];
+    assert_eq!(it["tier"], "focus", "листы с маской находятся: {it}");
+    assert!(
+        !warnings(it).iter().any(|w| w.contains("not indexed")),
+        "{it}"
+    );
+    check_parts(it, &l2);
+    let s = skips(it["text"].as_str().unwrap());
+    assert!(!s.is_empty(), "{it}");
+    let mut seen_mark = false;
+    for x in &s {
+        let got = reread_exact(&a, &nid, &l2, x).await;
+        assert!(!got.contains(&key), "{x:?}: {got}");
+        seen_mark |= got.contains("‹secret›");
+    }
+    assert!(seen_mark, "маска — в пропущенном: {s:?}");
+    // md — то же, без значения
+    let md = read_md(
+        &a,
+        json!({"items": [{"id": &nid, "focus": "нейтрино"}], "budget_tokens": 20000}),
+    )
+    .await;
+    assert!(!md.contains(&key), "{md}");
 }
 
 /// `range` — `r<rev>:S-E`, байты L2 ревизии: без ревизии, с `section`, `since_rev`, `focus`,
@@ -600,7 +667,8 @@ async fn range_after_edit_and_removed_revision() {
 }
 
 /// `range` идёт тем же путём доступа и по тому же тексту, что L2: байты заметки с секретом — те
-/// же, что в L2 (L2 не маскируется, маскирует только нарезка индекса); чужой токен — как у L2.
+/// же, что в L2 (по токену L2 маскирован целиком — задача 5 M7.1 — и `range` режет ту же маску);
+/// чужой токен — как у L2.
 #[tokio::test]
 async fn range_same_text_and_access_as_l2() {
     let a = api("focus-range-acl", |_| {}).await;
@@ -610,6 +678,7 @@ async fn range_same_text_and_access_as_l2() {
     let nid = format!("n:{n}");
     let l2 = read_ok(&a, json!({"items": [{"id": &nid}]})).await;
     let l2 = l2["items"][0]["text"].as_str().unwrap().to_string();
+    assert!(!l2.contains(&key), "{l2}");
     let (x, y) = (l2.find("Ключ").unwrap(), l2.find(" Ещё").unwrap());
     let j = read_ok(
         &a,

@@ -551,6 +551,50 @@ async fn expand_section_for_leaves_under_h4() {
     );
 }
 
+/// `expand=section` по токену (задача 5 M7.1, спецификация M7 §4.3.1 п. 4): секция берётся из
+/// маскированного текста ревизии — значения секрета из соседнего листа той же секции в выдаче нет
+/// (до задачи — исходник секции, прямая утечка в `memory_search`); сессии WebUI — исходник.
+#[tokio::test]
+async fn search_expand_section_masked() {
+    let a = api("search-expand-mask", |_| {}).await;
+    // фиктивный ключ собирается из частей: в исходнике его нет целиком (push protection)
+    let key = ["AK", "IA", "Z7Q4", "MRT2", "WXPH", "BK9C"].concat();
+    let filler = |m: &str| {
+        (0..150)
+            .map(|i| format!("{m}{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let content = format!(
+        "# Док\n\nВступление.\n\n## Доступ\n\nНачало секции.\n\n#### Первый\n\n\
+         ГАММАМЕТКА общеслово. {}\n\n#### Второй\n\nКлюч склада {key} выдан. {}\n\n\
+         ## Другое\n\nПро другое.\n",
+        filler("первый"),
+        filler("второй")
+    );
+    let node = a.note("knowledge", "секция-с-ключом", &content).await;
+    let node = node["id"].as_str().unwrap().to_string();
+    let body = json!({"query": "ГАММАМЕТКА", "mode": "chunks", "expand": "section",
+                      "top_k": 1, "budget_tokens": 20000});
+    for fmt in ["json", "md"] {
+        let mut b = body.clone();
+        b["format"] = json!(fmt);
+        let r = search(&a, b).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let t = r.text();
+        assert!(t.contains("Ключ склада"), "секция целиком: {t}");
+        assert!(!t.contains(&key), "{fmt}: {t}");
+        assert!(t.contains("‹secret›"), "{fmt}: {t}");
+    }
+    let j = search(&a, body.clone()).await.json();
+    assert_eq!(j["items"][0]["node_id"], node.as_str(), "{j}");
+    let r = a
+        .adm(Method::POST, "/api/v1/search", Some(body), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains(&key), "человеку — исходник: {}", r.text());
+}
+
 /// `filters.insight_kinds` (§9.1, задача 13 раунд 1): insight чужих видов отсеиваются, заметки
 /// и записи других видов остаются, если их включает `kinds`; неизвестный вид — 400.
 #[tokio::test]

@@ -2203,6 +2203,8 @@ pub async fn symbol(
         "knowledge": knowledge,
         "knowledge_left": knowledge_left,
     });
+    // заголовки знаний агенту по токену — с маской секретов (задача 5 M7.1)
+    super::agent_view::view_json(&p, &mut body, &["knowledge.title"]);
     body["tokens"] = json!(tokens_of(&body));
     Ok(Json(body))
 }
@@ -2295,6 +2297,8 @@ pub async fn impact(
         "knowledge": knowledge,
         "warnings": [],
     });
+    // заголовки знаний — в строки влияния напоминания `Stop`: агенту с маской (задача 5 M7.1)
+    super::agent_view::view_json(&p, &mut body, &["knowledge.title"]);
     body["tokens"] = json!(tokens_of(&body));
     Ok(Json(body))
 }

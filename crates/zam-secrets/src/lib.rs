@@ -20,9 +20,14 @@
 //!
 //! [`mask_text`] идемпотентна для любого текста (задача 3 M7.1): скан идёт до неподвижной
 //! точки, а упор в [`FIXPOINT_MAX`] расширяет неустойчивые находки, пока вид не перестанет
-//! меняться ([`ScanOutcome::depth_capped`]). Правила флагов командной строки — отдельно,
-//! [`mask_flags`] (только текст команд).
+//! меняться ([`ScanOutcome::depth_capped`]). Правила флагов командной строки (`-pXXX`,
+//! `--password X`, `-u user:pass`, `Authorization:`) сканер применяет **только внутри кода**
+//! Markdown — строки блоков в ограждениях и инлайн-код ([`scan_flags_in_code`], вид
+//! [`SecretKind::CommandFlag`]; круг правок 1–2 задачи 5 M7.1); текст команды целиком —
+//! [`mask_flags`] (первая строка команды снимка сессии у клиента), в [`mask_text`] она не входит.
+//! Что считать кодом — [`code`]: одно определение на проект (его берёт и `zam-markdown`).
 
+pub mod code;
 mod flags;
 
 use std::ops::Range;
@@ -42,7 +47,8 @@ pub const SECRET_MARK: &str = "‹secret›";
 /// 1 — правила M3–M5.7 (значение `'1'` старых баз); 2 — значение в обратных кавычках (задача 15b
 /// M6, I1); 3 — русские слова-ключи (значение и тогда, когда оно только из hex), `response`
 /// заголовка `Authorization: Digest`, идемпотентность на цепочках «пароль в URL ↔ ключ-значение»
-/// (задача 3 M7.1).
+/// (задача 3 M7.1), флаги командной строки внутри кода Markdown (задача 5 M7.1, тот же
+/// невыпущенный выпуск 0.0.14-m7.1 — версия не повышалась).
 pub const RULES_VERSION: u32 = 3;
 
 /// Тип сработавшего правила.
@@ -60,6 +66,9 @@ pub enum SecretKind {
     Jwt,
     /// Длинная случайная строка с высокой энтропией.
     HighEntropy,
+    /// Значение флага командной строки внутри кода Markdown (```` ``` ````-блок или `` `…` ``):
+    /// `-pXXX` у mysql, `--password X`, `-u user:pass` у curl, `Authorization:` ([`mask_flags`]).
+    CommandFlag,
 }
 
 impl SecretKind {
@@ -72,6 +81,7 @@ impl SecretKind {
             SecretKind::UrlPassword => "url_password",
             SecretKind::Jwt => "jwt",
             SecretKind::HighEntropy => "high_entropy",
+            SecretKind::CommandFlag => "command_flag",
         }
     }
 }
@@ -160,14 +170,34 @@ fn anchored_at(text: &str, at: usize, out: &mut Vec<(Range<usize>, SecretKind)>)
 /// конец находки). Найденное — снова в работу. Повторы отсекает множество `(начало, конец)`:
 /// цепочка из 50 000 ключей — линейно (ревью повторное 9A).
 fn glued_prefixes(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
+    // проверять есть что, только у префиксных и JWT-находок или если с конца находки может
+    // начаться ключ ([`GLUED_FIRST`]); иначе — ни множеств, ни копии находок (круг правок 2
+    // задачи 5 M7.1: десятки тысяч находок флагов подряд)
+    let bytes = text.as_bytes();
+    let candidate = |(h, k): &(Range<usize>, SecretKind)| {
+        matches!(k, SecretKind::KnownPrefix(_) | SecretKind::Jwt)
+            || bytes.get(h.end).is_some_and(|b| GLUED_FIRST.contains(b))
+    };
+    let mut work: Vec<(Range<usize>, SecretKind)> =
+        raw.iter().filter(|&x| candidate(x)).cloned().collect();
+    if work.is_empty() {
+        return;
+    }
     let mut seen: std::collections::HashSet<(usize, usize)> =
         raw.iter().map(|(r, _)| (r.start, r.end)).collect();
     let mut ends: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut work: Vec<(Range<usize>, SecretKind)> = raw.clone();
     let mut found = Vec::new();
     while let Some((h, kind)) = work.pop() {
         found.clear();
-        if h.end < text.len() && text.is_char_boundary(h.end) && ends.insert(h.end) {
+        // с конца находки ключ начинается только с первого байта шаблона ([`GLUED_FIRST`]):
+        // иначе якорные шаблоны не проверяются вовсе — десятки тысяч находок подряд (флаги
+        // `-px -px …` в коде, круг правок 2 задачи 5 M7.1) не стоят десятков вызовов регулярок
+        // каждая
+        if h.end < text.len()
+            && GLUED_FIRST.contains(&text.as_bytes()[h.end])
+            && text.is_char_boundary(h.end)
+            && ends.insert(h.end)
+        {
             anchored_at(text, h.end, &mut found);
         }
         if matches!(kind, SecretKind::KnownPrefix(_) | SecretKind::Jwt) {
@@ -852,6 +882,35 @@ pub fn scan_secrets_ext(text: &str) -> ScanOutcome {
     scan_to_fixpoint(text, FIXPOINT_MAX)
 }
 
+/// Находки только правила флагов командной строки внутри кода Markdown (вид
+/// [`SecretKind::CommandFlag`]): значения `-pXXX` у mysql-подобных и `sshpass`, `--password X` и
+/// подобных, `-u user:pass` у HTTP-клиентов, `Authorization:`/`X-Api-Key:` в строках
+/// fenced-блоков (```` ``` ````/`~~~`) и в inline-спанах `` `…` ``; проза вне кода не трогается.
+/// Это правило входит в [`scan_secrets`] и [`mask_text`]; отдельно — для проверок и отчётов.
+pub fn scan_flags_in_code(text: &str) -> Vec<SecretHit> {
+    let raw = flags::code_flag_ranges(text)
+        .into_iter()
+        .map(|r| (r, SecretKind::CommandFlag))
+        .collect();
+    with_lines(text, merge_ranges(raw))
+}
+
+/// Находки с номерами строк (с 1) одним проходом по упорядоченным диапазонам.
+fn with_lines(text: &str, merged: Vec<(Range<usize>, SecretKind)>) -> Vec<SecretHit> {
+    let (mut line, mut pos) = (1usize, 0usize);
+    merged
+        .into_iter()
+        .map(|(range, kind)| {
+            line += text.as_bytes()[pos..range.start]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count();
+            pos = range.start;
+            SecretHit { kind, range, line }
+        })
+        .collect()
+}
+
 /// Скан до неподвижной точки: обычных повторов — не больше `limit`, дальше — расширение находок
 /// ([`WIDEN_STEPS`]). Предел — параметр ради юнит-тестов ступеней расширения: обычные входы в
 /// [`FIXPOINT_MAX`] укладываются.
@@ -881,20 +940,7 @@ fn scan_to_fixpoint(text: &str, limit: u32) -> ScanOutcome {
             (view.start_in_text(r.start)..view.end_in_text(r.end), k)
         }));
     }
-    let merged = merge_ranges(raw);
-    // номера строк одним проходом
-    let (mut line, mut pos) = (1usize, 0usize);
-    let hits = merged
-        .into_iter()
-        .map(|(range, kind)| {
-            line += text.as_bytes()[pos..range.start]
-                .iter()
-                .filter(|&&b| b == b'\n')
-                .count();
-            pos = range.start;
-            SecretHit { kind, range, line }
-        })
-        .collect();
+    let hits = with_lines(text, merge_ranges(raw));
     ScanOutcome {
         hits,
         passes,
@@ -943,16 +989,26 @@ fn scan_rules(text: &str) -> Vec<(Range<usize>, SecretKind)> {
             raw.push((v.range(), SecretKind::UrlPassword));
         }
     }
-    glued_prefixes(text, &mut raw);
-    let others: Vec<Range<usize>> = merge_ranges(raw.clone())
-        .into_iter()
-        .map(|(r, _)| r)
-        .collect();
+    // флаги командной строки — только внутри кода Markdown (круг правок 1 задачи 5 M7.1)
     raw.extend(
-        entropy_hits(text, &others)
+        flags::code_flag_ranges(text)
             .into_iter()
-            .map(|r| (r, SecretKind::HighEntropy)),
+            .map(|r| (r, SecretKind::CommandFlag)),
     );
+    glued_prefixes(text, &mut raw);
+    // нет кандидатов энтропии — и объединять находки для неё незачем (тысячи находок флагов
+    // подряд, круг правок 2 задачи 5 M7.1)
+    if ENTROPY_CANDIDATE.is_match(text) {
+        let others: Vec<Range<usize>> = merge_ranges(raw.clone())
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        raw.extend(
+            entropy_hits(text, &others)
+                .into_iter()
+                .map(|r| (r, SecretKind::HighEntropy)),
+        );
+    }
     raw
 }
 

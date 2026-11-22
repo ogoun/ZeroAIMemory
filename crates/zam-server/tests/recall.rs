@@ -417,6 +417,90 @@ async fn digest_includes_rules_gotchas_revisit_changelog() {
     assert_eq!(c.shown, 1);
 }
 
+/// Заголовки подсказок `/recall` (задача 5 M7.1, спецификация M7 §4.3.1 п. 5) — без значений
+/// секретов: ловушка с ключом в заголовке (строка дайджеста и `items[].title`), индекс changelog,
+/// имя записи окружения Vault, заголовок термина в подсказке к запросу.
+#[tokio::test]
+async fn recall_titles_masked() {
+    let a = server("titles-masked").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    // фиктивный ключ собирается из частей: в исходнике его нет целиком (push protection)
+    let s = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let gotcha = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        &format!("Ключ {s} утёк в лог"),
+        "Ротировать ключ.",
+        "gotcha",
+    )
+    .await;
+    let change = entry(
+        &a,
+        &a.token,
+        G,
+        json!({"kind": "changelog", "title": format!("Сменён ключ {s}"), "body": "x",
+               "data": {"kind": "ops"}}),
+    )
+    .await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/vault",
+            Some(json!({"title": format!("стенд {s}"),
+                        "data": {"type": "host", "purpose": "приёмочный стенд"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let vault = r.json()["id"].as_str().unwrap().to_string();
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tm1"),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let got = ids(&j);
+    assert!(got.contains(&format!("i:{gotcha}")), "{j}");
+    assert!(got.contains(&format!("c:{change}")), "{j}");
+    assert!(
+        j["text"].as_str().unwrap().contains(&format!("v:{vault}")),
+        "{j}"
+    );
+    assert!(!j.to_string().contains(&s), "{j}");
+    assert!(
+        j["text"]
+            .as_str()
+            .unwrap()
+            .contains("Ключ ‹secret› утёк в лог"),
+        "{j}"
+    );
+    // термин с ключом в заголовке — подсказка к запросу без значения
+    entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "term", "title": format!("Шлюз {s}"),
+               "data": {"definition": "входная точка API", "aliases": ["шлюзапи"]}}),
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("tm2"),
+        json!({"event": "prompt", "prompt": "как настроить шлюзапи для стенда"}),
+    )
+    .await;
+    assert!(!j.to_string().contains(&s), "{j}");
+    assert!(
+        j["text"]
+            .as_str()
+            .unwrap()
+            .contains("термин «Шлюз ‹secret›»"),
+        "{j}"
+    );
+}
+
 /// `prompt`: 0–3 подсказки — insight и заметки Rules (не заметки Knowledge) с баллом не ниже
 /// `recall.prompt_min_score`; нерелевантный запрос — пустой `text`.
 #[tokio::test]

@@ -518,6 +518,103 @@ async fn preview_text_pptx_and_code() {
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
 }
 
+/// Предпросмотр по токену (задача 5 M7.1, спецификация M7 §4.3.1 п. 7, решение координатора):
+/// текст (`kind=text`, HTML подсветки строится по маскированному тексту) и ячейки листа
+/// (`kind=sheet`) — с `‹secret›` вместо значения, ETag у маски свой; сессии WebUI — исходник; сам
+/// файл (`GET /blobs/…`) — как есть.
+#[tokio::test]
+async fn previews_text_masked_for_token() {
+    let (a, _) = world("prev-mask").await;
+    let n = note(&a, &a.token, "knowledge", "p/ключи").await;
+    // фиктивный ключ собирается из частей: в исходнике его нет целиком (push protection)
+    let key = ["AK", "IA", "Z7Q4", "MRT2", "WXPH", "BK9C"].concat();
+    let code = format!("# конфигурация\naws_key = \"{key}\"\nregion = \"eu\"\n");
+    let up = upload(&a, &a.token, &n, "conf.py", code.as_bytes()).await;
+    let sha = sha_of(&up);
+    let csv = format!("имя,значение\nключ,{key}\nрегион,eu\n");
+    let csha = sha_of(&upload(&a, &a.token, &n, "keys.csv", csv.as_bytes()).await);
+    let adm = |q: String| {
+        let a = &a;
+        async move { a.adm(Method::GET, &q, None, None).await }
+    };
+    for (s, q) in [(&sha, "kind=text"), (&csha, "kind=sheet")] {
+        let r = get(&a, &a.token, s, q).await;
+        assert_eq!(r.status, StatusCode::OK, "{q}: {}", r.text());
+        assert!(!r.text().contains(&key), "{q}: {}", r.text());
+        assert!(r.text().contains("‹secret›"), "{q}: {}", r.text());
+        let tag = r.header("etag").to_string();
+        // повтор (из кэша) — та же маска
+        let again = get(&a, &a.token, s, q).await;
+        assert!(!again.text().contains(&key), "{q}: {}", again.text());
+        let h = adm(uri(s, q)).await;
+        assert_eq!(h.status, StatusCode::OK, "{q}: {}", h.text());
+        assert!(h.text().contains(&key), "человеку — исходник: {}", h.text());
+        assert_ne!(h.header("etag"), tag, "{q}: ETag маски и исходника");
+        // после превью человеку токену — снова маска (кэш не общий)
+        let r = get(&a, &a.token, s, q).await;
+        assert!(!r.text().contains(&key), "{q}: {}", r.text());
+    }
+    // сам файл — как есть
+    let r = a
+        .t(Method::GET, &format!("/api/v1/blobs/{sha}/conf.py"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains(&key));
+}
+
+/// Ключ на границе обрезки текста (1 МиБ, `TEXT_MAX`): агенту маска — по началу файла с запасом
+/// за границей, ключ — меткой целиком, а не префиксом; показ — до прежней границы, `truncated`
+/// (круг правок 1 задачи 5 M7.1). Человеку — исходник до той же границы.
+#[tokio::test]
+async fn preview_text_key_on_boundary_masked() {
+    const MAX: usize = 1024 * 1024;
+    let (a, _) = world("prev-mask-edge").await;
+    let n = note(&a, &a.token, "knowledge", "p/граница").await;
+    let key = ["AK", "IA", "Z7Q4", "MRT2", "WXPH", "BK9C"].concat();
+    let head = &key[..8];
+    let lead = "key = ";
+    let mut text = String::new();
+    // ключ — с байта MAX - 16 до MAX + 4: метка (12 байт) влезает в показ, префикс ключа — нет
+    while text.len() + 128 < MAX - 16 - lead.len() {
+        text.push_str("обычная строка файла конфигурации\n");
+    }
+    let fill = MAX - 16 - lead.len() - text.len() - 1;
+    text.push_str(&"x".repeat(fill));
+    text.push('\n');
+    text.push_str(lead);
+    text.push_str(&key);
+    text.push_str("\nхвост файла\n");
+    assert_eq!(text.find(&key), Some(MAX - 16), "ключ пересекает границу");
+    let sha = sha_of(&upload(&a, &a.token, &n, "edge.txt", text.as_bytes()).await);
+    let r = get(&a, &a.token, &sha, "kind=text").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let html = j["html"].as_str().unwrap();
+    let tail = |s: &str| -> String {
+        let v: Vec<char> = s.chars().rev().take(120).collect();
+        v.into_iter().rev().collect()
+    };
+    assert!(
+        !html.contains(head),
+        "префикс ключа на границе: …{}",
+        tail(html)
+    );
+    assert!(html.contains("‹secret›"), "…{}", tail(html));
+    assert!(!html.contains("хвост файла"), "показ — до границы");
+    assert_eq!(j["truncated"], true, "{}", tail(html));
+    let h = a
+        .adm(Method::GET, &uri(&sha, "kind=text"), None, None)
+        .await;
+    assert_eq!(h.status, StatusCode::OK, "{}", h.text());
+    let hj = h.json();
+    let hh = hj["html"].as_str().unwrap();
+    assert!(
+        hh.contains(head) && !hh.contains(&key),
+        "человеку — исходник до границы"
+    );
+    assert_eq!(hj["truncated"], true);
+}
+
 /// Права — как у скачивания блоба: Human по токену, Knowledge владельца участнику решения,
 /// посторонний, неодобренный запрос доступа — ответ тот же, что у несуществующего sha
 /// (статус и тело); участник видит вложение пространства решения, администратор — Human.

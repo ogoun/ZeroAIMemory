@@ -1376,6 +1376,38 @@ fn checkpoint_reminds_next_step_for_claimed_task() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("cp-t1"));
 }
 
+/// Напоминание `Stop` (задача 5 M7.1, спецификация M7 §4.3.1 п. 5; задача памяти
+/// `k:01M7XTYJKSE7RAHM1NWWE7EMYW`): заголовок захваченной задачи с ключом — маской `zam-secrets`
+/// до обрезки: значения в напоминании нет, даже если сервер (старый) прислал его исходником.
+#[test]
+fn stop_reminder_title_masked() {
+    let _g = serial();
+    // фиктивный ключ собирается из частей: в исходнике его нет целиком (push protection)
+    let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let body = json!({"memory_writes": 0, "claimed_tasks": [
+        {"id": "01M7ZZZZZZZZZZZZZZZZZZZZZZ", "title": format!("Ротация {key} на стенде"),
+         "status": "in_progress"}]})
+    .to_string();
+    let (url, _seen) = common::stub_body(std::sync::Arc::new(
+        move |_: &str, _: &str, _: usize, _: &Value| (200, body.clone(), Duration::ZERO),
+    ));
+    let p = Proj::new("stop-mask", &url, "zam_x");
+    let s = "sm-1";
+    // правка в сессии — маркер правок для напоминания
+    ok(&p.hook("pre-tool", &write_ev(&p, s, "a.txt")));
+    let v = hook_json(&p.hook(
+        "checkpoint",
+        &p.ev("Stop", s, json!({"stop_hook_active": false})),
+    ));
+    assert_eq!(v["decision"], "block", "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(!reason.contains(&key), "{reason}");
+    assert!(
+        reason.contains("k:01M7ZZZZZZZZZZZZZZZZZZZZZZ («Ротация ‹secret› на стенде»)"),
+        "{reason}"
+    );
+}
+
 /// I-1: `zam` подставляет сессию хуков, только если его запустил агент (`CLAUDECODE=1`,
 /// переменные Codex, `ZAM_AGENT=1`); явный `ZAM_SESSION` сильнее файла, `ZAM_SESSION=-` — без
 /// сессии; человек в терминале — без сессии.

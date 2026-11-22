@@ -176,31 +176,34 @@ pub async fn answer(
         )
         .await?;
     }
-    let mut decision = json!(d);
-    super::secrets::attach_entry(&mut decision, &d);
-    let mut entry = json!(q);
-    super::secrets::attach_entry(&mut entry, &q);
+    // эхо записей: агенту по токену — с маской секретов (задача 5 M7.1; ответ с телами — до
+    // нескольких МБ, длинный — в пуле, круг правок 2)
+    let raw = |e: &zam_store::Entry| {
+        let mut v = json!(e);
+        super::secrets::attach_entry(&mut v, e);
+        v
+    };
     let mut out = json!({
-        "entry": entry,
-        "decision": decision,
+        "entry": raw(&q),
+        "decision": raw(&d),
         "decision_id": d.id,
     });
     if let Some(i) = &idea {
-        let mut v = json!(i);
-        super::secrets::attach_entry(&mut v, i);
-        out["idea"] = v;
+        out["idea"] = raw(i);
     }
     if let Some(t) = &task {
-        let mut v = json!(t);
-        super::secrets::attach_entry(&mut v, t);
-        out["task"] = v;
+        out["task"] = raw(t);
     }
+    let out =
+        super::agent_view::view_entries_in(&p, out, &["entry", "decision", "idea", "task"]).await?;
     Ok(Json(out))
 }
 
 /// 409 `possible-duplicate` нового вопроса: совпал нормализованный заголовок `open` или
-/// `answered` вопроса пространства. `None` — дублей нет.
+/// `answered` вопроса пространства. `None` — дублей нет. Заголовки и ответы кандидатов агенту `p`
+/// по токену — с маской секретов (задача 5 M7.1).
 pub async fn question_duplicate(
+    p: &Principal,
     db: &zam_store::Db,
     space: zam_core::Id,
     title: &str,
@@ -209,13 +212,15 @@ pub async fn question_duplicate(
     if cands.is_empty() {
         return Ok(None);
     }
-    Ok(Some(duplicate(cands)))
+    Ok(Some(duplicate(p, cands)))
 }
 
-fn duplicate(candidates: Vec<QuestionCandidate>) -> ApiError {
+fn duplicate(p: &Principal, candidates: Vec<QuestionCandidate>) -> ApiError {
     let answered = candidates.iter().any(|c| c.status == EntryStatus::Answered);
     let mut extra = Map::new();
-    extra.insert("candidates".into(), json!(candidates));
+    let mut cands = json!(candidates);
+    super::agent_view::view_json(p, &mut cands, &["title", "answer"]);
+    extra.insert("candidates".into(), cands);
     extra.insert("dedup".into(), json!("title"));
     ApiError::PossibleDuplicate {
         detail: if answered {

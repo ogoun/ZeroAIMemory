@@ -311,19 +311,52 @@ pub fn outline(doc: &Doc) -> Vec<OutlineItem> {
 pub fn first_paragraph(src: &str, doc: &Doc) -> Option<String> {
     let body = src.get(doc.body_start..).unwrap_or(src);
     let arena = Arena::new();
+    let root = parse_body(&arena, body);
+    first_paragraph_node(root)
+        .map(paragraph_text)
+        .filter(|t| !t.is_empty())
+}
+
+/// [`first_paragraph`] без значений секретов — авто-L0 заметки (круг правок 2 задачи 5 M7.1):
+/// comrak снимает обратные кавычки инлайн-кода, и по готовому тексту правило флагов в коде
+/// (`` `mysql -pX` ``) уже не видно. Поэтому маскируются **исходные строки** абзаца
+/// ([`crate::mask_text`], обратные кавычки на месте), и текст берётся из них. Маска — только по
+/// строкам абзаца: инлайн-код и контекст ключ-значение не выходят за абзац, а вся заметка до 5 МиБ
+/// ради одной строки L0 не сканируется. Длины и смещения L0 нигде не адресуются.
+pub fn first_paragraph_masked(src: &str, doc: &Doc) -> Option<String> {
+    let body = src.get(doc.body_start..).unwrap_or(src);
+    let arena = Arena::new();
+    let root = parse_body(&arena, body);
+    let sp = first_paragraph_node(root)?.data().sourcepos;
+    let li = LineIndex::new(body);
+    let lines = body.get(li.line_start(sp.start.line)..li.line_end(sp.end.line))?;
+    let masked = crate::mask_text(lines);
+    let arena = Arena::new();
+    let root = parse_body(&arena, &masked);
+    first_paragraph_node(root)
+        .map(paragraph_text)
+        .filter(|t| !t.is_empty())
+}
+
+/// Разбор тела заметки (frontmatter уже отрезан по `body_start`).
+fn parse_body<'a>(arena: &'a Arena<'a>, body: &str) -> &'a AstNode<'a> {
     let mut options = comrak_options();
-    // frontmatter уже отрезан по body_start
     options.extension.front_matter_delimiter = None;
-    let root = parse_document(&arena, body, &options);
+    parse_document(arena, body, &options)
+}
+
+/// Первый абзац верхнего уровня.
+fn first_paragraph_node<'a>(root: &'a AstNode<'a>) -> Option<&'a AstNode<'a>> {
     root.children()
         .find(|n| matches!(n.data().value, NodeValue::Paragraph))
-        .map(|n| {
-            n.collect_text()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|t| !t.is_empty())
+}
+
+/// Текст узла без разметки, пробелы схлопнуты.
+fn paragraph_text<'a>(n: &'a AstNode<'a>) -> String {
+    n.collect_text()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Секция по пути вида `"Установка > Linux"`; пробелы вокруг `>` не важны.

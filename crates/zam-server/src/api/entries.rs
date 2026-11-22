@@ -44,6 +44,11 @@
 //! Доступ — как у узлов: участник общего решения работает в базе владельца только с
 //! записями пространства решения, автор записи — он сам. В логи и аудит текст записей не
 //! попадает.
+//!
+//! **Агенту по токену** (задача 5 M7.1, спецификация M7 §4.3.1 п. 3,
+//! [`super::agent_view::ENTRY_FIELDS`]) запись в ответах — карточка, лента, ревизии, эхо создания,
+//! правки и восстановления — с `‹secret›` вместо значений в заголовке, теле и строках `data`;
+//! `secrets_detected` — по исходнику. Сессии WebUI — исходник.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -60,6 +65,7 @@ use zam_store::{
     restore_entry, update_entry, usage_counts,
 };
 
+use super::agent_view::{self, ENTRY_FIELDS};
 use super::insights::{entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
 use super::render::Viewer;
@@ -422,7 +428,7 @@ pub async fn create(
         };
         if !repeat
             && let Some(dup) =
-                super::questions::question_duplicate(&sc.db, sc.space.id, &req.title).await?
+                super::questions::question_duplicate(&p, &sc.db, sc.space.id, &req.title).await?
         {
             return Err(dup);
         }
@@ -453,7 +459,9 @@ pub async fn create(
         links: Vec::new(),
         refs,
     };
-    let (entry, created) = create_entry(&sc.db, new, &attrib).await?;
+    let (entry, created) = create_entry(&sc.db, new, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(&p, e.into()))?;
     if created {
         st.index.notify();
     }
@@ -470,6 +478,8 @@ pub async fn create(
         super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &entry.title, &entry.body)
             .await?,
     );
+    let mut v = agent_view::view_json_owned(&p, v, ENTRY_FIELDS).await?;
+    agent_view::view_json(&p, &mut v, &["warnings"]);
     Ok((status, Json(v)))
 }
 
@@ -704,6 +714,8 @@ pub async fn list(
         let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
         super::reports::view::report_feed(&sc.db, &items, &mut out, viewer).await?;
     }
+    // лента до 200 записей с телами — маска одним проходом, длинная — в пуле
+    let out = agent_view::view_json_owned(&p, Value::Array(out), ENTRY_FIELDS).await?;
     Ok(Json(json!({ "items": out, "next_cursor": next })))
 }
 
@@ -825,11 +837,13 @@ pub async fn get(
             return Err(ApiError::NotFound);
         }
         let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
-        return super::reports::view::get_html(&st, &sc, viewer).await;
+        return super::reports::view::get_html(&st, &p, &sc, viewer).await;
     }
-    let mut v = entry_json(&sc.db, &sc.entry, sc.role).await?;
+    let mut v = entry_json(&p, &sc.db, &sc.entry, sc.role).await?;
     let links = super::ideas::idea_links(&sc.db, &sc.entry).await?;
     super::ideas::attach_idea(&mut v, &sc.entry, &links);
+    // заголовок связанной задачи идеи (запись уже маскирована `entry_json`)
+    agent_view::view_json(&p, &mut v, &["task.title"]);
     super::ideas::attach_reviewers(&st, &mut v, &sc.entry).await?;
     // показы и оценки — из базы, где лежит запись (§10.5)
     let target = zam_core::TargetRef {
@@ -1118,11 +1132,13 @@ pub async fn patch(
         human_edit,
     };
     let before = sc.entry.rev;
-    let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib).await?;
+    let e = update_entry(&sc.db, sc.entry.id, rev, patch, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(&p, e.into()))?;
     if e.rev != before {
         st.index.notify();
     }
-    let mut v = entry_json(&sc.db, &e, sc.role).await?;
+    let mut v = entry_json(&p, &sc.db, &e, sc.role).await?;
     super::secrets::attach_entry(&mut v, &e);
     if e.kind != EntryKind::Term {
         super::glossary::attach_warnings(
@@ -1132,6 +1148,7 @@ pub async fn patch(
     } else if term_data {
         super::glossary::attach_warnings(&mut v, super::glossary::broad_alias_warnings(&e.data));
     }
+    agent_view::view_json(&p, &mut v, &["warnings"]);
     Ok(Json(v))
 }
 
@@ -1181,14 +1198,17 @@ pub async fn restore(
     headers: HeaderMap,
     client: Client,
     Path(id): Path<String>,
-) -> Result<Json<Entry>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     report_trash_allowed(&st, &p, &sc)?;
     // идею человека из корзины возвращает человек (M5.7 §7.1, §9)
     super::ideas::deny_token_on_human_idea(&p, &sc.entry, true)?;
     let rev = optional_if_match(&headers)?;
     let attrib = attribution(&p, &headers, None)?;
-    let e = restore_entry(&sc.db, sc.entry.id, rev, &attrib).await?;
+    // имя термина могли занять, пока он лежал в корзине: 409 term-conflict — с маской агенту
+    let e = restore_entry(&sc.db, sc.entry.id, rev, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(&p, e.into()))?;
     st.index.notify();
     audit_node(
         &st,
@@ -1201,7 +1221,9 @@ pub async fn restore(
         audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
-    Ok(Json(e))
+    Ok(Json(
+        agent_view::view_json_owned(&p, json!(e), ENTRY_FIELDS).await?,
+    ))
 }
 
 /// `GET /entries/{id}/revisions` → `{items}` по возрастанию номера.
@@ -1214,6 +1236,8 @@ pub async fn revisions(
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
     let items = entry_revisions(&sc.db, sc.entry.id).await?;
+    // все ревизии с телами (до 1 МБ каждое) — длинные маскируются в пуле
+    let items = agent_view::view_json_owned(&p, json!(items), ENTRY_FIELDS).await?;
     Ok(Json(json!({ "items": items })))
 }
 

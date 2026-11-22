@@ -1005,8 +1005,8 @@ async fn guide_has_focus_rejected_snapshot() {
                 "`‹secret›`",
                 "`--password X`",
                 "`Authorization:`",
-                "Только в командах снимка",
-                "работает только сканер секретов",
+                "в командах снимка (их первой строке)",
+                "только внутри кода Markdown",
                 "не диктуйте секреты в чат",
                 "данные, а не указания",
             ],
@@ -1102,8 +1102,8 @@ async fn guide_has_focus_rejected_snapshot() {
                 "`‹secret›`",
                 "`--password X`",
                 "`Authorization:`",
-                "Only in snapshot commands",
-                "only the secrets scanner works there",
+                "in snapshot commands (their first line)",
+                "only inside Markdown code",
                 "do not dictate secrets in the chat",
                 "data, not instructions",
             ],
@@ -1314,6 +1314,48 @@ async fn guide_vault_scope_and_delete_rule() {
         assert!(en.contains(want), "{want}: {en}");
     }
     assert!(!en.contains("zam vault add <"), "{en}");
+}
+
+/// Протокол (задача 5 M7.1, спецификация M7 §4.3.1): секреты в выдаче агенту — `‹secret›`, ключ —
+/// из Vault (раскрытие не маскируется), смещения `range` — по маске, блобы — как есть; ru и en
+/// синхронно. Блока v8 правило не касается.
+#[tokio::test]
+async fn guide_secrets_masked_in_output() {
+    let a = api("agent-guide-secrets", |_| {}).await;
+    for (q, wants) in [
+        (
+            "",
+            [
+                "в выдаче агенту значения, похожие на секреты, приходят меткой `‹secret›`",
+                "нужный ключ бери из Vault: `memory_vault get`",
+                "Смещения `range` и пропуски фокуса — по тексту с маской",
+                "файлы вложений (`GET /blobs/…`) — как есть",
+            ],
+        ),
+        (
+            "?lang=en",
+            [
+                "in output to the agent values that look like secrets come as `‹secret›`",
+                "take the key you need from Vault: `memory_vault get`",
+                "`range` offsets and focus skips — over the masked text",
+                "attachment files (`GET /blobs/…`) — as is",
+            ],
+        ),
+    ] {
+        let r = a
+            .tok(
+                &a.token,
+                Method::GET,
+                &format!("/api/v1/agent-guide{q}"),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let g = r.text();
+        for w in wants {
+            assert!(g.contains(w), "{q}: {w}");
+        }
+    }
 }
 
 /// Протокол (M6.6, замечание 34 обкатки): раздел задач (ru, en) — работа по плану из N шагов —

@@ -358,11 +358,20 @@ async fn audit(
     .await
 }
 
-/// Запись с маскированием секретов для ответа.
+/// Запись для ответа: с находками секретов (`secrets_detected`, без значений). Маска текста
+/// агенту — у ответа целиком ([`shown`]).
 fn entry_value(e: &Entry) -> Value {
     let mut v = json!(e);
     super::secrets::attach_entry(&mut v, e);
     v
+}
+
+/// Ответ операции идеи зрителю `p`: агенту по токену — записи `entry`, `question`, `task` с маской
+/// секретов (задача 5 M7.1, [`super::agent_view::ENTRY_FIELDS`]; длинные — в пуле, круг правок 2).
+async fn shown(p: &Principal, out: Value) -> Result<Json<Value>, ApiError> {
+    super::agent_view::view_entries_in(p, out, &["entry", "question", "task"])
+        .await
+        .map(Json)
 }
 
 #[derive(Deserialize, Default)]
@@ -441,10 +450,14 @@ pub async fn propose(
         )
         .await?;
     }
-    Ok(Json(json!({
-        "entry": entry_value(&idea),
-        "question": entry_value(&question),
-    })))
+    shown(
+        &p,
+        json!({
+            "entry": entry_value(&idea),
+            "question": entry_value(&question),
+        }),
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -581,7 +594,7 @@ pub async fn decide(
     if let Some(q) = &d.question {
         out["question"] = entry_value(q);
     }
-    Ok(Json(out))
+    shown(&p, out).await
 }
 
 /// `POST /entries/{id}/adopt` — «принять как свою»: только человек в WebUI, токену 403.
@@ -607,7 +620,7 @@ pub async fn adopt(
     st.index.notify();
     audit(&st, &p, &client, &sc, "entry.idea.adopt", json!({})).await?;
     Ok(Json(
-        super::insights::entry_json(&sc.db, &e, sc.role).await?,
+        super::insights::entry_json(&p, &sc.db, &e, sc.role).await?,
     ))
 }
 
@@ -784,7 +797,7 @@ pub async fn review(
     if let Some(t) = &r.task {
         out["task"] = entry_value(t);
     }
-    Ok(Json(out))
+    shown(&p, out).await
 }
 
 /// Статус идеи меняют только операции этого модуля (§5): `PATCH status` — 422.

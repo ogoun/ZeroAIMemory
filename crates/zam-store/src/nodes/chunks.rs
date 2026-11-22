@@ -10,8 +10,10 @@
 //!
 //! Сканер секретов (§7.6): нарезка идёт по тексту с замаскированными секретами
 //! (`zam_markdown::scan_secrets`, значение → `‹secret›`), поэтому значения не попадают ни в
-//! `chunks.text` (FTS), ни в эмбеддинги и Qdrant; ревизии и чтение заметки остаются
-//! исходными. Автоматический L0 тоже маскируется.
+//! `chunks.text` (FTS), ни в эмбеддинги и Qdrant; ревизии хранятся исходными. Автоматический L0
+//! тоже маскируется. Выдача агенту по токену (сервер, `api::agent_view`, задача 5 M7.1) маскирует
+//! весь текст ревизии тем же сканером — листы с `‹secret›` в нём находятся (фокус, `range`);
+//! человеку в сессии WebUI текст ревизии выдаётся исходным.
 //!
 //! После пересборки чанков ставится задание outbox (в той же транзакции):
 //! индексируемая заметка → `upsert`; Human и `index: false` → без задания
@@ -24,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use zam_core::Id;
 use zam_markdown::{
     ApproxCounter, ChunkLevel, ChunkParams, Doc, EstimateCounter, TokenCounter, chunk_note,
-    first_paragraph, mask_secrets, mask_text, parse, scan_secrets,
+    first_paragraph_masked, mask_secrets, mask_text, parse, scan_secrets,
 };
 
 use super::{hex, revision_text};
@@ -458,12 +460,16 @@ pub(crate) fn note_meta(content: &str, agent_l0: Option<&str>) -> NoteMeta {
         (Some(s), Some("manual"))
     } else if let Some(s) = nonempty(fm.and_then(|f| f.description.as_deref())) {
         (Some(s), Some("manual"))
-    } else if let Some(s) = first_paragraph(content, &doc) {
+    } else if let Some(s) = first_paragraph_masked(content, &doc) {
+        // абзац — из маскированных исходных строк: comrak снимает обратные кавычки, и маска
+        // готового текста флаг в инлайн-коде уже не видит (круг правок 2 задачи 5 M7.1)
         (Some(truncate_words(&s, L0_AUTO_MAX_CHARS)), Some("auto"))
     } else {
         (None, None)
     };
-    // L0 попадает в payload индекса и выдачу: значения секретов в нём не нужны
+    // L0 попадает в payload индекса и выдачу: значения секретов в нём не нужны (ручной и
+    // агентский — маской готового текста; авто — уже по маскированному исходнику, маска
+    // идемпотентна)
     let l0 = l0.map(|s| mask_text(&s));
     let index = fm.and_then(|f| f.index) != Some(false);
     let certainty_raw = fm.and_then(|f| f.certainty.clone());
@@ -1083,28 +1089,34 @@ pub(crate) async fn rescan_secrets(db: &Db, priority: i64) -> Result<u64, StoreE
         let (n, found, last) = db
             .write(move |tx| {
                 let now = fmt_ts(crate::time::now());
-                let batch: Vec<(Id, i64, String, Option<String>)> = {
+                type Row = (Id, i64, String, Option<String>, Option<String>);
+                let batch: Vec<Row> = {
                     let mut st = tx.prepare_cached(
-                        "SELECT id, current_rev, index_state, l0 FROM nodes
+                        "SELECT id, current_rev, index_state, l0, l0_source FROM nodes
                          WHERE kind = 'note' AND deleted_at IS NULL
                            AND (?1 IS NULL OR id > ?1)
                          ORDER BY id LIMIT ?2",
                     )?;
                     st.query_map(params![cursor, RECHUNK_BATCH], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                     })?
                     .collect::<Result<_, _>>()?
                 };
                 let mut found = 0u64;
-                for (id, rev, state, l0) in &batch {
+                for (id, rev, state, l0, l0_source) in &batch {
                     let content = revision_text(tx, *id, *rev)?;
                     // секрет в тексте или в уже записанных префиксах чанков (путь, имя, теги)
                     let text_hit = !scan_secrets(&content).is_empty()
                         || stored_prefix_hit(tx, "node_id", *id)?;
-                    let masked_l0 = l0
-                        .as_deref()
-                        .map(mask_text)
-                        .filter(|m| Some(m.as_str()) != l0.as_deref());
+                    // авто-L0 при находке в тексте — заново по исходнику ([`remasked_l0`])
+                    let meta = text_hit.then(|| note_meta(&content, None));
+                    let masked_l0 = match &meta {
+                        Some(m) => remasked_l0(l0.as_deref(), l0_source.as_deref(), m),
+                        None => l0
+                            .as_deref()
+                            .map(mask_text)
+                            .filter(|m| Some(m.as_str()) != l0.as_deref()),
+                    };
                     if !text_hit && masked_l0.is_none() {
                         continue;
                     }
@@ -1113,9 +1125,8 @@ pub(crate) async fn rescan_secrets(db: &Db, priority: i64) -> Result<u64, StoreE
                         tx.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
                             .execute(params![id, m])?;
                     }
-                    if text_hit {
-                        let meta = note_meta(&content, None);
-                        rebuild_chunks(tx, *id, *rev, &content, &meta)?;
+                    if let Some(meta) = &meta {
+                        rebuild_chunks(tx, *id, *rev, &content, meta)?;
                     }
                     enqueue_for_note(tx, *id, *rev, Some(state), priority, &now)?;
                 }
@@ -1147,28 +1158,38 @@ pub(crate) fn remask_note(
     priority: i64,
     now: &str,
 ) -> Result<bool, StoreError> {
-    let row: Option<(i64, String, Option<String>)> = c
+    let row: Option<(i64, String, Option<String>, Option<String>)> = c
         .prepare_cached(
-            "SELECT current_rev, index_state, l0 FROM nodes
+            "SELECT current_rev, index_state, l0, l0_source FROM nodes
              WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL",
         )?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
-    let Some((rev, state, l0)) = row else {
+    let Some((rev, state, l0, l0_source)) = row else {
         return Ok(false);
     };
-    if let Some(l0) = &l0 {
-        let m = mask_text(l0);
-        if &m != l0 {
-            c.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
-                .execute(params![id, m])?;
-        }
-    }
     let content = revision_text(c, id, rev)?;
     let meta = note_meta(&content, None);
+    if let Some(m) = remasked_l0(l0.as_deref(), l0_source.as_deref(), &meta) {
+        c.prepare_cached("UPDATE nodes SET l0 = ?2 WHERE id = ?1")?
+            .execute(params![id, m])?;
+    }
     rebuild_chunks(c, id, rev, &content, &meta)?;
     enqueue_for_note(c, id, rev, Some(&state), priority, now)?;
     Ok(true)
+}
+
+/// Новый L0 записанной заметки при перемаскировке (`None` — тот же): автоматический —
+/// заново по исходнику (`meta` — [`note_meta`] текущей ревизии без агентского L0): маска готового
+/// текста не видит флагов инлайн-кода, comrak снял обратные кавычки (круг правок 2 задачи 5
+/// M7.1); ручной и агентский — маской записанного текста.
+fn remasked_l0(l0: Option<&str>, source: Option<&str>, meta: &NoteMeta) -> Option<String> {
+    let l0 = l0?;
+    let m = match (source, meta.l0_source, meta.l0.as_deref()) {
+        (Some("auto"), Some("auto"), Some(auto)) => auto.to_string(),
+        _ => mask_text(l0),
+    };
+    (m != l0).then_some(m)
 }
 
 /// Заметок в одной транзакции перечанковки: писатель не занят надолго.

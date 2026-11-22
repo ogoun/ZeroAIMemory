@@ -60,6 +60,7 @@ use zam_store::{
     retract_entry, supersede_entry, title_duplicates, validate_trigger,
 };
 
+use super::agent_view;
 use super::entries::{
     audit_details, check_size, check_title, empty_object, idempotency_key, optional_if_match,
     unprocessable,
@@ -666,8 +667,16 @@ async fn decision_vector(
 
 /// Запись как JSON: у insight — её триггеры (`triggers` — массив, у не-insight — нет поля), у
 /// задачи — поля [`super::tasks::attach_task`] (длительность, идеи плана — видимые с ролью `role`,
-/// [`super::tasks::idea_spaces`]).
-pub async fn entry_json(db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
+/// [`super::tasks::idea_spaces`]). Агенту `p` по токену — с маской секретов
+/// ([`agent_view::ENTRY_FIELDS`], задача 5 M7.1; длинное тело — в пуле блокирующих задач);
+/// сессии WebUI — исходник.
+pub async fn entry_json(p: &Principal, db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
+    let v = entry_json_raw(db, e, role).await?;
+    agent_view::view_json_owned(p, v, agent_view::ENTRY_FIELDS).await
+}
+
+/// [`entry_json`] без маски (исходник для любого зрителя).
+async fn entry_json_raw(db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
     let mut v = serde_json::to_value(e).map_err(|e| ApiError::Internal(e.to_string()))?;
     if e.kind == EntryKind::Insight
         && let Value::Object(o) = &mut v
@@ -840,7 +849,9 @@ pub async fn create(
         let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
         // замещение через supersedes_id: ревизия старой не сверяется (If-Match у POST
         // коллекции относился бы к новой записи) [решение исполнителя]
-        let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib).await?;
+        let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib)
+            .await
+            .map_err(|e| agent_view::view_error(p, e.into()))?;
         st.index.notify();
         // аудит — как у POST /entries/{id}/supersede (повтор по ключу — без новой строки)
         if !repeat {
@@ -856,10 +867,10 @@ pub async fn create(
             )
             .await?;
         }
-        let mut v = entry_json(&sc.db, &n, sc.role).await?;
+        let mut v = entry_json(p, &sc.db, &n, sc.role).await?;
         super::secrets::attach_entry(&mut v, &n);
-        v["superseded"] =
-            serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
+        let old_v = serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
+        v["superseded"] = agent_view::view_json_owned(p, old_v, agent_view::ENTRY_FIELDS).await?;
         if kind == EntryKind::Insight {
             v["dedup"] = json!(DedupMode::Skipped.as_str());
             let w = alias_warnings(st, &sc.db, sc.space.id, &n.title, &n.body).await?;
@@ -877,6 +888,7 @@ pub async fn create(
         } else if kind == EntryKind::Term {
             attach_warnings(&mut v, broad_alias_warnings(&n.data));
         }
+        agent_view::view_json(p, &mut v, &["warnings"]);
         let status = if repeat {
             StatusCode::OK
         } else {
@@ -890,7 +902,7 @@ pub async fn create(
         DedupMode::Skipped
     } else {
         let area = req.area.clone().or_else(|| attrib.area.clone());
-        let (cands, mode, vec) = dedup(
+        let (mut cands, mode, vec) = dedup(
             st,
             &sc.db,
             sc.owner,
@@ -901,17 +913,24 @@ pub async fn create(
         )
         .await?;
         if !cands.is_empty() {
+            // заголовки похожих записей в 409 — агенту с маской
+            for c in &mut cands {
+                agent_view::view_in_place(p, &mut c.title);
+            }
             return Err(duplicate(cands, mode));
         }
         dense = vec;
         mode
     };
     let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
-    let (e, created) = create_entry(&sc.db, new, &attrib).await?;
+    // 409 term-conflict — заголовки занятых терминов агенту с маской
+    let (e, created) = create_entry(&sc.db, new, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(p, e.into()))?;
     if created {
         st.index.notify();
     }
-    let mut v = entry_json(&sc.db, &e, sc.role).await?;
+    let mut v = entry_json(p, &sc.db, &e, sc.role).await?;
     super::secrets::attach_entry(&mut v, &e);
     if kind == EntryKind::Insight {
         v["dedup"] = json!(mode.as_str());
@@ -932,6 +951,7 @@ pub async fn create(
     } else if kind == EntryKind::Term {
         attach_warnings(&mut v, broad_alias_warnings(&e.data));
     }
+    agent_view::view_json(p, &mut v, &["warnings"]);
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -987,7 +1007,9 @@ pub async fn supersede(
         None => false,
     };
     let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
-    let (n, o) = supersede_entry(&sc.db, sc.entry.id, rev, new, &attrib).await?;
+    let (n, o) = supersede_entry(&sc.db, sc.entry.id, rev, new, &attrib)
+        .await
+        .map_err(|e| agent_view::view_error(&p, e.into()))?;
     st.index.notify();
     if !repeat {
         audit_node(
@@ -1007,7 +1029,7 @@ pub async fn supersede(
     } else {
         StatusCode::CREATED
     };
-    let mut entry = entry_json(&sc.db, &n, sc.role).await?;
+    let mut entry = entry_json(&p, &sc.db, &n, sc.role).await?;
     super::secrets::attach_entry(&mut entry, &n);
     if kind == EntryKind::Insight {
         let w = alias_warnings(&st, &sc.db, sc.space.id, &n.title, &n.body).await?;
@@ -1027,11 +1049,12 @@ pub async fn supersede(
     } else if kind == EntryKind::Term {
         attach_warnings(&mut entry, broad_alias_warnings(&n.data));
     }
+    agent_view::view_json(&p, &mut entry, &["warnings"]);
     Ok((
         status,
         Json(json!({
             "entry": entry,
-            "superseded": entry_json(&sc.db, &o, sc.role).await?,
+            "superseded": entry_json(&p, &sc.db, &o, sc.role).await?,
         })),
     ))
 }
@@ -1083,7 +1106,7 @@ pub async fn retract(
         audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
-    Ok(Json(entry_json(&sc.db, &e, sc.role).await?))
+    Ok(Json(entry_json(&p, &sc.db, &e, sc.role).await?))
 }
 
 #[cfg(test)]

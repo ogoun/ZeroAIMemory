@@ -102,7 +102,11 @@ pub(super) async fn lookup(
         }
     };
     let mut out = Vec::with_capacity(hits.len());
-    for hit in hits {
+    for mut hit in hits {
+        // агенту по токену — запрос и текст выжимки с маской секретов (задача 5 M7.1): строка
+        // шага 0 и `text` JSON строятся из них
+        crate::api::agent_view::view_in_place(p, &mut hit.entry.query);
+        crate::api::agent_view::view_in_place(p, &mut hit.entry.summary);
         let foreign = hit.entry.session_id.as_deref() != session || session.is_none();
         let author = match st.system.get_user(hit.entry.author_user_id).await {
             Ok(u) => u.map(|u| u.name),

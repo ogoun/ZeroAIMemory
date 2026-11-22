@@ -890,14 +890,22 @@ fn entry_ref(e: &Entry) -> String {
     format!("{}:{}", e.kind.ref_letter(), e.id)
 }
 
+/// Заголовок записи в подсказке агенту — без секретов (задача 5 M7.1, спецификация M7 §4.3.1
+/// п. 5): `/recall` — текст для агента (WebUI его не зовёт), поэтому маска — для любого
+/// принципала, как [`masked_clip`] с M4 **[решение исполнителя, задача 5]**.
+fn hint_title(title: &str) -> String {
+    crate::api::agent_view::mask(title).into_owned()
+}
+
 /// Подсказка-запись журнала.
 fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Cand {
     let kind = data_kind(e);
     let certainty = certainty_str(e.certainty);
     let reference = entry_ref(e);
+    let title = hint_title(&e.title);
     let block = hint_line(
         lead,
-        &e.title,
+        &title,
         &[kind.as_str(), certainty.as_deref().unwrap_or_default()],
         &reference,
     );
@@ -910,7 +918,7 @@ fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Can
         rev: e.rev,
         reference,
         kind: e.kind.as_str(),
-        title: e.title.clone(),
+        title,
         certainty,
         reason,
         block,
@@ -919,12 +927,14 @@ fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Can
 }
 
 /// Подсказка-индекс записи журнала (M6 §8: changelog и revisit): `<ссылка> «<заголовок>» · Nt`,
-/// `N` — размер записи (заголовок и тело) счётчиком выдачи: агент решает, читать ли её.
+/// `N` — размер записи (заголовок и тело) счётчиком выдачи: агент решает, читать ли её
+/// (оценка по исходнику: маска меняет его на единицы токенов, а скан тела на горячем пути
+/// подсказок не нужен).
 fn index_cand(target: usize, e: &Entry, reason: &'static str) -> Cand {
     let mut c = entry_cand(target, e, reason, "");
     let size = count_tokens(&format!("{}\n\n{}", e.title, e.body));
-    // заголовок — до `SOLUTION_ROOT_L0_TOKENS`, как L0 корня (ревью 8a, M3)
-    let title = one_line(&e.title);
+    // заголовок — до `SOLUTION_ROOT_L0_TOKENS`, как L0 корня (ревью 8a, M3); без секретов
+    let title = one_line(&c.title);
     let cap = zam_store::budget_cap(SOLUTION_ROOT_L0_TOKENS);
     let (title, _) = truncate_marked(&title, cap, &count_tokens);
     c.block = format!("{} «{title}» · {size}t", c.reference);
@@ -1333,7 +1343,8 @@ fn environment_block(m: &zam_store::VaultMeta) -> String {
     parts.extend(field("purpose"));
     parts.extend(field("address"));
     parts.extend(field("limits").map(|l| format!("ограничения: {l}")));
-    let mut s = format!("ZeroAIMemory: {}", one_line(&m.title));
+    // имя записи — тоже без секретов (задача 5 M7.1): его задаёт автор
+    let mut s = format!("ZeroAIMemory: {}", one_line(&hint_title(&m.title)));
     if !parts.is_empty() {
         s.push_str(&format!(" — {}", parts.join("; ")));
     }
@@ -1385,7 +1396,7 @@ async fn environment_cands(
             rev: m.rev,
             reference: format!("v:{}", m.id),
             kind: "vault",
-            title: m.title.clone(),
+            title: hint_title(&m.title),
             certainty: None,
             reason: REASON_ENVIRONMENT,
             block: environment_block(m),
@@ -1978,7 +1989,7 @@ async fn brief_search(
         else {
             continue;
         };
-        let title = it["title"].as_str().unwrap_or_default().to_string();
+        let title = hint_title(it["title"].as_str().unwrap_or_default());
         let reference = format!("i:{id}");
         let ik = it["insight_kind"].as_str().unwrap_or_default();
         let block = hint_line(
@@ -2127,9 +2138,10 @@ async fn file_cands(
                     } else {
                         ""
                     };
+                    let title = hint_title(&it.title);
                     let block = hint_line(
                         &format!("файл {}: ", pr.path),
-                        &it.title,
+                        &title,
                         &[kind, stale],
                         &it.id,
                     );
@@ -2139,7 +2151,7 @@ async fn file_cands(
                         rev: 0,
                         reference: it.id.clone(),
                         kind,
-                        title: it.title.clone(),
+                        title,
                         certainty: None,
                         reason: REASON_FILE,
                         block,
@@ -2725,12 +2737,8 @@ async fn term_cands(
             }
             let reference = format!("t:{}", t.id);
             let def = zam_markdown::mask_text(&one_line(&t.definition));
-            let block = hint_line(
-                "термин ",
-                &format!("«{}» — {def}", t.title),
-                &[],
-                &reference,
-            );
+            let title = hint_title(&t.title);
+            let block = hint_line("термин ", &format!("«{title}» — {def}"), &[], &reference);
             out.push(Cand {
                 target: i,
                 tref: TargetRef {
@@ -2740,7 +2748,7 @@ async fn term_cands(
                 rev: t.rev,
                 reference,
                 kind: "term",
-                title: t.title.clone(),
+                title,
                 certainty: None,
                 reason: REASON_GLOSSARY,
                 block,
@@ -2895,9 +2903,10 @@ async fn error_hints(
             taken.insert(tref);
             let reference = format!("i:{}", row.entry_id);
             let certainty = certainty_str(row.certainty);
+            let title = hint_title(&row.title);
             let block = hint_line(
                 lead,
-                &row.title,
+                &title,
                 &[
                     row.insight_kind.as_str(),
                     certainty.as_deref().unwrap_or_default(),
@@ -2910,7 +2919,7 @@ async fn error_hints(
                 rev: 0,
                 reference,
                 kind: "insight",
-                title: row.title.clone(),
+                title,
                 certainty,
                 reason: "error_regex",
                 block,
@@ -2983,9 +2992,10 @@ async fn error_hints(
             taken.insert(h.target);
             let reference = format!("i:{}", h.target.id);
             let kind = e.insight_kind.clone().unwrap_or_default();
+            let title = hint_title(&e.title);
             let block = hint_line(
                 lead,
-                &e.title,
+                &title,
                 &[kind.as_str(), e.certainty.as_deref().unwrap_or_default()],
                 &reference,
             );
@@ -2995,7 +3005,7 @@ async fn error_hints(
                 rev: h.rev,
                 reference,
                 kind: "insight",
-                title: e.title.clone(),
+                title,
                 certainty: e.certainty.clone(),
                 reason: "error_fts",
                 block,

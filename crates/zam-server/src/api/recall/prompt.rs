@@ -56,8 +56,8 @@ use zam_store::{
 
 use super::ideas::{QueueLine, prompt_ideas, review_queue_line};
 use super::{
-    Cand, Deadline, REASON_TASK, RecallReq, TASK_TITLE_CHARS, age_of, entry_spaces, inner_search,
-    item_age, masked_clip, prompt_min_score, term_cands,
+    Cand, Deadline, REASON_TASK, RecallReq, TASK_TITLE_CHARS, age_of, entry_spaces, hint_title,
+    inner_search, item_age, masked_clip, prompt_min_score, term_cands,
 };
 use crate::api::search::Health;
 use crate::api::sessions::RequestSession;
@@ -205,9 +205,11 @@ async fn prompt_hints(
         let snippet =
             truncate_to_tokens(&snippet, st.cfg.recall.snippet_tokens, &count_tokens).to_string();
         let (reference, title, lead, tags, out_kind, reason) = match tref {
+            // заголовок — без секретов (задача 5 M7.1; поиск по токену уже маскирует его, маска
+            // идемпотентна)
             TargetKind::Entry => (
                 format!("i:{id}"),
-                it["title"].as_str().unwrap_or_default().to_string(),
+                hint_title(it["title"].as_str().unwrap_or_default()),
                 "",
                 it["insight_kind"].as_str().unwrap_or_default().to_string(),
                 "insight",
@@ -350,7 +352,7 @@ async fn task_prompt_cands(
             rev: h.rev,
             reference,
             kind: EntryKind::Task.as_str(),
-            title: e.title.clone(),
+            title: hint_title(&e.title),
             certainty: e.certainty.clone(),
             reason: REASON_TASK,
             block,
