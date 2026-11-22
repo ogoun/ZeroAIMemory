@@ -198,10 +198,18 @@ pub fn strip_exit_header(s: &str) -> &str {
     }
 }
 
-/// Служебные фразы вывода (M7.1 §4.6 п. 3): описание условия ОС, а не предмет ошибки — их
-/// слова в покрытие не идут ([`subject_error_terms`]). Сравнение — целыми словами без учёта
-/// регистра.
-pub const SERVICE_PHRASES: [&str; 1] = ["no such file or directory"];
+/// Служебные фразы вывода (M7.1 §4.6 п. 3): сообщения ОС «нет такого файла или пути» (POSIX
+/// `ENOENT` в английской и русской локали, Windows — тоже в обеих), а не предмет ошибки — их слова
+/// в покрытие не идут ([`subject_error_terms`]). Сравнение — целыми словами после [`norm_word`]
+/// (регистр, `ё` → `е`: «Не удаётся» = «Не удается»).
+pub const SERVICE_PHRASES: [&str; 6] = [
+    "no such file or directory",
+    "нет такого файла или каталога",
+    "the system cannot find the path specified",
+    "the system cannot find the file specified",
+    "не удается найти указанный путь",
+    "не удается найти указанный файл",
+];
 
 /// Слова нормализованной ошибки для покрытия по предметным словам (M7.1 §4.6 п. 3): как
 /// [`error_terms`], но без вхождений [`SERVICE_PHRASES`].
@@ -210,6 +218,7 @@ pub fn subject_error_terms(normalized: &str) -> Vec<String> {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .collect();
+    let normed: Vec<String> = words.iter().map(|w| norm_word(w)).collect();
     let phrases: Vec<Vec<&str>> = SERVICE_PHRASES
         .iter()
         .map(|p| p.split(' ').collect())
@@ -218,10 +227,7 @@ pub fn subject_error_terms(normalized: &str) -> Vec<String> {
     let mut i = 0;
     while i < words.len() {
         let hit = phrases.iter().find(|p| {
-            words.len() - i >= p.len()
-                && p.iter()
-                    .zip(&words[i..])
-                    .all(|(a, b)| b.eq_ignore_ascii_case(a))
+            words.len() - i >= p.len() && p.iter().zip(&normed[i..]).all(|(a, b)| b == a)
         });
         match hit {
             Some(p) => i += p.len(),
@@ -1220,6 +1226,22 @@ mod tests {
             subject_error_terms("no such file or directoryX"),
             ["such", "file", "directoryx"]
         );
+        // русская локаль и Windows (M-6 ревью задачи 8), `ё` = `е`
+        for (err, rest) in [
+            (
+                "ls: невозможно получить доступ к 'x': Нет такого файла или каталога",
+                vec!["невозможно", "получить", "доступ"],
+            ),
+            ("The system cannot find the path specified.", vec![]),
+            (
+                "open: The system cannot find the file specified. (os error 2)",
+                vec!["open", "error"],
+            ),
+            ("Не удаётся найти указанный путь", vec![]),
+            ("Системе: Не удается найти указанный файл.", vec!["системе"]),
+        ] {
+            assert_eq!(subject_error_terms(&normalize_error(err)), rest, "{err}");
+        }
     }
 
     /// M7.1 §4.6 п. 3: покрытие по предметным словам — снятые слова не идут ни в число слов, ни
