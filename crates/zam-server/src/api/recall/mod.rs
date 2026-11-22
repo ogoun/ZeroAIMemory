@@ -230,8 +230,8 @@
 //!   `text` в нём (Rules — первыми, хвост их приоритета — L0, затем снимаются разделы с меньшим
 //!   `keep`, правила — со строкой «не показано — правил: N»); хук без поля (есть `source` или
 //!   `code_map`) — 7500 байт; `max` вне 1..=1 000 000 или иная единица — 400;
-//! - `path_words` (M7.1 §4.6 п. 3, только `post_tool`) — слова путей из аргументов команды:
-//!   не предмет ошибки, в покрытие не идут (первые 64);
+//! - `path_words` (M7.1 §4.6 п. 3, только `post_tool`) — имена каталогов из аргументов
+//!   команды: не предмет ошибки, в покрытие не идут (первые `zam_core::shell::PATH_WORDS_MAX`);
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
 //!   recovery | brief | idea_review` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
 //!
@@ -260,6 +260,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
+use zam_core::shell::PATH_WORDS_MAX;
 use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
     CoverageQuery, CoverageRule, HINT_PREFIX, Section, error_regex_matches, error_terms, hint_line,
@@ -525,14 +526,12 @@ pub struct RecallReq {
     /// Идей в пакете `idea_review` (M6.5 §7): 1..=[`IDEA_REVIEW_LIMIT_MAX`], иначе 400; нет —
     /// [`IDEA_REVIEW_LIMIT`]. У прочих событий не действует.
     limit: Option<u32>,
-    /// `post_tool` (M7.1 §4.6 п. 3): слова путей из аргументов команды (их шлёт хук `zam`,
+    /// `post_tool` (M7.1 §4.6 п. 3): имена каталогов из аргументов команды (их шлёт хук `zam`,
     /// `zam_core::shell::path_words`) — в покрытие слов ошибки не идут; берутся первые
-    /// [`PATH_WORDS_MAX`], без учёта регистра. У прочих событий не действует.
+    /// [`PATH_WORDS_MAX`] (тот же предел, что у клиента), без учёта регистра. У прочих событий не
+    /// действует.
     path_words: Option<Vec<String>>,
 }
-
-/// Слов `path_words` запроса, не больше.
-const PATH_WORDS_MAX: usize = 64;
 
 /// Единица предела вывода: символы (Claude Code) или байты UTF-8 (Codex).
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -3048,16 +3047,24 @@ async fn subject_cover(
             let statuses = vec!["active".to_string(), "revisit".to_string()];
             let step = insight_term_docs(&t.db, spaces, statuses, counted.clone());
             match deadline.step(step).await {
-                Some(Ok((n, d))) => {
-                    docs += n;
-                    df.iter_mut().zip(d).for_each(|(a, b)| *a += b);
+                Some(Ok(td)) => {
+                    docs += td.docs;
+                    df.iter_mut().zip(td.df).for_each(|(a, b)| *a += b);
                 }
                 Some(Err(e)) => {
-                    tracing::warn!(error = %e, "post_tool: частота слов ошибки не прочитана");
+                    tracing::warn!(
+                        error = %e,
+                        "post_tool: частота слов ошибки не прочитана — покрытие без частых слов"
+                    );
                     complete = false;
                     break;
                 }
                 None => {
+                    tracing::warn!(
+                        reason = "recall timeout",
+                        "post_tool: частота слов ошибки не посчитана до срока сбора — покрытие без \
+                         частых слов"
+                    );
                     complete = false;
                     break;
                 }

@@ -906,58 +906,186 @@ async fn fts_channels(
     .await
 }
 
+/// Документная частота слов среди insight области ([`insight_term_docs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermDocs {
+    /// Действующих insight области.
+    pub docs: usize,
+    /// По каждому слову запроса — insight, в чанках которых есть слово с этим началом.
+    pub df: Vec<usize>,
+    /// Проходов индекса FTS в этом вызове (слов, которых не было в кэше версии; 0 — всё из кэша).
+    pub matched: usize,
+}
+
+/// Версия insight области: число действующих, сумма их ревизий и наибольший `rowid` записи —
+/// меняется при создании, правке, смене статуса, удалении и восстановлении insight.
+type InsightVersion = (i64, i64, i64);
+
+/// Кэш частоты слов области ([`insight_term_docs`]): чанки insight версии и найденные частоты.
+struct TermDocsArea {
+    version: InsightVersion,
+    /// `seq` чанка insight → номер insight.
+    doc_of: std::sync::Arc<HashMap<i64, usize>>,
+    docs: usize,
+    /// Диапазон `seq` чанков insight: проход индекса FTS — только по нему.
+    lo: i64,
+    hi: i64,
+    df: HashMap<String, usize>,
+}
+
+/// Область кэша частоты: база (путь файла), пространства и статусы.
+type TermDocsKey = (std::path::PathBuf, Vec<Id>, Vec<String>);
+
+/// Областей в кэше частоты, не больше (больше — кэш сбрасывается целиком).
+const TERM_DOCS_AREAS_MAX: usize = 64;
+/// Слов с частотой в области, не больше (больше — частоты области сбрасываются).
+const TERM_DOCS_TERMS_MAX: usize = 8192;
+
+fn term_docs_cache() -> &'static std::sync::Mutex<HashMap<TermDocsKey, TermDocsArea>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<TermDocsKey, TermDocsArea>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 /// Документная частота слов среди действующих insight (M7.1 §4.6 п. 3: частые слова ошибки
-/// `/recall(post_tool)`): `(insight всего, по каждому слову `terms` — insight, в чанках которых
-/// есть слово с этим началом)`. Слово ищется тем же термом FTS, что у поиска (`"слово"*` от 3
-/// символов, короче — точное; все колонки `chunks_fts`); insight — живые записи вида `insight` в
-/// `space_ids` со статусом из `statuses`. Как [`leaf_term_hits`]: чанки insight (индексы
-/// `entries_feed`, `chunks_entry`) и по одному проходу индекса FTS на слово — только `rowid`,
-/// пересечение — в памяти. Пустые `space_ids` или `terms` — нули без запросов.
+/// `/recall(post_tool)`): insight — живые записи вида `insight` в `space_ids` со статусом из
+/// `statuses`; частота слова — сколько из них имеют в чанках слово с этим началом (тот же терм
+/// FTS, что у поиска: `"слово"*` от 3 символов, короче — точное; все колонки `chunks_fts`).
+///
+/// Цена (ревью задачи 8, M-3): кэш процесса по области — по образцу кэша словаря сервера, версия
+/// читается на каждое обращение одним запросом по `entries` ([`InsightVersion`]); при той же
+/// версии чанки insight и уже найденные частоты берутся из кэша, а индекс FTS проходится только для
+/// новых слов и только в диапазоне `seq` чанков insight (`rowid BETWEEN`, как у
+/// [`focus_leaves`]); другая версия — чанки читаются заново, частоты сбрасываются. Перенарезка
+/// чанков без новой ревизии (перемаскировка секретов) версию не меняет: до следующей правки insight
+/// частота новых слов может быть занижена — слово тогда не считается частым. Пустые `space_ids`
+/// или `terms` — нули без запросов.
 pub async fn insight_term_docs(
     db: &Db,
     space_ids: Vec<Id>,
     statuses: Vec<String>,
     terms: Vec<String>,
-) -> Result<(usize, Vec<usize>), StoreError> {
+) -> Result<TermDocs, StoreError> {
     if space_ids.is_empty() || terms.is_empty() {
-        return Ok((0, vec![0; terms.len()]));
+        return Ok(TermDocs {
+            docs: 0,
+            df: vec![0; terms.len()],
+            matched: 0,
+        });
     }
+    let path = db.path().to_path_buf();
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
-        let statuses = serde_json::Value::from(statuses).to_string();
-        let mut st = tx.prepare_cached(&format!(
-            "SELECT c.seq, e.id FROM entries e CROSS JOIN chunks c ON c.entry_id = e.id
-             WHERE e.kind = 'insight' AND e.deleted_at IS NULL AND e.space_id IN ({})
+        let statuses_json = serde_json::Value::from(statuses.clone()).to_string();
+        let mut args: Vec<&dyn ToSql> = vec![&statuses_json];
+        args.extend(space_ids.iter().map(|s| s as &dyn ToSql));
+        let scope = format!(
+            "e.kind = 'insight' AND e.deleted_at IS NULL AND e.space_id IN ({})
                AND e.status IN (SELECT value FROM json_each(?1))",
             placeholders(2, space_ids.len())
-        ))?;
-        let mut args: Vec<&dyn ToSql> = vec![&statuses];
-        args.extend(space_ids.iter().map(|s| s as &dyn ToSql));
-        // `seq` чанка → номер insight
-        let mut doc_of: HashMap<i64, usize> = HashMap::new();
-        let mut docs: HashMap<Id, usize> = HashMap::new();
-        let rows = st.query_map(params_from_iter(args), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Id>(1)?))
-        })?;
-        for row in rows {
-            let (seq, id) = row?;
-            let next = docs.len();
-            doc_of.insert(seq, *docs.entry(id).or_insert(next));
-        }
-        let mut df = Vec::with_capacity(terms.len());
-        let mut st = tx.prepare_cached("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1")?;
-        for t in &terms {
-            let mut with: HashSet<usize> = HashSet::new();
-            if !docs.is_empty() && !t.is_empty() {
-                for seq in st.query_map([quote_term(t)], |r| r.get::<_, i64>(0))? {
-                    if let Some(d) = doc_of.get(&seq?) {
-                        with.insert(*d);
+        );
+        let version: InsightVersion = tx
+            .prepare_cached(&format!(
+                "SELECT count(*), coalesce(sum(e.current_rev), 0), coalesce(max(e.rowid), 0)
+                 FROM entries e WHERE {scope}"
+            ))?
+            .query_row(params_from_iter(args.iter()), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        let key: TermDocsKey = (path, space_ids.clone(), statuses);
+        let lock = || {
+            term_docs_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        // версия та же — чанки и найденные частоты из кэша; иначе чанки — заново
+        let cached = lock()
+            .get(&key)
+            .filter(|a| a.version == version)
+            .map(|a| (a.doc_of.clone(), a.docs, a.lo, a.hi));
+        let (doc_of, docs, lo, hi) = match cached {
+            Some(c) => c,
+            None => {
+                let mut st = tx.prepare_cached(&format!(
+                    "SELECT c.seq, e.id FROM entries e CROSS JOIN chunks c ON c.entry_id = e.id
+                     WHERE {scope}"
+                ))?;
+                let mut doc_of: HashMap<i64, usize> = HashMap::new();
+                let mut ids: HashMap<Id, usize> = HashMap::new();
+                let rows = st.query_map(params_from_iter(args.iter()), |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Id>(1)?))
+                })?;
+                for row in rows {
+                    let (seq, id) = row?;
+                    let next = ids.len();
+                    doc_of.insert(seq, *ids.entry(id).or_insert(next));
+                }
+                let (lo, hi) = doc_of
+                    .keys()
+                    .fold((i64::MAX, i64::MIN), |(a, b), &k| (a.min(k), b.max(k)));
+                let area = TermDocsArea {
+                    version,
+                    doc_of: std::sync::Arc::new(doc_of),
+                    docs: ids.len(),
+                    lo,
+                    hi,
+                    df: HashMap::new(),
+                };
+                let out = (area.doc_of.clone(), area.docs, lo, hi);
+                let mut m = lock();
+                if m.len() >= TERM_DOCS_AREAS_MAX && !m.contains_key(&key) {
+                    m.clear();
+                }
+                m.insert(key.clone(), area);
+                out
+            }
+        };
+        let known: HashMap<String, usize> = lock().get(&key).map_or_else(HashMap::new, |a| {
+            terms
+                .iter()
+                .filter_map(|t| a.df.get(t).map(|n| (t.clone(), *n)))
+                .collect()
+        });
+        let missing: Vec<&String> = terms
+            .iter()
+            .filter(|t| !known.contains_key(*t))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut found: HashMap<String, usize> = HashMap::new();
+        if docs > 0 {
+            let mut st = tx.prepare_cached(
+                "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 AND rowid BETWEEN ?2 AND ?3",
+            )?;
+            for t in &missing {
+                let mut with: HashSet<usize> = HashSet::new();
+                if !t.is_empty() {
+                    for seq in st.query_map(params![quote_term(t), lo, hi], |r| r.get::<_, i64>(0))? {
+                        if let Some(d) = doc_of.get(&seq?) {
+                            with.insert(*d);
+                        }
                     }
                 }
+                found.insert((*t).clone(), with.len());
             }
-            df.push(with.len());
+        } else {
+            found.extend(missing.iter().map(|t| ((*t).clone(), 0)));
         }
-        Ok((docs.len(), df))
+        if let Some(a) = lock().get_mut(&key).filter(|a| a.version == version) {
+            if a.df.len() + found.len() > TERM_DOCS_TERMS_MAX {
+                a.df.clear();
+            }
+            a.df.extend(found.iter().map(|(t, n)| (t.clone(), *n)));
+        }
+        let df = terms
+            .iter()
+            .map(|t| known.get(t).or_else(|| found.get(t)).copied().unwrap_or(0))
+            .collect();
+        Ok(TermDocs {
+            docs,
+            df,
+            matched: if docs > 0 { missing.len() } else { 0 },
+        })
     })
     .await
 }

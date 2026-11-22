@@ -948,7 +948,8 @@ async fn insight_in(db: &Db, space: Id, title: &str, body: &str) -> Id {
 
 /// M7.1 §4.6 п. 3: документная частота слов среди действующих insight пространств — по началу
 /// слова (как терм FTS), один раз на insight; удалённые, отозванные, заметки и чужие
-/// пространства не считаются.
+/// пространства не считаются. Кэш (M-3 ревью задачи 8): та же версия insight — без проходов
+/// индекса FTS, новая (запись, отзыв insight) — частоты заново; заметка версию не меняет.
 #[tokio::test]
 async fn insight_term_docs_counts_live_insights() {
     let (db, k, h) = setup("insight-term-docs").await;
@@ -972,13 +973,32 @@ async fn insight_term_docs_counts_live_insights() {
         "pulsar".into(),
         "nebula".into(),
     ];
-    let (docs, df) = zam_store::insight_term_docs(&db, vec![k], st(), terms.clone())
+    let td = |terms: &[String]| zam_store::insight_term_docs(&db, vec![k], st(), terms.to_vec());
+    let r = td(&terms).await.unwrap();
+    assert_eq!((r.docs, r.df.clone(), r.matched), (3, vec![2, 2, 2, 0], 4));
+    // та же версия insight — из кэша, без проходов индекса; новое слово — один проход
+    let r = td(&terms).await.unwrap();
+    assert_eq!((r.docs, r.df, r.matched), (3, vec![2, 2, 2, 0], 0));
+    let r = td(&["pulsar".into(), "quasars".into()]).await.unwrap();
+    assert_eq!((r.df, r.matched), (vec![2, 1], 1));
+    // заметка — не insight: версия та же
+    add(&db, k, "notes/q2", "# Q2\n\nquasar ещё\n").await;
+    assert_eq!(td(&terms).await.unwrap().matched, 0);
+    // новый insight — новая версия: частоты заново
+    insight_in(&db, k, "Ещё квазар", "quasar").await;
+    let r = td(&terms).await.unwrap();
+    assert_eq!((r.docs, r.df, r.matched), (4, vec![3, 3, 2, 0], 4));
+    // отзыв — тоже новая версия
+    let q = insight_in(&db, k, "Квазар на отзыв", "quasar").await;
+    assert_eq!(td(&terms).await.unwrap().df, vec![4, 4, 2, 0]);
+    zam_store::retract_entry(&db, q, None, "неверно", &attrib())
         .await
         .unwrap();
-    assert_eq!((docs, df), (3, vec![2, 2, 2, 0]));
+    let r = td(&terms).await.unwrap();
+    assert_eq!((r.docs, r.df, r.matched), (4, vec![3, 3, 2, 0], 4));
     // пустые пространства или слова — без запросов
-    let (docs, df) = zam_store::insight_term_docs(&db, Vec::new(), st(), terms)
+    let r = zam_store::insight_term_docs(&db, Vec::new(), st(), terms)
         .await
         .unwrap();
-    assert_eq!((docs, df), (0, vec![0; 4]));
+    assert_eq!((r.docs, r.df, r.matched), (0, vec![0; 4], 0));
 }
