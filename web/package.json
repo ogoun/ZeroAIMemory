@@ -1,7 +1,7 @@
 {
   "name": "zam-web",
   "private": true,
-  "version": "0.0.13-m6.6",
+  "version": "0.0.14-m7.1",
   "type": "module",
   "engines": {
     "node": ">=22.13"
