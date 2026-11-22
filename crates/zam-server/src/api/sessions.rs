@@ -47,10 +47,14 @@
 //!   инструменты MCP — `mcp`, чтения `/read` из MCP — ещё `mcp_read` (вызов и `reread_calls`,
 //!   токенов 0 — их считает `mcp`); хуки с локальным
 //!   выводом — `pre_tool`, `post_tool_local`, `subagent_local`;
-//! - `GET /sessions?solution=&limit=&tokens=` → `{items}` — свои, свежие первыми (50, до 500);
-//!   `tokens=true` — у каждой ещё `tokens`, как в `GET /sessions/{id}` (`zam sessions tokens
-//!   --last N`, страница сессий WebUI); у сессии со снимком (M6 §8а) — `snapshot_at` (момент
-//!   снимка; сам снимок — `GET /sessions/{id}/snapshot`, [`super::snapshot`]);
+//! - `GET /sessions?solution=&limit=&tokens=&parent=` → `{items}` — свои, свежие первыми (50, до
+//!   500); `tokens=true` — у каждой ещё `tokens`, как в `GET /sessions/{id}` (`zam sessions
+//!   tokens --last N`, страница сессий WebUI); у сессии со снимком (M6 §8а) — `snapshot_at`
+//!   (момент снимка; сам снимок — `GET /sessions/{id}/snapshot`, [`super::snapshot`]);
+//!   `parent=<id>` (M7 §5.8 п. 1, признак `sessions_parent`) — только сессии субагентов сессии
+//!   `<id>` и их субагентов (потомки по `parent_id`, без самой сессии — самоссылка и цикл её не
+//!   добавляют): `zam sessions tokens --subagents`, `cargo xtask ab`, WebUI; некорректный id —
+//!   400, сессий нет — пустой `items`;
 //! - `GET /sessions/unattributed?days=N` → `{items: [{day, event, calls, tokens}]}` — выданное
 //!   без явной сессии по суткам UTC (M6 §7.1, [`unattributed`]).
 //!
@@ -81,10 +85,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Db, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts, bump_epoch,
-    claimed_tasks, end_session, get_session, list_sessions, list_spaces, register_session,
-    session_epoch, session_holdout, session_tokens, sessions_tokens, set_holdout, snapshot_times,
-    touch_session,
+    Db, SessionFilter, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts,
+    bump_epoch, claimed_tasks, end_session, get_session, list_sessions, list_spaces,
+    register_session, session_epoch, session_holdout, session_tokens, sessions_tokens, set_holdout,
+    snapshot_times, touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -451,6 +455,9 @@ pub struct ListQuery {
     limit: Option<usize>,
     /// `true` — у каждой сессии `tokens` (выданное по событию).
     tokens: Option<bool>,
+    /// Только сессии субагентов этой сессии и их субагентов (потомки по `parent_id`; M7 §5.8
+    /// п. 1, признак `sessions_parent`).
+    parent: Option<String>,
 }
 
 /// `GET /sessions`.
@@ -474,8 +481,18 @@ pub async fn list(
                 .map_err(|_| ApiError::BadRequest("solution: GUID решения".into()))
         })
         .transpose()?;
+    // id родителя — по правилам id сессии (пустой, длинный, с управляющими символами — 400)
+    let parent = q.parent.as_deref().map(str::trim);
+    if let Some(id) = parent {
+        zam_store::check_session_id(id)
+            .map_err(|_| ApiError::BadRequest("parent: id сессии родителя".into()))?;
+    }
     let db = requester_db(&st, &p, &headers).await?;
-    let items = list_sessions(&db, solution.as_ref(), limit).await?;
+    let filter = SessionFilter {
+        solution: solution.as_ref(),
+        parent,
+    };
+    let items = list_sessions(&db, filter, limit).await?;
     let ids: Vec<String> = items.iter().map(|s| s.id.clone()).collect();
     let snaps = snapshot_times(&db, &ids).await?;
     let mut tokens = if q.tokens == Some(true) {

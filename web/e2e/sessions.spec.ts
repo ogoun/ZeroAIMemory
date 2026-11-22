@@ -1,9 +1,12 @@
 // «Сессии» (M6 §8, задача 8b): выданное сессии агента по событию — «событие · вызовов · токенов»
 // и доля «уже выдавалось» (повторное чтение `/read` той же ревизии); плашка `rules_heavy` у Rules
 // в дереве и на странице «Индекс». Данные создаёт агент (токен администратора) через REST.
+// M7.2 (задача 9, §5.8 п. 3): блок «Без сессии» (выдача MCP без сессии агента), субагенты под
+// родителем, на телефоне — карточка вместо списка.
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
+import { VIEWPORTS, minTarget, noHorizontalScroll, touch } from './viewports';
 
 const env = (k: string) => {
   const v = process.env[k];
@@ -147,6 +150,226 @@ test('snapshot text is not html', async ({ page, playwright }) => {
   }
   await rc.dispose();
   expect(problems, problems.join('\n')).toEqual([]);
+});
+
+/** Сессия `parent` и три её субагента `<parent>:a1..a3` (хук `subagent-start`) с учётом хуков:
+ * у родителя 10 токенов, у субагентов 7 + 5 + 3. */
+async function seedSubagents(rc: APIRequestContext, parent: string): Promise<{ own: number; all: number }> {
+  const a = agent(rc);
+  const bodies = [
+    { id: parent, agent: 'claude-code', tokens: { pre_tool: 10 } },
+    { id: `${parent}:a1`, parent_id: parent, agent_type: 'Explore', tokens: { subagent_local: 7 } },
+    { id: `${parent}:a2`, parent_id: parent, agent_type: 'Plan', tokens: { pre_tool: { calls: 2, tokens: 5 } } },
+    { id: `${parent}:a3`, parent_id: parent, agent_type: 'Explore', tokens: { post_tool_local: 3 } },
+  ];
+  for (const b of bodies) {
+    const r = await a.post('sessions', b);
+    expect(r.status(), await r.text()).toBe(201);
+  }
+  return { own: 10, all: 25 };
+}
+
+type Unattributed = { items: { day: string; event: string; calls: number; tokens: number }[] };
+
+/** Выдача без сессии за `days` суток по событию `event` (REST, как страница). */
+async function unattributedOf(rc: APIRequestContext, days: number, event: string) {
+  const r = await rc.get(`api/v1/sessions/unattributed?days=${days}`, {
+    headers: { Authorization: `Bearer ${env('E2E_ADMIN_TOKEN')}` },
+  });
+  expect(r.status(), await r.text()).toBe(200);
+  const rows = ((await r.json()) as Unattributed).items.filter((x) => x.event === event);
+  return { calls: rows.reduce((n, x) => n + x.calls, 0), tokens: rows.reduce((n, x) => n + x.tokens, 0), rows };
+}
+
+/** Вызов инструмента MCP без сессии агента: без `X-Zam-Session` и `session_id` — как `.mcp.json`
+ * с HTTP вместо `zam mcp` (`crates/zam-server/tests/mcp.rs`, `implicit_session_no_marks_goes_unattributed`). */
+async function mcpWithoutSession(rc: APIRequestContext, name: string, args: unknown) {
+  const r = await rc.post('mcp', {
+    headers: {
+      Authorization: `Bearer ${env('E2E_ADMIN_TOKEN')}`,
+      Accept: 'application/json, text/event-stream',
+    },
+    data: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } },
+    failOnStatusCode: false,
+  });
+  expect(r.status(), await r.text()).toBe(200);
+  expect(((await r.json()) as { error?: unknown }).error, 'ответ MCP').toBeUndefined();
+}
+
+const num = (n: number) => n.toLocaleString('ru-RU');
+
+// M7.2 §5.8 п. 3: выдача MCP без сессии видна в блоке «Без сессии» за 7 сут. (по событиям и по
+// суткам — раскрытием, числа — как у сервера); сессии субагентов свёрнуты под родителем
+// («субагенты: 3»), у родителя — строка «с субагентами»; раскрытие дочитывает `?parent=`.
+test('sessions_unattributed_and_subagents_folded', async ({ page, playwright }) => {
+  const problems = watch(page);
+  const rc = await playwright.request.newContext({ baseURL: base() });
+  const parent = 'e2e-sub-parent-9';
+  const sums = await seedSubagents(rc, parent);
+  // выдача MCP без сессии: учёт пишется в фоне после ответа — ждём, пока он не дойдёт
+  const before = await unattributedOf(rc, 7, 'mcp');
+  await mcpWithoutSession(rc, 'memory_search', { query: 'выданное без сессии' });
+  await expect.poll(async () => (await unattributedOf(rc, 7, 'mcp')).calls, { timeout: 10_000 }).toBe(before.calls + 1);
+  const mcp = await unattributedOf(rc, 7, 'mcp');
+  expect(mcp.tokens).toBeGreaterThan(before.tokens);
+  const mcp30 = await unattributedOf(rc, 30, 'mcp');
+
+  // 30 суток — к ответу сервера строка двадцатидневной давности (в e2e вся выдача без сессии
+  // свежая: иначе числа за 7 и 30 суток совпали бы); ответ на 7 суток ждёт сигнала — пока его нет,
+  // прежние строки под новой подписью не показываются (ревью задачи 9, Minor 3)
+  const old = new Date(Date.now() - 20 * 86_400_000).toISOString().slice(0, 10);
+  const isUn = (u: URL, d: string) =>
+    u.pathname.endsWith('/api/v1/sessions/unattributed') && u.searchParams.get('days') === d;
+  await page.route(
+    (u) => isUn(u, '30'),
+    async (route) => {
+      const r = await route.fetch();
+      const j = (await r.json()) as Unattributed;
+      j.items.push({ day: old, event: 'mcp', calls: 4, tokens: 100 });
+      await route.fulfill({ response: r, json: j });
+    },
+  );
+  let release7: () => void = () => {};
+  const gate7 = new Promise<void>((res) => (release7 = res));
+  await page.route(
+    (u) => isUn(u, '7'),
+    async (route) => {
+      await gate7;
+      await route.continue();
+    },
+  );
+
+  await page.goto(base());
+  await page.getByRole('link', { name: 'Сессии' }).click();
+  await expect(page).toHaveURL(/#\/sessions$/);
+
+  // без сессии: по умолчанию 30 суток, затем 7 — у каждого периода свои числа; по суткам —
+  // раскрытием
+  const block = page.getByRole('region', { name: 'Без сессии' });
+  await expect(block).toContainText('без привязки к сессии агента');
+  await expect(block.getByRole('link', { name: 'подключения агента' })).toHaveAttribute('href', '#/agent-setup');
+  await expect(block).toContainText('zam mcp');
+  const table = block.getByRole('table', { name: 'Без сессии по событиям' });
+  const ev = table.locator('tr[data-event="mcp"] td');
+  await expect(block.getByRole('button', { name: '30 сут.' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(ev.nth(1)).toHaveText(num(mcp30.calls + 4));
+  await expect(ev.nth(2)).toHaveText(num(mcp30.tokens + 100));
+  const d7 = block.getByRole('button', { name: '7 сут.' });
+  await d7.click();
+  await expect(d7).toHaveAttribute('aria-pressed', 'true');
+  await expect(block.getByRole('button', { name: '30 сут.' })).toHaveAttribute('aria-pressed', 'false');
+  await expect(block.locator('[data-unattributed-loading]')).toBeVisible();
+  await expect(table).toHaveCount(0);
+  release7();
+  await expect(ev.nth(1)).toHaveText(num(mcp.calls));
+  await expect(ev.nth(2)).toHaveText(num(mcp.tokens));
+  expect(mcp.calls).not.toBe(mcp30.calls + 4);
+  await expect(table.locator('tfoot')).toContainText('Итого за 7 сут.');
+  const byDay = block.getByRole('table', { name: 'Без сессии по суткам' });
+  await expect(byDay).toBeHidden();
+  await block.getByText('По суткам').click();
+  const today = new Date().toISOString().slice(0, 10);
+  const todayRow = mcp.rows.find((x) => x.day === today) ?? mcp.rows[0];
+  await expect(byDay.locator(`tr[data-day="${todayRow.day}"][data-event="mcp"] td`).nth(2)).toHaveText(num(todayRow.calls));
+
+  // субагенты — свёрнуты под родителем, строка «с субагентами» — у родителя
+  const list = page.getByRole('table', { name: 'Список сессий' });
+  const row = list.locator(`tr[data-session="${parent}"]`);
+  await expect(row.locator('td').last()).toHaveText(num(sums.own));
+  await expect(list.locator(`tr[data-session^="${parent}:"]`)).toHaveCount(0);
+  const group = list.locator(`tr[data-subagents-of="${parent}"]`);
+  const toggle = group.getByRole('button', { name: 'субагенты: 3' });
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(group.locator('[data-with-subagents]')).toHaveText(`с субагентами: ${num(sums.all)}`);
+  // раскрытие — полный список субагентов с сервера (`?parent=`)
+  const asked = page.waitForResponse((r) => r.url().includes(`parent=${encodeURIComponent(parent)}`) && r.ok());
+  await toggle.click();
+  await asked;
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  const subs = list.locator(`tr[data-session^="${parent}:"]`);
+  await expect(subs).toHaveCount(3);
+  await expect(subs.first()).toContainText('субагент');
+  await expect(list.locator(`tr[data-session="${parent}:a2"] td`).last()).toHaveText('5');
+  await page.screenshot({ path: `${screens}sessions-subagents.png`, fullPage: true });
+
+  // карточка субагента — с ссылкой на родителя; у родителя — число субагентов и сумма
+  await list.locator(`tr[data-session="${parent}:a1"]`).getByRole('button', { name: `${parent}:a1` }).click();
+  await expect(page).toHaveURL(new RegExp(`#/sessions/${encodeURIComponent(`${parent}:a1`)}$`));
+  const sub = page.getByRole('region', { name: `Сессия ${parent}:a1` });
+  await expect(sub).toContainText('Субагент Explore сессии');
+  await sub.getByRole('link', { name: parent }).click();
+  const card = page.getByRole('region', { name: `Сессия ${parent}` });
+  await expect(card.locator('[data-card-subagents]')).toHaveText(`Субагенты: 3 · с субагентами — ${num(sums.all)} токенов`);
+
+  // сессия из адреса вне окна списка (ревью задачи 9, Minor 4): список без неё и её субагентов —
+  // как при 200 более свежих сессиях; карточка — по id, потомки — по `?parent=`
+  await page.route(
+    (u) => u.pathname.endsWith('/api/v1/sessions') && !u.searchParams.has('parent'),
+    async (route) => {
+      const r = await route.fetch();
+      const j = (await r.json()) as { items: { id: string }[] };
+      await route.fulfill({ response: r, json: { items: j.items.filter((x) => !x.id.startsWith(parent)) } });
+    },
+  );
+  await page.reload();
+  await expect(card).toBeVisible();
+  await expect(list.locator(`tr[data-session="${parent}"]`)).toHaveCount(0);
+  await expect(card.locator('[data-card-subagents]')).toHaveText(`Субагенты: 3 · с субагентами — ${num(sums.all)} токенов`);
+  await expect(card.getByRole('table', { name: 'Выданное сессии' }).locator('tfoot')).toContainText(num(sums.own));
+  // сессии нет у пользователя — сообщение, а не молча список
+  const none = 'e2e-no-such-session-9';
+  await page.goto(`${base()}#/sessions/${none}`);
+  await expect(page.getByRole('region', { name: `Сессия ${none}` }).locator('[data-session-missing]')).toContainText(
+    'Такой сессии нет',
+  );
+  await rc.dispose();
+  // ожидаемые 404: сессия, которой нет, и снимок сессии вне окна (у неё `snapshot_at` неизвестен)
+  const expected = (p: string) =>
+    p === `HTTP 404 GET /api/v1/sessions/${none}` || p === `HTTP 404 GET /api/v1/sessions/${parent}/snapshot`;
+  const rest = problems.filter((p) => !expected(p));
+  expect(rest, rest.join('\n')).toEqual([]);
+});
+
+// §5.1 на телефоне: таблицы — в `.table-wrap` (страница вбок не прокручивается), карточка сессии —
+// вместо списка, «← Сессии» и «назад» браузера возвращают список; цели касания — 44 px.
+test.describe('телефон', () => {
+  test.use({ viewport: VIEWPORTS.phone, ...touch });
+
+  test('sessions_phone_card_replaces_list', async ({ page, playwright }) => {
+    const problems = watch(page);
+    const rc = await playwright.request.newContext({ baseURL: base() });
+    const parent = 'e2e-sub-parent-9-phone';
+    await seedSubagents(rc, parent);
+    await page.goto(`${base()}#/sessions`);
+    const list = page.getByRole('table', { name: 'Список сессий' });
+    await expect(list.locator(`tr[data-session="${parent}"]`)).toBeVisible();
+    await expect(page.getByRole('table', { name: 'Без сессии по событиям' }).or(page.locator('[data-unattributed-empty]'))).toBeVisible();
+    expect(await noHorizontalScroll(page), 'горизонтальная прокрутка списка').toBe(true);
+    const group = list.locator(`tr[data-subagents-of="${parent}"]`);
+    await minTarget(group.getByRole('button', { name: 'субагенты: 3' }));
+    await minTarget(page.getByRole('group', { name: 'Период' }).getByRole('button'));
+
+    await list.locator(`tr[data-session="${parent}"]`).getByRole('button', { name: parent }).click();
+    const card = page.getByRole('region', { name: `Сессия ${parent}` });
+    await expect(card).toBeVisible();
+    await expect(page.locator('.jsplit')).toHaveAttribute('data-layout', 'stack');
+    await expect(list).toBeHidden();
+    await expect(card.getByRole('heading', { name: `Сессия ${parent}` })).toBeFocused();
+    expect(await noHorizontalScroll(page), 'горизонтальная прокрутка карточки').toBe(true);
+    await page.screenshot({ path: `${screens}sessions-phone-card.png`, fullPage: true });
+    await page.getByRole('link', { name: '← Сессии' }).click();
+    await expect(page).toHaveURL(/#\/sessions$/);
+    await expect(list).toBeVisible();
+    await expect(card).toHaveCount(0);
+    // «назад» браузера — тоже к списку
+    await list.locator(`tr[data-session="${parent}"]`).getByRole('button', { name: parent }).click();
+    await expect(card).toBeVisible();
+    await page.goBack();
+    await expect(list).toBeVisible();
+    await expect(page).toHaveURL(/#\/sessions$/);
+    await rc.dispose();
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
 });
 
 test('rules heavy banner', async ({ page, playwright }) => {

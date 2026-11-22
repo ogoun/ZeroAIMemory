@@ -43,6 +43,7 @@ pub const FEATURES: &[&str] = &[
     "idea_queue_line",
     "post_tool_subject",
     "task_subtasks",
+    "sessions_parent",
     "agent_text_masked",
 ];
 

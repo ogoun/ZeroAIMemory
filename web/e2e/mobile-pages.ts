@@ -24,6 +24,8 @@ export interface MobilePage {
 
 export const PAGES: MobilePage[] = [
   { name: 'стартовая', path: (c) => `#/u/${c.user}` },
+  // «Сессии» (задача 9): список с субагентами под родителем и блок «Без сессии»
+  { name: 'сессии', path: () => '#/sessions' },
   { name: 'документ', path: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}` },
   { name: 'журнал', path: (c) => `#/u/${c.user}/s/${c.solution}/j/glossary` },
 ];

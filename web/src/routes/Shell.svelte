@@ -471,11 +471,12 @@
         {/await}
       </div>
     {:else if route.name === 'sessions'}
-      <div class="admin">
+      <!-- «список — карточка», как журналы: ширина страницы журнала (M7.2 §5.8 п. 3) -->
+      <div class="journal-page">
         {#await import('../components/SessionsView.svelte')}
           <p class="muted">Загрузка…</p>
         {:then { default: SessionsView }}
-          <SessionsView {me} {users} {onexpired} />
+          <SessionsView {me} {users} {onexpired} session={route.session ?? null} />
         {:catch e}
           <LazyFail error={e} />
         {/await}

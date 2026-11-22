@@ -1276,7 +1276,8 @@ enum CacheCmd {
 #[derive(Subcommand)]
 enum SessionsCmd {
     /// Таблица «событие · вызовов · токенов · уже выдавалось»: сессия по id, сумма по --last N;
-    /// без них — сессия агента (ZAM_SESSION, сессия хуков) или последняя
+    /// без них — сессия агента (ZAM_SESSION, сессия хуков) или последняя; --unattributed —
+    /// выдача без сессии
     Tokens {
         /// Id сессии
         id: Option<String>,
@@ -1286,6 +1287,16 @@ enum SessionsCmd {
         /// Отдельно контрольная группа A/B (holdout) и остальные
         #[arg(long)]
         by_holdout: bool,
+        /// Вместе с субагентами сессии (не с --last)
+        #[arg(long, conflicts_with = "last")]
+        subagents: bool,
+        /// Выдача без сессии (MCP по HTTP без привязки к сессии агента): сутки · событие ·
+        /// вызовов · токенов
+        #[arg(long, conflicts_with_all = ["id", "last", "by_holdout", "subagents"])]
+        unattributed: bool,
+        /// Окно --unattributed, суток UTC (по умолчанию 30)
+        #[arg(long, requires = "unattributed", value_parser = clap::value_parser!(u32).range(1..=366))]
+        days: Option<u32>,
         #[command(flatten)]
         common: Common,
     },
@@ -1307,20 +1318,27 @@ enum SessionsCmd {
 }
 
 fn sessions(c: SessionsCmd) -> Result<(), CliError> {
-    use cmd::sessions::{Pick, tokens};
+    use cmd::sessions::{Pick, UNATTRIBUTED_DAYS, tokens, unattributed as without_session};
     match c {
         SessionsCmd::Tokens {
             id,
             last,
             by_holdout,
+            subagents,
+            unattributed,
+            days,
             common,
         } => {
+            let ctx = cmd::connect(&common)?;
+            if unattributed {
+                return without_session(&ctx, days.unwrap_or(UNATTRIBUTED_DAYS));
+            }
             let pick = match (id.as_deref(), last) {
                 (Some(id), _) => Pick::Id(id),
                 (None, Some(n)) => Pick::Last(n),
                 (None, None) => Pick::Current,
             };
-            tokens(&cmd::connect(&common)?, &pick, by_holdout)
+            tokens(&ctx, &pick, by_holdout, subagents)
         }
         SessionsCmd::Snapshot {
             transcript,

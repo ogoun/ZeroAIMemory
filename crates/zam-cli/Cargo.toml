@@ -57,3 +57,6 @@ axum.workspace = true
 assert_cmd.workspace = true
 # приёмка M5.6: причина устарелости ссылки — из базы сервера соединением только для чтения
 rusqlite.workspace = true
+# сутки UTC посева выдачи без сессии (`zam_store::add_unattributed`, задача 9 M7.2; крейт уже
+# в workspace — zam-store, zam-server)
+jiff.workspace = true

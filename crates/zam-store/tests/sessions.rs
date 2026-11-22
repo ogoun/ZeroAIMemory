@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use jiff::{SignedDuration, Timestamp};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
-    DataDir, SeenItem, SeenKey, SeenTarget, SessionTouch, UsageEvent, UsageKind, UsageSource,
-    UserDbs, WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session, latest_session,
-    list_sessions, mark_seen, record_usage, register_session, seen_revs, touch_session,
-    usage_counts,
+    DataDir, SeenItem, SeenKey, SeenTarget, SessionFilter, SessionTouch, UsageEvent, UsageKind,
+    UsageSource, UserDbs, WHOLE_TARGET, add_memory_write, end_session, gc_sessions, get_session,
+    latest_session, list_sessions, mark_seen, record_usage, register_session, seen_revs,
+    touch_session, usage_counts,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -103,7 +103,7 @@ async fn touch_session_upsert() {
     assert_eq!(get_session(&db, "нет").await.unwrap(), None);
 
     // свежие — первыми (конец сессии — тоже обращение к ней)
-    let ids: Vec<String> = list_sessions(&db, None, 10)
+    let ids: Vec<String> = list_sessions(&db, SessionFilter::default(), 10)
         .await
         .unwrap()
         .into_iter()
@@ -121,19 +121,91 @@ async fn touch_session_upsert() {
     )
     .await
     .unwrap();
-    let only: Vec<String> = list_sessions(&db, Some(&g), 10)
+    let by_solution = SessionFilter {
+        solution: Some(&g),
+        ..SessionFilter::default()
+    };
+    let only: Vec<String> = list_sessions(&db, by_solution, 10)
         .await
         .unwrap()
         .into_iter()
         .map(|s| s.id)
         .collect();
     assert_eq!(only, ["s3"]);
-    assert_eq!(list_sessions(&db, None, 2).await.unwrap().len(), 2);
+    assert_eq!(
+        list_sessions(&db, SessionFilter::default(), 2)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     // пустой и слишком длинный id — отказ
     for bad in [String::new(), "я".repeat(129)] {
         assert!(touch_session(&db, &touch(&bad)).await.is_err());
     }
+}
+
+/// Отбор по родителю (M7 §5.8 п. 1): сессии субагентов этой сессии и их субагентов (потомки по
+/// `parent_id`, круг правок 1 задачи 9 M7.2), свежие первыми; сама сессия и субагенты другой сессии
+/// в ответ не входят; самоссылка (`parent_id = id`) и цикл не прибавляют сессию к самой себе и не
+/// зацикливают; вместе с решением — оба условия.
+#[tokio::test]
+async fn list_sessions_parent_filter() {
+    let (_dd, db) = db("parent").await;
+    let g: zam_core::SolutionGuid = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e51".parse().unwrap();
+    let sub = |id: &str, parent: &str, solution: Option<&zam_core::SolutionGuid>| SessionTouch {
+        id: id.into(),
+        parent_id: Some(parent.into()),
+        agent_type: Some("Explore".into()),
+        solution_guid: solution.cloned(),
+        ..SessionTouch::default()
+    };
+    touch_session(&db, &touch("s")).await.unwrap();
+    touch_session(&db, &sub("s:a1", "s", Some(&g)))
+        .await
+        .unwrap();
+    touch_session(&db, &sub("t:b1", "t", None)).await.unwrap();
+    touch_session(&db, &sub("s:a1:c1", "s:a1", None))
+        .await
+        .unwrap();
+    // обращение позже — первым
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    touch_session(&db, &sub("s:a2", "s", None)).await.unwrap();
+    async fn ids(db: &zam_store::Db, f: SessionFilter<'_>) -> Vec<String> {
+        let list = list_sessions(db, f, 10).await.unwrap();
+        list.into_iter().map(|s| s.id).collect()
+    }
+    let of = |parent| SessionFilter {
+        parent: Some(parent),
+        ..SessionFilter::default()
+    };
+    // свежий — первым; внук `s:a1:c1` — среди потомков `s`
+    let all = ids(&db, of("s")).await;
+    assert_eq!(all[0], "s:a2", "{all:?}");
+    let mut set = all.clone();
+    set.sort_unstable();
+    assert_eq!(set, ["s:a1", "s:a1:c1", "s:a2"]);
+    assert_eq!(ids(&db, of("s:a1")).await, ["s:a1:c1"]);
+    assert!(ids(&db, of("нет")).await.is_empty());
+    // без отбора — все пять, как раньше
+    assert_eq!(ids(&db, SessionFilter::default()).await.len(), 5);
+    let both = SessionFilter {
+        solution: Some(&g),
+        parent: Some("s"),
+    };
+    assert_eq!(ids(&db, both).await, ["s:a1"]);
+    // самоссылка: сессия — не свой субагент; цикл `x` ↔ `y` — конечен, без самой сессии
+    touch_session(&db, &sub("loop", "loop", None))
+        .await
+        .unwrap();
+    assert!(ids(&db, of("loop")).await.is_empty());
+    touch_session(&db, &sub("x", "y", None)).await.unwrap();
+    touch_session(&db, &sub("y", "x", None)).await.unwrap();
+    touch_session(&db, &sub("x:k", "x", None)).await.unwrap();
+    let mut x = ids(&db, of("x")).await;
+    x.sort_unstable();
+    assert_eq!(x, ["x:k", "y"]);
 }
 
 /// `mark_seen` сохраняет большую ревизию части цели; части (чанк, цель целиком), сессии и
@@ -376,9 +448,20 @@ async fn migrate_v12_to_v13() {
     assert_eq!(ver, zam_store::USER_MIGRATIONS.len() as u32);
     assert_eq!(tables, 3);
     assert!(zam_store::get_space(&db, space).await.unwrap().is_some());
-    assert!(list_sessions(&db, None, 10).await.unwrap().is_empty());
+    assert!(
+        list_sessions(&db, SessionFilter::default(), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     touch_session(&db, &touch("после-миграции")).await.unwrap();
-    assert_eq!(list_sessions(&db, None, 10).await.unwrap().len(), 1);
+    assert_eq!(
+        list_sessions(&db, SessionFilter::default(), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// Последняя незавершённая сессия с обращением не раньше срока; с машиной — только этой
