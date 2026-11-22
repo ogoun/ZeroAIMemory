@@ -123,6 +123,9 @@ pub struct InsightReq {
     #[serde(default)]
     force: bool,
     supersedes_id: Option<String>,
+    /// Ревизия замещаемой записи (`supersedes_id`), с которой агент читал её вид: метки
+    /// `‹secret-N›` нового текста — по её маскам; без неё такие метки — 428 (M7 §4.3.2 п. 3).
+    supersedes_rev: Option<i64>,
     /// Явные связи графа `[{type, target}]`.
     links: Option<Vec<Value>>,
     /// Ссылки на файлы `{files: [{path, hash?, commit?}]}` (M4.5 §6.1, [`super::files`]).
@@ -816,6 +819,25 @@ fn restore_req(old: &Entry, req: &mut InsightReq) -> Result<usize, ApiError> {
     .restore(old.into())
 }
 
+/// В тексте новой записи есть метка с номером `‹secret-N›` (номера — по виду замещаемой записи).
+fn numbered_marks(req: &InsightReq) -> bool {
+    let has = |s: &str| zam_secrets::marks(s).any(|(_, n)| n.is_some());
+    has(&req.title)
+        || has(&req.body)
+        || req.tags.iter().any(|t| has(t))
+        || req.area.as_deref().is_some_and(has)
+        || has(&req.data.to_string())
+}
+
+/// 428: замещение с метками `‹secret-N›` без ревизии замещаемой записи (M7 §4.3.2 п. 3).
+fn revision_required() -> ApiError {
+    ApiError::PreconditionRequired(
+        "метки ‹secret-N› нового текста — по виду замещаемой записи: передайте её ревизию \
+         (If-Match у /supersede, supersedes_rev у supersedes_id)"
+            .into(),
+    )
+}
+
 /// [`restore_req`] для принципала `p`: человеку — как есть (0); длинные тела с метками — в пуле
 /// блокирующих задач.
 async fn restore_for(
@@ -861,6 +883,11 @@ pub async fn create(
     let (mut req, kept) = match req.supersedes_id.as_deref().map(super::parse_id) {
         Some(Ok(old)) if agent_view::masks(p) => match get_entry(&sc.db, old).await {
             Ok(o) if o.deleted_at.is_none() && !hidden_entry(p, &o) => {
+                // метки с номером — по ревизии, с которой агент читал (M7 §4.3.2 п. 3)
+                if req.supersedes_rev.is_none() && numbered_marks(&req) {
+                    return Err(revision_required());
+                }
+                super::entries::stale_entry(&o, req.supersedes_rev)?;
                 restore_for(p, &o, req).await?
             }
             _ => (req, 0),
@@ -903,10 +930,11 @@ pub async fn create(
                 kind.as_str()
             )));
         }
+        let sup_rev = req.supersedes_rev;
         let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
-        // замещение через supersedes_id: ревизия старой не сверяется (If-Match у POST
-        // коллекции относился бы к новой записи) [решение исполнителя]
-        let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib)
+        // замещение через supersedes_id: ревизия старой — `supersedes_rev`, если задана (If-Match у
+        // POST коллекции относился бы к новой записи) [решение исполнителя]
+        let (n, o) = supersede_entry(&sc.db, old, sup_rev, new, &attrib)
             .await
             .map_err(|e| agent_view::view_error(p, e.into()))?;
         st.index.notify();
@@ -1062,9 +1090,15 @@ pub async fn supersede(
     }
     // агент писал новую запись по маскированному виду старой — значения обратно (M7 §4.3.2);
     // вид устаревшей ревизии `If-Match` без ключа повтора — 409 раньше восстановления (круг
-    // правок 2 задачи 6, B4: как правка записи; повтор по ключу ревизию не сверяет)
-    if agent_view::masks(&p) && !headers.contains_key("idempotency-key") {
-        super::entries::stale_entry(&sc.entry, rev)?;
+    // правок 2 задачи 6, B4: как правка записи; повтор по ключу ревизию не сверяет); метки с
+    // номером без ревизии — 428: номера — по виду ревизии, с которой агент читал (§4.3.2 п. 3)
+    if agent_view::masks(&p) {
+        if rev.is_none() && numbered_marks(&req) {
+            return Err(revision_required());
+        }
+        if !headers.contains_key("idempotency-key") {
+            super::entries::stale_entry(&sc.entry, rev)?;
+        }
     }
     let (mut req, kept) = restore_for(&p, &sc.entry, req).await?;
     let kind = sc.entry.kind;

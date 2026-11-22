@@ -1714,6 +1714,14 @@ fn key_value_with_qualifier() {
         "token (see above) is a string".to_string(),
         format!("token ({}): {pw}", "x".repeat(41)),
         "пароль (стенд)".to_string(),
+        // круг правок 4, M1: вызов и объявление функции — не ключ с уточнением; после
+        // разделителя уточнения — без перехода строки
+        "```python\n@property\ndef token(self):\n    return self._token\n```".to_string(),
+        "```python\ndef password(self):\n    return self._password\n```".to_string(),
+        "```ts\nasync function getToken(req: Request): Promise<string> {\n```".to_string(),
+        "```kotlin\nfun refreshToken(ctx: Context): Boolean = true\n```".to_string(),
+        "secret(n) = fibonacci(n)".to_string(),
+        "token (prod):\nследующая строка".to_string(),
     ] {
         assert_eq!(mask_text(&t), t, "{t}");
     }

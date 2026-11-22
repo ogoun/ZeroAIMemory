@@ -84,8 +84,9 @@ pub const CERTAINTY_NOT_RECOGNIZED: &str = "certainty_not_recognized";
 /// Предупреждение: `verified_at_commit:` во frontmatter — не sha коммита (4–64 hex).
 pub const VERIFIED_AT_COMMIT_INVALID: &str = "verified_at_commit_invalid";
 
-/// Предупреждения записи заметки по её тексту.
-fn note_warnings(content: &str) -> Vec<String> {
+/// Предупреждения записи заметки по её тексту; `mask` — агенту: путь `invalid_ref` маскируется до
+/// усечения (кусок секрета на границе усечения сканер уже не узнал бы, круг правок 4 задачи 6).
+fn note_warnings(content: &str, mask: bool) -> Vec<String> {
     let doc = zam_markdown::parse(content);
     let mut out = Vec::new();
     if let Some(f) = &doc.frontmatter {
@@ -109,7 +110,17 @@ fn note_warnings(content: &str) -> Vec<String> {
                 Ok(p) => {
                     valid.insert((p, fr.symbol));
                 }
-                Err(e) => out.push(format!("invalid_ref: {} ({e})", zam_store::shown_ref(r))),
+                Err(e) => {
+                    let shown = if mask {
+                        std::borrow::Cow::Owned(zam_markdown::mask_text(r))
+                    } else {
+                        std::borrow::Cow::Borrowed(r.as_str())
+                    };
+                    out.push(format!(
+                        "invalid_ref: {} ({e})",
+                        zam_store::shown_ref(&shown)
+                    ))
+                }
             }
         }
         if valid.len() > zam_store::file_refs::REFS_MAX {
@@ -138,7 +149,7 @@ async fn node_reply(
     base: Option<&str>,
 ) -> Result<Value, ApiError> {
     let mut v = serde_json::to_value(node).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let mut w = note_warnings(content);
+    let mut w = note_warnings(content, agent_view::masks(p));
     if !content.is_empty() {
         w.extend(crate::api::glossary::alias_warnings(st, db, space, &node.name, content).await?);
     }
@@ -490,7 +501,14 @@ fn patch_restored(
     cur_rev: i64,
     ops: &[PatchOp],
 ) -> Result<secret_restore::Restored, zam_store::WriteError> {
-    let masks = secret_restore::FieldMasks::of(base.unwrap_or(current));
+    let base_text = base.unwrap_or(current);
+    let masks = secret_restore::FieldMasks::of(base_text);
+    // заголовки нумерованного вида базы — для адреса с меткой без номера (§4.3.2 п. 3)
+    let heads = ops
+        .iter()
+        .filter_map(|op| op_parts(op).0)
+        .any(super::read::plain_mark)
+        .then(|| zam_markdown::parse(&secret_restore::numbered_view(base_text)));
     let mut texts: Vec<&str> = vec![current];
     texts.extend(base);
     for op in ops {
@@ -507,22 +525,37 @@ fn patch_restored(
     };
     // адрес секции с исходником → адрес агента (ошибки операций)
     let mut back: Vec<(String, String)> = Vec::new();
-    let raw_ops: Vec<PatchOp> = ops
-        .iter()
-        .map(|op| {
-            let (section, content) = op_parts(op);
-            let section = section.map(|s| {
-                let filled = masks.fill(s).into_owned();
+    let mut raw_ops: Vec<PatchOp> = Vec::with_capacity(ops.len());
+    for op in ops {
+        let (section, content) = op_parts(op);
+        let section = match section {
+            Some(s) => {
+                let numbered = match &heads {
+                    Some(doc) if super::read::plain_mark(s) => {
+                        match super::read::resolve_unmarked(doc, s, false) {
+                            zam_markdown::SectionLookup::Found(x) => Some(x.path.join(" > ")),
+                            zam_markdown::SectionLookup::NotFound => None,
+                            zam_markdown::SectionLookup::Ambiguous => {
+                                return Err(zam_store::WriteError::Patch(
+                                    zam_markdown::PatchError::Ambiguous(s.to_string()),
+                                ));
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let filled = masks.fill(numbered.as_deref().unwrap_or(s)).into_owned();
                 if filled != s {
                     back.push((filled.clone(), s.to_string()));
                 }
-                filled
-            });
-            with_parts(op, section, masks.defer(content, &mut d))
-        })
-        .collect();
+                Some(filled)
+            }
+            None => None,
+        };
+        raw_ops.push(with_parts(op, section, masks.defer(content, &mut d)));
+    }
     let text = apply_ops(base, current, cur_rev, &raw_ops).map_err(|e| shown_error(e, &back))?;
-    Ok(d.finish(&text))
+    Ok(d.finish(&text, current, masks.literals()))
 }
 
 /// Адрес секции и содержимое операции.

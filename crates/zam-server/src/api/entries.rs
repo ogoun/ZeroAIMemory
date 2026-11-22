@@ -1317,8 +1317,9 @@ pub async fn revisions(
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
     let items = entry_revisions(&sc.db, sc.entry.id).await?;
-    // все ревизии с телами (до 1 МБ каждое) — длинные маскируются в пуле
-    let items = agent_view::view_entry_json_owned(&p, json!(items)).await?;
+    // все ревизии с телами (до 1 МБ каждое) — длинные маскируются в пуле; метки без номеров:
+    // номера действуют только у текущей записи (M7 §4.3.2 п. 1, круг правок 4 задачи 6)
+    let items = agent_view::view_json_owned(&p, json!(items), agent_view::ENTRY_FIELDS).await?;
     Ok(Json(json!({ "items": items })))
 }
 

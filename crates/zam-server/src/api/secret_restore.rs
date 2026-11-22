@@ -10,9 +10,14 @@
 //!   значения); маска, номер которой не вернулся, удалена правкой. Метка без номера маски (без
 //!   номера, номер вне поля, при создании — каждая) записывается как есть: ответ получает
 //!   предупреждение [`SECRET_MARK_KEPT`].
-//! - Правка, которая выводит восстановленное значение из-под маски (снят забор кода, URL с
-//!   паролем переписан, у ключа снят разделитель), отклоняется: 422 [`SECRET_CONTEXT_CHANGED`]
-//!   с номерами строк редактируемого вида, без значений; ничего не записано.
+//! - Предупреждение — о метках без номера сверх литералов `‹secret›` в виде базы поля и о номерах
+//!   вне поля (§4.3.2 п. 2, круг правок 4).
+//! - Покрытие всего текста ([`exposure`], §4.3.2 п. 5, круг правок 4): правка, после которой
+//!   значение секрета — восстановленное или любой маски исходника — не покрыто находкой чаще, чем
+//!   в исходнике (снят или открыт забор кода, URL с паролем переписан, у ключа снят разделитель —
+//!   и вне правленого места), отклоняется: 422 [`SECRET_CONTEXT_CHANGED`] с номерами строк итога,
+//!   без значений; ничего не записано. У `data` записи — по прежним строкам тех же полей верхнего
+//!   уровня (прочие слияние не трогает).
 //! - Поля записи журнала — [`EntryTexts`] (правка, замещение, создание): заголовок, тело, область
 //!   — каждое своё поле; строки `data` (и `next_step`, `blocked_by` задачи — строки той же
 //!   `data`) — одно поле со сквозной нумерацией по порядку обхода; теги — одно поле.
@@ -20,7 +25,10 @@ use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::{Db, Entry, StoreError, node_content};
 
-pub use zam_secrets::restore::{Deferred, FieldMasks, Restored, has_mark, marks_in, restore};
+pub use zam_secrets::restore::{
+    Deferred, FieldMasks, Restored, exposure, has_mark, marks_in, numbered_view, restore,
+    unnumbered,
+};
 
 use super::agent_view::{self, BLOCKING_FROM};
 use crate::error::ApiError;
@@ -215,22 +223,49 @@ impl<'a> EntryTexts<'a> {
         if self.data.is_some() || !self.data_fields.is_empty() {
             let mut masks = FieldMasks::new();
             add_value(base.data, &mut masks);
+            // строки нового `data` с путями и поля `data`, переданные отдельно
+            let mut keys: Vec<String> = self
+                .data_fields
+                .iter()
+                .map(|(k, _)| (*k).to_string())
+                .collect();
+            let mut new: Vec<(String, &mut String)> = Vec::new();
             if let Some(d) = self.data {
+                if let Value::Object(o) = &*d {
+                    keys.extend(o.keys().cloned());
+                }
                 let mut path = String::from("data");
-                kept += restore_value(&masks, d, &mut path, &mut ex);
+                strings_mut(d, &mut path, &mut new);
             }
             for (k, s) in self.data_fields {
-                kept += restore_in_place(&masks, s, &format!("data.{k}"), &mut ex);
+                new.push((format!("data.{k}"), s));
             }
+            // покрытие — по прежним строкам тех же полей верхнего уровня: прочие слияние не трогает
+            let mut cur: Vec<&str> = Vec::new();
+            match base.data {
+                Value::Object(o) => {
+                    keys.sort_unstable();
+                    keys.dedup();
+                    keys.iter()
+                        .filter_map(|k| o.get(k))
+                        .for_each(|v| strings_ref(v, &mut cur));
+                }
+                v => strings_ref(v, &mut cur),
+            }
+            kept += restore_strings(&masks, &cur, new, &mut ex);
         }
         if let Some(t) = self.tags {
             let mut masks = FieldMasks::new();
             for s in base.tags {
                 masks.add(s);
             }
-            for (i, s) in t.iter_mut().enumerate() {
-                kept += restore_in_place(&masks, s, &format!("tags[{i}]"), &mut ex);
-            }
+            let cur: Vec<&str> = base.tags.iter().map(String::as_str).collect();
+            let new: Vec<(String, &mut String)> = t
+                .iter_mut()
+                .enumerate()
+                .map(|(i, s)| (format!("tags[{i}]"), s))
+                .collect();
+            kept += restore_strings(&masks, &cur, new, &mut ex);
         }
         if let Some(a) = self.area {
             let masks = FieldMasks::of(base.area.unwrap_or(""));
@@ -284,40 +319,73 @@ fn add_value<'b>(v: &'b Value, masks: &mut FieldMasks<'b>) {
     }
 }
 
-/// Строки значения `data`, правленного агентом по редактируемому виду: каждая — по маскам всей
-/// прежней `data` (`masks`, сквозная нумерация): элемент или поле, перенесённые в другое место, —
-/// со своим значением. Места выхода из-под маски — в `ex` с путём строки (`data.options[0]`).
-fn restore_value(
+/// Строки поля из нескольких строк (`data`, теги) — `new` (путь строки и сама строка), правленные
+/// агентом по редактируемому виду: каждая — по маскам всего поля (`masks`, сквозная нумерация:
+/// элемент или поле, перенесённые в другое место, — со своим значением); покрытие — по прежним
+/// строкам `cur` (§4.3.2 п. 5), места выхода из-под маски — в `ex` с путём строки
+/// (`data.options[0]: строка 1`). Итог — предупреждение `secret_mark_kept` поля.
+fn restore_strings(
     masks: &FieldMasks,
-    new: &mut Value,
-    path: &mut String,
+    cur: &[&str],
+    new: Vec<(String, &mut String)>,
     ex: &mut Exposed,
 ) -> usize {
-    match new {
-        Value::String(s) => restore_in_place(masks, s, path, ex),
-        Value::Array(a) => a
-            .iter_mut()
-            .enumerate()
-            .map(|(i, x)| {
+    if !new.iter().any(|(_, s)| has_mark(s)) {
+        return 0;
+    }
+    let edited: Vec<&str> = new.iter().map(|(_, s)| s.as_str()).collect();
+    let (texts, kept) = masks.restore_texts(&edited);
+    let shown: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let open = exposure(cur, &shown, masks.values());
+    let mut at = 0;
+    while at < open.len() {
+        let k = open[at].0;
+        let lines: Vec<usize> = open[at..]
+            .iter()
+            .take_while(|(p, _)| *p == k)
+            .map(|(_, l)| *l)
+            .collect();
+        at += lines.len();
+        ex.0.push((Some(new[k].0.clone()), lines));
+    }
+    for ((_, s), t) in new.into_iter().zip(texts) {
+        *s = t;
+    }
+    kept
+}
+
+/// Строки значения `v` по порядку обхода (тот же, что у вида) — с путями, для правки на месте.
+fn strings_mut<'v>(v: &'v mut Value, path: &mut String, out: &mut Vec<(String, &'v mut String)>) {
+    match v {
+        Value::String(s) => out.push((path.clone(), s)),
+        Value::Array(a) => {
+            for (i, x) in a.iter_mut().enumerate() {
                 let len = path.len();
                 path.push_str(&format!("[{i}]"));
-                let kept = restore_value(masks, x, path, ex);
+                strings_mut(x, path, out);
                 path.truncate(len);
-                kept
-            })
-            .sum(),
-        Value::Object(o) => o
-            .iter_mut()
-            .map(|(k, x)| {
+            }
+        }
+        Value::Object(o) => {
+            for (k, x) in o.iter_mut() {
                 let len = path.len();
                 path.push('.');
                 path.push_str(k);
-                let kept = restore_value(masks, x, path, ex);
+                strings_mut(x, path, out);
                 path.truncate(len);
-                kept
-            })
-            .sum(),
-        _ => 0,
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Строки значения `v` по порядку обхода.
+fn strings_ref<'v>(v: &'v Value, out: &mut Vec<&'v str>) {
+    match v {
+        Value::String(s) => out.push(s),
+        Value::Array(a) => a.iter().for_each(|x| strings_ref(x, out)),
+        Value::Object(o) => o.values().for_each(|x| strings_ref(x, out)),
+        _ => {}
     }
 }
 

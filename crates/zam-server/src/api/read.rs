@@ -571,7 +571,14 @@ async fn fetch_node(
         // агенту — нумерованный вид всей ревизии (`‹secret-N›`, M7 §4.3.2 п. 6), затем срез:
         // адрес выдан по этому виду, а маска куска исходника — не кусок маски
         let text = agent_view::edit_view_owned(p, text).await?;
-        let piece = byte_range(&text, a, b, rev)?.to_string();
+        let piece = byte_range(&text, a, b, rev)?;
+        // номера действуют только у текущей ревизии (M7 §4.3.2 п. 1, круг правок 4): кусок
+        // старой — метками без номеров (смещения — по нумерованному виду)
+        let piece = if rev == node.current_rev {
+            piece.to_string()
+        } else {
+            zam_secrets::restore::unnumbered(piece).into_owned()
+        };
         if rev != node.current_rev {
             warnings.push(format!("range: rev{rev}, текущая rev{}", node.current_rev));
         } else {

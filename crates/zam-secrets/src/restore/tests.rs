@@ -123,9 +123,18 @@ fn restore_unpaired_kept() {
     assert_eq!((r.kept, r.exposed.len()), (3, 0));
     let r = restore("чистый текст\n", &format!("чистый текст {}\n", m(1)));
     assert_eq!((r.text, r.kept), (format!("чистый текст {}\n", m(1)), 1));
-    let lit = format!("сервис: {M}\n");
+    // литерал базы напротив себя — не предупреждение (сверх литералов вида базы, круг правок 4)
+    let lit = format!("сервис: {M}\nещё {}\n", m(3));
     let r = restore(&lit, &numbered_view(&lit));
-    assert_eq!((r.text.as_str(), r.kept), (lit.as_str(), 1));
+    assert_eq!(
+        (r.text.as_str(), r.kept),
+        (format!("сервис: {M}\nещё {M}\n").as_str(), 0)
+    );
+    let r = restore(&lit, &format!("{M} {M} {M} {}\n", m(1)));
+    assert_eq!(
+        r.kept, 2,
+        "три без номера при двух литералах и номер вне поля"
+    );
     assert_eq!(restore(&base, "без меток").text, "без меток");
     assert!(has_mark(&m(3)) && has_mark(M) && !has_mark("‹secret-›") && !has_mark("secret"));
     assert_eq!(marks_in(&format!("{M}{}{M} {}", m(1), m(12))), 4);
@@ -304,8 +313,9 @@ fn field_masks_items() {
     assert_eq!(r.kept, 1);
 }
 
-/// Отложенные значения: заменители в кусках, сборка, затем значения и пересканирование; номер
-/// строки отказа — строка итога, где значение — одна строка.
+/// Отложенные значения: заменители в кусках, сборка, затем значения и проверка покрытия по
+/// исходнику текущей ревизии; номер строки отказа — строка итога (с переводами строк
+/// многострочных значений, круг правок 4, M3).
 #[test]
 fn deferred_values() {
     let (k, p) = (key(91), pw(91));
@@ -315,14 +325,13 @@ fn deferred_values() {
     let mut d = Deferred::new(&[&base, &piece, "хвост\n"]).unwrap();
     let a = f.defer(&piece, &mut d);
     assert!(!a.contains(&k) && !a.contains(&p) && a.contains(M), "{a}");
-    assert_eq!(d.kept(), 1);
-    let r = d.finish(&format!("# Заголовок\n{a}хвост\n"));
+    let r = d.finish(&format!("# Заголовок\n{a}хвост\n"), &base, f.literals());
     assert_eq!(
         r.text,
         format!("# Заголовок\nновое: {k}\npassword {p}\nx {M}\nхвост\n")
     );
     assert_eq!((r.kept, r.exposed.clone()), (1, vec![3]));
-    // многострочное значение — одна строка в номерах
+    // многострочное значение: строки итога — с его переводами строк
     let pem = format!(
         "-----BEGIN {}PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END {}PRIVATE KEY-----",
         "RSA ", "RSA "
@@ -332,8 +341,8 @@ fn deferred_values() {
     let piece = format!("{}\npassword {}\n", m(1), m(2));
     let mut d = Deferred::new(&[&base, &piece]).unwrap();
     let a = f.defer(&piece, &mut d);
-    let r = d.finish(&a);
-    assert_eq!(r.exposed, vec![2], "{}", r.text);
+    let r = d.finish(&a, &base, f.literals());
+    assert_eq!(r.exposed, vec![4], "{}", r.text);
     // адрес секции — к заголовку исходника
     let base = format!("## Стенд {k}\n");
     let f = FieldMasks::of(&base);
@@ -342,6 +351,51 @@ fn deferred_values() {
         format!("K > Стенд {k}")
     );
     assert_eq!(f.fill(&format!("Стенд {M}")), format!("Стенд {M}"));
+}
+
+/// Покрытие всего текста (круг правок 4, C1, §4.3.2 п. 5): незакрытый забор над блоком с
+/// `mysql -p…` открывает флаг, которого агент не трогал, — и при правке целиком (`PUT`), и
+/// отложенно (`PATCH`: `prepend` забора); значение, уже открытое в исходнике человека (проза), при
+/// правке рядом — не отказ; новое открытое вхождение того же значения — отказ.
+#[test]
+fn exposure_whole_text() {
+    let p = pw(95);
+    let base = format!("# K\n\n```\nmysql -uroot -p{p} db\n```\n\nконец\n");
+    let v = numbered_view(&base).into_owned();
+    assert!(v.contains(&format!("-p{}", m(1))), "{v}");
+    // PUT: незакрытый забор перед блоком — строка mysql уходит в прозу
+    let r = restore(&base, &v.replace("# K\n\n", "# K\n\n```\nпример\n"));
+    assert_eq!(r.exposed, vec![6], "{}", r.text);
+    // то же без метки в правке (агент её не трогал): дописано только начало забора
+    let r = restore(&base, &format!("```\n{v}"));
+    assert!(!r.exposed.is_empty(), "{}", r.text);
+    // PATCH: `prepend "```\n"` по исходнику — значение маски текущей ревизии открыто
+    let f = FieldMasks::of(&base);
+    let piece = "```\n";
+    let mut d = Deferred::new(&[&base, piece]).unwrap();
+    let a = f.defer(piece, &mut d);
+    let r = d.finish(&format!("{a}{base}"), &base, f.literals());
+    assert_eq!(r.exposed, vec![5], "{}", r.text);
+    // проза человека: значение открыто в исходнике — правка рядом не отказ
+    let base = format!("password = {p}\nв прозе: {p}\n");
+    let v = numbered_view(&base).into_owned();
+    assert_eq!(v, format!("password = {}\nв прозе: {p}\n", m(1)));
+    let r = restore(&base, &v.replace("password = ", "password (prod) = "));
+    assert!(r.exposed.is_empty(), "{:?}", r.exposed);
+    // ещё одно открытое вхождение — отказ (строки итога с открытыми вхождениями)
+    let r = restore(&base, &format!("{v}копия {}\n", m(1)));
+    assert_eq!(r.exposed, vec![2, 3], "{}", r.text);
+    // несколько кусков: строка и номер строки внутри куска
+    let found = exposure(
+        &[
+            &format!("token: {}", key(96)),
+            &format!("a\npassword = {p}"),
+        ],
+        &["x", &format!("a\nb\npassword {p}")],
+        &[],
+    );
+    assert_eq!(found, vec![(1, 3)]);
+    assert!(exposure(&["без секретов"], &["что угодно"], &[]).is_empty());
 }
 
 /// Псевдослучайный генератор (LCG) — воспроизводимые правки.
@@ -497,7 +551,7 @@ fn bench_restore() {
         times.sort();
         times[2]
     };
-    for size in [1024 * 1024, 5 * 1024 * 1024] {
+    for size in [1024 * 1024, 5 * 1024 * 1024 / 2, 5 * 1024 * 1024] {
         let base = doc(size);
         let view = numbered_view(&base).into_owned();
         let t_view = median(&mut || {
@@ -531,5 +585,21 @@ fn bench_restore() {
                 marks_in(edited),
             );
         }
+        // PATCH (круг правок 4, I1): содержимое операции — нумерованный вид всей заметки с
+        // тысячами масок (отложенные значения, сборка, проверка покрытия по исходнику)
+        let mut exposed = 0;
+        let t = median(&mut || {
+            let f = FieldMasks::of(&base);
+            let mut d = Deferred::new(&[&base, &view]).unwrap();
+            let content = f.defer(&view, &mut d);
+            let r = d.finish(&content, &base, f.literals());
+            assert_eq!(r.text, base);
+            exposed = r.exposed.len();
+        });
+        println!(
+            "{} байт: PATCH видом всей заметки ({} меток, отказов {exposed}) {t:?}",
+            base.len(),
+            marks_in(&view),
+        );
     }
 }

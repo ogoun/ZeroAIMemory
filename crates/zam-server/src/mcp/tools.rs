@@ -1412,6 +1412,7 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
         "scope",
         "force",
         "supersedes_id",
+        "supersedes_rev",
     ];
     let mut body = pick(args, &keys);
     if report {
