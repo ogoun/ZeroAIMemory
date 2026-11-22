@@ -2725,25 +2725,26 @@ RED (исходники снова сняты патчем на время пр�
 - Задача 6 m3 — порядок 422/409 при `Idempotency-Key` и устаревшей ревизии у замещения.
 - Задача 6 m4 — `def token (self):` маскирует `return` → M7.5 со сканером.
 - Задача 6 m5 — строже 422 при удалении открытого человеком значения — принято как есть.
-- M-3 — холодный старт регулярок `zam-secrets` на `pre-tool` (3,7–3,9 мс) — проверит
-  координатор в тихом окне `m4`.
+- M-3 — холодный старт регулярок `zam-secrets` на `pre-tool` (3,7–3,9 мс) — проверено в тихом
+  окне `m4`: p95 процесса `pre-tool` 25,5 мс из 50 (внутри 15,9), правка не нужна.
 
 #### Приёмка: числа
 
-Заготовка — числа впишет координатор (спецификация §10, п. 2–4).
+Итоговая приёмка на голове ветки `524b3f1f` (2026-11-22 16:46–18:54, Windows 11, HDD, машина
+без посторонней нагрузки; сценарий `.tmp/m71/accept/accept.ps1`, `CARGO_TARGET_DIR` — отдельный).
 
 | Проверка | Итог |
 |---|---|
-| Полный прогон workspace `ZAM_REQUIRE_ML=1` (Windows 11, HDD) | … наборов, … passed, … failed, … ignored |
-| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | … |
-| CI `ci.yml` — Windows и Linux | … |
-| `package.yml` / `package-smoke` (первый прогон с ключом `deps-v2-` — без кэша, ORT с NuGet) | … |
-| e2e WebUI (release-сборка) | … passed |
-| Тихое окно `m4` | … |
-| Тихое окно `m57` (`acceptance_recall_p95_with_50_ideas`, абсолютные пороги) | … |
-| Тихое окно `m6` (`acceptance_hook_budgets`, медиана отношения p95 `/recall(prompt)` к v0.0.13-m6.6 ≤ 1,10) | … |
-| Блок v8 ru/en (500/497), MCP — 11 инструментов, описания ≤ 300 рекурсивно | … |
-| Финальное ревью ветки и волна правок | … |
+| Полный прогон workspace `ZAM_REQUIRE_ML=1` (Windows 11, HDD) | 207 наборов, 3506 passed, 0 failed, 58 ignored (debug, 1 ч 30 мин). Предварительный прогон `b7a05fc0` под нагрузкой ревью — 3 тайминговых падения (`focus_rank_timeout_falls_back_with_warning`, `hostile_long_ref_rejected_fast`, `holdout_empty_text_and_inherited`), по отдельности зелёные; на тихой машине — 0 |
+| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | чисто (код 0 оба) |
+| CI `ci.yml` — Windows и Linux | `524b3f1f`: CI 45029252723 success (web, check windows-latest, check ubuntu-22.04); Edge 45029252724 success; CUDA 45029252712 success (linux-x64, windows-x64) |
+| `package.yml` / `package-smoke` (первый прогон с ключом `deps-v2-` — без кэша, ORT с NuGet) | success в составе CI `524b3f1f`: package и cli для windows-x64 и linux-x64; models — skipped (`inputs.extras` — только у выпуска и `release-dry-run`) |
+| e2e WebUI (release-сборка) | 122 passed (2,0 мин) |
+| Тихое окно `m4` | `hook_budgets` ok (корпус 212 заметок, 165 insight, 3 правила; p95 процесса, мс, к бюджету): session-start 45,8/300, prompt 88,7/250 (1 тайм-аут из 59 — 1,7 % при допуске 5 %), post-tool 89,7/250, pre-tool 25,5/50 (внутри 15,9 — M-3, холодный старт регулярок, не проблема), checkpoint 35,5/100, post-tool-ok 25,0/50, subagent-start 62,9/300, session-start-holdout 47,5/300, checkpoint-snap 63,7/100, session-start-catchup 92,7/300 |
+| Тихое окно `m57` (`acceptance_recall_p95_with_50_ideas`, абсолютные пороги) | ok: p95 session-start с идеями / без — 56,7/25,2 и 29,2/26,3 мс, prompt — 26,7/19,4 и 28,1/20,8 мс (два замера) |
+| Тихое окно `m6` (`acceptance_hook_budgets`, медиана отношения p95 `/recall(prompt)` к v0.0.13-m6.6 ≤ 1,10) | ok, release: медиана отношения 0,765 (раунды 0,590–0,793); p95 ветки 7,7–8,2 мс, у v0.0.13-m6.6 — 10,1–13,1 мс |
+| Блок v8 ru/en (500/497), MCP — 11 инструментов, описания ≤ 300 рекурсивно | зелёные в полном прогоне: `agent_setup_block_v8_under_500_tokens_ru_en`, `mcp_tools_still_eleven`, `all_schema_descriptions_under_300` |
+| Финальное ревью ветки и волна правок | `7af69d7c..b7a05fc0`: With fixes — Critical нет, Important I-1…I-5, Minor M-1…M-5, триаж отложенных Minor T1–T9; волна правок `8413d35c`, `41720a6d`, `1ed3ee74`; повторное ревью — закрыто всё, новые N-1, N-2, N-4 (Important) и N-3 (Minor) исправлены в `18141e16`, `a3edc60a`; итог — `524b3f1f` |
 | Тег `v0.0.14-m7.1`, Release, развёртывание на рабочий сервер памяти (с копией данных) и тестовый стенд, клиент владельца | … |
 
 ## Уточнить у владельца
