@@ -196,25 +196,33 @@ fn restore_same_wording_in_sections() {
     assert!(r.text == want, "ключи не своих секций:\n{}", r.text);
 }
 
-/// Проба ревью 5 (M1): строка заменена на месте строкой с другим ключом — значение не
-/// переносится, метка — литерал и `kept`; тот же ключ в другом регистре — пара.
+/// Проба ревью 5 (M1 и решение координатора по сомнению 1 круга правок 1): строка заменена на
+/// месте строкой с другим ключом — значение не переносится, а раз маска базы участка осталась без
+/// пары, это правка окружения существующего секрета: строка — в `exposed` (отказ). Тот же ключ в
+/// другом регистре — пара. Новая строка с меткой в участке без масок базы — литерал и `kept`.
 #[test]
 fn restore_other_key_kept() {
     let k = key(31);
     let base = format!("GITHUB_TOKEN: {k}\nконец\n");
     let r = restore(&base, &format!("OPENAI_KEY: {M}\nконец\n"));
-    assert_eq!(r.text, format!("OPENAI_KEY: {M}\nконец\n"));
-    assert_eq!(r.kept, 1);
+    assert!(!r.text.contains(&k), "{}", r.text);
+    assert_eq!(r.exposed, vec![1]);
     let r = restore(&base, &format!("github_token: {M} # prod\nконец\n"));
     assert_eq!(r.text, format!("github_token: {k} # prod\nконец\n"));
-    assert_eq!(r.kept, 0);
+    assert_eq!((r.kept, r.exposed.len()), (0, 0));
+    // участок без масок базы: «x ‹secret›» вместо строки без ключа — литерал
+    let base = format!("GITHUB_TOKEN: {k}\nпросто текст\nконец\n");
+    let r = restore(&base, &format!("GITHUB_TOKEN: {M}\nx {M}\nконец\n"));
+    assert_eq!(r.text, format!("GITHUB_TOKEN: {k}\nx {M}\nконец\n"));
+    assert_eq!((r.kept, r.exposed.len()), (1, 0));
 }
 
 /// Пробы ревью 2–4 (C1): смена окружения метки. Снятый забор кода и URL или ключ-значение без
 /// разделителя (слово перед меткой то же) — значение восстановлено, но сканер его в итоге не
 /// закрывает: `exposed` — строки нового текста. Слово перед меткой сменилось (URL переписан
-/// прозой, «пароль от стенда — ‹secret›») — пары нет (M1): литерал, значение не выходит. Контекст
-/// сохранён — `exposed` пуст.
+/// прозой, «пароль от стенда — ‹secret›») — пары нет (M1), а маска базы участка осталась без
+/// пары: тоже `exposed` (решение координатора по сомнению 1 круга правок 1), значения в тексте
+/// нет. Контекст сохранён — `exposed` пуст.
 #[test]
 fn restore_context_changed_exposed() {
     let p = pw(41);
@@ -226,7 +234,7 @@ fn restore_context_changed_exposed() {
     // забор сохранён, правка рядом — проходит
     let r = restore(&base, &view.replace("db\n", "db --verbose\n"));
     assert!(r.exposed.is_empty() && r.text.contains(&p), "{}", r.text);
-    // 3: URL переписан прозой — слово перед меткой сменилось: литерал
+    // 3: URL переписан прозой — слово перед меткой сменилось, маска базы без пары: отказ
     let base = format!("база: https://user:{p}@db.example.com/\n");
     let view = mask_text(&base);
     let r = restore(
@@ -235,11 +243,8 @@ fn restore_context_changed_exposed() {
             .replace("https://user:", "логин user, пароль ")
             .replace("@db.example.com/", " (db.example.com)"),
     );
-    assert!(
-        !r.text.contains(&p) && r.exposed.is_empty() && r.kept == 1,
-        "{}",
-        r.text
-    );
+    assert!(!r.text.contains(&p), "{}", r.text);
+    assert_eq!(r.exposed, vec![1], "{}", r.text);
     // 3′: то же слово перед меткой, но не URL — значение вышло бы
     let r = restore(
         &base,
@@ -251,15 +256,12 @@ fn restore_context_changed_exposed() {
     // URL сохранён, правка вокруг — проходит
     let r = restore(&base, &view.replace("база:", "база prod:"));
     assert!(r.exposed.is_empty() && r.text.contains(&p), "{}", r.text);
-    // 4: «password = ‹secret›» → «пароль от стенда — ‹secret›»: литерал
+    // 4: «password = ‹secret›» → «пароль от стенда — ‹secret›»: отказ, значения в тексте нет
     let base = format!("password = {p}\n");
     let view = mask_text(&base);
     let r = restore(&base, &view.replace("password = ", "пароль от стенда — "));
-    assert!(
-        !r.text.contains(&p) && r.exposed.is_empty() && r.kept == 1,
-        "{}",
-        r.text
-    );
+    assert!(!r.text.contains(&p), "{}", r.text);
+    assert_eq!(r.exposed, vec![1], "{}", r.text);
     // 4′: разделитель снят — значение вышло бы
     let r = restore(&base, &view.replace("password = ", "password "));
     assert_eq!(r.exposed, vec![1], "{}", r.text);

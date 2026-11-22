@@ -52,6 +52,9 @@ subtle.workspace = true
 cookie.workspace = true
 memory-serve.workspace = true
 zam-markdown = { path = "../zam-markdown" }
+# восстановление значений `‹secret›` при записи агентом (`zam_secrets::restore`, M7 §4.3.2) —
+# фича только сервера: клиент `zam` берёт сканер без диффа
+zam-secrets = { path = "../zam-secrets", features = ["restore"] }
 lru.workspace = true
 uuid.workspace = true
 sha2.workspace = true

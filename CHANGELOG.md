@@ -168,7 +168,8 @@
   замещения). То же предупреждение получает создание по токену с меткой — заметка, запись
   журнала любого вида, задача плана разбора идеи, выжимка кэша и её превращение, ответ на
   вопрос: значения там нет, и агент об этом узнаёт. Значение получает только метка с тем же
-  словом перед ней (`GITHUB_TOKEN: ‹secret›`, переписанный в `OPENAI_KEY: ‹secret›`, — нет);
+  словом перед ней; переписанный на месте ключ (`GITHUB_TOKEN: ‹secret›` → `OPENAI_KEY:
+  ‹secret›`, URL с паролем — прозой) — отказ 422, а не литерал: значение не пропадает молча;
   строки одинаковых секций не путаются (секции — по заголовкам); `\r\n` и `\n` обеих сторон не
   мешают. Правка, которая вывела бы значение из-под маски (снят забор кода вокруг
   `mysql -p‹secret›`, убран разделитель `ключ: значение` или URL), отклоняется: 422
@@ -323,8 +324,9 @@
   Круг правок 5: `mask_code_regions`, `mask_code_region_sets`, `code_regions_round2`,
   `code_regions_loose`, `fence_blocks_round2`, `fence_blocks_loose`, `fenced_lines_round2`;
   comrak — `dev-dependencies` `zam-secrets` (сверка участков кода, `tests/commonmark.rs`).
-- `zam_secrets::restore` — восстановление значений под `‹secret›` (задача 6 M7.1; с круга
-  правок 1 — здесь, вторая зависимость крейта — `similar`): `restore(base, edited) -> Restored
+- `zam_secrets::restore` (фича `restore`, по умолчанию выключена; включает только `zam-server`
+  — клиент `zam` дифф `similar` не тянет) — восстановление значений под `‹secret›` (задача 6
+  M7.1; с круга правок 1 — здесь): `restore(base, edited) -> Restored
   {text, kept, exposed}` (`exposed` — строки, где значение вышло бы из-под маски), `MaskedBase`,
   `has_mark`, `marks_in`. `zam_server::api::secret_restore` — обвязка: `restore_owned`
   (больше 64 КиБ — в пуле), `node_base`, `EntryTexts`/`EntryBase` (поля записи журнала — один

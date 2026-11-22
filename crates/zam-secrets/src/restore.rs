@@ -23,7 +23,8 @@
 //! один токен. Метка нового текста получает значение, только если **слово перед ней** (ключ слева
 //! от разделителя: `token`, `user` в URL, `p` у `-p…`) то же, что у метки базы (без учёта
 //! регистра; метка в начале строки — слово после неё): `GITHUB_TOKEN: ‹secret›`, переписанный в
-//! `OPENAI_KEY: ‹secret›`, значение не получает.
+//! `OPENAI_KEY: ‹secret›`, значение не получает (и, раз маска базы осталась без пары, правка
+//! отклоняется — ниже).
 //!
 //! Метка без пары записывается как есть и считается в [`Restored::kept`]. Литерал `‹secret›`, уже
 //! лежавший в базе, — метка со значением «сама метка»: напротив себя он не новый.
@@ -32,6 +33,10 @@
 //! кода вокруг `mysql -p‹secret›`, URL с паролем переписан прозой, `password = ‹secret›` стал
 //! «пароль — ‹secret›»), выходит из-под маски — номера таких строк нового текста —
 //! [`Restored::exposed`]; такую правку вызывающий отклоняет (решение координатора, круг правок 1).
+//! Туда же — метка без пары в изменённом участке, где осталась маска базы без пары (ключ
+//! переписан другими словами, URL — прозой): это правка окружения существующего секрета, литералом
+//! значение молча пропало бы из текущей ревизии (решение координатора по сомнению 1 круга
+//! правок 1). Метка, дописанная в участок, где все маски базы в паре или масок нет, — литерал.
 //!
 //! Результат детерминирован (нет сроков по часам; обход `HashMap` в выборе пар упорядочен):
 //! пределы работы диффа — по размерам входа.
@@ -52,7 +57,8 @@ pub struct Restored {
     /// Меток нового текста без пары в базе — записаны как есть.
     pub kept: usize,
     /// Строки нового текста (с 1, по возрастанию), где восстановленное значение сканер в итоге не
-    /// закрывает: правка выводит секрет из-под маски.
+    /// закрывает (правка выводит секрет из-под маски) или где метка без пары стоит в участке с
+    /// маской базы без пары (правка окружения существующего секрета).
     pub exposed: Vec<usize>,
 }
 
@@ -156,8 +162,8 @@ impl<'a> MaskedBase<'a> {
         if edited == self.masked {
             return Restored::same(self.raw.to_owned());
         }
-        let pair = if self.marks.is_empty() {
-            vec![NONE; new_marks.len()]
+        let (pair, orphans) = if self.marks.is_empty() {
+            (vec![NONE; new_marks.len()], Vec::new())
         } else {
             // переводы строк — к `\n`: метки те же и в том же порядке (`\r` — не часть метки)
             let (old, new) = (normalized(&self.masked), normalized(edited));
@@ -165,11 +171,18 @@ impl<'a> MaskedBase<'a> {
             debug_assert_eq!((om.len(), nm.len()), (self.marks.len(), new_marks.len()));
             align(&old, &om, &new, &nm)
         };
-        self.assemble(edited, &new_marks, &pair)
+        self.assemble(edited, &new_marks, &pair, orphans)
     }
 
-    /// Текст по `edited` со значениями пар; пересканирование итога ([`Restored::exposed`]).
-    fn assemble(&self, edited: &str, new_marks: &[usize], pair: &[u32]) -> Restored {
+    /// Текст по `edited` со значениями пар; пересканирование итога и метки без пары при маске
+    /// базы без пары в участке (`orphans`) — [`Restored::exposed`].
+    fn assemble(
+        &self,
+        edited: &str,
+        new_marks: &[usize],
+        pair: &[u32],
+        orphans: Vec<usize>,
+    ) -> Restored {
         let crlf = edited.contains("\r\n");
         let extra: usize = pair
             .iter()
@@ -198,7 +211,7 @@ impl<'a> MaskedBase<'a> {
             pos = at + SECRET_MARK.len();
         }
         text.push_str(&edited[pos..]);
-        let exposed = exposed_lines(&text, &values, edited, new_marks);
+        let exposed = exposed_lines(&text, &values, orphans, edited, new_marks);
         Restored {
             text,
             kept,
@@ -221,30 +234,24 @@ fn push_value(out: &mut String, v: &str, crlf: bool) {
     }
 }
 
-/// Строки `edited` (с 1), где значение из `values` сканер итога `text` не закрывает целиком.
+/// Строки `edited` (с 1), где значение из `values` сканер итога `text` не закрывает целиком, и
+/// строки меток `orphans` (индексы меток `edited`).
 fn exposed_lines(
     text: &str,
     values: &[(Range<usize>, usize)],
+    orphans: Vec<usize>,
     edited: &str,
     new_marks: &[usize],
 ) -> Vec<usize> {
-    if values.is_empty() {
+    let mut open = orphans;
+    if !values.is_empty() {
+        uncovered(text, values, &mut open);
+    }
+    if open.is_empty() {
         return Vec::new();
     }
-    let hits = scan_secrets(text);
-    let mut open: Vec<usize> = Vec::new();
-    let mut h = 0;
-    for (r, j) in values {
-        while h < hits.len() && hits[h].range.end <= r.start {
-            h += 1;
-        }
-        let covered = hits
-            .get(h)
-            .is_some_and(|x| x.range.start <= r.start && r.end <= x.range.end);
-        if !covered {
-            open.push(*j);
-        }
-    }
+    open.sort_unstable();
+    open.dedup();
     // номера строк меток — одним проходом по `edited`
     let (mut line, mut pos) = (1usize, 0usize);
     let mut out: Vec<usize> = Vec::with_capacity(open.len());
@@ -260,6 +267,23 @@ fn exposed_lines(
         }
     }
     out
+}
+
+/// Индексы меток значений `values`, которые сканер итога `text` не закрывает целиком, — в `open`.
+fn uncovered(text: &str, values: &[(Range<usize>, usize)], open: &mut Vec<usize>) {
+    let hits = scan_secrets(text);
+    let mut h = 0;
+    for (r, j) in values {
+        while h < hits.len() && hits[h].range.end <= r.start {
+            h += 1;
+        }
+        let covered = hits
+            .get(h)
+            .is_some_and(|x| x.range.start <= r.start && r.end <= x.range.end);
+        if !covered {
+            open.push(*j);
+        }
+    }
 }
 
 /// Текст с переводами строк `\n` (`\r\n` и одиночный `\r` — `\n`).
@@ -293,7 +317,7 @@ fn push_plain(
 
 /// Пары меток: для каждой метки `new` (позиции `new_marks`) — индекс метки `old` (позиции
 /// `old_marks`) или [`NONE`].
-fn align(old: &str, old_marks: &[usize], new: &str, new_marks: &[usize]) -> Vec<u32> {
+fn align(old: &str, old_marks: &[usize], new: &str, new_marks: &[usize]) -> (Vec<u32>, Vec<usize>) {
     let mut intern: HashMap<&str, u32> = HashMap::new();
     let old = Side::new(old, old_marks, &mut intern);
     let new = Side::new(new, new_marks, &mut intern);
@@ -303,6 +327,7 @@ fn align(old: &str, old_marks: &[usize], new: &str, new_marks: &[usize]) -> Vec<
     }
     let mut a = Aligner {
         heads,
+        orphans: Vec::new(),
         pair: vec![NONE; new_marks.len()],
         old_paired: vec![false; old_marks.len()],
         old_used: vec![false; old.lines.len()],
@@ -316,7 +341,7 @@ fn align(old: &str, old_marks: &[usize], new: &str, new_marks: &[usize]) -> Vec<
         budget: WORK_BUDGET,
     };
     a.run();
-    a.pair
+    (a.pair, a.orphans)
 }
 
 /// Слова вокруг метки в её строке: последнее слово перед ней и первое после (без слов соседних
@@ -571,6 +596,8 @@ struct Aligner<'x> {
     new_sec: Vec<u32>,
     /// Номер содержимого строки — заголовок Markdown (`#…`).
     heads: Vec<bool>,
+    /// Метки нового текста без пары, где в том же участке осталась маска базы без пары.
+    orphans: Vec<usize>,
     budget: u64,
 }
 
@@ -630,8 +657,35 @@ impl Aligner<'_> {
             self.same_words_in_block(o.clone(), n.clone());
         }
         self.similar_lines();
+        for (o, n) in &blocks {
+            self.rest_of_block(o.clone(), n.clone());
+        }
         for (o, n) in blocks {
-            self.rest_of_block(o, n);
+            self.orphans_of_block(o, n);
+        }
+    }
+
+    /// Метки нового текста без пары в изменённом участке, где осталась маска базы без пары: это
+    /// правка окружения существующего секрета (литералом значение молча пропало бы) — в
+    /// `orphans`, вызывающий отклоняет такую правку (решение координатора по сомнению 1 круга
+    /// правок 1). Маски базы участка все в паре (дописана ещё одна метка) или участок без масок —
+    /// метки остаются литералом.
+    fn orphans_of_block(&mut self, o: Range<usize>, n: Range<usize>) {
+        let lost = o.into_iter().any(|l| {
+            self.old
+                .line_marks(l)
+                .into_iter()
+                .any(|a| !self.old_paired[a])
+        });
+        if !lost {
+            return;
+        }
+        for k in n {
+            for b in self.new.line_marks(k) {
+                if self.pair[b] == NONE {
+                    self.orphans.push(b);
+                }
+            }
         }
     }
 

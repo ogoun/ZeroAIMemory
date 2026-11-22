@@ -1655,6 +1655,37 @@ async fn agent_context_changed_rejected() {
             .await
             .contains(&format!("mysql -p{p} db --verbose"))
     );
+    // пробы ревью 3 и 4: URL переписан прозой, «password = ‹secret›» — «пароль от стенда —
+    // ‹secret›»: слово перед меткой сменилось, маска базы без пары — тоже 422 (решение
+    // координатора по сомнению 1 круга правок 1), значение в базе прежнее
+    let base = format!("# Доступ\n\nбаза: https://user:{p}@db.example.com/\npassword = {p}\n");
+    let n2 = a.note("knowledge", "ops/restore-context-2", &base).await;
+    let id2 = n2["id"].as_str().unwrap().to_string();
+    let seen2 = agent_text(&a, &id2).await;
+    for (edited, lines) in [
+        (
+            seen2
+                .replace("https://user:", "логин user, пароль ")
+                .replace("@db.example.com/", " (db.example.com)"),
+            "строка 3",
+        ),
+        (
+            seen2.replace("password = ", "пароль от стенда — "),
+            "строка 4",
+        ),
+    ] {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::PUT,
+                &format!("/api/v1/nodes/{id2}"),
+                Some(json!({"content": edited})),
+                &[("if-match", "1")],
+            )
+            .await;
+        context_changed(&r, &p, lines);
+    }
+    assert_eq!(human_text(&a, &id2).await, base);
     // запись журнала: у ключа снят разделитель
     let e = post_entry(
         &a,

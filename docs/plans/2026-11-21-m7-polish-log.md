@@ -1767,6 +1767,22 @@ ideas --test questions --test transfer_import --test cache_api --test agent_setu
 79, 20, 4, 19, 17, 21, 15, 49, 10, 19 passed, 0 failed; `cargo clippy -p zam-secrets -p
 zam-store -p zam-server --lib --tests` — без предупреждений; `rustfmt --check` — чисто.
 
+#### Решения координатора по кругу правок 1
+
+1. **Метка без пары там, где в базе был секрет** — отказ 422 `secret_context_changed` (тот же
+   текст и номера строк), а не литерал: иначе значение молча пропало бы из текущей ревизии.
+   `zam_secrets::restore`: после всех шагов в каждом изменённом участке диффа строк, где
+   осталась маска базы без пары, метки нового текста без пары — в `Restored::exposed`
+   [решение исполнителя: условие — маска базы **без пары**; участок, где все маски базы в паре
+   (к строке с ключом дописана ещё одна метка), или участок без масок — литерал с
+   `secret_mark_kept`, как прежде]. Массив `data` и теги — так же, местом служит поле целиком
+   (`data.options`, `tags`). Пробы ревьюера 3 и 4 (и 5 — ключ переписан на месте) теперь — 422;
+   новая строка `x ‹secret›` в участке без масок — литерал и предупреждение.
+2. **`similar` в клиенте** — модуль `zam_secrets::restore` за фичей `restore` (по умолчанию
+   выключена, `similar` — `optional`); включает её только `zam-server` (прямая зависимость
+   `zam-secrets` с `features = ["restore"]`). `cargo tree -p zam-cli -e normal` — `similar` нет.
+   Тесты модуля — `cargo test -p zam-secrets --features restore`.
+
 **Инцидент.** При вставке блока PATCH в `revise.rs` команда PowerShell с относительным путём
 (.NET берёт каталог процесса, а не текущий каталог сессии) записала файл основного каталога
 `H:\Documents\GitHub\ZeroAIMemory\crates\zam-store\src\nodes\revise.rs` (удалено 140 строк).

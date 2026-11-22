@@ -1,6 +1,6 @@
 //! Обвязка восстановления значений под `‹secret›` при записи агентом (спецификация M7 §4.3.2,
-//! задача 6 M7.1): алгоритм — [`zam_markdown::secrets::restore`] (крейт `zam-secrets`, с круга
-//! правок 1); здесь — кто пишет, база правки, поля записи журнала, предупреждение и отказ.
+//! задача 6 M7.1): алгоритм — [`zam_secrets::restore`] (фича `restore` крейта `zam-secrets`, с
+//! круга правок 1); здесь — кто пишет, база правки, поля записи журнала, предупреждение и отказ.
 //!
 //! - Агент по токену ([`agent_view::masks`]) правит маскированный текст; человек в сессии WebUI
 //!   видит исходник и пишет как есть.
@@ -10,14 +10,17 @@
 //! - Правка, которая выводит восстановленное значение из-под маски (снят забор кода, URL с
 //!   паролем переписан, у ключа снят разделитель), отклоняется: 422 [`SECRET_CONTEXT_CHANGED`]
 //!   с номерами строк маскированного вида, без значений; данные не теряются и не утекают
-//!   (решение координатора, круг правок 1).
+//!   (решение координатора, круг правок 1). Так же — метка без пары там, где в том же изменённом
+//!   участке (у `data` — в том же массиве) осталась маска базы без пары: это правка окружения
+//!   существующего секрета, литералом значение молча пропало бы из текущей ревизии (решение
+//!   координатора по сомнению 1 круга правок 1).
 //! - Поля записи журнала, которые агент видит маской и присылает обратно, — один список
 //!   ([`EntryTexts`]) для правки, замещения и создания.
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::{Db, Entry, StoreError, node_content};
 
-pub use zam_markdown::secrets::restore::{MaskedBase, Restored, has_mark, marks_in, restore};
+pub use zam_secrets::restore::{MaskedBase, Restored, has_mark, marks_in, restore};
 
 use super::agent_view::{self, BLOCKING_FROM};
 use crate::error::ApiError;
@@ -98,6 +101,11 @@ impl Exposed {
         }
     }
 
+    /// Поле целиком (массив `data`, теги): метка без пары там, где осталась маска без пары.
+    fn add_field(&mut self, field: &str) {
+        self.0.push((Some(field.to_string()), Vec::new()));
+    }
+
     /// Нет мест — `Ok`; иначе 422 [`SECRET_CONTEXT_CHANGED`] без значений.
     pub fn check(self) -> Result<(), ApiError> {
         if self.0.is_empty() {
@@ -119,6 +127,7 @@ impl Exposed {
             .0
             .iter()
             .map(|(f, l)| match f {
+                Some(f) if l.is_empty() => f.clone(),
                 Some(f) => format!("{f}: {}", lines(l)),
                 None => lines(l),
             })
@@ -219,13 +228,18 @@ impl<'a> EntryTexts<'a> {
         if let Some(t) = self.tags {
             let olds: Vec<Value> = base.tags.iter().map(|s| json!(s)).collect();
             let mut list = Listed::new(&olds);
+            let mut unpaired = 0;
             for s in t.iter_mut() {
                 let mut v = Value::String(std::mem::take(s));
-                kept += list.restore(&mut v);
+                unpaired += list.restore(&mut v);
                 if let Value::String(x) = v {
                     *s = x;
                 }
             }
+            if unpaired > 0 && list.lost() {
+                ex.add_field("tags");
+            }
+            kept += unpaired;
         }
         if let Some(a) = self.area {
             kept += restore_in_place(base.area, a, "area", &mut ex);
@@ -271,14 +285,21 @@ pub fn marks_in_value(v: &Value) -> usize {
 /// у каждой строки своя, [`agent_view::mask_value`]): строка — по строке того же пути (ключи
 /// объекта); элемент массива — только прежний элемент, вид которого совпал целиком (на любом
 /// месте, каждый — не больше одной пары), иначе его метки — без пары (по индексу значения не
-/// подставляются, круг правок 1, M2). Места выхода из-под маски — в `ex` с путём поля.
+/// подставляются, круг правок 1, M2), а если при этом остался прежний элемент с маской без пары —
+/// место отказа (массив целиком). Места выхода из-под маски — в `ex` с путём поля.
 fn restore_value(base: &Value, new: &mut Value, path: &mut String, ex: &mut Exposed) -> usize {
     match new {
         Value::String(s) => restore_in_place(base.as_str(), s, path, ex),
         Value::Array(a) => {
             let olds: &[Value] = base.as_array().map_or(&[], |v| v.as_slice());
             let mut list = Listed::new(olds);
-            a.iter_mut().map(|x| list.restore(x)).sum()
+            let unpaired: usize = a.iter_mut().map(|x| list.restore(x)).sum();
+            // метка без пары при прежнем элементе с маской без пары — правка окружения
+            // существующего секрета (решение координатора по сомнению 1 круга правок 1)
+            if unpaired > 0 && list.lost() {
+                ex.add_field(path);
+            }
+            unpaired
         }
         Value::Object(o) => o
             .iter_mut()
@@ -337,6 +358,18 @@ impl<'b> Listed<'b> {
         }
         marks
     }
+
+    /// Остался прежний элемент с маской (значением секрета) без пары.
+    fn lost(&mut self) -> bool {
+        (0..self.olds.len()).any(|j| {
+            !self.taken[j]
+                && marks_in_value(self.shown[j].get_or_insert_with(|| {
+                    let mut v = self.olds[j].clone();
+                    agent_view::mask_value(&mut v);
+                    v
+                })) > 0
+        })
+    }
 }
 
 #[cfg(test)]
@@ -366,8 +399,9 @@ mod tests {
     }
 
     /// `data` записи: строки по пути; элементы массива — только по виду целиком (переставлены —
-    /// на места), иначе — без пары (по индексу значение не подставляется, M2); новое поле — как
-    /// есть; теги — так же.
+    /// на места); новое поле — как есть; теги — так же. Правленый элемент массива с меткой, пока
+    /// прежний элемент с маской остался без пары, — отказ (по индексу значение не подставляется,
+    /// M2; молча пропасть ему нельзя — решение координатора по сомнению 1 круга правок 1).
     #[test]
     fn restore_entry_fields() {
         let (k1, k2) = (key(21), key(22));
@@ -383,7 +417,7 @@ mod tests {
         let mut data = json!({
             "kind": "decision",
             "evidence": {"checked": format!("token: {M} (prod)"), "n": 3},
-            "options": ["c", shown["options"][1].clone(), format!("a {M} (правлено)")],
+            "options": ["c", shown["options"][1].clone(), shown["options"][0].clone()],
             "new": format!("x {M}"),
         });
         let mut seen: Vec<String> = tags
@@ -399,18 +433,27 @@ mod tests {
         };
         assert_eq!(t.marks(), 6);
         let kept = t.restore(base).unwrap();
-        // «a ‹secret› (правлено)» по индексу 2 ключ не получает; новое поле и тег-метка — без пары
-        assert_eq!(kept, 3);
+        // новое поле и лишняя метка тегов (прежние теги все в паре) — без пары
+        assert_eq!(kept, 2);
         assert_eq!(data["evidence"]["checked"], format!("token: {k1} (prod)"));
         assert_eq!(
             data["options"],
-            json!(["c", format!("b {k2}"), format!("a {M} (правлено)")])
+            json!(["c", format!("b {k2}"), format!("a {k1}")])
         );
         assert_eq!(data["new"], format!("x {M}"));
         assert_eq!(
             seen,
             vec!["ops".to_string(), format!("t-{k1}"), M.to_string()]
         );
+        // «a ‹secret› (правлено)»: по индексу ключ не получает, а «a <ключ>» остался без пары
+        let mut data = json!({"options": ["c", format!("a {M} (правлено)")]});
+        let t = EntryTexts {
+            data: Some(&mut data),
+            ..EntryTexts::default()
+        };
+        let e = t.restore(base).unwrap_err();
+        assert!(e.to_string().contains("(data.options)"), "{e}");
+        assert!(!e.to_string().contains(&k1), "{e}");
     }
 
     /// Поле, где значение вышло бы из-под маски, — 422 с путём поля и строкой, без значения.
