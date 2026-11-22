@@ -1524,13 +1524,29 @@ export interface SessionSnapshot {
 export const sessionSnapshot = (id: string, user?: string) =>
   call<SessionSnapshot>('GET', `sessions/${encodeURIComponent(id)}/snapshot`, undefined, user);
 
-/** Свои сессии, свежие первыми, с выданным по событию; администратор — пользователя `user`. */
-export function listSessions(f: { solution?: string; limit?: number }, user?: string) {
+/** Свои сессии, свежие первыми, с выданным по событию; `parent` — только субагенты этой сессии
+ * (M7 §5.8 п. 1); администратор — пользователя `user`. */
+export function listSessions(f: { solution?: string; limit?: number; parent?: string }, user?: string) {
   const p = new URLSearchParams({ tokens: 'true' });
   if (f.solution) p.set('solution', f.solution);
   if (f.limit) p.set('limit', String(f.limit));
+  if (f.parent) p.set('parent', f.parent);
   return call<{ items: SessionItem[] }>('GET', `sessions?${p}`, undefined, user);
 }
+
+/** Выданное без явной сессии за сутки UTC `day` по событию (M6 §7.1): MCP по HTTP без привязки
+ * к сессии агента. */
+export interface UnattributedRow {
+  day: string;
+  event: string;
+  calls: number;
+  tokens: number;
+}
+
+/** Выдача без сессии за `days` суток (1..=366), свежие сутки первыми; администратор —
+ * пользователя `user`. */
+export const unattributed = (days: number, user?: string) =>
+  call<{ items: UnattributedRow[] }>('GET', `sessions/unattributed?days=${days}`, undefined, user);
 
 /** Rules пользователя (`GET /index/status?only=rules`, M6 §8): `warning` — `rules_heavy` при
  * больше 10 правил или L1 в сумме больше 1500 токенов. */
