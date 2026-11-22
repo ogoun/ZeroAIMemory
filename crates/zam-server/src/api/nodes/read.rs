@@ -16,8 +16,8 @@
 //! все виды — по тексту ревизии с `‹secret›` вместо значений секретов: маска всей ревизии до
 //! секции и L1, HTML — маска до рендера (свой ключ кэша рендера), `node.frontmatter`
 //! (`description`, `tags`, `l0`) и L0 — тоже; оглавление — по маскированному тексту. Текст для
-//! правки (`md`, `json`, L1, оглавление) — нумерованный вид `‹secret-N›` (M7 §4.3.2, круг правок 3
-//! задачи 6), HTML — метки без номеров. `ETag` у
+//! правки (`md`, `json`, L1, оглавление) — вид с метками `‹secret-T-N›` (M7 §4.3.2, круги правок
+//! 3–5 задачи 6), HTML — метки без номеров. `ETag` у
 //! `format=md` — по-прежнему `"<rev>"`: это ревизия для `If-Match` записи, и у маски она та же.
 //! Сессии WebUI — исходник.
 use axum::Json;
@@ -134,8 +134,9 @@ pub async fn outline(
         return Ok(Json(Vec::new()));
     }
     let (_, text) = node_content(&sc.db, sc.node.id, None).await?;
-    // агенту — заголовки нумерованного вида (`‹secret-N›`: по ним агент адресует секции `PATCH`)
-    let text = agent_view::edit_view_owned(&p, text).await?;
+    // агенту — заголовки нумерованного вида (`‹secret-T-N›`: по ним агент адресует секции `PATCH`)
+    let tag = agent_view::object_tag(&sc.node.id, sc.node.current_rev);
+    let text = agent_view::edit_view_owned(&p, tag, text).await?;
     Ok(Json(doc_outline(&parse(&text))))
 }
 
@@ -205,12 +206,12 @@ async fn read(
     // хэш ключа кэша HTML — по прочитанному исходнику (`content_hash` ревизии), до маски
     let hash = (format == Format::Html && q.section.is_none()).then(|| key_hash(node, rev, &text));
     // агенту — маска всей ревизии до секции, L1 и рендера: текст для правки (`md`, `json`, L1)
-    // текущей ревизии — нумерованный вид `‹secret-N›` (M7 §4.3.2 п. 1); HTML и старая ревизия
+    // текущей ревизии — вид с метками `‹secret-T-N›` (M7 §4.3.2 п. 1); HTML и старая ревизия
     // (`rev=N`: номера действуют только у текущей, круг правок 4) — метки без номеров
     let text = if (format == Format::Html && tier == Tier::L2) || rev != node.current_rev {
         agent_view::view_owned(p, text).await?
     } else {
-        agent_view::edit_view_owned(p, text).await?
+        agent_view::edit_view_owned(p, agent_view::object_tag(&node.id, rev), text).await?
     };
     let (text, whole) = match q.section.as_deref() {
         Some(path) => (section_slice(&text, path)?.to_string(), false),
@@ -295,7 +296,7 @@ pub(crate) fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, Ap
 
 /// В адресе секции есть метка без номера (`‹secret›`).
 pub(crate) fn plain_mark(path: &str) -> bool {
-    zam_secrets::marks(path).any(|(_, n)| n.is_none())
+    zam_secrets::marks(path).any(|(_, k)| k == zam_secrets::Mark::Plain)
 }
 
 /// Секция по адресу с метками, где метки заголовков (`‹secret-N›`) и адреса сравниваются как

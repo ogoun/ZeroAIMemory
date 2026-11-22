@@ -86,9 +86,6 @@ zstd = { version = "0.13.3", default-features = false }
 # M3: проверка триггеров инсайтов (§10.3): regex без обратных ссылок (ReDoS невозможен) —
 # MIT OR Apache-2.0, уже в дереве; globset — маски file_glob, Unlicense OR MIT (берём MIT)
 regex = "1"
-# M7.1 (задача 6, §4.3.2 п. 5): поиск многих образцов одним проходом — покрытие значений секретов
-# в итоге записи агентом; MIT OR Unlicense, уже в дереве (через `regex`), та же версия
-aho-corasick = "1.1.5"
 globset = { version = "0.4", default-features = false }
 # xtask eval: Snowball-стемминг ru/en для проверки «перефраз без общих слов» (не в продукте);
 # MIT/BSD-3-Clause, без unsafe, зависимости serde/serde_derive — уже в дереве

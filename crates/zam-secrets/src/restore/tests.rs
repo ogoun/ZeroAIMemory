@@ -6,19 +6,26 @@ fn key(n: u32) -> String {
     format!("gh{}_{}{n:04}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF")
 }
 
+/// URL с паролем из частей: в исходнике нет пары `логин:пароль@` (фиктивные секреты — склейкой).
+fn url(head: &str, pass: &str, tail: &str) -> String {
+    format!("{head}:{pass}@{tail}")
+}
+
 /// Пароль ключ-значения из частей.
 fn pw(n: u32) -> String {
     format!("{}{n}{}", "hunter", "Qz9x")
 }
 
 const M: &str = SECRET_MARK;
+/// Метка объекта и ревизии в тестах.
+const T: &str = "0a1b2c";
 
-/// Метка с номером.
+/// Метка объекта `T` с номером `n`.
 fn m(n: u32) -> String {
-    format!("‹secret-{n}›")
+    format!("‹secret-{T}-{n}›")
 }
 
-/// Все метки (с номером и без) — `‹secret›`.
+/// Все метки — `‹secret›`.
 fn plain(s: &str) -> String {
     let mut out = String::new();
     let mut pos = 0;
@@ -31,16 +38,29 @@ fn plain(s: &str) -> String {
     out
 }
 
-/// Восстановление строго по номерам: ожидаемый текст, без меток без пары и отказа.
+/// Вид объекта из одного текста.
+fn view(raw: &str) -> String {
+    numbered_view(T, raw).into_owned()
+}
+
+/// Восстановление по меткам: ожидаемый текст, без предупреждения и отказа.
 #[track_caller]
 fn exact(base: &str, edited: &str, want: &str) {
-    let r = restore(base, edited);
+    let r = restore(T, base, edited);
     assert_eq!(r.text, want, "правка {edited:?}");
     assert_eq!((r.kept, r.exposed.len()), (0, 0), "правка {edited:?}");
 }
 
-/// Вид: маски — по порядку `‹secret-1›`, `‹secret-2›`, …; без номеров вид — ровно `mask_text`;
-/// литералы меток исходника (`‹secret›`, `‹secret-N›`) — `‹secret›` без номера.
+/// Отказ (значение вне покрытия) на строках `lines`.
+#[track_caller]
+fn exposed(base: &str, edited: &str, lines: &[usize]) {
+    let r = restore(T, base, edited);
+    assert_eq!(r.exposed, lines, "правка {edited:?} → {:?}", r.text);
+}
+
+/// Вид: маски — `‹secret-T-1›`, `‹secret-T-2›`, …; без меток вид — ровно `mask_text`; литералы
+/// меток исходника (`‹secret›`, `‹secret-N›`, `‹secret-T-N›`) — `‹secret›`; нумерация объекта —
+/// сквозная по полям.
 #[test]
 fn numbered_view_order() {
     let (k1, k2) = (key(1), key(2));
@@ -48,7 +68,7 @@ fn numbered_view_order() {
         "# K\ntoken: {k1}\nbase: https://user:{}@db.example.com/\nb: {k2}\n",
         pw(1)
     );
-    let v = numbered_view(&base);
+    let v = view(&base);
     assert_eq!(
         v,
         format!(
@@ -59,46 +79,40 @@ fn numbered_view_order() {
         )
     );
     assert_eq!(plain(&v), mask_text(&base));
-    assert!(matches!(numbered_view("без секретов"), Cow::Borrowed(_)));
-    let lit = format!("было {M} и {} и token: {k1}\n", m(7));
+    assert!(matches!(numbered_view(T, "без секретов"), Cow::Borrowed(_)));
+    let lit = format!("было {M} и ‹secret-7› и ‹secret-ffffff-2› и token: {k1}\n");
     assert_eq!(
-        numbered_view(&lit),
-        format!("было {M} и {M} и token: {}\n", m(1))
+        view(&lit),
+        format!("было {M} и {M} и {M} и token: {}\n", m(1))
     );
-    // поле из нескольких строк — сквозная нумерация
-    let mut f = FieldMasks::new();
+    assert_eq!(literals_in(&lit), 3);
+    // объект из нескольких полей — сквозная нумерация
+    let mut o = ObjectMasks::new(T);
     let (a, b) = (format!("a {k1}"), format!("b {k2}"));
-    assert_eq!(f.view(&a), format!("a {}", m(1)));
-    assert_eq!(f.view("c"), "c");
-    assert_eq!(f.view(&b), format!("b {}", m(2)));
-    assert_eq!(
-        (f.len(), f.value(2), f.value(3)),
-        (2, Some(k2.as_str()), None)
-    );
-    assert_eq!(f.value(0), None);
+    assert_eq!(o.view(&a), format!("a {}", m(1)));
+    assert_eq!(o.view("c"), "c");
+    assert_eq!(o.view(&b), format!("b {}", m(2)));
+    assert_eq!(o.len(), 2);
+    assert_eq!(o.value(Mark::Tagged(T, 2)), Some(k2.as_str()));
+    assert_eq!(o.value(Mark::Tagged(T, 3)), None);
+    assert_eq!(o.value(Mark::Tagged("ffffff", 1)), None);
+    assert_eq!(o.value(Mark::Numbered(1)), None);
+    assert_eq!(unnumbered(&v), mask_text(&base));
 }
 
-/// Вид без правки — исходник; правка вокруг метки, перестановка, перенос, удаление строк —
-/// значения по номерам.
+/// Вид без правки — исходник; правка вокруг метки, перестановка, перенос, удаление, повтор — по
+/// меткам.
 #[test]
-fn restore_by_number() {
+fn restore_by_mark() {
     let (k1, k2) = (key(11), key(12));
     let base = format!("# K\n\na: {k1}\nb: {k2}\n\nхвост\n");
-    let v = numbered_view(&base).into_owned();
-    exact(&base, &v, &base);
+    exact(&base, &view(&base), &base);
     exact(
         &base,
         &format!("# K\n\nb: {} (prod)\nтекст\na: {}\n", m(2), m(1)),
         &format!("# K\n\nb: {k2} (prod)\nтекст\na: {k1}\n"),
     );
-    exact(
-        &base,
-        &format!("хвост {}\n", m(2)),
-        &format!("хвост {k2}\n"),
-    );
-    // удалены обе — значений нет
     exact(&base, "# K\n", "# K\n");
-    // повтор номера — повтор значения
     exact(
         &base,
         &format!("a: {}\nкопия: {}\n", m(1), m(1)),
@@ -106,98 +120,66 @@ fn restore_by_number() {
     );
 }
 
-/// Метка без номера и номер, которого в базе нет, — как есть и `kept`; база без секретов — все
-/// метки как есть; литерал базы напротив себя — тоже `kept`.
+/// Литералы (§4.3.2 п. 2): чужая метка объекта, номер вне базы, `‹secret›`, прежняя `‹secret-N›` —
+/// как есть; предупреждение — литералов итога сверх литералов исходника поля.
 #[test]
-fn restore_unpaired_kept() {
+fn restore_literals_and_kept() {
     let k = key(21);
     let base = format!("token: {k}\n");
     let r = restore(
+        T,
         &base,
-        &format!("token: {}\nx {M}\ny {}\nz {}\n", m(1), m(2), m(0)),
+        &format!(
+            "token: {}\nx {M}\ny {}\nz ‹secret-1›\nw ‹secret-ffffff-1›\n",
+            m(1),
+            m(2)
+        ),
     );
     assert_eq!(
         r.text,
-        format!("token: {k}\nx {M}\ny {}\nz {}\n", m(2), m(0))
+        format!(
+            "token: {k}\nx {M}\ny {}\nz ‹secret-1›\nw ‹secret-ffffff-1›\n",
+            m(2)
+        )
     );
-    assert_eq!((r.kept, r.exposed.len()), (3, 0));
-    let r = restore("чистый текст\n", &format!("чистый текст {}\n", m(1)));
-    assert_eq!((r.text, r.kept), (format!("чистый текст {}\n", m(1)), 1));
-    // литерал базы напротив себя — не предупреждение (сверх литералов вида базы, круг правок 4)
-    let lit = format!("сервис: {M}\nещё {}\n", m(3));
-    let r = restore(&lit, &numbered_view(&lit));
+    assert_eq!((r.kept, r.exposed.len()), (4, 0));
+    // литерал архива напротив себя — не предупреждение; дописанный — предупреждение (M-c)
+    let lit = format!("сервис: {M}\nещё ‹secret-3›\n");
+    let r = restore(T, &lit, &view(&lit));
     assert_eq!(
         (r.text.as_str(), r.kept),
         (format!("сервис: {M}\nещё {M}\n").as_str(), 0)
     );
-    let r = restore(&lit, &format!("{M} {M} {M} {}\n", m(1)));
-    assert_eq!(
-        r.kept, 2,
-        "три без номера при двух литералах и номер вне поля"
-    );
-    assert_eq!(restore(&base, "без меток").text, "без меток");
+    let r = restore(T, &lit, &format!("{}новый {M}\n", view(&lit)));
+    assert_eq!(r.kept, 1);
+    assert_eq!(restore(T, &base, "без меток").text, "без меток");
     assert!(has_mark(&m(3)) && has_mark(M) && !has_mark("‹secret-›") && !has_mark("secret"));
-    assert_eq!(marks_in(&format!("{M}{}{M} {}", m(1), m(12))), 4);
+    assert_eq!(marks_in(&format!("{M}{}{M} ‹secret-12›", m(1))), 4);
 }
 
-/// Пробы ревью кругов 1–2 (S1, S2, V1–V7, db1/db3): значение — строго по номеру, который агент
-/// оставил у строки, без подмен и молчаливой потери; номер другой строки — её значение (явный
-/// выбор агента).
+/// Пробы ревью кругов 1–4 (S1, S2, V1–V7, db1/db3): значение — по метке, которую агент оставил у
+/// строки.
 #[test]
 fn restore_review_cases() {
     let (a, b) = (key(1), key(2));
     let (p1, p2, p3) = (pw(1), pw(2), pw(3));
-    // S1: секция Prod удалена, строка Dev правлена словами строки Prod
     let base = format!("# K\n## Prod\ntoken: {a} (prod)\n## Dev\ntoken: {b}\n");
     exact(
         &base,
         &format!("# K\n## Dev\ntoken: {} (было prod)\n", m(2)),
         &format!("# K\n## Dev\ntoken: {b} (было prod)\n"),
     );
-    // V1: то же, строка встала после неизменённой строки
-    let base1 = format!("# K\n## Prod\ntoken: {a} (prod)\n## Dev\ntoken: {b}\nтекст\n");
     exact(
-        &base1,
-        &format!("# K\n## Dev\nтекст\ntoken: {} (было prod)\n", m(2)),
-        &format!("# K\n## Dev\nтекст\ntoken: {b} (было prod)\n"),
+        &base,
+        &format!("# K\n## Dev\ntoken: {} (prod)\n", m(1)),
+        &format!("# K\n## Dev\ntoken: {a} (prod)\n"),
     );
-    // S2: без заголовков
     let base = format!("начало\ntoken: {a} prod eu\nсередина\ntoken: {b}\nконец\n");
     exact(
         &base,
         &format!("начало\nсередина\ntoken: {} prod eu копия\nконец\n", m(2)),
         &format!("начало\nсередина\ntoken: {b} prod eu копия\nконец\n"),
     );
-    // V2: длинная строка Dev переписана описанием Prod
-    let base = format!(
-        "## Prod\n- prod: password = {p1} (основной кластер)\n## Dev\n- dev: password = {p2} (стенд разработки)\n"
-    );
-    exact(
-        &base,
-        &format!("## Dev\n- dev: password = {} (основной кластер)\n", m(2)),
-        &format!("## Dev\n- dev: password = {p2} (основной кластер)\n"),
-    );
-    // V3: ключ переименован
-    let base = format!("# K\n## Prod\ntoken: {a} (prod)\n## Dev\ndev_token: {b}\n");
-    exact(
-        &base,
-        &format!("# K\n## Dev\ntoken: {} (было prod)\n", m(2)),
-        &format!("# K\n## Dev\ntoken: {b} (было prod)\n"),
-    );
-    // V4: строка Dev стала равна виду строки Prod — номер Dev
-    let base = format!("# K\n## Prod\ntoken: {a} (prod)\n## Dev\ntoken: {b}\n");
-    exact(
-        &base,
-        &format!("# K\n## Dev\ntoken: {} (prod)\n", m(2)),
-        &format!("# K\n## Dev\ntoken: {b} (prod)\n"),
-    );
-    // V4′: агент перенёс строку Prod под Dev (номер Prod) — её значение
-    exact(
-        &base,
-        &format!("# K\n## Dev\ntoken: {} (prod)\n", m(1)),
-        &format!("# K\n## Dev\ntoken: {a} (prod)\n"),
-    );
-    // V7: обе правлены на месте, строка Prod — словами строки Dev: без обмена
     let base = format!("# K\n## Prod\ntoken: {a}\n## Dev\ntoken: {b} dev west\n");
     exact(
         &base,
@@ -208,7 +190,6 @@ fn restore_review_cases() {
         ),
         &format!("# K\n## Prod\ntoken: {a} dev west (now prod)\n## Dev\ntoken: {b}\n"),
     );
-    // db1/db3: db1 удалена, db3 правлена и перенесена на её место
     let base = format!(
         "## S\n- db1: password = {p1}\n- db2: password = {p2}\n- db3: password = {p3}\nконец\n"
     );
@@ -221,54 +202,132 @@ fn restore_review_cases() {
         ),
         &format!("## S\n- db3: password = {p3} (новый)\n- db2: password = {p2}\nконец\n"),
     );
-    // две метки в строке переставлены
-    exact(
-        &format!("a: {a} b: {b}\n"),
-        &format!("b: {} a: {}\n", m(2), m(1)),
-        &format!("b: {b} a: {a}\n"),
-    );
 }
 
-/// Пересканирование (C1 круга 1): снят забор кода вокруг флага, URL с паролем переписан прозой,
-/// у ключа снят разделитель — значение вышло бы из-под маски: строки — в `exposed`; контекст
-/// сохранён — `exposed` пуст.
+/// Покрытие по происхождению (§4.3.2 п. 5): снят забор, URL прозой, снят разделитель — отказ на
+/// строке итога; контекст сохранён — нет.
 #[test]
 fn restore_context_changed_exposed() {
     let p = pw(41);
     let base = format!("# Стенд\n\n```bash\nmysql -p{p} db\n```\n");
-    let v = numbered_view(&base).into_owned();
+    let v = view(&base);
     assert!(v.contains(&format!("mysql -p{} db", m(1))), "{v}");
-    let r = restore(&base, &v.replace("```bash\n", "").replace("```\n", ""));
-    assert_eq!(r.exposed, vec![3], "{}", r.text);
-    let r = restore(&base, &v.replace("db\n", "db --verbose\n"));
-    assert!(r.exposed.is_empty() && r.text.contains(&p), "{}", r.text);
+    exposed(
+        &base,
+        &v.replace("```bash\n", "").replace("```\n", ""),
+        &[3],
+    );
+    exposed(&base, &v.replace("db\n", "db --verbose\n"), &[]);
     let base = format!("база: https://user:{p}@db.example.com/\n");
-    let v = numbered_view(&base).into_owned();
-    let r = restore(
+    let v = view(&base);
+    exposed(
         &base,
         &v.replace("https://user:", "логин user, пароль ")
             .replace("@db.example.com/", " (db.example.com)"),
+        &[1],
     );
-    assert_eq!(r.exposed, vec![1], "{}", r.text);
-    let r = restore(&base, &v.replace("база:", "база prod:"));
-    assert!(r.exposed.is_empty() && r.text.contains(&p), "{}", r.text);
+    exposed(&base, &v.replace("база:", "база prod:"), &[]);
     let base = format!("x\npassword = {p}\n");
-    let v = numbered_view(&base).into_owned();
-    assert_eq!(
-        restore(&base, &v.replace("password = ", "password ")).exposed,
-        vec![2]
-    );
-    let r = restore(&base, &v.replace("password = ", "password (стенд) = "));
-    assert!(r.exposed.is_empty() && r.text.contains(&p), "{}", r.text);
+    let v = view(&base);
+    exposed(&base, &v.replace("password = ", "password "), &[2]);
+    exposed(&base, &v.replace("password = ", "password (стенд) = "), &[]);
 }
 
-/// База с `\r\n`, правка с `\n` — значения на месте, окончания — как у правки; многострочное
-/// значение (закрытый ключ) — с окончаниями правки.
+/// Слабые значения (круг правок 5, I-A): пароль URL, совпадающий с логином и схемой, и пароль из
+/// одного знака, переписанные прозой, — отказ; обычные слова рядом со слабым значением (I-B) и
+/// дописанные догадки (I-C) — не отказ.
+#[test]
+fn weak_values() {
+    let pg = &format!(
+        "БД: {}\n",
+        url("postgres://postgres", "postgres", "localhost:5432/app")
+    );
+    let v = view(pg);
+    assert_eq!(
+        v,
+        format!(
+            "БД: {}\n",
+            url("postgres://postgres", &m(1), "localhost:5432/app")
+        )
+    );
+    exposed(
+        pg,
+        &format!("БД: логин postgres, пароль {}, хост localhost\n", m(1)),
+        &[1],
+    );
+    exposed(pg, &format!("БД: пароль {}\n", m(1)), &[1]);
+    let mq = &format!(
+        "Очередь: {}\n",
+        url("amqp://guest", "guest", "localhost:5672/")
+    );
+    exposed(mq, &format!("Очередь: пароль {}\n", m(1)), &[1]);
+    let one = &format!("Строка {}\n", url("postgres://u", "p", "h/db"));
+    assert!(view(one).contains(&m(1)), "{}", view(one));
+    exposed(one, &format!("Строка: пароль {}\n", m(1)), &[1]);
+    // I-B: набранный агентом текст не проверяется
+    let rd = &format!("Кэш: {}\n", url("redis://", "pass", "localhost:6379"));
+    exposed(
+        rd,
+        &format!("{}Сменить password раз в квартал\n", view(rd)),
+        &[],
+    );
+    let pp = &format!(
+        "POSTGRES_PASSWORD: {}\nвход: {}\n",
+        ["pass", "word"].concat(),
+        url("redis://", "pass", "h")
+    );
+    exposed(pp, &format!("{}password policy: 90 дней\n", view(pp)), &[]);
+    exposed(
+        pg,
+        &format!("{}Перезапустить postgres после обновления\n", view(pg)),
+        &[],
+    );
+    exposed(one, &format!("{}deploy\n", view(one)), &[]);
+    let line = view(pg);
+    exposed(pg, &format!("{line}{line}"), &[]);
+    // I-C: догадки без меток — без отказа (строки ничего не называют)
+    let base = format!("# Стенд\n\npassword = {}\n", pw(31));
+    let guesses: String = (20..40).map(|k| format!("{}\n", pw(k))).collect();
+    exposed(&base, &format!("{}{guesses}", view(&base)), &[]);
+}
+
+/// Метки с личностью (круг правок 5, I-D): перенос метки из поля в поле объекта — значение; копия
+/// из другого объекта (чужой T) и прежняя `‹secret-N›` без T — литерал.
+#[test]
+fn object_marks_across_fields() {
+    let (k, p) = (key(81), pw(81));
+    let (title, body) = (format!("Ключ CI {k}"), format!("Стенд\npassword = {p}\n"));
+    let mut o = ObjectMasks::new(T);
+    let tv = o.view(&title).into_owned();
+    let bv = o.view(&body).into_owned();
+    assert_eq!(
+        (tv.as_str(), bv.as_str()),
+        (
+            format!("Ключ CI {}", m(1)).as_str(),
+            format!("Стенд\npassword = {}\n", m(2)).as_str()
+        )
+    );
+    // строка пароля перенесена из body в title
+    let r = o.restore(&format!("{tv}; password = {}", m(2)), 0);
+    assert_eq!(r.text, format!("{title}; password = {p}"));
+    assert_eq!((r.kept, r.exposed.len()), (0, 0));
+    // копия строки из другой заметки (её T) — литерал и предупреждение
+    let other = numbered_view("ffffff", &format!("token: {}\n", key(82))).into_owned();
+    let r = o.restore(&format!("{bv}{other}"), 0);
+    assert_eq!(r.text, format!("{body}{other}"));
+    assert_eq!(r.kept, 1);
+    // вид круга 3 (`‹secret-1›` без T) — литерал
+    let r = restore(T, &body, "password = ‹secret-1›\n");
+    assert_eq!((r.text.as_str(), r.kept), ("password = ‹secret-1›\n", 1));
+}
+
+/// База с `\r\n`, правка с `\n`; многострочное значение — с окончаниями правки; строка отказа —
+/// строка итога с переводами строк многострочного значения.
 #[test]
 fn restore_crlf_and_multiline() {
     let k = key(51);
     let base = format!("# K\r\n\r\ntoken: {k}\r\nпрочее\r\n");
-    let edited = numbered_view(&base)
+    let edited = view(&base)
         .replace("\r\n", "\n")
         .replace("прочее", "прочее 2");
     exact(&base, &edited, &format!("# K\n\ntoken: {k}\nпрочее 2\n"));
@@ -276,126 +335,73 @@ fn restore_crlf_and_multiline() {
         "-----BEGIN {}PRIVATE KEY-----\r\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\r\n-----END {}PRIVATE KEY-----",
         "RSA ", "RSA "
     );
-    let base = format!("ключ:\r\n{pem}\r\nконец\r\n");
-    let v = numbered_view(&base);
-    assert_eq!(v, format!("ключ:\r\n{}\r\nконец\r\n", m(1)));
+    let base = format!("ключ:\r\n{pem}\r\npassword = {}\r\nконец\r\n", pw(52));
+    let v = view(&base);
+    assert_eq!(
+        v,
+        format!("ключ:\r\n{}\r\npassword = {}\r\nконец\r\n", m(1), m(2))
+    );
     exact(
         &base,
         &v.replace("\r\n", "\n").replace("конец", "конец 2"),
-        &format!("ключ:\n{}\nконец 2\n", pem.replace("\r\n", "\n")),
+        &format!(
+            "ключ:\n{}\npassword = {}\nконец 2\n",
+            pem.replace("\r\n", "\n"),
+            pw(52)
+        ),
+    );
+    exposed(
+        &base,
+        &v.replace("\r\n", "\n").replace("password = ", "password "),
+        &[5],
     );
 }
 
-/// Поле из нескольких строк (элементы массива, теги): нумерация сквозная, элемент перенесён в
-/// другое место или в другой элемент — значение по номеру (V2d, I5 круга 2).
-#[test]
-fn field_masks_items() {
-    let (a, b) = (key(81), key(82));
-    let (p1, p2) = (pw(81), pw(82));
-    let items = [
-        format!("prod: password = {p1} (основной кластер)"),
-        format!("dev: password = {p2} (стенд)"),
-        format!("CI: {a}"),
-        format!("Dev: {b}"),
-    ];
-    let mut f = FieldMasks::new();
-    let views: Vec<String> = items.iter().map(|s| f.view(s).into_owned()).collect();
-    assert_eq!(views[3], format!("Dev: {}", m(4)));
-    // V2d: элемент dev переписан описанием prod (prod удалён)
-    let r = f.restore(&format!("dev: password = {} (основной кластер)", m(2)));
-    assert_eq!(r.text, format!("dev: password = {p2} (основной кластер)"));
-    // I5: элемент CI удалён, Dev получил слово CI
-    let r = f.restore(&format!("Dev CI: {}", m(4)));
-    assert_eq!(r.text, format!("Dev CI: {b}"));
-    // два значения в одном элементе и номер вне поля
-    let r = f.restore(&format!("{} и {} и {}", m(3), m(1), m(9)));
-    assert_eq!(r.text, format!("{a} и {p1} и {}", m(9)));
-    assert_eq!(r.kept, 1);
-}
-
-/// Отложенные значения: заменители в кусках, сборка, затем значения и проверка покрытия по
-/// исходнику текущей ревизии; номер строки отказа — строка итога (с переводами строк
-/// многострочных значений, круг правок 4, M3).
+/// Отложенные значения (`PATCH`): незакрытый забор над блоком с `-p…` открывает маску текущей
+/// ревизии, перенесённую без правки (C1); значения из меток операции и перенесённые — позиции в
+/// итоге; адрес секции — к заголовку исходника.
 #[test]
 fn deferred_values() {
-    let (k, p) = (key(91), pw(91));
-    let base = format!("token: {k}\npassword = {p}\n");
-    let f = FieldMasks::of(&base);
-    let piece = format!("новое: {}\npassword {}\nx {M}\n", m(1), m(2));
-    let mut d = Deferred::new(&[&base, &piece, "хвост\n"]).unwrap();
-    let a = f.defer(&piece, &mut d);
-    assert!(!a.contains(&k) && !a.contains(&p) && a.contains(M), "{a}");
-    let r = d.finish(&format!("# Заголовок\n{a}хвост\n"), &base, f.literals());
-    assert_eq!(
-        r.text,
-        format!("# Заголовок\nновое: {k}\npassword {p}\nx {M}\nхвост\n")
-    );
-    assert_eq!((r.kept, r.exposed.clone()), (1, vec![3]));
-    // многострочное значение: строки итога — с его переводами строк
-    let pem = format!(
-        "-----BEGIN {}PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END {}PRIVATE KEY-----",
-        "RSA ", "RSA "
-    );
-    let base = format!("{pem}\npassword = {p}\n");
-    let f = FieldMasks::of(&base);
-    let piece = format!("{}\npassword {}\n", m(1), m(2));
-    let mut d = Deferred::new(&[&base, &piece]).unwrap();
-    let a = f.defer(&piece, &mut d);
-    let r = d.finish(&a, &base, f.literals());
-    assert_eq!(r.exposed, vec![4], "{}", r.text);
-    // адрес секции — к заголовку исходника
-    let base = format!("## Стенд {k}\n");
-    let f = FieldMasks::of(&base);
-    assert_eq!(
-        f.fill(&format!("K > Стенд {}", m(1))),
-        format!("K > Стенд {k}")
-    );
-    assert_eq!(f.fill(&format!("Стенд {M}")), format!("Стенд {M}"));
-}
-
-/// Покрытие всего текста (круг правок 4, C1, §4.3.2 п. 5): незакрытый забор над блоком с
-/// `mysql -p…` открывает флаг, которого агент не трогал, — и при правке целиком (`PUT`), и
-/// отложенно (`PATCH`: `prepend` забора); значение, уже открытое в исходнике человека (проза), при
-/// правке рядом — не отказ; новое открытое вхождение того же значения — отказ.
-#[test]
-fn exposure_whole_text() {
     let p = pw(95);
-    let base = format!("# K\n\n```\nmysql -uroot -p{p} db\n```\n\nконец\n");
-    let v = numbered_view(&base).into_owned();
-    assert!(v.contains(&format!("-p{}", m(1))), "{v}");
-    // PUT: незакрытый забор перед блоком — строка mysql уходит в прозу
-    let r = restore(&base, &v.replace("# K\n\n", "# K\n\n```\nпример\n"));
-    assert_eq!(r.exposed, vec![6], "{}", r.text);
-    // то же без метки в правке (агент её не трогал): дописано только начало забора
-    let r = restore(&base, &format!("```\n{v}"));
-    assert!(!r.exposed.is_empty(), "{}", r.text);
-    // PATCH: `prepend "```\n"` по исходнику — значение маски текущей ревизии открыто
-    let f = FieldMasks::of(&base);
-    let piece = "```\n";
-    let mut d = Deferred::new(&[&base, piece]).unwrap();
-    let a = f.defer(piece, &mut d);
-    let r = d.finish(&format!("{a}{base}"), &base, f.literals());
-    assert_eq!(r.exposed, vec![5], "{}", r.text);
-    // проза человека: значение открыто в исходнике — правка рядом не отказ
-    let base = format!("password = {p}\nв прозе: {p}\n");
-    let v = numbered_view(&base).into_owned();
-    assert_eq!(v, format!("password = {}\nв прозе: {p}\n", m(1)));
-    let r = restore(&base, &v.replace("password = ", "password (prod) = "));
-    assert!(r.exposed.is_empty(), "{:?}", r.exposed);
-    // ещё одно открытое вхождение — отказ (строки итога с открытыми вхождениями)
-    let r = restore(&base, &format!("{v}копия {}\n", m(1)));
-    assert_eq!(r.exposed, vec![2, 3], "{}", r.text);
-    // несколько кусков: строка и номер строки внутри куска
-    let found = exposure(
-        &[
-            &format!("token: {}", key(96)),
-            &format!("a\npassword = {p}"),
-        ],
-        &["x", &format!("a\nb\npassword {p}")],
-        &[],
+    let current = format!("# K\n\n```\nmysql -uroot -p{p} db\n```\n\nконец\n");
+    let o = {
+        let mut o = ObjectMasks::new(T);
+        o.add(&current);
+        o
+    };
+    let keep = secret_ranges(&current);
+    assert_eq!(keep.len(), 1);
+    // prepend «```\n»: перенесённая маска сдвигается на 4 байта
+    let mut d = Deferred::new(&[&current, "```\n"]).unwrap();
+    let piece = o.defer("```\n", &mut d);
+    let shifted: Vec<Range<usize>> = keep.iter().map(|r| r.start + 4..r.end + 4).collect();
+    let f = d.finish(&format!("{piece}{current}"), &shifted);
+    assert_eq!(f.text, format!("```\n{current}"));
+    assert_eq!(f.at, shifted);
+    assert_eq!(uncovered_lines(&f.text, &f.at), vec![5]);
+    // метки операции: значение в коде — покрыто, прозой — нет
+    let piece = format!("```\nmysql -p{} x\n```\nпароль {}\n", m(1), m(1));
+    let mut d = Deferred::new(&[&current, &piece]).unwrap();
+    let a = o.defer(&piece, &mut d);
+    assert!(!a.contains(&p), "{a}");
+    let text = format!("{current}{a}");
+    let f = d.finish(&text, &keep);
+    assert_eq!(
+        f.text,
+        format!("{current}```\nmysql -p{p} x\n```\nпароль {p}\n")
     );
-    assert_eq!(found, vec![(1, 3)]);
-    assert!(exposure(&["без секретов"], &["что угодно"], &[]).is_empty());
+    assert_eq!(f.at.len(), 3);
+    assert_eq!(uncovered_lines(&f.text, &f.at), vec![11]);
+    assert_eq!(f.literals, 0);
+    // адрес секции
+    let head = format!("## Стенд {}\n", key(96));
+    let mut o = ObjectMasks::new(T);
+    o.add(&head);
+    assert_eq!(
+        o.fill(&format!("K > Стенд {}", m(1))),
+        format!("K > Стенд {}", key(96))
+    );
+    assert_eq!(o.fill(&format!("Стенд {M}")), format!("Стенд {M}"));
 }
 
 /// Псевдослучайный генератор (LCG) — воспроизводимые правки.
@@ -411,8 +417,8 @@ impl Rng {
     }
 }
 
-/// Строка `i` исходника: проза, ключ, пароль ключ-значения, пароль в URL, два секрета или
-/// однообразная строка без номера.
+/// Строка `i` исходника: проза, ключ, пароль ключ-значения, пароль в URL, два секрета, однообразная
+/// строка и слабые значения (совпадают с логином и схемой, из одного знака, подстрока ключа).
 fn line(i: u32, kind: usize) -> String {
     match kind {
         0 => format!("строка {i}: обычный текст про сборку\n"),
@@ -420,7 +426,20 @@ fn line(i: u32, kind: usize) -> String {
         2 => format!("строка {i}: password = {}\n", pw(i)),
         3 => format!("строка {i}: https://user:{}@db.example.com/x\n", pw(i)),
         4 => format!("строка {i}: {} и password = {}\n", key(i), pw(i)),
-        _ => format!("token: {}\n", key(i)),
+        5 => format!("token: {}\n", key(i)),
+        6 => format!(
+            "строка {i}: {}\n",
+            url("postgres://postgres", "postgres", &format!("db{i}/app"))
+        ),
+        7 => format!(
+            "строка {i}: {}\n",
+            url("amqp://guest", "guest", &format!("mq{i}:5672/"))
+        ),
+        8 => format!(
+            "строка {i}: {}\n",
+            url("redis://", "p", &format!("cache{i}:6379"))
+        ),
+        _ => format!("строка {i}: password = {}\n", &key(i)[4..14]),
     }
 }
 
@@ -440,10 +459,19 @@ fn edit_line(s: &mut String, e: usize) {
     }
 }
 
-/// Случайные правки агента по нумерованному виду: перестановка, удаление, дублирование строк с
-/// метками, вставка, правка слов вокруг меток; база с `\r\n` и правка с `\n`. Итог — ровно те же
-/// правки исходника (значения по номерам, повтор — тем же значением), меток без пары и отказов
-/// нет. Зерно и число случаев — `T6_SEED`, `T6_CASES`.
+/// Слова набранного агентом текста — со слабыми значениями (`password`, `postgres`, `guest`, `p`).
+const PROSE: &[&str] = &[
+    "сменить password раз в квартал\n",
+    "перезапустить postgres\n",
+    "пользователь guest\n",
+    "p\n",
+    "deploy\n",
+];
+
+/// Случайные правки агента по виду: перестановка, удаление, дублирование строк с метками, вставка
+/// прозы со словами слабых значений, правка слов вокруг меток; база с `\r\n` и правка с `\n`; слабые
+/// значения. Итог — ровно те же правки исходника (значения по меткам, повтор — тем же значением),
+/// предупреждений и отказов нет. Зерно и число случаев — `T6_SEED`, `T6_CASES`.
 #[test]
 fn restore_random_line_edits() {
     let env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
@@ -455,7 +483,7 @@ fn restore_random_line_edits() {
             raw.push(format!("## Секция {case}-{s}\n"));
             for _ in 0..1 + rng.next(8) {
                 let i = case * 1000 + raw.len() as u32;
-                raw.push(line(i, rng.next(6)));
+                raw.push(line(i, rng.next(10)));
             }
         }
         if crlf {
@@ -464,8 +492,8 @@ fn restore_random_line_edits() {
             }
         }
         let base: String = raw.concat();
-        let view = numbered_view(&base).into_owned();
-        let mut seen: Vec<String> = view.split_inclusive('\n').map(str::to_owned).collect();
+        let v = view(&base);
+        let mut seen: Vec<String> = v.split_inclusive('\n').map(str::to_owned).collect();
         assert_eq!(raw.len(), seen.len(), "строки вида — как строки исходника");
         if crlf {
             for l in raw.iter_mut().chain(seen.iter_mut()) {
@@ -474,10 +502,10 @@ fn restore_random_line_edits() {
         }
         for e in 0..1 + rng.next(9) {
             let len = raw.len();
-            match rng.next(6) {
+            match rng.next(7) {
                 0 => {
                     let at = rng.next(len + 1);
-                    let t = format!("вставка {case}-{e}\n");
+                    let t = PROSE[rng.next(PROSE.len())].to_string();
                     raw.insert(at, t.clone());
                     seen.insert(at, t);
                 }
@@ -492,7 +520,6 @@ fn restore_random_line_edits() {
                     edit_line(&mut seen[at], e);
                 }
                 3 => {
-                    // дубль строки (с её метками) в другом месте
                     let (from, to) = (rng.next(len), rng.next(len + 1));
                     let (r, s) = (raw[from].clone(), seen[from].clone());
                     raw.insert(to, r);
@@ -508,7 +535,7 @@ fn restore_random_line_edits() {
             }
         }
         let (want, edited) = (raw.concat(), seen.concat());
-        let r = restore(&base, &edited);
+        let r = restore(T, &base, &edited);
         assert_eq!(r.text, want, "случай {case}:\n{edited}");
         assert_eq!(
             (r.kept, r.exposed.len()),
@@ -518,11 +545,11 @@ fn restore_random_line_edits() {
     }
 }
 
-/// Цена (журнал этапа): заметка 1 МБ и 5 МиБ — разделы с прозой, кодом и ключом на ~157 байт;
-/// нумерованный вид и восстановление правки (дописка к десяти строкам с метками, вставка и
-/// удаление строк; худший случай — правлена каждая строка). Медиана 5 прогонов, только release:
-/// `cargo test --release -p zam-secrets --features restore --lib -- --ignored bench_restore
-/// --nocapture`.
+/// Цена (журнал этапа): заметка 1 МБ и 5 МиБ — разделы с прозой, кодом и ключом на ~157 байт; вид,
+/// восстановление правки (дописка к десяти строкам с метками, вставка и удаление строк; худший
+/// случай — правлена каждая строка) и `PATCH`, где содержимое операции — вид всей заметки (тысячи
+/// масок). Медиана 5 прогонов, только release: `cargo test --release -p zam-secrets --features
+/// restore --lib -- --ignored bench_restore --nocapture`.
 #[test]
 #[ignore]
 fn bench_restore() {
@@ -553,11 +580,11 @@ fn bench_restore() {
     };
     for size in [1024 * 1024, 5 * 1024 * 1024 / 2, 5 * 1024 * 1024] {
         let base = doc(size);
-        let view = numbered_view(&base).into_owned();
+        let v = view(&base);
         let t_view = median(&mut || {
-            std::hint::black_box(numbered_view(&base));
+            std::hint::black_box(numbered_view(T, &base));
         });
-        let mut lines: Vec<String> = view.split_inclusive('\n').map(str::to_owned).collect();
+        let mut lines: Vec<String> = v.split_inclusive('\n').map(str::to_owned).collect();
         let step = lines.len() / 10;
         for j in 0..10 {
             let at = j * step + 1;
@@ -572,34 +599,49 @@ fn bench_restore() {
             }
         }
         let small: String = lines.concat();
-        let all: String = view
-            .split_inclusive('\n')
-            .map(|l| format!("> {l}"))
-            .collect();
+        let all: String = v.split_inclusive('\n').map(|l| format!("> {l}")).collect();
         for (what, edited) in [("правка", &small), ("каждая строка", &all)] {
             let mut kept = 0;
-            let t = median(&mut || kept = restore(&base, edited).kept);
+            let t = median(&mut || kept = restore(T, &base, edited).kept);
             println!(
-                "{} байт: вид {t_view:?}; восстановление ({what}, {} меток, без пары {kept}) {t:?}",
+                "{} байт: вид {t_view:?}; восстановление ({what}, {} меток, литералов {kept}) {t:?}",
                 base.len(),
                 marks_in(edited),
             );
         }
-        // PATCH (круг правок 4, I1): содержимое операции — нумерованный вид всей заметки с
-        // тысячами масок (отложенные значения, сборка, проверка покрытия по исходнику)
-        let mut exposed = 0;
+        // как у сервера: маски текущей ревизии (`secret_ranges`) — до операций; вид всей заметки
+        // заменяет текст целиком (перенесённых нет)
+        let mut exp = 0;
         let t = median(&mut || {
-            let f = FieldMasks::of(&base);
-            let mut d = Deferred::new(&[&base, &view]).unwrap();
-            let content = f.defer(&view, &mut d);
-            let r = d.finish(&content, &base, f.literals());
-            assert_eq!(r.text, base);
-            exposed = r.exposed.len();
+            let mut o = ObjectMasks::new(T);
+            o.add(&base);
+            std::hint::black_box(secret_ranges(&base));
+            let mut d = Deferred::new(&[&base, &v]).unwrap();
+            let content = o.defer(&v, &mut d);
+            let f = d.finish(&content, &[]);
+            assert_eq!(f.text, base);
+            exp = uncovered_lines(&f.text, &f.at).len();
         });
         println!(
-            "{} байт: PATCH видом всей заметки ({} меток, отказов {exposed}) {t:?}",
+            "{} байт: PATCH видом всей заметки ({} меток, отказов {exp}) {t:?}",
             base.len(),
-            marks_in(&view),
+            marks_in(&v),
+        );
+        // дописка строки в конец: все маски текущей ревизии перенесены и проверяются в итоге
+        let t = median(&mut || {
+            let mut o = ObjectMasks::new(T);
+            o.add(&base);
+            let keep = secret_ranges(&base);
+            let line = "новая строка\n";
+            let mut d = Deferred::new(&[&base, line]).unwrap();
+            let text = format!("{base}{}", o.defer(line, &mut d));
+            let f = d.finish(&text, &keep);
+            exp = uncovered_lines(&f.text, &f.at).len();
+        });
+        println!(
+            "{} байт: PATCH дописка строки ({} перенесённых масок, отказов {exp}) {t:?}",
+            base.len(),
+            secret_ranges(&base).len(),
         );
     }
 }

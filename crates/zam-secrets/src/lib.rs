@@ -28,9 +28,10 @@
 //! Что считать кодом — [`code`]: одно определение на проект (его берёт и `zam-markdown`).
 //!
 //! `restore` (фича `restore`, её включает только `zam-server`) — обратный путь маски для записи
-//! агентом (M7 §4.3.2, задача 6 M7.1): нумерованный вид `‹secret-N›` редактируемого текста и
-//! восстановление значений по номеру метки. Метка с номером ([`mark_at`], [`marks`]) для сканера —
-//! уже замаскированное место, как [`SECRET_MARK`].
+//! агентом (M7 §4.3.2, задача 6 M7.1): вид `‹secret-T-N›` редактируемого текста (T — метка объекта
+//! и ревизии, N — сквозной номер маски) и восстановление значений по метке. Метка с номером
+//! ([`mark_at`], [`marks`]; и прежняя `‹secret-N›`) для сканера — уже замаскированное место, как
+//! [`SECRET_MARK`].
 
 pub mod code;
 mod flags;
@@ -47,42 +48,70 @@ pub use flags::mask_flags;
 /// Замена секрета в тексте чанка.
 pub const SECRET_MARK: &str = "‹secret›";
 
-/// Начало метки с номером `‹secret-N›` — маски в тексте, который агент правит и возвращает
-/// записью (M7 §4.3.2, круг правок 3 задачи 6 M7.1): номер — личность маски в поле ревизии. Для
-/// сканера метка с номером — уже замаскированное место, как [`SECRET_MARK`].
+/// Начало метки с личностью `‹secret-T-N›` (и прежней `‹secret-N›`) — маски в тексте, который
+/// агент правит и возвращает записью (M7 §4.3.2, круги правок 3–5 задачи 6 M7.1): T — метка
+/// объекта и ревизии, N — номер маски в объекте. Для сканера любая метка — уже замаскированное
+/// место, как [`SECRET_MARK`].
 pub const NUMBERED_MARK_PREFIX: &str = "‹secret-";
 
-/// Наибольшее число цифр номера метки `‹secret-N›`.
+/// Наибольшее число цифр номера метки.
 const MARK_DIGITS_MAX: usize = 9;
 
-/// Метка в начале `s`: [`SECRET_MARK`] или `‹secret-N›` (N — от 1 до 9 цифр) — её длина и номер
-/// (у метки без номера — `None`).
-pub fn mark_at(s: &str) -> Option<(usize, Option<u32>)> {
-    if s.starts_with(SECRET_MARK) {
-        return Some((SECRET_MARK.len(), None));
-    }
-    let rest = s.strip_prefix(NUMBERED_MARK_PREFIX)?;
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 || digits > MARK_DIGITS_MAX || !rest[digits..].starts_with('›') {
-        return None;
-    }
-    let n = rest[..digits].parse().ok()?;
-    Some((
-        NUMBERED_MARK_PREFIX.len() + digits + '›'.len_utf8(),
-        Some(n),
-    ))
+/// Знаков метки объекта T в `‹secret-T-N›` (шестнадцатеричных, строчных).
+pub const MARK_TAG_LEN: usize = 6;
+
+/// Метка вида выдачи агенту.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark<'a> {
+    /// `‹secret›` — без личности.
+    Plain,
+    /// `‹secret-N›` — номер без метки объекта (вид круга правок 3; для записи — литерал).
+    Numbered(u32),
+    /// `‹secret-T-N›` — метка объекта и ревизии T и номер маски в объекте N.
+    Tagged(&'a str, u32),
 }
 
-/// Метки текста ([`mark_at`]) по порядку: диапазон и номер.
-pub fn marks(s: &str) -> impl Iterator<Item = (Range<usize>, Option<u32>)> + '_ {
-    // обе метки начинаются с `‹secret`
+/// Метка в начале `s`: [`SECRET_MARK`], `‹secret-N›` или `‹secret-T-N›` (T — 6 строчных
+/// шестнадцатеричных знаков, N — от 1 до 9 цифр) — её длина и вид.
+pub fn mark_at(s: &str) -> Option<(usize, Mark<'_>)> {
+    if s.starts_with(SECRET_MARK) {
+        return Some((SECRET_MARK.len(), Mark::Plain));
+    }
+    let rest = s.strip_prefix(NUMBERED_MARK_PREFIX)?;
+    let close = '›'.len_utf8();
+    let tag = rest
+        .get(..MARK_TAG_LEN)
+        .filter(|t| {
+            t.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .filter(|_| rest.as_bytes().get(MARK_TAG_LEN) == Some(&b'-'));
+    let (tag, body) = match tag {
+        Some(t) => (Some(t), &rest[MARK_TAG_LEN + 1..]),
+        None => (None, rest),
+    };
+    let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || digits > MARK_DIGITS_MAX || !body[digits..].starts_with('›') {
+        return None;
+    }
+    let n = body[..digits].parse().ok()?;
+    let len = NUMBERED_MARK_PREFIX.len() + (rest.len() - body.len()) + digits + close;
+    Some(match tag {
+        Some(t) => (len, Mark::Tagged(t, n)),
+        None => (len, Mark::Numbered(n)),
+    })
+}
+
+/// Метки текста ([`mark_at`]) по порядку: диапазон и вид.
+pub fn marks(s: &str) -> impl Iterator<Item = (Range<usize>, Mark<'_>)> + '_ {
+    // все метки начинаются с `‹secret`
     let mut from = 0;
     std::iter::from_fn(move || {
         while let Some(i) = s.get(from..)?.find("‹secret") {
             let at = from + i;
-            if let Some((len, n)) = mark_at(&s[at..]) {
+            if let Some((len, m)) = mark_at(&s[at..]) {
                 from = at + len;
-                return Some((at..at + len, n));
+                return Some((at..at + len, m));
             }
             from = at + "‹secret".len();
         }
@@ -90,7 +119,7 @@ pub fn marks(s: &str) -> impl Iterator<Item = (Range<usize>, Option<u32>)> + '_ 
     })
 }
 
-/// Есть ли в тексте метка — [`SECRET_MARK`] или `‹secret-N›`.
+/// Есть ли в тексте метка — [`SECRET_MARK`], `‹secret-N›` или `‹secret-T-N›`.
 pub fn has_any_mark(s: &str) -> bool {
     marks(s).next().is_some()
 }
@@ -336,10 +365,9 @@ const SEP_END: &str = r"(?:\*\*|__|[*_])?";
 const QUALIFIER: &str = r"[\t\p{Zs}]+\([^()\n]{1,40}\)";
 
 /// Ключ-значение; необязательная кавычка перед разделителем покрывает JSON (`"password": "…"`)
-/// [решение исполнителя], разметка Markdown вокруг ключа — [`KEY_END`], [`SEP_END`]. Уточнение в
-/// скобках перед разделителем ([`QUALIFIER`]) — отдельной веткой: после разделителя у неё только
-/// горизонтальный пробел, без перехода строки (`def token(self):` с телом ниже — не значение,
-/// круг правок 4, M1); прежняя ветка без уточнения не менялась.
+/// [решение исполнителя], разметка Markdown вокруг ключа — [`KEY_END`], [`SEP_END`], уточнение в
+/// скобках перед разделителем — [`QUALIFIER`]; значение — и на следующей строке, с уточнением и без
+/// (`password (стенд):\n  hunter…`, круг правок 5, M-d).
 ///
 /// Значение в кавычках берётся до закрывающей кавычки (пароль-фраза с пробелами); без кавычек —
 /// до пробела ([`kv_quoted`], [`kv_bare`]), от 6 символов. Словарь ключей расширен `secret_key`,
@@ -350,7 +378,7 @@ const QUALIFIER: &str = r"[\t\p{Zs}]+\([^()\n]{1,40}\)";
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     let (q, b) = (kv_quoted(6), kv_bare(6));
     rx(&format!(
-        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key){KEY_END}(?:\s*[:=]{SEP_END}\s*|{QUALIFIER}[\t\p{{Zs}}]*[:=]{SEP_END}[\t\p{{Zs}}]*)(?:{q}|{b})"#
+        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key){KEY_END}(?:{QUALIFIER})?\s*[:=]{SEP_END}\s*(?:{q}|{b})"#
     ))
 });
 

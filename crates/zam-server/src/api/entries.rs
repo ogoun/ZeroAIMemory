@@ -48,9 +48,10 @@
 //! **Агенту по токену** (задача 5 M7.1, спецификация M7 §4.3.1 п. 3,
 //! [`super::agent_view::view_entry_json_owned`]) запись в ответах — карточка, лента, ревизии, эхо
 //! создания, правки и восстановления — с метками вместо значений: в заголовке, теле, строках
-//! `data`, тегах и области — с номером `‹secret-N›` (номер маски в поле, круг правок 3 задачи 6),
+//! `data`, тегах и области — `‹secret-T-N›` (метка записи и ревизии, сквозной номер маски, круг
+//! правок 5 задачи 6),
 //! в прочих полях — `‹secret›`; `secrets_detected` — по исходнику. Сессии WebUI — исходник. Правку
-//! агента (`PATCH`) по этому виду сервер возвращает к исходнику по номерам меток (задача 6 M7.1,
+//! агента (`PATCH`) по этому виду сервер возвращает к исходнику по меткам (задача 6 M7.1,
 //! M7 §4.3.2, [`super::secret_restore`]); метка без номера маски записывается как есть с
 //! предупреждением `secret_mark_kept`.
 use axum::Json;
@@ -1059,11 +1060,15 @@ pub async fn patch(
     if agent_view::masks(&p) {
         stale_entry(&sc.entry, rev)?;
     }
-    // агент правил нумерованный вид записи: значения под `‹secret-N›` — обратно до проверок
+    // агент правил вид записи с метками: значения под `‹secret-T-N›` — обратно до проверок
     // (M7 §4.3.2), длинное тело с метками — в пуле; сессия WebUI — как есть
-    let big_body = req.body.as_ref().is_some_and(|b| {
-        b.len() + sc.entry.body.len() > agent_view::BLOCKING_FROM && secret_restore::has_mark(b)
-    });
+    let big_body = req
+        .body
+        .as_ref()
+        .or(req.append_body.as_ref())
+        .is_some_and(|b| {
+            b.len() + sc.entry.body.len() > agent_view::BLOCKING_FROM && secret_restore::has_mark(b)
+        });
     let kept = if !agent_view::masks(&p) {
         0
     } else if !big_body {
@@ -1211,10 +1216,10 @@ pub(crate) fn stale_entry(e: &Entry, rev: Option<i64>) -> Result<(), ApiError> {
     }
 }
 
-/// Правка `req` агентом по нумерованному виду записи `e` (M7 §4.3.2, задача 6 M7.1): поля
-/// [`secret_restore::EntryTexts`] — значения по номерам меток `‹secret-N›` масок того же поля
-/// записи; метки дописки `append_body` — новые. Меток без значения; правка, выводящая секрет
-/// из-под маски, — 422.
+/// Правка `req` агентом по виду записи `e` с метками (M7 §4.3.2, задача 6 M7.1): поля
+/// [`secret_restore::EntryTexts`] — значения масок записи по меткам `‹secret-T-N›` с T этой записи
+/// и ревизии, и в дописке `append_body`. Прочие метки — литералы; правка, выводящая секрет из-под
+/// маски, — 422.
 fn restore_patch(e: &Entry, req: &mut Patch) -> Result<usize, ApiError> {
     let mut data_fields = Vec::new();
     if let Some(Some(s)) = &mut req.next_step {
@@ -1226,7 +1231,7 @@ fn restore_patch(e: &Entry, req: &mut Patch) -> Result<usize, ApiError> {
     secret_restore::EntryTexts {
         title: req.title.as_mut(),
         body: req.body.as_mut(),
-        append_body: req.append_body.as_deref(),
+        append_body: req.append_body.as_mut(),
         data: req.data.as_mut(),
         data_fields,
         tags: req.tags.as_mut(),

@@ -579,7 +579,10 @@ async fn mcp_write_restores_secret() {
         .unwrap()
         .to_string();
     assert!(
-        seen.contains("token: ‹secret-1›") && !seen.contains(&s),
+        seen.contains(&format!(
+            "token: ‹secret-{}-1›",
+            zam_server::api::agent_view::object_tag(&id, 1)
+        )) && !seen.contains(&s),
         "{seen}"
     );
     let o = ok(
@@ -1001,8 +1004,13 @@ async fn vault_reveal_not_masked() {
     )
     .await;
     assert!(!o.text.contains(&value), "{}", o.text);
-    // `memory_read` — редактируемый текст: метка с номером маски (M7 §4.3.2)
-    assert!(o.text.contains("token: ‹secret-1›"), "{}", o.text);
+    // `memory_read` — редактируемый текст: метка объекта и номер маски (M7 §4.3.2)
+    let t = zam_server::api::agent_view::object_tag(&n["id"].as_str().unwrap(), 1);
+    assert!(
+        o.text.contains(&format!("token: ‹secret-{t}-1›")),
+        "{}",
+        o.text
+    );
 }
 
 /// Запись окружения без значения: `memory_vault get id=v:<id>` (ссылка дайджеста) отдаёт

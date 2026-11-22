@@ -349,7 +349,7 @@ fn flag_values(
             && ["bearer", "basic", "token", "digest"]
                 .iter()
                 .any(|w| inner.eq_ignore_ascii_case(w));
-        // уже замаскированное (и меткой с номером `‹secret-N›`): сначала дешёвый поиск первого
+        // уже замаскированное (и меткой `‹secret-T-N›` или `‹secret-N›`): сначала дешёвый поиск первого
         // знака метки
         let masked = inner.contains('\u{2039}') && crate::has_any_mark(inner);
         if inner.is_empty() || scheme || masked || is_reference(inner) || is_caps_placeholder(inner)

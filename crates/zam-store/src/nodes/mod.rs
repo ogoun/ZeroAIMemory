@@ -51,8 +51,8 @@ pub use history::{RevisionInfo, entry_snapshot_text, list_revisions, unified_dif
 pub use l0::{set_auto_l0, set_folder_l0};
 pub use read::{find_by_name, get_node, get_node_by_path, list_children, node_content};
 pub use revise::{
-    WriteError, apply_ops, patch_note, patch_note_keyed, patch_note_prepared, patch_note_within,
-    patch_replayed, revert_note, update_note, update_note_keyed,
+    WriteError, apply_ops, apply_ops_tracking, patch_note, patch_note_keyed, patch_note_prepared,
+    patch_note_within, patch_replayed, revert_note, update_note, update_note_keyed,
 };
 pub(crate) use tree_ops::move_tx;
 pub use tree_ops::{delete_node, list_trash, move_node, restore_node};

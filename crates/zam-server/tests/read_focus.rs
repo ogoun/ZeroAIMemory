@@ -528,11 +528,14 @@ async fn agent_range_offsets_on_masked_text() {
     let nid = format!("n:{n}");
     let l2 = read_ok(&a, json!({"items": [{"id": &nid}], "budget_tokens": 20000})).await;
     let l2 = l2["items"][0]["text"].as_str().unwrap().to_string();
+    let t = zam_server::api::agent_view::object_tag(&n, 1);
     assert!(
-        !l2.contains(&key) && l2.contains("‹secret-1›") && l2.contains("‹secret-2›"),
+        !l2.contains(&key)
+            && l2.contains(&format!("‹secret-{t}-1›"))
+            && l2.contains(&format!("‹secret-{t}-2›")),
         "{l2}"
     );
-    assert_eq!(l2, zam_secrets::restore::numbered_view(&text));
+    assert_eq!(l2, zam_secrets::restore::numbered_view(&t, &text));
     assert_ne!(
         l2.len(),
         text.len(),

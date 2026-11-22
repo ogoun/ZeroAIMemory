@@ -43,7 +43,7 @@
 //! Целиком без фокуса: листов не больше `focus_leaves` (`focus skipped: short`); листов нет,
 //! нарезка другой ревизии или лист не нашёлся в тексте — `focus skipped: not indexed`. Нарезка
 //! идёт по маскированному тексту ревизии: агенту по токену `/read` отдаёт фокус по нумерованному
-//! виду того же текста (задача 5 M7.1; метки `‹secret-N›` — круг правок 3 задачи 6, M7 §4.3.2
+//! виду того же текста (задача 5 M7.1; метки `‹secret-T-N›` — круги правок 3–5 задачи 6, M7 §4.3.2
 //! п. 6) — лист с `‹secret›` сопоставляется с ним с учётом номеров ([`Unnumbered`]), адреса и `~N`
 //! — по нумерованному виду; человеку в сессии WebUI текст — исходник, и лист с секретом в нём не
 //! находится.
@@ -468,7 +468,7 @@ fn next_char(text: &str, i: usize) -> usize {
     i + text[i..].chars().next().map_or(1, char::len_utf8)
 }
 
-/// Текст с метками без номеров: метка с номером `‹secret-N›` (нумерованный вид агента, M7 §4.3.2
+/// Текст с метками без номеров: метка `‹secret-T-N›` или `‹secret-N›` (вид агента, M7 §4.3.2
 /// п. 6) и литерал метки — `‹secret›`, как в листах (чанки маскированы без номеров); позиции —
 /// обратно в исходный текст ([`Unnumbered::to_src`]).
 struct Unnumbered<'t> {
@@ -490,8 +490,8 @@ impl<'t> Unnumbered<'t> {
         let mut text = String::with_capacity(src.len());
         let mut marks = Vec::new();
         let mut pos = 0;
-        for (r, n) in zam_secrets::marks(src) {
-            if n.is_none() {
+        for (r, k) in zam_secrets::marks(src) {
+            if k == zam_secrets::Mark::Plain {
                 continue;
             }
             text.push_str(&src[pos..r.start]);
@@ -524,7 +524,7 @@ impl<'t> Unnumbered<'t> {
 
 /// Байты листов в тексте `text` по порядку (поиск с начала предыдущего листа: соседние
 /// перекрываются). Лист — `src[range]` или повторённый заголовок блока + `src[range]` (тогда ищется
-/// без первых строк). Метки с номером `‹secret-N›` в тексте и литералы в листе сопоставляются как
+/// без первых строк). Метки `‹secret-T-N›` в тексте и литералы в листе сопоставляются как
 /// `‹secret›` ([`Unnumbered`]); байты — исходного `text`. Не нашёлся — `None`.
 fn locate(text: &str, leaves: &[FocusLeaf]) -> Option<Vec<(usize, usize)>> {
     let plain = Unnumbered::new(text);

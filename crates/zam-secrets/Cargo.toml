@@ -10,15 +10,12 @@ rust-version.workspace = true
 # и клиент `zam` (маскировка снимка сессии, задача 17a M6)
 [dependencies]
 regex.workspace = true
-# покрытие значений секретов в итоге записи агентом (модуль `restore`, M7 §4.3.2 п. 5): поиск
-# многих образцов одним проходом; только с фичей `restore`, клиенту `zam` не нужен
-aho-corasick = { workspace = true, optional = true }
 
 [features]
 # `zam_secrets::restore` — обратный путь маски для записи агентом (сервер): нумерованный вид
-# `‹secret-N›`, восстановление по номеру метки и проверка покрытия (M7 §4.3.2, круги правок 3–4
-# задачи 6 M7.1); клиенту `zam` не нужен
-restore = ["dep:aho-corasick"]
+# `‹secret-T-N›`, восстановление по метке и покрытие по происхождению (M7 §4.3.2, круги правок 3–5
+# задачи 6 M7.1), без зависимостей; клиенту `zam` не нужен
+restore = []
 
 [dev-dependencies]
 proptest.workspace = true

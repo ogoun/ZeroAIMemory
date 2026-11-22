@@ -237,13 +237,28 @@ pub async fn patch_replayed(
 /// Операции PATCH по тексту `current` ревизии `cur_rev`; `base` — текст `base_rev`, если она
 /// старше текущей: для операции с секцией сравниваются байты секции в обеих (до применения всей
 /// цепочки) — различаются (или секция есть только в одной) → `SectionChanged`. Общий шаг PATCH
-/// хранилища и PATCH агента по нумерованному виду (сервер переводит адреса и метки к исходнику и
+/// хранилища и PATCH агента по виду с метками (сервер переводит адреса и метки к исходнику и
 /// считает его по исходникам обеих ревизий вне транзакции писателя, задача 6 M7.1).
 pub fn apply_ops(
     base: Option<&str>,
     current: &str,
     cur_rev: i64,
     ops: &[PatchOp],
+) -> Result<String, WriteError> {
+    apply_ops_tracking(base, current, cur_rev, ops, &mut Vec::new())
+}
+
+/// [`apply_ops`], ведущий через операции диапазоны `keep` текста `current` (по возрастанию, без
+/// пересечений): диапазон до изменённого операцией места остаётся, после — сдвигается, задетый —
+/// выпадает (до и после [`zam_markdown::Applied::changed`] — байты прежнего текста). PATCH агента
+/// так проверяет покрытие масок текущей ревизии, перенесённых без правки (M7 §4.3.2 п. 5, круг
+/// правок 5 задачи 6 M7.1).
+pub fn apply_ops_tracking(
+    base: Option<&str>,
+    current: &str,
+    cur_rev: i64,
+    ops: &[PatchOp],
+    keep: &mut Vec<std::ops::Range<usize>>,
 ) -> Result<String, WriteError> {
     let mut text = current.to_string();
     for op in ops {
@@ -255,7 +270,25 @@ pub fn apply_ops(
                 current_rev: cur_rev,
             });
         }
-        text = apply_patch(&text, op)?.text;
+        let a = apply_patch(&text, op)?;
+        if !keep.is_empty() {
+            let (old_len, new_len) = (text.len(), a.text.len());
+            let start = a.changed.start;
+            // конец заменённого куска в прежнем тексте: хвост после `changed` — прежний
+            let old_end = old_len - (new_len - a.changed.end);
+            let delta = new_len as isize - old_len as isize;
+            keep.retain_mut(|r| {
+                if r.end <= start {
+                    true
+                } else if r.start >= old_end {
+                    *r = (r.start as isize + delta) as usize..(r.end as isize + delta) as usize;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        text = a.text;
     }
     Ok(text)
 }

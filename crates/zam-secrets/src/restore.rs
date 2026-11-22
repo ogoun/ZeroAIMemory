@@ -1,87 +1,107 @@
-//! Обратный путь маски для записи агентом (спецификация M7 §4.3.2, задача 6 M7.1; с круга правок
-//! 3 — **восстановление по номеру метки**, решение координатора: эвристика выравнивания кругов
-//! 1–2 давала новые случаи тихой подмены и потери значения, потому что у метки не было личности).
-//! Обвязка — `zam_server::api::secret_restore`.
+//! Обратный путь маски для записи агентом (спецификация M7 §4.3.2, задача 6 M7.1). Обвязка —
+//! `zam_server::api::secret_restore`; история решений — журнал этапа (круги правок 1–5 задачи 6,
+//! решения координатора 10).
 //!
-//! **Нумерованный вид.** Текст, который агент правит и возвращает записью, он получает видом
-//! [`FieldMasks::view`] ([`numbered_view`] — для одного текста, [`Numbering`] — без хранения
-//! значений): каждая маска поля — `‹secret-N›`, N — порядковый номер маски в поле этой ревизии
-//! (с 1), детерминированно: находки [`scan_secrets`], те же, что у [`crate::mask_text`]. Литерал
-//! метки, уже лежавший в исходнике (`‹secret›` или `‹secret-N›`: прежний `secret_mark_kept`,
-//! импорт архива с маской, текст человека), в виде — `‹secret›` без номера: номер есть только у
-//! маски со значением, и чужой номер из текста значение не подставит. Поле из нескольких строк
-//! (строки `data` записи журнала, теги) — один [`FieldMasks`]: нумерация сквозная, по порядку
-//! обхода.
+//! **Метки с личностью.** Текст, который агент правит и возвращает записью, он получает видом
+//! [`ObjectMasks::view`] ([`numbered_view`] — для объекта из одного текста, [`Numbering`] — без
+//! хранения значений): каждая маска — `‹secret-T-N›`, где T — метка объекта и ревизии (её строит
+//! вызывающий: 6 шестнадцатеричных знаков хэша `id ‖ ревизия`), N — порядковый номер маски в
+//! объекте (с 1), **сквозной по всем редактируемым полям** в постоянном порядке; находки —
+//! [`scan_secrets`], те же, что у [`crate::mask_text`]. Литерал метки, уже лежавший в исходнике
+//! (`‹secret›`, `‹secret-N›`, `‹secret-T-N›`: прежний `secret_mark_kept`, импорт архива с маской,
+//! текст человека), в виде — `‹secret›`: метка с личностью есть только у маски со значением.
 //!
-//! **Восстановление** ([`FieldMasks::restore`], [`restore`]): каждая `‹secret-N›` нового текста —
-//! значение N-й маски того же поля базы (повтор номера — повтор значения, явный выбор агента);
-//! метка без номера или с номером, которого в базе нет, записывается как есть; маска базы, номер
-//! которой не вернулся, удалена правкой, как любой текст. [`Restored::kept`] — меток без номера
-//! **сверх** числа литералов в виде базы поля (литералы из архивов с маской не предупреждают на
-//! каждой правке) плюс номера вне поля (§4.3.2 п. 2, круг правок 4). Многострочное значение
-//! (закрытый ключ) — с переводами строк нового текста.
+//! **Восстановление** ([`ObjectMasks::fill_marks`], [`ObjectMasks::restore`], [`restore`]): метка
+//! `‹secret-T-N›`, у которой T — метка этого объекта и базовой ревизии, а N — номер маски базы, —
+//! значение этой маски в любом поле объекта (перенос строки между полями сохраняет значение;
+//! повтор — повтор значения); любая другая метка (чужой T — копия из другого объекта или
+//! ревизии, номер вне базы, `‹secret›`, прежняя `‹secret-N›`) записывается как есть. Маска базы,
+//! которую агент не вернул, удалена правкой, как любой текст. Многострочное значение (закрытый
+//! ключ) — с переводами строк нового текста. Предупреждение `secret_mark_kept` поля — меток-
+//! литералов в итоге сверх их числа в исходнике текущей ревизии того же поля ([`literals_in`]).
 //!
-//! **Покрытие всего текста** ([`exposure`], §4.3.2 п. 5, круг правок 4): итог сканируется заново;
-//! у каждого секретного значения — маски исходника текущей ревизии и восстановленного — число
-//! вхождений в итоге, не покрытых находкой, не должно быть больше, чем в исходнике. Иначе
-//! (снят или открыт забор кода, `ключ: значение` переписан прозой, разобран URL — и вне правленого
-//! места) — строки итога [`Restored::exposed`]; такую правку вызывающий отклоняет (422).
-//! Вхождения всех значений — один проход Aho-Corasick, покрытие — по отсортированным находкам.
+//! **Покрытие по происхождению** ([`uncovered_lines`], §4.3.2 п. 5, круг правок 5): каждая
+//! позиция итога, где стоит значение секрета, — восстановленное из метки и маска текущей ревизии,
+//! перенесённая без правки (у `PATCH`, [`Deferred::finish`]), — должна быть целиком покрыта
+//! находкой итога; иначе — строки итога (агент сменил окружение значения: снял или открыл забор
+//! кода, переписал `ключ: значение` прозой, разобрал URL). Текст, набранный агентом, не
+//! проверяется: значения в нём нет, кроме угаданного, а угаданное агент и так знает (подсчёт
+//! вхождений строки значения круга 4 давал обход и ложные отказы на слабых значениях и оракул
+//! подбора).
 //!
 //! [`Deferred`] — значения в тексте, который собирается позже (операции `PATCH` по секциям
 //! применяются к исходнику текущей ревизии): в куски вместо значений встают заменители, после
-//! сборки — значения и та же проверка покрытия.
+//! сборки — значения и их позиции.
 //!
-//! Время — линейное: сканы исходника и итога, один проход поиска значений, один проход выбора
-//! заменителя.
+//! Время — линейное: скан исходника, скан итога и проход по упорядоченным позициям.
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use crate::{Mark, NUMBERED_MARK_PREFIX, SECRET_MARK, has_any_mark, marks, scan_secrets};
 
-use crate::{NUMBERED_MARK_PREFIX, SECRET_MARK, has_any_mark, marks, scan_secrets};
-
-/// Итог восстановления.
+/// Итог восстановления поля.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restored {
-    /// Текст со значениями на месте меток с номером маски базы.
+    /// Текст со значениями на месте меток объекта.
     pub text: String,
-    /// Меток нового текста без значения для предупреждения `secret_mark_kept`: без номера —
-    /// сверх литералов в виде базы поля, с номером вне поля — все (записаны как есть).
+    /// Предупреждение `secret_mark_kept`: меток-литералов в итоге сверх их числа в исходнике
+    /// текущей ревизии поля.
     pub kept: usize,
-    /// Строки итога (с 1, по возрастанию), где значение секрета не покрыто находкой чаще, чем в
-    /// исходнике (правка выводит секрет из-под маски).
+    /// Строки итога (с 1, по возрастанию), где значение секрета не покрыто находкой целиком.
     pub exposed: Vec<usize>,
 }
 
-impl Restored {
-    fn same(text: String) -> Self {
+/// Текст со значениями и их позициями.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filled {
+    pub text: String,
+    /// Позиции значений в `text` (восстановленных и, у [`Deferred`], перенесённых без правки), по
+    /// возрастанию.
+    pub at: Vec<Range<usize>>,
+    /// Меток-литералов в `text`.
+    pub literals: usize,
+}
+
+impl Filled {
+    /// Итог поля: предупреждение — сверх `current_literals` (литералов исходника текущей ревизии
+    /// поля), покрытие — по позициям значений.
+    pub fn into_restored(self, current_literals: usize) -> Restored {
         Restored {
-            text,
-            kept: 0,
-            exposed: Vec::new(),
+            exposed: uncovered_lines(&self.text, &self.at),
+            kept: self.literals.saturating_sub(current_literals),
+            text: self.text,
         }
     }
 }
 
-/// Есть ли в тексте метка — `‹secret›` или `‹secret-N›`: без неё восстанавливать нечего, база не
-/// сканируется.
+/// Есть ли в тексте метка (`‹secret›`, `‹secret-N›`, `‹secret-T-N›`): без неё восстанавливать
+/// нечего, база не сканируется.
 pub fn has_mark(s: &str) -> bool {
     has_any_mark(s)
 }
 
-/// Меток в тексте (`‹secret›` и `‹secret-N›`).
+/// Меток в тексте.
 pub fn marks_in(s: &str) -> usize {
     marks(s).count()
 }
 
-/// Нумерованный вид одного текста ([`FieldMasks::view`]); без находок и меток — заимствование.
-pub fn numbered_view(raw: &str) -> Cow<'_, str> {
-    Numbering::new().view(raw)
+/// Меток-литералов в исходнике `raw` — меток вне находок (в виде они `‹secret›`).
+pub fn literals_in(raw: &str) -> usize {
+    if !has_any_mark(raw) {
+        return 0;
+    }
+    let found = hits(raw);
+    marks(raw).filter(|(m, _)| !covered(&found, m)).count()
 }
 
-/// Метки с номером — `‹secret›` (вид старой ревизии и кусок нумерованного вида без номеров,
+/// Вид объекта из одного текста с метками `‹secret-T-N›` ([`ObjectMasks::view`]); без находок и
+/// меток — заимствование.
+pub fn numbered_view<'r>(tag: &str, raw: &'r str) -> Cow<'r, str> {
+    Numbering::new(tag).view(raw)
+}
+
+/// Метки с личностью и с номером — `‹secret›` (вид старой ревизии и кусок вида без меток объекта,
 /// §4.3.2 п. 1); без них — заимствование.
 pub fn unnumbered(s: &str) -> Cow<'_, str> {
     if !s.contains(NUMBERED_MARK_PREFIX) {
@@ -89,8 +109,8 @@ pub fn unnumbered(s: &str) -> Cow<'_, str> {
     }
     let mut out = String::with_capacity(s.len());
     let mut pos = 0;
-    for (m, n) in marks(s) {
-        if n.is_some() {
+    for (m, k) in marks(s) {
+        if k != Mark::Plain {
             out.push_str(&s[pos..m.start]);
             out.push_str(SECRET_MARK);
             pos = m.end;
@@ -100,61 +120,69 @@ pub fn unnumbered(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Восстановление нового текста `edited`, правленного по нумерованному виду базы `base` (одно
-/// поле; база — исходник текущей ревизии).
-pub fn restore(base: &str, edited: &str) -> Restored {
+/// Восстановление поля `edited` объекта из одного текста `base` (исходник текущей ревизии) с меткой
+/// объекта `tag`.
+pub fn restore(tag: &str, base: &str, edited: &str) -> Restored {
     if !has_mark(edited) {
-        return Restored::same(edited.to_owned());
+        return Restored {
+            text: edited.to_owned(),
+            kept: 0,
+            exposed: Vec::new(),
+        };
     }
-    FieldMasks::of(base).restore(edited)
+    let mut m = ObjectMasks::new(tag);
+    let literals = m.add(base);
+    m.fill_marks(edited).into_restored(literals)
 }
 
-/// Кусок исходника поля и его находки.
+/// Находки исходника `raw` — позиции масок (у `PATCH` — для покрытия перенесённых без правки).
+pub fn secret_ranges(raw: &str) -> Vec<Range<usize>> {
+    hits(raw)
+}
+
+/// Строки `text` (с 1, по возрастанию, без повторов), где значение на позиции из `at` (по
+/// возрастанию) не покрыто находкой `text` целиком.
+pub fn uncovered_lines(text: &str, at: &[Range<usize>]) -> Vec<usize> {
+    if at.is_empty() {
+        return Vec::new();
+    }
+    let found = hits(text);
+    let (mut line, mut pos) = (1usize, 0usize);
+    let mut out: Vec<usize> = Vec::new();
+    for r in at {
+        if covered(&found, r) {
+            continue;
+        }
+        line += text.as_bytes()[pos..r.start.max(pos)]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        pos = pos.max(r.start);
+        if out.last() != Some(&line) {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Значения масок объекта по номерам (с 1) и метка объекта и ревизии: нумерация — по порядку
+/// кусков, добавленных [`ObjectMasks::view`] или [`ObjectMasks::add`] (поля объекта в постоянном
+/// порядке).
 #[derive(Debug, Clone)]
-struct Piece<'a> {
-    raw: &'a str,
-    hits: Vec<Range<usize>>,
-}
-
-/// Значения масок поля по номерам (с 1): нумерация — по порядку кусков, добавленных
-/// [`FieldMasks::view`] или [`FieldMasks::add`]; куски с находками — для проверки покрытия.
-#[derive(Debug, Default, Clone)]
-pub struct FieldMasks<'a> {
+pub struct ObjectMasks<'a> {
+    tag: String,
     values: Vec<&'a str>,
-    pieces: Vec<Piece<'a>>,
-    /// Литералов меток в виде поля (меток исходника вне находок).
-    literals: usize,
 }
 
-/// Счёт меток нового текста.
-#[derive(Debug, Default, Clone, Copy)]
-struct Counts {
-    /// Без номера.
-    unnumbered: usize,
-    /// С номером, которого в поле нет.
-    stray: usize,
-}
-
-impl Counts {
-    /// Предупреждение: без номера — сверх `literals`, вне поля — все.
-    fn kept(self, literals: usize) -> usize {
-        self.unnumbered.saturating_sub(literals) + self.stray
-    }
-}
-
-impl<'a> FieldMasks<'a> {
-    pub fn new() -> Self {
-        FieldMasks::default()
+impl<'a> ObjectMasks<'a> {
+    pub fn new(tag: &str) -> Self {
+        ObjectMasks {
+            tag: tag.to_owned(),
+            values: Vec::new(),
+        }
     }
 
-    /// Поле из одного текста.
-    pub fn of(raw: &'a str) -> Self {
-        let mut f = FieldMasks::new();
-        f.add(raw);
-        f
-    }
-
-    /// Масок в поле.
+    /// Масок в объекте.
     pub fn len(&self) -> usize {
         self.values.len()
     }
@@ -163,132 +191,88 @@ impl<'a> FieldMasks<'a> {
         self.values.is_empty()
     }
 
-    /// Значения масок поля по порядку номеров.
+    /// Значения масок по порядку номеров.
     pub fn values(&self) -> &[&'a str] {
         &self.values
     }
 
-    /// Литералов меток в виде поля.
-    pub fn literals(&self) -> usize {
-        self.literals
+    /// Значение метки `m`: `‹secret-T-N›` с T этого объекта и N — номер маски; иначе `None`.
+    pub fn value(&self, m: Mark) -> Option<&'a str> {
+        match m {
+            Mark::Tagged(t, n) if t == self.tag => {
+                let i = (n as usize).checked_sub(1)?;
+                self.values.get(i).copied()
+            }
+            _ => None,
+        }
     }
 
-    /// Значение маски `n` (с 1).
-    pub fn value(&self, n: u32) -> Option<&'a str> {
-        let i = (n as usize).checked_sub(1)?;
-        self.values.get(i).copied()
-    }
-
-    /// Маски куска `raw` — в поле (нумерация продолжается), без вида.
-    pub fn add(&mut self, raw: &'a str) {
+    /// Маски куска `raw` — в объект (нумерация продолжается), без вида; итог — литералов в куске.
+    pub fn add(&mut self, raw: &'a str) -> usize {
         let found = hits(raw);
         for r in &found {
             self.values.push(&raw[r.clone()]);
         }
-        self.literals += marks(raw).filter(|(m, _)| !covered(&found, m)).count();
-        self.pieces.push(Piece { raw, hits: found });
+        if !has_any_mark(raw) {
+            return 0;
+        }
+        marks(raw).filter(|(m, _)| !covered(&found, m)).count()
     }
 
-    /// Нумерованный вид куска `raw` поля: маски — `‹secret-N›` (нумерация продолжается), литералы
-    /// меток исходника — `‹secret›`; без находок и меток — заимствование.
+    /// Вид куска `raw`: маски — `‹secret-T-N›` (нумерация продолжается), литералы меток —
+    /// `‹secret›`; без находок и меток — заимствование.
     pub fn view(&mut self, raw: &'a str) -> Cow<'a, str> {
-        let found = hits(raw);
-        let (view, literals) = view_into(raw, &found, |v| {
+        let tag = self.tag.clone();
+        view_into(raw, &tag, |v| {
             self.values.push(v);
             self.values.len()
-        });
-        self.literals += literals;
-        self.pieces.push(Piece { raw, hits: found });
-        view
+        })
     }
 
-    /// Восстановление куска `edited` (поле из одного куска — исходник базы), правленного по
-    /// нумерованному виду; покрытие — по исходнику поля (правило — в описании модуля).
-    pub fn restore(&self, edited: &str) -> Restored {
-        if !has_mark(edited) {
-            return Restored::same(edited.to_owned());
-        }
-        let mut c = Counts::default();
-        let text = self.fill_values(edited, &mut c);
-        let cur: Vec<(&str, &[Range<usize>])> = self
-            .pieces
-            .iter()
-            .map(|p| (p.raw, p.hits.as_slice()))
-            .collect();
-        let exposed = exposure_with(&cur, &[text.as_str()], &[])
-            .into_iter()
-            .map(|(_, l)| l)
-            .collect();
-        Restored {
-            text,
-            kept: c.kept(self.literals),
-            exposed,
-        }
-    }
-
-    /// Восстановление кусков поля `edited` (все строки поля по порядку) без проверки покрытия —
-    /// её делает вызывающий ([`exposure`]) по нужным кускам исходника; второе — предупреждение
-    /// `secret_mark_kept` поля.
-    pub fn restore_texts(&self, edited: &[&str]) -> (Vec<String>, usize) {
-        let mut c = Counts::default();
-        let texts = edited
-            .iter()
-            .map(|e| {
-                if has_mark(e) {
-                    self.fill_values(e, &mut c)
-                } else {
-                    (*e).to_owned()
-                }
-            })
-            .collect();
-        (texts, c.kept(self.literals))
-    }
-
-    /// `edited` со значениями вместо меток с номером маски поля; прочие метки — как есть (счёт —
-    /// в `c`).
-    fn fill_values(&self, edited: &str, c: &mut Counts) -> String {
+    /// `edited` со значениями вместо меток объекта и их позиции; прочие метки — как есть.
+    pub fn fill_marks(&self, edited: &str) -> Filled {
         let crlf = edited.contains("\r\n");
         let mut text = String::with_capacity(edited.len());
-        let mut pos = 0;
-        for (m, n) in marks(edited) {
+        let mut at = Vec::new();
+        let (mut pos, mut literals) = (0, 0);
+        for (m, k) in marks(edited) {
             text.push_str(&edited[pos..m.start]);
-            match n.map(|n| (n, self.value(n))) {
-                Some((_, Some(v))) => push_value(&mut text, v, crlf),
-                Some((_, None)) => {
-                    text.push_str(&edited[m.clone()]);
-                    c.stray += 1;
+            match self.value(k) {
+                Some(v) => {
+                    let s = text.len();
+                    push_value(&mut text, v, crlf);
+                    at.push(s..text.len());
                 }
                 None => {
                     text.push_str(&edited[m.clone()]);
-                    c.unnumbered += 1;
+                    literals += 1;
                 }
             }
             pos = m.end;
         }
         text.push_str(&edited[pos..]);
-        text
+        Filled { text, at, literals }
     }
 
-    /// Значения куска `edited` — в `d` на потом ([`Deferred`]): метка с номером маски поля —
-    /// заменитель, прочие — как есть (считаются для предупреждения).
+    /// Восстановление поля `edited`: предупреждение — сверх `current_literals` (литералов
+    /// исходника текущей ревизии поля), покрытие — по позициям восстановленных значений.
+    pub fn restore(&self, edited: &str, current_literals: usize) -> Restored {
+        self.fill_marks(edited).into_restored(current_literals)
+    }
+
+    /// Значения куска `edited` — в `d` на потом ([`Deferred`]): метка объекта — заменитель,
+    /// прочие — как есть.
     pub fn defer(&self, edited: &str, d: &mut Deferred<'a>) -> String {
         let mut out = String::with_capacity(edited.len());
         let mut pos = 0;
-        for (m, n) in marks(edited) {
+        for (m, k) in marks(edited) {
             out.push_str(&edited[pos..m.start]);
-            match n.map(|n| self.value(n)) {
-                Some(Some(v)) => {
+            match self.value(k) {
+                Some(v) => {
                     d.values.push(v);
                     let _ = write!(out, "{0}{1}{0}", d.sentinel, d.values.len() - 1);
                 }
-                Some(None) => {
-                    out.push_str(&edited[m.clone()]);
-                    d.counts.stray += 1;
-                }
-                None => {
-                    out.push_str(&edited[m.clone()]);
-                    d.counts.unnumbered += 1;
-                }
+                None => out.push_str(&edited[m.clone()]),
             }
             pos = m.end;
         }
@@ -296,20 +280,17 @@ impl<'a> FieldMasks<'a> {
         out
     }
 
-    /// `s` со значениями вместо меток с номером маски поля (адрес секции `PATCH` по заголовку
-    /// нумерованного вида — к заголовку исходника); прочее — как есть.
+    /// `s` со значениями вместо меток объекта (адрес секции `PATCH` по заголовку вида — к
+    /// заголовку исходника); прочее — как есть.
     pub fn fill<'s>(&self, s: &'s str) -> Cow<'s, str> {
         if !has_mark(s) {
             return Cow::Borrowed(s);
         }
         let mut out = String::with_capacity(s.len());
         let mut pos = 0;
-        for (m, n) in marks(s) {
+        for (m, k) in marks(s) {
             out.push_str(&s[pos..m.start]);
-            match n.and_then(|n| self.value(n)) {
-                Some(v) => out.push_str(v),
-                None => out.push_str(&s[m.clone()]),
-            }
+            out.push_str(self.value(k).unwrap_or(&s[m.clone()]));
             pos = m.end;
         }
         out.push_str(&s[pos..]);
@@ -317,57 +298,57 @@ impl<'a> FieldMasks<'a> {
     }
 }
 
-/// Нумерация масок поля без значений — для выдачи ([`FieldMasks::view`] без хранения значений:
+/// Нумерация масок объекта без значений — для выдачи ([`ObjectMasks::view`] без хранения значений:
 /// вид строится на месте, исходник заменяется видом).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Numbering {
+    tag: String,
     n: usize,
 }
 
 impl Numbering {
-    pub fn new() -> Self {
-        Numbering { n: 0 }
+    pub fn new(tag: &str) -> Self {
+        Numbering {
+            tag: tag.to_owned(),
+            n: 0,
+        }
     }
 
-    /// Нумерованный вид куска `raw` поля (нумерация продолжается) — как [`FieldMasks::view`].
+    /// Вид куска `raw` объекта (нумерация продолжается) — как [`ObjectMasks::view`].
     pub fn view<'r>(&mut self, raw: &'r str) -> Cow<'r, str> {
-        view_into(raw, &hits(raw), |_| {
+        let tag = self.tag.clone();
+        view_into(raw, &tag, |_| {
             self.n += 1;
             self.n
         })
-        .0
     }
 }
 
-/// Нумерованный вид `raw` с находками `found`: маска — `‹secret-N›`, `N` — от `take(значение)`;
-/// литералы меток — `‹secret›` (их число — второе); без находок и меток — заимствование.
-fn view_into<'r>(
-    raw: &'r str,
-    found: &[Range<usize>],
-    mut take: impl FnMut(&'r str) -> usize,
-) -> (Cow<'r, str>, usize) {
+/// Вид `raw`: маска — `‹secret-T-N›` (`N` — от `take(значение)`), литералы меток — `‹secret›`;
+/// без находок и меток — заимствование.
+fn view_into<'r>(raw: &'r str, tag: &str, mut take: impl FnMut(&'r str) -> usize) -> Cow<'r, str> {
+    let found = hits(raw);
     if found.is_empty() && !has_any_mark(raw) {
-        return (Cow::Borrowed(raw), 0);
+        return Cow::Borrowed(raw);
     }
-    let mut out = String::with_capacity(raw.len() + found.len() * 4);
-    let (mut pos, mut literals) = (0, 0);
+    let mut out = String::with_capacity(raw.len() + found.len() * 12);
+    let mut pos = 0;
     for r in found {
-        literals += push_plain(&raw[pos..r.start], &mut out);
+        push_plain(&raw[pos..r.start], &mut out);
         let n = take(&raw[r.clone()]);
-        let _ = write!(out, "{NUMBERED_MARK_PREFIX}{n}›");
+        let _ = write!(out, "{NUMBERED_MARK_PREFIX}{tag}-{n}›");
         pos = r.end;
     }
-    literals += push_plain(&raw[pos..], &mut out);
-    (Cow::Owned(out), literals)
+    push_plain(&raw[pos..], &mut out);
+    Cow::Owned(out)
 }
 
-/// Значения, отложенные до сборки текста ([`FieldMasks::defer`]): в кусках — заменители
+/// Значения, отложенные до сборки текста ([`ObjectMasks::defer`]): в кусках — заменители
 /// `<знак><индекс><знак>`, знак — из области частного использования Unicode, которого нет ни в
-/// одном тексте сборки; [`Deferred::finish`] ставит значения и проверяет покрытие итога.
+/// одном тексте сборки; [`Deferred::finish`] ставит значения.
 #[derive(Debug)]
 pub struct Deferred<'a> {
     values: Vec<&'a str>,
-    counts: Counts,
     sentinel: char,
 }
 
@@ -391,151 +372,60 @@ impl<'a> Deferred<'a> {
         let i = used.iter().position(|u| !u)?;
         Some(Deferred {
             values: Vec::new(),
-            counts: Counts::default(),
             sentinel: char::from_u32(base + i as u32)?,
         })
     }
 
-    /// Итог: значения вместо заменителей в собранном тексте `text`; предупреждение — сверх
-    /// `literals` (литералов в виде базы поля); покрытие — по исходнику текущей ревизии `current`
-    /// (значения его масок и поставленные).
-    pub fn finish(self, text: &str, current: &str, literals: usize) -> Restored {
-        let kept = self.counts.kept(literals);
+    /// Итог: значения вместо заменителей в собранном тексте `text` и позиции значений —
+    /// поставленных и масок текущей ревизии, перенесённых без правки (`keep` — их позиции в
+    /// `text`, по возрастанию, вне заменителей).
+    pub fn finish(self, text: &str, keep: &[Range<usize>]) -> Filled {
         let crlf = text.contains("\r\n");
         let mut out = String::with_capacity(text.len());
-        let mut rest = text;
+        let mut at: Vec<Range<usize>> = Vec::new();
+        // сдвиг позиций `text` → итог после каждого поставленного значения
+        let mut shifts: Vec<(usize, isize)> = Vec::new();
         let s = self.sentinel;
         let w = s.len_utf8();
-        while let Some(i) = rest.find(s) {
-            let after = &rest[i + w..];
-            let Some(j) = after.find(s) else { break };
-            match after[..j]
+        let mut pos = 0usize;
+        while let Some(i) = text[pos..].find(s).map(|i| pos + i) {
+            let after = i + w;
+            let Some(j) = text[after..].find(s).map(|j| after + j) else {
+                break;
+            };
+            match text[after..j]
                 .parse::<usize>()
                 .ok()
                 .and_then(|k| self.values.get(k))
             {
                 Some(v) => {
-                    out.push_str(&rest[..i]);
+                    out.push_str(&text[pos..i]);
+                    let start = out.len();
                     push_value(&mut out, v, crlf);
-                    rest = &after[j + w..];
+                    at.push(start..out.len());
+                    pos = j + w;
+                    shifts.push((pos, out.len() as isize - pos as isize));
                 }
                 None => {
-                    out.push_str(&rest[..i + w]);
-                    rest = after;
+                    out.push_str(&text[pos..after]);
+                    pos = after;
                 }
             }
         }
-        out.push_str(rest);
-        let exposed = exposure(&[current], &[out.as_str()], &self.values)
-            .into_iter()
-            .map(|(_, l)| l)
-            .collect();
-        Restored {
+        out.push_str(&text[pos..]);
+        for r in keep {
+            let k = shifts.partition_point(|&(p, _)| p <= r.start);
+            let d = if k == 0 { 0 } else { shifts[k - 1].1 };
+            let (a, b) = (r.start as isize + d, r.end as isize + d);
+            at.push(a as usize..b as usize);
+        }
+        at.sort_unstable_by_key(|r| (r.start, r.end));
+        Filled {
+            literals: marks_in(&out),
             text: out,
-            kept,
-            exposed,
+            at,
         }
     }
-}
-
-/// Покрытие всего текста (§4.3.2 п. 5): у каждого значения — маски кусков `current` (исходник
-/// текущей ревизии) и `extra` (восстановленные) — вхождений в кусках `new`, не покрытых находкой,
-/// не больше, чем в `current`. Итог — `(кусок new, строка с 1)` непокрытых вхождений значений,
-/// где их больше (по возрастанию, без повторов); пусто — правка значений не открывает.
-pub fn exposure(current: &[&str], new: &[&str], extra: &[&str]) -> Vec<(usize, usize)> {
-    let found: Vec<Vec<Range<usize>>> = current.iter().map(|c| hits(c)).collect();
-    let cur: Vec<(&str, &[Range<usize>])> = current
-        .iter()
-        .zip(&found)
-        .map(|(c, h)| (*c, h.as_slice()))
-        .collect();
-    exposure_with(&cur, new, extra)
-}
-
-/// [`exposure`] с находками кусков `current`, уже известными.
-fn exposure_with(
-    current: &[(&str, &[Range<usize>])],
-    new: &[&str],
-    extra: &[&str],
-) -> Vec<(usize, usize)> {
-    let mut uniq: Vec<&str> = current
-        .iter()
-        .flat_map(|(raw, h)| h.iter().map(|r| &raw[r.clone()]))
-        .chain(extra.iter().copied())
-        .filter(|v| !v.is_empty())
-        .collect();
-    uniq.sort_unstable();
-    uniq.dedup();
-    if uniq.is_empty() {
-        return Vec::new();
-    }
-    // образцы: значение, у многострочного — ещё с `\n` и с `\r\n` (окончания итога — как у правки)
-    let mut pats: Vec<Cow<str>> = Vec::with_capacity(uniq.len());
-    let mut owner: Vec<usize> = Vec::with_capacity(uniq.len());
-    for (i, v) in uniq.iter().enumerate() {
-        pats.push(Cow::Borrowed(v));
-        owner.push(i);
-        if v.contains(['\r', '\n']) {
-            let lf = v.replace("\r\n", "\n").replace('\r', "\n");
-            let crlf = lf.replace('\n', "\r\n");
-            for p in [lf, crlf] {
-                if p != *v {
-                    pats.push(Cow::Owned(p));
-                    owner.push(i);
-                }
-            }
-        }
-    }
-    let Ok(ac) = AhoCorasick::builder()
-        .match_kind(MatchKind::Standard)
-        .build(pats.iter().map(|p| p.as_ref()))
-    else {
-        // автомат не строится (предел размера) — безопасный путь: отказ
-        return vec![(0, 1)];
-    };
-    let mut open_cur = vec![0usize; uniq.len()];
-    for (raw, h) in current {
-        for m in ac.find_overlapping_iter(*raw) {
-            if !covered(h, &m.range()) {
-                open_cur[owner[m.pattern().as_usize()]] += 1;
-            }
-        }
-    }
-    let mut open_new = vec![0usize; uniq.len()];
-    // непокрытые вхождения итога: (кусок, начало, значение)
-    let mut open: Vec<(usize, usize, usize)> = Vec::new();
-    for (k, text) in new.iter().enumerate() {
-        let h = hits(text);
-        for m in ac.find_overlapping_iter(*text) {
-            if !covered(&h, &m.range()) {
-                let v = owner[m.pattern().as_usize()];
-                open_new[v] += 1;
-                open.push((k, m.start(), v));
-            }
-        }
-    }
-    open.retain(|&(_, _, v)| open_new[v] > open_cur[v]);
-    if open.is_empty() {
-        return Vec::new();
-    }
-    open.sort_unstable();
-    // номера строк — нарастающим итогом по каждому куску
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(open.len());
-    let (mut piece, mut line, mut pos) = (usize::MAX, 1usize, 0usize);
-    for (k, at, _) in open {
-        if k != piece {
-            (piece, line, pos) = (k, 1, 0);
-        }
-        line += new[k].as_bytes()[pos..at]
-            .iter()
-            .filter(|&&b| b == b'\n')
-            .count();
-        pos = at;
-        if out.last() != Some(&(k, line)) {
-            out.push((k, line));
-        }
-    }
-    out
 }
 
 /// Диапазон `r` целиком внутри одной из находок `hits` (по возрастанию, без пересечений).
@@ -565,18 +455,15 @@ fn hits(raw: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// Кусок исходника без находок — в вид: литералы меток (`‹secret›`, `‹secret-N›`) — `‹secret›`;
-/// их число.
-fn push_plain(piece: &str, out: &mut String) -> usize {
-    let (mut pos, mut n) = (0, 0);
+/// Кусок исходника без находок — в вид: литералы меток — `‹secret›`.
+fn push_plain(piece: &str, out: &mut String) {
+    let mut pos = 0;
     for (m, _) in marks(piece) {
         out.push_str(&piece[pos..m.start]);
         out.push_str(SECRET_MARK);
         pos = m.end;
-        n += 1;
     }
     out.push_str(&piece[pos..]);
-    n
 }
 
 /// Значение `v` в итог: многострочное — с переводами строк нового текста (`crlf` — `\r\n`).
