@@ -550,8 +550,8 @@ async fn mcp_write_conflict_is_tool_error() {
     assert!(o.text.contains("useful"), "{}", o.text);
 }
 
-/// `memory_write` по маскированному тексту (задача 6 M7.1, M7 §4.3.2) — то же, что `PUT` и
-/// `PATCH` REST: значения под `‹secret›` в базе на месте (чтение сессией WebUI), новая метка —
+/// `memory_write` по нумерованному виду (задача 6 M7.1, M7 §4.3.2) — то же, что `PUT` и `PATCH`
+/// REST: значения под `‹secret-N›` в базе на месте (чтение сессией WebUI), метка без номера —
 /// литерал с предупреждением `secret_mark_kept` в ответе инструмента.
 #[tokio::test]
 async fn mcp_write_restores_secret() {
@@ -578,7 +578,10 @@ async fn mcp_write_restores_secret() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(seen.contains(mark) && !seen.contains(&s), "{seen}");
+    assert!(
+        seen.contains("token: ‹secret-1›") && !seen.contains(&s),
+        "{seen}"
+    );
     let o = ok(
         &a,
         &a.token,
@@ -958,7 +961,7 @@ async fn mcp_vault_get_audited() {
 }
 
 /// Маскировка выдачи агенту (задача 5 M7.1, спецификация M7 §4.3.1) MCP покрывает сквозным
-/// REST с тем же bearer: `memory_read` заметки с ключом — `‹secret›` вместо значения; раскрытие
+/// REST с тем же bearer: `memory_read` заметки с ключом — `‹secret-N›` вместо значения; раскрытие
 /// Vault (`memory_vault get`) — способ получить ключ — отдаёт значение как есть.
 #[tokio::test]
 async fn vault_reveal_not_masked() {
@@ -984,7 +987,7 @@ async fn vault_reveal_not_masked() {
     )
     .await;
     assert!(o.text.contains(&value), "раскрытие — как есть: {}", o.text);
-    assert!(!o.text.contains("‹secret›"), "{}", o.text);
+    assert!(!zam_secrets::has_any_mark(&o.text), "{}", o.text);
     // заметка с тем же ключом: чтение через MCP — маска
     let n = a
         .note("knowledge", "ops/ci", &format!("# CI\n\ntoken: {value}\n"))
@@ -998,7 +1001,8 @@ async fn vault_reveal_not_masked() {
     )
     .await;
     assert!(!o.text.contains(&value), "{}", o.text);
-    assert!(o.text.contains("token: ‹secret›"), "{}", o.text);
+    // `memory_read` — редактируемый текст: метка с номером маски (M7 §4.3.2)
+    assert!(o.text.contains("token: ‹secret-1›"), "{}", o.text);
 }
 
 /// Запись окружения без значения: `memory_vault get id=v:<id>` (ссылка дайджеста) отдаёт

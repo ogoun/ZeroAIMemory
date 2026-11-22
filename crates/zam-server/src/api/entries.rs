@@ -46,11 +46,12 @@
 //! попадает.
 //!
 //! **Агенту по токену** (задача 5 M7.1, спецификация M7 §4.3.1 п. 3,
-//! [`super::agent_view::ENTRY_FIELDS`]) запись в ответах — карточка, лента, ревизии, эхо создания,
-//! правки и восстановления — с `‹secret›` вместо значений в заголовке, теле и строках `data`;
-//! `secrets_detected` — по исходнику. Сессии WebUI — исходник. Правку агента (`PATCH`) по этому
-//! виду сервер возвращает к исходнику (задача 6 M7.1, M7 §4.3.2, [`super::secret_restore`]):
-//! значения под `‹secret›` на прежних местах сохраняются, новая метка записывается как есть с
+//! [`super::agent_view::view_entry_json_owned`]) запись в ответах — карточка, лента, ревизии, эхо
+//! создания, правки и восстановления — с метками вместо значений: в заголовке, теле, строках
+//! `data`, тегах и области — с номером `‹secret-N›` (номер маски в поле, круг правок 3 задачи 6),
+//! в прочих полях — `‹secret›`; `secrets_detected` — по исходнику. Сессии WebUI — исходник. Правку
+//! агента (`PATCH`) по этому виду сервер возвращает к исходнику по номерам меток (задача 6 M7.1,
+//! M7 §4.3.2, [`super::secret_restore`]); метка без номера маски записывается как есть с
 //! предупреждением `secret_mark_kept`.
 use axum::Json;
 use axum::body::Bytes;
@@ -68,7 +69,7 @@ use zam_store::{
     restore_entry, update_entry, usage_counts,
 };
 
-use super::agent_view::{self, ENTRY_FIELDS};
+use super::agent_view;
 use super::insights::{entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
 use super::render::Viewer;
@@ -489,7 +490,7 @@ pub async fn create(
         super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &entry.title, &entry.body)
             .await?,
     );
-    let mut v = agent_view::view_json_owned(&p, v, ENTRY_FIELDS).await?;
+    let mut v = agent_view::view_entry_json_owned(&p, v).await?;
     agent_view::view_json(&p, &mut v, &["warnings"]);
     secret_restore::attach_kept(&mut v, kept);
     Ok((status, Json(v)))
@@ -727,7 +728,7 @@ pub async fn list(
         super::reports::view::report_feed(&sc.db, &items, &mut out, viewer).await?;
     }
     // лента до 200 записей с телами — маска одним проходом, длинная — в пуле
-    let out = agent_view::view_json_owned(&p, Value::Array(out), ENTRY_FIELDS).await?;
+    let out = agent_view::view_entry_json_owned(&p, Value::Array(out)).await?;
     Ok(Json(json!({ "items": out, "next_cursor": next })))
 }
 
@@ -1058,7 +1059,7 @@ pub async fn patch(
     if agent_view::masks(&p) {
         stale_entry(&sc.entry, rev)?;
     }
-    // агент правил маскированный вид записи: значения под `‹secret›` — обратно до проверок
+    // агент правил нумерованный вид записи: значения под `‹secret-N›` — обратно до проверок
     // (M7 §4.3.2), длинное тело с метками — в пуле; сессия WebUI — как есть
     let big_body = req.body.as_ref().is_some_and(|b| {
         b.len() + sc.entry.body.len() > agent_view::BLOCKING_FROM && secret_restore::has_mark(b)
@@ -1210,10 +1211,10 @@ pub(crate) fn stale_entry(e: &Entry, rev: Option<i64>) -> Result<(), ApiError> {
     }
 }
 
-/// Правка `req` агентом по маскированному виду записи `e` (M7 §4.3.2, задача 6 M7.1): поля
-/// [`secret_restore::EntryTexts`] — значения под `‹secret›`, оставшимися напротив меток прежнего
-/// текста, восстанавливаются; метки дописки `append_body` — новые. Меток без пары; правка,
-/// выводящая секрет из-под маски, — 422.
+/// Правка `req` агентом по нумерованному виду записи `e` (M7 §4.3.2, задача 6 M7.1): поля
+/// [`secret_restore::EntryTexts`] — значения по номерам меток `‹secret-N›` масок того же поля
+/// записи; метки дописки `append_body` — новые. Меток без значения; правка, выводящая секрет
+/// из-под маски, — 422.
 fn restore_patch(e: &Entry, req: &mut Patch) -> Result<usize, ApiError> {
     let mut data_fields = Vec::new();
     if let Some(Some(s)) = &mut req.next_step {
@@ -1303,9 +1304,7 @@ pub async fn restore(
         audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
-    Ok(Json(
-        agent_view::view_json_owned(&p, json!(e), ENTRY_FIELDS).await?,
-    ))
+    Ok(Json(agent_view::view_entry_json_owned(&p, json!(e)).await?))
 }
 
 /// `GET /entries/{id}/revisions` → `{items}` по возрастанию номера.
@@ -1319,7 +1318,7 @@ pub async fn revisions(
     live_entry(&sc)?;
     let items = entry_revisions(&sc.db, sc.entry.id).await?;
     // все ревизии с телами (до 1 МБ каждое) — длинные маскируются в пуле
-    let items = agent_view::view_json_owned(&p, json!(items), ENTRY_FIELDS).await?;
+    let items = agent_view::view_entry_json_owned(&p, json!(items)).await?;
     Ok(Json(json!({ "items": items })))
 }
 

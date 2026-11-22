@@ -98,7 +98,9 @@
 //! по токену текст узла (L0, L1, L2, `section`, фокус, `range`, дифф `since_rev`) и записи
 //! журнала (заголовок, L0, L1, L2, `section`, дифф снимков) — с `‹secret›` вместо значения; маска
 //! накладывается на всю ревизию **до** нарезки, смещения `range`, пропуски фокуса и их `~N` — по
-//! маскированному тексту. Сессии WebUI — исходник. Вложения — текст чанков (маскирован при
+//! маскированному тексту. Текст для правки (L2, `section`, `range`, фокус, L1 узла; заголовок и
+//! тело записи) — нумерованный вид `‹secret-N›` (M7 §4.3.2, круг правок 3 задачи 6): по номеру
+//! запись агента вернёт значение. Сессии WebUI — исходник. Вложения — текст чанков (маскирован при
 //! нарезке); имена файлов и пути — как есть.
 //!
 //! Маршрут — служебный, не в `memory_routes`: `/read` читает память и не пишет в неё, потому
@@ -566,9 +568,9 @@ async fn fetch_node(
             }
             Err(e) => return Err(e.into()),
         };
-        // агенту — маска всей ревизии, затем срез: адрес выдан по маскированному тексту, а маска
-        // куска исходника — не кусок маски
-        let text = agent_view::view_owned(p, text).await?;
+        // агенту — нумерованный вид всей ревизии (`‹secret-N›`, M7 §4.3.2 п. 6), затем срез:
+        // адрес выдан по этому виду, а маска куска исходника — не кусок маски
+        let text = agent_view::edit_view_owned(p, text).await?;
         let piece = byte_range(&text, a, b, rev)?.to_string();
         if rev != node.current_rev {
             warnings.push(format!("range: rev{rev}, текущая rev{}", node.current_rev));
@@ -578,10 +580,11 @@ async fn fetch_node(
         range_rev = Some(rev);
         Content::plain(piece, false)
     } else {
-        // ровно та ревизия, что в снимке узла; агенту — маска всей ревизии до секции, фокуса и
-        // L1 (листы нарезаны по тому же маскированному тексту — фокус их находит)
+        // ровно та ревизия, что в снимке узла; агенту — нумерованный вид всей ревизии
+        // (`‹secret-N›`: по номеру запись вернёт значение, M7 §4.3.2) до секции, фокуса и L1
+        // (листы нарезаны по маскированному тексту — фокус сопоставляет их с номерами)
         let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
-        let text = agent_view::view_owned(p, text).await?;
+        let text = agent_view::edit_view_owned(p, text).await?;
         let (text, whole) = match section {
             Some(s) => (slice(&text, s)?.to_string(), false),
             None => (text, true),
@@ -723,8 +726,8 @@ async fn fetch_entry(
                 Some("range — только у заметки (адрес пропуска фокуса)".into()),
             )));
         }
-        // тело целиком — маской до секции и L1
-        let body = agent_view::view_owned(p, e.body.clone()).await?;
+        // тело целиком — нумерованным видом (поле `body` записи) до секции и L1
+        let body = agent_view::edit_view_owned(p, e.body.clone()).await?;
         let (text, whole) = match section {
             Some(s) => (slice(&body, s)?.to_string(), false),
             None => (body, true),
@@ -738,7 +741,7 @@ async fn fetch_entry(
             _ => Content::plain(text, whole),
         }
     };
-    let title = agent_view::view(p, &e.title).into_owned();
+    let title = agent_view::edit_view(p, &e.title).into_owned();
     let (letter, kind) = (e.kind.ref_letter(), e.kind.as_str());
     let reference = format!("{letter}:{}", e.id);
     let target = TargetRef {

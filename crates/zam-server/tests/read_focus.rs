@@ -507,10 +507,11 @@ async fn focus_not_indexed_and_few_leaves() {
 }
 
 /// Агенту по токену (задача 5 M7.1, спецификация M7 §4.3.1) фокус заметки с секретом работает:
-/// текст ревизии маскируется целиком до фокуса, листы (нарезка — по тому же маскированному
-/// тексту) находятся — не `not indexed`; куски, пропуски, их адреса и `~N` — по маскированному
-/// тексту; адрес `range` из пропуска дочитывается тем же токеном и равен срезу маскированного L2
-/// (дочитывание маскирует всю ревизию и режет). Значения нет нигде в ответах.
+/// текст ревизии — нумерованный вид целиком до фокуса (`‹secret-N›`, M7 §4.3.2 п. 6, круг правок 3
+/// задачи 6), листы (нарезка — по маскированному тексту без номеров) сопоставляются с ним с учётом
+/// номеров — не `not indexed`; куски, пропуски, их адреса и `~N` — по нумерованному виду; адрес
+/// `range` из пропуска дочитывается тем же токеном и равен срезу нумерованного L2 (дочитывание
+/// нумерует всю ревизию и режет). Значения нет нигде в ответах.
 #[tokio::test]
 async fn agent_range_offsets_on_masked_text() {
     let a = api("focus-masked", |_| {}).await;
@@ -527,8 +528,11 @@ async fn agent_range_offsets_on_masked_text() {
     let nid = format!("n:{n}");
     let l2 = read_ok(&a, json!({"items": [{"id": &nid}], "budget_tokens": 20000})).await;
     let l2 = l2["items"][0]["text"].as_str().unwrap().to_string();
-    assert!(!l2.contains(&key) && l2.contains("‹secret›"), "{l2}");
-    assert_eq!(l2, zam_markdown::mask_text(&text));
+    assert!(
+        !l2.contains(&key) && l2.contains("‹secret-1›") && l2.contains("‹secret-2›"),
+        "{l2}"
+    );
+    assert_eq!(l2, zam_secrets::restore::numbered_view(&text));
     assert_ne!(
         l2.len(),
         text.len(),
@@ -553,7 +557,7 @@ async fn agent_range_offsets_on_masked_text() {
     for x in &s {
         let got = reread_exact(&a, &nid, &l2, x).await;
         assert!(!got.contains(&key), "{x:?}: {got}");
-        seen_mark |= got.contains("‹secret›");
+        seen_mark |= zam_secrets::has_any_mark(&got);
     }
     assert!(seen_mark, "маска — в пропущенном: {s:?}");
     // md — то же, без значения

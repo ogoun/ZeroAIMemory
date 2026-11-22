@@ -37,8 +37,8 @@
 //! `supersedes_id` и повторе по ключу) **[решение исполнителя]**; при замещении — ещё
 //! `superseded` (старая запись).
 //!
-//! Замещение агентом (`supersedes_id`, [`supersede`]) пишется по маскированному виду старой
-//! записи: значения под `‹secret›` возвращаются по ней (задача 6 M7.1, M7 §4.3.2,
+//! Замещение агентом (`supersedes_id`, [`supersede`]) пишется по нумерованному виду старой
+//! записи: значения под `‹secret-N›` возвращаются по её маскам (задача 6 M7.1, M7 §4.3.2,
 //! [`super::secret_restore`]), новая метка — как есть с `secret_mark_kept`.
 //!
 //! **Операции:** `POST /entries/{id}/supersede {новая запись}` → 201 `{entry, superseded}`;
@@ -673,11 +673,11 @@ async fn decision_vector(
 /// Запись как JSON: у insight — её триггеры (`triggers` — массив, у не-insight — нет поля), у
 /// задачи — поля [`super::tasks::attach_task`] (длительность, идеи плана — видимые с ролью `role`,
 /// [`super::tasks::idea_spaces`]). Агенту `p` по токену — с маской секретов
-/// ([`agent_view::ENTRY_FIELDS`], задача 5 M7.1; длинное тело — в пуле блокирующих задач);
-/// сессии WebUI — исходник.
+/// ([`agent_view::view_entry_json_owned`]: редактируемые поля — `‹secret-N›`, задача 5 и круг
+/// правок 3 задачи 6 M7.1; длинное тело — в пуле блокирующих задач); сессии WebUI — исходник.
 pub async fn entry_json(p: &Principal, db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
     let v = entry_json_raw(db, e, role).await?;
-    agent_view::view_json_owned(p, v, agent_view::ENTRY_FIELDS).await
+    agent_view::view_entry_json_owned(p, v).await
 }
 
 /// [`entry_json`] без маски (исходник для любого зрителя).
@@ -801,10 +801,9 @@ fn duplicate(candidates: Vec<DedupCandidate>, mode: DedupMode) -> ApiError {
     }
 }
 
-/// Новая запись `req` агента по маскированному виду замещаемой `old` (M7 §4.3.2, задача 6 M7.1):
-/// поля [`secret_restore::EntryTexts`] — значения под `‹secret›`, оставшимися напротив меток
-/// старой записи, восстанавливаются. Меток без пары; правка, выводящая секрет из-под маски, —
-/// 422.
+/// Новая запись `req` агента по нумерованному виду замещаемой `old` (M7 §4.3.2, задача 6 M7.1):
+/// поля [`secret_restore::EntryTexts`] — значения по номерам меток `‹secret-N›` масок того же
+/// поля старой записи. Меток без значения; правка, выводящая секрет из-под маски, — 422.
 fn restore_req(old: &Entry, req: &mut InsightReq) -> Result<usize, ApiError> {
     secret_restore::EntryTexts {
         title: Some(&mut req.title),
@@ -928,7 +927,7 @@ pub async fn create(
         let mut v = entry_json(p, &sc.db, &n, sc.role).await?;
         attach_secrets(p, &mut v, &n, &o);
         let old_v = serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
-        v["superseded"] = agent_view::view_json_owned(p, old_v, agent_view::ENTRY_FIELDS).await?;
+        v["superseded"] = agent_view::view_entry_json_owned(p, old_v).await?;
         if kind == EntryKind::Insight {
             v["dedup"] = json!(DedupMode::Skipped.as_str());
             let w = alias_warnings(st, &sc.db, sc.space.id, &n.title, &n.body).await?;

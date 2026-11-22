@@ -76,8 +76,30 @@ async fn secret_in_note_not_in_fts_nor_qdrant_text() {
     assert_eq!(hits, 0);
 }
 
-/// Метка значения секрета в выдаче агенту.
+/// Метка значения секрета в выдаче агенту (нередактируемая выдача, метка без номера).
 const MARK: &str = "‹secret›";
+
+/// Метка с номером N — маска в редактируемой выдаче агенту (L2, поля записи; M7 §4.3.2, круг
+/// правок 3 задачи 6 M7.1).
+fn mk(n: u32) -> String {
+    format!("‹secret-{n}›")
+}
+
+/// Есть ли в тексте метка (с номером или без).
+trait HasMark {
+    fn has_mark(&self) -> bool;
+}
+
+impl HasMark for str {
+    fn has_mark(&self) -> bool {
+        zam_secrets::has_any_mark(self)
+    }
+}
+
+/// Нумерованный вид — редактируемая выдача агенту.
+fn numbered(s: &str) -> String {
+    zam_secrets::restore::numbered_view(s).into_owned()
+}
 
 /// `GET /nodes/{id}`: по токену — текст с маской (задача 5 M7.1; до неё — исходник), сессии
 /// WebUI — исходник; ETag — ревизия у обоих (он же `If-Match` записи).
@@ -91,9 +113,12 @@ async fn note_read_masked_for_token_original_for_session() {
     let uri = format!("/api/v1/nodes/{id}");
     let r = a.t(Method::GET, &uri, None).await;
     assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.json()["content"], format!("# Ключи\n\ntoken: {MARK}\n"));
+    assert_eq!(
+        r.json()["content"],
+        format!("# Ключи\n\ntoken: {}\n", mk(1))
+    );
     let md = a.t(Method::GET, &format!("{uri}?format=md"), None).await;
-    assert_eq!(md.text(), format!("# Ключи\n\ntoken: {MARK}\n"));
+    assert_eq!(md.text(), format!("# Ключи\n\ntoken: {}\n", mk(1)));
     assert_eq!(md.header("etag"), "\"1\"");
     let r = a.adm(Method::GET, &uri, None, None).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
@@ -145,13 +170,10 @@ async fn agent_read_masks_l2_l1_section() {
             r.json()["items"][0]["text"].as_str().unwrap().to_string()
         }
     };
-    assert_eq!(
-        read(items[0].clone()).await,
-        zam_markdown::mask_text(&content)
-    );
+    assert_eq!(read(items[0].clone()).await, numbered(&content));
     assert_eq!(
         read(items[3].clone()).await,
-        format!("## Доступ\n\ntoken: {MARK}\n\n")
+        format!("## Доступ\n\ntoken: {}\n\n", mk(1))
     );
     // человеку — исходник
     let r = a
@@ -200,7 +222,7 @@ async fn agent_since_rev_diff_masked() {
             .await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.text());
         let t = r.text();
-        assert!(clean(&t) && t.contains(MARK), "{fmt}: {t}");
+        assert!(clean(&t) && t.has_mark(), "{fmt}: {t}");
     }
     for uri in [
         format!("/api/v1/nodes/{id}/diff?from=1&to=2"),
@@ -210,7 +232,7 @@ async fn agent_since_rev_diff_masked() {
         let r = a.t(Method::GET, &uri, None).await;
         assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
         assert!(
-            clean(&r.text()) && r.text().contains(MARK),
+            clean(&r.text()) && r.text().has_mark(),
             "{uri}: {}",
             r.text()
         );
@@ -321,7 +343,7 @@ async fn entry_body_secret_masked() {
     assert!(!j["secrets_detected"].to_string().contains(&s));
     assert!(!j["secrets_hint"].to_string().contains(&s));
     assert!(!j.to_string().contains(&s), "{j}");
-    assert!(j["body"].as_str().unwrap().contains(MARK), "{j}");
+    assert!(j["body"].as_str().unwrap().has_mark(), "{j}");
     let id: Id = j["id"].as_str().unwrap().parse().unwrap();
     // исходное тело записи не меняется: сессия WebUI читает его как есть
     let r = a
@@ -431,7 +453,7 @@ async fn agent_entries_masked() {
     .await;
     assert!(!r.text().contains(&s), "эхо POST: {}", r.text());
     let j = r.json();
-    assert!(j["title"].as_str().unwrap().contains(MARK), "{j}");
+    assert!(j["title"].as_str().unwrap().has_mark(), "{j}");
     let gotcha = j["id"].as_str().unwrap().to_string();
     // секрет в строке `data`
     let r = post(json!({"kind": "insight", "title": "Опыт с ротацией ключей",
@@ -465,7 +487,7 @@ async fn agent_entries_masked() {
         let r = a.t(Method::GET, &uri, None).await;
         assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
         assert!(!r.text().contains(&s), "{uri}: {}", r.text());
-        assert!(r.text().contains(MARK), "{uri}: {}", r.text());
+        assert!(r.text().has_mark(), "{uri}: {}", r.text());
         // человеку — исходник
         let r = a.adm(Method::GET, &uri, None, None).await;
         assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
@@ -503,7 +525,7 @@ async fn agent_entries_masked() {
         assert_eq!(r.status, StatusCode::OK, "{}", r.text());
         assert!(r.text().contains(&gotcha), "{fmt}: {}", r.text());
         assert!(!r.text().contains(&s), "{fmt}: {}", r.text());
-        assert!(r.text().contains(MARK), "{fmt}: {}", r.text());
+        assert!(r.text().has_mark(), "{fmt}: {}", r.text());
     }
     let r = a
         .adm(
@@ -563,7 +585,7 @@ async fn get_pair(a: &Api, uri: &str, s: &str) -> (Resp, Resp) {
     let t = a.t(Method::GET, uri, None).await;
     assert_eq!(t.status, StatusCode::OK, "{uri}: {}", t.text());
     assert!(
-        !t.text().contains(s) && t.text().contains(MARK),
+        !t.text().contains(s) && t.text().has_mark(),
         "{uri}: {}",
         t.text()
     );
@@ -580,7 +602,7 @@ async fn get_pair(a: &Api, uri: &str, s: &str) -> (Resp, Resp) {
 /// Ответ по токену без значения `s` (и с меткой, если `mark`).
 fn clean(r: &Resp, s: &str, mark: bool, what: &str) {
     assert!(!r.text().contains(s), "{what}: {}", r.text());
-    assert!(!mark || r.text().contains(MARK), "{what}: {}", r.text());
+    assert!(!mark || r.text().has_mark(), "{what}: {}", r.text());
 }
 
 /// `GET /file-refs` (хук `post-tool` печатает заголовки агенту, круг правок 1): по токену —
@@ -645,7 +667,7 @@ async fn agent_glossary_and_term_conflict_masked() {
     assert_eq!(p["type"], "/problems/term-conflict", "{p}");
     clean(&r, &s, true, "409 term-conflict");
     assert!(
-        p["conflicts"][0]["title"].as_str().unwrap().contains(MARK),
+        p["conflicts"][0]["title"].as_str().unwrap().has_mark(),
         "{p}"
     );
     let r = a
@@ -770,7 +792,7 @@ async fn agent_release_compare_masked() {
         "{j}"
     );
     assert!(
-        j["commits"][0]["subject"].as_str().unwrap().contains(MARK),
+        j["commits"][0]["subject"].as_str().unwrap().has_mark(),
         "{j}"
     );
 }
@@ -916,7 +938,7 @@ async fn auto_l0_inline_flag_masked_everywhere() {
         }
         assert!(!r.text().contains(&pw), "{uri}: {}", r.text());
         if uri.contains("L0") || uri.contains("/read") {
-            assert!(r.text().contains(MARK), "{uri}: {}", r.text());
+            assert!(r.text().has_mark(), "{uri}: {}", r.text());
         }
         // человеку: L0 хранится без значения (в `GET /nodes/{id}` — исходный текст заметки)
         if !uri.ends_with(&nid) {
@@ -930,8 +952,8 @@ async fn auto_l0_inline_flag_masked_everywhere() {
     }
 }
 
-/// `range` из сессии WebUI режет исходник (смещения — по исходному тексту), по токену — маску
-/// всей ревизии (смещения — по ней).
+/// `range` из сессии WebUI режет исходник (смещения — по исходному тексту), по токену —
+/// нумерованный вид всей ревизии (смещения — по нему, M7 §4.3.2 п. 6).
 #[tokio::test]
 async fn range_session_original_token_masked() {
     let a = api("secrets-range-pair", |_| {}).await;
@@ -939,7 +961,7 @@ async fn range_session_original_token_masked() {
     let content = format!("# Ключи\n\ntoken: {s}\n\nхвост\n");
     let n = a.note("knowledge", "ops/range-pair", &content).await;
     let nid = format!("n:{}", n["id"].as_str().unwrap());
-    let masked = zam_markdown::mask_text(&content);
+    let masked = numbered(&content);
     let body = |len: usize| json!({"items": [{"id": &nid, "range": format!("r1:0-{len}")}]});
     let r = a
         .t(Method::POST, "/api/v1/read", Some(body(masked.len())))
@@ -1144,9 +1166,9 @@ fn kept_of(j: &Value) -> Option<u64> {
     n
 }
 
-/// `PUT` агента по маскированному L2: правка другой строки и правка вокруг метки сохраняют
-/// значения в базе (чтение сессией); новая строка с `‹secret›` — литерал с предупреждением;
-/// эхо ответа — с маской.
+/// `PUT` агента по нумерованному L2 (`‹secret-N›`): правка другой строки и правка вокруг метки
+/// сохраняют значения в базе (чтение сессией); новая строка с `‹secret›` — литерал с
+/// предупреждением; эхо ответа — с маской.
 #[tokio::test]
 async fn agent_put_restores_secret_values() {
     let a = api("secrets-restore-put", |_| {}).await;
@@ -1161,7 +1183,7 @@ async fn agent_put_restores_secret_values() {
     let uri = format!("/api/v1/nodes/{id}");
     let seen = agent_text(&a, &id).await;
     assert!(
-        !seen.contains(&s) && !seen.contains(&pw) && seen.contains(MARK),
+        !seen.contains(&s) && !seen.contains(&pw) && seen.has_mark(),
         "{seen}"
     );
     let edited = seen.replace("текст\n", "текст, правка агента\n");
@@ -1182,8 +1204,8 @@ async fn agent_put_restores_secret_values() {
     // правка вокруг метки и новая строка с меткой
     let seen = agent_text(&a, &id).await;
     let edited = seen.replace(
-        &format!("token: {MARK}\n"),
-        &format!("token: {MARK} (prod)\nновый ключ: {MARK}\n"),
+        &format!("token: {}\n", mk(1)),
+        &format!("token: {} (prod)\nновый ключ: {MARK}\n", mk(1)),
     );
     let r = a
         .tok_h(
@@ -1205,9 +1227,9 @@ async fn agent_put_restores_secret_values() {
     );
 }
 
-/// `PATCH` агента: секция с ключом в заголовке адресуется маскированным заголовком; замена
-/// секции с меткой из прежнего текста и дописка в конец — значения на месте, новая метка —
-/// литерал с предупреждением; старая `base_rev` с неизменённой (по виду) секцией проходит.
+/// `PATCH` агента: секция с ключом в заголовке адресуется заголовком нумерованного вида; замена
+/// секции с меткой из прежнего текста и дописка в конец — значения на месте по номерам, метка без
+/// номера — литерал с предупреждением; старая `base_rev` с неизменённой секцией проходит.
 #[tokio::test]
 async fn agent_patch_masked_heading() {
     let a = api("secrets-restore-patch", |_| {}).await;
@@ -1219,10 +1241,10 @@ async fn agent_patch_masked_heading() {
     assert!(
         agent_text(&a, &id)
             .await
-            .contains(&format!("## Стенд {MARK}\n")),
+            .contains(&format!("## Стенд {}\n", mk(1))),
         "заголовок — с маской"
     );
-    let heading = format!("Ключи > Стенд {MARK}");
+    let heading = format!("Ключи > Стенд {}", mk(1));
     let r = a
         .t(
             Method::PATCH,
@@ -1244,7 +1266,7 @@ async fn agent_patch_masked_heading() {
             &uri,
             Some(json!({"base_rev": 2, "ops": [
                 {"op": "replace_section", "section": "Ключи > Доступ",
-                 "content": format!("token: {MARK}\nещё строка\n")},
+                 "content": format!("token: {}\nещё строка\n", mk(2))},
                 {"op": "append", "content": format!("хвост {MARK}\n")}]})),
         )
         .await;
@@ -1254,7 +1276,7 @@ async fn agent_patch_masked_heading() {
     assert!(t.contains(&format!("## Стенд {s}\n")), "{t}");
     assert!(t.contains(&format!("token: {s2}\nещё строка\n")), "{t}");
     assert!(t.contains(&format!("хвост {MARK}\n")), "{t}");
-    // base_rev 2 при текущей 3: секция «Стенд ‹secret›» с тех пор не менялась
+    // base_rev 2 при текущей 3: секция «Стенд ‹secret-1›» с тех пор не менялась
     let r = a
         .t(
             Method::PATCH,
@@ -1347,7 +1369,7 @@ async fn agent_entry_edit_restores_secret() {
     let turi = format!("/api/v1/entries/{}", t["id"].as_str().unwrap());
     let v = a.t(Method::GET, &turi, None).await.json();
     let step = v["data"]["next_step"].as_str().unwrap();
-    assert!(step.contains(MARK), "{v}");
+    assert!(step.has_mark(), "{v}");
     let r = a
         .tok_rev(
             &a.token,
@@ -1551,7 +1573,7 @@ async fn agent_supersede_restores_secret() {
         .await
         .json();
     let (title, body) = shown(&v);
-    assert!(body.contains(MARK) && !body.contains(&s), "{body}");
+    assert!(body.has_mark() && !body.contains(&s), "{body}");
     let r = a
         .t(
             Method::POST,
@@ -1605,7 +1627,7 @@ fn context_changed(r: &Resp, s: &str, lines: &str) {
     assert!(!r.text().contains(s), "{}", r.text());
 }
 
-/// Смена окружения метки (C1): агент снял забор кода вокруг `mysql -p‹secret›` (`PUT` и `PATCH`),
+/// Смена окружения метки (C1): агент снял забор кода вокруг `mysql -p‹secret-1›` (`PUT` и `PATCH`),
 /// у ключа записи снят разделитель — запись отклонена 422, значение в базе прежнее; правка с
 /// сохранённым контекстом проходит.
 #[tokio::test]
@@ -1634,7 +1656,7 @@ async fn agent_context_changed_rejected() {
             Method::PATCH,
             &uri,
             Some(json!({"base_rev": 1, "ops": [{"op": "replace_section",
-                "section": "Стенд > Доступ", "content": format!("\nmysql -p{MARK} db\n")}]})),
+                "section": "Стенд > Доступ", "content": format!("\nmysql -p{} db\n", mk(1))}]})),
         )
         .await;
     context_changed(&r, &p, "строка 5");
@@ -1655,9 +1677,9 @@ async fn agent_context_changed_rejected() {
             .await
             .contains(&format!("mysql -p{p} db --verbose"))
     );
-    // пробы ревью 3 и 4: URL переписан прозой — ключ тот же, но сканер прозу не закрывает;
-    // «password = ‹secret›» — «пароль от стенда — ‹secret›»: ключ сменился, маска базы без пары
-    // (решение координатора по сомнению 1 круга правок 1) — оба 422, значение в базе прежнее
+    // пробы ревью 3 и 4: URL переписан прозой, «password = ‹secret-2›» — «пароль от стенда —
+    // ‹secret-2›»: значение восстановлено по номеру, но сканер прозу не закрывает — оба 422,
+    // значение в базе прежнее
     let base = format!("# Доступ\n\nбаза: https://user:{p}@db.example.com/\npassword = {p}\n");
     let n2 = a.note("knowledge", "ops/restore-context-2", &base).await;
     let id2 = n2["id"].as_str().unwrap().to_string();
@@ -1833,7 +1855,7 @@ async fn agent_patch_race_recounts() {
             &uri,
             Some(
                 json!({"base_rev": 1, "ops": [{"op": "replace_section", "section": "K > A",
-                "content": format!("\ntoken: {MARK} (prod)\n\n")}]}),
+                "content": format!("\ntoken: {} (prod)\n\n", mk(1))}]}),
             ),
         )
         .await;
@@ -1851,7 +1873,7 @@ async fn agent_patch_race_recounts() {
             &uri,
             Some(
                 json!({"base_rev": 3, "ops": [{"op": "replace_section", "section": "K > A",
-                "content": format!("\ntoken: {MARK} (dev)\n\n")}]}),
+                "content": format!("\ntoken: {} (dev)\n\n", mk(1))}]}),
             ),
         )
         .await;
@@ -1869,9 +1891,9 @@ async fn agent_patch_race_recounts() {
 }
 
 /// Литерал `‹secret›` в базе (импорт архива с маской, прежний `secret_mark_kept`) и правка
-/// элемента массива с секретом по правилу ключа (B2, B3 круга правок 2): правка строки с
-/// литералом проходит; элемент `data` правлен с тем же ключом — значение на месте; на месте
-/// элемента другой ключ — 422 с путём элемента.
+/// элемента массива с секретом (круг правок 3): литерал в виде — метка без номера, правка строк с
+/// ним проходит, литералы — как есть с предупреждением; элемент `data` правлен вокруг метки — значение
+/// по номеру; метка без номера на месте элемента — литерал, значение удалено правкой.
 #[tokio::test]
 async fn agent_literal_and_item_edits() {
     let a = api("secrets-restore-literal", |_| {}).await;
@@ -1889,7 +1911,11 @@ async fn agent_literal_and_item_edits() {
         )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    assert_eq!(kept_of(&r.json()), None, "{}", r.text());
+    assert_eq!(kept_of(&r.json()), Some(5), "{}", r.text());
+    assert_eq!(
+        human_text(&a, &id).await,
+        lit.replace("сервис 3: ", "сервис 3 (выведен): ")
+    );
     let e = post_entry(
         &a,
         "knowledge",
@@ -1905,7 +1931,7 @@ async fn agent_literal_and_item_edits() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(opt.contains(MARK), "{v}");
+    assert!(opt.has_mark(), "{v}");
     let data = |o: String| {
         json!({"kind": "decision", "decision": {"options": [o, "без ключа"], "chosen": "CI",
                "rationale": "проверено"}})
@@ -1933,7 +1959,13 @@ async fn agent_literal_and_item_edits() {
             Some(json!({"data": data(format!("OPENAI_KEY: {MARK}"))})),
         )
         .await;
-    context_changed(&r, &s, "data.decision.options[0]: строка 1");
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(kept_of(&r.json()), Some(1), "{}", r.text());
+    let h = a.adm(Method::GET, &euri, None, None).await.json();
+    assert_eq!(
+        h["data"]["decision"]["options"][0],
+        format!("OPENAI_KEY: {MARK}")
+    );
 }
 
 /// Теги и `blocked_by` задачи по маске (M11): переставленный тег с ключом — прежний тег,
@@ -1987,7 +2019,7 @@ async fn agent_tags_blocked_by_and_replay() {
     )
     .await;
     let sup = format!("/api/v1/entries/{}/supersede", i["id"].as_str().unwrap());
-    let body = json!({"title": "Ключ стенда", "body": format!("token: {MARK}\nновый {MARK}"),
+    let body = json!({"title": "Ключ стенда", "body": format!("token: {}\nновый {MARK}", mk(1)),
                       "data": {"kind": "gotcha"}});
     let h = [("idempotency-key", "sup-1")];
     let r = a

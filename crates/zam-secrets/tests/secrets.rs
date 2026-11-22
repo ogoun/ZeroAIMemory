@@ -381,6 +381,10 @@ proptest! {
                 "[A-Za-z0-9=]{32,60}",
                 Just("postgres://u:pw12345@h/".to_string()),
                 Just(SECRET_MARK.to_string()),
+                // круг правок 3 задачи 6: метка с номером — уже замаскированное место
+                Just("‹secret-3›".to_string()),
+                Just("‹secret-12›@".to_string()),
+                Just("password (стенд) = ".to_string()),
                 Just(format!("hf_{}", rnd(34, 40))),
                 Just(format!("SG.{}.{}", rnd(22, 41), rnd(43, 42))),
                 Just(format!("npm_{}", rnd(36, 43))),
@@ -437,6 +441,7 @@ proptest! {
                 Just(" https://u:pw12345@h/ ".to_string()),
                 Just("password=abcdef123".to_string()),
                 Just(SECRET_MARK.to_string()),
+                Just("‹secret-7›".to_string()),
                 Just(format!("gh{}_{}", "p", rnd(36, 44))),
                 // круг правок 2: цитаты, многострочный инлайн-код, одиночный `\r`, заглушки,
                 // JSON-заголовок, подстановка `$(…)`
@@ -1675,4 +1680,76 @@ fn code_flags_in_list_items() {
         mask_text(&t),
         format!("- a\n  ```\n  mysql -p{SECRET_MARK}\n```\nmysql -p{SECRET_MARK}\n")
     );
+}
+
+/// Уточнение в скобках между ключом и разделителем (круг правок 3 задачи 6 M7.1): значение
+/// маскируется и у английских, и у русских ключей; скобка без разделителя после неё («токен
+/// (см. выше) — это строка») — не ключ-значение; скобка длиннее 40 знаков — тоже.
+#[test]
+fn key_value_with_qualifier() {
+    let pw = ["hunter", "7Qz9x"].concat();
+    let m = SECRET_MARK;
+    for (t, want) in [
+        (format!("token (prod): {pw}"), format!("token (prod): {m}")),
+        (
+            format!("password (стенд) = {pw}"),
+            format!("password (стенд) = {m}"),
+        ),
+        (format!("API_KEY (CI)={pw}"), format!("API_KEY (CI)={m}")),
+        (
+            format!("пароль (стенд) = {pw}"),
+            format!("пароль (стенд) = {m}"),
+        ),
+        (format!("Токен (prod): {pw}"), format!("Токен (prod): {m}")),
+        (
+            format!("**token** (dev): {pw}"),
+            format!("**token** (dev): {m}"),
+        ),
+    ] {
+        assert_eq!(mask_text(&t), want, "{t}");
+        assert_eq!(mask_text(&want), want, "повторно: {t}");
+    }
+    for t in [
+        "токен (см. выше) — это строка".to_string(),
+        "token (see above) is a string".to_string(),
+        format!("token ({}): {pw}", "x".repeat(41)),
+        "пароль (стенд)".to_string(),
+    ] {
+        assert_eq!(mask_text(&t), t, "{t}");
+    }
+}
+
+/// Метка с номером `‹secret-N›` (нумерованный вид для записи агентом, круг правок 3 задачи 6
+/// M7.1) — уже замаскированное место: `mask_text` её не трогает ни как значение ключа, ни как
+/// пароль в URL, ни как значение флага в коде.
+#[test]
+fn numbered_mark_is_placeholder() {
+    for t in [
+        "password = ‹secret-3›",
+        "token: \"‹secret-1›\"",
+        "база: https://user:‹secret-12›@db.example.com/",
+        "```sh\nmysql -uroot -p‹secret-2› db\n```",
+        "```sh\ncurl -H \"Authorization: Bearer ‹secret-4›\" https://h\n```",
+        "пароль: ‹secret-5›",
+        "‹secret-1›‹secret-2›",
+    ] {
+        assert_eq!(mask_text(t), t, "{t}");
+        assert!(scan_secrets(t).is_empty(), "{t}");
+    }
+    assert_eq!(
+        zam_secrets::mark_at("‹secret-12›x"),
+        Some(("‹secret-12›".len(), Some(12)))
+    );
+    assert_eq!(
+        zam_secrets::mark_at(&format!("{SECRET_MARK}x")),
+        Some((SECRET_MARK.len(), None))
+    );
+    for t in [
+        "‹secret-›",
+        "‹secret-1",
+        "‹secret-1234567890›",
+        "‹secret-a›",
+    ] {
+        assert_eq!(zam_secrets::mark_at(t), None, "{t}");
+    }
 }

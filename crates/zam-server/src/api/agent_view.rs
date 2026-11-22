@@ -24,12 +24,19 @@
 //! сам сканер — внутри кода Markdown (блоки ```` ``` ````/`~~~` и `` `…` ``,
 //! `zam_secrets::scan_flags_in_code`, круг правок 1 задачи 5); проза вне кода не трогается.
 //!
-//! Запись обратно (восстановление значения под `‹secret›`, §4.3.2) — задача 6 M7.1
-//! (`api::secret_restore`), она решает по [`masks`].
+//! **Редактируемый текст** (§4.3.2 п. 1, круг правок 3 задачи 6 M7.1) — тот, что агент может
+//! вернуть записью: L2 узла (`/read` L2, `section`, `range`, фокус, оглавление и L1 —
+//! [`edit_view_owned`]; `GET /nodes` `md`/`json`) и поля записи журнала (`title`, `body`, строки
+//! `data`, `tags`, `area` — [`EDIT_ENTRY_FIELDS`], [`view_entry_json_owned`]: карточка, лента,
+//! ревизии, эхо записи, `/read` записи). В нём каждая маска — `‹secret-N›`, N — номер маски в поле
+//! этой ревизии (строки `data` и теги — сквозная нумерация по обходу): по номеру запись агента
+//! вернёт значение (`api::secret_restore`, решает по [`masks`]). Нередактируемая выдача
+//! (карточки поиска, подсказки, дайджест, дифф ревизий, HTML, экспорт) — прежняя `‹secret›`.
 use std::borrow::Cow;
 
 use serde_json::Value;
 use zam_markdown::{SECRET_MARK, mask_secrets, scan_secrets};
+use zam_secrets::restore::Numbering;
 
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -110,6 +117,90 @@ pub fn mask_in_place(s: &mut String) -> bool {
 /// [`BLOCKING_FROM`]) — в `spawn_blocking`. Пул снят — 503 ([`blocking`]).
 pub async fn view_owned(p: &Principal, s: String) -> Result<String, ApiError> {
     if masks(p) { mask_owned(s).await } else { Ok(s) }
+}
+
+/// Редактируемый текст для зрителя `p`: агенту — нумерованный вид (`‹secret-N›`, номер маски в
+/// тексте), человеку — исходник.
+pub fn edit_view<'a>(p: &Principal, s: &'a str) -> Cow<'a, str> {
+    if masks(p) {
+        zam_secrets::restore::numbered_view(s)
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// [`edit_view`] для своего текста: длинный (больше [`BLOCKING_FROM`]) — в `spawn_blocking`; пул
+/// снят — 503.
+pub async fn edit_view_owned(p: &Principal, s: String) -> Result<String, ApiError> {
+    if !masks(p) {
+        return Ok(s);
+    }
+    let numbered = |s: String| match zam_secrets::restore::numbered_view(&s) {
+        Cow::Borrowed(_) => s,
+        Cow::Owned(v) => v,
+    };
+    if s.len() <= BLOCKING_FROM {
+        return Ok(numbered(s));
+    }
+    blocking(move || numbered(s)).await
+}
+
+/// Поля записи журнала, которые агент правит и возвращает записью: каждое — своё поле нумерации
+/// меток `‹secret-N›` (`data` и `tags` — сквозная нумерация по обходу строк). Прочие
+/// [`ENTRY_FIELDS`] — маска без номеров.
+pub const EDIT_ENTRY_FIELDS: &[&str] = &["title", "body", "data", "tags", "area"];
+
+/// Запись журнала (или список записей) в ответе агенту: [`EDIT_ENTRY_FIELDS`] — нумерованный
+/// вид, прочие [`ENTRY_FIELDS`] — маска. `true` — что-то заменено.
+pub fn number_entries(v: &mut Value) -> bool {
+    if let Value::Array(a) = v {
+        return a.iter_mut().fold(false, |c, x| number_entries(x) | c);
+    }
+    let mut changed = false;
+    if let Value::Object(o) = v {
+        for f in EDIT_ENTRY_FIELDS {
+            if let Some(x) = o.get_mut(*f) {
+                changed |= number_value(x, &mut Numbering::new());
+            }
+        }
+    }
+    let rest: Vec<&str> = ENTRY_FIELDS
+        .iter()
+        .copied()
+        .filter(|f| !EDIT_ENTRY_FIELDS.contains(f))
+        .collect();
+    changed | mask_fields(v, &rest)
+}
+
+/// Нумерованный вид всех строк значения по порядку обхода (одна нумерация `n` — поле; ключи
+/// объектов — нет). Порядок обхода — тот же, что у восстановления (`secret_restore`).
+pub fn number_value(v: &mut Value, n: &mut Numbering) -> bool {
+    match v {
+        Value::String(s) => match n.view(s) {
+            Cow::Borrowed(_) => false,
+            Cow::Owned(x) => {
+                *s = x;
+                true
+            }
+        },
+        Value::Array(a) => a.iter_mut().fold(false, |c, x| number_value(x, n) | c),
+        Value::Object(o) => o.values_mut().fold(false, |c, x| number_value(x, n) | c),
+        _ => false,
+    }
+}
+
+/// Запись журнала (или список) в ответе зрителю `p`: агенту — [`number_entries`] (строк больше
+/// [`BLOCKING_FROM`] — в пуле), человеку — как есть.
+pub async fn view_entry_json_owned(p: &Principal, v: Value) -> Result<Value, ApiError> {
+    let size = if masks(p) {
+        fields_size(&v, ENTRY_FIELDS)
+    } else {
+        0
+    };
+    view_with(p, v, size, |v| {
+        number_entries(v);
+    })
+    .await
 }
 
 /// Маска своего текста (см. [`view_owned`]): без находок — тот же `String` без копии.
@@ -236,7 +327,7 @@ pub async fn view_json_with(
 }
 
 /// Ответ из нескольких записей под ключами `keys` (эхо операций идей и ответа на вопрос:
-/// `entry`, `question`, `task`, …) для зрителя `p`: у каждой — [`ENTRY_FIELDS`]; строк больше
+/// `entry`, `question`, `task`, …) для зрителя `p`: у каждой — [`number_entries`]; строк больше
 /// [`BLOCKING_FROM`] — в пуле.
 pub async fn view_entries_in(
     p: &Principal,
@@ -246,7 +337,7 @@ pub async fn view_entries_in(
     view_json_with(p, v, move |v| {
         for k in keys {
             if let Some(e) = v.get_mut(*k) {
-                mask_fields(e, ENTRY_FIELDS);
+                number_entries(e);
             }
         }
     })

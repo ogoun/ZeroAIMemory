@@ -7120,7 +7120,6 @@ dependencies = [
  "comrak",
  "proptest",
  "regex",
- "similar",
  "zam-core",
 ]
 

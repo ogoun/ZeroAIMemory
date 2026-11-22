@@ -12,13 +12,14 @@
 //! не дата `YYYY-MM-DD`; `verified_at_commit_invalid` — `verified_at_commit:` не sha коммита
 //! (4–64 hex); `invalid_ref: <путь> (<причина>)` — путь `refs:` не стал ссылкой на файл;
 //! `refs_truncated` — ссылок больше 64 (M4.5 §6.1, §7); `secret_mark_kept: N …` (+ поле
-//! `secret_mark_kept: N`) — в правке агента (`PUT`, `PATCH`) `‹secret›` без прежнего значения на
-//! этом месте записана как есть ([`crate::api::secret_restore`]).
+//! `secret_mark_kept: N`) — в правке агента (`PUT`, `PATCH`) метка без номера маски записана как
+//! есть ([`crate::api::secret_restore`]).
 //!
-//! **Агент по токену** правит маскированный текст (задача 6 M7.1, M7 §4.3.2): `PUT` —
-//! восстановление значений под `‹secret›` по ревизии `If-Match` (устаревшая без ключа повтора —
-//! 409 без восстановления), `PATCH` — операции по маске текущей ревизии (заголовки с маской),
-//! итог — со значениями, подсчёт вне транзакции писателя со сверкой ревизии при записи
+//! **Агент по токену** правит нумерованный вид (`‹secret-N›`, задача 6 M7.1, M7 §4.3.2): `PUT` —
+//! значения по номерам масок ревизии `If-Match` (устаревшая без ключа повтора — 409 без
+//! восстановления), `PATCH` — операции по виду ревизии `base_rev` к исходнику текущей
+//! ([`patch_restored`]: адрес секции с номером — заголовок исходника, метки содержимого — значения
+//! масок `base_rev`), подсчёт вне транзакции писателя со сверкой ревизии при записи
 //! ([`zam_store::patch_note_prepared`]). Правка, выводящая секрет из-под маски, — 422
 //! `secret_context_changed`; `secrets_detected` — только новые находки. Сессия WebUI пишет
 //! исходник как есть.
@@ -264,8 +265,8 @@ pub async fn replace(
     check_size(&st, &req.content)?;
     let key = idempotency_key(&headers)?;
     let attrib = attribution(&p, &headers, req.message)?;
-    // агент правил маскированный текст ревизии `If-Match` (M7 §4.3.2): значения под `‹secret›`
-    // — обратно по ней. Ревизия уже устарела (текущая только растёт) и ключа повтора нет — 409
+    // агент правил нумерованный вид ревизии `If-Match` (M7 §4.3.2): значения под `‹secret-N›`
+    // — обратно по её маскам. Ревизия уже устарела (текущая только растёт) и ключа повтора нет — 409
     // хранилища без восстановления (круг правок 1, M6); с ключом — как прежде: повтор по ключу
     // старый `If-Match` не сверяет
     let stale = key.is_none() && base < sc.node.current_rev;
@@ -350,8 +351,8 @@ pub async fn patch(
     let key = idempotency_key(&headers)?;
     let attrib = attribution(&p, &headers, req.message.take())?;
     let max = st.cfg.limits.note_max_bytes;
-    // агенту — операции по маскированному виду (заголовки он видел с `‹secret›`), значения —
-    // обратно (M7 §4.3.2); человеку — по исходнику, как прежде (у папки текста нет — ответ
+    // агенту — операции по нумерованному виду (заголовки он видел с `‹secret-N›`), значения —
+    // обратно по номерам (M7 §4.3.2); человеку — по исходнику, как прежде (у папки текста нет — ответ
     // хранилища тот же)
     if agent_view::masks(&p) && sc.node.kind == zam_store::NodeKind::Note {
         return patch_by_view(&st, &p, &sc, req, attrib, max, key).await;
@@ -375,11 +376,10 @@ pub async fn patch(
 /// Попыток PATCH агента по маске, если заметку меняют между подсчётом и записью.
 const PATCH_ATTEMPTS: usize = 3;
 
-/// `PATCH` агента по маске (M7 §4.3.2; круг правок 1 задачи 6 — вне транзакции писателя, M5):
-/// повтор по ключу — сразу; иначе по текущей ревизии — маски обеих ревизий, операции по маске
-/// текущей ([`zam_store::apply_ops`]: проверка «секция не менялась после `base_rev`» — по
-/// маскам), значения — обратно ([`secret_restore::MaskedBase`]); выход секрета из-под маски — 422;
-/// запись — со сверкой текущей ревизии ([`zam_store::patch_note_prepared`]), она сменилась —
+/// `PATCH` агента по нумерованному виду (M7 §4.3.2; круг правок 1 задачи 6 — вне транзакции
+/// писателя, M5; круг правок 3 — по номеру метки): повтор по ключу — сразу; иначе
+/// [`patch_restored`] по исходникам `base_rev` и текущей ревизии; выход секрета из-под маски —
+/// 422; запись — со сверкой текущей ревизии ([`zam_store::patch_note_prepared`]), она сменилась —
 /// подсчёт заново (до [`PATCH_ATTEMPTS`] раз, затем 409 с `current_rev` и `diff`, как у
 /// устаревшей ревизии).
 async fn patch_by_view(
@@ -421,10 +421,7 @@ async fn patch_by_view(
         let ops = req.ops.clone();
         let big = current.len() + base.as_ref().map_or(0, String::len) > agent_view::BLOCKING_FROM;
         let prepare = move || -> (Result<secret_restore::Restored, zam_store::WriteError>, String) {
-            let seen = secret_restore::MaskedBase::new(&current);
-            let base_seen = base.as_deref().map(zam_markdown::mask_text);
-            let r = apply_ops(base_seen.as_deref(), seen.masked(), cur_rev, &ops)
-                .map(|edited| seen.restore(&edited));
+            let r = patch_restored(base.as_deref(), &current, cur_rev, &ops);
             (r, current)
         };
         let (r, current) = if big {
@@ -479,6 +476,115 @@ async fn patch_by_view(
         current,
     };
     Err(write_error(p, &sc.db, id, req.base_rev, e).await)
+}
+
+/// Операции `PATCH` агента, построенные по нумерованному виду ревизии `base_rev` (`base`; `None` —
+/// она же текущая `current`), — к исходнику `current` (M7 §4.3.2 п. 3, круг правок 3 задачи 6):
+/// адрес секции — к заголовку исходника (`‹secret-N›` — значение N-й маски базы), метки
+/// содержимого — отложенные значения масок базы ([`secret_restore::Deferred`]); сверка «секция не
+/// менялась после `base_rev`» — по исходникам обеих ревизий ([`zam_store::apply_ops`]); итог —
+/// со значениями и пересканирован. Ошибка операции — с адресом агента, а не с исходником.
+fn patch_restored(
+    base: Option<&str>,
+    current: &str,
+    cur_rev: i64,
+    ops: &[PatchOp],
+) -> Result<secret_restore::Restored, zam_store::WriteError> {
+    let masks = secret_restore::FieldMasks::of(base.unwrap_or(current));
+    let mut texts: Vec<&str> = vec![current];
+    texts.extend(base);
+    for op in ops {
+        let (section, content) = op_parts(op);
+        texts.extend(section);
+        texts.push(content);
+    }
+    let Some(mut d) = secret_restore::Deferred::new(&texts) else {
+        return Err(zam_store::WriteError::Store(
+            zam_store::StoreError::BadInput(
+                "в тексте заняты все знаки частного использования Unicode — правьте в WebUI".into(),
+            ),
+        ));
+    };
+    // адрес секции с исходником → адрес агента (ошибки операций)
+    let mut back: Vec<(String, String)> = Vec::new();
+    let raw_ops: Vec<PatchOp> = ops
+        .iter()
+        .map(|op| {
+            let (section, content) = op_parts(op);
+            let section = section.map(|s| {
+                let filled = masks.fill(s).into_owned();
+                if filled != s {
+                    back.push((filled.clone(), s.to_string()));
+                }
+                filled
+            });
+            with_parts(op, section, masks.defer(content, &mut d))
+        })
+        .collect();
+    let text = apply_ops(base, current, cur_rev, &raw_ops).map_err(|e| shown_error(e, &back))?;
+    Ok(d.finish(&text))
+}
+
+/// Адрес секции и содержимое операции.
+fn op_parts(op: &PatchOp) -> (Option<&str>, &str) {
+    match op {
+        PatchOp::ReplaceSection { section, content }
+        | PatchOp::AppendToSection { section, content }
+        | PatchOp::InsertAfterHeading { section, content } => (Some(section), content),
+        PatchOp::Append { content } | PatchOp::Prepend { content } => (None, content),
+    }
+}
+
+/// Та же операция с адресом `section` (у операций с секцией) и содержимым `content`.
+fn with_parts(op: &PatchOp, section: Option<String>, content: String) -> PatchOp {
+    let s = || section.clone().unwrap_or_default();
+    match op {
+        PatchOp::ReplaceSection { .. } => PatchOp::ReplaceSection {
+            section: s(),
+            content,
+        },
+        PatchOp::AppendToSection { .. } => PatchOp::AppendToSection {
+            section: s(),
+            content,
+        },
+        PatchOp::InsertAfterHeading { .. } => PatchOp::InsertAfterHeading {
+            section: s(),
+            content,
+        },
+        PatchOp::Append { .. } => PatchOp::Append { content },
+        PatchOp::Prepend { .. } => PatchOp::Prepend { content },
+    }
+}
+
+/// Ошибка операции по исходнику — агенту: адрес секции — как он его прислал (`back`: адрес с
+/// исходником → адрес агента), прочий путь из исходника — с маской.
+fn shown_error(e: zam_store::WriteError, back: &[(String, String)]) -> zam_store::WriteError {
+    use zam_markdown::PatchError;
+    use zam_store::WriteError;
+    let fix = |s: String| {
+        back.iter()
+            .find(|(raw, _)| *raw == s)
+            .map_or_else(|| zam_markdown::mask_text(&s), |(_, shown)| shown.clone())
+    };
+    match e {
+        WriteError::Patch(p) => WriteError::Patch(match p {
+            PatchError::SectionNotFound(s) => PatchError::SectionNotFound(fix(s)),
+            PatchError::SectionNotFoundTail { section, full } => PatchError::SectionNotFoundTail {
+                section: fix(section),
+                full: fix(full),
+            },
+            PatchError::Ambiguous(s) => PatchError::Ambiguous(fix(s)),
+            PatchError::Broken(s) => PatchError::Broken(fix(s)),
+        }),
+        WriteError::SectionChanged {
+            section,
+            current_rev,
+        } => WriteError::SectionChanged {
+            section: fix(section),
+            current_rev,
+        },
+        e => e,
+    }
 }
 
 /// Тестовая точка гонки `PATCH` агента по маске (фича `test-hooks`, круг правок 2 задачи 6,

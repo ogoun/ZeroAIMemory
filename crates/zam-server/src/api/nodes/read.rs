@@ -15,7 +15,9 @@
 //! **Агенту по токену** (задача 5 M7.1, спецификация M7 §4.3.1 п. 2, [`crate::api::agent_view`])
 //! все виды — по тексту ревизии с `‹secret›` вместо значений секретов: маска всей ревизии до
 //! секции и L1, HTML — маска до рендера (свой ключ кэша рендера), `node.frontmatter`
-//! (`description`, `tags`, `l0`) и L0 — тоже; оглавление — по маскированному тексту. `ETag` у
+//! (`description`, `tags`, `l0`) и L0 — тоже; оглавление — по маскированному тексту. Текст для
+//! правки (`md`, `json`, L1, оглавление) — нумерованный вид `‹secret-N›` (M7 §4.3.2, круг правок 3
+//! задачи 6), HTML — метки без номеров. `ETag` у
 //! `format=md` — по-прежнему `"<rev>"`: это ревизия для `If-Match` записи, и у маски она та же.
 //! Сессии WebUI — исходник.
 use axum::Json;
@@ -132,8 +134,8 @@ pub async fn outline(
         return Ok(Json(Vec::new()));
     }
     let (_, text) = node_content(&sc.db, sc.node.id, None).await?;
-    // агенту — заголовки маскированного текста
-    let text = agent_view::view_owned(&p, text).await?;
+    // агенту — заголовки нумерованного вида (`‹secret-N›`: по ним агент адресует секции `PATCH`)
+    let text = agent_view::edit_view_owned(&p, text).await?;
     Ok(Json(doc_outline(&parse(&text))))
 }
 
@@ -202,8 +204,13 @@ async fn read(
         node_content(&sc.db, node.id, Some(q.rev.unwrap_or(node.current_rev))).await?;
     // хэш ключа кэша HTML — по прочитанному исходнику (`content_hash` ревизии), до маски
     let hash = (format == Format::Html && q.section.is_none()).then(|| key_hash(node, rev, &text));
-    // агенту — маска всей ревизии до секции, L1 и рендера
-    let text = agent_view::view_owned(p, text).await?;
+    // агенту — маска всей ревизии до секции, L1 и рендера: текст для правки (`md`, `json`, L1) —
+    // нумерованный вид `‹secret-N›` (M7 §4.3.2 п. 1), HTML — метки без номеров
+    let text = if format == Format::Html && tier == Tier::L2 {
+        agent_view::view_owned(p, text).await?
+    } else {
+        agent_view::edit_view_owned(p, text).await?
+    };
     let (text, whole) = match q.section.as_deref() {
         Some(path) => (section_slice(&text, path)?.to_string(), false),
         None => (text, true),

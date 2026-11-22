@@ -13,7 +13,7 @@
 //! Диапазоны результата отсортированы, не пересекаются и лежат на границах символов UTF-8.
 //! Бюджет — не больше 2 мс на 100 КБ (release).
 //!
-//! Отдельный крейт с одной зависимостью (`regex`; `similar` — только с фичей `restore`) — с задачи 15b M6: сканер нужен не только
+//! Отдельный крейт с одной зависимостью (`regex`) — с задачи 15b M6: сканер нужен не только
 //! серверу (через `zam-markdown`, реэкспорт `zam_markdown::secrets` и прежние имена), но и
 //! клиенту `zam` без comrak (маскировка снимка сессии, задача 17a). [`scan_secrets_ext`]
 //! дополнительно сообщает число повторов скана и упор в их предел ([`ScanOutcome`]).
@@ -27,9 +27,10 @@
 //! [`mask_flags`] (первая строка команды снимка сессии у клиента), в [`mask_text`] она не входит.
 //! Что считать кодом — [`code`]: одно определение на проект (его берёт и `zam-markdown`).
 //!
-//! `restore` (фича `restore`, её включает только `zam-server`) — обратный путь маски: значения
-//! под `‹secret›` в тексте, правленном по маске (запись агентом, M7 §4.3.2, задача 6 M7.1); с ней
-//! крейт берёт `similar` (дифф), клиент `zam` — нет.
+//! `restore` (фича `restore`, её включает только `zam-server`) — обратный путь маски для записи
+//! агентом (M7 §4.3.2, задача 6 M7.1): нумерованный вид `‹secret-N›` редактируемого текста и
+//! восстановление значений по номеру метки. Метка с номером ([`mark_at`], [`marks`]) для сканера —
+//! уже замаскированное место, как [`SECRET_MARK`].
 
 pub mod code;
 mod flags;
@@ -45,6 +46,54 @@ pub use flags::mask_flags;
 
 /// Замена секрета в тексте чанка.
 pub const SECRET_MARK: &str = "‹secret›";
+
+/// Начало метки с номером `‹secret-N›` — маски в тексте, который агент правит и возвращает
+/// записью (M7 §4.3.2, круг правок 3 задачи 6 M7.1): номер — личность маски в поле ревизии. Для
+/// сканера метка с номером — уже замаскированное место, как [`SECRET_MARK`].
+pub const NUMBERED_MARK_PREFIX: &str = "‹secret-";
+
+/// Наибольшее число цифр номера метки `‹secret-N›`.
+const MARK_DIGITS_MAX: usize = 9;
+
+/// Метка в начале `s`: [`SECRET_MARK`] или `‹secret-N›` (N — от 1 до 9 цифр) — её длина и номер
+/// (у метки без номера — `None`).
+pub fn mark_at(s: &str) -> Option<(usize, Option<u32>)> {
+    if s.starts_with(SECRET_MARK) {
+        return Some((SECRET_MARK.len(), None));
+    }
+    let rest = s.strip_prefix(NUMBERED_MARK_PREFIX)?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || digits > MARK_DIGITS_MAX || !rest[digits..].starts_with('›') {
+        return None;
+    }
+    let n = rest[..digits].parse().ok()?;
+    Some((
+        NUMBERED_MARK_PREFIX.len() + digits + '›'.len_utf8(),
+        Some(n),
+    ))
+}
+
+/// Метки текста ([`mark_at`]) по порядку: диапазон и номер.
+pub fn marks(s: &str) -> impl Iterator<Item = (Range<usize>, Option<u32>)> + '_ {
+    // обе метки начинаются с `‹secret`
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        while let Some(i) = s.get(from..)?.find("‹secret") {
+            let at = from + i;
+            if let Some((len, n)) = mark_at(&s[at..]) {
+                from = at + len;
+                return Some((at..at + len, n));
+            }
+            from = at + "‹secret".len();
+        }
+        None
+    })
+}
+
+/// Есть ли в тексте метка — [`SECRET_MARK`] или `‹secret-N›`.
+pub fn has_any_mark(s: &str) -> bool {
+    marks(s).next().is_some()
+}
 
 /// Версия правил сканера. Увеличивается при каждой правке правил, после которой сканер находит
 /// больше: хранилище (`zam-store`, ключи `meta` `secrets_scanned_v2` и `secrets_scanned_v3`)
@@ -277,8 +326,14 @@ const KEY_END: &str = r#"(?:\*\*|__|[*_»"'])?"#;
 /// Разметка Markdown сразу после разделителя: `**Password:** …`, `__Пароль:__ …`.
 const SEP_END: &str = r"(?:\*\*|__|[*_])?";
 
+/// Уточнение в скобках между ключом и разделителем: `token (prod): …`, `password (стенд) = …`,
+/// `пароль (стенд) = …` (круг правок 3 задачи 6 M7.1: без него значение открывалось агенту при
+/// чтении). Без разделителя после скобки («токен (см. выше) — это строка») — не ключ-значение.
+const QUALIFIER: &str = r"(?:[\t\p{Zs}]*\([^()\n]{1,40}\))?";
+
 /// Ключ-значение; необязательная кавычка перед разделителем покрывает JSON (`"password": "…"`)
-/// [решение исполнителя], разметка Markdown вокруг ключа — [`KEY_END`], [`SEP_END`].
+/// [решение исполнителя], разметка Markdown вокруг ключа — [`KEY_END`], [`SEP_END`], уточнение в
+/// скобках перед разделителем — [`QUALIFIER`].
 ///
 /// Значение в кавычках берётся до закрывающей кавычки (пароль-фраза с пробелами); без кавычек —
 /// до пробела ([`kv_quoted`], [`kv_bare`]), от 6 символов. Словарь ключей расширен `secret_key`,
@@ -289,7 +344,7 @@ const SEP_END: &str = r"(?:\*\*|__|[*_])?";
 static KEY_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     let (q, b) = (kv_quoted(6), kv_bare(6));
     rx(&format!(
-        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key){KEY_END}\s*[:=]{SEP_END}\s*(?:{q}|{b})"#
+        r#"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|secret[_-]?key|signing[_-]?key|private[_-]?key){KEY_END}{QUALIFIER}\s*[:=]{SEP_END}\s*(?:{q}|{b})"#
     ))
 });
 
@@ -326,7 +381,7 @@ static KEY_SEP_RU: LazyLock<Regex> = LazyLock::new(|| {
         ["токен", "парол", "секрет", "ключ", "api"].map(three_cases);
     let zs = r"[\t\p{Zs}]";
     rx(&format!(
-        r#"(?:{token}(?i:а|ом)?|{pass}(?i:ь|я|ем)|{secret}(?i:а)?|{key}{zs}+(?i:api)|{api}[-_\p{{Zs}}]?(?i:ключ)){KEY_END}{zs}*[:=]|(?:{token}(?i:ом)|{pass}(?i:ем)){KEY_END}{zs}+["'`]"#
+        r#"(?:{token}(?i:а|ом)?|{pass}(?i:ь|я|ем)|{secret}(?i:а)?|{key}{zs}+(?i:api)|{api}[-_\p{{Zs}}]?(?i:ключ)){KEY_END}{QUALIFIER}{zs}*[:=]|(?:{token}(?i:ом)|{pass}(?i:ем)){KEY_END}{zs}+["'`]"#
     ))
 });
 
@@ -687,7 +742,8 @@ const ENTROPY_MIN: f64 = 4.5;
 fn is_placeholder(v: &str) -> bool {
     let l = v.to_ascii_lowercase();
     v.starts_with('<')
-        || v.starts_with(SECRET_MARK) // уже замаскировано: повторный проход идемпотентен
+        // уже замаскировано (и меткой с номером `‹secret-N›`): повторный проход идемпотентен
+        || mark_at(v).is_some()
         || v.starts_with("${")
         || v.starts_with("{{")
         // ссылка на переменную окружения: $TOKEN, $(cmd), %TOKEN%

@@ -349,8 +349,9 @@ fn flag_values(
             && ["bearer", "basic", "token", "digest"]
                 .iter()
                 .any(|w| inner.eq_ignore_ascii_case(w));
-        // уже замаскированное: сначала дешёвый поиск первого знака метки
-        let masked = inner.contains('\u{2039}') && inner.contains(SECRET_MARK);
+        // уже замаскированное (и меткой с номером `‹secret-N›`): сначала дешёвый поиск первого
+        // знака метки
+        let masked = inner.contains('\u{2039}') && crate::has_any_mark(inner);
         if inner.is_empty() || scheme || masked || is_reference(inner) || is_caps_placeholder(inner)
         {
             return false;
@@ -378,9 +379,9 @@ fn flag_values(
             } else {
                 let next = m.start() + text[m.start()..].chars().next().map_or(1, char::len_utf8);
                 v.and_then(|v| {
-                    text[v.clone()]
-                        .rfind(SECRET_MARK)
-                        .map(|i| v.start + i + SECRET_MARK.len())
+                    crate::marks(&text[v.clone()])
+                        .last()
+                        .map(|(m, _)| v.start + m.end)
                 })
                 .map_or(next, |after_mark| after_mark.max(next))
             };
