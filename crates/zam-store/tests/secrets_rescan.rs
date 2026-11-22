@@ -1097,3 +1097,58 @@ async fn delta_rescan_timing() {
     );
     assert_eq!(queued, (N / 10) as i64);
 }
+
+/// Авто-L0 старой базы с открытым флагом инлайн-кода (L0 строился по тексту без обратных
+/// кавычек — маска его не видела): перемаскировка строит L0 заново по исходнику, а не маской
+/// записанного текста (круг правок 2 задачи 5 M7.1).
+#[tokio::test]
+async fn rescan_rebuilds_auto_l0_with_inline_flag() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("secrets-rescan-l0");
+    let _ = std::fs::remove_dir_all(&dir);
+    let dd = DataDir::open(&dir).unwrap();
+    let user = Id::new();
+    let pw = ["S3c", "ret", "9x"].concat();
+    let db = UserDbs::new(dd.users_dir()).get(user).await.unwrap();
+    let k = list_spaces(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    let n = create_note(
+        &db,
+        NewNote {
+            space_id: k,
+            path: NodePath::parse("ops/бд").unwrap(),
+            content: format!("# БД\n\nПодключение: `mysql -uroot -p{pw} prod`.\n"),
+            l0: None,
+            attrib: Attribution::new(AuthorKind::Agent),
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    // имитация базы до круга правок 2: L0 с открытым паролем, флага перемаскировки нет
+    let leaked = format!("Подключение: mysql -uroot -p{pw} prod.");
+    db.write(move |tx| {
+        tx.execute("DELETE FROM meta WHERE key = ?1", [FLAG])?;
+        tx.execute(
+            "UPDATE nodes SET l0 = ?2 WHERE id = ?1",
+            rusqlite::params![n, leaked],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    drain(&db).await;
+    drop(db);
+    let dbs = UserDbs::new(dd.users_dir());
+    let db = dbs.get(user).await.unwrap();
+    dbs.wait_rechunk(user).await;
+    let l0 = zam_store::get_node(&db, n).await.unwrap().l0.unwrap();
+    assert_eq!(
+        l0,
+        format!("Подключение: mysql -uroot -p{SECRET_MARK} prod.")
+    );
+}

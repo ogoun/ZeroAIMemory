@@ -853,6 +853,57 @@ async fn agent_node_and_entry_ops_masked() {
     clean(&r, &s, true, "восстановление записи");
 }
 
+/// Авто-L0 заметки, где единственный секрет — флаг в инлайн-коде (круг правок 2 задачи 5 M7.1):
+/// значения нет ни в L0 узла, ни в `/read` L0, ни в карточке поиска, ни в дереве пространства —
+/// ни агенту, ни человеку (L0 строится по маскированному исходнику и так хранится).
+#[tokio::test]
+async fn auto_l0_inline_flag_masked_everywhere() {
+    let a = api("secrets-l0-inline", |_| {}).await;
+    let pw = ["S3c", "ret", "9x"].concat();
+    let n = a
+        .note(
+            "knowledge",
+            "ops/бд-доступ",
+            &format!("# Доступ к БД\n\nПодключение: `mysql -uroot -p{pw} prod`.\n"),
+        )
+        .await;
+    assert!(!n.to_string().contains(&pw), "эхо записи: {n}");
+    let nid = n["id"].as_str().unwrap().to_string();
+    let requests = [
+        (Method::GET, format!("/api/v1/nodes/{nid}?tier=L0"), None),
+        (Method::GET, format!("/api/v1/nodes/{nid}"), None),
+        (
+            Method::POST,
+            "/api/v1/read".to_string(),
+            Some(json!({"items": [{"id": format!("n:{nid}"), "tier": "L0"}]})),
+        ),
+        (
+            Method::POST,
+            "/api/v1/search".to_string(),
+            Some(json!({"query": "Подключение prod"})),
+        ),
+        (
+            Method::GET,
+            "/api/v1/spaces/knowledge/tree?path=ops".to_string(),
+            None,
+        ),
+    ];
+    for (m, uri, body) in requests {
+        let r = a.t(m.clone(), &uri, body.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        assert!(!r.text().contains(&pw), "{uri}: {}", r.text());
+        if uri.contains("L0") || uri.contains("/read") {
+            assert!(r.text().contains(MARK), "{uri}: {}", r.text());
+        }
+        // человеку: L0 хранится без значения (в `GET /nodes/{id}` — исходный текст заметки)
+        if !uri.ends_with(&nid) {
+            let h = a.adm(m, &uri, body, None).await;
+            assert_eq!(h.status, StatusCode::OK, "{uri}: {}", h.text());
+            assert!(!h.text().contains(&pw), "человеку L0: {uri}: {}", h.text());
+        }
+    }
+}
+
 /// `range` из сессии WebUI режет исходник (смещения — по исходному тексту), по токену — маску
 /// всей ревизии (смещения — по ней).
 #[tokio::test]
