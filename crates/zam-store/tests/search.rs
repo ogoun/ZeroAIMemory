@@ -1009,6 +1009,9 @@ async fn insight_term_docs_counts_live_insights() {
 /// со статусом вне фильтра — нет; фильтр с заметками проверки не делает.
 #[tokio::test]
 async fn entry_only_filter_without_live_entries_is_empty() {
+    // счёт по пути базы: другие тесты процесса его не трогают
+    #[cfg(feature = "test-hooks")]
+    zam_store::test_hooks::count_fts_channels();
     let (db, k, _) = setup("entry-only-empty").await;
     add(
         &db,

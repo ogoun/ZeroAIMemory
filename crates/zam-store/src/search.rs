@@ -869,8 +869,10 @@ async fn fts_channels(
     light: Option<LightSearch>,
 ) -> Result<FtsChannels, StoreError> {
     let (spaces, prefix) = check_query(&q)?;
+    // счёт проходов (тест пропуска пустых каналов) — только при включённом флаге: без него ни
+    // блокировки, ни копии пути
     #[cfg(feature = "test-hooks")]
-    let path = db.path().to_path_buf();
+    let counted = crate::test_hooks::fts_counting().then(|| db.path().to_path_buf());
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
         let targs = q.targets.args();
@@ -883,7 +885,9 @@ async fn fts_channels(
             return Ok(FtsChannels::default());
         }
         #[cfg(feature = "test-hooks")]
-        crate::test_hooks::fts_channels_ran(&path);
+        if let Some(path) = &counted {
+            crate::test_hooks::fts_channels_ran(path);
+        }
         let ch = run_channels(
             &tx,
             &q.text,

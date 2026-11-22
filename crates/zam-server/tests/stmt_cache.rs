@@ -5,12 +5,13 @@
 //! читателей у них общий). Число запросов должно быть меньше `zam_store::db::STATEMENT_CACHE` с
 //! запасом не меньше 1,5×, и так же — вместе с дайджестом `session_start`. Иначе LRU вытесняет
 //! запросы по кругу, и они готовятся заново на каждом вызове (корень роста M6.6,
-//! `i:01M80RNR5QEHWADSZXM69SRNBW`).
+//! `i:01M80SWM48EF9R3PZCG4083NS8`).
 //!
 //! Мир — как у `zam-cli/tests/m6_acceptance.rs::acceptance_hook_budgets` (30 заметок, 10 insight,
 //! 50 идей человека). Добавлены две открытые задачи и термин, чтобы шли каналы задач и словаря.
 //!
-//! Учёт — `zam_store::test_hooks::sql_texts_*` (фича `test-hooks`, `trace_v2`).
+//! Учёт — `zam_store::test_hooks::sql_texts_*` (фича `test-hooks`, `trace_v2`; включает его
+//! `sql_trace_on` до создания сервера, с увеличенным на время учёта кэшем).
 //! - Запрос в кэше — тот, чей подготовленный запрос запускался повторно
 //!   (`SQLITE_STMTSTATUS_RUN` > 0 в начале запуска).
 //! - Разовые (`query_row`, `execute_batch`) и внутренние запросы SQLite и FTS5 не в счёт.
@@ -80,6 +81,9 @@ async fn round(a: &Api, tag: &str, note: &str, insight: &str, digest: bool) {
 
 #[tokio::test]
 async fn statement_cache_fits_hot_paths() {
+    // учёт SQL — до открытия баз сервера; кэш на время учёта — с запасом, чтобы ни один запрос не
+    // вытеснялся и счёт не зависел от `STATEMENT_CACHE`
+    zam_store::test_hooks::sql_trace_on(4096);
     let a = api("stmt-cache", |c| c.recall.timeout_ms = 30_000).await;
     let r = a
         .t(

@@ -145,6 +145,11 @@ static SQL_SLOT_DATA: LazyLock<Vec<SqlSlot>> = LazyLock::new(|| {
 });
 static SQL_NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 static SQL_RECORDING: AtomicBool = AtomicBool::new(false);
+/// Учёт SQL включён ([`sql_trace_on`]): без него `trace_v2` на соединения не ставится — встроенные
+/// серверы замеров (`m4`, `m56`, `m57`, гейт `m6`) идут без трассировки (ревью задачи 9, круг 2).
+static SQL_TRACE: AtomicBool = AtomicBool::new(false);
+/// Ёмкость кэша `prepare_cached` под учётом SQL ([`sql_trace_on`]); 0 — без переопределения.
+static SQL_CACHE: AtomicUsize = AtomicUsize::new(0);
 
 fn sql_slot(i: usize) -> MutexGuard<'static, (PathBuf, HashMap<String, bool>)> {
     SQL_SLOT_DATA[i].lock().unwrap_or_else(|e| e.into_inner())
@@ -173,8 +178,29 @@ static SQL_SLOT_FNS: [fn(rusqlite::trace::TraceEvent<'_>); SQL_SLOTS] = sql_slot
     0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
 );
 
-/// Учёт текстов SQL соединения `conn` базы `path` (зовёт [`crate::Db`] при открытии соединения).
+/// Включить учёт SQL процесса — до открытия баз, которые надо считать (трассировка ставится при
+/// открытии соединения): `trace_v2` на новые соединения и кэш `prepare_cached` ёмкостью `cache`
+/// вместо `crate::db::STATEMENT_CACHE` (счёт не должен зависеть от размера кэша — у вытесненного
+/// запроса нет повторных запусков). Только для теста, один в своём двоичном файле.
+pub fn sql_trace_on(cache: usize) {
+    SQL_CACHE.store(cache, Ordering::SeqCst);
+    SQL_TRACE.store(true, Ordering::SeqCst);
+}
+
+/// Ёмкость кэша `prepare_cached` новых соединений, заданная [`sql_trace_on`].
+pub(crate) fn statement_cache_override() -> Option<usize> {
+    SQL_TRACE
+        .load(Ordering::Relaxed)
+        .then(|| SQL_CACHE.load(Ordering::Relaxed))
+        .filter(|&c| c > 0)
+}
+
+/// Учёт текстов SQL соединения `conn` базы `path` (зовёт [`crate::Db`] при открытии соединения),
+/// если включён [`sql_trace_on`].
 pub(crate) fn trace_statements(conn: &rusqlite::Connection, path: &Path) {
+    if !SQL_TRACE.load(Ordering::Relaxed) {
+        return;
+    }
     let i = SQL_NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % SQL_SLOTS;
     sql_slot(i).0 = path.to_path_buf();
     conn.trace_v2(
@@ -227,9 +253,22 @@ pub fn sql_texts_stop() -> Vec<(PathBuf, Vec<SqlText>)> {
 // ---------- проходы каналов FTS (проверка пропуска пустых, M7.1 задача 9) ----------
 
 static FTS_RUNS: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Default::default);
+/// Счёт проходов включён ([`count_fts_channels`]): без него `fts_channels` не берёт блокировку и
+/// не копирует путь базы.
+static FTS_COUNT: AtomicBool = AtomicBool::new(false);
+
+/// Включить счёт проходов каналов FTS процесса ([`fts_channel_runs`]).
+pub fn count_fts_channels() {
+    FTS_COUNT.store(true, Ordering::SeqCst);
+}
+
+/// Счёт проходов включён ([`count_fts_channels`]).
+pub(crate) fn fts_counting() -> bool {
+    FTS_COUNT.load(Ordering::Relaxed)
+}
 
 /// Каналы FTS базы `path` выполнили `MATCH` (`fts_channels` не пропустил их проверкой
-/// `any_live_entry`).
+/// `any_live_entry`); зовётся только при [`fts_counting`].
 pub(crate) fn fts_channels_ran(path: &Path) {
     *FTS_RUNS
         .lock()
@@ -238,8 +277,9 @@ pub(crate) fn fts_channels_ran(path: &Path) {
         .or_default() += 1;
 }
 
-/// Сколько раз каналы FTS базы `path` выполняли `MATCH` (`search_fts_channels`,
-/// `search_fts_channels_light`; пропущенные проверкой живых записей — не в счёт).
+/// Сколько раз каналы FTS базы `path` выполняли `MATCH` с [`count_fts_channels`]
+/// (`search_fts_channels`, `search_fts_channels_light`; пропущенные проверкой живых записей — не
+/// в счёт).
 pub fn fts_channel_runs(path: &Path) -> u64 {
     FTS_RUNS
         .lock()
