@@ -20,7 +20,18 @@
   --callout-important: #8250df;
   --callout-warning: #9a6700;
   --callout-caution: #cf222e;
-  --header-h: 52px;
+  /* безопасные области экрана (вырез, закруглённые углы; `viewport-fit=cover` в index.html) */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  /* высота шапки — с верхней безопасной областью: на неё опираются все липкие панели */
+  --header-h: calc(52px + var(--safe-top));
+  /* высота окна: 100dvh — без адресной строки мобильного браузера, запасная — 100vh */
+  --app-h: 100vh;
+}
+@supports (height: 100dvh) {
+  :root { --app-h: 100dvh; }
 }
 /* тёмная тема — только на экране: печать и PDF всегда светлые (print.css, M5.5) */
 @media screen and (prefers-color-scheme: dark) {
@@ -87,12 +98,72 @@ button:disabled { opacity: 0.5; cursor: default; }
 .muted { color: var(--muted); }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .overlay { position: fixed; inset: 0; z-index: 50; background: rgb(0 0 0 / 0.5); }
+/* ширина окна — `--dialog-w` (у диалога побольше — своя переменная, не своя ширина) */
 .dialog {
   position: fixed; top: 50%; left: 50%; z-index: 51; transform: translate(-50%, -50%);
-  width: min(520px, 92vw);
+  width: min(var(--dialog-w, 520px), 92vw);
 }
 .warn { background: var(--warn-bg); color: var(--warn-text); padding: 8px 10px; border-radius: 6px; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
 code { font-family: ui-monospace, Consolas, monospace; }
 .token-field { width: 100%; font-family: ui-monospace, Consolas, monospace; }
+
+/* ---- адаптивная вёрстка (M7.2, §5.1): ширины — только из web/src/lib/layout.ts ---- */
+
+/* Таблица шире области прокручивается внутри обёртки; страница вбок — нет (§5.1 п. 6). */
+.table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+/* Полоса (журналы пространства, вкладки документа, чипы статусов — §5.1 п. 4): одна строка с
+   прокруткой внутри полосы и привязкой к пунктам; выбранный пункт держит в видимой части
+   действие `revealSelected` (viewport.svelte.ts). На настольном — перенос строк. */
+.strip {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+}
+.strip::-webkit-scrollbar { display: none; }
+.strip > * {
+  flex: none;
+  white-space: nowrap;
+  scroll-snap-align: start;
+}
+@media (min-width: 1024px) {
+  .strip { flex-wrap: wrap; overflow: visible; }
+}
+
+/* Телефон: диалог во всю ширину, высота — до 90 % окна, прокрутка внутри (§5.1 п. 7). */
+@media (max-width: 719px) {
+  .dialog {
+    width: 100%;
+    max-height: 90vh;
+    max-height: 90dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+}
+
+/* Сенсорный ввод (§5.1 п. 2): цели касания не меньше 44 × 44 px (WCAG 2.2 SC 2.5.5, Apple HIG),
+   шрифт полей — не меньше 16 px (Safari на iOS иначе увеличивает страницу при фокусе). Мышь на
+   узком окне — прежние размеры. */
+@media (pointer: coarse) {
+  button, select { min-height: 44px; }
+  button { min-width: 44px; }
+  input:not([type='checkbox'], [type='radio'], [type='range'], [type='file']) { min-height: 44px; }
+  input, select, textarea { font-size: 16px !important; }
+  .strip > a, .strip > button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
+    min-width: 44px;
+  }
+}

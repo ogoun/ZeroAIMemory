@@ -117,4 +117,11 @@
   .menu button.danger {
     color: var(--danger);
   }
+  /* сенсорный ввод (M7.2, §5.1 п. 7): пункты по 44 px */
+  @media (pointer: coarse) {
+    .menu button {
+      min-height: 44px;
+      padding: 10px 14px;
+    }
+  }
 </style>

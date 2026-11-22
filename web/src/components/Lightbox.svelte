@@ -123,7 +123,7 @@
   }
   .lb-stage img {
     max-width: 100%;
-    max-height: calc(100vh - 80px);
+    max-height: calc(var(--app-h) - 80px);
     cursor: zoom-in;
     background: #fff;
   }

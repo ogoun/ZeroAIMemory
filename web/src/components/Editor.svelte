@@ -426,7 +426,7 @@
     gap: 16px;
   }
   .pane {
-    height: calc(100vh - var(--header-h) - 150px);
+    height: calc(var(--app-h) - var(--header-h) - 150px);
     min-height: 320px;
     overflow: auto;
     border: 1px solid var(--border);
@@ -446,7 +446,8 @@
     padding: 12px 16px;
   }
   :global(.dialog.conflict) {
-    width: min(860px, 94vw);
+    /* ширина — переменной: на телефоне окно во всю ширину (app.css) */
+    --dialog-w: 860px;
   }
   .conflict-diff {
     margin-top: 12px;
@@ -455,7 +456,8 @@
     margin-top: 16px;
     justify-content: flex-end;
   }
-  @media (max-width: 999px) {
+  /* две колонки «рядом» — с 1024 px (BP_DESKTOP, layout.ts) */
+  @media (max-width: 1023px) {
     .split {
       grid-template-columns: minmax(0, 1fr);
     }

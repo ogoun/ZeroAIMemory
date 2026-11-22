@@ -30,10 +30,23 @@ function watch(page: Page): string[] {
   return problems;
 }
 
-/** Открывает приложение с общей сессией (вход — один раз в global-setup). */
+/**
+ * Открывает приложение с общей сессией (вход — один раз в global-setup). На телефоне «Выйти» — в
+ * меню аккаунта шапки (M7.2, §5.1 п. 3): помощник открывает меню, ждёт «Выйти» и закрывает меню.
+ */
 async function login(page: Page) {
   await page.goto(base());
-  await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+  const out = page.getByRole('button', { name: 'Выйти' });
+  const menu = page.getByRole('button', { name: 'Меню аккаунта', exact: true });
+  await expect(out.or(menu).first()).toBeVisible();
+  if (await menu.isVisible()) {
+    await menu.click();
+    await expect(out).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(out).toHaveCount(0);
+  } else {
+    await expect(out).toBeVisible();
+  }
 }
 
 // По CSS, а не по роли: на узком экране скрытая панель inert и выпадает из дерева доступности.

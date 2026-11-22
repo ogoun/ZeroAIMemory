@@ -53,7 +53,7 @@
 <style>
   .text-view {
     margin: 0;
-    max-height: calc(100vh - var(--header-h) - 170px);
+    max-height: calc(var(--app-h) - var(--header-h) - 170px);
     overflow: auto;
     padding: 12px 14px;
     border: 1px solid var(--border);

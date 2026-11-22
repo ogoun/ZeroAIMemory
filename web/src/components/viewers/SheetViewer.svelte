@@ -328,7 +328,7 @@
   }
   .grid {
     position: relative;
-    height: calc(100vh - var(--header-h) - 220px);
+    height: calc(var(--app-h) - var(--header-h) - 220px);
     min-height: 360px;
     overflow: auto;
     border: 1px solid var(--border);

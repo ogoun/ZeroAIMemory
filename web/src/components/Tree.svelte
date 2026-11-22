@@ -840,4 +840,26 @@
     padding: 2px 8px;
     font-size: 12px;
   }
+  /* сенсорный ввод (M7.2, §5.1 п. 2): строка, раскрывашка, ссылка и «⋯» — не меньше 44 × 44 px */
+  @media (pointer: coarse) {
+    .tree-row {
+      min-height: 44px;
+    }
+    .twisty,
+    .more {
+      width: 44px;
+      height: 44px;
+    }
+    .label {
+      min-height: 44px;
+    }
+    .tag.pending {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+    }
+    .tree-note {
+      padding-left: calc(52px + var(--depth) * 14px);
+    }
+  }
 </style>

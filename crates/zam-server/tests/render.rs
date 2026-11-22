@@ -101,14 +101,58 @@ async fn render_resolves_wikilinks_in_base_node_space() {
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }
 
+/// Кэш `highlight.css` — проверкой по `ETag` (M7.2, §5.1 п. 10): прежде `public, max-age=86400`
+/// и ручная версия `?v=` в адресе WebUI; параметр по-прежнему принимается и ничего не меняет.
 #[tokio::test]
 async fn highlight_css_is_cacheable() {
     let a = api("render-css", |_| {}).await;
     let r = a.t(Method::GET, "/api/v1/render/highlight.css", None).await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.header("content-type"), "text/css; charset=utf-8");
-    assert_eq!(r.header("cache-control"), "public, max-age=86400");
+    assert_eq!(r.header("cache-control"), "private, no-cache");
     assert!(!r.body.is_empty());
+    let v = a
+        .t(Method::GET, "/api/v1/render/highlight.css?v=2", None)
+        .await;
+    assert_eq!(v.status, StatusCode::OK);
+    assert_eq!(v.body, r.body);
+    assert_eq!(v.header("etag"), r.header("etag"));
+}
+
+/// `ETag` по хэшу содержимого: повтор с `If-None-Match` — 304 без тела, с тем же `ETag` и
+/// `Cache-Control`; другой или слабый тег — по правилам `If-None-Match` (список, `W/`, `*`).
+#[tokio::test]
+async fn highlight_css_etag_304() {
+    let a = api("render-css-etag", |_| {}).await;
+    const URI: &str = "/api/v1/render/highlight.css";
+    let r = a.t(Method::GET, URI, None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let etag = r.header("etag").to_string();
+    let hex = etag
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("ETag не в кавычках: {etag}"));
+    assert!(
+        hex.len() >= 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{etag}"
+    );
+    assert!(r.header("cache-control").contains("no-cache"));
+
+    let cond = async |tag: &str| {
+        a.tok_h(&a.token, Method::GET, URI, None, &[("if-none-match", tag)])
+            .await
+    };
+    let hit = cond(&etag).await;
+    assert_eq!(hit.status, StatusCode::NOT_MODIFIED);
+    assert!(hit.body.is_empty());
+    assert_eq!(hit.header("etag"), etag);
+    assert!(hit.header("cache-control").contains("no-cache"));
+    for t in [format!("W/{etag}"), format!("\"x\", {etag}"), "*".into()] {
+        assert_eq!(cond(&t).await.status, StatusCode::NOT_MODIFIED, "{t}");
+    }
+    let miss = cond("\"0000\"").await;
+    assert_eq!(miss.status, StatusCode::OK);
+    assert_eq!(miss.body, r.body);
 }
 
 /// Бюджет HTML подсветки на документ (ревью задачи 8 M5, раунд 2): заметка из 1000 блоков JSON
