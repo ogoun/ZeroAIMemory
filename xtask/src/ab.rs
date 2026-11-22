@@ -18,6 +18,15 @@
 //!   выдачей памяти.
 //! - **Память** — `GET /sessions/{id}` сервера (`--server`, токен `--token` или `ZAM_TOKEN`):
 //!   сумма `tokens` по событиям и `holdout`; 404 (плечо без памяти) — 0; без `--server` — нет.
+//!   С M7.2 (§5.8 п. 4, решение координатора 27) — вместе с субагентами сессии
+//!   (`GET /sessions?parent=<id>&tokens=true`, как журналы субагентов в транскриптах): `memory` —
+//!   сумма, `memory_session` — только сессия (сравнение с отчётами 0.0.14), `subagents` — их
+//!   число. Сервер без признака `sessions_parent` (`/health.features`; `/health` не ответил —
+//!   проба `?parent=`, на 400) — один обход `GET /sessions?limit=500&tokens=true` по `parent_id`
+//!   с предупреждением ([`Server`]).
+//! - **Выдано без сессии** (`--unattributed-days N`, 30) — `GET /sessions/unattributed?days=N`:
+//!   раздел вне плеч, JSON `unattributed {days, calls, tokens, by_event}` и предупреждение при
+//!   T > 0 (выдача MCP без сессии агента ни в один прогон не попала).
 //! - **Метки** (`--runs`, `eval/ab/runs.toml`): `[[run]] task, arm, rep, session, outcome =
 //!   pass|fail`; сравнения — `[[compare]] base, arm`, без них — известные пары §12 (`off` →
 //!   `memory`, `nomap` → `map`, `noimpact` → `impact`; контрольная группа реальных сессий —
@@ -42,6 +51,14 @@ use crate::eval::metrics::{BOOTSTRAP_M6, Estimate, SEED, estimate_with, ratio_es
 const LINE_MAX: usize = 64 * 1024 * 1024;
 /// Срок запроса к серверу.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Окно выдачи без сессии по умолчанию (`--unattributed-days`), суток.
+const UNATTRIBUTED_DAYS: u32 = 30;
+/// Предел списка `GET /sessions` сервера: субагентов одной сессии и сессий обхода.
+const SESSIONS_LIMIT: u32 = 500;
+/// Признак `GET /sessions?parent=` в `/health.features` (M7 §5.8 п. 1).
+const PARENT_FEATURE: &str = "sessions_parent";
+/// Признак `GET /sessions/unattributed` (M6 §7.1).
+const UNATTRIBUTED_FEATURE: &str = "unattributed";
 /// Известные пары плеч §12: (база, плечо).
 const KNOWN_PAIRS: [(&str, &str); 4] = [
     ("off", "memory"),
@@ -70,6 +87,10 @@ pub struct AbArgs {
     /// Прогоны без журнала не ошибка: они перечисляются в `missing` и в агрегаты не входят
     #[arg(long)]
     pub allow_missing: bool,
+    /// Окно раздела «Выдано без сессии», суток UTC (GET /sessions/unattributed?days=N)
+    #[arg(long, default_value_t = UNATTRIBUTED_DAYS,
+          value_parser = clap::value_parser!(u32).range(1..=366))]
+    pub unattributed_days: u32,
 }
 
 /// Исход прогона.
@@ -412,31 +433,214 @@ fn transcripts(dir: &Path) -> Result<BTreeMap<String, (Usage, usize)>> {
     Ok(scan.finish())
 }
 
-/// Память сессии с сервера: (токены по всем событиям, holdout); 404 — `(0, false)`.
-fn memory_of(agent: &ureq::Agent, base: &str, token: &str, id: &str) -> Result<(u64, bool)> {
-    let url = format!(
-        "{}/api/v1/sessions/{}",
-        base.trim_end_matches('/'),
-        encode_segment(id)
-    );
-    let mut r = agent
-        .get(&url)
-        .header("Authorization", &format!("Bearer {token}"))
-        .call()
-        .with_context(|| format!("GET {url}"))?;
-    let st = r.status().as_u16();
-    let text = r.body_mut().read_to_string()?;
-    match st {
-        200 => {}
-        404 => return Ok((0, false)),
-        _ => bail!("GET {url}: HTTP {st}: {text}"),
-    }
-    let v: Value = serde_json::from_str(&text).with_context(|| format!("GET {url}: не JSON"))?;
-    let tokens = v["tokens"]
+/// Сумма `tokens` сессии по всем событиям.
+fn tokens_of(session: &Value) -> u64 {
+    session["tokens"]
         .as_object()
         .map(|m| m.values().filter_map(|e| e["tokens"].as_u64()).sum())
-        .unwrap_or(0);
-    Ok((tokens, v["holdout"].as_bool() == Some(true)))
+        .unwrap_or(0)
+}
+
+/// `items` ответа-списка сервера.
+fn items_of(text: &str, what: &str) -> Result<Vec<Value>> {
+    let v: Value = serde_json::from_str(text).with_context(|| format!("GET {what}: не JSON"))?;
+    Ok(v["items"].as_array().cloned().unwrap_or_default())
+}
+
+/// Память прогона с сервера: сессия и её субагенты.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RunMemory {
+    /// Токены сессии по всем событиям.
+    session: u64,
+    /// Число субагентов сессии.
+    subagents: u64,
+    /// Токены субагентов.
+    subagent_tokens: u64,
+    holdout: bool,
+}
+
+/// Сервер памяти прогонов (`--server`): возможности из `/health`, сессии и субагенты прогонов,
+/// выдача без сессии (M7 §5.8 п. 4); предупреждения — в отчёт.
+struct Server {
+    agent: ureq::Agent,
+    base: String,
+    token: String,
+    /// `features` из `GET /health` (у сервера до M6 поля нет — пусто); `None` — `/health` не
+    /// ответил: возможности неизвестны.
+    features: Option<BTreeSet<String>>,
+    /// Субагенты — `GET /sessions?parent=`; `false` — обходом списка ([`Server::listed`]).
+    by_parent: bool,
+    /// Сессии обхода `GET /sessions?limit=500&tokens=true` (читаются один раз).
+    listed: Option<Vec<Value>>,
+    warnings: Vec<String>,
+}
+
+impl Server {
+    fn connect(agent: ureq::Agent, base: &str, token: String) -> Server {
+        let mut s = Server {
+            agent,
+            base: base.trim_end_matches('/').to_string(),
+            token,
+            features: None,
+            by_parent: true,
+            listed: None,
+            warnings: Vec::new(),
+        };
+        // сеть или не JSON — возможности неизвестны: решают ответы самих запросов
+        s.features = match s.get("/api/v1/health") {
+            Ok((200, text)) => serde_json::from_str::<Value>(&text).ok().map(|v| {
+                v["features"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|f| f.as_str().map(str::to_string))
+                    .collect()
+            }),
+            _ => None,
+        };
+        s.by_parent = s.has(PARENT_FEATURE) != Some(false);
+        s
+    }
+
+    /// Признак `f` сервера; `None` — возможности неизвестны.
+    fn has(&self, f: &str) -> Option<bool> {
+        self.features.as_ref().map(|x| x.contains(f))
+    }
+
+    /// `GET <path>` с токеном: (HTTP-статус, тело).
+    fn get(&self, path: &str) -> Result<(u16, String)> {
+        let url = format!("{}{path}", self.base);
+        let mut r = self
+            .agent
+            .get(&url)
+            .header("Authorization", &format!("Bearer {}", self.token))
+            .call()
+            .with_context(|| format!("GET {url}"))?;
+        let st = r.status().as_u16();
+        Ok((st, r.body_mut().read_to_string()?))
+    }
+
+    /// Память прогона сессии `id`: `GET /sessions/{id}` (404 — плечо без памяти: 0) и субагенты.
+    fn run(&mut self, id: &str) -> Result<RunMemory> {
+        let path = format!("/api/v1/sessions/{}", encode_segment(id));
+        let (st, text) = self.get(&path)?;
+        let (session, holdout) = match st {
+            200 => {
+                let v: Value =
+                    serde_json::from_str(&text).with_context(|| format!("GET {path}: не JSON"))?;
+                (tokens_of(&v), v["holdout"].as_bool() == Some(true))
+            }
+            404 => (0, false),
+            _ => bail!("GET {path}: HTTP {st}: {text}"),
+        };
+        let subs = self.subagents(id)?;
+        Ok(RunMemory {
+            session,
+            subagents: subs.len() as u64,
+            subagent_tokens: subs.iter().map(tokens_of).sum(),
+            holdout,
+        })
+    }
+
+    /// Сессии субагентов сессии `id`: `GET /sessions?parent=`; сервер без параметра (400) или
+    /// без признака — обход списка.
+    fn subagents(&mut self, id: &str) -> Result<Vec<Value>> {
+        if self.by_parent {
+            let path = format!(
+                "/api/v1/sessions?parent={}&tokens=true&limit={SESSIONS_LIMIT}",
+                encode_segment(id)
+            );
+            let (st, text) = self.get(&path)?;
+            match st {
+                200 => return items_of(&text, &path),
+                // `ListQuery` старого сервера разбирается строго: неизвестный `parent` — 400
+                400 => self.by_parent = false,
+                _ => bail!("GET {path}: HTTP {st}: {text}"),
+            }
+        }
+        Ok(self
+            .listed()?
+            .iter()
+            .filter(|s| s["parent_id"].as_str() == Some(id))
+            .cloned()
+            .collect())
+    }
+
+    /// Сессии обхода `GET /sessions?limit=500&tokens=true` — один запрос на отчёт и одно
+    /// предупреждение (субагенты сессий старше 500 последних не найдутся).
+    fn listed(&mut self) -> Result<&[Value]> {
+        if self.listed.is_none() {
+            let why = match self.has(PARENT_FEATURE) {
+                Some(false) => format!("сервер без признака {PARENT_FEATURE} в /health.features"),
+                _ => format!(
+                    "сервер ответил 400 на GET /sessions?parent= (признак {PARENT_FEATURE} неизвестен)"
+                ),
+            };
+            let path = format!("/api/v1/sessions?limit={SESSIONS_LIMIT}&tokens=true");
+            let (st, text) = self.get(&path)?;
+            let list = if st == 200 {
+                self.warnings.push(format!(
+                    "{why}: субагенты прогонов найдены обходом GET /sessions?limit={SESSIONS_LIMIT}\
+                     &tokens=true по parent_id — субагенты сессий старше {SESSIONS_LIMIT} последних \
+                     не учтены; обновите zam-server"
+                ));
+                items_of(&text, &path)?
+            } else {
+                self.warnings.push(format!(
+                    "{why}; обход GET /sessions?limit={SESSIONS_LIMIT}&tokens=true — HTTP {st}: \
+                     субагенты прогонов не учтены"
+                ));
+                Vec::new()
+            };
+            self.listed = Some(list);
+        }
+        Ok(self.listed.as_deref().unwrap_or_default())
+    }
+
+    /// Выдача без сессии за `days` суток: `{days, calls, tokens, by_event: {событие: {calls,
+    /// tokens}}}`; сервер без маршрута (признака нет или 404 — до M6) — `None` с предупреждением.
+    fn unattributed(&mut self, days: u32) -> Result<Option<Value>> {
+        let missing = |why: &str| {
+            format!(
+                "выдача без сессии не посчитана: {why} — нужен сервер с GET /sessions/unattributed \
+                 (M6, признак {UNATTRIBUTED_FEATURE})"
+            )
+        };
+        if self.has(UNATTRIBUTED_FEATURE) == Some(false) {
+            let w = missing(&format!("в /health.features нет {UNATTRIBUTED_FEATURE}"));
+            self.warnings.push(w);
+            return Ok(None);
+        }
+        let path = format!("/api/v1/sessions/unattributed?days={days}");
+        let (st, text) = self.get(&path)?;
+        match st {
+            200 => {}
+            404 => {
+                self.warnings.push(missing("сервер ответил 404"));
+                return Ok(None);
+            }
+            _ => bail!("GET {path}: HTTP {st}: {text}"),
+        }
+        let mut by: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for r in items_of(&text, &path)? {
+            let e = by
+                .entry(r["event"].as_str().unwrap_or("?").to_string())
+                .or_default();
+            e.0 += r["calls"].as_u64().unwrap_or(0);
+            e.1 += r["tokens"].as_u64().unwrap_or(0);
+        }
+        let (calls, tokens) = by.values().fold((0, 0), |a, v| (a.0 + v.0, a.1 + v.1));
+        let by_event: serde_json::Map<String, Value> = by
+            .into_iter()
+            .map(|(e, (c, t))| (e, json!({"calls": c, "tokens": t})))
+            .collect();
+        Ok(Some(json!({
+            "days": days,
+            "calls": calls,
+            "tokens": tokens,
+            "by_event": by_event,
+        })))
+    }
 }
 
 /// Процентное кодирование сегмента пути (id сессии).
@@ -467,8 +671,12 @@ struct RunRow {
     output: u64,
     total: u64,
     tool_calls: u64,
-    /// Выдано памятью (`GET /sessions/{id}`); `null` — без `--server`.
+    /// Выдано памятью сессии и её субагентам; `null` — без `--server`.
     memory: Option<u64>,
+    /// Выдано памятью только сессии (`GET /sessions/{id}`, как в отчётах 0.0.14).
+    memory_session: Option<u64>,
+    /// Субагентов сессии на сервере.
+    subagents: Option<u64>,
     holdout: Option<bool>,
 }
 
@@ -482,12 +690,13 @@ fn metric(r: &RunRow, name: &str) -> f64 {
         "total" => r.total as f64,
         "tool_calls" => r.tool_calls as f64,
         "memory" => r.memory.unwrap_or(0) as f64,
+        "memory_session" => r.memory_session.unwrap_or(0) as f64,
         "pass" => f64::from(u8::from(r.outcome == Outcome::Pass)),
         _ => unreachable!("метрика {name}"),
     }
 }
 
-const METRICS: [&str; 7] = [
+const METRICS: [&str; 8] = [
     "input",
     "cache_read",
     "cache_creation",
@@ -495,6 +704,7 @@ const METRICS: [&str; 7] = [
     "total",
     "tool_calls",
     "memory",
+    "memory_session",
 ];
 
 /// Среднее метрики по повторам задачи в плече: задача → значение.
@@ -645,16 +855,18 @@ fn consistency_warnings(rows: &[RunRow]) -> Vec<String> {
 fn markdown(j: &Value) -> String {
     let mut s = format!(
         "# Агентный A/B (M6 §12)\n\nпрогонов {}, задач {}; интервалы — 95 % бутстреп задач \
-         ({BOOTSTRAP_M6} выборок)\n\n## Плечи (среднее на задачу)\n\n\
+         ({BOOTSTRAP_M6} выборок); память — сессия с субагентами, память сессии — без них\n\n\
+         ## Плечи (среднее на задачу)\n\n\
          | плечо | прогонов | задач | вход | кэш чтение | кэш запись | выход | всего | память | \
-         инструменты | доля успешных |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
+         память сессии | инструменты | доля успешных |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|\n",
         j["runs"], j["tasks"]
     );
     if let Some(arms) = j["arms"].as_object() {
         for (name, a) in arms {
             let pt = &a["per_task"];
             s.push_str(&format!(
-                "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 a["runs"],
                 a["tasks"],
                 est0(&pt["input"]),
@@ -663,6 +875,7 @@ fn markdown(j: &Value) -> String {
                 est0(&pt["output"]),
                 est0(&pt["total"]),
                 est0(&pt["memory"]),
+                est0(&pt["memory_session"]),
                 est(&pt["tool_calls"]),
                 est(&a["pass_rate"]),
             ));
@@ -687,6 +900,24 @@ fn markdown(j: &Value) -> String {
                 est(&c["r_tool_calls"]),
                 est(&c["d_pass_rate"]),
             ));
+        }
+    }
+    let u = &j["unattributed"];
+    if u.is_object() {
+        s.push_str(&format!("\n## Выдано без сессии за {} сут.\n\n", u["days"]));
+        match u["by_event"].as_object().filter(|m| !m.is_empty()) {
+            None => s.push_str("Вне плеч и прогонов: выдачи без сессии нет.\n"),
+            Some(by) => {
+                s.push_str(&format!(
+                    "Вне плеч и прогонов — MCP без привязки к сессии агента \
+                     (`GET /sessions/unattributed`): вызовов {}, токенов {}.\n\n\
+                     | событие | вызовов | токенов |\n|---|---|---|\n",
+                    u["calls"], u["tokens"]
+                ));
+                for (event, v) in by {
+                    s.push_str(&format!("| {event} | {} | {} |\n", v["calls"], v["tokens"]));
+                }
+            }
         }
     }
     let missing = j["missing"].as_array().cloned().unwrap_or_default();
@@ -718,7 +949,7 @@ pub fn main(a: AbArgs) -> Result<()> {
         bail!("{}: нет ни одного [[run]]", a.runs.display());
     }
     let usage = transcripts(&a.transcripts)?;
-    let server = match &a.server {
+    let mut server = match &a.server {
         Some(url) => {
             let token = a
                 .token
@@ -726,7 +957,11 @@ pub fn main(a: AbArgs) -> Result<()> {
                 .or_else(|| std::env::var("ZAM_TOKEN").ok())
                 .filter(|t| !t.trim().is_empty())
                 .context("--server: нужен токен (--token или ZAM_TOKEN)")?;
-            Some((crate::smoke::agent_with(HTTP_TIMEOUT), url.clone(), token))
+            Some(Server::connect(
+                crate::smoke::agent_with(HTTP_TIMEOUT),
+                url,
+                token,
+            ))
         }
         None => None,
     };
@@ -740,8 +975,8 @@ pub fn main(a: AbArgs) -> Result<()> {
                                 "session": r.session, "outcome": r.outcome}));
             continue;
         }
-        let mem = match &server {
-            Some((ag, url, tok)) => Some(memory_of(ag, url, tok, &r.session)?),
+        let mem = match server.as_mut() {
+            Some(s) => Some(s.run(&r.session)?),
             None => None,
         };
         rows.push(RunRow {
@@ -757,8 +992,10 @@ pub fn main(a: AbArgs) -> Result<()> {
             output: u.output,
             total: u.total(),
             tool_calls: u.tool_calls,
-            memory: mem.map(|m| m.0),
-            holdout: mem.map(|m| m.1),
+            memory: mem.map(|m| m.session + m.subagent_tokens),
+            memory_session: mem.map(|m| m.session),
+            subagents: mem.map(|m| m.subagents),
+            holdout: mem.map(|m| m.holdout),
         });
     }
     if !missing.is_empty() && !a.allow_missing {
@@ -788,6 +1025,23 @@ pub fn main(a: AbArgs) -> Result<()> {
             None => warnings.push(format!("сравнение {x} / {b}: нет общих задач")),
         }
     }
+    // выдача без сессии — вне плеч (M7 §5.8 п. 4): ни в один прогон она не попала
+    let unattributed = match server.as_mut() {
+        Some(s) => s.unattributed(a.unattributed_days)?,
+        None => None,
+    };
+    if let Some(u) = &unattributed
+        && u["tokens"].as_u64().is_some_and(|t| t > 0)
+    {
+        warnings.push(format!(
+            "часть выдачи памяти не отнесена к прогонам: MCP без сессии — вызовов {}, токенов {} \
+             за {} сут. (раздел «Выдано без сессии»; MCP через zam mcp передаёт сессию агента)",
+            u["calls"], u["tokens"], u["days"]
+        ));
+    }
+    if let Some(s) = server.as_mut() {
+        warnings.append(&mut s.warnings);
+    }
     let j = json!({
         "runs": rows.len(),
         "tasks": tasks.len(),
@@ -796,6 +1050,7 @@ pub fn main(a: AbArgs) -> Result<()> {
         "run": rows,
         "arms": arms_j,
         "compare": cmp,
+        "unattributed": unattributed,
         "missing": missing,
         "warnings": warnings,
     });
@@ -953,6 +1208,8 @@ mod tests {
             total: 0,
             tool_calls: 0,
             memory,
+            memory_session: memory,
+            subagents: memory.map(|_| 0),
             holdout,
         };
         let w = consistency_warnings(&[

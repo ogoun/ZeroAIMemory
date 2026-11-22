@@ -6953,6 +6953,7 @@ dependencies = [
  "blake3",
  "clap",
  "globset",
+ "jiff",
  "regex",
  "rpassword",
  "rusqlite",

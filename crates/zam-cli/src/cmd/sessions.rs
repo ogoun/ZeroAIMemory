@@ -9,14 +9,26 @@
 //!   MCP — чтений MCP с пометкой из чтений MCP (`mcp_read`). `<id>` — одна сессия; `--last N` — сумма по N последним (свежие первыми, 1..=500); без
 //!   обоих — сессия агента (`ZAM_SESSION`, сессия хуков проекта), иначе последняя.
 //!   `--by-holdout` — суммы отдельно по контрольной группе A/B (`holdout`, M6 §12) и остальным.
-//!   Время — UTC `yyyy-MM-dd HH:mm:ss` ([`agent_time`]); `--json` — сессии с `tokens` и суммы.
+//!   `--subagents` (M7 §5.8 п. 2) — к сессии прибавляются её субагенты (`GET /sessions?parent=`,
+//!   строка «с субагентами: N»). Время — UTC `yyyy-MM-dd HH:mm:ss` ([`agent_time`]); `--json` —
+//!   сессии с `tokens` и суммы. Последняя строка текста — «без сессии за 30 сут.: …», если была
+//!   выдача без сессии ([`unattributed_line`]);
+//! - `zam sessions tokens --unattributed [--days N]` (M7 §5.8 п. 2) — выдача без сессии (MCP по
+//!   HTTP без привязки к сессии агента, `GET /sessions/unattributed`): «сутки · событие ·
+//!   вызовов · токенов» и итог; `--json` — строки сервера и сумма.
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
 use super::hook::encode_segment;
-use super::{Ctx, agent_time, emit, emit_json};
+use super::{Ctx, agent_time, emit, emit_json, old_server};
 use crate::client::{CliError, read_json};
+
+/// Окно выдачи без сессии по умолчанию (`--days`) и окно строки «без сессии» в выводе сессий,
+/// суток.
+pub const UNATTRIBUTED_DAYS: u32 = 30;
+/// Предел субагентов сессии в `--subagents` (предел `GET /sessions`).
+const SUBAGENTS_MAX: &str = "500";
 
 /// Порядок строк таблицы: события сервера, затем хуков с локальным выводом; прочие — по имени.
 const ORDER: [&str; 13] = [
@@ -171,16 +183,118 @@ fn fetch(ctx: &Ctx, pick: &Pick) -> Result<Vec<Value>, CliError> {
     }
 }
 
-/// `zam sessions tokens`.
-pub fn tokens(ctx: &Ctx, pick: &Pick, by_holdout: bool) -> Result<(), CliError> {
+/// Сессии субагентов сессии `id` с `tokens` (`GET /sessions?parent=`, M7 §5.8 п. 1). Сервер без
+/// параметра отвечает 400 (`ListQuery` разбирается строго) — код 1 с подсказкой обновить сервер.
+fn fetch_subagents(ctx: &Ctx, id: &str) -> Result<Vec<Value>, CliError> {
+    let v = ctx
+        .client
+        .get(
+            "/sessions",
+            &[("parent", id), ("tokens", "true"), ("limit", SUBAGENTS_MAX)],
+        )
+        .and_then(read_json)
+        .map_err(|e| {
+            old_server(
+                ctx,
+                e,
+                &[400],
+                "sessions_parent",
+                "сервер не поддерживает субагентов сессии (GET /sessions?parent=): обновите zam-server",
+            )
+        })?;
+    Ok(v["items"].as_array().cloned().unwrap_or_default())
+}
+
+/// Строки выдачи без сессии за `days` суток (`GET /sessions/unattributed?days=N`, M6 §7.1).
+fn fetch_unattributed(ctx: &Ctx, days: u32) -> Result<Vec<Value>, CliError> {
+    let days = days.to_string();
+    let v = read_json(
+        ctx.client
+            .get("/sessions/unattributed", &[("days", days.as_str())])?,
+    )?;
+    Ok(v["items"].as_array().cloned().unwrap_or_default())
+}
+
+/// Сумма вызовов и токенов строк выдачи без сессии.
+fn unattributed_total(rows: &[Value]) -> (u64, u64) {
+    rows.iter().fold((0, 0), |(c, t), r| {
+        (
+            c + r["calls"].as_u64().unwrap_or(0),
+            t + r["tokens"].as_u64().unwrap_or(0),
+        )
+    })
+}
+
+/// Строка «без сессии за 30 сут.: вызовов C, токенов T — zam sessions tokens --unattributed»
+/// под выводом сессий (M7 §5.8 п. 2), если T > 0. Ошибка запроса (сервер до M6 отвечает 404:
+/// маршрута нет) строку просто убирает — основной вывод уже получен.
+fn unattributed_line(ctx: &Ctx) -> Option<String> {
+    let rows = fetch_unattributed(ctx, UNATTRIBUTED_DAYS).ok()?;
+    let (calls, tokens) = unattributed_total(&rows);
+    (tokens > 0).then(|| {
+        format!(
+            "без сессии за {UNATTRIBUTED_DAYS} сут.: вызовов {calls}, токенов {tokens} — \
+             zam sessions tokens --unattributed\n"
+        )
+    })
+}
+
+/// `zam sessions tokens --unattributed [--days N]`: выдача без сессии по суткам UTC и событиям
+/// (свежие первыми, как у сервера) и итог.
+pub fn unattributed(ctx: &Ctx, days: u32) -> Result<(), CliError> {
+    let rows = fetch_unattributed(ctx, days).map_err(|e| {
+        old_server(
+            ctx,
+            e,
+            &[404],
+            "unattributed",
+            "сервер не поддерживает учёт выдачи без сессии (GET /sessions/unattributed): обновите zam-server",
+        )
+    })?;
+    let (calls, tokens) = unattributed_total(&rows);
+    if ctx.json {
+        return emit_json(&json!({
+            "days": days,
+            "items": rows,
+            "total": {"calls": calls, "tokens": tokens},
+        }));
+    }
+    if rows.is_empty() {
+        return emit(format!("выдачи без сессии за {days} сут. нет\n").as_bytes());
+    }
+    let mut s = format!(
+        "выдано без сессии за {days} сут. (MCP по HTTP без привязки к сессии агента; сутки UTC)\n\
+         сутки\tсобытие\tвызовов\tтокенов\n"
+    );
+    for r in &rows {
+        s.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            r["day"].as_str().unwrap_or("?"),
+            r["event"].as_str().unwrap_or("?"),
+            r["calls"].as_u64().unwrap_or(0),
+            r["tokens"].as_u64().unwrap_or(0),
+        ));
+    }
+    s.push_str(&format!("итого\t\t{calls}\t{tokens}\n"));
+    emit(s.as_bytes())
+}
+
+/// `zam sessions tokens`; `subagents` — к единственной выбранной сессии прибавляются её субагенты.
+pub fn tokens(ctx: &Ctx, pick: &Pick, by_holdout: bool, subagents: bool) -> Result<(), CliError> {
     let items = fetch(ctx, pick)?;
+    let subs = match (subagents, items.as_slice()) {
+        (true, [one]) => fetch_subagents(ctx, one["id"].as_str().unwrap_or_default())?,
+        _ => Vec::new(),
+    };
+    let all: Vec<&Value> = items.iter().chain(&subs).collect();
     let groups: Vec<(&str, Vec<&Value>)> = if by_holdout {
-        let (hold, main): (Vec<&Value>, Vec<&Value>) = items
+        let (hold, main): (Vec<&Value>, Vec<&Value>) = all
             .iter()
+            .copied()
             .partition(|s| s["holdout"].as_bool() == Some(true));
         vec![("main", main), ("holdout", hold)]
     } else {
-        vec![("all", items.iter().collect())]
+        vec![("all", all.clone())]
     };
     if ctx.json {
         let g: serde_json::Map<String, Value> = groups
@@ -201,13 +315,16 @@ pub fn tokens(ctx: &Ctx, pick: &Pick, by_holdout: bool) -> Result<(), CliError> 
                 )
             })
             .collect();
-        return emit_json(&json!({ "items": items, "groups": g }));
-    }
-    if items.is_empty() {
-        return emit("сессий нет\n".as_bytes());
+        let mut out = json!({ "items": all, "groups": g });
+        if subagents {
+            out["subagents"] = json!(subs.len());
+        }
+        return emit_json(&out);
     }
     let mut out = String::new();
-    if items.len() == 1 {
+    if items.is_empty() {
+        out.push_str("сессий нет\n");
+    } else if items.len() == 1 {
         out.push_str(&session_line(&items[0]));
     } else {
         // свежие первыми: последняя — первая в списке
@@ -218,7 +335,11 @@ pub fn tokens(ctx: &Ctx, pick: &Pick, by_holdout: bool) -> Result<(), CliError> 
             agent_time(items[0]["last_seen_at"].as_str().unwrap_or("?")),
         ));
     }
-    for (name, list) in &groups {
+    if subagents && !items.is_empty() {
+        out.push_str(&format!("с субагентами: {}\n", subs.len()));
+    }
+    let shown = if items.is_empty() { &[][..] } else { &groups };
+    for (name, list) in shown {
         if by_holdout {
             let title = if *name == "holdout" {
                 "контрольная группа (holdout)"
@@ -231,6 +352,10 @@ pub fn tokens(ctx: &Ctx, pick: &Pick, by_holdout: bool) -> Result<(), CliError> 
             continue;
         }
         out.push_str(&table(&sum(list.iter().copied())));
+    }
+    // выдача без сессии не входит ни в одну сессию — напоминание под выводом (M7 §5.8 п. 2)
+    if let Some(line) = unattributed_line(ctx) {
+        out.push_str(&line);
     }
     emit(out.as_bytes())
 }

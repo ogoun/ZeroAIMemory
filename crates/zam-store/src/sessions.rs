@@ -23,7 +23,8 @@
 //! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12); признак с
 //!   наследованием от родителя — [`session_holdout`];
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
-//!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя;
+//!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя; субагенты сессии —
+//!   [`list_sessions`] с [`SessionFilter::parent`] (M7 §5.8 п. 1);
 //! - `session_tokens` — выданное сессии по событию (§9.5): число выдач `calls`, оценка размера в
 //!   токенах `tokens` и число повторных выдач `reread_calls` (M6 §7.3: `/read` с пометкой «уже
 //!   выдавалось» — у события `read`); `/recall` прибавляет свои события
@@ -356,21 +357,38 @@ pub async fn get_session(db: &Db, id: &str) -> Result<Option<Session>, StoreErro
     .await
 }
 
-/// Сессии базы, свежие первыми; `solution` — только сессии этого решения.
+/// Отбор [`list_sessions`]; `None` — без этого условия, заданные условия действуют вместе.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionFilter<'a> {
+    /// Только сессии этого решения.
+    pub solution: Option<&'a SolutionGuid>,
+    /// Только сессии субагентов этой сессии (`parent_id`, M7 §5.8 п. 1): прямые, без «внуков».
+    pub parent: Option<&'a str>,
+}
+
+/// Сессии базы по отбору `f`, свежие первыми.
 pub async fn list_sessions(
     db: &Db,
-    solution: Option<&SolutionGuid>,
+    f: SessionFilter<'_>,
     limit: usize,
 ) -> Result<Vec<Session>, StoreError> {
-    let solution = solution.map(|g| g.as_str().to_string());
+    let solution = f.solution.map(|g| g.as_str().to_string());
+    let parent = f.parent.map(str::to_string);
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    // с родителем — условие `parent_id = ?` без `IS NULL OR`: тогда план берёт частичный индекс
+    // `sessions_parent` (миграция 0017), а не перебор всех сессий базы
+    let by_parent = if parent.is_some() {
+        "parent_id = ?2"
+    } else {
+        "?2 IS NULL"
+    };
     db.read(move |c| {
         let mut st = c.prepare(&format!(
             "SELECT {SESSION_COLS} FROM sessions
-             WHERE ?1 IS NULL OR solution_guid = ?1
-             ORDER BY last_seen_at DESC, id LIMIT ?2"
+             WHERE {by_parent} AND (?1 IS NULL OR solution_guid = ?1)
+             ORDER BY last_seen_at DESC, id LIMIT ?3"
         ))?;
-        let rows = st.query_map(params![solution, limit], session_row)?;
+        let rows = st.query_map(params![solution, parent, limit], session_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     })
     .await

@@ -110,6 +110,8 @@ fn health_features_documented() {
         "agent_text_masked",
         // подзадачи `part_of`: поля задачи, фильтры ленты и счётчиков (задача 5 M7.2)
         "task_subtasks",
+        // сессии субагентов `GET /sessions?parent=` (задача 9 M7.2)
+        "sessions_parent",
     ] {
         assert!(built.contains(f), "{f}");
     }

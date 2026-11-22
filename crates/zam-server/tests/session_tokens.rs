@@ -339,3 +339,63 @@ async fn sessions_list_with_tokens() {
     let r = a.t(Method::GET, "/api/v1/sessions", None).await;
     assert!(r.json()["items"][0].get("tokens").is_none(), "{}", r.text());
 }
+
+/// M7 §5.8 п. 1 (задача 9 M7.2): `GET /sessions?parent=<id>` — сессии субагентов этой сессии
+/// (`parent_id`), с `tokens=true` — их учёт; сама сессия и субагенты другой сессии в ответ не
+/// входят; у другого пользователя (его база) — пусто; без параметра список прежний; пустой id —
+/// 400.
+#[tokio::test]
+async fn sessions_parent_filter() {
+    let a = api("tokens-parent", |_| {}).await;
+    let post = async |body: Value| a.t(Method::POST, "/api/v1/sessions", Some(body)).await;
+    for body in [
+        json!({"id": "s", "tokens": {"pre_tool": 5}}),
+        json!({"id": "s:a1", "parent_id": "s", "agent_type": "Explore",
+               "tokens": {"subagent_local": 7}}),
+        json!({"id": "s:a2", "parent_id": "s", "agent_type": "Plan",
+               "tokens": {"pre_tool": {"calls": 2, "tokens": 9}}}),
+        json!({"id": "t:b1", "parent_id": "t", "tokens": {"pre_tool": 1}}),
+    ] {
+        let r = post(body.clone()).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
+    }
+    let get = async |token: &str, q: &str| {
+        let r = a
+            .tok(token, Method::GET, &format!("/api/v1/sessions{q}"), None)
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{q}: {}", r.text());
+        r.json()["items"].as_array().unwrap().clone()
+    };
+    let items = get(&a.token, "?parent=s&tokens=true").await;
+    let mut ids: Vec<&str> = items.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["s:a1", "s:a2"], "{items:?}");
+    let by = |id: &str| items.iter().find(|s| s["id"] == id).unwrap().clone();
+    assert_eq!(
+        by("s:a1")["tokens"],
+        json!({"subagent_local": {"calls": 1, "tokens": 7}})
+    );
+    assert_eq!(
+        by("s:a2")["tokens"],
+        json!({"pre_tool": {"calls": 2, "tokens": 9}})
+    );
+    assert!(items.iter().all(|s| s["parent_id"] == "s"), "{items:?}");
+    // без `tokens=true` — прежняя форма строки
+    let plain = get(&a.token, "?parent=s").await;
+    assert_eq!(plain.len(), 2);
+    assert!(plain.iter().all(|s| s.get("tokens").is_none()), "{plain:?}");
+    // субагенты другой сессии и неизвестный родитель
+    assert_eq!(get(&a.token, "?parent=t&tokens=true").await.len(), 1);
+    assert!(get(&a.token, "?parent=s:a1").await.is_empty());
+    // чужая база: у другого пользователя таких сессий нет — пусто, не 404
+    let (_, other) = a.new_user("Борис").await;
+    assert!(get(&other, "?parent=s&tokens=true").await.is_empty());
+    // без параметра — все сессии, как раньше
+    assert_eq!(get(&a.token, "").await.len(), 4);
+    for bad in ["?parent=", "?parent=%20"] {
+        let r = a
+            .t(Method::GET, &format!("/api/v1/sessions{bad}"), None)
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+}

@@ -2866,6 +2866,96 @@ RED: до правки сервера и CLI падали все новые те
   (неверный флаг и id, вид без статусов).
 - Minor 5 (версия «сервер 0.0.15-m7.2 и новее» в справке флагов) — решение координатора: оставить.
 
+### M7.2 · Задача 9 — Выдача без сессии: CLI, WebUI, `xtask ab`
+
+Спецификация §5.8 (решение 27; пре-флайт N22, N23); worktree `.tmp/m72/wt-t9`, ветка `m7.2-t9` от
+`2d7a5401` (задача 5 влита, каркас задачи 1 — ещё нет). Работа в два этапа: **A** — сервер, CLI,
+`xtask ab` (без каркаса), **B** — WebUI «Сессии» и e2e после слияния каркаса задачи 1 в ветку.
+
+**Этап A.**
+
+- **Хранилище.** `list_sessions(db, SessionFilter {solution, parent}, limit)` вместо
+  `(db, solution, limit)`; с `parent` — условие `parent_id = ?` без `IS NULL OR`, чтобы план брал
+  частичный индекс `sessions_parent` (миграция 0017), а не перебирал сессии базы. Пять вызовов
+  `crates/zam-store/tests/sessions.rs` — на `SessionFilter`, новый тест
+  `list_sessions_parent_filter` (прямые субагенты, без «внуков», с решением — оба условия).
+- **Сервер.** `GET /sessions?parent=<id>[&tokens=true]` (`ListQuery.parent`), id — по правилам id
+  сессии (`check_session_id`; пустой, длинный — 400); сессий нет или база другого пользователя —
+  пустой `items`. Признак `sessions_parent` (`FEATURES` — после `task_subtasks`, перед
+  последним), строка `docs/api-compat.md`.
+- **CLI.** `zam sessions tokens --unattributed [--days N]` — таблица «сутки · событие · вызовов ·
+  токенов» и итог, `--json` — `{days, items, total}`; `--subagents` — сессия и её субагенты
+  (`GET /sessions?parent=&tokens=true&limit=500`, строка «с субагентами: N», `--json` — `items`
+  и `subagents`); строка «без сессии за 30 сут.: вызовов C, токенов T — zam sessions tokens
+  --unattributed» последней строкой текста одной сессии и `--last N`, если T > 0. Старый сервер
+  — общий `cmd::old_server` (400 у `parent`, 404 у `unattributed` → `GET /health` без признака →
+  код 1 «обновите zam-server»).
+- **`xtask ab`.** Клиент сервера `ab::Server` (вместо `memory_of`): `/health.features` один раз,
+  на прогон — `GET /sessions/{id}` и субагенты; `RunRow.memory` — сессия и субагенты,
+  `memory_session` — только сессия, `subagents` — их число; метрика `memory_session` — в суммах
+  и средних плеч, столбец «память сессии». `--unattributed-days N` (1..=366, 30) — раздел
+  «Выдано без сессии за N сут.» после сравнений, JSON `unattributed {days, calls, tokens,
+  by_event}`, предупреждение при T > 0.
+
+Решения исполнителя:
+- **`--days` вне 1..=366 — код 6, а не 2** [решение исполнителя, задача 9]: бриф и пре-флайт N22
+  ждали «код 2 от clap, как `--last`», но `zam` переводит любую ошибку разбора clap в код 6
+  (неверный ввод, `main.rs`: «ошибка аргументов — неверный ввод (6), не 2»; код 2 у `zam` —
+  сервер недоступен). Механизм — тот же `value_parser!(u32).range(1..=366)`, что у `--last`
+  (`range(1..=500)`), тест сверяет код `--days 400` с кодом `--last 501` и фиксирует 6.
+  Спецификация §5.8 кода не называет.
+- **`SessionFilter`** [решение исполнителя, задача 9] вместо четвёртого позиционного `Option`:
+  два необязательных условия рядом с `limit` читаются хуже, а третий отбор (`machine`, `agent`)
+  дописывается без смены вызовов.
+- **`--subagents` не с `--last`** [решение исполнителя, задача 9]: спецификация говорит «к
+  сессии»; список `--last N` уже содержит сессии субагентов отдельными строками (они — сессии
+  базы), прибавка их ещё раз удвоила бы счёт. С `--by-holdout` — можно (субагенты наследуют
+  метку родителя).
+- **`--days` только вместе с `--unattributed`** (`requires`), `--unattributed` — не с `<id>`,
+  `--last`, `--by-holdout`, `--subagents` [решение исполнителя, задача 9]: окно строки «без
+  сессии» под выводом сессий — всегда 30 сут. (спецификация), `--days` его не меняет.
+- **Строка «без сессии» и при «сессий нет»** [решение исполнителя, задача 9]: пользователь, у
+  которого весь MCP идёт без сессии, иначе не узнал бы, куда делась выдача. В `--json` строки
+  нет (форма `{items, groups}` прежняя); ошибка запроса `unattributed` (404 у сервера до M6,
+  сеть) строку просто убирает — основной вывод уже получен.
+- **`xtask ab`: признак, затем 400** [решение исполнителя, задача 9; пре-флайт N23]: признак
+  `sessions_parent` есть — `?parent=` на прогон; `features` без него — сразу обход; `/health` не
+  ответил — проба `?parent=`, на 400 — обход до конца отчёта (одна проба). Обход —
+  `GET /sessions?limit=500&tokens=true` один раз на отчёт, одно предупреждение; его отказ — тоже
+  предупреждение, субагенты — 0.
+- **`xtask ab`: субагенты и у сессии с 404** [решение исполнителя, задача 9]: плечо `off` (сессии
+  нет) тоже спрашивает `?parent=`: субагент с выдачей у такого прогона — повод для
+  предупреждения «плечо off, а память выдала …», а не тихий ноль.
+- **`unattributed` сервера без маршрута — `null` с предупреждением** [решение исполнителя,
+  задача 9]: признака `unattributed` нет в `features` или 404 — раздела нет, отчёт строится.
+- **Прежний тест `ab_report_on_fixture`** — ожидание запросов к серверу дополнено `/health`,
+  `?parent=` прогонов и `unattributed?days=30` (поведение изменилось по §5.8 п. 4); прочие
+  ожидания прежние, добавлены `memory_session`, `subagents`, раздел без предупреждения.
+
+Тесты этапа A (TDD): хранилище `tests/sessions.rs` — `list_sessions_parent_filter`; сервер
+`tests/session_tokens.rs` — `sessions_parent_filter` (два субагента с `tokens`, без `tokens=true`
+— прежняя строка, субагенты другой сессии, другой пользователь — пусто, без параметра — весь
+список, `parent=` и `parent=%20` — 400), `boot` — `health_features_documented`; CLI
+`tests/sessions.rs` — `sessions_tokens_unattributed_table` (таблица 30, 366 и 1 сут., `--json`,
+ошибки разбора), `sessions_tokens_line_when_unattributed` (строка у одной сессии и `--last 2
+--by-holdout`, нет — в `--json`, при выдаче только 40 суток назад и без выдачи),
+`sessions_tokens_subagents_sum` (сумма 1590 = 1490 + 100, `ZAM_SESSION`, `--json`, с `--last` —
+код 6), `sessions_tokens_old_server_no_line` (заглушка сервера до M6: строки нет, код 0;
+`--unattributed`, `--subagents` — код 1); `xtask/tests/ab.rs` — `ab_memory_includes_subagents`
+(признак, без признака — один обход, `/health` 404 — одна проба `?parent=` и обход),
+`ab_unattributed_section` (окно 7, T > 0 — раздел и предупреждение, T = 0 — раздел без
+предупреждения, без `--server` — `null`, окно 0 и 367 — ошибка). RED: хранилище — нет
+`SessionFilter` (сборка), сервер — 400 «unknown field `parent`» и таблица флагов против
+`FEATURES`, CLI — `unexpected argument '--unattributed'`/`'--subagents'` и нет строки, `xtask` —
+`unexpected argument '--unattributed-days'`, `memory` 100 вместо 155, запросы без `/health`.
+GREEN — все; затронутые наборы: `zam-store --lib --test sessions` (121 + 19), `zam-server --lib
+--test session_tokens --test boot --test sessions --test snapshot` (322 + 6 + 15 + 17 + 28),
+`zam-cli --bin zam --test sessions` (232 + 7), `xtask --bin xtask --test ab` (241 + 5); clippy
+`--workspace --all-targets -D warnings`, `cargo fmt --all --check` — чисто. План запроса
+(`EXPLAIN QUERY PLAN`, SQLite 3.51, схема сессий 0013 + 0017): с родителем — `SEARCH sessions
+USING INDEX sessions_parent (parent_id=?)`; без родителя — прежний `SCAN … sessions_last_seen`;
+вариант `(?2 IS NULL OR parent_id = ?2)` индекс не берёт.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

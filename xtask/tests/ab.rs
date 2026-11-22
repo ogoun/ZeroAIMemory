@@ -1,9 +1,10 @@
 //! Стенд агентного A/B `cargo xtask ab` (спецификация M6 §12, §17 п. 16; задача 12): отчёт по
 //! плечам с интервалами на синтетической фикстуре — два транскрипта Claude Code и один Codex
-//! (только поля, которые читает стенд, и посторонний текст-приманка), ответы `GET /sessions/{id}`
-//! заглушки и `runs.toml`. Из транскриптов читаются только `usage` (и тип блоков — счёт вызовов
-//! инструментов); файлы не копируются и не меняются — проверка тестом. Журналы агентов владельца
-//! тест не читает.
+//! (только поля, которые читает стенд, и посторонний текст-приманка), ответы заглушки сервера
+//! (`/health`, `GET /sessions/{id}`, субагенты `GET /sessions?parent=` и обход списка, выдача без
+//! сессии `GET /sessions/unattributed` — M7 §5.8 п. 4) и `runs.toml`. Из транскриптов читаются
+//! только `usage` (и тип блоков — счёт вызовов инструментов); файлы не копируются и не меняются —
+//! проверка тестом. Журналы агентов владельца тест не читает.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -40,9 +41,91 @@ fn tmp(name: &str) -> PathBuf {
 /// Принятые заглушкой запросы: (путь, `Authorization`).
 type Seen = Arc<Mutex<Vec<(String, String)>>>;
 
-/// Заглушка сервера: `GET /api/v1/sessions/{id}` → ответ из `sessions` (нет — 404); принятые
-/// пути и заголовки авторизации — в журнал.
+/// Что отвечает заглушка сервера ([`stub_server`]).
+#[derive(Clone, Default)]
+struct Server {
+    /// `GET /sessions/{id}`: id → ответ (нет — 404).
+    sessions: BTreeMap<String, Value>,
+    /// Сессии субагентов (`parent_id`, `tokens`): `GET /sessions?parent=` и обход списка.
+    subagents: Vec<Value>,
+    /// `features` ответа `GET /health`; `None` — `/health` отвечает 404 (возможности неизвестны).
+    features: Option<Vec<&'static str>>,
+    /// Строки `GET /sessions/unattributed`; `None` — 404 (сервер до M6).
+    unattributed: Option<Vec<Value>>,
+}
+
+impl Server {
+    /// Сервер M7.2: признаки `sessions_parent` и `unattributed`, выдачи без сессии нет.
+    fn current(sessions: BTreeMap<String, Value>) -> Server {
+        Server {
+            sessions,
+            features: Some(vec!["m6", "unattributed", "sessions_parent"]),
+            unattributed: Some(Vec::new()),
+            ..Server::default()
+        }
+    }
+
+    /// Ответ на запрос `path` (с параметрами).
+    fn reply(&self, path: &str) -> (u16, String) {
+        let (p, q) = path.split_once('?').unwrap_or((path, ""));
+        let param = |k: &str| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+                .map(str::to_string)
+        };
+        let items = |v: Vec<Value>| (200, json!({ "items": v }).to_string());
+        match p {
+            "/api/v1/health" => match &self.features {
+                Some(f) => (200, json!({"status": "ok", "features": f}).to_string()),
+                None => (404, r#"{"status":404}"#.to_string()),
+            },
+            "/api/v1/sessions" => match param("parent") {
+                Some(parent) if self.has("sessions_parent") => items(
+                    self.subagents
+                        .iter()
+                        .filter(|s| s["parent_id"] == parent.as_str())
+                        .cloned()
+                        .collect(),
+                ),
+                // сервер без `parent`: `ListQuery` с `deny_unknown_fields`
+                Some(_) => (
+                    400,
+                    r#"{"status":400,"detail":"unknown field `parent`"}"#.into(),
+                ),
+                None => items(
+                    self.sessions
+                        .values()
+                        .chain(&self.subagents)
+                        .cloned()
+                        .collect(),
+                ),
+            },
+            "/api/v1/sessions/unattributed" => match &self.unattributed {
+                Some(v) => items(v.clone()),
+                None => (404, r#"{"status":404,"detail":"нет"}"#.to_string()),
+            },
+            _ => {
+                let id = p.strip_prefix("/api/v1/sessions/").unwrap_or("");
+                match self.sessions.get(id) {
+                    Some(v) => (200, v.to_string()),
+                    None => (404, r#"{"status":404,"detail":"нет"}"#.to_string()),
+                }
+            }
+        }
+    }
+
+    fn has(&self, f: &str) -> bool {
+        self.features.as_ref().is_some_and(|x| x.contains(&f))
+    }
+}
+
+/// Заглушка сервера M7.2 ([`Server::current`]) с сессиями `sessions`.
 fn stub(sessions: BTreeMap<String, Value>) -> (String, Seen) {
+    stub_server(Server::current(sessions))
+}
+
+/// Заглушка сервера `srv`; принятые пути и заголовки авторизации — в журнал.
+fn stub_server(srv: Server) -> (String, Seen) {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     let seen: Seen = Arc::default();
@@ -73,11 +156,7 @@ fn stub(sessions: BTreeMap<String, Value>) -> (String, Seen) {
             let mut b = vec![0u8; len];
             let _ = r.read_exact(&mut b);
             s2.lock().unwrap().push((path.clone(), auth));
-            let id = path.strip_prefix("/api/v1/sessions/").unwrap_or("");
-            let (code, body) = match sessions.get(id) {
-                Some(v) => (200, v.to_string()),
-                None => (404, r#"{"status":404,"detail":"нет"}"#.to_string()),
-            };
+            let (code, body) = srv.reply(&path);
             let mut c = conn;
             let _ = write!(
                 c,
@@ -295,17 +374,24 @@ outcome = "fail"
     for (what, s) in [("stdout", &stdout), ("stderr", &stderr), ("отчёт", &report)] {
         assert!(!s.contains(BAIT), "{what} содержит текст транскрипта");
     }
-    // сервер: только `GET /sessions/{id}` прогонов, с токеном
+    // сервер: возможности (`/health`), `GET /sessions/{id}` и субагенты (`?parent=`) прогонов,
+    // выдача без сессии за 30 суток (M7 §5.8 п. 4) — все с токеном
     let seen = seen.lock().unwrap().clone();
     let mut paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
     paths.sort();
     assert_eq!(
         paths,
         [
+            "/api/v1/health",
             "/api/v1/sessions/s-t1-mem",
             "/api/v1/sessions/s-t1-off",
             "/api/v1/sessions/s-t2-mem",
-            "/api/v1/sessions/s-t2-off"
+            "/api/v1/sessions/s-t2-off",
+            "/api/v1/sessions/unattributed?days=30",
+            "/api/v1/sessions?parent=s-t1-mem&tokens=true&limit=500",
+            "/api/v1/sessions?parent=s-t1-off&tokens=true&limit=500",
+            "/api/v1/sessions?parent=s-t2-mem&tokens=true&limit=500",
+            "/api/v1/sessions?parent=s-t2-off&tokens=true&limit=500",
         ]
     );
     assert!(seen.iter().all(|(_, a)| a == "Bearer zam_test"), "{seen:?}");
@@ -323,6 +409,9 @@ outcome = "fail"
     assert_eq!(r["output"], 23, "{r}");
     assert_eq!(r["tool_calls"], 4, "{r}");
     assert_eq!(r["memory"], 100, "{r}");
+    // субагентов на сервере нет: память сессии — та же
+    assert_eq!(r["memory_session"], 100, "{r}");
+    assert_eq!(r["subagents"], 0, "{r}");
     assert_eq!(r["transcripts"], 2, "{r}");
     // Codex: итог накопленного, вход без кэша
     let r = run("s-t2-mem");
@@ -377,9 +466,286 @@ outcome = "fail"
         "{j}"
     );
     assert!(stdout.contains("Без журнала"), "{stdout}");
+    // выдачи без сессии нет: раздел есть, предупреждения нет
+    assert_eq!(
+        j["unattributed"],
+        json!({"days": 30, "calls": 0, "tokens": 0, "by_event": {}}),
+        "{j}"
+    );
+    assert!(
+        stdout.contains("## Выдано без сессии за 30 сут."),
+        "{stdout}"
+    );
+    assert_eq!(j["warnings"], json!([]), "{j}");
     // вывод по плечам — с интервалами
     for want in ["memory", "off", "R memory / off", "[", "доля успешных"] {
         assert!(stdout.contains(want), "нет «{want}»:\n{stdout}");
+    }
+}
+
+/// Две метки (`t1`: `memory` — сессия `s-m`, `off` — `s-o`) и их транскрипты Claude Code в `d`.
+fn two_runs(d: &Path) {
+    write_jsonl(
+        &d.join("tr/s-m.jsonl"),
+        &[claude_line("s-m", "m1", [10, 20, 30, 40], &["tool_use"])],
+    );
+    write_jsonl(
+        &d.join("tr/s-o.jsonl"),
+        &[claude_line("s-o", "m1", [1, 2, 3, 4], &["text"])],
+    );
+    fs::write(
+        d.join("runs.toml"),
+        "[[run]]\ntask = \"t1\"\narm = \"memory\"\nrep = 1\nsession = \"s-m\"\noutcome = \"pass\"\n\n\
+         [[run]]\ntask = \"t1\"\narm = \"off\"\nrep = 1\nsession = \"s-o\"\noutcome = \"fail\"\n",
+    )
+    .unwrap();
+}
+
+/// `xtask ab` по фикстуре [`two_runs`] каталога `d` с сервером `url` (токен — `ZAM_TOKEN`) и
+/// аргументами `extra`: вывод и JSON-отчёт (`d/ab.json`).
+fn run_ab(d: &Path, url: Option<&str>, extra: &[&str]) -> (Output, Value) {
+    let out = d.join("ab.json");
+    let _ = fs::remove_file(&out);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_xtask"));
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("ZAM_") {
+            c.env_remove(k);
+        }
+    }
+    c.env("ZAM_TOKEN", "zam_test")
+        .args(["ab", "--transcripts"])
+        .arg(d.join("tr"))
+        .arg("--runs")
+        .arg(d.join("runs.toml"))
+        .arg("--out")
+        .arg(&out)
+        .args(extra);
+    if let Some(u) = url {
+        c.args(["--server", u]);
+    }
+    let o = c.output().unwrap();
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let j = serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+    (o, j)
+}
+
+/// M7 §5.8 п. 4, решение координатора 27: память прогона — сессия и её субагенты
+/// (`GET /sessions?parent=`): `memory` — сумма, `memory_session` — только сессия (как в отчётах
+/// 0.0.14), `subagents` — их число; субагенты чужой сессии не входят. Сервер без признака
+/// `sessions_parent` — один обход `GET /sessions?limit=500&tokens=true` по `parent_id` и
+/// предупреждение; `/health` не ответил — пробный `?parent=`, на 400 — тот же обход.
+#[test]
+fn ab_memory_includes_subagents() {
+    let d = tmp("subagents");
+    two_runs(&d);
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        "s-m".to_string(),
+        json!({"id": "s-m", "holdout": false,
+               "tokens": {"session_start": {"calls": 1, "tokens": 100}}}),
+    );
+    let subagents = vec![
+        json!({"id": "s-m:a1", "parent_id": "s-m", "agent_type": "Explore",
+               "tokens": {"subagent_local": {"calls": 1, "tokens": 40}}}),
+        json!({"id": "s-m:a2", "parent_id": "s-m", "agent_type": "Plan",
+               "tokens": {"mcp": {"calls": 2, "tokens": 10}, "pre_tool": {"calls": 1, "tokens": 5}}}),
+        // субагент сессии вне прогонов
+        json!({"id": "s-x:a9", "parent_id": "s-x", "tokens": {"mcp": {"calls": 1, "tokens": 999}}}),
+    ];
+    let check = |j: &Value, what: &str| {
+        let runs = j["run"].as_array().unwrap();
+        let run = |s: &str| runs.iter().find(|r| r["session"] == s).unwrap().clone();
+        let m = run("s-m");
+        assert_eq!(m["memory"], 155, "{what}: {m}");
+        assert_eq!(m["memory_session"], 100, "{what}: {m}");
+        assert_eq!(m["subagents"], 2, "{what}: {m}");
+        let o = run("s-o");
+        assert_eq!((&o["memory"], &o["memory_session"]), (&json!(0), &json!(0)));
+        let arm = &j["arms"]["memory"];
+        assert_eq!(arm["sum"]["memory"], 155, "{what}: {arm}");
+        assert_eq!(arm["sum"]["memory_session"], 100, "{what}: {arm}");
+    };
+    let paths = |seen: &Seen| -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect()
+    };
+    let parent_warning = |j: &Value| {
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|w| w.contains("sessions_parent"))
+            .count()
+    };
+
+    // сервер M7.2: `?parent=` на каждый прогон, обхода списка нет
+    let (url, seen) = stub_server(Server {
+        subagents: subagents.clone(),
+        ..Server::current(sessions.clone())
+    });
+    let (o, j) = run_ab(&d, Some(&url), &[]);
+    check(&j, "sessions_parent");
+    assert_eq!(parent_warning(&j), 0, "{j}");
+    let p = paths(&seen);
+    assert!(
+        p.contains(&"/api/v1/sessions?parent=s-m&tokens=true&limit=500".to_string()),
+        "{p:?}"
+    );
+    assert!(
+        !p.iter()
+            .any(|x| x.contains("limit=500") && !x.contains("parent=")),
+        "{p:?}"
+    );
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("память сессии"), "{stdout}");
+
+    // сервер без признака: `?parent=` не шлётся, один обход списка, предупреждение
+    let (url, seen) = stub_server(Server {
+        subagents: subagents.clone(),
+        features: Some(vec!["m6", "unattributed"]),
+        ..Server::current(sessions.clone())
+    });
+    let (o, j) = run_ab(&d, Some(&url), &[]);
+    check(&j, "без признака");
+    assert_eq!(parent_warning(&j), 1, "{j}");
+    let p = paths(&seen);
+    assert!(!p.iter().any(|x| x.contains("parent=")), "{p:?}");
+    assert_eq!(
+        p.iter()
+            .filter(|x| *x == "/api/v1/sessions?limit=500&tokens=true")
+            .count(),
+        1,
+        "{p:?}"
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("предупреждение:") && stderr.contains("sessions_parent"),
+        "{stderr}"
+    );
+
+    // `/health` не ответил (возможности неизвестны), сервер без `parent` — 400 на пробу и обход
+    let (url, seen) = stub_server(Server {
+        subagents,
+        features: None,
+        unattributed: None,
+        ..Server::current(sessions)
+    });
+    let (_, j) = run_ab(&d, Some(&url), &[]);
+    check(&j, "400");
+    assert_eq!(parent_warning(&j), 1, "{j}");
+    let p = paths(&seen);
+    assert_eq!(
+        p.iter().filter(|x| x.contains("parent=")).count(),
+        1,
+        "{p:?}"
+    );
+    // у такого сервера нет и учёта без сессии: `unattributed: null` с предупреждением
+    assert!(j["unattributed"].is_null(), "{j}");
+    assert!(
+        j["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .is_some_and(|w| w.contains("GET /sessions/unattributed"))),
+        "{j}"
+    );
+}
+
+/// M7 §5.8 п. 4: `--unattributed-days N` (30) — раздел «Выдано без сессии за N сут.» вне плеч
+/// (`GET /sessions/unattributed?days=N`: вызовы и токены по событиям) и при T > 0 предупреждение
+/// «часть выдачи памяти не отнесена к прогонам: MCP без сессии»; T = 0 — раздел без
+/// предупреждения; без `--server` — `unattributed: null`, раздела нет; N вне 1..=366 — ошибка.
+#[test]
+fn ab_unattributed_section() {
+    let d = tmp("unattributed");
+    two_runs(&d);
+    let rows = vec![
+        json!({"day": "2026-11-22", "event": "brief", "calls": 1, "tokens": 5}),
+        json!({"day": "2026-11-22", "event": "mcp", "calls": 3, "tokens": 120}),
+        json!({"day": "2026-11-20", "event": "mcp", "calls": 1, "tokens": 30}),
+    ];
+    let (url, seen) = stub_server(Server {
+        unattributed: Some(rows),
+        ..Server::current(BTreeMap::new())
+    });
+    let (o, j) = run_ab(&d, Some(&url), &["--unattributed-days", "7"]);
+    assert_eq!(
+        j["unattributed"],
+        json!({"days": 7, "calls": 5, "tokens": 155, "by_event": {
+            "brief": {"calls": 1, "tokens": 5}, "mcp": {"calls": 4, "tokens": 150}}}),
+        "{j}"
+    );
+    let p: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect();
+    assert!(
+        p.contains(&"/api/v1/sessions/unattributed?days=7".to_string()),
+        "{p:?}"
+    );
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let section = stdout
+        .split_once("## Выдано без сессии за 7 сут.\n")
+        .unwrap_or_else(|| panic!("{stdout}"))
+        .1;
+    assert!(section.contains("вызовов 5, токенов 155"), "{stdout}");
+    assert!(section.contains("| mcp | 4 | 150 |"), "{stdout}");
+    assert!(section.contains("| brief | 1 | 5 |"), "{stdout}");
+    let warn = "часть выдачи памяти не отнесена к прогонам: MCP без сессии";
+    assert!(
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().is_some_and(|w| w.contains(warn))),
+        "{j}"
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains(warn));
+    // раздел — вне плеч: память прогонов прежняя
+    assert_eq!(j["arms"]["memory"]["sum"]["memory"], 0, "{j}");
+
+    // выдачи без сессии нет — раздел без предупреждения
+    let (url, _) = stub(BTreeMap::new());
+    let (o, j) = run_ab(&d, Some(&url), &[]);
+    assert_eq!(j["unattributed"]["days"], 30, "{j}");
+    assert_eq!(j["unattributed"]["tokens"], 0, "{j}");
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("## Выдано без сессии за 30 сут."),
+        "{j}"
+    );
+    assert_eq!(j["warnings"], json!([]), "{j}");
+
+    // без сервера — неизвестно
+    let (o, j) = run_ab(&d, None, &[]);
+    assert!(j["unattributed"].is_null(), "{j}");
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("без сессии"));
+
+    // окно вне 1..=366 — ошибка разбора до сети
+    for bad in ["0", "367"] {
+        let o = xtask(&[
+            "ab",
+            "--transcripts",
+            d.join("tr").to_str().unwrap(),
+            "--runs",
+            d.join("runs.toml").to_str().unwrap(),
+            "--unattributed-days",
+            bad,
+        ]);
+        assert!(!o.status.success(), "{bad}");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("--unattributed-days"),
+            "{bad}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
     }
 }
 
