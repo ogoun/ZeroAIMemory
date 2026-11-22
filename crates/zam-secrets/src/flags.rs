@@ -141,6 +141,8 @@ fn header_value(m: &str) -> Option<Range<usize>> {
 /// Флаг с дефисом: правило, всё совпадение, значение (в кавычках — с ними), у `-u` — имя.
 struct DashFlag {
     rule: usize,
+    /// Начало самого флага (первый `-`).
+    flag: usize,
     whole: Range<usize>,
     value: Range<usize>,
     user: Option<Range<usize>>,
@@ -177,15 +179,20 @@ fn value_end(text: &str, p: usize) -> Option<usize> {
     }
 }
 
-/// Флаги с дефисом в `text` одним проходом по знакам `-` (шаблоны — у [`LONG`]): у каждого
-/// правила совпадения не пересекаются и идут слева направо, как у `find_iter` регулярки.
-fn dash_flags(text: &str, enabled: [bool; 4], f: &mut dyn FnMut(DashFlag)) {
+/// Флаги с дефисом в `text` одним проходом по знакам `-` (шаблоны — у [`LONG`]), слева направо.
+/// `f` решает, взято ли значение: взятое совпадение закрывает собой следующие того же правила,
+/// начатые внутри него (они — внутри маскируемого значения), а отвергнутое — нет (круг правок 3
+/// задачи 5 M7.1: иначе отвергнутое совпадение прятало соседнее, а маска другого правила его
+/// убирала — и повторная маскировка находила новое).
+fn dash_flags(text: &str, enabled: [bool; 4], f: &mut dyn FnMut(DashFlag) -> bool) {
     let b = text.as_bytes();
     let mut last_end = [0usize; 4];
     let mut emit = |d: DashFlag, last_end: &mut [usize; 4]| {
-        if d.whole.start >= last_end[d.rule] {
-            last_end[d.rule] = d.whole.end;
-            f(d);
+        // знак перед флагом (пробел, кавычка) может быть концом прежнего значения: закрывает
+        // только сам флаг, начатый внутри взятого совпадения
+        let (rule, flag, end) = (d.rule, d.flag, d.whole.end);
+        if flag >= last_end[rule] && f(d) {
+            last_end[rule] = end;
         }
     };
     let mut i = 0;
@@ -199,6 +206,7 @@ fn dash_flags(text: &str, enabled: [bool; 4], f: &mut dyn FnMut(DashFlag)) {
                 {
                     let d = DashFlag {
                         rule: GLUED_P,
+                        flag: at,
                         whole: start..end,
                         value: at + 2..end,
                         user: None,
@@ -241,6 +249,7 @@ fn dash_flags(text: &str, enabled: [bool; 4], f: &mut dyn FnMut(DashFlag)) {
                 }
                 let d = DashFlag {
                     rule: USER_PASS,
+                    flag,
                     whole: start..q + pn,
                     value: q..q + pn,
                     user: Some(p..p + un),
@@ -273,6 +282,7 @@ fn dash_flags(text: &str, enabled: [bool; 4], f: &mut dyn FnMut(DashFlag)) {
                 if let Some(end) = value_end(text, p) {
                     let d = DashFlag {
                         rule: LONG,
+                        flag: at,
                         whole: start..end,
                         value: p..end,
                         user: None,
@@ -286,12 +296,16 @@ fn dash_flags(text: &str, enabled: [bool; 4], f: &mut dyn FnMut(DashFlag)) {
 }
 
 /// Значение — заглушка из заглавных латинских букв и `_` (`TOKEN`, `PASSWORD`, `PASS_WORD`), от
-/// трёх знаков, хотя бы одна буква: так пишут место для значения, а не само значение.
+/// трёх до [`CAPS_PLACEHOLDER_MAX`] знаков, хотя бы одна буква: так пишут место для значения, а не
+/// само значение; длинная строка заглавных (`XKQZJWPRMVNBTLHGFDSAYUEIOC`) — уже похожа на ключ.
 fn is_caps_placeholder(v: &str) -> bool {
-    v.len() >= 3
+    (3..=CAPS_PLACEHOLDER_MAX).contains(&v.len())
         && v.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
         && v.bytes().any(|b| b.is_ascii_uppercase())
 }
+
+/// Наибольшая длина заглушки [`is_caps_placeholder`] (круг правок 3 задачи 5 M7.1).
+const CAPS_PLACEHOLDER_MAX: usize = 24;
 
 /// Значения флагов в `text`: диапазоны байт значений (по правилам, без сортировки). Правило `i`
 /// с воротами проверяется, только если `enabled[i]`, и значение берётся, только если
@@ -304,25 +318,30 @@ fn flag_values(
     gate: &dyn Fn(usize, Range<usize>) -> bool,
 ) -> Vec<Range<usize>> {
     let mut out = Vec::new();
+    // `true` — значение взято
     let mut take = |rule: usize, whole: Range<usize>, value: Range<usize>, user: Option<&str>| {
         let (mut b, mut e) = (value.start, value.end);
         // `-u user:pass` — числовые `uid:gid` — не пароль
         if let Some(u) = user {
             let digits = |s: &str| s.bytes().all(|x| x.is_ascii_digit());
             if digits(u) && digits(&text[b..e]) {
-                return;
+                return false;
             }
         }
         let raw = &text[b..e];
-        if (raw.starts_with('"') || raw.starts_with('\'')) && raw.len() >= 2 {
+        let quoted = (raw.starts_with('"') || raw.starts_with('\'')) && raw.len() >= 2;
+        if quoted {
             b += 1;
             e -= 1;
-        }
-        // закрывающая скобка без пары — конец подстановки `$(…)`, не значение
-        while text[b..e].ends_with(')')
-            && text[b..e].matches('(').count() < text[b..e].matches(')').count()
-        {
-            e -= 1;
+        } else if raw.ends_with(')') {
+            // закрывающие скобки без пары — конец подстановки `$(…)`, не значение (у значения в
+            // кавычках скобка — его часть); один подсчёт, снятие — с уменьшением счётчика
+            let open = raw.bytes().filter(|&c| c == b'(').count();
+            let mut close = raw.bytes().filter(|&c| c == b')').count();
+            while open < close && e > b && text.as_bytes()[e - 1] == b')' {
+                e -= 1;
+                close -= 1;
+            }
         }
         let inner = &text[b..e];
         // у заголовка без значения длиной ≥ 6 шаблон берёт слово-схему — его не трогаем
@@ -334,27 +353,37 @@ fn flag_values(
         let masked = inner.contains('\u{2039}') && inner.contains(SECRET_MARK);
         if inner.is_empty() || scheme || masked || is_reference(inner) || is_caps_placeholder(inner)
         {
-            return;
+            return false;
         }
         if (rule == USER_PASS || rule == GLUED_P) && !gate(rule, whole) {
-            return;
+            return false;
         }
         out.push(b..e);
+        true
     };
     dash_flags(text, enabled, &mut |d| {
         let user = d.user.map(|u| &text[u]);
-        take(d.rule, d.whole, d.value, user);
+        take(d.rule, d.whole, d.value, user)
     });
     if enabled[HEADER] {
-        for m in HEADER_RE.find_iter(text) {
-            if let Some(v) = header_value(m.as_str()) {
-                take(
-                    HEADER,
-                    m.range(),
-                    m.start() + v.start..m.start() + v.end,
-                    None,
-                );
-            }
+        // отвергнутое совпадение заголовка следующих не прячет (см. [`dash_flags`]): поиск — с
+        // позиции за его началом, а если в значении метка — сразу за последней меткой (все
+        // заголовки до неё отвергнуты бы по той же метке; так поиск остаётся линейным)
+        let mut from = 0;
+        while let Some(m) = HEADER_RE.find_at(text, from) {
+            let v = header_value(m.as_str()).map(|v| m.start() + v.start..m.start() + v.end);
+            let taken = v.clone().is_some_and(|v| take(HEADER, m.range(), v, None));
+            from = if taken {
+                m.end()
+            } else {
+                let next = m.start() + text[m.start()..].chars().next().map_or(1, char::len_utf8);
+                v.and_then(|v| {
+                    text[v.clone()]
+                        .rfind(SECRET_MARK)
+                        .map(|i| v.start + i + SECRET_MARK.len())
+                })
+                .map_or(next, |after_mark| after_mark.max(next))
+            };
         }
     }
     out
@@ -370,8 +399,10 @@ fn flag_values(
 ///   ссылка на переменную (`Bearer $TOKEN`) и сама схема не маскируются.
 ///
 /// Значение заменяется меткой [`SECRET_MARK`]; ссылки на переменные (`$X`, `%X%`), заглушки
-/// (`<…>`, `TOKEN`) и уже замаскированные значения остаются — повторный вызов ничего не меняет.
-/// Ворота `-p` и `-u` — по всему `text` (это одна команда).
+/// (`<…>`, `TOKEN`) и уже замаскированные значения остаются — повторный вызов ничего не меняет
+/// (отвергнутое совпадение соседнее не прячет, пересёкшиеся значения правил маскируются одной
+/// меткой; proptest `mask_flags_idempotent`, круг правок 3 задачи 5 M7.1). Ворота `-p` и `-u` —
+/// по всему `text` (это одна команда).
 pub fn mask_flags(text: &str) -> String {
     let [mysql, curl] = &*GATES;
     let enabled = [true, curl.is_match(text), true, mysql.is_match(text)];
@@ -380,12 +411,17 @@ pub fn mask_flags(text: &str) -> String {
         return text.to_string();
     }
     ranges.sort_by_key(|r| (r.start, r.end));
+    // пересёкшиеся значения разных правил — одной меткой: иначе хвост второго остался бы открытым
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if r.start < last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
     let mut out = String::with_capacity(text.len());
     let mut pos = 0;
-    for r in ranges {
-        if r.start < pos {
-            continue;
-        }
+    for r in merged {
         out.push_str(&text[pos..r.start]);
         out.push_str(SECRET_MARK);
         pos = r.end;
@@ -493,8 +529,9 @@ fn line_units(s: &str, base: usize, units: &mut Vec<usize>) {
 }
 
 /// Значение — целиком ссылка на переменную или заглушка, а не секрет: `$NAME`, `${NAME}`,
-/// `%NAME%` (имя — `[A-Za-z_][A-Za-z0-9_]*`) или `<…>`. `%2Fabc…`, `$2b$10$…` (хэш bcrypt) —
-/// не ссылки.
+/// `%NAME%` (имя — `[A-Za-z_][A-Za-z0-9_]*`) или `<…>` без `:` внутри (`<TOKEN>`, `<api-key>`;
+/// с двоеточием — уже не заглушка, а в значении заголовка — ещё и соседний заголовок, круг правок
+/// 3 задачи 5 M7.1). `%2Fabc…`, `$2b$10$…` (хэш bcrypt) — не ссылки.
 fn is_reference(v: &str) -> bool {
     let ident = |s: &str| {
         let mut c = s.chars();
@@ -511,7 +548,7 @@ fn is_reference(v: &str) -> bool {
     if let Some(r) = v.strip_prefix('%') {
         return r.strip_suffix('%').is_some_and(ident);
     }
-    v.len() >= 2 && v.starts_with('<') && v.ends_with('>')
+    v.len() >= 2 && v.starts_with('<') && v.ends_with('>') && !v.contains(':')
 }
 
 #[cfg(test)]
@@ -530,7 +567,8 @@ mod tests {
                 text[d.whole].to_string(),
                 text[d.value].to_string(),
                 d.user.map(|u| text[u].to_string()),
-            ))
+            ));
+            true
         });
         out
     }

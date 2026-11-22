@@ -1486,3 +1486,157 @@ fn bench_scan_adversarial_flags() {
         assert!(per <= budget, "{name} {len} байт: {per:?} > {budget:?}");
     }
 }
+
+/// Круг правок 3 задачи 5 M7.1: скобка у значения в кавычках — часть значения (`-p'X)'` →
+/// `-p'‹secret›'`); заглушка из заглавных — не длиннее 24 знаков (длинная — похожа на ключ);
+/// отвергнутое совпадение соседнее не прячет (`Authorization:"--password ""--password y`), и
+/// повторная маска клиента ничего не меняет.
+#[test]
+fn flags_round3_cases() {
+    let pw = ["S3c", "ret", "9x"].concat();
+    let m = SECRET_MARK;
+    assert_eq!(
+        mask_flags(&format!("mysql -p'{pw})'")),
+        format!("mysql -p'{m}'")
+    );
+    assert_eq!(
+        mask_text(&format!("```\nmysql -p\"{pw})\" db\n```")),
+        format!("```\nmysql -p\"{m}\" db\n```")
+    );
+    let caps = "XKQZJWPRMVNBTLHGFDSAYUEIOC";
+    assert_eq!(
+        mask_flags(&format!("mysql -p{caps}")),
+        format!("mysql -p{m}"),
+        "26 заглавных — не заглушка"
+    );
+    let max = "A".repeat(24);
+    assert_eq!(
+        mask_flags(&format!("mysql -p{max}")),
+        format!("mysql -p{max}")
+    );
+    for t in [
+        "Authorization:\"--password \"\"--password y",
+        "Authorization:\"--password \"\"--token=f",
+        "--token=X-Api-Key: ‹secret›X-Api-Key:\"zation",
+    ] {
+        let once = mask_flags(t);
+        assert_eq!(mask_flags(&once), once, "{t:?}");
+    }
+    assert_eq!(
+        mask_flags("Authorization:\"--password \"\"--password y"),
+        format!("Authorization:\"{m} \"\"--password {m}")
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+    /// Круг правок 3 задачи 5 M7.1: клиентская [`mask_flags`] идемпотентна — атомы флагов,
+    /// кавычек, заголовков (и JSON-формы), скобок, заглушек, меток и ворот (атомы пробы
+    /// ревьюера `t5r2probe idem`).
+    #[test]
+    fn mask_flags_idempotent(
+        parts in proptest::collection::vec(
+            prop_oneof![
+                Just("```".to_string()),
+                Just("`".to_string()),
+                Just("\n".to_string()),
+                Just("\r".to_string()),
+                Just(" \\\n".to_string()),
+                Just("    ".to_string()),
+                Just("> ".to_string()),
+                Just("- ".to_string()),
+                Just("mysql ".to_string()),
+                Just("curl ".to_string()),
+                Just("-uroot ".to_string()),
+                Just("-pS3cret9x".to_string()),
+                Just("-p'a b'".to_string()),
+                Just("-p\"a\nb\"".to_string()),
+                Just("-p\"a)\"".to_string()),
+                Just("-u admin:p4ss".to_string()),
+                Just("--user=adm:p4ss ".to_string()),
+                Just("--password \"x y\"".to_string()),
+                Just("--password ".to_string()),
+                Just("--token=abc123def".to_string()),
+                Just("--token TOKEN".to_string()),
+                Just("PASS_WORD".to_string()),
+                Just("Authorization: Bearer abcdef123".to_string()),
+                Just("{\"Authorization\": \"Bearer abcdef123\"}".to_string()),
+                Just("Authorization: \"".to_string()),
+                Just("Authorization:".to_string()),
+                Just("\"Authorization\"".to_string()),
+                Just(": ".to_string()),
+                Just("Bearer ".to_string()),
+                Just("X-Api-Key: ".to_string()),
+                Just("x-api-key:".to_string()),
+                Just("$TOKEN".to_string()),
+                Just("$(".to_string()),
+                Just("(".to_string()),
+                Just(")".to_string()),
+                Just("))".to_string()),
+                Just("<".to_string()),
+                Just(">".to_string()),
+                Just(SECRET_MARK.to_string()),
+                Just("\u{2039}".to_string()),
+                Just(" ".to_string()),
+                Just("a".to_string()),
+                Just("A".to_string()),
+                Just("=".to_string()),
+                Just("'".to_string()),
+                Just("\"".to_string()),
+                Just("ё".to_string()),
+                "[A-Za-z0-9=/,:@\"' ()-]{1,10}",
+            ],
+            0..24,
+        )
+    ) {
+        let text = parts.concat();
+        let once = mask_flags(&text);
+        prop_assert_eq!(mask_flags(&once), once, "{:?}", text);
+    }
+}
+
+/// Скобки без пары после флага — линейно (круг правок 3 задачи 5 M7.1; прежняя обрезка
+/// пересчитывала значение на каждую снятую скобку: 100 КБ — 18,7 с): `-p` + `)`, `--password )`,
+/// `Authorization: )`, `curl -u a:)` на 100 КБ и 1 МБ в блоке кода и клиентская [`mask_flags`] —
+/// не больше 2 мс на 100 КБ (release). `cargo test -p zam-secrets --release --test secrets --
+/// --ignored bench_scan_paren_flags --nocapture`.
+#[test]
+#[ignore]
+fn bench_scan_paren_flags() {
+    let mut rows = Vec::new();
+    for size in [100 * 1024, 1024 * 1024] {
+        for (name, head) in [
+            ("-p)))", "```\nmysql -p"),
+            ("--password )))", "```\n --password "),
+            ("Authorization: )))", "```\nAuthorization: "),
+            ("curl -u a:)))", "```\ncurl -u a:"),
+        ] {
+            let mut t = head.to_string();
+            t.push_str(&")".repeat(size));
+            t.push_str("\n```\n");
+            let n = if size > 200 * 1024 { 3 } else { 10 };
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(scan_secrets(&t));
+            }
+            let per = t0.elapsed() / n;
+            println!("scan_secrets ({name}, {} байт): {per:?}", t.len());
+            rows.push((name, t.len(), per));
+        }
+        let t = format!("mysql -p{}", ")".repeat(size));
+        // первый вызов собирает регулярки ворот — не в замер
+        std::hint::black_box(mask_flags("mysql -px"));
+        let n = if size > 200 * 1024 { 3 } else { 10 };
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(mask_flags(&t));
+        }
+        let per = t0.elapsed() / n;
+        println!("mask_flags (-p))), {} байт): {per:?}", t.len());
+        rows.push(("mask_flags -p)))", t.len(), per));
+    }
+    for (name, len, per) in rows {
+        let budget = std::time::Duration::from_micros((len as u64 * 2000) / (100 * 1024));
+        assert!(per <= budget, "{name} {len} байт: {per:?} > {budget:?}");
+    }
+}
