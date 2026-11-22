@@ -919,3 +919,178 @@ async fn entry_leaves_and_term_hits() {
     assert_eq!(hits[0].target, t);
     assert!(hits[0].heading_path.ends_with("Вторая"), "{hits:?}");
 }
+
+/// Insight `title`/`body` в пространстве `space`; id.
+async fn insight_in(db: &Db, space: Id, title: &str, body: &str) -> Id {
+    let (e, _) = zam_store::create_entry(
+        db,
+        zam_store::NewEntry {
+            refs: None,
+            space_id: space,
+            kind: zam_store::EntryKind::Insight,
+            title: title.into(),
+            body: body.into(),
+            data: serde_json::json!({"kind": "gotcha"}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: None,
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &attrib(),
+    )
+    .await
+    .unwrap();
+    e.id
+}
+
+/// M7.1 §4.6 п. 3: документная частота слов среди действующих insight пространств — по началу
+/// слова (как терм FTS), один раз на insight; удалённые, отозванные, заметки и чужие
+/// пространства не считаются. Кэш (M-3 ревью задачи 8): та же версия insight — без проходов
+/// индекса FTS, новая (запись, отзыв insight) — частоты заново; заметка версию не меняет.
+#[tokio::test]
+async fn insight_term_docs_counts_live_insights() {
+    let (db, k, h) = setup("insight-term-docs").await;
+    insight_in(&db, k, "Квазары", "quasar quasars quasar — одна запись").await;
+    insight_in(&db, k, "Пульсар", "pulsar рядом с quasar").await;
+    insight_in(&db, k, "Без слова", "только pulsar").await;
+    let gone = insight_in(&db, k, "Удалённая", "quasar").await;
+    zam_store::delete_entry(&db, gone, None, &attrib())
+        .await
+        .unwrap();
+    let off = insight_in(&db, k, "Отозванная", "quasar").await;
+    zam_store::retract_entry(&db, off, None, "неверно", &attrib())
+        .await
+        .unwrap();
+    insight_in(&db, h, "Human", "quasar").await;
+    add(&db, k, "notes/q", "# Q\n\nquasar в заметке\n").await;
+    let st = || vec!["active".to_string(), "revisit".to_string()];
+    let terms = vec![
+        "quasar".into(),
+        "quas".into(),
+        "pulsar".into(),
+        "nebula".into(),
+    ];
+    let td = |terms: &[String]| zam_store::insight_term_docs(&db, vec![k], st(), terms.to_vec());
+    let r = td(&terms).await.unwrap();
+    assert_eq!((r.docs, r.df.clone(), r.matched), (3, vec![2, 2, 2, 0], 4));
+    // та же версия insight — из кэша, без проходов индекса; новое слово — один проход
+    let r = td(&terms).await.unwrap();
+    assert_eq!((r.docs, r.df, r.matched), (3, vec![2, 2, 2, 0], 0));
+    let r = td(&["pulsar".into(), "quasars".into()]).await.unwrap();
+    assert_eq!((r.df, r.matched), (vec![2, 1], 1));
+    // заметка — не insight: версия та же
+    add(&db, k, "notes/q2", "# Q2\n\nquasar ещё\n").await;
+    assert_eq!(td(&terms).await.unwrap().matched, 0);
+    // новый insight — новая версия: частоты заново
+    insight_in(&db, k, "Ещё квазар", "quasar").await;
+    let r = td(&terms).await.unwrap();
+    assert_eq!((r.docs, r.df, r.matched), (4, vec![3, 3, 2, 0], 4));
+    // отзыв — тоже новая версия
+    let q = insight_in(&db, k, "Квазар на отзыв", "quasar").await;
+    assert_eq!(td(&terms).await.unwrap().df, vec![4, 4, 2, 0]);
+    zam_store::retract_entry(&db, q, None, "неверно", &attrib())
+        .await
+        .unwrap();
+    let r = td(&terms).await.unwrap();
+    assert_eq!((r.docs, r.df, r.matched), (4, vec![3, 3, 2, 0], 4));
+    // пустые пространства или слова — без запросов
+    let r = zam_store::insight_term_docs(&db, Vec::new(), st(), terms)
+        .await
+        .unwrap();
+    assert_eq!((r.docs, r.df, r.matched), (0, vec![0; 4], 0));
+}
+
+/// M7.1 §4.8 (задача 9): фильтр только по записям, а живых записей его видов и статусов в
+/// области нет, — пустые каналы (как у трёх пустых проходов FTS, которых теперь нет): заметки и
+/// insight с теми же словами задачу не дают; живая задача находится; удалённая — нет; задача
+/// со статусом вне фильтра — нет; фильтр с заметками проверки не делает.
+#[tokio::test]
+async fn entry_only_filter_without_live_entries_is_empty() {
+    // счёт по пути базы: другие тесты процесса его не трогают
+    #[cfg(feature = "test-hooks")]
+    zam_store::test_hooks::count_fts_channels();
+    let (db, k, _) = setup("entry-only-empty").await;
+    add(
+        &db,
+        k,
+        "notes/m",
+        "# Миграция\n\nМиграция базы и кэш деплоя.\n",
+    )
+    .await;
+    insight_in(
+        &db,
+        k,
+        "Ловушка миграции",
+        "Миграция базы падает на шаге 7.",
+    )
+    .await;
+    let tasks = |kinds: &[&str], statuses: &[&str]| {
+        let mut f = q("миграция базы деплоя", &[k]);
+        f.targets.kinds = kinds.iter().map(|s| s.to_string()).collect();
+        f.targets.statuses = statuses.iter().map(|s| s.to_string()).collect();
+        zam_store::search_fts_channels(&db, f)
+    };
+    // проходы каналов с `MATCH` (фича `test-hooks`; без неё проверяется только выдача): пропуск
+    // пустых — не проход
+    let runs = |want: u64| {
+        #[cfg(feature = "test-hooks")]
+        assert_eq!(
+            zam_store::test_hooks::fts_channel_runs(db.path()),
+            want,
+            "проходов каналов FTS"
+        );
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = want;
+    };
+    let open = ["open", "in_progress", "blocked"];
+    let ch = tasks(&["task"], &open).await.unwrap();
+    assert!(
+        ch.bm25.is_empty() && ch.trigram.is_empty() && ch.alias.is_empty(),
+        "{ch:?}"
+    );
+    assert!(!ch.relaxed && !ch.alias_relaxed, "{ch:?}");
+    runs(0);
+    let (task, _) = zam_store::create_entry(
+        &db,
+        zam_store::NewEntry {
+            refs: None,
+            space_id: k,
+            kind: zam_store::EntryKind::Task,
+            title: "Миграция базы".into(),
+            body: "Шаги задачи.".into(),
+            data: serde_json::json!({}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: None,
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &attrib(),
+    )
+    .await
+    .unwrap();
+    let ch = tasks(&["task"], &open).await.unwrap();
+    assert!(ch.bm25.iter().all(|h| h.target.id == task.id), "{ch:?}");
+    assert!(!ch.bm25.is_empty(), "{ch:?}");
+    runs(1);
+    // статус задачи вне фильтра — нет живой записи фильтра
+    assert!(tasks(&["task"], &["done"]).await.unwrap().bm25.is_empty());
+    runs(1);
+    // с заметками фильтр идёт обычным путём: заметка находится и без задач
+    zam_store::delete_entry(&db, task.id, None, &attrib())
+        .await
+        .unwrap();
+    assert!(tasks(&["task"], &open).await.unwrap().bm25.is_empty());
+    runs(1);
+    let ch = tasks(&["task", "note"], &open).await.unwrap();
+    assert!(
+        ch.bm25.iter().any(|h| h.target.kind == TargetKind::Node),
+        "{ch:?}"
+    );
+    runs(2);
+}

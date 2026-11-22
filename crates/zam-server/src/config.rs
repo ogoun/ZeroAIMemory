@@ -809,6 +809,8 @@ pub struct RecallSection {
     /// Порог покрытия слов ошибки у ослабленного FTS `post_tool` (M6 §9):
     /// `{divisor, cap, word_match}` — `clamp(⌈n / divisor⌉, 2, cap)`, слова `plain` | `stems`;
     /// `{2, 6, plain}` — по сетке задачи 9 (до M6 — `{3, 4, plain}`; [`CoverageRule::M6`]).
+    /// `common_pct` (M7.1 §4.6 п. 3, 1..=100) — слово ошибки в большей доле insight области
+    /// поиска частое и в покрытие не идёт; 100 — выключено ([`CoverageRule::M71`]).
     pub post_tool_coverage: CoverageRule,
     /// Бюджет сервера на сбор подсказок хуков, мс (1..=60000, 200): по превышении отдаётся
     /// собранное и `warnings: ["recall timeout"]`.
@@ -870,6 +872,9 @@ impl RecallSection {
         }
         if !(2..=32).contains(&cov.cap) {
             return Err(bad("post_tool_coverage.cap", "от 2 до 32"));
+        }
+        if !(1..=100).contains(&cov.common_pct) {
+            return Err(bad("post_tool_coverage.common_pct", "от 1 до 100"));
         }
         if !(1..=60_000).contains(&self.timeout_ms) {
             return Err(bad("timeout_ms", "от 1 до 60000"));
@@ -1598,7 +1603,7 @@ impl Default for ServerConfig {
                 brief_tokens: 800,
                 prompt_min_score: 0.6,
                 prompt_min_score_fts: None,
-                post_tool_coverage: CoverageRule::M6,
+                post_tool_coverage: CoverageRule::M71,
                 timeout_ms: 200,
                 max_timeout_ms: 2000,
                 snippet_tokens: 60,
@@ -2905,7 +2910,7 @@ master_key = \"x\"
     }
 
     /// M6 §9: `recall.prompt_min_score_fts` и `recall.post_tool_coverage` — умолчания, `ZAM_*`
-    /// вложенного ключа, диапазоны.
+    /// вложенного ключа, диапазоны; M7.1 §4.6 п. 3 — `common_pct`.
     #[test]
     fn recall_hint_threshold_keys() {
         use zam_search::recall::WordMatch;
@@ -2914,12 +2919,13 @@ master_key = \"x\"
             d.prompt_min_score_fts, None,
             "не задан — как prompt_min_score"
         );
-        assert_eq!(d.post_tool_coverage, CoverageRule::M6);
+        assert_eq!(d.post_tool_coverage, CoverageRule::M71);
         let e = vec![
             env("ZAM_RECALL__PROMPT_MIN_SCORE_FTS", "0.3"),
             env("ZAM_RECALL__POST_TOOL_COVERAGE__DIVISOR", "2"),
             env("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "6"),
             env("ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH", "stems"),
+            env("ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT", "35"),
         ];
         let r = load(None, &e, &Default::default()).unwrap().recall;
         assert_eq!(r.prompt_min_score_fts, Some(0.3));
@@ -2928,7 +2934,8 @@ master_key = \"x\"
             CoverageRule {
                 divisor: 2,
                 cap: 6,
-                word_match: WordMatch::Stems
+                word_match: WordMatch::Stems,
+                common_pct: 35,
             }
         );
         for (k, v) in [
@@ -2937,6 +2944,8 @@ master_key = \"x\"
             ("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "1"),
             ("ZAM_RECALL__POST_TOOL_COVERAGE__CAP", "33"),
             ("ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH", "snowball"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT", "0"),
+            ("ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT", "101"),
         ] {
             assert!(
                 load(None, &[env(k, v)], &Default::default()).is_err(),

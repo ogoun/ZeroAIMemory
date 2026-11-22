@@ -342,7 +342,8 @@ pub async fn graph(
         }
         let solution = super::files::query_solution(q.solution.as_deref(), &headers)?;
         let (db, owners) = super::files::file_owners(&st, &p, &headers, file, solution).await?;
-        let nodes = graph_nodes(&db, owners).await?;
+        let mut nodes = graph_nodes(&db, owners).await?;
+        shown_titles(&p, &mut nodes);
         return Ok(Json(
             json!({ "nodes": nodes, "edges": [], "truncated": false }),
         ));
@@ -357,10 +358,19 @@ pub async fn graph(
     let types = parse_types(q.types.as_deref())?;
     let t = live_target(&st, &p, &headers, start, Mode::Read).await?;
     let spaces = graph_spaces(&p, &t.db, &t.space, t.role).await?;
-    let g = t.db.neighbors(&[t.r], depth, &types, &spaces).await?;
+    let mut g = t.db.neighbors(&[t.r], depth, &types, &spaces).await?;
+    shown_titles(&p, &mut g.nodes);
     Ok(Json(
         json!({ "nodes": g.nodes, "edges": g.edges, "truncated": g.truncated }),
     ))
+}
+
+/// Заголовки записей журналов среди узлов графа агенту по токену — с маской секретов (задача 5
+/// M7.1); имя заметки — адрес, как есть.
+fn shown_titles(p: &Principal, nodes: &mut [zam_store::GraphNode]) {
+    for n in nodes.iter_mut().filter(|n| n.r.kind == TargetKind::Entry) {
+        super::agent_view::view_in_place(p, &mut n.title);
+    }
 }
 
 #[derive(Deserialize)]
@@ -453,14 +463,17 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `{items, nodes}`: рёбра и узлы их других концов (`other` — какой конец).
+/// `{items, nodes}`: рёбра и узлы их других концов (`other` — какой конец); заголовки — для
+/// зрителя `p` ([`shown_titles`]).
 async fn edges_reply(
+    p: &Principal,
     db: &Db,
     items: Vec<EdgeView>,
     other: impl Fn(&EdgeView) -> Option<TargetRef>,
 ) -> Result<Json<Value>, ApiError> {
     let refs: Vec<TargetRef> = items.iter().filter_map(&other).collect();
-    let nodes = graph_nodes(db, refs).await?;
+    let mut nodes = graph_nodes(db, refs).await?;
+    shown_titles(p, &mut nodes);
     Ok(Json(json!({ "items": items, "nodes": nodes })))
 }
 
@@ -473,7 +486,7 @@ async fn backlinks_of(
     let t = live_target(st, p, headers, r, Mode::Read).await?;
     let spaces = graph_spaces(p, &t.db, &t.space, t.role).await?;
     let items = t.db.backlinks(t.r, &spaces).await?;
-    edges_reply(&t.db, items, |e| Some(e.src)).await
+    edges_reply(p, &t.db, items, |e| Some(e.src)).await
 }
 
 /// `GET /nodes/{id}/backlinks`.
@@ -542,7 +555,7 @@ async fn links_of(
     let t = live_target(st, p, headers, r, Mode::Read).await?;
     let spaces = graph_spaces(p, &t.db, &t.space, t.role).await?;
     let items = t.db.outgoing(t.r, &spaces).await?;
-    edges_reply(&t.db, items, |e| e.dst).await
+    edges_reply(p, &t.db, items, |e| e.dst).await
 }
 
 #[cfg(test)]

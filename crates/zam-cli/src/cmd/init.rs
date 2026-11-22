@@ -16,10 +16,12 @@
 //!
 //! **Токен** **[решение контроллера, задача 11 M4]**: в CLAUDE.md, AGENTS.md и `.mcp.json` не
 //! пишется. Заданный флагом `--token` или найденный в прежнем блоке (v1 держал
-//! `ZeroAIMemoryToken=`) того файла, где блок заменяется, токен сохраняется вместе с адресом в
-//! `~/.zeroaimemory/config.toml` (права 0600 на unix) — там его находят `zam` и хуки
-//! ([`locate::resolve`]). Другой токен там заменяет только `--token` (с предупреждением), без
-//! него — предупреждение; после переноса из блока — совет сменить токен (fix round 1, I-6).
+//! `ZeroAIMemoryToken=`) того файла, где блок заменяется, токен сохраняется в
+//! `~/.zeroaimemory/config.toml` (права 0600 на unix) ключом своего адреса
+//! `[servers."<адрес>"]` (M7 §4.4) — там его находят `zam` и хуки ([`locate::resolve`]); токены
+//! других адресов не трогаются. Другой токен этого адреса заменяет только `--token` (с
+//! предупреждением), без него — предупреждение; после переноса из блока — совет сменить токен
+//! (fix round 1, I-6).
 //! MCP Claude Code (`.mcp.json`) — stdio-прокси `zam mcp` (M6 §7.1): токен, адрес и решение
 //! — те же, что у `zam`; для Codex — подсказка про `~/.codex/config.toml`. Файлы проекта пишутся атомарно, BOM и CRLF
 //! сохраняются. Повторный запуск идемпотентен.
@@ -42,8 +44,8 @@ pub use url::UrlTo;
 use serde_json::Value;
 
 use super::hook;
-use super::{home_dir, zam_env};
-use crate::client::{CliError, Client, EXIT_TOKEN, read_json};
+use super::{home_dir, missing_token, unbound_token_note, zam_env};
+use crate::client::{CliError, Client, read_json};
 use crate::locate::{self, Flags, Source};
 use crate::target::{self, Solution};
 use ojson::J;
@@ -408,12 +410,10 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         )
     })?;
     locate::check_url(&url.value).map_err(CliError::config)?;
-    let token = r.token.ok_or_else(|| {
-        CliError::new(
-            EXIT_TOKEN,
-            "токен не задан: zam init --url … --token <токен> (или ZAM_TOKEN)",
-        )
-    })?;
+    let elsewhere = r.other_server_keys;
+    let token = r
+        .token
+        .ok_or_else(|| missing_token(&url.value, elsewhere))?;
     let root = hook::project_root(&cwd, &home);
     if root == home {
         return Err(CliError::config(
@@ -516,6 +516,17 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     // адрес вне блока: home — домашний конфиг (другой адрес там — отказ), local —
     // CLAUDE.local.md и его исключение из git; block — проверка, что файл не уйдёт в git
     let local_path = root.join(LOCAL_MD);
+    // токен — в домашний конфиг ключом своего адреса `[servers."<адрес>"]` (не в файлы проекта,
+    // M7 §4.4): `--token` заменяет другой токен этого адреса с предупреждением, перенесённый из
+    // блока v1 — нет; токены других адресов не трогаются
+    let forced = token.source == Source::Flag;
+    let candidate = if forced {
+        Some(token.value.clone())
+    } else {
+        migrated.as_ref().map(|(t, _)| t.clone())
+    };
+    // токен адреса после запуска: записываемый или найденный
+    let addr_token = candidate.as_deref().unwrap_or(&token.value);
     let mut home_url = locate::HomeUrlPlan::Unchanged;
     match url_to {
         UrlTo::Block => {
@@ -525,7 +536,9 @@ pub fn run(o: Opts) -> Result<(), CliError> {
                 .map(|(_, file, _)| file.to_string())
                 .collect();
         }
-        UrlTo::Home => home_url = url::plan_home(&home, &url.value)?,
+        // ключ без адреса рядом с `url` стал бы ключом этого адреса: сверка с токеном, который
+        // пишется или найден для адреса
+        UrlTo::Home => home_url = url::plan_home(&home, &url.value, addr_token)?,
         UrlTo::Local => {
             let old = read_opt(&local_path)?;
             let text = merge::set_url_line(old.as_deref(), &url.value);
@@ -574,21 +587,63 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             merge::merge_mcp(j, &frag)
         })?);
     }
-    // токен — в домашний конфиг вместе с адресом (не в файлы проекта): `--token` заменяет
-    // другой токен с предупреждением, перенесённый из блока v1 — нет
-    let forced = token.source == Source::Flag;
-    let candidate = if forced {
-        Some(token.value.clone())
-    } else {
-        migrated.as_ref().map(|(t, _)| t.clone())
+    // `url` верхнего уровня (адрес для каталогов без своего): block — если его нет, home — этот,
+    // local — не трогается
+    let top = match url_to {
+        UrlTo::Block => locate::TopUrl::IfAbsent,
+        UrlTo::Home => locate::TopUrl::Set,
+        UrlTo::Local => locate::TopUrl::Keep,
     };
-    // у `--url-to local` адрес домашнего конфига не трогается
-    let home_addr = (url_to != UrlTo::Local).then_some(url.value.as_str());
+    // block: проект и хуки берут адрес из строки `ZeroAIMemoryUrl=` блока (`server.public_url` или
+    // `Host` запроса) и ищут токен по нему — он пишется и под адресами блока, отличными от
+    // `--url`, где токена ещё нет (финальное ревью M7.1, I-3); другой токен под адресом блока не
+    // заменяется и с `--token` — адрес назвал сервер (N-1), только предупреждение
+    let aliases: Vec<String> = if url_to == UrlTo::Block {
+        let key = locate::normalize_url(&url.value);
+        let mut a: Vec<String> = urls
+            .iter()
+            .map(|u| locate::normalize_url(u))
+            .filter(|u| *u != key)
+            .collect();
+        a.sort_unstable();
+        a.dedup();
+        a
+    } else {
+        Vec::new()
+    };
+    let alias_state = if aliases.is_empty() {
+        locate::AliasTokens::default()
+    } else {
+        locate::alias_tokens(&home, &url.value, &aliases, addr_token).map_err(CliError::config)?
+    };
     let home_plan = match &candidate {
-        Some(t) => locate::plan_home(&home, home_addr, t, forced).map_err(CliError::config)?,
+        Some(t) => locate::plan_home_aliases(&home, &url.value, &aliases, t, forced, top)
+            .map_err(CliError::config)?,
+        // токен адреса из домашнего конфига: дописать его и под адресом блока (без `url`
+        // верхнего уровня — его этот запуск не задавал); токен окружения и файла проекта в
+        // домашний конфиг не переносится
+        None if !aliases.is_empty()
+            && matches!(token.source, Source::Home(_) | Source::HomeServer(..)) =>
+        {
+            locate::plan_home_aliases(
+                &home,
+                &url.value,
+                &aliases,
+                &token.value,
+                false,
+                locate::TopUrl::Keep,
+            )
+            .map_err(CliError::config)?
+        }
         None => locate::HomePlan::Unchanged,
     };
-    // одна запись домашнего конфига: план токена (адрес в нём тот же) или только адрес
+    // ключ без адреса, который после запуска остаётся и не используется, — предупреждение и без
+    // записи токена (M7 §4.4): у записи — из плана, иначе — из файла
+    let unbound_left = match &home_plan {
+        locate::HomePlan::Write { unbound_left, .. } => unbound_left.clone(),
+        _ => locate::unused_unbound_token(&home, addr_token).map_err(CliError::config)?,
+    };
+    // одна запись домашнего конфига: план токена (у `--url-to home` — с адресом) или только адрес
     let home_write = match (&home_plan, &home_url) {
         (locate::HomePlan::Write { path, text, .. }, _)
         | (_, locate::HomeUrlPlan::Write { path, text }) => Some((path, text)),
@@ -679,20 +734,36 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     if skipped {
         println!("Хуки и .mcp.json не записаны: повторите с --yes.");
     }
+    let key = locate::normalize_url(&url.value);
+    // записанные ключи: адрес и адреса блока, где токена не было
+    let keys = std::iter::once(&key)
+        .chain(&alias_state.missing)
+        .map(|k| format!("[servers.\"{k}\"]"))
+        .collect::<Vec<_>>()
+        .join(" и ");
     match &home_plan {
         locate::HomePlan::Write { replaced: true, .. } => eprintln!(
-            "предупреждение: в ~/.zeroaimemory/config.toml был другой токен — заменён на заданный --token"
+            "предупреждение: в ~/.zeroaimemory/config.toml для {key} был другой токен — заменён на \
+             заданный --token"
         ),
-        locate::HomePlan::Write { .. } if url_to == UrlTo::Local => {
-            println!("Токен сохранён в ~/.zeroaimemory/config.toml (его берут zam и хуки).")
-        }
         locate::HomePlan::Write { .. } => {
-            println!("Токен и адрес сохранены в ~/.zeroaimemory/config.toml (их берут zam и хуки).")
+            println!("Токен сохранён в ~/.zeroaimemory/config.toml {keys} (его берут zam и хуки).")
         }
         locate::HomePlan::Conflict(_) => eprintln!(
-            "предупреждение: в ~/.zeroaimemory/config.toml другой токен — не заменён (заменить: zam init --token <токен>)"
+            "предупреждение: в ~/.zeroaimemory/config.toml для {key} другой токен — не заменён \
+             (заменить: zam init --token <токен>)"
         ),
         locate::HomePlan::Unchanged => {}
+    }
+    // адрес блока с другим токеном не заменён и с --token (N-1)
+    for a in &alias_state.other {
+        eprintln!(
+            "предупреждение: под адресом {a} уже другой токен — не заменён; проект с блоком этого \
+             адреса пойдёт с прежним токеном"
+        );
+    }
+    if let Some(mask) = &unbound_left {
+        eprintln!("предупреждение: {}", unbound_token_note(mask, None));
     }
     if let (Some((_, first)), Some(other)) = (&migrated, differs) {
         eprintln!(

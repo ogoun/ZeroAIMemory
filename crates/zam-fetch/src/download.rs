@@ -76,14 +76,11 @@ fn is_loopback(url: &str) -> bool {
 }
 
 /// Скачивает `url` в `dest` (через прокси из окружения, кроме локальной петли), с таймаутами.
-/// При ошибке частичный `dest` остаётся — его удаляет вызывающий.
-pub fn download(url: &str, dest: &Path) -> Result<(), FetchError> {
-    download_limited(url, dest, None)
-}
-
-/// [`download`] с пределом размера: тело длиннее `max` байт обрывает загрузку
-/// (сервер отдаёт не тот файл — гигабайты впустую не качаются).
-fn download_limited(url: &str, dest: &Path, max: Option<u64>) -> Result<(), FetchError> {
+/// `size` — закреплённый размер, если задан: тело длиннее обрывает загрузку (сервер отдаёт не
+/// тот файл — гигабайты впустую не качаются; [`FetchError::SizeExceeded`]), короче — ошибка
+/// после загрузки ([`FetchError::SizeMismatch`]). При ошибке частичный `dest` остаётся — его
+/// удаляет вызывающий.
+pub fn download(url: &str, dest: &Path, size: Option<u64>) -> Result<(), FetchError> {
     let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
@@ -107,25 +104,25 @@ fn download_limited(url: &str, dest: &Path, max: Option<u64>) -> Result<(), Fetc
         url: url.to_string(),
         message: e.to_string(),
     };
-    match max {
+    match size {
         None => {
             io::copy(&mut reader, &mut out).map_err(copy_err)?;
         }
         Some(max) => {
             let mut limited = reader.take(max.saturating_add(1));
             let n = io::copy(&mut limited, &mut out).map_err(copy_err)?;
+            // прочитано max + 1 — сколько всего, неизвестно
             if n > max {
-                return Err(FetchError::SizeMismatch {
+                return Err(FetchError::SizeExceeded {
                     what: url.to_string(),
-                    expected: max,
-                    actual: n,
+                    max,
                 });
             }
         }
     }
     out.flush()
         .map_err(FetchError::io(format!("запись {}", dest.display())))?;
-    Ok(())
+    check_size(dest, url, size)
 }
 
 /// Путь внутри архива без `./` и с прямыми слэшами.
@@ -337,27 +334,36 @@ fn extract_tar<R: Read>(
 
 /// Формат архива по расширению URL.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Format {
+pub(crate) enum Format {
+    /// zip и пакет NuGet `.nupkg` (тот же zip; ONNX Runtime с M7.1).
     Zip,
     TarGz,
     TarXz,
 }
 
-fn format_of(url: &str) -> Option<Format> {
+/// Окончания URL поддерживаемых архивов и их форматы — единственный источник для
+/// [`format_of`] и текста ошибки проверки манифеста.
+pub(crate) const ARCHIVE_SUFFIXES: [(&str, Format); 6] = [
+    (".zip", Format::Zip),
+    (".nupkg", Format::Zip),
+    (".tar.gz", Format::TarGz),
+    (".tgz", Format::TarGz),
+    (".tar.xz", Format::TarXz),
+    (".txz", Format::TarXz),
+];
+
+/// Формат по окончанию URL без учёта регистра ([`ARCHIVE_SUFFIXES`]); `None` — архив не
+/// поддерживается.
+pub(crate) fn format_of(url: &str) -> Option<Format> {
     let lower = url.to_ascii_lowercase();
-    if lower.ends_with(".zip") {
-        Some(Format::Zip)
-    } else if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
-        Some(Format::TarGz)
-    } else if lower.ends_with(".txz") || lower.ends_with(".tar.xz") {
-        Some(Format::TarXz)
-    } else {
-        None
-    }
+    ARCHIVE_SUFFIXES
+        .iter()
+        .find(|(s, _)| lower.ends_with(s))
+        .map(|&(_, f)| f)
 }
 
-/// Извлекает из архива (zip, tar.gz, tar.xz) только перечисленные в `entry.extract` файлы
-/// в `out`. В tar под нужным путём допускается ссылка на файл того же каталога
+/// Извлекает из архива (zip и nupkg, tar.gz, tar.xz) только перечисленные в `entry.extract`
+/// файлы в `out`. В tar под нужным путём допускается ссылка на файл того же каталога
 /// (см. [`extract_tar`]); в zip — только обычные файлы.
 ///
 /// Не для недоверенных архивов: вызывающий обязан заранее сверить SHA-256 архива с манифестом
@@ -524,8 +530,7 @@ pub fn fetch_file(
         .ok_or_else(|| FetchError::Invalid("у пути назначения нет каталога".into()))?;
     fs::create_dir_all(dir).map_err(FetchError::io(format!("создание {}", dir.display())))?;
     let part = fresh_part(dest)?;
-    let checked = download_limited(url, &part, size).and_then(|()| {
-        check_size(&part, url, size)?;
+    let checked = download(url, &part, size).and_then(|()| {
         let actual = sha256_file(&part)?;
         if actual == expected {
             Ok(())
@@ -631,8 +636,7 @@ pub fn install_archive(entry: &PlatformEntry, dir: &Path, key: &str) -> Result<b
     let part = fresh_part(dir)?;
     let tmp = sibling(dir, ".tmp")?;
     let result = (|| {
-        download_limited(&entry.url, &part, entry.size)?;
-        check_size(&part, &entry.url, entry.size)?;
+        download(&entry.url, &part, entry.size)?;
         let actual = sha256_file(&part)?;
         if actual != expected {
             return Err(FetchError::Sha256Mismatch {
@@ -796,6 +800,41 @@ mod tests {
         let mode = |n: &str| std::fs::metadata(out.join(n)).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode("tool"), 0o755);
         assert_eq!(mode("b.so"), 0o644);
+    }
+
+    /// Пакет NuGet (`.nupkg`) — zip (ONNX Runtime с M7.1); регистр окончания не важен.
+    #[test]
+    fn format_of_nupkg_is_zip() {
+        let u = "https://api.nuget.org/v3-flatcontainer/x/1.31.0/x.1.31.0.nupkg";
+        assert!(matches!(format_of(u), Some(Format::Zip)));
+        assert!(matches!(format_of("https://x/X.NUPKG"), Some(Format::Zip)));
+    }
+
+    /// Раскладка пакета NuGet: корневого каталога нет, библиотеки в `runtimes/<rid>/native/`.
+    #[test]
+    fn extract_from_nupkg() {
+        let d = tmp("extract_nupkg");
+        let p = d.join("u.nupkg");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&p).unwrap());
+        let o = zip::write::SimpleFileOptions::default();
+        for (n, c) in [
+            ("[Content_Types].xml", "<Types/>"),
+            ("runtimes/win-x64/native/a.dll", "AAA"),
+            ("runtimes/linux-x64/native/liba.so", "LLL"),
+        ] {
+            z.start_file(n, o).unwrap();
+            z.write_all(c.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+        let out = d.join("out");
+        let e = entry(&["runtimes/win-x64/native/a.dll"], &[]);
+        extract_selected(&p, "u.nupkg", &e, &out).unwrap();
+        let want: String = Sha256::digest(b"AAA")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        verify_sha256(&out.join("a.dll"), &want).unwrap();
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
     }
 
     #[test]
@@ -1233,10 +1272,19 @@ mod tests {
         std::fs::write(d.join("m").join("model.onnx.4242.part"), b"old").unwrap();
         std::fs::write(d.join("m").join("model.onnx.x.part"), b"keep").unwrap();
         std::fs::write(d.join("m").join("tokenizer.json.77.part"), b"keep").unwrap();
-        // тело длиннее закреплённого размера — загрузка обрывается
+        // тело длиннее закреплённого размера — загрузка обрывается на size + 1 байте, поэтому
+        // в тексте «больше N байт», а не число прочитанного
         let (url, _) = serve(b"hello", "file.bin", 1);
         let err = fetch_file(&url, HELLO_SHA, Some(3), &dest).unwrap_err();
-        assert!(matches!(err, FetchError::SizeMismatch { .. }), "{err}");
+        assert!(
+            matches!(err, FetchError::SizeExceeded { max: 3, .. }),
+            "{err}"
+        );
+        let err = err.to_string();
+        assert!(
+            err.contains("больше 3 байт") && !err.contains("получено 4"),
+            "{err}"
+        );
         // короче закреплённого — ошибка до хэша
         let (url, _) = serve(b"hello", "file.bin", 1);
         let err = fetch_file(&url, HELLO_SHA, Some(10), &dest).unwrap_err();

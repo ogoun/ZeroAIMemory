@@ -2,7 +2,7 @@
 //! из `mod.rs`, правила тишины и подсказка-задача). Разделы ответа ([`prompt_sections`]) — по
 //! порядку: строки словаря ([`super::term_cands`]), подсказки поиска ([`prompt_hints`]),
 //! подсказка-задача ([`task_prompt_cands`]), подсказки-идеи ([`super::ideas::prompt_ideas`]) и
-//! строка очереди разбора ([`super::ideas::review_queue_head`], [`super::ideas::QueueHead::line`]);
+//! строка очереди разбора ([`super::ideas::review_queue_line`]);
 //! у каждого раздела свой предел ([`super::section_limit`]). Правила выдачи, учёт показа и
 //! сроки — в документации модуля [`super`]. Правило тишины — общее с моделью калибровки
 //! `xtask eval --hints`: [`zam_search::recall::prompt_gate`] (ревью задачи 2, I1).
@@ -27,16 +27,18 @@
 //!   `ZeroAIMemory: задача «<заголовок>» [<статус>] k:<id>` (заголовок — без секретов и до 80
 //!   символов, как в строке открытых задач), `reason: task`, не больше [`TASK_HINTS_MAX`] на
 //!   ответ, раз за сессию (`session_seen`, как у остальных подсказок).
-//! - **Очередь разбора** (M6.6 §3.5, замечание 36): режим `review`, владелец базы решения, идеи
-//!   включены — строка `ZeroAIMemory: новая идея на разбор «<заголовок>» w:<id>` (при
-//!   нескольких непоказанных — ` (ещё N)`), `reason: idea_review`, одна на ответ, раз на идею за
-//!   эпоху сессии в её текущей ревизии (показ дайджестом той же эпохи считается; после сжатия
-//!   контекста — снова; идея, вернувшаяся в `new` новой ревизией, — снова). От близости к
-//!   запросу не зависит и идёт мимо правила «нет предметных слов» («продолжай»), но не мимо
-//!   пересылки; голова очереди читается до поиска; срок — общий срок `prompt`, не уложился —
-//!   тишина без предупреждений. Режим `propose`, участник общего решения, выключенные идеи — без
-//!   строки; снятая пределом вывода канала — строка «не показано — идей на разбор: 1
-//!   (memory_recall event=idea_review)».
+//! - **Очередь разбора** (M6.6 §3.5, замечание 36; одна строка — M7.1 §4.5 п. 1): режим
+//!   `review`, владелец базы решения, идеи включены, очередь не пуста — строка
+//!   `ZeroAIMemory: идей ждут разбора: N, первая «<заголовок>» — список: …`
+//!   ([`super::ideas::REVIEW_QUEUE_LINE`]), `reason: idea_review` (ссылка — первая идея), раз за
+//!   эпоху сессии (раздел очереди дайджеста той же эпохи — тоже показ; после сжатия контекста —
+//!   снова) и ещё раз, когда после показа в очереди появилась идея. От близости к запросу не
+//!   зависит и идёт мимо правила «нет предметных слов» («продолжай»), но не мимо пересылки;
+//!   очередь читается до поиска; срок — общий срок `prompt`, не уложился — тишина без
+//!   предупреждений. Первая идея строки уже идёт в ответе подсказкой-идеей — строка снимается
+//!   повтором ссылки и ждёт следующего запроса (показ не отмечен). Режим `propose`, участник
+//!   общего решения, выключенные идеи — без строки; снятая пределом вывода канала — строка «не
+//!   показано — идей на разбор: 1 (memory_recall event=idea_review)».
 //!
 //! [`PROMPT_SHORT_WORDS`]: zam_search::recall::PROMPT_SHORT_WORDS
 use std::collections::HashSet;
@@ -52,10 +54,10 @@ use zam_store::{
     EntryKind, EntryStatus, FtsHit, FtsQuery, TargetFilter, count_tokens, search_fts_channels,
 };
 
-use super::ideas::{prompt_ideas, review_queue_head};
+use super::ideas::{QueueLine, prompt_ideas, review_queue_line};
 use super::{
-    Cand, Deadline, REASON_TASK, RecallReq, TASK_TITLE_CHARS, age_of, entry_spaces, inner_search,
-    item_age, masked_clip, prompt_min_score, term_cands,
+    Cand, Deadline, REASON_TASK, RecallReq, TASK_TITLE_CHARS, age_of, entry_spaces, hint_title,
+    inner_search, item_age, masked_clip, prompt_min_score, term_cands,
 };
 use crate::api::search::Health;
 use crate::api::sessions::RequestSession;
@@ -72,15 +74,14 @@ const TASK_LEAD: &str = "задача ";
 
 /// Разделы ответа `prompt` (см. модуль): строки словаря, подсказки поиска, подсказка-задача,
 /// подсказки-идеи (`ideas_on` — идеи включены, [`super::ideas_enabled`]; `review` — режим
-/// `ideas.mode = review`) — и отдельно строка очереди разбора (M6.6 §3.5): у неё свой отбор
-/// показанного (эпоха и ревизия, [`super::ideas::review_queue_head`]), общий фильтр показанного
+/// `ideas.mode = review`) — и отдельно строка очереди разбора (M7.1 §4.5 п. 1): у неё свой учёт
+/// показа (раз за эпоху, [`super::ideas::review_queue_line`]), общий фильтр показанного
 /// `recall` её не трогает. Проход задач — до идей: у идей свой срок, и шаг после их просрочки
 /// ставил бы `recall timeout`, которого у ответа без идей нет.
 ///
-/// Голова очереди читается после правила пересылки (§3.3) и до правила «нет предметных слов»
-/// (§3.1) — до поиска, чтобы срок поиска её не вытеснял (ревью задачи 14, M1); строка выбирается
-/// после подсказок-идей и идёт в ответе последней: от запроса она не зависит и не повторяет
-/// идею, которую ответ уже несёт подсказкой-идеей.
+/// Очередь читается после правила пересылки (§3.3) и до правила «нет предметных слов» (§3.1) —
+/// до поиска, чтобы срок поиска её не вытеснял (ревью задачи 14 M6.6, M1); строка идёт в ответе
+/// последней: от запроса она не зависит.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn prompt_sections(
     st: &AppState,
@@ -92,12 +93,12 @@ pub(super) async fn prompt_sections(
     review: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
-) -> Result<(Vec<(Option<&'static str>, Vec<Cand>)>, Vec<Cand>), ApiError> {
+) -> Result<(Vec<(Option<&'static str>, Vec<Cand>)>, Option<QueueLine>), ApiError> {
     let prompt = req.prompt.as_deref().unwrap_or_default();
     // признак пересылки — по всему промпту, как у хука; предметные слова — по запросу поиска
     let gate = prompt_gate(prompt, zam_store::search::QUERY_MAX_CHARS);
     if gate == PromptGate::Relayed {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), None));
     }
     // строки словаря — перед подсказками insight; у каждого свой предел
     let chars = crate::glossary::HINT_TEXT_CHARS;
@@ -105,25 +106,24 @@ pub(super) async fn prompt_sections(
     // очередь разбора (M6.6 §3.5) — и к реплике без предметных слов; пустой запрос — не запрос
     // человека (как у подсказок-идей)
     let queue = if ideas_on && review && !prompt.trim().is_empty() {
-        review_queue_head(st, p, session, health, deadline).await
+        review_queue_line(st, p, session, health, deadline).await
     } else {
         None
     };
     let mut out = vec![(None, terms)];
-    let mut ideas = Vec::new();
     if let PromptGate::Search { subject, short } = &gate {
         let query = query_head(prompt);
         let hints = prompt_hints(st, p, headers, req, &query, &gate, health, deadline).await?;
         let tasks = task_prompt_cands(&query, subject, *short, health, deadline).await?;
         // идеи — отдельным поиском после основного, своей строкой и своим пределом
-        if ideas_on {
-            ideas = prompt_ideas(st, p, headers, req, session, health, deadline, review).await?;
-        }
-        out.extend([(None, hints), (None, tasks)]);
+        let ideas = if ideas_on {
+            prompt_ideas(st, p, headers, req, session, health, deadline, review).await?
+        } else {
+            Vec::new()
+        };
+        out.extend([(None, hints), (None, tasks), (None, ideas)]);
     }
-    let line = queue.map(|q| q.line(&ideas)).unwrap_or_default();
-    out.push((None, ideas));
-    Ok((out, line))
+    Ok((out, queue))
 }
 
 /// Первые [`zam_store::search::QUERY_MAX_CHARS`] символов промпта — запрос поиска подсказок.
@@ -205,9 +205,11 @@ async fn prompt_hints(
         let snippet =
             truncate_to_tokens(&snippet, st.cfg.recall.snippet_tokens, &count_tokens).to_string();
         let (reference, title, lead, tags, out_kind, reason) = match tref {
+            // заголовок — без секретов (задача 5 M7.1; поиск по токену уже маскирует его, маска
+            // идемпотентна)
             TargetKind::Entry => (
                 format!("i:{id}"),
-                it["title"].as_str().unwrap_or_default().to_string(),
+                hint_title(it["title"].as_str().unwrap_or_default()),
                 "",
                 it["insight_kind"].as_str().unwrap_or_default().to_string(),
                 "insight",
@@ -350,7 +352,7 @@ async fn task_prompt_cands(
             rev: h.rev,
             reference,
             kind: EntryKind::Task.as_str(),
-            title: e.title.clone(),
+            title: hint_title(&e.title),
             certainty: e.certainty.clone(),
             reason: REASON_TASK,
             block,

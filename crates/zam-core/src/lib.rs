@@ -3,6 +3,7 @@
 pub mod fsx;
 pub mod id;
 pub mod link;
+pub mod shell;
 pub mod snapshot;
 pub mod solution;
 pub mod space;

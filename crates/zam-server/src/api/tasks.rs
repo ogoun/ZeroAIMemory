@@ -162,7 +162,7 @@ pub async fn claim(
     .await?;
     let e = get_entry(&sc.db, sc.entry.id).await?;
     Ok(Json(
-        super::insights::entry_json(&sc.db, &e, sc.role).await?,
+        super::insights::entry_json(&p, &sc.db, &e, sc.role).await?,
     ))
 }
 
@@ -199,6 +199,6 @@ pub async fn release(
     }
     let e = get_entry(&sc.db, sc.entry.id).await?;
     Ok(Json(
-        super::insights::entry_json(&sc.db, &e, sc.role).await?,
+        super::insights::entry_json(&p, &sc.db, &e, sc.role).await?,
     ))
 }

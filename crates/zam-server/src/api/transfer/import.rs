@@ -28,6 +28,12 @@
 //! **Коллизии id.** Для всех кандидатов id назначения проверяются базы других пользователей
 //! сервера и точки Qdrant других тенантов ([`zam_index::VectorIndex::foreign_targets`]).
 //!
+//! **Архив, снятый по токену** (опись `secrets_masked: true`, задача 5 M7.1): первым
+//! предупреждением итога — [`super::archive::SECRETS_MASKED_WARNING`] («секреты в архиве
+//! замаскированы и не восстановятся»); метки `‹secret›` записываются как есть. По токену с
+//! `on_conflict=revision` такой архив — 422 [`MASKED_REVISION`] до записи: ревизия поверх живой
+//! заметки затёрла бы значения метками (круг правок 1 задачи 6 M7.1).
+//!
 //! **Аудит** — без текста: `space.import {space, user, owner, own, on_conflict, axioms,
 //! dry_run}` до тела и `space.import.done {space, user, owner, job?, complete, reason?,
 //! created, revised, skipped, conflicts, bytes}` по окончании (`reason`: `client`, `too_large`,
@@ -968,7 +974,7 @@ pub async fn status(
     };
     // место в очереди — пока задание ждёт записи
     let queue = (j.stage == "queued").then(|| st.imports.queue_position(id));
-    Ok(Json(json!({
+    let mut v = json!({
         "job": id,
         "state": state,
         "stage": j.stage,
@@ -980,7 +986,11 @@ pub async fn status(
         },
         "report": j.report,
         "error": j.error,
-    })))
+    });
+    // предупреждения итога называют записи заголовком («запись «…»: …», найденные секреты), текст
+    // ошибки — строку архива: агенту по токену — с маской (задача 5 M7.1, круг правок 1)
+    crate::api::agent_view::view_json(&p, &mut v, &["report.warnings", "error"]);
+    Ok(Json(v))
 }
 
 /// Слот записи (очередь): ждём, пока сервер не остановится.
@@ -996,6 +1006,10 @@ async fn write_slot(st: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, 
         }
     }
 }
+
+/// Отказ импорта по токену архива с маской (`secrets_masked: true`) с `on_conflict=revision`.
+pub const MASKED_REVISION: &str = "архив с маской: секреты в нём заменены ‹secret›, ревизия поверх \
+     заметки затёрла бы значения — используйте on_conflict=skip или копию из WebUI";
 
 /// Задание: очередь, проверка, распаковка, запись (см. модуль); `out` — итог для аудита.
 #[allow(clippy::too_many_arguments)]
@@ -1033,6 +1047,20 @@ async fn run(
     .map_err(|e| ApiError::Internal(format!("проверка архива: {e}")))?
     .map_err(|e| import_err(e, out))?;
     plan.folder_label = folder;
+    // архив снят по токену (задача 5 M7.1, §4.3.1 п. 6): значений секретов в нём нет
+    if plan.secrets_masked {
+        // ревизия поверх живой заметки (`on_conflict=revision`, `zam_store::import` — правка
+        // изменённой заметки) затёрла бы её значения метками; импорт по токену такого архива —
+        // 422 до записи (круг правок 1 задачи 6 M7.1, M8). Сессия WebUI — человек, решает сам
+        if opts.on_conflict == OnConflict::Revision && attrib.token_id.is_some() {
+            return Err(import_err(
+                ImportError::Rejected(MASKED_REVISION.into()),
+                out,
+            ));
+        }
+        plan.warnings
+            .insert(0, super::archive::SECRETS_MASKED_WARNING.to_string());
+    }
     let own = plan.is_own(t.owner, opts.own);
     opts.own = own;
     let mut warnings = Vec::new();

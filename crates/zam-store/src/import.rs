@@ -430,6 +430,9 @@ pub struct Plan {
     /// указывающий на него, переводится на пространство назначения.
     pub source_space: Option<Id>,
     pub archive_fingerprint: String,
+    /// Опись: `secrets_masked: true` — архив снят по токену, значения секретов в текстах заменены
+    /// `‹secret›` (сервер M7.1): предупреждение пишет сервер.
+    pub secrets_masked: bool,
     pub folders: Vec<PlanFolder>,
     pub notes: Vec<PlanNote>,
     pub entries: Vec<PlanEntry>,
@@ -991,6 +994,7 @@ pub fn validate_archive<R: Read + Seek>(
         }
         plan.source_user_id = opt_id(MANIFEST_FILE, m.get("source_user_id"))?;
         plan.source_space = opt_id(MANIFEST_FILE, m.get("space"))?;
+        plan.secrets_masked = m.get("secrets_masked").and_then(Value::as_bool) == Some(true);
         let declared = opt_str(m.get("archive_fingerprint")).unwrap_or_default();
         if declared != computed {
             plan.warnings

@@ -1,5 +1,7 @@
 //! Правка существующей заметки (§11.3 ТЗ): замена текста с проверкой ревизии
-//! (`If-Match`), PATCH секций относительно `base_rev` и откат к старой ревизии.
+//! (`If-Match`), PATCH секций относительно `base_rev` и откат к старой ревизии. PATCH агента по
+//! маске `‹secret›` сервер считает вне транзакции ([`apply_ops`] по маскам, значения — обратно) и
+//! пишет [`patch_note_prepared`] со сверкой текущей ревизии (задача 6 M7.1, круг правок 1).
 //!
 //! Каждая операция — одна транзакция писателя. Новая ревизия только дописывается
 //! (§4.1 п.4); frontmatter, L0, `content_hash`, размер и чанки пересчитываются так же,
@@ -173,21 +175,8 @@ pub async fn patch_note_keyed(
     max_bytes: usize,
     key: Option<String>,
 ) -> Result<(Node, bool), WriteError> {
-    let ops_bytes = match key {
-        Some(_) => serde_json::to_vec(&ops).map_err(|e| StoreError::Corrupt(e.to_string()))?,
-        None => Vec::new(),
-    };
+    let k = patch_key(key, &a, id, base_rev, &ops)?;
     write_note(db, move |tx| {
-        let k = NodeKey::new(
-            key,
-            &a,
-            NodeOp::Patch,
-            &[
-                id.to_string().as_bytes(),
-                &base_rev.to_le_bytes(),
-                &ops_bytes,
-            ],
-        )?;
         if let Some(k) = &k
             && let Some(n) = k.replay(tx)?
         {
@@ -198,6 +187,154 @@ pub async fn patch_note_keyed(
             k.remember(tx, n.id)?;
         }
         Ok((n, true))
+    })
+    .await
+}
+
+/// Ключ повтора PATCH: отпечаток — цель, `base_rev` и операции запроса (у агента по маске — те же
+/// операции, что он прислал, а не итоговый текст).
+fn patch_key(
+    key: Option<String>,
+    a: &Attribution,
+    id: Id,
+    base_rev: i64,
+    ops: &[PatchOp],
+) -> Result<Option<NodeKey>, StoreError> {
+    if key.is_none() {
+        return Ok(None);
+    }
+    let ops_bytes = serde_json::to_vec(ops).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    NodeKey::new(
+        key,
+        a,
+        NodeOp::Patch,
+        &[
+            id.to_string().as_bytes(),
+            &base_rev.to_le_bytes(),
+            &ops_bytes,
+        ],
+    )
+}
+
+/// Повтор PATCH по `Idempotency-Key` без записи (чтение): узел в текущем виде, если ключ уже
+/// использован этим же запросом; `None` — ключа нет или он свободен. Другой запрос с тем же
+/// ключом — `IdempotencyMismatch`. Для PATCH, посчитанного вне транзакции
+/// ([`patch_note_prepared`]): повтор не пересчитывается по новой текущей ревизии.
+pub async fn patch_replayed(
+    db: &Db,
+    id: Id,
+    base_rev: i64,
+    ops: &[PatchOp],
+    a: &Attribution,
+    key: Option<String>,
+) -> Result<Option<Node>, StoreError> {
+    let Some(k) = patch_key(key, a, id, base_rev, ops)? else {
+        return Ok(None);
+    };
+    db.read(move |c| k.replay(c)).await
+}
+
+/// Операции PATCH по тексту `current` ревизии `cur_rev`; `base` — текст `base_rev`, если она
+/// старше текущей: для операции с секцией сравниваются байты секции в обеих (до применения всей
+/// цепочки) — различаются (или секция есть только в одной) → `SectionChanged`. Общий шаг PATCH
+/// хранилища и PATCH агента по виду с метками (сервер переводит адреса и метки к исходнику и
+/// считает его по исходникам обеих ревизий вне транзакции писателя, задача 6 M7.1).
+pub fn apply_ops(
+    base: Option<&str>,
+    current: &str,
+    cur_rev: i64,
+    ops: &[PatchOp],
+) -> Result<String, WriteError> {
+    apply_ops_tracking(base, current, cur_rev, ops, &mut Vec::new())
+}
+
+/// [`apply_ops`], ведущий через операции диапазоны `keep` текста `current` (по возрастанию, без
+/// пересечений): диапазон до изменённого операцией места остаётся, после — сдвигается, задетый —
+/// выпадает (до и после [`zam_markdown::Applied::changed`] — байты прежнего текста). PATCH агента
+/// так проверяет покрытие масок текущей ревизии, перенесённых без правки (M7 §4.3.2 п. 5, круг
+/// правок 5 задачи 6 M7.1).
+pub fn apply_ops_tracking(
+    base: Option<&str>,
+    current: &str,
+    cur_rev: i64,
+    ops: &[PatchOp],
+    keep: &mut Vec<std::ops::Range<usize>>,
+) -> Result<String, WriteError> {
+    let mut text = current.to_string();
+    for op in ops {
+        if let (Some(base), Some(section)) = (base, op_section(op))
+            && section_bytes(base, section) != section_bytes(current, section)
+        {
+            return Err(WriteError::SectionChanged {
+                section: section.to_string(),
+                current_rev: cur_rev,
+            });
+        }
+        let a = apply_patch(&text, op)?;
+        if !keep.is_empty() {
+            let (old_len, new_len) = (text.len(), a.text.len());
+            let start = a.changed.start;
+            // конец заменённого куска в прежнем тексте: хвост после `changed` — прежний
+            let old_end = old_len - (new_len - a.changed.end);
+            let delta = new_len as isize - old_len as isize;
+            keep.retain_mut(|r| {
+                if r.end <= start {
+                    true
+                } else if r.start >= old_end {
+                    *r = (r.start as isize + delta) as usize..(r.end as isize + delta) as usize;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        text = a.text;
+    }
+    Ok(text)
+}
+
+/// PATCH с итоговым текстом `text`, посчитанным вне транзакции по ревизии `cur_rev` (агент по
+/// маске, M7 §4.3.2, круг правок 1 задачи 6 M7.1): в транзакции — повтор по ключу (отпечаток —
+/// операции `ops` запроса), живая заметка, `base_rev` новее текущей → `RevMismatch`, текущая
+/// ревизия не `cur_rev` → `Ok(None)` (текст устарел — посчитать заново), предел `max_bytes`,
+/// запись. Повтор — узел в текущем виде и `false`.
+#[allow(clippy::too_many_arguments)]
+pub async fn patch_note_prepared(
+    db: &Db,
+    id: Id,
+    base_rev: i64,
+    ops: &[PatchOp],
+    cur_rev: i64,
+    text: String,
+    a: Attribution,
+    max_bytes: usize,
+    key: Option<String>,
+) -> Result<Option<(Node, bool)>, WriteError> {
+    let k = patch_key(key, &a, id, base_rev, ops)?;
+    write_note(db, move |tx| {
+        if let Some(k) = &k
+            && let Some(n) = k.replay(tx)?
+        {
+            return Ok(Some((n, false)));
+        }
+        let node = live_note(tx, id)?;
+        if base_rev > node.current_rev {
+            return Err(rev_mismatch(tx, &node)?);
+        }
+        if node.current_rev != cur_rev {
+            return Ok(None);
+        }
+        if text.len() > max_bytes {
+            return Err(WriteError::TooLarge {
+                size: text.len(),
+                max: max_bytes,
+            });
+        }
+        let n = commit_text(tx, node, &text, None, &a)?;
+        if let Some(k) = &k {
+            k.remember(tx, n.id)?;
+        }
+        Ok(Some((n, true)))
     })
     .await
 }
@@ -225,18 +362,7 @@ fn patch_tx(
     } else {
         Some(revision_text(tx, id, base_rev)?)
     };
-    let mut text = current.clone();
-    for op in ops {
-        if let (Some(base), Some(section)) = (&base, op_section(op))
-            && section_bytes(base, section) != section_bytes(&current, section)
-        {
-            return Err(WriteError::SectionChanged {
-                section: section.to_string(),
-                current_rev: cur_rev,
-            });
-        }
-        text = apply_patch(&text, op)?.text;
-    }
+    let text = apply_ops(base.as_deref(), &current, cur_rev, ops)?;
     if text.len() > max_bytes {
         return Err(WriteError::TooLarge {
             size: text.len(),

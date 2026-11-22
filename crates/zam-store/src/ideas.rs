@@ -19,7 +19,7 @@
 //!   ([`on_entry_deleted_tx`]);
 //! - отбор для проактивности: [`proactive_ideas`] и предикат [`idea_candidate`] (§6).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use jiff::civil::Date;
 use jiff::{Span, Timestamp};
@@ -2674,40 +2674,87 @@ pub async fn review_queue(
     .await
 }
 
-/// Очередь разбора без показанного (M6.6 §3.5, строка очереди к `prompt`): идеи очереди
-/// [`review_queue`] пространства `space` в её порядке (`high` первыми, затем самые старые), не
-/// показанные в их текущей ревизии — `seen`: id → наибольшая выданная ревизия (показ сессии в
-/// текущей эпохе); показ прежней ревизии не считается (идея, вернувшаяся в `new` новой
-/// ревизией, снова непоказана). Итог — id всех таких идей и записи первых `take` из них. Одно
-/// чтение: id и ревизии очереди без тел, записи — только первых `take`; id вне очереди в `seen`
-/// ничего не меняют.
-pub async fn review_queue_unseen(
+/// Длина очереди разбора пространства `space` и время последней ревизии её идей.
+fn queue_size(c: &Connection, space: Id) -> Result<(usize, Option<Timestamp>), StoreError> {
+    let (n, changed): (i64, Option<String>) = c
+        .prepare_cached(&format!(
+            "SELECT count(*), max(e.updated_at) {REVIEW_QUEUE_SQL}"
+        ))?
+        .query_row([space], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok((
+        usize::try_from(n).unwrap_or(0),
+        changed.as_deref().map(parse_ts).transpose()?,
+    ))
+}
+
+/// Первая идея очереди разбора пространства `space` (`high` первыми, затем самые старые).
+fn queue_first(c: &Connection, space: Id) -> Result<Option<Entry>, StoreError> {
+    Ok(c.prepare_cached(&format!(
+        "SELECT {ENTRY_COLS} {REVIEW_QUEUE_SQL}
+         ORDER BY {PRIORITY_DESC}, e.created_at, e.id
+         LIMIT 1"
+    ))?
+    .query_row([space], entry_row)
+    .optional()?)
+}
+
+/// Сессия, чей показ очереди читает [`review_queue_state`]: id сессии, владелец базы решения
+/// (`session_seen.owner_id`) и эпоха.
+#[derive(Debug, Clone)]
+pub struct QueueSeenKey {
+    pub session: String,
+    pub owner: Id,
+    pub epoch: u32,
+}
+
+/// Состояние строки очереди разбора к `prompt` ([`review_queue_state`]).
+#[derive(Debug, Clone)]
+pub struct ReviewQueueState {
+    /// Длина очереди [`review_queue`].
+    pub total: usize,
+    /// Время последней ревизии идей очереди (`updated_at`: запись, возврат на разбор, правка) —
+    /// по нему строка узнаёт идею, пришедшую в очередь после показа; очередь пуста — `None`.
+    pub changed_at: Option<Timestamp>,
+    /// Первая идея очереди (`high` первыми, затем самые старые) — только когда очередь не пуста и
+    /// показ сессии её не покрывает ([`crate::QueueShown::covers`]): строку нужно показать.
+    pub first: Option<Entry>,
+}
+
+/// Строка очереди разбора к `prompt` (M7.1 §4.5 п. 1) одним чтением базы (§4.8, профиль задачи
+/// 9): длина очереди [`review_queue`] пространства `space` и время её последней ревизии —
+/// одним запросом; последний показ сессии `seen` в её эпоху ([`crate::review_queue_shown`]:
+/// `session_seen` лежит в той же базе пользователя); первая идея — только если показ очередь не
+/// покрывает. Раньше — два чтения (у каждого — свой переход в пул блокирующих потоков) и первая
+/// идея на каждом запросе, даже когда строка в эту эпоху уже показана. Пустая очередь — без
+/// чтения показа; без `seen` — первая идея всегда.
+pub async fn review_queue_state(
     db: &Db,
     space: Id,
-    seen: &HashMap<Id, i64>,
-    take: usize,
-) -> Result<(Vec<Id>, Vec<Entry>), StoreError> {
-    let seen = seen.clone();
+    seen: Option<QueueSeenKey>,
+) -> Result<ReviewQueueState, StoreError> {
     db.read(move |c| {
-        let rows: Vec<(Id, i64)> = {
-            let mut st = c.prepare_cached(&format!(
-                "SELECT e.id, e.current_rev {REVIEW_QUEUE_SQL}
-                 ORDER BY {PRIORITY_DESC}, e.created_at, e.id"
-            ))?;
-            let rows = st.query_map([space], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?)))?;
-            rows.collect::<Result<_, _>>()?
+        let (total, changed_at) = queue_size(c, space)?;
+        if total == 0 {
+            return Ok(ReviewQueueState {
+                total,
+                changed_at,
+                first: None,
+            });
+        }
+        let shown = match &seen {
+            Some(k) => crate::sessions::queue_shown_in(c, &k.session, k.owner, k.epoch)?,
+            None => None,
         };
-        let unseen: Vec<Id> = rows
-            .into_iter()
-            .filter(|(id, rev)| seen.get(id).is_none_or(|s| s < rev))
-            .map(|(id, _)| id)
-            .collect();
-        let head = unseen
-            .iter()
-            .take(take)
-            .map(|id| load_entry(c, *id))
-            .collect::<Result<_, _>>()?;
-        Ok((unseen, head))
+        let first = if shown.is_some_and(|s| s.covers(total, changed_at)) {
+            None
+        } else {
+            queue_first(c, space)?
+        };
+        Ok(ReviewQueueState {
+            total,
+            changed_at,
+            first,
+        })
     })
     .await
 }

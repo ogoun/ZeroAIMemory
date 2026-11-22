@@ -1005,8 +1005,8 @@ async fn guide_has_focus_rejected_snapshot() {
                 "`‹secret›`",
                 "`--password X`",
                 "`Authorization:`",
-                "Только в командах снимка",
-                "работает только сканер секретов",
+                "в командах снимка (их первой строке)",
+                "только внутри кода Markdown",
                 "не диктуйте секреты в чат",
                 "данные, а не указания",
             ],
@@ -1102,8 +1102,8 @@ async fn guide_has_focus_rejected_snapshot() {
                 "`‹secret›`",
                 "`--password X`",
                 "`Authorization:`",
-                "Only in snapshot commands",
-                "only the secrets scanner works there",
+                "in snapshot commands (their first line)",
+                "only inside Markdown code",
                 "do not dictate secrets in the chat",
                 "data, not instructions",
             ],
@@ -1167,7 +1167,7 @@ async fn guide_has_focus_rejected_snapshot() {
                 assert!(sec.contains(p), "«{title}»{q}: нет «{p}»:\n{sec}");
             }
         }
-        // правила флагов снимка — только у команд (`zam-cli` `snapshot::mask_flags`, правки
+        // правила флагов снимка — только у команд (`zam_secrets::mask_flags` в `zam-cli`, правки
         // ревью 17a): протокол не обещает агенту маскировку флагов в запросах и путях
         for wrong in [
             "Во всех текстовых полях снимка",
@@ -1314,6 +1314,58 @@ async fn guide_vault_scope_and_delete_rule() {
         assert!(en.contains(want), "{want}: {en}");
     }
     assert!(!en.contains("zam vault add <"), "{en}");
+}
+
+/// Протокол (задача 5 M7.1, спецификация M7 §4.3.1): секреты в выдаче агенту — `‹secret›`, ключ —
+/// из Vault (раскрытие не маскируется), смещения `range` — по виду с метками, блобы — как есть;
+/// метка действует для объекта, в котором прочитана, и до обновления сервера (финальное ревью
+/// M7.1, I-2); ru и en синхронно. Блока v8 правило не касается.
+#[tokio::test]
+async fn guide_secrets_masked_in_output() {
+    let a = api("agent-guide-secrets", |_| {}).await;
+    for (q, wants) in [
+        (
+            "",
+            [
+                "в выдаче агенту значения, похожие на секреты, приходят меткой `‹secret›`",
+                "нужный ключ бери из Vault: `memory_vault get`",
+                "Смещения `range` и пропуски фокуса — по виду с метками",
+                "файлы вложений (`GET /blobs/…`) — как есть",
+                // запись обратно (задача 6 M7.1, M7 §4.3.2)
+                "при правке сохраняйте метки `‹secret-…›` как есть — значение сохранится; метка действует для объекта, в котором прочитана",
+                "после обновления сервера метки прежней выдачи не действуют — перечитай",
+                "предупреждение `secret_mark_kept`",
+                "422 `secret_context_changed`",
+            ],
+        ),
+        (
+            "?lang=en",
+            [
+                "in output to the agent values that look like secrets come as `‹secret›`",
+                "take the key you need from Vault: `memory_vault get`",
+                "`range` offsets and focus skips — over the view with marks",
+                "attachment files (`GET /blobs/…`) — as is",
+                "keep `‹secret-…›` marks as is when editing — the value is kept; a mark is valid for the object it was read from",
+                "after a server update the marks of earlier output are no longer valid — read again",
+                "warning `secret_mark_kept`",
+                "422 `secret_context_changed`",
+            ],
+        ),
+    ] {
+        let r = a
+            .tok(
+                &a.token,
+                Method::GET,
+                &format!("/api/v1/agent-guide{q}"),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let g = r.text();
+        for w in wants {
+            assert!(g.contains(w), "{q}: {w}");
+        }
+    }
 }
 
 /// Протокол (M6.6, замечание 34 обкатки): раздел задач (ru, en) — работа по плану из N шагов —
@@ -1525,8 +1577,9 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         // M6.5 §8: разбор идей агентом и пункты плана из идей
         "### Разбор идей",
         "### Идеи на разбор",
-        // M6.6 §3.5: строка очереди разбора к любому запросу человека
-        "строкой «новая идея на разбор «…» w:<id>» к любому запросу человека, и к короткой реплике",
+        // M6.6 §3.5, M7.1 §4.5: одна строка очереди разбора к любому запросу человека
+        "к любому запросу человека, и к короткой реплике («продолжай»): раз в контексте",
+        "когда после показа в очереди появилась идея",
         "event=idea_review",
         "action=review",
         "`outcome`",
@@ -1561,6 +1614,11 @@ async fn guide_has_ideas_section_and_moved_phrases() {
     // строка-указание раздела `### Идеи на разбор` — дословно, как её пишет сервер (M6.5 §7)
     let hint = zam_server::api::recall::IDEAS_REVIEW_HINT.replace("{n}", "N");
     assert!(ideas.contains(&hint), "{hint}: {ideas}");
+    // строка очереди разбора к запросу — дословно, как её пишет сервер (M7.1 §4.5 п. 1)
+    let queue = zam_server::api::recall::REVIEW_QUEUE_LINE
+        .replace("{n}", "N")
+        .replace("{title}", "…");
+    assert!(ideas.contains(&queue), "{queue}: {ideas}");
     assert!(section(&ru, "Запись").contains("(409 — перечитай)"));
     assert!(section(&ru, "Запись").contains("заметке — `l0`"));
     assert!(section(&ru, "Задачи и передача работы").contains("перед работой"));
@@ -1588,7 +1646,8 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         "`w:`",
         "### Idea review",
         "### Идеи на разбор",
-        "as the line “новая идея на разбор «…» w:<id>” (a new idea to review) for any human prompt",
+        "for any human prompt, a short reply (“continue”) included: once per context",
+        "when an idea appeared in the queue after it was shown",
         "event=idea_review",
         "action=review",
         "`outcome`",
@@ -1618,6 +1677,7 @@ async fn guide_has_ideas_section_and_moved_phrases() {
         assert!(ideas.contains(want), "{want}: {ideas}");
     }
     assert!(ideas.contains(&hint), "{hint}: {ideas}");
+    assert!(ideas.contains(&queue), "{queue}: {ideas}");
     assert!(section(&en, "Writing").contains("(409 — reread)"));
     assert!(section(&en, "Writing").contains("give notes an `l0`"));
     assert!(section(&en, "Tasks and handing work over").contains("before work"));

@@ -12,12 +12,14 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_search::recall::{
-    CoverageRule, HINT_PREFIX, StemWord, WordMatch, error_terms, hint_line, prepared_terms,
+    CoverageRule, HINT_PREFIX, StemWord, WordMatch, error_terms, one_line, prepared_terms,
     stem_words,
 };
+use zam_search::truncate_to_tokens;
 use zam_store::{
-    Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, GraphStore, RECALL_PART, SpaceKind,
-    StoreError, TargetFilter, list_entries, search_fts_channels,
+    Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, GraphStore, RECALL_PART,
+    REVIEW_QUEUE_PART, SeenItem, SpaceKind, StoreError, TargetFilter, count_tokens, list_entries,
+    search_fts_channels,
 };
 
 use super::{
@@ -149,8 +151,9 @@ const REVIEW_OMIT_BUDGET: &str = "подними budget_tokens или умень
 /// (фича `test-hooks`, проверка тишины по идеям).
 #[cfg(feature = "test-hooks")]
 pub const TEST_SLOW_IDEA_MARK: &str = "zam-test-slow-idea";
-/// Тестовая метка заголовка идеи очереди: чтение головы очереди разбора к `prompt`
-/// ([`review_queue_head`]) «не укладывается в срок» — шаг обрывает срок (фича `test-hooks`).
+/// Тестовая метка заголовка идеи очереди: чтение очереди разбора к `prompt`
+/// ([`zam_store::review_queue_state`]) «не укладывается в срок» — шаг обрывает срок (фича
+/// `test-hooks`).
 #[cfg(feature = "test-hooks")]
 pub const TEST_SLOW_QUEUE_MARK: &str = "zam-test-slow-queue";
 /// Запросы, по которым шёл второй проход подсказки-идей ([`released_prompt_ideas`]) — только с
@@ -288,23 +291,43 @@ fn idea_review_prompt_line(e: &Entry) -> String {
     )
 }
 
-/// Начало строки очереди разбора к `prompt` после `ZeroAIMemory: ` (M6.6 §3.5).
-const REVIEW_QUEUE_LEAD: &str = "новая идея на разбор ";
+/// Строка очереди разбора к `prompt` после `ZeroAIMemory: ` (M7.1 §4.5 п. 1, решение владельца
+/// `i:01M7Z53BM6EGK9Z9W5G18NYGAM`): одна на очередь вместо строки на идею. `{n}` — число идей в
+/// очереди, `{title}` — заголовок первой (подставляется последним: подстановки в тексте человека
+/// не раскрываются). Строка — по-русски, как все строки `/recall`; перевод — в протоколе
+/// `zam guide` (`guide.en.md`).
+pub const REVIEW_QUEUE_LINE: &str =
+    "идей ждут разбора: {n}, первая «{title}» — список: `zam idea queue`";
+/// Предел строки очереди разбора, токенов (§4.5 п. 1): длинный заголовок первой идеи
+/// укорачивается до него ([`review_queue_summary`]).
+const REVIEW_QUEUE_TOKENS: usize = 60;
 
-/// Строка очереди разбора к `prompt` (M6.6 §3.5) — по образцу подсказки-задачи (M6.6 §3.4):
-/// `ZeroAIMemory: новая идея на разбор «<заголовок до 120>» w:<id>`, при `more` > 0 других
-/// непоказанных идей очереди — ` (ещё <more>)`.
-fn review_queue_line(e: &Entry, more: usize) -> String {
-    let mut s = hint_line(
-        REVIEW_QUEUE_LEAD,
-        &format!("«{}»", idea_title(e)),
-        &[],
-        &entry_ref(e),
-    );
-    if more > 0 {
-        s.push_str(&format!(" (ещё {more})"));
+/// Строка очереди разбора к `prompt` (M7.1 §4.5 п. 1): «ZeroAIMemory: идей ждут разбора: <total>,
+/// первая «<заголовок>» — список: `zam idea queue`» ([`REVIEW_QUEUE_LINE`]) — не длиннее
+/// [`REVIEW_QUEUE_TOKENS`] токенов. Заголовок первой идеи `first` — без секретов, в одну строку,
+/// до 120 символов ([`idea_title`]); не помещается — укорачивается по токенам с «…».
+pub(super) fn review_queue_summary(first: &Entry, total: usize) -> String {
+    let line = |title: &str| {
+        let text = REVIEW_QUEUE_LINE
+            .replace("{n}", &total.to_string())
+            .replace("{title}", title);
+        format!("{HINT_PREFIX} {text}")
+    };
+    let title = one_line(&idea_title(first));
+    let full = line(&title);
+    if count_tokens(&full) <= REVIEW_QUEUE_TOKENS {
+        return full;
     }
-    s
+    // токены не складываются точно: запас заголовка уменьшается, пока строка не уложится
+    let mut room = REVIEW_QUEUE_TOKENS.saturating_sub(count_tokens(&line("…")));
+    loop {
+        let cut = truncate_to_tokens(&title, room, &count_tokens);
+        let s = line(&format!("{cut}…"));
+        if room == 0 || count_tokens(&s) <= REVIEW_QUEUE_TOKENS {
+            return s;
+        }
+        room -= 1;
+    }
 }
 
 /// Строка плана [`PLAN_LINE`]: `n` пунктов плана из идей, следующий — `next`, открытый
@@ -970,134 +993,124 @@ pub(super) async fn prompt_ideas(
     Ok(first)
 }
 
-/// Голова очереди разбора к `prompt` (M6.6 §3.5, замечание 36), прочитанная **до поиска**
-/// ([`review_queue_head`]; ревью задачи 14, M1): строку выбирает [`QueueHead::line`] после
-/// подсказок-идей ответа.
-pub(super) struct QueueHead {
-    /// Цель — база решения (личная цель владельца).
-    target: usize,
-    /// Идеи очереди, не показанные в текущей эпохе сессии в их текущей ревизии, — по порядку
-    /// очереди.
-    unseen: Vec<Id>,
-    /// Записи первых `ideas.prompt_max + 1` из [`QueueHead::unseen`]: подсказки-идеи ответа
-    /// займут не больше `ideas.prompt_max`.
-    head: Vec<Entry>,
-    /// Записи базы цели, показанные сессии в любой эпохе: так подсказки-идеи отбирает
-    /// [`recall`] (показ идей без эпохи, M6 §7.2) — по ним [`QueueHead::line`] узнаёт идеи,
-    /// которые ответ понесёт подсказкой-идеей.
-    ///
-    /// [`recall`]: super::recall
-    seen_any: HashSet<Id>,
-    /// `ideas.prompt_max`.
-    max: usize,
+/// Строка очереди разбора ответа `prompt` (M7.1 §4.5 п. 1) — [`review_queue_line`].
+pub(super) struct QueueLine {
+    /// Подсказка строки ([`review_queue_summary`]): `kind: idea`, `reason: idea_review`, ссылка —
+    /// первая идея очереди.
+    pub(super) cand: Cand,
+    /// Число идей в очереди — в отметку показа ([`queue_mark`]).
+    pub(super) total: usize,
 }
 
-/// Чтение головы очереди разбора к `prompt` (M6.6 §3.5) — до поиска, без эмбеддинга: срок
-/// поиска строку не вытесняет (ревью задачи 14, M1). Условия: режим `review` (решает
-/// вызывающий), вызывающий — владелец базы решения (пространство решения в личной цели;
-/// участнику общего решения — нет), право записи ([`ideas_writable`]: разбор с `ro` дал бы
-/// 403), цель жива, `ideas.prompt_max > 0` (подсказок-идей к `prompt` нет — нет и строки
-/// **[решение исполнителя, задача 14]**). Иначе — `None`.
+impl QueueLine {
+    /// Подсказка `c` ответа — эта строка (тот же объект, а не та же ссылка: первая идея строки
+    /// бывает и подсказкой-идеей).
+    pub(super) fn is(&self, c: &Cand) -> bool {
+        std::ptr::eq(c, &self.cand)
+    }
+}
+
+/// Строка очереди разбора к `prompt` (M7.1 §4.5 п. 1, решение владельца
+/// `i:01M7Z53BM6EGK9Z9W5G18NYGAM`) — одна на очередь ([`review_queue_summary`]), читается **до
+/// поиска** и без эмбеддинга: срок поиска её не вытесняет (ревью задачи 14 M6.6, M1). Условия
+/// (M6.6 §3.5): режим `review` (решает вызывающий), вызывающий — владелец базы решения
+/// (пространство решения в личной цели; участнику общего решения — нет), право записи
+/// ([`ideas_writable`]: разбор с `ro` дал бы 403), цель жива, `ideas.prompt_max > 0`
+/// (подсказок-идей к `prompt` нет — нет и строки), очередь не пуста. Иначе — `None`.
 ///
-/// Показанной идея считается в **текущей эпохе сессии в её текущей ревизии**
-/// ([`zam_store::seen_entry_revs`], [`RECALL_PART`]; решение координатора, ревью задачи 14):
-/// показ дайджестом той же эпохи считается; после сжатия контекста (новая эпоха) голова очереди
-/// приходит снова — пакет восстановления раздела идей не несёт, повторный старт раздел идей не
-/// повторяет ([`idea_shown_in_session`]); идея, вернувшаяся в `new` новой ревизией, приходит
-/// снова и в той же эпохе. Без сессии — без фильтра показанного, как у прочих подсказок.
+/// Показ — **раз за эпоху сессии** ([`zam_store::review_queue_shown`]: отметка части
+/// [`zam_store::REVIEW_QUEUE_PART`] с числом идей очереди, её ставит учёт ответа, когда строка или
+/// раздел очереди дайджеста вошли в текст, [`queue_mark`]); после сжатия контекста (новая эпоха)
+/// — снова. В той же эпохе — ещё раз, когда после показа в очереди появилась идея **[решение
+/// координатора: новая идея не должна ждать сжатия]**: очередь длиннее показанной или у идеи
+/// очереди ревизия новее показа (записана, вернулась на разбор, правлена) — по ревизии узнаётся
+/// и новая идея, пришедшая, пока агент разбирал очередь (длина тогда не растёт). Без сессии —
+/// без учёта показа, как у прочих подсказок.
+///
+/// Чтение — одно ([`zam_store::review_queue_state`], M7.1 §4.8): длина очереди, показ сессии и
+/// первая идея — только когда строку надо показать. База сессии здесь — та же база пользователя,
+/// что и база решения (строка — только владельцу); иначе показ читается отдельно.
 ///
 /// Срок — своя копия общего срока `prompt`, не дальше половины его остатка (чтение идёт до
 /// поиска): не уложилось чтение (или сбой — WARN) — тишина без предупреждений, `recall timeout`
 /// строка не ставит.
-pub(super) async fn review_queue_head(
+pub(super) async fn review_queue_line(
     st: &AppState,
     p: &Principal,
     session: Option<&RequestSession>,
     health: &Health<'_>,
     deadline: &Deadline,
-) -> Option<QueueHead> {
-    let max = st.cfg.ideas.prompt_max as usize;
+) -> Option<QueueLine> {
     let targets = health.targets();
     let (i, space) = solution_space(targets)?;
     let t = &targets[i];
-    if max == 0 || t.solution.is_some() || !health.alive[i] || !ideas_writable(p, t) {
+    if st.cfg.ideas.prompt_max == 0
+        || t.solution.is_some()
+        || !health.alive[i]
+        || !ideas_writable(p, t)
+    {
         return None;
     }
     // чтение — до поиска: не дольше половины остатка срока, чтобы зависшее чтение не оставило
-    // поиск подсказок без срока **[решение исполнителя, задача 14, круг правок 1]**
+    // поиск подсказок без срока **[решение исполнителя, задача 14 M6.6, круг правок 1]**
     let now = Instant::now();
     let mut own = Deadline {
         at: now + deadline.at.saturating_duration_since(now) / 2,
         expired: deadline.expired,
     };
     let read = async {
-        let (any, epoch) = match session {
-            Some(s) => {
-                let (id, owner) = (&s.touch.id, t.owner);
-                let any = zam_store::seen_entry_ids(&s.db, id, owner, RECALL_PART).await?;
-                let epoch = s.touch.epoch;
-                let revs = zam_store::seen_entry_revs(&s.db, id, owner, RECALL_PART, epoch).await?;
-                (any, revs)
+        // показ сессии — тем же чтением, если её база — база решения
+        let same = session.filter(|s| s.db.path() == t.db.path());
+        let seen = same.map(|s| zam_store::QueueSeenKey {
+            session: s.touch.id.clone(),
+            owner: t.owner,
+            epoch: s.touch.epoch,
+        });
+        let mut q = zam_store::review_queue_state(&t.db, space, seen).await?;
+        if let (Some(s), None, 1..) = (session, same, q.total) {
+            let shown =
+                zam_store::review_queue_shown(&s.db, &s.touch.id, t.owner, s.touch.epoch).await?;
+            if shown.is_some_and(|sh| sh.covers(q.total, q.changed_at)) {
+                q.first = None;
             }
-            None => (Vec::new(), std::collections::HashMap::new()),
-        };
-        let (unseen, head) = zam_store::review_queue_unseen(&t.db, space, &epoch, max + 1).await?;
+        }
         // тестовое «медленное чтение» (фича test-hooks): шаг не уложился в срок — его обрывает
         // `own.step`, как настоящее медленное чтение
         #[cfg(feature = "test-hooks")]
-        if head.iter().any(|e| e.title.contains(TEST_SLOW_QUEUE_MARK)) {
+        if q.first
+            .as_ref()
+            .is_some_and(|e| e.title.contains(TEST_SLOW_QUEUE_MARK))
+        {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
-        Ok::<_, StoreError>((any, unseen, head))
+        Ok::<_, StoreError>(q)
     };
-    let (any, unseen, head) = match own.step(read).await? {
+    let q = match own.step(read).await? {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "recall: очередь разбора не прочитана");
             return None;
         }
     };
-    Some(QueueHead {
-        target: i,
-        unseen,
-        head,
-        seen_any: any.into_iter().collect(),
-        max,
+    // пустая очередь или показ этой эпохи её покрывает — строки нет
+    let first = q.first?;
+    let block = review_queue_summary(&first, q.total);
+    Some(QueueLine {
+        cand: idea_cand(i, &first, REASON_IDEA_REVIEW, block),
+        total: q.total,
     })
 }
 
-impl QueueHead {
-    /// Строка очереди разбора ответа (M6.6 §3.5): первая непоказанная идея головы, которой нет в
-    /// подсказках-идеях этого ответа (`ideas` — [`prompt_ideas`]: первые `ideas.prompt_max`
-    /// непоказанных, как их отбирает [`recall`]), — одной строкой [`review_queue_line`] с числом
-    /// остальных таких идей; `reason: idea_review`, показ — в `session_seen` общим учётом ответа.
-    /// Строка не зависит от близости к запросу.
-    ///
-    /// [`recall`]: super::recall
-    pub(super) fn line(&self, ideas: &[Cand]) -> Vec<Cand> {
-        // Knowledge — пространство той же личной цели: `ahead` совпадает с отбором
-        // подсказок-идей `recall`; других целей у владельца в области `prompt` нет
-        let ahead: HashSet<Id> = ideas
-            .iter()
-            .filter(|c| c.target == self.target && !self.seen_any.contains(&c.tref.id))
-            .take(self.max)
-            .map(|c| c.tref.id)
-            .collect();
-        let rest: Vec<Id> = self
-            .unseen
-            .iter()
-            .copied()
-            .filter(|id| !ahead.contains(id))
-            .collect();
-        // `ahead` — не больше `max`, голова — `max + 1`: первая из `rest` в голове есть
-        let Some(e) = rest
-            .first()
-            .and_then(|id| self.head.iter().find(|e| e.id == *id))
-        else {
-            return Vec::new();
-        };
-        let block = review_queue_line(e, rest.len() - 1);
-        vec![idea_cand(self.target, e, REASON_IDEA_REVIEW, block)]
+/// Отметка показа очереди разбора в `session_seen` (M7.1 §4.5 п. 1, [`review_queue_line`]): цель
+/// — первая показанная идея очереди `first`, часть [`zam_store::REVIEW_QUEUE_PART`], ревизия —
+/// число идей в очереди `total` при показе. Ставит её учёт ответа — только когда строка очереди
+/// `prompt` или раздел `### Идеи на разбор` дайджеста вошли в текст.
+pub(super) fn queue_mark(targets: &[SearchTarget], first: &Cand, total: usize) -> SeenItem {
+    let mut key = seen_key(targets, first);
+    key.part = REVIEW_QUEUE_PART.to_string();
+    SeenItem {
+        key,
+        rev: i64::try_from(total).unwrap_or(i64::MAX),
     }
 }
 
@@ -1168,11 +1181,13 @@ fn idea_lexically_matched(item: &Value, e: &Entry, q: &IdeaQuery) -> bool {
 /// недостижимым (половина от 6 — 3 слова, не больше порога покрытия запроса 4).
 const IDEA_WORDS_CAP: usize = 6;
 /// Порог покрытия слов запроса у подсказок-идей — свой и фиксированный (M5.7: ⌈n/3⌉ от 2 до 4,
-/// основы): ключ `recall.post_tool_coverage` (M6 §9) на него не влияет.
+/// основы): ключ `recall.post_tool_coverage` (M6 §9) на него не влияет; частые слова ошибки
+/// (`common_pct`, M7.1 §4.6 п. 3) идеи не снимают.
 const IDEA_QUERY_RULE: CoverageRule = CoverageRule {
     divisor: 3,
     cap: 4,
     word_match: WordMatch::Stems,
+    common_pct: 100,
 };
 
 /// Стоп-основы общих глаголов и слов работы с кодом — **только для слов запроса подсказок-идей**

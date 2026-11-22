@@ -99,11 +99,11 @@ pub use entries::{
     Trigger, TriggerKind, TriggerRow, active_triggers, allowed_statuses, changelog_between,
     count_by_status, create_entry, create_report, delete_entry, enqueue_entry_upserts,
     entry_attachment, entry_attachments, entry_by_idempotency_key, entry_chunks_for_index,
-    entry_revisions, entry_triggers, find_release_by_version, finish_entries_reindexed,
-    first_images, get_entry, has_certainty, initial_status, is_entry_ref_letter, list_entries,
-    live_entries_by_ids, normalize_area, normalize_title, reindex_entries_page,
-    report_blob_meta_by_sha, restore_entry, retract_entry, set_triggers, supersede_entry,
-    title_duplicates, update_entry, validate_trigger,
+    entry_revisions, entry_revisions_at, entry_triggers, find_release_by_version,
+    finish_entries_reindexed, first_images, get_entry, has_certainty, initial_status,
+    is_entry_ref_letter, list_entries, live_entries_by_ids, normalize_area, normalize_title,
+    reindex_entries_page, report_blob_meta_by_sha, restore_entry, retract_entry, set_triggers,
+    supersede_entry, title_duplicates, update_entry, validate_trigger,
 };
 pub use export::{
     EntryDump, ExportSelect, NodeRevision, NoteAttachment, RefRow, SpaceReader, export_space,
@@ -127,12 +127,13 @@ pub use ideas::{
     Decided, DecidedAs, DecidedVia, Decision, IDEA_DEFER_DAYS_DEFAULT, IDEA_LINK_MAX_CHARS,
     IDEA_LINKS_MAX, IDEA_OPTIONS, IDEA_ORIGIN_REQUIRED, IDEA_REOPEN_OPTIONS, IdeaData,
     IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, IdeaSpaces, NewDecision, NewReview,
-    PROPOSE_TEXT_MAX_CHARS, ProposalKind, REVIEW_MIN_CHARS_DEFAULT, REVIEW_MISSING_MAX_CHARS,
-    REVIEW_REFS_MAX, REVIEW_SUMMARY_MAX_CHARS, REVIEWS_MAX, Review, ReviewOutcome, ReviewTask,
-    Reviewed, TaskIdea, TaskState, adopt_idea, any_idea, any_new_idea, check_idea,
-    check_idea_shape, check_idea_transition, decide_idea, idea_candidate, idea_task_state,
-    ideas_of_tasks, planned_from_ideas, proactive_ideas, proposal_ideas, propose_idea,
-    released_ideas, review_idea, review_queue, review_queue_unseen, task_released,
+    PROPOSE_TEXT_MAX_CHARS, ProposalKind, QueueSeenKey, REVIEW_MIN_CHARS_DEFAULT,
+    REVIEW_MISSING_MAX_CHARS, REVIEW_REFS_MAX, REVIEW_SUMMARY_MAX_CHARS, REVIEWS_MAX, Review,
+    ReviewOutcome, ReviewQueueState, ReviewTask, Reviewed, TaskIdea, TaskState, adopt_idea,
+    any_idea, any_new_idea, check_idea, check_idea_shape, check_idea_transition, decide_idea,
+    idea_candidate, idea_task_state, ideas_of_tasks, planned_from_ideas, proactive_ideas,
+    proposal_ideas, propose_idea, released_ideas, review_idea, review_queue, review_queue_state,
+    task_released,
 };
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,
@@ -153,6 +154,7 @@ pub use nodes::{
     set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter, token_counter_exact,
     unified_diff, update_note, update_note_keyed,
 };
+pub use nodes::{apply_ops, apply_ops_tracking, patch_note_prepared, patch_replayed};
 pub use paths::{NodePath, path_ancestors};
 pub use questions::{
     ANSWER_TEXT_MAX_CHARS, Answer, AnswerBy, Answered, Channel, NewAnswer, OPTION_KEY_MAX_CHARS,
@@ -162,18 +164,18 @@ pub use questions::{
 };
 pub use search::{
     AliasGroup, AttachmentHit, ChunkScope, EntryHit, FocusLeaf, FolderRow, FtsChannels, FtsHit,
-    FtsQuery, LeafChunk, LeafHit, LightSearch, MARK_END, MARK_START, TargetFilter, first_leaves,
-    focus_leaves, leaf_term_hits, leaves_of_targets, live_chunks, live_folders, neighbor_leaves,
-    node_leaves, pending_count, query_needles, query_terms, sanitize_fts, search_fts,
-    search_fts_channels, search_fts_channels_light, text_snippet,
+    FtsQuery, LeafChunk, LeafHit, LightSearch, MARK_END, MARK_START, TargetFilter, TermDocs,
+    first_leaves, focus_leaves, insight_term_docs, leaf_term_hits, leaves_of_targets, live_chunks,
+    live_folders, neighbor_leaves, node_leaves, pending_count, query_needles, query_terms,
+    sanitize_fts, search_fts, search_fts_channels, search_fts_channels_light, text_snippet,
 };
 pub use sessions::{
-    RECALL_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey, SeenTarget, Session, SessionTouch,
-    TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET, add_memory_write, add_token_counts,
-    add_tokens, bump_epoch, check_session_id, end_session, gc_sessions, get_session,
-    latest_session, list_sessions, mark_seen, mark_seen_with_tokens, register_session,
-    seen_entry_ids, seen_entry_revs, seen_revs, seen_revs_any_epoch, session_epoch,
-    session_holdout, session_tokens, sessions_tokens, set_holdout, touch_session,
+    QueueShown, RECALL_PART, REVIEW_QUEUE_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey,
+    SeenTarget, Session, SessionTouch, TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat, WHOLE_TARGET,
+    add_memory_write, add_token_counts, add_tokens, bump_epoch, check_session_id, end_session,
+    gc_sessions, get_session, latest_session, list_sessions, mark_seen, mark_seen_with_tokens,
+    register_session, review_queue_shown, seen_entry_ids, seen_revs, seen_revs_any_epoch,
+    session_epoch, session_holdout, session_tokens, sessions_tokens, set_holdout, touch_session,
 };
 pub use snapshots::{
     SnapTask, SnapshotRow, digest_snapshot, gc_snapshots, get_snapshot, put_snapshot,

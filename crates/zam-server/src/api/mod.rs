@@ -1,6 +1,7 @@
 //! Маршруты HTTP API.
 pub mod admin;
 pub mod agent_setup;
+pub mod agent_view;
 pub mod big_body;
 pub mod blobs;
 pub mod cache;
@@ -27,6 +28,7 @@ pub mod render;
 pub mod reports;
 pub mod scope;
 pub mod search;
+pub mod secret_restore;
 pub mod secrets;
 pub mod sessions;
 pub mod snapshot;

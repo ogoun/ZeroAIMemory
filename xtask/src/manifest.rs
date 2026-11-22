@@ -49,6 +49,9 @@ rename = { "qdrant" = "qdrant-bin" }
     #[test]
     fn real_manifests_are_valid() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy");
+        // оба манифеста ORT — в списке: иначе проверки NuGet ниже молча пропустились бы
+        // (финальное ревью M7.1, отложенный Minor задачи 1)
+        assert!(MANIFESTS.contains(&"onnxruntime"));
         assert!(MANIFESTS.contains(&"onnxruntime-gpu"));
         for name in MANIFESTS {
             let m = Manifest::load(&dir.join(format!("{name}.toml"))).unwrap();
@@ -56,6 +59,20 @@ rename = { "qdrant" = "qdrant-bin" }
             m.validate(false).unwrap();
             for p in PLATFORMS {
                 assert!(m.platform.contains_key(p), "{name}: нет платформы {p}");
+            }
+            // M7.1 (§4.1 п. 1): ONNX Runtime — пакеты NuGet с закреплённым размером, без rename
+            if !matches!(name, "onnxruntime" | "onnxruntime-gpu") {
+                continue;
+            }
+            for (p, e) in &m.platform {
+                assert!(
+                    e.url.starts_with("https://api.nuget.org/v3-flatcontainer/")
+                        && e.url.ends_with(".nupkg"),
+                    "{name} [{p}]: {}",
+                    e.url
+                );
+                assert!(e.size.is_some_and(|s| s > 0), "{name} [{p}]: нет size");
+                assert!(e.rename.is_empty(), "{name} [{p}]: rename");
             }
         }
     }

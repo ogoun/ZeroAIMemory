@@ -1933,3 +1933,33 @@ async fn refs_recv_count_accepted_validated() {
         "вызовы по получателю весят меньше прямых: {go} / {stop}: {m}"
     );
 }
+
+/// Заголовки знаний в карточке символа и во влиянии правки агенту по токену — с маской
+/// секретов (задача 5 M7.1, круг правок 1); сессии WebUI — исходник.
+#[tokio::test]
+async fn knowledge_titles_masked_for_token() {
+    let a = world("knowledge-mask", |_| {}).await;
+    put(&a, vec![file("a.rs", 1, vec![func("foo", 1)], &[])]).await;
+    // фиктивный ключ собирается из частей: в исходнике его нет целиком (push protection)
+    let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    insight_on(&a, &format!("Ключ {key} в a.rs"), "a.rs").await;
+    let id = symbol_id(&a, "foo").await;
+    let card = format!("/api/v1/code/symbols/{id}?solution={G}");
+    let r = get(&a, &card).await;
+    ok(&r, StatusCode::OK, "карточка");
+    assert!(
+        !r.text().contains(&key) && r.text().contains("‹secret›"),
+        "{}",
+        r.text()
+    );
+    let r = impact(&a, json!([{"path": "a.rs"}])).await;
+    ok(&r, StatusCode::OK, "влияние");
+    assert!(
+        !r.text().contains(&key) && r.text().contains("‹secret›"),
+        "{}",
+        r.text()
+    );
+    let r = a.adm(Method::GET, &card, None, None).await;
+    ok(&r, StatusCode::OK, "карточка человеку");
+    assert!(r.text().contains(&key), "{}", r.text());
+}

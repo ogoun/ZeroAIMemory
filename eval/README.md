@@ -26,7 +26,7 @@
 | `grid-m6-recall.toml` | M6 §3.5 п. 3–5 (задача 8c): `recall.digest_tokens` × `digest_entries`, `recovery_tokens`, `brief_tokens` × `code.brief_tokens` на dev ТС-2 (`eval --sessions --grid`), первая точка — умолчания |
 | `grid-m6-search.toml` | M6 §3.5 п. 1 (задача 5): `search.budget_tokens` {400, 600, 800} × `search.brief_min_rel` {0; 0,4; 0,5} на dev ТС-1, первая точка дважды — A/A-гейт |
 | `grid-m6-budget-b4.toml` | M6, задача 13b (решение владельца 2026-11-15): `search.budget_tokens` {800, 900, 1000, 1100, 1200} на dev ТС-1 к B4, вариант Б (`--targets-of 0.0.5-m4`), K = 3 — три прогона сетки против трёх прогонов B4 (`--arm` ×3 `--compare` ×3); выбор — наименьшее значение с критерием п. 1 на dev (итог — `results/2026-11-15-m6-budget-dev-b4.md`) |
-| `hints.toml` | M4: точность подсказок хуков — 72 случая (`prompt` 30, `post_tool` 24, `pre_tool` 18; половина «нерелевантно»), 17 insight с триггерами и без и 3 заметки Rules; M6 §9 — 180 случаев (`prompt` 50, `post_tool` 112), 26 insight; M6.6 §3 — ещё 3 случая тишины `prompt` (`source = "m66"`: реплики «согласен», «продолжай», пересланный отчёт субагента) — 183 |
+| `hints.toml` | M4: точность подсказок хуков — 72 случая (`prompt` 30, `post_tool` 24, `pre_tool` 18; половина «нерелевантно»), 17 insight с триггерами и без и 3 заметки Rules; M6 §9 — 180 случаев (`prompt` 50, `post_tool` 112), 26 insight; M6.6 §3 — ещё 3 случая тишины `prompt` (`source = "m66"`: реплики «согласен», «продолжай», пересланный отчёт субагента) — 183; M7.1 §4.5 — ещё 6 случаев тишины `prompt` (`source = "m71"`: формы реплик «ладно», «сделай», «продолжаем», «продолжим», «хорош», «приступай», по одной-две и по три в запросе) — 189 |
 | `scenarios.toml` | M4: 20 сценариев расхода токенов «вопрос агента → источники» (протокол §9.3, повтор через кэш, наивный `mode=chunks`); M6 — ТС-1 с видами и нагетами (`kind`, `nuggets`, разметка — задача 1b) |
 | `nuggets.lock` | M6: замороженные `nuggets_fingerprint` и `corpus_fingerprint` ТС-1 (создаёт задача 1b) |
 | `area-queries.toml` | M6, задача 11: 36 запросов набора областей (§11) — `same`/`other`/`none` по 12, в каждом виде по 4 на `backend`/`frontend`/`infra`; у всех `area` (заголовок `X-Zam-Area`) и `area_kind`; составил независимый агент без доступа к коду поиска и сеткам, разметка без правок (метки формулировки `kind` — журнал задачи 11); как составлен — `area-queries.README.md` |
@@ -389,8 +389,10 @@ Toolkit (`--keep-cuda-path` — оставить): библиотеки NVIDIA �
 `eval/hints.toml` (ТЗ §10.3, §18.2; задача 15 M4): `[[insight]]` — записи с триггерами
 (`file_glob`, `command_regex`, `error_regex`) и без них (подсказку `post_tool` даёт FTS) в формате
 `insights.toml`; `[[rule]]` — заметки Rules (`key`, `path`, `text`); `[[case]]` — случай
-`{id, event: prompt | post_tool | pre_tool, input, tool?, expected, note}`. `input` — текст
-запроса, текст ошибки или путь файла (`Write`/`Edit`) и команда (`Bash`) у `pre_tool`;
+`{id, event: prompt | post_tool | pre_tool, input, tool?, command?, expected, note}`. `input` —
+текст запроса, текст ошибки или путь файла (`Write`/`Edit`) и команда (`Bash`) у `pre_tool`;
+`command` (M7.1 §4.6, только `post_tool`) — команда Bash, на которой случилась ошибка: такой
+случай идёт через хук `zam hook post-tool` (`PostToolUseFailure`, своя сессия), как у агента;
 `expected` — подсказки, которые должны быть показаны (`insight:<key>` — запись `insights.toml`
 или этого файла, `rule:<key>`), пусто — ожидается тишина. Релевантны обе записи пары «надёжное —
 гипотеза» одной темы: подсказка показывает `certainty`. Записи набора в прогоны поиска не
@@ -403,7 +405,9 @@ Toolkit (`--keep-cuda-path` — оставить): библиотеки NVIDIA �
 Классы ошибок M6 — сборка, тесты, git, кодировки, сеть (`h18`–`h26`, `e-25`–`e-52`).
 
 Прогон `cargo xtask eval --hints` поднимает сервер с корпусом, `insights.toml` и записями
-набора; `prompt` и `post_tool` — `POST /recall` без сессии (`tool: "Bash"` у `post_tool`),
+набора; `prompt` и `post_tool` — `POST /recall` без сессии (`tool: "Bash"` у `post_tool`; у
+случая с `command` — поле `path_words` из `zam_core::shell::path_words`, а в `--hints` такой случай
+идёт через хук `zam hook post-tool` и в модель калибровки не входит),
 `pre_tool` — процесс `zam hook pre-tool` (только локально, кэш триггеров — от `zam hook
 session-start`) в каталоге проекта `target/eval/<прогон>/project` с
 `.zeroaimemory/solution.toml` решения набора (адрес и токен — `ZAM_URL`, `ZAM_TOKEN`, свой
@@ -445,11 +449,13 @@ session-start`) в каталоге проекта `target/eval/<прогон>/p
 --mode fts` — `recall.post_tool_coverage` (делитель {3, 2} × `cap` {3, 4, 6} × `word_match`
 {`plain`, `stems`}) на случаях `post_tool`, отчёт по корзинам длины; `--grid
 eval/grid-m6-hints-fts.toml --mode fts` — `recall.prompt_min_score_fts` {0,2…0,6} на случаях
-`prompt` (сервер без модели: поиск деградирует до FTS). Файл сетки — `rule` и точки `[[point]]
+`prompt` (сервер без модели: поиск деградирует до FTS); `--grid eval/grid-m71-hints-common.toml
+--mode fts` — порог частого слова `recall.post_tool_coverage.common_pct` (M7.1 §4.6 п. 3, правило
+и порог — журнал этапа M7, задача 8). Файл сетки — `rule` и точки `[[point]]
 name, env = { ZAM_… }`; корпус загружается один раз, каждая точка — копия каталога и сервер с
 переменными точки, первая точка — дважды (A/A: FTS побайтово), срок сбора `recall.timeout_ms` —
 60 с (ответ с `recall timeout` — ошибка прогона). Решение — по случаям `source` `m4`,
-`independent`, `independent_b` (у случаев автора сетки `task9` и случаев тишины M6.6 `m66` — справочно), отчёт — по частям. Интервалы — парный бутстреп
+`independent`, `independent_b` (у случаев автора сетки `task9` и случаев тишины M6.6 `m66` и M7.1 `m71` — справочно), отчёт — по частям. Интервалы — парный бутстреп
 случаев, 10 000 выборок, односторонние 95 % границы. Правила выбора — в начале
 `xtask/src/eval/hints/grid.rs`. Итог — `results/<дата>-fts-hints-<сетка>.{json,md}`. Подсказки
 `post_tool` идут без векторного канала (`error_regex` и FTS), поэтому их сетка снимается на FTS.

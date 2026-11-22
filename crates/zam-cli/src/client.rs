@@ -25,10 +25,14 @@ pub struct CliError {
     pub code: u8,
     pub msg: String,
     pub problem: Option<Value>,
-    /// Сетевая ошибка — истёк срок запроса, ответа сервера нет ([`CliError::is_timeout`]).
-    /// Поле закрыто: признак ставит только [`net_error`], прочие ошибки строятся через
-    /// [`CliError::new`] и [`CliError::with_problem`] — без него.
+    /// Сетевая ошибка — истёк срок запроса: ответа сервера нет или его тело не дочитано за срок
+    /// ([`CliError::is_timeout`]). Поле закрыто: признак ставят только [`net_error`] и
+    /// [`body_error`], прочие ошибки строятся через [`CliError::new`] и
+    /// [`CliError::with_problem`] — без него.
     timeout: bool,
+    /// Транспорт: ответа сервера нет или тело не дочитано — соединение, обрыв, срок
+    /// ([`CliError::is_network`]). Ставят только [`net_error`] и [`body_error`].
+    network: bool,
     /// Запрос не начат: абсолютный срок клиента вышел до отправки ([`CliError::is_unsent`]).
     unsent: bool,
 }
@@ -45,6 +49,7 @@ impl CliError {
             msg: msg.into(),
             problem,
             timeout: false,
+            network: false,
             unsent: false,
         }
     }
@@ -75,10 +80,18 @@ impl CliError {
             .and_then(|s| u16::try_from(s).ok())
     }
 
-    /// Запрос оборван сроком клиента (разрешение имени, соединение, ожидание ответа): сервер не
-    /// ответил вовремя. Отказ соединения, обрыв и ответ сервера с ошибкой — не срок.
+    /// Запрос оборван сроком клиента (разрешение имени, соединение, ожидание ответа, чтение тела
+    /// ответа): сервер не ответил или не дослал ответ вовремя. Отказ соединения, обрыв и ответ
+    /// сервера с ошибкой — не срок.
     pub fn is_timeout(&self) -> bool {
         self.timeout
+    }
+
+    /// Сбой транспорта: ответа сервера нет (отказ и обрыв соединения, срок) или тело ответа не
+    /// дочитано. Ответ сервера с ошибкой, неверный JSON и запрос, не начатый за сроком
+    /// ([`CliError::is_unsent`]), — не транспорт.
+    pub fn is_network(&self) -> bool {
+        self.network
     }
 
     /// Запрос не начат — абсолютный срок клиента вышел до отправки ([`Timeouts::Deadline`]):
@@ -660,7 +673,19 @@ fn net_error(base: &str, e: ureq::Error) -> CliError {
         msg: format!("сервер {base} недоступен: {e}"),
         problem: None,
         timeout: timed_out(&e),
+        network: true,
         unsent: false,
+    }
+}
+
+/// Тело ответа не дочитано: ввод-вывод сокета и срок — транспорт ([`CliError::is_network`],
+/// срок — [`CliError::is_timeout`]); предел размера и неверный UTF-8 — нет.
+fn body_error(e: ureq::Error) -> CliError {
+    let timeout = timed_out(&e);
+    CliError {
+        network: timeout || matches!(e, ureq::Error::Io(_)),
+        timeout,
+        ..CliError::new(EXIT_UNREACHABLE, format!("чтение ответа: {e}"))
     }
 }
 
@@ -695,7 +720,7 @@ fn read_text_mut(resp: &mut Response<Body>) -> Result<String, CliError> {
         .with_config()
         .limit(BODY_MAX)
         .read_to_string()
-        .map_err(|e| CliError::new(EXIT_UNREACHABLE, format!("чтение ответа: {e}")))
+        .map_err(body_error)
 }
 
 /// Тело ответа потоком (без предела: заметка до 5 МБ, сервер свой).
@@ -771,6 +796,24 @@ mod tests {
         assert!(!net_error("http://x", io(ErrorKind::ConnectionReset)).is_timeout());
         assert!(!CliError::new(EXIT_UNREACHABLE, "timeout: global").is_timeout());
         assert!(!CliError::with_problem(EXIT_CONFLICT, "x", None).is_timeout());
+    }
+
+    /// M7.1, задача 7: признак транспорта — у отказа и обрыва соединения, срока и недочитанного
+    /// тела; не у ответа сервера с ошибкой, неверного JSON и запроса, не начатого за сроком.
+    #[test]
+    fn network_flag_marks_transport_only() {
+        use std::io::{Error, ErrorKind};
+        let io = |k: ErrorKind| ureq::Error::Io(Error::from(k));
+        assert!(net_error("http://x", io(ErrorKind::ConnectionRefused)).is_network());
+        assert!(net_error("http://x", io(ErrorKind::TimedOut)).is_network());
+        let cut = body_error(io(ErrorKind::ConnectionReset));
+        assert!(cut.is_network() && !cut.is_timeout(), "{cut}");
+        let slow = body_error(io(ErrorKind::TimedOut));
+        assert!(slow.is_network() && slow.is_timeout(), "{slow}");
+        let status = Some(serde_json::json!({"status": 500}));
+        assert!(!CliError::with_problem(EXIT_UNREACHABLE, "x (HTTP 500)", status).is_network());
+        assert!(!CliError::new(EXIT_UNREACHABLE, "ответ сервера не JSON").is_network());
+        assert!(!CliError::unsent().is_network());
     }
 
     /// Задача 17b-http: срок клиента хуков — абсолютный, один на все запросы. Сервер принял

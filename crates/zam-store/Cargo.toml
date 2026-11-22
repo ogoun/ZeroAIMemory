@@ -41,8 +41,10 @@ zip.workspace = true
 
 [features]
 # Точка остановки фоновой перенарезки при открытии базы — только для тестов (включает
-# dev-зависимость zam-server); в сборке сервера и релизе её нет.
-test-hooks = []
+# dev-зависимость zam-server); в сборке сервера и релизе её нет. `rusqlite/trace` — учёт текстов
+# SQL по соединениям (размер кэша подготовленных запросов, M7.1 задача 9; модуль rusqlite в
+# крейте уже есть, новых зависимостей нет).
+test-hooks = ["rusqlite/trace"]
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

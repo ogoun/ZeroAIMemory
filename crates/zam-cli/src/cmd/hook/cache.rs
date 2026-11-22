@@ -85,9 +85,11 @@ impl Trigger {
     }
 
     /// Строка подсказки §10.3, M6 §4.3 (как у сервера, `zam_search::hint_line`):
-    /// `ZeroAIMemory: <lead><title> [<вид>·<cert>] i:<id>`, надёжность — `ax`, `th`, `hyp`.
+    /// `ZeroAIMemory: <lead><title> [<вид>·<cert>] i:<id>`, надёжность — `ax`, `th`, `hyp`;
+    /// заголовок — с маской секретов ([`super::shown_title`]: старый сервер его не маскирует).
     pub fn hint(&self, lead: &str) -> String {
-        let title = self.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let one_line = self.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title = super::shown_title(&one_line, usize::MAX);
         let cert = zam_core::certainty_short(self.certainty.as_deref().unwrap_or(""));
         let tags: Vec<&str> = [self.insight_kind.as_str(), cert]
             .into_iter()
@@ -216,6 +218,50 @@ pub fn usable_triggers(env: &Env, server: Option<&str>) -> Option<TriggersCache>
     Some(c)
 }
 
+/// Сбой обновления кэша с сервера (`triggers.json`, `file-refs.json`).
+#[derive(Debug)]
+pub enum RefreshError {
+    /// Запрос или ответ сервера.
+    Request(CliError),
+    /// Запись файла кэша.
+    Cache(String),
+}
+
+impl RefreshError {
+    /// Причина для строки `hooks.log` (M7.1, задача 7): `срок: …` (срок запроса или бюджет хука
+    /// до запроса) и `сеть: …` (ответа нет, тело не дочитано) — среда; `ответ: <код>` (сервер
+    /// ответил ошибкой), `ответ: не разобран` и `кэш: …` (сбой записи файла) — нет. Текста ответа
+    /// сервера в причине нет (§10.7).
+    pub fn reason(&self) -> String {
+        match self {
+            RefreshError::Request(e) if e.is_unsent() || e.is_timeout() => format!("срок: {e}"),
+            RefreshError::Request(e) if e.is_network() => format!("сеть: {e}"),
+            RefreshError::Request(e) => match e.http_status() {
+                Some(s) => format!("ответ: {s}"),
+                None => "ответ: не разобран".to_string(),
+            },
+            RefreshError::Cache(m) => format!("кэш: {m}"),
+        }
+    }
+}
+
+impl From<CliError> for RefreshError {
+    fn from(e: CliError) -> Self {
+        RefreshError::Request(e)
+    }
+}
+
+/// `zam triggers sync`: ошибка команды — прежняя (запрос как есть, сбой записи — код
+/// [`EXIT_UNREACHABLE`]).
+impl From<RefreshError> for CliError {
+    fn from(e: RefreshError) -> Self {
+        match e {
+            RefreshError::Request(e) => e,
+            RefreshError::Cache(m) => CliError::new(EXIT_UNREACHABLE, m),
+        }
+    }
+}
+
 /// Итог обновления кэша триггеров.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refresh {
@@ -231,7 +277,7 @@ pub fn refresh_triggers(
     env: &Env,
     client: &Client,
     force: bool,
-) -> Result<(Refresh, Vec<String>), CliError> {
+) -> Result<(Refresh, Vec<String>), RefreshError> {
     let path = triggers_path(&env.root);
     let sol = env.solution.as_ref().map(|s| s.id.clone());
     let old = if force {
@@ -251,7 +297,7 @@ pub fn refresh_triggers(
     let r = client.get_with("/triggers", &query, &headers)?;
     let write = |c: &TriggersCache| {
         write_json_file(&path, c)
-            .map_err(|e| CliError::new(EXIT_UNREACHABLE, format!("запись {}: {e}", path.display())))
+            .map_err(|e| RefreshError::Cache(format!("запись {}: {e}", path.display())))
     };
     if r.status().as_u16() == 304
         && let Some(mut c) = old
@@ -360,7 +406,7 @@ pub fn file_refs_for(
 
 /// `GET /file-refs?solution=` с `If-None-Match` и запись `file-refs.json` (304 — кэш остаётся,
 /// обновляется `fetched_at`). Без решения — `None` без запроса.
-pub fn refresh_file_refs(env: &Env, client: &Client) -> Result<Option<Refresh>, CliError> {
+pub fn refresh_file_refs(env: &Env, client: &Client) -> Result<Option<Refresh>, RefreshError> {
     let Some(sol) = env.solution.as_ref().map(|s| s.id.clone()) else {
         return Ok(None);
     };
@@ -379,7 +425,7 @@ pub fn refresh_file_refs(env: &Env, client: &Client) -> Result<Option<Refresh>, 
     let r = client.get_with("/file-refs", &[("solution", sol.as_str())], &headers)?;
     let write = |c: &FileRefsCache| {
         write_json_file(&path, c)
-            .map_err(|e| CliError::new(EXIT_UNREACHABLE, format!("запись {}: {e}", path.display())))
+            .map_err(|e| RefreshError::Cache(format!("запись {}: {e}", path.display())))
     };
     if r.status().as_u16() == 304
         && let Some(mut c) = old
@@ -1437,6 +1483,29 @@ pub fn sync(ctx: &super::super::Ctx) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M7.1, задача 7: причина сбоя обновления кэша — код ответа без его текста, неразобранный
+    /// ответ и сбой записи кэша — не «сеть» и не «срок» (среда — только транспорт и срок, их
+    /// признаки ставит клиент: `client::tests::network_flag_marks_transport_only`).
+    #[test]
+    fn refresh_error_reason_without_response_text() {
+        let status = CliError::with_problem(
+            EXIT_UNREACHABLE,
+            "тайна ответа (HTTP 500)",
+            Some(serde_json::json!({"status": 500})),
+        );
+        assert_eq!(RefreshError::Request(status).reason(), "ответ: 500");
+        let json = CliError::new(EXIT_UNREACHABLE, "ответ сервера не JSON: тайна");
+        assert_eq!(RefreshError::Request(json).reason(), "ответ: не разобран");
+        let cache = RefreshError::Cache("запись triggers.json: отказ".into());
+        assert_eq!(cache.reason(), "кэш: запись triggers.json: отказ");
+        // `zam triggers sync` — прежняя ошибка команды
+        let e = CliError::from(RefreshError::Cache("запись x: отказ".into()));
+        assert_eq!(
+            (e.code, e.to_string()),
+            (EXIT_UNREACHABLE, "запись x: отказ".into())
+        );
+    }
 
     /// Ревью задачи 9A, M1: замок, перехваченный другим процессом (токен в файле чужой), при
     /// `Drop` не удаляется; свой — удаляется.

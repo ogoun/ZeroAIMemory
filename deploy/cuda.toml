@@ -1,4 +1,7 @@
 # Библиотеки NVIDIA для CUDA EP ONNX Runtime 1.31 (сборка gpu_cuda13: CUDA 13.0+, cuDNN 9.x).
+# С M7.1 ORT GPU берётся из пакетов NuGet Microsoft.ML.OnnxRuntime.Gpu.Windows/.Gpu.Linux 1.31.0
+# (deploy/onnxruntime-gpu.toml): файлы побайтово равны архивам GitHub v1.31.0 gpu_cuda13,
+# проверено 2026-11-21, — поэтому набор ниже и проверка импортов в силе.
 # В GPU-комплект zam-server не входят (решение владельца): их ставит `zam-server cuda fetch`
 # в <exe_dir>/cuda/ или архив zam-cuda-<ver>-<os>-x64. `cargo xtask fetch-deps` их не скачивает.
 #

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use super::{home_dir, zam_env};
+use super::{home_dir, missing_token, unbound_token_note, zam_env};
 use crate::client::{EXIT_CONFIG, EXIT_TOKEN, EXIT_UNREACHABLE, Timeouts, agent};
 use crate::locate::{self, Flags, Found};
 use crate::target::Solution;
@@ -46,6 +46,11 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
         eprintln!("{e}");
         return EXIT_CONFIG;
     }
+    // ключ без адреса в домашнем конфиге — примечание с командой привязки (M7 §4.4)
+    if let Some(u) = &r.unbound_token {
+        let used = u.used.then_some(url.value.as_str());
+        eprintln!("примечание: {}", unbound_token_note(&u.mask, used));
+    }
     let solution = locate::find_solution(&cwd);
     // файл читается сразу: имя и GUID печатаются и без ответа /spaces
     let sol = solution.as_deref().map(|p| {
@@ -54,6 +59,17 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
             e.msg.strip_prefix(&lead).unwrap_or(&e.msg).to_string()
         })
     });
+    // в домашнем конфиге токены только других адресов — ошибка настройки до сети (M7 §4.4); у
+    // `--json` — отчёт с полем `error` (сервер не спрашивался: версия «?»)
+    if r.token.is_none() && r.other_server_keys {
+        let e = missing_token(&url.value, true);
+        if as_json {
+            Report::new(url, None, solution, sol, "?".into(), "?".into()).print(true, Some(&e.msg));
+        } else {
+            eprintln!("{}", e.msg);
+        }
+        return e.code;
+    }
     let agent = agent(&url.value, Timeouts::Probe);
 
     // 1. сервер: /health без аутентификации
@@ -76,25 +92,20 @@ pub fn run(flags: Flags, as_json: bool) -> u8 {
             .unwrap_or("?")
             .to_string()
     };
-    let mut rep = Report {
+    let mut rep = Report::new(
         url,
-        version: field("version"),
-        git: field("git"),
-        token: r.token.clone(),
-        user: None,
-        access: None,
+        r.token.clone(),
         solution,
         sol,
-        registry_name: None,
-        role: None,
-        pending: None,
-        block: None,
-    };
+        field("version"),
+        field("git"),
+    );
 
     // 2. токен: /spaces
     let Some(token) = r.token else {
-        rep.print(as_json, Some("токен не задан"));
-        return EXIT_TOKEN;
+        let e = missing_token(&rep.url.value, false);
+        rep.print(as_json, Some(&e.msg));
+        return e.code;
     };
     match get(
         &agent,
@@ -228,6 +239,31 @@ struct Report {
 }
 
 impl Report {
+    /// Отчёт до ответа `/spaces`: сервер, токен и решение.
+    fn new(
+        url: Found,
+        token: Option<Found>,
+        solution: Option<PathBuf>,
+        sol: Option<Result<Solution, String>>,
+        version: String,
+        git: String,
+    ) -> Report {
+        Report {
+            url,
+            version,
+            git,
+            token,
+            user: None,
+            access: None,
+            solution,
+            sol,
+            registry_name: None,
+            role: None,
+            pending: None,
+            block: None,
+        }
+    }
+
     /// Печать результата; токен — только маска. `problem` идёт в stderr (и в поле `error` JSON).
     fn print(&self, as_json: bool, problem: Option<&str>) {
         let mask = self.token.as_ref().map(|t| zam_core::mask_token(&t.value));

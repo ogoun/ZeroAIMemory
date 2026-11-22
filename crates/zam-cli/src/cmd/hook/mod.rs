@@ -505,6 +505,23 @@ impl Env {
             .filter(|d| !d.is_zero())
     }
 
+    /// Строка агенту, когда у хука нет токена для найденного адреса (M7 §4.4; финальное ревью
+    /// M7.1, M-4): адрес-псевдоним после обновления (IP в блоке, имя хоста в домашнем `url`)
+    /// молча лишал дайджеста и подсказок — причина была только в `hooks.log`. Прочие причины
+    /// отказа клиента — только в журнале; токены других адресов не печатаются.
+    pub fn missing_token_note(&self) -> Option<String> {
+        let r =
+            locate::resolve(&Flags::default(), &super::zam_env(), &self.cwd, &self.home).ok()?;
+        let url = r.url?;
+        if r.token.is_some() {
+            return None;
+        }
+        Some(format!(
+            "ZeroAIMemory: {}",
+            super::missing_token(&url.value, r.other_server_keys).msg
+        ))
+    }
+
     /// Клиент API со сроком [`Env::http_deadline`] на все его запросы (клиент можно
     /// переиспользовать и делить между потоками: второго срока не будет); нет адреса, токена или
     /// времени — `None` (причина — в журнал).
@@ -523,8 +540,13 @@ impl Env {
                 return None;
             }
         };
-        let (Some(url), Some(token)) = (r.url, r.token) else {
+        let Some(url) = r.url else {
             self.log("не заданы адрес сервера или токен");
+            return None;
+        };
+        // токена этого адреса нет — подсказка `zam init` (M7 §4.4)
+        let Some(token) = r.token else {
+            self.log(&super::missing_token(&url.value, r.other_server_keys).msg);
             return None;
         };
         if let Err(e) = locate::check_url(&url.value) {
@@ -755,6 +777,13 @@ pub fn head_bytes(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Заголовок записи в строке хука агенту: маска секретов `zam-secrets` **до** обрезки (иначе
+/// разрезанный границей ключ маска не узнала бы) и не длиннее `max` символов (задача 5 M7.1;
+/// сервер M7.1 уже маскирует заголовки для токена — здесь ещё и для старого сервера).
+pub fn shown_title(title: &str, max: usize) -> String {
+    zam_secrets::mask_text(title).chars().take(max).collect()
 }
 
 #[cfg(test)]

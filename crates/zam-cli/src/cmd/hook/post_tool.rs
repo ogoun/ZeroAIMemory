@@ -13,6 +13,15 @@
 //! `holdout: true` (контрольная группа A/B, M6 §12) — тишина: ни локальных `error_regex`, ни
 //! строки петли, маркер сессии ставится ([`cache::note_holdout`]).
 //!
+//! M7.1 §4.6: ожидаемый ненулевой код ([`expected_exit`]: `grep`, `diff`, `test`… с кодом 1 без
+//! stderr) — не ошибка, а успех команды (`Ev::Cmd {ok: true}`, без сети); сбой класса «не
+//! повторяй» ([`dont_repeat_class`]: 401, 403, квота, диск, 429, 400/422) — к подсказкам сервера
+//! (запрос `/recall(post_tool)` — как у любой ошибки) и `error_regex` добавляется строка класса,
+//! построенная локально, раз за сессию на класс и отпечаток; сервер недоступен — строка всё
+//! равно есть; в запрос `/recall(post_tool)` — имена каталогов из команды `path_words`
+//! ([`zam_core::shell::path_words`]: первые 16 КиБ команды, после маскировки секретов): сервер
+//! не считает их предметом ошибки.
+//!
 //! **Успех** (M4.5 §6.3, §9.1; `PostToolUse` без ошибки; без сети, бюджет 50 мс):
 //! - `Read` — `Ev::Read` и знание о файле по `file-refs.json` ([`file_context_lines`], ключ
 //!   `file_context`): до 3 записей, раз за сессию на файл (`shown-<сессия>.json`, ключ
@@ -42,7 +51,7 @@ use super::input::Input;
 use super::journal::{self, Ev};
 use super::output::Output;
 use super::pre_tool::{is_edit_tool, patch_files};
-use super::{Agent, Env, Flag, Kind, Settings, head_bytes};
+use super::{Agent, Env, Flag, Kind, Settings, head_bytes, shown_title};
 use crate::client::read_json;
 use crate::cmd::refs::{self, MISSING_HASH};
 
@@ -98,10 +107,323 @@ pub fn error_text(inp: &Input, agent: Agent) -> Option<String> {
 
 pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     match error_text(inp, env.agent) {
+        // ожидаемый ненулевой код (M7.1 §4.6 п. 1) — исход команды, а не сбой
+        Some(error) if command_of(inp).is_some_and(|c| expected_exit(&c, &error)) => {
+            success(env, inp, s)
+        }
         Some(error) => failure(env, inp, s, &error),
         None if inp.event == "PostToolUse" => success(env, inp, s),
         None => Output::Empty,
     }
+}
+
+/// Программы, у которых код 1 — исход проверки, а не сбой (M7.1 §4.6 п. 1): «совпадений нет»,
+/// «файлы различаются», «ложно». У `git` — только `git diff --quiet | --exit-code`.
+pub const EXIT_1_PROGRAMS: [&str; 6] = ["grep", "rg", "diff", "cmp", "test", "["];
+/// Начала строк-диагностик (stderr) в выводе, кроме имени самой программы: сообщения `git`
+/// (`error:`, `fatal:`, `warning:`), справка `usage:` и оболочки.
+const DIAG_WORDS: [&str; 9] = [
+    "error", "fatal", "warning", "usage", "bash", "sh", "zsh", "dash", "ksh",
+];
+
+/// Ожидаемый ненулевой код (M7.1 §4.6 п. 1): простая команда `cmd`
+/// ([`zam_core::shell::is_simple`]: без `|`, `;`, `&&`, `||`, фона, второй строки и без
+/// подстановок `$(…)`, `` `…` ``, `<(…)`, `>(…)` — их сбой прячется в коде внешней программы) —
+/// программа из [`EXIT_1_PROGRAMS`] или `git diff` с `--quiet`/`--exit-code` — завершилась кодом 1
+/// и без stderr. Код — первая строка `error` `Exit code 1` (Claude Code; stdout и stderr идут за
+/// ней одним текстом), поэтому stderr — строки-диагностики после неё ([`has_diagnostics`])
+/// **[решение исполнителя, задача 8 M7.1]**; разница `diff`, счётчик `grep -c` и «a b differ»
+/// `cmp` — stdout. У Codex `error` — сам непустой stderr без строки кода: не ожидаемый.
+pub fn expected_exit(cmd: &str, error: &str) -> bool {
+    let (head, body) = error.split_once('\n').unwrap_or((error, ""));
+    if !head.trim().eq_ignore_ascii_case("exit code 1") || !zam_core::shell::is_simple(cmd) {
+        return false;
+    }
+    let Some(prog) = program_name(cmd) else {
+        return false;
+    };
+    let words = zam_core::shell::words(cmd);
+    let args = words
+        .iter()
+        .skip_while(|w| zam_core::shell::is_assignment(w))
+        .skip(1)
+        .map(String::as_str);
+    let listed = match prog.as_str() {
+        "git" => git_diff_exit_code(args),
+        p => EXIT_1_PROGRAMS.contains(&p),
+    };
+    listed && !has_diagnostics(body, &prog)
+}
+
+/// Программа команды или слова: [`journal::exe_of`] (первое слово без присваиваний и пути) без
+/// регистра и суффикса `.exe`.
+fn program_name(cmd: &str) -> Option<String> {
+    let exe = journal::exe_of(cmd)?.to_lowercase();
+    Some(match exe.strip_suffix(".exe") {
+        Some(b) => b.to_string(),
+        None => exe,
+    })
+}
+
+/// `git [-C <путь>] [-c <ключ=значение>] [--флаги] diff … --quiet | --exit-code`.
+fn git_diff_exit_code<'a>(mut args: impl Iterator<Item = &'a str>) -> bool {
+    while let Some(a) = args.next() {
+        match a {
+            "-C" | "-c" => {
+                args.next();
+            }
+            "diff" => return args.any(|a| a == "--quiet" || a == "--exit-code"),
+            a if a.starts_with('-') => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// В выводе есть строка-диагностика ([`expected_exit`]). Диагностика начинается с первой
+/// колонки (строки контекста `diff -u` с отступом — stdout) и это одно из:
+/// - слово до `:` без пробелов — программа `prog`, оболочка (`bash:`, `/usr/bin/bash:`) или
+///   слово из [`DIAG_WORDS`];
+/// - `<имя>:<число>:` — сообщение скрипта или оболочки с номером строки, в том числе zsh
+///   `(eval):1: no such file or directory: …` (у программ списка с кодом 1 такого stdout нет:
+///   `grep -n` без совпадений ничего не печатает);
+/// - Python: `Traceback (most recent call last):` и `<Имя>Error: …` (с модулем —
+///   `requests.exceptions.ConnectionError: …`).
+fn has_diagnostics(body: &str, prog: &str) -> bool {
+    body.lines().any(|l| {
+        if l == "Traceback (most recent call last):" {
+            return true;
+        }
+        let Some((word, rest)) = l.split_once(':') else {
+            return false;
+        };
+        if word.is_empty() || word.contains(char::is_whitespace) {
+            return false;
+        }
+        let numbered = rest
+            .split_once(':')
+            .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let python_error = word.rsplit('.').next().is_some_and(|w| {
+            w.len() > "Error".len()
+                && w.ends_with("Error")
+                && w.starts_with(|c: char| c.is_ascii_uppercase())
+                && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        let named =
+            program_name(word).is_some_and(|w| w == prog || DIAG_WORDS.contains(&w.as_str()));
+        numbered || python_error || named
+    })
+}
+
+/// Класс сбоя, который повтор той же команды не исправит (M7.1 §4.6 п. 2): строка «не
+/// повторяй» ([`DontRepeat::line`]) строится локально, без сети, и добавляется к подсказкам
+/// сервера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DontRepeat {
+    /// 401, `invalid_grant` — учётные данные.
+    Auth,
+    /// 403, scope — права.
+    Scope,
+    /// Квота, кредиты.
+    Quota,
+    /// `ENOSPC`, «No space left on device» — диск.
+    NoSpace,
+    /// 429 — лимит запросов (`Retry-After`).
+    RateLimit,
+    /// 400, 422 — неверный запрос.
+    BadRequest,
+}
+
+/// Код HTTP в тексте ошибки: `HTTP 401`, `HTTP/1.1 401`, `status: 401`, `status code 401`,
+/// `returned error: 401`, `response code 401` — или `401 Unauthorized` (имена `names`).
+fn http_status(code: &str, names: &str) -> String {
+    format!(
+        r"\b(?:HTTP(?:/\d(?:\.\d)?)?[ :]+|status(?:[ _]?code)?\s*[:=]?\s*|returned error:?\s*|response code:?\s*){code}\b|\b{code}\s+(?:{names}|client error)\b"
+    )
+}
+
+impl DontRepeat {
+    /// Порядок проверки: точные признаки раньше общих (`insufficient_quota` приходит с 429, «API
+    /// rate limit exceeded» — с 403).
+    pub const ALL: [DontRepeat; 6] = [
+        DontRepeat::NoSpace,
+        DontRepeat::Quota,
+        DontRepeat::RateLimit,
+        DontRepeat::Auth,
+        DontRepeat::Scope,
+        DontRepeat::BadRequest,
+    ];
+
+    /// Имя класса в ключе показа (`shown-<сессия>.json`).
+    pub fn key(self) -> &'static str {
+        match self {
+            DontRepeat::Auth => "auth",
+            DontRepeat::Scope => "scope",
+            DontRepeat::Quota => "quota",
+            DontRepeat::NoSpace => "no_space",
+            DontRepeat::RateLimit => "rate_limit",
+            DontRepeat::BadRequest => "bad_request",
+        }
+    }
+
+    /// Шаблон класса (без учёта регистра).
+    fn pattern(self) -> String {
+        match self {
+            DontRepeat::NoSpace => r"\bENOSPC\b|no space left on device|there is not enough space on the disk|недостаточно места на диске".into(),
+            DontRepeat::Quota => r"\binsufficient_quota\b|\bquota\b[^\n]{0,40}\b(?:exceeded|exhausted)\b|\b(?:exceeded|exhausted)\b[^\n]{0,40}\bquota\b|\bcredit balance is too low\b".into(),
+            DontRepeat::RateLimit => format!(
+                r"{}|\btoo many requests\b|\brate[ _-]?limit(?:ed)?\b[^\n]{{0,30}}\b(?:exceeded|reached)\b",
+                http_status("429", "too many requests")
+            ),
+            DontRepeat::Auth => format!(r"{}|\binvalid_grant\b", http_status("401", "unauthorized")),
+            DontRepeat::Scope => format!(
+                r"{}|\binsufficient[_ ]scopes?\b|\b(?:missing|required) scopes?\b",
+                http_status("403", "forbidden")
+            ),
+            DontRepeat::BadRequest => format!(
+                "{}|{}",
+                http_status("400", "bad request"),
+                http_status("422", r"unprocessable(?: entity| content)?")
+            ),
+        }
+    }
+
+    /// Строка класса, до 30 токенов: что проверить вместо повтора (без готового рецепта); у 429 —
+    /// значение `Retry-After`, если оно есть в ошибке.
+    pub fn line(self, error: &str) -> String {
+        match self {
+            DontRepeat::Auth => {
+                "ZeroAIMemory: доступ отклонён (401/invalid_grant) — проверь ключ, не повторяй тот \
+                 же запрос"
+                    .into()
+            }
+            DontRepeat::Scope => {
+                "ZeroAIMemory: нет прав (403/scope) — проверь права ключа, повтор не поможет".into()
+            }
+            DontRepeat::Quota => {
+                "ZeroAIMemory: квота исчерпана — проверь лимит и баланс, повтор не поможет".into()
+            }
+            DontRepeat::NoSpace => {
+                "ZeroAIMemory: нет места на диске — освободи место, повтор не поможет".into()
+            }
+            DontRepeat::RateLimit => {
+                let wait = retry_after(error).map_or(String::new(), |s| format!(" ({s} с)"));
+                format!(
+                    "ZeroAIMemory: лимит запросов (429) — выжди Retry-After{wait}, не повторяй сразу"
+                )
+            }
+            DontRepeat::BadRequest => {
+                "ZeroAIMemory: запрос отклонён (400/422) — проверь запрос, а не повторяй".into()
+            }
+        }
+    }
+}
+
+/// Тест-раннер среди простых команд `cmd` ([`zam_core::shell::segments`]; ревью задачи 8 M7.1,
+/// M-4): в выводе тестов коды HTTP — чаще текст проверок (`400 Bad Request` в ожидании теста),
+/// чем сбой самой команды, поэтому классы «не повторяй» к ним не применяются. Раннеры: `cargo
+/// test | nextest`, `go test`, `npm | pnpm | yarn | bun test` (и `run test`), `pytest`, `jest`,
+/// `vitest` (и через `npx`/`pnpx`/`bunx`, `python -m pytest`).
+fn is_test_runner(cmd: &str) -> bool {
+    zam_core::shell::segments(cmd).iter().any(|seg| {
+        let words = zam_core::shell::words(seg);
+        let mut w = words
+            .iter()
+            .skip_while(|w| zam_core::shell::is_assignment(w))
+            .map(|w| program_name(w).unwrap_or_default());
+        let Some(prog) = w.next() else {
+            return false;
+        };
+        let rest: Vec<String> = w.collect();
+        // первое слово-подкоманда: без флагов `-…` и `+toolchain`
+        let sub = || {
+            rest.iter()
+                .find(|a| !a.starts_with(['-', '+']))
+                .map(String::as_str)
+        };
+        match prog.as_str() {
+            "pytest" | "jest" | "vitest" => true,
+            "cargo" => matches!(sub(), Some("test" | "nextest")),
+            "go" => sub() == Some("test"),
+            "npm" | "pnpm" | "yarn" | "bun" => {
+                let mut subs = rest.iter().filter(|a| !a.starts_with('-'));
+                match subs.next().map(String::as_str) {
+                    Some("test") => true,
+                    Some("run") => subs.next().is_some_and(|s| s == "test"),
+                    _ => false,
+                }
+            }
+            "npx" | "pnpx" | "bunx" => matches!(sub(), Some("jest" | "vitest" | "pytest")),
+            "python" | "python3" | "py" => {
+                rest.windows(2).any(|p| p[0] == "-m" && p[1] == "pytest")
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Скомпилированные шаблоны классов ([`DontRepeat::ALL`]) — один раз на процесс.
+fn dont_repeat_regexes() -> &'static [(DontRepeat, regex::Regex)] {
+    static RE: std::sync::OnceLock<Vec<(DontRepeat, regex::Regex)>> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        DontRepeat::ALL
+            .iter()
+            .filter_map(|&c| {
+                RegexBuilder::new(&c.pattern())
+                    .case_insensitive(true)
+                    .build()
+                    .ok()
+                    .map(|r| (c, r))
+            })
+            .collect()
+    })
+}
+
+/// Класс «не повторяй» ошибки (M7.1 §4.6 п. 2) — первый совпавший по порядку
+/// [`DontRepeat::ALL`]; не совпал ни один — `None`.
+pub fn dont_repeat_class(error: &str) -> Option<DontRepeat> {
+    dont_repeat_regexes()
+        .iter()
+        .find(|(_, r)| r.is_match(error))
+        .map(|(c, _)| *c)
+}
+
+/// Секунды `Retry-After: N` в тексте ошибки.
+fn retry_after(error: &str) -> Option<u64> {
+    static RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        RegexBuilder::new(r"\bretry-after\s*[:=]?\s*(\d{1,6})\b")
+            .case_insensitive(true)
+            .build()
+            .ok()
+    })
+    .as_ref()?
+    .captures(error)?
+    .get(1)?
+    .as_str()
+    .parse()
+    .ok()
+}
+
+/// Строка класса `class` ошибки с отпечатком `fp`: раз за сессию на класс и отпечаток (`shown`,
+/// ключ `dont_repeat:<класс>:<отпечаток>`); без сессии — каждый раз.
+fn dont_repeat_line(
+    env: &Env,
+    session: Option<&str>,
+    class: DontRepeat,
+    fp: &str,
+    error: &str,
+) -> Option<String> {
+    if let Some(id) = session {
+        let key = format!("dont_repeat:{}:{fp}", class.key());
+        let mut sh = cache::read_shown(env, id);
+        if sh.shown.contains(&key) {
+            return None;
+        }
+        sh.shown.push(key);
+        cache::write_shown(env, id, &sh);
+    }
+    Some(class.line(error))
 }
 
 /// Команда `tool_input.command` (строка или массив аргументов).
@@ -123,12 +445,12 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
     {
         record_edits(env, s, inp, t, id, false);
     }
+    let norm = journal::mask_secrets(&journal::normalize_error(error));
+    let fp = journal::err_fingerprint(&norm);
     let mut loop_line = None;
     if let Some(session) = inp.session_id.as_deref()
         && s.flag_on(Flag::SessionJournal)
     {
-        let norm = journal::mask_secrets(&journal::normalize_error(error));
-        let fp = journal::err_fingerprint(&norm);
         journal::note(
             env,
             session,
@@ -148,7 +470,7 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
                 &Ev::Cmd {
                     exe,
                     ok: false,
-                    err_fp: Some(fp),
+                    err_fp: Some(fp.clone()),
                 },
             );
         }
@@ -162,6 +484,17 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
         .as_ref()
         .map(|c| local_matches(&c.triggers, tool, error, env))
         .unwrap_or_default();
+    // имена каталогов из команды — не предмет ошибки (M7.1 §4.6 п. 3); значения секретов и флагов с
+    // паролем не уходят (маскировка — как у команд снимка сессии); у длинной команды — только
+    // начало и не больше `PATH_WORDS_STAT_MAX` stat (бюджет хука, финальное ревью M7.1, I-4)
+    let path_words: Vec<String> = match (tool, command_of(inp)) {
+        (Some("apply_patch"), _) | (_, None) => Vec::new(),
+        (_, Some(c)) => {
+            let head = head_bytes(&c, zam_core::shell::PATH_WORDS_SCAN_MAX);
+            let masked = zam_secrets::mask_flags(&zam_secrets::mask_text(head));
+            zam_core::shell::path_words(&masked, |a| env.cwd.join(a).is_dir())
+        }
+    };
     let remote = env.client().and_then(|client| {
         let body = json!({
             "event": "post_tool",
@@ -171,6 +504,7 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
             "tool": tool,
             // предел канала агента (ревью 8a M6, C1)
             "output_limit": super::output::output_limit(env.agent, ""),
+            "path_words": path_words,
         });
         let session = inp.session_id.as_deref();
         std::thread::scope(|sc| {
@@ -223,6 +557,20 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
             known.push(r);
             lines.push(t.hint(LEAD));
         }
+    }
+    // сбой, который повтор не исправит (M7.1 §4.6 п. 2; решение координатора): строка класса
+    // строится локально и идёт после подсказок сервера и `error_regex` (сервер недоступен — и
+    // без них); сервер её не видел — она в очередь учёта (M4.5 §9.5)
+    // у тест-раннера коды HTTP в выводе — текст проверок, не сбой команды (M-4 ревью)
+    let runner = command_of(inp).is_some_and(|c| is_test_runner(&c));
+    if !runner
+        && let Some(class) = dont_repeat_class(error)
+        && let Some(line) = dont_repeat_line(env, inp.session_id.as_deref(), class, &fp, error)
+    {
+        if let Some(id) = inp.session_id.as_deref() {
+            cache::note_tokens(env, id, cache::TOKENS_POST_TOOL_LOCAL, &line);
+        }
+        lines.push(line);
     }
     lines.extend(loop_line);
     Output::context(&inp.event, &lines.join("\n"))
@@ -495,14 +843,10 @@ pub fn file_hint(pr: &PathRefs) -> String {
     let parts: Vec<String> = items
         .iter()
         .map(|i| {
-            let title: String = i
-                .title
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(TITLE_MAX)
-                .collect();
+            // заголовок — с маской секретов до обрезки ([`shown_title`]): сервер M7.1 маскирует
+            // его для токена сам, старый — нет
+            let one_line = i.title.split_whitespace().collect::<Vec<_>>().join(" ");
+            let title = shown_title(&one_line, TITLE_MAX);
             // теги как у `hint_line`: пустые опускаются, без тегов — без скобок
             let stale = if i.state == "stale" {
                 "возможно устарело"
@@ -615,6 +959,30 @@ mod tests {
         );
     }
 
+    /// Заголовок с секретом (старый сервер его не маскирует) — меткой `‹secret›` до обрезки:
+    /// ключ на границе [`TITLE_MAX`] не выходит префиксом (круг правок 1 задачи 5 M7.1).
+    #[test]
+    fn file_hint_title_masked() {
+        // ключ из частей: целиком его в исходнике нет (push protection)
+        let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+        let pad = "п".repeat(TITLE_MAX - 10);
+        let item = |title: String| cache::RefItem {
+            id: "i:01A".into(),
+            kind: "gotcha".into(),
+            title,
+            state: "ok".into(),
+            symbol: None,
+        };
+        let pr = PathRefs {
+            path: "src/a.rs".into(),
+            hash: None,
+            items: vec![item(format!("ключ {key}")), item(format!("{pad} {key}"))],
+        };
+        let line = file_hint(&pr);
+        assert!(!line.contains(&key) && !line.contains("ghp_aB3"), "{line}");
+        assert!(line.contains("ключ ‹secret› [gotcha] i:01A"), "{line}");
+    }
+
     #[test]
     fn error_from_failure_and_stderr() {
         let (cl, cx) = (Agent::Claude, Agent::Codex);
@@ -639,5 +1007,191 @@ mod tests {
             r#"{"hook_event_name":"PostToolUse","tool_response":{"stderr":"e","metadata":{"exit_code":2}}}"#,
         );
         assert_eq!(error_text(&n, cx).as_deref(), Some("e"));
+    }
+
+    /// M7.1 §4.6 п. 1: код 1 простой команды из списка без stderr — ожидаемый; иначе — ошибка.
+    #[test]
+    fn expected_exit_cases() {
+        for (cmd, err) in [
+            ("grep -c x f", "Exit code 1"),
+            ("grep -c x a b", "Exit code 1\na:0\nb:0"),
+            ("rg foo src", "exit code 1\n"),
+            ("diff a b", "Exit code 1\n1c1\n< a\n---\n> b"),
+            ("cmp a b", "Exit code 1\na b differ: byte 1, line 1"),
+            ("test -f x", "Exit code 1"),
+            ("[ -f x ]", "Exit code 1"),
+            ("git diff --quiet", "Exit code 1"),
+            (
+                "git -C repo diff --exit-code -- a.rs",
+                "Exit code 1\ndiff --git a/a.rs b/a.rs\n+error: x",
+            ),
+            ("grep 'a|b' f", "Exit code 1"),
+            ("LC_ALL=C /usr/bin/grep x f", "Exit code 1"),
+            (r"C:\Git\usr\bin\grep.exe x f", "Exit code 1"),
+            ("grep x f", "Exit code 1\nShell cwd was reset to /w"),
+            // перенаправления — не составная команда (M-2 ревью)
+            ("grep x f 2>&1", "Exit code 1"),
+            ("grep x f >out.txt 2>&1", "Exit code 1"),
+            ("diff a b &>diff.txt", "Exit code 1"),
+            ("diff a b &>>diff.txt", "Exit code 1"),
+            // строка контекста `diff -u` с отступом — stdout (M-1 ревью)
+            (
+                "diff -u a.rs b.rs",
+                "Exit code 1\n--- a.rs\n+++ b.rs\n@@ -1,3 +1,3 @@\n struct E {\n     error: String,\n-    code: u8,\n+    code: u16,",
+            ),
+            ("grep -q '$(x)' f", "Exit code 1"),
+        ] {
+            assert!(expected_exit(cmd, err), "{cmd} / {err:?}");
+        }
+        for (cmd, err) in [
+            // составная команда
+            ("grep x f | wc -l", "Exit code 1"),
+            ("grep x f; echo", "Exit code 1"),
+            ("grep x f && echo", "Exit code 1"),
+            ("grep x f || exit 1", "Exit code 1"),
+            ("cd a\ngrep x f", "Exit code 1"),
+            // другой код и stderr
+            (
+                "grep x nofile",
+                "Exit code 2\ngrep: nofile: No such file or directory",
+            ),
+            ("cmp a b", "Exit code 1\ncmp: EOF on a after byte 3, line 1"),
+            (
+                "git diff --exit-code",
+                "Exit code 1\nwarning: in the working copy of 'a.sh', LF will be replaced by CRLF",
+            ),
+            (
+                "test 1 -gt",
+                "Exit code 1\nbash: test: 1: unary operator expected",
+            ),
+            (
+                "[ a -gt 1 ]",
+                "Exit code 1\n/usr/bin/bash: line 1: [: a: integer expression expected",
+            ),
+            // сбой вложенной программы прячется в коде внешней (I-1 ревью): подстановки
+            (
+                "diff <(sort a) <(sort b)",
+                "Exit code 1\nsort: cannot read: a: No such file or directory\n0a1\n> x",
+            ),
+            (
+                "diff <(jq . a.json) <(jq . b.json)",
+                "Exit code 1\n1c1\n< 1\n---\n> 2",
+            ),
+            ("cmp <(xxd a) <(xxd b)", "Exit code 1\n- 1 differ: byte 3"),
+            ("diff a >(tee log)", "Exit code 1"),
+            ("grep -n foo $(find src -name '*.rs')", "Exit code 1"),
+            ("grep -n foo `find src -name '*.rs'`", "Exit code 1"),
+            (
+                "test -n \"$(python find.py)\"",
+                "Exit code 1\nTraceback (most recent call last):\n  File \"find.py\", line 3, in \
+                 <module>\nFileNotFoundError: [Errno 2] No such file or directory: 'x'",
+            ),
+            ("test -n \"`cat x`\"", "Exit code 1"),
+            // диагностики (I-1 ревью): zsh `(eval)`, `<имя>:<число>:`, Python
+            (
+                "grep x f",
+                "Exit code 1\n(eval):1: no such file or directory: ./tools/x",
+            ),
+            (
+                "test -f x",
+                "Exit code 1\n./check.sh:3: test: too many arguments",
+            ),
+            ("cmp a b", "Exit code 1\nTraceback (most recent call last):"),
+            ("diff a b", "Exit code 1\nValueError: bad input"),
+            (
+                "diff a b",
+                "Exit code 1\nrequests.exceptions.ConnectionError: refused",
+            ),
+            // не из списка
+            ("cargo test", "Exit code 1"),
+            ("git diff", "Exit code 1"),
+            ("git log --exit-code", "Exit code 1"),
+            ("! grep x f", "Exit code 1"),
+            ("", "Exit code 1"),
+            // Codex: stderr без строки кода
+            ("diff a b", "diff: b: No such file or directory"),
+            ("grep x f", "Error: Exit code 1"),
+        ] {
+            assert!(!expected_exit(cmd, err), "{cmd} / {err:?}");
+        }
+    }
+
+    /// M7.1 §4.6 п. 2: классы «не повторяй» — по точным признакам; строка — до 30 токенов.
+    #[test]
+    fn dont_repeat_classes_and_lines() {
+        use DontRepeat::*;
+        for (err, class) in [
+            ("HTTP 401 invalid_grant", Auth),
+            ("gh: HTTP/1.1 401 (https://api.github.com/user)", Auth),
+            ("error: invalid_grant: token expired", Auth),
+            ("npm ERR! 401 Unauthorized - GET https://registry/x", Auth),
+            ("curl: (22) The requested URL returned error: 401", Auth),
+            ("HTTPError: 403 Client Error: Forbidden for url", Scope),
+            ("error: insufficient_scope: requires repo scope", Scope),
+            ("HTTP 403: API rate limit exceeded for user", RateLimit),
+            ("429 Too Many Requests; Retry-After: 30", RateLimit),
+            ("error: insufficient_quota (HTTP 429)", Quota),
+            ("Monthly quota exceeded for this key", Quota),
+            ("No space left on device (os error 28)", NoSpace),
+            ("ENOSPC: no space left, write", NoSpace),
+            ("Недостаточно места на диске. (os error 112)", NoSpace),
+            ("status: 422 Unprocessable Entity", BadRequest),
+            ("HTTP 400 Bad Request: field `x`", BadRequest),
+        ] {
+            assert_eq!(dont_repeat_class(err), Some(class), "{err}");
+        }
+        for err in [
+            "assertion failed: left: 401, right: 200",
+            "error[E0401]: can't use generic parameters",
+            "test result: FAILED. 401 passed; 3 failed",
+            "permission denied",
+            "error: could not find `Cargo.toml`",
+            "HTTP 4010 weird",
+        ] {
+            assert_eq!(dont_repeat_class(err), None, "{err}");
+        }
+        assert_eq!(
+            RateLimit.line("429 Too Many Requests\nRetry-After: 30"),
+            "ZeroAIMemory: лимит запросов (429) — выжди Retry-After (30 с), не повторяй сразу"
+        );
+        for c in DontRepeat::ALL {
+            let line = c.line("Retry-After: 120");
+            assert!(line.starts_with("ZeroAIMemory: "), "{line}");
+            assert!(cache::estimate_tokens(&line) <= 30, "{line}");
+        }
+    }
+
+    /// M-4 ревью задачи 8: тест-раннеры — по программе любой простой команды строки.
+    #[test]
+    fn test_runners_by_program() {
+        for cmd in [
+            "cargo test -p zam-server --test recall",
+            "cargo +nightly nextest run",
+            "cd crates && cargo test",
+            "RUST_LOG=debug cargo test",
+            "pytest -x tests/",
+            "python -m pytest -q",
+            "npm test",
+            "pnpm run test -- --watch=false",
+            "npx jest src/a.test.ts",
+            "npx vitest run",
+            "vitest",
+            "go test ./...",
+            r"C:\Python312\python.exe -m pytest",
+        ] {
+            assert!(is_test_runner(cmd), "{cmd}");
+        }
+        for cmd in [
+            "cargo build",
+            "cargo run -- test",
+            "gh api user",
+            "curl https://x/test",
+            "npm install",
+            "go build ./...",
+            "python test.py",
+            "echo cargo test",
+        ] {
+            assert!(!is_test_runner(cmd), "{cmd}");
+        }
     }
 }

@@ -139,3 +139,38 @@ async fn folder_l0_written_without_revision() {
         Some("Текст.")
     );
 }
+
+/// Авто-L0 из первого абзаца — без значения флага в инлайн-коде (круг правок 2 задачи 5 M7.1):
+/// comrak снимает обратные кавычки, поэтому абзац берётся из маскированных исходных строк;
+/// заметка без секретов — прежний текст.
+#[tokio::test]
+async fn auto_l0_masks_flags_in_inline_code() {
+    let (db, k) = setup("inline-flag").await;
+    // фиктивный пароль собирается из частей (push protection)
+    let pw = ["S3c", "ret", "9x"].concat();
+    for (path, content) in [
+        (
+            "db",
+            format!("# Доступ к БД\n\nПодключение: `mysql -uroot -p{pw} prod`.\n"),
+        ),
+        (
+            "api",
+            format!("# API\n\nЗапрос `curl -u admin:{pw} https://example.com/x` — 200.\n"),
+        ),
+        (
+            "hdr",
+            format!("# H\n\nЗаголовок `Authorization: Bearer {pw}abcdef` для теста.\n"),
+        ),
+    ] {
+        let n = note(&db, k, path, &content, None).await;
+        let node = get_node(&db, n).await.unwrap();
+        let l0 = node.l0.unwrap();
+        assert_eq!(node.l0_source.as_deref(), Some("auto"));
+        assert!(!l0.contains(&pw) && l0.contains("‹secret›"), "{path}: {l0}");
+    }
+    let n = note(&db, k, "plain", "# П\n\nОбычный `код` и текст.\n", None).await;
+    assert_eq!(
+        get_node(&db, n).await.unwrap().l0.as_deref(),
+        Some("Обычный код и текст.")
+    );
+}

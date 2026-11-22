@@ -494,7 +494,20 @@ pub async fn index(
         let k = space_of_kind(&own, SpaceKind::Knowledge).await?;
         parts.push(refs_index(&own, guid.as_str(), &[k.id]).await?);
     }
+    // заголовки записей хук `post-tool` печатает агенту подсказкой «файл связан с …»: по токену —
+    // с маской секретов (задача 5 M7.1, круг правок 1) до `ETag` — он по выданному
     let refs = merge_index(parts);
+    let size: usize = refs
+        .iter()
+        .flat_map(|r| &r.items)
+        .map(|it| it.title.len())
+        .sum();
+    let refs = super::agent_view::view_with(&p, refs, size, |refs| {
+        for it in refs.iter_mut().flat_map(|r| r.items.iter_mut()) {
+            super::agent_view::mask_in_place(&mut it.title);
+        }
+    })
+    .await?;
     let canon = serde_json::to_vec(&Canon { refs: &refs })
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let etag = blake3::hash(&canon).to_hex().to_string();

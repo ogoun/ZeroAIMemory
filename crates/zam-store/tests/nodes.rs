@@ -834,6 +834,149 @@ async fn patch_changed_section_is_conflict() {
     ));
 }
 
+/// PATCH по тексту, посчитанному вне транзакции (круг правок 1 задачи 6 M7.1, M5): операции —
+/// [`zam_store::apply_ops`] по виду (`SEKRET` показан как `[x]`; проверка «секция не менялась после
+/// `base_rev`» — по видам обеих ревизий), запись — [`zam_store::patch_note_prepared`] со сверкой
+/// текущей ревизии (сменилась — `None`, ничего не записано); повтор по ключу —
+/// [`zam_store::patch_replayed`] без записи и узел без второй правки.
+#[tokio::test]
+async fn patch_prepared_outside_tx() {
+    let (db, space) = setup("patch-prepared").await;
+    let text = "# Заметка\n\n## Ключ SEKRET\n\nстарое\n\n## Прочее\n\nтекст SEKRET\n";
+    let n = create_note(&db, note(space, "Вид", text)).await.unwrap();
+    let shown = |t: &str| t.replace("SEKRET", "[x]");
+    let back = |t: &str| t.replace("[x]", "SEKRET");
+    let ops = vec![replace("Заметка > Ключ [x]", "\nновое\n\n")];
+    // ключ повтора — в границах автора: все вызовы — тот же токен
+    let who = agent();
+    let edited = zam_store::apply_ops(None, &shown(text), 1, &ops).unwrap();
+    let r = zam_store::patch_note_prepared(
+        &db,
+        n.id,
+        1,
+        &ops,
+        1,
+        back(&edited),
+        who.clone(),
+        usize::MAX,
+        Some("k1".into()),
+    )
+    .await
+    .unwrap();
+    let (node, fresh) = r.expect("ревизия та же — записано");
+    assert!(fresh);
+    assert_eq!(node.current_rev, 2);
+    let (_, t) = node_content(&db, n.id, None).await.unwrap();
+    assert_eq!(
+        t,
+        "# Заметка\n\n## Ключ SEKRET\n\nновое\n\n## Прочее\n\nтекст SEKRET\n"
+    );
+    // повтор по ключу: чтение находит его, запись — тоже без второй правки
+    let again = zam_store::patch_replayed(&db, n.id, 1, &ops, &who, Some("k1".into()))
+        .await
+        .unwrap()
+        .expect("повтор");
+    assert_eq!(again.current_rev, 2);
+    let r = zam_store::patch_note_prepared(
+        &db,
+        n.id,
+        1,
+        &ops,
+        1,
+        "не тот текст".into(),
+        who.clone(),
+        usize::MAX,
+        Some("k1".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.map(|(n, f)| (n.current_rev, f)), Some((2, false)));
+    assert!(
+        zam_store::patch_replayed(&db, n.id, 1, &ops, &who, Some("k2".into()))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // другая секция правится без вида (rev 3): по виду с base_rev 2 секция «Ключ» та же
+    patch_note(
+        &db,
+        n.id,
+        2,
+        vec![replace("Заметка > Прочее", "другое SEKRET\n")],
+        human("б"),
+    )
+    .await
+    .unwrap();
+    let (_, base) = node_content(&db, n.id, Some(2)).await.unwrap();
+    let (_, cur) = node_content(&db, n.id, Some(3)).await.unwrap();
+    let ops = vec![PatchOp::AppendToSection {
+        section: "Заметка > Ключ [x]".into(),
+        content: "дописано\n".into(),
+    }];
+    let edited = zam_store::apply_ops(Some(&shown(&base)), &shown(&cur), 3, &ops).unwrap();
+    // текст посчитан по ревизии 2, а текущая — 3: не записано
+    let stale = zam_store::patch_note_prepared(
+        &db,
+        n.id,
+        2,
+        &ops,
+        2,
+        back(&edited),
+        agent(),
+        usize::MAX,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(stale.is_none());
+    let (node, _) = zam_store::patch_note_prepared(
+        &db,
+        n.id,
+        2,
+        &ops,
+        3,
+        back(&edited),
+        agent(),
+        usize::MAX,
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("записано");
+    assert_eq!(node.current_rev, 4);
+    let (_, t) = node_content(&db, n.id, None).await.unwrap();
+    assert!(
+        t.contains("## Ключ SEKRET\n\nновое\n") && t.contains("дописано\n"),
+        "{t}"
+    );
+    assert!(t.contains("другое SEKRET\n") && !t.contains("[x]"), "{t}");
+    // секция по виду изменилась после base_rev — SectionChanged
+    let ops = vec![replace("Заметка > Прочее", "x\n")];
+    let r = zam_store::apply_ops(Some(&shown(&base)), &shown(&cur), 3, &ops);
+    assert!(
+        matches!(r, Err(WriteError::SectionChanged { current_rev: 3, .. })),
+        "{r:?}"
+    );
+    // предел — по итоговому тексту
+    let r =
+        zam_store::patch_note_prepared(&db, n.id, 4, &ops, 4, "x".repeat(100), agent(), 50, None)
+            .await;
+    assert!(matches!(r, Err(WriteError::TooLarge { .. })), "{r:?}");
+    // без вида заголовка «Ключ [x]» нет
+    let r = patch_note(
+        &db,
+        n.id,
+        4,
+        vec![replace("Заметка > Ключ [x]", "x\n")],
+        human("а"),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(WriteError::Patch(PatchError::SectionNotFound(_)))),
+        "{r:?}"
+    );
+}
+
 #[tokio::test]
 async fn deleted_note_is_not_writable() {
     let (db, space) = setup("deleted").await;

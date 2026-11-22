@@ -348,7 +348,7 @@ enum Cmd {
         /// Адрес сервера
         #[arg(long)]
         url: Option<String>,
-        /// Токен (сохраняется в ~/.zeroaimemory/config.toml, не в файлы проекта)
+        /// Токен (сохраняется в ~/.zeroaimemory/config.toml по адресу сервера, не в файлы проекта)
         #[arg(long)]
         token: Option<String>,
         /// Агент: claude (CLAUDE.md), codex (AGENTS.md), both
@@ -523,6 +523,9 @@ enum LogCmd {
         /// Заменить существующий insight (id) этой записью
         #[arg(long)]
         supersedes: Option<String>,
+        /// Ревизия замещаемой записи, с которой прочитан текст (метки ‹secret-…› — по её виду)
+        #[arg(long, requires = "supersedes")]
+        supersedes_rev: Option<i64>,
         /// GUID решения (иначе agent_solution_id из solution.toml)
         #[arg(long)]
         solution: Option<String>,
@@ -1044,6 +1047,10 @@ enum InsightCmd {
         /// Вид (по умолчанию — как у замещаемой)
         #[arg(long, value_parser = ["gotcha", "failure", "discovery", "decision", "experiment", "pattern"])]
         kind: Option<String>,
+        /// Ревизия замещаемой записи (If-Match), с которой прочитан текст: метки ‹secret-…› — по
+        /// её виду
+        #[arg(long)]
+        rev: Option<i64>,
         // `Box` — как у `log insight` (clippy `large_enum_variant`)
         #[command(flatten)]
         new: Box<InsightArgs>,
@@ -1925,9 +1932,15 @@ fn insight(c: InsightCmd) -> Result<(), CliError> {
         InsightCmd::Supersede {
             id,
             kind,
+            rev,
             new,
             common,
-        } => i::supersede(&cmd::connect(&common)?, &id, &new.fields(kind.as_deref())),
+        } => i::supersede(
+            &cmd::connect(&common)?,
+            &id,
+            &new.fields(kind.as_deref()),
+            rev,
+        ),
         InsightCmd::Retract { id, reason, common } => {
             i::retract(&cmd::connect(&common)?, &id, &reason)
         }
@@ -2255,6 +2268,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                     scope,
                     force,
                     supersedes,
+                    supersedes_rev,
                     solution,
                     common,
                 },
@@ -2264,6 +2278,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 scope: scope.as_deref(),
                 force,
                 supersedes: supersedes.as_deref(),
+                supersedes_rev,
                 solution: solution.as_deref(),
             };
             cmd::insight::log(&cmd::connect(&common)?, &o)

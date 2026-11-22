@@ -121,11 +121,12 @@
 //!   `horizon`, `accepted` со снятой задачей) с указанием `action=propose` в строке; очереди нет —
 //!   раздел M5.7 из них одних. Подсказка к `prompt` у идеи решения `new` — «к задаче подходит
 //!   идея на разбор w:<id>» (`reason: idea_review`); у владельца базы решения ответ `prompt`
-//!   несёт и строку очереди разбора (M6.6 §3.5): первая идея очереди, не показанная в текущей
-//!   эпохе сессии в её текущей ревизии (дайджестом той же эпохи, пакетом, прежней подсказкой) и
-//!   не в подсказках-идеях этого ответа, — `ZeroAIMemory: новая идея на разбор «…» w:<id>` и
-//!   ` (ещё N)` при нескольких, одна на ответ, без зависимости от близости к запросу; голова
-//!   очереди читается до поиска. Строка плана [`PLAN_LINE`] — сразу за
+//!   несёт и строку очереди разбора (M6.6 §3.5; одна на очередь — M7.1 §4.5 п. 1):
+//!   [`REVIEW_QUEUE_LINE`] — число идей очереди и заголовок первой, раз за эпоху сессии (раздел
+//!   очереди дайджеста той же эпохи — тоже показ; отметка — `session_seen` с частью
+//!   [`zam_store::REVIEW_QUEUE_PART`] и числом идей) и ещё раз, когда после показа в очереди
+//!   появилась идея (`ideas::review_queue_line`); без зависимости от близости к запросу;
+//!   очередь читается до поиска. Строка плана [`PLAN_LINE`] — сразу за
 //!   задачами дайджеста и пакета восстановления: пункты плана из идей (задачи `open |
 //!   in_progress | blocked` с ребром `derived_from` на идею) и следующий — только `open`, по
 //!   `data.priority`, затем самый старый ([`zam_store::planned_from_ideas`]; открытых нет —
@@ -146,10 +147,13 @@
 //! - **`post_tool`** — ошибка инструмента: совпадения `error_regex` действующих триггеров
 //!   insight решения и Knowledge (по первым [`ERROR_SCAN_MAX`] байтам `error`; триггер с
 //!   `tools` — только для этих инструментов, если `tool` задан), затем FTS по insight по
-//!   нормализованной ошибке ([`normalize_error`]): строгий запрос (все слова) — как есть,
-//!   ослабленный (любое слово) — если запись покрывает достаточно слов ошибки
-//!   ([`CoverageQuery`], правило `recall.post_tool_coverage`, M6 §9). Не больше [`POST_TOOL_MAX`]; строка — «ZeroAIMemory: эта ошибка уже
-//!   разбиралась: …»;
+//!   нормализованной ошибке ([`normalize_error`]; первая строка `Exit code <N>` агента снята —
+//!   [`strip_exit_header`], M7.1 §4.6 п. 3): строгий запрос (все слова) — как есть,
+//!   ослабленный (любое слово) — если запись покрывает достаточно **предметных** слов ошибки
+//!   ([`CoverageQuery::subject`], правило `recall.post_tool_coverage`, M6 §9 и M7.1 §4.6 п. 3:
+//!   без фразы «No such file or directory», имён каталогов из команды `path_words` и частых в insight
+//!   области слов — `subject_cover`; одного совпадения кода ошибки достаточно). Не больше
+//!   [`POST_TOOL_MAX`]; строка — «ZeroAIMemory: эта ошибка уже разбиралась: …»;
 //! - **без повторов**: подсказка `prompt` показывается не больше раза за сессию — по
 //!   `session_seen` с частью [`RECALL_PART`] (любая ревизия). Дайджест `session_start` не
 //!   фильтруется (после `/compact` и `resume` Claude Code шлёт тот же `session_id`, а контекст
@@ -226,6 +230,8 @@
 //!   `text` в нём (Rules — первыми, хвост их приоритета — L0, затем снимаются разделы с меньшим
 //!   `keep`, правила — со строкой «не показано — правил: N»); хук без поля (есть `source` или
 //!   `code_map`) — 7500 байт; `max` вне 1..=1 000 000 или иная единица — 400;
+//! - `path_words` (M7.1 §4.6 п. 3, только `post_tool`) — имена каталогов из аргументов
+//!   команды: не предмет ошибки, в покрытие не идут (первые `zam_core::shell::PATH_WORDS_MAX`);
 //! - `budget_tokens` — 1..=200000 (иначе 400); `event` — `session_start | prompt | post_tool |
 //!   recovery | brief | idea_review` (иначе 400; `pre_tool` — только локально в хуке, §10.3).
 //!
@@ -254,18 +260,20 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
+use zam_core::shell::PATH_WORDS_MAX;
 use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
     CoverageQuery, CoverageRule, HINT_PREFIX, Section, error_regex_matches, error_terms, hint_line,
-    normalize_error, one_line, pack_sections, reserved_text,
+    is_common, is_error_code, normalize_error, one_line, pack_sections, reserved_text,
+    strip_exit_header, subject_error_terms,
 };
 use zam_search::truncate_marked;
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, NodeKind, RECALL_PART,
     SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind, UsageEvent,
-    UsageKind, UsageSource, active_triggers, bump_epoch, count_tokens, list_children, list_entries,
-    mark_seen_with_tokens, node_content, record_usages, search_fts_channels, seen_revs,
-    seen_revs_any_epoch, session_holdout, touch_session,
+    UsageKind, UsageSource, active_triggers, bump_epoch, count_tokens, insight_term_docs,
+    list_children, list_entries, mark_seen_with_tokens, node_content, record_usages,
+    search_fts_channels, seen_revs, seen_revs_any_epoch, session_holdout, touch_session,
 };
 
 use super::json_body;
@@ -284,11 +292,11 @@ pub use ideas::{
     IDEA_REVIEW_BUDGET, IDEA_REVIEW_EMPTY, IDEA_REVIEW_LIMIT, IDEA_REVIEW_LIMIT_MAX,
     IDEA_REVIEW_NO_ACCESS, IDEA_REVIEW_NO_SOLUTION, IDEA_REVIEW_OFF, IDEA_REVIEW_READ_ONLY,
     IDEA_REVIEW_SIMILAR_MAX, IDEA_REVIEW_STEPS, IDEA_REVIEW_UNREGISTERED, IDEA_STOP_STEMS,
-    IDEAS_REVIEW_HINT, PLAN_LINE, PLAN_LINE_NO_NEXT, SECTION_IDEAS_REVIEW,
+    IDEAS_REVIEW_HINT, PLAN_LINE, PLAN_LINE_NO_NEXT, REVIEW_QUEUE_LINE, SECTION_IDEAS_REVIEW,
 };
 use ideas::{
-    REASON_IDEA, REASON_IDEA_REVIEW, digest_ideas, ideas_enabled, ideas_section_head, plan_line,
-    review_pack, review_shown_line, solution_ideas_mode,
+    QueueLine, REASON_IDEA, REASON_IDEA_REVIEW, digest_ideas, ideas_enabled, ideas_section_head,
+    plan_line, queue_mark, review_pack, review_shown_line, solution_ideas_mode,
 };
 #[cfg(feature = "test-hooks")]
 pub use ideas::{
@@ -518,6 +526,11 @@ pub struct RecallReq {
     /// Идей в пакете `idea_review` (M6.5 §7): 1..=[`IDEA_REVIEW_LIMIT_MAX`], иначе 400; нет —
     /// [`IDEA_REVIEW_LIMIT`]. У прочих событий не действует.
     limit: Option<u32>,
+    /// `post_tool` (M7.1 §4.6 п. 3): имена каталогов из аргументов команды (их шлёт хук `zam`,
+    /// `zam_core::shell::path_words`) — в покрытие слов ошибки не идут; берутся первые
+    /// [`PATH_WORDS_MAX`] (тот же предел, что у клиента), без учёта регистра. У прочих событий не
+    /// действует.
+    path_words: Option<Vec<String>>,
 }
 
 /// Единица предела вывода: символы (Claude Code) или байты UTF-8 (Codex).
@@ -877,14 +890,22 @@ fn entry_ref(e: &Entry) -> String {
     format!("{}:{}", e.kind.ref_letter(), e.id)
 }
 
+/// Заголовок записи в подсказке агенту — без секретов (задача 5 M7.1, спецификация M7 §4.3.1
+/// п. 5): `/recall` — текст для агента (WebUI его не зовёт), поэтому маска — для любого
+/// принципала, как [`masked_clip`] с M4 **[решение исполнителя, задача 5]**.
+fn hint_title(title: &str) -> String {
+    crate::api::agent_view::mask(title).into_owned()
+}
+
 /// Подсказка-запись журнала.
 fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Cand {
     let kind = data_kind(e);
     let certainty = certainty_str(e.certainty);
     let reference = entry_ref(e);
+    let title = hint_title(&e.title);
     let block = hint_line(
         lead,
-        &e.title,
+        &title,
         &[kind.as_str(), certainty.as_deref().unwrap_or_default()],
         &reference,
     );
@@ -897,7 +918,7 @@ fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Can
         rev: e.rev,
         reference,
         kind: e.kind.as_str(),
-        title: e.title.clone(),
+        title,
         certainty,
         reason,
         block,
@@ -906,12 +927,14 @@ fn entry_cand(target: usize, e: &Entry, reason: &'static str, lead: &str) -> Can
 }
 
 /// Подсказка-индекс записи журнала (M6 §8: changelog и revisit): `<ссылка> «<заголовок>» · Nt`,
-/// `N` — размер записи (заголовок и тело) счётчиком выдачи: агент решает, читать ли её.
+/// `N` — размер записи (заголовок и тело) счётчиком выдачи: агент решает, читать ли её
+/// (оценка по исходнику: маска меняет его на единицы токенов, а скан тела на горячем пути
+/// подсказок не нужен).
 fn index_cand(target: usize, e: &Entry, reason: &'static str) -> Cand {
     let mut c = entry_cand(target, e, reason, "");
     let size = count_tokens(&format!("{}\n\n{}", e.title, e.body));
-    // заголовок — до `SOLUTION_ROOT_L0_TOKENS`, как L0 корня (ревью 8a, M3)
-    let title = one_line(&e.title);
+    // заголовок — до `SOLUTION_ROOT_L0_TOKENS`, как L0 корня (ревью 8a, M3); без секретов
+    let title = one_line(&c.title);
     let cap = zam_store::budget_cap(SOLUTION_ROOT_L0_TOKENS);
     let (title, _) = truncate_marked(&title, cap, &count_tokens);
     c.block = format!("{} «{title}» · {size}t", c.reference);
@@ -1320,7 +1343,8 @@ fn environment_block(m: &zam_store::VaultMeta) -> String {
     parts.extend(field("purpose"));
     parts.extend(field("address"));
     parts.extend(field("limits").map(|l| format!("ограничения: {l}")));
-    let mut s = format!("ZeroAIMemory: {}", one_line(&m.title));
+    // имя записи — тоже без секретов (задача 5 M7.1): его задаёт автор
+    let mut s = format!("ZeroAIMemory: {}", one_line(&hint_title(&m.title)));
     if !parts.is_empty() {
         s.push_str(&format!(" — {}", parts.join("; ")));
     }
@@ -1372,7 +1396,7 @@ async fn environment_cands(
             rev: m.rev,
             reference: format!("v:{}", m.id),
             kind: "vault",
-            title: m.title.clone(),
+            title: hint_title(&m.title),
             certainty: None,
             reason: REASON_ENVIRONMENT,
             block: environment_block(m),
@@ -1965,7 +1989,7 @@ async fn brief_search(
         else {
             continue;
         };
-        let title = it["title"].as_str().unwrap_or_default().to_string();
+        let title = hint_title(it["title"].as_str().unwrap_or_default());
         let reference = format!("i:{id}");
         let ik = it["insight_kind"].as_str().unwrap_or_default();
         let block = hint_line(
@@ -2114,9 +2138,10 @@ async fn file_cands(
                     } else {
                         ""
                     };
+                    let title = hint_title(&it.title);
                     let block = hint_line(
                         &format!("файл {}: ", pr.path),
-                        &it.title,
+                        &title,
                         &[kind, stale],
                         &it.id,
                     );
@@ -2126,7 +2151,7 @@ async fn file_cands(
                         rev: 0,
                         reference: it.id.clone(),
                         kind,
-                        title: it.title.clone(),
+                        title,
                         certainty: None,
                         reason: REASON_FILE,
                         block,
@@ -2712,12 +2737,8 @@ async fn term_cands(
             }
             let reference = format!("t:{}", t.id);
             let def = zam_markdown::mask_text(&one_line(&t.definition));
-            let block = hint_line(
-                "термин ",
-                &format!("«{}» — {def}", t.title),
-                &[],
-                &reference,
-            );
+            let title = hint_title(&t.title);
+            let block = hint_line("термин ", &format!("«{title}» — {def}"), &[], &reference);
             out.push(Cand {
                 target: i,
                 tref: TargetRef {
@@ -2727,7 +2748,7 @@ async fn term_cands(
                 rev: t.rev,
                 reference,
                 kind: "term",
-                title: t.title.clone(),
+                title,
                 certainty: None,
                 reason: REASON_GLOSSARY,
                 block,
@@ -2882,9 +2903,10 @@ async fn error_hints(
             taken.insert(tref);
             let reference = format!("i:{}", row.entry_id);
             let certainty = certainty_str(row.certainty);
+            let title = hint_title(&row.title);
             let block = hint_line(
                 lead,
-                &row.title,
+                &title,
                 &[
                     row.insight_kind.as_str(),
                     certainty.as_deref().unwrap_or_default(),
@@ -2897,7 +2919,7 @@ async fn error_hints(
                 rev: 0,
                 reference,
                 kind: "insight",
-                title: row.title.clone(),
+                title,
                 certainty,
                 reason: "error_regex",
                 block,
@@ -2906,11 +2928,10 @@ async fn error_hints(
         }
     }
 
-    // 2. FTS по insight по нормализованной ошибке
-    let normalized = normalize_error(raw);
+    // 2. FTS по insight по нормализованной ошибке; строка `Exit code <N>` агента — служебная
+    // (M7.1 §4.6 п. 3)
+    let normalized = normalize_error(strip_exit_header(raw));
     let terms = error_terms(&normalized);
-    // порог покрытия ослабленного FTS — `recall.post_tool_coverage` (M6 §9)
-    let cover = CoverageQuery::new(&terms, rule);
     if out.len() < POST_TOOL_MAX && !terms.is_empty() {
         let mut hits: Vec<(f64, usize, zam_store::FtsHit, bool)> = Vec::new();
         for (i, t) in targets.iter().enumerate() {
@@ -2944,6 +2965,13 @@ async fn error_hints(
         }
         // bm25: меньше — лучше (слияние баз — по сырому баллу, как в поиске)
         hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // порог покрытия ослабленного FTS — `recall.post_tool_coverage` (M6 §9) по предметным
+        // словам ошибки (M7.1 §4.6 п. 3); нужен, только если ослабленный запрос что-то нашёл
+        let cover = if hits.iter().any(|h| h.3) {
+            Some(subject_cover(req, rule, &normalized, targets, health, deadline).await)
+        } else {
+            None
+        };
         for (_, i, h, relaxed) in hits {
             if out.len() >= POST_TOOL_MAX {
                 break;
@@ -2954,15 +2982,20 @@ async fn error_hints(
             if taken.contains(&h.target) {
                 continue;
             }
-            if relaxed && !cover.enough(&format!("{}\n{}", e.title, h.text)) {
+            if relaxed
+                && !cover
+                    .as_ref()
+                    .is_some_and(|c| c.enough(&format!("{}\n{}", e.title, h.text)))
+            {
                 continue;
             }
             taken.insert(h.target);
             let reference = format!("i:{}", h.target.id);
             let kind = e.insight_kind.clone().unwrap_or_default();
+            let title = hint_title(&e.title);
             let block = hint_line(
                 lead,
-                &e.title,
+                &title,
                 &[kind.as_str(), e.certainty.as_deref().unwrap_or_default()],
                 &reference,
             );
@@ -2972,7 +3005,7 @@ async fn error_hints(
                 rev: h.rev,
                 reference,
                 kind: "insight",
-                title: e.title.clone(),
+                title,
                 certainty: e.certainty.clone(),
                 reason: "error_fts",
                 block,
@@ -2981,6 +3014,82 @@ async fn error_hints(
         }
     }
     Ok(out)
+}
+
+/// Покрытие `post_tool` по предметным словам ошибки (M7.1 §4.6 п. 3,
+/// [`CoverageQuery::subject`]): слова `normalized` без служебных фраз
+/// ([`subject_error_terms`]), без имён каталогов из команды (`path_words` запроса) и без частых слов —
+/// [`is_common`] по документной частоте среди действующих insight области поиска (пространства
+/// решения и Knowledge живых целей, [`insight_term_docs`]); коды ошибок не снимаются.
+/// `recall.post_tool_coverage.common_pct = 100` — частота не считается. Сбой чтения частоты (WARN
+/// в журнал) или срок сбора — без частых слов, как при `common_pct = 100`: подсказка не
+/// теряется из-за вспомогательного запроса.
+async fn subject_cover(
+    req: &RecallReq,
+    rule: &CoverageRule,
+    normalized: &str,
+    targets: &[SearchTarget],
+    health: &Health<'_>,
+    deadline: &mut Deadline,
+) -> CoverageQuery {
+    let terms = subject_error_terms(normalized);
+    let path: HashSet<String> = req
+        .path_words
+        .iter()
+        .flatten()
+        .take(PATH_WORDS_MAX)
+        .map(|w| w.to_lowercase())
+        .collect();
+    let counted: Vec<String> = terms
+        .iter()
+        .filter(|t| !is_error_code(t) && !path.contains(*t))
+        .cloned()
+        .collect();
+    let mut common: HashSet<String> = HashSet::new();
+    if rule.common_pct < 100 && !counted.is_empty() {
+        let (mut docs, mut df) = (0usize, vec![0usize; counted.len()]);
+        let mut complete = true;
+        for (i, t) in targets.iter().enumerate() {
+            let spaces = entry_spaces(t);
+            if spaces.is_empty() || !health.alive[i] {
+                continue;
+            }
+            let statuses = vec!["active".to_string(), "revisit".to_string()];
+            let step = insight_term_docs(&t.db, spaces, statuses, counted.clone());
+            match deadline.step(step).await {
+                Some(Ok(td)) => {
+                    docs += td.docs;
+                    df.iter_mut().zip(td.df).for_each(|(a, b)| *a += b);
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "post_tool: частота слов ошибки не прочитана — покрытие без частых слов"
+                    );
+                    complete = false;
+                    break;
+                }
+                None => {
+                    tracing::warn!(
+                        reason = "recall timeout",
+                        "post_tool: частота слов ошибки не посчитана до срока сбора — покрытие без \
+                         частых слов"
+                    );
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            common = counted
+                .iter()
+                .zip(df)
+                .filter(|(_, n)| is_common(*n, docs, rule.common_pct))
+                .map(|(t, _)| t.clone())
+                .collect();
+        }
+    }
+    CoverageQuery::subject(&terms, rule, |t| path.contains(t) || common.contains(t))
 }
 
 /// Ключ показа подсказки в `session_seen`.
@@ -3020,29 +3129,57 @@ async fn shown(
     }
 }
 
-/// Учёт показа: `session_seen` (с касанием сессии) и выданные токены `session_tokens`
-/// (M4.5 §9.5) одной транзакцией базы сессии, `usage` в базах целей. Сбой — WARN.
+/// Отметки показа ответа в `session_seen` ([`record`]): подсказки записей — часть
+/// [`RECALL_PART`] с ревизией записи (без строк файлов и окружения). Показ очереди разбора (M7.1
+/// §4.5 п. 1) — отметка [`queue_mark`] с числом идей очереди: у строки очереди `prompt` (`line`) —
+/// вместо отметки подсказки (строка — об очереди, а не показ идеи: подсказка-идея по близости к
+/// запросу для её первой идеи остаётся), у раздела `### Идеи на разбор` дайджеста
+/// (`digest_queue` — длина очереди) — вместе с отметками его идей.
+fn seen_items(
+    targets: &[SearchTarget],
+    shown: &[&Cand],
+    line: Option<&QueueLine>,
+    digest_queue: Option<usize>,
+) -> Vec<SeenItem> {
+    let is_line = |c: &Cand| line.is_some_and(|q| q.is(c));
+    let queue = match (line, digest_queue) {
+        (Some(q), _) => shown
+            .iter()
+            .find(|c| is_line(c))
+            .map(|c| queue_mark(targets, c, q.total)),
+        (None, Some(n)) => shown
+            .iter()
+            .find(|c| c.reason == REASON_IDEA_REVIEW)
+            .map(|c| queue_mark(targets, c, n)),
+        (None, None) => None,
+    };
+    shown
+        .iter()
+        .filter(|c| c.reason != REASON_FILE && c.reason != REASON_ENVIRONMENT && !is_line(c))
+        .map(|c| SeenItem {
+            key: seen_key(targets, c),
+            rev: c.rev,
+        })
+        .chain(queue)
+        .collect()
+}
+
+/// Учёт показа: `session_seen` (с касанием сессии; отметки — [`seen_items`]) и выданные токены
+/// `session_tokens` (M4.5 §9.5) одной транзакцией базы сессии, `usage` в базах целей. Сбой — WARN.
 async fn record(
     s: Option<&RequestSession>,
     targets: &[SearchTarget],
     user: Id,
     event: Event,
     shown: &[&Cand],
+    items: &[SeenItem],
     tokens: &[TokenCount],
 ) {
     if let Some(s) = s {
-        let items: Vec<SeenItem> = shown
-            .iter()
-            .filter(|c| c.reason != REASON_FILE && c.reason != REASON_ENVIRONMENT)
-            .map(|c| SeenItem {
-                key: seen_key(targets, c),
-                rev: c.rev,
-            })
-            .collect();
         let r = if items.is_empty() && tokens.is_empty() {
             touch_session(&s.db, &s.touch).await
         } else {
-            mark_seen_with_tokens(&s.db, &s.touch, &items, tokens).await
+            mark_seen_with_tokens(&s.db, &s.touch, items, tokens).await
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "recall: учёт сессии не выполнен");
@@ -3599,9 +3736,9 @@ pub async fn recall(
     };
     let review = mode == IdeasMode::Review;
     let mut idea_cands: Vec<Cand> = Vec::new();
-    // строка очереди разбора к `prompt` (M6.6 §3.5): свой отбор показанного — по эпохе и
-    // ревизии ([`ideas::review_queue_head`]), а не общий фильтр идей «любая эпоха»
-    let mut queue_cands: Vec<Cand> = Vec::new();
+    // строка очереди разбора к `prompt` (M7.1 §4.5 п. 1): свой учёт показа — раз за эпоху
+    // ([`ideas::review_queue_line`]), а не общий фильтр идей «любая эпоха»
+    let mut queue_line: Option<QueueLine> = None;
     let (mut lines, sections, repeatable) = match req.event {
         _ if !enabled => (Lines::default(), Vec::new(), true),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
@@ -3633,7 +3770,7 @@ pub async fn recall(
             let (h, d) = (&mut health, &mut deadline);
             let (secs, queue) =
                 prompt_sections(&st, &p, &sh, &req, s, ideas_on, review, h, d).await?;
-            queue_cands = queue;
+            queue_line = queue;
             (Lines::default(), secs, false)
         }
         Event::PostTool => {
@@ -3695,14 +3832,13 @@ pub async fn recall(
             (*title, chosen)
         })
         .collect();
-    // строка очереди — последним разделом `prompt`, показанное уже отсеяно своим правилом
-    if !queue_cands.is_empty() {
-        let per = section_limit(req.event, None, &queue_cands, limit, ideas_max, entries);
-        let queue: Vec<&Cand> = queue_cands
-            .iter()
+    // строка очереди — последним разделом `prompt`, показанное уже отсеяно своим правилом;
+    // первая идея строки уже идёт подсказкой-идеей — строка ждёт следующего запроса (её показ
+    // не отмечается)
+    if let Some(q) = &queue_line {
+        let queue: Vec<&Cand> = std::iter::once(&q.cand)
             .filter(|c| health.alive[c.target])
             .filter(|c| dup.insert(c.tref))
-            .take(per)
             .collect();
         chosen.push((None, queue));
     }
@@ -3726,7 +3862,7 @@ pub async fn recall(
     let (mut packed, mut picked) = arrange(recovery, rules_reserved, lines, ideas, chosen);
     // строка очереди, снятая пределом вывода канала, — с адресом очереди, а не общим «строк:
     // 1 (memory_recall)» (ревью задачи 14, M2)
-    let is_queue = |c: &Cand| queue_cands.iter().any(|q| std::ptr::eq(c, q));
+    let is_queue = |c: &Cand| queue_line.as_ref().is_some_and(|q| q.is(c));
     if let Some(si) = picked.iter().position(|p| p.iter().any(|c| is_queue(c))) {
         packed[si].omit = Some((OMIT_REVIEW_QUEUE.0.into(), OMIT_REVIEW_QUEUE.1.into()));
     }
@@ -3818,12 +3954,16 @@ pub async fn recall(
                 });
             }
         }
+        // показ очереди разбора дайджеста — длина очереди его раздела (M7.1 §4.5 п. 1)
+        let digest_queue = (req.event == Event::SessionStart).then_some(review_total);
+        let seen = seen_items(&targets, &shown_now, queue_line.as_ref(), digest_queue);
         record(
             session.as_ref(),
             &targets,
             user,
             req.event,
             &shown_now,
+            &seen,
             &tokens,
         )
         .await;

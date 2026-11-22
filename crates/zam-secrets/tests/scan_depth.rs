@@ -1,53 +1,55 @@
 //! Счётчик повторов скана и упор в `FIXPOINT_MAX` (задача 15b M6, долг M5.6): упор больше не
 //! молчит — [`scan_secrets_ext`] возвращает `passes` и `depth_capped`.
 //!
-//! Вход, на котором скан упирается в предел, подобран генератором [`generate_depth_capped`]
-//! (эволюционный перебор склеек атомов `common::atoms` и минимизация) и закреплён фикстурой
-//! `fixtures/scan_depth_capped.txt` — шаблоном `common::expand` (секреты в файле не хранятся:
-//! GitHub push protection). Цепочка находок на нём (``x://pwd=:`/<40>@pwd=://<20>"pwd=:`@``):
+//! Вход, на котором скан правил M6 упирался в предел, подобран генератором
+//! [`generate_depth_capped`] (эволюционный перебор склеек атомов `common::atoms` и минимизация) и
+//! закреплён фикстурой `fixtures/scan_depth_capped.txt` — шаблоном `common::expand` (секреты в
+//! файле не хранятся: GitHub push protection). Цепочка находок на нём правилами M6
+//! (``x://pwd=:`/<40>@pwd=://<20>"pwd=:`@``):
 //! 0. ключ-значение — значение второго `pwd=` (`://<20>`, до `"`);
 //! 1. энтропия `/<40>` — в URL-токене больше нет `://`;
 //! 2. пароль в URL `x://pwd=:` — пароль `` `‹secret›`` (в тексте мешал `/`);
 //! 3. ключ-значение первого `pwd=` — значение `:‹secret›@…` (в тексте `:` до `` ` `` — короче 6);
 //! 4. пароль в URL — `` ` `` последнего ``pwd=:`@`` (имя пользователя теперь без `:`);
-//! 5. ключ-значение последнего `pwd=` — снова; звено ``"pwd=:`@`` удлиняет цепочку на два
+//! 5. ключ-значение последнего `pwd=` — снова; звено ``"pwd=:`@`` удлиняло цепочку на два
 //!    повтора.
+//!
+//! С задачи 3 M7.1 значение ключа не заходит в метку `‹`: шаг 3 не находится, цепочка кончается
+//! на шаге 2 (три повтора, последний пуст), без упора. Упор же (если обычные повторы где-то не
+//! сойдутся) расширяет находки — маскировка идемпотентна всегда (юнит-тест крейта
+//! `widening_reaches_fixpoint_at_any_limit`).
 
 mod common;
 
-use common::{MARK, atoms, corpus, expand};
-use zam_secrets::{FIXPOINT_MAX, mask_text, scan_secrets, scan_secrets_ext};
+use common::{atoms, corpus, expand};
+use zam_secrets::{mask_text, scan_secrets, scan_secrets_ext};
 
-/// Закреплённый вход упора (шаблон фикстуры, раскрытый).
+/// Закреплённый вход упора правил M6 (шаблон фикстуры, раскрытый).
 fn depth_capped_input() -> String {
     let t = include_str!("fixtures/scan_depth_capped.txt");
     expand(t.trim_end_matches(['\r', '\n']))
 }
 
-/// Вход генератора упирается в предел: все [`FIXPOINT_MAX`] повторов дали находки, и
-/// проверочный повтор тоже; находки — те же, что у `scan_secrets`.
+/// Задача 3 M7.1: цепочка «пароль в URL ↔ ключ-значение» фикстуры больше не упирается в предел —
+/// скан доходит до неподвижной точки без предупреждения `secrets_scan_depth`, маскировка
+/// идемпотентна, значения фикстуры (`{rnd:40:101}`, `{rnd:20:301}`) скрыты. Звенья цепочки
+/// сверх фикстуры ничего не меняют.
 #[test]
-fn scan_depth_capped() {
+fn scan_depth_capped_no_warning() {
     let t = depth_capped_input();
-    let o = scan_secrets_ext(&t);
-    assert!(o.depth_capped, "упор не обнаружен: passes = {}", o.passes);
-    assert_eq!(o.passes, FIXPOINT_MAX);
-    assert_eq!(
-        o.hits,
-        scan_secrets(&t),
-        "проверочный повтор не меняет находок"
-    );
-    // признак честный: маскировка на таком входе не идемпотентна; «золотые» результаты —
-    // первая маскировка оставляет последнее звено `:`…`@` открытым, вторая закрывает его
-    let once = mask_text(&t);
-    assert_eq!(once, format!("x://pwd={MARK}\"pwd=:{MARK}@"), "{t}");
-    assert_eq!(mask_text(&once), format!("x://pwd={MARK}\"pwd={MARK}"));
-    // на звено короче — ровно предел, без упора: проверочный повтор ничего не нашёл
-    let short = t
-        .strip_suffix("\"pwd=:`@")
-        .expect("звено цепочки в конце фикстуры");
-    let o = scan_secrets_ext(short);
-    assert_eq!((o.passes, o.depth_capped), (FIXPOINT_MAX, false), "{short}");
+    let secrets = [common::rnd(40, 101), common::rnd(20, 301)];
+    for links in 0..4 {
+        let t = format!("{t}{}", "\"pwd=:`@".repeat(links));
+        let o = scan_secrets_ext(&t);
+        assert!(!o.depth_capped, "упор: passes = {}, {t}", o.passes);
+        assert!(o.passes <= 3, "{} повторов: {t}", o.passes);
+        assert_eq!(o.hits, scan_secrets(&t));
+        let once = mask_text(&t);
+        assert_eq!(mask_text(&once), once, "не идемпотентна: {t}");
+        for s in &secrets {
+            assert!(!once.contains(s.as_str()), "{once}");
+        }
+    }
 }
 
 /// Обычные входы (корпус тестов сканера) укладываются в 3 повтора и не упираются в предел.
@@ -79,9 +81,12 @@ fn passes_counted() {
 
 /// Генератор входа упора: эволюционный перебор склеек атомов (вставка, удаление, замена,
 /// перестановка, повтор куска, скрещивание; приспособленность — число повторов, упор — цель) и
-/// минимизация найденного удалением токенов (delta debugging). Печатает шаблон для фикстуры.
-/// Случайный перебор без отбора до упора не доходит: на 4,6 млн склеек до 24 атомов — 12 входов
-/// с тремя повторами и ни одного с четырьмя. `cargo test -p zam-secrets --release --test
+/// минимизация найденного удалением токенов (delta debugging). Печатает больше всего повторов,
+/// которых достиг поиск, и, если нашёлся упор, — шаблон для фикстуры. Случайный перебор без
+/// отбора до упора не доходит: на 4,6 млн склеек до 24 атомов — 12 входов с тремя повторами и ни
+/// одного с четырьмя (правила M6). Задача 3 M7.1: генератор нашёл упоры на первых редакциях новых
+/// правил (левая граница слова-ключа проверкой после совпадения, первый `response` Digest) — они
+/// исправлены, итог прогонов — журнал этапа. `cargo test -p zam-secrets --release --test
 /// scan_depth -- --ignored generate_depth_capped --nocapture`.
 #[test]
 #[ignore]
@@ -89,12 +94,16 @@ fn generate_depth_capped() {
     let atoms = atoms();
     let na = atoms.len();
     let tpl = |v: &[usize]| v.iter().map(|&i| atoms[i].as_str()).collect::<String>();
+    // приспособленность и число повторов входа
     let score = |t: &str| {
         let o = scan_secrets_ext(&expand(t));
-        i64::from(o.passes) * 10 + if o.depth_capped { 100 } else { 0 }
+        let f = i64::from(o.passes) * 10 + if o.depth_capped { 100 } else { 0 };
+        (f, o.passes)
     };
     // перезапуски с новым зерном: отбор иногда застревает на трёх повторах
     let mut found = None;
+    // лучший вход всех перезапусков: (повторов, шаблон) — итог поиска, если упора нет
+    let mut best: (u32, String) = (0, String::new());
     for restart in 0..64u64 {
         if found.is_some() {
             break;
@@ -109,7 +118,7 @@ fn generate_depth_capped() {
         let mut pop: Vec<(i64, Vec<usize>)> = (0..200)
             .map(|_| {
                 let v: Vec<usize> = (0..6 + r(12)).map(|_| r(na)).collect();
-                (score(&tpl(&v)), v)
+                (score(&tpl(&v)).0, v)
             })
             .collect();
         for _ in 0..300_000 {
@@ -147,7 +156,12 @@ fn generate_depth_capped() {
             if v.len() > 40 {
                 continue;
             }
-            let f = score(&tpl(&v)) - v.len() as i64 / 8;
+            let t = tpl(&v);
+            let (f, passes) = score(&t);
+            let f = f - v.len() as i64 / 8;
+            if passes > best.0 {
+                best = (passes, t);
+            }
             let (i, j) = (r(pop.len()), r(pop.len()));
             let w = if pop[i].0 < pop[j].0 { i } else { j };
             if f >= pop[w].0 {
@@ -159,7 +173,11 @@ fn generate_depth_capped() {
             }
         }
     }
-    let found = found.expect("упор не найден");
+    println!("больше всего повторов: {} — {}", best.0, best.1);
+    let Some(found) = found else {
+        println!("упор не найден");
+        return;
+    };
     // минимизация: токены — шаблоны `{…}` и отдельные символы
     let mut toks: Vec<String> = Vec::new();
     let mut rest = found.as_str();

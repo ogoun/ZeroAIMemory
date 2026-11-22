@@ -174,6 +174,9 @@ struct Shared {
     /// Тест: мягкий срок разбора внутри процесса, мс (`u64::MAX` — 80 % `docs.timeout_ms`).
     #[cfg(feature = "test-hooks")]
     soft_ms: AtomicU64,
+    /// Тест: пауза процесса перед разбором `extract`, мс (0 — нет).
+    #[cfg(feature = "test-hooks")]
+    extract_stall_ms: AtomicU64,
 }
 
 /// Пул рабочих процессов разбора документов.
@@ -402,6 +405,17 @@ impl DocPool {
             .soft_ms
             .store(ms.unwrap_or(u64::MAX), Ordering::SeqCst);
     }
+
+    /// Тест: процесс стоит `ms` мс перед разбором каждого следующего `extract` (`None` — без
+    /// паузы). Процесс гарантированно ещё разбирает файл, когда тест его убивает: исход не
+    /// зависит от скорости сборки (в release разбор успевал до `kill`, журнал M5.5).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_extract_stall_ms(&self, ms: Option<u64>) {
+        self.shared
+            .extract_stall_ms
+            .store(ms.unwrap_or(0), Ordering::SeqCst);
+    }
 }
 
 /// Ответ на `Extract { kind }`: извлечение того же вида. Другой вид — процесс ответил не на
@@ -460,6 +474,8 @@ fn body_of(op: &Op, s: &Settings, shared: &Shared) -> Vec<u8> {
                 kind: kind.as_str().into(),
                 limits: WireLimits::from(&s.limits),
                 soft_ms,
+                #[cfg(feature = "test-hooks")]
+                stall_ms: shared.extract_stall_ms.load(Ordering::SeqCst),
                 bytes: Cow::Borrowed(""),
             },
             Some(bytes),

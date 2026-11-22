@@ -202,6 +202,45 @@ fn first_paragraph_plain_text() {
     assert_eq!(first_paragraph(src, &parse(src)), None);
 }
 
+/// Авто-L0 без значений (круг правок 2 задачи 5 M7.1): исходные строки абзаца маскируются до
+/// разбора — флаг в инлайн-коде (`mysql -p…`, `curl -u`, `Authorization: Bearer`) не выходит
+/// открытым; абзац без секретов — тот же текст, что у [`first_paragraph`].
+#[test]
+fn first_paragraph_masked_hides_flags_in_inline_code() {
+    // фиктивный пароль собирается из частей (push protection)
+    let pw = ["S3c", "ret", "9x"].concat();
+    for (src, want) in [
+        (
+            format!("---\nl0: x\n---\n# Доступ к БД\n\nПодключение: `mysql -uroot -p{pw} prod`.\n"),
+            "Подключение: mysql -uroot -p‹secret› prod.",
+        ),
+        (
+            format!("# API\n\nЗапрос `curl -u admin:{pw} https://example.com/x` возвращает 200.\n"),
+            "Запрос curl -u admin:‹secret› https://example.com/x возвращает 200.",
+        ),
+        (
+            format!("# H\n\nЗаголовок `Authorization: Bearer {pw}abcdef` для теста.\r\n"),
+            "Заголовок Authorization: Bearer ‹secret› для теста.",
+        ),
+    ] {
+        let doc = parse(&src);
+        let raw = first_paragraph(&src, &doc).unwrap();
+        assert!(raw.contains(&pw), "без маски — исходник: {raw}");
+        assert_eq!(
+            zam_markdown::first_paragraph_masked(&src, &doc).as_deref(),
+            Some(want)
+        );
+    }
+    let src = "# Заголовок\n\nПервый **жирный** и [ссылка](a.md)\nвторая строка.\n\nВторой.\n";
+    let doc = parse(src);
+    assert_eq!(
+        zam_markdown::first_paragraph_masked(src, &doc),
+        first_paragraph(src, &doc)
+    );
+    let src = "# Только заголовок\n";
+    assert_eq!(zam_markdown::first_paragraph_masked(src, &parse(src)), None);
+}
+
 #[test]
 fn preamble_only_when_non_empty() {
     assert_eq!(parse("\n\n# A\n").sections[0].level, 1);

@@ -11,6 +11,15 @@
 //!   от верхнего; если такого полного пути нет, подходит **хвост** пути (`Тесты` для
 //!   `Сборка > Тесты`), когда он однозначен **[решение исполнителя, проверка на стенде M4]**;
 //! - `rev=N` → старая ревизия.
+//!
+//! **Агенту по токену** (задача 5 M7.1, спецификация M7 §4.3.1 п. 2, [`crate::api::agent_view`])
+//! все виды — по тексту ревизии с `‹secret›` вместо значений секретов: маска всей ревизии до
+//! секции и L1, HTML — маска до рендера (свой ключ кэша рендера), `node.frontmatter`
+//! (`description`, `tags`, `l0`) и L0 — тоже; оглавление — по маскированному тексту. Текст для
+//! правки (`md`, `json`, L1, оглавление) — вид с метками `‹secret-T-N›` (M7 §4.3.2, круги правок
+//! 3–5 задачи 6), HTML — метки без номеров. `ETag` у
+//! `format=md` — по-прежнему `"<rev>"`: это ревизия для `If-Match` записи, и у маски она та же.
+//! Сессии WebUI — исходник.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
@@ -25,6 +34,7 @@ use zam_markdown::{
 };
 use zam_store::{NodeKind, NodePath, get_node_by_path, node_content};
 
+use crate::api::agent_view;
 use crate::api::query;
 use crate::api::render::{RenderCtx, Viewer, cache_get, cache_key, render, render_cached};
 use crate::api::scope::{Mode, NodeScope, live, node_scope, space_scope};
@@ -123,8 +133,19 @@ pub async fn outline(
     if sc.node.kind == NodeKind::Folder {
         return Ok(Json(Vec::new()));
     }
-    let (_, text) = node_content(&sc.db, sc.node.id, None).await?;
+    let (rev, text) = node_content(&sc.db, sc.node.id, None).await?;
+    // агенту — заголовки нумерованного вида (`‹secret-T-N›`: по ним агент адресует секции `PATCH`);
+    // T — ревизии прочитанного текста, а не снимка узла: запись между ними не сдвинет нумерацию
+    // под чужой T (финальное ревью M7.1, M-1)
+    let tag = agent_view::object_tag(&sc.node.id, rev);
+    let text = agent_view::edit_view_owned(&p, tag, text).await?;
     Ok(Json(doc_outline(&parse(&text))))
+}
+
+/// Ключ кэша рендера текста с маской: свой у агента (у `Viewer::Member` токена и сессии
+/// участника вид один — различает их только ключ), меняется с версией правил сканера.
+fn masked_key(hash: &str) -> String {
+    format!("{hash}#m{}", zam_markdown::secrets::RULES_VERSION)
 }
 
 async fn read(
@@ -142,18 +163,29 @@ async fn read(
         space: sc.space.id,
         viewer: Viewer::of(st, p, sc.owner, sc.role),
     };
+    let mask = agent_view::masks(p);
     if tier == Tier::L0 {
-        return Ok(Json(json!({ "l0": node.l0, "rev": node.current_rev })).into_response());
+        let l0 = node.l0.as_deref().map(|s| agent_view::view(p, s));
+        return Ok(Json(json!({ "l0": l0, "rev": node.current_rev })).into_response());
     }
+    let node_v = agent_view::node_json(p, node)?;
     if node.kind == NodeKind::Folder {
         return match (tier, format) {
             (Tier::L2, Format::Json) => {
-                Ok(Json(json!({ "node": node, "content": null, "rev": 0 })).into_response())
+                Ok(Json(json!({ "node": node_v, "content": null, "rev": 0 })).into_response())
             }
             _ => Err(ApiError::BadRequest("узел — папка: текста нет".into())),
         };
     }
     let current = q.rev.is_none_or(|r| r == node.current_rev);
+    // ключ кэша HTML: у маски — свой (`masked_key`)
+    let shown_key = |hash: &str| {
+        if mask {
+            masked_key(hash)
+        } else {
+            hash.to_string()
+        }
+    };
 
     // Попадание в кэш HTML текущей ревизии — без чтения текста.
     if tier == Tier::L2
@@ -161,7 +193,10 @@ async fn read(
         && q.section.is_none()
         && current
         && let Some(hash) = &node.content_hash
-        && let Some(r) = cache_get(st, &cache_key(st, hash, sc.space.id, sc.owner, ctx.viewer))
+        && let Some(r) = cache_get(
+            st,
+            &cache_key(st, &shown_key(hash), sc.space.id, sc.owner, ctx.viewer),
+        )
     {
         return Ok(html_json(&r, node.current_rev));
     }
@@ -170,6 +205,16 @@ async fn read(
     // дала бы текст rev N+1 при `node`/хэше rev N (и отравила бы кэш HTML).
     let (rev, text) =
         node_content(&sc.db, node.id, Some(q.rev.unwrap_or(node.current_rev))).await?;
+    // хэш ключа кэша HTML — по прочитанному исходнику (`content_hash` ревизии), до маски
+    let hash = (format == Format::Html && q.section.is_none()).then(|| key_hash(node, rev, &text));
+    // агенту — маска всей ревизии до секции, L1 и рендера: текст для правки (`md`, `json`, L1)
+    // текущей ревизии — вид с метками `‹secret-T-N›` (M7 §4.3.2 п. 1); HTML и старая ревизия
+    // (`rev=N`: номера действуют только у текущей, круг правок 4) — метки без номеров
+    let text = if (format == Format::Html && tier == Tier::L2) || rev != node.current_rev {
+        agent_view::view_owned(p, text).await?
+    } else {
+        agent_view::edit_view_owned(p, agent_view::object_tag(&node.id, rev), text).await?
+    };
     let (text, whole) = match q.section.as_deref() {
         Some(path) => (section_slice(&text, path)?.to_string(), false),
         None => (text, true),
@@ -179,10 +224,12 @@ async fn read(
     }
     Ok(match format {
         Format::Md => markdown_response(text, rev),
-        Format::Json => Json(json!({ "node": node, "content": text, "rev": rev })).into_response(),
+        Format::Json => {
+            Json(json!({ "node": node_v, "content": text, "rev": rev })).into_response()
+        }
         Format::Html if whole => {
-            let hash = key_hash(node, rev, &text);
-            let key = cache_key(st, &hash, sc.space.id, sc.owner, ctx.viewer);
+            let hash = hash.unwrap_or_default();
+            let key = cache_key(st, &shown_key(&hash), sc.space.id, sc.owner, ctx.viewer);
             let r = render_cached(st, key, &sc.db, ctx, text).await?;
             html_json(&r, rev)
         }
@@ -196,7 +243,8 @@ fn html_json(r: &zam_markdown::Rendered, rev: i64) -> Response {
         .into_response()
 }
 
-/// Текст ревизии как есть: `text/markdown; charset=utf-8`, `ETag: "<rev>"`.
+/// Текст ревизии (агенту — с маской, её делает вызывающий): `text/markdown; charset=utf-8`,
+/// `ETag: "<rev>"` — ревизия, она же `If-Match` записи (у маски — та же).
 pub(crate) fn markdown_response(text: String, rev: i64) -> Response {
     let mut r = text.into_response();
     let h = r.headers_mut();
@@ -232,13 +280,66 @@ fn sha256_hex(b: &[u8]) -> String {
 /// кончается `path` (агент обычно знает только свой заголовок: `Тесты` вместо
 /// `Сборка > Тесты`). Нет секции → 404, путь у нескольких секций → 422.
 pub(crate) fn section_slice<'a>(text: &'a str, path: &str) -> Result<&'a str, ApiError> {
-    match resolve_section(&parse(text), path) {
+    let doc = parse(text);
+    let found = match resolve_section(&doc, path) {
+        // адрес с меткой без номера (`‹secret›` из нередактируемой выдачи) — по заголовкам, где
+        // `‹secret-N›` сравниваются как `‹secret›` (M7 §4.3.2 п. 3, круг правок 4 задачи 6)
+        SectionLookup::NotFound if plain_mark(path) => resolve_unmarked(&doc, path, true),
+        other => other,
+    };
+    match found {
         SectionLookup::Found(s) => text.get(s.range.clone()).ok_or(ApiError::NotFound),
         SectionLookup::NotFound => Err(ApiError::NotFound),
         SectionLookup::Ambiguous => Err(ApiError::Unprocessable(format!(
             "путь секции неоднозначен: {path}"
         ))),
     }
+}
+
+/// В адресе секции есть метка без номера (`‹secret›`).
+pub(crate) fn plain_mark(path: &str) -> bool {
+    zam_secrets::marks(path).any(|(_, k)| k == zam_secrets::Mark::Plain)
+}
+
+/// Секция по адресу с метками, где метки заголовков (`‹secret-N›`) и адреса сравниваются как
+/// `‹secret›` (M7 §4.3.2 п. 3): полный путь, а при `tail` и без полного — хвост пути (как у
+/// [`resolve_section`]). Одна — она, несколько — неоднозначно.
+pub(crate) fn resolve_unmarked<'a>(
+    doc: &'a zam_markdown::Doc,
+    path: &str,
+    tail: bool,
+) -> SectionLookup<'a> {
+    let want: Vec<String> = path
+        .split('>')
+        .map(|p| zam_secrets::restore::unnumbered(p.trim()).into_owned())
+        .collect();
+    if want.iter().any(String::is_empty) {
+        return SectionLookup::NotFound;
+    }
+    let same = |a: &[String], b: &[String]| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| zam_secrets::restore::unnumbered(x) == y.as_str())
+    };
+    let pick = |mut it: Box<dyn Iterator<Item = &'a zam_markdown::Section> + '_>| match (
+        it.next(),
+        it.next(),
+    ) {
+        (None, _) => None,
+        (Some(s), None) => Some(SectionLookup::Found(s)),
+        _ => Some(SectionLookup::Ambiguous),
+    };
+    let headed = || doc.sections.iter().filter(|s| s.level > 0);
+    if let Some(r) = pick(Box::new(headed().filter(|s| same(&s.path, &want)))) {
+        return r;
+    }
+    if !tail {
+        return SectionLookup::NotFound;
+    }
+    let tails = headed()
+        .filter(|s| s.path.len() > want.len() && same(&s.path[s.path.len() - want.len()..], &want));
+    pick(Box::new(tails)).unwrap_or(SectionLookup::NotFound)
 }
 
 /// L1 (§8.3): оглавление и первое предложение каждой секции — тот же `note_l1`, что

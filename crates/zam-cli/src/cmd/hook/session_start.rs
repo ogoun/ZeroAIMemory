@@ -186,7 +186,19 @@ fn digest_net(
         if let Some(j) = job {
             snapshot_queue::run(env, s, j, false);
         }
-        return local(s);
+        // нет токена для адреса — одна строка и агенту, иначе сбой не виден (M-4)
+        return match env.missing_token_note() {
+            Some(note) if s.on(Kind::SessionStart) => {
+                let tail = summary(s);
+                let text = if tail.trim().is_empty() {
+                    note
+                } else {
+                    format!("{note}\n\n{}", tail.trim())
+                };
+                Output::context(&inp.event, &text)
+            }
+            _ => local(s),
+        };
     };
     // очереди снимков, которые уходят до `/recall` (сессия снимка; после `compact` — своя)
     let first_ids: Vec<String> = job
@@ -279,7 +291,7 @@ fn digest_net(
             want_refs.then(|| cache::refresh_file_refs(env, c))
         });
         match refs.join() {
-            Ok(Some(Err(e))) => env.log(&format!("кэш file-refs не обновлён: {e}")),
+            Ok(Some(Err(e))) => env.log(&format!("кэш file-refs не обновлён ({})", e.reason())),
             Err(_) => env.log("files/changed, file-refs: паника"),
             _ => {}
         }
@@ -311,7 +323,7 @@ fn digest_net(
                 env.log(&format!("триггеры: предупреждение сервера: {w}"));
             }
         }
-        Ok(Err(e)) => env.log(&format!("кэш триггеров не обновлён: {e}")),
+        Ok(Err(e)) => env.log(&format!("кэш триггеров не обновлён ({})", e.reason())),
         Err(_) => env.log("кэш триггеров: паника"),
     }
     let v: Value = match recall {

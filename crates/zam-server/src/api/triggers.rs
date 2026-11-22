@@ -154,6 +154,11 @@ pub async fn list(
     }
     let k = space_of_kind(&db, SpaceKind::Knowledge).await?;
     groups.push((active_triggers(&db, &[k.id]).await?, "knowledge".into()));
+    // заголовок insight хук показывает агенту подсказкой: по токену — с маской секретов (задача 5
+    // M7.1); шаблон — как есть (это сопоставитель). ETag — по выданному
+    for t in groups.iter_mut().flat_map(|(rows, _)| rows.iter_mut()) {
+        super::agent_view::view_in_place(&p, &mut t.title);
+    }
     let items: Vec<Item> = groups
         .iter()
         .flat_map(|(rows, space)| {

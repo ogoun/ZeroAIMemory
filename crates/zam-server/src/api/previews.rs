@@ -8,8 +8,8 @@
 //!   листа в `/read` и карточках поиска (порядок листов среди единиц, `api::doc_locator`) — у
 //!   каждого листа с единицами извлечения, когда документ извлечён (иначе `null`); `header`,
 //!   `rows`, `first_row`,
-//!   `total_rows`, `cols`, `warnings`. Ячейки не маскируются: превью показывает файл, как
-//!   скачивание блоба.
+//!   `total_rows`, `cols`, `warnings`. Сессии WebUI ячейки — как в файле (превью показывает файл,
+//!   как скачивание блоба); токену — с маской секретов (ниже).
 //! - `kind=thumb&page=<N>&px=<1..=1024>` — PNG: страница PDF (pdfium) или изображение PNG, JPEG,
 //!   GIF, WebP (вид — по сигнатуре; SVG — не изображение); по умолчанию `page=1`, `px=256`.
 //! - `kind=text` — JSON: PPTX — `{format: "slides", slides: [{slide, title, text, notes}]}`;
@@ -19,6 +19,13 @@
 //!   подсвечиваются первые 64 КиБ; разметка больше 40 × исходник (`[` в JSON и т. п.) — весь
 //!   текст экранирован, `highlight_skipped: "too_large"`. HTML от рабочего процесса проверяется
 //!   (`zam_markdown::is_highlight_html`): иной — отброшен, текст экранируется здесь.
+//!
+//! **Токену** (агент: задача 5 M7.1, спецификация M7 §4.3.1 п. 7 — **[решение координатора]**)
+//! текст и ячейки — с `‹secret›` вместо значений ([`crate::api::agent_view`]): лист — маска
+//! заголовка и строк страницы при ответе (кэш страницы общий, сырой); слайды PPTX — маска текста;
+//! HTML подсветки — по маскированному тексту файла (маска всего начала файла до подсветки: по
+//! разметке маска не работает), в своём файле кэша `m<RULES_VERSION>-…`. ETag маски — свой (у
+//! листа — с суффиксом `.m<RULES_VERSION>`). Миниатюры и сам файл (`GET /blobs/…`) — как есть.
 //!
 //! Неудача построения (422) помнится: свойство файла (`parse_error`, `too_large`, `unsupported`)
 //! — 5 мин, сбой процесса (`parse_timeout`, `parse_crash`, `parse_oom`) — 45 с
@@ -53,11 +60,13 @@ use tokio::io::AsyncReadExt as _;
 use zam_core::Id;
 use zam_docs::{DocError, DocKind, Limits, Locator};
 use zam_markdown::mask_text;
+use zam_markdown::secrets::RULES_VERSION;
 use zam_store::blobs::is_sha256;
 use zam_store::{
     BlobStore, Db, blob_meta_by_sha, blob_meta_by_sha_in_space, report_blob_meta_by_sha,
 };
 
+use super::agent_view;
 use super::blobs::NoCompress;
 use super::doc_locator::Sheets;
 use super::query;
@@ -79,6 +88,9 @@ const ROWS_MAX: u32 = 1000;
 const PX_DEFAULT: u32 = 256;
 /// Начало текстового файла для `kind=text`, байт.
 pub const TEXT_MAX: u64 = 1024 * 1024;
+/// Запас за [`TEXT_MAX`] для маски агенту, байт: ключ на границе обрезки маска видит целиком
+/// (иначе его начало вышло бы префиксом), выдача — всё равно до [`TEXT_MAX`] ([`masked_head`]).
+const MASK_LOOKAHEAD: u64 = 4 * 1024;
 /// Начало файла для определения вида (как `zam_docs::sniff_file`).
 const HEAD: u64 = 64 * 1024 + 16;
 
@@ -321,10 +333,23 @@ pub async fn preview(
         return Err(ApiError::NotFound);
     }
     let svc = st.previews.clone();
-    let name = svc.file_name(&key, &loc.filename);
+    // агенту — маска текста и ячеек (миниатюра — картинка, как есть)
+    let masked = agent_view::masks(&p) && !matches!(key, PreviewKey::Thumb { .. });
+    let raw_name = svc.file_name(&key, &loc.filename);
+    // вид с маской — свой ETag; у текста — и свой файл кэша (HTML строится по маске)
+    let tag_name = if masked {
+        format!("m{RULES_VERSION}-{raw_name}")
+    } else {
+        raw_name.clone()
+    };
+    let name = if masked && key == PreviewKey::Text {
+        tag_name.clone()
+    } else {
+        raw_name
+    };
     let base_tag = format!(
         "\"{sha}.{}\"",
-        name.rsplit_once('.').map_or(&*name, |(n, _)| n)
+        tag_name.rsplit_once('.').map_or(&*tag_name, |(n, _)| n)
     );
     let ctype = match key {
         PreviewKey::Thumb { .. } => "image/png",
@@ -359,7 +384,7 @@ pub async fn preview(
                 return Err(ApiError::Unprocessable(detail));
             }
             let _permit = svc.permit().await;
-            match build(&st, &loc, &path, &key).await {
+            match build(&st, &loc, &path, &key, masked).await {
                 Ok(b) => b,
                 Err(ApiError::Unprocessable(detail)) => {
                     svc.remember_failure(loc.owner, &sha, &name, detail.clone());
@@ -377,6 +402,9 @@ pub async fn preview(
             let page: WireSheetPage = serde_json::from_slice(&built.data)
                 .map_err(|e| ApiError::Internal(format!("страница листа превью: {e}")))?;
             let (body, refs) = sheet_json(&loc, &sha, no, page).await;
+            // агенту — ячейки с маской (каждая ячейка — свой текст); до 1000 строк листа — в пуле
+            // при объёме больше 64 КиБ (круг правок 2 задачи 5 M7.1)
+            let body = agent_view::view_json_owned(&p, body, &["header", "rows"]).await?;
             let etag = match refs {
                 Some(r) => format!("{}.n{r}\"", base_tag.trim_end_matches('"')),
                 None => base_tag,
@@ -414,12 +442,14 @@ struct Built {
     cache: bool,
 }
 
-/// Строит превью в рабочем процессе.
+/// Строит превью в рабочем процессе; `masked` — текст агенту с маской секретов (лист маскируется
+/// при ответе, [`sheet_json`]).
 async fn build(
     st: &AppState,
     loc: &Located,
     path: &std::path::Path,
     key: &PreviewKey,
+    masked: bool,
 ) -> Result<Built, ApiError> {
     let svc = &st.previews;
     let limits = svc.limits().clone();
@@ -486,15 +516,36 @@ async fn build(
                     .extract(DocKind::Pptx, bytes)
                     .await
                     .map_err(|f| failed(st, f, false))?;
-                slides_json(x)
+                let mut v = slides_json(x);
+                if masked {
+                    agent_view::mask_fields(
+                        &mut v,
+                        &["slides.title", "slides.text", "slides.notes"],
+                    );
+                }
+                v
             } else {
-                let (head, more) = read_head(path, TEXT_MAX).await?;
+                // агенту — с запасом за границей: маска по нему, выдача — до `TEXT_MAX`
+                let read = if masked {
+                    TEXT_MAX + MASK_LOOKAHEAD
+                } else {
+                    TEXT_MAX
+                };
+                let (head, more) = read_head(path, read).await?;
+                let probe = &head[..head.len().min(TEXT_MAX as usize)];
                 let textual = matches!(kind, None | Some(DocKind::Text | DocKind::Csv))
-                    && zam_docs::is_text(&head)
-                    && zam_docs::sniff_image(&head).is_none();
+                    && zam_docs::is_text(probe)
+                    && zam_docs::sniff_image(probe).is_none();
                 if !textual {
                     return Err(unfit("текста"));
                 }
+                // агенту — подсветка маскированного текста: маска всего прочитанного до разметки
+                // (в HTML значение разрезано тегами подсветки, по нему маска не работает)
+                let (head, more) = if masked {
+                    masked_head(head, more).await?
+                } else {
+                    (head, more)
+                };
                 let head = Bytes::from(head);
                 let h = pool
                     .highlight(head.clone(), loc.filename.clone(), more)
@@ -536,6 +587,32 @@ fn checked_html(h: WireHtml, head: &[u8], truncated: bool) -> WireHtml {
         highlighted: 0,
         skipped: None,
     }
+}
+
+/// Начало текстового файла `head` (прочитано до [`TEXT_MAX`] + [`MASK_LOOKAHEAD`], `more` — файл
+/// длиннее) с маской секретов и обрезкой до [`TEXT_MAX`] ([`agent_view::mask_head`]: маска — по
+/// всему прочитанному, показ — не дальше `TEXT_MAX` исходника и не длиннее `TEXT_MAX`, метка не
+/// разрезается); второе — «показано не всё». Текст — как его подсвечивает рабочий процесс (BOM
+/// снят, обрезанный последний символ отброшен, неверный UTF-8 — U+FFFD,
+/// [`crate::docs::worker::source_text`]); маска — в пуле блокирующих задач (1 МиБ — до 20 мс).
+/// Двоичный файл (нулевой байт) — как есть до `TEXT_MAX`: подсветка его отвергнет.
+async fn masked_head(head: Vec<u8>, more: bool) -> Result<(Vec<u8>, bool), ApiError> {
+    let max = TEXT_MAX as usize;
+    agent_view::blocking(
+        move || match crate::docs::worker::source_text(&head, more) {
+            Some(t) => {
+                let (shown, cut) = agent_view::mask_head(&t, max);
+                (shown.into_bytes(), cut || more)
+            }
+            None => {
+                let mut head = head;
+                let cut = more || head.len() > max;
+                head.truncate(max);
+                (head, cut)
+            }
+        },
+    )
+    .await
 }
 
 async fn read_all(path: &std::path::Path) -> Result<Bytes, ApiError> {

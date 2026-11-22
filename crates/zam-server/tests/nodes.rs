@@ -463,6 +463,118 @@ async fn admin_reads_user_note_with_x_zam_user() {
     assert_eq!(revs[0]["author_kind"], "human");
 }
 
+/// Выдача узла агенту по токену (задача 5 M7.1, спецификация M7 §4.3.1 п. 2): `format=json`
+/// (`content`, `node.frontmatter` — `description`, `tags`, `l0`), `html` (маска до рендера),
+/// оглавление, эхо записи, дерево пространства и поле `diff` ответа 409 — без значения; сессии
+/// WebUI — исходник (в `json` и `html`), кэш HTML у них разный.
+#[tokio::test]
+async fn agent_node_json_frontmatter_masked() {
+    let a = api("agent-node-mask", |_| {}).await;
+    // фиктивный ключ собирается из частей: в исходнике его нет целиком (push protection)
+    let s = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let content = format!(
+        "---\ndescription: \"ключ {s}\"\ntags: [\"t-{s}\", \"ops\"]\nl0: \"сводка {s}\"\n---\n\
+         # Доступ {s}\n\ntoken: {s}\n"
+    );
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": "knowledge", "path": "ops/node-mask", "kind": "note",
+                        "content": &content}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert!(!r.text().contains(&s), "эхо записи: {}", r.text());
+    let nid = id(&r.json());
+    let base = format!("/api/v1/nodes/{nid}");
+    for uri in [
+        base.clone(),
+        format!("{base}?format=md"),
+        format!("{base}?format=html"),
+        format!("{base}/outline"),
+        format!("{base}?tier=L1"),
+        format!("{base}?tier=L0"),
+        "/api/v1/spaces/knowledge/tree?path=ops".to_string(),
+    ] {
+        let r = get(&a, &uri).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        assert!(!r.text().contains(&s), "{uri}: {}", r.text());
+    }
+    let j = get(&a, &base).await.json();
+    let fm = &j["node"]["frontmatter"];
+    assert!(
+        fm["description"].as_str().unwrap().contains("‹secret›"),
+        "{j}"
+    );
+    assert_eq!(fm["tags"][1], "ops", "{j}");
+    // текст для правки — нумерованный вид (M7 §4.3.2), frontmatter узла — метки без номеров
+    assert!(
+        j["content"].as_str().unwrap().contains(&format!(
+            "token: ‹secret-{}-5›",
+            zam_server::api::agent_view::object_tag(&nid, 1)
+        )),
+        "{j}"
+    );
+    // человеку — исходник, в том числе md (целиком, с frontmatter) и HTML (кэш рендера — свой у
+    // маски); `node.frontmatter` — исходный
+    for uri in [
+        base.clone(),
+        format!("{base}?format=md"),
+        format!("{base}?format=html"),
+    ] {
+        let r = a.adm(Method::GET, &uri, None, None).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        assert!(r.text().contains(&s), "{uri}: {}", r.text());
+    }
+    let r = a.adm(Method::GET, &base, None, None).await;
+    let fm = &r.json()["node"]["frontmatter"];
+    assert_eq!(fm["description"], format!("ключ {s}"), "{fm}");
+    assert_eq!(fm["tags"][0], format!("t-{s}"), "{fm}");
+    let md = get(&a, &format!("{base}?format=md")).await.text();
+    assert_eq!(
+        md,
+        zam_secrets::restore::numbered_view(
+            &zam_server::api::agent_view::object_tag(&nid, 1),
+            &content
+        ),
+        "md агенту — нумерованный вид всего файла"
+    );
+    let h = get(&a, &format!("{base}?format=html")).await;
+    assert!(
+        !h.text().contains(&s),
+        "HTML агенту после HTML человеку: {}",
+        h.text()
+    );
+    // 409 RevMismatch: дифф base_rev → текущая — без значения
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &base,
+            Some(json!({"content": format!("{content}\nстрока 2\n")})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains(&s), "эхо PUT: {}", r.text());
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &base,
+            Some(json!({"content": "другое"})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let p = r.json();
+    assert!(p["diff"].as_str().unwrap().contains("+строка 2"), "{p}");
+    assert!(!r.text().contains(&s), "409: {}", r.text());
+}
+
 #[tokio::test]
 async fn put_requires_if_match_and_reports_conflict_diff() {
     let a = api("put", |c| c.limits.note_max_bytes = 1000).await;

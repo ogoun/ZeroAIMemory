@@ -156,6 +156,51 @@ fn cli_export_writes_zip() {
     let b = std::fs::read(r.join("all.zip")).unwrap();
     assert_eq!(v["bytes"], b.len());
     assert!(has(&b, "other.md") && !has(&b, "_history/"));
+    assert!(
+        !stderr(&o).contains("без значений секретов"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// Экспорт по токену с маской (финальное ревью M7.1, I-5): опись `secrets_masked: true` — одна
+/// строка в stderr «архив без значений секретов (‹secret›); полная копия — экспорт из WebUI или
+/// zam-server backup». Без находок (`cli_export_writes_zip`) строки нет.
+#[test]
+fn cli_export_masked_archive_note() {
+    let (url, tok) = start("masked");
+    let r = tmp("masked-repo");
+    // ключ из частей (push protection)
+    let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build(),
+    );
+    let code = agent
+        .post(&format!("{url}/api/v1/nodes"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .content_type("application/json")
+        .send(
+            serde_json::json!({"space": "knowledge", "path": "ops/key", "kind": "note",
+                               "content": format!("token: {key}\n")})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(code, 201);
+    let o = zam(&url, &tok, &r, &["export", "-o", "masked.zip"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let e = stderr(&o);
+    assert_eq!(e.lines().filter(|l| *l == zam_cli_note()).count(), 1, "{e}");
+}
+
+/// Строка `zam export` об архиве с маской (как в `zam`).
+fn zam_cli_note() -> &'static str {
+    "архив без значений секретов (‹secret›); полная копия — экспорт из WebUI или zam-server backup"
 }
 
 /// Сервер до 0.0.11-m6: маршрута экспорта нет (404), а пространство есть — «сервер не

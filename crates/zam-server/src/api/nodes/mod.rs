@@ -54,8 +54,9 @@ pub(crate) async fn audit_node(
 }
 
 /// Ошибка записи заметки → problem. `RevMismatch` дополняется диффом
-/// `base_rev → current_rev` (base не найдена — дифф от пустого текста).
-async fn write_error(db: &Db, id: Id, base_rev: i64, e: WriteError) -> ApiError {
+/// `base_rev → current_rev` (base не найдена — дифф от пустого текста); агенту `p` по токену —
+/// дифф масок обеих ревизий (задача 5 M7.1: MCP печатает его агенту, `problem_text`).
+async fn write_error(p: &Principal, db: &Db, id: Id, base_rev: i64, e: WriteError) -> ApiError {
     match e {
         WriteError::Store(e) => e.into(),
         WriteError::RevMismatch {
@@ -65,6 +66,11 @@ async fn write_error(db: &Db, id: Id, base_rev: i64, e: WriteError) -> ApiError 
             let base = match node_content(db, id, Some(base_rev)).await {
                 Ok((_, t)) => t,
                 Err(_) => String::new(),
+            };
+            let shown = |t| crate::api::agent_view::view_owned(p, t);
+            let (base, current) = match (shown(base).await, shown(current).await) {
+                (Ok(b), Ok(c)) => (b, c),
+                (Err(e), _) | (_, Err(e)) => return e,
             };
             let diff = match diff_blocking(
                 base,

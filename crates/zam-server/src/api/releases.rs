@@ -10,7 +10,8 @@
 //! - `commits` — `to.data.commits`.
 //!
 //! Доступ — как у записи `to` (`entry_scope`); `with` ищется в той же базе и пространстве,
-//! иначе 404.
+//! иначе 404. Агенту по токену записи, `notes_diff` (тексты маской до диффа) и `commits` — с
+//! `‹secret›` вместо значений секретов (задача 5 M7.1); сессии WebUI — исходник.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
@@ -22,6 +23,7 @@ use zam_store::{
     list_entries,
 };
 
+use super::agent_view::{self, ENTRY_FIELDS};
 use super::entries::CHANGELOG_KINDS;
 use super::nodes::diff_blocking;
 use super::query;
@@ -129,14 +131,34 @@ pub async fn compare(
             .to_string()
     };
     let old_label = from.as_ref().map_or_else(|| "(начало)".to_string(), label);
-    let notes_diff = diff_blocking(old, to.body.clone(), old_label, label(&to)).await?;
+    // агенту по токену — тексты обоих релизов маской до диффа (задача 5 M7.1)
+    let old = agent_view::view_owned(&p, old).await?;
+    let new = agent_view::view_owned(&p, to.body.clone()).await?;
+    let notes_diff = diff_blocking(old, new, old_label, label(&to)).await?;
     let commits = to.data.get("commits").cloned().unwrap_or_else(|| json!([]));
-    Ok(Json(json!({
+    let v = json!({
         "from": from,
         "to": to,
         "changelog": group_by_kind(items)?,
         "truncated": truncated,
         "notes_diff": notes_diff,
         "commits": commits,
-    })))
+    });
+    // записи (`from`, `to`, группы changelog — массивы записей) и сообщения коммитов; длинные
+    // тексты — в пуле блокирующих задач
+    let v = agent_view::view_json_with(&p, v, |v| {
+        for k in ["from", "to"] {
+            if let Some(e) = v.get_mut(k) {
+                agent_view::mask_fields(e, ENTRY_FIELDS);
+            }
+        }
+        if let Some(groups) = v.get_mut("changelog").and_then(Value::as_object_mut) {
+            for g in groups.values_mut() {
+                agent_view::mask_fields(g, ENTRY_FIELDS);
+            }
+        }
+        agent_view::mask_fields(v, &["commits"]);
+    })
+    .await?;
+    Ok(Json(v))
 }

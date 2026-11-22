@@ -9,15 +9,17 @@
 //!   быть чужим), часть цели `part` (решение контроллера R11: `chunk_id` чанка, отданного
 //!   целиком, или [`WHOLE_TARGET`] — полный текст цели; [`RECALL_PART`] — подсказка `/recall`)
 //!   и её ревизия. Вложение (M5) — цель [`SeenTarget::Blob`] (sha256), часть — `locator`,
-//!   отданный `/read` целиком, или `chunk_id` фрагмента `mode=chunks`, ревизия 0. Хранится большая из выданных ревизий: ревизии только растут, и повторная
-//!   выдача старой не откатывает отметку;
+//!   отданный `/read` целиком, или `chunk_id` фрагмента `mode=chunks`, ревизия 0. Хранится
+//!   большая из выданных ревизий: ревизии только растут, и повторная выдача старой не откатывает
+//!   отметку. Исключение — отметка очереди разбора [`REVIEW_QUEUE_PART`]: её «ревизия» — число
+//!   идей **последнего** показа, она перезаписывается (из равных по `seen_at` — поздняя строка);
 //! - эпоха (спецификация M6 §7.2, миграция 0025): `sessions.seen_epoch` растёт [`bump_epoch`]
 //!   (сжатие контекста, `resume`, `clear`, восстановление), отметка пишется в эпоху касания
 //!   ([`SessionTouch::epoch`]), [`seen_revs`] читает только её. Отметки прежних эпох хранятся до
 //!   срока сессии (аналитика). Показ идей — без эпохи (§7.2, «одна идея — один показ за
 //!   сессию»): раздел идей дайджеста читает [`seen_entry_ids`], подсказка идей к запросу —
-//!   [`seen_revs_any_epoch`]; строка очереди разбора к запросу (M6.6 §3.5) — по эпохе и ревизии,
-//!   [`seen_entry_revs`];
+//!   [`seen_revs_any_epoch`]; показ очереди разбора (M7.1 §4.5: строка к запросу, раздел
+//!   дайджеста) — своя отметка [`REVIEW_QUEUE_PART`] по эпохе, [`review_queue_shown`];
 //! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12); признак с
 //!   наследованием от родителя — [`session_holdout`];
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
@@ -47,6 +49,12 @@ pub const WHOLE_TARGET: &str = "";
 /// поэтому поиск (`skip_seen`) и `/read` такую отметку выдачей текста не считают
 /// **[решение исполнителя, задача 8 M4]**. Подсказка показывается не больше раза за сессию.
 pub const RECALL_PART: &str = "recall";
+/// `part` отметки показа очереди разбора идей (M7.1 §4.5 п. 1): строка очереди к запросу или
+/// раздел `### Идеи на разбор` дайджеста. Цель — первая идея очереди при показе, ревизия — **число
+/// идей в очереди** при показе (не ревизия цели; повторный показ с той же первой идеей
+/// перезаписывает число, [`mark_seen_with_tokens`]). Подсказку записи ([`RECALL_PART`]) и выдачу
+/// текста такая отметка не задевает: их читают по своим частям.
+pub const REVIEW_QUEUE_PART: &str = "review_queue";
 
 /// Касание сессии: id и то, что о ней известно из запроса (`None` — не менять прежнее).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -535,7 +543,9 @@ pub async fn sessions_tokens(
 }
 
 /// [`mark_seen`] и прибавки учёта выданного (`/recall`: показ и его размер) — одной
-/// транзакцией, без лишней синхронизации диска на горячем пути.
+/// транзакцией, без лишней синхронизации диска на горячем пути. Повторная отметка той же части
+/// хранит большую ревизию, а отметка очереди разбора ([`REVIEW_QUEUE_PART`]) — число идей
+/// **последнего** показа: её ревизия — не ревизия цели, а длина очереди.
 pub async fn mark_seen_with_tokens(
     db: &Db,
     s: &SessionTouch,
@@ -556,7 +566,9 @@ pub async fn mark_seen_with_tokens(
                                        seen_at, epoch)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (session_id, owner_id, target_kind, target_id, part, epoch) DO UPDATE SET
-               rev = max(rev, excluded.rev), seen_at = excluded.seen_at",
+               rev = CASE WHEN excluded.part = ?9 THEN excluded.rev
+                          ELSE max(rev, excluded.rev) END,
+               seen_at = excluded.seen_at",
         )?;
         for it in &items {
             let (kind, id) = seen_cols(&it.key.target)?;
@@ -568,7 +580,8 @@ pub async fn mark_seen_with_tokens(
                 it.key.part,
                 it.rev,
                 now,
-                s.epoch
+                s.epoch,
+                REVIEW_QUEUE_PART
             ])?;
         }
         Ok(())
@@ -658,37 +671,64 @@ pub async fn seen_entry_ids(
     .await
 }
 
-/// Записи журналов (`target_kind = entry`) базы владельца `owner`, выданные сессии с частью
-/// `part` **в эпоху `epoch`**, с наибольшей выданной ревизией (M6.6 §3.5, ревью задачи 14:
-/// строка очереди разбора к запросу — показ по эпохе и ревизии; одно чтение на запрос).
-pub async fn seen_entry_revs(
+/// Последний показ очереди разбора сессии в эпоху ([`review_queue_shown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueShown {
+    /// Число идей в очереди при последнем показе.
+    pub total: usize,
+    /// Время последнего показа.
+    pub at: Timestamp,
+}
+
+impl QueueShown {
+    /// Показ покрывает очередь из `total` идей с последней ревизией `changed_at` (M7.1 §4.5 п. 1):
+    /// очередь не длиннее показанной и ни одна её идея не новее показа. Не покрывает — строку
+    /// очереди показывают снова (идея пришла, вернулась на разбор или правлена после показа).
+    pub fn covers(&self, total: usize, changed_at: Option<Timestamp>) -> bool {
+        total <= self.total && changed_at.is_none_or(|changed| changed <= self.at)
+    }
+}
+
+/// Последний показ очереди разбора идей базы владельца `owner` сессии в эпоху `epoch` (M7.1
+/// §4.5 п. 1): отметка части [`REVIEW_QUEUE_PART`] с самым поздним `seen_at` — число идей
+/// очереди при том показе и его время (ревью задачи 4, Minor 1: с наибольшим числом за эпоху
+/// идея, пришедшая после того, как очередь разобрали, ждала бы сжатия); показа в эпохе не было —
+/// `None`. Одно чтение на запрос; вместе с головой очереди — `zam_store::review_queue_state`.
+pub async fn review_queue_shown(
     db: &Db,
     session: &str,
     owner: Id,
-    part: &str,
     epoch: u32,
-) -> Result<HashMap<Id, i64>, StoreError> {
-    let (session, part) = (session.to_string(), part.to_string());
-    db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT target_id, max(rev) FROM session_seen
-             WHERE session_id = ?1 AND owner_id = ?2 AND target_kind = 'entry' AND part = ?3
-               AND epoch = ?4
-             GROUP BY target_id",
-        )?;
-        let rows = st.query_map(params![session, owner, part, epoch], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        let mut out = HashMap::new();
-        for row in rows {
-            let (id, rev) = row?;
-            if let Ok(id) = id.parse::<Id>() {
-                out.insert(id, rev);
-            }
-        }
-        Ok(out)
-    })
-    .await
+) -> Result<Option<QueueShown>, StoreError> {
+    let session = session.to_string();
+    db.read(move |c| queue_shown_in(c, &session, owner, epoch))
+        .await
+}
+
+/// [`review_queue_shown`] на соединении `c`.
+pub(crate) fn queue_shown_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    owner: Id,
+    epoch: u32,
+) -> Result<Option<QueueShown>, StoreError> {
+    let row: Option<(i64, String)> = c
+        .prepare_cached(
+            "SELECT rev, seen_at FROM session_seen
+             WHERE session_id = ?1 AND owner_id = ?2 AND part = ?3 AND epoch = ?4
+             ORDER BY seen_at DESC, rowid DESC LIMIT 1",
+        )?
+        .query_row(params![session, owner, REVIEW_QUEUE_PART, epoch], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    let Some((total, at)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(QueueShown {
+        total: usize::try_from(total).unwrap_or(0),
+        at: crate::time::parse_ts(&at)?,
+    }))
 }
 
 /// Таблицы с `session_id → sessions(id)` без каскада: [`gc_sessions`] чистит их до сессий.

@@ -1035,6 +1035,8 @@ async fn cache_put(rest: &Rest, args: &JsonObject) -> Res {
         if let Some(p) = v["promoted"].as_str() {
             s.push_str(&format!(" → {p}"));
         }
+        // предупреждения ответа (`secret_mark_kept` текста выжимки)
+        s.push_str(&warnings_inline(v));
         s
     })
 }
@@ -1335,6 +1337,8 @@ fn review_outcome(v: &Value) -> String {
     if v["replay"] == true {
         s.push_str(" · повтор (записано ранее)");
     }
+    // предупреждения ответа (`secret_mark_kept` задачи плана)
+    s.push_str(&warnings_inline(v));
     s
 }
 
@@ -1408,6 +1412,7 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
         "scope",
         "force",
         "supersedes_id",
+        "supersedes_rev",
     ];
     let mut body = pick(args, &keys);
     if report {
@@ -1565,6 +1570,8 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
                     s.push_str(" · ");
                     s.push_str(&idea_outcome(v));
                 }
+                // предупреждения ответа (`secret_mark_kept` текста ответа)
+                s.push_str(&warnings_inline(v));
                 s
             });
         }
@@ -1714,12 +1721,14 @@ fn triggers_body(args: &JsonObject) -> Result<Map<String, Value>, Fail> {
 /// <entry_short>».
 fn changed_line(action: &str, v: &Value) -> String {
     let w = warnings_inline(v);
-    // замещение: {entry, superseded}
+    // замещение: {entry, superseded}; предупреждения записи (`secret_mark_kept` и др.) — у
+    // новой записи
     if let Some(new) = v.get("entry").filter(|e| e.is_object()) {
         return format!(
-            "Новая {} · замещена {}{w}",
+            "Новая {} · замещена {}{}",
             entry_short(new),
-            entry_ref_of(&v["superseded"])
+            entry_ref_of(&v["superseded"]),
+            warnings_inline(new)
         );
     }
     match action {
@@ -1903,11 +1912,23 @@ fn vault_candidates(rest: &Rest, args: &JsonObject) -> Result<Vec<String>, Fail>
     Ok(out)
 }
 
-/// Секрет для `get`: по `id`; по `name` — точное совпадение в пространствах по порядку, иначе
-/// единственное совпадение без учёта регистра. Несколько таких — 409 со списком, ни одного —
-/// 404 с пространствами поиска. `unique` (у `delete`, ревью задачи 6, M3): точное имя есть в
-/// нескольких пространствах поиска — 409 со списком `v:<id>` и областей, порядок не решает.
-async fn vault_locate(rest: &Rest, args: &JsonObject, unique: bool) -> Result<Value, Fail> {
+/// Как [`vault_locate`] находит запись Vault по `name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByName {
+    /// `get`, `rename`, `move`: точное имя в пространствах поиска по порядку, иначе единственное
+    /// совпадение без учёта регистра.
+    Loose,
+    /// `delete`: только точное имя (регистр важен, M7.1 §4.5 п. 4) и только в одной области
+    /// поиска (ревью задачи 6 M6.6, M3): удаление по «почти тому же» имени необратимо для агента.
+    Exact,
+}
+
+/// Секрет по `id` или `name` ([`ByName`]). `Loose`: точное совпадение в пространствах по
+/// порядку, иначе единственное совпадение без учёта регистра; несколько таких — 409 со списком,
+/// ни одного — 404 с пространствами поиска. `Exact` (у `delete`): точное имя есть в нескольких
+/// пространствах поиска — 409 со списком `v:<id>` и областей, порядок не решает; точного нет, а
+/// без учёта регистра есть — 404 со списком точных имён (`v:<id>`, область).
+async fn vault_locate(rest: &Rest, args: &JsonObject, by: ByName) -> Result<Value, Fail> {
     if let Some(id) = opt_str(args, "id")? {
         // ссылка дайджеста `v:<id>` (раздел «Окружение») — как голый id
         let id = id.trim();
@@ -1923,8 +1944,9 @@ async fn vault_locate(rest: &Rest, args: &JsonObject, unique: bool) -> Result<Va
         .iter()
         .filter_map(|items| exact(items, name))
         .collect();
-    if unique && exact_all.len() > 1 {
-        let list: Vec<String> = exact_all
+    // `- v:<id> «<имя>» · <область>` — без значений
+    let refs = |items: &[&Value]| -> String {
+        items
             .iter()
             .map(|m| {
                 format!(
@@ -1934,12 +1956,15 @@ async fn vault_locate(rest: &Rest, args: &JsonObject, unique: bool) -> Result<Va
                     m["space"].as_str().unwrap_or("?")
                 )
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if by == ByName::Exact && exact_all.len() > 1 {
         return Err(Fail::Problem {
             status: StatusCode::CONFLICT,
             detail: format!(
                 "имя «{name}» есть в нескольких областях Vault — укажи scope или v:<id>:\n{}",
-                list.join("\n")
+                refs(&exact_all)
             ),
         });
     }
@@ -1947,6 +1972,18 @@ async fn vault_locate(rest: &Rest, args: &JsonObject, unique: bool) -> Result<Va
         return Ok((*m).clone());
     }
     let mut loose: Vec<Value> = found.into_iter().flatten().collect();
+    if by == ByName::Exact && !loose.is_empty() {
+        let near: Vec<&Value> = loose.iter().collect();
+        return Err(Fail::Problem {
+            status: StatusCode::NOT_FOUND,
+            detail: format!(
+                "секрета с точным именем «{name}» нет (искали: {}); удаление — только по точному \
+                 имени (регистр важен) или v:<id>, то же имя в другом регистре:\n{}",
+                spaces.join(", "),
+                refs(&near)
+            ),
+        });
+    }
     match loose.len() {
         1 => Ok(loose.remove(0)),
         0 => Err(Fail::Problem {
@@ -1967,11 +2004,11 @@ async fn vault_locate(rest: &Rest, args: &JsonObject, unique: bool) -> Result<Va
     }
 }
 
-/// Запись для `delete`, `rename`, `move` с метаданными (имя, область, ревизия): по `name` — как
-/// у `get` ([`vault_locate`]; `unique` — точное имя только в одной области), по `id` (`v:<id>` —
-/// как голый id) — `GET /vault/{id}` без раскрытия.
-async fn vault_target(rest: &Rest, args: &JsonObject, unique: bool) -> Result<Value, Fail> {
-    let m = vault_locate(rest, args, unique).await?;
+/// Запись для `delete`, `rename`, `move` с метаданными (имя, область, ревизия): по `name` —
+/// [`vault_locate`] (`by`: у `delete` — [`ByName::Exact`]), по `id` (`v:<id>` — как голый id) —
+/// `GET /vault/{id}` без раскрытия.
+async fn vault_target(rest: &Rest, args: &JsonObject, by: ByName) -> Result<Value, Fail> {
+    let m = vault_locate(rest, args, by).await?;
     if m.get("title").is_some() {
         return Ok(m);
     }
@@ -2039,7 +2076,7 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
             })
         }
         "get" => {
-            let m = vault_locate(rest, args, false).await?;
+            let m = vault_locate(rest, args, ByName::Loose).await?;
             let id = m["id"].as_str().unwrap_or("").to_string();
             // раскрытие — `?reveal=1`: аудит `vault.reveal` с сессией и машиной делает REST
             let r = call_rest(
@@ -2145,9 +2182,10 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
             done(f, &r, |v| format!("Сохранено\n{}", vault_meta_line(v)))
         }
         // удаление мягкое: ревизии и аудит `vault.delete` остаются (M6.6 §7, решение 11); имя в
-        // двух областях без `scope` — ошибка со списком, а не запись по порядку поиска (M3 ревью)
+        // двух областях без `scope` — ошибка со списком, а не запись по порядку поиска (M3 ревью);
+        // имя — только точное (M7.1 §4.5 п. 4)
         "delete" => {
-            let m = vault_target(rest, args, true).await?;
+            let m = vault_target(rest, args, ByName::Exact).await?;
             let id = m["id"].as_str().unwrap_or("").to_string();
             let uri = format!("/api/v1/vault/{}", enc(&id));
             call_rest(rest, Method::DELETE, &uri, None, &[]).await?;
@@ -2161,7 +2199,7 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
         }
         "rename" => {
             let new_name = req_str(args, "new_name")?.trim().to_string();
-            let m = vault_target(rest, args, false).await?;
+            let m = vault_target(rest, args, ByName::Loose).await?;
             let id = m["id"].as_str().unwrap_or("").to_string();
             // имя — с `If-Match` прочитанной ревизии: чужая правка между чтением и записью — 409
             let guard: Vec<(HeaderName, String)> =
@@ -2193,7 +2231,7 @@ async fn vault(rest: &Rest, args: &JsonObject) -> Res {
         // перенос — маршрутом сервера: значение не раскрывается, id и история те же (решение 12)
         "move" => {
             let to = vault_area(rest, "to", req_str(args, "to")?)?;
-            let m = vault_target(rest, args, false).await?;
+            let m = vault_target(rest, args, ByName::Loose).await?;
             let id = m["id"].as_str().unwrap_or("").to_string();
             let r = call_rest(
                 rest,

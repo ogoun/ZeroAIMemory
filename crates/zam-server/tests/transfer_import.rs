@@ -1875,18 +1875,136 @@ async fn import_links_outside_skipped_reported() {
     );
 }
 
-/// Сканер секретов работает, как при обычной записи: предупреждение `secrets_detected`.
+/// Сканер секретов работает, как при обычной записи: предупреждение `secrets_detected`. Архив —
+/// из сессии WebUI: экспорт по токену маскирует секреты (задача 5 M7.1), находить было бы нечего.
 #[tokio::test]
 async fn import_secrets_detected_warning() {
     let w = world("imp-secret").await;
     // фиктивный ключ собирается конкатенацией: в исходнике его нет целиком (push protection)
     let key = format!("{}{}", "AK", "IAQWERTYUIOPASDFGH");
     note(&w.a, &w.o.tok, G, "s", &format!("ключ {key} тут")).await;
-    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let zip = export_web(&w.a, &w.o, G, "").await;
     let r = report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
     let ws = r["warnings"].to_string();
     assert!(ws.contains("secrets_detected"), "{r}");
     assert!(!ws.contains(&key), "значение секрета в отчёте: {r}");
+    assert!(
+        !ws.contains("замаскированы"),
+        "архив сессии — исходник: {r}"
+    );
+}
+
+/// Импорт архива, снятого по токену (опись `secrets_masked: true`, задача 5 M7.1, спецификация
+/// M7 §4.3.1 п. 6), — предупреждение «секреты в архиве замаскированы и не восстановятся»; метка
+/// `‹secret›` ложится в базу как есть (значения в архиве нет). Архив по токену без секретов
+/// признака не несёт — и предупреждения нет.
+#[tokio::test]
+async fn import_masked_archive_warns() {
+    let w = world("imp-masked").await;
+    let key = format!("{}{}", "AK", "IAQWERTYUIOPASDFGH");
+    note(&w.a, &w.o.tok, G, "s", &format!("ключ {key} тут")).await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let r = report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+    let ws = r["warnings"].to_string();
+    assert!(
+        ws.contains("секреты в архиве замаскированы и не восстановятся"),
+        "{r}"
+    );
+    assert!(!ws.contains(&key), "{r}");
+    let db = db(&w.a, &w.rw.id).await;
+    let id = node_by_path(&db, "s").await.expect("заметка импортирована");
+    let (_, text) = zam_store::node_content(&db, id.parse().unwrap(), None)
+        .await
+        .unwrap();
+    assert!(text.contains("ключ ‹secret› тут"), "{text}");
+    // без секретов — признака и предупреждения нет
+    let w = world("imp-masked-clean").await;
+    note(&w.a, &w.o.tok, G, "c", "чистый текст").await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    let r = report(&import_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await);
+    assert!(!r["warnings"].to_string().contains("замаскированы"), "{r}");
+}
+
+/// Архив с маской по токену с `on_conflict=revision` (круг правок 1 задачи 6 M7.1, M8) — 422 до
+/// записи: ревизия поверх живой заметки затёрла бы значения метками; `skip` — проходит, заметка
+/// с ключом не тронута; из сессии WebUI — как прежде.
+#[tokio::test]
+async fn import_masked_archive_revision_rejected() {
+    let w = world("imp-masked-rev").await;
+    let key = format!("{}{}", "AK", "IAQWERTYUIOPASDFGH");
+    note(&w.a, &w.o.tok, G, "s", &format!("ключ {key} тут")).await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    // у получателя та же заметка уже есть с другим текстом: revision её бы переписал
+    note(
+        &w.a,
+        &w.rw.tok,
+        "knowledge",
+        "s",
+        &format!("свой ключ {key}"),
+    )
+    .await;
+    let r = import_tok(
+        &w.a,
+        &w.rw.tok,
+        "knowledge",
+        "?on_conflict=revision",
+        zip.clone(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert!(r.text().contains("on_conflict=skip"), "{}", r.text());
+    let db = db(&w.a, &w.rw.id).await;
+    let id = node_by_path(&db, "s").await.expect("заметка на месте");
+    let (_, text) = zam_store::node_content(&db, id.parse().unwrap(), None)
+        .await
+        .unwrap();
+    assert!(text.contains(&key), "значение не затёрто: {text}");
+    let r = report(
+        &import_tok(
+            &w.a,
+            &w.rw.tok,
+            "knowledge",
+            "?on_conflict=skip",
+            zip.clone(),
+        )
+        .await,
+    );
+    assert!(r.to_string().contains("замаскированы"), "{r}");
+    let r = report(&import_web(&w.a, &w.rw, "knowledge", "?on_conflict=revision", zip).await);
+    assert!(r.to_string().contains("замаскированы"), "{r}");
+}
+
+/// Итог задания импорта называет записи заголовком (`secrets_detected: «<заголовок>»`): опрос
+/// `GET /spaces/{space}/imports/{job}` по токену — с маской `‹secret›` (круг правок 1 задачи 5
+/// M7.1), из сессии WebUI — исходник.
+#[tokio::test]
+async fn import_job_warnings_masked_for_token() {
+    let w = world("imp-job-mask").await;
+    let key = format!("{}{}", "AK", "IAQWERTYUIOPASDFGH");
+    entry(
+        &w.a,
+        &w.o.tok,
+        G,
+        json!({"kind": "insight", "title": format!("Ключ {key} в логе"),
+               "body": format!("API_KEY={key}"), "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let zip = export_web(&w.a, &w.o, G, "").await;
+    let accepted = post_tok(&w.a, &w.rw.tok, "knowledge", "", zip).await;
+    ok(&accepted, StatusCode::ACCEPTED, "задание импорта");
+    let status = format!("/api/v1{}", accepted.json()["status"].as_str().unwrap());
+    let r = report(&wait_job(&w.a, Who::Tok(&w.rw.tok), accepted).await);
+    let ws = r["warnings"].to_string();
+    assert!(
+        ws.contains("secrets_detected") && ws.contains("‹secret›"),
+        "{r}"
+    );
+    assert!(!ws.contains(&key), "{r}");
+    // то же задание из сессии WebUI того же пользователя — исходник заголовка
+    let h = get_as(&w.a, Who::Web(&w.rw), &status).await;
+    ok(&h, StatusCode::OK, "опрос из WebUI");
+    let ws = h.json()["report"]["warnings"].to_string();
+    assert!(ws.contains(&key), "{ws}");
 }
 
 /// Участник решения (`rw` и `ro`) не импортирует — 403; владелец и администратор — да.

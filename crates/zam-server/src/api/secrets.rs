@@ -2,31 +2,65 @@
 //!
 //! Сканер (`zam_markdown::scan_secrets`, крейт `zam-secrets`) находит в сохранённом тексте
 //! значения, похожие на ключи и пароли. Текст при этом сохраняется как есть, а в индекс (FTS,
-//! эмбеддинги, Qdrant) уходит замаскированным. Ответ получает `warnings: ["secrets_detected"]`,
+//! эмбеддинги, Qdrant) и в выдачу агенту по токену (задача 5 M7.1, [`super::agent_view`]) уходит
+//! замаскированным; исходник видит человек в WebUI. Ответ получает `warnings: ["secrets_detected"]`,
 //! `secrets_detected: [{kind, line}]` (без значений) и подсказку про Vault. Скан упёрся в предел
 //! повторов (`ScanOutcome::depth_capped`, задача 15b M6) — ещё `warnings: ["secrets_scan_depth"]`
 //! и WARN в журнал сервера без текста находок (число находок и повторов, длина текста).
 
 use serde_json::{Value, json};
-use zam_markdown::scan_secrets_ext;
+use zam_markdown::{ScanOutcome, scan_secrets_ext};
 use zam_store::Entry;
 
 /// Предупреждение в массиве `warnings`.
 pub const SECRETS_DETECTED: &str = "secrets_detected";
 
 /// Предупреждение в `warnings`: скан упёрся в предел повторов (`zam_markdown::secrets::
-/// FIXPOINT_MAX`) — часть значений может уйти в индекс незамаскированной.
+/// FIXPOINT_MAX`) — неустойчивые находки замаскированы с соседним текстом (до пробелов, строки или
+/// весь текст; задача 3 M7.1), в индекс значения не уходят, но поиск по этому месту хуже.
 pub const SECRETS_SCAN_DEPTH: &str = "secrets_scan_depth";
 
 /// Подсказка, куда класть секреты.
-pub const SECRETS_HINT: &str = "В тексте найдены значения, похожие на секреты. В индекс и поиск \
-они не попадают (маскируются), но текст сохранён как есть. Храните секреты в Vault: \
-`zam vault set <имя>`, а в тексте оставляйте ссылку на имя.";
+pub const SECRETS_HINT: &str = "В тексте найдены значения, похожие на секреты. Текст сохранён как \
+есть (исходник — в WebUI), но в индекс, поиск и выдачу агенту значения не попадают: вместо них \
+‹secret›. Храните секреты в Vault: `zam vault set <имя>`, а в тексте оставляйте ссылку на имя.";
 
 /// Добавляет в ответ-объект `v` предупреждение и список находок по тексту `text`;
 /// без находок ответ не меняется.
 pub fn attach(v: &mut Value, text: &str) {
+    attach_scan(v, text.len(), scan_secrets_ext(text));
+}
+
+/// [`attach`] для правки агента по маске (круг правок 1 задачи 6 M7.1, M4): только находки,
+/// значений которых нет в прежнем тексте `base`, — восстановленные из-под `‹secret›` и
+/// оставшиеся прежними значения агенту не новость (ключа он не знает, перенести его в Vault не
+/// может).
+pub fn attach_new(v: &mut Value, text: &str, base: &str) {
     let scan = scan_secrets_ext(text);
+    if scan.hits.is_empty() {
+        return;
+    }
+    let known: std::collections::HashSet<&str> = zam_markdown::scan_secrets(base)
+        .into_iter()
+        .filter_map(|h| base.get(h.range))
+        .collect();
+    let hits = scan
+        .hits
+        .into_iter()
+        .filter(|h| text.get(h.range.clone()).is_none_or(|s| !known.contains(s)))
+        .collect();
+    attach_scan(v, text.len(), ScanOutcome { hits, ..scan });
+}
+
+/// [`attach_new`] по текстам записи и её прежнего вида.
+pub fn attach_entry_new(v: &mut Value, e: &Entry, base: &Entry) {
+    attach_new(v, &entry_text(e), &entry_text(base));
+}
+
+/// [`attach`] по готовому итогу скана текста длиной `text_bytes`: сам текст сюда не передаётся,
+/// поэтому WARN упора без текста находок по построению. Отдельно от [`attach`] — ради теста этого
+/// свойства: входа, который упирается в предел, с задачи 3 M7.1 нет (ревью, Minor 5).
+pub fn attach_scan(v: &mut Value, text_bytes: usize, scan: ScanOutcome) {
     let hits = scan.hits;
     if hits.is_empty() {
         return;
@@ -36,7 +70,7 @@ pub fn attach(v: &mut Value, text: &str) {
         tracing::warn!(
             hits = hits.len(),
             passes = scan.passes,
-            text_bytes = text.len(),
+            text_bytes,
             "сканер секретов упёрся в предел повторов (secrets_scan_depth)"
         );
     }

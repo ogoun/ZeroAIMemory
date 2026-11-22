@@ -1695,6 +1695,26 @@ pub(crate) mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
     }
 
+    /// M7.1 (§4.1 п. 5): `ThirdPartyNotices.txt` пакета ONNX Runtime (LF) — в `LICENSES/`
+    /// комплекта рядом с лицензией MIT. Упаковка с настоящим `deploy/` репозитория.
+    #[test]
+    fn licenses_include_ort_third_party() {
+        let w = work("ort-licenses");
+        let (deps, _, gen_dir, crt, dist) = fixture(&w, "linux-x64");
+        let deploy = repo().join("deploy");
+        let fx = (deps, deploy.clone(), gen_dir, crt, dist);
+        let got = package_fixture(&w, "linux-x64", Flavor::Cpu, false, None, &fx).unwrap();
+        let root = "zam-server-1.2.3-linux-x64-cpu";
+        for n in [
+            "ONNXRUNTIME-LICENSE-MIT.txt",
+            "ONNXRUNTIME-THIRD-PARTY-NOTICES.txt",
+        ] {
+            let b = tar_bytes(&got[0], &format!("{root}/LICENSES/{n}"));
+            assert!(!b.is_empty() && !b.contains(&b'\r'), "{n}: пуст или не LF");
+            assert_eq!(b, fs::read(deploy.join("licenses").join(n)).unwrap(), "{n}");
+        }
+    }
+
     /// M6 (задача 15c, ответ владельца M5.6 п. 14): упаковка без сети. В `about.toml`
     /// репозитория нет `clarify.git`; каждый `clarify.files` указывает на файл в
     /// `deploy/licenses/` с тем же SHA-256, и путь к нему в настройках для cargo-about —

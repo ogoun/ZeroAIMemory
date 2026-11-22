@@ -1,18 +1,22 @@
 //! Кэш архивов `target/deps-cache` и штампы распакованных зависимостей.
-//! Загрузка, SHA-256 и извлечение — в общем крейте `zam-fetch` (их же использует сервер).
+//! Загрузка, проверка размера и SHA-256, извлечение — в общем крейте `zam-fetch` (их же
+//! использует сервер).
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use zam_fetch::{PlatformEntry, download, extract_atomic, verify_sha256};
 pub use zam_fetch::{dest_names, sha256_file};
 
-/// Скачивает во временный `*.part` внутри кэша; возвращает путь и хэш.
-fn download_part(url: &str, cache: &Path) -> Result<(PathBuf, String)> {
+/// Скачивает во временный `*.part` внутри кэша с проверкой размера `size` (если задан);
+/// возвращает путь и хэш. При ошибке `*.part` удаляется.
+fn download_part(url: &str, cache: &Path, size: Option<u64>) -> Result<(PathBuf, String)> {
     fs::create_dir_all(cache)?;
     let part = cache.join(format!("{}.part", std::process::id()));
-    if let Err(e) = download(url, &part) {
+    if let Err(e) = download(url, &part, size) {
         let _ = fs::remove_file(&part);
         return Err(e.into());
     }
@@ -42,9 +46,10 @@ fn is_up_to_date(entry: &PlatformEntry, out: &Path, expected: &str) -> Result<bo
     Ok(dest_names(entry)?.iter().all(|n| out.join(n).is_file()))
 }
 
-/// Скачивает (если нет в кэше), проверяет хэш и распаковывает. `root` — каталог `target/`.
-/// Возвращает true, если загрузка не понадобилась (архив в кэше или каталог уже распакован
-/// из того же архива — по штампу `<out>.sha256`; так CI достаточно кэшировать `target/deps`).
+/// Скачивает (если нет в кэше), проверяет размер (`size` манифеста, если задан) и хэш и
+/// распаковывает. `root` — каталог `target/`. Возвращает true, если загрузка не понадобилась
+/// (архив в кэше или каталог уже распакован из того же архива — по штампу `<out>.sha256`; так
+/// CI достаточно кэшировать `target/deps`).
 pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> Result<bool> {
     if entry.sha256.trim().is_empty() {
         bail!(
@@ -63,6 +68,17 @@ pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> 
     let cached = cache.join(&expected);
     let from_cache = cached.is_file();
     if from_cache {
+        // размер — до хэша: чужой файл не хэшируется
+        let len = fs::metadata(&cached)?.len();
+        if let Some(size) = entry.size
+            && len != size
+        {
+            bail!(
+                "{name}: файл кэша {} — {len} байт, а size в манифесте — {size}; исправьте size \
+                 в манифесте или удалите файл кэша и повторите",
+                cached.display()
+            );
+        }
         verify_sha256(&cached, &expected).with_context(|| {
             format!(
                 "{name}: файл кэша повреждён; удалите файл кэша {} и повторите",
@@ -71,7 +87,7 @@ pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> 
         })?;
     } else {
         println!("{name}: загрузка {}", entry.url);
-        let (part, actual) = download_part(&entry.url, &cache)?;
+        let (part, actual) = download_part(&entry.url, &cache, entry.size)?;
         if !actual.eq_ignore_ascii_case(&expected) {
             let _ = fs::remove_file(&part);
             bail!("{name}: несовпадение SHA-256: ожидалось {expected}, получено {actual}");
@@ -83,12 +99,77 @@ pub fn fetch_one(name: &str, entry: &PlatformEntry, root: &Path, out: &Path) -> 
     Ok(from_cache)
 }
 
-/// Скачивает архив, кладёт в кэш под фактическим хэшем и возвращает хэш.
-pub fn print_hash(url: &str, root: &Path) -> Result<String> {
+/// Скачивает архив (без проверки размера: значения манифеста могут быть прежней версии), кладёт
+/// в кэш под фактическим хэшем и возвращает хэш и размер.
+pub fn print_hash(url: &str, root: &Path) -> Result<(String, u64)> {
     let cache = root.join("deps-cache");
-    let (part, hash) = download_part(url, &cache)?;
+    let (part, hash) = download_part(url, &cache, None)?;
+    let size = fs::metadata(&part)?.len();
     fs::rename(&part, cache.join(&hash))?;
-    Ok(hash)
+    Ok((hash, size))
+}
+
+/// sha256 всех манифестов `deploy/*.toml` (зависимости, `cuda.toml`, `models.toml`): значения
+/// ключей `sha256` на любой глубине — ключ общий для всех схем, поэтому новый манифест не
+/// требует правки здесь. Нечитаемый манифест — ошибка: чистка по неполному списку удалила бы
+/// нужный архив.
+pub fn manifest_hashes(deploy: &Path) -> Result<BTreeSet<String>> {
+    fn walk(t: &toml::Table, out: &mut BTreeSet<String>) {
+        for (k, v) in t {
+            match v {
+                toml::Value::String(s) if k == "sha256" && !s.trim().is_empty() => {
+                    out.insert(s.trim().to_ascii_lowercase());
+                }
+                toml::Value::Table(t) => walk(t, out),
+                toml::Value::Array(a) => {
+                    for t in a.iter().filter_map(toml::Value::as_table) {
+                        walk(t, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    let rd = fs::read_dir(deploy).with_context(|| format!("чтение {}", deploy.display()))?;
+    for e in rd {
+        let p = e?.path();
+        if p.extension().is_none_or(|x| x != "toml") || !p.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&p).with_context(|| format!("чтение {}", p.display()))?;
+        let t: toml::Table = text
+            .parse()
+            .with_context(|| format!("разбор {}", p.display()))?;
+        walk(&t, &mut out);
+    }
+    Ok(out)
+}
+
+/// Удаляет из каталога кэша архивов `cache` файлы, имени которых нет в `keep` (sha256 архивов
+/// текущих манифестов, [`manifest_hashes`]): прежние версии и `*.part` прерванных загрузок.
+/// Подкаталоги не трогаются; нет каталога — удалять нечего. Возвращает число и объём (байт)
+/// удалённых файлов.
+pub fn prune_cache(cache: &Path, keep: &BTreeSet<String>) -> Result<(usize, u64)> {
+    let rd = match fs::read_dir(cache) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e).with_context(|| format!("чтение {}", cache.display())),
+    };
+    let (mut n, mut bytes) = (0, 0);
+    for e in rd {
+        let e = e?;
+        if !e.file_type()?.is_file()
+            || keep.contains(&e.file_name().to_string_lossy().to_ascii_lowercase())
+        {
+            continue;
+        }
+        let len = e.metadata()?.len();
+        fs::remove_file(e.path()).with_context(|| format!("удаление {}", e.path().display()))?;
+        n += 1;
+        bytes += len;
+    }
+    Ok((n, bytes))
 }
 
 #[cfg(test)]
@@ -172,5 +253,122 @@ mod tests {
         std::fs::remove_file(out.join("a.dll")).unwrap();
         e.url = "https://127.0.0.1:1/a.zip".into();
         assert!(fetch_one("dep", &e, &d, &out).is_err());
+    }
+
+    /// M7.1 (§4.1 п. 3): `size` манифеста сверяется и для архива из кэша — до хэша и
+    /// распаковки.
+    #[test]
+    fn fetch_rejects_size_mismatch() {
+        let d = tmp("size_cache");
+        let zip_p = d.join("a.zip");
+        make_zip(&zip_p);
+        let hash = sha256_file(&zip_p).unwrap();
+        let len = std::fs::metadata(&zip_p).unwrap().len();
+        std::fs::create_dir_all(d.join("deps-cache")).unwrap();
+        std::fs::rename(&zip_p, d.join("deps-cache").join(&hash)).unwrap();
+        let mut e = entry(&["root/lib/a.dll"]);
+        e.sha256 = hash;
+        e.url = "https://x/a.zip".into();
+        e.size = Some(len + 1);
+        let out = d.join("deps").join("dep");
+        let err = format!("{:#}", fetch_one("dep", &e, &d, &out).unwrap_err());
+        assert!(
+            err.contains("size") && err.contains(&len.to_string()),
+            "{err}"
+        );
+        assert!(!out.exists() && !d.join("deps").join("dep.sha256").exists());
+        // верный size — распаковка из кэша
+        e.size = Some(len);
+        assert!(fetch_one("dep", &e, &d, &out).unwrap());
+        assert_eq!(std::fs::read(out.join("a.dll")).unwrap(), b"AAA");
+    }
+
+    /// Отдаёт `body` на один HTTP-запрос с локальной петли; возвращает URL `…/<name>`.
+    fn serve_once(body: &'static [u8], name: &str) -> String {
+        use std::io::Read as _;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/{name}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            let mut req = Vec::new();
+            let mut b = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut b) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => req.extend_from_slice(&b[..k]),
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(body);
+        });
+        url
+    }
+
+    /// Загрузка длиннее `size` манифеста обрывается; в кэше не остаётся ни архива, ни `*.part`.
+    #[test]
+    fn fetch_download_rejects_size_mismatch() {
+        let d = tmp("size_download");
+        let body: &'static [u8] = b"0123456789";
+        let mut e = entry(&["root/lib/a.dll"]);
+        e.url = serve_once(body, "a.nupkg");
+        e.sha256 = {
+            let p = d.join("body");
+            std::fs::write(&p, body).unwrap();
+            sha256_file(&p).unwrap()
+        };
+        e.size = Some(4);
+        let err = format!(
+            "{:#}",
+            fetch_one("dep", &e, &d, &d.join("out")).unwrap_err()
+        );
+        assert!(
+            err.contains("размер") && err.contains("больше 4 байт"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_dir(d.join("deps-cache")).unwrap().count(), 0);
+    }
+
+    /// M7.1 (§4.1 п. 4): `--prune-cache` оставляет в `deps-cache` только архивы, sha256 которых
+    /// есть в манифестах `deploy/*.toml` (зависимости и `[[lib]]` cuda — на любой глубине).
+    #[test]
+    fn prune_cache_keeps_manifest_hashes() {
+        let d = tmp("prune");
+        let (dep, lib, old) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let deploy = d.join("deploy");
+        std::fs::create_dir_all(&deploy).unwrap();
+        std::fs::write(
+            deploy.join("dep.toml"),
+            format!(
+                "name = \"dep\"\nversion = \"1\"\n[platform.windows-x64]\nurl = \"https://x/a.zip\"\n\
+                 sha256 = \"{}\"\nextract = [\"a\"]\n",
+                dep.to_uppercase()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            deploy.join("cuda.toml"),
+            format!("cuda = \"13\"\n[[lib]]\nsha256 = \"{lib}\"\n"),
+        )
+        .unwrap();
+        let cache = d.join("deps-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        for (n, body) in [(&dep, "AAA"), (&lib, "BB"), (&old, "OLDOLD")] {
+            std::fs::write(cache.join(n), body).unwrap();
+        }
+        let keep = manifest_hashes(&deploy).unwrap();
+        assert_eq!(prune_cache(&cache, &keep).unwrap(), (1, 6));
+        let mut left: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [dep, lib]);
+        // повторно удалять нечего; нет каталога кэша — не ошибка
+        assert_eq!(prune_cache(&cache, &keep).unwrap(), (0, 0));
+        assert_eq!(prune_cache(&d.join("nope"), &keep).unwrap(), (0, 0));
     }
 }

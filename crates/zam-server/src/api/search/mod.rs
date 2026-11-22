@@ -1296,13 +1296,16 @@ enum SectionKey {
 ///
 /// Исходник ревизии читается и разбирается один раз на `(цель, узел, ревизия)` (`cache`),
 /// разбор и поиск секции листа — в `spawn_blocking`; паника там — элемент без секции и
-/// предупреждение `section unavailable`, а не 500 на весь запрос.
+/// предупреждение `section unavailable`, а не 500 на весь запрос. `mask` — агенту по токену
+/// (задача 5 M7.1): текст ревизии маскируется целиком **до** разбора на секции — секция берётся
+/// из маски (лист — из маскированных чанков — в ней и находится); человеку — исходник.
 async fn expand_items(
     health: &mut Health<'_>,
     items: Vec<Item>,
     how: Expand,
     top_k: usize,
     cache: &mut SectionCache,
+    mask: bool,
 ) -> Result<Vec<Item>, ApiError> {
     let targets = health.targets;
     let mut out: Vec<Item> = Vec::with_capacity(top_k);
@@ -1334,8 +1337,15 @@ async fn expand_items(
                             drop_target(&mut out, &mut sections, ti);
                             continue;
                         };
-                        let t = match tokio::task::spawn_blocking(move || SectionTable::build(s))
-                            .await
+                        let t = match tokio::task::spawn_blocking(move || {
+                            let s = if mask {
+                                crate::api::agent_view::mask_string(s)
+                            } else {
+                                s
+                            };
+                            SectionTable::build(s)
+                        })
+                        .await
                         {
                             Ok(t) => Some(Arc::new(t)),
                             Err(e) => {
@@ -1403,6 +1413,21 @@ async fn expand_items(
         out.push(it);
     }
     Ok(out)
+}
+
+/// Поля карточек, которые не из чанков, для зрителя `p` (агенту — с маской секретов): заголовок
+/// записи журнала и L0 (L0 узла хранится маскированным, кроме ручного L0 папки старого импорта;
+/// маска идемпотентна).
+fn view_cards(p: &Principal, items: &mut [Item]) {
+    use crate::api::agent_view::view_in_place;
+    for it in items {
+        if let Some(e) = it.hit.entry.as_mut() {
+            view_in_place(p, &mut e.title);
+        }
+        if let Some(l0) = it.l0.as_mut() {
+            view_in_place(p, l0);
+        }
+    }
 }
 
 /// Убирает из `out` элементы исключённой цели `t` и переиндексирует секции оставшихся.
@@ -2969,7 +2994,15 @@ pub(crate) async fn search_with(
         SearchMode::Notes => group_by_node(items, top_k),
         SearchMode::Chunks => {
             let mut cache = SectionCache::default();
-            expand_items(&mut health, items, expand, top_k, &mut cache).await?
+            expand_items(
+                &mut health,
+                items,
+                expand,
+                top_k,
+                &mut cache,
+                crate::api::agent_view::masks(&p),
+            )
+            .await?
         }
         SearchMode::Brief => items.into_iter().take(top_k).collect(),
     };
@@ -3044,6 +3077,10 @@ pub(crate) async fn search_with(
     }
     // лист с секретом в имени — номером, как в `/read` (задача 7 M5, раунд правок 2)
     number_secret_sheets(&targets, &mut items).await;
+    // агенту по токену (задача 5 M7.1) — заголовки записей журналов и L0 карточек с маской
+    // секретов: до упаковки, бюджет считается по выданному тексту (сниппеты и тексты листов — из
+    // маскированных чанков, секция — из маски ревизии)
+    view_cards(&p, &mut items);
     // слабые карточки `brief`/`notes` — вон (M6 §4.2, `search.brief_min_rel`)
     let weak = drop_weak(&mut items, mode, min_rel);
     let degraded = available.err().or(vrun.failed);
@@ -3710,7 +3747,7 @@ mod tests {
         let mut h = Health::new(&targets, Vec::new());
         let mut cache = SectionCache::default();
         let its = section_hits(node, "Док > Детали > Глубже", &paras);
-        let out = expand_items(&mut h, its, Expand::Section, 100, &mut cache)
+        let out = expand_items(&mut h, its, Expand::Section, 100, &mut cache, false)
             .await
             .unwrap();
         assert_eq!(cache.builds, 1, "исходник разобран один раз");
@@ -3742,7 +3779,7 @@ mod tests {
         let mut h = Health::new(&targets, Vec::new());
         let mut cache = SectionCache::default();
         let its = section_hits(node, "Док > Детали", std::slice::from_ref(&leaf));
-        let out = expand_items(&mut h, its, Expand::Section, 10, &mut cache)
+        let out = expand_items(&mut h, its, Expand::Section, 10, &mut cache, false)
             .await
             .expect("без 500");
         assert_eq!(out.len(), 1);
@@ -3826,7 +3863,7 @@ mod tests {
         let mut cache = SectionCache::default();
         let mut its = section_hits(node, "Док > Детали", &[a_text.clone(), b_text.clone()]);
         its[1].target = 1;
-        let out = expand_items(&mut h, its, Expand::Section, 10, &mut cache)
+        let out = expand_items(&mut h, its, Expand::Section, 10, &mut cache, false)
             .await
             .unwrap();
         assert_eq!(out.len(), 2, "разные базы не сливаются");
@@ -3856,7 +3893,7 @@ mod tests {
         let mut cache = SectionCache::default();
         let its = section_hits(node, "", &paras[paras.len() - 300..]);
         let t0 = Instant::now();
-        let out = expand_items(&mut h, its, Expand::Section, 100, &mut cache)
+        let out = expand_items(&mut h, its, Expand::Section, 100, &mut cache, false)
             .await
             .unwrap();
         eprintln!(
