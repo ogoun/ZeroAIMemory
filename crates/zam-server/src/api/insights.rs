@@ -1061,7 +1061,12 @@ pub async fn supersede(
             "scope и supersedes_id задаются замещаемой записью, а не телом",
         ));
     }
-    // агент писал новую запись по маскированному виду старой — значения обратно (M7 §4.3.2)
+    // агент писал новую запись по маскированному виду старой — значения обратно (M7 §4.3.2);
+    // вид устаревшей ревизии `If-Match` без ключа повтора — 409 раньше восстановления (круг
+    // правок 2 задачи 6, B4: как правка записи; повтор по ключу ревизию не сверяет)
+    if agent_view::masks(&p) && !headers.contains_key("idempotency-key") {
+        super::entries::stale_entry(&sc.entry, rev)?;
+    }
     let (mut req, kept) = restore_for(&p, &sc.entry, req).await?;
     let kind = sc.entry.kind;
     let triggers = check_request(&st, &mut req, kind)?;

@@ -1655,9 +1655,9 @@ async fn agent_context_changed_rejected() {
             .await
             .contains(&format!("mysql -p{p} db --verbose"))
     );
-    // пробы ревью 3 и 4: URL переписан прозой, «password = ‹secret›» — «пароль от стенда —
-    // ‹secret›»: слово перед меткой сменилось, маска базы без пары — тоже 422 (решение
-    // координатора по сомнению 1 круга правок 1), значение в базе прежнее
+    // пробы ревью 3 и 4: URL переписан прозой — ключ тот же, но сканер прозу не закрывает;
+    // «password = ‹secret›» — «пароль от стенда — ‹secret›»: ключ сменился, маска базы без пары
+    // (решение координатора по сомнению 1 круга правок 1) — оба 422, значение в базе прежнее
     let base = format!("# Доступ\n\nбаза: https://user:{p}@db.example.com/\npassword = {p}\n");
     let n2 = a.note("knowledge", "ops/restore-context-2", &base).await;
     let id2 = n2["id"].as_str().unwrap().to_string();
@@ -1719,6 +1719,221 @@ async fn agent_context_changed_rejected() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let h = a.adm(Method::GET, &euri, None, None).await.json();
     assert_eq!(h["body"], format!("стенд prod\npassword = {p}\n"));
+}
+
+/// Устаревший `If-Match` и правка, которая вывела бы секрет из-под маски (M6 круга 1, B4 и B6
+/// круга правок 2): `PUT` заметки, `PATCH` и замещение записи журнала — 409 с текущей ревизией,
+/// а не 422; без значения в ответе, база не тронута.
+#[tokio::test]
+async fn agent_stale_rev_conflict_before_restore() {
+    let a = api("secrets-restore-stale", |_| {}).await;
+    let p = ["hunter", "8Qz9x"].concat();
+    let content = format!("# Стенд\n\npassword = {p}\nтекст\n");
+    let n = a.note("knowledge", "ops/restore-stale", &content).await;
+    let id = n["id"].as_str().unwrap().to_string();
+    let uri = format!("/api/v1/nodes/{id}");
+    let seen = agent_text(&a, &id).await;
+    let v2 = content.replace("текст", "текст человека");
+    let r = a
+        .adm_h(
+            Method::PUT,
+            &uri,
+            Some(json!({"content": &v2})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &uri,
+            Some(json!({"content": seen.replace("password = ", "password ")})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["current_rev"], 2, "{}", r.text());
+    assert!(!r.text().contains(&p), "{}", r.text());
+    assert_eq!(human_text(&a, &id).await, v2);
+    // запись журнала: правка и замещение по виду ревизии 1 при текущей 2
+    for kind in ["patch", "supersede"] {
+        let e = post_entry(
+            &a,
+            "knowledge",
+            json!({"kind": "insight", "title": format!("Пароль стенда {kind}"),
+                   "body": format!("стенд\npassword = {p}\n"), "data": {"kind": "gotcha"}}),
+        )
+        .await;
+        let euri = format!("/api/v1/entries/{}", e["id"].as_str().unwrap());
+        let body = a.t(Method::GET, &euri, None).await.json()["body"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r = a
+            .adm_h(
+                Method::PATCH,
+                &euri,
+                Some(json!({"title": format!("Пароль стенда {kind} (человек)")})),
+                &[("if-match", "1")],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let exposing = body.replace("password = ", "password ");
+        let r = if kind == "patch" {
+            a.tok_h(
+                &a.token,
+                Method::PATCH,
+                &euri,
+                Some(json!({"body": exposing})),
+                &[("if-match", "1")],
+            )
+            .await
+        } else {
+            a.tok_h(
+                &a.token,
+                Method::POST,
+                &format!("{euri}/supersede"),
+                Some(json!({"title": "Пароль стенда", "body": exposing,
+                            "data": {"kind": "gotcha"}})),
+                &[("if-match", "1")],
+            )
+            .await
+        };
+        assert_eq!(r.status, StatusCode::CONFLICT, "{kind}: {}", r.text());
+        assert_eq!(r.json()["rev"], 2, "{kind}: {}", r.text());
+        assert!(!r.text().contains(&p), "{}", r.text());
+        let h = a.adm(Method::GET, &euri, None, None).await.json();
+        assert_eq!(h["body"], format!("стенд\npassword = {p}\n"), "{kind}");
+    }
+}
+
+/// Гонка `PATCH` агента по маске (B5 и B6 круга правок 2): между подсчётом и записью заметку
+/// правят — подсчёт заново по новой ревизии, значение на месте, чужая правка сохранена; правят
+/// быстрее всех попыток — 409 с `current_rev` и `diff` (как у устаревшей ревизии), без значения.
+#[tokio::test]
+async fn agent_patch_race_recounts() {
+    use zam_server::api::nodes::write::TEST_PATCH_RACES;
+    let a = api("secrets-restore-race", |_| {}).await;
+    let s = secret();
+    let content = format!("# K\n\n## A\n\ntoken: {s}\n\n## B\n\nхвост\n");
+    let n = a.note("knowledge", "ops/restore-race", &content).await;
+    let id = n["id"].as_str().unwrap().to_string();
+    let nid: Id = id.parse().unwrap();
+    let uri = format!("/api/v1/nodes/{id}");
+    let races = |c: usize| {
+        let mut g = TEST_PATCH_RACES.lock().unwrap();
+        g.retain(|(x, _)| *x != nid);
+        g.push((nid, c));
+    };
+    races(1);
+    let r = a
+        .t(
+            Method::PATCH,
+            &uri,
+            Some(
+                json!({"base_rev": 1, "ops": [{"op": "replace_section", "section": "K > A",
+                "content": format!("\ntoken: {MARK} (prod)\n\n")}]}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["current_rev"], 3, "{}", r.text());
+    let t = human_text(&a, &id).await;
+    assert!(
+        t.contains(&format!("token: {s} (prod)\n")) && t.ends_with("хвост\nгонка 1\n"),
+        "{t}"
+    );
+    races(3);
+    let r = a
+        .t(
+            Method::PATCH,
+            &uri,
+            Some(
+                json!({"base_rev": 3, "ops": [{"op": "replace_section", "section": "K > A",
+                "content": format!("\ntoken: {MARK} (dev)\n\n")}]}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["current_rev"], 6, "{j}");
+    assert!(
+        j["diff"].as_str().is_some_and(|d| d.contains("гонка 5")),
+        "{j}"
+    );
+    assert!(!r.text().contains(&s), "{}", r.text());
+    let t = human_text(&a, &id).await;
+    assert!(t.contains(&format!("token: {s} (prod)\n")), "{t}");
+    TEST_PATCH_RACES.lock().unwrap().retain(|(x, _)| *x != nid);
+}
+
+/// Литерал `‹secret›` в базе (импорт архива с маской, прежний `secret_mark_kept`) и правка
+/// элемента массива с секретом по правилу ключа (B2, B3 круга правок 2): правка строки с
+/// литералом проходит; элемент `data` правлен с тем же ключом — значение на месте; на месте
+/// элемента другой ключ — 422 с путём элемента.
+#[tokio::test]
+async fn agent_literal_and_item_edits() {
+    let a = api("secrets-restore-literal", |_| {}).await;
+    let s = secret();
+    let lit: String = (0..5).map(|i| format!("сервис {i}: {MARK}\n")).collect();
+    let n = a.note("knowledge", "ops/restore-literal", &lit).await;
+    let id = n["id"].as_str().unwrap().to_string();
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{id}"),
+            Some(json!({"content": lit.replace("сервис 3: ", "сервис 3 (выведен): ")})),
+            &[("if-match", "1")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(kept_of(&r.json()), None, "{}", r.text());
+    let e = post_entry(
+        &a,
+        "knowledge",
+        json!({"kind": "insight", "title": "Варианты ключа", "body": "",
+               "data": {"kind": "decision", "decision": {
+                   "options": [format!("CI: {s}"), "без ключа"], "chosen": "CI",
+                   "rationale": "проверено"}}}),
+    )
+    .await;
+    let euri = format!("/api/v1/entries/{}", e["id"].as_str().unwrap());
+    let v = a.t(Method::GET, &euri, None).await.json();
+    let opt = v["data"]["decision"]["options"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(opt.contains(MARK), "{v}");
+    let data = |o: String| {
+        json!({"kind": "decision", "decision": {"options": [o, "без ключа"], "chosen": "CI",
+               "rationale": "проверено"}})
+    };
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &euri,
+            Some(json!({"data": data(opt.replace("CI:", "CI (GitHub Actions):"))})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let h = a.adm(Method::GET, &euri, None, None).await.json();
+    assert_eq!(
+        h["data"]["decision"]["options"][0],
+        format!("CI (GitHub Actions): {s}"),
+        "{h}"
+    );
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &euri,
+            Some(json!({"data": data(format!("OPENAI_KEY: {MARK}"))})),
+        )
+        .await;
+    context_changed(&r, &s, "data.decision.options[0]: строка 1");
 }
 
 /// Теги и `blocked_by` задачи по маске (M11): переставленный тег с ключом — прежний тег,

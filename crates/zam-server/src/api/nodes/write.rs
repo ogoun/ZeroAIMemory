@@ -380,7 +380,8 @@ const PATCH_ATTEMPTS: usize = 3;
 /// текущей ([`zam_store::apply_ops`]: проверка «секция не менялась после `base_rev`» — по
 /// маскам), значения — обратно ([`secret_restore::MaskedBase`]); выход секрета из-под маски — 422;
 /// запись — со сверкой текущей ревизии ([`zam_store::patch_note_prepared`]), она сменилась —
-/// подсчёт заново (до [`PATCH_ATTEMPTS`] раз, затем 409).
+/// подсчёт заново (до [`PATCH_ATTEMPTS`] раз, затем 409 с `current_rev` и `diff`, как у
+/// устаревшей ревизии).
 async fn patch_by_view(
     st: &AppState,
     p: &Principal,
@@ -438,6 +439,8 @@ async fn patch_by_view(
         let mut ex = secret_restore::Exposed::default();
         ex.add(None, &restored);
         ex.check()?;
+        #[cfg(feature = "test-hooks")]
+        patch_race(&sc.db, id, cur_rev, &attrib).await;
         let w = patch_note_prepared(
             &sc.db,
             id,
@@ -468,10 +471,53 @@ async fn patch_by_view(
             Err(e) => return Err(write_error(p, &sc.db, id, req.base_rev, e).await),
         }
     }
-    Err(ApiError::conflict(
-        "заметку меняют во время правки: перечитайте её (memory_read) и повторите с base_rev \
-         текущей ревизии",
-    ))
+    // заметку меняют быстрее подсчёта — тот же 409, что у устаревшей ревизии: `current_rev` и
+    // `diff` от `base_rev` (круг правок 2 задачи 6, B5)
+    let (current_rev, current) = node_content(&sc.db, id, None).await?;
+    let e = zam_store::WriteError::RevMismatch {
+        current_rev,
+        current,
+    };
+    Err(write_error(p, &sc.db, id, req.base_rev, e).await)
+}
+
+/// Тестовая точка гонки `PATCH` агента по маске (фича `test-hooks`, круг правок 2 задачи 6,
+/// B6): узел → сколько раз между подсчётом и записью «чужая» правка дописывает строку в конец
+/// заметки (новая ревизия — запись видит её и считает заново).
+#[cfg(feature = "test-hooks")]
+pub static TEST_PATCH_RACES: std::sync::Mutex<Vec<(zam_core::Id, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Гонка [`TEST_PATCH_RACES`] для узла `id` ревизии `rev`, если задана.
+#[cfg(feature = "test-hooks")]
+async fn patch_race(db: &zam_store::Db, id: zam_core::Id, rev: i64, a: &zam_store::Attribution) {
+    let hit = {
+        let mut g = TEST_PATCH_RACES.lock().unwrap_or_else(|e| e.into_inner());
+        match g.iter_mut().find(|(n, c)| *n == id && *c > 0) {
+            Some((_, c)) => {
+                *c -= 1;
+                true
+            }
+            None => false,
+        }
+    };
+    if !hit {
+        return;
+    }
+    let (_, text) = node_content(db, id, Some(rev))
+        .await
+        .expect("гонка: текст ревизии");
+    update_note_keyed(
+        db,
+        id,
+        rev,
+        format!("{text}гонка {rev}\n"),
+        None,
+        a.clone(),
+        None,
+    )
+    .await
+    .expect("гонка: правка");
 }
 
 #[derive(Deserialize)]

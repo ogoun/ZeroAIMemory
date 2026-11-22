@@ -1052,6 +1052,12 @@ pub async fn patch(
     deny_report_mutation(&p, &sc)?;
     let rev = Some(if_match(&headers)?);
     let mut req: Patch = json_body(body)?;
+    // агент правил вид ревизии `If-Match`: она устарела — 409 хранилища раньше восстановления
+    // по текущей (круг правок 2 задачи 6, B4; как `PUT` заметки, M6 круга 1) — иначе правка по
+    // старому виду дала бы 422 вместо 409
+    if agent_view::masks(&p) {
+        stale_entry(&sc.entry, rev)?;
+    }
     // агент правил маскированный вид записи: значения под `‹secret›` — обратно до проверок
     // (M7 §4.3.2), длинное тело с метками — в пуле; сессия WebUI — как есть
     let big_body = req.body.as_ref().is_some_and(|b| {
@@ -1188,6 +1194,20 @@ pub async fn patch(
     agent_view::view_json(&p, &mut v, &["warnings"]);
     secret_restore::attach_kept(&mut v, kept);
     Ok(Json(v))
+}
+
+/// `If-Match` `rev` не совпал с ревизией записи `e` — 409 с текущей `rev`, тот же, что даёт
+/// хранилище ([`zam_store::StoreError::StaleRevision`]): сверка раньше восстановления значений
+/// под `‹secret›` по виду записи (правка, замещение).
+pub(crate) fn stale_entry(e: &Entry, rev: Option<i64>) -> Result<(), ApiError> {
+    match rev {
+        Some(expected) if expected != e.rev => Err(zam_store::StoreError::StaleRevision {
+            expected,
+            current: e.rev,
+        }
+        .into()),
+        _ => Ok(()),
+    }
 }
 
 /// Правка `req` агентом по маскированному виду записи `e` (M7 §4.3.2, задача 6 M7.1): поля
