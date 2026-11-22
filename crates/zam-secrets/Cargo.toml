@@ -10,6 +10,9 @@ rust-version.workspace = true
 # и клиент `zam` (маскировка снимка сессии, задача 17a M6)
 [dependencies]
 regex.workspace = true
+# восстановление значений под `‹secret›` при записи агентом (`restore`, M7 §4.3.2, круг правок 1
+# задачи 6 M7.1): дифф строк и слов; без зависимостей, уже в дереве (`zam-store`)
+similar.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
