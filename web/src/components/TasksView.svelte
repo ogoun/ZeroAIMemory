@@ -349,6 +349,20 @@
     actionError = '';
   }
 
+  /** Несохранённое в панели (вопрос перед закрытием): поля — так, как уйдут при отправке
+   * (обрезанные), против сохранённого в задаче. После сохранения и перечитывания карточки (`open`
+   * берёт `next_step` сервера) — пусто; после неудачной отправки набранное остаётся несохранённым. */
+  function unsaved(): boolean {
+    if (mode === 'create') return !!(nTitle.trim() || nBody.trim() || nStep.trim());
+    const c = cur;
+    if (!c) return false;
+    if (mode === 'status') {
+      if (sReason.trim()) return true;
+      if (toStatus === 'blocked' && sBlocked.trim() !== str(c.data, 'blocked_by')) return true;
+    }
+    return c.status !== 'done' && c.status !== 'dropped' && stepDraft.trim() !== str(c.data, 'next_step');
+  }
+
   async function act(fn: () => Promise<string | void>, done: string) {
     if (busy) return;
     busy = true;
@@ -463,6 +477,7 @@
     back={{ href: href({ name: 'journal', user, space, journal: 'tasks', entry: null }), label: JOURNAL_TITLE.tasks }}
     label={mode === 'create' && !cur ? 'Новая задача' : 'Задача'}
     onclose={closeDetail}
+    dirty={unsaved}
     {entry}
   >
     {#snippet list()}

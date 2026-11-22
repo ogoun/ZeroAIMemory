@@ -159,7 +159,8 @@ test.describe('настольный', () => {
   });
 
   test('tasks_overlay_desktop', async ({ page }) => {
-    const problems = watch(page);
+    // 500 на правку — подменённый ответ сценария «неудачная отправка»
+    const problems = watch(page, (path, status) => status === 500 && /\/entries\/[0-9A-Za-z]+$/.test(path));
     const guid = await newSolution('панель поверх доски');
     const id = await addTask(guid, 'Панель: открытая');
     const working = await addTask(guid, 'Панель: в работе', 'in_progress');
@@ -225,15 +226,22 @@ test.describe('настольный', () => {
     await expect(tile).toBeFocused();
     await expect(page).toHaveURL(/\/j\/tasks$/);
     expect(await historyLength()).toBe(h0 + 1);
-    // фон закрывает панель; «Закрыть» — тоже
+    // это был «назад», а не замена адреса: «вперёд» снова открывает задачу
+    await page.goForward();
+    await expect(card.getByRole('heading', { name: 'Панель: открытая' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(sheet).toHaveCount(0);
+    await expect(page).toHaveURL(/\/j\/tasks$/);
+    // фон закрывает панель; «Закрыть» — тоже, двойной щелчок по нему не уводит назад дважды
     await tile.click();
     await expect(card).toBeVisible();
     await page.mouse.click(boardBox.x + 40, VIEWPORTS.desktop.height - 40);
     await expect(sheet).toHaveCount(0);
     await expect(tile).toBeFocused();
     await tile.click();
-    await sheet.getByRole('button', { name: 'Закрыть', exact: true }).click();
+    await sheet.getByRole('button', { name: 'Закрыть', exact: true }).dblclick();
     await expect(sheet).toHaveCount(0);
+    await expect(page).toHaveURL(/\/j\/tasks$/);
     await expect(tile).toBeFocused();
     expect(await historyLength()).toBe(h0 + 1);
 
@@ -250,17 +258,42 @@ test.describe('настольный', () => {
     await expect(ask).toHaveCount(0);
     await expect(step).toBeFocused();
     await expect(step).toHaveValue('черновик шага');
+    // пока вопрос на экране, повторные щелчки по фону и «Закрыть» панель мимо него не закрывают
     await page.mouse.click(boardBox.x + 40, VIEWPORTS.desktop.height - 40);
     await expect(ask).toBeVisible();
+    await expect(ask).toHaveAccessibleDescription('В карточке есть несохранённый текст. Закрыть без сохранения?');
+    await page.mouse.dblclick(boardBox.x + 40, VIEWPORTS.desktop.height - 40);
+    await sheet.getByRole('button', { name: 'Закрыть', exact: true }).click();
+    await expect(ask).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`/j/tasks/${id}$`));
+    await expect(ask.getByRole('button', { name: 'Продолжить правку' })).toBeFocused();
     await ask.getByRole('button', { name: 'Закрыть без сохранения' }).click();
     await expect(sheet).toHaveCount(0);
     await expect(tile).toBeFocused();
-    // сохранённое — не черновик: после «Сохранить шаг» Esc закрывает сразу
+    // сохранённое — не черновик, и с пробелами по краям (уходит обрезанным, карточка перечитана):
+    // после «Сохранить шаг» Esc закрывает сразу
     await tile.click();
-    await step.fill('сохранённый шаг');
+    await step.fill('  сохранённый шаг  ');
     await card.getByRole('button', { name: 'Сохранить шаг' }).click();
     await expect(card.getByRole('status')).toHaveText('Следующий шаг сохранён.');
+    await expect(step).toHaveValue('сохранённый шаг');
     await page.keyboard.press('Escape');
+    await expect(sheet).toHaveCount(0);
+    // неудачная отправка: ошибка видна, текст цел, Esc — снова вопрос, а не молчаливое закрытие
+    await tile.click();
+    await page.route(`**/api/v1/entries/${id}`, (route) =>
+      route.request().method() === 'PATCH'
+        ? route.fulfill({ status: 500, contentType: 'text/plain', body: 'сбой для теста' })
+        : route.continue(),
+    );
+    await step.fill('не ушло на сервер');
+    await card.getByRole('button', { name: 'Сохранить шаг' }).click();
+    await expect(card.getByRole('alert')).toBeVisible();
+    await expect(step).toHaveValue('не ушло на сервер');
+    await page.keyboard.press('Escape');
+    await expect(ask).toBeVisible();
+    await page.unroute(`**/api/v1/entries/${id}`);
+    await ask.getByRole('button', { name: 'Закрыть без сохранения' }).click();
     await expect(sheet).toHaveCount(0);
 
     // в панели открыли другую задачу (ссылка из карточки): после закрытия фокус — на её плитке
@@ -282,6 +315,10 @@ test.describe('настольный', () => {
     await expect(page).toHaveURL(/\/j\/tasks$/);
     expect(await historyLength()).toBe(h1);
     await expect(tile).toBeFocused();
+    // это была замена адреса, а не «назад»: «вперёд» никуда не ведёт, панель закрыта
+    await page.goForward();
+    await expect(page).toHaveURL(/\/j\/tasks$/);
+    await expect(sheet).toHaveCount(0);
     expect(await noHorizontalScroll(page)).toBe(true);
     expect(problems, problems.join('\n')).toEqual([]);
   });

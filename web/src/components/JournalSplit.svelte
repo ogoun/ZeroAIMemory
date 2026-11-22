@@ -10,10 +10,12 @@
   //   панель 480 px поверх списка (окно `role="dialog"` у правого края под шапкой, своя прокрутка),
   //   список не сужается; фон, Esc и «Закрыть» закрывают (`onclose` и адрес журнала без записи —
   //   «назад» истории, если панель открыта со списка, иначе заменой адреса: закрытие не добавляет
-  //   запись истории). Несохранённый текст в полях панели молча не теряется — сначала вопрос
-  //   «Закрыть без сохранения?». Esc — самому верхнему слою: выдвижная панель дерева, окна и меню
-  //   берут его раньше. Фокус не уходит под фон: Tab — по кругу целей панели, фокус на элементе под
-  //   фоном или панелью (после щелчка по шапке) возвращается в панель; уже SPLIT_MIN — `stack`.
+  //   запись истории; повторное закрытие, пока идёт «назад», ничего не делает). Несохранённое молча
+  //   не теряется: журнал отвечает `dirty()` (что не сохранено — знает он), и тогда сначала вопрос
+  //   «Закрыть без сохранения?»; пока он на экране, закрывает только «Закрыть без сохранения».
+  //   Esc — самому верхнему слою: выдвижная панель дерева, окна и меню берут его раньше. Фокус не
+  //   уходит под фон: Tab — по кругу целей панели, фокус на списке под панелью или на элементе под
+  //   фоном (после щелчка по шапке) возвращается в панель; уже SPLIT_MIN — `stack`.
   // Фокус переходит только при открытии записи или формы (и при смене записи — `entry`): в `stack`
   // и `overlay` — на первый заголовок карточки, при возврате «←» (закрытии панели) — на нажатую
   // строку списка, иначе на строку записи (`[data-entry="<entry>"]` в списке), иначе на сам список.
@@ -34,13 +36,18 @@
     label?: string;
     /** Карточку закрыли («←» в `stack`; фон или Esc панели `overlay`). */
     onclose?: () => void;
+    /** В панели `overlay` есть несохранённое (сравнение — у журнала, с тем, что сохранено в записи):
+     * закрытие сначала спрашивает. */
+    dirty?: () => boolean;
     /** id открытой записи: смена — новая карточка; строка списка помечена `data-entry` с ним. */
     entry?: string | null;
     list: Snippet;
     detail: Snippet;
   }
 
-  let { open, back, mode = 'auto', label, onclose, entry = null, list, detail }: Props = $props();
+  let { open, back, mode = 'auto', label, onclose, dirty, entry = null, list, detail }: Props = $props();
+
+  const uid = $props.id();
 
   /** Ширина области; 0 — ещё не измерена (первое значение приходит до отрисовки). */
   let width = $state(0);
@@ -81,9 +88,10 @@
   let opened: { hash: string; pops: boolean } | null = null;
   /** Последняя смена адреса-хэша (`hashchange`): откуда пришли к открытой записи. */
   let lastChange: { from: string; to: string } | null = null;
-  /** Поля ввода панели и их значения на момент первого фокуса или отправки формы: отличие —
-   * несохранённый текст. */
-  const initial = new Map<HTMLInputElement | HTMLTextAreaElement, string>();
+  /** Панель закрывается («назад» истории ещё не отработал): повторные закрытия не действуют. */
+  let closing = false;
+  /** Где был фокус, когда появился вопрос «Закрыть без сохранения?» («Продолжить правку» — туда). */
+  let beforeAsk: HTMLElement | null = null;
   /** Последний нажатый элемент списка: Safari не даёт кнопке фокус по нажатию. */
   let activated: HTMLElement | null = null;
 
@@ -154,7 +162,7 @@
           fresh = false;
         } else {
           confirming = false;
-          initial.clear();
+          closing = false;
           opened = null;
           if (!o) void closeSheet();
           // иначе область сузилась при открытой панели — карточка вместо списка (ниже)
@@ -218,8 +226,8 @@
   function openSheet() {
     const h = location.hash;
     opened = { hash: h, pops: !!lastChange && lastChange.from === back.href && lastChange.to === h };
-    initial.clear();
     confirming = false;
+    closing = false;
   }
 
   /** Панель поверх списка: при открытии (и смене записи) — фокус на заголовке карточки; при смене
@@ -287,10 +295,12 @@
 
   /** Закрыть панель: `onclose` (форма без записи) и адрес журнала без записи — «назад» истории,
    * если к записи пришли со списка, иначе заменой адреса: закрытие записи истории не добавляет, и
-   * «назад» браузера закрытую панель снова не открывает. */
+   * «назад» браузера закрытую панель снова не открывает. «Назад» асинхронный: до смены адреса
+   * панель ещё видна, и повторный Esc или щелчок не уводят назад второй раз (`closing`). */
   function close() {
+    if (closing) return;
+    closing = true;
     confirming = false;
-    initial.clear();
     onclose?.();
     const h = location.hash;
     if (h === back.href) return;
@@ -298,43 +308,30 @@
     else go(parse(back.href), { replace: true });
   }
 
-  /** Поле ввода панели с несохранённым текстом (значение не то, что было при первом фокусе или
-   * последней отправке формы). */
-  function draftField(): HTMLInputElement | HTMLTextAreaElement | null {
-    for (const [f, v] of initial) if (f.isConnected && f.value !== v) return f;
-    return null;
-  }
-
-  /** Закрыть по фону, Esc или «Закрыть»: несохранённый текст — сначала вопрос в панели. */
+  /** Закрыть по фону, Esc или «Закрыть»: несохранённое — сначала вопрос в панели; пока он на
+   * экране, фон и «Закрыть» только возвращают к нему фокус (закрывает «Закрыть без сохранения»). */
   async function requestClose() {
-    if (!confirming && draftField()) {
-      confirming = true;
-      await tick();
-      confirmEl?.querySelector<HTMLElement>('button')?.focus();
+    if (closing) return;
+    if (!confirming && !dirty?.()) {
+      close();
       return;
     }
-    close();
+    if (!confirming) {
+      const a = document.activeElement;
+      beforeAsk = a instanceof HTMLElement && detailEl?.contains(a) ? a : null;
+      confirming = true;
+    }
+    await tick();
+    confirmEl?.querySelector<HTMLElement>('button')?.focus();
   }
 
-  /** «Продолжить правку»: вопрос скрыт, фокус — в поле с текстом. */
+  /** «Продолжить правку»: вопрос скрыт, фокус — где был (поле с текстом), иначе на панели. */
   async function keepEditing() {
     confirming = false;
-    const f = draftField();
+    const back0 = beforeAsk;
+    beforeAsk = null;
     await tick();
-    (f ?? detailEl)?.focus();
-  }
-
-  const TEXT_INPUT = /^(text|search|url|email|tel|number|password|date|datetime-local|time|month|week)$/;
-  /** Первый фокус поля ввода панели — его значение без правок. */
-  function trackField(e: FocusEvent) {
-    const t = e.target;
-    if (!paneled || initial.has(t as HTMLInputElement)) return;
-    if (t instanceof HTMLTextAreaElement || (t instanceof HTMLInputElement && TEXT_INPUT.test(t.type))) initial.set(t, t.value);
-  }
-
-  /** Форма панели отправлена: набранное — уже не черновик. */
-  function resnap() {
-    for (const f of initial.keys()) initial.set(f, f.value);
+    (back0?.isConnected ? back0 : detailEl)?.focus();
   }
 
   // Esc — самому верхнему слою. Этот обработчик — на `window` после обработчика оболочки (она
@@ -351,14 +348,17 @@
     else void requestClose();
   }
 
-  /** Элемент закрыт фоном или самой панелью (по точке в его середине, внутри окна). */
+  /** Элемент закрыт фоном или самой панелью. Список журнала под открытой панелью закрыт всегда (по
+   * DOM: и строка, заехавшая под липкую шапку); прочее (неподвижное дерево) — по точке в середине
+   * элемента внутри окна: выше фона лежат шапка, выдвижная панель, окна и меню. */
   function underSheet(t: HTMLElement): boolean {
+    if (listEl?.contains(t)) return true;
     const r = t.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) return !!listEl?.contains(t);
+    if (r.width === 0 && r.height === 0) return false;
     const x = Math.min(Math.max(r.left + r.width / 2, 0), window.innerWidth - 1);
     const y = Math.min(Math.max(r.top + r.height / 2, 0), window.innerHeight - 1);
     const hit = document.elementFromPoint(x, y);
-    if (!hit) return !!listEl?.contains(t);
+    if (!hit) return false;
     if (hit === t || t.contains(hit) || hit.contains(t)) return false;
     return hit === scrimEl || !!detailEl?.contains(hit);
   }
@@ -377,6 +377,8 @@
 
   function onhashchange(e: HashChangeEvent) {
     lastChange = { from: new URL(e.oldURL).hash, to: new URL(e.newURL).hash };
+    // адрес сменился — закрытие состоялось (или ушли со страницы): повторное снова разрешено
+    closing = false;
   }
 
   const FOCUSABLE = 'a[href], button, input, select, textarea, summary, [tabindex]';
@@ -434,16 +436,20 @@
         aria-label={sheet ? (label ?? back.label) : undefined}
         tabindex={sheet ? -1 : undefined}
         onkeydown={trap}
-        onfocusin={trackField}
-        onsubmit={resnap}
       >
         {#if layout === 'stack'}
           <a class="jsplit-back" href={back.href} onclick={() => onclose?.()}>← {back.label}</a>
         {:else if sheet}
           <div class="jsplit-bar"><button type="button" onclick={requestClose}>Закрыть</button></div>
           {#if confirming}
-            <div class="jsplit-confirm warn" role="alertdialog" aria-label="Несохранённый текст" bind:this={confirmEl}>
-              <p>В карточке есть несохранённый текст. Закрыть без сохранения?</p>
+            <div
+              class="jsplit-confirm warn"
+              role="alertdialog"
+              aria-label="Несохранённый текст"
+              aria-describedby={`${uid}-ask`}
+              bind:this={confirmEl}
+            >
+              <p id={`${uid}-ask`}>В карточке есть несохранённый текст. Закрыть без сохранения?</p>
               <div class="row">
                 <button type="button" onclick={keepEditing}>Продолжить правку</button>
                 <button type="button" class="danger" onclick={close}>Закрыть без сохранения</button>
