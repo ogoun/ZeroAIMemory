@@ -91,6 +91,9 @@ test.describe('телефон, сенсорный ввод', () => {
       await expect(sections.getByRole('link', { name, exact: true })).toBeVisible();
     }
     await minTarget(sections.getByRole('link'), 44);
+    // строки «Разделов» — по левому краю, как строки дерева
+    const align = await sections.getByRole('link').evaluateAll((els) => els.map((e) => getComputedStyle(e).justifyContent));
+    expect(align.filter((j) => j === 'center'), 'строки «Разделов» не по центру').toEqual([]);
     await expect(treeNav(page)).toBeVisible();
     const order = await sidebar(page).evaluate((s) => {
       const nav = s.querySelector('nav[aria-label="Разделы"]')!;
@@ -134,6 +137,14 @@ test.describe('телефон, сенсорный ввод', () => {
     await page.keyboard.press('Escape');
     await expect(page.getByRole('button', { name: 'Выйти' })).toHaveCount(0);
     await expect(account).toBeFocused();
+    // Esc закрывает меню и когда фокус не в нём (Safari и Firefox на macOS не фокусируют кнопку
+    // по щелчку)
+    await account.click();
+    await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: 'Выйти' })).toHaveCount(0);
+    await expect(account).toHaveAttribute('aria-expanded', 'false');
 
     // смена класса ширины закрывает панель: телефон → планшет (фокус с исчезнувших «Разделов» —
     // на ☰), затем настольный и обратно — панель не открывается сама
@@ -437,6 +448,14 @@ test.describe('планшет в альбомной ориентации, сен
     await expect(split).toHaveAttribute('data-layout', 'split');
     await expect(def).toBeFocused();
     await expect(page.getByRole('list', { name: 'Термины' })).toBeVisible();
+
+    // фокус в списке, а сужение прячет список — фокус на заголовок карточки, не на body
+    await page.getByRole('searchbox', { name: 'Поиск по словарю' }).focus();
+    await page.setViewportSize({ width: VIEWPORTS.tablet.width, height: VIEWPORTS.tablet.height });
+    await expect(split).toHaveAttribute('data-layout', 'stack');
+    await expect(
+      page.getByRole('article', { name: 'Карточка термина' }).getByRole('heading', { name: `Поворот ${run}` }),
+    ).toBeFocused();
     expect(problems, problems.join('\n')).toEqual([]);
   });
 });

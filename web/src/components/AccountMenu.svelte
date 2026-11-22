@@ -1,8 +1,8 @@
 <script lang="ts">
   // Меню аккаунта шапки телефона (M7.2, спецификация §5.1 п. 3): логин и «Выйти». Раскрывашка
   // (`aria-expanded`, панель в DOM всегда — `hidden`, поэтому `aria-controls` ссылается на
-  // существующий узел); закрывается Esc (фокус — на кнопку меню), щелчком мимо, уходом фокуса из
-  // меню и сменой `closeKey` (переход по адресу).
+  // существующий узел); закрывается Esc (где бы ни был фокус; фокус из меню — на кнопку меню),
+  // щелчком мимо, уходом фокуса из меню и сменой `closeKey` (переход по адресу).
   import { untrack } from 'svelte';
 
   let { login, onlogout, closeKey }: { login: string; onlogout: () => void; closeKey?: unknown } = $props();
@@ -24,19 +24,21 @@
     if (e.relatedTarget instanceof Node && !root?.contains(e.relatedTarget)) open = false;
   }
 
-  // Esc меню отмечается обработанным: Esc оболочки (выдвижная панель) его уже не берёт
+  // Esc — на документе, пока меню открыто: Safari и Firefox на macOS не дают кнопке фокус по
+  // щелчку, и фокус может быть вне меню. Esc отмечается обработанным — Esc оболочки (выдвижная
+  // панель) его уже не берёт; фокус был в меню или потерян — на кнопку меню.
   function onkeydown(e: KeyboardEvent) {
-    if (e.key !== 'Escape' || !open) return;
+    if (e.key !== 'Escape' || !open || e.defaultPrevented) return;
     e.preventDefault();
     open = false;
-    button?.focus();
+    const a = document.activeElement;
+    if (!a || a === document.body || root?.contains(a)) button?.focus();
   }
 </script>
 
-<svelte:document {onpointerdown} />
+<svelte:document {onpointerdown} {onkeydown} />
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="account" bind:this={root} {onfocusout} {onkeydown}>
+<div class="account" bind:this={root} {onfocusout}>
   <button
     type="button"
     class="account-btn"

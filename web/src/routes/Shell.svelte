@@ -570,7 +570,8 @@
     /* пунктов больше, чем влезает на узком экране: меню прокручивается само, страница — нет */
     min-width: 0;
     overflow-x: auto;
-    scrollbar-width: none;
+    /* с мышью при переполнении видна тонкая полоса прокрутки, при касании — скрыта */
+    scrollbar-width: thin;
   }
   .topnav a {
     flex: none;
@@ -721,8 +722,13 @@
     /* разделы шапки в ряд — с зазором между целями (`--touch-gap`, app.css) */
     .topnav:not(.rows) {
       gap: var(--touch-gap);
+      scrollbar-width: none;
     }
-    .topnav a {
+    .topnav:not(.rows)::-webkit-scrollbar {
+      display: none;
+    }
+    /* строки «Разделов» панели — свои правила (44 px, по левому краю) */
+    .topnav:not(.rows) a {
       display: inline-flex;
       align-items: center;
       justify-content: center;

@@ -127,7 +127,8 @@
   });
 
   /** Карточка вместо списка: при открытии — её верх в видимой области под шапкой и фокус на
-   * заголовке; при смене раскладки — фокус на месте, прокрутка — если фокус не в карточке. */
+   * заголовке; при смене раскладки — фокус на месте, прокрутка — если фокус не в карточке, а
+   * фокус со скрытого списка (или потерянный) — на заголовок карточки. */
   async function showCard(opening: boolean) {
     shownEntry = entry;
     await tick();
@@ -137,7 +138,9 @@
     const top = d.getBoundingClientRect().top;
     const margin = parseFloat(getComputedStyle(d).scrollMarginTop) || 0;
     if (top < margin || top > window.innerHeight - 120) d.scrollIntoView({ block: 'start' });
-    if (!opening) return;
+    const a = document.activeElement;
+    const lost = !a || a === document.body || inList(a);
+    if (!opening && !lost) return;
     const h = d.querySelector<HTMLElement>('h1, h2, h3');
     if (h) {
       if (!h.hasAttribute('tabindex')) h.tabIndex = -1;
