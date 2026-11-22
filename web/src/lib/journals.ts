@@ -31,18 +31,9 @@ export function journalsOf(kind: string): Journal[] {
  * импортирует и `ideaButtons.ts`, проверяемый `node --test`). */
 export { JOURNAL_OF_KIND, entryRef } from './entryRefs';
 
-/** Колонки доски задач (M4.5 §3) и подписи. */
-export const TASK_COLUMNS: EntryStatus[] = ['open', 'in_progress', 'blocked', 'done', 'dropped'];
-
-/**
- * Вкладка доски задач в узкой области (M7.2, спецификация §5.2 п. 1, решение 18): статус задачи из
- * адреса, иначе «в работе», а если в работе задач нет — «открыт». Числа — `entries/counts` с
- * фильтрами доски; не пришли (`null`) — «в работе».
- */
-export function boardTab(counts: Partial<Record<EntryStatus, number>> | null, status: EntryStatus | null = null): EntryStatus {
-  if (status && TASK_COLUMNS.includes(status)) return status;
-  return counts && !counts.in_progress ? 'open' : 'in_progress';
-}
+/** Колонки доски задач (M4.5 §3) и вкладка по умолчанию в узкой области (M7.2, §5.2 п. 1) — в
+ * `taskBoard.ts` (без зависимостей: его проверяет `node --test`). */
+export { TASK_COLUMNS, boardTab } from './taskBoard';
 
 /** Подпись статуса с заглавной буквы: вкладки доски («В работе»). */
 export const capitalized = (s: string): string => (s ? s[0].toUpperCase() + s.slice(1) : s);

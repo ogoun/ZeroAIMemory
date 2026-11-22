@@ -20,7 +20,7 @@
   // `<details>` (открыт первый непустой раздел, число — в заголовке); чипы статусов — полоса;
   // фильтры (приоритет, тег, поиск) на телефоне — под кнопкой «Фильтры»; сбой загрузки чанка формы
   // — `LazyFail`.
-  import { untrack, type Snippet } from 'svelte';
+  import { tick, untrack, type Snippet } from 'svelte';
   import JournalSplit from './JournalSplit.svelte';
   import LazyFail from './LazyFail.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
@@ -301,6 +301,20 @@
       cur = null;
       fail(e, (m) => (curError = m));
     }
+  }
+
+  /** «Показать ещё»: на время загрузки кнопка остаётся (`aria-disabled`), фокус на ней цел;
+   * страниц больше нет и кнопка ушла — фокус на первую догруженную запись. */
+  async function more(e: MouseEvent) {
+    if (loading) return;
+    const btn = e.currentTarget as HTMLElement;
+    const n = items.length;
+    await load(user, space, false);
+    await tick();
+    const a = document.activeElement;
+    const first = items[n]?.id;
+    if (btn.isConnected || (a && a !== document.body) || !first) return;
+    document.querySelector<HTMLElement>(`[data-idea="${CSS.escape(first)}"] button`)?.focus();
   }
 
   /** Открыть идею: новая запись истории — «назад» браузера возвращает к ленте (§5.1 п. 5). */
@@ -601,8 +615,8 @@
     {#if !loading && !error && !(hits ?? items).length}
       <p class="muted">{hits ? 'Ничего не найдено.' : filtered ? 'Идей по выбранным фильтрам нет.' : 'Идей нет.'}</p>
     {/if}
-    {#if next && !loading}
-      <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
+    {#if next}
+      <button type="button" class="more" aria-disabled={loading} aria-busy={loading} onclick={more}>Показать ещё</button>
     {/if}
     {#if loading}<p class="muted">Загрузка…</p>{/if}
   </div>
@@ -807,6 +821,10 @@
 {/snippet}
 
 <style>
+  .more[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: default;
+  }
   .bar {
     margin-bottom: 8px;
   }

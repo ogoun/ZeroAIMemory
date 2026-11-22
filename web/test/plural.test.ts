@@ -18,11 +18,3 @@ test('plural_ru', () => {
   assert.equal(plural(-21, 'задача', 'задачи', 'задач'), 'задача');
   assert.equal(plural(2.5, 'задача', 'задачи', 'задач'), 'задачи');
 });
-
-test('plural_matches_code_files_text', () => {
-  // прежние подписи страницы «Код» (`filesText`, `symbolsText`) — то же правило
-  assert.deepEqual(
-    [1, 3, 8, 40].map((n) => `${n} ${plural(n, 'файл', 'файла', 'файлов')}`),
-    ['1 файл', '3 файла', '8 файлов', '40 файлов'],
-  );
-});

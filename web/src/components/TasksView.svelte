@@ -14,7 +14,7 @@
   // вкладки, решение 19); на вкладках грузится только выбранная. Числа колонок и вкладок —
   // `entries/counts` сервера, с фильтром «Из идей». Вкладка по умолчанию — «В работе», при пустой —
   // «Открыт»; задача, открытая из адреса, выбирает вкладку своего статуса (решение 18).
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
   import StatusTabs from './StatusTabs.svelte';
@@ -59,6 +59,8 @@
 
   /** Задач статуса на страницу (решение 19). */
   const PAGE = 50;
+  /** Наибольшая страница ленты сервера: перечитывание после правки сохраняет загруженное до неё. */
+  const PAGE_MAX = 200;
 
   /** Колонка (вкладка) статуса: загруженные задачи, курсор, состояние запроса. */
   interface Column {
@@ -132,9 +134,7 @@
         tab = null;
         tabFor = '';
         resetBoard();
-        loadRefs(u, s).then((r) => {
-          if (u === user && s === space) refs = r;
-        });
+        reloadRefs();
         return;
       }
       if (countsFailed) loadCounts();
@@ -172,6 +172,15 @@
     untrack(() => open(u, id));
   });
 
+  /** Ссылки на файлы задач («возможно устарело»): при входе в журнал и после правки. */
+  function reloadRefs() {
+    const u = user;
+    const s = space;
+    loadRefs(u, s).then((r) => {
+      if (u === user && s === space) refs = r;
+    });
+  }
+
   /** Всё заново: числа и колонки (видимые загрузит эффект выше). */
   function resetBoard() {
     for (const s of TASK_COLUMNS) cseq[s] = (cseq[s] ?? 0) + 1;
@@ -196,8 +205,8 @@
     }
   }
 
-  /** Страница задач статуса `s`: первая (`reset`) или следующая по курсору. */
-  async function loadColumn(s: EntryStatus, reset: boolean) {
+  /** Страница задач статуса `s`: первая (`reset`) или следующая по курсору; `limit` — размер. */
+  async function loadColumn(s: EntryStatus, reset: boolean, limit = PAGE) {
     const c = cols[s];
     const my = (cseq[s] = (cseq[s] ?? 0) + 1);
     c.loading = true;
@@ -208,7 +217,7 @@
         status: [s],
         fromIdea,
         cursor: reset ? null : c.next,
-        limit: PAGE,
+        limit,
       });
       if (my !== cseq[s]) return;
       c.items = reset ? r.items : [...c.items, ...r.items];
@@ -227,8 +236,9 @@
     }
   }
 
-  /** После правки: числа и видимые статусы — заново (задача могла сменить колонку), прочие
-   * вкладки — при следующем выборе. */
+  /** После правки: числа и видимые статусы — заново (задача могла сменить колонку), столько же
+   * задач, сколько было загружено «Показать ещё» (до PAGE_MAX); прочие вкладки — при следующем
+   * выборе. */
   async function reloadBoard() {
     const vis = visible;
     for (const s of TASK_COLUMNS) {
@@ -236,11 +246,23 @@
       cseq[s] = (cseq[s] ?? 0) + 1;
       cols[s] = emptyColumn();
     }
-    await Promise.all([loadCounts(), ...vis.map((s) => loadColumn(s, true))]);
+    const size = (s: EntryStatus) => Math.min(PAGE_MAX, Math.max(PAGE, cols[s].items.length));
+    await Promise.all([loadCounts(), ...vis.map((s) => loadColumn(s, true, size(s)))]);
   }
 
-  function more(s: EntryStatus) {
-    if (!cols[s].loading) loadColumn(s, false);
+  /** «Показать ещё» колонки или вкладки. Кнопка на время загрузки остаётся (`aria-disabled`),
+   * фокус на ней цел; страниц больше нет и кнопка ушла — фокус на первую догруженную задачу. */
+  async function more(s: EntryStatus, e: MouseEvent) {
+    const c = cols[s];
+    if (c.loading) return;
+    const btn = e.currentTarget as HTMLElement;
+    const box = btn.parentElement;
+    const first = c.items.length;
+    await loadColumn(s, false);
+    await tick();
+    const a = document.activeElement;
+    if (btn.isConnected || (a && a !== document.body)) return;
+    box?.querySelectorAll<HTMLElement>('[data-task]')[first]?.querySelector<HTMLElement>('button')?.focus();
   }
 
   function selectTab(s: EntryStatus) {
@@ -336,6 +358,7 @@
       const target = (await fn()) ?? cur?.id ?? null;
       mode = 'none';
       await reloadBoard();
+      reloadRefs();
       if (target && target !== entry) select(target);
       else await open(user, target);
       notice = done;
@@ -503,8 +526,8 @@
       {#if stale.length}<div class="badge small">возможно устарело</div>{/if}
     </article>
   {/each}
-  {#if c.next && !c.loading}
-    <button type="button" class="more" onclick={() => more(s)}>Показать ещё</button>
+  {#if c.next}
+    <button type="button" class="more" aria-disabled={c.loading} aria-busy={c.loading} onclick={(e) => more(s, e)}>Показать ещё</button>
   {/if}
 {/snippet}
 
@@ -646,6 +669,10 @@
   }
   .more {
     margin-top: 2px;
+  }
+  .more[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: default;
   }
   .link {
     padding: 0;

@@ -9,7 +9,7 @@
   // карточка вместо таблицы); в области журнала уже 720 px таблица остаётся таблицей (те же строки
   // и ячейки), столбцы «Вид», «Область», «Показы», «Изменено» скрыты, их значения — строкой под
   // заголовком. Условие — ширина области журнала, а не колонки списка рядом с карточкой.
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
@@ -147,13 +147,18 @@
   // Таблица — заново только при смене пользователя или пространства: свойства приходят из объекта
   // маршрута, и эффект перезапускается на каждый переход (открытие записи) — фильтры, загруженные
   // страницы и прокрутка при этом целы (§5.1 п. 5); неудавшаяся загрузка повторяется при следующем
-  // переходе.
+  // переходе с прежними фильтрами.
   let listOf = '';
+  /** Первая страница таблицы не загрузилась: следующий переход повторит загрузку. */
+  let failed = false;
   $effect(() => {
     const u = user;
     const s = space;
     untrack(() => {
-      if (listOf === `${u}|${s}`) return;
+      if (listOf === `${u}|${s}`) {
+        if (failed) load(u, s, true);
+        return;
+      }
       listOf = `${u}|${s}`;
       fKind = '';
       fStatus = '';
@@ -162,11 +167,19 @@
       fTag = '';
       fHuman = false;
       load(u, s, true);
-      loadRefs(u, s).then((r) => {
-        if (u === user && s === space) refs = r;
-      });
+      reloadRefs();
     });
   });
+
+  /** Ссылки на файлы записей («возможно устарело»): при входе в журнал и после правки (новая
+   * запись замены приходит со своими ссылками). */
+  function reloadRefs() {
+    const u = user;
+    const s = space;
+    loadRefs(u, s).then((r) => {
+      if (u === user && s === space) refs = r;
+    });
+  }
 
   $effect(() => {
     const id = entry;
@@ -178,6 +191,7 @@
     const my = ++seq;
     loading = true;
     error = '';
+    if (reset) failed = false;
     try {
       const r = await listEntries(u, s, {
         kind: 'insight',
@@ -197,8 +211,7 @@
       if (my !== seq) return;
       if (reset) {
         items = [];
-        // следующий переход в журнал загрузит таблицу снова (фильтры сбросятся)
-        listOf = '';
+        failed = true;
       }
       fail(e, (m) => (error = m));
     } finally {
@@ -294,6 +307,20 @@
     }
   }
 
+  /** «Показать ещё»: на время загрузки кнопка остаётся (`aria-disabled`), фокус на ней цел;
+   * страниц больше нет и кнопка ушла — фокус на первую догруженную запись. */
+  async function more(e: MouseEvent) {
+    if (loading) return;
+    const btn = e.currentTarget as HTMLElement;
+    const n = items.length;
+    await load(user, space, false);
+    await tick();
+    const a = document.activeElement;
+    const first = items[n]?.id;
+    if (btn.isConnected || (a && a !== document.body) || !first) return;
+    document.querySelector<HTMLElement>(`tr[data-entry="${CSS.escape(first)}"] button`)?.focus();
+  }
+
   /** Открыть запись: новая запись истории — «назад» браузера возвращает к таблице (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
@@ -313,6 +340,7 @@
       const target = (await fn()) ?? cur?.id ?? null;
       mode = 'none';
       await reloadList();
+      reloadRefs();
       if (target && target !== entry) {
         select(target);
       } else {
@@ -571,8 +599,8 @@
   </div>
   {#if !loading && items.length === 0 && !error}<p class="muted">Записей нет.</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}
-  {#if next && !loading}
-    <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
+  {#if next}
+    <button type="button" class="more" aria-disabled={loading} aria-busy={loading} onclick={more}>Показать ещё</button>
   {/if}
 {/snippet}
 
@@ -793,6 +821,10 @@
 {/snippet}
 
 <style>
+  .more[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: default;
+  }
   .filters {
     margin-bottom: 12px;
   }

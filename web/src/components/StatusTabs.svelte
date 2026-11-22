@@ -74,7 +74,10 @@
   {/each}
 </div>
 {#if children}
-  <div role="tabpanel" id={`${uid}-panel`} aria-labelledby={`${uid}-tab-${selected}`}>
+  <!-- панель — в порядке Tab (`tabindex="0"`, как в образце ARIA APG): пустая вкладка («Задач
+       нет.») тоже достижима, Tab с вкладки — на панель, затем на её содержимое -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <div class="status-panel" role="tabpanel" id={`${uid}-panel`} aria-labelledby={`${uid}-tab-${selected}`} tabindex="0">
     {@render children()}
   </div>
 {/if}
@@ -104,6 +107,11 @@
   }
   [aria-selected='true'] .count {
     color: inherit;
+  }
+  .status-panel:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
   }
   /* при касании — цели 44 px (app.css) и зазор между соседними (`--touch-gap`) */
   @media (pointer: coarse) {

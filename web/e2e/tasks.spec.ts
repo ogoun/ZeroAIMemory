@@ -16,8 +16,8 @@ const screens = fileURLToPath(new URL('../../.tmp/e2e/screens/mobile/', import.m
 
 test.use({ storageState: ADMIN_STATE });
 
-/** Ошибки JS, CSP и неожиданные HTTP-ответы страницы. */
-function watch(page: Page): string[] {
+/** Ошибки JS, CSP и неожиданные HTTP-ответы страницы; `allow(path, status)` — ожидаемые. */
+function watch(page: Page, allow: (path: string, status: number) => boolean = () => false): string[] {
   const problems: string[] = [];
   page.on('console', (m) => {
     if (m.type() === 'error' && !m.text().startsWith('Failed to load resource')) problems.push(m.text());
@@ -27,7 +27,8 @@ function watch(page: Page): string[] {
     const path = new URL(r.url()).pathname;
     const expected =
       (r.status() === 401 && path.endsWith('/api/v1/auth/me')) ||
-      (r.status() === 404 && path.endsWith('/favicon.ico'));
+      (r.status() === 404 && path.endsWith('/favicon.ico')) ||
+      allow(path, r.status());
     if (r.status() >= 400 && !expected) problems.push(`HTTP ${r.status()} ${r.request().method()} ${path}`);
   });
   return problems;
@@ -129,14 +130,31 @@ test.describe('настольный', () => {
     const done = columnOf(page, 'выполнен').locator('[data-task]');
     await expect(done).toHaveCount(50);
     await expect(columnOf(page, 'открыт').getByRole('button', { name: 'Показать ещё' })).toHaveCount(0);
-    await columnOf(page, 'выполнен').getByRole('button', { name: 'Показать ещё' }).click();
+    // «Показать ещё» с клавиатуры: кнопка остаётся на месте (на время загрузки — `aria-disabled`),
+    // фокус на ней не теряется
+    const more = columnOf(page, 'выполнен').getByRole('button', { name: 'Показать ещё' });
+    await more.focus();
+    await page.keyboard.press('Enter');
     await expect(done).toHaveCount(100);
+    await expect(more).toBeFocused();
+    await expect(more).toHaveAttribute('aria-busy', 'false');
     await expect(done.first()).toContainText('Выполненная задача 250');
     const statuses = lists.map((u) => u.searchParams.get('status') ?? '');
     expect([...new Set(statuses)].sort()).toEqual(['blocked', 'done', 'dropped', 'in_progress', 'open']);
     expect(lists.every((u) => u.searchParams.get('limit') === '50'), lists.join('\n')).toBe(true);
     expect(lists.filter((u) => u.searchParams.get('cursor')).map((u) => u.searchParams.get('status'))).toEqual(['done']);
     expect(lists).toHaveLength(6);
+
+    // правка из карточки перечитывает колонки, но не укорачивает догруженную: «выполнен» — 100
+    await columnOf(page, 'открыт').getByRole('button', { name: 'Старая открытая задача' }).click();
+    const card = page.getByRole('article', { name: 'Карточка задачи' });
+    await card.getByRole('button', { name: '→ в работе' }).click();
+    await card.getByRole('button', { name: 'Применить' }).click();
+    await expect(card.getByRole('status')).toHaveText('Статус: в работе.');
+    await expect(columnOf(page, 'в работе')).toContainText('Старая открытая задача');
+    await expect(columnOf(page, 'открыт').getByRole('heading')).toHaveText('открыт 0');
+    await expect(done).toHaveCount(100);
+    expect(lists.filter((u) => u.searchParams.get('status') === 'done').at(-1)?.searchParams.get('limit')).toBe('100');
     expect(problems, problems.join('\n')).toEqual([]);
   });
 
@@ -144,7 +162,7 @@ test.describe('настольный', () => {
     const problems = watch(page);
     const guid = await newSolution('панель поверх доски');
     const id = await addTask(guid, 'Панель: открытая');
-    await addTask(guid, 'Панель: в работе', 'in_progress');
+    const working = await addTask(guid, 'Панель: в работе', 'in_progress');
     await addTask(guid, 'Панель: выполненная', 'done');
     const c = await pageCtx(page);
     await open(page, tasksUrl(c.user, guid));
@@ -158,6 +176,8 @@ test.describe('настольный', () => {
 
     // карточка — панель 480 px у правого края под шапкой, доска не сузилась
     const tile = columnOf(page, 'открыт').getByRole('button', { name: 'Панель: открытая' });
+    const historyLength = () => page.evaluate(() => history.length);
+    const h0 = await historyLength();
     await tile.click();
     await expect(page).toHaveURL(new RegExp(`/j/tasks/${id}$`));
     await expect(page.locator('.jsplit')).toHaveAttribute('data-layout', 'overlay');
@@ -184,11 +204,27 @@ test.describe('настольный', () => {
       expect(await inSheet(), `Shift+Tab ${i + 1}`).toBe(true);
     }
 
-    // Esc закрывает, фокус — на плитке; адрес — журнал без записи
+    // фокус не уходит под фон: после шапки Tab возвращает фокус в панель, а не на доску и дерево
+    const where = () =>
+      page.evaluate(() => {
+        const a = document.activeElement;
+        if (a?.closest('[role="dialog"]')) return 'панель';
+        if (a?.closest('header.topbar')) return 'шапка';
+        return 'под фоном';
+      });
+    await page.getByRole('button', { name: 'Поиск', exact: true }).focus();
+    for (let i = 0; i < 6; i++) {
+      await page.keyboard.press('Tab');
+      await expect.poll(where, `Tab ${i + 1} после шапки`).not.toBe('под фоном');
+    }
+
+    // Esc закрывает, фокус — на плитке; адрес журнала без записи — «назад» истории: закрытие
+    // записи истории не добавляет, и «назад» браузера панель снова не открывает
     await page.keyboard.press('Escape');
     await expect(sheet).toHaveCount(0);
     await expect(tile).toBeFocused();
     await expect(page).toHaveURL(/\/j\/tasks$/);
+    expect(await historyLength()).toBe(h0 + 1);
     // фон закрывает панель; «Закрыть» — тоже
     await tile.click();
     await expect(card).toBeVisible();
@@ -196,14 +232,159 @@ test.describe('настольный', () => {
     await expect(sheet).toHaveCount(0);
     await expect(tile).toBeFocused();
     await tile.click();
-    await sheet.getByRole('button', { name: 'Закрыть' }).click();
+    await sheet.getByRole('button', { name: 'Закрыть', exact: true }).click();
     await expect(sheet).toHaveCount(0);
     await expect(tile).toBeFocused();
-    // адрес с записью сразу открывает панель
+    expect(await historyLength()).toBe(h0 + 1);
+
+    // несохранённый текст молча не теряется: Esc и фон спрашивают, «Продолжить правку» — в поле
+    await tile.click();
+    const step = card.getByLabel('Следующий шаг');
+    await step.fill('черновик шага');
+    await page.keyboard.press('Escape');
+    const ask = sheet.getByRole('alertdialog', { name: 'Несохранённый текст' });
+    await expect(ask).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`/j/tasks/${id}$`));
+    await expect(ask.getByRole('button', { name: 'Продолжить правку' })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(ask).toHaveCount(0);
+    await expect(step).toBeFocused();
+    await expect(step).toHaveValue('черновик шага');
+    await page.mouse.click(boardBox.x + 40, VIEWPORTS.desktop.height - 40);
+    await expect(ask).toBeVisible();
+    await ask.getByRole('button', { name: 'Закрыть без сохранения' }).click();
+    await expect(sheet).toHaveCount(0);
+    await expect(tile).toBeFocused();
+    // сохранённое — не черновик: после «Сохранить шаг» Esc закрывает сразу
+    await tile.click();
+    await step.fill('сохранённый шаг');
+    await card.getByRole('button', { name: 'Сохранить шаг' }).click();
+    await expect(card.getByRole('status')).toHaveText('Следующий шаг сохранён.');
+    await page.keyboard.press('Escape');
+    await expect(sheet).toHaveCount(0);
+
+    // в панели открыли другую задачу (ссылка из карточки): после закрытия фокус — на её плитке
+    await tile.click();
+    await expect(card.getByRole('heading', { name: 'Панель: открытая' })).toBeFocused();
+    await page.evaluate((h) => (location.hash = h), tasksUrl(c.user, guid, working));
+    await expect(card.getByRole('heading', { name: 'Панель: в работе' })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(sheet).toHaveCount(0);
+    await expect(columnOf(page, 'в работе').getByRole('button', { name: 'Панель: в работе' })).toBeFocused();
+
+    // адрес с записью сразу открывает панель; закрытие — заменой адреса, без новой записи истории
     await page.goto('about:blank');
     await open(page, tasksUrl(c.user, guid, id));
     await expect(sheet.getByRole('heading', { name: 'Панель: открытая' })).toBeFocused();
+    const h1 = await historyLength();
+    await page.keyboard.press('Escape');
+    await expect(sheet).toHaveCount(0);
+    await expect(page).toHaveURL(/\/j\/tasks$/);
+    expect(await historyLength()).toBe(h1);
+    await expect(tile).toBeFocused();
     expect(await noHorizontalScroll(page)).toBe(true);
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('tasks_overlay_esc_layers', async ({ page }) => {
+    // планшет 1000 px: дерево — выдвижная панель, а область журнала шире 840 px — колонки и панель
+    // карточки. Esc — самому верхнему слою: сначала выдвижной панели дерева, потом карточке
+    const problems = watch(page);
+    await page.setViewportSize({ width: 1000, height: 800 });
+    const guid = await newSolution('слои Esc');
+    await addTask(guid, 'Слои: открытая');
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid));
+    await expect(page.locator('[data-board]')).toHaveAttribute('data-board', 'columns');
+    await columnOf(page, 'открыт').getByRole('button', { name: 'Слои: открытая' }).click();
+    const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+    await expect(sheet).toBeVisible();
+    const step = sheet.getByRole('article', { name: 'Карточка задачи' }).getByLabel('Следующий шаг');
+    await step.fill('черновик');
+    const toggle = page.getByRole('button', { name: 'Показать дерево' });
+    await toggle.click();
+    const tree = page.locator('nav[aria-label="Дерево заметок"]');
+    await expect(tree).toBeInViewport();
+    // фокус в выдвижной панели дерева в карточку не уводится
+    await page.keyboard.press('Tab');
+    await expect.poll(() => page.evaluate(() => !!document.activeElement?.closest('#sidebar'))).toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(tree).not.toBeInViewport();
+    await expect(sheet).toBeVisible();
+    await expect(step).toHaveValue('черновик');
+    await expect(sheet.getByRole('alertdialog')).toHaveCount(0);
+    await expect(toggle).toBeFocused();
+    // следующий Esc — карточке: несохранённый черновик — вопрос, а не молчаливое закрытие
+    await page.keyboard.press('Escape');
+    await expect(sheet.getByRole('alertdialog', { name: 'Несохранённый текст' })).toBeVisible();
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('tasks_from_idea_counts', async ({ page, browser }) => {
+    // «Из идей» — и в числах колонок и вкладок (`entries/counts?from_idea=1`)
+    const problems = watch(page);
+    const guid = await newSolution('из идей');
+    const idea = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+      kind: 'idea',
+      title: 'Идея доски',
+      body: 'Идея доски: замысел.',
+      data: { origin: 'human' },
+    });
+    await api('POST', `entries/${idea.id}/decide`, { decision: 'accept', by: 'human' });
+    await addTask(guid, 'Обычная задача 1');
+    await addTask(guid, 'Обычная задача 2');
+    await addTask(guid, 'Обычная в работе', 'in_progress');
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid));
+    await expect(columnOf(page, 'открыт').getByRole('heading')).toHaveText('открыт 3');
+    await expect(columnOf(page, 'в работе').getByRole('heading')).toHaveText('в работе 1');
+    const counted = page.waitForRequest((r) => r.url().includes('/entries/counts?') && r.url().includes('from_idea=1'));
+    await page.getByRole('button', { name: 'Из идей' }).click();
+    await counted;
+    await expect(columnOf(page, 'открыт').getByRole('heading')).toHaveText('открыт 1');
+    await expect(columnOf(page, 'в работе').getByRole('heading')).toHaveText('в работе 0');
+    await expect(columnOf(page, 'открыт')).toContainText('Идея доски');
+    expect(problems, problems.join('\n')).toEqual([]);
+
+    // телефон: те же числа во вкладках
+    const ctx = await browser.newContext({ storageState: ADMIN_STATE, viewport: VIEWPORTS.phone, ...touch });
+    const p = await ctx.newPage();
+    const pProblems = watch(p);
+    await open(p, tasksUrl(c.user, guid));
+    await expect(tabOf(p, 'Открыт')).toHaveAccessibleName('Открыт, 3 задачи');
+    await p.getByRole('button', { name: 'Из идей' }).tap();
+    await expect(tabOf(p, 'Открыт')).toHaveAccessibleName('Открыт, 1 задача');
+    await expect(tabOf(p, 'В работе')).toHaveAccessibleName('В работе, 0 задач');
+    expect(pProblems, pProblems.join('\n')).toEqual([]);
+    await ctx.close();
+  });
+
+  test('tasks_retry_after_error', async ({ page }) => {
+    // колонка не загрузилась (500) — ошибка над доской; следующий переход (открытие задачи)
+    // повторяет загрузку этой колонки, остальное не перечитывается
+    const problems = watch(page, (path, status) => status === 500 && path.endsWith('/entries'));
+    const guid = await newSolution('повтор после ошибки');
+    await addTask(guid, 'Повтор: открытая');
+    await addTask(guid, 'Повтор: выполненная', 'done');
+    let fail = true;
+    await page.route(/\/entries\?.*status=done/, async (route) => {
+      if (!fail) return route.continue();
+      fail = false;
+      await route.fulfill({ status: 500, contentType: 'text/plain', body: 'сбой для теста' });
+    });
+    const lists = listRequests(page, guid);
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid));
+    await expect(columnOf(page, 'открыт')).toContainText('Повтор: открытая');
+    const alert = page.locator('section.tasks').getByRole('alert');
+    await expect(alert).toBeVisible();
+    await expect(columnOf(page, 'выполнен')).not.toContainText('Повтор: выполненная');
+    const before = lists.length;
+    await columnOf(page, 'открыт').getByRole('button', { name: 'Повтор: открытая' }).click();
+    await expect(page.getByRole('article', { name: 'Карточка задачи' })).toBeVisible();
+    await expect(columnOf(page, 'выполнен')).toContainText('Повтор: выполненная');
+    await expect(alert).toHaveCount(0);
+    expect(lists.slice(before).map((u) => u.searchParams.get('status'))).toEqual(['done']);
     expect(problems, problems.join('\n')).toEqual([]);
   });
 
@@ -262,7 +443,8 @@ test.describe('телефон, сенсорный ввод', () => {
     const problems = watch(page);
     const guid = await newSolution('вкладки телефона');
     for (let i = 1; i <= 60; i++) await addTask(guid, `Выполненная ${pad(i)}`, 'done');
-    for (let i = 1; i <= 3; i++) await addTask(guid, `Открытая ${i}`);
+    const opened: string[] = [];
+    for (let i = 1; i <= 3; i++) opened.push(await addTask(guid, `Открытая ${i}`));
     for (let i = 1; i <= 2; i++) await addTask(guid, `В работе ${i}`, 'in_progress');
     const lists = listRequests(page, guid);
     const c = await pageCtx(page);
@@ -325,6 +507,14 @@ test.describe('телефон, сенсорный ввод', () => {
     // загруженные страницы целы: доска не перечитывалась
     await expect(tiles).toHaveCount(60);
     expect(lists).toHaveLength(loaded);
+
+    // задача из адреса открывает вкладку своего статуса (а не «В работе» по умолчанию)
+    await page.goto('about:blank');
+    await open(page, tasksUrl(c.user, guid, opened[0]));
+    await expect(card.getByRole('heading', { name: 'Открытая 1' })).toBeFocused();
+    await page.getByRole('link', { name: '← Задачи' }).tap();
+    await expect(tabOf(page, 'Открыт')).toHaveAttribute('aria-selected', 'true');
+    await expect(panel.getByRole('button', { name: 'Открытая 1' })).toBeFocused();
     expect(problems, problems.join('\n')).toEqual([]);
   });
 });
@@ -370,9 +560,18 @@ test.describe('телефон, клавиатура', () => {
     await page.keyboard.press('ArrowLeft');
     await at('Выполнен');
     await expect(panel).toContainText('Клавиши: выполненная');
-    // Tab — из списка вкладок в панель
+    // Tab — из списка вкладок на панель (`tabindex="0"`, как в ARIA APG), затем на её содержимое;
+    // пустая вкладка («Задач нет.») так тоже достижима
+    await page.keyboard.press('Tab');
+    await expect(panel).toBeFocused();
     await page.keyboard.press('Tab');
     await expect(panel.getByRole('button', { name: 'Клавиши: выполненная' })).toBeFocused();
+    await tabOf(page, 'Выполнен').focus();
+    await page.keyboard.press('End');
+    await at('Снят');
+    await expect(panel).toContainText('Задач нет.');
+    await page.keyboard.press('Tab');
+    await expect(panel).toBeFocused();
     expect(problems, problems.join('\n')).toEqual([]);
   });
 });

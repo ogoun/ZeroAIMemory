@@ -19,7 +19,7 @@ const screens = fileURLToPath(new URL('../../.tmp/e2e/screens/mobile/', import.m
 test.use({ storageState: ADMIN_STATE });
 
 /** Ошибки JS, CSP и неожиданные HTTP-ответы страницы. */
-function watch(page: Page): string[] {
+function watch(page: Page, allow: (path: string, status: number) => boolean = () => false): string[] {
   const problems: string[] = [];
   page.on('console', (m) => {
     if (m.type() === 'error' && !m.text().startsWith('Failed to load resource')) problems.push(m.text());
@@ -29,7 +29,8 @@ function watch(page: Page): string[] {
     const path = new URL(r.url()).pathname;
     const expected =
       (r.status() === 401 && path.endsWith('/api/v1/auth/me')) ||
-      (r.status() === 404 && path.endsWith('/favicon.ico'));
+      (r.status() === 404 && path.endsWith('/favicon.ico')) ||
+      allow(path, r.status());
     if (r.status() >= 400 && !expected) problems.push(`HTTP ${r.status()} ${r.request().method()} ${path}`);
   });
   return problems;
@@ -422,9 +423,16 @@ test.describe('телефон, сенсорный ввод', () => {
 
   test('insights_compact_rows_phone', async ({ page, browser }) => {
     // «Insights» на телефоне (§5.2 п. 3): та же таблица (строки считаются), «Вид», «Область»,
-    // «Показы», «Изменено» скрыты, их значения — под заголовком; условие — ширина области журнала
-    const problems = watch(page);
-    type Row = { id: string; area: string | null; data: { kind?: string }; usage?: { shown: number; useful: number; useless: number } };
+    // «Показы», «Изменено» скрыты, их значения — под заголовком; условие — ширина области журнала.
+    // Открытие записи фильтры не сбрасывает; сбой загрузки повторяется с прежними фильтрами.
+    const problems = watch(page, (path, status) => status === 500 && path.endsWith('/entries'));
+    type Row = {
+      id: string;
+      area: string | null;
+      certainty: string | null;
+      data: { kind?: string };
+      usage?: { shown: number; useful: number; useless: number };
+    };
     const all = await api<{ items: Row[] }>('GET', `spaces/${SOLUTION_GUID}/entries?kind=insight&limit=100`);
     expect(all.items.length).toBeGreaterThan(2);
     const c = await pageCtx(page);
@@ -448,6 +456,45 @@ test.describe('телефон, сенсорный ввод', () => {
     await expect(table).toBeHidden();
     await page.getByRole('link', { name: '← Insights' }).tap();
     await expect(table.locator('tbody tr')).toHaveCount(all.items.length);
+
+    // фильтр цел после открытия записи и возврата: таблица не перечитывается и не сбрасывается
+    const lists: string[] = [];
+    page.on('request', (r) => {
+      const u = new URL(r.url());
+      if (u.pathname.endsWith(`/spaces/${SOLUTION_GUID}/entries`) && u.searchParams.get('kind') === 'insight') lists.push(u.search);
+    });
+    const ofCertainty = (cert: string) => all.items.filter((i) => i.certainty === cert);
+    const hyp = ofCertainty('hypothesis');
+    expect(hyp.length).toBeGreaterThan(0);
+    const certainty = page.getByLabel('Надёжность', { exact: true });
+    await certainty.selectOption('hypothesis');
+    await expect(table.locator('tbody tr')).toHaveCount(hyp.length);
+    const n = lists.length;
+    await table.locator(`tr[data-entry="${hyp[0].id}"]`).getByRole('button').first().tap();
+    await expect(page.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(certainty).toHaveValue('hypothesis');
+    await expect(table.locator('tbody tr')).toHaveCount(hyp.length);
+    expect(lists.length, 'таблица не перечитывалась').toBe(n);
+
+    // сбой загрузки — следующий переход повторяет её с прежними фильтрами
+    let fail = true;
+    await page.route(/\/entries\?.*kind=insight/, async (route) => {
+      if (!fail) return route.continue();
+      fail = false;
+      await route.fulfill({ status: 500, contentType: 'text/plain', body: 'сбой для теста' });
+    });
+    const thm = ofCertainty('theorem');
+    await certainty.selectOption('theorem');
+    await expect(page.locator('section.insights').getByRole('alert')).toBeVisible();
+    await expect(table.locator('tbody tr')).toHaveCount(0);
+    await page.evaluate((h) => (location.hash = h), `${url}/${thm[0]?.id ?? x.id}`);
+    await expect(page.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(certainty).toHaveValue('theorem');
+    await expect(table.locator('tbody tr')).toHaveCount(thm.length);
+    await expect(page.locator('section.insights').getByRole('alert')).toHaveCount(0);
+    await page.unroute(/\/entries\?.*kind=insight/);
     expect(problems, problems.join('\n')).toEqual([]);
 
     // 1280 × 720 с открытой карточкой: колонка списка рядом с карточкой уже 720 px, но область
