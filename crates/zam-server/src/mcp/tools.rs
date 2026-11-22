@@ -1714,12 +1714,14 @@ fn triggers_body(args: &JsonObject) -> Result<Map<String, Value>, Fail> {
 /// <entry_short>».
 fn changed_line(action: &str, v: &Value) -> String {
     let w = warnings_inline(v);
-    // замещение: {entry, superseded}
+    // замещение: {entry, superseded}; предупреждения записи (`secret_mark_kept` и др.) — у
+    // новой записи
     if let Some(new) = v.get("entry").filter(|e| e.is_object()) {
         return format!(
-            "Новая {} · замещена {}{w}",
+            "Новая {} · замещена {}{}",
             entry_short(new),
-            entry_ref_of(&v["superseded"])
+            entry_ref_of(&v["superseded"]),
+            warnings_inline(new)
         );
     }
     match action {

@@ -48,7 +48,10 @@
 //! **Агенту по токену** (задача 5 M7.1, спецификация M7 §4.3.1 п. 3,
 //! [`super::agent_view::ENTRY_FIELDS`]) запись в ответах — карточка, лента, ревизии, эхо создания,
 //! правки и восстановления — с `‹secret›` вместо значений в заголовке, теле и строках `data`;
-//! `secrets_detected` — по исходнику. Сессии WebUI — исходник.
+//! `secrets_detected` — по исходнику. Сессии WebUI — исходник. Правку агента (`PATCH`) по этому
+//! виду сервер возвращает к исходнику (задача 6 M7.1, M7 §4.3.2, [`super::secret_restore`]):
+//! значения под `‹secret›` на прежних местах сохраняются, новая метка записывается как есть с
+//! предупреждением `secret_mark_kept`.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -74,6 +77,7 @@ use super::scope::{
     Mode, deny_report_mutation, entry_scope, live_entry, report_trash_allowed, space_scope,
     trash_allowed,
 };
+use super::secret_restore;
 use super::{json_body, query};
 use crate::app::AppState;
 use crate::attrib::attribution;
@@ -1039,7 +1043,28 @@ pub async fn patch(
     // отчёт неизменен: любое поле — 409 раньше `If-Match` и разбора тела
     deny_report_mutation(&p, &sc)?;
     let rev = Some(if_match(&headers)?);
-    let req: Patch = json_body(body)?;
+    let mut req: Patch = json_body(body)?;
+    // агент правил маскированный вид записи: значения под `‹secret›` — обратно до проверок
+    // (M7 §4.3.2), длинное тело с метками — в пуле; сессия WebUI — как есть
+    let big_body = req.body.as_ref().is_some_and(|b| {
+        b.len() + sc.entry.body.len() > agent_view::BLOCKING_FROM
+            && b.contains(zam_markdown::SECRET_MARK)
+    });
+    let kept = if !agent_view::masks(&p) {
+        0
+    } else if !big_body {
+        restore_patch(&sc.entry, &mut req)
+    } else {
+        let base = sc.entry.clone();
+        let (r, k) = agent_view::blocking(move || {
+            let mut r = req;
+            let k = restore_patch(&base, &mut r);
+            (r, k)
+        })
+        .await?;
+        req = r;
+        k
+    };
     check_patch_by(&p, &sc.entry, &req)?;
     // правку сделал человек: сессия WebUI или слова человека токеном (`by: human`, M6.5 §6) —
     // возвращённая идея снова идёт на разбор
@@ -1149,7 +1174,44 @@ pub async fn patch(
         super::glossary::attach_warnings(&mut v, super::glossary::broad_alias_warnings(&e.data));
     }
     agent_view::view_json(&p, &mut v, &["warnings"]);
+    secret_restore::attach_kept(&mut v, kept);
     Ok(Json(v))
+}
+
+/// Правка `req` агентом по маскированному виду записи `e` (M7 §4.3.2, задача 6 M7.1): заголовок,
+/// тело, строки `data`, теги, область, `next_step` и `blocked_by` задачи — значения под
+/// `‹secret›`, оставшимися напротив меток прежнего текста, восстанавливаются
+/// ([`secret_restore`]); метки дописки `append_body` — новые. Меток без пары.
+fn restore_patch(e: &Entry, req: &mut Patch) -> usize {
+    use secret_restore::{marks_in, restore_in_place, restore_tags, restore_value};
+    let mut kept = 0;
+    if let Some(t) = &mut req.title {
+        kept += restore_in_place(Some(&e.title), t);
+    }
+    if let Some(b) = &mut req.body {
+        kept += restore_in_place(Some(&e.body), b);
+    }
+    if let Some(b) = &req.append_body {
+        kept += marks_in(b);
+    }
+    if let Some(d) = &mut req.data {
+        kept += restore_value(&e.data, d);
+    }
+    if let Some(t) = &mut req.tags {
+        kept += restore_tags(&e.tags, t);
+    }
+    if let Some(Some(a)) = &mut req.area {
+        kept += restore_in_place(e.area.as_deref(), a);
+    }
+    for (k, v) in [
+        ("next_step", &mut req.next_step),
+        ("blocked_by", &mut req.blocked_by),
+    ] {
+        if let Some(Some(s)) = v {
+            kept += restore_in_place(e.data.get(k).and_then(Value::as_str), s);
+        }
+    }
+    kept
 }
 
 /// Детали аудита операций записи (без текста записи).

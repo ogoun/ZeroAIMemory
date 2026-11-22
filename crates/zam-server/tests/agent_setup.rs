@@ -1330,6 +1330,9 @@ async fn guide_secrets_masked_in_output() {
                 "нужный ключ бери из Vault: `memory_vault get`",
                 "Смещения `range` и пропуски фокуса — по тексту с маской",
                 "файлы вложений (`GET /blobs/…`) — как есть",
+                // запись обратно (задача 6 M7.1, M7 §4.3.2)
+                "`‹secret›` при правке сохраняет значение",
+                "предупреждение `secret_mark_kept`",
             ],
         ),
         (
@@ -1339,6 +1342,8 @@ async fn guide_secrets_masked_in_output() {
                 "take the key you need from Vault: `memory_vault get`",
                 "`range` offsets and focus skips — over the masked text",
                 "attachment files (`GET /blobs/…`) — as is",
+                "`‹secret›` in an edit keeps the value",
+                "warning `secret_mark_kept`",
             ],
         ),
     ] {

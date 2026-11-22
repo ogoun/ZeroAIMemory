@@ -834,6 +834,121 @@ async fn patch_changed_section_is_conflict() {
     ));
 }
 
+/// Вид для пишущего в тестах [`patch_note_viewed`]: `SEKRET` показывается как `[x]`, обратно —
+/// `[x]` снова `SEKRET`; `[?]` (метка без пары) остаётся и считается.
+struct Shown<'a>(&'a str, String);
+
+impl zam_store::ViewedText for Shown<'_> {
+    fn view(&self) -> &str {
+        &self.1
+    }
+
+    fn write_back(&self, edited: &str) -> (String, usize) {
+        assert!(!self.0.contains("[x]"), "исходник — без вида");
+        (
+            edited.replace("[x]", "SEKRET"),
+            edited.matches("[?]").count(),
+        )
+    }
+}
+
+fn shown(raw: &str) -> Box<dyn zam_store::ViewedText + '_> {
+    Box::new(Shown(raw, raw.replace("SEKRET", "[x]")))
+}
+
+/// PATCH по виду (задача 6 M7.1, M7 §4.3.2): секция адресуется заголовком вида, операции — по
+/// виду, итог — через `write_back` (число мест без пары — в `kept`); проверка «секция не
+/// менялась после `base_rev`» — по видам; без вида заголовка вида нет; повтор по ключу — без
+/// второй правки и с `kept == 0`.
+#[tokio::test]
+async fn patch_viewed_ops_on_view() {
+    let (db, space) = setup("patch-viewed").await;
+    let text = "# Заметка\n\n## Ключ SEKRET\n\nстарое\n\n## Прочее\n\nтекст SEKRET\n";
+    let n = create_note(&db, note(space, "Вид", text)).await.unwrap();
+    let view = Some(shown as zam_store::TextView);
+    // ключ повтора — в границах автора: оба вызова — тот же токен
+    let who = agent();
+    let p = zam_store::patch_note_viewed(
+        &db,
+        n.id,
+        1,
+        vec![replace("Заметка > Ключ [x]", "\nновое [?]\n\n")],
+        who.clone(),
+        usize::MAX,
+        Some("k1".into()),
+        view,
+    )
+    .await
+    .unwrap();
+    assert!(p.fresh);
+    assert_eq!((p.node.current_rev, p.kept), (2, 1));
+    let (_, t) = node_content(&db, n.id, None).await.unwrap();
+    assert_eq!(
+        t,
+        "# Заметка\n\n## Ключ SEKRET\n\nновое [?]\n\n## Прочее\n\nтекст SEKRET\n"
+    );
+    // повтор по ключу — та же правка не применяется второй раз
+    let again = zam_store::patch_note_viewed(
+        &db,
+        n.id,
+        1,
+        vec![replace("Заметка > Ключ [x]", "\nновое [?]\n\n")],
+        who,
+        usize::MAX,
+        Some("k1".into()),
+        view,
+    )
+    .await
+    .unwrap();
+    assert!(!again.fresh);
+    assert_eq!((again.node.current_rev, again.kept), (2, 0));
+    // другая секция правится без вида (rev 3); правка по виду с base_rev 2 — секция та же
+    patch_note(
+        &db,
+        n.id,
+        2,
+        vec![replace("Заметка > Прочее", "другое SEKRET\n")],
+        human("б"),
+    )
+    .await
+    .unwrap();
+    let p = zam_store::patch_note_viewed(
+        &db,
+        n.id,
+        2,
+        vec![PatchOp::AppendToSection {
+            section: "Заметка > Ключ [x]".into(),
+            content: "дописано\n".into(),
+        }],
+        agent(),
+        usize::MAX,
+        None,
+        view,
+    )
+    .await
+    .unwrap();
+    assert_eq!((p.node.current_rev, p.kept), (4, 1));
+    let (_, t) = node_content(&db, n.id, None).await.unwrap();
+    assert!(
+        t.contains("## Ключ SEKRET\n\nновое [?]\n") && t.contains("дописано\n"),
+        "{t}"
+    );
+    assert!(t.contains("другое SEKRET\n") && !t.contains("[x]"), "{t}");
+    // без вида заголовка «Ключ [x]» нет
+    let r = patch_note(
+        &db,
+        n.id,
+        4,
+        vec![replace("Заметка > Ключ [x]", "x\n")],
+        human("а"),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(WriteError::Patch(PatchError::SectionNotFound(_)))),
+        "{r:?}"
+    );
+}
+
 #[tokio::test]
 async fn deleted_note_is_not_writable() {
     let (db, space) = setup("deleted").await;

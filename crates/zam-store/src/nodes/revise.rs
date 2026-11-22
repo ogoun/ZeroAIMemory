@@ -1,5 +1,7 @@
 //! Правка существующей заметки (§11.3 ТЗ): замена текста с проверкой ревизии
-//! (`If-Match`), PATCH секций относительно `base_rev` и откат к старой ревизии.
+//! (`If-Match`), PATCH секций относительно `base_rev` и откат к старой ревизии. PATCH по виду
+//! текста пишущего ([`patch_note_viewed`], [`ViewedText`]) — агент правит заметку по маске
+//! `‹secret›`, значения возвращает сервер (задача 6 M7.1).
 //!
 //! Каждая операция — одна транзакция писателя. Новая ревизия только дописывается
 //! (§4.1 п.4); frontmatter, L0, `content_hash`, размер и чанки пересчитываются так же,
@@ -173,6 +175,51 @@ pub async fn patch_note_keyed(
     max_bytes: usize,
     key: Option<String>,
 ) -> Result<(Node, bool), WriteError> {
+    patch_note_viewed(db, id, base_rev, ops, a, max_bytes, key, None)
+        .await
+        .map(|p| (p.node, p.fresh))
+}
+
+/// Текст ревизии, каким его видит пишущий (спецификация M7 §4.3.2, задача 6 M7.1): агент по
+/// токену читает заметку с `‹secret›` вместо значений и адресует операции PATCH по этому виду.
+/// Хранилище не знает, что это маска: вид и обратный путь даёт сервер.
+pub trait ViewedText {
+    /// Текст ревизии для пишущего.
+    fn view(&self) -> &str;
+    /// Правленный вид `edited` — обратно в текст хранилища: текст и число мест вида без пары в
+    /// исходнике (у маски — меток `‹secret›`, записанных как есть).
+    fn write_back(&self, edited: &str) -> (String, usize);
+}
+
+/// Строит [`ViewedText`] по тексту ревизии (`fn`: без состояния, можно в транзакцию писателя).
+pub type TextView = for<'a> fn(&'a str) -> Box<dyn ViewedText + 'a>;
+
+/// Итог [`patch_note_viewed`].
+#[derive(Debug)]
+pub struct Patched {
+    pub node: Node,
+    /// `false` — повтор по `Idempotency-Key`: операции второй раз не применялись.
+    pub fresh: bool,
+    /// Мест вида без пары в исходнике ([`ViewedText::write_back`]); без вида и у повтора — 0.
+    pub kept: usize,
+}
+
+/// [`patch_note_keyed`] по виду текста `view` (M7 §4.3.2): операции применяются к виду текущей
+/// ревизии, проверка «секция не менялась после `base_rev`» сравнивает виды обеих ревизий
+/// (заголовки пишущий видел в виде), итог возвращается к исходнику текущей ревизии
+/// ([`ViewedText::write_back`]); предел `max_bytes` — по итоговому тексту. `None` — как
+/// [`patch_note_keyed`]. Отпечаток `Idempotency-Key` — по операциям запроса.
+#[allow(clippy::too_many_arguments)]
+pub async fn patch_note_viewed(
+    db: &Db,
+    id: Id,
+    base_rev: i64,
+    ops: Vec<PatchOp>,
+    a: Attribution,
+    max_bytes: usize,
+    key: Option<String>,
+    view: Option<TextView>,
+) -> Result<Patched, WriteError> {
     let ops_bytes = match key {
         Some(_) => serde_json::to_vec(&ops).map_err(|e| StoreError::Corrupt(e.to_string()))?,
         None => Vec::new(),
@@ -189,20 +236,28 @@ pub async fn patch_note_keyed(
             ],
         )?;
         if let Some(k) = &k
-            && let Some(n) = k.replay(tx)?
+            && let Some(node) = k.replay(tx)?
         {
-            return Ok((n, false));
+            return Ok(Patched {
+                node,
+                fresh: false,
+                kept: 0,
+            });
         }
-        let n = patch_tx(tx, id, base_rev, &ops, &a, max_bytes)?;
+        let (node, kept) = patch_tx(tx, id, base_rev, &ops, &a, max_bytes, view)?;
         if let Some(k) = &k {
-            k.remember(tx, n.id)?;
+            k.remember(tx, node.id)?;
         }
-        Ok((n, true))
+        Ok(Patched {
+            node,
+            fresh: true,
+            kept,
+        })
     })
     .await
 }
 
-/// Тело [`patch_note_keyed`] в транзакции писателя.
+/// Тело [`patch_note_viewed`] в транзакции писателя: узел и число мест вида без пары.
 fn patch_tx(
     tx: &Connection,
     id: Id,
@@ -210,7 +265,8 @@ fn patch_tx(
     ops: &[PatchOp],
     a: &Attribution,
     max_bytes: usize,
-) -> Result<Node, WriteError> {
+    view: Option<TextView>,
+) -> Result<(Node, usize), WriteError> {
     let node = live_note(tx, id)?;
     if ops.is_empty() {
         return Err(StoreError::BadInput("пустой список операций PATCH".into()).into());
@@ -225,10 +281,21 @@ fn patch_tx(
     } else {
         Some(revision_text(tx, id, base_rev)?)
     };
-    let mut text = current.clone();
+    // вид пишущего: операции и проверка секций — по нему (без вида — по исходнику)
+    let current_seen = view.map(|v| v(&current));
+    let base_seen = match (view, &base) {
+        (Some(v), Some(b)) => Some(v(b)),
+        _ => None,
+    };
+    let current_text = current_seen.as_ref().map_or(current.as_str(), |s| s.view());
+    let base_text = match &base_seen {
+        Some(s) => Some(s.view()),
+        None => base.as_deref(),
+    };
+    let mut text = current_text.to_string();
     for op in ops {
-        if let (Some(base), Some(section)) = (&base, op_section(op))
-            && section_bytes(base, section) != section_bytes(&current, section)
+        if let (Some(base), Some(section)) = (base_text, op_section(op))
+            && section_bytes(base, section) != section_bytes(current_text, section)
         {
             return Err(WriteError::SectionChanged {
                 section: section.to_string(),
@@ -237,13 +304,17 @@ fn patch_tx(
         }
         text = apply_patch(&text, op)?.text;
     }
+    let (text, kept) = match &current_seen {
+        Some(s) => s.write_back(&text),
+        None => (text, 0),
+    };
     if text.len() > max_bytes {
         return Err(WriteError::TooLarge {
             size: text.len(),
             max: max_bytes,
         });
     }
-    Ok(commit_text(tx, node, &text, None, a)?)
+    Ok((commit_text(tx, node, &text, None, a)?, kept))
 }
 
 /// Откат: новая ревизия с текстом ревизии `to_rev`, L0 пересчитывается по тексту.

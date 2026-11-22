@@ -28,6 +28,7 @@ pub mod render;
 pub mod reports;
 pub mod scope;
 pub mod search;
+pub mod secret_restore;
 pub mod secrets;
 pub mod sessions;
 pub mod snapshot;
