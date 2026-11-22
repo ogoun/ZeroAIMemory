@@ -1631,7 +1631,8 @@ async fn stale_not_with_live_claim() {
 }
 
 /// Счётчики статусов доски — `entries/counts?kind=task&top_level=1` без подзадач,
-/// `parent=<id>` — по прямым подзадачам; не у задач — 422.
+/// `parent=<id>` — по прямым подзадачам; не у задач и вместе — 422, неверный флаг или id — 400
+/// (ревью r1, Minor 4: разбор у счётчиков — свой вызов `SubtaskFilter::parse`).
 #[tokio::test]
 async fn counts_top_level() {
     let a = api("tasks-subtasks-counts", |_| {}).await;
@@ -1670,8 +1671,41 @@ async fn counts_top_level() {
         counts(format!("?kind=task&parent={p}")).await,
         (StatusCode::OK, kids)
     );
-    for q in ["?kind=idea&top_level=1", "?kind=question&parent=x"] {
-        let (code, j) = counts(q.into()).await;
-        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{q}: {j}");
+    // разбор фильтров у счётчиков — тот же, что у ленты (`SubtaskFilter::parse`): не у задач и
+    // вместе — 422, неверный флаг и id — 400
+    for (q, code) in [
+        (
+            "?kind=idea&top_level=1".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "?kind=question&parent=x".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            format!("?kind=idea&parent={p}"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            format!("?kind=task&top_level=1&parent={p}"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "?kind=task&top_level=2".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("?kind=task&parent=xyz".to_string(), StatusCode::BAD_REQUEST),
+        (
+            "?kind=idea&top_level=yes".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        // вид без статусов — 400 раньше фильтров (прежнее правило счётчиков)
+        (
+            "?kind=changelog&top_level=1".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (got, j) = counts(q.clone()).await;
+        assert_eq!(got, code, "{q}: {j}");
     }
 }
