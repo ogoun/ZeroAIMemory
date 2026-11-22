@@ -11,6 +11,8 @@
 //!   конца текста;
 //! - ограждение внутри цитаты (`> ```sh`, вложенные `> >`) — блок той же цитаты: строки блока
 //!   несут те же маркеры `>`, строка с меньшей глубиной цитаты блок закрывает;
+//! - в пункте списка отступ забора считается от колонки содержимого пункта (`- ` — 2, `1. ` — 3,
+//!   вложенные — больше; [`fence_blocks`], круг правок 3 задачи 5 M7.1);
 //! - инлайн-код: серия из n обратных кавычек — до ближайшей следующей серии той же длины, если
 //!   между ними нет пустой строки (спан может быть многострочным); серия внутри блока инлайн-код
 //!   не открывает, но закрыть может ([`code_spans`]);
@@ -75,12 +77,55 @@ pub fn fence_of(line: &str) -> Option<(u8, usize)> {
     if line.len() - t.len() > 3 {
         return None;
     }
+    fence_run(t)
+}
+
+/// Серия ограждения в начале `t` (отступ уже снят): знак и длина (правила — у [`fence_of`]).
+fn fence_run(t: &str) -> Option<(u8, usize)> {
     let c = *t.as_bytes().first()?;
     if c != b'`' && c != b'~' {
         return None;
     }
     let n = t.bytes().take_while(|&b| b == c).count();
     (n >= 3 && (c == b'~' || !t.as_bytes()[n..].contains(&b'`'))).then_some((c, n))
+}
+
+/// Отступ строки в колонках (табуляция — до следующей колонки, кратной 4) и остаток без него.
+fn indent_of(s: &str) -> (usize, &str) {
+    let mut col = 0;
+    let mut i = 0;
+    for b in s.bytes() {
+        match b {
+            b' ' => col += 1,
+            b'\t' => col += 4 - col % 4,
+            _ => break,
+        }
+        i += 1;
+    }
+    (col, &s[i..])
+}
+
+/// Маркер пункта списка в начале `t` (отступ уже снят): `-`, `+`, `*` или до девяти цифр с `.`
+/// или `)`; за ним — пробелы или табуляции либо конец строки. Длина маркера и число пробелов за
+/// ним.
+fn list_marker(t: &str) -> Option<(usize, usize)> {
+    let b = t.as_bytes();
+    let m = match *b.first()? {
+        b'-' | b'+' | b'*' => 1,
+        c if c.is_ascii_digit() => {
+            let n = b.iter().take_while(|c| c.is_ascii_digit()).count();
+            if n > 9 || !matches!(b.get(n), Some(b'.' | b')')) {
+                return None;
+            }
+            n + 1
+        }
+        _ => return None,
+    };
+    let sp = b[m..]
+        .iter()
+        .take_while(|&&c| c == b' ' || c == b'\t')
+        .count();
+    (sp > 0 || m == b.len()).then_some((m, sp))
 }
 
 /// Маркеры цитаты в начале строки — не больше `max`: до трёх пробелов, `>` и один необязательный
@@ -109,18 +154,32 @@ pub struct FenceBlock {
 }
 
 /// Блоки в ограждениях по строкам `lines` (см. модуль: цитаты, закрытие, незакрытый — до конца).
+///
+/// Пункты списков (круг правок 3 задачи 5 M7.1, решение координатора): отступ забора считается
+/// от колонки содержимого текущего пункта (`- ` — 2, `1. ` — 3, у вложенных — больше), так что
+/// забор с отступом 4 и больше в пункте — забор. Колонки открытых пунктов — стеком; пункт
+/// закрывается строкой левее его колонки после пустой строки или строкой, начинающей блок
+/// (маркер, заголовок, ограждение); иначе строка — ленивое продолжение абзаца, и пункт остаётся
+/// (в сомнении — шире код: лишняя маска безопаснее утечки). Блок в пункте кончается строкой
+/// левее колонки пункта (кроме пустых).
 pub fn fence_blocks(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
     let mut out = Vec::new();
-    // открытый блок: знак, длина серии, глубина цитаты, строка открытия
-    let mut open: Option<(u8, usize, usize, usize)> = None;
+    // открытый блок: знак, длина серии, глубина цитаты, колонка пункта, строка открытия
+    let mut open: Option<(u8, usize, usize, usize, usize)> = None;
+    // колонки содержимого открытых пунктов списка, по возрастанию
+    let mut items: Vec<usize> = Vec::new();
+    let mut prev_blank = true;
     for (i, l) in lines.iter().enumerate() {
         let s = &text[l.content.clone()];
-        if let Some((c, n, d, from)) = open {
+        if let Some((c, n, d, base, from)) = open {
             let (q, rest) = strip_quotes(s, d);
-            if q == d {
-                let closes = fence_of(rest).is_some_and(|(c2, n2)| {
-                    c2 == c && n2 >= n && rest.trim().bytes().all(|b| b == c)
-                });
+            let (ind, t) = indent_of(rest);
+            let dedent = base > 0 && !t.is_empty() && ind < base;
+            if q == d && !dedent {
+                let closes = ind.saturating_sub(base) <= 3
+                    && fence_run(t).is_some_and(|(c2, n2)| {
+                        c2 == c && n2 >= n && t.trim_end().bytes().all(|b| b == c)
+                    });
                 if closes {
                     out.push(FenceBlock {
                         open: from,
@@ -128,10 +187,12 @@ pub fn fence_blocks(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
                         closed: true,
                     });
                     open = None;
+                    prev_blank = false;
                 }
                 continue;
             }
-            // цитата кончилась — блок закрыт до этой строки, сама строка разбирается заново
+            // цитата или пункт кончились — блок закрыт до этой строки, сама строка разбирается
+            // заново
             out.push(FenceBlock {
                 open: from,
                 last: i - 1,
@@ -140,11 +201,36 @@ pub fn fence_blocks(text: &str, lines: &[Line]) -> Vec<FenceBlock> {
             open = None;
         }
         let (d, rest) = strip_quotes(s, usize::MAX);
-        if let Some((c, n)) = fence_of(rest) {
-            open = Some((c, n, d, i));
+        let (mut ind, mut t) = indent_of(rest);
+        if t.is_empty() {
+            prev_blank = true;
+            continue;
         }
+        let marker = list_marker(t);
+        let starts_block = marker.is_some() || t.starts_with('#') || fence_run(t).is_some();
+        while items.last().is_some_and(|&col| col > ind) && (prev_blank || starts_block) {
+            items.pop();
+        }
+        let mut base = items.last().copied().unwrap_or(0);
+        if let Some((m, sp)) = marker
+            && ind.saturating_sub(base) <= 3
+        {
+            // колонка содержимого: за маркером и пробелами (пустой пункт или код с отступом
+            // внутри — за одним пробелом)
+            let content = if sp == 0 || sp > 4 { m + 1 } else { m + sp };
+            base = ind + content;
+            items.push(base);
+            t = &t[m + sp..];
+            ind += m + sp;
+        }
+        if let Some((c, n)) = fence_run(t)
+            && ind.saturating_sub(base) <= 3
+        {
+            open = Some((c, n, d, base, i));
+        }
+        prev_blank = false;
     }
-    if let Some((_, _, _, from)) = open {
+    if let Some((_, _, _, _, from)) = open {
         out.push(FenceBlock {
             open: from,
             last: lines.len() - 1,
@@ -410,6 +496,44 @@ mod tests {
         assert!(
             fenced("```x``` и дальше\nтекст").is_empty(),
             "инлайн, не блок"
+        );
+    }
+
+    /// Круг правок 3 задачи 5 M7.1: забор в пункте списка — с отступом от колонки содержимого
+    /// пункта (`1. ` — 3, `- ` — 2, вложенный — больше), в том числе через пустую строку и с
+    /// пустой строкой внутри блока; забор на строке маркера; блок кончается строкой левее
+    /// пункта; ленивое продолжение абзаца пункт не закрывает; вне списка отступ 4 — не забор.
+    #[test]
+    fn fenced_regions_in_lists() {
+        assert_eq!(
+            fenced("1. Шаг:\n\n    ```sh\n    mysql -uroot -px\n\n    mysql -px other\n    ```\n"),
+            ["    mysql -uroot -px\n\n    mysql -px other"]
+        );
+        assert_eq!(
+            fenced(
+                "- Деплой:\n\n    ```bash\n    export A=1\n\n    curl -u a:b https://h\n    ```\n"
+            ),
+            ["    export A=1\n\n    curl -u a:b https://h"]
+        );
+        assert_eq!(
+            fenced("- a\n  - b\n\n      ```sh\n      x\n      ```\n"),
+            ["      x"]
+        );
+        assert_eq!(fenced("- ```sh\n  x\n  ```\n"), ["  x"]);
+        assert_eq!(
+            fenced("- a\n\n    ```\n    x\nпроза\n```\n"),
+            ["    x"],
+            "строка левее пункта закрывает блок; следующий ``` — новый пустой незакрытый"
+        );
+        assert_eq!(
+            fenced("- a\nленивое продолжение\n\n    ```\n    x\n    ```\n"),
+            ["    x"]
+        );
+        assert!(fenced("- a\n\nабзац вне списка\n\n    ```\n    x\n    ```\n").is_empty());
+        assert!(fenced("абзац\n    ```\n    x\n    ```\n").is_empty());
+        assert_eq!(
+            fenced("10) пункт\n     ```\n     y\n     ```\n"),
+            ["     y"]
         );
     }
 
