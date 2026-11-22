@@ -13,7 +13,8 @@
 //!   `snippet` (§4.3, задача 5), `focus` (§6, задача 7b), `digest` (§8, задача 8a),
 //!   `hint_thresholds` (§9, задача 9), `kind_boost` (§10), `attach_weight` (§11), `snapshot`
 //!   (§8а, задача 17c), `recall_timeout` (§16 п. 19, задача 19), `idea_review` (M6.5 §7,
-//!   ключ `ideas.default_mode`); `code_recv` (§12а, задача 14) — возможность без ключа конфигурации (в
+//!   ключ `ideas.default_mode`), `post_tool_subject` (M7.1 §4.6 п. 3, ключ
+//!   `recall.post_tool_coverage.common_pct`); `code_recv` (§12а, задача 14) — возможность без ключа конфигурации (в
 //!   [`KEYS`] её нет). Пока строки нет, ключ этой сборке не шлётся (а прогон с ним — не
 //!   сравнивается);
 //! - `features` нет — выпуск по таблице [`RELEASES`]: версия и коммит (`git`, 12 знаков) должны
@@ -216,6 +217,10 @@ pub const KEYS: &[(&str, Since)] = &[
     ("recall.post_tool_coverage.divisor", F("hint_thresholds")),
     ("recall.post_tool_coverage.cap", F("hint_thresholds")),
     ("recall.post_tool_coverage.word_match", F("hint_thresholds")),
+    (
+        "recall.post_tool_coverage.common_pct",
+        F("post_tool_subject"),
+    ),
     ("search.kind_boost_mode", F("kind_boost")),
     ("search.w_attach", F("attach_weight")),
     ("recall.snapshot_tokens", F("snapshot")),

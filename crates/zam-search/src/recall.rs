@@ -2,7 +2,9 @@
 //! нормализация ошибки инструмента ([`normalize_error`]), сопоставление `error_regex`
 //! ([`error_regex_matches`]), покрытие слов ошибки найденным текстом ([`error_terms`],
 //! [`term_coverage`], [`coverage_enough`] по правилу [`CoverageRule`]: слова как есть или
-//! основы [`StemWord`] — общий код с подсказками-идеями сервера, M6 §9), предметные слова
+//! основы [`StemWord`] — общий код с подсказками-идеями сервера, M6 §9; с M7.1 §4.6 п. 3 —
+//! по предметным словам ошибки: [`strip_exit_header`], [`subject_error_terms`],
+//! [`is_error_code`], [`is_common`], [`CoverageQuery::subject`]), предметные слова
 //! запроса пользователя ([`subject_terms`], M6.6 §3.1), строка подсказки ([`hint_line`]) и
 //! упаковка дайджеста в бюджет токенов ([`pack_sections`]).
 //!
@@ -161,11 +163,14 @@ pub fn error_regex_matches(pattern: &str, text: &str) -> bool {
 /// Слова нормализованной ошибки для покрытия: буквенно-цифровые от [`MIN_TERM_CHARS`]
 /// символов, в нижнем регистре, без повторов, не больше 32 (как в запросе FTS).
 pub fn error_terms(normalized: &str) -> Vec<String> {
+    terms_of(normalized.split(|c: char| !c.is_alphanumeric()))
+}
+
+/// Слова для покрытия из последовательности слов: от [`MIN_TERM_CHARS`] символов, в нижнем
+/// регистре, без повторов, не больше [`MAX_TERMS`].
+fn terms_of<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for w in normalized
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.chars().count() >= MIN_TERM_CHARS)
-    {
+    for w in words.filter(|w| w.chars().count() >= MIN_TERM_CHARS) {
         let w = w.to_lowercase();
         if !out.contains(&w) {
             out.push(w);
@@ -175,6 +180,88 @@ pub fn error_terms(normalized: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Первая строка ошибки `Exit code <N>` (её ставит Claude Code перед выводом команды в
+/// `PostToolUseFailure.error`) снимается: служебная строка агента, не текст ошибки (M7.1 §4.6
+/// п. 3). Строка — целиком, без учёта регистра и краевых пробелов; иначе текст как есть.
+pub fn strip_exit_header(s: &str) -> &str {
+    let (first, rest) = s.split_once('\n').unwrap_or((s, ""));
+    let head = first.trim();
+    let code = head
+        .get(..10)
+        .filter(|h| h.eq_ignore_ascii_case("exit code "))
+        .map(|_| head[10..].trim_start_matches('-'));
+    match code {
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => rest,
+        _ => s,
+    }
+}
+
+/// Служебные фразы вывода (M7.1 §4.6 п. 3): сообщения ОС «нет такого файла или пути» (POSIX
+/// `ENOENT` в английской и русской локали, Windows — тоже в обеих), а не предмет ошибки — их слова
+/// в покрытие не идут ([`subject_error_terms`]). Сравнение — целыми словами после [`norm_word`]
+/// (регистр, `ё` → `е`: «Не удаётся» = «Не удается»).
+pub const SERVICE_PHRASES: [&str; 6] = [
+    "no such file or directory",
+    "нет такого файла или каталога",
+    "the system cannot find the path specified",
+    "the system cannot find the file specified",
+    "не удается найти указанный путь",
+    "не удается найти указанный файл",
+];
+
+/// Слова нормализованной ошибки для покрытия по предметным словам (M7.1 §4.6 п. 3): как
+/// [`error_terms`], но без вхождений [`SERVICE_PHRASES`].
+pub fn subject_error_terms(normalized: &str) -> Vec<String> {
+    let words: Vec<&str> = normalized
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let normed: Vec<String> = words.iter().map(|w| norm_word(w)).collect();
+    let phrases: Vec<Vec<&str>> = SERVICE_PHRASES
+        .iter()
+        .map(|p| p.split(' ').collect())
+        .collect();
+    let mut keep: Vec<&str> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let hit = phrases.iter().find(|p| {
+            words.len() - i >= p.len() && p.iter().zip(&normed[i..]).all(|(a, b)| b == a)
+        });
+        match hit {
+            Some(p) => i += p.len(),
+            None => {
+                keep.push(words[i]);
+                i += 1;
+            }
+        }
+    }
+    terms_of(keep.into_iter())
+}
+
+/// Код ошибки (M7.1 §4.6 п. 3): 1–4 латинские буквы и 4–6 цифр — `lnk1104`, `e0432`,
+/// `ts2307`, `cs0246` (слово ошибки уже в нижнем регистре). Такое слово не бывает частым, и
+/// одного его совпадения целиком достаточно ([`CoverageQuery::subject`]); `sha256`, `x86`, `e2e`
+/// и hex — не коды.
+pub fn is_error_code(w: &str) -> bool {
+    let letters = w.bytes().take_while(u8::is_ascii_lowercase).count();
+    let digits = w.len() - letters;
+    (1..=4).contains(&letters)
+        && (4..=6).contains(&digits)
+        && w.bytes().skip(letters).all(|b| b.is_ascii_digit())
+}
+
+/// Наименьшее число insight со словом, при котором оно может быть частым ([`is_common`]): на
+/// малом корпусе доля документов ничего не говорит (у решения из двух записей каждое их слово —
+/// в половине) **[решение исполнителя, задача 8 M7.1]**.
+pub const COMMON_MIN_DOCS: usize = 5;
+
+/// Частое слово ошибки (M7.1 §4.6 п. 3): `df` из `docs` действующих insight области поиска
+/// содержат слово с этим началом, `df ≥` [`COMMON_MIN_DOCS`] и доля `df / docs` строго выше
+/// `pct` процентов (`recall.post_tool_coverage.common_pct`; 100 — правило выключено).
+pub fn is_common(df: usize, docs: usize, pct: u32) -> bool {
+    df >= COMMON_MIN_DOCS && df * 100 > pct as usize * docs
 }
 
 /// Сколько слов `terms` встречается в `text` по границе слова (без учёта регистра): слово
@@ -469,7 +556,8 @@ pub fn prompt_gate(prompt: &str, head_chars: usize) -> PromptGate {
 /// Порог покрытия слов запроса текстом записи у ослабленного FTS (любое слово):
 /// `need = clamp(⌈n / divisor⌉, 2, cap)`, не больше `n` — иначе общие слова ошибки («file»,
 /// «error») поднимали бы случайные записи, а длинная ошибка (stack trace) требовала бы от
-/// короткой записи десятков совпадений. Ключ `recall.post_tool_coverage` (M6 §9).
+/// короткой записи десятков совпадений. Ключ `recall.post_tool_coverage` (M6 §9); с M7.1 §4.6
+/// п. 3 — и порог частого слова `common_pct` ([`is_common`], [`CoverageQuery::subject`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageRule {
@@ -478,6 +566,15 @@ pub struct CoverageRule {
     /// Наибольший порог, 2..=32.
     pub cap: u32,
     pub word_match: WordMatch,
+    /// Доля действующих insight области поиска со словом ошибки, %, выше которой слово частое и
+    /// в покрытие не идёт (1..=100; 100 — правило выключено). Нет в конфигурации — умолчание.
+    #[serde(default = "default_common_pct")]
+    pub common_pct: u32,
+}
+
+/// Умолчание `common_pct` ([`CoverageRule::M71`]).
+fn default_common_pct() -> u32 {
+    CoverageRule::M71.common_pct
 }
 
 impl CoverageRule {
@@ -486,6 +583,7 @@ impl CoverageRule {
         divisor: 3,
         cap: 4,
         word_match: WordMatch::Plain,
+        common_pct: 100,
     };
 
     /// Умолчание M6 по сетке §9 (задача 9 с правками ревью, `eval/grid-m6-hints.toml`):
@@ -497,6 +595,17 @@ impl CoverageRule {
         divisor: 2,
         cap: 6,
         word_match: WordMatch::Plain,
+        common_pct: 100,
+    };
+
+    /// Умолчание M7.1 (§4.6 п. 3): правило M6 и порог частого слова 10 % по сетке
+    /// `eval/grid-m71-hints-common.toml` (правило выбора M6 §9, записано до прогона; журнал этапа
+    /// M7, задача 8): на решающей части (60 случаев `post_tool` M4 и независимых наборов, 42
+    /// релевантных) Δ hint_precision +0,160 (Бонферрони — нижняя граница +0,051), потерь
+    /// ожидаемых подсказок 0 из 42, Δ silence_rate +0,095; 5 % теряет 3 подсказки.
+    pub const M71: CoverageRule = CoverageRule {
+        common_pct: 10,
+        ..CoverageRule::M6
     };
 
     /// Нужно совпавших слов из `n` (`n` — после [`prepared_terms`]).
@@ -510,7 +619,7 @@ impl CoverageRule {
 
 impl Default for CoverageRule {
     fn default() -> Self {
-        CoverageRule::M6
+        CoverageRule::M71
     }
 }
 
@@ -520,6 +629,9 @@ pub struct CoverageQuery {
     rule: CoverageRule,
     plain: Vec<String>,
     stems: Vec<StemWord>,
+    /// Коды ошибок ([`is_error_code`]) покрытия по предметным словам: совпадение одного кода
+    /// целиком — достаточно ([`CoverageQuery::subject`]); у [`CoverageQuery::new`] — пусто.
+    codes: Vec<String>,
 }
 
 impl CoverageQuery {
@@ -539,6 +651,21 @@ impl CoverageQuery {
             rule: *rule,
             plain,
             stems,
+            codes: Vec::new(),
+        }
+    }
+
+    /// Покрытие по предметным словам (M7.1 §4.6 п. 3): `query` ([`subject_error_terms`]) без
+    /// слов, для которых `skip` (частые, слова путей команды); коды ошибок ([`is_error_code`]) не
+    /// снимаются и в число слов порога не входят — совпадение одного кода целиком
+    /// достаточно. Порог `need` — по числу оставшихся слов.
+    pub fn subject(query: &[String], rule: &CoverageRule, skip: impl Fn(&str) -> bool) -> Self {
+        let (codes, words): (Vec<String>, Vec<String>) =
+            query.iter().cloned().partition(|t| is_error_code(t));
+        let words: Vec<String> = words.into_iter().filter(|t| !skip(t)).collect();
+        CoverageQuery {
+            codes,
+            ..CoverageQuery::new(&words, rule)
         }
     }
 
@@ -575,8 +702,16 @@ impl CoverageQuery {
         }
     }
 
-    /// Покрытие `text` достаточно ([`CoverageRule::need`]); пустой запрос — нет.
+    /// Покрытие `text` достаточно ([`CoverageRule::need`]) или в `text` целиком есть код ошибки
+    /// запроса ([`CoverageQuery::subject`]); пустой запрос без кодов — нет.
     pub fn enough(&self, text: &str) -> bool {
+        if !self.codes.is_empty() {
+            let text = text.to_lowercase();
+            let mut words = text.split(|c: char| !c.is_alphanumeric());
+            if words.any(|w| self.codes.iter().any(|c| c == w)) {
+                return true;
+            }
+        }
         let n = self.len();
         n > 0 && self.covered(text) >= self.rule.need(n)
     }
@@ -912,7 +1047,7 @@ mod tests {
         let r = |divisor, cap| CoverageRule {
             divisor,
             cap,
-            word_match: WordMatch::Plain,
+            ..CoverageRule::M6
         };
         assert_eq!(r(2, 6).need(20), 6);
         assert_eq!(r(2, 6).need(9), 5);
@@ -1018,6 +1153,127 @@ mod tests {
             StemWord::exact_codes("отчетов".into())
                 .matches(&StemWord::exact_codes("отчеты".into()))
         );
+    }
+
+    /// M7.1 §4.6 п. 3: строка `Exit code <N>` агента снимается только первой строкой ошибки.
+    #[test]
+    fn exit_header_stripped_only_first_line() {
+        assert_eq!(strip_exit_header("Exit code 2\nls: x"), "ls: x");
+        assert_eq!(strip_exit_header("  exit code 127 \r\nboom"), "boom");
+        assert_eq!(strip_exit_header("Exit code 1"), "");
+        assert_eq!(strip_exit_header("Exit code -1073741819\nx"), "x");
+        for keep in [
+            "robocopy exited with code 3",
+            "error: Exit code 1 from build",
+            "boom\nExit code 1",
+            "Exit code x\ny",
+        ] {
+            assert_eq!(strip_exit_header(keep), keep);
+        }
+    }
+
+    /// M7.1 §4.6 п. 3: коды ошибок — 1–4 латинские буквы и 4–6 цифр.
+    #[test]
+    fn error_code_words() {
+        for w in ["lnk1104", "e0432", "ts2307", "cs0246", "c2065", "lnk1181"] {
+            assert!(is_error_code(w), "{w}");
+        }
+        for w in [
+            "sha256",
+            "x86",
+            "e2e",
+            "utf8",
+            "h264",
+            "0x80070005",
+            "00942",
+            "error",
+            "lnk1104x",
+            "abcde1234",
+            "LNK1104",
+        ] {
+            assert!(!is_error_code(w), "{w}");
+        }
+    }
+
+    /// M7.1 §4.6 п. 3: частое слово — доля insight со словом выше порога и таких insight не
+    /// меньше [`COMMON_MIN_DOCS`]; 100 % — правило выключено.
+    #[test]
+    fn common_word_share_and_min_docs() {
+        assert!(is_common(6, 7, 20));
+        assert!(!is_common(4, 4, 20), "меньше пяти insight — не частое");
+        assert!(is_common(5, 5, 20));
+        assert!(!is_common(20, 100, 20), "ровно порог — не выше");
+        assert!(is_common(21, 100, 20));
+        assert!(!is_common(100, 100, 100), "100 % — выключено");
+        assert!(!is_common(0, 0, 20));
+    }
+
+    /// M7.1 §4.6 п. 3: слова ошибки для покрытия по предметным словам — без фразы «No such file or
+    /// directory» (в любом регистре, целыми словами).
+    #[test]
+    fn service_phrase_words_dropped() {
+        let n = normalize_error(strip_exit_header(
+            "Exit code 2\nls: cannot access 'web/x': No Such File or Directory",
+        ));
+        assert_eq!(n, "ls: cannot access No Such File or Directory");
+        assert_eq!(subject_error_terms(&n), ["cannot", "access"]);
+        // слово вне фразы остаётся
+        assert_eq!(
+            subject_error_terms("cannot open file: no such file or directory"),
+            ["cannot", "open", "file"]
+        );
+        assert_eq!(
+            subject_error_terms("no such file or directoryX"),
+            ["such", "file", "directoryx"]
+        );
+        // русская локаль и Windows (M-6 ревью задачи 8), `ё` = `е`
+        for (err, rest) in [
+            (
+                "ls: невозможно получить доступ к 'x': Нет такого файла или каталога",
+                vec!["невозможно", "получить", "доступ"],
+            ),
+            ("The system cannot find the path specified.", vec![]),
+            (
+                "open: The system cannot find the file specified. (os error 2)",
+                vec!["open", "error"],
+            ),
+            ("Не удаётся найти указанный путь", vec![]),
+            ("Системе: Не удается найти указанный файл.", vec!["системе"]),
+        ] {
+            assert_eq!(subject_error_terms(&normalize_error(err)), rest, "{err}");
+        }
+    }
+
+    /// M7.1 §4.6 п. 3: покрытие по предметным словам — снятые слова не идут ни в число слов, ни
+    /// в совпавшие; код ошибки не снимается, и одного его совпадения целиком достаточно.
+    #[test]
+    fn subject_coverage_skips_words_and_codes_suffice() {
+        let rule = CoverageRule::M6;
+        let q = error_terms("cannot access build test dist");
+        let lnk = "LNK1104: cannot open file; access denied; cargo test, cargo build";
+        // прежнее покрытие: 4 слова из 5 при пороге 3
+        assert!(CoverageQuery::new(&q, &rule).enough(lnk));
+        let common = |t: &str| matches!(t, "cannot" | "access" | "build" | "test");
+        let sq = CoverageQuery::subject(&q, &rule, common);
+        assert_eq!(sq.len(), 1);
+        assert!(!sq.enough(lnk), "из предметных слов осталось только dist");
+        assert!(sq.enough("dist"));
+        // ничего не осталось — подсказки нет
+        let none = CoverageQuery::subject(&error_terms("cannot access"), &rule, common);
+        assert!(none.is_empty() && !none.enough(lnk));
+        // код ошибки: снимать нельзя, совпадение целиком — достаточно
+        let q = error_terms("LINK fatal error LNK1104 cannot open file exe");
+        let all = |_: &str| true;
+        let sq = CoverageQuery::subject(&q, &rule, all);
+        assert!(sq.enough("Компоновщик: LNK1104 — exe занят"));
+        assert!(!sq.enough("LNK1181 onnxruntime.lib"));
+        assert!(!sq.enough("LNK11040 другое"));
+        // у `stems` — так же
+        let stems = CoverageRule {
+            word_match: WordMatch::Stems,
+            ..rule
+        };
+        assert!(CoverageQuery::subject(&q, &stems, all).enough("ошибка lnk1104"));
     }
 
     /// M6 §4.3: `ZeroAIMemory: <заголовок> [<вид>·<cert>] i:<id>`, надёжность сокращена.

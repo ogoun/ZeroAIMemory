@@ -162,6 +162,11 @@ pub struct Case {
     /// `pre_tool`: `Write | Edit | Bash`.
     #[serde(default)]
     pub tool: Option<String>,
+    /// `post_tool` (M7.1 §4.6): команда Bash, на которой случилась ошибка `input`. Случай идёт
+    /// через хук `zam hook post-tool` (`PostToolUseFailure`), как у агента: ожидаемый код выхода,
+    /// классы «не повторяй» и слова путей команды — правила клиента. Без поля — `POST /recall`.
+    #[serde(default)]
+    pub command: Option<String>,
     /// Ожидаемые подсказки (`insight:<key>`, `rule:<key>`); пусто — тишина.
     pub expected: Vec<String>,
     #[serde(default)]
@@ -169,7 +174,8 @@ pub struct Case {
     /// Происхождение случая ([`SOURCES`]): `m4` (по умолчанию), `task9` (исполнитель задачи 9
     /// M6), `independent` и `independent_b` (два независимых набора ревью задачи 9 — авторы не видели
     /// код, сетки и результаты), `m66` (случаи тишины M6.6 §3: реплики и пересланные сообщения),
-    /// `m71` (случаи тишины M7.1 §4.5: новые формы слов-реплик); `m66` и `m71` в решающие части
+    /// `m71` (M7.1: случаи тишины §4.5 — новые формы слов-реплик — и случаи `post_tool` §4.6
+    /// через хук — замечание обкатки 37, коды 1 `grep`/`diff`); `m66` и `m71` в решающие части
     /// сеток [`grid::DECISION_SOURCES`] не входят.
     #[serde(default = "default_source")]
     pub source: String,
@@ -279,6 +285,12 @@ pub fn validate_hints(set: &HintSet, corpus: &Corpus) -> Result<HintSummary> {
         }
         if !SOURCES.contains(&c.source.as_str()) {
             bad(format!("source {} — ожидается {SOURCES:?}", c.source));
+        }
+        if c.command.is_some() && c.event != Event::PostTool {
+            bad("command — только у post_tool".into());
+        }
+        if c.command.as_deref().is_some_and(|x| x.trim().is_empty()) {
+            bad("пустой command".into());
         }
         match (c.event, c.tool.as_deref()) {
             (Event::PreTool, Some("Write" | "Edit" | "Bash")) => {}
@@ -658,6 +670,9 @@ pub struct CaseRun {
     pub note: String,
     /// Происхождение случая ([`Case::source`]).
     pub source: String,
+    /// `post_tool` через хук `zam hook post-tool` ([`Case::command`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub via_hook: bool,
 }
 
 /// Строка перебора порога.
@@ -1186,6 +1201,7 @@ fn case_run(c: &Case) -> CaseRun {
         warnings: Vec::new(),
         note: c.note.clone(),
         source: c.source.clone(),
+        via_hook: c.event == Event::PostTool && c.command.is_some(),
     }
 }
 
@@ -1194,8 +1210,12 @@ fn case_run(c: &Case) -> CaseRun {
 fn api_case(s: &Session, refs: &RefMap, c: &Case, run: &mut CaseRun) -> Result<()> {
     let body = match c.event {
         Event::Prompt => json!({"event": "prompt", "prompt": c.input, "solution": EVAL_SOLUTION}),
+        // слова путей команды — как у хука (каталогов проекта у прогона нет)
         _ => json!({"event": "post_tool", "error": c.input, "tool": "Bash",
-                    "solution": EVAL_SOLUTION}),
+                    "solution": EVAL_SOLUTION,
+                    "path_words": c.command.as_deref()
+                        .map(|x| zam_core::shell::path_words(x, |_| false))
+                        .unwrap_or_default()}),
     };
     let (v, ms) = recall(s, &body)?;
     run.ms = ms;
@@ -1221,6 +1241,21 @@ fn run_cases(
     for c in &set.cases {
         let mut run = case_run(c);
         match c.event {
+            Event::PostTool if c.command.is_some() => {
+                let session = format!("hints-{tag}-{}", c.id);
+                let inp = h.input(
+                    "PostToolUseFailure",
+                    &session,
+                    json!({"tool_name": "Bash", "tool_input": {"command": c.command},
+                           "error": c.input}),
+                );
+                let (o, ms) = h.run("post-tool", &inp)?;
+                run.ms = ms;
+                run.shown = refs_in_text(&hook_context(&o))
+                    .into_iter()
+                    .map(|(k, id)| refs.map(&format!("{k}:{id}")))
+                    .collect();
+            }
             Event::Prompt | Event::PostTool => {
                 api_case(s, refs, c, &mut run)?;
                 if c.event == Event::Prompt {
@@ -1315,7 +1350,11 @@ fn calibrate(runs: &[CaseRun], full: &Corpus) -> Calibration {
         .count() as f64
         / prompts.len().max(1) as f64;
     let cands = err_cands(full);
-    let posts: Vec<&CaseRun> = runs.iter().filter(|r| r.event == Event::PostTool).collect();
+    // случаи через хук (`command`) модель отбора сервера не описывает
+    let posts: Vec<&CaseRun> = runs
+        .iter()
+        .filter(|r| r.event == Event::PostTool && !r.via_hook)
+        .collect();
     let post_tool = sweep(
         COVERAGE_RULES
             .iter()
@@ -2074,5 +2113,22 @@ mod tests {
         let (set, _) = load_hints(&root.join("hints.toml")).unwrap();
         let s = validate_hints(&set, &corpus).unwrap();
         assert!(s.cases >= MIN_CASES);
+        // `command` — только у `post_tool` и непустой (M7.1 §4.6)
+        let mut bad = set.clone();
+        let i = bad
+            .cases
+            .iter()
+            .position(|c| c.event == Event::Prompt)
+            .unwrap();
+        bad.cases[i].command = Some("grep x f".into());
+        let j = bad
+            .cases
+            .iter()
+            .position(|c| c.event == Event::PostTool && c.command.is_none())
+            .unwrap();
+        bad.cases[j].command = Some(" ".into());
+        let e = validate_hints(&bad, &corpus).unwrap_err().to_string();
+        assert!(e.contains("command — только у post_tool"), "{e}");
+        assert!(e.contains("пустой command"), "{e}");
     }
 }

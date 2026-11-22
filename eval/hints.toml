@@ -249,6 +249,25 @@ scope = "global"
 title = "Вывод консоли Windows с кириллицей превращается в кракозябры"
 body = "Кодовая страница консоли 866 не совпадает с UTF-8 вывода программы. Перед запуском — chcp 65001 и [Console]::OutputEncoding = [Text.Encoding]::UTF8."
 
+# ---- M7.1 §4.6 (ревью задачи 8, M-7): ловушка, на которую ложились частые слова вывода в
+# замечании обкатки 37 (по образцу записи рабочей памяти), и запись со словами «exit code» ----
+
+[[insight]]
+key = "h27-lnk1104-locked-exe"
+lang = "ru"
+kind = "gotcha"
+scope = "solution"
+title = "LNK1104 при пересборке тестов на Windows — exe держит посторонний процесс"
+body = '''`cargo test` и `cargo build` на Windows падают на компоновке: LNK1104: cannot open file …\deps\<тест>-<хэш>.exe, хотя процессов тестов нет. Exe держит открытым посторонний процесс (античит игры), файл нельзя перезаписать. Тест-бинарники пересобираются и после npm run build в web/: build.rs следит за web/dist. Собирать в новый CARGO_TARGET_DIR или менять хэш артефактов: cargo test --config 'profile.dev.package.zam-server.codegen-units=255'; не запускать npm run build между сборкой тестов и прогоном.'''
+
+[[insight]]
+key = "h28-exit-137-oom"
+lang = "ru"
+kind = "failure"
+scope = "global"
+title = "Exit code 137 — процесс снят OOM killer"
+body = "Exit code 137 = 128 + 9: процесс получил SIGKILL от ядра при нехватке памяти (OOM killer). Проверь dmesg и лимит памяти контейнера или юнита systemd, а не код программы."
+
 # ======================= заметки Rules (prompt, дайджест session_start) =======================
 
 [[rule]]
@@ -809,8 +828,8 @@ note = "FTS, короткая ошибка: одно общее слово"
 id = "e-11"
 event = "post_tool"
 input = "LINK : fatal error LNK1104: cannot open file 'target\\debug\\deps\\zam-a1b2c3.exe'"
-expected = ["insight:h17-lnk1104", "insight:c02-b"]
-note = "FTS; та же проблема на русском — c02-b"
+expected = ["insight:h17-lnk1104", "insight:c02-b", "insight:h27-lnk1104-locked-exe"]
+note = "FTS; та же проблема на русском — c02-b; с M7.1 — и h27 (тот же код, другая причина)"
 
 [[case]]
 id = "e-12"
@@ -1753,6 +1772,63 @@ requests.exceptions.ConnectionError: HTTPSConnectionPool(host='api.internal.acme
 expected = []
 note = "independent; silence; > 20; ловушка: connection/health/retries (h23, k24, h22), DNS (r02), Python traceback"
 source = "independent_b"
+
+# ---- M7.1 §4.6: ошибки команд через хук `zam hook post-tool` (поле `command`): строка `Exit code`
+# Claude Code, ожидаемый код 1 у grep/diff, слова путей команды; замечание обкатки 37 ----
+
+[[case]]
+id = "e-53"
+event = "post_tool"
+input = "Exit code 2\nweb/:\nbuild\ndist\ne2e\nindex.html\nnode_modules\npackage-lock.json\npackage.json\nsrc\ntest\ntsconfig.json\nviewer-pdf.html\nvite.config.ts\n\nweb/e2e:\naccess.spec.ts\nadmin.spec.ts\nagent-setup.spec.ts\ncache.spec.ts\ncode.spec.ts\ndocs-fixtures.ts\ndocuments.spec.ts\neditor.spec.ts\nexport.spec.ts\nglobal-setup.ts\nideas.spec.ts\nindex.spec.ts\njournals.spec.ts\nmermaid.spec.ts\nnotes.spec.ts\nplaywright.config.ts\nreports-print.spec.ts\nreports.spec.ts\nrun.mjs\nseed-docs.ts\nseed.ts\nsession.ts\nsessions.spec.ts\nuser-login.spec.ts\nworking-memory.spec.ts\nls: cannot access 'web/playwright.config.*': No such file or directory"
+command = "ls web/ web/e2e; ls web/playwright.config.*"
+expected = []
+note = "M7.1, замечание обкатки 37: настоящий вывод ls web/ web/e2e с кодом 2 — не ловушка LNK1104 (h27) по частым словам листинга"
+source = "m71"
+
+[[case]]
+id = "e-54"
+event = "post_tool"
+input = "Exit code 1"
+command = "grep -rn \"ERESOLVE\" docs"
+expected = []
+note = "M7.1 §4.6 п. 1: grep без совпадений — код 1 без вывода, не ошибка (база: «Exit code» → h28)"
+source = "m71"
+
+[[case]]
+id = "e-55"
+event = "post_tool"
+input = "Exit code 1\n0"
+command = "grep -c TODO src/lib.rs"
+expected = []
+note = "M7.1 §4.6 п. 1: grep -c печатает 0 в stdout, код 1 — не ошибка (база: «Exit code» → h28)"
+source = "m71"
+
+[[case]]
+id = "e-56"
+event = "post_tool"
+input = "Exit code 1\n3c3\n< timeout = 30\n---\n> timeout = 60"
+command = "diff config/old.toml config/new.toml"
+expected = []
+note = "M7.1 §4.6 п. 1: diff с разницей — код 1, разница в stdout, не ошибка (база: «Exit code» → h28)"
+source = "m71"
+
+[[case]]
+id = "e-57"
+event = "post_tool"
+input = "Exit code 101\nLINK : fatal error LNK1104: cannot open file 'target\\debug\\deps\\zam-a1b2c3.exe'"
+command = "cargo test -p zam-server --test recall"
+expected = ["insight:h17-lnk1104", "insight:c02-b", "insight:h27-lnk1104-locked-exe"]
+note = "M7.1: как e-11, но через хук со строкой Exit code — код LNK1104 по-прежнему находит запись"
+source = "m71"
+
+[[case]]
+id = "e-58"
+event = "post_tool"
+input = "Exit code 127\n./deploy.sh: line 3: $'\\r': command not found"
+command = "./deploy.sh"
+expected = ["insight:h11-crlf-bash", "insight:h01-sh-lf"]
+note = "M7.1: как e-04 через хук — error_regex и запись о LF при слове deploy из команды"
+source = "m71"
 
 # ======================= случаи: pre_tool =======================
 
