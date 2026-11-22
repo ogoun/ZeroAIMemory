@@ -510,8 +510,12 @@ async fn agent_node_json_frontmatter_masked() {
         "{j}"
     );
     assert_eq!(fm["tags"][1], "ops", "{j}");
+    // текст для правки — нумерованный вид (M7 §4.3.2), frontmatter узла — метки без номеров
     assert!(
-        j["content"].as_str().unwrap().contains("token: ‹secret›"),
+        j["content"].as_str().unwrap().contains(&format!(
+            "token: ‹secret-{}-5›",
+            zam_server::api::agent_view::object_tag(&nid, 1)
+        )),
         "{j}"
     );
     // человеку — исходник, в том числе md (целиком, с frontmatter) и HTML (кэш рендера — свой у
@@ -532,8 +536,11 @@ async fn agent_node_json_frontmatter_masked() {
     let md = get(&a, &format!("{base}?format=md")).await.text();
     assert_eq!(
         md,
-        zam_markdown::mask_text(&content),
-        "md агенту — маска всего файла"
+        zam_secrets::restore::numbered_view(
+            &zam_server::api::agent_view::object_tag(&nid, 1),
+            &content
+        ),
+        "md агенту — нумерованный вид всего файла"
     );
     let h = get(&a, &format!("{base}?format=html")).await;
     assert!(

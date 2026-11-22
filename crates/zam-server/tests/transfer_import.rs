@@ -1925,6 +1925,55 @@ async fn import_masked_archive_warns() {
     assert!(!r["warnings"].to_string().contains("замаскированы"), "{r}");
 }
 
+/// Архив с маской по токену с `on_conflict=revision` (круг правок 1 задачи 6 M7.1, M8) — 422 до
+/// записи: ревизия поверх живой заметки затёрла бы значения метками; `skip` — проходит, заметка
+/// с ключом не тронута; из сессии WebUI — как прежде.
+#[tokio::test]
+async fn import_masked_archive_revision_rejected() {
+    let w = world("imp-masked-rev").await;
+    let key = format!("{}{}", "AK", "IAQWERTYUIOPASDFGH");
+    note(&w.a, &w.o.tok, G, "s", &format!("ключ {key} тут")).await;
+    let zip = export_tok(&w.a, &w.o.tok, G, "").await;
+    // у получателя та же заметка уже есть с другим текстом: revision её бы переписал
+    note(
+        &w.a,
+        &w.rw.tok,
+        "knowledge",
+        "s",
+        &format!("свой ключ {key}"),
+    )
+    .await;
+    let r = import_tok(
+        &w.a,
+        &w.rw.tok,
+        "knowledge",
+        "?on_conflict=revision",
+        zip.clone(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert!(r.text().contains("on_conflict=skip"), "{}", r.text());
+    let db = db(&w.a, &w.rw.id).await;
+    let id = node_by_path(&db, "s").await.expect("заметка на месте");
+    let (_, text) = zam_store::node_content(&db, id.parse().unwrap(), None)
+        .await
+        .unwrap();
+    assert!(text.contains(&key), "значение не затёрто: {text}");
+    let r = report(
+        &import_tok(
+            &w.a,
+            &w.rw.tok,
+            "knowledge",
+            "?on_conflict=skip",
+            zip.clone(),
+        )
+        .await,
+    );
+    assert!(r.to_string().contains("замаскированы"), "{r}");
+    let r = report(&import_web(&w.a, &w.rw, "knowledge", "?on_conflict=revision", zip).await);
+    assert!(r.to_string().contains("замаскированы"), "{r}");
+}
+
 /// Итог задания импорта называет записи заголовком (`secrets_detected: «<заголовок>»`): опрос
 /// `GET /spaces/{space}/imports/{job}` по токену — с маской `‹secret›` (круг правок 1 задачи 5
 /// M7.1), из сессии WebUI — исходник.

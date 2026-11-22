@@ -37,6 +37,10 @@
 //! `supersedes_id` и повторе по ключу) **[решение исполнителя]**; при замещении — ещё
 //! `superseded` (старая запись).
 //!
+//! Замещение агентом (`supersedes_id`, [`supersede`]) пишется по виду старой записи с метками:
+//! значения под `‹secret-T-N›` возвращаются по её маскам (задача 6 M7.1, M7 §4.3.2,
+//! [`super::secret_restore`]), новая метка — как есть с `secret_mark_kept`.
+//!
 //! **Операции:** `POST /entries/{id}/supersede {новая запись}` → 201 `{entry, superseded}`;
 //! `POST /entries/{id}/retract {reason}` (у обеих `If-Match: <rev>` необязателен, при наличии
 //! проверяется — 409 с `rev` текущей, §11.3; пустая причина → 422; отзыв `superseded` разрешён:
@@ -73,6 +77,7 @@ use super::scope::{
     EntryScope, MemScope, Mode, Role, deny_report_mutation, entry_scope, hidden_entry, live_entry,
     space_scope,
 };
+use super::secret_restore;
 use crate::app::AppState;
 use crate::attrib::attribution;
 use crate::auth::{Client, Principal};
@@ -118,6 +123,9 @@ pub struct InsightReq {
     #[serde(default)]
     force: bool,
     supersedes_id: Option<String>,
+    /// Ревизия замещаемой записи (`supersedes_id`), с которой агент читал её вид: метки
+    /// `‹secret-T-N›` нового текста — по её маскам; без неё такие метки — 428 (M7 §4.3.2 п. 3).
+    supersedes_rev: Option<i64>,
     /// Явные связи графа `[{type, target}]`.
     links: Option<Vec<Value>>,
     /// Ссылки на файлы `{files: [{path, hash?, commit?}]}` (M4.5 §6.1, [`super::files`]).
@@ -668,11 +676,11 @@ async fn decision_vector(
 /// Запись как JSON: у insight — её триггеры (`triggers` — массив, у не-insight — нет поля), у
 /// задачи — поля [`super::tasks::attach_task`] (длительность, идеи плана — видимые с ролью `role`,
 /// [`super::tasks::idea_spaces`]). Агенту `p` по токену — с маской секретов
-/// ([`agent_view::ENTRY_FIELDS`], задача 5 M7.1; длинное тело — в пуле блокирующих задач);
-/// сессии WebUI — исходник.
+/// ([`agent_view::view_entry_json_owned`]: редактируемые поля — `‹secret-T-N›`, задача 5 и круги
+/// правок 3–5 задачи 6 M7.1; длинное тело — в пуле блокирующих задач); сессии WebUI — исходник.
 pub async fn entry_json(p: &Principal, db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
     let v = entry_json_raw(db, e, role).await?;
-    agent_view::view_json_owned(p, v, agent_view::ENTRY_FIELDS).await
+    agent_view::view_entry_json_owned(p, v).await
 }
 
 /// [`entry_json`] без маски (исходник для любого зрителя).
@@ -796,6 +804,74 @@ fn duplicate(candidates: Vec<DedupCandidate>, mode: DedupMode) -> ApiError {
     }
 }
 
+/// Новая запись `req` агента по виду замещаемой `old` ревизии `rev` (M7 §4.3.2, задача 6 M7.1):
+/// поля [`secret_restore::EntryTexts`] — значения масок старой записи по меткам `‹secret-T-N›`
+/// с T этой записи и ревизии `rev` (повтор по ключу после замещения: ревизия старой уже
+/// следующая, тексты — те же). Прочие метки — литералы; правка, выводящая секрет из-под маски, —
+/// 422.
+fn restore_req(old: &Entry, rev: i64, req: &mut InsightReq) -> Result<usize, ApiError> {
+    let mut base = secret_restore::EntryBase::from(old);
+    base.rev = rev;
+    secret_restore::EntryTexts {
+        title: Some(&mut req.title),
+        body: Some(&mut req.body),
+        data: Some(&mut req.data),
+        tags: Some(&mut req.tags),
+        area: req.area.as_mut(),
+        ..secret_restore::EntryTexts::default()
+    }
+    .restore(base)
+}
+
+/// В тексте новой записи есть метка объекта `‹secret-T-N›` или с номером `‹secret-N›` (метки — по
+/// виду замещаемой записи).
+fn numbered_marks(req: &InsightReq) -> bool {
+    let has = |s: &str| zam_secrets::marks(s).any(|(_, k)| k != zam_secrets::Mark::Plain);
+    has(&req.title)
+        || has(&req.body)
+        || req.tags.iter().any(|t| has(t))
+        || req.area.as_deref().is_some_and(has)
+        || has(&req.data.to_string())
+}
+
+/// 428: замещение с метками `‹secret-…›` без ревизии замещаемой записи (M7 §4.3.2 п. 3).
+fn revision_required() -> ApiError {
+    ApiError::PreconditionRequired(
+        "метки ‹secret-…› нового текста — по виду замещаемой записи: передайте её ревизию \
+         (If-Match у /supersede, в MCP — rev у memory_update_entry supersede; supersedes_rev \
+         у supersedes_id)"
+            .into(),
+    )
+}
+
+/// [`restore_req`] для принципала `p` (ревизия вида — `rev`, без неё — текущая): человеку — как
+/// есть (0); длинные тела с метками — в пуле блокирующих задач.
+async fn restore_for(
+    p: &Principal,
+    old: &Entry,
+    rev: Option<i64>,
+    req: InsightReq,
+) -> Result<(InsightReq, usize), ApiError> {
+    let rev = rev.unwrap_or(old.rev);
+    if !agent_view::masks(p) {
+        return Ok((req, 0));
+    }
+    let mut req = req;
+    if !secret_restore::has_mark(&req.body)
+        || req.body.len() + old.body.len() <= agent_view::BLOCKING_FROM
+    {
+        let kept = restore_req(old, rev, &mut req)?;
+        return Ok((req, kept));
+    }
+    let old = old.clone();
+    let (req, kept) = agent_view::blocking(move || {
+        let kept = restore_req(&old, rev, &mut req);
+        (req, kept)
+    })
+    .await?;
+    Ok((req, kept?))
+}
+
 /// `POST /spaces/{space}/entries` с `kind: insight` или `term` (тело уже прочитано как
 /// JSON): 201 / 200 (повтор по ключу) / 409 possible-duplicate или term-conflict / 422.
 pub async fn create(
@@ -806,10 +882,30 @@ pub async fn create(
     space: &str,
     body: Value,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let mut req: InsightReq = serde_json::from_value(body)
+    let req: InsightReq = serde_json::from_value(body)
         .map_err(|e| ApiError::BadRequest(format!("некорректное тело: {e}")))?;
     let kind = req.kind.unwrap_or(EntryKind::Insight);
     let sc = target_scope(st, p, headers, space, req.scope.as_deref()).await?;
+    // замещение агентом по маскированному виду старой записи — значения обратно до проверок
+    // (M7 §4.3.2); проверки доступа к старой записи — ниже, как раньше: здесь она только база
+    let (mut req, kept) = match req.supersedes_id.as_deref().map(super::parse_id) {
+        Some(Ok(old)) if agent_view::masks(p) => match get_entry(&sc.db, old).await {
+            Ok(o) if o.deleted_at.is_none() && !hidden_entry(p, &o) => {
+                // метки — по ревизии, с которой агент читал (M7 §4.3.2 п. 3); повтор по ключу
+                // ревизию не сверяет (как `/supersede`): её сверит хранилище, кроме повтора
+                if req.supersedes_rev.is_none() && numbered_marks(&req) {
+                    return Err(revision_required());
+                }
+                if !headers.contains_key("idempotency-key") {
+                    super::entries::stale_entry(&o, req.supersedes_rev)?;
+                }
+                let rev = req.supersedes_rev;
+                restore_for(p, &o, rev, req).await?
+            }
+            _ => (req, 0),
+        },
+        _ => (req, 0),
+    };
     let triggers = check_request(st, &mut req, kind)?;
     let raw_links = req.links.take().unwrap_or_default();
     let links = insight_links(
@@ -846,10 +942,11 @@ pub async fn create(
                 kind.as_str()
             )));
         }
+        let sup_rev = req.supersedes_rev;
         let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
-        // замещение через supersedes_id: ревизия старой не сверяется (If-Match у POST
-        // коллекции относился бы к новой записи) [решение исполнителя]
-        let (n, o) = supersede_entry(&sc.db, old, None, new, &attrib)
+        // замещение через supersedes_id: ревизия старой — `supersedes_rev`, если задана (If-Match у
+        // POST коллекции относился бы к новой записи) [решение исполнителя]
+        let (n, o) = supersede_entry(&sc.db, old, sup_rev, new, &attrib)
             .await
             .map_err(|e| agent_view::view_error(p, e.into()))?;
         st.index.notify();
@@ -868,9 +965,9 @@ pub async fn create(
             .await?;
         }
         let mut v = entry_json(p, &sc.db, &n, sc.role).await?;
-        super::secrets::attach_entry(&mut v, &n);
+        attach_secrets(p, &mut v, &n, &o);
         let old_v = serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
-        v["superseded"] = agent_view::view_json_owned(p, old_v, agent_view::ENTRY_FIELDS).await?;
+        v["superseded"] = agent_view::view_entry_json_owned(p, old_v).await?;
         if kind == EntryKind::Insight {
             v["dedup"] = json!(DedupMode::Skipped.as_str());
             let w = alias_warnings(st, &sc.db, sc.space.id, &n.title, &n.body).await?;
@@ -889,6 +986,10 @@ pub async fn create(
             attach_warnings(&mut v, broad_alias_warnings(&n.data));
         }
         agent_view::view_json(p, &mut v, &["warnings"]);
+        // повтор по ключу — без предупреждения (круг правок 1, M9)
+        if !repeat {
+            secret_restore::attach_kept(&mut v, kept);
+        }
         let status = if repeat {
             StatusCode::OK
         } else {
@@ -924,12 +1025,19 @@ pub async fn create(
     };
     let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
     // 409 term-conflict — заголовки занятых терминов агенту с маской
-    let (e, created) = create_entry(&sc.db, new, &attrib)
+    let (mut e, created) = create_entry(&sc.db, new, &attrib)
         .await
         .map_err(|e| agent_view::view_error(p, e.into()))?;
     if created {
         st.index.notify();
     }
+    // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
+    // координатора по задаче 6 M7.1); повтор по ключу — без предупреждения
+    let kept = if created && agent_view::masks(p) {
+        secret_restore::EntryTexts::of(&mut e).marks()
+    } else {
+        0
+    };
     let mut v = entry_json(p, &sc.db, &e, sc.role).await?;
     super::secrets::attach_entry(&mut v, &e);
     if kind == EntryKind::Insight {
@@ -952,6 +1060,7 @@ pub async fn create(
         attach_warnings(&mut v, broad_alias_warnings(&e.data));
     }
     agent_view::view_json(p, &mut v, &["warnings"]);
+    secret_restore::attach_kept(&mut v, kept);
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -985,12 +1094,25 @@ pub async fn supersede(
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live_insight(&p, &sc)?;
     let rev = optional_if_match(&headers)?;
-    let mut req: InsightReq = json_body(body)?;
+    let req: InsightReq = json_body(body)?;
     if req.scope.is_some() || req.supersedes_id.is_some() {
         return Err(unprocessable(
             "scope и supersedes_id задаются замещаемой записью, а не телом",
         ));
     }
+    // агент писал новую запись по маскированному виду старой — значения обратно (M7 §4.3.2);
+    // вид устаревшей ревизии `If-Match` без ключа повтора — 409 раньше восстановления (круг
+    // правок 2 задачи 6, B4: как правка записи; повтор по ключу ревизию не сверяет); метки с
+    // номером без ревизии — 428: номера — по виду ревизии, с которой агент читал (§4.3.2 п. 3)
+    if agent_view::masks(&p) {
+        if rev.is_none() && numbered_marks(&req) {
+            return Err(revision_required());
+        }
+        if !headers.contains_key("idempotency-key") {
+            super::entries::stale_entry(&sc.entry, rev)?;
+        }
+    }
+    let (mut req, kept) = restore_for(&p, &sc.entry, rev, req).await?;
     let kind = sc.entry.kind;
     let triggers = check_request(&st, &mut req, kind)?;
     let raw_links = req.links.take().unwrap_or_default();
@@ -1030,7 +1152,7 @@ pub async fn supersede(
         StatusCode::CREATED
     };
     let mut entry = entry_json(&p, &sc.db, &n, sc.role).await?;
-    super::secrets::attach_entry(&mut entry, &n);
+    attach_secrets(&p, &mut entry, &n, &sc.entry);
     if kind == EntryKind::Insight {
         let w = alias_warnings(&st, &sc.db, sc.space.id, &n.title, &n.body).await?;
         attach_warnings(&mut entry, w);
@@ -1050,6 +1172,10 @@ pub async fn supersede(
         attach_warnings(&mut entry, broad_alias_warnings(&n.data));
     }
     agent_view::view_json(&p, &mut entry, &["warnings"]);
+    // повтор по ключу — без предупреждения (круг правок 1, M9)
+    if !repeat {
+        secret_restore::attach_kept(&mut entry, kept);
+    }
     Ok((
         status,
         Json(json!({
@@ -1057,6 +1183,16 @@ pub async fn supersede(
             "superseded": entry_json(&p, &sc.db, &o, sc.role).await?,
         })),
     ))
+}
+
+/// `secrets_detected` замещающей записи `n`: агенту — только находки, которых нет в замещённой
+/// `old` (круг правок 1 задачи 6, M4), человеку — все.
+fn attach_secrets(p: &Principal, v: &mut Value, n: &Entry, old: &Entry) {
+    if agent_view::masks(p) {
+        super::secrets::attach_entry_new(v, n, old);
+    } else {
+        super::secrets::attach_entry(v, n);
+    }
 }
 
 #[derive(Deserialize)]

@@ -46,9 +46,14 @@
 //! попадает.
 //!
 //! **Агенту по токену** (задача 5 M7.1, спецификация M7 §4.3.1 п. 3,
-//! [`super::agent_view::ENTRY_FIELDS`]) запись в ответах — карточка, лента, ревизии, эхо создания,
-//! правки и восстановления — с `‹secret›` вместо значений в заголовке, теле и строках `data`;
-//! `secrets_detected` — по исходнику. Сессии WebUI — исходник.
+//! [`super::agent_view::view_entry_json_owned`]) запись в ответах — карточка, лента, ревизии, эхо
+//! создания, правки и восстановления — с метками вместо значений: в заголовке, теле, строках
+//! `data`, тегах и области — `‹secret-T-N›` (метка записи и ревизии, сквозной номер маски, круг
+//! правок 5 задачи 6),
+//! в прочих полях — `‹secret›`; `secrets_detected` — по исходнику. Сессии WebUI — исходник. Правку
+//! агента (`PATCH`) по этому виду сервер возвращает к исходнику по меткам (задача 6 M7.1,
+//! M7 §4.3.2, [`super::secret_restore`]); метка без номера маски записывается как есть с
+//! предупреждением `secret_mark_kept`.
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -65,7 +70,7 @@ use zam_store::{
     restore_entry, update_entry, usage_counts,
 };
 
-use super::agent_view::{self, ENTRY_FIELDS};
+use super::agent_view;
 use super::insights::{entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
 use super::render::Viewer;
@@ -74,6 +79,7 @@ use super::scope::{
     Mode, deny_report_mutation, entry_scope, live_entry, report_trash_allowed, space_scope,
     trash_allowed,
 };
+use super::secret_restore;
 use super::{json_body, query};
 use crate::app::AppState;
 use crate::attrib::attribution;
@@ -459,12 +465,19 @@ pub async fn create(
         links: Vec::new(),
         refs,
     };
-    let (entry, created) = create_entry(&sc.db, new, &attrib)
+    let (mut entry, created) = create_entry(&sc.db, new, &attrib)
         .await
         .map_err(|e| agent_view::view_error(&p, e.into()))?;
     if created {
         st.index.notify();
     }
+    // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
+    // координатора по задаче 6 M7.1); повтор по ключу — без предупреждения
+    let kept = if created && agent_view::masks(&p) {
+        secret_restore::EntryTexts::of(&mut entry).marks()
+    } else {
+        0
+    };
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -478,8 +491,9 @@ pub async fn create(
         super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &entry.title, &entry.body)
             .await?,
     );
-    let mut v = agent_view::view_json_owned(&p, v, ENTRY_FIELDS).await?;
+    let mut v = agent_view::view_entry_json_owned(&p, v).await?;
     agent_view::view_json(&p, &mut v, &["warnings"]);
+    secret_restore::attach_kept(&mut v, kept);
     Ok((status, Json(v)))
 }
 
@@ -715,7 +729,7 @@ pub async fn list(
         super::reports::view::report_feed(&sc.db, &items, &mut out, viewer).await?;
     }
     // лента до 200 записей с телами — маска одним проходом, длинная — в пуле
-    let out = agent_view::view_json_owned(&p, Value::Array(out), ENTRY_FIELDS).await?;
+    let out = agent_view::view_entry_json_owned(&p, Value::Array(out)).await?;
     Ok(Json(json!({ "items": out, "next_cursor": next })))
 }
 
@@ -1039,7 +1053,37 @@ pub async fn patch(
     // отчёт неизменен: любое поле — 409 раньше `If-Match` и разбора тела
     deny_report_mutation(&p, &sc)?;
     let rev = Some(if_match(&headers)?);
-    let req: Patch = json_body(body)?;
+    let mut req: Patch = json_body(body)?;
+    // агент правил вид ревизии `If-Match`: она устарела — 409 хранилища раньше восстановления
+    // по текущей (круг правок 2 задачи 6, B4; как `PUT` заметки, M6 круга 1) — иначе правка по
+    // старому виду дала бы 422 вместо 409
+    if agent_view::masks(&p) {
+        stale_entry(&sc.entry, rev)?;
+    }
+    // агент правил вид записи с метками: значения под `‹secret-T-N›` — обратно до проверок
+    // (M7 §4.3.2), длинное тело с метками — в пуле; сессия WebUI — как есть
+    let big_body = req
+        .body
+        .as_ref()
+        .or(req.append_body.as_ref())
+        .is_some_and(|b| {
+            b.len() + sc.entry.body.len() > agent_view::BLOCKING_FROM && secret_restore::has_mark(b)
+        });
+    let kept = if !agent_view::masks(&p) {
+        0
+    } else if !big_body {
+        restore_patch(&sc.entry, &mut req)?
+    } else {
+        let base = sc.entry.clone();
+        let (r, k) = agent_view::blocking(move || {
+            let mut r = req;
+            let k = restore_patch(&base, &mut r);
+            (r, k)
+        })
+        .await?;
+        req = r;
+        k?
+    };
     check_patch_by(&p, &sc.entry, &req)?;
     // правку сделал человек: сессия WebUI или слова человека токеном (`by: human`, M6.5 §6) —
     // возвращённая идея снова идёт на разбор
@@ -1139,7 +1183,12 @@ pub async fn patch(
         st.index.notify();
     }
     let mut v = entry_json(&p, &sc.db, &e, sc.role).await?;
-    super::secrets::attach_entry(&mut v, &e);
+    // находки — у агента только новые: восстановленные и прежние значения ему не новость (M4)
+    if agent_view::masks(&p) {
+        super::secrets::attach_entry_new(&mut v, &e, &sc.entry);
+    } else {
+        super::secrets::attach_entry(&mut v, &e);
+    }
     if e.kind != EntryKind::Term {
         super::glossary::attach_warnings(
             &mut v,
@@ -1149,7 +1198,46 @@ pub async fn patch(
         super::glossary::attach_warnings(&mut v, super::glossary::broad_alias_warnings(&e.data));
     }
     agent_view::view_json(&p, &mut v, &["warnings"]);
+    secret_restore::attach_kept(&mut v, kept);
     Ok(Json(v))
+}
+
+/// `If-Match` `rev` не совпал с ревизией записи `e` — 409 с текущей `rev`, тот же, что даёт
+/// хранилище ([`zam_store::StoreError::StaleRevision`]): сверка раньше восстановления значений
+/// под `‹secret›` по виду записи (правка, замещение).
+pub(crate) fn stale_entry(e: &Entry, rev: Option<i64>) -> Result<(), ApiError> {
+    match rev {
+        Some(expected) if expected != e.rev => Err(zam_store::StoreError::StaleRevision {
+            expected,
+            current: e.rev,
+        }
+        .into()),
+        _ => Ok(()),
+    }
+}
+
+/// Правка `req` агентом по виду записи `e` с метками (M7 §4.3.2, задача 6 M7.1): поля
+/// [`secret_restore::EntryTexts`] — значения масок записи по меткам `‹secret-T-N›` с T этой записи
+/// и ревизии, и в дописке `append_body`. Прочие метки — литералы; правка, выводящая секрет из-под
+/// маски, — 422.
+fn restore_patch(e: &Entry, req: &mut Patch) -> Result<usize, ApiError> {
+    let mut data_fields = Vec::new();
+    if let Some(Some(s)) = &mut req.next_step {
+        data_fields.push(("next_step", s));
+    }
+    if let Some(Some(s)) = &mut req.blocked_by {
+        data_fields.push(("blocked_by", s));
+    }
+    secret_restore::EntryTexts {
+        title: req.title.as_mut(),
+        body: req.body.as_mut(),
+        append_body: req.append_body.as_mut(),
+        data: req.data.as_mut(),
+        data_fields,
+        tags: req.tags.as_mut(),
+        area: req.area.as_mut().and_then(Option::as_mut),
+    }
+    .restore(e.into())
 }
 
 /// Детали аудита операций записи (без текста записи).
@@ -1221,9 +1309,7 @@ pub async fn restore(
         audit_details(sc.space.id, sc.entry.kind),
     )
     .await?;
-    Ok(Json(
-        agent_view::view_json_owned(&p, json!(e), ENTRY_FIELDS).await?,
-    ))
+    Ok(Json(agent_view::view_entry_json_owned(&p, json!(e)).await?))
 }
 
 /// `GET /entries/{id}/revisions` → `{items}` по возрастанию номера.
@@ -1236,8 +1322,9 @@ pub async fn revisions(
     let sc = entry_scope(&st, &p, &headers, &id, Mode::Read).await?;
     live_entry(&sc)?;
     let items = entry_revisions(&sc.db, sc.entry.id).await?;
-    // все ревизии с телами (до 1 МБ каждое) — длинные маскируются в пуле
-    let items = agent_view::view_json_owned(&p, json!(items), ENTRY_FIELDS).await?;
+    // все ревизии с телами (до 1 МБ каждое) — длинные маскируются в пуле; метки без номеров:
+    // номера действуют только у текущей записи (M7 §4.3.2 п. 1, круг правок 4 задачи 6)
+    let items = agent_view::view_json_owned(&p, json!(items), agent_view::ENTRY_FIELDS).await?;
     Ok(Json(json!({ "items": items })))
 }
 

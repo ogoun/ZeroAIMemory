@@ -1035,6 +1035,8 @@ async fn cache_put(rest: &Rest, args: &JsonObject) -> Res {
         if let Some(p) = v["promoted"].as_str() {
             s.push_str(&format!(" → {p}"));
         }
+        // предупреждения ответа (`secret_mark_kept` текста выжимки)
+        s.push_str(&warnings_inline(v));
         s
     })
 }
@@ -1335,6 +1337,8 @@ fn review_outcome(v: &Value) -> String {
     if v["replay"] == true {
         s.push_str(" · повтор (записано ранее)");
     }
+    // предупреждения ответа (`secret_mark_kept` задачи плана)
+    s.push_str(&warnings_inline(v));
     s
 }
 
@@ -1408,6 +1412,7 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
         "scope",
         "force",
         "supersedes_id",
+        "supersedes_rev",
     ];
     let mut body = pick(args, &keys);
     if report {
@@ -1565,6 +1570,8 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
                     s.push_str(" · ");
                     s.push_str(&idea_outcome(v));
                 }
+                // предупреждения ответа (`secret_mark_kept` текста ответа)
+                s.push_str(&warnings_inline(v));
                 s
             });
         }
@@ -1714,12 +1721,14 @@ fn triggers_body(args: &JsonObject) -> Result<Map<String, Value>, Fail> {
 /// <entry_short>».
 fn changed_line(action: &str, v: &Value) -> String {
     let w = warnings_inline(v);
-    // замещение: {entry, superseded}
+    // замещение: {entry, superseded}; предупреждения записи (`secret_mark_kept` и др.) — у
+    // новой записи
     if let Some(new) = v.get("entry").filter(|e| e.is_object()) {
         return format!(
-            "Новая {} · замещена {}{w}",
+            "Новая {} · замещена {}{}",
             entry_short(new),
-            entry_ref_of(&v["superseded"])
+            entry_ref_of(&v["superseded"]),
+            warnings_inline(new)
         );
     }
     match action {

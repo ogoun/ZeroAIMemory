@@ -11,6 +11,12 @@ rust-version.workspace = true
 [dependencies]
 regex.workspace = true
 
+[features]
+# `zam_secrets::restore` — обратный путь маски для записи агентом (сервер): нумерованный вид
+# `‹secret-T-N›`, восстановление по метке и покрытие по происхождению (M7 §4.3.2, круги правок 3–5
+# задачи 6 M7.1), без зависимостей; клиенту `zam` не нужен
+restore = []
+
 [dev-dependencies]
 proptest.workspace = true
 # эталон CommonMark для сверки участков кода (`tests/commonmark.rs`, круг правок 5 задачи 5

@@ -42,9 +42,11 @@
 //!
 //! Целиком без фокуса: листов не больше `focus_leaves` (`focus skipped: short`); листов нет,
 //! нарезка другой ревизии или лист не нашёлся в тексте — `focus skipped: not indexed`. Нарезка
-//! идёт по маскированному тексту ревизии: агенту по токену `/read` отдаёт фокус по тому же
-//! маскированному тексту (задача 5 M7.1) — лист с `‹secret›` находится, адреса и `~N` — по маске;
-//! человеку в сессии WebUI текст — исходник, и лист с секретом в нём не находится.
+//! идёт по маскированному тексту ревизии: агенту по токену `/read` отдаёт фокус по нумерованному
+//! виду того же текста (задача 5 M7.1; метки `‹secret-T-N›` — круги правок 3–5 задачи 6, M7 §4.3.2
+//! п. 6) — лист с `‹secret›` сопоставляется с ним с учётом номеров ([`Unnumbered`]), адреса и `~N`
+//! — по нумерованному виду; человеку в сессии WebUI текст — исходник, и лист с секретом в нём не
+//! находится.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -466,14 +468,72 @@ fn next_char(text: &str, i: usize) -> usize {
     i + text[i..].chars().next().map_or(1, char::len_utf8)
 }
 
+/// Текст с метками без номеров: метка `‹secret-T-N›` или `‹secret-N›` (вид агента, M7 §4.3.2
+/// п. 6) и литерал метки — `‹secret›`, как в листах (чанки маскированы без номеров); позиции —
+/// обратно в исходный текст ([`Unnumbered::to_src`]).
+struct Unnumbered<'t> {
+    text: std::borrow::Cow<'t, str>,
+    /// Метки, длина которых отличается от `‹secret›`: (начало в `text`, начало в исходном, длина
+    /// в исходном), по возрастанию.
+    marks: Vec<(usize, usize, usize)>,
+}
+
+impl<'t> Unnumbered<'t> {
+    fn new(src: &'t str) -> Self {
+        let mark = zam_markdown::SECRET_MARK;
+        if !src.contains(zam_secrets::NUMBERED_MARK_PREFIX) {
+            return Unnumbered {
+                text: std::borrow::Cow::Borrowed(src),
+                marks: Vec::new(),
+            };
+        }
+        let mut text = String::with_capacity(src.len());
+        let mut marks = Vec::new();
+        let mut pos = 0;
+        for (r, k) in zam_secrets::marks(src) {
+            if k == zam_secrets::Mark::Plain {
+                continue;
+            }
+            text.push_str(&src[pos..r.start]);
+            marks.push((text.len(), r.start, r.len()));
+            text.push_str(mark);
+            pos = r.end;
+        }
+        text.push_str(&src[pos..]);
+        Unnumbered {
+            text: std::borrow::Cow::Owned(text),
+            marks,
+        }
+    }
+
+    /// Позиция `p` текста без номеров — в исходном: внутри метки — её конец.
+    fn to_src(&self, p: usize) -> usize {
+        let k = self.marks.partition_point(|m| m.0 < p);
+        if k == 0 {
+            return p;
+        }
+        let (ps, ss, sl) = self.marks[k - 1];
+        let ml = zam_markdown::SECRET_MARK.len();
+        if p < ps + ml {
+            ss + sl
+        } else {
+            p - ps - ml + ss + sl
+        }
+    }
+}
+
 /// Байты листов в тексте `text` по порядку (поиск с начала предыдущего листа: соседние
 /// перекрываются). Лист — `src[range]` или повторённый заголовок блока + `src[range]` (тогда ищется
-/// без первых строк). Не нашёлся — `None`.
+/// без первых строк). Метки `‹secret-T-N›` в тексте и литералы в листе сопоставляются как
+/// `‹secret›` ([`Unnumbered`]); байты — исходного `text`. Не нашёлся — `None`.
 fn locate(text: &str, leaves: &[FocusLeaf]) -> Option<Vec<(usize, usize)>> {
+    let plain = Unnumbered::new(text);
+    let pt = plain.text.as_ref();
     let mut out = Vec::with_capacity(leaves.len());
     let mut from = 0usize;
     for l in leaves {
-        let t = l.text.as_str();
+        let lt = Unnumbered::new(&l.text);
+        let t = lt.text.as_ref();
         let mut cands: Vec<&str> = vec![t, t.trim()];
         let mut rest = t;
         for _ in 0..3 {
@@ -488,9 +548,9 @@ fn locate(text: &str, leaves: &[FocusLeaf]) -> Option<Vec<(usize, usize)>> {
         let (pos, len) = cands
             .into_iter()
             .filter(|c| !c.is_empty())
-            .find_map(|c| text.get(from..)?.find(c).map(|p| (from + p, c.len())))?;
-        out.push((pos, pos + len));
-        from = next_char(text, pos).min(text.len());
+            .find_map(|c| pt.get(from..)?.find(c).map(|p| (from + p, c.len())))?;
+        out.push((plain.to_src(pos), plain.to_src(pos + len)));
+        from = next_char(pt, pos).min(pt.len());
     }
     Some(out)
 }
@@ -1069,5 +1129,30 @@ mod tests {
         );
         assert_eq!(crossed(text, &secs, gs[1].0, gs[1].1), ["A > C"]);
         assert!(locate("другое", &l).is_none());
+    }
+
+    /// Нумерованный вид (M7 §4.3.2 п. 6, круг правок 3 задачи 6): листы с `‹secret›` (и литерал
+    /// `‹secret-N›` исходника в листе — в виде он без номера) находятся, байты — нумерованного
+    /// текста, граница листа на метке — её конец в нумерованном тексте.
+    #[test]
+    fn locate_numbered_marks() {
+        let text = "# A\n\nключ ‹secret-1› и ‹secret-12›.\n\nдалее ‹secret› текст.\n";
+        let l = vec![
+            leaf(0, 0, "ключ ‹secret› и ‹secret›."),
+            leaf(1, 0, "‹secret› и ‹secret›."),
+            leaf(2, 0, "далее ‹secret-7› текст."),
+        ];
+        let r = locate(text, &l).unwrap();
+        assert_eq!(&text[r[0].0..r[0].1], "ключ ‹secret-1› и ‹secret-12›.");
+        assert_eq!(&text[r[1].0..r[1].1], "‹secret-1› и ‹secret-12›.");
+        assert_eq!(&text[r[2].0..r[2].1], "далее ‹secret› текст.");
+        let u = Unnumbered::new(text);
+        assert_eq!(
+            u.text,
+            "# A\n\nключ ‹secret› и ‹secret›.\n\nдалее ‹secret› текст.\n"
+        );
+        // позиция внутри метки — её конец в исходном
+        let inside = u.text.find("‹secret›").unwrap() + 1;
+        assert_eq!(u.to_src(inside), text.find(" и ").unwrap());
     }
 }

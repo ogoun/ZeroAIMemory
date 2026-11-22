@@ -113,6 +113,15 @@ pub async fn answer(
         horizon = Some(super::ideas::default_horizon(&st)?);
     }
     let attrib = attribution(&p, &headers, req.message)?;
+    // ответ по токену — новый текст: метка `‹secret›` значения не хранит (решение координатора по
+    // задаче 6 M7.1, круг правок 1)
+    let kept = if super::agent_view::masks(&p) {
+        req.text
+            .as_deref()
+            .map_or(0, super::secret_restore::marks_in)
+    } else {
+        0
+    };
     let zam_store::Answered {
         question: q,
         decision: d,
@@ -194,8 +203,9 @@ pub async fn answer(
     if let Some(t) = &task {
         out["task"] = raw(t);
     }
-    let out =
+    let mut out =
         super::agent_view::view_entries_in(&p, out, &["entry", "decision", "idea", "task"]).await?;
+    super::secret_restore::attach_kept(&mut out, kept);
     Ok(Json(out))
 }
 

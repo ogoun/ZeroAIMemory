@@ -756,6 +756,15 @@ pub async fn review(
         .map(str::trim)
         .and_then(ReviewOutcome::parse)
         .ok_or_else(|| unprocessable("outcome: plan, return, decline или done"))?;
+    // новая задача плана по токену: базы нет — метка `‹secret›` значения не хранит (решение
+    // координатора по задаче 6 M7.1)
+    let task_marks = req.task.as_ref().map_or(0, |t| {
+        [&t.title, &t.body]
+            .into_iter()
+            .flatten()
+            .map(|s| super::secret_restore::marks_in(s))
+            .sum::<usize>()
+    });
     let task = req
         .task
         .map(ReviewTaskReq::parse)
@@ -797,7 +806,11 @@ pub async fn review(
     if let Some(t) = &r.task {
         out["task"] = entry_value(t);
     }
-    shown(&p, out).await
+    let Json(mut out) = shown(&p, out).await?;
+    if !r.replay && r.task.is_some() && super::agent_view::masks(&p) {
+        super::secret_restore::attach_kept(&mut out, task_marks);
+    }
+    Ok(Json(out))
 }
 
 /// Статус идеи меняют только операции этого модуля (§5): `PATCH status` — 422.

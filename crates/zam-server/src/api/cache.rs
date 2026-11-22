@@ -644,6 +644,13 @@ pub async fn put(
             m.remove("summary");
         }
     }
+    // выжимка по токену — новый текст: метка `‹secret›` значения не хранит (решение
+    // координатора по задаче 6 M7.1, круг правок 1)
+    if super::agent_view::masks(&p) {
+        let kept =
+            super::secret_restore::marks_in(&q) + super::secret_restore::marks_in(&req.summary);
+        super::secret_restore::attach_kept(&mut v, kept);
+    }
     Ok((StatusCode::CREATED, Json(v)))
 }
 
@@ -800,7 +807,13 @@ pub async fn promote(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let pr: Promote = json_body(body)?;
     let (sc, h) = locate(&st, &p, &headers, &id, Mode::Write).await?;
-    let v = do_promote(&st, &p, &headers, &sc, h.entry.id, &pr, &h.entry.query).await?;
+    let mut v = do_promote(&st, &p, &headers, &sc, h.entry.id, &pr, &h.entry.query).await?;
+    // заметка или insight из выжимки по токену: метки её текста значений не хранят
+    if super::agent_view::masks(&p) {
+        let kept = super::secret_restore::marks_in(&h.entry.query)
+            + super::secret_restore::marks_in(&h.entry.summary);
+        super::secret_restore::attach_kept(&mut v, kept);
+    }
     Ok((StatusCode::CREATED, Json(v)))
 }
 

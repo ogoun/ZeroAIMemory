@@ -550,6 +550,115 @@ async fn mcp_write_conflict_is_tool_error() {
     assert!(o.text.contains("useful"), "{}", o.text);
 }
 
+/// `memory_write` по нумерованному виду (задача 6 M7.1, M7 §4.3.2) — то же, что `PUT` и `PATCH`
+/// REST: значения под `‹secret-N›` в базе на месте (чтение сессией WebUI), метка без номера —
+/// литерал с предупреждением `secret_mark_kept` в ответе инструмента.
+#[tokio::test]
+async fn mcp_write_restores_secret() {
+    let a = api("mcp-restore", |_| {}).await;
+    let s = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let mark = "‹secret›";
+    let path = "knowledge:/ops/mcp-restore";
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": path, "content": format!("# K\n\ntoken: {s}\n\nтекст\n")}),
+    )
+    .await;
+    let id = o
+        .text
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("n:"))
+        .expect("ссылка n:<id>")
+        .to_string();
+    let uri = format!("/api/v1/nodes/{id}");
+    let seen = a.t(Method::GET, &uri, None).await.json()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        seen.contains(&format!(
+            "token: ‹secret-{}-1›",
+            zam_server::api::agent_view::object_tag(&id, 1)
+        )) && !seen.contains(&s),
+        "{seen}"
+    );
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": path, "content": seen.replace("текст", "текст 2"), "base_rev": 1}),
+    )
+    .await;
+    assert!(
+        o.text.contains("rev2") && !o.text.contains("secret_mark_kept"),
+        "{}",
+        o.text
+    );
+    assert_eq!(
+        human_content(&a, &uri).await,
+        format!("# K\n\ntoken: {s}\n\nтекст 2\n")
+    );
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": path, "base_rev": 2,
+               "ops": [{"op": "append", "content": format!("x {mark}\n")}]}),
+    )
+    .await;
+    assert!(o.text.contains("rev3"), "{}", o.text);
+    assert!(
+        o.text.contains("warning: secret_mark_kept: 1"),
+        "{}",
+        o.text
+    );
+    let t = human_content(&a, &uri).await;
+    assert!(
+        t.contains(&format!("token: {s}\n")) && t.contains(&format!("x {mark}")),
+        "{t}"
+    );
+    // создание с меткой (базы нет — значение не сохранено): заметка и запись журнала
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_write",
+        json!({"path": "knowledge:/ops/mcp-new-mark", "content": format!("# N\n\nkey {mark}\n")}),
+    )
+    .await;
+    assert!(
+        o.text.contains("rev1") && o.text.contains("warning: secret_mark_kept: 1"),
+        "{}",
+        o.text
+    );
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "task", "space": "knowledge", "title": "Ротация",
+               "body": format!("ключ {mark}")}),
+    )
+    .await;
+    assert!(
+        o.text.contains("warning: secret_mark_kept: 1"),
+        "{}",
+        o.text
+    );
+}
+
+/// Текст заметки `uri` для человека (сессия WebUI) — исходник в базе.
+async fn human_content(a: &Api, uri: &str) -> String {
+    let r = a.adm(Method::GET, uri, None, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["content"].as_str().unwrap().to_string()
+}
+
 /// Регистрирует решение `G` токеном `tok` (201 — новое, 202 — запрос доступа).
 async fn register(a: &Api, tok: &str) -> StatusCode {
     a.tok(
@@ -855,7 +964,7 @@ async fn mcp_vault_get_audited() {
 }
 
 /// Маскировка выдачи агенту (задача 5 M7.1, спецификация M7 §4.3.1) MCP покрывает сквозным
-/// REST с тем же bearer: `memory_read` заметки с ключом — `‹secret›` вместо значения; раскрытие
+/// REST с тем же bearer: `memory_read` заметки с ключом — `‹secret-N›` вместо значения; раскрытие
 /// Vault (`memory_vault get`) — способ получить ключ — отдаёт значение как есть.
 #[tokio::test]
 async fn vault_reveal_not_masked() {
@@ -881,7 +990,7 @@ async fn vault_reveal_not_masked() {
     )
     .await;
     assert!(o.text.contains(&value), "раскрытие — как есть: {}", o.text);
-    assert!(!o.text.contains("‹secret›"), "{}", o.text);
+    assert!(!zam_secrets::has_any_mark(&o.text), "{}", o.text);
     // заметка с тем же ключом: чтение через MCP — маска
     let n = a
         .note("knowledge", "ops/ci", &format!("# CI\n\ntoken: {value}\n"))
@@ -895,7 +1004,13 @@ async fn vault_reveal_not_masked() {
     )
     .await;
     assert!(!o.text.contains(&value), "{}", o.text);
-    assert!(o.text.contains("token: ‹secret›"), "{}", o.text);
+    // `memory_read` — редактируемый текст: метка объекта и номер маски (M7 §4.3.2)
+    let t = zam_server::api::agent_view::object_tag(&n["id"].as_str().unwrap(), 1);
+    assert!(
+        o.text.contains(&format!("token: ‹secret-{t}-1›")),
+        "{}",
+        o.text
+    );
 }
 
 /// Запись окружения без значения: `memory_vault get id=v:<id>` (ссылка дайджеста) отдаёт

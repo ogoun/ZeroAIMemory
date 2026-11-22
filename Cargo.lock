@@ -7174,6 +7174,7 @@ dependencies = [
  "zam-markdown",
  "zam-ml",
  "zam-search",
+ "zam-secrets",
  "zam-server",
  "zam-store",
  "zeroize",

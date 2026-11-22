@@ -31,6 +31,32 @@ pub fn attach(v: &mut Value, text: &str) {
     attach_scan(v, text.len(), scan_secrets_ext(text));
 }
 
+/// [`attach`] для правки агента по маске (круг правок 1 задачи 6 M7.1, M4): только находки,
+/// значений которых нет в прежнем тексте `base`, — восстановленные из-под `‹secret›` и
+/// оставшиеся прежними значения агенту не новость (ключа он не знает, перенести его в Vault не
+/// может).
+pub fn attach_new(v: &mut Value, text: &str, base: &str) {
+    let scan = scan_secrets_ext(text);
+    if scan.hits.is_empty() {
+        return;
+    }
+    let known: std::collections::HashSet<&str> = zam_markdown::scan_secrets(base)
+        .into_iter()
+        .filter_map(|h| base.get(h.range))
+        .collect();
+    let hits = scan
+        .hits
+        .into_iter()
+        .filter(|h| text.get(h.range.clone()).is_none_or(|s| !known.contains(s)))
+        .collect();
+    attach_scan(v, text.len(), ScanOutcome { hits, ..scan });
+}
+
+/// [`attach_new`] по текстам записи и её прежнего вида.
+pub fn attach_entry_new(v: &mut Value, e: &Entry, base: &Entry) {
+    attach_new(v, &entry_text(e), &entry_text(base));
+}
+
 /// [`attach`] по готовому итогу скана текста длиной `text_bytes`: сам текст сюда не передаётся,
 /// поэтому WARN упора без текста находок по построению. Отдельно от [`attach`] — ради теста этого
 /// свойства: входа, который упирается в предел, с задачи 3 M7.1 нет (ревью, Minor 5).

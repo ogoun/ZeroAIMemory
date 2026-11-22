@@ -154,6 +154,7 @@ pub use nodes::{
     set_chunk_params, set_folder_l0, set_prefix_l0, set_token_counter, token_counter_exact,
     unified_diff, update_note, update_note_keyed,
 };
+pub use nodes::{apply_ops, apply_ops_tracking, patch_note_prepared, patch_replayed};
 pub use paths::{NodePath, path_ancestors};
 pub use questions::{
     ANSWER_TEXT_MAX_CHARS, Answer, AnswerBy, Answered, Channel, NewAnswer, OPTION_KEY_MAX_CHARS,
