@@ -401,7 +401,10 @@ pub async fn preview(
         PreviewKey::Sheet { no, .. } => {
             let page: WireSheetPage = serde_json::from_slice(&built.data)
                 .map_err(|e| ApiError::Internal(format!("страница листа превью: {e}")))?;
-            let (body, refs) = sheet_json(&loc, &sha, no, page, masked).await;
+            let (body, refs) = sheet_json(&loc, &sha, no, page).await;
+            // агенту — ячейки с маской (каждая ячейка — свой текст); до 1000 строк листа — в пуле
+            // при объёме больше 64 КиБ (круг правок 2 задачи 5 M7.1)
+            let body = agent_view::view_json_owned(&p, body, &["header", "rows"]).await?;
             let etag = match refs {
                 Some(r) => format!("{}.n{r}\"", base_tag.trim_end_matches('"')),
                 None => base_tag,
@@ -660,7 +663,6 @@ async fn sheet_json(
     sha: &str,
     no: u32,
     p: WireSheetPage,
-    masked: bool,
 ) -> (Value, Option<String>) {
     let secret: Vec<bool> = p.sheets.iter().map(|n| mask_text(n) != *n).collect();
     let refs = match zam_store::blob_sheet_locators(&loc.db, sha).await {
@@ -688,7 +690,7 @@ async fn sheet_json(
             .collect();
         blake3::hash(nos.join(",").as_bytes()).to_hex()[..8].to_string()
     });
-    let mut body = json!({
+    let body = json!({
         "kind": "sheet",
         "sheet": no,
         "name": mask_text(&p.sheet),
@@ -700,10 +702,6 @@ async fn sheet_json(
         "cols": p.cols,
         "warnings": p.warnings,
     });
-    // агенту — ячейки с маской: каждая ячейка — свой текст
-    if masked {
-        agent_view::mask_fields(&mut body, &["header", "rows"]);
-    }
     (body, tag)
 }
 

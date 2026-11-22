@@ -358,13 +358,20 @@ async fn audit(
     .await
 }
 
-/// Запись для ответа зрителю `p`: находки секретов (`secrets_detected`, без значений) и — агенту
-/// по токену — маска текста записи (задача 5 M7.1, [`super::agent_view::ENTRY_FIELDS`]).
-fn entry_value(p: &Principal, e: &Entry) -> Value {
+/// Запись для ответа: с находками секретов (`secrets_detected`, без значений). Маска текста
+/// агенту — у ответа целиком ([`shown`]).
+fn entry_value(e: &Entry) -> Value {
     let mut v = json!(e);
     super::secrets::attach_entry(&mut v, e);
-    super::agent_view::view_json(p, &mut v, super::agent_view::ENTRY_FIELDS);
     v
+}
+
+/// Ответ операции идеи зрителю `p`: агенту по токену — записи `entry`, `question`, `task` с маской
+/// секретов (задача 5 M7.1, [`super::agent_view::ENTRY_FIELDS`]; длинные — в пуле, круг правок 2).
+async fn shown(p: &Principal, out: Value) -> Result<Json<Value>, ApiError> {
+    super::agent_view::view_entries_in(p, out, &["entry", "question", "task"])
+        .await
+        .map(Json)
 }
 
 #[derive(Deserialize, Default)]
@@ -443,10 +450,14 @@ pub async fn propose(
         )
         .await?;
     }
-    Ok(Json(json!({
-        "entry": entry_value(&p, &idea),
-        "question": entry_value(&p, &question),
-    })))
+    shown(
+        &p,
+        json!({
+            "entry": entry_value(&idea),
+            "question": entry_value(&question),
+        }),
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -576,14 +587,14 @@ pub async fn decide(
         extra["question"] = json!(q.id);
     }
     audit(&st, &p, &client, &sc, "entry.idea.decide", extra).await?;
-    let mut out = json!({ "entry": entry_value(&p, &d.idea) });
+    let mut out = json!({ "entry": entry_value(&d.idea) });
     if let Some(t) = &d.task {
-        out["task"] = entry_value(&p, t);
+        out["task"] = entry_value(t);
     }
     if let Some(q) = &d.question {
-        out["question"] = entry_value(&p, q);
+        out["question"] = entry_value(q);
     }
-    Ok(Json(out))
+    shown(&p, out).await
 }
 
 /// `POST /entries/{id}/adopt` — «принять как свою»: только человек в WebUI, токену 403.
@@ -782,11 +793,11 @@ pub async fn review(
         }
         audit(&st, &p, &client, &sc, "entry.idea.review", extra).await?;
     }
-    let mut out = json!({ "entry": entry_value(&p, &r.idea), "replay": r.replay });
+    let mut out = json!({ "entry": entry_value(&r.idea), "replay": r.replay });
     if let Some(t) = &r.task {
-        out["task"] = entry_value(&p, t);
+        out["task"] = entry_value(t);
     }
-    Ok(Json(out))
+    shown(&p, out).await
 }
 
 /// Статус идеи меняют только операции этого модуля (§5): `PATCH status` — 422.

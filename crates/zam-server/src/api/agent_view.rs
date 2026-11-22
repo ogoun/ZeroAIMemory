@@ -235,6 +235,24 @@ pub async fn view_json_with(
     view_with(p, v, size, mask).await
 }
 
+/// Ответ из нескольких записей под ключами `keys` (эхо операций идей и ответа на вопрос:
+/// `entry`, `question`, `task`, …) для зрителя `p`: у каждой — [`ENTRY_FIELDS`]; строк больше
+/// [`BLOCKING_FROM`] — в пуле.
+pub async fn view_entries_in(
+    p: &Principal,
+    v: Value,
+    keys: &'static [&'static str],
+) -> Result<Value, ApiError> {
+    view_json_with(p, v, move |v| {
+        for k in keys {
+            if let Some(e) = v.get_mut(*k) {
+                mask_fields(e, ENTRY_FIELDS);
+            }
+        }
+    })
+    .await
+}
+
 /// Общий путь маски своего значения для зрителя `p`: человеку — без изменений; агенту — `mask`
 /// в текущем потоке, а при `size` (байт маскируемого текста) больше [`BLOCKING_FROM`] — в пуле
 /// блокирующих задач; пул снят — 503.

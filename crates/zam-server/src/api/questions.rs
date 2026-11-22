@@ -176,24 +176,26 @@ pub async fn answer(
         )
         .await?;
     }
-    // эхо записи: агенту по токену — с маской секретов (задача 5 M7.1)
-    let shown = |e: &zam_store::Entry| {
+    // эхо записей: агенту по токену — с маской секретов (задача 5 M7.1; ответ с телами — до
+    // нескольких МБ, длинный — в пуле, круг правок 2)
+    let raw = |e: &zam_store::Entry| {
         let mut v = json!(e);
         super::secrets::attach_entry(&mut v, e);
-        super::agent_view::view_json(&p, &mut v, super::agent_view::ENTRY_FIELDS);
         v
     };
     let mut out = json!({
-        "entry": shown(&q),
-        "decision": shown(&d),
+        "entry": raw(&q),
+        "decision": raw(&d),
         "decision_id": d.id,
     });
     if let Some(i) = &idea {
-        out["idea"] = shown(i);
+        out["idea"] = raw(i);
     }
     if let Some(t) = &task {
-        out["task"] = shown(t);
+        out["task"] = raw(t);
     }
+    let out =
+        super::agent_view::view_entries_in(&p, out, &["entry", "decision", "idea", "task"]).await?;
     Ok(Json(out))
 }
 
