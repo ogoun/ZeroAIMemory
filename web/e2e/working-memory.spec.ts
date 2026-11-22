@@ -156,14 +156,19 @@ test('tasks_board_claim_shown', async ({ page }) => {
   await card.getByRole('button', { name: 'Применить' }).click();
   await expect(col('заблокирован')).toContainText('Блокер: ждём ответа владельца');
 
-  // снятие захвата человеком
+  // снятие захвата человеком; карточка — панель 480 px поверх доски (M7.2, §5.2 п. 1): она
+  // закрывает правые колонки, поэтому перед щелчком по следующей плитке — Esc
+  await page.keyboard.press('Escape');
+  await expect(card).toHaveCount(0);
   await col('в работе').getByRole('button', { name: 'Задача WM захвачена' }).click();
   await expect(card.getByTestId('claim')).toContainText('в работе у claude-wm');
   await card.getByRole('button', { name: 'Снять захват' }).click();
   await expect(card.getByTestId('claim')).toHaveCount(0);
   await expect(col('в работе')).not.toContainText('в работе у claude-wm');
 
-  // переоткрытие выполненной — с причиной
+  // переоткрытие выполненной — с причиной (панель сначала закрыть — Esc)
+  await page.keyboard.press('Escape');
+  await expect(card).toHaveCount(0);
   await col('выполнен').getByRole('button', { name: 'Задача WM выполнена' }).click();
   await card.getByRole('button', { name: 'Переоткрыть' }).click();
   await card.getByLabel('Причина переоткрытия').fill('тесты красные');
