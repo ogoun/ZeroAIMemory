@@ -464,8 +464,11 @@ NuGet (репозиторий GitHub недоступен; байты библи
   похожих на секреты, `‹secret›` — в чтении, поиске, подсказках, выжимках, предпросмотре и
   экспорте; человек в WebUI видит исходник, нужный ключ агент берёт из Vault (`memory_vault get`).
   В тексте для правки метка — `‹secret-T-N›`: агент правит заметку или запись, оставляя метки как
-  есть, и сервер возвращает значения на место; правка, которая выводит значение из-под маски (снят
-  блок кода, переписан `ключ: значение`), отклоняется с номерами строк.
+  есть, и сервер возвращает значения на место (и на второй правке подряд из того же текста; после
+  обновления сервера текст перечитывают); правка, которая выводит значение из-под маски (снят
+  блок кода, переписан `ключ: значение`), отклоняется с номерами строк. `zam export` по токену
+  пишет в stderr, что архив без значений секретов: полная копия — экспорт из WebUI или
+  `zam-server backup`.
 - **Сканер точнее.** Русские слова-ключи («токен: …», «пароль = …», «с паролем `…`») без ложных
   срабатываний на прозе («Тип токена: OAuth», «Хэш пароля: sha256»), значение `response` у
   `Authorization: Digest`, флаги `-pXXX`, `--password X`, `-u user:pass` внутри блоков кода и
@@ -646,7 +649,7 @@ stdio-прокси `zam mcp`). Токена в файлах проекта не�
 | `zam attach <цель> <файл>` | загрузить вложение и напечатать ссылку `_attachments/…` |
 | `zam report <файл.md> [--title T] [--tag X]… [--area A] [--ref commit:<sha>\|file:<путь>\|note:<id>\|task:k:<id>]… [--key K] [--json]` | отчёт пользователю (M5.5): Markdown с картинками и файлами по относительным ссылкам — одним запросом; печатает ссылку на страницу WebUI |
 | `zam code sync [--full] [--prune] \| status \| map [--focus <путь\|имя>]… [--task T] [--tokens N] \| sym <имя\|путь#qual> \| refs <имя> \| impact [--since C]` | карта кода решения (M5.6): синхронизация рабочей копии, карта в бюджете, карточка символа, кто ссылается, влияние правки. M6.6: секреты сигнатур клиент маскирует до отправки правилами сервера — итог строкой stderr «секреты в сигнатурах: N (файлов F) — …», список мест — `masked` в `--json` |
-| `zam log insight --kind K --title T [--scope global] [--certainty C] [--evidence-file F \| --evidence-checked C --evidence-method M --evidence-result R] [--context C] [--option O]… [--chosen C] [--rationale R] [--consequences C] [--decided-by human\|agent] [--revisit-if R]` | insight (открытие, ловушка, решение); M6.6: поля решения `data.decision` флагами — только у `--kind decision` (у `zam insight supersede` без `--kind` — вид замещаемой записи), до 8 `--option`; доказательство без файла — три флага `--evidence-*` вместе; без `--certainty` — строка в stderr об умолчании агента `hypothesis` |
+| `zam log insight --kind K --title T [--scope global] [--certainty C] [--evidence-file F \| --evidence-checked C --evidence-method M --evidence-result R] [--context C] [--option O]… [--chosen C] [--rationale R] [--consequences C] [--decided-by human\|agent] [--revisit-if R]` | insight (открытие, ловушка, решение); M6.6: поля решения `data.decision` флагами — только у `--kind decision` (у `zam insight supersede` без `--kind` — вид замещаемой записи), до 8 `--option`; доказательство без файла — три флага `--evidence-*` вместе; без `--certainty` — строка в stderr об умолчании агента `hypothesis`; M7.1: замещение текстом с метками `‹secret-…›` — с ревизией старой записи: `--supersedes <id> --supersedes-rev <rev>`, у `zam insight supersede <id>` — `--rev <rev>` (`If-Match`; без неё — 428) |
 | `zam insight triggers <id> --trigger ВИД:ШАБЛОН… \| --clear` | правка набора триггеров insight без замещения записи (M6.6): ревизия — из записи, правка с `If-Match` (запись изменилась — код 4); печатает `<id>@<rev> триггеров K` и новый набор |
 | `zam task new --title T [--next S] [--owner agent\|human] [--estimate МИН] [--link L]… [--priority low\|normal\|high]` | задача (M4.5); M6.6: владелец, оценка в минутах, ссылки и приоритет — в `data` задачи, их печатает `zam task show` |
 | `zam insight\|task\|question\|idea list [--global] [--limit N \| --all]` | ленты журналов; M6.6: есть ещё записи — строка в stderr «показано N, есть ещё: --limit 200 или --all», `--all` — вся лента. Область Knowledge — `--global` у лент, записей и Vault; `--knowledge` — синоним |

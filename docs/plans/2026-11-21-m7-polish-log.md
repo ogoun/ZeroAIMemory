@@ -1790,8 +1790,9 @@ recall_frozen` 5, `--test ideas_recall` 30 (2 ignored) — ожидания те
      brief и chunks, `read`, `post_tool`.
    - Итог: наибольшее соединение — **28** запросов в кэше (48 разных текстов всего, с разовыми и
      внутренними FTS5). С дайджестом `session_start` на каждый промпт — **34** (60).
-   - Наименьшая степень двойки с запасом не меньше 1,5×: 34 × 1,5 = 51 → **64**. Значение
-     `STATEMENT_CACHE` — 64 (было 128). Тест держит запас 1,5× в обоих сценариях.
+   - Наименьшая степень двойки с запасом не меньше 1,5×: 34 × 1,5 = 51 → **64**. ~~Значение
+     `STATEMENT_CACHE` — 64 (было 128).~~ (заменено кругом правок 2: 128.) Тест держит запас 1,5×
+     в обоих сценариях.
    - Память (замер ревью, `.tmp/m7/review/t9_stmt_mem.py`): подготовленный запрос канала FTS
      занимает 32–34 КБ, соединение — 0,5–4,4 МБ, база — 3–8 МБ. Потолок — около 22 МБ на базу при
      128 и около 11 МБ при 64; на 10 пользователей — 30–90 МБ. Числа и выбор записаны в
@@ -1838,7 +1839,7 @@ recall_frozen` 5, `--test ideas_recall` 30 (2 ignored) — ожидания те
   | | `--test ideas_review` | 14 |
   | | `--test sessions` | 18 |
   | | `--test freeze` | 4 |
-  | `zam-store` без фичи | те же | те же |
+  | `zam-store` без фичи | те же, кроме `freeze` (он — только с фичей) | те же |
   | `zam-server` | `--lib` | 307 (1 ignored) |
   | | `--test recall` | 54 (1 ignored) |
   | | `--test ideas_review_recall` | 32 |
@@ -1883,6 +1884,7 @@ recall_frozen` 5, `--test ideas_recall` 30 (2 ignored) — ожидания те
    растёт с участием в общих решениях (`scope_sql`, `any_live_entry`, `insight_term_docs`,
    `live_chunks`). Нужна сверка планов запросов: `IN (SELECT value FROM json_each(?))` против
    списка — и замер.
+
 Прогоны круга 2 (`target\m71-t9`, `-j 2`, отладочная сборка) — все зелёные:
 
 | крейт | тест | итог |
@@ -1892,7 +1894,7 @@ recall_frozen` 5, `--test ideas_recall` 30 (2 ignored) — ожидания те
 | | `ideas_review` | 14 |
 | | `sessions` | 18 |
 | | `freeze` | 4 |
-| `zam-store` без фичи | те же | те же |
+| `zam-store` без фичи | те же, кроме `freeze` (он — только с фичей) | те же |
 | `zam-server` | `stmt_cache` | 1 |
 | | `search` | 22 |
 | | `recall` | 54 (1 ignored) |
@@ -1904,6 +1906,7 @@ recall_frozen` 5, `--test ideas_recall` 30 (2 ignored) — ожидания те
   «пропуск» нет.
 - `cargo fmt --all --check` и clippy `-D warnings` чистые: `-p zam-store -p zam-server -p zam-cli
   --all-targets` и `-p zam-store --all-targets` без фичи.
+
 ### M7.1 · Задача 6 — Восстановление секретов при записи агентом
 
 Спецификация M7 §4.3.2; worktree `.tmp/m71/wt-t6`, ветка `m7.1-t6` от `43718886` (задача 5
@@ -2458,6 +2461,140 @@ insights --test tasks --test transfer_export --test transfer_import --test agent
 `zam-store`, `zam-server` с `test-hooks` и без, `zam-cli`) — чисто; `cargo fmt --all --check` —
 чисто.
 
+### M7.1 · Финальное ревью и волна правок
+
+Финальное ревью ветки `7af69d7c..b7a05fc0` (Opus, только чтение): Critical нет, Important I-1–I-5,
+Minor M-1–M-5 и разбор отложенных Minor задач. Решения координатора — задание волны правок;
+спецификация §4.3.2 пп. 1–2 обновлена координатором (6aa60ba5). Worktree `.tmp/m71/wt-fix`, ветка
+`m7.1-fix` от `0e78bbd0` (ветка волны и подготовка выпуска), сборка `target\m71-fix`.
+
+- **I-1 — доступ до восстановления** (`api/insights.rs`): замещаемая запись `supersedes_id`
+  проверяется одной функцией `supersede_target` раньше всего прочего — нет, удалена или скрыта —
+  404; в базе владельца чужого решения вне пространства решения — 404; отчёт человеку — 409;
+  другое пространство или вид — 422; только затем 428/409 и восстановление (раньше блок
+  восстановления брал запись по id без проверки пространства: 428, 409 с ревизией и 422 о чужой
+  записи). `/supersede`, `PATCH` записи, `PUT`/`PATCH` узла и `append_body` уже шли через
+  `entry_scope`/`node_scope` до восстановления — сверено. Тест `participant_supersedes_foreign_entry_not_found`
+  (участник общего решения, id записи из Knowledge владельца: без ревизии, устаревшая ревизия,
+  значение вне маски, без меток — 404, запись владельца не тронута). RED: 428 вместо 404.
+- **I-2 — метка любой ревизии объекта** (§4.3.2 п. 2). T = 6 hex BLAKE3 от
+  `id:rev:RULES_VERSION:версия zam-secrets` (`agent_view::object_tag`, `object_tag_with` —
+  параметры для проверки «после обновления»; `zam_secrets::VERSION`). `zam_secrets::restore`:
+  `ObjectMasks` хранит маски нескольких ревизий (`revision(tag)`, значение — по T метки и номеру
+  той ревизии), `tags_in` (T меток текста), `revisions_by_tag` (каждой T — ревизия `1..=max_rev`,
+  если она одна; T двух ревизий и T без ревизии — нет, метка — литерал; без меток `tag_of` не
+  вызывается). Сервер (`api/secret_restore.rs`): узел — `node_revisions` (тексты нужных ревизий,
+  кроме уже прочитанных базы и текущей) и `node_masks`; запись журнала — `EntryRevs::load` (текущая
+  ревизия — сама запись, прежние — снимки `entry_revisions`, новая функция
+  `zam_store::entry_revisions_at`) и `EntryTexts::restore(current, revs)` (литералы — по текущей
+  записи, маски — по ревизиям меток). `PUT` (ревизии до `current_rev`), `PATCH` узла (метки
+  операций — по T, адрес секции с `‹secret›` — к заголовку вида базы по её маскам, отдельный
+  `ObjectMasks` базы), `PATCH` записи, `append_body`, `/supersede` и `supersedes_id` — все через
+  них. Покрытие по происхождению — как раньше. Тесты: `agent_second_write_from_same_view`
+  (заметка `PUT` r→r+1→ещё раз с `rev` r+1, `PATCH` с меткой r1 по `base_rev` 3; запись —
+  правка дважды, дописка и замещение с метками ревизии 1 — значения на месте, `kept` нет;
+  RED — `secret_mark_kept: 1`), `agent_marks_of_older_scanner_literal` (T прежних правил и прежней
+  версии — литерал, `kept` 1), модульные `object_marks_of_several_revisions`,
+  `revisions_by_tag_unique_only` (коллизия — параметром `tag_of`), `restore_entry_marks_of_two_revisions`,
+  `object_tag_depends_on_revision_and_scanner`. `zam guide` ru/en: метка действует для объекта, в
+  котором прочитана; вторая правка из того же текста сохраняет значения; после обновления сервера
+  — перечитай; замещение из CLI — с ревизией.
+  **[решение исполнителя, волна правок]** Ревизии по T ищутся в `1..=current_rev` (у `PUT` — снимок
+  узла `node_scope`), без окна: цена — хэш короткой строки на ревизию, и только если в правке есть
+  метка с T. Коллизия проверяется и для T базы: метки базы с T другой ревизии того же объекта — тоже
+  литерал (вероятность 2⁻²⁴ на пару ревизий).
+  **[решение исполнителя, волна правок]** Снимок прежней ревизии записи (`entry_revisions`) — без
+  `data.claimed_by` задачи (`content_data`); номер маски сдвинулся бы, только если секрет — в имени
+  захватившего агента (ревью: UUID-подобные id сканер не берёт).
+- **I-3 — `zam init` в режиме `block`** (`cmd/init.rs`, `locate::plan_home_aliases`): токен
+  пишется и под адресами строки `ZeroAIMemoryUrl=` блоков (`url` ответа `/agent-setup` —
+  `server.public_url` или `Host`), отличными от `--url`; другой токен под псевдонимом — как у
+  адреса (замена только с `--token`). Строка «Токен сохранён … [servers."<--url>"] и
+  [servers."<адрес блока>"]». Повтор без `--token`, когда токен адреса найден в домашнем конфиге, —
+  дописывает адрес блока, если его нет (без `url` верхнего уровня); токен окружения и файлов
+  проекта в домашний конфиг не переносится [решение исполнителя]. Тест
+  `init_block_public_url_token_under_block_address` (сервер с `public_url = http://localhost:<порт>`,
+  `--url http://127.0.0.1:<порт>`: оба ключа, `zam status` и `hook session-start` без флагов находят
+  токен, повтор без `--token` файл не меняет) и модульный `plan_home_aliases_writes_block_address`
+  (нормализация, без записи при обоих ключах, `Conflict` без `force`). `plan_home` без псевдонимов
+  — обёртка модульных тестов (`#[cfg(test)]`). RED — нет строки с двумя ключами.
+- **I-4 — `path_words`** (`zam_core::shell`, `hook/post_tool.rs`): в `path_words` идут первые
+  `PATH_WORDS_SCAN_MAX` = 16 КиБ команды (`head_bytes` до `mask_text`), `is_dir` — не больше
+  `PATH_WORDS_STAT_MAX` = 64 на команду (дальше аргумент без разделителя не проверяется, путь с
+  разделителем на конце — каталог как прежде). Тесты: `path_words_stat_limit` (400 КБ — ровно 64
+  stat, каталоги начала и конца команды; обычная команда — stat на каждый аргумент) и
+  `post_tool_long_command_within_budget` (команда 409 642 байт, отладочная сборка: время хука
+  внутри процесса ≤ `max_inner("post-tool")` = 375 мс; `path_words` — `["src", "web", "e2e"]`).
+  RED — 649,8 мс.
+- **I-5 — документы против кода.** Руководство: «Известные ограничения» (метка действует для
+  объекта и до обновления сервера, флаги CLI замещения, оракул только у читаемых объектов,
+  `zam read` → `zam write` переносит метки), «Перенос памяти» (строка stderr `zam export`), «Одно
+  пространство» (архив с секретами — экспорт из WebUI, затем `zam import --own`), «Что теряет
+  откат» (сохранять архивом из WebUI; по токену — только заметки без секретов), «Токены нескольких
+  серверов» (адрес блока и строка `session-start`). `zam export`: опись `secrets_masked: true` —
+  строка stderr «архив без значений секретов (‹secret›); полная копия — экспорт из WebUI или
+  zam-server backup» (`cmd/transfer.rs`, `secrets_masked` читает опись скачанного zip); тест
+  `cli_export_masked_archive_note` (RED — 0 строк), без находок строки нет (`cli_export_writes_zip`).
+  `api-compat.md`: строка `agent_text_masked` (значения — только у `‹secret-T-N›`, `‹secret›` —
+  литерал), T с версией сканера, «Запись обратно» (любая ревизия, доступ раньше, CLI-флаги),
+  «Ограничение» (M-5). CHANGELOG `[0.0.14-m7.1]`: метки, восстановление, CLI-флаги, 404 вместо
+  428/409/422, `zam export`, снимок, `zam init`, `path_words`; «ни одной строки» — «на генераторе
+  сверки»; устаревшее «у `zam` флага нет» убрано. ТЗ §7.6 (метки, восстановление, протокол).
+- **M-1** — оглавление `GET /nodes/{id}/outline`: T по ревизии, которую вернул `node_content`.
+- **M-2** — снимок сессии: `GET /sessions/{id}/snapshot` и раздел дайджеста маскируют поля заново
+  (`remask_data` при выдаче). Тест `snapshot_remasked_on_output` (снимок записан в базу без маски —
+  «пароль: …» правил 3): RED — значение в `GET`.
+- **M-4** — «нет токена для адреса» — одна строка `ZeroAIMemory: …` в выводе `session-start`
+  (`Env::missing_token_note`), не только `hooks.log`. Тест — дополнение
+  `missing_token_for_url_logged` (RED — вывода нет).
+- **M-5** — `api-compat`, «Ограничение»: «но не само значение, и только у объектов, которые он и
+  так читает».
+- **Задача 6 m2** — `zam insight supersede --rev <rev>` (`If-Match`), `zam log insight --supersedes
+  <id> --supersedes-rev <rev>` (`requires = supersedes`); текст 428 называет флаги CLI. Тесты:
+  `insight_supersede_revision_flags` (разбор), `supersede_marked_text_with_revision_flags` (без
+  ревизии — 428 с подсказкой, с ревизией — значение на месте: в выдаче новой записи метка её
+  объекта, а не `‹secret›`). RED — `unexpected argument '--rev'`.
+- **Расхождения подготовки выпуска:** doc-комментарий `api/entries.rs` (ревизии записи —
+  `‹secret›` без меток); `guide.*.md`, «Дочитать пропуск» — смещения по виду с метками.
+- **Отложенные Minor задач:** T1 — `assert!(MANIFESTS.contains(&"onnxruntime"))`; T3 —
+  `debug_assert!` длины и ASCII имён `RU_PROSE_TERMS` против буфера, doc `ru_prose_value` (`шт`);
+  T4 — doc модуля `zam-store/src/sessions.rs` (исключение `REVIEW_QUEUE_PART`), `ORDER BY seen_at
+  DESC, rowid DESC`; T5 — doc `flags.rs` (код маски — `mask_code_regions`), `lib.rs` и `code.rs`
+  (две функции), «на генераторе сверки», `#[doc(hidden)]` у `fenced_lines_round2`,
+  `fence_blocks_loose`, `fence_blocks_round2`; T7 — doc `IndexError::Corrupt` и `reindex.rs`
+  (совет по режиму Qdrant), `client.rs` (`timeout` ставит и `body_error`, `is_timeout` — и срок
+  чтения тела), `cache_refresh_failure_reason_in_log` — причина в самой строке кэша; T8 — `known`
+  со сверкой версии (`insight_term_docs`), «слова путей» → «имена каталогов» (код), CHANGELOG —
+  p95 77 мс на прогретом кэше, у `e-57` из трёх ожидаемых находится две; T9 — пустые строки перед
+  «Прогоны круга 2» и заголовком задачи 6, «64» круга 1 помечено заменённым, `freeze` — только с
+  фичей.
+
+RED — до правки (новые тесты против прежнего кода; исходники клиента и `snapshot.rs` на время RED
+сняты патчем и возвращены): I-1 — 428 вместо 404; I-2 — `secret_mark_kept: 1` на второй правке;
+I-3 — нет строки с двумя ключами; I-4 — 649,8 мс; M-2 — значение в `GET`; M-4 — вывода нет; m2 —
+`--rev` неизвестен; `zam export` — 0 строк. `agent_marks_of_older_scanner_literal` зелёный с
+первого прогона: T прежних правил не совпадает и с T без версии, тест закрепляет свойство (RED
+здесь не получить — без версии в T такого вида и не было).
+
+Прогоны волны (`target\m71-fix`, отладочная сборка, `-j 2`, модели — `.tmp/ci-models`), все
+зелёные, 0 failed:
+
+| крейт | наборы | passed |
+|---|---|---|
+| `zam-secrets --features restore` | lib, 3 интеграционных | 23 + 4 + 3 + 34 |
+| `zam-secrets` без фичи | те же | 11 + 4 + 3 + 34 |
+| `zam-core` | `--lib` | 35 |
+| `zam-store` | `--lib`, `entries`, `ideas_review`, `nodes`, `search`, `sessions` | 117, 22, 14, 29, 25, 18 |
+| `xtask` | `manifest` | 6 |
+| `zam-server` | `--lib`, `agent_setup`, `entries_revision`, `insights`, `mcp`, `nodes`, `read_batch`, `read_focus`, `recall`, `recall_brief`, `recall_frozen`, `recall_heavy`, `recall_heavy_ml`, `recall_prompt_ml`, `recall_recovery`, `secrets`, `snapshot`, `tasks`, `transfer_export`, `transfer_import` | 318, 19, 4, 19, 79, 20, 13, 20, 55, 10, 5, 2, 1, 2, 6, 41, 28, 17, 17, 49 (всего 725) |
+| `zam-cli` | `--bin zam`, `hooks`, `init`, `insights`, `snapshot`, `status`, `transfer` | 230, 122, 33, 15, 33, 13, 20 |
+
+Проверки кода — чисто: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D
+warnings`; `cargo clippy -p zam-secrets --all-targets -- -D warnings` (без фичи `restore`);
+`cargo clippy -p zam-server --lib -- -D warnings`.
+
+«Приёмка: числа» дополняет координатор (полный прогон).
+
 ### M7.1 · Итог
 
 Волна реализована, выпуск `0.0.14-m7.1` (2026-11-22; ТЗ v1.27, CHANGELOG `[0.0.14-m7.1]`). Ветка
@@ -2487,7 +2624,9 @@ insights --test tasks --test transfer_export --test transfer_import --test agent
 6. **Восстановление при записи агентом** (§4.3.2, круги правок 1–5): эвристика выравнивания
    (круги 1–2) заменена восстановлением по номеру метки (круг 3), номер стал сквозным по полям
    объекта и действует только у текущей ревизии (круг 4), метка — `‹secret-T-N›` с личностью
-   объекта и ревизии, проверка — покрытие по происхождению вместо счёта вхождений (круг 5); 428
+   объекта и ревизии, проверка — покрытие по происхождению вместо счёта вхождений (круг 5);
+   финальное ревью — метка любой ревизии объекта, версия сканера в T, доступ раньше
+   восстановления, флаги ревизии в CLI (раздел выше); 428
    у замещения с метками без ревизии и поле `supersedes_rev`; `similar` и `aho-corasick` из
    `zam-secrets` убраны, фича `restore` — без зависимостей.
 7. **Надёжность Qdrant и тестов** (§4.7): повтор `delete_collection` при сбое переименования,
@@ -2519,8 +2658,24 @@ insights --test tasks --test transfer_export --test transfer_import --test agent
 словом-ключом (задача 3, → M7); самоочистка частично удалённой коллекции Qdrant (задача 7);
 `json_each` вместо списка пространств в запросах (задача 9, → M7.5) и объединение переходов в пул
 блокирующих потоков на пути `prompt` (`i:01M80M2D2REY9S5PMTR484FJA4`); ONNX Runtime 1.31.1/1.32.0
-с прогоном GPU (задача 1); флаг ревизии у `zam insight supersede` / `zam log insight
---supersedes` (без него замещение текстом с метками из CLI — 428; найдено при сверке задачи 10).
+с прогоном GPU (задача 1). ~~Флаг ревизии у `zam insight supersede` / `zam log insight
+--supersedes`~~ — сделан волной правок финального ревью (`--rev`, `--supersedes-rev`).
+
+**Отложено** (решение координатора по финальному ревью, по строке на пункт):
+- T2 — косметика вывода `zam init` (строка «Токен сохранён» у переноса T1, молчание
+  `unused_unbound_token` при сильном источнике, подсказка `missing_token` о ключе без адреса).
+- T3 — `SAML2.0` слитно маскируется, таблицы Markdown `| Пароль | X |`, патологическая цена скана
+  (находка в каждой строке, плотная проза) → M7.5 вместе с `RULES_VERSION` 4.
+- T4 — отметка очереди разбора не различает решение (сессия принадлежит одному решению).
+- T5 — `code_regions_loose` маскирует прозу после одиночного забора с отступом ≥ 4 (лишняя маска).
+- T8 — кэш частоты слов без поколения перенарезки, раннеры playwright/`test:e2e`/uv/dotnet/make
+  в eval, холодный замер `post_tool` (после развёртывания, `task-postdeploy-37`).
+- T9 — тест фактической ёмкости кэша подготовленных запросов в рабочей сборке.
+- Задача 6 m3 — порядок 422/409 при `Idempotency-Key` и устаревшей ревизии у замещения.
+- Задача 6 m4 — `def token (self):` маскирует `return` → M7.5 со сканером.
+- Задача 6 m5 — строже 422 при удалении открытого человеком значения — принято как есть.
+- M-3 — холодный старт регулярок `zam-secrets` на `pre-tool` (3,7–3,9 мс) — проверит
+  координатор в тихом окне `m4`.
 
 #### Приёмка: числа
 
