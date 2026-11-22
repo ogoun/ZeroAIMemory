@@ -995,12 +995,31 @@ fn cache_refresh_failure_reason_in_log() {
         FILE_REFS_DEADLINE,
     ];
     assert!(!env_skipped(&log, &env), "ответ 500 — не среда: {log}");
-    // сервер недоступен — сеть или срок (на Windows отказ закрытого порта приходит позже срока)
+    // сервер недоступен — сеть или срок (на Windows отказ закрытого порта приходит позже срока):
+    // причина — в самой строке кэша, а не в любой строке журнала (`HOOK_BUDGET_SPENT` другой
+    // строки её не заменяет; финальное ревью M7.1, отложенный Minor задачи 7)
     let dead = Proj::new("refresh-reason-dead", DEAD, "zam_x");
     let ev = dead.ev("SessionStart", "rr-2", json!({"source": "startup"}));
     let _ = dead.hook_at(DEAD, "session-start", "claude", ev.to_string().as_bytes());
     let log = dead.log();
     assert!(env_skipped(&log, &env), "недоступный сервер — среда: {log}");
+    for (what, net, deadline) in [
+        ("кэш триггеров не обновлён", TRIGGERS_NET, TRIGGERS_DEADLINE),
+        (
+            "кэш file-refs не обновлён",
+            FILE_REFS_NET,
+            FILE_REFS_DEADLINE,
+        ),
+    ] {
+        let line = log
+            .lines()
+            .find(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("нет строки «{what}»: {log}"));
+        assert!(
+            line.contains(net) || line.contains(deadline),
+            "причина не сеть и не срок: {line}"
+        );
+    }
 }
 
 /// M6, задача 5 (A): привязка `zam mcp` к сессии (цепочка предков и файл `agent-<pid>.json`)
@@ -6890,7 +6909,8 @@ fn queue_lock_and_size_limit() {
 
 /// M7 §4.4 (круг правок 1): адрес без токена, а в домашнем конфиге — токен другого сервера:
 /// `session-start` на сервер не идёт, а пишет в `hooks.log` подсказку
-/// `zam init --url <адрес> --token`; токен другого сервера в журнал не попадает.
+/// `zam init --url <адрес> --token`; токен другого сервера в журнал не попадает. Подсказка видна и
+/// в выводе хука одной строкой (финальное ревью M7.1, M-4), без токена другого сервера.
 #[test]
 fn missing_token_for_url_logged() {
     let p = Proj::new("hook-nokey", DEAD, "zam_x");
@@ -6920,6 +6940,15 @@ fn missing_token_for_url_logged() {
     );
     assert!(!log.contains("не заданы адрес сервера или токен"), "{log}");
     assert!(!log.contains(&other), "{log}");
+    let c = context(&o, "SessionStart");
+    let lines: Vec<&str> = c.lines().filter(|l| l.contains("нет токена")).collect();
+    assert_eq!(lines.len(), 1, "{c}");
+    assert!(
+        lines[0].starts_with("ZeroAIMemory: ")
+            && lines[0].contains("zam init --url http://192.0.2.2:7700 --token"),
+        "{c}"
+    );
+    assert!(!c.contains(&other), "{c}");
 }
 
 /// Ревью 17b, Minor 11: без адреса сервера `session-start` пишет одну строку «не заданы адрес
@@ -7767,4 +7796,42 @@ fn post_tool_sends_path_words() {
         json!(["web", "e2e", "src", "out", "dir"]),
         "{body}"
     );
+}
+
+/// Цена `path_words` (финальное ревью M7.1, I-4): команда 400 КБ (heredoc, около 50 000 слов) —
+/// хук `post-tool` укладывается в бюджет §10.3 (первые 16 КиБ команды, `is_dir` — не больше 64
+/// раз); каталоги начала команды уходят как прежде.
+#[test]
+fn post_tool_long_command_within_budget() {
+    let _g = serial();
+    let (url, seen) = common::stub(200, r#"{"text":"","items":[]}"#, Duration::ZERO);
+    let p = Proj::new("path-words-long", &url, "zam_x");
+    std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    let mut cmd = String::from("ls src web/e2e/ && python3 - <<'EOF'\n");
+    while cmd.len() < 400 * 1024 {
+        cmd.push_str("alpha beta gamma delta epsilon zeta eta theta iota kappa\n");
+    }
+    cmd.push_str("EOF");
+    let ev = bash_fail(
+        &p,
+        "long",
+        &cmd,
+        "Exit code 1\nNameError: name 'alpha' is not defined",
+    );
+    let stdin = ev.to_string();
+    let (_, inner) = p.hook_best(&url, "post-tool", "claude", stdin.as_bytes());
+    assert!(
+        inner <= max_inner("post-tool"),
+        "post-tool на команде {} байт: {inner:?}",
+        cmd.len()
+    );
+    seen.lock().unwrap().clear();
+    let _ = p.hook_content(&url, "post-tool", "claude", stdin.as_bytes());
+    let seen = seen.lock().unwrap();
+    let body = &seen
+        .iter()
+        .find(|(m, path, _)| m == "POST" && path.ends_with("/recall"))
+        .unwrap_or_else(|| panic!("нет запроса /recall: {seen:?}"))
+        .2;
+    assert_eq!(body["path_words"], json!(["src", "web", "e2e"]), "{body}");
 }

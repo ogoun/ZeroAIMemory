@@ -505,6 +505,23 @@ impl Env {
             .filter(|d| !d.is_zero())
     }
 
+    /// Строка агенту, когда у хука нет токена для найденного адреса (M7 §4.4; финальное ревью
+    /// M7.1, M-4): адрес-псевдоним после обновления (IP в блоке, имя хоста в домашнем `url`)
+    /// молча лишал дайджеста и подсказок — причина была только в `hooks.log`. Прочие причины
+    /// отказа клиента — только в журнале; токены других адресов не печатаются.
+    pub fn missing_token_note(&self) -> Option<String> {
+        let r =
+            locate::resolve(&Flags::default(), &super::zam_env(), &self.cwd, &self.home).ok()?;
+        let url = r.url?;
+        if r.token.is_some() {
+            return None;
+        }
+        Some(format!(
+            "ZeroAIMemory: {}",
+            super::missing_token(&url.value, r.other_server_keys).msg
+        ))
+    }
+
     /// Клиент API со сроком [`Env::http_deadline`] на все его запросы (клиент можно
     /// переиспользовать и делить между потоками: второго срока не будет); нет адреса, токена или
     /// времени — `None` (причина — в журнал).

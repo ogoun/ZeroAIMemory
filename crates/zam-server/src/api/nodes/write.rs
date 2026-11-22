@@ -286,16 +286,28 @@ pub async fn replace(
     } else {
         None
     };
-    let (content, kept, base_text) = match base_text {
+    let (content, (kept, from), base_text) = match base_text {
         Some(b) => {
-            let tag = agent_view::object_tag(&sc.node.id, base);
-            let (r, b) = secret_restore::restore_owned(tag, b, req.content).await?;
+            // метки любой ревизии узла (§4.3.2 п. 2): вид, прочитанный до прошлой записи агента,
+            // тоже возвращает значения; ревизий и байт — в пределах (N-2)
+            let revs = secret_restore::node_revisions(
+                &sc.db,
+                sc.node.id,
+                sc.node.current_rev.max(base),
+                &[&req.content],
+                &[base],
+                restore_bytes(&st),
+            )
+            .await?;
+            let pairs = rev_pairs(&revs);
+            let (r, b) = secret_restore::restore_owned(revs, base, b, req.content).await?;
             let mut ex = secret_restore::Exposed::default();
             ex.add(None, &r);
             ex.check()?;
-            (r.text, r.kept, Some(b))
+            let from = secret_restore::from_revs(&r.from, &pairs, base);
+            (r.text, (r.kept, from), Some(b))
         }
-        None => (req.content, 0, None),
+        None => (req.content, (0, Vec::new()), None),
     };
     // предел — и по итоговому тексту
     check_size(&st, &content)?;
@@ -334,11 +346,26 @@ pub async fn replace(
             .await?;
             if fresh {
                 secret_restore::attach_kept(&mut v, kept);
+                secret_restore::attach_from_rev(&mut v, &from);
             }
             Ok(Json(v))
         }
         Err(e) => Err(write_error(&p, &sc.db, sc.node.id, base, e).await),
     }
+}
+
+/// Предел исходника прежних ревизий одной записи агента (N-2): `limits.note_max_bytes` ×
+/// [`secret_restore::RESTORE_BYTES_FACTOR`].
+pub(crate) fn restore_bytes(st: &AppState) -> usize {
+    st.cfg
+        .limits
+        .note_max_bytes
+        .saturating_mul(secret_restore::RESTORE_BYTES_FACTOR)
+}
+
+/// T и номер каждой ревизии масок узла.
+fn rev_pairs(revs: &[secret_restore::RevText]) -> Vec<(String, i64)> {
+    revs.iter().map(|r| (r.tag.clone(), r.rev)).collect()
 }
 
 #[derive(Deserialize)]
@@ -430,11 +457,42 @@ async fn patch_by_view(
             let (_, b) = node_content(&sc.db, id, Some(req.base_rev)).await?;
             Some(b)
         };
+        // маски ревизий по T меток операций (§4.3.2 пп. 2–3): база, текущая и любая прежняя
+        let edited: Vec<&str> = req
+            .ops
+            .iter()
+            .flat_map(|op| {
+                let (section, content) = op_parts(op);
+                section.into_iter().chain(std::iter::once(content))
+            })
+            .collect();
+        let revs = secret_restore::node_revisions(
+            &sc.db,
+            id,
+            cur_rev,
+            &edited,
+            &[cur_rev, req.base_rev],
+            restore_bytes(st),
+        )
+        .await?;
+        let pairs = rev_pairs(&revs);
         let ops = req.ops.clone();
-        let tag = agent_view::object_tag(&id, req.base_rev);
-        let big = current.len() + base.as_ref().map_or(0, String::len) > agent_view::BLOCKING_FROM;
+        let (base_rev, tag) = (req.base_rev, agent_view::object_tag(&id, req.base_rev));
+        let big = current.len()
+            + base.as_ref().map_or(0, String::len)
+            + revs
+                .iter()
+                .map(|r| r.text.as_ref().map_or(0, String::len))
+                .sum::<usize>()
+            > agent_view::BLOCKING_FROM;
         let prepare = move || -> (Result<secret_restore::Restored, zam_store::WriteError>, String) {
-            let r = patch_restored(&tag, base.as_deref(), &current, cur_rev, &ops);
+            let views = PatchViews {
+                tag: &tag,
+                base: base.as_deref(),
+                base_rev,
+                revs: &revs,
+            };
+            let r = patch_restored(&views, &current, cur_rev, &ops);
             (r, current)
         };
         let (r, current) = if big {
@@ -449,6 +507,7 @@ async fn patch_by_view(
         let mut ex = secret_restore::Exposed::default();
         ex.add(None, &restored);
         ex.check()?;
+        let from = secret_restore::from_revs(&restored.from, &pairs, req.base_rev);
         #[cfg(feature = "test-hooks")]
         patch_race(&sc.db, id, cur_rev, &attrib).await;
         let w = patch_note_prepared(
@@ -474,6 +533,7 @@ async fn patch_by_view(
                 let mut v = node_reply(st, p, &sc.db, sc.space.id, &n, &text, base).await?;
                 if fresh {
                     secret_restore::attach_kept(&mut v, restored.kept);
+                    secret_restore::attach_from_rev(&mut v, &from);
                 }
                 return Ok(Json(v));
             }
@@ -491,37 +551,52 @@ async fn patch_by_view(
     Err(write_error(p, &sc.db, id, req.base_rev, e).await)
 }
 
-/// Операции `PATCH` агента, построенные по виду ревизии `base_rev` с меткой объекта `tag` (`base`;
-/// `None` — она же текущая `current`), — к исходнику `current` (M7 §4.3.2 п. 3): адрес секции —
-/// сначала точно к заголовку исходника (метки объекта — значения масок базы), затем, если в адресе
-/// `‹secret›`, — по заголовкам вида без меток; метки содержимого — отложенные значения масок базы
-/// ([`secret_restore::Deferred`]); сверка «секция не менялась после `base_rev`» — по исходникам
-/// обеих ревизий ([`zam_store::apply_ops_tracking`]). Покрытие по происхождению (п. 5): значения
+/// Виды, по которым агент строил операции `PATCH`: ревизия `base_rev` с меткой объекта `tag`
+/// (`base`; `None` — она же текущая) и ревизии с T меток операций (`revs`,
+/// [`secret_restore::node_revisions`]; тексты базы и текущей — у вызывающего).
+struct PatchViews<'v> {
+    tag: &'v str,
+    base: Option<&'v str>,
+    base_rev: i64,
+    revs: &'v [secret_restore::RevText],
+}
+
+/// Операции `PATCH` агента, построенные по виду `v` (`base_rev`), — к исходнику `current`
+/// (M7 §4.3.2 п. 3): адрес секции — сначала точно к заголовку исходника (метки объекта — значения
+/// масок их ревизий), затем, если в адресе `‹secret›`, — по заголовкам вида базы без меток; метки
+/// содержимого — отложенные значения масок их ревизий (любой ревизии объекта, п. 2,
+/// [`secret_restore::Deferred`]); сверка «секция не менялась после `base_rev`» — по исходникам
+/// базы и текущей ([`zam_store::apply_ops_tracking`]). Покрытие по происхождению (п. 5): значения
 /// из меток операций и маски текущей ревизии, перенесённые без правки, — в позициях итога.
 /// Предупреждение — литералов итога сверх литералов исходника. Ошибка операции — с адресом агента.
 fn patch_restored(
-    tag: &str,
-    base: Option<&str>,
+    v: &PatchViews,
     current: &str,
     cur_rev: i64,
     ops: &[PatchOp],
 ) -> Result<secret_restore::Restored, zam_store::WriteError> {
+    let (tag, base) = (v.tag, v.base);
     let base_text = base.unwrap_or(current);
-    let mut masks = secret_restore::ObjectMasks::new(tag);
-    masks.add(base_text);
-    // адрес с меткой без номера: заголовки исходника (точно) и вида базы (без меток, §4.3.2 п. 3)
+    let masks = secret_restore::node_masks(v.revs, &[(cur_rev, current), (v.base_rev, base_text)]);
+    // адрес с меткой без номера: заголовки исходника (точно) и вида базы (без меток, §4.3.2 п. 3);
+    // найденный заголовок вида базы — к исходнику по её маскам
     let docs = ops
         .iter()
         .filter_map(|op| op_parts(op).0)
         .any(super::read::plain_mark)
         .then(|| {
+            let mut base_masks = secret_restore::ObjectMasks::new(tag);
+            base_masks.add(base_text);
             (
                 zam_markdown::parse(current),
                 zam_markdown::parse(&secret_restore::numbered_view(tag, base_text)),
+                base_masks,
             )
         });
     let mut texts: Vec<&str> = vec![current];
     texts.extend(base);
+    // и тексты прежних ревизий меток — база значений
+    texts.extend(v.revs.iter().filter_map(|r| r.text.as_deref()));
     for op in ops {
         let (section, content) = op_parts(op);
         texts.extend(section);
@@ -542,13 +617,13 @@ fn patch_restored(
         let section = match section {
             Some(s) => {
                 let mut filled = masks.fill(s).into_owned();
-                if let Some((cur_doc, view_doc)) = &docs
+                if let Some((cur_doc, view_doc, base_masks)) = &docs
                     && super::read::plain_mark(s)
                     && zam_markdown::section_by_path(cur_doc, &filled).is_none()
                 {
                     match super::read::resolve_unmarked(view_doc, s, false) {
                         zam_markdown::SectionLookup::Found(x) => {
-                            filled = masks.fill(&x.path.join(" > ")).into_owned();
+                            filled = base_masks.fill(&x.path.join(" > ")).into_owned();
                         }
                         zam_markdown::SectionLookup::NotFound => {}
                         zam_markdown::SectionLookup::Ambiguous => {

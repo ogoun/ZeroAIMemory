@@ -321,6 +321,85 @@ fn object_marks_across_fields() {
     assert_eq!((r.text.as_str(), r.kept), ("password = ‹secret-1›\n", 1));
 }
 
+/// Метки любой ревизии объекта (финальное ревью M7.1, I-2, §4.3.2 п. 2): у каждой метки — значение
+/// её ревизии по её номеру (номера ревизий разные: у прежней ключ — маска 1, у текущей — 2), в
+/// одном тексте метки двух ревизий; T ревизии, которой нет в объекте, — литерал.
+#[test]
+fn object_marks_of_several_revisions() {
+    const T2: &str = "0a1b2d";
+    let (k1, k2) = (key(83), key(84));
+    let r1 = format!("token: {k1}\n");
+    let r2 = format!("новый: {k2}\ntoken: {k1}\n");
+    let mut o = ObjectMasks::new(T);
+    o.add(&r1);
+    o.revision(T2).add(&r2);
+    assert_eq!(o.len(), 2, "маски последней ревизии");
+    assert_eq!(o.value(Mark::Tagged(T, 1)), Some(k1.as_str()));
+    assert_eq!(o.value(Mark::Tagged(T, 2)), None, "номер вне той ревизии");
+    assert_eq!(o.value(Mark::Tagged(T2, 1)), Some(k2.as_str()));
+    assert_eq!(o.value(Mark::Tagged(T2, 2)), Some(k1.as_str()));
+    let edited = format!(
+        "из прежней: token: {}\nиз текущей: новый: {}\nчужая: {}\n",
+        m(1),
+        format_args!("‹secret-{T2}-1›"),
+        "‹secret-ffffff-1›"
+    );
+    let r = o.restore(&edited, 0);
+    assert_eq!(
+        r.text,
+        format!("из прежней: token: {k1}\nиз текущей: новый: {k2}\nчужая: ‹secret-ffffff-1›\n")
+    );
+    assert_eq!((r.kept, r.exposed.len()), (1, 0));
+    // ревизии, давшие значения (N-3), — по первому появлению, чужая T — нет
+    assert_eq!(r.from, vec![T.to_string(), T2.to_string()]);
+    // отложенные значения (`PATCH`): ревизия — только у поставленного значения
+    let mut d = Deferred::new(&[&edited]).unwrap();
+    let piece = o.defer(&format!("x {}\n", format_args!("‹secret-{T2}-1›")), &mut d);
+    let f = d.finish(&piece, &[]);
+    assert_eq!(f.text, format!("x {k2}\n"));
+    assert_eq!(f.from, vec![T2.to_string()]);
+    // пустой объект: маски без метки не восстанавливаются
+    let mut e = ObjectMasks::default();
+    e.add(&r1);
+    assert_eq!(e.value(Mark::Tagged(T, 1)), None);
+}
+
+/// Ревизия по T (I-2): одна ревизия с T — она; T без ревизии и T двух ревизий (коллизия) — нет
+/// ревизии; без меток `tag_of` не вызывается.
+#[test]
+fn revisions_by_tag_unique_only() {
+    let text = format!("{} {} ‹secret-aaaaaa-1› ‹secret-2› {M}", m(1), m(3));
+    let tags = tags_in([text.as_str(), "без меток"]);
+    assert_eq!(tags.into_iter().collect::<Vec<_>>(), vec![T, "aaaaaa"]);
+    let tags = tags_in([text.as_str()]);
+    // T — ревизия 2; «aaaaaa» — ни одной
+    let tag_of = |k: i64| format!("{:06x}", k + 0x0a1b2a);
+    let found = revisions_by_tag(&tags, 5, tag_of);
+    assert_eq!(found.into_iter().collect::<Vec<_>>(), vec![(T, 2)]);
+    // коллизия: у ревизий 2 и 4 одна T — метка без ревизии
+    let collide = |k: i64| {
+        if k == 2 || k == 4 {
+            T.to_string()
+        } else {
+            format!("{k:06x}")
+        }
+    };
+    assert!(revisions_by_tag(&tags, 5, collide).is_empty());
+    assert_eq!(
+        revisions_by_tag(&tags, 3, collide)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![(T, 2)],
+        "в пределах 1..=3 ревизия с T одна"
+    );
+    let mut calls = 0;
+    let none = revisions_by_tag(&BTreeSet::new(), 1_000, |k| {
+        calls += 1;
+        k.to_string()
+    });
+    assert!(none.is_empty() && calls == 0);
+}
+
 /// База с `\r\n`, правка с `\n`; многострочное значение — с окончаниями правки; строка отказа —
 /// строка итога с переводами строк многострочного значения.
 #[test]

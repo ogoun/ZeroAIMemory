@@ -133,9 +133,11 @@ pub async fn outline(
     if sc.node.kind == NodeKind::Folder {
         return Ok(Json(Vec::new()));
     }
-    let (_, text) = node_content(&sc.db, sc.node.id, None).await?;
-    // агенту — заголовки нумерованного вида (`‹secret-T-N›`: по ним агент адресует секции `PATCH`)
-    let tag = agent_view::object_tag(&sc.node.id, sc.node.current_rev);
+    let (rev, text) = node_content(&sc.db, sc.node.id, None).await?;
+    // агенту — заголовки нумерованного вида (`‹secret-T-N›`: по ним агент адресует секции `PATCH`);
+    // T — ревизии прочитанного текста, а не снимка узла: запись между ними не сдвинет нумерацию
+    // под чужой T (финальное ревью M7.1, M-1)
+    let tag = agent_view::object_tag(&sc.node.id, rev);
     let text = agent_view::edit_view_owned(&p, tag, text).await?;
     Ok(Json(doc_outline(&parse(&text))))
 }

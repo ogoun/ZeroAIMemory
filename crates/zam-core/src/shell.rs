@@ -144,8 +144,16 @@ pub fn segments(command: &str) -> Vec<&str> {
 /// Предел имён каталогов команды ([`path_words`]) — и у клиента, и у сервера (поле
 /// `path_words` запроса `/recall`).
 pub const PATH_WORDS_MAX: usize = 32;
-/// Короче — не слово пути (как слова ошибки в покрытии подсказок `post_tool`).
+/// Короче — не имя каталога (как слова ошибки в покрытии подсказок `post_tool`).
 const PATH_WORD_MIN_CHARS: usize = 3;
+/// Начало команды, из которого клиент берёт [`path_words`], байт (16 КиБ; финальное ревью M7.1,
+/// I-4): у длинного `python - <<EOF …` (400 КБ) скан всей команды и stat на каждое слово выходили
+/// за бюджет хука `post-tool`.
+pub const PATH_WORDS_SCAN_MAX: usize = 16 * 1024;
+/// Вызовов `is_dir` у [`path_words`] на команду не больше (stat — около 6 мкс на Windows); дальше
+/// аргумент без разделителя не проверяется, у пути с разделителем последний сегмент — каталог,
+/// только если кончается разделителем.
+pub const PATH_WORDS_STAT_MAX: usize = 64;
 
 /// Имена каталогов из аргументов команды (M7.1 §4.6 п. 3: каталоги, набранные в команде, — не
 /// предмет её ошибки). Аргумент [`words`] с `/` или `\` (у `--флаг=путь` — значение после `=`) —
@@ -153,8 +161,17 @@ const PATH_WORD_MIN_CHARS: usize = 3;
 /// разделителем или `is_dir` (существующий каталог); имя файла и расширение — нет. Аргумент без
 /// разделителя — если `is_dir` (программа и флаги `-…` не проверяются). Адреса (`://`) и
 /// аргументы с `@` (`user:pass@host`) пропускаются. Слово — буквы и цифры от 3 символов в нижнем
-/// регистре, без повторов, до [`PATH_WORDS_MAX`].
+/// регистре, без повторов, до [`PATH_WORDS_MAX`]. `is_dir` — не больше [`PATH_WORDS_STAT_MAX`]
+/// раз; длину команды ограничивает вызывающий ([`PATH_WORDS_SCAN_MAX`]).
 pub fn path_words(command: &str, is_dir: impl Fn(&str) -> bool) -> Vec<String> {
+    let stats = std::cell::Cell::new(0usize);
+    let is_dir = |a: &str| {
+        if stats.get() >= PATH_WORDS_STAT_MAX {
+            return false;
+        }
+        stats.set(stats.get() + 1);
+        is_dir(a)
+    };
     let mut out: Vec<String> = Vec::new();
     let mut program = true;
     for w in words(command) {
@@ -323,5 +340,27 @@ mod tests {
             path_words(&format!("ls {many}"), none).len(),
             PATH_WORDS_MAX
         );
+    }
+
+    /// Цена (финальное ревью M7.1, I-4): у длинной команды `is_dir` — не больше
+    /// [`PATH_WORDS_STAT_MAX`] раз; каталоги начала команды — как прежде, пути с разделителем на
+    /// конце — и после исчерпания предела.
+    #[test]
+    fn path_words_stat_limit() {
+        let calls = std::cell::Cell::new(0usize);
+        let dir = |a: &str| {
+            calls.set(calls.get() + 1);
+            a == "src"
+        };
+        let mut cmd = String::from("ls src && python3 - <<'EOF'\n");
+        while cmd.len() < 400 * 1024 {
+            cmd.push_str("alpha beta gamma delta epsilon zeta eta theta\n");
+        }
+        cmd.push_str("print(1) out/dir/\nEOF\n");
+        assert_eq!(path_words(&cmd, dir), ["src", "out", "dir"]);
+        assert_eq!(calls.get(), PATH_WORDS_STAT_MAX);
+        calls.set(0);
+        assert_eq!(path_words("ls web/ web/e2e src", dir), ["web", "src"]);
+        assert_eq!(calls.get(), 2, "обычная команда — stat на каждый аргумент");
     }
 }

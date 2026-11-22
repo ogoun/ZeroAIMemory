@@ -186,7 +186,19 @@ fn digest_net(
         if let Some(j) = job {
             snapshot_queue::run(env, s, j, false);
         }
-        return local(s);
+        // нет токена для адреса — одна строка и агенту, иначе сбой не виден (M-4)
+        return match env.missing_token_note() {
+            Some(note) if s.on(Kind::SessionStart) => {
+                let tail = summary(s);
+                let text = if tail.trim().is_empty() {
+                    note
+                } else {
+                    format!("{note}\n\n{}", tail.trim())
+                };
+                Output::context(&inp.event, &text)
+            }
+            _ => local(s),
+        };
     };
     // очереди снимков, которые уходят до `/recall` (сессия снимка; после `compact` — своя)
     let first_ids: Vec<String> = job

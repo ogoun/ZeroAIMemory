@@ -1085,3 +1085,83 @@ fn insight_list_more_hint_and_all() {
     );
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
 }
+
+/// Замещение текстом с метками `‹secret-…›` из вида старой записи (финальное ревью M7.1, задача 6
+/// m2): без ревизии — 428 с подсказкой флага; `insight supersede --rev` (`If-Match`) и `log
+/// insight --supersedes … --supersedes-rev` — значение на месте: в выдаче новой записи — метка
+/// её собственного объекта, а не литерал `‹secret›`.
+#[test]
+fn supersede_marked_text_with_revision_flags() {
+    let (url, tok) = start("sup-rev");
+    let r = tmp("sup-rev-repo");
+    std::fs::create_dir_all(r.join(".zeroaimemory")).unwrap();
+    std::fs::write(
+        r.join(".zeroaimemory").join("solution.toml"),
+        format!("agent_solution_id = \"{G}\"\nname = \"Инсайты\"\n"),
+    )
+    .unwrap();
+    let z = |args: &[&str], stdin: &[u8]| zam(&url, &tok, &r, args, stdin);
+    // ключ из частей (push protection)
+    let key = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5");
+    let first = id_of(&ok(&z(
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "Ключ стенда",
+            "--force",
+        ],
+        format!("token: {key}\n").as_bytes(),
+    )));
+    let body_of = |id: &str| -> String {
+        let v = json(&z(&["insight", "show", id, "--json"], b""));
+        v["body"].as_str().unwrap().to_string()
+    };
+    let restored = |id: &str| {
+        let b = body_of(id);
+        assert!(
+            b.contains("‹secret-") && !b.contains("‹secret›") && !b.contains(&key),
+            "значение не восстановлено: {b}"
+        );
+    };
+    let seen = body_of(&first);
+    assert!(seen.contains("‹secret-") && !seen.contains(&key), "{seen}");
+    let sup = |extra: &[&str]| {
+        let mut a = vec![
+            "insight",
+            "supersede",
+            first.as_str(),
+            "--title",
+            "Ключ стенда (2)",
+        ];
+        a.extend_from_slice(extra);
+        z(&a, seen.as_bytes())
+    };
+    let o = sup(&[]);
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(err(&o).contains("--rev"), "{}", err(&o));
+    let second = id_of(&ok(&sup(&["--rev", "1"])));
+    restored(&second);
+    let seen2 = body_of(&second);
+    let log = |extra: &[&str]| {
+        let mut a = vec![
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "Ключ стенда (3)",
+            "--supersedes",
+            second.as_str(),
+        ];
+        a.extend_from_slice(extra);
+        z(&a, seen2.as_bytes())
+    };
+    let o = log(&[]);
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(err(&o).contains("--supersedes-rev"), "{}", err(&o));
+    let third = id_of(&ok(&log(&["--supersedes-rev", "1"])));
+    restored(&third);
+}

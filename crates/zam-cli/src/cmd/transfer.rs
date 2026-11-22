@@ -328,12 +328,39 @@ pub fn export(ctx: &mut Ctx, a: &ExportArgs) -> Result<(), CliError> {
             return Err(e);
         }
     };
+    // экспорт по токену маскирует тексты (M7 §4.3.1 п. 6): «копия» без значений — сразу, а не
+    // при импорте (финальное ревью M7.1, I-5)
+    if secrets_masked(a.out) {
+        eprintln!("{SECRETS_MASKED_NOTE}");
+    }
     if ctx.json {
         return emit_json(
             &json!({"file": a.out.display().to_string(), "bytes": bytes, "space": space}),
         );
     }
     emit(format!("{} ({bytes} байт)\n", a.out.display()).as_bytes())
+}
+
+/// Строка stderr `zam export`, когда опись архива помечена `secrets_masked: true`.
+pub const SECRETS_MASKED_NOTE: &str = "архив без значений секретов (‹secret›); полная копия — \
+экспорт из WebUI или zam-server backup";
+
+/// Опись `manifest.json` архива `path` помечена `secrets_masked: true` (экспорт по токену заменил
+/// значения секретов меткой `‹secret›`, M7 §4.3.1 п. 6); архив или опись не читаются — `false`.
+fn secrets_masked(path: &Path) -> bool {
+    let Ok(f) = File::open(path) else {
+        return false;
+    };
+    let Ok(mut z) = zip::ZipArchive::new(f) else {
+        return false;
+    };
+    let Ok(mut m) = z.by_name("manifest.json") else {
+        return false;
+    };
+    let mut s = String::new();
+    m.read_to_string(&mut s).is_ok()
+        && serde_json::from_str::<serde_json::Value>(&s)
+            .is_ok_and(|v| v["secrets_masked"] == serde_json::Value::Bool(true))
 }
 
 /// Сообщение для сервера без маршрута импорта.
