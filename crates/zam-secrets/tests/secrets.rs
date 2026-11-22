@@ -1640,3 +1640,38 @@ fn bench_scan_paren_flags() {
         assert!(per <= budget, "{name} {len} байт: {per:?} > {budget:?}");
     }
 }
+
+/// Круг правок 3–4 задачи 5 M7.1, сквозь [`mask_text`]: флаги в блоках пунктов списка — забор с
+/// отступом от колонки пункта (оба примера координатора, вложенный список) и забор на
+/// абсолютном отступе до 3, код которого левее пункта (шесть примеров ревьюера); закрывающий
+/// забор левее пункта закрывает блок.
+#[test]
+fn code_flags_in_list_items() {
+    let pw = ["S3c", "ret", "9x"].concat();
+    for t in [
+        format!(
+            "1. Шаг:\n\n    ```sh\n    mysql -uroot -p{pw}\n\n    mysql -p{pw} other\n    ```\n"
+        ),
+        format!(
+            "- Деплой:\n\n    ```bash\n    export A=1\n\n    curl -u admin:{pw} https://h\n    ```\n"
+        ),
+        format!("- a\n  - b\n\n      ```sh\n      mysql -p{pw}\n      ```\n"),
+        format!("- Подключение:\n  ```\nmysql -uroot -p{pw}\n  ```\n"),
+        format!("1. Run:\n   ```sh\n  mysql -uroot -p{pw}\n   ```"),
+        format!("1. Run:\n   ```sh\nmysql -uroot -p{pw}\n   ```"),
+        format!("- Шаг:\n  ```sh\n  cd /x\nmysql -uroot -p{pw}\n  ```"),
+        format!("- a\n> цитата\n  ```\nmysql -p{pw}\n  ```"),
+        format!("- a\n>   ```\n> mysql -p{pw}\n> ```"),
+        format!("- ```sh\nmysql -p{pw}\n```"),
+    ] {
+        let m = mask_text(&t);
+        assert!(!m.contains(&pw) && m.contains(SECRET_MARK), "{t:?} → {m:?}");
+        assert_eq!(mask_text(&m), m, "повторно: {t:?}");
+    }
+    // закрывающий забор левее пункта — закрывает блок: дальше проза, флаг в ней не маскируется
+    let t = format!("- a\n  ```\n  mysql -p{pw}\n```\nmysql -p{pw}\n");
+    assert_eq!(
+        mask_text(&t),
+        format!("- a\n  ```\n  mysql -p{SECRET_MARK}\n```\nmysql -p{pw}\n")
+    );
+}
