@@ -802,21 +802,22 @@ fn duplicate(candidates: Vec<DedupCandidate>, mode: DedupMode) -> ApiError {
 }
 
 /// Новая запись `req` агента по маскированному виду замещаемой `old` (M7 §4.3.2, задача 6 M7.1):
-/// заголовок, тело, строки `data`, теги и область — значения под `‹secret›`, оставшимися напротив
-/// меток старой записи, восстанавливаются ([`secret_restore`]). Меток без пары.
-fn restore_req(old: &Entry, req: &mut InsightReq) -> usize {
-    use secret_restore::{restore_in_place, restore_tags, restore_value};
-    restore_in_place(Some(&old.title), &mut req.title)
-        + restore_in_place(Some(&old.body), &mut req.body)
-        + restore_value(&old.data, &mut req.data)
-        + restore_tags(&old.tags, &mut req.tags)
-        + req
-            .area
-            .as_mut()
-            .map_or(0, |a| restore_in_place(old.area.as_deref(), a))
+/// поля [`secret_restore::EntryTexts`] — значения под `‹secret›`, оставшимися напротив меток
+/// старой записи, восстанавливаются. Меток без пары; правка, выводящая секрет из-под маски, —
+/// 422.
+fn restore_req(old: &Entry, req: &mut InsightReq) -> Result<usize, ApiError> {
+    secret_restore::EntryTexts {
+        title: Some(&mut req.title),
+        body: Some(&mut req.body),
+        data: Some(&mut req.data),
+        tags: Some(&mut req.tags),
+        area: req.area.as_mut(),
+        ..secret_restore::EntryTexts::default()
+    }
+    .restore(old.into())
 }
 
-/// [`restore_req`] для принципала `p`: человеку — как есть (0); длинные тела — в пуле
+/// [`restore_req`] для принципала `p`: человеку — как есть (0); длинные тела с метками — в пуле
 /// блокирующих задач.
 async fn restore_for(
     p: &Principal,
@@ -827,16 +828,19 @@ async fn restore_for(
         return Ok((req, 0));
     }
     let mut req = req;
-    if req.body.len() + old.body.len() <= agent_view::BLOCKING_FROM {
-        let kept = restore_req(old, &mut req);
+    if !secret_restore::has_mark(&req.body)
+        || req.body.len() + old.body.len() <= agent_view::BLOCKING_FROM
+    {
+        let kept = restore_req(old, &mut req)?;
         return Ok((req, kept));
     }
     let old = old.clone();
-    agent_view::blocking(move || {
+    let (req, kept) = agent_view::blocking(move || {
         let kept = restore_req(&old, &mut req);
         (req, kept)
     })
-    .await
+    .await?;
+    Ok((req, kept?))
 }
 
 /// `POST /spaces/{space}/entries` с `kind: insight` или `term` (тело уже прочитано как
@@ -922,7 +926,7 @@ pub async fn create(
             .await?;
         }
         let mut v = entry_json(p, &sc.db, &n, sc.role).await?;
-        super::secrets::attach_entry(&mut v, &n);
+        attach_secrets(p, &mut v, &n, &o);
         let old_v = serde_json::to_value(&o).map_err(|e| ApiError::Internal(e.to_string()))?;
         v["superseded"] = agent_view::view_json_owned(p, old_v, agent_view::ENTRY_FIELDS).await?;
         if kind == EntryKind::Insight {
@@ -943,7 +947,10 @@ pub async fn create(
             attach_warnings(&mut v, broad_alias_warnings(&n.data));
         }
         agent_view::view_json(p, &mut v, &["warnings"]);
-        secret_restore::attach_kept(&mut v, kept);
+        // повтор по ключу — без предупреждения (круг правок 1, M9)
+        if !repeat {
+            secret_restore::attach_kept(&mut v, kept);
+        }
         let status = if repeat {
             StatusCode::OK
         } else {
@@ -979,12 +986,19 @@ pub async fn create(
     };
     let new = new_entry(kind, req, sc.space.id, key, triggers, links)?;
     // 409 term-conflict — заголовки занятых терминов агенту с маской
-    let (e, created) = create_entry(&sc.db, new, &attrib)
+    let (mut e, created) = create_entry(&sc.db, new, &attrib)
         .await
         .map_err(|e| agent_view::view_error(p, e.into()))?;
     if created {
         st.index.notify();
     }
+    // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
+    // координатора по задаче 6 M7.1); повтор по ключу — без предупреждения
+    let kept = if created && agent_view::masks(p) {
+        secret_restore::EntryTexts::of(&mut e).marks()
+    } else {
+        0
+    };
     let mut v = entry_json(p, &sc.db, &e, sc.role).await?;
     super::secrets::attach_entry(&mut v, &e);
     if kind == EntryKind::Insight {
@@ -1007,11 +1021,7 @@ pub async fn create(
         attach_warnings(&mut v, broad_alias_warnings(&e.data));
     }
     agent_view::view_json(p, &mut v, &["warnings"]);
-    // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
-    // координатора по задаче 6 M7.1); повтор по ключу — без предупреждения
-    if created && agent_view::masks(p) {
-        secret_restore::attach_kept(&mut v, secret_restore::entry_marks(&e));
-    }
+    secret_restore::attach_kept(&mut v, kept);
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -1092,7 +1102,7 @@ pub async fn supersede(
         StatusCode::CREATED
     };
     let mut entry = entry_json(&p, &sc.db, &n, sc.role).await?;
-    super::secrets::attach_entry(&mut entry, &n);
+    attach_secrets(&p, &mut entry, &n, &sc.entry);
     if kind == EntryKind::Insight {
         let w = alias_warnings(&st, &sc.db, sc.space.id, &n.title, &n.body).await?;
         attach_warnings(&mut entry, w);
@@ -1112,7 +1122,10 @@ pub async fn supersede(
         attach_warnings(&mut entry, broad_alias_warnings(&n.data));
     }
     agent_view::view_json(&p, &mut entry, &["warnings"]);
-    secret_restore::attach_kept(&mut entry, kept);
+    // повтор по ключу — без предупреждения (круг правок 1, M9)
+    if !repeat {
+        secret_restore::attach_kept(&mut entry, kept);
+    }
     Ok((
         status,
         Json(json!({
@@ -1120,6 +1133,16 @@ pub async fn supersede(
             "superseded": entry_json(&p, &sc.db, &o, sc.role).await?,
         })),
     ))
+}
+
+/// `secrets_detected` замещающей записи `n`: агенту — только находки, которых нет в замещённой
+/// `old` (круг правок 1 задачи 6, M4), человеку — все.
+fn attach_secrets(p: &Principal, v: &mut Value, n: &Entry, old: &Entry) {
+    if agent_view::masks(p) {
+        super::secrets::attach_entry_new(v, n, old);
+    } else {
+        super::secrets::attach_entry(v, n);
+    }
 }
 
 #[derive(Deserialize)]

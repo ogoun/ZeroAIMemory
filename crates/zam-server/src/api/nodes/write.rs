@@ -16,9 +16,12 @@
 //! этом месте записана как есть ([`crate::api::secret_restore`]).
 //!
 //! **Агент по токену** правит маскированный текст (задача 6 M7.1, M7 §4.3.2): `PUT` —
-//! восстановление значений под `‹secret›` по ревизии `If-Match`, `PATCH` — операции по виду
-//! текущей ревизии (заголовки с маской), итог — со значениями
-//! ([`zam_store::patch_note_viewed`]). Сессия WebUI пишет исходник как есть.
+//! восстановление значений под `‹secret›` по ревизии `If-Match` (устаревшая без ключа повтора —
+//! 409 без восстановления), `PATCH` — операции по маске текущей ревизии (заголовки с маской),
+//! итог — со значениями, подсчёт вне транзакции писателя со сверкой ревизии при записи
+//! ([`zam_store::patch_note_prepared`]). Правка, выводящая секрет из-под маски, — 422
+//! `secret_context_changed`; `secrets_detected` — только новые находки. Сессия WebUI пишет
+//! исходник как есть.
 //!
 //! `Idempotency-Key` (M6 §16 п. 19, CR-20; заголовок — `api::entries::idempotency_key`, как у
 //! записей журнала): у создания заметки, `PUT` и `PATCH`. Повтор того же запроса — 200 и узел в
@@ -41,8 +44,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_markdown::PatchOp;
 use zam_store::{
-    NewNote, Node, NodePath, Patched, TextView, create_folder, create_note_keyed, delete_node,
-    list_trash, move_node, node_content, patch_note_viewed, restore_node, update_note_keyed,
+    NewNote, Node, NodePath, apply_ops, create_folder, create_note_keyed, delete_node, list_trash,
+    move_node, node_content, patch_note_keyed, patch_note_prepared, patch_replayed, restore_node,
+    update_note_keyed,
 };
 
 use super::{audit_node, write_error};
@@ -121,7 +125,8 @@ fn note_warnings(content: &str) -> Vec<String> {
 /// `Node` как JSON с `warnings` (только непустые); `db` и `space` — база и пространство
 /// заметки для предупреждений о псевдонимах словаря (кэш словаря — в `st`). Агенту `p` по
 /// токену — эхо с маской (`frontmatter`, L0 и тексты предупреждений, задача 5 M7.1); находки
-/// `secrets_detected` — по исходнику `content`.
+/// `secrets_detected` — по исходнику `content`, у правки агента по маске (`base` — прежний
+/// текст) — только новые (круг правок 1 задачи 6, M4).
 async fn node_reply(
     st: &AppState,
     p: &Principal,
@@ -129,6 +134,7 @@ async fn node_reply(
     space: zam_core::Id,
     node: &Node,
     content: &str,
+    base: Option<&str>,
 ) -> Result<Value, ApiError> {
     let mut v = serde_json::to_value(node).map_err(|e| ApiError::Internal(e.to_string()))?;
     let mut w = note_warnings(content);
@@ -142,7 +148,10 @@ async fn node_reply(
     }
     agent_view::view_json(p, &mut v, agent_view::NODE_FIELDS);
     agent_view::view_json(p, &mut v, &["warnings"]);
-    crate::api::secrets::attach(&mut v, content);
+    match base {
+        Some(b) => crate::api::secrets::attach_new(&mut v, content, b),
+        None => crate::api::secrets::attach(&mut v, content),
+    }
     Ok(v)
 }
 
@@ -204,13 +213,13 @@ pub async fn create(
         let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
         return Ok((
             StatusCode::OK,
-            Json(node_reply(&st, &p, &sc.db, sc.space.id, &node, &text).await?),
+            Json(node_reply(&st, &p, &sc.db, sc.space.id, &node, &text, None).await?),
         ));
     }
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
     st.docs.notify();
-    let mut v = node_reply(&st, &p, &sc.db, sc.space.id, &node, &content).await?;
+    let mut v = node_reply(&st, &p, &sc.db, sc.space.id, &node, &content, None).await?;
     // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
     // координатора по задаче 6 M7.1)
     if agent_view::masks(&p) {
@@ -255,25 +264,63 @@ pub async fn replace(
     check_size(&st, &req.content)?;
     let key = idempotency_key(&headers)?;
     let attrib = attribution(&p, &headers, req.message)?;
-    // агент правил маскированный текст ревизии `If-Match`: значения под `‹secret›` — обратно
-    // (M7 §4.3.2); предел — и по итоговому тексту
-    let restored = secret_restore::node_text(&p, &sc.db, sc.node.id, base, req.content).await?;
-    check_size(&st, &restored.text)?;
-    let content = restored.text.clone();
-    let r = update_note_keyed(&sc.db, sc.node.id, base, restored.text, req.l0, attrib, key).await;
+    // агент правил маскированный текст ревизии `If-Match` (M7 §4.3.2): значения под `‹secret›`
+    // — обратно по ней. Ревизия уже устарела (текущая только растёт) и ключа повтора нет — 409
+    // хранилища без восстановления (круг правок 1, M6); с ключом — как прежде: повтор по ключу
+    // старый `If-Match` не сверяет
+    let stale = key.is_none() && base < sc.node.current_rev;
+    let base_text = if agent_view::masks(&p) && !stale {
+        secret_restore::node_base(&sc.db, sc.node.id, base).await?
+    } else {
+        None
+    };
+    let (content, kept, base_text) = match base_text {
+        Some(b) => {
+            let (r, b) = secret_restore::restore_owned(b, req.content).await?;
+            let mut ex = secret_restore::Exposed::default();
+            ex.add(None, &r);
+            ex.check()?;
+            (r.text, r.kept, Some(b))
+        }
+        None => (req.content, 0, None),
+    };
+    // предел — и по итоговому тексту
+    check_size(&st, &content)?;
+    let r = update_note_keyed(
+        &sc.db,
+        sc.node.id,
+        base,
+        content.clone(),
+        req.l0,
+        attrib,
+        key,
+    )
+    .await;
     match r {
         Ok((n, fresh)) => {
             // повтор по ключу — текущий текст узла (его могли править после первого запроса)
-            let text = if fresh {
+            let (text, base_text) = if fresh {
                 st.index.notify();
                 st.docs.notify();
-                content
+                (content, base_text)
             } else {
-                node_content(&sc.db, n.id, Some(n.current_rev)).await?.1
+                (
+                    node_content(&sc.db, n.id, Some(n.current_rev)).await?.1,
+                    None,
+                )
             };
-            let mut v = node_reply(&st, &p, &sc.db, sc.space.id, &n, &text).await?;
+            let mut v = node_reply(
+                &st,
+                &p,
+                &sc.db,
+                sc.space.id,
+                &n,
+                &text,
+                base_text.as_deref(),
+            )
+            .await?;
             if fresh {
-                secret_restore::attach_kept(&mut v, restored.kept);
+                secret_restore::attach_kept(&mut v, kept);
             }
             Ok(Json(v))
         }
@@ -299,41 +346,132 @@ pub async fn patch(
 ) -> Result<Json<Value>, ApiError> {
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
-    let req: Patch = json_body(body)?;
+    let mut req: Patch = json_body(body)?;
     let key = idempotency_key(&headers)?;
-    let attrib = attribution(&p, &headers, req.message)?;
+    let attrib = attribution(&p, &headers, req.message.take())?;
     let max = st.cfg.limits.note_max_bytes;
     // агенту — операции по маскированному виду (заголовки он видел с `‹secret›`), значения —
-    // обратно (M7 §4.3.2); человеку — по исходнику
-    let view = agent_view::masks(&p).then_some(secret_restore::view as TextView);
-    let r = patch_note_viewed(
-        &sc.db,
-        sc.node.id,
-        req.base_rev,
-        req.ops,
-        attrib,
-        max,
-        key,
-        view,
-    )
-    .await;
+    // обратно (M7 §4.3.2); человеку — по исходнику, как прежде (у папки текста нет — ответ
+    // хранилища тот же)
+    if agent_view::masks(&p) && sc.node.kind == zam_store::NodeKind::Note {
+        return patch_by_view(&st, &p, &sc, req, attrib, max, key).await;
+    }
+    let r = patch_note_keyed(&sc.db, sc.node.id, req.base_rev, req.ops, attrib, max, key).await;
     match r {
-        Ok(Patched {
-            node: n,
-            fresh,
-            kept,
-        }) => {
+        Ok((n, fresh)) => {
             if fresh {
                 st.index.notify();
                 st.docs.notify();
             }
             let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
-            let mut v = node_reply(&st, &p, &sc.db, sc.space.id, &n, &text).await?;
-            secret_restore::attach_kept(&mut v, kept);
-            Ok(Json(v))
+            Ok(Json(
+                node_reply(&st, &p, &sc.db, sc.space.id, &n, &text, None).await?,
+            ))
         }
         Err(e) => Err(write_error(&p, &sc.db, sc.node.id, req.base_rev, e).await),
     }
+}
+
+/// Попыток PATCH агента по маске, если заметку меняют между подсчётом и записью.
+const PATCH_ATTEMPTS: usize = 3;
+
+/// `PATCH` агента по маске (M7 §4.3.2; круг правок 1 задачи 6 — вне транзакции писателя, M5):
+/// повтор по ключу — сразу; иначе по текущей ревизии — маски обеих ревизий, операции по маске
+/// текущей ([`zam_store::apply_ops`]: проверка «секция не менялась после `base_rev`» — по
+/// маскам), значения — обратно ([`secret_restore::MaskedBase`]); выход секрета из-под маски — 422;
+/// запись — со сверкой текущей ревизии ([`zam_store::patch_note_prepared`]), она сменилась —
+/// подсчёт заново (до [`PATCH_ATTEMPTS`] раз, затем 409).
+async fn patch_by_view(
+    st: &AppState,
+    p: &Principal,
+    sc: &crate::api::scope::NodeScope,
+    req: Patch,
+    attrib: zam_store::Attribution,
+    max: usize,
+    key: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = sc.node.id;
+    if let Some(n) =
+        patch_replayed(&sc.db, id, req.base_rev, &req.ops, &attrib, key.clone()).await?
+    {
+        let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
+        return Ok(Json(
+            node_reply(st, p, &sc.db, sc.space.id, &n, &text, None).await?,
+        ));
+    }
+    if req.ops.is_empty() {
+        return Err(ApiError::BadRequest("пустой список операций PATCH".into()));
+    }
+    for _ in 0..PATCH_ATTEMPTS {
+        let (cur_rev, current) = node_content(&sc.db, id, None).await?;
+        if req.base_rev > cur_rev {
+            let e = zam_store::WriteError::RevMismatch {
+                current_rev: cur_rev,
+                current,
+            };
+            return Err(write_error(p, &sc.db, id, req.base_rev, e).await);
+        }
+        let base = if req.base_rev == cur_rev {
+            None
+        } else {
+            let (_, b) = node_content(&sc.db, id, Some(req.base_rev)).await?;
+            Some(b)
+        };
+        let ops = req.ops.clone();
+        let big = current.len() + base.as_ref().map_or(0, String::len) > agent_view::BLOCKING_FROM;
+        let prepare = move || -> (Result<secret_restore::Restored, zam_store::WriteError>, String) {
+            let seen = secret_restore::MaskedBase::new(&current);
+            let base_seen = base.as_deref().map(zam_markdown::mask_text);
+            let r = apply_ops(base_seen.as_deref(), seen.masked(), cur_rev, &ops)
+                .map(|edited| seen.restore(&edited));
+            (r, current)
+        };
+        let (r, current) = if big {
+            agent_view::blocking(prepare).await?
+        } else {
+            prepare()
+        };
+        let restored = match r {
+            Ok(r) => r,
+            Err(e) => return Err(write_error(p, &sc.db, id, req.base_rev, e).await),
+        };
+        let mut ex = secret_restore::Exposed::default();
+        ex.add(None, &restored);
+        ex.check()?;
+        let w = patch_note_prepared(
+            &sc.db,
+            id,
+            req.base_rev,
+            &req.ops,
+            cur_rev,
+            restored.text,
+            attrib.clone(),
+            max,
+            key.clone(),
+        )
+        .await;
+        match w {
+            Ok(Some((n, fresh))) => {
+                if fresh {
+                    st.index.notify();
+                    st.docs.notify();
+                }
+                let (_, text) = node_content(&sc.db, n.id, Some(n.current_rev)).await?;
+                let base = fresh.then_some(current.as_str());
+                let mut v = node_reply(st, p, &sc.db, sc.space.id, &n, &text, base).await?;
+                if fresh {
+                    secret_restore::attach_kept(&mut v, restored.kept);
+                }
+                return Ok(Json(v));
+            }
+            Ok(None) => continue,
+            Err(e) => return Err(write_error(p, &sc.db, id, req.base_rev, e).await),
+        }
+    }
+    Err(ApiError::conflict(
+        "заметку меняют во время правки: перечитайте её (memory_read) и повторите с base_rev \
+         текущей ревизии",
+    ))
 }
 
 #[derive(Deserialize)]

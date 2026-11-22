@@ -124,6 +124,11 @@ pub enum ApiError {
     /// 422 `/problems/idempotency-mismatch`: ключ повторён с другим запросом.
     #[error("{0}")]
     IdempotencyMismatch(String),
+    /// 422 `/problems/secret-context-changed`, `code: secret_context_changed` (M7 §4.3.2, круг
+    /// правок 1 задачи 6 M7.1): правка агента по маске выводит восстановленный секрет из-под
+    /// маски; в `detail` — номера строк маскированного вида, без значений.
+    #[error("{0}")]
+    SecretContextChanged(String),
     /// 422 `/problems/certainty` (§7.5): нарушение матрицы прав `certainty` — нет
     /// доказательства или причины; `code` — машинный код ([`zam_store::CertaintyError::code`]).
     #[error("{0}")]
@@ -303,6 +308,11 @@ impl ApiError {
                 "/problems/idempotency-mismatch",
                 "Unprocessable Content",
             ),
+            ApiError::SecretContextChanged(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "/problems/secret-context-changed",
+                "Unprocessable Content",
+            ),
             ApiError::Certainty(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/certainty",
@@ -434,6 +444,12 @@ impl IntoResponse for ApiError {
         }
         if let (ApiError::Certainty(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("code".into(), json!(c.code()));
+        }
+        if let (ApiError::SecretContextChanged(_), Value::Object(o)) = (&self, &mut body) {
+            o.insert(
+                "code".into(),
+                json!(crate::api::secret_restore::SECRET_CONTEXT_CHANGED),
+            );
         }
         if let (ApiError::SolutionAccess { guid, state }, Value::Object(o)) = (&self, &mut body) {
             o.insert("state".into(), json!(state));

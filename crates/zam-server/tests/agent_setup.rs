@@ -1333,6 +1333,7 @@ async fn guide_secrets_masked_in_output() {
                 // запись обратно (задача 6 M7.1, M7 §4.3.2)
                 "`‹secret›` при правке сохраняет значение",
                 "предупреждение `secret_mark_kept`",
+                "422 `secret_context_changed`",
             ],
         ),
         (
@@ -1344,6 +1345,7 @@ async fn guide_secrets_masked_in_output() {
                 "attachment files (`GET /blobs/…`) — as is",
                 "`‹secret›` in an edit keeps the value",
                 "warning `secret_mark_kept`",
+                "422 `secret_context_changed`",
             ],
         ),
     ] {

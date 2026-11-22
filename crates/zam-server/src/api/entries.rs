@@ -463,12 +463,19 @@ pub async fn create(
         links: Vec::new(),
         refs,
     };
-    let (entry, created) = create_entry(&sc.db, new, &attrib)
+    let (mut entry, created) = create_entry(&sc.db, new, &attrib)
         .await
         .map_err(|e| agent_view::view_error(&p, e.into()))?;
     if created {
         st.index.notify();
     }
+    // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
+    // координатора по задаче 6 M7.1); повтор по ключу — без предупреждения
+    let kept = if created && agent_view::masks(&p) {
+        secret_restore::EntryTexts::of(&mut entry).marks()
+    } else {
+        0
+    };
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -484,11 +491,7 @@ pub async fn create(
     );
     let mut v = agent_view::view_json_owned(&p, v, ENTRY_FIELDS).await?;
     agent_view::view_json(&p, &mut v, &["warnings"]);
-    // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
-    // координатора по задаче 6 M7.1); повтор по ключу — без предупреждения
-    if created && agent_view::masks(&p) {
-        secret_restore::attach_kept(&mut v, secret_restore::entry_marks(&entry));
-    }
+    secret_restore::attach_kept(&mut v, kept);
     Ok((status, Json(v)))
 }
 
@@ -1052,13 +1055,12 @@ pub async fn patch(
     // агент правил маскированный вид записи: значения под `‹secret›` — обратно до проверок
     // (M7 §4.3.2), длинное тело с метками — в пуле; сессия WebUI — как есть
     let big_body = req.body.as_ref().is_some_and(|b| {
-        b.len() + sc.entry.body.len() > agent_view::BLOCKING_FROM
-            && b.contains(zam_markdown::SECRET_MARK)
+        b.len() + sc.entry.body.len() > agent_view::BLOCKING_FROM && secret_restore::has_mark(b)
     });
     let kept = if !agent_view::masks(&p) {
         0
     } else if !big_body {
-        restore_patch(&sc.entry, &mut req)
+        restore_patch(&sc.entry, &mut req)?
     } else {
         let base = sc.entry.clone();
         let (r, k) = agent_view::blocking(move || {
@@ -1068,7 +1070,7 @@ pub async fn patch(
         })
         .await?;
         req = r;
-        k
+        k?
     };
     check_patch_by(&p, &sc.entry, &req)?;
     // правку сделал человек: сессия WebUI или слова человека токеном (`by: human`, M6.5 §6) —
@@ -1169,7 +1171,12 @@ pub async fn patch(
         st.index.notify();
     }
     let mut v = entry_json(&p, &sc.db, &e, sc.role).await?;
-    super::secrets::attach_entry(&mut v, &e);
+    // находки — у агента только новые: восстановленные и прежние значения ему не новость (M4)
+    if agent_view::masks(&p) {
+        super::secrets::attach_entry_new(&mut v, &e, &sc.entry);
+    } else {
+        super::secrets::attach_entry(&mut v, &e);
+    }
     if e.kind != EntryKind::Term {
         super::glossary::attach_warnings(
             &mut v,
@@ -1183,40 +1190,28 @@ pub async fn patch(
     Ok(Json(v))
 }
 
-/// Правка `req` агентом по маскированному виду записи `e` (M7 §4.3.2, задача 6 M7.1): заголовок,
-/// тело, строки `data`, теги, область, `next_step` и `blocked_by` задачи — значения под
-/// `‹secret›`, оставшимися напротив меток прежнего текста, восстанавливаются
-/// ([`secret_restore`]); метки дописки `append_body` — новые. Меток без пары.
-fn restore_patch(e: &Entry, req: &mut Patch) -> usize {
-    use secret_restore::{marks_in, restore_in_place, restore_tags, restore_value};
-    let mut kept = 0;
-    if let Some(t) = &mut req.title {
-        kept += restore_in_place(Some(&e.title), t);
+/// Правка `req` агентом по маскированному виду записи `e` (M7 §4.3.2, задача 6 M7.1): поля
+/// [`secret_restore::EntryTexts`] — значения под `‹secret›`, оставшимися напротив меток прежнего
+/// текста, восстанавливаются; метки дописки `append_body` — новые. Меток без пары; правка,
+/// выводящая секрет из-под маски, — 422.
+fn restore_patch(e: &Entry, req: &mut Patch) -> Result<usize, ApiError> {
+    let mut data_fields = Vec::new();
+    if let Some(Some(s)) = &mut req.next_step {
+        data_fields.push(("next_step", s));
     }
-    if let Some(b) = &mut req.body {
-        kept += restore_in_place(Some(&e.body), b);
+    if let Some(Some(s)) = &mut req.blocked_by {
+        data_fields.push(("blocked_by", s));
     }
-    if let Some(b) = &req.append_body {
-        kept += marks_in(b);
+    secret_restore::EntryTexts {
+        title: req.title.as_mut(),
+        body: req.body.as_mut(),
+        append_body: req.append_body.as_deref(),
+        data: req.data.as_mut(),
+        data_fields,
+        tags: req.tags.as_mut(),
+        area: req.area.as_mut().and_then(Option::as_mut),
     }
-    if let Some(d) = &mut req.data {
-        kept += restore_value(&e.data, d);
-    }
-    if let Some(t) = &mut req.tags {
-        kept += restore_tags(&e.tags, t);
-    }
-    if let Some(Some(a)) = &mut req.area {
-        kept += restore_in_place(e.area.as_deref(), a);
-    }
-    for (k, v) in [
-        ("next_step", &mut req.next_step),
-        ("blocked_by", &mut req.blocked_by),
-    ] {
-        if let Some(Some(s)) = v {
-            kept += restore_in_place(e.data.get(k).and_then(Value::as_str), s);
-        }
-    }
-    kept
+    .restore(e.into())
 }
 
 /// Детали аудита операций записи (без текста записи).
