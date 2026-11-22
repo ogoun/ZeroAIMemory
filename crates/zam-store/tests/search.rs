@@ -1002,3 +1002,95 @@ async fn insight_term_docs_counts_live_insights() {
         .unwrap();
     assert_eq!((r.docs, r.df, r.matched), (0, vec![0; 4], 0));
 }
+
+/// M7.1 §4.8 (задача 9): фильтр только по записям, а живых записей его видов и статусов в
+/// области нет, — пустые каналы (как у трёх пустых проходов FTS, которых теперь нет): заметки и
+/// insight с теми же словами задачу не дают; живая задача находится; удалённая — нет; задача
+/// со статусом вне фильтра — нет; фильтр с заметками проверки не делает.
+#[tokio::test]
+async fn entry_only_filter_without_live_entries_is_empty() {
+    // счёт по пути базы: другие тесты процесса его не трогают
+    #[cfg(feature = "test-hooks")]
+    zam_store::test_hooks::count_fts_channels();
+    let (db, k, _) = setup("entry-only-empty").await;
+    add(
+        &db,
+        k,
+        "notes/m",
+        "# Миграция\n\nМиграция базы и кэш деплоя.\n",
+    )
+    .await;
+    insight_in(
+        &db,
+        k,
+        "Ловушка миграции",
+        "Миграция базы падает на шаге 7.",
+    )
+    .await;
+    let tasks = |kinds: &[&str], statuses: &[&str]| {
+        let mut f = q("миграция базы деплоя", &[k]);
+        f.targets.kinds = kinds.iter().map(|s| s.to_string()).collect();
+        f.targets.statuses = statuses.iter().map(|s| s.to_string()).collect();
+        zam_store::search_fts_channels(&db, f)
+    };
+    // проходы каналов с `MATCH` (фича `test-hooks`; без неё проверяется только выдача): пропуск
+    // пустых — не проход
+    let runs = |want: u64| {
+        #[cfg(feature = "test-hooks")]
+        assert_eq!(
+            zam_store::test_hooks::fts_channel_runs(db.path()),
+            want,
+            "проходов каналов FTS"
+        );
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = want;
+    };
+    let open = ["open", "in_progress", "blocked"];
+    let ch = tasks(&["task"], &open).await.unwrap();
+    assert!(
+        ch.bm25.is_empty() && ch.trigram.is_empty() && ch.alias.is_empty(),
+        "{ch:?}"
+    );
+    assert!(!ch.relaxed && !ch.alias_relaxed, "{ch:?}");
+    runs(0);
+    let (task, _) = zam_store::create_entry(
+        &db,
+        zam_store::NewEntry {
+            refs: None,
+            space_id: k,
+            kind: zam_store::EntryKind::Task,
+            title: "Миграция базы".into(),
+            body: "Шаги задачи.".into(),
+            data: serde_json::json!({}),
+            area: None,
+            tags: Vec::new(),
+            status: None,
+            certainty: None,
+            idempotency_key: None,
+            triggers: Vec::new(),
+            links: Vec::new(),
+        },
+        &attrib(),
+    )
+    .await
+    .unwrap();
+    let ch = tasks(&["task"], &open).await.unwrap();
+    assert!(ch.bm25.iter().all(|h| h.target.id == task.id), "{ch:?}");
+    assert!(!ch.bm25.is_empty(), "{ch:?}");
+    runs(1);
+    // статус задачи вне фильтра — нет живой записи фильтра
+    assert!(tasks(&["task"], &["done"]).await.unwrap().bm25.is_empty());
+    runs(1);
+    // с заметками фильтр идёт обычным путём: заметка находится и без задач
+    zam_store::delete_entry(&db, task.id, None, &attrib())
+        .await
+        .unwrap();
+    assert!(tasks(&["task"], &open).await.unwrap().bm25.is_empty());
+    runs(1);
+    let ch = tasks(&["task", "note"], &open).await.unwrap();
+    assert!(
+        ch.bm25.iter().any(|h| h.target.kind == TargetKind::Node),
+        "{ch:?}"
+    );
+    runs(2);
+}

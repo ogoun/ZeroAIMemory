@@ -775,7 +775,8 @@ cargo build --release -p zam-cli                   # отдельной кома
   нет), например
   `cargo test -p zam-cli --test m4_acceptance hook_budgets -- --ignored --exact`. Так же
   запускается `m57_acceptance`, а `m6_acceptance acceptance_hook_budgets` — с `--release` и
-  бинарниками тега (см. описание теста). Пороги в них не ослаблены.
+  бинарником предыдущего выпуска (`target/tags/<тег>/release`, см. описание теста). Пороги в них
+  не ослаблены.
 - Тесты `zam-index`, которые пишут в Qdrant, сначала проверяют свободное место на диске
   (по умолчанию 4096 МБ, порог задаёт `ZAM_TEST_MIN_FREE_MB`). Если места мало, тест
   пропускается со строкой

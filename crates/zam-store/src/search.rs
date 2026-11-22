@@ -594,6 +594,11 @@ fn channel_spec(ch: Channel) -> (&'static str, &'static str, i64) {
 /// `_`. У записи пути нет: при префиксе она не проходит. Чанк вложения (`attachment_id`, M5)
 /// проходит по своей ветке: вид `attachment`, живой документ и живой узел-владелец, область;
 /// префикс, `area`, `certainty` и ссылка на файл — узла-владельца; при `decided_by` — нет.
+///
+/// **Связь с [`any_live_entry`]** (пропуск пустых каналов, M7.1 задача 9): её условия — часть
+/// условий ветки записей отсюда (пространство, `deleted_at`, вид, статус, id). Новое условие
+/// ветки записей сужает выдачу и пропуск не ломает; ослабить или изменить там вид, статус или id
+/// — значит поправить и её (тест `entry_only_filter_without_live_entries_is_empty`).
 fn scope_sql(n_spaces: usize) -> String {
     let sp = placeholders(3, n_spaces);
     let (notes, kinds, statuses, area) = (3 + n_spaces, 4 + n_spaces, 5 + n_spaces, 6 + n_spaces);
@@ -839,20 +844,56 @@ pub async fn search_fts_channels_light(
     fts_channels(db, q, Some(light)).await
 }
 
+/// Есть ли в пространствах `spaces` живая запись видов, статусов и id фильтра `t` — условия
+/// ветки записей [`scope_sql`] без остальных (область, `certainty`, файл…): нет такой записи — нет
+/// и чанка записи, который фильтр пропустил бы. Индекс `(space_id, kind)`. Менять — вместе с
+/// веткой записей [`scope_sql`].
+fn any_live_entry(c: &Connection, spaces: &[Id], t: &TargetArgs) -> Result<bool, StoreError> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM entries e
+           WHERE e.space_id IN ({}) AND e.deleted_at IS NULL
+             AND e.kind IN (SELECT value FROM json_each(?1))
+             AND (e.status IS NULL OR ?2 IS NULL OR e.status IN (SELECT value FROM json_each(?2)))
+             AND (?3 IS NULL OR e.id IN (SELECT value FROM json_each(?3))))",
+        placeholders(4, spaces.len())
+    );
+    let mut args: Vec<&dyn ToSql> = vec![&t.kinds, &t.statuses, &t.entry_ids];
+    args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+    Ok(c.prepare_cached(&sql)?
+        .query_row(params_from_iter(args), |r| r.get(0))?)
+}
+
 async fn fts_channels(
     db: &Db,
     q: FtsQuery,
     light: Option<LightSearch>,
 ) -> Result<FtsChannels, StoreError> {
     let (spaces, prefix) = check_query(&q)?;
+    // счёт проходов (тест пропуска пустых каналов) — только при включённом флаге: без него ни
+    // блокировки, ни копии пути
+    #[cfg(feature = "test-hooks")]
+    let counted = crate::test_hooks::fts_counting().then(|| db.path().to_path_buf());
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
+        let targs = q.targets.args();
+        // фильтр только по записям (без заметок и вложений), а живых записей его видов и статусов
+        // в области нет — каналы пусты без MATCH: ответ тот же, что у трёх пустых проходов
+        // (строгий, ослабленный, триграммы). Подсказка-задача к `prompt` на базе без открытых задач
+        // платила за них на каждом запросе (M7.1 §4.8, профиль задачи 9: 0,6 мс вместе с
+        // промахами кэша подготовленных запросов)
+        if !targs.notes && !targs.attachments && !any_live_entry(&tx, &spaces, &targs)? {
+            return Ok(FtsChannels::default());
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Some(path) = &counted {
+            crate::test_hooks::fts_channels_ran(path);
+        }
         let ch = run_channels(
             &tx,
             &q.text,
             prefix.as_deref(),
             &spaces,
-            &q.targets.args(),
+            &targs,
             &q.alias_groups,
             light.map(|l| l.channel_depth),
             light.is_some_and(|l| l.any_terms),
