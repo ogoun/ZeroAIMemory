@@ -834,6 +834,64 @@ async fn agent_claimed_tasks_masked() {
     clean(&r, &s, true, "claimed_tasks");
 }
 
+/// Подзадачи `part_of` (M7 §5.4 п. 2, задача 5 M7.2): заголовки общей в `parent.title` и шагов в
+/// `subtasks.items[].title` агенту по токену — с маской `‹secret›` (карточка, лента, эхо правки),
+/// сессии WebUI — исходник.
+#[tokio::test]
+async fn subtask_titles_masked_for_token() {
+    let a = api("secrets-subtasks", |_| {}).await;
+    let s = secret();
+    let task = |title: String| json!({"kind": "task", "title": title, "body": "План."});
+    let p = post_entry(&a, "knowledge", task(format!("Этап {s}"))).await;
+    let st = post_entry(&a, "knowledge", task(format!("Шаг {s}"))).await;
+    let (p, st) = (
+        p["id"].as_str().unwrap().to_string(),
+        st["id"].as_str().unwrap().to_string(),
+    );
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/edges",
+            Some(json!({"src": format!("e:{st}"), "type": "part_of", "dst": format!("e:{p}")})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    // шаг: заголовок общей в `parent`
+    let (t, h) = get_pair(&a, &format!("/api/v1/entries/{st}"), &s).await;
+    assert_eq!(
+        t.json()["parent"]["title"],
+        format!("Этап {MARK}"),
+        "{}",
+        t.text()
+    );
+    assert_eq!(h.json()["parent"]["title"], format!("Этап {s}"));
+    // общая: заголовки шагов в `subtasks.items`
+    let (t, h) = get_pair(&a, &format!("/api/v1/entries/{p}"), &s).await;
+    assert_eq!(
+        t.json()["subtasks"]["items"][0]["title"],
+        format!("Шаг {MARK}"),
+        "{}",
+        t.text()
+    );
+    assert_eq!(
+        h.json()["subtasks"]["items"][0]["title"],
+        format!("Шаг {s}")
+    );
+    // лента и эхо правки — без значения
+    get_pair(&a, "/api/v1/spaces/knowledge/entries?kind=task", &s).await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{st}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    clean(&r, &s, true, "эхо правки шага");
+    assert_eq!(r.json()["parent"]["title"], format!("Этап {MARK}"));
+}
+
 /// Узел и запись после операций — `revert`, `move`, удаление в корзину, корзина, `restore`: ответ
 /// агенту без значения (frontmatter узла и текст записи — с маской).
 #[tokio::test]

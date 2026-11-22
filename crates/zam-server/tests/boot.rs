@@ -108,6 +108,8 @@ fn health_features_documented() {
         "epochs",
         // выдача агенту по токену — с `‹secret›` (задача 5 M7.1)
         "agent_text_masked",
+        // подзадачи `part_of`: поля задачи, фильтры ленты и счётчиков (задача 5 M7.2)
+        "task_subtasks",
     ] {
         assert!(built.contains(f), "{f}");
     }

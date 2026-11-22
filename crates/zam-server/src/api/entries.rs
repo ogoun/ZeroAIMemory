@@ -12,15 +12,17 @@
 //!   `GET /entries/{id}/revisions`; `GET /entries/{id}` отдаёт и `usage: {shown, useful,
 //!   useless}` (§10.5, оценка — [`super::feedback`]), список — у каждой insight (задача 13);
 //! - `GET /spaces/{space}/entries/counts?kind=<вид>` — число живых записей вида по статусам с
-//!   фильтрами ленты (`area`, `tag`, `origin`, `priority`, `from_idea`): чипы статусов ленты
-//!   идей WebUI (M6.5 §9).
+//!   фильтрами ленты (`area`, `tag`, `origin`, `priority`, `from_idea`, у задач — `top_level`,
+//!   `parent`): чипы статусов ленты идей WebUI (M6.5 §9), вкладки доски задач (M7 §5.4).
 //!
 //! `kind: task` — журнал задач (M4.5 §3, [`super::tasks`]): в решении и Knowledge, `data`
 //! по [`zam_store::TaskData`]; `PATCH` меняет `status` (с `next_step`, `blocked_by`, `reason`;
 //! переоткрытие `done`/`dropped` → `open` — только с `reason`, иначе 422 `reason-required`) и
 //! поля задачи слиянием; у `done` в ответах — `duration_min`; у задачи из идеи (системное ребро
 //! `derived_from` на живую идею) — `idea {id, title, status, space_id}` и `ideas` (все её идеи), у ленты —
-//! фильтр `from_idea=1` (M6.5 §9).
+//! фильтр `from_idea=1` (M6.5 §9); подзадачи `part_of` (M7 §5.4, [`super::tasks::attach_task`]) —
+//! `parent`, `subtasks`, `last_activity_at`, `stale`, у карточки общей — `subtasks.items`, у ленты
+//! и счётчиков — фильтры `top_level=1` и `parent=<id>` (прямые подзадачи в порядке шагов).
 //! `kind: question` — вопрос к человеку (M4.5 §4, [`super::questions`]): в решении и Knowledge,
 //! `data` по [`zam_store::QuestionData`] (`options`, `recommendation`); совпавший заголовок
 //! `open`/`answered` вопроса — 409 `possible-duplicate` (`force` пишет всё равно); `PATCH` —
@@ -72,7 +74,7 @@ use zam_store::{
 };
 
 use super::agent_view;
-use super::insights::{entry_json, parse_triggers};
+use super::insights::{entry_card_json, entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
 use super::render::Viewer;
 use super::reports::ReportInput;
@@ -486,7 +488,13 @@ pub async fn create(
     };
     let mut v = json!(entry);
     super::secrets::attach_entry(&mut v, &entry);
-    super::tasks::attach_task(&mut v, &entry, &[]);
+    // новая задача — без связей; повтор по ключу — по дереву подзадач пространства (M7 §5.4)
+    let tree = if entry.kind == EntryKind::Task && !created {
+        zam_store::task_tree(&sc.db, sc.space.id).await?
+    } else {
+        zam_store::TaskTree::default()
+    };
+    super::tasks::attach_task(&mut v, &entry, &[], &tree, zam_store::time::now());
     super::glossary::attach_warnings(
         &mut v,
         super::glossary::alias_warnings(&st, &sc.db, sc.space.id, &entry.title, &entry.body)
@@ -524,6 +532,70 @@ pub struct ListQuery {
     priority: Option<String>,
     /// Только `kind=task`: `1` — задачи из идей (пункты плана, M6.5 §9).
     from_idea: Option<String>,
+    /// Только `kind=task`: `1` — верхний уровень, без подзадач `part_of` (M7 §5.4 п. 3).
+    top_level: Option<String>,
+    /// Только `kind=task`: id задачи — её прямые подзадачи в порядке шагов (M7 §5.4 п. 3).
+    parent: Option<String>,
+}
+
+/// Фильтры подзадач `part_of` ленты и счётчиков задач (M7 §5.4 п. 3, задача 5 M7.2).
+struct SubtaskFilter {
+    /// `top_level=1` — без подзадач.
+    top_level: bool,
+    /// `parent=<id>` — прямые подзадачи задачи в порядке создания ребра.
+    parent: Option<Id>,
+}
+
+impl SubtaskFilter {
+    /// `top_level` — флаг ([`parse_flag`], иначе 400), `parent` — id задачи (можно `k:<id>`,
+    /// `e:<id>`; иначе 400); оба — только у `kind=task` (иначе 422, как `from_idea`), вместе — 422
+    /// (у прямых подзадач родитель есть всегда: пересечение пусто).
+    fn parse(
+        kind: Option<EntryKind>,
+        top_level: Option<&str>,
+        parent: Option<&str>,
+    ) -> Result<SubtaskFilter, ApiError> {
+        let top_level = parse_flag(top_level, "top_level")?;
+        let parent = parent.map(str::trim).filter(|s| !s.is_empty());
+        if (top_level || parent.is_some()) && kind != Some(EntryKind::Task) {
+            return Err(unprocessable(
+                "top_level и parent — фильтры ленты задач (kind=task)",
+            ));
+        }
+        let parent = parent
+            .map(|raw| {
+                let bare = raw
+                    .strip_prefix("k:")
+                    .or_else(|| raw.strip_prefix("e:"))
+                    .unwrap_or(raw);
+                bare.parse::<Id>()
+                    .map_err(|_| ApiError::BadRequest(format!("parent: «{raw}» — не id задачи")))
+            })
+            .transpose()?;
+        if top_level && parent.is_some() {
+            return Err(unprocessable(
+                "top_level и parent вместе не задаются: у подзадачи родитель есть всегда",
+            ));
+        }
+        Ok(SubtaskFilter { top_level, parent })
+    }
+
+    /// Нужен ли фильтру дерево подзадач.
+    fn active(&self) -> bool {
+        self.top_level || self.parent.is_some()
+    }
+
+    /// Ограничение ленты по дереву `tree`: без подзадач или только прямые подзадачи `parent` в
+    /// порядке шагов (курсор — позиция в списке).
+    fn apply(&self, f: &mut EntryFilter, tree: &zam_store::TaskTree) {
+        if self.top_level {
+            f.except_ids = tree.subtask_ids();
+        }
+        if let Some(p) = self.parent {
+            f.only_ids = Some(tree.children_of(p).to_vec());
+            f.ids_order = true;
+        }
+    }
 }
 
 /// Флаг запроса: нет, пусто, `0`, `false` — выключен, `1`, `true` — включён, иное — 400.
@@ -661,7 +733,8 @@ pub async fn list(
     if from_idea && kind != Some(EntryKind::Task) {
         return Err(unprocessable("from_idea — фильтр ленты задач (kind=task)"));
     }
-    let f = EntryFilter {
+    let sub = SubtaskFilter::parse(kind, q.top_level.as_deref(), q.parent.as_deref())?;
+    let mut f = EntryFilter {
         space_id: sc.space.id,
         kind,
         statuses: parse_list(q.status.as_deref(), "status", EntryStatus::parse)?,
@@ -692,8 +765,24 @@ pub async fn list(
             zam_store::IdeaPriority::parse,
         )?,
         from_idea: from_idea.then(|| super::tasks::idea_spaces(sc.role, sc.space.id)),
+        ..Default::default()
     };
+    // дерево подзадач — одно на запрос (M7 §5.4): фильтры `top_level`, `parent` и поля задач
+    // ленты (`parent`, `subtasks`, `stale`) — без запроса на задачу
+    let mut tree = if sub.active() {
+        Some(zam_store::task_tree(&sc.db, sc.space.id).await?)
+    } else {
+        None
+    };
+    if let Some(t) = &tree {
+        sub.apply(&mut f, t);
+    }
     let (items, next) = list_entries(&sc.db, f).await?;
+    if tree.is_none() && items.iter().any(|e| e.kind == EntryKind::Task) {
+        tree = Some(zam_store::task_tree(&sc.db, sc.space.id).await?);
+    }
+    let tree = tree.unwrap_or_default();
+    let now = zam_store::time::now();
     // у insight — показы и оценки (столбец списка Insights WebUI, задача 13), одним запросом
     let ids: Vec<Id> = items
         .iter()
@@ -721,7 +810,8 @@ pub async fn list(
         if e.kind == EntryKind::Insight {
             v["usage"] = json!(usage.get(&e.id).copied().unwrap_or_default());
         }
-        super::tasks::attach_task(&mut v, e, task_ideas.get(&e.id).map_or(&[], Vec::as_slice));
+        let ideas = task_ideas.get(&e.id).map_or(&[][..], Vec::as_slice);
+        super::tasks::attach_task(&mut v, e, ideas, &tree, now);
         super::ideas::attach_idea_task(&mut v, e, &idea_tasks);
         out.push(v);
     }
@@ -745,13 +835,18 @@ pub struct CountsQuery {
     priority: Option<String>,
     /// Только `kind=task`: `1` — задачи из идей.
     from_idea: Option<String>,
+    /// Только `kind=task`: `1` — без подзадач `part_of` (вкладки доски, M7 §5.4 п. 3).
+    top_level: Option<String>,
+    /// Только `kind=task`: id задачи — по её прямым подзадачам.
+    parent: Option<String>,
 }
 
 /// `GET /spaces/{space}/entries/counts?kind=<вид>` → `{<статус>: n}` — все статусы вида
 /// ([`zam_store::allowed_statuses`], нулевые тоже) с фильтрами ленты [`list`]: `area`,
 /// `tag`, у идей `origin` и `priority`, у задач `from_idea` (M6.5 §9, чипы статусов ленты идей
-/// WebUI). Без `kind` или у вида без статусов — 400; фильтр не своего вида — 422; вид, невидимый
-/// агенту, токену — 400, как у ленты.
+/// WebUI), `top_level` и `parent` (M7 §5.4 п. 3, вкладки доски без подзадач). Без `kind` или у
+/// вида без статусов — 400; фильтр не своего вида — 422; вид, невидимый агенту, токену — 400, как
+/// у ленты.
 pub async fn counts(
     State(st): State<AppState>,
     p: Principal,
@@ -787,21 +882,13 @@ pub async fn counts(
     if from_idea && kind != EntryKind::Task {
         return Err(unprocessable("from_idea — фильтр ленты задач (kind=task)"));
     }
-    let f = EntryFilter {
+    let sub = SubtaskFilter::parse(Some(kind), q.top_level.as_deref(), q.parent.as_deref())?;
+    let mut f = EntryFilter {
         space_id: sc.space.id,
         kind: Some(kind),
-        statuses: Vec::new(),
-        certainty: Vec::new(),
         area: q.area.filter(|a| !a.is_empty()),
         tag: q.tag.filter(|a| !a.is_empty()),
-        data_kind: None,
-        decided_by: None,
-        since: None,
-        until: None,
-        cursor: None,
         limit: 1,
-        with_reports: false,
-        deleted_only: false,
         origin: parse_one(q.origin.as_deref(), "origin", zam_store::IdeaOrigin::parse)?,
         priority: parse_one(
             q.priority.as_deref(),
@@ -809,7 +896,11 @@ pub async fn counts(
             zam_store::IdeaPriority::parse,
         )?,
         from_idea: from_idea.then(|| super::tasks::idea_spaces(sc.role, sc.space.id)),
+        ..Default::default()
     };
+    if sub.active() {
+        sub.apply(&mut f, &zam_store::task_tree(&sc.db, sc.space.id).await?);
+    }
     let counts = zam_store::count_by_status(&sc.db, f).await?;
     let mut out = serde_json::Map::new();
     for (s, n) in counts {
@@ -854,7 +945,8 @@ pub async fn get(
         let viewer = Viewer::of(&st, &p, sc.owner, sc.role);
         return super::reports::view::get_html(&st, &p, &sc, viewer).await;
     }
-    let mut v = entry_json(&p, &sc.db, &sc.entry, sc.role).await?;
+    // карточка: у общей задачи — ещё строки подзадач (M7 §5.4 п. 2)
+    let mut v = entry_card_json(&p, &sc.db, &sc.entry, sc.role).await?;
     let links = super::ideas::idea_links(&sc.db, &sc.entry).await?;
     super::ideas::attach_idea(&mut v, &sc.entry, &links);
     // заголовок связанной задачи идеи (запись уже маскирована `entry_json`)

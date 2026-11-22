@@ -148,22 +148,8 @@ async fn make_report(db: &Db, space: Id, title: &str) -> zam_store::Entry {
 fn filter(space: Id) -> EntryFilter {
     EntryFilter {
         space_id: space,
-        kind: None,
-        statuses: Vec::new(),
-        certainty: Vec::new(),
-        area: None,
-        tag: None,
-        data_kind: None,
-        decided_by: None,
-        since: None,
-        until: None,
-        cursor: None,
         limit: 50,
-        with_reports: false,
-        deleted_only: false,
-        origin: None,
-        priority: None,
-        from_idea: None,
+        ..Default::default()
     }
 }
 

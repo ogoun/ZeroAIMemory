@@ -671,12 +671,19 @@ enum TaskCmd {
         /// GUID решения (иначе agent_solution_id из solution.toml)
         #[arg(long)]
         solution: Option<String>,
+        /// Прямые подзадачи part_of задачи k:<id> в порядке шагов; без --status — все статусы
+        /// (сервер 0.0.15-m7.2 и новее)
+        #[arg(long, value_name = "k:<id>", conflicts_with = "top")]
+        parent: Option<String>,
+        /// Только верхний уровень — без подзадач part_of (сервер 0.0.15-m7.2 и новее)
+        #[arg(long)]
+        top: bool,
         #[command(flatten)]
         page: cmd::Paging,
         #[command(flatten)]
         common: Common,
     },
-    /// Карточка задачи: статус, шаги, захват, времена, план
+    /// Карточка задачи: статус, шаги, захват, времена, подзадачи, план
     Show {
         /// k:<id>
         id: String,
@@ -1629,6 +1636,8 @@ fn task(c: TaskCmd) -> Result<(), CliError> {
             status,
             global,
             solution,
+            parent,
+            top,
             page,
             common,
         } => t::list(
@@ -1637,6 +1646,10 @@ fn task(c: TaskCmd) -> Result<(), CliError> {
             global,
             solution.as_deref(),
             page,
+            t::Subtasks {
+                parent: parent.as_deref(),
+                top,
+            },
         ),
         TaskCmd::Show { id, common } => t::show(&cmd::connect(&common)?, &id),
         TaskCmd::New {

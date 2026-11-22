@@ -680,28 +680,47 @@ async fn decision_vector(
 /// [`super::tasks::idea_spaces`]). Агенту `p` по токену — с маской секретов
 /// ([`agent_view::view_entry_json_owned`]: редактируемые поля — `‹secret-T-N›`, задача 5 и круги
 /// правок 3–5 задачи 6 M7.1; длинное тело — в пуле блокирующих задач); сессии WebUI — исходник.
+/// У задачи — и подзадачи `part_of` (`parent`, `subtasks`, `last_activity_at`, `stale`; M7 §5.4)
+/// по дереву пространства — один запрос [`zam_store::task_tree`]; строк подзадач в эхо правки и
+/// захвата нет — они у карточки [`entry_card_json`].
 pub async fn entry_json(p: &Principal, db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
-    let v = entry_json_raw(db, e, role).await?;
+    let v = entry_json_raw(db, e, role, false).await?;
     agent_view::view_entry_json_owned(p, v).await
 }
 
-/// [`entry_json`] без маски (исходник для любого зрителя).
-async fn entry_json_raw(db: &Db, e: &Entry, role: Role) -> Result<Value, ApiError> {
+/// [`entry_json`] карточки `GET /entries/{id}`: у общей задачи — ещё строки подзадач
+/// `subtasks.items` и `subtasks.truncated` ([`super::tasks::attach_subtask_items`], M7 §5.4 п. 2).
+pub async fn entry_card_json(
+    p: &Principal,
+    db: &Db,
+    e: &Entry,
+    role: Role,
+) -> Result<Value, ApiError> {
+    let v = entry_json_raw(db, e, role, true).await?;
+    agent_view::view_entry_json_owned(p, v).await
+}
+
+/// [`entry_json`] без маски (исходник для любого зрителя); `items` — со строками подзадач.
+async fn entry_json_raw(db: &Db, e: &Entry, role: Role, items: bool) -> Result<Value, ApiError> {
     let mut v = serde_json::to_value(e).map_err(|e| ApiError::Internal(e.to_string()))?;
     if e.kind == EntryKind::Insight
         && let Value::Object(o) = &mut v
     {
         o.insert("triggers".into(), json!(entry_triggers(db, e.id).await?));
     }
-    let ideas = if e.kind == EntryKind::Task {
-        zam_store::ideas_of_tasks(db, &[e.id], &super::tasks::idea_spaces(role, e.space_id))
-            .await?
-            .remove(&e.id)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    super::tasks::attach_task(&mut v, e, &ideas);
+    if e.kind == EntryKind::Task {
+        let ideas =
+            zam_store::ideas_of_tasks(db, &[e.id], &super::tasks::idea_spaces(role, e.space_id))
+                .await?
+                .remove(&e.id)
+                .unwrap_or_default();
+        let tree = zam_store::task_tree(db, e.space_id).await?;
+        let now = zam_store::time::now();
+        super::tasks::attach_task(&mut v, e, &ideas, &tree, now);
+        if items {
+            super::tasks::attach_subtask_items(&mut v, e.id, &tree, now);
+        }
+    }
     Ok(v)
 }
 
