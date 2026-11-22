@@ -1035,6 +1035,8 @@ async fn cache_put(rest: &Rest, args: &JsonObject) -> Res {
         if let Some(p) = v["promoted"].as_str() {
             s.push_str(&format!(" → {p}"));
         }
+        // предупреждения ответа (`secret_mark_kept` текста выжимки)
+        s.push_str(&warnings_inline(v));
         s
     })
 }
@@ -1567,6 +1569,8 @@ async fn update_entry(rest: &Rest, args: &JsonObject) -> Res {
                     s.push_str(" · ");
                     s.push_str(&idea_outcome(v));
                 }
+                // предупреждения ответа (`secret_mark_kept` текста ответа)
+                s.push_str(&warnings_inline(v));
                 s
             });
         }
