@@ -33,11 +33,16 @@ type Unattributed = &'static [(i64, &'static str, u32, u64)];
 /// Что ещё посеять в базе пользователя тестового сервера ([`start_with`]).
 #[derive(Default, Clone, Copy)]
 struct Seed {
-    /// Субагенты `s-new:a1` (`pre_tool` 2/20, `read` 1/50) и `s-new:a2` (`read` 1/30) — раньше
-    /// обеих сессий: `--last 2` их не берёт.
+    /// Субагенты `s-new:a1` (`pre_tool` 2/20, `read` 1/50) и `s-new:a2` (`read` 1/30), внук
+    /// `s-new:a1:c1` (`read` 1/20) и сессия с самоссылкой `loop` (`parent_id = loop`,
+    /// `session_start` 1/9) — раньше обеих сессий: `--last 2` их не берёт.
     subagents: bool,
-    /// Строки `tokens_unattributed` (сутки UTC от сегодня).
+    /// Строки `tokens_unattributed` (сутки UTC от `today`).
     unattributed: Unattributed,
+    /// «Сегодня» посева (сутки UTC): тест берёт его один раз и сверяет с ним ожидания — переход
+    /// через полночь UTC между посевом и запросом не меняет ожиданий (ревью задачи 9, Minor 7);
+    /// `None` — сегодня в момент посева.
+    today: Option<jiff::civil::Date>,
 }
 
 /// Выдача без сессии: сегодня `mcp` 2/30 и `brief` 1/5, три дня назад `mcp` 1/7 (за 30 суток —
@@ -49,13 +54,16 @@ const UNATTRIBUTED: Unattributed = &[
     (40, "mcp", 4, 100),
 ];
 
-/// Сутки UTC `days` назад.
-fn day_ago(days: i64) -> jiff::civil::Date {
+/// Сегодня, сутки UTC.
+fn utc_today() -> jiff::civil::Date {
     jiff::Timestamp::now()
         .to_zoned(jiff::tz::TimeZone::UTC)
         .date()
-        .checked_sub(jiff::Span::new().days(days))
-        .unwrap()
+}
+
+/// Сутки `days` до `base`.
+fn days_before(base: jiff::civil::Date, days: i64) -> jiff::civil::Date {
+    base.checked_sub(jiff::Span::new().days(days)).unwrap()
 }
 
 /// Сервер в фоновом потоке с учётом двух сессий (`s-old` — holdout, затем `s-new`): адрес и
@@ -88,15 +96,18 @@ fn start_with(name: &str, seed: Seed) -> (String, String) {
                 ..SessionTouch::default()
             };
             if seed.subagents {
-                for (id, counts) in [
+                for (id, parent, counts) in [
                     (
                         "s-new:a1",
+                        "s-new",
                         vec![count("pre_tool", 2, 20, 0), count("read", 1, 50, 0)],
                     ),
-                    ("s-new:a2", vec![count("read", 1, 30, 0)]),
+                    ("s-new:a2", "s-new", vec![count("read", 1, 30, 0)]),
+                    ("s-new:a1:c1", "s-new:a1", vec![count("read", 1, 20, 0)]),
+                    ("loop", "loop", vec![count("session_start", 1, 9, 0)]),
                 ] {
                     let sub = SessionTouch {
-                        parent_id: Some("s-new".into()),
+                        parent_id: Some(parent.into()),
                         agent_type: Some("Explore".into()),
                         ..touch(id)
                     };
@@ -106,8 +117,10 @@ fn start_with(name: &str, seed: Seed) -> (String, String) {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
+            let today = seed.today.unwrap_or_else(utc_today);
             for (ago, event, calls, tokens) in seed.unattributed {
-                zam_store::add_unattributed(&db, day_ago(*ago), event, *calls, *tokens)
+                let day = days_before(today, *ago);
+                zam_store::add_unattributed(&db, day, event, *calls, *tokens)
                     .await
                     .unwrap();
             }
@@ -301,18 +314,21 @@ fn cli_sessions_tokens_old_server() {
 /// (`GET /sessions/unattributed?days=N`): строки «сутки · событие · вызовов · токенов», итог;
 /// `--json` — строки сервера и сумма; `--days` вне 1..=366 — ошибка разбора флага, как `--last`
 /// вне 1..=500; `--days` без `--unattributed` и `--unattributed` вместе с id, `--last`,
-/// `--subagents` — тоже.
+/// `--subagents` — тоже. Сутки посева берутся один раз: окна проверки (2, 7, 30, 366 сут.) дают
+/// те же строки и после полуночи UTC между посевом и запросом.
 #[test]
 fn sessions_tokens_unattributed_table() {
+    let t = utc_today();
     let (url, tok) = start_with(
         "unattributed",
         Seed {
             unattributed: UNATTRIBUTED,
+            today: Some(t),
             ..Seed::default()
         },
     );
     let r = tmp("unattributed-repo");
-    let (t, d3, d40) = (day_ago(0), day_ago(3), day_ago(40));
+    let (d3, d40) = (days_before(t, 3), days_before(t, 40));
     let out = ok(&zam(
         &url,
         &tok,
@@ -341,11 +357,12 @@ fn sessions_tokens_unattributed_table() {
     assert!(all.starts_with("выдано без сессии за 366 сут."), "{all}");
     assert!(all.contains(&format!("\n{d40}\tmcp\t4\t100\n")), "{all}");
     assert!(all.ends_with("\nитого\t\t8\t142\n"), "{all}");
+    // 2 суток: «сегодня» посева — и до полуночи UTC, и после неё
     let today = ok(&zam(
         &url,
         &tok,
         &r,
-        &["sessions", "tokens", "--unattributed", "--days", "1"],
+        &["sessions", "tokens", "--unattributed", "--days", "2"],
         None,
     ));
     assert!(
@@ -466,9 +483,10 @@ fn sessions_tokens_line_when_unattributed() {
     assert!(!out.contains("без сессии"), "{out}");
 }
 
-/// M7 §5.8 п. 2: `--subagents` — к сессии прибавляются её субагенты (`GET /sessions?parent=`),
-/// строка «с субагентами: N»; без флага — только сессия; `--json` — сессия и субагенты в
-/// `items`, их число — `subagents`; вместе с `--last` — ошибка ввода.
+/// M7 §5.8 п. 2: `--subagents` — к сессии прибавляются её субагенты и их субагенты
+/// (`GET /sessions?parent=`), строка «с субагентами: N»; без флага — только сессия; `--json` —
+/// сессия и субагенты в `items`, их число — `subagents`; вместе с `--last` — ошибка ввода. Сессия
+/// с самоссылкой (`parent_id = id`) к себе не прибавляется (ревью задачи 9, Minor 2).
 #[test]
 fn sessions_tokens_subagents_sum() {
     let (url, tok) = start_with(
@@ -489,18 +507,19 @@ fn sessions_tokens_subagents_sum() {
     let mut lines = out.splitn(3, '\n');
     let head = lines.next().unwrap();
     assert!(head.starts_with("сессия s-new · claude · "), "{out}");
-    assert_eq!(lines.next(), Some("с субагентами: 2"), "{out}");
+    // субагенты `a1`, `a2` и внук `a1:c1`
+    assert_eq!(lines.next(), Some("с субагентами: 3"), "{out}");
     assert_eq!(
         lines.next().unwrap(),
         "событие\tвызовов\tтокенов\tуже выдавалось\n\
          session_start\t1\t700\t\n\
          rules\t1\t300\t\n\
          pre_tool\t2\t20\t\n\
-         read\t6\t480\t1\n\
+         read\t7\t500\t1\n\
          mcp\t5\t90\t\n\
          mcp_read\t3\t0\t2\n\
-         итого\t\t1590\t\n\
-         уже выдавалось: read 1 из 6 (17 %); чтения MCP 2 из 3 (67 %)\n",
+         итого\t\t1610\t\n\
+         уже выдавалось: read 1 из 7 (14 %); чтения MCP 2 из 3 (67 %)\n",
         "{out}"
     );
     // сессия агента (`ZAM_SESSION`) — то же
@@ -524,11 +543,24 @@ fn sessions_tokens_subagents_sum() {
         None,
     )))
     .unwrap();
-    assert_eq!(j["subagents"], 2, "{j}");
+    assert_eq!(j["subagents"], 3, "{j}");
     assert_eq!(j["items"][0]["id"], "s-new", "{j}");
-    assert_eq!(j["items"].as_array().unwrap().len(), 3, "{j}");
-    assert_eq!(j["groups"]["all"]["sessions"], 3, "{j}");
-    assert_eq!(j["groups"]["all"]["tokens"]["read"]["calls"], 6, "{j}");
+    assert_eq!(j["items"].as_array().unwrap().len(), 4, "{j}");
+    assert_eq!(j["groups"]["all"]["sessions"], 4, "{j}");
+    assert_eq!(j["groups"]["all"]["tokens"]["read"]["calls"], 7, "{j}");
+    // самоссылка: субагентов нет, своя выдача — один раз
+    let lp = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "loop", "--subagents"],
+        None,
+    ));
+    assert!(lp.contains("\nс субагентами: 0\n"), "{lp}");
+    assert!(
+        lp.contains("\nsession_start\t1\t9\t\nитого\t\t9\t\n"),
+        "{lp}"
+    );
     // `--last 2` субагентов не берёт (они раньше обеих сессий); `--subagents` с ним — ошибка
     let last = ok(&zam(
         &url,
@@ -599,5 +631,50 @@ fn sessions_tokens_old_server_no_line() {
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(err.contains("обновите zam-server"), "{args:?}: {err}");
         assert!(o.stdout.is_empty(), "{args:?}: {o:?}");
+    }
+}
+
+/// Ревью задачи 9, Minor 6: субагентов в пределе `GET /sessions` (ровно 500) — сумма может быть
+/// неполной: строка-предупреждение в stderr, вывод и код прежние; 499 — без предупреждения.
+#[test]
+fn sessions_tokens_subagents_limit_warned() {
+    for (n, warned) in [(500usize, true), (499, false)] {
+        let (url, _) = common::stub_body(std::sync::Arc::new(
+            move |_: &str, p: &str, _: usize, _: &Value| {
+                let now = std::time::Duration::ZERO;
+                if p.starts_with("/api/v1/sessions?") {
+                    let items: Vec<Value> = (0..n)
+                        .map(|i| {
+                            serde_json::json!({"id": format!("s-big:a{i}"), "parent_id": "s-big",
+                                               "tokens": {"read": {"calls": 1, "tokens": 1}}})
+                        })
+                        .collect();
+                    return (200, serde_json::json!({ "items": items }).to_string(), now);
+                }
+                if p == "/api/v1/sessions/s-big" {
+                    let s = r#"{"id":"s-big","agent":"claude","started_at":"2026-11-01T00:00:00Z",
+                                "last_seen_at":"2026-11-01T00:00:00Z",
+                                "tokens":{"read":{"calls":1,"tokens":10}}}"#;
+                    return (200, s.to_string(), now);
+                }
+                (404, r#"{"status":404}"#.to_string(), now)
+            },
+        ));
+        let r = tmp(&format!("limit-{n}-repo"));
+        let o = zam(
+            &url,
+            "t",
+            &r,
+            &["sessions", "tokens", "s-big", "--subagents"],
+            None,
+        );
+        let out = ok(&o);
+        assert!(out.contains(&format!("\nс субагентами: {n}\n")), "{out}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(
+            err.contains("субагентов не меньше 500"),
+            warned,
+            "{n}: {err}"
+        );
     }
 }

@@ -10,13 +10,17 @@
   //
   // M7.2 (§5.8 п. 3): сессии субагентов (`parent_id`) — под сессией-родителем, свёрнуты
   // («субагенты: N»), у родителя — строка «с субагентами» (его выдача и выдача субагентов);
-  // раскрытие дочитывает полный список `GET /sessions?parent=`. Блок «Без сессии» — выдача MCP без
+  // группировка — `lib/sessionTree.ts` (внук — под тем же корнем, самоссылка и цикл — наверху).
+  // Раскрытие и открытие карточки дочитывают потомков `GET /sessions?parent=`; до этого у сессии
+  // на краю окна списка числа — «≥ N». Сессия из адреса вне окна — `GET /sessions/{id}`, нет её —
+  // сообщение в карточке. Блок «Без сессии» — выдача MCP без
   // привязки к сессии агента (`GET /sessions/unattributed`) за 7 / 30 / 90 сут. по событиям, по
   // суткам — раскрытием. Раскладка — `JournalSplit` (§5.1 п. 5): в узкой области карточка сессии
   // вместо списка, в широкой — рядом; таблицы — в `.table-wrap`.
   import {
     ApiError,
     errorText,
+    getSession,
     isAdminSession,
     listSessions,
     sessionSnapshot,
@@ -30,6 +34,7 @@
   } from '../lib/api';
   import { untrack } from 'svelte';
   import { go, href } from '../lib/router';
+  import { descendantsOf, groupSessions, maybePartial } from '../lib/sessionTree';
   import { localTime } from '../lib/time';
   import JournalSplit from './JournalSplit.svelte';
 
@@ -71,10 +76,16 @@
   let items = $state<SessionItem[]>([]);
   let loaded = $state(false);
   let error = $state('');
-  /** Субагенты, дочитанные при раскрытии (`?parent=`): родитель → полный список. */
+  /** Потомки сессии, дочитанные при раскрытии и открытии карточки (`?parent=`): сессия → список. */
   let fetched = $state<Record<string, SessionItem[]>>({});
   /** Раскрытые группы субагентов. */
   let expanded = $state<Record<string, boolean>>({});
+  /** Сессии из адреса вне окна списка, дочитанные по id (`GET /sessions/{id}`). */
+  let outside = $state<Record<string, SessionItem>>({});
+  /** Сессия из адреса, которой нет у пользователя (404). */
+  let missing = $state<string | null>(null);
+  /** Идущие запросы потомков и сессий по id (повторно не шлются). */
+  const pending = new Set<string>();
 
   type Row = { event: string; calls: number; tokens: number; reread: number };
 
@@ -113,6 +124,9 @@
     error = '';
     fetched = {};
     expanded = {};
+    outside = {};
+    missing = null;
+    pending.clear();
     try {
       const r = await listSessions({ limit: LIMIT }, admin ? who : undefined);
       if (n !== seq) return;
@@ -139,12 +153,10 @@
   /** Строка сессии: открыть её карточку или закрыть открытую (адрес — `#/sessions/<id>`). */
   const select = (id: string) => go({ name: 'sessions', session: session === id ? null : id });
 
-  /** Раскрыть или свернуть субагентов сессии `id`; первое раскрытие дочитывает их полный список
-   * (в списке страницы могут быть не все). */
-  async function toggle(id: string) {
-    const on = !expanded[id];
-    expanded = { ...expanded, [id]: on };
-    if (!on || fetched[id]) return;
+  /** Потомки сессии `id` с сервера (`?parent=`: субагенты и их субагенты) — один раз на сессию. */
+  async function fetchSubs(id: string) {
+    if (fetched[id] || pending.has(`p:${id}`)) return;
+    pending.add(`p:${id}`);
     const n = seq;
     try {
       const r = await listSessions({ parent: id, limit: SUBAGENTS_LIMIT }, admin ? who : undefined);
@@ -153,38 +165,58 @@
       if (n !== seq) return;
       if (e instanceof ApiError && e.status === 401) return onexpired();
       error = errorText(e);
+    } finally {
+      if (n === seq) pending.delete(`p:${id}`);
     }
   }
 
-  /** Все известные сессии по id: список страницы и дочитанные субагенты. */
+  /** Раскрыть или свернуть субагентов сессии `id`; первое раскрытие дочитывает их полный список
+   * (в окне списка могут быть не все). */
+  function toggle(id: string) {
+    const on = !expanded[id];
+    expanded = { ...expanded, [id]: on };
+    if (on) void fetchSubs(id);
+  }
+
+  /** Сессия из адреса вне окна списка — по id; нет у пользователя (404) — сообщение в карточке. */
+  async function fetchOne(id: string) {
+    if (pending.has(`s:${id}`)) return;
+    pending.add(`s:${id}`);
+    const n = seq;
+    try {
+      const s = await getSession(id, admin ? who : undefined);
+      if (n === seq) outside = { ...outside, [id]: s };
+    } catch (e) {
+      if (n !== seq) return;
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      if (e instanceof ApiError && e.status === 404) missing = id;
+      else error = errorText(e);
+    } finally {
+      if (n === seq) pending.delete(`s:${id}`);
+    }
+  }
+
+  /** Все известные сессии по id: окно списка, дочитанные потомки и сессии из адреса. */
   let byId = $derived.by(() => {
     const m = new Map<string, SessionItem>();
     for (const s of items) m.set(s.id, s);
     for (const list of Object.values(fetched)) for (const s of list) if (!m.has(s.id)) m.set(s.id, s);
+    for (const s of Object.values(outside)) if (!m.has(s.id)) m.set(s.id, s);
     return m;
   });
-  /** Субагенты по родителю из списка; дочитанные при раскрытии — вместо них. */
-  let children = $derived.by(() => {
-    const ids = new Set(items.map((s) => s.id));
-    const m = new Map<string, SessionItem[]>();
-    for (const s of items) {
-      if (s.parent_id && ids.has(s.parent_id)) m.set(s.parent_id, [...(m.get(s.parent_id) ?? []), s]);
-    }
-    for (const [p, list] of Object.entries(fetched)) if (ids.has(p) && list.length) m.set(p, list);
-    return m;
-  });
-  /** Строки верхнего уровня: сессии без родителя и субагенты, чей родитель не в списке. */
-  let top = $derived.by(() => {
-    const ids = new Set(items.map((s) => s.id));
-    return items.filter((s) => !s.parent_id || !ids.has(s.parent_id));
-  });
-  const subsOf = (id: string) => children.get(id) ?? [];
+  /** Верхний уровень и потомки под корнем (внук — под тем же корнем; самоссылка и цикл — наверху). */
+  let groups = $derived(groupSessions(items, fetched));
+  const subsOf = (id: string) => descendantsOf(id, groups, fetched);
   const withSubs = (s: SessionItem) => subsOf(s.id).reduce((n, c) => n + own(c), own(s));
+  /** Число потомков может быть неполным: край окна списка или предел ответа (`≥`). */
+  const partial = (s: SessionItem) => maybePartial(s, items, LIMIT, fetched[s.id], SUBAGENTS_LIMIT);
+  const atLeast = (s: SessionItem) => (partial(s) ? '≥ ' : '');
 
   // ---- выдача без сессии ----
 
   let days = $state<number>(30);
-  let un = $state<UnattributedRow[] | null>(null);
+  /** Ответ сервера — вместе с периодом и пользователем, за который он получен. */
+  let un = $state<{ days: number; user: string | undefined; items: UnattributedRow[] } | null>(null);
   let unError = $state('');
   let unSeq = 0;
   async function loadUnattributed(d: number, user: string | undefined) {
@@ -192,11 +224,10 @@
     unError = '';
     try {
       const r = await unattributed(d, user);
-      if (n === unSeq) un = r.items;
+      if (n === unSeq) un = { days: d, user, items: r.items };
     } catch (e) {
       if (n !== unSeq) return;
       if (e instanceof ApiError && e.status === 401) return onexpired();
-      un = null;
       unError = errorText(e);
     }
   }
@@ -207,10 +238,14 @@
     untrack(() => void loadUnattributed(d, user));
   });
 
+  /** Строки выбранного периода; до ответа на новый период (или пользователя) — `null`: прежние
+   * строки под новой подписью не показываются (ревью задачи 9, Minor 3). */
+  let unItems = $derived(un && un.days === days && un.user === (admin ? who : undefined) ? un.items : null);
+
   /** Выдача без сессии по событиям за период. */
   let unEvents = $derived.by(() => {
     const m = new Map<string, { event: string; calls: number; tokens: number }>();
-    for (const r of un ?? []) {
+    for (const r of unItems ?? []) {
       const x = m.get(r.event) ?? { event: r.event, calls: 0, tokens: 0 };
       x.calls += r.calls;
       x.tokens += r.tokens;
@@ -248,6 +283,8 @@
     } catch (e) {
       if (n !== snapSeq) return;
       if (e instanceof ApiError && e.status === 401) return onexpired();
+      // снимка нет (сессия из адреса без `snapshot_at` или снимок ушёл по сроку) — блока нет
+      if (e instanceof ApiError && e.status === 404) return;
       snapError = errorText(e);
     }
   }
@@ -264,9 +301,27 @@
   let opened = $derived(session ? (byId.get(session) ?? null) : null);
   let openRows = $derived(opened ? rows([opened]) : []);
   let openSubs = $derived(opened ? subsOf(opened.id) : []);
-  let snapId = $derived(opened?.snapshot_at ? opened.id : null);
+  // у сессии из адреса вне окна `snapshot_at` нет (`GET /sessions/{id}` его не отдаёт): снимок
+  // пробуется, 404 — блока нет
+  let snapId = $derived(opened && (opened.snapshot_at || outside[opened.id]) ? opened.id : null);
   let snapAt = $derived(opened?.snapshot_at ?? null);
-  let subCount = $derived(items.filter((s) => s.parent_id).length);
+  let subCount = $derived(items.filter((s) => s.parent_id && s.parent_id !== s.id).length);
+  /** Адрес указывает на сессию, которой у пользователя нет. */
+  let gone = $derived(session !== null && missing === session);
+
+  // Открытая карточка — точные потомки сессии (ревью задачи 9, Minor 1): окно списка могло их
+  // не вместить.
+  $effect(() => {
+    const id = opened?.id;
+    if (id) untrack(() => void fetchSubs(id));
+  });
+
+  // Сессия из адреса вне окна списка — по id (ревью задачи 9, Minor 4).
+  $effect(() => {
+    const id = session;
+    if (!id || !loaded || byId.has(id)) return;
+    untrack(() => void fetchOne(id));
+  });
 </script>
 
 {#snippet table(rs: Row[], label: string)}
@@ -299,7 +354,7 @@
   <tr data-session={s.id} data-entry={s.id} class:sel={session === s.id} class:sub>
     <td>
       <button type="button" class="link" onclick={() => select(s.id)}>{s.id}</button>
-      {#if s.parent_id}<span class="tag" title="родитель {s.parent_id}">субагент{s.agent_type ? ` ${s.agent_type}` : ''}</span>{/if}
+      {#if s.parent_id && s.parent_id !== s.id}<span class="tag" title="родитель {s.parent_id}">субагент{s.agent_type ? ` ${s.agent_type}` : ''}</span>{/if}
       {#if s.holdout}<span class="tag" title="контрольная группа A/B">holdout</span>{/if}
       {#if s.ended_at}<span class="tag">завершена</span>{/if}
       {#if s.snapshot_at}<span class="tag" title="снимок {localTime(s.snapshot_at)}">снимок</span>{/if}
@@ -319,17 +374,24 @@
       <table aria-label="Список сессий">
         <thead><tr><th>Сессия</th><th>Агент</th><th>Начало</th><th>Последнее обращение</th><th class="n">Токенов</th></tr></thead>
         <tbody>
-          {#each top as s (s.id)}
+          {#each groups.top as s (s.id)}
             {@const subs = subsOf(s.id)}
+            {@const more = atLeast(s)}
             {@render sessionRow(s, false)}
             {#if subs.length}
               <tr class="subs" data-subagents-of={s.id}>
                 <td colspan="4">
-                  <button type="button" class="link toggle" aria-expanded={!!expanded[s.id]} onclick={() => toggle(s.id)}>
-                    <span aria-hidden="true">{expanded[s.id] ? '▾' : '▸'}</span> субагенты: {subs.length}
+                  <button
+                    type="button"
+                    class="link toggle"
+                    aria-expanded={!!expanded[s.id]}
+                    title={more ? 'не все субагенты в окне списка: раскройте — полный список с сервера' : undefined}
+                    onclick={() => toggle(s.id)}
+                  >
+                    <span aria-hidden="true">{expanded[s.id] ? '▾' : '▸'}</span> субагенты: {more}{subs.length}
                   </button>
                 </td>
-                <td class="n" data-with-subagents>с субагентами: {num(withSubs(s))}</td>
+                <td class="n" data-with-subagents>с субагентами: {more}{num(withSubs(s))}</td>
               </tr>
               {#if expanded[s.id]}
                 {#each subs as c (c.id)}{@render sessionRow(c, true)}{/each}
@@ -359,11 +421,11 @@
       — на странице <a href={href({ name: 'agentsetup' })}>подключения агента</a>).
     </p>
     {#if unError}<p class="error" role="alert">{unError}</p>{/if}
-    {#if un === null && !unError}
-      <p class="muted">Загрузка…</p>
-    {:else if un && !un.length}
+    {#if unItems === null && !unError}
+      <p class="muted" data-unattributed-loading>Загрузка…</p>
+    {:else if unItems && !unItems.length}
       <p class="muted" data-unattributed-empty>За {days} сут. выдачи без сессии нет.</p>
-    {:else if un}
+    {:else if unItems}
       <div class="table-wrap">
         <table aria-label="Без сессии по событиям">
           <thead><tr><th>Событие</th><th class="n">Вызовов</th><th class="n">Токенов</th></tr></thead>
@@ -385,7 +447,7 @@
           <table aria-label="Без сессии по суткам">
             <thead><tr><th>Сутки (UTC)</th><th>Событие</th><th class="n">Вызовов</th><th class="n">Токенов</th></tr></thead>
             <tbody>
-              {#each un as r (`${r.day}/${r.event}`)}
+              {#each unItems as r (`${r.day}/${r.event}`)}
                 <tr data-day={r.day} data-event={r.event}>
                   <td>{r.day}</td>
                   <td><code>{r.event}</code></td>
@@ -402,14 +464,21 @@
 {/snippet}
 
 {#snippet card()}
-  {#if opened}
+  {#if gone}
+    <section class="detail card" aria-label="Сессия {session}">
+      <h3>Сессия <code>{session}</code></h3>
+      <p class="muted" data-session-missing>
+        Такой сессии нет у пользователя: сессии хранятся 30 суток после последнего обращения.
+      </p>
+    </section>
+  {:else if opened}
     <section class="detail card" aria-label="Сессия {opened.id}">
       <h3>Сессия <code>{opened.id}</code></h3>
       <p class="muted small">
         {opened.agent ?? 'агент неизвестен'}{opened.machine ? ` · машина ${opened.machine}` : ''} · записей в память
         {opened.memory_writes} · эпоха {opened.seen_epoch}
       </p>
-      {#if opened.parent_id}
+      {#if opened.parent_id && opened.parent_id !== opened.id}
         <p class="small">
           Субагент{opened.agent_type ? ` ${opened.agent_type}` : ''} сессии
           <a href={href({ name: 'sessions', session: opened.parent_id })}><code>{opened.parent_id}</code></a>
@@ -417,7 +486,7 @@
       {/if}
       {#if openSubs.length}
         <p class="small" data-card-subagents>
-          Субагенты: {openSubs.length} · с субагентами — {num(withSubs(opened))} токенов
+          Субагенты: {atLeast(opened)}{openSubs.length} · с субагентами — {atLeast(opened)}{num(withSubs(opened))} токенов
         </p>
       {/if}
       {@render table(openRows, 'Выданное сессии')}
@@ -473,9 +542,9 @@
 
   <!-- список и карточка — рядом в широкой области, карточка вместо списка в узкой (§5.1 п. 5) -->
   <JournalSplit
-    open={opened !== null}
+    open={opened !== null || gone}
     back={{ href: href({ name: 'sessions', session: null }), label: 'Сессии' }}
-    entry={opened?.id ?? null}
+    entry={opened?.id ?? (gone ? session : null)}
   >
     {#snippet list()}
       {@render sessionList()}

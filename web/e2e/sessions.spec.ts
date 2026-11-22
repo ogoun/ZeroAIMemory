@@ -212,23 +212,59 @@ test('sessions_unattributed_and_subagents_folded', async ({ page, playwright }) 
   await expect.poll(async () => (await unattributedOf(rc, 7, 'mcp')).calls, { timeout: 10_000 }).toBe(before.calls + 1);
   const mcp = await unattributedOf(rc, 7, 'mcp');
   expect(mcp.tokens).toBeGreaterThan(before.tokens);
+  const mcp30 = await unattributedOf(rc, 30, 'mcp');
+
+  // 30 суток — к ответу сервера строка двадцатидневной давности (в e2e вся выдача без сессии
+  // свежая: иначе числа за 7 и 30 суток совпали бы); ответ на 7 суток ждёт сигнала — пока его нет,
+  // прежние строки под новой подписью не показываются (ревью задачи 9, Minor 3)
+  const old = new Date(Date.now() - 20 * 86_400_000).toISOString().slice(0, 10);
+  const isUn = (u: URL, d: string) =>
+    u.pathname.endsWith('/api/v1/sessions/unattributed') && u.searchParams.get('days') === d;
+  await page.route(
+    (u) => isUn(u, '30'),
+    async (route) => {
+      const r = await route.fetch();
+      const j = (await r.json()) as Unattributed;
+      j.items.push({ day: old, event: 'mcp', calls: 4, tokens: 100 });
+      await route.fulfill({ response: r, json: j });
+    },
+  );
+  let release7: () => void = () => {};
+  const gate7 = new Promise<void>((res) => (release7 = res));
+  await page.route(
+    (u) => isUn(u, '7'),
+    async (route) => {
+      await gate7;
+      await route.continue();
+    },
+  );
 
   await page.goto(base());
   await page.getByRole('link', { name: 'Сессии' }).click();
   await expect(page).toHaveURL(/#\/sessions$/);
 
-  // без сессии: 7 суток — те же числа, что у сервера; по суткам — раскрытием
+  // без сессии: по умолчанию 30 суток, затем 7 — у каждого периода свои числа; по суткам —
+  // раскрытием
   const block = page.getByRole('region', { name: 'Без сессии' });
   await expect(block).toContainText('без привязки к сессии агента');
   await expect(block.getByRole('link', { name: 'подключения агента' })).toHaveAttribute('href', '#/agent-setup');
   await expect(block).toContainText('zam mcp');
+  const table = block.getByRole('table', { name: 'Без сессии по событиям' });
+  const ev = table.locator('tr[data-event="mcp"] td');
+  await expect(block.getByRole('button', { name: '30 сут.' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(ev.nth(1)).toHaveText(num(mcp30.calls + 4));
+  await expect(ev.nth(2)).toHaveText(num(mcp30.tokens + 100));
   const d7 = block.getByRole('button', { name: '7 сут.' });
   await d7.click();
   await expect(d7).toHaveAttribute('aria-pressed', 'true');
   await expect(block.getByRole('button', { name: '30 сут.' })).toHaveAttribute('aria-pressed', 'false');
-  const ev = block.getByRole('table', { name: 'Без сессии по событиям' }).locator('tr[data-event="mcp"] td');
+  await expect(block.locator('[data-unattributed-loading]')).toBeVisible();
+  await expect(table).toHaveCount(0);
+  release7();
   await expect(ev.nth(1)).toHaveText(num(mcp.calls));
   await expect(ev.nth(2)).toHaveText(num(mcp.tokens));
+  expect(mcp.calls).not.toBe(mcp30.calls + 4);
+  await expect(table.locator('tfoot')).toContainText('Итого за 7 сут.');
   const byDay = block.getByRole('table', { name: 'Без сессии по суткам' });
   await expect(byDay).toBeHidden();
   await block.getByText('По суткам').click();
@@ -264,8 +300,34 @@ test('sessions_unattributed_and_subagents_folded', async ({ page, playwright }) 
   await sub.getByRole('link', { name: parent }).click();
   const card = page.getByRole('region', { name: `Сессия ${parent}` });
   await expect(card.locator('[data-card-subagents]')).toHaveText(`Субагенты: 3 · с субагентами — ${num(sums.all)} токенов`);
+
+  // сессия из адреса вне окна списка (ревью задачи 9, Minor 4): список без неё и её субагентов —
+  // как при 200 более свежих сессиях; карточка — по id, потомки — по `?parent=`
+  await page.route(
+    (u) => u.pathname.endsWith('/api/v1/sessions') && !u.searchParams.has('parent'),
+    async (route) => {
+      const r = await route.fetch();
+      const j = (await r.json()) as { items: { id: string }[] };
+      await route.fulfill({ response: r, json: { items: j.items.filter((x) => !x.id.startsWith(parent)) } });
+    },
+  );
+  await page.reload();
+  await expect(card).toBeVisible();
+  await expect(list.locator(`tr[data-session="${parent}"]`)).toHaveCount(0);
+  await expect(card.locator('[data-card-subagents]')).toHaveText(`Субагенты: 3 · с субагентами — ${num(sums.all)} токенов`);
+  await expect(card.getByRole('table', { name: 'Выданное сессии' }).locator('tfoot')).toContainText(num(sums.own));
+  // сессии нет у пользователя — сообщение, а не молча список
+  const none = 'e2e-no-such-session-9';
+  await page.goto(`${base()}#/sessions/${none}`);
+  await expect(page.getByRole('region', { name: `Сессия ${none}` }).locator('[data-session-missing]')).toContainText(
+    'Такой сессии нет',
+  );
   await rc.dispose();
-  expect(problems, problems.join('\n')).toEqual([]);
+  // ожидаемые 404: сессия, которой нет, и снимок сессии вне окна (у неё `snapshot_at` неизвестен)
+  const expected = (p: string) =>
+    p === `HTTP 404 GET /api/v1/sessions/${none}` || p === `HTTP 404 GET /api/v1/sessions/${parent}/snapshot`;
+  const rest = problems.filter((p) => !expected(p));
+  expect(rest, rest.join('\n')).toEqual([]);
 });
 
 // §5.1 на телефоне: таблицы — в `.table-wrap` (страница вбок не прокручивается), карточка сессии —

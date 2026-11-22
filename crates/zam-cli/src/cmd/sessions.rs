@@ -28,7 +28,7 @@ use crate::client::{CliError, read_json};
 /// суток.
 pub const UNATTRIBUTED_DAYS: u32 = 30;
 /// Предел субагентов сессии в `--subagents` (предел `GET /sessions`).
-const SUBAGENTS_MAX: &str = "500";
+const SUBAGENTS_MAX: usize = 500;
 
 /// Порядок строк таблицы: события сервера, затем хуков с локальным выводом; прочие — по имени.
 const ORDER: [&str; 13] = [
@@ -183,14 +183,17 @@ fn fetch(ctx: &Ctx, pick: &Pick) -> Result<Vec<Value>, CliError> {
     }
 }
 
-/// Сессии субагентов сессии `id` с `tokens` (`GET /sessions?parent=`, M7 §5.8 п. 1). Сервер без
-/// параметра отвечает 400 (`ListQuery` разбирается строго) — код 1 с подсказкой обновить сервер.
+/// Сессии субагентов сессии `id` и их субагентов с `tokens` (`GET /sessions?parent=`, M7 §5.8
+/// п. 1). Сервер без параметра отвечает 400 (`ListQuery` разбирается строго) — код 1 с подсказкой
+/// обновить сервер. Сама сессия (самоссылка `parent_id = id`) и повторы id не прибавляются; список
+/// в пределе сервера (500) — предупреждение в stderr: сумма может быть неполной.
 fn fetch_subagents(ctx: &Ctx, id: &str) -> Result<Vec<Value>, CliError> {
+    let limit = SUBAGENTS_MAX.to_string();
     let v = ctx
         .client
         .get(
             "/sessions",
-            &[("parent", id), ("tokens", "true"), ("limit", SUBAGENTS_MAX)],
+            &[("parent", id), ("tokens", "true"), ("limit", limit.as_str())],
         )
         .and_then(read_json)
         .map_err(|e| {
@@ -202,7 +205,26 @@ fn fetch_subagents(ctx: &Ctx, id: &str) -> Result<Vec<Value>, CliError> {
                 "сервер не поддерживает субагентов сессии (GET /sessions?parent=): обновите zam-server",
             )
         })?;
-    Ok(v["items"].as_array().cloned().unwrap_or_default())
+    let items = v["items"].as_array().cloned().unwrap_or_default();
+    if items.len() >= SUBAGENTS_MAX {
+        eprintln!(
+            "внимание: у сессии {id} субагентов не меньше {SUBAGENTS_MAX} (предел GET /sessions) — \
+             сумма с субагентами может быть неполной"
+        );
+    }
+    Ok(own_subagents(id, items))
+}
+
+/// Субагенты сессии `id` без неё самой и без повторов id (первая строка из повторов).
+fn own_subagents(id: &str, items: Vec<Value>) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|s| {
+            let sid = s["id"].as_str().unwrap_or_default();
+            sid != id && seen.insert(sid.to_string())
+        })
+        .collect()
 }
 
 /// Строки выдачи без сессии за `days` суток (`GET /sessions/unattributed?days=N`, M6 §7.1).
@@ -387,6 +409,22 @@ mod tests {
              итого\t\t1725\t\n\
              уже выдавалось: read 1 из 4 (25 %); чтения MCP 2 из 3 (67 %)\n"
         );
+    }
+
+    /// Самоссылка и повтор id не прибавляются (ревью задачи 9 M7.2, Minor 2).
+    #[test]
+    fn own_subagents_skip_self_and_repeats() {
+        let got = own_subagents(
+            "s",
+            vec![
+                json!({"id": "s", "parent_id": "s"}),
+                json!({"id": "s:a1", "parent_id": "s"}),
+                json!({"id": "s:a1:c1", "parent_id": "s:a1"}),
+                json!({"id": "s:a1", "parent_id": "s"}),
+            ],
+        );
+        let ids: Vec<&str> = got.iter().filter_map(|s| s["id"].as_str()).collect();
+        assert_eq!(ids, ["s:a1", "s:a1:c1"]);
     }
 
     #[test]

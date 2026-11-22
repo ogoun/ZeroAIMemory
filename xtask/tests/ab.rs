@@ -79,27 +79,48 @@ impl Server {
                 Some(f) => (200, json!({"status": "ok", "features": f}).to_string()),
                 None => (404, r#"{"status":404}"#.to_string()),
             },
-            "/api/v1/sessions" => match param("parent") {
-                Some(parent) if self.has("sessions_parent") => items(
-                    self.subagents
-                        .iter()
-                        .filter(|s| s["parent_id"] == parent.as_str())
-                        .cloned()
-                        .collect(),
-                ),
-                // сервер без `parent`: `ListQuery` с `deny_unknown_fields`
-                Some(_) => (
-                    400,
-                    r#"{"status":400,"detail":"unknown field `parent`"}"#.into(),
-                ),
-                None => items(
-                    self.sessions
-                        .values()
-                        .chain(&self.subagents)
-                        .cloned()
-                        .collect(),
-                ),
-            },
+            "/api/v1/sessions" => {
+                let limit: usize = param("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
+                match param("parent") {
+                    // как сервер: потомки по `parent_id` (субагенты и их субагенты), без самой
+                    // сессии, в пределе `limit`
+                    Some(parent) if self.has("sessions_parent") => {
+                        let mut out: Vec<Value> = Vec::new();
+                        let mut seen = vec![parent.clone()];
+                        let mut frontier = vec![parent];
+                        while let Some(p) = frontier.pop() {
+                            for s in self
+                                .subagents
+                                .iter()
+                                .filter(|s| s["parent_id"] == p.as_str())
+                            {
+                                let id = s["id"].as_str().unwrap().to_string();
+                                if !seen.contains(&id) {
+                                    seen.push(id.clone());
+                                    frontier.push(id);
+                                    out.push(s.clone());
+                                }
+                            }
+                        }
+                        out.truncate(limit);
+                        items(out)
+                    }
+                    // сервер без `parent`: `ListQuery` с `deny_unknown_fields`
+                    Some(_) => (
+                        400,
+                        r#"{"status":400,"detail":"unknown field `parent`"}"#.into(),
+                    ),
+                    // список — в пределе `limit` (субагенты — первыми: они свежее)
+                    None => items(
+                        self.subagents
+                            .iter()
+                            .chain(self.sessions.values())
+                            .take(limit)
+                            .cloned()
+                            .collect(),
+                    ),
+                }
+            }
             "/api/v1/sessions/unattributed" => match &self.unattributed {
                 Some(v) => items(v.clone()),
                 None => (404, r#"{"status":404,"detail":"нет"}"#.to_string()),
@@ -536,9 +557,10 @@ fn run_ab(d: &Path, url: Option<&str>, extra: &[&str]) -> (Output, Value) {
 
 /// M7 §5.8 п. 4, решение координатора 27: память прогона — сессия и её субагенты
 /// (`GET /sessions?parent=`): `memory` — сумма, `memory_session` — только сессия (как в отчётах
-/// 0.0.14), `subagents` — их число; субагенты чужой сессии не входят. Сервер без признака
-/// `sessions_parent` — один обход `GET /sessions?limit=500&tokens=true` по `parent_id` и
-/// предупреждение; `/health` не ответил — пробный `?parent=`, на 400 — тот же обход.
+/// 0.0.14), `subagents` — их число; субагенты чужой сессии не входят, внук — входит, самоссылка
+/// (`parent_id` сессии — она сама) сессию к себе не прибавляет (ревью задачи 9, Minor 2). Сервер
+/// без признака `sessions_parent` — один обход `GET /sessions?limit=500&tokens=true` по
+/// `parent_id` и предупреждение; `/health` не ответил — пробный `?parent=`, на 400 — тот же обход.
 #[test]
 fn ab_memory_includes_subagents() {
     let d = tmp("subagents");
@@ -546,7 +568,7 @@ fn ab_memory_includes_subagents() {
     let mut sessions = BTreeMap::new();
     sessions.insert(
         "s-m".to_string(),
-        json!({"id": "s-m", "holdout": false,
+        json!({"id": "s-m", "parent_id": "s-m", "holdout": false,
                "tokens": {"session_start": {"calls": 1, "tokens": 100}}}),
     );
     let subagents = vec![
@@ -554,6 +576,9 @@ fn ab_memory_includes_subagents() {
                "tokens": {"subagent_local": {"calls": 1, "tokens": 40}}}),
         json!({"id": "s-m:a2", "parent_id": "s-m", "agent_type": "Plan",
                "tokens": {"mcp": {"calls": 2, "tokens": 10}, "pre_tool": {"calls": 1, "tokens": 5}}}),
+        // внук: субагент субагента
+        json!({"id": "s-m:a1:c1", "parent_id": "s-m:a1",
+               "tokens": {"subagent_local": {"calls": 1, "tokens": 20}}}),
         // субагент сессии вне прогонов
         json!({"id": "s-x:a9", "parent_id": "s-x", "tokens": {"mcp": {"calls": 1, "tokens": 999}}}),
     ];
@@ -561,13 +586,13 @@ fn ab_memory_includes_subagents() {
         let runs = j["run"].as_array().unwrap();
         let run = |s: &str| runs.iter().find(|r| r["session"] == s).unwrap().clone();
         let m = run("s-m");
-        assert_eq!(m["memory"], 155, "{what}: {m}");
+        assert_eq!(m["memory"], 175, "{what}: {m}");
         assert_eq!(m["memory_session"], 100, "{what}: {m}");
-        assert_eq!(m["subagents"], 2, "{what}: {m}");
+        assert_eq!(m["subagents"], 3, "{what}: {m}");
         let o = run("s-o");
         assert_eq!((&o["memory"], &o["memory_session"]), (&json!(0), &json!(0)));
         let arm = &j["arms"]["memory"];
-        assert_eq!(arm["sum"]["memory"], 155, "{what}: {arm}");
+        assert_eq!(arm["sum"]["memory"], 175, "{what}: {arm}");
         assert_eq!(arm["sum"]["memory_session"], 100, "{what}: {arm}");
     };
     let paths = |seen: &Seen| -> Vec<String> {
@@ -656,6 +681,56 @@ fn ab_memory_includes_subagents() {
             .is_some_and(|w| w.contains("GET /sessions/unattributed"))),
         "{j}"
     );
+}
+
+/// Ревью задачи 9, Minor 6: субагентов сессии в пределе списка сервера (ровно 500) — память
+/// прогона может быть неполной: предупреждение и с признаком (`?parent=`), и у старого сервера
+/// (обход списка); 499 — без предупреждения.
+#[test]
+fn ab_subagents_limit_warned() {
+    let d = tmp("subagents-limit");
+    two_runs(&d);
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        "s-m".to_string(),
+        json!({"id": "s-m", "holdout": false, "tokens": {}}),
+    );
+    let subs = |n: usize| -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                json!({"id": format!("s-m:a{i}"), "parent_id": "s-m",
+                       "tokens": {"subagent_local": {"calls": 1, "tokens": 1}}})
+            })
+            .collect()
+    };
+    let limit_warning = |j: &Value| {
+        j["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|w| w.contains("s-m") && w.contains("не меньше 500"))
+    };
+    for (n, features, warned) in [
+        (500, vec!["m6", "unattributed", "sessions_parent"], true),
+        (500, vec!["m6", "unattributed"], true),
+        (499, vec!["m6", "unattributed", "sessions_parent"], false),
+    ] {
+        let (url, _) = stub_server(Server {
+            subagents: subs(n),
+            features: Some(features.clone()),
+            ..Server::current(sessions.clone())
+        });
+        let (_, j) = run_ab(&d, Some(&url), &[]);
+        let m = j["run"].as_array().unwrap()[0].clone();
+        assert_eq!(m["subagents"], n, "{features:?}: {m}");
+        assert_eq!(
+            limit_warning(&j),
+            warned,
+            "{n} {features:?}: {}",
+            j["warnings"]
+        );
+    }
 }
 
 /// M7 §5.8 п. 4: `--unattributed-days N` (30) — раздел «Выдано без сессии за N сут.» вне плеч

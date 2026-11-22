@@ -52,8 +52,9 @@
 //!   tokens --last N`, страница сессий WebUI); у сессии со снимком (M6 §8а) — `snapshot_at`
 //!   (момент снимка; сам снимок — `GET /sessions/{id}/snapshot`, [`super::snapshot`]);
 //!   `parent=<id>` (M7 §5.8 п. 1, признак `sessions_parent`) — только сессии субагентов сессии
-//!   `<id>` (`parent_id`): `zam sessions tokens --subagents`, `cargo xtask ab`; некорректный
-//!   id — 400, сессий нет — пустой `items`;
+//!   `<id>` и их субагентов (потомки по `parent_id`, без самой сессии — самоссылка и цикл её не
+//!   добавляют): `zam sessions tokens --subagents`, `cargo xtask ab`, WebUI; некорректный id —
+//!   400, сессий нет — пустой `items`;
 //! - `GET /sessions/unattributed?days=N` → `{items: [{day, event, calls, tokens}]}` — выданное
 //!   без явной сессии по суткам UTC (M6 §7.1, [`unattributed`]).
 //!
@@ -454,8 +455,8 @@ pub struct ListQuery {
     limit: Option<usize>,
     /// `true` — у каждой сессии `tokens` (выданное по событию).
     tokens: Option<bool>,
-    /// Только сессии субагентов этой сессии (`parent_id`; M7 §5.8 п. 1, признак
-    /// `sessions_parent`).
+    /// Только сессии субагентов этой сессии и их субагентов (потомки по `parent_id`; M7 §5.8
+    /// п. 1, признак `sessions_parent`).
     parent: Option<String>,
 }
 

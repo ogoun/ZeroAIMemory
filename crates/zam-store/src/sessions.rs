@@ -23,8 +23,8 @@
 //! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12); признак с
 //!   наследованием от родителя — [`session_holdout`];
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
-//!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя; субагенты сессии —
-//!   [`list_sessions`] с [`SessionFilter::parent`] (M7 §5.8 п. 1);
+//!   `subagent-start` создаёт `<session>:<agent_id>` с id родителя; субагенты сессии (с их
+//!   субагентами) — [`list_sessions`] с [`SessionFilter::parent`] (M7 §5.8 п. 1);
 //! - `session_tokens` — выданное сессии по событию (§9.5): число выдач `calls`, оценка размера в
 //!   токенах `tokens` и число повторных выдач `reread_calls` (M6 §7.3: `/read` с пометкой «уже
 //!   выдавалось» — у события `read`); `/recall` прибавляет свои события
@@ -362,7 +362,9 @@ pub async fn get_session(db: &Db, id: &str) -> Result<Option<Session>, StoreErro
 pub struct SessionFilter<'a> {
     /// Только сессии этого решения.
     pub solution: Option<&'a SolutionGuid>,
-    /// Только сессии субагентов этой сессии (`parent_id`, M7 §5.8 п. 1): прямые, без «внуков».
+    /// Только сессии субагентов этой сессии (M7 §5.8 п. 1) — потомки по `parent_id`: субагенты и
+    /// их субагенты, без самой сессии (самоссылка `parent_id = id` и цикл не зацикливают и сессию
+    /// к самой себе не прибавляют).
     pub parent: Option<&'a str>,
 }
 
@@ -375,19 +377,29 @@ pub async fn list_sessions(
     let solution = f.solution.map(|g| g.as_str().to_string());
     let parent = f.parent.map(str::to_string);
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    // с родителем — условие `parent_id = ?` без `IS NULL OR`: тогда план берёт частичный индекс
-    // `sessions_parent` (миграция 0017), а не перебор всех сессий базы
-    let by_parent = if parent.is_some() {
-        "parent_id = ?2"
+    // с родителем — потомки рекурсивным CTE: `parent_id = ?` в обеих частях берёт частичный индекс
+    // `sessions_parent` (миграция 0017), `UNION` отбрасывает повторы — цикл конечен, `id <> ?2`
+    // убирает саму сессию (самоссылка, цикл через неё); без родителя — прежний запрос
+    let sql = if parent.is_some() {
+        format!(
+            "WITH RECURSIVE sub(id) AS (
+               SELECT id FROM sessions WHERE parent_id = ?2
+               UNION
+               SELECT s.id FROM sessions s JOIN sub ON s.parent_id = sub.id
+             )
+             SELECT {SESSION_COLS} FROM sessions
+             WHERE id IN (SELECT id FROM sub) AND id <> ?2 AND (?1 IS NULL OR solution_guid = ?1)
+             ORDER BY last_seen_at DESC, id LIMIT ?3"
+        )
     } else {
-        "?2 IS NULL"
+        format!(
+            "SELECT {SESSION_COLS} FROM sessions
+             WHERE ?2 IS NULL AND (?1 IS NULL OR solution_guid = ?1)
+             ORDER BY last_seen_at DESC, id LIMIT ?3"
+        )
     };
     db.read(move |c| {
-        let mut st = c.prepare(&format!(
-            "SELECT {SESSION_COLS} FROM sessions
-             WHERE {by_parent} AND (?1 IS NULL OR solution_guid = ?1)
-             ORDER BY last_seen_at DESC, id LIMIT ?3"
-        ))?;
+        let mut st = c.prepare(&sql)?;
         let rows = st.query_map(params![solution, parent, limit], session_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     })

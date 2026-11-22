@@ -441,6 +441,36 @@ fn tokens_of(session: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// Потомки сессии `id` среди `list` без неё самой и без повторов id. `walk` — список всех сессий
+/// (обход старого сервера): потомки ищутся по `parent_id` вглубь (субагенты субагентов), цикл
+/// конечен; иначе `list` — уже ответ `?parent=` (сервер отдаёт потомков) и только чистится.
+fn descendants(id: &str, list: &[Value], walk: bool) -> Vec<Value> {
+    let sid = |s: &Value| s["id"].as_str().unwrap_or_default().to_string();
+    let mut seen: BTreeSet<String> = BTreeSet::from([id.to_string()]);
+    if !walk {
+        return list
+            .iter()
+            .filter(|s| seen.insert(sid(s)))
+            .cloned()
+            .collect();
+    }
+    let mut out = Vec::new();
+    let mut frontier = vec![id.to_string()];
+    while let Some(p) = frontier.pop() {
+        for s in list
+            .iter()
+            .filter(|s| s["parent_id"].as_str() == Some(p.as_str()))
+        {
+            let k = sid(s);
+            if seen.insert(k.clone()) {
+                frontier.push(k);
+                out.push(s.clone());
+            }
+        }
+    }
+    out
+}
+
 /// `items` ответа-списка сервера.
 fn items_of(text: &str, what: &str) -> Result<Vec<Value>> {
     let v: Value = serde_json::from_str(text).with_context(|| format!("GET {what}: не JSON"))?;
@@ -534,6 +564,13 @@ impl Server {
             _ => bail!("GET {path}: HTTP {st}: {text}"),
         };
         let subs = self.subagents(id)?;
+        // в пределе списка сервера часть субагентов могла не войти (ревью задачи 9, Minor 6)
+        if subs.len() >= SESSIONS_LIMIT as usize {
+            self.warnings.push(format!(
+                "у сессии {id} субагентов не меньше {SESSIONS_LIMIT} (предел GET /sessions): \
+                 память прогона может быть неполной"
+            ));
+        }
         Ok(RunMemory {
             session,
             subagents: subs.len() as u64,
@@ -542,8 +579,9 @@ impl Server {
         })
     }
 
-    /// Сессии субагентов сессии `id`: `GET /sessions?parent=`; сервер без параметра (400) или
-    /// без признака — обход списка.
+    /// Сессии субагентов сессии `id` и их субагентов: `GET /sessions?parent=` (сервер отдаёт
+    /// потомков); сервер без параметра (400) или без признака — обход списка. Сама сессия
+    /// (самоссылка `parent_id = id`) и повторы id не прибавляются.
     fn subagents(&mut self, id: &str) -> Result<Vec<Value>> {
         if self.by_parent {
             let path = format!(
@@ -552,18 +590,13 @@ impl Server {
             );
             let (st, text) = self.get(&path)?;
             match st {
-                200 => return items_of(&text, &path),
+                200 => return Ok(descendants(id, &items_of(&text, &path)?, false)),
                 // `ListQuery` старого сервера разбирается строго: неизвестный `parent` — 400
                 400 => self.by_parent = false,
                 _ => bail!("GET {path}: HTTP {st}: {text}"),
             }
         }
-        Ok(self
-            .listed()?
-            .iter()
-            .filter(|s| s["parent_id"].as_str() == Some(id))
-            .cloned()
-            .collect())
+        Ok(descendants(id, self.listed()?, true))
     }
 
     /// Сессии обхода `GET /sessions?limit=500&tokens=true` — один запрос на отчёт и одно
@@ -1189,6 +1222,37 @@ mod tests {
     fn est_null_is_dash() {
         assert_eq!(est(&Value::Null), "—");
         assert_eq!(est0(&json!({"mean": 1.4, "lo": 1.0, "hi": 2.0})), "1 [1–2]");
+    }
+
+    /// Потомки сессии (ревью задачи 9, Minor 2): обход — вглубь, без самой сессии (самоссылка) и
+    /// без повторов, цикл конечен; ответ `?parent=` — только чистка от самой сессии и повторов.
+    #[test]
+    fn descendants_skip_self_and_cycles() {
+        let s = |id: &str, parent: &str| json!({"id": id, "parent_id": parent});
+        let list = [
+            s("p", "p"),
+            s("p:a1", "p"),
+            s("p:a2", "p"),
+            s("p:a1:c1", "p:a1"),
+            s("x", "y"),
+            s("y", "x"),
+            s("other:a1", "other"),
+        ];
+        let ids = |v: Vec<Value>| -> BTreeSet<String> {
+            v.iter()
+                .map(|s| s["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let want = |a: &[&str]| -> BTreeSet<String> { a.iter().map(|s| s.to_string()).collect() };
+        assert_eq!(
+            ids(descendants("p", &list, true)),
+            want(&["p:a1", "p:a2", "p:a1:c1"])
+        );
+        assert_eq!(ids(descendants("x", &list, true)), want(&["y"]));
+        assert!(descendants("none", &list, true).is_empty());
+        let answer = [s("p", "p"), s("p:a1", "p"), s("p:a1", "p")];
+        assert_eq!(ids(descendants("p", &answer, false)), want(&["p:a1"]));
+        assert_eq!(descendants("p", &answer, false).len(), 1);
     }
 
     /// Предупреждения: `holdout` без метки, `main` с меткой, `off` с памятью.

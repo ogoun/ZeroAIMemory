@@ -1524,8 +1524,13 @@ export interface SessionSnapshot {
 export const sessionSnapshot = (id: string, user?: string) =>
   call<SessionSnapshot>('GET', `sessions/${encodeURIComponent(id)}/snapshot`, undefined, user);
 
-/** Свои сессии, свежие первыми, с выданным по событию; `parent` — только субагенты этой сессии
- * (M7 §5.8 п. 1); администратор — пользователя `user`. */
+/** Сессия `id` с выданным по событию (`GET /sessions/{id}`; `snapshot_at` в ответе нет);
+ * администратор — пользователя `user`. */
+export const getSession = (id: string, user?: string) =>
+  call<SessionItem>('GET', `sessions/${encodeURIComponent(id)}`, undefined, user);
+
+/** Свои сессии, свежие первыми, с выданным по событию; `parent` — только субагенты этой сессии и
+ * их субагенты (M7 §5.8 п. 1); администратор — пользователя `user`. */
 export function listSessions(f: { solution?: string; limit?: number; parent?: string }, user?: string) {
   const p = new URLSearchParams({ tokens: 'true' });
   if (f.solution) p.set('solution', f.solution);

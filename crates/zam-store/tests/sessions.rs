@@ -146,9 +146,10 @@ async fn touch_session_upsert() {
     }
 }
 
-/// Отбор по родителю (M7 §5.8 п. 1): только сессии субагентов этой сессии (`parent_id`), свежие
-/// первыми; сама сессия, субагенты другой сессии и внуки в ответ не входят; вместе с решением —
-/// оба условия.
+/// Отбор по родителю (M7 §5.8 п. 1): сессии субагентов этой сессии и их субагентов (потомки по
+/// `parent_id`, круг правок 1 задачи 9 M7.2), свежие первыми; сама сессия и субагенты другой сессии
+/// в ответ не входят; самоссылка (`parent_id = id`) и цикл не прибавляют сессию к самой себе и не
+/// зацикливают; вместе с решением — оба условия.
 #[tokio::test]
 async fn list_sessions_parent_filter() {
     let (_dd, db) = db("parent").await;
@@ -179,7 +180,12 @@ async fn list_sessions_parent_filter() {
         parent: Some(parent),
         ..SessionFilter::default()
     };
-    assert_eq!(ids(&db, of("s")).await, ["s:a2", "s:a1"]);
+    // свежий — первым; внук `s:a1:c1` — среди потомков `s`
+    let all = ids(&db, of("s")).await;
+    assert_eq!(all[0], "s:a2", "{all:?}");
+    let mut set = all.clone();
+    set.sort_unstable();
+    assert_eq!(set, ["s:a1", "s:a1:c1", "s:a2"]);
     assert_eq!(ids(&db, of("s:a1")).await, ["s:a1:c1"]);
     assert!(ids(&db, of("нет")).await.is_empty());
     // без отбора — все пять, как раньше
@@ -189,6 +195,17 @@ async fn list_sessions_parent_filter() {
         parent: Some("s"),
     };
     assert_eq!(ids(&db, both).await, ["s:a1"]);
+    // самоссылка: сессия — не свой субагент; цикл `x` ↔ `y` — конечен, без самой сессии
+    touch_session(&db, &sub("loop", "loop", None))
+        .await
+        .unwrap();
+    assert!(ids(&db, of("loop")).await.is_empty());
+    touch_session(&db, &sub("x", "y", None)).await.unwrap();
+    touch_session(&db, &sub("y", "x", None)).await.unwrap();
+    touch_session(&db, &sub("x:k", "x", None)).await.unwrap();
+    let mut x = ids(&db, of("x")).await;
+    x.sort_unstable();
+    assert_eq!(x, ["x:k", "y"]);
 }
 
 /// `mark_seen` сохраняет большую ревизию части цели; части (чанк, цель целиком), сессии и
