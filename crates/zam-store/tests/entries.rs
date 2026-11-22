@@ -821,22 +821,8 @@ async fn deleted_entry_not_in_fts_restore_returns() {
     assert_eq!(entry_revisions(&db, e.id).await.unwrap().len(), 1);
     let feed = EntryFilter {
         space_id: k,
-        kind: None,
-        statuses: Vec::new(),
-        certainty: Vec::new(),
-        area: None,
-        tag: None,
-        data_kind: None,
-        decided_by: None,
-        since: None,
-        until: None,
-        cursor: None,
         limit: 10,
-        with_reports: false,
-        deleted_only: false,
-        origin: None,
-        priority: None,
-        from_idea: None,
+        ..Default::default()
     };
     assert!(list_entries(&db, feed.clone()).await.unwrap().0.is_empty());
     assert!(matches!(
@@ -897,22 +883,8 @@ async fn list_entries_cursor_and_filters() {
         .unwrap();
     let base = EntryFilter {
         space_id: k,
-        kind: None,
-        statuses: Vec::new(),
-        certainty: Vec::new(),
-        area: None,
-        tag: None,
-        data_kind: None,
-        decided_by: None,
-        since: None,
-        until: None,
-        cursor: None,
         limit: 3,
-        with_reports: false,
-        deleted_only: false,
-        origin: None,
-        priority: None,
-        from_idea: None,
+        ..Default::default()
     };
     // постранично, новые первыми, без повторов и пропусков
     let mut seen = Vec::new();

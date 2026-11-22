@@ -34,14 +34,43 @@ fn json_list<T>(v: &[T], f: impl Fn(&T) -> &'static str) -> Option<String> {
         .then(|| serde_json::Value::from(v.iter().map(&f).collect::<Vec<_>>()).to_string())
 }
 
+/// JSON-массив id для `json_each` (пустой — `[]`).
+fn json_ids(v: &[Id]) -> String {
+    serde_json::Value::from(v.iter().map(Id::to_string).collect::<Vec<_>>()).to_string()
+}
+
+/// Списки id фильтра для `?19` (только эти, без повторов; `None` — без ограничения, пустой
+/// список — пустая лента) и `?20` (кроме этих; пусто — `None`).
+fn id_lists(f: &EntryFilter) -> (Option<Vec<Id>>, Option<String>) {
+    let only = f.only_ids.as_ref().map(|v| {
+        let mut seen = std::collections::HashSet::new();
+        v.iter().copied().filter(|i| seen.insert(*i)).collect()
+    });
+    let except = (!f.except_ids.is_empty()).then(|| json_ids(&f.except_ids));
+    (only, except)
+}
+
+/// Курсор ленты «новые первыми» по столбцу `key`: `?9` — значение ключа последней записи прошлой
+/// страницы, `?10` — её id.
+fn key_cursor(key: &str) -> String {
+    format!("(?9 IS NULL OR {key} < ?9 OR ({key} = ?9 AND e.id < ?10))")
+}
+
+/// Курсор ленты в порядке списка `?19` ([`EntryFilter::ids_order`]): `?9` — позиция последней
+/// записи прошлой страницы в списке (`j.key` — индекс `json_each`). Позиция зависит от состава
+/// списка: изъятый между страницами элемент сдвигает следующие на одну (решение пре-флайта N8;
+/// поведение клиенту — `docs/api-compat.md`, «Подзадачи задач»).
+const POS_CURSOR: &str = "(?9 IS NULL OR j.key > ?9)";
+
 /// Условия ленты пространства — общие у [`list_entries`] и [`count_by_status`], чтобы счётчики
 /// совпадали с лентой. Параметры: `?1` пространство, `?2` вид, `?3` статусы (JSON), `?4`
 /// `certainty` (JSON), `?5` область, `?6` тег, `?7`–`?8` интервал `created_at`, `?9`–`?10`
-/// курсор (`key`, id), `?12` `data.kind`, `?13` `decided_by`, `?14` с отчётами, `?15`–`?16`
-/// `origin`, `priority` идеи, `?17` только задачи из идей, `?18` пространства их идей (JSON,
-/// `NULL` — любые); `?11` — `LIMIT` ленты. `alive` —
-/// живые или удалённые записи, `key` — столбец порядка и курсора.
-fn feed_where(alive: &str, key: &str) -> String {
+/// курсор (условие `cursor`: [`key_cursor`] или [`POS_CURSOR`]), `?12` `data.kind`, `?13`
+/// `decided_by`, `?14` с отчётами, `?15`–`?16` `origin`, `priority` идеи, `?17` только задачи
+/// из идей, `?18` пространства их идей (JSON, `NULL` — любые), `?19` только эти id (JSON), `?20`
+/// кроме этих id (JSON); `?11` — `LIMIT` ленты. `alive` — живые или удалённые записи. Списки id —
+/// одним параметром `json_each`: текст запроса постоянный, кэш подготовленных запросов не растёт.
+fn feed_where(alive: &str, cursor: &str) -> String {
     format!(
         "e.space_id = ?1 AND {alive}
            AND (?2 IS NULL OR e.kind = ?2)
@@ -53,7 +82,9 @@ fn feed_where(alive: &str, key: &str) -> String {
                                       WHERE t.value = ?6))
            AND (?7 IS NULL OR e.created_at >= ?7)
            AND (?8 IS NULL OR e.created_at < ?8)
-           AND (?9 IS NULL OR {key} < ?9 OR ({key} = ?9 AND e.id < ?10))
+           AND {cursor}
+           AND (?19 IS NULL OR e.id IN (SELECT value FROM json_each(?19)))
+           AND (?20 IS NULL OR e.id NOT IN (SELECT value FROM json_each(?20)))
            AND (?12 IS NULL OR json_extract(e.data, '$.kind') = ?12)
            AND (?13 IS NULL OR (e.kind = 'insight'
                 AND json_extract(e.data, '$.kind') = 'decision'
@@ -89,7 +120,20 @@ fn check_kind_filters(f: &EntryFilter) -> Result<(), StoreError> {
             "from_idea — фильтр задач: только с kind=task".into(),
         ));
     }
+    if f.ids_order && (f.only_ids.is_none() || f.deleted_only) {
+        return Err(StoreError::BadInput(
+            "порядок списка id — только с only_ids и у живых записей".into(),
+        ));
+    }
     Ok(())
+}
+
+/// Позиция курсора ленты в порядке списка ([`EntryFilter::ids_order`]): целое ≥ 0.
+fn parse_pos(s: &str) -> Result<i64, StoreError> {
+    s.parse::<i64>()
+        .ok()
+        .filter(|p| *p >= 0)
+        .ok_or_else(|| StoreError::BadInput("некорректный cursor".into()))
 }
 
 /// Лента живых записей пространства: новые первыми (`created_at`, затем id по убыванию),
@@ -102,11 +146,14 @@ fn check_kind_filters(f: &EntryFilter) -> Result<(), StoreError> {
 /// `deleted_only` — корзина: только удалённые записи, новые удаления первыми (курсор —
 /// `<deleted_at>|<id>`). `origin` и `priority` — фильтры идей по `data` (M5.7), только при
 /// `kind = idea`; `from_idea` — задачи из идей (M6.5 §9), только при `kind = task` (иначе
-/// `BadInput`).
+/// `BadInput`). `only_ids` и `except_ids` — только эти записи и кроме этих (подзадачи, M7 §5.4
+/// п. 3); `ids_order` — лента в порядке `only_ids` (порядок шагов плана), курсор — позиция в
+/// списке (десятичное число).
 pub async fn list_entries(
     db: &Db,
     f: EntryFilter,
 ) -> Result<(Vec<Entry>, Option<String>), StoreError> {
+    use rusqlite::types::Value as Sql;
     if !(1..=LIST_LIMIT_MAX).contains(&f.limit) {
         return Err(StoreError::BadInput(format!(
             "limit: от 1 до {LIST_LIMIT_MAX}"
@@ -115,10 +162,19 @@ pub async fn list_entries(
     check_kind_filters(&f)?;
     let origin = f.origin.map(|o| o.as_str());
     let priority = f.priority.map(|p| p.as_str());
-    let cursor = f.cursor.as_deref().map(parse_cursor).transpose()?;
+    // курсор: `<ключ>|<id>` у ленты «новые первыми», позиция — у ленты в порядке списка
+    let (c_key, c_id): (Option<Sql>, Option<Id>) = match f.cursor.as_deref() {
+        None => (None, None),
+        Some(s) if f.ids_order => (Some(Sql::Integer(parse_pos(s)?)), None),
+        Some(s) => {
+            let (t, i) = parse_cursor(s)?;
+            (Some(Sql::Text(t)), Some(i))
+        }
+    };
     let statuses = json_list(&f.statuses, |s| s.as_str());
     let certainty = json_list(&f.certainty, |c| c.as_str());
-    let (c_ts, c_id) = cursor.map_or((None, None), |(t, i)| (Some(t), Some(i)));
+    let (only, except) = id_lists(&f);
+    let only_json = only.as_deref().map(json_ids);
     let since = f.since.map(fmt_ts);
     let until = f.until.map(fmt_ts);
     let limit = f.limit;
@@ -128,14 +184,26 @@ pub async fn list_entries(
     } else {
         ("e.deleted_at IS NULL", "e.created_at")
     };
-    db.read(move |c| {
-        let mut st = c.prepare_cached(&format!(
+    let sql = if f.ids_order {
+        // порядок списка: `json_each` снаружи, запись — по первичному ключу
+        format!(
+            "SELECT {ENTRY_COLS} FROM json_each(?19) j CROSS JOIN entries e ON e.id = j.value
+             WHERE {}
+             ORDER BY j.key
+             LIMIT ?11",
+            feed_where(alive, POS_CURSOR)
+        )
+    } else {
+        format!(
             "SELECT {ENTRY_COLS} FROM entries e
              WHERE {}
              ORDER BY {key} DESC, e.id DESC
              LIMIT ?11",
-            feed_where(alive, key)
-        ))?;
+            feed_where(alive, &key_cursor(key))
+        )
+    };
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&sql)?;
         let rows = st.query_map(
             params![
                 f.space_id,
@@ -146,7 +214,7 @@ pub async fn list_entries(
                 f.tag,
                 since,
                 until,
-                c_ts,
+                c_key,
                 c_id,
                 (limit + 1) as i64,
                 f.data_kind,
@@ -156,19 +224,29 @@ pub async fn list_entries(
                 priority,
                 f.from_idea.is_some(),
                 f.from_idea.as_ref().and_then(crate::ideas::IdeaSpaces::sql),
+                only_json,
+                except,
             ],
             entry_row,
         )?;
         let mut out: Vec<Entry> = rows.collect::<Result<_, _>>()?;
         let next = if out.len() > limit {
             out.truncate(limit);
-            out.last().map(|e| {
-                let ts = if f.deleted_only {
-                    e.deleted_at.unwrap_or(e.created_at)
-                } else {
-                    e.created_at
-                };
-                format!("{}{CURSOR_SEP}{}", fmt_ts(ts), e.id)
+            out.last().map(|e| match &only {
+                // позиция в списке без повторов — та же, что `j.key` запроса
+                Some(ids) if f.ids_order => ids
+                    .iter()
+                    .position(|i| *i == e.id)
+                    .unwrap_or(ids.len())
+                    .to_string(),
+                _ => {
+                    let ts = if f.deleted_only {
+                        e.deleted_at.unwrap_or(e.created_at)
+                    } else {
+                        e.created_at
+                    };
+                    format!("{}{CURSOR_SEP}{}", fmt_ts(ts), e.id)
+                }
             })
         } else {
             None
@@ -180,8 +258,10 @@ pub async fn list_entries(
 
 /// Число живых записей вида `f.kind` по статусам — с теми же фильтрами, что у
 /// [`list_entries`] (чипы статусов ленты идей WebUI, M6.5 §9): каждый статус вида
-/// ([`super::allowed_statuses`], в его порядке), отсутствующий — с нулём. `statuses`, `cursor` и
-/// `limit` фильтра не учитываются. Без вида, у вида без статусов и с `deleted_only` — `BadInput`.
+/// ([`super::allowed_statuses`], в его порядке), отсутствующий — с нулём; `only_ids` и
+/// `except_ids` — как у ленты (счётчики доски без подзадач, M7 §5.4 п. 3). `statuses`, `cursor`,
+/// `limit` и `ids_order` фильтра не учитываются. Без вида, у вида без статусов и с `deleted_only`
+/// — `BadInput`.
 pub async fn count_by_status(
     db: &Db,
     f: EntryFilter,
@@ -207,6 +287,8 @@ pub async fn count_by_status(
     let origin = f.origin.map(|o| o.as_str());
     let priority = f.priority.map(|p| p.as_str());
     let certainty = json_list(&f.certainty, |c| c.as_str());
+    let (only, except) = id_lists(&f);
+    let only = only.as_deref().map(json_ids);
     let since = f.since.map(fmt_ts);
     let until = f.until.map(fmt_ts);
     let counts: Vec<(Option<EntryStatus>, i64)> = db
@@ -216,7 +298,7 @@ pub async fn count_by_status(
                 "SELECT e.status, count(*) FROM entries e
                  WHERE {}
                  GROUP BY e.status",
-                feed_where("e.deleted_at IS NULL", "e.created_at")
+                feed_where("e.deleted_at IS NULL", &key_cursor("e.created_at"))
             ))?;
             let rows = st.query_map(
                 params![
@@ -238,6 +320,8 @@ pub async fn count_by_status(
                     priority,
                     f.from_idea.is_some(),
                     f.from_idea.as_ref().and_then(crate::ideas::IdeaSpaces::sql),
+                    only,
+                    except,
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;

@@ -187,9 +187,9 @@ pub use system::{
     WebSession,
 };
 pub use tasks::{
-    CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Claim, ClaimedTask, OpenTask, Owner, TaskData,
-    TaskError, check_task, check_task_transition, claim_task, claimed_tasks, open_tasks,
-    release_task,
+    CLAIM_TTL_DEFAULT_MIN, CLAIM_TTL_MAX_MIN, Claim, ClaimedTask, OpenTask, Owner, SubtaskSummary,
+    TaskData, TaskError, TaskNode, TaskTree, check_task, check_task_transition, claim_task,
+    claimed_tasks, open_tasks, release_task, task_tree,
 };
 pub use usage::{
     UnattributedRow, UsageCounts, UsageEvent, UsageKind, UsageSource, add_unattributed,

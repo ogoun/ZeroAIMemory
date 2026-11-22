@@ -15,9 +15,13 @@
 //! - [`claimed_tasks`] — задачи, захваченные сессией (для `GET /sessions/{id}` и хука
 //!   `checkpoint`);
 //! - [`open_tasks`] — число открытых задач и заголовки незахваченных для строки дайджеста
-//!   «Открыто задач: N — …» (M6.6 §4.2).
+//!   «Открыто задач: N — …» (M6.6 §4.2);
+//! - [`task_tree`] — дерево подзадач `part_of` пространства (M7 §5.4 п. 1, задача 5 M7.2):
+//!   одним запросом, циклы — компонентами сильной связности ([`TaskTree::build`]).
 
 use std::cmp::Reverse;
+use std::collections::hash_map::Entry as MapEntry;
+use std::collections::{HashMap, HashSet};
 
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::{params, params_from_iter};
@@ -578,10 +582,369 @@ fn claimed_sql(n: usize) -> String {
     )
 }
 
+/// Задача в дереве подзадач ([`TaskTree`]): то, что нужно полям ответа о родителе и подзадачах
+/// (`parent`, `subtasks`, `last_activity_at`, строки подзадач карточки) без запроса на задачу.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskNode {
+    pub title: String,
+    /// Статус задачи (запись без статуса — `open`).
+    pub status: EntryStatus,
+    pub updated_at: Timestamp,
+    /// Срок записанного захвата `data.claimed_by.until` (в том числе истёкшего).
+    pub claim_until: Option<Timestamp>,
+    /// Агент записанного захвата `data.claimed_by.agent` (строки подзадач: «в работе у …»)
+    /// **[решение исполнителя, задача 5 M7.2]**: без него `claimed {agent, until}` строки
+    /// потребовал бы второго запроса.
+    pub claim_agent: Option<String>,
+}
+
+impl TaskNode {
+    /// Захват действует на момент `now` (то же сравнение, что [`Claim::live`]).
+    pub fn claimed(&self, now: Timestamp) -> bool {
+        self.claim_until.is_some_and(|u| u > now)
+    }
+}
+
+/// Сводка прямых подзадач общей задачи (M7 §5.4 п. 2): всего и по статусам; прогресс —
+/// `done/(total − dropped)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SubtaskSummary {
+    pub total: usize,
+    pub done: usize,
+    pub dropped: usize,
+    pub open: usize,
+    pub in_progress: usize,
+    pub blocked: usize,
+}
+
+/// Дерево подзадач `part_of` пространства (M7 §5.4 п. 1): подзадача — живая задача `S` с ребром
+/// `S part_of P` к живой задаче `P` того же пространства. Родитель — самое раннее ребро
+/// ([`TaskTree::parent`]); задача с двумя родителями — в списках обоих
+/// ([`TaskTree::children`]). Рёбра задачи на цикле `part_of` любой длины не учитываются: она —
+/// верхнего уровня и ничья не подзадача (решение 21). Верхний уровень — ровно задачи без
+/// учтённого ребра к родителю.
+#[derive(Debug, Clone, Default)]
+pub struct TaskTree {
+    /// Живые задачи пространства.
+    pub nodes: HashMap<Id, TaskNode>,
+    /// Подзадача → родитель (самое раннее учтённое ребро).
+    pub parent: HashMap<Id, Id>,
+    /// Общая задача → прямые подзадачи в порядке создания ребра (порядок шагов плана).
+    pub children: HashMap<Id, Vec<Id>>,
+}
+
+impl TaskTree {
+    /// Дерево по задачам `nodes` и рёбрам `edges` — пары `(подзадача, родитель)` в порядке
+    /// создания ребра. Рёбра, у которых конец — не задача из `nodes`, и повторы пропускаются.
+    /// Циклы ищутся по всем оставшимся рёбрам — компоненты сильной связности (Тарьян, без
+    /// рекурсии и без предела длины), O(V + E): рёбра задач компоненты больше одной задачи (и
+    /// петли) в дерево не входят.
+    pub fn build(nodes: HashMap<Id, TaskNode>, edges: &[(Id, Id)]) -> TaskTree {
+        let mut seen: HashSet<(Id, Id)> = HashSet::new();
+        let edges: Vec<(Id, Id)> = edges
+            .iter()
+            .copied()
+            .filter(|(s, p)| {
+                nodes.contains_key(s) && nodes.contains_key(p) && seen.insert((*s, *p))
+            })
+            .collect();
+        let mut adj: HashMap<Id, Vec<Id>> = HashMap::new();
+        for (s, p) in &edges {
+            adj.entry(*s).or_default().push(*p);
+        }
+        let cyclic = on_cycles(&adj);
+        let mut parent: HashMap<Id, Id> = HashMap::new();
+        let mut children: HashMap<Id, Vec<Id>> = HashMap::new();
+        for (s, p) in edges {
+            if cyclic.contains(&s) {
+                continue;
+            }
+            parent.entry(s).or_insert(p);
+            children.entry(p).or_default().push(s);
+        }
+        TaskTree {
+            nodes,
+            parent,
+            children,
+        }
+    }
+
+    /// Прямые подзадачи `id` в порядке шагов (нет — пусто).
+    pub fn children_of(&self, id: Id) -> &[Id] {
+        self.children.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Сводка прямых подзадач `id`; подзадач нет — `None`.
+    pub fn summary(&self, id: Id) -> Option<SubtaskSummary> {
+        let kids = self.children_of(id);
+        if kids.is_empty() {
+            return None;
+        }
+        let mut s = SubtaskSummary {
+            total: kids.len(),
+            ..SubtaskSummary::default()
+        };
+        for k in kids {
+            match self.nodes.get(k).map(|n| n.status) {
+                Some(EntryStatus::Done) => s.done += 1,
+                Some(EntryStatus::Dropped) => s.dropped += 1,
+                Some(EntryStatus::InProgress) => s.in_progress += 1,
+                Some(EntryStatus::Blocked) => s.blocked += 1,
+                _ => s.open += 1,
+            }
+        }
+        Some(s)
+    }
+
+    /// Последняя активность задачи `id` с собственным `updated_at` `own`: наибольшее из него и
+    /// `updated_at` её прямых подзадач (захват ревизии не создаёт и `updated_at` не меняет).
+    pub fn last_activity(&self, id: Id, own: Timestamp) -> Timestamp {
+        self.children_of(id)
+            .iter()
+            .filter_map(|k| self.nodes.get(k).map(|n| n.updated_at))
+            .fold(own, Timestamp::max)
+    }
+
+    /// Все подзадачи пространства (задачи с учтённым родителем) — `top_level=1` ленты их
+    /// исключает.
+    pub fn subtask_ids(&self) -> Vec<Id> {
+        self.parent.keys().copied().collect()
+    }
+}
+
+/// Задачи на циклах графа `adj` (задача → её родители): компоненты сильной связности больше
+/// одной вершины и петли — алгоритм Тарьяна с явным стеком (глубина графа стек потока не
+/// расходует), O(V + E).
+fn on_cycles(adj: &HashMap<Id, Vec<Id>>) -> HashSet<Id> {
+    let mut index: HashMap<Id, usize> = HashMap::new();
+    let mut low: HashMap<Id, usize> = HashMap::new();
+    let mut stack: Vec<Id> = Vec::new();
+    let mut on_stack: HashSet<Id> = HashSet::new();
+    let mut out: HashSet<Id> = HashSet::new();
+    let mut next = 0usize;
+    let succ = |v: &Id| adj.get(v).map_or(&[][..], Vec::as_slice);
+    for &root in adj.keys() {
+        if index.contains_key(&root) {
+            continue;
+        }
+        // кадры обхода: вершина и номер её следующего ребра
+        let mut work: Vec<(Id, usize)> = vec![(root, 0)];
+        index.insert(root, next);
+        low.insert(root, next);
+        next += 1;
+        stack.push(root);
+        on_stack.insert(root);
+        while let Some(top) = work.last_mut() {
+            let v = top.0;
+            if let Some(&w) = succ(&v).get(top.1) {
+                top.1 += 1;
+                match index.entry(w) {
+                    MapEntry::Vacant(slot) => {
+                        slot.insert(next);
+                        low.insert(w, next);
+                        next += 1;
+                        stack.push(w);
+                        on_stack.insert(w);
+                        work.push((w, 0));
+                    }
+                    MapEntry::Occupied(iw) if on_stack.contains(&w) => {
+                        let lv = low.get_mut(&v).expect("вершина обхода");
+                        *lv = (*lv).min(*iw.get());
+                    }
+                    MapEntry::Occupied(_) => {}
+                }
+                continue;
+            }
+            work.pop();
+            let lv = low[&v];
+            if let Some(&(u, _)) = work.last() {
+                let lu = low.get_mut(&u).expect("вершина обхода");
+                *lu = (*lu).min(lv);
+            }
+            if lv == index[&v] {
+                // `v` — корень компоненты: она — вершины стека до `v` включительно
+                let mut comp: Vec<Id> = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack.remove(&w);
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if comp.len() > 1 || succ(&v).contains(&v) {
+                    out.extend(comp);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Дерево подзадач пространства `space_id` (M7 §5.4 п. 1) одним запросом: живые задачи
+/// пространства (индекс `entries_feed`) с их рёбрами `part_of` на записи (`edges_src`) в порядке
+/// создания ребра; разбор — [`TaskTree::build`]. Рёбра на запись другого пространства или базы,
+/// на удалённую задачу и удалённые рёбра в дерево не входят. Цена на 2 000 задач — журнал этапа
+/// («M7.2 · Задача 5»).
+pub async fn task_tree(db: &Db, space_id: Id) -> Result<TaskTree, StoreError> {
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT t.id, t.title, t.status, t.updated_at,
+                    json_extract(t.data, '$.claimed_by.until'),
+                    json_extract(t.data, '$.claimed_by.agent'), g.dst_id
+             FROM entries t INDEXED BY entries_feed
+             LEFT JOIN edges g ON g.src_kind = 'entry' AND g.src_id = t.id
+                  AND g.type = 'part_of' AND g.dst_kind = 'entry' AND g.deleted_at IS NULL
+             WHERE t.space_id = ?1 AND t.kind = 'task' AND t.deleted_at IS NULL
+             ORDER BY g.created_at, g.rowid",
+        )?;
+        let mut rows = st.query([space_id])?;
+        let mut nodes: HashMap<Id, TaskNode> = HashMap::new();
+        let mut edges: Vec<(Id, Id)> = Vec::new();
+        // повреждённые `data` и ссылки читаются как отсутствующие (как `TaskData::from_stored`)
+        let text = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<Option<String>> {
+            Ok(r.get_ref(i)?.as_str().ok().map(str::to_string))
+        };
+        while let Some(r) = rows.next()? {
+            let id: Id = r.get(0)?;
+            // строка на каждое ребро задачи: узел — по первой
+            if let MapEntry::Vacant(slot) = nodes.entry(id) {
+                let status: Option<EntryStatus> = r.get(2)?;
+                slot.insert(TaskNode {
+                    title: r.get(1)?,
+                    status: status.unwrap_or(EntryStatus::Open),
+                    updated_at: crate::time::ts_at(r, 3)?,
+                    claim_until: text(r, 4)?.and_then(|s| s.parse().ok()),
+                    claim_agent: text(r, 5)?,
+                });
+            }
+            if let Some(dst) = text(r, 6)?.and_then(|s| s.parse::<Id>().ok()) {
+                edges.push((id, dst));
+            }
+        }
+        Ok(TaskTree::build(nodes, &edges))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use EntryStatus::*;
+
+    fn node(status: EntryStatus) -> TaskNode {
+        TaskNode {
+            title: "t".into(),
+            status,
+            updated_at: "2026-11-22T10:00:00Z".parse().unwrap(),
+            claim_until: None,
+            claim_agent: None,
+        }
+    }
+
+    /// Задачи `n` штук со статусом `open`.
+    fn tasks(n: usize) -> (Vec<Id>, HashMap<Id, TaskNode>) {
+        let ids: Vec<Id> = (0..n).map(|_| Id::new()).collect();
+        let nodes = ids.iter().map(|i| (*i, node(Open))).collect();
+        (ids, nodes)
+    }
+
+    /// Родитель — самое раннее ребро, подзадача с двумя родителями — в списках обоих; порядок
+    /// подзадач — порядок рёбер; повтор ребра и ребро на задачу вне пространства не в счёт.
+    #[test]
+    fn tree_parents_and_order() {
+        let (t, nodes) = tasks(5);
+        let outside = Id::new();
+        let tree = TaskTree::build(
+            nodes,
+            &[
+                (t[3], t[0]),
+                (t[1], t[0]),
+                (t[1], t[4]),
+                (t[2], t[0]),
+                (t[3], t[0]),
+                (t[2], outside),
+            ],
+        );
+        assert_eq!(tree.children_of(t[0]), [t[3], t[1], t[2]]);
+        assert_eq!(tree.children_of(t[4]), [t[1]]);
+        assert_eq!(tree.parent[&t[1]], t[0]);
+        assert_eq!(tree.parent.len(), 3);
+        assert!(tree.children_of(outside).is_empty());
+        let mut subs = tree.subtask_ids();
+        subs.sort();
+        let mut want = vec![t[1], t[2], t[3]];
+        want.sort();
+        assert_eq!(subs, want);
+    }
+
+    /// Циклы длиной 2, 3 и 10 и петля: задачи цикла — верхнего уровня, их рёбра (и к общей вне
+    /// цикла) не учитываются; задача вне цикла — подзадача задачи цикла.
+    #[test]
+    fn tree_cycles_any_length_stay_top_level() {
+        let (t, mut nodes) = tasks(17);
+        let lone = Id::new();
+        nodes.insert(lone, node(Open));
+        let mut edges = vec![(t[0], t[1]), (t[1], t[0])];
+        edges.extend([(t[2], t[3]), (t[3], t[4]), (t[4], t[2])]);
+        edges.extend((5..15).map(|i| (t[i], t[if i == 14 { 5 } else { i + 1 }])));
+        // D (t[15]) — часть A (t[0]); задача цикла t[2] — ещё и часть общей t[16]
+        edges.extend([(t[15], t[0]), (t[2], t[16]), (lone, lone)]);
+        let tree = TaskTree::build(nodes, &edges);
+        for (i, x) in t.iter().enumerate().take(15) {
+            assert!(!tree.parent.contains_key(x), "задача цикла {i}");
+        }
+        assert!(!tree.parent.contains_key(&lone), "петля — цикл");
+        assert_eq!(tree.children_of(t[0]), [t[15]]);
+        assert_eq!(tree.parent[&t[15]], t[0]);
+        assert!(tree.children_of(t[16]).is_empty());
+        assert_eq!(tree.subtask_ids(), [t[15]]);
+    }
+
+    /// Длинная цепочка `part_of` (10 000 задач) и цикл той же длины — без переполнения стека:
+    /// у цепочки родитель есть у всех, кроме корня; у цикла — ни у кого.
+    #[test]
+    fn tree_long_chain_and_long_cycle() {
+        let n = 10_000;
+        let (t, nodes) = tasks(n);
+        let chain: Vec<(Id, Id)> = (1..n).map(|i| (t[i], t[i - 1])).collect();
+        let tree = TaskTree::build(nodes.clone(), &chain);
+        assert_eq!(tree.parent.len(), n - 1);
+        let mut cycle = chain;
+        cycle.push((t[0], t[n - 1]));
+        let tree = TaskTree::build(nodes, &cycle);
+        assert!(tree.parent.is_empty() && tree.children.is_empty());
+    }
+
+    /// Сводка по статусам прямых подзадач и последняя активность — наибольшее `updated_at`.
+    #[test]
+    fn tree_summary_and_last_activity() {
+        let (t, mut nodes) = tasks(7);
+        for (i, s) in [Done, Done, Dropped, InProgress, Blocked]
+            .into_iter()
+            .enumerate()
+        {
+            nodes.get_mut(&t[i + 1]).unwrap().status = s;
+        }
+        let late: Timestamp = "2026-11-22T12:00:00Z".parse().unwrap();
+        nodes.get_mut(&t[4]).unwrap().updated_at = late;
+        let edges: Vec<(Id, Id)> = (1..7).map(|i| (t[i], t[0])).collect();
+        let tree = TaskTree::build(nodes, &edges);
+        assert_eq!(
+            tree.summary(t[0]),
+            Some(SubtaskSummary {
+                total: 6,
+                done: 2,
+                dropped: 1,
+                open: 1,
+                in_progress: 1,
+                blocked: 1,
+            })
+        );
+        assert_eq!(tree.summary(t[1]), None);
+        let own: Timestamp = "2026-11-22T11:00:00Z".parse().unwrap();
+        assert_eq!(tree.last_activity(t[0], own), late);
+        assert_eq!(tree.last_activity(t[1], own), own);
+    }
 
     #[test]
     fn transitions() {

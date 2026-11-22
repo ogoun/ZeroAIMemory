@@ -46,8 +46,9 @@ pub const BLOCKING_FROM: usize = 64 * 1024;
 
 /// Поля записи журнала (`Entry`, ревизия записи, `TaskIdea`) в ответах агенту: заголовок, тело,
 /// строки `data` (все, рекурсивно), теги и область, причины отзыва и смены статуса; у задачи и
-/// идеи — заголовки связанных записей (`idea`, `ideas`, `task`). Ссылки и пути — без изменений: в
-/// них сканер секрет найдёт, только если он там действительно есть.
+/// идеи — заголовки связанных записей (`idea`, `ideas`, `task`), у задачи — заголовки родителя и
+/// строк подзадач (`parent`, `subtasks.items`; M7 §5.4, задача 5 M7.2). Ссылки и пути — без
+/// изменений: в них сканер секрет найдёт, только если он там действительно есть.
 pub const ENTRY_FIELDS: &[&str] = &[
     "title",
     "body",
@@ -59,6 +60,8 @@ pub const ENTRY_FIELDS: &[&str] = &[
     "idea.title",
     "ideas.title",
     "task.title",
+    "parent.title",
+    "subtasks.items.title",
 ];
 
 /// Поля узла `Node` в ответах агенту: L0 и `frontmatter` — описание, теги, L0 (путь, имя и
@@ -586,6 +589,28 @@ mod tests {
     /// Ключ из частей: в исходнике его нет целиком (push protection).
     fn key() -> String {
         format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5")
+    }
+
+    /// Подзадачи (M7 §5.4, задача 5 M7.2): заголовки родителя и строк подзадач в записи агенту —
+    /// маской без метки объекта (их не правят этой записью), заголовок самой записи — с меткой.
+    #[test]
+    fn task_parent_and_subtask_titles_masked() {
+        let k = key();
+        let mut v = json!({"id": "01A", "rev": 2, "title": format!("общая {k}"),
+                           "parent": {"id": "01P", "title": format!("этап {k}")},
+                           "subtasks": {"total": 1, "items": [{"id": "01S",
+                                                                "title": format!("шаг {k}")}]}});
+        assert!(number_entries(&mut v));
+        assert!(!v.to_string().contains(&k), "{v}");
+        assert_eq!(v["parent"]["title"], format!("этап {SECRET_MARK}"));
+        assert_eq!(
+            v["subtasks"]["items"][0]["title"],
+            format!("шаг {SECRET_MARK}")
+        );
+        assert!(
+            v["title"].as_str().unwrap().starts_with("общая ‹secret-"),
+            "{v}"
+        );
     }
 
     /// Поля по путям: строки — маской, массивы на любом шаге — поэлементно, прочее и ключи

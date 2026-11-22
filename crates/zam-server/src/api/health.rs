@@ -42,6 +42,7 @@ pub const FEATURES: &[&str] = &[
     "vault_move",
     "idea_queue_line",
     "post_tool_subject",
+    "task_subtasks",
     "agent_text_masked",
 ];
 

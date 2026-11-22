@@ -87,21 +87,9 @@ pub async fn compare(
             let f = EntryFilter {
                 space_id: to.space_id,
                 kind: Some(EntryKind::Release),
-                statuses: Vec::new(),
-                certainty: Vec::new(),
-                area: None,
-                tag: None,
-                data_kind: None,
-                decided_by: None,
-                since: None,
                 until: Some(to.created_at),
-                cursor: None,
                 limit: 1,
-                with_reports: false,
-                deleted_only: false,
-                origin: None,
-                priority: None,
-                from_idea: None,
+                ..Default::default()
             };
             list_entries(&sc.db, f).await?.0.into_iter().next()
         }

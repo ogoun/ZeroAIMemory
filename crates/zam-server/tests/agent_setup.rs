@@ -1434,6 +1434,41 @@ async fn guide_plan_steps_are_part_of_tasks() {
     );
 }
 
+/// Протокол (M7 §5.4 п. 5, задача 5 M7.2): в пункте «Работа по плану» (ru, en) — как увидеть
+/// прогресс общей задачи: `zam task show k:<общая>` (подзадачи N/M). Блок v8 не меняется.
+#[tokio::test]
+async fn guide_plan_progress_by_task_show() {
+    let a = api("agent-guide-plan-progress", |_| {}).await;
+    for (q, item, want) in [
+        (
+            "",
+            "**Работа по плану из N шагов**",
+            "прогресс — `zam task show k:<общая>` (подзадачи N/M)",
+        ),
+        (
+            "?lang=en",
+            "**Work on a plan of N steps**",
+            "progress — `zam task show k:<umbrella>` (subtasks N/M)",
+        ),
+    ] {
+        let r = a
+            .tok(
+                &a.token,
+                Method::GET,
+                &format!("/api/v1/agent-guide{q}"),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let g = r.text();
+        let line = g
+            .lines()
+            .find(|l| l.contains(item))
+            .unwrap_or_else(|| panic!("нет пункта {item}: {g}"));
+        assert!(line.contains(want), "{want}: {line}");
+    }
+}
+
 /// Протокол (M5.6): раздел о карте кода (ru, en) и три фразы, перенесённые из блока v5 ради
 /// бюджета 500 токенов, — в своих разделах протокола; в блоке их нет.
 #[tokio::test]
