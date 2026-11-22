@@ -891,6 +891,14 @@ async fn auto_l0_inline_flag_masked_everywhere() {
     for (m, uri, body) in requests {
         let r = a.t(m.clone(), &uri, body.clone()).await;
         assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        // поиск: сначала — карточка заметки в выдаче (иначе «значения нет» ничего не доказывает)
+        if uri.ends_with("/search") {
+            assert!(
+                r.text().contains(&nid),
+                "карточки заметки нет: {}",
+                r.text()
+            );
+        }
         assert!(!r.text().contains(&pw), "{uri}: {}", r.text());
         if uri.contains("L0") || uri.contains("/read") {
             assert!(r.text().contains(MARK), "{uri}: {}", r.text());
@@ -899,6 +907,9 @@ async fn auto_l0_inline_flag_masked_everywhere() {
         if !uri.ends_with(&nid) {
             let h = a.adm(m, &uri, body, None).await;
             assert_eq!(h.status, StatusCode::OK, "{uri}: {}", h.text());
+            if uri.ends_with("/search") {
+                assert!(h.text().contains(&nid), "карточки нет: {}", h.text());
+            }
             assert!(!h.text().contains(&pw), "человеку L0: {uri}: {}", h.text());
         }
     }
