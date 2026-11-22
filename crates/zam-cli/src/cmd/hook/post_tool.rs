@@ -126,27 +126,27 @@ const DIAG_WORDS: [&str; 9] = [
 ];
 
 /// Ожидаемый ненулевой код (M7.1 §4.6 п. 1): простая команда `cmd`
-/// ([`zam_core::shell::is_simple`]: без `|`, `;`, `&`, перевода строки вне кавычек) — программа
-/// из [`EXIT_1_PROGRAMS`] или `git diff` с `--quiet`/`--exit-code` — завершилась кодом 1 и без
-/// stderr. Код — первая строка `error` `Exit code 1` (Claude Code; stdout и stderr идут за ней
-/// одним текстом), поэтому stderr — строки-диагностики после неё: начинаются словом с `:` —
-/// именем программы, оболочки или одним из [`DIAG_WORDS`] (`cmp: EOF on a`, `warning: … LF will
-/// be replaced`) **[решение исполнителя, задача 8 M7.1]**; разница `diff`, счётчик `grep -c` и
-/// «a b differ» `cmp` — stdout. У Codex `error` — сам непустой stderr без строки кода: не
-/// ожидаемый.
+/// ([`zam_core::shell::is_simple`]: без `|`, `;`, `&&`, `||`, фона, второй строки и без
+/// подстановок `$(…)`, `` `…` ``, `<(…)`, `>(…)` — их сбой прячется в коде внешней программы) —
+/// программа из [`EXIT_1_PROGRAMS`] или `git diff` с `--quiet`/`--exit-code` — завершилась кодом 1
+/// и без stderr. Код — первая строка `error` `Exit code 1` (Claude Code; stdout и stderr идут за
+/// ней одним текстом), поэтому stderr — строки-диагностики после неё ([`has_diagnostics`])
+/// **[решение исполнителя, задача 8 M7.1]**; разница `diff`, счётчик `grep -c` и «a b differ»
+/// `cmp` — stdout. У Codex `error` — сам непустой stderr без строки кода: не ожидаемый.
 pub fn expected_exit(cmd: &str, error: &str) -> bool {
     let (head, body) = error.split_once('\n').unwrap_or((error, ""));
     if !head.trim().eq_ignore_ascii_case("exit code 1") || !zam_core::shell::is_simple(cmd) {
         return false;
     }
-    let words = zam_core::shell::words(cmd);
-    let mut args = words
-        .iter()
-        .skip_while(|w| zam_core::shell::is_assignment(w))
-        .map(String::as_str);
-    let Some(prog) = args.next().map(program_name) else {
+    let Some(prog) = program_name(cmd) else {
         return false;
     };
+    let words = zam_core::shell::words(cmd);
+    let args = words
+        .iter()
+        .skip_while(|w| zam_core::shell::is_assignment(w))
+        .skip(1)
+        .map(String::as_str);
     let listed = match prog.as_str() {
         "git" => git_diff_exit_code(args),
         p => EXIT_1_PROGRAMS.contains(&p),
@@ -154,13 +154,14 @@ pub fn expected_exit(cmd: &str, error: &str) -> bool {
     listed && !has_diagnostics(body, &prog)
 }
 
-/// Имя программы: без пути, суффикса `.exe` и регистра.
-fn program_name(w: &str) -> String {
-    let base = w.rsplit(['/', '\\']).next().unwrap_or(w).to_lowercase();
-    match base.strip_suffix(".exe") {
+/// Программа команды или слова: [`journal::exe_of`] (первое слово без присваиваний и пути) без
+/// регистра и суффикса `.exe`.
+fn program_name(cmd: &str) -> Option<String> {
+    let exe = journal::exe_of(cmd)?.to_lowercase();
+    Some(match exe.strip_suffix(".exe") {
         Some(b) => b.to_string(),
-        None => base,
-    }
+        None => exe,
+    })
 }
 
 /// `git [-C <путь>] [-c <ключ=значение>] [--флаги] diff … --quiet | --exit-code`.
@@ -178,18 +179,38 @@ fn git_diff_exit_code<'a>(mut args: impl Iterator<Item = &'a str>) -> bool {
     false
 }
 
-/// В выводе есть строка-диагностика ([`expected_exit`]): первое слово строки до `:` без пробелов
-/// — программа `prog`, оболочка (`bash:`, `/usr/bin/bash:`) или слово из [`DIAG_WORDS`].
+/// В выводе есть строка-диагностика ([`expected_exit`]). Диагностика начинается с первой
+/// колонки (строки контекста `diff -u` с отступом — stdout) и это одно из:
+/// - слово до `:` без пробелов — программа `prog`, оболочка (`bash:`, `/usr/bin/bash:`) или
+///   слово из [`DIAG_WORDS`];
+/// - `<имя>:<число>:` — сообщение скрипта или оболочки с номером строки, в том числе zsh
+///   `(eval):1: no such file or directory: …` (у программ списка с кодом 1 такого stdout нет:
+///   `grep -n` без совпадений ничего не печатает);
+/// - Python: `Traceback (most recent call last):` и `<Имя>Error: …` (с модулем —
+///   `requests.exceptions.ConnectionError: …`).
 fn has_diagnostics(body: &str, prog: &str) -> bool {
     body.lines().any(|l| {
-        let Some((word, _)) = l.trim_start().split_once(':') else {
+        if l == "Traceback (most recent call last):" {
+            return true;
+        }
+        let Some((word, rest)) = l.split_once(':') else {
             return false;
         };
         if word.is_empty() || word.contains(char::is_whitespace) {
             return false;
         }
-        let w = program_name(word);
-        w == prog || DIAG_WORDS.contains(&w.as_str())
+        let numbered = rest
+            .split_once(':')
+            .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let python_error = word.rsplit('.').next().is_some_and(|w| {
+            w.len() > "Error".len()
+                && w.ends_with("Error")
+                && w.starts_with(|c: char| c.is_ascii_uppercase())
+                && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        let named =
+            program_name(word).is_some_and(|w| w == prog || DIAG_WORDS.contains(&w.as_str()));
+        numbered || python_error || named
     })
 }
 
@@ -295,6 +316,49 @@ impl DontRepeat {
             }
         }
     }
+}
+
+/// Тест-раннер среди простых команд `cmd` ([`zam_core::shell::segments`]; ревью задачи 8 M7.1,
+/// M-4): в выводе тестов коды HTTP — чаще текст проверок (`400 Bad Request` в ожидании теста),
+/// чем сбой самой команды, поэтому классы «не повторяй» к ним не применяются. Раннеры: `cargo
+/// test | nextest`, `go test`, `npm | pnpm | yarn | bun test` (и `run test`), `pytest`, `jest`,
+/// `vitest` (и через `npx`/`pnpx`/`bunx`, `python -m pytest`).
+fn is_test_runner(cmd: &str) -> bool {
+    zam_core::shell::segments(cmd).iter().any(|seg| {
+        let words = zam_core::shell::words(seg);
+        let mut w = words
+            .iter()
+            .skip_while(|w| zam_core::shell::is_assignment(w))
+            .map(|w| program_name(w).unwrap_or_default());
+        let Some(prog) = w.next() else {
+            return false;
+        };
+        let rest: Vec<String> = w.collect();
+        // первое слово-подкоманда: без флагов `-…` и `+toolchain`
+        let sub = || {
+            rest.iter()
+                .find(|a| !a.starts_with(['-', '+']))
+                .map(String::as_str)
+        };
+        match prog.as_str() {
+            "pytest" | "jest" | "vitest" => true,
+            "cargo" => matches!(sub(), Some("test" | "nextest")),
+            "go" => sub() == Some("test"),
+            "npm" | "pnpm" | "yarn" | "bun" => {
+                let mut subs = rest.iter().filter(|a| !a.starts_with('-'));
+                match subs.next().map(String::as_str) {
+                    Some("test") => true,
+                    Some("run") => subs.next().is_some_and(|s| s == "test"),
+                    _ => false,
+                }
+            }
+            "npx" | "pnpx" | "bunx" => matches!(sub(), Some("jest" | "vitest" | "pytest")),
+            "python" | "python3" | "py" => {
+                rest.windows(2).any(|p| p[0] == "-m" && p[1] == "pytest")
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Скомпилированные шаблоны классов ([`DontRepeat::ALL`]) — один раз на процесс.
@@ -494,7 +558,10 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
     // сбой, который повтор не исправит (M7.1 §4.6 п. 2; решение координатора): строка класса
     // строится локально и идёт после подсказок сервера и `error_regex` (сервер недоступен — и
     // без них); сервер её не видел — она в очередь учёта (M4.5 §9.5)
-    if let Some(class) = dont_repeat_class(error)
+    // у тест-раннера коды HTTP в выводе — текст проверок, не сбой команды (M-4 ревью)
+    let runner = command_of(inp).is_some_and(|c| is_test_runner(&c));
+    if !runner
+        && let Some(class) = dont_repeat_class(error)
         && let Some(line) = dont_repeat_line(env, inp.session_id.as_deref(), class, &fp, error)
     {
         if let Some(id) = inp.session_id.as_deref() {
@@ -939,6 +1006,17 @@ mod tests {
             ("LC_ALL=C /usr/bin/grep x f", "Exit code 1"),
             (r"C:\Git\usr\bin\grep.exe x f", "Exit code 1"),
             ("grep x f", "Exit code 1\nShell cwd was reset to /w"),
+            // перенаправления — не составная команда (M-2 ревью)
+            ("grep x f 2>&1", "Exit code 1"),
+            ("grep x f >out.txt 2>&1", "Exit code 1"),
+            ("diff a b &>diff.txt", "Exit code 1"),
+            ("diff a b &>>diff.txt", "Exit code 1"),
+            // строка контекста `diff -u` с отступом — stdout (M-1 ревью)
+            (
+                "diff -u a.rs b.rs",
+                "Exit code 1\n--- a.rs\n+++ b.rs\n@@ -1,3 +1,3 @@\n struct E {\n     error: String,\n-    code: u8,\n+    code: u16,",
+            ),
+            ("grep -q '$(x)' f", "Exit code 1"),
         ] {
             assert!(expected_exit(cmd, err), "{cmd} / {err:?}");
         }
@@ -966,6 +1044,40 @@ mod tests {
             (
                 "[ a -gt 1 ]",
                 "Exit code 1\n/usr/bin/bash: line 1: [: a: integer expression expected",
+            ),
+            // сбой вложенной программы прячется в коде внешней (I-1 ревью): подстановки
+            (
+                "diff <(sort a) <(sort b)",
+                "Exit code 1\nsort: cannot read: a: No such file or directory\n0a1\n> x",
+            ),
+            (
+                "diff <(jq . a.json) <(jq . b.json)",
+                "Exit code 1\n1c1\n< 1\n---\n> 2",
+            ),
+            ("cmp <(xxd a) <(xxd b)", "Exit code 1\n- 1 differ: byte 3"),
+            ("diff a >(tee log)", "Exit code 1"),
+            ("grep -n foo $(find src -name '*.rs')", "Exit code 1"),
+            ("grep -n foo `find src -name '*.rs'`", "Exit code 1"),
+            (
+                "test -n \"$(python find.py)\"",
+                "Exit code 1\nTraceback (most recent call last):\n  File \"find.py\", line 3, in \
+                 <module>\nFileNotFoundError: [Errno 2] No such file or directory: 'x'",
+            ),
+            ("test -n \"`cat x`\"", "Exit code 1"),
+            // диагностики (I-1 ревью): zsh `(eval)`, `<имя>:<число>:`, Python
+            (
+                "grep x f",
+                "Exit code 1\n(eval):1: no such file or directory: ./tools/x",
+            ),
+            (
+                "test -f x",
+                "Exit code 1\n./check.sh:3: test: too many arguments",
+            ),
+            ("cmp a b", "Exit code 1\nTraceback (most recent call last):"),
+            ("diff a b", "Exit code 1\nValueError: bad input"),
+            (
+                "diff a b",
+                "Exit code 1\nrequests.exceptions.ConnectionError: refused",
             ),
             // не из списка
             ("cargo test", "Exit code 1"),
@@ -1023,6 +1135,40 @@ mod tests {
             let line = c.line("Retry-After: 120");
             assert!(line.starts_with("ZeroAIMemory: "), "{line}");
             assert!(cache::estimate_tokens(&line) <= 30, "{line}");
+        }
+    }
+
+    /// M-4 ревью задачи 8: тест-раннеры — по программе любой простой команды строки.
+    #[test]
+    fn test_runners_by_program() {
+        for cmd in [
+            "cargo test -p zam-server --test recall",
+            "cargo +nightly nextest run",
+            "cd crates && cargo test",
+            "RUST_LOG=debug cargo test",
+            "pytest -x tests/",
+            "python -m pytest -q",
+            "npm test",
+            "pnpm run test -- --watch=false",
+            "npx jest src/a.test.ts",
+            "npx vitest run",
+            "vitest",
+            "go test ./...",
+            r"C:\Python312\python.exe -m pytest",
+        ] {
+            assert!(is_test_runner(cmd), "{cmd}");
+        }
+        for cmd in [
+            "cargo build",
+            "cargo run -- test",
+            "gh api user",
+            "curl https://x/test",
+            "npm install",
+            "go build ./...",
+            "python test.py",
+            "echo cargo test",
+        ] {
+            assert!(!is_test_runner(cmd), "{cmd}");
         }
     }
 }

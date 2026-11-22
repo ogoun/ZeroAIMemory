@@ -7470,6 +7470,14 @@ fn dont_repeat_line_once_per_class() {
     );
     assert_eq!(line("dr-2", auth), AUTH_LINE, "другая сессия");
     assert_eq!(server_asks(&p), 5, "запрос — на каждую ошибку: {}", p.log());
+    // тест-раннер (M-4 ревью): код HTTP в выводе тестов — текст проверки, строки класса нет
+    empty(&fail_dead(
+        &p,
+        "dr",
+        "cd api && cargo test -p orders",
+        "Exit code 101\nthread 'create' panicked at tests/api.rs:9:5:\nassertion `left == right` \
+         failed\n  left: \"400 Bad Request\"\n right: \"201 Created\"",
+    ));
 }
 
 /// Решение координатора к M7.1 §4.6 п. 2: на «HTTP 401 invalid_grant» хук спрашивает сервер, как
@@ -7507,8 +7515,9 @@ fn dont_repeat_line_after_server_hint() {
     assert!(c.starts_with(&hint) && !c.contains(AUTH_LINE), "{c}");
 }
 
-/// M7.1 §4.6 п. 3: в запрос `/recall(post_tool)` — слова путей команды `path_words` (аргументы
-/// с разделителем и существующие каталоги), после маскировки секретов: значение
+/// M7.1 §4.6 п. 3: в запрос `/recall(post_tool)` — имена каталогов из команды `path_words`:
+/// каталоги путей с разделителем (последний сегмент — только если это каталог: `web/e2e`, но не
+/// `f.txt`) и существующие каталоги без разделителя (`src`), после маскировки секретов: значение
 /// `--password=…` не уходит.
 #[test]
 fn post_tool_sends_path_words() {
@@ -7516,6 +7525,7 @@ fn post_tool_sends_path_words() {
     let (url, seen) = common::stub(200, r#"{"text":"","items":[]}"#, Duration::ZERO);
     let p = Proj::new("path-words", &url, "zam_x");
     std::fs::create_dir_all(p.repo.join("src")).unwrap();
+    std::fs::create_dir_all(p.repo.join("web").join("e2e")).unwrap();
     let pass = ["--password=Qwe", "/rty", "123"].concat();
     let ev = bash_fail(
         &p,
@@ -7532,7 +7542,7 @@ fn post_tool_sends_path_words() {
         .2;
     assert_eq!(
         body["path_words"],
-        json!(["web", "e2e", "src", "out", "dir", "txt"]),
+        json!(["web", "e2e", "src", "out", "dir"]),
         "{body}"
     );
 }

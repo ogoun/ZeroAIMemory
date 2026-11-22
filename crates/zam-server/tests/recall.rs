@@ -1529,9 +1529,9 @@ async fn post_tool_common_words_not_enough() {
     assert_eq!(got, [format!("i:{lnk}")]);
 }
 
-/// M7.1 §4.6 п. 3: слова путей команды (`path_words`, их шлёт хук `zam`) — не предмет ошибки:
-/// имена каталогов и файлов из `ls web e2e web/playwright.config.*` в выводе подсказку не
-/// поднимают; без поля — поднимают, как прежде.
+/// M7.1 §4.6 п. 3: имена каталогов команды (`path_words`, их шлёт хук `zam`) — не предмет ошибки:
+/// каталоги `web` и `e2e` из `ls web e2e` в выводе подсказку не поднимают (остальные слова
+/// записи — `playwright`, `config` — до порога не дотягивают); без поля — поднимают, как прежде.
 #[tokio::test]
 async fn post_tool_path_words_not_subject() {
     let a = server("post-tool-path-words").await;
@@ -1550,7 +1550,7 @@ async fn post_tool_path_words_not_subject() {
         [format!("i:{id}")],
         "без path_words — как прежде"
     );
-    let words = json!({"path_words": ["web", "e2e", "playwright", "config"]});
+    let words = json!({"path_words": ["web", "e2e"]});
     assert_eq!(post_tool_ids(&a, err, words).await, Vec::<String>::new());
 }
 

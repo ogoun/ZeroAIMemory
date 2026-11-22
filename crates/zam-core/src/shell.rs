@@ -1,10 +1,17 @@
 //! Разбор команды оболочки без зависимостей (M7.1 §4.6): слова с учётом кавычек ([`words`],
-//! перенесён из журнала сессии хуков `zam-cli`), простая ли команда ([`is_simple`]) и слова
-//! путей её аргументов ([`path_words`]). Их читают хук `zam hook post-tool` и прогон подсказок
-//! `xtask eval --hints` — одно правило для клиента и замера.
+//! перенесён из журнала сессии хуков `zam-cli`), простая ли команда ([`is_simple`]), простые
+//! команды строки ([`segments`]) и имена каталогов её аргументов ([`path_words`]). Их читают хук
+//! `zam hook post-tool`, сервер (предел [`PATH_WORDS_MAX`]) и прогон подсказок `xtask eval
+//! --hints` — одно правило для клиента, сервера и замера.
+//!
+//! **Обратная косая.** [`words`] вне кавычек держит `\` буквально: `C:\Git\bin\grep.exe` без
+//! кавычек остаётся путём Windows (так программу и называет агент). [`is_simple`] и [`segments`]
+//! вне кавычек считают `\` экранированием следующего символа, как POSIX: `grep a\|b f` — не
+//! конвейер; перед буквой пути Windows экранирование ничего не меняет. В двойных кавычках у всех
+//! трёх `\` экранирует только `"`, `\`, `$` и `` ` `` (POSIX).
 
-/// Слова команды с учётом кавычек `"…"` и `'…'` (и `\\` вне одинарных) — грубый разбор
-/// shell, достаточный для первого слова и аргументов.
+/// Слова команды с учётом кавычек `"…"` и `'…'`; `\` экранирует только в двойных кавычках (см.
+/// модуль) — грубый разбор shell, достаточный для первого слова и аргументов.
 pub fn words(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -57,41 +64,96 @@ pub fn is_assignment(word: &str) -> bool {
         && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Простая команда (M7.1 §4.6 п. 1): вне кавычек нет `|`, `;`, `&` и перевода строки — ни
-/// конвейера, ни списка команд (`&&`, `||`, `;`), ни фона, ни второй строки скрипта. Кавычки — как
-/// у [`words`]; незакрытая кавычка — не простая.
-pub fn is_simple(command: &str) -> bool {
+/// Что встретил разбор строки команды ([`scan`]).
+enum Mark {
+    /// Разделитель простых команд: `|`, `||`, `;`, `&&`, фон `&`, перевод строки.
+    Separator,
+    /// Подстановка: `$(…)`, `` `…` `` (и в двойных кавычках), `<(…)`, `>(…)`.
+    Substitution,
+}
+
+/// Проход строки команды с кавычками и экранированием (см. модуль): `on(смещение начала,
+/// длина, что)` на каждый разделитель и подстановку вне одинарных кавычек; перенаправления
+/// (`2>&1`, `>&2`, `<&3`, `&>`, `&>>`) разделителем не считаются. `false` — незакрытая кавычка.
+fn scan(command: &str, mut on: impl FnMut(usize, usize, Mark)) -> bool {
     let mut quote: Option<char> = None;
-    let mut chars = command.chars();
-    while let Some(c) = chars.next() {
+    let mut prev: Option<char> = None;
+    let mut it = command.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        let next = it.peek().map(|&(_, n)| n);
         match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some('"'), '\\') => {
-                chars.next();
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (Some(_), '"') => quote = None,
+            (Some(_), '\\') => {
+                if matches!(next, Some('"' | '\\' | '$' | '`')) {
+                    it.next();
+                }
             }
+            (Some(_), '`') => on(i, 1, Mark::Substitution),
+            (Some(_), '$') if next == Some('(') => on(i, 2, Mark::Substitution),
             (Some(_), _) => {}
             (None, '\\') => {
-                chars.next();
+                it.next();
             }
             (None, '"' | '\'') => quote = Some(c),
-            (None, '|' | ';' | '&' | '\n' | '\r') => return false,
+            (None, '`') => on(i, 1, Mark::Substitution),
+            (None, '$' | '<' | '>') if next == Some('(') => on(i, 2, Mark::Substitution),
+            (None, '&') if matches!(prev, Some('>' | '<')) || next == Some('>') => {}
+            (None, '&' | '|') if next == Some(c) => {
+                it.next();
+                on(i, 2, Mark::Separator);
+            }
+            (None, '&' | '|' | ';' | '\n' | '\r') => on(i, 1, Mark::Separator),
             (None, _) => {}
         }
+        prev = Some(c);
     }
     quote.is_none()
 }
 
-/// Предел слов путей команды ([`path_words`]).
+/// Простая команда (M7.1 §4.6 п. 1): вне кавычек нет `|`, `;`, `&&`, `||`, фона `&` и перевода
+/// строки, и нигде нет подстановок `$(…)`, `` `…` `` (вне одинарных кавычек), `<(…)`, `>(…)`:
+/// сбой вложенной программы прячется в коде внешней (`diff <(sort a) <(sort b)` без `a`).
+/// Перенаправления `2>&1`, `&>`, `&>>` команду составной не делают. Незакрытая кавычка — не
+/// простая.
+pub fn is_simple(command: &str) -> bool {
+    let mut simple = true;
+    let closed = scan(command, |_, _, _| simple = false);
+    simple && closed
+}
+
+/// Простые команды строки — части между разделителями `|`, `||`, `;`, `&&`, `&` и переводами
+/// строк вне кавычек (подстановки разделителями не считаются), без пустых и краевых пробелов.
+pub fn segments(command: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    scan(command, |i, len, m| {
+        if let Mark::Separator = m {
+            out.push(&command[from..i]);
+            from = i + len;
+        }
+    });
+    out.push(&command[from..]);
+    out.into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Предел имён каталогов команды ([`path_words`]) — и у клиента, и у сервера (поле
+/// `path_words` запроса `/recall`).
 pub const PATH_WORDS_MAX: usize = 32;
 /// Короче — не слово пути (как слова ошибки в покрытии подсказок `post_tool`).
 const PATH_WORD_MIN_CHARS: usize = 3;
 
-/// Слова путей из аргументов команды (M7.1 §4.6 п. 3: имена каталогов и файлов, набранные в
-/// команде, — не предмет её ошибки): аргументы [`words`] с `/` или `\` (у `--флаг=путь` —
-/// значение после `=`) и аргументы без разделителя, для которых `is_dir` (существующий каталог;
-/// программа и флаги `-…` не проверяются). Адреса (`://`) и аргументы с `@` (`user:pass@host`)
-/// пропускаются. Слово — буквы и цифры от 3 символов в нижнем регистре, без повторов, до
-/// [`PATH_WORDS_MAX`].
+/// Имена каталогов из аргументов команды (M7.1 §4.6 п. 3: каталоги, набранные в команде, — не
+/// предмет её ошибки). Аргумент [`words`] с `/` или `\` (у `--флаг=путь` — значение после `=`) —
+/// его каталоги: все сегменты, кроме последнего, а последний — если аргумент кончается
+/// разделителем или `is_dir` (существующий каталог); имя файла и расширение — нет. Аргумент без
+/// разделителя — если `is_dir` (программа и флаги `-…` не проверяются). Адреса (`://`) и
+/// аргументы с `@` (`user:pass@host`) пропускаются. Слово — буквы и цифры от 3 символов в нижнем
+/// регистре, без повторов, до [`PATH_WORDS_MAX`].
 pub fn path_words(command: &str, is_dir: impl Fn(&str) -> bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut program = true;
@@ -104,11 +166,18 @@ pub fn path_words(command: &str, is_dir: impl Fn(&str) -> bool) -> Vec<String> {
             continue;
         }
         let value = w.rsplit_once('=').map_or(w.as_str(), |(_, v)| v);
-        let pathlike = value.contains(['/', '\\']);
-        if !pathlike && (first || value.starts_with('-') || value.is_empty() || !is_dir(value)) {
+        let dirs: &str = if value.contains(['/', '\\']) {
+            if value.ends_with(['/', '\\']) || is_dir(value) {
+                value
+            } else {
+                value.rsplit_once(['/', '\\']).map_or("", |(d, _)| d)
+            }
+        } else if first || value.starts_with('-') || value.is_empty() || !is_dir(value) {
             continue;
-        }
-        for part in value
+        } else {
+            value
+        };
+        for part in dirs
             .split(|c: char| !c.is_alphanumeric())
             .filter(|p| p.chars().count() >= PATH_WORD_MIN_CHARS)
         {
@@ -134,11 +203,16 @@ mod tests {
             words(r#"FOO="a b" "C:\Tools\zam.exe" 'x y' "q\"t""#),
             ["FOO=a b", r"C:\Tools\zam.exe", "x y", r#"q"t"#]
         );
+        assert_eq!(
+            words(r"C:\Git\bin\grep.exe x"),
+            [r"C:\Git\bin\grep.exe", "x"]
+        );
         assert!(words("   ").is_empty());
         assert!(is_assignment("A_1=x") && !is_assignment("1A=x") && !is_assignment("--a=b"));
     }
 
-    /// Простая команда: операторы — только вне кавычек; незакрытая кавычка — не простая.
+    /// Простая команда: операторы — только вне кавычек; подстановки (и в двойных кавычках) —
+    /// нет; перенаправления — да; незакрытая кавычка — не простая.
     #[test]
     fn simple_command_operators_outside_quotes() {
         for s in [
@@ -148,50 +222,92 @@ mod tests {
             r"grep a\|b f",
             "diff a b > out.txt",
             "test -f x",
+            "grep x f 2>&1",
+            "grep x f >log 2>&1",
+            "diff a b &>diff.txt",
+            "diff a b &>>diff.txt",
+            "cmp a b 0<&3",
+            "grep '$(x)' f",
+            "grep '`x`' f",
+            r#"grep "\$(x)" f"#,
+            r"C:\Git\bin\grep.exe x f",
             "",
         ] {
             assert!(is_simple(s), "{s:?}");
         }
         for s in [
             "grep x f | wc -l",
+            "grep x f |& cat",
             "grep x f; echo",
             "grep x f && echo",
             "grep x f || true",
             "grep x f &",
             "cd a\ngrep x f",
             "grep 'x f",
+            "diff <(sort a) <(sort b)",
+            "diff a >(tee log)",
+            "grep -n foo $(find src -name '*.rs')",
+            "grep -n foo `find src`",
+            "test -n \"$(python find.py)\"",
+            "test -n \"`cat x`\"",
         ] {
             assert!(!is_simple(s), "{s:?}");
         }
     }
 
-    /// Слова путей: аргументы с разделителем (и значение `--флаг=путь`), каталоги без него — по
-    /// `is_dir`; программа, флаги, адреса и `user@host` — нет.
+    /// Простые команды строки: разделители вне кавычек; перенаправления и подстановки — нет.
+    #[test]
+    fn segments_split_on_separators() {
+        assert_eq!(
+            segments("cd crates && cargo test 2>&1 | tail -n 5; echo 'a;b' || true &"),
+            [
+                "cd crates",
+                "cargo test 2>&1",
+                "tail -n 5",
+                "echo 'a;b'",
+                "true"
+            ]
+        );
+        // скобки подстановки не отслеживаются: `|` внутри `$(…)` — тоже разделитель (для поиска
+        // программы этого хватает: такая команда и так не простая)
+        assert_eq!(
+            segments("grep x $(find . | head)"),
+            ["grep x $(find .", "head)"]
+        );
+        assert_eq!(segments("  cargo test  "), ["cargo test"]);
+        assert!(segments(" ; ").is_empty());
+    }
+
+    /// Имена каталогов: каталоги путей аргументов (последний сегмент — у пути с разделителем на
+    /// конце или по `is_dir`), каталоги без разделителя — по `is_dir`; имя файла, программа,
+    /// флаги, адреса и `user@host` — нет.
     #[test]
     fn path_words_of_arguments() {
         let none = |_: &str| false;
         assert_eq!(
             path_words("ls web/ web/e2e …; ls web/playwright.config.*", none),
-            ["web", "e2e", "playwright", "config"]
+            ["web"]
+        );
+        let e2e = |a: &str| a == "web/e2e";
+        assert_eq!(
+            path_words("ls web/ web/e2e …; ls web/playwright.config.*", e2e),
+            ["web", "e2e"]
         );
         assert_eq!(
             path_words(
                 r#"cargo build --manifest-path=crates/zam-cli/Cargo.toml -p zam-cli"#,
                 none
             ),
-            ["crates", "zam", "cli", "cargo", "toml"]
+            ["crates", "zam", "cli"]
         );
-        assert_eq!(
-            path_words(r"type C:\work\Отчёт.txt", none),
-            ["work", "отчёт", "txt"]
-        );
+        assert_eq!(path_words(r"type C:\work\Отчёт.txt", none), ["work"]);
         // адрес, учётные данные, флаг и программа-путь
         assert_eq!(
             path_words(
-                "curl https://example.org/a/b ssh://u:p@h/x u@h:/srv -o out/file ./run.sh",
+                "curl https://example.org/a/b ssh://u:p@h/x u@h:/srv -o out/dir/f.txt ./run.sh",
                 none
             ),
-            ["out", "file", "run"]
+            ["out", "dir"]
         );
         assert_eq!(
             path_words("A=b/c ./scripts/x.sh", none),
