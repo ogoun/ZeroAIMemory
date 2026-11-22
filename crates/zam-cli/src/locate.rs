@@ -559,11 +559,12 @@ pub fn plan_home(
 /// сохраняются (комментарии — нет: файл пишет `zam`). Другой токен этого адреса заменяется, только
 /// если `force` (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
 ///
-/// Тот же токен пишется и под адресами `aliases` — другими адресами того же сервера (`zam init` в
-/// режиме `block`: адрес строки `ZeroAIMemoryUrl=` блока — `server.public_url` или `Host` —
-/// отличается от `--url`, а проект и хуки ищут токен по адресу блока; финальное ревью M7.1, I-3).
-/// Другой токен под псевдонимом — как у адреса: замена только с `force`, иначе
-/// [`HomePlan::Conflict`].
+/// Тот же токен пишется и под адресами `aliases` — адресами строки `ZeroAIMemoryUrl=` блока
+/// (`server.public_url` или `Host` сервера), отличными от `--url`: проект и хуки ищут токен по
+/// адресу блока (финальное ревью M7.1, I-3) — но только где токена ещё нет ([`AliasTokens`]).
+/// Псевдоним с тем же токеном не трогается; с **другим** — не заменяется и с `force` (N-1: адрес
+/// назвал сервер, а не пользователь, и он может вести на другой сервер — его токен сломался бы, а
+/// токен `--url` ушёл бы туда); об этом предупреждает `zam init`.
 pub fn plan_home_aliases(
     home: &Path,
     url: &str,
@@ -574,13 +575,7 @@ pub fn plan_home_aliases(
 ) -> Result<HomePlan, String> {
     let (path, mut t, cfg) = home_doc(home)?;
     let key = normalize_url(url);
-    let mut alias_keys: Vec<String> = aliases
-        .iter()
-        .map(|a| normalize_url(a))
-        .filter(|a| !a.is_empty() && *a != key)
-        .collect();
-    alias_keys.sort_unstable();
-    alias_keys.dedup();
+    let alias_keys = split_aliases(&cfg, &key, aliases, token).missing;
     let top_token = nonempty(cfg.token.as_deref());
     // чей `token` верхнего уровня: `url` верхнего уровня; без него — ключ без адреса
     let owner = nonempty(cfg.url.as_deref()).map(|u| normalize_url(&u));
@@ -590,23 +585,13 @@ pub fn plan_home_aliases(
     {
         return Err(unbound_refusal(&path, u));
     }
-    let old_of = |k: &str| {
-        cfg.server_token(k)
-            .map(|(_, v)| v)
-            .or_else(|| top_token.clone().filter(|_| owner.as_deref() == Some(k)))
-    };
-    let olds: Vec<Option<String>> = std::iter::once(key.as_str())
-        .chain(alias_keys.iter().map(String::as_str))
-        .map(old_of)
-        .collect();
+    let old = home_token(&cfg, &key);
     let migrate = top_token.is_some() && unbound_left.is_none();
     let write_url = top != TopUrl::Keep && owner.is_none() && unbound_left.is_none();
-    if olds.iter().all(|o| o.as_deref() == Some(token)) && !migrate && !write_url {
+    if old.as_deref() == Some(token) && alias_keys.is_empty() && !migrate && !write_url {
         return Ok(HomePlan::Unchanged);
     }
-    let replaced = olds
-        .iter()
-        .any(|o| o.as_deref().is_some_and(|o| o != token));
+    let replaced = old.as_deref().is_some_and(|o| o != token);
     if replaced && !force {
         return Ok(HomePlan::Conflict(path));
     }
@@ -634,6 +619,57 @@ pub fn plan_home_aliases(
         replaced,
         unbound_left: unbound_left.map(|u| zam_core::mask_token(&u)),
     })
+}
+
+/// Токен адреса `k` (нормализованного) в домашнем конфиге `cfg`: запись `[servers]` или `token`
+/// верхнего уровня, если `url` верхнего уровня — этот адрес.
+fn home_token(cfg: &HomeConfig, k: &str) -> Option<String> {
+    cfg.server_token(k).map(|(_, v)| v).or_else(|| {
+        let owner = nonempty(cfg.url.as_deref()).map(|u| normalize_url(&u));
+        nonempty(cfg.token.as_deref()).filter(|_| owner.as_deref() == Some(k))
+    })
+}
+
+/// Псевдонимы адреса `--url` (адреса блока, [`plan_home_aliases`]) по токену в домашнем конфиге:
+/// нормализованные, без самого адреса и без повторов.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AliasTokens {
+    /// Токена нет — пишется тот же токен.
+    pub missing: Vec<String>,
+    /// Другой токен — не трогается даже с `--token` (N-1); `zam init` предупреждает.
+    pub other: Vec<String>,
+}
+
+/// [`AliasTokens`] адреса `key` (нормализованного) для токена `token` по конфигу `cfg`.
+fn split_aliases(cfg: &HomeConfig, key: &str, aliases: &[String], token: &str) -> AliasTokens {
+    let mut keys: Vec<String> = aliases
+        .iter()
+        .map(|a| normalize_url(a))
+        .filter(|a| !a.is_empty() && a != key)
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut out = AliasTokens::default();
+    for a in keys {
+        match home_token(cfg, &a) {
+            None => out.missing.push(a),
+            Some(t) if t != token => out.other.push(a),
+            Some(_) => {}
+        }
+    }
+    out
+}
+
+/// [`AliasTokens`] адреса `url` для токена `token` по домашнему конфигу `home`; битый файл —
+/// ошибка.
+pub fn alias_tokens(
+    home: &Path,
+    url: &str,
+    aliases: &[String],
+    token: &str,
+) -> Result<AliasTokens, String> {
+    let (_, _, cfg) = home_doc(home)?;
+    Ok(split_aliases(&cfg, &normalize_url(url), aliases, token))
 }
 
 /// Токен `token` адреса `key` (нормализованного) — в `[servers."<key>"]`; записи того же адреса
@@ -1361,9 +1397,10 @@ mod tests {
         assert!(plan_home(&home, a, &t1, true, keep).is_err());
     }
 
-    /// Псевдонимы адреса (финальное ревью M7.1, I-3): тот же токен — и под адресом блока
-    /// (нормализованным, без повтора `--url`); оба уже есть — без записи; другой токен под
-    /// псевдонимом — замена только с `force`, иначе `Conflict`.
+    /// Псевдонимы адреса (финальное ревью M7.1, I-3, N-1): тот же токен — и под адресом блока без
+    /// токена (нормализованным, без повтора `--url`); оба уже есть — без записи; другой токен под
+    /// псевдонимом не заменяется ни без `force`, ни с ним (`AliasTokens::other`), адрес `--url`
+    /// пишется как обычно.
     #[test]
     fn plan_home_aliases_writes_block_address() {
         let (a, b) = ("http://192.0.2.1:7700", "http://192.0.2.9:7700");
@@ -1399,7 +1436,11 @@ mod tests {
             plan_home_aliases(&home, a, &aliases, &t1, false, TopUrl::IfAbsent).unwrap(),
             HomePlan::Unchanged
         );
-        // под адресом блока другой токен: без force — не трогать, с force — заменить
+        assert_eq!(
+            alias_tokens(&home, a, &aliases, &t1).unwrap(),
+            AliasTokens::default()
+        );
+        // под адресом блока другой токен: не трогается ни без force, ни с force
         std::fs::write(
             &cfg,
             format!(
@@ -1407,20 +1448,37 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(matches!(
-            plan_home_aliases(&home, a, &aliases, &t1, false, TopUrl::IfAbsent).unwrap(),
-            HomePlan::Conflict(_)
-        ));
+        for force in [false, true] {
+            assert_eq!(
+                plan_home_aliases(&home, a, &aliases, &t1, force, TopUrl::IfAbsent).unwrap(),
+                HomePlan::Unchanged,
+                "force = {force}"
+            );
+        }
+        assert_eq!(
+            alias_tokens(&home, a, &aliases, &t1).unwrap(),
+            AliasTokens {
+                missing: Vec::new(),
+                other: vec![b.to_string()],
+            }
+        );
+        // другой токен и у `--url`: с force заменяется только он, адрес блока — прежний
+        let t3 = ["zam_", &"5".repeat(40)].concat();
         let HomePlan::Write { text, replaced, .. } =
-            plan_home_aliases(&home, a, &aliases, &t1, true, TopUrl::IfAbsent).unwrap()
+            plan_home_aliases(&home, a, &aliases, &t3, true, TopUrl::IfAbsent).unwrap()
         else {
-            panic!("замена");
+            panic!("замена адреса --url");
         };
         assert!(replaced);
         let t: toml::Table = toml::from_str(&text).unwrap();
         assert_eq!(
+            t["servers"][a]["token"].as_str(),
+            Some(t3.as_str()),
+            "{t:?}"
+        );
+        assert_eq!(
             t["servers"][b]["token"].as_str(),
-            Some(t1.as_str()),
+            Some(t2.as_str()),
             "{t:?}"
         );
     }

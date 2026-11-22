@@ -1173,6 +1173,28 @@ fn kept_of(j: &Value) -> Option<u64> {
     n
 }
 
+/// Предупреждение `secret_mark_from_rev` ответа записи (финальное ревью M7.1, N-3): список
+/// ревизий в поле и строка в `warnings` с теми же номерами.
+fn from_rev_of(j: &Value) -> Option<Vec<i64>> {
+    let n: Option<Vec<i64>> = j["secret_mark_from_rev"]
+        .as_array()
+        .map(|a| a.iter().map(|x| x.as_i64().unwrap()).collect());
+    let w = j["warnings"].as_array().and_then(|w| {
+        w.iter()
+            .filter_map(Value::as_str)
+            .find(|s| s.starts_with("secret_mark_from_rev: "))
+    });
+    assert_eq!(n.is_some(), w.is_some(), "поле и строка — вместе: {j}");
+    if let (Some(n), Some(w)) = (&n, w) {
+        let list: Vec<String> = n.iter().map(i64::to_string).collect();
+        assert!(
+            w.starts_with(&format!("secret_mark_from_rev: {} ", list.join(", "))),
+            "{w}"
+        );
+    }
+    n
+}
+
 /// `PUT` агента по нумерованному L2 (`‹secret-N›`): правка другой строки и правка вокруг метки
 /// сохраняют значения в базе (чтение сессией); новая строка с `‹secret›` — литерал с
 /// предупреждением; эхо ответа — с маской.
@@ -2569,8 +2591,11 @@ async fn agent_second_write_from_same_view() {
     };
     let r = put(seen.replace("текст\n", "текст 1\n"), "1").await;
     assert_eq!(r.json()["current_rev"], 2, "{}", r.text());
-    // тот же вид ревизии 1, `rev` 2 из ответа
-    put(seen.replace("текст\n", "текст 2\n"), "2").await;
+    // метки базовой ревизии — без `secret_mark_from_rev` (N-3)
+    assert_eq!(from_rev_of(&r.json()), None, "{}", r.text());
+    // тот же вид ревизии 1, `rev` 2 из ответа: значения — из ревизии 1, предупреждение
+    let r = put(seen.replace("текст\n", "текст 2\n"), "2").await;
+    assert_eq!(from_rev_of(&r.json()), Some(vec![1]), "{}", r.text());
     assert_eq!(
         human_text(&a, &id).await,
         content.replace("текст\n", "текст 2\n")
@@ -2587,6 +2612,7 @@ async fn agent_second_write_from_same_view() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(kept_of(&r.json()), None, "{}", r.text());
+    assert_eq!(from_rev_of(&r.json()), Some(vec![1]), "{}", r.text());
     assert!(
         human_text(&a, &id)
             .await
@@ -2622,6 +2648,8 @@ async fn agent_second_write_from_same_view() {
             .await;
         assert_eq!(r.status, StatusCode::OK, "{rev}: {}", r.text());
         assert_eq!(kept_of(&r.json()), None, "{rev}: {}", r.text());
+        let want = (rev != "1").then(|| vec![1]);
+        assert_eq!(from_rev_of(&r.json()), want, "{rev}: {}", r.text());
     }
     let r = a
         .tok_h(
@@ -2655,6 +2683,12 @@ async fn agent_second_write_from_same_view() {
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(kept_of(&r.json()["entry"]), None, "{}", r.text());
+    assert_eq!(
+        from_rev_of(&r.json()["entry"]),
+        Some(vec![1]),
+        "{}",
+        r.text()
+    );
     let nid = r.json()["entry"]["id"].as_str().unwrap().to_string();
     let h = a
         .adm(Method::GET, &format!("/api/v1/entries/{nid}"), None, None)
@@ -2662,6 +2696,104 @@ async fn agent_second_write_from_same_view() {
         .json();
     assert_eq!(h["title"], format!("Ключ {s2}"), "{h}");
     assert_eq!(h["body"], format!("token: {s}\nверсия 4\n"), "{h}");
+}
+
+/// Заметка `id`: `n` правок человека подряд (ревизии 2..=n+1) — текст `body(k)` ревизии `k`.
+async fn human_revisions(a: &Api, id: &str, n: i64, body: impl Fn(i64) -> String) {
+    for k in 2..=n + 1 {
+        let prev = (k - 1).to_string();
+        let r = a
+            .adm_h(
+                Method::PUT,
+                &format!("/api/v1/nodes/{id}"),
+                Some(json!({"content": body(k)})),
+                &[("if-match", prev.as_str())],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{k}: {}", r.text());
+    }
+}
+
+/// Предел ревизий по меткам (финальное ревью M7.1, N-2): метки 21 ревизии заметки в одной записи —
+/// значения у текущей и 8 ближайших к ней прежних, прочие — литералы с `secret_mark_kept`; ответ
+/// 200 за ограниченное время; `secret_mark_from_rev` — ревизии значений.
+#[tokio::test]
+async fn agent_marks_of_many_revisions_limited() {
+    let a = api("secrets-restore-many-revs", |_| {}).await;
+    let s = secret();
+    let body = |k: i64| format!("# K\n\ntoken: {s}\nверсия {k:02}\n");
+    let n = a.note("knowledge", "ops/restore-many", &body(1)).await;
+    let id = n["id"].as_str().unwrap().to_string();
+    human_revisions(&a, &id, 20, body).await;
+    let text: String = (1..=21)
+        .map(|k| format!("k{k:02}: token: {}\n", mk(&tg(&id, k), 1)))
+        .collect();
+    let t0 = std::time::Instant::now();
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{id}"),
+            Some(json!({"content": text})),
+            &[("if-match", "21")],
+        )
+        .await;
+    let took = t0.elapsed();
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    assert_eq!(kept_of(&r.json()), Some(12), "{}", r.text());
+    assert_eq!(
+        from_rev_of(&r.json()),
+        Some((13..=20).collect()),
+        "{}",
+        r.text()
+    );
+    let h = human_text(&a, &id).await;
+    let restored: Vec<&str> = h.lines().filter(|l| l.contains(&s)).collect();
+    assert_eq!(restored.len(), 9, "{h}");
+    assert!(
+        restored[0].starts_with("k13: ") && restored[8].starts_with("k21: "),
+        "{h}"
+    );
+}
+
+/// Предел байт прежних ревизий (N-2): `limits.note_max_bytes` × 4 — у ревизий по 2 970 байт при
+/// пределе 4 096 загружаются 5 ближайших к текущей, старше — литералы.
+#[tokio::test]
+async fn agent_marks_revisions_byte_limit() {
+    let a = api("secrets-restore-rev-bytes", |c| {
+        c.limits.note_max_bytes = 4096
+    })
+    .await;
+    let s = secret();
+    let pad = "x".repeat(2900);
+    let body = |k: i64| format!("# K\n\ntoken: {s}\nверсия {k:02}\n{pad}\n");
+    assert_eq!(body(1).len(), 2970);
+    let n = a.note("knowledge", "ops/restore-bytes", &body(1)).await;
+    let id = n["id"].as_str().unwrap().to_string();
+    human_revisions(&a, &id, 7, body).await;
+    let text: String = (1..=8)
+        .map(|k| format!("k{k}: token: {}\n", mk(&tg(&id, k), 1)))
+        .collect();
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{id}"),
+            Some(json!({"content": text})),
+            &[("if-match", "8")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(kept_of(&r.json()), Some(2), "{}", r.text());
+    assert_eq!(
+        from_rev_of(&r.json()),
+        Some(vec![3, 4, 5, 6, 7]),
+        "{}",
+        r.text()
+    );
+    let h = human_text(&a, &id).await;
+    assert_eq!(h.lines().filter(|l| l.contains(&s)).count(), 6, "{h}");
 }
 
 /// Метки, прочитанные до обновления сканера (I-2, §4.3.2 п. 1): T другой версии правил или крейта

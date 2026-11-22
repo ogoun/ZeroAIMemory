@@ -826,9 +826,10 @@ fn req_texts(req: &mut InsightReq) -> secret_restore::EntryTexts<'_> {
 fn restore_req(
     old: &Entry,
     revs: &secret_restore::EntryRevs,
+    base_rev: i64,
     req: &mut InsightReq,
-) -> Result<usize, ApiError> {
-    req_texts(req).restore(old.into(), &revs.bases(old))
+) -> Result<(usize, Vec<i64>), ApiError> {
+    req_texts(req).restore(old.into(), &revs.bases(old), base_rev)
 }
 
 /// В тексте новой записи есть метка объекта `‹secret-T-N›` или с номером `‹secret-N›` (метки — по
@@ -853,33 +854,41 @@ fn revision_required() -> ApiError {
     )
 }
 
-/// [`restore_req`] для принципала `p` (старая запись `old` в базе `db`, доступ к ней уже
-/// проверен): человеку — как есть (0); длинные тела с метками — в пуле блокирующих задач.
+/// Итог восстановления замещения: `secret_mark_kept` и ревизии `secret_mark_from_rev`.
+type Notes = (usize, Vec<i64>);
+
+/// [`restore_req`] для принципала `p` (старая запись `old` в базе `st`/`db`, доступ к ней уже
+/// проверен; база — ревизия `rev` вида, без неё — текущая): человеку — как есть; длинные тела с
+/// метками — в пуле блокирующих задач.
 async fn restore_for(
+    st: &AppState,
     db: &Db,
     p: &Principal,
     old: &Entry,
+    rev: Option<i64>,
     req: InsightReq,
-) -> Result<(InsightReq, usize), ApiError> {
+) -> Result<(InsightReq, Notes), ApiError> {
     if !agent_view::masks(p) {
-        return Ok((req, 0));
+        return Ok((req, (0, Vec::new())));
     }
+    let base_rev = rev.unwrap_or(old.rev);
     let mut req = req;
     let tags = req_texts(&mut req).tags();
-    let revs = secret_restore::EntryRevs::load(db, old, &tags).await?;
+    let max_bytes = super::nodes::write::restore_bytes(st);
+    let revs = secret_restore::EntryRevs::load(db, old, &tags, max_bytes).await?;
     if !secret_restore::has_mark(&req.body)
         || req.body.len() + old.body.len() <= agent_view::BLOCKING_FROM
     {
-        let kept = restore_req(old, &revs, &mut req)?;
-        return Ok((req, kept));
+        let notes = restore_req(old, &revs, base_rev, &mut req)?;
+        return Ok((req, notes));
     }
     let old = old.clone();
-    let (req, kept) = agent_view::blocking(move || {
-        let kept = restore_req(&old, &revs, &mut req);
-        (req, kept)
+    let (req, notes) = agent_view::blocking(move || {
+        let notes = restore_req(&old, &revs, base_rev, &mut req);
+        (req, notes)
     })
     .await?;
-    Ok((req, kept?))
+    Ok((req, notes?))
 }
 
 /// Замещаемая запись `old` (id из `supersedes_id`) новой записью вида `kind` в области `sc` —
@@ -936,7 +945,7 @@ pub async fn create(
     };
     // замещение агентом по маскированному виду старой записи — значения обратно до проверок
     // текста (M7 §4.3.2)
-    let (mut req, kept) = match &target {
+    let (mut req, (kept, from)) = match &target {
         Some(o) if agent_view::masks(p) => {
             // метки — по ревизиям, с которых агент читал (M7 §4.3.2 п. 3); повтор по ключу
             // ревизию не сверяет (как `/supersede`): её сверит хранилище, кроме повтора
@@ -946,9 +955,10 @@ pub async fn create(
             if !headers.contains_key("idempotency-key") {
                 super::entries::stale_entry(o, req.supersedes_rev)?;
             }
-            restore_for(&sc.db, p, o, req).await?
+            let rev = req.supersedes_rev;
+            restore_for(st, &sc.db, p, o, rev, req).await?
         }
-        _ => (req, 0),
+        _ => (req, (0, Vec::new())),
     };
     let triggers = check_request(st, &mut req, kind)?;
     let raw_links = req.links.take().unwrap_or_default();
@@ -1014,6 +1024,7 @@ pub async fn create(
         // повтор по ключу — без предупреждения (круг правок 1, M9)
         if !repeat {
             secret_restore::attach_kept(&mut v, kept);
+            secret_restore::attach_from_rev(&mut v, &from);
         }
         let status = if repeat {
             StatusCode::OK
@@ -1137,7 +1148,7 @@ pub async fn supersede(
             super::entries::stale_entry(&sc.entry, rev)?;
         }
     }
-    let (mut req, kept) = restore_for(&sc.db, &p, &sc.entry, req).await?;
+    let (mut req, (kept, from)) = restore_for(&st, &sc.db, &p, &sc.entry, rev, req).await?;
     let kind = sc.entry.kind;
     let triggers = check_request(&st, &mut req, kind)?;
     let raw_links = req.links.take().unwrap_or_default();
@@ -1200,6 +1211,7 @@ pub async fn supersede(
     // повтор по ключу — без предупреждения (круг правок 1, M9)
     if !repeat {
         secret_restore::attach_kept(&mut entry, kept);
+        secret_restore::attach_from_rev(&mut entry, &from);
     }
     Ok((
         status,

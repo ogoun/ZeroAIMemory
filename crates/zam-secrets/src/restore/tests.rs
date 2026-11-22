@@ -350,6 +350,14 @@ fn object_marks_of_several_revisions() {
         format!("из прежней: token: {k1}\nиз текущей: новый: {k2}\nчужая: ‹secret-ffffff-1›\n")
     );
     assert_eq!((r.kept, r.exposed.len()), (1, 0));
+    // ревизии, давшие значения (N-3), — по первому появлению, чужая T — нет
+    assert_eq!(r.from, vec![T.to_string(), T2.to_string()]);
+    // отложенные значения (`PATCH`): ревизия — только у поставленного значения
+    let mut d = Deferred::new(&[&edited]).unwrap();
+    let piece = o.defer(&format!("x {}\n", format_args!("‹secret-{T2}-1›")), &mut d);
+    let f = d.finish(&piece, &[]);
+    assert_eq!(f.text, format!("x {k2}\n"));
+    assert_eq!(f.from, vec![T2.to_string()]);
     // пустой объект: маски без метки не восстанавливаются
     let mut e = ObjectMasks::default();
     e.add(&r1);

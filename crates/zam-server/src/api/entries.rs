@@ -1071,11 +1071,17 @@ pub async fn patch(
         .is_some_and(|b| {
             b.len() + sc.entry.body.len() > agent_view::BLOCKING_FROM && secret_restore::has_mark(b)
         });
-    let kept = if !agent_view::masks(&p) {
-        0
+    let (kept, from) = if !agent_view::masks(&p) {
+        (0, Vec::new())
     } else {
         let tags = patch_texts(&mut req).tags();
-        let revs = secret_restore::EntryRevs::load(&sc.db, &sc.entry, &tags).await?;
+        let revs = secret_restore::EntryRevs::load(
+            &sc.db,
+            &sc.entry,
+            &tags,
+            super::nodes::write::restore_bytes(&st),
+        )
+        .await?;
         if !big_body {
             restore_patch(&sc.entry, &revs, &mut req)?
         } else {
@@ -1205,6 +1211,7 @@ pub async fn patch(
     }
     agent_view::view_json(&p, &mut v, &["warnings"]);
     secret_restore::attach_kept(&mut v, kept);
+    secret_restore::attach_from_rev(&mut v, &from);
     Ok(Json(v))
 }
 
@@ -1251,8 +1258,8 @@ fn restore_patch(
     e: &Entry,
     revs: &secret_restore::EntryRevs,
     req: &mut Patch,
-) -> Result<usize, ApiError> {
-    patch_texts(req).restore(e.into(), &revs.bases(e))
+) -> Result<(usize, Vec<i64>), ApiError> {
+    patch_texts(req).restore(e.into(), &revs.bases(e), e.rev)
 }
 
 /// Детали аудита операций записи (без текста записи).

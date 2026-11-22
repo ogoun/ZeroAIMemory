@@ -596,7 +596,8 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     };
     // block: проект и хуки берут адрес из строки `ZeroAIMemoryUrl=` блока (`server.public_url` или
     // `Host` запроса) и ищут токен по нему — он пишется и под адресами блока, отличными от
-    // `--url`: это тот же сервер, `init` говорил с ним по `--url` (финальное ревью M7.1, I-3)
+    // `--url`, где токена ещё нет (финальное ревью M7.1, I-3); другой токен под адресом блока не
+    // заменяется и с `--token` — адрес назвал сервер (N-1), только предупреждение
     let aliases: Vec<String> = if url_to == UrlTo::Block {
         let key = locate::normalize_url(&url.value);
         let mut a: Vec<String> = urls
@@ -609,6 +610,11 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         a
     } else {
         Vec::new()
+    };
+    let alias_state = if aliases.is_empty() {
+        locate::AliasTokens::default()
+    } else {
+        locate::alias_tokens(&home, &url.value, &aliases, addr_token).map_err(CliError::config)?
     };
     let home_plan = match &candidate {
         Some(t) => locate::plan_home_aliases(&home, &url.value, &aliases, t, forced, top)
@@ -729,8 +735,9 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         println!("Хуки и .mcp.json не записаны: повторите с --yes.");
     }
     let key = locate::normalize_url(&url.value);
+    // записанные ключи: адрес и адреса блока, где токена не было
     let keys = std::iter::once(&key)
-        .chain(&aliases)
+        .chain(&alias_state.missing)
         .map(|k| format!("[servers.\"{k}\"]"))
         .collect::<Vec<_>>()
         .join(" и ");
@@ -747,6 +754,13 @@ pub fn run(o: Opts) -> Result<(), CliError> {
              (заменить: zam init --token <токен>)"
         ),
         locate::HomePlan::Unchanged => {}
+    }
+    // адрес блока с другим токеном не заменён и с --token (N-1)
+    for a in &alias_state.other {
+        eprintln!(
+            "предупреждение: под адресом {a} уже другой токен — не заменён; проект с блоком этого \
+             адреса пойдёт с прежним токеном"
+        );
     }
     if let Some(mask) = &unbound_left {
         eprintln!("предупреждение: {}", unbound_token_note(mask, None));

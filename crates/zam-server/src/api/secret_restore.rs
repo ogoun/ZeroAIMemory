@@ -46,6 +46,37 @@ pub const SECRET_MARK_KEPT: &str = "secret_mark_kept";
 /// Код отказа записи: правка выводит секрет из-под маски (422).
 pub const SECRET_CONTEXT_CHANGED: &str = "secret_context_changed";
 
+/// Предупреждение ответа записи: значения меток взяты из ревизий объекта, отличных от базовой
+/// (финальное ревью M7.1, N-3): секрет мог смениться после той ревизии; номера — в строке
+/// предупреждения и в поле ответа с тем же именем (список).
+pub const SECRET_MARK_FROM_REV: &str = "secret_mark_from_rev";
+
+/// Ревизий объекта, кроме текущей, по меткам одной записи — не больше (финальное ревью M7.1,
+/// N-2): T вычисляется публично, и метки, сфабрикованные для каждой ревизии, иначе подняли бы в
+/// память и скан все ревизии. Сверх — метки литералом (`secret_mark_kept`), без ошибки; первыми
+/// берутся ревизии, ближайшие к текущей.
+pub const RESTORE_REVS_MAX: usize = 8;
+
+/// Исходник загружаемых прежних ревизий одной записи — не больше `limits.note_max_bytes` × это
+/// число (N-2).
+pub const RESTORE_BYTES_FACTOR: usize = 4;
+
+/// Ревизии `found` (T и номер) по пределу [`RESTORE_REVS_MAX`]: текущая `current` — всегда,
+/// прочие — ближайшие к ней, по убыванию номера.
+pub fn nearest_revisions(found: Vec<(String, i64)>, current: i64) -> Vec<(String, i64)> {
+    let mut found = found;
+    found.sort_unstable_by_key(|(_, k)| std::cmp::Reverse(*k));
+    let mut others = 0;
+    found.retain(|(_, k)| {
+        if *k == current {
+            return true;
+        }
+        others += 1;
+        others <= RESTORE_REVS_MAX
+    });
+    found
+}
+
 /// Ревизия объекта, метки которой есть в правке агента (M7 §4.3.2 п. 2): её T, номер и, у узла,
 /// текст.
 #[derive(Debug, Clone)]
@@ -57,16 +88,19 @@ pub struct RevText {
     pub text: Option<String>,
 }
 
-/// Ревизии узла `id` (`1..=max_rev`) по меткам `‹secret-T-N›` текстов `edited` (§4.3.2 п. 2,
-/// финальное ревью M7.1, I-2): каждой T правки — ревизия с этой T, если она одна
-/// ([`revisions_by_tag`]); тексты читаются, кроме ревизий `known` (их тексты у вызывающего).
-/// Ревизии нет в базе — пропуск (метки — литералы). Без меток с T — ни одного чтения.
+/// Ревизии узла `id` (`1..=max_rev`, текущая — `max_rev`) по меткам `‹secret-T-N›` текстов
+/// `edited` (§4.3.2 п. 2, финальное ревью M7.1, I-2): каждой T правки — ревизия с этой T, если
+/// она одна ([`revisions_by_tag`]); не больше [`RESTORE_REVS_MAX`] прежних, ближайшие к текущей
+/// ([`nearest_revisions`]), и тексты читаются, пока их сумма не больше `max_bytes` (N-2: сверх —
+/// метки литералом); ревизии `known` не читаются (их тексты у вызывающего). Ревизии нет в базе —
+/// пропуск (метки — литералы). Без меток с T — ни одного чтения.
 pub async fn node_revisions(
     db: &Db,
     id: Id,
     max_rev: i64,
     edited: &[&str],
     known: &[i64],
+    max_bytes: usize,
 ) -> Result<Vec<RevText>, ApiError> {
     let found: Vec<(String, i64)> = {
         let tags = tags_in(edited.iter().copied());
@@ -75,19 +109,65 @@ pub async fn node_revisions(
             .map(|(t, k)| (t.to_string(), k))
             .collect()
     };
-    let mut out = Vec::with_capacity(found.len());
-    for (tag, rev) in found {
+    let mut out = Vec::new();
+    let mut loaded = 0usize;
+    for (tag, rev) in nearest_revisions(found, max_rev) {
         let text = if known.contains(&rev) {
             None
         } else {
             match node_base(db, id, rev).await? {
-                Some(t) => Some(t),
+                Some(t) if loaded + t.len() <= max_bytes => {
+                    loaded += t.len();
+                    Some(t)
+                }
+                // сверх суммы — эта и более старые ревизии без значений
+                Some(_) => break,
                 None => continue,
             }
         };
         out.push(RevText { tag, rev, text });
     }
     Ok(out)
+}
+
+/// Номера ревизий, давших значения (`from` — их T, [`Restored::from`]), кроме базовой `base_rev`,
+/// по возрастанию; `revs` — T и номер каждой ревизии масок.
+pub fn from_revs<'t>(
+    from: impl IntoIterator<Item = &'t String>,
+    revs: &[(String, i64)],
+    base_rev: i64,
+) -> Vec<i64> {
+    let mut out: Vec<i64> = from
+        .into_iter()
+        .filter_map(|t| revs.iter().find(|(tag, _)| tag == t).map(|(_, k)| *k))
+        .filter(|&k| k != base_rev)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Предупреждение [`SECRET_MARK_FROM_REV`] в ответ-объект `v` (строка `warnings` и список номеров);
+/// пустой список — ответ не меняется.
+pub fn attach_from_rev(v: &mut Value, revs: &[i64]) {
+    if revs.is_empty() {
+        return;
+    }
+    let list = revs
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    super::glossary::attach_warnings(
+        v,
+        vec![format!(
+            "{SECRET_MARK_FROM_REV}: {list} — значения меток взяты из прежних ревизий объекта, а не \
+             из базовой: если секрет с тех пор меняли, проверьте его в WebUI"
+        )],
+    );
+    if let Value::Object(o) = v {
+        o.insert(SECRET_MARK_FROM_REV.into(), json!(revs));
+    }
 }
 
 /// Маски ревизий `revs` узла: текст ревизии без своего (`None`) — из `known` (номер, текст); нет
@@ -142,8 +222,7 @@ pub async fn restore_owned(
 fn same(text: String) -> Restored {
     Restored {
         text,
-        kept: 0,
-        exposed: Vec::new(),
+        ..Restored::default()
     }
 }
 
@@ -230,12 +309,14 @@ impl Exposed {
 
 /// Строки поля записи — `new` (путь строки и сама строка) — по маскам объекта `masks`: значения
 /// на место, покрытие — по позициям восстановленных значений (места — в `ex` с путём строки);
-/// итог — предупреждение поля сверх `current_literals` (литералов исходника поля).
+/// итог — предупреждение поля сверх `current_literals` (литералов исходника поля); T ревизий,
+/// давших значения, — в `from`.
 fn restore_field(
     masks: &ObjectMasks,
     new: Vec<(String, &mut String)>,
     current_literals: usize,
     ex: &mut Exposed,
+    from: &mut Vec<String>,
 ) -> usize {
     let mut literals = 0;
     for (path, s) in new {
@@ -245,6 +326,7 @@ fn restore_field(
         let f = masks.fill_marks(s);
         ex.lines(Some(&path), &uncovered_lines(&f.text, &f.at));
         literals += f.literals;
+        from.extend(f.from);
         *s = f.text;
     }
     literals.saturating_sub(current_literals)
@@ -320,12 +402,21 @@ impl<'a> EntryTexts<'a> {
     /// Восстановление по маскам ревизий `revs` записи (у каждой — по всем её редактируемым полям
     /// в порядке нумерации, метка — `id` и ревизия; ревизии нашёл [`EntryRevs`]); `current` —
     /// текущая запись (литералы её полей — порог предупреждения, тело — основа дописки):
-    /// предупреждение; правка, выводящая секрет из-под маски, — 422 [`SECRET_CONTEXT_CHANGED`]
-    /// (ничего не записано).
-    pub fn restore(self, current: EntryBase, revs: &[EntryBase]) -> Result<usize, ApiError> {
+    /// предупреждение `secret_mark_kept` и номера ревизий, давших значения, кроме базовой
+    /// `base_rev` (`secret_mark_from_rev`, N-3); правка, выводящая секрет из-под маски, — 422
+    /// [`SECRET_CONTEXT_CHANGED`] (ничего не записано).
+    pub fn restore(
+        self,
+        current: EntryBase,
+        revs: &[EntryBase],
+        base_rev: i64,
+    ) -> Result<(usize, Vec<i64>), ApiError> {
         let mut masks = ObjectMasks::default();
+        let mut tags: Vec<(String, i64)> = Vec::with_capacity(revs.len());
         for r in revs {
-            masks.revision(&agent_view::object_tag(&r.id, r.rev));
+            let tag = agent_view::object_tag(&r.id, r.rev);
+            masks.revision(&tag);
+            tags.push((tag, r.rev));
             masks.add(r.title);
             masks.add(r.body);
             add_value(r.data, &mut masks);
@@ -336,6 +427,7 @@ impl<'a> EntryTexts<'a> {
         }
         let base = current;
         let mut ex = Exposed::default();
+        let mut from: Vec<String> = Vec::new();
         let mut kept = 0;
         if let Some(t) = self.title {
             kept += restore_field(
@@ -343,6 +435,7 @@ impl<'a> EntryTexts<'a> {
                 vec![("title".into(), t)],
                 literals_in(base.title),
                 &mut ex,
+                &mut from,
             );
         }
         if let Some(b) = self.body {
@@ -351,6 +444,7 @@ impl<'a> EntryTexts<'a> {
                 vec![("body".into(), b)],
                 literals_in(base.body),
                 &mut ex,
+                &mut from,
             );
         }
         if let Some(more) = self.append_body
@@ -373,6 +467,7 @@ impl<'a> EntryTexts<'a> {
                 .collect();
             ex.lines(Some("append_body"), &lines);
             kept += f.literals;
+            from.extend(f.from);
             *more = f.text;
         }
         if self.data.is_some() || !self.data_fields.is_empty() {
@@ -407,7 +502,7 @@ impl<'a> EntryTexts<'a> {
                 v => strings_ref(v, &mut cur),
             }
             let lit: usize = cur.iter().map(|s| literals_in(s)).sum();
-            kept += restore_field(&masks, new, lit, &mut ex);
+            kept += restore_field(&masks, new, lit, &mut ex, &mut from);
         }
         if let Some(t) = self.tags {
             let lit: usize = base.tags.iter().map(|s| literals_in(s)).sum();
@@ -416,14 +511,14 @@ impl<'a> EntryTexts<'a> {
                 .enumerate()
                 .map(|(i, s)| (format!("tags[{i}]"), s))
                 .collect();
-            kept += restore_field(&masks, new, lit, &mut ex);
+            kept += restore_field(&masks, new, lit, &mut ex, &mut from);
         }
         if let Some(a) = self.area {
             let lit = literals_in(base.area.unwrap_or(""));
-            kept += restore_field(&masks, vec![("area".into(), a)], lit, &mut ex);
+            kept += restore_field(&masks, vec![("area".into(), a)], lit, &mut ex, &mut from);
         }
         ex.check()?;
-        Ok(kept)
+        Ok((kept, from_revs(&from, &tags, base_rev)))
     }
 }
 
@@ -479,18 +574,54 @@ pub struct EntryRevs {
 }
 
 impl EntryRevs {
-    /// Ревизии записи `e` (`1..=e.rev`) по T меток правки `tags` ([`EntryTexts::tags`]); без
-    /// меток с T — ни одного чтения.
-    pub async fn load(db: &Db, e: &Entry, tags: &BTreeSet<String>) -> Result<Self, ApiError> {
+    /// Ревизии записи `e` (`1..=e.rev`) по T меток правки `tags` ([`EntryTexts::tags`]): не
+    /// больше [`RESTORE_REVS_MAX`] прежних, ближайшие к текущей, и снимки — пока их сумма не
+    /// больше `max_bytes` (N-2; сверх — метки литералом); без меток с T — ни одного чтения.
+    pub async fn load(
+        db: &Db,
+        e: &Entry,
+        tags: &BTreeSet<String>,
+        max_bytes: usize,
+    ) -> Result<Self, ApiError> {
         let set: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
-        let mut revs: Vec<i64> =
+        let found: Vec<(String, i64)> =
             revisions_by_tag(&set, e.rev, |k| agent_view::object_tag(&e.id, k))
-                .into_values()
+                .into_iter()
+                .map(|(t, k)| (t.to_string(), k))
                 .collect();
+        let near = nearest_revisions(found, e.rev);
+        let older: Vec<i64> = near
+            .iter()
+            .map(|(_, k)| *k)
+            .filter(|&k| k != e.rev)
+            .collect();
+        let mut rows = zam_store::entry_revisions_at(db, e.id, older).await?;
+        // ближайшие к текущей — первыми; сверх суммы — эта и более старые без значений
+        rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.rev));
+        let mut loaded = 0usize;
+        let mut kept_rows = Vec::with_capacity(rows.len());
+        for r in rows {
+            let size = r.title.len()
+                + r.body.len()
+                + r.data.to_string().len()
+                + r.tags.iter().map(String::len).sum::<usize>()
+                + r.area.as_ref().map_or(0, String::len);
+            if loaded + size > max_bytes {
+                break;
+            }
+            loaded += size;
+            kept_rows.push(r);
+        }
+        let mut revs: Vec<i64> = near
+            .into_iter()
+            .map(|(_, k)| k)
+            .filter(|&k| k == e.rev || kept_rows.iter().any(|r| r.rev == k))
+            .collect();
         revs.sort_unstable();
-        let older: Vec<i64> = revs.iter().copied().filter(|&k| k != e.rev).collect();
-        let older = zam_store::entry_revisions_at(db, e.id, older).await?;
-        Ok(EntryRevs { revs, older })
+        Ok(EntryRevs {
+            revs,
+            older: kept_rows,
+        })
     }
 
     /// Базы восстановления [`EntryTexts::restore`] — по возрастанию ревизии: текущая — запись `e`,
@@ -657,7 +788,7 @@ mod tests {
             ..EntryTexts::default()
         };
         assert_eq!(t.marks(), 10);
-        let kept = t.restore(base, &[base]).unwrap();
+        let kept = t.restore(base, &[base], 3).unwrap().0;
         assert_eq!(kept, 4);
         assert_eq!(title, format!("Ключ {k2} / token: {k1}"));
         assert_eq!(data["evidence"]["checked"], format!("token: {k1} (prod)"));
@@ -696,7 +827,8 @@ mod tests {
             ..EntryTexts::default()
         };
         assert_eq!(t.tags().len(), 3);
-        assert_eq!(t.restore(cur, &[old, cur]).unwrap(), 1);
+        // значение из ревизии 2 при базе 3 — `secret_mark_from_rev: 2` (N-3)
+        assert_eq!(t.restore(cur, &[old, cur], 3).unwrap(), (1, vec![2]));
         assert!(
             body.starts_with(&format!(
                 "из 2: token: {k2}\nиз 3: новый: {k3}\nиз 1: ‹secret-"
@@ -723,7 +855,7 @@ mod tests {
             data: Some(&mut data),
             ..EntryTexts::default()
         };
-        let e = t.restore(base, &[base]).unwrap_err();
+        let e = t.restore(base, &[base], 3).unwrap_err();
         let s = e.to_string();
         assert!(matches!(e, ApiError::SecretContextChanged(_)), "{s}");
         assert!(
@@ -747,14 +879,14 @@ mod tests {
             append_body: Some(&mut more),
             ..EntryTexts::default()
         };
-        assert_eq!(t.restore(base, &[base]).unwrap(), 1);
+        assert_eq!(t.restore(base, &[base], 3).unwrap().0, 1);
         assert_eq!(more, format!("прод: password = {p} и ‹secret-ffffff-1›"));
         let mut more = format!("прод:\nтекст\nпароль — {}", m(1));
         let t = EntryTexts {
             append_body: Some(&mut more),
             ..EntryTexts::default()
         };
-        let s = t.restore(base, &[base]).unwrap_err().to_string();
+        let s = t.restore(base, &[base], 3).unwrap_err().to_string();
         assert!(
             s.contains("append_body: строка 3") && !s.contains(&p),
             "{s}"
@@ -767,7 +899,46 @@ mod tests {
             append_body: Some(&mut more),
             ..EntryTexts::default()
         };
-        assert_eq!(t.restore(base, &[base]).unwrap(), 0);
+        assert_eq!(t.restore(base, &[base], 3).unwrap().0, 0);
+    }
+
+    /// Предел ревизий по меткам (N-2): текущая — всегда, прежних — не больше
+    /// [`RESTORE_REVS_MAX`], ближайшие к текущей; номера ревизий значений (N-3) — без базовой, по
+    /// возрастанию, без повторов; предупреждение — строка и список.
+    #[test]
+    fn nearest_revisions_and_from_rev() {
+        let found: Vec<(String, i64)> = (1..=20).map(|k| (format!("t{k}"), k)).collect();
+        let near = nearest_revisions(found, 20);
+        let revs: Vec<i64> = near.iter().map(|(_, k)| *k).collect();
+        assert_eq!(revs, (12..=20).rev().collect::<Vec<_>>());
+        // текущей среди меток нет — прежних всё равно не больше предела
+        let found: Vec<(String, i64)> = (1..=20).map(|k| (format!("t{k}"), k)).collect();
+        assert_eq!(nearest_revisions(found, 30).len(), RESTORE_REVS_MAX);
+        let pairs = vec![
+            ("a".to_string(), 3),
+            ("b".to_string(), 5),
+            ("c".to_string(), 7),
+        ];
+        let from = [
+            "c".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "x".to_string(),
+        ];
+        assert_eq!(from_revs(&from, &pairs, 7), vec![3]);
+        assert_eq!(from_revs(&from, &pairs, 5), vec![3, 7]);
+        let mut v = json!({"id": "x"});
+        attach_from_rev(&mut v, &[]);
+        assert_eq!(v, json!({"id": "x"}));
+        attach_from_rev(&mut v, &[3, 7]);
+        assert_eq!(v[SECRET_MARK_FROM_REV], json!([3, 7]));
+        assert!(
+            v["warnings"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("secret_mark_from_rev: 3, 7 — "),
+            "{v}"
+        );
     }
 
     /// Предупреждение: строка в `warnings` (к прежним) и число; без меток — ответ как есть.

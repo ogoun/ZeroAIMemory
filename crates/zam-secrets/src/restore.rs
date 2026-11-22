@@ -46,7 +46,7 @@ use std::ops::Range;
 use crate::{Mark, NUMBERED_MARK_PREFIX, SECRET_MARK, has_any_mark, marks, scan_secrets};
 
 /// Итог восстановления поля.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Restored {
     /// Текст со значениями на месте меток объекта.
     pub text: String,
@@ -55,10 +55,13 @@ pub struct Restored {
     pub kept: usize,
     /// Строки итога (с 1, по возрастанию), где значение секрета не покрыто находкой целиком.
     pub exposed: Vec<usize>,
+    /// Метки T ревизий, давших значения (без повторов, по первому появлению) — предупреждение
+    /// `secret_mark_from_rev` у ревизий, отличных от базовой (финальное ревью M7.1, N-3).
+    pub from: Vec<String>,
 }
 
 /// Текст со значениями и их позициями.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filled {
     pub text: String,
     /// Позиции значений в `text` (восстановленных и, у [`Deferred`], перенесённых без правки), по
@@ -66,6 +69,8 @@ pub struct Filled {
     pub at: Vec<Range<usize>>,
     /// Меток-литералов в `text`.
     pub literals: usize,
+    /// Метки T ревизий, давших значения ([`Restored::from`]).
+    pub from: Vec<String>,
 }
 
 impl Filled {
@@ -76,7 +81,15 @@ impl Filled {
             exposed: uncovered_lines(&self.text, &self.at),
             kept: self.literals.saturating_sub(current_literals),
             text: self.text,
+            from: self.from,
         }
+    }
+}
+
+/// `tag` — в список `from` без повторов.
+fn note_from(from: &mut Vec<String>, tag: &str) {
+    if !from.iter().any(|t| t == tag) {
+        from.push(tag.to_owned());
     }
 }
 
@@ -131,8 +144,7 @@ pub fn restore(tag: &str, base: &str, edited: &str) -> Restored {
     if !has_mark(edited) {
         return Restored {
             text: edited.to_owned(),
-            kept: 0,
-            exposed: Vec::new(),
+            ..Restored::default()
         };
     }
     let mut m = ObjectMasks::new(tag);
@@ -307,6 +319,7 @@ impl<'a> ObjectMasks<'a> {
         let crlf = edited.contains("\r\n");
         let mut text = String::with_capacity(edited.len());
         let mut at = Vec::new();
+        let mut from = Vec::new();
         let (mut pos, mut literals) = (0, 0);
         for (m, k) in marks(edited) {
             text.push_str(&edited[pos..m.start]);
@@ -315,6 +328,9 @@ impl<'a> ObjectMasks<'a> {
                     let s = text.len();
                     push_value(&mut text, v, crlf);
                     at.push(s..text.len());
+                    if let Mark::Tagged(t, _) = k {
+                        note_from(&mut from, t);
+                    }
                 }
                 None => {
                     text.push_str(&edited[m.clone()]);
@@ -324,7 +340,12 @@ impl<'a> ObjectMasks<'a> {
             pos = m.end;
         }
         text.push_str(&edited[pos..]);
-        Filled { text, at, literals }
+        Filled {
+            text,
+            at,
+            literals,
+            from,
+        }
     }
 
     /// Восстановление поля `edited`: предупреждение — сверх `current_literals` (литералов
@@ -340,12 +361,12 @@ impl<'a> ObjectMasks<'a> {
         let mut pos = 0;
         for (m, k) in marks(edited) {
             out.push_str(&edited[pos..m.start]);
-            match self.value(k) {
-                Some(v) => {
-                    d.values.push(v);
+            match (self.value(k), k) {
+                (Some(v), Mark::Tagged(t, _)) => {
+                    d.values.push((v, t.to_owned()));
                     let _ = write!(out, "{0}{1}{0}", d.sentinel, d.values.len() - 1);
                 }
-                None => out.push_str(&edited[m.clone()]),
+                _ => out.push_str(&edited[m.clone()]),
             }
             pos = m.end;
         }
@@ -421,7 +442,8 @@ fn view_into<'r>(raw: &'r str, tag: &str, mut take: impl FnMut(&'r str) -> usize
 /// одном тексте сборки; [`Deferred::finish`] ставит значения.
 #[derive(Debug)]
 pub struct Deferred<'a> {
-    values: Vec<&'a str>,
+    /// Значение и метка T его ревизии.
+    values: Vec<(&'a str, String)>,
     sentinel: char,
 }
 
@@ -456,6 +478,7 @@ impl<'a> Deferred<'a> {
         let crlf = text.contains("\r\n");
         let mut out = String::with_capacity(text.len());
         let mut at: Vec<Range<usize>> = Vec::new();
+        let mut from = Vec::new();
         // сдвиг позиций `text` → итог после каждого поставленного значения
         let mut shifts: Vec<(usize, isize)> = Vec::new();
         let s = self.sentinel;
@@ -471,11 +494,12 @@ impl<'a> Deferred<'a> {
                 .ok()
                 .and_then(|k| self.values.get(k))
             {
-                Some(v) => {
+                Some((v, tag)) => {
                     out.push_str(&text[pos..i]);
                     let start = out.len();
                     push_value(&mut out, v, crlf);
                     at.push(start..out.len());
+                    note_from(&mut from, tag);
                     pos = j + w;
                     shifts.push((pos, out.len() as isize - pos as isize));
                 }
@@ -497,6 +521,7 @@ impl<'a> Deferred<'a> {
             literals: marks_in(&out),
             text: out,
             at,
+            from,
         }
     }
 }

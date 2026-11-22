@@ -1387,6 +1387,61 @@ fn init_block_public_url_token_under_block_address() {
     assert_eq!(std::fs::read_to_string(home_cfg(&p)).unwrap(), before);
 }
 
+/// Адрес блока с другим токеном (финальное ревью M7.1, N-1): адрес назвал сервер
+/// (`server.public_url`), поэтому `zam init --token` его токен не заменяет — предупреждение одной
+/// строкой с этим адресом; токен `--url` записан, строка «Токен сохранён» называет только его.
+#[test]
+fn init_block_public_url_other_token_kept() {
+    let (url, public, tok) = start_public("public-url-other");
+    let p = Proj::new("public-url-other", &url, &tok);
+    let other = ["zam_", &"7".repeat(40)].concat();
+    let cfg = home_cfg(&p);
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    std::fs::write(
+        &cfg,
+        format!("[servers.\"{public}\"]\ntoken = \"{other}\"\n"),
+    )
+    .unwrap();
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    let home: toml::Table = toml::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(
+        home["servers"][public.as_str()]["token"].as_str(),
+        Some(other.as_str()),
+        "токен адреса блока не тронут: {home:?}"
+    );
+    assert_eq!(
+        home["servers"][url.as_str()]["token"].as_str(),
+        Some(tok.as_str()),
+        "{home:?}"
+    );
+    let e = err(&o);
+    let warn: Vec<&str> = e
+        .lines()
+        .filter(|l| l.contains("уже другой токен"))
+        .collect();
+    assert_eq!(warn.len(), 1, "{e}");
+    assert!(
+        warn[0].contains(&format!(
+            "под адресом {public} уже другой токен — не заменён"
+        )),
+        "{e}"
+    );
+    assert!(
+        !e.contains(&other) && !e.contains(&tok),
+        "токены в выводе: {e}"
+    );
+    let s = out(&o);
+    let saved = s
+        .lines()
+        .find(|l| l.starts_with("Токен сохранён"))
+        .unwrap_or_else(|| panic!("нет строки «Токен сохранён»: {s}"));
+    assert!(
+        saved.contains(&format!("[servers.\"{url}\"] (его берут")) && !saved.contains(&public),
+        "{saved}"
+    );
+}
+
 /// M6.6 §10.1 (замечание 1): `--url-to home` — блок без строки адреса, адрес — в домашнем
 /// конфиге (токен и свои ключи там не трогаются), `zam status` без флагов находит сервер.
 #[test]

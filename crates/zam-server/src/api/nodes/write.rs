@@ -286,25 +286,28 @@ pub async fn replace(
     } else {
         None
     };
-    let (content, kept, base_text) = match base_text {
+    let (content, (kept, from), base_text) = match base_text {
         Some(b) => {
             // метки любой ревизии узла (§4.3.2 п. 2): вид, прочитанный до прошлой записи агента,
-            // тоже возвращает значения
+            // тоже возвращает значения; ревизий и байт — в пределах (N-2)
             let revs = secret_restore::node_revisions(
                 &sc.db,
                 sc.node.id,
                 sc.node.current_rev.max(base),
                 &[&req.content],
                 &[base],
+                restore_bytes(&st),
             )
             .await?;
+            let pairs = rev_pairs(&revs);
             let (r, b) = secret_restore::restore_owned(revs, base, b, req.content).await?;
             let mut ex = secret_restore::Exposed::default();
             ex.add(None, &r);
             ex.check()?;
-            (r.text, r.kept, Some(b))
+            let from = secret_restore::from_revs(&r.from, &pairs, base);
+            (r.text, (r.kept, from), Some(b))
         }
-        None => (req.content, 0, None),
+        None => (req.content, (0, Vec::new()), None),
     };
     // предел — и по итоговому тексту
     check_size(&st, &content)?;
@@ -343,11 +346,26 @@ pub async fn replace(
             .await?;
             if fresh {
                 secret_restore::attach_kept(&mut v, kept);
+                secret_restore::attach_from_rev(&mut v, &from);
             }
             Ok(Json(v))
         }
         Err(e) => Err(write_error(&p, &sc.db, sc.node.id, base, e).await),
     }
+}
+
+/// Предел исходника прежних ревизий одной записи агента (N-2): `limits.note_max_bytes` ×
+/// [`secret_restore::RESTORE_BYTES_FACTOR`].
+pub(crate) fn restore_bytes(st: &AppState) -> usize {
+    st.cfg
+        .limits
+        .note_max_bytes
+        .saturating_mul(secret_restore::RESTORE_BYTES_FACTOR)
+}
+
+/// T и номер каждой ревизии масок узла.
+fn rev_pairs(revs: &[secret_restore::RevText]) -> Vec<(String, i64)> {
+    revs.iter().map(|r| (r.tag.clone(), r.rev)).collect()
 }
 
 #[derive(Deserialize)]
@@ -448,9 +466,16 @@ async fn patch_by_view(
                 section.into_iter().chain(std::iter::once(content))
             })
             .collect();
-        let revs =
-            secret_restore::node_revisions(&sc.db, id, cur_rev, &edited, &[cur_rev, req.base_rev])
-                .await?;
+        let revs = secret_restore::node_revisions(
+            &sc.db,
+            id,
+            cur_rev,
+            &edited,
+            &[cur_rev, req.base_rev],
+            restore_bytes(st),
+        )
+        .await?;
+        let pairs = rev_pairs(&revs);
         let ops = req.ops.clone();
         let (base_rev, tag) = (req.base_rev, agent_view::object_tag(&id, req.base_rev));
         let big = current.len()
@@ -482,6 +507,7 @@ async fn patch_by_view(
         let mut ex = secret_restore::Exposed::default();
         ex.add(None, &restored);
         ex.check()?;
+        let from = secret_restore::from_revs(&restored.from, &pairs, req.base_rev);
         #[cfg(feature = "test-hooks")]
         patch_race(&sc.db, id, cur_rev, &attrib).await;
         let w = patch_note_prepared(
@@ -507,6 +533,7 @@ async fn patch_by_view(
                 let mut v = node_reply(st, p, &sc.db, sc.space.id, &n, &text, base).await?;
                 if fresh {
                     secret_restore::attach_kept(&mut v, restored.kept);
+                    secret_restore::attach_from_rev(&mut v, &from);
                 }
                 return Ok(Json(v));
             }
