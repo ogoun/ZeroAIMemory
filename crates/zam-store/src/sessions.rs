@@ -678,11 +678,20 @@ pub struct QueueShown {
     pub at: Timestamp,
 }
 
+impl QueueShown {
+    /// Показ покрывает очередь из `total` идей с последней ревизией `changed_at` (M7.1 §4.5 п. 1):
+    /// очередь не длиннее показанной и ни одна её идея не новее показа. Не покрывает — строку
+    /// очереди показывают снова (идея пришла, вернулась на разбор или правлена после показа).
+    pub fn covers(&self, total: usize, changed_at: Option<Timestamp>) -> bool {
+        total <= self.total && changed_at.is_none_or(|changed| changed <= self.at)
+    }
+}
+
 /// Последний показ очереди разбора идей базы владельца `owner` сессии в эпоху `epoch` (M7.1
 /// §4.5 п. 1): отметка части [`REVIEW_QUEUE_PART`] с самым поздним `seen_at` — число идей
 /// очереди при том показе и его время (ревью задачи 4, Minor 1: с наибольшим числом за эпоху
 /// идея, пришедшая после того, как очередь разобрали, ждала бы сжатия); показа в эпохе не было —
-/// `None`. Одно чтение на запрос.
+/// `None`. Одно чтение на запрос; вместе с головой очереди — `zam_store::review_queue_state`.
 pub async fn review_queue_shown(
     db: &Db,
     session: &str,
@@ -690,26 +699,34 @@ pub async fn review_queue_shown(
     epoch: u32,
 ) -> Result<Option<QueueShown>, StoreError> {
     let session = session.to_string();
-    db.read(move |c| {
-        let row: Option<(i64, String)> = c
-            .prepare_cached(
-                "SELECT rev, seen_at FROM session_seen
-                 WHERE session_id = ?1 AND owner_id = ?2 AND part = ?3 AND epoch = ?4
-                 ORDER BY seen_at DESC LIMIT 1",
-            )?
-            .query_row(params![session, owner, REVIEW_QUEUE_PART, epoch], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?;
-        let Some((total, at)) = row else {
-            return Ok(None);
-        };
-        Ok(Some(QueueShown {
-            total: usize::try_from(total).unwrap_or(0),
-            at: crate::time::parse_ts(&at)?,
-        }))
-    })
-    .await
+    db.read(move |c| queue_shown_in(c, &session, owner, epoch))
+        .await
+}
+
+/// [`review_queue_shown`] на соединении `c`.
+pub(crate) fn queue_shown_in(
+    c: &rusqlite::Connection,
+    session: &str,
+    owner: Id,
+    epoch: u32,
+) -> Result<Option<QueueShown>, StoreError> {
+    let row: Option<(i64, String)> = c
+        .prepare_cached(
+            "SELECT rev, seen_at FROM session_seen
+             WHERE session_id = ?1 AND owner_id = ?2 AND part = ?3 AND epoch = ?4
+             ORDER BY seen_at DESC LIMIT 1",
+        )?
+        .query_row(params![session, owner, REVIEW_QUEUE_PART, epoch], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    let Some((total, at)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(QueueShown {
+        total: usize::try_from(total).unwrap_or(0),
+        at: crate::time::parse_ts(&at)?,
+    }))
 }
 
 /// Таблицы с `session_id → sessions(id)` без каскада: [`gc_sessions`] чистит их до сессий.

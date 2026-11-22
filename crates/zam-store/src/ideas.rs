@@ -38,6 +38,7 @@ use crate::nodes::Attribution;
 use crate::questions::{
     AnswerBy, Channel, NormalizedAnswer, QuestionData, QuestionError, answer_tx, in_list,
 };
+use crate::sessions::QueueShown;
 use crate::tasks::{TASK_LINK_MAX_CHARS, TASK_LINKS_MAX, TaskData, links_field};
 use crate::time::{fmt_ts, parse_ts, ser_ts, utc_today};
 use crate::user_db::SpaceKind;
@@ -2692,25 +2693,103 @@ pub struct ReviewQueueHead {
 /// только первой.
 pub async fn review_queue_head(db: &Db, space: Id) -> Result<ReviewQueueHead, StoreError> {
     db.read(move |c| {
-        let (n, changed): (i64, Option<String>) = c
-            .prepare_cached(&format!(
-                "SELECT count(*), max(e.updated_at) {REVIEW_QUEUE_SQL}"
-            ))?
-            .query_row([space], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        let first = if n == 0 {
+        let (total, changed_at) = queue_size(c, space)?;
+        let first = if total == 0 {
             None
         } else {
-            c.prepare_cached(&format!(
-                "SELECT {ENTRY_COLS} {REVIEW_QUEUE_SQL}
-                 ORDER BY {PRIORITY_DESC}, e.created_at, e.id
-                 LIMIT 1"
-            ))?
-            .query_row([space], entry_row)
-            .optional()?
+            queue_first(c, space)?
         };
         Ok(ReviewQueueHead {
-            total: usize::try_from(n).unwrap_or(0),
-            changed_at: changed.as_deref().map(parse_ts).transpose()?,
+            total,
+            changed_at,
+            first,
+        })
+    })
+    .await
+}
+
+/// Длина очереди разбора пространства `space` и время последней ревизии её идей.
+fn queue_size(c: &Connection, space: Id) -> Result<(usize, Option<Timestamp>), StoreError> {
+    let (n, changed): (i64, Option<String>) = c
+        .prepare_cached(&format!(
+            "SELECT count(*), max(e.updated_at) {REVIEW_QUEUE_SQL}"
+        ))?
+        .query_row([space], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok((
+        usize::try_from(n).unwrap_or(0),
+        changed.as_deref().map(parse_ts).transpose()?,
+    ))
+}
+
+/// Первая идея очереди разбора пространства `space` (`high` первыми, затем самые старые).
+fn queue_first(c: &Connection, space: Id) -> Result<Option<Entry>, StoreError> {
+    Ok(c.prepare_cached(&format!(
+        "SELECT {ENTRY_COLS} {REVIEW_QUEUE_SQL}
+         ORDER BY {PRIORITY_DESC}, e.created_at, e.id
+         LIMIT 1"
+    ))?
+    .query_row([space], entry_row)
+    .optional()?)
+}
+
+/// Сессия, чей показ очереди читает [`review_queue_state`]: id сессии, владелец базы решения
+/// (`session_seen.owner_id`) и эпоха.
+#[derive(Debug, Clone)]
+pub struct QueueSeenKey {
+    pub session: String,
+    pub owner: Id,
+    pub epoch: u32,
+}
+
+/// Состояние строки очереди разбора к `prompt` ([`review_queue_state`]).
+#[derive(Debug, Clone)]
+pub struct ReviewQueueState {
+    /// Длина очереди [`review_queue`].
+    pub total: usize,
+    /// Время последней ревизии идей очереди; очередь пуста — `None`.
+    pub changed_at: Option<Timestamp>,
+    /// Последний показ очереди сессии в эпоху ([`crate::review_queue_shown`]); без сессии или при
+    /// пустой очереди — `None`.
+    pub shown: Option<QueueShown>,
+    /// Первая идея очереди — только когда очередь не пуста и показ её не покрывает
+    /// ([`QueueShown::covers`]): строку нужно показать.
+    pub first: Option<Entry>,
+}
+
+/// Строка очереди разбора к `prompt` одним чтением базы (M7.1 §4.8, профиль задачи 9): длина
+/// очереди пространства `space` и время её последней ревизии ([`review_queue_head`]), последний
+/// показ сессии `seen` в её эпоху ([`crate::review_queue_shown`]: `session_seen` лежит в той же
+/// базе пользователя) и первая идея — только если показ очередь не покрывает. Раньше — два
+/// чтения (у каждого — свой переход в пул блокирующих потоков) и первая идея на каждом запросе,
+/// даже когда строка в эту эпоху уже показана. Пустая очередь — без чтения показа.
+pub async fn review_queue_state(
+    db: &Db,
+    space: Id,
+    seen: Option<QueueSeenKey>,
+) -> Result<ReviewQueueState, StoreError> {
+    db.read(move |c| {
+        let (total, changed_at) = queue_size(c, space)?;
+        if total == 0 {
+            return Ok(ReviewQueueState {
+                total,
+                changed_at,
+                shown: None,
+                first: None,
+            });
+        }
+        let shown = match &seen {
+            Some(k) => crate::sessions::queue_shown_in(c, &k.session, k.owner, k.epoch)?,
+            None => None,
+        };
+        let first = if shown.is_some_and(|s| s.covers(total, changed_at)) {
+            None
+        } else {
+            queue_first(c, space)?
+        };
+        Ok(ReviewQueueState {
+            total,
+            changed_at,
+            shown,
             first,
         })
     })

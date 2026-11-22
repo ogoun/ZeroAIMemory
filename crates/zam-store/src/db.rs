@@ -50,6 +50,13 @@ use crate::StoreError;
 use crate::migrate::{self, Migration};
 
 const READERS: usize = 4;
+/// Подготовленных запросов в кэше соединения (`prepare_cached`). У rusqlite по умолчанию 16 — LRU,
+/// а путь `/recall(prompt)` берёт на одном соединении больше разных запросов (каналы FTS — свой
+/// текст на каждое число пространств), и при обходе по кругу кэш вытеснял их все: запросы
+/// готовились заново на каждом вызове. M6.6 добавил запросы (задача по заголовку, очередь разбора)
+/// и около 1 мс к p95. С 128 медиана сервера на мире приёмки — 6,3 мс вместо 8,0 (M7.1 §4.8,
+/// профиль задачи 9); память — подготовленные запросы, порядка мегабайт на базу.
+const STATEMENT_CACHE: usize = 128;
 /// Ожидание блокировки записи потоком-писателем (см. документацию модуля).
 pub const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -324,6 +331,7 @@ impl std::fmt::Debug for Db {
 fn set_common_pragmas(conn: &Connection) -> Result<(), StoreError> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     Ok(())
 }
 

@@ -839,6 +839,24 @@ pub async fn search_fts_channels_light(
     fts_channels(db, q, Some(light)).await
 }
 
+/// Есть ли в пространствах `spaces` живая запись видов, статусов и id фильтра `t` — условия
+/// ветки записей [`scope_sql`] без остальных (область, `certainty`, файл…): нет такой записи — нет
+/// и чанка записи, который фильтр пропустил бы. Индекс `entries_feed`.
+fn any_live_entry(c: &Connection, spaces: &[Id], t: &TargetArgs) -> Result<bool, StoreError> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM entries e
+           WHERE e.space_id IN ({}) AND e.deleted_at IS NULL
+             AND e.kind IN (SELECT value FROM json_each(?1))
+             AND (e.status IS NULL OR ?2 IS NULL OR e.status IN (SELECT value FROM json_each(?2)))
+             AND (?3 IS NULL OR e.id IN (SELECT value FROM json_each(?3))))",
+        placeholders(4, spaces.len())
+    );
+    let mut args: Vec<&dyn ToSql> = vec![&t.kinds, &t.statuses, &t.entry_ids];
+    args.extend(spaces.iter().map(|s| s as &dyn ToSql));
+    Ok(c.prepare_cached(&sql)?
+        .query_row(params_from_iter(args), |r| r.get(0))?)
+}
+
 async fn fts_channels(
     db: &Db,
     q: FtsQuery,
@@ -847,12 +865,21 @@ async fn fts_channels(
     let (spaces, prefix) = check_query(&q)?;
     db.read(move |c| {
         let tx = c.unchecked_transaction()?;
+        let targs = q.targets.args();
+        // фильтр только по записям (без заметок и вложений), а живых записей его видов и статусов
+        // в области нет — каналы пусты без MATCH: ответ тот же, что у трёх пустых проходов
+        // (строгий, ослабленный, триграммы). Подсказка-задача к `prompt` на базе без открытых задач
+        // платила за них на каждом запросе (M7.1 §4.8, профиль задачи 9: 0,6 мс вместе с
+        // промахами кэша подготовленных запросов)
+        if !targs.notes && !targs.attachments && !any_live_entry(&tx, &spaces, &targs)? {
+            return Ok(FtsChannels::default());
+        }
         let ch = run_channels(
             &tx,
             &q.text,
             prefix.as_deref(),
             &spaces,
-            &q.targets.args(),
+            &targs,
             &q.alias_groups,
             light.map(|l| l.channel_depth),
             light.is_some_and(|l| l.any_terms),

@@ -14,7 +14,10 @@
 //!   `source=compact` при `[hooks] recovery = true`; идеи; `zam mcp` (неявный путь);
 //!   `zam code sync` (`recv_count` 0);
 //! - `acceptance_hook_budgets` (§17 п. 15, `#[ignore]`, тихое окно) — p95 `/recall(prompt)`
-//!   release-серверов M6 и v0.0.10-m5.7 вперемешку: медиана по раундам отношения p95 ≤ 1,10.
+//!   release-сервера ветки и **предыдущего выпуска** ([`PREV_RELEASE`], `target/tags/<тег>/release`
+//!   или `ZAM_PREV_SERVER_BIN`) вперемешку: медиана по раундам отношения p95 ≤ 1,10 (M7.1 §4.8
+//!   п. 3 **[решение координатора]**: база — предыдущий выпуск, а не замороженная M5.7; накопленный
+//!   рост держат абсолютные пороги `m57_acceptance` и бюджеты хуков).
 //!   Прочие бюджеты хуков §17 п. 15 — release-серии `m4_acceptance::hook_budgets*` задачи 17d
 //!   (`relr2-1`, `relr2-2` — 4 из 4, журнал этапа), `m56_acceptance::acceptance_hook_budgets_with_map`,
 //!   `m57_acceptance::acceptance_recall_p95_with_50_ideas`.
@@ -667,6 +670,31 @@ fn compat_old_zam_new_server() {
 
 // ---------- §17 п. 15: p95 /recall(prompt) ----------
 
+/// Предыдущий выпуск — база сравнения p95 `/recall(prompt)` (M7.1 §4.8 п. 3): тег и версия
+/// `/health`. С каждым выпуском сдвигается на него.
+const PREV_RELEASE: (&str, &str) = ("v0.0.13-m6.6", "0.0.13-m6.6");
+
+/// Release `zam-server` предыдущего выпуска [`PREV_RELEASE`]: `ZAM_PREV_SERVER_BIN` или
+/// `target/tags/<тег>/release/zam-server` (сборка тега — как у баз M6: `git archive` тега,
+/// `ZAM_GIT_SHA`, `--target-dir target/tags/<тег>`).
+fn prev_release_server() -> Option<PathBuf> {
+    let p = std::env::var_os("ZAM_PREV_SERVER_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            common::repo_root()
+                .join("target/tags")
+                .join(PREV_RELEASE.0)
+                .join("release")
+                .join(exe("zam-server"))
+        });
+    if p.is_file() {
+        Some(p)
+    } else {
+        eprintln!("нет {} (ZAM_PREV_SERVER_BIN) — пропуск", p.display());
+        None
+    }
+}
+
 /// Release `zam-server` M6: `ZAM_M6_SERVER_BIN` или `zam-server` рядом с бинарником теста.
 fn m6_release_server() -> Option<PathBuf> {
     let p = std::env::var_os("ZAM_M6_SERVER_BIN")
@@ -757,27 +785,26 @@ fn p95(mut v: Vec<Duration>) -> Duration {
     v[(v.len() * 95).div_ceil(100) - 1]
 }
 
-/// §17 п. 15: p95 `/recall(prompt)` release-сервера M6 не хуже v0.0.10-m5.7 + 10 %: один мир
+/// §17 п. 15: p95 `/recall(prompt)` release-сервера ветки не хуже предыдущего выпуска + 10 %
+/// ([`PREV_RELEASE`]; до M7.1 база — замороженная v0.0.10-m5.7, M7.1 §4.8 п. 3): один мир
 /// (30 заметок, 10 insight, 50 идей) в двух каталогах, серверы без моделей; 5 раундов по 40
 /// вызовов на сервер вперемешку (общий фон нагрузки), каждый вызов — новая сессия; критерий —
-/// медиана по раундам отношения p95 M6 / M5.7 ≤ 1,10 (предрегистрация 13b). Время — запрос по
-/// петле целиком глазами клиента (`ureq`). Запуск — в тихом окне:
+/// медиана по раундам отношения p95 ветка / предыдущий выпуск ≤ 1,10 (предрегистрация 13b).
+/// Время — запрос по петле целиком глазами клиента (`ureq`). Запуск — в тихом окне и только
+/// release (отладочный сервер против release-тега даёт отношение ≈ 3):
 /// `cargo test -p zam-cli --release --test m6_acceptance acceptance_hook_budgets -- --ignored
-/// --nocapture`.
+/// --exact --nocapture --test-threads 1`.
 #[test]
-#[ignore = "замер времени для приёмки: release, тихое окно, бинарники M6 и v0.0.10-m5.7"]
+#[ignore = "замер времени для приёмки: release, тихое окно, бинарники ветки и предыдущего выпуска"]
 fn acceptance_hook_budgets() {
     let _g = serial();
-    let (Some(old), Some(new)) = (
-        tag_bin("ZAM_M57_SERVER_BIN", "zam-server"),
-        m6_release_server(),
-    ) else {
+    let (Some(old), Some(new)) = (prev_release_server(), m6_release_server()) else {
         return;
     };
-    let so = Srv::start(&old, "p95-m57");
-    let sn = Srv::start(&new, "p95-m6");
-    assert_eq!(so.version(), "0.0.10-m5.7");
-    eprintln!("ZAM_INFO сервер M6: {}", sn.version());
+    let so = Srv::start(&old, "p95-prev");
+    let sn = Srv::start(&new, "p95-new");
+    assert_eq!(so.version(), PREV_RELEASE.1, "база — предыдущий выпуск");
+    eprintln!("ZAM_INFO сервер ветки: {}", sn.version());
     load_world(&so);
     load_world(&sn);
     let prompts = [
@@ -811,8 +838,9 @@ fn acceptance_hook_budgets() {
         let (po, pn) = (p95(a.clone()), p95(b.clone()));
         let r = pn.as_secs_f64() / po.as_secs_f64();
         eprintln!(
-            "ZAM_TIMING m6 p95 /recall(prompt) раунд {round}: M5.7 p50 {:?} p95 {po:?}; M6 p50 {:?} \
-             p95 {pn:?}; отношение {r:.3}",
+            "ZAM_TIMING m6 p95 /recall(prompt) раунд {round}: {} p50 {:?} p95 {po:?}; ветка p50 \
+             {:?} p95 {pn:?}; отношение {r:.3}",
+            PREV_RELEASE.0,
             common::quantile(&a, 50),
             common::quantile(&b, 50)
         );
@@ -820,9 +848,13 @@ fn acceptance_hook_budgets() {
     }
     ratios.sort_by(f64::total_cmp);
     let med = ratios[ROUNDS / 2];
-    eprintln!("ZAM_TIMING m6 p95 /recall(prompt): медиана отношения {med:.3} (порог 1,10)");
+    eprintln!(
+        "ZAM_TIMING m6 p95 /recall(prompt) к {}: медиана отношения {med:.3} (порог 1,10)",
+        PREV_RELEASE.0
+    );
     assert!(
         med <= 1.10,
-        "p95 /recall(prompt) M6 хуже v0.0.10-m5.7 + 10 %: {ratios:?}"
+        "p95 /recall(prompt) ветки хуже {} + 10 %: {ratios:?}",
+        PREV_RELEASE.0
     );
 }

@@ -1033,6 +1033,75 @@ async fn review_queue_head_first_and_changed_at() {
     assert_eq!(review_queue_head(&db, kn).await.unwrap().total, 1);
 }
 
+/// Строка очереди одним чтением (M7.1 §4.8, задача 9): без сессии и без показа в эпоху — длина,
+/// время и первая идея, как у [`review_queue_head`]; показ эпохи, покрывающий очередь, —
+/// первой идеи нет; очередь выросла или идея очереди правлена после показа — первая снова есть;
+/// показ другой эпохи и другого владельца не считается; пустая очередь — без показа.
+#[tokio::test]
+async fn review_queue_state_reads_shown_once() {
+    use zam_store::{QueueSeenKey, SeenItem, SeenKey, SessionTouch, review_queue_state};
+    let (db, sol, _) = setup("queue-state").await;
+    let owner = Id::new();
+    let key = |epoch| {
+        Some(QueueSeenKey {
+            session: "q".into(),
+            owner,
+            epoch,
+        })
+    };
+    let state = |epoch| review_queue_state(&db, sol, key(epoch));
+    let s = state(0).await.unwrap();
+    assert_eq!((s.total, s.shown, s.first.is_none()), (0, None, true));
+    let old = new_idea(&db, sol, "Старая", "human", "normal").await;
+    new_idea(&db, sol, "Новая", "human", "normal").await;
+    let head = review_queue_head(&db, sol).await.unwrap();
+    let s = review_queue_state(&db, sol, None).await.unwrap();
+    assert_eq!((s.total, s.changed_at, s.shown), (2, head.changed_at, None));
+    assert_eq!(s.first.map(|e| e.id), Some(old.id));
+    // показ очереди из 2 идей в эпоху 0 (как отметка учёта ответа `queue_mark`)
+    let show = |owner_id, epoch, total| {
+        let db = db.clone();
+        async move {
+            let s = SessionTouch {
+                id: "q".into(),
+                epoch,
+                ..SessionTouch::default()
+            };
+            let item = SeenItem {
+                key: SeenKey {
+                    owner_id,
+                    target: zam_core::TargetRef {
+                        kind: zam_core::TargetKind::Entry,
+                        id: old.id,
+                    }
+                    .into(),
+                    part: zam_store::REVIEW_QUEUE_PART.into(),
+                },
+                rev: total,
+            };
+            zam_store::mark_seen(&db, &s, &[item]).await.unwrap();
+        }
+    };
+    show(Id::new(), 0, 2).await;
+    show(owner, 1, 2).await;
+    let s = state(0).await.unwrap();
+    assert_eq!((s.shown, s.first.map(|e| e.id)), (None, Some(old.id)));
+    show(owner, 0, 2).await;
+    let s = state(0).await.unwrap();
+    assert_eq!(s.shown.map(|x| x.total), Some(2));
+    assert!(s.first.is_none(), "показ эпохи покрывает очередь: {s:?}");
+    // рост очереди после показа
+    new_idea(&db, sol, "Посреди сессии", "human", "normal").await;
+    let s = state(0).await.unwrap();
+    assert_eq!((s.total, s.first.map(|e| e.id)), (3, Some(old.id)));
+    show(owner, 0, 3).await;
+    assert!(state(0).await.unwrap().first.is_none());
+    // правка идеи очереди после показа — длина та же, ревизия новее
+    human_edit(&db, old.id, "Замысел идеи с подробностями.").await;
+    let s = state(0).await.unwrap();
+    assert_eq!((s.total, s.first.map(|e| e.id)), (3, Some(old.id)));
+}
+
 /// Строка плана: живые задачи `open | in_progress | blocked` с системным ребром `derived_from`
 /// на живую идею; следующая — только среди `open`, по `data.priority` (нет — `normal`), затем
 /// самая старая (ревью задачи 4, Important 2: взятая в работу «следующей» не бывает); открытых

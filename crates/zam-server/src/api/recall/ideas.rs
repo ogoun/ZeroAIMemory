@@ -151,8 +151,9 @@ const REVIEW_OMIT_BUDGET: &str = "подними budget_tokens или умень
 /// (фича `test-hooks`, проверка тишины по идеям).
 #[cfg(feature = "test-hooks")]
 pub const TEST_SLOW_IDEA_MARK: &str = "zam-test-slow-idea";
-/// Тестовая метка заголовка идеи очереди: чтение головы очереди разбора к `prompt`
-/// ([`review_queue_head`]) «не укладывается в срок» — шаг обрывает срок (фича `test-hooks`).
+/// Тестовая метка заголовка идеи очереди: чтение очереди разбора к `prompt`
+/// ([`zam_store::review_queue_state`]) «не укладывается в срок» — шаг обрывает срок (фича
+/// `test-hooks`).
 #[cfg(feature = "test-hooks")]
 pub const TEST_SLOW_QUEUE_MARK: &str = "zam-test-slow-queue";
 /// Запросы, по которым шёл второй проход подсказки-идей ([`released_prompt_ideas`]) — только с
@@ -1026,6 +1027,10 @@ impl QueueLine {
 /// и новая идея, пришедшая, пока агент разбирал очередь (длина тогда не растёт). Без сессии —
 /// без учёта показа, как у прочих подсказок.
 ///
+/// Чтение — одно ([`zam_store::review_queue_state`], M7.1 §4.8): длина очереди, показ сессии и
+/// первая идея — только когда строку надо показать. База сессии здесь — та же база пользователя,
+/// что и база решения (строка — только владельцу); иначе показ читается отдельно.
+///
 /// Срок — своя копия общего срока `prompt`, не дальше половины его остатка (чтение идёт до
 /// поиска): не уложилось чтение (или сбой — WARN) — тишина без предупреждений, `recall timeout`
 /// строка не ставит.
@@ -1054,44 +1059,45 @@ pub(super) async fn review_queue_line(
         expired: deadline.expired,
     };
     let read = async {
-        let head = zam_store::review_queue_head(&t.db, space).await?;
+        // показ сессии — тем же чтением, если её база — база решения
+        let same = session.filter(|s| s.db.path() == t.db.path());
+        let seen = same.map(|s| zam_store::QueueSeenKey {
+            session: s.touch.id.clone(),
+            owner: t.owner,
+            epoch: s.touch.epoch,
+        });
+        let mut q = zam_store::review_queue_state(&t.db, space, seen).await?;
+        if let (Some(s), None, 1..) = (session, same, q.total) {
+            let shown =
+                zam_store::review_queue_shown(&s.db, &s.touch.id, t.owner, s.touch.epoch).await?;
+            if shown.is_some_and(|sh| sh.covers(q.total, q.changed_at)) {
+                q.first = None;
+            }
+        }
         // тестовое «медленное чтение» (фича test-hooks): шаг не уложился в срок — его обрывает
         // `own.step`, как настоящее медленное чтение
         #[cfg(feature = "test-hooks")]
-        if head
-            .first
+        if q.first
             .as_ref()
             .is_some_and(|e| e.title.contains(TEST_SLOW_QUEUE_MARK))
         {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
-        // пустая очередь — без второго чтения
-        let shown = match (session, head.total) {
-            (Some(s), 1..) => {
-                zam_store::review_queue_shown(&s.db, &s.touch.id, t.owner, s.touch.epoch).await?
-            }
-            _ => None,
-        };
-        Ok::<_, StoreError>((head, shown))
+        Ok::<_, StoreError>(q)
     };
-    let (head, shown) = match own.step(read).await? {
+    let q = match own.step(read).await? {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "recall: очередь разбора не прочитана");
             return None;
         }
     };
-    let first = head.first?;
-    let fresh = shown.is_none_or(|s| {
-        head.total > s.total || head.changed_at.is_some_and(|changed| changed > s.at)
-    });
-    if !fresh {
-        return None;
-    }
-    let block = review_queue_summary(&first, head.total);
+    // пустая очередь или показ этой эпохи её покрывает — строки нет
+    let first = q.first?;
+    let block = review_queue_summary(&first, q.total);
     Some(QueueLine {
         cand: idea_cand(i, &first, REASON_IDEA_REVIEW, block),
-        total: head.total,
+        total: q.total,
     })
 }
 
