@@ -38,7 +38,6 @@ use crate::nodes::Attribution;
 use crate::questions::{
     AnswerBy, Channel, NormalizedAnswer, QuestionData, QuestionError, answer_tx, in_list,
 };
-use crate::sessions::QueueShown;
 use crate::tasks::{TASK_LINK_MAX_CHARS, TASK_LINKS_MAX, TaskData, links_field};
 use crate::time::{fmt_ts, parse_ts, ser_ts, utc_today};
 use crate::user_db::SpaceKind;
@@ -2675,39 +2674,6 @@ pub async fn review_queue(
     .await
 }
 
-/// Голова очереди разбора ([`review_queue_head`]).
-#[derive(Debug, Clone)]
-pub struct ReviewQueueHead {
-    /// Длина очереди [`review_queue`].
-    pub total: usize,
-    /// Время последней ревизии идей очереди (`updated_at`: запись, возврат на разбор, правка);
-    /// очередь пуста — `None`.
-    pub changed_at: Option<Timestamp>,
-    /// Первая идея очереди (`high` первыми, затем самые старые); очередь пуста — `None`.
-    pub first: Option<Entry>,
-}
-
-/// Голова очереди разбора к строке очереди (M7.1 §4.5 п. 1): длина очереди [`review_queue`]
-/// пространства `space`, время последней ревизии её идей (по нему строка узнаёт идею, пришедшую
-/// в очередь после показа) и первая идея. Одно чтение: счёт и время — одним запросом, запись —
-/// только первой.
-pub async fn review_queue_head(db: &Db, space: Id) -> Result<ReviewQueueHead, StoreError> {
-    db.read(move |c| {
-        let (total, changed_at) = queue_size(c, space)?;
-        let first = if total == 0 {
-            None
-        } else {
-            queue_first(c, space)?
-        };
-        Ok(ReviewQueueHead {
-            total,
-            changed_at,
-            first,
-        })
-    })
-    .await
-}
-
 /// Длина очереди разбора пространства `space` и время последней ревизии её идей.
 fn queue_size(c: &Connection, space: Id) -> Result<(usize, Option<Timestamp>), StoreError> {
     let (n, changed): (i64, Option<String>) = c
@@ -2746,22 +2712,21 @@ pub struct QueueSeenKey {
 pub struct ReviewQueueState {
     /// Длина очереди [`review_queue`].
     pub total: usize,
-    /// Время последней ревизии идей очереди; очередь пуста — `None`.
+    /// Время последней ревизии идей очереди (`updated_at`: запись, возврат на разбор, правка) —
+    /// по нему строка узнаёт идею, пришедшую в очередь после показа; очередь пуста — `None`.
     pub changed_at: Option<Timestamp>,
-    /// Последний показ очереди сессии в эпоху ([`crate::review_queue_shown`]); без сессии или при
-    /// пустой очереди — `None`.
-    pub shown: Option<QueueShown>,
-    /// Первая идея очереди — только когда очередь не пуста и показ её не покрывает
-    /// ([`QueueShown::covers`]): строку нужно показать.
+    /// Первая идея очереди (`high` первыми, затем самые старые) — только когда очередь не пуста и
+    /// показ сессии её не покрывает ([`crate::QueueShown::covers`]): строку нужно показать.
     pub first: Option<Entry>,
 }
 
-/// Строка очереди разбора к `prompt` одним чтением базы (M7.1 §4.8, профиль задачи 9): длина
-/// очереди пространства `space` и время её последней ревизии ([`review_queue_head`]), последний
-/// показ сессии `seen` в её эпоху ([`crate::review_queue_shown`]: `session_seen` лежит в той же
-/// базе пользователя) и первая идея — только если показ очередь не покрывает. Раньше — два
-/// чтения (у каждого — свой переход в пул блокирующих потоков) и первая идея на каждом запросе,
-/// даже когда строка в эту эпоху уже показана. Пустая очередь — без чтения показа.
+/// Строка очереди разбора к `prompt` (M7.1 §4.5 п. 1) одним чтением базы (§4.8, профиль задачи
+/// 9): длина очереди [`review_queue`] пространства `space` и время её последней ревизии —
+/// одним запросом; последний показ сессии `seen` в её эпоху ([`crate::review_queue_shown`]:
+/// `session_seen` лежит в той же базе пользователя); первая идея — только если показ очередь не
+/// покрывает. Раньше — два чтения (у каждого — свой переход в пул блокирующих потоков) и первая
+/// идея на каждом запросе, даже когда строка в эту эпоху уже показана. Пустая очередь — без
+/// чтения показа; без `seen` — первая идея всегда.
 pub async fn review_queue_state(
     db: &Db,
     space: Id,
@@ -2773,7 +2738,6 @@ pub async fn review_queue_state(
             return Ok(ReviewQueueState {
                 total,
                 changed_at,
-                shown: None,
                 first: None,
             });
         }
@@ -2789,7 +2753,6 @@ pub async fn review_queue_state(
         Ok(ReviewQueueState {
             total,
             changed_at,
-            shown,
             first,
         })
     })

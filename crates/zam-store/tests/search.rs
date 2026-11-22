@@ -1030,6 +1030,18 @@ async fn entry_only_filter_without_live_entries_is_empty() {
         f.targets.statuses = statuses.iter().map(|s| s.to_string()).collect();
         zam_store::search_fts_channels(&db, f)
     };
+    // проходы каналов с `MATCH` (фича `test-hooks`; без неё проверяется только выдача): пропуск
+    // пустых — не проход
+    let runs = |want: u64| {
+        #[cfg(feature = "test-hooks")]
+        assert_eq!(
+            zam_store::test_hooks::fts_channel_runs(db.path()),
+            want,
+            "проходов каналов FTS"
+        );
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = want;
+    };
     let open = ["open", "in_progress", "blocked"];
     let ch = tasks(&["task"], &open).await.unwrap();
     assert!(
@@ -1037,6 +1049,7 @@ async fn entry_only_filter_without_live_entries_is_empty() {
         "{ch:?}"
     );
     assert!(!ch.relaxed && !ch.alias_relaxed, "{ch:?}");
+    runs(0);
     let (task, _) = zam_store::create_entry(
         &db,
         zam_store::NewEntry {
@@ -1061,16 +1074,20 @@ async fn entry_only_filter_without_live_entries_is_empty() {
     let ch = tasks(&["task"], &open).await.unwrap();
     assert!(ch.bm25.iter().all(|h| h.target.id == task.id), "{ch:?}");
     assert!(!ch.bm25.is_empty(), "{ch:?}");
+    runs(1);
     // статус задачи вне фильтра — нет живой записи фильтра
     assert!(tasks(&["task"], &["done"]).await.unwrap().bm25.is_empty());
+    runs(1);
     // с заметками фильтр идёт обычным путём: заметка находится и без задач
     zam_store::delete_entry(&db, task.id, None, &attrib())
         .await
         .unwrap();
     assert!(tasks(&["task"], &open).await.unwrap().bm25.is_empty());
+    runs(1);
     let ch = tasks(&["task", "note"], &open).await.unwrap();
     assert!(
         ch.bm25.iter().any(|h| h.target.kind == TargetKind::Node),
         "{ch:?}"
     );
+    runs(2);
 }

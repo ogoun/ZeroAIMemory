@@ -50,13 +50,9 @@ use crate::StoreError;
 use crate::migrate::{self, Migration};
 
 const READERS: usize = 4;
-/// Подготовленных запросов в кэше соединения (`prepare_cached`). У rusqlite по умолчанию 16 — LRU,
-/// а путь `/recall(prompt)` берёт на одном соединении больше разных запросов (каналы FTS — свой
-/// текст на каждое число пространств), и при обходе по кругу кэш вытеснял их все: запросы
-/// готовились заново на каждом вызове. M6.6 добавил запросы (задача по заголовку, очередь разбора)
-/// и около 1 мс к p95. С 128 медиана сервера на мире приёмки — 6,3 мс вместо 8,0 (M7.1 §4.8,
-/// профиль задачи 9); память — подготовленные запросы, порядка мегабайт на базу.
-const STATEMENT_CACHE: usize = 128;
+/// Подготовленных запросов в кэше соединения (`prepare_cached`, [`set_common_pragmas`]) — см.
+/// там, почему 64.
+pub const STATEMENT_CACHE: usize = 64;
 /// Ожидание блокировки записи потоком-писателем (см. документацию модуля).
 pub const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -93,6 +89,8 @@ fn open_reader(path: &Path) -> Result<Connection, StoreError> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     set_common_pragmas(&r)?;
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::trace_statements(&r, path);
     Ok(r)
 }
 
@@ -328,6 +326,28 @@ impl std::fmt::Debug for Db {
     }
 }
 
+/// PRAGMA и кэш подготовленных запросов соединения (писатель и читатели).
+///
+/// **Кэш [`STATEMENT_CACHE`] = 64** (M7.1 §4.8, задача 9 и круг правок 1). У rusqlite по
+/// умолчанию 16, это LRU. Путь `/recall(prompt)` берёт на одном соединении больше разных
+/// запросов (у каналов FTS свой текст на каждое число пространств), и при обходе по кругу кэш
+/// вытеснял их все: запросы готовились заново на каждом вызове. M6.6 добавил запросы — задачу по
+/// заголовку и очередь разбора — и около 1 мс к p95.
+///
+/// Размер выбран по замеру `zam-server/tests/stmt_cache.rs` (мир приёмки, учёт SQL `test-hooks`).
+/// На одно соединение приходится:
+/// - 28 запросов в кэше на путях `prompt`, `post_tool`, `search` и `read`;
+/// - 34 — вместе с дайджестом `session_start`.
+///
+/// Наименьшая степень двойки с запасом не меньше 1,5× — 64 (34 × 1,5 = 51). Тест держит этот
+/// запас и падает, если запросов станет больше.
+///
+/// Память по замеру ревью: подготовленный запрос канала FTS занимает 32–34 КБ, соединение — 0,5–4,4
+/// МБ, база — 3–8 МБ (потолок при 128 — около 22 МБ, при 64 — около 11 МБ на базу). На 10
+/// пользователей выходит 30–90 МБ.
+///
+/// Профиль задачи 9 (кэш 128, тот же рабочий набор): медиана сервера на мире приёмки — 6,3 мс
+/// вместо 8,0 при кэше 16.
 fn set_common_pragmas(conn: &Connection) -> Result<(), StoreError> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", true)?;
@@ -377,6 +397,8 @@ impl Db {
     ) -> Result<Db, StoreError> {
         let mut conn = Connection::open(path)?;
         set_common_pragmas(&conn)?;
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::trace_statements(&conn, path);
         conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {

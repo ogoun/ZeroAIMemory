@@ -129,11 +129,11 @@ pub use ideas::{
     IdeaDecision, IdeaError, IdeaOrigin, IdeaPriority, IdeaSpaces, NewDecision, NewReview,
     PROPOSE_TEXT_MAX_CHARS, ProposalKind, QueueSeenKey, REVIEW_MIN_CHARS_DEFAULT,
     REVIEW_MISSING_MAX_CHARS, REVIEW_REFS_MAX, REVIEW_SUMMARY_MAX_CHARS, REVIEWS_MAX, Review,
-    ReviewOutcome, ReviewQueueHead, ReviewQueueState, ReviewTask, Reviewed, TaskIdea, TaskState,
-    adopt_idea, any_idea, any_new_idea, check_idea, check_idea_shape, check_idea_transition,
-    decide_idea, idea_candidate, idea_task_state, ideas_of_tasks, planned_from_ideas,
-    proactive_ideas, proposal_ideas, propose_idea, released_ideas, review_idea, review_queue,
-    review_queue_head, review_queue_state, task_released,
+    ReviewOutcome, ReviewQueueState, ReviewTask, Reviewed, TaskIdea, TaskState, adopt_idea,
+    any_idea, any_new_idea, check_idea, check_idea_shape, check_idea_transition, decide_idea,
+    idea_candidate, idea_task_state, ideas_of_tasks, planned_from_ideas, proactive_ideas,
+    proposal_ideas, propose_idea, released_ideas, review_idea, review_queue, review_queue_state,
+    task_released,
 };
 pub use jobs::{
     AttachmentPayload, EntryPayload, FailedJob, IndexChunk, IndexFolder, IndexState, Job, JobOp,

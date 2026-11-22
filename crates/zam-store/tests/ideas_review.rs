@@ -13,7 +13,7 @@ use zam_store::{
     NewDecision, NewEntry, NewNote, NewReview, NodePath, REVIEW_MIN_CHARS_DEFAULT, REVIEW_REFS_MAX,
     REVIEWS_MAX, ReviewOutcome, ReviewTask, SpaceKind, StoreError, TaskData, create_entry,
     create_note, create_solution, decide_idea, delete_entry, entry_revisions, get_entry,
-    list_spaces, planned_from_ideas, review_idea, review_queue, review_queue_head, update_entry,
+    list_spaces, planned_from_ideas, review_idea, review_queue, review_queue_state, update_entry,
 };
 
 // ---------- окружение ----------
@@ -990,14 +990,15 @@ async fn review_queue_order_and_filters() {
     assert_eq!(review_queue(&db, kn, 10).await.unwrap().0, 1);
 }
 
-/// Голова очереди к строке очереди разбора (M7.1 §4.5 п. 1): длина очереди, первая идея по
-/// порядку очереди (`high` первыми, затем самые старые) и время последней ревизии идей очереди;
-/// идеи вне очереди (агента, Knowledge, разобранные) ни в длину, ни во время не идут; новая
-/// ревизия идеи очереди время двигает; пустая очередь — 0 без первой и без времени.
+/// Очередь к строке очереди разбора без сессии (M7.1 §4.5 п. 1; `review_queue_state` без показа,
+/// задача 9): длина очереди, первая идея по порядку очереди (`high` первыми, затем самые старые) и
+/// время последней ревизии идей очереди; идеи вне очереди (агента, Knowledge, разобранные) ни в
+/// длину, ни во время не идут; новая ревизия идеи очереди время двигает; пустая очередь — 0 без
+/// первой и без времени.
 #[tokio::test]
-async fn review_queue_head_first_and_changed_at() {
+async fn review_queue_state_first_and_changed_at() {
     let (db, sol, kn) = setup("queue-head").await;
-    let h = review_queue_head(&db, sol).await.unwrap();
+    let h = review_queue_state(&db, sol, None).await.unwrap();
     assert_eq!((h.total, h.first.is_none(), h.changed_at), (0, true, None));
     let stored = |e: &Entry| {
         let (db, id) = (db.clone(), e.id);
@@ -1005,19 +1006,19 @@ async fn review_queue_head_first_and_changed_at() {
     };
     let old = new_idea(&db, sol, "Старая", "human", "normal").await;
     let young = new_idea(&db, sol, "Новая", "human", "normal").await;
-    let h = review_queue_head(&db, sol).await.unwrap();
+    let h = review_queue_state(&db, sol, None).await.unwrap();
     assert_eq!((h.total, h.first.map(|e| e.id)), (2, Some(old.id)));
     assert_eq!(h.changed_at, Some(stored(&young).await));
     let high = new_idea(&db, sol, "Срочная", "human", "high").await;
     new_idea(&db, sol, "Идея агента", "agent", "high").await;
     new_idea(&db, kn, "Идея Knowledge", "human", "high").await;
-    let h = review_queue_head(&db, sol).await.unwrap();
+    let h = review_queue_state(&db, sol, None).await.unwrap();
     assert_eq!(h.total, 3);
     assert_eq!(h.first.map(|e| e.title), Some("Срочная".to_string()));
     assert_eq!(h.changed_at, Some(stored(&high).await));
     // новая ревизия идеи очереди (правка человеком) — время её ревизии
     let edited = human_edit(&db, old.id, "Замысел идеи с подробностями.").await;
-    let h = review_queue_head(&db, sol).await.unwrap();
+    let h = review_queue_state(&db, sol, None).await.unwrap();
     assert_eq!(h.changed_at, Some(stored(&edited).await));
     // разобранная — вне очереди
     review_idea(
@@ -1028,18 +1029,18 @@ async fn review_queue_head_first_and_changed_at() {
     )
     .await
     .unwrap();
-    let h = review_queue_head(&db, sol).await.unwrap();
+    let h = review_queue_state(&db, sol, None).await.unwrap();
     assert_eq!((h.total, h.first.map(|e| e.id)), (2, Some(old.id)));
-    assert_eq!(review_queue_head(&db, kn).await.unwrap().total, 1);
+    assert_eq!(review_queue_state(&db, kn, None).await.unwrap().total, 1);
 }
 
-/// Строка очереди одним чтением (M7.1 §4.8, задача 9): без сессии и без показа в эпоху — длина,
-/// время и первая идея, как у [`review_queue_head`]; показ эпохи, покрывающий очередь, —
-/// первой идеи нет; очередь выросла или идея очереди правлена после показа — первая снова есть;
-/// показ другой эпохи и другого владельца не считается; пустая очередь — без показа.
+/// Строка очереди одним чтением (M7.1 §4.8, задача 9): без показа в эпоху — длина, время и первая
+/// идея, как без сессии; показ эпохи, покрывающий очередь, — первой идеи нет; очередь выросла или
+/// идея очереди правлена после показа — первая снова есть; показ другой эпохи и другого владельца
+/// не считается; пустая очередь — без показа.
 #[tokio::test]
 async fn review_queue_state_reads_shown_once() {
-    use zam_store::{QueueSeenKey, SeenItem, SeenKey, SessionTouch, review_queue_state};
+    use zam_store::{QueueSeenKey, SeenItem, SeenKey, SessionTouch};
     let (db, sol, _) = setup("queue-state").await;
     let owner = Id::new();
     let key = |epoch| {
@@ -1051,12 +1052,12 @@ async fn review_queue_state_reads_shown_once() {
     };
     let state = |epoch| review_queue_state(&db, sol, key(epoch));
     let s = state(0).await.unwrap();
-    assert_eq!((s.total, s.shown, s.first.is_none()), (0, None, true));
+    assert_eq!((s.total, s.changed_at, s.first.is_none()), (0, None, true));
     let old = new_idea(&db, sol, "Старая", "human", "normal").await;
     new_idea(&db, sol, "Новая", "human", "normal").await;
-    let head = review_queue_head(&db, sol).await.unwrap();
-    let s = review_queue_state(&db, sol, None).await.unwrap();
-    assert_eq!((s.total, s.changed_at, s.shown), (2, head.changed_at, None));
+    let head = review_queue_state(&db, sol, None).await.unwrap();
+    let s = state(0).await.unwrap();
+    assert_eq!((s.total, s.changed_at), (2, head.changed_at));
     assert_eq!(s.first.map(|e| e.id), Some(old.id));
     // показ очереди из 2 идей в эпоху 0 (как отметка учёта ответа `queue_mark`)
     let show = |owner_id, epoch, total| {
@@ -1085,10 +1086,13 @@ async fn review_queue_state_reads_shown_once() {
     show(Id::new(), 0, 2).await;
     show(owner, 1, 2).await;
     let s = state(0).await.unwrap();
-    assert_eq!((s.shown, s.first.map(|e| e.id)), (None, Some(old.id)));
+    assert_eq!(
+        s.first.as_ref().map(|e| e.id),
+        Some(old.id),
+        "чужой показ: {s:?}"
+    );
     show(owner, 0, 2).await;
     let s = state(0).await.unwrap();
-    assert_eq!(s.shown.map(|x| x.total), Some(2));
     assert!(s.first.is_none(), "показ эпохи покрывает очередь: {s:?}");
     // рост очереди после показа
     new_idea(&db, sol, "Посреди сессии", "human", "normal").await;

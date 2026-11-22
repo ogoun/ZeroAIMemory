@@ -8,8 +8,10 @@
 //!
 //! [`crate::time::freeze_now`] замораживает часы хранилища и сервера (`time::now()`, M6 §4.4).
 
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
 use jiff::Timestamp;
@@ -31,9 +33,9 @@ impl Drop for GateGuard {
 }
 
 /// Поток — держатель записи [`GATE`].
-static HOLDER: std::sync::Mutex<Option<ThreadId>> = std::sync::Mutex::new(None);
+static HOLDER: Mutex<Option<ThreadId>> = Mutex::new(None);
 
-fn holder() -> std::sync::MutexGuard<'static, Option<ThreadId>> {
+fn holder() -> MutexGuard<'static, Option<ThreadId>> {
     HOLDER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -124,4 +126,125 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         }
         std::thread::park();
     }
+}
+
+// ---------- тексты SQL по соединениям (размер кэша запросов, M7.1 задача 9) ----------
+
+/// Ячеек учёта SQL: у каждого соединения базы (писатель и читатели, [`crate::Db`]) — своя, по
+/// кругу; соединений в процессе больше — ячейки делятся (оценка только растёт).
+const SQL_SLOTS: usize = 32;
+
+/// Соединение — ячейка учёта: путь базы и разные тексты SQL, выполненные с начала учёта, с
+/// признаком «подготовленный запрос выполнялся повторно» ([`record_sql`]).
+type SqlSlot = Mutex<(PathBuf, HashMap<String, bool>)>;
+
+static SQL_SLOT_DATA: LazyLock<Vec<SqlSlot>> = LazyLock::new(|| {
+    (0..SQL_SLOTS)
+        .map(|_| Mutex::new(Default::default()))
+        .collect()
+});
+static SQL_NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+static SQL_RECORDING: AtomicBool = AtomicBool::new(false);
+
+fn sql_slot(i: usize) -> MutexGuard<'static, (PathBuf, HashMap<String, bool>)> {
+    SQL_SLOT_DATA[i].lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Колбэк `trace_v2` ячейки `N`: при идущем учёте — текст выполняемого запроса (без значений
+/// параметров, `sqlite3_sql`) и признак повторного запуска того же подготовленного запроса.
+/// `SQLITE_STMTSTATUS_RUN` растёт в `OP_Init` после события `SQLITE_TRACE_STMT`: в событии он —
+/// число прежних запусков. Запрос из кэша `prepare_cached` запускается снова (> 0), разовый
+/// (`prepare`, `query_row`, `execute`, `execute_batch`) готовится заново (0).
+fn record_sql<const N: usize>(e: rusqlite::trace::TraceEvent<'_>) {
+    if !SQL_RECORDING.load(Ordering::Relaxed) {
+        return;
+    }
+    if let rusqlite::trace::TraceEvent::Stmt(s, _) = e {
+        let reused = s.get_status(rusqlite::StatementStatus::Run) > 0;
+        *sql_slot(N).1.entry(s.sql().into_owned()).or_default() |= reused;
+    }
+}
+
+macro_rules! sql_slot_fns {
+    ($($n:literal)*) => { [$(record_sql::<$n> as fn(rusqlite::trace::TraceEvent<'_>)),*] };
+}
+
+static SQL_SLOT_FNS: [fn(rusqlite::trace::TraceEvent<'_>); SQL_SLOTS] = sql_slot_fns!(
+    0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+);
+
+/// Учёт текстов SQL соединения `conn` базы `path` (зовёт [`crate::Db`] при открытии соединения).
+pub(crate) fn trace_statements(conn: &rusqlite::Connection, path: &Path) {
+    let i = SQL_NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % SQL_SLOTS;
+    sql_slot(i).0 = path.to_path_buf();
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(SQL_SLOT_FNS[i]),
+    );
+}
+
+/// Начать учёт разных текстов SQL по соединениям (прежний учёт сбрасывается). Учёт общий для
+/// процесса: тест, который его читает, — один в своём двоичном файле.
+pub fn sql_texts_start() {
+    for i in 0..SQL_SLOTS {
+        sql_slot(i).1.clear();
+    }
+    SQL_RECORDING.store(true, Ordering::SeqCst);
+}
+
+/// Текст SQL соединения за время учёта ([`sql_texts_stop`]).
+#[derive(Debug, Clone)]
+pub struct SqlText {
+    /// Текст запроса без значений параметров.
+    pub sql: String,
+    /// Тот же подготовленный запрос запускался повторно — запрос живёт в кэше: свой
+    /// `prepare_cached` или внутренний запрос SQLite и FTS5 (их тексты — с `'main'.`).
+    pub reused: bool,
+}
+
+/// Закончить учёт: по соединению — путь базы и разные тексты SQL с [`sql_texts_start`]
+/// (соединения без запросов не входят), по тексту.
+pub fn sql_texts_stop() -> Vec<(PathBuf, Vec<SqlText>)> {
+    SQL_RECORDING.store(false, Ordering::SeqCst);
+    (0..SQL_SLOTS)
+        .filter_map(|i| {
+            let s = sql_slot(i);
+            (!s.1.is_empty()).then(|| {
+                let mut v: Vec<SqlText> =
+                    s.1.iter()
+                        .map(|(sql, reused)| SqlText {
+                            sql: sql.clone(),
+                            reused: *reused,
+                        })
+                        .collect();
+                v.sort_by(|a, b| a.sql.cmp(&b.sql));
+                (s.0.clone(), v)
+            })
+        })
+        .collect()
+}
+
+// ---------- проходы каналов FTS (проверка пропуска пустых, M7.1 задача 9) ----------
+
+static FTS_RUNS: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Default::default);
+
+/// Каналы FTS базы `path` выполнили `MATCH` (`fts_channels` не пропустил их проверкой
+/// `any_live_entry`).
+pub(crate) fn fts_channels_ran(path: &Path) {
+    *FTS_RUNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(path.to_path_buf())
+        .or_default() += 1;
+}
+
+/// Сколько раз каналы FTS базы `path` выполняли `MATCH` (`search_fts_channels`,
+/// `search_fts_channels_light`; пропущенные проверкой живых записей — не в счёт).
+pub fn fts_channel_runs(path: &Path) -> u64 {
+    FTS_RUNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .copied()
+        .unwrap_or(0)
 }

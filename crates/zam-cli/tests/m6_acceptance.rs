@@ -1,7 +1,8 @@
 //! Приёмка M6 (спецификация M6 §17, задача 13b), клиентская часть — только новые по сути
 //! проверки, с **настоящими** бинарниками тега `v0.0.10-m5.7` (`target/tags/v0.0.10-m5.7/release`,
-//! сборка задачи 1a2; другие пути — `ZAM_M57_SERVER_BIN`, `ZAM_M57_ZAM_BIN`). Нет бинарника —
-//! пропуск с сообщением (в CI их нет).
+//! сборка задачи 1a2; в git worktree — и `target/tags` основного каталога; другие пути —
+//! `ZAM_M57_SERVER_BIN`, `ZAM_M57_ZAM_BIN`). Нет бинарника — пропуск с сообщением (в CI их нет);
+//! у замера `acceptance_hook_budgets` — паника с инструкцией.
 //!
 //! - `compat_new_zam_old_server` (§17 п. 13, 17) — `zam` M6 против сервера v0.0.10-m5.7: поиск и
 //!   чтение; `--focus` — понятная ошибка «unknown field `focus`»; хуки (`session-start`,
@@ -15,7 +16,8 @@
 //!   `zam code sync` (`recv_count` 0);
 //! - `acceptance_hook_budgets` (§17 п. 15, `#[ignore]`, тихое окно) — p95 `/recall(prompt)`
 //!   release-сервера ветки и **предыдущего выпуска** ([`PREV_RELEASE`], `target/tags/<тег>/release`
-//!   или `ZAM_PREV_SERVER_BIN`) вперемешку: медиана по раундам отношения p95 ≤ 1,10 (M7.1 §4.8
+//!   или `ZAM_PREV_SERVER_BIN`; версия и коммит базы — по `/health`, у ветки коммит другой)
+//!   вперемешку: медиана по раундам отношения p95 ≤ 1,10 (M7.1 §4.8
 //!   п. 3 **[решение координатора]**: база — предыдущий выпуск, а не замороженная M5.7; накопленный
 //!   рост держат абсолютные пороги `m57_acceptance` и бюджеты хуков).
 //!   Прочие бюджеты хуков §17 п. 15 — release-серии `m4_acceptance::hook_budgets*` задачи 17d
@@ -57,18 +59,64 @@ fn exe(name: &str) -> String {
     }
 }
 
-/// Бинарник тега v0.0.10-m5.7: переменная `var` или `target/tags/v0.0.10-m5.7/release/<name>`.
-fn tag_bin(var: &str, name: &str) -> Option<PathBuf> {
-    let p = std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| {
-        common::repo_root()
-            .join("target/tags/v0.0.10-m5.7/release")
-            .join(exe(name))
-    });
-    if p.is_file() {
-        Some(p)
-    } else {
-        eprintln!("нет {} ({var}) — пропуск", p.display());
-        None
+/// Тег баз совместимости `compat_*`.
+const M57_TAG: &str = "v0.0.10-m5.7";
+
+/// Каталоги `target/tags`, где ищутся бинарники тегов: самого репозитория и — в git worktree —
+/// основного каталога (`git rev-parse --git-common-dir` → его родитель): теги собираются один раз,
+/// в основном каталоге (ревью задачи 9 M7.1, Important 1).
+fn tags_dirs() -> Vec<PathBuf> {
+    let root = common::repo_root();
+    let mut dirs = vec![root.join("target/tags")];
+    let common_dir = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(&root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    if let Some(main) = common_dir
+        .map(|d| if d.is_absolute() { d } else { root.join(d) })
+        .and_then(|d| d.canonicalize().ok())
+        .and_then(|d| d.parent().map(Path::to_path_buf))
+    {
+        let d = main.join("target/tags");
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs
+}
+
+/// Бинарник `name` тега `tag`: переменная `var` или `target/tags/<tag>/release/<name>` в
+/// [`tags_dirs`]. Нет — `Err` с перечнем мест, где искали.
+fn tag_bin(var: &str, tag: &str, name: &str) -> Result<PathBuf, String> {
+    if let Some(p) = std::env::var_os(var).map(PathBuf::from) {
+        return if p.is_file() {
+            Ok(p)
+        } else {
+            Err(format!("{var}={}", p.display()))
+        };
+    }
+    let found: Vec<PathBuf> = tags_dirs()
+        .into_iter()
+        .map(|d| d.join(tag).join("release").join(exe(name)))
+        .collect();
+    found.iter().find(|p| p.is_file()).cloned().ok_or_else(|| {
+        let at: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
+        format!("{} ({var} не задана)", at.join(", "))
+    })
+}
+
+/// Бинарник тега v0.0.10-m5.7 для `compat_*` ([`tag_bin`]); нет — пропуск с сообщением (в CI
+/// бинарников тегов нет).
+fn m57_bin(var: &str, name: &str) -> Option<PathBuf> {
+    match tag_bin(var, M57_TAG, name) {
+        Ok(p) => Some(p),
+        Err(at) => {
+            eprintln!("нет {name} {M57_TAG}: {at} — пропуск");
+            None
+        }
     }
 }
 
@@ -198,6 +246,11 @@ impl Srv {
         );
         assert!((200..300).contains(&c), "{v}");
         Srv { child, url, token }
+    }
+
+    /// Ответ `GET /health` сервера.
+    fn health(&self) -> Value {
+        rest(&self.url, &self.token, "GET", "/health", None).1
     }
 
     fn version(&self) -> String {
@@ -506,7 +559,7 @@ fn common_steps(p: &Proj, who: &str, ideas: &str) {
 #[test]
 fn compat_new_zam_old_server() {
     let _g = serial();
-    let Some(srv) = tag_bin("ZAM_M57_SERVER_BIN", "zam-server") else {
+    let Some(srv) = m57_bin("ZAM_M57_SERVER_BIN", "zam-server") else {
         return;
     };
     let s = Srv::start(&srv, "new-zam-old-srv");
@@ -610,7 +663,7 @@ fn compat_new_zam_old_server() {
 #[test]
 fn compat_old_zam_new_server() {
     let _g = serial();
-    let Some(zam) = tag_bin("ZAM_M57_ZAM_BIN", "zam") else {
+    let Some(zam) = m57_bin("ZAM_M57_ZAM_BIN", "zam") else {
         return;
     };
     let (url, tok) = m6_server("old-zam-new-srv");
@@ -670,33 +723,45 @@ fn compat_old_zam_new_server() {
 
 // ---------- §17 п. 15: p95 /recall(prompt) ----------
 
-/// Предыдущий выпуск — база сравнения p95 `/recall(prompt)` (M7.1 §4.8 п. 3): тег и версия
-/// `/health`. С каждым выпуском сдвигается на него.
-const PREV_RELEASE: (&str, &str) = ("v0.0.13-m6.6", "0.0.13-m6.6");
-
-/// Release `zam-server` предыдущего выпуска [`PREV_RELEASE`]: `ZAM_PREV_SERVER_BIN` или
-/// `target/tags/<тег>/release/zam-server` (сборка тега — как у баз M6: `git archive` тега,
-/// `ZAM_GIT_SHA`, `--target-dir target/tags/<тег>`).
-fn prev_release_server() -> Option<PathBuf> {
-    let p = std::env::var_os("ZAM_PREV_SERVER_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            common::repo_root()
-                .join("target/tags")
-                .join(PREV_RELEASE.0)
-                .join("release")
-                .join(exe("zam-server"))
-        });
-    if p.is_file() {
-        Some(p)
-    } else {
-        eprintln!("нет {} (ZAM_PREV_SERVER_BIN) — пропуск", p.display());
-        None
-    }
+/// Предыдущий выпуск — база сравнения p95 `/recall(prompt)` (M7.1 §4.8 п. 3). С каждым выпуском
+/// сдвигается на него (и бинарник тега собирается, [`prev_release_server`]).
+struct PrevRelease {
+    /// Тег git.
+    tag: &'static str,
+    /// `/health.version` сборки тега.
+    version: &'static str,
+    /// `/health.git` сборки тега: коммит тега (`git rev-parse --short=12 <тег>^{commit}`,
+    /// при сборке — `ZAM_GIT_SHA`).
+    git: &'static str,
 }
 
-/// Release `zam-server` M6: `ZAM_M6_SERVER_BIN` или `zam-server` рядом с бинарником теста.
-fn m6_release_server() -> Option<PathBuf> {
+const PREV_RELEASE: PrevRelease = PrevRelease {
+    tag: "v0.0.13-m6.6",
+    version: "0.0.13-m6.6",
+    git: "5800ed92d9f8",
+};
+
+/// Release `zam-server` предыдущего выпуска [`PREV_RELEASE`]: `ZAM_PREV_SERVER_BIN` или
+/// `target/tags/<тег>/release/zam-server` ([`tag_bin`]: в worktree — и основного каталога). Нет —
+/// паника с инструкцией: гейт без базы не проходит (ревью задачи 9 M7.1, Important 1).
+fn prev_release_server() -> PathBuf {
+    let p = &PREV_RELEASE;
+    tag_bin("ZAM_PREV_SERVER_BIN", p.tag, "zam-server").unwrap_or_else(|at| {
+        panic!(
+            "нет zam-server предыдущего выпуска {tag}: {at}. Соберите тег в основном каталоге \
+             репозитория (как базы M6): `git archive {tag}` → распаковка в .tmp/<каталог>, там \
+             `ZAM_GIT_SHA={git}` и `cargo build --release -p zam-server -p zam-cli -j 2 \
+             --target-dir <репозиторий>/target/tags/{tag}`, затем удалить deps, build, incremental, \
+             .fingerprint и распаковку; или задайте ZAM_PREV_SERVER_BIN=<путь к zam-server {tag}>",
+            tag = p.tag,
+            git = p.git,
+        )
+    })
+}
+
+/// Release `zam-server` ветки: `ZAM_M6_SERVER_BIN` или `zam-server` рядом с бинарником теста
+/// (`target/release`). Нет — паника с инструкцией.
+fn m6_release_server() -> PathBuf {
     let p = std::env::var_os("ZAM_M6_SERVER_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -708,12 +773,13 @@ fn m6_release_server() -> Option<PathBuf> {
                 .unwrap()
                 .join(exe("zam-server"))
         });
-    if p.is_file() {
-        Some(p)
-    } else {
-        eprintln!("нет {} (ZAM_M6_SERVER_BIN) — пропуск", p.display());
-        None
-    }
+    assert!(
+        p.is_file(),
+        "нет zam-server ветки {}: соберите `cargo build --release -p zam-server` с тем же \
+         CARGO_TARGET_DIR, что у теста, или задайте ZAM_M6_SERVER_BIN",
+        p.display()
+    );
+    p
 }
 
 /// Мир замера в решении `G`: заметки, insight с триггерами, 50 идей человека.
@@ -794,17 +860,48 @@ fn p95(mut v: Vec<Duration>) -> Duration {
 /// release (отладочный сервер против release-тега даёт отношение ≈ 3):
 /// `cargo test -p zam-cli --release --test m6_acceptance acceptance_hook_budgets -- --ignored
 /// --exact --nocapture --test-threads 1`.
+///
+/// Гейт не проходит молча (ревью задачи 9 M7.1, Important 1–2): нет бинарника базы или ветки —
+/// паника с инструкцией; база и ветка — один файл, у базы `/health.version` или `/health.git` не
+/// те, что у сборки тега, или ветка собрана из того же коммита — ошибка, а не сравнение бинарника
+/// с самим собой (до поднятия версии ветка отвечает той же `version`, что и тег).
 #[test]
 #[ignore = "замер времени для приёмки: release, тихое окно, бинарники ветки и предыдущего выпуска"]
 fn acceptance_hook_budgets() {
     let _g = serial();
-    let (Some(old), Some(new)) = (prev_release_server(), m6_release_server()) else {
-        return;
+    let (old, new) = (prev_release_server(), m6_release_server());
+    let canon = |p: &Path| {
+        p.canonicalize()
+            .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
     };
+    assert_ne!(
+        canon(&old),
+        canon(&new),
+        "база (ZAM_PREV_SERVER_BIN) и ветка (ZAM_M6_SERVER_BIN) — один файл"
+    );
     let so = Srv::start(&old, "p95-prev");
     let sn = Srv::start(&new, "p95-new");
-    assert_eq!(so.version(), PREV_RELEASE.1, "база — предыдущий выпуск");
-    eprintln!("ZAM_INFO сервер ветки: {}", sn.version());
+    let (prev, branch) = (so.health(), sn.health());
+    let p = &PREV_RELEASE;
+    assert_eq!(
+        (prev["version"].as_str(), prev["git"].as_str()),
+        (Some(p.version), Some(p.git)),
+        "база {} — не сборка тега {} (версия и коммит /health; собрать с ZAM_GIT_SHA={})",
+        old.display(),
+        p.tag,
+        p.git
+    );
+    assert_ne!(
+        branch["git"].as_str(),
+        Some(p.git),
+        "ветка {} собрана из коммита тега {}: сравнение с самим собой",
+        new.display(),
+        p.tag
+    );
+    eprintln!(
+        "ZAM_INFO сервер ветки: {} ({}), база: {} ({})",
+        branch["version"], branch["git"], prev["version"], prev["git"]
+    );
     load_world(&so);
     load_world(&sn);
     let prompts = [
@@ -840,7 +937,7 @@ fn acceptance_hook_budgets() {
         eprintln!(
             "ZAM_TIMING m6 p95 /recall(prompt) раунд {round}: {} p50 {:?} p95 {po:?}; ветка p50 \
              {:?} p95 {pn:?}; отношение {r:.3}",
-            PREV_RELEASE.0,
+            PREV_RELEASE.tag,
             common::quantile(&a, 50),
             common::quantile(&b, 50)
         );
@@ -850,11 +947,11 @@ fn acceptance_hook_budgets() {
     let med = ratios[ROUNDS / 2];
     eprintln!(
         "ZAM_TIMING m6 p95 /recall(prompt) к {}: медиана отношения {med:.3} (порог 1,10)",
-        PREV_RELEASE.0
+        PREV_RELEASE.tag
     );
     assert!(
         med <= 1.10,
         "p95 /recall(prompt) ветки хуже {} + 10 %: {ratios:?}",
-        PREV_RELEASE.0
+        PREV_RELEASE.tag
     );
 }
