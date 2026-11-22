@@ -14,29 +14,40 @@
 //! 3. изменённый участок между неизменёнными — строки с метками в пару по одинаковым словам (без
 //!    слов меток; порядок сохраняется: цитата `> `, отступ, другие знаки);
 //! 4. правленые строки (на месте и перенесённые) — пары по похожести слов, самые похожие первыми,
-//!    при равной похожести — строка того же изменённого участка, затем ближайшая по месту;
+//!    при равной похожести — строка того же изменённого участка, затем ближайшая по месту (спорная
+//!    пара из другого участка — отказ ниже);
 //! 5. остаток изменённого участка (строка переписана другими словами, строки склеены) — дифф по
 //!    всем его строкам с метками без пары; участок больше предела — по порядку появления, если
-//!    меток поровну.
+//!    меток поровну (иначе метки участка без пары — и отказ ниже: безопасный путь).
 //!
 //! Внутри пары строк метки сопоставляет дифф «символов» — токенов: слово, пробелы, знак, метка —
-//! один токен. Метка нового текста получает значение, только если **слово перед ней** (ключ слева
-//! от разделителя: `token`, `user` в URL, `p` у `-p…`) то же, что у метки базы (без учёта
-//! регистра; метка в начале строки — слово после неё): `GITHUB_TOKEN: ‹secret›`, переписанный в
-//! `OPENAI_KEY: ‹secret›`, значение не получает (и, раз маска базы осталась без пары, правка
-//! отклоняется — ниже).
+//! один токен. Метка нового текста получает значение, только если **ключ** тот же: среди слов от
+//! начала строки (или от прежней метки строки) до метки, без уточнений в закрытых скобках, есть
+//! общее с такими же словами метки базы (без учёта регистра): `token (prod): ‹secret›`,
+//! `api key v2: ‹secret›`, `| CI prod | ‹secret› |` — тот же ключ; `GITHUB_TOKEN: ‹secret›`,
+//! переписанный в `OPENAI_KEY: ‹secret›`, значение не получает (и, раз маска базы осталась без
+//! пары, правка отклоняется — ниже). Слов до метки нет у обеих (голое значение строкой или пунктом
+//! списка: `- ‹secret› (prod)`) — тот же ключ, слова после метки не сравниваются.
 //!
 //! Метка без пары записывается как есть и считается в [`Restored::kept`]. Литерал `‹secret›`, уже
-//! лежавший в базе, — метка со значением «сама метка»: напротив себя он не новый.
+//! лежавший в базе (прежний `secret_mark_kept`, импорт архива с маской, текст человека), — метка
+//! без значения: напротив себя он не новый и не маска секрета (правило отказа ниже его не
+//! считает).
 //!
 //! Итог пересканируется: значение, которое сканер в новом тексте не закрывает целиком (снят забор
 //! кода вокруг `mysql -p‹secret›`, URL с паролем переписан прозой, `password = ‹secret›` стал
 //! «пароль — ‹secret›»), выходит из-под маски — номера таких строк нового текста —
 //! [`Restored::exposed`]; такую правку вызывающий отклоняет (решение координатора, круг правок 1).
-//! Туда же — метка без пары в изменённом участке, где осталась маска базы без пары (ключ
-//! переписан другими словами, URL — прозой): это правка окружения существующего секрета, литералом
-//! значение молча пропало бы из текущей ревизии (решение координатора по сомнению 1 круга
-//! правок 1). Метка, дописанная в участок, где все маски базы в паре или масок нет, — литерал.
+//! Туда же — метки изменённого участка, где осталась маска базы без пары, если у метки нет пары
+//! (ключ переписан другими словами, URL — прозой) или её пара из другого участка спорна (строка
+//! правлена словами удалённой чужой строки, а источником могла быть и маска участка): это правка
+//! окружения существующего секрета, значение молча пропало бы из текущей ревизии или встало бы
+//! чужое (решения координатора по сомнению 1 круга правок 1 и по кругу правок 2). Метка,
+//! дописанная в участок, где все маски базы в паре или масок нет, — литерал; строка, перенесённая
+//! целиком из другого участка, — со своим значением.
+//!
+//! Список строк (элементы массива JSON, у каждого своя маска) — [`restore_items`]: то же правило,
+//! строка выравнивания — элемент.
 //!
 //! Результат детерминирован (нет сроков по часам; обход `HashMap` в выборе пар упорядочен):
 //! пределы работы диффа — по размерам входа.
@@ -57,8 +68,9 @@ pub struct Restored {
     /// Меток нового текста без пары в базе — записаны как есть.
     pub kept: usize,
     /// Строки нового текста (с 1, по возрастанию), где восстановленное значение сканер в итоге не
-    /// закрывает (правка выводит секрет из-под маски) или где метка без пары стоит в участке с
-    /// маской базы без пары (правка окружения существующего секрета).
+    /// закрывает (правка выводит секрет из-под маски) или где метка без пары или с парой из
+    /// другого участка стоит в участке с маской базы без пары (правка окружения существующего
+    /// секрета).
     pub exposed: Vec<usize>,
 }
 
@@ -111,14 +123,24 @@ const SIMILAR_KEEP: usize = 4;
 /// сверху его `O((n + m)·D)`); исчерпан — участки идут запасным путём.
 const WORK_BUDGET: u64 = 200_000_000;
 
+/// Метка вида базы.
+struct BaseMark {
+    /// Позиция в виде.
+    at: usize,
+    /// Диапазон значения в исходнике (у литерала — сама метка).
+    value: Range<usize>,
+    /// Литерал `‹secret›`, уже лежавший в исходнике (прежний `secret_mark_kept`, импорт архива с
+    /// маской, текст человека): значения за ним нет — это не маска секрета (круг правок 2, B2).
+    literal: bool,
+}
+
 /// Вид базы для агента и значения его меток.
 pub struct MaskedBase<'a> {
     raw: &'a str,
     /// `mask_text(raw)`.
     masked: String,
-    /// Метки `masked` по порядку: позиция в `masked` и диапазон значения в `raw` (литерал
-    /// `‹secret›` исходника — он сам).
-    marks: Vec<(usize, Range<usize>)>,
+    /// Метки `masked` по порядку.
+    marks: Vec<BaseMark>,
 }
 
 impl<'a> MaskedBase<'a> {
@@ -140,7 +162,11 @@ impl<'a> MaskedBase<'a> {
                 continue;
             }
             push_plain(raw, pos..r.start, &mut masked, &mut marks);
-            marks.push((masked.len(), r.clone()));
+            marks.push(BaseMark {
+                at: masked.len(),
+                value: r.clone(),
+                literal: false,
+            });
             masked.push_str(SECRET_MARK);
             pos = r.end;
         }
@@ -151,6 +177,17 @@ impl<'a> MaskedBase<'a> {
     /// Вид базы.
     pub fn masked(&self) -> &str {
         &self.masked
+    }
+
+    /// Значение метки `a` вида; у литерала — `None` (метка остаётся меткой).
+    fn value(&self, a: usize) -> Option<&'a str> {
+        let m = &self.marks[a];
+        (!m.literal).then(|| &self.raw[m.value.clone()])
+    }
+
+    /// Литералы среди меток вида, по порядку.
+    fn literals(&self) -> Vec<bool> {
+        self.marks.iter().map(|m| m.literal).collect()
     }
 
     /// Восстановление нового текста `edited`, правленного по виду (правило — в описании модуля).
@@ -169,54 +206,137 @@ impl<'a> MaskedBase<'a> {
             let (old, new) = (normalized(&self.masked), normalized(edited));
             let (om, nm) = (mark_positions(&old), mark_positions(&new));
             debug_assert_eq!((om.len(), nm.len()), (self.marks.len(), new_marks.len()));
-            align(&old, &om, &new, &nm)
+            align(&old, &om, &self.literals(), &new, &nm)
         };
-        self.assemble(edited, &new_marks, &pair, orphans)
+        assemble(edited, &new_marks, &pair, orphans, |a| {
+            self.value(a as usize)
+        })
     }
+}
 
-    /// Текст по `edited` со значениями пар; пересканирование итога и метки без пары при маске
-    /// базы без пары в участке (`orphans`) — [`Restored::exposed`].
-    fn assemble(
-        &self,
-        edited: &str,
-        new_marks: &[usize],
-        pair: &[u32],
-        orphans: Vec<usize>,
-    ) -> Restored {
-        let crlf = edited.contains("\r\n");
-        let extra: usize = pair
+/// Восстановление списка строк `edited`, правленного по виду списка `bases` (элементы массива
+/// JSON: у каждой строки своя маска, [`crate::mask_text`] элемента) — то же правило, что у
+/// текста (описание модуля), строка выравнивания — элемент (ключ метки — от начала её строки
+/// внутри элемента). Итог — по элементу `edited`; номера строк [`Restored::exposed`] —
+/// внутри элемента (круг правок 2 задачи 6, B3: правка элемента с секретом — по правилу ключа,
+/// а не отказ на любую правку).
+pub fn restore_items(bases: &[&str], edited: &[&str]) -> Vec<Restored> {
+    if !edited.iter().any(|s| has_mark(s)) {
+        return edited
             .iter()
-            .filter(|&&a| a != NONE)
-            .map(|&a| self.marks[a as usize].1.len())
-            .sum();
-        let mut text = String::with_capacity(edited.len() + extra);
-        // восстановленные значения: диапазон в итоге и индекс метки нового текста
-        let mut values: Vec<(Range<usize>, usize)> = Vec::new();
-        let (mut pos, mut kept) = (0, 0);
-        for (j, (&at, &a)) in new_marks.iter().zip(pair).enumerate() {
-            text.push_str(&edited[pos..at]);
-            if a == NONE {
-                text.push_str(SECRET_MARK);
-                kept += 1;
-            } else {
-                let v = &self.raw[self.marks[a as usize].1.clone()];
-                if v == SECRET_MARK {
-                    text.push_str(v);
-                } else {
-                    let start = text.len();
-                    push_value(&mut text, v, crlf);
-                    values.push((start..text.len(), j));
-                }
+            .map(|s| Restored::same((*s).to_owned()))
+            .collect();
+    }
+    let olds: Vec<MaskedBase> = bases.iter().map(|b| MaskedBase::new(b)).collect();
+    let (mut old, mut om, mut lit) = (String::new(), Vec::new(), Vec::new());
+    // метка вида списка → (элемент, метка элемента)
+    let mut src: Vec<(usize, usize)> = Vec::new();
+    for (i, b) in olds.iter().enumerate() {
+        let at = old.len();
+        push_item(&mut old, &b.masked);
+        for (j, m) in b.marks.iter().enumerate() {
+            om.push(at + m.at);
+            lit.push(m.literal);
+            src.push((i, j));
+        }
+    }
+    let (mut new, mut nm) = (String::new(), Vec::new());
+    let mut item_marks: Vec<Vec<usize>> = Vec::with_capacity(edited.len());
+    // первая метка элемента в списке меток нового вида
+    let mut first: Vec<usize> = Vec::with_capacity(edited.len() + 1);
+    for e in edited {
+        first.push(nm.len());
+        let at = new.len();
+        push_item(&mut new, e);
+        let ms = mark_positions(e);
+        nm.extend(ms.iter().map(|p| at + p));
+        item_marks.push(ms);
+    }
+    first.push(nm.len());
+    let (pair, orphans) = if om.is_empty() {
+        (vec![NONE; nm.len()], Vec::new())
+    } else {
+        align(&old, &om, &lit, &new, &nm)
+    };
+    let mut item_orphans: Vec<Vec<usize>> = vec![Vec::new(); edited.len()];
+    for j in orphans {
+        let k = first.partition_point(|&f| f <= j) - 1;
+        item_orphans[k].push(j - first[k]);
+    }
+    let value = |a: u32| {
+        let (i, j) = src[a as usize];
+        olds[i].value(j)
+    };
+    edited
+        .iter()
+        .enumerate()
+        .map(|(k, e)| {
+            let pair = pair[first[k]..first[k + 1]].to_vec();
+            let orphans = std::mem::take(&mut item_orphans[k]);
+            if item_marks[k].is_empty() {
+                return Restored::same((*e).to_owned());
             }
-            pos = at + SECRET_MARK.len();
+            assemble(e, &item_marks[k], &pair, orphans, value)
+        })
+        .collect()
+}
+
+/// Элемент списка — строка вида списка: переводы строк внутри — [`ITEM_BREAK`] (позиции те же).
+fn push_item(out: &mut String, s: &str) {
+    out.extend(s.chars().map(|c| {
+        if c == '\r' || c == '\n' {
+            ITEM_BREAK
+        } else {
+            c
         }
-        text.push_str(&edited[pos..]);
-        let exposed = exposed_lines(&text, &values, orphans, edited, new_marks);
-        Restored {
-            text,
-            kept,
-            exposed,
+    }));
+    out.push('\n');
+}
+
+/// Перевод строки внутри элемента списка в строке выравнивания: ключ метки — от него, как от
+/// начала строки (в тексте `\r` к выравниванию не доходит — переводы строк приведены к `\n`).
+const ITEM_BREAK: char = '\r';
+
+/// Текст по `edited` со значениями пар (`value` метки базы; литерал — `None`, метка остаётся);
+/// пересканирование итога и метки без пары при маске базы без пары в участке (`orphans`) —
+/// [`Restored::exposed`].
+fn assemble<'v>(
+    edited: &str,
+    new_marks: &[usize],
+    pair: &[u32],
+    orphans: Vec<usize>,
+    value: impl Fn(u32) -> Option<&'v str>,
+) -> Restored {
+    let crlf = edited.contains("\r\n");
+    let extra: usize = pair
+        .iter()
+        .filter(|&&a| a != NONE)
+        .map(|&a| value(a).map_or(0, str::len))
+        .sum();
+    let mut text = String::with_capacity(edited.len() + extra);
+    // восстановленные значения: диапазон в итоге и индекс метки нового текста
+    let mut values: Vec<(Range<usize>, usize)> = Vec::new();
+    let (mut pos, mut kept) = (0, 0);
+    for (j, (&at, &a)) in new_marks.iter().zip(pair).enumerate() {
+        text.push_str(&edited[pos..at]);
+        if a == NONE {
+            text.push_str(SECRET_MARK);
+            kept += 1;
+        } else if let Some(v) = value(a) {
+            let start = text.len();
+            push_value(&mut text, v, crlf);
+            values.push((start..text.len(), j));
+        } else {
+            text.push_str(SECRET_MARK);
         }
+        pos = at + SECRET_MARK.len();
+    }
+    text.push_str(&edited[pos..]);
+    let exposed = exposed_lines(&text, &values, orphans, edited, new_marks);
+    Restored {
+        text,
+        kept,
+        exposed,
     }
 }
 
@@ -301,26 +421,33 @@ fn mark_positions(s: &str) -> Vec<usize> {
 
 /// Кусок исходника `r` без находок — в вид как есть; литеральные `‹secret›` в нём — метки со
 /// значением «сама метка».
-fn push_plain(
-    raw: &str,
-    r: Range<usize>,
-    masked: &mut String,
-    marks: &mut Vec<(usize, Range<usize>)>,
-) {
+fn push_plain(raw: &str, r: Range<usize>, masked: &mut String, marks: &mut Vec<BaseMark>) {
     let piece = &raw[r.clone()];
     for (i, _) in piece.match_indices(SECRET_MARK) {
         let at = r.start + i;
-        marks.push((masked.len() + i, at..at + SECRET_MARK.len()));
+        marks.push(BaseMark {
+            at: masked.len() + i,
+            value: at..at + SECRET_MARK.len(),
+            literal: true,
+        });
     }
     masked.push_str(piece);
 }
 
 /// Пары меток: для каждой метки `new` (позиции `new_marks`) — индекс метки `old` (позиции
-/// `old_marks`) или [`NONE`].
-fn align(old: &str, old_marks: &[usize], new: &str, new_marks: &[usize]) -> (Vec<u32>, Vec<usize>) {
+/// `old_marks`, литералы — `old_lit`) или [`NONE`]; метки `new` в правке окружения
+/// существующего секрета ([`Aligner::orphans_of_block`]).
+fn align(
+    old: &str,
+    old_marks: &[usize],
+    old_lit: &[bool],
+    new: &str,
+    new_marks: &[usize],
+) -> (Vec<u32>, Vec<usize>) {
     let mut intern: HashMap<&str, u32> = HashMap::new();
-    let old = Side::new(old, old_marks, &mut intern);
-    let new = Side::new(new, new_marks, &mut intern);
+    let mut words: HashMap<Cow<str>, u32> = HashMap::new();
+    let old = Side::new(old, old_marks, &mut intern, &mut words);
+    let new = Side::new(new, new_marks, &mut intern, &mut words);
     let mut heads = vec![false; intern.len()];
     for (line, &id) in &intern {
         heads[id as usize] = line.trim_start().starts_with('#');
@@ -330,8 +457,10 @@ fn align(old: &str, old_marks: &[usize], new: &str, new_marks: &[usize]) -> (Vec
         orphans: Vec::new(),
         pair: vec![NONE; new_marks.len()],
         old_paired: vec![false; old_marks.len()],
+        old_lit,
         old_used: vec![false; old.lines.len()],
         new_used: vec![false; new.lines.len()],
+        new_moved: vec![false; new.lines.len()],
         old_block: vec![NONE; old.lines.len()],
         new_block: vec![NONE; new.lines.len()],
         old_sec: vec![0; old.lines.len()],
@@ -344,10 +473,6 @@ fn align(old: &str, old_marks: &[usize], new: &str, new_marks: &[usize]) -> (Vec
     (a.pair, a.orphans)
 }
 
-/// Слова вокруг метки в её строке: последнее слово перед ней и первое после (без слов соседних
-/// меток).
-type Key<'x> = (Option<&'x str>, Option<&'x str>);
-
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -357,20 +482,64 @@ fn word_iter(s: &str) -> impl DoubleEndedIterator<Item = &str> {
     s.split(|c: char| !is_word(c)).filter(|w| !w.is_empty())
 }
 
-/// Одно и то же слово (без учёта регистра).
-fn same_word(a: Option<&str>, b: Option<&str>) -> bool {
-    match (a, b) {
-        (Some(x), Some(y)) => x == y || x.to_lowercase() == y.to_lowercase(),
-        _ => false,
+/// Слова ключа метки — в `out`: слова куска `s` (от начала строки или от прежней метки строки до
+/// метки) без уточнений в закрытых скобках: `token (prod): ` — `token`, `- CI (GitHub Actions): `
+/// — `CI`; слова незакрытой скобки (`(token: ‹secret›)`) остаются.
+fn key_words<'x>(s: &'x str, out: &mut Vec<&'x str>) {
+    let mut opens: Vec<usize> = Vec::new();
+    let mut word: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        if is_word(c) {
+            word.get_or_insert(i);
+            continue;
+        }
+        if let Some(b) = word.take() {
+            out.push(&s[b..i]);
+        }
+        match c {
+            '(' => opens.push(out.len()),
+            ')' => {
+                if let Some(at) = opens.pop() {
+                    out.truncate(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = word {
+        out.push(&s[b..]);
     }
 }
 
-/// Метки могут быть парой: слово перед ними одно и то же; у меток в начале строки — слово после
-/// (или его нет у обеих).
-fn keys_match(o: Key, n: Key) -> bool {
-    match (o.0, n.0) {
-        (Some(_), Some(_)) => same_word(o.0, n.0),
-        (None, None) => (o.1.is_none() && n.1.is_none()) || same_word(o.1, n.1),
+/// Слово в нижнем регистре (без копии, если заглавных нет).
+fn lower(w: &str) -> Cow<'_, str> {
+    if w.chars().any(char::is_uppercase) {
+        Cow::Owned(w.to_lowercase())
+    } else {
+        Cow::Borrowed(w)
+    }
+}
+
+/// Есть ли общий элемент у возрастающих списков.
+fn intersects(a: &[u32], b: &[u32]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+/// Метки могут быть парой (ключ тот же): у обеих слова ключа ([`key_words`]) есть и среди них —
+/// общее слово (без учёта регистра); или слов ключа нет у обеих (метка в начале строки, голое
+/// значение пункта списка) — правая часть тогда не сравнивается (круг правок 2, B3).
+fn keys_match(o: &[u32], n: &[u32]) -> bool {
+    match (o.is_empty(), n.is_empty()) {
+        (true, true) => true,
+        (false, false) => intersects(o, n),
         _ => false,
     }
 }
@@ -385,16 +554,25 @@ struct Side<'x> {
     first: Vec<u32>,
     /// Позиции меток в `text`, по возрастанию.
     marks: &'x [usize],
-    /// Слова вокруг каждой метки ([`Key`]).
-    keys: Vec<Key<'x>>,
+    /// Слова ключа метки `i` ([`key_words`]; номера слов в нижнем регистре, общие для обеих
+    /// сторон, по возрастанию без повторов) — `key_ids[key_at[i]..key_at[i + 1]]`.
+    key_ids: Vec<u32>,
+    key_at: Vec<u32>,
 }
 
 impl<'x> Side<'x> {
-    fn new(text: &'x str, marks: &'x [usize], intern: &mut HashMap<&'x str, u32>) -> Self {
+    fn new(
+        text: &'x str,
+        marks: &'x [usize],
+        intern: &mut HashMap<&'x str, u32>,
+        words: &mut HashMap<Cow<'x, str>, u32>,
+    ) -> Self {
         let mut lines = Vec::new();
         let mut ids = Vec::new();
         let mut first = Vec::new();
-        let mut keys = Vec::with_capacity(marks.len());
+        let mut key_ids = Vec::new();
+        let mut key_at = Vec::with_capacity(marks.len() + 1);
+        let mut buf: Vec<&'x str> = Vec::new();
         let (mut start, mut m) = (0usize, 0usize);
         for piece in text.split_inclusive('\n') {
             let end = start + piece.len();
@@ -404,17 +582,31 @@ impl<'x> Side<'x> {
                 m += 1;
             }
             for i in m0..m {
-                let at = marks[i];
                 let left_from = if i > m0 {
                     marks[i - 1] + SECRET_MARK.len()
                 } else {
                     start
                 };
-                let right_to = if i + 1 < m { marks[i + 1] } else { end };
-                keys.push((
-                    word_iter(&text[left_from..at]).next_back(),
-                    word_iter(&text[at + SECRET_MARK.len()..right_to]).next(),
-                ));
+                // строка элемента списка — от перевода строки внутри него ([`ITEM_BREAK`])
+                let seg = &text[left_from..marks[i]];
+                let seg = seg.rfind(ITEM_BREAK).map_or(seg, |b| &seg[b + 1..]);
+                buf.clear();
+                key_words(seg, &mut buf);
+                let at = key_ids.len();
+                key_at.push(at as u32);
+                for w in &buf {
+                    let next = words.len() as u32;
+                    key_ids.push(*words.entry(lower(w)).or_insert(next));
+                }
+                key_ids[at..].sort_unstable();
+                let mut keep = at;
+                for r in at..key_ids.len() {
+                    if keep == at || key_ids[keep - 1] != key_ids[r] {
+                        key_ids[keep] = key_ids[r];
+                        keep += 1;
+                    }
+                }
+                key_ids.truncate(keep);
             }
             let next = intern.len() as u32;
             ids.push(*intern.entry(piece).or_insert(next));
@@ -422,19 +614,31 @@ impl<'x> Side<'x> {
             start = end;
         }
         first.push(m as u32);
+        key_at.push(key_ids.len() as u32);
         Side {
             text,
             lines,
             ids,
             first,
             marks,
-            keys,
+            key_ids,
+            key_at,
         }
     }
 
     /// Индексы меток строки `l`.
     fn line_marks(&self, l: usize) -> Range<usize> {
         self.first[l] as usize..self.first[l + 1] as usize
+    }
+
+    /// Строка метки `a`.
+    fn mark_line(&self, a: usize) -> usize {
+        self.first.partition_point(|&f| f as usize <= a) - 1
+    }
+
+    /// Слова ключа метки `a` ([`Side::key_ids`]).
+    fn key(&self, a: usize) -> &[u32] {
+        &self.key_ids[self.key_at[a] as usize..self.key_at[a + 1] as usize]
     }
 
     /// Куски строки `l` без меток.
@@ -585,9 +789,13 @@ struct Aligner<'x> {
     pair: Vec<u32>,
     /// Метка старого текста уже в паре.
     old_paired: Vec<bool>,
+    /// Метка старого текста — литерал (не маска секрета, [`BaseMark::literal`]).
+    old_lit: &'x [bool],
     /// Строка уже сопоставлена целиком (неизменённая, перенесённая или правленая).
     old_used: Vec<bool>,
     new_used: Vec<bool>,
+    /// Строка нового текста — перенесённая целиком ([`Aligner::moves`]).
+    new_moved: Vec<bool>,
     /// Изменённый участок строки (индекс в списке участков) или [`NONE`].
     old_block: Vec<u32>,
     new_block: Vec<u32>,
@@ -660,33 +868,72 @@ impl Aligner<'_> {
         for (o, n) in &blocks {
             self.rest_of_block(o.clone(), n.clone());
         }
-        for (o, n) in blocks {
-            self.orphans_of_block(o, n);
+        for (b, (o, n)) in blocks.into_iter().enumerate() {
+            self.orphans_of_block(b as u32, o, n);
         }
     }
 
-    /// Метки нового текста без пары в изменённом участке, где осталась маска базы без пары: это
-    /// правка окружения существующего секрета (литералом значение молча пропало бы) — в
-    /// `orphans`, вызывающий отклоняет такую правку (решение координатора по сомнению 1 круга
-    /// правок 1). Маски базы участка все в паре (дописана ещё одна метка) или участок без масок —
-    /// метки остаются литералом.
-    fn orphans_of_block(&mut self, o: Range<usize>, n: Range<usize>) {
-        let lost = o.into_iter().any(|l| {
-            self.old
-                .line_marks(l)
-                .into_iter()
-                .any(|a| !self.old_paired[a])
-        });
-        if !lost {
+    /// Метки нового текста в изменённом участке `b`, где осталась маска базы без пары (литерал
+    /// базы — не маска: значения за ним нет, круг правок 2, B2), — правка окружения существующего
+    /// секрета: в `orphans`, вызывающий отклоняет такую правку (решение координатора по сомнению 1
+    /// круга правок 1). Это метка без пары и метка со спорной парой из другого участка (круг
+    /// правок 2, B1): строка участка правлена словами удалённой чужой строки — какое из значений
+    /// её, не решить, а другое молча пропало бы. Спорна пара, если источником могла быть и маска
+    /// участка без пары — ключ тот же и строка похожа ([`similarity`]); у строки, перенесённой
+    /// целиком (та же строка вида), — если строка этой маски содержит все слова новой (правкой
+    /// стала бы она). Маски базы участка все в паре (дописана ещё одна метка) или участок без
+    /// масок — метки остаются литералом, пары — как есть.
+    fn orphans_of_block(&mut self, b: u32, o: Range<usize>, n: Range<usize>) {
+        let lost: Vec<usize> = o
+            .filter(|&l| {
+                self.old
+                    .line_marks(l)
+                    .any(|a| !self.old_paired[a] && !self.old_lit[a])
+            })
+            .collect();
+        if lost.is_empty() {
             return;
         }
+        // слова строк с масками без пары — для спорных пар (их больше предела — любая пара из
+        // другого участка спорна: безопасный путь)
+        let lost_words: Option<Vec<Words>> = (lost.len() <= SIMILAR_CANDIDATES)
+            .then(|| lost.iter().map(|&l| self.old.line_words(l)).collect());
         for k in n {
-            for b in self.new.line_marks(k) {
-                if self.pair[b] == NONE {
-                    self.orphans.push(b);
+            let mut words: Option<Words> = None;
+            for j in self.new.line_marks(k) {
+                let a = self.pair[j];
+                let contested = if a == NONE {
+                    true
+                } else if self.old_block[self.old.mark_line(a as usize)] == b {
+                    false
+                } else if let Some(lw) = &lost_words {
+                    let nw = words.get_or_insert_with(|| self.new.line_words(k));
+                    self.contested(j, k, nw, &lost, lw)
+                } else {
+                    true
+                };
+                if contested {
+                    self.orphans.push(j);
                 }
             }
         }
+    }
+
+    /// Пара метки `j` (строка `k` нового текста, её слова `nw`) из другого участка спорна: маска
+    /// без пары строк `lost` (их слова `lw`) с тем же ключом могла быть её источником
+    /// ([`Aligner::orphans_of_block`]).
+    fn contested(&self, j: usize, k: usize, nw: &Words, lost: &[usize], lw: &[Words]) -> bool {
+        let all: u32 = nw.values().sum();
+        lost.iter().zip(lw).any(|(&l, w)| {
+            let s = similarity(w, nw);
+            s > 0
+                && (!self.new_moved[k] || s >= all)
+                && self.old.line_marks(l).any(|a| {
+                    !self.old_paired[a]
+                        && !self.old_lit[a]
+                        && keys_match(self.old.key(a), self.new.key(j))
+                })
+        })
     }
 
     /// Пара без проверки слов (одинаковые строки).
@@ -695,11 +942,11 @@ impl Aligner<'_> {
         self.old_paired[a] = true;
     }
 
-    /// Пара правленых строк: только свободные метки с тем же словом рядом ([`keys_match`]).
+    /// Пара правленых строк: только свободные метки с тем же ключом ([`keys_match`]).
     fn link_checked(&mut self, a: usize, b: usize) {
         if self.pair[b] == NONE
             && !self.old_paired[a]
-            && keys_match(self.old.keys[a], self.new.keys[b])
+            && keys_match(self.old.key(a), self.new.key(b))
         {
             self.link(a, b);
         }
@@ -766,6 +1013,7 @@ impl Aligner<'_> {
             };
             if let Some(l) = pick {
                 self.pair_lines(l, k);
+                self.new_moved[k] = true;
             }
         }
     }
@@ -814,7 +1062,8 @@ impl Aligner<'_> {
 
     /// Правленые строки (на месте и перенесённые): свободные строки с метками в пары по похожести
     /// слов ([`similarity`]), самые похожие первыми; при равной — строка того же изменённого
-    /// участка, затем ближайшая по месту в тексте. Новая строка с другими словами
+    /// участка, затем ближайшая по месту в тексте (спорную пару из другого участка отклоняет
+    /// [`Aligner::orphans_of_block`]). Новая строка с другими словами
     /// («x ‹secret›» вместо удалённой «token: ‹secret›») пары не получает. Кандидаты — строки того
     /// же участка (если их не больше [`SIMILAR_CANDIDATES`]) и строки с общими словами (слова
     /// чаще [`SIMILAR_POSTINGS_MAX`] строк кандидатов не дают).

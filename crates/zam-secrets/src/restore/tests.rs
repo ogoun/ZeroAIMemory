@@ -129,8 +129,11 @@ fn masked_base_is_mask_text() {
         let b = MaskedBase::new(&raw);
         assert_eq!(b.masked(), mask_text(&raw), "{raw}");
         let at: Vec<usize> = b.masked.match_indices(M).map(|(i, _)| i).collect();
-        let ours: Vec<usize> = b.marks.iter().map(|m| m.0).collect();
+        let ours: Vec<usize> = b.marks.iter().map(|m| m.at).collect();
         assert_eq!(at, ours, "{raw}");
+        // литерал — ровно метки исходника: их столько же, сколько `‹secret›` в исходнике
+        let lit = b.marks.iter().filter(|m| m.literal).count();
+        assert_eq!(lit, raw.matches(M).count(), "{raw}");
     }
 }
 
@@ -218,11 +221,10 @@ fn restore_other_key_kept() {
 }
 
 /// Пробы ревью 2–4 (C1): смена окружения метки. Снятый забор кода и URL или ключ-значение без
-/// разделителя (слово перед меткой то же) — значение восстановлено, но сканер его в итоге не
-/// закрывает: `exposed` — строки нового текста. Слово перед меткой сменилось (URL переписан
-/// прозой, «пароль от стенда — ‹secret›») — пары нет (M1), а маска базы участка осталась без
-/// пары: тоже `exposed` (решение координатора по сомнению 1 круга правок 1), значения в тексте
-/// нет. Контекст сохранён — `exposed` пуст.
+/// разделителя или прозой (ключ тот же) — значение восстановлено, но сканер его в итоге не
+/// закрывает: `exposed` — строки нового текста. Ключ сменился («пароль от стенда — ‹secret›») —
+/// пары нет (M1), а маска базы участка осталась без пары: тоже `exposed` (решение координатора по
+/// сомнению 1 круга правок 1), значения в тексте нет. Контекст сохранён — `exposed` пуст.
 #[test]
 fn restore_context_changed_exposed() {
     let p = pw(41);
@@ -234,7 +236,8 @@ fn restore_context_changed_exposed() {
     // забор сохранён, правка рядом — проходит
     let r = restore(&base, &view.replace("db\n", "db --verbose\n"));
     assert!(r.exposed.is_empty() && r.text.contains(&p), "{}", r.text);
-    // 3: URL переписан прозой — слово перед меткой сменилось, маска базы без пары: отказ
+    // 3: URL переписан прозой — ключ тот же (`база`, `user` до метки, круг правок 2, B3):
+    // значение восстановлено, но сканер прозу «пароль <значение>» не закрывает — отказ
     let base = format!("база: https://user:{p}@db.example.com/\n");
     let view = mask_text(&base);
     let r = restore(
@@ -243,9 +246,8 @@ fn restore_context_changed_exposed() {
             .replace("https://user:", "логин user, пароль ")
             .replace("@db.example.com/", " (db.example.com)"),
     );
-    assert!(!r.text.contains(&p), "{}", r.text);
     assert_eq!(r.exposed, vec![1], "{}", r.text);
-    // 3′: то же слово перед меткой, но не URL — значение вышло бы
+    // 3′: тот же ключ, но не URL — значение вышло бы
     let r = restore(
         &base,
         &view
@@ -268,6 +270,226 @@ fn restore_context_changed_exposed() {
     // разделитель сохранён — проходит
     let r = restore(&base, &view.replace("password = ", "password: "));
     assert!(r.exposed.is_empty() && r.text.contains(&p), "{}", r.text);
+}
+
+/// Значение `v` восстановлено, отказа и меток без пары нет.
+#[track_caller]
+fn passes(base: &str, edited: &str, v: &str) {
+    let r = restore(base, edited);
+    assert!(
+        r.exposed.is_empty() && r.kept == 0 && r.text.contains(v),
+        "{edited:?} → {:?}, exposed {:?}, kept {}",
+        r.text,
+        r.exposed,
+        r.kept
+    );
+}
+
+/// Пробы повторного ревью S1 и S2 (круг правок 2, B1): секция Prod (строка без заголовков)
+/// удалена, строка Dev правлена словами строки Prod. Какой ключ её — не решить по тексту, а
+/// другой молча пропал бы: строка — в `exposed` (отказ), а не тихо ключ Prod под Dev. Так же —
+/// список однообразных строк: удалена `db1`, `db3` правлена и перенесена на её место (строка
+/// участка похожа и на удалённую `db1`): отказ, а не тихо пароль `db1` у `db3`. Перенос целиком
+/// (та же строка вида) — со своим значением и при удалённой маске участка; перенос с правкой в
+/// участок без масок без пары — тоже.
+#[test]
+fn restore_cross_block_contested() {
+    let (a, b, c) = (key(61), key(62), key(63));
+    let base = format!("# K\n## Prod\ntoken: {a} (prod)\n## Dev\ntoken: {b}\n");
+    let r = restore(&base, &format!("# K\n## Dev\ntoken: {M} (было prod)\n"));
+    assert_eq!(r.exposed, vec![3], "{}", r.text);
+    let base = format!("начало\ntoken: {a} prod eu\nсередина\ntoken: {b}\nконец\n");
+    let r = restore(
+        &base,
+        &format!("начало\nсередина\ntoken: {M} prod eu копия\nконец\n"),
+    );
+    assert_eq!(r.exposed, vec![3], "{}", r.text);
+    // список: удалена db1, db3 правлена и перенесена на её место
+    let base = format!(
+        "## S\n- db1: password = {}\n- db2: password = {}\n- db3: password = {}\nконец\n",
+        pw(61),
+        pw(62),
+        pw(63)
+    );
+    let r = restore(
+        &base,
+        &format!("## S\n- db3: password = {M} (новый)\n- db2: password = {M}\nконец\n"),
+    );
+    assert_eq!(r.exposed, vec![2], "{}", r.text);
+    // db3 перенесена целиком — её значение, db1 удалена
+    passes(
+        &base,
+        &format!("## S\n- db3: password = {M}\n- db2: password = {M}\nконец\n"),
+        &format!(
+            "- db3: password = {}\n- db2: password = {}\n",
+            pw(63),
+            pw(62)
+        ),
+    );
+    // перенос с правкой в участок без масок базы без пары
+    let base = format!("a\ntoken: {c}\nb\nx\nконец\n");
+    passes(
+        &base,
+        &format!("a\nb\ny\ntoken: {M} (prod)\nконец\n"),
+        &format!("y\ntoken: {c} (prod)\n"),
+    );
+    // секция Prod удалена, строка Dev правлена своими словами — ключ Dev
+    let base = format!("# K\n## Prod\ntoken: {a} (prod)\n## Dev\ntoken: {b} (dev)\n");
+    passes(
+        &base,
+        &format!("# K\n## Dev\ntoken: {M} (dev) 2\n"),
+        &format!("token: {b} (dev) 2\n"),
+    );
+}
+
+/// Литерал `‹secret›` базы — не маска секрета (круг правок 2, B2; пробы L1–L4): строка с ним
+/// переписана, удалена рядом с новой меткой, заметка из литералов (импорт архива с маской) правлена
+/// — отказа нет; новая метка — литерал (`kept`), литерал напротив литерала — не новый. Маска
+/// настоящего секрета рядом с литералом по-прежнему считается.
+#[test]
+fn restore_literal_not_mask() {
+    let r = restore(
+        &format!("Ключ: {M}\nконец\n"),
+        &format!("Новый ключ — {M}\nконец\n"),
+    );
+    assert_eq!((r.kept, r.exposed.len()), (0, 0), "{}", r.text);
+    let r = restore(&format!("x {M}\nконец\n"), &format!("y {M}\nконец\n"));
+    assert_eq!((r.text.as_str(), r.kept), (&*format!("y {M}\nконец\n"), 1));
+    assert!(r.exposed.is_empty());
+    let r = restore(
+        &format!("а\nстарый {M}\nб\n"),
+        &format!("а\nновый {M}\nб\n"),
+    );
+    assert_eq!((r.kept, r.exposed.len()), (1, 0));
+    let base: String = (0..20).map(|i| format!("сервис {i}: {M}\n")).collect();
+    let r = restore(&base, &base.replace("сервис 7: ", "сервис 7 (выведен): "));
+    assert_eq!((r.kept, r.exposed.len()), (0, 0));
+    // литерал и настоящий ключ: ключ переписан другим словом — отказ по ключу
+    let k = key(64);
+    let r = restore(
+        &format!("Ключ: {M}\ntoken: {k}\n"),
+        &format!("Ключ: {M}\nother: {M}\n"),
+    );
+    assert_eq!(r.exposed, vec![2], "{}", r.text);
+}
+
+/// Ключ метки — общее слово среди слов от начала строки (или прежней метки) до метки, без
+/// уточнений в скобках (круг правок 2, B3): уточнение между ключом и разделителем, слово в
+/// ключе, ячейка таблицы, правленая строка элемента; без слов у обеих — правая часть не
+/// сравнивается (голое значение пунктом списка или строкой). Другой ключ — отказ.
+#[test]
+fn restore_key_words() {
+    let (a, p) = (key(71), pw(71));
+    for (base, edited) in [
+        (
+            format!("token: {a}\nконец\n"),
+            format!("token (prod): {M}\nконец\n"),
+        ),
+        (
+            format!("GITHUB_TOKEN: {a}\nконец\n"),
+            format!("GITHUB_TOKEN (CI): {M}\nконец\n"),
+        ),
+        (
+            format!("- CI: {a}\n"),
+            format!("- CI (GitHub Actions): {M}\n"),
+        ),
+        (format!("api key: {a}\n"), format!("api key v2: {M}\n")),
+        (
+            format!("export TOKEN={a}\n"),
+            format!("export TOKEN={M}  # ci\n"),
+        ),
+        (
+            format!("| имя | ключ |\n|---|---|\n| CI | {a} |\n"),
+            format!("| имя | ключ |\n|---|---|\n| CI prod | {M} |\n"),
+        ),
+        (
+            format!("Ключи:\n- {a}\nконец\n"),
+            format!("Ключи:\n- {M} (prod)\nконец\n"),
+        ),
+        (
+            format!("Ключи:\n- {a}\nконец\n"),
+            format!("Ключи:\n- {M} — CI\nконец\n"),
+        ),
+        (
+            format!("Ключ CI:\n{a}\nконец\n"),
+            format!("Ключ CI:\n{M} (CI)\nконец\n"),
+        ),
+        (format!("token: {a}\n"), format!("(token: {M})\n")),
+    ] {
+        passes(&base, &edited, &a);
+    }
+    for (base, edited) in [
+        (format!("пароль: {p}\n"), format!("Пароль: {M} (стенд)\n")),
+        (
+            format!("password = {p}\n"),
+            format!("password = {M}  # стенд\n"),
+        ),
+        (
+            format!("база: https://user:{p}@db.example.com/\n"),
+            format!("база: https://admin:{M}@db.example.com/\n"),
+        ),
+    ] {
+        passes(&base, &edited, &p);
+    }
+    // две метки в строке: ключ каждой — от прежней метки
+    let b = key(72);
+    passes(
+        &format!("a: {a}, b: {b}\n"),
+        &format!("a (prod): {M}, b (prod): {M}\n"),
+        &format!("a (prod): {a}, b (prod): {b}"),
+    );
+    // `password (стенд) = ‹secret›`: ключ тот же, значение восстановлено, но правило сканера
+    // ключ-значение уточнения перед разделителем не знает — значение вышло бы: отказ
+    // пересканированием, не правилом ключа
+    let r = restore(
+        &format!("password = {p}\n"),
+        &format!("password (стенд) = {M}\n"),
+    );
+    assert_eq!((r.exposed.as_slice(), r.kept), (&[1usize][..], 0));
+    assert!(r.text.contains(&p));
+    // другой ключ — отказ; голое значение получило ключ — тоже
+    let r = restore(
+        &format!("GITHUB_TOKEN: {a}\n"),
+        &format!("OPENAI_KEY (CI): {M}\n"),
+    );
+    assert_eq!(r.exposed, vec![1]);
+    let r = restore(&format!("- {a}\n"), &format!("- prod: {M}\n"));
+    assert_eq!(r.exposed, vec![1]);
+}
+
+/// Список строк (элементы массива JSON, у каждого своя маска, круг правок 2, B3): переставленные
+/// и правленые элементы — значения на месте; элемент с другим ключом на месте прежнего — отказ в
+/// этом элементе; литерал — не маска; перевод строки внутри элемента — строка элемента.
+#[test]
+fn restore_items_rule() {
+    let (k1, k2) = (key(81), key(82));
+    let (i1, i2) = (format!("a {k1}"), format!("b {k2}"));
+    let bases = [i1.as_str(), i2.as_str(), "c"];
+    let (v1, v2) = (mask_text(&i1), mask_text(&i2));
+    let edited = format!("{} (правлено)", v1);
+    let r = restore_items(&bases, &["c", &v2, &edited]);
+    let texts: Vec<&str> = r.iter().map(|x| x.text.as_str()).collect();
+    assert_eq!(texts, ["c", i2.as_str(), &format!("a {k1} (правлено)")]);
+    assert!(r.iter().all(|x| x.kept == 0 && x.exposed.is_empty()));
+    let r = restore_items(&bases, &[&format!("z {M}"), &v2, "c"]);
+    assert_eq!(r[0].exposed, vec![1], "{}", r[0].text);
+    assert_eq!(r[1].text, i2);
+    // элемент удалён, новый элемент другими словами — литерал
+    let r = restore_items(&bases, &["c", &format!("новый {M}")]);
+    assert_eq!((r[1].kept, r[1].exposed.len()), (1, 0));
+    // литерал элемента
+    let lit = format!("сервис: {M}");
+    let r = restore_items(&[&lit], &[&format!("сервис (old): {M}")]);
+    assert_eq!((r[0].kept, r[0].exposed.len()), (0, 0));
+    // перевод строки внутри элемента
+    let multi = format!("вход\ntoken: {k1}");
+    let r = restore_items(&[&multi, "x"], &["x", &format!("вход\ntoken: {M} (prod)")]);
+    assert_eq!(r[1].text, format!("вход\ntoken: {k1} (prod)"));
+    let r = restore_items(&[&multi], &[&format!("вход\nother: {M}")]);
+    assert_eq!(r[0].exposed, vec![2], "{}", r[0].text);
+    // без меток — как есть
+    let r = restore_items(&bases, &["c"]);
+    assert_eq!((r.len(), r[0].text.as_str()), (1, "c"));
 }
 
 /// Пробы ревью 6–7 (M3): база с `\r\n`, правка с `\n` — значения на месте, окончания — как у
@@ -377,13 +599,17 @@ fn edit_line(s: &mut String, e: usize) {
 /// Случайные правки агента по виду: вставка, удаление, правка до и после меток, перенос строки
 /// (и перенос правленой), однообразные строки в разных секциях, база с `\r\n` и правка с `\n`,
 /// смена окружения метки (`password = ‹secret›` → `password ‹secret›`). Итог — ровно те же правки
-/// исходника (окончания правки), меток без пары нет; строки со сменой окружения — ровно в
-/// `exposed`. Зерно и число случаев — `T6_SEED`, `T6_CASES`.
+/// исходника (окончания правки), меток без пары нет; строки со сменой окружения — в `exposed`.
+/// Сверх них в `exposed` — только правленая строка, если удалялась строка с маской и что-то
+/// переносилось (спорная пара из другого участка, круг правок 2, B1: безопасный путь);
+/// неправленая — никогда. Зерно и число случаев — `T6_SEED`, `T6_CASES`.
 #[test]
 fn restore_random_line_edits() {
     let env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
     let mut rng = Rng(env("T6_SEED").unwrap_or(7));
-    for case in 0..env("T6_CASES").unwrap_or(1000) as u32 {
+    let mut contested = 0usize;
+    let cases = env("T6_CASES").unwrap_or(1000) as u32;
+    for case in 0..cases {
         let crlf = rng.next(4) == 0;
         // секции с заголовком; однообразная строка — не больше одной на секцию
         let mut raw: Vec<String> = Vec::new();
@@ -415,17 +641,21 @@ fn restore_random_line_edits() {
                 *l = l.replace("\r\n", "\n");
             }
         }
-        // (правлена, перенесена, окружение снято); однообразные строки не переносятся
-        let mut done: Vec<(bool, bool, bool)> = raw
+        // (правлена, не переносить, окружение снято, перенесена); однообразные строки не
+        // переносятся
+        let mut done: Vec<(bool, bool, bool, bool)> = raw
             .iter()
             .map(|l| {
                 (
                     l.starts_with("## "),
                     l.starts_with("## ") || l.starts_with("token: "),
                     false,
+                    false,
                 )
             })
             .collect();
+        // удалялась строка с маской
+        let mut lost = false;
         for e in 0..1 + rng.next(7) {
             let len = raw.len();
             match rng.next(6) {
@@ -434,7 +664,7 @@ fn restore_random_line_edits() {
                     let t = format!("вставка {case}-{e}\n");
                     raw.insert(at, t.clone());
                     seen.insert(at, t);
-                    done.insert(at, (true, true, false));
+                    done.insert(at, (true, true, false, false));
                 }
                 1 if len > 1 => {
                     let at = rng.next(len);
@@ -442,7 +672,7 @@ fn restore_random_line_edits() {
                         continue;
                     }
                     raw.remove(at);
-                    seen.remove(at);
+                    lost |= seen.remove(at).contains(M);
                     done.remove(at);
                 }
                 2 | 3 => {
@@ -455,14 +685,14 @@ fn restore_random_line_edits() {
                     done[at].0 = true;
                 }
                 4 => {
-                    // смена окружения: ключ-значение без разделителя (слово перед меткой то же)
+                    // смена окружения: ключ-значение без разделителя (ключ тот же)
                     let at = rng.next(len);
                     if done[at].0 || !seen[at].ends_with(&format!("password = {M}\n")) {
                         continue;
                     }
                     raw[at] = raw[at].replace("password = ", "password ");
                     seen[at] = seen[at].replace("password = ", "password ");
-                    done[at] = (true, true, true);
+                    done[at] = (true, true, true, done[at].3);
                 }
                 _ => {
                     let from = rng.next(len);
@@ -473,7 +703,7 @@ fn restore_random_line_edits() {
                     let to = rng.next(len);
                     raw.insert(to, r);
                     seen.insert(to, s);
-                    done.insert(to, (d.0, true, d.2));
+                    done.insert(to, (d.0, true, d.2, true));
                 }
             }
         }
@@ -481,14 +711,28 @@ fn restore_random_line_edits() {
         let r = restore(&base, &edited);
         assert_eq!(r.text, want, "случай {case}:\n{edited}");
         assert_eq!(r.kept, 0, "случай {case}");
-        let exposed: Vec<usize> = done
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.2)
-            .map(|(i, _)| i + 1)
-            .collect();
-        assert_eq!(r.exposed, exposed, "случай {case}:\n{edited}");
+        for (i, d) in done.iter().enumerate() {
+            let at = r.exposed.contains(&(i + 1));
+            if d.2 {
+                assert!(
+                    at,
+                    "случай {case}: строка {} не в exposed:\n{edited}",
+                    i + 1
+                );
+            } else if at {
+                // спорная пара — только правленая строка при удалённой маске и переносе (её или
+                // соседней: для диффа строк это одно и то же)
+                assert!(
+                    lost && d.0 && done.iter().any(|d| d.3),
+                    "случай {case}: строка {} в exposed {:?}:\n{edited}",
+                    i + 1,
+                    r.exposed
+                );
+                contested += 1;
+            }
+        }
     }
+    println!("спорных пар (безопасный путь): {contested} на {cases} случаев");
 }
 
 /// Каждая строка большой заметки правлена (цитата `> `) — все значения на месте.
