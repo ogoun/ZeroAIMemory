@@ -22,10 +22,12 @@
 //! точки, а упор в [`FIXPOINT_MAX`] расширяет неустойчивые находки, пока вид не перестанет
 //! меняться ([`ScanOutcome::depth_capped`]). Правила флагов командной строки (`-pXXX`,
 //! `--password X`, `-u user:pass`, `Authorization:`) сканер применяет **только внутри кода**
-//! Markdown — строки fenced-блоков и inline-спаны ([`scan_flags_in_code`], вид
-//! [`SecretKind::CommandFlag`]; круг правок 1 задачи 5 M7.1); текст команды целиком — [`mask_flags`]
-//! (первая строка команды снимка сессии у клиента), в [`mask_text`] она не входит.
+//! Markdown — строки блоков в ограждениях и инлайн-код ([`scan_flags_in_code`], вид
+//! [`SecretKind::CommandFlag`]; круг правок 1–2 задачи 5 M7.1); текст команды целиком —
+//! [`mask_flags`] (первая строка команды снимка сессии у клиента), в [`mask_text`] она не входит.
+//! Что считать кодом — [`code`]: одно определение на проект (его берёт и `zam-markdown`).
 
+pub mod code;
 mod flags;
 
 use std::ops::Range;
@@ -168,14 +170,34 @@ fn anchored_at(text: &str, at: usize, out: &mut Vec<(Range<usize>, SecretKind)>)
 /// конец находки). Найденное — снова в работу. Повторы отсекает множество `(начало, конец)`:
 /// цепочка из 50 000 ключей — линейно (ревью повторное 9A).
 fn glued_prefixes(text: &str, raw: &mut Vec<(Range<usize>, SecretKind)>) {
+    // проверять есть что, только у префиксных и JWT-находок или если с конца находки может
+    // начаться ключ ([`GLUED_FIRST`]); иначе — ни множеств, ни копии находок (круг правок 2
+    // задачи 5 M7.1: десятки тысяч находок флагов подряд)
+    let bytes = text.as_bytes();
+    let candidate = |(h, k): &(Range<usize>, SecretKind)| {
+        matches!(k, SecretKind::KnownPrefix(_) | SecretKind::Jwt)
+            || bytes.get(h.end).is_some_and(|b| GLUED_FIRST.contains(b))
+    };
+    let mut work: Vec<(Range<usize>, SecretKind)> =
+        raw.iter().filter(|&x| candidate(x)).cloned().collect();
+    if work.is_empty() {
+        return;
+    }
     let mut seen: std::collections::HashSet<(usize, usize)> =
         raw.iter().map(|(r, _)| (r.start, r.end)).collect();
     let mut ends: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut work: Vec<(Range<usize>, SecretKind)> = raw.clone();
     let mut found = Vec::new();
     while let Some((h, kind)) = work.pop() {
         found.clear();
-        if h.end < text.len() && text.is_char_boundary(h.end) && ends.insert(h.end) {
+        // с конца находки ключ начинается только с первого байта шаблона ([`GLUED_FIRST`]):
+        // иначе якорные шаблоны не проверяются вовсе — десятки тысяч находок подряд (флаги
+        // `-px -px …` в коде, круг правок 2 задачи 5 M7.1) не стоят десятков вызовов регулярок
+        // каждая
+        if h.end < text.len()
+            && GLUED_FIRST.contains(&text.as_bytes()[h.end])
+            && text.is_char_boundary(h.end)
+            && ends.insert(h.end)
+        {
             anchored_at(text, h.end, &mut found);
         }
         if matches!(kind, SecretKind::KnownPrefix(_) | SecretKind::Jwt) {
@@ -974,15 +996,19 @@ fn scan_rules(text: &str) -> Vec<(Range<usize>, SecretKind)> {
             .map(|r| (r, SecretKind::CommandFlag)),
     );
     glued_prefixes(text, &mut raw);
-    let others: Vec<Range<usize>> = merge_ranges(raw.clone())
-        .into_iter()
-        .map(|(r, _)| r)
-        .collect();
-    raw.extend(
-        entropy_hits(text, &others)
+    // нет кандидатов энтропии — и объединять находки для неё незачем (тысячи находок флагов
+    // подряд, круг правок 2 задачи 5 M7.1)
+    if ENTROPY_CANDIDATE.is_match(text) {
+        let others: Vec<Range<usize>> = merge_ranges(raw.clone())
             .into_iter()
-            .map(|r| (r, SecretKind::HighEntropy)),
-    );
+            .map(|(r, _)| r)
+            .collect();
+        raw.extend(
+            entropy_hits(text, &others)
+                .into_iter()
+                .map(|r| (r, SecretKind::HighEntropy)),
+        );
+    }
     raw
 }
 

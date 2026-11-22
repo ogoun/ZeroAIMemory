@@ -1,53 +1,87 @@
 //! Правила флагов командной строки (задача 3 M7.1, §4.2 п. 5 спецификации M7): значения
 //! паролей и токенов в аргументах команд, которых остальные правила сканера не знают.
 //!
-//! Перенесены из клиента `zam` (`snapshot::mask_flags`, задача 17a M6) без изменения поведения.
-//! Применяются двумя путями:
+//! Перенесены из клиента `zam` (`snapshot::mask_flags`, задача 17a M6). Применяются двумя путями:
 //! - [`mask_flags`] — текст команды целиком (первая строка команды снимка сессии, клиент): в
 //!   [`crate::mask_text`] эта функция не входит;
-//! - [`code_flag_ranges`] — **только внутри кода** Markdown: строки fenced-блоков (```` ``` ````
-//!   и `~~~`, любой язык или без него) и inline-спаны `` `…` `` (круг правок 1 задачи 5 M7.1,
-//!   решение координатора). Это правило сканера ([`crate::scan_secrets`], вид
-//!   [`crate::SecretKind::CommandFlag`]): чанки, L0, выдача агенту и фокус маскируются одинаково.
-//!   Проза вне кода не трогается: «используйте -u для пользователя», «basic», «bearer» в тексте —
-//!   не пароль. Ворота `-p` (mysql-подобные, `sshpass`) и `-u user:pass` (HTTP-клиенты) —
-//!   по логической строке кода (строки с `\` в конце склеиваются) или по inline-спану.
+//! - [`code_flag_ranges`] — **только внутри кода** Markdown ([`crate::code::code_regions`]: строки
+//!   блоков в ограждениях, в том числе в цитатах, и инлайн-код, в том числе многострочный; круг
+//!   правок 1–2 задачи 5 M7.1, решение координатора). Это правило сканера
+//!   ([`crate::scan_secrets`], вид [`crate::SecretKind::CommandFlag`]): чанки, L0, выдача агенту и
+//!   фокус маскируются одинаково. Проза вне кода не трогается: «используйте -u для
+//!   пользователя», «basic», «bearer» в тексте — не пароль. Ворота `-p` (mysql-подобные,
+//!   `sshpass`) и `-u user:pass` (HTTP-клиенты) — по логической строке блока (строки с `\` в
+//!   конце склеиваются) или по спану инлайн-кода целиком.
+//!
+//! Значение: без кавычек; обратная кавычка в значение не входит (`` `mysql -pX` ``), закрывающая
+//! скобка без пары — тоже (`$(mysql -pX)`); ссылки на переменные (`$X`, `${X}`, `%X%`), заглушки
+//! `<…>` и заглушки из заглавных букв и `_` (`TOKEN`, `PASS_WORD`, от трёх знаков) — не
+//! секреты; уже замаскированное — остаётся. Заголовок `Authorization`/`X-Api-Key` узнаётся и в
+//! JSON и YAML (`"Authorization": "Bearer …"`, `Authorization: "Bearer …"`).
+//!
+//! Время линейно по длине текста (круг правок 2: прежние ворота строили логическую строку и
+//! проходили её регуляркой на каждого кандидата — квадратично, 38 с на строке в 1 МБ): флаги с
+//! дефисом — один проход по знакам `-` без регулярок ([`dash_flags`]), заголовок — один поиск
+//! регулярки; начала логических единиц собираются один раз, единица кандидата — двоичным
+//! поиском, регулярка ворот проходит каждую единицу не больше раза на правило.
 //!
 //! Правило в коде вошло в выпуск 0.0.14-m7.1 вместе с прочими правилами версии
 //! [`crate::RULES_VERSION`] 3 (версия не повышалась: выпуск ещё не вышел).
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 use crate::SECRET_MARK;
+use crate::code::{CodeKind, code_regions};
 
-/// Шаблоны значений: `--password X`, `-u user:pass`, `Authorization: X`, `-pXXX`.
-static FLAGS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
-    [
-        // --password X, --password=X, --token "a b"
-        Regex::new(
-            r#"(?i)(?:^|[\s'"])--(?:password|passwd|pass|pwd|passphrase|token|api-key|apikey|api-token|secret|secret-key|client-secret|access-token|auth-token|http-password|proxy-password)(?:=|\s+)("[^"]*"|'[^']*'|[^\s"']+)"#,
-        )
-        .expect("regex"),
-        // curl -u user:pass, --user user:pass, -uuser:pass
-        Regex::new(r#"(?:^|\s)(?:-u\s*|--user(?:=|\s+))["']?([^\s:"']+):([^\s"'@]+)"#)
-            .expect("regex"),
-        // Authorization: Bearer X | Basic X | Token X | X; X-Api-Key: X
-        Regex::new(
-            r#"(?i)(?:authorization\s*:\s*(?:(?:bearer|basic|token|digest)\s+)?|x-api-key\s*:\s*)([^\s"']{6,})"#,
-        )
-        .expect("regex"),
-        // -pXXX, -p'a b' (значение слитно с флагом)
-        Regex::new(r#"(?:^|\s)-p("[^"]*"|'[^']*'|[^\s"']+)"#).expect("regex"),
-    ]
-});
-
-/// Номер правила `-u user:pass` в [`FLAGS`] (ворота — HTTP-клиенты).
+/// Правила флагов (номер — в [`flag_values`], ворота — у `-u` и `-p`):
+/// - [`LONG`] — `--password X`, `--password=X`, `--token "a b"` (имена — [`LONG_NAMES`]);
+/// - [`USER_PASS`] — `-u user:pass`, `--user user:pass`, `-uuser:pass` (ворота — HTTP-клиенты);
+/// - [`HEADER`] — `Authorization: Bearer X | Basic X | Token X | X`, `X-Api-Key: X`, в том числе
+///   JSON и YAML ([`HEADER_RE`]);
+/// - [`GLUED_P`] — `-pXXX`, `-p'a b'` (значение слитно с флагом; ворота — mysql-подобные и
+///   `sshpass`).
+///
+/// Флаги с дефисом ищутся одним проходом по знакам `-` ([`dash_flags`]) — по смыслу это шаблоны
+/// `(?:^|[\s'"])--(?:имена)(?:=|\s+)(?:"[^"]*"|'[^']*'|[^\s"'`]+)`,
+/// `(?:^|\s)(?:-u\s*|--user(?:=|\s+))["']?[^\s:"'`]+:[^\s"'@`]+` и
+/// `(?:^|\s)-p(?:"[^"]*"|'[^']*'|[^\s"'`]+)` (поиск регулярки на каждое из тысяч совпадений
+/// подряд стоил ~100 нс, разбор — единицы).
+const LONG: usize = 0;
 const USER_PASS: usize = 1;
-/// Номер правила `-pXXX` в [`FLAGS`] (ворота — mysql-подобные и `sshpass`).
+const HEADER: usize = 2;
 const GLUED_P: usize = 3;
+
+/// Имена длинных флагов с паролем или токеном (строчными; сравнение без учёта регистра).
+const LONG_NAMES: &[&str] = &[
+    "password",
+    "passwd",
+    "pass",
+    "pwd",
+    "passphrase",
+    "token",
+    "api-key",
+    "apikey",
+    "api-token",
+    "secret",
+    "secret-key",
+    "client-secret",
+    "access-token",
+    "auth-token",
+    "http-password",
+    "proxy-password",
+];
+
+/// Заголовок: значение — в конце совпадения, его выделяет [`header_value`].
+static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(?:authorization|x-api-key)["']?\s*:\s*["']?(?:(?:bearer|basic|token|digest)\s+)?[^\s"'`]{6,}"#,
+    )
+    .expect("regex")
+});
 
 /// Команды, у которых флаги `-p` и `-u` значат пароль: mysql-подобные и `sshpass`; HTTP-клиенты.
 static GATES: LazyLock<[Regex; 2]> = LazyLock::new(|| {
@@ -68,73 +102,259 @@ static CODE_GATES: LazyLock<[Regex; 2]> = LazyLock::new(|| {
     ]
 });
 
+/// Позиция после пробельных символов с `p` (как `\s` регулярок: Unicode White_Space).
+fn skip_ws(m: &str, p: usize) -> usize {
+    p + m[p..]
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace())
+        .map_or(m.len() - p, |(i, _)| i)
+}
+
+/// Позиция после одной кавычки (`"` или `'`) с `p`, если она там есть.
+fn skip_quote(m: &str, p: usize) -> usize {
+    p + usize::from(m[p..].starts_with(['"', '\'']))
+}
+
+/// Значение в совпадении заголовка `m` ([`HEADER_RE`], диапазон внутри `m`): после `:`, кавычки
+/// и схемы (`Bearer`) — после последнего пробела.
+fn header_value(m: &str) -> Option<Range<usize>> {
+    let kw = if m
+        .as_bytes()
+        .get(..13)
+        .is_some_and(|k| k.eq_ignore_ascii_case(b"authorization"))
+    {
+        13
+    } else {
+        "x-api-key".len()
+    };
+    let mut p = skip_ws(m, skip_quote(m, kw));
+    p = m[p..].starts_with(':').then_some(p + 1)?;
+    p = skip_quote(m, skip_ws(m, p));
+    let start = m[p..]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(p, |(j, c)| p + j + c.len_utf8());
+    Some(start..m.len())
+}
+
+/// Флаг с дефисом: правило, всё совпадение, значение (в кавычках — с ними), у `-u` — имя.
+struct DashFlag {
+    rule: usize,
+    whole: Range<usize>,
+    value: Range<usize>,
+    user: Option<Range<usize>>,
+}
+
+/// Начало совпадения перед позицией `i` по `(?:^|\s)` (или `(?:^|[\s'"])` при `quotes`): начало
+/// текста или начало предшествующего пробельного знака (кавычки).
+fn lead_at(text: &str, i: usize, quotes: bool) -> Option<usize> {
+    if i == 0 {
+        return Some(0);
+    }
+    let c = text[..i].chars().next_back()?;
+    (c.is_whitespace() || (quotes && matches!(c, '"' | '\''))).then(|| i - c.len_utf8())
+}
+
+/// Длина серии знаков с `p`, для которых `keep` истинно.
+fn run_len(text: &str, p: usize, keep: impl Fn(char) -> bool) -> usize {
+    let rest = &text[p..];
+    rest.char_indices()
+        .find(|(_, c)| !keep(*c))
+        .map_or(rest.len(), |(j, _)| j)
+}
+
+/// Конец значения `(?:"[^"]*"|'[^']*'|[^\s"'`]+)` с позиции `p`.
+fn value_end(text: &str, p: usize) -> Option<usize> {
+    match *text.as_bytes().get(p)? {
+        q @ (b'"' | b'\'') => text[p + 1..].find(q as char).map(|j| p + 1 + j + 1),
+        _ => {
+            let n = run_len(text, p, |c| {
+                !c.is_whitespace() && !matches!(c, '"' | '\'' | '`')
+            });
+            (n > 0).then_some(p + n)
+        }
+    }
+}
+
+/// Флаги с дефисом в `text` одним проходом по знакам `-` (шаблоны — у [`LONG`]): у каждого
+/// правила совпадения не пересекаются и идут слева направо, как у `find_iter` регулярки.
+fn dash_flags(text: &str, enabled: [bool; 4], f: &mut dyn FnMut(DashFlag)) {
+    let b = text.as_bytes();
+    let mut last_end = [0usize; 4];
+    let mut emit = |d: DashFlag, last_end: &mut [usize; 4]| {
+        if d.whole.start >= last_end[d.rule] {
+            last_end[d.rule] = d.whole.end;
+            f(d);
+        }
+    };
+    let mut i = 0;
+    while let Some(j) = b[i..].iter().position(|&c| c == b'-') {
+        let at = i + j;
+        i = at + 1;
+        match b.get(at + 1) {
+            Some(b'p') if enabled[GLUED_P] => {
+                if let Some(start) = lead_at(text, at, false)
+                    && let Some(end) = value_end(text, at + 2)
+                {
+                    let d = DashFlag {
+                        rule: GLUED_P,
+                        whole: start..end,
+                        value: at + 2..end,
+                        user: None,
+                    };
+                    emit(d, &mut last_end);
+                }
+            }
+            Some(b'u') if enabled[USER_PASS] => {
+                // `--user` — с первого дефиса; `-u` — с этого
+                let (flag, after) = if at >= 1 && b[at - 1..].starts_with(b"--user") {
+                    let p = at - 1 + "--user".len();
+                    let after = if b.get(p) == Some(&b'=') {
+                        Some(p + 1)
+                    } else {
+                        let w = skip_ws(text, p);
+                        (w > p).then_some(w)
+                    };
+                    (at - 1, after)
+                } else {
+                    (at, Some(skip_ws(text, at + 2)))
+                };
+                let Some(start) = lead_at(text, flag, false) else {
+                    continue;
+                };
+                let Some(p) = after.map(|p| skip_quote(text, p)) else {
+                    continue;
+                };
+                let un = run_len(text, p, |c| {
+                    !c.is_whitespace() && !matches!(c, ':' | '"' | '\'' | '`')
+                });
+                if un == 0 || b.get(p + un) != Some(&b':') {
+                    continue;
+                }
+                let q = p + un + 1;
+                let pn = run_len(text, q, |c| {
+                    !c.is_whitespace() && !matches!(c, '"' | '\'' | '@' | '`')
+                });
+                if pn == 0 {
+                    continue;
+                }
+                let d = DashFlag {
+                    rule: USER_PASS,
+                    whole: start..q + pn,
+                    value: q..q + pn,
+                    user: Some(p..p + un),
+                };
+                emit(d, &mut last_end);
+            }
+            Some(b'-') if enabled[LONG] => {
+                let Some(start) = lead_at(text, at, true) else {
+                    continue;
+                };
+                let name = at + 2;
+                let nn = text[name..]
+                    .bytes()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == b'-')
+                    .count();
+                let n = &text[name..name + nn];
+                if !LONG_NAMES.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+                    continue;
+                }
+                let p = name + nn;
+                let p = if b.get(p) == Some(&b'=') {
+                    p + 1
+                } else {
+                    let w = skip_ws(text, p);
+                    if w == p {
+                        continue;
+                    }
+                    w
+                };
+                if let Some(end) = value_end(text, p) {
+                    let d = DashFlag {
+                        rule: LONG,
+                        whole: start..end,
+                        value: p..end,
+                        user: None,
+                    };
+                    emit(d, &mut last_end);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Значение — заглушка из заглавных латинских букв и `_` (`TOKEN`, `PASSWORD`, `PASS_WORD`), от
+/// трёх знаков, хотя бы одна буква: так пишут место для значения, а не само значение.
+fn is_caps_placeholder(v: &str) -> bool {
+    v.len() >= 3
+        && v.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+        && v.bytes().any(|b| b.is_ascii_uppercase())
+}
+
 /// Значения флагов в `text`: диапазоны байт значений (по правилам, без сортировки). Правило `i`
 /// с воротами проверяется, только если `enabled[i]`, и значение берётся, только если
-/// `gate(i, совпадение)` (весь диапазон совпадения; ворота — последней, самой дорогой проверкой).
-/// Значение — без кавычек; ссылки на переменные, заглушки, схема заголовка без значения и уже
-/// замаскированное — не значения.
+/// `gate(i, совпадение)` (весь диапазон совпадения; ворота — последней проверкой). Значение — без
+/// кавычек и без закрывающей скобки без пары; ссылки на переменные, заглушки, схема заголовка без
+/// значения, числовые `uid:gid` и уже замаскированное — не значения.
 fn flag_values(
     text: &str,
     enabled: [bool; 4],
     gate: &dyn Fn(usize, Range<usize>) -> bool,
 ) -> Vec<Range<usize>> {
     let mut out = Vec::new();
-    for (i, r) in FLAGS.iter().enumerate() {
-        if !enabled[i] {
-            continue;
+    let mut take = |rule: usize, whole: Range<usize>, value: Range<usize>, user: Option<&str>| {
+        let (mut b, mut e) = (value.start, value.end);
+        // `-u user:pass` — числовые `uid:gid` — не пароль
+        if let Some(u) = user {
+            let digits = |s: &str| s.bytes().all(|x| x.is_ascii_digit());
+            if digits(u) && digits(&text[b..e]) {
+                return;
+            }
         }
-        // одни и те же ячейки групп на все совпадения правила: без выделения памяти на каждое
-        let mut locs = r.capture_locations();
-        let mut from = 0usize;
-        while from < text.len() {
-            let Some(found) = r.captures_read_at(&mut locs, text, from) else {
-                break;
-            };
-            let whole = found.range();
-            // совпадения непустые; на всякий случай — шаг вперёд на символ
-            from = if whole.end > from {
-                whole.end
-            } else {
-                from + text[from..].chars().next().map_or(1, char::len_utf8)
-            };
-            let group = |k: usize| locs.get(k).map(|(s, e)| s..e);
-            // `-u user:pass` — значение во второй группе; числовые `uid:gid` — не пароль
-            let m = if i == USER_PASS {
-                let (Some(u), Some(p)) = (group(1), group(2)) else {
-                    continue;
-                };
-                let digits = |r: &Range<usize>| text[r.clone()].bytes().all(|b| b.is_ascii_digit());
-                if digits(&u) && digits(&p) {
-                    continue;
-                }
-                p
-            } else {
-                let Some(m) = group(1) else { continue };
-                m
-            };
-            let v = &text[m.clone()];
-            let (mut b, mut e) = (m.start, m.end);
-            if (v.starts_with('"') || v.starts_with('\'')) && v.len() >= 2 {
-                b += 1;
-                e -= 1;
+        let raw = &text[b..e];
+        if (raw.starts_with('"') || raw.starts_with('\'')) && raw.len() >= 2 {
+            b += 1;
+            e -= 1;
+        }
+        // закрывающая скобка без пары — конец подстановки `$(…)`, не значение
+        while text[b..e].ends_with(')')
+            && text[b..e].matches('(').count() < text[b..e].matches(')').count()
+        {
+            e -= 1;
+        }
+        let inner = &text[b..e];
+        // у заголовка без значения длиной ≥ 6 шаблон берёт слово-схему — его не трогаем
+        let scheme = rule == HEADER
+            && ["bearer", "basic", "token", "digest"]
+                .iter()
+                .any(|w| inner.eq_ignore_ascii_case(w));
+        // уже замаскированное: сначала дешёвый поиск первого знака метки
+        let masked = inner.contains('\u{2039}') && inner.contains(SECRET_MARK);
+        if inner.is_empty() || scheme || masked || is_reference(inner) || is_caps_placeholder(inner)
+        {
+            return;
+        }
+        if (rule == USER_PASS || rule == GLUED_P) && !gate(rule, whole) {
+            return;
+        }
+        out.push(b..e);
+    };
+    dash_flags(text, enabled, &mut |d| {
+        let user = d.user.map(|u| &text[u]);
+        take(d.rule, d.whole, d.value, user);
+    });
+    if enabled[HEADER] {
+        for m in HEADER_RE.find_iter(text) {
+            if let Some(v) = header_value(m.as_str()) {
+                take(
+                    HEADER,
+                    m.range(),
+                    m.start() + v.start..m.start() + v.end,
+                    None,
+                );
             }
-            let inner = &text[b..e];
-            // значение целиком — ссылка на переменную (`$NAME`, `${NAME}`, `%NAME%`) или заглушка
-            // `<…>` ([`is_reference`]); у заголовка без значения длиной ≥ 6 регулярка берёт
-            // слово-схему — его не трогаем
-            let scheme = i == 2
-                && ["bearer", "basic", "token", "digest"]
-                    .iter()
-                    .any(|w| inner.eq_ignore_ascii_case(w));
-            // уже замаскированное: сначала дешёвый поиск первого знака метки
-            let masked = inner.contains('\u{2039}') && inner.contains(SECRET_MARK);
-            if inner.is_empty() || scheme || masked || is_reference(inner) {
-                continue;
-            }
-            if (i == USER_PASS || i == GLUED_P) && !gate(i, whole) {
-                continue;
-            }
-            out.push(b..e);
         }
     }
     out
@@ -150,8 +370,8 @@ fn flag_values(
 ///   ссылка на переменную (`Bearer $TOKEN`) и сама схема не маскируются.
 ///
 /// Значение заменяется меткой [`SECRET_MARK`]; ссылки на переменные (`$X`, `%X%`), заглушки
-/// (`<…>`) и уже замаскированные значения остаются — повторный вызов ничего не меняет. Ворота
-/// `-p` и `-u` — по всему `text` (это одна команда).
+/// (`<…>`, `TOKEN`) и уже замаскированные значения остаются — повторный вызов ничего не меняет.
+/// Ворота `-p` и `-u` — по всему `text` (это одна команда).
 pub fn mask_flags(text: &str) -> String {
     let [mysql, curl] = &*GATES;
     let enabled = [true, curl.is_match(text), true, mysql.is_match(text)];
@@ -174,175 +394,101 @@ pub fn mask_flags(text: &str) -> String {
     out
 }
 
-/// Значения флагов внутри кода Markdown `text` (см. модуль): диапазоны байт `text`. Участки кода —
-/// [`code_segments`]; они собираются в один буфер через `\n`, и каждое правило и каждые ворота
-/// проходят его один раз (линейно по объёму кода, без вызова регулярок на каждый спан или
-/// совпадение); значение берётся, только если целиком лежит в одном участке, а слово ворот
-/// `-p`/`-u` есть в его логической строке (поиск по отсортированным началам слов ворот).
+/// Значения флагов внутри кода Markdown `text` (см. модуль): диапазоны байт `text`.
+///
+/// Участки кода ([`code_regions`]) собираются в один буфер через `\n`: каждое правило проходит
+/// его одним поиском. Значение берётся, только если совпадение целиком лежит в одном участке, а
+/// для `-p`/`-u` в его логической единице есть слово ворот. Логические единицы — строки блока
+/// (строка, кончающаяся `\`, продолжается следующей) и спан инлайн-кода целиком; их начала
+/// собираются один раз, единица кандидата — двоичным поиском, регулярка ворот проходит каждую
+/// единицу не больше раза на правило (ответ запоминается: кандидаты идут слева направо).
 pub(crate) fn code_flag_ranges(text: &str) -> Vec<Range<usize>> {
     // нет ни обратной кавычки, ни тильды — кода нет (обычная проза — без разбора строк)
     if !text.bytes().any(|b| b == b'`' || b == b'~') {
         return Vec::new();
     }
-    let segs = code_segments(text);
-    if segs.is_empty() {
+    let regions = code_regions(text);
+    if regions.is_empty() {
         return Vec::new();
     }
-    // (начало в буфере, начало в тексте, длина)
-    let mut map: Vec<(usize, usize, usize)> = Vec::with_capacity(segs.len());
-    let mut buf = String::with_capacity(segs.iter().map(|s| s.len() + 1).sum());
-    for s in &segs {
-        map.push((buf.len(), s.start, s.len()));
-        buf.push_str(&text[s.clone()]);
+    // (начало в буфере, начало в тексте, длина) и начала логических единиц в буфере
+    let mut map: Vec<(usize, usize, usize)> = Vec::with_capacity(regions.len());
+    let mut units: Vec<usize> = Vec::with_capacity(regions.len());
+    let mut buf = String::with_capacity(regions.iter().map(|r| r.range.len() + 1).sum());
+    for r in &regions {
+        let s = &text[r.range.clone()];
+        let base = buf.len();
+        map.push((base, r.range.start, s.len()));
+        units.push(base);
+        if r.kind == CodeKind::Fenced {
+            line_units(s, base, &mut units);
+        }
+        buf.push_str(s);
         buf.push('\n');
     }
-    let seg_of = |at: usize| map.partition_point(|m| m.0 <= at) - 1;
-    // ворота — по логической строке участка вокруг последнего байта совпадения (начало совпадения
-    // может быть разделителем `\n` перед участком — `(?:^|\s)` шаблона); проверяются только у
-    // кандидатов, прошедших прочие проверки
+    let region_of = |at: usize| map.partition_point(|m| m.0 <= at) - 1;
+    let unit_of = |at: usize| {
+        let k = units.partition_point(|&u| u <= at) - 1;
+        units[k]..units.get(k + 1).copied().unwrap_or(buf.len())
+    };
+    // ворота — по единице последнего байта совпадения (начало совпадения может быть
+    // разделителем `\n` перед участком — `(?:^|\s)` шаблона): регулярка ворот проходит единицу
+    // один раз — ответ запоминается до следующей единицы (кандидаты идут слева направо), так что
+    // всего проходится не больше буфера на правило, сколько бы кандидатов ни было
     let [mysql, curl] = &*CODE_GATES;
+    let cache: [Cell<(usize, bool)>; 2] = [
+        Cell::new((usize::MAX, false)),
+        Cell::new((usize::MAX, false)),
+    ];
     let gate = |i: usize, r: Range<usize>| {
         let mut at = r.end.saturating_sub(1).max(r.start);
         while !buf.is_char_boundary(at) {
             at -= 1;
         }
-        let (bs, _, len) = map[seg_of(at)];
-        let line = &buf[logical_line(&buf, bs..bs + len, at)];
-        if i == GLUED_P {
-            mysql.is_match(line)
-        } else {
-            curl.is_match(line)
+        let unit = unit_of(at);
+        let (k, re) = if i == GLUED_P { (0, mysql) } else { (1, curl) };
+        let (start, open) = cache[k].get();
+        if start == unit.start {
+            return open;
         }
+        let open = re.is_match(&buf[unit.clone()]);
+        cache[k].set((unit.start, open));
+        open
     };
     flag_values(&buf, [true; 4], &gate)
         .into_iter()
         .filter_map(|r| {
-            let (bs, ts, len) = map[seg_of(r.start)];
-            (r.end <= bs + len).then(|| ts + (r.start - bs)..ts + (r.end - bs))
+            let (bs, ts, len) = map[region_of(r.start)];
+            (r.start >= bs && r.end <= bs + len).then(|| ts + (r.start - bs)..ts + (r.end - bs))
         })
         .collect()
 }
 
-/// Логическая строка участка `seg` буфера `buf` вокруг позиции `at` (диапазон в буфере): от
-/// начала строки до её конца; строка, которая кончается на `\` (перенос команды), продолжается
-/// следующей — и в обе стороны.
-fn logical_line(buf: &str, seg: Range<usize>, at: usize) -> Range<usize> {
-    let s = &buf[seg.clone()];
-    let a = at.saturating_sub(seg.start).min(s.len());
-    let continued = |end: usize| s[..end].trim_end_matches([' ', '\t', '\r']).ends_with('\\');
-    let mut start = s[..a].rfind('\n').map_or(0, |i| i + 1);
-    while start > 0 && continued(start - 1) {
-        start = s[..start - 1].rfind('\n').map_or(0, |i| i + 1);
-    }
-    let mut end = s[a..].find('\n').map_or(s.len(), |i| a + i);
-    while end < s.len() && continued(end) {
-        end = s[end + 1..].find('\n').map_or(s.len(), |i| end + 1 + i);
-    }
-    seg.start + start..seg.start + end
-}
-
-/// Участки кода Markdown в `text` (диапазоны байт): содержимое fenced-блоков — от строки после
-/// открывающей ```` ``` ````/`~~~` (три и больше одинаковых знаков; у ```` ` ```` — без обратных
-/// кавычек в строке информации) до закрывающей того же знака не короче открывающей (нет её —
-/// до конца текста), и содержимое inline-спанов вне блоков — между двумя сериями обратных
-/// кавычек одной длины в одной строке. Отступ перед забором не ограничивается (блоки в списках).
-pub(crate) fn code_segments(text: &str) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
-    // открытый блок: знак забора, длина серии, начало содержимого
-    let mut fence: Option<(u8, usize, usize)> = None;
-    let mut pos = 0usize;
-    while pos <= text.len() {
-        let end = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
-        let line = &text[pos..end];
-        let t = line.trim_start_matches([' ', '\t']);
-        match fence {
-            Some((ch, n, start)) => {
-                if is_fence_close(t, ch, n) {
-                    out.push(start..pos);
-                    fence = None;
-                }
-            }
-            None => {
-                if let Some((ch, n)) = fence_open(t) {
-                    fence = Some((ch, n, (end + 1).min(text.len())));
-                } else if line.contains('`') {
-                    inline_spans(line, pos, &mut out);
-                }
-            }
-        }
-        if end == text.len() {
-            break;
-        }
-        pos = end + 1;
-    }
-    if let Some((_, _, start)) = fence
-        && start < text.len()
-    {
-        out.push(start..text.len());
-    }
-    out
-}
-
-/// Длина серии знака `ch` в начале `t`.
-fn run_of(t: &[u8], ch: u8) -> usize {
-    t.iter().take_while(|&&b| b == ch).count()
-}
-
-/// Открывающий забор: три и больше ```` ` ```` (без ```` ` ```` дальше в строке) или `~`.
-fn fence_open(t: &str) -> Option<(u8, usize)> {
-    let b = t.as_bytes();
-    let ch = *b.first()?;
-    if ch != b'`' && ch != b'~' {
-        return None;
-    }
-    let n = run_of(b, ch);
-    if n < 3 || (ch == b'`' && t[n..].contains('`')) {
-        return None;
-    }
-    Some((ch, n))
-}
-
-/// Закрывающий забор блока `(ch, n)`: серия `ch` не короче `n`, дальше — только пробелы.
-fn is_fence_close(t: &str, ch: u8, n: usize) -> bool {
-    let k = run_of(t.as_bytes(), ch);
-    k >= n && t[k..].trim().is_empty()
-}
-
-/// Inline-спаны строки `line` (её начало в тексте — `base`): серия из `n` обратных кавычек и
-/// следующая серия ровно из `n`; между ними — код. Непарная серия — просто знаки.
-fn inline_spans(line: &str, base: usize, out: &mut Vec<Range<usize>>) {
-    let b = line.as_bytes();
-    let mut i = 0usize;
+/// Начала логических строк блока `s` (в буфере — со смещения `base`) после первой: новая строка
+/// начинается за переводом строки (`\n`, `\r\n`, одиночный `\r`), если предыдущая не кончается
+/// `\` (перенос команды; пробелы и табуляции после него не мешают).
+fn line_units(s: &str, base: usize, units: &mut Vec<usize>) {
+    let b = s.as_bytes();
+    let mut line_start = 0;
+    let mut i = 0;
     while i < b.len() {
-        if b[i] != b'`' {
-            i += 1;
-            continue;
-        }
-        let n = run_of(&b[i..], b'`');
-        let open_end = i + n;
-        let mut j = open_end;
-        let mut close = None;
-        while j < b.len() {
-            if b[j] == b'`' {
-                let m = run_of(&b[j..], b'`');
-                if m == n {
-                    close = Some(j);
-                    break;
-                }
-                j += m;
-            } else {
-                j += 1;
+        let eol = match b[i] {
+            b'\n' => 1,
+            b'\r' if b.get(i + 1) == Some(&b'\n') => 2,
+            b'\r' => 1,
+            _ => {
+                i += 1;
+                continue;
             }
+        };
+        let continued = s[line_start..i]
+            .trim_end_matches([' ', '\t'])
+            .ends_with('\\');
+        i += eol;
+        if !continued {
+            units.push(base + i);
         }
-        match close {
-            Some(j) => {
-                if j > open_end {
-                    out.push(base + open_end..base + j);
-                }
-                i = j + n;
-            }
-            None => i = open_end,
-        }
+        line_start = i;
     }
 }
 
@@ -372,26 +518,87 @@ fn is_reference(v: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Участки кода: блоки ```` ``` ````/`~~~` (с языком и без, в списке, незакрытый — до
-    /// конца), inline-спаны любой длины серии; забор с ```` ` ```` в строке информации — не
-    /// забор; непарная кавычка — не код.
+    /// Флаги с дефисом: (правило, совпадение, значение, имя) — как у прежних шаблонов
+    /// (`(?:^|\s)` и `(?:^|[\s'"])` перед флагом, `--user=`/`--user ` и `-u`/`-uX`, имена длинных
+    /// флагов без учёта регистра, значение в кавычках — с ними, без обратной кавычки), совпадения
+    /// одного правила не пересекаются.
+    fn dash(text: &str) -> Vec<(usize, String, String, Option<String>)> {
+        let mut out = Vec::new();
+        dash_flags(text, [true; 4], &mut |d| {
+            out.push((
+                d.rule,
+                text[d.whole].to_string(),
+                text[d.value].to_string(),
+                d.user.map(|u| text[u].to_string()),
+            ))
+        });
+        out
+    }
+
     #[test]
-    fn code_segments_cases() {
-        let seg = |t: &str| -> Vec<String> {
-            code_segments(t)
-                .into_iter()
-                .map(|r| t[r].to_string())
-                .collect()
+    fn dash_flags_cases() {
+        let one = |t: &str| {
+            let v = dash(t);
+            assert_eq!(v.len(), 1, "{t:?}: {v:?}");
+            (v[0].0, v[0].2.clone(), v[0].3.clone())
         };
-        assert_eq!(seg("a\n```sh\nx -y\nz\n```\nb"), ["x -y\nz\n"]);
-        assert_eq!(seg("~~~\nk\n~~~~\n"), ["k\n"]);
-        assert_eq!(seg("- пункт\n  ```\n  y\n  ```\n"), ["  y\n"]);
-        assert_eq!(seg("```\nоткрыт\nдо конца"), ["открыт\nдо конца"]);
-        assert_eq!(seg("```` ``` внутри ````\n"), [" ``` внутри "]);
-        assert_eq!(seg("а `b` и ``c ` d`` и `"), ["b", "c ` d"]);
-        // не забор: обратная кавычка в строке информации — строка разбирается как inline
-        assert_eq!(seg("```js `x`\nтекст\n"), ["x"]);
-        assert!(seg("просто текст без кода").is_empty());
-        assert!(seg("одна ` кавычка").is_empty());
+        assert_eq!(one(" --password=abc"), (LONG, "abc".into(), None));
+        assert_eq!(one("--TOKEN  \"a b\""), (LONG, "\"a b\"".into(), None));
+        assert_eq!(one("'--api-key=k1"), (LONG, "k1".into(), None));
+        assert_eq!(
+            one(" -u admin:pw"),
+            (USER_PASS, "pw".into(), Some("admin".into()))
+        );
+        assert_eq!(
+            one(" --user='a:b"),
+            (USER_PASS, "b".into(), Some("a".into()))
+        );
+        assert_eq!(
+            one(" --user x:y"),
+            (USER_PASS, "y".into(), Some("x".into()))
+        );
+        assert_eq!(
+            one("-uroot:x"),
+            (USER_PASS, "x".into(), Some("root".into()))
+        );
+        assert_eq!(one("\u{a0}-pS3cret"), (GLUED_P, "S3cret".into(), None));
+        assert_eq!(one(" -p'a b'"), (GLUED_P, "'a b'".into(), None));
+        assert_eq!(one("`mysql -pX`"), (GLUED_P, "X".into(), None));
+        for t in [
+            "x-pS3cret",
+            "--password-file=x",
+            "--username=a:b",
+            "--pass",
+            " -p",
+            " -p\"open",
+            " -uroot",
+            "ё-u a:b",
+        ] {
+            assert!(dash(t).is_empty(), "{t:?}: {:?}", dash(t));
+        }
+        assert_eq!(dash(" -pa -pb -u x:y").len(), 3);
+    }
+
+    /// Значение заголовка — после `:`, кавычки и схемы; JSON и YAML.
+    #[test]
+    fn header_value_cases() {
+        let v = |m: &str| header_value(m).map(|r| m[r].to_string());
+        assert_eq!(v("Authorization: Bearer abcdef").as_deref(), Some("abcdef"));
+        assert_eq!(v("authorization:abcdef").as_deref(), Some("abcdef"));
+        assert_eq!(
+            v("Authorization\": \"Bearer abcdef").as_deref(),
+            Some("abcdef")
+        );
+        assert_eq!(v("X-Api-Key: k1k2k3").as_deref(), Some("k1k2k3"));
+    }
+
+    /// Логические единицы блока: перенос `\` (в том числе с CRLF и одиночным `\r`) склеивает
+    /// строки.
+    #[test]
+    fn line_units_continuation() {
+        let mut u = vec![0];
+        // «a \» + CRLF склеена с «b»; «c» + одиночный `\r`; «d \» склеена с «e»
+        line_units("a \\\r\nb\nc\rd \\\ne", 0, &mut u);
+        assert_eq!(u, [0, 7, 9]);
     }
 }

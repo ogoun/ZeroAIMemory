@@ -438,6 +438,17 @@ proptest! {
                 Just("password=abcdef123".to_string()),
                 Just(SECRET_MARK.to_string()),
                 Just(format!("gh{}_{}", "p", rnd(36, 44))),
+                // круг правок 2: цитаты, многострочный инлайн-код, одиночный `\r`, заглушки,
+                // JSON-заголовок, подстановка `$(…)`
+                Just("> ".to_string()),
+                Just("> ```sh\n".to_string()),
+                Just("`mysql -uroot\n-pS3cret9x`".to_string()),
+                Just("\r".to_string()),
+                Just("\n\n".to_string()),
+                Just("--token TOKEN ".to_string()),
+                Just("{\"Authorization\": \"Bearer abcdef123\"}".to_string()),
+                Just("$(".to_string()),
+                Just(")".to_string()),
                 "[A-Za-z0-9=/,:@\"' -]{1,12}",
                 "\\PC{0,8}",
             ],
@@ -1350,4 +1361,128 @@ fn code_flags_masked_and_guards() {
         format!("mysql -uroot -p{pw} db"),
         "в прозе (не в коде) сканер флаги не трогает"
     );
+}
+
+/// Круг правок 2 задачи 5 M7.1: код по CommonMark ([`zam_secrets::code`]) — забор в цитате,
+/// многострочный инлайн-код (ворота — по спану целиком), одиночный `\r`; забор с отступом 4 — не
+/// забор (а инлайн-код через строки — код), блок с отступом — не код. Значение не съедает
+/// обратную кавычку и скобку без пары; заглушки из заглавных букв и `_` — не секрет; заголовок
+/// `Authorization` в JSON и YAML.
+#[test]
+fn code_flags_round2_cases() {
+    let pw = ["S3c", "ret", "9x"].concat();
+    let tok = ["Abc", "123", "Def", "456"].concat();
+    let m = SECRET_MARK;
+    for (t, want) in [
+        (
+            format!("> ```sh\n> mysql -uroot -p{pw} db\n> ```\n"),
+            format!("> ```sh\n> mysql -uroot -p{m} db\n> ```\n"),
+        ),
+        (
+            format!("run `mysql -uroot\n-p{pw}` now"),
+            format!("run `mysql -uroot\n-p{m}` now"),
+        ),
+        (
+            format!("```\rmysql -p{pw}\r```\r"),
+            format!("```\rmysql -p{m}\r```\r"),
+        ),
+        (
+            format!("para\n    ```\nmysql -p{pw}\n    ```\nmysql -p{pw}"),
+            format!("para\n    ```\nmysql -p{m}\n    ```\nmysql -p{pw}"),
+        ),
+        (
+            format!("`` `mysql -p{pw}` ``"),
+            format!("`` `mysql -p{m}` ``"),
+        ),
+        (
+            format!("```sh\nX=$(mysql -uroot -p{pw})\necho `mysql -p{pw}`\n```"),
+            format!("```sh\nX=$(mysql -uroot -p{m})\necho `mysql -p{m}`\n```"),
+        ),
+        (
+            format!("```json\n{{\"Authorization\": \"Bearer {tok}\"}}\n```"),
+            format!("```json\n{{\"Authorization\": \"Bearer {m}\"}}\n```"),
+        ),
+        (
+            format!("```yaml\nheaders:\n  Authorization: \"Bearer {tok}\"\n```"),
+            format!("```yaml\nheaders:\n  Authorization: \"Bearer {m}\"\n```"),
+        ),
+        (
+            format!("```yaml\nauthorization: Bearer {tok}\n```"),
+            format!("```yaml\nauthorization: Bearer {m}\n```"),
+        ),
+    ] {
+        assert_eq!(mask_text(&t), want, "{t:?}");
+        assert_eq!(mask_text(&want), want, "повторно: {t:?}");
+    }
+    for t in [
+        format!("Text\n\n    mysql -uroot -p{pw} db\n\nmore"),
+        "```\nmytool --token TOKEN --password PASSWORD\nmysql -pPASS_WORD\n```".to_string(),
+        "```\nmytool --token <TOKEN> --password \"PASSWORD\"\n```".to_string(),
+        format!("`mysql` then `-p{pw}`"),
+        format!("`-p{pw}`"),
+        format!("run `mysql -uroot\n\n-p{pw}` now"),
+    ] {
+        assert!(
+            scan_flags_in_code(&t).is_empty(),
+            "{t:?}: {:?}",
+            scan_flags_in_code(&t)
+        );
+    }
+    // клиентская функция — те же правила значения
+    assert_eq!(
+        mask_flags(&format!("X=$(mysql -uroot -p{pw}) && mytool --token TOKEN")),
+        format!("X=$(mysql -uroot -p{m}) && mytool --token TOKEN")
+    );
+}
+
+/// Враждебные входы правила флагов (круг правок 2 задачи 5 M7.1; прежние ворота были
+/// квадратичны — 38 с на строке в 1 МБ, пробы ревьюера): одна строка `-px -px …`, цепочка
+/// переносов `a -px \`, одна строка `-u a:b -u a:b …` в блоке кода — не больше 2 мс на 100 КБ и
+/// 20 мс на 1 МБ (release). Те же входы с открытыми воротами (`mysql`/`curl` в строке: каждое
+/// значение — настоящая находка, десятки тысяч масок на 100 КБ, цена — маскировка и повторный
+/// скан вида) — линейно, не больше 4 бюджетов. `cargo test -p zam-secrets --release --test secrets
+/// -- --ignored bench_scan_adversarial_flags --nocapture`.
+#[test]
+#[ignore]
+fn bench_scan_adversarial_flags() {
+    let build = |size: usize, head: &str, unit: &str| {
+        let mut t = format!("```\n{head}");
+        while t.len() < size {
+            t.push_str(unit);
+        }
+        t.push_str("\n```\n");
+        t
+    };
+    let mut rows = Vec::new();
+    for size in [100 * 1024, 1024 * 1024] {
+        for (name, head, unit, factor) in [
+            ("строка -px", "", " -px", 1),
+            ("цепочка \\", "", "a -px \\\n", 1),
+            ("строка -u a:b", "", " -u a:b", 1),
+            ("строка mysql -px", "mysql", " -px", 4),
+            ("цепочка mysql \\", "mysql \\\n", "a -px \\\n", 4),
+            ("строка curl -u a:b", "curl", " -u a:b", 4),
+        ] {
+            let t = build(size, head, unit);
+            if factor > 1 {
+                assert!(
+                    mask_text(&t).contains(SECRET_MARK),
+                    "{name}: маска не легла"
+                );
+            }
+            let n = if size > 200 * 1024 { 3 } else { 10 };
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(scan_secrets(&t));
+            }
+            let per = t0.elapsed() / n;
+            println!("scan_secrets ({name}, {} байт): {per:?}", t.len());
+            let budget =
+                std::time::Duration::from_micros((t.len() as u64 * 2000 * factor) / (100 * 1024));
+            rows.push((name, t.len(), per, budget));
+        }
+    }
+    for (name, len, per, budget) in rows {
+        assert!(per <= budget, "{name} {len} байт: {per:?} > {budget:?}");
+    }
 }
