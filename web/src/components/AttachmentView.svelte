@@ -164,6 +164,6 @@
   }
   .image img {
     max-width: 100%;
-    max-height: calc(100vh - var(--header-h) - 180px);
+    max-height: calc(var(--app-h) - var(--header-h) - 180px);
   }
 </style>

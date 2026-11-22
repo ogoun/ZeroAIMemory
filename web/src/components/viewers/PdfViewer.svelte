@@ -102,7 +102,7 @@
   .pdf-frame {
     display: block;
     width: 100%;
-    height: calc(100vh - var(--header-h) - 150px);
+    height: calc(var(--app-h) - var(--header-h) - 150px);
     min-height: 420px;
     border: 1px solid var(--border);
     border-radius: 8px;

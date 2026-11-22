@@ -18,8 +18,9 @@
     type Entry,
     type GlossaryItem,
   } from '../lib/api';
-  import { AUTHOR_TEXT, fmtTime } from '../lib/journals';
+  import { AUTHOR_TEXT, JOURNAL_TITLE, fmtTime } from '../lib/journals';
   import { go, href } from '../lib/router';
+  import JournalSplit from './JournalSplit.svelte';
 
   interface Props {
     user: string;
@@ -69,10 +70,16 @@
     set(errorText(e));
   }
 
+  // Список — заново только при смене пользователя или пространства: свойства приходят из объекта
+  // маршрута, и эффект перезапускается на каждый переход (открытие термина) — поиск и загруженный
+  // список при этом целы (§5.1 п. 5, карточка вместо списка в узкой области).
+  let listOf = '';
   $effect(() => {
     const u = user;
     const s = space;
     untrack(() => {
+      if (listOf === `${u}|${s}`) return;
+      listOf = `${u}|${s}`;
       search = '';
       load(u, s);
     });
@@ -95,6 +102,8 @@
     } catch (e) {
       if (my !== seq) return;
       items = [];
+      // неудача — следующий переход в журнал загрузит список снова
+      listOf = '';
       fail(e, (m) => (error = m));
     } finally {
       if (my === seq) loading = false;
@@ -154,9 +163,20 @@
     document.getElementById(`gl-${letter}`)?.scrollIntoView({ block: 'start' });
   }
 
+  /** Открыть термин: новая запись истории — «назад» браузера возвращает к списку (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
-    go({ name: 'journal', user, space, journal: 'glossary', entry: id }, { replace: true });
+    go({ name: 'journal', user, space, journal: 'glossary', entry: id });
+  }
+
+  /** Карточка или форма показана (в узкой области — вместо списка). */
+  let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create' || mode === 'edit');
+
+  /** «← Словарь»: адрес без записи закрывает карточку, форма нового термина закрывается здесь. */
+  function closeDetail() {
+    mode = 'none';
+    actionError = '';
+    conflicts = [];
   }
 
   function startCreate() {
@@ -260,6 +280,23 @@
 </script>
 
 <section class="journal glossary">
+  <!-- список и карточка — рядом в широкой области, карточка вместо списка в узкой (§5.1 п. 5) -->
+  <JournalSplit
+    open={detailOpen}
+    back={{ href: href({ name: 'journal', user, space, journal: 'glossary', entry: null }), label: JOURNAL_TITLE.glossary }}
+    onclose={closeDetail}
+    {entry}
+  >
+    {#snippet list()}
+      {@render termList()}
+    {/snippet}
+    {#snippet detail()}
+      {@render termDetail()}
+    {/snippet}
+  </JournalSplit>
+</section>
+
+{#snippet termList()}
   <div class="row bar">
     <input type="search" bind:value={search} placeholder="Поиск по имени, псевдониму, определению" aria-label="Поиск по словарю" />
     <button type="button" class="primary" onclick={startCreate}>Новый термин</button>
@@ -282,7 +319,7 @@
     {#each groups as [letter, terms] (letter)}
       <h2 id="gl-{letter}" class="letter">{letter}</h2>
       {#each terms as t (t.id)}
-        <div role="listitem" class="term" class:selected={t.id === entry} data-term={t.id}>
+        <div role="listitem" class="term" class:selected={t.id === entry} data-term={t.id} data-entry={t.id}>
           <button type="button" class="link name" onclick={() => select(t.id)}>{t.title}</button>
           {#each t.aliases as a (a)}<span class="chip">{a}</span>{/each}
           <div class="muted def">{t.definition}</div>
@@ -290,7 +327,9 @@
       {/each}
     {/each}
   </div>
+{/snippet}
 
+{#snippet termDetail()}
   {#if curError}<p class="error" role="alert">{curError}</p>{/if}
   {#if cur}
     {@const c = cur}
@@ -362,7 +401,7 @@
       {@render formEnd('Сохранить')}
     </form>
   {/if}
-</section>
+{/snippet}
 
 {#snippet formEnd(label: string)}
   {#if actionError && conflicts.length === 0}<p class="error" role="alert">{actionError}</p>{/if}
@@ -385,6 +424,12 @@
     flex-wrap: wrap;
     gap: 2px;
     margin-bottom: 8px;
+  }
+  /* буквы указателя при касании — цели по 44 px с зазором (`--touch-gap`, app.css) */
+  @media (pointer: coarse) {
+    .alpha {
+      gap: var(--touch-gap);
+    }
   }
   .link {
     padding: 0 4px;
@@ -421,7 +466,7 @@
     font-size: 12px;
   }
   .card {
-    margin-top: 16px;
+    margin-top: 4px;
   }
   .card h2 {
     margin: 0 0 4px;

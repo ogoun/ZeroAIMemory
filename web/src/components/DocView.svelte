@@ -34,6 +34,7 @@
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
   import { anchorId, go, href, parse } from '../lib/router';
+  import { revealSelected } from '../lib/viewport.svelte';
 
   interface Props {
     user: string;
@@ -298,7 +299,8 @@
     {#if info && info.kind === 'note' && (fileRefs.length || verifiedAt)}
       <FileRefs refs={fileRefs} {verifiedAt} />
     {/if}
-    <div class="tabs" role="tablist" aria-label="Разделы заметки">
+    <!-- вкладки — полоса (§5.1 п. 4): одна строка с прокруткой на телефоне и планшете -->
+    <div class="tabs strip" role="tablist" aria-label="Разделы заметки" use:revealSelected={tab}>
       <button type="button" role="tab" aria-selected={tab === 'doc'} onclick={() => (tab = 'doc')}>Документ</button>
       <button type="button" role="tab" aria-selected={tab === 'history'} onclick={() => (tab = 'history')}>История</button>
       <button type="button" role="tab" aria-selected={tab === 'links'} onclick={() => (tab = 'links')}>Связи</button>
@@ -466,18 +468,11 @@
     color: var(--muted);
   }
   .tabs {
-    display: flex;
-    gap: 2px;
     margin-top: 12px;
-    /* линия под вкладками — тенью: на узком экране вкладки прокручиваются сами (страница — нет),
-       а подчёркивание активной ложится на линию без выхода за контейнер прокрутки */
+    /* раскладка — `.strip` (app.css); линия под вкладками — тенью: на узком экране вкладки
+       прокручиваются сами (страница — нет), а подчёркивание активной ложится на линию без выхода
+       за контейнер прокрутки */
     box-shadow: inset 0 -1px var(--border);
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-width: none;
-  }
-  .tabs button {
-    flex: none;
   }
   .tabs button {
     border: 0;
