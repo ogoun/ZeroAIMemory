@@ -1041,6 +1041,21 @@ recall.timeout_ms=60000`; база — та же сборка `6961aef6`, вет
   находит `h17`, и ослабленный не идёт, — так же, как у `e-11` через API у обоих плеч; у базы
   слова `exit`, `code` ломали строгий запрос, и `h27` приходила через ослабленный.
 
+Прогоны круга 1 (`target\m71-t8`, `-j 2`):
+- RED — обратными мутациями (код круга написан вместе с тестами): без подстановок в `scan`, без
+  правила перенаправлений, с прежним последним сегментом пути, с `trim_start` и без новых
+  диагностик, без тест-раннеров, без русской фразы падают `shell::simple_command_…`
+  (`"grep x f 2>&1"`, затем `"diff <(sort a) <(sort b)"`), `segments_split_on_separators`
+  (`"cargo test 2>", "1"`), `path_words_of_arguments` (`["web", "e2e", "playwright",
+  "config"]`), `service_phrase_words_dropped` («Нет такого файла или каталога» в словах),
+  `expected_exit_cases` (`grep x f 2>&1`, затем `diff <(sort a) <(sort b)` с `sort:`),
+  `test_runners_by_program` (`pytest -x tests/`). Мутации убраны (файлы записаны заново).
+- GREEN: `zam-core --lib` 34, `zam-search --lib` 50, `zam-store --test search` 24 (2 ignored),
+  `zam-cli --bin zam` 225 (1 ignored), `--test hooks` 119, `zam-server --test recall` 54
+  (1 ignored), `--lib` 307 (1 ignored), `--test boot` 15, `xtask` 241 + 3 + 5; `cargo fmt --all
+  --check`, `cargo clippy -p zam-core -p zam-search -p zam-store -p zam-server -p zam-cli -p xtask
+  --all-targets -- -D warnings`, `cargo clippy -p zam-server -- -D warnings` — чисто.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия
