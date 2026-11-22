@@ -52,8 +52,8 @@ pub(crate) use chunks::{
 };
 pub use read::{
     CHANGELOG_BETWEEN_MAX, DEDUP_CANDIDATES_MAX, DedupCandidate, changelog_between,
-    count_by_status, entry_revisions, find_release_by_version, get_entry, list_entries,
-    live_entries_by_ids, title_duplicates,
+    count_by_status, entry_revisions, entry_revisions_at, find_release_by_version, get_entry,
+    list_entries, live_entries_by_ids, title_duplicates,
 };
 pub(crate) use reports::{ATT_COLS, att_row};
 pub use reports::{

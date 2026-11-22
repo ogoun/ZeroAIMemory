@@ -7,10 +7,16 @@
 //!   (T — метка объекта и ревизии [`agent_view::object_tag`], N — сквозной номер маски по
 //!   редактируемым полям объекта, [`agent_view::edit_view_owned`],
 //!   [`agent_view::number_entries`]); человек в сессии WebUI видит исходник и пишет как есть.
-//! - Метка этого объекта и базовой ревизии — значение маски в любом поле объекта (перенос строки
-//!   между полями сохраняет значение); любая другая (чужой T, номер вне базы, `‹secret›`, прежняя
-//!   `‹secret-N›`) записывается как есть. Предупреждение [`SECRET_MARK_KEPT`] поля — меток-литералов
-//!   в итоге сверх их числа в исходнике текущей ревизии того же поля; при создании — каждая метка.
+//! - Метка этого объекта и **любой его ревизии** (финальное ревью M7.1, I-2) — значение маски той
+//!   ревизии в любом поле объекта (перенос строки между полями сохраняет значение, вторая правка
+//!   подряд из того же вида — тоже): ревизию по T находит [`revisions_by_tag`] среди ревизий
+//!   объекта (у узла — [`node_revisions`], у записи — [`EntryRevs`]); две ревизии с одним T, чужой
+//!   T (другой объект, вид до обновления сервера), номер вне той ревизии, `‹secret›`, прежняя
+//!   `‹secret-N›` — записываются как есть. Предупреждение [`SECRET_MARK_KEPT`] поля —
+//!   меток-литералов в итоге сверх их числа в исходнике текущей ревизии того же поля; при создании
+//!   — каждая метка.
+//! - Восстановление — после проверки доступа к объекту (пространство, вид записи, не отчёт) и
+//!   после 428/409 обработчика: о чужом объекте агент получает тот же 404, что у чтения.
 //! - Покрытие по происхождению (§4.3.2 п. 5): каждая позиция итога, где стоит восстановленное
 //!   значение (и у `PATCH` — маска текущей ревизии, перенесённая без правки), должна быть целиком
 //!   покрыта находкой; иначе — 422 [`SECRET_CONTEXT_CHANGED`] с номерами строк итога, без
@@ -18,13 +24,15 @@
 //! - Поля записи журнала — [`EntryTexts`] (правка, замещение, создание) в порядке нумерации:
 //!   заголовок, тело, строки `data` (и `next_step`, `blocked_by` задачи — строки той же `data`),
 //!   теги, область.
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 use zam_core::Id;
-use zam_store::{Db, Entry, StoreError, node_content};
+use zam_store::{Db, Entry, EntryRevision, StoreError, node_content};
 
 pub use zam_secrets::restore::{
     Deferred, Filled, ObjectMasks, Restored, has_mark, literals_in, marks_in, numbered_view,
-    restore, secret_ranges, uncovered_lines, unnumbered,
+    restore, revisions_by_tag, secret_ranges, tags_in, uncovered_lines, unnumbered,
 };
 
 use super::agent_view::{self, BLOCKING_FROM};
@@ -38,26 +46,96 @@ pub const SECRET_MARK_KEPT: &str = "secret_mark_kept";
 /// Код отказа записи: правка выводит секрет из-под маски (422).
 pub const SECRET_CONTEXT_CHANGED: &str = "secret_context_changed";
 
-/// [`restore`] своих текстов (объект из одного текста с меткой `tag`, база — исходник текущей
-/// ревизии): вместе больше [`BLOCKING_FROM`] — в пуле блокирующих задач (пул снят — 503); база
-/// возвращается вызывающему (находки `secrets_detected` — по ней).
+/// Ревизия объекта, метки которой есть в правке агента (M7 §4.3.2 п. 2): её T, номер и, у узла,
+/// текст.
+#[derive(Debug, Clone)]
+pub struct RevText {
+    pub tag: String,
+    pub rev: i64,
+    /// Текст ревизии; `None` — ревизия, текст которой уже прочитал вызывающий (`known` у
+    /// [`node_revisions`]).
+    pub text: Option<String>,
+}
+
+/// Ревизии узла `id` (`1..=max_rev`) по меткам `‹secret-T-N›` текстов `edited` (§4.3.2 п. 2,
+/// финальное ревью M7.1, I-2): каждой T правки — ревизия с этой T, если она одна
+/// ([`revisions_by_tag`]); тексты читаются, кроме ревизий `known` (их тексты у вызывающего).
+/// Ревизии нет в базе — пропуск (метки — литералы). Без меток с T — ни одного чтения.
+pub async fn node_revisions(
+    db: &Db,
+    id: Id,
+    max_rev: i64,
+    edited: &[&str],
+    known: &[i64],
+) -> Result<Vec<RevText>, ApiError> {
+    let found: Vec<(String, i64)> = {
+        let tags = tags_in(edited.iter().copied());
+        revisions_by_tag(&tags, max_rev, |k| agent_view::object_tag(&id, k))
+            .into_iter()
+            .map(|(t, k)| (t.to_string(), k))
+            .collect()
+    };
+    let mut out = Vec::with_capacity(found.len());
+    for (tag, rev) in found {
+        let text = if known.contains(&rev) {
+            None
+        } else {
+            match node_base(db, id, rev).await? {
+                Some(t) => Some(t),
+                None => continue,
+            }
+        };
+        out.push(RevText { tag, rev, text });
+    }
+    Ok(out)
+}
+
+/// Маски ревизий `revs` узла: текст ревизии без своего (`None`) — из `known` (номер, текст); нет
+/// там — ревизия пропущена.
+pub fn node_masks<'a>(revs: &'a [RevText], known: &[(i64, &'a str)]) -> ObjectMasks<'a> {
+    let mut m = ObjectMasks::default();
+    for r in revs {
+        let text = match &r.text {
+            Some(t) => t.as_str(),
+            None => match known.iter().find(|(k, _)| *k == r.rev) {
+                Some((_, t)) => t,
+                None => continue,
+            },
+        };
+        m.revision(&r.tag).add(text);
+    }
+    m
+}
+
+/// Восстановление текста узла `edited` агентом по маскам ревизий `revs` (`base` — исходник
+/// ревизии `base_rev`, `If-Match`; предупреждение — сверх литералов `base`): вместе больше
+/// [`BLOCKING_FROM`] — в пуле блокирующих задач (пул снят — 503); база возвращается вызывающему
+/// (находки `secrets_detected` — по ней).
 pub async fn restore_owned(
-    tag: String,
+    revs: Vec<RevText>,
+    base_rev: i64,
     base: String,
     edited: String,
 ) -> Result<(Restored, String), ApiError> {
     if !has_mark(&edited) {
         return Ok((same(edited), base));
     }
-    if base.len() + edited.len() <= BLOCKING_FROM {
-        let r = restore(&tag, &base, &edited);
-        return Ok((r, base));
-    }
-    agent_view::blocking(move || {
-        let r = restore(&tag, &base, &edited);
+    let size = base.len()
+        + edited.len()
+        + revs
+            .iter()
+            .map(|r| r.text.as_ref().map_or(0, String::len))
+            .sum::<usize>();
+    let run = move || {
+        let r = node_masks(&revs, &[(base_rev, base.as_str())])
+            .fill_marks(&edited)
+            .into_restored(literals_in(&base));
         (r, base)
-    })
-    .await
+    };
+    if size <= BLOCKING_FROM {
+        return Ok(run());
+    }
+    agent_view::blocking(run).await
 }
 
 /// Текст как есть: литералов нет.
@@ -221,18 +299,42 @@ impl<'a> EntryTexts<'a> {
             + self.area.as_deref().map_or(0, |s| marks_in(s))
     }
 
-    /// Восстановление по прежней записи `base` (маски объекта — по всем её редактируемым полям в
-    /// порядке нумерации, метка — её `id` и ревизия): предупреждение; правка, выводящая секрет
-    /// из-под маски, — 422 [`SECRET_CONTEXT_CHANGED`] (ничего не записано).
-    pub fn restore(self, base: EntryBase) -> Result<usize, ApiError> {
-        let mut masks = ObjectMasks::new(&agent_view::object_tag(&base.id, base.rev));
-        masks.add(base.title);
-        masks.add(base.body);
-        add_value(base.data, &mut masks);
-        for t in base.tags {
-            masks.add(t);
+    /// Метки объекта T меток `‹secret-T-N›` всех полей (по ним [`EntryRevs::load`] находит
+    /// ревизии).
+    pub fn tags(&self) -> BTreeSet<String> {
+        let mut texts: Vec<&str> = Vec::new();
+        texts.extend(self.title.as_deref().map(String::as_str));
+        texts.extend(self.body.as_deref().map(String::as_str));
+        texts.extend(self.append_body.as_deref().map(String::as_str));
+        if let Some(d) = self.data.as_deref() {
+            strings_ref(d, &mut texts);
         }
-        masks.add(base.area.unwrap_or(""));
+        texts.extend(self.data_fields.iter().map(|(_, s)| s.as_str()));
+        if let Some(t) = self.tags.as_deref() {
+            texts.extend(t.iter().map(String::as_str));
+        }
+        texts.extend(self.area.as_deref().map(String::as_str));
+        tags_in(texts).into_iter().map(str::to_string).collect()
+    }
+
+    /// Восстановление по маскам ревизий `revs` записи (у каждой — по всем её редактируемым полям
+    /// в порядке нумерации, метка — `id` и ревизия; ревизии нашёл [`EntryRevs`]); `current` —
+    /// текущая запись (литералы её полей — порог предупреждения, тело — основа дописки):
+    /// предупреждение; правка, выводящая секрет из-под маски, — 422 [`SECRET_CONTEXT_CHANGED`]
+    /// (ничего не записано).
+    pub fn restore(self, current: EntryBase, revs: &[EntryBase]) -> Result<usize, ApiError> {
+        let mut masks = ObjectMasks::default();
+        for r in revs {
+            masks.revision(&agent_view::object_tag(&r.id, r.rev));
+            masks.add(r.title);
+            masks.add(r.body);
+            add_value(r.data, &mut masks);
+            for t in r.tags {
+                masks.add(t);
+            }
+            masks.add(r.area.unwrap_or(""));
+        }
+        let base = current;
         let mut ex = Exposed::default();
         let mut kept = 0;
         if let Some(t) = self.title {
@@ -349,6 +451,64 @@ impl<'b> From<&'b Entry> for EntryBase<'b> {
             tags: &e.tags,
             area: e.area.as_deref(),
         }
+    }
+}
+
+impl<'b> EntryBase<'b> {
+    /// Прежняя ревизия `r` записи `id` (снимок `entry_revisions`).
+    pub fn revision(id: Id, r: &'b EntryRevision) -> Self {
+        EntryBase {
+            id,
+            rev: r.rev,
+            title: &r.title,
+            body: &r.body,
+            data: &r.data,
+            tags: &r.tags,
+            area: r.area.as_deref(),
+        }
+    }
+}
+
+/// Ревизии записи журнала, метки которых агент вернул правкой или замещением (M7 §4.3.2 п. 2,
+/// финальное ревью M7.1, I-2): номера ревизий с T меток правки (у каждой T — единственная
+/// ревизия, [`revisions_by_tag`]) и снимки прежних из них; текущая ревизия — сама запись.
+#[derive(Debug, Clone, Default)]
+pub struct EntryRevs {
+    revs: Vec<i64>,
+    older: Vec<EntryRevision>,
+}
+
+impl EntryRevs {
+    /// Ревизии записи `e` (`1..=e.rev`) по T меток правки `tags` ([`EntryTexts::tags`]); без
+    /// меток с T — ни одного чтения.
+    pub async fn load(db: &Db, e: &Entry, tags: &BTreeSet<String>) -> Result<Self, ApiError> {
+        let set: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
+        let mut revs: Vec<i64> =
+            revisions_by_tag(&set, e.rev, |k| agent_view::object_tag(&e.id, k))
+                .into_values()
+                .collect();
+        revs.sort_unstable();
+        let older: Vec<i64> = revs.iter().copied().filter(|&k| k != e.rev).collect();
+        let older = zam_store::entry_revisions_at(db, e.id, older).await?;
+        Ok(EntryRevs { revs, older })
+    }
+
+    /// Базы восстановления [`EntryTexts::restore`] — по возрастанию ревизии: текущая — запись `e`,
+    /// прежние — снимки (снимка нет — ревизия пропущена).
+    pub fn bases<'b>(&'b self, e: &'b Entry) -> Vec<EntryBase<'b>> {
+        self.revs
+            .iter()
+            .filter_map(|&k| {
+                if k == e.rev {
+                    Some(EntryBase::from(e))
+                } else {
+                    self.older
+                        .iter()
+                        .find(|r| r.rev == k)
+                        .map(|r| EntryBase::revision(e.id, r))
+                }
+            })
+            .collect()
     }
 }
 
@@ -497,7 +657,7 @@ mod tests {
             ..EntryTexts::default()
         };
         assert_eq!(t.marks(), 10);
-        let kept = t.restore(base).unwrap();
+        let kept = t.restore(base, &[base]).unwrap();
         assert_eq!(kept, 4);
         assert_eq!(title, format!("Ключ {k2} / token: {k1}"));
         assert_eq!(data["evidence"]["checked"], format!("token: {k1} (prod)"));
@@ -509,6 +669,39 @@ mod tests {
         assert_eq!(
             seen,
             vec!["ops".to_string(), format!("t-{k1}"), M.to_string()]
+        );
+    }
+
+    /// Метки двух ревизий записи в одной правке (финальное ревью M7.1, I-2): каждая — значение
+    /// своей ревизии по её номеру (у прежней ключ `k2` — маска 2, у текущей — 3); ревизия, которой
+    /// нет среди баз, — литерал.
+    #[test]
+    fn restore_entry_marks_of_two_revisions() {
+        let (k1, k2, k3) = (key(31), key(32), key(33));
+        let (t2, b2) = (format!("Ключ {k1}"), format!("token: {k2}\n"));
+        let (t3, b3) = (format!("Ключ {k1}"), format!("новый: {k3}\ntoken: {k2}\n"));
+        let null = Value::Null;
+        let mut old = entry(&t2, &b2, &null, &[]);
+        old.rev = 2;
+        let cur = entry(&t3, &b3, &null, &[]);
+        let m2 = |n: u32| format!("‹secret-{}-{n}›", agent_view::object_tag(&id(), 2));
+        let mut body = format!(
+            "из 2: token: {}\nиз 3: новый: {}\nиз 1: {}\n",
+            m2(2),
+            m(2),
+            format_args!("‹secret-{}-1›", agent_view::object_tag(&id(), 1))
+        );
+        let t = EntryTexts {
+            body: Some(&mut body),
+            ..EntryTexts::default()
+        };
+        assert_eq!(t.tags().len(), 3);
+        assert_eq!(t.restore(cur, &[old, cur]).unwrap(), 1);
+        assert!(
+            body.starts_with(&format!(
+                "из 2: token: {k2}\nиз 3: новый: {k3}\nиз 1: ‹secret-"
+            )),
+            "{body}"
         );
     }
 
@@ -530,7 +723,7 @@ mod tests {
             data: Some(&mut data),
             ..EntryTexts::default()
         };
-        let e = t.restore(base).unwrap_err();
+        let e = t.restore(base, &[base]).unwrap_err();
         let s = e.to_string();
         assert!(matches!(e, ApiError::SecretContextChanged(_)), "{s}");
         assert!(
@@ -554,14 +747,14 @@ mod tests {
             append_body: Some(&mut more),
             ..EntryTexts::default()
         };
-        assert_eq!(t.restore(base).unwrap(), 1);
+        assert_eq!(t.restore(base, &[base]).unwrap(), 1);
         assert_eq!(more, format!("прод: password = {p} и ‹secret-ffffff-1›"));
         let mut more = format!("прод:\nтекст\nпароль — {}", m(1));
         let t = EntryTexts {
             append_body: Some(&mut more),
             ..EntryTexts::default()
         };
-        let s = t.restore(base).unwrap_err().to_string();
+        let s = t.restore(base, &[base]).unwrap_err().to_string();
         assert!(
             s.contains("append_body: строка 3") && !s.contains(&p),
             "{s}"
@@ -574,7 +767,7 @@ mod tests {
             append_body: Some(&mut more),
             ..EntryTexts::default()
         };
-        assert_eq!(t.restore(base).unwrap(), 0);
+        assert_eq!(t.restore(base, &[base]).unwrap(), 0);
     }
 
     /// Предупреждение: строка в `warnings` (к прежним) и число; без меток — ответ как есть.

@@ -1081,12 +1081,17 @@ pub async fn insight_term_docs(
                 out
             }
         };
-        let known: HashMap<String, usize> = lock().get(&key).map_or_else(HashMap::new, |a| {
-            terms
-                .iter()
-                .filter_map(|t| a.df.get(t).map(|n| (t.clone(), *n)))
-                .collect()
-        });
+        // частоты — только той же версии: между двумя захватами замка другой запрос мог положить
+        // область другой версии (финальное ревью M7.1, отложенный Minor задачи 8)
+        let known: HashMap<String, usize> = lock()
+            .get(&key)
+            .filter(|a| a.version == version)
+            .map_or_else(HashMap::new, |a| {
+                terms
+                    .iter()
+                    .filter_map(|t| a.df.get(t).map(|n| (t.clone(), *n)))
+                    .collect()
+            });
         let missing: Vec<&String> = terms
             .iter()
             .filter(|t| !known.contains_key(*t))

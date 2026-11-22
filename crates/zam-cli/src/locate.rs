@@ -477,7 +477,8 @@ pub enum HomePlan {
     Conflict(PathBuf),
 }
 
-/// Что [`plan_home`] делает с `url` верхнего уровня — адресом для каталогов без своего (M7 §4.4).
+/// Что [`plan_home_aliases`] делает с `url` верхнего уровня — адресом для каталогов без своего
+/// (M7 §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopUrl {
     /// Не трогать (`--url-to local`).
@@ -536,6 +537,18 @@ pub fn unused_unbound_token(home: &Path, token: &str) -> Result<Option<String>, 
         .map(|u| zam_core::mask_token(&u)))
 }
 
+/// [`plan_home_aliases`] без псевдонимов адреса — обёртка модульных тестов.
+#[cfg(test)]
+pub fn plan_home(
+    home: &Path,
+    url: &str,
+    token: &str,
+    force: bool,
+    top: TopUrl,
+) -> Result<HomePlan, String> {
+    plan_home_aliases(home, url, &[], token, force, top)
+}
+
 /// План записи токена `token` адреса `url` в `~/.zeroaimemory/config.toml` (M7 §4.4): ключом
 /// `[servers."<адрес>"]` (адрес — [`normalize_url`]); токены других адресов не трогаются,
 /// `url` верхнего уровня — по `top` ([`TopUrl`]). Прежний формат переводится в новый без потери
@@ -545,15 +558,29 @@ pub fn unused_unbound_token(home: &Path, token: &str) -> Result<Option<String>, 
 /// есть — `unbound_left` у [`HomePlan::Write`], а у [`TopUrl::Set`] — отказ. Остальные ключи
 /// сохраняются (комментарии — нет: файл пишет `zam`). Другой токен этого адреса заменяется, только
 /// если `force` (`--token`), иначе [`HomePlan::Conflict`]. Битый файл — ошибка.
-pub fn plan_home(
+///
+/// Тот же токен пишется и под адресами `aliases` — другими адресами того же сервера (`zam init` в
+/// режиме `block`: адрес строки `ZeroAIMemoryUrl=` блока — `server.public_url` или `Host` —
+/// отличается от `--url`, а проект и хуки ищут токен по адресу блока; финальное ревью M7.1, I-3).
+/// Другой токен под псевдонимом — как у адреса: замена только с `force`, иначе
+/// [`HomePlan::Conflict`].
+pub fn plan_home_aliases(
     home: &Path,
     url: &str,
+    aliases: &[String],
     token: &str,
     force: bool,
     top: TopUrl,
 ) -> Result<HomePlan, String> {
     let (path, mut t, cfg) = home_doc(home)?;
     let key = normalize_url(url);
+    let mut alias_keys: Vec<String> = aliases
+        .iter()
+        .map(|a| normalize_url(a))
+        .filter(|a| !a.is_empty() && *a != key)
+        .collect();
+    alias_keys.sort_unstable();
+    alias_keys.dedup();
     let top_token = nonempty(cfg.token.as_deref());
     // чей `token` верхнего уровня: `url` верхнего уровня; без него — ключ без адреса
     let owner = nonempty(cfg.url.as_deref()).map(|u| normalize_url(&u));
@@ -563,17 +590,23 @@ pub fn plan_home(
     {
         return Err(unbound_refusal(&path, u));
     }
-    let old = cfg.server_token(&key).map(|(_, v)| v).or_else(|| {
-        top_token
-            .clone()
-            .filter(|_| owner.as_deref() == Some(key.as_str()))
-    });
+    let old_of = |k: &str| {
+        cfg.server_token(k)
+            .map(|(_, v)| v)
+            .or_else(|| top_token.clone().filter(|_| owner.as_deref() == Some(k)))
+    };
+    let olds: Vec<Option<String>> = std::iter::once(key.as_str())
+        .chain(alias_keys.iter().map(String::as_str))
+        .map(old_of)
+        .collect();
     let migrate = top_token.is_some() && unbound_left.is_none();
     let write_url = top != TopUrl::Keep && owner.is_none() && unbound_left.is_none();
-    if old.as_deref() == Some(token) && !migrate && !write_url {
+    if olds.iter().all(|o| o.as_deref() == Some(token)) && !migrate && !write_url {
         return Ok(HomePlan::Unchanged);
     }
-    let replaced = old.as_deref().is_some_and(|o| o != token);
+    let replaced = olds
+        .iter()
+        .any(|o| o.as_deref().is_some_and(|o| o != token));
     if replaced && !force {
         return Ok(HomePlan::Conflict(path));
     }
@@ -587,6 +620,9 @@ pub fn plan_home(
         }
     }
     set_server_token(&mut servers, &key, token);
+    for a in &alias_keys {
+        set_server_token(&mut servers, a, token);
+    }
     t.insert("servers".into(), toml::Value::Table(servers));
     if write_url {
         t.insert("url".into(), toml::Value::String(key));
@@ -1323,6 +1359,70 @@ mod tests {
         // `servers` не таблица — ошибка с путём
         std::fs::write(&cfg, "servers = 1\n").unwrap();
         assert!(plan_home(&home, a, &t1, true, keep).is_err());
+    }
+
+    /// Псевдонимы адреса (финальное ревью M7.1, I-3): тот же токен — и под адресом блока
+    /// (нормализованным, без повтора `--url`); оба уже есть — без записи; другой токен под
+    /// псевдонимом — замена только с `force`, иначе `Conflict`.
+    #[test]
+    fn plan_home_aliases_writes_block_address() {
+        let (a, b) = ("http://192.0.2.1:7700", "http://192.0.2.9:7700");
+        let t1 = ["zam_", &"3".repeat(40)].concat();
+        let t2 = ["zam_", &"4".repeat(40)].concat();
+        let (_, home, cfg) = home_with("planaliases", "");
+        std::fs::remove_file(&cfg).unwrap();
+        // адрес блока со `/` на конце и повтор `--url`
+        let aliases = vec![format!("{b}/"), a.to_string()];
+        let HomePlan::Write { text, replaced, .. } =
+            plan_home_aliases(&home, a, &aliases, &t1, false, TopUrl::IfAbsent).unwrap()
+        else {
+            panic!("запись");
+        };
+        assert!(!replaced);
+        std::fs::write(&cfg, &text).unwrap();
+        let t: toml::Table = toml::from_str(&text).unwrap();
+        let servers = t["servers"].as_table().unwrap();
+        assert_eq!(servers.len(), 2, "{t:?}");
+        for u in [a, b] {
+            assert_eq!(
+                servers[u]["token"].as_str(),
+                Some(t1.as_str()),
+                "{u}: {t:?}"
+            );
+        }
+        assert_eq!(
+            t["url"].as_str(),
+            Some(a),
+            "url верхнего уровня — адрес --url"
+        );
+        assert_eq!(
+            plan_home_aliases(&home, a, &aliases, &t1, false, TopUrl::IfAbsent).unwrap(),
+            HomePlan::Unchanged
+        );
+        // под адресом блока другой токен: без force — не трогать, с force — заменить
+        std::fs::write(
+            &cfg,
+            format!(
+                "url = \"{a}\"\n[servers.\"{a}\"]\ntoken = \"{t1}\"\n[servers.\"{b}\"]\ntoken = \"{t2}\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_home_aliases(&home, a, &aliases, &t1, false, TopUrl::IfAbsent).unwrap(),
+            HomePlan::Conflict(_)
+        ));
+        let HomePlan::Write { text, replaced, .. } =
+            plan_home_aliases(&home, a, &aliases, &t1, true, TopUrl::IfAbsent).unwrap()
+        else {
+            panic!("замена");
+        };
+        assert!(replaced);
+        let t: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(
+            t["servers"][b]["token"].as_str(),
+            Some(t1.as_str()),
+            "{t:?}"
+        );
     }
 
     #[test]

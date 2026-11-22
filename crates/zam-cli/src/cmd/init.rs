@@ -594,9 +594,40 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         UrlTo::Home => locate::TopUrl::Set,
         UrlTo::Local => locate::TopUrl::Keep,
     };
+    // block: проект и хуки берут адрес из строки `ZeroAIMemoryUrl=` блока (`server.public_url` или
+    // `Host` запроса) и ищут токен по нему — он пишется и под адресами блока, отличными от
+    // `--url`: это тот же сервер, `init` говорил с ним по `--url` (финальное ревью M7.1, I-3)
+    let aliases: Vec<String> = if url_to == UrlTo::Block {
+        let key = locate::normalize_url(&url.value);
+        let mut a: Vec<String> = urls
+            .iter()
+            .map(|u| locate::normalize_url(u))
+            .filter(|u| *u != key)
+            .collect();
+        a.sort_unstable();
+        a.dedup();
+        a
+    } else {
+        Vec::new()
+    };
     let home_plan = match &candidate {
-        Some(t) => {
-            locate::plan_home(&home, &url.value, t, forced, top).map_err(CliError::config)?
+        Some(t) => locate::plan_home_aliases(&home, &url.value, &aliases, t, forced, top)
+            .map_err(CliError::config)?,
+        // токен адреса из домашнего конфига: дописать его и под адресом блока (без `url`
+        // верхнего уровня — его этот запуск не задавал); токен окружения и файла проекта в
+        // домашний конфиг не переносится
+        None if !aliases.is_empty()
+            && matches!(token.source, Source::Home(_) | Source::HomeServer(..)) =>
+        {
+            locate::plan_home_aliases(
+                &home,
+                &url.value,
+                &aliases,
+                &token.value,
+                false,
+                locate::TopUrl::Keep,
+            )
+            .map_err(CliError::config)?
         }
         None => locate::HomePlan::Unchanged,
     };
@@ -698,14 +729,19 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         println!("Хуки и .mcp.json не записаны: повторите с --yes.");
     }
     let key = locate::normalize_url(&url.value);
+    let keys = std::iter::once(&key)
+        .chain(&aliases)
+        .map(|k| format!("[servers.\"{k}\"]"))
+        .collect::<Vec<_>>()
+        .join(" и ");
     match &home_plan {
         locate::HomePlan::Write { replaced: true, .. } => eprintln!(
             "предупреждение: в ~/.zeroaimemory/config.toml для {key} был другой токен — заменён на \
              заданный --token"
         ),
-        locate::HomePlan::Write { .. } => println!(
-            "Токен сохранён в ~/.zeroaimemory/config.toml [servers.\"{key}\"] (его берут zam и хуки)."
-        ),
+        locate::HomePlan::Write { .. } => {
+            println!("Токен сохранён в ~/.zeroaimemory/config.toml {keys} (его берут zam и хуки).")
+        }
         locate::HomePlan::Conflict(_) => eprintln!(
             "предупреждение: в ~/.zeroaimemory/config.toml для {key} другой токен — не заменён \
              (заменить: zam init --token <токен>)"

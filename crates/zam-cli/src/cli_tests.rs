@@ -174,6 +174,64 @@ fn term_code_hyphen_value_help() {
     );
 }
 
+/// Ревизия замещаемой записи (финальное ревью M7.1, задача 6 m2): `insight supersede --rev`
+/// (`If-Match`) и `log insight --supersedes … --supersedes-rev`; `--supersedes-rev` без
+/// `--supersedes` — ошибка разбора.
+#[test]
+fn insight_supersede_revision_flags() {
+    let Ok(Cli {
+        cmd: Cmd::Insight {
+            cmd: InsightCmd::Supersede { rev, .. },
+        },
+    }) = parse(&["insight", "supersede", "01E", "--title", "Т", "--rev", "3"])
+    else {
+        panic!("supersede --rev");
+    };
+    assert_eq!(rev, Some(3));
+    let Ok(Cli {
+        cmd:
+            Cmd::Log {
+                cmd:
+                    LogCmd::Insight {
+                        supersedes,
+                        supersedes_rev,
+                        ..
+                    },
+            },
+    }) = parse(&[
+        "log",
+        "insight",
+        "--kind",
+        "gotcha",
+        "--title",
+        "Т",
+        "--supersedes",
+        "01E",
+        "--supersedes-rev",
+        "2",
+    ])
+    else {
+        panic!("log insight --supersedes-rev");
+    };
+    assert_eq!(
+        (supersedes.as_deref(), supersedes_rev),
+        (Some("01E"), Some(2))
+    );
+    assert!(
+        parse(&[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "Т",
+            "--supersedes-rev",
+            "2"
+        ])
+        .is_err()
+    );
+}
+
 /// M6.6 §9 (8): справка `--certainty` называет умолчание; флаги решения и доказательства
 /// разбираются у `log insight` и `insight supersede`; доказательство — все три флага вместе,
 /// не с `--evidence-file`.

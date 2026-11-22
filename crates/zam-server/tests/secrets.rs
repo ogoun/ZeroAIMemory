@@ -2535,3 +2535,223 @@ async fn agent_weak_values() {
         }
     }
 }
+
+/// Вторая правка подряд из того же контекста (финальное ревью M7.1, I-2, §4.3.2 п. 2): агент
+/// прочитал ревизию r, записал r+1 и снова пишет из того же текста с `rev` r+1 из ответа — метки
+/// ревизии r действуют, значения на месте, `secret_mark_kept` нет. Заметка (`PUT`, `PATCH`) и запись
+/// журнала (правка, дописка, замещение).
+#[tokio::test]
+async fn agent_second_write_from_same_view() {
+    let a = api("secrets-restore-second", |_| {}).await;
+    let (s, s2) = (secret(), secret2());
+    let content = format!("# Стенд\n\n## Доступ\n\ntoken: {s}\n\n## Прочее\n\nтекст\n");
+    let n = a.note("knowledge", "ops/restore-second", &content).await;
+    let id = n["id"].as_str().unwrap().to_string();
+    let uri = format!("/api/v1/nodes/{id}");
+    let seen = agent_text(&a, &id).await;
+    assert!(seen.contains(&mk(&tg(&id, 1), 1)), "{seen}");
+    let put = |text: String, rev: &'static str| {
+        let (a, uri) = (&a, &uri);
+        async move {
+            let r = a
+                .tok_h(
+                    &a.token,
+                    Method::PUT,
+                    uri,
+                    Some(json!({"content": text})),
+                    &[("if-match", rev)],
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            assert_eq!(kept_of(&r.json()), None, "{}", r.text());
+            r
+        }
+    };
+    let r = put(seen.replace("текст\n", "текст 1\n"), "1").await;
+    assert_eq!(r.json()["current_rev"], 2, "{}", r.text());
+    // тот же вид ревизии 1, `rev` 2 из ответа
+    put(seen.replace("текст\n", "текст 2\n"), "2").await;
+    assert_eq!(
+        human_text(&a, &id).await,
+        content.replace("текст\n", "текст 2\n")
+    );
+    // PATCH по base_rev 3 с меткой вида ревизии 1
+    let r = a
+        .t(
+            Method::PATCH,
+            &uri,
+            Some(json!({"base_rev": 3, "ops": [{"op": "replace_section",
+                "section": "Стенд > Доступ",
+                "content": format!("\ntoken: {} (prod)\n\n", mk(&tg(&id, 1), 1))}]})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(kept_of(&r.json()), None, "{}", r.text());
+    assert!(
+        human_text(&a, &id)
+            .await
+            .contains(&format!("token: {s} (prod)\n")),
+        "PATCH: значение ревизии 1"
+    );
+    // запись журнала: правка, вторая правка тем же видом, дописка и замещение
+    let e = post_entry(
+        &a,
+        "knowledge",
+        json!({"kind": "insight", "title": format!("Ключ {s2}"),
+               "body": format!("token: {s}\nверсия 1\n"), "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let eid = e["id"].as_str().unwrap().to_string();
+    let euri = format!("/api/v1/entries/{eid}");
+    let v = a.t(Method::GET, &euri, None).await.json();
+    let (title, body) = (
+        v["title"].as_str().unwrap().to_string(),
+        v["body"].as_str().unwrap().to_string(),
+    );
+    assert!(body.contains(&mk(&tg(&eid, 1), 2)), "{v}");
+    for (rev, tail) in [("1", "версия 2"), ("2", "версия 3")] {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::PATCH,
+                &euri,
+                Some(json!({"title": format!("{title} ({tail})"),
+                            "body": body.replace("версия 1", tail)})),
+                &[("if-match", rev)],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{rev}: {}", r.text());
+        assert_eq!(kept_of(&r.json()), None, "{rev}: {}", r.text());
+    }
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PATCH,
+            &euri,
+            Some(json!({"append_body": format!("ещё: {}", body.lines().next().unwrap())})),
+            &[("if-match", "3")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(kept_of(&r.json()), None, "{}", r.text());
+    let h = a.adm(Method::GET, &euri, None, None).await.json();
+    assert_eq!(h["title"], format!("Ключ {s2} (версия 3)"), "{h}");
+    assert_eq!(
+        h["body"],
+        format!("token: {s}\nверсия 3\n\nещё: token: {s}"),
+        "{h}"
+    );
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("{euri}/supersede"),
+            Some(
+                json!({"title": title, "body": body.replace("версия 1", "версия 4"),
+                        "data": {"kind": "gotcha"}}),
+            ),
+            &[("if-match", "4")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(kept_of(&r.json()["entry"]), None, "{}", r.text());
+    let nid = r.json()["entry"]["id"].as_str().unwrap().to_string();
+    let h = a
+        .adm(Method::GET, &format!("/api/v1/entries/{nid}"), None, None)
+        .await
+        .json();
+    assert_eq!(h["title"], format!("Ключ {s2}"), "{h}");
+    assert_eq!(h["body"], format!("token: {s}\nверсия 4\n"), "{h}");
+}
+
+/// Метки, прочитанные до обновления сканера (I-2, §4.3.2 п. 1): T другой версии правил или крейта
+/// у того же объекта и ревизии — литерал с `secret_mark_kept`, значение не подставлено.
+#[tokio::test]
+async fn agent_marks_of_older_scanner_literal() {
+    let a = api("secrets-restore-rules", |_| {}).await;
+    let s = secret();
+    let content = format!("# K\n\ntoken: {s}\n");
+    for (i, (rules, version)) in [
+        (zam_secrets::RULES_VERSION - 1, zam_secrets::VERSION),
+        (zam_secrets::RULES_VERSION, "0.0.13-m6.6"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let n = a
+            .note("knowledge", &format!("ops/restore-rules-{i}"), &content)
+            .await;
+        let id = n["id"].as_str().unwrap().to_string();
+        let old = zam_server::api::agent_view::object_tag_with(&id, 1, rules, version);
+        assert_ne!(old, tg(&id, 1));
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::PUT,
+                &format!("/api/v1/nodes/{id}"),
+                Some(json!({"content": format!("# K\n\ntoken: {} (prod)\n", mk(&old, 1))})),
+                &[("if-match", "1")],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(kept_of(&r.json()), Some(1), "{}", r.text());
+        let t = human_text(&a, &id).await;
+        assert!(!t.contains(&s), "значение по прежней метке: {t}");
+        assert_eq!(t, format!("# K\n\ntoken: {} (prod)\n", mk(&old, 1)));
+    }
+}
+
+/// Доступ раньше восстановления (финальное ревью M7.1, I-1, §4.3.2 п. 2): участник общего решения
+/// замещает через `supersedes_id` запись из личного Knowledge владельца — 404, как у чтения: без 428
+/// (метки без ревизии), 409 (устаревшая ревизия) и 422 (значение вне маски).
+#[tokio::test]
+async fn participant_supersedes_foreign_entry_not_found() {
+    const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e66";
+    let a = api("secrets-restore-access", |_| {}).await;
+    let (_, a_tok) = a.new_user("Анна").await;
+    let (b_id, b_tok) = a.new_user("Борис").await;
+    let reg = json!({ "agent_solution_id": G, "name": "Общее" });
+    let r = a
+        .tok(&a_tok, Method::POST, "/api/v1/solutions", Some(reg.clone()))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = a
+        .tok(&b_tok, Method::POST, "/api/v1/solutions", Some(reg))
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    a.set_access(&a_tok, G, &b_id, "rw").await;
+    let p = ["hunter", "7Qz9x"].concat();
+    let r = a
+        .tok(
+            &a_tok,
+            Method::POST,
+            "/api/v1/spaces/knowledge/entries",
+            Some(json!({"kind": "insight", "title": "Пароль стенда",
+                        "body": format!("password = {p}\n"), "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let old = r.json()["id"].as_str().unwrap().to_string();
+    let m1 = mk(&tg(&old, 1), 1);
+    let uri = format!("/api/v1/spaces/{G}/entries");
+    for (what, rev, body) in [
+        ("без ревизии", None, format!("password = {m1}\n")),
+        ("устаревшая ревизия", Some(5), format!("password = {m1}\n")),
+        ("значение вне маски", Some(1), format!("пароль {m1}\n")),
+        ("без меток", None, "текст\n".to_string()),
+    ] {
+        let mut req = json!({"kind": "insight", "supersedes_id": &old, "title": "Пароль",
+                             "body": body, "data": {"kind": "gotcha"}});
+        if let Some(rev) = rev {
+            req["supersedes_rev"] = json!(rev);
+        }
+        let r = a.tok(&b_tok, Method::POST, &uri, Some(req)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{what}: {}", r.text());
+        assert!(!r.text().contains(&p), "{what}: {}", r.text());
+    }
+    // запись владельца не тронута
+    let r = a
+        .tok(&a_tok, Method::GET, &format!("/api/v1/entries/{old}"), None)
+        .await;
+    assert_eq!(r.json()["rev"], 1, "{}", r.text());
+}

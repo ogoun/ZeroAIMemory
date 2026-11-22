@@ -468,6 +468,55 @@ async fn server_remasks_secrets() {
     assert_eq!(r.status, StatusCode::NO_CONTENT);
 }
 
+/// Перемаскировка при выдаче (финальное ревью M7.1, M-2): снимок, записанный в базу без маски
+/// нынешних правил (загружен прежним сервером: правила 2 не знали русских слов-ключей), уходит
+/// агенту маской — и `GET /sessions/{id}/snapshot`, и раздел дайджеста.
+#[tokio::test]
+async fn snapshot_remasked_on_output() {
+    let a = world("remask-out", |_| {}).await;
+    let task = {
+        let _c = at("08:00");
+        register(&a, "old", true, None).await;
+        task_of(&a, "old", "Задача старого снимка").await
+    };
+    assert!(!task.is_empty());
+    // значение из частей (push protection); строка «пароль: …» — находка правил 3
+    let pw = ["Qz9x", "Hunter", "41"].concat();
+    let raw = format!("пароль: {pw}");
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let data: zam_core::snapshot::SnapshotData = serde_json::from_value(json!({
+        "compact_summary": format!("Current Work: {raw}"),
+        "prompts": [raw.clone()],
+        "files": ["src/a.rs"],
+        "commands": [{"cmd": "cargo test", "failed": true}],
+    }))
+    .unwrap();
+    let row = zam_store::SnapshotRow {
+        session_id: "old".into(),
+        taken_at: t("09:00"),
+        trigger: zam_core::snapshot::SnapTrigger::parse("stop").unwrap(),
+        agent: Some("claude".into()),
+        status: zam_core::snapshot::SnapStatus::parse("complete").unwrap(),
+        skipped: 0,
+        bytes: 100,
+        data,
+    };
+    assert!(zam_store::put_snapshot(&db, &row).await.unwrap());
+    let g = a.t(Method::GET, &snap_uri("old"), None).await;
+    assert_eq!(g.status, StatusCode::OK, "{}", g.text());
+    assert!(
+        !g.text().contains(&pw) && g.text().contains("‹secret›"),
+        "{}",
+        g.text()
+    );
+    let text = {
+        let _c = at("10:00");
+        digest(&a, "new").await
+    };
+    let sec = section(&text).unwrap_or_else(|| panic!("нет раздела: {text}"));
+    assert!(!sec.contains(&pw) && sec.contains("‹secret›"), "{sec}");
+}
+
 /// §8а: снимок старше `snapshot.keep_days` (от `taken_at`) удаляет обслуживание;
 /// `gc_sessions` удаляет снимок вместе с сессией.
 #[tokio::test]

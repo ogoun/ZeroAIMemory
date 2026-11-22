@@ -5,20 +5,24 @@
 //! **Метки с личностью.** Текст, который агент правит и возвращает записью, он получает видом
 //! [`ObjectMasks::view`] ([`numbered_view`] — для объекта из одного текста, [`Numbering`] — без
 //! хранения значений): каждая маска — `‹secret-T-N›`, где T — метка объекта и ревизии (её строит
-//! вызывающий: 6 шестнадцатеричных знаков хэша `id ‖ ревизия`), N — порядковый номер маски в
-//! объекте (с 1), **сквозной по всем редактируемым полям** в постоянном порядке; находки —
-//! [`scan_secrets`], те же, что у [`crate::mask_text`]. Литерал метки, уже лежавший в исходнике
-//! (`‹secret›`, `‹secret-N›`, `‹secret-T-N›`: прежний `secret_mark_kept`, импорт архива с маской,
-//! текст человека), в виде — `‹secret›`: метка с личностью есть только у маски со значением.
+//! вызывающий: 6 шестнадцатеричных знаков хэша `id ‖ ревизия ‖ RULES_VERSION ‖ версия крейта`,
+//! [`VERSION`](crate::VERSION)), N — порядковый номер маски в объекте (с 1), **сквозной по всем
+//! редактируемым полям** в постоянном порядке; находки — [`scan_secrets`], те же, что у
+//! [`crate::mask_text`]. Литерал метки, уже лежавший в исходнике (`‹secret›`, `‹secret-N›`,
+//! `‹secret-T-N›`: прежний `secret_mark_kept`, импорт архива с маской, текст человека), в виде —
+//! `‹secret›`: метка с личностью есть только у маски со значением.
 //!
 //! **Восстановление** ([`ObjectMasks::fill_marks`], [`ObjectMasks::restore`], [`restore`]): метка
-//! `‹secret-T-N›`, у которой T — метка этого объекта и базовой ревизии, а N — номер маски базы, —
-//! значение этой маски в любом поле объекта (перенос строки между полями сохраняет значение;
-//! повтор — повтор значения); любая другая метка (чужой T — копия из другого объекта или
-//! ревизии, номер вне базы, `‹secret›`, прежняя `‹secret-N›`) записывается как есть. Маска базы,
-//! которую агент не вернул, удалена правкой, как любой текст. Многострочное значение (закрытый
-//! ключ) — с переводами строк нового текста. Предупреждение `secret_mark_kept` поля — меток-
-//! литералов в итоге сверх их числа в исходнике текущей ревизии того же поля ([`literals_in`]).
+//! `‹secret-T-N›`, у которой T — метка этого объекта и **любой его ревизии** (ревизию по T
+//! находит [`revisions_by_tag`]; две ревизии с одним T — ни одной: метка — литерал), а N — номер
+//! маски той ревизии, — значение этой маски в любом поле объекта (перенос строки между полями
+//! сохраняет значение; повтор — повтор значения; вторая правка подряд из того же контекста — по
+//! меткам прежней ревизии, финальное ревью M7.1, I-2). Маски ревизий — [`ObjectMasks::revision`].
+//! Любая другая метка (чужой T — копия из другого объекта или вид до обновления сканера, номер
+//! вне той ревизии, `‹secret›`, прежняя `‹secret-N›`) записывается как есть. Маска базы, которую
+//! агент не вернул, удалена правкой, как любой текст. Многострочное значение (закрытый ключ) — с
+//! переводами строк нового текста. Предупреждение `secret_mark_kept` поля — меток-литералов в
+//! итоге сверх их числа в исходнике текущей ревизии того же поля ([`literals_in`]).
 //!
 //! **Покрытие по происхождению** ([`uncovered_lines`], §4.3.2 п. 5, круг правок 5): каждая
 //! позиция итога, где стоит значение секрета, — восстановленное из метки и маска текущей ревизии,
@@ -35,6 +39,7 @@
 //!
 //! Время — линейное: скан исходника, скан итога и проход по упорядоченным позициям.
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::ops::Range;
 
@@ -140,6 +145,51 @@ pub fn secret_ranges(raw: &str) -> Vec<Range<usize>> {
     hits(raw)
 }
 
+/// Метки объекта T меток `‹secret-T-N›` текстов `texts` — без повторов, по возрастанию.
+pub fn tags_in<'s>(texts: impl IntoIterator<Item = &'s str>) -> BTreeSet<&'s str> {
+    let mut out = BTreeSet::new();
+    for s in texts {
+        if !s.contains(NUMBERED_MARK_PREFIX) {
+            continue;
+        }
+        for (_, m) in marks(s) {
+            if let Mark::Tagged(t, _) = m {
+                out.insert(t);
+            }
+        }
+    }
+    out
+}
+
+/// Ревизии объекта по меткам (M7 §4.3.2 п. 2, финальное ревью M7.1, I-2): каждой T из `tags` —
+/// ревизия `k ∈ 1..=max_rev`, у которой `tag_of(k) == T`, если такая ревизия **одна**; T без
+/// ревизии (чужой объект, вид до обновления сканера) и T двух ревизий (коллизия 24 бит) в итог не
+/// входят — их метки записываются как есть. Цена — `max_rev` вызовов `tag_of` (хэш короткой
+/// строки), без `tags` — ни одного.
+pub fn revisions_by_tag<'t>(
+    tags: &BTreeSet<&'t str>,
+    max_rev: i64,
+    mut tag_of: impl FnMut(i64) -> String,
+) -> BTreeMap<&'t str, i64> {
+    let mut found: BTreeMap<&'t str, Option<i64>> = BTreeMap::new();
+    if tags.is_empty() {
+        return BTreeMap::new();
+    }
+    for k in 1..=max_rev {
+        let t = tag_of(k);
+        if let Some(&want) = tags.get(t.as_str()) {
+            found
+                .entry(want)
+                .and_modify(|r| *r = None)
+                .or_insert(Some(k));
+        }
+    }
+    found
+        .into_iter()
+        .filter_map(|(t, k)| k.map(|k| (t, k)))
+        .collect()
+}
+
 /// Строки `text` (с 1, по возрастанию, без повторов), где значение на позиции из `at` (по
 /// возрастанию) не покрыто находкой `text` целиком.
 pub fn uncovered_lines(text: &str, at: &[Range<usize>]) -> Vec<usize> {
@@ -165,53 +215,75 @@ pub fn uncovered_lines(text: &str, at: &[Range<usize>]) -> Vec<usize> {
     out
 }
 
-/// Значения масок объекта по номерам (с 1) и метка объекта и ревизии: нумерация — по порядку
-/// кусков, добавленных [`ObjectMasks::view`] или [`ObjectMasks::add`] (поля объекта в постоянном
-/// порядке).
-#[derive(Debug, Clone)]
+/// Значения масок объекта по номерам (с 1) у каждой его ревизии с меткой T: нумерация ревизии —
+/// по порядку кусков, добавленных [`ObjectMasks::view`] или [`ObjectMasks::add`] (поля объекта в
+/// постоянном порядке) после [`ObjectMasks::new`] или [`ObjectMasks::revision`] с её меткой.
+/// Ревизии с одной T вызывающий не добавляет ([`revisions_by_tag`]); если добавил — значение даёт
+/// первая.
+#[derive(Debug, Clone, Default)]
 pub struct ObjectMasks<'a> {
-    tag: String,
-    values: Vec<&'a str>,
+    /// Ревизии: метка T и значения масок по номерам; куски — в последнюю.
+    revs: Vec<(String, Vec<&'a str>)>,
 }
 
 impl<'a> ObjectMasks<'a> {
+    /// Объект с одной ревизией (метка `tag`).
     pub fn new(tag: &str) -> Self {
         ObjectMasks {
-            tag: tag.to_owned(),
-            values: Vec::new(),
+            revs: vec![(tag.to_owned(), Vec::new())],
         }
     }
 
-    /// Масок в объекте.
+    /// Следующая ревизия объекта с меткой `tag`: маски кусков, добавленных после
+    /// ([`Self::add`], [`Self::view`]), — её, нумерация с 1.
+    pub fn revision(&mut self, tag: &str) -> &mut Self {
+        self.revs.push((tag.to_owned(), Vec::new()));
+        self
+    }
+
+    /// Значения последней ревизии (куски — в неё); у пустого объекта — ревизия без метки (её
+    /// маски не восстанавливаются: у метки T всегда 6 знаков).
+    fn last(&mut self) -> &mut (String, Vec<&'a str>) {
+        if self.revs.is_empty() {
+            self.revs.push((String::new(), Vec::new()));
+        }
+        self.revs.last_mut().expect("ревизия есть")
+    }
+
+    /// Масок в последней ревизии.
     pub fn len(&self) -> usize {
-        self.values.len()
+        self.revs.last().map_or(0, |(_, v)| v.len())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.len() == 0
     }
 
-    /// Значения масок по порядку номеров.
+    /// Значения масок последней ревизии по порядку номеров.
     pub fn values(&self) -> &[&'a str] {
-        &self.values
+        self.revs.last().map_or(&[], |(_, v)| v.as_slice())
     }
 
-    /// Значение метки `m`: `‹secret-T-N›` с T этого объекта и N — номер маски; иначе `None`.
+    /// Значение метки `m`: `‹secret-T-N›` с T одной из ревизий объекта и N — номер маски той
+    /// ревизии; иначе `None`.
     pub fn value(&self, m: Mark) -> Option<&'a str> {
         match m {
-            Mark::Tagged(t, n) if t == self.tag => {
+            Mark::Tagged(t, n) => {
+                let (_, values) = self.revs.iter().find(|(tag, _)| tag == t)?;
                 let i = (n as usize).checked_sub(1)?;
-                self.values.get(i).copied()
+                values.get(i).copied()
             }
             _ => None,
         }
     }
 
-    /// Маски куска `raw` — в объект (нумерация продолжается), без вида; итог — литералов в куске.
+    /// Маски куска `raw` — в последнюю ревизию (нумерация продолжается), без вида; итог —
+    /// литералов в куске.
     pub fn add(&mut self, raw: &'a str) -> usize {
         let found = hits(raw);
+        let values = &mut self.last().1;
         for r in &found {
-            self.values.push(&raw[r.clone()]);
+            values.push(&raw[r.clone()]);
         }
         if !has_any_mark(raw) {
             return 0;
@@ -219,13 +291,14 @@ impl<'a> ObjectMasks<'a> {
         marks(raw).filter(|(m, _)| !covered(&found, m)).count()
     }
 
-    /// Вид куска `raw`: маски — `‹secret-T-N›` (нумерация продолжается), литералы меток —
-    /// `‹secret›`; без находок и меток — заимствование.
+    /// Вид куска `raw` последней ревизии: маски — `‹secret-T-N›` (нумерация продолжается),
+    /// литералы меток — `‹secret›`; без находок и меток — заимствование.
     pub fn view(&mut self, raw: &'a str) -> Cow<'a, str> {
-        let tag = self.tag.clone();
+        let (tag, values) = self.last();
+        let tag = tag.clone();
         view_into(raw, &tag, |v| {
-            self.values.push(v);
-            self.values.len()
+            values.push(v);
+            values.len()
         })
     }
 

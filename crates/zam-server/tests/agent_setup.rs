@@ -1317,8 +1317,9 @@ async fn guide_vault_scope_and_delete_rule() {
 }
 
 /// Протокол (задача 5 M7.1, спецификация M7 §4.3.1): секреты в выдаче агенту — `‹secret›`, ключ —
-/// из Vault (раскрытие не маскируется), смещения `range` — по маске, блобы — как есть; ru и en
-/// синхронно. Блока v8 правило не касается.
+/// из Vault (раскрытие не маскируется), смещения `range` — по виду с метками, блобы — как есть;
+/// метка действует для объекта, в котором прочитана, и до обновления сервера (финальное ревью
+/// M7.1, I-2); ru и en синхронно. Блока v8 правило не касается.
 #[tokio::test]
 async fn guide_secrets_masked_in_output() {
     let a = api("agent-guide-secrets", |_| {}).await;
@@ -1328,10 +1329,11 @@ async fn guide_secrets_masked_in_output() {
             [
                 "в выдаче агенту значения, похожие на секреты, приходят меткой `‹secret›`",
                 "нужный ключ бери из Vault: `memory_vault get`",
-                "Смещения `range` и пропуски фокуса — по тексту с маской",
+                "Смещения `range` и пропуски фокуса — по виду с метками",
                 "файлы вложений (`GET /blobs/…`) — как есть",
                 // запись обратно (задача 6 M7.1, M7 §4.3.2)
-                "при правке сохраняйте метки `‹secret-…›` как есть — значение сохранится; метка действует только для объекта и ревизии, с которых прочитана",
+                "при правке сохраняйте метки `‹secret-…›` как есть — значение сохранится; метка действует для объекта, в котором прочитана",
+                "после обновления сервера метки прежней выдачи не действуют — перечитай",
                 "предупреждение `secret_mark_kept`",
                 "422 `secret_context_changed`",
             ],
@@ -1341,9 +1343,10 @@ async fn guide_secrets_masked_in_output() {
             [
                 "in output to the agent values that look like secrets come as `‹secret›`",
                 "take the key you need from Vault: `memory_vault get`",
-                "`range` offsets and focus skips — over the masked text",
+                "`range` offsets and focus skips — over the view with marks",
                 "attachment files (`GET /blobs/…`) — as is",
-                "keep `‹secret-…›` marks as is when editing — the value is kept; a mark is valid only for the object and revision it was read from",
+                "keep `‹secret-…›` marks as is when editing — the value is kept; a mark is valid for the object it was read from",
+                "after a server update the marks of earlier output are no longer valid — read again",
                 "warning `secret_mark_kept`",
                 "422 `secret_context_changed`",
             ],

@@ -9,8 +9,10 @@
 //!   быть чужим), часть цели `part` (решение контроллера R11: `chunk_id` чанка, отданного
 //!   целиком, или [`WHOLE_TARGET`] — полный текст цели; [`RECALL_PART`] — подсказка `/recall`)
 //!   и её ревизия. Вложение (M5) — цель [`SeenTarget::Blob`] (sha256), часть — `locator`,
-//!   отданный `/read` целиком, или `chunk_id` фрагмента `mode=chunks`, ревизия 0. Хранится большая из выданных ревизий: ревизии только растут, и повторная
-//!   выдача старой не откатывает отметку;
+//!   отданный `/read` целиком, или `chunk_id` фрагмента `mode=chunks`, ревизия 0. Хранится
+//!   большая из выданных ревизий: ревизии только растут, и повторная выдача старой не откатывает
+//!   отметку. Исключение — отметка очереди разбора [`REVIEW_QUEUE_PART`]: её «ревизия» — число
+//!   идей **последнего** показа, она перезаписывается (из равных по `seen_at` — поздняя строка);
 //! - эпоха (спецификация M6 §7.2, миграция 0025): `sessions.seen_epoch` растёт [`bump_epoch`]
 //!   (сжатие контекста, `resume`, `clear`, восстановление), отметка пишется в эпоху касания
 //!   ([`SessionTouch::epoch`]), [`seen_revs`] читает только её. Отметки прежних эпох хранятся до
@@ -714,7 +716,7 @@ pub(crate) fn queue_shown_in(
         .prepare_cached(
             "SELECT rev, seen_at FROM session_seen
              WHERE session_id = ?1 AND owner_id = ?2 AND part = ?3 AND epoch = ?4
-             ORDER BY seen_at DESC LIMIT 1",
+             ORDER BY seen_at DESC, rowid DESC LIMIT 1",
         )?
         .query_row(params![session, owner, REVIEW_QUEUE_PART, epoch], |r| {
             Ok((r.get(0)?, r.get(1)?))

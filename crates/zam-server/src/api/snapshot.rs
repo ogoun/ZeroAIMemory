@@ -40,6 +40,9 @@
 //!   снимок не делают сессию живой). Работа до ответа — разбор, скан и одна запись SQLite.
 //! - **Чтение** — только своя сессия (база пользователя запроса, у администратора —
 //!   `X-Zam-User`); чужая, в том числе для участника общего решения, — 404, как несуществующая.
+//!   Выдача (`GET` и показ [`last_state`]) маскирует поля заново нынешними правилами сканера
+//!   (финальное ревью M7.1, M-2): снимок, загруженный прежним сервером (правила 2), иначе ушёл бы
+//!   агенту без новых находок.
 //!
 //! **Показ** ([`last_state`]) — раздел
 //! `### Последнее известное состояние (снимок <время>, извлечено автоматически)`:
@@ -396,10 +399,11 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<SnapshotRow>, ApiError> {
     let db = requester_db(&st, &p, &headers).await?;
-    get_snapshot(&db, &id)
-        .await?
-        .map(Json)
-        .ok_or(ApiError::NotFound)
+    let mut row = get_snapshot(&db, &id).await?.ok_or(ApiError::NotFound)?;
+    // перемаскировка при выдаче (финальное ревью M7.1, M-2): снимок, загруженный прежними
+    // правилами сканера, — по нынешним (исходника на сервере нет: маска и человеку)
+    remask_data(&mut row.data);
+    Ok(Json(row))
 }
 
 // ---- показ «последнего известного состояния» (§8а) ----
@@ -499,6 +503,9 @@ pub(crate) async fn last_state(q: ShowReq<'_>) -> Result<Option<Shown>, StoreErr
         None if snap.data.files.is_empty() => return Ok(None),
         None => None,
     };
+    // перемаскировка при показе (M-2): снимок мал (`snapshot.max_bytes`), правила — нынешние
+    let mut snap = snap;
+    remask_data(&mut snap.data);
     Ok(render(
         &snap,
         at,

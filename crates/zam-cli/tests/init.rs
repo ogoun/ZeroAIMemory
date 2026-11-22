@@ -1294,6 +1294,99 @@ fn admin_template(p: &Proj, tpl: &str) {
     assert_eq!(st.as_u16(), 200, "шаблон блока");
 }
 
+/// Сервер с `server.public_url` — другим адресом того же сервера (`http://localhost:<порт>` при
+/// подключении клиента по `http://127.0.0.1:<порт>`): (адрес клиента, адрес блока, токен `rw`).
+fn start_public(name: &str) -> (String, String, String) {
+    let data = tmp(&format!("{name}-data"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let public = format!("http://localhost:{port}");
+            let mut cfg = ServerConfig {
+                data_dir: data,
+                ..ServerConfig::default()
+            };
+            cfg.server.public_url = Some(public.clone());
+            let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
+            let u = st.system.create_user("Анна", false).await.unwrap();
+            let (_, t) = st.system.issue_token(u.id, "t0", Access::Rw).await.unwrap();
+            tx.send((format!("http://127.0.0.1:{port}"), public, t))
+                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+    });
+    rx.recv().unwrap()
+}
+
+/// `server.public_url` не равен `--url` (финальное ревью M7.1, I-3): блок получает адрес сервера,
+/// токен сохраняется под обоими адресами — `zam status` и хук `session-start` без флагов находят
+/// токен по адресу блока; повтор без `--token` (токен — из домашнего конфига) ничего не меняет.
+#[test]
+fn init_block_public_url_token_under_block_address() {
+    let (url, public, tok) = start_public("public-url");
+    let p = Proj::new("public-url", &url, &tok);
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    let md = p.read("CLAUDE.md");
+    assert!(md.contains(&format!("ZeroAIMemoryUrl={public}")), "{md}");
+    let s = out(&o);
+    assert!(
+        s.contains(&format!("[servers.\"{url}\"] и [servers.\"{public}\"]")),
+        "{s}"
+    );
+    let home: toml::Table =
+        toml::from_str(&std::fs::read_to_string(home_cfg(&p)).unwrap()).unwrap();
+    for u in [&url, &public] {
+        assert_eq!(
+            home["servers"][u.as_str()]["token"].as_str(),
+            Some(tok.as_str()),
+            "{u}: {home:?}"
+        );
+    }
+    let o = p.cmd().arg("status").output().unwrap();
+    ok(&o);
+    assert!(
+        out(&o).contains(&format!("Сервер:   {public}")),
+        "{}",
+        out(&o)
+    );
+    let o = p
+        .cmd()
+        .args(["hook", "session-start"])
+        .write_stdin(
+            json!({"session_id": "s-public", "cwd": p.repo, "hook_event_name": "SessionStart",
+                   "source": "startup", "transcript_path": p.repo.join("t.jsonl")})
+            .to_string(),
+        )
+        .output()
+        .unwrap();
+    ok(&o);
+    assert!(!out(&o).contains("нет токена"), "{}", out(&o));
+    let log =
+        std::fs::read_to_string(p.repo.join(".zeroaimemory/logs/hooks.log")).unwrap_or_default();
+    assert!(!log.contains("нет токена"), "{log}");
+    // повтор без --token: токен адреса — из домашнего конфига, оба ключа уже есть
+    let before = std::fs::read_to_string(home_cfg(&p)).unwrap();
+    let o = p
+        .cmd()
+        .args(["init", "--url", &url, "--yes"])
+        .output()
+        .unwrap();
+    ok(&o);
+    assert_eq!(std::fs::read_to_string(home_cfg(&p)).unwrap(), before);
+}
+
 /// M6.6 §10.1 (замечание 1): `--url-to home` — блок без строки адреса, адрес — в домашнем
 /// конфиге (токен и свои ключи там не трогаются), `zam status` без флагов находит сервер.
 #[test]

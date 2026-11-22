@@ -283,36 +283,63 @@ pub async fn live_entries_by_ids(
     .await
 }
 
+/// Столбцы ревизии записи для [`revision_row`].
+const REVISION_COLS: &str = "rev, title, body, data, tags, area, status, certainty, reason, ts,
+                    author_kind, user_id, token_id, session_id, machine";
+
+/// Строка `entry_revisions` (столбцы [`REVISION_COLS`]).
+fn revision_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRevision> {
+    Ok(EntryRevision {
+        rev: r.get(0)?,
+        title: r.get(1)?,
+        body: r.get(2)?,
+        data: json_col(r, 3)?,
+        tags: json_col(r, 4)?,
+        area: r.get(5)?,
+        status: r.get(6)?,
+        certainty: r.get(7)?,
+        reason: r.get(8)?,
+        ts: ts_at(r, 9)?,
+        author: AuthorView {
+            kind: r.get(10)?,
+            user_id: r.get(11)?,
+            token_id: r.get(12)?,
+            session_id: r.get(13)?,
+            machine: r.get(14)?,
+        },
+    })
+}
+
 /// Ревизии записи по возрастанию номера. Нет записи → `NotFound`.
 pub async fn entry_revisions(db: &Db, id: Id) -> Result<Vec<EntryRevision>, StoreError> {
     db.read(move |c| {
         load_entry(c, id)?;
-        let mut st = c.prepare_cached(
-            "SELECT rev, title, body, data, tags, area, status, certainty, reason, ts,
-                    author_kind, user_id, token_id, session_id, machine
-             FROM entry_revisions WHERE entry_id = ?1 ORDER BY rev",
-        )?;
-        let rows = st.query_map([id], |r| {
-            Ok(EntryRevision {
-                rev: r.get(0)?,
-                title: r.get(1)?,
-                body: r.get(2)?,
-                data: json_col(r, 3)?,
-                tags: json_col(r, 4)?,
-                area: r.get(5)?,
-                status: r.get(6)?,
-                certainty: r.get(7)?,
-                reason: r.get(8)?,
-                ts: ts_at(r, 9)?,
-                author: AuthorView {
-                    kind: r.get(10)?,
-                    user_id: r.get(11)?,
-                    token_id: r.get(12)?,
-                    session_id: r.get(13)?,
-                    machine: r.get(14)?,
-                },
-            })
-        })?;
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {REVISION_COLS} FROM entry_revisions WHERE entry_id = ?1 ORDER BY rev"
+        ))?;
+        let rows = st.query_map([id], revision_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// Ревизии `revs` записи `id` по возрастанию номера (каких нет — пропущены): прежние ревизии,
+/// метки которых агент вернул записью (M7 §4.3.2 п. 2, финальное ревью M7.1, I-2).
+pub async fn entry_revisions_at(
+    db: &Db,
+    id: Id,
+    revs: Vec<i64>,
+) -> Result<Vec<EntryRevision>, StoreError> {
+    if revs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = serde_json::to_string(&revs).expect("сериализация списка чисел");
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {REVISION_COLS} FROM entry_revisions
+             WHERE entry_id = ?1 AND rev IN (SELECT value FROM json_each(?2)) ORDER BY rev"
+        ))?;
+        let rows = st.query_map(rusqlite::params![id, list], revision_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     })
     .await

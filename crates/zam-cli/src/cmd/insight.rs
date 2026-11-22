@@ -2,8 +2,9 @@
 //! revisit|triggers|append|certify|feedback`.
 //!
 //! - `zam log insight --kind K --title T [--scope solution|global] [--certainty C]
-//!   [--reason R] [--evidence-file F] [--trigger TYPE:PATTERN]… [--tag X]… [--force] [--supersedes ID]
-//!   [--area A] [--solution GUID] [--key K] [--body-file F | stdin]` — запись insight в решение
+//!   [--reason R] [--evidence-file F] [--trigger TYPE:PATTERN]… [--tag X]… [--force] [--supersedes ID
+//!   [--supersedes-rev REV]] [--area A] [--solution GUID] [--key K] [--body-file F | stdin]` —
+//!   запись insight в решение
 //!   (`solution.toml` или `--solution`) или, при `--scope global`, в Knowledge. `--evidence-file`
 //!   — JSON-объект `{checked, method, result}` → `data.evidence`; `--trigger` —
 //!   `file_glob:**/*.sh`, `command_regex:…`, `error_regex:…`, `keyword:…` (без инструментов:
@@ -20,8 +21,11 @@
 //!   старой записи), иначе код 6 до записи.
 //! - `zam insight list [--status S,…] [--global] [--solution GUID] [--limit N | --all]` — лента
 //!   insight (страница — умолчание сервера, 50; обход и подсказка — [`super::list_entries`]);
-//!   `show ID` — карточка с текстом и триггерами; `supersede ID --title T [--kind K] …` —
-//!   замещение (вид по умолчанию — у старой записи); `retract ID --reason R`; `revisit ID
+//!   `show ID` — карточка с текстом и триггерами; `supersede ID --title T [--kind K] [--rev REV]
+//!   …` — замещение (вид по умолчанию — у старой записи); текст с метками `‹secret-…›` из вида
+//!   старой записи — с её ревизией: `--rev` у `supersede` (`If-Match`), `--supersedes-rev` у
+//!   `log insight --supersedes` (M7 §4.3.2 п. 3; без ревизии сервер отвечает 428);
+//!   `retract ID --reason R`; `revisit ID
 //!   [--reason R]`; `append ID [--body-file F | stdin] [--by human|agent]` — дописать к телу
 //!   (`--by human` у идеи — слова человека: возвращённая идея снова на разбор, M6.5 §6).
 //! - `zam insight certify ID axiom|theorem|hypothesis|none --reason R [--evidence-file F]` —
@@ -173,6 +177,9 @@ pub struct Log<'a> {
     pub scope: Option<&'a str>,
     pub force: bool,
     pub supersedes: Option<&'a str>,
+    /// Ревизия замещаемой записи (`supersedes_rev`), с которой прочитан текст с метками
+    /// `‹secret-…›` (M7 §4.3.2 п. 3; без неё — 428).
+    pub supersedes_rev: Option<i64>,
     pub solution: Option<&'a str>,
 }
 
@@ -346,6 +353,9 @@ pub fn log(ctx: &Ctx, o: &Log) -> Result<(), CliError> {
     }
     if let Some(s) = o.supersedes {
         body["supersedes_id"] = json!(s);
+    }
+    if let Some(r) = o.supersedes_rev {
+        body["supersedes_rev"] = json!(r);
     }
     let r = ctx
         .client
@@ -545,8 +555,9 @@ pub fn triggers(ctx: &Ctx, id: &str, raw: &[String]) -> Result<(), CliError> {
 
 /// `zam insight supersede <id>`: новая запись замещает старую (вид — у старой, если не задан).
 /// Флаги решения — только у решения: число вариантов проверяется до запросов, вид — после
-/// чтения старой записи и до замещения (M6.6 §9).
-pub fn supersede(ctx: &Ctx, id: &str, f: &Fields) -> Result<(), CliError> {
+/// чтения старой записи и до замещения (M6.6 §9). `rev` (`--rev`) — `If-Match` замещаемой записи:
+/// ревизия, с которой прочитан текст с метками `‹secret-…›` (M7 §4.3.2 п. 3; без неё — 428).
+pub fn supersede(ctx: &Ctx, id: &str, f: &Fields, rev: Option<i64>) -> Result<(), CliError> {
     status_reason(f)?;
     f.decision.data()?;
     let kind = match f.kind {
@@ -557,11 +568,14 @@ pub fn supersede(ctx: &Ctx, id: &str, f: &Fields) -> Result<(), CliError> {
             .to_string(),
     };
     let body = insight_body(f, &kind)?;
-    let r = ctx.client.post_json_with(
-        &format!("/entries/{id}/supersede"),
-        &body,
-        &write_headers(f),
-    )?;
+    let rev = rev.map(|r| r.to_string());
+    let mut headers = write_headers(f);
+    if let Some(r) = &rev {
+        headers.push(("If-Match", r.as_str()));
+    }
+    let r = ctx
+        .client
+        .post_json_with(&format!("/entries/{id}/supersede"), &body, &headers)?;
     let created = r.status().as_u16() == 201;
     let v = read_json(r)?;
     ctx.note_write("insight");

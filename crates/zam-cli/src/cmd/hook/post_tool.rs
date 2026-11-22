@@ -18,8 +18,9 @@
 //! повторяй» ([`dont_repeat_class`]: 401, 403, квота, диск, 429, 400/422) — к подсказкам сервера
 //! (запрос `/recall(post_tool)` — как у любой ошибки) и `error_regex` добавляется строка класса,
 //! построенная локально, раз за сессию на класс и отпечаток; сервер недоступен — строка всё
-//! равно есть; в запрос `/recall(post_tool)` — слова путей команды `path_words` ([`zam_core::shell::path_words`],
-//! после маскировки секретов): сервер не считает их предметом ошибки.
+//! равно есть; в запрос `/recall(post_tool)` — имена каталогов из команды `path_words`
+//! ([`zam_core::shell::path_words`]: первые 16 КиБ команды, после маскировки секретов): сервер
+//! не считает их предметом ошибки.
 //!
 //! **Успех** (M4.5 §6.3, §9.1; `PostToolUse` без ошибки; без сети, бюджет 50 мс):
 //! - `Read` — `Ev::Read` и знание о файле по `file-refs.json` ([`file_context_lines`], ключ
@@ -483,12 +484,14 @@ fn failure(env: &Env, inp: &Input, s: &Settings, error: &str) -> Output {
         .as_ref()
         .map(|c| local_matches(&c.triggers, tool, error, env))
         .unwrap_or_default();
-    // слова путей команды — не предмет ошибки (M7.1 §4.6 п. 3); значения секретов и флагов с
-    // паролем не уходят (маскировка — как у команд снимка сессии)
+    // имена каталогов из команды — не предмет ошибки (M7.1 §4.6 п. 3); значения секретов и флагов с
+    // паролем не уходят (маскировка — как у команд снимка сессии); у длинной команды — только
+    // начало и не больше `PATH_WORDS_STAT_MAX` stat (бюджет хука, финальное ревью M7.1, I-4)
     let path_words: Vec<String> = match (tool, command_of(inp)) {
         (Some("apply_patch"), _) | (_, None) => Vec::new(),
         (_, Some(c)) => {
-            let masked = zam_secrets::mask_flags(&zam_secrets::mask_text(&c));
+            let head = head_bytes(&c, zam_core::shell::PATH_WORDS_SCAN_MAX);
+            let masked = zam_secrets::mask_flags(&zam_secrets::mask_text(head));
             zam_core::shell::path_words(&masked, |a| env.cwd.join(a).is_dir())
         }
     };

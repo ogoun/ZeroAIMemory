@@ -119,11 +119,19 @@ pub async fn view_owned(p: &Principal, s: String) -> Result<String, ApiError> {
     if masks(p) { mask_owned(s).await } else { Ok(s) }
 }
 
-/// Метка объекта и ревизии `T` для меток `‹secret-T-N›` (M7 §4.3.2 п. 1, круг правок 5 задачи 6):
-/// первые 6 шестнадцатеричных знаков blake3 от `id ‖ ревизия` — метка вида, прочитанного с этого
-/// объекта и этой ревизии; запись восстанавливает только свои метки.
+/// Метка объекта и ревизии `T` для меток `‹secret-T-N›` (M7 §4.3.2 п. 1, круг правок 5 задачи 6;
+/// финальное ревью M7.1, I-2): первые 6 шестнадцатеричных знаков blake3 от
+/// `id:ревизия:RULES_VERSION:версия zam-secrets` — метка вида, прочитанного с этого объекта и этой
+/// ревизии этим сканером; запись восстанавливает только метки своего объекта, а после обновления
+/// сервера прежние метки — литералы (номера масок могли сдвинуться).
 pub fn object_tag(id: &impl std::fmt::Display, rev: i64) -> String {
-    let h = blake3::hash(format!("{id}:{rev}").as_bytes());
+    object_tag_with(id, rev, zam_secrets::RULES_VERSION, zam_secrets::VERSION)
+}
+
+/// [`object_tag`] при правилах сканера `rules` и версии `version` (вид, прочитанный с другим
+/// сканером, — проверка «после обновления метки не действуют»).
+pub fn object_tag_with(id: &impl std::fmt::Display, rev: i64, rules: u32, version: &str) -> String {
+    let h = blake3::hash(format!("{id}:{rev}:{rules}:{version}").as_bytes());
     h.to_hex()[..zam_secrets::MARK_TAG_LEN].to_string()
 }
 
@@ -546,6 +554,33 @@ mod tests {
         let (h, cut) = mask_head(&many, many.len());
         assert!(h.len() <= many.len() && !h.contains("pw1x") && cut, "{h}");
         assert!(mask(&many).starts_with(&h));
+    }
+
+    /// Метка объекта T (финальное ревью M7.1, I-2): 6 строчных шестнадцатеричных знаков; своя у
+    /// каждой ревизии, у другой версии правил сканера и у другой версии крейта — после обновления
+    /// сервера прежние метки не совпадают.
+    #[test]
+    fn object_tag_depends_on_revision_and_scanner() {
+        let id = zam_core::Id::new();
+        let t = object_tag(&id, 3);
+        assert_eq!(t.len(), zam_secrets::MARK_TAG_LEN);
+        assert!(
+            t.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        assert_eq!(
+            t,
+            object_tag_with(&id, 3, zam_secrets::RULES_VERSION, zam_secrets::VERSION)
+        );
+        assert_ne!(t, object_tag(&id, 4));
+        assert_ne!(
+            t,
+            object_tag_with(&id, 3, zam_secrets::RULES_VERSION + 1, zam_secrets::VERSION)
+        );
+        assert_ne!(
+            t,
+            object_tag_with(&id, 3, zam_secrets::RULES_VERSION, "0.0.13-m6.6")
+        );
     }
 
     /// Ключ из частей: в исходнике его нет целиком (push protection).

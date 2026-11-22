@@ -49,6 +49,9 @@ rename = { "qdrant" = "qdrant-bin" }
     #[test]
     fn real_manifests_are_valid() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy");
+        // оба манифеста ORT — в списке: иначе проверки NuGet ниже молча пропустились бы
+        // (финальное ревью M7.1, отложенный Minor задачи 1)
+        assert!(MANIFESTS.contains(&"onnxruntime"));
         assert!(MANIFESTS.contains(&"onnxruntime-gpu"));
         for name in MANIFESTS {
             let m = Manifest::load(&dir.join(format!("{name}.toml"))).unwrap();
