@@ -49,11 +49,20 @@ const TRAILING_PUNCT: &[char] = &['.', ',', ';', ':', '!', '?', ')', ']', '}', '
 /// Предложения `text` — байтовые диапазоны по порядку, без краевых пробелов;
 /// пустые сегменты отбрасываются. Не паникует на любом входе.
 pub fn split_sentences(text: &str) -> Vec<Range<usize>> {
+    split_sentences_by(text, fenced_lines)
+}
+
+/// [`split_sentences`] со строками блоков по `fenced` (сверка с определением кода круга 2 —
+/// тесты).
+pub(crate) fn split_sentences_by(
+    text: &str,
+    fenced: fn(&str, &[Line]) -> Vec<bool>,
+) -> Vec<Range<usize>> {
     if text.trim().is_empty() {
         return Vec::new();
     }
     let lines = lines_of(text);
-    let fenced = fenced_lines(text, &lines);
+    let fenced = fenced(text, &lines);
     let norm = soften_newlines(text, &lines, &fenced);
     let protected = protected_spans(text, &lines, &fenced);
 

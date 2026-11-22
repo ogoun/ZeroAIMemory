@@ -26,8 +26,17 @@ pub fn prose_mask_prefix(prefix: &str) -> String {
 }
 
 fn mask(text: &str, open_tail: bool) -> String {
+    mask_by(text, open_tail, fenced_lines)
+}
+
+/// [`mask`] со строками блоков по `fenced` (сверка с определением кода круга 2 — тесты).
+pub(crate) fn mask_by(
+    text: &str,
+    open_tail: bool,
+    fenced: fn(&str, &[Line]) -> Vec<bool>,
+) -> String {
     let lines = lines_of(text);
-    let fenced = fenced_lines(text, &lines);
+    let fenced = fenced(text, &lines);
     let mut spans = code_spans_of(text, &lines, &fenced, open_tail);
     if spans.is_empty() {
         return text.to_string();
@@ -126,5 +135,80 @@ mod tests {
         assert_eq!(prose_mask_prefix("a ``b` c"), format!("a {}", sp(6)));
         assert_eq!(prose_mask_prefix("a\n```\nb"), "a\n   \n ");
         assert_eq!(prose_mask_prefix("проза"), "проза");
+    }
+
+    /// Круг правок 5 задачи 5 M7.1: маска прозы (имена терминов в коде не ищутся) и сегментация
+    /// предложений против определения кода круга 2 на текстах со списками — числа журнала.
+    /// `cargo test -p zam-markdown --release --lib -- --ignored round2_comparison --nocapture`.
+    #[test]
+    #[ignore]
+    fn round2_comparison_on_lists() {
+        use zam_secrets::code::fenced_lines_round2;
+        const ATOMS: &[&str] = &[
+            "- ",
+            "  - ",
+            "    - ",
+            "1. ",
+            "   1. ",
+            "10) ",
+            "-   ",
+            "-\t",
+            "* ",
+            "  ",
+            "   ",
+            "    ",
+            "      ",
+            "\t",
+            "```",
+            "```sh",
+            "~~~",
+            "> ",
+            "Термин. ",
+            "Слово x. ",
+            "\n",
+            "\n",
+            "\n",
+            "\n\n",
+            "`",
+        ];
+        let mut x: u64 = 0x5EED_0005_0000_0001;
+        let mut pick = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        let n = 200_000;
+        let (mut texts, mut mask_diff, mut more, mut less, mut seg_diff) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        for _ in 0..n {
+            let k = pick(30);
+            let mut t = String::new();
+            for _ in 0..k {
+                t.push_str(ATOMS[pick(ATOMS.len())]);
+            }
+            if !["- ", "1. ", "10) ", "* "].iter().any(|m| t.contains(m)) {
+                continue;
+            }
+            texts += 1;
+            let now = mask_by(&t, false, fenced_lines);
+            let old = mask_by(&t, false, fenced_lines_round2);
+            if now != old {
+                mask_diff += 1;
+                // байты, ставшие кодом (замаскированы теперь, но не в круге 2) и ставшие прозой
+                let triples = || now.bytes().zip(old.bytes()).zip(t.bytes());
+                let to_code = triples().filter(|((a, b), c)| a != c && b == c).count();
+                let to_prose = triples().filter(|((a, b), c)| a == c && b != c).count();
+                more += u64::from(to_code > 0);
+                less += u64::from(to_prose > 0);
+            }
+            let s_now = crate::sentences::split_sentences_by(&t, fenced_lines);
+            let s_old = crate::sentences::split_sentences_by(&t, fenced_lines_round2);
+            seg_diff += u64::from(s_now != s_old);
+        }
+        println!(
+            "тексты со списками {texts}: маска прозы отличается от круга 2 в {mask_diff} (кода больше \
+             в {more}, меньше в {less}); сегментация предложений отличается в {seg_diff}"
+        );
     }
 }
