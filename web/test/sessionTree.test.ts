@@ -60,6 +60,31 @@ test('sessions_fetched_complete_group_without_repeats', () => {
   assert.deepEqual(descendantsOf('p:a1', g, {}), []);
 });
 
+test('sessions_fetched_moves_top_descendants_under_root', () => {
+  // внук в окне, его родитель `p:a1` — вне окна: без дочитанного внук наверху; по ответу сервера
+  // (`?parent=p`: `p:a1`, `p:a1:c1`) — оба в группе `p`, как у сервера и `zam --subagents`
+  const items = [s('p', null, 10, 50), s('p:a1:c1', 'p:a1', 25, 30)];
+  assert.deepEqual(ids(groupSessions(items).top), ['p', 'p:a1:c1']);
+  const fetched = { p: [s('p:a1', 'p', 20, 40), s('p:a1:c1', 'p:a1', 25, 30)] };
+  const g = groupSessions(items, fetched);
+  assert.deepEqual(ids(g.top), ['p']);
+  assert.deepEqual(ids(g.children.get('p') ?? []), ['p:a1', 'p:a1:c1']);
+  assert.equal(descendantsOf('p', g, fetched).length, 2);
+  // участник цикла: `?parent=x` — `x:k` и `y`; оба переходят под `x`, ни одна сессия не теряется
+  const cyc = [s('x', 'y', 2), s('y', 'x', 3), s('x:k', 'x', 4)];
+  const gx = groupSessions(cyc, { x: [s('x:k', 'x', 4), s('y', 'x', 3)], y: [s('x', 'y', 2), s('x:k', 'x', 4)] });
+  assert.deepEqual(ids(gx.top), ['x']);
+  assert.deepEqual(ids(gx.children.get('x') ?? []), ['x:k', 'y']);
+  const placed = [...ids(gx.top), ...[...gx.children.values()].flatMap(ids)].sort();
+  assert.deepEqual(placed, ids(cyc).sort());
+  // перенесённая сессия уносит свою группу: у `q` в окне свой субагент `q:z`
+  const withGroup = [s('p', null, 10, 50), s('q', 'p:a1', 20, 45), s('q:z', 'q', 21, 44)];
+  const gq = groupSessions(withGroup, { p: [s('p:a1', 'p', 15, 16), s('q', 'p:a1', 20, 45), s('q:z', 'q', 21, 44)] });
+  assert.deepEqual(ids(gq.top), ['p']);
+  assert.deepEqual(ids(gq.children.get('p') ?? []), ['q', 'q:z', 'p:a1']);
+  assert.equal(gq.children.get('q'), undefined);
+});
+
 test('sessions_partial_count_at_window_edge', () => {
   const items = [s('new', null, 100, 120), s('old', null, 10, 90), s('mid', null, 60, 95)];
   // окно не полное — числа точные

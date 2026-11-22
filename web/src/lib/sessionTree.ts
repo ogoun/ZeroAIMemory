@@ -44,8 +44,11 @@ const fresh = (a: TreeSession, b: TreeSession) =>
 /**
  * Группы списка `items` (свежие первыми): верхний уровень — сессии, которые сами себе корень
  * ([`rootOf`]); потомки (субагенты и их субагенты) — под корнем, внук — под тем же корнем, что и
- * его родитель. `fetched` — потомки, дочитанные по `GET /sessions?parent=<корень>`: дополняют
- * группу корня сессиями вне списка (повторы id и сам корень не входят).
+ * его родитель. `fetched` — потомки, дочитанные по `GET /sessions?parent=<корень>` (сервер отдаёт
+ * всех потомков без самой сессии): дополняют группу корня сессиями вне списка, а сессию списка
+ * верхнего уровня, которая по ответу сервера — потомок корня (внук, чей родитель вне окна; сессия
+ * цикла), переносят под корень вместе с её группой (ревью задачи 9, круг 2: число группы — как у
+ * сервера). Сам корень и повторы id не входят; сессия, уже стоящая под другим корнем, остаётся там.
  */
 export function groupSessions<S extends TreeSession>(items: S[], fetched: Record<string, S[]> = {}): Grouped<S> {
   const byId = new Map(items.map((s) => [s.id, s] as const));
@@ -56,15 +59,32 @@ export function groupSessions<S extends TreeSession>(items: S[], fetched: Record
     if (r === s.id) top.push(s);
     else children.set(r, [...(children.get(r) ?? []), s]);
   }
+  const topIds = new Set(top.map((s) => s.id));
   for (const root of top) {
-    const more = (fetched[root.id] ?? []).filter((s) => s.id !== root.id && !byId.has(s.id));
-    if (!more.length) continue;
-    const seen = new Set<string>();
-    const all = [...(children.get(root.id) ?? []), ...more].filter((s) => !seen.has(s.id) && !!seen.add(s.id));
-    children.set(root.id, all);
+    const list = fetched[root.id];
+    // перенесённый под другой корень — уже не корень
+    if (!list || !topIds.has(root.id)) continue;
+    const group = children.get(root.id) ?? [];
+    const have = new Set(group.map((s) => s.id));
+    const add = (s: S) => {
+      if (s.id === root.id || have.has(s.id)) return;
+      have.add(s.id);
+      group.push(s);
+    };
+    for (const f of list) {
+      const own = byId.get(f.id);
+      if (!own) add(f);
+      else if (f.id !== root.id && topIds.has(f.id)) {
+        topIds.delete(f.id);
+        add(own);
+        for (const c of children.get(f.id) ?? []) add(c);
+        children.delete(f.id);
+      }
+    }
+    if (group.length) children.set(root.id, group);
   }
   for (const list of children.values()) list.sort(fresh);
-  return { top, children };
+  return { top: top.filter((s) => topIds.has(s.id)), children };
 }
 
 /**
