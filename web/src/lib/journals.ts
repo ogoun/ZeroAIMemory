@@ -34,6 +34,19 @@ export { JOURNAL_OF_KIND, entryRef } from './entryRefs';
 /** Колонки доски задач (M4.5 §3) и подписи. */
 export const TASK_COLUMNS: EntryStatus[] = ['open', 'in_progress', 'blocked', 'done', 'dropped'];
 
+/**
+ * Вкладка доски задач в узкой области (M7.2, спецификация §5.2 п. 1, решение 18): статус задачи из
+ * адреса, иначе «в работе», а если в работе задач нет — «открыт». Числа — `entries/counts` с
+ * фильтрами доски; не пришли (`null`) — «в работе».
+ */
+export function boardTab(counts: Partial<Record<EntryStatus, number>> | null, status: EntryStatus | null = null): EntryStatus {
+  if (status && TASK_COLUMNS.includes(status)) return status;
+  return counts && !counts.in_progress ? 'open' : 'in_progress';
+}
+
+/** Подпись статуса с заглавной буквы: вкладки доски («В работе»). */
+export const capitalized = (s: string): string => (s ? s[0].toUpperCase() + s.slice(1) : s);
+
 /** `data.decision` (ADR, M4.5 §5.1) insight `decision`: поля формы. */
 export interface Adr {
   context: string;

@@ -2,7 +2,7 @@
 // задача, добавившая страницу или журнал, дописывает её сюда — перед последним элементом или на
 // своё место (не в хвост: параллельные задачи иначе правят одну строку).
 import { expect, type Page } from '@playwright/test';
-import { SOLUTION_GUID } from './seed';
+import { IDEAS_GUID, SOLUTION_GUID } from './seed';
 
 /** Контекст адреса: свой пользователь сессии, решение E2E и переменные `E2E_*` global-setup. */
 export interface PageCtx {
@@ -25,6 +25,10 @@ export interface MobilePage {
 export const PAGES: MobilePage[] = [
   { name: 'стартовая', path: (c) => `#/u/${c.user}` },
   { name: 'документ', path: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}` },
+  // журналы «список — карточка» и доска задач (задача 2, §5.2 пп. 1–3)
+  { name: 'задачи', path: (c) => `#/u/${c.user}/s/${c.solution}/j/tasks` },
+  { name: 'идеи', path: (c) => `#/u/${c.user}/s/${IDEAS_GUID}/j/ideas` },
+  { name: 'insights', path: (c) => `#/u/${c.user}/s/${c.solution}/j/insights` },
   { name: 'журнал', path: (c) => `#/u/${c.user}/s/${c.solution}/j/glossary` },
 ];
 

@@ -6,11 +6,22 @@
   // агента (`X-Zam-Session`), у WebUI сессии агента нет. План работ (M6.5 §9): у задачи из идеи —
   // пометка «из идеи w:<id> «…»» со ссылкой на идею (поле `idea`, в карточке — все её идеи),
   // кнопка «Из идей» — только такие задачи (`from_idea=1` на сервере).
+  //
+  // Раскладка (M7.2, спецификация §5.2 п. 1) — по ширине своей области: от BOARD_MIN — колонки
+  // статусов (`data-board="columns"`), карточка — панель поверх доски (`JournalSplit` `overlay`);
+  // уже — вкладки статусов с числами (`StatusTabs`, `data-board="tabs"`), карточка — вместо доски
+  // («← Задачи»). Каждый статус — свой запрос (`status=<s>`, по 50, «Показать ещё» у колонки или
+  // вкладки, решение 19); на вкладках грузится только выбранная. Числа колонок и вкладок —
+  // `entries/counts` сервера, с фильтром «Из идей». Вкладка по умолчанию — «В работе», при пустой —
+  // «Открыт»; задача, открытая из адреса, выбирает вкладку своего статуса (решение 18).
   import { untrack } from 'svelte';
   import FileRefs from './FileRefs.svelte';
+  import JournalSplit from './JournalSplit.svelte';
+  import StatusTabs from './StatusTabs.svelte';
   import {
     ApiError,
     createEntry,
+    entryCounts,
     errorText,
     getEntry,
     isStaleEntry,
@@ -21,8 +32,21 @@
     type EntryStatus,
   } from '../lib/api';
   import { loadRefs, staleOf, type RefsByTarget } from '../lib/fileRefs';
-  import { AUTHOR_TEXT, STATUS_TEXT, TASK_COLUMNS, entryRef, entryStatusText, fmtTime } from '../lib/journals';
+  import {
+    AUTHOR_TEXT,
+    JOURNAL_TITLE,
+    STATUS_TEXT,
+    TASK_COLUMNS,
+    boardTab,
+    capitalized,
+    entryRef,
+    entryStatusText,
+    fmtTime,
+  } from '../lib/journals';
+  import { BOARD_MIN } from '../lib/layout';
+  import { TASK_FORMS } from '../lib/plural';
   import { go, href } from '../lib/router';
+  import { observeWidth } from '../lib/viewport.svelte';
 
   interface Props {
     user: string;
@@ -33,16 +57,43 @@
 
   let { user, space, entry, onexpired }: Props = $props();
 
-  const PAGE = 200;
+  /** Задач статуса на страницу (решение 19). */
+  const PAGE = 50;
 
-  let items = $state<Entry[]>([]);
-  let next = $state<string | null>(null);
-  let loading = $state(false);
-  let error = $state('');
+  /** Колонка (вкладка) статуса: загруженные задачи, курсор, состояние запроса. */
+  interface Column {
+    items: Entry[];
+    next: string | null;
+    loading: boolean;
+    loaded: boolean;
+    error: string;
+  }
+  const emptyColumn = (): Column => ({ items: [], next: null, loading: false, loaded: false, error: '' });
+  const emptyColumns = () => Object.fromEntries(TASK_COLUMNS.map((s) => [s, emptyColumn()])) as Record<EntryStatus, Column>;
+
+  let cols = $state(emptyColumns());
+  /** Номер последнего запроса колонки: ответ устаревшего запроса не применяется. */
+  const cseq: Partial<Record<EntryStatus, number>> = {};
+  /** Число задач по статусам (`entries/counts`, с «Из идей»); `null` — ещё не пришло. */
+  let counts = $state<Partial<Record<EntryStatus, number>> | null>(null);
+  let countsFailed = $state(false);
+  let kseq = 0;
   let refs = $state<RefsByTarget>(new Map());
   /** Только задачи из идей (пункты плана). */
   let fromIdea = $state(false);
-  let seq = 0;
+
+  /** Ширина области доски (CSS px); 0 — ещё не измерена. */
+  let width = $state(0);
+  let board = $derived<'columns' | 'tabs' | null>(width === 0 ? null : width >= BOARD_MIN ? 'columns' : 'tabs');
+  /** Выбранная вкладка; `null` — ещё не выбрана (ждём числа и запись из адреса). */
+  let tab = $state<EntryStatus | null>(null);
+  /** Задача, по статусу которой уже выбрана вкладка: правка статуса вкладку не меняет. */
+  let tabFor = '';
+  /** Статусы на экране: колонки — все, вкладки — выбранная. */
+  let visible = $derived<EntryStatus[]>(board === 'columns' ? TASK_COLUMNS : board === 'tabs' && tab ? [tab] : []);
+  let total = $derived(counts ? TASK_COLUMNS.reduce((n, s) => n + (counts?.[s] ?? 0), 0) : null);
+  /** Ошибка загрузки видимых статусов — одна на доску. */
+  let boardError = $derived(visible.map((s) => cols[s].error).find(Boolean) ?? '');
 
   let cur = $state<Entry | null>(null);
   let curError = $state('');
@@ -66,15 +117,52 @@
     set(errorText(e));
   }
 
+  // Доска — заново только при смене пользователя или пространства: свойства приходят из объекта
+  // маршрута, и эффект перезапускается на каждый переход (открытие задачи) — вкладка, загруженные
+  // страницы и прокрутка при этом целы (§5.1 п. 5). Неудавшиеся запросы повторяются при следующем
+  // переходе.
+  let listOf = '';
   $effect(() => {
     const u = user;
     const s = space;
     untrack(() => {
-      fromIdea = false;
-      load(u, s, true);
-      loadRefs(u, s).then((r) => {
-        if (u === user && s === space) refs = r;
-      });
+      if (listOf !== `${u}|${s}`) {
+        listOf = `${u}|${s}`;
+        fromIdea = false;
+        tab = null;
+        tabFor = '';
+        resetBoard();
+        loadRefs(u, s).then((r) => {
+          if (u === user && s === space) refs = r;
+        });
+        return;
+      }
+      if (countsFailed) loadCounts();
+      for (const st of visible) if (cols[st].error) loadColumn(st, true);
+    });
+  });
+
+  // Видимые статусы загружены: колонки — все, вкладки — выбранная (прочие — при выборе).
+  $effect(() => {
+    const vis = visible;
+    const c = cols;
+    untrack(() => {
+      for (const s of vis) if (!c[s].loaded && !c[s].loading && !c[s].error) loadColumn(s, true);
+    });
+  });
+
+  // Вкладка по умолчанию — когда пришли числа (и запись из адреса, если она есть).
+  $effect(() => {
+    if (board !== 'tabs' || tab !== null) return;
+    const c = counts;
+    const failed = countsFailed;
+    const e = cur;
+    const ce = curError;
+    if (c === null && !failed) return;
+    if (entry && !e && !ce) return;
+    untrack(() => {
+      if (e) tabFor = e.id;
+      tab = boardTab(c, e?.status ?? null);
     });
   });
 
@@ -84,22 +172,80 @@
     untrack(() => open(u, id));
   });
 
-  async function load(u: string, s: string, reset: boolean) {
-    const my = ++seq;
-    loading = true;
-    error = '';
+  /** Всё заново: числа и колонки (видимые загрузит эффект выше). */
+  function resetBoard() {
+    for (const s of TASK_COLUMNS) cseq[s] = (cseq[s] ?? 0) + 1;
+    cols = emptyColumns();
+    counts = null;
+    countsFailed = false;
+    loadCounts();
+  }
+
+  async function loadCounts() {
+    const my = ++kseq;
     try {
-      const r = await listEntries(u, s, { kind: 'task', fromIdea, cursor: reset ? null : next, limit: PAGE });
-      if (my !== seq) return;
-      items = reset ? r.items : [...items, ...r.items];
-      next = r.next_cursor;
+      const c = await entryCounts(user, space, { kind: 'task', fromIdea });
+      if (my !== kseq) return;
+      counts = c;
+      countsFailed = false;
     } catch (e) {
-      if (my !== seq) return;
-      if (reset) items = [];
-      fail(e, (m) => (error = m));
-    } finally {
-      if (my === seq) loading = false;
+      // без чисел доска работает; 401 — сессия кончилась
+      if (my !== kseq) return;
+      countsFailed = true;
+      if (e instanceof ApiError && e.status === 401) onexpired();
     }
+  }
+
+  /** Страница задач статуса `s`: первая (`reset`) или следующая по курсору. */
+  async function loadColumn(s: EntryStatus, reset: boolean) {
+    const c = cols[s];
+    const my = (cseq[s] = (cseq[s] ?? 0) + 1);
+    c.loading = true;
+    c.error = '';
+    try {
+      const r = await listEntries(user, space, {
+        kind: 'task',
+        status: [s],
+        fromIdea,
+        cursor: reset ? null : c.next,
+        limit: PAGE,
+      });
+      if (my !== cseq[s]) return;
+      c.items = reset ? r.items : [...c.items, ...r.items];
+      c.next = r.next_cursor;
+      c.loaded = true;
+    } catch (e) {
+      if (my !== cseq[s]) return;
+      if (reset) {
+        c.items = [];
+        c.next = null;
+        c.loaded = false;
+      }
+      fail(e, (m) => (c.error = m));
+    } finally {
+      if (my === cseq[s]) c.loading = false;
+    }
+  }
+
+  /** После правки: числа и видимые статусы — заново (задача могла сменить колонку), прочие
+   * вкладки — при следующем выборе. */
+  async function reloadBoard() {
+    const vis = visible;
+    for (const s of TASK_COLUMNS) {
+      if (vis.includes(s)) continue;
+      cseq[s] = (cseq[s] ?? 0) + 1;
+      cols[s] = emptyColumn();
+    }
+    await Promise.all([loadCounts(), ...vis.map((s) => loadColumn(s, true))]);
+  }
+
+  function more(s: EntryStatus) {
+    if (!cols[s].loading) loadColumn(s, false);
+  }
+
+  function selectTab(s: EntryStatus) {
+    tab = s;
+    if (cols[s].error) loadColumn(s, true);
   }
 
   async function open(u: string, id: string | null) {
@@ -121,6 +267,11 @@
       }
       cur = e;
       stepDraft = str(e.data, 'next_step');
+      // запись из адреса — вкладка её статуса; правка статуса из карточки вкладку не меняет
+      if (e.id !== tabFor && e.status && TASK_COLUMNS.includes(e.status)) {
+        tabFor = e.id;
+        tab = e.status;
+      }
     } catch (e) {
       if (my !== eseq) return;
       cur = null;
@@ -149,11 +300,11 @@
     return m % 60 ? `${h} ч ${m % 60} мин` : `${h} ч`;
   };
 
-  let columns = $derived(TASK_COLUMNS.map((s) => ({ status: s, tasks: items.filter((t) => t.status === s) })));
+  let tabs = $derived(TASK_COLUMNS.map((s) => ({ id: s, title: capitalized(STATUS_TEXT[s]), count: counts?.[s] })));
 
   function toggleFromIdea() {
     fromIdea = !fromIdea;
-    load(user, space, true);
+    resetBoard();
   }
 
   /** Ссылка на идею задачи: идея в пространстве задачи — в нём же, иначе — Knowledge (задача
@@ -161,9 +312,19 @@
   const ideaHref = (t: Entry, id: string, ideaSpace: string) =>
     href({ name: 'journal', user, space: ideaSpace === t.space_id ? space : 'knowledge', journal: 'ideas', entry: id });
 
+  /** Открыть задачу: новая запись истории — «назад» браузера возвращает к доске (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
-    go({ name: 'journal', user, space, journal: 'tasks', entry: id }, { replace: true });
+    go({ name: 'journal', user, space, journal: 'tasks', entry: id });
+  }
+
+  /** Карточка или форма показана (панелью поверх доски или вместо неё). */
+  let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create');
+
+  /** Закрыли карточку («← Задачи», фон, Esc): форма новой задачи закрывается здесь. */
+  function closeDetail() {
+    mode = 'none';
+    actionError = '';
   }
 
   async function act(fn: () => Promise<string | void>, done: string) {
@@ -174,7 +335,7 @@
     try {
       const target = (await fn()) ?? cur?.id ?? null;
       mode = 'none';
-      await load(user, space, true);
+      await reloadBoard();
       if (target && target !== entry) select(target);
       else await open(user, target);
       notice = done;
@@ -270,48 +431,84 @@
   }
 </script>
 
-<section class="journal tasks">
+<section class="journal tasks" data-board={board ?? undefined} use:observeWidth={(w) => (width = w)}>
+  <!-- широкая область — колонки и карточка-панель поверх доски, узкая — вкладки и карточка вместо
+       доски (§5.2 п. 1) -->
+  <JournalSplit
+    open={detailOpen}
+    mode="overlay"
+    back={{ href: href({ name: 'journal', user, space, journal: 'tasks', entry: null }), label: JOURNAL_TITLE.tasks }}
+    label={mode === 'create' && !cur ? 'Новая задача' : 'Задача'}
+    onclose={closeDetail}
+    {entry}
+  >
+    {#snippet list()}
+      {@render boardView()}
+    {/snippet}
+    {#snippet detail()}
+      {@render taskDetail()}
+    {/snippet}
+  </JournalSplit>
+</section>
+
+{#snippet boardView()}
   <div class="row bar">
     <button type="button" class="primary" onclick={startCreate}>Новая задача</button>
     <button type="button" class="toggle" aria-pressed={fromIdea} onclick={toggleFromIdea} title="Только задачи из идей — пункты плана работ">Из идей</button>
   </div>
 
-  {#if error}<p class="error" role="alert">{error}</p>{/if}
-  {#if loading}<p class="muted">Загрузка…</p>{/if}
-  {#if !loading && items.length === 0 && !error}<p class="muted">{fromIdea ? 'Задач из идей нет.' : 'Задач нет.'}</p>{/if}
+  {#if boardError}<p class="error" role="alert">{boardError}</p>{/if}
+  {#if total === 0 && !boardError}<p class="muted">{fromIdea ? 'Задач из идей нет.' : 'Задач нет.'}</p>{/if}
 
   <div class="board" role="group" aria-label="Доска задач">
-    {#each columns as col (col.status)}
-      <section class="col" aria-label="Задачи: {STATUS_TEXT[col.status]}" data-status={col.status}>
-        <h2>{STATUS_TEXT[col.status]} <span class="muted small">{col.tasks.length}</span></h2>
-        {#each col.tasks as t (t.id)}
-          {@const claim = claimOf(t)}
-          {@const stale = staleOf(refs.get(entryRef('task', t.id)))}
-          <article class="task" class:selected={t.id === entry} data-task={t.id}>
-            <button type="button" class="link title" onclick={() => select(t.id)}>{t.title}</button>
-            {#if t.idea}
-              <a class="small from-idea" href={ideaHref(t, t.idea.id, t.idea.space_id)} data-testid="from-idea">
-                из идеи {entryRef('idea', t.idea.id)} «{t.idea.title}»{#if (t.ideas?.length ?? 1) > 1}&nbsp;и ещё {(t.ideas?.length ?? 1) - 1}{/if}
-              </a>
-            {/if}
-            {#if str(t.data, 'next_step')}<div class="small">Дальше: {str(t.data, 'next_step')}</div>{/if}
-            {#if t.status === 'blocked' && str(t.data, 'blocked_by')}
-              <div class="small blocked">Блокер: {str(t.data, 'blocked_by')}</div>
-            {/if}
-            {#if claim}<div class="claim small">{claimText(claim)}</div>{/if}
-            {#if t.status === 'done' && t.duration_min !== undefined && t.duration_min !== null}
-              <div class="muted small">длительность {durationText(t.duration_min)}</div>
-            {/if}
-            {#if stale.length}<div class="badge small">возможно устарело</div>{/if}
-          </article>
+    {#if board === 'columns'}
+      <div class="columns">
+        {#each TASK_COLUMNS as s (s)}
+          <section class="col" aria-label="Задачи: {STATUS_TEXT[s]}" data-status={s}>
+            <h2>{STATUS_TEXT[s]} <span class="muted small">{counts?.[s] ?? ''}</span></h2>
+            {@render tasksOf(s)}
+          </section>
         {/each}
-      </section>
-    {/each}
+      </div>
+    {:else if board === 'tabs'}
+      <StatusTabs label="Статусы задач" {tabs} selected={tab ?? ''} onselect={(id) => selectTab(id as EntryStatus)} noun={TASK_FORMS}>
+        {#if tab}{@render tasksOf(tab)}{:else}<p class="muted small">Загрузка…</p>{/if}
+      </StatusTabs>
+    {/if}
   </div>
-  {#if next && !loading}
-    <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
-  {/if}
+{/snippet}
 
+{#snippet tasksOf(s: EntryStatus)}
+  {@const c = cols[s]}
+  {#if c.loading && !c.loaded}<p class="muted small">Загрузка…</p>{/if}
+  {#if board === 'tabs' && c.loaded && c.items.length === 0 && total !== 0}<p class="muted small">Задач нет.</p>{/if}
+  {#each c.items as t (t.id)}
+    {@const claim = claimOf(t)}
+    {@const stale = staleOf(refs.get(entryRef('task', t.id)))}
+    <article class="task" class:selected={t.id === entry} data-task={t.id} data-entry={t.id}>
+      <button type="button" class="link title" onclick={() => select(t.id)}>{t.title}</button>
+      {#if t.idea}
+        <a class="small from-idea" href={ideaHref(t, t.idea.id, t.idea.space_id)} data-testid="from-idea">
+          из идеи {entryRef('idea', t.idea.id)} «{t.idea.title}»{#if (t.ideas?.length ?? 1) > 1}&nbsp;и ещё {(t.ideas?.length ?? 1) - 1}{/if}
+        </a>
+      {/if}
+      {#if str(t.data, 'next_step')}<div class="small">Дальше: {str(t.data, 'next_step')}</div>{/if}
+      {#if t.status === 'blocked' && str(t.data, 'blocked_by')}
+        <div class="small blocked">Блокер: {str(t.data, 'blocked_by')}</div>
+      {/if}
+      {#if claim}<div class="claim small">{claimText(claim)}</div>{/if}
+      {#if t.status === 'done' && t.duration_min !== undefined && t.duration_min !== null}
+        <div class="muted small">длительность {durationText(t.duration_min)}</div>
+      {/if}
+      {#if stale.length}<div class="badge small">возможно устарело</div>{/if}
+    </article>
+  {/each}
+  {#if c.next && !c.loading}
+    <button type="button" class="more" onclick={() => more(s)}>Показать ещё</button>
+  {/if}
+{/snippet}
+
+{#snippet taskDetail()}
   {#if curError}<p class="error" role="alert">{curError}</p>{/if}
   {#if cur}
     {@const c = cur}
@@ -390,7 +587,7 @@
       {@render formEnd('Добавить')}
     </form>
   {/if}
-</section>
+{/snippet}
 
 {#snippet formEnd(label: string)}
   {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
@@ -419,13 +616,14 @@
     align-items: center;
     overflow-wrap: anywhere;
   }
-  .board {
+  .columns {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
     gap: 10px;
     align-items: start;
   }
   .col {
+    min-width: 0;
     padding: 8px;
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -445,6 +643,9 @@
   }
   .task.selected {
     background: var(--selected);
+  }
+  .more {
+    margin-top: 2px;
   }
   .link {
     padding: 0;
@@ -477,7 +678,7 @@
     font-size: 12px;
   }
   .card {
-    margin-top: 16px;
+    margin-top: 4px;
   }
   .card h2 {
     margin: 0 0 4px;
@@ -522,8 +723,9 @@
   .small {
     font-size: 12px;
   }
+  /* в панели и на телефоне кнопка переносится под поле, а не сжимает его */
   input[aria-label='Следующий шаг'] {
-    flex: 1;
-    min-width: 200px;
+    flex: 1 1 200px;
+    min-width: 0;
   }
 </style>
