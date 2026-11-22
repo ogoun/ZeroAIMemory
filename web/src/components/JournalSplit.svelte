@@ -5,11 +5,14 @@
   //   карточка `position: sticky` со своей прокруткой; без открытой карточки список — во всю ширину;
   // - `stack` (уже): открытая карточка или форма — вместо списка, над ней «← <журнал>» (ссылка
   //   журнала без записи, `onclose` — тоже). Список скрыт, но не размонтирован: фильтры, вкладки и
-  //   загруженные страницы целы; позиция прокрутки запоминается и восстанавливается, фокус — на
-  //   первый заголовок карточки при открытии и на нажатую строку списка при возврате;
+  //   загруженные страницы целы; позиция прокрутки запоминается и восстанавливается;
   // - `overlay` (`mode='overlay'`, область ≥ SPLIT_MIN): карточка-панель поверх доски — делает и
   //   проверяет задача 2 M7.2; уже SPLIT_MIN — `stack`.
-  // Атрибут `data-layout` — текущая раскладка (для e2e).
+  // Фокус переходит только при открытии записи или формы (и при смене записи — `entry`): в `stack`
+  // — на первый заголовок карточки, при возврате «←» — на нажатую строку списка, иначе на строку
+  // записи (`[data-entry="<entry>"]` в списке), иначе на сам список. Смена раскладки при открытой
+  // карточке (поворот, изменение окна) фокус не трогает, а прокрутку — только если фокус не в
+  // карточке. Атрибут `data-layout` — текущая раскладка (для e2e).
   import { tick, untrack, type Snippet } from 'svelte';
   import { SPLIT_MIN } from '../lib/layout';
   import { observeWidth } from '../lib/viewport.svelte';
@@ -22,11 +25,13 @@
     mode?: 'auto' | 'overlay';
     /** Карточку закрыли («←» в `stack`). */
     onclose?: () => void;
+    /** id открытой записи: смена — новая карточка; строка списка помечена `data-entry` с ним. */
+    entry?: string | null;
     list: Snippet;
     detail: Snippet;
   }
 
-  let { open, back, mode = 'auto', onclose, list, detail }: Props = $props();
+  let { open, back, mode = 'auto', onclose, entry = null, list, detail }: Props = $props();
 
   /** Ширина области; 0 — ещё не измерена (первое значение приходит до отрисовки). */
   let width = $state(0);
@@ -42,8 +47,16 @@
 
   /** Показана ли карточка вместо списка (после замера ширины): переходы — по смене. */
   let shown = false;
-  /** Что вернуть при возврате к списку. */
-  let saved: { top: number; focus: HTMLElement | null } | null = null;
+  /** Предыдущие `open` и `entry` — что открыли заново. */
+  let wasOpen = false;
+  let lastEntry: string | null = null;
+  /** Карточку открыли (или сменили запись), а фокус ещё не переведён. */
+  let fresh = false;
+  /** Запись, показанная вместо списка последней (строка для фокуса при возврате). */
+  let shownEntry: string | null = null;
+  /** Что вернуть при возврате к списку: прокрутка (`null` — список ушёл при смене раскладки),
+   * нажатая строка, запись, открытая из списка. */
+  let saved: { top: number | null; focus: HTMLElement | null; entry: string | null } | null = null;
   /** Последний нажатый элемент списка: Safari не даёт кнопке фокус по нажатию. */
   let activated: HTMLElement | null = null;
 
@@ -61,34 +74,70 @@
     if (t) activated = t;
   }
 
-  // До скрытия списка — его прокрутка и элемент, к которому вернуть фокус.
+  const inList = (x: Element | null): x is HTMLElement => x instanceof HTMLElement && !!listEl?.contains(x);
+  /** Другая запись. Уход записи из адреса (`null`) — закрытие, а не новая карточка: адрес
+   * меняется раньше, чем журнал закрывает карточку (`open`), и миг «открыта без записи» не должен
+   * переводить фокус. */
+  const isNewRecord = (e: string | null) => e !== null && e !== lastEntry;
+  const focusInDetail = () => !!detailEl?.contains(document.activeElement);
+
+  // До скрытия списка — его прокрутка и элемент, к которому вернуть фокус. Открытие записи —
+  // запоминается всё; смена раскладки при открытой карточке — только запись.
   $effect.pre(() => {
     const r = replaced && width > 0;
+    const o = open;
+    const e = entry;
     untrack(() => {
       if (!r || shown) return;
+      const opening = fresh || (o && (!wasOpen || isNewRecord(e)));
       const a = document.activeElement;
-      const inList = (x: Element | null): x is HTMLElement => x instanceof HTMLElement && !!listEl?.contains(x);
-      saved = { top: scroller().scrollTop, focus: inList(a) ? a : inList(activated) ? activated : null };
+      saved = opening
+        ? { top: scroller().scrollTop, focus: inList(a) ? a : inList(activated) ? activated : null, entry: e }
+        : { top: null, focus: null, entry: e };
     });
   });
 
   $effect(() => {
-    const r = replaced && width > 0;
+    const o = open;
+    const e = entry;
+    const measured = width > 0;
+    const r = replaced && measured;
     untrack(() => {
-      if (r === shown) return;
-      shown = r;
-      void (r ? showCard() : showList());
+      if (o && (!wasOpen || isNewRecord(e))) fresh = true;
+      if (!o) fresh = false;
+      wasOpen = o;
+      lastEntry = e;
+      if (r !== shown) {
+        shown = r;
+        if (r) {
+          void showCard(fresh);
+          fresh = false;
+        } else {
+          void showList(!o);
+        }
+      } else if (r && fresh) {
+        // другая запись в `stack` (переход из карточки): её верх и заголовок
+        void showCard(true);
+        fresh = false;
+      } else if (o && measured) {
+        // карточка рядом со списком: переводить фокус не нужно, позже сужение его не отнимет
+        fresh = false;
+      }
     });
   });
 
-  /** Карточка вместо списка: её верх — в видимой области под шапкой, фокус — на заголовок. */
-  async function showCard() {
+  /** Карточка вместо списка: при открытии — её верх в видимой области под шапкой и фокус на
+   * заголовке; при смене раскладки — фокус на месте, прокрутка — если фокус не в карточке. */
+  async function showCard(opening: boolean) {
+    shownEntry = entry;
     await tick();
     const d = detailEl;
     if (!d) return;
+    if (!opening && focusInDetail()) return;
     const top = d.getBoundingClientRect().top;
     const margin = parseFloat(getComputedStyle(d).scrollMarginTop) || 0;
     if (top < margin || top > window.innerHeight - 120) d.scrollIntoView({ block: 'start' });
+    if (!opening) return;
     const h = d.querySelector<HTMLElement>('h1, h2, h3');
     if (h) {
       if (!h.hasAttribute('tabindex')) h.tabIndex = -1;
@@ -96,14 +145,40 @@
     }
   }
 
-  /** Список снова на месте: прежняя прокрутка; закрыли карточку — фокус на её строку. */
-  async function showList() {
+  /** Список снова на месте. Закрыли карточку — прежняя прокрутка и фокус на строку: нажатую,
+   * иначе строку записи, иначе сам список. Раскладка сменилась при открытой карточке — фокус на
+   * месте, прокрутка восстанавливается, только если фокус не в карточке. */
+  async function showList(closing: boolean) {
     const s = saved;
     saved = null;
     await tick();
     if (!s) return;
-    scroller().scrollTop = s.top;
-    if (!open && s.focus?.isConnected) s.focus.focus({ preventScroll: true });
+    const sc = scroller();
+    if (!closing) {
+      if (s.top !== null && !focusInDetail()) sc.scrollTop = s.top;
+      return;
+    }
+    const same = shownEntry === s.entry;
+    if (same && s.focus?.isConnected) {
+      if (s.top !== null) sc.scrollTop = s.top;
+      s.focus.focus({ preventScroll: true });
+      return;
+    }
+    const row = shownEntry ? listEl?.querySelector<HTMLElement>(`[data-entry="${CSS.escape(shownEntry)}"]`) : null;
+    const target = row
+      ? (row.matches('a[href], button') ? row : row.querySelector<HTMLElement>('a[href], button')) ?? row
+      : null;
+    if (target) {
+      target.scrollIntoView({ block: 'center' });
+      if (!target.matches('a[href], button, [tabindex]')) target.tabIndex = -1;
+      target.focus({ preventScroll: true });
+      return;
+    }
+    if (s.top !== null) sc.scrollTop = s.top;
+    if (listEl) {
+      if (!listEl.hasAttribute('tabindex')) listEl.tabIndex = -1;
+      listEl.focus({ preventScroll: true });
+    }
   }
 </script>
 

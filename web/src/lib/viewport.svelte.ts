@@ -46,11 +46,14 @@ export const observeWidth: Action<HTMLElement, (w: number) => void> = (node, cb)
 /**
  * Полоса (`.strip`, прокрутка вбок): выбранный пункт (`aria-current="page"` или
  * `aria-selected="true"`) — в видимой части полосы. `key` — что выбрано: смена прокручивает
- * полосу снова. Страница при этом не прокручивается.
+ * полосу снова; изменение ширины полосы (поворот, окно) — тоже. Страница при этом не
+ * прокручивается.
  */
 export const revealSelected: Action<HTMLElement, unknown> = (node) => {
-  const reveal = () =>
-    requestAnimationFrame(() => {
+  let frame = 0;
+  const reveal = () => {
+    cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(() => {
       const el = node.querySelector<HTMLElement>('[aria-current="page"], [aria-selected="true"]');
       if (!el || node.scrollWidth <= node.clientWidth) return;
       // координаты пункта внутри прокручиваемого содержимого полосы
@@ -61,6 +64,15 @@ export const revealSelected: Action<HTMLElement, unknown> = (node) => {
       // не целиком видим — к началу пункта: там же точка привязки прокрутки (`scroll-snap-align`)
       if (left < node.scrollLeft || right > node.scrollLeft + node.clientWidth) node.scrollLeft = left;
     });
-  reveal();
-  return { update: reveal };
+  };
+  // первое наблюдение приходит сразу — оно же и первый показ
+  const ro = new ResizeObserver(reveal);
+  ro.observe(node);
+  return {
+    update: reveal,
+    destroy() {
+      ro.disconnect();
+      cancelAnimationFrame(frame);
+    },
+  };
 };

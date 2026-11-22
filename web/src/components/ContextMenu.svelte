@@ -21,11 +21,12 @@
   let pos = $state({ left: 0, top: 0 });
   let placed = $state(false);
 
-  // Меню не выходит за край окна; фокус — на первый пункт.
+  // Меню не выходит за край окна; фокус — на первый пункт, когда меню уже видимо (пункт с
+  // `visibility: hidden` фокус не принимает — тогда не работали бы ни стрелки, ни Esc).
   $effect(() => {
     void x;
     void y;
-    tick().then(() => {
+    tick().then(async () => {
       if (!el) return;
       const r = el.getBoundingClientRect();
       pos = {
@@ -33,7 +34,8 @@
         top: Math.max(4, Math.min(y, window.innerHeight - r.height - 4)),
       };
       placed = true;
-      el.querySelector<HTMLButtonElement>('button')?.focus();
+      await tick();
+      el?.querySelector<HTMLButtonElement>('button')?.focus();
     });
   });
 

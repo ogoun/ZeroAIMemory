@@ -33,6 +33,33 @@ export async function noHorizontalScroll(page: Page): Promise<boolean> {
   });
 }
 
+/**
+ * Соседние цели одного ряда (общий родитель, пересечение по высоте) — не ближе `px` друг к другу
+ * по горизонтали (по `getBoundingClientRect`). Возвращает число проверенных пар.
+ */
+export async function minGap(locator: Locator, px = 8): Promise<number> {
+  const found = await locator.evaluateAll((els) => {
+    const rows = new Map<Element | null, DOMRect[]>();
+    for (const e of els) {
+      const r = e.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      rows.set(e.parentElement, [...(rows.get(e.parentElement) ?? []), r]);
+    }
+    const gaps: { gap: number; at: string }[] = [];
+    for (const rs of rows.values()) {
+      rs.sort((a, b) => a.left - b.left);
+      for (let i = 1; i < rs.length; i++) {
+        const [a, b] = [rs[i - 1], rs[i]];
+        if (b.top >= a.bottom || a.top >= b.bottom) continue;
+        gaps.push({ gap: b.left - a.right, at: `${Math.round(a.right)}…${Math.round(b.left)} y=${Math.round(a.top)}` });
+      }
+    }
+    return gaps;
+  });
+  for (const g of found) expect(g.gap, `${locator}: зазор ${g.at}`).toBeGreaterThanOrEqual(px - 0.5);
+  return found.length;
+}
+
 /** Каждый элемент `locator` отрисован и не меньше `px` × `px` (по `boundingBox`). */
 export async function minTarget(locator: Locator, px = 44): Promise<void> {
   const n = await locator.count();

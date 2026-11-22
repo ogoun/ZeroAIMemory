@@ -9,6 +9,7 @@
   // подписями, дерево — в панели; настольный — дерево постоянное (260 px до 1279, 300 px дальше).
   import { onMount, tick, untrack } from 'svelte';
   import DocView from '../components/DocView.svelte';
+  import AccountMenu from '../components/AccountMenu.svelte';
   import LazyFail from '../components/LazyFail.svelte';
   import Search from '../components/Search.svelte';
   import Tree, { type Reveal, type TreeChange } from '../components/Tree.svelte';
@@ -60,10 +61,8 @@
   /** Счётчик событий маршрута (повторный переход к тому же якорю тоже прокручивает). */
   let nav = $state(0);
   let searchOpen = $state(false);
-  let accountOpen = $state(false);
   let toggleEl = $state<HTMLButtonElement | null>(null);
   let sidebarEl = $state<HTMLElement | null>(null);
-  let accountEl = $state<HTMLElement | null>(null);
 
   async function loadUsers() {
     usersError = '';
@@ -116,7 +115,6 @@
       route = r;
       nav++;
       drawer = false;
-      accountOpen = false;
       // после администрирования список пользователей мог измениться
       if (wasAdmin && !isAdmin(r)) loadUsers();
     });
@@ -141,19 +139,22 @@
     });
   });
 
-  // меню аккаунта есть только на телефоне: при повороте шире оно закрывается
+  // Смена класса ширины (поворот, изменение окна) закрывает панель: на настольном её нет, а
+  // «Разделы» уходят из панели в шапку (или обратно) — фокус с исчезнувшей ссылки переходит на ☰
+  // (эффект выше). Меню аккаунта есть только на телефоне и закрывается само вместе с ним.
+  let widthShown = viewport.current;
   $effect(() => {
-    if (!phone) untrack(() => (accountOpen = false));
+    const c = viewport.current;
+    untrack(() => {
+      if (c === widthShown) return;
+      widthShown = c;
+      drawer = false;
+    });
   });
 
-  /** Меню аккаунта закрывается щелчком мимо него. */
-  function onpointerdown(e: PointerEvent) {
-    if (accountOpen && e.target instanceof Node && !accountEl?.contains(e.target)) accountOpen = false;
-  }
-
-  /** Фокус ушёл из меню аккаунта (Tab) — меню закрывается. */
-  function onaccountfocusout(e: FocusEvent) {
-    if (e.relatedTarget instanceof Node && !accountEl?.contains(e.relatedTarget)) accountOpen = false;
+  /** Щелчок по ссылке панели закрывает её, даже если адрес не меняется (текущий пункт). */
+  function onsidebarclick(e: MouseEvent) {
+    if (narrow && drawer && e.target instanceof Element && e.target.closest('a[href]')) drawer = false;
   }
 
   function onloaded(n: NodeInfo) {
@@ -218,14 +219,10 @@
       return;
     }
     if (e.key !== 'Escape' || e.defaultPrevented || searchOpen) return;
-    // Esc окна и меню (`role="dialog"`, `role="menu"`) закрывает их, а не панель
+    // Esc окна и меню (`role="dialog"`, `role="menu"`; меню аккаунта отмечает свой Esc
+    // обработанным) закрывает их, а не панель
     if (e.target instanceof Element && e.target.closest('[role="dialog"], [role="menu"]')) return;
-    if (accountOpen) {
-      accountOpen = false;
-      accountEl?.querySelector<HTMLElement>('button')?.focus();
-    } else if (drawer) {
-      drawer = false;
-    }
+    if (drawer) drawer = false;
   }
 
   /** Заголовок текущего раздела — в шапке телефона (разделы там — в панели). */
@@ -255,7 +252,6 @@
 </script>
 
 <svelte:window {onkeydown} />
-<svelte:document {onpointerdown} />
 
 <!-- Разделы: в шапке (на планшете — короткие подписи) или строками в панели телефона -->
 {#snippet sections(rows: boolean)}
@@ -308,24 +304,7 @@
     </button>
     {#if phone}
       <!-- меню аккаунта телефона: логин и «Выйти» (§5.1 п. 3) -->
-      <div class="account" bind:this={accountEl} onfocusout={onaccountfocusout}>
-        <button
-          type="button"
-          class="account-btn"
-          aria-label="Меню аккаунта"
-          aria-expanded={accountOpen}
-          aria-controls="account-menu"
-          onclick={() => (accountOpen = !accountOpen)}
-        >
-          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="7" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6" /><path d="M3.5 17.5c.8-3.6 3.4-5.4 6.5-5.4s5.7 1.8 6.5 5.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
-        </button>
-        {#if accountOpen}
-          <div id="account-menu" class="account-menu panel">
-            <span class="muted">{me.login}</span>
-            <button type="button" onclick={onlogout}>Выйти</button>
-          </div>
-        {/if}
-      </div>
+      <AccountMenu login={me.login} {onlogout} closeKey={nav} />
     {:else}
       <span class="who">
         <span class="muted login">{me.login}</span>
@@ -334,7 +313,8 @@
     {/if}
   </header>
 
-  <aside id="sidebar" class="sidebar" bind:this={sidebarEl} inert={narrow && !drawer}>
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+  <aside id="sidebar" class="sidebar" bind:this={sidebarEl} inert={narrow && !drawer} onclick={onsidebarclick}>
     {#if phone}
       <div class="drawer-heading" aria-hidden="true">Разделы</div>
       {@render sections(true)}
@@ -659,8 +639,7 @@
     align-items: center;
     gap: 8px;
   }
-  .drawer-toggle,
-  .account-btn {
+  .drawer-toggle {
     flex: none;
     display: none;
     place-items: center;
@@ -668,31 +647,10 @@
     border: 0;
     background: transparent;
   }
-  .drawer-toggle svg,
-  .account-btn svg {
+  .drawer-toggle svg {
     display: block;
     width: 20px;
     height: 20px;
-  }
-  .account {
-    position: relative;
-    flex: none;
-  }
-  .account-btn {
-    display: grid;
-  }
-  .account-menu {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
-    z-index: 35;
-    display: grid;
-    gap: 8px;
-    min-width: 200px;
-    max-width: calc(100vw - 16px);
-    padding: 12px;
-    overflow-wrap: anywhere;
-    box-shadow: 0 8px 24px rgb(0 0 0 / 0.18);
   }
   .sidebar {
     grid-area: side;
@@ -760,13 +718,18 @@
   }
 
   @media (pointer: coarse) {
+    /* разделы шапки в ряд — с зазором между целями (`--touch-gap`, app.css) */
+    .topnav:not(.rows) {
+      gap: var(--touch-gap);
+    }
     .topnav a {
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       min-height: 44px;
+      min-width: 44px;
     }
     .drawer-toggle,
-    .account-btn,
     .search-btn {
       min-width: 44px;
       min-height: 44px;

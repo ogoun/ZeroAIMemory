@@ -102,6 +102,8 @@
     } catch (e) {
       if (my !== seq) return;
       items = [];
+      // неудача — следующий переход в журнал загрузит список снова
+      listOf = '';
       fail(e, (m) => (error = m));
     } finally {
       if (my === seq) loading = false;
@@ -283,6 +285,7 @@
     open={detailOpen}
     back={{ href: href({ name: 'journal', user, space, journal: 'glossary', entry: null }), label: JOURNAL_TITLE.glossary }}
     onclose={closeDetail}
+    {entry}
   >
     {#snippet list()}
       {@render termList()}
@@ -316,7 +319,7 @@
     {#each groups as [letter, terms] (letter)}
       <h2 id="gl-{letter}" class="letter">{letter}</h2>
       {#each terms as t (t.id)}
-        <div role="listitem" class="term" class:selected={t.id === entry} data-term={t.id}>
+        <div role="listitem" class="term" class:selected={t.id === entry} data-term={t.id} data-entry={t.id}>
           <button type="button" class="link name" onclick={() => select(t.id)}>{t.title}</button>
           {#each t.aliases as a (a)}<span class="chip">{a}</span>{/each}
           <div class="muted def">{t.definition}</div>
@@ -421,6 +424,12 @@
     flex-wrap: wrap;
     gap: 2px;
     margin-bottom: 8px;
+  }
+  /* буквы указателя при касании — цели по 44 px с зазором (`--touch-gap`, app.css) */
+  @media (pointer: coarse) {
+    .alpha {
+      gap: var(--touch-gap);
+    }
   }
   .link {
     padding: 0 4px;

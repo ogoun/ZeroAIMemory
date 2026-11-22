@@ -1,7 +1,7 @@
 // Запуск: npm run test:build (node --test, встроенная поддержка TypeScript).
 // Ширины вёрстки WebUI (M7.2, спецификация §5.1 п. 1): один источник — `src/lib/layout.ts`. В CSS
 // переменные в `@media`/`@container` не работают, поэтому числа повторяются — и этот тест пропускает
-// в стилях только ширины из `layout.ts`; `matchMedia` с шириной — только через `MEDIA`.
+// в стилях только ширины из `layout.ts`; `matchMedia`/`MediaQuery` с шириной — только через `MEDIA`.
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -69,17 +69,31 @@ test('media_widths_from_layout', () => {
   );
 });
 
+/** Медиазапросы строкой в коде: `matchMedia('…')` и `new MediaQuery('…')` (svelte/reactivity). */
+function mediaCalls(text: string): { api: string; query: string }[] {
+  return [...text.matchAll(/\b(matchMedia|MediaQuery)\(\s*(['"`])([^'"`]*)\2/g)].map((m) => ({ api: m[1], query: m[3] }));
+}
+
 test('match_media_widths_from_layout', () => {
-  // ширина в matchMedia — только из MEDIA/BP_* layout.ts, не строкой в компоненте
+  // ширина в медиазапросе кода — только из MEDIA/BP_* layout.ts, не строкой в компоненте
   const bad: string[] = [];
   for (const f of files(['.svelte', '.ts'])) {
     if (f.endsWith(join('lib', 'layout.ts'))) continue;
-    const text = readFileSync(f, 'utf8');
-    for (const m of text.matchAll(/matchMedia\(\s*(['"`])([^'"`]*)\1/g)) {
-      if (/width/.test(m[2])) bad.push(`${relative(SRC, f)}: matchMedia('${m[2]}')`);
+    for (const c of mediaCalls(readFileSync(f, 'utf8'))) {
+      if (/width/.test(c.query)) bad.push(`${relative(SRC, f)}: ${c.api}('${c.query}')`);
     }
   }
   assert.deepEqual(bad, []);
+});
+
+test('media_calls_parser_sees_media_query', () => {
+  const got = mediaCalls(
+    "matchMedia('(max-width: 999px)'); new MediaQuery('max-width: 600px'); new MediaQuery(MEDIA.phone);",
+  );
+  assert.deepEqual(got, [
+    { api: 'matchMedia', query: '(max-width: 999px)' },
+    { api: 'MediaQuery', query: 'max-width: 600px' },
+  ]);
 });
 
 test('width_class_boundaries', () => {
