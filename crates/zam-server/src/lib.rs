@@ -24,6 +24,7 @@ pub mod rerank;
 pub mod service;
 pub mod vault;
 pub mod web;
+pub mod works;
 
 #[cfg(test)]
 mod test_util;
