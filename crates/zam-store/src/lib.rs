@@ -18,6 +18,7 @@ pub mod blobs;
 pub mod cache;
 pub mod certainty;
 pub mod code;
+pub mod counts;
 pub mod datadir;
 pub mod db;
 pub mod embeddings;
@@ -82,6 +83,7 @@ pub use certainty::{
     CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,
     default_certainty,
 };
+pub use counts::{SpaceCounts, space_counts};
 pub use datadir::{
     DataDir, DirLock, LockMark, MAX_DATA_DIR_CHARS_WINDOWS, RESTORE_INCOMPLETE_FILE,
     RESTORE_MARK_FILE, check_data_dir_len, lock_mark, restore_incomplete, try_lock_dir,

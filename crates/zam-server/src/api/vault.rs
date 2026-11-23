@@ -47,8 +47,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
-    Db, User, VaultMeta, VaultScope, check_vault_title, vault_delete, vault_get, vault_get_any,
-    vault_list, vault_move, vault_put, vault_revision_secret, vault_revisions, vault_update,
+    Db, Space, SpaceKind, User, VaultMeta, VaultScope, check_vault_title, vault_delete, vault_get,
+    vault_get_any, vault_list, vault_move, vault_put, vault_revision_secret, vault_revisions,
+    vault_update,
 };
 use zeroize::Zeroizing;
 
@@ -414,6 +415,38 @@ pub async fn list(
     Ok(Json(v))
 }
 
+/// Область Vault пространства: Knowledge — личный Vault, решение — Vault решения по GUID; у
+/// Rules и Human Vault нет.
+fn scope_of(space: &Space) -> Option<VaultScope> {
+    match space.kind {
+        SpaceKind::Knowledge => Some(VaultScope::Knowledge),
+        SpaceKind::Solution => space
+            .solution_guid
+            .as_deref()?
+            .parse::<SolutionGuid>()
+            .ok()
+            .map(VaultScope::Solution),
+        SpaceKind::Rules | SpaceKind::Human => None,
+    }
+}
+
+/// Число записей Vault пространства `space` у пользователя запроса `user` — тем же чтением и
+/// базой, что [`list`] без `q`: записи пользователя запроса в его собственной базе (Vault
+/// участника решения — в его базе, а не в базе владельца; спецификация M7 §5.3 п. 1, решение
+/// пре-флайта N13). Доступ к пространству проверяет вызывающий; у Rules и Human Vault нет —
+/// `None`.
+pub(crate) async fn count_of(
+    st: &AppState,
+    user: &User,
+    space: &Space,
+) -> Result<Option<usize>, ApiError> {
+    let Some(scope) = scope_of(space) else {
+        return Ok(None);
+    };
+    let db = st.users.get(user.id).await?;
+    Ok(Some(vault_list(&db, &scope, None).await?.len()))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Create {
@@ -771,6 +804,34 @@ mod tests {
         ));
         for bad in ["rules", "human", "Knowledge", "", &Id::new().to_string()] {
             assert!(matches!(parse_scope(bad), Err(ApiError::NotFound)), "{bad}");
+        }
+    }
+
+    /// Область Vault пространства для числа записей раздела (`count_of`) — та же, что
+    /// `{space}` ленты `GET /spaces/{space}/vault` для этого пространства.
+    #[test]
+    fn scope_of_space_kinds() {
+        let g = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e31";
+        let sp = |kind, guid: Option<&str>| Space {
+            id: Id::new(),
+            kind,
+            solution_guid: guid.map(str::to_string),
+            name: "x".into(),
+        };
+        assert_eq!(
+            scope_of(&sp(SpaceKind::Knowledge, None)),
+            Some(parse_scope("knowledge").unwrap())
+        );
+        assert_eq!(
+            scope_of(&sp(SpaceKind::Solution, Some(g))),
+            Some(parse_scope(g).unwrap())
+        );
+        for (kind, guid) in [
+            (SpaceKind::Rules, None),
+            (SpaceKind::Human, None),
+            (SpaceKind::Solution, None),
+        ] {
+            assert_eq!(scope_of(&sp(kind, guid)), None, "{kind:?}");
         }
     }
 

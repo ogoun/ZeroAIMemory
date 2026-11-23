@@ -2,7 +2,7 @@
 // замещение insight, повышение до theorem с доказательством, раскрытие секрета Vault,
 // вкладка «Связи» с обратной ссылкой, карточки записей в поиске Ctrl+K.
 // Данные — seedJournals (global-setup). Снимки — в .tmp/e2e/screens/ (под .gitignore).
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import { SOLUTION_GUID, SOLUTION_NAME, VAULT_SECRET } from './seed';
@@ -362,4 +362,167 @@ test('Поиск Ctrl+K: карточка записи со статусом и 
     page.getByRole('article', { name: 'Карточка insight' }).getByRole('heading', { name: 'CRLF ломает хэш содержимого' }),
   ).toBeVisible();
   expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// ---- числа разделов (M7.2, спецификация §5.3; задача 4) ----
+
+interface SpaceCounts {
+  journals: Record<string, number>;
+  open: { questions: number; tasks: number };
+  notes: number;
+}
+
+/** Журналы решения в порядке дерева и полосы: ключ ответа `counts` и прежнее имя ссылки. */
+const JOURNALS: [string, string][] = [
+  ['changelog', 'Changelog'],
+  ['releases', 'Releases'],
+  ['reports', 'Отчёты'],
+  ['code', 'Код'],
+  ['insights', 'Insights'],
+  ['glossary', 'Словарь'],
+  ['tasks', 'Задачи'],
+  ['ideas', 'Идеи'],
+  ['questions', 'Вопросы'],
+  ['vault', 'Vault'],
+];
+
+/** Ожидаемые подписи — своим кодом, независимо от `counts.ts` (его формы — `counts.test.ts`). */
+const fmt = (n: number) => new Intl.NumberFormat('ru-RU').format(n);
+function forms(n: number, one: string, few: string, many: string) {
+  const d = n % 10;
+  const h = n % 100;
+  return d === 1 && h !== 11 ? one : d >= 2 && d <= 4 && (h < 12 || h > 14) ? few : many;
+}
+const description = (key: string, n: number, open: number) =>
+  `${fmt(n)} ${key === 'code' ? forms(n, 'файл', 'файла', 'файлов') : forms(n, 'запись', 'записи', 'записей')}` +
+  (open > 0 ? `, открыто ${fmt(open)}` : '');
+
+/** Числа решения E2E у сессии администратора (с отчётами — как у дерева). */
+async function solutionCounts(page: Page): Promise<SpaceCounts> {
+  const r = await page.request.get(`${base()}api/v1/spaces/${SOLUTION_GUID}/counts`);
+  expect(r.status(), await r.text()).toBe(200);
+  return (await r.json()) as SpaceCounts;
+}
+
+/** REST по токену администратора (агент). */
+async function agentApi<T>(method: string, path: string, body?: unknown, extra: Record<string, string> = {}) {
+  const r = await fetch(`${base()}api/v1/${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${env('E2E_ADMIN_TOKEN')}`,
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      ...extra,
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`${method} ${path}: HTTP ${r.status} ${await r.text()}`);
+  return (r.status === 204 ? undefined : await r.json()) as T;
+}
+
+test('tree_and_tabs_show_counts', async ({ page }) => {
+  const problems = watch(page);
+  // открытый вопрос решения — для «открыто N» у «Вопросов» (убирается в конце)
+  const q = await agentApi<{ id: string; rev: number }>('POST', `spaces/${SOLUTION_GUID}/entries`, {
+    kind: 'question',
+    title: 'Вопрос E2E: числа разделов',
+    body: 'Ждёт ответа человека.',
+  });
+  let ideaId = '';
+  try {
+    const c = await solutionCounts(page);
+    expect(c.open.questions).toBeGreaterThanOrEqual(1);
+    await page.goto(base());
+    await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+    const t = tree(page);
+    await t.getByRole('button', { name: /^Solutions/ }).first().click();
+    const sol = t.getByRole('button', { name: new RegExp(`^${SOLUTION_NAME}`) }).first();
+    await sol.click();
+    const journals = t.getByRole('list', { name: `Журналы: ${SOLUTION_NAME}` });
+    // имена ссылок прежние: число — отдельный элемент вне ссылки (пре-флайт N3)
+    await expect(journals.getByRole('link')).toHaveText(JOURNALS.map(([, title]) => title));
+    const treeNum = (key: string) => journals.locator(`[data-count="${key}"]`);
+    for (const [key, title] of JOURNALS) {
+      const n = c.journals[key];
+      const open = key === 'questions' ? c.open.questions : 0;
+      await expect(treeNum(key), key).toHaveText(fmt(n));
+      await expect(journals.getByRole('link', { name: title, exact: true })).toHaveAccessibleDescription(
+        description(key, n, open),
+      );
+    }
+    // «Вопросы» с открытым — акцентная метка; у пространства — число заметок (описание кнопки)
+    const qRow = journals.getByRole('listitem').filter({ has: page.getByRole('link', { name: 'Вопросы', exact: true }) });
+    await expect(qRow.getByText(`открыто ${fmt(c.open.questions)}`, { exact: true })).toBeVisible();
+    const solLabel = page.getByRole('button', { name: new RegExp(`^${SOLUTION_NAME}`) });
+    const notes = t.locator('.tree-row.space').filter({ has: solLabel }).locator('[data-count="notes"]');
+    await expect(notes).toHaveText(fmt(c.notes));
+    await expect(sol).toHaveAccessibleDescription(new RegExp(`^${fmt(c.notes)} замет(ка|ки|ок)$`));
+
+    // полоса журналов — те же числа, имена ссылок прежние
+    await journals.getByRole('link', { name: 'Идеи', exact: true }).click();
+    await expect(page).toHaveURL(new RegExp(`/s/${SOLUTION_GUID}/j/ideas$`));
+    const strip = page.getByRole('navigation', { name: 'Журналы пространства' });
+    await expect(strip.getByRole('link')).toHaveText(JOURNALS.map(([, title]) => title));
+    const stripNum = (key: string) => strip.locator(`[data-count="${key}"]`);
+    for (const [key, title] of JOURNALS) {
+      const open = key === 'questions' ? c.open.questions : 0;
+      await expect(stripNum(key), key).toHaveText(fmt(c.journals[key]));
+      await expect(strip.getByRole('link', { name: title, exact: true })).toHaveAccessibleDescription(
+        description(key, c.journals[key], open),
+      );
+    }
+    await expect(strip.getByText(`открыто ${fmt(c.open.questions)}`, { exact: true })).toBeVisible();
+    // число и «открыто N» — поверх правого поля ссылки: внутри её рамки, перенос строки их не
+    // разделяет (ревью r1, M3)
+    const inside = async (title: string, part: Locator) => {
+      const [lb, nb] = await Promise.all([strip.getByRole('link', { name: title, exact: true }).boundingBox(), part.boundingBox()]);
+      return !!lb && !!nb && nb.x >= lb.x - 0.5 && nb.x + nb.width <= lb.x + lb.width + 0.5 && nb.y >= lb.y - 0.5;
+    };
+    expect(await inside('Идеи', stripNum('ideas')), 'число внутри ссылки').toBe(true);
+    expect(await inside('Вопросы', strip.getByText(`открыто ${fmt(c.open.questions)}`, { exact: true })), 'метка внутри ссылки').toBe(true);
+    // ноль — цветом `--muted` без прозрачности (контраст WCAG AA, ревью r1 M2); в дереве — кроме
+    // выбранной строки «Идеи» под указателем: там все числа цветом текста
+    for (const [key] of JOURNALS.filter(([k]) => c.journals[k] === 0)) {
+      for (const el of key === 'ideas' ? [stripNum(key)] : [treeNum(key), stripNum(key)]) {
+        const [color, muted, opacity] = await el.evaluate((e) => {
+          const probe = document.createElement('span');
+          probe.style.color = 'var(--muted)';
+          e.parentElement!.append(probe);
+          const m = getComputedStyle(probe).color;
+          probe.remove();
+          return [getComputedStyle(e).color, m, getComputedStyle(e).opacity];
+        });
+        expect([color, opacity], key).toEqual([muted, '1']);
+      }
+    }
+    await page.screenshot({ path: `${screens}journal-counts.png` });
+
+    // новая идея из WebUI — «Идеи» +1 в дереве и в полосе без перезагрузки
+    await page.getByRole('button', { name: 'Новая идея' }).click();
+    const form = page.getByRole('form', { name: 'Новая идея' });
+    await form.getByLabel('Заголовок').fill('Идея E2E: число раздела');
+    await form.getByLabel('Замысел').fill('Проверка числа записей раздела.');
+    const created = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().endsWith(`/spaces/${SOLUTION_GUID}/entries`));
+    await form.getByRole('button', { name: 'Записать' }).click();
+    ideaId = ((await (await created).json()) as { id: string }).id;
+    await expect(page.getByRole('status')).toHaveText('Идея записана.');
+    const ideas = c.journals.ideas + 1;
+    await expect(stripNum('ideas')).toHaveText(fmt(ideas));
+    await expect(treeNum('ideas')).toHaveText(fmt(ideas));
+    await expect(journals.getByRole('link', { name: 'Идеи', exact: true })).toHaveAccessibleDescription(
+      description('ideas', ideas, 0),
+    );
+    expect((await solutionCounts(page)).journals.ideas).toBe(ideas);
+    expect(problems, problems.join('\n')).toEqual([]);
+  } finally {
+    // идею человека в корзину убирает человек (сессия), вопрос агента — его токен
+    if (ideaId) {
+      const me = (await (await page.request.get(`${base()}api/v1/auth/me`)).json()) as { csrf: string };
+      const cur = (await (await page.request.get(`${base()}api/v1/entries/${ideaId}`)).json()) as { rev: number };
+      const del = await page.request.delete(`${base()}api/v1/entries/${ideaId}`, {
+        headers: { 'X-CSRF-Token': me.csrf, 'If-Match': `"${cur.rev}"` },
+      });
+      expect(del.status()).toBe(204);
+    }
+    await agentApi('DELETE', `entries/${q.id}`, undefined, { 'If-Match': `"${q.rev}"` });
+  }
 });
